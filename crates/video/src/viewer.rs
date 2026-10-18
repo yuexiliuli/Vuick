@@ -68,6 +68,7 @@ use ui::motion::hover_spring;
 
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
+use super::hw::{SharedCopier, create_worker_d3d11_device};
 use super::subtitle::{SubtitleEntry, SubtitleStyle, find_active_subtitle, parse_ass_text};
 
 use ::viewer::auto_hide;
@@ -235,6 +236,63 @@ pub(crate) fn hw_engaged_reset() {
     HW_ENGAGED.store(false, Ordering::Relaxed);
 }
 
+/// 测试探针：worker 最近一次打开 reader 时**双设备 GPU 直通**是否真正接管（区别于 SAFE
+/// 硬解 BGRA——`hw_engaged` 两者都置 true，双设备测试需单独断言直通引擎生效）。
+#[cfg(test)]
+static DUAL_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn dual_engaged() -> bool {
+    DUAL_ENGAGED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn dual_engaged_reset() {
+    DUAL_ENGAGED.store(false, Ordering::Relaxed);
+}
+
+/// 双设备直通允许开关：**生产恒开**（`dual_path_allowed` = true，auto 模式直通优先）；
+/// **测试默认关**（保持既有 SAFE BGRA 硬解/软解基准与回归测试的原路径不动），仅
+/// `gpu_passthrough_*` 测试用 [`DualPathGuard`] 显式开启。这是双设备与现有 40+ 真解码
+/// 测试基线互不污染的隔离阀门（同 `hw_fault` 注入的 cfg(test) 折叠纪律）。
+#[cfg(test)]
+static DUAL_PATH_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn dual_path_set_enabled(v: bool) {
+    DUAL_PATH_ENABLED.store(v, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn dual_path_allowed() -> bool {
+    DUAL_PATH_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn dual_path_allowed() -> bool {
+    true
+}
+
+/// 测试专用 RAII 守卫：构造开启双设备直通、Drop 复位（任何 return/panic 路径都不把
+/// 直通首选项泄漏给后续测试）。
+#[cfg(test)]
+struct DualPathGuard;
+
+#[cfg(test)]
+impl DualPathGuard {
+    fn new() -> Self {
+        dual_path_set_enabled(true);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for DualPathGuard {
+    fn drop(&mut self) {
+        dual_path_set_enabled(false);
+    }
+}
+
 /// 测试专用故障注入（模拟硬解设备丢失 / 瞬时解码错误）——仅 `cfg(test)` 存在，生产零字段
 /// 零开销（编译期折叠）：视频 worker 在给**硬解** reader 发解码/预滚 FFI 前查 [`hw_fault_hook`]，
 /// 返回 true 即视为本次调用失败（走与真实 FFI 报错完全相同的恢复路径）。
@@ -343,14 +401,18 @@ pub(crate) fn take_seek_diag_test() -> Option<(f64, u8, f64, u32, f64, f64, f64,
     })
 }
 
-/// 解码线程经通道传递的一帧：恒为软 BGRA（硬解 reader 内核自行回读+sws，输出与软解逐帧同构；
-/// 旧 M2e「GPU 目标纹理直通」已废除——渲染像素只信 BGRA/RenderImage）。
+/// 解码线程经通道传递的一帧：软 BGRA 帧（sws/回读转好、主线程包 `RenderImage` 上屏）或
+/// 双设备 GPU 直通帧（worker 自有设备解码 + GPU 侧拷进共享槽，主线程 `paint_external_yuv`
+/// 上屏，CPU 零回读/零 sws）。
 enum FrameItem {
     /// 解码 BGRA 帧（sws/回读转好、主线程包 `RenderImage` 上屏）。
     Soft(SoftFrame),
+    /// 双设备 GPU 直通帧：worker 已把解码帧拷进共享 NV12 槽（keyed mutex 已释放），
+    /// 跨线程只传 `shared_handle` 数值；主线程上屏时渲染设备打开该句柄采样。
+    Gpu(GpuFrame),
 }
 
-/// 解码一帧。
+/// 解码一帧（软 BGRA）。
 struct SoftFrame {
     pts: f64,
     w: u32,
@@ -358,10 +420,20 @@ struct SoftFrame {
     bgra: Vec<u8>,
 }
 
+/// 一帧双设备 GPU 直通产物（worker 产出、主线程经通道消费）。
+struct GpuFrame {
+    pts: f64,
+    w: u32,
+    h: u32,
+    /// DXGI 共享句柄（usize 数值；worker 槽池持有 COM 引用，主线程用后经释放消息回池）。
+    shared_handle: usize,
+}
+
 impl FrameItem {
     fn pts(&self) -> f64 {
         match self {
             FrameItem::Soft(f) => f.pts,
+            FrameItem::Gpu(f) => f.pts,
         }
     }
 }
@@ -449,8 +521,11 @@ fn seed_rng() -> u64 {
 pub struct VideoViewer {
     path: PathBuf,
     focus_handle: gpui::FocusHandle,
-    /// 当前上屏帧。
+    /// 当前上屏帧（软 BGRA：`RenderImage` 图集 tile）。
     frame: Option<Arc<RenderImage>>,
+    /// 当前上屏帧（双设备 GPU 直通：共享 NV12 槽句柄）。二者互斥：装软帧清 GPU 帧、
+    /// 装 GPU 帧清软帧（切换模式/回退时旧帧槽显式回池）。
+    gpu_frame: Option<GpuFrame>,
     /// 测试探针：最近一次 `drop_image` 释放掉的旧帧 `ImageId.0`（仅 test 编译，供
     /// 回归断言「替换只 drop 旧帧、当前帧留存」；运行态不占字段）。
     #[cfg(test)]
@@ -518,8 +593,11 @@ pub struct VideoViewer {
     diag_session: u64,
     /// 常驻视频解码线程的命令通道。worker 一生一个，切换/seek 全投命令；新文件在
     /// **同一线程内**串行重开旧 reader —— 实测“新线程在上一解码器 teardown 后立刻
-    /// `avformat_open_input`”会卡死（72.MP4 复现），单 worker 串行重开则稳定。
+    /// `avformat_open_input` 会卡死”（72.MP4 复现），单 worker 串行重开则稳定。
     decode_cmd: Option<std::sync::mpsc::Sender<DecodeCmd>>,
+    /// 双设备 GPU 直通：主线程把「已换下的 GPU 帧共享槽」归还 worker 的释放通道（无界，
+    /// 只传数值；worker 逐帧拉取回池复用——与帧通道同生命周期，viewer Drop 时随之断连）。
+    release_cmd: Option<std::sync::mpsc::Sender<usize>>,
     /// 常驻音频解码线程的命令通道（同 `decode_cmd` 的收尾理由）。
     audio_cmd: Option<std::sync::mpsc::Sender<AudioCmd>>,
     /// 本媒体音频是否已真正开喂（音频 worker 开成功置 true；切媒体/seek 复位 false）。
@@ -609,6 +687,7 @@ impl VideoViewer {
             path: path.clone(),
             focus_handle: cx.focus_handle(),
             frame: None,
+            gpu_frame: None,
             #[cfg(test)]
             dropped_frame: None,
             #[cfg(test)]
@@ -646,6 +725,7 @@ impl VideoViewer {
             // 据此匹配共享槽并聚合打印；普通运行恒 0/新值）。
             diag_session: 0,
             decode_cmd: None,
+            release_cmd: None,
             audio_cmd: None,
             audio_ready: Arc::new(AtomicBool::new(false)),
             audio_anchor_pending: true,
@@ -834,8 +914,13 @@ impl VideoViewer {
         }
         let (tx, rx) = std::sync::mpsc::channel::<DecodeCmd>();
         let gen_arc = self.generation.clone();
-        std::thread::spawn(move || Self::video_worker(rx, gen_arc));
+        // GPU 槽归还通道：主线程释放「已换下的 GPU 帧共享槽」→ worker 回收（见
+        // `video_worker` 的 `reap_releases`；Arc<Mutex<Receiver>> 供内层帧循环逐帧拉取）
+        let (rel_tx, rel_rx) = std::sync::mpsc::channel::<usize>();
+        let rel_rx = Arc::new(std::sync::Mutex::new(rel_rx));
+        std::thread::spawn(move || Self::video_worker(rx, gen_arc, rel_rx));
         self.decode_cmd = Some(tx);
+        self.release_cmd = Some(rel_tx);
     }
 
     /// 惰性启动常驻 hover 预解码 worker（一生一个；`hover_cmd` Sender 随 viewer Drop 弃、
@@ -855,21 +940,23 @@ impl VideoViewer {
     /// 直到换代/EOF）。
     ///
     /// 打开路径一律按进程级解码偏好旋钮（[`crate::decode::decode_mode`]，生产恒 auto）：
-    /// auto/hw → `open_scaled_hw`（FFmpeg 自有 D3D11VA/DXVA2 设备，worker 线程独享、无调用方
-    /// 注入、失败内核自动回软解）；soft → `open_scaled`（纯软解）。不再读
-    /// `gpui_platform::d3d11_device_context()`——旧 M2e 把渲染线程 immediate context 注入
-    /// 解码 worker 共享导致真机崩溃（exit 2173），注入路径已废除。
+    /// auto/hw → **双设备 GPU 直通优先**（[`Self::open_reader_for_mode`]：worker 自有
+    /// D3D11 设备 + `open_hw`，失败自动回落 SAFE BGRA 硬解 `open_scaled_hw`，再回软解）；
+    /// soft → `open_scaled`（纯软解）。双设备不注入渲染线程的 immediate context（旧 M2e
+    /// 崩溃路径已废除——帧经 shared handle + keyed mutex 跨设备移动）。
     fn video_worker(
         rx: std::sync::mpsc::Receiver<DecodeCmd>,
         gen_arc: Arc<AtomicU64>,
+        rel_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<usize>>>,
     ) {
         // 常驻 reader：同路径 + 同模式（auto 或 soft cap）的命令直接复用——seek 只做容器内
         // 定位（av_seek_frame + 解码器 flush），不重开文件；重开（avformat open + 解码器/sws
         // 初始化）在一次 seek 命令里可能几十 ms，是「点击进度条后画面要等片刻」的主因
         //（探针实测 open_scaled≈57ms、复用 seek≈0ms）。换文件 / cap 变化（窗口缩放）/
         // 模式切换才重开。同一线程内串行使用，无并发；reader 非 Send，仅在本 worker
-        // 线程持有。
-        let mut active: Option<(std::path::PathBuf, ReaderMode, VideoReader)> = None;
+        // 线程持有。第 4 元 = 双设备共享槽拷贝引擎（`Some` ⇔ 直通已接管；`None` ⇔ SAFE
+        // BGRA/软解——与 reader 同生共死，换代/重开一并 drop 释放）。
+        let mut active: Option<(std::path::PathBuf, ReaderMode, VideoReader, Option<SharedCopier>)> = None;
         // 常驻帧缓冲（worker 线程独占，软解 / 硬解 seek 预滚共用）：跨命令存活，零初始化
         // 只在扩容发生一次（按源顶格 `source_cap`），随后逐帧覆写复用。
         let mut buf: Vec<u8> = Vec::new();
@@ -880,15 +967,15 @@ impl VideoViewer {
             } else {
                 ReaderMode::Auto(cmd.cap)
             };
-            let same = matches!(&active, Some((p, m, _)) if *p == cmd.path && *m == mode);
+            let same = matches!(&active, Some((p, m, _, _)) if *p == cmd.path && *m == mode);
             if !same {
-                // 打开（按模式；两者都失败 → 报错跳过本命令）
+                // 打开（按模式；双设备/SAFE/软解任一成功即用，全失败 → 报错跳过本命令）
                 match Self::open_reader_for_mode(&cmd.path, &mode) {
-                    Ok((opened_mode, reader)) => {
+                    Ok((opened_mode, reader, copier)) => {
                         if let Some(out) = &cmd.result_tx {
                             let _ = out.send(Ok(reader.params()));
                         }
-                        active = Some((cmd.path.clone(), opened_mode, reader));
+                        active = Some((cmd.path.clone(), opened_mode, reader, copier));
                     }
                     Err(e) => {
                         if let Some(out) = &cmd.result_tx {
@@ -904,21 +991,23 @@ impl VideoViewer {
                 // 尺寸不填（loading 只关参数缺失），切换窗口期对撞时即触发。
                 let _ = out.send(Ok(active.as_ref().expect("复用分支已有 reader").2.params()));
             }
-            // 硬解 reader（FFmpeg 自有设备）：seek 预滚走 `skip_to_bgra_into`（一次调用完成
-            // seek + 跳帧免转换 + 首帧 BGRA，seek 墙钟主要加速）；软解保持旧逐帧口径字节不动。
-            // 借用只在本拍即时消费、不跨内层循环持有——设备丢失自恢复要整体替换 active
-            // reader（见内层循环末尾），长借用会挡住重建。
+            // 直通（worker 自有设备 open_hw）是否接管：`active[3]` Some ⇔ 双设备已接管
+            let mut dual = matches!(&active, Some((_, _, _, Some(_))));
+            // 硬解 reader 判别：SAFE BGRA（FFmpeg 自有设备）与双设备（worker 自有设备）
+            // 都是 is_hw()==true；软解为 false。驱动 seek 预滚分支与「设备丢失计数」。
             let mut hw_reader = active
                 .as_ref()
-                .map(|(_, _, r)| r.is_hw())
+                .map(|(_, _, r, _)| r.is_hw())
                 .unwrap_or(false);
-            if !hw_reader {
-                let _ = active.as_mut().map(|(_, _, r)| r.seek(cmd.target));
+            if !hw_reader || dual {
+                // 软解照旧：seek 后才逐帧过滤预滚。双设备：skip_to_bgra 不做（零回读），
+                // 需显式 seek 目标，预滚帧在帧循环里免拷贝丢弃。
+                let _ = active.as_mut().map(|(_, _, r, _)| r.seek(cmd.target));
             }
             // 源顶格容量（同文件同 cap 在重开前后不变）：内层循环扩容判据，省逐帧取参
             let src_cap = active
                 .as_ref()
-                .map(|(_, _, r)| r.source_cap())
+                .map(|(_, _, r, _)| r.source_cap())
                 .unwrap_or(1);
             // seek 全链路探针（env 开或 test 构建采集，打印仍只按 env；本命仅 seek 命令开）：
             // 收集「回退量 / 预滚数 / 首帧≥target 入队时刻」，首帧入队瞬间写槽（此时
@@ -954,7 +1043,9 @@ impl VideoViewer {
             let mut vp_frames: u64 = 0;
             let mut vp_window = Instant::now();
             while gen_arc.load(Ordering::SeqCst) == cmd.generation {
-                let t0 = Instant::now();
+                // 回收主线程归还的 GPU 共享槽（逐帧拉取：连续播放时主线程每消费一帧归还一槽，
+                // 不及时 reap 会让 slot 池在 decode-ahead 窗口内堆积耗尽）
+                Self::reap_releases(&mut active, &rel_rx);                let t0 = Instant::now();
                 // 设备丢失/瞬时错误注入（仅测试构建）：硬解 reader 下一次解码/预滚前查一次
                 let fault_now = {
                     #[cfg(test)]
@@ -967,10 +1058,55 @@ impl VideoViewer {
                     }
                 };
                 let item = {
-                    // 本拍即时借用；块退出即释放，恢复分支可整块替换 active
-                    let reader = &mut active.as_mut().expect("打开成功必有 reader").2;
+                    // 本拍即时借用：一次解构取 reader 与可选的直通 copier（两个互斥字段借用），
+                    // 块退出即释放，恢复分支可整块替换 active
+                    let act = active.as_mut().expect("打开成功必有 reader");
+                    let (_, _, reader, copier) = act;
+                    let copier = copier.as_mut();
                     if fault_now {
                         Err(anyhow::anyhow!("测试注入：模拟硬解设备丢失/解码失败"))
+                    } else if dual {
+                        // ---- 双设备 GPU 直通（零回读）：worker 自有设备逐帧解码 → GPU 侧
+                        // 拷进共享槽（AcquireSync→Copy→Flush→ReleaseSync）→ 送主线程 ----
+                        // 预滚帧（pts<target）免拷贝丢弃（不占槽/不占跨设备带宽）；首个 ≥target
+                        // 帧拷贝后立即 release 解码器槽位（帧池 headroom≈1-2）。
+                        let cp = copier.expect("直通接管必有共享拷贝引擎");
+                        match reader.next_frame_hw() {
+                            Ok(Some(fr)) if fr.pts >= frame_target => {
+                                let pts = fr.pts;
+                                let w = fr.w;
+                                let h = fr.h;
+                                let copied = cp.copy(w, h, fr.tex, fr.array_index);
+                                // 无论拷贝成败都归还解码器槽位（headroom 纪律）
+                                VideoReader::release_hw_frame(fr.frame_ptr);
+                                match copied {
+                                    Ok(cf) => Ok(Some(FrameItem::Gpu(GpuFrame {
+                                        pts,
+                                        w,
+                                        h,
+                                        shared_handle: cf.shared_handle,
+                                    }))),
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Ok(Some(fr)) => {
+                                // 预滚帧（pts<target）：免拷贝丢弃；计入 seek 诊断
+                                //（回归量取首个解码帧、跳帧数累加）
+                                if seek_diag_on {
+                                    if seek_first_decoded {
+                                        seek_first_decoded = false;
+                                        seek_regress = fr.pts - cmd.target;
+                                    }
+                                    seek_skipped += 1;
+                                }
+                                resume_pts = resume_pts.max(fr.pts);
+                                VideoReader::release_hw_frame(fr.frame_ptr);
+                                pre_roll = None;
+                                continue;
+                            }
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(e),
+                        }
                     } else if hw_reader && !hw_primed {
                         hw_primed = true;
                         // ---- 硬解 seek 预滚快路径：一次 `skip_to_bgra_into` 完成 seek + 跳帧
@@ -1141,16 +1277,22 @@ impl VideoViewer {
                         crate::decode::blacklist_hw_path(&cmd.path);
                         let reopen_pos = resume_pts;
                         match Self::open_reader_for_mode(&cmd.path, &ReaderMode::Soft(cmd.cap)) {
-                            Ok((soft_mode, soft_reader)) => {
-                                active = Some((cmd.path.clone(), soft_mode, soft_reader));
+                            Ok((soft_mode, soft_reader, soft_copier)) => {
+                                active = Some((
+                                    cmd.path.clone(),
+                                    soft_mode,
+                                    soft_reader,
+                                    soft_copier,
+                                ));
                                 hw_reader = false;
+                                dual = false;
                                 hw_primed = true;
                                 // 续播接纳阈值抬到最后成功解码 pts：首个软帧 ≥ 此值才送
                                 frame_target = reopen_pos;
                                 pre_roll = None;
                                 let _ = active
                                     .as_mut()
-                                    .map(|(_, _, rd)| rd.seek(reopen_pos));
+                                    .map(|(_, _, rd, _)| rd.seek(reopen_pos));
                                 continue; // 下一拍起走软解逐帧路径，播放无感接续
                             }
                             Err(e) => {
@@ -1176,13 +1318,30 @@ impl VideoViewer {
         }
     }
 
-    /// 按模式打开 reader：返回 `(实际模式, reader)`。auto → `open_scaled_hw`（FFmpeg 自有
-    /// 设备，硬解优先、失败内核自动回软解，行为不降级）；soft → `open_scaled`（纯软解）。
-    /// 两者都失败才 `Err`。
+    /// 逐帧拉取主线程归还的 GPU 共享槽并回池（直通模式才有 copier；软解/SAFE BGRA 幂等 no-op）。
+    /// 每次进内层循环调用一次：播放稳态下主线程每消费一帧归还一槽，不及时 reap 会让槽池在
+    /// decode-ahead + 在途窗口内堆积 → `copy` 触发「池耗尽」错误 → 误回退 SAFE 路径。
+    fn reap_releases(
+        active: &mut Option<(std::path::PathBuf, ReaderMode, VideoReader, Option<SharedCopier>)>,
+        rel_rx: &std::sync::Mutex<std::sync::mpsc::Receiver<usize>>,
+    ) {
+        let Some((_, _, _, Some(copier))) = active.as_mut() else {
+            return;
+        };
+        let _rx = rel_rx.lock().unwrap_or_else(|e| e.into_inner());
+        while let Ok(shared_handle) = _rx.try_recv() {
+            copier.recycle(shared_handle);
+        }
+    }
+
+    /// 按模式打开 reader：返回 `(实际模式, reader, 直通 copier)`。auto → **双设备 GPU 直通
+    /// 优先**（worker 自有设备 + `open_hw`；任一环节失败 → 回落 SAFE BGRA 硬解
+    /// `open_scaled_hw`，行为不降级）；soft → `open_scaled`（纯软解）。三者都失败才 `Err`。
     fn open_reader_for_mode(
         path: &std::path::Path,
         mode: &ReaderMode,
-    ) -> anyhow::Result<(ReaderMode, VideoReader)> {
+    ) -> anyhow::Result<(ReaderMode, VideoReader, Option<SharedCopier>)> {
+        use windows::core::Interface as _;
         match mode {
             ReaderMode::Auto(cap) => {
                 // 设备丢失黑名单路径：不再尝试 hw init，直接软解（返回 Soft 模式便于复用判据
@@ -1191,17 +1350,37 @@ impl VideoViewer {
                     #[cfg(test)]
                     HW_ENGAGED.store(false, Ordering::Relaxed);
                     return VideoReader::open_scaled(path, *cap)
-                        .map(|r| (ReaderMode::Soft(*cap), r));
+                        .map(|r| (ReaderMode::Soft(*cap), r, None));
+                }
+                // 双设备 GPU 直通：worker 自有设备（硬件→WARP 兜底）+ 外部设备注入解码。
+                // 任一环节失败（建设备/open_hw）→ 回落 SAFE BGRA 硬解（与旧 auto 行为一致）。
+                if dual_path_allowed() {
+                    if let Some(worker) = create_worker_d3d11_device() {
+                        let raw_dev = worker.device.as_raw() as usize;
+                        let raw_ctx = worker.context.as_raw() as usize;
+                        if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
+                            #[cfg(test)]
+                            {
+                                DUAL_ENGAGED.store(true, Ordering::Relaxed);
+                                HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
+                            }
+                            return Ok((
+                                ReaderMode::Auto(*cap),
+                                r,
+                                Some(SharedCopier::new(worker)),
+                            ));
+                        }
+                    }
                 }
                 let r = VideoReader::open_scaled_hw(path, *cap)?;
                 #[cfg(test)]
                 HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
-                Ok((ReaderMode::Auto(*cap), r))
+                Ok((ReaderMode::Auto(*cap), r, None))
             }
             ReaderMode::Soft(cap) => {
                 #[cfg(test)]
                 HW_ENGAGED.store(false, Ordering::Relaxed);
-                VideoReader::open_scaled(path, *cap).map(|r| (ReaderMode::Soft(*cap), r))
+                VideoReader::open_scaled(path, *cap).map(|r| (ReaderMode::Soft(*cap), r, None))
             }
         }
     }
@@ -1499,9 +1678,9 @@ impl VideoViewer {
             };
             match item {
                 Some(item) if item.pts() <= self.playhead => {
-                    // 先到的帧被更新的帧顶掉：旧软帧直接 drop（无跨线程资源）
+                    // 先到的帧被更新的帧顶掉：旧帧直接弃（软帧无资源；GPU 帧共享槽回池）
                     if let Some(prev) = latest.replace(item) {
-                        let _ = prev;
+                        self.drop_frame_item(prev);
                     }
                 }
                 Some(item) if land_seek.is_some() && item.pts() >= land_seek.unwrap() => {
@@ -1509,7 +1688,7 @@ impl VideoViewer {
                     // 后续帧恢复正常 overflow 规则（不整段快进到最新帧）。
                     land_seek = None;
                     if let Some(prev) = latest.replace(item) {
-                        let _ = prev;
+                        self.drop_frame_item(prev);
                     }
                 }
                 Some(item) => {
@@ -1526,6 +1705,15 @@ impl VideoViewer {
                     #[cfg(test)]
                     {
                         self.last_frame_pts = Some(f.pts);
+                    }
+                }
+                FrameItem::Gpu(f) => {
+                    #[cfg(test)]
+                    let gpts = f.pts;
+                    self.install_gpu(f, cx);
+                    #[cfg(test)]
+                    {
+                        self.last_frame_pts = Some(gpts);
                     }
                 }
             }
@@ -1750,6 +1938,12 @@ impl VideoViewer {
     /// 后写视频同目录（不可写回退系统临时目录）。PNG 编码放后台线程（1080p ~几十 ms，
     /// 不卡主线程播放泵）；完成经 [`Self::show_status`] 右上角浮层提示路径。
     fn screenshot_png(&mut self, cx: &mut Context<Self>) {
+        if self.gpu_frame.is_some() {
+            // 双设备 GPU 直通帧不含 CPU 像素（零回读）——截图像素需回读，属架构性不支持；
+            // 用户可切软解后截图。
+            self.show_status("GPU 直通帧不含 CPU 像素，无法截图（切软解后可截）".to_string(), cx);
+            return;
+        }
         let Some(frame) = self.frame.clone() else {
             self.show_status("暂无画面可截图：视频尚未解码出帧".to_string(), cx);
             return;
@@ -1868,6 +2062,10 @@ impl VideoViewer {
     /// **源尺寸**（decode-to-display 下采样后逐帧 w/h 是输出尺寸，宽高比一致即可）。
     fn install_bgra(&mut self, w: u32, h: u32, bgra: Vec<u8>, cx: &mut Context<Self>) {
         let t0 = Instant::now();
+        // 从 GPU 直通切回 BGRA（回退/切软解）：旧 GPU 帧共享槽回池复用
+        if let Some(g) = self.gpu_frame.take() {
+            self.send_release(g.shared_handle);
+        }
         // 帧字节移入 RenderImage（零拷贝）即持有时；截图在点击时经 `frame.as_bytes` 取回
         let buf = RgbaImage::from_raw(w, h, bgra).expect("解码帧长度恒为 w*h*4");
         let new = Arc::new(RenderImage::new(vec![Frame::new(buf)]));
@@ -1897,9 +2095,48 @@ impl VideoViewer {
         }
     }
 
-    /// 清空 `overflow`（换代 / 切文件共用）：软越线帧随 drop 释放，无跨线程资源要收。
+    /// 清空 `overflow`（换代 / 切文件共用）：软越线帧随 drop 释放；GPU 越线帧的共享槽
+    /// 回往 worker 池（不回流会在 decode-ahead 窗口内堆积耗尽槽池）。
     fn clear_overflow(&mut self) {
-        self.overflow.take();
+        if let Some(o) = self.overflow.take() {
+            self.drop_frame_item(o);
+        }
+    }
+
+    /// 把共享槽释放消息发给 worker（跨线程只传数值；通道无界不阻塞；worker 已随换代/退出
+    /// 死亡时 send 失败 = 槽随 worker 池一并释放，安全 no-op）。
+    fn send_release(&self, shared_handle: usize) {
+        if let Some(tx) = &self.release_cmd {
+            let _ = tx.send(shared_handle);
+        }
+    }
+
+    /// 丢弃一个**未装屏**的帧：GPU 帧的共享槽回往 worker 池；软帧为纯字节无需回收。
+    fn drop_frame_item(&mut self, item: FrameItem) {
+        if let FrameItem::Gpu(f) = item {
+            self.send_release(f.shared_handle);
+        }
+    }
+
+    /// 是否已有可显示帧（软 BGRA 或 GPU 直通任一）。
+    fn has_frame(&self) -> bool {
+        self.frame.is_some() || self.gpu_frame.is_some()
+    }
+
+    /// 装一帧双设备 GPU 直通帧（worker 已 GPU 侧拷进共享槽）：旧软帧显式 drop（图集 tile）、
+    /// 旧 GPU 帧槽回池，新句柄上屏。
+    fn install_gpu(&mut self, f: GpuFrame, cx: &mut Context<Self>) {
+        let (w, h) = (f.w, f.h);
+        // 从 BGRA 切回 GPU 直通：释放旧软帧图集 tile（与 install_bgra 同款 P0 姿势）
+        if let Some(old) = self.frame.take() {
+            self.drop_old_frame(old, cx);
+        }
+        // 旧 GPU 帧的共享槽回往 worker 池复用（跨线程只传句柄数值）
+        if let Some(g) = self.gpu_frame.take() {
+            self.send_release(g.shared_handle);
+        }
+        self.gpu_frame = Some(f);
+        self.intrinsic.get_or_insert((w as f32, h as f32));
     }
 
     /// 关闭当前媒体、打开 `nav[current]`（同文件夹切换共用）。
@@ -1909,9 +2146,12 @@ impl VideoViewer {
         }
         self.path = self.nav.item(idx).expect("set_current 已校验越界");
         // 切文件：旧媒体最后一帧的图集 tile 一并显式释放（与 install_bgra 同款 P0 姿势，
-        // 否则切换 Playlist 多支时每切一次漏一片 tile）。
+        // 否则切换 Playlist 多支时每切一次漏一片 tile）；GPU 直通帧的共享槽回往 worker。
         if let Some(old) = self.frame.take() {
             self.drop_old_frame(old, cx);
+        }
+        if let Some(g) = self.gpu_frame.take() {
+            self.send_release(g.shared_handle);
         }
         self.intrinsic = None;
         self.loading = true;
@@ -3072,7 +3312,7 @@ impl Render for VideoViewer {
         // 按显示尺寸自适应解码封顶：画面已上屏且窗口尺寸落进新的 256px「桶」时，只
         // 重开视频解码器（restart_audio=false 不打断音频/进度），把 sws 输出与逐帧
         // 上传切成显示所需像素数（省 decode/swscale/纹理上传，播放 CPU 大头之一）。
-        if self.frame.is_some()
+        if self.has_frame()
             && !self.loading
             && self.pending_seek.is_none()
             && vw > 0.0
@@ -3091,10 +3331,45 @@ impl Render for VideoViewer {
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
             Self::placeholder(&format!("无法打开视频：{err}"), muted, cx)
         } else {
-            match (self.frame.clone(), self.intrinsic) {
-                // 上屏帧恒为 BGRA（`RenderImage`）：硬解 reader 的帧在解码线程内核已回读+sws
-                // 转 BGRA，与软解逐字同构；旧 M2e `paint_external_yuv` 直通管线已废除。
-                (Some(render), Some((iw, ih))) => {
+            match (self.gpu_frame.as_ref(), self.frame.clone(), self.intrinsic) {
+                // 双设备 GPU 直通帧：canvas paint 里调 `paint_external_yuv`（外部共享 NV12
+                // 纹理直接走 vendored YUV→BGRA 管线，CPU 零回读/零 sws）。bounds 取与软图
+                // 同款 contain×缩放×平移后的像素框。
+                (Some(g), _, Some((iw, ih))) => {
+                    let (dw, dh) = Self::contain_fit(iw, ih, vw, area_h);
+                    let (dw, dh) = (dw * self.zoom, dh * self.zoom);
+                    self.pan = Self::clamp_pan(self.pan, vw, area_h, dw, dh);
+                    let (ox, oy) = ((vw - dw) * 0.5 + self.pan.0, (area_h - dh) * 0.5 + self.pan.1);
+                    vrect = (ox, oy, dw, dh);
+                    let handle = g.shared_handle;
+                    let tex_size = gpui::Size {
+                        width: px(iw.max(1.0)),
+                        height: px(ih.max(1.0)),
+                    };
+                    gpui::canvas(
+                        move |_, _, _| (),
+                        move |bounds, (), window, _cx| {
+                            // 测试探针：paint_external_yuv 真的收到本帧共享句柄
+                            //（production 为 no-op）
+                            crate::hw::record_hw_paint(handle);
+                            window.paint_external_yuv(
+                                bounds,
+                                gpui::Corners::default(),
+                                handle,
+                                tex_size,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .left(px(ox))
+                    .top(px(oy))
+                    .w(px(dw))
+                    .h(px(dh))
+                    .into_any_element()
+                }
+                // 软 BGRA 帧（`RenderImage`）：硬解 reader 的帧在解码线程内核已回读+sws
+                // 转 BGRA，与软解逐字同构。
+                (_, Some(render), Some((iw, ih))) => {
                     // 手动 contain 适配 × 缩放（绝对定位 + 显式像素框，**不用 100% 尺寸**）：
                     // 竖屏/横屏都等比缩放居中，不会因 flex 子级百分比高度失效而按固有
                     // 尺寸放大只露局部（对齐 ImageViewer 的 display_size 姿势）。放大超出
@@ -3115,10 +3390,10 @@ impl Render for VideoViewer {
                         .h(px(dh))
                         .into_any_element()
                 }
-                (_, _) if self.playing || self.loading => {
+                (_, _, _) if self.playing || self.loading => {
                     Self::placeholder("正在打开视频…", muted, cx)
                 }
-                (_, _) => Self::placeholder("暂停", muted, cx),
+                (_, _, _) => Self::placeholder("暂停", muted, cx),
             }
         };
 
@@ -3198,7 +3473,7 @@ impl Render for VideoViewer {
         // 暂停标志（右上角）：仅放大 ❚❚ 双竖条图标，无圆底/边框/投影；暂停/停在结尾时
         // 显示。以**视频实际矩形** `vrect` 为基准（右上角内 32px），不随窗口/画布走；纯视觉
         // 无交互（不遮双击全屏）；仅在有画面且非播放、未出错时挂出。
-        let badge_shown = Self::paused_badge_shown(self.playing, self.frame.is_some(), self.load_error.is_some());
+        let badge_shown = Self::paused_badge_shown(self.playing, self.has_frame(), self.load_error.is_some());
         if badge_shown {
             let badge_left = (vrect.0 + vrect.2 - 80.0).max(4.0);
             let badge_top = (vrect.1 + 30.0).max(4.0);
@@ -3323,6 +3598,7 @@ mod tests {
             path,
             focus_handle: cx.focus_handle(),
             frame: None,
+            gpu_frame: None,
             #[cfg(test)]
             dropped_frame: None,
             #[cfg(test)]
@@ -3360,6 +3636,7 @@ mod tests {
             // 据此匹配共享槽并聚合打印；普通运行恒 0/新值）。
             diag_session: 0,
             decode_cmd: None,
+            release_cmd: None,
             audio_cmd: None,
             audio_ready: Arc::new(AtomicBool::new(false)),
             audio_anchor_pending: true,
@@ -4320,6 +4597,211 @@ mod tests {
         eprintln!(
             "[HW skiptobgra] target={target:.2}s firstpts={pts0:.2}s skipped={skipped} {w}x{h} 续读pts={:.2}s",
             next.0
+        );
+        cx.run_until_parked();
+    }
+
+    /// 双设备 GPU 直通主回归（纯代码、不开 GUI，真实 D3D11 设备 + 真硬解 + 真墙钟）：
+    /// 显式开启直通（[`DualPathGuard`]）→ auto 模式 worker 打开 `target\视频测试.mp4`
+    /// 应进入双设备（`dual_engaged`）→ 等首 GPU 帧上屏 → **槽池循环复用**：步进 30 帧
+    ///（0.5s/步，远超共享槽池上限 8）断言 pts 单调、`gpu_frame` 持续在屏（若槽池不回收而
+    /// 耗尽会触发「池耗尽」错误 → 误回退 SAFE BGRA —— 本测为「pool recycling over ~30 frames
+    /// no pool exceeded」的实证）→ 开测试窗口强制 draw：canvas paint 回调里
+    /// `paint_external_yuv` 收到当前共享句柄（`take_hw_paint_probe` 断言非 0 且等于在屏帧）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn gpu_passthrough_first_frame_paints_shared_handle(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _dual = DualPathGuard::new();
+        let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（直通优先）
+        let _fault_bl = FaultAndBlGuard; // 黑名单/注入都不带进本测
+        dual_engaged_reset();
+        hw_engaged_reset();
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        // 等首 GPU 帧上屏 + 时长已知 + seek 落地（真解码异步）
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.has_frame() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待双设备首帧上屏超时");
+        }
+        if !dual_engaged() {
+            // 本机无 D3D11VA h264 硬解 / 解码器不支持外部设备注入 / 语义级不支持 → 直通必然
+            // 未接管；SKIP（直通不可测时 SAFE 回退路径由 `gpu_passthrough_fallback_to_safe` 兜底）
+            eprintln!("SKIP: 本机无法双设备直通（无 D3D11VA h264 硬解或外部注入不支持），回退 SAFE 路径");
+            return;
+        }
+        assert!(
+            !cx.update(|app| viewer.read(app).load_error.is_some()),
+            "双设备首帧期不应报告加载错误"
+        );
+        // 槽池循环复用：步进 30 帧（0.5s/步）→ 每次主线程装新帧归还旧槽 → worker reap 复用；
+        // 断言 pts 单调 + 不落回 SAFE（`dual_engaged` 不被回退覆盖）+ `gpu_frame` 持续在屏。
+        let mut last_pts = -1.0f64;
+        let mut gpu_seen = false;
+        let mut advanced = 0u32;
+        for _ in 0..30 {
+            viewer.update(cx, |v, cx| {
+                v.playhead += 0.5;
+                let _ = v.tick(cx);
+            });
+            // 让真解码线程有空逐帧出帧（fake 时钟只推进调度，worker 是真实线程）
+            cx.background_executor.timer(Duration::from_millis(8)).await;
+            let (pts, gpu) = cx.update(|app| {
+                let v = viewer.read(app);
+                (v.last_frame_pts.unwrap_or(last_pts), v.gpu_frame.is_some())
+            });
+            gpu_seen |= gpu;
+            assert!(
+                pts >= last_pts - 1e-6,
+                "GPU 直通帧 pts 应单调: {pts:.2} < {last_pts:.2}"
+            );
+            last_pts = pts;
+            advanced += 1;
+        }
+        assert!(
+            gpu_seen && dual_engaged(),
+            "步进期间 GPU 帧应持续上屏且直通未被回退（槽池循环复用无 'pool exceeded'），gpu_seen={gpu_seen}"
+        );
+        let current_handle = cx
+            .update(|app| viewer.read(app).gpu_frame.as_ref().map(|f| f.shared_handle))
+            .expect("GPU 帧仍在屏，应有共享句柄");
+        // 开测试窗口承载同一 viewer 并强制 draw：canvas paint 回调调 paint_external_yuv 写探针
+        struct ViewerHost {
+            viewer: gpui::Entity<VideoViewer>,
+        }
+        impl gpui::Render for ViewerHost {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                self.viewer.clone()
+            }
+        }
+        let (_host, vcx) = cx.add_window_view(|_window, _cx| ViewerHost {
+            viewer: viewer.clone(),
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let probe_handle = crate::hw::take_hw_paint_probe();
+        assert_ne!(
+            probe_handle, 0,
+            "paint_external_yuv 应在 canvas paint 里被调用（探针记录 shared_handle）"
+        );
+        assert_eq!(
+            probe_handle, current_handle,
+            "外部 YUV 精灵应使用当前 GPU 上屏共享句柄（probe={probe_handle:#x} vs 当前 {current_handle:#x}）"
+        );
+        eprintln!(
+            "[GPU passthrough] 探针 shared_handle={probe_handle:#x} 步进 {advanced} 帧 pts 至 {last_pts:.2}s（槽池循环复用，无 pool exceeded）"
+        );
+        cx.run_until_parked();
+    }
+
+    /// 双设备回退回归：**不开启**直通（= [`DualPathGuard`] 缺省关）＝双设备「建设备/open_hw 失败」
+    /// 的毒化钩子（`dual_path_allowed` 返回 false 即等价于直通任何一步失败）——worker 必须回落
+    /// SAFE BGRA 路径（auto → `open_scaled_hw` → 内核软回退）：画面照常 BGRA（`RenderImage`）
+    /// 上屏、pts 单调、**GPU paint 探针恒 0**（canvas 走 img 不调 paint_external_yuv）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn gpu_passthrough_fallback_to_safe(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto；直通被默认关 = 毒化
+        let _fault_bl = FaultAndBlGuard;
+        dual_engaged_reset();
+        hw_engaged_reset();
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        // 等首帧上屏：BGRA（`frame` 有、`gpu_frame` 恒 None）+ 时长已知 + seek 落地
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && !v.gpu_frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待 SAFE 回退首帧上屏超时");
+        }
+        assert!(!dual_engaged(), "直通被毒化（未开启）时不应进入双设备");
+        // 回退路径播放正常：步进 10 帧断言 BGRA 帧持续上屏、pts 单调
+        let mut last_pts = -1.0f64;
+        for _ in 0..10 {
+            viewer.update(cx, |v, cx| {
+                v.playhead += 0.5;
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(8)).await;
+            let (pts, gpu) = cx.update(|app| {
+                let v = viewer.read(app);
+                (v.last_frame_pts.unwrap_or(last_pts), v.gpu_frame.is_some())
+            });
+            assert!(!gpu, "回退路径不应有 GPU 帧上屏");
+            assert!(
+                pts >= last_pts - 1e-6,
+                "SAFE 回退帧 pts 应单调: {pts:.2} < {last_pts:.2}"
+            );
+            last_pts = pts;
+        }
+        // 强制 draw：BGRA 走 img（无 canvas paint_external_yuv）→ 探针恒 0
+        struct ViewerHost {
+            viewer: gpui::Entity<VideoViewer>,
+        }
+        impl gpui::Render for ViewerHost {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                self.viewer.clone()
+            }
+        }
+        let (_host, vcx) = cx.add_window_view(|_window, _cx| ViewerHost {
+            viewer: viewer.clone(),
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let probe_handle = crate::hw::take_hw_paint_probe();
+        assert_eq!(
+            probe_handle, 0,
+            "SAFE 回退路径不应触发 GPU paint 探针（probe={probe_handle:#x}）"
+        );
+        eprintln!(
+            "[GPU fallback] 直通被毒化时 worker 回落 SAFE BGRA（frame 上屏、gpu_frame=None、无 paint 探针），pts 至 {last_pts:.2}s"
         );
         cx.run_until_parked();
     }

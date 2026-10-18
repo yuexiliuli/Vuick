@@ -5171,18 +5171,17 @@ impl Window {
         });
     }
 
-    /// 把一个「外部 NV12 D3D11 纹理」作为一帧绘制进场景（零 CPU 回读 GPU 直通）。
+    /// 把一个「外部共享 NV12 D3D11 纹理」作为一帧绘制进场景（零 CPU 回读 GPU 直通，双设备）。
     ///
-    /// `tex` 是外部解码器持有的 `ID3D11Texture2D*` 裸指针（必须与主渲染同一 D3D11
-    /// 设备，见 `gpui_windows::d3d11_device_context`），`array_index` 是纹理数组里的
-    /// 帧下标，`texture_size` 是纹理的完整像素尺寸；YUV→BGRA 由 `external_yuv`
-    /// 像素着色器在 GPU 上完成。
+    /// `shared_handle` 是解码 worker 在其自有 D3D11 设备上创建的共享 NV12 纹理的 DXGI
+    /// 共享句柄（usize 携带；由解码器经 shared handle + keyed mutex 跨设备移动，见
+    /// `gpui_windows::directx_renderer` 的 `external_views`），`texture_size` 是纹理的完整
+    /// 像素尺寸；YUV→BGRA 由 `external_yuv` 像素着色器在 GPU 上完成。
     pub fn paint_external_yuv(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
-        tex: usize,
-        array_index: u32,
+        shared_handle: usize,
         texture_size: Size<Pixels>,
     ) {
         self.invalidator.debug_assert_paint();
@@ -5199,8 +5198,7 @@ impl Window {
             bounds: self.snap_bounds(bounds),
             content_mask,
             corner_radii,
-            tex,
-            array_index,
+            shared_handle,
             texture_size: texture_size.scale(self.scale_factor()),
         });
     }

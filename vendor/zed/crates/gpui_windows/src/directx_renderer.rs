@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HANDLE, HWND},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -23,6 +23,10 @@ use windows::{
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
 use gpui::*;
+
+/// 外部共享纹理键控互斥的 AcquireSync 超时（ms）：渲染端正常每帧末 ReleaseSync，这里基本
+/// 零等待；用有限超时防「worker 已 (re)write、渲染端崩了未释放」时本帧绘制无限等待。
+const EXTERNAL_ACQUIRE_TIMEOUT_MS: u32 = 2_000;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -44,9 +48,13 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
-    /// 外部 NV12 纹理 `(裸指针, array_index)` → 两个平面 SRV（Y@t0、UV@t2）的缓存，
-    /// 设备丢失重建时整表清空（旧 SRV 已随旧设备失效）。
-    external_textures: HashMap<(usize, u32), [Option<ID3D11ShaderResourceView>; 2]>,
+    /// 外部共享 NV12 纹理（按 worker 传入的 DXGI 共享句柄）→ 本渲染设备上打开的纹理 +
+    /// 键控互斥 + 两个平面 SRV（Y@t0、UV@t2）的缓存；设备丢失重建时整表清空（旧句柄已随
+    /// 旧设备失效）。
+    external_textures: HashMap<usize, ExternalYuvTexture>,
+    /// 本帧已 `AcquireSync` 的共享句柄（ExternalYuv 批次绘制前逐句柄获取一次，帧末统一
+    /// `ReleaseSync`——键控互斥不配对会死锁，见模块头）。
+    external_acquired: Vec<usize>,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -58,6 +66,18 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+}
+
+/// 一个外部共享 NV12 纹理在本渲染设备上的打开态：`tex`（OpenSharedResource 获得、本设备
+/// 独立的引用）、`mutex`（同对象 QI 出的键控互斥；每帧 AcquireSync/ReleaseSync 配对）与
+/// 两平面 SRV 缓存。生命周期随 `external_textures` 表（设备丢失重建时整表 Drop）。
+struct ExternalYuvTexture {
+    /// 打开的纹理引用（OpenSharedResource 获得、本设备独立持有）。字段本身不读——RAII
+    /// 保活：其 SRV 基于此纹理创建，纹理必须先于视图释放；随表项 Drop 统一释放。
+    #[allow(dead_code)]
+    tex: ID3D11Texture2D,
+    mutex: Option<IDXGIKeyedMutex>,
+    views: [Option<ID3D11ShaderResourceView>; 2],
 }
 
 /// Direct3D objects
@@ -195,6 +215,7 @@ impl DirectXRenderer {
             globals,
             pipelines,
             external_textures: HashMap::new(),
+            external_acquired: Vec::new(),
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -267,8 +288,10 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        // 外部纹理 SRV 由旧设备创建，随旧设备一并失效，先整表清空
+        // 外部纹理 SRV/打开态由旧设备创建，随旧设备一并失效，先整表清空（含键控互斥——
+        // 未配对的 acquired 一并弃（ReleaseSync 在死设备上是 no-op/无害））
         self.external_textures.clear();
+        self.external_acquired.clear();
         let disable_direct_composition = self.direct_composition.is_none();
 
         unsafe {
@@ -346,6 +369,8 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.render(scene, background_appearance)?;
+        // 帧末统一 ReleaseSync 本帧已获取的外部键控互斥（与 draw_external_yuv 的获取配对）
+        self.release_external_yuv();
         self.present()
     }
 
@@ -434,6 +459,8 @@ impl DirectXRenderer {
             "render_to_image unavailable while recovering from a lost device"
         );
         self.render(scene, background_appearance)?;
+        // 帧末统一 ReleaseSync（render_to_image 也走完整 render——与 draw 同一批次语义）
+        self.release_external_yuv();
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let device = &devices.device;
@@ -852,8 +879,8 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// 绘制一批外部 NV12 精灵。当前约定一次只绘制一个视频纹理（解码器每帧同一块
-    /// NV12 纹理 + 单一下标）；不同纹理/下标应由 scene 的 batch 拆分保证。
+    /// 绘制一批外部共享 NV12 精灵。当前约定一次只绘制一个视频纹理（worker 每帧同一块
+    /// 共享纹理 + 单一共享句柄）；不同句柄应由 scene 的 batch 拆分保证。
     fn draw_external_yuv(&mut self, sprites: &[ExternalYuvSprite]) -> Result<()> {
         if sprites.is_empty() {
             return Ok(());
@@ -863,16 +890,35 @@ impl DirectXRenderer {
         };
         debug_assert!(sprites
             .iter()
-            .all(|sprite| sprite.tex == first.tex && sprite.array_index == first.array_index));
-        let views = self.external_views(first.tex, first.array_index);
-        if views[0].is_none() || views[1].is_none() {
-            // 纹理/设备暂不可用（如设备丢失未重建），跳过本批
+            .all(|sprite| sprite.shared_handle == first.shared_handle));
+        // 首次见到的句柄先在渲染设备上打开并缓存（需要 &mut 插入表）
+        if !self.external_textures.contains_key(&first.shared_handle) {
+            self.open_external_texture(first.shared_handle);
+        }
+        // 之后只用共享借用（与 pipelines/devices/globals 各字段互不冲突）
+        let Some(texture) = self.external_textures.get(&first.shared_handle) else {
             return Ok(());
+        };
+        if texture.views[0].is_none() || texture.views[1].is_none() {
+            // 纹理/设备暂不可用（如设备丢失未重建/打开共享句柄失败），跳过本批
+            return Ok(());
+        }
+        // 键控互斥：同一句柄本帧只 AcquireSync 一次（多批次连续绘制共享同一纹理时不重复、
+        // 不提前 Release）；AcquireSync 失败（设备丢失等）→ 跳过本批绘制（帧缺失可接受，
+        // 帧末 release 集合里也没有它）。
+        if !self.external_acquired.contains(&first.shared_handle) {
+            if let Some(mutex) = &texture.mutex
+                && unsafe { mutex.AcquireSync(0, EXTERNAL_ACQUIRE_TIMEOUT_MS) }.is_ok()
+            {
+                self.external_acquired.push(first.shared_handle);
+            } else {
+                return Ok(());
+            }
         }
         let devices = self.devices.as_ref().context("devices missing")?;
         self.pipelines.yuv_sprites.draw_range_with_external_yuv(
             &devices.device_context,
-            &views,
+            &texture.views,
             self.globals
                 .batch_params_buffer
                 .as_ref()
@@ -883,26 +929,49 @@ impl DirectXRenderer {
         )
     }
 
-    /// 取（或构造并缓存）外部 NV12 纹理的两个平面 SRV：`[Y(R8), UV(R8G8)]`。
-    /// 从裸指针重建临时纹理包装用于创建 SRV，随后 forget 以免把解码器持有的
-    /// 纹理引用计数多扣一次。
-    fn external_views(
-        &mut self,
-        tex: usize,
-        array_index: u32,
-    ) -> [Option<ID3D11ShaderResourceView>; 2] {
-        if let Some(views) = self.external_textures.get(&(tex, array_index)) {
-            return views.clone();
-        }
+    /// 在**本渲染设备**上打开一个外部共享句柄并缓存其两平面 SRV（Y@t0、UV@t2）。
+    /// 首次见到的句柄：`OpenSharedResource` 打开（获得独立引用——worker 自有设备的纹理经
+    /// 共享句柄跨设备移动，不做共享上下文/裸指针借用），QI 键控互斥并按单切片
+    ///（array_index=0）建两平面 SRV（与 M2e 非数组 NV12 路径同款 `CreateShaderResourceView1`
+    /// PlaneSlice 语义）。打开/建视图失败 → 不插入（上层按「不可用跳过本批」处理）。
+    fn open_external_texture(&mut self, shared_handle: usize) {
         let Some(devices) = &self.devices else {
-            return [None, None];
+            return;
         };
-        let texture = unsafe { ID3D11Texture2D::from_raw(tex as *mut core::ffi::c_void) };
-        let views =
-            create_external_yuv_views(&devices.device, &texture, array_index).unwrap_or([None, None]);
-        std::mem::forget(texture);
-        self.external_textures.insert((tex, array_index), views.clone());
-        views
+        let device = &devices.device;
+        let mut opened: Option<ID3D11Texture2D> = None;
+        let hr = unsafe {
+            device.OpenSharedResource(HANDLE(shared_handle as *mut core::ffi::c_void), &mut opened)
+        };
+        if hr.is_err() || opened.is_none() {
+            return;
+        }
+        let tex = opened.expect("OpenSharedResource 成功必有纹理");
+        let mutex = tex.cast::<IDXGIKeyedMutex>().ok();
+        let views = create_external_yuv_views(device, &tex, 0).unwrap_or([None, None]);
+        self.external_textures
+            .insert(shared_handle, ExternalYuvTexture { tex, mutex, views });
+    }
+
+    /// 帧末统一释放本帧已 `AcquireSync` 的键控互斥（与 `draw_external_yuv` 的获取配对；
+    /// 不配对会卡死 worker 侧下一次对该槽的 acquire，见 K22 跨线程 GPU 纪律），并**逐帧
+    /// 驱逐未被本帧绘制的缓存句柄**：换文件/切解码尺寸后 worker 已销毁的旧共享纹理，若其
+    /// 打开引用仍滞留在缓存里会被渲染侧保活、跨代存活（长期泄漏源）；只保留本帧实际绘制
+    /// 过的句柄（≤1-2），下一帧起旧句柄自然驱逐。
+    fn release_external_yuv(&mut self) {
+        let acquired = std::mem::take(&mut self.external_acquired);
+        for handle in &acquired {
+            if let Some(texture) = self.external_textures.get(handle)
+                && let Some(mutex) = &texture.mutex
+            {
+                unsafe {
+                    let _ = mutex.ReleaseSync(0);
+                }
+            }
+        }
+        let kept: std::collections::HashSet<usize> = acquired.into_iter().collect();
+        self.external_textures
+            .retain(|handle, _| kept.contains(handle));
     }
 
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
@@ -2410,6 +2479,81 @@ mod tests {
         assert!(y_view.is_some() && uv_view.is_some(), "两平面 SRV 都应创建成功");
     }
 
+    /// 双设备路径的平面 SRV 实证：worker 设备（A）创建**共享** NV12（ArraySize=1、
+    /// SHARED+SHARED_KEYEDMUTEX）→ 取 DXGI 共享句柄 → 渲染设备（B，新 D3D11 设备）
+    /// `OpenSharedResource` 打开 → 在 B 上 `create_external_yuv_views` 建两平面 SRV。
+    /// 证明渲染侧可按「共享句柄 → 打开纹理 → 平面 SRV」的直接路径工作（双设备零回读）。
+    #[test]
+    fn test_external_yuv_plane_srvs_via_open_shared_handle() {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG;
+        use windows::Win32::Graphics::Dxgi::IDXGIResource;
+
+        let Some((device_a, _ctx_a)) = create_test_device() else {
+            return;
+        };
+        let Some((device_b, _ctx_b)) = create_test_device() else {
+            return;
+        };
+        // 设备 A 上建共享 NV12（单数组切片）。先探测本机适配器支持的标记组合——共享平面
+        // 格式视频纹理的跨设备支持因驱动而异（实测本机 0x100=KEYEDMUTEX 单独可用，
+        // 叠加 0x2=SHARED 反而 E_INVALIDARG），逐一尝试直到成功。
+        let combos = [
+            D3D11_RESOURCE_MISC_FLAG(0x100),
+            D3D11_RESOURCE_MISC_FLAG(0x100) | D3D11_RESOURCE_MISC_FLAG(0x2),
+            D3D11_RESOURCE_MISC_FLAG(0x100) | D3D11_RESOURCE_MISC_FLAG(0x8000),
+            D3D11_RESOURCE_MISC_FLAG(0x100) | D3D11_RESOURCE_MISC_FLAG(0x2)
+                | D3D11_RESOURCE_MISC_FLAG(0x8000),
+            D3D11_RESOURCE_MISC_FLAG(0x2),
+        ];
+        let mut shared: Option<ID3D11Texture2D> = None;
+        let mut chosen = None;
+        for &misc in &combos {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: 640,
+                Height: 360,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: misc.0 as u32,
+            };
+            unsafe {
+                let _ = device_a.CreateTexture2D(&desc, None, Some(&mut shared));
+            }
+            if let Some(t) = shared.take() {
+                chosen = Some((misc.0, t));
+                break;
+            }
+        }
+        let (chosen_misc, shared) = chosen.expect("本机应至少支持一种共享 NV12 组合");
+        eprintln!("[probe] 可用共享标记组合 misc={chosen_misc:#x}");
+        let dxgi: IDXGIResource = shared.cast().expect("共享纹理应可 QI IDXGIResource");
+        let handle = unsafe { dxgi.GetSharedHandle() }.expect("取共享句柄失败").0 as usize;
+
+        // 设备 B：OpenSharedResource 打开 → 建两平面 SRV（array_index=0 单切片）
+        let mut opened: Option<ID3D11Texture2D> = None;
+        unsafe {
+            device_b
+                .OpenSharedResource(
+                    HANDLE(handle as *mut core::ffi::c_void),
+                    &mut opened,
+                )
+                .expect("设备 B 打开共享句柄失败（驱动应支持跨设备共享 NV12）");
+        }
+        let opened = opened.expect("OpenSharedResource 成功必有纹理");
+        let Some([y_view, uv_view]) = super::create_external_yuv_views(&device_b, &opened, 0) else {
+            panic!("渲染设备上经 OpenSharedResource 的平面 SRV 创建失败（双设备路径不可用）");
+        };
+        assert!(y_view.is_some() && uv_view.is_some(), "两平面 SRV 都应创建成功");
+    }
+
     /// 静态编译验证 `external_yuv_*` HLSL 入口（与 debug 运行时 / release fxc 同源的
     /// D3DCompileFromFile 前端），无 GUI 也能兜住着色器语法错误（含 GetDimensions、
     /// BT.709 换算与中文注释编码）。
@@ -2469,10 +2613,10 @@ mod tests {
         // BatchIterator 对「同 kind 相邻」图元合批（无其它 kind 插队时跨 order 也合），
         // 故整体 1 批，但 finish() 必须先按 order 排序（0 在最前）。
         let mut scene = Scene::default();
-        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234, 1));
-        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234, 1));
-        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234, 1));
-        scene.external_yuv_sprites.push(make_yuv_sprite(0, 0x5678, 0));
+        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234));
+        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234));
+        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234));
+        scene.external_yuv_sprites.push(make_yuv_sprite(0, 0x5678));
         scene.finish();
 
         assert_eq!(scene.external_yuv_sprites[0].order, 0);
@@ -2490,8 +2634,8 @@ mod tests {
 
         // 场景 B：order 0/2 外部 YUV + 中间 order 1 的 Quad → 切成 3 批且按 z 序
         let mut scene = Scene::default();
-        scene.external_yuv_sprites.push(make_yuv_sprite(2, 0x1234, 1));
-        scene.external_yuv_sprites.push(make_yuv_sprite(0, 0x1234, 1));
+        scene.external_yuv_sprites.push(make_yuv_sprite(2, 0x1234));
+        scene.external_yuv_sprites.push(make_yuv_sprite(0, 0x1234));
         scene.quads.push(Quad {
             order: 1,
             ..Default::default()
@@ -2510,17 +2654,16 @@ mod tests {
         // 另验证 insert_primitive 的 From 转换路径可接受 ExternalYuvSprite（order 由
         // BoundsTree 覆盖，BoundsTree::insert 首插返回 1，故这里只校验入队与字段透传）
         let mut scene3 = Scene::default();
-        scene3.insert_primitive(make_yuv_sprite(99, 0x999, 2));
+        scene3.insert_primitive(make_yuv_sprite(99, 0x999));
         assert_eq!(scene3.external_yuv_sprites.len(), 1);
-        assert_eq!(scene3.external_yuv_sprites[0].tex, 0x999);
-        assert_eq!(scene3.external_yuv_sprites[0].array_index, 2);
+        assert_eq!(scene3.external_yuv_sprites[0].shared_handle, 0x999);
         scene3.finish();
         let batches: Vec<PrimitiveBatch> = scene3.batches().collect();
         assert_eq!(batches.len(), 1);
         assert!(matches!(&batches[0], PrimitiveBatch::ExternalYuv(_)));
     }
 
-    fn make_yuv_sprite(order: u32, tex: usize, array_index: u32) -> ExternalYuvSprite {
+    fn make_yuv_sprite(order: u32, shared_handle: usize) -> ExternalYuvSprite {
         ExternalYuvSprite {
             order,
             bounds: Bounds::new(
@@ -2535,8 +2678,7 @@ mod tests {
             },
             corner_radii: Corners::default(),
             opacity: 1.0,
-            tex,
-            array_index,
+            shared_handle,
             texture_size: Size {
                 width: ScaledPixels(640.0),
                 height: ScaledPixels(360.0),

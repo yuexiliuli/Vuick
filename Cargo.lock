@@ -6503,6 +6503,7 @@ dependencies = [
  "libloading",
  "ui",
  "viewer",
+ "windows 0.62.2",
 ]
 
 [[package]]

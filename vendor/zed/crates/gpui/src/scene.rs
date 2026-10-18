@@ -814,9 +814,11 @@ impl From<PaintSurface> for Primitive {
     }
 }
 
-/// 一个引用**外部 D3D11 NV12 纹理**的精灵：纹理与主渲染属于同一 D3D11 设备，
-/// 由视频解码器（D3D11VA）持有，`tex` 为 `ID3D11Texture2D*` 裸指针，CPU 端零
-/// 回读，YUV→BGRA 由 `external_yuv` 像素着色器在 GPU 上完成。
+/// 一个引用**外部共享 NV12 纹理**的精灵：纹理由解码 worker 在其自有 D3D11 设备上创建，
+/// 经 **shared handle + keyed mutex**（`D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`）跨设备
+/// 移动到主渲染设备（gpui_windows 的 `external_views` 负责 `OpenSharedResource` + 平面 SRV），
+/// `shared_handle` 为 DXGI 共享句柄（usize 携带，避免跨 FFI 边界），CPU 端零回读，
+/// YUV→BGRA 由 `external_yuv` 像素着色器在 GPU 上完成。
 #[derive(Clone, Debug)]
 #[expect(missing_docs)]
 pub struct ExternalYuvSprite {
@@ -825,10 +827,8 @@ pub struct ExternalYuvSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub opacity: f32,
-    /// 外部 `ID3D11Texture2D*` 裸指针（以 usize 携带，避免跨 FFI 边界）。
-    pub tex: usize,
-    /// 纹理数组下标（解码器多帧环形缓冲里的帧下标/槽位）。
-    pub array_index: u32,
+    /// DXGI 共享句柄（usize 携带；渲染端据此在**渲染设备**上打开纹理并建平面 SRV）。
+    pub shared_handle: usize,
     /// 纹理的完整尺寸（宽×高）。目前仅作 CPU 侧记录（渲染器绘制时 GPU 端改从
     /// SRV 的 `GetDimensions` 取平面尺寸），保留以备将来 CPU 侧换算/调试用。
     pub texture_size: Size<ScaledPixels>,
