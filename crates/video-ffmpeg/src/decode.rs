@@ -2436,20 +2436,27 @@ impl SubtitleReader {
         }
     }
     
-    /// 获取当前时间应显示的字幕。
-    ///
-    /// 线性扫描（窗口可重叠、含端点，与 `vff_subtitle_at` 同口径）。显示路径已被
-    /// `video::subtitle::find_active_subtitle` 取代（dormancy）——本方法仅供本 crate
-    /// 单测对拍（生产 FFI `vff_subtitle_at` 保留符号、同款 dormancy 注释，见 lib.rs）。
-    #[allow(dead_code)] // 仅单测对拍用（dormancy：显示已走 find_active_subtitle）
-    pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
-        for entry in &self.subtitles {
-            if seconds >= entry.start_pts && seconds <= entry.end_pts {
-                return Some(entry);
-            }
-        }
-        None
+    /// 当前时间应显示的字幕下标——`subtitles` 按 `start_pts` 升序（open 已 sort）：
+    /// 二分定位最后一个 `start_pts ≤ seconds`，从该处**往前回扫**找命中。重叠窗口
+    /// （同一时间多条活跃）取「最近开始」那条，与 `video` crate 生产路径
+    /// `subtitle::find_active_subtitle` **同口径**（显示最新对白）。dormancy：显示已走
+    /// `find_active_subtitle`；本方法供保留导出的 FFI `vff_subtitle_at` 与本 crate 单测
+    /// 对拍，保持与生产一致以消除三份实现的口径漂移。
+    pub fn active_subtitle_index(&self, seconds: f64) -> Option<usize> {
+        active_subtitle_index(&self.subtitles, seconds)
     }
+
+    /// 当前时间应显示的字幕（同 [`Self::active_subtitle_index`] 语义）。
+    #[allow(dead_code)] // 仅供本 crate 单测对拍（显示已走 find_active_subtitle）
+    pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
+        self.active_subtitle_index(seconds).map(|i| &self.subtitles[i])
+    }
+}
+
+/// 与 [`SubtitleReader::active_subtitle_index`] 同语义的纯函数（独立于 reader 构造，可直测）。
+pub(crate) fn active_subtitle_index(subtitles: &[SubtitleEntry], seconds: f64) -> Option<usize> {
+    let i = subtitles.partition_point(|s| s.start_pts <= seconds);
+    subtitles[..i].iter().rposition(|s| seconds <= s.end_pts)
 }
 
 #[cfg(test)]
@@ -2501,6 +2508,36 @@ mod subtitle_tests {
             r.subtitle_at(20.5).is_some(),
             "20.5s 应命中活动字幕（首条 [20.05, 22.03]）"
         );
+    }
+
+    /// 对拍（评审 SUGGESTION-5 修复）：重叠窗口（同一秒多条活跃）取「最近开始」——与
+    /// `video` crate 生产 `find_active_subtitle` 同口径（旧线性首命中 = 最早开始，不一致）。
+    /// 锁死该语义 + 纯函数与 reader 读口（`subtitle_at` 委托同一实现）不漂移。
+    #[test]
+    fn active_subtitle_index_prefers_latest_start_match() {
+        let subs = vec![
+            SubtitleEntry { start_pts: 0.0, end_pts: 4.0, text: "early".into() },
+            SubtitleEntry {
+                start_pts: 2.0,
+                end_pts: 5.0,
+                text: "late".into(),
+            },
+            SubtitleEntry {
+                start_pts: 6.0,
+                end_pts: 7.0,
+                text: "after".into(),
+            },
+        ];
+        assert_eq!(
+            active_subtitle_index(&subs, 3.0),
+            Some(1),
+            "重叠时刻 3.0：应取「最近开始」的 late(2.0)，而非 early(0.0)"
+        );
+        assert_eq!(active_subtitle_index(&subs, 0.5), Some(0));
+        assert_eq!(active_subtitle_index(&subs, 6.5), Some(2));
+        assert_eq!(active_subtitle_index(&subs, 5.5), None, "[2,5] 与 [6,7] 之间无活跃");
+        assert_eq!(active_subtitle_index(&subs, 99.0), None);
+        assert_eq!(active_subtitle_index(&[], 1.0), None, "空清单");
     }
 
     /// 回归（K-锁）：字幕全文件扫描不得长期占全局 FFMPEG_LOCK 阻塞视频 seek。

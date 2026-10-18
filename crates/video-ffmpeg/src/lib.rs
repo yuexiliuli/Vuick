@@ -495,16 +495,13 @@ pub unsafe extern "C" fn vff_subtitle_get_text(
 /// **dormancy（dormant）**：显示路径已被视频端 `find_active_subtitle` 取代（crates/video
 /// 逐帧在 render 用预加载清单二分命中），本符号**不再被生产消费**——仅因主程序 FFI
 /// 加载器（`crates/video/src/decode.rs` 的 `load_bridge`）仍按 `vff_subtitle_at\0` 解析
-/// 符号而**保留导出**（缺符号会导致整桥加载失败 → 视频不可用）。保留按「窗口包含该秒」
-/// 扫描返回首个命中索引（与 `find_active_subtitle` 同口径：开区间逐条、含端点）。
+/// 符号而**保留导出**（缺符号会导致整桥加载失败 → 视频不可用）。语义与生产
+/// `find_active_subtitle` 同口径（重叠窗口取「最近开始」），经 `active_subtitle_index`
+/// 单一实现以消除三份拷贝的匹配口径漂移。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_subtitle_at(h: *mut c_void, seconds: f64) -> c_int {
     let r = reader::<SubtitleReader>(h);
-    match r
-        .subtitles()
-        .iter()
-        .position(|s| seconds >= s.start_pts && seconds <= s.end_pts)
-    {
+    match r.active_subtitle_index(seconds) {
         Some(i) => i as c_int,
         None => -1,
     }

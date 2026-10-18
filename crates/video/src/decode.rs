@@ -866,12 +866,13 @@ impl SubtitleReader {
     }
 }
 
-/// 仅测试构建存在：当前时间应显示的字幕（生产显示走 `crate::video::subtitle::find_active_subtitle`，
-/// 预加载清单二分命中；FFI `vff_subtitle_at` 因此 dormancy，见 video-ffmpeg/src/lib.rs）。
+/// 仅测试构建存在：当前时间应显示的字幕（生产显示走 `crate::subtitle::find_active_subtitle`；
+/// 本测试读口**直接委托它**——单一真值、重叠窗口"最近开始"口径不漂移；FFI
+/// `vff_subtitle_at` 在 video-ffmpeg 侧同款语义，见其 `active_subtitle_index`）。
 #[cfg(test)]
 impl SubtitleReader {
     pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
-        self.subtitles.iter().find(|s| seconds >= s.start_pts && seconds <= s.end_pts)
+        crate::subtitle::find_active_subtitle(&self.subtitles, seconds)
     }
 }
 
