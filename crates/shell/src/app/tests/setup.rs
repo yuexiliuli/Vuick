@@ -8,7 +8,8 @@
 
     /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
     fn init_test(cx: &mut TestAppContext) {
-        cx.update(crate::test_support::bind_local_keymaps);
+        // 复用生产键位组合（`test_support` 双份已删，见 lib.rs）。
+        cx.update(crate::bind_local_keymaps);
     }
 
     /// 测试辅助：取选项卡的 PDF 阅读器实体（`MediaReader` 收敛后经 `MediaReader::Pdf` 取）。

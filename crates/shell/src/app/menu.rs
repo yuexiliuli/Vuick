@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::actions::{Copy, Cut, Redo, SelectAll, Undo};
+use crate::commands::{
+    COPY, CUT, DECREASE_FONT, FOLLOW_THEME, INCREASE_FONT, NEW_FILE, OPEN_FILE, OPEN_FOLDER,
+    PASTE, PREVIEW, QUIT, REDO, RESET_FONT, SAVE, SAVE_AS, SELECT_ALL, THEME, TOGGLE_WRAP, UNDO,
+};
 use ui::button::{Button, ButtonVariants as _};
 use ui::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 
@@ -38,20 +42,25 @@ impl EditorApp {
         })
     }
 
-    /// "文件"菜单。
+    /// "文件"菜单。label / 快捷键来自公共命令表（`crate::commands` 单一真值）。
     fn file_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
-        menu.item(Self::menu_action_item("新建", "Ctrl+N", weak.clone(), |this, window, cx| {
-            this.new_tab(window, cx)
-        }))
+        menu.item(Self::menu_action_item(
+            NEW_FILE.menu_label,
+            NEW_FILE.shortcut,
+            weak.clone(),
+            |this, window, cx| {
+                this.new_tab(window, cx)
+            },
+        ))
         .item(Self::menu_action_item(
-            "打开文件…",
-            "Ctrl+O",
+            OPEN_FILE.menu_label,
+            OPEN_FILE.shortcut,
             weak.clone(),
             |this, window, cx| this.open_dialog(window, cx),
         ))
         .item(Self::menu_action_item(
-            "打开文件夹…",
-            "Ctrl+Shift+O",
+            OPEN_FOLDER.menu_label,
+            OPEN_FOLDER.shortcut,
             weak.clone(),
             |this, window, cx| this.open_folder_dialog(window, cx),
         ))
@@ -71,14 +80,14 @@ impl EditorApp {
             })
         })
         .item(Self::menu_action_item(
-            "保存",
-            "Ctrl+S",
+            SAVE.menu_label,
+            SAVE.shortcut,
             weak.clone(),
             |this, window, cx| this.save(window, cx),
         ))
         .item(Self::menu_action_item(
-            "另存为…",
-            "Shift+Ctrl+S",
+            SAVE_AS.menu_label,
+            SAVE_AS.shortcut,
             weak.clone(),
             |this, window, cx| this.save_as(window, cx),
         ))
@@ -86,8 +95,8 @@ impl EditorApp {
         .item(Self::session_restore_menu_item(weak.clone()))
         .separator()
         .item(Self::menu_action_item(
-            "退出",
-            "Ctrl+Q",
+            QUIT.menu_label,
+            QUIT.shortcut,
             weak,
             |_, _window, cx| cx.quit(),
         ))
@@ -96,8 +105,8 @@ impl EditorApp {
     /// "编辑"菜单。
     fn edit_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
         menu.item(Self::menu_action_item(
-            "撤销",
-            "Ctrl+Z",
+            UNDO.menu_label,
+            UNDO.shortcut,
             weak.clone(),
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
@@ -105,8 +114,8 @@ impl EditorApp {
             },
         ))
         .item(Self::menu_action_item(
-            "重做",
-            "Ctrl+Y",
+            REDO.menu_label,
+            REDO.shortcut,
             weak.clone(),
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
@@ -115,8 +124,8 @@ impl EditorApp {
         ))
         .separator()
         .item(Self::menu_action_item(
-            "剪切",
-            "Ctrl+X",
+            CUT.menu_label,
+            CUT.shortcut,
             weak.clone(),
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
@@ -124,8 +133,8 @@ impl EditorApp {
             },
         ))
         .item(Self::menu_action_item(
-            "复制",
-            "Ctrl+C",
+            COPY.menu_label,
+            COPY.shortcut,
             weak.clone(),
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
@@ -133,15 +142,15 @@ impl EditorApp {
             },
         ))
         .item(Self::menu_action_item(
-            "粘贴",
-            "Ctrl+V",
+            PASTE.menu_label,
+            PASTE.shortcut,
             weak.clone(),
             |this, window, cx| this.paste_normalized(window, cx),
         ))
         .separator()
         .item(Self::menu_action_item(
-            "全选",
-            "Ctrl+A",
+            SELECT_ALL.menu_label,
+            SELECT_ALL.shortcut,
             weak,
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
@@ -153,10 +162,10 @@ impl EditorApp {
     /// "查看"菜单。
     fn view_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
         menu.item(Self::menu_action_item(
-            "预览",
-            // P2-8：原 Ctrl+P = 预览切换已改开「打开文件快选」→ 提示清空，
-            // 预览切换现由标签栏眼睛按钮承担。
-            "",
+            PREVIEW.menu_label,
+            // 快捷键提示走命令表（空串 = 无提示）：P2-8 原 Ctrl+P = 预览切换已改开
+            // 「打开文件快选」→ 预览切换现由标签栏眼睛按钮承担。
+            PREVIEW.shortcut,
             weak.clone(),
             |this, window, cx| {
                 let idx = this.active_tab;
@@ -166,6 +175,7 @@ impl EditorApp {
         .item(Self::live_test_menu_item(weak.clone()))
         .separator()
         // P4-1：EPUB 章节翻转（WyEditor 只读宿主 / MarkdownPreview 回退通用）。
+        // 快捷键 Ctrl+[/Ctrl+] 仅为**菜单提示**（历史未实际绑定，本仓库不发其他键绑定）。
         .item(Self::menu_action_item(
             "上一章",
             "Ctrl+[",
@@ -186,20 +196,20 @@ impl EditorApp {
         ))
         .separator()
         .item(Self::menu_action_item(
-            "增大字号",
-            "Ctrl+=",
+            INCREASE_FONT.menu_label,
+            INCREASE_FONT.shortcut,
             weak.clone(),
             |this, _window, cx| this.change_font_size(1.0, cx),
         ))
         .item(Self::menu_action_item(
-            "减小字号",
-            "Ctrl+-",
+            DECREASE_FONT.menu_label,
+            DECREASE_FONT.shortcut,
             weak.clone(),
             |this, _window, cx| this.change_font_size(-1.0, cx),
         ))
         .item(Self::menu_action_item(
-            "重置字号",
-            "Ctrl+0",
+            RESET_FONT.menu_label,
+            RESET_FONT.shortcut,
             weak.clone(),
             |this, _window, cx| this.reset_font_size(cx),
         ))
@@ -207,14 +217,14 @@ impl EditorApp {
         .item(Self::wrap_menu_item(weak.clone()))
         .separator()
         .item(Self::menu_action_item(
-            "黑白切换",
-            "",
+            THEME.menu_label,
+            THEME.shortcut,
             weak.clone(),
             |this, window, cx| this.toggle_theme(window, cx),
         ))
         .item(Self::menu_action_item(
-            "跟随系统主题",
-            "Ctrl+Shift+T",
+            FOLLOW_THEME.menu_label,
+            FOLLOW_THEME.shortcut,
             weak,
             |this, _window, cx| this.follow_system_theme(cx),
         ))
@@ -266,6 +276,7 @@ impl EditorApp {
     }
 
     /// "自动换行"菜单项：动态显示当前是否开启（前导 ☑/☐），点击切换。
+    /// label 与快捷键来自公共命令表（`commands::TOGGLE_WRAP`）。
     fn wrap_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
         let weak2 = weak.clone();
         PopupMenuItem::element(move |_, cx| {
@@ -276,14 +287,19 @@ impl EditorApp {
             let chrome = ui::theme::ChromeColors::for_mode(
                 ui::theme::Theme::global(cx).is_dark(),
             );
+            let label = SharedString::from(format!(
+                "{} {}",
+                if on { "☑" } else { "☐" },
+                TOGGLE_WRAP.menu_label,
+            ));
             div()
                 .w_full()
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .child(if on { "☑ 自动换行" } else { "☐ 自动换行" })
-                .child(div().text_color(chrome.text_tertiary).child("Ctrl+Alt+W"))
+                .child(label)
+                .child(div().text_color(chrome.text_tertiary).child(TOGGLE_WRAP.shortcut))
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_wrap(window, cx));

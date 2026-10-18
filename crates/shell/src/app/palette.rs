@@ -1,13 +1,18 @@
 //! 命令面板宿主接线（P2-8）：打开/关闭 + 命令/文件条目构建。
 //!
-//! 单一来源说明：命令面板的命令列表与顶部菜单（`menu.rs`）**镜像同一批动作**
-//! （label/快捷键/回调口径一致）。未抽公共命令元数据——菜单项还承载 disabled /
-//! 分隔线 / 动态勾选等渲染细节，把面板与菜单耦进同一份数据侵入太大；此处镜像
-//! 成本低、语义明确（见 `command_palette_items`）。若日后收敛，可把
-//! `{category,label,shortcut,handler}` 抽成公共表，菜单与面板各自投影。
+//! 单一来源说明：命令面板的命令 label / 快捷键与顶部菜单（`menu.rs`）共享公共命令表
+//! （`crate::commands`）为唯一真值——两处从同一常量取 label + 快捷键展示串（个别命令
+//! 的菜单/面板 label 历史不同，如「新建」 vs 「新建文件」，同在表内一行）。菜单还承载
+//! disabled / 分隔线 / 动态勾选等渲染细节，仍保留各自结构（见 `commands.rs` 模块注释）；
+//! 分类（文件/编辑/查看/设置）只被面板使用，随面板内联。
 
 use super::*;
 use crate::actions::{Copy, Cut, Redo, SelectAll, Undo};
+use crate::commands::{
+    COPY, CUT, DECREASE_FONT, FOLLOW_THEME, INCREASE_FONT, NEW_FILE, OPEN_FILE, OPEN_FOLDER,
+    PASTE, PREVIEW, QUIT, REDO, RESET_FONT, SAVE, SAVE_AS, SELECT_ALL, THEME, TOGGLE_SIDEBAR,
+    TOGGLE_WRAP, UNDO,
+};
 use ui::palette::{CommandPalette, PaletteItem, PaletteMode};
 
 impl EditorApp {
@@ -65,17 +70,17 @@ impl EditorApp {
         }
     }
 
-    /// 命令列表：与顶部菜单镜像的同一批动作。
+    /// 命令列表：与顶部菜单共享公共命令表（`crate::commands`）的 label/快捷键单一真值。
     fn command_palette_items(&self, cx: &Context<Self>) -> Vec<PaletteItem> {
         let weak = cx.weak_entity();
         macro_rules! command {
-            ($category:expr, $label:expr, $shortcut:expr, $handler:expr) => {{
+            ($category:expr, $cmd:expr, $handler:expr) => {{
                 let w = weak.clone();
                 let handler: fn(&mut EditorApp, &mut Window, &mut Context<EditorApp>) = $handler;
                 PaletteItem::new(
-                    $label,
+                    $cmd.label,
                     $category,
-                    $shortcut,
+                    $cmd.shortcut,
                     move |window, cx| {
                         let _ = w.update(cx, |this, cx| handler(this, window, cx));
                     },
@@ -84,70 +89,70 @@ impl EditorApp {
         }
         vec![
             // 文件
-            command!("文件", "新建文件", "Ctrl+N", |this, window, cx| {
+            command!("文件", NEW_FILE, |this, window, cx| {
                 this.new_tab(window, cx)
             }),
-            command!("文件", "打开文件…", "Ctrl+O", |this, window, cx| {
+            command!("文件", OPEN_FILE, |this, window, cx| {
                 this.open_dialog(window, cx)
             }),
-            command!("文件", "打开文件夹…", "Ctrl+Shift+O", |this, window, cx| {
+            command!("文件", OPEN_FOLDER, |this, window, cx| {
                 this.open_folder_dialog(window, cx)
             }),
-            command!("文件", "保存", "Ctrl+S", |this, window, cx| {
+            command!("文件", SAVE, |this, window, cx| {
                 this.save(window, cx)
             }),
-            command!("文件", "另存为…", "Shift+Ctrl+S", |this, window, cx| {
+            command!("文件", SAVE_AS, |this, window, cx| {
                 this.save_as(window, cx)
             }),
-            command!("文件", "退出", "Ctrl+Q", |_this, _window, cx| cx.quit()),
+            command!("文件", QUIT, |_this, _window, cx| cx.quit()),
             // 编辑
-            command!("编辑", "撤销", "Ctrl+Z", |this, window, cx| {
+            command!("编辑", UNDO, |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
                 window.dispatch_action(Box::new(Undo), cx);
             }),
-            command!("编辑", "重做", "Ctrl+Y", |this, window, cx| {
+            command!("编辑", REDO, |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
                 window.dispatch_action(Box::new(Redo), cx);
             }),
-            command!("编辑", "剪切", "Ctrl+X", |this, window, cx| {
+            command!("编辑", CUT, |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
                 window.dispatch_action(Box::new(Cut), cx);
             }),
-            command!("编辑", "复制", "Ctrl+C", |this, window, cx| {
+            command!("编辑", COPY, |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
                 window.dispatch_action(Box::new(Copy), cx);
             }),
-            command!("编辑", "粘贴", "Ctrl+V", |this, window, cx| {
+            command!("编辑", PASTE, |this, window, cx| {
                 this.paste_normalized(window, cx)
             }),
-            command!("编辑", "全选", "Ctrl+A", |this, window, cx| {
+            command!("编辑", SELECT_ALL, |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
                 window.dispatch_action(Box::new(SelectAll), cx);
             }),
             // 查看
-            command!("查看", "预览", "", |this, window, cx| {
+            command!("查看", PREVIEW, |this, window, cx| {
                 let idx = this.active_tab;
                 this.toggle_preview_for_tab(idx, window, cx);
             }),
-            command!("查看", "切换侧边栏", "", |this, _window, cx| {
+            command!("查看", TOGGLE_SIDEBAR, |this, _window, cx| {
                 this.toggle_sidebar(cx)
             }),
-            command!("查看", "增大字号", "Ctrl+=", |this, _window, cx| {
+            command!("查看", INCREASE_FONT, |this, _window, cx| {
                 this.change_font_size(1.0, cx)
             }),
-            command!("查看", "减小字号", "Ctrl+-", |this, _window, cx| {
+            command!("查看", DECREASE_FONT, |this, _window, cx| {
                 this.change_font_size(-1.0, cx)
             }),
-            command!("查看", "重置字号", "Ctrl+0", |this, _window, cx| {
+            command!("查看", RESET_FONT, |this, _window, cx| {
                 this.reset_font_size(cx)
             }),
-            command!("查看", "自动换行", "Ctrl+Alt+W", |this, window, cx| {
+            command!("查看", TOGGLE_WRAP, |this, window, cx| {
                 this.toggle_wrap(window, cx)
             }),
-            command!("设置", "黑白切换", "", |this, window, cx| {
+            command!("设置", THEME, |this, window, cx| {
                 this.toggle_theme(window, cx)
             }),
-            command!("设置", "跟随系统主题", "Ctrl+Shift+T", |this, _window, cx| {
+            command!("设置", FOLLOW_THEME, |this, _window, cx| {
                 this.follow_system_theme(cx)
             }),
         ]

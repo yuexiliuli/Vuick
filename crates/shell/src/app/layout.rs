@@ -32,17 +32,12 @@ impl EditorApp {
         // 空白未命名文档——就直接渲染编辑区（可键入），绝不叠欢迎页（原 `is_empty_body`
         // 把「未命名空文档」也算空态的语义已被模型 3 取代：有 tab 即不显示欢迎页）。
         if self.tabs.is_empty() {
-            return div()
-                .id("app-empty-body")
-                .debug_selector(|| "app-empty-body".into())
-                .relative()
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .min_w(px(0.))
-                .overflow_hidden()
-                .child(self.render_empty_state(cx))
-                .into_any_element();
+            return Self::pane_wrap(
+                Some("app-empty-body"),
+                Some("app-empty-body"),
+                true,
+                self.render_empty_state(cx),
+            );
         }
         let live_edit = self
             .tabs
@@ -52,16 +47,12 @@ impl EditorApp {
         if live_edit {
             // 实时预览编辑（WYSIWYG）本身即「所见即所得」，右侧 Markdown 预览冗余 →
             // 编辑区占满整块（不显示分割线与预览区），退出实时模式后恢复原分屏。
-            div()
-                .id("app-live-body")
-                .debug_selector(|| "app-live-body".into())
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .min_w(px(0.))
-                .overflow_hidden()
-                .child(self.render_editor_pane(window, 1.0, cx))
-                .into_any_element()
+            Self::pane_wrap(
+                Some("app-live-body"),
+                Some("app-live-body"),
+                false,
+                self.render_editor_pane(window, 1.0, cx),
+            )
         } else if self.show_preview() {
             let ratio = self.split_ratio;
             // EPUB 等全屏预览：预览区占满整个内容区，不显示编辑区与分割线。
@@ -128,14 +119,40 @@ impl EditorApp {
             // 无预览：编辑区占满剩余。必须 min_w(0)+overflow_hidden——
             // 否则该容器 min-width:auto 被编辑器 980px 内容撑住，右侧溢出窗口
             // 46px，编辑器元素右缘落在屏幕外 → 滚动条画在窗口外看不见。
-            div()
-                .flex()
-                .flex_1()
-                .min_h(px(0.))
-                .min_w(px(0.))
-                .overflow_hidden()
-                .child(self.render_editor_pane(window, 1.0, cx))
-                .into_any_element()
+            Self::pane_wrap(None, None, false, self.render_editor_pane(window, 1.0, cx))
+        }
+    }
+
+    /// 正文区面板统一外壳：`.flex().flex_1().min_h(0).min_w(0).overflow_hidden()`
+    /// 防坍缩样板收敛为一处（`flex_1` 高度坍缩会毁滚动/命中，K19 同款先例），外加
+    /// 可选 id / debug_selector / relative（欢迎页需 relative，其余分支不设）。
+    /// id/debug_selector 的组合在宏内每臂保持单一具体元素类型（`Div` 与
+    /// `Stateful<Div>` 互斥），避免 `if` 赋值跨类型分叉。
+    fn pane_wrap(
+        with_layout_id: Option<&'static str>,
+        debug_selector: Option<&'static str>,
+        relative: bool,
+        inner: gpui::AnyElement,
+    ) -> gpui::AnyElement {
+        macro_rules! finish {
+            ($el:expr) => {{
+                let el = if relative { $el.relative() } else { $el };
+                el.flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .child(inner)
+                    .into_any_element()
+            }};
+        }
+        match (with_layout_id, debug_selector) {
+            (Some(id), Some(sel)) => {
+                finish!(div().id(id).debug_selector(move || sel.into()))
+            }
+            (Some(id), None) => finish!(div().id(id)),
+            (None, Some(sel)) => finish!(div().debug_selector(move || sel.into())),
+            (None, None) => finish!(div()),
         }
     }
 

@@ -22,6 +22,10 @@
 
 pub mod app;
 
+/// 公共命令表（单一真值）：菜单 / 命令面板 / 根级快捷键共享 label 与快捷键常量，
+/// 根级键位 [`commands::root_keybindings`] 供二进制壳 `src/main.rs` 绑定。
+pub mod commands;
+
 /// 自绘横向滚动条（原根级 `src/scrollbar.rs`，仅 app 消费，随 shell 吸收）。
 mod scrollbar;
 
@@ -43,16 +47,4 @@ pub fn bind_local_keymaps(cx: &mut gpui::App) {
     base::actions::bind_input_keys(cx);
     ui::root::bind_keys(cx);
     markdown_wysiwyg::bind_keys(cx);
-}
-
-/// 测试用键位助手：与生产版 [`bind_local_keymaps`] 完全一致（完整组合），供
-/// 本 crate 的 `app::tests` 初始化使用（原 `crate::actions::bind_local_keymaps`）。
-#[cfg(test)]
-pub mod test_support {
-    /// 安装全部本地快捷键（= [`super::bind_local_keymaps`]），app 测试初始化用。
-    pub fn bind_local_keymaps(cx: &mut gpui::App) {
-        base::actions::bind_input_keys(cx);
-        ui::root::bind_keys(cx);
-        markdown_wysiwyg::bind_keys(cx);
-    }
 }

@@ -39,8 +39,9 @@ use std::path::{Path, PathBuf};
 
 /// 会话持久化防抖窗口（ms）：内容变化后停顿该时长才写盘一次，压缩打字期间的高频重写。
 /// 结构变化（新建/关闭/切换选项卡、打开文件、保存）不经防抖，立即落盘。
-/// `#[allow(dead_code)]`：仅在非测试构建的防抖定时器里被引用，测试构建该分支整体编译掉。
-#[allow(dead_code)]
+/// 仅在非测试构建的防抖定时器里被引用（测试构建该分支整体编译掉）→ `#[cfg(not(test))]`
+/// 归位，不再退化 `allow(dead_code)`。
+#[cfg(not(test))]
 const SESSION_FLUSH_DEBOUNCE_MS: u64 = 300;
 
 /// 清单里单个会话选项卡。
@@ -250,16 +251,16 @@ impl EditorApp {
     /// 退出钩子入口（`on_app_quit` **兜底**）：把主窗口选项卡保存到 `UserPrefs::session_dir()`。
     /// 开关关闭时只清不写（见 [`save_session_to`]）。常态保存由「状态变化即持久化」
     /// （[`Self::schedule_session_flush`]）承担，本钩子仅在平台确实触发退出回调时做最终落盘。
-    /// `#[allow(dead_code)]`：仅 `new_impl` 的 `#[cfg(not(test))]` 退出钩子调用，
-    /// 测试构建下无调用点（测试直接驱动 `save_session_to` 纯逻辑）。
-    #[allow(dead_code)]
+    /// `#[cfg(not(test))]`：仅 `new_impl` 的 `#[cfg(not(test))]` 退出钩子调用，测试构建下
+    /// 无此函数（测试直接驱动 `save_session_to` 纯逻辑），归位后无需 `allow(dead_code)`。
+    #[cfg(not(test))]
     pub(super) fn save_session(&mut self, cx: &Context<Self>) {
         let _ = save_session_to(self, &UserPrefs::session_dir(), cx);
     }
 
     /// 启动恢复入口（`new_impl` 里无 CLI 首参时调用）：开关开启且清单存在且有效才恢复。
-    /// `#[allow(dead_code)]`：见 [`Self::save_session`]。
-    #[allow(dead_code)]
+    /// `#[cfg(not(test))]`：见 [`Self::save_session`]。
+    #[cfg(not(test))]
     pub(super) fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = restore_session_from(self, &UserPrefs::session_dir(), window, cx);
     }

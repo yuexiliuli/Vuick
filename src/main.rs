@@ -9,7 +9,7 @@
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 use base::actions::*;
-use shell::{bind_local_keymaps, EditorApp};
+use shell::{bind_local_keymaps, commands, EditorApp};
 use syntax::prewarm;
 use ui::root;
 use ui::theme::{Theme, ThemeMode};
@@ -19,25 +19,9 @@ fn main() {
     gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(980.), px(720.)), cx);
 
-        // 应用级快捷键（全局，None 上下文）。
-        cx.bind_keys([
-                KeyBinding::new("ctrl-n", NewFile, None),
-                KeyBinding::new("ctrl-o", OpenFile, None),
-                KeyBinding::new("ctrl-shift-o", OpenFolder, None),
-                KeyBinding::new("ctrl-s", Save, None),
-                KeyBinding::new("shift-ctrl-s", SaveAs, None),
-                KeyBinding::new("ctrl-w", CloseTab, None),
-                // P2-8 命令面板：Ctrl+P 改开「打开文件快选」；
-                // 原「预览切换」由标签栏眼睛按钮 + 查看菜单承担（菜单快捷键提示已去掉）。
-                KeyBinding::new("ctrl-p", QuickOpenFile, None),
-                KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, None),
-                KeyBinding::new("ctrl-alt-w", ToggleWordWrap, None),
-                KeyBinding::new("ctrl-=", IncreaseFontSize, None),
-                KeyBinding::new("ctrl--", DecreaseFontSize, None),
-                KeyBinding::new("ctrl-0", ResetFontSize, None),
-                KeyBinding::new("ctrl-shift-t", FollowSystemTheme, None),
-                KeyBinding::new("ctrl-q", Quit, None),
-            ]);
+        // 应用级快捷键（全局，None 上下文）：键串来自 `shell::commands` 公共命令表
+        // （菜单/命令面板/键位三处共享同一真值，改快捷键只动命令表一处）。
+        cx.bind_keys(commands::root_keybindings());
 
             // 种入自研主题（已无 gpui-component 双轨，只写 ui::theme）。
             // 启动跟随：按持久化偏好解析；从未手动选过（默认 follow）→ 由系统深浅色决定。
