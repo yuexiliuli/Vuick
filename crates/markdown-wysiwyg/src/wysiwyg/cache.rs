@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use gpui::{Pixels, SharedString};
 use crate::markdown::wysiwyg::element;
 use crate::markdown::wysiwyg::{CodeParseKey, CodeParseState, MathSlot};
@@ -67,9 +68,9 @@ pub(crate) struct LruEntry<K: LruKey, V> {
 ///   `lookup`、RowShape 命中读）；
 /// - [`LruCache::put`]：满容量且键不在场 → 淘汰 BTreeSet 队首（最久未用）；已存在同名
 ///   条目（换代重插）先摘旧钟。返回覆盖旧槽 + 被淘汰槽（[`CacheWrite`]）。
-pub(crate) struct LruCache<K: LruKey, V> {
+pub(crate) struct LruCache<K: LruKey, V, S = std::collections::hash_map::RandomState> {
     /// 缓存键 → 条目（`RowShapeCache.entries` 测试断言读它）。
-    pub(crate) entries: std::collections::HashMap<K, LruEntry<K, V>>,
+    pub(crate) entries: std::collections::HashMap<K, LruEntry<K, V>, S>,
     /// `(last_seen, key)` 升序 LRU 索引：首元素即最久未用条目；组合键用 `key` 解
     /// `last_seen` 相同（u32 clock 回绕后）的歧义，淘汰顺序确定。
     lru: std::collections::BTreeSet<(u32, K)>,
@@ -77,24 +78,33 @@ pub(crate) struct LruCache<K: LruKey, V> {
     clock: u32,
 }
 
-impl<K: LruKey, V: Clone> LruCache<K, V> {
+impl<K: LruKey, V: Clone, S: Default + std::hash::BuildHasher> LruCache<K, V, S> {
     fn new(cap: usize) -> Self {
         Self {
-            entries: std::collections::HashMap::new(),
+            entries: std::collections::HashMap::default(),
             lru: std::collections::BTreeSet::new(),
             cap,
             clock: 0,
         }
     }
 
-    /// 纯查询（O(1)，不移动 LRU 次序；paint/形状热路径）。
-    fn get(&self, key: &K) -> Option<&V> {
+    /// 纯查询（O(1)，不移动 LRU 次序；paint/形状热路径）。`Q: Borrow<K>` 使
+    /// `&str`/`&u64` 等借键直接命中 HashMap，**零分配**（MathSlot 旧实现同款）。
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         self.entries.get(key).map(|e| &e.value)
     }
 
     /// 命中：更新访问钟并返回条目。内部换钟 = 移除旧 `(last_seen, key)` 再插新钟
     /// （`clock` 单调进、组合键唯一 → 绝不残留过期键）。
-    fn get_with_touch(&mut self, key: &K) -> Option<&mut V> {
+    fn get_with_touch<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         let e = self.entries.get_mut(key)?;
         let last = e.last_seen;
         e.last_seen = self.clock;
@@ -105,7 +115,11 @@ impl<K: LruKey, V: Clone> LruCache<K, V> {
     }
 
     /// 标记「最近使用」（键不在场则 no-op）。`clock` 换钟同 [`Self::get_with_touch`]。
-    fn touch(&mut self, key: &K) {
+    fn touch<Q>(&mut self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         let Some(e) = self.entries.get_mut(key) else {
             return;
         };
@@ -158,7 +172,11 @@ impl<K: LruKey, V: Clone> LruCache<K, V> {
     }
 
     /// 按键移除（返回被移除的值；测试/定向作废用）。
-    fn remove(&mut self, key: &K) -> Option<V> {
+    fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         let e = self.entries.remove(key)?;
         self.lru.remove(&(e.last_seen, e.key));
         Some(e.value)
@@ -180,7 +198,11 @@ impl<K: LruKey, V: Clone> LruCache<K, V> {
         self.entries.len()
     }
 
-    pub(crate) fn contains_key(&self, key: &K) -> bool {
+    pub(crate) fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         self.entries.contains_key(key)
     }
 
@@ -217,7 +239,7 @@ pub(crate) struct CacheWrite<T> {
 ///   大文档 ≈14k 次插 × 16k 表项比较）。
 pub(crate) struct RowShapeCache {
     /// 内容指纹 → 条目（`frame::block_content_id` 键；`shape_rows_has` 测试断言读它）。
-    pub(crate) entries: LruCache<u64, RowShapeEntry>,
+    pub(crate) entries: LruCache<u64, RowShapeEntry, rustc_hash::FxBuildHasher>,
 }
 
 #[derive(Clone)]
@@ -322,15 +344,15 @@ impl MathSlotCache {
     }
     /// 纯查询（O(1)，不移动 LRU 次序；paint/形状热路径）。
     pub(crate) fn get(&self, key: &str) -> Option<&MathSlot> {
-        self.entries.get(&key.into())
+        self.entries.get(key)
     }
     #[cfg(test)]
     pub(crate) fn contains_key(&self, key: &str) -> bool {
-        self.entries.contains_key(&key.into())
+        self.entries.contains_key(key)
     }
     /// 标记「最近使用」：`sync_math` 每帧对带内公式统一调用（带内 = LRU 命中面）。
     pub(crate) fn touch(&mut self, key: &str) {
-        self.entries.touch(&key.into());
+        self.entries.touch(key);
     }
     /// 插入并标记最近使用；容量满且键不在场 → LRU 淘汰最久未用条目（`evicted` 由
     /// 调用方释放 `Ready` 纹理）。返回覆盖旧值 + 淘汰槽。
@@ -340,7 +362,7 @@ impl MathSlotCache {
     /// 按键移除（返回被移除的槽；测试/定向作废用）。
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) -> Option<MathSlot> {
-        self.entries.remove(&key.into())
+        self.entries.remove(key)
     }
     /// 全部取走并清空（换源 / 主题色变化整批清除；调用方负责释放 `Ready` 纹理）。
     pub(crate) fn drain_all(&mut self) -> Vec<MathSlot> {
