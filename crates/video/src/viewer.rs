@@ -53,11 +53,11 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnimationExt, App, Bounds, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div, img, px,
-    prelude::FluentBuilder as _,
+    Anchor, AnimationExt, App, Bounds, Context, CursorStyle, DefiniteLength, Edges, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle,
+    ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledImage, Window, anchored, canvas,
+    deferred, div, img, point, px, prelude::FluentBuilder as _,
 };
 use image::{Frame, RgbaImage};
 
@@ -140,6 +140,12 @@ const SCRUB_RETARGET_MS: u64 = 60;
 /// hover 缓存命中容差（秒）：预解码帧 pts 与点击落点距离 ≤ 此值（且 pts ≥ 落点）视为命中，
 /// 直接装屏不重解；更远判 stale（防止把「很久前悬停/过冲」的帧误当点击落点）。
 const HOVER_HIT_WINDOW_S: f64 = 0.35;
+// --- F1 悬停时间提示 ---
+/// F1 悬停时间浮层与进度条上缘的纵向间隙（px）。
+const HOVER_TIME_GAP_PX: f32 = 6.0;
+/// F1 悬停时间浮层的 deferred 绘制优先级：高于普通 deferred（note card = 1）/tooltip（60），
+/// 悬浮在控制条之上，低于全局 toast（200）/菜单（100→120 不与其冲突）。
+const HOVER_TIME_LAYER_PRIORITY: usize = 120;
 
 /// 播放模式三态（控制条按钮循环切换；播完「自然结尾」时的去向）：
 /// - [`PlaybackMode::Sequential`]：顺序播放——播完当前自动停（默认，保持历史行为）；
@@ -695,6 +701,10 @@ pub struct VideoViewer {
     // --- M0 hover 预解码 ---
     /// 进度条悬停位置（秒，钳位到 [0, duration]；未悬停 None，仅未拖拽的 `on_seek_move` 记录）。
     hovered_target: Option<f64>,
+    /// F1 悬停时间浮层：悬停光标的**窗口坐标** x（px；在 seek 进度条盒内才记录，随 `on_seek_move`
+    /// 刷新；开始拖拽 / 移出进度条 / 换文件时清 None → 浮层隐藏）。不在 render 里做命中检测，
+    /// 由事件回调记录这一帧的横向位置，浮层紧随光标移动。
+    hover_x: Option<f32>,
     /// hover 预解码 worker 命令通道（独立线程 + 独立 `VideoReader`，与播放 worker 彻底隔离，
     /// 专做「悬停落点」单帧后台解码，永不阻塞/饿死播放 worker）。
     hover_cmd: Option<std::sync::mpsc::Sender<HoverCmd>>,
@@ -753,6 +763,7 @@ impl VideoViewer {
             fps: None,
             decode_cap: DECODE_MAX_DIM,
             hovered_target: None,
+            hover_x: None,
             hover_cmd: None,
             hover_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hover_cache: None,
@@ -2560,8 +2571,9 @@ impl VideoViewer {
         // 会因 generation 不匹配立即退出，随后由 start_decoder_at 的新命令接手）。
         self.generation.fetch_add(1, Ordering::SeqCst);
         // M0 失效源（换文件）：悬停位置/缓存/在途预解码全作废（新文件的落点需重新解码）；
-        // `hover_generation` 同步递增，旧文件 worker 回填结果一律丢弃。
+        // `hover_generation` 同步递增，旧文件 worker 回填结果一律丢弃。F1 悬停浮层同失效。
         self.hovered_target = None;
+        self.hover_x = None;
         self.hover_cache = None;
         self.served_hover_target = None;
         self.hover_generation.fetch_add(1, Ordering::SeqCst);
@@ -2738,6 +2750,7 @@ impl VideoViewer {
     /// 出声），且 HE-AAC(SBR) 每次选中流 mid-frame 首包都会解码报 `env_facs_q` 坏帧。
     fn begin_scrub(&mut self, fraction: f32, cx: &mut Context<Self>) {
         self.scrubbing = true;
+        self.hover_x = None; // F1：开始拖拽 → 悬停时间浮层隐藏
         self.scrub_target = self.clamped_scrub_target(fraction);
         self.playhead = self.scrub_target;
         self.last_tick = None;
@@ -3140,6 +3153,8 @@ impl VideoViewer {
             self.controls_auto.hover_in();
             cx.notify();
         } else {
+            // F1：鼠标离开控制条整条 → 悬停时间浮层一并隐藏（条内移开由 on_controls_move 清）
+            self.hover_x = None;
             self.controls_auto.hover_out();
             self.show_controls_temporarily(cx);
         }
@@ -3238,10 +3253,80 @@ impl VideoViewer {
         }
     }
 
-    /// `秒` → `m:ss`（控制条时间显示）。
+    /// `秒` → `m:ss`；≥1h 自动 `h:mm:ss`（控制条时间与 F1 悬停时间浮层共用同一语义）。
     fn fmt_time(secs: f64) -> String {
         let s = secs.max(0.0) as u64;
-        format!("{:01}:{:02}", s / 60, s % 60)
+        let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+        if h > 0 {
+            format!("{h}:{m:02}:{sec:02}")
+        } else {
+            format!("{m}:{sec:02}")
+        }
+    }
+
+    /// F1：进度条悬停时间浮层（纯视觉，**无任何事件监听** → 不拦 seek 条点击/拖拽/dblclick，
+    /// 命中穿透；也不占布局——deferred 独立绘制层，随 `.position(窗口坐标)` 悬浮）。
+    /// 纵向固定浮在进度条上方 [`HOVER_TIME_GAP_PX`]，横向跟随光标；`deferred(anchored(Window))`
+    /// 定位用 `.position(窗口坐标)`（坑速查：不用 `.offset`），`snap_to_window_with_margin`
+    /// 自动把左右边缘 Clamp 在窗口内（0 秒/片尾悬停被截断的风险由它消掉）。配色全走
+    /// `ui::theme`（同 toast/暂停徽标的 surface/border/fg 取色姿势，明暗主题都可读），
+    /// 出现/离开瞬间短弹簧淡入淡出，收敛即静止（无常驻重绘）。测试探针：`debug_selector`
+    /// 静态 `HOVER_TIME` → `debug_bounds("HOVER_TIME")` 断言「元素存在 + 定位」；文本由
+    /// `fmt_time(hovered_target)` 纯函数链断言（render 唯一文本来源）。
+    fn hover_time_float(
+        secs: f64,
+        cursor_x: f32,
+        seek_bounds: &Rc<Cell<Bounds<Pixels>>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let b = seek_bounds.get();
+        if b.size.width.as_f32() <= 0.0 {
+            return div().into_any_element();
+        }
+        let theme = ui::theme::Theme::global(cx);
+        let surface: Hsla = theme.colors.surface.into();
+        let border: Hsla = theme.colors.border.into();
+        let fg: Hsla = theme.colors.fg.into();
+        let is_dark = theme.is_dark();
+        let label = Self::fmt_time(secs);
+        // 纵向固定：贴进度条上缘上移 `HOVER_TIME_GAP_PX`（BottomCenter 锚点 = 卡片底边中点）。
+        let top = (b.origin.y - px(HOVER_TIME_GAP_PX)).as_f32().max(0.0);
+        let card = div()
+            .id("video-hover-time")
+            .debug_selector(move || "HOVER_TIME".to_string())
+            .whitespace_nowrap()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(surface.opacity(if is_dark {
+                GLASS_PANEL_ALPHA_DARK
+            } else {
+                GLASS_PANEL_ALPHA_LIGHT
+            }))
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.16))
+                    .blur_radius(px(6.)),
+            ])
+            .text_size(px(11.))
+            .text_color(fg)
+            .child(label)
+            .with_spring(
+                "video-hover-time-fade",
+                hover_spring(1.0).from(0.0),
+                |this, v| this.opacity(v),
+            );
+        deferred(
+            anchored()
+                .anchor(Anchor::BottomCenter)
+                .position(point(px(cursor_x), px(top)))
+                .snap_to_window_with_margin(Edges::all(px(6.)))
+                .child(card),
+        )
+        .with_priority(HOVER_TIME_LAYER_PRIORITY)
+        .into_any_element()
     }
 
     /// 底部全屏控制条：上一支 / 播放·暂停 / 下一支 / 时间 / seek 进度条 /
@@ -3266,7 +3351,10 @@ impl VideoViewer {
         }
         // 可见控制条：双击不让其漏到画面区（与 `#video-main` 双击全屏互斥）；须挂在
         // `if 隐藏早退` 之后——隐藏态透明热区下方就是视频画面，双击仍需命中画面元素。
-        let strip = strip.on_mouse_down(MouseButton::Left, cx.listener(Self::on_controls_mouse_down));
+        // on_mouse_move：F1 悬停浮层「移出 seek 条即隐藏」的清理点（条内任意移首都冒泡到这）。
+        let strip = strip
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_controls_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_controls_move));
         let colors = ui::theme::Theme::global(cx).colors;
         let dark = ui::theme::Theme::global(cx).is_dark();
         let fg: Hsla = colors.fg.into();
@@ -3603,8 +3691,11 @@ impl VideoViewer {
                 return;
             }
             // M0：未拖拽的悬停 → 记录悬停位置并（空闲时）后台预解码该落点帧，点击即现。
+            // F1：同时记下光标的窗口坐标 x，悬停时间浮层紧随光标横向移动。
             if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
+                self.hover_x = Some(e.position.x.as_f32());
                 self.update_hover_target(self.clamped_scrub_target(f), cx);
+                cx.notify(); // 浮层文本/横坐标随光标实时刷新
             }
             return;
         }
@@ -3614,6 +3705,48 @@ impl VideoViewer {
             } else {
                 self.begin_scrub(f, cx);
             }
+        }
+        self.hover_x = None; // 开始拖拽 → 悬停浮层隐藏（拖拽时当前时间已跟手指）
+        cx.notify();
+    }
+
+    /// F1：光标是否落在 seek 进度条**盒内**（窗口坐标，含纵向）。`fraction_at` 只做 x→进度
+    /// 映射、对条外点也返回钳位值，不能当「在条上」判据。盒由 canvas prepaint 记录：canvas
+    /// 自身布局高度为 0（条高由外层 `.h(px(16.))` 撑起、同 `strip_element`），故纵向用
+    /// 「盒顶 + 条高」重建。在 → 返回该点对应秒（钳位 [0, duration]）；不在/未布局 → None。
+    fn seek_hover_target_at(&self, point: Point<Pixels>) -> Option<f64> {
+        let b = self.seek_bounds.get();
+        if b.size.width.as_f32() <= 0.0 {
+            return None;
+        }
+        let x = point.x.as_f32();
+        let y = point.y.as_f32();
+        let left = b.origin.x.as_f32();
+        let right = (b.origin.x + b.size.width).as_f32();
+        let top = b.origin.y.as_f32();
+        let bar_h = if b.size.height.as_f32() > 0.0 {
+            b.size.height.as_f32()
+        } else {
+            16.0
+        };
+        if x < left || x > right || y < top || y > top + bar_h {
+            return None;
+        }
+        let f = ((x - left) / (right - left)).clamp(0.0, 1.0) as f32;
+        Some(self.clamped_scrub_target(f))
+    }
+
+    /// 控制条内任意指针移动：光标离开 seek 进度条（移到按钮/空隙/音量条等）→ 清除悬停
+    /// 浮层（x 不在盒内即隐藏；回到条上由 seek 元素自己的 `on_seek_move` 重新记录 → 复现）。
+    fn on_controls_move(
+        &mut self,
+        e: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.seek_hover_target_at(e.position).is_none() && self.hover_x.is_some() {
+            self.hover_x = None;
+            cx.notify();
         }
     }
 
@@ -3629,6 +3762,16 @@ impl VideoViewer {
         }
         if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
             self.end_scrub(f, cx);
+            // F1：松手仍在进度条盒内（含纵向，`fraction_at` 只比 x）→ 恢复正常 hover：
+            // 同步把 hovered_target 刷新到松手落点（否则浮层文本残留拖拽前悬停的旧秒数，
+            // 出现「文本与横坐标错位」）；拖到条外（纵向出去）松开 → 保持隐藏不残影。
+            if let Some(target) = self.seek_hover_target_at(e.position) {
+                self.hovered_target = Some(target);
+                self.hover_x = Some(e.position.x.as_f32());
+            } else {
+                self.hover_x = None;
+            }
+            cx.notify();
         } else {
             self.end_scrub_at_current(cx);
         }
@@ -3811,6 +3954,14 @@ impl Render for VideoViewer {
         // 控制条：普通模式常驻（画面预留底部高度）；纯视频（锁定）模式为浮层按需浮现，
         // 画面充满整个画布区。
         root = root.child(self.control_bar(window, cx));
+        // F1 悬停时间提示：未拖拽且正悬停进度条（hover_x 在条内被记录）时挂出，纯视觉无交互；
+        // 拖拽/移出/换文件时 hover_x 已被清 None 或 scrubbing 为真 → 不渲染浮层。
+        if !self.scrubbing
+            && let Some(secs) = self.hovered_target
+            && let Some(x) = self.hover_x
+        {
+            root = root.child(Self::hover_time_float(secs, x, &self.seek_bounds, window, cx));
+        }
         // 右上角瞬时状态浮层（截图结果提示等）：在期内才挂，过期由定时器清除兜底。
         if let Some((text, at)) = &self.status
             && at.elapsed() < std::time::Duration::from_millis(STATUS_MS)
@@ -3993,6 +4144,7 @@ mod tests {
             fps: None,
             decode_cap: DECODE_MAX_DIM,
             hovered_target: None,
+            hover_x: None,
             hover_cmd: None,
             hover_generation: Arc::new(AtomicU64::new(0)),
             hover_cache: None,
@@ -8140,5 +8292,276 @@ mod tests {
             let v = v.read(app);
             (v.frame.is_some(), v.intrinsic.is_some(), v.load_error.clone())
         })
+    }
+
+    /// F1 文本语义：`fmt_time` = `m:ss`；≥1h 自动 `h:mm:ss`（控制条时间与 F1 悬停浮层共用）。
+    /// 回归断言：旧 `{:01}:{:02}` 对 ≥1h 会错误输出 `90:05`（隐含 小时×60），新语义必须
+    /// `h:mm:ss`（F1-1「悬停显示 m:ss，≥1h 自动 h:mm:ss」的纯函数基座）。
+    #[test]
+    fn fmt_time_m_ss_and_h_mm_ss() {
+        assert_eq!(VideoViewer::fmt_time(0.0), "0:00");
+        assert_eq!(VideoViewer::fmt_time(59.9), "0:59");
+        assert_eq!(VideoViewer::fmt_time(60.0), "1:00");
+        assert_eq!(VideoViewer::fmt_time(65.9), "1:05");
+        assert_eq!(VideoViewer::fmt_time(599.0), "9:59");
+        assert_eq!(VideoViewer::fmt_time(600.0), "10:00");
+        assert_eq!(VideoViewer::fmt_time(3599.0), "59:59");
+        assert_eq!(VideoViewer::fmt_time(3600.0), "1:00:00");
+        assert_eq!(VideoViewer::fmt_time(3661.5), "1:01:01");
+        assert_eq!(VideoViewer::fmt_time(7325.0), "2:02:05");
+        assert_eq!(VideoViewer::fmt_time(-5.0), "0:00", "负值按 0 处理（与旧语义一致）");
+    }
+
+    /// F1：进度条悬停时间浮层——「悬停 → 元素出现 + 文本 = m:ss + 横向跟随 + 纵向固定浮在
+    /// 进度条上方 + 移出隐藏」（回归断言，走真实事件分发 + rendered_frame debug_bounds）。
+    /// 不开解码：用不存在的路径（加载落错误占位，控制条照常布局）；固定 duration=100 供
+    /// 文本断言（render 文本唯一来源 = `fmt_time(hovered_target)`）。
+    #[gpui::test]
+    async fn hover_time_float_shows_follows_and_hides(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, wcx) = cx.add_window_view(|_window, cx| {
+            VideoViewer::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/no-hover-time.mp4"),
+                cx,
+            )
+        });
+        wcx.cx.update(|app| {
+            viewer.update(app, |v, _| {
+                v.duration = 100.0;
+            })
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let seek = wcx.cx.read(|app| viewer.read(app).seek_bounds.get());
+        assert!(seek.size.width.as_f32() > 0.0, "seek 条应已布局");
+        // (1) 悬停 seek 条中点：浮层出现、文本 = 中点对应 m:ss、纵向在进度条上方
+        let mid = seek.center();
+        wcx.simulate_mouse_move(mid, None, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let s = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.hovered_target, v.hover_x, v.scrubbing)
+        });
+        assert!(!s.2, "未拖拽才出浮层");
+        assert_eq!(s.0, Some(50.0), "中点 → 50s");
+        assert_eq!(VideoViewer::fmt_time(50.0), "0:50", "浮层文本 = m:ss");
+        let float = wcx.debug_bounds("HOVER_TIME").expect("悬停浮层出现");
+        assert!(
+            float.bottom().as_f32() <= seek.origin.y.as_f32() + 0.5,
+            "浮层纵向固定浮在进度条上方（bottom ≤ seek.top），bottom={} seek.top={}",
+            float.bottom().as_f32(),
+            seek.origin.y.as_f32()
+        );
+        assert!(
+            (float.center().x.as_f32() - mid.x.as_f32()).abs() <= 1.0,
+            "浮层底边中点对准光标 x"
+        );
+        // (2) 移到另一 x（左 1/4）：文本与横坐标都变
+        let q = gpui::Point::new(px(seek.origin.x.as_f32() + seek.size.width.as_f32() * 0.25), mid.y);
+        wcx.simulate_mouse_move(q, None, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let (target_q, x_q) = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.hovered_target, v.hover_x)
+        });
+        assert_eq!(x_q, Some(q.x.as_f32()), "hover_x 记录新光标x");
+        assert!(
+            (target_q.unwrap() - 25.0).abs() < 1.0,
+            "1/4 处 → ~25s 实得 {:?}",
+            target_q
+        );
+        assert_eq!(VideoViewer::fmt_time(target_q.unwrap()), "0:25", "文本随光标变化");
+        let float_q = wcx.debug_bounds("HOVER_TIME").expect("跟随光标仍显示");
+        assert!(
+            (float_q.center().x.as_f32() - q.x.as_f32()).abs() <= 1.0,
+            "浮层横向跟随光标移动"
+        );
+        assert!(
+            (float_q.center().x.as_f32() - float.center().x.as_f32()).abs() > 5.0,
+            "x 变化 → 浮层横向真正移动"
+        );
+        // (3) 移到 seek 条外（控制条内其他区域，如左缘按钮带）→ 浮层隐藏
+        let off = gpui::Point::new(px(seek.origin.x.as_f32() - 60.0), mid.y);
+        wcx.simulate_mouse_move(off, None, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        assert!(wcx.debug_bounds("HOVER_TIME").is_none(), "移出 seek 条 → 浮层隐藏");
+        // (4) 回到条最左缘（0 秒）：文本 0:00 且不越出窗口左边界（Clamp）
+        let left = gpui::Point::new(seek.origin.x, mid.y);
+        wcx.simulate_mouse_move(left, None, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let t0 = wcx.cx.read(|app| viewer.read(app).hovered_target);
+        assert_eq!(t0, Some(0.0), "条左缘 → 0 秒");
+        assert_eq!(VideoViewer::fmt_time(0.0), "0:00");
+        let fb = wcx.debug_bounds("HOVER_TIME").expect("0 秒悬停也显示浮层");
+        assert!(fb.origin.x.as_f32() >= 0.0, "0 秒悬停浮层不越出窗口左边界");
+        cx.run_until_parked();
+    }
+
+    /// F1-2 边界：悬停 seek 条最右缘（片尾附近）→ 浮层右缘被 Clamp 在窗口内（不被截断）。
+    #[gpui::test]
+    async fn hover_time_float_clamps_to_right_window_edge(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, wcx) = cx.add_window_view(|_window, cx| {
+            VideoViewer::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/no-hover-right.mp4"),
+                cx,
+            )
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let seek = wcx.cx.read(|app| viewer.read(app).seek_bounds.get());
+        assert!(seek.size.width.as_f32() > 0.0, "seek 条应已布局");
+        // 悬停最右缘内侧 1px（精确在右缘会命中右侧下一元素 vol 条）：无 Clamp 时浮层
+        //（底边中点对齐光标）会右探出窗口 ~半卡宽。
+        let right = gpui::Point::new(seek.origin.x + seek.size.width - px(1.0), seek.center().y);
+        wcx.simulate_mouse_move(right, None, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let float = wcx.debug_bounds("HOVER_TIME").expect("片尾悬停浮层出现");
+        let ww = wcx
+            .cx
+            .windows()
+            .first()
+            .copied()
+            .expect("测试窗把手")
+            .update(&mut wcx.cx, |_, window, _| window.bounds().size.width.as_f32())
+            .expect("读测试窗宽");
+        assert!(
+            float.right().as_f32() <= ww - 5.0,
+            "右缘悬停浮层被 Clamp 在窗口内（right={} 窗口宽={}）",
+            float.right().as_f32(),
+            ww
+        );
+        // 片尾时间文本随条尾（duration > 0）
+        let t = wcx.cx.read(|app| viewer.read(app).hovered_target);
+        assert!(t.is_some(), "最右缘仍记悬停秒数（≈duration）");
+        cx.run_until_parked();
+    }
+
+    /// F1-3：开始拖拽 → 浮层隐藏；拖拽松手仍在进度条上 → 恢复正常 hover（浮层复现）。
+    #[gpui::test]
+    async fn hover_time_float_hides_during_scrub_restores_after_release(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, wcx) = cx.add_window_view(|_window, cx| {
+            VideoViewer::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/no-hover-drag.mp4"),
+                cx,
+            )
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let seek = wcx.cx.read(|app| viewer.read(app).seek_bounds.get());
+        let mid = seek.center();
+        // 先悬停 → 浮层出现
+        wcx.simulate_mouse_move(mid, None, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        assert!(wcx.debug_bounds("HOVER_TIME").is_some(), "悬停浮层出现");
+        // 按下左键（拖拽开始）→ 浮层隐藏
+        wcx.simulate_mouse_down(mid, MouseButton::Left, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        assert!(
+            wcx.cx.read(|app| viewer.read(app).scrubbing),
+            "按下进入拖拽"
+        );
+        assert!(wcx.debug_bounds("HOVER_TIME").is_none(), "拖拽中浮层隐藏");
+        // 按住拖动 → 仍隐藏（当前时间已跟手指，无需浮层）
+        let d = gpui::Point::new(px(mid.x.as_f32() + 40.0), mid.y);
+        wcx.simulate_mouse_move(d, Some(MouseButton::Left), Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        assert!(wcx.debug_bounds("HOVER_TIME").is_none(), "拖拽移动仍隐藏");
+        // 松手仍在进度条上 → 恢复正常 hover（浮层即刻复现，不等下一次 mouse_move）
+        wcx.simulate_mouse_up(d, MouseButton::Left, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        // 回归（C1）：阈值刷新——浮层文本必须=松手落点，不得残留拖拽前悬停(中点 50s)旧秒数
+        let (scrub2, hover_x2, hover_tgt2) = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.scrubbing, v.hover_x, v.hovered_target)
+        });
+        assert!(!scrub2, "松手退出拖拽");
+        assert!(hover_x2.is_some(), "松手在条上 → 恢复 hover_x（浮层复现）");
+        let f_release =
+            ((d.x.as_f32() - seek.origin.x.as_f32()) / seek.size.width.as_f32()).clamp(0.0, 1.0);
+        let expect_t = wcx.cx.read(|app| viewer.read(app).clamped_scrub_target(f_release));
+        let tgt = hover_tgt2.expect("松手后 hovered_target 应就位");
+        assert!(
+            (tgt - expect_t).abs() < 1e-6,
+            "浮层文本应刷新到松手落点（expect {expect_t} 实得 {tgt}），不得残留 50s"
+        );
+        assert_eq!(VideoViewer::fmt_time(tgt), VideoViewer::fmt_time(expect_t));
+        assert!(wcx.debug_bounds("HOVER_TIME").is_some(), "松手后浮层复现并跟随新落点");
+        // 第二次拖拽后往条**上方**松手（x 仍在条内、y 出条）→ 浮层保持隐藏、不残影
+        wcx.simulate_mouse_down(d, MouseButton::Left, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let above = gpui::Point::new(d.x, px(mid.y.as_f32() - 40.0));
+        wcx.simulate_mouse_move(above, Some(MouseButton::Left), Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        wcx.simulate_mouse_up(above, MouseButton::Left, Default::default());
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let hover_x3 = wcx.cx.read(|app| viewer.read(app).hover_x);
+        assert_eq!(hover_x3, None, "条外纵向松手 → 不恢复 hover_x");
+        assert!(wcx.debug_bounds("HOVER_TIME").is_none(), "条外纵向松手 → 浮层不残影");
+        cx.run_until_parked();
+    }
+
+    /// F2 回归（锁「悬停防抖/不卡顿」语义）：播放中悬停后**快速**点击（<250ms 即点，hover
+    /// 预解码缓存来不及回填）——既有 idle 门（`!playing`）不投预解码（hover_generation 不
+    /// 推进、拉起不起 worker），点击直接走正常 seek 兜底（pending_seek 就位），主线程不被
+    /// 悬停机制阻塞（begin+end 同步返回）。快速点击绝不能误用「未就绪」的悬停缓存装屏。
+    /// （②长悬停命中、③pending_seek 期停投已由既有 `hover_cache_hit_serves_once_and_no_reseek`
+    /// 与 `hover_not_dispatched_during_pending_seek` 覆盖，此处不重复。）
+    #[gpui::test]
+    async fn hover_quick_click_while_playing_falls_back_to_normal_seek(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.duration = 10.0;
+            v.playing = true; // 播放中：悬停预解码机会式跳过（防抖门）
+            v
+        }));
+        // 悬停：记录位置；播放中不投预解码（generation 不推进 / worker 不被拉起）
+        ent.update(cx, |v, cx| v.update_hover_target(6.0, cx));
+        let (gen_before, got_cmd, cached) = ent.update(cx, |v, _| {
+            (
+                v.hover_generation.load(Ordering::SeqCst),
+                v.hover_cmd.is_some(),
+                v.hover_cache.is_some(),
+            )
+        });
+        assert_eq!(gen_before, 0, "播放中悬停不推进 hover_generation（不投预解码）");
+        assert!(!got_cmd, "播放中悬停不拉起 hover worker（零白投）");
+        assert!(!cached, "缓存未就绪（快速点击 <250ms 的前提）");
+        // 快速点击：begin+end 同步完成（主线程不被悬停机制阻塞），走正常 seek
+        ent.update(cx, |v, cx| v.begin_scrub(0.6, cx));
+        ent.update(cx, |v, cx| v.end_scrub(0.6, cx));
+        let (served, pend, scrub) = ent.update(cx, |v, _| {
+            (v.served_hover_target, v.pending_seek, v.scrubbing)
+        });
+        assert_eq!(served, None, "缓存未就绪 → 不得由 hover 服务（走正常 seek 兜底）");
+        let pend = pend.expect("快速点击应即时进入正常 seek（pending_seek 就位）");
+        assert!(
+            (pend - 6.0).abs() < 1e-6,
+            "pending_seek 应指向点击落点 6.0s，实得 {pend}"
+        );
+        assert!(!scrub, "点击后退出拖拽态");
+        cx.run_until_parked();
     }
 }
