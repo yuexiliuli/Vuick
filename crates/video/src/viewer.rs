@@ -537,6 +537,37 @@ struct FrameWake {
     rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
 }
 
+/// 把一个解码帧经 `tx` 入队，成功则 `wake` fire-and-forget 唤醒 pump（P1 事件驱动泵：
+/// 帧已入队 → 通知 pump，级联语义由 bounded cap 1 承载，满则丢弃不阻塞、不堆积）。
+/// 阻塞版 `send`（通道满时等 pump 排空）——常规播放/seek 预滚送帧共用。返回是否入队成功。
+fn send_relay(
+    tx: &std::sync::mpsc::SyncSender<FrameItem>,
+    wake: &std::sync::mpsc::SyncSender<()>,
+    item: FrameItem,
+) -> bool {
+    if tx.send(item).is_ok() {
+        let _ = wake.try_send(());
+        true
+    } else {
+        false
+    }
+}
+
+/// 非阻塞版 [`send_relay`]：`try_send` 立刻失败（=丢弃）不阻塞 worker——EOF/换代保底
+/// 路径专用（接收端已换走 / 通道满都不必等 pump 排空）。
+fn try_send_relay(
+    tx: &std::sync::mpsc::SyncSender<FrameItem>,
+    wake: &std::sync::mpsc::SyncSender<()>,
+    item: FrameItem,
+) -> bool {
+    if tx.try_send(item).is_ok() {
+        let _ = wake.try_send(());
+        true
+    } else {
+        false
+    }
+}
+
 /// 投递给常驻音频解码线程的命令（同视频；worker 持 sink 克隆、命令开头统一 flush）。
 struct AudioCmd {
     generation: u64,
@@ -881,7 +912,17 @@ impl VideoViewer {
                             let load_path = path.clone();
                             let subtitles = cx.background_executor().spawn(async move {
                                 super::decode::SubtitleReader::open(&load_path)
-                                    .map(|r| r.subtitles().to_vec())
+                                    .map(|r| {
+                                        let mut subs = r.subtitles().to_vec();
+                                        // 字幕文本一次性清洗（原先每帧 render 热路径重跑
+                                        // `parse_ass_text`：每帧分配 String + 2×replace）：加载完
+                                        // 即摊平为纯文本，render 直接消费 `entry.text`——渲染输出
+                                        // 逐字节一致（`parse_ass_text` 幂等，双洗同输出）。
+                                        for e in &mut subs {
+                                            e.text = parse_ass_text(&e.text);
+                                        }
+                                        subs
+                                    })
                                     .unwrap_or_else(|_| Vec::new())
                             }).await;
                             let _ = weak.update(cx, |this, cx| {
@@ -1288,10 +1329,7 @@ impl VideoViewer {
                     Ok(Some(frame)) if frame.pts() >= frame_target => {
                         // 落点前一帧保底（排空先有帧可上屏）；软帧发送失败直接丢弃（无池资源）
                         if let Some(p) = pre_roll.take() {
-                            if cmd.tx.send(p).is_ok() {
-                                // P1：帧已入队 → 通知 pump 事件驱动唤醒（bounded try_send 幂等）
-                                let _ = cmd.wake.try_send(());
-                            }
+                            let _ = send_relay(&cmd.tx, &cmd.wake, p);
                         }
                         // seek 探针写槽（每个 seek 一次）：此刻预滚数/回退量已定，
                         // 把解码阶段数据落进共享槽，供 tick 首帧落地时聚合打印。
@@ -1338,11 +1376,10 @@ impl VideoViewer {
                             }
                         }
                         // 发送成功（主线程接收）或换代（接收端已换走 = 帧丢弃）；软帧无池资源要回
-                        match cmd.tx.send(frame) {
-                            Ok(()) => {
-                                // P1：帧已入队 → 通知 pump（首帧/续帧都发；级联语义由
-                                // bounded cap 1 承载，满则丢弃不阻塞、不堆积）
-                                if seek_diag_enabled() {
+                        if seek_diag_enabled() {
+                            // seek 探针：wake 投递成功与否也落探针（仅 diag 下才关心 wake 细节）
+                            match cmd.tx.send(frame) {
+                                Ok(()) => {
                                     let w_ok = cmd.wake.try_send(()).is_ok();
                                     if seek_first_sent.is_some() && !seek_wake_dbg_printed {
                                         seek_wake_dbg_printed = true;
@@ -1352,12 +1389,12 @@ impl VideoViewer {
                                             cmd.target
                                         );
                                     }
-                                } else {
-                                    let _ = cmd.wake.try_send(());
+                                    true
                                 }
-                                true
+                                Err(_) => false,
                             }
-                            Err(_) => false,
+                        } else {
+                            send_relay(&cmd.tx, &cmd.wake, frame)
                         }
                     }
                     Ok(Some(frame)) => {
@@ -1371,9 +1408,7 @@ impl VideoViewer {
                     Ok(None) => {
                         // EOF 且一帧未过落点（seek 到片尾外）：回退最后预滚帧，不黑屏/不挂泵
                         if let Some(p) = pre_roll.take() {
-                            if cmd.tx.send(p).is_ok() {
-                                let _ = cmd.wake.try_send(());
-                            }
+                            let _ = send_relay(&cmd.tx, &cmd.wake, p);
                         }
                         false
                     }
@@ -1440,12 +1475,10 @@ impl VideoViewer {
                     // 本命以 EOF/解码错误结束（换代时不走此分支进入——换代已把旧接收端
                     // 换走，`try_send` 连不上、帧被丢弃且非必需；画面保留最近上屏帧，跟手
                     // 由 `SCRUB_RETARGET_MS` 节流保证，不依赖这里的保底）：把缓存的「落点
-                    // 前一帧」尽力送出，让 pump 在 EOF/出错时至少有一帧上屏。`try_send`：
+                    // 前一帧」尽力送出，让 pump 在 EOF/出错时至少有一帧上屏。`try_send_relay`：
                     // 接收端已换走/通道满都立刻失败（=丢弃），不阻塞 worker。
                     if let Some(p) = pre_roll.take() {
-                        if cmd.tx.try_send(p).is_ok() {
-                            let _ = cmd.wake.try_send(());
-                        }
+                        let _ = try_send_relay(&cmd.tx, &cmd.wake, p);
                     }
                     break; // 接收端已被换代/弃用
                 }
@@ -2449,27 +2482,32 @@ impl VideoViewer {
         cx.defer(move |app| app.drop_image(old, None));
     }
 
+    /// 装新帧/切文件时换下**当前已上屏**的旧帧：旧 BGRA 帧的图集 tile 延迟到本拍更新末尾
+    /// 释放（[`Self::drop_old_frame`]，见其注释）；旧 GPU 直通帧的共享槽回往 worker 池
+    /// （跨线程只传句柄数值）。三个替换点共用：`install_bgra` / `install_gpu` / `open_folder_index`。
+    fn swap_display(&mut self, cx: &mut Context<Self>) {
+        if let Some(old) = self.frame.take() {
+            self.drop_old_frame(old, cx);
+        }
+        if let Some(g) = self.gpu_frame.take() {
+            self.send_release(g.shared_handle);
+        }
+    }
+
     /// 把 BGRA 包成 `RenderImage` 上屏。`intrinsic` 优先保留打开期从 `params` 读到的
     /// **源尺寸**（decode-to-display 下采样后逐帧 w/h 是输出尺寸，宽高比一致即可）。
     fn install_bgra(&mut self, w: u32, h: u32, bgra: Vec<u8>, cx: &mut Context<Self>) {
         let t0 = Instant::now();
-        // 从 GPU 直通切回 BGRA（回退/切软解）：旧 GPU 帧共享槽回池复用
-        if let Some(g) = self.gpu_frame.take() {
-            self.send_release(g.shared_handle);
-        }
         // 帧字节移入 RenderImage（零拷贝）即持有时；截图在点击时经 `frame.as_bytes` 取回
         let buf = RgbaImage::from_raw(w, h, bgra).expect("解码帧长度恒为 w*h*4");
         let new = Arc::new(RenderImage::new(vec![Frame::new(buf)]));
-        // 旧帧被新帧替换的唯一点：显式 `drop_image` 释放被换下的旧图集 tile（P0 资源
-        // 泄漏——视频每帧新建 `RenderImage` → 全局自增 `ImageId`，图集 key 必 miss →
-        // 新 tile 只进不出，长会话 VRAM/图集持续上涨；`ImageSource::Render` 源图只经
-        // `drop_image` 下线，同 pdf/markdown-wysiwyg 姿势。gpui 语义：删 sprite_atlas
-        // 键并卸载对应 backend tile；已在先前帧 present 的旧场景不含此键，安全。
-        // 释放经 `drop_old_frame` 延迟到本拍更新末尾（见其注释：窗口上下文下当前窗口
-        // 不在 `App.windows`，当场 drop 会漏掉正在播放的窗口）。
-        if let Some(old) = self.frame.replace(new) {
-            self.drop_old_frame(old, cx);
-        }
+        // 旧帧被新帧替换的唯一点：显式释放被换下的旧图集 tile（P0 资源泄漏——视频每帧新建
+        // `RenderImage` → 全局自增 `ImageId`，图集 key 必 miss → 新 tile 只进不出，长会话
+        // VRAM/图集持续上涨；`ImageSource::Render` 源图只经 `drop_image` 下线，同 pdf/
+        // markdown-wysiwyg 姿势。gpui 语义：删 sprite_atlas 键并卸载对应 backend tile；已在
+        // 先前帧 present 的旧场景不含此键，安全。旧 GPU 帧共享槽一并回池（见 `swap_display`）。
+        self.swap_display(cx);
+        self.frame = Some(new);
         self.intrinsic.get_or_insert((w as f32, h as f32));
         if vprof_enabled() {
             VPROF_PRESENT.with(|acc| {
@@ -2518,14 +2556,7 @@ impl VideoViewer {
     /// 旧 GPU 帧槽回池，新句柄上屏。
     fn install_gpu(&mut self, f: GpuFrame, cx: &mut Context<Self>) {
         let (w, h) = (f.w, f.h);
-        // 从 BGRA 切回 GPU 直通：释放旧软帧图集 tile（与 install_bgra 同款 P0 姿势）
-        if let Some(old) = self.frame.take() {
-            self.drop_old_frame(old, cx);
-        }
-        // 旧 GPU 帧的共享槽回往 worker 池复用（跨线程只传句柄数值）
-        if let Some(g) = self.gpu_frame.take() {
-            self.send_release(g.shared_handle);
-        }
+        self.swap_display(cx);
         self.gpu_frame = Some(f);
         self.intrinsic.get_or_insert((w as f32, h as f32));
     }
@@ -2536,14 +2567,9 @@ impl VideoViewer {
             return;
         }
         self.path = self.nav.item(idx).expect("set_current 已校验越界");
-        // 切文件：旧媒体最后一帧的图集 tile 一并显式释放（与 install_bgra 同款 P0 姿势，
-        // 否则切换 Playlist 多支时每切一次漏一片 tile）；GPU 直通帧的共享槽回往 worker。
-        if let Some(old) = self.frame.take() {
-            self.drop_old_frame(old, cx);
-        }
-        if let Some(g) = self.gpu_frame.take() {
-            self.send_release(g.shared_handle);
-        }
+        // 切文件：旧媒体最后一帧的图集 tile 与 GPU 直通共享槽一并释放（与 install_bgra 同款
+        // P0 姿势，否则切换 Playlist 多支时每切一次漏一片 tile / 槽位）
+        self.swap_display(cx);
         self.intrinsic = None;
         self.loading = true;
         self.load_error = None;
@@ -4031,7 +4057,8 @@ impl Render for VideoViewer {
         // 「白字黑描边」的落底实现，零新依赖）。
         if self.subtitle_visible && !self.subtitles.is_empty() {
             if let Some(subtitle) = find_active_subtitle(&self.subtitles, self.playhead) {
-                let text = parse_ass_text(&subtitle.text);
+                // 文本已在加载时清洗（见 start());当前在字幕窗口内 → 直接显示
+                let text = subtitle.text.clone();
                 if !text.trim().is_empty() {
                     let (vx, vy, vdw, vdh) = vrect;
                     // 随画面高度适度放大（参考高度 480，钳位 0.8x..=1.8x）

@@ -712,8 +712,7 @@ impl AudioReader {
             if self.skip_until >= 0.0
                 && let Some(p) = packet.as_ref().and_then(|p| p.pts())
             {
-                let p_sec = p as f64 * f64::from(self.time_base.numerator())
-                    / f64::from(self.time_base.denominator());
+                let p_sec = pts_to_seconds(p, self.time_base);
                 if p_sec < self.skip_until {
                     continue;
                 }
@@ -743,9 +742,7 @@ impl AudioReader {
             }
             let mut decoded = ffmpeg::frame::Audio::empty();
             while self.decoder.receive_frame(&mut decoded).is_ok() {
-                let pts = decoded.pts().unwrap_or(0) as f64
-                    * f64::from(self.time_base.numerator())
-                    / f64::from(self.time_base.denominator());
+                let pts = pts_to_seconds(decoded.pts().unwrap_or(0), self.time_base);
                 self.last_pts = pts;
                 // 帧级 gate（包级跳过的兜底：时间戳缺失/落点偏差时仍保证不从落点前起播）
                 if self.skip_until >= 0.0 && pts < self.skip_until {
@@ -771,6 +768,12 @@ impl AudioReader {
         }
         None
     }
+}
+
+/// 帧 pts（第纳秒）转秒（time_base 换算）——视频/音频共用的公共换算。
+#[inline]
+fn pts_to_seconds(pts: i64, time_base: ffmpeg::Rational) -> f64 {
+    pts as f64 * f64::from(time_base.numerator()) / f64::from(time_base.denominator())
 }
 
 /// 可 seek 的持久视频解码器。
@@ -1090,14 +1093,18 @@ impl VideoReader {
     /// 的主要加速来源（交接文档「seek2first 占 90%+」直指本路径）。
     ///
     /// 线程归属调用方（worker 拉帧），恒持 [`FFMPEG_LOCK`]；`seek_inner` 不再重复加锁。
-    pub fn skip_to_bgra_into(
+    /// 三段逐帧解码循环（seek 预滚 / 逐帧 BGRA / 逐帧 HW）共享的私有**逐帧驱动**：
+    /// 骨架 = `next_video_packet → send_packet → 把解码器产出的全部帧给 `accept` 取舍`，
+    /// 包耗尽后进入 EOF drain（`send_eof` + 继续 `receive_frame` 取完缓冲）。三条路径
+    /// 只供一个 `accept`（每收到一帧调一次）：返回 `Some(_)` 立即交货提前返回，`None`
+    /// 继续解下一帧；EOF drain 耗尽仍无帧 → `Ok(None)`（之后可再 seek 复用）。
+    ///
+    /// **不改任何一条路径的处理细节语义**（跳过/计数/EOF 行为与三条旧循环逐码一致）；
+    /// 加锁由公共入口负责，本驱动器不重复上锁。
+    fn drain_until<T>(
         &mut self,
-        target: f64,
-        out: &mut [u8],
-    ) -> Result<Option<(f64, u32, u32, u64)>> {
-        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        self.seek_inner(target)?;
-        let mut skipped: u64 = 0;
+        mut accept: impl FnMut(&mut Self, &ffmpeg::frame::Video) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
         loop {
             let packet = self.next_video_packet();
             let packet = match packet {
@@ -1110,15 +1117,8 @@ impl VideoReader {
                     }
                     let mut f = ffmpeg::frame::Video::empty();
                     while self.decoder.receive_frame(&mut f).is_ok() {
-                        let Some(pts) = f.pts() else {
-                            continue;
-                        };
-                        if self.pts_seconds(pts) >= target {
-                            if let Some((p, w, h)) = self.convert_bgra_into(&f, out)? {
-                                return Ok(Some((p, w, h, skipped)));
-                            }
-                        } else {
-                            skipped += 1;
+                        if let Some(v) = accept(self, &f)? {
+                            return Ok(Some(v));
                         }
                     }
                     return Ok(None);
@@ -1130,25 +1130,40 @@ impl VideoReader {
             // 一个包可能产出 0~多帧（B 帧）；全部消耗到 EAGAIN 再喂下个包
             let mut f = ffmpeg::frame::Video::empty();
             while self.decoder.receive_frame(&mut f).is_ok() {
-                let Some(pts) = f.pts() else {
-                    continue;
-                };
-                if self.pts_seconds(pts) >= target {
-                    if let Some((p, w, h)) = self.convert_bgra_into(&f, out)? {
-                        return Ok(Some((p, w, h, skipped)));
-                    }
-                } else {
-                    skipped += 1;
+                if let Some(v) = accept(self, &f)? {
+                    return Ok(Some(v));
                 }
             }
         }
     }
 
+    pub fn skip_to_bgra_into(
+        &mut self,
+        target: f64,
+        out: &mut [u8],
+    ) -> Result<Option<(f64, u32, u32, u64)>> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.seek_inner(target)?;
+        // 落点前帧只解码不转换（不算 skipped 的 sws/回读）；第一个 pts ≥ target 的帧一次性
+        // 转 BGRA 交货（`convert_bgra_into` 对已确认有 pts 的帧恒定产出，`None` 仅防御）。
+        let mut skipped: u64 = 0;
+        self.drain_until(|this, f| {
+            let Some(pts) = f.pts() else {
+                return Ok(None);
+            };
+            if this.pts_seconds(pts) >= target {
+                Ok(this.convert_bgra_into(f, out)?.map(|(p, w, h)| (p, w, h, skipped)))
+            } else {
+                skipped += 1;
+                Ok(None)
+            }
+        })
+    }
+
     /// 帧 pts（第纳秒）转秒（time_base 换算）。
     #[inline]
     fn pts_seconds(&self, pts: i64) -> f64 {
-        pts as f64 * f64::from(self.time_base.numerator())
-            / f64::from(self.time_base.denominator())
+        pts_to_seconds(pts, self.time_base)
     }
 
     /// 推进到**下一帧**并转成 BGRA。返回 [`DecodedFrame`]；
@@ -1178,36 +1193,7 @@ impl VideoReader {
     /// 一次（release 下输出 ~2.3MB），是解码→上屏路径里的冗余复制之一。
     pub fn next_frame_bgra_into(&mut self, out: &mut [u8]) -> Result<Option<(f64, u32, u32)>> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            let packet = self.next_video_packet();
-            let packet = match packet {
-                Some(p) => p,
-                None => {
-                    // 流结束：drain 掉解码器缓冲的剩余帧
-                    if !self.drained {
-                        self.decoder.send_eof().ok();
-                        self.drained = true;
-                    }
-                    let mut f = ffmpeg::frame::Video::empty();
-                    while self.decoder.receive_frame(&mut f).is_ok() {
-                        if let Some(r) = self.convert_bgra_into(&f, out)? {
-                            return Ok(Some(r));
-                        }
-                    }
-                    return Ok(None);
-                }
-            };
-            self.decoder
-                .send_packet(&packet)
-                .context("decoder send_packet 失败")?;
-            // 一个包可能产出 0~多帧（B 帧）；全部消耗到 EAGAIN 再喂下个包
-            let mut f = ffmpeg::frame::Video::empty();
-            while self.decoder.receive_frame(&mut f).is_ok() {
-                if let Some(r) = self.convert_bgra_into(&f, out)? {
-                    return Ok(Some(r));
-                }
-            }
-        }
+        self.drain_until(|this, f| this.convert_bgra_into(f, out))
     }
 
     /// 取属于本视频流的下一个 demux 包（跨流包一律跳过、不影响光标）。
@@ -1229,36 +1215,7 @@ impl VideoReader {
     /// `HwFrame` 为 `Send`，可跨线程持有/释放（槽位引用计数原子，见 [`HwFramePin`]）。
     pub fn next_frame_hw(&mut self) -> Result<Option<HwFrame>> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            let packet = self.next_video_packet();
-            let packet = match packet {
-                Some(p) => p,
-                None => {
-                    // 流结束：drain 掉解码器缓冲的剩余帧
-                    if !self.drained {
-                        self.decoder.send_eof().ok();
-                        self.drained = true;
-                    }
-                    let mut f = ffmpeg::frame::Video::empty();
-                    while self.decoder.receive_frame(&mut f).is_ok() {
-                        if let Some(hw) = self.hw_frame_from(&f) {
-                            return Ok(Some(hw));
-                        }
-                    }
-                    return Ok(None);
-                }
-            };
-            self.decoder
-                .send_packet(&packet)
-                .context("decoder send_packet 失败")?;
-            // 一个包可能产出 0~多帧（B 帧）；全部消耗到 EAGAIN 再喂下个包
-            let mut f = ffmpeg::frame::Video::empty();
-            while self.decoder.receive_frame(&mut f).is_ok() {
-                if let Some(hw) = self.hw_frame_from(&f) {
-                    return Ok(Some(hw));
-                }
-            }
-        }
+        self.drain_until(|this, f| Ok(this.hw_frame_from(f)))
     }
 
     /// 把解码出的一个 HW 帧复制为可独立存活的 [`HwFrame`]：无 pts 的帧跳过（`None`）；
@@ -1287,8 +1244,7 @@ impl VideoReader {
                 return None;
             }
 
-            let secs = pts as f64 * f64::from(self.time_base.numerator())
-                / f64::from(self.time_base.denominator());
+            let secs = self.pts_seconds(pts);
             Some(HwFrame {
                 pts_seconds: secs,
                 width: f.width(),
@@ -1364,8 +1320,7 @@ impl VideoReader {
             return Err(anyhow!("解码输出缓冲过小: {} < 需要 {}", out.len(), need));
         }
         out[..need].copy_from_slice(&bgra.data(0)[..need]);
-        let secs = pts as f64 * f64::from(self.time_base.numerator())
-            / f64::from(self.time_base.denominator());
+        let secs = self.pts_seconds(pts);
         Ok(Some((secs, self.out_width, self.out_height)))
     }
 }
@@ -1870,8 +1825,7 @@ mod tests {
         let t = std::time::Instant::now();
         out[..need].copy_from_slice(&bgra.data(0)[..need]);
         stage[ST_COPY] += t.elapsed().as_secs_f64();
-        let secs = pts as f64 * f64::from(r.time_base.numerator())
-            / f64::from(r.time_base.denominator());
+        let secs = r.pts_seconds(pts);
         Ok(Some((secs, r.out_width, r.out_height)))
     }
 
@@ -2225,15 +2179,6 @@ pub struct SubtitleEntry {
 /// [`FFMPEG_LOCK`] —— 同视频/音频的串行纪律。
 pub struct SubtitleReader {
     ictx: std::mem::ManuallyDrop<ffmpeg::format::context::Input>,
-    /// 字幕流索引 / 时间基 / 格式：open 期已消费（扫描解析用）；暂存供后续「流级
-    /// 重定位 / 增量拉取」能力使用，当前消费方（`subtitles()`/`subtitle_at`/FFI）
-    /// 只读解析后的清单 → 系预留，非死代码。
-    #[allow(dead_code)]
-    stream_index: usize,
-    #[allow(dead_code)]
-    time_base: ffmpeg::Rational,
-    #[allow(dead_code)]
-    format: SubtitleFormat,
     /// 已确定的输出参数（仅供 [`Self::params`] 返回）。
     params: SubtitleParams,
     /// 预加载的字幕清单（打开时一次性加载全部）。
@@ -2299,7 +2244,8 @@ impl SubtitleReader {
             format,
         };
         
-        // 一次性加载所有字幕（`ictx.packets()` 产出 `(Stream, Packet)` 元组，迭代无失败分支）
+        // 一次性加载所有字幕（`ictx.packets()` 产出 `(Stream, Packet)` 元组，迭代无失败分支）；
+        // `stream_index/time_base/format` 只在 open 期扫描解析用，不作暂存（无流级重定位消费者）
         let mut subtitles = Vec::new();
         for (stream, pkt) in ictx.packets() {
             if stream.index() == stream_index {
@@ -2326,9 +2272,6 @@ impl SubtitleReader {
         
         Ok(Self {
             ictx: std::mem::ManuallyDrop::new(ictx),
-            stream_index,
-            time_base,
-            format,
             params,
             subtitles,
             current_index: 0,
@@ -2495,10 +2438,10 @@ impl SubtitleReader {
     
     /// 获取当前时间应显示的字幕。
     ///
-    /// 线性扫描（窗口可重叠、含端点，与 `vff_subtitle_at` 在 FFI 内联的实现同口径）。
-    /// 生产 FFI `vff_subtitle_at` 已按索引内联匹配（见 lib.rs）——本方法保留供
-    /// 单测/上层 API 使用，勿再按 `start_pts` 回查索引（重复 start_pts 会误配）。
-    #[allow(dead_code)] // 供单测与上层 API 使用，生产 index 匹配在 vff_subtitle_at 内联
+    /// 线性扫描（窗口可重叠、含端点，与 `vff_subtitle_at` 同口径）。显示路径已被
+    /// `video::subtitle::find_active_subtitle` 取代（dormancy）——本方法仅供本 crate
+    /// 单测对拍（生产 FFI `vff_subtitle_at` 保留符号、同款 dormancy 注释，见 lib.rs）。
+    #[allow(dead_code)] // 仅单测对拍用（dormancy：显示已走 find_active_subtitle）
     pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
         for entry in &self.subtitles {
             if seconds >= entry.start_pts && seconds <= entry.end_pts {

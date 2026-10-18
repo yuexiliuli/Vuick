@@ -119,6 +119,29 @@ mod tests {
         assert!(!cleaned.contains('{') && !cleaned.contains('}'));
     }
 
+    /// 对拍「清洗前渲染 vs 清洗后渲染」：旧 render 每帧调 `parse_ass_text(raw)`；新实现把
+    /// 清洗移到**加载时**（`entry.text = parse_ass_text(raw)` 存回，render 直接读 `entry.text`）。
+    /// 两者逐字节一致 ⟺ `parse_ass_text` 幂等（双洗同输出）——覆盖真实 ASS 常见样式：
+    /// 覆盖块 / HTML 标记 / 换行转义。
+    #[test]
+    fn parse_ass_text_move_to_load_keeps_render_output_identical() {
+        let raws = [
+            r#"{\an8}<font face="微软雅黑" size="32"><b>这是一条测试字幕</b></font>"#,
+            r#"{\b1}Hello{\b0} World"#,
+            "上\\N下 左\\n右",
+            "<i>斜体</i>与{\\pos(0,0)}纯文本",
+            "无样式纯文本",
+        ];
+        for raw in raws {
+            let once = parse_ass_text(raw);
+            assert_eq!(
+                parse_ass_text(&once),
+                once,
+                "双洗同输出（旧=parse(raw)、新=读取已清洗文本）: {raw:?}"
+            );
+        }
+    }
+
     /// 活动字幕按 [start, end] 闭区间命中；区间外不命中。
     #[test]
     fn find_active_subtitle_selects_by_window() {

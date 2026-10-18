@@ -492,10 +492,11 @@ pub unsafe extern "C" fn vff_subtitle_get_text(
 
 /// 获取当前时间应显示的字幕索引（-1 = 无）。
 ///
-/// 直接按「窗口包含该秒」扫描返回**首个命中索引**，与视频端 `find_active_subtitle`
-/// 同口径（开区间逐条扫描、含端点）。**不可**用先取 entry 再按 `start_pts` 相等的
-/// `position` 回查：重叠字幕窗口可能出现相同 `start_pts`，position 会误配到非命中的
-/// 首条。字幕按 start 排序、窗口可重叠，线性是唯一可靠匹配。
+/// **dormancy（dormant）**：显示路径已被视频端 `find_active_subtitle` 取代（crates/video
+/// 逐帧在 render 用预加载清单二分命中），本符号**不再被生产消费**——仅因主程序 FFI
+/// 加载器（`crates/video/src/decode.rs` 的 `load_bridge`）仍按 `vff_subtitle_at\0` 解析
+/// 符号而**保留导出**（缺符号会导致整桥加载失败 → 视频不可用）。保留按「窗口包含该秒」
+/// 扫描返回首个命中索引（与 `find_active_subtitle` 同口径：开区间逐条、含端点）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_subtitle_at(h: *mut c_void, seconds: f64) -> c_int {
     let r = reader::<SubtitleReader>(h);

@@ -864,9 +864,12 @@ impl SubtitleReader {
     pub fn subtitles(&self) -> &[SubtitleEntry] {
         &self.subtitles
     }
-    
-    /// 获取当前时间应显示的字幕。
-    #[allow(dead_code)] // 保留供后续扩展用
+}
+
+/// 仅测试构建存在：当前时间应显示的字幕（生产显示走 `crate::video::subtitle::find_active_subtitle`，
+/// 预加载清单二分命中；FFI `vff_subtitle_at` 因此 dormancy，见 video-ffmpeg/src/lib.rs）。
+#[cfg(test)]
+impl SubtitleReader {
     pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
         self.subtitles.iter().find(|s| seconds >= s.start_pts && seconds <= s.end_pts)
     }

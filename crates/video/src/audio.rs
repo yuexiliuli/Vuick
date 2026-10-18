@@ -104,7 +104,6 @@ impl AudioSink {
     }
 
     /// 播放位置（秒）= 已播帧数 / 采样率；seek 后 `flush` 归零。
-    #[allow(dead_code)] // M4 音频时钟接入后启用（当前墙钟播放）
     pub fn position(&self) -> f64 {
         self.inner.played_frames.load(Ordering::Relaxed) as f64
             / f64::from(self.inner.sample_rate)
