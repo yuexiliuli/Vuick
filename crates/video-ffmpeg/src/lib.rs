@@ -109,6 +109,23 @@ pub unsafe extern "C" fn vff_video_is_hw(h: Handle) -> c_int {
     reader::<VideoReader>(h).is_hw() as c_int
 }
 
+/// 探测驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」：这是双设备 GPU 直通让渲染
+/// 设备对共享 NV12 建平面 SRV 采样 YUV 的前提。1 = 支持（可走直通）；0 = 不支持（Intel Arc
+/// 等驱动实测 `CreateTexture2D` E_INVALIDARG，纹理不可做 SRV → 须回落 SAFE 硬解 BGRA）。
+/// 纯 device/frames 上下文探测、**不开解码器**，无副作用；`device` 为空 → 0。与
+/// [`VideoReader::open_external_hw`] 内部的能力探测同源（同一函数、同一次构建）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_d3d11_supports_shader_bound_textures(
+    device: *mut c_void,
+    device_context: *mut c_void,
+) -> c_int {
+    // 本函数是**独立成组**的 FFmpeg 入口（门控在 worker 开媒体时调，可能与 hover/音频
+    // worker 的解码并发跑）：所有 FFI 调用必须过 FFMPEG_LOCK 串行（decode.rs 注释同款
+    // 纪律）——否则并发的 av_hwdevice/frame ctx init 与解码互卡（72.MP4 实测卡死同源）。
+    let _g = decode::FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    decode::d3d11_supports_shader_bound_textures(device, device_context) as c_int
+}
+
 /// **seek 预滚**：`seek(target)` 后逐帧解码，落点前帧**只解码不转换**（硬件 ≈0.5ms/帧、
 /// 软解 ≈2.9ms/帧），第一个 `pts ≥ target` 的帧一次性转 BGRA 拷进 `out_buf`，并写出
 /// `*pts/*w/*hh/*skipped`（已跳帧数，含 demux 包级已越过的前帧计数口径同旧预滚）。

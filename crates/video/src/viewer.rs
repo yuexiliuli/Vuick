@@ -210,6 +210,14 @@ struct SeekDiag {
     skipped: u32,
     /// 首个 ≥ target 帧 pts。
     firstpts: f64,
+    // —— 各节点细分探针（[SEEKNODE]，env 开才打印；普通运行 None 空置，零开销）——
+    /// cmd 实际投递完成的 GUI 线程时刻（`start_decoder_at` 记）：[SEEK] total 起点与
+    /// [SEEKNODE]「submit」终点。
+    sent: Option<Instant>,
+    /// worker 收到 cmd、开始处理的时刻（`video_worker` 命令开头记）：[SEEKNODE]「wake」终点。
+    recv: Option<Instant>,
+    /// worker 打开/复用完成、`reader.seek` 之前的时刻（[SEEKNODE] 把「open」与「seek 调用」拆开）。
+    opened: Option<Instant>,
 }
 
 static SEEK_DIAG_SLOT: std::sync::OnceLock<std::sync::Mutex<Option<SeekDiag>>> =
@@ -878,9 +886,10 @@ impl VideoViewer {
         self.pending_seek = Some(target);
         // seek 全链路探针：会话号递增；仅「seek 型」命令（result_tx 空）开槽记触发时刻，
         // 换媒体（挂握手通道）不算 seek、不打印。普通运行只多一次 u64 写。
+        let is_seek = result_tx.is_none();
         let seek_session = SEEK_DIAG_SESSION.fetch_add(1, Ordering::Relaxed) + 1;
         self.diag_session = seek_session;
-        if seek_diag_collect() && result_tx.is_none() {
+        if seek_diag_collect() && is_seek {
             *seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(SeekDiag {
                 session: seek_session,
                 target,
@@ -899,6 +908,18 @@ impl VideoViewer {
             seek_session,
         };
         if let Some(tx) = &self.decode_cmd {
+            // 探针：先记「投稿完成时刻」再 send——worker 首帧写槽会整块替换 SeekDiag，
+            // 若 send 后才补写，竞争窗口内 worker 替换会把它记成 None、[SEEKNODE] 丢行。
+            if seek_diag_collect() && is_seek {
+                if let Some(d) = seek_diag_slot()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_mut()
+                    .filter(|d| d.session == seek_session)
+                {
+                    d.sent = Some(Instant::now());
+                }
+            }
             let _ = tx.send(cmd);
         }
         if restart_audio {
@@ -967,6 +988,10 @@ impl VideoViewer {
             } else {
                 ReaderMode::Auto(cmd.cap)
             };
+            // 探针：seek 全链路细化（env 开或 test 构建采集，打印仍只按 env；媒体切换命令
+            // 不采集）。`t_recv` = 命令到 worker 的处理开始时刻（[SEEKNODE]「wake」终点）。
+            let seek_diag_on = seek_diag_collect() && cmd.result_tx.is_none();
+            let t_recv = if seek_diag_on { Some(Instant::now()) } else { None };
             let same = matches!(&active, Some((p, m, _, _)) if *p == cmd.path && *m == mode);
             if !same {
                 // 打开（按模式；双设备/SAFE/软解任一成功即用，全失败 → 报错跳过本命令）
@@ -991,6 +1016,9 @@ impl VideoViewer {
                 // 尺寸不填（loading 只关参数缺失），切换窗口期对撞时即触发。
                 let _ = out.send(Ok(active.as_ref().expect("复用分支已有 reader").2.params()));
             }
+            // 探针：打开/复用完成、`reader.seek` 之前时刻——[SEEKNODE] 把「open」（含打开/复用）
+            // 与「seek 调用」（reader.seek，软解/双设备才走；SAFE 硬解靠 skip_to_bgra 内部完成）拆开
+            let t_opened = if seek_diag_on { Some(Instant::now()) } else { None };
             // 直通（worker 自有设备 open_hw）是否接管：`active[3]` Some ⇔ 双设备已接管
             let mut dual = matches!(&active, Some((_, _, _, Some(_))));
             // 硬解 reader 判别：SAFE BGRA（FFmpeg 自有设备）与双设备（worker 自有设备）
@@ -1009,10 +1037,9 @@ impl VideoViewer {
                 .as_ref()
                 .map(|(_, _, r, _)| r.source_cap())
                 .unwrap_or(1);
-            // seek 全链路探针（env 开或 test 构建采集，打印仍只按 env；本命仅 seek 命令开）：
-            // 收集「回退量 / 预滚数 / 首帧≥target 入队时刻」，首帧入队瞬间写槽（此时
-            // 解码量已定——预滚帧全在它之前），tick 首帧上屏时聚合打印一次。
-            let seek_diag_on = seek_diag_collect() && cmd.result_tx.is_none();
+            // seek 全链路探针（`seek_diag_on` 已在命令开头定）：收集「回退量 / 预滚数 /
+            // 首帧≥target 入队时刻」，首帧入队瞬间写槽（此时解码量已定——预滚帧全在它之前），
+            // tick 首帧上屏时聚合打印一次。
             let seek_worker_start = if seek_diag_on { Some(Instant::now()) } else { None };
             let mut seek_first_decoded = true;
             let mut seek_regress: f64 = 0.0;
@@ -1214,6 +1241,10 @@ impl VideoViewer {
                                         .as_ref()
                                         .and_then(|s| s.trigger)
                                         .or(worker_start),
+                                    // GUI 线程投递时刻沿用 start_decoder_at 预填（[SEEKNODE]「submit」）
+                                    sent: sslot.as_ref().and_then(|s| s.sent),
+                                    recv: t_recv,
+                                    opened: t_opened,
                                     worker_start,
                                     t_sent: seek_first_sent,
                                     reuse: same,
@@ -1356,19 +1387,37 @@ impl VideoViewer {
                 // 任一环节失败（建设备/open_hw）→ 回落 SAFE BGRA 硬解（与旧 auto 行为一致）。
                 if dual_path_allowed() {
                     if let Some(worker) = create_worker_d3d11_device() {
-                        let raw_dev = worker.device.as_raw() as usize;
-                        let raw_ctx = worker.context.as_raw() as usize;
-                        if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
-                            #[cfg(test)]
-                            {
-                                DUAL_ENGAGED.store(true, Ordering::Relaxed);
-                                HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
+                        // 能力门控：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」——
+                        // 这是双设备直通让渲染设备对共享 NV12 建平面 SRV 采样 YUV 的前提。不支持
+                        //（Intel Arc 等驱动实测 `CreateTexture2D` E_INVALIDARG）→ 纹理不可做
+                        // SRV、像素着色器 Sample 出绿屏 → 停用双设备、回落 SAFE 硬解 BGRA。
+                        let shr_ok = crate::decode::VideoReader::supports_shader_bound_textures(
+                            worker.device.as_raw() as usize,
+                            worker.context.as_raw() as usize,
+                        );
+                        if shr_ok {
+                            let raw_dev = worker.device.as_raw() as usize;
+                            let raw_ctx = worker.context.as_raw() as usize;
+                            if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
+                                #[cfg(test)]
+                                {
+                                    DUAL_ENGAGED.store(true, Ordering::Relaxed);
+                                    HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
+                                }
+                                return Ok((
+                                    ReaderMode::Auto(*cap),
+                                    r,
+                                    Some(SharedCopier::new(worker)),
+                                ));
                             }
-                            return Ok((
-                                ReaderMode::Auto(*cap),
-                                r,
-                                Some(SharedCopier::new(worker)),
-                            ));
+                        } else {
+                            // 门控日志：OnceLock 只打一次（禁每次 seek/重开刷屏）
+                            static DUAL_GATED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            DUAL_GATED.get_or_init(|| {
+                                eprintln!(
+                                    "[GPU passthrough] 本机驱动不支持平面 SRV 采样（D3D11VA 纹理不可做 SRV），双设备直通停用 → SAFE 硬解 BGRA"
+                                );
+                            });
                         }
                     }
                 }
@@ -1780,6 +1829,42 @@ impl VideoViewer {
                         "[SEEK] total={:.1}ms reuse={} regress={:+.2}s skipped={} seek2first={:.1}ms frame2screen={:.1}ms target={:.2}s firstpts={:.2}s",
                         total, reuse, regress, skipped, s2f, f2s, target, firstpts,
                     );
+                    // [SEEKNODE] 各节点细分：submit=GUI 提交、wake=channel+线程唤醒、
+                    // open=打开/复用、seek=reader.seek 调用、preroll=seek 后首帧≥target 解码、
+                    // screen=入队→tick 上屏、total=点击→上屏（应与 [SEEK] total 吻合）。
+                    // 缺少任一关键时刻（如旧路径未采集）则不打印，[SEEK] 聚合不受影响。
+                    if let Some(d) = seek_diag_slot()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .filter(|d| d.session == self.diag_session)
+                    {
+                        if let (Some(tr), Some(s), Some(r), Some(op), Some(ws), Some(ts)) = (
+                            d.trigger,
+                            d.sent,
+                            d.recv,
+                            d.opened,
+                            d.worker_start,
+                            d.t_sent,
+                        ) {
+                            let dn = Instant::now();
+                            let ms =
+                                |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1000.0;
+                            eprintln!(
+                                "[SEEKNODE] submit={:.1}ms wake={:.1}ms open={:.1}ms seek={:.1}ms preroll={:.1}ms screen={:.1}ms total={:.1}ms reuse={} skipped={} target={:.2}s",
+                                ms(tr, s),
+                                ms(s, r),
+                                ms(r, op),
+                                ms(op, ws),
+                                ms(ws, ts),
+                                ms(ts, dn),
+                                ms(tr, dn),
+                                if d.reuse { 1u8 } else { 0u8 },
+                                d.skipped,
+                                d.target,
+                            );
+                        }
+                    }
                     *seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
                     self.diag_session = 0;
                 }
@@ -3682,6 +3767,19 @@ mod tests {
         }
     }
 
+    /// 双设备门控的**机器能力**探测：建 worker 自有 D3D11 设备 + 查询驱动是否支持「D3D11VA
+    /// 解码数组纹理带 SHADER_RESOURCE」。`None` = 本机连 worker D3D11 设备都建不起（测试
+    /// SKIP）；`Some(true)` = 可走双设备直通；`Some(false)`（Intel Arc 等驱动实测）→ 门控
+    /// 必须停用双设备、回落 SAFE 硬解 BGRA。与 `open_reader_for_mode` 内的门控同款探测姿势。
+    fn dual_gate_capability() -> Option<bool> {
+        use windows::core::Interface as _;
+        let worker = crate::hw::create_worker_d3d11_device()?;
+        Some(crate::decode::VideoReader::supports_shader_bound_textures(
+            worker.device.as_raw() as usize,
+            worker.context.as_raw() as usize,
+        ))
+    }
+
     /// delta 回归（音频 worker 复用）：常驻 `AudioReader` 连续 seek 回不同落点，每次重新
     /// 起播首块 pts 落在目标附近（reuse 不重开文件、`AudioReader::seek` 冲掉 swr 残留）。
     /// 真音频（`target\视频测试.mp4` 有音轨），缺夹具 SKIP（AGENTS.md §5）。
@@ -4622,6 +4720,16 @@ mod tests {
         let _dual = DualPathGuard::new();
         let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（直通优先）
         let _fault_bl = FaultAndBlGuard; // 黑名单/注入都不带进本测
+        // 机器自适应：先在**门控同款**的 worker 设备上探测「D3D11VA 数组纹理带 SHADER_RESOURCE」。
+        // 支持 → 直通断言（本测原路径）；不支持（Intel Arc 等驱动实测）→ 断言门控回落 SAFE。
+        let shr_supported = match dual_gate_capability() {
+            Some(v) => v,
+            None => {
+                eprintln!("SKIP: 本机连 worker 自有 D3D11 设备都建不起（双设备不可测）");
+                return;
+            }
+        };
+        eprintln!("[GPU passthrough] 本机 D3D11VA 平面 SRV 采样能力 = {shr_supported}");
         dual_engaged_reset();
         hw_engaged_reset();
         let viewer: gpui::Entity<VideoViewer> =
@@ -4642,6 +4750,67 @@ mod tests {
             cx.background_executor.timer(Duration::from_millis(5)).await;
             wait += 1;
             assert!(wait < 6000, "等待双设备首帧上屏超时");
+        }
+        if !shr_supported && !dual_engaged() {
+            // 能力 false（本机）：门控停用双设备 → 断言回落 SAFE BGRA 且出帧正常（首帧可用、
+            // gpu_frame 恒 None、pts 单调、paint 探针为 0——SAFE 走 img 不调 paint_external_yuv）。
+            eprintln!(
+                "[GPU passthrough] 能力 false → 门控停用双设备（dual_engaged={}，hw_engaged={}）",
+                dual_engaged(),
+                hw_engaged()
+            );
+            let mut last_pts = -1.0f64;
+            for _ in 0..10 {
+                viewer.update(cx, |v, cx| {
+                    v.playhead += 0.5;
+                    let _ = v.tick(cx);
+                });
+                cx.background_executor.timer(Duration::from_millis(8)).await;
+                let (pts, frame, gpu) = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (
+                        v.last_frame_pts.unwrap_or(last_pts),
+                        v.frame.is_some(),
+                        v.gpu_frame.is_some(),
+                    )
+                });
+                assert!(frame, "门控回落路径应有 SAFE BGRA 帧上屏");
+                assert!(!gpu, "门控回落路径不应有 GPU 帧（gpu_frame 恒 None）");
+                assert!(
+                    pts >= last_pts - 1e-6,
+                    "门控回落帧 pts 应单调: {pts:.2} < {last_pts:.2}"
+                );
+                last_pts = pts;
+            }
+            // 强制 draw：SIMD BGRA 走 img（无 canvas paint_external_yuv）→ 探针 0
+            struct ViewerHost {
+                viewer: gpui::Entity<VideoViewer>,
+            }
+            impl gpui::Render for ViewerHost {
+                fn render(
+                    &mut self,
+                    _window: &mut gpui::Window,
+                    _cx: &mut gpui::Context<Self>,
+                ) -> impl gpui::IntoElement {
+                    self.viewer.clone()
+                }
+            }
+            let (_host, vcx) = cx.add_window_view(|_window, _cx| ViewerHost {
+                viewer: viewer.clone(),
+            });
+            vcx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+            let probe_handle = crate::hw::take_hw_paint_probe();
+            assert_eq!(
+                probe_handle, 0,
+                "能力 false 门控回落 SAFE 不应触发 GPU paint 探针（probe={probe_handle:#x}）"
+            );
+            eprintln!(
+                "[GPU passthrough] 能力 false：门控回落 SAFE BGRA（frame 上屏、gpu_frame=None、无 paint 探针），pts 至 {last_pts:.2}s"
+            );
+            cx.run_until_parked();
+            return;
         }
         if !dual_engaged() {
             // 本机无 D3D11VA h264 硬解 / 解码器不支持外部设备注入 / 语义级不支持 → 直通必然
@@ -4715,6 +4884,109 @@ mod tests {
         eprintln!(
             "[GPU passthrough] 探针 shared_handle={probe_handle:#x} 步进 {advanced} 帧 pts 至 {last_pts:.2}s（槽池循环复用，无 pool exceeded）"
         );
+        cx.run_until_parked();
+    }
+
+    /// 机器自适应门控回归（纯代码、不开 GUI）：开启直通（[`DualPathGuard`]）+ auto 模式 +
+    /// 真实夹具 `target\视频测试.mp4`：
+    /// - 能力 false（本机 Intel Arc 不支持平面 SRV 采样）→ 门控必须停用双设备：断言
+    ///   `dual_engaged()==false`、帧为 SAFE BGRA（`frame` Some / `gpu_frame` 恒 None）、
+    ///   首帧可用、步进 pts 单调（对应 `open_reader_for_mode` 的回落路径仍在工作）；
+    /// - 能力 true → 双设备可走（既有 `gpu_passthrough_first_frame_paints_shared_handle`
+    ///   已断言直通），本测**不额外断言**直通细节、只确认能出首帧。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn gpu_passthrough_machine_adaptive_gate(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _dual = DualPathGuard::new();
+        let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（直通优先）
+        let _fault_bl = FaultAndBlGuard;
+        let shr_supported = match dual_gate_capability() {
+            Some(v) => v,
+            None => {
+                eprintln!("SKIP: 本机连 worker 自有 D3D11 设备都建不起（双设备不可测）");
+                return;
+            }
+        };
+        eprintln!("[GPU adaptive] 本机 D3D11VA 平面 SRV 采样能力 = {shr_supported}");
+        dual_engaged_reset();
+        hw_engaged_reset();
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        // 等首帧上屏（真解码异步；two 分支都要求首帧可用）
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.has_frame() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待门控回归首帧上屏超时");
+        }
+        assert!(
+            !cx.update(|app| viewer.read(app).load_error.is_some()),
+            "首帧期不应报告加载错误"
+        );
+        if !shr_supported {
+            // (a) 能力 false：门控停用双设备 → SAFE BGRA 出帧
+            assert!(
+                !dual_engaged(),
+                "驱动不支持平面 SRV 采样时双设备直通应被门控停用（dual_engaged 恒 false）"
+            );
+            // HW_ENGAGED 反映 SAFE 解码器实际接管状态（本机 D3D11VA 可用=硬解；无 D3D11VA
+            // 机器内核自动回软解=软解）——只打点不硬断言，避免成非目标机器的回归。
+            eprintln!(
+                "[GPU adaptive] 门控回落 SAFE：hw_engaged={}",
+                hw_engaged()
+            );
+            let (first_frame, first_gpu) = cx.update(|app| {
+                let v = viewer.read(app);
+                (v.frame.is_some(), v.gpu_frame.is_some())
+            });
+            assert!(first_frame, "门控回落路径首帧应为 SAFE BGRA（frame Some）");
+            assert!(!first_gpu, "门控回落路径首帧不应为 GPU 帧（gpu_frame None）");
+            let mut last_pts = -1.0f64;
+            for _ in 0..10 {
+                viewer.update(cx, |v, cx| {
+                    v.playhead += 0.5;
+                    let _ = v.tick(cx);
+                });
+                cx.background_executor.timer(Duration::from_millis(8)).await;
+                let (pts, gpu) = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (v.last_frame_pts.unwrap_or(last_pts), v.gpu_frame.is_some())
+                });
+                assert!(!gpu, "门控回落路径不应有 GPU 帧");
+                assert!(
+                    pts >= last_pts - 1e-6,
+                    "门控回落帧 pts 应单调: {pts:.2} < {last_pts:.2}"
+                );
+                last_pts = pts;
+            }
+            eprintln!(
+                "[GPU adaptive] 能力 false：门控停用双设备、SAFE BGRA 出帧正常（hw_engaged={}，pts 至 {last_pts:.2}s）",
+                hw_engaged()
+            );
+        } else {
+            // (b) 能力 true：双设备由既有直通测试断言（本测不做额外直通细节断言）
+            eprintln!(
+                "[GPU adaptive] 能力 true：双设备直通由 gpu_passthrough_first_frame_paints_shared_handle 断言（本测仅确认首帧可用）"
+            );
+        }
         cx.run_until_parked();
     }
 

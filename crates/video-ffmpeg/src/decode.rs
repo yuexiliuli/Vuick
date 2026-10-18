@@ -30,7 +30,7 @@ use windows::core::Interface as _;
 /// 在 `format::input`（开放闸只串 open 无效，open 与解码也会互相卡）。因此**所有 FFI
 /// 调用**（open / seek / next_frame / next_pcm / subtitle）都过此互斥量串行；单次操作毫秒级，
 /// 视频 2 帧通道 + 音频 1s 缓冲足以吸收串行抖动。打开后、解码途中均释放，不长期持锁。
-static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
 
 /// FFmpeg 日志级别一次性收敛到 `Error`（进程内仅执行一次）：ffmpeg 默认 `Warning` 会把
 /// 大量良性抖动打到 stderr（如 mp4/mov 的 `udta` 盒布局异常 → `UDTA parsing failed
@@ -412,7 +412,9 @@ fn build_external_d3d11_device_ctx(
 ///
 /// 纯 device/frames 上下文、**不开解码器** → 失败无副作用（表由 [`VideoReader::open_external_hw`]
 /// 在打开解码器前调用；只用 `AVHWFramesContext` 最小池探测，顺带验证帧池纹理可建）。
-fn d3d11_supports_shader_bound_textures(
+/// `pub(crate)`：经 lib.rs 的 [`vff_d3d11_supports_shader_bound_textures`] 导出给主程序做
+/// 双设备直通的门控能力查询（与 `open_external_hw` 内部的探测同源）。
+pub(crate) fn d3d11_supports_shader_bound_textures(
     device: *mut std::ffi::c_void,
     device_context: *mut std::ffi::c_void,
 ) -> bool {

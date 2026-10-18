@@ -125,6 +125,11 @@ type FnVideoFrameHw = unsafe extern "C" fn(
     *mut u32,
 ) -> *mut std::ffi::c_void;
 type FnVideoFrameRelease = unsafe extern "C" fn(*mut std::ffi::c_void);
+// 能力查询：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」（双设备直通让渲染设备
+// 建平面 SRV 采样 YUV 的前提）——`device`/`device_context` 为 worker 自有
+// `ID3D11Device*`/`ID3D11DeviceContext*` 的 usize 裸指针（同 [`FnOpenVideoHw`] 传参姿势）；
+// 1 = 支持、0 = 不支持/空指针。纯探测、无解码器副作用。
+type FnSupportsShaderBoundTextures = unsafe extern "C" fn(usize, usize) -> CInt;
 
 // 字幕 FFI 类型
 #[repr(C)]
@@ -169,6 +174,7 @@ struct Bridge {
     open_video_hw: libloading::Symbol<'static, FnOpenVideoHw>,
     video_frame_hw: libloading::Symbol<'static, FnVideoFrameHw>,
     video_frame_release: libloading::Symbol<'static, FnVideoFrameRelease>,
+    d3d11_supports_shader_bound_textures: libloading::Symbol<'static, FnSupportsShaderBoundTextures>,
     #[allow(dead_code)] // FFI 符号，实际在 SubtitleReader 中用
     open_subtitle: libloading::Symbol<'static, FnOpenSubtitle>,
     #[allow(dead_code)]
@@ -232,6 +238,10 @@ fn load_bridge() -> Option<Bridge> {
         open_video_hw: sym!(b"vff_open_video_hw\0", FnOpenVideoHw),
         video_frame_hw: sym!(b"vff_video_frame_hw\0", FnVideoFrameHw),
         video_frame_release: sym!(b"vff_video_frame_release\0", FnVideoFrameRelease),
+        d3d11_supports_shader_bound_textures: sym!(
+            b"vff_d3d11_supports_shader_bound_textures\0",
+            FnSupportsShaderBoundTextures
+        ),
         open_subtitle: sym!(b"vff_open_subtitle\0", FnOpenSubtitle),
         subtitle_count: sym!(b"vff_subtitle_count\0", FnSubtitleCount),
         subtitle_get_info: sym!(b"vff_subtitle_get_info\0", FnSubtitleGetInfo),
@@ -558,6 +568,21 @@ impl VideoReader {
     }
 
     // ---------------- 双设备 GPU 直通（零回读）：外部 D3D11 设备注入 ----------------
+
+    /// 探测本机驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」：true = 渲染设备可对
+    /// 共享 NV12 建平面 SRV 采样 YUV（可走双设备直通）；false（Intel Arc 等驱动实测不支持该
+    /// 绑定组合）→ 纹理不可做 SRV、像素着色器 Sample 出绿屏，须回落 SAFE 硬解 BGRA 路径。
+    /// `device`/`device_context` 为 worker 自有 D3D11 设备/上下文的 usize 裸指针（与
+    /// [`Self::open_hw`] 传参同款）。桥不可用或设备指针为空 → 优雅 `false`（不 panic）。
+    pub fn supports_shader_bound_textures(device: usize, device_context: usize) -> bool {
+        let Some(b) = bridge() else {
+            return false;
+        };
+        if device == 0 {
+            return false;
+        }
+        unsafe { (b.d3d11_supports_shader_bound_textures)(device, device_context) != 0 }
+    }
 
     /// 打开**外部设备硬件解码**（不可用即 `Err`，上层据此回退 SAFE BGRA 路径）：`device`/
     /// `device_context` 为调用方 **worker 自有** `ID3D11Device*`/`ID3D11DeviceContext*` 的

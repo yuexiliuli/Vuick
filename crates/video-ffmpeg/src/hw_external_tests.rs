@@ -8,7 +8,7 @@
 //! 本机无可用 D3D11 设备（硬件 + WARP 都建不起）或解码器不支持时打印 SKIP 不 FAIL。
 
 use crate::decode::{HwFrame, VideoReader};
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use windows::core::Interface as _;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
@@ -393,5 +393,49 @@ fn hw_skip_to_bgra_fast_preroll() {
     assert!(
         skipped > 0,
         "深 GOP 落点应跳过若干落点前帧（skipped={skipped}）"
+    );
+}
+
+/// 能力查询 FFI 一致性：`vff_d3d11_supports_shader_bound_textures` 与 `open_external_hw`
+/// 内部的能力探测同源（同一函数）——导出值应与内核内部函数逐位一致；空设备指针优雅返回 0
+///（不 panic、不崩）；有效设备上返回值恒 0/1。这是双设备直通门控的判定来源，必须与
+/// 解码器实际建 SHR 纹理的探测结果一致（若门控误判「支持」会在不支持 SRV 的驱动上绿屏）。
+#[test]
+fn hw_external_capability_srvs_export_matches_internal_probe() {
+    // 空指针优雅 false：不 panic，直接 0（桥侧同样裁剪到「不可用 → false」）
+    assert_eq!(
+        unsafe {
+            crate::vff_d3d11_supports_shader_bound_textures(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0,
+        "空 device 应返回 0（不支持/不可用）"
+    );
+
+    let (device, context, dtype) = match make_d3d11_device() {
+        Some(x) => x,
+        None => {
+            eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用");
+            return;
+        }
+    };
+    let dev = device.as_raw();
+    let ctx = context.as_raw();
+    let exported = unsafe { crate::vff_d3d11_supports_shader_bound_textures(dev, ctx) };
+    // 与内核内部探测同源一致（同一函数、同一次 device/context）
+    let internal = crate::decode::d3d11_supports_shader_bound_textures(dev, ctx);
+    assert_eq!(
+        exported,
+        internal as c_int,
+        "FFI 导出应与内核内部探测逐位一致（设备={dtype}）"
+    );
+    assert!(
+        exported == 0 || exported == 1,
+        "能力查询应返回 0/1，实得 {exported}（设备={dtype}）"
+    );
+    eprintln!(
+        "[HW capability] 设备={dtype} D3D11VA 数组纹理带 SHADER_RESOURCE（平面 SRV 采样）支持 = {exported}（与 open_external_hw 内部探测同源）"
     );
 }
