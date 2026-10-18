@@ -665,20 +665,21 @@ mod tests {
     use super::*;
 
     fn test_epub_path() -> std::path::PathBuf {
-        // P4：本 crate 位于 crates/epub，xy.epub 夹具在工作区根 fixtures/（上溯两级）。
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub")
+        // P4：本 crate 位于 crates/epub，py 夹具在工作区根 target/测试epub.epub（上溯两级，
+        // 不入库、手动装配）。
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/测试epub.epub")
     }
 
     #[test]
     fn parses_epub_title_and_author() {
-        let doc = parse_epub_file(&test_epub_path()).expect("解析 xy.epub 应成功");
+        let doc = parse_epub_file(&test_epub_path()).expect("解析 测试epub.epub 应成功");
         assert_eq!(doc.title, "共产党宣言");
         assert!(doc.author.contains("马克思"));
     }
 
     #[test]
     fn extracts_chapters_in_spine_order() {
-        let doc = parse_epub_file(&test_epub_path()).expect("解析 xy.epub 应成功");
+        let doc = parse_epub_file(&test_epub_path()).expect("解析 测试epub.epub 应成功");
         assert!(doc.chapter_count >= 5, "应有多个章节，实际={}", doc.chapter_count);
         assert!(!doc.markdown.is_empty());
         // 应包含著名开头标题之一（1888年英文版序言 或 第一章 资产者和无产者）
@@ -690,8 +691,8 @@ mod tests {
 
     #[test]
     fn extracts_epub_images_to_memory() {
-        let doc = parse_epub_file(&test_epub_path()).expect("解析 xy.epub 应成功");
-        // xy.epub 有 6 张图（正文 5 张 + SVG 封面 1 张）；正文里以 `![...](epubimg://...)` 虚拟 src 引用
+        let doc = parse_epub_file(&test_epub_path()).expect("解析 测试epub.epub 应成功");
+        // 测试epub.epub 有 6 张图；正文里以 `![...](epubimg://...)` 虚拟 src 引用
         let img_marks: Vec<&str> = doc
             .markdown
             .lines()

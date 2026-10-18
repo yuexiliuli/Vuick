@@ -7,7 +7,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/测试epub.epub");
         assert!(epub.exists(), "测试 EPUB 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -271,9 +271,9 @@
     /// 分页；滚动预览到末标题后页码前进（滚动明细由 view 层单元测试覆盖）。
     #[gpui::test]
     async fn epub_status_bar_shows_pages_and_follows_scroll(cx: &mut TestAppContext) {
-        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/测试epub.epub");
         if !epub.exists() {
-            eprintln!("SKIP epub_status_bar_shows_pages_and_follows_scroll: 缺 fixtures/xy.epub");
+            eprintln!("SKIP epub_status_bar_shows_pages_and_follows_scroll: 缺 target/测试epub.epub");
             return;
         }
         init_test(cx);
@@ -355,7 +355,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/测试epub.epub");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.open_file(epub.to_str().unwrap(), window, cx)
@@ -462,7 +462,7 @@
         #[cfg(feature = "video")]
         std::fs::write(&vid_p, b"not a real video").unwrap();
         let epub_p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/xy.epub");
+            .join("../../target/测试epub.epub");
         let epub_doc = epub::parse_epub_file(&epub_p).expect("测试 EPUB 应可解析");
 
         // 新建选项卡并装载，返回新下标（对齐真实打开路径：load_* 总是在新 make_tab 上）。

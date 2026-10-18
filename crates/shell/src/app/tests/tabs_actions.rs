@@ -604,7 +604,7 @@
         );
         // 只读预览（EPUB）：两个阅读控制按钮都隐藏（自带全屏阅读）。
         let epub =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/测试epub.epub");
         assert!(epub.exists(), "测试 EPUB 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(epub.to_str().unwrap(), window, cx));
