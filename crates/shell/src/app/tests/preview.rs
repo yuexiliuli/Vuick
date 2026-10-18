@@ -2247,7 +2247,7 @@
             let a = app.read(cx);
             let t = &a.tabs[a.active_tab];
             (
-                t.md_wy_pending.clone(),
+                t.md_wy_install.pending.clone(),
                 t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
             )
         });
@@ -2271,7 +2271,7 @@
             cx.run_until_parked();
             done = cx.update(|_w, cx| {
                 app.read(cx).tabs[app.read(cx).active_tab]
-                    .md_wy_pending
+                    .md_wy_install.pending
                     .is_none()
             });
             if done {
@@ -2463,7 +2463,7 @@
             let a = app.read(cx);
             let t = &a.tabs[a.active_tab];
             (
-                t.md_wy_pending.clone(),
+                t.md_wy_install.pending.clone(),
                 t.md_wy.clone().expect("md_wy 应在"),
             )
         });
@@ -2704,7 +2704,7 @@
             cx.run_until_parked();
             done = cx.update(|_w, cx| {
                 app.read(cx).tabs[app.read(cx).active_tab]
-                    .md_wy_pending
+                    .md_wy_install.pending
                     .is_none()
             });
             if done {
@@ -2880,7 +2880,7 @@
                 app.tabs[idx].preview_on = true;
                 // 等价 `md_wy_spawn_early_install` 启动后（代号 = ensure_md_wy 已 invalidate →
                 // seq=1；整篇在途、未编辑）。
-                app.tabs[idx].md_wy_early = Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
+                app.tabs[idx].md_wy_install.early = Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
                 app.md_wy_spawn_prefix_install(idx, rope.clone(), 1, cx);
             });
         });
@@ -2896,8 +2896,8 @@
             (
                 wy.read(cx).is_loaded(),
                 wy.read(cx).text().to_string(),
-                a.tabs[i].md_wy_pending_full,
-                a.tabs[i].md_wy_early,
+                a.tabs[i].md_wy_install.pending_full,
+                a.tabs[i].md_wy_install.early,
             )
         });
         assert!(loaded, "prefix 首装应 `install_open`（loaded=true），首屏立刻真内容");
@@ -2944,7 +2944,7 @@
                 });
                 app.ensure_md_wy(idx, window, cx, false);
                 app.tabs[idx].preview_on = true;
-                app.tabs[idx].md_wy_early =
+                app.tabs[idx].md_wy_install.early =
                     Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
                 app.md_wy_spawn_prefix_install(idx, rope.clone(), 1, cx);
             });
@@ -3019,8 +3019,8 @@
             (
                 after,
                 wy.read(cx).text().to_string(),
-                a.tabs[i].md_wy_early,
-                a.tabs[i].md_wy_pending_full,
+                a.tabs[i].md_wy_install.early,
+                a.tabs[i].md_wy_install.pending_full,
             )
         });
         assert_eq!(after, Some(before), "整篇换入后顶行 src_line 应锚定不变（视觉不跳）");
@@ -3063,7 +3063,7 @@
                 });
                 app.ensure_md_wy(idx, window, cx, false);
                 app.tabs[idx].preview_on = true;
-                app.tabs[idx].md_wy_early =
+                app.tabs[idx].md_wy_install.early =
                     Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
                 let rope_prefix = ropey::Rope::from(prefix.as_str());
                 app.md_wy_spawn_prefix_install(idx, rope_prefix.clone(), 1, cx);
@@ -3079,7 +3079,7 @@
             let a = app.read(cx);
             let i = a.active_tab;
             let wy = a.tabs[i].md_wy.as_ref().unwrap();
-            (wy.read(cx).is_loaded(), a.tabs[i].md_wy_pending_full, wy.read(cx).len())
+            (wy.read(cx).is_loaded(), a.tabs[i].md_wy_install.pending_full, wy.read(cx).len())
         });
         assert!(pre_loaded, "prefix 应已 install（loaded）");
         assert_eq!(pre_pending, Some((1, prefix.len())));
@@ -3103,7 +3103,7 @@
             (
                 wy.read(cx).text().to_string(),
                 a.tabs[i].editor.read(cx).value(),
-                a.tabs[i].md_wy_pending_full,
+                a.tabs[i].md_wy_install.pending_full,
                 wy.read(cx).is_loaded(),
             )
         });

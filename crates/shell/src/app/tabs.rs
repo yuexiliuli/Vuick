@@ -42,10 +42,7 @@ impl EditorApp {
             live_vscroll: gpui::ScrollHandle::new(),
             md_wy: None,
             md_wy_vscroll: gpui::ScrollHandle::new(),
-            md_wy_pending: None,
-            md_wy_install_seq: 0,
-            md_wy_early: None,
-            md_wy_pending_full: None,
+            md_wy_install: MdWyInstall::default(),
             epub_images: Default::default(),
             epub_notes: Default::default(),
             edit_version: 0,
@@ -228,24 +225,22 @@ impl EditorApp {
     }
 
     /// 标记“选项卡栏最近在滚动”：横向滚动条立即可见，并重启自动隐藏计时
-    /// （[`TAB_HSCROLL_HIDE_MS`] 后无新滚动则隐藏）。带代序号防旧定时器误清新滚动。
+    /// （[`TAB_HSCROLL_HIDE_MS`] 后无新滚动则隐藏）。`SeqAfter` 代序作废旧定时器，
+    /// 旧定时器到点不误清新滚动。
     pub(super) fn poke_tab_hscroll(&mut self, cx: &mut Context<Self>) {
         *self.tab_bar_hscroll.visible.borrow_mut() = true;
         cx.notify();
-        self.tab_hscroll_seq = self.tab_hscroll_seq.wrapping_add(1);
-        let seq = self.tab_hscroll_seq;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(TAB_HSCROLL_HIDE_MS))
-                .await;
-            let _ = this.update(cx, |app, cx| {
-                if app.tab_hscroll_seq == seq {
+        let weak = cx.weak_entity();
+        self.tab_hscroll_delay.after(
+            cx,
+            std::time::Duration::from_millis(TAB_HSCROLL_HIDE_MS),
+            move |app| {
+                let _ = weak.update(app, |app, cx| {
                     *app.tab_bar_hscroll.visible.borrow_mut() = false;
                     cx.notify();
-                }
-            });
-        })
-        .detach();
+                });
+            },
+        );
     }
 
     /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
@@ -572,6 +567,7 @@ impl EditorApp {
     /// 选项卡栏右键 → 在光标处弹「新建文件 / 打开文件」上下文菜单（取代已移除的「+」
     /// 按钮）。关闭（选择/Esc/点击外）经 `DismissEvent` 订阅清理；先收掉上一份菜单
     /// （若有）再在光标处新建（旧订阅带 emitter 身份校验，不会误清新菜单）。
+    /// 装配/焦点/订阅闭环收敛自 `ui::menu::spawn_context_menu`。
     fn on_tab_bar_right_click(
         &mut self,
         ev: &MouseDownEvent,
@@ -585,50 +581,48 @@ impl EditorApp {
         self.tab_bar_menu_pos = None;
         self.tab_bar_menu_sub = None;
         let weak = cx.weak_entity();
-        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-            menu.item({
-                let weak = weak.clone();
-                PopupMenuItem::element(move |_, _| {
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .child("新建文件")
-                        .debug_selector(|| "tab-bar-menu-item-new".into())
+        let (menu, sub) = ui::menu::spawn_context_menu(
+            window,
+            cx,
+            move |menu, _window, _cx| {
+                menu.item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("新建文件")
+                            .debug_selector(|| "tab-bar-menu-item-new".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| this.new_tab(window, cx));
+                    })
                 })
-                .on_click(move |_, window, cx| {
-                    let _ = weak.update(cx, |this, cx| this.new_tab(window, cx));
+                .item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("打开文件")
+                            .debug_selector(|| "tab-bar-menu-item-open".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| this.open_dialog(window, cx));
+                    })
                 })
-            })
-            .item({
-                let weak = weak.clone();
-                PopupMenuItem::element(move |_, _| {
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .child("打开文件")
-                        .debug_selector(|| "tab-bar-menu-item-open".into())
-                })
-                .on_click(move |_, window, cx| {
-                    let _ = weak.update(cx, |this, cx| this.open_dialog(window, cx));
-                })
-            })
-        });
-        // 聚焦并记住开菜单前的焦点（关闭后归还）
-        let previous_focus = window.focused(cx);
-        let focus_handle = menu.read(cx).focus_handle(cx);
-        menu.update(cx, |m, _| m.set_previous_focus(previous_focus));
-        window.focus(&focus_handle, cx);
-        // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
-        let menu_entity = menu.clone();
-        let sub = cx.subscribe(&menu_entity, move |this, emitter, _: &DismissEvent, cx| {
-            if this.tab_bar_menu_entity.as_ref() == Some(&emitter) {
-                this.tab_bar_menu_entity = None;
-                this.tab_bar_menu_pos = None;
-            }
-            cx.notify();
-        });
+            },
+            |this, emitter, cx| {
+                // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
+                if this.tab_bar_menu_entity.as_ref() == Some(&emitter) {
+                    this.tab_bar_menu_entity = None;
+                    this.tab_bar_menu_pos = None;
+                }
+                cx.notify();
+            },
+        );
         self.tab_bar_menu_pos = Some(ev.position);
         self.tab_bar_menu_entity = Some(menu);
         self.tab_bar_menu_sub = Some(sub);

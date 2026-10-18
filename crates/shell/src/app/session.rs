@@ -282,32 +282,27 @@ impl EditorApp {
     }
 
     /// 安排一次会话持久化：结构变化 `immediate=true` 立即写盘；内容变化 `false` 走
-    /// [`SESSION_FLUSH_DEBOUNCE_MS`] 防抖（打字停顿后才写一次，不逐键写盘）。仿侧边栏
-    /// 搜索防抖（`schedule_search_debounce`）的时序代号模式：旧防抖定时器到点比对
-    /// 不符即作废，防抖可重入。防抖期间又被安排 → 新代号覆盖，最终只落盘一次最新状态。
-    /// 超时 / 唤醒失败静默丢弃，不 panic。
+    /// [`SESSION_FLUSH_DEBOUNCE_MS`] 防抖（打字停顿后才写一次，不逐键写盘）。收敛自
+    /// 侧边栏搜索防抖的时序代号模式（`base::SeqAfter` 可重入、代序作废）：防抖期间又
+    /// 被安排 → 新代号覆盖，最终只落盘一次最新状态。超时 / 唤醒失败静默丢弃，不 panic。
     pub(super) fn schedule_session_flush(&mut self, cx: &mut Context<Self>, immediate: bool) {
         if immediate {
             self.persist_session(cx);
             return;
         }
-        let seq = self.session_flush_seq.wrapping_add(1);
-        self.session_flush_seq = seq;
         // 防抖只挂在非测试构建：测试直接驱动纯逻辑函数验证，不在测试进程残留定时任务。
         #[cfg(not(test))]
         {
-            cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(SESSION_FLUSH_DEBOUNCE_MS))
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    // 防抖窗内又安排过 → 序号已变，本定时器作废（只落盘最新一次）。
-                    if this.session_flush_seq == seq {
+            let weak = cx.weak_entity();
+            self.session_flush_debounce.after(
+                cx,
+                std::time::Duration::from_millis(SESSION_FLUSH_DEBOUNCE_MS),
+                move |app| {
+                    let _ = weak.update(app, |this, cx| {
                         this.persist_session(cx);
-                    }
-                });
-            })
-            .detach();
+                    });
+                },
+            );
         }
     }
 }

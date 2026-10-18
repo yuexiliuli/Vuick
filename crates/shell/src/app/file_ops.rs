@@ -372,7 +372,7 @@ impl EditorApp {
                 .get(idx)
                 .is_some_and(|t| {
                     matches!(
-                        t.md_wy_early,
+                        t.md_wy_install.early,
                         Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Done)
                     )
                 });
@@ -404,7 +404,7 @@ impl EditorApp {
             && let Some(wy) = md_wy_open {
                 ed.update(cx, |ed, _| ed.install_open(wy));
                 // Step3：EOF 兜底整篇装配落地 → 整篇已装，解除「整篇在途」标记。
-                tab.md_wy_pending_full = None;
+                tab.md_wy_install.pending_full = None;
             }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             // 诊断“拖到底不到底”：量程就绪后的纵向总高。编辑器精确时应 ≈ 行数×行高；
@@ -608,7 +608,7 @@ impl EditorApp {
                         .update_window_entity(&entity, |this, _w, _cx| {
                             this.tabs.get(idx).is_some_and(|t| {
                                 matches!(
-                                    t.md_wy_early,
+                                    t.md_wy_install.early,
                                     Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Done)
                                 )
                             })

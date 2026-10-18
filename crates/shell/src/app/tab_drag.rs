@@ -6,6 +6,8 @@ use super::*;
 impl EditorApp {
     /// 从本窗口「拔出」一个选项卡：移除选项卡（**不**释放 PDF 纹理、不重置编辑器——
     /// 实体与元数据整体移到目标窗口），下标与激活态自动校正。
+    /// 整结构 move：一次解构 `EditorTab` 搬到 `DetachedTab`（`..` 丢弃源窗口专属的
+    /// live 态 / 订阅），不再逐字段手抄。
     pub(super) fn take_tab_payload(&mut self, idx: usize) -> Option<DetachedTab> {
         if idx >= self.tabs.len() {
             return None;
@@ -17,29 +19,48 @@ impl EditorApp {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
         self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
+        let EditorTab {
+            editor,
+            reader,
+            md_wy,
+            md_wy_vscroll,
+            md_wy_install,
+            epub_images,
+            epub_notes,
+            file_path,
+            dirty,
+            content,
+            line_count,
+            char_count,
+            cursor_row,
+            cursor_col,
+            preview_on,
+            preview_fullscreen,
+            readonly_preview,
+            editor_pending,
+            edit_version,
+            ..
+        } = tab;
         Some(DetachedTab {
-            editor: tab.editor,
-            reader: tab.reader,
-            md_wy: tab.md_wy,
-            md_wy_vscroll: tab.md_wy_vscroll,
-            md_wy_pending: tab.md_wy_pending,
-            md_wy_install_seq: tab.md_wy_install_seq,
-            md_wy_early: tab.md_wy_early,
-            md_wy_pending_full: tab.md_wy_pending_full,
-            epub_images: tab.epub_images,
-            epub_notes: tab.epub_notes,
-            file_path: tab.file_path,
-            dirty: tab.dirty,
-            content: tab.content,
-            line_count: tab.line_count,
-            char_count: tab.char_count,
-            cursor_row: tab.cursor_row,
-            cursor_col: tab.cursor_col,
-            preview_on: tab.preview_on,
-            preview_fullscreen: tab.preview_fullscreen,
-            readonly_preview: tab.readonly_preview,
-            editor_pending: tab.editor_pending,
-            edit_version: tab.edit_version,
+            editor,
+            reader,
+            md_wy,
+            md_wy_vscroll,
+            md_wy_install,
+            epub_images,
+            epub_notes,
+            file_path,
+            dirty,
+            content,
+            line_count,
+            char_count,
+            cursor_row,
+            cursor_col,
+            preview_on,
+            preview_fullscreen,
+            readonly_preview,
+            editor_pending,
+            edit_version,
         })
     }
 
@@ -47,48 +68,67 @@ impl EditorApp {
     /// 置为激活并同步预览/PDF 主题与软换行偏好。
     /// `window=None` 用于跨窗口还原（此时不抢焦点，由调用方在目标窗口聚焦）；
     /// `Some(window)` 用于拆出新窗口（直接聚焦新窗口的编辑区）。
+    /// 整结构 move：一次解构 `DetachedTab` 搬回 `EditorTab`（live 态/订阅置目标窗口
+    /// 缺省值），不再逐字段手抄。
     pub(crate) fn adopt_tab(
         &mut self,
         payload: DetachedTab,
         mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        let edit_sub = self.subscribe_editor(&payload.editor, cx);
-        let is_md = payload
-            .file_path
+        let DetachedTab {
+            editor,
+            reader,
+            md_wy,
+            md_wy_vscroll,
+            md_wy_install,
+            epub_images,
+            epub_notes,
+            file_path,
+            dirty,
+            content,
+            line_count,
+            char_count,
+            cursor_row,
+            cursor_col,
+            preview_on,
+            preview_fullscreen,
+            readonly_preview,
+            editor_pending,
+            edit_version,
+        } = payload;
+        let edit_sub = self.subscribe_editor(&editor, cx);
+        let is_md = file_path
             .as_ref()
             .map(|p| Self::is_markdown_path(p))
             .unwrap_or(false);
         let idx = self.tabs.len();
         self.tabs.push(EditorTab {
-            editor: payload.editor,
-            file_path: payload.file_path,
-            dirty: payload.dirty,
-            content: payload.content,
-            line_count: payload.line_count,
-            char_count: payload.char_count,
-            cursor_row: payload.cursor_row,
-            cursor_col: payload.cursor_col,
-            reader: payload.reader,
-            md_wy: payload.md_wy,
-            md_wy_vscroll: payload.md_wy_vscroll,
-            md_wy_pending: payload.md_wy_pending,
-            md_wy_install_seq: payload.md_wy_install_seq,
-            md_wy_early: payload.md_wy_early,
-            md_wy_pending_full: payload.md_wy_pending_full,
-            epub_images: payload.epub_images,
-            epub_notes: payload.epub_notes,
-            preview_on: payload.preview_on,
-            preview_fullscreen: payload.preview_fullscreen,
-            readonly_preview: payload.readonly_preview,
-            editor_pending: payload.editor_pending,
+            editor,
+            file_path,
+            dirty,
+            content,
+            line_count,
+            char_count,
+            cursor_row,
+            cursor_col,
+            reader,
+            md_wy,
+            md_wy_vscroll,
+            md_wy_install,
+            epub_images,
+            epub_notes,
+            preview_on,
+            preview_fullscreen,
+            readonly_preview,
+            editor_pending,
+            edit_version,
             // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交写回，见 take_tab_payload 调用点）
             live_edit: false,
             live2: None,
             live2_dirty: false,
             _live2_sub: None,
             live_vscroll: gpui::ScrollHandle::new(),
-            edit_version: payload.edit_version,
             _edit_sub: edit_sub,
         });
         self.active_tab = idx;

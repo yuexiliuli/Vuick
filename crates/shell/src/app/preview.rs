@@ -822,9 +822,9 @@ impl EditorApp {
     /// （装错）。`file_ops`（打开换源）也调用，故 `pub(super)`。
     pub(super) fn md_wy_invalidate_async(&mut self, idx: usize) {
         if let Some(t) = self.tabs.get_mut(idx) {
-            t.md_wy_install_seq += 1;
-            t.md_wy_pending = None;
-            t.md_wy_pending_full = None; // Step3：任何同步改写 md_wy 内容 → 整篇在途标记一并作废
+            t.md_wy_install.seq += 1;
+            t.md_wy_install.pending = None;
+            t.md_wy_install.pending_full = None; // Step3：任何同步改写 md_wy 内容 → 整篇在途标记一并作废
         }
     }
 
@@ -841,8 +841,8 @@ impl EditorApp {
         };
         let seq = {
             let t = &mut self.tabs[idx];
-            t.md_wy_install_seq += 1;
-            t.md_wy_install_seq
+            t.md_wy_install.seq += 1;
+            t.md_wy_install.seq
         };
         if content.len() < MD_WY_ASYNC_INSTALL_MIN_BYTES {
             // 同步小整篇（无「旧→新」等待；`open_from_str` 免 `set_source_text` 的一次
@@ -851,15 +851,15 @@ impl EditorApp {
                 w.install_open(markdown_wysiwyg::WyEditor::open_from_str(content))
             });
             if let Some(t) = self.tabs.get_mut(idx) {
-                t.md_wy_pending = None;
-                t.md_wy_pending_full = None; // Step3：同步装好即 == 编辑区 → 解除在途标记
+                t.md_wy_install.pending = None;
+                t.md_wy_install.pending_full = None; // Step3：同步装好即 == 编辑区 → 解除在途标记
             }
             return;
         }
-        self.tabs[idx].md_wy_pending = Some((seq, content.clone()));
+        self.tabs[idx].md_wy_install.pending = Some((seq, content.clone()));
         // Step3：异步整篇在途、预览仍为旧内容（<新整篇）→ 置在途标记，增量桥打旧内容会
         // 错位，转为「作废 + 重喂」（见 `sync::on_editor_edited`）。
-        self.tabs[idx].md_wy_pending_full = Some((seq, 0));
+        self.tabs[idx].md_wy_install.pending_full = Some((seq, 0));
         #[cfg(test)]
         LIVE_COMMIT_MD_WY_ASYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self::md_wy_spawn_async_install(idx, wy, content, seq, cx);
@@ -958,10 +958,10 @@ impl EditorApp {
         };
         let (seq, ver) = {
             let t = &mut self.tabs[idx];
-            t.md_wy_install_seq += 1;
-            (t.md_wy_install_seq, t.edit_version)
+            t.md_wy_install.seq += 1;
+            (t.md_wy_install.seq, t.edit_version)
         };
-        self.tabs[idx].md_wy_early = Some(MdWyEarly::Pending { seq, edit_version: ver });
+        self.tabs[idx].md_wy_install.early = Some(MdWyEarly::Pending { seq, edit_version: ver });
         cx.spawn(async move |this, cx| {
             // 独立后台任务：读全文（归一化）→ 整篇解析（UI 线程不背 O(n)）。
             let result = cx
@@ -981,17 +981,17 @@ impl EditorApp {
             let _ = this.update(cx, |this, cx| {
                 // 守卫 1/2（短借用）：tab 归属 + 装配代号。
                 let ok = this.tabs.get(idx).is_some_and(|t| {
-                    t.md_wy.as_ref() == Some(&wy) && t.md_wy_install_seq == seq
+                    t.md_wy.as_ref() == Some(&wy) && t.md_wy_install.seq == seq
                 });
                 if !ok {
                     // 代号已换代 / 实体已易主（换源、重喂、切走重建）→ 本结果作废；清掉
                     // 本代号的在途标记（不误标 Failed——新装配会接管）。
                     if let Some(t) = this.tabs.get_mut(idx)
-                        && t.md_wy_early.as_ref()
+                        && t.md_wy_install.early.as_ref()
                             == Some(&MdWyEarly::Pending { seq, edit_version: ver })
                     {
-                        t.md_wy_early = None;
-                        t.md_wy_pending_full = None;
+                        t.md_wy_install.early = None;
+                        t.md_wy_install.pending_full = None;
                     }
                     return;
                 }
@@ -1004,8 +1004,8 @@ impl EditorApp {
                         // 已编辑：丢弃整篇结果（sync 自愈/重喂链路接管），复位在途标记
                         //（EOF 收尾不再指望它，走既有收尾兜底）。
                         let t = &mut this.tabs[idx];
-                        t.md_wy_early = None;
-                        t.md_wy_pending_full = None;
+                        t.md_wy_install.early = None;
+                        t.md_wy_install.pending_full = None;
                     }
                     Err(_) => {
                         // 读盘/解析失败：置 Failed，EOF 收尾回退走既有整篇装配兜底——*前提是
@@ -1018,8 +1018,8 @@ impl EditorApp {
                         {
                             let t = &mut this.tabs[idx];
                             // 仅当依旧命中本代号（期间无换代）才接管，否则交新装配。
-                            t.md_wy_early = Some(MdWyEarly::Failed);
-                            t.md_wy_pending_full = None;
+                            t.md_wy_install.early = Some(MdWyEarly::Failed);
+                            t.md_wy_install.pending_full = None;
                         }
                         let rope = this.tabs[idx].editor.read(cx).rope().clone();
                         this.md_wy_feed_full_rope(idx, rope, cx);
@@ -1049,8 +1049,8 @@ impl EditorApp {
             wy.update(cx, |ed, _| ed.set_scroll_target(sl));
         }
         if let Some(tab) = self.tabs.get_mut(idx) {
-            tab.md_wy_early = Some(MdWyEarly::Done);
-            tab.md_wy_pending_full = None;
+            tab.md_wy_install.early = Some(MdWyEarly::Done);
+            tab.md_wy_install.pending_full = None;
         }
         cx.notify();
     }
@@ -1092,17 +1092,17 @@ impl EditorApp {
                 let Some(tab) = this.tabs.get_mut(idx) else {
                     return;
                 };
-                if tab.md_wy.as_ref() != Some(&wy) || tab.md_wy_install_seq != full_seq {
+                if tab.md_wy.as_ref() != Some(&wy) || tab.md_wy_install.seq != full_seq {
                     return; // 归属/代号换代 → 丢弃（新装配接管）
                 }
-                if matches!(tab.md_wy_early, Some(MdWyEarly::Done)) {
+                if matches!(tab.md_wy_install.early, Some(MdWyEarly::Done)) {
                     return; // 整篇已先装：不降级回 prefix
                 }
                 if tab.edit_version != ver {
                     return; // 已编辑：prefix 快照已过期，sync 重喂接管
                 }
                 wy.update(cx, |ed, _| ed.install_open(result));
-                tab.md_wy_pending_full = Some((full_seq, prefix_len));
+                tab.md_wy_install.pending_full = Some((full_seq, prefix_len));
                 cx.notify();
             });
         })
@@ -1120,8 +1120,8 @@ impl EditorApp {
         };
         let seq = {
             let t = &mut self.tabs[idx];
-            t.md_wy_install_seq += 1;
-            t.md_wy_install_seq
+            t.md_wy_install.seq += 1;
+            t.md_wy_install.seq
         };
         if rope.len() < MD_WY_ASYNC_INSTALL_MIN_BYTES {
             // 同步小整篇：装好后预览 == 编辑区 → 解除在途标记。
@@ -1129,13 +1129,13 @@ impl EditorApp {
                 w.install_open(markdown_wysiwyg::WyEditor::open_from_rope(rope))
             });
             if let Some(t) = self.tabs.get_mut(idx) {
-                t.md_wy_pending = None;
-                t.md_wy_pending_full = None;
+                t.md_wy_install.pending = None;
+                t.md_wy_install.pending_full = None;
             }
             return;
         }
-        self.tabs[idx].md_wy_pending = None;
-        self.tabs[idx].md_wy_pending_full = Some((seq, 0));
+        self.tabs[idx].md_wy_install.pending = None;
+        self.tabs[idx].md_wy_install.pending_full = Some((seq, 0));
         Self::md_wy_spawn_async_install_rope(idx, wy, rope, seq, cx);
     }
 
@@ -1158,19 +1158,19 @@ impl EditorApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.tabs.get(tab_idx).is_some_and(|t| {
-                    t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install_seq == seq
+                    t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install.seq == seq
                 }) {
                     wy_install.update(cx, |ed, _| ed.install_open(result));
                     if let Some(tab) = this.tabs.get_mut(tab_idx) {
-                        tab.md_wy_pending = None;
-                        tab.md_wy_pending_full = None;
+                        tab.md_wy_install.pending = None;
+                        tab.md_wy_install.pending_full = None;
                     }
                     cx.notify();
                 } else if let Some(tab) = this.tabs.get_mut(tab_idx)
-                    && tab.md_wy_pending_full.as_ref().is_some_and(|(s, _)| *s == seq)
+                    && tab.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq)
                 {
                     // 守卫不通过（切走/关闭/换代）→ 若仍挂本代号则清悬空标记；已换新代号保留。
-                    tab.md_wy_pending_full = None;
+                    tab.md_wy_install.pending_full = None;
                 }
             });
         })
@@ -1205,23 +1205,23 @@ impl EditorApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.tabs.get(tab_idx).is_some_and(|t| {
-                    t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install_seq == seq
+                    t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install.seq == seq
                 }) {
                     wy_install.update(cx, |ed, _| ed.install_open(result));
                     if let Some(tab) = this.tabs.get_mut(tab_idx) {
-                        tab.md_wy_pending = None;
+                        tab.md_wy_install.pending = None;
                         // Step3：异步整篇落地 → 预览已 == 目标，解除在途标记（增量桥恢复）。
-                        tab.md_wy_pending_full = None;
+                        tab.md_wy_install.pending_full = None;
                     }
                     cx.notify();
                 } else if let Some(tab) = this.tabs.get_mut(tab_idx)
-                    && (tab.md_wy_pending.as_ref().is_some_and(|(s, _)| *s == seq)
-                        || tab.md_wy_pending_full.as_ref().is_some_and(|(s, _)| *s == seq))
+                    && (tab.md_wy_install.pending.as_ref().is_some_and(|(s, _)| *s == seq)
+                        || tab.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq))
                 {
                     // 守卫不通过（切走/关闭/更新换代后结果被丢弃）：若 pending / pending_full
                     // 仍挂本代号（期间无更新装配）则清掉悬空标记；已换新代号则保留新标记。
-                    tab.md_wy_pending = None;
-                    tab.md_wy_pending_full = None;
+                    tab.md_wy_install.pending = None;
+                    tab.md_wy_install.pending_full = None;
                 }
             });
         })
@@ -1263,10 +1263,10 @@ impl EditorApp {
                 .filter(|w| {
                     async_load
                         && w.read(cx).is_loaded()
-                        && self.tabs[idx].md_wy_pending.is_none()
-                        && self.tabs[idx].md_wy_pending_full.is_none()
+                        && self.tabs[idx].md_wy_install.pending.is_none()
+                        && self.tabs[idx].md_wy_install.pending_full.is_none()
                         && !matches!(
-                            self.tabs[idx].md_wy_early,
+                            self.tabs[idx].md_wy_install.early,
                             Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Failed)
                         )
                         && w.read(cx).len() == rope.len()

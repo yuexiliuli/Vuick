@@ -1534,31 +1534,28 @@ impl EditorApp {
         hit_rows
     }
 
-    /// 输入变化 → 登记防抖待提交词并重启防抖计时器（时序代号作废旧定时器）。
-    /// 每键只做 O(1) 更新 + 即时通知刷新输入框渲染；[`SEARCH_DEBOUNCE_MS`] 期满且无
-    /// 新输入才把 `search_pending` 提交为 `search_committed` 并通知（触发一次扫描）。
-    /// 连续输入（间隔 < 防抖窗）时扫描零触发——大文档不再每键全量重扫正文。
+    /// 输入变化 → 登记防抖待提交词并重启防抖计时器（`base::SeqAfter` 代序作废旧
+    /// 定时器）。每键只做 O(1) 更新 + 即时通知刷新输入框渲染；[`SEARCH_DEBOUNCE_MS`]
+    /// 期满且无新输入才把 `search_pending` 提交为 `search_committed` 并通知（触发一次
+    /// 扫描）。连续输入（间隔 < 防抖窗）时扫描零触发——大文档不再每键全量重扫正文。
     pub(super) fn schedule_search_debounce(&mut self, value: String, cx: &mut Context<Self>) {
-        let seq = self.search_debounce_seq.wrapping_add(1);
-        self.search_debounce_seq = seq;
         self.search_pending = normalize_search_query(&value);
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                // 期间有新输入 → 序号已变，本定时器作废（防抖可重入）。
-                if this.search_debounce_seq == seq {
+        let weak = cx.weak_entity();
+        self.search_debounce.after(
+            cx,
+            std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS),
+            move |app| {
+                let _ = weak.update(app, |this, cx| {
+                    // 期间有新输入 → 代序已前进，本定时器作废（防抖可重入）。
                     let pending = std::mem::take(&mut this.search_pending);
                     if this.search_committed != pending {
                         this.search_committed = pending;
                         cx.notify();
                     }
-                }
-            });
-        })
-        .detach();
+                });
+            },
+        );
     }
 
     /// 侧边栏搜索「扫描并缓存」：查询词 + 活动文档未变时命中缓存（O(1) Rc 克隆，

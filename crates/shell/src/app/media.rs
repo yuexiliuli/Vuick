@@ -69,6 +69,7 @@ impl EditorApp {
 
     /// 图片/视频右键 → 在光标处弹「锁定/解锁」上下文菜单（仅活动选项卡是图片/视频时
     /// 生效）。锁定 = 隐藏全部非媒体 UI、媒体充满窗口；解锁回归。就地换掉旧的（若已打开）。
+    /// 装配/焦点/订阅闭环收敛自 `ui::menu::spawn_context_menu`。
     pub(super) fn on_media_right_click(
         &mut self,
         ev: &MouseDownEvent,
@@ -86,63 +87,61 @@ impl EditorApp {
         self.media_lock_menu_entity = None;
         self.media_lock_menu_pos = None;
         self.media_lock_menu_sub = None;
-        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-            let item = match media.clone() {
-                MediaReader::Image(img) => {
-                    let viewer_render = img.clone();
-                    PopupMenuItem::element(move |_window, cx| {
-                        let locked = viewer_render.read(cx).is_locked();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
-                            .child("锁定图片视图")
-                            .debug_selector(|| "media-lock-menu-item".into())
-                    })
-                    .on_click(move |_click, window, cx| {
-                        img.update(cx, |v, cx| v.toggle_lock(cx));
-                        // 强制重绘：宿主重读媒体查看器锁定态 → 隐藏/恢复外壳 → 媒体自动填满/缩小
-                        window.refresh();
-                    })
+        let (menu, sub) = ui::menu::spawn_context_menu(
+            window,
+            cx,
+            move |menu, _window, _cx| {
+                let item = match media.clone() {
+                    MediaReader::Image(img) => {
+                        let viewer_render = img.clone();
+                        PopupMenuItem::element(move |_window, cx| {
+                            let locked = viewer_render.read(cx).is_locked();
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
+                                .child("锁定图片视图")
+                                .debug_selector(|| "media-lock-menu-item".into())
+                        })
+                        .on_click(move |_click, window, cx| {
+                            img.update(cx, |v, cx| v.toggle_lock(cx));
+                            // 强制重绘：宿主重读媒体查看器锁定态 → 隐藏/恢复外壳 → 媒体自动填满/缩小
+                            window.refresh();
+                        })
+                    }
+                    #[cfg(feature = "video")]
+                    MediaReader::Video(vid) => {
+                        let viewer_render = vid.clone();
+                        PopupMenuItem::element(move |_window, cx| {
+                            let locked = viewer_render.read(cx).is_locked();
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
+                                .child("锁定视频视图")
+                                .debug_selector(|| "media-lock-menu-item".into())
+                        })
+                        .on_click(move |_click, window, cx| {
+                            vid.update(cx, |v, cx| v.toggle_lock(cx));
+                            window.refresh();
+                        })
+                    }
+                    // active_media_viewer 已按 is_lockable 过滤，PDF/无 不可达。
+                    MediaReader::Pdf(_) | MediaReader::None => unreachable!(),
+                };
+                menu.item(item)
+            },
+            |this, emitter, cx| {
+                // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
+                if this.media_lock_menu_entity.as_ref() == Some(&emitter) {
+                    this.media_lock_menu_entity = None;
+                    this.media_lock_menu_pos = None;
                 }
-                #[cfg(feature = "video")]
-                MediaReader::Video(vid) => {
-                    let viewer_render = vid.clone();
-                    PopupMenuItem::element(move |_window, cx| {
-                        let locked = viewer_render.read(cx).is_locked();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
-                            .child("锁定视频视图")
-                            .debug_selector(|| "media-lock-menu-item".into())
-                    })
-                    .on_click(move |_click, window, cx| {
-                        vid.update(cx, |v, cx| v.toggle_lock(cx));
-                        window.refresh();
-                    })
-                }
-                // active_media_viewer 已按 is_lockable 过滤，PDF/无 不可达。
-                MediaReader::Pdf(_) | MediaReader::None => unreachable!(),
-            };
-            menu.item(item)
-        });
-        // 聚焦并记住开菜单前的焦点（关闭后归还）
-        let previous_focus = window.focused(cx);
-        let focus_handle = menu.read(cx).focus_handle(cx);
-        menu.update(cx, |m, _| m.set_previous_focus(previous_focus));
-        window.focus(&focus_handle, cx);
-        // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
-        let menu_entity = menu.clone();
-        let sub = cx.subscribe(&menu_entity, move |this, emitter, _: &DismissEvent, cx| {
-            if this.media_lock_menu_entity.as_ref() == Some(&emitter) {
-                this.media_lock_menu_entity = None;
-                this.media_lock_menu_pos = None;
-            }
-            cx.notify();
-        });
+                cx.notify();
+            },
+        );
         self.media_lock_menu_pos = Some(ev.position);
         self.media_lock_menu_entity = Some(menu);
         self.media_lock_menu_sub = Some(sub);

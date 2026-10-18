@@ -75,6 +75,7 @@ use ropey::Rope;
 use ui::icon::{Icon, IconName};
 use ui::theme::ChromeColors;
 use ui::motion::hover_spring;
+use base::util::SeqAfter;
 
 // WYSIWYG 预览编辑——本项目 `markdown_wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
 use markdown_wysiwyg::{WyEditor, WyEvent};
@@ -144,23 +145,11 @@ struct EditorTab {
     /// 经 `track_scroll` 跟踪它，右侧自绘 `Scrollbar::vertical` 跟随（与 `live_vscroll`
     /// 同型：每次渲染重建容器、句柄跨帧稳定）。随选项卡搬迁（与 `md_preview` 同）。
     md_wy_vscroll: gpui::ScrollHandle,
-    /// B3：右栏 `md_wy` 「后台整篇装配在途」标记：`Some((装配代号, 目标内容))` = 已登记
-    /// 后台 `open_from_str` 解析、尚未 `install_open`；`None` = 无在途（已装好 / 被同步
-    /// 改动取代）。异步完成回调按代号与 [Self::md_wy_install_seq] 匹配才装配（不装错、不
-    /// 泄漏）；切回右栏内容「后到」期间保持旧内容。
-    md_wy_pending: Option<(usize, SharedString)>,
-    /// B3：右栏 `md_wy` 内容装配代号单调计数器——每次发起后台整篇装配 / 任何同步改源
-    /// （增量重放、同步喂源、换源 install_open、预览关闭）递增，结束在途旧装配（代号
-    /// 不匹配即丢弃其完成回调，防陈旧整篇覆盖刚改好的内容）。随选项卡搬迁。
-    md_wy_install_seq: usize,
-    /// Step2：大文档 md「打开即提前整篇解析」在途状态（见 [`MdWyEarly`]）。随选项卡搬迁。
-    md_wy_early: Option<MdWyEarly>,
-    /// Step3：右栏 `md_wy`「整篇在途」标记：`Some((装配代号, prefix 字节长))` = 预览
-    /// 当前只装了**首块 prefix**（已 `is_loaded`，首屏即真内容），整篇后台解析在途——
-    /// 此期间预览 ≠ 编辑区全文，`sync` 增量桥**禁止**把编辑区坐标增量打到 prefix（会
-    /// 错位），改走「作废在途整篇 + 异步整篇重喂」；整篇就绪带守卫换入全文后置 `None`
-    /// （恢复逐键增量）。随选项卡搬迁。
-    md_wy_pending_full: Option<(usize, usize)>,
+    /// 右栏 `md_wy`「在途装配」三代叠加态状态包（B3 后台整篇装配在途 / 装配代号 /
+    /// Step2 提前整篇解析在途 / Step3「整篇在途·prefix 已装」收敛为单字段，见
+    /// [`MdWyInstall`]）。随选项卡搬迁（EditorTab ⇄ DetachedTab）作为一个字段整包搬移，
+    /// 不再逐带双份复制。
+    md_wy_install: MdWyInstall,
     /// 编辑版本号：每次内容变更 +1。编辑区⇄预览滚动同步用它判断「画面/内容是否有新
     /// 编辑需重建同步基线」。
     edit_version: u64,
@@ -185,14 +174,9 @@ pub(crate) struct DetachedTab {
     /// 实体与窗口无关，可直接跨窗口移动）。
     md_wy: Option<gpui::Entity<WyEditor>>,
     md_wy_vscroll: gpui::ScrollHandle,
-    /// B3：随选项卡搬迁（承接在途后台装配的标记与代号，防搬迁后旧完成回调被误丢）。
-    md_wy_pending: Option<(usize, SharedString)>,
-    md_wy_install_seq: usize,
-    /// Step2：随选项卡搬迁（承接提前整篇解析在途状态，防搬迁后 EOF 让位/回退判断错位）。
-    md_wy_early: Option<MdWyEarly>,
-    /// Step3：随选项卡搬迁（承接「整篇在途、prefix 已装」标记，防搬迁后 sync 把增量
-    /// 错位打到 prefix）。
-    md_wy_pending_full: Option<(usize, usize)>,
+    /// 随选项卡搬迁（整包承接在途装配状态包，防搬迁后旧完成回调被误丢 / EOF 让位判断
+    /// 错位 / sync 增量错打 prefix）。
+    md_wy_install: MdWyInstall,
     /// P4-1：EPUB 内存图片表随选项卡搬迁（与 `md_wy` 宿主共用）。
     epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     /// P4-2：EPUB 注记正文表随选项卡搬迁（`ensure_epub_wy` → `set_notes` 用）。
@@ -238,6 +222,33 @@ pub(crate) enum MdWyEarly {
     Done,
     /// 提前读盘/解析失败（EOF 回退走既有整篇装配兜底）。
     Failed,
+}
+
+/// 右栏 `md_wy`「在途装配」状态的单字段状态包：收敛 B3（`pending` + `seq`）、Step2
+/// （`early`）、Step3（`pending_full`）三代叠加态，EditorTab ⇄ DetachedTab 搬迁时作为
+/// **一个字段**整包搬移（不再逐带双份复制进 DetachedTab）。
+///
+/// 四子项的语义与旧字段一一对应（行为零变化）：`pending` 与 `seq` 可共存（`feed_full`
+/// 同时登记后台整篇在途与代号）；`early` 与 `pending_full` 亦可在 Step2/3 两阶段协作时
+/// 同时置位——故收敛为**状态包**而非互斥枚举，避免改变「各标记独立置位/清位」的既有
+/// 时序语义。
+#[derive(Default)]
+pub(crate) struct MdWyInstall {
+    /// 后台整篇装配在途（原 `md_wy_pending`）：`Some((装配代号, 目标内容))` = 已登记
+    /// 后台 `open_from_str` 解析、尚未 `install_open`；`None` = 无在途。异步完成回调按
+    /// 代号与 `seq` 匹配才装配（不装错、不泄漏）。
+    pub(crate) pending: Option<(usize, SharedString)>,
+    /// 装配代号单调计数器（原 `md_wy_install_seq`）：每次发起后台整篇装配 / 任何同步
+    /// 改源（增量重放、同步喂源、换源 install_open、预览关闭）递增，结束在途旧装配
+    /// （代号不匹配即丢弃其完成回调，防陈旧整篇覆盖刚改好的内容）。
+    pub(crate) seq: usize,
+    /// Step2 提前整篇解析在途状态（原 `md_wy_early`，见 [`MdWyEarly`]）。
+    pub(crate) early: Option<MdWyEarly>,
+    /// Step3「整篇在途」标记（原 `md_wy_pending_full`）：`Some((装配代号, prefix 字节
+    /// 长))` = 预览只装了**首块 prefix**（已 `is_loaded`）、整篇后台解析在途——此期间
+    /// 预览 ≠ 编辑区全文，`sync` 增量桥**禁止**把编辑区坐标增量打到 prefix（会错位），
+    /// 改走「作废在途整篇 + 异步整篇重喂」；整篇就绪带守卫换入全文后置 `None`。
+    pub(crate) pending_full: Option<(usize, usize)>,
 }
 
 /// 选项卡拖拽携带的数据：目标选项卡下标 + 当前显示名（拖拽幽灵视图用它画“小胶囊”）。
@@ -346,8 +357,9 @@ pub struct EditorApp {
     active_tab: usize,
     /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条）
     tab_bar_hscroll: TableScrollState,
-    /// 自动隐藏定时器的代序号：只清除同代定时器，避免旧定时器误清新滚动。
-    tab_hscroll_seq: u64,
+    /// 横向滚动条自动隐藏延迟（`poke_tab_hscroll` 重启）：可重入、代序作废，旧定时器
+    /// 到点不误清新滚动。[`TAB_HSCROLL_HIDE_MS`] 后无新滚动再隐藏滚动条。
+    tab_hscroll_delay: SeqAfter,
     /// 顶部状态文字与是否"正常"
     status: SharedString,
     status_ok: bool,
@@ -367,9 +379,12 @@ pub struct EditorApp {
     /// 「恢复上次会话」开关（文件 → 菜单切换，随 [`UserPrefs`] 立即持久化；默认开）。
     /// 关闭时退出不写会话清单并清理遗留清单/槽位，下次启动不恢复。
     session_restore: bool,
-    /// 会话持久化防抖时序代号：每次安排 +1；旧防抖定时器到点比对不符即作废（仿
-    /// `search_debounce_seq`）。内容变化 300ms 停顿后才写盘一次，不逐键写盘。
-    session_flush_seq: u64,
+    /// 会话持久化防抖（`schedule_session_flush`）：可重入、代序作废（仿侧边栏搜索
+    /// 防抖 [`Self::search_debounce`]）。内容变化 300ms 停顿后才写盘一次，不逐键写盘。
+    /// （读取点 `schedule_session_flush` 被 `#[cfg(not(test))]` 门控 → 测试构建报该字段
+    /// 未读，属性注释压掉此噪声。）
+    #[cfg_attr(test, allow(dead_code))]
+    session_flush_debounce: SeqAfter,
     /// 会话恢复进行中：恢复期间重建的选项卡不触发持久化（避免反复写盘 / 抵抗
     /// `clear_session` 清理）。
     session_restoring: bool,
@@ -413,8 +428,9 @@ pub struct EditorApp {
     pub(crate) search_committed: String,
     /// 防抖窗口内最新一次输入（未提交的归一化查询词）；到点写入 `search_committed`。
     search_pending: String,
-    /// 防抖时序代号：每次输入 +1。旧防抖定时器到点比对不符即作废，防抖可重入。
-    search_debounce_seq: u64,
+    /// 搜索防抖（[`Self::schedule_search_debounce`]）：可重入、代序作废——旧防抖定时器
+    /// 到点被作废，只有最新一次输入期满才提交给扫描。
+    search_debounce: SeqAfter,
     /// 大文档「两段式打开」快段（`load_file_text` 延迟挂载编辑器）执行次数。
     /// 测试用：验证大文件先瞬时挂编辑器、再后台补齐统计/预览的完整流程两段都跑了。
     pub(crate) open_fast_count: usize,

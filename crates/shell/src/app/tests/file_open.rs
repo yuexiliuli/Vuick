@@ -1018,7 +1018,7 @@
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
             (
-                a.tabs[i].md_wy_early,
+                a.tabs[i].md_wy_install.early,
                 a.open_finish_count,
                 a.tabs[i]
                     .md_wy
@@ -1126,7 +1126,7 @@
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
             (
-                a.tabs[i].md_wy_early,
+                a.tabs[i].md_wy_install.early,
                 a.open_finish_count,
                 a.tabs[i]
                     .md_wy

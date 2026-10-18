@@ -63,7 +63,7 @@ impl EditorApp {
             tabs: Vec::new(),
             active_tab: 0,
             tab_bar_hscroll: TableScrollState::new(),
-            tab_hscroll_seq: 0,
+            tab_hscroll_delay: SeqAfter::default(),
             status: SharedString::from("就绪"),
             status_ok: true,
             notifications: Vec::new(),
@@ -76,8 +76,8 @@ impl EditorApp {
             wrap_enabled: false,
             // 会话恢复开关：None（未设置）= 默认开。
             session_restore: prefs.session_restore.unwrap_or(true),
-            // 会话持久化防抖时序代号 / 恢复期间抑制标记 / 槽位指纹表（见 session 模块）。
-            session_flush_seq: 0,
+            // 会话持久化防抖（可重入、代序作废） / 恢复期间抑制标记 / 槽位指纹表（见 session 模块）。
+            session_flush_debounce: SeqAfter::default(),
             session_restoring: false,
             session_slot_hashes: std::collections::HashMap::new(),
             session_last_manifest_digest: None,
@@ -112,7 +112,7 @@ impl EditorApp {
             search_scan_count: 0,
             search_committed: String::new(),
             search_pending: String::new(),
-            search_debounce_seq: 0,
+            search_debounce: SeqAfter::default(),
             open_fast_count: 0,
             open_finish_count: 0,
             open_dialog_calls: 0,

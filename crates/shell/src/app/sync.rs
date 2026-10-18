@@ -70,7 +70,7 @@ impl EditorApp {
                     // 当前预览；改以当前编辑区 Rope（O(1) COW 快照）**异步整篇重喂**（带装配
                     // 代号守卫，作废在途整篇/prefix），装好后预览 == 编辑区，此后的编辑退化
                     // 逐键增量——编辑过的整篇离散弃，不装旧。
-                    let stale = self.tabs[tab_ix].md_wy_pending_full.is_some()
+                    let stale = self.tabs[tab_ix].md_wy_install.pending_full.is_some()
                         || wy.read(cx).len() != ed.read(cx).rope().len();
                     if stale {
                         let rope = ed.read(cx).rope().clone();
