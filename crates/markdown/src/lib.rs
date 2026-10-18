@@ -40,6 +40,8 @@ pub use parse::scan_blocks;
 // `syntax::` / `ime::` 旧路径在拆 crate 后零改动即可解析。
 // ---------------------------------------------------------------------------
 /// 迁移期别名：自引用。本 crate 根 = 原 bin 里 `markdown` 模块，`crate::markdown::X` → `crate::X`。
+/// 现存引用只在 `#[cfg(test)]`（ir/parity/doc 金标准），生产自引用已清零，保留供后续即插即用。
+#[allow(unused_imports)]
 use crate as markdown;
 /// 迁移期别名：`crate::prof::` → `base::prof`。
 use base::prof;

@@ -556,6 +556,25 @@ impl Buffer {
     /// 应用一次替换（返回可逆记录）。`range` 需在字符边界上。
     pub fn apply_edit(&mut self, range: Range<usize>, new_text: &str) -> Edit {
         let range = self.clip(range.start).min(self.clip(range.end))..self.clip(range.end);
+        self.replace_region(range, new_text)
+    }
+
+    /// 撤销：把 `inserted_range` 还原为 `old_text`。
+    pub fn undo_edit(&mut self, edit: &Edit) {
+        let ir = edit.inserted_range();
+        let _ = self.replace_region(ir, edit.old_text.as_ref());
+    }
+
+    /// 重做：把 `replaced_range` 重新替换为 `new_text`。
+    pub fn redo_edit(&mut self, edit: &Edit) {
+        let rr = edit.replaced_range();
+        let _ = self.replace_region(rr, edit.new_text.as_ref());
+    }
+
+    /// 三操作（apply/undo/redo）共用的核心：取受影响行宽直方图 → 绳替换 → 刷新派生
+    /// 行状态 → 版本推进 + 清「纯尾追加」标记。`range` 需在字符边界上（undo/redo 的
+    /// 区间由 `Edit` 记录推出，天然合法）。行为零漂移：三个公共入口收敛为薄包装。
+    fn replace_region(&mut self, range: Range<usize>, new_text: &str) -> Edit {
         let old_line_a = self.line_of_offset(range.start.min(self.text.len()));
         let old_line_b = self.line_of_offset(range.end.min(self.text.len()));
         // 先捕获受影响旧行的整行宽（行宽直方图需要，替换后这些行可能消失）。
@@ -563,7 +582,7 @@ impl Buffer {
         let old = SharedString::from(self.text.slice(range.clone()).to_string());
         self.text.replace(range.clone(), new_text);
         self.version += 1;
-        self.tail_append = None; // 编辑 = 非尾部追加变更，清掉「纯尾追加」标记
+        self.tail_append = None; // 编辑/撤销/重做 = 非尾部追加变更，清掉「纯尾追加」标记
         let new_line_b = self.line_of_offset((range.start + new_text.len()).min(self.text.len()));
         self.refresh_lines(old_widths, old_line_a, new_line_b);
         Edit {
@@ -571,34 +590,6 @@ impl Buffer {
             old_text: old,
             new_text: new_text.into(),
         }
-    }
-
-    /// 撤销：把 `inserted_range` 还原为 `old_text`。
-    pub fn undo_edit(&mut self, edit: &Edit) {
-        let ir = edit.inserted_range();
-        let old_line_a = self.line_of_offset(ir.start.min(self.text.len()));
-        let old_line_b = self.line_of_offset(ir.end.min(self.text.len()));
-        let old_widths = self.line_widths_in(old_line_a, old_line_b);
-        self.text.replace(ir, edit.old_text.as_ref());
-        self.version += 1;
-        self.tail_append = None; // 撤销 = 非尾部追加变更
-        let new_line_b = self
-            .line_of_offset((edit.start + edit.old_text.len()).min(self.text.len()));
-        self.refresh_lines(old_widths, old_line_a, new_line_b);
-    }
-
-    /// 重做：把 `replaced_range` 重新替换为 `new_text`。
-    pub fn redo_edit(&mut self, edit: &Edit) {
-        let rr = edit.replaced_range();
-        let old_line_a = self.line_of_offset(rr.start.min(self.text.len()));
-        let old_line_b = self.line_of_offset(rr.end.min(self.text.len()));
-        let old_widths = self.line_widths_in(old_line_a, old_line_b);
-        self.text.replace(rr, edit.new_text.as_ref());
-        self.version += 1;
-        self.tail_append = None; // 重做 = 非尾部追加变更
-        let new_line_b = self
-            .line_of_offset((edit.start + edit.new_text.len()).min(self.text.len()));
-        self.refresh_lines(old_widths, old_line_a, new_line_b);
     }
 
 }

@@ -36,11 +36,14 @@
 use std::{
     collections::HashMap,
     ops::Range,
-    sync::{LazyLock, Mutex},
 };
 
-use gpui::{Hsla, rgb};
-use syntect::parsing::{ParseState, Scope, ScopeStackOp, SyntaxReference, SyntaxSet};
+use gpui::Hsla;
+use syntect::parsing::{ParseState, Scope, ScopeStackOp, SyntaxReference};
+
+// 高亮单真值：SyntaxSet/find_syntax/semantic_name/GitHubTheme 全部消费 syntax crate，
+// 编辑器不再内嵌重复实现（此前同 scope 配色数值漂移，如 comment 浅色 0x6e7781 vs 0x6a737d）。
+use syntax::{SemanticStyleResolver, find_syntax, github_theme_cached, semantic_name_cached, syntax_set};
 
 use crate::editor::buffer::Buffer;
 
@@ -70,118 +73,18 @@ const HL_SNAPSHOT_CAP: usize = 4;
 /// 单份快照最大行数（见 [`HL_SNAPSHOT_CAP`] 的取舍注释）。
 const HL_SNAPSHOT_MAX_ROWS: usize = 2048;
 
-/// 共享语法集（默认语法集几 MB，进程级共享一次）。
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-
-/// 语言名 → 语法解析结果缓存（`find_syntax_by_token` 全量扫描较慢）。
-static SYNTAX_CACHE: LazyLock<Mutex<HashMap<String, Option<&'static SyntaxReference>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
-    let lang = language.to_owned();
-    if let Ok(cache) = SYNTAX_CACHE.lock()
-        && let Some(r) = cache.get(&lang) {
-            return *r;
-        }
-    let r = SYNTAX_SET
-        .find_syntax_by_token(&lang)
-        .or_else(|| SYNTAX_SET.find_syntax_by_extension(&lang));
-    if let Ok(mut cache) = SYNTAX_CACHE.lock() {
-        cache.insert(lang, r);
-    }
-    r
-}
-
 /// 测试探针：进程级共享语法集引用（供基准校准直接测纯 syntect parse 成本）。
+/// 单一真值在 syntax crate（`syntax::syntax_set`）。
 #[cfg(test)]
-pub(crate) fn syntax_set_ref() -> &'static SyntaxSet {
-    &SYNTAX_SET
+pub(crate) fn syntax_set_ref() -> &'static syntect::parsing::SyntaxSet {
+    syntax_set()
 }
 
-/// syntect scope → 语义名（与 `src/syntax` 的 GitHub 配色语义一致）。
-fn semantic_name(scope: &Scope) -> Option<&'static str> {
-    let scope = scope.build_string();
-    if scope.starts_with("comment") {
-        Some("comment")
-    } else if scope.starts_with("constant.character.escape") {
-        Some("string.escape")
-    } else if scope.starts_with("string") {
-        Some("string")
-    } else if scope.starts_with("constant.numeric") {
-        Some("number")
-    } else if scope.starts_with("constant.language.boolean") {
-        Some("boolean")
-    } else if scope.starts_with("keyword.operator") {
-        Some("operator")
-    } else if scope.starts_with("keyword") || scope.starts_with("storage") {
-        Some("keyword")
-    } else if scope.starts_with("entity.name.function") || scope.starts_with("support.function") {
-        Some("function")
-    } else if scope.starts_with("entity.name.type")
-        || scope.starts_with("entity.name.class")
-        || scope.starts_with("support.type")
-    {
-        Some("type")
-    } else if scope.starts_with("entity.name.tag") {
-        Some("tag")
-    } else if scope.starts_with("entity.other.attribute-name") {
-        Some("attribute")
-    } else if scope.starts_with("variable.other.property")
-        || scope.starts_with("support.constant.property")
-    {
-        Some("property")
-    } else if scope.starts_with("variable") {
-        Some("variable")
-    } else if scope.starts_with("constant") {
-        Some("constant")
-    } else if scope.starts_with("punctuation") {
-        Some("punctuation")
-    } else if scope.starts_with("entity.name.namespace") || scope.starts_with("keyword.control.import")
-    {
-        Some("preproc")
-    } else {
-        None
-    }
-}
-
-/// 语义名 → 配色（内嵌 GitHub Light/Dark 色板）。
+/// 语义名 → 配色（单源：syntax crate 的 `GitHubTheme`，编辑器只取颜色分量——产出的段
+/// 只有颜色，无斜体/加粗）。未设色（`variable`/`punctuation` 等）→ `None` → 沿用外层
+/// 文字色，与 syntax 语义一致。
 fn name_color(name: &str, dark: bool) -> Option<Hsla> {
-    let c: u32 = match (name, dark) {
-        ("comment", false) => 0x6e7781,
-        ("comment", true) => 0x8b949e,
-        ("string", false) => 0x0a3069,
-        ("string", true) => 0xa5d6ff,
-        ("string.escape", false) => 0x116329,
-        ("string.escape", true) => 0xff7b72,
-        ("number", false) => 0x0550ae,
-        ("number", true) => 0x79c0ff,
-        ("boolean", false) => 0xcf222e,
-        ("boolean", true) => 0xd2a8ff,
-        ("operator", false) => 0xcf222e,
-        ("operator", true) => 0xff7b72,
-        ("keyword", false) => 0xcf222e,
-        ("keyword", true) => 0xff7b72,
-        ("function", false) => 0x8250df,
-        ("function", true) => 0xd2a8ff,
-        ("type", false) => 0x953800,
-        ("type", true) => 0xffa657,
-        ("tag", false) => 0x116329,
-        ("tag", true) => 0x7ee787,
-        ("attribute", false) => 0x116329,
-        ("attribute", true) => 0x7ee787,
-        ("property", false) => 0x116329,
-        ("property", true) => 0x79c0ff,
-        ("variable", false) => 0x24292f,
-        ("variable", true) => 0xe6edf3,
-        ("constant", false) => 0x0550ae,
-        ("constant", true) => 0x79c0ff,
-        ("punctuation", false) => 0x24292f,
-        ("punctuation", true) => 0xe6edf3,
-        ("preproc", false) => 0x116329,
-        ("preproc", true) => 0xffa657,
-        _ => return None,
-    };
-    Some(rgb(c).into())
+    github_theme_cached(dark).style(name).and_then(|s| s.color)
 }
 
 /// 历史解析窗口快照：主窗口被丢弃/重锚前的一帧完整镜像（逐行样式 + 每行解析状态保存点）。
@@ -226,6 +129,9 @@ pub struct Highlighter {
     snapshots: Vec<HighlightSnapshot>,
     /// 快照 LRU 访问钟（`HighlightSnapshot::last_seen`，淘汰最久未用）。
     snapshot_clock: u32,
+    /// per-scope 语义名缓存（`syntax::semantic_name_cached`）：同一 `Scope` 跨行/跨段
+    /// 复用，避免 `parse_line` 每段都 `scope.build_string()` 字符串化（顺带收益）。
+    semantic_names: HashMap<Scope, Option<&'static str>>,
     /// 待消费的「最近编辑」登记（由 `set_dirty` 写入，仅消费一次）：
     /// `(min_row, tail_new, delta)` —— `min_row` 编辑前最小受影响逻辑行；
     /// `tail_new` 编辑后在**当前坐标**下首个内容未变的「尾部」行
@@ -266,6 +172,7 @@ impl Highlighter {
             gated_id: 0,
             snapshots: Vec::new(),
             snapshot_clock: 0,
+            semantic_names: HashMap::new(),
             dirty: None,
             force_full: true,
             pending: None,
@@ -512,7 +419,7 @@ impl Highlighter {
                 .saves
                 .last()
                 .cloned()
-                .unwrap_or_else(|| ParseState::new(SYNTAX_SET.find_syntax_plain_text()));
+                .unwrap_or_else(|| ParseState::new(syntax_set().find_syntax_plain_text()));
             for r in s_end..=hi {
                 let text = buffer.line_text(r);
                 let mut style: Vec<(Range<usize>, Hsla)> = Vec::new();
@@ -836,7 +743,7 @@ impl Highlighter {
             // 占位保存点，恢复 `saves.len() == lines.len()` 不变量——否则深跳触发容量
             // 收缩 `saves.drain(..drop)` 会越界 panic（syntax 为 None 时 `extend_down`
             // /`reparse_after_edit` 都早退，占位保存点只用于对齐、从不被读取）。
-            let plain = SYNTAX_SET.find_syntax_plain_text();
+            let plain = syntax_set().find_syntax_plain_text();
             let fresh = ParseState::new(plain);
             for _ in start..=hi {
                 lines.push(Vec::new());
@@ -997,23 +904,30 @@ impl Highlighter {
     }
 
     fn parse_line(
-        &self,
+        &mut self,
         parser: &mut ParseState,
         text: &str,
         out: &mut Vec<(Range<usize>, Hsla)>,
         dark: bool,
     ) {
-        let Ok(operations) = parser.parse_line(text, &SYNTAX_SET) else {
+        let Ok(operations) = parser.parse_line(text, syntax_set()) else {
             return;
         };
         let mut active: Vec<Scope> = Vec::new();
         let mut cursor = 0usize;
         let line_len = text.len();
-        let paint = |active: &[Scope], from: usize, to: usize, out: &mut Vec<(Range<usize>, Hsla)>| {
+        let paint = |cache: &mut HashMap<Scope, Option<&'static str>>,
+                     active: &[Scope],
+                     from: usize,
+                     to: usize,
+                     out: &mut Vec<(Range<usize>, Hsla)>| {
             if to <= from {
                 return;
             }
-            let name = active.iter().rev().find_map(semantic_name);
+            let name = active
+                .iter()
+                .rev()
+                .find_map(|scope| semantic_name_cached(cache, *scope));
             if let Some(name) = name
                 && let Some(color) = name_color(name, dark) {
                     out.push((from..to, color));
@@ -1021,13 +935,13 @@ impl Highlighter {
         };
         for (index, operation) in operations {
             if cursor < index {
-                paint(&active, cursor, index, out);
+                paint(&mut self.semantic_names, &active, cursor, index, out);
             }
             self.apply_op(&mut active, &operation);
             cursor = index;
         }
         if cursor < line_len {
-            paint(&active, cursor, line_len, out);
+            paint(&mut self.semantic_names, &active, cursor, line_len, out);
         }
     }
 
@@ -1050,5 +964,47 @@ impl Highlighter {
 impl Default for Highlighter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syntax::SemanticStyleResolver;
+
+    /// 单源色板对拍：编辑器 `name_color` 必须与 syntax GitHubTheme 同 scope 色完全一致
+    /// （此前两套内嵌色板数值漂移，如 comment 浅色 0x6e7781 vs 官方 0x6a737d；
+    /// 统一后 editor 碱色 == syntax 碱色锁死）。
+    #[test]
+    fn editor_colors_match_syntax_github_theme() {
+        let names = [
+            "comment",
+            "string",
+            "string.escape",
+            "number",
+            "boolean",
+            "operator",
+            "keyword",
+            "function",
+            "type",
+            "tag",
+            "attribute",
+            "property",
+            "constant",
+            "preproc",
+        ];
+        for dark in [false, true] {
+            let theme = github_theme_cached(dark);
+            for &name in &names {
+                assert_eq!(
+                    name_color(name, dark),
+                    theme.style(name).and_then(|s| s.color),
+                    "scope {name} dark={dark} 颜色应与 syntax GitHubTheme 一致"
+                );
+            }
+            // 未设色 scope（variable/punctuation）→ 编辑器应放行（沿用外层文字色）。
+            assert_eq!(name_color("variable", dark), None, "dark={dark}");
+            assert_eq!(name_color("punctuation", dark), None, "dark={dark}");
+        }
     }
 }

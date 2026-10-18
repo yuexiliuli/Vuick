@@ -971,23 +971,25 @@ pub(crate) fn merge_highlights(
     bounds.dedup();
 
     let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    // 双指针归并：`bounds` 与 `runs` 均升序（runs 互不重叠且升序），`ri` 随 `a` 单调
+    // 前进——每段只需跳到「首个 end > a」的 run（整段 O(n+m)），不再每切分单元从头部
+    // 重扫（旧实现最坏 O(段²)，每个可见行每帧重复）。切分边界/合并规则保持不变。
+    let mut ri = 0usize;
     for (i, a) in bounds.iter().copied().enumerate() {
         let Some(&b) = bounds.get(i + 1) else { break };
         if b <= a {
             continue;
         }
-        let mut style = HighlightStyle::default();
-        // 样式段：runs 互不重叠且升序，取首个覆盖 [a, b) 的段（整段复制）。
-        for (r, s) in runs {
-            if r.end <= a {
-                continue;
-            }
-            if r.start >= b {
-                break;
-            }
-            style = *s;
-            break;
+        while ri < runs.len() && runs[ri].0.end <= a {
+            ri += 1;
         }
+        let mut style = HighlightStyle::default();
+        // 跳过 `end <= a` 后，`runs[ri]` 即首个可能覆盖 [a, b) 的段：`start < b` 则覆盖
+        // （runs 非重叠 ⇒ 其后段起点更大，不可能更早覆盖本单元）。
+        if let Some((r, s)) = runs.get(ri)
+            && r.start < b {
+                style = *s;
+            }
         if sel.as_ref().is_some_and(|s| a >= s.start && b <= s.end) {
             style.background_color = Some(sel_bg);
         }

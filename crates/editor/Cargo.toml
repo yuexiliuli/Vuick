@@ -13,6 +13,9 @@ syntect = { workspace = true }
 config = { path = "../config" }
 base = { path = "../base" }
 ime = { path = "../ime" }
+# 高亮单真值：编辑器语法高亮消费 syntax crate 的 SyntaxSet/find_syntax/semantic_name/GitHubTheme
+# （编辑器不再内嵌重复语法集、scope 映射与色板）。
+syntax = { path = "../syntax" }
 # 编辑器视图渲染用 ui 的 theme/scrollbar/shell（第二 UI 组件 crate，依赖 {config,base,ime} 不依赖 editor）。
 ui = { path = "../ui" }
 

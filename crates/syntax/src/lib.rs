@@ -20,6 +20,12 @@ use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet
 /// 全局语法集（Windows syntax-based detection）；进程内仅加载一次。
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
+/// 进程级共享语法集引用：editor 窗口高亮与预览/WYSIWYG 块高亮共用同一实例
+/// （单一真值，不再各自 `load_defaults_newlines` 一份）。
+pub fn syntax_set() -> &'static SyntaxSet {
+    &SYNTAX_SET
+}
+
 /// 语言名 → 语法的解析结果缓存（`find_syntax_by_token` 全量扫描较慢，避免每次重扫）。
 static SYNTAX_CACHE: LazyLock<std::sync::Mutex<std::collections::HashMap<String, Option<&'static SyntaxReference>>>> =
     LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -37,7 +43,8 @@ fn normalize_language(lang: &str) -> &str {
 }
 
 /// 按语言 token 或扩展名定位语法（带结果缓存）；找不到返回 `None`（不产出高亮）。
-fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
+/// editor 窗口高亮跨 crate 消费（单真值；丢失的 alias 归一由本函数统一收编）。
+pub fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
     let lang = normalize_language(language).to_owned();
     let key = lang.to_lowercase();
     if let Ok(cache) = SYNTAX_CACHE.lock()
@@ -87,12 +94,12 @@ fn find_name(
     scopes: &ScopeStack,
 ) -> Option<&'static str> {
     scopes.scopes.iter().rev().find_map(|scope| {
-        *cache.entry(*scope).or_insert_with(|| semantic_name(*scope))
+        semantic_name_cached(cache, *scope)
     })
 }
 
 /// 把 syntect scope 字符串映射为语义名（与 [`GitHubTheme::style`] 的键一致）。
-fn semantic_name(scope: Scope) -> Option<&'static str> {
+pub fn semantic_name(scope: Scope) -> Option<&'static str> {
     let scope = scope.build_string();
     let name = if scope.starts_with("comment") {
         "comment"
@@ -135,6 +142,15 @@ fn semantic_name(scope: Scope) -> Option<&'static str> {
         return None;
     };
     Some(name)
+}
+
+/// 带 per-scope 缓存的语义名映射：调用方跨行/跨段复用同一 `cache`，避免每段都
+/// `scope.build_string()` 字符串化。映射真值仍单一在 [`semantic_name`]。
+pub fn semantic_name_cached(
+    cache: &mut HashMap<Scope, Option<&'static str>>,
+    scope: Scope,
+) -> Option<&'static str> {
+    *cache.entry(scope).or_insert_with(|| semantic_name(scope))
 }
 
 // -------------------------------------------------------------------------

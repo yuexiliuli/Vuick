@@ -97,7 +97,8 @@ pub fn heading_fold_regions(
 /// same `-`, `*`, or `_`, separated only by optional spaces — e.g. `---`, `***`,
 /// `- - -`. The editor paints a divider in its place (reveal-on-caret). Matches
 /// CommonMark, ignoring the rare setext-underline ambiguity this app doesn't use.
-#[allow(dead_code)]
+/// 测试锚：生产路径（`MarkdownDecor`/WYSIWYG）已不再消费，仅 `ir`/`parity` 金标准测试用。
+#[cfg(test)]
 pub(crate) fn thematic_break(line: &str) -> bool {
     let mut chars = line.bytes().filter(|b| !b.is_ascii_whitespace());
     let Some(first) = chars.next() else {
@@ -256,7 +257,9 @@ pub fn toggle_task_checkbox(line: &str) -> Option<String> {
 /// (W4) when the caret is elsewhere; a line with any other trailing text stays
 /// plain source. Prefix recognition is shared with the preview parser
 /// (`crate::markdown::parse::parse_ref`, parity-pinned).
-#[allow(dead_code)]
+/// 测试锚：生产路径已由 `parse_image_line` / WYSIWYG `DocRow::Image` 取代，仅本模块/
+/// `ir`/`parity` 金标准测试消费。
+#[cfg(test)]
 pub(crate) fn image_line(line: &str) -> Option<(&str, Option<f32>)> {
     let r = crate::markdown::parse::parse_ref(line.trim())?;
     let tail = r.tail.trim();
@@ -281,7 +284,8 @@ pub(crate) fn image_line(line: &str) -> Option<(&str, Option<f32>)> {
 /// marker (0 for a plain standalone image). The editor renders the image inset
 /// past the marker so a bulleted image keeps its bullet, instead of the row
 /// collapsing to the image or falling back to raw source.
-#[allow(dead_code)]
+/// 测试锚：生产路径已由 WYSIWYG `DocRow::Image` 取代，仅 `ir`/`parity` 金标准测试消费。
+#[cfg(test)]
 pub(crate) fn image_row(line: &str) -> Option<(&str, Option<f32>, usize)> {
     if let Some((src, width)) = image_line(line) {
         return Some((src, width, 0));
