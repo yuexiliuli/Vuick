@@ -436,25 +436,27 @@ impl PdfWorker {
         let pdfium = Pdfium::new(bindings);
         // 文档存活期 = `pdfium` 存活期；所有 `PdfDocument<'a>` 都借用上面的 `pdfium`。
         let mut docs: HashMap<DocId, PdfDocument<'_>> = HashMap::new();
-        // 本地优先级队列：阻塞等第一条消息后，把当前积压一次性入队再调度。
+        // 本地优先级队列：按类分桶（render > mid > thumb > 其余），桶内 FIFO——
         // **Render 永不排在 Text 之后**（滚动画帧的栅格化优先于懒加载的文本提取），
-        // 其余消息（Open/Close/Text 之间）保持 FIFO。
-        let mut queue: VecDeque<WorkerMsg> = VecDeque::new();
+        // 同优先级保持到达顺序。替代原「单队 + 每轮 `iter().position()+remove(i)`」的
+        // O(n) 扫描抽取；调度语义（严格类优先级 + 同类 FIFO）与原实现完全一致。
+        let mut render_q: VecDeque<WorkerMsg> = VecDeque::new();
+        let mut mid_q: VecDeque<WorkerMsg> = VecDeque::new();
+        let mut thumb_q: VecDeque<WorkerMsg> = VecDeque::new();
+        let mut rest_q: VecDeque<WorkerMsg> = VecDeque::new();
         // 在途的全文档检索（分片续跑）：worker 无渲染/占位积压时每轮扫一片（几页/几 ms），
         // 保证检索期间到达的 Render/RenderTile 可以插队先跑——否则一次全量扫描会冻结所有
         // 瓦片/封面（87 页文本 PDF 实测检索 ~440ms，期间渲染被整段堵住 → 随机页先模糊）。
         let mut pending_search: Option<PendingSearch> = None;
         loop {
+            // 现积压一次性分桶入队（每桶 FIFO；跨类优先序由下方「先取高优先桶」体现）。
             while let Ok(msg) = rx.try_recv() {
-                queue.push_back(msg);
+                enqueue_msg(msg, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q);
             }
             // 1) 渲染永远最优先：全尺寸 Render / RenderTile（瓦片与整页同为视口内容），
             //    即使渲染消息排在检索/文本之后到，也会先从队列里抽出来执行。
-            if let Some(i) = queue
-                .iter()
-                .position(|m| matches!(m, WorkerMsg::Render(..) | WorkerMsg::RenderTile(..)))
-            {
-                match queue.remove(i).expect("position 已命中") {
+            if let Some(msg) = render_q.pop_front() {
+                match msg {
                     WorkerMsg::Render(doc_id, req, tx) => {
                         let result = docs.get(&doc_id).and_then(|doc| render_page(doc, req));
                         let _ = tx.send(result);
@@ -463,33 +465,33 @@ impl PdfWorker {
                         let result = docs.get(&doc_id).and_then(|doc| render_tile(doc, req));
                         let _ = tx.send(result);
                     }
-                    _ => unreachable!("只抽到 Render/RenderTile"),
+                    _ => unreachable!("render_q 只入 Render/RenderTile"),
                 }
                 continue;
             }
             // 2) LOD 占位：Mid（中清）> Thumb（缩略），低于渲染、高于其余。
-            if let Some(i) = queue.iter().position(|m| matches!(m, WorkerMsg::Mid(..))) {
-                match queue.remove(i).expect("已命中") {
+            if let Some(msg) = mid_q.pop_front() {
+                match msg {
                     WorkerMsg::Mid(doc_id, page, sf, tx) => {
                         let result = docs.get(&doc_id).and_then(|doc| render_mid(doc, page, sf));
                         let _ = tx.send(result);
                     }
-                    _ => unreachable!("只抽到 Mid"),
+                    _ => unreachable!("mid_q 只入 Mid"),
                 }
                 continue;
             }
-            if let Some(i) = queue.iter().position(|m| matches!(m, WorkerMsg::Thumb(..))) {
-                match queue.remove(i).expect("已命中") {
+            if let Some(msg) = thumb_q.pop_front() {
+                match msg {
                     WorkerMsg::Thumb(doc_id, page, tx) => {
                         let result = docs.get(&doc_id).and_then(|doc| render_thumb(doc, page));
                         let _ = tx.send(result);
                     }
-                    _ => unreachable!("只抽到 Thumb"),
+                    _ => unreachable!("thumb_q 只入 Thumb"),
                 }
                 continue;
             }
             // 3) 其余 FIFO：Open / Close / Text / Search。Search 只登记成分片状态、不在此阻塞。
-            if let Some(msg) = queue.pop_front() {
+            if let Some(msg) = rest_q.pop_front() {
                 match msg {
                     WorkerMsg::Open(doc_id, bytes, tx) => {
                         let t0 = std::time::Instant::now();
@@ -561,7 +563,7 @@ impl PdfWorker {
                             let _ = tx.send(None);
                         }
                     }
-                    _ => unreachable!("Render/RenderTile/Mid/Thumb 已在上方抽走"),
+                    _ => unreachable!("rest_q 只入 Open/Close/Text/Search"),
                 }
                 continue;
             }
@@ -581,10 +583,28 @@ impl PdfWorker {
             }
             // 5) 真空闲：阻塞等新消息（只有在既无排队消息也无在途检索时才会真阻塞）。
             match rx.recv() {
-                Ok(msg) => queue.push_back(msg),
+                Ok(msg) => enqueue_msg(msg, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q),
                 Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
             }
         }
+    }
+}
+
+/// 把工作消息按优先级类分桶（render > mid > thumb > rest），桶内保持到达顺序（FIFO）。
+/// 分桶后各桶互不交错：严格类优先级 + 同类 FIFO 与原「单队 + position/remove 扫描」的
+/// 调度语义完全一致，只是每轮取舍从 O(n) 扫描降为 O(1) 取桶头。
+fn enqueue_msg(
+    msg: WorkerMsg,
+    render_q: &mut VecDeque<WorkerMsg>,
+    mid_q: &mut VecDeque<WorkerMsg>,
+    thumb_q: &mut VecDeque<WorkerMsg>,
+    rest_q: &mut VecDeque<WorkerMsg>,
+) {
+    match msg {
+        WorkerMsg::Render(..) | WorkerMsg::RenderTile(..) => render_q.push_back(msg),
+        WorkerMsg::Mid(..) => mid_q.push_back(msg),
+        WorkerMsg::Thumb(..) => thumb_q.push_back(msg),
+        _ => rest_q.push_back(msg),
     }
 }
 

@@ -103,10 +103,127 @@ struct CacheEntry {
 }
 
 /// 原始文件压缩字节（磁盘→RAM 预读层，LRU 字节预算缓存；解码从这里取字节免等磁盘）。
+/// 路径以 LRU 键（[`LruMap<PathBuf, _>`]）独立存储，条目只保留字节本体。
 #[derive(Clone)]
 struct ByteEntry {
-    path: PathBuf,
     bytes: Arc<Vec<u8>>,
+}
+
+/// 泛型 LRU 缓存：队首最旧 / 队尾最近用；命中（[`LruMap::get`]）与写入（[`LruMap::put`]）
+/// 都移到队尾。条目大小经 `size` 闭包计价并内部维护总字节（[`LruMap::bytes`]）；`put`
+/// 按「条目数上限 / 字节上限」从队首淘汰，被替换/被淘汰的条目原样返回（供调用方释放/
+/// 记账）。替换原 `cache`（解码结果）与 `byte_cache`（原始字节）两套平行 LRU 的近同构
+/// 实现，二者仅 `size` 计价与容量规则不同。
+struct LruMap<K, V> {
+    /// （键, 值）队列：队首最旧、队尾最近用。
+    q: VecDeque<(K, V)>,
+    /// 总字节（各条目经 `size` 计价，替换/淘汰同步增减）。
+    bytes: usize,
+    /// 条目数上限（`None` = 不按张数淘汰，仅字节预算）。
+    max_items: Option<usize>,
+    /// 总字节上限。
+    max_bytes: usize,
+    /// 单条目「字节代计」：解码结果用 RGBA 近似内存，字节缓存用 `bytes.len()`。
+    size: fn(&V) -> usize,
+}
+
+impl<K: PartialEq, V> LruMap<K, V> {
+    /// 建空 LRU：`max_items` 为 None 时仅按字节预算淘汰（字节缓存语义）。
+    fn new(max_items: Option<usize>, max_bytes: usize, size: fn(&V) -> usize) -> Self {
+        Self {
+            q: VecDeque::new(),
+            bytes: 0,
+            max_items,
+            max_bytes,
+            size,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.q.len()
+    }
+
+    /// 当前总字节（淘汰预算 / 派发停止判断用）。
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// 只读查询（不改变 LRU 顺序）。键按 `Borrow` 匹配：`PathBuf` 键可直接用 `&Path` 查。
+    fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: PartialEq + ?Sized,
+    {
+        self.q.iter().any(|(k, _)| k.borrow() == key)
+    }
+
+    /// 命中并移到队尾（MRU），返回可克隆副本（Arc 浅拷贝）；未中 `None`。
+    fn get<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: PartialEq + ?Sized,
+        V: Clone,
+    {
+        let pos = self.q.iter().position(|(k, _)| k.borrow() == key)?;
+        let (k, v) = self.q.remove(pos).expect("position 已命中");
+        let ret = v.clone();
+        self.q.push_back((k, v));
+        Some(ret)
+    }
+
+    /// 写入（同 key 已存在先移除旧条目再入队尾），超出条目数/字节上限按 LRU 从队首淘汰。
+    /// 返回被移除 / 被淘汰的全部条目（含同 key 替换的旧条目），供调用方释放 / 记账。
+    fn put(&mut self, key: K, value: V) -> Vec<(K, V)> {
+        let mut removed = Vec::new();
+        if let Some(pos) = self.q.iter().position(|(k, _)| k == &key) {
+            let (k, old) = self.q.remove(pos).expect("position 已命中");
+            self.bytes = self.bytes.saturating_sub((self.size)(&old));
+            removed.push((k, old));
+        }
+        self.bytes = self.bytes.saturating_add((self.size)(&value));
+        self.q.push_back((key, value));
+        while self.max_items.is_some_and(|n| self.q.len() > n) || self.bytes > self.max_bytes {
+            let Some((k, old)) = self.q.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub((self.size)(&old));
+            removed.push((k, old));
+        }
+        removed
+    }
+
+    /// 清空（条目与字节账一并归零）。
+    fn clear(&mut self) {
+        self.q.clear();
+        self.bytes = 0;
+    }
+
+    /// 按 LRU 序（队首 → 队尾）迭代值。
+    fn iter(&self) -> impl Iterator<Item = &V> {
+        self.q.iter().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> IntoIterator for LruMap<K, V> {
+    type Item = V;
+    type IntoIter = std::vec::IntoIter<V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.q.into_iter().map(|(_, v)| v).collect::<Vec<_>>().into_iter()
+    }
+}
+
+impl<K, V> Default for LruMap<K, V> {
+    /// 空缓存（供 `std::mem::take` / 释放路径使用；`size` 为哑函数，空存时不会被调用）。
+    fn default() -> Self {
+        Self {
+            q: VecDeque::new(),
+            bytes: 0,
+            max_items: None,
+            max_bytes: 0,
+            size: |_| 0,
+        }
+    }
 }
 
 /// 图片查看器：自包含的图片浏览视图。
@@ -131,14 +248,10 @@ pub struct ImageViewer {
     viewport: ScrollHandle,
     /// 画布背景（None → 主题推导；宿主 `EditorApp` 通常显式设置）。
     bg: Option<Hsla>,
-    /// 解码结果 LRU 缓存（队首最旧 / 队尾最近用；命中与写入都移到队尾）。
-    cache: VecDeque<CacheEntry>,
-    /// 缓存总字节（RGBA 近似内存，淘汰预算 [`CACHE_MAX_BYTES`]）。
-    cache_bytes: usize,
-    /// 原始文件字节 LRU 缓存（磁盘预读层；解码优先从这里取字节）。
-    byte_cache: VecDeque<ByteEntry>,
-    /// 字节缓存总字节（预算 [`BYTE_CACHE_BYTES`]）。
-    byte_cache_bytes: usize,
+    /// 解码结果 LRU 缓存（队首最旧 / 队尾最近用；命中与写入都移到队尾；张数 + 字节双上限）。
+    cache: LruMap<PathBuf, CacheEntry>,
+    /// 原始文件字节 LRU 缓存（磁盘预读层；解码优先从这里取字节；仅字节预算上限）。
+    byte_cache: LruMap<PathBuf, ByteEntry>,
     /// 已在后台解码中的路径去重（当前目标 + 预取共用，防同一路径重复解码）。
     in_flight: HashSet<PathBuf>,
     /// 字节预读在途去重（与解码池分离：IO 便宜，不占 [`MAX_DECODE`] 解码槽）。
@@ -209,10 +322,8 @@ impl ImageViewer {
             load_error: None,
             viewport: ScrollHandle::new(),
             bg: None,
-            cache: VecDeque::new(),
-            cache_bytes: 0,
-            byte_cache: VecDeque::new(),
-            byte_cache_bytes: 0,
+            cache: LruMap::new(Some(CACHE_MAX_ITEMS), CACHE_MAX_BYTES, |e: &CacheEntry| e.bytes),
+            byte_cache: LruMap::new(None, BYTE_CACHE_BYTES, |e: &ByteEntry| e.bytes.len()),
             in_flight: HashSet::new(),
             byte_flight: HashSet::new(),
             pending_target: None,
@@ -336,9 +447,7 @@ impl ImageViewer {
         for entry in std::mem::take(&mut self.cache).into_iter() {
             cx.drop_image(entry.render, Some(window));
         }
-        self.cache_bytes = 0;
         self.byte_cache.clear();
-        self.byte_cache_bytes = 0;
         self.in_flight.clear();
         self.byte_flight.clear();
         self.pending_target = None;
@@ -725,10 +834,7 @@ impl ImageViewer {
                         // 回填字节缓存（跳过再回看不重读盘）
                         this.byte_cache_put(
                             decode_path.clone(),
-                            ByteEntry {
-                                path: decode_path.clone(),
-                                bytes: raw,
-                            },
+                            ByteEntry { bytes: raw },
                         );
                         match decoded {
                             Ok((frames, w, h, den)) => {
@@ -871,7 +977,7 @@ impl ImageViewer {
             && (self.prefetch_pos - self.prefetch_origin).abs() <= forward_win
         {
             // 解码缓存已满（字节预算）→ 预取一解即被 LRU 挤掉，纯白算 CPU：停止新派发
-            if self.cache_bytes >= CACHE_MAX_BYTES {
+            if self.cache.bytes() >= CACHE_MAX_BYTES {
                 break;
             }
             let ni = self.prefetch_pos.rem_euclid(n) as usize;
@@ -893,7 +999,7 @@ impl ImageViewer {
             for k in 1..=PREFETCH_BACKWARD as i64 {
                 if self.prefetch_inflight + 1 >= MAX_DECODE
                     || self.cache.len() >= CACHE_MAX_ITEMS
-                    || self.cache_bytes >= CACHE_MAX_BYTES
+                    || self.cache.bytes() >= CACHE_MAX_BYTES
                 {
                     break;
                 }
@@ -948,13 +1054,7 @@ impl ImageViewer {
                 if let Some(b) = read
                     && !this.byte_cache_contains(&p)
                 {
-                    this.byte_cache_put(
-                        p.clone(),
-                        ByteEntry {
-                            path: p,
-                            bytes: b,
-                        },
-                    );
+                    this.byte_cache_put(p.clone(), ByteEntry { bytes: b });
                 }
             });
         })
@@ -1034,66 +1134,32 @@ impl ImageViewer {
 
     /// 缓存查询并移到队尾（MRU）。命中返回克隆（Arc 浅拷贝），未中 `None`。
     fn cache_get(&mut self, path: &Path) -> Option<CacheEntry> {
-        if let Some(pos) = self.cache.iter().position(|e| e.path == path) {
-            let entry = self.cache.remove(pos).unwrap();
-            self.cache.push_back(entry.clone());
-            Some(entry)
-        } else {
-            None
-        }
+        self.cache.get(path)
     }
 
     /// 缓存是否已含某路径（只读，不改变 LRU 顺序）。
     fn cache_contains(&self, path: &Path) -> bool {
-        self.cache.iter().any(|e| e.path == path)
+        self.cache.contains(path)
     }
 
     /// 写入缓存（已存在则移到队尾），超出张数/字节预算按 LRU 从队首淘汰。
     fn cache_put(&mut self, path: PathBuf, entry: CacheEntry) {
-        if let Some(pos) = self.cache.iter().position(|e| e.path == path) {
-            self.cache_bytes -= self.cache[pos].bytes;
-            self.cache.remove(pos);
-        }
-        self.cache_bytes += entry.bytes;
-        self.cache.push_back(entry);
-        while self.cache.len() > CACHE_MAX_ITEMS || self.cache_bytes > CACHE_MAX_BYTES {
-            let Some(old) = self.cache.pop_front() else {
-                break;
-            };
-            self.cache_bytes -= old.bytes;
-        }
+        let _ = self.cache.put(path, entry);
     }
 
     /// 字节缓存查询并移到队尾（MRU），返回 Arc 克隆（保留在缓存里供解码/重解码复用）。
     fn byte_cache_get(&mut self, path: &Path) -> Option<Arc<Vec<u8>>> {
-        if let Some(pos) = self.byte_cache.iter().position(|e| e.path == path) {
-            let entry = self.byte_cache.remove(pos).unwrap();
-            let bytes = entry.bytes.clone();
-            self.byte_cache.push_back(entry);
-            Some(bytes)
-        } else {
-            None
-        }
+        self.byte_cache.get(path).map(|e| e.bytes)
     }
 
     /// 字节缓存是否已含某路径（只读，不改变 LRU 顺序）。
     fn byte_cache_contains(&self, path: &Path) -> bool {
-        self.byte_cache.iter().any(|e| e.path == path)
+        self.byte_cache.contains(path)
     }
 
     /// 写入字节缓存（已存在则移到队尾），超出字节预算 [`BYTE_CACHE_BYTES`] 按 LRU 淘汰。
     fn byte_cache_put(&mut self, path: PathBuf, entry: ByteEntry) {
-        if let Some(pos) = self.byte_cache.iter().position(|e| e.path == path) {
-            self.byte_cache_bytes -= self.byte_cache.remove(pos).unwrap().bytes.len();
-        }
-        self.byte_cache_bytes += entry.bytes.len();
-        self.byte_cache.push_back(entry);
-        while self.byte_cache_bytes > BYTE_CACHE_BYTES {
-            let Some(old) = self.byte_cache.pop_front() else {
-                break;
-            };
-            self.byte_cache_bytes -= old.bytes.len();
-        }
+        let _ = self.byte_cache.put(path, entry);
     }
 
     /// C6：取滚动方向最近一张「已解码在缓存、但非当前显示」的图，包成**垫底透明 img**

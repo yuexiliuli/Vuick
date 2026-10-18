@@ -17,6 +17,9 @@ pub(crate) struct Slot {
     /// 像素密度渲染（见 [`render_scale`]），**内存 = 视口可见瓦片数 × TILE_SIZE² × 4**，
     /// 不随整页位图面积缩放爆炸（旧整页方案 4× 缩放一页 A4 = 64MB 的根因）。
     pub(crate) tiles: HashMap<(u32, u32), TileSlot>,
+    /// 该页已驻留瓦片的估算字节和（每片增删同步记账，见 `view.rs` 各增删点）。
+    /// 字节预算以各槽位账簿汇总为准（替代原「O(页×瓦片) 全扫兜底」的自愈重算）。
+    pub(crate) tile_bytes: u64,
     /// 现有瓦片对应的渲染倍率（px/pt）。缩放/换 DPI 显示器后与新一轮 [`render_scale`]
     /// 不一致 → 该页瓦片被惰性作废，按新密度重栅格化（旧瓦片 `drop_image` 下线）。
     pub(crate) tile_scale: f32,
@@ -384,14 +387,33 @@ pub(crate) fn content_to_local(
     if dims.is_empty() || cx < 0.0 || cx > page_width {
         return None;
     }
-    for i in 0..dims.len() {
-        let h = display_height(dims[i], page_width);
-        let (top, bottom) = (tops[i], tops[i] + h);
-        if cy >= top - 1.0 && cy <= bottom + 1.0 {
-            return Some((i, cx, cy - tops[i]));
+    // 二分定位「页带（`页顶-1 ..= 页底+1`）含 `cy`」的页：页带互不交叠（PAGE_GAP > 2）
+    // 且随 `tops` 严格递增 → 谓词「页带起点 ≤ cy」单调，可二分（对齐 `first_visible_page`
+    // 既有姿势，千页命中测试 O(页数)→O(log 页数)），与旧线性扫逐例等价：同套浮点运算，
+    // 页间沟槽 / 首页之上仍按「任何页带都不含 `cy`」返回 `None`（清空选区）。
+    let n = dims.len();
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if tops[mid] - 1.0 <= cy {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
-    None
+    // `lo-1` = 最后一个「页带起点 ≤ cy」的页；其页带底（页底 + 1）未包住 `cy`（页间沟槽）
+    // 或 `lo == 0`（首页带起点之上）→ `None`，与旧线性扫的沟槽判据一致。
+    if lo == 0 {
+        return None;
+    }
+    let i = lo - 1;
+    let h = display_height(dims[i], page_width);
+    if cy <= tops[i] + h + 1.0 {
+        Some((i, cx, cy - tops[i]))
+    } else {
+        None
+    }
 }
 
 /// 命中测试（纯函数）：页内 PDF 点 → 最近字符索引。
