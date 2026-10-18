@@ -28,7 +28,7 @@
 
 use std::ops::Range;
 
-use gpui::{Pixels, SharedString, TextRun, WindowTextSystem};
+use gpui::{FontWeight, Hsla, Pixels, SharedString, TextRun, WindowTextSystem};
 
 use config::markdown::{
     CONTENT_EDGE_PAD_X_PX, IMAGE_CAPTION_GAP_PX, IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H,
@@ -252,16 +252,20 @@ fn text_gutter(kind: IrKind) -> f32 {
     }
 }
 
-/// `DocRow.runs` → gpui `TextRun`：只保留**影响宽度/折行**的字体维度
-/// （加粗/斜体/行内代码等宽），镜像 `wysiwyg::shape::runs_to_text_runs` 的
-/// 对齐/间隙/尾段逻辑（字符边界吸收、未覆盖区间补默认、尾段补齐）。
-fn font_runs(
+/// 单一 run 构造核心（[`runs_to_text_runs`]/[`font_runs`] 的公共基）：
+/// - 逐 run 守卫（字符边界吸收 / 空区间丢弃 / 未覆盖区间补默认 / 尾段补齐）为**同一条
+///   `wysiwyg::shape::runs_to_text_runs`** 逐行复刻；
+/// - `base`：run 之外的默认字体（当前 run 字体由 `deco` 派生）；未覆盖区间（两个 run
+///   之间的空隙 / 尾段）一律 `base`、无装饰——与两份旧实现逐字段等值。
+/// - `deco`：`RunKind → TextRunDeco`（字体 + 可选色/划线/下划线）。`wysiwyg::shape`
+///   返回完整装饰；`layout::font_runs` 只取字形相关维度（加粗/斜体/等宽），色/划线恒
+///   `None`（宽度/折行由字形决定，色不影响几何）。
+pub(crate) fn text_runs(
     text: &str,
     runs: &[(Range<usize>, RunKind)],
     base: &gpui::Font,
-    mono: &gpui::Font,
+    deco: impl Fn(RunKind) -> TextRunDeco,
 ) -> Vec<TextRun> {
-    use gpui::{FontStyle, FontWeight};
     let mut out = Vec::with_capacity(runs.len().saturating_add(1).max(1));
     let mut i = 0usize;
     for (range, kind) in runs {
@@ -271,23 +275,81 @@ fn font_runs(
             continue;
         }
         if s > i {
-            out.push(TextRun { len: s - i, font: base.clone(), ..Default::default() });
+            out.push(TextRun {
+                len: s - i,
+                font: base.clone(),
+                ..Default::default()
+            });
         }
+        let d = deco(*kind);
+        let mut tr = TextRun {
+            len: e - s,
+            font: d.font,
+            ..Default::default()
+        };
+        if let Some(c) = d.color {
+            tr.color = c;
+        }
+        if let Some(st) = d.strikethrough {
+            tr.strikethrough = Some(st);
+        }
+        if let Some(ul) = d.underline {
+            tr.underline = Some(ul);
+        }
+        out.push(tr);
+        i = e;
+    }
+    if i < text.len() {
+        out.push(TextRun {
+            len: text.len() - i,
+            font: base.clone(),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// [`text_runs`] 的逐 run 装饰：字体 + 颜色/划线/下划线（全 `Option`，可只取字形）。
+#[derive(Clone)]
+pub(crate) struct TextRunDeco {
+    pub font: gpui::Font,
+    pub color: Option<Hsla>,
+    pub strikethrough: Option<gpui::StrikethroughStyle>,
+    pub underline: Option<gpui::UnderlineStyle>,
+}
+
+/// 纯字体决策（加粗/斜体/行内代码等宽；不复制色）——`layout::shape_text_shards` 用。
+/// 与 `wysiwyg::shape::runs_to_text_runs` 的字体分支同规则（两处字体断言同一）。
+/// `Font` 按值传入（代价 = 浅克隆；闭包不捕获引用 → 无寿命歧义）。
+fn kind_font_deco(base: gpui::Font, mono: gpui::Font) -> impl Fn(RunKind) -> TextRunDeco {
+    move |kind| {
         let mut f = base.clone();
         match kind {
             RunKind::Bold => f.weight = FontWeight::BOLD,
-            RunKind::Italic => f.style = FontStyle::Italic,
+            RunKind::Italic => f.style = gpui::FontStyle::Italic,
             RunKind::InlineCode => f = mono.clone(),
             // Strikethrough/Link/Image 不影响字形宽度 → 沿用基字。
             _ => {}
         }
-        out.push(TextRun { len: e - s, font: f, ..Default::default() });
-        i = e;
+        TextRunDeco {
+            font: f,
+            color: None,
+            strikethrough: None,
+            underline: None,
+        }
     }
-    if i < text.len() {
-        out.push(TextRun { len: text.len() - i, font: base.clone(), ..Default::default() });
-    }
-    out
+}
+
+/// `DocRow.runs` → gpui `TextRun`：只保留**影响宽度/折行**的字体维度
+/// （加粗/斜体/行内代码等宽），镜像 `wysiwyg::shape::runs_to_text_runs` 的
+/// 对齐/间隙/尾段逻辑（字符边界吸收、未覆盖区间补默认、尾段补齐）。
+fn font_runs(
+    text: &str,
+    runs: &[(Range<usize>, RunKind)],
+    base: &gpui::Font,
+    mono: &gpui::Font,
+) -> Vec<TextRun> {
+    text_runs(text, runs, base, kind_font_deco(base.clone(), mono.clone()))
 }
 
 /// 按显示字节区间裁剪 runs / code_ranges（相对本条带文本的起点重定基）。

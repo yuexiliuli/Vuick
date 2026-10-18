@@ -11,6 +11,7 @@ use super::*;
 
 use gpui::{Pixels, Window};
 
+use crate::layout::{text_runs, TextRunDeco};
 use crate::markdown::doc::{DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
 use crate::markdown::parse::inline_style::{self, MathRegion};
@@ -30,6 +31,9 @@ const QUOTE_TEXT_INDENT_PX: f32 = 15.0;
 /// 行内代码：等宽字体 + `code_inline_fg` 文字色（**无 run 背景**——圆角 pill 由
 /// [`paint_text_row`] 在 paint 阶段按像素几何自绘，与预览 [`TextTrack::paint_code_ranges`]
 /// 同式；`code_inline_*` 单一源 [`super::WyTheme`] ← [`StyleParams`]）。
+/// 收敛自 `layout::text_runs` 单一 run 构造核心（字体/颜色/划线经 `TextRunDeco` 参数化；
+/// 本调用点传完整视觉装饰，`layout::font_runs` 只传字形维度——两处对拍由
+/// `layout::tests` parity 钉死，见 [`crate::layout::tests::parity_shard_height_sum_matches_shape_docrow`]）。
 #[allow(clippy::too_many_arguments)] // 样式参数互为正交的纯映射助手
 pub(crate) fn runs_to_text_runs(
     text: &str,
@@ -41,8 +45,7 @@ pub(crate) fn runs_to_text_runs(
     link: gpui::Hsla,
     code_inline_fg: gpui::Hsla,
 ) -> Vec<gpui::TextRun> {
-    use gpui::{StrikethroughStyle, TextRun, UnderlineStyle};
-    let len = text.len();
+    use gpui::{StrikethroughStyle, UnderlineStyle};
     // 防御：run 边界必须落在 `text` 的 UTF-8 **字符边界**上（CJK/emoji 多字节字符
     // 下，编辑→重析→`style_links_in_runs`/`strip_prefix_bytes` 等按字节搬运的区间
     // 可能把边界切进字符内部）——GPUI `Text`/`StyledText` 在非字符边界处切 run 会
@@ -51,44 +54,27 @@ pub(crate) fn runs_to_text_runs(
     // 三处合一的共享基元（`crate::util::char_align_byte`，M1.1-P5）：可将 start/end
     // 分别向前进位吸收到最近字符边界、钳入 `text`，空区间丢弃。这使本渲染路径即便
     // 上游混入坏区间也永不 panic。
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    for (range, kind) in runs {
-        let s = crate::util::char_align_byte(text, range.start).max(i);
-        let e = crate::util::char_align_byte(text, range.end);
-        if e <= s {
-            continue;
-        }
-        if s > i {
-            out.push(TextRun {
-                len: s - i,
-                font: base.clone(),
-                color,
-                ..Default::default()
-            });
-        }
-        let mut tr = TextRun {
-            len: e - s,
-            font: base.clone(),
-            color,
-            ..Default::default()
-        };
+    text_runs(text, runs, base, move |kind| {
+        let mut f = base.clone();
+        let mut run_color = color;
+        let mut strikethrough = None;
+        let mut underline = None;
         match kind {
-            RunKind::Bold => tr.font.weight = gpui::FontWeight::BOLD,
-            RunKind::Italic => tr.font.style = gpui::FontStyle::Italic,
+            RunKind::Bold => f.weight = gpui::FontWeight::BOLD,
+            RunKind::Italic => f.style = gpui::FontStyle::Italic,
             RunKind::InlineCode => {
-                tr.font = mono.clone();
-                tr.color = code_inline_fg;
+                f = mono.clone();
+                run_color = code_inline_fg;
             }
             RunKind::Strikethrough => {
-                tr.strikethrough = Some(StrikethroughStyle {
+                strikethrough = Some(StrikethroughStyle {
                     thickness: px(1.),
                     color: Some(color),
                 });
             }
             RunKind::Link => {
-                tr.color = link;
-                tr.underline = Some(UnderlineStyle {
+                run_color = link;
+                underline = Some(UnderlineStyle {
                     thickness: px(1.),
                     color: Some(link),
                     wavy: false,
@@ -99,22 +85,15 @@ pub(crate) fn runs_to_text_runs(
             // 脚注标记 `[n]`：静态 accent 高亮（回归修复——P4-2 后标号回落到正文色）。
             // 对齐 A 侧预览 `link_color = p.accent` 同色；**不下划线**（不冒充链接，
             // 与老预览的 HighlightStyle 只着色一致）。
-            RunKind::NoteMarker => {
-                tr.color = accent;
-            }
+            RunKind::NoteMarker => run_color = accent,
         }
-        out.push(tr);
-        i = e;
-    }
-    if i < len {
-        out.push(TextRun {
-            len: len - i,
-            font: base.clone(),
-            color,
-            ..Default::default()
-        });
-    }
-    out
+        TextRunDeco {
+            font: f,
+            color: Some(run_color),
+            strikethrough,
+            underline,
+        }
+    })
 }
 
 /// 表格块的总高（px）：与预览**实际渲染**同式 `(1 + 数据行数) × 行高 + 行分隔数 + 2`

@@ -2,6 +2,7 @@ use super::*;
 
 use crate::markdown::parse::inline_style;
 use crate::markdown::parse::recognition;
+use crate::markdown::parse::BlockMeta;
 
 /// WyEditor 编辑核心 / 撤销重做 / 区域导航 / 光标移动（M2.1 自 mod.rs 拆出）。
 impl WyEditor {
@@ -158,6 +159,10 @@ impl WyEditor {
             return false;
         }
         let shift = |x: usize| -> usize { (x as i64 + line_delta).max(0) as usize };
+        // 三处「行号 > edit_line 平移」（数学区域 / 警报折叠区 / 标题折叠体）同规则——
+        // 因各自容器形态不同（MathRegion.range / (Range,_) / Range）保留显式循环，
+        // 平分逻辑一致：`start > edit_line` 才平移两端（跨编辑线已由上方
+        // `region_containing` 排除）。
         for reg in &mut d.math_regions {
             if reg.range.start > edit_line {
                 reg.range.start = shift(reg.range.start);
@@ -194,27 +199,35 @@ impl WyEditor {
         true
     }
 
-    pub(crate) fn rebuild_block_regions(&mut self) {
+    /// 从块元数据构造可编辑区域（代码内容行 / 表格表头+数据行）。`rebuild_block_regions`
+    /// 与 `update_block_regions_after_edit`（窗口重算）共用同一构造。
+    fn region_for_block_meta(m: &BlockMeta) -> Option<BlockRegion> {
         use crate::markdown::parse::RowKind;
+        match m.kind {
+            RowKind::Code => {
+                let lo = m.src_line as usize + 1;
+                let hi = lo + m.aux.max(1) as usize - 1;
+                Some(BlockRegion::Code { lo, hi })
+            }
+            RowKind::Table => {
+                let header = m.src_line as usize;
+                let dlo = header + 2;
+                let dhi = header + 1 + m.aux.max(1) as usize;
+                Some(BlockRegion::Table { header, dlo, dhi })
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn rebuild_block_regions(&mut self) {
         let n = self.doc.block_count();
         let mut regions: Vec<BlockRegion> = Vec::new();
         for i in 0..n {
             let Some(m) = self.doc.block_meta(i) else {
                 continue;
             };
-            match m.kind {
-                RowKind::Code => {
-                    let lo = m.src_line as usize + 1;
-                    let hi = lo + m.aux.max(1) as usize - 1;
-                    regions.push(BlockRegion::Code { lo, hi });
-                }
-                RowKind::Table => {
-                    let header = m.src_line as usize;
-                    let dlo = header + 2;
-                    let dhi = header + 1 + m.aux.max(1) as usize;
-                    regions.push(BlockRegion::Table { header, dlo, dhi });
-                }
-                _ => {}
+            if let Some(r) = Self::region_for_block_meta(&m) {
+                regions.push(r);
             }
         }
         self.block_regions = regions;
@@ -230,7 +243,6 @@ impl WyEditor {
     /// `line_delta`。序列仍按 src_line 升序（上方保留 < 窗口新派生 < 下方平移）。
     /// 首建/整篇重置仍走 [`Self::rebuild_block_regions`]。
     fn update_block_regions_after_edit(&mut self, edit_line: usize, line_delta: i64) {
-        use crate::markdown::parse::RowKind;
         let doc = &self.doc;
         let n = doc.block_count();
         let span = |r: &BlockRegion| -> (usize, usize) {
@@ -272,20 +284,7 @@ impl WyEditor {
         let win_hi = (edit_blk + 2).min(n);
         for i in edit_blk..win_hi {
             let Some(m) = doc.block_meta(i) else { continue };
-            let r = match m.kind {
-                RowKind::Code => {
-                    let lo = m.src_line as usize + 1;
-                    let hi = lo + m.aux.max(1) as usize - 1;
-                    BlockRegion::Code { lo, hi }
-                }
-                RowKind::Table => {
-                    let header = m.src_line as usize;
-                    let dlo = header + 2;
-                    let dhi = header + 1 + m.aux.max(1) as usize;
-                    BlockRegion::Table { header, dlo, dhi }
-                }
-                _ => continue,
-            };
+            let Some(r) = Self::region_for_block_meta(&m) else { continue };
             let rl = span(&r).0;
             let pos = kept.partition_point(|k| span(k).1 < rl);
             kept.insert(pos, r);

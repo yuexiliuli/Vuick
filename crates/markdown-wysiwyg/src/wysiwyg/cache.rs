@@ -31,6 +31,171 @@ pub(crate) fn zoom_band_for_top(top: f32, viewport_h: Pixels) -> (f32, f32) {
         ((top + 2. * vh) / q).ceil() * q,
     )
 }
+
+// ═══ 泛型 LRU 核心 ═══
+// 三份手抄 LRU（RowShape / MathSlot / CodeParse）的「(clock,key) BTreeSet + 满容量淘汰 +
+// 插入摘旧钟 + CacheWrite{old,evicted}」收敛于此。语义差异（查询是否 touch——MathSlot
+// 是 `get` 不 touch / 外部 `touch`；淘汰是否返回——RowShape 需释放内部资源；键是否
+// "携带代"）由各缓存**薄封装**保留（见 [`RowShapeCache`]/[`MathSlotCache`]/
+// [`CodeParseCache`]），泛型核心只承担三份共有的「BTreeSet LRU + 满容量淘汰 + 插入
+// 摘旧钟 + CacheWrite」。逐字段与三份旧实现对齐，行为零变化。
+
+/// LRU 组合键：需 `Ord`（BTreeSet 升序）、`Clone`（移插）、`Hash + Eq`（HashMap 键）。
+/// `u64`（RowShape 内容指纹）/`SharedString`（MathSlot）/`CodeParseKey` 均满足。
+pub(crate) trait LruKey: Clone + Ord + std::hash::Hash + Eq {}
+impl LruKey for u64 {}
+impl LruKey for SharedString {}
+impl LruKey for CodeParseKey {}
+
+/// 一个缓存条目：值 + 最近使用钟 + 供 BTreeSet 组合键的 key。
+///
+/// `key` 对两类缓存分别为：
+/// - RowShape（内容寻址 + 换代）：条目键 = 缓存键（内容指纹），换代的代键随值
+///   `RowShapeEntry.key` 携带——重插同指纹时旧条目被摘钟、新条目复用同一 key ⇒
+///   `(clock, key)` 组合键恒唯一（clock 更换即同 key 也严格有序）。
+/// - MathSlot / CodeParse（简单键）：条目键 = 缓存键本身（`identity`）。
+pub(crate) struct LruEntry<K: LruKey, V> {
+    last_seen: u32,
+    key: K,
+    value: V,
+}
+
+/// 泛型 LRU 缓存（时钟序 BTreeSet 淘汰：对数找最久未用、对数插——替代每次满缓存插入
+/// 全表扫 `min(last_seen)` 的 O(cap)）。读/写语义差异由各缓存薄封装决定：
+/// - [`LruCache::get`]：不改顺序的纯查询（MathSlot paint 热路径、CodeParse `contains`）；
+/// - [`LruCache::get_with_touch`]：命中即换新钟（MathSlot 外部 `touch`、CodeParse
+///   `lookup`、RowShape 命中读）；
+/// - [`LruCache::put`]：满容量且键不在场 → 淘汰 BTreeSet 队首（最久未用）；已存在同名
+///   条目（换代重插）先摘旧钟。返回覆盖旧槽 + 被淘汰槽（[`CacheWrite`]）。
+pub(crate) struct LruCache<K: LruKey, V> {
+    /// 缓存键 → 条目（`RowShapeCache.entries` 测试断言读它）。
+    pub(crate) entries: std::collections::HashMap<K, LruEntry<K, V>>,
+    /// `(last_seen, key)` 升序 LRU 索引：首元素即最久未用条目；组合键用 `key` 解
+    /// `last_seen` 相同（u32 clock 回绕后）的歧义，淘汰顺序确定。
+    lru: std::collections::BTreeSet<(u32, K)>,
+    cap: usize,
+    clock: u32,
+}
+
+impl<K: LruKey, V: Clone> LruCache<K, V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            lru: std::collections::BTreeSet::new(),
+            cap,
+            clock: 0,
+        }
+    }
+
+    /// 纯查询（O(1)，不移动 LRU 次序；paint/形状热路径）。
+    fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|e| &e.value)
+    }
+
+    /// 命中：更新访问钟并返回条目。内部换钟 = 移除旧 `(last_seen, key)` 再插新钟
+    /// （`clock` 单调进、组合键唯一 → 绝不残留过期键）。
+    fn get_with_touch(&mut self, key: &K) -> Option<&mut V> {
+        let e = self.entries.get_mut(key)?;
+        let last = e.last_seen;
+        e.last_seen = self.clock;
+        self.lru.remove(&(last, e.key.clone()));
+        self.lru.insert((self.clock, e.key.clone()));
+        self.clock = self.clock.wrapping_add(1);
+        Some(&mut e.value)
+    }
+
+    /// 标记「最近使用」（键不在场则 no-op）。`clock` 换钟同 [`Self::get_with_touch`]。
+    fn touch(&mut self, key: &K) {
+        let Some(e) = self.entries.get_mut(key) else {
+            return;
+        };
+        let last = e.last_seen;
+        e.last_seen = self.clock;
+        self.lru.remove(&(last, e.key.clone()));
+        self.lru.insert((self.clock, e.key.clone()));
+        self.clock = self.clock.wrapping_add(1);
+    }
+
+    /// 插入/替换：满容量且键不在场 → LRU 淘汰 BTreeSet 队首（最久未用条目，`evicted`
+    /// 交调用方释放，如 `MathSlot::Ready` 位图纹理）；已存在同名条目（换代重插）先摘
+    /// 旧钟再重插（`old` = 被覆盖旧值）。`key_of` 给条目写 key（RowShape 的 content 键
+    /// 派生；MathSlot/CodeParse 恒 `identity`）。
+    fn put(
+        &mut self,
+        key: K,
+        value: V,
+        key_of: impl Fn(&K, &V) -> K,
+    ) -> CacheWrite<V> {
+        let mut evicted = None;
+        if self.entries.len() >= self.cap
+            && !self.entries.contains_key(&key)
+            && let Some(&(_, ref k)) = self.lru.iter().next()
+        {
+            let k = k.clone();
+            let last = self.entries[&k].last_seen;
+            self.lru.remove(&(last, k.clone()));
+            evicted = self.entries.remove(&k).map(|e| e.value);
+        }
+        let old = if let Some(e) = self.entries.get(&key) {
+            let last = e.last_seen;
+            self.lru.remove(&(last, key.clone()));
+            Some(e.value.clone())
+        } else {
+            None
+        };
+        let entry_key = key_of(&key, &value);
+        self.entries.insert(
+            key.clone(),
+            LruEntry {
+                last_seen: self.clock,
+                key: entry_key,
+                value,
+            },
+        );
+        self.lru.insert((self.clock, key));
+        self.clock = self.clock.wrapping_add(1);
+        CacheWrite { old, evicted }
+    }
+
+    /// 按键移除（返回被移除的值；测试/定向作废用）。
+    fn remove(&mut self, key: &K) -> Option<V> {
+        let e = self.entries.remove(key)?;
+        self.lru.remove(&(e.last_seen, e.key));
+        Some(e.value)
+    }
+
+    /// 全部取走并清空（换源 / 主题色变化整批清除；调用方负责释放 `Ready` 纹理）。
+    fn drain_all(&mut self) -> Vec<V> {
+        self.lru.clear();
+        self.entries.drain().map(|(_, e)| e.value).collect()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn keys(&self) -> std::collections::hash_map::Keys<'_, K, LruEntry<K, V>> {
+        self.entries.keys()
+    }
+}
+
+/// 一次缓存写入的结果：覆盖的旧槽 + 被 LRU 淘汰的槽。淘汰槽（`MathSlot::Ready` 的
+/// 位图纹理）由调用方负责释放（`cx.drop_image`）——本仓唯一带 GPU 纹理的缓存值。
+pub(crate) struct CacheWrite<T> {
+    pub(crate) old: Option<T>,
+    pub(crate) evicted: Option<T>,
+}
+
 /// 一整行（块）的**整形内容缓存**（内容寻址，键 = 块内容指纹 `block_content_id`）。
 /// 滚动/带重建时复用已整形块，不再把可视带整批重 shape（`shape_line` ）并为每个代码块
 /// 重跑 syntect——结构密集代码文档「滚动每档 65ms」的主因（对齐 `view` 的行虚拟化复用
@@ -51,102 +216,85 @@ pub(crate) fn zoom_band_for_top(top: f32, viewport_h: Pixels) -> (f32, f32) {
 ///   大文档 ≈14k 次插 × 16k 表项比较）。
 pub(crate) struct RowShapeCache {
     /// 内容指纹 → 条目（`frame::block_content_id` 键；`shape_rows_has` 测试断言读它）。
-    pub(crate) entries: rustc_hash::FxHashMap<u64, RowShapeEntry>,
-    /// `(last_seen, id)` 升序 LRU 索引：首元素即最久未用条目；组合键用 `id` 解 last_seen
-    /// 相同（u32 clock 回绕后）的歧义，淘汰顺序确定。
-    lru: std::collections::BTreeSet<(u32, u64)>,
-    cap: usize,
-    clock: u32,
+    pub(crate) entries: LruCache<u64, RowShapeEntry>,
 }
 
+#[derive(Clone)]
 pub(crate) struct RowShapeEntry {
     key: u64,
-    last_seen: u32,
     row: std::rc::Rc<element::ShapedRow>,
+}
+
+fn identity_key<K: Clone, V>(k: &K, _v: &V) -> K {
+    k.clone()
 }
 
 impl RowShapeCache {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
-            entries: rustc_hash::FxHashMap::default(),
-            lru: std::collections::BTreeSet::new(),
-            cap,
-            clock: 0,
+            entries: LruCache::new(cap),
         }
     }
     /// 命中：更新访问钟并返回 `Rc`（浅克隆即可取得行，heavy 数据全是 Arc/Rc）。
+    /// 键换代（`RowShapeEntry.key != 查询 key`）→ 不命中、也不移动 LRU 次序。
     pub(crate) fn get(&mut self, id: u64, key: u64) -> Option<std::rc::Rc<element::ShapedRow>> {
-        match self.entries.get_mut(&id) {
-            Some(e) if e.key == key => {
-                self.lru.remove(&(e.last_seen, id));
-                e.last_seen = self.clock;
-                self.lru.insert((self.clock, id));
-                self.clock = self.clock.wrapping_add(1);
-                Some(e.row.clone())
-            }
-            _ => None,
+        // 键在场且一致才更新访问钟（换代不 touch）；先只读判定再取行克隆。
+        if !self.key_mismatch_unchecked(id, key) {
+            return None;
         }
+        let row = self.entries.entries.get_mut(&id).unwrap().value.row.clone();
+        self.entries.touch(&id);
+        Some(row)
+    }
+    /// 键在场且一致（换代/key 一致才更新访问钟）。
+    fn key_mismatch_unchecked(&self, id: u64, key: u64) -> bool {
+        self.entries
+            .entries
+            .get(&id)
+            .is_some_and(|e| e.value.key == key)
     }
     /// 该块存在**但键已换代**（宽度/mermaid 缩放变化把旧行逐出）——与"从未缓存"区分：
     /// 换代重排时旧 `settled/verified/attempts` 判决对应的是上一代结果，应作废重来。
     pub(crate) fn key_mismatch(&self, id: u64, key: u64) -> bool {
-        self.entries.get(&id).is_some_and(|e| e.key != key)
+        self.entries
+            .entries
+            .get(&id)
+            .is_some_and(|e| e.value.key != key)
     }
     /// 插入（新行）；容量满时淘汰 LRU 索引首元素（最久未用条目）。返回缓存的 `Rc`。
+    /// 换代重插同指纹：旧条目被摘钟后新条目复用同一 cache 键（`(clock, id)` 组合键恒
+    /// 唯一，见 [`LruEntry`] 注释）。本缓存不向调用方返回淘汰/覆盖的旧行（旧实现同；
+    /// 行内 heavy 数据是 Arc/Rc，局部丢弃即释放引用）。
     pub(crate) fn put(
         &mut self,
         id: u64,
         key: u64,
         row: element::ShapedRow,
     ) -> std::rc::Rc<element::ShapedRow> {
-        if self.entries.len() >= self.cap
-            && !self.entries.contains_key(&id)
-            && let Some(&(old, k)) = self.lru.iter().next()
-        {
-            self.lru.remove(&(old, k));
-            self.entries.remove(&k);
-        }
         let rc = std::rc::Rc::new(row);
-        // 已存在同名条目（换代重插）：先把旧访问钟从 LRU 索引摘掉，避免残留过期键。
-        if let Some(e) = self.entries.get(&id) {
-            self.lru.remove(&(e.last_seen, id));
-        }
-        self.entries.insert(
+        let _ = self.entries.put(
             id,
             RowShapeEntry {
                 key,
-                last_seen: self.clock,
                 row: rc.clone(),
             },
+            identity_key,
         );
-        self.lru.insert((self.clock, id));
-        self.clock = self.clock.wrapping_add(1);
         rc
     }
     /// 逐个作废（数学就绪/内容变化的受影响块；键 = 内容指纹）。
     pub(crate) fn invalidate_ids(&mut self, ids: &[u64]) {
         for &b in ids {
-            if let Some(e) = self.entries.get(&b) {
-                self.lru.remove(&(e.last_seen, b));
-            }
             self.entries.remove(&b);
         }
     }
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
-        self.lru.clear();
     }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
-}
-
-/// 一次缓存写入的结果：覆盖的旧槽 + 被 LRU 淘汰的槽。淘汰槽（`MathSlot::Ready` 的
-/// 位图纹理）由调用方负责释放（`cx.drop_image`）——本仓唯一带 GPU 纹理的缓存值。
-pub(crate) struct CacheWrite<T> {
-    pub(crate) old: Option<T>,
-    pub(crate) evicted: Option<T>,
 }
 
 /// 数学排版槽缓存：把无界 `HashMap<SharedString, MathSlot>` 收成「容量上限 + LRU」
@@ -162,94 +310,44 @@ pub(crate) struct CacheWrite<T> {
 ///   条目，O(log cap)，与 [`RowShapeCache`] 同款；cap=1000 见
 ///   [`config::limits::MATH_SLOTS_CACHE_CAP`] 取舍。
 pub(crate) struct MathSlotCache {
-    entries: std::collections::HashMap<SharedString, MathSlotEntry>,
-    /// `(last_seen, key)` 升序 LRU 索引：首元素即最久未用条目。
-    lru: std::collections::BTreeSet<(u32, SharedString)>,
-    cap: usize,
-    clock: u32,
-}
-
-/// 条目：槽值 + 最近使用钟。
-pub(crate) struct MathSlotEntry {
-    slot: MathSlot,
-    last_seen: u32,
+    entries: LruCache<SharedString, MathSlot>,
 }
 
 impl MathSlotCache {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
-            entries: std::collections::HashMap::new(),
-            lru: std::collections::BTreeSet::new(),
-            cap,
-            clock: 0,
+            entries: LruCache::new(cap),
         }
     }
     /// 纯查询（O(1)，不移动 LRU 次序；paint/形状热路径）。
     pub(crate) fn get(&self, key: &str) -> Option<&MathSlot> {
-        self.entries.get(key).map(|e| &e.slot)
+        self.entries.get(&key.into())
     }
     #[cfg(test)]
     pub(crate) fn contains_key(&self, key: &str) -> bool {
-        self.entries.contains_key(key)
+        self.entries.contains_key(&key.into())
     }
     /// 标记「最近使用」：`sync_math` 每帧对带内公式统一调用（带内 = LRU 命中面）。
     pub(crate) fn touch(&mut self, key: &str) {
-        let Some(e) = self.entries.get_mut(key) else {
-            return;
-        };
-        let last = e.last_seen;
-        e.last_seen = self.clock;
-        self.lru.remove(&(last, key.into()));
-        self.lru.insert((self.clock, key.into()));
-        self.clock = self.clock.wrapping_add(1);
+        self.entries.touch(&key.into());
     }
     /// 插入并标记最近使用；容量满且键不在场 → LRU 淘汰最久未用条目（`evicted` 由
     /// 调用方释放 `Ready` 纹理）。返回覆盖旧值 + 淘汰槽。
     pub(crate) fn insert(&mut self, key: SharedString, slot: MathSlot) -> CacheWrite<MathSlot> {
-        let mut evicted = None;
-        if self.entries.len() >= self.cap
-            && !self.entries.contains_key(&key)
-            && let Some(&(_, ref k)) = self.lru.iter().next()
-        {
-            let k = k.clone();
-            let last = self.entries[&k].last_seen;
-            self.lru.remove(&(last, k.clone()));
-            evicted = self.entries.remove(&k).map(|e| e.slot);
-        }
-        let old = if let Some(e) = self.entries.get(&key) {
-            let last = e.last_seen;
-            self.lru.remove(&(last, key.clone()));
-            Some(e.slot.clone())
-        } else {
-            None
-        };
-        self.entries.insert(
-            key.clone(),
-            MathSlotEntry {
-                slot,
-                last_seen: self.clock,
-            },
-        );
-        self.lru.insert((self.clock, key));
-        self.clock = self.clock.wrapping_add(1);
-        CacheWrite { old, evicted }
+        self.entries.put(key, slot, identity_key)
     }
     /// 按键移除（返回被移除的槽；测试/定向作废用）。
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) -> Option<MathSlot> {
-        let e = self.entries.remove(key)?;
-        self.lru.remove(&(e.last_seen, key.into()));
-        Some(e.slot)
+        self.entries.remove(&key.into())
     }
     /// 全部取走并清空（换源 / 主题色变化整批清除；调用方负责释放 `Ready` 纹理）。
     pub(crate) fn drain_all(&mut self) -> Vec<MathSlot> {
-        self.lru.clear();
-        self.entries.drain().map(|(_, e)| e.slot).collect()
+        self.entries.drain_all()
     }
     #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
-        self.lru.clear();
     }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -258,7 +356,7 @@ impl MathSlotCache {
     #[cfg(test)]
     pub(crate) fn keys(
         &self,
-    ) -> std::collections::hash_map::Keys<'_, SharedString, MathSlotEntry> {
+    ) -> std::collections::hash_map::Keys<'_, SharedString, LruEntry<SharedString, MathSlot>> {
         self.entries.keys()
     }
 }
@@ -267,37 +365,18 @@ impl MathSlotCache {
 /// 「容量上限 + LRU」。读路径 `lookup` 触摸最近使用（shape 期每块 O(log cap)，
 /// cap=512 ⇒ ≤9 级；解析 runs 是纯 CPU 数据，淘汰无纹理可释放）。
 pub(crate) struct CodeParseCache {
-    entries: std::collections::HashMap<CodeParseKey, CodeParseEntry>,
-    /// `(last_seen, key)` 升序 LRU 索引：首元素即最久未用条目。
-    lru: std::collections::BTreeSet<(u32, CodeParseKey)>,
-    cap: usize,
-    clock: u32,
-}
-
-/// 条目：解析态 + 最近使用钟。
-pub(crate) struct CodeParseEntry {
-    state: CodeParseState,
-    last_seen: u32,
+    entries: LruCache<CodeParseKey, CodeParseState>,
 }
 
 impl CodeParseCache {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
-            entries: std::collections::HashMap::new(),
-            lru: std::collections::BTreeSet::new(),
-            cap,
-            clock: 0,
+            entries: LruCache::new(cap),
         }
     }
     /// 查询 + 标记最近使用（O(log cap)；shape 期对带内代码块调用）。
     pub(crate) fn lookup(&mut self, key: &CodeParseKey) -> Option<&CodeParseState> {
-        let state = self.entries.get_mut(key)?;
-        let last = state.last_seen;
-        state.last_seen = self.clock;
-        self.lru.remove(&(last, key.clone()));
-        self.lru.insert((self.clock, key.clone()));
-        self.clock = self.clock.wrapping_add(1);
-        Some(&state.state)
+        self.entries.get_with_touch(key).map(|v| &*v)
     }
     pub(crate) fn contains_key(&self, key: &CodeParseKey) -> bool {
         self.entries.contains_key(key)
@@ -308,37 +387,10 @@ impl CodeParseCache {
         key: CodeParseKey,
         state: CodeParseState,
     ) -> CacheWrite<CodeParseState> {
-        let mut evicted = None;
-        if self.entries.len() >= self.cap
-            && !self.entries.contains_key(&key)
-            && let Some(&(_, ref k)) = self.lru.iter().next()
-        {
-            let k = k.clone();
-            let last = self.entries[&k].last_seen;
-            self.lru.remove(&(last, k.clone()));
-            evicted = self.entries.remove(&k).map(|e| e.state);
-        }
-        let old = if let Some(e) = self.entries.get(&key) {
-            let last = e.last_seen;
-            self.lru.remove(&(last, key.clone()));
-            Some(e.state.clone())
-        } else {
-            None
-        };
-        self.entries.insert(
-            key.clone(),
-            CodeParseEntry {
-                state,
-                last_seen: self.clock,
-            },
-        );
-        self.lru.insert((self.clock, key));
-        self.clock = self.clock.wrapping_add(1);
-        CacheWrite { old, evicted }
+        self.entries.put(key, state, identity_key)
     }
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
-        self.lru.clear();
     }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

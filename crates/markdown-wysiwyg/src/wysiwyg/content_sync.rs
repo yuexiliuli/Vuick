@@ -10,6 +10,14 @@ use crate::markdown::wysiwyg::math_typeset;
 impl WyEditor {
     /* ---------- 数学排版（LaTeX → RenderImage；参考 zorite 的 MathStore） ---------- */
 
+    /// 把一张「应丢弃」的 Ready 位图登记进 `pending_math_drop`（下一帧 `sync_math`
+    /// 统一 `drop_image` 释放）。三点共用（换源守卫不新鲜 / 占位槽被淘汰 / 主题色换变）
+    /// ——收敛「散点直 push」为单一入口（K10 副作用集中注入；K14 的 `cx.defer`/
+    /// 帧末统一释放姿势不变）。
+    fn queue_math_drop(&self, img: Arc<RenderImage>) {
+        self.pending_math_drop.borrow_mut().push(img);
+    }
+
     /// 公式排版槽（元素 build/paint 只读查询）。
     pub(crate) fn math_slots(&self) -> Rc<RefCell<MathSlotCache>> {
         self.math_slots.clone()
@@ -346,9 +354,7 @@ impl WyEditor {
                     .unwrap_or(false);
                 if !fresh {
                     if let MathSlot::Ready(img, _, _) = &slot {
-                        let _ = this.update(cx, |e, _| {
-                            e.pending_math_drop.borrow_mut().push(img.clone())
-                        });
+                        let _ = this.update(cx, |e, _| e.queue_math_drop(img.clone()));
                     }
                     return;
                 }
@@ -360,9 +366,7 @@ impl WyEditor {
                     // 槽：结果弃置（旧任务不写入已淘汰槽），其 Ready 位图纹理登记待释放。
                     if !matches!(slots2.get(key2.as_ref()), Some(MathSlot::Loading)) {
                         if let MathSlot::Ready(img, _, _) = &slot {
-                            let _ = this.update(cx, |e, _| {
-                                e.pending_math_drop.borrow_mut().push(img.clone())
-                            });
+                            let _ = this.update(cx, |e, _| e.queue_math_drop(img.clone()));
                         }
                         return;
                     }

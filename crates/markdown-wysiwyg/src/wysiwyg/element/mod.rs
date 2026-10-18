@@ -968,14 +968,10 @@ impl Element for WyEditorElement {
             point(bounds.origin.x + px(shift), bounds.origin.y)
         };
         // 可视带（窗口坐标 → 元素局部 y）：元素在滚动容器内的原点即滚动偏移；
-        // 量程化使小滚动不动带（measure→prepaint 的带保持一致）。
-        let vh = f32::from(window.viewport_size().height).max(1.);
+        // 量程化使小滚动不动带（measure→prepaint 的带保持一致）。与 cache::zoom_band_for_top
+        // 同式（q=512 分带，`top` = 元素局部 y 的视口顶部）。
         let top = (-f32::from(bounds.origin.y)).max(0.);
-        let q = 512.;
-        let band = (
-            (((top - vh) / q).floor() * q).max(0.),
-            ((top + 2. * vh) / q).ceil() * q,
-        );
+        let band = super::zoom_band_for_top(top, window.viewport_size().height);
         self.editor.update(cx, |e, _| e.set_shape_band(Some(band)));
 
         // 带移动 / 内容 / 宽度 / 图片/数学/mermaid缩放 变化 → 按新状态重建窗口化帧。
