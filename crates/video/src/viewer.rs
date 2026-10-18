@@ -88,10 +88,12 @@ const PUMP_MS: u64 = 16;
 /// 本值只作「无新帧」时的兜底超时（= 粗粒度刷新节拍，兼推进度条；K12 合规，不引入常驻
 /// 轮询、不持续逐帧重绘）。平时仍按帧率节拍，播放稳态 CPU 不增。
 const SEEK_WAKE_CAP_MS: u64 = COARSE_REPAINT_MS;
-/// 事件驱动泵在 seek 等待期的**切片兜底**（ms）：无通知时不在 [`SEEK_WAKE_CAP_MS`] 上整睡
-/// 一拍，而是每 [`SEEK_WAKE_SLICE_MS`] 醒来由 pump tick 排空帧通道——通知被 bound cap-1
-/// 级联丢弃但帧已在通道时，本片即上屏（真机实测同落点连点曾漏通知睡满 200ms 静默→尖峰）。
-/// 32ms 远小于 80ms 静默护栏、低于播放帧率节拍；seek 等待期瞬态，多出的空排空拍可忽略。
+/// 事件驱动泵的**切片兜底**（ms）：seek/播放两条等待统一走「wake + 超时 = min(切片, 帧率
+/// 节拍)」（见 `pump_event_timeout`）。无通知时不在 [`SEEK_WAKE_CAP_MS`] 上整睡一拍，而是
+/// 每 ≤ 切片/节拍 醒来由 pump tick 排空帧通道——通知被 bound cap-1 级联丢弃但帧已在通道时，
+/// 本片即上屏（真机实测同落点连点曾漏通知睡满 200ms 静默→尖峰；播放支路旧定时整睡一拍节拍，
+/// 曾致「seek 落点恰逢播放节拍休眠」时 frame2screen 偶发 38-76ms 末梢）。低帧率（节拍 >
+/// 32ms）取本值兜底、高帧率取节拍（不改变播放节奏与上下限语义）；多出的空排空拍可忽略——
 /// 正常事件驱动路径「通知即到」，本值只作兜底粒度，不影响典型帧到屏 ≈0-2ms。
 #[cfg(not(test))]
 const SEEK_WAKE_SLICE_MS: u64 = 32;
@@ -1098,6 +1100,8 @@ impl VideoViewer {
             let mut seek_regress: f64 = 0.0;
             let mut seek_skipped: u32 = 0;
             let mut seek_first_sent: Option<Instant> = None;
+            // 泵竞态探针（env 门控）：首帧 wake 投递结果只打一次
+            let mut seek_wake_dbg_printed = false;
             // 硬解首帧是否已由 skip_to_bgra 产出（软解恒 false → 走旧逐帧预滚过滤）
             let mut hw_primed = false;
             // —— 设备丢失自恢复（本命令内状态）——
@@ -1282,6 +1286,18 @@ impl VideoViewer {
                         // 把解码阶段数据落进共享槽，供 tick 首帧落地时聚合打印。
                         if seek_diag_on && seek_first_sent.is_none() {
                             seek_first_sent = Some(Instant::now()); // 首帧 ≥ target 入队
+                            // 泵竞态定位探针（env 门控）：首帧 ≥ target 就绪时刻，供与 pump
+                            // 侧 [SEEKPUMPDBG] P/T 行对表（帧入队 → 泵唤醒 → 排空上屏时序）。
+                            if seek_diag_enabled() {
+                                eprintln!(
+                                    "[SEEKPUMPDBG] W first>=t pts={:.2} target={:.2} gen={} reuse={} side={}",
+                                    frame.pts(),
+                                    cmd.target,
+                                    cmd.generation,
+                                    if same { 1 } else { 0 },
+                                    if dual { "gpu" } else if hw_reader { "safe" } else { "soft" }
+                                );
+                            }
                             let mut sslot = seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner());
                             let mine = sslot
                                 .as_ref()
@@ -1315,7 +1331,19 @@ impl VideoViewer {
                             Ok(()) => {
                                 // P1：帧已入队 → 通知 pump（首帧/续帧都发；级联语义由
                                 // bounded cap 1 承载，满则丢弃不阻塞、不堆积）
-                                let _ = cmd.wake.try_send(());
+                                if seek_diag_enabled() {
+                                    let w_ok = cmd.wake.try_send(()).is_ok();
+                                    if seek_first_sent.is_some() && !seek_wake_dbg_printed {
+                                        seek_wake_dbg_printed = true;
+                                        eprintln!(
+                                            "[SEEKPUMPDBG] W first-wake sent={} target={:.2}",
+                                            if w_ok { 1 } else { 0 },
+                                            cmd.target
+                                        );
+                                    }
+                                } else {
+                                    let _ = cmd.wake.try_send(());
+                                }
                                 true
                             }
                             Err(_) => false,
@@ -1730,11 +1758,23 @@ impl VideoViewer {
         snapped.clamp(DECODE_MIN_DIM, DECODE_MAX_DIM)
     }
 
-    /// 泵等待一拍的最长时长：seek 首帧落地等待期（`pending_seek` 活跃）改走**事件驱动**泵
-    /// ——本值仅作「帧就绪通知通道缺失（`frame_wake` 为 None，实际构造即建不出现）」的
-    /// 兜底超时口径（= [`COARSE_REPAINT_MS`]）；正常等待由 [`ensure_pump`] 的
-    /// 「切片事件等待」承担（[`SEEK_WAKE_CAP_MS`] 不再整睡一拍，见 [`SEEK_WAKE_SLICE_MS`]）。
-    /// 其余按帧率节拍（不改变播放节奏）。
+    /// 泵事件等待的「兜底超时」：统一 seek/播放两路（[`Self::ensure_pump`]）的「wake +
+    /// 超时」等待——事件驱动是主路径（worker 入队一帧即醒，帧到屏「通知即到」），本值只作
+    /// **无新帧**时的节拍兜底 = min(切片, 帧率节拍)：绝不大于节拍（播放稳态 playhead 照常
+    /// 推进、进度条平滑、K12 不空转、不忙唤醒），也绝不大于切片（通知被 cap-1 级联丢弃而
+    /// 帧已在通道时 ≤ 切片回 pump tick 排空上屏，不整睡静默）。120fps 节拍下限 8ms、慢帧率
+    /// 50ms 兜底语义不变（只参与 min 取小）。仅生产路径使用（cfg(test) 泵事件等待直接走
+    /// 细拍兜底 [`SEEK_WAKE_POLL_MS_TEST`]，不依赖本值）。
+    #[cfg(not(test))]
+    fn pump_event_timeout(&self) -> Duration {
+        let beat_ms = self.pump_interval().as_millis() as u64;
+        Duration::from_millis(SEEK_WAKE_SLICE_MS.min(beat_ms))
+    }
+
+    /// 泵等待的「兜底超时口径」：[`ensure_pump`] 的正常等待走「wake + 超时=min(切片,节拍)」
+    ///（[`Self::pump_event_timeout`]）；本值仅作「帧就绪通知通道缺失（`frame_wake` 为 None，
+    /// 实际构造即建不出现）」时的最后防线：seek 首帧落地等待期（`pending_seek` 活跃）
+    /// = [`COARSE_REPAINT_MS`]，其余按帧率节拍（不改变播放节奏）。
     fn pump_wait_interval(&self) -> Duration {
         if self.pending_seek.is_some() {
             Duration::from_millis(SEEK_WAKE_CAP_MS)
@@ -1752,79 +1792,115 @@ impl VideoViewer {
             // 上次强制重绘时刻：仅「有新帧落屏」才每拍重绘；无新帧的闲置拍最多每
             // COARSE_REPAINT_MS 一次（推进度条/控制条），不再 16ms 把整窗全刷一遍。
             let mut last_paint: Option<Instant> = None;
+            // seek 泵竞态定位探针（env 门控）：本拍起点 / 上一拍排空时刻，供 [SEEKPUMPDBG]
+            // P/T 行对表（帧入队 → 泵唤醒方式 → 排空上屏的墙钟缺口）。
+            let pump_t0 = std::time::Instant::now();
+            let mut pump_prev_land: Option<std::time::Instant> = None;
             loop {
-                // 等待方式二选一：
-                //  ① `pending_seek` 活跃（seek 首帧落地期）→ **事件驱动**：排空已就绪通知
-                //     后阻塞在 worker 「帧就绪通知」通道的**小片**上（worker 入队一帧即唤醒
-                //     drain+上屏，帧到屏收敛到「通知即到」；切片超时自查帧通道，通知被 cap-1
-                //     丢弃也 ≤[`SEEK_WAKE_SLICE_MS`] 上屏，绝不再整睡 [`SEEK_WAKE_CAP_MS`]，
-                //     见下方分支注释）。
-                //  ② 平时按帧率节拍定时（不改变播放节奏）。
-                let (wait, seek_waiting) = this
-                    .update(cx, |v, _| (v.pump_wait_interval(), v.pending_seek.is_some()))
-                    .unwrap_or((Duration::from_millis(PUMP_MS), false));
-                if seek_waiting {
-                    let rx = this
-                        .update(cx, |v, _| v.frame_wake.as_ref().map(|w| w.rx.clone()))
-                        .unwrap_or(None);
-                    match rx {
-                        Some(rx) => {
-                            #[cfg(test)]
-                            {
-                                // 测试 fake 调度器无「跨线程唤醒」（确定性护栏拒绝 foreign
-                                // wake，本仓实测）：事件通知用「先 try_recv 排空已就绪通知、
-                                // 无则睡兜底 fake 定时器」的半阻塞姿势表达——run_until_parked
-                                // 对无通知的等待正常 park（不阻塞线程、不死等）。兜底拍用
-                                // 细粒度（[`SEEK_WAKE_POLL_MS_TEST`]）让 advance_clock 驱动
-                                // pump 及时排空 worker 已入队的帧；生产走下方真实事件路径。
-                                let cap = Duration::from_millis(SEEK_WAKE_POLL_MS_TEST);
-                                let has = rx.lock().unwrap_or_else(|e| e.into_inner())
-                                    .try_recv().is_ok();
-                                if !has {
-                                    cx.background_executor().timer(cap).await;
-                                }
-                            }
-                            #[cfg(not(test))]
-                            {
-                                // 生产：事件驱动 + 切片兜底。
-                                // ① 先**非阻塞排空** wake 通道：上一拍 tick 期间 worker 又入队
-                                //    帧的通知可能已就绪——有信号立即放行 tick，杜绝「通知已到、
-                                //    泵却睡整拍」。同落点第二次点击的残留窗口：新泵首片消化上一
-                                //    seek worker 续播尾通知后再等真实通知，旧实现整睡 200ms。
-                                // ② 无信号才阻塞 recv 一小片（[`SEEK_WAKE_SLICE_MS`]），worker
-                                //    真实通知「即到」（事件驱动，帧到屏 ≈0-2ms 不变）。
-                                // ③ 切片超时（通知被 bound cap-1 级联丢弃、帧却已在帧通道）→
-                                //    不等满 [`SEEK_WAKE_CAP_MS`]，直接回 pump tick 排空帧通道：
-                                //    帧已入队本拍即上屏，未入队再进下一片等待——绝不睡整拍静默。
-                                //    播放稳态走下方帧率节拍（`pending_seek` 空），不受本块影响。
-                                let notified = {
-                                    let wake = rx.lock().unwrap_or_else(|e| e.into_inner());
-                                    let mut any = false;
-                                    while wake.try_recv().is_ok() {
-                                        any = true;
-                                    }
-                                    any
-                                };
-                                if !notified {
-                                    let slice = Duration::from_millis(SEEK_WAKE_SLICE_MS);
-                                    let _ = cx.background_executor().spawn(async move {
-                                        let wake = rx.lock().unwrap_or_else(|e| e.into_inner());
-                                        let _ = wake.recv_timeout(slice);
-                                    }).await;
-                                }
+                let pump_it_t0 = std::time::Instant::now();
+                let mut pump_dbg_wait: &'static str = "none";
+                let mut pump_dbg_wait_ms = 0.0f64;
+                let mut pump_dbg_new = false;
+                let mut pump_dbg_tick_ms = 0.0f64;
+                // 等待方式：seek/播放两条统一为一条「wake 事件驱动 + 兜底超时」路径，不改变
+                // 帧率节拍的上下限语义。无论 `pending_seek` 是否活跃，都阻塞在 worker「帧
+                // 就绪通知」通道上等待——worker 入队一帧即唤醒 drain+上屏（seek 首帧落地与
+                // 播放稳态取帧都收敛到「通知即到」，帧到屏 ≈0-2ms）；**播放支路不再整睡一拍
+                // 节拍**：真机实测「seek 落点正逢 pump 于播放节拍定时休眠（非 seek 事件等待）
+                // 时触发，泵要等下一拍才排空」→ frame2screen 偶发 38-76ms 末梢，由本路径
+                // 消掉（事件即醒）。无新帧的等待以 **min(切片,节拍)（≤ 节拍）** 为界：兜底
+                // 超时既自查帧通道（通知被 cap-1 级联丢弃而帧已在通道时 ≤ 切片上屏、绝不
+                // 整睡 [`SEEK_WAKE_CAP_MS`]），也让播放稳态照常推进 playhead（进度条平滑、
+                // K12 不空转、不忙唤醒）。[`Self::pump_wait_interval`] 仅作「帧就绪通道缺失
+                //（构造即建，实际不出现）」时的最后防线。
+                let wait = this
+                    .update(cx, |v, _| v.pump_wait_interval())
+                    .unwrap_or(Duration::from_millis(PUMP_MS));
+                let (rx, pend) = this
+                    .update(cx, |v, _| {
+                        (
+                            v.frame_wake.as_ref().map(|w| w.rx.clone()),
+                            v.pending_seek.is_some(),
+                        )
+                    })
+                    .unwrap_or((None, false));
+                match rx {
+                    Some(rx) => {
+                        #[cfg(test)]
+                        {
+                            // 测试 fake 调度器无「跨线程唤醒」（确定性护栏拒绝 foreign
+                            // wake，本仓实测）：事件通知用「先 try_recv 排空已就绪通知、
+                            // 无则睡兜底 fake 定时器」的半阻塞姿势表达——run_until_parked
+                            // 对无通知的等待正常 park（不阻塞线程、不死等）。兜底拍用细粒度
+                            //（[`SEEK_WAKE_POLL_MS_TEST`]）让 advance_clock 驱动 pump 及时
+                            // 排空 worker 已入队的帧（bench 帧到屏 ≈ 细拍粒度，可作回归锚）；
+                            // 生产走下方真实事件路径。**播放支路同样走本姿势**：真节拍定时
+                            // 在 fake 调度器下盖不住「事件即醒」，回归测试据此区分新旧行为。
+                            pump_dbg_wait = "recv:test";
+                            pump_dbg_wait_ms = 0.0;
+                            let cap = Duration::from_millis(SEEK_WAKE_POLL_MS_TEST);
+                            let has = rx
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .try_recv()
+                                .is_ok();
+                            if !has {
+                                cx.background_executor().timer(cap).await;
                             }
                         }
-                        None => {
-                            cx.background_executor().timer(wait).await;
+                        #[cfg(not(test))]
+                        {
+                            // 生产：事件驱动 + 兜底超时（min(切片,节拍)）。
+                            // ① 先**非阻塞排空** wake 通道：上一拍 tick 期间 worker 又入队
+                            //    帧的通知可能已就绪——有信号立即放行 tick，杜绝「通知已到、
+                            //    泵却睡整拍」。同落点第二次点击的残留窗口：新泵首片消化上一
+                            //    seek worker 续播尾通知后再等真实通知，旧实现整睡 200ms。
+                            // ② 无信号才阻塞 recv 一小片（`pump_event_timeout`），worker
+                            //    真实通知「即到」（事件驱动，帧到屏 ≈0-2ms 不变）——播放
+                            //    支路也在此监听：seek 落点恰逢播放节拍休眠时，首帧通知即醒
+                            //    泵、不等下一拍（消 38-76ms 末梢）。
+                            // ③ 超时（无新帧 / 通知被 cap-1 级联丢弃而帧已在通道）→ 回 pump
+                            //    tick 排空帧通道：帧已入队本拍即上屏，未入队再进下一片等待。
+                            //    超时 ≤ 节拍：播放稳态 playhead 照常推进、进度条平滑，
+                            //    无新帧的等待以节拍为界（K12 不空转）。
+                            let timeout = this
+                                .update(cx, |v, _| v.pump_event_timeout())
+                                .unwrap_or(Duration::from_millis(SEEK_WAKE_SLICE_MS));
+                            let notified = {
+                                let wake = rx.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut any = false;
+                                while wake.try_recv().is_ok() {
+                                    any = true;
+                                }
+                                any
+                            };
+                            if !notified {
+                                let recv_t0 = std::time::Instant::now();
+                                let recv_kind = cx
+                                    .background_executor()
+                                    .spawn(async move {
+                                        let wake = rx.lock().unwrap_or_else(|e| e.into_inner());
+                                        wake.recv_timeout(timeout).is_ok()
+                                    })
+                                    .await;
+                                pump_dbg_wait_ms = recv_t0.elapsed().as_secs_f64() * 1000.0;
+                                pump_dbg_wait = if recv_kind { "recv:wake" } else { "recv:timeout" };
+                            } else {
+                                pump_dbg_wait = "drain:early";
+                            }
                         }
                     }
-                } else {
-                    cx.background_executor().timer(wait).await;
+                    None => {
+                        cx.background_executor().timer(wait).await;
+                    }
                 }
                 let now = Instant::now();
                 let keep = this
                     .update(cx, |v, cx| {
+                        let tick_t0 = std::time::Instant::now();
                         let new_frame = v.tick(cx);
+                        pump_dbg_tick_ms = tick_t0.elapsed().as_secs_f64() * 1000.0;
+                        pump_dbg_new = new_frame;
                         let coarse_due = last_paint
                             .map(|t| {
                                 now.duration_since(t)
@@ -1838,14 +1914,53 @@ impl VideoViewer {
                             last_paint = Some(now);
                             cx.refresh_windows();
                         }
-                        v.pump_wanted()
+                        let wanted = v.pump_wanted();
+                        if !wanted {
+                            // 泵收尾与循环退出**同拍完成**：不再让旧泵「已退出、标记未清」
+                            // 的异步窗口挡住下一次 seek 的 ensure_pump（真机同落点连点第二次
+                            // 点击 44-50ms 静默——旧泵收尾滞后时新泵启不动、首帧无人排空）。
+                            v.pump_running = false;
+                        }
+                        wanted
                     })
                     .unwrap_or(false);
+                // 泵竞态定位探针（env 门控，仅待 seek 落点期）：一拍=P 行（等待类型/墙钟）+
+                // T 行（tick 是否排到帧/耗时），与 worker [SEEKPUMPDBG] W 行对表。
+                if pend && seek_diag_enabled() {
+                    let it_ms = pump_t0.elapsed().as_secs_f64() * 1000.0;
+                    let iter_ms = pump_it_t0.elapsed().as_secs_f64() * 1000.0;
+                    let since_ms = pump_prev_land
+                        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    if pump_dbg_wait == "drain:early" {
+                        eprintln!(
+                            "[SEEKPUMPDBG] P t={it_ms:8.2} iter={iter_ms:7.2} wait=drain:early new={} tick={:.3}ms since_prev_tick={since_ms:7.2}",
+                            if pump_dbg_new { 1 } else { 0 },
+                            pump_dbg_tick_ms
+                        );
+                    } else {
+                        eprintln!(
+                            "[SEEKPUMPDBG] P t={it_ms:8.2} iter={iter_ms:7.2} wait={} wait_ms={:.2} new={} tick={:.3}ms since_prev_tick={since_ms:7.2}",
+                            pump_dbg_wait,
+                            pump_dbg_wait_ms,
+                            if pump_dbg_new { 1 } else { 0 },
+                            pump_dbg_tick_ms
+                        );
+                    }
+                    pump_prev_land = Some(pump_it_t0);
+                }
                 if !keep {
                     break;
                 }
             }
-            let _ = this.update(cx, |v, _cx| v.pump_running = false);
+            // 收尾安全网（仅当泵已不再被需要才清旗标）：不要让无条件清写覆盖「在循环内清旗标
+            // 后、本拍 break 前」期间新启动的泵（同落点/EOF 后立刻再 seek，新泵 pump_running
+            // 已置 true 时会被旧泵此处误清 → 第三次 ensure_pump 双泵并跑）。
+            let _ = this.update(cx, |v, _cx| {
+                if !v.pump_wanted() {
+                    v.pump_running = false;
+                }
+            });
         })
         .detach();
     }
@@ -1884,7 +1999,13 @@ impl VideoViewer {
         // 「逾线帧」塞回 overflow、`pending_seek` 永不清 → seek 冻结。软解靠「预滚保底帧
         //（≤ 落点）先行」掩盖此缺口；硬解 skip 只送 ≥ 落点帧，直接暴露（pause→hover→seek
         // 回归实测）。
-        let mut land_seek = if self.scrubbing || !self.playing {
+        // **播放中 seek 同此处理**：`pending_seek` 活跃（= 有在途落点等待）时第首个
+        // 「pts ≥ 落点」帧即落点帧，须即时收下——否则它被当逾线帧塞 overflow、要等墙钟/
+        // 音钟再走完 ~1 帧量化（25fps→40ms、30fps→33ms）+ 泵节拍才上屏（真机实测
+        // frame2screen 残余 44-50ms 静默，集中在同落点连点第二次点击——播放中重复
+        // seek 同一 target，时钟每轮重新追赶量化尾差）。正常播放（无 in-flight seek）
+        // `pending_seek` 为 None → land_seek 仍 None，行为逐字节不变。
+        let mut land_seek = if self.scrubbing || !self.playing || self.pending_seek.is_some() {
             self.pending_seek
         } else {
             None
@@ -4604,6 +4725,40 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// 回归：**播放中 seek 落点帧即时上屏**（不挨时钟追量化尾差）。播放中 `pending_seek`
+    /// 活跃时，tick 须走 `land_seek` 分支把首个「pts ≥ 落点」帧即时收下；旧门
+    /// `scrubbing || !playing` 把播放中 seek 排除 → 落点帧被当「逾线帧」塞 overflow，要等
+    /// 墙钟/音钟再走完 ~1 帧量化（25fps→40ms、30fps→33ms）+ 泵节拍才上屏——真机实测
+    /// frame2screen 残余 44-50ms 静默、集中在同落点连点第二次点击。断言：单拍 tick 即上屏
+    /// 并清 pending，播放态保留、落点帧不进 overflow。
+    #[gpui::test]
+    async fn playing_seek_lands_on_quantized_first_frame_immediately(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playing = true;
+                v.duration = 1000.0;
+                v.playhead = 400.0; // seek 已把 playhead 落到落点
+                v.fps = Some((25, 1)); // 帧率已知 → 量化尾差 40ms 量级
+                v.pending_seek = Some(400.0);
+                v
+            })
+        });
+        // 首个 ≥ 落点帧：pts 恰超落点一帧量化（硬解 skip 后首帧的典型形态）
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FrameItem>(2);
+        let _ = tx.try_send(frame_of(400.04, 1));
+        ent.update(cx, |v, cx| {
+            v.rx = Some(rx);
+            let inst = v.tick(cx);
+            assert!(inst, "播放中 seek 首拍即应把落点帧上屏（旧门等时钟才上 → 44-50ms 静默）");
+            assert_eq!(v.pending_seek, None, "落点帧上屏即清 pending");
+            assert_eq!(v.last_frame_pts, Some(400.04));
+            assert!(v.playing, "播放态必须保留");
+            assert!(v.overflow.is_none(), "落点帧不得被当逾线帧塞 overflow");
+        });
+        cx.run_until_parked();
+    }
+
     /// 性能基准（纯代码、不开 GUI，真解码 + 真墙钟）：模拟「点击进度条」seek——begin_scrub
     /// 与 end_scrub 同分数 → 走单击合并路径（仅一次换代，正是用户真实点击链路）——量「点击那刻
     /// → 首个新帧上屏（pending_seek 清空）」的端到端墙钟。测试上下文 timer 是 fake-clock
@@ -6057,6 +6212,115 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// 性能基准（纯代码、不开 GUI，真解码 + 真墙钟）：**播放节拍等待中发起 seek 的回归
+    /// 护栏**——pump 从**播放稳态**（`pending_seek` 空、停于播放支路等待）发起 seek
+    ///（begin_scrub+end_scrub 单击）。若播放支路仍像旧实现「整睡一拍帧率节拍定时」，落点帧
+    /// 入队通知要等下一拍才被排空，frame2screen 会偶发撑到 ≈ 节拍（≈41ms）——本 bench 真解码、
+    /// 真墙钟、不手动 tick（pump 自行落地），断言 frame2screen 中位 < 30ms 护栏（播放等待也
+    /// 监听 wake 通道，事件即醒消末梢）。与 [`bench_pump_framewake_lands_seek_wall`] 同姿势；
+    /// 每次 seek 前垫一小段真实时间让泵渡回播放支路等待。夹具 `target\视频测试字幕.mkv`；
+    /// 缺夹具 SKIP。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bench_pump_seek_from_playback_beat_wall(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _decode_mode = crate::decode::DecodeModeGuard::new(2); // SAFE 硬解优先（skip 快路径）
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待首帧/时长超时");
+        }
+        let duration = cx.update(|app| viewer.read(app).duration);
+        let raw = [72.0f64, 191.0, 354.0, 900.0];
+        let hi = (duration - 2.0).max(0.05);
+        let mut f2s: Vec<f64> = Vec::with_capacity(raw.len());
+        for &sec in &raw {
+            let sec = sec.clamp(0.05, hi);
+            // 垫播放稳态期：上一 seek 落地后 pending_seek 已空、泵停在播放支路；再推 ~35ms
+            // 让泵渡完上一轮 tick 并落进新的播放等待（回归窗口：本次 seek 恰逢播放节拍/
+            // 事件等待的任意相位发起）。
+            let settle = Instant::now() + Duration::from_millis(35);
+            while Instant::now() < settle {
+                cx.executor().advance_clock(Duration::from_millis(1));
+                cx.background_executor.timer(Duration::from_millis(2)).await;
+            }
+            let fraction = (sec / duration).clamp(0.0, 1.0) as f32;
+            let t0 = Instant::now();
+            viewer.update(cx, |v, cx| v.begin_scrub(fraction, cx));
+            viewer.update(cx, |v, cx| v.end_scrub(fraction, cx));
+            let target = cx.update(|app| viewer.read(app).playhead);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let landed = loop {
+                // 不手动 tick：pump 自行落地（播放等待中 seek → 事件即醒；测试执行器
+                // fake + 真实 worker 通知经 advance_clock/真实 timer 合拍驱动，同既有 bench）
+                cx.executor().advance_clock(Duration::from_millis(1));
+                cx.background_executor.timer(Duration::from_millis(2)).await;
+                let s = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (v.pending_seek, v.last_frame_pts)
+                });
+                if s.0.is_none() {
+                    break s.1;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "播放节拍等待中的 seek 未自行落地（target={target:.2}s）"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            match take_seek_diag_test() {
+                Some((_t, _re, _re2, _sk, _s2f, f2s_ms, _tg, _fp)) => {
+                    f2s.push(f2s_ms);
+                    eprintln!(
+                        "[SEEKPLAYW] total={:.1}ms frame2screen={f2s_ms:.1}ms target={target:.1}s landed={:?}",
+                        t0.elapsed().as_secs_f64() * 1e3,
+                        landed.map(|p| format!("{p:.2}s"))
+                    );
+                }
+                None => {
+                    f2s.push(t0.elapsed().as_secs_f64() * 1e3);
+                    eprintln!(
+                        "[SEEKPLAYW] target={target:.1}s click2frame={:.1}ms landed={:?}（无 diag 快照，兜底）",
+                        t0.elapsed().as_secs_f64() * 1e3,
+                        landed.map(|p| format!("{p:.2}s"))
+                    );
+                }
+            }
+        }
+        let mut fs = f2s.clone();
+        fs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let f_med = fs[fs.len() / 2];
+        eprintln!(
+            "[SEEKPLAYW] 摘要 n={} frame2screen 中位={f_med:.1}ms max={:.1}ms（<30ms 护栏：播放节拍等待中 seek 不得整睡一拍）",
+            f2s.len(),
+            fs[fs.len() - 1],
+        );
+        assert!(
+            f_med < 30.0,
+            "播放节拍等待中 seek 的 frame2screen 中位应 <30ms，实得 {f_med:.1}ms（疑似播放支路整睡一拍节拍）"
+        );
+        cx.run_until_parked();
+    }
+
     /// 性能基准（纯代码、不开 GUI，真 SAFE 硬解 + 真墙钟）：**P2 hover SAFE**——hover 预解码
     /// worker 改走 SAFE 硬解（`open_scaled_hw` + `skip_to_bgra_into` 跳帧免转换快路径，独立
     /// 线程独立 reader）。暂停 → 悬停深 GOP 落点 → 等预解码缓存抵达（量 preroll 墙钟）→ 点击
@@ -6757,6 +7021,73 @@ mod tests {
         };
         assert!(s.0, "帧就绪通知应即时唤醒 pump 上屏首帧（不待帧率节拍 41ms）");
         assert_eq!(s.1, None, "首帧上屏后 pending_seek 应立即清空");
+        cx.run_until_parked();
+    }
+
+    /// 回归（③ 播放节拍等待期间发起 seek）：泵在**播放稳态**（`pending_seek` 为空）的等待
+    /// 也统一走「wake 事件驱动 + 兜底超时」——帧就绪通知即醒，不再整睡一拍帧率节拍。
+    /// 本测试把泵固定在播放等待（fps=24 → 帧率节拍 41ms），再注入 seek 交付态（pending_seek +
+    /// 落点帧 + 帧就绪通知），以 fake 时钟推进量计落地上屏耗时：断言远小于 41ms 节拍
+    ///（若播放支路退化成 `timer(41ms)` 整睡一拍即红——真机对应「seek 落点恰逢播放节拍休眠」
+    /// 的 frame2screen 38-76ms 末梢）。
+    #[gpui::test]
+    async fn pump_playback_beat_wait_wakes_promptly_on_seek_event(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.duration = 10.0;
+            v.fps = Some((24, 1)); // 播放节拍 41ms（旧播放支路整睡一拍 = 回归判据）
+            v.playhead = 5.0;
+            v
+        }));
+        let (tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
+        ent.update(cx, |v, _| {
+            v.rx = Some(rx);
+        });
+        // 泵进入播放等待（pending_seek 为空 → 播放支路）；run_until_parked 让泵落进等待
+        ent.update(cx, |v, cx| v.ensure_pump(cx));
+        cx.run_until_parked();
+        // 此时发起 seek：置落点 + 交付①落点帧（≥ 落点，模拟 worker 首帧入队）②帧就绪通知。
+        // `scrubbing=true` 让 land_seek = pending_seek：首个 ≥ 落点帧立即装屏（与真实点按
+        // seek 的落地语义一致，不依赖 playhead 推进）。
+        ent.update(cx, |v, _| {
+            v.scrubbing = true;
+            v.pending_seek = Some(5.0);
+        });
+        tx.send(frame_of(5.1, 9)).ok();
+        ent.update(cx, |v, _| {
+            if let Some(w) = &v.frame_wake {
+                let _ = w.tx.try_send(());
+            }
+        });
+        // 驱动 fake 时钟：播放支路事件等待每细拍（2ms）自查一次，落点帧应在其后 ≤ 数拍内
+        // 装屏——若手写旧实现（播放支路 `timer(41ms)` 兜底），节拍未到泵不动 → 断言红。
+        let mut steps = 0u32;
+        let s = loop {
+            cx.executor().advance_clock(Duration::from_millis(1));
+            cx.run_until_parked();
+            steps += 1;
+            let s = cx.update(|app| {
+                let v = ent.read(app);
+                (v.frame.is_some(), v.pending_seek)
+            });
+            if s.0 && s.1.is_none() {
+                break s;
+            }
+            assert!(
+                steps < 20,
+                "泵在播放节拍等待中收到 seek 事件后未及时上屏（steps={steps}ms，远未到 41ms 节拍即应落屏）"
+            );
+        };
+        assert!(s.0, "seek 落点帧应上屏");
+        assert_eq!(s.1, None, "落点帧上屏后 pending_seek 应立即清空");
+        eprintln!(
+            "[PUMPWAKE] 播放等待→seek 落地 fake 时钟 {steps}ms（节拍 41ms 判据，需 ≤ ~8）"
+        );
+        assert!(
+            steps <= 8,
+            "泵应在事件通知后 ≤ 细拍粒度上屏（实测 {steps}ms），播放支路整睡一拍即回归"
+        );
         cx.run_until_parked();
     }
 
