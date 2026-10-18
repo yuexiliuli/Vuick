@@ -126,7 +126,6 @@ pub struct PopupMenu {
     previous_focus: Option<FocusHandle>,
     menu_items: Vec<PopupMenuItem>,
     selected_index: Option<usize>,
-    min_width: Option<Pixels>,
 }
 
 impl PopupMenu {
@@ -136,7 +135,6 @@ impl PopupMenu {
             previous_focus: None,
             menu_items: Vec::new(),
             selected_index: None,
-            min_width: None,
         }
     }
 
@@ -377,7 +375,7 @@ impl Render for PopupMenu {
             .flex_col()
             .p(PANEL_PADDING)
             .gap_y(PANEL_PADDING)
-            .min_w(self.min_width.unwrap_or(px(160.)))
+            .min_w(px(160.))
             .children(items);
 
         div()
