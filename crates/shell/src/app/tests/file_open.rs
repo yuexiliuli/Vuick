@@ -802,13 +802,17 @@
         let _ = std::fs::remove_file(&dir);
     }
 
-    /// P1b：大文档渐进打开的消费者改为**批级装配**——一次 UI 更新内尽量多收已缓冲块、
-    /// 逐块追加、批末统一一次 notify（每块不再整窗重绘）。本测试锁定语义不回归：
-    /// 多块消息一个不丢（内容字节级一致）、`open_fast_count`/`open_finish_count` 各 1 次、
-    /// notify 数与块数的量级关系合理（批均 ≥1 块/批），并让既有逐块时序/计数断言全绿。
+    /// P1（消除主线程逐块 `Rope::insert` 冻结）：大文档打开改为「首块即时挂载（内容瞬时
+    /// 可见）+ 锁输入，后台整篇建 rope，EOF 一次 O(1) 换装」——主线程不再逐块追加。本测试
+    /// 锁定语义不回归：内容消息只发 1 个首块（chunks=1）、进度消息至少 1 条（状态栏
+    /// 「数字跳动」，P2）、notify 在 [2, 2+ticks]（节流，WARN-1）、`open_fast_count`/
+    /// `open_finish_count` 各 1 次、装载期 `loading_lock` 置位（锁输入防编辑竞态）且收尾后
+    /// 复位、最终内容字节级一致、行数正确。
     #[gpui::test]
     async fn progressive_open_batches_and_preserves_semantics(cx: &mut TestAppContext) {
-        use crate::app::file_ops::{PROGRESSIVE_OPEN_CHUNKS, PROGRESSIVE_OPEN_NOTIFIES};
+        use crate::app::file_ops::{
+            PROGRESSIVE_OPEN_CHUNKS, PROGRESSIVE_OPEN_NOTIFIES, PROGRESSIVE_OPEN_TICKS,
+        };
         use std::sync::atomic::Ordering;
         init_test(cx);
         let (app, cx) = add_app(cx);
@@ -816,9 +820,9 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        // ~12MB / 6 万行：首块 256KB + 后 ~1MB/块 → 12+ 块，给批级装配留足合并窗口。
+        // ~12MB / 6 万行：远超首块下限，且 fake 调度器一轮内可完成后台整篇建 rope。
         let dir = std::env::temp_dir().join(format!(
-            "gpui-p1b-batch-{}-{}.txt",
+            "gpui-p1-open-{}-{}.txt",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -837,18 +841,18 @@
 
         PROGRESSIVE_OPEN_NOTIFIES.store(0, Ordering::Relaxed);
         PROGRESSIVE_OPEN_CHUNKS.store(0, Ordering::Relaxed);
-        let chunks_before = PROGRESSIVE_OPEN_CHUNKS.load(Ordering::Relaxed);
-
+        PROGRESSIVE_OPEN_TICKS.store(0, Ordering::Relaxed);
+        let mut frames = 0;
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
         });
-        let mut frames = 0;
         loop {
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.tabs.len().saturating_sub(1);
                 !a.tabs[i].editor_pending
+                    && !a.tabs[i].loading_lock
                     && a.tabs[i].editor.read(cx).value() == content
                     && a.open_finish_count >= 1
             });
@@ -857,27 +861,201 @@
             }
             frames += 1;
             if frames > 1000 {
-                panic!("P1b 大文件批级装配超时：{} 帧", frames);
+                panic!("P1 大文档打开超时：{} 帧", frames);
             }
         }
-        let (chunks, notifies, fast, finish) = (
-            PROGRESSIVE_OPEN_CHUNKS.load(Ordering::Relaxed) - chunks_before,
+        let (chunks, notifies, ticks, fast, finish) = (
+            PROGRESSIVE_OPEN_CHUNKS.load(Ordering::Relaxed),
             PROGRESSIVE_OPEN_NOTIFIES.load(Ordering::Relaxed),
+            PROGRESSIVE_OPEN_TICKS.load(Ordering::Relaxed),
             cx.update(|_, cx| app.read(cx).open_fast_count),
             cx.update(|_, cx| app.read(cx).open_finish_count),
         );
-        assert!(chunks >= 7, "应有多块渐进（实际 {chunks} 块）——测试前提不成立");
-        assert_eq!(fast, 1, "两段式快段应执行 1 次");
-        assert_eq!(finish, 1, "两段式慢段应执行 1 次");
+        // P1：内容消息只发首块一个；快/慢段各 1 次。
+        assert_eq!(chunks, 1, "P1 只应发 1 个首块内容消息（实际 {chunks}）");
+        assert_eq!(fast, 1, "两段式快段（首块挂载）应执行 1 次");
+        assert_eq!(finish, 1, "两段式慢段（整篇换装）应执行 1 次");
+        // P2：至少一条进度消息（状态栏「数字跳动」）；notify = 首块挂载 + 收尾 + 节流后的
+        // 进度跳（每 4 条进步触发一次，WARN-1）→ 上界「2 + ticks」、下界「2」。
         assert!(
-            notifies >= 1 && notifies <= chunks,
-            "批级 notify 数应在 [1, 块数] 内（notifies={notifies} / chunks={chunks}）"
+            ticks >= 1,
+            "应收到 ≥1 条进度消息（状态栏数字跳动，实际 {ticks}）"
         );
-        // 语义保真：批内绝不丢块（内容字节级一致已断言）。批均 ≥1 块/批 = 无损失上界。
-        eprintln!(
-            "[P1b] chunks={chunks} notifies={notifies} 批均 {:.2} 块/批",
-            chunks as f64 / notifies.max(1) as f64
+        assert!(
+            notifies >= 2 && notifies <= 2 + ticks,
+            "P1+P2 notify 应在 [2, 2+ticks]（节流）内（实际 {notifies}，ticks={ticks}）"
         );
+        // 语义保真：最终内容字节级一致（整篇换装）已断言；行数对账。
+        let lc = cx.update(|_, cx| {
+            app.read(cx).tabs.last().unwrap().editor.read(cx).display_line_count()
+        });
+        assert_eq!(lc, 60_000, "最终行数应为全文行数");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// P2（状态栏「数字跳动」回归）：大文档打开期间状态栏行/字数应**随读随跳**——生产者
+    /// 每块推一次 `OpenMsg::Progress`，消费端 O(1) 更新 `tab.line_count`/`tab.char_count`
+    /// 并 notify，而不是「挂载小计数 → 整篇换装瞬间跳到终值」。逐 tick 驱动协作式调度器，
+    /// 断言中间某时刻 `tab.char_count` 严格落在 `(0, 全文字符数)` 之间且单调不减（跳动
+    /// 而非跳变），收尾后等于全文字符数、内容字节级一致。
+    #[gpui::test]
+    async fn progressive_open_ticks_status_counts(cx: &mut TestAppContext) {
+        use crate::app::file_ops::{PROGRESSIVE_OPEN_CHUNKS, PROGRESSIVE_OPEN_TICKS};
+        use std::sync::atomic::Ordering;
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // ~12MB / 6 万行：远超首块下限，多块（1MB/块 → ~11 条进度）。
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-p2-tick-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let content = (0..60_000)
+            .map(|i| format!("{} {i:09}\n", "y".repeat(120)))
+            .collect::<String>();
+        assert!(
+            content.len() > 2 * 1024 * 1024,
+            "测试文件应远超首块下限且多块（实际 {} B）",
+            content.len()
+        );
+        std::fs::write(&dir, &content).unwrap();
+        let full_chars = content.chars().count();
+
+        PROGRESSIVE_OPEN_CHUNKS.store(0, Ordering::Relaxed);
+        PROGRESSIVE_OPEN_TICKS.store(0, Ordering::Relaxed);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+
+        let mut saw_intermediate = false;
+        let mut prev_char = 0usize;
+        let mut monotonic = true;
+        let mut done = false;
+        let mut steps = 0;
+        while steps < 3000 {
+            if !cx.cx.executor().tick() {
+                break;
+            }
+            steps += 1;
+            let (cc, pending, lock) = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                let tab = &a.tabs[i];
+                (tab.char_count, tab.editor_pending, tab.loading_lock)
+            });
+            if cc < prev_char {
+                monotonic = false; // 计数回退 = 抖动/跳变，数字跳动不得回退
+            }
+            prev_char = cc;
+            if !done && !pending && cc > 0 && cc < full_chars {
+                saw_intermediate = true; // 中间态：正从某块计数往全文计数跳
+            }
+            if !pending && !lock && cc == full_chars {
+                done = true;
+            }
+        }
+        assert!(
+            done,
+            "P2 大文档打开应收尾（{steps} steps；char_count={prev_char}/{full_chars}）"
+        );
+        assert!(
+            saw_intermediate,
+            "应观察到状态栏字符数中间态（数字跳动：首块计数 → 全文计数）；{steps} steps 内未见"
+        );
+        assert!(monotonic, "状态栏字符数应单调不减（跳动而非跳变/回退）");
+        assert_eq!(
+            PROGRESSIVE_OPEN_CHUNKS.load(Ordering::Relaxed),
+            1,
+            "P2 内容消息仍只发首块 1 条（不开逐块上屏）"
+        );
+        assert!(
+            PROGRESSIVE_OPEN_TICKS.load(Ordering::Relaxed) >= 1,
+            "P2 应收到 ≥1 条进度消息支撑状态栏跳动"
+        );
+        let final_ok = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let tab = &a.tabs[i];
+            tab.char_count == full_chars
+                && tab.editor.read(cx).value() == content
+                && tab.editor.read(cx).display_line_count() == 60_000
+        });
+        assert!(final_ok, "P2 收尾后全文字符数/内容/行数应对账一致");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// 评审 BLOCK-1 回归：大文档分块读盘**中途出错**（首块已挂载、EOF 前读盘报错，如
+    /// 后续读到非法 UTF-8 → 只发 `Err` 不发 `Eof`）时，`report_open_failure` 必须**解锁**
+    /// `loading_lock`——否则选项卡永久停在「已显示首块但不可编辑/滚动」的锁状态
+    /// （评审发现 `loading_lock` 只在 `finish_file_text` 复位，失败路径此前漏解锁）。
+    /// 失败语义 = 保留已读到的部分内容、可继续查看/编辑。
+    #[gpui::test]
+    async fn mid_read_failure_unlocks_loading_lock(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 前 512KB 合法（>首块 256KB 下限 → 首块先送出并挂载），随后一个 0xFF 非法
+        // UTF-8 字节 → 后台 ChunkReader 在首块之后报 InvalidData（只发 Err、不发 Eof）；
+        // 读缓冲 256KB，第三个 advance 恰从 0xFF 处开始即报错。
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-midread-fail-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut good = String::new();
+        while good.len() < 512 * 1024 {
+            good.push_str("行内容 0123456789 abcdefghij\n");
+        }
+        let mut bytes = good.into_bytes();
+        bytes.push(0xFF);
+        bytes.extend_from_slice("\n余下内容\n".as_bytes());
+        std::fs::write(&dir, &bytes).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let (lock, failed, mounted) = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                let ed = a.tabs[i].editor.read(cx);
+                (
+                    a.tabs[i].loading_lock,
+                    !a.status_ok,
+                    ed.value().len() > 0 && !a.tabs[i].editor_pending,
+                )
+            });
+            if failed && mounted && !lock {
+                break; // 失败已报、首块已挂载、且锁被解开（BLOCK-1 修复生效）
+            }
+            frames += 1;
+            if frames > 1000 {
+                panic!("中途读盘失败未解锁 loading_lock（frames={frames}）");
+            }
+        }
+        // 已读首块内容保留、可继续查看（editor_pending 已复位、存在内容）。
+        let (content_len, pending) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            (a.tabs[i].editor.read(cx).value().len(), a.tabs[i].editor_pending)
+        });
+        assert_eq!(pending, false, "中途失败后 editor 应可查看（pending 复位）");
+        assert!(content_len > 0, "首块内容应保留：{content_len} 字节");
         let _ = std::fs::remove_file(&dir);
     }
 

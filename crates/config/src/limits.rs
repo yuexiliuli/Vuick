@@ -13,7 +13,8 @@ pub const OPEN_ASYNC_MIN_BYTES: u64 = 128 * 1024;
 /// 整篇读完才挂载。取 1MB：主线程每次只做 O(1MB) 的 rope 追加 ≈ 毫秒级，不卡帧。
 pub const OPEN_CHUNK_TARGET_BYTES: usize = 1024 * 1024;
 /// 首个分块的下限：仅首块用它（更小，几十 KB 即出首屏），之后统一用
-/// [`OPEN_CHUNK_TARGET_BYTES`]。
+/// [`OPEN_CHUNK_TARGET_BYTES`]。取 256KB：首块越小首屏越早，但过小会让**首个消费批**
+/// 收满通道容量（4×后续 1MB 块）再挂载、反而晚（实测 96KB→首挂 296ms vs 256KB→170ms）。
 pub const OPEN_FIRST_CHUNK_BYTES: usize = 256 * 1024;
 /// 大文档分块读盘的原始字节缓存大小（每次 `File::read` 读这么多；与发行块大小无关）。
 pub const READ_BUF_BYTES: usize = 256 * 1024;

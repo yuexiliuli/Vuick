@@ -119,6 +119,10 @@ struct EditorTab {
     /// 等用户第一时间看到预览内容后，下一拍再把编辑器挂上——编辑器
     /// 首次对 16 万行做 DisplayMap 布局会冻结一两秒，不让它挡在首帧前）。
     editor_pending: bool,
+    /// 大文档 P1 后台装配在途（整篇 rope 尚在生产端）：编辑区已显示首块但**锁输入**
+    /// （渲染层全区域透明拦截，见 panes.rs）——避免「打开期间编辑」与 EOF 整篇换装
+    /// 竞态；`finish_file_text` 换装成功后置 false。
+    loading_lock: bool,
     /// 是否处于「所见即所得预览编辑」模式：左面板用 `WyEditor` 代替源码编辑区；
     /// 退出时内容写回。
     live_edit: bool,
@@ -192,6 +196,10 @@ pub(crate) struct DetachedTab {
     preview_fullscreen: bool,
     readonly_preview: bool,
     editor_pending: bool,
+    /// 大文档 P1 后台装配在途（整篇 rope 尚在生产端）：编辑区已显示首块但**锁输入**
+    /// （渲染层全区域透明拦截，见 panes.rs）——避免「打开期间编辑」与 EOF 整篇换装
+    /// 竞态；`finish_file_text` 换装成功后置 false。
+    loading_lock: bool,
     edit_version: u64,
 }
 

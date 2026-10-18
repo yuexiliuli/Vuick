@@ -38,6 +38,7 @@ impl EditorApp {
             preview_fullscreen,
             readonly_preview,
             editor_pending,
+            loading_lock,
             edit_version,
             ..
         } = tab;
@@ -60,6 +61,7 @@ impl EditorApp {
             preview_fullscreen,
             readonly_preview,
             editor_pending,
+            loading_lock,
             edit_version,
         })
     }
@@ -95,6 +97,7 @@ impl EditorApp {
             preview_fullscreen,
             readonly_preview,
             editor_pending,
+            loading_lock,
             edit_version,
         } = payload;
         let edit_sub = self.subscribe_editor(&editor, cx);
@@ -122,6 +125,7 @@ impl EditorApp {
             preview_fullscreen,
             readonly_preview,
             editor_pending,
+            loading_lock,
             edit_version,
             // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交写回，见 take_tab_payload 调用点）
             live_edit: false,

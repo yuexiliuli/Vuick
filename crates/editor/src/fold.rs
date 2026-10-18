@@ -1246,4 +1246,47 @@ fn after() {
             t_full[0], med_full, t_inc[0], med_inc, med_full / med_inc.max(1e-6),
         );
     }
+
+    /// 真文件诊断（`#[ignore]`，仅本机）：直接测量「P3 之前 EOF 打开路径在 **UI 线程**
+    /// 同步整篇折叠候选＋括号配对重扫」在真实 `大文档测试.txt`（15.6 万行 / 6.1MB）上的
+    /// 耗时——这是用户报告「打开会卡」的主线程卡顿量级（debug 下更大，release 同理更小
+    /// 但相对量级不变）。P3 起该段工作改由 `refresh_fold_brackets` 在后台执行，UI 线程只
+    /// 留 O(1) 换装；此处数字 = 已从首帧临界路径移出的同步开销。
+    /// 跑法：`cargo test --release -p editor fold::bench_real_file_sync_scan -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_real_file_sync_scan() {
+        let path = r"E:\Rust\gpui-editor\target\大文档测试.txt";
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP: missing {path} ({e})");
+                return;
+            }
+        };
+        // 与生产 `recompute_fold_brackets_full` 的闭包同款：ropey Rope + line_shared
+        // （O(log n)/行；不能用 text_line_fn——`split('\n').nth(i)` 是 O(i)/行 → O(n²)）。
+        use crate::editor::rope_ext::RopeExt as _;
+        let rope = ropey::Rope::from_str(&src);
+        let n = rope.lines_len();
+        assert!(n > 100_000, "真文件应有 >10 万行：{n}");
+        let line = |r: usize| crate::editor::buffer::line_shared(&rope, r);
+        let mut t = Vec::new();
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            let (folds, pairs, fb, pb) = full_fold_brackets(line, n);
+            std::hint::black_box(&folds);
+            std::hint::black_box(&pairs);
+            std::hint::black_box(&fb);
+            std::hint::black_box(&pb);
+            t.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[BENCH] real 大文档测试.txt: {n} 行 / {:.1} MB，EOF 同步折叠+括号全扫 min/med: {:.2}/{:.2} ms（P3 前在 UI 线程执行→即打开卡顿量级；P3 后移后台，UI 只 O(1) 换装）",
+            src.len() as f64 / 1e6,
+            t[0],
+            t[t.len() / 2],
+        );
+    }
 }

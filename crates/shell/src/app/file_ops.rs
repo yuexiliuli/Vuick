@@ -39,16 +39,43 @@ pub(crate) static PROGRESSIVE_OPEN_NOTIFIES: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 pub(crate) static PROGRESSIVE_OPEN_CHUNKS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// 测试探针（`cfg(test)`）：收到/应用的**进度消息**（`OpenMsg::Progress`）数。P2 回归
+/// 断言「状态栏行/字数随读随跳」：进度消息数 ≥ 1（内容消息仍只有首块 1 个），
+/// notify = 2（首块挂载 + 收尾）+ ticks（每次进度一跳）。
+#[cfg(test)]
+pub(crate) static PROGRESSIVE_OPEN_TICKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// 生产者 → 消费者的消息（大文档分块打开的异步通道）。
 enum OpenMsg {
+    /// 仅首块（即位挂载：内容瞬时可见）；其余块不再逐块上屏。
     Chunk(TextChunk),
-    Eof { src_len: u64 },
+    /// 后续块的后台字节级统计（不携内容，主线程 O(1) 更新）：状态栏行/字数
+    /// **随读随跳**——不再是「挂载小计数 → 整篇换装瞬间跳到终值」（P2）。
+    Progress {
+        /// 已读完整行的累计行数（`hist` 求和，O(块)）。
+        lines: usize,
+        /// 已读完整行的累计字符数（`TextChunk::chars` 累积，Unicode 标量）。
+        chars: usize,
+    },
+    /// 生产端在后台把整篇归一化文本建成 Rope + 汇总统计，EOF 一次性交给主线程换装
+    /// （消除主线程逐块 `Rope::insert` 的 4.5s 冻结）。
+    Eof {
+        src_len: u64,
+        full: ropey::Rope,
+        hist: editor::buffer::LineWidthHistogram,
+        max_line_chars: usize,
+    },
     Err(std::io::Error),
 }
 
 /// 后台分块读盘 + 归一化 + 逐块统计的生产者：`send().await` 背压外推（读满让出），
 /// EOF / 出错 / 消费端放弃即收尾关闭通道。
+///
+/// **P1（消除主线程逐块追加冻结）**：只把**首块**推给主线程作即时挂载（内容瞬时可见）；
+/// 其余块全部在后台攒进整篇 String + 汇总统计，EOF 时后台 `Rope::from_str` 建成整篇
+/// rope，一次性交回主线程换装（O(1)）。主线程不再逐块 `Rope::insert`（128MB/312万行
+/// debug 下每 1MB ~35ms → 免掉 4.5s 冻结）。
 async fn read_chunks_async(
     mut prod_tx: futures::channel::mpsc::Sender<OpenMsg>,
     prod_p: std::path::PathBuf,
@@ -63,11 +90,44 @@ async fn read_chunks_async(
             return;
         }
     };
+    let mut full: String = String::new();
+    let mut cum_hist = editor::buffer::LineWidthHistogram::new();
+    let mut cum_mx = 0usize;
+    let mut cum_lines = 0usize;
+    let mut cum_chars = 0usize;
+    let mut first_sent = false;
     loop {
         match reader.next_chunk() {
             Ok(Some(chunk)) => {
-                if prod_tx.send(OpenMsg::Chunk(chunk)).await.is_err() {
-                    return; // 消费端已放弃 → 停止读盘
+                // 逐块已在后台算好精确 hist/max → 汇总（EOF 换装用）。
+                cum_mx = cum_mx.max(chunk.max_line_chars);
+                for (w, c) in chunk.hist.iter() {
+                    *cum_hist.entry(*w).or_insert(0) += c;
+                }
+                // 累计行/字数（字节级统计路径，O(1)/行）——状态栏「数字跳动」用。
+                cum_lines += chunk.hist.values().sum::<usize>();
+                cum_chars += chunk.chars;
+                // 整篇（含首块）都在后台攒进 String —— 首块同时推送主线程作即时挂载，
+                // 其余块只进 `full` 不再上主线程逐块 `Rope::insert`（→ 不冻结）。
+                full.push_str(&chunk.text);
+                if !first_sent {
+                    if prod_tx.send(OpenMsg::Chunk(chunk)).await.is_err() {
+                        return; // 消费端已放弃 → 停止读盘
+                    }
+                    first_sent = true;
+                } else {
+                    // 状态栏进度：每块 O(1) 推一次累计行/字（不携内容、不逐块上屏，
+                    // 主线程只 O(1) 更新计数 + notify，不重绘整篇）。
+                    if prod_tx
+                        .send(OpenMsg::Progress {
+                            lines: cum_lines,
+                            chars: cum_chars,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
             Ok(None) => {
@@ -77,8 +137,22 @@ async fn read_chunks_async(
                         t.elapsed().as_millis()
                     );
                 }
+                let t_rope = std::time::Instant::now();
+                let rope = ropey::Rope::from_str(&full);
+                drop(full);
+                if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                    eprintln!(
+                        "[MD_OPEN_DEBUG] 后台 Rope::from_str(整篇) 合计: {} ms",
+                        t_rope.elapsed().as_millis()
+                    );
+                }
                 let _ = prod_tx
-                    .send(OpenMsg::Eof { src_len: reader.total_bytes() })
+                    .send(OpenMsg::Eof {
+                        src_len: reader.total_bytes(),
+                        full: rope,
+                        hist: cum_hist,
+                        max_line_chars: cum_mx,
+                    })
                     .await;
                 prod_tx.close_channel();
                 return;
@@ -103,6 +177,11 @@ struct OpenFailureNotification;
 
 impl EditorApp {
     /// 打开失败：状态栏置为失败，并弹出可点击关闭、5 秒后自动消失的通知。
+    /// 同时**解锁**该路径选项卡的「加载期锁输入」：大文档分块流水线若在首块已挂载、
+    /// EOF 之前读盘出错，`loading_lock` 只在 `finish_file_text` 复位——若失败路径不解锁，
+    /// 选项卡将永久停在「已显示首块但不可编辑/滚动」的锁状态（评审 BLOCK-1）。
+    /// 失败语义 = 保留已读到的部分内容、可继续查看/编辑（与旧同步失败的「不建 tab」
+    /// 不同，这是异步路径的既有取舍）。
     fn report_open_failure(
         &mut self,
         p: &std::path::Path,
@@ -110,6 +189,11 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        for tab in self.tabs.iter_mut() {
+            if tab.file_path.as_deref() == Some(p) {
+                tab.loading_lock = false;
+            }
+        }
         self.status = SharedString::from(format!("打开失败：{e}"));
         self.status_ok = false;
         // 自托管计时移除（而非依赖通知层按窗口激活状态倒计时），保证必然消失。
@@ -240,7 +324,17 @@ impl EditorApp {
         tab.editor.update(cx, |ed, _cx| {
             // O(1) 装配：行宽统计在后台算好（快速挂载时为占位，finish 再补真值），
             // 不再 UI 线程 recompute_max_line（≈350ms）。
-            ed.set_rope_with_stats(prep.rope, prep.max_line_chars, prep.line_width_histogram);
+            // 大文档首块（defer_preview=true）：延后折叠/括号扫描到下一帧后台，
+            // 首屏零同步重扫（首块 6561 行全行扫描 ≈146ms 挪出首帧临界路径）。
+            if defer_preview {
+                ed.set_rope_with_stats_defer(
+                    prep.rope,
+                    prep.max_line_chars,
+                    prep.line_width_histogram,
+                );
+            } else {
+                ed.set_rope_with_stats(prep.rope, prep.max_line_chars, prep.line_width_histogram);
+            }
             if is_md && lines <= EDITOR_WRAP_MAX_LINES {
                 // 自研编辑器尚不支持软换行（占位，API 一致；大文档无 DisplayMap 布局问题）
                 ed.set_soft_wrap(true);
@@ -345,15 +439,17 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 大文档「先瞬时显示、后台补齐」的第二段：后台并行算好行宽统计 + (md)scan_blocks
-    /// 后调用。守卫：选项卡仍存、仍是同一文件、且**打开后未编辑**（已编辑则跳过，让
-    /// 增量同步/编辑自身维护）。应用后 O(1) 修正横向滑动条量程，并给 Markdown 预览装上
-    /// 预建索引（登记增量基底，后续编辑即可走增量扫描）。
+    /// 大文档「先瞬时显示、后台补齐」的收尾段：**P1 起整篇 rope 由生产端在后台建好，
+    /// 此处 `set_rope_with_stats` 一次性换装**（O(1)，替换首块的部分 rope；主线程不再
+    /// 逐块追加，故打开全程不冻结）。守卫：选项卡仍存、仍是同一文件、且**打开后未编辑**
+    /// （已编辑则跳过，让增量同步/编辑自身维护）。换装后 O(1) 修正统计，并给 Markdown
+    /// 预览装上预建索引（登记增量基底，后续编辑即可走增量扫描）。
     #[allow(clippy::too_many_arguments)]
     fn finish_file_text(
         &mut self,
         idx: usize,
         p: &std::path::Path,
+        full: Option<ropey::Rope>,
         max_line_chars: usize,
         line_width_histogram: editor::buffer::LineWidthHistogram,
         md_wy_open: Option<markdown_wysiwyg::WyOpenResult>,
@@ -385,13 +481,32 @@ impl EditorApp {
         if tab.file_path.as_deref() != Some(p) {
             return; // 选项卡已被换成其它文件
         }
-        self.open_finish_count += 1; // 大文档两段式打开：慢段（统计 + 预览索引补齐）
+        self.open_finish_count += 1; // 大文档两段式打开：慢段（整篇换装 + 预览索引补齐）
         if resume_version.is_some_and(|v| tab.edit_version != v) {
-            return; // 打开后已编辑：统计/索引已过期，交给编辑/增量同步链路维护
+            // 打开后已编辑（输入锁下本不应发生，防御）：不换装，保留用户编辑，解锁。
+            tab.loading_lock = false;
+            return;
         }
-        tab.editor.update(cx, |ed, _| {
-            ed.apply_stats(max_line_chars, line_width_histogram);
-        });
+        if let Some(full) = full {
+            // P1 换装：整篇 rope + 统计一次装入（O(1)；取代逐块追加）。换装后行/字计数
+            // 跟着整篇统计走（与 `load_file_text` 同款更新）。
+            // P3：用 `set_rope_with_stats_defer`（延后折叠候选/括号配对扫描）——否则
+            // `resync_list(false)` 在 UI 线程整篇同步重扫折叠候选＋括号配对：≤20 万行的
+            // 中等大文档（如 6.1MB/15.6 万行）恰好触发全量，debug 实测 ~280ms 主线程卡顿
+            // （`大文档测试.txt` 的「会卡」即此）。延后后同帧由打开收尾的
+            // `refresh_fold_brackets` 在后台补齐同一份结果，UI 只留 O(1) 换装。
+            tab.editor.update(cx, |ed, _| {
+                ed.set_rope_with_stats_defer(full, max_line_chars, line_width_histogram);
+            });
+            tab.line_count = tab.editor.read(cx).display_line_count();
+            tab.char_count = tab.editor.read(cx).char_count();
+        } else {
+            // 无整篇（异常兜底）：统计就位（内容已是首块）。
+            tab.editor.update(cx, |ed, _| {
+                ed.apply_stats(max_line_chars, line_width_histogram);
+            });
+        }
+        tab.loading_lock = false; // 整篇就绪：解锁编辑；同帧 status 由消费者置「已打开」。
         // A4 脱离：MD 不再喂 MarkdownPreview / 登记增量基底（预览统一走 md_wy）——
         // 后台预建的 `WyOpenResult` 一次性 `install_open` 装配右栏 WyEditor 预览
         // （UI 线程只做 O(块) 换源重置，不背 Doc::open）。
@@ -466,113 +581,108 @@ impl EditorApp {
                     .spawn(read_chunks_async(prod_tx, prod_p))
                     .detach();
 
-                // ---- 消费者：批级装配（一次 UI 更新尽量多收已缓冲块、逐块追加、批末统一
-                // notify；空时让出调度），再到主线程追加装配 ----
-                let mut cum_mx = 0usize;
-                let mut cum_hist = editor::buffer::LineWidthHistogram::new();
+                // ---- 消费者：首块即位挂载（内容瞬时可见）+ 锁输入；EOF 拿整篇 rope 一次换装。
+                // P1：不再逐块追加（主线程逐块 `Rope::insert` 128MB/312万行 debug ~4.5s 冻结）——整篇
+                // rope 由生产端在后台建好（`Rope::from_str`），本消费端只做首块挂载 + EOF O(1) 换装。
+                let t0_prog = std::time::Instant::now();
+                let mut full: Option<ropey::Rope> = None;
+                let mut full_hist = editor::buffer::LineWidthHistogram::new();
+                let mut full_mx = 0usize;
                 let mut src_len = 0u64;
                 let mut first = true;
                 let mut resume_version: Option<u64> = None;
                 let mut io_err: Option<std::io::Error> = None;
                 let mut aborted = false;
+                // WARN-1 节流门：状态字段每块 O(1) 都更新，但 `notify`（→整窗重绘）每
+                // 4 条进度才触发一次（gpui 还会按帧合并）——128MB 打开期 ~127 条进度把
+                // 重绘从 ~127 次压到 ~32 次，避免无谓帧压力；EOF 换装帧必然 notify，终值不丢。
+                let mut progress_gate = 0usize;
                 let mut rx = rx;
-                // 组批时把通道里非 Chunk 的尾巴（Eof/Err）暂存到下一篇处理（`try_next`
-                // 会把它取出，不能放回通道）。
-                let mut pending_msg: Option<OpenMsg> = None;
                 'consume: loop {
-                    let msg = match pending_msg.take() {
+                    let msg = match rx.next().await {
                         Some(m) => m,
-                        None => match rx.next().await {
-                            Some(m) => m,
-                            None => break 'consume,
-                        },
+                        None => break 'consume,
                     };
-                    let OpenMsg::Chunk(first_chunk) = msg else {
-                        match msg {
-                            OpenMsg::Eof { src_len: s } => {
-                                src_len = s;
-                                break 'consume;
-                            }
-                            OpenMsg::Err(e) => {
-                                io_err = Some(e);
-                                break 'consume;
-                            }
-                            OpenMsg::Chunk(_) => unreachable!(), // 上面 let-else 已排除
+                    match msg {
+                        OpenMsg::Err(e) => {
+                            io_err = Some(e);
+                            break 'consume;
                         }
-                    };
-                    // —— 收齐通道已缓冲的块入批（通道容量 4；Eof/Err 暂存下一篇按序处理）——
-                    let mut batch: Vec<TextChunk> = vec![first_chunk];
-                    while let Ok(m) = rx.try_recv() {
-                        match m {
-                            OpenMsg::Chunk(c) => batch.push(c),
-                            other => {
-                                pending_msg = Some(other);
-                                break;
-                            }
-                        }
-                    }
-                    // —— 批内累计精确统计（每块自身携带精确 hist/max_line_chars；finish 复位用）——
-                    #[cfg(test)]
-                    PROGRESSIVE_OPEN_CHUNKS
-                        .fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed);
-                    for chunk in &batch {
-                        cum_mx = cum_mx.max(chunk.max_line_chars);
-                        for (w, c) in chunk.hist.iter() {
-                            *cum_hist.entry(*w).or_insert(0) += c;
-                        }
-                    }
-                    // —— 一次 UI 更新内依次挂载/追加（各自不 notify），批末统一一次 notify：
-                    // 每块不再触发整窗重绘（P1b；配合 P1a 高亮门控，打开期整窗重绘/重解析
-                    // 从 ~块数 降到 ~批数）——保留首块挂载、Stale 中止、resume_version 语义。
-                    let is_first = first;
-                    let p_ch = p.clone();
-                    let res = cx
-                        .update_window_entity(&entity, move |this, window, cx| {
-                            let mut out = (None, false, false); // (Mounted版本, 是否挂过载, 是否中止)
-                            for (i, chunk) in batch.into_iter().enumerate() {
-                                let r = this.apply_open_chunk(
-                                    idx,
-                                    &p_ch,
-                                    chunk,
-                                    is_first && i == 0,
-                                    window,
-                                    cx,
-                                );
-                                match r {
-                                    ChunkApply::Mounted(v) => {
-                                        if out.0.is_none() {
-                                            out.0 = Some(v);
-                                        }
-                                        out.1 = true;
-                                    }
-                                    ChunkApply::Appended => {}
-                                    ChunkApply::Stale => {
-                                        out.2 = true;
-                                        break;
-                                    }
+                        OpenMsg::Progress { lines, chars } => {
+                            // P2 状态栏「数字跳动」：O(1) 更新累计行/字（不逐块上屏）。
+                            // WARN-1：notify 按 `progress_gate` 节流（每 4 条一跳）。
+                            // tab 换成别的文件/已关 → 跳过。
+                            let p_prg = p.clone();
+                            let do_notify = progress_gate % 4 == 0;
+                            progress_gate += 1;
+                            let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
+                                if let Some(tab) = this.tabs.get_mut(idx).filter(|t| {
+                                    t.file_path.as_deref() == Some(p_prg.as_path())
+                                }) {
+                                    tab.line_count = lines;
+                                    tab.char_count = chars;
+                                }
+                                if do_notify {
+                                    cx.notify();
+                                }
+                            });
+                            #[cfg(test)]
+                            {
+                                PROGRESSIVE_OPEN_TICKS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if do_notify {
+                                    PROGRESSIVE_OPEN_NOTIFIES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
-                            #[cfg(test)]
-                            PROGRESSIVE_OPEN_NOTIFIES
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            cx.notify(); // 批末统一一次通知（本批块不逐块重绘）
-                            out
-                        });
-                    match res {
-                        Ok((Some(v), _, false)) => {
-                            if resume_version.is_none() {
-                                resume_version = Some(v);
-                            }
-                            first = false;
                         }
-                        Ok((_, mounted, false)) => {
-                            if mounted {
-                                first = false;
-                            }
-                        }
-                        Ok((_, _, true)) | Err(_) => {
-                            aborted = true; // 选项卡已关 / 下标被换成其它文件
+                        OpenMsg::Eof {
+                            src_len: s,
+                            full: r,
+                            hist,
+                            max_line_chars,
+                        } => {
+                            src_len = s;
+                            full = Some(r);
+                            full_hist = hist;
+                            full_mx = max_line_chars;
                             break 'consume;
+                        }
+                        OpenMsg::Chunk(chunk) => {
+                            if first {
+                                let p_ch = p.clone();
+                                let r = cx.update_window_entity(
+                                    &entity,
+                                    move |this, window, cx| {
+                                        this.apply_open_chunk(idx, &p_ch, chunk, true, window, cx)
+                                    },
+                                );
+                                match r {
+                                    Ok(ChunkApply::Mounted(v)) => {
+                                        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                                            eprintln!(
+                                                "[MD_OPEN_DEBUG] 首块已挂载（内容可显示）@ {:.1} ms",
+                                                t0_prog.elapsed().as_secs_f64() * 1000.0
+                                            );
+                                        }
+                                        #[cfg(test)]
+                                        {
+                                            PROGRESSIVE_OPEN_CHUNKS
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            PROGRESSIVE_OPEN_NOTIFIES
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        resume_version = Some(v);
+                                        first = false;
+                                    }
+                                    Ok(ChunkApply::Stale) => {
+                                        aborted = true;
+                                        break 'consume;
+                                    }
+                                    Ok(ChunkApply::Appended) | Err(_) => {}
+                                }
+                            }
+                            // 防御：P1 起不再有后续块；有则忽略（整篇在后台，EOF 一次换装）。
                         }
                     }
                 }
@@ -617,16 +727,9 @@ impl EditorApp {
                 let md_wy_open = if early_live {
                     None
                 } else if is_md {
-                    let p_snap = p.clone();
-                    let snap = cx
-                        .update_window_entity(&entity, move |this, _w, cx| {
-                            this.tabs
-                                .get(idx)
-                                .filter(|t| t.file_path.as_deref() == Some(p_snap.as_path()))
-                                .map(|t| t.editor.read(cx).rope().clone())
-                        })
-                        .ok()
-                        .flatten();
+                    // P1：整篇 rope 由生产端在后台建好（`full`），直接快照它（O(1) COW），
+                    // 不再快照编辑区的首块部分 rope。
+                    let snap = full.clone();
                     let Some(snap) = snap else { return };
                     let t_wy = std::time::Instant::now();
                     let wy_open = cx
@@ -646,15 +749,16 @@ impl EditorApp {
                 } else {
                     None
                 };
-                // 最终：装算统计/预览装配 + 恢复「已打开」状态。
-                let hist_lines = cum_hist.values().sum::<usize>();
+                // 最终：整篇换装（O(1)）+ 预览装配 + 恢复「已打开」状态。
+                let hist_lines = full_hist.values().sum::<usize>();
                 let p_fin = p.clone();
                 let _ = cx.update_window_entity(&entity, move |this, window, cx| {
                     this.finish_file_text(
                         idx,
                         &p_fin,
-                        cum_mx,
-                        cum_hist,
+                        full.take(),
+                        full_mx,
+                        full_hist,
                         md_wy_open,
                         resume_version,
                         cx,
@@ -680,13 +784,17 @@ impl EditorApp {
                         });
                         this.status_ok = true;
                     }
-                    // 折叠候选 / 括号标尺：末块落定后**后台**重扫一次（打开全程不再每块
+                    // 折叠候选 / 括号标尺：整篇换装后**后台**重扫一次（打开全程不再每块
                     // 整篇重扫 → 打开 160k 行文档从 ~2s UI 卡顿降到毫秒级装配）。
                     if let Some(tab) = this.tabs.get_mut(idx).filter(|t| t.file_path.as_deref() == Some(p_fin.as_path())) {
                         tab.editor.update(cx, |ed, cx| {
                             ed.refresh_fold_brackets(cx);
                         });
                     }
+                    #[cfg(test)]
+                    PROGRESSIVE_OPEN_NOTIFIES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    cx.notify(); // 换装 + 解锁同帧重绘
                 });
                 if std::env::var_os("MD_OPEN_DEBUG").is_some() {
                     eprintln!(
@@ -698,13 +806,15 @@ impl EditorApp {
             .detach();
     }
 
-    /// 把后台读到的第 `first` 块（首块）挂上 / 后续块追到编辑器末尾。
+    /// 把后台读到的第 `first` 块（首块）挂上 / 后续块防御忽略。
     ///
     /// - 首块：走 [`Self::load_file_text`](defer=true) 快速挂载（`open_fast_count` +1、
-    ///   `editor_pending`=false → **几十 KB 即出内容**），并返回打开瞬间的编辑版本号
-    ///   作为收尾的「未编辑」守卫；
-    /// - 后续块：`CodeEditor::append_mounted_chunk` O(块大小) 追加（滚动/撤销保留），
-    ///   行/字缓存与横向量程随块精确补齐。
+    ///   `editor_pending`=false → **几十 KB 即出内容**），并设 `loading_lock`（长文档
+    ///   整篇仍在后台装配：挂载期锁输入 + 透明拦截，避免「打开期间编辑」与换装竞态）；
+    ///   返回打开瞬间的编辑版本号作为收尾的「未编辑」守卫；
+    /// - P1 起生产端**只发首块**（整篇在后台一次建好、EOF 换装）——非首块分支仅留防御：
+    ///   万一收到额外块直接忽略，**绝不在主线程逐块 `Rope::insert`**（实测 128MB/312万行
+    ///   debug 每 1MB ~35ms → 4.5s 冻结）。
     fn apply_open_chunk(
         &mut self,
         idx: usize,
@@ -716,7 +826,7 @@ impl EditorApp {
     ) -> ChunkApply {
         if first {
             // 复用既有选项卡重开文件：file_path 此刻仍是旧文件，不拦截（首块即替换内容）。
-            let TextChunk { text, hist, max_line_chars } = chunk;
+            let TextChunk { text, hist, max_line_chars, .. } = chunk;
             let rope = Rope::from(text.as_str());
             let lines = prep_first_lines_hint(&text);
             let chars = text.chars().count();
@@ -739,8 +849,9 @@ impl EditorApp {
                 let full_seq = self.md_wy_spawn_early_install(idx, p.to_path_buf(), cx);
                 self.md_wy_spawn_prefix_install(idx, prefix, full_seq, cx);
             }
-            // 首块后内容已可见，但整篇仍在读盘 → 保持「正在打开」，读完置最终态。
-            if let Some(tab) = self.tabs.get(idx) {
+            // 首块后内容已可见，但整篇仍在读盘 → 保持「正在打开」；锁输入防编辑竞态。
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                tab.loading_lock = true;
                 self.status = SharedString::from(format!("正在打开大文档：{}…", p.display()));
                 self.status_ok = true;
                 return ChunkApply::Mounted(tab.edit_version);
@@ -753,19 +864,7 @@ impl EditorApp {
         if tab.file_path.as_deref() != Some(p) {
             return ChunkApply::Stale; // 该下标已被换成其它文件
         }
-        self.search_scan = None; // 内容被追加 → 搜索缓存失效
-        let TextChunk { text, hist, max_line_chars } = chunk;
-        tab.editor.update(cx, |ed, _| {
-            ed.append_mounted_chunk(&text, max_line_chars, hist);
-        });
-        let (lc, cc) = {
-            let st = tab.editor.read(cx);
-            (st.display_line_count(), st.char_count())
-        };
-        tab.line_count = lc;
-        tab.char_count = cc;
-        // 不在此 notify：P1b 批级装配在 `spawn_progressive_open` 批末统一 notify 一次
-        // （每块整窗重绘 → 每批一次），首块挂载自有 `load_file_text` 的 notify。
+        // P1 防御：不应再有后续块；有则忽略（整篇在后台，EOF 一次换装）。
         ChunkApply::Appended
     }
 

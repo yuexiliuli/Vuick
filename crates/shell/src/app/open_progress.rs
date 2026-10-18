@@ -24,7 +24,8 @@ use std::io::{self, Read};
 use config::limits::{
     OPEN_CHUNK_TARGET_BYTES, OPEN_FIRST_CHUNK_BYTES, READ_BUF_BYTES,
 };
-use editor::buffer::{LineWidthHistogram, char_width_units};
+use editor::buffer::LineWidthHistogram;
+use memchr::memchr2;
 
 /// 一块已归一化（LF）文本增量：`text` 只含完整行（除文件末尾可能不含换行的最后一行
 /// 外，均以 `\n` 结尾），`hist` / `max_line_chars` 是这些完整行的精确行宽统计。
@@ -35,6 +36,11 @@ pub(crate) struct TextChunk {
     pub hist: LineWidthHistogram,
     /// 本块完整行的最长行字符数（Unicode 标量）。
     pub max_line_chars: usize,
+    /// 本块文本的精确字符数（Unicode 标量）：与 `text.chars().count()` 同值，但由
+    /// **字节级统计路径** O(1) 累积（`finish_line` 把该行 `suffix_chars` 并入），
+    /// 不在消费端/后台另做整篇 `chars()` 重扫——大文档状态栏「数字跳动」的累计
+    /// 字符进度用它（行数进度 = `hist.values().sum()`，块内隐式携带）。
+    pub chars: usize,
 }
 
 /// 分块读盘器：一次取一块（[`Self::next_chunk`]），内部跨块维护 UTF-8 残留、
@@ -152,6 +158,7 @@ impl ChunkReader {
                 text: std::mem::take(&mut self.s.out),
                 hist: std::mem::take(&mut self.s.out_hist),
                 max_line_chars: std::mem::take(&mut self.s.out_mx_chars),
+                chars: std::mem::take(&mut self.s.out_chars),
             });
         }
         if !self.s.suffix.is_empty() {
@@ -163,13 +170,67 @@ impl ChunkReader {
                 text: std::mem::take(&mut self.s.suffix),
                 hist,
                 max_line_chars: self.s.suffix_chars,
+                chars: self.s.suffix_chars,
             });
         }
         Ok(())
     }
 }
 
+/// 统计一段（ASCII 分隔符之间的）行内容的宽度单位与字符数——**字节级快路径**：
+/// ASCII 单步、多字节按首字节长度整跳（输入是已校验的合法 UTF-8）。与旧逐字符
+/// `char_width_units`（Tab=4 / ASCII=1 / 其它=2）完全同值，debug 下约一个数量级更快
+/// （大文档生产端主要耗时点：128MB 逐 `chars()` 迭代 ≈ 8.5s → 本路径 ≈ 1s 内）。
+#[inline]
+fn line_byte_stats(bytes: &[u8]) -> (usize, usize) {
+    let mut units = 0usize;
+    let mut chars = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c < 0x80 {
+            units += if c == b'\t' { 4 } else { 1 };
+            chars += 1;
+            i += 1;
+        } else {
+            units += 2;
+            chars += 1;
+            i += if c >= 0xF0 {
+                4
+            } else if c >= 0xE0 {
+                3
+            } else {
+                2
+            };
+        }
+    }
+    (units, chars)
+}
+
+/// 块大小达到目标即整块发出（`TextChunk` 只含完整行、均以 `\n` 结尾——非末块绝不劈行）。
+/// 与旧实现的「每条完整行落定后检查」语义一致（`out` 只在 `finish_line` 时增长）。
+fn maybe_ship(s: &mut ChunkBuilder, first: &mut bool, pending: &mut VecDeque<TextChunk>) {
+    let target = if *first {
+        OPEN_FIRST_CHUNK_BYTES
+    } else {
+        OPEN_CHUNK_TARGET_BYTES
+    };
+    if s.out.len() >= target {
+        pending.push_back(TextChunk {
+            text: std::mem::take(&mut s.out),
+            hist: std::mem::take(&mut s.out_hist),
+            max_line_chars: std::mem::take(&mut s.out_mx_chars),
+            chars: std::mem::take(&mut s.out_chars),
+        });
+        *first = false;
+    }
+}
+
 /// 把一批（UTF-8 合法、可跨 `\r` 状态的）文本灌入分块器；产出的块追加进 `pending`。
+///
+/// **字节级快路径**（替代旧版逐字符 `chars()` 的 5–10×）：`memchr2` 找 `\r`/`\n` 分隔符，
+/// 行内容整段 `push_str` + [`line_byte_stats`] 一次计宽计字数。跨块状态（`\r` 残留、
+/// 未结束行 `suffix`）与旧实现逐位一致——换行归一化/行不劈块/直方图语义零变化。
 fn feed(
     pending_cr: &mut bool,
     s: &mut ChunkBuilder,
@@ -177,36 +238,43 @@ fn feed(
     first: &mut bool,
     pending: &mut VecDeque<TextChunk>,
 ) {
-    for ch in text.chars() {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
         if *pending_cr {
             *pending_cr = false;
-            if ch != '\n' {
-                // 孤立 `\r`：先结束当前行，再照常处理 ch。
+            if bytes[i] == b'\n' {
+                // CRLF：\r 由上一轮置位，\n 结束当前行（suffix 里是该行内容）。
                 s.finish_line();
+                i += 1;
+                maybe_ship(s, first, pending);
+                continue;
             }
-            // ch == '\n'：CRLF → 归为一个换行（由下面 '\n' 分支结束当前行）。
+            // 孤立 `\r`：先结束当前行，再照常处理当前字节。
+            s.finish_line();
         }
-        match ch {
-            '\r' => *pending_cr = true,
-            '\n' => s.finish_line(),
+        match bytes[i] {
+            b'\r' => {
+                *pending_cr = true;
+                i += 1;
+            }
+            b'\n' => {
+                s.finish_line();
+                i += 1;
+                maybe_ship(s, first, pending);
+            }
             _ => {
-                s.suffix.push(ch);
-                s.suffix_units += char_width_units(ch);
-                s.suffix_chars += 1;
+                // 行内容：扫到下一个 `\r`/`\n`（或块尾），整段处理一次。
+                let start = i;
+                let rest = &bytes[i..];
+                let end = i + memchr2(b'\n', b'\r', rest).unwrap_or(rest.len());
+                let part = &text[start..end];
+                let (units, chars) = line_byte_stats(part.as_bytes());
+                s.suffix.push_str(part);
+                s.suffix_units += units;
+                s.suffix_chars += chars;
+                i = end;
             }
-        }
-        let target = if *first {
-            OPEN_FIRST_CHUNK_BYTES
-        } else {
-            OPEN_CHUNK_TARGET_BYTES
-        };
-        if s.out.len() >= target {
-            pending.push_back(TextChunk {
-                text: std::mem::take(&mut s.out),
-                hist: std::mem::take(&mut s.out_hist),
-                max_line_chars: std::mem::take(&mut s.out_mx_chars),
-            });
-            *first = false;
         }
     }
 }
@@ -220,6 +288,9 @@ struct ChunkBuilder {
     out_hist: LineWidthHistogram,
     /// `out` 中这些行的最长行字符数。
     out_mx_chars: usize,
+    /// `out` 中这些行的精确字符数（Unicode 标量；随 [`Self::finish_line`] 累积，
+    /// 供 [`TextChunk::chars`] 状态栏进度用，O(1) 不重扫）。
+    out_chars: usize,
     /// 当前**未结束**行（不随块发出：换行绝不跨块劈开）。
     suffix: String,
     suffix_units: usize,
@@ -235,6 +306,10 @@ impl ChunkBuilder {
         *self.out_hist.entry(self.suffix_units).or_insert(0) += 1;
         self.out.push_str(&self.suffix);
         self.out.push('\n');
+        // 字符数含行终止 `\n`（+1）：整块 `out_chars` 才与 `out.chars().count()` 精确同值，
+        // 也才能与换装后的 `Rope::len_chars()`（全文含换行）口径一致——状态栏「数字跳动」
+        // 的最后一步不会因「进度只算行内容、终值含换行」而出现 +N 行的末跳（评审 WARN-2）。
+        self.out_chars += self.suffix_chars + 1;
         self.suffix.clear();
         self.suffix_units = 0;
         self.suffix_chars = 0;
@@ -261,6 +336,73 @@ mod tests {
     use super::*;
     use editor::buffer::{compute_line_stats, LineWidthHistogram};
     use ropey::Rope;
+
+    /// 诊断（`#[ignore]`，需显式跑）：消费端逐块追加（`rope.insert(末尾)`）在主线程的真实
+    /// 成本——只测带统计合并前最核心的 rope 追加（P1 前实测 128MB/312万行 debug 下每 1MB
+    /// ~35ms、累计 4.5s → 主线程冻结元凶；P1 已改为后台一次建 rope + EOF O(1) 换装）。
+    #[test]
+    #[ignore]
+    fn temp_consumer_append_cost() {
+        let line = "x".repeat(79);
+        let mut chunk = String::with_capacity(1_048_600);
+        while chunk.len() < 1_048_576 {
+            chunk.push_str(&line);
+            chunk.push('\n');
+        }
+        let mut rope = ropey::Rope::new();
+        let t = std::time::Instant::now();
+        let mut ms_total = 0.0;
+        for i in 0..128 {
+            let t1 = std::time::Instant::now();
+            rope.insert(rope.len(), &chunk);
+            ms_total += t1.elapsed().as_secs_f64() * 1000.0;
+            if i % 16 == 15 {
+                eprintln!(
+                    "  累计 {}{} B / {:.1} ms（本批 {:.1} ms）",
+                    (i + 1) * 1_048_576 / 1024 / 1024,
+                    "MB",
+                    ms_total,
+                    t1.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+        eprintln!(
+            "128×1MB rope末尾insert 累计: {:.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    /// 基准：生产端 `ChunkReader` 真实全流程（真实线程/磁盘：读→UTF-8 校验→CRLF 归一→
+    /// 逐块行宽统计）的**纯 CPU 墙钟**——不经过 fake 调度器的通道背压停摆，用于对比
+    /// 「读盘+归一+统计」合计与原始字节数（debug ≈ release × 10，看相对变化）。
+    /// 运行：`cargo test --release -p shell bench_progressive_producer_real -- \
+    ///        --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_progressive_producer_real() {
+        let path = std::env::var("BENCH_OPEN_FILE").unwrap_or_else(|_| {
+            r"E:\Rust\gpui-editor\target\大文档测试126MB.txt".to_string()
+        });
+        if !std::path::Path::new(&path).is_file() {
+            eprintln!("SKIP: missing {path}");
+            return;
+        }
+        let file_mb = std::fs::metadata(&path).map(|m| m.len() / 1024 / 1024).unwrap_or(0);
+        let t0 = std::time::Instant::now();
+        let mut reader = ChunkReader::open(std::path::Path::new(&path)).unwrap();
+        let mut n = 0usize;
+        let mut bytes = 0usize;
+        while let Some(c) = reader.next_chunk().unwrap() {
+            n += 1;
+            bytes += c.text.len();
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "==== 生产端 ChunkReader 基准：{file_mb} MB / {n} 块 / {bytes} B 归一文本 ===="
+        );
+        println!("  真实线程全流程: {secs:.2} s（{:.0} MB/s 归一输出）", bytes as f64 / 1e6 / secs);
+    }
+
 
     fn collect(path: &std::path::Path, read_buf: usize) -> (String, LineWidthHistogram, usize) {
         let mut text = String::new();

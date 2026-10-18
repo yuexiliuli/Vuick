@@ -585,7 +585,7 @@ impl CodeEditor {
         #[cfg(test)]
         CODE_EDITOR_FULL_RESET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.buffer = Buffer::new(text);
-        self.reset_document();
+        self.reset_document(false);
     }
 
     /// 与 [`Self::set_text`] 相同，但**连 Rope 与行宽统计都复用调用方（后台）算好的
@@ -600,7 +600,24 @@ impl CodeEditor {
         #[cfg(test)]
         CODE_EDITOR_FULL_RESET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.buffer = Buffer::from_parts(text, max_line_chars, line_width_histogram);
-        self.reset_document();
+        self.reset_document(false);
+    }
+
+    /// 同 [`Self::set_rope_with_stats`]，但**延后折叠候选/括号配对扫描**：`defer_scans=true`
+    /// 时首屏零同步重扫（`resync_list(true)` 置 `scan_dirty_edit`，折叠数据交给下一帧后台
+    /// `refresh_fold_brackets` 补齐）——大文档渐进打开**首块挂载**即用此路径，把
+    /// [*首屏即就绪*] 的同步全行扫描（首块 6561 行也 ~146ms）挪出首帧临界路径；文档
+    /// 后续块持续追加、折叠扫描本就该整篇收尾后一次做。
+    pub fn set_rope_with_stats_defer(
+        &mut self,
+        text: Rope,
+        max_line_chars: usize,
+        line_width_histogram: crate::editor::buffer::LineWidthHistogram,
+    ) {
+        #[cfg(test)]
+        CODE_EDITOR_FULL_RESET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.buffer = Buffer::from_parts(text, max_line_chars, line_width_histogram);
+        self.reset_document(true);
     }
 
     /// 大文档「先瞬时显示、后台补齐统计」用：全文已经由 [`Self::set_rope_with_stats`]
@@ -633,7 +650,10 @@ impl CodeEditor {
     }
 
     /// 整篇替换文档后的通用复位（撤销/选区/横向滚动/标记清空 + 列表行数同步）。
-    fn reset_document(&mut self) {
+    /// `defer_scans` 透传给 [`Self::resync_list`]：`false` = 同步重扫折叠候选/括号配对
+    /// （内容全新、首屏即就绪，测试依赖）；`true` = 延到下一帧后台刷新（打开大文档
+    /// 首块挂载走 [`Self::set_rope_with_stats_defer`]，首屏零同步重扫）。
+    fn reset_document(&mut self, defer_scans: bool) {
         self.undo.clear();
         self.selection = Selection::collapsed(0);
         // 整篇替换 = 文档在光标下被换掉：任何进行中的鼠标拖选都失去意义，一并取消。
@@ -661,7 +681,7 @@ impl CodeEditor {
         self.desired_scroll.set(0.);
         // 整篇替换：折叠视图投影一并清空（文本结构已变）。
         self.folds.clear();
-        self.resync_list(false);
+        self.resync_list(defer_scans);
     }
 
     /// 在选区处输入文本（等同连续打字：合并撤销、走同一编辑主链）。

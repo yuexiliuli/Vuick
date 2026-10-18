@@ -50,6 +50,11 @@ impl EditorApp {
             cx.notify();
             return self.render_editor_pending(grow);
         }
+        // P1 大文档整篇仍在后台装配：编辑区已有首块内容但**锁输入**（全区域透明拦截，
+        // 防「打开期间编辑」与 EOF 整篇换装竞态）；`finish_file_text` 换装后同帧解锁。
+        if self.tabs[self.active_tab].loading_lock {
+            return self.render_plain_editor(grow, true, cx);
+        }
         // 所见即所得预览编辑（WYSIWYG）模式：左面板 = 本项目 `WyEditor`
         // （AUTO-GROW，内部无滚动条，宿主负责滚动 + 自绘纵向滚动条）。
         if let Some(ed) = self.tabs[self.active_tab].live2.clone() {
