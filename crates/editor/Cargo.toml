@@ -2,6 +2,7 @@
 name = "editor"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "gpui-editor 自研文本/代码编辑器 crate（CodeEditor：buffer/fold/highlight/movement/selection/undo/rope_ext/markdown 装饰）"
 
 [dependencies]

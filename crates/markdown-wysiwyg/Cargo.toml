@@ -2,6 +2,7 @@
 name = "markdown-wysiwyg"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "gpui-editor 自研 WYSIWYG 所见即所得编辑 crate（自 crates/markdown 的 wysiwyg 拆分独立，依赖 markdown 的 parse/doc/ir/view 共享层）"
 
 [dependencies]

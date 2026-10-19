@@ -1886,7 +1886,11 @@ impl Window {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
-                                #[cfg(feature = "profiler")]
+// [gpui-editor fork] Modified from upstream zed
+// (https://github.com/zed-industries/zed, rev 93d7456). See vendor/zed/README.md
+// for the per-crate change list. License: Apache-2.0 (see vendor/zed/LICENSE-APACHE).
+
+#[cfg(feature = "profiler")]
                                 window
                                     .window_profiler
                                     .record_frame_signal(request_frame_options.signal_at);

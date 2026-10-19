@@ -2,6 +2,7 @@
 name = "viewer"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "gpui-editor 查看器共享组件 crate（pan_zoom 缩放/平移 controller + folder 兄弟文件导航）"
 
 [dependencies]

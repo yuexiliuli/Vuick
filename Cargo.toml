@@ -1,6 +1,7 @@
 [package]
 name = "gpui-editor"
 version = "0.1.0"
+license = "Apache-2.0"
 description = "基于 GPUI 的文本 / 代码 / Markdown 编辑器"
 # 2024：随 zorite 移植的 WYSIWYG 编辑器（src/markdown/live）使用 edition-2024 的 let-chain。
 edition = "2024"
@@ -56,9 +57,10 @@ default-members = [".", "crates/video-ffmpeg"]
 # 各成员 crate 用 `x.workspace = true` 引用；升级/换版本只在此处改一处。
 # ---------------------------------------------------------------------------
 
-[workspace.package]
-publish = false
-edition = "2024"
+  [workspace.package]
+  publish = false
+  edition = "2024"
+  license = "Apache-2.0"
 
 [workspace.lints.rust]
 unexpected_cfgs = "allow"

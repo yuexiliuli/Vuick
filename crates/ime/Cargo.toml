@@ -2,6 +2,7 @@
 name = "ime"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "gpui-editor 共享 IME 状态机核心 crate（byte 语义，ImeTextHost / replace / unmark 等）"
 
 [dependencies]

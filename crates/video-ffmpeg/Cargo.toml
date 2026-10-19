@@ -2,6 +2,7 @@
 name = "video-ffmpeg"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 publish = false
 description = "FFmpeg 视频/音频解码内核（cdylib），供 gpui-editor 主程序运行时经 libloading 动态加载"
 

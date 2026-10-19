@@ -2,6 +2,7 @@
 name = "config"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "gpui-editor 的集中配置常量 crate（geometry / performance / timing / user prefs）"
 
 [dependencies]

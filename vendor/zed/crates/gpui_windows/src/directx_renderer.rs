@@ -2159,7 +2159,11 @@ pub(crate) mod shader_resources {
 }
 
 mod nvidia {
-    use std::{
+// [gpui-editor fork] Modified from upstream zed
+// (https://github.com/zed-industries/zed, rev 93d7456). See vendor/zed/README.md
+// for the per-crate change list. License: Apache-2.0 (see vendor/zed/LICENSE-APACHE).
+
+use std::{
         ffi::CStr,
         os::raw::{c_char, c_int, c_uint},
     };

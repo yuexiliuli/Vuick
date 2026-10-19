@@ -2,6 +2,7 @@
 name = "video"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "gpui-editor 视频查看器 crate（FFmpeg 经 libloading 运行时加载 + 帧钟播放 + 音频输出）"
 
 [dependencies]

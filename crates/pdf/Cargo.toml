@@ -2,6 +2,7 @@
 name = "pdf"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "gpui-editor PDF 阅读器 crate（pdfium 栅格化 + 瓦片虚拟化）"
 build = "build.rs"
 
