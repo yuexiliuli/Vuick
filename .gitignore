@@ -4,7 +4,7 @@ target/
 assets/
 kilo.json
 records/
-resources/
+/resources/
 docs/
 
 # exe 打包 dll目录
