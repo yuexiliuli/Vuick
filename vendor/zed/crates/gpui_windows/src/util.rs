@@ -209,9 +209,9 @@ pub fn yuv_nv12_to_bgra(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     let y_ = y - 16.0;
     let cb = u - 128.0;
     let cr = v - 128.0;
-    let r = 1.164 * y_ + 1.596 * cr;
-    let g = 1.164 * y_ - 0.391 * cr - 0.813 * cb;
-    let b = 1.164 * y_ + 2.018 * cb;
+    let r = 1.164 * y_ + 1.793 * cr;
+    let g = 1.164 * y_ - 0.213 * cb - 0.533 * cr;
+    let b = 1.164 * y_ + 2.112 * cb;
     (clamp_channel(b), clamp_channel(g), clamp_channel(r))
 }
 
@@ -234,9 +234,28 @@ mod tests {
         assert_eq!(yuv_nv12_to_bgra(16, 128, 128), (0, 0, 0));
         // 白：Y=235、U=V=128 → RGB 全 255
         assert_eq!(yuv_nv12_to_bgra(235, 128, 128), (255, 255, 255));
-        // 红（BT.709 红色条 Y=81、U=90、V=240）→ (B, G, R) ≈ (0, 63, 254)
-        assert_eq!(yuv_nv12_to_bgra(81, 90, 240), (0, 63, 254));
-        // 蓝（Y=41、U=240、V=110）→ (B, G, R) = (255, 0, 0)
-        assert_eq!(yuv_nv12_to_bgra(41, 240, 110), (255, 0, 0));
+        // 红（BT.709 红色条 Y=81、U=90、V=240）→ (B, G, R) ≈ (0, 24, 255)
+        assert_eq!(yuv_nv12_to_bgra(81, 90, 240), (0, 24, 255));
+        // 蓝（Y=41、U=240、V=110）→ (B, G, R) = (255, 15, 0)
+        assert_eq!(yuv_nv12_to_bgra(41, 240, 110), (255, 15, 0));
+    }
+
+    /// 锁定 GPU 像素着色器（`external_yuv_fragment`）与 CPU 参考实现
+    /// （`yuv_nv12_to_bgra`）使用**同一组 BT.709 有限范围**系数：此前绿行系数互换 +
+    /// 601/709 混用，导致 GPU 直通视频偏黄（红色条被注入 +39/255 绿色）。系数漂移本节红。
+    #[test]
+    fn test_shader_yuv_matrix_matches_cpu_reference() {
+        let hlsl = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shaders.hlsl"))
+            .expect("读取 shaders.hlsl");
+        for needle in [
+            "1.164 * y_ + 1.793 * cr",
+            "1.164 * y_ - 0.213 * cb - 0.533 * cr",
+            "1.164 * y_ + 2.112 * cb",
+        ] {
+            assert!(
+                hlsl.contains(needle),
+                "shaders.hlsl 缺少 BT.709 系数: {needle}（GPU 直通会偏黄）"
+            );
+        }
     }
 }

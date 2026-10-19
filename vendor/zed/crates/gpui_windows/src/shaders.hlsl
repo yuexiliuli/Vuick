@@ -1335,9 +1335,9 @@ float4 external_yuv_fragment(ExternalYuvSpriteFragmentInput input): SV_Target {
     float y_ = Y - 16.0 / 255.0;
     float cb = uv.x - 128.0 / 255.0; // U
     float cr = uv.y - 128.0 / 255.0; // V
-    float r = 1.164 * y_ + 1.596 * cr;
-    float g = 1.164 * y_ - 0.391 * cr - 0.813 * cb;
-    float b = 1.164 * y_ + 2.018 * cb;
+    float r = 1.164 * y_ + 1.793 * cr;
+    float g = 1.164 * y_ - 0.213 * cb - 0.533 * cr;
+    float b = 1.164 * y_ + 2.112 * cb;
 
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
     float4 color = float4(r, g, b, 1.0);
