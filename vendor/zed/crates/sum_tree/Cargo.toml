@@ -17,12 +17,7 @@ doctest = false
 [dependencies]
 heapless.workspace = true
 rayon.workspace = true
-ztracing.workspace = true
-tracing.workspace = true
 proptest = { workspace = true, optional = true }
-
-[package.metadata.cargo-shear]
-ignored = ["tracing"]
 
 [features]
 test-support = ["proptest"]

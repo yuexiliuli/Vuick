@@ -9,7 +9,7 @@
 - 上游 rev：`93d7456`（git checkout 对应 `~/.cargo/git/checkouts/zed-a70e2ad075855582/93d7456`）
 - 拷贝范围：`crates/` 下本项目需要的 Windows 子集（gpui / gpui_windows / gpui_platform / gpui_macros /
   gpui_shared_string / gpui_util / collections / scheduler / sum_tree / refineable(+derive_refineable) /
-  http_client / ztracing / ztracing_macro）。
+  http_client）。
 - fork 动机：GPU 直通（YUV 着色器 / D3D11 设备暴露 / 外部纹理）需改 `gpui`/`gpui_windows`，改为仓内 fork 可随意改。
 
 ## 相对上游的改动（按 crate）
@@ -21,7 +21,10 @@
 | gpui | `src/scene.rs`、`src/window.rs`、`resources/windows/gpui.rc`、`Cargo.toml` | GPU 直通 / YUV 着色器相关宿主改动 + Windows 资源清单调整 + 依赖裁剪 |
 | gpui_windows | `src/directx_renderer.rs`、`src/gpui_windows.rs`、`src/platform.rs`、`src/util.rs`、`src/shaders.hlsl`、`build.rs`、`Cargo.toml` | D3D11 硬件设备暴露、外部纹理、着色器增强（外部解除锁，786 行增量） |
 | gpui_platform | `src/gpui_platform.rs`、`Cargo.toml` | 平台 trait 再导出整理 + 依赖裁剪 |
-| 其余 11 crate | `Cargo.toml` | 依赖/feature 裁剪与 workspace 对齐（无逻辑改动） |
+| 其余 9 crate | `Cargo.toml` | 依赖/feature 裁剪与 workspace 对齐（无逻辑改动） |
+
+> 2026-10-19：`ztracing` / `ztracing_macro` 已移除。二者仅是默认空转的 tracing 封装（无操作宏
+> `#[instrument]` 恒等透传），唯一使用者 `sum_tree` 已同步移除探针属性与依赖，运行行为零变化。
 
 ## 对本目录做改动时的纪律
 
