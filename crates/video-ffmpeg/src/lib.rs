@@ -109,6 +109,13 @@ pub unsafe extern "C" fn vff_video_is_hw(h: Handle) -> c_int {
     reader::<VideoReader>(h).is_hw() as c_int
 }
 
+/// 拖拽快扫预览模式：1 = `skip_frame=NONKEY`（解码器只解关键帧，Video Decode 引擎每轮
+/// seek 从「关键帧→落点整段 P/B"」降到「1 个 I 帧」）；0 = 全帧精确（seek/播放）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_video_set_skip_nonkey(h: Handle, nonkey: c_int) {
+    reader::<VideoReader>(h).set_skip_nonkey(nonkey != 0)
+}
+
 /// 诊断/测试用能力探测：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」。1 = 支持；
 /// 0 = 不支持（Intel Arc 等驱动实测 `CreateTexture2D` E_INVALIDARG）。
 /// **NOT 直通门控**：双设备直通恒用 DECODER-only 解码池（渲染端只采样共享 NV12 槽），本

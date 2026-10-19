@@ -97,6 +97,7 @@ type FnOpen = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
 // 安全硬解（FFmpeg 自有设备，无注入）：打开/取 IS/HW/seek 预滚免转换跳帧
 type FnOpenHwPrefer = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
 type FnVideoIsHw = unsafe extern "C" fn(Handle) -> CInt;
+type FnVideoSetSkipNonkey = unsafe extern "C" fn(Handle, CInt);
 type FnSkipToBgra = unsafe extern "C" fn(
     Handle,
     f64,
@@ -159,6 +160,7 @@ struct Bridge {
     open_video: libloading::Symbol<'static, FnOpen>,
     open_video_hw_prefer: libloading::Symbol<'static, FnOpenHwPrefer>,
     video_is_hw: libloading::Symbol<'static, FnVideoIsHw>,
+    video_set_skip_nonkey: libloading::Symbol<'static, FnVideoSetSkipNonkey>,
     video_skip_to_bgra: libloading::Symbol<'static, FnSkipToBgra>,
     open_audio: libloading::Symbol<'static, FnOpenAudio>,
     video_params: libloading::Symbol<'static, FnParams>,
@@ -226,6 +228,7 @@ fn load_bridge() -> Option<Bridge> {
         open_video: sym!(b"vff_open_video\0", FnOpen),
         open_video_hw_prefer: sym!(b"vff_open_video_hw_prefer\0", FnOpenHwPrefer),
         video_is_hw: sym!(b"vff_video_is_hw\0", FnVideoIsHw),
+        video_set_skip_nonkey: sym!(b"vff_video_set_skip_nonkey\0", FnVideoSetSkipNonkey),
         video_skip_to_bgra: sym!(b"vff_video_skip_to_bgra\0", FnSkipToBgra),
         open_audio: sym!(b"vff_open_audio\0", FnOpenAudio),
         video_params: sym!(b"vff_video_params\0", FnParams),
@@ -461,6 +464,14 @@ impl VideoReader {
     pub fn is_hw(&self) -> bool {
         let b = bridge().expect("reader 持有期桥必在");
         unsafe { (b.video_is_hw)(self.handle) != 0 }
+    }
+
+    /// 拖拽快扫预览模式：`nonkey=true` 只解关键帧（`skip_frame=NONKEY`，Video Decode 引擎
+    /// 每轮 seek 负载骤降）；`false` 恢复全帧精确 seek。对应 FFI `vff_video_set_skip_nonkey`。
+    pub fn set_skip_nonkey(&mut self, nonkey: bool) {
+        if let Some(b) = bridge() {
+            unsafe { (b.video_set_skip_nonkey)(self.handle, if nonkey { 1 } else { 0 }) }
+        }
     }
 
     /// **seek 预滚**：`seek(target)` 后逐帧解码，落点前帧只解码不转换，第一个 `pts ≥ target`

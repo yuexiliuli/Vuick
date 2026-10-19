@@ -457,6 +457,22 @@ impl VideoReader {
         self.hw.is_some()
     }
 
+    /// 拖拽快扫预览模式开关：`nonkey=true` → `skip_frame=AVDISCARD_NONKEY`，解码器**只解
+    /// 关键帧**——一次 seek 的视频解码引擎负载从「关键帧→落点整段 P/B"」（长 GOP 一次几十
+    /// ~百帧）降到「1 个 I 帧」，是拖拽时 Video Decode 占用相对 VLC（快扫只解关键帧）
+    /// 偏高的主因；`nonkey=false`（精确 seek/播放）恢复全帧。
+    /// 每次命令 seek 前重设（复用 reader 也按命令切换；改动即时生效、无需单独边界处理——
+    /// 紧接的 seek/packet 解码即按新 `skip_frame` 执行）。
+    pub fn set_skip_nonkey(&mut self, nonkey: bool) {
+        use ffmpeg::ffi::AVDiscard;
+        let skip = if nonkey {
+            AVDiscard::AVDISCARD_NONKEY
+        } else {
+            AVDiscard::AVDISCARD_DEFAULT
+        };
+        unsafe { (*self.decoder.as_mut_ptr()).skip_frame = skip };
+    }
+
     /// **seek 预滚专用**：`seek(target)` 后逐帧解码，**落点前帧只解码不转换**（不算 pts 的
     /// sws/回读；硬件帧 ≈0.5ms/帧），直到第一个 `pts ≥ target` 的帧，再把该帧一次性转
     /// BGRA 写进 `out`（须 ≥ 输出 w×h×4，一般用源尺寸预分配即可）。

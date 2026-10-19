@@ -170,6 +170,7 @@ impl super::VideoViewer {
             tx,
             result_tx,
             seek_session,
+            scrubbing: self.scrubbing,
             wake: self
                 .frame_wake
                 .as_ref()
@@ -299,6 +300,12 @@ impl super::VideoViewer {
                 .as_ref()
                 .map(|(_, _, r, _)| r.is_hw())
                 .unwrap_or(false);
+            // 拖拽快扫：预览命令只解关键帧（Video Decode 引擎每轮从「关键帧→落点整段
+            // P/B」降到「1 个 I 帧」）；松手/停稳后的精确命令恢复全帧。必在首次 seek 前
+            // 重设（复用 reader 也按命令切换，seek 紧跟即 flush）。
+            if let Some((_, _, r, _)) = active.as_mut() {
+                let _ = r.set_skip_nonkey(cmd.scrubbing);
+            }
             if !hw_reader || dual {
                 // 软解照旧：seek 后才逐帧过滤预滚。双设备：skip_to_bgra 不做（零回读），
                 // 需显式 seek 目标，预滚帧在帧循环里免拷贝丢弃。
@@ -601,8 +608,12 @@ impl super::VideoViewer {
                         }
                     }
                 }
+                // 拖拽（scrubbing）：落点帧送出即停、不做解码超前——超前帧会在下一次重定向
+                // 时全作废，是拖拽期 GPU 瞬时占用高（相对 VLC 只解到落点）的主因。
+                let mut landed = false;
                 let keep = match item {
                     Ok(Some(frame)) if frame.pts() >= frame_target => {
+                        landed = true;
                         // 落点前一帧保底（排空先有帧可上屏）；软帧发送失败直接丢弃（无池资源）
                         if let Some(p) = pre_roll.take() {
                             let _ = send_relay(&cmd.tx, &cmd.wake, p);
@@ -705,6 +716,11 @@ impl super::VideoViewer {
                     }
                     Err(_) => false, // 解码错误：本代结束
                 };
+                // 拖拽命令：首帧 ≥ target 已送出 → 停下不再解码超前（等下一条重定向命令，
+                // 省拖拽期纯浪费的 GPU 解码；播放/点按 seek 的 scrubbing=false 不受影响）
+                if cmd.scrubbing && landed && keep {
+                    break;
+                }
                 let t2 = Instant::now();
                 if vp_on {
                     vp_decode += t1 - t0;

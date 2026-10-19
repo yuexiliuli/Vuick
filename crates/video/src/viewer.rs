@@ -520,6 +520,10 @@ struct DecodeCmd {
     /// 主线程 pump（`pending_seek` 期事件驱动唤醒，替代旧 ~2ms 轮询；bounded try_send
     /// 满则丢弃，级联共享）。
     wake: std::sync::mpsc::SyncSender<()>,
+    /// 拖拽（scrubbing）中：worker 落点（首帧 ≥ target）送出后立即停、不做解码超前——
+    /// 拖拽期超前帧会在下一次重定向命令时全部作废 = 纯 GPU 浪费（对应 VLC 拖拽只解到
+    /// 落点；播放/点按 seek 为 false，解码超前照旧保平滑）。
+    scrubbing: bool,
 }
 
 /// 帧就绪通知（P1 事件驱动泵）：worker 每成功把一帧入队主线程就 `try_send` 一个空通知。

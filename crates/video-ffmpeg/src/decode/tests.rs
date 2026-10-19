@@ -683,6 +683,57 @@ fn bench_seek_preroll_hw_vs_sw() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 探针：拖拽快扫「只解关键帧（skip_frame=NONKEY）」vs「整段预滚精确解」的解码帧数与
+/// 墙钟——视频解码引擎负载与解码帧数成正比；长 GOP 文件一次精确 seek 解近百帧，NONKEY
+/// 只需 1 帧（对应 VLC 快扫只解关键帧）。断 NONKEY 恰好 1 帧，同时是机制回归测试。
+#[test]
+fn bench_scrub_preview_skip_nonkey_vs_precise() -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/视频测试字幕.mkv");
+    if !path.exists() {
+        eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+        return Ok(());
+    }
+    const TARGET: f64 = 176.0; // 中段长帧距档（预滚帧数最大档位之一）
+    // SAFETY: 探针为串行诊断用，无并行测试竞争该 env；跑完还原。
+    unsafe { std::env::set_var("VFF_VIDEO_SW", "1") };
+    let mut sw =
+        VideoReader::open_scaled_impl(&path, 1920, false).context("软路径打开失败")?;
+    unsafe { std::env::remove_var("VFF_VIDEO_SW") };
+    let cap = (sw.out_width as usize) * (sw.out_height as usize) * 4;
+    let mut out = vec![0u8; cap];
+
+    let mut measure = |sw: &mut VideoReader, nonkey: bool| -> anyhow::Result<(u64, f64)> {
+        sw.set_skip_nonkey(nonkey);
+        sw.seek(TARGET)?;
+        let t1 = Instant::now();
+        let mut n: u64 = 0;
+        loop {
+            n += 1;
+            match sw.next_frame_bgra_into(&mut out)? {
+                // 精确：首帧 ≥ TARGET 落点；快扫：唯一 I 帧（pts ≤ TARGET）即落点
+                Some((pts, ..)) if pts >= TARGET || nonkey => break,
+                Some(_) => continue, // 预滚帧只解不取
+                None => break,       // 片尾 EOF 无 I 帧
+            }
+        }
+        Ok((n, t1.elapsed().as_secs_f64() * 1e3))
+    };
+
+    let (p_n, p_ms) = measure(&mut sw, false)?;
+    let (k_n, k_ms) = measure(&mut sw, true)?;
+    eprintln!(
+        "[SCRUBPREV] target={}s 精确(全帧): {p_n}帧 {p_ms:.1}ms ｜ 快扫(仅关键帧): {k_n}帧 {k_ms:.1}ms ｜ 帧数比≈{:.1}× 墙钟比≈{:.1}×",
+        TARGET,
+        p_n as f64 / k_n as f64,
+        p_ms / k_ms
+    );
+    assert_eq!(k_n, 1, "skip_frame=NONKEY 应只解 1 个关键帧（got {k_n}）");
+    Ok(())
+}
+
 /// BGRA 帧内容能量（粗判非黑/非花屏）：等距抽样像素算平均绝对偏差；真实画面远高于
 /// 纯黑/纯色的 ~0。只判「帧有效」，不含具体内容断言（夹具敏感）。
 fn frame_energy(bgra: &[u8], w: u32, h: u32) -> f64 {
