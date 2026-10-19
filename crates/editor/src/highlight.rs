@@ -57,6 +57,17 @@ use crate::editor::buffer::Buffer;
 /// 路径——打开/首帧同步上色（见 [`Self::accept_deferred`]），否则大文档先出纯文本再补色。
 const EXTEND_SYNC_BUDGET_ROWS: usize = 160;
 
+/// 首屏「空缓存」拆分的窗口行数门限：有语法文档首窗逻辑行 ≤ 此值时仍**同步整窗上色**
+/// （小文档/小视口，解析快，首屏即全彩）；超过此值（大视口或大文档，debug ~1.5ms/行 →
+/// 整窗几百 ms 冻结）改走延后**分片补色**（`syntect_fill_deferred` 每帧 32 行）——首帧先出
+/// 纯文本、颜色逐帧从可见顶往下补，根除「打开大 .rs 先空白/被冻结几百 ms」。txt 无语法
+/// 恒同步（填空==0ms），不受影响。
+const HL_OPEN_FIRST_SYNC_MAX_ROWS: usize = 48;
+/// 首帧「预热 160 行」的**文档行数上限**：仅小文档（≤此值）首帧空缓存整窗解析时做预热
+/// （促进打开后首次下滚平滑）；大文档走分片补色，预热会一次性多解析 160 行（~240ms）
+/// 把首帧又冻结回白屏，故不做。
+const HL_OPEN_FIRST_SYNC_WARM_MAX_DOC: usize = 5_000;
+
 /// 回跳快照缓存预算（取舍）：`HL_SNAPSHOT_CAP` = 最多保留的快照份数；
 /// `HL_SNAPSHOT_MAX_ROWS` = 单份快照的行数上限。
 ///
@@ -137,6 +148,10 @@ pub struct Highlighter {
     /// `tail_new` 编辑后在**当前坐标**下首个内容未变的「尾部」行
     /// （= `min_row + 新文本行数`）；`delta` 净行增量（新行数 − 被删行数）。
     dirty: Option<(usize, usize, i64)>,
+    /// 本次「空缓存首窗被延后分片补色」标记（`accept_deferred` 对大语法文档置位）：
+    /// 该空缓存首帧的 `full_reparse` 必须**跳过 160 行预热**，否则分片补色的首切片
+    /// 又一次性同步解析 96+ 行（~150ms）把「先出纯文本」打回「一帧冻结」。建缓存后清除。
+    deferred_first: bool,
     /// 语言/色板切换强制整窗重解析（跳过增量路径）。
     force_full: bool,
     /// 滚动（拖拽/快滚）期间被延后的高亮窗口 `(lo, hi, lookback)`：缺口超过单帧同步预算
@@ -174,6 +189,7 @@ impl Highlighter {
             snapshot_clock: 0,
             semantic_names: HashMap::new(),
             dirty: None,
+            deferred_first: false,
             force_full: true,
             pending: None,
             #[cfg(test)]
@@ -256,11 +272,18 @@ impl Highlighter {
         self.saves.clear();
         self.dirty = None;
         self.pending = None;
+        self.deferred_first = false;
         // 整篇替换/换语言 → 历史窗口快照一并作废（换 Buffer 后 version 归零，残留快照
         // 与「同 version 撞车」同危——快照携带 `gated_id`/`dark` 双保险，这里直接清空）。
         self.snapshots.clear();
         self.snapshot_clock = 0;
         self.force_full = true;
+    }
+
+    /// 高亮缓存是否完全为空（首帧 / 整篇替换后；供 `build_rows` 的 P6「首帧零解析」
+    /// 判定——缓存为空时首帧只渲染纯文本、不解析任何 syntect，让文件开头即刻可见）。
+    pub(crate) fn is_cache_empty(&self) -> bool {
+        self.lines.is_empty()
     }
 
     /// 切换语言（按 token/扩展名找语法；`None` 无高亮）。
@@ -484,14 +507,22 @@ impl Highlighter {
             self.pending = None;
             return true;
         }
-        // 首屏（缓存为空）→ 同步立即上色：打开/首帧一次整窗解析（O(窗口+回看)≈一屏）直接
-        // 放本帧做。P1c 曾把「首帧一律延后 + settle」与「滚动大缺口延后」共用同一
-        // pending/settle 状态机，导致首次打开大文档也是先出纯文本、滚动停住才上色
-        // （观感死区）；改后只有**滚动大缺口**（>单帧预算下跳 / 上移越过 base）才走
-        // 延后 + settle（滚动期帧必须廉价、滑块/内容跟手）。
-        // `.txt`（无 syntax）首屏本就走快路径（建缓存只是填空样式，代价≈0），不受影响。
+        // 首屏（缓存为空）：
+        // - 无语法（.txt）→ 同步立即上色（建缓存只是填空样式，代价≈0）；
+        // - 有语法但首窗小（≤ HL_OPEN_FIRST_SYNC_MAX_ROWS 行）→ 同步整窗上色（快、首屏全彩）；
+        // - 有语法且首窗大（debug ~1.5ms/行 → 整窗几百 ms）→ **延后分片补色**：本帧先出
+        //   纯文本（不空白），颜色由宿主 `syntect_fill_deferred` 每帧 32 行从可见顶往下补。
+        //   **不置 pending**：置了会让下一帧 `settle` 对整窗同步重锚，又把首帧冻结打回来。
+        //   （原实现此处恒同步——「打开大 .rs 先空白/冻结几百 ms」根因。）
         if self.lines.is_empty() {
-            return true;
+            let window_rows = hi.saturating_sub(lo).saturating_add(1);
+            if self.syntax.is_none() || window_rows <= HL_OPEN_FIRST_SYNC_MAX_ROWS {
+                // 首屏走快路径（建缓存只是填空样式，代价≈0）
+                return true;
+            }
+            // 延后分片补色：首帧先出纯文本、颜色逐帧补（不置 pending，避免 settle 整窗重锚）。
+            self.deferred_first = true;
+            return false;
         }
         let needs_reanchor = if lo >= self.base {
             let cached_end = self.base + self.lines.len();
@@ -713,21 +744,25 @@ impl Highlighter {
         #[cfg(test)]
         self.bump_reparse_count();
         let start = lo.saturating_sub(lookback).min(line_count.saturating_sub(1));
-        // 方案 B：首屏从文件头锚定（空缓存 + lo==0）时预热 ≤2×视口 行（视口 =
-        // hi−lo+1，封顶 `EXTEND_SYNC_BUDGET_ROWS`）并保存每行作用域保存点——打开后首次
-        // 下滚在预热范围内由 `extend_down`
-        // 从保存点连续续栈、不整段重锚（滚动小缺口即时上色而不是重锚整窗）。预热必须
-        // 封顶（`min` 单帧预算），且**绝不越过「末真实行」**：`line_count` 含 ropey
-        // 尾换行幻影空行，若把幻影行缓存下来，追加开始时该槽被新内容占用而缓存未失效
-        // → 复用旧空槽（色缺失）。预热下端最多到请求窗口底（请求窗本身含幻影行是既有
-        // 语义，不得缩到请求窗口之下）。代价 O(视口)+常数，绝不演变成全档 parse。
+        // 预热：仅「空缓存 + 文档头 + 小文档（≤ HL_OPEN_FIRST_SYNC_WARM_MAX_DOC）」首窗
+        // 时预解析 ≤2×视口（封顶 `EXTEND_SYNC_BUDGET_ROWS`）并保存每行作用域保存点——
+        // 打开后首次下滚由 `extend_down` 从保存点连续续栈（不整段重锚）。大文档走分片
+        // 补色，若继续预热会一次性多解析 160 行（~240ms）把首帧又冻结回白屏（违背
+        // 「先出纯文本」意图），故跳过——分片补色本身逐帧从保存点续栈，滚进新行等价平滑。
         let requested_hi = hi;
-        let warm_rows = if self.lines.is_empty() && lo == 0 {
+        let warm_rows = if self.lines.is_empty()
+            && lo == 0
+            && !self.deferred_first
+            && line_count <= HL_OPEN_FIRST_SYNC_WARM_MAX_DOC
+        {
             (hi.saturating_sub(lo).saturating_add(1).saturating_mul(2))
                 .min(EXTEND_SYNC_BUDGET_ROWS)
         } else {
             0
         };
+        // 空缓存首窗被延后的「分片补色」只跳过**首次**建缓存的预热（分片切片每次 ≤32 行，
+        // 无需 160 行预热）；建完后即清标，此后 `full_reparse` 恢复既有行为。
+        self.deferred_first = false;
         // 末真实行：`line_count - 1` 为幻影空行（尾换行 → 该行长 0）则减一，否则即末行。
         let last_real = if line_count > 1 && buffer.line_len(line_count - 1) == 0 {
             line_count.saturating_sub(2)
@@ -971,6 +1006,159 @@ impl Default for Highlighter {
 mod tests {
     use super::*;
     use syntax::SemanticStyleResolver;
+
+    /// 真文件诊断（`#[ignore]`，仅本机）：量化「大 .rs 打开 EOF 换装时刻」在 UI 线程的
+    /// 各段成本——`.txt` 全绿后用户反馈 `.rs` 仍「卡一下」，定位到换装后**首帧**要同步
+    /// 做一次整窗 syntect 重解析（`reset_document` → `highlighter.invalidate()` →
+    /// `highlight_window` 空缓存 → `full_reparse` O(窗口+回看)），.txt 无语法此段≈0。
+    /// P4 后改 keep-identity 换装（保留 Buffer id + `tail_append`），换装前挂载首块已解析
+    /// 的顶部窗口被 A0 门控跨版本复用 → 换装帧零重解析。
+    /// 本测试在真实 `大文档测试126MB.rs`（329 万行）上对拍：
+    /// - before = 全新 Highlighter（旧换装＝作废缓存）整窗(0..400)解析的 min/med；
+    /// - after  = 挂载首块解析后经 keep-identity 换装，同一窗口再次请求的耗时（应≈0 命中）。
+    /// 顺带对照 ropey `len_lines`/`len_chars`（换装计数）是否 O(log n)。
+    /// 跑法：`cargo test -p editor highlight::bench_real_rs_swap_window -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_real_rs_swap_window() {
+        let path = std::env::var("BENCH_RS_FILE").unwrap_or_else(|_| {
+            r"E:\Rust\gpui-editor\target\大文档测试126MB.rs".to_string()
+        });
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP: missing {path} ({e})");
+                return;
+            }
+        };
+        let rope = ropey::Rope::from_str(&src);
+        use crate::editor::rope_ext::RopeExt as _;
+        let lines = rope.lines_len();
+        let chars = rope.len_chars();
+        eprintln!("[BENCH] 126MB.rs lines_len={lines} len_chars={chars}（O(log n) ≤ 微秒级）");
+        let n = lines.min(400);
+        // 挂载首块：取全文首 256KB（与 OPEN_FIRST_CHUNK_BYTES 同量级）。
+        let head_bytes = src.as_bytes().get(..256 * 1024).unwrap_or(src.as_bytes()).len();
+        let head_off = src.floor_char_boundary(head_bytes);
+        let head_src = &src[..head_off];
+        let mut buffer = Buffer::from_parts(ropey::Rope::from_str(head_src), 0, Default::default());
+        fn eval(hl: &mut Highlighter, buffer: &Buffer, n: usize) -> f32 {
+            let t0 = std::time::Instant::now();
+            let win = hl.highlight_window(buffer, 0, n - 1, 16);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(win.len());
+            ms as f32
+        }
+        // before：旧换装（新 Highlighter = 缓存作废后整窗重解析）×5。
+        let mut t_before = Vec::new();
+        for _ in 0..5 {
+            let mut hl = Highlighter::new();
+            hl.set_language(Some("rust"));
+            t_before.push(eval(&mut hl, &buffer, n));
+        }
+        // after：挂载期首窗解析一次，经 keep-identity 换装后同一窗口再请求 ×5 → 命中。
+        let mut hl = Highlighter::new();
+        hl.set_language(Some("rust"));
+        eval(&mut hl, &buffer, n); // 挂载期首窗整窗解析（预热）
+        let tail_row = buffer.line_count();
+        buffer.replace_text_keep_id(ropey::Rope::from_str(&src), 0, Default::default(), tail_row);
+        let mut t_after = Vec::new();
+        for _ in 0..5 {
+            t_after.push(eval(&mut hl, &buffer, n));
+        }
+        t_before.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        t_after.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[BENCH] 首窗 0..{n} 行 syntect——before(旧换装整窗重解析) min/med: {:.2}/{:.2} ms | after(keep-identity 换装→缓存命中) med: {:.2} ms | 提速 {:.0}x",
+            t_before[0],
+            t_before[t_before.len() / 2],
+            t_after[t_after.len() / 2],
+            t_before[t_before.len() / 2] / t_after[t_after.len() / 2].max(1e-6),
+        );
+        let _ = &mut buffer;
+    }
+
+    /// P4 回归：大文档打开「整篇换装」用 keep-identity（保留 Buffer id + `tail_append`）
+    /// 后，高亮器 A0 门控跨版本复用挂载期窗口缓存——换装前后对同一顶部窗口的请求不再
+    /// 整窗重解析（大 `.rs` 首窗 syntect ~620ms debug 的「打开会卡一下」根因）。
+    /// 断言：换装后 `test_reparse_count` 不因此 +1，且顶部窗口颜色与挂载期逐位一致。
+    #[test]
+    fn keep_identity_swap_reuses_window_cache() {
+        let head = (0..400)
+            .map(|i| format!("fn foo_{i}() {{ let x = {i}; x * 2 }} // c{i}\n"))
+            .collect::<String>();
+        let tail = (400..2_000)
+            .map(|i| format!("fn bar_{i}() {{ /* {i} */ }}\n"))
+            .collect::<String>();
+        let full_text = format!("{head}{tail}");
+        let mut buffer = Buffer::from_parts(ropey::Rope::from_str(&head), 0, Default::default());
+        let mut hl = Highlighter::new();
+        hl.set_language(Some("rust"));
+        // 挂载期首帧：整窗重解析（count=1）且顶部窗口带真颜色。
+        let runs = hl.highlight_window(&buffer, 0, 100, 16).to_vec();
+        assert_eq!(hl.test_reparse_count(), 1, "挂载期首窗应整窗重解析 1 次");
+        let color_segments = runs.iter().flatten().count();
+        assert!(color_segments > 0, "挂载期顶部窗口应有语法颜色段");
+        // 整篇换装（keep-identity）：全文 Rope + 版本 +1 + tail_append（起点=挂载首块行数）。
+        let tail_row = buffer.line_count();
+        buffer.replace_text_keep_id(
+            ropey::Rope::from_str(&full_text),
+            0,
+            Default::default(),
+            tail_row,
+        );
+        assert!(tail_row >= 400, "挂载首块行数应 ≥400：{tail_row}");
+        // 换装后同一顶部窗口：A0 门控 → 命中缓存，零重解析。
+        let runs2 = hl.highlight_window(&buffer, 0, 100, 16).to_vec();
+        assert_eq!(
+            hl.test_reparse_count(),
+            1,
+            "换装不应触发顶部窗口整窗重解析（A0 门控跨版本复用缓存）"
+        );
+        assert_eq!(
+            runs2.iter().flatten().count(),
+            color_segments,
+            "换装后顶部窗口颜色应与挂载期一致"
+        );
+    }
+
+    /// P5 回归：大 `.rs` 打开首帧不再整窗同步解析（"先空白→才加载"根因）。空缓存 +
+    /// 大首窗 → `accept_deferred` 应**延后**（返回 false、不置 pending，避免下一帧
+    /// settle 整窗重锚），且分片补色的首切片只解析 ≤`HL_OPEN_FIRST_SYNC_MAX_ROWS` 行
+    /// （跳过 160 行预热）——首帧先出纯文本、颜色逐帧补，整窗解析不再一帧几百 ms 冻结。
+    #[test]
+    fn large_doc_first_frame_defers_and_bounded() {
+        let body = (0..500)
+            .map(|i| format!("fn f_{i}() {{ let x = {i}; x }} // c{i}\n"))
+            .collect::<String>();
+        let buffer = Buffer::from_parts(ropey::Rope::from_str(&body), 0, Default::default());
+        let mut hl = Highlighter::new();
+        hl.set_language(Some("rust"));
+        // 大首窗（200 行 > 48）→ 延后分片补色；不置 pending（防 settle 整窗重锚）。
+        assert!(
+            !hl.accept_deferred(0, 199, 16),
+            "大文档首帧应延后分片补色（不整窗同步解析）"
+        );
+        assert!(hl.pending().is_none(), "延后首窗不得置 pending");
+        // 分片补色首切片：只解析 32 行（无 64+ 预热），首帧帧成本 O(32) 非 O(200+)。
+        let slice = hl.highlight_window(&buffer, 0, 31, 16);
+        assert_eq!(slice.len(), 32, "首切片应对齐 32 行");
+        assert!(
+            hl.test_cache_len() <= 48,
+            "首切片缓存应受限（无预热，实际 {} 行）",
+            hl.test_cache_len()
+        );
+        // 小首窗（≤ 48 行）仍同步整窗上色（首屏即全彩、解析快）。
+        let mut small = Highlighter::new();
+        small.set_language(Some("rust"));
+        assert!(
+            small.accept_deferred(0, 30, 16),
+            "小首窗应保持同步整窗上色"
+        );
+        // txt（无语法）恒同步（填空==0ms）。
+        let mut txt = Highlighter::new();
+        assert!(txt.accept_deferred(0, 199, 16), "txt 无语法应同步");
+    }
 
     /// 单源色板对拍：编辑器 `name_color` 必须与 syntax GitHubTheme 同 scope 色完全一致
     /// （此前两套内嵌色板数值漂移，如 comment 浅色 0x6e7781 vs 官方 0x6a737d；

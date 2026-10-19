@@ -321,6 +321,20 @@ struct HlFill {
     /// 下一个待补逻辑行（向下阶段：`vis_top_l → hi_l`）。`> hi_l` 表示可见区顶到窗口底
     /// 已补完，剩余「上方过扫 `[lo_l, vis_top_l)`」由 settle 一次补齐。
     cursor: usize,
+    /// P6：本补色会话的「首帧零解析」是否已消费（打开首帧高亮缓存为空时，本帧
+    /// **不解析任何 syntect**，直接渲染纯文本让「文件开头」即刻可见；第二帧起每帧
+    /// 32 行补色）。窗口/版本变化重置会话时自动归 false。
+    first_pass_done: bool,
+}
+
+impl HlFill {
+    /// 分片补色会话是否仍在「该窗口 + 版本」的进行中（下一待补行 ≤ 窗口底）。
+    /// `build_rows` 用它门控：补色期间不回落同步整窗解析、也不 `settle` 整窗重锚——
+    /// 两者都会在补色早期一次性同步解析整窗（debug 数百 ms），把「打开大 .rs 首帧先出
+    /// 纯文本」打回「一帧冻结空白」（P5 根因）。
+    fn active(&self, version: u64, lo_l: usize, hi_l: usize) -> bool {
+        self.version == version && self.window == (lo_l, hi_l) && self.cursor <= hi_l
+    }
 }
 
 /// 自研代码编辑器（首版）。
@@ -620,6 +634,26 @@ impl CodeEditor {
         self.reset_document(true);
     }
 
+    /// 大文档打开「整篇换装」专用（P3 之后）：替换全文 Rope 但**保留 Buffer id + 高亮
+    /// 缓存**。换装前（挂载首块）已解析的可见窗口在新全文里逐位相同，尾交给 highlighter
+    /// `tail_append` A0 门控跨版本复用→不再整窗零收益重解析（大 `.rs` 首窗 syntect
+    /// ~620ms debug = 用户「打开 .rs 会卡一下」根因）。折叠/括号扫描仍走延后（同
+    /// `set_rope_with_stats_defer`）。`tail_append_row` = 挂载首块行数（新内容起点）。
+    /// **仅 open 流水线 EOF 收尾且未编辑时可调**；普通整篇替换仍走新 id 全量作废。
+    pub fn set_rope_with_stats_keep_highlight(
+        &mut self,
+        text: Rope,
+        max_line_chars: usize,
+        line_width_histogram: crate::editor::buffer::LineWidthHistogram,
+        tail_append_row: usize,
+    ) {
+        #[cfg(test)]
+        CODE_EDITOR_FULL_RESET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.buffer
+            .replace_text_keep_id(text, max_line_chars, line_width_histogram, tail_append_row);
+        self.reset_document_impl(true, true);
+    }
+
     /// 大文档「先瞬时显示、后台补齐统计」用：全文已经由 [`Self::set_rope_with_stats`]
     /// 挂上（统计为占位），后台算好真统计后 O(1) 修正横向滑动条量程/最长行。
     /// **要求调用方保证统计与当前文本一致**（打开后未编辑）。
@@ -654,6 +688,14 @@ impl CodeEditor {
     /// （内容全新、首屏即就绪，测试依赖）；`true` = 延到下一帧后台刷新（打开大文档
     /// 首块挂载走 [`Self::set_rope_with_stats_defer`]，首屏零同步重扫）。
     fn reset_document(&mut self, defer_scans: bool) {
+        self.reset_document_impl(defer_scans, false);
+    }
+
+    /// [`Self::reset_document`] 的实现；`keep_highlight=true` 时**跳过高亮缓存作废**——
+    /// 仅供大文档打开整篇换装（[`Self::set_rope_with_stats_keep_highlight`]）使用：换装后
+    /// 顶部窗口与挂载首块逐位相同，由 `tail_append` A0 门控跨版本复用缓存，避免整窗
+    /// 零收益重解析（大 `.rs` ~620ms debug）。
+    fn reset_document_impl(&mut self, defer_scans: bool, keep_highlight: bool) {
         self.undo.clear();
         self.selection = Selection::collapsed(0);
         // 整篇替换 = 文档在光标下被换掉：任何进行中的鼠标拖选都失去意义，一并取消。
@@ -667,7 +709,9 @@ impl CodeEditor {
         // 整篇替换：高亮增量登记 + 高亮缓存一并作废（下一帧整段重解析；
         // 防「新旧文档同 version=0」命中上一份文档的颜色）。
         self.hl_dirty = None;
-        self.highlighter.invalidate();
+        if !keep_highlight {
+            self.highlighter.invalidate();
+        }
         // 整篇替换：行级缓存同样显式清空（`Buffer::new` 后 version 归零，同防
         // 「新旧文档同 version=0」命中上一份文档的行静态内容）。
         self.row_cache.clear();
@@ -1472,14 +1516,23 @@ impl CodeEditor {
         } else {
             // 把最近编辑的增量登记喂给高亮器（局部重解析 + 收敛早退），只取走一次。
             self.highlighter.set_dirty(self.hl_dirty.take());
+            let buf_version = self.buffer.version();
+            // 分片补色进行中：本帧继续逐 32 行往下补（不入 quick 同步整窗、不 settle 整窗
+            // 重锚——两者都会在补色早期一次性同步解析整窗几百 ms，把「首帧先出纯文本」
+            // 打回「一帧冻结空白」，见 `HlFill::active`）。
+            let fill_active = self.hl_fill.active(buf_version, lo_l, hi_l);
             // 大文档拖滚动条：窗口未覆盖且需有界重锚时，本帧走「分片补色」——从可见区
             // 顶部起只解析 `HL_FILL_BUDGET_ROWS` 行真颜色（窗口其余行空样式），颜色
             // 逐帧往下长；滚动停住（相邻帧窗口一致）由 `settle_pending` 补一次有界
             // 重锚补齐整窗（含上方过扫）、清 pending。
             let prev_pending = self.highlighter.pending();
-            let quick = self.highlighter.accept_deferred(lo_l, hi_l, HL_LOOKBACK_LINES);
+            let quick = self
+                .highlighter
+                .accept_deferred(lo_l, hi_l, HL_LOOKBACK_LINES)
+                && !fill_active;
             let settle = !quick
-                && prev_pending == Some((lo_l, hi_l, HL_LOOKBACK_LINES));
+                && prev_pending == Some((lo_l, hi_l, HL_LOOKBACK_LINES))
+                && !fill_active;
             if quick || settle {
                 if settle {
                     self.highlighter.settle_pending(&self.buffer);
@@ -1597,6 +1650,7 @@ impl CodeEditor {
                 version,
                 vis_top_l,
                 cursor: vis_top_l,
+                first_pass_done: false,
             };
         }
         let start = self.hl_fill.vis_top_l;
@@ -1604,6 +1658,19 @@ impl CodeEditor {
             Vec::with_capacity(hi_l - lo_l + 1);
         hl_lines.resize(hi_l - lo_l + 1, Vec::new());
         let mut colored: Option<(usize, usize)> = None;
+        // P6：打开首帧零解析——仅在**文档顶部**（`vis_top==0`、高亮缓存仍为空，即首块刚
+        // 挂载的开场帧）本帧**不解析任何 syntect**，只渲染纯文本，让「文件开头」在首个
+        // 刷新帧即刻可见（省掉 ~50ms 的 32 行切片解析；颜色下一帧起每帧 32 行往下补）。
+        // 只跳一次（`first_pass_done`）。滚动/深跳窗口（`vis_top>0`）照常首帧即补可见顶
+        // 颜色（那是已展开会话，无「空白开场」问题）。
+        if !self.hl_fill.first_pass_done
+            && vis_top_l == 0
+            && lo_l == 0
+            && self.highlighter.is_cache_empty()
+        {
+            self.hl_fill.first_pass_done = true;
+            return (hl_lines, None, false); // 未覆盖窗口 → 调用方预约下一帧开始补色
+        }
         if self.hl_fill.cursor <= hi_l {
             // 本帧可达上限：游标向下推 `BUDGET` 行。
             let fetch_hi = self

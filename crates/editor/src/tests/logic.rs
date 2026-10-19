@@ -472,13 +472,14 @@ fn deferred_scroll_skips_syntect_until_settled() {
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
 
-    // 首屏（P1c：空缓存 + 语法）→ 方案 A **同步立即上色**——不再延后 settle，首帧即
-    // 整窗解析建缓存（O(窗口+回看)）；只有滚动大缺口才走延后。缓存就绪后同窗口命中
-    // 快速路径。
-    assert!(hl.accept_deferred(0, 108, 16), "首屏（空缓存）应同步立即上色（方案 A）");
-    assert_eq!(hl.pending(), None, "首屏同步上色不登记 pending");
+    // 首屏（P5：空缓存 + 大首窗 + 语法）→ **延后分片补色**——本帧不整窗同步解析
+    // （先出纯文本、颜色逐帧从可见顶补，debug 整窗 ~500ms 冻结 → 首切片 ~50ms），
+    // 亦不置 pending（避免下一帧 settle 整窗重锚把首帧冻结打回来）。直接整窗请求
+    // 等价于补色完成后的 API（编辑器 `syntect_fill_deferred` 逐 32 行调用）。
+    assert!(!hl.accept_deferred(0, 108, 16), "大首窗应延后分片补色（不再同步整窗解析）");
+    assert_eq!(hl.pending(), None, "延后首窗不登记 pending");
     let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
-    assert!(!top[0].is_empty(), "首屏首行立即有颜色（不再先纯文本后补色）");
+    assert!(!top[0].is_empty(), "窗口从可见顶起有颜色");
     // 缓存就绪后，同窗口再次请求命中快速路径（覆盖 → 不登记 pending）。
     assert!(hl.accept_deferred(0, 108, 16), "缓存命中应走快速路径");
     assert_eq!(hl.pending(), None, "快路径不登记 pending");
@@ -529,8 +530,8 @@ fn medium_gap_scroll_defers_until_settled() {
     let b = Buffer::new(&text);
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
-    // 首屏（P1c 空缓存）→ 方案 A 同步上色建顶窗缓存（不再延后 settle）。
-    assert!(hl.accept_deferred(0, 108, 16), "首屏（空缓存）应同步立即上色（方案 A）");
+    // 首屏（P5：大首窗延后分片补色；直接整窗请求等价于补色完成后的 API）。
+    assert!(!hl.accept_deferred(0, 108, 16), "大首窗应延后分片补色");
     let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
     assert!(!top[0].is_empty(), "首屏顶部应有颜色");
 
@@ -566,11 +567,15 @@ fn small_gap_scroll_stays_sync_path() {
     let b = Buffer::new(&text);
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
-    // 首屏（P1c 空缓存）→ 方案 A 同步上色建顶窗缓存（+ ≤2×视口预热）。
-    assert!(hl.accept_deferred(0, 108, 16), "首屏（空缓存）应同步立即上色（方案 A）");
+    // 首屏（P5：大首窗延后分片补色；直接整窗请求等价于补色完成后的 API）。无预热 →
+    // 缓存仅止于请求窗 [0,108]（不再是旧 160 行预热后的 [0,~268]）。
+    assert!(!hl.accept_deferred(0, 108, 16), "大首窗应延后分片补色");
     let _ = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    // 把缓存前缀扩到 268（gap 160 ≤ 预算 → 同步扩展，等价于补色自尊完成后的一次滚动）。
+    assert!(hl.accept_deferred(160, 268, 16), "≤预算缺口应同步扩展");
+    let _ = hl.highlight_window(&b, 160, 268, 16).to_vec();
 
-    // 小缺口下滚：窗口 [260,380] 越出预热缓存上界 112 行（≤ 预算）→ 同步扩展、颜色即时。
+    // 小缺口下滚：窗口 [260,380] 越出缓存上界 112 行（≤ 预算）→ 同步扩展、颜色即时。
     let (lo, hi) = (260usize, 380usize);
     assert!(hl.accept_deferred(lo, hi, 16), "小缺口应走同步快路径（不延后）");
     assert_eq!(hl.pending(), None, "同步路径不登记 pending");

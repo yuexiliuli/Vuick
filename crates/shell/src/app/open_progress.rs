@@ -337,6 +337,58 @@ mod tests {
     use editor::buffer::{compute_line_stats, LineWidthHistogram};
     use ropey::Rope;
 
+    /// 诊断（`#[ignore]`，仅本机，真线程墙钟）：生产端「首块产出」的真实延迟——用
+    /// 真实的 `大文档测试126MB.rs`（329 万行）直接走 `ChunkReader`（与 `read_chunks_async`
+    /// 同一读法），量：文件打开、首个 256KB 块产出、以及在此之上整篇读完的花费。
+    /// 「首块产出」即挂载可显示的前置耗时——若远大于几十 ms，需查磁盘/读缓冲配置。
+    /// 跑法：`cargo test -p shell open_progress::bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_real_first_chunk_wall_clock() {
+        let path = std::env::var("BENCH_OPEN_FILE").unwrap_or_else(|_| {
+            r"E:\Rust\gpui-editor\target\大文档测试126MB.rs".to_string()
+        });
+        let t_open = std::time::Instant::now();
+        let mut reader = match ChunkReader::open(std::path::Path::new(&path)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIP: missing {path} ({e})");
+                return;
+            }
+        };
+        let t_first = std::time::Instant::now();
+        let mut n = 0usize;
+        let mut total_bytes = 0usize;
+        let mut first_bytes = 0usize;
+        loop {
+            match reader.next_chunk().unwrap() {
+                Some(c) => {
+                    if n == 0 {
+                        first_bytes = c.text.len();
+                        eprintln!(
+                            "[BENCH] 文件打开: {:.1} ms；首块(256KB)产出: {:.1} ms（{} B / {} 行）",
+                            (t_first - t_open).as_secs_f64() * 1000.0,
+                            t_first.elapsed().as_secs_f64() * 1000.0,
+                            c.text.len(),
+                            c.hist.values().sum::<usize>(),
+                        );
+                    }
+                    n += 1;
+                    total_bytes += c.text.len();
+                }
+                None => break,
+            }
+        }
+        eprintln!(
+            "[BENCH] 整篇读完: {:.1} ms（{} 块 / {} B / {} 行）",
+            t_first.elapsed().as_secs_f64() * 1000.0,
+            n,
+            total_bytes,
+            reader.total_bytes(),
+        );
+        let _ = first_bytes;
+    }
+
     /// 诊断（`#[ignore]`，需显式跑）：消费端逐块追加（`rope.insert(末尾)`）在主线程的真实
     /// 成本——只测带统计合并前最核心的 rope 追加（P1 前实测 128MB/312万行 debug 下每 1MB
     /// ~35ms、累计 4.5s → 主线程冻结元凶；P1 已改为后台一次建 rope + EOF O(1) 换装）。

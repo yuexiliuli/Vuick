@@ -492,11 +492,20 @@ impl EditorApp {
             // 跟着整篇统计走（与 `load_file_text` 同款更新）。
             // P3：用 `set_rope_with_stats_defer`（延后折叠候选/括号配对扫描）——否则
             // `resync_list(false)` 在 UI 线程整篇同步重扫折叠候选＋括号配对：≤20 万行的
-            // 中等大文档（如 6.1MB/15.6 万行）恰好触发全量，debug 实测 ~280ms 主线程卡顿
+            // 中等大文档（如 6.1MB/15.6 万行）恰好触发全量，debug 实测 ~3.4s 主线程卡顿
             // （`大文档测试.txt` 的「会卡」即此）。延后后同帧由打开收尾的
             // `refresh_fold_brackets` 在后台补齐同一份结果，UI 只留 O(1) 换装。
+            // P4：用 `set_rope_with_stats_keep_highlight` 保留 Buffer id + 高亮缓存——
+            // 换装后顶部窗口与挂载首块逐位相同，`tail_append` A0 门控跨版本复用缓存，
+            // 大 `.rs` 整窗重解析（debug ~620ms）不再发生（「打开 .rs 会卡一下」根因）。
+            let tail_row = tab.editor.read(cx).line_count(); // 挂载首块行数 = 新内容起点
             tab.editor.update(cx, |ed, _| {
-                ed.set_rope_with_stats_defer(full, max_line_chars, line_width_histogram);
+                ed.set_rope_with_stats_keep_highlight(
+                    full,
+                    max_line_chars,
+                    line_width_histogram,
+                    tail_row,
+                );
             });
             tab.line_count = tab.editor.read(cx).display_line_count();
             tab.char_count = tab.editor.read(cx).char_count();

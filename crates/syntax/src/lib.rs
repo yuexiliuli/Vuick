@@ -682,6 +682,32 @@ pub fn prewarm() {
 mod tests {
     use super::*;
 
+    /// 真机诊断（`#[ignore]`）：首次 `find_syntax` 的冷成本拆解——`SYNTAX_SET`
+    /// `load_defaults_newlines` 反序列化几 MB + `find_syntax_by_token` 全量扫描
+    /// （debug 注释实测 rust ~250ms）。**若该冷加载发生在 UI 线程的
+    /// `set_language(Some("rust"))` 且后台 prewarm 未完成，用户开 .rs 就会先白屏冻结**
+    /// ——文本文件从不 set_language，故只有 .rs 有「先空白后加载」。
+    /// 跑法：`cargo test -p syntax bench_cold_first_find_syntax -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_cold_first_find_syntax() {
+        let t0 = std::time::Instant::now();
+        let r = find_syntax("rust");
+        let t1 = std::time::Instant::now();
+        let r2 = find_syntax("rust");
+        let t2 = std::time::Instant::now();
+        let warm_set = std::time::Instant::now();
+        let _ = &*SYNTAX_SET;
+        let t3 = std::time::Instant::now();
+        assert!(r.is_some() && r2.is_some());
+        eprintln!(
+            "[BENCH] cold find_syntax(rust)（SyntaxSet 反序列化 + 首扫）: {:.1} ms；warm: {:.1} ms；SYNTAX_SET 就绪后取引用: {:.3} ms",
+            (t1 - t0).as_secs_f64() * 1000.0,
+            (t2 - t1).as_secs_f64() * 1000.0,
+            (t3 - warm_set).as_secs_f64() * 1000.0,
+        );
+    }
+
     /// 解析器可覆盖常见语言；`resolve_styles` 把区间切成无缝隙的样式 run。
     #[test]
     fn syntax_covers_common_languages_and_styles_cover_range() {

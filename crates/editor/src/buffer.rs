@@ -264,6 +264,32 @@ impl Buffer {
         self.line_width_histogram = line_width_histogram;
     }
 
+    /// 大文档打开「整篇换装」专用（`CodeEditor::set_rope_with_stats_keep_highlight` 的
+    /// 底层）：把全文 Rope **整体替换**，但**保留实例 id**、版本 +1、并标记「新内容自
+    /// `tail_append_row` 行起为尾部追加」——而不是像 [`Self::from_parts`] 那样发新 id。
+    ///
+    /// 目的：换装前（挂载首块）已解析的可见窗口在新全文里**逐位相同**（全文 = 首块 +
+    /// 其后追加），交给高亮器 `tail_append` A0 门控跨版本复用窗口缓存——否则整窗零收益
+    /// 重解析（大 `.rs` 首窗 syntect ~620ms debug，即用户「打开 .rs 会卡一下」根因）。
+    ///
+    /// 约束：仅 open 流水线 EOF 收尾、且挂载后未编辑（版本必为 0）时可调；普通
+    /// `set_text`/`set_rope_with_stats` 仍走 `from_parts` 新 id 全量作废。
+    pub(crate) fn replace_text_keep_id(
+        &mut self,
+        text: Rope,
+        max_line_chars: usize,
+        line_width_histogram: LineWidthHistogram,
+        tail_append_row: usize,
+    ) {
+        self.text = text;
+        self.version += 1;
+        self.max_line_chars = max_line_chars;
+        self.line_width_histogram = line_width_histogram;
+        // 视作「纯尾追加运行」（与 `append_chunk` 同款语义，供高亮器 A0 门控）：
+        // 自本版本起「新增内容」都在挂载首块行数之后；首块已解析窗口内容未变。
+        self.tail_append = Some((self.version, tail_append_row));
+    }
+
     /// 大文档「分块渐进装配」用：把后台已归一化的一块文本追到全文末尾（ropey
     /// `insert` 到字节末尾，O(块大小)），并合并本块的行宽统计（O(本块行数)）。
     ///
