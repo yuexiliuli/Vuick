@@ -54,6 +54,18 @@ impl super::VideoViewer {
     }
 
 
+    /// 玻璃面板底色：theme surface × 模式半透明 alpha（白主题=亮玻璃、暗主题=深玻璃，
+    /// 与 toast/placeholder/hover-time 同一套取色）。纯函数，测试注入明/暗各一面断言
+    /// （回归：曾硬编码 #191a1b 致白主题下控制条为黑条）。
+    pub(super) fn glass_panel_bg(surface: Hsla, dark: bool) -> Hsla {
+        surface.opacity(if dark {
+            GLASS_PANEL_ALPHA_DARK
+        } else {
+            GLASS_PANEL_ALPHA_LIGHT
+        })
+    }
+
+
     /// F1：进度条悬停时间浮层（纯视觉，**无任何事件监听** → 不拦 seek 条点击/拖拽/dblclick，
     /// 命中穿透；也不占布局——deferred 独立绘制层，随 `.position(窗口坐标)` 悬浮）。
     /// 纵向固定浮在进度条上方 [`HOVER_TIME_GAP_PX`]，横向跟随光标；`deferred(anchored(Window))`
@@ -199,13 +211,10 @@ impl super::VideoViewer {
         };
 
         // 玻璃拟态：半透明面板（透出视频）+ 顶部直角 + 细边框 +
-        // 上抛柔和投影（矩阵浮层风格）。面板底色固定 #191a1b（用户指定，非 theme token），
-        // 仍保留半透明 alpha（亮/暗各一档）。纯视觉，不碰 seek/vol 坐标与交互路径。
-        let panel = gpui::hsla(210., 0.04, 0.102, 1.0).opacity(if dark {
-            GLASS_PANEL_ALPHA_DARK
-        } else {
-            GLASS_PANEL_ALPHA_LIGHT
-        });
+        // 上抛柔和投影（矩阵浮层风格）。面板底色取 theme surface（明暗各自取色，与
+        // toast/placeholder/hover-time 同一套玻璃样式），再乘模式半透明 alpha——白主题
+        // 是亮玻璃、不再是黑条（回归 `control_bar_panel_follows_theme`）。纯视觉。
+        let panel = Self::glass_panel_bg(colors.surface.into(), dark);
         strip
             .bg(panel)
             .border_1()

@@ -384,6 +384,11 @@ impl PdfViewer {
         self.bg = Some(bg);
     }
 
+    /// 当前画布背景色（`set_background` 传入；None = 未设置 → render 回落 `default_canvas`）。
+    pub fn background(&self) -> Option<Hsla> {
+        self.bg
+    }
+
     /// 画布默认底色：亮 #F5F5F5 / 暗 #202020（中性灰阶，与外壳 `window_bg` 同源；
     /// 应用启动后 `set_background` 会用 ChromeColors 覆盖，此处仅兜底）。
     fn default_canvas(cx: &App) -> Hsla {

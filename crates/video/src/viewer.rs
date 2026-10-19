@@ -889,6 +889,11 @@ impl VideoViewer {
     pub fn set_background(&mut self, bg: Hsla) {
         self.bg = Some(bg);
     }
+
+    /// 当前画布背景色（`set_background` 传入；None = 未设置 → render 回落 `default_canvas`）。
+    pub fn background(&self) -> Option<Hsla> {
+        self.bg
+    }
 }
 
 impl Drop for VideoViewer {

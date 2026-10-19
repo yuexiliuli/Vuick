@@ -439,6 +439,11 @@ impl ImageViewer {
         self.bg = Some(bg);
     }
 
+    /// 当前画布背景色（`set_background` 传入；None = 未设置 → render 回落主题 canvas）。
+    pub fn background(&self) -> Option<Hsla> {
+        self.bg
+    }
+
     /// 释放已上屏与缓存的 GPU 纹理（关闭标签页时调用，与 PDF 阅读器同款）。
     pub fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(img) = self.image.take() {

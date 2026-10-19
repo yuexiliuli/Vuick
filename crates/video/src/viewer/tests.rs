@@ -3445,6 +3445,20 @@
         assert!(!shown(true, true, None));
     }
 
+    /// 回归：控制条玻璃面板底色随明暗主题（白主题=亮玻璃、暗主题=深玻璃）。曾硬编码
+    /// #191a1b 面板底色，白主题下控制条仍为黑条（用户实测反馈）；用「亮度」公式钉住：
+    /// 亮面 l 必须 >0.9（白 surface）、暗面 l<0.4（深 surface）、且亮面 > 暗面。
+    #[test]
+    fn control_bar_panel_follows_theme() {
+        let light_surface: Hsla = ui::theme::Theme::light().colors.surface.into();
+        let dark_surface: Hsla = ui::theme::Theme::dark().colors.surface.into();
+        let light_panel = VideoViewer::glass_panel_bg(light_surface, false);
+        let dark_panel = VideoViewer::glass_panel_bg(dark_surface, true);
+        assert!(light_panel.l > 0.9, "白主题控制条应为亮玻璃，l={}", light_panel.l);
+        assert!(dark_panel.l < 0.4, "暗主题控制条应为深玻璃，l={}", dark_panel.l);
+        assert!(light_panel.l > dark_panel.l, "亮主题面板必须比暗主题亮");
+    }
+
     /// 向窗口派发一次**真实双击**（mousedown `click_count=2` + mouseup `click_count=2`）：
     /// 走 `simulate_event` 完整分发路径，双击识别与欢迎页同套语义
     /// （`MouseDownEvent.click_count >= 2`）；`simulate_click` 恒为单击，无法覆盖。

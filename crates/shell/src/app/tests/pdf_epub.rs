@@ -592,3 +592,80 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 回归：切主题（`refresh_theme_ui`）必须同步刷新 PDF/图片阅读器的画布背景。曾只刷
+    /// PDF——图片/视频打开时记下的 `canvas_bg` 停留旧主题，切主题后仍空旧底色（视频整窗
+    /// 白底即此因，用户实测）。此处以 PDF + 图片实例断言背景随主题翻转并还原；视频走
+    /// `MediaReader::Video` 同款 match 臂（本机 shell 测试开真视频会让测试拆解挂起——既有
+    /// `video_right_click_lock_menu_toggles` 同病，故不在本测试里开视频）。
+    #[gpui::test]
+    async fn media_readers_follow_theme_background(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!("kilo_media_theme_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_p = dir.join("a.pdf");
+        let img_p = dir.join("a.jpg");
+        std::fs::write(&pdf_p, b"not a real pdf").unwrap();
+        std::fs::write(&img_p, b"not a real jpeg").unwrap();
+
+        // 真实打开路径装配媒体 tab（load_media 内 set_background(canvas_bg)）。
+        let open = |cx: &mut VisualTestContext, p: &std::path::Path, kind: MediaKind| -> usize {
+            cx.update(|w, cx| {
+                app.update(cx, |a, cx| {
+                    let idx = a.make_tab(w, cx);
+                    a.load_media(idx, p, kind, w, cx);
+                    idx
+                })
+            })
+        };
+        let i_pdf = open(cx, &pdf_p, MediaKind::Pdf);
+        let i_img = open(cx, &img_p, MediaKind::Image);
+
+        let reader_bg = |cx: &mut VisualTestContext, idx: usize| -> Option<gpui::Hsla> {
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                match &a.tabs[idx].reader {
+                    MediaReader::Pdf(p) => p.read(cx).background(),
+                    MediaReader::Image(i) => i.read(cx).background(),
+                    #[cfg(feature = "video")]
+                    MediaReader::Video(v) => v.read(cx).background(),
+                    MediaReader::None => None,
+                }
+            })
+        };
+
+        // 不假设初始明暗（测试环境可能亮也可能暗）：记录打开时的背景。
+        let pdf0 = reader_bg(cx, i_pdf).expect("PDF 打开应有画布背景");
+        let img0 = reader_bg(cx, i_img).expect("图片打开应有画布背景");
+
+        // 切到另一主题（真路径 refresh_theme_ui）→ 阅读器背景同步翻转（背景赋值在
+        // refresh_theme_ui 内同步完成，无需 pump 渲染即可读）。回归点：曾漏刷非 PDF 阅读器。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                a.dark_mode = !a.dark_mode;
+                a.refresh_theme_ui(cx);
+                cx.notify();
+            });
+        });
+        let toggled_bg: gpui::Hsla = cx.update(|_w, cx| app.read(cx).window_bg());
+        assert_ne!(pdf0, toggled_bg, "翻转明暗后 window_bg 应变化（测试前提）");
+        assert_eq!(reader_bg(cx, i_pdf), Some(toggled_bg), "PDF 背景应随主题翻转");
+        assert_eq!(reader_bg(cx, i_img), Some(toggled_bg), "图片背景应随主题翻转（回归）");
+
+        // 切回 → 阅读器背景还原到打开时值。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                a.dark_mode = !a.dark_mode;
+                a.refresh_theme_ui(cx);
+                cx.notify();
+            });
+        });
+        assert_eq!(reader_bg(cx, i_pdf), Some(pdf0), "还原后 PDF 背景应回初值");
+        assert_eq!(reader_bg(cx, i_img), Some(img0), "还原后图片背景应回初值");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+

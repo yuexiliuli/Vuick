@@ -175,13 +175,33 @@ impl EditorApp {
                     cx.notify();
                 });
             }
-            // PDF 阅读器同样刷新背景（主题色变化后与画布保持一致）
-            if let MediaReader::Pdf(pdf) = &tab.reader {
-                let pv = pdf.clone();
-                pv.update(cx, |view, cx| {
-                    view.set_background(canvas_bg);
-                    cx.notify();
-                });
+            // PDF / 图片 / 视频阅读器同样刷新背景（主题色变化后与画布保持一致；否则打开时
+            // 记下的 `canvas_bg` 停留在旧主题，切主题后画面底仍旧色——视频曾整窗白底、图片
+            // 白板不随暗色）。
+            match &tab.reader {
+                MediaReader::Pdf(pdf) => {
+                    let pv = pdf.clone();
+                    pv.update(cx, |view, cx| {
+                        view.set_background(canvas_bg);
+                        cx.notify();
+                    });
+                }
+                MediaReader::Image(img) => {
+                    let iv = img.clone();
+                    iv.update(cx, |view, cx| {
+                        view.set_background(canvas_bg);
+                        cx.notify();
+                    });
+                }
+                #[cfg(feature = "video")]
+                MediaReader::Video(vid) => {
+                    let vv = vid.clone();
+                    vv.update(cx, |view, cx| {
+                        view.set_background(canvas_bg);
+                        cx.notify();
+                    });
+                }
+                MediaReader::None => {}
             }
         }
         cx.notify();
