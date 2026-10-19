@@ -35,7 +35,8 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource};
@@ -70,7 +71,7 @@ pub fn create_worker_d3d11_device() -> Option<WorkerD3D> {
                 adapter,
                 driver,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_FLAG(0),
+                D3D11_CREATE_DEVICE_FLAG(D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 as u32),
                 None, // 全部 feature level
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -550,7 +551,7 @@ mod tests {
                     adapter,
                     driver,
                     HMODULE::default(),
-                    D3D11_CREATE_DEVICE_FLAG(0),
+                    D3D11_CREATE_DEVICE_FLAG(D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 as u32),
                     None,
                     D3D11_SDK_VERSION,
                     Some(&mut device),

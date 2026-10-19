@@ -391,7 +391,12 @@ pub(crate) fn warm_external_d3d11_frames_pool(
         (*fc).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
         (*fc).width = 1280;
         (*fc).height = 720;
-        (*fc).initial_pool_size = 4;
+        // `initial_pool_size` 必须取小：本机 Arc 实测「单张 NV12 数组纹理」池 ≥4 时
+        // `CreateTexture2D` E_INVALIDARG（0x80070057，曾污染每次 open 的 stderr），≤2
+        // 成功（探针对照 pool=1/2 → rc=0、pool=4/20 → E_INVALIDARG）。本护栏是一次性的
+        // teardown 兼容预跑、池即建即弃，最小池足够；解码器的真实帧池由 libavcodec 在
+        // 首帧按其自身参数另建，与此无关。
+        (*fc).initial_pool_size = 2;
         let fhw = (*fc).hwctx as *mut AVD3D11VAFramesContext;
         (*fhw).BindFlags = 0x20; // DECODER only（必成功）
         let _ = ffmpeg::ffi::av_hwframe_ctx_init(frames);
