@@ -31,6 +31,7 @@ mod tests;
 // 供视频正文（VideoReader）引用的硬解内部名：裸名直达，正文复用拆分前原样。
 use self::hw::{
     HardwareDecode, HwFramePin, build_external_d3d11_device_ctx, is_hw_frame, try_open_hw_decoder,
+    warm_external_d3d11_frames_pool,
 };
 
 // 再导出：让 `decode::{AudioReader, SubtitleReader, VideoReader, HwFrame, FFMPEG_LOCK,
@@ -58,7 +59,7 @@ pub(crate) static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
 /// `Once` 保证幂等（早于首次 open 由播放线程触发）。
 static FFMPEG_LOG_QUIET: Once = Once::new();
 
-/// 被 [`ffmpeg_log_filter_cb`] 滤掉的良性坏帧报错条数（诊断/测试用，非热路径）。
+/// 被 [`ffmpeg_log_filter_cb`] 滤掉的良性报错条数（诊断/测试用，非热路径）。
 static FFMPEG_LOG_FILTERED: AtomicUsize = AtomicUsize::new(0);
 
 /// HE-AAC SBR 断链坏帧的良性报错特征：seek 落点非 AAC 帧对齐（MKV lacing 1ms vs AAC
@@ -333,10 +334,13 @@ impl VideoReader {
     /// 接口各 AddRef 一次，解码器关闭（`Drop`）时由 FFmpeg uninit 统一 Release；调用方
     /// 只需自持它的那份引用即可（不夺引用、也不代还引用）。
     ///
-    /// `BindFlags` 处理：默认按规范给设备挂 `D3D11_BIND_SHADER_RESOURCE`（帧纹理可被调用方
-    /// 直接 SRV 采样）——但**部分驱动（实测 Intel Arc 驱动）拒绝 `DECODER|SHADER_RESOURCE`
-    /// 的 NV12 解码数组纹理**，退化时自动「无 SHADER_RESOURCE」重开（解码照常，仅纹理不再
-    /// 可被调用方直接采样；返回的 reader 照常工作，见 [`build_external_d3d11_device_ctx`]）。
+    /// `BindFlags` 处理：恒给设备挂 **DECODER-only**（无 `D3D11_BIND_SHADER_RESOURCE`）。
+    /// 解码器帧池不需要 SRV——渲染端只采样**共享 NV12 槽**（`SharedCopier::copy` 经
+    /// `CopySubresourceRegion` 把解码阵元拷进单切片共享纹理，渲染设备对槽建平面 SRV
+    /// PlaneSlice 0/1 采样 YUV），解码纹理本身从不被直接采样；而 `CopySubresourceRegion`
+    /// 的源只需 `USAGE_DEFAULT`（源 BindFlags 无关）。DECODER-only 在 Intel Arc 等驱动上
+    /// 是**必须**（`DECODER|SHADER_RESOURCE` 组合 `CreateTexture2D` E_INVALIDARG），在
+    /// 其它驱动上无害。
     ///
     /// **不缩放**：`max_dim` 仅作参数兼容保留——HW 帧不经 sws，输出即源尺寸（`HwFrame`
     /// 自带实际宽高，不受本参数影响）。
@@ -377,18 +381,14 @@ impl VideoReader {
             0.0
         };
 
-        // 注入外部 D3D11 设备：先测驱动是否支持「解码数组纹理带 SHADER_RESOURCE」——
-        // 支持 → 带 SHR（调用方可直接采样解码纹理）；不支持（Intel Arc 等驱动实测
-        // E_INVALIDARG）→ 无 SHR 设备上下文，解码照常（仅纹理不可再被调用方直接采样）。
-        // 探测用最小帧池（不开解码器），无副作用。
-        let use_shr = d3d11_supports_shader_bound_textures(device, device_context);
-        if !use_shr {
-            eprintln!(
-                "[video-ffmpeg] 驱动不支持 D3D11VA 解码纹理带 SHADER_RESOURCE（Intel Arc 等驱动实测），\
-                 已回退 DECODER-only——解码正常，但纹理不可直接做 SRV 采样"
-            );
-        }
-        let device_buf = build_external_d3d11_device_ctx(device, device_context, use_shr)?;
+        // 注入外部 D3D11 设备：恒 DECODER-only（见函数文档）——解码纹理不做 SRV（渲染只
+        // 采样共享槽），DECODER-only 是 Intel Arc 的必须（DECODER|SHR 组合 E_INVALIDARG）、
+        // 其它驱动无害。不再做 SHR 能力门控（SHR 探测仅留作诊断/测试，见 `decode::hw`）。
+        // teardown 兼容护栏：实测 Arc 上 open_external_hw 在注入设备上预跑一次最小帧池
+        // 初始化可稳定窗口释放 `ID3D11DeviceContext`（偶发 0xc0000005；机制未完全定位、
+        // 非因果陈述，见 [`warm_external_d3d11_frames_pool`]）。
+        warm_external_d3d11_frames_pool(device, device_context);
+        let device_buf = build_external_d3d11_device_ctx(device, device_context, false)?;
 
         let context = ffmpeg::codec::context::Context::from_parameters(params_for_decoder)
             .context("解析视频流参数失败")?;

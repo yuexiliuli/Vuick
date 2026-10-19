@@ -68,7 +68,7 @@ use ui::motion::hover_spring;
 
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
-use super::hw::{SharedCopier, create_worker_d3d11_device};
+use super::hw::{CopyError, SharedCopier, create_worker_d3d11_device};
 use super::subtitle::{SubtitleEntry, SubtitleStyle, find_active_subtitle, parse_ass_text};
 // 拆分子模块后 `super` 变成本 viewer（不再是 crate 根）：给子模块内保留原 `super::decode::…`
 // 路径的调用兜底——重新导出 crate 根 `decode` 模块，正文无需改动。

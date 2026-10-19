@@ -105,6 +105,19 @@ impl super::VideoViewer {
     }
 
 
+    /// 换接收端/换文件时回收旧接收端里仍缓存着的帧：GPU 直通帧的共享槽经
+    /// `drop_frame_item` 发 release 归还 worker 池；软 BGRA 帧为纯字节 no-op。
+    /// 不能直接 `drop(old)` —— 拖动重定向/切文件时旧端里可能缓存着 ≤
+    /// `DECODE_AHEAD_FRAMES` 个已拷入共享槽的 GPU 帧（槽 `in_use=true`），随通道析构
+    /// 静默丢弃 = 槽泄漏，累积到槽池耗尽 → Backpressure → 丢帧定格（真机拖进度条偶发
+    /// 停顿的根因）。
+    pub(super) fn drop_replaced_rx_frames(&mut self, old: std::sync::mpsc::Receiver<FrameItem>) {
+        while let Ok(item) = old.try_recv() {
+            self.drop_frame_item(item);
+        }
+    }
+
+
     /// 启动（或重开）解码，从 `target` 秒开始。向**常驻视频 worker** 投新命令换代：
     /// 旧命令内层循环按 `generation` 立即停，worker 在**同一线程**内 drop 旧 reader 后
     /// 串行重开新文件——实测规避“新线程在上一解码器 teardown 后 avformat_open_input 卡死”
@@ -128,10 +141,11 @@ impl super::VideoViewer {
         self.hover_generation.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
         // 换掉旧接收端 → worker 若正阻塞在 send 会收到失联错误、本命令内层循环退出；
-        // 旧越线帧（软 BGRA）随接收端 drop 释放，无跨线程资源要回收
+        // 旧端里可能缓存着已拷入共享槽的 GPU 帧 → drop_replaced_rx_frames 逐条归还
+        //（不能随接收端 drop 静默丢句柄，否则槽泄漏累积到 16 耗尽 → 丢帧定格）
         self.clear_overflow();
         if let Some(old) = self.rx.replace(rx) {
-            drop(old);
+            self.drop_replaced_rx_frames(old);
         }
         self.pending_seek = Some(target);
         // seek 全链路探针：会话号递增；仅「seek 型」命令（result_tx 空）开槽记触发时刻，
@@ -290,8 +304,12 @@ impl super::VideoViewer {
                 // 需显式 seek 目标，预滚帧在帧循环里免拷贝丢弃。
                 let _ = active.as_mut().map(|(_, _, r, _)| r.seek(cmd.target));
             }
-            // 源顶格容量（同文件同 cap 在重开前后不变）：内层循环扩容判据，省逐帧取参
-            let src_cap = active
+            // 源顶格容量：内层循环扩容判据（省逐帧取参）。**重开后可变**——双设备直通 reader
+            //（`open_hw`）无 scaler、`source_cap()==1`（HW 帧按源尺寸、cap 忽略）；硬解/软解
+            // reader 有 scaler、cap 是真实输出字节数。若命令中途「设备丢失/格式不支持 → 重开软解」，
+            // 必须在此按新 reader 刷新，否则 buf 停在旧（dual 的 1）容量 → 软解 `_into` 报
+            // 「解码输出缓冲过小」→ 首帧解码失败、本命令断代无画面。
+            let mut src_cap = active
                 .as_ref()
                 .map(|(_, _, r, _)| r.source_cap())
                 .unwrap_or(1);
@@ -329,10 +347,23 @@ impl super::VideoViewer {
             let mut vp_send = Duration::ZERO;
             let mut vp_frames: u64 = 0;
             let mut vp_window = Instant::now();
+            // —— 拷贝失败分类（≠ 一律背压）参数：`SharedCopier::copy` 的失败按 [`CopyError`]
+            // 分类——背压（槽池瞬满）重试同一帧 + 间隙 reap 吸收；格式不支持（P010 等）/ 键控
+            // 互斥或资源创建设备侧故障 → 按「设备丢失」走黑名单 + 软重开恢复（不能永久无画面）。
+            const COPY_RETRY_BUDGET: usize = 128;
+            // 重试墙钟预算上限：最坏 ≈ 1×AcquireSync（上限 2000ms 的超时） + 128×~1ms ≈ ~2.2s；
+            // 正常「槽瞬满立即失败」时 ≈ 128×~1ms ≈ 130ms。预算在**单次成功时清零**，按突发计
+            //（不跨突发累计，避免一次爆发后连跳后续帧）。
+            const COPY_RETRY_WALL_CAP: Duration = Duration::from_millis(300);
+            // 本命令累计 copy 背压/重试尝试次数（成功清零；超预算跳过/降级诊断用；**不**参与 hw_fail_count）
+            let mut copy_backpressure_tries: usize = 0;
+            // 本命令「纯背压超预算跳过本帧」诊断只打一次（真机 GUI 卡顿可从日志看到，不刷屏）
+            let mut backpressure_skip_printed = false;
             while gen_arc.load(Ordering::SeqCst) == cmd.generation {
                 // 回收主线程归还的 GPU 共享槽（逐帧拉取：连续播放时主线程每消费一帧归还一槽，
                 // 不及时 reap 会让 slot 池在 decode-ahead 窗口内堆积耗尽）
-                Self::reap_releases(&mut active, &rel_rx);                let t0 = Instant::now();
+                Self::reap_releases(&mut active, &rel_rx);
+                let t0 = Instant::now();
                 // 设备丢失/瞬时错误注入（仅测试构建）：硬解 reader 下一次解码/预滚前查一次
                 let fault_now = {
                     #[cfg(test)]
@@ -345,11 +376,6 @@ impl super::VideoViewer {
                     }
                 };
                 let item = {
-                    // 本拍即时借用：一次解构取 reader 与可选的直通 copier（两个互斥字段借用），
-                    // 块退出即释放，恢复分支可整块替换 active
-                    let act = active.as_mut().expect("打开成功必有 reader");
-                    let (_, _, reader, copier) = act;
-                    let copier = copier.as_mut();
                     if fault_now {
                         Err(anyhow::anyhow!("测试注入：模拟硬解设备丢失/解码失败"))
                     } else if dual {
@@ -357,23 +383,120 @@ impl super::VideoViewer {
                         // 拷进共享槽（AcquireSync→Copy→Flush→ReleaseSync）→ 送主线程 ----
                         // 预滚帧（pts<target）免拷贝丢弃（不占槽/不占跨设备带宽）；首个 ≥target
                         // 帧拷贝后立即 release 解码器槽位（帧池 headroom≈1-2）。
-                        let cp = copier.expect("直通接管必有共享拷贝引擎");
-                        match reader.next_frame_hw() {
+                        // 一次解构取 reader 解一帧（块退出即释放借用，拷贝重试间隙可整借 active reap）。
+                        let next = {
+                            let reader = &mut active.as_mut().expect("打开成功必有 reader").2;
+                            reader.next_frame_hw()
+                        };
+                        match next {
                             Ok(Some(fr)) if fr.pts >= frame_target => {
                                 let pts = fr.pts;
                                 let w = fr.w;
                                 let h = fr.h;
-                                let copied = cp.copy(w, h, fr.tex, fr.array_index);
-                                // 无论拷贝成败都归还解码器槽位（headroom 纪律）
+                                // ---- 拷贝失败按 [`CopyError`] 分类的重试 / 降级 ----
+                                // · Backpressure（槽池瞬满）：重试**同一帧**（`fr` 仍持解码器槽位、
+                                //   不推进解码）+ 间隙 reap 主线程归还的槽 → 渲染端追上进度；预算
+                                //   封顶后跳过本帧（保留最近上屏帧），**永不**进 hw_fail_count。
+                                // · Sync / Resource（键控互斥超时 / 驱动器创建失败）：同预算内重试
+                                //   （瞬时滞后可吸收）；预算耗尽仍未出帧 ≈ 疑似渲染端/设备死亡 → 按
+                                //   真实失败计数（连续 2 条命令 → 黑名单 + 软重开恢复，防永久无画面）。
+                                // · Unsupported（P010 等格式）：不进重试，立即按「该文件不支持直通」
+                                //   的真实失败计数 → 连续 2 帧即黑名单 + 软重开恢复。
+                                let t_copy_start = Instant::now();
+                                let copied = {
+                                    // 本突发是否见到过 Sync/Resource 类硬失败（预算耗尽时据此
+                                    // 判定「计数/降级」而非「纯背压跳过」）
+                                    let mut hard_err: Option<CopyError> = None;
+                                    loop {
+                                        let once = active
+                                            .as_mut()
+                                            .expect("打开成功必有 reader")
+                                            .3
+                                            .as_mut()
+                                            .expect("直通接管必有共享拷贝引擎")
+                                            .copy(w, h, fr.tex, fr.array_index);
+                                        match once {
+                                            Ok(cf) => {
+                                                // 成功：本命令背压预算清零（按突发计，不跨突发累计）
+                                                copy_backpressure_tries = 0;
+                                                break Ok(Some(cf));
+                                            }
+                                            Err(e) => match e {
+                                                CopyError::Unsupported => {
+                                                    // 该文件格式不走 GPU 直通：立即按真实失败处理
+                                                    //（hw_fail_count → 黑名单 + 软重开恢复）
+                                                    break Err(e);
+                                                }
+                                                CopyError::Backpressure => {
+                                                    copy_backpressure_tries += 1;
+                                                    if copy_backpressure_tries >= COPY_RETRY_BUDGET
+                                                        || gen_arc.load(Ordering::SeqCst)
+                                                            != cmd.generation
+                                                        || t_copy_start.elapsed()
+                                                            >= COPY_RETRY_WALL_CAP
+                                                    {
+                                                        break Ok(None);
+                                                    }
+                                                    // 回收主线程刚归还的空闲槽 → 给渲染端追进度的窗口
+                                                    Self::reap_releases(&mut active, &rel_rx);
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_millis(1),
+                                                    );
+                                                }
+                                                CopyError::Sync | CopyError::Resource => {
+                                                    copy_backpressure_tries += 1;
+                                                    hard_err.get_or_insert(e);
+                                                    if gen_arc.load(Ordering::SeqCst)
+                                                        != cmd.generation
+                                                    {
+                                                        // 换代：本帧已过期/被接收端弃用，不是设备
+                                                        // 死亡 → 与纯背压换代同口径不计数（镜像
+                                                        // Backpressure 分支的 `break Ok(None)`）
+                                                        break Ok(None);
+                                                    }
+                                                    if copy_backpressure_tries >= COPY_RETRY_BUDGET
+                                                        || t_copy_start.elapsed()
+                                                            >= COPY_RETRY_WALL_CAP
+                                                    {
+                                                        // 预算/墙钟耗尽仍见 Sync/Resource：疑似设备
+                                                        // 死亡 → 计数（≥2 条命令即黑名单 + 软重开恢复）
+                                                        break Err(hard_err.unwrap_or(e));
+                                                    }
+                                                    Self::reap_releases(&mut active, &rel_rx);
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_millis(1),
+                                                    );
+                                                }
+                                            },
+                                        }
+                                    }
+                                };
+                                // 无论拷贝成败，本帧解码器槽位**恰好归还一次**（headroom 纪律）
                                 VideoReader::release_hw_frame(fr.frame_ptr);
                                 match copied {
-                                    Ok(cf) => Ok(Some(FrameItem::Gpu(GpuFrame {
+                                    Ok(Some(cf)) => Ok(Some(FrameItem::Gpu(GpuFrame {
                                         pts,
                                         w,
                                         h,
                                         shared_handle: cf.shared_handle,
                                     }))),
-                                    Err(e) => Err(e),
+                                    Ok(None) => {
+                                        // 纯背压超预算：跳过本帧续解（显示保最近帧）；诊断每命令
+                                        // 一次——真机 GUI 卡顿能在日志里看到；不计数、不黑名单、不重开
+                                        if !backpressure_skip_printed {
+                                            backpressure_skip_printed = true;
+                                            eprintln!(
+                                                "[passthrough] slot 回压，重试后仍超预算，跳过本帧（n={}）",
+                                                copy_backpressure_tries
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        // Unsupported / Sync / Resource：真实失败 → 进入
+                                        // `hw_fail_count`「设备丢失」记账（≥2 → 黑名单 + 软重开）
+                                        Err(anyhow::anyhow!("GPU 直通拷贝失败（{e:?}），按设备丢失处理"))
+                                    }
                                 }
                             }
                             Ok(Some(fr)) => {
@@ -398,6 +521,7 @@ impl super::VideoViewer {
                         hw_primed = true;
                         // ---- 硬解 seek 预滚快路径：一次 `skip_to_bgra_into` 完成 seek + 跳帧
                         //（免转换/免回读）+ 首帧 BGRA —— seek 墙钟主要加速 ----
+                        let reader = &mut active.as_mut().expect("打开成功必有 reader").2;
                         if buf.len() < src_cap {
                             buf.resize(src_cap, 0);
                         }
@@ -424,6 +548,7 @@ impl super::VideoViewer {
                         // 扩容目标：始终按源顶格（src_cap）兜底——任何解码输出 ≤ 源尺寸，
                         // 缓冲永不小于未知的当前帧 need，`_into` 的 slice 上界恒安全。零初始化
                         // 只在扩容瞬间发生一次，逐帧不重置。
+                        let reader = &mut active.as_mut().expect("打开成功必有 reader").2;
                         if buf.len() < src_cap {
                             buf.resize(src_cap, 0);
                         }
@@ -526,8 +651,10 @@ impl super::VideoViewer {
                                 });
                             }
                         }
-                        // 发送成功（主线程接收）或换代（接收端已换走 = 帧丢弃）；软帧无池资源要回
-                        if seek_diag_enabled() {
+                        // 发送成功（主线程接收）或换代（接收端已换走 = 帧丢弃）；软帧无池资源、
+                        // 无需回收；**GPU 帧发送失败=槽无人接收 → 当场回收回池**（防 worker 侧
+                        // 槽泄漏：换代窗口每丢一帧都漏一块 in_use 槽，池越用越少）
+                        let sent = if seek_diag_enabled() {
                             // seek 探针：wake 投递成功与否也落探针（仅 diag 下才关心 wake 细节）
                             match cmd.tx.send(frame) {
                                 Ok(()) => {
@@ -542,11 +669,24 @@ impl super::VideoViewer {
                                     }
                                     true
                                 }
-                                Err(_) => false,
+                                Err(e) => {
+                                    Self::recycle_unsent_gpu(e.0, &mut active);
+                                    false
+                                }
                             }
                         } else {
-                            send_relay(&cmd.tx, &cmd.wake, frame)
-                        }
+                            match cmd.tx.send(frame) {
+                                Ok(()) => {
+                                    let _ = cmd.wake.try_send(());
+                                    true
+                                }
+                                Err(e) => {
+                                    Self::recycle_unsent_gpu(e.0, &mut active);
+                                    false
+                                }
+                            }
+                        };
+                        sent
                     }
                     Ok(Some(frame)) => {
                         // 预滚（pts<落点，仅软解路径）：只记最新一帧，不送
@@ -595,6 +735,9 @@ impl super::VideoViewer {
                         // 本文件永久弃用硬解：后续 open 直接软解（其它文件仍可硬解）
                         crate::decode::blacklist_hw_path(&cmd.path);
                         let reopen_pos = resume_pts;
+                        // 先 drop 旧 reader 再重开：释放外部注入设备 + FFmpeg 句柄后再做同文件
+                        // 重开（SAFE→软 同样受益，更稳）
+                        let _old = active.take();
                         match Self::open_reader_for_mode(&cmd.path, &ReaderMode::Soft(cmd.cap)) {
                             Ok((soft_mode, soft_reader, soft_copier)) => {
                                 active = Some((
@@ -606,6 +749,14 @@ impl super::VideoViewer {
                                 hw_reader = false;
                                 dual = false;
                                 hw_primed = true;
+                                // **刷新源顶格容量**：旧 reader 若是双设备直通（`source_cap()==1`），
+                                // 不刷新会让 buf 停在 1 字节 → 软解 `_into` 报「解码输出缓冲过小」、
+                                // 首帧解码失败断代（本命令无画面）。按新软 reader 刷新后，软解路径的
+                                // `buf.len() < src_cap` 扩容自动把 buf 涨到真实容量。
+                                src_cap = active
+                                    .as_ref()
+                                    .map(|(_, _, r, _)| r.source_cap())
+                                    .unwrap_or(1);
                                 // 续播接纳阈值抬到最后成功解码 pts：首个软帧 ≥ 此值才送
                                 frame_target = reopen_pos;
                                 pre_roll = None;
@@ -615,7 +766,9 @@ impl super::VideoViewer {
                                 continue; // 下一拍起走软解逐帧路径，播放无感接续
                             }
                             Err(e) => {
-                                // 重开软解也失败：落断代（与既有错误断代一致，不弹错）
+                                active = None;
+                                // 重开软解也失败：落断代（与既有错误断代一致，不弹错；无 reader，
+                                // 命令从下方 break 退出）
                                 let _ = e;
                             }
                         }
@@ -655,6 +808,22 @@ impl super::VideoViewer {
     }
 
 
+    /// GPU 帧在 worker 侧「未送出即丢弃」时的槽回收：换代/发送失败路径把一帧 `FrameItem::Gpu`
+    /// 直接 drop 的话，其共享槽已 `in_use`、若不回收会在 worker 槽池泄漏（decode-ahead 窗口内
+    /// 越堆越多 → 放大槽池耗尽 → 误触发背压重试——正是本修复要消除的「瞬态回压」）。软帧无池
+    /// 资源无需回收（no-op）。**display.rs 主线程侧的归还路径保持原样**（那里已正确回池）。
+    pub(super) fn recycle_unsent_gpu(
+        frame: FrameItem,
+        active: &mut Option<(std::path::PathBuf, ReaderMode, VideoReader, Option<SharedCopier>)>,
+    ) {
+        if let FrameItem::Gpu(f) = frame {
+            if let Some((_, _, _, Some(copier))) = active.as_mut() {
+                copier.recycle(f.shared_handle);
+            }
+        }
+    }
+
+
     /// 按模式打开 reader：返回 `(实际模式, reader, 直通 copier)`。auto → **双设备 GPU 直通
     /// 优先**（worker 自有设备 + `open_hw`；任一环节失败 → 回落 SAFE BGRA 硬解
     /// `open_scaled_hw`，行为不降级）；soft → `open_scaled`（纯软解）。三者都失败才 `Err`。
@@ -673,41 +842,26 @@ impl super::VideoViewer {
                     return VideoReader::open_scaled(path, *cap)
                         .map(|r| (ReaderMode::Soft(*cap), r, None));
                 }
-                // 双设备 GPU 直通：worker 自有设备（硬件→WARP 兜底）+ 外部设备注入解码。
-                // 任一环节失败（建设备/open_hw）→ 回落 SAFE BGRA 硬解（与旧 auto 行为一致）。
+                // 双设备 GPU 直通：worker 自有设备（硬件→WARP 兜底）+ 外部设备注入解码——
+                // **无 SHR 门控**：解码池恒 DECODER-only（Intel Arc 拒绝 DECODER|SHR 组合；
+                // 拷贝源只需 USAGE_DEFAULT，BIND_DECODER 同样可作拷贝源）。渲染设备只采样
+                // 共享 NV12 槽（平面 SRV PlaneSlice），从不直接采解码纹理。任一环节失败
+                //（建设备/open_hw）→ 回落 SAFE BGRA 硬解（与旧 auto 行为一致）。
                 if dual_path_allowed() {
                     if let Some(worker) = create_worker_d3d11_device() {
-                        // 能力门控：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」——
-                        // 这是双设备直通让渲染设备对共享 NV12 建平面 SRV 采样 YUV 的前提。不支持
-                        //（Intel Arc 等驱动实测 `CreateTexture2D` E_INVALIDARG）→ 纹理不可做
-                        // SRV、像素着色器 Sample 出绿屏 → 停用双设备、回落 SAFE 硬解 BGRA。
-                        let shr_ok = crate::decode::VideoReader::supports_shader_bound_textures(
-                            worker.device.as_raw() as usize,
-                            worker.context.as_raw() as usize,
-                        );
-                        if shr_ok {
-                            let raw_dev = worker.device.as_raw() as usize;
-                            let raw_ctx = worker.context.as_raw() as usize;
-                            if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
-                                #[cfg(test)]
-                                {
-                                    DUAL_ENGAGED.store(true, Ordering::Relaxed);
-                                    HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
-                                }
-                                return Ok((
-                                    ReaderMode::Auto(*cap),
-                                    r,
-                                    Some(SharedCopier::new(worker)),
-                                ));
+                        let raw_dev = worker.device.as_raw() as usize;
+                        let raw_ctx = worker.context.as_raw() as usize;
+                        if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
+                            #[cfg(test)]
+                            {
+                                DUAL_ENGAGED.store(true, Ordering::Relaxed);
+                                HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
                             }
-                        } else {
-                            // 门控日志：OnceLock 只打一次（禁每次 seek/重开刷屏）
-                            static DUAL_GATED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                            DUAL_GATED.get_or_init(|| {
-                                eprintln!(
-                                    "[GPU passthrough] 本机驱动不支持平面 SRV 采样（D3D11VA 纹理不可做 SRV），双设备直通停用 → SAFE 硬解 BGRA"
-                                );
-                            });
+                            return Ok((
+                                ReaderMode::Auto(*cap),
+                                r,
+                                Some(SharedCopier::new(worker)),
+                            ));
                         }
                     }
                 }

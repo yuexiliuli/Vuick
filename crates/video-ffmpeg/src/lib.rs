@@ -109,11 +109,11 @@ pub unsafe extern "C" fn vff_video_is_hw(h: Handle) -> c_int {
     reader::<VideoReader>(h).is_hw() as c_int
 }
 
-/// 探测驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」：这是双设备 GPU 直通让渲染
-/// 设备对共享 NV12 建平面 SRV 采样 YUV 的前提。1 = 支持（可走直通）；0 = 不支持（Intel Arc
-/// 等驱动实测 `CreateTexture2D` E_INVALIDARG，纹理不可做 SRV → 须回落 SAFE 硬解 BGRA）。
-/// 纯 device/frames 上下文探测、**不开解码器**，无副作用；`device` 为空 → 0。与
-/// [`VideoReader::open_external_hw`] 内部的能力探测同源（同一函数、同一次构建）。
+/// 诊断/测试用能力探测：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」。1 = 支持；
+/// 0 = 不支持（Intel Arc 等驱动实测 `CreateTexture2D` E_INVALIDARG）。
+/// **NOT 直通门控**：双设备直通恒用 DECODER-only 解码池（渲染端只采样共享 NV12 槽），本
+/// 探测仅供能力自诊断与一致性测试，返回 0 不会、也不应停用直通。纯 device/frames 上下文
+/// 探测、**不开解码器**，无副作用；`device` 为空 → 0。与内部同名函数同源（同一函数）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_d3d11_supports_shader_bound_textures(
     device: *mut c_void,

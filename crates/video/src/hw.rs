@@ -13,7 +13,7 @@
 //!   decode: open_hw(path, deviceA, ctxA)               paint_external_yuv(shared_handle)
 //!   hw frame (tex, array_index)                          external_views(handle):
 //!   copy: AcquireSync(0) → CopySubresourceRegion           OpenSharedHandle on B →
-//!         → ReleaseSync(0) → Flush                           AcquireSync(0) → 建两平面 SRV
+//!         → Flush() → ReleaseSync(0)                          AcquireSync(0) → 建两平面 SRV
 //!   → send (pts,w,h,shared_handle)                          draw (Y t0 / UV t2 / instance t1)
 //!   main 归还槽 → recycle                                   → ReleaseSync(0) 帧末
 //! ```
@@ -39,6 +39,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 /// 键控互斥获取超时（ms）：正常时渲染端每帧末 ReleaseSync，worker 的 acquire 基本零等待。
 /// 用有限超时而非 INFINITE——若渲染端因设备丢失/异常未按时释放，worker 不会被永久卡死，
@@ -102,6 +104,26 @@ pub struct SharedFrame {
     pub h: u32,
 }
 
+/// 一次 `SharedCopier::copy` 失败的原因分类——worker 据此区分「可重试吸收的背压」与
+/// 「必须走软重开恢复的真实失败」：
+/// - [`CopyError::Backpressure`]：共享槽池瞬满/获取互斥超时等渲染端瞬时滞后 → 重试同一帧吸收，
+///   **永不**计入设备丢失计数；
+/// - [`CopyError::Unsupported`]：解码帧格式非 NV12（10-bit P010 等深色格式）——该文件不走
+///   GPU 直通，按「不支持直通」走黑名单 + 软重开恢复（软回退决策在 worker，不在本方法）；
+/// - [`CopyError::Sync`] / [`CopyError::Resource`]：键控互斥/驱动器创建等设备侧故障 → 预算内
+///   可重试，预算耗尽按设备丢失计数（软重开兜底）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyError {
+    /// 共享槽池瞬满（槽池耗尽 / 尺寸不匹配且池满）——渲染端未及时归还槽，**可重试**（背压 ≠ 设备丢失）。
+    Backpressure,
+    /// 解码帧格式非 NV12（10-bit P010 等）——该文件不支持 GPU 直通，应软重开。
+    Unsupported,
+    /// AcquireSync/ReleaseSync 键控互斥失败（含超时）——渲染端/设备侧故障，预算内可重试。
+    Sync,
+    /// 共享 NV12 目标纹理创建失败（驱动不支持）——本机/当前尺寸直通不可用，应软重开。
+    Resource,
+}
+
 /// 池中一块共享 NV12 目标纹理（worker 线程持有 COM 引用；`raw_handle` 供跨线程传递）。
 struct SharedSlot {
     /// DXGI 共享句柄（数值）。
@@ -140,7 +162,10 @@ impl SharedCopier {
             device: worker.device,
             context: worker.context,
             pool: Vec::new(),
-            max_pool: 8,
+            // 渲染端滞后突发（seek/拖拽瞬间共享槽瞬满）的容差余量：8 → 16。每 1280×720
+            // NV12 槽 ≈1.4MB、受单个 worker 上界约束；余量让「拷贝背压重试 + reap 回收」
+            // 有喘息空间，不因槽池瞬满触发黑名单式软降级（背压 ≠ 设备丢失，见 workers 重试）
+            max_pool: 16,
         }
     }
 
@@ -148,91 +173,113 @@ impl SharedCopier {
     /// `src_tex` 的第 `array_index` 个阵元 GPU 侧拷进该纹理并 `Flush` + `ReleaseSync`，
     /// 返回共享句柄（跨线程传递给主线程的唯一载体；主线程用后经释放消息回池）。
     ///
-    /// 失败（格式非 NV12 / 获取互斥超时 / 池耗尽）→ `Err`，外层据此回退 SAFE BGRA 路径。
+    /// 失败 → [`CopyError`]：背压（[`CopyError::Backpressure`]）由 worker 重试同一帧吸收；
+    /// 格式不支持（[`CopyError::Unsupported`]）与设备侧故障（[`CopyError::Sync`] /
+    /// [`CopyError::Resource`]）按 worker 的「设备丢失」逻辑做黑名单 + 软重开恢复（软回退
+    /// 决策在 worker，本方法不再承诺就地回退软解）。任何失败路径都把槽**还回空闲**
+    ///（防 in_use 永久占死池位 → 池越用越少）。
     pub fn copy(
         &mut self,
         w: u32,
         h: u32,
         src_tex: usize,
         array_index: u32,
-    ) -> anyhow::Result<SharedFrame> {
-        let idx = self.ensure_slot(w, h)?;
-        let slot = &self.pool[idx];
-        unsafe {
-            // 键控互斥获取：客户端写入完成并 ReleaseSync 前阻塞；超时不 INFINITE（见模块头）
-            slot.mutex.AcquireSync(0, ACQUIRE_TIMEOUT_MS)?;
-
-            // 解码器数组纹理借用包装（不 AddRef；用后 forget，引用由 FFmpeg 帧池管理）
-            let src = ID3D11Texture2D::from_raw(src_tex as *mut _);
-            let mut src_desc = std::mem::zeroed::<D3D11_TEXTURE2D_DESC>();
-            src.GetDesc(&mut src_desc);
-            if src_desc.Format != DXGI_FORMAT_NV12 {
-                std::mem::forget(src);
-                let _ = slot.mutex.ReleaseSync(0);
-                return Err(anyhow::anyhow!(
-                    "D3D11VA 帧格式 {:?} 非 NV12（10-bit P010 等暂不支持硬件直通），回退软解",
-                    src_desc.Format
-                ));
+    ) -> Result<SharedFrame, CopyError> {
+        // 测试钩子：把接下来若干次 copy 强制报「槽回压 / 格式不支持」（模拟渲染端未及时归还槽
+        // → 槽池瞬满；或 P010 等深色格式），供回归断言拷贝错误分类；生产构建编译期折叠为零开销
+        #[cfg(test)]
+        {
+            let remaining = COPY_FAIL_REMAINING.load(Ordering::Relaxed);
+            if remaining > 0 {
+                COPY_FAIL_REMAINING.store(remaining - 1, Ordering::Relaxed);
+                COPY_FAIL_FIRED.store(true, Ordering::Relaxed);
+                return Err(CopyError::Backpressure);
             }
-            debug_assert!(
-                array_index < src_desc.ArraySize,
-                "D3D11VA 帧数组下标越界: idx={array_index} ArraySize={}",
-                src_desc.ArraySize
-            );
-
-            // NV12 两平面分别拷贝（目标 = 1 mip × 1 切片非数组 NV12）：
-            //  - Y  平面：src 子资源 = array_index*2 + 0 → dst 子资源 0
-            //  - UV 平面：src 子资源 = array_index*2 + 1 → dst 子资源 1
-            // （D3D11 ComputeSubresourceIndex（NV12 PlaneCount=2）——与 M2c/M2e 拷贝机制一致）
-            let y_box = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: w,
-                bottom: h,
-                back: 1,
-            };
-            self.context.CopySubresourceRegion(
-                &slot.tex,
-                0,
-                0,
-                0,
-                0,
-                &src,
-                array_index * 2,
-                Some(&y_box),
-            );
-            let uv_box = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: w / 2,
-                bottom: h / 2,
-                back: 1,
-            };
-            self.context.CopySubresourceRegion(
-                &slot.tex,
-                1,
-                0,
-                0,
-                0,
-                &src,
-                array_index * 2 + 1,
-                Some(&uv_box),
-            );
-            // 提交到 GPU 队列（不等待完成；随后 ReleaseSync 保证渲染端 acquire 到的是已
-            // 提交的写入——DXGI 键控互斥 release 在已提交工作完成后才被观测到）
-            self.context.Flush();
-            // 交还互斥：渲染端可 acquire 本槽
-            slot.mutex.ReleaseSync(0)?;
-            std::mem::forget(src);
+            let unsupported = COPY_UNSUPPORTED_REMAINING.load(Ordering::Relaxed);
+            if unsupported > 0 {
+                COPY_UNSUPPORTED_REMAINING.store(unsupported - 1, Ordering::Relaxed);
+                COPY_UNSUPPORTED_FIRED.store(true, Ordering::Relaxed);
+                return Err(CopyError::Unsupported);
+            }
         }
-        let raw_handle = self.pool[idx].raw_handle;
-        Ok(SharedFrame {
-            shared_handle: raw_handle,
-            w,
-            h,
-        })
+        let idx = self.ensure_slot(w, h)?;
+        let out: Result<SharedFrame, CopyError> = (|| {
+            let slot = &self.pool[idx];
+            unsafe {
+                // 键控互斥获取：客户端写入完成并 ReleaseSync 前阻塞；超时不 INFINITE（见模块头）
+                slot
+                    .mutex
+                    .AcquireSync(0, ACQUIRE_TIMEOUT_MS)
+                    .map_err(|_| CopyError::Sync)?;
+
+                // 解码器数组纹理借用包装（不 AddRef；用后 forget，引用由 FFmpeg 帧池管理）
+                let src = ID3D11Texture2D::from_raw(src_tex as *mut _);
+                let mut src_desc = std::mem::zeroed::<D3D11_TEXTURE2D_DESC>();
+                src.GetDesc(&mut src_desc);
+                if src_desc.Format != DXGI_FORMAT_NV12 {
+                    // 源格式不被 GPU 直通支持（10-bit P010 等）：软回退决策由 worker 负责
+                    //（黑名单 + 软重开），本方法只报告「不支持直通」，不再就地承诺回退软解
+                    std::mem::forget(src);
+                    let _ = slot.mutex.ReleaseSync(0);
+                    return Err(CopyError::Unsupported);
+                }
+                debug_assert!(
+                    array_index < src_desc.ArraySize,
+                    "D3D11VA 帧数组下标越界: idx={array_index} ArraySize={}",
+                    src_desc.ArraySize
+                );
+
+                // NV12 数组阵元 = **单一子资源**（D3D11CalcSubresource 无平面项；MipLevels=1 时
+                // SrcSubresource 即 ArraySlice）——一次 `CopySubresourceRegion` 拷一**整**阵元的
+                // Y+UV 两平面（与 FFmpeg d3d11va `av_hwframe_transfer_data` / mpv hwdec_d3d11va
+                // 同款姿势；源 BindFlags DECODER 与否无关，源 USAGE_DEFAULT 即可作拷贝源）。
+                // 实测本机 Intel Arc：错误的 2 调用「2i/2i+1 平面拆开」会让号 1 阵元读到号 0
+                // 数据（OOB 子资源下标被驱动别名回 0）——直通画面错帧的直接成因。正确姿势即
+                // 上面的**单调用整阵元拷贝**（D3D11 平面数组阵元 = 单一子资源，与 FFmpeg d3d11va
+                // / mpv hwdec_d3d11va 同款；见 hw::tests::test_shared_copier_array_pixel_roundtrip）。
+                let y_box = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: w,
+                    bottom: h,
+                    back: 1,
+                };
+                self.context.CopySubresourceRegion(
+                    &slot.tex,
+                    0, // 目标 = 单切片共享框的**唯一**子资源 0
+                    0,
+                    0,
+                    0,
+                    &src,
+                    array_index, // 源 = 数组纹理第 array_index 个阵元（整阵元含 Y+UV）
+                    Some(&y_box),
+                );
+                // 提交到 GPU 队列（不等待完成；随后 ReleaseSync 保证渲染端 acquire 到的是已
+                // 提交的写入——DXGI 键控互斥 release 在已提交工作完成后才被观测到）
+                self.context.Flush();
+                // 借用包装**先 forget** 再 ReleaseSync：后者失败走 `?` 早退时 src 已不 Drop
+                //（from_raw 不 AddRef，若在此 Drop 会让借用 COM 引用计数下溢）
+                std::mem::forget(src);
+                // 交还互斥：渲染端可 acquire 本槽
+                slot
+                    .mutex
+                    .ReleaseSync(0)
+                    .map_err(|_| CopyError::Sync)?;
+            }
+            let raw_handle = self.pool[idx].raw_handle;
+            Ok(SharedFrame {
+                shared_handle: raw_handle,
+                w,
+                h,
+            })
+        })();
+        if out.is_err() {
+            // 拷贝失败（背压/格式/设备侧）把槽**还回空闲**：留在 in_use=true 会永久占死一块
+            // 池位、池越用越少——背压重试后仍失败由上层按分类跳过本帧或软重开（不消费槽）
+            self.pool[idx].in_use = false;
+        }
+        out
     }
 
     /// 主线程归还的共享槽标记回空闲（供下一帧复用）；未知句柄（换代/切文件后）安全 no-op。
@@ -250,7 +297,7 @@ impl SharedCopier {
 
     /// 取（或新建）一块空闲且尺寸匹配的共享槽下标（无则新建进池，池满则复用最旧空闲并
     /// 重建为新尺寸）。COM 引用由池持有（生命期随池）。
-    fn ensure_slot(&mut self, w: u32, h: u32) -> anyhow::Result<usize> {
+    fn ensure_slot(&mut self, w: u32, h: u32) -> Result<usize, CopyError> {
         if let Some((idx, slot)) = self
             .pool
             .iter_mut()
@@ -261,18 +308,19 @@ impl SharedCopier {
             return Ok(idx);
         }
         if self.pool.len() < self.max_pool {
-            let slot = create_shared_slot(&self.device, w, h)?;
+            let slot = create_shared_slot(&self.device, w, h).map_err(|_| CopyError::Resource)?;
             self.pool.push(slot);
             return Ok(self.pool.len() - 1);
         }
-        // 池满且无尺寸匹配：换掉最旧空闲的一块（尺寸必然不同）——重建为当前尺寸。
+        // 池满且无尺寸匹配：换掉最旧空闲的一块（尺寸必然不同）——重建为当前尺寸；若无任何
+        // 空闲槽（全在途）＝渲染端未及时归还 → 背压（可重试，≠ 设备丢失）
         let (idx, _) = self
             .pool
             .iter_mut()
             .enumerate()
             .find(|(_, s)| !s.in_use)
-            .ok_or_else(|| anyhow::anyhow!("NV12 共享槽池耗尽（主线程未及时归还槽）"))?;
-        let slot = create_shared_slot(&self.device, w, h)?;
+            .ok_or(CopyError::Backpressure)?;
+        let slot = create_shared_slot(&self.device, w, h).map_err(|_| CopyError::Resource)?;
         self.pool[idx] = slot;
         Ok(idx)
     }
@@ -363,6 +411,56 @@ thread_local! {
 #[cfg(test)]
 pub fn take_hw_paint_probe() -> usize {
     HW_PAINT_PROBE.with(|p| p.replace(0))
+}
+
+/// 测试专用：把接下来 N 次 `SharedCopier::copy` 强制报「槽回压」错误（模拟渲染端未及时归还
+/// 共享槽 → 槽池瞬满 / 获取互斥超时），供回归断言「拷贝背压 ≠ 设备丢失：不黑名单、不重开软解」。
+/// 生产零字段零开销（cfg(test) 折叠）。
+#[cfg(test)]
+static COPY_FAIL_REMAINING: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+/// 注入已实际触发过至少一次（测试等待把「错误已发生」与「后续恢复/断言」解耦）。
+#[cfg(test)]
+static COPY_FAIL_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 测试专用：把接下来 N 次 `SharedCopier::copy` 强制报「格式不支持」（模拟 P010 等 10-bit
+/// 深色源），供回归断言「Unsupported ≠ 背压：按设备丢失走黑名单 + 软重开恢复」。
+#[cfg(test)]
+static COPY_UNSUPPORTED_REMAINING: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+/// 注入已实际触发过至少一次（同 `COPY_FAIL_FIRED` 解耦语义）。
+#[cfg(test)]
+static COPY_UNSUPPORTED_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 测试专用：让接下来 `n` 次 `SharedCopier::copy` 失败（n 次后自动撤销）。配合调用方 RAII
+/// 守卫（Drop 复位）保证任何退出路径都不把注入泄漏给后续测试。
+#[cfg(test)]
+pub fn copy_fail_for(n: u32) {
+    COPY_FAIL_REMAINING.store(n as i64, Ordering::Relaxed);
+    COPY_FAIL_FIRED.store(false, Ordering::Relaxed);
+}
+
+/// 测试专用：让接下来 `n` 次 `SharedCopier::copy` 强制报「格式不支持」（n 次后自动撤销）。
+#[cfg(test)]
+pub fn copy_unsupported_for(n: u32) {
+    COPY_UNSUPPORTED_REMAINING.store(n as i64, Ordering::Relaxed);
+    COPY_UNSUPPORTED_FIRED.store(false, Ordering::Relaxed);
+}
+
+/// 测试专用：撤销拷贝失败注入（背压与格式不支持一并撤销）。
+#[cfg(test)]
+pub fn copy_fail_disable() {
+    COPY_FAIL_REMAINING.store(-1, Ordering::Relaxed);
+    COPY_UNSUPPORTED_REMAINING.store(-1, Ordering::Relaxed);
+}
+
+/// 测试专用：注入是否已实际触发过至少一次。
+#[cfg(test)]
+pub fn copy_fail_fired() -> bool {
+    COPY_FAIL_FIRED.load(Ordering::Relaxed)
+}
+
+/// 测试专用：格式不支持注入是否已实际触发过至少一次。
+#[cfg(test)]
+pub fn copy_unsupported_fired() -> bool {
+    COPY_UNSUPPORTED_FIRED.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -553,5 +651,131 @@ mod tests {
             }),
             "recycle 后应复用同一共享槽句柄（池不增长）"
         );
+    }
+
+    /// 把共享槽（worker 设备上的单切片 NV12 共享纹理）拷回 staging 读 (Y@0, UV@rowH)。
+    /// 槽是单切片 → 读回无「平面/阵元下标」歧义（既有 make_nv12 通路的 Map 姿势）。
+    fn read_slot_planes(
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        handle: usize,
+    ) -> (u8, u8) {
+        use windows::core::Interface as _;
+        use windows::Win32::Foundation::HANDLE;
+        let mut opened: Option<ID3D11Texture2D> = None;
+        unsafe { device.OpenSharedResource(HANDLE(handle as *mut c_void), &mut opened) }
+            .expect("OpenSharedResource 打开共享槽失败");
+        let opened = opened.expect("OpenSharedResource 成功必有纹理");
+        let mutex: IDXGIKeyedMutex = opened.cast().expect("共享槽应带键控互斥");
+        unsafe { mutex.AcquireSync(0, ACQUIRE_TIMEOUT_MS).expect("读槽 acquire 成功") };
+        let back = make_nv12(
+            device,
+            D3D11_USAGE_STAGING,
+            D3D11_CPU_ACCESS_READ.0 as u32 | D3D11_CPU_ACCESS_WRITE.0 as u32,
+            1,
+        );
+        unsafe { ctx.CopyResource(&back, &opened) };
+        unsafe { mutex.ReleaseSync(0).expect("读槽 release 成功") };
+        (read_plane_byte(ctx, &back, 0), read_plane_byte(ctx, &back, 1))
+    }
+
+    /// **[D3D11 平面数组拷贝语义取证]**（决定 `SharedCopier::copy` 的 SrcSubresource 下标方案）：
+    /// 建 **DECODER-only（无 SHR）** NV12 **数组**纹理（ArraySize=2，镜像解码池），逐阵元经
+    /// staging 填互异已知图案（e0: Y=0x10 UV=0x80；e1: Y=0x30 UV=0xC0），随后：
+    ///   1) 子资源内容探针：把子资源下标 s∈0..1 各自拷回单切片 staging，打印 (Y@0, UV@rowH)
+    ///      ——揭示「子资源下标 → 阵元/平面」在本驱动上的真实布局（探针只取两模型都合法的 0/1）；
+    ///   2) 对 e0、e1 各跑一次**当前** `SharedCopier::copy`，把共享槽拷回 staging 断言 Y/UV 像素。
+    /// 判定：若 (1) 显示「每阵元=单一子资源」且 (2) 对 e1 读回 ≠ e1 图案 → 当前 2i/2i+1 下标错，
+    /// 须改为规范单调用（SrcSubresource=阵元下标，一次拷 Y+UV）；若 (1) 显示「平面独立子资源」
+    /// 且 (2) 两阵元都吻合 → 本驱动行为与「子资源无平面项」的规范读数不同，当前写法即正确
+    /// （不改写、记录证据）。
+    #[test]
+    fn test_shared_copier_array_pixel_roundtrip() {
+        let Some(worker) = create_worker_d3d11_device() else {
+            eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用");
+            return;
+        };
+        let device = &worker.device;
+        let ctx = &worker.context;
+
+        // 无 SHR、仅 DECODER（0x20）的 NV12 数组纹理——与 D3D11VA 解码池同款绑定
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: W,
+            Height: H,
+            MipLevels: 1,
+            ArraySize: 2,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0x20,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut arr: Option<ID3D11Texture2D> = None;
+        if let Err(e) = unsafe { device.CreateTexture2D(&desc, None, Some(&mut arr)) } {
+            // 个别驱动（如仅 WARP 的机器）不支持 D3D11_BIND_DECODER 数组纹理 → SKIP 不 FAIL
+            eprintln!("SKIP: CreateTexture2D DECODER-only NV12 数组失败（驱动不支持 DECODER 绑定）: {e}");
+            return;
+        }
+        let arr = arr.expect("创建数组纹理必有对象");
+
+        // 逐阵元填充：单切片 staging+default（既有 make_nv12 姿势）→ CopySubresourceRegion 进
+        // 数组（按「阵元 = 子资源下标」的规范姿势；若本驱动为平面独立子资源，此填充会落在
+        // 各阵元的 Y 平面、UV 平面另在下标 2i+1——由探针揭示）
+        let pairs: [(u8, u8); 2] = [(0x10, 0x80), (0x30, 0xC0)];
+        for (i, &(py, puv)) in pairs.iter().enumerate() {
+            let def = make_nv12(device, D3D11_USAGE_DEFAULT, 0, 1);
+            let stg = make_nv12(
+                device,
+                D3D11_USAGE_STAGING,
+                D3D11_CPU_ACCESS_READ.0 as u32 | D3D11_CPU_ACCESS_WRITE.0 as u32,
+                1,
+            );
+            fill_plane(ctx, &stg, 0, py);
+            fill_plane(ctx, &stg, 1, puv);
+            unsafe { ctx.CopyResource(&def, &stg) };
+            unsafe {
+                ctx.CopySubresourceRegion(&arr, i as u32, 0, 0, 0, &def, 0, None);
+            }
+        }
+        let arr_raw = arr.as_raw() as usize;
+
+        // 1) 子资源布局探针（s=0/1 在两模型下都合法，各拷回单切片后读 Y/UV）
+        let stg = make_nv12(
+            device,
+            D3D11_USAGE_STAGING,
+            D3D11_CPU_ACCESS_READ.0 as u32 | D3D11_CPU_ACCESS_WRITE.0 as u32,
+            1,
+        );
+        for s in 0..2u32 {
+            unsafe {
+                let _ = ctx.CopySubresourceRegion(&stg, 0, 0, 0, 0, &arr, s, None);
+            }
+            let y = read_plane_byte(ctx, &stg, 0);
+            let uv = read_plane_byte(ctx, &stg, 1);
+            eprintln!(
+                "[array probe] src_sub={s} → 单切片回读 Y={y:#04x} UV={uv:#04x}（填充名义分配：e0=10/80 e1=30/c0）"
+            );
+        }
+
+        // 2) 当前 `SharedCopier::copy` 逐阵元：读回共享槽断言像素（copier 取克隆，worker 引用
+        // 留给 `read_slot_planes`）
+        let mut copier = SharedCopier::new(WorkerD3D {
+            device: device.clone(),
+            context: ctx.clone(),
+            kind: worker.kind,
+        });
+        for (i, &(py, puv)) in pairs.iter().enumerate() {
+            let frame = copier
+                .copy(W, H, arr_raw, i as u32)
+                .expect("数组阵元拷贝应成功");
+            let (y, uv) = read_slot_planes(device, ctx, frame.shared_handle);
+            eprintln!(
+                "[passthrough copy] element={i} → 槽 Y={y:#04x} UV={uv:#04x}（期望 Y={py:#04x} UV={puv:#04x}）"
+            );
+            assert_eq!(y, py, "阵元 {i} 的 Y 平面应原样到达共享槽");
+            assert_eq!(uv, puv, "阵元 {i} 的 UV 平面应原样到达共享槽");
+            copier.recycle(frame.shared_handle);
+        }
     }
 }

@@ -106,6 +106,42 @@
         })
     }
 
+    /// 回归：换接收端/换文件时旧通道里缓存的 GPU 直通帧槽位必须归还 —— 不能随
+    /// `drop(old)` 静默丢失（那是拖动重定向偶发丢帧定格的根因：泄漏槽累积到槽池耗尽 →
+    /// Backpressure → 跳过本帧，画面定格）。
+    #[gpui::test]
+    fn replaced_rx_drain_releases_gpu_slots(cx: &mut TestAppContext) {
+        let (rel_tx, rel_rx) = std::sync::mpsc::channel::<usize>();
+        let viewer = cx.update(|app| app.new(|cx| VideoViewer::new(fixture(), cx)));
+        viewer.update(cx, |v, _| v.release_cmd = Some(rel_tx));
+
+        // 造「旧接收端」并缓存：GPU 直通帧 ×2（槽已占 in_use=true，仅传句柄数值）+ 软帧 ×1
+        let (tx, old_rx) = std::sync::mpsc::sync_channel::<FrameItem>(4);
+        tx.send(FrameItem::Gpu(GpuFrame {
+            pts: 1.0,
+            w: 320,
+            h: 240,
+            shared_handle: 111,
+        }))
+        .unwrap();
+        let _ = tx.send(frame_of(2.0, 0x55));
+        tx.send(FrameItem::Gpu(GpuFrame {
+            pts: 3.0,
+            w: 320,
+            h: 240,
+            shared_handle: 222,
+        }))
+        .unwrap();
+        drop(tx);
+
+        viewer.update(cx, |v, _| v.drop_replaced_rx_frames(old_rx));
+
+        let got: Vec<usize> = rel_rx.try_iter().collect();
+        assert!(got.contains(&111), "GPU 槽 111 未归还（泄漏）: {got:?}");
+        assert!(got.contains(&222), "GPU 槽 222 未归还（泄漏）: {got:?}");
+        assert_eq!(got.len(), 2, "软帧不应触发槽归还: {got:?}");
+    }
+
     /// 设备丢失回归的测试卫生守卫：任何退出路径（含 panic unwind）都清空硬解黑名单并撤销
     /// 故障注入，防进程级静态泄漏污染后续测试（黑名单/注入均为进程级持久状态）。
     struct FaultAndBlGuard;
@@ -113,13 +149,15 @@
         fn drop(&mut self) {
             crate::decode::hw_blacklist_clear_for_test();
             hw_fault_disable();
+            crate::hw::copy_fail_disable();
         }
     }
 
-    /// 双设备门控的**机器能力**探测：建 worker 自有 D3D11 设备 + 查询驱动是否支持「D3D11VA
+    /// 双设备直通的机器能力**诊断**：建 worker 自有 D3D11 设备 + 查询驱动是否支持「D3D11VA
     /// 解码数组纹理带 SHADER_RESOURCE」。`None` = 本机连 worker D3D11 设备都建不起（测试
-    /// SKIP）；`Some(true)` = 可走双设备直通；`Some(false)`（Intel Arc 等驱动实测）→ 门控
-    /// 必须停用双设备、回落 SAFE 硬解 BGRA。与 `open_reader_for_mode` 内的门控同款探测姿势。
+    /// SKIP）；`Some(..)` = 该驱动约束的**诊断值**——**不再是直通门控**（直通恒用
+    /// DECODER-only 解码池，渲染端只采样共享槽）。Arc（`Some(false)`）现在断言直通**照常
+    /// 生效**（`gpu_passthrough_machine_adaptive_gate` 的 Arc 回归分支）。
     fn dual_gate_capability() -> Option<bool> {
         use windows::core::Interface as _;
         let worker = crate::hw::create_worker_d3d11_device()?;
@@ -1089,6 +1127,8 @@
     /// 耗尽会触发「池耗尽」错误 → 误回退 SAFE BGRA —— 本测为「pool recycling over ~30 frames
     /// no pool exceeded」的实证）→ 开测试窗口强制 draw：canvas paint 回调里
     /// `paint_external_yuv` 收到当前共享句柄（`take_hw_paint_probe` 断言非 0 且等于在屏帧）。
+    /// **无 SHR 门控**：驱动是否支持「解码数组纹理带 SHADER_RESOURCE」只作诊断打印，不改变
+    /// 直通断言——包括 Intel Arc（能力 false）在内，只要双设备能接管就断言直通生效。
     #[gpui::test]
     #[allow(clippy::await_holding_lock)]
     #[cfg(target_os = "windows")]
@@ -1103,8 +1143,7 @@
         let _dual = DualPathGuard::new();
         let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（直通优先）
         let _fault_bl = FaultAndBlGuard; // 黑名单/注入都不带进本测
-        // 机器自适应：先在**门控同款**的 worker 设备上探测「D3D11VA 数组纹理带 SHADER_RESOURCE」。
-        // 支持 → 直通断言（本测原路径）；不支持（Intel Arc 等驱动实测）→ 断言门控回落 SAFE。
+        // 机器能力**诊断**（仅建 worker 设备失败才 SKIP；能力值只打印、不门控直通）
         let shr_supported = match dual_gate_capability() {
             Some(v) => v,
             None => {
@@ -1112,7 +1151,7 @@
                 return;
             }
         };
-        eprintln!("[GPU passthrough] 本机 D3D11VA 平面 SRV 采样能力 = {shr_supported}");
+        eprintln!("[GPU passthrough] 本机 D3D11VA 平面 SRV 采样能力 = {shr_supported}（诊断，非直通门控）");
         dual_engaged_reset();
         hw_engaged_reset();
         let viewer: gpui::Entity<VideoViewer> =
@@ -1133,67 +1172,6 @@
             cx.background_executor.timer(Duration::from_millis(5)).await;
             wait += 1;
             assert!(wait < 6000, "等待双设备首帧上屏超时");
-        }
-        if !shr_supported && !dual_engaged() {
-            // 能力 false（本机）：门控停用双设备 → 断言回落 SAFE BGRA 且出帧正常（首帧可用、
-            // gpu_frame 恒 None、pts 单调、paint 探针为 0——SAFE 走 img 不调 paint_external_yuv）。
-            eprintln!(
-                "[GPU passthrough] 能力 false → 门控停用双设备（dual_engaged={}，hw_engaged={}）",
-                dual_engaged(),
-                hw_engaged()
-            );
-            let mut last_pts = -1.0f64;
-            for _ in 0..10 {
-                viewer.update(cx, |v, cx| {
-                    v.playhead += 0.5;
-                    let _ = v.tick(cx);
-                });
-                cx.background_executor.timer(Duration::from_millis(8)).await;
-                let (pts, frame, gpu) = cx.update(|app| {
-                    let v = viewer.read(app);
-                    (
-                        v.last_frame_pts.unwrap_or(last_pts),
-                        v.frame.is_some(),
-                        v.gpu_frame.is_some(),
-                    )
-                });
-                assert!(frame, "门控回落路径应有 SAFE BGRA 帧上屏");
-                assert!(!gpu, "门控回落路径不应有 GPU 帧（gpu_frame 恒 None）");
-                assert!(
-                    pts >= last_pts - 1e-6,
-                    "门控回落帧 pts 应单调: {pts:.2} < {last_pts:.2}"
-                );
-                last_pts = pts;
-            }
-            // 强制 draw：SIMD BGRA 走 img（无 canvas paint_external_yuv）→ 探针 0
-            struct ViewerHost {
-                viewer: gpui::Entity<VideoViewer>,
-            }
-            impl gpui::Render for ViewerHost {
-                fn render(
-                    &mut self,
-                    _window: &mut gpui::Window,
-                    _cx: &mut gpui::Context<Self>,
-                ) -> impl gpui::IntoElement {
-                    self.viewer.clone()
-                }
-            }
-            let (_host, vcx) = cx.add_window_view(|_window, _cx| ViewerHost {
-                viewer: viewer.clone(),
-            });
-            vcx.update(|window, cx| {
-                window.draw(cx).clear(cx);
-            });
-            let probe_handle = crate::hw::take_hw_paint_probe();
-            assert_eq!(
-                probe_handle, 0,
-                "能力 false 门控回落 SAFE 不应触发 GPU paint 探针（probe={probe_handle:#x}）"
-            );
-            eprintln!(
-                "[GPU passthrough] 能力 false：门控回落 SAFE BGRA（frame 上屏、gpu_frame=None、无 paint 探针），pts 至 {last_pts:.2}s"
-            );
-            cx.run_until_parked();
-            return;
         }
         if !dual_engaged() {
             // 本机无 D3D11VA h264 硬解 / 解码器不支持外部设备注入 / 语义级不支持 → 直通必然
@@ -1270,13 +1248,15 @@
         cx.run_until_parked();
     }
 
-    /// 机器自适应门控回归（纯代码、不开 GUI）：开启直通（[`DualPathGuard`]）+ auto 模式 +
-    /// 真实夹具 `target\视频测试.mp4`：
-    /// - 能力 false（本机 Intel Arc 不支持平面 SRV 采样）→ 门控必须停用双设备：断言
-    ///   `dual_engaged()==false`、帧为 SAFE BGRA（`frame` Some / `gpu_frame` 恒 None）、
-    ///   首帧可用、步进 pts 单调（对应 `open_reader_for_mode` 的回落路径仍在工作）；
+    /// 机器自适应回归（纯代码、不开 GUI）：开启直通（[`DualPathGuard]`）+ auto 模式 +
+    /// 真实夹具 `target\视频测试.mp4`。**无 SHR 门控**——驱动能力只分两种断言口径：
+    /// - 能力 false（**Intel Arc 回归测试**）：默认应支持平面 SRV 采样，但 Arc 实测拒绝
+    ///   `DECODER|SHADER_RESOURCE` 组合 → 以前门控停用双设备；现在恒 DECODER-only 解码池，
+    ///   故**必须断言直通照常生效**：`dual_engaged()==true`、首帧为 GPU 帧
+    ///   （`gpu_frame` Some）、步进 pts 单调（`SharedCopier::copy` 的单调用拷贝在
+    ///   DECODER-only 源上照常工作）；
     /// - 能力 true → 双设备可走（既有 `gpu_passthrough_first_frame_paints_shared_handle`
-    ///   已断言直通），本测**不额外断言**直通细节、只确认能出首帧。
+    ///   已断言直通细节），本测**不额外断言**直通细节、只确认能出首帧。
     #[gpui::test]
     #[allow(clippy::await_holding_lock)]
     #[cfg(target_os = "windows")]
@@ -1291,6 +1271,7 @@
         let _dual = DualPathGuard::new();
         let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（直通优先）
         let _fault_bl = FaultAndBlGuard;
+        // 机器能力**诊断**（仅建 worker 设备失败才 SKIP；能力值不门控、只区分断言口径）
         let shr_supported = match dual_gate_capability() {
             Some(v) => v,
             None => {
@@ -1298,12 +1279,12 @@
                 return;
             }
         };
-        eprintln!("[GPU adaptive] 本机 D3D11VA 平面 SRV 采样能力 = {shr_supported}");
+        eprintln!("[GPU adaptive] 本机 D3D11VA 平面 SRV 采样能力 = {shr_supported}（诊断，非直通门控）");
         dual_engaged_reset();
         hw_engaged_reset();
         let viewer: gpui::Entity<VideoViewer> =
             cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
-        // 等首帧上屏（真解码异步；two 分支都要求首帧可用）
+        // 等首帧上屏（真解码异步；两分支都要求首帧可用）
         let mut wait = 0;
         loop {
             let ready = cx.update(|app| {
@@ -1318,30 +1299,35 @@
             });
             cx.background_executor.timer(Duration::from_millis(5)).await;
             wait += 1;
-            assert!(wait < 6000, "等待门控回归首帧上屏超时");
+            assert!(wait < 6000, "等待自适应回归首帧上屏超时");
         }
         assert!(
             !cx.update(|app| viewer.read(app).load_error.is_some()),
             "首帧期不应报告加载错误"
         );
         if !shr_supported {
-            // (a) 能力 false：门控停用双设备 → SAFE BGRA 出帧
+            // (a) 能力 false（本机 Intel Arc）：无 SHR 门控 → 断言直通**照常生效**
+            if !dual_engaged() {
+                eprintln!("SKIP: 本机无 D3D11VA h264 硬解/外部注入（能力 false 且直通未接管）——非 Arc 目标机器");
+                cx.run_until_parked();
+                return;
+            }
             assert!(
-                !dual_engaged(),
-                "驱动不支持平面 SRV 采样时双设备直通应被门控停用（dual_engaged 恒 false）"
+                dual_engaged(),
+                "能力 false（Arc）无门控后双设备直通应照常生效（dual_engaged=true）"
             );
-            // HW_ENGAGED 反映 SAFE 解码器实际接管状态（本机 D3D11VA 可用=硬解；无 D3D11VA
-            // 机器内核自动回软解=软解）——只打点不硬断言，避免成非目标机器的回归。
             eprintln!(
-                "[GPU adaptive] 门控回落 SAFE：hw_engaged={}",
+                "[GPU adaptive] 能力 false（Arc）：双设备直通生效，hw_engaged={}",
                 hw_engaged()
             );
-            let (first_frame, first_gpu) = cx.update(|app| {
+            let (first_gpu, first_frame) = cx.update(|app| {
                 let v = viewer.read(app);
-                (v.frame.is_some(), v.gpu_frame.is_some())
+                (v.gpu_frame.is_some(), v.frame.is_some())
             });
-            assert!(first_frame, "门控回落路径首帧应为 SAFE BGRA（frame Some）");
-            assert!(!first_gpu, "门控回落路径首帧不应为 GPU 帧（gpu_frame None）");
+            assert!(
+                first_gpu,
+                "能力 false（Arc）首帧应为 GPU 帧（gpu_frame Some，直通接管）"
+            );
             let mut last_pts = -1.0f64;
             for _ in 0..10 {
                 viewer.update(cx, |v, cx| {
@@ -1353,15 +1339,15 @@
                     let v = viewer.read(app);
                     (v.last_frame_pts.unwrap_or(last_pts), v.gpu_frame.is_some())
                 });
-                assert!(!gpu, "门控回落路径不应有 GPU 帧");
+                assert!(gpu, "能力 false（Arc）直通路径帧应持续为 GPU 帧");
                 assert!(
                     pts >= last_pts - 1e-6,
-                    "门控回落帧 pts 应单调: {pts:.2} < {last_pts:.2}"
+                    "直通帧 pts 应单调: {pts:.2} < {last_pts:.2}"
                 );
                 last_pts = pts;
             }
             eprintln!(
-                "[GPU adaptive] 能力 false：门控停用双设备、SAFE BGRA 出帧正常（hw_engaged={}，pts 至 {last_pts:.2}s）",
+                "[GPU adaptive] 能力 false（Arc）：直通占用、GPU 帧持续上屏（hw_engaged={}，first_frame={first_frame}，pts 至 {last_pts:.2}s）",
                 hw_engaged()
             );
         } else {
@@ -1370,6 +1356,184 @@
                 "[GPU adaptive] 能力 true：双设备直通由 gpu_passthrough_first_frame_paints_shared_handle 断言（本测仅确认首帧可用）"
             );
         }
+        cx.run_until_parked();
+    }
+
+    /// 零回读双设备直通 vs SAFE 硬解回读的**性能证据**（纯代码、不开 GUI、真 D3D11 设备 +
+    /// 真墙钟；非回归基准，**不硬断言快慢**——驱动时序抖动多，只打印可解析数字供用户对表）：
+    /// ① mechanism proof：auto 模式经 viewer 打开 `target\视频测试.mp4` → 断言
+    ///   `dual_engaged()` / `hw_engaged()` / 首帧 `gpu_frame` 上屏（= 直通接管开关真开；
+    ///   Intel Arc 亦应 true——本机即 Arc 回归机）；
+    /// ② 逐帧墙钟对照：直通 leg = 外部设备 `open_hw` + [`SharedCopier::copy`]（GPU 侧零回读
+    ///   拷贝，仅 `AcquireSync→Copy→Flush→ReleaseSync`）；SAFE leg = `open_scaled_hw`（FFmpeg
+    ///   自有设备）+ `next_frame_bgra_into`（`av_hwframe_transfer_data` 回读 + sws 转 BGRA）。
+    ///   各剔除前若干暖机帧采样 N 帧，报 min/中位/均值 ms·帧 与 SAFE/copy 比值。
+    /// 缺夹具 / 无 D3D11 设备 / 外部注入解码打不开 → SKIP（机制证明缺口径时不算 PASS）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn bench_dual_device_copy_vs_safe_readback(cx: &mut TestAppContext) {
+        use std::time::Instant;
+        use windows::core::Interface as _;
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(worker) = crate::hw::create_worker_d3d11_device() else {
+            eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用");
+            return;
+        };
+
+        // ① mechanism proof：auto 直通接管（Intel Arc 无 SHR 也必须接管）
+        let _dual = DualPathGuard::new();
+        let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（直通优先）
+        let _fault_bl = FaultAndBlGuard;
+        dual_engaged_reset();
+        hw_engaged_reset();
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path.clone(), cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.has_frame() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待直通首帧上屏超时");
+        }
+        let gpu_on_screen = cx.update(|app| {
+            let v = viewer.read(app);
+            v.gpu_frame.is_some()
+        });
+        if !dual_engaged() {
+            // 机器自适应：真实 D3D11VA h264 硬解未接管（无 h264 VA / 外部注入不支持）→
+            // SKIP 不 FAIL（同 `gpu_passthrough_machine_adaptive_gate` 的 SKIP 风格）
+            eprintln!(
+                "SKIP: 本机双设备未接管（dual_engaged=false hw_engaged={}）——非 Arc 目标机器",
+                hw_engaged()
+            );
+            cx.run_until_parked();
+            return;
+        }
+        assert!(
+            dual_engaged() && hw_engaged() && gpu_on_screen,
+            "直通应接管并上 GPU 帧（dual_engaged={} hw_engaged={} gpu_frame={gpu_on_screen}）",
+            dual_engaged(),
+            hw_engaged()
+        );
+        eprintln!(
+            "[PASSTHROUGH] mechanism: dual_engaged={} hw_engaged={} gpu_frame={gpu_on_screen} 设备={}",
+            dual_engaged(),
+            hw_engaged(),
+            worker.kind
+        );
+        // 停掉 viewer 泵（generation 自退）再进计时，避免后台 worker 抢 FFmpeg 影响墙钟
+        drop(viewer);
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // ② 直通 leg：外部设备 open_hw + SharedCopier::copy
+        const N: u32 = 200;
+        const WARMUP: u32 = 10;
+        let raw_dev = worker.device.as_raw() as usize;
+        let raw_ctx = worker.context.as_raw() as usize;
+        let mut r_hw = match crate::decode::VideoReader::open_hw(&path, raw_dev, raw_ctx) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIP: 外部设备注入解码打开失败（无 h264 硬解?）: {e:#}");
+                return;
+            }
+        };
+        assert!(r_hw.is_hw(), "open_hw 直通 reader 必须真硬解（mechanism proof）");
+        let mut copier = crate::hw::SharedCopier::new(worker);
+        let mut p_times: Vec<f64> = Vec::with_capacity(N as usize);
+        let mut n: u32 = 0;
+        loop {
+            match r_hw.next_frame_hw() {
+                Ok(Some(fr)) => {
+                    let t = Instant::now();
+                    let copied = copier.copy(fr.w, fr.h, fr.tex, fr.array_index);
+                    let dt = t.elapsed().as_secs_f64() * 1e3;
+                    crate::decode::VideoReader::release_hw_frame(fr.frame_ptr);
+                    let cf = copied.expect("直通 GPU 拷贝失败");
+                    // 立即回池：直通测量只关心单帧 `SharedCopier::copy` 墙钟，不消费帧
+                    copier.recycle(cf.shared_handle);
+                    if n >= WARMUP {
+                        assert_ne!(cf.shared_handle, 0, "直通拷贝应返回非 0 共享句柄");
+                        p_times.push(dt);
+                    }
+                    n += 1;
+                }
+                Ok(None) => {
+                    // 夹具足够长一般到不了这；到了就 seek 回 0 凑够采样
+                    r_hw.seek(0.0).unwrap();
+                }
+                Err(e) => panic!("直通解码失败: {e:#}"),
+            }
+            if n >= N + WARMUP {
+                break;
+            }
+        }
+
+        // SAFE leg：open_scaled_hw + next_frame_bgra_into（回读+sws）
+        let mut r_safe = crate::decode::VideoReader::open_scaled_hw(&path, 1920)
+            .expect("SAFE 硬解打开失败");
+        eprintln!(
+            "[SAFE] 硬解接管={}（1=FFmpeg 自有设备 D3D11VA 回读+sws；0=内核回软解）",
+            if r_safe.is_hw() { 1 } else { 0 }
+        );
+        let mut out = vec![0u8; r_safe.source_cap()];
+        let mut s_times: Vec<f64> = Vec::with_capacity(N as usize);
+        let mut n: u32 = 0;
+        loop {
+            let t = Instant::now();
+            match r_safe.next_frame_bgra_into(&mut out) {
+                Ok(Some(_)) => {
+                    let dt = t.elapsed().as_secs_f64() * 1e3;
+                    if n >= WARMUP {
+                        s_times.push(dt);
+                    }
+                    n += 1;
+                }
+                Ok(None) => r_safe.seek(0.0).unwrap(),
+                Err(e) => panic!("SAFE 解码失败: {e:#}"),
+            }
+            if n >= N + WARMUP {
+                break;
+            }
+        }
+
+        let stat = |v: &mut Vec<f64>| -> (f64, f64, f64) {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (min, med) = (v[0], v[v.len() / 2]);
+            (min, med, v.iter().sum::<f64>() / v.len() as f64)
+        };
+        let (p_min, p_med, p_mean) = stat(&mut p_times);
+        let (s_min, s_med, s_mean) = stat(&mut s_times);
+        eprintln!(
+            "[PASSTHROUGH] copy={p_med:.3}ms/帧（中位; min={p_min:.3} 均值={p_mean:.3}; n={}）",
+            p_times.len()
+        );
+        eprintln!(
+            "[SAFE] readback+sws={s_med:.3}ms/帧（中位; min={s_min:.3} 均值={s_mean:.3}; n={}）",
+            s_times.len()
+        );
+        eprintln!(
+            "[PASSTHROUGH RATIO] SAFE/copy ≈ {:.1}×（{:.3}ms / {:.3}ms，越小越划算）",
+            s_med / p_med.max(1e-6),
+            s_med,
+            p_med
+        );
         cx.run_until_parked();
     }
 
@@ -1727,6 +1891,280 @@
             "切换到的另一文件应仍硬解（黑名单不外溢到其它路径）"
         );
         eprintln!("[device-lost] 另一文件仍硬解接管（hw_engaged={}）", hw_engaged());
+        cx.run_until_parked();
+    }
+
+    /// 回归：**共享槽拷贝背压 ≠ GPU 设备丢失**——`SharedCopier::copy` 瞬态失败（渲染端未及时
+    /// 归还槽 → 槽池瞬满 / 获取互斥超时）不得被当成设备丢失处理：不得进硬解黑名单、不得静默
+    /// 重开软解（silent soft downgrade），直通持续接管、后续 seek 仍产 GPU 帧。
+    ///
+    /// 注入：测试钩子强制接下来 K=3 次 `copy` 返回 `Err("test: 槽回压")`（然后自卸）。旧实现
+    /// 把 copy 错误当解码错误计入 `hw_fail_count` → 连续 2 次即黑名单 + 重开软解（本测修前在
+    /// 首帧期就应触发软降级 → 断言必红）。纯代码不开 GUI，真 D3D11 设备 + 真硬解 + 真墙钟；
+    /// 缺夹具 / 无 D3D11 设备 / 直通未接管 → SKIP。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn copy_backpressure_does_not_soft_downgrade(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _dual = DualPathGuard::new(); // 生产默认：双设备直通优先
+        let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（直通优先）
+        let _cleanup = FaultAndBlGuard; // 清黑名单 + 撤注入（任意退出路径）
+        crate::decode::hw_blacklist_clear_for_test();
+        hw_fault_disable();
+        crate::hw::copy_fail_disable();
+        hw_engaged_reset();
+        dual_engaged_reset();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
+            return;
+        }
+        // 注入：接下来 3 次 copy 强制失败（然后自动撤销）——拷贝背压应由重试循环吸收，
+        // 绝不进 hw_fail_count（修前第 2 次连续 copy 失败即黑名单+软降级，本测必红）
+        crate::hw::copy_fail_for(3);
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path.clone(), cx)));
+        // 等首帧上屏 + 时长已知 + seek 落地（真解码异步；双设备/SAFE/软解任一都会出帧）
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.has_frame() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待首帧/时长超时");
+        }
+        if !dual_engaged() {
+            // 本机无 D3D11VA h264 硬解 / 外部注入不支持 → 直通未接管，回退 SAFE 由
+            // `gpu_passthrough_fallback_to_safe` 兜底；本测 SKIP（同其它直通测试口径）
+            eprintln!("SKIP: 本机无法双设备直通（无 D3D11VA h264 硬解或外部注入不支持），回退 SAFE 路径");
+            return;
+        }
+        // 直通接管后首帧即走 copy → 钩子必火；短暂补等防时序抖动
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::hw::copy_fail_fired() {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            assert!(
+                Instant::now() < deadline,
+                "拷贝回压注入未在期限内触发（直通首帧应命中 copy hook）"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // ① 注入的拷贝失败**不得**导致黑名单（背压 ≠ 设备丢失）
+        assert!(
+            !crate::decode::hw_path_blacklisted(&path),
+            "拷贝背压不得把该文件列入硬解黑名单（背压 ≠ 设备丢失）"
+        );
+        // ② 直通持续接管（未被静默重开软解）
+        assert!(
+            dual_engaged(),
+            "拷贝背压后双设备直通应保持接管（不得 silent soft downgrade）"
+        );
+        // ②′ 合同断言：两条件**同时**成立（直通接管 ∧ 不黑名单）才是「无静默软降级」
+        assert!(
+            dual_engaged() && !crate::decode::hw_path_blacklisted(&path),
+            "拷贝背压后必须同时满足：直通保持接管 dual={} 且不黑名单 bl={}",
+            dual_engaged(),
+            crate::decode::hw_path_blacklisted(&path)
+        );
+        eprintln!(
+            "[copy backpressure] 注入 K=3 拷贝失败后：blacklist=false dual={} hw={}",
+            dual_engaged(),
+            hw_engaged()
+        );
+        // ③ 钩子已撤销（K=3 自卸 + 显式双保险）后，后续 seek 仍产 GPU 帧（探针 == 在屏句柄）
+        crate::hw::copy_fail_disable();
+        let duration = cx.update(|app| viewer.read(app).duration);
+        let target = (duration * 0.5).clamp(0.05, duration - 2.0);
+        viewer.update(cx, |v, cx| v.seek(target - v.playhead, cx));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let current_pts = loop {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            let s = cx.update(|app| {
+                let v = viewer.read(app);
+                (v.pending_seek, v.last_frame_pts, v.gpu_frame.is_some())
+            });
+            if s.0.is_none() && s.2 {
+                break s.1;
+            }
+            assert!(Instant::now() < deadline, "seek 后 GPU 帧上屏超时（target={target:.2}s）");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let current_handle = cx
+            .update(|app| {
+                let v = viewer.read(app);
+                v.gpu_frame.as_ref().map(|f| f.shared_handle)
+            })
+            .expect("seek 后应在屏 GPU 帧（dual 未被软降级）");
+        assert!(
+            (current_pts.unwrap_or(target) - target).abs() < 0.5,
+            "seek 落点帧应到 target 附近: {current_pts:?}"
+        );
+        // 开测试窗口承载同一 viewer 并强制 draw：paint_external_yuv 收到当前 GPU 帧句柄
+        struct ViewerHost {
+            viewer: gpui::Entity<VideoViewer>,
+        }
+        impl gpui::Render for ViewerHost {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                self.viewer.clone()
+            }
+        }
+        let (_host, vcx) = cx.add_window_view(|_window, _cx| ViewerHost {
+            viewer: viewer.clone(),
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let probe_handle = crate::hw::take_hw_paint_probe();
+        assert_ne!(
+            probe_handle, 0,
+            "拷贝背压恢复后 GPU 帧应仍走 paint_external_yuv（探针非 0，直通未掉）"
+        );
+        assert_eq!(
+            probe_handle, current_handle,
+            "外部 YUV 精灵应使用当前 GPU 上屏共享句柄（probe={probe_handle:#x} vs 当前 {current_handle:#x}）"
+        );
+        eprintln!(
+            "[copy backpressure] seek 后仍产 GPU 帧 probe={probe_handle:#x} pts={current_pts:?} blacklist={}",
+            crate::decode::hw_path_blacklisted(&path)
+        );
+        cx.run_until_parked();
+    }
+
+    /// 回归（独立评审 MUST-FIX 伴生测试）：**格式不支持 ≠ 背压**——把 `CopyError::Unsupported`
+    ///（如 P010 10-bit HEVC）当成背压重试/跳过会永久无画面（修前回归：不黑名单、不软重开）。
+    /// 断言完整恢复契约：`copy` 前几次强制报 Unsupported → 按「设备丢失」路径**黑名单 + 软重开**
+    /// + **软解续播帧真正上屏**（P010 续播保证）。
+    /// 注：此前「软重开首帧解码失败」根因在**我方代码**而非 cdylib——双设备 reader
+    /// `source_cap()==1`（无 scaler），`src_cap` 命令开头只取一次、软重开后未刷新 → 常驻 buf
+    /// 停在 1 字节 → 软解 `_into` 报「解码输出缓冲过小」→ 断代无画面。worker 软重开分支已在
+    /// 公共路径刷新 `src_cap`（workers.rs 软重开分支），故本测等到 **BGRA 帧真正上屏**才算恢复。
+    /// 纯代码不开 GUI；缺夹具 / 无 D3D11 设备 / 直通未接管 → SKIP。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn copy_unsupported_format_reopens_soft(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _dual = DualPathGuard::new(); // 生产默认：双设备直通优先
+        let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（直通优先）
+        let _cleanup = FaultAndBlGuard; // 清黑名单 + 撤注入（任意退出路径）
+        crate::decode::hw_blacklist_clear_for_test();
+        hw_fault_disable();
+        crate::hw::copy_fail_disable();
+        hw_engaged_reset();
+        dual_engaged_reset();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+            return;
+        }
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path.clone(), cx)));
+        // 先等首个 GPU 帧上屏（直通接管确认、resume_pts 有个非 0 落点再注入，对齐
+        // device_lost 的「播放中故障」形态）
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.has_frame() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待直通首帧/时长超时");
+        }
+        if !dual_engaged() {
+            eprintln!("SKIP: 本机无法双设备直通（无 D3D11VA h264 硬解或外部注入不支持），回退 SAFE 路径");
+            return;
+        }
+        // 推进播放到 >0.2s（resume_pts 非 0，软重开续播位置明确）
+        let mut driving = 0;
+        loop {
+            let p = cx.update(|app| viewer.read(app).last_frame_pts);
+            if p.is_some_and(|p| p >= 0.2) {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                v.playing = true;
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            driving += 1;
+            assert!(driving < 6000, "播放推进超时（last_frame_pts 未前进）");
+        }
+        // 注入：接下来 4 次 copy 强制「格式不支持」（Unsupported 不进重试、逐帧计数——连续 2 帧
+        // 即触发黑名单 + 软重开；软路径不再调 copy，剩余注入自然作废）
+        crate::hw::copy_unsupported_for(4);
+        // 等完整恢复闭环：该文件进黑名单 ∧ 软解接管（hw_engaged 复位）∧ **BGRA 帧真正上屏**
+        //（`frame` 有、`gpu_frame` 掉、pending 清）——P010 续播成功而非断代无画面
+        let mut wait2 = 0;
+        loop {
+            let done = cx.update(|app| {
+                let v = viewer.read(app);
+                let gpu = v.gpu_frame.is_some();
+                let soft = v.frame.is_some();
+                crate::decode::hw_path_blacklisted(&path)
+                    && !hw_engaged()
+                    && !gpu
+                    && soft
+                    && v.pending_seek.is_none()
+            });
+            if done {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait2 += 1;
+            assert!(wait2 < 6000, "等待 Unsupported 软重开 + BGRA 续播帧上屏超时");
+        }
+        // 直通接管后首帧即走 copy → Unsupported 钩子必火（软重开完成前已触发）
+        assert!(
+            crate::hw::copy_unsupported_fired(),
+            "Unsupported 注入应已实际触发（直通首帧即命中 copy hook）"
+        );
+        // ① 该文件进硬解黑名单（Unsupported = 「该文件不支持直通」→ 黑名单 + 软重开恢复路径）
+        assert!(
+            crate::decode::hw_path_blacklisted(&path),
+            "格式不支持应把该文件列入硬解黑名单（按设备丢失恢复路径），而非背压式永久跳过"
+        );
+        // ② 软解接管：硬解关闭、GPU 帧掉、BGRA 帧上屏（恢复播放，非断代无画面）
+        assert!(!hw_engaged(), "格式不支持后应软重开（hw_engaged=false，软解接管）");
+        let (gpu, soft) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.gpu_frame.is_some(), v.frame.is_some())
+        });
+        assert!(!gpu, "软重开后不应再有 GPU 帧上屏（gpu_frame 掉）");
+        assert!(soft, "软重开后 BGRA 帧应真正上屏（P010 续播保证，src_cap 已刷新）");
+        eprintln!(
+            "[copy unsupported] 格式不支持 → 黑名单={} 软接管（hw={} gpu_frame={gpu} frame={soft}）",
+            crate::decode::hw_path_blacklisted(&path),
+            hw_engaged()
+        );
         cx.run_until_parked();
     }
 
@@ -4471,5 +4909,237 @@
             "pending_seek 应指向点击落点 6.0s，实得 {pend}"
         );
         assert!(!scrub, "点击后退出拖拽态");
+        cx.run_until_parked();
+    }
+
+    /// [INVESTIGATION-2026-10-19] 读者级 SAFE vs DUAL seek 预滚墙钟分解（临时测量，K27 留证）：
+    /// 同一夹具 `target\视频测试.mp4`、同一组落点（早 10% / 中 50% / 晚 85% / 晚→早回退），
+    /// 逐条测量：
+    /// - SAFE：`open_scaled_hw` + 一次 `skip_to_bgra_into(target, buf)`（内核内部逐帧跳帧，
+    ///   单次 FFI；落点帧一次性回读+sws 转 BGRA）。
+    /// - DUAL：`open_hw`（worker 自有 D3D11 设备注入）+ `seek` + 逐帧 `next_frame_hw` 丢弃
+    ///   预滚帧（免拷贝、每帧 release_hw_frame，镜像 workers.rs 356-396），落点帧 `SharedCopier::copy`
+    ///   + release + recycle。
+    /// 逐表报「每目标墙钟 ms + 预滚帧数 + 丢弃循环均摊 ms/帧」（后项 ≈ FFI 逐帧调用的每帧成本）。
+    /// 缺夹具 / 无 D3D11 设备 / open_hw 失败 → SKIP。
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn bench_reader_seek_preroll_safe_vs_dual() {
+        use std::time::Instant;
+        use windows::core::Interface as _;
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _cleanup = FaultAndBlGuard;
+
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let fixtures = [
+            base.join("视频测试.mp4"),
+            base.join("视频测试字幕.mkv"),
+        ];
+        for path in &fixtures {
+            if !path.exists() {
+                eprintln!("SKIP: missing {}（夹具不入库）", path.display());
+                continue;
+            }
+            // DUAL 腿：worker 自有设备 + 外部注入解码（生产每次 open 新建设备）
+            let Some(worker) = crate::hw::create_worker_d3d11_device() else {
+                eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用");
+                return;
+            };
+            let worker_kind = worker.kind;
+            let raw_dev = worker.device.as_raw() as usize;
+            let raw_ctx = worker.context.as_raw() as usize;
+            let mut r_dual = match crate::decode::VideoReader::open_hw(path, raw_dev, raw_ctx) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("SKIP: 外部设备注入解码打开失败（无 h264 硬解?）: {e:#}");
+                    return;
+                }
+            };
+            assert!(r_dual.is_hw(), "DUAL open_hw 必须真硬解");
+            let mut copier = crate::hw::SharedCopier::new(worker);
+
+            // SAFE 腿
+            let mut r_safe =
+                crate::decode::VideoReader::open_scaled_hw(path, 1920).expect("SAFE 硬解打开失败");
+            let safe_hw = r_safe.is_hw();
+            eprintln!(
+                "[SEEKRT] fixture={} params={}x{} dur={:.2}s SAFE_hw={} DUAL_device={}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                r_safe.params().width,
+                r_safe.params().height,
+                r_safe.params().duration,
+                safe_hw,
+                worker_kind,
+            );
+
+            let dur = r_safe.params().duration;
+            let mut buf = vec![0u8; r_safe.source_cap().max(1)];
+            // 早 10% / 中 50% / 晚 85% / 晚→早回退（far-back re-seek）
+            let raw_frac = [0.10f64, 0.50, 0.85];
+            let mut targets: Vec<f64> = raw_frac
+                .iter()
+                .map(|f| (dur * f).clamp(0.05, (dur - 2.0).max(0.05)))
+                .collect();
+            targets.push(targets[2]); // far-back = 回到晚落点那一个（跨大段 re-seek）
+            targets.push(targets[0]);
+
+            eprintln!(
+                "[SEEKRT] 目标(秒): {:?}",
+                targets
+                    .iter()
+                    .map(|t| format!("{t:.2}"))
+                    .collect::<Vec<_>>()
+            );
+
+            for (i, &target) in targets.iter().enumerate() {
+                // ---- DUAL 腿 ----
+                let t0 = Instant::now();
+                r_dual.seek(target).expect("DUAL seek 失败");
+                let mut preroll_dual: u32 = 0;
+                let (dual_ms, preroll_dual_out, copy_ms) = loop {
+                    let fr = match r_dual.next_frame_hw() {
+                        Ok(Some(f)) => f,
+                        Ok(None) => panic!("DUAL EOF 提前（target={target:.2}s）"),
+                        Err(e) => panic!("DUAL 解码失败: {e:#}"),
+                    };
+                    if fr.pts >= target {
+                        let tc = Instant::now();
+                        let cf = copier
+                            .copy(fr.w, fr.h, fr.tex, fr.array_index)
+                            .expect("DUAL copy 失败");
+                        let copy_ms = tc.elapsed().as_secs_f64() * 1e3;
+                        let dual_ms = t0.elapsed().as_secs_f64() * 1e3;
+                        crate::decode::VideoReader::release_hw_frame(fr.frame_ptr);
+                        copier.recycle(cf.shared_handle);
+                        break (dual_ms, preroll_dual, copy_ms);
+                    }
+                    preroll_dual += 1;
+                    crate::decode::VideoReader::release_hw_frame(fr.frame_ptr);
+                };
+                let preroll_dual = preroll_dual_out;
+
+                // ---- SAFE 腿 ----
+                let t0 = Instant::now();
+                let (safe_ms, safe_skipped) = match r_safe.skip_to_bgra_into(target, &mut buf) {
+                    Ok(Some((_p, _w, _h, skipped))) => {
+                        (t0.elapsed().as_secs_f64() * 1e3, skipped)
+                    }
+                    Ok(None) => panic!("SAFE EOF 提前（target={target:.2}s）"),
+                    Err(e) => panic!("SAFE 预滚失败: {e:#}"),
+                };
+
+                eprintln!(
+                    "[SEEKRT #{i}] target={target:.2}s | DUAL total={dual_ms:.1}ms (preroll={preroll_dual}帧 per-frame≈{:.3}ms, copy={copy_ms:.2}ms, seek+drop={:.1}ms) | SAFE total={safe_ms:.1}ms (skipped={safe_skipped}) | 比值 DUAL/SAFE={:.1}×",
+                    if preroll_dual > 0 { dual_ms / preroll_dual as f64 } else { 0.0 },
+                    (dual_ms - copy_ms),
+                    dual_ms / safe_ms.max(1e-6),
+                );
+            }
+        }
+    }
+
+    /// [INVESTIGATION-2026-10-19] 查看器级（用户可感知）DUAL 直通 seek 墙钟（临时测量，K27
+    /// 留证）：与 [`bench_seek_hw_d3d11_wall`] 同构（同 mkv 夹具、同落点、同 8 字段 diag），
+    /// 唯一差异 = `DualPathGuard` 开启双设备直通 + auto 模式（生产默认路径）→ 断言
+    /// `dual_engaged()`（Arc 上双设备真正接管）。与 SAFE 基准数字直接对表。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn bench_seek_dual_passthrough_land_wall(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _dual = DualPathGuard::new(); // 生产默认：双设备直通优先
+        let _decode_mode = crate::decode::DecodeModeGuard::new(0); // auto（生产默认）
+        let _fault_bl = FaultAndBlGuard;
+        dual_engaged_reset();
+        hw_engaged_reset();
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path.clone(), cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.has_frame() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待 DUAL 首帧上屏超时");
+        }
+        if !dual_engaged() {
+            eprintln!(
+                "SKIP: 本机双设备未接管（dual_engaged=false hw_engaged={}）——非 Arc 目标机器",
+                hw_engaged()
+            );
+            cx.run_until_parked();
+            return;
+        }
+        eprintln!(
+            "[SEEKBENCHDUAL] 模式=auto 双设备=1 hw=1 gpu_frame={}",
+            cx.update(|app| {
+                let v = viewer.read(app);
+                v.gpu_frame.is_some()
+            })
+        );
+        let duration = cx.update(|app| viewer.read(app).duration);
+        let raw = [191.0f64, 354.0, 447.0, 1335.0, 354.0];
+        let hi = (duration - 2.0).max(0.05);
+        let mut rows: Vec<f64> = Vec::with_capacity(raw.len());
+        for &sec in &raw {
+            let sec = sec.clamp(0.05, hi);
+            let fraction = (sec / duration).clamp(0.0, 1.0) as f32;
+            let t0 = Instant::now();
+            viewer.update(cx, |v, cx| v.begin_scrub(fraction, cx));
+            viewer.update(cx, |v, cx| v.end_scrub(fraction, cx));
+            let target = cx.update(|app| viewer.read(app).playhead);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let landed = loop {
+                viewer.update(cx, |v, cx| {
+                    let _ = v.tick(cx);
+                });
+                let s = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (v.pending_seek, v.last_frame_pts)
+                });
+                if s.0.is_none() {
+                    break s.1;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "DUAL seek 落点帧上屏超时（target={target:.2}s）"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let firstpts = landed.expect("DUAL seek 首帧应上屏");
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let (total, reuse, regress, skipped, s2f, f2s, tgt, fp) = match take_seek_diag_test()
+            {
+                Some(x) => x,
+                None => (ms, 1u8, f64::NAN, 0u32, ms, 0.0, target, firstpts),
+            };
+            rows.push(total);
+            eprintln!(
+                "[SEEKBENCHDUAL] total={total:.1}ms reuse={reuse} regress={regress:+.2}s skipped={skipped} seek2first={s2f:.1}ms frame2screen={f2s:.1}ms target={tgt:.2}s firstpts={fp:.2}s dual=1"
+            );
+        }
+        let mut sorted = rows.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[SEEKBENCHDUAL] 摘要 n={} min={:.1}ms median={:.1}ms max={:.1}ms（total 口径，dual=1）",
+            sorted.len(),
+            sorted[0],
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1],
+        );
         cx.run_until_parked();
     }

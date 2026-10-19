@@ -347,6 +347,36 @@ fn hw_external_release_never_leaks_slot() {
     drop(held);
 }
 
+/// 外部设备注入 **open→drop（不解码）** teardown 回归：打开外部 D3D11VA reader 后**一帧
+/// 不解**立即 drop，断言窗口释放设备/上下文干净无 AV。Arc 实测：注入路径若从未在注入
+/// 设备上 init 过 `AVHWFramesContext`，释放 `ID3D11DeviceContext` 偶发 0xc0000005（机制未
+/// 完全定位、非因果陈述，由 [`warm_external_d3d11_frames_pool`] 护栏兜底）；本测覆盖
+/// 「无解码直关」子路径（`hw_external_decode_frames` 已覆盖 open→decode→drop；open 内置的
+/// 预热帧池 AVBufferRef 随 reader 一起建/弃，顺带覆盖帧池缓冲 drop）。缺夹具 / 无 D3D11
+/// 设备 → SKIP。
+#[test]
+fn hw_external_open_drop_without_decode_teardown_clean() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/视频测试.mp4");
+    if !path.exists() {
+        eprintln!("SKIP: missing target/视频测试.mp4（媒体夹具不入库，手动装配）");
+        return;
+    }
+    let (device, context, dtype) = match make_d3d11_device() {
+        Some(x) => x,
+        None => {
+            eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用");
+            return;
+        }
+    };
+    let Some(r) = open_reader(&path, &device, &context, dtype) else {
+        return;
+    };
+    // 不解码任何帧：直接 drop reader → FFmpeg 解码器/设备/上下文 uninit → 函数尾 drop 设备/上下文
+    drop(r);
+    eprintln!("[HW teardown] open→drop（不解码）干净退出（设备={dtype}）");
+}
+
 /// 安全架构（FFmpeg 自有设备）seek 预滚回归：`open_scaled_hw` + `skip_to_bgra_into`
 /// （落点前帧只解码不转换、首个 ≥ target 帧一次性转 BGRA）。断言首帧 pts≥target、跳帧数>0、
 /// BGRA 缓冲有非零像素、随后 `next_frame_bgra_into` 续读 pts>target。墙钟供 [SEEKBENCH] 对表。
@@ -396,10 +426,11 @@ fn hw_skip_to_bgra_fast_preroll() {
     );
 }
 
-/// 能力查询 FFI 一致性：`vff_d3d11_supports_shader_bound_textures` 与 `open_external_hw`
-/// 内部的能力探测同源（同一函数）——导出值应与内核内部函数逐位一致；空设备指针优雅返回 0
-///（不 panic、不崩）；有效设备上返回值恒 0/1。这是双设备直通门控的判定来源，必须与
-/// 解码器实际建 SHR 纹理的探测结果一致（若门控误判「支持」会在不支持 SRV 的驱动上绿屏）。
+/// 能力查询 FFI 一致性：`vff_d3d11_supports_shader_bound_textures` 与内核
+/// `decode::d3d11_supports_shader_bound_textures` 同源（同一函数）——导出值应与内核内部
+/// 函数逐位一致；空设备指针优雅返回 0（不 panic、不崩）；有效设备上返回值恒 0/1。
+/// **NOT 直通门控**：解码池恒 DECODER-only（渲染端只采样共享槽），本探测仅供能力自诊断/
+/// 一致性核对；返回 0（Intel Arc）不再停用直通。
 #[test]
 fn hw_external_capability_srvs_export_matches_internal_probe() {
     // 空指针优雅 false：不 panic，直接 0（桥侧同样裁剪到「不可用 → false」）
@@ -436,6 +467,6 @@ fn hw_external_capability_srvs_export_matches_internal_probe() {
         "能力查询应返回 0/1，实得 {exported}（设备={dtype}）"
     );
     eprintln!(
-        "[HW capability] 设备={dtype} D3D11VA 数组纹理带 SHADER_RESOURCE（平面 SRV 采样）支持 = {exported}（与 open_external_hw 内部探测同源）"
+        "[HW capability] 设备={dtype} D3D11VA 数组纹理带 SHADER_RESOURCE（平面 SRV 采样）支持 = {exported}（诊断，非直通门控）"
     );
 }

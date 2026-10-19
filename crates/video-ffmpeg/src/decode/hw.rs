@@ -241,11 +241,11 @@ impl Drop for AddRefGuard {
 /// 成功或失败都让 FFmpeg 的 uninit 回调负责 Release（`av_buffer_unref` 触发；失败时先 disarm
 /// guard 防止双 Release）。`lock_ctx` 置空（全局桥，无需每设备状态）。
 ///
-/// `shader_resource=true`（规范默认）时给帧纹理挂 `D3D11_BIND_SHADER_RESOURCE`，调用方
-/// 可直接把解码纹理绑 SRV 采样（零回读 GPU 直通的前提）；但实测部分驱动（Intel Arc
-/// 32.0.101.x 等）拒绝 `D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE` 的 NV12 数组
-/// 纹理（`CreateTexture2D` E_INVALIDARG），此时需 `shader_resource=false` 重开
-/// （解码照常，仅纹理不再可被直接采样——见 [`VideoReader::open_external_hw`] 的回退逻辑）。
+/// `shader_resource=true` 时给帧纹理挂 `D3D11_BIND_SHADER_RESOURCE`（仅供
+/// [`d3d11_supports_shader_bound_textures`] 能力探测用）；**生产解码路径恒传 `false`**
+///（DECODER-only，见 [`VideoReader::open_external_hw`] 文档）——Arc 等驱动拒绝
+/// `D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE` 的 NV12 数组纹理（`CreateTexture2D`
+/// E_INVALIDARG），而拷贝源只需 `USAGE_DEFAULT`、渲染只采样共享槽，故无需 SHR。
 ///
 /// 返回 `AvBuf` 已持有对设备上下文 `AVBufferRef` 的引用（含 uninit 时的接口释放），
 /// 调用方（[`VideoReader::open_external_hw`]）再 `av_buffer_ref` 一份挂给解码器。
@@ -319,16 +319,17 @@ pub(crate) fn build_external_d3d11_device_ctx(
     Ok(AvBuf(device_buf))
 }
 
-/// 探测驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」：用**带 SHR** 的设备上下文
-/// 建一个最小帧池（NV12 数组 ×4，BindFlags = `DECODER | SHADER_RESOURCE`，与 libavcodec
-/// D3D11VA frame_params 一致）跑 `av_hwframe_ctx_init`——成功 = 支持；失败
+/// 诊断/测试用探测：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」——用**带 SHR**
+/// 的设备上下文建一个最小帧池（NV12 数组 ×4，BindFlags = `DECODER | SHADER_RESOURCE`，与
+/// libavcodec D3D11VA frame_params 一致）跑 `av_hwframe_ctx_init`：成功 = 支持；失败
 ///（`CreateTexture2D` E_INVALIDARG，实测 Intel Arc 32.0.101.x 等驱动拒绝该组合）=
-/// 不支持、需回退无 SHR 的设备上下文。
+/// 不支持。
 ///
-/// 纯 device/frames 上下文、**不开解码器** → 失败无副作用（表由 [`VideoReader::open_external_hw`]
-/// 在打开解码器前调用；只用 `AVHWFramesContext` 最小池探测，顺带验证帧池纹理可建）。
-/// `pub(crate)`：经 lib.rs 的 [`vff_d3d11_supports_shader_bound_textures`] 导出给主程序做
-/// 双设备直通的门控能力查询（与 `open_external_hw` 内部的探测同源）。
+/// **NOT 直通门控**：双设备直通不再依赖本探测——解码器配置恒 DECODER-only（见
+/// [`VideoReader::open_external_hw`] 的文档），渲染端只采样共享槽。本函数仅供
+/// `hw_external_tests` 一致性检查与主程序能力自诊断（FFI
+/// [`vff_d3d11_supports_shader_bound_textures`]）使用，结果只反映驱动约束、不影响解码路径。
+/// 纯 device/frames 上下文、**不开解码器** → 失败无副作用。
 pub(crate) fn d3d11_supports_shader_bound_textures(
     device: *mut std::ffi::c_void,
     device_context: *mut std::ffi::c_void,
@@ -358,6 +359,45 @@ pub(crate) fn d3d11_supports_shader_bound_textures(
     };
     drop(dev);
     ok
+}
+
+/// Intel Arc 驱动 teardown 兼容护栏：在外部注入的 D3D11 设备/上下文上预先跑一次最小的
+/// **DECODER-only** `AVHWFramesContext` 帧池初始化（成功即弃、不开解码器）。
+///
+/// 实测发现（本机 Arc 32.0.101.8861，`hw_external_*` 套件）：`open_external_hw` 若从未在
+/// 注入设备上 init 过任何 `AVHWFramesContext`，窗口释放 `ID3D11DeviceContext` 时**偶发**
+/// 0xc0000005（drop(reader) 正常、最后 context Release AV）。机制/根因未完全定位——引用
+/// 计数上探测/预热的起止恒平衡，且正常解码的 reader 首帧也会建帧池，故不构成
+/// 「未 init 必崩」的因果陈述；此处如实按经验记录。旧实现里的「带 SHR 失败帧池探测」
+///（[`d3d11_supports_shader_bound_textures`]）恰也包含一次 `av_hwframe_ctx_init`，曾被误作
+/// 直通门控必需；废除门控后由本护栏承接同一「预跑一次帧池初始化」职责：DECODER-only
+/// 构建通常成功（无失败日志噪音），仅首次打开时一次、热路径零成本，其它驱动无害。
+pub(crate) fn warm_external_d3d11_frames_pool(
+    device: *mut std::ffi::c_void,
+    device_context: *mut std::ffi::c_void,
+) {
+    use ffmpeg::ffi::{AVBufferRef, AVD3D11VAFramesContext, AVHWFramesContext};
+    let Ok(dev) = build_external_d3d11_device_ctx(device, device_context, false) else {
+        return;
+    };
+    unsafe {
+        let frames = ffmpeg::ffi::av_hwframe_ctx_alloc(ffmpeg::ffi::av_buffer_ref(dev.0));
+        if frames.is_null() {
+            drop(dev);
+            return;
+        }
+        let fc = (*frames).data as *mut AVHWFramesContext;
+        (*fc).format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
+        (*fc).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+        (*fc).width = 1280;
+        (*fc).height = 720;
+        (*fc).initial_pool_size = 4;
+        let fhw = (*fc).hwctx as *mut AVD3D11VAFramesContext;
+        (*fhw).BindFlags = 0x20; // DECODER only（必成功）
+        let _ = ffmpeg::ffi::av_hwframe_ctx_init(frames);
+        ffmpeg::ffi::av_buffer_unref(&mut (frames as *mut AVBufferRef));
+    }
+    drop(dev);
 }
 
 /// 单帧 HW 帧的 `AVBufferRef` 引用钉：把解码帧的 AVBufferRef 引用复制一份私有持有，

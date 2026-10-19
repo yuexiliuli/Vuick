@@ -404,8 +404,10 @@ impl super::VideoViewer {
         self.served_hover_target = None;
         self.hover_generation.fetch_add(1, Ordering::SeqCst);
         let (_tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
+        // 换文件同款：旧接收端缓存里的 GPU 直通帧槽位须归还（见 `drop_replaced_rx_frames`，
+        // 不能随 `drop(old)` 静默丢句柄）
         if let Some(old) = self.rx.replace(rx) {
-            drop(old);
+            self.drop_replaced_rx_frames(old);
         }
         self.start(cx);
         // 切视频：控制条浮现（锁定模式默认可见随后自隐；普通模式常驻）
