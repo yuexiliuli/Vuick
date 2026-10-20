@@ -2278,6 +2278,7 @@ dependencies = [
  "gpui",
  "image",
  "libjpeg-turbo-rs",
+ "rayon",
  "ui",
  "viewer",
 ]

@@ -26,6 +26,9 @@
 //!   AVX2/SSE2 IDCT 降档 + 直出 BGRA，无 `DynamicImage` 中间拷贝）按 [`Self::display_need`]
 //!   档位解码。选档规则 = **解码分辨率 ≥ 显示需要的像素**（上限 1/8，需要涨则分母落，
 //!   需要超过原图才全解）——GPU 只缩小不放大 → **显示不糊**；单帧内存 75MB→~20MB。
+//! - **PNG 同款降档**：PNG 走 `image::codecs::png::PngDecoder` 全量解出 RGBA8（palette/
+//!   灰度/16bit 展开归一）后按同一选档规则**盒式降采样**到展示档（rayon 行组并行，小图
+//!   退串行）——缓存/GPU 上传像素数按 den² 缩小，放大升档链路与 JPEG 对齐。
 //! - **内存/CPU 有界**：解码并发照旧 [`MAX_DECODE`]-1 预取封顶，且 [`Self::pump_prefetch`]
 //!   在解码缓存达到字节预算后**停止派发**（[`CACHE_MAX_BYTES`]）——不再把整个文件夹扫一遍
 //!   白算 CPU（此前 106 张全解 ≈ 8GB 像素量磨 8 核）。缓存能装 ~9 张显示档 → 滚动基本全命中。
@@ -92,8 +95,9 @@ struct CacheEntry {
     render: Arc<RenderImage>,
     intrinsic: (f32, f32),
     bytes: usize,
-    /// JPEG 实际解码降档分母（1/8/4/2/1；非 JPEG 恒 1）。用于「升档判定」：
-    /// 展示分母 > 当前需要分母（= 解码比显示更粗）时按需重解更细档（放大时）。
+    /// 实际解码降档分母（1/8/4/2/1）：JPEG 走 libjpeg-turbo IDCT 降档、PNG 走盒式降采样，
+    /// 二者共用 [`pick_jpeg_denom`] 选档；其它格式恒 1。用于「升档判定」：展示分母 >
+    /// 当前需要分母（= 解码比显示更粗）时按需重解更细档（放大时）。
     denom: u8,
     /// 动图（GIF）逐帧切片：每帧一个**独立单帧** `RenderImage` + 各自时长；`None` = 静态图。
     /// 采用「按帧切片」而非 gpui 多帧 `RenderImage`：gpui `img()` 元素的自动动画只在窗口
@@ -283,11 +287,11 @@ pub struct ImageViewer {
     last_scroll_at: Option<std::time::Instant>,
     /// 上一帧实测的可视视口尺寸（render 期记录；展示像素需要 / 显示尺寸据此）。
     last_viewport: (f32, f32),
-    /// 展示像素需要（宽, 高）：由「适应视口尺寸 × zoom」算出，**JPEG 解码档位的下限**——
+    /// 展示像素需要（宽, 高）：由「适应视口尺寸 × zoom」算出，**JPEG/PNG 解码档位的下限**——
     /// 解码分辨率 ≥ 该值（GPU 只缩小、不放大）→ 显示不糊。首个 render 前用
     /// [`DISPLAY_NEED_INIT`] 兜底。
     display_need: (f32, f32),
-    /// 当前安装展示的 JPEG 降档分母（1/8/4/2/1；非 JPEG 恒 1）。缩放放大且需要更细档时
+    /// 当前安装展示的降档分母（1/8/4/2/1；JPEG/PNG；其它格式恒 1）。缩放放大且需要更细档时
     /// 据此触发「升档」重解（[`Self::escalate_display_denom`]）。
     display_denom: u8,
     /// 平移（px）：放大后拖拽浏览其他区域，以视口中心为基准、每帧 clamp 到图始终覆盖视口。
@@ -892,18 +896,28 @@ impl ImageViewer {
         }
     }
 
-    /// 「升档」：当前展示是 JPEG 且降档分母比当前展示需要更粗（解码像素比显示小）时，
-    /// 重解更细档替换。直接派发（跳过 [`Self::queue_decode`] 的缓存短路——缓存里存的旧档位
-    /// 命中只会装回旧图）；`in_flight`/并发满则记 [`Self::pending_target`]。完成后新档
-    /// 经 `cache_put` 替换粗档并上屏，`display_denom` 收敛到 ≤ 需要 → 不再触发（只升不降）。
+    /// 「升档」：当前展示档分母比当前展示需要更粗（解码像素比显示小）时，重解更细档替换
+    /// （JPEG/PNG 皆可——选档 [`pick_jpeg_denom`] 与格式无关）。直接派发（跳过
+    /// [`Self::queue_decode`] 的缓存短路——缓存里存的旧档位命中只会装回旧图）；
+    /// `in_flight`/并发满则记 [`Self::pending_target`]。完成后新档经 `cache_put` 替换
+    /// 粗档并上屏，`display_denom` 收敛到 ≤ 需要 → 不再触发（只升不降）。
     fn escalate_display_denom(&mut self, cx: &mut Context<Self>) {
-        if self.display_denom == 1 || !path_is_jpeg(&self.path) {
+        // display_denom==1 已满档（全解）不升；去掉 `path_is_jpeg` 限定让 PNG den>1 条目
+        // 在 display_need 变大（放大/窗口变大）时同样能重解更细档
+        if self.display_denom <= 1 {
             return;
         }
         let Some((iw, ih)) = self.intrinsic else {
             return;
         };
-        let desired = pick_jpeg_denom(iw as u32, ih as u32, self.display_need);
+        // `intrinsic` 是**降档后**的尺寸：选档基准必须按「全量原图」估回（×display_denom），
+        // 否则在「当前降档输出已 ≥ 展示需要」区会算出 desired=1 < display_denom →
+        // 每次缩放/回看缓存图都触一次重解，又落回同一分母（浪费一次全量 PNG 解码）。
+        let full = (
+            (iw as u32).saturating_mul(u32::from(self.display_denom)),
+            (ih as u32).saturating_mul(u32::from(self.display_denom)),
+        );
+        let desired = pick_jpeg_denom(full.0, full.1, self.display_need);
         if self.display_denom <= desired {
             return;
         }
@@ -1167,37 +1181,49 @@ impl ImageViewer {
         let _ = self.byte_cache.put(path, entry);
     }
 
-    /// C6：取滚动方向最近一张「已解码在缓存、但非当前显示」的图，包成**垫底透明 img**
-    /// （同尺寸、opacity 0、不拦截输入）。让 gpui 在上屏前就完成该纹理的 GPU 上传，切到
-    /// 的那一帧不再肩负首次上传（真实 GPU 生效；headless 测试无真实纹理，仅保证构造正确）。
-    fn peek_upgrade_element(&self) -> Option<gpui::AnyElement> {
+    /// C6：取滚动方向最近「已解码在缓存、但非当前显示」的最多 3 张图，各自包成**垫底透明
+    /// img**（同尺寸、opacity 0、不拦截输入）叠进返回值。让 gpui 在上屏前就完成这些纹理的
+    /// GPU 上传，切到的那一帧不再肩负首次上传（真实 GPU 生效；headless 测试无真实纹理，
+    /// 仅保证构造正确）。前向加深到 3 张：快翻时后 2 张大概率已缓存，一次预上传 3 张省
+    /// 掉连续切换里「首次上传」的卡顿；缓存没填满 3 张就只叠加存在者，重复路径去重。
+    fn peek_upgrade_elements(&self) -> Vec<gpui::AnyElement> {
         let n = self.nav.len() as i64;
         if n <= 1 {
-            return None;
+            return Vec::new();
         }
-        let ni = (self.nav.current() as i64 + self.prefetch_dir as i64).rem_euclid(n) as usize;
-        let target = self.nav.get(ni)?;
-        if *target == self.path {
-            return None;
+        let mut seen: Vec<&Path> = Vec::new();
+        let mut out = Vec::new();
+        for k in 1i64..=3 {
+            let ni = (self.nav.current() as i64 + self.prefetch_dir as i64 * k).rem_euclid(n) as usize;
+            let Some(target) = self.nav.get(ni) else {
+                continue;
+            };
+            if *target == self.path || seen.iter().any(|p| *p == target) {
+                continue;
+            }
+            let Some(entry) = self.cache.iter().find(|e| e.path == *target) else {
+                continue;
+            };
+            seen.push(target);
+            let render = entry.render.clone();
+            out.push(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .w_full()
+                    .h_full()
+                    .opacity(0.0)
+                    .child(
+                        img(gpui::ImageSource::Render(render))
+                            .object_fit(ObjectFit::Contain)
+                            .w_full()
+                            .h_full(),
+                    )
+                    .into_any_element(),
+            );
         }
-        let entry = self.cache.iter().find(|e| e.path == *target)?;
-        let render = entry.render.clone();
-        Some(
-            div()
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .w_full()
-                .h_full()
-                .opacity(0.0)
-                .child(
-                    img(gpui::ImageSource::Render(render))
-                        .object_fit(ObjectFit::Contain)
-                        .w_full()
-                        .h_full(),
-                )
-                .into_any_element(),
-        )
+        out
     }
 
     /// 居中占位文本（加载中 / 加载失败共用）。
@@ -1254,15 +1280,16 @@ impl Render for ImageViewer {
             self.zoom * 100.0
         ));
 
-        // C6：把方向最近的已缓存图以透明 img 垫底，纹理预先上传（详见 peek_upgrade_element）
-        let preheat = self.peek_upgrade_element();
+        // C6：把方向最近的已缓存图（最多 3 张）以透明 img 垫底，纹理预先上传（详见
+        // peek_upgrade_elements）
+        let preheat = self.peek_upgrade_elements();
 
         let mut root = div()
             .id("image-viewer")
             .size_full()
             .relative()
             .bg(canvas);
-        if let Some(peek) = preheat {
+        for peek in preheat {
             root = root.child(peek);
         }
         root = root
@@ -1336,6 +1363,13 @@ fn is_jpeg_magic(b: &[u8]) -> bool {
 /// 伪装成其它扩展名的 GIF 也会被识别。
 fn is_gif_magic(b: &[u8]) -> bool {
     b.starts_with(b"GIF")
+}
+
+/// PNG 魔数（8 字节签名 `\x89PNG\r\n\x1a\n`）检测：区分「PNG 走展示档降采样解码」与
+/// 「其它格式走 image 全解」。以字节为准，比扩展名可信（伪装成 .png 的其它格式不会
+/// 被误当 PNG 硬解）。
+fn is_png_magic(b: &[u8]) -> bool {
+    b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
 }
 
 /// 路径扩展名是否 jpg/jpeg（升档路由的廉价判据；最终仍以魔数 + `probe` 为准）。
@@ -1495,6 +1529,215 @@ fn decode_jpeg_display(
     Ok((img.data, img.width as u32, img.height as u32, den))
 }
 
+/// 盒式降采样并行阈值（输入像素数）：低于则用单线程，避免 rayon 线程池分摊/派发开销
+/// 反噬小图（小图后处理占比已可忽略）。
+const PARALLEL_DOWNSAMPLE_MIN_PX: u64 = 1_000_000;
+
+/// 4 通道盒式降采样（**单线程参考实现**）：`den×den` 源像素块 → 1 输出像素，每通道取均值
+/// （**含 alpha**；右/下边缘不满块按实际像素数归一）。输出尺寸 ceil(iw/den)×ceil(ih/den)。
+/// 纯后处理、除输出缓冲区外零分配、不 panic（输入尺寸一致由调用方保证）。用在 PNG 展示
+/// 档：全量解出 RGBA8 后缩到展示档，只对**缩小后**的缓冲区 swap 红蓝。像素测试以此实现
+/// 为基准；生产大图走同语义的 [`box_downsample_bgra_or_rgba_rayon`]（并行与串行逐字节
+/// 一致，有回归断言兜底）。
+fn box_downsample_bgra_or_rgba(buf: &[u8], iw: u32, ih: u32, den: u8) -> (Vec<u8>, u32, u32) {
+    let den = u32::from(den).max(1);
+    let ow = iw.div_ceil(den);
+    let oh = ih.div_ceil(den);
+    let mut out = vec![0u8; (ow as usize) * (oh as usize) * 4];
+    for oy in 0..oh {
+        downsample_row_4ch(buf, iw, ih, den, ow, oy, &mut out[(oy as usize * ow as usize) * 4..]);
+    }
+    (out, ow, oh)
+}
+
+/// 单条输出行：对其 `den×den` 源块的 `ow` 个像素块各自求 4 通道平均（含 alpha，边缘不满
+/// 块按实际像素数归一）。行与行互不依赖 → 供 rayon 按行并行复用。
+#[inline]
+fn downsample_row_4ch(buf: &[u8], iw: u32, ih: u32, den: u32, ow: u32, oy: u32, dst: &mut [u8]) {
+    let y0 = oy * den;
+    let y1 = (y0 + den).min(ih);
+    for ox in 0..ow {
+        let x0 = ox * den;
+        let x1 = (x0 + den).min(iw);
+        let col_bytes = (x1 - x0) as usize * 4;
+        let mut acc = [0u32; 4];
+        let mut n = 0u32;
+        for y in y0..y1 {
+            let row = &buf[((y * iw + x0) as usize) * 4..][..col_bytes];
+            let mut off = 0usize;
+            while off < col_bytes {
+                acc[0] += row[off] as u32;
+                acc[1] += row[off + 1] as u32;
+                acc[2] += row[off + 2] as u32;
+                acc[3] += row[off + 3] as u32;
+                n += 1;
+                off += 4;
+            }
+        }
+        let di = ox as usize * 4;
+        if n > 0 {
+            dst[di] = (acc[0] / n) as u8;
+            dst[di + 1] = (acc[1] / n) as u8;
+            dst[di + 2] = (acc[2] / n) as u8;
+            dst[di + 3] = (acc[3] / n) as u8;
+        }
+    }
+}
+
+/// 同 [`box_downsample_bgra_or_rgba`] 语义的 **rayon 行组并行** 版：输出行互不依赖，按行
+/// 派给并行迭代器；输入像素 < [`PARALLEL_DOWNSAMPLE_MIN_PX`] 时退回单线程（避免线程池
+/// 开销反噬小图）。产出与单线程参考实现逐字节一致（整数平均确定性），有回归断言兜底。
+fn box_downsample_bgra_or_rgba_rayon(buf: &[u8], iw: u32, ih: u32, den: u8) -> (Vec<u8>, u32, u32) {
+    if (iw as u64) * (ih as u64) < PARALLEL_DOWNSAMPLE_MIN_PX {
+        return box_downsample_bgra_or_rgba(buf, iw, ih, den);
+    }
+    use rayon::prelude::*;
+    let den = u32::from(den).max(1);
+    let ow = iw.div_ceil(den);
+    let oh = ih.div_ceil(den);
+    let row_bytes = (ow as usize) * 4;
+    let mut out = vec![0u8; row_bytes * (oh as usize)];
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(oy, dst)| downsample_row_4ch(buf, iw, ih, den, ow, oy as u32, dst));
+    (out, ow, oh)
+}
+
+/// PngDecoder 非 RGBA8 输出（灰度 / 灰度+alpha / 16bit）→ RGBA8 展开（每像素 4 字节 RGBA）。
+/// PngDecoder 固定 EXPAND 变换：palette 已展开为 Rgb/Rgba、<8bit 已升到 8bit，但 16bit
+/// 通道仍为 L16/La16/Rgb16/Rgba16（`read_image` 已按契约转本机字节序）——这里统一按
+/// 高字节右移 8 归一为 u8（与 image 16→8 缩放惯例一致）。
+fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> Option<Vec<u8>> {
+    let n = (w as usize).checked_mul(h as usize)?;
+    let mut out = vec![0u8; n * 4];
+    match color {
+        image::ColorType::Rgba8 => {
+            if buf.len() != n * 4 {
+                return None;
+            }
+            out.copy_from_slice(buf);
+        }
+        image::ColorType::Rgb8 => {
+            if buf.len() != n * 3 {
+                return None;
+            }
+            for (src, dst) in buf.chunks_exact(3).zip(out.chunks_exact_mut(4)) {
+                dst[..3].copy_from_slice(src);
+                dst[3] = 255;
+            }
+        }
+        image::ColorType::L8 => {
+            if buf.len() != n {
+                return None;
+            }
+            for (g, dst) in buf.iter().zip(out.chunks_exact_mut(4)) {
+                dst[0] = *g;
+                dst[1] = *g;
+                dst[2] = *g;
+                dst[3] = 255;
+            }
+        }
+        image::ColorType::La8 => {
+            if buf.len() != n * 2 {
+                return None;
+            }
+            for (p, dst) in buf.chunks_exact(2).zip(out.chunks_exact_mut(4)) {
+                dst[0] = p[0];
+                dst[1] = p[0];
+                dst[2] = p[0];
+                dst[3] = p[1];
+            }
+        }
+        image::ColorType::Rgba16 => {
+            if buf.len() != n * 8 {
+                return None;
+            }
+            for (p, dst) in buf.chunks_exact(8).zip(out.chunks_exact_mut(4)) {
+                dst[0] = (u16::from_ne_bytes([p[0], p[1]]) >> 8) as u8;
+                dst[1] = (u16::from_ne_bytes([p[2], p[3]]) >> 8) as u8;
+                dst[2] = (u16::from_ne_bytes([p[4], p[5]]) >> 8) as u8;
+                dst[3] = (u16::from_ne_bytes([p[6], p[7]]) >> 8) as u8;
+            }
+        }
+        image::ColorType::Rgb16 => {
+            if buf.len() != n * 6 {
+                return None;
+            }
+            for (p, dst) in buf.chunks_exact(6).zip(out.chunks_exact_mut(4)) {
+                dst[0] = (u16::from_ne_bytes([p[0], p[1]]) >> 8) as u8;
+                dst[1] = (u16::from_ne_bytes([p[2], p[3]]) >> 8) as u8;
+                dst[2] = (u16::from_ne_bytes([p[4], p[5]]) >> 8) as u8;
+                dst[3] = 255;
+            }
+        }
+        image::ColorType::L16 => {
+            if buf.len() != n * 2 {
+                return None;
+            }
+            for (p, dst) in buf.chunks_exact(2).zip(out.chunks_exact_mut(4)) {
+                let g = (u16::from_ne_bytes([p[0], p[1]]) >> 8) as u8;
+                dst[0] = g;
+                dst[1] = g;
+                dst[2] = g;
+                dst[3] = 255;
+            }
+        }
+        image::ColorType::La16 => {
+            if buf.len() != n * 4 {
+                return None;
+            }
+            for (p, dst) in buf.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+                let g = (u16::from_ne_bytes([p[0], p[1]]) >> 8) as u8;
+                let a = (u16::from_ne_bytes([p[2], p[3]]) >> 8) as u8;
+                dst[0] = g;
+                dst[1] = g;
+                dst[2] = g;
+                dst[3] = a;
+            }
+        }
+        _ => return None, // PngDecoder 不会产出 float32 等类型（防御）
+    }
+    Some(out)
+}
+
+/// PNG 按展示需要**降档解码**（`image::codecs::png::PngDecoder` 解全量位图，非 RGBA8 先
+/// 展开，再对全量做盒式降采样到展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。
+/// 选档复用 [`pick_jpeg_denom`]（与格式无关的「解码 ≥ 显示」语义）。
+/// - den=1 → 与改动前 `image` 全解**逐像素一致**（RGBA swap 成 BGRA，尺寸=原始）；
+/// - den>1 → 只对**缩小后**缓冲区 swap 红蓝（不在 9M 全量上做交换）。
+/// 任何失败均返回 `Err`（由上层回退 `image` 全解），绝不 panic/硬失败。
+fn decode_png_display(
+    bytes: &[u8],
+    need: (f32, f32),
+) -> Result<(Vec<u8>, u32, u32, u8), String> {
+    let mut dec = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
+        .map_err(|e| format!("PNG 解码器初始化失败：{e}"))?;
+    // 与 `image` 全解一致的上限护栏（Limits::default()：max_alloc=512MB / 最大宽高 65535）
+    dec.set_limits(image::Limits::default())
+        .map_err(|e| format!("PNG 尺寸超限：{e}"))?;
+    let (iw, ih) = dec.dimensions();
+    let den = pick_jpeg_denom(iw, ih, need);
+    let color = dec.color_type();
+    let nbytes = usize::try_from(dec.total_bytes()).map_err(|_| "PNG 解码尺寸过大".to_string())?;
+    let mut raw = vec![0u8; nbytes];
+    dec.read_image(&mut raw)
+        .map_err(|e| format!("PNG 解码失败：{e}"))?;
+    // 8bit RGBA 直接复用读出缓冲（零拷贝）；其余色彩逐一展开到 RGBA8
+    let mut rgba = if color == image::ColorType::Rgba8 {
+        raw
+    } else {
+        expand_png_to_rgba8(&raw, iw, ih, color).ok_or("PNG 色彩转换失败")?
+    };
+    if den == 1 {
+        // den=1：与改动前 `image` 全解逐像素一致（RGBA→BGRA 交换、尺寸=原始）
+        swap_rb_in_place(rgba.as_mut());
+        return Ok((rgba, iw, ih, 1));
+    }
+    let (mut bgra, w, h) = box_downsample_bgra_or_rgba_rayon(&rgba, iw, ih, den);
+    swap_rb_in_place(bgra.as_mut());
+    Ok((bgra, w, h, den))
+}
+
 /// RGBA → BGRA（原地交换每像素 R/B；缓冲区按 w×h×4 的 RGBA 直排）。GPUI 的
 /// `RenderImage` 字节序为 BGRA（PDF 模块亦如此）；不交换会红蓝互换、颜色明显失真。
 fn swap_rb_in_place(rgba: &mut [u8]) {
@@ -1589,8 +1832,9 @@ fn decode_generic(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
 }
 
 /// 后台解码总入口：JPEG → libjpeg-turbo 按展示需要降档直出 BGRA（特殊 JPEG 如 CMYK / 12bit /
-/// lossless 解不动时回退 `image` 全解，绝不硬失败）包成单帧；非 JPEG → `image` 全解
-/// （GIF 解全帧动图）。返回 (BGRA 帧序列, 宽, 高, 降档分母)。
+/// lossless 解不动时回退 `image` 全解，绝不硬失败）包成单帧；PNG → 展示档降采样解码
+/// （[`decode_png_display`]，失败回退 `image` 全解）；其它 → `image` 全解（GIF 解全帧动图）。
+/// 返回 (BGRA 帧序列, 宽, 高, 降档分母)。den=1 时与改动前逐像素一致。
 fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<Frame>, u32, u32, u8), String> {
     if is_jpeg_magic(bytes) {
         match decode_jpeg_display(bytes, need) {
@@ -1599,6 +1843,18 @@ fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<Frame>, u32,
                 Ok((vec![frame], w, h, den))
             }
             Err(_) => {
+                let (frames, w, h) = decode_generic(bytes)?;
+                Ok((frames, w, h, 1))
+            }
+        }
+    } else if is_png_magic(bytes) {
+        match decode_png_display(bytes, need) {
+            Ok((bgra, w, h, den)) => {
+                let frame = bgra_single_frame(bgra, w, h).ok_or("解码结果尺寸异常")?;
+                Ok((vec![frame], w, h, den))
+            }
+            Err(_) => {
+                // 降采样链路任何失败 → 回退既有 `image` 全解（den=1），绝不硬失败/panic
                 let (frames, w, h) = decode_generic(bytes)?;
                 Ok((frames, w, h, 1))
             }
@@ -1662,6 +1918,465 @@ mod tests {
         // [蓝10, 绿30, 红200, 255]。若这里仍是 RGBA 序，说明红蓝互换的修复回退。
         let c = [bgra[0], bgra[1], bgra[2], bgra[3]];
         assert_eq!(c, [10, 30, 200, 255]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手写极小 PNG 字节（免依赖）：CRC32 + chunk 拼装 + deflate **stored** 块（无压缩，
+    /// 避开对 flate2/zlib 的直接依赖）。
+    fn png_adler32(data: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+
+    fn png_chunk_byte(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        fn crc32(d: &[u8]) -> u32 {
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in d {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&out[4..]).to_be_bytes());
+        out
+    }
+
+    /// 手写 1×1 RGBA8 PNG；`interlace`=1 走 Adam7（1×1 仅 pass0 一个扫描行，IDAT 载荷与
+    /// 非交错相同）。覆盖「交错 PNG PngDecoder 自动重组、至少不 panic」。
+    fn minimal_1x1_rgba_png(interlace: u8, pixel: [u8; 4]) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, interlace]); // 8bit RGBA, interlace 标志
+        out.extend_from_slice(&png_chunk_byte(b"IHDR", &ihdr));
+        let scan: Vec<u8> = std::iter::once(0).chain(pixel).collect(); // filter0 + RGBA
+        let mut idat = Vec::new();
+        idat.extend_from_slice(&[0x78, 0x01]); // zlib 头（CMF/FLG，FCHECK 整除 31）
+        idat.push(0x01); // deflate stored 块：BFINAL=1, BTYPE=00
+        idat.extend_from_slice(&(scan.len() as u16).to_le_bytes());
+        idat.extend_from_slice(&(!(scan.len() as u16)).to_le_bytes());
+        idat.extend_from_slice(&scan);
+        idat.extend_from_slice(&png_adler32(&scan).to_be_bytes()); // zlib adler32 尾部
+        out.extend_from_slice(&png_chunk_byte(b"IDAT", &idat));
+        out.extend_from_slice(&png_chunk_byte(b"IEND", &[]));
+        out
+    }
+
+    /// 手写 2×1 palette PNG（8bit 索引色）：IHDR colortype=3 + PLTE（两色）+ IDAT 两个索引
+    /// 字节（stored deflate，无 tRNS → alpha=255）。验证 palette 被 PngDecoder EXPAND 展开
+    /// （image 编码器不产 palette 文件，故手写构造）。
+    fn minimal_2x1_palette_png(colors: &[[u8; 3]], indices: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 3, 0, 0, 0]); // 8bit 索引色
+        out.extend_from_slice(&png_chunk_byte(b"IHDR", &ihdr));
+        let plte: Vec<u8> = colors.iter().flatten().copied().collect();
+        out.extend_from_slice(&png_chunk_byte(b"PLTE", &plte));
+        let mut scan = vec![0u8]; // filter0
+        scan.extend_from_slice(indices);
+        let mut idat = Vec::new();
+        idat.extend_from_slice(&[0x78, 0x01]); // zlib 头
+        idat.push(0x01);
+        idat.extend_from_slice(&(scan.len() as u16).to_le_bytes());
+        idat.extend_from_slice(&(!(scan.len() as u16)).to_le_bytes());
+        idat.extend_from_slice(&scan);
+        idat.extend_from_slice(&png_adler32(&scan).to_be_bytes()); // zlib adler32 尾部
+        out.extend_from_slice(&png_chunk_byte(b"IDAT", &idat));
+        out.extend_from_slice(&png_chunk_byte(b"IEND", &[]));
+        out
+    }
+
+    /// 手写**多 pass** 交错（Adam7）PNG（实心色，任意尺寸）：按 PNG 规范把各 pass 的滤波
+    /// 扫描行按 pass 顺序拼进 IDAT（stored deflate + adler32）。实心色让所有 pass 的像素
+    /// 相同、无需逐像素推算各 pass 归属，解码后整幅必须全是该色，从而验证 PngDecoder 的
+    /// Adam7 重组正确（不只 1×1 单 pass）。字节已用 python zlib + Pillow 交叉验证。
+    fn minimal_interlaced_solid_png(w: u32, h: u32, color: [u8; 4]) -> Vec<u8> {
+        // Adam7 七 pass 几何：(起始行, 行间距, 起始列, 列间距)
+        let passes: [(u32, u32, u32, u32); 7] = [
+            (0, 8, 0, 8),
+            (0, 8, 4, 8),
+            (4, 8, 0, 4),
+            (0, 4, 2, 4),
+            (2, 4, 0, 2),
+            (0, 2, 1, 2),
+            (1, 2, 0, 1),
+        ];
+        let mut raw = Vec::new();
+        for (pr, pg, pc, cg) in passes {
+            let rows = if h > pr { (h - pr - 1) / pg + 1 } else { 0 };
+            let cols = if w > pc { (w - pc - 1) / cg + 1 } else { 0 };
+            if rows > 0 && cols > 0 {
+                let mut line = vec![0u8]; // filter0
+                for _ in 0..cols {
+                    line.extend_from_slice(&color);
+                }
+                for _ in 0..rows {
+                    raw.extend_from_slice(&line);
+                }
+            }
+        }
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 1]); // 8bit RGBA, Adam7
+        out.extend_from_slice(&png_chunk_byte(b"IHDR", &ihdr));
+        let mut idat = Vec::new();
+        idat.extend_from_slice(&[0x78, 0x01]);
+        idat.push(0x01);
+        idat.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+        idat.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
+        idat.extend_from_slice(&raw);
+        idat.extend_from_slice(&png_adler32(&raw).to_be_bytes());
+        out.extend_from_slice(&png_chunk_byte(b"IDAT", &idat));
+        out.extend_from_slice(&png_chunk_byte(b"IEND", &[]));
+        out
+    }
+
+    /// 极小图（40×20 RGBA8，den=1）：decode_png_display 的 BGRA 输出与改动前 `image` 全解
+    /// （decode_static_first_frame）**逐像素一致**；尺寸/字节数不变。
+    #[test]
+    fn decode_png_display_den1_equals_old_full_decode_pixel_perfect() {
+        let dir = tmp_dir("png_den1");
+        let p = dir.join("p.png");
+        write_png(&p, 40, 20);
+        let bytes = std::fs::read(&p).unwrap();
+        // need 远超原图 → 恒 den=1（全解档）
+        let (bgra, w, h, den) = decode_png_display(&bytes, (1000.0, 1000.0)).unwrap();
+        assert_eq!((w, h, den), (40, 20, 1));
+        let (frames, w2, h2) = decode_static_first_frame(&bytes).unwrap();
+        assert_eq!((w2, h2), (40, 20));
+        let old = frames[0].buffer().as_raw();
+        assert_eq!(bgra, *old, "den=1 输出必须与改动前全解逐像素一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 尺寸断言：3000×2400 需要 (1032,1032) → den=2，输出 1500×1200 ≥ need（不糊，对齐
+    /// pick_jpeg_denom_never_below_display_pixels 的「输出 ≥ 显示需要」同款断言）。
+    #[test]
+    fn decode_png_display_downscales_and_never_below_display_pixels() {
+        let dir = tmp_dir("png_den2");
+        let p = dir.join("big.png");
+        write_png(&p, 3000, 2400);
+        let bytes = std::fs::read(&p).unwrap();
+        let (bgra, w, h, den) = decode_png_display(&bytes, (1032.0, 1032.0)).unwrap();
+        assert_eq!(den, 2, "3000×2400 对 1032 需要应选 1/2");
+        assert_eq!((w, h), (1500, 1200));
+        assert!(w >= 1032 && h >= 1032, "解码像素不得低于显示需要");
+        assert_eq!(bgra.len(), (w as usize * h as usize * 4) as usize);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 极大边界：den=4 与 den=8 且奇数宽（2999 → 右/下缘不满块，归一仍正确）。
+    #[test]
+    fn decode_png_display_den4_and_den8_odd_dims() {
+        let dir = tmp_dir("png_odd");
+        let p = dir.join("a.png");
+        write_png(&p, 2999, 2400);
+        let bytes = std::fs::read(&p).unwrap();
+        // den8(375×300) < need(400,300) → 落 den4：750×600（ceil(2999/4)=750）
+        let (_, w4, h4, den4) = decode_png_display(&bytes, (400.0, 300.0)).unwrap();
+        assert_eq!(den4, 4);
+        assert_eq!((w4, h4), (750, 600));
+        assert!(w4 >= 400 && h4 >= 300);
+        let (_, w8, h8, den8) = decode_png_display(&bytes, (100.0, 60.0)).unwrap();
+        assert_eq!(den8, 8);
+        assert_eq!((w8, h8), (375, 300)); // ceil(2999/8)=375, ceil(2400/8)=300
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 像素断言：盒式降采样对 4 通道各自求平均（2×2 半红半蓝 → 平均 0x7F,0,0x7F；
+    /// 含 alpha 平均；单色块输出同色）。
+    #[test]
+    fn box_downsample_averages_channels_and_alpha() {
+        // RGBA 2×2：上排红、下排蓝（红=FF0000FF，蓝=0000FFFF）→ 平均 (127,0,127,255)
+        let buf: Vec<u8> = [
+            [255, 0, 0, 255], [255, 0, 0, 255],
+            [0, 0, 255, 255], [0, 0, 255, 255],
+        ]
+        .concat();
+        let (out, w, h) = box_downsample_bgra_or_rgba(&buf, 2, 2, 2);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(&out[..4], &[127, 0, 127, 255]);
+        // 单色块 → 输出同色
+        let flat: Vec<u8> = [100u8, 150, 200, 42].repeat(4);
+        let (out2, _, _) = box_downsample_bgra_or_rgba(&flat, 2, 2, 2);
+        assert_eq!(&out2[..4], &[100, 150, 200, 42]);
+        // alpha 平均：2×2 两个 alpha=0 两个 =255 → 平均 127；RGB 全同
+        let alpha: Vec<u8> = [
+            [10, 20, 30, 0], [10, 20, 30, 255],
+            [10, 20, 30, 0], [10, 20, 30, 255],
+        ]
+        .concat();
+        let (out3, _, _) = box_downsample_bgra_or_rgba(&alpha, 2, 2, 2);
+        assert_eq!(&out3[..4], &[10, 20, 30, 127]);
+    }
+
+    /// 边缘不满块按实际像素数归一：3×2 den=2 → 输出 2×1；右列只 2 像素参与平均（非整除）。
+    #[test]
+    fn box_downsample_partial_edge_blocks_use_real_pixel_count() {
+        // 3×2 布局（RGBA）：a b c / d e f；den=2 → 2×1
+        // 块(0)=a,b,d,e 平均；块(1)=c,f 平均（竖排 2 像素，非 4）
+        let mk = |r: u8, g: u8, b: u8| [r, g, b, 255];
+        let buf: Vec<u8> = [
+            mk(0, 0, 0), mk(10, 0, 0), mk(200, 0, 0), // a b c
+            mk(0, 20, 0), mk(10, 20, 0), mk(200, 40, 0), // d e f
+        ]
+        .concat();
+        let (out, w, h) = box_downsample_bgra_or_rgba(&buf, 3, 2, 2);
+        assert_eq!((w, h), (2, 1));
+        // 块(0)：a(0,0,0)+b(10,0,0)+d(0,20,0)+e(10,20,0) → (20,40,0)/4=(5,10,0)
+        assert_eq!(&out[0..4], &[5, 10, 0, 255]);
+        // 块(1)：c(200,0,0)+f(200,40,0) → (400,40,0)/2=(200,20,0)
+        assert_eq!(&out[4..8], &[200, 20, 0, 255]);
+    }
+
+    /// rayon 行组并行降采样 == 单线程参考（大缓冲触发并行路径、小缓冲退回串行路径）：
+    /// 整数平均确定性 → 应逐字节一致（防并行实现语义漂移，K15 式实证断言）。
+    #[test]
+    fn parallel_rayon_downsample_matches_serial_reference() {
+        // 1.28M 输入像素 > PARALLEL_DOWNSAMPLE_MIN_PX → 并行路径；确定性渐变防「恰好相等」
+        let (w, h) = (1600u32, 800u32);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+            let x = (i as u32) % w;
+            let y = (i as u32) / w;
+            px[0] = ((x * 7 + y * 3) % 256) as u8;
+            px[1] = ((x * 5 + y * 11) % 256) as u8;
+            px[2] = ((x * 13) % 256) as u8;
+            px[3] = ((x + y) % 256) as u8;
+        }
+        let (ser, sw, sh) = box_downsample_bgra_or_rgba(&buf, w, h, 2);
+        let (par, pw, ph) = box_downsample_bgra_or_rgba_rayon(&buf, w, h, 2);
+        assert_eq!((sw, sh), (pw, ph));
+        assert_eq!(ser, par, "并行与串行必须逐字节一致");
+        // 小图（低于阈值）走串行回退，也应正常
+        let small = vec![9u8; 32 * 32 * 4];
+        let (a, aw, ah) = box_downsample_bgra_or_rgba(&small, 32, 32, 2);
+        let (b, bw, bh) = box_downsample_bgra_or_rgba_rayon(&small, 32, 32, 2);
+        assert_eq!((aw, ah), (bw, bh));
+        assert_eq!(a, b);
+    }
+
+    /// palette PNG：PngDecoder (EXPAND) 应产出 RGBA8——红蓝两像素、alpha=255。
+    #[test]
+    fn handcrafted_palette_png_decodes_to_rgba8() {
+        let bytes = minimal_2x1_palette_png(&[[255, 0, 0], [0, 0, 255]], &[0, 1]);
+        let (bgra, w, h, den) = decode_png_display(&bytes, (1000.0, 1000.0)).unwrap();
+        assert_eq!((w, h, den), (2, 1, 1));
+        // BGRA 输出：像素0=红 → [B,G,R,A]=[0,0,255,255]；像素1=蓝 → [255,0,0,255]
+        assert_eq!(&bgra[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&bgra[4..8], &[255, 0, 0, 255]);
+    }
+
+    /// 交错（Adam7）与普通 1×1 PNG：PngDecoder 自动重组，不 panic 且像素正确；另加
+    /// 8×8 **多 pass** 实心图验证 Adam7 七个 pass 全部正确归位（字节经 python zlib+Pillow 校验）。
+    #[test]
+    fn handcrafted_interlaced_png_decodes_without_panic() {
+        let bytes = minimal_1x1_rgba_png(1, [255, 0, 0, 255]);
+        let (bgra, w, h, den) = decode_png_display(&bytes, (1000.0, 1000.0)).unwrap();
+        assert_eq!((w, h, den), (1, 1, 1));
+        assert_eq!(&bgra[..4], &[0, 0, 255, 255]); // 纯红 → BGRA [B=0,G=0,R=255,A=255]
+        // 多 pass Adam7：8×8 实心墨绿，全幅必须都是该色 → 全部 pass 正确重组
+        let big = minimal_interlaced_solid_png(8, 8, [0, 128, 0, 255]);
+        let (b8, w8, h8, _) = decode_png_display(&big, (1000.0, 1000.0)).unwrap();
+        assert_eq!((w8, h8), (8, 8));
+        assert!(
+            b8.chunks_exact(4).all(|p| p == [0, 128, 0, 255]),
+            "Adam7 全 pass 重组后应整幅同色"
+        );
+        let plain = minimal_1x1_rgba_png(0, [0, 255, 0, 255]);
+        let (b2, _, _, _) = decode_png_display(&plain, (1000.0, 1000.0)).unwrap();
+        assert_eq!(&b2[..4], &[0, 255, 0, 255]);
+    }
+
+    /// 灰度（L8）与 16bit（L16）PNG：PngDecoder 输出非 RGBA8 → 展开为 RGBA8，R=G=B。
+    #[test]
+    fn gray_and_16bit_png_expand_to_rgba8() {
+        let dir = tmp_dir("png_ex");
+        let g8 = dir.join("g8.png");
+        let img: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
+            image::ImageBuffer::from_pixel(4, 3, image::Luma([128]));
+        img.save(&g8).expect("写出灰度 PNG 应成功");
+        let bytes8 = std::fs::read(&g8).unwrap();
+        let (b8, w8, h8, _) = decode_png_display(&bytes8, (1000.0, 1000.0)).unwrap();
+        assert_eq!((w8, h8), (4, 3));
+        assert_eq!(b8.len(), 4 * 3 * 4);
+        assert_eq!([b8[0], b8[1], b8[2], b8[3]], [128, 128, 128, 255], "灰度 → R=G=B");
+        let g16 = dir.join("g16.png");
+        let img16: image::ImageBuffer<image::Luma<u16>, Vec<u16>> =
+            image::ImageBuffer::from_pixel(2, 2, image::Luma([0xABCDu16]));
+        img16.save(&g16).expect("写出 16bit 灰度 PNG 应成功");
+        let bytes16 = std::fs::read(&g16).unwrap();
+        let (b16, w16, h16, _) = decode_png_display(&bytes16, (1000.0, 1000.0)).unwrap();
+        assert_eq!((w16, h16), (2, 2));
+        assert_eq!([b16[0], b16[1], b16[2], b16[3]], [0xAB, 0xAB, 0xAB, 255], "16bit 高字节归一");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 非法 PNG 字节：decode_background 不 panic——PNG 魔数命中但无有效 IHDR → 降采样解不了
+    /// → 回退全解也失败 → 返回 Err（顶层以加载错误呈现；对齐 decode_missing_file_reports_error
+    /// 风格）。完整可解 PNG 不应被误伤。
+    #[test]
+    fn invalid_png_bytes_fall_back_to_error_not_panic() {
+        let bad = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x00];
+        assert!(decode_background(&bad, (1000.0, 1000.0)).is_err(), "损坏 PNG 应返回 Err 而非 panic");
+        let dir = tmp_dir("png_ok");
+        let p = dir.join("ok.png");
+        write_png(&p, 4, 4);
+        let ok = std::fs::read(&p).unwrap();
+        assert!(decode_background(&ok, (1000.0, 1000.0)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：打开 20MP **PNG** → 首解即「显示尺寸档」1/2（2560×1920，不糊），缓存只存
+    /// 这份清晰档（镜像 JPEG 版 jpeg_cold_open_installs_sharp_display）。
+    #[gpui::test]
+    async fn png_cold_open_installs_sharp_display(cx: &mut TestAppContext) {
+        let dir = tmp_dir("png_sharp");
+        let p = dir.join("big.png");
+        write_png(&p, 5120, 3840);
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        let (den, w, h, cache_len) = cx.update(|app| {
+            let v = viewer.read(app);
+            let c = v.cache.len();
+            (
+                v.display_denom,
+                v.intrinsic.map(|i| i.0 as u32).unwrap_or(0),
+                v.intrinsic.map(|i| i.1 as u32).unwrap_or(0),
+                c,
+            )
+        });
+        assert_eq!(den, 2, "PNG 首解应为 1/2 显示尺寸档，而非全解 1/1：{den}");
+        assert_eq!((w, h), (2560, 1920));
+        assert_eq!(cache_len, 1, "缓存应是唯一一份清晰档");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PNG 升档：放大使展示像素需要超过 1/2 档时按需重解 1/1 全解替换（镜像 JPEG 版
+    /// zoom_in_escalates_display_to_full_resolution；升档门已去掉 `path_is_jpeg` 限定）。
+    #[gpui::test]
+    async fn png_zoom_escalates_display_to_full_resolution(cx: &mut TestAppContext) {
+        let dir = tmp_dir("png_esc");
+        let p = dir.join("big.png");
+        write_png(&p, 5120, 3840);
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        assert_eq!(cx.update(|app| viewer.read(app).display_denom), 2, "首解 1/2");
+        // 放大 ≥2×：需要 (2752,2064) > 1/2(2560×1920) → 应升到 1/1 全解
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.display_need = (2752.0, 2064.0);
+                v.escalate_display_denom(cx);
+            })
+        });
+        flush(cx);
+        let (d1, w1, h1, cached) = cx.update(|app| {
+            let v = viewer.read(app);
+            let c: Vec<(u8, u32, u32)> = v
+                .cache
+                .iter()
+                .map(|e| (e.denom, e.intrinsic.0 as u32, e.intrinsic.1 as u32))
+                .collect();
+            (
+                v.display_denom,
+                v.intrinsic.map(|i| i.0 as u32).unwrap_or(0),
+                v.intrinsic.map(|i| i.1 as u32).unwrap_or(0),
+                c,
+            )
+        });
+        assert_eq!(d1, 1, "PNG 放大 2× 后应升档到 1/1 全解，而非停在 1/2");
+        assert_eq!((w1, h1), (5120, 3840));
+        assert_eq!(cached, vec![(1, 5120, 3840)], "缓存应升级为唯一全解档");
+        // 再次触发（无需升档）应为空操作：不新增解码、档位不变
+        cx.update(|app| viewer.update(app, |v, cx| v.escalate_display_denom(cx)));
+        let stable = cx.update(|app| viewer.read(app).display_denom);
+        assert_eq!(stable, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PNG 已满足区的升档**空操作**回归：den=2 输出 D=(2560×1920) 已 ≥ 展示需要
+    /// (1440×1080)（1080p 视口内 4:3 图、zoom≈1）时，升档判定不得再触发重解——选档基准
+    /// 必须按全量原图估回（×display_denom），否则 desired=1<2 每触必重解却落回同一分母。
+    #[gpui::test]
+    async fn png_escalate_noop_when_display_denom_already_satisfies(cx: &mut TestAppContext) {
+        let dir = tmp_dir("png_noop");
+        let p = dir.join("big.png");
+        write_png(&p, 5120, 3840);
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        assert_eq!(cx.update(|app| viewer.read(app).display_denom), 2, "首解 1/2");
+        // 缩放前（need 被 1/2 档覆盖）：升档应为空操作——不新增任何解码
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.display_need = (1440.0, 1080.0);
+                v.escalate_display_denom(cx);
+            })
+        });
+        let (den, in_flight, cache_len) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.display_denom, v.in_flight.len(), v.cache.len())
+        });
+        assert_eq!(den, 2, "满足区升档不得改变档位");
+        assert_eq!(in_flight, 0, "满足区升档不得新增解码（否则每次缩放/回看都白解一次 9MP PNG）");
+        assert_eq!(cache_len, 1, "缓存不得被无谓重解替换");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 降采样开销占比测定（`--ignored --nocapture` 运行）：9MP（3000×3000）PNG 冷解码墙钟
+    /// vs 其中盒式降采样步骤耗时（串行参考 vs rayon 行组并行）。用于论证降采样并行取舍：
+    /// 若占比可观（本机实测 ~35%+），rayon 行组并行值得上；数值随铁反映。
+    #[test]
+    #[ignore]
+    fn bench_png_downsample_fraction() {
+        let dir = tmp_dir("ds_frac");
+        let p = dir.join("big.png");
+        write_pattern_png(&p, 3000, 3000);
+        let bytes = std::fs::read(&p).unwrap();
+        let need = (1376.0, 1032.0);
+        // 独立复刻 decode 的「全量解码」步骤，只计时「降采样」两版本
+        let dec = image::codecs::png::PngDecoder::new(Cursor::new(&bytes)).unwrap();
+        let (iw, ih) = dec.dimensions();
+        let color = dec.color_type();
+        let n = usize::try_from(dec.total_bytes()).unwrap();
+        let mut raw = vec![0u8; n];
+        dec.read_image(&mut raw).unwrap();
+        let rgba = if color == image::ColorType::Rgba8 {
+            raw
+        } else {
+            expand_png_to_rgba8(&raw, iw, ih, color).unwrap()
+        };
+        let t0 = std::time::Instant::now();
+        let _ = box_downsample_bgra_or_rgba(&rgba, iw, ih, 2);
+        let ms_ds_ser = t0.elapsed().as_secs_f64() * 1000.0;
+        let t0 = std::time::Instant::now();
+        let _ = box_downsample_bgra_or_rgba_rayon(&rgba, iw, ih, 2);
+        let ms_ds_par = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let _ = decode_png_display(&bytes, need).unwrap();
+        let ms_total = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "\n[PNG-DS] {}×{}: 全链路 {:.1}ms\n  降采样(den=2) 串行 {:.1}ms ({:.1}%) | rayon 并行 {:.1}ms (并行收益 {:.1}×)\n  → 生产走 rayon：降占比 {:.1}%",
+            iw, ih, ms_total, ms_ds_ser, ms_ds_ser / ms_total.max(0.001) * 100.0, ms_ds_par,
+            ms_ds_ser / ms_ds_par.max(0.001), ms_ds_par / ms_total.max(0.001) * 100.0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2347,7 +3062,7 @@ mod tests {
         // 1080p 视口 contain 需要的展示像素（≈ 结果「显示尺寸档」的选档基准）
         let need = (1376.0, 1032.0);
         eprintln!(
-            "\n[IMG-BENCH] {} 张 | 全解(旧 image) vs 展示尺寸(libjpeg-turbo SIMD 降档, 需要 {:.0}×{:.0})：",
+            "\n[IMG-BENCH] {} 张 | 全解(旧 image) vs 展示尺寸(JPEG libjpeg-turbo SIMD / PNG 盒式降采样, 需要 {:.0}×{:.0})：",
             files.len(),
             need.0,
             need.1
