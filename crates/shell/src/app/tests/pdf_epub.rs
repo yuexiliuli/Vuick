@@ -669,3 +669,270 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 回归（真 bug）：多 PDF 选项卡并存时，侧边栏 PDF 检索计数/页列表的刷新信号必须
+    /// **各自独立**到达 app。根因：`_pdf_observe` 是单槽订阅——后打开的 PDF 覆盖先打开者，
+    /// 先打开 PDF 的 notify 再也收不到 → 其侧栏不再刷新。修复后每个 PDF 选项卡各自持有
+    /// `_pdf_sub` 订阅。本测试流程：
+    /// 1. 真实打开两个 PDF（先开慢速扫描件 A / 后开快速文本件 B，旧单槽被 B 覆盖）；
+    /// 2. 真实侧栏路径激活 A 并搜「配置」，泵帧驱动 A 的后台检索（250ms 防抖 → worker
+    ///    扫描 → 帧循环 `collect_search_results` 收集）**真实完成**（命中 > 0）；
+    /// 3. 登记「app 实体 notify」计数器（基线清零）；
+    /// 4. 用**真实入口** `PdfViewer::focus_match_on_page`（侧边栏命中行点击走的正是这个）
+    ///    让 A 在 update 上下文内自然 emit notify；
+    /// 5. 断言 app 收到那次 notify（`cx.notify()` 就是 `_pdf_sub` 回调和的内容）。
+    /// 旧单槽代码下 A 的订阅被覆盖 → A 的 notify 丢失 → 本断言 FAIL；per-tab 订阅 → PASS。
+    #[gpui::test]
+    async fn multi_pdf_tabs_each_refresh_sidebar_after_notify(cx: &mut TestAppContext) {
+        if pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = pdf::test_util::lock().lock().unwrap();
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // A = 慢速扫描件（pdf测试2.pdf，259 页文本型，检索耗时 >100ms）；B = 快速文本件。
+        // 先后打开的顺序决定旧单槽 `_pdf_observe` 覆盖方向：后打开的 B 覆盖 A → A 的订阅丢。
+        let pdf_slow = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        let pdf_fast = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试.pdf");
+        assert!(pdf_slow.exists() && pdf_fast.exists(), "测试 PDF 应存在");
+        let wait_loaded = |cx: &mut VisualTestContext| {
+            for _ in 0..600 {
+                cx.run_until_parked();
+                let loaded = cx.update(|_w, cx| {
+                    tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+                        .map(|pv| pv.read(cx).is_loaded())
+                        .unwrap_or(false)
+                });
+                if loaded {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| a.open_file(pdf_slow.to_str().unwrap(), window, cx));
+        });
+        wait_loaded(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| a.open_file(pdf_fast.to_str().unwrap(), window, cx));
+        });
+        wait_loaded(cx);
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            3,
+            "初始空 tab + A + B 共 3 个选项卡"
+        );
+        let a_idx = 1;
+        // 激活 A → 切搜索视图 → 键入查询（真实输入路径：InputState.set_value → 防抖 →
+        // 提交 → render_sidebar_search_results 对活动 PDF 推 set_search(A,"配置")）。
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| a.activate_tab(a_idx, window, cx));
+        });
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                a.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx);
+            });
+        });
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("配置", window, cx));
+        });
+        // 防抖期满提交 → 侧栏渲染推 set_search 到 A → 检索在途
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_w, cx| {
+                app.read(cx).pdf_search.as_ref()
+                    == Some(&(a_idx, "配置".to_string()))
+            }),
+            "应在侧栏渲染时把查询推给 A（pdf_search 键 (A,配置)）"
+        );
+
+        // 泵帧驱动 A 的后台检索**真实完成**（250ms 防抖 → worker 扫描 → 帧循环收集命中）。
+        // 读到 hits>0 即证明：真实异步检索落库到 A 的阅读器（后续 focus_match_on_page 的
+        // notify 才是针对「结果已就绪」的真信号）。
+        let mut completed = false;
+        for _ in 0..1800 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.update(|_, _| {});
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let hits = cx.update(|_w, cx| {
+                tab_pdf(&app.read(cx).tabs[a_idx])
+                    .expect("A 应挂 PDF 阅读器")
+                    .read(cx)
+                    .search_summary()
+                    .0
+            });
+            if hits > 0 {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "A 的检索应按真实异步路径收集到命中（慢速扫描件）");
+
+        // 登记「app 实体 notify」计数器并观察 app（基线在检索完成后落位 → 之后 A 的这次
+        // notify 是窗口内唯一可能的 app notify 来源）。订阅必须存进持有实体字段保持有效
+        // （直接丢弃 = 立即退订，计数器永不增长）。
+        struct AppNotifyCounter(
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            Option<gpui::Subscription>,
+        );
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holder = cx.update(|_w, cx| {
+            let h = cx.new(|_| AppNotifyCounter(notified.clone(), None));
+            h.update(cx, |count, cx| {
+                let n = count.0.clone();
+                let sub = cx.observe(&app, move |_, _, _| {
+                    n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+                count.1 = Some(sub);
+            });
+            h
+        });
+        let _holder_kept = holder;
+
+        // 真实入口：触发 A 的「跳到某页命中」动作（侧边栏命中行点击走的正是
+        // `PdfViewer::focus_match_on_page`）→ 阅读器在 update 上下文内 emit notify →
+        // （per-tab 订阅下）`_pdf_sub` 回调 `cx.notify()` → 本计数器 +1。
+        let a_pdf = cx.update(|_w, cx| {
+            tab_pdf(&app.read(cx).tabs[a_idx])
+                .expect("A 应挂 PDF 阅读器")
+                .clone()
+        });
+        cx.update(|_w, cx| {
+            a_pdf.update(cx, |v, cx| v.focus_match_on_page(0, cx));
+        });
+        cx.run_until_parked();
+        let delta = notified.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            delta > 0,
+            "A 的 notify 必须到达 app（侧栏刷新信号）。旧单槽 `_pdf_observe` 被后打开的 B \
+             覆盖 → A 的 notify 丢失 → delta=0；修复后每 PDF 各自独立订阅 → delta>0。\
+             实际 app notify 增量 = {delta}"
+        );
+    }
+
+    /// 回归（真 bug 的「拖拽换位 / 分屏粘贴」路径）：选项卡**拔除再收纳**（`take_tab_payload`
+    /// → `adopt_tab`，即拖出拆分/还原、分屏粘贴走的路径）后，per-tab 的 PDF 订阅必须随
+    /// 选项卡重建并**跟 tab 走**——多 PDF 依次换位后，先换位者的 notify 仍要到达 app
+    /// （旧单槽 `_pdf_observe` 在每次 `adopt_tab` 时被后收纳者覆盖 → 先收纳的丢订阅）。
+    /// 全部走真实入口：`take_tab_payload` / `adopt_tab`（同 `panes.rs` 的用法）换位两次，
+    /// 再对第一个 PDF 的阅读器调 `PdfViewer::focus_match_on_page`（侧边栏命中行点击走的
+    /// 公共方法，无条件 emit notify）断言 app 收到那次 notify。
+    #[gpui::test]
+    async fn pdf_subscription_follows_adopt_across_tear_offs(cx: &mut TestAppContext) {
+        if pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = pdf::test_util::lock().lock().unwrap();
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试.pdf");
+        assert!(pdf.exists(), "测试 PDF 应存在");
+        let wait_loaded = |cx: &mut VisualTestContext| {
+            for _ in 0..600 {
+                cx.run_until_parked();
+                let loaded = cx.update(|_w, cx| {
+                    tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+                        .map(|pv| pv.read(cx).is_loaded())
+                        .unwrap_or(false)
+                });
+                if loaded {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| a.open_file(pdf.to_str().unwrap(), window, cx));
+        });
+        wait_loaded(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| a.open_file(pdf.to_str().unwrap(), window, cx));
+        });
+        wait_loaded(cx);
+        // 记住第一个 PDF 的阅读器实体（换位后按实体身份找回它的选项卡，防下标漂移）。
+        let first_pdf = cx.update(|_w, cx| {
+            tab_pdf(&app.read(cx).tabs[1])
+                .expect("第 1 个 PDF 阅读器应在场")
+                .clone()
+        });
+        let first_pdf_entity_id = first_pdf.entity_id();
+        // 依次拔除/收纳两次（真实换位路径）：先 A 再 B，B 后收纳 → 旧单槽被 B 覆盖。
+        // take_tab_payload(1) 拔的是当前下标 1（A）；adopt_tab(payload, None) 落到末位。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                let payload = a.take_tab_payload(1).expect("应能拔除 A");
+                a.adopt_tab(payload, None, cx);
+            });
+        });
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                let payload = a.take_tab_payload(1).expect("应能拔除 B");
+                a.adopt_tab(payload, None, cx);
+            });
+        });
+
+        // 登记「app 实体 notify」计数器（基线在换位完成后落位）。
+        struct AppNotifyCounter(
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            Option<gpui::Subscription>,
+        );
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holder = cx.update(|_w, cx| {
+            let h = cx.new(|_| AppNotifyCounter(notified.clone(), None));
+            h.update(cx, |count, cx| {
+                let n = count.0.clone();
+                let sub = cx.observe(&app, move |_, _, _| {
+                    n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+                count.1 = Some(sub);
+            });
+            h
+        });
+        let _holder_kept = holder;
+
+        // 真实入口：对第一个 PDF（先换位者）触发一次 notify；其 per-tab 订阅须随换位存活。
+        cx.update(|_w, cx| {
+            first_pdf.update(cx, |v, cx| v.focus_match_on_page(0, cx));
+        });
+        cx.run_until_parked();
+        let delta = notified.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            delta > 0,
+            "先换位的 PDF 的 notify 必须仍到达 app（订阅随选项卡走）。旧单槽在每次 \
+             adopt_tab 时被后收纳者覆盖 → 先收纳的丢订阅 → delta=0；per-tab → delta>0。\
+             实际 app notify 增量 = {delta}"
+        );
+        // 兜底：换位后第一个 PDF 仍指向同一阅读器实体（未错位）。
+        let still_first = cx.update(|_w, cx| {
+            app.read(cx)
+                .tabs
+                .iter()
+                .any(|t| matches!(&t.reader, MediaReader::Pdf(p) if p.entity_id() == first_pdf_entity_id))
+        });
+        assert!(still_first, "换位后第一个 PDF 阅读器实体应仍存在（未错位/未泄漏）");
+    }
+

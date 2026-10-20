@@ -66,6 +66,22 @@ impl EditorApp {
         })
     }
 
+    /// 移出选项卡前的统一收尾（live2 守卫下沉）：实时预览编辑实体不随选项卡搬迁——
+    /// 先 `commit_live` 把 live2 写回编辑区再取载荷。两处拖拽移出路径（`release_tab_drag_outside`
+    /// 窗口外松开 / `tear_off_drag` 越过窗口缘）此前各自手抄「`live_edit` → `commit_live`」守卫，
+    /// 收敛为此 helper；`take_tab_payload` 本身保持无副作用（测试直调、不隐含 commit）。
+    fn commit_live_and_take_tab_payload(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<DetachedTab> {
+        if self.tabs[idx].live_edit {
+            self.commit_live(idx, window, cx);
+        }
+        self.take_tab_payload(idx)
+    }
+
     /// 把一个「拔出」的选项卡收纳进本窗口：共享编辑器/预览实体、重建编辑订阅、
     /// 置为激活并同步预览/PDF 主题与软换行偏好。
     /// `window=None` 用于跨窗口还原（此时不抢焦点，由调用方在目标窗口聚焦）；
@@ -134,6 +150,8 @@ impl EditorApp {
             _live2_sub: None,
             live_vscroll: gpui::ScrollHandle::new(),
             _edit_sub: edit_sub,
+            // PDF 阅读器订阅随选项卡重建（源窗口的 `_pdf_sub` 已随 take_tab_payload 丢弃）
+            _pdf_sub: None,
         });
         self.active_tab = idx;
         self.search_scan = None;
@@ -149,9 +167,8 @@ impl EditorApp {
         match self.tabs[idx].reader.clone() {
             MediaReader::Pdf(pdf) => {
                 pdf.update(cx, |view, _| view.set_background(canvas_bg));
-                self._pdf_observe = Some(cx.observe(&pdf, |_this, _e, cx| {
-                    cx.notify();
-                }));
+                // PDF 订阅随选项卡重建（换位后订阅跟 tab 走；多 PDF 并存各自独立）
+                self.subscribe_pdf(idx, &pdf, cx);
             }
             MediaReader::Image(img) => {
                 img.update(cx, |view, _| view.set_background(canvas_bg));
@@ -196,10 +213,7 @@ impl EditorApp {
             return;
         }
         // 实时预览编辑模式下鼠标按住拖出：先把内容写回编辑区（实时实体不随选项卡搬）。
-        if self.tabs[idx].live_edit {
-            self.commit_live(idx, window, cx);
-        }
-        let Some(payload) = self.take_tab_payload(idx) else {
+        let Some(payload) = self.commit_live_and_take_tab_payload(idx, window, cx) else {
             return;
         };
         if self.is_detached {
@@ -229,10 +243,7 @@ impl EditorApp {
             return;
         }
         // 实时预览编辑模式下 tear-off：先写回（实时实体不随选项卡搬）。
-        if self.tabs[idx].live_edit {
-            self.commit_live(idx, window, cx);
-        }
-        let Some(payload) = self.take_tab_payload(idx) else {
+        let Some(payload) = self.commit_live_and_take_tab_payload(idx, window, cx) else {
             return;
         };
         self.tab_dragging = None;

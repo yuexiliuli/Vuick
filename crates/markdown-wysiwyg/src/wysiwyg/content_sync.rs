@@ -80,8 +80,15 @@ impl WyEditor {
             return h;
         }
         let h = element::math_line_height_h(src);
-        if self.math_line_map.borrow().len() < 10_000 {
+        let cap = config::limits::MATH_LINE_MAP_CAP;
+        if self.math_line_map.borrow().len() < cap {
             self.math_line_map.borrow_mut().insert(src.to_string(), h);
+        } else if !self.math_line_map_warned.get() {
+            self.math_line_map_warned.set(true);
+            eprintln!(
+                "[WY-MATH-LINE-MAP] 互异公式源超过缓存上限 {cap}：甲方为性能回退（每轮重建重算 \
+                 LaTeX→Unicode 转换），不丢正确性；换源后复位可再加缓存"
+            );
         }
         h
     }

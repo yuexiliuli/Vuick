@@ -137,22 +137,13 @@ fn slot_path(dir: &Path, slot: &str) -> PathBuf {
     dir.join(slot)
 }
 
-/// 「临时文件 + rename」原子写（Windows rename 不覆盖 → 先删旧文件，仿 config/user.rs）。
+/// 「临时文件 + rename」原子写（实现统一收敛到 `base::util::atomic_write`，此处只保留
+/// 调用方的布尔化错误信号；Windows `std::fs::rename` 可覆盖既有文件，不再先删旧文件）。
 fn atomic_write(path: &Path, body: &str) -> bool {
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    if !parent.as_os_str().is_empty() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    if fs::write(&tmp, body).is_err() {
+    if path.parent().is_none() {
         return false;
     }
-    let _ = fs::remove_file(path);
-    fs::rename(&tmp, path).is_ok()
+    base::util::atomic_write(path, body.as_bytes()).is_ok()
 }
 
 /// 写清单（槽位全部写成功后调用——清单存在即「本次会话可恢复」的原子信号）。

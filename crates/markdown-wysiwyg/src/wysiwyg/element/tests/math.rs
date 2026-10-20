@@ -512,7 +512,7 @@ fn math_edit_card_click_outside_closes(cx: &mut TestAppContext) {
         ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
         assert!(ed.read(cx).math_edit_open(), "应先打开编辑卡");
         assert!(
-            ed.read(cx).math_edit_anchor().is_some(),
+            ed.read(cx).math_edit_anchor.get().is_some(),
             "打开时应按当前帧算出窗口锚点"
         );
         // 卡片外的坐标：卡片**保守包围盒**右下之外（卡片加大后尾行可能被浮层覆盖，
@@ -1170,7 +1170,7 @@ fn math_edit_card_switch_block_closes_old_and_opens_new(cx: &mut TestAppContext)
 fn math_edit_card_title_drag_moves_anchor_and_keeps_after_paint(cx: &mut TestAppContext) {
     // 标题栏（**拖拽把手**）真实渲染路径：绘制出卡片 → 标题栏按下（抓取点=标题栏内、
     // 基准锚点=当前缓存锚点）→ 窗口级 `on_window_mouse_move`(+Δx,+Δy) → 缓存锚点 =
-    // 原锚点 + Δ → paint 期 `math_edit_anchor_at` 刷新后偏移仍保持（不被每帧 paint 冲掉）
+    // 原锚点 + Δ → paint 期 `math_edit_anchor_now` 刷新后偏移仍保持（不被每帧 paint 冲掉）
     // → 松开结束，随后纯移动不再改锚点；期间卡片未关、文档光标未动。
     use gpui::{Bounds, Modifiers, MouseButton, size};
     cx.update(crate::test_support::bind_local_keymaps);
@@ -1200,7 +1200,7 @@ fn math_edit_card_title_drag_moves_anchor_and_keeps_after_paint(cx: &mut TestApp
         let _ = window.draw(cx);
     });
     let anchor0 = ed
-        .read_with(vcx, |e, _| e.math_edit_anchor())
+        .read_with(vcx, |e, _| e.math_edit_anchor.get())
         .expect("打开即缓存锚点");
     // 标题栏中心（真实拖拽把手）按下。
     let title_b = vcx
@@ -1223,7 +1223,7 @@ fn math_edit_card_title_drag_moves_anchor_and_keeps_after_paint(cx: &mut TestApp
         Modifiers::default(),
     );
     let anchor1 = ed
-        .read_with(vcx, |e, _| e.math_edit_anchor())
+        .read_with(vcx, |e, _| e.math_edit_anchor.get())
         .expect("拖拽后锚点");
     assert!(
         (f32::from(anchor1.x) - (f32::from(anchor0.x) + dx)).abs() < 1.
@@ -1250,13 +1250,13 @@ fn math_edit_card_title_drag_moves_anchor_and_keeps_after_paint(cx: &mut TestApp
         ed.update(cx, |e, _| {
             let base = f
                 .as_ref()
-                .and_then(|f| e.math_edit_anchor_at(origin, f))
+                .and_then(|f| e.math_edit_anchor_now(origin, f))
                 .expect("锚点");
-            e.set_math_edit_anchor(Some(base));
+            e.math_edit_anchor.set(Some(base));
         });
     });
     let anchor2 = ed
-        .read_with(vcx, |e, _| e.math_edit_anchor())
+        .read_with(vcx, |e, _| e.math_edit_anchor.get())
         .expect("paint 后锚点");
     assert!(
         (f32::from(anchor2.x) - f32::from(anchor1.x)).abs() < 1.
@@ -1277,14 +1277,14 @@ fn math_edit_card_title_drag_moves_anchor_and_keeps_after_paint(cx: &mut TestApp
         !ed.read_with(vcx, |e, _| e.math_edit_dragging()),
         "松开结束拖拽"
     );
-    let before_more = ed.read_with(vcx, |e, _| e.math_edit_anchor());
+    let before_more = ed.read_with(vcx, |e, _| e.math_edit_anchor.get());
     vcx.simulate_mouse_move(
         point(px(f32::from(title.x) + dx + 20.), px(f32::from(title.y) + dy + 20.)),
         Some(MouseButton::Left),
         Modifiers::default(),
     );
     assert_eq!(
-        ed.read_with(vcx, |e, _| e.math_edit_anchor()),
+        ed.read_with(vcx, |e, _| e.math_edit_anchor.get()),
         before_more,
         "松开后移动不再改锚点"
     );
@@ -1598,7 +1598,7 @@ fn math_edit_long_formula_tail_reachable_by_hscroll(cx: &mut TestAppContext) {
         ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
         assert!(ed.read(cx).math_edit_open(), "长公式应打开编辑卡");
         assert!(
-            ed.read(cx).math_edit_anchor().is_some(),
+            ed.read(cx).math_edit_anchor.get().is_some(),
             "打开即缓存锚点（浮层就位）"
         );
         // 真实绘制一帧（内嵌 CodeEditor 渲染 + deferred 卡片浮层布局）。

@@ -106,7 +106,6 @@ impl EditorApp {
             },
             search_state,
             _search_sub: search_sub,
-            _pdf_observe: None,
             pdf_search: None,
             search_scan: None,
             search_scan_count: 0,

@@ -100,6 +100,7 @@ impl WyEditor {
             // 块每次 fold_plan 重建重复转换 = ~38ms（B3）；缓存后 O(1) 复用。内容变更
             // 清缓存。
             math_line_map: RefCell::new(std::collections::HashMap::new()),
+            math_line_map_warned: Cell::new(false),
             inline_math_rows: RefCell::new(std::collections::HashMap::new()),
             math_pins: RefCell::new(std::collections::HashMap::new()),
             base_dir: None,
@@ -130,9 +131,9 @@ impl WyEditor {
             hover_inline_image: Cell::new(None),
             selected_inline_image: Cell::new(None),
             image_edit: None,
-            image_edit_anchor: Cell::new(None),
+            image_edit_anchor: CardAnchor::new(element::IMAGE_EDIT_CARD_W),
             math_edit: None,
-            math_edit_anchor: Cell::new(None),
+            math_edit_anchor: CardAnchor::new(element::MATH_EDIT_CARD_W),
             math_edit_sub: None,
             math_edit_drag: Cell::new(None),
             math_edit_delta: Cell::new(point(px(0.), px(0.))),
@@ -205,14 +206,14 @@ impl WyEditor {
             self.dragging = false;
             // 只读：无编辑能力 → 收起图片编辑卡片与悬浮按钮态、图片选中态（含行内图）。
             self.image_edit = None;
-            self.image_edit_anchor.set(None);
+            self.image_edit_anchor.clear();
             self.hover_image.set(None);
             self.selected_image.set(None);
             self.hover_inline_image.set(None);
             self.selected_inline_image.set(None);
             // 只读：数学编辑卡（写回依赖可编辑）一并收起 + 订阅 drop + 拖拽态清空。
             self.math_edit = None;
-            self.math_edit_anchor.set(None);
+            self.math_edit_anchor.clear();
             self.math_edit_sub = None;
             self.math_edit_drag.set(None);
             self.math_edit_delta.set(point(px(0.), px(0.)));
@@ -474,14 +475,14 @@ impl WyEditor {
         self.focused_mermaid = None;
         // 换源：图片编辑卡片/悬浮态/选中态随行号失效 → 关闭（含行内图）。
         self.image_edit = None;
-        self.image_edit_anchor.set(None);
+        self.image_edit_anchor.clear();
         self.hover_image.set(None);
         self.selected_image.set(None);
         self.hover_inline_image.set(None);
         self.selected_inline_image.set(None);
         // 换源：数学编辑卡（锚定行号/正文随源失效）关闭 + 订阅 drop + 拖拽态清空。
         self.math_edit = None;
-        self.math_edit_anchor.set(None);
+        self.math_edit_anchor.clear();
         self.math_edit_sub = None;
         self.math_edit_drag.set(None);
         self.math_edit_delta.set(point(px(0.), px(0.)));
@@ -497,6 +498,7 @@ impl WyEditor {
         self.struct_blk_span_delta.set(0);
         self.struct_edit_pending.set(false);
         self.math_line_map.borrow_mut().clear();
+        self.math_line_map_warned.set(false);
         // 换源：行的 src_line 全变 → 行内公式→行的登记作废（重新 claim 时再登记）。
         self.inline_math_rows.borrow_mut().clear();
         // 换源：数学位图钉随行号作废（重新绘制/claim 时再录）。

@@ -115,6 +115,67 @@ const BLINK_MS: u64 = 500;
 /// 光标交互后的常亮静止期（ms）：点击/键移/输入后先亮住再继续闪。
 const BLINK_PAUSE_MS: u64 = 300;
 
+/// 编辑卡片锚点（图片卡 / 数学卡共用一套 scaffold，收敛 image.rs 与 math_edit.rs 的
+/// 两份同构实现）：
+/// - 缓存 `Cell<Option<Point>>` + `set`/`clear`/`get`；
+/// - [`Self::at`]：paint 期「本帧 `bounds.origin` + 本帧 frame」**同代配对现算**（内容区
+///   水平居中 + 顶对齐目标行）——绝不能由 render 直接拿 frame/last_bounds 现算：
+///   `end_selection` 清帧后 `ensure_frame_for_input` 用兜底 `px(800)` 宽重建一帧、随后
+///   prepaint 又按真实宽重建，render 期每次读到的帧宽不同 → 卡片横向左右跳一帧；
+/// - [`Self::resolve`]：**缓存命中读、未命中现算回退**（旧 `match get { Some=>a,
+///   None=>现算? }` 逐字同义，回退触发时机不变）。
+/// 调用方只保留各自的「目标行查找 + 拖拽偏移叠加」差异。
+pub(crate) struct CardAnchor {
+    anchor: Cell<Option<gpui::Point<Pixels>>>,
+    card_w: f32,
+}
+
+impl CardAnchor {
+    pub(crate) fn new(card_w: f32) -> Self {
+        Self {
+            anchor: Cell::new(None),
+            card_w,
+        }
+    }
+
+    /// 现算：内容区水平居中 + 顶对齐 `row_top`（帧行坐标 = 文档局部，`origin` 与 `f`
+    /// 必须同代）。公式与 image/math 两份旧实现逐字对齐。
+    pub(crate) fn at(
+        &self,
+        origin: gpui::Point<Pixels>,
+        f: &element::Frame,
+        row_top: f32,
+    ) -> gpui::Point<Pixels> {
+        let content_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+        let l = f32::from(f.padding) + ((content_w - self.card_w) / 2.).max(0.);
+        point(
+            px(f32::from(origin.x) + l),
+            px(f32::from(origin.y) + row_top),
+        )
+    }
+
+    /// 回退语义：缓存命中读；未命中 → `compute` 现算并返回（`None` = 无卡片/本帧不画）。
+    pub(crate) fn resolve<F>(&self, compute: F) -> Option<gpui::Point<Pixels>>
+    where
+        F: FnOnce() -> Option<gpui::Point<Pixels>>,
+    {
+        self.anchor.get().or_else(compute)
+    }
+
+    /// 写入缓存（paint 每帧刷新 / open 首帧预填；`None` 清空，同旧 `set`）。
+    pub(crate) fn set(&self, a: Option<gpui::Point<Pixels>>) {
+        self.anchor.set(a);
+    }
+    /// 清空缓存（关卡片 / 换源 / 切只读）。
+    pub(crate) fn clear(&self) {
+        self.anchor.set(None);
+    }
+    /// 读缓存（拖拽基准 / 卡片包围盒 / 测试访问器）。
+    pub(crate) fn get(&self) -> Option<gpui::Point<Pixels>> {
+        self.anchor.get()
+    }
+}
+
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。
 #[derive(Clone, PartialEq, Debug)]
 pub enum WyEvent {
@@ -342,6 +403,9 @@ pub struct WyEditor {
     code_epoch: Cell<u64>,
     /// 数学显示行数缓存（见字段声明）。
     math_line_map: RefCell<std::collections::HashMap<String, f32>>,
+    /// 撞过 `config::limits::MATH_LINE_MAP_CAP` 的**一次性告警节流**（换源 clear 时复位，
+    /// 避免超限后每个新源都刷一条 stderr；只提示一次让超限可见）。
+    math_line_map_warned: Cell<bool>,
     /// 行内公式键（`"inline:…"`）→ 包含它的行 src_line（`sync_math` claim 时登记）。
     /// `on_math_ready` 完成时**定向作废**这些行整形缓存条目——替代 mgen 进全局 shape_key
     /// 的整带 miss（`$$` 显示块在 Pass2 被 blocked、不入 `shape_rows`，无需作废）。
@@ -449,21 +513,22 @@ pub struct WyEditor {
     /// 图片编辑卡片（打开时在图片旁渲染悬浮表单：链接 + 文本两个输入框）。
     /// `None` = 未打开。打开期间输入框获得焦点（IME 走 `InputState`，与文档输入互不干扰）。
     image_edit: Option<ImageEditPopup>,
-    /// 图片编辑卡片的**窗口锚点**（卡片 TopLeft，window 坐标）：paint 期用「本帧
-    /// `bounds.origin` + 本帧 frame」同代配对算出并缓存，render 只读它摆卡片。
+    /// 图片编辑卡片的**窗口锚点**缓存（卡片 TopLeft，window 坐标）：paint 期「本帧
+    /// `bounds.origin` + 本帧 frame」同代配对现算缓存，render 只读 + 未命中回退现算；
     /// 绝不能由 render 直接拿 frame/last_bounds 现算——`end_selection` 清帧后
     /// `ensure_frame_for_input` 会用兜底 `px(800)` 宽重建一帧、随后 prepaint 又按真实宽
     /// 重建，render 期每次读到的帧宽不同 → 卡片横向左右跳一帧（「突然往左闪烁」）。
-    /// `None` = 无卡片 / 锚点未就绪。
-    image_edit_anchor: Cell<Option<gpui::Point<Pixels>>>,
+    /// `None` = 无卡片 / 锚点未就绪。实现见 [`CardAnchor`]，行查找差异在 image.rs。
+    image_edit_anchor: CardAnchor,
     /// 块级数学公式（`$$…$$`）的编辑卡片（双击卡弹出，预填正文多行输入区域）。
     /// `None` = 未打开。打开期间输入区域获得焦点（内嵌 CodeEditor，与文档输入互不
     /// 干扰）；每键经订阅即时写回文档（`apply_edit` 撤销栈、实时重渲染），点卡片外
     /// 任意处关闭（无取消语义）。仅可编辑模式打开；只读模式双击 = no-op（保持渲染卡）。
     math_edit: Option<MathEditPopup>,
-    /// 数学编辑卡片的**窗口锚点**（卡片 TopLeft，window 坐标）：paint 期同代配对算出并
-    /// 缓存，render 只读它摆卡片（同 `image_edit_anchor` 的纪律：render 绝不现算 frame）。
-    math_edit_anchor: Cell<Option<gpui::Point<Pixels>>>,
+    /// 数学编辑卡片的**窗口锚点**缓存（卡片 TopLeft，window 坐标）：paint 期同代配对
+    /// 现算缓存，render 只读 + 未命中回退现算（同 [`CardAnchor`] 纪律并与图片编辑卡
+    /// 共用一套实现；`math_edit_delta` 拖拽偏移叠加在 math_edit.rs 的现算内）。
+    math_edit_anchor: CardAnchor,
     /// 数学编辑卡片输入区域（CodeEditor）的 `Edited` 订阅（每键写回文档的唯一入口）。
     /// 随打开重建、随关闭 / 换源 / 切只读 drop（旧输入实体随之失效）。
     math_edit_sub: Option<gpui::Subscription>,

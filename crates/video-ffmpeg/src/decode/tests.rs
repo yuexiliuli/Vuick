@@ -926,6 +926,42 @@ fn active_subtitle_index_prefers_latest_start_match() {
     assert_eq!(active_subtitle_index(&[], 1.0), None, "空清单");
 }
 
+/// 对拍（评审 SUGGESTION-8 补强）：与 `video` crate `subtitle::tests::
+/// find_active_subtitle_edge_case_battery` **逐字同源**的样例集跑 FFI 骨干实现
+/// `active_subtitle_index`（即 `vff_subtitle_at` 的单一实现）——覆盖重叠窗口、相邻紧贴、
+/// 0 时刻起点、窗口间隙、尾部越界、空集；相同采样点断言相同索引，锁死两份实现口径一致。
+#[test]
+fn active_subtitle_index_edge_case_battery_cross_check() {
+    let subs = vec![
+        SubtitleEntry { start_pts: 0.0, end_pts: 1.0, text: "at-zero".into() }, // 0 时刻起点
+        SubtitleEntry { start_pts: 1.0, end_pts: 2.0, text: "touching".into() }, // 紧贴 [0,1]|[1,2]
+        SubtitleEntry { start_pts: 1.5, end_pts: 3.0, text: "overlap".into() }, // 跨段包裹 touching 起点
+        SubtitleEntry { start_pts: 5.0, end_pts: 6.0, text: "tail".into() },
+    ];
+    let cases: &[(f64, Option<usize>)] = &[
+        (-1.0, None), // 全部之前
+        (0.0, Some(0)), // 0 时刻闭区间命中
+        (0.5, Some(0)),
+        (1.0, Some(1)), // 紧贴边界：两端活跃，取「最近开始」（touching）
+        (1.75, Some(2)), // 重叠：overlap 起于 1.5，覆盖 touching → 取最近开始
+        (2.5, Some(2)), // overlap 独立活跃
+        (3.0, Some(2)), // 含结束端点（闭区间）
+        (3.5, None), // 窗口间隙
+        (5.0, Some(3)),
+        (6.0, Some(3)), // 含结束端点（闭区间）
+        (6.5, None), // 尾部越界
+        (99.0, None),
+    ];
+    assert_eq!(active_subtitle_index(&[], 0.0), None, "空清单");
+    for &(t, want) in cases {
+        assert_eq!(
+            active_subtitle_index(&subs, t),
+            want,
+            "t={t}: active_subtitle_index 应选中索引 {want:?}"
+        );
+    }
+}
+
 /// 回归（K-锁）：字幕全文件扫描不得长期占全局 FFMPEG_LOCK 阻塞视频 seek。
 ///
 /// 现象：打开 `目标/视频测试字幕.mkv`（415MB、511 条 ASS）后点击进度条卡顿——

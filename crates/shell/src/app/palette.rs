@@ -107,27 +107,22 @@ impl EditorApp {
             command!("文件", QUIT, |_this, _window, cx| cx.quit()),
             // 编辑
             command!("编辑", UNDO, |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(Undo), cx);
+                Self::dispatch_editor_action(this, window, cx, Box::new(Undo))
             }),
             command!("编辑", REDO, |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(Redo), cx);
+                Self::dispatch_editor_action(this, window, cx, Box::new(Redo))
             }),
             command!("编辑", CUT, |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(Cut), cx);
+                Self::dispatch_editor_action(this, window, cx, Box::new(Cut))
             }),
             command!("编辑", COPY, |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(Copy), cx);
+                Self::dispatch_editor_action(this, window, cx, Box::new(Copy))
             }),
             command!("编辑", PASTE, |this, window, cx| {
                 this.paste_normalized(window, cx)
             }),
             command!("编辑", SELECT_ALL, |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(SelectAll), cx);
+                Self::dispatch_editor_action(this, window, cx, Box::new(SelectAll))
             }),
             // 查看
             command!("查看", PREVIEW, |this, window, cx| {

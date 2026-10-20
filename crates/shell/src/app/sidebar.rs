@@ -1012,7 +1012,8 @@ impl EditorApp {
         let active_bg = self.tab_active_bg();
         // PDF 标签：全文检索由 PdfViewer 后台执行（文本在 pdfium 里，不在 tab.content）。
         // 查询按（标签, 词）键控、变化才推送（阅读器内部 250ms 防抖）；侧边栏只展示
-        // 计数/页列表并驱动跳转。结果异步到达 → 经 `_pdf_observe` 重绘本面板。
+        // 计数/页列表并驱动跳转。结果异步到达 → 经对应 PDF 选项卡的 `_pdf_sub` 订阅
+        // 重绘本面板（多 PDF 并存各自独立订阅，见 `subscribe_pdf`）。
         if let Some(MediaReader::Pdf(pdf)) =
             self.tabs.get(self.active_tab).map(|t| t.reader.clone())
         {

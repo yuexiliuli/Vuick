@@ -108,38 +108,26 @@ impl EditorApp {
             UNDO.menu_label,
             UNDO.shortcut,
             weak.clone(),
-            |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(Undo), cx);
-            },
+            |this, window, cx| Self::dispatch_editor_action(this, window, cx, Box::new(Undo)),
         ))
         .item(Self::menu_action_item(
             REDO.menu_label,
             REDO.shortcut,
             weak.clone(),
-            |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(Redo), cx);
-            },
+            |this, window, cx| Self::dispatch_editor_action(this, window, cx, Box::new(Redo)),
         ))
         .separator()
         .item(Self::menu_action_item(
             CUT.menu_label,
             CUT.shortcut,
             weak.clone(),
-            |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(Cut), cx);
-            },
+            |this, window, cx| Self::dispatch_editor_action(this, window, cx, Box::new(Cut)),
         ))
         .item(Self::menu_action_item(
             COPY.menu_label,
             COPY.shortcut,
             weak.clone(),
-            |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(Copy), cx);
-            },
+            |this, window, cx| Self::dispatch_editor_action(this, window, cx, Box::new(Copy)),
         ))
         .item(Self::menu_action_item(
             PASTE.menu_label,
@@ -152,10 +140,7 @@ impl EditorApp {
             SELECT_ALL.menu_label,
             SELECT_ALL.shortcut,
             weak,
-            |this, window, cx| {
-                Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(SelectAll), cx);
-            },
+            |this, window, cx| Self::dispatch_editor_action(this, window, cx, Box::new(SelectAll)),
         ))
     }
 
@@ -333,6 +318,21 @@ impl EditorApp {
         let idx = this.active_tab;
         let focus = this.tab_focus_handle(idx, cx);
         window.focus(&focus, cx);
+    }
+
+    /// 编辑类命令助手：先 `focus_active_editor` 把焦点还给当前激活选项卡编辑区，再向
+    /// 窗口派发编辑动作。右键「编辑」菜单（`edit_items`）与命令面板命令表（`palette.rs`）
+    /// 共 5×2 个同构闭包（Undo/Redo/Cut/Copy/SelectAll）此前各自手抄，收敛于此。两处
+    /// 目标解析一致（都走 `focus_active_editor` 的 active_tab），故直接共用；
+    /// 粘贴（Paste）走 `paste_normalized` 不在此列。
+    pub(super) fn dispatch_editor_action(
+        this: &mut Self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        action: Box<dyn gpui::Action>,
+    ) {
+        Self::focus_active_editor(this, window, cx);
+        window.dispatch_action(action, cx);
     }
 
     /// 菜单按钮组（文件/编辑/查看/帮助），并入自绘标题栏使用。

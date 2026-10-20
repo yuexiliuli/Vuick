@@ -181,24 +181,18 @@ impl UserPrefs {
         Self::from_json_value(&v)
     }
 
-    /// 保存：临时文件 + rename 原子替换（Windows rename 不覆盖 → 先删旧文件）。
+    /// 保存：同目录临时文件 + rename 原子替换（唯一临时名统一收敛到
+    /// `base::util::atomic_write`；Windows `std::fs::rename` 可覆盖既有文件，不再先删旧文件）。
+    /// 写失败静默回退：保持内存态、不覆盖磁盘，与既有处置一致。
     pub fn save(&self) {
         if cfg!(test) {
             return;
         }
         let path = Self::config_path();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            let _ = fs::create_dir_all(parent);
-        }
         let body = self.to_json_value().to_string();
-        let tmp = path.with_extension("json.tmp");
-        if fs::write(&tmp, body).is_err() {
+        if base::util::atomic_write(&path, body.as_bytes()).is_err() {
             return;
         }
-        let _ = fs::remove_file(&path);
-        let _ = fs::rename(&tmp, &path);
     }
 }
 

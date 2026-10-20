@@ -58,3 +58,9 @@ pub const MATH_SLOTS_CACHE_CAP: usize = 1000;
 /// runs 缓存（纯 CPU 数据）。512 块覆盖常见文档交互面 + 长滚动窗口（大文档几十个
 /// 代码块已足够往复滚动复用），超出按最近最少使用淘汰（命中率与内存折中）。
 pub const CODE_PARSE_CACHE_CAP: usize = 512;
+/// WYSIWYG 数学卡高估算缓存（按**公式源码键**计）的**条目上限**：每个互异公式源一条
+/// `源→显示行数估算`（`math_line_height_h` 的确定性结果）。估算值可确定性重算，所以
+/// 超限**不丢正确性、只丢缓存**（超限源退回每次 fold_plan 重建都重算 LaTeX→Unicode 转换
+/// 的性能路径）。上限防长期编辑会话里「互异公式源只增不减、不随编辑回收」把缓存撑成
+/// 内存无底洞。撞线即打一次 warn（见 content_sync::math_height_estimate）。
+pub const MATH_LINE_MAP_CAP: usize = 10_000;

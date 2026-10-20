@@ -892,6 +892,7 @@ impl SubtitleReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subtitle::find_active_subtitle;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -954,6 +955,76 @@ mod tests {
         assert!(
             r.subtitle_at(22.04).is_none(),
             "22.04s 应不命中（超出首条窗口）"
+        );
+    }
+
+    /// 对拍（跨 crate）：同一份真实字幕数据分别走 video 生产实现
+    /// [`find_active_subtitle`](`crate::subtitle::find_active_subtitle`) 与 cdylib 侧
+    /// `vff_subtitle_at`（经运行时 FFI 桥 `Bridge::subtitle_at`，内部即
+    /// `active_subtitle_index`），在密集采样时间点上逐点断言两实现返回同一活动字幕
+    /// **索引**（FFI 返回 `>=0` 为索引、`-1` 为无）。缺桥/缺夹具 SKIP 不 FAIL。
+    ///
+    /// 这里的 `vff_subtitle_at` 是**真 FFI 调用**（走已加载的 `video_ffmpeg.dll`，
+    /// 非本地镜像），对拍的是两份独立实现的口径是否漂移。
+    #[test]
+    fn subtitle_ffi_active_index_agrees_with_find_active_subtitle() {
+        if !available() {
+            eprintln!("SKIP: video_ffmpeg.dll 不可用");
+            return;
+        }
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（字幕夹具不入库，手动装配）");
+            return;
+        }
+        let r = SubtitleReader::open(&path).expect("打开字幕失败");
+        let subs = r.subtitles();
+        assert!(!subs.is_empty(), "应提取到字幕，实得 {} 条", subs.len());
+
+        // 采样时间点：窗口内/紧贴端点（含边界）各 ±ε、窗口间隙，再铺一层 0.5s 均匀网格
+        // 跨全片；另加首条之前 / 0 时刻 / 尾部越界兜底点。
+        let mut times: Vec<f64> = Vec::new();
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for s in subs.iter() {
+            lo = lo.min(s.start_pts);
+            hi = hi.max(s.end_pts);
+            times.push(s.start_pts - 0.05);
+            times.push(s.start_pts);
+            times.push((s.start_pts + s.end_pts) * 0.5);
+            times.push(s.end_pts);
+            times.push(s.end_pts + 0.05);
+        }
+        let mut t = lo - 1.0;
+        while t <= hi + 1.0 {
+            times.push(t);
+            t += 0.5;
+        }
+        times.push(-1.0);
+        times.push(0.0);
+        times.push(hi + 10.0);
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        times.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+
+        let Some(b) = bridge() else {
+            eprintln!("SKIP: video_ffmpeg.dll 不可用");
+            return;
+        };
+        let mut mismatches: Vec<(f64, Option<usize>, Option<usize>)> = Vec::new();
+        for t in times {
+            let video = find_active_subtitle(subs, t)
+                .map(|e| subs.iter().position(|s| std::ptr::eq(s, e)).unwrap());
+            let ffi = unsafe { (b.subtitle_at)(r.handle, t) };
+            let ffi_id = if ffi >= 0 { Some(ffi as usize) } else { None };
+            if video != ffi_id {
+                mismatches.push((t, video, ffi_id));
+            }
+        }
+        let shown = mismatches.len().min(8);
+        assert!(
+            mismatches.is_empty(),
+            "对拍分歧 {} 处（t, find_active_subtitle idx, vff_subtitle_at idx）前 {shown} 处：{:?}",
+            mismatches.len(),
+            &mismatches[..shown]
         );
     }
 

@@ -185,6 +185,43 @@ mod tests {
         assert!(find_active_subtitle(&ov, 4.5).is_none());
     }
 
+    /// 对拍代表性样例集（与 `video-ffmpeg` crate `decode/tests.rs` 的
+    /// `active_subtitle_index_edge_case_battery_cross_check` **逐字同源**，两侧同一份数据、
+    /// 同一组采样点断言同一索引）：覆盖 0 时刻起点、相邻紧贴（前条 end == 后条 start）、
+    /// 重叠跨段（前者窗口包裹后者起点）、窗口间隙、尾部越界、空集。
+    #[test]
+    fn find_active_subtitle_edge_case_battery() {
+        let subs = vec![
+            SubtitleEntry { start_pts: 0.0, end_pts: 1.0, text: "at-zero".into() }, // 0 时刻起点
+            SubtitleEntry { start_pts: 1.0, end_pts: 2.0, text: "touching".into() }, // 紧贴 [0,1]|[1,2]
+            SubtitleEntry { start_pts: 1.5, end_pts: 3.0, text: "overlap".into() }, // 跨段包裹 touching 起点
+            SubtitleEntry { start_pts: 5.0, end_pts: 6.0, text: "tail".into() },
+        ];
+        let cases: &[(f64, Option<usize>)] = &[
+            (-1.0, None), // 全部之前
+            (0.0, Some(0)), // 0 时刻闭区间命中
+            (0.5, Some(0)),
+            (1.0, Some(1)), // 紧贴边界：两端活跃，取「最近开始」（touching）
+            (1.75, Some(2)), // 重叠：overlap 起于 1.5，覆盖 touching → 取最近开始
+            (2.5, Some(2)), // overlap 独立活跃
+            (3.0, Some(2)), // 含结束端点（闭区间）
+            (3.5, None), // 窗口间隙
+            (5.0, Some(3)),
+            (6.0, Some(3)), // 含结束端点（闭区间）
+            (6.5, None), // 尾部越界
+            (99.0, None),
+        ];
+        assert!(
+            find_active_subtitle(&[], 0.0).is_none(),
+            "空集不命中"
+        );
+        for &(t, want) in cases {
+            let got = find_active_subtitle(&subs, t)
+                .map(|e| subs.iter().position(|s| std::ptr::eq(s, e)).unwrap());
+            assert_eq!(got, want, "t={t}: find_active_subtitle 应选中索引 {want:?}");
+        }
+    }
+
     /// `is_active_at` 含端点（结束秒处仍显示，与实际播放时钟一致）。
     #[test]
     fn entry_is_active_at_uses_inclusive_bounds() {

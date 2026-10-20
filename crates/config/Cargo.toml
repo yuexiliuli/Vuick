@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "gpui-editor 的集中配置常量 crate（geometry / performance / timing / user prefs）"
 
 [dependencies]
+base = { path = "../base" }
 gpui = { workspace = true }
 serde_json = { workspace = true }
 

@@ -509,6 +509,33 @@ impl WyEditor {
             .copied()
             .unwrap_or(0.)
     }
+
+    /// 结构编辑后清除「以 src_line 为键」的块视图态（代码/表格/数学横向滚动、
+    /// mermaid 缩放、数学自然宽侧缓存）：被结构替换**行窗**（`edit_line ..=
+    /// edit_line + max(删/插换行)`）内的旧键会误套到同线新块（把旧块的横向滚动
+    /// /缩放带到新块），故按窗清；**窗外的块内容未变**（仅行号平移，旧键落空
+    /// 自愈）→ 保留，勿误清用户有意保留的滚动。
+    /// `math_pins`/`notdef_retry` 已在编辑管道同期清理（见 `invalidate_after_edit`）；
+    /// `folded_headings` 按**文本键**存、不随行号错位（改标题文本键自然失效，折叠体
+    /// 由 derived 平移/重建）→ 无需清理（结构编辑失效机理对照）。
+    pub(crate) fn clear_src_line_view_state(&self, edit_line: usize, max_nl: usize) {
+        let end = edit_line.saturating_add(max_nl);
+        self.code_h_scroll
+            .borrow_mut()
+            .retain(|&l, _| l < edit_line || l > end);
+        self.table_h_scroll
+            .borrow_mut()
+            .retain(|&l, _| l < edit_line || l > end);
+        self.math_h_scroll
+            .borrow_mut()
+            .retain(|&l, _| l < edit_line || l > end);
+        self.math_natural_w
+            .borrow_mut()
+            .retain(|&l, _| l < edit_line || l > end);
+        self.mermaid_zoom
+            .borrow_mut()
+            .retain(|&l, _| l < edit_line || l > end);
+    }
     /// 记录本帧元素在窗口中的 bounds（paint 调用；鼠标命中换算用）。
     pub(crate) fn set_last_bounds(&self, bounds: Option<gpui::Bounds<Pixels>>) {
         self.last_bounds.set(bounds);

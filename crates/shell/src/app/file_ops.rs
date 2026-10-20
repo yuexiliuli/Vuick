@@ -943,35 +943,39 @@ impl EditorApp {
         if !self.reset_common_tab_fields(idx, p, SharedString::default(), 0, 0, cx) {
             return;
         }
-        let Some(tab) = self.tabs.get_mut(idx) else {
-            return;
-        };
-        match kind {
-            MediaKind::Pdf => {
-                // PdfViewer：自包含阅读器（异步读文件+解析+页级按需栅格化，不解析为 Markdown）
-                let viewer = cx.new(|cx| pdf::PdfViewer::new(p.to_path_buf(), cx));
-                viewer.update(cx, |view, _| view.set_background(canvas_bg));
-                // 订阅阅读器 notify：检索结果/加载进度到达 → 重绘 app（侧边栏 PDF 命中计数/页列表更新）
-                self._pdf_observe = Some(cx.observe(&viewer, |_this, _e, cx| {
-                    cx.notify();
-                }));
-                tab.reader = MediaReader::Pdf(viewer);
-            }
-            MediaKind::Image => {
-                // ImageViewer：自包含图片查看器（后台解码 + 同文件夹切换 + Ctrl+滚轮缩放）
-                let viewer = cx.new(|cx| image_viewer::ImageViewer::new(p.to_path_buf(), cx));
-                viewer.update(cx, |view, _| view.set_background(canvas_bg));
-                tab.reader = MediaReader::Image(viewer);
-            }
-            #[cfg(feature = "video")]
-            MediaKind::Video => {
-                // VideoViewer：自包含视频播放器（后台解码 + 帧钟 + 控制）
-                let viewer = cx.new(|cx| video::VideoViewer::new(p.to_path_buf(), cx));
-                viewer.update(cx, |view, _| view.set_background(canvas_bg));
-                // 焦点落到查看器：Space/←/→/滚轮等控制键直达（按键监听挂在查看器焦点句柄上）
-                let fh = viewer.read(cx).focus_handle();
-                _window.focus(&fh, cx);
-                tab.reader = MediaReader::Video(viewer);
+        if kind == MediaKind::Pdf {
+            // PdfViewer：自包含阅读器（异步读文件+解析+页级按需栅格化，不解析为 Markdown）
+            let viewer = cx.new(|cx| pdf::PdfViewer::new(p.to_path_buf(), cx));
+            viewer.update(cx, |view, _| view.set_background(canvas_bg));
+            // 订阅阅读器 notify：检索结果/加载进度到达 → 重绘 app（侧边栏 PDF 命中计数/
+            // 页列表更新）。订阅收进**选项卡**（`_pdf_sub`）而非全局单槽：多 PDF 并存各自
+            // 独立、不被后打开者覆盖（旧 `_pdf_observe` 单槽即此缺陷）。单一写点
+            // `subscribe_pdf`（新建/跨窗口移交共用，K10 收敛）。
+            self.subscribe_pdf(idx, &viewer, cx);
+            let tab = self.tabs.get_mut(idx).expect("PDF 选项卡应已在场");
+            tab.reader = MediaReader::Pdf(viewer);
+        } else {
+            let Some(tab) = self.tabs.get_mut(idx) else {
+                return;
+            };
+            match kind {
+                MediaKind::Image => {
+                    // ImageViewer：自包含图片查看器（后台解码 + 同文件夹切换 + Ctrl+滚轮缩放）
+                    let viewer = cx.new(|cx| image_viewer::ImageViewer::new(p.to_path_buf(), cx));
+                    viewer.update(cx, |view, _| view.set_background(canvas_bg));
+                    tab.reader = MediaReader::Image(viewer);
+                }
+                #[cfg(feature = "video")]
+                MediaKind::Video => {
+                    // VideoViewer：自包含视频播放器（后台解码 + 帧钟 + 控制）
+                    let viewer = cx.new(|cx| video::VideoViewer::new(p.to_path_buf(), cx));
+                    viewer.update(cx, |view, _| view.set_background(canvas_bg));
+                    // 焦点落到查看器：Space/←/→/滚轮等控制键直达（按键监听挂在查看器焦点句柄上）
+                    let fh = viewer.read(cx).focus_handle();
+                    _window.focus(&fh, cx);
+                    tab.reader = MediaReader::Video(viewer);
+                }
+                _ => unreachable!(),
             }
         }
         self.status = match kind {

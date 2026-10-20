@@ -48,6 +48,7 @@ impl EditorApp {
             epub_notes: Default::default(),
             edit_version: 0,
             _edit_sub: edit_sub,
+            _pdf_sub: None,
         });
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;

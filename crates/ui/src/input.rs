@@ -936,7 +936,7 @@ impl Element for InputElement {
     }
 
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
+        base::util::source_location()
     }
 
     fn request_layout(

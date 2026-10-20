@@ -22,11 +22,6 @@ impl WyEditor {
     ) -> Option<gpui::Entity<editor::CodeEditor>> {
         self.math_edit.as_ref().map(|p| p.text.clone())
     }
-    /// 当前缓存的卡片锚点（测试访问器）。
-    #[cfg(test)]
-    pub(crate) fn math_edit_anchor(&self) -> Option<gpui::Point<Pixels>> {
-        self.math_edit_anchor.get()
-    }
     /// 当前拖拽把手是否进行中（测试访问器）。
     #[cfg(test)]
     pub(crate) fn math_edit_dragging(&self) -> bool {
@@ -134,7 +129,7 @@ impl WyEditor {
         if let Some(f) = self.frame.borrow().as_ref().cloned() {
             let origin = self.content_origin();
             self.math_edit_anchor
-                .set(self.math_edit_anchor_at(origin, &f));
+                .set(self.math_edit_anchor_now(origin, &f));
         }
         // 聚焦多行输入区域（用户可直接键入/IME）。
         if let Some(p) = &self.math_edit {
@@ -147,7 +142,7 @@ impl WyEditor {
     /// 关闭数学编辑卡片（不写源码——写回已实时完成，无取消语义）。
     pub(crate) fn close_math_edit(&mut self, cx: &mut Context<Self>) {
         if self.math_edit.take().is_some() {
-            self.math_edit_anchor.set(None);
+            self.math_edit_anchor.clear();
             self.math_edit_sub = None;
             self.math_edit_drag.set(None);
             self.math_edit_delta.set(point(px(0.), px(0.)));
@@ -258,7 +253,7 @@ impl WyEditor {
 
     /// 拖拽中应用到新指针位置：`位移 = pos − grab`，累计偏移 = 抓取前偏移 + 位移，
     /// 缓存锚点 = 抓取时基准锚点 + 位移（卡片跟手；paint 期刷新锚点经
-    /// `math_edit_anchor_at` 叠加累计偏移，不再把拖拽位移冲掉）。
+    /// `math_edit_anchor_now` 叠加累计偏移，不再把拖拽位移冲掉）。
     pub(crate) fn math_edit_drag_move(&mut self, pos: gpui::Point<Pixels>) {
         let Some(d) = self.math_edit_drag.get() else {
             return;
@@ -275,21 +270,18 @@ impl WyEditor {
         self.math_edit_drag.set(None);
     }
 
-    /// 数学编辑卡片的**窗口锚点**（卡片 TopLeft，window 坐标）：内容区水平居中 +
-    /// 顶对齐目标公式卡行的当前屏幕 y。帧行坐标是**文档局部**（`row.top` 含整篇偏移），
-    /// 窗口坐标 = 元素屏幕原点（`origin`）+ 帧局部。`origin` 必须与 `f` 同代（paint 期
-    /// 用 `bounds.origin` + 本帧 frame，open 期用 `content_origin` + 保持的帧），否则换帧
-    /// 就闪。结果再叠加**拖拽累计偏移** `math_edit_delta`（未拖拽 = 0，行为与旧一致）。
-    /// 缺卡片/找不到目标卡行 → `None`。
-    pub(crate) fn math_edit_anchor_at(
+    /// 数学编辑卡片的**窗口锚点现算**（卡片 TopLeft，window 坐标）：复用
+    /// [`CardAnchor::at`] 的内容区水平居中 + 顶对齐换算，独有部分只剩目标行查找与
+    /// **拖拽累计偏移** `math_edit_delta` 叠加（未拖拽 = 0，行为与旧一致）。帧行坐标是
+    /// **文档局部**（`row.top` 含整篇偏移），窗口坐标 = 元素屏幕原点（`origin`）+ 帧
+    /// 局部。`origin` 必须与 `f` 同代（paint 期用 `bounds.origin` + 本帧 frame，open 期
+    /// 用 `content_origin` + 保持的帧），否则换帧就闪。缺卡片/找不到目标卡行 → `None`。
+    pub(crate) fn math_edit_anchor_now(
         &self,
         origin: gpui::Point<Pixels>,
         f: &element::Frame,
     ) -> Option<gpui::Point<Pixels>> {
         let popup = self.math_edit.as_ref()?;
-        let card_w = element::MATH_EDIT_CARD_W;
-        let content_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
-        let l = f32::from(f.padding) + ((content_w - card_w) / 2.).max(0.);
         let row_top = f
             .rows
             .iter()
@@ -302,17 +294,9 @@ impl WyEditor {
                 let blk = f.block_index_for_src_line(popup.src_line).unwrap_or(0);
                 f.block_top(blk)
             });
-        let base = point(
-            px(f32::from(origin.x) + l),
-            px(f32::from(origin.y) + row_top),
-        );
+        let base = self.math_edit_anchor.at(origin, f, row_top);
         let d = self.math_edit_delta.get();
         Some(point(base.x + d.x, base.y + d.y))
-    }
-
-    /// 设置数学编辑卡片锚点（`element::WyEditorElement::paint` 每帧刷新；`None` 清空）。
-    pub(crate) fn set_math_edit_anchor(&self, anchor: Option<gpui::Point<Pixels>>) {
-        self.math_edit_anchor.set(anchor);
     }
 
     /// 数学编辑卡内嵌编辑器**当前是否持有焦点**（app 层 `PasteNormalized` 路由判定：
@@ -373,15 +357,12 @@ impl WyEditor {
         // 卡片几何（**窗口坐标**，供 `anchored(Window)` 定位）：**直接读 paint 期缓存好的
         // 锚点**（同 `image_edit_card_element`——render 期现算 frame 会读到 ensure 兜底
         // 800 宽重建的临时帧，卡片横跳一帧）。锚点未就绪才回退到逐帧现算。
-        let anchor = match self.math_edit_anchor.get() {
-            Some(a) => a,
-            None => {
-                let f = self.frame.borrow();
-                let f = f.as_ref()?;
-                let origin = self.content_origin();
-                self.math_edit_anchor_at(origin, f)?
-            }
-        };
+        let anchor = self.math_edit_anchor.resolve(|| {
+            let f = self.frame.borrow();
+            let f = f.as_ref()?;
+            let origin = self.content_origin();
+            self.math_edit_anchor_now(origin, f)
+        })?;
         let (left, top) = (f32::from(anchor.x), f32::from(anchor.y));
         let ed_close = cx.entity();
         let colors = ui::theme::Theme::global(cx).colors;

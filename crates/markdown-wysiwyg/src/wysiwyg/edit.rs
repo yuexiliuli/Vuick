@@ -558,6 +558,12 @@ impl WyEditor {
             *self.pending_patch_blocks.borrow_mut() = None;
             // 结构编辑：块行号/身份可能位移 → 数学位图钉随行号作废。
             self.clear_math_pins();
+            // 结构编辑：被替换/插入**行窗**内的 src_line 旧键会误套到同线新块（把旧
+            // 代码块的横向滚动/缩放残留到新块）→ 按窗清块视图态；窗外块内容未变保留。
+            self.clear_src_line_view_state(
+                edit_line,
+                removed.matches('\n').count().max(text.matches('\n').count()),
+            );
             // fold_plan deltas 增量平移的编辑信息：被编辑块旧下标 + 块数净增。
             self.struct_blk_old.set(edit_blk);
             self.struct_blk_span_delta

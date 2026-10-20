@@ -159,6 +159,13 @@ struct EditorTab {
     edit_version: u64,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
+    /// 监听 PDF 阅读器 `notify()`（检索结果/加载进度到达）→ 刷新 app（侧边栏计数）。
+    /// **随选项卡持有**：多 PDF 选项卡并存时各自独立订阅，避免旧单槽全局
+    /// `EditorApp::_pdf_observe` 被后打开者覆盖、先打开 PDF 的 notify 丢失（真 bug）。
+    /// 订阅绑定本窗口 EditorApp；随选项卡搬迁时随源 `EditorTab` 一起丢弃
+    /// （`take_tab_payload` 解构 `..`），目标窗口 `adopt_tab` 重建。关选项卡 / 拔除时
+    /// 随 `EditorTab` drop 自动退订（无幽灵回调 / 泄漏）。
+    _pdf_sub: Option<gpui::Subscription>,
     /// `live2`（WyEditor）的变更订阅。
     _live2_sub: Option<Subscription>,
     /// 预览编辑（WYSIWYG）宿主纵向滚动句柄：`#live-scroll`（`overflow_y_scroll`）
@@ -419,8 +426,6 @@ pub struct EditorApp {
     search_state: gpui::Entity<InputState>,
     /// 监听搜索框输入变化 → 刷新搜索结果。
     _search_sub: Subscription,
-    /// 监听 PDF 阅读器 `notify()`（检索结果/加载进度到达）→ 刷新 app（侧边栏计数）。
-    _pdf_observe: Option<gpui::Subscription>,
     /// 已推送给 PDF 阅读器的查询（`(活动标签, 查询词)`）：两者都未变才跳过推送，
     /// 切换标签/重开 PDF 后即使查询相同也会重新推送。
     pdf_search: Option<(usize, String)>,

@@ -29,6 +29,22 @@ impl EditorApp {
         })
     }
 
+    /// 订阅 PDF 阅读器 notify（检索结果 / 加载进度到达 → `cx.notify()` 重绘 app，侧边栏
+    /// PDF 命中计数/页列表随之刷新）。**单一写点**：新建 PDF 选项卡（`load_media`）与
+    /// 跨窗口移交（`adopt_tab`）共用（K10 精神：订阅生命周期收敛到 tab 建立/销毁，不散点）。
+    /// 订阅**随选项卡持有**（`_pdf_sub`）：多 PDF 并存各自独立，取代旧单槽 `_pdf_observe`
+    /// （被后打开者覆盖 → 先打开 PDF 的 notify 丢失）；关选项卡 / 拔除时随 `EditorTab`
+    /// 一起 drop 自动退订。
+    pub(super) fn subscribe_pdf(
+        &mut self,
+        idx: usize,
+        pdf: &gpui::Entity<pdf::PdfViewer>,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = self.tabs.get_mut(idx).expect("PDF 订阅需选项卡在场");
+        tab._pdf_sub = Some(cx.observe(pdf, |_this, _e, cx| cx.notify()));
+    }
+
     /// 编辑器「光标 / 选区变化」（不修改文本）：刷新选项卡缓存的行/列。轻量路径——
     /// 只做 O(1) 光标读数并写回缓存，不碰搜索缓存 / 脏区间 / 预览同步（与
     /// `on_editor_edited` 的重活分开，避免鼠标选中拖动时触发逐次预览扫描）。

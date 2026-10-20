@@ -7,6 +7,10 @@
 //! - **[`SeqAfter`] 延迟防抖、代序作废助手**（依赖 gpui 调度）：收敛 shell 内四处
 //!   「spawn timer + 单调 seq + 比对作废」手抄骨架。
 
+use std::fs;
+use std::io;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -85,6 +89,71 @@ impl SeqAfter {
         })
         .detach();
     }
+}
+
+/// `Element::source_location` 的统一载体：gpui 自定义元素一律**不**上报源码位置
+/// （inspector 里无从定位）。
+///
+/// ui::input::InputElement / ui::icon::Icon / ui::scrollbar::Scrollbar /
+/// editor::view::render::EditorElement / markdown-wysiwyg::WyEditorElement 五处此前各自
+/// 手抄 `None`，收敛为这里的公共函数，各 impl 委托它（gpui `Element` trait 该方法
+/// 无默认体，impl 方法不可省）。
+pub fn source_location() -> Option<&'static core::panic::Location<'static>> {
+    None
+}
+
+/// 「同目录临时文件 + rename」原子写：同目录建唯一名临时文件（进程 pid + 单调纳秒
+/// 时间戳）写入并 `sync_all` 落盘后 `rename` 覆盖目标。
+///
+/// `std::fs::rename` 在 Windows 走 MoveFileEx 可覆盖既有目标——**不要**先删旧文件再
+/// rename（先删后改存在「旧文件已删、新文件未就位」的非原子窗口，中途崩溃丢旧文件）。
+/// 唯一临时名（pid + 纳秒时间戳）让并发写入者互不覆盖彼此的临时文件；同一目标并发写
+/// 时最后一次 rename 胜出，目标始终是某个完整文件。
+/// config::user::save 与 shell::app::session::atomic_write 两处此前各自手抄此套路，收敛至此。
+/// 错误语义：写失败会清理半截临时文件并把 `io::Error` 回传（`fs::rename` 失败同样回传）。
+pub fn atomic_write<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<()> {
+    let path = path.as_ref();
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic_write: 目标路径必须以文件名结尾",
+        )
+    })?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = match parent {
+        Some(parent) => parent.join(format!(
+            "{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            nanos
+        )),
+        None => PathBuf::from(format!(
+            "{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            nanos
+        )),
+    };
+    let write = (|| -> io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?; // flush 落盘（比 flush 更强：fsync 到磁盘）
+        Ok(())
+    })();
+    if let Err(err) = write {
+        // 写失败清理半截临时文件，避免残留；错误交还调用方处置。
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]

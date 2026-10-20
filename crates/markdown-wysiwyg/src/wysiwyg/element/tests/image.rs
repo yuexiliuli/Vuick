@@ -566,7 +566,7 @@ fn image_edit_card_anchor_ignores_transient_frame_rebuild(cx: &mut TestAppContex
     let expected_l = f32::from(frame.padding)
         + (((width - 2.0 * f32::from(frame.padding)) - super::IMAGE_EDIT_CARD_W) / 2.).max(0.);
     let anchor0 = ed
-        .read_with(vcx, |e, _| e.image_edit_anchor())
+        .read_with(vcx, |e, _| e.image_edit_anchor.get())
         .expect("打开即缓存锚点");
     assert!(
         (f32::from(anchor0.x) - expected_l).abs() < 1. && (f32::from(anchor0.y) - top).abs() < 1.,
@@ -582,7 +582,7 @@ fn image_edit_card_anchor_ignores_transient_frame_rebuild(cx: &mut TestAppContex
         ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(rc));
     });
     let anchor1 = ed
-        .read_with(vcx, |e, _| e.image_edit_anchor())
+        .read_with(vcx, |e, _| e.image_edit_anchor.get())
         .expect("锚点仍在");
     assert!(
         (f32::from(anchor1.x) - f32::from(anchor0.x)).abs() < 1.

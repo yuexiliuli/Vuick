@@ -326,6 +326,36 @@ impl EditorApp {
         Some((wy.read(cx).toc_entries(), MdTocScroll::Unified(wy.clone())))
     }
 
+    /// 右栏 WyEditor 懒创建的共用引导块（`ensure_md_wy` / `ensure_epub_wy` 两处手抄的
+    /// ~15 行设置收敛于此）：尚未创建时新建并套 A1 只读门控 `set_editable(false)` +
+    /// 全局字号 + 基准目录；`configure` 注入阅读器差分支（当前 MD/EPUB 创建期均无专属
+    /// 设置 → 传空闭包；EPUB 的只读居中/内存图/注记等仍在调用方喂源块）。保持 lazy-once
+    /// 语义（不预建），各阅读器创建后的喂源差异逻辑留在各自调用方。
+    fn ensure_wy(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        configure: impl FnOnce(&mut WyEditor, &mut gpui::App),
+    ) {
+        let fs = self.font_size;
+        let base_dir = self.tabs[idx]
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|d| d.to_path_buf());
+        if self.tabs[idx].md_wy.is_none() {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            ed.update(cx, |ed, cx| {
+                ed.set_editable(false); // A1 只读门控：右栏预览不可编辑
+                ed.set_font_size(gpui::px(fs));
+                ed.set_base_dir(base_dir);
+                configure(ed, cx);
+            });
+            self.tabs[idx].md_wy = Some(ed.clone());
+        }
+    }
+
     /// A2：确保某选项卡的右栏 WyEditor 预览已创建（懒创建 + A1 只读门控 + 全局字号/
     /// 基准目录）。`feed=true` 用当前编辑区文本**同步喂源**（小文档 / 切预览；
     /// 大文档异步走 `open_from_rope`(后台) + `finish_file_text` 的 `install_open`，
@@ -342,23 +372,16 @@ impl EditorApp {
         }
         // B3：喂源/就地换源前作废在途后台装配（防旧切回的装配把新喂内容覆盖回去）。
         self.md_wy_invalidate_async(idx);
-        let fs = self.font_size;
-        let base_dir = self.tabs[idx]
-            .file_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|d| d.to_path_buf());
-        if self.tabs[idx].md_wy.is_none() {
-            let ed = cx.new(|cx| WyEditor::new(window, cx));
-            ed.update(cx, |ed, _| {
-                ed.set_editable(false); // A1 只读门控：右栏预览不可编辑
-                ed.set_font_size(gpui::px(fs));
-                ed.set_base_dir(base_dir.clone());
-            });
-            self.tabs[idx].md_wy = Some(ed.clone());
-        }
+        // 懒创建引导块共用；MD 创建期无专属设置 → 空配置闭包。
+        self.ensure_wy(idx, window, cx, |_ed, _cx| {});
         if feed {
             // 同步喂源：源 = 编辑区规范文本（与预览宿主同口径）。
+            let fs = self.font_size;
+            let base_dir = self.tabs[idx]
+                .file_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|d| d.to_path_buf());
             let text = {
                 let tab = &mut self.tabs[idx];
                 tab.editor.read(cx).value().to_string()
@@ -391,21 +414,14 @@ impl EditorApp {
         }
         // B3：喂源/就地换源前作废在途后台装配（防旧切回装配覆盖新喂内容）。
         self.md_wy_invalidate_async(idx);
+        // 懒创建引导块共用；EPUB 创建期无专属设置 → 空配置闭包。
+        self.ensure_wy(idx, window, cx, |_ed, _cx| {});
         let fs = self.font_size;
         let base_dir = self.tabs[idx]
             .file_path
             .as_ref()
             .and_then(|p| p.parent())
             .map(|d| d.to_path_buf());
-        if self.tabs[idx].md_wy.is_none() {
-            let ed = cx.new(|cx| WyEditor::new(window, cx));
-            ed.update(cx, |ed, _| {
-                ed.set_editable(false); // A1 只读门控：EPUB 阅读不可编辑
-                ed.set_font_size(gpui::px(fs));
-                ed.set_base_dir(base_dir.clone());
-            });
-            self.tabs[idx].md_wy = Some(ed.clone());
-        }
         if let Some(ed) = self.tabs[idx].md_wy.clone() {
             ed.update(cx, |ed, _| {
                 ed.set_font_size(gpui::px(fs));
