@@ -1912,6 +1912,7 @@ dependencies = [
  "gpui_platform",
  "shell",
  "syntax",
+ "tray",
  "ui",
  "video",
 ]
@@ -4421,11 +4422,13 @@ dependencies = [
  "markdown-wysiwyg",
  "memchr",
  "pdf",
+ "raw-window-handle",
  "rfd",
  "ropey",
  "serde_json",
  "syntax",
  "toc",
+ "tray",
  "ui",
  "video",
 ]
@@ -4971,6 +4974,13 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "tray"
+version = "0.1.0"
+dependencies = [
+ "windows 0.62.2",
+]
 
 [[package]]
 name = "ttf-parser"

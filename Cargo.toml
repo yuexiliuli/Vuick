@@ -20,6 +20,8 @@ ui = { path = "crates/ui" }
 config = { path = "crates/config" }
 syntax = { path = "crates/syntax" }
 base = { path = "crates/base" }
+# P6：系统托盘（Windows 托盘图标 / 关闭到托盘），unsafe Win32 全部收敛在该 crate。
+tray = { path = "crates/tray" }
 # P4：视频解码内核（FFmpeg 经 libloading 运行时加载）已随 video crate 独立；
 # 作为可选依赖由根 `video` feature 经 `dep:video` 开启——根包不直接消费 video crate，
 # 该可选依赖是整链的总开关（--no-default-features 即完全不拉 FFmpeg 相关代码）。
@@ -45,7 +47,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["crates/video-ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/markdown", "crates/markdown-wysiwyg", "crates/toc", "crates/pdf", "crates/image_viewer", "crates/video", "crates/epub", "crates/shell", "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
+members = ["crates/video-ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/markdown", "crates/markdown-wysiwyg", "crates/toc", "crates/pdf", "crates/image_viewer", "crates/video", "crates/epub", "crates/shell", "crates/tray", "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。

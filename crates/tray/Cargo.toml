@@ -1,0 +1,11 @@
+[package]
+name = "tray"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 系统托盘 crate（Windows 托盘图标 / 关闭到托盘 / 托盘菜单：unsafe Win32 全部收敛于此）"
+
+[dependencies]
+# 复用 workspace 已有 windows（含 Win32_UI_Shell / Win32_UI_WindowsAndMessaging /
+# Win32_System_LibraryLoader，无需改 workspace features）；非 windows 目标编译为空操作。
+windows = { workspace = true }

@@ -75,6 +75,9 @@ pub struct UserPrefs {
     pub sidebar_width: Option<f32>,
     /// 「恢复上次会话」开关。`None` = 未设置过，默认开启；`Some(false)` = 显式关闭。
     pub session_restore: Option<bool>,
+    /// 「关闭到系统托盘」开关。`None` = 未设置过，默认关（点标题栏 × 直接关闭退出）；
+    /// `Some(true)` = 开启（点 × / Alt+F4 隐藏到系统托盘图标，托盘退出才真正退出）。
+    pub close_to_tray: Option<bool>,
     /// 打开文件夹的根路径（侧边栏「文件」视图）。跨重启恢复文件树；`None` = 未打开过。
     pub opened_folder: Option<String>,
     /// 最近打开的文件夹路径（新→旧，至多 [`RECENT_MAX`] 条）。
@@ -131,6 +134,9 @@ impl UserPrefs {
         if let Some(Value::Bool(b)) = map.get("session_restore") {
             prefs.session_restore = Some(*b);
         }
+        if let Some(Value::Bool(b)) = map.get("close_to_tray") {
+            prefs.close_to_tray = Some(*b);
+        }
         if let Some(Value::String(s)) = map.get("opened_folder") {
             if !s.is_empty() {
                 prefs.opened_folder = Some(s.clone());
@@ -161,6 +167,7 @@ impl UserPrefs {
             "font_size": self.font_size,
             "sidebar_width": self.sidebar_width,
             "session_restore": self.session_restore,
+            "close_to_tray": self.close_to_tray,
             "opened_folder": self.opened_folder,
             "recent_folders": self.recent_folders,
             "recent_files": self.recent_files,
@@ -232,6 +239,7 @@ mod tests {
             font_size: Some(15.0),
             sidebar_width: None,
             session_restore: Some(false),
+            close_to_tray: None,
             opened_folder: None,
             recent_folders: Vec::new(),
             recent_files: Vec::new(),
@@ -249,6 +257,37 @@ mod tests {
         // 非对象 → 全默认。
         let back = UserPrefs::from_json_value(&Value::Null);
         assert_eq!(back.session_restore, None);
+    }
+
+    /// 「关闭到系统托盘」开关字段 roundtrip：None = 默认关（不写入、读回 None）；
+    /// Some(false/true) 显式保留；缺字段 / 非法值回退默认。走纯函数
+    /// （`to_json_value` / `from_json_value`），不触碰真实配置路径。
+    #[test]
+    fn close_to_tray_json_roundtrip() {
+        // None（从未设置）= 默认关：不写入 JSON、读回为 None。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["close_to_tray"], Value::Null);
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.close_to_tray, None);
+
+        // Some(false/true) 显式持久化并读回（其余字段不受影响）。
+        let p = UserPrefs { close_to_tray: Some(false), ..UserPrefs::default() };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(back.close_to_tray, Some(false));
+        assert_eq!(back.theme, ThemePref::Follow);
+        assert_eq!(p.to_json_value()["close_to_tray"], serde_json::json!(false));
+        let p2 = UserPrefs { close_to_tray: Some(true), ..UserPrefs::default() };
+        assert_eq!(
+            UserPrefs::from_json_value(&p2.to_json_value()).close_to_tray,
+            Some(true)
+        );
+
+        // 非法值（非布尔）→ 回退 None。
+        let v = serde_json::json!({ "close_to_tray": "yes" });
+        assert_eq!(UserPrefs::from_json_value(&v).close_to_tray, None);
+        // 非对象 → 全默认。
+        let back = UserPrefs::from_json_value(&Value::Null);
+        assert_eq!(back.close_to_tray, None);
     }
 
     /// 「打开文件夹」根路径 roundtrip：None = 未打开（JSON 值为 null、读回 None）；

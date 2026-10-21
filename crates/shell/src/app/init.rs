@@ -76,6 +76,8 @@ impl EditorApp {
             wrap_enabled: false,
             // 会话恢复开关：None（未设置）= 默认开。
             session_restore: prefs.session_restore.unwrap_or(true),
+            // 关闭到托盘开关：None（未设置）= 默认关（点 × 直接退出）。
+            close_to_tray: prefs.close_to_tray.unwrap_or(false),
             // 会话持久化防抖（可重入、代序作废） / 恢复期间抑制标记 / 槽位指纹表（见 session 模块）。
             session_flush_debounce: SeqAfter::default(),
             session_restoring: false,
@@ -234,12 +236,40 @@ impl EditorApp {
             {
                 cx.on_app_quit(|this, cx| {
                     this.save_session(cx);
+                    // 优雅清理系统托盘（best-effort；进程退出系统也会自动清托盘图标）。
+                    tray::shutdown();
                     async {}
                 })
                 .detach();
                 // 关窗默认保存：不再注册 `on_window_should_close` 询问钩子——临时文件
                 // 由「状态变化即持久化」的连续落盘常态写在盘上，点窗口 × 直接关闭，
                 // 下次启动原样恢复（见 session 模块注释）。
+                // 关闭到托盘接线（仅主窗口；detached 拆分窗口不参与托盘隐藏/恢复）：
+                // 1) 提取主窗口原生 HWND 交给 tray crate 记录（0 = 未知）；
+                // 2) 按当前开关建/撤托盘图标（默认关仅清状态不建图标）；
+                // 3) 注册 `should_close` 钩子：开关开且非强制退出 → 隐藏到托盘并拦下关闭
+                //    （返回 false）；否则放行真正退出。显式退出路径（Ctrl+Q / 菜单退出 /
+                //    命令面板 → cx.quit，本平台走 PostQuitMessage 不触发 should_close）
+                //    天然不受影响。
+                #[cfg(windows)]
+                {
+                    use raw_window_handle::HasWindowHandle as _;
+                    if let Ok(handle) = window.window_handle()
+                        && let Ok(raw_window_handle::RawWindowHandle::Win32(win32)) =
+                            raw_window_handle::RawWindowHandle::try_from(handle)
+                    {
+                        tray::set_main_hwnd(win32.hwnd.get() as isize);
+                    }
+                    tray::set_close_to_tray(app.close_to_tray);
+                    window.on_window_should_close(cx, |_window, _cx| {
+                        if tray::should_close_to_tray() {
+                            tray::hide_main_window();
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
             }
         }
         app

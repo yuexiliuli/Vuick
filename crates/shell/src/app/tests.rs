@@ -16,4 +16,5 @@ include!("tests/panes.rs");
 include!("tests/palette.rs");
 include!("tests/splitter.rs");
 include!("tests/session.rs");
+include!("tests/close_tray.rs");
 include!("tests/recent.rs");

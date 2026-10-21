@@ -46,6 +46,7 @@ mod tabs;
 // 原私有条目在 `app` 内对整棵子树（含 app::tests）可见 → 搬入子模块后统一 `pub(super)`
 // （可见于 `app`）；原 `pub` / `pub(super)`（= crate 可见）搬入私有子模块后升为 `pub(crate)`）。
 mod chrome;
+mod close_tray;
 mod diff;
 mod init;
 mod layout;
@@ -394,6 +395,9 @@ pub struct EditorApp {
     /// 「恢复上次会话」开关（文件 → 菜单切换，随 [`UserPrefs`] 立即持久化；默认开）。
     /// 关闭时退出不写会话清单并清理遗留清单/槽位，下次启动不恢复。
     session_restore: bool,
+    /// 「关闭到系统托盘」开关（文件 → 菜单切换，随 [`UserPrefs`] 立即持久化；默认关）。
+    /// 开启时点标题栏 × / Alt+F4 隐藏到系统托盘图标（托盘菜单「退出」才真正退出）。
+    close_to_tray: bool,
     /// 会话持久化防抖（`schedule_session_flush`）：可重入、代序作废（仿侧边栏搜索
     /// 防抖 [`Self::search_debounce`]）。内容变化 300ms 停顿后才写盘一次，不逐键写盘。
     /// （读取点 `schedule_session_flush` 被 `#[cfg(not(test))]` 门控 → 测试构建报该字段

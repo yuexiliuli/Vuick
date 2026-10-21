@@ -18,6 +18,10 @@ serde_json = { workspace = true }
 # 迁入本 crate 后 app/scrollbar 内部经 crate-root 短别名消费的全部项目内 crate。
 config = { path = "../config" }
 base = { path = "../base" }
+# 系统托盘（Windows）：关闭到托盘 / 托盘恢复 / 托盘退出。非 windows 目标为 no-op。
+tray = { path = "../tray" }
+# 提取主窗口原生 HWND 交给 tray crate（复用 workspace 已有 raw-window-handle=0.6）。
+raw-window-handle = { workspace = true }
 syntax = { path = "../syntax" }
 ui = { path = "../ui" }
 editor = { path = "../editor" }
