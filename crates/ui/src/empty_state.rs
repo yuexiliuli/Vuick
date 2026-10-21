@@ -1,9 +1,9 @@
 //! 空状态占位：无标签页 / 空目录 / 无搜索命中时的微软风自绘占位（插图 + 文案 + 入口）。
 //!
-//! 插图采用「文件夹 + 打开的文档」简笔线性画，全部用 `div` 拼装（圆角矩形 + 圆角细条），
-//! **零图片资产、零新增依赖**；三层灰阶（文件夹灰底 / 文档纸面 / 正文灰线）+ 蓝色标题条
-//! 点缀，颜色一律取自 [`crate::ui::theme::ColorScheme`] 语义 token，亮暗自动适配，
-//! 与 P2 图标（1.5px Fluent 线性描边）共用同一套灰蓝语言。
+//! 插图采用「变色龙吉祥物」扁平 3D 风 App 图标：圆角方形浅蓝渐变底 + 青蓝圆身变色龙
+//! （巨大圆形单眼 + 螺旋卷尾），手绘全彩矢量 SVG（resvg 全彩栅格化 + `img()` 上屏），
+//! 平滑贝塞尔曲线替代 div 拼装，观感大幅提升且零图片资产文件；固定品牌色板
+//! （亮暗主题一致），青蓝色调呼应「代码/文档/媒体多格式阅读器」的清新气质。
 //!
 //! 两个入口：
 //! - [`empty_state_hero`]：正文区整屏空态（零选项卡欢迎页）——160×120 固定
@@ -12,24 +12,38 @@
 //! - [`compact_empty_state`]：侧栏窄面板空态（空目录 / 无搜索命中）——小号灰图标 +
 //!   弱化文案，与正文区空态同款灰阶视觉。
 
+use std::sync::{Arc, OnceLock};
+
 use gpui::{
-    AnimationExt, App, Hsla, InteractiveElement, IntoElement, ParentElement, Styled, div, px,
+    AnimationExt, App, Hsla, ImageSource, InteractiveElement, IntoElement, ParentElement, Styled,
+    div, img, px,
 };
 
 use crate::ui::icon::{Icon, IconName};
 use crate::ui::motion::hover_spring;
 use crate::ui::theme::Theme;
 
-/// 空态插图（固定 160×120）：文件夹底座 + 打开的文档（三层灰阶 + 蓝色标题条点缀）。
-pub(crate) fn empty_illustration(cx: &mut App) -> gpui::AnyElement {
-    let c = Theme::global(cx).colors;
-    // 灰阶与点缀统一取语义 token：文件夹灰底 / 文档纸面 + 描边 / 正文灰线 / 强调蓝。
-    let folder: Hsla = c.selected_bg.into();
-    let border: Hsla = c.border.into();
-    let paper: Hsla = c.bg.into();
-    let line: Hsla = c.fg_disabled.into();
-    let accent: Hsla = c.accent.into();
+/// 变色龙吉祥物全彩 SVG（340×326）：用户原图经「降采样栅格化 → 非底色 kmeans 5 色
+/// posterize → potrace 逐色贝塞尔拟合」（1442 段三次贝塞尔，转角均值 46.7°→15°，
+/// 颜色保持同一青蓝族），比像素折线版「线条顺滑不凌乱」；单色系干净清爽，
+/// 资产存于 `assets/icon-chameleon.svg`；resvg 全彩栅格化后 `img()` 上屏。
+const CHAMELEON_SVG: &[u8] = include_str!("../assets/icon-chameleon.svg").as_bytes();
 
+/// 惰性栅格化变色龙 SVG → 渲染图像（进程内仅一次；resvg 全彩、含渐变/阴影/柔光）。
+fn chameleon_render(cx: &mut App) -> Arc<gpui::RenderImage> {
+    static RENDER: OnceLock<Arc<gpui::RenderImage>> = OnceLock::new();
+    RENDER
+        .get_or_init(|| {
+            cx.svg_renderer()
+                .render_single_frame(CHAMELEON_SVG, 1.0)
+                .expect("变色龙 SVG 栅格化失败")
+        })
+        .clone()
+}
+
+/// 空态插图（固定 160×120）：变色龙吉祥物 App 图标（自含圆角浅蓝渐变底），
+/// 固定品牌色板双主题一致；SVG 全彩矢量一次栅格化后 `img()` 上屏。
+pub(crate) fn empty_illustration(cx: &mut App) -> gpui::AnyElement {
     div()
         .id("empty-illustration")
         .debug_selector(|| "empty-illustration".into())
@@ -37,107 +51,20 @@ pub(crate) fn empty_illustration(cx: &mut App) -> gpui::AnyElement {
         .w(px(160.))
         .h(px(120.))
         .flex_shrink_0()
-        // 文件夹底层：圆角矩形灰底 + 描边。
+        .flex()
+        .items_center()
+        .justify_center()
         .child(
             div()
-                .absolute()
-                .left(px(18.))
-                .top(px(50.))
-                .w(px(124.))
-                .h(px(46.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(border)
-                .bg(folder)
-                .into_any_element(),
-        )
-        // 文件夹拉手：盖在底层顶边之上（消掉该段的顶边框线），只描顶/左/右三边。
-        .child(
-            div()
-                .absolute()
-                .left(px(18.))
-                .top(px(40.))
-                .w(px(34.))
-                .h(px(10.))
-                .rounded_tl(px(4.))
-                .rounded_tr(px(4.))
-                .border_t_1()
-                .border_l_1()
-                .border_r_1()
-                .border_color(border)
-                .bg(folder)
-                .into_any_element(),
-        )
-        // 文档页：前层纸面（＝面板底色），圆角描边，浮在文件夹之上。
-        .child(
-            div()
-                .absolute()
-                .left(px(54.))
-                .top(px(22.))
-                .w(px(56.))
-                .h(px(82.))
-                .rounded(px(6.))
-                .border_1()
-                .border_color(border)
-                .bg(paper)
-                .into_any_element(),
-        )
-        // 文档标题强调条（蓝色点缀）。
-        .child(
-            div()
-                .absolute()
-                .left(px(64.))
-                .top(px(30.))
-                .w(px(30.))
-                .h(px(4.))
-                .rounded_full()
-                .bg(accent)
-                .into_any_element(),
-        )
-        // 文档正文灰线（三层灰阶的最深一档）。
-        .child(
-            div()
-                .absolute()
-                .left(px(64.))
-                .top(px(40.))
-                .w(px(36.))
-                .h(px(3.))
-                .rounded_full()
-                .bg(line)
-                .into_any_element(),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(64.))
-                .top(px(47.))
-                .w(px(28.))
-                .h(px(3.))
-                .rounded_full()
-                .bg(line)
-                .into_any_element(),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(64.))
-                .top(px(54.))
-                .w(px(36.))
-                .h(px(3.))
-                .rounded_full()
-                .bg(line)
-                .into_any_element(),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(64.))
-                .top(px(61.))
-                .w(px(22.))
-                .h(px(3.))
-                .rounded_full()
-                .bg(line)
-                .into_any_element(),
+                .id("chameleon-icon")
+                .debug_selector(|| "chameleon-icon".into())
+                .w(px(112.))
+                .h(px(107.))
+                .child(
+                    img(ImageSource::Render(chameleon_render(cx)))
+                        .w(px(112.))
+                        .h(px(107.)),
+                ),
         )
         .into_any_element()
 }
@@ -297,6 +224,10 @@ mod tests {
             assert!(
                 illus.size.width > px(0.) && illus.size.height > px(0.),
                 "插图应有尺寸（{dark}）：{illus:?}"
+            );
+            assert!(
+                cx.debug_bounds("chameleon-icon").is_some(),
+                "变色龙图标应渲染（{dark}）"
             );
             assert!(
                 cx.debug_bounds("empty-state").is_some(),

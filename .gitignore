@@ -2,6 +2,8 @@ target/
 .kilo
 .code-review-graph/
 assets/
+# 仅放开欢迎页图标资产（其余 assets/ 目录仍忽略）
+!crates/ui/assets/
 kilo.json
 records/
 /resources/
