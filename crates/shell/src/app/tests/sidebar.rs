@@ -793,6 +793,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
+        fs_clear_restored_folder(&app, cx);
         let a = std::env::temp_dir().join("gpui-sz-a.md");
         let b = std::env::temp_dir().join("gpui-sz-b.md");
         std::fs::write(&a, "# 甲\n阿尔法内容仅此一处\n").unwrap();
@@ -862,6 +863,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
+        fs_clear_restored_folder(&app, cx);
         let f = std::env::temp_dir().join("gpui-sz-cache.md");
         std::fs::write(&f, "# 甲\n阿尔法 shanghai 内容\n真义行 beta\n").unwrap();
         cx.update(|window, cx| {
@@ -961,6 +963,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
+        fs_clear_restored_folder(&app, cx);
         let txt = std::env::temp_dir().join("gpui-sz-debounce.txt");
         std::fs::write(&txt, "第一行 alpha\n预览 beta\n预览编辑 gamma\ndelta\n").unwrap();
         cx.update(|window, cx| {
@@ -1638,5 +1641,1304 @@
             "搜索滚动条叠层应有非零高度，实际={search_bar:?}"
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// 文件夹级搜索测试辅助：泵后台扫描直到完成并返回最终 `FolderSearchScan` 克隆。
+    /// （轮询上限内未完成 → panic，避免死循环挂死测试。）
+    fn fs_wait_scan(
+        app: &gpui::Entity<EditorApp>,
+        cx: &mut VisualTestContext,
+        expect_min_hits: usize,
+    ) -> crate::app::sidebar::FolderSearchScan {
+        let mut last: Option<crate::app::sidebar::FolderSearchScan> = None;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let snap = cx.update(|_w, cx| app.read(cx).folder_search.clone());
+            if let Some(s) = &snap {
+                last = Some((**s).clone());
+                if !s.running && s.total_hits >= expect_min_hits {
+                    return (**s).clone();
+                }
+            }
+        }
+        panic!(
+            "文件夹扫描未在轮询上限内完成：last={:?}",
+            last.as_ref()
+                .map(|s| (s.root.clone(), s.total_hits, s.running))
+        );
+    }
+
+    /// 测试隔离：开发者真实 `%APPDATA%\gpui-editor\config.json` 可能带「已打开文件夹」
+    /// 且 `config` crate 未做 `cfg(test)` 门控（AGENTS K8）——会使「默认整个文件夹」
+    /// 意外生效。搜索侧测试前置清空根，保证在「未打开文件夹」环境下运行。
+    fn fs_clear_restored_folder(app: &gpui::Entity<EditorApp>, cx: &mut VisualTestContext) {
+        cx.update(|_w, cx| {
+            app.update(cx, |a, _cx| {
+                a.sidebar.files.set_root(None);
+            });
+        });
+    }
+
+    /// 文件夹级搜索：范围 tab 默认规则——未打开文件夹时默认「当前文件」且「整个文件夹」
+    /// 不可用（点击仅提示）；打开文件夹后**默认选中「整个文件夹」**；手动点「当前文件」
+    /// 后保持手动选择。
+    #[gpui::test]
+    async fn sidebar_search_folder_scope_default_and_tabs(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        // 打开搜索面板（无文件夹）→ 两个范围 tab 都在，生效范围 = 当前文件
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-search-scope").is_some(),
+            "范围切换 tab 条应渲染"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-search-scope-current").is_some()
+                && cx.debug_bounds("sidebar-search-scope-folder").is_some(),
+            "「当前文件」「整个文件夹」两个 tab 都应渲染"
+        );
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).effective_search_scope()),
+            crate::app::sidebar::SearchScopeTab::CurrentFile,
+            "无文件夹时默认生效范围 = 当前文件"
+        );
+        // 点击「整个文件夹」（无文件夹）→ 仅提示，不切换
+        let folder_tab = cx
+            .debug_bounds("sidebar-search-scope-folder")
+            .expect("应渲染「整个文件夹」tab");
+        cx.simulate_click(folder_tab.center(), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).effective_search_scope()),
+            crate::app::sidebar::SearchScopeTab::CurrentFile,
+            "无文件夹时点「整个文件夹」不应切换范围（保持只搜当前文件）"
+        );
+        let hint = cx.update(|_w, cx| app.read(cx).status.clone());
+        assert!(
+            hint.contains("先打开文件夹"),
+            "无文件夹点「整个文件夹」应提示先打开文件夹，实际={hint}"
+        );
+
+        // 打开文件夹 → 生效范围自动 = 整个文件夹
+        let dir = std::env::temp_dir().join(format!("gpui-fs-scope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "needle one\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(dir.clone(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).effective_search_scope()),
+            crate::app::sidebar::SearchScopeTab::Folder,
+            "已打开文件夹时默认生效范围 = 整个文件夹"
+        );
+        // 手动点「当前文件」→ 手动选择被记录（不再自动跟随）
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let current_tab = cx
+            .debug_bounds("sidebar-search-scope-current")
+            .expect("应渲染「当前文件」tab");
+        cx.simulate_click(current_tab.center(), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).effective_search_scope()),
+            crate::app::sidebar::SearchScopeTab::CurrentFile,
+            "手动点「当前文件」后应保持当前文件（manual=true）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件夹级搜索：递归跨文件命中**按文件分组** + 词频计数 + 跳过规则
+    /// （.git / target / 二进制 NUL 文件不出现在结果）。
+    #[gpui::test]
+    async fn sidebar_search_folder_groups_results_and_skips(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!("gpui-fs-grp-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("a.txt"), "alpha needle 一处\n").unwrap();
+        std::fs::write(dir.join("b.md"), "beta needle one\ngamma needle two\n").unwrap();
+        std::fs::write(dir.join("sub/c.txt"), "sub needle 深处\n").unwrap();
+        std::fs::write(dir.join(".git/config"), "needle 不应命中（git）\n").unwrap();
+        std::fs::write(dir.join("target/out.txt"), "needle 不应命中（target）\n").unwrap();
+        std::fs::write(
+            dir.join("bin.dat"),
+            vec![b'n', b'e', b'e', b'd', b'l', b'e', 0u8, b'g', b'o'],
+        )
+        .unwrap();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(dir.clone(), window, cx));
+        });
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("needle", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let scan = fs_wait_scan(&app, cx, 4);
+        assert!(!scan.running, "扫描应已完成");
+        assert_eq!(scan.total_hits, 4, "应命中 4 处（a/b/sub，两类跳过）");
+        assert_eq!(scan.files.len(), 3, "应命中 3 个文件（按文件分组）");
+        let names: Vec<String> = scan
+            .files
+            .iter()
+            .map(|f| {
+                f.path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "a.txt") && names.iter().any(|n| n == "b.md")
+                && names.iter().any(|n| n == "c.txt"),
+            "应命中 a.txt / b.md / sub/c.txt，实际={names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "config" || n == "out.txt" || n == "bin.dat"),
+            ".git/target/二进制 均不应出现在结果，实际={names:?}"
+        );
+        let b_hits = scan
+            .files
+            .iter()
+            .find(|f| f.path.file_name().is_some_and(|s| s == "b.md"))
+            .map(|f| f.hits.len())
+            .unwrap();
+        assert_eq!(b_hits, 2, "b.md 词频应 = 2（两行各 1 处）");
+        // 渲染侧：文件头行 + 命中行都真实渲染
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-folder-file-0").is_some(),
+            "首个文件分组头应渲染"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-search-folder-hit-0-0").is_some(),
+            "首个命中行应渲染"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-folder-search-summary").is_some(),
+            "文件夹搜索汇总头应渲染"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件夹级搜索：点击命中行 → 未打开则新建选项卡打开 + 光标定位到命中行；
+    /// 再点同一命中 → 激活既有选项卡（不新建）且光标仍在命中行。
+    #[gpui::test]
+    async fn sidebar_search_folder_click_jumps_to_line(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!("gpui-fs-jump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("jump.txt");
+        std::fs::write(&target, "第一行 alpha\n第二行 beta\n第三行 needle 目标\n第四行\n")
+            .unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(dir.clone(), window, cx));
+        });
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("needle", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        fs_wait_scan(&app, cx, 1);
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let hit = cx
+            .debug_bounds("sidebar-search-folder-hit-0-0")
+            .expect("应渲染文件夹命中行");
+        cx.simulate_click(hit.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (tabs_after, ti, pos) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let ti = a.active_tab;
+            let pos = a.tabs[ti].editor.read(cx).cursor_position();
+            (a.tabs.len(), ti, pos)
+        });
+        assert_eq!(
+            tabs_after,
+            tabs_before + 1,
+            "点击未打开文件应新建 1 个选项卡"
+        );
+        let opened = cx.update(|_w, cx| {
+            app.read(cx).tabs[ti].file_path.as_deref() == Some(target.as_path())
+        });
+        assert!(opened, "点击应打开 jump.txt 并激活");
+        assert_eq!(pos.0, 2, "光标应落在命中行（0 基第 2 行）");
+        // 再点同一命中行：不新建选项卡，激活既有并仍定位
+        let tabs_before2 = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let hit = cx
+            .debug_bounds("sidebar-search-folder-hit-0-0")
+            .expect("命中行仍在");
+        cx.simulate_click(hit.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (tabs_after2, row2) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let ti = a.active_tab;
+            let pos = a.tabs[ti].editor.read(cx).cursor_position();
+            (a.tabs.len(), pos.0)
+        });
+        assert_eq!(tabs_after2, tabs_before2, "再次点击已打开文件不应新建选项卡");
+        assert_eq!(row2, 2, "再次点击后光标仍应在命中行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件夹级搜索：命中条数达 [`config::limits::FOLDER_SEARCH_RESULT_CAP`]（500）
+    /// 即截断并标记 truncated（不无限累积）。
+    #[gpui::test]
+    async fn sidebar_search_folder_truncates_at_cap(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!("gpui-fs-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 80 文件 × 每文件 7 行命中 = 560 > 500 → 必截断
+        for i in 0..80 {
+            let mut body = String::new();
+            for j in 0..7 {
+                body.push_str(&format!("第{j}行 needle {i}\n"));
+            }
+            std::fs::write(dir.join(format!("f{i:03}.txt")), &body).unwrap();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(dir.clone(), window, cx));
+        });
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("needle", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let scan = fs_wait_scan(&app, cx, 500);
+        assert!(scan.truncated, "达上限应标记截断");
+        assert_eq!(
+            scan.total_hits,
+            config::limits::FOLDER_SEARCH_RESULT_CAP,
+            "截断时总命中数应恰为上限 500"
+        );
+        assert!(
+            scan.files.len() <= config::limits::FOLDER_SEARCH_RESULT_CAP,
+            "分组行数不应超过上限"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件夹级搜索：无命中 → 空态；清空查询 → 回到输入提示；切换文件夹 → 旧结果
+    /// 失效、按新根重扫；关闭文件夹（根失效）→ 「先打开文件夹」提示。
+    #[gpui::test]
+    async fn sidebar_search_folder_empty_clear_and_invalidate(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir_a = std::env::temp_dir().join(format!("gpui-fs-inv-a-{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("gpui-fs-inv-b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("hit.txt"), "alpha needle only\n").unwrap();
+        std::fs::write(dir_b.join("other.txt"), "无命中内容\n").unwrap();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(dir_a.clone(), window, cx));
+        });
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        // 搜索「needle」→ A 有命中
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("needle", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let scan_a = fs_wait_scan(&app, cx, 1);
+        assert_eq!(scan_a.total_hits, 1, "A 应有 1 处命中");
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-search-folder-hit-0-0").is_some(),
+            "A 的命中行应渲染"
+        );
+
+        // 清空查询（重扫空 → 不显示结果，回到输入提示）
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-search-hint").is_some(),
+            "清空查询应回到输入提示（空态）"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-search-folder-hit-0-0").is_none(),
+            "清空查询后不应渲染旧命中行"
+        );
+
+        // 切到 B 文件夹 → 旧结果失效，按新根重扫（无命中 → 空态）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(dir_b.clone(), window, cx));
+        });
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("needle", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let scan_b = fs_wait_scan(&app, cx, 0);
+        assert_eq!(
+            scan_b.root.as_deref(),
+            Some(dir_b.as_path()),
+            "换根后应按新根重扫"
+        );
+        assert_eq!(scan_b.total_hits, 0, "B 无命中");
+        assert!(
+            cx.debug_bounds("sidebar-search-empty").is_some(),
+            "B 无命中应显示空态"
+        );
+
+        // 先手动点到「整个文件夹」（B 在 → 可用），再关闭文件夹（根失效 → None）
+        // → 范围仍手动是文件夹 → 显示「先打开文件夹」提示且不搜当前文件。
+        let folder_tab = cx
+            .debug_bounds("sidebar-search-scope-folder")
+            .expect("应渲染「整个文件夹」tab");
+        cx.simulate_click(folder_tab.center(), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).effective_search_scope()),
+            crate::app::sidebar::SearchScopeTab::Folder,
+            "点「整个文件夹」后范围应切到文件夹"
+        );
+        cx.update(|window, cx| {
+            app.update(
+                cx,
+                |app, cx| app.open_folder_path(dir_a.join("不存在").to_path_buf(), window, cx),
+            );
+        });
+        // 无效路径不切视图（仍停在搜索面板）：直接渲染，无需再 toggle（重复 toggle 会收起面板）。
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).sidebar.files.root.clone()),
+            None,
+            "失效路径应清空文件夹根"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-search-empty").is_some(),
+            "无文件夹 + 文件夹范围应显示「先打开文件夹」空态"
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    // -----------------------------------------------------------------
+    // WP-C：文件树增强（过滤 / 右键菜单 / 新建 / 重命名 / 删除）
+    // -----------------------------------------------------------------
+
+    /// 泵文件树布局缓存就位（过滤词提交后重收集完成 + 无在途子项扫描）。
+    fn ft_wait_layout(app: &gpui::Entity<EditorApp>, cx: &mut VisualTestContext) {
+        for _ in 0..120 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let ready = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                a.sidebar.files.pending.is_empty() && a.sidebar.files_layout.is_some()
+            });
+            if ready {
+                return;
+            }
+        }
+        panic!("文件树布局缓存未在轮询上限内就位");
+    }
+
+    /// `file_tree_invalidate` 后的树刷新等待：父目录重扫完成且出现名字 `name` 的子项。
+    fn ft_wait_child(
+        app: &gpui::Entity<EditorApp>,
+        cx: &mut VisualTestContext,
+        dir: &std::path::Path,
+        name: &str,
+    ) {
+        for _ in 0..120 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let found = cx.update(|_w, cx| {
+                app.read(cx)
+                    .sidebar
+                    .files
+                    .children
+                    .get(dir)
+                    .is_some_and(|cs| cs.iter().any(|c| c.name == name))
+            });
+            if found {
+                return;
+            }
+        }
+        panic!("树刷新后未出现子项 {name}");
+    }
+
+    /// 打开文件夹 → 文件视图就绪（行序：root=0，目录优先、组内名字排序）。
+    fn ft_open_folder(
+        app: &gpui::Entity<EditorApp>,
+        cx: &mut VisualTestContext,
+        dir: &std::path::Path,
+    ) {
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Files, cx);
+            });
+            app.update(cx, |app, cx| app.open_folder_path(dir.to_path_buf(), window, cx));
+        });
+        ft_wait_tree_loaded(app, cx, dir);
+        ft_wait_layout(app, cx);
+    }
+
+    /// 文件树过滤：typeahead 按名字（不区分大小写子串）过滤含目录、清空恢复全树。
+    #[gpui::test]
+    async fn sidebar_file_filter_typeahead_and_clear(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-filter-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        std::fs::write(dir.join("alpha.txt"), "A").unwrap();
+        std::fs::write(dir.join("beta.md"), "B").unwrap();
+        std::fs::write(dir.join("subdir/gamma.cpp"), "C").unwrap();
+        ft_open_folder(&app, cx, &dir);
+
+        let root_name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let labels = |cx: &mut VisualTestContext| {
+            cx.update(|_w, cx| {
+                app.read(cx)
+                    .sidebar
+                    .files_layout
+                    .as_ref()
+                    .expect("布局应已生成")
+                    .1
+                    .iter()
+                    .map(|r| r.label.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let all = labels(cx);
+        assert!(all.contains(&"subdir".to_string()) && all.contains(&"alpha.txt".to_string()));
+        // 过滤 "be"（Beta 子串，大小写不敏感）→ 只剩 beta.md（根恒在），subdir/alpha 隐藏。
+        cx.update(|window, cx| {
+            let input = app.read(cx).files_filter_state.clone();
+            input.update(cx, |s, cx| s.set_value("be", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(150));
+        ft_wait_layout(&app, cx);
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).files_filter.clone()),
+            "be",
+            "过滤词应防抖提交"
+        );
+        let filtered = labels(cx);
+        assert!(filtered.contains(&root_name), "根行恒可见");
+        assert!(filtered.contains(&"beta.md".to_string()));
+        assert!(
+            !filtered.contains(&"alpha.txt".to_string()) && !filtered.contains(&"subdir".to_string()),
+            "不匹配条目（含目录）应隐藏，实际={filtered:?}"
+        );
+        // 清空 → 恢复全树。
+        cx.update(|window, cx| {
+            let input = app.read(cx).files_filter_state.clone();
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(150));
+        ft_wait_layout(&app, cx);
+        let restored = labels(cx);
+        assert!(restored.contains(&"alpha.txt".to_string()) && restored.contains(&"subdir".to_string()));
+        // 过滤无匹配 → 「无匹配结果」空态文案（仅剩根 + 占位）。
+        cx.update(|window, cx| {
+            let input = app.read(cx).files_filter_state.clone();
+            input.update(cx, |s, cx| s.set_value("zzz_nomatch", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(150));
+        ft_wait_layout(&app, cx);
+        let none = labels(cx);
+        assert!(
+            none.contains(&"无匹配结果".to_string()),
+            "过滤无匹配应显示空态文案，实际={none:?}"
+        );
+        assert_eq!(none.len(), 2, "只剩根行 + 无匹配占位，实际={none:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件树右键菜单按适用集区分：文件行 = 重命名/删除（无新建）；目录行 = 新建文件/
+    /// 新建文件夹/重命名/删除。右键不误触发行点击（不打开文件）。
+    #[gpui::test]
+    async fn sidebar_file_right_click_menu_by_kind(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-rclick-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        ft_open_folder(&app, cx, &dir);
+        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+
+        // 文件行（行序 root=0、subdir=1、a.txt=2）右键 → 只有重命名/删除。
+        let file_row = cx.debug_bounds("sidebar-file-row-2").expect("a.txt 行应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: file_row.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(cx.debug_bounds("file-tree-menu").is_some(), "右键文件树应弹菜单");
+        assert!(cx.debug_bounds("file-tree-menu-rename").is_some());
+        assert!(cx.debug_bounds("file-tree-menu-delete").is_some());
+        assert!(
+            cx.debug_bounds("file-tree-menu-new-file").is_none()
+                && cx.debug_bounds("file-tree-menu-new-folder").is_none(),
+            "文件行不应出现新建类菜单项"
+        );
+        // 右键不误触发行点击（未打开任何文件 / 未切换选项卡）。
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            tabs_before,
+            "右键文件行不应触发行点击打开"
+        );
+        // Esc 关闭当前菜单。
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 目录行（subdir=1）右键 → 有新建文件/文件夹。
+        let dir_row = cx.debug_bounds("sidebar-file-row-1").expect("subdir 行应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: dir_row.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(cx.debug_bounds("file-tree-menu-new-file").is_some(), "目录行应有「新建文件」");
+        assert!(cx.debug_bounds("file-tree-menu-new-folder").is_some(), "目录行应有「新建文件夹」");
+        assert!(cx.debug_bounds("file-tree-menu-rename").is_some());
+        assert!(cx.debug_bounds("file-tree-menu-delete").is_some());
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新建文件：右键目录 → 新建文件… → 预填默认名 → 改名回车 → 磁盘创建 + **自动打开
+    /// 成选项卡** + 树刷新；重名 → 内联提示不静默；Esc 关闭。
+    #[gpui::test]
+    async fn sidebar_file_new_file_opens_and_dup_hint(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("existing.txt"), "E").unwrap();
+        ft_open_folder(&app, cx, &dir);
+
+        // 右键根目录行（0）→ 新建文件…
+        let root_row = cx.debug_bounds("sidebar-file-row-0").expect("根行应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: root_row.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let new_item = cx.debug_bounds("file-tree-menu-new-file").expect("应有新建文件项");
+        cx.simulate_click(new_item.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(cx.debug_bounds("file-tree-prompt").is_some(), "应弹出输入层");
+        let pv = cx.update(|_w, cx| {
+            let p = app
+                .read(cx)
+                .file_tree_prompt
+                .as_ref()
+                .expect("弹层应打开")
+                .read(cx);
+            (p.input_value(cx), p.kind().clone())
+        });
+        assert_eq!(pv.0, "新建文件.md", "应预填默认名");
+        assert!(
+            matches!(pv.1, crate::app::file_tree_prompt::FileTreePromptKind::NewFile { .. }),
+            "应为新建文件类型"
+        );
+        // 改名 hello.txt → 回车提交。
+        let target = dir.join("hello.txt");
+        let prompt_input = cx.update(|_w, cx| {
+            let p = app
+                .read(cx)
+                .file_tree_prompt
+                .as_ref()
+                .unwrap()
+                .read(cx);
+            p.input_entity()
+        });
+        cx.update(|window, cx| {
+            prompt_input.update(cx, |s, cx| s.set_value("hello.txt", window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(target.is_file(), "应创建 hello.txt");
+        assert!(
+            cx.update(|_w, cx| app.read(cx).file_tree_prompt.is_none()),
+            "提交成功应关闭弹层"
+        );
+        ft_wait_child(&app, cx, &dir, "hello.txt");
+        assert!(
+            cx.update(|_w, cx| {
+                app.read(cx)
+                    .tabs
+                    .iter()
+                    .any(|t| t.file_path.as_deref() == Some(target.as_path()))
+            }),
+            "新建文件应自动打开成选项卡"
+        );
+
+        // 重名：再次新建同名 → 内联提示不静默。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file_tree_prompt(
+                    crate::app::file_tree_prompt::FileTreePromptKind::NewFile {
+                        parent: dir.clone(),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let prompt_input2 = cx.update(|_w, cx| {
+            app.read(cx).file_tree_prompt.as_ref().unwrap().read(cx).input_entity()
+        });
+        cx.update(|window, cx| {
+            prompt_input2.update(cx, |s, cx| s.set_value("hello.txt", window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("file-tree-prompt-hint").is_some(),
+            "重名应内联提示"
+        );
+        // Esc 取消。
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| app.read(cx).file_tree_prompt.is_none()),
+            "Esc 应关闭弹层"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件树输入弹层按钮：点「确定」提交（与回车同语义，预填默认名创建）；
+    /// 点「取消」关闭且不创建。
+    #[gpui::test]
+    async fn sidebar_file_prompt_buttons_submit_and_cancel(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-btn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ft_open_folder(&app, cx, &dir);
+        // 新建文件：点「确定」→ 用预填默认名提交 → 创建 + 自动打开 + 弹层关闭。
+        cx.update(|window, cx| {
+            app.update(
+                cx,
+                |app, cx| {
+                    app.open_file_tree_prompt(
+                        crate::app::file_tree_prompt::FileTreePromptKind::NewFile {
+                            parent: dir.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                },
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let ok = cx
+            .debug_bounds("file-tree-prompt-ok")
+            .expect("确定按钮应渲染");
+        cx.simulate_click(ok.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            dir.join("新建文件.md").is_file(),
+            "点确定应创建默认名文件"
+        );
+        assert!(
+            cx.update(|_w, cx| app.read(cx).file_tree_prompt.is_none()),
+            "提交成功应关闭弹层"
+        );
+        // 新建文件夹：点「取消」→ 关闭且不创建。
+        cx.update(|window, cx| {
+            app.update(
+                cx,
+                |app, cx| {
+                    app.open_file_tree_prompt(
+                        crate::app::file_tree_prompt::FileTreePromptKind::NewFolder {
+                            parent: dir.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                },
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let cancel = cx
+            .debug_bounds("file-tree-prompt-cancel")
+            .expect("取消按钮应渲染");
+        cx.simulate_click(cancel.center(), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| app.read(cx).file_tree_prompt.is_none()),
+            "点取消应关闭弹层"
+        );
+        assert!(
+            !dir.join("新建文件夹").exists(),
+            "取消不应创建文件或文件夹"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新建文件夹：右键目录 → 新建文件夹… → 回车提交 → 磁盘创建 + 树刷新。
+    #[gpui::test]
+    async fn sidebar_file_new_folder_creates_and_tree_refreshes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-nfold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ft_open_folder(&app, cx, &dir);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file_tree_prompt(
+                    crate::app::file_tree_prompt::FileTreePromptKind::NewFolder {
+                        parent: dir.clone(),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let pv = cx.update(|_w, cx| {
+            app.read(cx).file_tree_prompt.as_ref().unwrap().read(cx).input_value(cx)
+        });
+        assert_eq!(pv, "新建文件夹", "应预填默认名");
+        let prompt_input = cx.update(|_w, cx| {
+            app.read(cx).file_tree_prompt.as_ref().unwrap().read(cx).input_entity()
+        });
+        cx.update(|window, cx| {
+            prompt_input.update(cx, |s, cx| s.set_value("新目录", window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(dir.join("新目录").is_dir(), "应创建新目录");
+        ft_wait_child(&app, cx, &dir, "新目录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 重命名：右键 → 重命名… → 预填当前名 → 改名回车 → 磁盘改名 + **已打开选项卡路径
+    /// 同步** + 会话清单记录新路径 + 树刷新；目标已存在 → 内联提示。
+    #[gpui::test]
+    async fn sidebar_file_rename_syncs_tab_and_session(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-ren-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_path = dir.join("a.txt");
+        let new_path = dir.join("b.md");
+        std::fs::write(&old_path, "AAA").unwrap();
+        std::fs::write(dir.join("occupied.txt"), "OCC").unwrap();
+        ft_open_folder(&app, cx, &dir);
+        // 打开 a.txt 作为活动选项卡。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_path_or_activate(&old_path, window, cx);
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| {
+                app.read(cx)
+                    .tabs
+                    .iter()
+                    .any(|t| t.file_path.as_deref() == Some(old_path.as_path()))
+            }),
+            "a.txt 应已打开"
+        );
+
+        // 右键 a.txt 行（行序 root=0、a.txt=1——无子目录）→ 重命名…
+        let a_row = cx.debug_bounds("sidebar-file-row-1").expect("a.txt 行应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: a_row.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let ren_item = cx.debug_bounds("file-tree-menu-rename").expect("应有重命名项");
+        cx.simulate_click(ren_item.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let pv = cx.update(|_w, cx| {
+            app.read(cx).file_tree_prompt.as_ref().unwrap().read(cx).input_value(cx)
+        });
+        assert_eq!(pv, "a.txt", "应预填当前文件名");
+        let pi = cx.update(|_w, cx| {
+            app.read(cx).file_tree_prompt.as_ref().unwrap().read(cx).input_entity()
+        });
+        cx.update(|window, cx| {
+            pi.update(cx, |s, cx| s.set_value("b.md", window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(!old_path.exists() && new_path.is_file(), "磁盘应改名 a.txt → b.md");
+        assert!(
+            cx.update(|_w, cx| {
+                app.read(cx)
+                    .tabs
+                    .iter()
+                    .any(|t| t.file_path.as_deref() == Some(new_path.as_path()))
+            }),
+            "已打开选项卡路径应同步为 b.md"
+        );
+        ft_wait_child(&app, cx, &dir, "b.md");
+        // 树刷新：布局行里有 b.md、没有 a.txt。
+        let labels = cx.update(|_w, cx| {
+            app.read(cx)
+                .sidebar
+                .files_layout
+                .as_ref()
+                .unwrap()
+                .1
+                .iter()
+                .map(|r| r.label.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert!(labels.contains(&"b.md".to_string()));
+        assert!(!labels.contains(&"a.txt".to_string()));
+
+        // 会话持久化一致：显式目录 save_session_to → 清单应记录新路径。
+        let sess = std::env::temp_dir().join(format!("gpui-ft-ren-sess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sess);
+        std::fs::create_dir_all(&sess).unwrap();
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                crate::app::session::save_session_to(app, &sess, cx);
+            });
+        });
+        let manifest = crate::app::session::read_manifest(&sess).expect("清单应写入");
+        assert!(
+            manifest.tabs.iter().any(|t| {
+                matches!(
+                    t,
+                    crate::app::session::SessionTab::File { path }
+                        if path == &new_path
+                )
+            }),
+            "会话清单应记录重命名后的新路径"
+        );
+        let _ = std::fs::remove_dir_all(&sess);
+
+        // 目标已存在 → 内联提示（重命名到 occupied.txt）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file_tree_prompt(
+                    crate::app::file_tree_prompt::FileTreePromptKind::Rename {
+                        path: new_path.clone(),
+                        is_dir: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let pi2 = cx.update(|_w, cx| {
+            app.read(cx).file_tree_prompt.as_ref().unwrap().read(cx).input_entity()
+        });
+        cx.update(|window, cx| {
+            pi2.update(cx, |s, cx| s.set_value("occupied.txt", window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("file-tree-prompt-hint").is_some(),
+            "目标已存在应内联提示"
+        );
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 删除：原生确认后 → 干净受影响选项卡同步关闭 + 磁盘删除 + 树刷新；
+    /// 有未保存修改的受影响选项卡 → 不删磁盘（不可静默丢内容），提示后取消。
+    #[gpui::test]
+    async fn sidebar_file_delete_closes_tab_and_dirty_abort(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d_path = dir.join("d.txt");
+        let dirty_path = dir.join("dirty.txt");
+        std::fs::write(&d_path, "D").unwrap();
+        std::fs::write(&dirty_path, "DIRTY").unwrap();
+        ft_open_folder(&app, cx, &dir);
+        // 打开 d.txt 与 dirty.txt 两个选项卡。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_path_or_activate(&d_path, window, cx);
+                app.open_path_or_activate(&dirty_path, window, cx);
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        assert!(
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                a.tabs
+                    .iter()
+                    .any(|t| t.file_path.as_deref() == Some(d_path.as_path()))
+            }),
+            "d.txt 已打开"
+        );
+
+        // —— 干净文件删除：执行删除入口（原生确认框已由 `file_tree_delete_request`
+        // 在真实环境弹，headless 直接驱动确认后的执行体）——
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.file_tree_delete(&d_path, window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(!d_path.exists(), "确认后干净文件应从磁盘删除");
+        assert!(
+            cx.update(|_w, cx| {
+                !app.read(cx)
+                    .tabs
+                    .iter()
+                    .any(|t| t.file_path.as_deref() == Some(d_path.as_path()))
+            }),
+            "已打开选项卡应同步关闭"
+        );
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            tabs_before - 1,
+            "只应关掉 d.txt 一个选项卡"
+        );
+        ft_wait_layout(&app, cx);
+        let labels = cx.update(|_w, cx| {
+            app.read(cx)
+                .sidebar
+                .files_layout
+                .as_ref()
+                .unwrap()
+                .1
+                .iter()
+                .map(|r| r.label.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert!(!labels.contains(&"d.txt".to_string()), "树应刷新去掉 d.txt");
+
+        // —— 未保存修改的受影响选项卡 → 不删磁盘（不可静默丢内容）——
+        cx.update(|_w, cx| {
+            app.update(cx, |app, _cx| {
+                if let Some(t) = app
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.file_path.as_deref() == Some(dirty_path.as_path()))
+                {
+                    t.dirty = true;
+                }
+            });
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.file_tree_delete(&dirty_path, window, cx);
+            });
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(dirty_path.is_file(), "有未保存修改应不删磁盘");
+        assert!(
+            cx.update(|_w, cx| {
+                app.read(cx)
+                    .tabs
+                    .iter()
+                    .any(|t| t.file_path.as_deref() == Some(dirty_path.as_path()))
+            }),
+            "有未保存修改的选项卡不应被关闭"
+        );
+        let status = cx.update(|_w, cx| app.read(cx).status.to_string());
+        assert!(status.contains("未保存修改"), "应提示存在未保存修改，实际={status}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 

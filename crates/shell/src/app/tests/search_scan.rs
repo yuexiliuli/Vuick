@@ -2,7 +2,7 @@
 // `find_ci` 大小写折叠、首个命中、UTF-8 字节区间；`scan_line_hits` 行偏移、
 // 单行多命中、上限截断、空文档/尾换行、极长行。保证优化不漂移命中语义。
 
-use crate::app::sidebar::{find_ci, scan_line_hits};
+use crate::app::sidebar::{find_ci, folder_scan_collect, scan_line_hits, FolderScanUpdate};
 use config::limits::SEARCH_RESULT_CAP;
 
 #[test]
@@ -156,4 +156,71 @@ fn scan_line_hits_ascii_copy_matches_old_semantics() {
             "查询 {q}：新旧命中数应一致"
         );
     }
+}
+
+/// 文件夹级搜索：目录级符号链接（Unix symlink / Windows 目录联接）**不递归**，防
+/// 「循环引用 → 扫描无限循环」。（回归：`folder_scan_collect` 用 `entry.file_type()`
+/// （不跟随）判目录；若用 `metadata`（跟随）判，联接指向自身会无限入栈挂死。）
+#[test]
+fn folder_scan_skips_symlinked_dirs_prevents_cycle() {
+    use futures::{SinkExt as _, StreamExt as _};
+    let base = std::env::temp_dir().join(format!("gpui-fs-sym-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    // 一个命中文件 + 一个「循环指向自身」的目录链接：若跟随递归 → 无限扫描
+    std::fs::write(base.join("hit.txt"), "needle here\n").unwrap();
+    let link = base.join("loop");
+    if !create_dir_link(&link, &base) {
+        // 环境不支持创建链接 → 跳过（保持非空运行，Windows 目录联接 / Unix 符号链接通常可用）
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+    let (mut tx, mut rx) = futures::channel::mpsc::channel::<FolderScanUpdate>(4);
+    let mut total = 0usize;
+    let truncated = futures::executor::block_on(folder_scan_collect(
+        &base,
+        "needle",
+        tx.clone(),
+        &std::path::PathBuf::from("__nonexistent_session__").as_path(),
+        &mut total,
+        SEARCH_RESULT_CAP,
+    ));
+    assert!(!truncated, "小目录不应截断");
+    assert_eq!(total, 1, "应命中 hit.txt 且不因循循环重复计数");
+    // 模拟生产端：扫描结束后补发 Done（`start_folder_scan` 的真实姿势），再释放全部 sender
+    futures::executor::block_on(tx.send(FolderScanUpdate::Done { truncated })).expect("send Done");
+    drop(tx);
+    let mut blocks = 0usize;
+    let mut done = false;
+    while let Some(u) = futures::executor::block_on(rx.next()) {
+        blocks += 1;
+        if matches!(u, FolderScanUpdate::Done { .. }) {
+            done = true;
+        }
+    }
+    assert!(done, "应收到 Done 块（扫描正常结束而非挂死）");
+    assert_eq!(blocks, 2, "应恰好 1 个 File 块 + 1 个 Done 块");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Windows：`mklink /J` 目录联接（无需管理员权限）；失败返回 false。
+#[cfg(windows)]
+fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> bool {
+    std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &link.to_string_lossy(),
+            &target.to_string_lossy(),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Unix：目录符号链接；失败返回 false。
+#[cfg(not(windows))]
+fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> bool {
+    std::os::unix::fs::symlink_dir(target, link).is_ok()
 }

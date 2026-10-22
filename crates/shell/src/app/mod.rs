@@ -48,6 +48,7 @@ mod tabs;
 mod chrome;
 mod close_tray;
 mod diff;
+mod file_tree_prompt;
 mod init;
 mod layout;
 mod media;
@@ -436,6 +437,17 @@ pub struct EditorApp {
     /// 侧边栏搜索的惰性扫描缓存：按（查询词, 活动文档）复用，渲染帧不重扫全文。
     /// 查询变化 / 切换文档 / 内容被编辑时清空，下次渲染重建。
     search_scan: Option<std::rc::Rc<sidebar::SidebarSearchScan>>,
+    /// 侧边栏搜索**范围**（当前文件 / 整个文件夹）。用户未手动选过时按
+    /// 「有打开文件夹默认选整个文件夹」自动跟随（见 [`EditorApp::effective_search_scope`]）。
+    pub(crate) search_scope: sidebar::SearchScopeTab,
+    /// 用户是否**手动**切换过搜索范围（手选后自动跟随规则不再覆盖）。
+    pub(crate) search_scope_manual: bool,
+    /// 文件夹级内容搜索的扫描结果（后台增量装配，按键 `(根, 查询词)` 复用，渲染帧不重扫）。
+    /// 换根 / 关文件夹 / 查询变化 → 置 `None` 触发新扫；旧代异步回调按代丢弃。
+    pub(crate) folder_search: Option<std::rc::Rc<sidebar::FolderSearchScan>>,
+    /// 文件夹扫描**代**：每发起一次新扫描 +1，异步回调携带发起时代，与当前代不符即丢弃
+    /// （防「换查询后旧扫描结果晚到覆盖新结果」）。
+    pub(crate) folder_search_gen: u64,
     /// 实际执行过的搜索扫描次数（每次命中缓存复用不改）。测试用：验证「查询未变
     /// 时反复渲染不重扫」这一优化真实生效。
     pub(crate) search_scan_count: usize,
@@ -478,6 +490,27 @@ pub struct EditorApp {
     tab_bar_menu_entity: Option<gpui::Entity<PopupMenu>>,
     /// 选项卡栏右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     tab_bar_menu_sub: Option<Subscription>,
+    /// 文件树右键上下文菜单：弹出位置（窗口坐标）。None = 未打开。
+    file_tree_menu_pos: Option<Point<Pixels>>,
+    /// 已打开的文件树右键菜单实体（随位置同生同灭）。
+    file_tree_menu_entity: Option<gpui::Entity<PopupMenu>>,
+    /// 文件树右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
+    file_tree_menu_sub: Option<Subscription>,
+    /// 文件树「新建/重命名」输入弹层：打开时为 `Some`，提交/取消（`DismissEvent`）
+    /// 关闭后清空。弹层是独立 [`file_tree_prompt::FileTreePrompt`] 实体。
+    file_tree_prompt: Option<gpui::Entity<file_tree_prompt::FileTreePrompt>>,
+    /// 文件树输入弹层的关闭订阅（提交成功/取消 → 清空引用释放实体）。
+    _file_tree_prompt_sub: Option<Subscription>,
+    /// 文件树「过滤文件名」输入框（typeahead 按名过滤树；防抖后提交生效）。
+    files_filter_state: gpui::Entity<InputState>,
+    /// 过滤输入框变化订阅（防抖调度）。
+    _files_filter_sub: Subscription,
+    /// 文件树过滤词（防抖后提交、已归一化小写；渲染/收集只看它）。
+    pub(crate) files_filter: String,
+    /// 防抖窗口内最新一次过滤输入（未提交；布局避免逐键重收）。
+    files_filter_pending: String,
+    /// 文件树过滤防抖（`base::SeqAfter` 可重入、代序作废，同搜索防抖姿势）。
+    files_filter_debounce: SeqAfter,
     /// 最近打开的文件夹路径（新→旧，至多 [`config::limits::RECENT_MAX`] 条）。
     /// 跨重启持久化（`UserPrefs::recent_folders`）；面板四区域模式只展示前 10。
     pub(crate) recent_folders: Vec<String>,

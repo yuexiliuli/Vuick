@@ -44,6 +44,8 @@ pub const FOLD_CANDIDATE_FULL_MAX_LINES: usize = 200_000;
 pub const BRACKET_GUIDE_WINDOW_LOOKBACK_LINES: usize = 2048;
 /// 侧边栏搜索结果条数上限。
 pub const SEARCH_RESULT_CAP: usize = 200;
+/// 文件夹级内容搜索「总命中条数」上限：达到即截断并提示（不无限累积渲染分组）。
+pub const FOLDER_SEARCH_RESULT_CAP: usize = 500;
 /// WYSIWYG 行整形缓存容量（按**块下标**计）：滚动/带重建复用已整形的块（文本/代码/
 /// 表格），避免每档重建把可视带整批重 shape + 代码块重跑 syntect（对齐 `view` 的
 /// 行虚拟化复用与 `editor` 「只重排变更区」）。超出后按最近最少使用淘汰。

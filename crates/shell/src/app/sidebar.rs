@@ -5,10 +5,13 @@
 //! 直连外壳：与选项卡栏+编辑区、状态栏全部直角贴缝（无浮层卡片/圆角/间距），右缘仅以
 //! 一条发丝线（`bar_border`）与正文区分隔。
 
+use super::file_tree_prompt::FileTreePromptKind;
 use super::*;
 use ui::input::Input;
 
-use config::limits::SEARCH_RESULT_CAP;
+use config::limits::{FOLDER_SEARCH_RESULT_CAP, SEARCH_RESULT_CAP};
+use config::user::UserPrefs;
+use gpui::{HighlightStyle, StyledText};
 use ui::motion::{hover_bg_fade, hover_spring};
 
 use std::rc::Rc;
@@ -26,6 +29,16 @@ pub(super) const SEARCH_DEBOUNCE_MS: u64 = 150;
 /// 归一化搜索查询词（与旧 `value().trim().to_lowercase()` 一致，作缓存键与渲染用词）。
 fn normalize_search_query(q: &str) -> String {
     q.trim().to_lowercase()
+}
+
+/// 侧边栏搜索**范围**：只搜当前文件 / 递归搜已打开文件夹内文本文件。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum SearchScopeTab {
+    /// 当前文档内容（+ 跨打开文件文件名匹配），旧语义。
+    #[default]
+    CurrentFile,
+    /// 整个打开的文件夹（未打开文件夹时不可用）。
+    Folder,
 }
 
 /// 侧边栏视图。
@@ -928,7 +941,9 @@ impl EditorApp {
         rows
     }
 
-    /// 「搜索」视图：关键字输入框 + 当前文档的匹配结果（文件名跨打开文件匹配）。
+    /// 「搜索」视图：关键词输入框 + 范围切换（当前文件 / 整个文件夹）+ 匹配结果。
+    /// 「当前文件」= 当前文档内容 + 跨打开文件文件名匹配（旧语义）；
+    /// 「整个文件夹」= 递归扫已打开文件夹内文本文件内容（后台分块，按文件分组展示）。
     fn render_sidebar_search(
         &mut self,
         window: &mut Window,
@@ -962,8 +977,17 @@ impl EditorApp {
         // 扫描用「防抖后已提交」的查询词（已归一化 trim+小写）；输入框实时文本在
         // `search_state` —— 连续输入时这里沿用上次提交词的结果，防抖期满才重扫。
         let q = query;
+        let scope = self.effective_search_scope();
+        let hint_text = match scope {
+            SearchScopeTab::CurrentFile => {
+                "输入关键字，搜索当前文件内容；文件名匹配所有打开文件"
+            }
+            SearchScopeTab::Folder => "输入关键字，搜索整个文件夹内文本文件内容",
+        };
         let result_area: gpui::AnyElement = if q.is_empty() {
             div()
+                .id("sidebar-search-hint")
+                .debug_selector(|| "sidebar-search-hint".into())
                 .px_3()
                 .py_2()
                 .w_full()
@@ -972,10 +996,15 @@ impl EditorApp {
                 .text_overflow(gpui::TextOverflow::Truncate("…".into()))
                 .text_size(px(12.))
                 .text_color(muted)
-                .child("输入关键字，搜索当前文件内容；文件名匹配所有打开文件")
+                .child(hint_text)
                 .into_any_element()
         } else {
-            self.render_sidebar_search_results(window, &q, cx)
+            match scope {
+                SearchScopeTab::CurrentFile => {
+                    self.render_sidebar_search_results(window, &q, cx)
+                }
+                SearchScopeTab::Folder => self.render_sidebar_folder_search(window, &q, cx),
+            }
         };
 
         div()
@@ -988,6 +1017,7 @@ impl EditorApp {
             .min_h(px(0.))
             .overflow_hidden()
             .child(input)
+            .child(self.render_search_scope_tabs(window, cx))
             .child(result_area)
             // P2-10：面板开合轻淡入（同目录面板，见 `sidebar-toc-fade`）。
             .with_spring(
@@ -996,6 +1026,146 @@ impl EditorApp {
                 |this, v| this.opacity(v),
             )
             .into_any_element()
+    }
+
+    /// 搜索范围「当前文件 / 整个文件夹」切换 tab 条：输入框下方横排两个小 tab。
+    /// 未打开文件夹时「整个文件夹」置灰不可用（点击仅提示「先打开文件夹」，
+    /// 保持只搜当前文件）；活动项以活动背景 + 主前景色标示。
+    fn render_search_scope_tabs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (fg, muted) = (self.text_primary(), self.text_minor());
+        let active_bg = self.tab_active_bg();
+        let has_folder = self.sidebar.files.root.is_some();
+        let scope = self.effective_search_scope();
+        let view_id = window.current_view();
+
+        let current_hover =
+            window.use_keyed_state("side-search-scope-cur-hover", cx, |_, _| false);
+        let folder_hover =
+            window.use_keyed_state("side-search-scope-folder-hover", cx, |_, _| false);
+        let current_hovered = *current_hover.read(cx);
+        let folder_hovered = *folder_hover.read(cx);
+
+        let current = div()
+            .id("sidebar-search-scope-current")
+            .debug_selector(|| "sidebar-search-scope-current".into())
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .h(px(26.))
+            .mx(px(4.))
+            .rounded_md()
+            .text_size(px(12.))
+            .text_color(if scope == SearchScopeTab::CurrentFile { fg } else { muted })
+            .cursor(CursorStyle::PointingHand)
+            .on_hover({
+                let st = current_hover.clone();
+                move |h, _w, cx| {
+                    st.update(cx, |v, _| *v = *h);
+                    cx.notify(view_id);
+                }
+            })
+            .on_click(cx.listener(
+                |this: &mut EditorApp, _ev, window, cx| {
+                    this.set_search_scope(SearchScopeTab::CurrentFile, window, cx);
+                },
+            ))
+            .child("当前文件");
+
+        let folder = div()
+            .id("sidebar-search-scope-folder")
+            .debug_selector(|| "sidebar-search-scope-folder".into())
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .h(px(26.))
+            .mx(px(4.))
+            .rounded_md()
+            .text_size(px(12.))
+            .text_color(if scope == SearchScopeTab::Folder {
+                fg
+            } else if has_folder {
+                muted
+            } else {
+                muted.opacity(0.5)
+            })
+            .cursor(if has_folder {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::default()
+            })
+            .on_hover({
+                let st = folder_hover.clone();
+                move |h, _w, cx| {
+                    st.update(cx, |v, _| *v = *h);
+                    cx.notify(view_id);
+                }
+            })
+            .on_click(cx.listener(
+                |this: &mut EditorApp, _ev, window, cx| {
+                    // 未打开文件夹 → 「整个文件夹」不可用：仅提示，保持只搜当前文件。
+                    if this.sidebar.files.root.is_none() {
+                        this.status = SharedString::from("先打开文件夹，再搜索整个文件夹");
+                        this.status_ok = false;
+                        cx.notify();
+                        return;
+                    }
+                    this.set_search_scope(SearchScopeTab::Folder, window, cx);
+                },
+            ))
+            .child("整个文件夹");
+
+        let set_bg = |active: bool, hovered: bool| {
+            if active {
+                active_bg
+            } else if hovered {
+                active_bg
+            } else {
+                active_bg.opacity(0.)
+            }
+        };
+        div()
+            .id("sidebar-search-scope")
+            .debug_selector(|| "sidebar-search-scope".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .mx_2()
+            .mb_1()
+            .child(current.bg(set_bg(scope == SearchScopeTab::CurrentFile, current_hovered)))
+            .child(folder.bg(set_bg(
+                scope == SearchScopeTab::Folder,
+                folder_hovered && has_folder,
+            )))
+            .into_any_element()
+    }
+
+    /// 当前生效的搜索范围：用户手动选过 → 手动值；否则**有打开文件夹时默认
+    /// 「整个文件夹」**，无文件夹回退「当前文件」（未打开文件夹时文件夹范围不可用）。
+    pub(super) fn effective_search_scope(&self) -> SearchScopeTab {
+        if self.search_scope_manual {
+            self.search_scope
+        } else if self.sidebar.files.root.is_some() {
+            SearchScopeTab::Folder
+        } else {
+            SearchScopeTab::CurrentFile
+        }
+    }
+
+    /// 用户点击范围 tab：记录手动选择（此后不再自动跟随文件夹有无），并通知刷新。
+    pub(super) fn set_search_scope(
+        &mut self,
+        scope: SearchScopeTab,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_scope_manual = true;
+        self.search_scope = scope;
+        self.search_scan = None; // 范围变化 → 当前文件扫描缓存也一并失效（下帧重建）
+        cx.notify();
     }
 
     /// 计算并渲染搜索结果（文件名命中 + 行内容命中，按打开顺序排列，封顶）。
@@ -1078,6 +1248,385 @@ impl EditorApp {
             .bar_id("sidebar-search-vscrollbar")
             .build(inner)
             .into_any_element()
+    }
+
+    /// 文件夹级搜索视图：按文件分组展示命中（文件头行 + 命中行），后台增量装配。
+    /// 未打开文件夹 → 「先打开文件夹」空态；扫描中且无命中 → 「搜索中…」；
+    /// 命中后按 [`FOLDER_SEARCH_RESULT_CAP`] 截断并提示。
+    fn render_sidebar_folder_search(
+        &mut self,
+        window: &mut Window,
+        q: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(scan) = self.folder_search_scan(q, window, cx) else {
+            return self.wrap_search_scroll(
+                "sidebar-search-results",
+                ui::empty_state::compact_empty_state(
+                    "sidebar-search-empty",
+                    IconName::Folder,
+                    "先打开文件夹，再搜索整个文件夹",
+                    cx,
+                ),
+            );
+        };
+        // 扫描进行中且尚无任何命中 → 「搜索中…」占位（有命中则走汇总头计数 + 分组行）。
+        if scan.running && scan.total_hits == 0 {
+            return self.folder_search_loading();
+        }
+        if scan.total_hits == 0 {
+            return self.wrap_search_scroll(
+                "sidebar-search-results",
+                ui::empty_state::compact_empty_state(
+                    "sidebar-search-empty",
+                    IconName::Search,
+                    "未找到匹配内容",
+                    cx,
+                ),
+            );
+        }
+        let (fg, muted) = (self.text_primary(), self.text_minor());
+        let active_bg = self.tab_active_bg();
+        let rows = self.sidebar_folder_file_rows(window, &scan, fg, muted, active_bg, cx);
+        let inner = div()
+            .child(self.sidebar_folder_search_summary(&scan, muted))
+            .child(div().flex().flex_col().py_1().children(rows));
+        self.wrap_search_scroll("sidebar-search-results", inner)
+    }
+
+    /// 文件夹搜索「搜索中…」占位（扫描进行中、尚无命中时的整块提示）。
+    fn folder_search_loading(&self) -> gpui::AnyElement {
+        let muted = self.text_minor();
+        let container = div()
+            .id("sidebar-search-loading")
+            .debug_selector(|| "sidebar-search-loading".into())
+            .px_3()
+            .py_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(12.))
+            .text_color(muted)
+            .child(Icon::new(IconName::Search).size(px(14.)).text_color(muted))
+            .child("搜索中…");
+        self.wrap_search_scroll("sidebar-search-results", container)
+    }
+
+    /// 文件夹搜索汇总头：n 处匹配（m 个文件）/ 搜索中计数 / 已达上限截断提示。
+    fn sidebar_folder_search_summary(
+        &self,
+        scan: &FolderSearchScan,
+        muted: gpui::Hsla,
+    ) -> gpui::AnyElement {
+        let text = if scan.running {
+            format!("搜索中… 已找到 {} 处匹配", scan.total_hits)
+        } else if scan.truncated {
+            format!("{} 处匹配（已达上限，结果截断）", scan.total_hits)
+        } else {
+            format!("{} 处匹配（{} 个文件）", scan.total_hits, scan.files.len())
+        };
+        div()
+            .id("sidebar-folder-search-summary")
+            .debug_selector(|| "sidebar-folder-search-summary".into())
+            .px_3()
+            .py_2()
+            .text_size(px(11.))
+            .text_color(muted)
+            .child(text)
+            .into_any_element()
+    }
+
+    /// 文件夹级搜索**分组渲染**：每文件一个组 = 文件头行（文件名 + 命中词频计数）+
+    /// 逐命中行（`L行号  命中行预览`，命中词以强调色高亮）。点击命中行 → 打开/激活 +
+    /// 光标定位 + 滚动可见 + 命中词临时高亮（见 [`EditorApp::folder_search_open_hit`]）。
+    #[allow(clippy::too_many_arguments)] // 三色 + 数据源 + 滚动句柄，与其它行渲染同构
+    fn sidebar_folder_file_rows(
+        &self,
+        window: &mut Window,
+        scan: &FolderSearchScan,
+        fg: gpui::Hsla,
+        muted: gpui::Hsla,
+        active_bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let accent: gpui::Hsla = ui::theme::Theme::global(cx).colors.accent.into();
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for (fi, file) in scan.files.iter().enumerate() {
+            let fname = file
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.path.to_string_lossy().into_owned());
+            // 文件头行（文件名 + 命中词频计数）。
+            let hdr = div()
+                .id(SharedString::from(format!("sidebar-folder-file-{fi}")))
+                .debug_selector(move || format!("sidebar-folder-file-{fi}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .mx(px(4.))
+                .rounded_md()
+                .child(Icon::new(IconName::File).size(px(13.)).text_color(fg))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                        .text_size(px(12.))
+                        .text_color(fg)
+                        .child(fname),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child(format!("{} 处", file.hits.len())),
+                );
+            rows.push(hdr.into_any_element());
+            // 命中行：行号 + 预览（命中词高亮）。
+            for (ki, hit) in file.hits.iter().enumerate() {
+                let li = hit.line;
+                let match_range = hit.range.clone();
+                let snippet = hit.snippet.clone();
+                let q_owned = scan.query.clone();
+                let path = file.path.clone();
+                // P2-10：hover 状态跨帧记录 → 行背景淡入。
+                let hover = window
+                    .use_keyed_state(format!("sf-hit-{fi}-{ki}-hover"), cx, |_, _| false);
+                let hovered = *hover.read(cx);
+                let view_id = window.current_view();
+                let line_prefix = format!("L{}  ", li + 1);
+                let display = format!("{line_prefix}{snippet}");
+                // 命中词在预览中高亮：snippet 内全部大小写不敏感命中区间，再平移到显示串。
+                let mut hl = highlight_ranges(&snippet, &q_owned);
+                for r in &mut hl {
+                    r.start += line_prefix.len();
+                    r.end += line_prefix.len();
+                }
+                let styled = StyledText::new(SharedString::from(display))
+                    .with_highlights(
+                        hl.into_iter()
+                            .map(|r| {
+                                (
+                                    r,
+                                    HighlightStyle {
+                                        color: Some(accent),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                let r = div()
+                    .id(SharedString::from(format!(
+                        "sidebar-search-folder-hit-{fi}-{ki}"
+                    )))
+                    .debug_selector(move || format!("sidebar-search-folder-hit-{fi}-{ki}"))
+                    .px_2()
+                    .py_1()
+                    .mx(px(4.))
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .cursor(CursorStyle::PointingHand)
+                    .on_hover({
+                        let st = hover.clone();
+                        move |h, _w, cx| {
+                            st.update(cx, |v, _| *v = *h);
+                            cx.notify(view_id);
+                        }
+                    })
+                    .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                        this.folder_search_open_hit(&path, li, match_range.clone(), &q_owned, window, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(styled),
+                    );
+                rows.push(
+                    r.bg(if hovered { active_bg } else { active_bg.opacity(0.) })
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
+    }
+
+    /// 文件夹搜索「取扫描或发起扫描」：按键 `(根, 查询词)` 复用缓存（含进行中/已完成），
+    /// 未打开文件夹返回 `None`；查询词 / 根变化 → 发起新一轮后台扫描（新代，旧代结果丢弃）。
+    fn folder_search_scan(
+        &mut self,
+        q: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Rc<FolderSearchScan>> {
+        let root = self.sidebar.files.root.clone()?;
+        if let Some(s) = &self.folder_search
+            && s.query == q
+            && s.root.as_deref() == Some(root.as_path())
+        {
+            return Some(s.clone());
+        }
+        self.start_folder_scan(root, q, window, cx);
+        self.folder_search.clone()
+    }
+
+    /// 发起一把文件夹级后台扫描：**不在主线程同步扫整棵**——生产者（后台线程）递归
+    /// 读盘并逐文件外推命中块（有界 channel 背压，参考 `spawn_progressive_open` 大文档
+    /// 分块读盘姿势），主线程只收块增量装配到 [`Self::folder_search`]，扫描中 UI 显示
+    /// 「搜索中…」。查询词 / 根变化 → 换代；旧代异步回调按代丢弃（不覆盖新结果）。
+    fn start_folder_scan(
+        &mut self,
+        root: PathBuf,
+        q: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.folder_search_gen.wrapping_add(1);
+        self.folder_search_gen = generation;
+        self.folder_search = Some(Rc::new(FolderSearchScan {
+            query: q.to_string(),
+            root: Some(root.clone()),
+            files: Vec::new(),
+            truncated: false,
+            running: true,
+            generation,
+            total_hits: 0,
+        }));
+        let entity = cx.entity();
+        let q_owned = q.to_string();
+        let (tx, rx) = futures::channel::mpsc::channel::<FolderScanUpdate>(4);
+        window
+            .spawn(cx, async move |cx| {
+                use futures::{SinkExt as _, StreamExt as _};
+                // ---- 生产者（后台线程）：递归扫文件夹 → 逐文件命中按块外推 ----
+                let mut prod_tx = tx.clone();
+                let prod_root = root;
+                let prod_q = q_owned;
+                let prod_sess = UserPrefs::session_dir();
+                cx.background_executor()
+                    .spawn(async move {
+                        let mut total = 0usize;
+                        let truncated = folder_scan_collect(
+                            &prod_root,
+                            &prod_q,
+                            prod_tx.clone(),
+                            &prod_sess,
+                            &mut total,
+                            FOLDER_SEARCH_RESULT_CAP,
+                        )
+                        .await;
+                        let _ = prod_tx.send(FolderScanUpdate::Done { truncated }).await;
+                    })
+                    .detach();
+                // 原始 sender 立即释放：生产者外推完毕后 channel 关闭 → 消费者收完退出。
+                drop(tx);
+
+                // ---- 消费者（主线程任务）：逐块增量装配，扫描中逐块刷新 ----
+                let mut rx = rx;
+                while let Some(update) = rx.next().await {
+                    let scan_gen = generation;
+                    let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
+                        let Some(existing) = this.folder_search.as_ref() else {
+                            return;
+                        };
+                        if existing.generation != scan_gen {
+                            return; // 已被更新的查询/换根取代 → 丢弃旧代结果
+                        }
+                        // 逐块增量：基于当前状态克隆应用增量后放回（Rc 共享读、写时替换）。
+                        let mut next = (**existing).clone();
+                        match update {
+                            FolderScanUpdate::File(f) => {
+                                next.total_hits += f.hits.len();
+                                next.files.push(f);
+                            }
+                            FolderScanUpdate::Done { truncated } => {
+                                next.truncated = truncated;
+                                next.running = false;
+                            }
+                        }
+                        this.folder_search = Some(Rc::new(next));
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+    }
+
+    /// 文件夹搜索点击命中行：路径失效 → 提示不打开；有效 → 打开/激活（已打开激活既有
+    /// 选项卡）+ 光标定位到命中行 + 滚动可见 + 命中词临时高亮（编辑区选区 / 预览搜索高亮）。
+    pub(super) fn folder_search_open_hit(
+        &mut self,
+        path: &std::path::Path,
+        line: usize,
+        range: std::ops::Range<usize>,
+        q_owned: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 错误分类：命中路径在点击时已失效（文件被删除/改名）→ 不打开并提示。
+        if !path.is_file() {
+            self.status = SharedString::from(format!("命中文件已不存在：{}", path.display()));
+            self.status_ok = false;
+            cx.notify();
+            return;
+        }
+        self.open_path_or_activate(path, window, cx);
+        let Some(ti) = self.tabs.iter().position(|t| t.file_path.as_deref() == Some(path))
+        else {
+            return;
+        };
+        self.jump_tab_to_hit(ti, line, range, q_owned, cx);
+        cx.notify();
+    }
+
+    /// 跳转到命中行并高亮命中词：源码编辑区 = 光标落行 + 选中命中区间（选中即高亮、
+    /// `reveal_caret` 滚动可见）；只读预览 / WYSIWYG / 统一组件 = `set_scroll_target` +
+    /// `highlight_search`（命中词临时高亮）。大文档后台打开尚未挂载（空缓冲）→ 跳过定位。
+    fn jump_tab_to_hit(
+        &mut self,
+        ti: usize,
+        li: usize,
+        range: std::ops::Range<usize>,
+        q_owned: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(ti) else {
+            return;
+        };
+        if tab.readonly_preview {
+            if let Some(wy) = tab.md_wy.clone() {
+                wy.update(cx, |v, cx| {
+                    v.set_scroll_target(li);
+                    v.highlight_search(li, q_owned, cx);
+                });
+            }
+            return;
+        }
+        if let Some(l2) = tab.live2.clone() {
+            l2.update(cx, |v, cx| v.highlight_search(li, q_owned, cx));
+        }
+        if let Some(wy) = tab.md_wy.clone() {
+            wy.update(cx, |v, cx| v.highlight_search(li, q_owned, cx));
+        }
+        let ed = tab.editor.clone();
+        ed.update(cx, |ed, cx| {
+            if ed.char_count() == 0 {
+                return; // 大文档后台打开尚未挂载 → 跳过定位（文件回到顶部，随后内容到达）
+            }
+            ed.set_caret_to(ed.offset_for_line_col(li, 0));
+            ed.set_selection_range(range, cx);
+        });
     }
 
     /// 文件名命中（跨所有打开文件）：相当于「打开文件」快速选择器，点击激活选项卡。
@@ -1188,39 +1737,7 @@ impl EditorApp {
                 })
                 .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
                     this.activate_tab(ti, window, cx);
-                    if let Some(tab) = this.tabs.get(ti) {
-                        if tab.readonly_preview {
-                            // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行并高亮命中文本。
-                            // P4-2：一律 WyEditor 只读宿主（`MarkdownPreview` 已删）——
-                            // `set_scroll_target`（prepaint 重钉）+ 搜索高亮。
-                            if let Some(wy) = tab.md_wy.clone() {
-                                wy.update(cx, |v, cx| {
-                                    v.set_scroll_target(li);
-                                    v.highlight_search(li, &q_owned.clone(), cx);
-                                });
-                            }
-                        } else {
-                            // 统一组件（live2 WYSIWYG）与右栏 WyEditor 预览在场时：命中文本
-                            // 同步高亮（预览独有能力搬入 `WyEditor::highlight_search`，同款语义）。
-                            if let Some(l2) = tab.live2.clone() {
-                                l2.update(cx, |v, cx| {
-                                    v.highlight_search(li, &q_owned, cx);
-                                });
-                            }
-                            if let Some(wy) = tab.md_wy.clone() {
-                                wy.update(cx, |v, cx| {
-                                    v.highlight_search(li, &q_owned, cx);
-                                });
-                            }
-                            let ed = tab.editor.clone();
-                            ed.update(cx, |ed, cx| {
-                                // 先落光标（滚动到该行），再选中命中文本作为高亮
-                                let start = ed.offset_for_line_col(li, 0);
-                                ed.set_caret_to(start);
-                                ed.set_selection_range(match_range.clone(), cx);
-                            });
-                        }
-                    }
+                    this.jump_tab_to_hit(ti, li, match_range.clone(), &q_owned, cx);
                     cx.notify();
                 }))
                 .child(
@@ -1778,8 +2295,7 @@ impl EditorApp {
             if !cached {
                 let rows = self.sidebar_files_collect();
                 self.sidebar.files_layout = Some((layout_gen, rows));
-            }
-            let layout_rows = &self.sidebar.files_layout.as_ref().unwrap().1;
+            }            let layout_rows = &self.sidebar.files_layout.as_ref().unwrap().1;
             let total = layout_rows.len();
             // 虚拟化：只物化可视带 + 上下 M 行缓冲（同目录视图 render_sidebar_toc 口径），
             // 行等高 `FILE_TREE_ROW_H` → divisor 精确；带外以等高 spacer 占位，滚动量程稳定。
@@ -1835,6 +2351,7 @@ impl EditorApp {
             .flex()
             .flex_col()
             .child(self.render_sidebar_files_header())
+            .child(self.render_files_filter_input(window, cx))
             .child(self.wrap_files_scroll(content))
             // P2-10：面板开合轻淡入（同目录/搜索面板）。
             .with_spring(
@@ -1846,6 +2363,8 @@ impl EditorApp {
     }
 
     /// 收集文件树全部**可见行描述**（根行 + 已展开递归子行 + 空目录占位）。
+    /// 过滤词非空时按「名称不区分大小写子串」过滤：不匹配的条目（含目录）整体隐藏，
+    /// 目录不匹配则其子树一并隐藏；过滤中省略「（空）」占位行（无意义）。
     /// O(可见行) 且只克隆轻量描述，不构造元素；结果按 [`SidebarChromeState::files_layout`]
     /// 缓存（`files.layout_gen` 失效），渲染逐帧 O(可视带) 物化。
     fn sidebar_files_collect(&self) -> Vec<FileRow> {
@@ -1853,6 +2372,8 @@ impl EditorApp {
         let Some(root) = self.sidebar.files.root.clone() else {
             return out;
         };
+        let filter = self.files_filter.as_str();
+        // 根行恒可见（树根不因过滤消失；其下子项按过滤词裁剪）。
         let root_name = root
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1864,31 +2385,51 @@ impl EditorApp {
             depth: 0,
             placeholder: false,
         });
-        self.sidebar_files_collect_children(&root, 0, &mut out);
+        self.sidebar_files_collect_children(&root, 0, filter, &mut out);
+        // 过滤无匹配空态：仅剩根行且根的子项已加载（过滤有意义）→ 追加「无匹配结果」占位。
+        if !filter.is_empty()
+            && out.len() == 1
+            && self.sidebar.files.children.contains_key(&root)
+        {
+            out.push(FileRow {
+                path: root.clone(),
+                label: SharedString::from("无匹配结果"),
+                is_dir: false,
+                depth: 1,
+                placeholder: true,
+            });
+        }
         out
     }
 
-    /// 递归收集某个**已展开目录**的直接子行描述（空目录 → 「（空）」占位行）。
+    /// 递归收集某个**已展开目录**的直接子行描述（空目录 → 「（空）」占位行；过滤中省略）。
     fn sidebar_files_collect_children(
         &self,
         dir: &std::path::Path,
         depth: usize,
+        filter: &str,
         out: &mut Vec<FileRow>,
     ) {
         let Some(children) = self.sidebar.files.children.get(dir) else {
             return; // 尚未扫描完成（加载中）→ 无子行，扫描完成后 `layout_gen` 递增重收
         };
         if children.is_empty() {
-            out.push(FileRow {
-                path: dir.to_path_buf(),
-                label: SharedString::default(),
-                is_dir: false,
-                depth: depth + 1,
-                placeholder: true,
-            });
+            if filter.is_empty() {
+                out.push(FileRow {
+                    path: dir.to_path_buf(),
+                    label: SharedString::default(),
+                    is_dir: false,
+                    depth: depth + 1,
+                    placeholder: true,
+                });
+            }
             return;
         }
         for child in children {
+            // 过滤：名称不区分大小写子串不匹配 → 隐藏（含目录及其子树）。
+            if !filter.is_empty() && !child.name.to_lowercase().contains(filter) {
+                continue;
+            }
             let is_expanded = child.is_dir && self.sidebar.files.expanded.contains(&child.path);
             out.push(FileRow {
                 path: child.path.clone(),
@@ -1898,7 +2439,7 @@ impl EditorApp {
                 placeholder: false,
             });
             if is_expanded {
-                self.sidebar_files_collect_children(&child.path, depth + 1, out);
+                self.sidebar_files_collect_children(&child.path, depth + 1, filter, out);
             }
         }
     }
@@ -1918,8 +2459,13 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let rows_id = format!("sidebar-file-row-{key}");
-        // 空目录占位行（不可点）。
+        // 空目录占位行（「（空）」）与过滤无匹配占位行（「无匹配结果」）：均不可点。
         if row.placeholder {
+            let placeholder_text = if row.label.is_empty() {
+                SharedString::from("（空）")
+            } else {
+                row.label.clone()
+            };
             return div()
                 .id(SharedString::from(rows_id.clone()))
                 .debug_selector(move || rows_id.clone())
@@ -1930,7 +2476,7 @@ impl EditorApp {
                 .rounded_md()
                 .text_size(px(12.))
                 .text_color(muted)
-                .child("（空）")
+                .child(placeholder_text)
                 .into_any_element();
         }
         let is_expanded = row.is_dir && self.sidebar.files.expanded.contains(&row.path);
@@ -1992,13 +2538,25 @@ impl EditorApp {
                     cx.notify(view_id);
                 }
             })
-            .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                if is_dir {
-                    this.file_tree_toggle(path.clone(), window, cx);
-                } else {
-                    this.open_path_or_activate(&path, window, cx);
-                }
-            }))
+            .on_click({
+                let lc_path = path.clone();
+                cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                    if is_dir {
+                        this.file_tree_toggle(lc_path.clone(), window, cx);
+                    } else {
+                        this.open_path_or_activate(&lc_path, window, cx);
+                    }
+                })
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                {
+                    let rc_path = path.clone();
+                    cx.listener(move |this: &mut EditorApp, ev, window, cx| {
+                        this.on_file_tree_right_click(&rc_path, is_dir, ev, window, cx);
+                    })
+                },
+            )
             .child(chevron)
             .child(type_icon)
             .child(
@@ -2026,6 +2584,515 @@ impl EditorApp {
             .get(self.active_tab)
             .and_then(|t| t.file_path.as_ref())
             .is_some_and(|p| p == path)
+    }
+
+    // -----------------------------------------------------------------
+    // 文件树增强：过滤 / 右键菜单 / 新建 / 重命名 / 删除
+    // -----------------------------------------------------------------
+
+    /// 文件树过滤输入框：typeahead 按名字过滤树（防抖提交见
+    /// [`Self::schedule_files_filter_debounce`]），清空恢复全树。
+    /// 规则：过滤只作用于**已加载（已扫描且所在目录已展开）的条目**——匹配折叠/未
+    /// 扫描目录内的名字不会命中（懒加载不整棵预扫，见 [`FileTreeState`]）；命中的目录
+    /// 行保留并可展开（其子树仍按同词继续过滤）。
+    fn render_files_filter_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // 未打开文件夹 → 过滤框不显示（空态占满）。
+        if self.sidebar.files.root.is_none() {
+            return div().into_any_element();
+        }
+        let search = self.files_filter_state.clone();
+        let focused = window.focused(cx) == Some(self.files_filter_state.read(cx).focus_handle(cx));
+        let border_color: gpui::Hsla = if focused {
+            ui::theme::Theme::global(cx).colors.focus_ring.into()
+        } else {
+            self.bar_border()
+        };
+        div()
+            .id("sidebar-files-filter-input")
+            .debug_selector(|| "sidebar-files-filter-input".into())
+            .px_2()
+            .py_1()
+            .mx_2()
+            .my_1()
+            .w_full()
+            .rounded_sm()
+            .border_1()
+            .border_color(border_color)
+            .child(Input::new(&search))
+            .into_any_element()
+    }
+
+    /// 输入变化 → 登记防抖待提交过滤词并重启防抖计时器（`SeqAfter` 代序作废旧定时器）。
+    /// 防抖期满提交 `files_filter` + 作废文件树布局缓存（下次渲染按新过滤词重收集可见行）。
+    pub(super) fn schedule_files_filter_debounce(&mut self, value: String, cx: &mut Context<Self>) {
+        self.files_filter_pending = value.trim().to_lowercase();
+        cx.notify();
+        let weak = cx.weak_entity();
+        self.files_filter_debounce.after(
+            cx,
+            std::time::Duration::from_millis(FILES_FILTER_DEBOUNCE_MS),
+            move |app| {
+                let _ = weak.update(app, |this, cx| {
+                    let pending = std::mem::take(&mut this.files_filter_pending);
+                    if this.files_filter != pending {
+                        this.files_filter = pending;
+                        this.sidebar.files.layout_gen = this.sidebar.files.layout_gen.wrapping_add(1);
+                        cx.notify();
+                    }
+                });
+            },
+        );
+    }
+
+    /// 文件树项右键 → 弹上下文菜单（位置存窗口坐标）：目录 = 新建文件 / 新建文件夹 /
+    /// 重命名 / 删除；文件 = 重命名 / 删除。新建类仅目录适用。关闭经 `DismissEvent`
+    /// 订阅清理（同选项卡栏右键，见 [`Self::on_tab_bar_right_click`]）。
+    pub(super) fn on_file_tree_right_click(
+        &mut self,
+        path: &std::path::Path,
+        is_dir: bool,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 事件继续冒泡到树根会触发图片/视频右键（on_media_right_click）等其它右键菜单，
+        // 此处拦截保证右键文件树只弹本菜单。
+        cx.stop_propagation();
+        // 生命周期：菜单构建闭包是 'static，borrow 的 `path` 参数需先物化为 owned 再移动。
+        let path = path.to_path_buf();
+        self.file_tree_menu_entity = None;
+        self.file_tree_menu_pos = None;
+        self.file_tree_menu_sub = None;
+        let weak = cx.weak_entity();
+        let (menu, sub) = ui::menu::spawn_context_menu(
+            window,
+            cx,
+            move |menu, _window, _cx| {
+                let mut m = menu;
+                if is_dir {
+                    m = m.item({
+                        let weak = weak.clone();
+                        let parent = path.to_path_buf();
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .child("新建文件…")
+                                .debug_selector(|| "file-tree-menu-new-file".into())
+                        })
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.open_file_tree_prompt(
+                                    FileTreePromptKind::NewFile { parent: parent.clone() },
+                                    window,
+                                    cx,
+                                );
+                            });
+                        })
+                    });
+                    m = m.item({
+                        let weak = weak.clone();
+                        let parent = path.to_path_buf();
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .child("新建文件夹…")
+                                .debug_selector(|| "file-tree-menu-new-folder".into())
+                        })
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.open_file_tree_prompt(
+                                    FileTreePromptKind::NewFolder { parent: parent.clone() },
+                                    window,
+                                    cx,
+                                );
+                            });
+                        })
+                    });
+                }
+                m = m.item({
+                    let weak = weak.clone();
+                    let target = path.to_path_buf();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("重命名…")
+                            .debug_selector(|| "file-tree-menu-rename".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.open_file_tree_prompt(
+                                FileTreePromptKind::Rename {
+                                    path: target.clone(),
+                                    is_dir: is_dir,
+                                },
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+                });
+                m.item({
+                    let weak = weak.clone();
+                    let target = path.to_path_buf();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("删除…")
+                            .debug_selector(|| "file-tree-menu-delete".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.file_tree_delete_request(&target, is_dir, window, cx);
+                        });
+                    })
+                })
+            },
+            |this, emitter, cx| {
+                if this.file_tree_menu_entity.as_ref() == Some(&emitter) {
+                    this.file_tree_menu_entity = None;
+                    this.file_tree_menu_pos = None;
+                }
+                cx.notify();
+            },
+        );
+        self.file_tree_menu_pos = Some(ev.position);
+        self.file_tree_menu_entity = Some(menu);
+        self.file_tree_menu_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// 文件树右键菜单 Overlay（光标处弹出，同选项卡栏右键菜单定位姿势）。
+    pub(super) fn render_file_tree_menu(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(pos) = self.file_tree_menu_pos else {
+            return div().into_any_element();
+        };
+        let Some(menu) = self.file_tree_menu_entity.clone() else {
+            return div().into_any_element();
+        };
+        div()
+            .id("file-tree-menu")
+            .debug_selector(|| "file-tree-menu".into())
+            .child(
+                deferred(
+                    anchored()
+                        .position_mode(gpui::AnchoredPositionMode::Window)
+                        .anchor(Anchor::TopLeft)
+                        .position(pos)
+                        .snap_to_window_with_margin(Edges::all(px(8.)))
+                        .child(menu),
+                )
+                .with_priority(100),
+            )
+            .into_any_element()
+    }
+
+    /// 打开文件树输入弹层（新建/重命名共用）：建实体 + 订阅（Dismiss → 清引用）+
+    /// 聚焦输入框。
+    pub(super) fn open_file_tree_prompt(
+        &mut self,
+        kind: FileTreePromptKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host = cx.weak_entity();
+        let previous_focus = window.focused(cx);
+        let prompt = cx.new(|cx| {
+            file_tree_prompt::FileTreePrompt::new(host, kind, previous_focus, window, cx)
+        });
+        let sub = cx.subscribe(&prompt, |this, _e, _: &DismissEvent, cx| {
+            this.file_tree_prompt = None;
+            this._file_tree_prompt_sub = None;
+            cx.notify();
+        });
+        let handle = prompt.read(cx).input_focus(cx);
+        window.focus(&handle, cx);
+        self.file_tree_prompt = Some(prompt);
+        self._file_tree_prompt_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// 文件树输入弹层的渲染挂点（根级 overlay；无弹层 → 空元素）。
+    pub(super) fn render_file_tree_prompt(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match self.file_tree_prompt.clone() {
+            Some(p) => p.into_any_element(),
+            None => div().into_any_element(),
+        }
+    }
+
+    /// 弹层提交入口：按类型分发到新建文件/新建文件夹/重命名。`Err(msg)` 回给弹层在
+    /// 卡片内联提示（不静默关闭）；`Ok(())` 弹层自关。
+    pub(super) fn file_tree_submit_prompt(
+        &mut self,
+        kind: &FileTreePromptKind,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let name = value.trim();
+        if name.is_empty() {
+            return Err("名称不能为空".to_string());
+        }
+        match kind {
+            FileTreePromptKind::NewFile { parent } => {
+                self.file_tree_create_file(parent, name, window, cx)
+            }
+            FileTreePromptKind::NewFolder { parent } => {
+                self.file_tree_create_dir(parent, name, window, cx)
+            }
+            FileTreePromptKind::Rename { path, is_dir } => {
+                self.file_tree_rename(path, *is_dir, name, window, cx)
+            }
+        }
+    }
+
+    /// 名称合法性校验（新建/重命名共用）：非空、非 `.`/`..`、无路径分隔/非法字符。
+    fn validate_name(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("名称不能为空".to_string());
+        }
+        if name == "." || name == ".." {
+            return Err("非法名称".to_string());
+        }
+        if name.contains(&['/', '\\', ':', '*', '?', '"', '<', '>', '|'][..]) {
+            return Err("名称包含非法字符：/ \\ : * ? \" < > |".to_string());
+        }
+        Ok(())
+    }
+
+    /// 新建文件：建空文件 → 作废父目录缓存重扫 → **自动打开成选项卡** → 会话落盘。
+    fn file_tree_create_file(
+        &mut self,
+        parent: &std::path::Path,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        Self::validate_name(name)?;
+        let target = parent.join(name);
+        if target.exists() {
+            return Err("已存在同名文件或文件夹".to_string());
+        }
+        std::fs::File::create(&target).map_err(|e| format!("新建失败：{e}"))?;
+        self.file_tree_invalidate(&target, window, cx);
+        self.open_path_or_activate(&target, window, cx); // 新建文件 → 自动打开
+        self.schedule_session_flush(cx, true);
+        Ok(())
+    }
+
+    /// 新建文件夹：建空目录 → 作废父目录缓存重扫。
+    fn file_tree_create_dir(
+        &mut self,
+        parent: &std::path::Path,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        Self::validate_name(name)?;
+        let target = parent.join(name);
+        if target.exists() {
+            return Err("已存在同名文件或文件夹".to_string());
+        }
+        std::fs::create_dir(&target).map_err(|e| format!("新建文件夹失败：{e}"))?;
+        self.file_tree_invalidate(&target, window, cx);
+        Ok(())
+    }
+
+    /// 重命名：磁盘改名 → 树刷新 → **已打开选项卡路径同步**（含目录下子树）+ 会话落盘。
+    /// 重命名根目录：换根（重建树）并按新路径持久化 `opened_folder`。
+    fn file_tree_rename(
+        &mut self,
+        path: &std::path::Path,
+        is_dir: bool,
+        new_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        Self::validate_name(new_name)?;
+        let target = path
+            .parent()
+            .map(|p| p.join(new_name))
+            .unwrap_or_else(|| PathBuf::from(new_name));
+        if target == path {
+            return Ok(()); // 名未变 → 无操作
+        }
+        if target.exists() {
+            return Err("已存在同名文件或文件夹".to_string());
+        }
+        std::fs::rename(path, &target).map_err(|e| format!("重命名失败：{e}"))?;
+        let was_root = self.sidebar.files.root.as_deref() == Some(path);
+        if was_root {
+            // 重命名根：换根重建树（展开/缓存全清，不可复用旧路径）。
+            self.sidebar.files.set_root(Some(target.clone()));
+            self.sidebar.files.expanded.insert(target.clone());
+            self.spawn_file_tree_scan(target.clone(), window, cx);
+            self.persist_prefs(); // opened_folder 跟随新根路径
+        } else {
+            self.file_tree_invalidate(path, window, cx);
+        }
+        // 已打开选项卡路径同步（文件精确 / 目录下子树整体前缀改写）。
+        for tab in self.tabs.iter_mut() {
+            let Some(fp) = tab.file_path.clone() else { continue };
+            if fp == path {
+                tab.file_path = Some(target.clone());
+            } else if is_dir
+                && fp.starts_with(path)
+                && let Ok(rel) = fp.strip_prefix(path)
+            {
+                tab.file_path = Some(target.join(rel));
+            }
+        }
+        self.schedule_session_flush(cx, true); // 会话清单记录新路径
+        Ok(())
+    }
+
+    /// 删除请求：原生确认框（复用「未保存关闭确认」同款 `window.prompt`）→ 确认后执行。
+    pub(super) fn file_tree_delete_request(
+        &mut self,
+        path: &std::path::Path,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let kind_label = if is_dir { "文件夹" } else { "文件" };
+        let entity = cx.entity();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "删除",
+            Some(&format!("确定要删除{kind_label}「{name}」？此操作不可恢复。")),
+            &["删除", "取消"],
+            cx,
+        );
+        let target = path.to_path_buf();
+        window
+            .spawn(cx, async move |cx| {
+                let idx = answer.await.unwrap_or(1);
+                if idx == 0 {
+                    let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                        this.file_tree_delete(&target, window, cx);
+                    });
+                }
+                let _ = ();
+            })
+            .detach();
+    }
+
+    /// 执行删除：**任一受影响打开选项卡有未保存修改 → 不删磁盘**（不可静默丢内容，
+    /// 提示后取消整个删除，请用户先保存/关闭相关选项卡）；否则干净关闭受影响选项卡
+    /// → 删磁盘 → 树刷新。删根 → 清空文件夹根（等价关文件夹）。
+    pub(super) fn file_tree_delete(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_dir = path.is_dir();
+        // 受影响的打开选项卡：文件精确匹配 / 目录按前缀覆盖子树。
+        let affected: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.file_path.as_ref().is_some_and(|p| {
+                    if is_dir {
+                        p.starts_with(path)
+                    } else {
+                        p == path
+                    }
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // 决策：任一受影响选项卡有未保存修改 → 不删磁盘（不可静默丢内容），提示后取消。
+        if affected.iter().any(|&i| self.tabs[i].dirty) {
+            self.status = SharedString::from(
+                "有未保存修改，未删除：请先保存或关闭相关选项卡，再重试删除",
+            );
+            self.status_ok = false;
+            cx.notify();
+            return;
+        }
+        // 干净受影响选项卡：同步关闭（下标降序防位移）。
+        for &i in affected.iter().rev() {
+            self.remove_tab(i, window, cx);
+        }
+        // 删磁盘。
+        let res = if is_dir {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match res {
+            Ok(()) => {
+                let was_root = self.sidebar.files.root.as_deref() == Some(path);
+                if was_root {
+                    self.sidebar.files.set_root(None);
+                    self.persist_prefs(); // opened_folder 写回 null
+                } else {
+                    self.file_tree_invalidate(path, window, cx);
+                }
+                self.schedule_session_flush(cx, true);
+                self.status = SharedString::from(format!(
+                    "已删除{}{}",
+                    if is_dir { "文件夹" } else { "文件" },
+                    path.display()
+                ));
+                self.status_ok = true;
+            }
+            Err(e) => {
+                self.status = SharedString::from(format!("删除失败：{e}"));
+                self.status_ok = false;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 树模型失效（新建/重命名/删除后的派生状态失效源）：父目录直接子项缓存作废并
+    /// 重扫；`changed`（目录时含其后代）的展开集/子项缓存/在途扫描一并作废；布局代 +1。
+    fn file_tree_invalidate(
+        &mut self,
+        changed: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(parent) = changed.parent()
+            && self
+                .sidebar
+                .files
+                .root
+                .as_deref()
+                .is_some_and(|r| parent.starts_with(r) || parent == r)
+        {
+            self.sidebar.files.children.remove(parent);
+            self.sidebar.files.pending.remove(parent);
+            self.spawn_file_tree_scan(parent.to_path_buf(), window, cx);
+        }
+        self.sidebar
+            .files
+            .children
+            .retain(|p, _| p != changed && !p.starts_with(changed));
+        self.sidebar.files.pending.retain(|p| p != changed && !p.starts_with(changed));
+        self.sidebar.files.expanded.retain(|p| p != changed && !p.starts_with(changed));
+        self.sidebar.files.layout_gen = self.sidebar.files.layout_gen.wrapping_add(1);
     }
 }
 
@@ -2079,6 +3146,169 @@ pub(super) struct SearchLineHit {
     pub(super) range: std::ops::Range<usize>,
     /// 去掉首尾空白后的行内容（渲染条目显示）。
     pub(super) snippet: String,
+}
+
+/// 文件夹级搜索跳过的目录名（黑名单）：VCS / 构建产物 / 依赖目录。
+const FOLDER_SCAN_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
+/// 文件树「过滤文件名」输入防抖时长（ms）：停顿这么久才提交过滤词并重收集可见行
+/// （大目录下避免逐键 O(可见行) 重算布局缓存，同搜索防抖姿势）。
+const FILES_FILTER_DEBOUNCE_MS: u64 = 120;
+/// 文件夹级搜索跳过的**超大文本文件**阈值：> 5MB 不读盘跳过（元数据判断）。
+const FOLDER_SCAN_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+/// 二进制嗅探采样窗口（读前 N 字节含 NUL → 视为二进制跳过）。
+const FOLDER_SCAN_BINARY_SNIFF_BYTES: usize = 8192;
+
+/// 文件夹级搜索「单文件命中组」（按文件分组渲染；词频 = 组内命中条数）。
+#[derive(Debug, Clone)]
+pub(crate) struct FolderFileHit {
+    /// 命中文件绝对路径（点击行打开的依据）。
+    pub(super) path: PathBuf,
+    /// 组内命中行（行号 / LF 归一化全文字节区间 / trim 片段）。
+    pub(super) hits: Vec<SearchLineHit>,
+}
+
+/// 文件夹级搜索的（后台增量装配的）扫描结果缓存。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct FolderSearchScan {
+    /// 归一化查询词（渲染命中词高亮与缓存键的一部分）。
+    pub(super) query: String,
+    /// 扫描时的文件夹根（缓存键的一部分：换根即失效重扫）。
+    pub(super) root: Option<PathBuf>,
+    /// 按文件分组的结果（扫描完成顺序）。
+    pub(super) files: Vec<FolderFileHit>,
+    /// 是否因达到 [`FOLDER_SEARCH_RESULT_CAP`] 截断。
+    pub(super) truncated: bool,
+    /// 是否仍在后台扫描（UI 据此显示「搜索中…」）。
+    pub(super) running: bool,
+    /// 扫描代：换查询 / 换根发起新扫描即 +1，旧代异步回调按代丢弃（防晚到覆盖新结果）。
+    pub(super) generation: u64,
+    /// 累计命中条数（词频与截断判定依据）。
+    pub(super) total_hits: usize,
+}
+
+/// 后台扫描 → 主线程的一块增量更新（有界 channel，见 [`EditorApp::start_folder_scan`]）。
+#[derive(Debug)]
+pub(super) enum FolderScanUpdate {
+    /// 一个文件命中组（含该文件全部命中行）。
+    File(FolderFileHit),
+    /// 扫描完成（携带是否截断）。
+    Done { truncated: bool },
+}
+
+/// 在 `text` 中收集查询词 `q` 的**全部**大小写不敏感命中的字节区间（非重叠、逐段推进），
+/// 供命中词预览高亮。区间恒落在 UTF-8 字符边界（`find_ci` 语义保证），跳过重叠尾随。
+fn highlight_ranges(text: &str, q: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    if q.is_empty() {
+        return out;
+    }
+    let mut pos = 0usize;
+    while pos < text.len() {
+        let Some(r) = find_ci(&text[pos..], q) else {
+            break;
+        };
+        let start = pos + r.start;
+        let end = pos + r.end;
+        if end <= start {
+            break; // 空命中防御（理论上不会发生）
+        }
+        out.push(start..end);
+        pos = end;
+    }
+    out
+}
+
+/// 后台递归扫描文件夹内容（**不在主线程执行**）：跳过黑名单目录 / 会话目录、跳过
+/// >5MB 超大文件与二进制 / 非 UTF-8 文件；对每个候选文本文件 LF 归一化后逐行扫查询词
+/// （`scan_line_hits`），命中文件作为一个块经有界 `tx` 外推（背压让出）。`total` 为
+/// 累计命中条数，达到 `cap` 即停止扫描（返回截断标记）。单文件读失败 / 单目录读失败 /
+/// 无权限 → 跳过该条目计为已扫描，**不中断**整体扫描。
+pub(super) async fn folder_scan_collect(
+    root: &std::path::Path,
+    q: &str,
+    tx: futures::channel::mpsc::Sender<FolderScanUpdate>,
+    session_dir: &std::path::Path,
+    total: &mut usize,
+    cap: usize,
+) -> bool {
+    use futures::SinkExt as _;
+    let mut tx = tx;
+    // 显式栈 DFS（避免深目录递归爆栈；深度顺序对结果无影响，条目整体排序保证确定性）。
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if *total >= cap {
+            return true;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue; // 单目录读失败 → 跳过不中断
+        };
+        // 条目排序保证确定性（目录/文件一律按文件名），与树视图 read_dir_entries 同款。
+        let mut entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if *total >= cap {
+                return true;
+            }
+            let path = entry.path();
+            // 目录判定用 `entry.file_type()`（**不跟随**符号链接）：符号链接 / Windows
+            // 目录联接指向的目录一律**不递归**进栈，防「目录循环引用 → 扫描无限循环」
+            // （`metadata` 跟随链接，用其判目录时 `.→自身` 的联接会无限入栈白耗磁盘）。
+            let Ok(ft) = entry.file_type() else {
+                continue; // 单条目元数据失败 → 跳过
+            };
+            if ft.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if FOLDER_SCAN_SKIP_DIRS.contains(&name) || path == *session_dir {
+                    continue;
+                }
+                stack.push(path);
+            } else {
+                // 文件（含指向文件的符号链接）：跟随元数据取真实类型 / 大小；指向目录的
+                // 符号链接 / 其它特殊文件 → 跳过（一律不递归，防循环）。
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue; // 单条目元数据失败 → 跳过
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                if meta.len() > FOLDER_SCAN_MAX_FILE_BYTES {
+                    continue; // 超大文件：不读盘跳过
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue; // 单文件读失败 / 无权限 → 跳过不中断
+                };
+                // 二进制检测：采样窗口含 NUL 字节视为二进制；再校验整篇 UTF-8
+                //（编辑器以 UTF-8 读盘，非 UTF-8 文件即使无 NUL 也不可索引）。
+                if bytes[..bytes.len().min(FOLDER_SCAN_BINARY_SNIFF_BYTES)].contains(&0) {
+                    continue;
+                }
+                let Ok(content) = std::str::from_utf8(&bytes) else {
+                    continue;
+                };
+                // LF 归一化后再扫：命中行号 / 字节区间与打开文件后的编辑缓冲一致
+                //（`open_file` 同样做 `normalize_newlines`），点击跳转选中才不偏。
+                // 无 `\r`（LF 已归一）直接扫原文零分配；有 CR/CRLF 才物化归一化副本。
+                let remaining = cap.saturating_sub(*total);
+                let mut hits: Vec<SearchLineHit> = Vec::new();
+                if content.contains('\r') {
+                    let normalized = crate::app::EditorApp::normalize_newlines(content);
+                    scan_line_hits(&normalized, q, remaining, &mut hits);
+                } else {
+                    scan_line_hits(content, q, remaining, &mut hits);
+                }
+                if hits.is_empty() {
+                    continue;
+                }
+                *total += hits.len();
+                let f = FolderFileHit { path, hits };
+                let _ = tx.send(FolderScanUpdate::File(f)).await;
+            }
+        }
+    }
+    *total >= cap
 }
 
 /// ASCII 大小写不敏感子串查找（无分配），返回首个命中的字节区间。

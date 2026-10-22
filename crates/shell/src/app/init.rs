@@ -48,6 +48,17 @@ impl EditorApp {
         });
         // 加载持久化用户偏好（主题三态 / 字号 / 侧边栏宽度；缺失或损坏 → 默认）。
         let prefs = UserPrefs::load();
+        // 文件树「过滤文件名」输入框：内容变化 → 登记防抖待提交过滤词（typeahead）。
+        let files_filter = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("过滤文件名…")
+                .default_value("")
+        });
+        let files_filter_sub =
+            cx.subscribe(&files_filter, |this, _emitter, _ev: &InputEvent, cx| {
+                let value = this.files_filter_state.read(cx).value().to_string();
+                this.schedule_files_filter_debounce(value, cx);
+            });
         // 打开文件夹根路径（启动恢复文件树；`prefs` 随后被逐字段消费，先取出）。
         let opened_folder = prefs.opened_folder.clone();
         // 最近打开（文件夹 / 文件）：新→旧的路径列表，跨重启恢复「打开最近」面板。
@@ -110,6 +121,10 @@ impl EditorApp {
             _search_sub: search_sub,
             pdf_search: None,
             search_scan: None,
+            search_scope: sidebar::SearchScopeTab::CurrentFile,
+            search_scope_manual: false,
+            folder_search: None,
+            folder_search_gen: 0,
             search_scan_count: 0,
             search_committed: String::new(),
             search_pending: String::new(),
@@ -126,6 +141,16 @@ impl EditorApp {
             tab_bar_menu_pos: None,
             tab_bar_menu_entity: None,
             tab_bar_menu_sub: None,
+            file_tree_menu_pos: None,
+            file_tree_menu_entity: None,
+            file_tree_menu_sub: None,
+            file_tree_prompt: None,
+            _file_tree_prompt_sub: None,
+            files_filter_state: files_filter,
+            _files_filter_sub: files_filter_sub,
+            files_filter: String::new(),
+            files_filter_pending: String::new(),
+            files_filter_debounce: SeqAfter::default(),
             recent_folders,
             recent_files,
             recent_panel: None,

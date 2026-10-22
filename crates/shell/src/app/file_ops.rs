@@ -1225,6 +1225,9 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 换根 / 关文件夹 → 旧文件夹级搜索结果失效（下次渲染按新根重扫；根为 None 时
+        // 「整个文件夹」范围不可用，走未打开文件夹提示）。
+        self.folder_search = None;
         if !path.is_dir() {
             self.sidebar.files.set_root(None);
             self.status = SharedString::from(format!("文件夹无效：{}", path.display()));
