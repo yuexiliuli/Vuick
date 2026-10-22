@@ -1,9 +1,9 @@
 //! 空状态占位：无标签页 / 空目录 / 无搜索命中时的微软风自绘占位（插图 + 文案 + 入口）。
 //!
-//! 插图采用「变色龙吉祥物」扁平 3D 风 App 图标：圆角方形浅蓝渐变底 + 青蓝圆身变色龙
-//! （巨大圆形单眼 + 螺旋卷尾），手绘全彩矢量 SVG（resvg 全彩栅格化 + `img()` 上屏），
-//! 平滑贝塞尔曲线替代 div 拼装，观感大幅提升且零图片资产文件；固定品牌色板
-//! （亮暗主题一致），青蓝色调呼应「代码/文档/媒体多格式阅读器」的清新气质。
+//! 插图采用「变色龙吉祥物」App 图标：圆角方形浅蓝渐变底 + 青蓝圆身变色龙（巨大圆形
+//! 单眼 + 螺旋卷尾），来自入库 288×288 PNG（调色板 8bpp，见 [`crate::assets`]），解码成
+//! `gpui::RenderImage` 后 `img()` 上屏；固定品牌色板（亮暗主题一致），青蓝色调呼应
+//! 「代码/文档/媒体多格式阅读器」的清新气质。
 //!
 //! 两个入口：
 //! - [`empty_state_hero`]：正文区整屏空态（零选项卡欢迎页）——160×120 固定
@@ -11,8 +11,6 @@
 //!   **双击**回调；随窗口自适应居中，仅一次透明度淡入。
 //! - [`compact_empty_state`]：侧栏窄面板空态（空目录 / 无搜索命中）——小号灰图标 +
 //!   弱化文案，与正文区空态同款灰阶视觉。
-
-use std::sync::{Arc, OnceLock};
 
 use gpui::{
     AnimationExt, App, Hsla, ImageSource, InteractiveElement, IntoElement, ParentElement, Styled,
@@ -23,27 +21,12 @@ use crate::ui::icon::{Icon, IconName};
 use crate::ui::motion::hover_spring;
 use crate::ui::theme::Theme;
 
-/// 变色龙吉祥物全彩 SVG（340×326）：用户原图经「降采样栅格化 → 非底色 kmeans 5 色
-/// posterize → potrace 逐色贝塞尔拟合」（1442 段三次贝塞尔，转角均值 46.7°→15°，
-/// 颜色保持同一青蓝族），比像素折线版「线条顺滑不凌乱」；单色系干净清爽，
-/// 资产存于 `assets/icon-chameleon.svg`；resvg 全彩栅格化后 `img()` 上屏。
-const CHAMELEON_SVG: &[u8] = include_str!("../assets/icon-chameleon.svg").as_bytes();
-
-/// 惰性栅格化变色龙 SVG → 渲染图像（进程内仅一次；resvg 全彩、含渐变/阴影/柔光）。
-fn chameleon_render(cx: &mut App) -> Arc<gpui::RenderImage> {
-    static RENDER: OnceLock<Arc<gpui::RenderImage>> = OnceLock::new();
-    RENDER
-        .get_or_init(|| {
-            cx.svg_renderer()
-                .render_single_frame(CHAMELEON_SVG, 1.0)
-                .expect("变色龙 SVG 栅格化失败")
-        })
-        .clone()
-}
+/// 变色龙吉祥物图：内嵌 128×128 ICO（PNG 编码）一次性解码成 `gpui::RenderImage`
+/// （见 [`crate::assets::app_icon_render`]），与自绘标题栏最左图标同源同图。
 
 /// 空态插图（固定 160×120）：变色龙吉祥物 App 图标（自含圆角浅蓝渐变底），
-/// 固定品牌色板双主题一致；SVG 全彩矢量一次栅格化后 `img()` 上屏。
-pub(crate) fn empty_illustration(cx: &mut App) -> gpui::AnyElement {
+/// 固定品牌色板双主题一致；ICO 解码渲染后 `img()` 上屏。
+pub(crate) fn empty_illustration() -> gpui::AnyElement {
     div()
         .id("empty-illustration")
         .debug_selector(|| "empty-illustration".into())
@@ -59,11 +42,11 @@ pub(crate) fn empty_illustration(cx: &mut App) -> gpui::AnyElement {
                 .id("chameleon-icon")
                 .debug_selector(|| "chameleon-icon".into())
                 .w(px(112.))
-                .h(px(107.))
+                .h(px(112.))
                 .child(
-                    img(ImageSource::Render(chameleon_render(cx)))
+                    img(ImageSource::Render(crate::assets::app_icon_render()))
                         .w(px(112.))
-                        .h(px(107.)),
+                        .h(px(112.)),
                 ),
         )
         .into_any_element()
@@ -105,7 +88,7 @@ pub fn empty_state_hero(
         .items_center()
         .justify_center()
         .gap(px(14.))
-        .child(empty_illustration(cx))
+        .child(empty_illustration())
         .child(
             div()
                 .text_size(px(16.))
@@ -190,7 +173,7 @@ mod tests {
             div()
                 .w(px(400.))
                 .h(px(400.))
-                .child(empty_illustration(cx))
+                .child(empty_illustration())
                 .child(empty_state_hero("主", "副", None, Some("双击新建文件"), None, cx))
                 .child(compact_empty_state("compact-test", IconName::Search, "无结果", cx))
         }

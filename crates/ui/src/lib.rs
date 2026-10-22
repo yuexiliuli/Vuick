@@ -43,6 +43,7 @@
 //! 以下 crate 根短别名让迁移期 `config::` / `crate::actions::` / `ime::` /
 //! `crate::ui::` 旧路径零改动即可解析（与根包 P1/P2 的别名过渡同一策略）。
 
+pub mod assets;
 pub mod button;
 pub mod empty_state;
 pub mod icon;

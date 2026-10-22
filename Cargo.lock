@@ -4979,6 +4979,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 name = "tray"
 version = "0.1.0"
 dependencies = [
+ "image",
  "windows 0.62.2",
 ]
 
@@ -5004,6 +5005,7 @@ dependencies = [
  "base",
  "config",
  "gpui",
+ "image",
  "ime",
  "regex",
 ]

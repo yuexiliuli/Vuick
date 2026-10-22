@@ -447,6 +447,8 @@ impl EditorApp {
             .bg(self.mica_bar_bg())
             .border_b_1()
             .border_color(self.hairline())
+            // 窗口最顶部最左：应用图标（内嵌 128×128 ICO 变色龙，ui::assets 同源）。
+            .child(ui::assets::app_icon_element(px(18.)))
             .child(self.render_menu_buttons(cx))
             .child(
                 div()

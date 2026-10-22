@@ -1,6 +1,5 @@
-# 决策备选版图标：只保留当前生效的 icon-chameleon.svg 入库
-icon-chameleon-A-curve.svg
-icon-chameleon-B-potrace.svg
-icon-chameleon-C-flat.svg
-icon-chameleon-D-hires.svg
-icon-chameleon-E-polygon.svg
+*.ico
+*.png
+# app-icon-228x228.png 被 crates/tray（HICON）与 crates/ui（标题栏/欢迎页）编译期
+# include_bytes 内嵌，不入库会在全新检出时断链 → 单独放行这条。
+!app-icon-228x228.png

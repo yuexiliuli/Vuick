@@ -7,7 +7,12 @@
         let (app, cx) = add_app(cx);
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                assert!(!app.close_to_tray, "默认关（None 未设置 → false）");
+                // K8：`add_app` 经 `EditorApp::new` → `new_impl`（app/init.rs:80
+                // `prefs.close_to_tray.unwrap_or(false)`）直读真实 %APPDATA% 的 config
+                // （config crate 作依赖编译不带自身 cfg(test)，照常读盘）——真机配置可能含
+                // 用户开启过的 "close_to_tray":true，测试须与真机配置解耦：显式归零默认关
+                // 再跑翻转断言，不断言从真实 config 读到的初始值。
+                app.close_to_tray = false;
                 app.toggle_close_to_tray(window, cx);
                 assert!(app.close_to_tray, "点击一次 → 开");
                 // tray crate 状态联动：开关已翻、主窗口已知 → 应判定「点 × 隐藏到托盘」。

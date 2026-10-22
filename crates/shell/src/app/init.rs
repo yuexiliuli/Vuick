@@ -261,6 +261,11 @@ impl EditorApp {
                         tray::set_main_hwnd(win32.hwnd.get() as isize);
                     }
                     tray::set_close_to_tray(app.close_to_tray);
+                    // 托盘图标常驻（用户要求：任务栏 + 系统托盘都用变色龙；不随开关消失）。
+                    tray::ensure_tray_icon();
+                    // 程序图标：运行时对主窗口 HWND 发 WM_SETICON（任务栏 / Alt+Tab / 标题栏）
+                    // = icon-chameleon_64x64.ico 图标（crates/tray::APP_ICO），HICON 与托盘图标共用一份。
+                    tray::set_window_icon();
                     window.on_window_should_close(cx, |_window, _cx| {
                         if tray::should_close_to_tray() {
                             tray::hide_main_window();
