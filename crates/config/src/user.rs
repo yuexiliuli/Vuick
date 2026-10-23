@@ -84,6 +84,10 @@ pub struct UserPrefs {
     pub recent_folders: Vec<String>,
     /// 最近打开的文件路径（新→旧，至多 [`RECENT_MAX`] 条）。
     pub recent_files: Vec<String>,
+    /// 音乐播放器音乐目录。`None` = 未设置过，读默认 [`crate::limits::DEFAULT_MUSIC_DIR`]。
+    pub music_dir: Option<String>,
+    /// 音乐收藏（歌曲路径字符串，新→旧）。
+    pub music_liked: Vec<String>,
 }
 
 impl UserPrefs {
@@ -142,10 +146,16 @@ impl UserPrefs {
                 prefs.opened_folder = Some(s.clone());
             }
         }
+        if let Some(Value::String(s)) = map.get("music_dir") {
+            if !s.is_empty() {
+                prefs.music_dir = Some(s.clone());
+            }
+        }
         // 最近打开（文件夹 / 文件）：读取字符串数组，非数组 / 缺省 → 空；
         // 元素非字符串跳过；截断至 RECENT_MAX（安全护栏，防手改配置超长）。
         prefs.recent_folders = Self::read_string_array(map, "recent_folders");
         prefs.recent_files = Self::read_string_array(map, "recent_files");
+        prefs.music_liked = Self::read_string_array(map, "music_liked");
         prefs
     }
 
@@ -171,6 +181,8 @@ impl UserPrefs {
             "opened_folder": self.opened_folder,
             "recent_folders": self.recent_folders,
             "recent_files": self.recent_files,
+            "music_dir": self.music_dir,
+            "music_liked": self.music_liked,
         })
     }
 
@@ -243,6 +255,8 @@ mod tests {
             opened_folder: None,
             recent_folders: Vec::new(),
             recent_files: Vec::new(),
+            music_dir: None,
+            music_liked: Vec::new(),
         };
         let back = UserPrefs::from_json_value(&p.to_json_value());
         assert_eq!(back.session_restore, Some(false));
@@ -383,5 +397,47 @@ mod tests {
             vec!["a.txt".to_string(), "b.txt".to_string()],
             "非字符串元素应跳过"
         );
+    }
+
+    /// 音乐播放器字段 roundtrip：music_dir（None = 未设置 / 空串回退 None；Some 写入并
+    /// 读回）、music_liked（字符串数组，非数组/缺省 → 空）。走纯函数，不触碰真实配置。
+    #[test]
+    fn music_prefs_json_roundtrip() {
+        // None / 缺省：JSON 值为 null、读回 None；music_liked 空数组。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["music_dir"], Value::Null);
+        assert_eq!(v["music_liked"], serde_json::json!([]));
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.music_dir, None);
+        assert!(back.music_liked.is_empty());
+
+        // Some(路径) 与收藏 roundtrip（其余字段不受影响）。
+        let p = UserPrefs {
+            music_dir: Some("D:\\music\\music".to_string()),
+            music_liked: vec![
+                "D:\\music\\music\\周杰伦 - 晴天.ogg".to_string(),
+                "D:\\music\\music\\林俊杰 - 江南.mp3".to_string(),
+            ],
+            ..UserPrefs::default()
+        };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(back.music_dir.as_deref(), Some("D:\\music\\music"));
+        assert_eq!(
+            back.music_liked,
+            p.music_liked,
+            "音乐收藏应 roundtrip 且保持顺序"
+        );
+        assert_eq!(back.theme, ThemePref::Follow, "其余字段不受影响");
+
+        // 非法值：music_dir 空串 / 非字符串 → None；music_liked 非数组 → 空。
+        let v = serde_json::json!({ "music_dir": "" });
+        assert_eq!(UserPrefs::from_json_value(&v).music_dir, None);
+        let v = serde_json::json!({ "music_dir": 42 });
+        assert_eq!(UserPrefs::from_json_value(&v).music_dir, None);
+        let v = serde_json::json!({ "music_liked": "x" });
+        assert!(UserPrefs::from_json_value(&v).music_liked.is_empty());
+        let back = UserPrefs::from_json_value(&Value::Null);
+        assert_eq!(back.music_dir, None);
+        assert!(back.music_liked.is_empty());
     }
 }

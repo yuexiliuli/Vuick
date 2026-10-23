@@ -28,6 +28,9 @@ pub const EDITOR_VSCROLL_BOTTOM_EXTRA_LINES: usize = 8;
 /// 「打开最近」每类（文件夹 / 文件）最近记录的**上限条数**：超过最旧的被挤出；
 /// 面板四区域模式只展示前 10 条，完整列表模式展示全部（≤此上限）。
 pub const RECENT_MAX: usize = 50;
+/// 音乐播放器音乐目录的**默认值**（`music_dir` 未设置时读取的兜底路径；反斜杠
+/// 是 Windows 路径字面量，与 `D:\music\music` 目录一致）。
+pub const DEFAULT_MUSIC_DIR: &str = "D:\\music\\music";
 /// 自动折叠候选（gutter 默认指示器）的**全量扫描行数上限**：≤该行数的文档打开/编辑
 /// 时整篇扫一遍缩进折叠候选（O(行数)，几十万行毫秒级），gutter 默认显示可折叠指示器；
 /// 超过则由「手动 Ctrl+Shift+[/点击」按需折叠（候选为空，避免超大文档每键 O(N) 重扫）。

@@ -1,0 +1,17 @@
+[package]
+name = "music"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 音乐播放器核心引擎 crate（FFmpeg 音频经 libloading 运行时加载 + cpal 输出 + 播放引擎；UI 在后续阶段添加）"
+
+[dependencies]
+gpui = { workspace = true }
+anyhow = { workspace = true }
+cpal = { workspace = true }
+libloading = { workspace = true }
+config = { path = "../config" }
+
+[dev-dependencies]
+# zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
+gpui = { workspace = true, features = ["test-support"] }

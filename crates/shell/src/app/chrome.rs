@@ -220,6 +220,10 @@ impl EditorApp {
         if cfg!(test) {
             return;
         }
+        // 音乐播放器偏好（music_dir / music_liked）不由 shell 维护：本处写盘是 主题/字号/
+        // 最近打开 等其它设置的持久化，须沿用已存值，否则每次保存都会把音乐目录/收藏
+        // 覆盖回空（K10 派生状态一次性读回）。
+        let existing = UserPrefs::load();
         UserPrefs {
             theme: self.theme_pref,
             font_size: Some(self.font_size),
@@ -244,6 +248,8 @@ impl EditorApp {
             // 只随打开/移除/清空这类状态变化写，不逐帧 / 不重复全量重写）。
             recent_folders: self.recent_folders.clone(),
             recent_files: self.recent_files.clone(),
+            music_dir: existing.music_dir,
+            music_liked: existing.music_liked,
         }
         .save();
     }
