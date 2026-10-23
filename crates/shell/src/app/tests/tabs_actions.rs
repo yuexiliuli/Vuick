@@ -969,11 +969,12 @@
         settle_frames(cx, 3);
         let tabs0 = cx.update(|_w, cx| app.read(cx).tabs.len());
 
-        // 右键选项卡栏内（栏左缘右侧 40px、垂直居中）→ 弹上下文菜单
+        // 右键选项卡栏**空白区**（首标签之后的栏内区域，语义 = 栏级菜单；标签上右键已
+        // 专属「选项卡管理菜单」，见 tabs_context.rs）→ 弹「新建文件/打开文件」菜单
         let bar = cx
             .debug_bounds("tab-bar")
             .expect("选项卡栏 tab-bar 应渲染");
-        let right_click_at = gpui::Point::new(bar.origin.x + px(40.), bar.origin.y + px(16.));
+        let right_click_at = gpui::Point::new(bar.origin.x + px(400.), bar.origin.y + px(16.));
         cx.simulate_mouse_down(right_click_at, MouseButton::Right, Default::default());
         settle_frames(cx, 3);
         assert!(
@@ -1009,11 +1010,11 @@
             "关闭后菜单项不应再渲染"
         );
 
-        // 再右键 → 点「打开文件」→ 触发 open_dialog（计数断言）且菜单关闭
+        // 再右键（空白区）→ 点「打开文件」→ 触发 open_dialog（计数断言）且菜单关闭
         let bar2 = cx
             .debug_bounds("tab-bar")
             .expect("新建后选项卡栏仍在");
-        let right_click_at2 = gpui::Point::new(bar2.origin.x + px(60.), bar2.origin.y + px(16.));
+        let right_click_at2 = gpui::Point::new(bar2.origin.x + px(400.), bar2.origin.y + px(16.));
         cx.simulate_mouse_down(right_click_at2, MouseButton::Right, Default::default());
         settle_frames(cx, 3);
         assert!(
@@ -1046,11 +1047,11 @@
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         settle_frames(cx, 3);
 
-        // 右键选项卡栏内（栏左缘右侧 40px、垂直中部）→ 菜单应弹在光标处
+        // 右键选项卡栏**空白区**（首标签右方、栏级菜单）→ 菜单应弹在光标处
         let bar = cx
             .debug_bounds("tab-bar")
             .expect("选项卡栏 tab-bar 应渲染");
-        let right_click_at = gpui::Point::new(bar.origin.x + px(40.), bar.origin.y + px(16.));
+        let right_click_at = gpui::Point::new(bar.origin.x + px(400.), bar.origin.y + px(16.));
         cx.simulate_mouse_down(right_click_at, MouseButton::Right, Default::default());
         settle_frames(cx, 3);
         assert!(

@@ -369,6 +369,15 @@ impl EditorApp {
                 this.activate_tab(idx, window, cx);
             }),
         )
+        // 选项卡右键 → 选项卡管理菜单（关闭组 / 移入·复制新窗口组）。
+        // `stop_propagation` 在 `on_tab_right_click` 内：不冒泡到栏级右键（新建/打开）、
+        // 也不触发图片/视频媒体右键菜单。
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this: &mut EditorApp, ev, window, cx| {
+                this.on_tab_right_click(idx, ev, window, cx);
+            }),
+        )
         .with_spring(
             format!("tab-bg-{idx}"),
             hover_spring(if is_active || hovered { 1.0 } else { 0.0 }),
@@ -663,5 +672,387 @@ impl EditorApp {
                 .with_priority(100),
             )
             .into_any_element()
+    }
+
+    // -----------------------------------------------------------------
+    // 选项卡右键管理菜单 + 批量关闭 + 移入/复制新窗口
+    // -----------------------------------------------------------------
+
+    /// 选项卡右键 → 在光标处弹**选项卡管理菜单**（复用 `tab_bar_menu_entity/pos/sub`
+    /// 与 `render_tab_bar_menu` Overlay，同一时刻只开一个）。菜单分组：
+    /// 关闭 / 关闭其他 / 关闭右侧 / 关闭已保存 / 关闭全部 ── 分割线 ──
+    /// 移入新窗口 / 复制到新窗口。
+    /// `stop_propagation`：不冒泡到选项卡栏空白区右键（新建/打开），也不触发媒体右键菜单。
+    pub(super) fn on_tab_right_click(
+        &mut self,
+        idx: usize,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.tab_bar_menu_entity = None;
+        self.tab_bar_menu_pos = None;
+        self.tab_bar_menu_sub = None;
+        let weak = cx.weak_entity();
+        let (menu, sub) = ui::menu::spawn_context_menu(
+            window,
+            cx,
+            move |menu, _window, _cx| {
+                menu.item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("关闭")
+                            .debug_selector(|| "tab-menu-close".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| this.close_tab(idx, window, cx));
+                    })
+                })
+                .item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("关闭其他")
+                            .debug_selector(|| "tab-menu-close-others".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.tab_close_others(idx, window, cx);
+                        });
+                    })
+                })
+                .item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("关闭右侧")
+                            .debug_selector(|| "tab-menu-close-right".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.tab_close_right(idx, window, cx);
+                        });
+                    })
+                })
+                .item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("关闭已保存")
+                            .debug_selector(|| "tab-menu-close-saved".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.tab_close_saved(window, cx);
+                        });
+                    })
+                })
+                .item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("关闭全部")
+                            .debug_selector(|| "tab-menu-close-all".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.tab_close_all(window, cx);
+                        });
+                    })
+                })
+                .separator()
+                .item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("移入新窗口")
+                            .debug_selector(|| "tab-menu-move-new-window".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.tab_move_to_new_window(idx, window, cx);
+                        });
+                    })
+                })
+                .item({
+                    let weak = weak.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("复制到新窗口")
+                            .debug_selector(|| "tab-menu-copy-new-window".into())
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.tab_copy_to_new_window(idx, window, cx);
+                        });
+                    })
+                })
+            },
+            |this, emitter, cx| {
+                if this.tab_bar_menu_entity.as_ref() == Some(&emitter) {
+                    this.tab_bar_menu_entity = None;
+                    this.tab_bar_menu_pos = None;
+                }
+                cx.notify();
+            },
+        );
+        self.tab_bar_menu_pos = Some(ev.position);
+        self.tab_bar_menu_entity = Some(menu);
+        self.tab_bar_menu_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// 批量关闭前的脏/未命名审查：`affected(i)` 为真的选项卡中**任一** `dirty` 或
+    /// `file_path.is_none()`（未命名）→ 中止整次批量（一个都不关）+ 状态栏提示；
+    /// 全部干净 → 返回 true 放行。headless 可测：中止路径不下发任何 `remove_tab`。
+    fn tab_close_guard(&mut self, affected: &dyn Fn(usize) -> bool, cx: &mut Context<Self>) -> bool {
+        let any_unsaved = self
+            .tabs
+            .iter()
+            .enumerate()
+            .any(|(i, t)| affected(i) && (t.dirty || t.file_path.is_none()));
+        if any_unsaved {
+            self.status = SharedString::from("有未保存的更改，未关闭");
+            self.status_ok = false;
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// 「关闭其他」：关闭除 `idx` 外全部；任一受影响脏/未命名 → 中止一个都不关。
+    pub(super) fn tab_close_others(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tab_close_guard(&|i| i != idx, cx) {
+            return;
+        }
+        for i in (0..self.tabs.len()).rev() {
+            if i != idx {
+                self.remove_tab(i, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 「关闭右侧」：关闭 `idx` 右侧全部；任一受影响脏/未命名 → 中止一个都不关。
+    pub(super) fn tab_close_right(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tab_close_guard(&|i| i > idx, cx) {
+            return;
+        }
+        for i in (idx + 1..self.tabs.len()).rev() {
+            self.remove_tab(i, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 「关闭全部」：关闭全部；任一脏/未命名 → 中止一个都不关。
+    pub(super) fn tab_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tab_close_guard(&|_| true, cx) {
+            return;
+        }
+        for i in (0..self.tabs.len()).rev() {
+            self.remove_tab(i, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 「关闭已保存」：只关 `有路径 && !dirty` 的选项卡（定义如此，无中止语义）；
+    /// 脏 / 未命名 / 无路径空选项卡保留。
+    pub(super) fn tab_close_saved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for i in (0..self.tabs.len()).rev() {
+            let saved = self.tabs[i].file_path.is_some() && !self.tabs[i].dirty;
+            if saved {
+                self.remove_tab(i, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 「移入新窗口」：取载荷 → 拆进新独立窗口（级联偏移 = 源窗口左上 + (24,24)）。
+    /// 源窗口剩零选项卡 → 现行为回欢迎页；detached 窗口同样可再拆。
+    pub(super) fn tab_move_to_new_window(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let Some(payload) = self.commit_live_and_take_tab_payload(idx, window, cx) else {
+            return;
+        };
+        self.split_tab_to_new_window(payload, Point::new(px(24.), px(24.)), window, cx);
+    }
+
+    /// 「复制到新窗口」：源选项卡**保留原状**；文本类 = 内容快照副本（独立编辑器缓冲，
+    /// 可独立编辑）；媒体类 = 新窗口按原路径重新打开（文件不可变，路径即快照）。
+    pub(super) fn tab_copy_to_new_window(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        if self.tabs[idx].reader.is_none() {
+            self.tab_copy_text_to_new_window(idx, window, cx);
+        } else if let Some(p) = self.tabs[idx].file_path.clone() {
+            // 媒体（PDF/图片/视频）：文件型不可变 → 新窗口按路径重开（路径即快照）。
+            self.tab_copy_media_to_new_window(&p, window, cx);
+        }
+    }
+
+    /// 文本类「复制到新窗口」：先 `make_tab` 得到空 EditorTab（免手抄 25 字段）→
+    /// 用新的独立 CodeEditor 种子（有效文本/语言/光标）→ 回填元数据（路径/dirty/
+    /// 预览等）→ `take_tab_payload` 转 DetachedTab → `split_tab_to_new_window`。
+    /// 副本不共享源编辑器实体（独立缓冲）；源选项卡不动。复制期间源的编辑事件订阅会
+    /// 置脏/刷新缓存，故**先喂编辑器、后回填元数据**（覆盖事件副作用，保 dirty 语义）。
+    fn tab_copy_text_to_new_window(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (text, path, dirty, preview_on, readonly_preview, cursor_row, cursor_col, line_count, char_count) = {
+            let t = &self.tabs[idx];
+            (
+                self.tab_effective_text(idx, cx),
+                t.file_path.clone(),
+                t.dirty,
+                t.preview_on,
+                t.readonly_preview,
+                t.cursor_row,
+                t.cursor_col,
+                t.line_count,
+                t.char_count,
+            )
+        };
+        let lang = path.as_ref().map(|p| Self::language_id(p));
+        // 复制前记下源窗口活动选项卡：`make_tab` 把 `active_tab` 指到瞬态副本、
+        // `take_tab_payload` 拔出副本后又把它改到末位选项卡——复制「非末位」选项卡时
+        // 源窗口活动会跳到最后一个选项卡（可见闪烁）。取下后还原到复制前活动。
+        let kept_active = self.active_tab;
+        let new_idx = self.make_tab(window, cx);
+        // ① 先喂独立编辑器（新实体，不共享源缓冲）：内容 / 语言沿用 / 光标保留。
+        self.tabs[new_idx].editor.update(cx, |ed, _cx| {
+            ed.set_text(&text);
+            if let Some(l) = lang {
+                ed.set_language(Some(l));
+            }
+            ed.set_caret_to(ed.offset_for_line_col(cursor_row, cursor_col));
+        });
+        // ② 后回填元数据（覆盖 set_text 触发的编辑事件副作用，保 dirty/preview 语义）。
+        {
+            let t = &mut self.tabs[new_idx];
+            t.file_path = path.clone();
+            t.dirty = dirty;
+            t.content = SharedString::default();
+            t.line_count = line_count;
+            t.char_count = char_count;
+            t.cursor_row = cursor_row;
+            t.cursor_col = cursor_col;
+            t.preview_on = preview_on;
+            t.readonly_preview = readonly_preview;
+        }
+        let Some(payload) = self.take_tab_payload(new_idx) else {
+            return;
+        };
+        // 还原源窗口活动选项卡（瞬态副本已拔出，原下标全部未变）。
+        self.active_tab = kept_active;
+        // make_tab 期间的会话快照带瞬态副本 tab → 取下后立即补刷（detached 内部早退）。
+        self.schedule_session_flush(cx, true);
+        self.split_tab_to_new_window(payload, Point::new(px(24.), px(24.)), window, cx);
+    }
+
+    /// 媒体类「复制到新窗口」：新开一个 detached 窗口（占位空选项卡）→ 找到该窗口 →
+    /// 占位让位于「按原路径重开」媒体（路径即不可变文件的快照，源选项卡保留）。
+    fn tab_copy_media_to_new_window(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // ① 记当前已注册窗口句柄 → 开新 detached 窗口（占位空载荷）。
+        let before: Vec<AnyWindowHandle> = if cx.has_global::<EditorAppRegistry>() {
+            cx.global::<EditorAppRegistry>()
+                .windows
+                .iter()
+                .map(|(_, wh)| *wh)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let editor = cx.new(|cx| editor::CodeEditor::new(cx));
+        let placeholder = DetachedTab {
+            editor,
+            reader: MediaReader::None,
+            md_wy: None,
+            md_wy_vscroll: gpui::ScrollHandle::new(),
+            md_wy_install: MdWyInstall::default(),
+            epub_images: Default::default(),
+            epub_notes: Default::default(),
+            file_path: None,
+            dirty: false,
+            content: SharedString::default(),
+            line_count: 1,
+            char_count: 0,
+            cursor_row: 0,
+            cursor_col: 0,
+            preview_on: false,
+            preview_fullscreen: false,
+            readonly_preview: false,
+            editor_pending: false,
+            loading_lock: false,
+            edit_version: 0,
+        };
+        self.split_tab_to_new_window(placeholder, Point::new(px(24.), px(24.)), window, cx);
+        // ② 找到刚注册的 detached 新窗口实体（不在 before）→ 占位让位、按原路径重开。
+        let Some((target, wh)) = cx
+            .global::<EditorAppRegistry>()
+            .windows
+            .iter()
+            .find(|(weak, wh)| {
+                !before.contains(wh)
+                    && weak
+                        .upgrade()
+                        .is_some_and(|e| e.read_with(cx, |a, _| a.is_detached))
+            })
+            .map(|(weak, wh)| (weak.clone(), *wh))
+        else {
+            return;
+        };
+        let reopen = path.to_path_buf();
+        let _ = wh.update(cx, |_root, w, cx| {
+            let _ = target.update(cx, |app, cx| {
+                if !app.tabs.is_empty() {
+                    app.remove_tab(0, w, cx); // 占位空选项卡让位
+                }
+                app.open_path_or_activate(&reopen, w, cx);
+            });
+        });
     }
 }

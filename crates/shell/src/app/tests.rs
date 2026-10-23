@@ -2,6 +2,7 @@
 // Split by theme (M2.4): include! splices text within the tests module, so test paths/count stay identical to before.
 include!("tests/setup.rs");
 include!("tests/tabs_actions.rs");
+include!("tests/tabs_context.rs");
 include!("tests/sidebar.rs");
 include!("tests/search_scan.rs");
 include!("tests/preview.rs");

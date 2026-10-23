@@ -70,7 +70,7 @@ impl EditorApp {
     /// 先 `commit_live` 把 live2 写回编辑区再取载荷。两处拖拽移出路径（`release_tab_drag_outside`
     /// 窗口外松开 / `tear_off_drag` 越过窗口缘）此前各自手抄「`live_edit` → `commit_live`」守卫，
     /// 收敛为此 helper；`take_tab_payload` 本身保持无副作用（测试直调、不隐含 commit）。
-    fn commit_live_and_take_tab_payload(
+    pub(super) fn commit_live_and_take_tab_payload(
         &mut self,
         idx: usize,
         window: &mut Window,
