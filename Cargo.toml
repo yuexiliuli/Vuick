@@ -79,6 +79,9 @@ rustc-hash = "2"
 futures = "0.3"
 rfd = "0.17"
 anyhow = "1.0"
+# 文本编码解码（GBK/GB18030/UTF-16 等）：打开非 UTF-8 文本与按原编码保存写回。
+# 许可 Apache-2.0/MIT 双许可，用户已批准（属「不加依赖」纪律的一次性例外）。
+encoding_rs = "0.8"
 zip = "2"
 roxmltree = "0.21"
 # ropey：自研编辑器直接持有的文本存储类型（CodeEditor 缓冲区/语法缓存）。

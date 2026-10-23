@@ -24,6 +24,7 @@ impl EditorApp {
         self.tabs.push(EditorTab {
             editor,
             file_path: None,
+            source_encoding: None, // 新建选项卡 = 纯 UTF-8
             dirty: false,
             content: SharedString::default(),
             line_count: 1,
@@ -937,7 +938,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (text, path, dirty, preview_on, readonly_preview, cursor_row, cursor_col, line_count, char_count) = {
+        let (text, path, dirty, preview_on, readonly_preview, cursor_row, cursor_col, line_count, char_count, src_enc) = {
             let t = &self.tabs[idx];
             (
                 self.tab_effective_text(idx, cx),
@@ -949,6 +950,7 @@ impl EditorApp {
                 t.cursor_col,
                 t.line_count,
                 t.char_count,
+                t.source_encoding, // 复制 → 编码随文档走（保存回写不丢）
             )
         };
         let lang = path.as_ref().map(|p| Self::language_id(p));
@@ -969,6 +971,7 @@ impl EditorApp {
         {
             let t = &mut self.tabs[new_idx];
             t.file_path = path.clone();
+            t.source_encoding = src_enc;
             t.dirty = dirty;
             t.content = SharedString::default();
             t.line_count = line_count;
@@ -1017,6 +1020,7 @@ impl EditorApp {
             epub_notes: Default::default(),
             file_path: None,
             dirty: false,
+            source_encoding: None, // 媒体副本：按原路径重开，编码由新窗口打开时重新探测
             content: SharedString::default(),
             line_count: 1,
             char_count: 0,

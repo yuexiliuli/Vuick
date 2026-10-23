@@ -65,6 +65,9 @@ enum OpenMsg {
         full: ropey::Rope,
         hist: editor::buffer::LineWidthHistogram,
         max_line_chars: usize,
+        /// 本文件探测出的源文本编码（None = 纯 UTF-8），消费端写回选项卡，保存按
+        /// 此编码回写（见 [`crate::app::encoding`]）。
+        src_encoding: Option<&'static encoding_rs::Encoding>,
     },
     Err(std::io::Error),
 }
@@ -152,6 +155,7 @@ async fn read_chunks_async(
                         full: rope,
                         hist: cum_hist,
                         max_line_chars: cum_mx,
+                        src_encoding: reader.source_encoding(),
                     })
                     .await;
                 prod_tx.close_channel();
@@ -602,6 +606,8 @@ impl EditorApp {
                 let mut resume_version: Option<u64> = None;
                 let mut io_err: Option<std::io::Error> = None;
                 let mut aborted = false;
+                // 文件名 → 源编码（探测于生产端，EOF 带回，写回选项卡供保存回写）。
+                let mut src_enc: Option<&'static encoding_rs::Encoding> = None;
                 // WARN-1 节流门：状态字段每块 O(1) 都更新，但 `notify`（→整窗重绘）每
                 // 4 条进度才触发一次（gpui 还会按帧合并）——128MB 打开期 ~127 条进度把
                 // 重绘从 ~127 次压到 ~32 次，避免无谓帧压力；EOF 换装帧必然 notify，终值不丢。
@@ -650,11 +656,13 @@ impl EditorApp {
                             full: r,
                             hist,
                             max_line_chars,
+                            src_encoding,
                         } => {
                             src_len = s;
                             full = Some(r);
                             full_hist = hist;
                             full_mx = max_line_chars;
+                            src_enc = src_encoding; // 源编码写回选项卡（保存按此回写）
                             break 'consume;
                         }
                         OpenMsg::Chunk(chunk) => {
@@ -762,6 +770,12 @@ impl EditorApp {
                 let hist_lines = full_hist.values().sum::<usize>();
                 let p_fin = p.clone();
                 let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                    // 源编码写回选项卡（保存 `write_to_path` 按此编码回写）。
+                    if let Some(tab) = this.tabs.get_mut(idx).filter(|t| {
+                        t.file_path.as_deref() == Some(p_fin.as_path())
+                    }) {
+                        tab.source_encoding = src_enc;
+                    }
                     this.finish_file_text(
                         idx,
                         &p_fin,
@@ -1106,15 +1120,24 @@ impl EditorApp {
             self.record_recent_file(&p);
             return;
         }
-        // 小文档：同步打开（读成功再建 tab；小而快，保持既有行为）
+        // 小文档：同步打开（读成功再建 tab；小而快，保持既有行为）。
+        // 编码感知：BOM 优先 → 合法 UTF-8 → GB18030（见 `app::encoding`）；解码/检测
+        // 失败走既有 `report_open_failure`（不建坏 tab）。
         let t_read = std::time::Instant::now();
-        let text = match fs::read_to_string(&p) {
-            Ok(text) => Self::normalize_newlines(&text),
+        let (decoded, src_enc) = match std::fs::read(&p) {
+            Ok(bytes) => match crate::app::encoding::decode_bytes(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.report_open_failure(&p, &e, window, cx);
+                    return;
+                }
+            },
             Err(e) => {
                 self.report_open_failure(&p, &e, window, cx);
                 return;
             }
         };
+        let text = Self::normalize_newlines(&decoded);
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
                 "[MD_OPEN_DEBUG] 读文件+归一化: {} ms ({} B)",
@@ -1124,6 +1147,10 @@ impl EditorApp {
         }
         let t_mk = std::time::Instant::now();
         let idx = self.make_tab(window, cx);
+        // 源编码写回选项卡（保存 `write_to_path` 按此编码回写；None=纯 UTF-8）。
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.source_encoding = src_enc;
+        }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!("[MD_OPEN_DEBUG] make_tab: {} ms", t_mk.elapsed().as_millis());
         }
@@ -1258,7 +1285,11 @@ impl EditorApp {
         text: String,
         cx: &mut Context<Self>,
     ) -> bool {
-        match fs::write(path, text) {
+        // 按源编码把缓冲 UTF-8 转回字节写盘（None=纯 UTF-8 现状；GBK/UTF-16 等原编码
+        // 回写，含 BOM 还原——文档编码随文档走，「另存为」沿用同一 source_encoding）。
+        let enc = self.tabs.get(idx).and_then(|t| t.source_encoding);
+        let bytes = crate::app::encoding::encode_for_save(&text, enc);
+        match fs::write(path, bytes) {
             Ok(()) => {
                 if let Some(tab) = self.tabs.get_mut(idx) {
                     tab.file_path = Some(path.to_path_buf());

@@ -27,6 +27,47 @@ use config::limits::{
 use editor::buffer::LineWidthHistogram;
 use memchr::memchr2;
 
+use crate::app::encoding::{detect_source_encoding, is_truncated_utf8_tail};
+use encoding_rs::GB18030;
+
+/// 流式解码一块字节：`encoding_rs` 解码器跨块持有残缺多字节（`last` 仅末块为 true）。
+/// 返回解码出的文本（空则 `None`）；遇到 malformed（GB18030/UTF-16 拒收，含二进制与
+/// 截断多字节）→ `InvalidData`（保「二进制/截断 → 打开失败」既有语义）。
+fn decode_stream(
+    dec: &mut encoding_rs::Decoder,
+    bytes: &[u8],
+    is_last: bool,
+) -> io::Result<Option<String>> {
+    // 预分配足够容量（UTF-16 解码输出 ≤ 2 倍字节量），避免局中 OutputFull 扩容循环。
+    let mut dst = String::with_capacity(bytes.len() * 2 + 16);
+    let mut consumed = 0usize;
+    loop {
+        let (result, read) = dec
+            .decode_to_string_without_replacement(&bytes[consumed..], &mut dst, is_last);
+        consumed += read;
+        match result {
+            encoding_rs::DecoderResult::InputEmpty => break,
+            encoding_rs::DecoderResult::OutputFull => {
+                // `decode_to_string_without_replacement` **不扩容**：它以 String 当前容量
+                // 为输出上限（encoding_rs 文档），缓存已满则原地返回 OutputFull 且不消费。
+                // 必须主动补足容量再续解，否则同一容量下反复 OutputFull 死循环（挂死）。
+                dst.reserve(bytes.len().saturating_sub(consumed) * 2 + 32);
+            }
+            encoding_rs::DecoderResult::Malformed(..) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream did not match detected encoding",
+                ))
+            }
+        }
+    }
+    Ok(if dst.is_empty() { None } else { Some(dst) })
+}
+
+/// 首块级「编码探针」上限 = 首个分块目标字节数：读满首块量字节（或到文件尾）才决定
+/// 编码，随后进入流式解码——第一个分块本就要攒到该量才发出，探针不额外延迟首屏。
+const PROBE_CEIL_BYTES: usize = OPEN_FIRST_CHUNK_BYTES;
+
 /// 一块已归一化（LF）文本增量：`text` 只含完整行（除文件末尾可能不含换行的最后一行
 /// 外，均以 `\n` 结尾），`hist` / `max_line_chars` 是这些完整行的精确行宽统计。
 pub(crate) struct TextChunk {
@@ -43,11 +84,18 @@ pub(crate) struct TextChunk {
     pub chars: usize,
 }
 
-/// 分块读盘器：一次取一块（[`Self::next_chunk`]），内部跨块维护 UTF-8 残留、
+/// 分块读盘器：一次取一块（[`Self::next_chunk`]），内部跨块维护编码残留、
 /// `\r` 归一化、行不劈开等状态。
+///
+/// **编码感知**：打开解码顺序（用户确认）——① BOM 优先（UTF-8/UTF-16 LE/BE，去 BOM）；
+/// ② 合法 UTF-8 前缀 → UTF-8 原样（严格校验沿用 `utf8_carry`）；③ 否则 GB18030
+/// （覆盖 GBK/GB2312）。非 UTF-8 用 `encoding_rs` 单个 `Decoder` 跨块持有残缺多字节
+/// 输入（Streaming 解码，不物化整篇）；解码遇 malformed（GB18030 对非法字节序列
+/// 拒收，已探针验证）→ `InvalidData`（保「二进制/截断 → 打开失败」语义）。
 pub(crate) struct ChunkReader {
     file: File,
     buf: Vec<u8>,
+    /// 纯 UTF-8 路径的跨块 UTF-8 残留（≤3 字节不完整尾部）。
     utf8_carry: Vec<u8>,
     pending_cr: bool,
     s: ChunkBuilder,
@@ -59,6 +107,17 @@ pub(crate) struct ChunkReader {
     pending: VecDeque<TextChunk>,
     /// 已读的原始字节总数。
     total: u64,
+    /// 决定的源编码（[`crate::app::encoding`]）：`None` = 纯 UTF-8（无 BOM）；
+    /// `Some(UTF_8)` = 带 BOM 的 UTF-8；`Some(UTF_16LE/BE)` / `Some(GB18030)` 同理。
+    /// 决定前为 `None`（此时 `decided=false`），消费端 EOF 后经 [`Self::source_encoding`]
+    /// 读取并写回选项卡。
+    src_enc: Option<&'static encoding_rs::Encoding>,
+    /// 编码决定前的累积字节（≤ [`PROBE_CEIL_BYTES`] 或至文件尾；决定后清空灌入）。
+    probe: Vec<u8>,
+    /// 编码是否已决定（进入流式解码阶段）。
+    decided: bool,
+    /// 非 UTF-8（含带 BOM UTF-8/UTF-16/GB18030）的流式解码器；`None` = 纯 UTF-8 严格路径。
+    decoder: Option<encoding_rs::Decoder>,
 }
 
 impl ChunkReader {
@@ -79,7 +138,17 @@ impl ChunkReader {
             done: false,
             pending: VecDeque::new(),
             total: 0,
+            src_enc: None,
+            probe: Vec::with_capacity(PROBE_CEIL_BYTES.min(64 * 1024)),
+            decided: false,
+            decoder: None,
         })
+    }
+
+    /// 决定出的源文本编码（EOF 后稳定）：`None` = 纯 UTF-8。消费端据此写回选项卡
+    /// `source_encoding`（保存按此编码回写）。
+    pub(crate) fn source_encoding(&self) -> Option<&'static encoding_rs::Encoding> {
+        self.src_enc
     }
 
     /// 取下一个待发块。内部推进读盘直到产出一个块或到达文件尾；返回 `None` = 读尽
@@ -101,8 +170,9 @@ impl ChunkReader {
         self.total
     }
 
-    /// 推进一个读缓冲：读到数据 → UTF-8 校验 + 归一化 + 分块产出（入 `pending`）；
-    /// 读到 EOF → 收尾（孤立尾 `\r`、剩余完整行、无尾换行的最后一行）。
+    /// 推进一个读缓冲：读到数据 → **编码决定**（首块级探针）或按已定编码流式解码 →
+    /// 归一化 + 分块产出（入 `pending`）；读到 EOF → 收尾（孤立尾 `\r`、剩余完整行、
+    /// 无尾换行的最后一行；未决多字节尾部 → InvalidData）。
     fn advance(&mut self) -> io::Result<()> {
         if self.done {
             return Ok(());
@@ -110,40 +180,40 @@ impl ChunkReader {
         let n = self.file.read(&mut self.buf)?;
         if n > 0 {
             self.total += n as u64;
-            // 合并 UTF-8 残留，取最长合法前缀（≤3 字节不完整尾部留到下一块）。
-            // 与 fs::read_to_string 语义一致：整篇必须合法 UTF-8。此前只取合法前缀、
-            // 非法尾段则静默吞掉，导致大二进制（exe/dll）打开成只剩少量乱码前缀的页、
-            // 且永不弹「打开失败」。现改为：error_len() == Some（确定无效字节，
-            // 而非「读缓冲截断的多字节尾部」）→ 立即报 InvalidData。
-            self.utf8_carry.extend_from_slice(&self.buf[..n]);
-            let parsed = std::str::from_utf8(&self.utf8_carry);
-            if let Err(e) = &parsed
-                && e.error_len().is_some()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "stream did not contain valid UTF-8",
-                ));
+            // 借位隔离：先拷出本块字节（探针累积 / 流式解码均只读它），避免
+            // `&mut self` 方法调用与 `&self.buf` 的不可变借冲突。
+            let bytes = self.buf[..n].to_vec();
+            if !self.decided {
+                // 编码决定前：累积探针（首块级），攒够或 EOF 才决定（不做逐块喂、不
+                // 把可能被 GB18030 重新解码的前缀先喂进 rope）。
+                self.probe.extend_from_slice(&bytes);
+                if self.probe.len() >= PROBE_CEIL_BYTES {
+                    self.finish_decide()?;
+                }
+                return Ok(());
             }
-            let valid_len = match parsed {
-                Ok(_) => self.utf8_carry.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            feed(
-                &mut self.pending_cr,
-                &mut self.s,
-                std::str::from_utf8(&self.utf8_carry[..valid_len])
-                    .expect("前缀应合法 UTF-8"),
-                &mut self.first,
-                &mut self.pending,
-            );
-            self.utf8_carry.drain(..valid_len);
+            self.feed_read(&bytes)?;
             return Ok(());
         }
-        // EOF：收尾。若仍残留字节（文件在非法/截断多字节处结束），与 read_to_string
-        // 语义一致报 InvalidData，不再静默丢弃。
+        // EOF：若探针尚未决定编码 → 以全文决定；随后按流式解码器/严格 UTF-8 收尾。
         self.done = true;
-        if !self.utf8_carry.is_empty() {
+        if !self.decided {
+            self.finish_decide()?;
+        }
+        if let Some(dec) = self.decoder.as_mut() {
+            // 非 UTF-8 编码器收尾（last=true）：处理流内未决的多字节尾部；截断（无法
+            // 收尾）→ 报 InvalidData（与 `read_to_string` 的「截断多字节=失败」一致）。
+            if let Some(tail) = decode_stream(dec, &[], true)? {
+                feed(
+                    &mut self.pending_cr,
+                    &mut self.s,
+                    &tail,
+                    &mut self.first,
+                    &mut self.pending,
+                );
+            }
+        } else if !self.utf8_carry.is_empty() {
+            // 纯 UTF-8 路径：文件在非法/截断多字节处结束 → 报 InvalidData（现状语义）。
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "stream did not contain valid UTF-8",
@@ -174,6 +244,115 @@ impl ChunkReader {
             });
         }
         Ok(())
+    }
+
+    /// 探针就绪（攒够首块量或文件尾）→ 按 [`detect_source_encoding`] 决定编码并把探针
+    /// 整体灌入（BOM 已去 / 纯 UTF-8 直接喂 / 非 UTF-8 建解码器流式转）。决定后进入
+    /// 流式解码阶段（首块产出时点不变：都要攒满首块量）。
+    fn finish_decide(&mut self) -> io::Result<()> {
+        let probe = std::mem::take(&mut self.probe);
+        let (enc, bom) = detect_source_encoding(&probe);
+        self.decided = true;
+        // 探针恰在任意字节截止：若判「非 UTF-8 → GB18030」只因「合法 UTF-8 前缀 + 被块
+        // 边界切开的残缺多字节尾」（error_len==None），那是**纯 UTF-8 的跨块切分**（常态，
+        // 首块边界劈开中文三字节仅一例）——喂合法前缀、残尾进 `utf8_carry` 由下一块续解；
+        // 否则整篇会被误判成 GB18030（乱码）。EOF 收尾时这里不再有下一块，残尾由
+        // `advance` 的「utf8_carry 非空 → InvalidData」兜底（截断=失败，现状语义）。
+        if enc == Some(GB18030) && bom == 0 && is_truncated_utf8_tail(&probe) {
+            self.src_enc = None;
+            let valid = std::str::from_utf8(&probe)
+                .map(|s| s.len())
+                .unwrap_or_else(|e| e.valid_up_to());
+            if valid > 0 {
+                feed(
+                    &mut self.pending_cr,
+                    &mut self.s,
+                    std::str::from_utf8(&probe[..valid]).expect("前缀应合法 UTF-8"),
+                    &mut self.first,
+                    &mut self.pending,
+                );
+            }
+            self.utf8_carry.extend_from_slice(&probe[valid..]);
+            return Ok(());
+        }
+        self.src_enc = enc;
+        let raw = &probe[bom..];
+        match enc {
+            None => {
+                // 纯 UTF-8：探针整体已判定合法 → 直接喂（严格校验继续交给 `utf8_carry`。
+                let s = std::str::from_utf8(raw).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                feed(
+                    &mut self.pending_cr,
+                    &mut self.s,
+                    s,
+                    &mut self.first,
+                    &mut self.pending,
+                );
+            }
+            Some(e) => {
+                let mut dec = e.new_decoder_without_bom_handling();
+                if !raw.is_empty() {
+                    if let Some(s) = decode_stream(&mut dec, raw, false)? {
+                        feed(
+                            &mut self.pending_cr,
+                            &mut self.s,
+                            &s,
+                            &mut self.first,
+                            &mut self.pending,
+                        );
+                    }
+                }
+                self.decoder = Some(dec);
+            }
+        }
+        Ok(())
+    }
+
+    /// 已定编码后的逐块解码：非 UTF-8 → `encoding_rs` 解码器（跨块持有残缺多字节）；
+    /// 纯 UTF-8 → 沿用 `utf8_carry` + `error_len` 检测（现状路径不变）。
+    fn feed_read(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if let Some(dec) = self.decoder.as_mut() {
+            if let Some(s) = decode_stream(dec, bytes, false)? {
+                feed(
+                    &mut self.pending_cr,
+                    &mut self.s,
+                    &s,
+                    &mut self.first,
+                    &mut self.pending,
+                );
+            }
+            Ok(())
+        } else {
+            // 合并 UTF-8 残留，取最长合法前缀（≤3 字节不完整尾部留到下一块）。
+            // 与 fs::read_to_string 语义一致：整篇必须合法 UTF-8。error_len() == Some
+            // （确定无效字节，而非「读缓冲截断的多字节尾部」）→ 立即报 InvalidData。
+            self.utf8_carry.extend_from_slice(bytes);
+            let parsed = std::str::from_utf8(&self.utf8_carry);
+            if let Err(e) = &parsed
+                && e.error_len().is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ));
+            }
+            let valid_len = match parsed {
+                Ok(_) => self.utf8_carry.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            feed(
+                &mut self.pending_cr,
+                &mut self.s,
+                std::str::from_utf8(&self.utf8_carry[..valid_len])
+                    .expect("前缀应合法 UTF-8"),
+                &mut self.first,
+                &mut self.pending,
+            );
+            self.utf8_carry.drain(..valid_len);
+            Ok(())
+        }
     }
 }
 

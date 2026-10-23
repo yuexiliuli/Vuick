@@ -48,6 +48,7 @@ mod tabs;
 mod chrome;
 mod close_tray;
 mod diff;
+mod encoding;
 mod file_tree_prompt;
 mod init;
 mod layout;
@@ -96,6 +97,11 @@ struct EditorTab {
     editor: gpui::Entity<editor::CodeEditor>,
     /// 当前文件路径（None = 未命名）
     file_path: Option<PathBuf>,
+    /// 本选项卡的**源文本编码**（[`crate::app::encoding`]）：`None` = 纯 UTF-8（新建/
+    /// 打开/媒体）；`Some(&'static Encoding)` = 打开时探测出的非 UTF-8 编码（含带 BOM
+    /// 的 UTF-8/UTF-16）。保存（`write_to_path`）按此编码把缓冲 UTF-8 转回字节写盘。
+    /// 随选项卡搬迁（EditorTab ⇄ DetachedTab 整包搬移）、文档编码随文档走。
+    source_encoding: Option<&'static encoding_rs::Encoding>,
     /// 内容自上次打开/保存后是否被修改
     dirty: bool,
     /// 当前内容的镜像缓存（在 `InputEvent::Change` 时同步，避免每帧克隆 Rope）
@@ -196,6 +202,8 @@ pub(crate) struct DetachedTab {
     epub_notes: std::collections::BTreeMap<usize, String>,
     file_path: Option<PathBuf>,
     dirty: bool,
+    /// 源文本编码（见 [`EditorTab::source_encoding`]；随选项卡搬迁）。
+    source_encoding: Option<&'static encoding_rs::Encoding>,
     content: SharedString,
     line_count: usize,
     char_count: usize,

@@ -1784,3 +1784,214 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// 编码感知打开（GBK/GB18030）：内存构造 GBK 字节写临时文件 → 打开 → 正文被正确解码为
+    /// UTF-8 文本（可读中文），且选项卡 `source_encoding` 记录 GB18030（保存按此回写）。
+    #[gpui::test]
+    async fn gbk_open_decodes_content_and_records_encoding(cx: &mut TestAppContext) {
+        use encoding_rs::GB18030;
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let text = "从前有座寻仙山，山上有座庙……\n第二行 中文测试\n";
+        let gbk = GB18030.encode(text).0.into_owned();
+        let p = std::env::temp_dir().join(format!("gpui-gbk-open-{}.txt", std::process::id()));
+        std::fs::write(&p, &gbk).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (content, src_enc, status_ok) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let i = a.active_tab;
+            (
+                a.tabs[i].editor.read(cx).value().to_string(),
+                a.tabs[i].source_encoding,
+                a.status_ok,
+            )
+        });
+        assert!(status_ok, "GBK 打开不应置失败状态");
+        assert_eq!(content, text, "GBK（GB18030）正文应被正确解码为 UTF-8 文本");
+        assert_eq!(src_enc, Some(GB18030), "选项卡应记录源编码 GB18030");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 保编码保存 roundtrip：打开 GBK → 编辑内容 → 保存 → 磁盘字节按 GB18030 转回
+    /// （含新增中文行），无 UTF-8/GBK BOM。
+    #[gpui::test]
+    async fn gbk_edit_save_roundtrips_original_encoding(cx: &mut TestAppContext) {
+        use encoding_rs::GB18030;
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let original = "第一行原文\n第二行中文\n";
+        let mut edited = String::from("新增一行在前\n");
+        edited.push_str(original);
+        let p = std::env::temp_dir().join(format!("gpui-gbk-save-{}.txt", std::process::id()));
+        std::fs::write(&p, GB18030.encode(original).0).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let idx = cx.update(|_w, cx| app.read(cx).active_tab);
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                app.tabs[idx].editor.update(cx, |ed, _| ed.set_text(&edited));
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let saved = cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.save_tab(idx, window, cx))
+        });
+        assert!(saved, "保存应成功");
+        let disk = std::fs::read(&p).unwrap();
+        let expect = GB18030.encode(&edited).0.into_owned();
+        assert_eq!(disk, expect, "保存后磁盘字节应按 GB18030 转回（编辑后 roundtrip）");
+        assert!(
+            !disk.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "GB18030 保存不应带 UTF-8 BOM"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// UTF-16 LE / BE 带 BOM 打开：正文去 BOM 正确，且选项卡记录对应编码（保存回原编码）。
+    #[gpui::test]
+    async fn utf16_bom_open_strips_bom_and_records_encoding(cx: &mut TestAppContext) {
+        use encoding_rs::{UTF_16BE, UTF_16LE};
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        for (name, enc, expected_enc) in [
+            ("gpui-u16le-open.txt", UTF_16LE, Some(UTF_16LE)),
+            ("gpui-u16be-open.txt", UTF_16BE, Some(UTF_16BE)),
+        ] {
+            let text = "你好，UTF-16 世界\n第二行结尾没有换行。";
+            // 真 UTF-16 码元：encoding_rs `Encoding::encode()` 对 UTF-16 降级输出 UTF-8。
+            let le = enc == UTF_16LE;
+            let mut body = Vec::with_capacity(text.len() * 2);
+            for u in text.encode_utf16() {
+                let b = if le { u.to_le_bytes() } else { u.to_be_bytes() };
+                body.extend_from_slice(&b);
+            }
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(if le { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
+            bytes.extend_from_slice(&body);
+            let p = std::env::temp_dir().join(name);
+            std::fs::write(&p, &bytes).unwrap();
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+            });
+            for _ in 0..5 {
+                cx.run_until_parked();
+            }
+            let (content, src_enc, status_ok) = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let i = a.active_tab;
+                (
+                    a.tabs[i].editor.read(cx).value().to_string(),
+                    a.tabs[i].source_encoding,
+                    a.status_ok,
+                )
+            });
+            assert!(status_ok, "{name} 打开不应置失败状态");
+            assert_eq!(content, text, "{name} 应去 BOM 并正确解码");
+            assert_eq!(src_enc, expected_enc, "{name} 应记录源编码");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// 大文档 UTF-8 流式打开回归（首块边界劈开中文三字节）：>256KB 纯 UTF-8 文件，首块
+    /// 探针恰在 3 字节字符中段截断（error_len==None），不得误判成 GB18030——正文必须
+    /// 字节级一致，`source_encoding` 为 None（纯 UTF-8）。
+    #[gpui::test]
+    async fn large_utf8_streaming_not_misdetected_when_chunk_splits_multibyte(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 600KB / 无换行：字节下标 262144 % 3 == 1 → 首块探针恰好截在「标」三字节中段。
+        let content = "标".repeat(200_000);
+        assert!(
+            content.len() > 256 * 1024,
+            "测试内容应远超首块下限（实际 {} B）",
+            content.len()
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-utf8-stream-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&dir, &content).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                !a.tabs[i].editor_pending
+                    && !a.tabs[i].loading_lock
+                    && a.tabs[i].source_encoding == None
+                    && a.tabs[i].editor.read(cx).value() == content
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 2000 {
+                panic!("大 UTF-8 流式打开超时：未装配成完整一致内容");
+            }
+        }
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// 打开失败语义（编码兜底也拒收）：GB18030 对 0xFF 拒收 → `report_open_failure` 置失败
+    /// 状态、弹通知、**不新增坏标签页**（同步小文件路径）。
+    #[gpui::test]
+    async fn non_utf8_undecodable_reports_failure(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("gpui-undecodable-{}.txt", std::process::id()));
+        std::fs::write(&p, [0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (status_ok, tabs_after, notifs) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.status_ok, a.tabs.len(), a.notifications.len())
+        });
+        assert!(!status_ok, "GB18030 拒收字节应置失败状态");
+        assert_eq!(tabs_after, tabs_before, "打开失败不应新增坏标签页");
+        assert_eq!(notifs, 1, "打开失败应推送一条通知");
+        let _ = std::fs::remove_file(&p);
+    }
+
