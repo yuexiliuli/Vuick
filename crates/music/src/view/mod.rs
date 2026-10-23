@@ -118,6 +118,8 @@ pub struct MusicView {
     search_marked: Option<Range<usize>>,
     /// 中央 toast：`(文案, 出现时刻)`，超时由 tick/render 清理。
     toast: Option<(SharedString, Instant)>,
+    /// 上次已向用户浮现的播放错误（防每次 tick 重复弹 toast）。
+    last_error: Option<String>,
     /// 常驻 tick 循环句柄（view 销毁即取消）。
     _tick: Option<gpui::Task<()>>,
     // ---- 可交互条（进度/音量）的窗口坐标盒（canvas prepaint 记录） ----
@@ -150,6 +152,7 @@ impl MusicView {
             search_focus: cx.focus_handle(),
             search_marked: None,
             toast: None,
+            last_error: None,
             _tick: Some(task),
             np_progress: Rc::new(Cell::new(Bounds::default())),
             bb_progress: Rc::new(Cell::new(Bounds::default())),
@@ -164,14 +167,23 @@ impl MusicView {
     /// toast 过期清理。空闲（非播放）不 notify → 不持续重绘（K12）。
     fn on_tick(&mut self, cx: &mut Context<Self>) {
         self.player.update(cx, |p, cx| p.tick(cx));
+        // 播放错误浮现（如缺 video_ffmpeg.dll / 打开失败）：仅在错误值**变化**时弹一次
+        // toast，避免每拍重复；错误清除后记录复位（下次再错能再弹）。
+        let err = self.player.read(cx).error().map(ToString::to_string);
+        if err.as_deref() != self.last_error.as_deref() {
+            self.last_error = err.clone();
+            if let Some(e) = err {
+                self.toast = Some((format!("播放失败：{e}").into(), Instant::now()));
+            }
+        }
         // toast 过期：清掉（下次渲染可能不会发生，主动 notify 一次让其消失）
         let toast_expired =
             self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST_MS);
         if toast_expired {
             self.toast = None;
         }
-        // 播放中才高频刷新进度条/均衡器位置；toast 在期也刷新（保证按时消失）。
-        if self.player.read(cx).playing() || toast_expired {
+        // 播放中才高频刷新进度条/均衡器位置；toast 在期也刷新（保证按时出现/消失）。
+        if self.player.read(cx).playing() || self.toast.is_some() {
             cx.notify();
         }
     }
