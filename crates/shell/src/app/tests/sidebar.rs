@@ -2942,3 +2942,190 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 文件树右键菜单新组结构与分割线：文件菜单 = 7 项 + 3 分割线，目录菜单 = 9 项 +
+    /// 3 分割线；五个新项的 debug_selector 全部存在。
+    #[gpui::test]
+    async fn sidebar_file_right_click_menu_extra_items_and_separators(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-x-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        ft_open_folder(&app, cx, &dir);
+
+        // 文件行（root=0、subdir=1、a.txt=2）右键。
+        let file_row = cx.debug_bounds("sidebar-file-row-2").expect("a.txt 行应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: file_row.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let probe = cx.update(|_w, cx| {
+            app.read(cx)
+                .file_tree_menu_entity
+                .as_ref()
+                .expect("菜单应打开")
+                .read(cx)
+                .layout_probe()
+        });
+        assert_eq!(
+            probe,
+            (10, 3),
+            "文件菜单 = 7 项 + 3 分割线（总条目 10）=（总条目，分割线数），实际={probe:?}"
+        );
+        for sel in [
+            "file-tree-menu-rename",
+            "file-tree-menu-delete",
+            "file-tree-menu-reveal",
+            "file-tree-menu-copy-path",
+            "file-tree-menu-copy-rel-path",
+            "file-tree-menu-cut",
+            "file-tree-menu-copy-file",
+        ] {
+            assert!(
+                cx.debug_bounds(sel).is_some(),
+                "文件菜单应含 {sel}"
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 目录行（subdir=1）右键 → 多两个新建项。
+        let dir_row = cx.debug_bounds("sidebar-file-row-1").expect("subdir 行应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: dir_row.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let probe2 = cx.update(|_w, cx| {
+            app.read(cx)
+                .file_tree_menu_entity
+                .as_ref()
+                .expect("菜单应打开")
+                .read(cx)
+                .layout_probe()
+        });
+        assert_eq!(
+            probe2,
+            (12, 3),
+            "目录菜单 = 9 项 + 3 分割线（总条目 12）=（总条目，分割线数），实际={probe2:?}"
+        );
+        assert!(cx.debug_bounds("file-tree-menu-new-file").is_some());
+        assert!(cx.debug_bounds("file-tree-menu-reveal").is_some());
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 复制路径 / 复制相对路径 → 文本剪贴板断言：绝对路径（无引号）/ 相对已打开文件夹根。
+    #[gpui::test]
+    async fn sidebar_file_menu_copy_path_and_relative_path(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        fs_clear_restored_folder(&app, cx);
+        let dir = std::env::temp_dir().join(format!("gpui-ft-cp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "A").unwrap();
+        ft_open_folder(&app, cx, &dir);
+
+        // 备份原文本剪贴板（写「复制路径」会覆盖真实剪贴板），测试末还原，避免污染用户剪贴板。
+        let orig_clip: Option<String> = cx.update(|_w, cx| {
+            cx.read_from_clipboard()
+                .and_then(|i| i.text().map(|s| s.to_string()))
+        });
+
+        // 打开文件菜单（单文件：root=0、a.txt=1），点「复制路径」。
+        let row = cx.debug_bounds("sidebar-file-row-1").expect("a.txt 行应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: row.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let abs_item = cx.debug_bounds("file-tree-menu-copy-path").expect("复制路径项应存在");
+        cx.simulate_click(abs_item.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let text: Option<String> = cx.update(|_w, cx| {
+            cx.read_from_clipboard()
+                .map(|i| i.text().unwrap_or_default())
+        });
+        assert_eq!(
+            text.as_deref(),
+            Some(target.to_string_lossy().as_ref()),
+            "复制路径应为绝对路径且不带引号"
+        );
+
+        // 重新开菜单 → 点「复制相对路径」→ 相对根 = a.txt。
+        let row2 = cx.debug_bounds("sidebar-file-row-1").expect("a.txt 行仍在");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: row2.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let rel_item = cx.debug_bounds("file-tree-menu-copy-rel-path").expect("复制相对路径项应存在");
+        cx.simulate_click(rel_item.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let rel: Option<String> = cx.update(|_w, cx| {
+            cx.read_from_clipboard()
+                .map(|i| i.text().unwrap_or_default())
+        });
+        assert_eq!(
+            rel.as_deref(),
+            Some("a.txt"),
+            "复制相对路径应相对已打开文件夹根（原生分隔符、无引号）"
+        );
+        // 还原测试前剪贴板文本（有原内容才写回）。
+        if let Some(text) = orig_clip {
+            cx.update(|_w, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+

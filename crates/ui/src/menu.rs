@@ -173,6 +173,19 @@ impl PopupMenu {
         self.previous_focus = handle;
     }
 
+    /// 测试/诊断：返回 `(总条目数, 分割线数)`——总条目**含**分割线（项数 = 减分割线数），
+    /// 用于断言菜单结构与分组（shell 文件树右键菜单按组用分隔线隔开）。`ElementItem`
+    /// 的标签在渲染闭包内无法枚举，这里只数条目与分割线。
+    #[allow(dead_code)] // shell 测试断言用
+    pub fn layout_probe(&self) -> (usize, usize) {
+        let separators = self
+            .menu_items
+            .iter()
+            .filter(|i| i.is_separator())
+            .count();
+        (self.menu_items.len(), separators)
+    }
+
     /// 确认选中项：执行回调并关闭菜单（点击项 or Enter）。
     /// `keep_open` 项只执行回调、**不关闭**（如「打开最近…」保持文件菜单展开）。
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {

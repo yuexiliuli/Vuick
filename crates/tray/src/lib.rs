@@ -97,6 +97,134 @@ pub fn shutdown() {
     imp::shutdown();
 }
 
+// -------------------------------------------------------------------------
+// 剪贴板文件操作（CF_HDROP + Preferred DropEffect）+ 资源管理器定位
+// -------------------------------------------------------------------------
+
+/// 剪贴板文件操作的拖动效果（资源管理器语义：粘贴 = 复制 / 移动）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DropEffect {
+    /// 资源管理器「复制」（粘贴 → 复制文件）。
+    Copy,
+    /// 资源管理器「剪切」（粘贴 → 移动文件）。
+    Move,
+}
+
+/// 把单条**绝对路径**作为「文件操作」写入系统剪贴板（`CF_HDROP` + `Preferred DropEffect`，
+/// `copy=true` → effect=1 复制 / `false` → effect=2 移动）。语义 = Windows 资源管理器
+/// 「复制/剪切」，粘贴到 Explorer / 其它能消费文件操作的应用即复制/移动。**单路径**。
+/// 剪贴板被其它进程占用（`OpenClipboard` 失败）等 → `Err`（调用方状态栏提示，不 panic）。
+pub fn set_clipboard_file_drop(
+    path: &std::path::Path,
+    copy: bool,
+) -> Result<(), &'static str> {
+    #[cfg(windows)]
+    {
+        imp::set_clipboard_file_drop_impl(path, copy)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, copy);
+        Err("该平台不支持剪贴板文件操作")
+    }
+}
+
+/// 读回当前系统剪贴板的文件操作（`CF_HDROP` 解析）：返回 `(绝对路径列表, 拖动效果)`。
+/// 剪贴板无该格式 / 被占用 / 解析失败 → `None`。**测试对拍与后续扩展用**（真实「粘贴」
+/// 由资源管理器等消费方执行，本函数只回读）。
+pub fn read_clipboard_file_drop() -> Option<(Vec<std::path::PathBuf>, DropEffect)> {
+    #[cfg(windows)]
+    {
+        imp::read_clipboard_file_drop_impl()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// 构造 `explorer /select,<绝对路径>` 定位命令（**只构造不 spawn**；spawn 由 UI 动作
+/// 路径负责并在失败时提示/静默）。`explorer.exe` 单参数 `"/select,<path>"` 是 Windows
+/// 标准姿势（选中该文件/目录的资源管理器窗口）。
+pub fn reveal_in_explorer_command(path: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("explorer");
+    cmd.arg(format!("/select,{}", path.to_string_lossy()));
+    cmd
+}
+
+/// DROPFILES 头（`pFiles = sizeof(DROPFILES) = 20`、`pt = 0`、`fNC = false`、
+/// `fWide = true` —— UTF-16LE 路径）后接 UTF-16 绝对路径（`\0` 分隔）+ 结尾双 `\0`，
+/// 正是 `SetClipboardData(CF_HDROP, …)` 的全局内存布局。纯函数，可单测字节级对拍。
+pub(crate) fn build_dropfiles_bytes(paths: &[&str]) -> Vec<u8> {
+    let header_len = size_of::<windows::Win32::UI::Shell::DROPFILES>();
+    let mut out: Vec<u8> = Vec::with_capacity(
+        header_len
+            + paths.iter().map(|p| p.encode_utf16().count() * 2).sum::<usize>()
+            + 2,
+    );
+    // 头 20 字节：pFiles=20 / pt=0 / fNC=0 / fWide=1（结构原生布局，x86/x64 均 20 字节）。
+    {
+        let h = windows::Win32::UI::Shell::DROPFILES {
+            pFiles: header_len as u32,
+            pt: windows::Win32::Foundation::POINT::default(),
+            fNC: windows::core::BOOL(0),
+            fWide: windows::core::BOOL(1),
+        };
+        let hbytes = unsafe {
+            std::slice::from_raw_parts(
+                (&h as *const windows::Win32::UI::Shell::DROPFILES).cast::<u8>(),
+                header_len,
+            )
+        };
+        out.extend_from_slice(hbytes);
+    }
+    for p in paths {
+        for u in p.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+    // 结尾双 `\0`：上面每个路径末尾已有一个 `\0`，列表末尾再补一个凑成双 `\0`。
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// 解析 CF_HDROP 全局内存字节 → 绝对路径列表（UTF-16；跳过空项）。纯函数，可单测。
+/// 文件列表从头部 `pFiles` 字段给出的偏移开始（`DROPFILES` 头 20 字节被跳过）。
+pub(crate) fn parse_dropfiles_bytes(bytes: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if bytes.len() < 4 {
+        return out;
+    }
+    // 头 4 字节 = pFiles：文件列表起始偏移（越界防御钳到缓冲末尾）。
+    let start = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let start = start.min(bytes.len());
+    let mut i = start;
+    while i + 1 < bytes.len() {
+        let mut w = [0u16; 1];
+        w[0] = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        if w[0] == 0 {
+            break;
+        }
+        let mut units: Vec<u16> = Vec::new();
+        while w[0] != 0 {
+            units.push(w[0]);
+            i += 2;
+            if i + 1 >= bytes.len() {
+                break;
+            }
+            w[0] = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        }
+        if !units.is_empty() {
+            if let Ok(s) = String::from_utf16(&units) {
+                out.push(s);
+            }
+        }
+        i += 2; // 跳过本路径结尾 `\0`（若未触及缓冲末尾）
+    }
+    out
+}
+
 #[cfg(windows)]
 mod imp {
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -450,6 +578,146 @@ mod imp {
         }
     }
 
+    /// 写剪贴板文件操作（CF_HDROP + Preferred DropEffect）。unsafe Win32 全收敛于此。
+    /// 单 UI 线程调用（gpui 主线程菜单回调）；失败返回 Err（剪贴板占用 / 内存 / 格式）
+    /// 不 panic，调用方状态栏提示。句柄管理：失败路径 `GlobalFree` 归还、成功路径
+    /// 剪贴板接管（SetClipboardData 后不 free）。
+    pub(super) fn set_clipboard_file_drop_impl(
+        path: &std::path::Path,
+        copy: bool,
+    ) -> Result<(), &'static str> {
+        use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW,
+            SetClipboardData,
+        };
+        use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GLOBAL_ALLOC_FLAGS, GMEM_MOVEABLE, GMEM_ZEROINIT};
+        use windows::Win32::System::Ole::CF_HDROP;
+        use windows::core::{w, PCWSTR};
+
+        let abs = path.to_string_lossy();
+        let bytes = super::build_dropfiles_bytes(&[&abs]);
+        let gflags = GLOBAL_ALLOC_FLAGS(GMEM_MOVEABLE.0 | GMEM_ZEROINIT.0);
+        // SAFETY：系统剪贴板标准协议（OpenClipboard → EmptyClipboard → SetClipboardData，
+        // 全局内存经 GlobalAlloc/Lock/Copy/Unlock）。Windows 上单 UI 线程串行调用，无并发。
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return Err("无法访问系统剪贴板（可能被其它程序占用）");
+            }
+            let result = (|| {
+                EmptyClipboard().ok();
+                // CF_HDROP 块：DROPFILES 布局字节 → 移交剪贴板。
+                let hdrop = match GlobalAlloc(gflags, bytes.len()) {
+                    Ok(h) => h,
+                    Err(_) => return Err("系统内存不足"),
+                };
+                let p = GlobalLock(hdrop);
+                if p.is_null() {
+                    let _ = GlobalFree(Some(hdrop));
+                    return Err("系统内存不足");
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.cast::<u8>(), bytes.len());
+                GlobalUnlock(hdrop).ok();
+                if SetClipboardData(CF_HDROP.0 as u32, Some(HANDLE(hdrop.0))).is_err() {
+                    let _ = GlobalFree(Some(hdrop));
+                    return Err("写入剪贴板失败");
+                }
+                // Preferred DropEffect 块：DWORD 1=COPY / 2=MOVE（资源管理器「复制/剪切」）。
+                let fmt = RegisterClipboardFormatW(PCWSTR::from_raw(
+                    w!("Preferred DropEffect").as_ptr(),
+                ));
+                if fmt != 0 {
+                    let effect: u32 = if copy { 1 } else { 2 };
+                    let heffect = GlobalAlloc(gflags, std::mem::size_of::<u32>()).unwrap_or(HGLOBAL(std::ptr::null_mut()));
+                    if !heffect.0.is_null() {
+                        let p2 = GlobalLock(heffect);
+                        if !p2.is_null() {
+                            std::ptr::copy_nonoverlapping(
+                                (&effect as *const u32).cast::<u8>(),
+                                p2.cast::<u8>(),
+                                4,
+                            );
+                            GlobalUnlock(heffect).ok();
+                            if SetClipboardData(fmt, Some(HANDLE(heffect.0))).is_err() {
+                                let _ = GlobalFree(Some(heffect));
+                            }
+                        } else {
+                            let _ = GlobalFree(Some(heffect));
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            CloseClipboard().ok();
+            result
+        }
+    }
+
+    /// 读回剪贴板文件操作（CF_HDROP + Preferred DropEffect）。同一 unsafe 家庭成员；
+    /// 供测试对拍与后续扩展（真实「粘贴」由资源管理器等消费方执行）。
+    pub(super) fn read_clipboard_file_drop_impl(
+    ) -> Option<(Vec<std::path::PathBuf>, super::DropEffect)> {
+        use windows::Win32::Foundation::HGLOBAL;
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+        };
+        use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+        use windows::Win32::System::Ole::CF_HDROP;
+        use windows::core::{w, PCWSTR};
+
+        // SAFETY：OpenClipboard 期间 GetClipboardData 返回句柄、GlobalLock 映射为字节视图、
+        // 用后 Unlock + CloseClipboard（读不改全局态）。
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return None;
+            }
+            let result = (|| {
+                let hdrop = GetClipboardData(CF_HDROP.0 as u32).ok()?;
+                if hdrop.0.is_null() {
+                    return None;
+                }
+                // 剪贴板返回 HANDLE；以下全局内存访问一律视为 HGLOBAL（同一内核对象句柄）。
+                let hg = HGLOBAL(hdrop.0);
+                let size = GlobalSize(hg);
+                let p = GlobalLock(hg);
+                if p.is_null() {
+                    return None;
+                }
+                let mut bytes = vec![0u8; size];
+                std::ptr::copy_nonoverlapping(p.cast::<u8>(), bytes.as_mut_ptr(), size);
+                GlobalUnlock(hg).ok();
+                if bytes.is_empty() {
+                    return None;
+                }
+                let paths: Vec<std::path::PathBuf> = super::parse_dropfiles_bytes(&bytes)
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                // 拖动效果回读：DWORD 2=Move，其余按 Copy。
+                let mut effect = super::DropEffect::Copy;
+                let fmt = RegisterClipboardFormatW(PCWSTR::from_raw(w!("Preferred DropEffect").as_ptr()));
+                if fmt != 0 {
+                    let hfx = GetClipboardData(fmt).ok()?;
+                    if !hfx.0.is_null() {
+                        let hg2 = HGLOBAL(hfx.0);
+                        let px = GlobalLock(hg2);
+                        if !px.is_null() {
+                            let mut v = 0u32;
+                            std::ptr::copy_nonoverlapping(px.cast::<u8>(), (&mut v as *mut u32).cast::<u8>(), 4);
+                            GlobalUnlock(hg2).ok();
+                            if v == 2 {
+                                effect = super::DropEffect::Move;
+                            }
+                        }
+                    }
+                }
+                Some((paths, effect))
+            })();
+            CloseClipboard().ok();
+            result
+        }
+    }
+
     /// 隐藏窗口的窗口过程：托盘点按回调 / 菜单命令都经此分发。
     unsafe extern "system" fn hidden_wnd_proc(
         hwnd: HWND,
@@ -609,5 +877,240 @@ mod tests {
         assert_eq!(crate::imp::ensure_window_icon().unwrap(), raw);
         // 释放（无隐藏窗口时 remove_tray_icon/DestroyWindow 幂等 no-op，DestroyIcon 生效）。
         crate::shutdown();
+    }
+
+    /// 剪贴板文件操作测试串行锁（与托盘 flag 测试同锁共用，避免并行脚踩真实剪贴板）。
+    static CLIP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// DROPFILES 字节布局：pFiles=20 / pt=0 / fNC=0 / fWide=1 / UTF-16 路径 / 结尾双 `\0`。
+    #[test]
+    fn dropfiles_bytes_layout_header_and_wide() {
+        let b = crate::build_dropfiles_bytes(&[r"D:\a\b.txt"]);
+        // 头 20 字节 = DROPFILES：pFiles(20)=20, pt(0..8)=0, fNC=0, fWide=1
+        assert_eq!(&b[0..4], &[20u8, 0, 0, 0], "pFiles 应为 sizeof(DROPFILES)=20");
+        assert!(
+            b[4..12].iter().all(|&x| x == 0),
+            "pt 应为零"
+        );
+        assert!(
+            b[12..16].iter().all(|&x| x == 0),
+            "fNC 应为 false"
+        );
+        assert_eq!(&b[16..20], &[1u8, 0, 0, 0], "fWide 应为 true（UTF-16）");
+        // UTF-16LE 路径：D:\a\b.txt 各字符低字节在前
+        let mut p = 20usize;
+        for ch in r"D:\a\b.txt".encode_utf16() {
+            assert_eq!(b[p], (ch & 0xff) as u8, "UTF-16 低字节字符@{p}");
+            assert_eq!(b[p + 1], (ch >> 8) as u8, "UTF-16 高字节字符@{p}");
+            p += 2;
+        }
+        assert_eq!(
+            b[p],
+            0,
+            "路径后应为 `\\0`（单路径：该 `\\0` 即列表双 `\\0` 的第一半）"
+        );
+        assert_eq!(
+            b[p + 1],
+            0,
+            "列表末尾双 `\\0` 的第二半（CF_HDROP 规范要求双 null 结尾）"
+        );
+        assert_eq!(
+            b.len(),
+            p + 4,
+            "整体长度 = 头(20) + 路径 UTF-16 + 路径结尾 `\\0`(2) + 补位 `\\0`(2)=44"
+        );
+    }
+
+    /// 解析回读纯函数 roundtrip：多路径 UTF-16 → 原样还原。
+    #[test]
+    fn dropfiles_bytes_parse_roundtrip() {
+        let paths = [r"D:\a\b.txt", r"E:\文件夹\x 空格.md", r"C:\single"];
+        let bytes = crate::build_dropfiles_bytes(&paths);
+        let back = crate::parse_dropfiles_bytes(&bytes);
+        assert_eq!(back, paths, "UTF-16 路径 roundtrip 应一致");
+    }
+
+    /// 剪贴板写→读回真实对拍（含拖动效果）：若 `OpenClipboard` 失败（无交互会话 /
+    /// 剪贴板被占用）→ **优雅 skip**（打印说明并返回，不硬失败，K21）。
+    /// 副作用收敛：写盘**前**备份原剪贴板（CF_HDROP + Preferred DropEffect + CF_UNICODETEXT），
+    /// 经 RAII guard 在测试结束（含 panic）**后**还原——对拍不覆盖用户真实剪贴板。
+    #[cfg(windows)]
+    #[test]
+    fn clipboard_file_drop_roundtrip_with_effect() {
+        let _guard = CLIP_LOCK.lock().unwrap();
+        let _restore = ClipRestoreGuard(backup_clipboard());
+        let target = std::path::Path::new("D:\\gpui-editor\\src\\main.rs");
+        if let Err(e) = crate::set_clipboard_file_drop(target, true) {
+            eprintln!("[SKIP] 剪贴板不可用，跳过写入回读对拍：{e}");
+            return;
+        }
+        let (paths, effect) = crate::read_clipboard_file_drop().expect("写入后应能读回");
+        assert_eq!(paths, vec![target.to_path_buf()], "CF_HDROP 应原样回读单路径");
+        assert_eq!(effect, crate::DropEffect::Copy, "COPY 写入 → 效果应为复制");
+        // 剪切：效果翻转为 Move。
+        crate::set_clipboard_file_drop(target, false).expect("剪切写入应成功");
+        let (paths2, effect2) = crate::read_clipboard_file_drop().expect("剪切后应能读回");
+        assert_eq!(paths2, vec![target.to_path_buf()]);
+        assert_eq!(effect2, crate::DropEffect::Move, "MOVE 写入 → 效果应为移动");
+    }
+
+    /// 剪贴板备份：对拍测试写盘前的原始内容（读失败项为 `None`，还原时跳过该格式）。
+    #[cfg(windows)]
+    struct ClipBackup {
+        hdrop: Option<Vec<u8>>,
+        effect: Option<u32>,
+        text: Option<Vec<u8>>,
+    }
+
+    /// 备份当前剪贴板的 CF_HDROP 字节、Preferred DropEffect DWORD、CF_UNICODETEXT 字节。
+    /// 一次 `OpenClipboard` 会话内完成；打不开（被占用）→ `None`（测试照跑，尽力而为）。
+    #[cfg(windows)]
+    fn backup_clipboard() -> Option<ClipBackup> {
+        use windows::Win32::Foundation::HGLOBAL;
+        use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW};
+        use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+        use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+        use windows::core::{w, PCWSTR};
+        fn copy_global(handle: windows::Win32::Foundation::HANDLE) -> Option<Vec<u8>> {
+            unsafe {
+                if handle.0.is_null() {
+                    return None;
+                }
+                let hg = HGLOBAL(handle.0);
+                let size = GlobalSize(hg);
+                if size == 0 {
+                    return None;
+                }
+                let p = GlobalLock(hg);
+                if p.is_null() {
+                    return None;
+                }
+                let mut bytes = vec![0u8; size];
+                // SAFETY：GlobalLock 周期内把全局内存映射为 `size` 字节视图（GetClipboardData
+                // 句柄在 OpenClipboard 会话内有效）。只读拷贝，用后 Unlock。
+                std::ptr::copy_nonoverlapping(p.cast::<u8>(), bytes.as_mut_ptr(), size);
+                GlobalUnlock(hg).ok();
+                Some(bytes)
+            }
+        }
+        // SAFETY：OpenClipboard 期间经 GetClipboardData 只读回读，用后 CloseClipboard。
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return None;
+            }
+            let result = (|| {
+                let hdrop = GetClipboardData(CF_HDROP.0 as u32)
+                    .ok()
+                    .and_then(copy_global);
+                let fmt = RegisterClipboardFormatW(PCWSTR::from_raw(w!("Preferred DropEffect").as_ptr()));
+                let effect = if fmt == 0 {
+                    None
+                } else {
+                    GetClipboardData(fmt).ok().and_then(|h| {
+                        copy_global(h).map(|bytes| {
+                            let mut v = 0u32;
+                            if bytes.len() >= 4 {
+                                v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                            }
+                            v
+                        })
+                    })
+                };
+                let text = GetClipboardData(CF_UNICODETEXT.0 as u32)
+                    .ok()
+                    .and_then(copy_global);
+                Some(ClipBackup {
+                    hdrop,
+                    effect,
+                    text,
+                })
+            })();
+            CloseClipboard().ok();
+            result
+        }
+    }
+
+    /// 还原剪贴板备份：EmptyClipboard 后按各格式写回。仅尽力而为（某格式写失败静默跳过）。
+    #[cfg(windows)]
+    fn restore_clipboard(backup: ClipBackup) {
+        use windows::Win32::Foundation::{GlobalFree, HANDLE};
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW,
+            SetClipboardData,
+        };
+        use windows::Win32::System::Memory::{
+            GlobalAlloc, GlobalLock, GlobalUnlock, GLOBAL_ALLOC_FLAGS, GMEM_MOVEABLE,
+            GMEM_ZEROINIT,
+        };
+        use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+        use windows::core::{w, PCWSTR};
+        fn write_global(fmt: u32, bytes: &[u8]) -> bool {
+            let gflags = GLOBAL_ALLOC_FLAGS(GMEM_MOVEABLE.0 | GMEM_ZEROINIT.0);
+            // SAFETY：标准剪贴板写协议（分配全局内存 → 拷贝 → 移交 SetClipboardData）。
+            unsafe {
+                let Ok(hg) = GlobalAlloc(gflags, bytes.len()) else {
+                    return false;
+                };
+                let p = GlobalLock(hg);
+                if p.is_null() {
+                    let _ = GlobalFree(Some(hg));
+                    return false;
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.cast::<u8>(), bytes.len());
+                GlobalUnlock(hg).ok();
+                if SetClipboardData(fmt, Some(HANDLE(hg.0))).is_err() {
+                    // 移交失败：归还全局内存（剪贴板未接管）。
+                    let _ = GlobalFree(Some(hg));
+                    return false;
+                }
+                true
+            }
+        }
+        // SAFETY：OpenClipboard → EmptyClipboard → SetClipboardData → CloseClipboard 标准序列。
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return;
+            }
+            EmptyClipboard().ok();
+            if let Some(bytes) = &backup.hdrop {
+                write_global(CF_HDROP.0 as u32, bytes);
+            }
+            if let Some(v) = backup.effect {
+                let fmt = RegisterClipboardFormatW(PCWSTR::from_raw(w!("Preferred DropEffect").as_ptr()));
+                if fmt != 0 {
+                    write_global(fmt, &v.to_le_bytes());
+                }
+            }
+            if let Some(bytes) = &backup.text {
+                write_global(CF_UNICODETEXT.0 as u32, bytes);
+            }
+            CloseClipboard().ok();
+        }
+    }
+
+    /// RAII：`ClipBackup` 在 `Drop` 时还原（panic 也会还原）。
+    #[cfg(windows)]
+    struct ClipRestoreGuard(Option<ClipBackup>);
+    #[cfg(windows)]
+    impl Drop for ClipRestoreGuard {
+        fn drop(&mut self) {
+            if let Some(backup) = self.0.take() {
+                restore_clipboard(backup);
+            }
+        }
+    }
+
+    /// `explorer /select,<abs>` 命令构造（只构造不 spawn——真 spawn 留给用户动作路径）。
+    #[test]
+    fn reveal_command_selects_absolute_path() {
+        let cmd = crate::reveal_in_explorer_command(std::path::Path::new(r"D:\x y\a.rs"));
+        assert_eq!(cmd.get_program(), "explorer");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args.len(), 1, "应恰一个 `/select,<path>` 参数");
+        assert_eq!(
+            args[0],
+            r"/select,D:\x y\a.rs",
+            "空格路径应原样进单个参数"
+        );
     }
 }

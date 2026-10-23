@@ -2737,9 +2737,9 @@ impl EditorApp {
                         });
                     })
                 });
-                m.item({
+                m = m.item({
                     let weak = weak.clone();
-                    let target = path.to_path_buf();
+                    let target = path.clone();
                     PopupMenuItem::element(move |_, _| {
                         div()
                             .w_full()
@@ -2753,7 +2753,98 @@ impl EditorApp {
                             this.file_tree_delete_request(&target, is_dir, window, cx);
                         });
                     })
-                })
+                });
+                // ── 第二组：在资源管理器中显示（Explorer /select,<绝对路径>）──
+                m = m.separator();
+                m = m.item({
+                    let weak = weak.clone();
+                    let target = path.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("在资源管理器中显示")
+                            .debug_selector(|| "file-tree-menu-reveal".into())
+                    })
+                    .on_click(move |_, _window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.file_tree_reveal_in_explorer(&target, cx);
+                        });
+                    })
+                });
+                // ── 第三组：复制路径 / 复制相对路径（无引号文本）──
+                m = m.separator();
+                m = m.item({
+                    let weak = weak.clone();
+                    let target = path.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("复制路径")
+                            .debug_selector(|| "file-tree-menu-copy-path".into())
+                    })
+                    .on_click(move |_, _window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.file_tree_copy_path(&target, cx);
+                        });
+                    })
+                });
+                m = m.item({
+                    let weak = weak.clone();
+                    let target = path.clone();
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child("复制相对路径")
+                            .debug_selector(|| "file-tree-menu-copy-rel-path".into())
+                    })
+                    .on_click(move |_, _window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.file_tree_copy_relative_path(&target, cx);
+                        });
+                    })
+                });
+                // ── 第四组：剪切 / 复制（文件操作，CF_HDROP + PreferredDropEffect）──
+                m.separator()
+                    .item({
+                        let weak = weak.clone();
+                        let target = path.clone();
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .child("剪切")
+                                .debug_selector(|| "file-tree-menu-cut".into())
+                        })
+                        .on_click(move |_, _window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.file_tree_cut(&target, cx);
+                            });
+                        })
+                    })
+                    .item({
+                        let weak = weak.clone();
+                        let target = path.clone();
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .child("复制")
+                                .debug_selector(|| "file-tree-menu-copy-file".into())
+                        })
+                        .on_click(move |_, _window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.file_tree_copy_file(&target, cx);
+                            });
+                        })
+                    })
             },
             |this, emitter, cx| {
                 if this.file_tree_menu_entity.as_ref() == Some(&emitter) {
@@ -3093,6 +3184,88 @@ impl EditorApp {
         self.sidebar.files.pending.retain(|p| p != changed && !p.starts_with(changed));
         self.sidebar.files.expanded.retain(|p| p != changed && !p.starts_with(changed));
         self.sidebar.files.layout_gen = self.sidebar.files.layout_gen.wrapping_add(1);
+    }
+
+    // -----------------------------------------------------------------
+    // 文件树右键：资源管理器定位 / 复制路径 / 复制相对路径 / 剪切 / 复制（文件）
+    // -----------------------------------------------------------------
+
+    /// 「在资源管理器中显示」：构造 `explorer /select,<绝对路径>` 并 spawn（不阻塞 UI）；
+    /// 启动失败 → 状态栏提示（不 panic、不弹错误框，静默可接受）。
+    pub(super) fn file_tree_reveal_in_explorer(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let mut cmd = tray::reveal_in_explorer_command(path);
+        match cmd.spawn() {
+            Ok(_) => {}
+            Err(e) => {
+                self.status = SharedString::from(format!("无法在资源管理器中显示：{e}"));
+                self.status_ok = false;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 「复制路径」：把**绝对路径**写入文本剪贴板（不带引号）。
+    pub(super) fn file_tree_copy_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let p = path.to_string_lossy().into_owned();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(p));
+        cx.notify();
+    }
+
+    /// 「复制相对路径」：相对已打开文件夹根（`files.root`）的相对路径，原生分隔符、
+    /// 不带引号；根缺失 / `strip_prefix` 失败 / **路径即根自身（相对为空）** →
+    /// 防御性退化复制绝对路径。
+    pub(super) fn file_tree_copy_relative_path(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let rel = self
+            .sidebar
+            .files
+            .root
+            .as_deref()
+            .and_then(|r| path.strip_prefix(r).ok())
+            // 根自身 strip_prefix 得空串：复制空前缀无意义 → 退化绝对路径。
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(rel));
+        cx.notify();
+    }
+
+    /// 「剪切」：把路径写入系统剪贴板文件操作（`CF_HDROP` + effect=Move），语义 =
+    /// 资源管理器「剪切」；写入失败（剪贴板占用等）→ 状态栏提示不崩溃。
+    pub(super) fn file_tree_cut(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.file_clipboard_drop(path, false, cx);
+    }
+
+    /// 「复制」（文件操作）：同「剪切」但 effect=Copy，语义 = 资源管理器「复制」。
+    pub(super) fn file_tree_copy_file(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.file_clipboard_drop(path, true, cx);
+    }
+
+    /// 剪贴板文件操作共用执行：`tray::set_clipboard_file_drop`（unsafe Win32 收敛在 tray）；
+    /// 成功 → 状态栏「已复制/已剪切」；失败 → 状态栏提示（截断长路径）。
+    fn file_clipboard_drop(&mut self, path: &std::path::Path, copy: bool, cx: &mut Context<Self>) {
+        let label = if copy { "已复制：" } else { "已剪切：" };
+        match tray::set_clipboard_file_drop(path, copy) {
+            Ok(()) => {
+                self.status = SharedString::from(format!(
+                    "{label}{}",
+                    path.display()
+                ));
+                self.status_ok = true;
+            }
+            Err(e) => {
+                self.status = SharedString::from(e);
+                self.status_ok = false;
+            }
+        }
+        cx.notify();
     }
 }
 
