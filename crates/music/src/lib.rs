@@ -14,9 +14,11 @@
 pub mod library;
 pub mod model;
 pub mod player;
+pub mod view;
 mod decode; // 私有：libloading 桥
 mod sink;   // 私有：cpal AudioSink
 
 pub use library::{AUDIO_EXTENSIONS, is_audio_extension};
 pub use model::{MixGroup, RepeatMode, Track};
 pub use player::MusicPlayer;
+pub use view::MusicView;
