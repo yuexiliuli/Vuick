@@ -162,6 +162,10 @@ impl EditorApp {
             _palette_sub: None,
             // A：旧 live2 实体延迟回收队列（`commit_live` 暂存、下一帧 on_next_frame 清空）。
             retired_live2: Vec::new(),
+            // 音乐播放器视图与模式（惰性创建；退出音乐模式不销毁 MusicView——播放继续）。
+            music: None,
+            music_mode: false,
+            _music_sub: None,
         };
         app.register_window(window, cx);
         // 打开文件夹持久化 → 启动恢复：prefs.opened_folder 存在且目录仍有效 → 设为

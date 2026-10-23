@@ -36,6 +36,9 @@ image_viewer = { path = "../image_viewer" }
 # 视频查看器随本 crate 的 `video` feature 开关（`cfg(feature = "video")`）。
 video = { path = "../video", optional = true }
 epub = { path = "../epub" }
+# 音乐播放器（Phase A 引擎 + Phase B UI 已提交）：shell 集成（整窗音乐模式 /
+# 打开音频文件路由 / 状态栏指示）。不静态链 FFmpeg（运行时经 libloading 加载）。
+music = { path = "../music" }
 
 [features]
 default = ["video"]

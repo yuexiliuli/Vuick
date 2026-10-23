@@ -32,6 +32,8 @@ actions!(
         // P2-8 命令面板：Ctrl+Shift+P 打开命令面板、Ctrl+P 打开文件快选。
         ToggleCommandPalette,
         QuickOpenFile,
+        // 音乐播放器：Ctrl+M 切换整窗音乐模式。
+        ToggleMusicPlayer,
         Quit,
     ]
 );

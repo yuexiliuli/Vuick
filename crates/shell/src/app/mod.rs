@@ -35,6 +35,7 @@
 mod file_ops;
 mod open_progress;
 mod menu;
+mod music_player;
 mod palette;
 mod panes;
 mod recent_panel;
@@ -551,6 +552,12 @@ pub struct EditorApp {
     /// 移出点击同步路径。渲染路径在 `commit_live` 之后已不再引用旧实体（`tab.live2` 置
     /// None），延迟 Drop 不影响任何渲染。
     retired_live2: Vec<gpui::Entity<WyEditor>>,
+    /// 音乐播放器视图（惰性创建；不随退出音乐模式销毁——播放继续）。
+    music: Option<gpui::Entity<music::MusicView>>,
+    /// 是否正处于音乐模式（整窗渲染 MusicView；false = 编辑器正常界面）。
+    music_mode: bool,
+    /// 音乐视图事件订阅（`MusicEvent::ExitRequested` → 退出音乐模式并把焦点还给编辑区）。
+    _music_sub: Option<Subscription>,
 }
 
 /// 窗口控制钮（最小化/最大化/关闭）上一帧解析出的图标前景色。

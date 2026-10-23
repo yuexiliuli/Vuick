@@ -220,6 +220,18 @@ impl MusicView {
         self.toast = Some((s.into().into(), Instant::now()));
     }
 
+    /// 载入默认音乐目录（shell 集成入口）：先读 `UserPrefs::music_dir`（未设置/空 →
+    /// [`config::limits::DEFAULT_MUSIC_DIR`] 兜底），随后 `MusicPlayer::load_dir`。
+    /// 目录不存在/为空 → 库为空（UI 显示空态），不报错。
+    pub fn load_default_dir(&mut self, cx: &mut Context<Self>) {
+        let dir = config::user::UserPrefs::load()
+            .music_dir
+            .filter(|d| !d.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(config::limits::DEFAULT_MUSIC_DIR));
+        self.player.update(cx, |p, cx| p.load_dir(dir, cx));
+    }
+
     // ---- 播放器接线（view → player，均极薄转发） ----
     pub fn toggle_play(&mut self, cx: &mut Context<Self>) {
         self.player.update(cx, |p, cx| p.toggle(cx));

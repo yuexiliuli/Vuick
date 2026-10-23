@@ -6,6 +6,24 @@ use super::*;
 
 impl Render for EditorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 音乐模式：整窗渲染 MusicView。外层包一个壳 div 承载 `ToggleMusicPlayer` 重入
+        // （Ctrl+M 再次触发可切回编辑器界面）——与文档模式根元素的同名 on_action 并存，
+        // 两套都挂 `toggle_music_player`（同一 listener 两处挂载，命中任一即可切关）。
+        // 返回 `AnyElement`：与下方 render_root 的 opaque 返回统一成同一具体类型
+        //（`impl IntoElement` 的所有返回路径必须是同一类型）。
+        if self.music_mode {
+            if let Some(mv) = &self.music {
+                return div()
+                    .id("music-root-shell")
+                    .debug_selector(|| "music-root-shell".into())
+                    .size_full()
+                    .on_action(cx.listener(Self::toggle_music_player_on_action))
+                    .child(mv.clone().into_any_element())
+                    .into_any_element();
+            }
+            // 兜底：视图缺失（异常销毁）→ 退出音乐模式，走正常编辑器界面。
+            self.music_mode = false;
+        }
         // WY_TRACE 归因：操作（按键/滚动）起点 → 本帧 render 开始的等待，单独记账
         // 供「每键真实延迟」拆账——多为 60Hz vsync/帧调度，不是 CPU 段。
         if let Some(d) = crate::prof::op_elapsed() {
@@ -20,7 +38,7 @@ impl Render for EditorApp {
 
         let root = self.render_root(body, window, cx);
         crate::prof::end("wy.app.render", _t);
-        root
+        root.into_any_element()
     }
 }
 
@@ -398,6 +416,13 @@ impl EditorApp {
                     this.quick_open_file(window, cx);
                 }),
             )
+            // 音乐播放器：Ctrl+M 切换整窗音乐模式（同 music 模式壳 div 的 on_action 并存，
+            // 见 `render` 顶部音乐模式分支——任一命中都走 `toggle_music_player`）。
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &ToggleMusicPlayer, window, cx| {
+                    this.toggle_music_player(window, cx)
+                }),
+            )
             .child(self.render_material_layer(window))
             .child(
                 div()
@@ -438,5 +463,15 @@ impl EditorApp {
             Some(p) => p.into_any_element(),
             None => div().into_any_element(),
         }
+    }
+
+    /// ToggleMusicPlayer 动作入口（文档模式根元素与音乐模式壳 div 共用同一 listener 转发）。
+    fn toggle_music_player_on_action(
+        &mut self,
+        _: &ToggleMusicPlayer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_music_player(window, cx);
     }
 }

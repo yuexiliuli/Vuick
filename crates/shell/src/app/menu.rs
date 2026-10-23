@@ -4,7 +4,8 @@ use super::*;
 use crate::actions::{Copy, Cut, Redo, SelectAll, Undo};
 use crate::commands::{
     COPY, CUT, DECREASE_FONT, FOLLOW_THEME, INCREASE_FONT, NEW_FILE, OPEN_FILE, OPEN_FOLDER,
-    PASTE, PREVIEW, QUIT, REDO, RESET_FONT, SAVE, SAVE_AS, SELECT_ALL, THEME, TOGGLE_WRAP, UNDO,
+    PASTE, PREVIEW, QUIT, REDO, RESET_FONT, SAVE, SAVE_AS, SELECT_ALL, THEME,
+    TOGGLE_MUSIC_PLAYER, TOGGLE_WRAP, UNDO,
 };
 use ui::button::{Button, ButtonVariants as _};
 use ui::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -211,8 +212,15 @@ impl EditorApp {
         .item(Self::menu_action_item(
             FOLLOW_THEME.menu_label,
             FOLLOW_THEME.shortcut,
-            weak,
+            weak.clone(),
             |this, _window, cx| this.follow_system_theme(cx),
+        ))
+        // 音乐播放器：整窗音乐模式开关（Ctrl+M / 命令面板 / 菜单共用同一动作）。
+        .item(Self::menu_action_item(
+            TOGGLE_MUSIC_PLAYER.menu_label,
+            TOGGLE_MUSIC_PLAYER.shortcut,
+            weak,
+            |this, window, cx| this.toggle_music_player(window, cx),
         ))
     }
 

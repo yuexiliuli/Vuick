@@ -21,4 +21,4 @@ mod sink;   // 私有：cpal AudioSink
 pub use library::{AUDIO_EXTENSIONS, is_audio_extension};
 pub use model::{MixGroup, RepeatMode, Track};
 pub use player::MusicPlayer;
-pub use view::MusicView;
+pub use view::{MusicEvent, MusicView};

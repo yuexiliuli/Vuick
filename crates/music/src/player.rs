@@ -348,6 +348,26 @@ impl MusicPlayer {
         self.play_track(idx, cx);
     }
 
+    /// 播放指定路径的音频文件（shell 集成入口）：先在当前 library 里按路径找下标；
+    /// 未找到（如路径在配置目录之外）→ 以该文件**父目录**作该次库重扫，再按路径播放。
+    /// 复用 `load_dir`/`play_track`，不重复建队列逻辑。
+    pub fn play_path(&mut self, path: impl AsRef<Path>, cx: &mut Context<Self>) {
+        let path = path.as_ref().to_path_buf();
+        if let Some(idx) = self.library.iter().position(|t| t.path == path) {
+            return self.play_track(idx, cx);
+        }
+        // 路径不在当前库：以文件父目录重扫（父目录相同但文件新加入也会重扫到）。
+        if let Some(parent) = path.parent() {
+            self.load_dir(parent, cx);
+        }
+        let Some(idx) = self.library.iter().position(|t| t.path == path) else {
+            self.error = Some(format!("音频不在库中：{}", path.display()));
+            cx.notify();
+            return;
+        };
+        self.play_track(idx, cx);
+    }
+
     /// seek 到 `seconds`（clamp 到 [0, 探测时长]）；flush 在 worker 内完成。
     pub fn seek(&mut self, seconds: f64, cx: &mut Context<Self>) {
         let max = if self.duration > 0.0 {

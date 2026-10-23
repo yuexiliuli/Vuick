@@ -4460,6 +4460,7 @@ dependencies = [
  "markdown",
  "markdown-wysiwyg",
  "memchr",
+ "music",
  "pdf",
  "raw-window-handle",
  "rfd",

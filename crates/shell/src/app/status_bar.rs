@@ -361,7 +361,58 @@ impl EditorApp {
             right = right.child(self.status_wrap_btn(wrap_on, cx));
         }
 
+        // 音乐指示（编辑器模式且 MusicView 存在、当前有曲目时）：♪ 歌名 + 播放/暂停符号，
+        // 点击切 播放/暂停（不切音乐模式）。
+        if !self.music_mode {
+            let music_hint = self.music.as_ref().map(|mv| {
+                let pl = mv.read(cx).player.read(cx);
+                (
+                    pl.current_track().map(|t| t.title.clone()),
+                    pl.playing(),
+                )
+            });
+            if let Some((Some(title), playing)) = music_hint
+                && !title.is_empty()
+            {
+                right = right.child(self.status_music_btn(title, playing, cx));
+            }
+        }
+
         right
+    }
+
+    /// 状态栏右侧「音乐」指示钮：`♪ 歌名` + 播放/暂停符号；点击切 播放/暂停
+    ///（不切音乐模式，也不进入音乐界面）。
+    fn status_music_btn(
+        &self,
+        title: String,
+        playing: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("status-music-btn")
+            .debug_selector(|| "status-music-btn".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .h(px(status_pill_h()))
+            .rounded_sm()
+            .bg(self.chrome().pill_bg)
+            .text_size(px(12.))
+            .text_color(self.chrome().pill_fg)
+            .cursor(CursorStyle::PointingHand)
+            .child(if playing { "⏸ " } else { "▶ " })
+            .child(format!("♪ {title}"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _ev, _w, cx| {
+                    if let Some(mv) = &this.music {
+                        mv.update(cx, |v, cx| v.toggle_play(cx));
+                    }
+                }),
+            )
     }
 
     /// 状态栏上的小状态项：muted 文字 + 恰当间距（无 hover/点击）。
