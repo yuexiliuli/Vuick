@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, AnyElement, Bounds, ClipboardItem, Context, CursorStyle, DefiniteLength, Entity,
     EntityInputHandler, EventEmitter, Focusable, FocusHandle, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement as _,
-    Point, Pixels, Render, RenderImage, SharedString, Styled as _, StyledImage,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    ParentElement as _, Point, Pixels, Render, RenderImage, SharedString, Styled as _, StyledImage,
     TextInputConfiguration, UTF16Selection, Window, div, img, point, px, size,
 };
 
@@ -84,6 +84,16 @@ pub struct ViewState {
     /// 导航「返回」占位（预留）。
     #[allow(dead_code)]
     pub back_off: bool,
+    // ---- 进度条拖拽交互态（对齐视频 scrub 状态机，音频-only 适配） ----
+    /// 进度条是否正在拖拽（左键按下未松开）。
+    pub scrubbing: bool,
+    /// 拖拽当前锁定的落点（秒）：逐 move 更新，松手按此收尾提交（「松手停在当前位置」）。
+    pub scrub_target: f64,
+    /// 本次拖拽已向 worker 真实 seek 过的落点：松手同落点不重复 seek（无杂音）。
+    pub scrub_seeked: Option<f64>,
+    /// 拖拽节流：上次真实 seek 的时刻（密集 move 防刷爆 worker/杂音，对齐视频
+    /// `SCRUB_RETARGET_MS`）。节流窗口内每 move 只碰显示基准，不影响跟手。
+    pub last_scrub_retarget: Option<Instant>,
 }
 
 /// 音乐视图事件（shell 订阅退出音乐模式）。
@@ -132,6 +142,10 @@ pub struct MusicView {
     /// 全屏浮层当前悬停元素 id（按钮高亮/进度条圆点显示用；同一指针只有一个悬停）。
     fs_hover: Option<&'static str>,
 }
+
+/// 进度条拖拽真实 seek 节流（ms）：与视频查看器同量级；节流窗口内只更新显示基准
+/// （`set_seek_base` 即时跟手），真实 codec.seek + flush 降到节流粒度，防拖拽刷爆 worker/杂音。
+const SCRUB_RETARGET_MS: u64 = 60;
 
 impl MusicView {
     /// 新建音乐视图：建焦点句柄 + 起常驻 tick 循环（不在此 bind keys——根部
@@ -466,6 +480,17 @@ impl MusicView {
         el = el.on_mouse_move(
             cx.listener(move |this, ev, _w, cx| this.on_strip_drag(is_seek, b2.clone(), ev, cx)),
         );
+        // 松手收尾（进度条）：窗口内松开 / 拖出窗外松开都按最后锁定落点提交，保证
+        // 「松手停在当前位置」。音量条无需收尾（on_strip_up 对 !is_seek 直接返回）。
+        let b3 = bounds.clone();
+        el = el.on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, ev, _w, cx| this.on_strip_up(is_seek, b3.clone(), ev, cx)),
+        );
+        el = el.on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(move |this, ev, _w, cx| this.on_strip_up(is_seek, bounds.clone(), ev, cx)),
+        );
         el.into_any_element()
     }
 
@@ -477,6 +502,13 @@ impl MusicView {
         cx: &mut Context<Self>,
     ) {
         if let Some(f) = fraction_at(&bounds, ev.position) {
+            if is_seek {
+                // 点按即跳：进拖拽态并以该点为基准立即真实 seek（显示由 seek_base 即时到落点）。
+                self.state.scrubbing = true;
+                self.state.last_scrub_retarget = Some(Instant::now());
+                // 同步钉住播放器显示基准：拖拽中 position = 手指落点，不随时钟漂移。
+                self.player.update(cx, |p, cx| p.set_scrubbing(true, cx));
+            }
             self.apply_strip(is_seek, f, cx);
         }
     }
@@ -489,18 +521,91 @@ impl MusicView {
         cx: &mut Context<Self>,
     ) {
         if !ev.dragging() {
+            // 已松开但 mouse_up 未送达本条（如拖出窗外释放）→ 按最后锁定落点收尾
+            // （对齐视频 `on_seek_move` 的 `!dragging && scrubbing` 兜底）。
+            if self.state.scrubbing {
+                self.end_strip_scrub(cx);
+            }
             return;
         }
         if let Some(f) = fraction_at(&bounds, ev.position) {
-            self.apply_strip(is_seek, f, cx);
+            if is_seek && self.state.scrubbing {
+                self.seek_to_fraction(f, false, cx);
+            } else if !is_seek {
+                self.apply_strip(false, f, cx);
+            }
         }
     }
 
-    /// 应用拖拽比例：进度 → seek(f×duration)；音量 → set_volume(f)。
+    /// 进度条松手收尾（窗口内 `on_mouse_up` / 拖出窗外 `on_mouse_up_out` 共用）：
+    /// 窗口内优先用松手位置的精确分数刷新落点；窗外（fraction_at None）沿用最后锁定
+    /// 落点。随后按最终落点提交，「松手停在当前位置」。
+    fn on_strip_up(
+        &mut self,
+        is_seek: bool,
+        bounds: Rc<Cell<Bounds<Pixels>>>,
+        ev: &MouseUpEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !is_seek || !self.state.scrubbing {
+            return;
+        }
+        if let Some(f) = fraction_at(&bounds, ev.position) {
+            let dur = self.player.read(cx).duration();
+            self.state.scrub_target = dur * f as f64;
+        }
+        self.end_strip_scrub(cx);
+    }
+
+    /// 拖拽收尾：若最终落点尚未真实 seek（节流窗口内直接松手）→ 补发最后一次精确
+    /// 提交；否则（已 seek 过同落点）只退出拖拽态，不重复 seek（无杂音）。
+    fn end_strip_scrub(&mut self, cx: &mut Context<Self>) {
+        if !self.state.scrubbing {
+            return;
+        }
+        let target = self.state.scrub_target;
+        self.state.scrubbing = false;
+        // 先解锁播放器显示基准（拖拽钉扎解除），再按最终落点提交真实 seek。
+        self.player.update(cx, |p, cx| p.set_scrubbing(false, cx));
+        if self.state.scrub_seeked != Some(target) {
+            self.state.scrub_seeked = Some(target);
+            self.player.update(cx, |p, cx| p.seek(target, cx));
+        }
+        cx.notify();
+    }
+
+    /// 把进度条分数应用为 seek 落点：`force=true`（点按/松手收尾）无条件真实 seek；
+    /// `false`（拖动）走 [`SCRUB_RETARGET_MS`] 节流——节流窗口内只更新显示基准
+    /// （`set_seek_base`，显示由 seek_base 即时跟手，不依赖 worker）。
+    fn seek_to_fraction(&mut self, f: f32, force: bool, cx: &mut Context<Self>) {
+        let dur = self.player.read(cx).duration();
+        let target = dur * f as f64;
+        self.state.scrub_target = target;
+        if force {
+            self.state.last_scrub_retarget = Some(Instant::now());
+            self.state.scrub_seeked = Some(target);
+            self.player.update(cx, |p, cx| p.seek(target, cx));
+            return;
+        }
+        let due = match self.state.last_scrub_retarget {
+            Some(t) => t.elapsed() >= Duration::from_millis(SCRUB_RETARGET_MS),
+            None => true,
+        };
+        if due {
+            self.state.last_scrub_retarget = Some(Instant::now());
+            self.state.scrub_seeked = Some(target);
+            self.player.update(cx, |p, cx| p.seek(target, cx));
+        } else {
+            // 节流窗口内：显示仍逐 move 实时跟手（仅更新显示基准，不发 worker seek）。
+            self.player.update(cx, |p, cx| p.set_seek_base(target, cx));
+        }
+    }
+
+    /// 应用拖拽比例（点按/音量共用入口）：进度 → 立即真实 seek(f×duration) 并进拖拽态
+    /// 状态由调用方先置好；音量 → set_volume(f)。
     fn apply_strip(&mut self, is_seek: bool, f: f32, cx: &mut Context<Self>) {
         if is_seek {
-            let dur = self.player.read(cx).duration();
-            self.player.update(cx, |p, cx| p.seek(dur * f as f64, cx));
+            self.seek_to_fraction(f, true, cx);
         } else {
             self.player.update(cx, |p, cx| p.set_volume(f, cx));
         }

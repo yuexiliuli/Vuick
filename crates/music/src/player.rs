@@ -10,6 +10,7 @@
 //!   不加常驻定时器，避免测试悬空 + fake 调度器无跨线程唤醒（K26）——worker 事件经
 //!   mpsc 入队，`tick` 逐条 `try_recv` 处理）。sink 只打开一次（Same instance 跨曲目复用）。
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -69,6 +70,20 @@ pub struct MusicPlayer {
     liked: HashSet<String>,
     /// Load 代序号：每次 `play_track` 递增，worker 回送 Opened.gen_id 与之匹配过滤陈旧。
     generation: u64,
+    /// 显示基准（秒）：最近一次 seek / 拖拽预览的目标。sink.flush 会归零播放时钟，
+    /// 用它 + 时钟增量合成 `position()`，seek 后显示从落点继续走、不再从 0 重走。
+    seek_base: f64,
+    /// 显示基准锚点：记录 `seek_base` 设定时刻的 sink 时钟（即 seek/预览后、worker
+    /// flush 落地前的钟值）。增量合成规则见 [`Self::position`]。
+    seek_clock_base: f64,
+    /// 拖拽轨道：true 时 `position()` 钉在 `seek_base`（手指位置，对齐视频 scrub
+    /// 预览）；松手收尾（`set_scrubbing(false)`）后解锁、恢复由 sink 时钟推进。
+    scrubbing: bool,
+    /// 已观察到 worker 把 sink 时钟归零（seek flush / 新曲 Load / Stop）——`position()`
+    /// 是只读路径，用 `Cell` 在此吸收「时钟回跳」：一旦观察到 `clock < 锚点` 即判定
+    /// flush 已落地、此后增量直接取 `clock`（否则 flush 后时钟从 0 重走仍照旧锚点
+    /// 起算，会在 seek 落点上方「冻结满 C 秒再突然跃升」）。
+    flush_seen: Cell<bool>,
 }
 
 impl MusicPlayer {
@@ -96,6 +111,10 @@ impl MusicPlayer {
             duration: 0.0,
             liked: HashSet::new(),
             generation: 0,
+            seek_base: 0.0,
+            seek_clock_base: 0.0,
+            scrubbing: false,
+            flush_seen: Cell::new(false),
         }
     }
 
@@ -125,6 +144,9 @@ impl MusicPlayer {
                 {
                     t.duration = duration;
                 }
+                // 新曲目从 0 走：显示基准复位（seek 基准由 Opened 前 play_track 已复位，
+                // 此处兜底以防任何路径漏过）。
+                self.reset_playhead_base();
                 self.playing = true;
                 self.paused = false;
             }
@@ -239,6 +261,7 @@ impl MusicPlayer {
         self.duration = 0.0;
         self.paused = false;
         self.playing = true;
+        self.reset_playhead_base();
         let path = self.library[idx].path.clone();
         let rate = match &self.sink {
             Some(s) => s.sample_rate(),
@@ -369,6 +392,8 @@ impl MusicPlayer {
     }
 
     /// seek 到 `seconds`（clamp 到 [0, 探测时长]）；flush 在 worker 内完成。
+    /// 同步把显示基准 `seek_base` 置为目标：即使 worker 异步 flush 归零 sink 时钟，
+    /// `position()` 也从落点继续走（不再从 0 重走）——进度条点/拖「显示到落点」的关键。
     pub fn seek(&mut self, seconds: f64, cx: &mut Context<Self>) {
         let max = if self.duration > 0.0 {
             self.duration
@@ -376,11 +401,44 @@ impl MusicPlayer {
             f64::INFINITY
         };
         let t = seconds.max(0.0).min(max);
+        self.seek_base = t;
+        self.seek_clock_base = self.sink.as_ref().map(|s| s.position()).unwrap_or(0.0);
+        self.flush_seen.set(false);
         let gen_id = self.generation;
         if let Some(tx) = &self.worker_tx {
             let _ = tx.send(WorkerCmd::Seek { gen_id, seconds: t });
         }
         cx.notify();
+    }
+
+    /// 仅更新显示基准（拖拽节流窗口内逐 move 调用：显示即时跟手，不发 worker seek）。
+    /// 与 `seek` 同一基准语义：位置 = 新基准 + 自锚点起的时钟增量。
+    pub fn set_seek_base(&mut self, seconds: f64, cx: &mut Context<Self>) {
+        let max = if self.duration > 0.0 {
+            self.duration
+        } else {
+            0.0
+        };
+        let t = seconds.max(0.0).min(max);
+        self.seek_base = t;
+        self.seek_clock_base = self.sink.as_ref().map(|s| s.position()).unwrap_or(0.0);
+        cx.notify();
+    }
+
+    /// 拖拽轨道开关：进入后 `position()` 钉在 `seek_base`（显示跟手指、不随时钟
+    /// 漂移）；退出（松手收尾）解锁。与视图 `state.scrubbing` 对应——`position()`
+    /// 需要在拖拽中读到该状态，故在播放器侧留一份源。
+    pub fn set_scrubbing(&mut self, scrubbing: bool, cx: &mut Context<Self>) {
+        self.scrubbing = scrubbing;
+        cx.notify();
+    }
+
+    /// 新曲目/停止：播放显示基准复位（正常播放从 0 走）。
+    fn reset_playhead_base(&mut self) {
+        self.seek_base = 0.0;
+        self.seek_clock_base = 0.0;
+        self.scrubbing = false;
+        self.flush_seen.set(false);
     }
 
     pub fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
@@ -436,12 +494,33 @@ impl MusicPlayer {
         self.queue_pos = 0;
         self.current = None;
         self.duration = 0.0;
+        self.reset_playhead_base();
         cx.notify();
     }
 
-    /// 播放位置（秒）：sink 音频时钟（paused 时 worker 已暂停 sink → 天然冻结）；无 sink 0。
+    /// 播放位置（秒）= 显示基准 `seek_base` + 自落点起的时钟增量：
+    /// - 正常播放：seek_base=0、锚=0 → 位置 = sink 时钟（与现状一致）；
+    /// - `seek(T)` 后：位置立即 = T（显示到落点）；worker flush 归零时钟后进入
+    ///   「增量 = clock」直接模式 → 自 T 继续走，不再从 0 重走、也不「冻结再跃升」；
+    /// - 拖拽（`scrubbing`）：位置钉在最近预览落点 `seek_base`（跟手指，不随时钟漂移）；
+    /// - paused/无 sink：时钟不推进/恒 0 → 位置停在与 seek_base 一致处。
+    /// duration<=0（无曲目/未探测）恒 0。
     pub fn position(&self) -> f64 {
-        self.sink.as_ref().map(|s| s.position()).unwrap_or(0.0)
+        let clock = self.sink.as_ref().map(|s| s.position()).unwrap_or(0.0);
+        compose_playhead(
+            self.seek_base,
+            self.seek_clock_base,
+            &self.flush_seen,
+            clock,
+            self.duration,
+            self.scrubbing,
+        )
+    }
+
+    /// 测试专用注入：设置探测时长（无 worker/设备环境下定位 seek 显示语义用）。
+    #[cfg(test)]
+    pub(crate) fn set_test_duration(&mut self, seconds: f64) {
+        self.duration = seconds;
     }
 
     // ---- 只读访问器（Phase B UI 用） ----
@@ -770,6 +849,38 @@ fn worker_main(rx: mpsc::Receiver<WorkerCmd>, evt_tx: mpsc::Sender<Event>, sink:
     }
 }
 
+/// `position()` 的纯合成（独立成函数供单测直接驱动各种时钟/基准组合）：
+/// - duration<=0 → 恒 0（不 panic）；
+/// - 观察 `clock < 锚点`（sink 时钟回跳，played_frames 被 flush 归零）即判定 worker
+///   flush 已落地 → `flush_seen` 置真，此后增量**直接取 `clock`**（时钟 0 基自落点重走）；
+/// - 仍未观察到回跳（flush 在途）：增量 = `(clock − 锚点).max(0)`（异步 gap 内小幅增量，
+///   显示不跳端、不闪回溯）；
+/// - `scrubbing`：钉在 `seek_base`，不随时钟漂移（拖拽预览跟手指）。
+fn compose_playhead(
+    seek_base: f64,
+    seek_clock_base: f64,
+    flush_seen: &Cell<bool>,
+    clock: f64,
+    duration: f64,
+    scrubbing: bool,
+) -> f64 {
+    if duration <= 0.0 {
+        return 0.0;
+    }
+    if !flush_seen.get() && clock < seek_clock_base {
+        flush_seen.set(true);
+    }
+    if scrubbing {
+        return seek_base.min(duration);
+    }
+    let delta = if flush_seen.get() {
+        clock
+    } else {
+        (clock - seek_clock_base).max(0.0)
+    };
+    (seek_base + delta).min(duration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,6 +944,91 @@ mod tests {
         assert_eq!(s, orig, "洗牌只重排、不丢不重元素");
         // 20 元素洗牌结果几乎必变序（确定性伪随机也几乎必变）
         assert_ne!(q, orig);
+    }
+
+    /// 显示基准回归：`seek(T)` 后（有曲目时长、无 worker/sink）`position()≈T`（显示落到
+    /// 目标，而不是 sink flush 归零后从 0 重走）；正常播放（base=0）与现状一致；超时长
+    /// 钳位；duration=0（无曲目/未探测）显示恒 0、不 panic。
+    #[gpui::test]
+    async fn seek_updates_position_base_without_sink(cx: &mut TestAppContext) {
+        let player: gpui::Entity<MusicPlayer> =
+            cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+        // 无 sink：未 seek 前 position=0（与现状一致）。
+        let p0 = cx.read(|app| player.read(app).position());
+        assert_eq!(p0, 0.0, "未 seek 前无 sink position 应恒 0");
+        // 有曲目时长（无 worker/sink）：seek(7) 后 position≈7（显示基准=seek 目标）。
+        cx.update(|app| {
+            player.update(app, |p, _| p.set_test_duration(20.0));
+        });
+        cx.update(|app| {
+            player.update(app, |p, cx| p.seek(7.0, cx));
+        });
+        let p1 = cx.read(|app| player.read(app).position());
+        assert!(
+            (p1 - 7.0).abs() < 1e-9,
+            "seek 后 position 应=seek_base=7.0（显示不归零），实得 {p1}"
+        );
+        // 正常播放基准：base=0 时 position 由 sink 时钟驱动（无 sink → 0），与现状一致。
+        cx.update(|app| {
+            player.update(app, |p, cx| p.seek(0.0, cx));
+        });
+        let p2 = cx.read(|app| player.read(app).position());
+        assert_eq!(p2, 0.0, "seek(0) 后无 sink position 应回 0");
+        // 超 duration 钳位到 duration。
+        cx.update(|app| {
+            player.update(app, |p, _| p.set_test_duration(10.0));
+        });
+        cx.update(|app| {
+            player.update(app, |p, cx| p.seek(99.0, cx));
+        });
+        let p3 = cx.read(|app| player.read(app).position());
+        assert!(
+            (p3 - 10.0).abs() < 1e-9,
+            "seek 超 duration 应钳位到 duration=10，实得 {p3}"
+        );
+        // duration=0（无曲目/未探测）：点击/拖动不 panic、显示恒 0。
+        cx.update(|app| {
+            player.update(app, |p, _| p.set_test_duration(0.0));
+        });
+        cx.update(|app| {
+            player.update(app, |p, cx| p.seek(5.0, cx));
+        });
+        let p4 = cx.read(|app| player.read(app).position());
+        assert_eq!(p4, 0.0, "duration=0 无曲目 position 应恒 0");
+    }
+
+    /// `compose_playhead` 纯合成回归：seek 提交后（锚点 C、flush 已归零时钟）增量直接取
+    /// `clock`，显示自落点继续走——**不得**「冻结到时钟追上锚点再跃升」（原实现的
+    /// `(clock−锚点).max(0)` 在 flush 后时钟 0 基重走时会冻结 C 秒）；在途 flush 的异步
+    /// gap 内只允许小幅增量；拖拽钉扎不随时钟漂移；超时长钳位；duration=0 恒 0。
+    #[test]
+    fn compose_playhead_covers_flush_latch_pin_and_clamp() {
+        use std::cell::Cell;
+        // 在途 flush（尚未观察到时钟回跳）：clock ≥ 锚点 → 增量 = clock − 锚点（≈0）。
+        let f = Cell::new(false);
+        let p = compose_playhead(120.0, 60.0, &f, 60.05, 200.0, false);
+        assert!((p - 120.05).abs() < 1e-9, "flush 在途 gap 内仅小幅增量，实得 {p}");
+        assert!(!f.get(), "未观察到回跳前不得 latch");
+        // flush 落地：clock=0 < 锚点 → 首次观察到即 latch；随后增量直接取 clock。
+        let f = Cell::new(false);
+        let p = compose_playhead(120.0, 60.0, &f, 0.0, 200.0, false);
+        assert_eq!(p, 120.0, "flush 归零时刻显示恰为落点");
+        assert!(f.get(), "观察到时钟回跳应 latch");
+        let p2 = compose_playhead(120.0, 60.0, &f, 42.0, 200.0, false);
+        assert!((p2 - 162.0).abs() < 1e-9, "latch 后增量=clock，42s 处应 162，实得 {p2}");
+        // 拖拽钉扎：时钟再大也不漂移。
+        let f = Cell::new(false);
+        let p = compose_playhead(40.0, 3.0, &f, 200.0, 120.0, true);
+        assert_eq!(p, 40.0, "拖拽中 position 应钉在 seek_base=40");
+        // 超时长钳位（latch 后 clock 增长 + 大 seek 基准）。
+        let f = Cell::new(false);
+        compose_playhead(150.0, 60.0, &f, 0.0, 200.0, false); // latch
+        let p = compose_playhead(150.0, 60.0, &f, 80.0, 200.0, false);
+        assert_eq!(p, 200.0, "seek+增量超时长应钳位到 duration=200，实得 {p}");
+        // duration=0 恒 0（不 panic）。
+        let f = Cell::new(false);
+        let p = compose_playhead(50.0, 60.0, &f, 10.0, 0.0, false);
+        assert_eq!(p, 0.0, "duration=0 恒 0");
     }
 
     /// 手写 1.5s 双声道 16bit 44.1k WAV（低音量正弦）——scan 不读内容，播放走真解码。

@@ -387,6 +387,8 @@ impl super::MusicView {
         let hovered = self.fs_hover == Some("fs-prog");
         let b_down = self.fs_progress.clone();
         let b_drag = self.fs_progress.clone();
+        let b_up = self.fs_progress.clone();
+        let b_out = self.fs_progress.clone();
 
         div()
             .w_full()
@@ -409,6 +411,20 @@ impl super::MusicView {
                     .on_mouse_move(
                         cx.listener(move |this, ev, _w, cx| {
                             this.on_strip_drag(true, b_drag.clone(), ev, cx);
+                        }),
+                    )
+                    // 松手收尾（与 strip_element/bb/np 同一套 handler，三处进度条共用一处修）：
+                    // 窗口内松开 → on_mouse_up；拖出窗外/条外松开 → on_mouse_up_out 兜底。
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev, _w, cx| {
+                            this.on_strip_up(true, b_up.clone(), ev, cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev, _w, cx| {
+                            this.on_strip_up(true, b_out.clone(), ev, cx);
                         }),
                     )
                     .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
