@@ -64,9 +64,9 @@ impl super::MusicView {
     /// header：标题 + 三个 tab 钮（歌曲/歌词/队列）。
     fn render_rp_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let tabs = [
-            (RightTab::Song, "歌曲"),
-            (RightTab::Lyrics, "歌词"),
-            (RightTab::Queue, "队列"),
+            ("rp-tab-song", RightTab::Song, "歌曲"),
+            ("rp-tab-lyrics", RightTab::Lyrics, "歌词"),
+            ("rp-tab-queue", RightTab::Queue, "队列"),
         ];
         div()
             .flex()
@@ -87,13 +87,14 @@ impl super::MusicView {
                     .bg(theme::bg_secondary())
                     .rounded(px(8.))
                     .p(px(3.))
-                    .children(tabs.into_iter().map(|(tab, label)| {
+                    .children(tabs.into_iter().map(|(key, tab, label)| {
                         let active = self.state.right_tab == tab;
                         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
                             this.set_right_tab(tab, cx);
                         });
                         div()
-                            .id(format!("rp-tab-{label}"))
+                            .id(key)
+                            .relative()
                             .px(px(10.))
                             .py(px(5.))
                             .rounded(px(6.))
@@ -102,6 +103,8 @@ impl super::MusicView {
                             .text_size(px(12.))
                             .text_color(if active { gpui::white() } else { theme::text2() })
                             .on_click(cl)
+                            .on_hover(self.hover_tip_listener(cx, key, label))
+                            .child(theme::bounds_canvas(self.tip_box_cell(key)))
                             .child(label.to_string())
                             .into_any_element()
                     })),
@@ -192,6 +195,7 @@ impl super::MusicView {
             self.np_progress.clone(),
             progress_fraction,
             true,
+            None,
             None,
             cx,
         );
@@ -358,6 +362,7 @@ impl super::MusicView {
         });
         div()
             .id(id)
+            .relative()
             .flex()
             .items_center()
             .gap_x(px(5.))
@@ -365,6 +370,8 @@ impl super::MusicView {
             .text_size(px(12.))
             .text_color(if active { theme::pink() } else { theme::text3() })
             .on_click(cl)
+            .on_hover(self.hover_tip_listener(cx, id, label))
+            .child(theme::bounds_canvas(self.tip_box_cell(id)))
             .child(
                 IconView::new(icon)
                     .filled(active && matches!(icon, MusicIcon::Heart))

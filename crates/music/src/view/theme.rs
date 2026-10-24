@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Bounds, Hsla, IntoElement, Pixels, canvas, fill, linear_color_stop,
+    AnyElement, Bounds, Hsla, IntoElement, Pixels, Styled as _, canvas, fill, linear_color_stop,
     linear_gradient, px,
 };
 
@@ -163,9 +163,34 @@ pub fn grad_css((r, g, b): (u32, u32, u32)) -> String {
 /// 渐变封面（GPUI 无 CSS 渐变）：`canvas` 绘制 `135deg` 线性渐变圆角方块，
 /// 通常 `absolute inset-0` 铺满父容器。`(light, dark)` 为 `[0%, 100%]` 两停靠色。
 pub fn gradient_cover((light, dark): (Hsla, Hsla), radius: f32) -> AnyElement {
+    gradient_cover_impl((light, dark), radius, None)
+}
+
+/// 同 [`gradient_cover`]，但把 canvas **实际绘制盒**写入 `record`：供 fs 进度填充的
+/// 「填充随位置增长」回归断言——canvas 布局高度曾塌缩为 0（真机复报五：填充隐形只留轨道
+/// 一色），此盒可直接断言绘制面积非零且随 frac 变化（`bounds_canvas` 同款 Cell 姿势）。
+pub fn gradient_cover_tracked(
+    (light, dark): (Hsla, Hsla),
+    radius: f32,
+    record: Rc<Cell<Bounds<Pixels>>>,
+) -> AnyElement {
+    gradient_cover_impl((light, dark), radius, Some(record))
+}
+
+/// 渐变绘制公共实现：canvas 自身 `absolute().inset_0()` 填最近定位祖先（gpui 所有 div 默认
+/// `position: relative` = 直接父 div）——否则 block 子盒高度塌缩 0（布局只横向拉伸、纵向为
+/// content 高 0）→ 渐变面积 0 不可见（真机复报五根因）。
+fn gradient_cover_impl(
+    (light, dark): (Hsla, Hsla),
+    radius: f32,
+    record: Option<Rc<Cell<Bounds<Pixels>>>>,
+) -> AnyElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _cx| {
+            if let Some(r) = &record {
+                r.set(bounds);
+            }
             window.paint_quad(
                 fill(
                     bounds,
@@ -179,16 +204,23 @@ pub fn gradient_cover((light, dark): (Hsla, Hsla), radius: f32) -> AnyElement {
             );
         },
     )
+    .absolute()
+    .inset_0()
     .into_any_element()
 }
 
 /// 供可交互条（进度/音量）记录元素窗口坐标盒的 canvas 辅助：prepaint 期把自身布局盒
 /// 写入 `bounds`，事件回调据此反算比例（对齐 video 查看器 `strip_element` 姿势）。
+/// `absolute().inset_0()`：canvas 脱离布局流、在任何容器上下文（含 flex-row）都记录
+/// **父条完整盒**（宽>0）——旧实现无尺寸 canvas 在 flex-row（如 `#fs-vol`）里是 flex
+/// item → 宽塌缩 0 → `fraction_at` 拒算 → 全屏音量/进度点拖失效（真机复报）。
 pub fn bounds_canvas(bounds: Rc<Cell<Bounds<Pixels>>>) -> AnyElement {
     canvas(
         move |b, _w, _app| bounds.set(b),
         |_, _, _, _| {},
     )
+    .absolute()
+    .inset_0()
     .into_any_element()
 }
 

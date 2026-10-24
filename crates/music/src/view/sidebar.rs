@@ -219,9 +219,11 @@ impl super::MusicView {
             let cl = cx.listener(move |this: &mut MusicView, _ev, _w, _cx| {
                 this.toast_msg(format!("打开歌单：{tip}"));
             });
+            let sel = name.clone();
             title.push(
                 div()
                     .id(id)
+                    .debug_selector(move || format!("music-playlist-{sel}"))
                     .flex()
                     .items_center()
                     .gap_x(px(10.))

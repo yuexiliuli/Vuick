@@ -1,6 +1,9 @@
 //! 全屏播放浮层（v2 复刻）：`fs_open` 时渲染为根视图**最后子元素**（absolute inset-0，
-//! 绘制/命中最上层，盖住三栏 + 底栏）。原型 `prototype-orbitrum-player-v2.html`
-//! `.fullscreen-player`，相对 v1 的结构改动：
+//! 绘制/命中最上层，盖住三栏 + 底栏），并 `.occlude()`（`HitboxBehavior::BlockMouse`）
+//! ——gpui 命中栈仅对 BlockMouse break，然则盖住的下层元素（侧栏歌单/导航行等的
+//! `on_click`）在点击 fs 进度条等区域时会一并触发（真机复报：点 fs 进度条弹「打开歌单」）；
+//! occlude 整层拦截后，fs 子元素（条/按钮/歌词滚动）仍在栈内正常交互。原型
+//! `prototype-orbitrum-player-v2.html` `.fullscreen-player`，相对 v1 的结构改动：
 //! - 移除右侧「控制/歌词/队列」tab，右列改为**纯歌词面板**；
 //! - 全部播放控制并入左列：封面(320)→歌曲信息→进度→控制行→音量+操作；
 //! - 顶栏中心 "NOW PLAYING"；封面双层阴影；黑胶三圈不同周期/转向；进度条悬停 5→7px +
@@ -88,6 +91,7 @@ impl super::MusicView {
         div()
             .id("music-fs")
             .debug_selector(|| "music-fs".into())
+            .occlude()
             .absolute()
             .inset_0()
             .overflow_hidden()
@@ -179,6 +183,7 @@ impl super::MusicView {
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, _cx| this.toast_msg(tip));
         div()
             .id(format!("fs-btn-{tip}"))
+            .relative()
             .w(px(40.))
             .h(px(40.))
             .rounded(px(20.))
@@ -191,8 +196,11 @@ impl super::MusicView {
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
             .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
-                this.set_fs_hover(tip, *hovered, cx);
+                // 复用现有 toast 文案作悬停提示（id 与 tip 同名：fs-btn-{tip}）；
+                // 盒按 id（=tip）记入 tip_boxes，供 set_fs_hover_and_tip 锚定按钮盒。
+                this.set_fs_hover_and_tip(tip, Some(tip), *hovered, cx);
             }))
+            .child(theme::bounds_canvas(self.tip_box_cell(tip)))
             .child(
                 IconView::new(icon)
                     .size(px(20.))
@@ -210,6 +218,7 @@ impl super::MusicView {
         });
         div()
             .id("fs-close")
+            .relative()
             .w(px(40.))
             .h(px(40.))
             .rounded(px(20.))
@@ -230,8 +239,9 @@ impl super::MusicView {
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
             .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
-                this.set_fs_hover("fs-close", *hovered, cx);
+                this.set_fs_hover_and_tip("fs-close", Some("退出全屏"), *hovered, cx);
             }))
+            .child(theme::bounds_canvas(self.tip_box_cell("fs-close")))
             .child(
                 IconView::new(MusicIcon::FullscreenExit)
                     .size(px(20.))
@@ -457,7 +467,8 @@ impl super::MusicView {
                         }),
                     )
                     .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
-                        this.set_fs_hover("fs-prog", *hovered, cx);
+                        // 进度条只管理高亮/圆点，不弹名称提示（name=None 会清残留）。
+                        this.set_fs_hover_and_tip("fs-prog", None, *hovered, cx);
                     }))
                     .child(theme::bounds_canvas(self.fs_progress.clone()))
                     .child(
@@ -481,9 +492,11 @@ impl super::MusicView {
                                             .bottom_0()
                                             .w(DefiniteLength::Fraction(frac))
                                             .rounded(px(3.))
-                                            .child(theme::gradient_cover(
+                                            .debug_selector(|| "fs-prog-fill".into())
+                                            .child(theme::gradient_cover_tracked(
                                                 (theme::accent(), theme::accent_light()),
                                                 3.0,
+                                                self.fs_fill_box.clone(),
                                             )),
                                     )
                                     .child(
@@ -557,6 +570,8 @@ impl super::MusicView {
         });
         div()
             .id(id)
+            .debug_selector(move || id.to_string())
+            .relative()
             .w(px(size))
             .h(px(size))
             .flex()
@@ -565,8 +580,15 @@ impl super::MusicView {
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
             .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
-                this.set_fs_hover(id, *hovered, cx);
+                let name: Option<&'static str> = match id {
+                    "fs-shuffle" => Some("随机播放"),
+                    "fs-prev" => Some("上一首"),
+                    "fs-next" => Some("下一首"),
+                    _ => None,
+                };
+                this.set_fs_hover_and_tip(id, name, *hovered, cx);
             }))
+            .child(theme::bounds_canvas(self.tip_box_cell(id)))
             .child(
                 IconView::new(icon)
                     .size(px(size))
@@ -605,6 +627,10 @@ impl super::MusicView {
             )
             .blur_radius(px(24.))])
             .on_click(cl)
+            .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
+                this.set_fs_hover_and_tip("fs-play", Some("播放/暂停"), *hovered, cx);
+            }))
+            .child(theme::bounds_canvas(self.tip_box_cell("fs-play")))
             .child(theme::gradient_cover((theme::accent(), theme::accent_light()), 28.0))
             .child(
                 IconView::new(icon)
@@ -622,6 +648,7 @@ impl super::MusicView {
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| this.cycle_repeat(cx));
         div()
             .id("fs-repeat")
+            .relative()
             .w(px(26.))
             .h(px(26.))
             .flex()
@@ -630,8 +657,9 @@ impl super::MusicView {
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
             .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
-                this.set_fs_hover("fs-repeat", *hovered, cx);
+                this.set_fs_hover_and_tip("fs-repeat", Some("循环播放"), *hovered, cx);
             }))
+            .child(theme::bounds_canvas(self.tip_box_cell("fs-repeat")))
             .child(
                 IconView::new(MusicIcon::Repeat)
                     .size(px(24.))
@@ -684,6 +712,10 @@ impl super::MusicView {
     fn render_fs_volume(&mut self, cx: &mut Context<Self>, volume: f32) -> AnyElement {
         let b_down = self.fs_vol.clone();
         let b_drag = self.fs_vol.clone();
+        // 提示盒记录：复用 fs_vol 条盒 cell（无需多余 canvas；悬停「音量」按此盒锚定）。
+        self.tip_boxes
+            .entry("fs-vol")
+            .or_insert_with(|| self.fs_vol.clone());
         let hovered = self.fs_hover == Some("fs-vol");
         div()
             .flex()
@@ -715,7 +747,7 @@ impl super::MusicView {
                         }),
                     )
                     .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
-                        this.set_fs_hover("fs-vol", *hovered, cx);
+                        this.set_fs_hover_and_tip("fs-vol", Some("音量"), *hovered, cx);
                     }))
                     .child(theme::bounds_canvas(self.fs_vol.clone()))
                     .child(
@@ -766,6 +798,7 @@ impl super::MusicView {
         });
         div()
             .id(id)
+            .relative()
             .w(px(20.))
             .h(px(20.))
             .flex()
@@ -774,8 +807,15 @@ impl super::MusicView {
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
             .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
-                this.set_fs_hover(id, *hovered, cx);
+                let name: Option<&'static str> = match id {
+                    "fs-like" => Some("收藏"),
+                    "fs-que" => Some("加入队列"),
+                    "fs-dl" => Some("下载"),
+                    _ => None,
+                };
+                this.set_fs_hover_and_tip(id, name, *hovered, cx);
             }))
+            .child(theme::bounds_canvas(self.tip_box_cell(id)))
             .child(
                 IconView::new(icon)
                     .size(px(18.))

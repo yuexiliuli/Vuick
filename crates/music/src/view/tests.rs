@@ -955,3 +955,530 @@ fn right_panel_live_lyrics_gates_on_fullscreen() {
         "全屏浮层打开时右侧应静态占位（免双实例争夺）"
     );
 }
+
+// ---- 真机复报：全屏进度条与音量条不能点击/拖拽（bounds_canvas 在 flex 上下文宽塌缩 0） ----
+
+/// 用例 M（复报回归）：全屏音量条可点击——`theme::bounds_canvas` 的 canvas 无显式尺寸，
+/// 在 `#fs-vol`（`.flex().items_center()`，fullscreen.rs:698-705）里是 flex item → 宽塌缩 0
+/// → `fraction_at`（`size.width<=0 → None`）拒算 → 点/拖音量永远无效（headless 无 fs 音量
+/// 用例所以漏网）。修复 canvas `absolute.inset_0` → 记录父条完整盒（宽>0）→ 点击即调音量。
+#[gpui::test]
+async fn fs_volume_click_changes_volume(cx: &mut TestAppContext) {
+    let dur = 120.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, _| p.set_test_duration(dur));
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 打开全屏浮层并渲染一帧 → fs_vol 盒由 canvas prepaint 写入。
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.fs_open = true);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let b = wcx.cx.read(|app| view.read(app).fs_vol.get());
+    assert!(
+        b.size.width.as_f32() > 0.0,
+        "fs-vol 盒应已布局且宽>0，实得 {b:?}"
+    );
+    // 点按 25% → 音量应 ≈0.25。
+    wcx.simulate_mouse_down(at_frac(&b, 0.25), MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let vol = wcx.cx.read(|app| player.read(app).volume());
+    assert!(
+        (vol - 0.25).abs() < 0.02,
+        "点按 25% 应把音量调到≈0.25，实得 {vol}"
+    );
+    // 松手后音量保持（音量条不 seek、不误伤）。
+    wcx.simulate_mouse_up(at_frac(&b, 0.25), MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let vol2 = wcx.cx.read(|app| player.read(app).volume());
+    assert!((vol2 - 0.25).abs() < 0.02, "松手后音量应保持 0.25，实得 {vol2}");
+}
+
+/// 用例 N（防回退）：全屏进度条与音量条盒**都**宽>0——共享 `bounds_canvas` 修复兜底
+/// 任何「flex 上下文宽塌缩」变体（避免只修音量、进度条在别处塌缩再次漏网）。
+#[gpui::test]
+async fn fs_strips_bounds_nonzero(cx: &mut TestAppContext) {
+    let dur = 120.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, _| p.set_test_duration(dur));
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.fs_open = true);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let (pw, vw) = wcx.cx.read(|app| {
+        let v = view.read(app);
+        (
+            v.fs_progress.get().size.width.as_f32(),
+            v.fs_vol.get().size.width.as_f32(),
+        )
+    });
+    assert!(pw > 0.0, "fs 进度条盒应宽>0，实得 {pw}");
+    assert!(vw > 0.0, "fs 音量条盒应宽>0，实得 {vw}");
+}
+
+// ---- 真机复报四：全屏浮层不拦下层鼠标事件——点击 fs 进度条（与侧栏歌单行重叠）穿透 ----
+
+/// 用例 O（复报四回归）：`fs_open` 时 `#music-fs` 全屏覆盖浮层是根末子元素（绘制/命中最上），
+/// 但它**无鼠标监听 → `div.rs::should_insert_hitbox` 不插 hitbox、`hitbox_behavior` 默认
+/// Normal**——gpui 命中（`window.rs::hit_test`）只在对上 `BlockMouse` 时 break，Normal 盒
+/// 全部入栈、不拦后面元素 → 与 fs 进度条几何重叠的下层侧栏歌单行 `on_click` 照样触发
+/// （toast「打开歌单」，sidebar.rs:220）。真机用户窗口尺寸下重叠 → 点进度条弹歌单 toast。
+/// 修复：`#music-fs` `.occlude()`（BlockMouse）→ 下层整体移出命中栈 → 点击 = 纯 seek、
+/// 无侧栏副作用。
+#[gpui::test]
+async fn fs_progress_click_does_not_leak_to_sidebar_playlist(cx: &mut TestAppContext) {
+    let dur = 120.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, _| p.set_test_duration(dur));
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 用户窗口：缩小到 fs 进度条与侧栏歌单行**几何重叠**（默认 1280x800 不重叠 → 旧 headless
+    // 用例全绿却漏真机穿透）。
+    wcx.simulate_resize(gpui::size(px(900.), px(716.)));
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.fs_open = true);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let b = wcx.cx.read(|app| view.read(app).fs_progress.get());
+    assert!(
+        b.size.width.as_f32() > 0.0,
+        "fs-progress 盒应已布局（宽>0），实得 {b:?}"
+    );
+    // 歌单行应在侧栏渲染（fixture 3 曲 → 3 个艺术家组 → 3 行）。
+    let pl = wcx
+        .debug_bounds("music-playlist-周杰伦")
+        .expect("侧栏应渲染歌单行（music-playlist-周杰伦）");
+    // 夹具契约：取两盒**交集**中心作为点击点（同时落在 fs 进度条与歌单行内→复现穿透）。
+    // 交集必须非退化（高>2px），否则本用例无意义，需调窗口尺寸。
+    let (bx0, bx1) = (
+        b.origin.x.as_f32(),
+        (b.origin.x + b.size.width).as_f32(),
+    );
+    let (by0, by1) = (
+        b.origin.y.as_f32(),
+        (b.origin.y + b.size.height).as_f32(),
+    );
+    let (px0, px1) = (
+        pl.origin.x.as_f32(),
+        (pl.origin.x + pl.size.width).as_f32(),
+    );
+    let (py0, py1) = (
+        pl.origin.y.as_f32(),
+        (pl.origin.y + pl.size.height).as_f32(),
+    );
+    let ix0 = bx0.max(px0);
+    let ix1 = bx1.min(px1);
+    let iy0 = by0.max(py0);
+    let iy1 = by1.min(py1);
+    assert!(
+        ix1 - ix0 > 2.0 && iy1 - iy0 > 2.0,
+        "夹具：fs 进度条与歌单行应几何重叠（交集 {ix0:.1},{iy0:.1}-{ix1:.1},{iy1:.1}，当前窗口尺寸不重叠）"
+    );
+    let cx_click = (ix0 + ix1) * 0.5;
+    let cy_click = (iy0 + iy1) * 0.5;
+    let frac = (cx_click - bx0) / (bx1 - bx0);
+    let click = gpui::Point::new(px(cx_click), px(cy_click));
+    // 完整点击（down+up）→ fs 进度条应 seek 到 ≈frac×dur，且**不**触发侧栏歌单 toast。
+    wcx.simulate_mouse_down(click, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let pos1 = wcx.cx.read(|app| player.read(app).position());
+    let want = dur * frac as f64;
+    assert!(
+        (pos1 - want).abs() < 1.0,
+        "fs 进度条点按 {frac:.2} 应 seek 到 {want:.1}s，实得 {pos1:.1}"
+    );
+    wcx.simulate_mouse_up(click, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let toast_none = wcx.cx.read(|app| view.read(app).toast.is_none());
+    assert!(
+        toast_none,
+        "点击 fs 进度条不应穿透触发侧栏歌单 toast（视图 toast 应为 None）"
+    );
+}
+
+// ---- 真机复报五：全屏进度条填充不随播放位置增长（恒一个颜色） ----
+
+/// 用例 P（复报五回归）：`render_fs_progress` 填充盒 `w(DefiniteLength::Fraction(frac))`
+/// 应随 `player.position()/duration()` 实时增长/减少——pos 与底栏同源且底栏真机正常，故
+/// 断言对象聚焦「填充盒实际布局宽度」：pos≈0 → w0≈0；seek(50)/dur=100 → frac=0.5 →
+/// w1≈0.5×条盒宽 且 w1>w0。若填充盒宽恒 0 / 恒全宽 / 不随 frac 变 → RED（真机只见恒一色）。
+#[gpui::test]
+async fn fs_progress_fill_grows_with_position(cx: &mut TestAppContext) {
+    let dur = 100.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, cx| {
+            p.test_start_playing(0);
+            p.set_test_duration(dur);
+            p.seek(0.0, cx);
+        });
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 打开全屏并渲染一帧（pos=0 → frac=0）。
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.fs_open = true);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let read_fill_box = |wcx: &mut VisualTestContext| {
+        wcx.cx.read(|app| view.read(app).fs_fill_box.get())
+    };
+    // frame A（pos=0）：记录填充 div 布局宽 + 填充渐变 canvas 绘制盒。
+    let (w0, f0) = (
+        wcx
+            .debug_bounds("fs-prog-fill")
+            .expect("fs 填充盒应有 debug 盒")
+            .size
+            .width
+            .as_f32(),
+        read_fill_box(wcx),
+    );
+    // frame B：播放器改到 50s（position 确定性=50）→ 重绘。
+    wcx.update(|_w, app| {
+        player.update(app, |p, cx| p.seek(50.0, cx));
+    });
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let (w1, f50) = (
+        wcx
+            .debug_bounds("fs-prog-fill")
+            .expect("fs 填充盒重绘后仍应有 debug 盒")
+            .size
+            .width
+            .as_f32(),
+        read_fill_box(wcx),
+    );
+    let bar_w = wcx
+        .cx
+        .read(|app| view.read(app).fs_progress.get())
+        .size
+        .width
+        .as_f32();
+    assert!(bar_w > 0.0, "fs-progress 条盒宽应>0，实得 {bar_w}");
+    // 布局级：填充 div 宽随位置增长（frac 数据链正常）。
+    assert!(
+        w1 > w0,
+        "填充盒宽应随位置增长：w0(pos=0)={w0:.1} → w1(pos=50)={w1:.1}"
+    );
+    assert!(
+        (w1 - bar_w * 0.5).abs() < 2.0,
+        "pos=50s / dur=100s 填充宽应≈0.5×条宽：w1={w1:.1} bar={bar_w:.1}"
+    );
+    assert!(w0 < 2.0, "pos≈0 填充宽应≈0：w0={w0:.1}");
+    // 绘制级（复报五根因在此）：填充渐变的 **canvas 实际绘制盒** 必须高度非零
+    // （旧实现 block 子盒高度塌缩 0 → 渐变面积 0 → 真机只留轨道一色）且宽度随位置增长。
+    let (h0, h1) = (
+        f0.size.height.as_f32(),
+        f50.size.height.as_f32(),
+    );
+    let (wfill0, wfill1) = (
+        f0.size.width.as_f32(),
+        f50.size.width.as_f32(),
+    );
+    assert!(
+        h0 > 2.0 && h1 > 2.0,
+        "填充渐变绘制盒高度应>0（非隐形）：h(pos=0)={h0:.1} h(pos=50)={h1:.1}"
+    );
+    assert!(
+        wfill1 > wfill0,
+        "填充渐变绘制盒宽应随位置增长：w(pos=0)={wfill0:.1} → w(pos=50)={wfill1:.1}"
+    );
+    assert!(
+        (wfill1 - bar_w * 0.5).abs() < 2.0,
+        "pos=50 填充渐变宽应≈0.5×条宽：wfill1={wfill1:.1} bar={bar_w:.1}"
+    );
+    assert!(
+        wfill0 < 2.0,
+        "pos≈0 填充渐变宽应≈0：wfill0={wfill0:.1}"
+    );
+}
+
+// ---- 音乐界面按钮悬停提示（tooltip）：悬停 ≥500ms 弹名称浮层，移开/换钮切换 ----
+
+/// 建窗口视图并渲染一帧（debug_selector 盒由 prepaint 写入 debug_bounds）。
+fn open_tooltip_view<'a>(
+    cx: &'a mut TestAppContext,
+    player: Entity<MusicPlayer>,
+) -> (Entity<MusicView>, &'a mut VisualTestContext) {
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    (view, wcx)
+}
+
+/// 按 debug 盒中心发鼠标移动（触发按钮 on_hover 进入）。
+fn hover_button(wcx: &mut VisualTestContext, selector: &'static str) {
+    let b = wcx.debug_bounds(selector).expect("按钮 debug 盒应存在");
+    wcx.simulate_mouse_move(at_frac(&b, 0.5), None, Default::default());
+    wcx.run_until_parked();
+}
+
+/// 当前 tooltip 文案（None = 未悬停/已清除）。
+fn tooltip_text(
+    view: &Entity<MusicView>,
+    cx: &mut VisualTestContext,
+) -> Option<String> {
+    cx.cx
+        .read(|app| view.read(app).tip.clone().map(|(s, _)| s.to_string()))
+}
+
+/// 当前 tooltip 是否应显示（悬停已过 TOOLTIP_SHOW_MS）。render 与断言共用同一判定。
+fn tooltip_showing(
+    view: &Entity<MusicView>,
+    cx: &mut VisualTestContext,
+) -> bool {
+    cx.update(|_w, app| view.update(app, |v, cx| v.hover_tip_visible(cx)))
+}
+
+/// 用例 T1：悬停底栏 bb-play → `tip` 设置；不足 500ms 不显示、满 500ms 显示。
+#[gpui::test]
+fn hover_bb_play_shows_tooltip_after_delay(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    assert!(wcx.debug_bounds("bb-play").is_some(), "bb-play 应有 debug 盒");
+    hover_button(wcx, "bb-play");
+    assert_eq!(
+        tooltip_text(&view, wcx).as_deref(),
+        Some("播放/暂停"),
+        "悬停 bb-play 应设对应名称提示"
+    );
+    assert!(!tooltip_showing(&view, wcx), "未满 500ms 不应显示浮层");
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert!(tooltip_showing(&view, wcx), "满 500ms 后应显示浮层");
+    // 渲染层：重绘一帧，浮层应实际绘出（`render_tooltip` 分支产出 debug 盒，非仅状态）。
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("music-tooltip").is_some(),
+        "满 500ms 后浮层应实际渲染（music-tooltip 盒存在）"
+    );
+}
+
+/// 用例 T2：移开（hover false）→ `tip` 清除、浮层隐藏（不残留）。
+#[gpui::test]
+fn hover_leave_clears_tooltip(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    hover_button(wcx, "bb-play");
+    assert!(tooltip_text(&view, wcx).is_some(), "前置：悬停应设置提示");
+    // 移到角落（不悬停任何钮）→ bb-play on_hover(false) 清空。
+    wcx.simulate_mouse_move(gpui::Point::new(px(4.), px(4.)), None, Default::default());
+    wcx.run_until_parked();
+    assert!(tooltip_text(&view, wcx).is_none(), "移开应清空提示");
+    wcx.executor().advance_clock(Duration::from_millis(800));
+    wcx.run_until_parked();
+    assert!(!tooltip_showing(&view, wcx), "移开后不应残留浮层");
+}
+
+/// 用例 T3：从 bb-prev 移到 bb-next → 文案切换为新钮名称。
+#[gpui::test]
+fn hover_move_between_buttons_switches_name(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    hover_button(wcx, "bb-prev");
+    assert_eq!(
+        tooltip_text(&view, wcx).as_deref(),
+        Some("上一首"),
+        "悬停 bb-prev 提示应为「上一首」"
+    );
+    hover_button(wcx, "bb-next");
+    assert_eq!(
+        tooltip_text(&view, wcx).as_deref(),
+        Some("下一首"),
+        "从 bb-prev 移到 bb-next 文案应切换为「下一首」"
+    );
+}
+
+/// 用例 T4：全屏 fs-shuffle 悬停 → 名称出现 + 既有 `fs_hover` 高亮仍工作（不回归）。
+#[gpui::test]
+fn hover_fs_button_keeps_highlight_and_tip(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    // 打开全屏浮层并重渲染一帧（fs 按钮盒入 debug_bounds）。
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_fs(cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("fs-shuffle").is_some(),
+        "fs-shuffle 应有 debug 盒"
+    );
+    hover_button(wcx, "fs-shuffle");
+    assert_eq!(
+        tooltip_text(&view, wcx).as_deref(),
+        Some("随机播放"),
+        "全屏 fs-shuffle 悬停应设名称提示"
+    );
+    let fs_hover = wcx.cx.read(|app| view.read(app).fs_hover);
+    assert_eq!(fs_hover, Some("fs-shuffle"), "既有 fs_hover 高亮应仍被设置");
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert!(tooltip_showing(&view, wcx), "全屏钮满 500ms 也应显示浮层");
+}
+
+/// 用例 T5：快速划过（<500ms 即离开）→ 不残留浮层。
+#[gpui::test]
+fn hover_quick_sweep_leaves_no_tooltip(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    hover_button(wcx, "bb-play");
+    assert!(
+        tooltip_text(&view, wcx).is_some(),
+        "悬停进入应设置提示（此刻未满 500ms 不显示）"
+    );
+    // 未满 500ms 立即移开 → 清除；即使时间后推也不残留。
+    wcx.simulate_mouse_move(gpui::Point::new(px(4.), px(4.)), None, Default::default());
+    wcx.run_until_parked();
+    assert!(tooltip_text(&view, wcx).is_none(), "快速划过后应立即清除");
+    wcx.executor().advance_clock(Duration::from_millis(900));
+    wcx.run_until_parked();
+    assert!(
+        !tooltip_showing(&view, wcx),
+        "快速划过（<500ms 离开）不应残留浮层"
+    );
+}
+
+/// 用例 T6（按钮锚定契约，真机三连复报「提示固定错位、不贴按钮」根因）：tooltip
+/// **不再跟随光标**——锚定在**悬停按钮自身的窗口坐标盒**上（`theme::bounds_canvas`
+/// prepaint 记录，与全屏 seek/音量条点拖同一套真机已验证机制；`ev.position`/cursor 在
+/// 真机不可靠 → 弃用，否则钉在固定错误位置）。
+///
+/// 断言：
+/// ① 悬停钮 bb-play 满 500ms → 浮层盒底边中点 ≈ (bb-play 盒中心 x, bb-play 上缘 − GAP)；
+/// ② **钮内移动光标不位移**（框固定在按钮上，不随光标漂移——旧实现光标跟随=RED）。
+#[gpui::test]
+fn hover_tooltip_anchors_to_button_and_does_not_follow_cursor(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let bb = wcx.debug_bounds("bb-play").expect("bb-play 应有 debug 盒");
+    let c0 = at_frac(&bb, 0.5);
+    // 悬停 bb-play 中心 → 满 500ms → 渲染一帧读出浮层盒。
+    wcx.simulate_mouse_move(c0, None, Default::default());
+    wcx.run_until_parked();
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let tip0 = wcx.debug_bounds("music-tooltip").expect("过 500ms 应已显示浮层盒");
+    // ① 锚定断言：底边中点 ≈ (bb 中心 x, bb 上缘 − GAP)。
+    let want_mid_x = bb.origin.x.as_f32() + bb.size.width.as_f32() * 0.5;
+    let want_bottom_y = bb.origin.y.as_f32() - super::TOOLTIP_GAP_PX;
+    let mid_x = tip0.origin.x.as_f32() + tip0.size.width.as_f32() * 0.5;
+    let bottom_y = tip0.origin.y.as_f32() + tip0.size.height.as_f32();
+    assert!(
+        (mid_x - want_mid_x).abs() < 2.0,
+        "浮层底边中点应横贴按钮盒中心：mid_x={mid_x:.1} want={want_mid_x:.1}"
+    );
+    assert!(
+        (bottom_y - want_bottom_y).abs() < 2.0,
+        "浮层底边应在按钮盒上缘上方 GAP={}：bottom_y={bottom_y:.1} want={want_bottom_y:.1}（旧光标式=RED）",
+        super::TOOLTIP_GAP_PX
+    );
+    // ② 钮内向右 +10px（不换钮、不离开）：浮层位置**不变**（框固定在按钮上）。
+    let c1x = c0.x.as_f32() + 10.0;
+    assert!(
+        c1x <= (bb.origin.x + bb.size.width).as_f32() - 1.0,
+        "移动点应仍在 bb-play 盒内（避免换钮/离开）"
+    );
+    wcx.simulate_mouse_move(gpui::Point::new(px(c1x), c0.y), None, Default::default());
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let tip1 = wcx.debug_bounds("music-tooltip").expect("浮层应仍在显示");
+    assert!(
+        (tip1.origin.x.as_f32() - tip0.origin.x.as_f32()).abs() < 1.0
+            && (tip1.origin.y.as_f32() - tip0.origin.y.as_f32()).abs() < 1.0,
+        "光标在钮内移动 +10px 后浮层应固定不动（不随光标漂移）：p0={:?} p1={:?}（旧跟随实现=RED）",
+        tip0.origin,
+        tip1.origin
+    );
+}
+
+/// 用例 T7（防回退）：提示**未满 500ms** 时在盒内移动（不换钮/不离开）→ 浮层不提前
+/// 出现（`render_tooltip` 的延迟态不被 move 跳过）；满 500ms 后正常显示（不残留抑制）。
+#[gpui::test]
+fn hover_move_before_show_does_not_force_tooltip(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let bb = wcx.debug_bounds("bb-play").expect("bb-play 应有 debug 盒");
+    let c0 = at_frac(&bb, 0.5);
+    // 悬停 bb-play 中心（此刻 t≈0，浮层未显示期）。
+    wcx.simulate_mouse_move(c0, None, Default::default());
+    wcx.run_until_parked();
+    // 未过 500ms：盒内移动 → 即使显式重绘一帧也不应渲染浮层盒。
+    let c1 = gpui::Point::new(px(c0.x.as_f32() + 8.0), c0.y);
+    wcx.simulate_mouse_move(c1, None, Default::default());
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("music-tooltip").is_none(),
+        "未满 500ms 的盒内移动不应提前渲染浮层"
+    );
+    // 满 500ms 后正常显示。
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("music-tooltip").is_some(),
+        "满 500ms 后应正常显示浮层"
+    );
+}
+
+/// 用例 T8（按钮锚定换钮契约）：从钮 A 移到钮 B → 提示浮层**切换锚定**到 B 盒上方
+/// （底边中点 ≈ B 盒中心 x / B 上缘 − GAP，且 ≠ A 锚定处）——验证「按钮间切换跟随
+/// 按钮本身」（不是光标也不是固定某处），且 per-id 盒互不覆盖。
+#[gpui::test]
+fn hover_tooltip_switches_anchor_between_buttons(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let a = wcx.debug_bounds("bb-prev").expect("bb-prev 应有 debug 盒");
+    let b = wcx.debug_bounds("bb-next").expect("bb-next 应有 debug 盒");
+    // 悬停钮 A（bb-prev）→ 满 500ms → 读浮层盒，锚在 A 盒上方。
+    hover_button(wcx, "bb-prev");
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let ta = wcx.debug_bounds("music-tooltip").expect("悬停 A 应显示浮层盒");
+    let a_mid_x = a.origin.x.as_f32() + a.size.width.as_f32() * 0.5;
+    let a_bottom_y = ta.origin.y.as_f32() + ta.size.height.as_f32();
+    assert!(
+        (ta.origin.x.as_f32() + ta.size.width.as_f32() * 0.5 - a_mid_x).abs() < 2.0
+            && (a_bottom_y - (a.origin.y.as_f32() - super::TOOLTIP_GAP_PX)).abs() < 2.0,
+        "悬停 A 提示应锚在 A 盒上方：ta={ta:?} a={a:?}"
+    );
+    // 移到钮 B（bb-next）→ 提示切换锚定到 B 盒上方（位置应≠A 锚定处）。
+    hover_button(wcx, "bb-next");
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let tb = wcx.debug_bounds("music-tooltip").expect("悬停 B 应显示浮层盒");
+    let b_mid_x = b.origin.x.as_f32() + b.size.width.as_f32() * 0.5;
+    let b_bottom_y = tb.origin.y.as_f32() + tb.size.height.as_f32();
+    assert!(
+        (tb.origin.x.as_f32() + tb.size.width.as_f32() * 0.5 - b_mid_x).abs() < 2.0
+            && (b_bottom_y - (b.origin.y.as_f32() - super::TOOLTIP_GAP_PX)).abs() < 2.0,
+        "悬停 B 提示应锚在 B 盒上方：tb={tb:?} b={b:?}"
+    );
+    assert!(
+        (tb.origin.x.as_f32() - ta.origin.x.as_f32()).abs() > 1.0,
+        "换钮后提示应跟随到新钮上方（不固定在某处）：ta.x={:.1} tb.x={:.1}",
+        ta.origin.x.as_f32(),
+        tb.origin.x.as_f32()
+    );
+}

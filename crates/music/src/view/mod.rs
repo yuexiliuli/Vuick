@@ -35,11 +35,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AnyElement, Bounds, ClipboardItem, Context, CursorStyle, DefiniteLength, Entity,
-    EntityInputHandler, EventEmitter, Focusable, FocusHandle, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    Anchor, App, AnyElement, Bounds, ClipboardItem, Context, CursorStyle, DefiniteLength, Edges,
+    Entity, EntityInputHandler, EventEmitter, Focusable, FocusHandle, InteractiveElement as _,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     ParentElement as _, Point, Pixels, Render, RenderImage, ScrollHandle, SharedString, Styled as _,
-    StyledImage, TextInputConfiguration, UTF16Selection, Window, div, img, point, px, size,
+    StatefulInteractiveElement as _, StyledImage, TextInputConfiguration, UTF16Selection, Window,
+    anchored, deferred, div, img, point, px, size,
 };
 
 use crate::model::{RepeatMode, Track};
@@ -109,6 +110,17 @@ const TOAST_MS: Duration = Duration::from_millis(1800);
 /// 常驻 tick 周期（ms）：进度刷新节拍（约束 ≤250ms 才 notify，防持续逐帧重绘）。
 const TICK_INTERVAL_MS: u64 = 250;
 
+/// 悬停提示显示延迟（ms）：悬停 ≥ 此值才弹名称浮层，防快速划过闪烁。
+const TOOLTIP_SHOW_MS: u64 = 500;
+
+/// tooltip 浮层与**按钮盒上缘**竖直间距（px）：`Anchor::BottomCenter` 锚在按钮盒上方
+/// 该距离处（浮现在按钮正上方居中——按钮盒锚定，不依赖光标坐标）。
+const TOOLTIP_GAP_PX: f32 = 10.0;
+
+/// tooltip 的 deferred 绘制层优先级：高于普通 deferred/内容（对齐 video
+/// `HOVER_TIME_LAYER_PRIORITY=120`），保证浮层绘制在 root 最上。
+const TOOLTIP_LAYER_PRIORITY: usize = 120;
+
 /// 音乐播放器全 UI 视图。
 pub struct MusicView {
     /// 播放器实体（唯一状态源）。
@@ -137,10 +149,26 @@ pub struct MusicView {
     fs_progress: Rc<Cell<Bounds<Pixels>>>,
     bb_vol: Rc<Cell<Bounds<Pixels>>>,
     fs_vol: Rc<Cell<Bounds<Pixels>>>,
+    /// 全屏进度条**填充渐变**的 canvas 实际绘制盒（`gradient_cover_tracked` 记录）：
+    /// 供「填充随播放位置增长」回归断言（canvas 高度曾塌缩 0 → 填充隐形，真机复报五）。
+    fs_fill_box: Rc<Cell<Bounds<Pixels>>>,
     // ---- 悬停状态（hover 触发一次重绘即可，无需持续动画） ----
     hover_mix: Option<usize>,
     /// 全屏浮层当前悬停元素 id（按钮高亮/进度条圆点显示用；同一指针只有一个悬停）。
     fs_hover: Option<&'static str>,
+    // ---- 悬停提示（共享 tooltip）：单一浮层，根末尾渲染，纯视觉不拦事件 ----
+    /// 当前按钮悬停提示：`(文案, 出现时刻)`；渲染按 [`TOOLTIP_SHOW_MS`] 延迟显示。
+    /// 离开时**仅当文案与本次钮相同才清空**——同一拍内「旧钮 false + 新钮 true」谁先
+    /// 谁后都收敛到新钮（换钮顺序无关）。
+    tip: Option<(&'static str, Instant)>,
+    /// 当前悬停按钮的窗口坐标盒（由 [`Self::tip_boxes`] 在悬停进入/换钮时拷入）：
+    /// tooltip 按它锚定（不再依赖光标坐标——真机 `ev.position`/`cursor_pos` 不可靠，
+    /// 曾致提示钉在固定错误位置）。
+    tip_box: Option<Bounds<Pixels>>,
+    /// 各悬停按钮的窗口坐标盒记录（id → cell）：按钮元素上挂 `theme::bounds_canvas`
+    /// prepaint 写入（全屏 seek/音量条同款真机已验证机制）。per-id 隔离——fs 开/关、
+    /// tab 切换下不同元素各写各的 cell，互不覆盖。
+    tip_boxes: HashMap<&'static str, Rc<Cell<Bounds<Pixels>>>>,
     // ---- 歌词面板滚动（可滚浏览全部 + 自动跟随当前句） ----
     /// 歌词滚动容器句柄（`overflow_y_scroll` + `track_scroll`；原生滚轮与自动跟随
     /// 共用这一个 offset——跟随只写它、放手动时保持用户位置不动它）。
@@ -189,8 +217,12 @@ impl MusicView {
             fs_progress: Rc::new(Cell::new(Bounds::default())),
             bb_vol: Rc::new(Cell::new(Bounds::default())),
             fs_vol: Rc::new(Cell::new(Bounds::default())),
+            fs_fill_box: Rc::new(Cell::new(Bounds::default())),
             hover_mix: None,
             fs_hover: None,
+            tip: None,
+            tip_box: None,
+            tip_boxes: HashMap::new(),
             covers: HashMap::new(),
             cover_loading: HashSet::new(),
             lyrics_scroll: ScrollHandle::new(),
@@ -201,16 +233,150 @@ impl MusicView {
         }
     }
 
-    /// 全屏元素悬停状态：hover 进入置 id、离开清空（同一指针同时只悬停一个元素）。
-    /// 触发一次 notify 让高亮/进度圆点立即更新。
-    pub(super) fn set_fs_hover(
+    /// 全屏元素悬停统一处理：既更新 `fs_hover`（高亮/进度圆点）也更新悬停提示
+    /// （名称浮层）。`name=None` 的元素（如进度条）只管理高亮、不弹提示；离开动作
+    /// 由「前一个钮」的 leave 触发清空，故移到无色区/进度条时不会残留上次的浮层。
+    pub(super) fn set_fs_hover_and_tip(
         &mut self,
         id: &'static str,
+        name: Option<&'static str>,
         hovered: bool,
         cx: &mut Context<Self>,
     ) {
         self.fs_hover = if hovered { Some(id) } else { None };
+        match (hovered, name) {
+            (true, Some(n)) => {
+                self.tip = Some((n, cx.background_executor().now()));
+                self.tip_box = self.tip_boxes.get(id).map(|c| c.get());
+                self.schedule_tooltip_flush(cx);
+            }
+            // 离开只清「本元素自己」的提示（换钮同一拍 false/true 顺序无关）。
+            (false, Some(n)) if self.tip.is_some_and(|(l, _)| l == n) => {
+                self.tip = None;
+                self.tip_box = None;
+            }
+            _ => {}
+        }
         cx.notify();
+    }
+
+    /// 进入悬停后安排一次性延迟 notify：render 只在 notify 时重跑，暂停/空闲（无 tick
+    /// notify）时仅靠悬停那一帧 notify 无法让 500ms 后的浮层绘出——到点校验仍未离开/
+    /// 换钮（`tip` 仍与进入时刻一致）才 `cx.notify()` 渲染浮层；已离开/换钮则
+    /// 校验失败 → 零多余重绘。
+    fn schedule_tooltip_flush(&self, cx: &mut Context<Self>) {
+        let Some(entered) = self.tip else {
+            return;
+        };
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(TOOLTIP_SHOW_MS))
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.tip == Some(entered) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 按钮悬停提示通用监听工厂：进入/换钮 → `tip = Some((名称, 出现时刻))` 并把该按钮
+    /// 的窗口盒拷入 `tip_box`（从 [`Self::tip_boxes`] 按 `id` 取——tooltip 锚定按钮盒，
+    /// 不再依赖光标）；离开 → 若当前提示正是本钮文案则清空（同一拍「旧钮 false + 新钮
+    /// true」顺序无关，收敛到新钮）。返回可直接传给 `.on_hover` 的监听器。时刻用
+    /// `background_executor()` 的时钟（测试 `advance_clock` 可精确控制 [`TOOLTIP_SHOW_MS`]
+    /// 延迟判定）。
+    pub(super) fn hover_tip_listener(
+        &mut self,
+        cx: &mut Context<Self>,
+        id: &'static str,
+        label: &'static str,
+    ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        cx.listener(move |this: &mut MusicView, hovered: &bool, _w, cx| {
+            if *hovered {
+                this.tip = Some((label, cx.background_executor().now()));
+                this.tip_box = this.tip_boxes.get(id).map(|c| c.get());
+                this.schedule_tooltip_flush(cx);
+            } else if this.tip.is_some_and(|(l, _)| l == label) {
+                this.tip = None;
+                this.tip_box = None;
+            }
+            cx.notify();
+        })
+    }
+
+    /// 取某按钮的窗口盒记录 cell（懒建；per-id 隔离：不同元素各写各 cell，互不覆盖）。
+    pub(super) fn tip_box_cell(&mut self, id: &'static str) -> Rc<Cell<Bounds<Pixels>>> {
+        self.tip_boxes
+            .entry(id)
+            .or_insert_with(|| Rc::new(Cell::new(Bounds::default())))
+            .clone()
+    }
+
+    /// tooltip 是否应显示（悬停已过 [`TOOLTIP_SHOW_MS`] 延迟）。render 与测试共用同一判定。
+    pub(super) fn hover_tip_visible(&self, cx: &Context<Self>) -> bool {
+        let Some((_, at)) = &self.tip else {
+            return false;
+        };
+        cx.background_executor()
+            .now()
+            .duration_since(*at)
+            >= Duration::from_millis(TOOLTIP_SHOW_MS)
+    }
+
+    /// 共享悬停提示浮层（root 末尾子元素 → 绘制在 toast 之后的独立 deferred 层 = 最上）：
+    /// `tip` 存在、悬停已过 [`TOOLTIP_SHOW_MS`] 且 `tip_box` 有值 → 在**按钮盒上方**
+    /// [`TOOLTIP_GAP_PX`] 处分层浮出小药丸（`Anchor::BottomCenter` 锚点 = 浮层底边中点，
+    /// 横贴按钮盒水平中点、竖在按钮盒上缘之上——「浮现在按钮旁边」）。
+    ///
+    /// 定位用 `deferred(anchored()).position(窗口坐标)`（AGENTS §7 姿势，video
+    /// `hover_time_float` 同款）：`tip_box` 是悬停按钮经 `theme::bounds_canvas` 记录的
+    /// **窗口坐标盒**（prepaint 写入；与全屏 seek/音量条点拖同一套真机已验证机制），
+    /// **彻底不再依赖光标**——真机 `cursor_pos`/`ev.position` 不可靠（音乐视图嵌 shell
+    /// 编辑器内、事件坐标漂移 → 提示钉在固定错误位置，用户三连复报）。纯视觉：无鼠标
+    /// 监听（不拦点击/滚轮）、不进焦点、不 stop_propagation。
+    fn render_tooltip(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if !self.hover_tip_visible(cx) {
+            return div().into_any_element();
+        }
+        let Some((tip, _)) = self.tip else {
+            return div().into_any_element();
+        };
+        let Some(b) = self.tip_box else {
+            return div().into_any_element();
+        };
+        // 锚点 = 浮层底边中点：横贴按钮盒水平中点、竖在按钮上缘之上 GAP 处。
+        let pos = point(
+            b.center().x,
+            px(b.origin.y.as_f32() - TOOLTIP_GAP_PX),
+        );
+        let pill = div()
+            .debug_selector(|| "music-tooltip".into())
+            .px(px(9.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .bg(theme::glass())
+            .border_1()
+            .border_color(theme::border())
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(2.), gpui::black().opacity(0.4))
+                    .blur_radius(px(8.)),
+            ])
+            .text_size(px(11.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme::text())
+            .child(tip.to_string());
+        deferred(
+            anchored()
+                .anchor(Anchor::BottomCenter)
+                .position(pos)
+                .snap_to_window_with_margin(Edges::all(px(6.)))
+                .child(pill),
+        )
+        .with_priority(TOOLTIP_LAYER_PRIORITY)
+        .into_any_element()
     }
 
     /// 常驻 tick（250ms）：消费 worker 事件（内部已 notify）+ 播放中刷新进度 +
@@ -451,7 +617,8 @@ impl MusicView {
 
     /// 构建一条可交互条（seek 进度条 / 音量条共用，对齐 video `strip_element`）：
     /// `id` 元素级唯一；`bounds` 由 canvas prepaint 记录窗口坐标盒；`is_seek=true`
-    /// 拖拽 → `player.seek(f×duration)`，否则 `player.set_volume(f)`。
+    /// 拖拽 → `player.seek(f×duration)`，否则 `player.set_volume(f)`。`tip=Some(名称)`
+    /// 时挂悬停提示（音量条用；进度条不弹提示）。
     fn strip_element(
         &mut self,
         id: &'static str,
@@ -459,6 +626,7 @@ impl MusicView {
         fraction: f32,
         is_seek: bool,
         width: Option<f32>,
+        tip: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let f = fraction.clamp(0.0, 1.0);
@@ -500,6 +668,10 @@ impl MusicView {
         } else {
             el = el.flex_1();
         }
+        if let Some(_t) = tip {
+            // 提示钮的窗口盒记录：复用本条的 bounds cell（同一 Cell，无多余 canvas）。
+            self.tip_boxes.entry(id).or_insert_with(|| bounds.clone());
+        }
         let b1 = bounds.clone();
         el = el.on_mouse_down(
             MouseButton::Left,
@@ -520,6 +692,9 @@ impl MusicView {
             MouseButton::Left,
             cx.listener(move |this, ev, _w, cx| this.on_strip_up(is_seek, bounds.clone(), ev, cx)),
         );
+        if let Some(t) = tip {
+            el = el.on_hover(self.hover_tip_listener(cx, id, t));
+        }
         el.into_any_element()
     }
 
@@ -711,8 +886,9 @@ impl Render for MusicView {
         if self.state.fs_open {
             root = root.child(self.render_fullscreen(window, cx));
         }
-        // toast 最顶层。
+        // toast 最顶层，其后是共享悬停提示浮层（最上）。
         root = root.child(self.render_toast());
+        root = root.child(self.render_tooltip(window, cx));
         root
     }
 }

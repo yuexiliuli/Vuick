@@ -135,8 +135,11 @@ impl super::MusicView {
             .child(
                 div()
                     .id("bb-like")
+                    .relative()
                     .cursor(CursorStyle::PointingHand)
                     .on_click(cl)
+                    .on_hover(self.hover_tip_listener(cx, "bb-like", "收藏"))
+                    .child(theme::bounds_canvas(self.tip_box_cell("bb-like")))
                     .child(
                         IconView::new(if liked { MusicIcon::Heart } else { MusicIcon::HeartBorder })
                             .filled(liked)
@@ -160,6 +163,7 @@ impl super::MusicView {
             self.bb_progress.clone(),
             frac,
             true,
+            None,
             None,
             cx,
         );
@@ -219,6 +223,12 @@ impl super::MusicView {
         toggle: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let tip: Option<&'static str> = match id {
+            "bb-shuffle" => Some("随机播放"),
+            "bb-prev" => Some("上一首"),
+            "bb-next" => Some("下一首"),
+            _ => None,
+        };
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
             match id {
                 "bb-shuffle" => this.toggle_shuffle(cx),
@@ -231,10 +241,12 @@ impl super::MusicView {
                 }
             }
         });
-        div()
+        let mut el = div()
             .id(id)
+            .debug_selector(move || id.to_string())
             .w(px(size))
             .h(px(size))
+            .relative()
             .flex()
             .items_center()
             .justify_center()
@@ -244,8 +256,12 @@ impl super::MusicView {
                 IconView::new(icon)
                     .size(px(size))
                     .text_color(if active { theme::accent_light() } else { theme::text2() }),
-            )
-            .into_any_element()
+            );
+        if let Some(t) = tip {
+            el = el.on_hover(self.hover_tip_listener(cx, id, t));
+            el = el.child(theme::bounds_canvas(self.tip_box_cell(id)));
+        }
+        el.into_any_element()
     }
 
     /// 中列主播放钮（36px accent 圆）。
@@ -256,8 +272,10 @@ impl super::MusicView {
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| this.toggle_play(cx));
         div()
             .id("bb-play")
+            .debug_selector(|| "bb-play".into())
             .w(px(36.))
             .h(px(36.))
+            .relative()
             .rounded(px(18.))
             .flex()
             .items_center()
@@ -265,6 +283,8 @@ impl super::MusicView {
             .bg(theme::accent())
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
+            .on_hover(self.hover_tip_listener(cx, "bb-play", "播放/暂停"))
+            .child(theme::bounds_canvas(self.tip_box_cell("bb-play")))
             .child(IconView::new(icon).size(px(20.)).text_color(gpui::white()).filled(true))
             .into_any_element()
     }
@@ -274,6 +294,7 @@ impl super::MusicView {
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| this.cycle_repeat(cx));
         div()
             .id("bb-repeat")
+            .relative()
             .w(px(20.))
             .h(px(20.))
             .flex()
@@ -281,6 +302,8 @@ impl super::MusicView {
             .justify_center()
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
+            .on_hover(self.hover_tip_listener(cx, "bb-repeat", "循环播放"))
+            .child(theme::bounds_canvas(self.tip_box_cell("bb-repeat")))
             .child(
                 IconView::new(MusicIcon::Repeat)
                     .size(px(18.))
@@ -299,6 +322,7 @@ impl super::MusicView {
             volume,
             false,
             Some(80.),
+            Some("音量"),
             cx,
         );
         div()
@@ -323,8 +347,11 @@ impl super::MusicView {
             .child(
                 div()
                     .id("bb-fs")
+                    .relative()
                     .cursor(CursorStyle::PointingHand)
                     .on_click(cx.listener(|this: &mut MusicView, _ev, _w, cx| this.toggle_fs(cx)))
+                    .on_hover(self.hover_tip_listener(cx, "bb-fs", "全屏"))
+                    .child(theme::bounds_canvas(self.tip_box_cell("bb-fs")))
                     .child(
                         IconView::new(MusicIcon::Fullscreen)
                             .size(px(18.))
@@ -343,13 +370,21 @@ impl super::MusicView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.state.right_tab == tab;
+        let tip: &'static str = match tab {
+            RightTab::Lyrics => "歌词",
+            RightTab::Queue => "播放队列",
+            _ => "歌词",
+        };
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
             this.set_right_tab(tab, cx);
         });
         div()
             .id(id)
+            .relative()
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
+            .on_hover(self.hover_tip_listener(cx, id, tip))
+            .child(theme::bounds_canvas(self.tip_box_cell(id)))
             .child(
                 IconView::new(icon)
                     .size(px(18.))
