@@ -15,7 +15,7 @@ use gpui::{AppContext as _, Bounds, Entity, MouseButton, Pixels, TestAppContext,
 use super::fullscreen::LYRIC_ROW_H;
 use super::theme;
 use super::{MainSection, MusicEvent, MusicView, RightTab};
-use crate::model::Track;
+use crate::model::{RepeatMode, Track};
 use crate::player::MusicPlayer;
 
 /// 极小有效 PNG（2×1 纯红）字节：作为同名封面侧车装进临时库。
@@ -518,7 +518,7 @@ fn at_frac(b: &Bounds<Pixels>, frac: f32) -> gpui::Point<Pixels> {
 async fn bb_progress_click_jumps_to_position(cx: &mut TestAppContext) {
     let dur = 100.0;
     let (view, wcx) = open_seek_view(cx, dur);
-    let b = wcx.cx.read(|app| view.read(app).bb_progress.get());
+    let b = wcx.cx.read(|app| view.read(app).bottom_bar.read(app).bb_progress.get());
     assert!(b.size.width.as_f32() > 0.0, "bb-progress 盒应已布局（宽>0），实得 {b:?}");
     wcx.simulate_mouse_down(at_frac(&b, 0.75), MouseButton::Left, Default::default());
     wcx.run_until_parked();
@@ -540,7 +540,7 @@ async fn bb_progress_click_jumps_to_position(cx: &mut TestAppContext) {
 async fn bb_progress_drag_follows_and_release_lands(cx: &mut TestAppContext) {
     let dur = 100.0;
     let (view, wcx) = open_seek_view(cx, dur);
-    let b = wcx.cx.read(|app| view.read(app).bb_progress.get());
+    let b = wcx.cx.read(|app| view.read(app).bottom_bar.read(app).bb_progress.get());
     assert!(b.size.width.as_f32() > 0.0, "bb-progress 盒应已布局（宽>0），实得 {b:?}");
     wcx.simulate_mouse_down(at_frac(&b, 0.60), MouseButton::Left, Default::default());
     wcx.run_until_parked();
@@ -583,7 +583,7 @@ async fn paused_progress_seek_still_works(cx: &mut TestAppContext) {
         !wcx.cx.read(|app| player.read(app).playing()),
         "夹具应为暂停态（playing=false）"
     );
-    let b = wcx.cx.read(|app| view.read(app).bb_progress.get());
+    let b = wcx.cx.read(|app| view.read(app).bottom_bar.read(app).bb_progress.get());
     assert!(b.size.width.as_f32() > 0.0, "bb-progress 盒应已布局（宽>0），实得 {b:?}");
     wcx.simulate_mouse_down(at_frac(&b, 0.50), MouseButton::Left, Default::default());
     wcx.run_until_parked();
@@ -633,7 +633,7 @@ async fn fs_progress_click_seeks(cx: &mut TestAppContext) {
 async fn bb_progress_drag_release_outside_bar_lands_at_last_target(cx: &mut TestAppContext) {
     let dur = 100.0;
     let (view, wcx) = open_seek_view(cx, dur);
-    let b = wcx.cx.read(|app| view.read(app).bb_progress.get());
+    let b = wcx.cx.read(|app| view.read(app).bottom_bar.read(app).bb_progress.get());
     assert!(b.size.width.as_f32() > 0.0, "bb-progress 盒应已布局（宽>0），实得 {b:?}");
     wcx.simulate_mouse_down(at_frac(&b, 0.80), MouseButton::Left, Default::default());
     wcx.run_until_parked();
@@ -827,6 +827,383 @@ async fn fs_progress_drag_refreshes_fill_when_paused(cx: &mut TestAppContext) {
     });
     assert!((s.0 - dur * 0.80).abs() < 1.0, "暂停态松手仍停 80%，实得 {:.1}", s.0);
     assert!(!s.1 && s.2, "seek 不误伤暂停（playing/paused 不变）");
+}
+
+// ---- 性能优化第三步 A 段：eq/vinyl 动画 → 纯展示子视图，动画 notify 只落子视图 ----
+
+/// 播放中模拟数个动画帧：gpui `with_animation` 的 notify 目标是「包含动画元素的
+/// current_view」（gpui animation.rs：`let view = window.current_view()` → 到点
+/// `cx.notify(view)`）。A 段前动画在父 MusicView render 里构建 → current_view=父 →
+/// 动画每帧 notify 父（15fps×整树重建）；A 段后动画归 `EqBarsView` 子视图 →
+/// current_view=子视图，动画每帧只 notify 子视图、父计数器不动。
+/// RED：旧代码父被动画每帧 notify → `parent_delta==0` 断言失败；GREEN：拆分后父不动、子随动画跳。
+#[gpui::test]
+async fn lively_animation_notifies_only_subviews_not_parent(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, cx| {
+            p.test_start_playing(0); // 播放中：主区当前行嵌入 eq 子视图动画
+            p.set_test_duration(100.0);
+            p.seek(0.0, cx);
+        });
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    // 渲染首帧：eq 动画元素 mount → request_layout 安排 15fps（~66.7ms）timer。
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    // 观察父 MusicView 与子 eq 子视图——只对各自 `cx.notify()` 触发（动画 notify 走 emitter）。
+    let (parent_c, child_c) = wcx.update(|_w, app| {
+        let eq = view.read(app).eq_main.clone();
+        let parent_c = Rc::new(Cell::new(0usize));
+        let child_c = Rc::new(Cell::new(0usize));
+        {
+            let c = parent_c.clone();
+            app.observe(&view, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        {
+            let c = child_c.clone();
+            app.observe(&eq, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        (parent_c, child_c)
+    });
+    let base_p = parent_c.get();
+    let base_c = child_c.get();
+    // 3 拍动画帧：每拍 timer 到点 notify 子视图 → 显式重绘续排下一 timer。
+    for _ in 0..3 {
+        wcx.executor().advance_clock(Duration::from_millis(70));
+        wcx.run_until_parked();
+        wcx.update(|window, app| window.draw(app).clear(app));
+        wcx.run_until_parked();
+    }
+    let dp = parent_c.get() - base_p;
+    let dc = child_c.get() - base_c;
+    assert!(
+        dc >= 2,
+        "动画帧应每拍 notify 子 eq 子视图（delta={dc}，子计数器应随动画跳）"
+    );
+    assert_eq!(
+        dp, 0,
+        "动画帧不得 notify 父 MusicView（旧代码动画 notify current_view=父=RED）：delta={dp}"
+    );
+}
+
+// ---- 性能优化第三步 B 段：底栏 → BottomBarView 子视图（进度心跳 / 交互回父 / tooltip 回父）----
+
+/// 按按钮 debug 盒中心做一次完整点击（down+up），驱动其 on_click 回调（按钮在底栏
+/// 子视图的树内，debug_bounds 需 debug_selector 且已 prepaint）。
+fn click_button(wcx: &mut VisualTestContext, selector: &'static str) {
+    let b = wcx.debug_bounds(selector).expect("按钮应有 debug 盒");
+    wcx.simulate_mouse_down(at_frac(&b, 0.5), MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    wcx.simulate_mouse_up(at_frac(&b, 0.5), MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+}
+
+/// 用例 B1：播放中推进 120ms×2（总 < 父 250ms tick 不发）→ 底栏子视图被心跳自 notify
+/// （db≥2）、父 MusicView 不被该心跳 notify（dp==0）；附「渲染拉到最新 position」护栏：
+/// seek(50) 后重绘一帧 → bb 填充宽 ≈ 0.5×条盒宽（headless 下 position=seek_base 确定性，
+/// 与 fs_progress_fill 同款姿势——headless 证「心跳→重绘→新位置」数据链，真机由用户复验）。
+#[gpui::test]
+async fn bottom_heartbeat_notifies_subview_not_parent(cx: &mut TestAppContext) {
+    let dur = 100.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, cx| {
+            p.test_start_playing(0);
+            p.set_test_duration(dur);
+            p.seek(0.0, cx);
+        });
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let (parent_c, bottom_c) = wcx.update(|_w, app| {
+        let bottom = view.read(app).bottom_bar.clone();
+        let parent_c = Rc::new(Cell::new(0usize));
+        let bottom_c = Rc::new(Cell::new(0usize));
+        {
+            let c = parent_c.clone();
+            app.observe(&view, move |_, _| c.set(c.get() + 1))
+                .detach();
+        }
+        {
+            let c = bottom_c.clone();
+            app.observe(&bottom, move |_, _| c.set(c.get() + 1))
+                .detach();
+        }
+        (parent_c, bottom_c)
+    });
+    let bp = parent_c.get();
+    let bb = bottom_c.get();
+    for _ in 0..2 {
+        wcx.executor().advance_clock(Duration::from_millis(120));
+        wcx.run_until_parked();
+    }
+    let dp = parent_c.get() - bp;
+    let db = bottom_c.get() - bb;
+    assert!(
+        db >= 2,
+        "播放中心跳应每 ~120ms 自 notify 底栏子视图：delta={db}"
+    );
+    assert_eq!(
+        dp, 0,
+        "心跳不得 notify 父 MusicView（父只在 250ms tick 才整树 notify）：delta={dp}"
+    );
+    // 渲染拉到最新 position：seek(50) 后显式重绘 → 进度显示数据链仍活（headless 下
+    // position=seek_base 确定性；填充盒比例依赖既有条几何不在本次范围，只证 seek 语义
+    // + 心跳把重绘接到子视图——真机进度平滑由用户复验）。
+    wcx.update(|_w, app| {
+        let p = view.read(app).player.clone();
+        p.update(app, |p, cx| p.seek(dur * 0.5, cx));
+    });
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let pos = wcx.cx.read(|app| view.read(app).player.read(app).position());
+    assert!(
+        (pos - dur * 0.5).abs() < 1.0,
+        "seek(50) 后 position 应到 50s，实得 {pos:.1}"
+    );
+    assert!(
+        wcx.debug_bounds("bb-progress-fill").is_some(),
+        "bb 填充元素应仍在渲染（bb-progress-fill debug 盒存在）"
+    );
+}
+
+/// 用例 B2：bb 进度条点击/拖动 seek 仍实时跟手（B 段复用既有回归断言姿势，观察改为
+/// **子底栏** notify——拖动跟手由子视图自 notify，不寄生父 tick/动画帧）。
+#[gpui::test]
+async fn bb_progress_drag_notifies_bottom_subview(cx: &mut TestAppContext) {
+    let dur = 100.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, _| p.set_test_duration(dur));
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let bottom_c = wcx.update(|_w, app| {
+        let bottom = view.read(app).bottom_bar.clone();
+        let c = Rc::new(Cell::new(0usize));
+        {
+            let c = c.clone();
+            app.observe(&bottom, move |_, _| c.set(c.get() + 1))
+                .detach();
+        }
+        c
+    });
+    let b = wcx
+        .cx
+        .read(|app| view.read(app).bottom_bar.read(app).bb_progress.get());
+    assert!(
+        b.size.width.as_f32() > 0.0,
+        "bb-progress 盒应已布局（宽>0），实得 {b:?}"
+    );
+    let base = bottom_c.get();
+    wcx.simulate_mouse_down(at_frac(&b, 0.60), MouseButton::Left, Default::default());
+    wcx.simulate_mouse_move(at_frac(&b, 0.30), Some(MouseButton::Left), Default::default());
+    wcx.run_until_parked();
+    assert!(
+        bottom_c.get() > base,
+        "bb 拖拽应自 notify 底栏子视图（不寄生 tick/动画）：{} → {}",
+        base,
+        bottom_c.get()
+    );
+    let pos = wcx.cx.read(|app| view.read(app).player.read(app).position());
+    assert!(
+        (pos - dur * 0.30).abs() < 1.0,
+        "拖到 30% 应跟随 {:.1}s，实得 {pos:.1}",
+        dur * 0.30
+    );
+    wcx.simulate_mouse_up(at_frac(&b, 0.30), MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let pos2 = wcx.cx.read(|app| view.read(app).player.read(app).position());
+    assert!(
+        (pos2 - dur * 0.30).abs() < 1.0,
+        "松手仍停 30%，实得 {pos2:.1}"
+    );
+}
+
+/// 用例 B3：底部各按钮（播放/上下首/随机/循环/收藏/歌词/队列/全屏）点击后**父状态**真正
+/// 变化（参与断言：playing/current/shuffle/repeat/liked/right_tab/fs_open）——交互都经
+/// `parent.update` 回父执行（WeakEntity 防循环），非子视图本地假象。
+#[gpui::test]
+async fn bottom_buttons_route_to_parent_state(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, _| p.test_start_playing(0));
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    // 播放/暂停：bb-play → playing 翻转。
+    assert!(
+        wcx.cx.read(|app| view.read(app).player.read(app).playing()),
+        "前置：播放中"
+    );
+    click_button(wcx, "bb-play");
+    assert!(
+        !wcx.cx.read(|app| view.read(app).player.read(app).playing()),
+        "bb-play 应翻转 playing（回父 toggle_play）"
+    );
+    // 下一首/上一首：bb-next → current 前进；bb-prev → current 回到 0。
+    let c0 = wcx.cx.read(|app| view.read(app).player.read(app).current());
+    assert_eq!(c0, Some(0), "前置 current=0");
+    click_button(wcx, "bb-next");
+    let c1 = wcx.cx.read(|app| view.read(app).player.read(app).current());
+    assert_eq!(c1, Some(1), "bb-next 应前进到 1");
+    click_button(wcx, "bb-prev");
+    let c2 = wcx.cx.read(|app| view.read(app).player.read(app).current());
+    assert_eq!(c2, Some(0), "bb-prev 应回到 0");
+    // 随机：bb-shuffle → shuffle 翻转。
+    let s0 = wcx.cx.read(|app| view.read(app).player.read(app).shuffle());
+    click_button(wcx, "bb-shuffle");
+    let s1 = wcx.cx.read(|app| view.read(app).player.read(app).shuffle());
+    assert_ne!(s0, s1, "bb-shuffle 应翻转 shuffle");
+    // 循环：bb-repeat → repeat Off→All。
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).player.read(app).repeat()),
+        RepeatMode::Off
+    );
+    click_button(wcx, "bb-repeat");
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).player.read(app).repeat()),
+        RepeatMode::All,
+        "bb-repeat Off→All"
+    );
+    // 收藏：bb-like → 当前曲 liked 翻转。
+    let l0 = wcx.cx.read(|app| view.read(app).player.read(app).is_liked(0));
+    click_button(wcx, "bb-like");
+    let l1 = wcx.cx.read(|app| view.read(app).player.read(app).is_liked(0));
+    assert_ne!(l0, l1, "bb-like 应翻转当前曲收藏");
+    // 歌词/队列 tab：bb-lyrics/bb-queue → right_tab 切换。
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).state.right_tab),
+        RightTab::Song,
+        "前置右侧面板在歌曲 tab"
+    );
+    click_button(wcx, "bb-lyrics");
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).state.right_tab),
+        RightTab::Lyrics,
+        "bb-lyrics 应切到歌词 tab"
+    );
+    click_button(wcx, "bb-queue");
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).state.right_tab),
+        RightTab::Queue,
+        "bb-queue 应切到队列 tab"
+    );
+    // 全屏：bb-fs → fs_open 翻转。
+    let fs0 = wcx.cx.read(|app| view.read(app).state.fs_open);
+    click_button(wcx, "bb-fs");
+    let fs1 = wcx.cx.read(|app| view.read(app).state.fs_open);
+    assert_ne!(fs0, fs1, "bb-fs 应翻转 fs_open");
+}
+
+/// 用例 B4（tooltip 不回归）：底栏按钮悬停提示仍出现且**锚定按钮盒**（走父全局 tooltip
+/// 层——本视图把按钮盒写入父 tip_boxes 同名 cell）。断言 bb-fs：悬停 → 满 500ms 显示 +
+/// 浮层底边中点横贴 bb-fs 中心、竖在按钮上缘上方 GAP。
+#[gpui::test]
+fn bb_fs_tooltip_appears_and_anchors(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    let bbfs = wcx.debug_bounds("bb-fs").expect("bb-fs 应有 debug 盒");
+    wcx.simulate_mouse_move(at_frac(&bbfs, 0.5), None, Default::default());
+    wcx.run_until_parked();
+    assert_eq!(
+        tooltip_text(&view, wcx).as_deref(),
+        Some("全屏"),
+        "悬停 bb-fs 应设名称提示"
+    );
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert!(tooltip_showing(&view, wcx), "满 500ms 应显示浮层");
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let tip = wcx.debug_bounds("music-tooltip").expect("浮层应在渲染");
+    let want_mid_x = bbfs.origin.x.as_f32() + bbfs.size.width.as_f32() * 0.5;
+    let want_bottom_y = bbfs.origin.y.as_f32() - super::TOOLTIP_GAP_PX;
+    assert!(
+        (tip.origin.x.as_f32() + tip.size.width.as_f32() * 0.5 - want_mid_x).abs() < 2.0,
+        "浮层底边中点应横贴 bb-fs 中心"
+    );
+    assert!(
+        (tip.origin.y.as_f32() + tip.size.height.as_f32() - want_bottom_y).abs() < 2.0,
+        "浮层底边应在 bb-fs 上缘上方 GAP"
+    );
+}
+
+// ---- 性能优化第三步·墙钟探针（K27 留数）：播放中 1s 的「父整树重建次数/秒」折算 ----
+
+/// 模拟播放中 1 秒（20ms 步进 × 50，每步跑定期并显式重绘以续排各 timer），分别数出
+/// 父 MusicView / eq 子视图 / 底栏子视图的 notify 次数；按调试构建每整树重建 ~42ms、
+/// 子视图 ~1ms 折算主线程占用 ms/s。
+/// before（真机语境）：父整树重建 = 15fps(动画 notify 父) + 4Hz(tick) ≈ 19 次/s；
+/// after：父 ≈ 父 tick 4Hz，eq 15fps × ~1ms、底栏心跳 ~8Hz × ~1ms 都落到各自子视图。
+/// 断言只给宽区间（计时器对齐有抖动）；精确数值由 eprintln 留数（报告引用）。
+#[gpui::test]
+async fn lively_playback_1s_rebuild_rate_probe(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, cx| {
+            p.test_start_playing(0);
+            p.set_test_duration(100.0);
+            p.seek(0.0, cx);
+        });
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let (parent_c, eq_c, bottom_c) = wcx.update(|_w, app| {
+        let (eq, bottom) = {
+            let v = view.read(app);
+            (v.eq_main.clone(), v.bottom_bar.clone())
+        };
+        let parent_c = Rc::new(Cell::new(0usize));
+        let eq_c = Rc::new(Cell::new(0usize));
+        let bottom_c = Rc::new(Cell::new(0usize));
+        {
+            let c = parent_c.clone();
+            app.observe(&view, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        {
+            let c = eq_c.clone();
+            app.observe(&eq, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        {
+            let c = bottom_c.clone();
+            app.observe(&bottom, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        (parent_c, eq_c, bottom_c)
+    });
+    let (bp0, be0, bb0) = (parent_c.get(), eq_c.get(), bottom_c.get());
+    for _ in 0..50 {
+        wcx.executor().advance_clock(Duration::from_millis(20));
+        wcx.run_until_parked();
+        wcx.update(|window, app| window.draw(app).clear(app));
+        wcx.run_until_parked();
+    }
+    let (p, q, b) = (
+        parent_c.get() - bp0,
+        eq_c.get() - be0,
+        bottom_c.get() - bb0,
+    );
+    // 折算（debug：父整树 42ms/次、子视图 ~1ms/次）：
+    let parent_ms_s = p as f64 * 42.0;
+    let eq_ms_s = q as f64 * 1.0;
+    let bottom_ms_s = b as f64 * 1.0;
+    let before_ms_s = (15.0 + 4.0) * 42.0;
+    let after_ms_s = parent_ms_s + eq_ms_s + bottom_ms_s;
+    eprintln!(
+        "[perf] playback_1s: parent_whole_rebuild={p} ({parent_ms_s:.0}ms/s) eq_subview={q} ({eq_ms_s:.0}ms/s) bottom_subview={b} ({bottom_ms_s:.0}ms/s) | before≈{before_ms_s:.0}ms/s after≈{after_ms_s:.0}ms/s (-{:.0}%)",
+        (1.0 - after_ms_s / before_ms_s) * 100.0
+    );
+    assert!(
+        (3..=7).contains(&p),
+        "父整树重建应只剩父 tick 4Hz（≈4 次/秒），动画/心跳都别落父：实得 {p}"
+    );
+    assert!(q >= 10, "eq 子视图应承接 ~15fps 动画 notify：实得 {q}");
+    assert!(b >= 7, "底栏子视图应承接 ~8Hz 心跳 notify：实得 {b}");
 }
 
 // ---- 歌词面板：可滚浏览全部 + 自动跟随当前句（手动滚动暂停、停止约 3 秒恢复） ----

@@ -14,9 +14,13 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, Hsla, IntoElement, ParentElement as _, Styled as _,
-    Transformation, div, px, radians, svg,
+    Animation, AnimationExt, AnyElement, Context, Entity, Hsla, IntoElement, ParentElement as _,
+    Render, SharedString, Styled as _, Transformation, Window, div, px, radians, svg,
 };
+
+use crate::player::MusicPlayer;
+
+use super::theme;
 
 /// 均衡器小柱组（当前播放行「♪」指示）：四根小柱以不同高度基线 + 相位跳动，
 /// 三角波 easing 让高度在基线 ↔ 峰值间往返（近似原型 `eq-bounce` scaleY）。
@@ -63,6 +67,8 @@ pub fn eq_bars(playing: bool, accent: Hsla, prefix: String) -> AnyElement {
 /// 黑胶圈：给定直径的圆环 + 顶端缺口点（让旋转可见）。`playing` 时绕中心匀速旋转
 /// （`svg().with_transformation`，`div` 无 transform；`prefix` 保证动画 id 唯一）。
 /// 默认 8s 一圈顺时针（legacy 姿势）。
+/// 已被 [`VinylView`] 子视图取代（dormancy：保留公共绘制件，调用方全走子视图动画）。
+#[allow(dead_code)]
 pub fn vinyl_ring(diameter: f32, playing: bool, prefix: String) -> AnyElement {
     vinyl_ring_at(diameter, playing, prefix, Duration::from_secs(8), false)
 }
@@ -102,5 +108,88 @@ pub fn vinyl_ring_at(
     } else {
         ring.with_transformation(Transformation::rotate(radians(0.0)))
             .into_any_element()
+    }
+}
+
+// ---- 高频重绘热区 → 纯展示子视图（性能优化第三步 A 段） ----
+//
+// GPUI 动画的 notify 目标 = 包含动画元素的 `window.current_view()`（见 gpui
+// `AnimationElement::request_layout` 的 `with_max_fps` 分支：`let view =
+// window.current_view()` → 到点 `cx.notify(view)`）。旧代码动画在父 MusicView 的 render
+// 里构建 → current_view = 整棵 MusicView → 动画每帧 notify 整树（播放中 15fps×42ms 整树
+// 重建）。把动画元素放进下面的子视图后，current_view = 子视图 → 动画每帧只重绘本视图，
+// 父树不再被动画帧带动整树 notify。`repeat_synced` 走 App 级共享时钟，跨多个子视图实例
+// 的相位仍协同（不破坏既有视觉）。
+
+/// 均衡器小柱动画纯展示子视图：自身 render 构建 `eq_bars` 动画元素，无事件回调、
+/// 只读播放器态（`playing` 直接从 `player` 读，不做回写）；动画 notify 只落在本视图。
+/// `prefix` 须全局唯一（动画元素 id 全局唯一；主区当前行与队列当前项分设实例互不干扰）。
+pub struct EqBarsView {
+    player: Entity<MusicPlayer>,
+    prefix: SharedString,
+}
+
+impl EqBarsView {
+    pub(crate) fn new(player: Entity<MusicPlayer>, prefix: &str) -> Self {
+        Self {
+            player,
+            prefix: prefix.into(),
+        }
+    }
+}
+
+impl Render for EqBarsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let playing = self.player.read(cx).playing();
+        eq_bars(playing, theme::accent(), self.prefix.to_string())
+    }
+}
+
+/// 黑胶圈动画纯展示子视图：可配多圈（直径比例/周期/转向/前缀），渲染为 right.rs 与
+/// fullscreen.rs 旧实现同款的「absolute 满布 flex 容器、中心对齐多圈」；无事件回调、
+/// 只读播放器态；动画 notify 只落在本视图（多圈同容器 → 一次 notify 即全圈）。
+pub struct VinylView {
+    player: Entity<MusicPlayer>,
+    /// 封面基准边长（px）：各圈直径 = `base × 比例`。
+    base: f32,
+    /// (直径比例, 周期, 反向, 前缀)；prefix 须全局唯一。
+    rings: Vec<(f32, Duration, bool, SharedString)>,
+}
+
+impl VinylView {
+    pub(crate) fn new(player: Entity<MusicPlayer>, base: f32) -> Self {
+        Self {
+            player,
+            base,
+            rings: Vec::new(),
+        }
+    }
+
+    /// 追加一圈（按序叠放；prefix 全局唯一，防动画元素 id 冲突）。
+    pub(crate) fn ring(
+        mut self,
+        frac: f32,
+        period: Duration,
+        reverse: bool,
+        prefix: &str,
+    ) -> Self {
+        self.rings.push((frac, period, reverse, prefix.into()));
+        self
+    }
+}
+
+impl Render for VinylView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let playing = self.player.read(cx).playing();
+        let base = self.base;
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .children(self.rings.iter().map(move |(frac, period, reverse, prefix)| {
+                vinyl_ring_at(base * frac, playing, prefix.to_string(), *period, *reverse)
+            }))
     }
 }

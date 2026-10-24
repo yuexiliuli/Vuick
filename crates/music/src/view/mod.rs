@@ -42,6 +42,7 @@ use gpui::{
     StatefulInteractiveElement as _, StyledImage, TextInputConfiguration, UTF16Selection, Window,
     anchored, deferred, div, img, point, px, size,
 };
+use gpui::AppContext as _;
 
 use crate::model::{RepeatMode, Track};
 use crate::player::MusicPlayer;
@@ -145,9 +146,7 @@ pub struct MusicView {
     cover_loading: HashSet<PathBuf>,
     // ---- 可交互条（进度/音量）的窗口坐标盒（canvas prepaint 记录） ----
     np_progress: Rc<Cell<Bounds<Pixels>>>,
-    bb_progress: Rc<Cell<Bounds<Pixels>>>,
     fs_progress: Rc<Cell<Bounds<Pixels>>>,
-    bb_vol: Rc<Cell<Bounds<Pixels>>>,
     fs_vol: Rc<Cell<Bounds<Pixels>>>,
     /// 全屏进度条**填充渐变**的 canvas 实际绘制盒（`gradient_cover_tracked` 记录）：
     /// 供「填充随播放位置增长」回归断言（canvas 高度曾塌缩 0 → 填充隐形，真机复报五）。
@@ -191,6 +190,17 @@ pub struct MusicView {
     /// 主区「过滤/分组显示模型」缓存（`(分区, 搜索词)` → `(库变更计数, Rc<显示模型>)`）：
     /// 同一搜索词且 `player.mutation()` 不变则复用——消除每帧重过滤 + `Vec<Track>` 深克隆。
     main_list_cache: HashMap<(MainSection, String), (u64, Rc<main::MainList>)>,
+    // ---- 高频重绘热区 → 纯展示子视图（性能优化第三步）：动画 notify 只落子视图 ----
+    /// 主区「当前播放行」均衡器动画子视图（动画每帧只 notify 它，不再带动父整树）。
+    eq_main: Entity<widgets::EqBarsView>,
+    /// 右栏队列「当前项」均衡器动画子视图（与主区实例前缀隔离、互不干扰）。
+    eq_queue: Entity<widgets::EqBarsView>,
+    /// 右栏「正在播放」大封面黑胶三圈子视图（np-art）。
+    vinyl_np: Entity<widgets::VinylView>,
+    /// 全屏封面黑胶三圈子视图（fs cover；与 np 实例前缀隔离）。
+    vinyl_fs: Entity<widgets::VinylView>,
+    /// 底栏子视图（B 段）：整块底部播放栏拆出——自带进度心跳 + 交互回父 + tooltip 回父。
+    bottom_bar: Entity<bottom::BottomBarView>,
 }
 
 /// 进度条拖拽真实 seek 节流（ms）：与视频查看器同量级；节流窗口内只更新显示基准
@@ -210,6 +220,10 @@ impl MusicView {
                 let _ = weak.update(cx, |this, cx| this.on_tick(cx));
             }
         });
+        // 子视图各持一份播放器句柄（只读态；父字段移走 player 后不可再借用，先克隆）。
+        let player_for_views = player.clone();
+        // 底栏回父交互/tooltip 用：父视图弱柄（WeakEntity 防循环引用）。
+        let parent_weak = cx.weak_entity();
         Self {
             player,
             state: ViewState::default(),
@@ -220,9 +234,7 @@ impl MusicView {
             last_error: None,
             _tick: Some(task),
             np_progress: Rc::new(Cell::new(Bounds::default())),
-            bb_progress: Rc::new(Cell::new(Bounds::default())),
             fs_progress: Rc::new(Cell::new(Bounds::default())),
-            bb_vol: Rc::new(Cell::new(Bounds::default())),
             fs_vol: Rc::new(Cell::new(Bounds::default())),
             fs_fill_box: Rc::new(Cell::new(Bounds::default())),
             hover_mix: None,
@@ -239,6 +251,25 @@ impl MusicView {
             lyrics_track_path: None,
             main_scroll: ScrollHandle::new(),
             main_list_cache: HashMap::new(),
+            eq_main: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "row-current")),
+            eq_queue: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "queue-current")),
+            vinyl_np: cx
+                .new(|_| {
+                    widgets::VinylView::new(player_for_views.clone(), right::ART_PX)
+                        .ring(0.70, Duration::from_secs(8), false, "np-vinyl-1")
+                        .ring(0.50, Duration::from_secs(8), false, "np-vinyl-2")
+                        .ring(0.30, Duration::from_secs(8), false, "np-vinyl-3")
+                }),
+            vinyl_fs: cx
+                .new(|_| {
+                    widgets::VinylView::new(player_for_views.clone(), fullscreen::FS_COVER_PX)
+                        .ring(0.80, Duration::from_secs(12), false, "fsv-a")
+                        .ring(0.55, Duration::from_secs(9), true, "fsv-b")
+                        .ring(0.30, Duration::from_secs(7), false, "fsv-c")
+                }),
+            bottom_bar: cx.new(|cx| {
+                bottom::BottomBarView::new(player_for_views.clone(), parent_weak.clone(), cx)
+            }),
         }
     }
 
@@ -581,8 +612,8 @@ impl MusicView {
         self.toast_msg(if was { "取消收藏" } else { "已收藏" });
     }
 
-    /// 收藏/取消收藏当前播放曲目（右侧面板「收藏」钮）。
-    fn like_current(&mut self, cx: &mut Context<Self>) {
+    /// 收藏/取消收藏当前播放曲目（右侧面板「收藏」钮 / 底栏回父入口）。
+    pub(super) fn like_current(&mut self, cx: &mut Context<Self>) {
         if let Some(i) = self.player.read(cx).current() {
             self.toggle_like(i, cx);
         }
@@ -614,7 +645,8 @@ impl MusicView {
         cx.notify();
     }
 
-    fn set_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
+    /// 切右侧面板 tab（右栏 header / 底栏回父入口共用）。
+    pub(super) fn set_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         self.state.right_tab = tab;
         // 面板「歌词」tab 重进：复位歌词跟随/手动态（进入即从自动跟随当前句开始）。
         self.lyrics_manual_since = None;
@@ -829,6 +861,12 @@ impl MusicView {
             // 音量视觉同进度：视图自身 notify，点/拖即时刷新、不寄生动画/tick 帧。
             cx.notify();
         }
+    }
+
+    /// 底部播放栏（B 段）：整块已拆成独立 [`bottom::BottomBarView`] 子视图——进度心跳/
+    /// 拖拽/按钮/tooltip 全在子视图内，父树只嵌入它（子视图 notify 不带动父整树）。
+    pub(super) fn render_bottom(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> AnyElement {
+        self.bottom_bar.clone().into_any_element()
     }
 
     // ---- toast 浮层 ----

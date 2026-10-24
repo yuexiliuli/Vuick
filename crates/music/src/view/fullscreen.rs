@@ -23,10 +23,10 @@ use gpui::{
 use crate::model::{RepeatMode, duration_str};
 
 use super::icon::{IconView, MusicIcon};
-use super::{MusicView, theme, widgets};
+use super::{MusicView, theme};
 
 /// 全屏封面边长（px），黑胶圈按比例派生。
-const FS_COVER_PX: f32 = 320.0;
+pub(super) const FS_COVER_PX: f32 = 320.0;
 
 /// 歌词行三态（v2 `.fs-lyric`：active 白+加粗+accent 底 / past 暗 / future 更亮）。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,7 +100,7 @@ impl super::MusicView {
             .bg(theme::bg_deep())
             .child(self.render_fs_bg())
             .child(self.render_fs_topbar(cx))
-            .child(self.render_fs_body(cx, title, artist, album, light, dark, playing))
+            .child(self.render_fs_body(cx, title, artist, album, light, dark))
             .child(self.render_fs_bottom_eq(playing))
             .into_any_element()
     }
@@ -263,7 +263,6 @@ impl super::MusicView {
         album: String,
         light: Hsla,
         dark: Hsla,
-        playing: bool,
     ) -> AnyElement {
         div()
             .relative()
@@ -275,7 +274,7 @@ impl super::MusicView {
             .gap_x(px(80.))
             .px(px(56.))
             .py(px(48.))
-            .child(self.render_fs_left(cx, title, artist, album, light, dark, playing))
+            .child(self.render_fs_left(cx, title, artist, album, light, dark))
             .child(self.render_fs_lyrics(cx))
             .into_any_element()
     }
@@ -289,7 +288,6 @@ impl super::MusicView {
         album: String,
         light: Hsla,
         dark: Hsla,
-        playing: bool,
     ) -> AnyElement {
         div()
             .flex()
@@ -297,7 +295,7 @@ impl super::MusicView {
             .items_center()
             .w(px(FS_COVER_PX))
             .flex_shrink_0()
-            .child(self.render_fs_cover(cx, (light, dark), playing))
+            .child(self.render_fs_cover(cx, (light, dark)))
             .child(self.render_fs_song_meta(title, artist, album))
             .child(self.render_fs_progress(cx))
             .child(self.render_fs_controls(cx))
@@ -311,7 +309,6 @@ impl super::MusicView {
         &mut self,
         cx: &mut Context<Self>,
         (light, dark): (Hsla, Hsla),
-        playing: bool,
     ) -> AnyElement {
         let cover = self.cover_for_current(cx);
         let base = match &cover {
@@ -320,33 +317,9 @@ impl super::MusicView {
                 .size_full()
                 .child(theme::gradient_cover((light, dark), 16.0))
                 .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(widgets::vinyl_ring_at(
-                            FS_COVER_PX * 0.80,
-                            playing,
-                            "fsv-a".into(),
-                            Duration::from_secs(12),
-                            false,
-                        ))
-                        .child(widgets::vinyl_ring_at(
-                            FS_COVER_PX * 0.55,
-                            playing,
-                            "fsv-b".into(),
-                            Duration::from_secs(9),
-                            true,
-                        ))
-                        .child(widgets::vinyl_ring_at(
-                            FS_COVER_PX * 0.30,
-                            playing,
-                            "fsv-c".into(),
-                            Duration::from_secs(7),
-                            false,
-                        )),
+                    // 黑胶三圈（12s/9s/7s、外层反向）：动画在独立环形子视图内、只重绘自己
+                    // （VinylView 自带 absolute 满布 flex 容器，视觉/相位与旧实现一致）。
+                    self.vinyl_fs.clone().into_any_element(),
                 )
                 .child(
                     div()

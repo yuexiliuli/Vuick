@@ -12,10 +12,10 @@ use gpui::{
 use crate::model::RepeatMode;
 
 use super::icon::{IconView, MusicIcon};
-use super::{MusicView, RightTab, theme, widgets};
+use super::{MusicView, RightTab, theme};
 
 /// 右侧大封面固定边长（px），黑胶圈按比例从它派生。
-const ART_PX: f32 = 264.0;
+pub(super) const ART_PX: f32 = 264.0;
 
 impl super::MusicView {
     /// 右侧面板整块。
@@ -128,7 +128,6 @@ impl super::MusicView {
             .map(|t| t.artist.clone())
             .unwrap_or_else(|| "—".to_string());
         let grad = p.current_track().map(|t| t.grad);
-        let playing = p.playing();
         let dur = p.duration();
         let pos = p.position();
         let shuffle = p.shuffle();
@@ -146,16 +145,8 @@ impl super::MusicView {
                 .size_full()
                 .child(theme::gradient_cover((light, dark), 16.0))
                 .child(
-                    // 黑胶圈 ×3（70/50/30%），中心 flex 对齐。
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(widgets::vinyl_ring(ART_PX * 0.70, playing, "np-vinyl-1".into()))
-                        .child(widgets::vinyl_ring(ART_PX * 0.50, playing, "np-vinyl-2".into()))
-                        .child(widgets::vinyl_ring(ART_PX * 0.30, playing, "np-vinyl-3".into())),
+                    // 黑胶圈 ×3（70/50/30%）：动画在独立环形子视图内、只重绘自己。
+                    self.vinyl_np.clone().into_any_element(),
                 )
                 .child(
                     div()
@@ -387,7 +378,6 @@ impl super::MusicView {
         let p = self.player.read(cx);
         let queue = p.queue().to_vec();
         let qpos = p.queue_pos();
-        let playing = p.playing();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (qi, &idx) in queue.iter().enumerate() {
             let Some(t) = p.library().get(idx) else { continue };
@@ -456,7 +446,7 @@ impl super::MusicView {
                             ),
                     )
                     .child(if is_now {
-                        widgets::eq_bars(playing, theme::accent(), format!("queue-{qi}"))
+                        self.eq_queue.clone().into_any_element()
                     } else {
                         div()
                             .text_size(px(11.))

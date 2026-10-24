@@ -28,7 +28,7 @@ use std::sync::Arc;
 use crate::model::Track;
 
 use super::icon::{IconView, MusicIcon};
-use super::{MainSection, MusicView, theme, widgets};
+use super::{MainSection, MusicView, theme};
 
 /// 歌曲表行高（px，近似原型的行内距）。
 const ROW_H: f32 = 52.0;
@@ -742,7 +742,6 @@ impl super::MusicView {
             )
         };
         let (light, dark) = theme::gradient_pair_of(grad);
-        let accent = theme::accent();
         let row = div()
             .id(format!("song-row-{idx}"))
             .debug_selector(move || format!("song-row-{idx}"))
@@ -758,9 +757,9 @@ impl super::MusicView {
             .on_click(cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
                 this.handle_play_idx(idx, cx);
             }));
-        // 序号列：播放中 = 均衡器动画；否则纯数字。
+        // 序号列：播放中 = 均衡器动画（独立子视图，动画只重绘它、不带动整树）；否则纯数字。
         let num = if playing {
-            widgets::eq_bars(true, accent, format!("row-{idx}"))
+            self.eq_main.clone().into_any_element()
         } else {
             div()
                 .w(px(23.))
