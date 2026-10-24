@@ -31,7 +31,14 @@ impl super::MusicView {
                 col.push(self.render_up_next(cx));
             }
             RightTab::Lyrics => {
-                col.push(self.render_lyrics_panel_content(cx));
+                if super::fullscreen::right_panel_live_lyrics(self.state.fs_open) {
+                    col.push(self.render_lyrics_panel_content(cx));
+                } else {
+                    // 全屏浮层已渲染歌词面板（绝对盖住右栏）：此处静态占位——两个
+                    // `render_lyrics_panel_content` 会同抢同一 ScrollHandle（两套几何
+                    // 每帧交替钳位共享 offset）→ 全屏到底后上下跳动 + 闪（复报三）。
+                    col.push(div().flex_1().min_h(px(0.)).into_any_element());
+                }
             }
             RightTab::Queue => {
                 col.push(self.render_queue_list(window, cx));

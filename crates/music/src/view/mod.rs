@@ -38,8 +38,8 @@ use gpui::{
     App, AnyElement, Bounds, ClipboardItem, Context, CursorStyle, DefiniteLength, Entity,
     EntityInputHandler, EventEmitter, Focusable, FocusHandle, InteractiveElement as _, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement as _, Point, Pixels, Render, RenderImage, SharedString, Styled as _, StyledImage,
-    TextInputConfiguration, UTF16Selection, Window, div, img, point, px, size,
+    ParentElement as _, Point, Pixels, Render, RenderImage, ScrollHandle, SharedString, Styled as _,
+    StyledImage, TextInputConfiguration, UTF16Selection, Window, div, img, point, px, size,
 };
 
 use crate::model::{RepeatMode, Track};
@@ -141,6 +141,21 @@ pub struct MusicView {
     hover_mix: Option<usize>,
     /// 全屏浮层当前悬停元素 id（按钮高亮/进度条圆点显示用；同一指针只有一个悬停）。
     fs_hover: Option<&'static str>,
+    // ---- 歌词面板滚动（可滚浏览全部 + 自动跟随当前句） ----
+    /// 歌词滚动容器句柄（`overflow_y_scroll` + `track_scroll`；原生滚轮与自动跟随
+    /// 共用这一个 offset——跟随只写它、放手动时保持用户位置不动它）。
+    lyrics_scroll: ScrollHandle,
+    /// 上次经自动跟随写入的目标偏移（句首坐标 y，offset 取其负值；None=当前非跟随态，
+    /// 如已手动滚动/暂停/未布局）。用于检测「用户手动滚动」：实测 offset 偏离它即
+    /// 记 `lyrics_manual_since` 暂停跟随。
+    lyrics_follow_y: Option<f32>,
+    /// 手动浏览开始时刻（来自 `cx.background_executor().now()`，测试的虚拟时钟可控）。
+    /// 停止滚动约 3 秒（[`super::fullscreen::LYRIC_FOLLOW_RESUME_MS`]）后自动恢复跟随。
+    lyrics_manual_since: Option<Instant>,
+    /// 手动浏览期间上次观察到的滚动偏移（仍在滚动 → 刷新 3 秒计时）。
+    lyrics_manual_last_y: f32,
+    /// 当前参与歌词跟随的曲目路径（切歌/换曲时复位跟随态，新曲从自动跟随开始）。
+    lyrics_track_path: Option<PathBuf>,
 }
 
 /// 进度条拖拽真实 seek 节流（ms）：与视频查看器同量级；节流窗口内只更新显示基准
@@ -178,6 +193,11 @@ impl MusicView {
             fs_hover: None,
             covers: HashMap::new(),
             cover_loading: HashSet::new(),
+            lyrics_scroll: ScrollHandle::new(),
+            lyrics_follow_y: None,
+            lyrics_manual_since: None,
+            lyrics_manual_last_y: 0.0,
+            lyrics_track_path: None,
         }
     }
 
@@ -216,6 +236,9 @@ impl MusicView {
         if toast_expired {
             self.toast = None;
         }
+        // 歌词自动跟随：播放中把滚动偏移钉到「active 行居中」；检测到用户手动滚动则
+        // 暂停跟随、停止滚动约 3 秒后恢复（指挥权在这是为了避开 render 的无副作用纪律）。
+        self.update_lyrics_follow(cx);
         // 播放中才高频刷新进度条/均衡器位置；toast 在期也刷新（保证按时出现/消失）。
         if self.player.read(cx).playing() || self.toast.is_some() {
             cx.notify();
@@ -405,6 +428,9 @@ impl MusicView {
 
     pub fn toggle_fs(&mut self, cx: &mut Context<Self>) {
         self.state.fs_open = !self.state.fs_open;
+        // 全屏切换：复位歌词跟随/手动态（换渲染上下文从自动跟随重新开始）。
+        self.lyrics_manual_since = None;
+        self.lyrics_follow_y = None;
         cx.notify();
     }
 
@@ -415,6 +441,9 @@ impl MusicView {
 
     fn set_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         self.state.right_tab = tab;
+        // 面板「歌词」tab 重进：复位歌词跟随/手动态（进入即从自动跟随当前句开始）。
+        self.lyrics_manual_since = None;
+        self.lyrics_follow_y = None;
         cx.notify();
     }
 

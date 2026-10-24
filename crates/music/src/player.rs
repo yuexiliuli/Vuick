@@ -523,6 +523,27 @@ impl MusicPlayer {
         self.duration = seconds;
     }
 
+    /// 测试专用：直接置「播放中 + current=idx」的纯状态播放（**不发 worker/不开设备**，
+    /// 头less 视图测试用——真 `play_track` 在有设备/缺 dll 环境会被 worker 的 Error 事件
+    /// 翻转 playing=false，破坏确定性）。position 由 seek/seek_base 纯合成驱动。
+    #[cfg(test)]
+    pub(crate) fn test_start_playing(&mut self, idx: usize) {
+        if idx >= self.library.len() {
+            return;
+        }
+        if self.queue.is_empty() {
+            self.queue = (0..self.library.len()).collect();
+            self.queue_pos = 0;
+        }
+        self.queue_pos = idx.min(self.queue.len().saturating_sub(1));
+        self.current = Some(idx);
+        self.playing = true;
+        self.paused = false;
+        self.error = None;
+        self.duration = 0.0;
+        self.reset_playhead_base();
+    }
+
     // ---- 只读访问器（Phase B UI 用） ----
     pub fn current(&self) -> Option<usize> {
         self.current
