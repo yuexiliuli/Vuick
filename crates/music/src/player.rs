@@ -5,7 +5,7 @@
 //! - 一个 **worker 线程**（std mpsc 命令通道 + 事件通道）：`Load` 开曲目进入解码循环
 //!   （`next_pcm`→`sink.push`，回压 `queued_len>1s×采样率×2` 时短轮询新命令）；
 //!   `Seek` 调解码 seek + sink.flush；`Pause/Resume/Stop` 组 sink；EOF 发 `Finished`。
-//!   worker 与 probe 都走 `video_ffmpeg.dll`（FFMPEG_LOCK 在 dll 内部，进程内已串行）。
+//!   worker 与 probe 都走 `media_ffmpeg.dll`（FFMPEG_LOCK 在 dll 内部，进程内已串行）。
 //! - **事件消费由 `tick` 外部驱动**（Phase B 的 MusicView 持渲染/交互节拍调它；Phase A
 //!   不加常驻定时器，避免测试悬空 + fake 调度器无跨线程唤醒（K26）——worker 事件经
 //!   mpsc 入队，`tick` 逐条 `try_recv` 处理）。sink 只打开一次（Same instance 跨曲目复用）。
@@ -874,7 +874,7 @@ mod tests {
     #[gpui::test]
     async fn integration_plays_pause_freezes_next(cx: &mut TestAppContext) {
         if !crate::decode::bridge_ok() {
-            eprintln!("SKIP: video_ffmpeg.dll 不可用（缺视频/音乐运行库）");
+            eprintln!("SKIP: media_ffmpeg.dll 不可用（缺视频/音乐运行库）");
             return;
         }
         if cpal::default_host().default_output_device().is_none() {

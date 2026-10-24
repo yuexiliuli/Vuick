@@ -1,13 +1,13 @@
-//! 音乐解码运行时桥：**动态加载** `video_ffmpeg.dll`，复用其导出的音频 FFI。
+//! 音乐解码运行时桥：**动态加载** `media_ffmpeg.dll`，复用其导出的音频 FFI。
 //!
 //! 姿势照抄 `crates/video/src/decode.rs`（find_lib / Bridge / 符号泛型提升到 'static）。
-//! 只取音频子集符号：open / params / seek / pcm / close。解码语义与 video-ffmpeg 的
+//! 只取音频子集符号：open / params / seek / pcm / close。解码语义与 media-ffmpeg 的
 //! `AudioReader` 一致：统一重采样为 **F32 交错立体声**（`sample_rate` Hz），`next_pcm`
 //! 每次返回一块样本与块首 pts（秒），EOF 返回 `None`，seek 后内部 decode flush + drain。
 //!
 //! # 线程纪律
 //! 句柄只在解码线程内部创建/使用/释放（裸指针非 `Send`，与视频同款对齐）。FFmpeg
-//! 并发闸（FFMPEG_LOCK）在 video-ffmpeg dll 内部持有：进程内 FFMpeg FFI 已全局串行，
+//! 并发闸（FFMPEG_LOCK）在 media-ffmpeg dll 内部持有：进程内 FFMpeg FFI 已全局串行，
 //! music 侧无需再加锁（probe 与播放可各占线程并发调用，dll 自行串行）。
 
 use std::path::Path;
@@ -26,7 +26,7 @@ pub(crate) struct AudioParams {
     pub duration: f64,
 }
 
-/// 与 `video-ffmpeg` 的 `ParamFFI` 布局一致（音频侧宽高/帧率为 0，has_audio=1）。
+/// 与 `media-ffmpeg` 的 `ParamFFI` 布局一致（音频侧宽高/帧率为 0，has_audio=1）。
 #[repr(C)]
 struct ParamFFI {
     width: u32,
@@ -43,7 +43,7 @@ type Handle = *mut std::ffi::c_void;
 type CChar = std::ffi::c_char;
 type CInt = std::ffi::c_int;
 
-// 与 video-ffmpeg 音频导出签名逐字一致（见 crates/video-ffmpeg/src/lib.rs）。
+// 与 media-ffmpeg 音频导出签名逐字一致（见 crates/media-ffmpeg/src/lib.rs）。
 type FnOpenAudio = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
 type FnParams = unsafe extern "C" fn(Handle, *mut ParamFFI);
 type FnSeek = unsafe extern "C" fn(Handle, f64) -> CInt;
@@ -61,7 +61,7 @@ struct Bridge {
 }
 
 fn find_lib() -> std::path::PathBuf {
-    let name = "video_ffmpeg.dll";
+    let name = "media_ffmpeg.dll";
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
@@ -98,7 +98,7 @@ fn load_bridge() -> Option<Bridge> {
     })
 }
 
-/// 运行库是否可用（`video_ffmpeg.dll` 与其 FFmpeg 依赖能否被加载，进程内缓存一次）。
+/// 运行库是否可用（`media_ffmpeg.dll` 与其 FFmpeg 依赖能否被加载，进程内缓存一次）。
 /// 缺库 → false → 播放走纯状态（不打开解码器，窗口报「缺运行库」提示方向）。
 /// Phase A 集成测试用；Phase B UI 入场提示亦可用。
 #[allow(dead_code)]
@@ -131,10 +131,10 @@ impl Drop for AudioCodec {
 }
 
 /// 打开媒体音轨并重采样到 `sample_rate`/立体声/F32 交错；失败返回可读错误（含
-/// 「video_ffmpeg.dll 缺失（缺少视频/音乐运行库）」提示方向）。
+/// 「media_ffmpeg.dll 缺失（缺少视频/音乐运行库）」提示方向）。
 pub(crate) fn open_audio(path: &Path, sample_rate: u32) -> Result<AudioCodec> {
     let b = bridge()
-        .context("video_ffmpeg.dll 缺失（缺少视频/音乐运行库），音乐播放不可用")?;
+        .context("media_ffmpeg.dll 缺失（缺少视频/音乐运行库），音乐播放不可用")?;
     let cpath = utf8_cstr(path)?;
     let mut handle: Handle = std::ptr::null_mut();
     let rc = unsafe { (b.open_audio)(cpath.as_ptr(), sample_rate, &mut handle) };
@@ -168,7 +168,7 @@ impl AudioCodec {
 
     /// 跳转到 `seconds`：dll 内部 decode flush + drain 复位，落点前坏帧由内核跳过。
     pub(crate) fn seek(&mut self, seconds: f64) -> Result<()> {
-        let b = bridge().context("video_ffmpeg.dll 缺失（缺少视频/音乐运行库）")?;
+        let b = bridge().context("media_ffmpeg.dll 缺失（缺少视频/音乐运行库）")?;
         let rc = unsafe { (b.seek)(self.handle, seconds) };
         if rc != 0 {
             return Err(anyhow!("音频 seek 失败"));
@@ -184,7 +184,7 @@ impl AudioCodec {
     /// 而 retry 时该帧已随 `next_pcm_f32` 推进被丢弃（`-1` 不写缓冲）→ 起始丢帧/隔帧丢。
     /// 大起步 + 下方 -1 扩容仅作超上限的防御兜底（单帧 >2s×2ch 实际不可能）。
     pub(crate) fn next_pcm(&mut self, out: &mut Vec<f32>) -> Result<Option<f64>> {
-        let b = bridge().context("video_ffmpeg.dll 缺失（缺少视频/音乐运行库）")?;
+        let b = bridge().context("media_ffmpeg.dll 缺失（缺少视频/音乐运行库）")?;
         out.resize(48_000 * 2 * 2, 0.0);
         loop {
             let mut pts = 0.0f64;

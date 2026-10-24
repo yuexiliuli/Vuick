@@ -1,5 +1,5 @@
 <#
-一键装填视频功能（ffmpeg-next 依赖，位于工作区成员 `video-ffmpeg`）的开发机环境。
+一键装填视频功能（ffmpeg-next 依赖，位于工作区成员 `media-ffmpeg`）的开发机环境。
 
 需要三样：
 - FFMPEG_DIR    → 指向含 include/ + lib/ + bin/ 的 FFmpeg win64 shared 构建（gyan/BtbN）
@@ -11,7 +11,7 @@
 
 说明：ffmpeg-sys-next 只在编译期读 FFMPEG_DIR/LIBCLANG_PATH（生成 bindings + 链接），
 最终用户跑 release 二进制只需要 dll 随包带上（见 scripts/package.ps1）；源码构建方
-无 FFmpeg 环境时可用 `cargo build --workspace --no-default-features --exclude video-ffmpeg`
+无 FFmpeg 环境时可用 `cargo build --workspace --no-default-features --exclude media-ffmpeg`
 关闭视频功能绕过（本工作区根包+成员同为默认成员，跳过视频须同时排除 cdylib 成员）。
 #>
 

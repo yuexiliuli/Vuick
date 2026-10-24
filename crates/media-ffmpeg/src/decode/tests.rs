@@ -320,7 +320,7 @@ fn audio_upsample_outputs_requested_rate() {
 fn hw_or_sw_path_both_output_valid_bgra() {
     let mut r = VideoReader::open_scaled(&fixture_or_skip!(), 160).unwrap();
     eprintln!(
-        "video-ffmpeg 解码路径: {}",
+        "media-ffmpeg 解码路径: {}",
         if r.hw.is_some() { "硬件" } else { "软件回退" }
     );
     let (pts, w, h, bgra) = r.next_frame_bgra().unwrap().expect("帧应可解码");

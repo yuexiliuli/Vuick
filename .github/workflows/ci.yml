@@ -22,11 +22,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # 已知风险：gpui 视觉测试依赖本机字体/像素环境，headless runner 上个别
       # 字体/像素断言可能失败——此类用例可按项目备注补 #[ignore]（future-work T0）。
-      # 排除 video-ffmpeg：CI runner 无 FFmpeg 环境（ffmpeg-sys-next 的 bindgen/链接
+      # 排除 media-ffmpeg：CI runner 无 FFmpeg 环境（ffmpeg-sys-next 的 bindgen/链接
       # 会构建失败），本 job 只测主包逻辑。需覆盖视频成员时先跑
       # scripts/setup-ffmpeg.ps1 装好 FFMPEG_DIR/LIBCLANG_PATH/运行 dll 再移除 --exclude。
       - name: cargo test
-        run: cargo test --all-features --exclude video-ffmpeg
+        run: cargo test --all-features --exclude media-ffmpeg
 
   clippy:
     name: clippy (windows-latest)
@@ -40,7 +40,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # clippy 全目标全 feature 告警已清零（评审 P2 收尾）——硬门禁：任何新告警直接红。
-      # 排除 video-ffmpeg 理由同 test job（无 FFmpeg 环境构建失败；要覆盖需先跑
+      # 排除 media-ffmpeg 理由同 test job（无 FFmpeg 环境构建失败；要覆盖需先跑
       # scripts/setup-ffmpeg.ps1 再移除 --exclude）。
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features --exclude video-ffmpeg -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --exclude media-ffmpeg -- -D warnings

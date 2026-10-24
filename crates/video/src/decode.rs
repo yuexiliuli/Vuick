@@ -1,14 +1,14 @@
-//! 视频解码核心（主 exe 侧）：**运行时动态加载** `video_ffmpeg.dll` 执行解码。
+//! 视频解码核心（主 exe 侧）：**运行时动态加载** `media_ffmpeg.dll` 执行解码。
 //!
 //! 本模块原为直接链接 `ffmpeg_next` 的静态导入（缺 FFmpeg DLL 时 exe 无法启动）；现解码内核
-//! 已迁至工作区成员 `video-ffmpeg`（cdylib，同样用 ffmpeg_next）。主 exe 只在真正打开视频时
+//! 已迁至工作区成员 `media-ffmpeg`（cdylib，同样用 ffmpeg_next）。主 exe 只在真正打开视频时
 //! 经 `libloading` 载入该 DLL：
 //! - 载入成功 → 正常解码（FFmpeg DLL 随之被加载，须与 exe / cdylib 同目录或 PATH 上）；
-//! - 载入失败（缺 `video_ffmpeg.dll` 或 FFmpeg 运行库）→ [`Self::available`] 为 false，
+//! - 载入失败（缺 `media_ffmpeg.dll` 或 FFmpeg 运行库）→ [`Self::available`] 为 false，
 //!   查看器在窗口内报「缺少视频运行库」，**exe 照常启动**。
 //!
-//! 解码逻辑与逐帧回归测试均保留在 `video-ffmpeg` crate（`cargo test -p video-ffmpeg`）。
-//! FFI 约定见 `video-ffmpeg/src/lib.rs`：句柄透明、输出缓冲由调用方预分配、路径按 UTF-8 传。
+//! 解码逻辑与逐帧回归测试均保留在 `media-ffmpeg` crate（`cargo test -p media-ffmpeg`）。
+//! FFI 约定见 `media-ffmpeg/src/lib.rs`：句柄透明、输出缓冲由调用方预分配、路径按 UTF-8 传。
 //!
 //! # 线程纪律
 //! 句柄只在解码线程内部创建/使用/释放（裸指针非 `Send`，对齐旧版的「不跨线程搬 reader」）。
@@ -41,7 +41,7 @@ pub type DecodedFrame = (f64, u32, u32, Vec<u8>);
 
 /// 音频顶层参数。
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)] // cdylib 侧（video-ffmpeg 的 ParamFFI→AudioParams）在用；主侧暂不直接构造
+#[allow(dead_code)] // cdylib 侧（media-ffmpeg 的 ParamFFI→AudioParams）在用；主侧暂不直接构造
 pub struct AudioParams {
     /// 输出采样率（统一重采样到该率）。
     pub sample_rate: u32,
@@ -53,7 +53,7 @@ pub struct AudioParams {
 
 // ---------------- 运行时 FFI 桥 ----------------
 
-/// 与 `video-ffmpeg` 的 `ParamFFI` 布局一致。
+/// 与 `media-ffmpeg` 的 `ParamFFI` 布局一致。
 #[repr(C)]
 struct ParamFFI {
     width: u32,
@@ -197,7 +197,7 @@ struct Bridge {
 }
 
 fn find_lib() -> std::path::PathBuf {
-    let name = "video_ffmpeg.dll";
+    let name = "media_ffmpeg.dll";
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
@@ -257,7 +257,7 @@ fn load_bridge() -> Option<Bridge> {
     })
 }
 
-/// 视频运行库是否可用（`video_ffmpeg.dll` 与其 FFmpeg 依赖能否被加载，进程内缓存一次）。
+/// 视频运行库是否可用（`media_ffmpeg.dll` 与其 FFmpeg 依赖能否被加载，进程内缓存一次）。
 /// 缺库 → false → 查看器在窗口内报错而非害 exe 无法启动。
 pub fn available() -> bool {
     bridge().is_some()
@@ -366,7 +366,7 @@ pub fn hw_blacklist_clear_for_test() {
 
 // ---------------- 视频 Reader ----------------
 
-/// 可 seek 的持久视频解码器（运行时桥接 `video_ffmpeg.dll`）。**非 `Send`**：
+/// 可 seek 的持久视频解码器（运行时桥接 `media_ffmpeg.dll`）。**非 `Send`**：
 /// 句柄只在解码线程本地创建/使用/释放（对齐旧版纪律）。
 pub struct VideoReader {
     handle: Handle,
@@ -394,7 +394,7 @@ impl VideoReader {
     /// 同 [`Self::open`]，但 sws 输出按「长边 ≤ `max_dim`」封顶下采样（在 cdylib 内完成）。
     /// `params()` 仍报告源宽高——上层用它保持原始宽高比；逐帧输出尺寸见 [`DecodedFrame`]。
     pub fn open_scaled(path: &Path, max_dim: u32) -> Result<Self> {
-        let b = bridge().context("视频运行库不可用（缺 video_ffmpeg.dll 或 FFmpeg 运行库）")?;
+        let b = bridge().context("视频运行库不可用（缺 media_ffmpeg.dll 或 FFmpeg 运行库）")?;
         let cpath = utf8_cstr(path)?;
         let mut handle: Handle = std::ptr::null_mut();
         let rc = unsafe { (b.open_video)(cpath.as_ptr(), max_dim, &mut handle) };
@@ -432,7 +432,7 @@ impl VideoReader {
         if hw_path_blacklisted(path) {
             return Self::open_scaled(path, max_dim);
         }
-        let b = bridge().context("视频运行库不可用（缺 video_ffmpeg.dll 或 FFmpeg 运行库）")?;
+        let b = bridge().context("视频运行库不可用（缺 media_ffmpeg.dll 或 FFmpeg 运行库）")?;
         let cpath = utf8_cstr(path)?;
         let mut handle: Handle = std::ptr::null_mut();
         let rc = unsafe { (b.open_video_hw_prefer)(cpath.as_ptr(), max_dim, &mut handle) };
@@ -604,7 +604,7 @@ impl VideoReader {
     /// 尺寸硬解、**不做** sws——帧尺寸即源尺寸（[`HwFrame`] 自带宽高）。`cap` 参数无意义
     /// （仅接口对齐软解 `open_scaled`）；返回 reader 的 `source_cap()` 恒 1（HW 帧不走回读缓冲）。
     pub fn open_hw(path: &Path, device: usize, device_context: usize) -> Result<Self> {
-        let b = bridge().context("视频运行库不可用（缺 video_ffmpeg.dll 或 FFmpeg 运行库）")?;
+        let b = bridge().context("视频运行库不可用（缺 media_ffmpeg.dll 或 FFmpeg 运行库）")?;
         let cpath = utf8_cstr(path)?;
         let mut handle: Handle = std::ptr::null_mut();
         let rc = unsafe {
@@ -692,7 +692,7 @@ pub struct HwFrame {
 // ---------------- 音频 Reader ----------------
 
 /// 可 seek 的音频解码器：把源音轨统一重采样为 **F32 交错立体声**（`out_rate` Hz）。
-/// 行为与旧版一致；解码与重采样在 `video_ffmpeg.dll` 内完成。
+/// 行为与旧版一致；解码与重采样在 `media_ffmpeg.dll` 内完成。
 pub struct AudioReader {
     handle: Handle,
 }
@@ -709,7 +709,7 @@ impl Drop for AudioReader {
 impl AudioReader {
     /// 打开媒体音轨并重采样到 `sample_rate`/立体声/F32 交错。
     pub fn open_pcm_f32(path: &Path, sample_rate: u32) -> Result<Self> {
-        let b = bridge().context("视频运行库不可用（缺 video_ffmpeg.dll 或 FFmpeg 运行库）")?;
+        let b = bridge().context("视频运行库不可用（缺 media_ffmpeg.dll 或 FFmpeg 运行库）")?;
         let cpath = utf8_cstr(path)?;
         let mut handle: Handle = std::ptr::null_mut();
         let rc = unsafe { (b.open_audio)(cpath.as_ptr(), sample_rate, &mut handle) };
@@ -881,7 +881,7 @@ impl SubtitleReader {
 
 /// 仅测试构建存在：当前时间应显示的字幕（生产显示走 `crate::subtitle::find_active_subtitle`；
 /// 本测试读口**直接委托它**——单一真值、重叠窗口"最近开始"口径不漂移；FFI
-/// `vff_subtitle_at` 在 video-ffmpeg 侧同款语义，见其 `active_subtitle_index`）。
+/// `vff_subtitle_at` 在 media-ffmpeg 侧同款语义，见其 `active_subtitle_index`）。
 #[cfg(test)]
 impl SubtitleReader {
     pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
@@ -911,11 +911,11 @@ mod tests {
     /// 字幕 FFI 全链路回归（评审补）：`SubtitleReader::open` 经
     /// `vff_open_subtitle → count → get_info → get_text` 取回 `SubtitleEntry`，
     /// 验证 UTF-8 长度/缓冲往返不截断、首条窗口与文本与 cdylib 侧提取一致。
-    /// 缺夹具 SKIP（与 video-ffmpeg 侧同口径，SKIP 是常态不是回归）。
+    /// 缺夹具 SKIP（与 media-ffmpeg 侧同口径，SKIP 是常态不是回归）。
     #[test]
     fn subtitle_ffi_roundtrip_extracts_without_truncation() {
         if !available() {
-            eprintln!("SKIP: video_ffmpeg.dll 不可用");
+            eprintln!("SKIP: media_ffmpeg.dll 不可用");
             return;
         }
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/视频测试字幕.mkv");
@@ -964,12 +964,12 @@ mod tests {
     /// `active_subtitle_index`），在密集采样时间点上逐点断言两实现返回同一活动字幕
     /// **索引**（FFI 返回 `>=0` 为索引、`-1` 为无）。缺桥/缺夹具 SKIP 不 FAIL。
     ///
-    /// 这里的 `vff_subtitle_at` 是**真 FFI 调用**（走已加载的 `video_ffmpeg.dll`，
+    /// 这里的 `vff_subtitle_at` 是**真 FFI 调用**（走已加载的 `media_ffmpeg.dll`，
     /// 非本地镜像），对拍的是两份独立实现的口径是否漂移。
     #[test]
     fn subtitle_ffi_active_index_agrees_with_find_active_subtitle() {
         if !available() {
-            eprintln!("SKIP: video_ffmpeg.dll 不可用");
+            eprintln!("SKIP: media_ffmpeg.dll 不可用");
             return;
         }
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/视频测试字幕.mkv");
@@ -1006,7 +1006,7 @@ mod tests {
         times.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
 
         let Some(b) = bridge() else {
-            eprintln!("SKIP: video_ffmpeg.dll 不可用");
+            eprintln!("SKIP: media_ffmpeg.dll 不可用");
             return;
         };
         let mut mismatches: Vec<(f64, Option<usize>, Option<usize>)> = Vec::new();
@@ -1028,7 +1028,7 @@ mod tests {
         );
     }
 
-    /// 走完 `frames` 帧并积累每帧墙钟（EOF 则 seek(0) 复跑凑数，同 video-ffmpeg 姿势）。
+    /// 走完 `frames` 帧并积累每帧墙钟（EOF 则 seek(0) 复跑凑数，同 media-ffmpeg 姿势）。
     fn collect(r: &mut VideoReader, frames: usize) -> Vec<f64> {
         let mut out: Vec<f64> = Vec::with_capacity(frames);
         let cap = r.source_cap();
@@ -1059,7 +1059,7 @@ mod tests {
     #[ignore = "手动测量用"]
     fn bench_frame_alloc_paths() {
         if !available() {
-            eprintln!("SKIP: video_ffmpeg.dll 不可用");
+            eprintln!("SKIP: media_ffmpeg.dll 不可用");
             return;
         }
         let path = bench_video();

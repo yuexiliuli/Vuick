@@ -2,7 +2,7 @@
 //!
 //! # 为什么要拆成独立 cdylib
 //! 主 exe 若直接链接 `ffmpeg_next` 会得到 FFmpeg shared DLL 的**加载时静态导入**，缺库时
-//! exe 根本无法启动。把解码内核独立成 `video_ffmpeg.dll` 后，主 exe 只在用户真正打开视频
+//! exe 根本无法启动。把解码内核独立成 `media_ffmpeg.dll` 后，主 exe 只在用户真正打开视频
 //! 时用 `LoadLibrary` 载入本库；本库及其依赖的 FFmpeg DLL 缺失 → 加载失败 → 主程序在窗口内
 //! 提示「缺少视频运行库」，而 exe 本身可正常启动、其它功能不受影响。
 //!

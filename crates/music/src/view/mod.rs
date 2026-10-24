@@ -167,7 +167,7 @@ impl MusicView {
     /// toast 过期清理。空闲（非播放）不 notify → 不持续重绘（K12）。
     fn on_tick(&mut self, cx: &mut Context<Self>) {
         self.player.update(cx, |p, cx| p.tick(cx));
-        // 播放错误浮现（如缺 video_ffmpeg.dll / 打开失败）：仅在错误值**变化**时弹一次
+        // 播放错误浮现（如缺 media_ffmpeg.dll / 打开失败）：仅在错误值**变化**时弹一次
         // toast，避免每拍重复；错误清除后记录复位（下次再错能再弹）。
         let err = self.player.read(cx).error().map(ToString::to_string);
         if err.as_deref() != self.last_error.as_deref() {

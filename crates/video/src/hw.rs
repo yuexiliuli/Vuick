@@ -60,7 +60,7 @@ pub struct WorkerD3D {
 }
 
 /// 建 worker 设备：硬件驱动优先、WARP 兜底；两者都不可用 → `None`（调用方回退 SAFE 路径）。
-/// 与 `video-ffmpeg` 的 `hw_external_tests` 同款姿势（生产可调，非 cfg(test)）。
+/// 与 `media-ffmpeg` 的 `hw_external_tests` 同款姿势（生产可调，非 cfg(test)）。
 pub fn create_worker_d3d11_device() -> Option<WorkerD3D> {
     fn attempt(driver: D3D_DRIVER_TYPE) -> Option<(ID3D11Device, ID3D11DeviceContext)> {
         let adapter: Option<&windows::Win32::Graphics::Dxgi::IDXGIAdapter> = None; // null adapter = 按 driver type 自选

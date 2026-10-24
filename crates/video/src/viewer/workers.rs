@@ -14,7 +14,7 @@ impl super::VideoViewer {
                 let _ = weak.update(cx, |this, cx| {
                     this.loading = false;
                     this.load_error = Some(
-                        "缺少视频运行库（video_ffmpeg.dll 或 avcodec-63.dll / avformat-63.dll 等 FFmpeg 运行库），视频功能不可用。请把它们放到程序 exe 同目录后重新打开。"
+                        "缺少视频运行库（media_ffmpeg.dll 或 avcodec-63.dll / avformat-63.dll 等 FFmpeg 运行库），视频功能不可用。请把它们放到程序 exe 同目录后重新打开。"
                             .to_string(),
                     );
                     cx.notify();
@@ -340,7 +340,7 @@ impl super::VideoViewer {
             let mut hw_fail_count: u32 = 0;
             // 最近一次成功解码的帧 pts（重开软解时的续播位置；一帧未解过则 = seek 落点）
             let mut resume_pts = cmd.target;
-            // seek 预滚过滤：ffmpeg seek 回拉到目标前关键帧（video-ffmpeg decode.rs 的
+            // seek 预滚过滤：ffmpeg seek 回拉到目标前关键帧（media-ffmpeg decode.rs 的
             // seek 文档注明「调用方须丢弃 pts < 目标的帧」）；不丢的话，keyframe→落点
             // 整段帧会被主线程排空当「迟到帧」快速连放 = seek 后视频加速/一闪而过。
             // 规则：落点前的预滚帧只保留最新一帧（≈落点前一帧，保证排空先有帧可上屏、

@@ -4,7 +4,7 @@
 //! 注入解码器 → `next_frame_hw` 断言纹理句柄 / 数组下标 / pts / 宽高 / 帧池槽位回收。
 //!
 //! 跑法：ffmpeg 的 cdylib 内 FFmpeg 操作须串行（同既有 decode 测试纪律）——
-//! `cargo test -p video-ffmpeg hw_external -- --nocapture --test-threads=1`。
+//! `cargo test -p media-ffmpeg hw_external -- --nocapture --test-threads=1`。
 //! 本机无可用 D3D11 设备（硬件 + WARP 都建不起）或解码器不支持时打印 SKIP 不 FAIL。
 
 use crate::decode::{HwFrame, VideoReader};

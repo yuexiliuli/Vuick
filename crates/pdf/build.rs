@@ -5,7 +5,7 @@
 //! 临时目录再动态加载。若本机没有该 dll（如克隆后 resources/ 未就位），则不嵌入，
 //! 运行时按磁盘 candidate 查找或给出明确报错——避免因缺文件导致编译直接失败。
 //!
-//! FFmpeg 与主 exe 无关：解码内核在独立 cdylib（工作区成员 `video-ffmpeg`）里，
+//! FFmpeg 与主 exe 无关：解码内核在独立 cdylib（工作区成员 `media-ffmpeg`）里，
 //! 主程序运行时经 libloading 加载它；FFmpeg 的链接由该成员内的 `ffmpeg-sys-next`
 //! 自行处理（需 `FFMPEG_DIR` / `LIBCLANG_PATH` 环境变量，见 scripts/setup-ffmpeg.ps1）。
 //!

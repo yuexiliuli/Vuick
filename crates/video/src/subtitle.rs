@@ -185,7 +185,7 @@ mod tests {
         assert!(find_active_subtitle(&ov, 4.5).is_none());
     }
 
-    /// 对拍代表性样例集（与 `video-ffmpeg` crate `decode/tests.rs` 的
+    /// 对拍代表性样例集（与 `media-ffmpeg` crate `decode/tests.rs` 的
     /// `active_subtitle_index_edge_case_battery_cross_check` **逐字同源**，两侧同一份数据、
     /// 同一组采样点断言同一索引）：覆盖 0 时刻起点、相邻紧贴（前条 end == 后条 start）、
     /// 重叠跨段（前者窗口包裹后者起点）、窗口间隙、尾部越界、空集。
