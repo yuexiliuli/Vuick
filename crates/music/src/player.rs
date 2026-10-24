@@ -88,6 +88,15 @@ pub struct MusicPlayer {
     /// 递增。主区列表渲染按它做「过滤/分组显示模型缓存」失效键——搜索词不变且本计数不变
     /// 时复用缓存，避免每帧重过滤 + 深克隆 `Track`（性能优化第二步）。
     mutation: u64,
+    /// 异步扫库装配态：`load_dir` 已把目录遍历/读 .lrc/找封面移出主线程（后台执行），完成前
+    /// 此旗置真——UI 显示「正在扫描」空态；完成后 [`Self::commit_scan`] 一次性提交库并置假。
+    scanning: bool,
+    /// 扫库代次：每次 `load_dir` 递增，异步结果在 `commit_scan` 前比对——换目录/重扫时旧任务
+    /// 结果作废（防竞态覆盖新库）。时长探测批量任务也记录它，scan 换代即丢弃（下标已过期）。
+    scan_gen: u64,
+    /// `play_path` 待播路径：目标不在当前库时以父目录异步重扫，扫完在 `commit_scan` 中按路径
+    /// 重定位并播放（保持「播放外部文件」语义不被异步化打断）。
+    pending_path: Option<PathBuf>,
 }
 
 impl MusicPlayer {
@@ -120,6 +129,9 @@ impl MusicPlayer {
             scrubbing: false,
             flush_seen: Cell::new(false),
             mutation: 0,
+            scanning: false,
+            scan_gen: 0,
+            pending_path: None,
         }
     }
 
@@ -173,15 +185,43 @@ impl MusicPlayer {
         }
     }
 
-    /// 刷新音乐库（重扫 + 按艺术家分组 + 后台探测时长）；当前播放曲目若仍在列保持
-    /// `current`/`queue` 按路径重定位（重扫后下标可能漂移）。不打断播放。
+    /// 刷新音乐库（异步重扫 + 按艺术家分组 + 后台批量探测时长）。**目录遍历 + 逐曲读 .lrc +
+    /// 找封面全部移出主线程**（后台 executor `scan_dir`）：本方法只置装配态并派任务返回，主线程
+    /// 不再同步空等（大目录启动「黑 gap」消除）；扫描完成 [`Self::commit_scan`] 一次性提交库 +
+    /// **一次 notify** + 触发批量时长探测。当前播放曲目若仍在列保持 `current`/`queue` 按路径
+    /// 重定位（重扫后下标可能漂移）。不打断播放。换目录重扫由 `scan_gen` 作废旧结果（防竞态）。
     pub fn load_dir(&mut self, dir: impl AsRef<Path>, cx: &mut Context<Self>) {
         let dir = dir.as_ref().to_path_buf();
-        // 先按路径留底，再整体替换（重扫后下标漂移，用路径重定位）
+        self.scanning = true;
+        self.scan_gen = self.scan_gen.wrapping_add(1);
+        let scan_id = self.scan_gen;
+        let scanned_dir = dir.clone();
+        let weak = cx.weak_entity();
+        cx.notify(); // 装配态（「正在扫描」）立即可见
+        cx.spawn(async move |_, cx| {
+            let scanned = cx
+                .background_executor()
+                .spawn(async move { scan_dir(&scanned_dir) })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.scan_gen != scan_id {
+                    return; // 已被更新扫描取代：丢弃旧结果，防竞态覆盖
+                }
+                this.commit_scan(dir, scanned, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 后台扫描完成的主线程收口：整体置换库 + 重定位当前曲/队列 + 一次 notify + 派批量时长
+    /// 探测。只由异步 scan 任务在 `scan_gen` 未过期时调用（主线程串行，无竞态）。
+    fn commit_scan(&mut self, dir: PathBuf, scanned: Vec<Track>, cx: &mut Context<Self>) {
+        // 先按路径留底，再整体替换（重扫后下标漂移，用路径重定位）。
         let old_paths: Vec<PathBuf> = self.library.iter().map(|t| t.path.clone()).collect();
-        self.library = scan_dir(&dir);
+        self.library = scanned;
         self.mix_groups = build_mix_groups(&self.library);
         self.dir = Some(dir);
+        self.scanning = false;
         // 库整体替换 → 视图侧「过滤/分组显示模型」缓存失效。
         self.mutation += 1;
         let reidx = |i: usize, lib: &[Track]| {
@@ -207,13 +247,23 @@ impl MusicPlayer {
             None => 0,
         };
         self.error = None;
+        // 外部文件待播：新库就绪后按路径重定位播放（play_path 的异步延续）。
+        if let Some(p) = self.pending_path.take() {
+            if let Some(idx) = self.library.iter().position(|t| t.path == *p) {
+                cx.notify();
+                self.play_track(idx, cx);
+                self.probe_durations(cx);
+                return;
+            }
+            self.error = Some(format!("音频不在库中：{}", p.display()));
+        }
         cx.notify();
         self.probe_durations(cx);
     }
 
-    /// 后台逐个探测曲目时长（open+params+drop），完成一个即回主线程更新该 track 的
-    /// `duration` 并 notify；失败/无 dll 保持 0。采样率沿用 sink（未开则 44_100，
-    /// duration 与速率无关）。
+    /// 后台批量探测曲目时长（open+params+drop）：**整批攒齐后一次 notify**——消除旧实现
+    /// 「每首完成即整树 notify×N」的启动尖峰。失败/无 dll 保持 0。采样率沿用 sink
+    /// （未开则 44_100，duration 与速率无关）。`scan_gen` 变更（换库重扫）即整批丢弃。
     fn probe_durations(&mut self, cx: &mut Context<Self>) {
         let targets: Vec<(usize, PathBuf)> = self
             .library
@@ -226,22 +276,41 @@ impl MusicPlayer {
             return;
         }
         let rate = self.sink.as_ref().map(|s| s.sample_rate()).unwrap_or(44_100);
+        let scan_gen = self.scan_gen;
         let weak = cx.weak_entity();
         cx.spawn(async move |_, cx| {
-            for (i, path) in targets {
-                let d = cx
-                    .background_executor()
-                    .spawn(async move { probe_duration(&path, rate).unwrap_or(0.0) })
-                    .await;
-                let _ = weak.update(cx, |this, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out = Vec::with_capacity(targets.len());
+                    for (i, path) in &targets {
+                        out.push((*i, probe_duration(path, rate).unwrap_or(0.0)));
+                    }
+                    out
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.scan_gen != scan_gen {
+                    return; // 库已换代：本次探测下标已失效，丢弃
+                }
+                let mut any = false;
+                for (i, d) in results {
                     if let Some(t) = this.library.get_mut(i) {
                         t.duration = d;
-                        cx.notify();
+                        any = true;
                     }
-                });
-            }
+                }
+                if any {
+                    cx.notify(); // 整批一次
+                }
+            });
         })
         .detach();
+    }
+
+    /// 异步扫库装配态（UI 空态提示用）。
+    pub fn scanning(&self) -> bool {
+        self.scanning
     }
 
     /// 播放 `library[idx]`：queue 空则先建全库队列（shuffle 洗牌）；`idx` 不在队列则
@@ -379,23 +448,22 @@ impl MusicPlayer {
     }
 
     /// 播放指定路径的音频文件（shell 集成入口）：先在当前 library 里按路径找下标；
-    /// 未找到（如路径在配置目录之外）→ 以该文件**父目录**作该次库重扫，再按路径播放。
-    /// 复用 `load_dir`/`play_track`，不重复建队列逻辑。
+    /// 未找到（如路径在配置目录之外）→ 以该文件**父目录**作该次库异步重扫，扫完在
+    /// [`Self::commit_scan`] 中按路径重定位播放（`pending_path`）；父目录相同但文件新加入
+    /// 也会重扫到。复用 `load_dir`/`play_track`，不重复建队列逻辑。
     pub fn play_path(&mut self, path: impl AsRef<Path>, cx: &mut Context<Self>) {
         let path = path.as_ref().to_path_buf();
         if let Some(idx) = self.library.iter().position(|t| t.path == path) {
             return self.play_track(idx, cx);
         }
-        // 路径不在当前库：以文件父目录重扫（父目录相同但文件新加入也会重扫到）。
+        // 路径不在当前库：以文件父目录异步重扫，扫完按路径重定位播放。
         if let Some(parent) = path.parent() {
+            self.pending_path = Some(path.clone());
             self.load_dir(parent, cx);
-        }
-        let Some(idx) = self.library.iter().position(|t| t.path == path) else {
-            self.error = Some(format!("音频不在库中：{}", path.display()));
-            cx.notify();
             return;
-        };
-        self.play_track(idx, cx);
+        }
+        self.error = Some(format!("音频不在库中：{}", path.display()));
+        cx.notify();
     }
 
     /// seek 到 `seconds`（clamp 到 [0, 探测时长]）；flush 在 worker 内完成。
@@ -1122,6 +1190,9 @@ mod tests {
         cx.update(|app| {
             player.update(app, |p, cx| p.load_dir(&dir, cx));
         });
+        // load_dir 已异步扫库：排空后台 scan→commit（真 dll 路径下才到此）。
+        cx.background_executor.run_until_parked();
+        cx.background_executor.run_until_parked();
         cx.update(|app| {
             player.update(app, |p, cx| p.play_track(0, cx));
         });

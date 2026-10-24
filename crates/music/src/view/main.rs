@@ -394,7 +394,14 @@ impl super::MusicView {
             )
             .child(self.render_song_header())
             .child(if list.total == 0 {
-                super::empty_state("没有匹配的歌曲", "清空搜索或换个关键词").into_any_element()
+                // 空态：异步扫库装配中给弱提示，否则真无歌（搜索无命中）。
+                let p = self.player.read(cx);
+                if p.scanning() && p.library().is_empty() {
+                    super::empty_state("正在扫描音乐库…", "大目录首次装载需要片刻")
+                        .into_any_element()
+                } else {
+                    super::empty_state("没有匹配的歌曲", "清空搜索或换个关键词").into_any_element()
+                }
             } else {
                 self.render_list(&list, cx)
             })
@@ -562,13 +569,21 @@ impl super::MusicView {
 
     fn render_library(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let list = self.main_list_for(MainSection::Library, cx);
+        let scanning = {
+            let p = self.player.read(cx);
+            p.scanning() && p.library().is_empty()
+        };
         div()
             .flex_1()
             .min_h(px(0.))
             .flex()
             .flex_col()
             .child(self.section_title("音乐库"))
-            .child(if list.total == 0 {
+            .child(if scanning {
+                // 异步扫库装配态：加载中给弱提示，扫完一次性提交（commit_scan → 一次 notify）。
+                super::empty_state("正在扫描音乐库…", "大目录首次装载需要片刻")
+                    .into_any_element()
+            } else if list.total == 0 {
                 super::empty_state("暂无歌曲", "点开一个音乐文件夹加载曲库").into_any_element()
             } else {
                 self.render_list(&list, cx)

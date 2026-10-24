@@ -41,6 +41,16 @@ fn pump_ticks(cx: &mut VisualTestContext, rounds: usize) {
     }
 }
 
+/// 异步扫库驱动（夹具/测试共用）：`load_dir` 已异步化——扫描（目录遍历 + 读 .lrc + 找封面）
+/// 在后台 executor 执行、完成后主线程一次性提交（并触发批量时长探测）。已知 pending 的
+/// 测试若在 read library 前不排空，会看到空库；此 helper 把「scan → commit → probe」链全部
+/// 落地（fake 调度器 `run_until_parked` 即执行背景 future）。同步旧实现下调用为无害空操作。
+fn drain_scan(cx: &mut TestAppContext) {
+    for _ in 0..3 {
+        cx.background_executor.run_until_parked();
+    }
+}
+
 /// 建含「1 首有同名 png 封面 + 1 首无封面」的临时库播放器。
 fn library_with_cover(cx: &mut TestAppContext) -> (std::path::PathBuf, Entity<MusicPlayer>) {
     let dir = std::env::temp_dir().join(format!("gpui-music-cover-reg-{}", std::process::id()));
@@ -53,6 +63,7 @@ fn library_with_cover(cx: &mut TestAppContext) -> (std::path::PathBuf, Entity<Mu
     cx.update(|app| {
         player.update(app, |p, cx| p.load_dir(&dir, cx));
     });
+    drain_scan(cx);
     (dir, player)
 }
 
@@ -154,10 +165,10 @@ fn write_tiny_wav_short(dir: &Path, name: &str) {
     std::fs::write(dir.join(name), wav).unwrap();
 }
 
-/// 建含 `n` 曲的临时库：5 位艺术家轮转（`艺人{i%5}`）+ 唯一歌名（Library 分组、Home 热门表
-/// 虚拟化回归用）。目录名带全局自增序号防并行互删。
+/// 建含 `n` 曲的临时库**目录 + 播放器（未 load_dir）**：5 位艺术家轮转（`艺人{i%5}`）+ 唯一歌名。
+/// 目录名带全局自增序号防并行互删。不 load_dir——扫库探针/竞态测试需在 load_dir 前挂 observe。
 static N_LIB_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
-fn library_with_n(cx: &mut TestAppContext, n: usize) -> Entity<MusicPlayer> {
+fn n_library_dir(cx: &mut TestAppContext, n: usize) -> (std::path::PathBuf, Entity<MusicPlayer>) {
     let seq = N_LIB_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "gpui-music-nlib-{}-{seq}",
@@ -169,9 +180,17 @@ fn library_with_n(cx: &mut TestAppContext, n: usize) -> Entity<MusicPlayer> {
         write_tiny_wav_short(&dir, &format!("艺人{} - 歌曲{i}.wav", i % 5));
     }
     let player: Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+    (dir, player)
+}
+
+/// 建含 `n` 曲且已完成异步扫库（load_dir + [`drain_scan`]）的播放器——虚拟化/性能探针等测试
+/// 的现成夹具（读 library 前库已就绪）。
+fn library_with_n(cx: &mut TestAppContext, n: usize) -> Entity<MusicPlayer> {
+    let (dir, player) = n_library_dir(cx, n);
     cx.update(|app| {
         player.update(app, |p, cx| p.load_dir(&dir, cx));
     });
+    drain_scan(cx);
     player
 }
 
@@ -204,7 +223,106 @@ async fn render_main_lists_wallclock_200(cx: &mut TestAppContext) {
     );
 }
 
-/// 建一个含 3 曲的临时音乐库播放器（中文文件名）。目录名带全局自增序号：多测试并行
+/// 扫库/时长探测 **notify 预算探针**（K27 留数；仅用旧/新两态都存在的稳定 API，可对改造前/
+/// 后代跑）：`load_dir`（现异步扫库）+ 批量时长探测完成后，player 实体收到的 notify 总次数。
+/// before（同步扫 + 每首 notify）= 1(load_dir)+N(逐首探测) ≈ N+1；after（异步单次提交 + 批量
+/// 一次 notify）≈ 3。断言 ≤ 8（远小于 N）——防「大库启动一连串整树重绘尖峰」回潮。
+#[gpui::test]
+async fn scan_execute_notify_budget(cx: &mut TestAppContext) {
+    let n = 20;
+    let (dir, player) = n_library_dir(cx, n);
+    let notifies = Rc::new(Cell::new(0usize));
+    cx.update(|app| {
+        let c = notifies.clone();
+        app.observe(&player, move |_, _| c.set(c.get() + 1))
+            .detach();
+    });
+    cx.update(|app| {
+        player.update(app, |p, cx| p.load_dir(&dir, cx));
+    });
+    // 驱动：新=后台 scan→commit→probe；旧=同步（本循环为无害排空）。
+    for _ in 0..3 {
+        cx.background_executor.run_until_parked();
+    }
+    let k = notifies.get();
+    let len = cx.update(|app| player.read(app).library().len());
+    assert_eq!(len, n, "扫库应完成（库内容照旧）");
+    eprintln!("[perf] scan_execute_notify_budget: notify_count={k} library_len={len} (N={n})");
+    assert!(
+        k <= 8,
+        "load_dir+批量探测完成的 player notify 应 ≤ 小常数（旧实现每首 1 次 ≈ N+1={}），实得 {k}",
+        n + 1
+    );
+}
+
+/// 异步装配态：`load_dir` 后立即处于「扫描中」装配态（主线程不再同步空等），扫描完成驱动后
+/// 库出现、装配态复位；装配态渲染不 panic（空态可读）。
+#[gpui::test]
+async fn load_dir_async_shows_assembly_then_commits(cx: &mut TestAppContext) {
+    let (dir, player) = n_library_dir(cx, 8);
+    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 发起异步扫库：未驱动前即立装配态。
+    wcx.cx.update(|app| {
+        player.update(app, |p, cx| p.load_dir(&dir, cx));
+    });
+    let (scanning, len) = wcx.cx.read(|app| {
+        let p = player.read(app);
+        (p.scanning(), p.library().len())
+    });
+    assert!(scanning, "load_dir 后应立置装配态（扫描完成前不再同步空等）");
+    assert_eq!(len, 0, "扫描未完成前库应仍为空（后台执行，主线程不阻塞）");
+    // 装配态渲染照常（空态/「正在扫描」提示，不 panic）。
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 驱动扫库完成 → 一次性提交库 + 装配态复位。
+    drain_scan(&mut wcx.cx);
+    let (scanning2, len2) = wcx.cx.read(|app| {
+        let p = player.read(app);
+        (p.scanning(), p.library().len())
+    });
+    assert!(
+        !scanning2 && len2 == 8,
+        "扫库完成应复位装配态且库就绪：scanning={scanning2} len={len2}"
+    );
+    // 完成后库可直接播放（沿用既有路径，语义不破坏）。
+    wcx.cx.update(|app| {
+        player.update(app, |p, cx| p.play_track(0, cx));
+    });
+    let cur = wcx.cx.read(|app| player.read(app).current());
+    assert_eq!(cur, Some(0), "扫完即可播放（current=0）");
+}
+
+/// 换目录竞态：扫描中途再 load_dir → 最终库是**新目录**（旧任务结果作废），无跨目录混入。
+#[gpui::test]
+async fn load_dir_mid_scan_switch_directory_discards_stale(cx: &mut TestAppContext) {
+    let (dir_a, player) = n_library_dir(cx, 5);
+    let (dir_b, _unused) = n_library_dir(cx, 9);
+    // 未排空即快速发起第二个目录（模拟用户换目录/重扫）。
+    cx.update(|app| {
+        player.update(app, |p, cx| p.load_dir(&dir_a, cx));
+    });
+    cx.update(|app| {
+        player.update(app, |p, cx| p.load_dir(&dir_b, cx));
+    });
+    drain_scan(cx);
+    let (scanning, len, dir) = cx.read(|app| {
+        let p = player.read(app);
+        (p.scanning(), p.library().len(), p.dir().map(|d| d.to_path_buf()))
+    });
+    assert!(!scanning, "最终应结束装配态");
+    assert_eq!(len, 9, "最终库应是新目录（9 首），旧扫描不得覆盖：实得 {len}");
+    assert_eq!(dir.as_deref(), Some(dir_b.as_path()), "dir 应为新目录");
+    let paths_ok = cx.read(|app| {
+        player
+            .read(app)
+            .library()
+            .iter()
+            .all(|t| t.path.starts_with(&dir_b))
+    });
+    assert!(paths_ok, "库中不应混入旧目录曲目（A 目录内容被作废）");
+}/// 建一个含 3 曲的临时音乐库播放器（中文文件名）。目录名带全局自增序号：多测试并行
 /// 共用同名会互相删写 → 不稳定（与 `player_with_lrc` 同款隔离）。
 static LIB_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
 fn player_with_library(cx: &mut TestAppContext) -> Entity<MusicPlayer> {
@@ -222,6 +340,7 @@ fn player_with_library(cx: &mut TestAppContext) -> Entity<MusicPlayer> {
     cx.update(|app| {
         player.update(app, |p, cx| p.load_dir(&dir, cx));
     });
+    drain_scan(cx);
     player
 }
 
@@ -730,6 +849,7 @@ fn player_with_lrc(cx: &mut TestAppContext, lrc: &str) -> Entity<MusicPlayer> {
     cx.update(|app| {
         player.update(app, |p, cx| p.load_dir(&dir, cx));
     });
+    drain_scan(cx);
     player
 }
 
@@ -951,6 +1071,7 @@ async fn lyrics_track_change_resets_follow(cx: &mut TestAppContext) {
     cx.update(|app| {
         player.update(app, |p, cx| p.load_dir(&dir, cx));
     });
+    drain_scan(cx);
     play_at_pos(&player, cx, 450.0);
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
