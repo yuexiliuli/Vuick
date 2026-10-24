@@ -248,7 +248,18 @@ impl AudioReader {
                     continue;
                 }
                 self.skip_until = -1.0; // 首个 ≥ 落点帧已就绪：后续正常顺序读
-                let mut out = ffmpeg::frame::Audio::empty();
+                // 上采样容量修复：ffmpeg-next `resampler.run` 对空输出帧按 `input.samples()`
+                // 分配容量（resampling/context.rs），上采样（out_rate>in_rate）时每块输出被
+                // nb_samples 截断到输入样本数——丢尾 → 播放偏快 + 块边界截断杂音（音乐播放器
+                // 44.1k→48k 声卡实测复现）。预先按速率比例把输出帧容量配足（含 +64 余量吸收
+                // swr 内部缓冲抖动），swr 写满真实样本、`samples()` 返回实际数，读取不受影响。
+                let d = self.resampler.output();
+                let in_rate = decoded.rate().max(1);
+                let in_nb = decoded.samples() as u64;
+                let out_nb = ((in_nb * u64::from(d.rate) + u64::from(in_rate) - 1)
+                    / u64::from(in_rate)) as usize
+                    + 64;
+                let mut out = ffmpeg::frame::Audio::new(d.format, out_nb, d.channel_layout);
                 self.resampler.run(&decoded, &mut out).context("音频重采样失败")?;
                 let samples = Self::collect_f32(&out);
                 if !samples.is_empty() {

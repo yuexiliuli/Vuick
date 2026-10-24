@@ -271,6 +271,50 @@ fn audio_drain_clears_resampler_residue() {
     assert!(r.next_pcm_f32().is_ok(), "排空后读取应当正常");
 }
 
+/// 回归（上采样容量截断）：ffmpeg-next `resampler.run` 对空输出帧按 `input.samples()`
+/// 分配容量（resampling/context.rs `run`），上采样（out_rate>in_rate）时 swr 每块最多
+/// 写出输入样本数 → 丢尾 → 播放偏快 + 块边界截断杂音（44.1k 源 -> 48k 设备实测复现，
+/// 音乐播放器 / 高采样率设备的视频共用此路径）。修复：`next_pcm_f32` 预先按速率比例
+/// 配足输出帧容量。本测试把夹具 48k 音轨按 96k 解码数秒，断言隐含输出率≈96k
+/// （修复前恒 ≈48k → FAIL；缺夹具 SKIP，同 viewer 约定）。
+#[test]
+fn audio_upsample_outputs_requested_rate() {
+    const OUT_RATE: u32 = 96_000;
+    let path = audio_fixture_or_skip!();
+    let mut r = AudioReader::open_pcm_f32(&path, OUT_RATE).unwrap();
+    let p = r.params();
+    assert_eq!(p.channels, 2, "应统一立体声");
+    // 解到 ≥4 秒即停（全曲解码对夹具太慢，测速足够）
+    let mut total_out = 0usize;
+    let mut blocks = 0usize;
+    let mut last_pts = 0.0f64;
+    loop {
+        match r.next_pcm_f32() {
+            Ok(Some((pts, samples))) => {
+                total_out += samples.len();
+                blocks += 1;
+                last_pts = pts;
+                if pts >= 4.0 {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => panic!("解码失败: {e}"),
+        }
+    }
+    assert!(blocks > 0, "应能解码出音频块");
+    assert!(last_pts >= 1.0, "应至少解码到 ≥1s（实际 {last_pts:.2}s）");
+    let implied = (total_out / 2) as f64 / last_pts;
+    let rel = (implied - f64::from(OUT_RATE)).abs() / f64::from(OUT_RATE);
+    eprintln!(
+        "audio {OUT_RATE}: blocks={blocks} total_samples={total_out} reached={last_pts:.2}s implied_rate={implied:.1} rel={rel:.4}"
+    );
+    assert!(
+        rel < 0.02,
+        "上采样输出率应≈{OUT_RATE}，实测 {implied:.1}（上采样截断未修，播放偏快+杂音）"
+    );
+}
+
 /// 双路径（硬件优先 / 软件回退）都必须产出尺寸正确、alpha 不透明的 BGRA 帧。
 #[test]
 fn hw_or_sw_path_both_output_valid_bgra() {
