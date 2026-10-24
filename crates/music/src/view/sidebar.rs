@@ -138,7 +138,7 @@ impl super::MusicView {
         };
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| match action {
             NavAction::Section(s) => this.set_section(s, cx),
-            NavAction::ComingSoon(t) => this.toast_msg(t),
+            NavAction::ComingSoon(t) => this.toast_msg(t, cx),
         });
         div()
             .id(label)
@@ -216,8 +216,8 @@ impl super::MusicView {
         for (name, dot) in groups {
             let id = format!("music-playlist-{name}");
             let tip = name.clone();
-            let cl = cx.listener(move |this: &mut MusicView, _ev, _w, _cx| {
-                this.toast_msg(format!("打开歌单：{tip}"));
+            let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
+                this.toast_msg(format!("打开歌单：{tip}"), cx);
             });
             let sel = name.clone();
             title.push(

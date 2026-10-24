@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use gpui::{AppContext as _, Bounds, Entity, MouseButton, Pixels, TestAppContext, VisualTestContext, px};
 
-use super::fullscreen::LYRIC_ROW_H;
+use super::lyrics::LYRIC_ROW_H;
 use super::icon::MusicIcon;
 use super::theme;
 use super::titlebar::{TITLE_BAR_H, max_icon};
@@ -1141,7 +1141,10 @@ fn bb_fs_tooltip_appears_and_anchors(cx: &mut TestAppContext) {
 /// 父 MusicView / eq 子视图 / 底栏子视图的 notify 次数；按调试构建每整树重建 ~42ms、
 /// 子视图 ~1ms 折算主线程占用 ms/s。
 /// before（真机语境）：父整树重建 = 15fps(动画 notify 父) + 4Hz(tick) ≈ 19 次/s；
-/// after：父 ≈ 父 tick 4Hz，eq 15fps × ~1ms、底栏心跳 ~8Hz × ~1ms 都落到各自子视图。
+/// 3B（底栏拆子视图后）：父 ≈ 父 tick 4Hz，eq 15fps × ~1ms、底栏心跳 ~8Hz × ~1ms；
+/// 4B（歌词/np 进度拆子视图后）：普通（非全屏）态父 tick **不再整树 notify** → 父 ≈ 0
+/// 次/s（稳态 0 重建），eq/底栏心跳照旧落到各自子视图（np/歌词子视图另有自己的心跳，
+/// 本条探针只数父/eq/底栏三处基线）。
 /// 断言只给宽区间（计时器对齐有抖动）；精确数值由 eprintln 留数（报告引用）。
 #[gpui::test]
 async fn lively_playback_1s_rebuild_rate_probe(cx: &mut TestAppContext) {
@@ -1201,8 +1204,8 @@ async fn lively_playback_1s_rebuild_rate_probe(cx: &mut TestAppContext) {
         (1.0 - after_ms_s / before_ms_s) * 100.0
     );
     assert!(
-        (3..=7).contains(&p),
-        "父整树重建应只剩父 tick 4Hz（≈4 次/秒），动画/心跳都别落父：实得 {p}"
+        (0..=1).contains(&p),
+        "普通态播放中父整树重建应≈0（歌词/np 已拆子视图；before=4Hz tick）：实得 {p}"
     );
     assert!(q >= 10, "eq 子视图应承接 ~15fps 动画 notify：实得 {q}");
     assert!(b >= 7, "底栏子视图应承接 ~8Hz 心跳 notify：实得 {b}");
@@ -1270,19 +1273,21 @@ fn play_at_pos(player: &Entity<MusicPlayer>, cx: &mut TestAppContext, pos_secs: 
 
 /// 按**当前实际播放位置**算自动跟随目标偏移（y，offset 值 = 负的句首坐标）。测试断言
 /// 一律与实际 active 比对：无设备时 position=seek_base（确定性）；有设备时若 Opened
-/// 接管时长、position 变化，预期也随之变化——断言始终成立。
+/// 接管时长、position 变化，预期也随之变化——断言始终成立。歌词状态已迁入子视图
+/// `lyrics_right`（右栏实例），本 helper 经其读滚动句柄与跟随算法。
 fn expected_follow_y(view: &Entity<MusicView>, cx: &mut VisualTestContext, n: usize) -> f32 {
     cx.update(|_w, app| {
-        view.update(app, |v, cx| {
-            let pos_ms = (v.player.read(cx).position() * 1000.0) as i64;
-            let active = v
+        let lyrics = view.read(app).lyrics_right.clone();
+        lyrics.update(app, |lv, cx| {
+            let pos_ms = (lv.player.read(cx).position() * 1000.0) as i64;
+            let active = lv
                 .player
                 .read(cx)
                 .current_track()
                 .and_then(|t| t.lyrics.clone())
                 .and_then(|l| l.active_index(pos_ms))
                 .unwrap_or(0);
-            -v.lyrics_follow_scroll_top(active, n)
+            -lv.lyrics_follow_scroll_top(active, n)
         })
     })
 }
@@ -1297,7 +1302,7 @@ async fn lyrics_long_scroll_covers_all_lines(cx: &mut TestAppContext) {
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
     let n = 30usize;
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx.cx.read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     // 内容总高 = n×行高（max_offset = 内容总高 − 视口高）；视口应已布局。
     let viewport = handle.bounds().size.height.as_f32();
     let max = handle.max_offset().y.as_f32();
@@ -1309,7 +1314,10 @@ async fn lyrics_long_scroll_covers_all_lines(cx: &mut TestAppContext) {
         n as f32 * LYRIC_ROW_H
     );
     // 顶部：物化窗口含第一行。
-    let top_win = wcx.update(|_w, app| view.update(app, |v, _| v.lyrics_visible_window(n)));
+    let top_win = wcx.update(|_w, app| {
+        let lv = view.read(app).lyrics_right.clone();
+        lv.update(app, |lv, _| lv.lyrics_visible_window(n))
+    });
     assert_eq!(top_win.0, 0, "顶部应物化第一行，实得 {:?}", top_win);
     // 滚轮：在容器上滚 → 偏移下滚（offset 更负）。
     let b = handle.bounds();
@@ -1335,13 +1343,19 @@ async fn lyrics_long_scroll_covers_all_lines(cx: &mut TestAppContext) {
         (off_bottom + max).abs() < 2.0,
         "滚到底 offset 应≈-max：{off_bottom} vs {max}"
     );
-    let bot_win = wcx.update(|_w, app| view.update(app, |v, _| v.lyrics_visible_window(n)));
+    let bot_win = wcx.update(|_w, app| {
+        let lv = view.read(app).lyrics_right.clone();
+        lv.update(app, |lv, _| lv.lyrics_visible_window(n))
+    });
     assert_eq!(bot_win.1, n, "滚到底应物化末行，实得 {:?}", bot_win);
     // 回顶：offset=0，物化窗口含首行。
     handle.set_offset(point(px(0.), px(0.)));
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
-    let top2_win = wcx.update(|_w, app| view.update(app, |v, _| v.lyrics_visible_window(n)));
+    let top2_win = wcx.update(|_w, app| {
+        let lv = view.read(app).lyrics_right.clone();
+        lv.update(app, |lv, _| lv.lyrics_visible_window(n))
+    });
     assert_eq!(top2_win.0, 0, "回顶应物化首行，实得 {:?}", top2_win);
 }
 
@@ -1352,7 +1366,9 @@ async fn lyrics_auto_follow_centers_active(cx: &mut TestAppContext) {
     play_at_pos(&player, cx, 450.0); // 450s → 第 15 句
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     let expected = expected_follow_y(&view, wcx, 30);
     let got = handle.offset().y.as_f32();
     assert!(
@@ -1375,7 +1391,9 @@ async fn lyrics_manual_scroll_pauses_then_resumes_after_3s(cx: &mut TestAppConte
     play_at_pos(&player, cx, 450.0);
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     let expected0 = expected_follow_y(&view, wcx, 30);
     assert!(
         (handle.offset().y.as_f32() - expected0).abs() < 2.0,
@@ -1387,7 +1405,8 @@ async fn lyrics_manual_scroll_pauses_then_resumes_after_3s(cx: &mut TestAppConte
     // 下一拍检测到手动 → 暂停跟随，offset 保持用户位置、不被 tick 拉回。
     pump_ticks(wcx, 1);
     assert!(
-        wcx.cx.read(|app| view.read(app).lyrics_manual_since.is_some()),
+        wcx.cx
+            .read(|app| view.read(app).lyrics_right.read(app).lyrics_manual_since.is_some()),
         "手动滚动应暂停跟随"
     );
     let off1 = handle.offset().y.as_f32();
@@ -1408,7 +1427,8 @@ async fn lyrics_manual_scroll_pauses_then_resumes_after_3s(cx: &mut TestAppConte
         "3 秒后应恢复跟随当前句：off3={off3} expected={expected}"
     );
     assert!(
-        wcx.cx.read(|app| view.read(app).lyrics_manual_since.is_none()),
+        wcx.cx
+            .read(|app| view.read(app).lyrics_right.read(app).lyrics_manual_since.is_none()),
         "恢复后 manual 应清空"
     );
 }
@@ -1423,7 +1443,9 @@ async fn lyrics_paused_manual_scroll_not_pulled_back(cx: &mut TestAppContext) {
     wcx.update(|_w, app| {
         player.update(app, |p, cx| p.pause(cx));
     });
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     handle.set_offset(gpui::point(px(0.), px(-120.)));
     wcx.run_until_parked();
     // 暂停态推远超 3 秒：不恢复跟随（非播放不动滚动，尊重手动浏览）。
@@ -1461,21 +1483,27 @@ async fn lyrics_track_change_resets_follow(cx: &mut TestAppContext) {
     // 滚动主信号，与 G/H 用例一致）。
     wheel_on_lyrics(wcx, &view);
     pump_ticks(wcx, 1);
-    assert!(wcx.cx.read(|app| view.read(app).lyrics_manual_since.is_some()));
+    assert!(
+        wcx.cx
+            .read(|app| view.read(app).lyrics_right.read(app).lyrics_manual_since.is_some())
+    );
     // 切到第 1 首（path 变化 → 跟随态复位 → 新曲从自动跟随开始，不沿用手动暂停）。
     wcx.update(|_w, app| {
         player.update(app, |p, _| p.test_start_playing(1));
     });
     pump_ticks(wcx, 3);
     let expected = expected_follow_y(&view, wcx, 2);
-    let got = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let got = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     let got = got.offset().y.as_f32();
     assert!(
         (got - expected).abs() < 2.0,
         "换曲后应复位并在新曲上跟随：got={got} expected={expected}"
     );
     assert!(
-        wcx.cx.read(|app| view.read(app).lyrics_manual_since.is_none()),
+        wcx.cx
+            .read(|app| view.read(app).lyrics_right.read(app).lyrics_manual_since.is_none()),
         "换曲后 manual 应复位清空"
     );
 }
@@ -1493,7 +1521,9 @@ async fn lyrics_edge_cases_no_panic(cx: &mut TestAppContext) {
         window.draw(app).clear(app);
     });
     w1.run_until_parked();
-    let max1 = w1.cx.read(|app| v1.read(app).lyrics_scroll.max_offset().y.as_f32());
+    let max1 = w1
+        .cx
+        .read(|app| v1.read(app).lyrics_right.read(app).lyrics_scroll.max_offset().y.as_f32());
     assert_eq!(max1, 0.0, "1 行歌词（内容≤视口）应无可滚范围，实得 {max1}");
 
     // 无歌词 + 无 current（未播放）：空态渲染不 panic。
@@ -1504,16 +1534,21 @@ async fn lyrics_edge_cases_no_panic(cx: &mut TestAppContext) {
         window.draw(app).clear(app);
     });
     w2.run_until_parked();
-    let max2 = w2.cx.read(|app| v2.read(app).lyrics_scroll.max_offset().y.as_f32());
+    let max2 = w2
+        .cx
+        .read(|app| v2.read(app).lyrics_right.read(app).lyrics_scroll.max_offset().y.as_f32());
     assert!(max2 >= 0.0, "空态下滚动容器也应可布局，实得 {max2}");
 }
 
 // ---- 真机复报回归：尾部持续滚动被 3 秒误恢复拉回 / 滚到底继续滚轮「闪」 ----
 
 /// 在歌词滚动容器上派发一次真实滚动事件（offset 已钳到界限时事件照样触发）。
+/// 状态迁入子视图后，容器句柄经 `lyrics_right`（右栏实例）读取。
 fn wheel_on_lyrics(wcx: &mut VisualTestContext, view: &Entity<MusicView>) {
     use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     let b = handle.bounds();
     let pos = point(
         px(b.origin.x.as_f32() + b.size.width.as_f32() * 0.5),
@@ -1537,13 +1572,18 @@ async fn lyrics_continuous_scroll_at_tail_never_jumps_back(cx: &mut TestAppConte
     play_at_pos(&player, cx, 450.0);
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     let max = handle.max_offset().y.as_f32();
     let tail = -max;
     // 用户滚到尾部（手动滚动）→ 下一拍检测手动。
     handle.set_offset(gpui::point(px(0.), px(tail)));
     pump_ticks(wcx, 1);
-    assert!(wcx.cx.read(|app| view.read(app).lyrics_manual_since.is_some()));
+    assert!(
+        wcx.cx
+            .read(|app| view.read(app).lyrics_right.read(app).lyrics_manual_since.is_some())
+    );
     // 持续滚动：每轮 = 尾部滚一轮 + 推 0.5s。总时长跨越 3s，但每轮滚轮都刷新计时。
     for i in 0..8usize {
         wheel_on_lyrics(wcx, &view);
@@ -1563,11 +1603,16 @@ async fn lyrics_stop_at_tail_resumes_after_3s(cx: &mut TestAppContext) {
     play_at_pos(&player, cx, 450.0);
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     let max = handle.max_offset().y.as_f32();
     handle.set_offset(gpui::point(px(0.), px(-max)));
     pump_ticks(wcx, 1); // 检测手动
-    assert!(wcx.cx.read(|app| view.read(app).lyrics_manual_since.is_some()));
+    assert!(
+        wcx.cx
+            .read(|app| view.read(app).lyrics_right.read(app).lyrics_manual_since.is_some())
+    );
     // 停手 3 秒内保持尾部。
     pump_ticks(wcx, 10); // +2.5s
     let off1 = handle.offset().y.as_f32();
@@ -1581,7 +1626,8 @@ async fn lyrics_stop_at_tail_resumes_after_3s(cx: &mut TestAppContext) {
         "停手满 3s 应恢复跟随当前句：off2={off2} expected={expected}"
     );
     assert!(
-        wcx.cx.read(|app| view.read(app).lyrics_manual_since.is_none()),
+        wcx.cx
+            .read(|app| view.read(app).lyrics_right.read(app).lyrics_manual_since.is_none()),
         "恢复后 manual 应清空"
     );
 }
@@ -1594,17 +1640,25 @@ async fn lyrics_tail_wheel_keeps_window_stable(cx: &mut TestAppContext) {
     play_at_pos(&player, cx, 450.0);
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     let max = handle.max_offset().y.as_f32();
     handle.set_offset(gpui::point(px(0.), px(-max)));
     pump_ticks(wcx, 1); // 检测手动
     // 尾部滚一轮：offset 钳位不动 → 连续两拍物化窗口一致。
     wheel_on_lyrics(wcx, &view);
     let off1 = handle.offset().y.as_f32();
-    let win1 = wcx.update(|_w, app| view.update(app, |v, _| v.lyrics_visible_window(30)));
+    let win1 = wcx.update(|_w, app| {
+        let lv = view.read(app).lyrics_right.clone();
+        lv.update(app, |lv, _| lv.lyrics_visible_window(30))
+    });
     pump_ticks(wcx, 2); // 未满 3s，不恢复
     let off2 = handle.offset().y.as_f32();
-    let win2 = wcx.update(|_w, app| view.update(app, |v, _| v.lyrics_visible_window(30)));
+    let win2 = wcx.update(|_w, app| {
+        let lv = view.read(app).lyrics_right.clone();
+        lv.update(app, |lv, _| lv.lyrics_visible_window(30))
+    });
     assert!(
         (off1 + max).abs() < 2.0 && (off2 + max).abs() < 2.0,
         "尾部滚轮 offset 应恒定钳在 max：off1={off1} off2={off2}"
@@ -1627,14 +1681,19 @@ async fn lyrics_overbound_offset_uses_clamped_window(cx: &mut TestAppContext) {
     play_at_pos(&player, cx, 450.0);
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
     let n = 30usize;
     let max = handle.max_offset().y.as_f32();
     assert!(max > 0.0, "多行长歌词应可滚 max={max}");
     // 模拟滚轮在底部「先加后钳」的瞬时态：offset 越界到 max + 2 行（layout 尚未钳回）。
     handle.set_offset(gpui::point(px(0.), px(-(max + LYRIC_ROW_H * 2.0))));
     // 修复：物化窗口按钳位（max）算 first，与最终布局一致 → 不再漂移闪。
-    let (first, _last) = wcx.update(|_w, app| view.update(app, |v, _| v.lyrics_visible_window(n)));
+    let (first, _last) = wcx.update(|_w, app| {
+        let lv = view.read(app).lyrics_right.clone();
+        lv.update(app, |lv, _| lv.lyrics_visible_window(n))
+    });
     let expected_first = ((max / LYRIC_ROW_H).floor() as usize).min(n - 1);
     assert_eq!(
         first, expected_first,
@@ -1642,7 +1701,10 @@ async fn lyrics_overbound_offset_uses_clamped_window(cx: &mut TestAppContext) {
     );
     // 中段偏移不受钳位影响（正常浏览位置 still 精确，回归护栏）。
     handle.set_offset(gpui::point(px(0.), px(-(max * 0.5))));
-    let (first2, _l) = wcx.update(|_w, app| view.update(app, |v, _| v.lyrics_visible_window(n)));
+    let (first2, _l) = wcx.update(|_w, app| {
+        let lv = view.read(app).lyrics_right.clone();
+        lv.update(app, |lv, _| lv.lyrics_visible_window(n))
+    });
     let expected_first2 = (((max * 0.5) / LYRIC_ROW_H).floor() as usize).min(n - 1);
     assert_eq!(first2, expected_first2, "中段偏移不应被钳位改变");
 }
@@ -1658,57 +1720,307 @@ async fn lyrics_unlaidout_viewport_no_panic(cx: &mut TestAppContext) {
     });
     // 不主动 draw：若尚未布局（bounds=0/max=0）也应安全反算（FALLBACK 行窗），不 panic。
     wcx.run_until_parked();
-    let (f0, _) = wcx.update(|_w, app| view.update(app, |v, _| v.lyrics_visible_window(30)));
+    let (f0, _) = wcx.update(|_w, app| {
+        let lv = view.read(app).lyrics_right.clone();
+        lv.update(app, |lv, _| lv.lyrics_visible_window(30))
+    });
     assert_eq!(f0, 0, "未布局时行窗应从顶部开始，实得 {f0}");
 }
 
-// ---- 真机复报三：全屏 + 「歌词」tab 并存时树上双实例共用同一 ScrollHandle → 全屏抖动/闪 ----
+// ---- 真机复报三（新形态）：歌词拆双实例子视图后「全屏 + 歌词 tab 双 ScrollHandle 互不钳制」 ----
 
-/// 用例 L（复报三回归）：`fs_open` 时正常视图的右侧「歌词」tab 与全屏浮层**同时**渲染
-/// `render_lyrics_panel_content`（同一 ScrollHandle / 同一套滚动状态被两套几何钳位）→
-/// 全屏到底后共享 offset 被右栏更小 max 钳住、与 `max_offset()` 错位 = 上下跳动 + 闪。
-/// 修复后右侧占位、树上仅全屏一个实例：到底时 offset 钳位 == 本容器 max（真到底）。
+/// 用例 L（复报三回归·新形态）：歌词状态迁入 `lyrics_right`/`lyrics_fs` 双实例后，右栏歌词
+/// 与全屏歌词**各自独立滚动容器/句柄**——全屏到底时 offset 钳到它**自己**的 max（旧实现
+/// 双树共用一句柄被右栏更小 max 钳走 → 到底后上下跳动 + 闪）；右实例 offset 不被全屏侧
+/// 滚动污染（各钳自己的 max，互不干涉）。
 #[gpui::test]
-async fn lyrics_fullscreen_plus_right_tab_single_instance(cx: &mut TestAppContext) {
+async fn lyrics_double_instance_offsets_independent(cx: &mut TestAppContext) {
     let player = player_with_lrc(cx, &lrc_30_lines());
     play_at_pos(&player, cx, 450.0);
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 2);
-    // 打开全屏浮层（右栏仍停在「歌词」tab）——复现双实例共存的渲染时刻。
+    // 打开全屏浮层（右栏仍停在「歌词」tab）——双实例同树上共存（右实例被 fs 浮层盖住）。
+    // toggle_fs 按切换渲染上下文语义 reset 双实例跟随态。
     wcx.update(|window, app| {
         view.update(app, |v, cx| v.toggle_fs(cx));
         window.draw(app).clear(app);
     });
     wcx.run_until_parked();
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
-    let max_fs = handle.max_offset().y.as_f32();
+    let fs_handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_fs.read(app).lyrics_scroll.clone());
+    let right_handle = wcx
+        .cx
+        .read(|app| view.read(app).lyrics_right.read(app).lyrics_scroll.clone());
+    let max_fs = fs_handle.max_offset().y.as_f32();
     assert!(max_fs > 0.0, "全屏侧滚动容器应有可滚范围，实得 max_fs={max_fs}");
-    // 全屏内滚到最底部（越界偏移 = 滚轮到底的瞬时态）。
-    handle.set_offset(gpui::point(px(0.), px(-(max_fs + LYRIC_ROW_H * 4.0))));
+    // 记录右实例当前 offset（全屏滚动前）。
+    let right_off0 = right_handle.offset().y.as_f32();
+    // 全屏内滚到最底部（越界偏移 = 滚轮到底的瞬时态）→ 布局应钳到**全屏自己**的 max。
+    fs_handle.set_offset(gpui::point(px(0.), px(-(max_fs + LYRIC_ROW_H * 4.0))));
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
-    // 单实例语义：到底时 offset 应被钳到**本容器**的 max（与其 max_offset 对齐）。
-    // 现状双实例：offset 被右栏更小 max 钳走 ≠ max_offset（全屏侧最后一次写）→ RED。
-    let off = handle.offset().y.as_f32();
-    let max_after = handle.max_offset().y.as_f32();
+    let off = fs_handle.offset().y.as_f32();
+    let max_after = fs_handle.max_offset().y.as_f32();
     assert!(
         (off + max_after).abs() < 2.0,
-        "全屏+歌词tab 底部 offset 应钳到本容器 max：off={off} max_after={max_after}（双实例下被右栏钳走）"
+        "全屏歌词到底应钳到全屏自己 max：off={off} max_after={max_after}（旧共享句柄被右栏钳走）"
+    );
+    // 右实例 offset 独立：不被全屏侧滚动改变。
+    let right_off1 = right_handle.offset().y.as_f32();
+    assert!(
+        (right_off1 - right_off0).abs() < 2.0,
+        "右实例 offset 不应被全屏侧滚动污染：right {right_off0} → {right_off1}"
+    );
+    // 右实例也能按自己的 max 钳位（越界右实例 → 钳到自己 max，与全屏互不影响）。
+    let max_right = right_handle.max_offset().y.as_f32();
+    if max_right > 0.0 {
+        right_handle.set_offset(gpui::point(px(0.), px(-(max_right + LYRIC_ROW_H * 4.0))));
+        wcx.update(|window, app| window.draw(app).clear(app));
+        wcx.run_until_parked();
+        let roff = right_handle.offset().y.as_f32();
+        let rmax = right_handle.max_offset().y.as_f32();
+        assert!(
+            (roff + rmax).abs() < 2.0,
+            "右实例歌词到底应钳到自己 max：roff={roff} rmax={rmax}"
+        );
+    }
+}
+
+// ---- 音乐性能最后一块：父树稳态 0 重绘（歌词/右栏 np 进度子视图承载心跳） ----
+
+/// 用例 N1（目标验收 RED→GREEN）：普通（非全屏）态播放中父 MusicView 稳态 **0 整树
+/// notify**——歌词跟随/右栏 np 进度各有子视图心跳承接。旧实现父 tick 每拍
+/// `if playing { cx.notify() }` → 每 250ms 整树重建（当前代码应 RED：父增量 ≥1）。
+/// 判别：分别 `App::observe` 父/歌词/np 子视图，泵多拍后父增量 == 0，**当前上树**的
+/// 子视图增量 ≥1（各自心跳活）；离树的子视图心跳空转（增量 0）。
+#[gpui::test]
+async fn playing_steady_tick_no_parent_rebuild(cx: &mut TestAppContext) {
+    let player = player_with_lrc(cx, &lrc_30_lines());
+    play_at_pos(&player, cx, 0.0);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let (parent_c, np_c, lyrics_c) = wcx.update(|_w, app| {
+        let (np, lyrics) = {
+            let v = view.read(app);
+            (v.np_bar.clone(), v.lyrics_right.clone())
+        };
+        let parent_c = Rc::new(Cell::new(0usize));
+        let np_c = Rc::new(Cell::new(0usize));
+        let lyrics_c = Rc::new(Cell::new(0usize));
+        {
+            let c = parent_c.clone();
+            app.observe(&view, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        {
+            let c = np_c.clone();
+            app.observe(&np, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        {
+            let c = lyrics_c.clone();
+            app.observe(&lyrics, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        (parent_c, np_c, lyrics_c)
+    });
+    // 场景 A：歌曲 tab（np_bar 上树，lyrics_right 离树）——泵 4 拍：父 0 重建、np ≥1、歌词 0。
+    let (p0, n0, l0) = (parent_c.get(), np_c.get(), lyrics_c.get());
+    pump_ticks(wcx, 4);
+    let (dp, dn, dl) = (parent_c.get() - p0, np_c.get() - n0, lyrics_c.get() - l0);
+    assert_eq!(
+        dp, 0,
+        "播放中普通态父 tick 不应整树 notify（稳态 4 拍 0 重建）：delta={dp}"
+    );
+    assert!(dn >= 1, "右栏 np 进度子视图心跳应自 notify：delta={dn}");
+    assert_eq!(
+        dl, 0,
+        "离树歌词实例心跳应空转（不 notify）：delta={dl}"
+    );
+    // 场景 B：切歌词 tab（lyrics_right 上树，np_bar 离树）——泵 4 拍：父稳态 0、歌词 ≥1。
+    let np0_b = np_c.get();
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| v.set_right_tab(RightTab::Lyrics, cx));
+    });
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let (p1, l1) = (parent_c.get(), lyrics_c.get());
+    pump_ticks(wcx, 4);
+    let (dp2, dl2) = (parent_c.get() - p1, lyrics_c.get() - l1);
+    assert_eq!(
+        dp2, 0,
+        "切歌词 tab 后播放中普通态父稳态也应 0 重建：delta={dp2}"
+    );
+    assert!(dl2 >= 1, "歌词子视图心跳应自 notify（跟随推进）：delta={dl2}");
+    // np 离树后心跳空转（不再自 notify）。
+    let dn2 = np_c.get() - np0_b;
+    assert_eq!(dn2, 0, "离树 np 实例心跳应空转（不 notify）：delta={dn2}");
+}
+
+/// 用例 N2（fs 条件保留）：`fs_open` + 播放中父仍按拍重绘（fs 进度/时间/整块尚在父内）——
+/// 4 拍内父 notify ≥2；fs 场景是预期内的父 4Hz。
+#[gpui::test]
+async fn fs_open_still_refreshes_parent(cx: &mut TestAppContext) {
+    let player = player_with_lrc(cx, &lrc_30_lines());
+    play_at_pos(&player, cx, 0.0);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_fs(cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let parent_c = Rc::new(Cell::new(0usize));
+    wcx.update(|_w, app| {
+        let c = parent_c.clone();
+        app.observe(&view, move |_, _| c.set(c.get() + 1)).detach();
+    });
+    let base = parent_c.get();
+    pump_ticks(wcx, 3);
+    let d = parent_c.get() - base;
+    assert!(
+        d >= 2,
+        "fs_open+播放中父应按拍重绘（fs 进度/时间/整块在父内）：delta={d}"
     );
 }
 
-/// 右侧「歌词」tab 是否渲染真实歌词面板（纯函数，供 `render_right` 与测试共用）：
-/// `fs_open` 时全屏浮层已渲染歌词 → 右侧改为静态占位，保证树上**单实例**（防两个
-/// `render_lyrics_panel_content` 争夺同一 ScrollHandle → 全屏抖动/闪）。
-#[test]
-fn right_panel_live_lyrics_gates_on_fullscreen() {
+// ---- 右栏 np 进度子视图：随位置更新 + 拖拽 seek 跟手（headless 证机制） ----
+
+/// 用例 N3：np 进度填充随播放位置更新——seek(50%) 后显式重绘，`np-progress-fill` 宽 ≈ 50%
+/// 条宽（headless position=seek_base 确定性；K30 注「证机制」，真机平滑由心跳 + 复验）。
+#[gpui::test]
+async fn np_progress_updates_with_position(cx: &mut TestAppContext) {
+    let dur = 100.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, cx| {
+            p.test_start_playing(0);
+            p.set_test_duration(dur);
+            p.seek(0.0, cx);
+        });
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let b = wcx
+        .cx
+        .read(|app| view.read(app).np_bar.read(app).np_progress.get());
+    let bar_w = b.size.width.as_f32();
+    assert!(bar_w > 0.0, "np-progress 盒应已布局（宽>0），实得 {b:?}");
+    let fill0 = wcx.debug_bounds("np-progress-fill").expect("np 填充应有 debug 盒");
     assert!(
-        super::fullscreen::right_panel_live_lyrics(false),
-        "非全屏时右侧应渲染真实歌词面板"
+        fill0.size.width.as_f32() < 2.0,
+        "初始 pos=0 填充应≈0，实得 {fill0:?}"
     );
+    // 驱动 position 到 50%（seek 同步把 seek_base 显示基准置目标；无 sink 下确定性）。
+    wcx.update(|_w, app| {
+        let p = view.read(app).player.clone();
+        p.update(app, |p, cx| p.seek(dur * 0.5, cx));
+    });
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let fill1 = wcx.debug_bounds("np-progress-fill").expect("np 填充应仍在渲染");
+    let want = bar_w * 0.5;
     assert!(
-        !super::fullscreen::right_panel_live_lyrics(true),
-        "全屏浮层打开时右侧应静态占位（免双实例争夺）"
+        (fill1.size.width.as_f32() - want).abs() < 4.0,
+        "np 进度填充应随 position 更新 ≈{want:.1}，实得 {:.1}",
+        fill1.size.width.as_f32()
+    );
+}
+
+/// 用例 N4：np 进度条点击/拖动 seek 实时跟手——拖动**自 notify np 子视图**（不寄生父
+/// tick/动画），位置随落点、松手停在当前位置（复用 bb 姿势，观察对象换 np 子视图）。
+#[gpui::test]
+async fn np_progress_drag_notifies_np_subview(cx: &mut TestAppContext) {
+    let dur = 100.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, _| p.set_test_duration(dur));
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let np_c = wcx.update(|_w, app| {
+        let np = view.read(app).np_bar.clone();
+        let c = Rc::new(Cell::new(0usize));
+        {
+            let c = c.clone();
+            app.observe(&np, move |_, _| c.set(c.get() + 1)).detach();
+        }
+        c
+    });
+    let b = wcx
+        .cx
+        .read(|app| view.read(app).np_bar.read(app).np_progress.get());
+    assert!(
+        b.size.width.as_f32() > 0.0,
+        "np-progress 盒应已布局（宽>0），实得 {b:?}"
+    );
+    let base = np_c.get();
+    wcx.simulate_mouse_down(at_frac(&b, 0.60), MouseButton::Left, Default::default());
+    wcx.simulate_mouse_move(at_frac(&b, 0.30), Some(MouseButton::Left), Default::default());
+    wcx.run_until_parked();
+    assert!(
+        np_c.get() > base,
+        "np 拖拽应自 notify np 子视图（不寄生 tick/动画）：{} → {}",
+        base,
+        np_c.get()
+    );
+    let pos = wcx.cx.read(|app| view.read(app).player.read(app).position());
+    assert!(
+        (pos - dur * 0.30).abs() < 1.0,
+        "拖到 30% 应跟随 {:.1}s，实得 {pos:.1}",
+        dur * 0.30
+    );
+    wcx.simulate_mouse_up(at_frac(&b, 0.30), MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let pos2 = wcx.cx.read(|app| view.read(app).player.read(app).position());
+    assert!((pos2 - dur * 0.30).abs() < 1.0, "松手仍停 30%，实得 {pos2:.1}");
+}
+
+/// 用例 N5（toast 让步显式 notify 的回归护栏）：删掉父「playing||toast」整树 notify 后，
+/// toast **出现**（错误变化那拍）与 **消失**（满 1.8s 过期清空那拍）都必须显式 notify，
+/// 否则那两拍无重绘 = toast 永不呈现/永不消失回归。判别：空库注入播放错误 → 第一拍
+/// toast 出现 notify ≥1；toast 在期普通态 0 持续 notify；满 1.8s 过期 notify ≥1。
+#[gpui::test]
+async fn toast_appear_expire_each_notify_once(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("gpui-music-err-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let player: Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 注入：play_path 指向空库外路径 → 以父目录重扫空目录 → commit_scan 里 pending 未命中
+    // → error 置位（播放 false；无 toast 相关多余 notify 干扰）。
+    wcx.cx.update(|app| {
+        player.update(app, |p, cx| p.play_path(dir.join("缺.wav"), cx));
+    });
+    drain_scan(&mut wcx.cx);
+    let parent_c = Rc::new(Cell::new(0usize));
+    wcx.update(|_w, app| {
+        let c = parent_c.clone();
+        app.observe(&view, move |_, _| c.set(c.get() + 1)).detach();
+    });
+    let base = parent_c.get();
+    // 第一拍 tick：发现错误变化 → toast 出现 + 一次显式 notify。
+    pump_ticks(wcx, 1);
+    let after_appear = parent_c.get() - base;
+    assert!(
+        after_appear >= 1,
+        "toast 出现那拍应有视图 notify：delta={after_appear}"
+    );
+    // toast 在期（<1.8s）+ 非 fs 普通态：不持续 notify。
+    let b2 = parent_c.get();
+    pump_ticks(wcx, 4); // +1s
+    assert_eq!(
+        parent_c.get() - b2,
+        0,
+        "toast 在期普通态不应持续 notify（删掉 playing||toast 后的预期）"
+    );
+    // 满 1.8s：过期清空 + 一次显式 notify。
+    let b3 = parent_c.get();
+    pump_ticks(wcx, 4); // +1s → 累计 ≥1.8s
+    let after_expire = parent_c.get() - b3;
+    assert!(
+        after_expire >= 1,
+        "toast 过期清空那拍应有视图 notify：delta={after_expire}"
     );
 }
 

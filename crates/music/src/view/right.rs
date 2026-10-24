@@ -31,14 +31,9 @@ impl super::MusicView {
                 col.push(self.render_up_next(cx));
             }
             RightTab::Lyrics => {
-                if super::fullscreen::right_panel_live_lyrics(self.state.fs_open) {
-                    col.push(self.render_lyrics_panel_content(cx));
-                } else {
-                    // 全屏浮层已渲染歌词面板（绝对盖住右栏）：此处静态占位——两个
-                    // `render_lyrics_panel_content` 会同抢同一 ScrollHandle（两套几何
-                    // 每帧交替钳位共享 offset）→ 全屏到底后上下跳动 + 闪（复报三）。
-                    col.push(div().flex_1().min_h(px(0.)).into_any_element());
-                }
+                // 右栏常驻渲染 lyrics_right 实例（fs 浮层 absolute inset-0 + `.occlude()` 盖住
+                // 即可）：与全屏 lyrics_fs 各持独立 ScrollHandle——双实例双几何，互不钳位。
+                col.push(self.lyrics_right.clone().into_any_element());
             }
             RightTab::Queue => {
                 col.push(self.render_queue_list(window, cx));
@@ -128,8 +123,6 @@ impl super::MusicView {
             .map(|t| t.artist.clone())
             .unwrap_or_else(|| "—".to_string());
         let grad = p.current_track().map(|t| t.grad);
-        let dur = p.duration();
-        let pos = p.position();
         let shuffle = p.shuffle();
         let repeat = p.repeat();
         let cur_liked = p.current().map(|i| p.is_liked(i)).unwrap_or(false);
@@ -175,23 +168,8 @@ impl super::MusicView {
             .child(art_base)
             .on_click(cx.listener(|this: &mut MusicView, _ev, _w, cx| this.toggle_fs(cx)));
 
-        // 进度条（np_progress）。
-        let progress_fraction = if dur > 0.0 {
-            (pos / dur).clamp(0.0, 1.0) as f32
-        } else {
-            0.0
-        };
-        let progress = self.strip_element(
-            "np-progress",
-            self.np_progress.clone(),
-            progress_fraction,
-            true,
-            None,
-            None,
-            cx,
-        );
-        let time_cur = crate::model::duration_str(pos);
-        let time_total = crate::model::duration_str(dur);
+        // 进度条 + 当前/总时长时间（np 子视图：自带心跳刷新，拖拽 seek 自管；父稳态不重绘）。
+        let progress_n_time = self.np_bar.clone().into_any_element();
 
         div().flex().flex_col()
             .child(art)
@@ -213,17 +191,7 @@ impl super::MusicView {
                     .text_ellipsis()
                     .child(artist),
             )
-            .child(progress)
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .text_size(px(11.))
-                    .text_color(theme::text3())
-                    .child(time_cur)
-                    .child(time_total)
-                    .pb(px(14.)),
-            )
+            .child(progress_n_time)
             .child(
                 div()
                     .flex()
@@ -263,7 +231,7 @@ impl super::MusicView {
                 MusicIcon::Shuffle => this.toggle_shuffle(cx),
                 MusicIcon::Prev => this.player.update(cx, |p, cx| p.prev(cx)),
                 MusicIcon::Next => this.player.update(cx, |p, cx| p.next(cx)),
-                _ => this.toast_msg(label),
+                _ => this.toast_msg(label, cx),
             }
         });
         div()
@@ -344,11 +312,14 @@ impl super::MusicView {
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
             match label {
                 "收藏" => this.like_current(cx),
-                _ => this.toast_msg(match label {
-                    "加入队列" => "已添加到队列",
-                    "分享" => "分享链接已复制",
-                    _ => label,
-                }),
+                _ => this.toast_msg(
+                    match label {
+                        "加入队列" => "已添加到队列",
+                        "分享" => "分享链接已复制",
+                        _ => label,
+                    },
+                    cx,
+                ),
             }
         });
         div()

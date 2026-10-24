@@ -326,8 +326,8 @@ impl super::MusicView {
         label: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, _cx| {
-            this.toast_msg(label);
+        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
+            this.toast_msg(label, cx);
         });
         div()
             .id(id)

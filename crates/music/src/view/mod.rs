@@ -10,8 +10,11 @@
 //! （absolute inset-0，最后子元素 → 绘制/命中最上，覆盖标题栏/三栏/底栏）。
 //!
 //! 驱动：`new` 起一个常驻 `cx.spawn` tick 循环（250ms）——① `player.tick` 消费 worker
-//! 事件（Opened/Finished/Error，事件变化内部已 notify）；② 仅**播放中**才 `cx.notify()`
-//! 刷新进度/均衡器/歌词/封面（path 限制：暂停/空闲不持续重绘，K12）；③ toast 过期清理。
+//! 事件（Opened/Finished/Error，事件变化内部已 notify）；② toast 出现/过期各显式
+//! `cx.notify()` 一次；③ 仅 **fs 打开 + 播放中** 才父按拍 `cx.notify()`（fs 进度/时间/整块
+//! 尚在父内）。普通（非全屏）态父树稳态 **0 整树重绘**：歌词跟随（[`lyrics`] 双实例）、
+//! 右栏 np 进度/时间（[`npbar`]）、底栏进度（[`bottom`]）、eq/黑胶动画（[`widgets`]）
+//! 各自子视图自带心跳自 notify（K12：暂停/离树心跳空转，不持续重绘）。
 //! 焦点：根 `track_focus` + `on_key_down` 处理全局快捷键（Space/←/→/Esc/F/1/2/3），
 //! 搜索框持焦时让路（不抢输入键）。
 //! 封面：`cover.rs` 解码同名 `.jpg/.png/.webp` 成 `RenderImage`（BGRA），本文件用
@@ -22,7 +25,9 @@ pub mod theme;
 mod bottom;
 mod fullscreen;
 mod icon;
+mod lyrics;
 mod main;
+mod npbar;
 mod right;
 mod sidebar;
 mod titlebar;
@@ -37,11 +42,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Anchor, App, AnyElement, Bounds, ClipboardItem, Context, CursorStyle, DefiniteLength, Edges,
+    Anchor, App, AnyElement, Bounds, ClipboardItem, Context, Edges,
     Entity, EntityInputHandler, EventEmitter, Focusable, FocusHandle, InteractiveElement as _,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     ParentElement as _, Point, Pixels, Render, RenderImage, ScrollHandle, SharedString, Styled as _,
-    StatefulInteractiveElement as _, StyledImage, TextInputConfiguration, UTF16Selection, Window,
+    StyledImage, TextInputConfiguration, UTF16Selection, Window,
     anchored, deferred, div, img, point, px, size,
 };
 use gpui::AppContext as _;
@@ -147,7 +152,6 @@ pub struct MusicView {
     /// 正在解码的封面 path（防重复派发任务）。
     cover_loading: HashSet<PathBuf>,
     // ---- 可交互条（进度/音量）的窗口坐标盒（canvas prepaint 记录） ----
-    np_progress: Rc<Cell<Bounds<Pixels>>>,
     fs_progress: Rc<Cell<Bounds<Pixels>>>,
     fs_vol: Rc<Cell<Bounds<Pixels>>>,
     /// 全屏进度条**填充渐变**的 canvas 实际绘制盒（`gradient_cover_tracked` 记录）：
@@ -170,21 +174,14 @@ pub struct MusicView {
     /// prepaint 写入（全屏 seek/音量条同款真机已验证机制）。per-id 隔离——fs 开/关、
     /// tab 切换下不同元素各写各的 cell，互不覆盖。
     tip_boxes: HashMap<&'static str, Rc<Cell<Bounds<Pixels>>>>,
-    // ---- 歌词面板滚动（可滚浏览全部 + 自动跟随当前句） ----
-    /// 歌词滚动容器句柄（`overflow_y_scroll` + `track_scroll`；原生滚轮与自动跟随
-    /// 共用这一个 offset——跟随只写它、放手动时保持用户位置不动它）。
-    lyrics_scroll: ScrollHandle,
-    /// 上次经自动跟随写入的目标偏移（句首坐标 y，offset 取其负值；None=当前非跟随态，
-    /// 如已手动滚动/暂停/未布局）。用于检测「用户手动滚动」：实测 offset 偏离它即
-    /// 记 `lyrics_manual_since` 暂停跟随。
-    lyrics_follow_y: Option<f32>,
-    /// 手动浏览开始时刻（来自 `cx.background_executor().now()`，测试的虚拟时钟可控）。
-    /// 停止滚动约 3 秒（[`super::fullscreen::LYRIC_FOLLOW_RESUME_MS`]）后自动恢复跟随。
-    lyrics_manual_since: Option<Instant>,
-    /// 手动浏览期间上次观察到的滚动偏移（仍在滚动 → 刷新 3 秒计时）。
-    lyrics_manual_last_y: f32,
-    /// 当前参与歌词跟随的曲目路径（切歌/换曲时复位跟随态，新曲从自动跟随开始）。
-    lyrics_track_path: Option<PathBuf>,
+    // ---- 歌词面板滚动（可滚浏览全部 + 自动跟随当前句）——已拆独立子视图 [lyrics] ----
+    /// 右侧「歌词」tab 子视图实例（id 前缀 `lyrics-r`；fs 打开/非歌词 tab 时上树由父决定，
+    /// 心跳仅在可见时自 notify——详情见 [`lyrics::LyricsView`]）。
+    lyrics_right: Entity<lyrics::LyricsView>,
+    /// 全屏浮层歌词子视图实例（id 前缀 `lyrics-f`）。
+    lyrics_fs: Entity<lyrics::LyricsView>,
+    /// 右栏「正在播放」卡进度/时间子视图（见 [`npbar::NpBarView`]）。
+    np_bar: Entity<npbar::NpBarView>,
     // ---- 主区列表虚拟化（性能优化第二步）：可视窗行 + 显示模型缓存 ----
     /// 主区列表滚动句柄（Library/Liked/Home 单一活跃滚动容器共用；`track_scroll` 绑定、
     /// 偏移驱动可见行窗——见 `main::MainList::visible_range`）。
@@ -235,7 +232,6 @@ impl MusicView {
             toast: None,
             last_error: None,
             _tick: Some(task),
-            np_progress: Rc::new(Cell::new(Bounds::default())),
             fs_progress: Rc::new(Cell::new(Bounds::default())),
             fs_vol: Rc::new(Cell::new(Bounds::default())),
             fs_fill_box: Rc::new(Cell::new(Bounds::default())),
@@ -246,11 +242,6 @@ impl MusicView {
             tip_boxes: HashMap::new(),
             covers: HashMap::new(),
             cover_loading: HashSet::new(),
-            lyrics_scroll: ScrollHandle::new(),
-            lyrics_follow_y: None,
-            lyrics_manual_since: None,
-            lyrics_manual_last_y: 0.0,
-            lyrics_track_path: None,
             main_scroll: ScrollHandle::new(),
             main_list_cache: HashMap::new(),
             eq_main: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "row-current")),
@@ -272,6 +263,13 @@ impl MusicView {
             bottom_bar: cx.new(|cx| {
                 bottom::BottomBarView::new(player_for_views.clone(), parent_weak.clone(), cx)
             }),
+            // 歌词双实例（右栏/全屏各自 ScrollHandle，互不钳位）+ 右栏 np 进度子视图：
+            // 进入上树/离树由 render 注入 visible，心跳只在可见且播放时自 notify。
+            lyrics_right: cx
+                .new(|cx| lyrics::LyricsView::new(player_for_views.clone(), "lyrics-r", cx)),
+            lyrics_fs: cx
+                .new(|cx| lyrics::LyricsView::new(player_for_views.clone(), "lyrics-f", cx)),
+            np_bar: cx.new(|cx| npbar::NpBarView::new(player_for_views.clone(), cx)),
         }
     }
 
@@ -421,8 +419,9 @@ impl MusicView {
         .into_any_element()
     }
 
-    /// 常驻 tick（250ms）：消费 worker 事件（内部已 notify）+ 播放中刷新进度 +
-    /// toast 过期清理。空闲（非播放）不 notify → 不持续重绘（K12）。
+    /// 常驻 tick（250ms）：消费 worker 事件（内部已 notify）+ 播放中（fs）刷新 + toast
+    /// 过期清理。歌词跟随/右栏 np 进度/时间已拆进各自子视图心跳——普通（非全屏）态父
+    /// 树稳态不 notify → 0 整树重绘；仅 fs 打开（进度/时间/整块仍在父内）才父按拍重绘。
     fn on_tick(&mut self, cx: &mut Context<Self>) {
         self.player.update(cx, |p, cx| p.tick(cx));
         // 封面懒加载 + 库预取：每拍扫描库缺失封面的曲目派解码任务（幂等；58 首每 250ms
@@ -430,25 +429,32 @@ impl MusicView {
         // 时旧实现预取空转 + latch 卡死，封面永不呈现（K29 类）。
         self.ensure_library_covers(cx);
         // 播放错误浮现（如缺 media_ffmpeg.dll / 打开失败）：仅在错误值**变化**时弹一次
-        // toast，避免每拍重复；错误清除后记录复位（下次再错能再弹）。
+        // toast，避免每拍重复；错误清除后记录复位（下次再错能再弹）。**错误出现那拍显式
+        // notify**——删掉「playing||toast」整树 notify 后，toast 出现必须自驱动重绘。
         let err = self.player.read(cx).error().map(ToString::to_string);
         if err.as_deref() != self.last_error.as_deref() {
             self.last_error = err.clone();
             if let Some(e) = err {
-                self.toast = Some((format!("播放失败：{e}").into(), Instant::now()));
+                self.toast = Some((
+                    format!("播放失败：{e}").into(),
+                    cx.background_executor().now(),
+                ));
+                cx.notify();
             }
         }
-        // toast 过期：清掉（下次渲染可能不会发生，主动 notify 一次让其消失）
-        let toast_expired =
-            self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST_MS);
+        // toast 过期：清掉（**显式 notify 一次**让 toast 消失当拍重绘，不能只靠 render 兜底）。
+        // 时间戳用 background_executor 时钟（与 tooltip/歌词同款）——测试 advance_clock 可控。
+        let toast_expired = self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, at)| cx.background_executor().now().duration_since(*at) >= TOAST_MS);
         if toast_expired {
             self.toast = None;
+            cx.notify();
         }
-        // 歌词自动跟随：播放中把滚动偏移钉到「active 行居中」；检测到用户手动滚动则
-        // 暂停跟随、停止滚动约 3 秒后恢复（指挥权在这是为了避开 render 的无副作用纪律）。
-        self.update_lyrics_follow(cx);
-        // 播放中才高频刷新进度条/均衡器位置；toast 在期也刷新（保证按时出现/消失）。
-        if self.player.read(cx).playing() || self.toast.is_some() {
+        // 仅 fs 打开 + 播放中才父按拍重绘：fs 进度/时间/整块显示尚在父内（普通态 0 重建——
+        // 歌词与右栏 np 进度各有子视图心跳）。
+        if self.player.read(cx).playing() && self.state.fs_open {
             cx.notify();
         }
     }
@@ -576,9 +582,10 @@ impl MusicView {
         self.focus_handle.clone()
     }
 
-    /// 中央 toast（1.8s 自动消失）。
-    pub fn toast_msg(&mut self, s: impl Into<String>) {
-        self.toast = Some((s.into().into(), Instant::now()));
+    /// 中央 toast（1.8s 自动消失）。时间戳走 `background_executor` 时钟（与 tooltip/歌词
+    /// 同款）：生产恒等于 `Instant::now()`，测试 `advance_clock` 精确控过期判定。
+    pub fn toast_msg(&mut self, s: impl Into<String>, cx: &mut Context<Self>) {
+        self.toast = Some((s.into().into(), cx.background_executor().now()));
     }
 
     /// 载入默认音乐目录（shell 集成入口）：先读 `UserPrefs::music_dir`（未设置/空 →
@@ -604,14 +611,14 @@ impl MusicView {
         }
         self.player.update(cx, |p, cx| p.play_track(idx, cx));
         if let Some(t) = self.player.read(cx).current_track() {
-            self.toast_msg(format!("正在播放：{} - {}", t.title, t.artist));
+            self.toast_msg(format!("正在播放：{} - {}", t.title, t.artist), cx);
         }
     }
 
     pub fn toggle_like(&mut self, idx: usize, cx: &mut Context<Self>) {
         let was = self.player.read(cx).is_liked(idx);
         self.player.update(cx, |p, cx| p.toggle_like(idx, cx));
-        self.toast_msg(if was { "取消收藏" } else { "已收藏" });
+        self.toast_msg(if was { "取消收藏" } else { "已收藏" }, cx);
     }
 
     /// 收藏/取消收藏当前播放曲目（右侧面板「收藏」钮 / 底栏回父入口）。
@@ -636,9 +643,9 @@ impl MusicView {
 
     pub fn toggle_fs(&mut self, cx: &mut Context<Self>) {
         self.state.fs_open = !self.state.fs_open;
-        // 全屏切换：复位歌词跟随/手动态（换渲染上下文从自动跟随重新开始）。
-        self.lyrics_manual_since = None;
-        self.lyrics_follow_y = None;
+        // 全屏切换：双歌词实例复位跟随/手动态（换渲染上下文从自动跟随重新开始）。
+        self.lyrics_right.update(cx, |lv, _| lv.reset_follow());
+        self.lyrics_fs.update(cx, |lv, _| lv.reset_follow());
         cx.notify();
     }
 
@@ -650,96 +657,13 @@ impl MusicView {
     /// 切右侧面板 tab（右栏 header / 底栏回父入口共用）。
     pub(super) fn set_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         self.state.right_tab = tab;
-        // 面板「歌词」tab 重进：复位歌词跟随/手动态（进入即从自动跟随当前句开始）。
-        self.lyrics_manual_since = None;
-        self.lyrics_follow_y = None;
+        // 面板「歌词」tab 重进：双歌词实例复位跟随/手动态（进入即从自动跟随当前句开始）。
+        self.lyrics_right.update(cx, |lv, _| lv.reset_follow());
+        self.lyrics_fs.update(cx, |lv, _| lv.reset_follow());
         cx.notify();
     }
 
     // ---- 可交互条（进度/音量 share）：条元素 + 事件 → 播放器 ----
-
-    /// 构建一条可交互条（seek 进度条 / 音量条共用，对齐 video `strip_element`）：
-    /// `id` 元素级唯一；`bounds` 由 canvas prepaint 记录窗口坐标盒；`is_seek=true`
-    /// 拖拽 → `player.seek(f×duration)`，否则 `player.set_volume(f)`。`tip=Some(名称)`
-    /// 时挂悬停提示（音量条用；进度条不弹提示）。
-    fn strip_element(
-        &mut self,
-        id: &'static str,
-        bounds: Rc<Cell<Bounds<Pixels>>>,
-        fraction: f32,
-        is_seek: bool,
-        width: Option<f32>,
-        tip: Option<&'static str>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let f = fraction.clamp(0.0, 1.0);
-        let fill_col = theme::accent();
-        let track_col = theme::bg_hover();
-        let mut el = div()
-            .id(id)
-            .h(px(16.))
-            .relative()
-            .cursor(CursorStyle::PointingHand)
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .relative()
-                            .h(px(4.))
-                            .rounded(px(2.))
-                            .bg(track_col.opacity(0.6))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(DefiniteLength::Fraction(f))
-                                    .rounded(px(2.))
-                                    .bg(fill_col),
-                            ),
-                    ),
-            )
-            .child(theme::bounds_canvas(bounds.clone()));
-        if let Some(w) = width {
-            el = el.w(px(w));
-        } else {
-            el = el.flex_1();
-        }
-        if let Some(_t) = tip {
-            // 提示钮的窗口盒记录：复用本条的 bounds cell（同一 Cell，无多余 canvas）。
-            self.tip_boxes.entry(id).or_insert_with(|| bounds.clone());
-        }
-        let b1 = bounds.clone();
-        el = el.on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, ev, _w, cx| this.on_strip_down(is_seek, b1.clone(), ev, cx)),
-        );
-        let b2 = bounds.clone();
-        el = el.on_mouse_move(
-            cx.listener(move |this, ev, _w, cx| this.on_strip_drag(is_seek, b2.clone(), ev, cx)),
-        );
-        // 松手收尾（进度条）：窗口内松开 / 拖出窗外松开都按最后锁定落点提交，保证
-        // 「松手停在当前位置」。音量条无需收尾（on_strip_up 对 !is_seek 直接返回）。
-        let b3 = bounds.clone();
-        el = el.on_mouse_up(
-            MouseButton::Left,
-            cx.listener(move |this, ev, _w, cx| this.on_strip_up(is_seek, b3.clone(), ev, cx)),
-        );
-        el = el.on_mouse_up_out(
-            MouseButton::Left,
-            cx.listener(move |this, ev, _w, cx| this.on_strip_up(is_seek, bounds.clone(), ev, cx)),
-        );
-        if let Some(t) = tip {
-            el = el.on_hover(self.hover_tip_listener(cx, id, t));
-        }
-        el.into_any_element()
-    }
 
     fn on_strip_down(
         &mut self,
@@ -908,10 +832,28 @@ impl EventEmitter<MusicEvent> for MusicView {}
 
 impl Render for MusicView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // toast 到期：render 侧兜底清理（tick 正常时已清，这里防万一）。
-        if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST_MS) {
+        // toast 到期：render 侧兜底清理（tick 正常时已清，这里防万一）。时钟同 tick 用
+        // background_executor（测试 advance_clock 可控；生产即真实时钟）。
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, at)| cx.background_executor().now().duration_since(*at) >= TOAST_MS)
+        {
             self.toast = None;
         }
+        // 子视图可见性门控（powered by 父现有状态——每次父 render 都刷新，结构切换后
+        // 心跳立即对树上/离树实例正确取舍）：离树实例心跳空转（不跑跟随、不 notify）。
+        // 右栏歌词仅「非全屏 + 歌词 tab」、全屏歌词仅 fs_open、右栏 np 进度仅「非全屏 +
+        // 歌曲 tab」时上树且可见。
+        self.lyrics_right.update(
+            cx,
+            |lv, _| lv.visible = !self.state.fs_open && self.state.right_tab == RightTab::Lyrics,
+        );
+        self.lyrics_fs.update(cx, |lv, _| lv.visible = self.state.fs_open);
+        self.np_bar.update(
+            cx,
+            |lv, _| lv.visible = !self.state.fs_open && self.state.right_tab == RightTab::Song,
+        );
         let mut root = div()
             .id("music-view")
             .debug_selector(|| "music-view".into())

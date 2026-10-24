@@ -12,12 +12,10 @@
 //! 文字间距忽略；黑胶圈用 svg 圆环 + 旋转动画（暂停即停）。Esc 关全屏由根 `on_key`
 //! 处理，close 钮也关。
 
-use std::time::Duration;
-
 use gpui::{
     AnyElement, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, ScrollWheelEvent, StatefulInteractiveElement as _,
-    Styled as _, Window, div, point, px,
+    IntoElement, MouseButton, ParentElement as _, StatefulInteractiveElement as _, Styled as _,
+    Window, div, px,
 };
 
 use crate::model::{RepeatMode, duration_str};
@@ -28,42 +26,8 @@ use super::{MusicView, theme};
 /// 全屏封面边长（px），黑胶圈按比例派生。
 pub(super) const FS_COVER_PX: f32 = 320.0;
 
-/// 歌词行三态（v2 `.fs-lyric`：active 白+加粗+accent 底 / past 暗 / future 更亮）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LyricState {
-    Active,
-    Past,
-    Future,
-}
-
-/// 右侧「歌词」tab 是否渲染真实歌词面板（纯函数，供 `render_right` 与测试共用）：
-/// `fs_open` 时全屏浮层已渲染歌词 → 右侧改静态占位，保证树上**单实例**——否则两个
-/// `render_lyrics_panel_content` 会争夺同一个 `lyrics_scroll` ScrollHandle（两套几何
-/// 每帧交替钳位同一共享 offset → 全屏到底后上下跳动 + 闪，真机复报三）。
-pub(super) fn right_panel_live_lyrics(fs_open: bool) -> bool {
-    !fs_open
-}
-
-/// 歌词行三态判定：idx == active → Active；idx < active → Past；否则 Future。
-fn lyric_state_for(active: Option<usize>, idx: usize) -> LyricState {
-    if Some(idx) == active {
-        LyricState::Active
-    } else if active.is_some_and(|a| idx < a) {
-        LyricState::Past
-    } else {
-        LyricState::Future
-    }
-}
-
-/// 歌词固定行高（px）：滚动量程反算与行窗物化都按它——三态行统一高，便于按偏移/视口
-/// 精确反算行号与总高（内容总高 = 行数 × 行高）。
-pub(super) const LYRIC_ROW_H: f32 = 46.0;
-/// 手动滚动后自动恢复跟随的「停止滚动」时长（ms）。
-pub(super) const LYRIC_FOLLOW_RESUME_MS: u64 = 3000;
-/// 歌词滚动容器尚未布局前（bounds=0）兜底可见行数：估一行 46px、~11 行视口。
-const LYRIC_FALLBACK_VISIBLE: usize = 11;
-/// 可视行窗上下额外物化的缓冲行数（滚动时行间无缝衔接，防白缝）。
-const LYRIC_ROW_BUFFER: usize = 2;
+/// 歌词行三态常量已随 `super::lyrics::LyricsView` 迁走（`LYRIC_ROW_H`/
+/// `LYRIC_FOLLOW_RESUME_MS` 在 `view::lyrics`，测试经 `super::lyrics` 引用）。
 
 impl super::MusicView {
     /// 全屏浮层整块（v2：左列封面+控制 / 右列歌词）。
@@ -180,7 +144,7 @@ impl super::MusicView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let hovered = self.fs_hover == Some(tip);
-        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, _cx| this.toast_msg(tip));
+        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| this.toast_msg(tip, cx));
         div()
             .id(format!("fs-btn-{tip}"))
             .relative()
@@ -758,15 +722,18 @@ impl super::MusicView {
             "fs-like" => {
                 if let Some(i) = this.player.read(cx).current() {
                     this.player.update(cx, |p, cx| p.toggle_like(i, cx));
-                    this.toast_msg(if this.player.read(cx).is_liked(i) {
-                        "已收藏"
-                    } else {
-                        "取消收藏"
-                    });
+                    this.toast_msg(
+                        if this.player.read(cx).is_liked(i) {
+                            "已收藏"
+                        } else {
+                            "取消收藏"
+                        },
+                        cx,
+                    );
                 }
             }
-            "fs-que" => this.toast_msg("已加入队列"),
-            "fs-dl" => this.toast_msg("下载功能即将到来"),
+            "fs-que" => this.toast_msg("已加入队列", cx),
+            "fs-dl" => this.toast_msg("下载功能即将到来", cx),
             _ => {}
         });
         div()
@@ -804,7 +771,9 @@ impl super::MusicView {
     }
 
     /// 右列：歌词面板（v2 `.fs-right`：LYRICS 标题 + 同步歌词；无 LRC → 操作提示）。
-    fn render_fs_lyrics(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// 内容由 `self.lyrics_fs`（`view::lyrics::LyricsView` 实例，独立 ScrollHandle）渲染——
+    /// 双实例双句柄，全屏与右栏不再争抢同一滚动状态。
+    fn render_fs_lyrics(&mut self, _cx: &mut Context<Self>) -> AnyElement {
         div()
             .min_w(px(0.))
             .w(px(440.))
@@ -821,272 +790,8 @@ impl super::MusicView {
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child("LYRICS"),
             )
-            .child(self.render_lyrics_panel_content(cx))
+            .child(self.lyrics_fs.clone().into_any_element())
             .into_any_element()
-    }
-
-    /// `#lyrics-scroll` 滚动容器（两分支共用包装层）：挂 `on_scroll_wheel`——**每次滚轮事件**
-    /// 都记「手动滚动」并退出自动跟随。关键点：offset 已钳到界限（内容尽头）时原生滚动
-    /// 事件照样触发 → 用户持续滚动时「停止滚动」计时被持续刷新，不再满 ~3s 误恢复拉回视窗
-    /// （真机复报 bug1）。`overflow_y_scroll` 原生滚动手感不变，`track_scroll` 绑定句柄。
-    fn lyrics_scroll_container(
-        &mut self,
-        cx: &mut Context<Self>,
-        inner: impl IntoElement,
-    ) -> AnyElement {
-        let wheel = cx.listener(
-            |this: &mut MusicView, _ev: &ScrollWheelEvent, _w: &mut Window, cx: &mut Context<Self>| {
-                this.lyrics_manual_since = Some(cx.background_executor().now());
-                this.lyrics_follow_y = None;
-            },
-        );
-        div()
-            .id("lyrics-scroll")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.lyrics_scroll)
-            .on_scroll_wheel(wheel)
-            .child(inner)
-            .into_any_element()
-    }
-
-    /// 同步歌词内容（全屏右列与右侧面板「歌词」tab 共用）：有歌词 → `overflow_y_scroll`
-    /// 可滚动容器，内容总高 = 行数×固定行高（全歌词可经滚轮浏览）；只物化可视/近邻窗口
-    /// 行（K12：播放中 250ms tick 不全量物化几百行）；自动跟随（active 行居中）与手动
-    /// 滚动暂停/恢复由 `on_tick` → [`Self::update_lyrics_follow`] 写滚动偏移。
-    /// 无歌词 → 空态 + 「同名 .lrc」提示。`flex_1` 由调用方包一层保证占满可用高。
-    pub(super) fn render_lyrics_panel_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let p = self.player.read(cx);
-        let pos_ms = (p.position() * 1000.0) as i64;
-        let lyrics = p.current_track().and_then(|t| t.lyrics.clone());
-        let Some(lyrics) = lyrics else {
-            return div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .px(px(16.))
-                .child(
-                    IconView::new(MusicIcon::Lyrics)
-                        .size(px(32.))
-                        .text_color(theme::text3()),
-                )
-                .child(
-                    div()
-                        .mt(px(12.))
-                        .text_size(px(14.))
-                        .text_color(theme::text3())
-                        .child("暂无歌词"),
-                )
-                .child(
-                    div()
-                        .mt(px(6.))
-                        .text_size(px(12.))
-                        .text_color(theme::text3().opacity(0.7))
-                        .child("同名 .lrc 放在歌曲旁即可显示同步歌词"),
-                )
-                .into_any_element();
-        };
-
-        let n = lyrics.lines.len();
-        if n == 0 {
-            return div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(14.))
-                .text_color(theme::text3())
-                .child("暂无歌词")
-                .into_any_element();
-        }
-        let active = lyrics.active_index(pos_ms);
-        let viewport_h = self.lyrics_scroll.bounds().size.height.as_f32();
-        // 内容总高 ≤ 视口：全部物化并垂直居中（歌词少时保持「居中」观感，无可滚范围）。
-        // 进入本分支时 viewport_h 必 > 0（n>0 且首帧未布局时走滚动分支兜底）。
-        let fits = n as f32 * LYRIC_ROW_H <= viewport_h;
-        let mut rows: Vec<AnyElement> = Vec::new();
-        if fits {
-            for (i, line) in lyrics.lines.iter().enumerate() {
-                rows.push(self.lyric_row(&line.text, lyric_state_for(active, i)));
-            }
-            return self.lyrics_scroll_container(
-                cx,
-                div()
-                    .flex()
-                    .flex_col()
-                    .h(px(viewport_h))
-                    .justify_center()
-                    .children(rows),
-            );
-        }
-        // 超视口：只物化可视/近邻窗口行，上下补定高垫片保持内容总高 = n×行高（可滚全量）。
-        let (first, last) = self.lyrics_visible_window(n);
-        for (i, line) in lyrics.lines[first..last].iter().enumerate() {
-            let idx = first + i;
-            rows.push(self.lyric_row(&line.text, lyric_state_for(active, idx)));
-        }
-        let top_h = first as f32 * LYRIC_ROW_H;
-        let bottom_h = (n - last) as f32 * LYRIC_ROW_H;
-        self.lyrics_scroll_container(
-            cx,
-            div()
-                .flex()
-                .flex_col()
-                .h(px(n as f32 * LYRIC_ROW_H))
-                .child(div().h(px(top_h)))
-                .children(rows)
-                .child(div().h(px(bottom_h))),
-        )
-    }
-
-    /// 歌词当前应物化的行窗 `(first, last_exclusive)`：由当前滚动偏移/视口反算行号
-    /// （行高固定 → 精确），再外扩缓冲行。渲染物化与测试断言共用同一算法。
-    pub(super) fn lyrics_visible_window(&mut self, n: usize) -> (usize, usize) {
-        if n == 0 {
-            return (0, 0);
-        }
-        let viewport_h = self.lyrics_scroll.bounds().size.height.as_f32();
-        let max = self.lyrics_scroll.max_offset().y.as_f32();
-        // 先钳位再反算：滚轮处理先加、布局才钳回（div.rs `scroll_offset.y += delta_y` 无
-        // 界内钳制）→ render/prepaint 可能读到「max + 残量」的越界瞬时偏移；按钳位后
-        // 偏移算行窗，保证与最终布局一致——内容尽头继续滚轮不再错位一行/1 帧闪（复报二）。
-        let raw = -self.lyrics_scroll.offset().y.as_f32();
-        let off = raw.clamp(0.0, max.max(0.0));
-        let first = (off / LYRIC_ROW_H).floor().max(0.0) as usize;
-        let first = first.min(n.saturating_sub(1));
-        let visible = if viewport_h > 0.0 {
-            (viewport_h / LYRIC_ROW_H).ceil() as usize
-        } else {
-            LYRIC_FALLBACK_VISIBLE
-        };
-        let last = (first + visible + LYRIC_ROW_BUFFER * 2).min(n);
-        (first, last)
-    }
-
-    /// 自动跟随目标滚动量（句首坐标 y，px；写入 offset 时取其负值）：active 行居中、
-    /// 首/末行越界夹到 [0, max]（`max_offset` 布局后才有值）。供跟随与测试共用。
-    pub(super) fn lyrics_follow_scroll_top(&mut self, active: usize, n: usize) -> f32 {
-        if n == 0 {
-            return 0.0;
-        }
-        let viewport_h = self.lyrics_scroll.bounds().size.height.as_f32();
-        let max_y = self.lyrics_scroll.max_offset().y.as_f32();
-        let center = active as f32 * LYRIC_ROW_H + LYRIC_ROW_H * 0.5 - viewport_h * 0.5;
-        center.max(0.0).min(max_y.max(0.0))
-    }
-
-    /// 歌词自动跟随（每 tick 由 `on_tick` 调用）：仅播放中执行——按当前播放位置得
-    /// active 行，把滚动偏移写入「active 行居中」（无动画、不闪跳，维持现状跟随手感）。
-    /// 跟随中若实测偏移偏离了上次写入值（用户滚轮/拖滚动条手动滚动）→ 记
-    /// `lyrics_manual_since` 暂停跟随；停止滚动 ≥ [`LYRIC_FOLLOW_RESUME_MS`] 后自动恢复
-    /// 跟随当前句。切歌/换曲（track path 变化）复位跟随态。暂停/空闲不写入（尊重手动）
-    pub(super) fn update_lyrics_follow(&mut self, cx: &mut Context<Self>) {
-        // 非播放：不动滚动（尊重手动浏览）；清跟随基准，恢复播放时重新建立跟随。
-        if !self.player.read(cx).playing() {
-            self.lyrics_follow_y = None;
-            return;
-        }
-        let Some(track) = self.player.read(cx).current_track() else {
-            self.lyrics_follow_y = None;
-            return;
-        };
-        let Some(lyrics) = &track.lyrics else {
-            self.lyrics_follow_y = None;
-            return;
-        };
-        if lyrics.lines.is_empty() {
-            return;
-        }
-        // 切歌/换曲（path 变化）→ 复位跟随态，新曲从自动跟随当前句开始。
-        if self.lyrics_track_path.as_deref() != Some(track.path.as_path()) {
-            self.lyrics_track_path = Some(track.path.clone());
-            self.lyrics_manual_since = None;
-            self.lyrics_manual_last_y = 0.0;
-            self.lyrics_follow_y = None;
-        }
-        let n = lyrics.lines.len();
-        let pos_ms = (self.player.read(cx).position() * 1000.0) as i64;
-        let active = lyrics.active_index(pos_ms).unwrap_or(0);
-        let handle = self.lyrics_scroll.clone();
-        let follow_y = -self.lyrics_follow_scroll_top(active, n);
-        let offset_now = handle.offset().y.as_f32();
-        const EPS: f32 = 2.0;
-        // 跟随中：若实测偏移偏离了我们上次写入的值 → 用户手动滚过，暂停跟随。
-        if self.lyrics_manual_since.is_none()
-            && let Some(prev) = self.lyrics_follow_y
-            && (offset_now - prev).abs() > EPS
-        {
-            self.lyrics_manual_since = Some(cx.background_executor().now());
-            self.lyrics_manual_last_y = offset_now;
-            self.lyrics_follow_y = None;
-        }
-        let now = cx.background_executor().now();
-        match self.lyrics_manual_since {
-            Some(since) => {
-                if now.duration_since(since) >= Duration::from_millis(LYRIC_FOLLOW_RESUME_MS) {
-                    // 停止滚动 ≥3s：恢复跟随当前句。防闪（真机复报 bug2）：目标与当前
-                    // 偏移差不足一行时不写 offset（不触发重排/视窗边界抖动），直接认定
-                    // 当前视口即跟随位；偏差超过一行才写一次回到居中。
-                    self.lyrics_manual_since = None;
-                    if (offset_now - follow_y).abs() <= LYRIC_ROW_H {
-                        self.lyrics_follow_y = Some(offset_now);
-                    } else {
-                        self.lyrics_follow_y = Some(follow_y);
-                        handle.set_offset(point(px(0.), px(follow_y)));
-                    }
-                } else if (offset_now - self.lyrics_manual_last_y).abs() > EPS {
-                    // 仍在滚动（scrollbar 拖拽 / fling 落地未触滚轮事件时兜底）：刷新计时。
-                    self.lyrics_manual_since = Some(now);
-                    self.lyrics_manual_last_y = offset_now;
-                }
-                // 否则保持用户浏览位置，不写入偏移。
-            }
-            None => {
-                // 自动跟随：写入居中偏移（幂等；GPUI 布局侧还会做最终夹取）。
-                self.lyrics_follow_y = Some(follow_y);
-                handle.set_offset(point(px(0.), px(follow_y)));
-            }
-        }
-    }
-
-    /// 单句歌词行（v2 `.fs-lyric` 三态样式；固定行高 [`LYRIC_ROW_H`]——滚动量程按它反算）。
-    fn lyric_row(&mut self, text: &str, state: LyricState) -> AnyElement {
-        let (size, color, bg, weight) = match state {
-            LyricState::Active => (
-                px(17.),
-                gpui::white(),
-                theme::accent().opacity(0.10),
-                Some(gpui::FontWeight::BOLD),
-            ),
-            LyricState::Past => (
-                px(15.),
-                gpui::white().opacity(0.13),
-                gpui::transparent_black(),
-                None,
-            ),
-            LyricState::Future => (
-                px(15.),
-                gpui::white().opacity(0.24),
-                gpui::transparent_black(),
-                None,
-            ),
-        };
-        let mut el = div()
-            .px(px(14.))
-            .h(px(LYRIC_ROW_H))
-            .flex()
-            .items_center()
-            .rounded(px(6.))
-            .text_size(size)
-            .text_color(color)
-            .bg(bg);
-        if let Some(w) = weight {
-            el = el.font_weight(w);
-        }
-        el.child(text.to_string()).into_any_element()
     }
 
     /// 底部 eq 渐变装饰条（v2 `.fs-eq-bar`：3px、accent→pink，播放 0.5 / 暂停 0.15）。
