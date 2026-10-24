@@ -63,8 +63,6 @@ pub enum MusicIcon {
     FullscreenExit,
     /// 加入播放列表（列表 + 加号）。
     PlaylistAdd,
-    /// 更多（横三点）。
-    More,
     /// 拒绝/高品质（四角星）。
     Badge,
     /// 黑胶唱片（logo / 封面占位）。
@@ -151,9 +149,6 @@ impl MusicIcon {
             }
             MusicIcon::PlaylistAdd => {
                 "<path d=\"M3 6h13\"/><path d=\"M3 12h13\"/><path d=\"M3 18h7\"/><line x1=\"19\" y1=\"14\" x2=\"19\" y2=\"20\"/><line x1=\"16\" y1=\"17\" x2=\"22\" y2=\"17\"/>"
-            }
-            MusicIcon::More => {
-                "<circle cx=\"5\" cy=\"12\" r=\"1\"/><circle cx=\"12\" cy=\"12\" r=\"1\"/><circle cx=\"19\" cy=\"12\" r=\"1\"/>"
             }
             MusicIcon::Badge => {
                 "<path d=\"M12 3l1.9 4.9L19 9.6l-4.2 1.8L12 16l-2.8-4.6L5 9.6l5.1-1.7z\"/>"
@@ -317,7 +312,6 @@ mod tests {
             MusicIcon::Fullscreen,
             MusicIcon::FullscreenExit,
             MusicIcon::PlaylistAdd,
-            MusicIcon::More,
             MusicIcon::Badge,
             MusicIcon::Disc,
         ];

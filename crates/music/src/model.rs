@@ -15,6 +15,106 @@ pub struct Track {
     pub duration: f64,
     /// 渐变封面「肤色」主色（由 `artist - title` 稳定哈希派生）。
     pub grad: (u32, u32, u32),
+    /// 封面图片（同名 `.jpg/.jpeg/.png/.webp` 侧车；无则 None，回退渐变）。
+    pub cover_path: Option<std::path::PathBuf>,
+    /// 歌词（同名 `.lrc` 侧车解析；无则 None）。
+    pub lyrics: Option<Lyrics>,
+}
+
+/// 一句带时间戳的歌词。
+#[derive(Clone, Debug)]
+pub struct LyricLine {
+    /// 句首时间（毫秒）。
+    pub time_ms: i64,
+    /// 歌词文本（去前后空白）。
+    pub text: String,
+}
+
+/// 歌曲歌词（解析自同名 `.lrc` 侧车）。无时间戳行被忽略。
+#[derive(Clone, Debug)]
+pub struct Lyrics {
+    /// 按时间升序的时间戳行。
+    pub lines: Vec<LyricLine>,
+}
+
+impl Lyrics {
+    /// `pos_ms` 时刻「当前唱到哪一行」：最后一个 `time_ms <= pos_ms` 的行下标；
+    /// 尚未到首句 / 无歌词 → None。
+    pub fn active_index(&self, pos_ms: i64) -> Option<usize> {
+        let mut idx = None;
+        for (i, l) in self.lines.iter().enumerate() {
+            if l.time_ms <= pos_ms {
+                idx = Some(i);
+            } else {
+                break;
+            }
+        }
+        idx
+    }
+}
+
+/// 解析 LRC 文本（RFC 惯例）：
+/// - `[mm:ss(.xx)]文本` 时间戳行；同一行可挂多个时间戳 → 展开为多句；
+/// - 元数据 `[ti:]/[ar:]/[al:]` 忽略；`[offset:±毫秒]` 整体平移时间；
+/// - 无可解析时间戳行 / 全文空 → None。
+pub fn parse_lrc(content: &str) -> Option<Lyrics> {
+    let mut offset: i64 = 0;
+    let mut out: Vec<LyricLine> = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut rest = line;
+        let mut times: Vec<i64> = Vec::new();
+        loop {
+            let Some(closed) = rest.find(']') else { break };
+            if !rest.starts_with('[') {
+                break;
+            }
+            let tag = &rest[1..closed];
+            rest = &rest[closed + 1..];
+            if let Some(ms) = parse_lrc_time(tag) {
+                times.push(ms);
+            } else if let Some(o) = tag.strip_prefix("offset:") {
+                if let Ok(v) = o.trim().parse::<i64>() {
+                    offset = v;
+                }
+            }
+            // 其它 [..] 元数据标签（ti:/ar:/al:）直接忽略
+        }
+        let text = rest.trim().to_string();
+        if times.is_empty() || text.is_empty() {
+            continue;
+        }
+        for ms in times {
+            out.push(LyricLine {
+                time_ms: ms + offset,
+                text: text.clone(),
+            });
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.sort_by_key(|l| l.time_ms);
+    Some(Lyrics { lines: out })
+}
+
+/// 解析单个 `mm:ss(.xx)` 时间戳 → 毫秒；非法 → None。
+fn parse_lrc_time(tag: &str) -> Option<i64> {
+    let (mm, ss) = tag.split_once(':')?;
+    let mm: i64 = mm.trim().parse().ok()?;
+    let sec = ss.trim();
+    let (sec, ms) = match sec.split_once('.') {
+        Some((s, f)) => {
+            let frac = format!("{:0<3}", f);
+            let ms = frac.chars().take(3).collect::<String>();
+            (s.trim().parse::<i64>().ok()?, ms.parse::<i64>().ok()?)
+        }
+        None => (sec.parse::<i64>().ok()?, 0),
+    };
+    Some(mm * 60_000 + sec * 1000 + ms)
 }
 
 /// 混排分组（按艺术家聚合）。
@@ -162,5 +262,66 @@ mod tests {
         assert!(dark.starts_with('#') && dark.len() == 7, "dark={dark}");
         assert_ne!(light, dark, "两色应是主色与变体（不同）");
         assert_eq!(gradient_pair("周杰伦 - 晴天"), gradient_pair("周杰伦 - 晴天"));
+    }
+
+    #[test]
+    fn parse_lrc_timestamps_and_meta() {
+        let content = "\
+[ti:晴天]
+[ar:周杰伦]
+[00:01.50]前奏响起
+[00:05]第一句歌词
+[01:02.250]带毫秒的句
+[mm:ss]纯文本行被忽略
+";
+        let l = parse_lrc(content).expect("应解析出歌词");
+        let t: Vec<(i64, &str)> = l.lines.iter().map(|x| (x.time_ms, x.text.as_str())).collect();
+        assert_eq!(
+            t,
+            vec![(1500, "前奏响起"), (5000, "第一句歌词"), (62250, "带毫秒的句")]
+        );
+    }
+
+    #[test]
+    fn parse_lrc_multiple_timestamps_expand_and_offset() {
+        // 双时间戳同一句 → 展开两行；[offset:+] 整体平移
+        let content = "\
+[offset:+500]
+[00:01][01:02]同一句
+[00:02.5]另一句
+";
+        let l = parse_lrc(content).expect("应解析出歌词");
+        let t: Vec<(i64, &str)> = l.lines.iter().map(|x| (x.time_ms, x.text.as_str())).collect();
+        assert_eq!(
+            t,
+            vec![(1500, "同一句"), (3000, "另一句"), (62500, "同一句")]
+        );
+    }
+
+    #[test]
+    fn parse_lrc_none_and_invalid() {
+        assert!(parse_lrc("没有时间戳的歌词\n也不会有解析结果").is_none());
+        assert!(parse_lrc("").is_none());
+        assert!(parse_lrc("[00:01]").is_none(), "有时间戳但无文本 → 忽略");
+        // 非法时间戳被跳过
+        let l = parse_lrc("[00:xx]坏时间戳\n[01:00]好句").expect("至少保留合法句");
+        assert_eq!(l.lines.len(), 1);
+        assert_eq!(l.lines[0].text, "好句");
+    }
+
+    #[test]
+    fn lyrics_active_index() {
+        let l = Lyrics {
+            lines: vec![
+                LyricLine { time_ms: 1000, text: "a".into() },
+                LyricLine { time_ms: 5000, text: "b".into() },
+                LyricLine { time_ms: 9000, text: "c".into() },
+            ],
+        };
+        assert_eq!(l.active_index(0), None, "首句之前无活动行");
+        assert_eq!(l.active_index(1000), Some(0));
+        assert_eq!(l.active_index(4999), Some(0));
+        assert_eq!(l.active_index(5000), Some(1));
+        assert_eq!(l.active_index(99999), Some(2));
     }
 }

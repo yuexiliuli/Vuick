@@ -7,9 +7,10 @@ description = "gpui-editor 音乐播放器核心引擎 crate（FFmpeg 音频经 
 
 [dependencies]
 gpui = { workspace = true }
-anyhow = { workspace = true }
 cpal = { workspace = true }
 libloading = { workspace = true }
+anyhow = { workspace = true }
+image = { workspace = true }
 config = { path = "../config" }
 
 [dev-dependencies]

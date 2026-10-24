@@ -31,7 +31,7 @@ impl super::MusicView {
                 col.push(self.render_up_next(cx));
             }
             RightTab::Lyrics => {
-                col.push(self.render_lyrics_empty());
+                col.push(self.render_lyrics_panel_content(cx));
             }
             RightTab::Queue => {
                 col.push(self.render_queue_list(window, cx));
@@ -125,10 +125,43 @@ impl super::MusicView {
         let repeat = p.repeat();
         let cur_liked = p.current().map(|i| p.is_liked(i)).unwrap_or(false);
 
-        // 封面渐变（无当前曲目回退 accent→deep）。
+        // 封面渐变（无当前曲目回退 accent→deep）；有真实封面图 → 直接铺图。
         let (light, dark) = grad
             .map(theme::gradient_pair_of)
             .unwrap_or((theme::accent(), theme::bg_deep()));
+        let cover = self.cover_for_current(cx);
+        let art_base = match &cover {
+            Some(_) => self.render_cover_or(cover, div().into_any_element()),
+            None => div()
+                .size_full()
+                .child(theme::gradient_cover((light, dark), 16.0))
+                .child(
+                    // 黑胶圈 ×3（70/50/30%），中心 flex 对齐。
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(widgets::vinyl_ring(ART_PX * 0.70, playing, "np-vinyl-1".into()))
+                        .child(widgets::vinyl_ring(ART_PX * 0.50, playing, "np-vinyl-2".into()))
+                        .child(widgets::vinyl_ring(ART_PX * 0.30, playing, "np-vinyl-3".into())),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            IconView::new(MusicIcon::Note)
+                                .size(px(64.))
+                                .text_color(gpui::white().opacity(0.15)),
+                        ),
+                )
+                .into_any_element(),
+        };
         let art = div()
             .id("np-art")
             .w(px(ART_PX))
@@ -138,32 +171,7 @@ impl super::MusicView {
             .overflow_hidden()
             .mx_auto()
             .cursor(CursorStyle::PointingHand)
-            .child(theme::gradient_cover((light, dark), 16.0))
-            .child(
-                // 黑胶圈 ×3（70/50/30%），中心 flex 对齐。
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(widgets::vinyl_ring(ART_PX * 0.70, playing, "np-vinyl-1".into()))
-                    .child(widgets::vinyl_ring(ART_PX * 0.50, playing, "np-vinyl-2".into()))
-                    .child(widgets::vinyl_ring(ART_PX * 0.30, playing, "np-vinyl-3".into())),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        IconView::new(MusicIcon::Note)
-                            .size(px(64.))
-                            .text_color(gpui::white().opacity(0.15)),
-                    ),
-            )
+            .child(art_base)
             .on_click(cx.listener(|this: &mut MusicView, _ev, _w, cx| this.toggle_fs(cx)));
 
         // 进度条（np_progress）。
@@ -357,27 +365,6 @@ impl super::MusicView {
                     .text_color(if active { theme::pink() } else { theme::text3() }),
             )
             .child(label.to_string())
-            .into_any_element()
-    }
-
-    /// 歌词 tab 空态。
-    fn render_lyrics_empty(&mut self) -> AnyElement {
-        div()
-            .pt(px(40.))
-            .flex()
-            .flex_col()
-            .items_center()
-            .text_color(theme::text3())
-            .child(
-                IconView::new(MusicIcon::Lyrics).size(px(36.)).text_color(theme::text3()),
-            )
-            .child(
-                div()
-                    .pt(px(12.))
-                    .text_size(px(14.))
-                    .text_color(theme::text2())
-                    .child("暂无歌词"),
-            )
             .into_any_element()
     }
 

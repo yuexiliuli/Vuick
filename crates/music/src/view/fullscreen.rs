@@ -1,27 +1,43 @@
-//! 全屏播放浮层：`fs_open` 时渲染为根视图**最后子元素**（absolute inset-0，绘制/命中
-//! 最上层，盖住三栏 + 底栏）。复刻原型 `.fullscreen-player`：
-//! 动态背景（GPUI 无 radial-gradient，用两层大圆半透明光晕近似）、顶部工具条、
-//! 主体（左 380 封面 + 黑胶圈动画 / 右 tab 控制·歌词·队列）、底部 eq 渐变装饰条、
-//! 底部快捷键提示。Esc 关全屏由根 `on_key` 处理，close 钮也关。
+//! 全屏播放浮层（v2 复刻）：`fs_open` 时渲染为根视图**最后子元素**（absolute inset-0，
+//! 绘制/命中最上层，盖住三栏 + 底栏）。原型 `prototype-orbitrum-player-v2.html`
+//! `.fullscreen-player`，相对 v1 的结构改动：
+//! - 移除右侧「控制/歌词/队列」tab，右列改为**纯歌词面板**；
+//! - 全部播放控制并入左列：封面(320)→歌曲信息→进度→控制行→音量+操作；
+//! - 顶栏中心 "NOW PLAYING"；封面双层阴影；黑胶三圈不同周期/转向；进度条悬停 5→7px +
+//!   亮色圆点；暂停时黑胶圈/装饰条变暗。
+//! GPUI 无 CSS `radial-gradient`/`letter-spacing`：背景光晕用两个大圆半透明层近似、
+//! 文字间距忽略；黑胶圈用 svg 圆环 + 旋转动画（暂停即停）。Esc 关全屏由根 `on_key`
+//! 处理，close 钮也关。
+
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, StatefulInteractiveElement as _, Styled as _,
+    Window, div, px,
 };
 
-use crate::model::RepeatMode;
+use crate::model::{RepeatMode, duration_str};
 
 use super::icon::{IconView, MusicIcon};
-use super::{FsTab, MusicView, theme, widgets};
+use super::{MusicView, theme, widgets};
 
 /// 全屏封面边长（px），黑胶圈按比例派生。
-const FS_ART_PX: f32 = 380.0;
+const FS_COVER_PX: f32 = 320.0;
+
+/// 歌词行三态（v2 `.fs-lyric`：active 白+加粗+accent 底 / past 暗 / future 更亮）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LyricState {
+    Active,
+    Past,
+    Future,
+}
 
 impl super::MusicView {
-    /// 全屏浮层整块。
+    /// 全屏浮层整块（v2：左列封面+控制 / 右列歌词）。
     pub(super) fn render_fullscreen(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.player.read(cx);
@@ -34,10 +50,7 @@ impl super::MusicView {
             .current_track()
             .map(|t| t.artist.clone())
             .unwrap_or_else(|| "—".to_string());
-        let album = p
-            .current_track()
-            .map(|t| t.album.clone())
-            .unwrap_or_else(|| "".to_string());
+        let album = p.current_track().map(|t| t.album.clone()).unwrap_or_default();
         let grad = p.current_track().map(|t| t.grad);
         let (light, dark) = grad
             .map(theme::gradient_pair_of)
@@ -48,86 +61,48 @@ impl super::MusicView {
             .debug_selector(|| "music-fs".into())
             .absolute()
             .inset_0()
-            .relative()
             .overflow_hidden()
             .flex()
             .flex_col()
             .bg(theme::bg_deep())
-            .child(self.render_fs_glow())
+            .child(self.render_fs_bg())
             .child(self.render_fs_topbar(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap_x(px(64.))
-                    .flex_1()
-                    .min_h(px(0.))
-                    .px(px(48.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .child(self.render_fs_art((light, dark), playing))
-                            .child(self.render_fs_song_info(title, artist, album)),
-                    )
-                    .child(self.render_fs_control_section(window, cx)),
-            )
+            .child(self.render_fs_body(cx, title, artist, album, light, dark, playing))
             .child(self.render_fs_bottom_eq(playing))
-            .child(self.render_fs_shortcuts())
             .into_any_element()
     }
 
-    /// 动态背景光晕（两层大圆半透明，近似原型的 radial-gradient 光感）。
-    fn render_fs_glow(&mut self) -> AnyElement {
+    /// 动态背景光晕（v2 `.fs-bg`）：accent 大圆（左上 25%,30%）+ pink 大圆（右下 75%,70%），
+    /// 半透明大圆近似 radial-gradient 光感；GPUI 无径向渐变故不追求精确。
+    fn render_fs_bg(&mut self) -> AnyElement {
         div()
             .absolute()
             .inset_0()
             .child(
                 div()
                     .absolute()
-                    .w(px(700.))
-                    .h(px(700.))
-                    .left(px(-120.))
-                    .top(px(-180.))
-                    .rounded(px(350.))
+                    .w(px(760.))
+                    .h(px(760.))
+                    .left(px(-140.))
+                    .top(px(-220.))
+                    .rounded(px(380.))
                     .bg(theme::accent().opacity(0.16)),
             )
             .child(
                 div()
                     .absolute()
-                    .w(px(600.))
-                    .h(px(600.))
-                    .right(px(-140.))
-                    .bottom(px(-160.))
-                    .rounded(px(300.))
+                    .w(px(640.))
+                    .h(px(640.))
+                    .right(px(-160.))
+                    .bottom(px(-240.))
+                    .rounded(px(320.))
                     .bg(theme::pink().opacity(0.12)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .w(px(500.))
-                    .h(px(500.))
-                    .left(px(60.))
-                    .bottom(px(-120.))
-                    .rounded(px(250.))
-                    .bg(theme::green().opacity(0.05)),
             )
             .into_any_element()
     }
 
-    /// 顶部工具条：左 playlist_add/share，中「正在播放」，右 badge/more/close。
+    /// 顶部工具条（v2）：左 playlist_add/share，中 "NOW PLAYING"，右 high_quality/close。
     fn render_fs_topbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let left = [
-            (MusicIcon::PlaylistAdd, "添加到播放列表"),
-            (MusicIcon::Share, "分享链接已复制"),
-        ];
-        let right = [
-            (MusicIcon::Badge, "画质：高品质"),
-            (MusicIcon::More, "更多选项"),
-        ];
         div()
             .absolute()
             .top_0()
@@ -136,44 +111,42 @@ impl super::MusicView {
             .flex()
             .items_center()
             .justify_between()
-            .px(px(30.))
-            .py(px(18.))
+            .px(px(32.))
+            .py(px(20.))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_x(px(12.))
-                    .children(left.into_iter().map(|(icon, tip)| {
-                        self.fs_icon_btn(icon, tip, cx)
-                    })),
+                    .child(self.fs_icon_btn(MusicIcon::PlaylistAdd, "已添加到播放列表", cx))
+                    .child(self.fs_icon_btn(MusicIcon::Share, "分享链接已复制", cx)),
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(11.))
                     .text_color(theme::text3())
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("正在播放"),
+                    .child("NOW PLAYING"),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_x(px(12.))
-                    .children(right.into_iter().map(|(icon, tip)| {
-                        self.fs_icon_btn(icon, tip, cx)
-                    }))
+                    .child(self.fs_icon_btn(MusicIcon::Badge, "高音质", cx))
                     .child(self.fs_close_btn(cx)),
             )
             .into_any_element()
     }
 
-    /// 工具条圆钮（40px）：点击 toast 提示。
+    /// 工具条圆钮（40px，v2 悬停变亮）。
     fn fs_icon_btn(
         &mut self,
         icon: MusicIcon,
         tip: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let hovered = self.fs_hover == Some(tip);
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, _cx| this.toast_msg(tip));
         div()
             .id(format!("fs-btn-{tip}"))
@@ -183,17 +156,25 @@ impl super::MusicView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::white().opacity(0.06))
+            .bg(gpui::white().opacity(if hovered { 0.12 } else { 0.06 }))
             .border_1()
             .border_color(gpui::white().opacity(0.08))
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
-            .child(IconView::new(icon).size(px(19.)).text_color(theme::text2()))
+            .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
+                this.set_fs_hover(tip, *hovered, cx);
+            }))
+            .child(
+                IconView::new(icon)
+                    .size(px(20.))
+                    .text_color(if hovered { theme::text() } else { theme::text2() }),
+            )
             .into_any_element()
     }
 
     /// 关闭全屏钮（红 hover 语义：直接关 fs）。
     fn fs_close_btn(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let hovered = self.fs_hover == Some("fs-close");
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| {
             this.state.fs_open = false;
             cx.notify();
@@ -206,259 +187,314 @@ impl super::MusicView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::white().opacity(0.08))
+            .bg(if hovered {
+                gpui::hsla(5., 0.6, 0.55, 0.22)
+            } else {
+                gpui::white().opacity(0.08)
+            })
             .border_1()
-            .border_color(gpui::white().opacity(0.12))
+            .border_color(if hovered {
+                gpui::hsla(5., 0.6, 0.6, 0.3)
+            } else {
+                gpui::white().opacity(0.12)
+            })
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
+            .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
+                this.set_fs_hover("fs-close", *hovered, cx);
+            }))
             .child(
                 IconView::new(MusicIcon::FullscreenExit)
-                    .size(px(19.))
-                    .text_color(theme::text2()),
+                    .size(px(20.))
+                    .text_color(if hovered {
+                        gpui::hsla(5., 0.7, 0.7, 1.)
+                    } else {
+                        theme::text2()
+                    }),
             )
             .into_any_element()
     }
 
-    /// 左列：大封面（渐变 + 黑胶圈旋转动画）+ 音符占位。
-    fn render_fs_art(&mut self, (light, dark): (gpui::Hsla, gpui::Hsla), playing: bool) -> AnyElement {
+    /// 主体两栏（v2 `.fs-body`：左列封面+控制，右列歌词）。
+    fn render_fs_body(
+        &mut self,
+        cx: &mut Context<Self>,
+        title: String,
+        artist: String,
+        album: String,
+        light: Hsla,
+        dark: Hsla,
+        playing: bool,
+    ) -> AnyElement {
         div()
-            .w(px(FS_ART_PX))
-            .h(px(FS_ART_PX))
-            .rounded(px(20.))
+            .relative()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_x(px(80.))
+            .px(px(56.))
+            .py(px(48.))
+            .child(self.render_fs_left(cx, title, artist, album, light, dark, playing))
+            .child(self.render_fs_lyrics(cx))
+            .into_any_element()
+    }
+
+    /// 左列：封面 → 歌曲信息 → 进度 → 控制 → 音量+操作。
+    fn render_fs_left(
+        &mut self,
+        cx: &mut Context<Self>,
+        title: String,
+        artist: String,
+        album: String,
+        light: Hsla,
+        dark: Hsla,
+        playing: bool,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .w(px(FS_COVER_PX))
+            .flex_shrink_0()
+            .child(self.render_fs_cover(cx, (light, dark), playing))
+            .child(self.render_fs_song_meta(title, artist, album))
+            .child(self.render_fs_progress(cx))
+            .child(self.render_fs_controls(cx))
+            .child(self.render_fs_bottom_row(cx))
+            .into_any_element()
+    }
+
+    /// 封面 320：有真实封面图 → 直接铺图（`ObjectFit::Cover`）；无 → 渐变底 + 黑胶三圈
+    /// + 音符回退（v2 骨架）。双层阴影（压暗 + accent 光晕）恒在。
+    fn render_fs_cover(
+        &mut self,
+        cx: &mut Context<Self>,
+        (light, dark): (Hsla, Hsla),
+        playing: bool,
+    ) -> AnyElement {
+        let cover = self.cover_for_current(cx);
+        let base = match &cover {
+            Some(_) => self.render_cover_or(cover, div().into_any_element()),
+            None => div()
+                .size_full()
+                .child(theme::gradient_cover((light, dark), 16.0))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(widgets::vinyl_ring_at(
+                            FS_COVER_PX * 0.80,
+                            playing,
+                            "fsv-a".into(),
+                            Duration::from_secs(12),
+                            false,
+                        ))
+                        .child(widgets::vinyl_ring_at(
+                            FS_COVER_PX * 0.55,
+                            playing,
+                            "fsv-b".into(),
+                            Duration::from_secs(9),
+                            true,
+                        ))
+                        .child(widgets::vinyl_ring_at(
+                            FS_COVER_PX * 0.30,
+                            playing,
+                            "fsv-c".into(),
+                            Duration::from_secs(7),
+                            false,
+                        )),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            IconView::new(MusicIcon::Note)
+                                .size(px(80.))
+                                .text_color(gpui::white().opacity(0.12)),
+                        ),
+                )
+                .into_any_element(),
+        };
+        div()
+            .w(px(FS_COVER_PX))
+            .h(px(FS_COVER_PX))
+            .rounded(px(16.))
             .relative()
             .overflow_hidden()
-            .child(theme::gradient_cover((light, dark), 20.0))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(widgets::vinyl_ring(
-                        FS_ART_PX * 0.80,
-                        playing,
-                        "fs-vinyl-1".into(),
-                    ))
-                    .child(widgets::vinyl_ring(
-                        FS_ART_PX * 0.55,
-                        playing,
-                        "fs-vinyl-2".into(),
-                    ))
-                    .child(widgets::vinyl_ring(
-                        FS_ART_PX * 0.30,
-                        playing,
-                        "fs-vinyl-3".into(),
-                    )),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        IconView::new(MusicIcon::Note)
-                            .size(px(88.))
-                            .text_color(gpui::white().opacity(0.15)),
-                    ),
-            )
+            .mb(px(24.))
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(20.), gpui::hsla(0., 0., 0., 0.5))
+                    .blur_radius(px(60.)),
+                gpui::BoxShadow::new(px(0.), px(0.), theme::accent().opacity(0.35))
+                    .blur_radius(px(60.)),
+            ])
+            .child(base)
             .into_any_element()
     }
 
-    /// 封面下方歌曲信息：渐变标题 + 艺术家 + 专辑。
-    fn render_fs_song_info(
+    /// 封面下方歌曲信息（左对齐，v2 `.fs-song-meta`）。
+    fn render_fs_song_meta(
         &mut self,
         title: String,
         artist: String,
         album: String,
     ) -> AnyElement {
         div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(24.))
+            .w_full()
+            .mb(px(20.))
             .child(
                 div()
-                    .text_size(px(28.))
+                    .text_size(px(22.))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(theme::accent_light())
+                    .text_color(theme::text())
                     .text_ellipsis()
                     .child(title),
             )
             .child(
                 div()
-                    .pt(px(6.))
-                    .text_size(px(16.))
+                    .mt(px(4.))
+                    .text_size(px(14.))
                     .text_color(theme::text2())
+                    .text_ellipsis()
                     .child(artist),
             )
             .child(
                 div()
-                    .pt(px(4.))
-                    .text_size(px(13.))
+                    .mt(px(2.))
+                    .text_size(px(12.))
                     .text_color(theme::text3())
+                    .text_ellipsis()
                     .child(if album.is_empty() { "—".to_string() } else { album }),
             )
             .into_any_element()
     }
 
-    /// 右列：scripts tabs + 内容。
-    fn render_fs_control_section(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let fs_tab = self.state.fs_tab;
-        div()
-            .w(px(400.))
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .min_h(px(0.))
-            .child(self.render_fs_tabs(cx))
-            .child(self.render_fs_tab_content(window, cx, fs_tab))
-            .into_any_element()
-    }
-
-    /// Tab 条（控制/歌词/队列）：active accent 底。
-    fn render_fs_tabs(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let tabs = [
-            (FsTab::Controls, "控制"),
-            (FsTab::Lyrics, "歌词"),
-            (FsTab::Queue, "队列"),
-        ];
-        div()
-            .flex()
-            .gap_x(px(4.))
-            .bg(gpui::white().opacity(0.05))
-            .rounded(px(10.))
-            .p(px(4.))
-            .mb(px(24.))
-            .children(tabs.into_iter().map(|(tab, label)| {
-                let active = self.state.fs_tab == tab;
-                let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
-                    this.set_fs_tab(tab, cx);
-                });
-                div()
-                    .id(format!("fs-tab-{label}"))
-                    .flex_1()
-                    .py(px(8.))
-                    .rounded(px(8.))
-                    .cursor(CursorStyle::PointingHand)
-                    .bg(if active { theme::accent() } else { gpui::transparent_black() })
-                    .text_size(px(13.))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(if active { gpui::white() } else { theme::text3() })
-                    .text_align(gpui::TextAlign::Center)
-                    .on_click(cl)
-                    .child(label.to_string())
-                    .into_any_element()
-            }))
-            .into_any_element()
-    }
-
-    fn render_fs_tab_content(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        tab: FsTab,
-    ) -> AnyElement {
-        match tab {
-            FsTab::Controls => self.render_fs_controls(window, cx),
-            FsTab::Lyrics => self
-                .div_lyrics_empty()
-                .into_any_element(),
-            FsTab::Queue => self.render_fs_queue(window, cx),
-        }
-    }
-
-    /// 控制 tab：进度 + 控制行 + 附加行 + 音量。
-    fn render_fs_controls(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// 进度条（v2 `.fs-bar*`）：5px 轨道 + accent 渐变填充 + 悬停圆点；可拖拽 seek。
+    fn render_fs_progress(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let dur = p.duration();
         let pos = p.position();
-        let volume = p.volume();
-        let shuffle = p.shuffle();
-        let repeat = p.repeat();
-        let cur_liked = p.current().map(|i| p.is_liked(i)).unwrap_or(false);
         let frac = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
-        let progress = self.strip_element(
-            "fs-progress",
-            self.fs_progress.clone(),
-            frac,
-            true,
-            None,
-            cx,
-        );
-        let vol_strip = self.strip_element(
-            "fs-vol",
-            self.fs_vol.clone(),
-            volume,
-            false,
-            Some(160.),
-            cx,
-        );
-        div().flex().flex_col()
-            .child(progress)
+        let hovered = self.fs_hover == Some("fs-prog");
+        let b_down = self.fs_progress.clone();
+        let b_drag = self.fs_progress.clone();
+
+        div()
+            .w_full()
+            .mb(px(16.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("fs-prog")
+                    .relative()
+                    .w_full()
+                    .h(px(16.))
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev, _w, cx| {
+                            this.on_strip_down(true, b_down.clone(), ev, cx);
+                        }),
+                    )
+                    .on_mouse_move(
+                        cx.listener(move |this, ev, _w, cx| {
+                            this.on_strip_drag(true, b_drag.clone(), ev, cx);
+                        }),
+                    )
+                    .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
+                        this.set_fs_hover("fs-prog", *hovered, cx);
+                    }))
+                    .child(theme::bounds_canvas(self.fs_progress.clone()))
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .relative()
+                                    .h(px(5.))
+                                    .rounded(px(3.))
+                                    .bg(theme::bg_hover().opacity(0.8))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .left_0()
+                                            .top_0()
+                                            .bottom_0()
+                                            .w(DefiniteLength::Fraction(frac))
+                                            .rounded(px(3.))
+                                            .child(theme::gradient_cover(
+                                                (theme::accent(), theme::accent_light()),
+                                                3.0,
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .right(px(-6.))
+                                            .top(px(-3.5))
+                                            .w(px(12.))
+                                            .h(px(12.))
+                                            .rounded(px(6.))
+                                            .bg(gpui::white())
+                                            .shadow(vec![gpui::BoxShadow::new(
+                                                px(0.),
+                                                px(0.),
+                                                theme::accent().opacity(0.6),
+                                            )
+                                            .blur_radius(px(10.))])
+                                            .opacity(if hovered { 1.0 } else { 0.0 }),
+                                    ),
+                            ),
+                    ),
+            )
             .child(
                 div()
                     .flex()
                     .justify_between()
                     .mt(px(6.))
-                    .mb(px(22.))
-                    .text_size(px(12.))
+                    .text_size(px(11.))
                     .text_color(theme::text3())
-                    .child(crate::model::duration_str(pos))
-                    .child(crate::model::duration_str(dur)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_x(px(24.))
-                    .pb(px(24.))
-                    .child(self.fs_ctrl(MusicIcon::Shuffle, 28., shuffle, "fs-shuffle", cx))
-                    .child(self.fs_ctrl(MusicIcon::Prev, 28., false, "fs-prev", cx))
-                    .child(self.fs_play_btn(cx))
-                    .child(self.fs_ctrl(MusicIcon::Next, 28., false, "fs-next", cx))
-                    .child(self.fs_repeat(repeat, cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_x(px(28.))
-                    .pb(px(22.))
-                    .child(self.extra_btn(MusicIcon::Heart, "收藏", cur_liked, "fs-like", cx))
-                    .child(self.extra_btn(MusicIcon::QueueMusic, "队列", false, "fs-que", cx))
-                    .child(self.extra_btn(MusicIcon::Download, "下载", false, "fs-dl", cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_x(px(10.))
-                    .child(
-                        IconView::new(MusicIcon::Volume)
-                            .size(px(20.))
-                            .text_color(theme::text2()),
-                    )
-                    .child(vol_strip),
+                    .child(duration_str(pos))
+                    .child(duration_str(dur)),
             )
             .into_any_element()
     }
 
-    /// fs 普通控制钮（shuffle/prev/next）。
+    /// 控制行（v2 `.fs-controls`）：shuffle / prev / play(56 渐变圆) / next / repeat。
+    fn render_fs_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.player.read(cx);
+        let shuffle = p.shuffle();
+        let repeat = p.repeat();
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_x(px(24.))
+            .mb(px(16.))
+            .child(self.fs_ctrl(MusicIcon::Shuffle, 26., shuffle, "fs-shuffle", cx))
+            .child(self.fs_ctrl(MusicIcon::Prev, 26., false, "fs-prev", cx))
+            .child(self.fs_play_btn(cx))
+            .child(self.fs_ctrl(MusicIcon::Next, 26., false, "fs-next", cx))
+            .child(self.fs_repeat(repeat, cx))
+            .into_any_element()
+    }
+
+    /// 普通控制钮（shuffle/prev/next）：active 变 accent，悬停变亮。
     fn fs_ctrl(
         &mut self,
         icon: MusicIcon,
@@ -467,13 +503,12 @@ impl super::MusicView {
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
-            match id {
-                "fs-shuffle" => this.toggle_shuffle(cx),
-                "fs-prev" => this.player.update(cx, |p, cx| p.prev(cx)),
-                "fs-next" => this.player.update(cx, |p, cx| p.next(cx)),
-                _ => {}
-            }
+        let hovered = self.fs_hover == Some(id);
+        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| match id {
+            "fs-shuffle" => this.toggle_shuffle(cx),
+            "fs-prev" => this.player.update(cx, |p, cx| p.prev(cx)),
+            "fs-next" => this.player.update(cx, |p, cx| p.next(cx)),
+            _ => {}
         });
         div()
             .id(id)
@@ -484,15 +519,24 @@ impl super::MusicView {
             .justify_center()
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
+            .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
+                this.set_fs_hover(id, *hovered, cx);
+            }))
             .child(
                 IconView::new(icon)
                     .size(px(size))
-                    .text_color(if active { theme::accent_light() } else { theme::text2() }),
+                    .text_color(if active {
+                        theme::accent()
+                    } else if hovered {
+                        theme::text()
+                    } else {
+                        theme::text2()
+                    }),
             )
             .into_any_element()
     }
 
-    /// fs 主播放钮（64px accent 渐变圆）。
+    /// 主播放钮（56px accent→light 渐变圆，白图标）。
     fn fs_play_btn(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let playing = p.playing();
@@ -500,218 +544,348 @@ impl super::MusicView {
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| this.toggle_play(cx));
         div()
             .id("fs-play")
-            .w(px(64.))
-            .h(px(64.))
-            .rounded(px(32.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::accent())
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cl)
-            .child(IconView::new(icon).size(px(30.)).text_color(gpui::white()).filled(true))
-            .into_any_element()
-    }
-
-    fn fs_repeat(&mut self, repeat: RepeatMode, cx: &mut Context<Self>) -> AnyElement {
-        let active = repeat != RepeatMode::Off;
-        let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| this.cycle_repeat(cx));
-        div()
-            .id("fs-repeat")
-            .w(px(28.))
-            .h(px(28.))
+            .w(px(56.))
+            .h(px(56.))
+            .rounded(px(28.))
+            .relative()
+            .overflow_hidden()
             .flex()
             .items_center()
             .justify_center()
             .cursor(CursorStyle::PointingHand)
+            .shadow(vec![gpui::BoxShadow::new(
+                px(0.),
+                px(4.),
+                theme::accent().opacity(0.5),
+            )
+            .blur_radius(px(24.))])
             .on_click(cl)
+            .child(theme::gradient_cover((theme::accent(), theme::accent_light()), 28.0))
             .child(
-                IconView::new(MusicIcon::Repeat)
-                    .size(px(26.))
-                    .text_color(if active { theme::accent_light() } else { theme::text2() }),
+                IconView::new(icon)
+                    .size(px(28.))
+                    .text_color(gpui::white())
+                    .filled(true),
             )
             .into_any_element()
     }
 
-    /// 歌词 tab 空态（fs 内蒙版）。
-    fn div_lyrics_empty(&mut self) -> gpui::Div {
+    /// 循环钮：非 Off 高亮 accent。
+    fn fs_repeat(&mut self, repeat: RepeatMode, cx: &mut Context<Self>) -> AnyElement {
+        let active = repeat != RepeatMode::Off;
+        let hovered = self.fs_hover == Some("fs-repeat");
+        let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| this.cycle_repeat(cx));
+        div()
+            .id("fs-repeat")
+            .w(px(26.))
+            .h(px(26.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor(CursorStyle::PointingHand)
+            .on_click(cl)
+            .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
+                this.set_fs_hover("fs-repeat", *hovered, cx);
+            }))
+            .child(
+                IconView::new(MusicIcon::Repeat)
+                    .size(px(24.))
+                    .text_color(if active {
+                        theme::accent()
+                    } else if hovered {
+                        theme::text()
+                    } else {
+                        theme::text2()
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// 底部行（v2 `.fs-bottom-row`）：音量条（120）+ 操作（收藏/队列/下载）。
+    fn render_fs_bottom_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.player.read(cx);
+        let volume = p.volume();
+        let cur_liked = p.current().map(|i| p.is_liked(i)).unwrap_or(false);
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_x(px(16.))
+            .child(self.render_fs_volume(cx, volume))
+            .child(
+                div()
+                    .flex()
+                    .gap_x(px(12.))
+                    .child(
+                        self.fs_action(
+                            if cur_liked {
+                                MusicIcon::Heart
+                            } else {
+                                MusicIcon::HeartBorder
+                            },
+                            cur_liked,
+                            "fs-like",
+                            cx,
+                        ),
+                    )
+                    .child(self.fs_action(MusicIcon::QueueMusic, false, "fs-que", cx))
+                    .child(self.fs_action(MusicIcon::Download, false, "fs-dl", cx)),
+            )
+            .into_any_element()
+    }
+
+    /// 音量条（点击/拖拽调音量）。
+    fn render_fs_volume(&mut self, cx: &mut Context<Self>, volume: f32) -> AnyElement {
+        let b_down = self.fs_vol.clone();
+        let b_drag = self.fs_vol.clone();
+        let hovered = self.fs_hover == Some("fs-vol");
+        div()
+            .flex()
+            .items_center()
+            .gap_x(px(8.))
+            .child(
+                IconView::new(MusicIcon::Volume)
+                    .size(px(18.))
+                    .text_color(if hovered { theme::text() } else { theme::text2() }),
+            )
+            .child(
+                div()
+                    .id("fs-vol")
+                    .relative()
+                    .w(px(120.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev, _w, cx| {
+                            this.on_strip_down(false, b_down.clone(), ev, cx);
+                        }),
+                    )
+                    .on_mouse_move(
+                        cx.listener(move |this, ev, _w, cx| {
+                            this.on_strip_drag(false, b_drag.clone(), ev, cx);
+                        }),
+                    )
+                    .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
+                        this.set_fs_hover("fs-vol", *hovered, cx);
+                    }))
+                    .child(theme::bounds_canvas(self.fs_vol.clone()))
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(4.))
+                            .rounded(px(2.))
+                            .bg(theme::bg_hover().opacity(0.8))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(DefiniteLength::Fraction(volume.clamp(0.0, 1.0)))
+                                    .rounded(px(2.))
+                                    .bg(theme::text2().opacity(0.85)),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 操作小钮（收藏/队列/下载）：liked 用 pink，否则 text3（悬停变亮）。
+    fn fs_action(
+        &mut self,
+        icon: MusicIcon,
+        liked: bool,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hovered = self.fs_hover == Some(id);
+        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| match id {
+            "fs-like" => {
+                if let Some(i) = this.player.read(cx).current() {
+                    this.player.update(cx, |p, cx| p.toggle_like(i, cx));
+                    this.toast_msg(if this.player.read(cx).is_liked(i) {
+                        "已收藏"
+                    } else {
+                        "取消收藏"
+                    });
+                }
+            }
+            "fs-que" => this.toast_msg("已加入队列"),
+            "fs-dl" => this.toast_msg("下载功能即将到来"),
+            _ => {}
+        });
+        div()
+            .id(id)
+            .w(px(20.))
+            .h(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor(CursorStyle::PointingHand)
+            .on_click(cl)
+            .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
+                this.set_fs_hover(id, *hovered, cx);
+            }))
+            .child(
+                IconView::new(icon)
+                    .size(px(18.))
+                    .text_color(if liked {
+                        theme::pink()
+                    } else if hovered {
+                        theme::text()
+                    } else {
+                        theme::text3()
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// 右列：歌词面板（v2 `.fs-right`：LYRICS 标题 + 同步歌词；无 LRC → 操作提示）。
+    fn render_fs_lyrics(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .min_w(px(0.))
+            .w(px(440.))
+            .flex_shrink_0()
+            .h(px(460.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .mb(px(16.))
+                    .pl(px(8.))
+                    .text_size(px(12.))
+                    .text_color(theme::text3())
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("LYRICS"),
+            )
+            .child(self.render_lyrics_panel_content(cx))
+            .into_any_element()
+    }
+
+    /// 同步歌词内容（全屏右列与右侧面板「歌词」tab 共用）：有歌词 → 以播放位置为中心的
+    /// 窗口式渲染（自动跟随当前句；GPUI 无滚动条也能居中），活动句高亮、过去的变暗；
+    /// 无歌词 → 空态 + 「同名 .lrc」提示。`flex_1` 由调用方包一层保证占满可用高。
+    pub(super) fn render_lyrics_panel_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.player.read(cx);
+        let pos_ms = (p.position() * 1000.0) as i64;
+        let lyrics = p.current_track().and_then(|t| t.lyrics.clone());
+        let Some(lyrics) = lyrics else {
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .px(px(16.))
+                .child(
+                    IconView::new(MusicIcon::Lyrics)
+                        .size(px(32.))
+                        .text_color(theme::text3()),
+                )
+                .child(
+                    div()
+                        .mt(px(12.))
+                        .text_size(px(14.))
+                        .text_color(theme::text3())
+                        .child("暂无歌词"),
+                )
+                .child(
+                    div()
+                        .mt(px(6.))
+                        .text_size(px(12.))
+                        .text_color(theme::text3().opacity(0.7))
+                        .child("同名 .lrc 放在歌曲旁即可显示同步歌词"),
+                )
+                .into_any_element();
+        };
+
+        // 窗口式跟随：以当前句为中心渲染固定行数窗口，避免长歌词全部物化 + 天然自动滚动。
+        const WINDOW: usize = 11;
+        const HALF: usize = 5;
+        let n = lyrics.lines.len();
+        let active = lyrics.active_index(pos_ms);
+        let center = active.unwrap_or(0);
+        let start = center
+            .saturating_sub(HALF)
+            .min(n.saturating_sub(WINDOW))
+            .min(n);
+        let end = (start + WINDOW).min(n);
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (i, line) in lyrics.lines[start..end].iter().enumerate() {
+            let idx = start + i;
+            let state = if Some(idx) == active {
+                LyricState::Active
+            } else if active.is_some_and(|a| idx < a) {
+                LyricState::Past
+            } else {
+                LyricState::Future
+            };
+            rows.push(self.lyric_row(&line.text, state));
+        }
+
         div()
             .flex_1()
             .flex()
             .flex_col()
-            .items_center()
             .justify_center()
-            .text_color(theme::text3())
-            .child("暂无歌词")
+            .children(rows)
+            .into_any_element()
     }
 
-    /// 队列 tab：fs 内队列逐项。
-    fn render_fs_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let _ = window;
-        let p = self.player.read(cx);
-        let queue = p.queue().to_vec();
-        let qpos = p.queue_pos();
-        let playing = p.playing();
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (qi, &idx) in queue.iter().enumerate() {
-            let Some(t) = p.library().get(idx) else { continue };
-            let is_now = qi == qpos;
-            let (light, dark) = theme::gradient_pair_of(t.grad);
-            let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
-                this.handle_play_idx(idx, cx);
-            });
-            rows.push(
-                div()
-                    .id(format!("fs-queue-{qi}"))
-                    .flex()
-                    .items_center()
-                    .gap_x(px(12.))
-                    .px(px(10.))
-                    .py(px(9.))
-                    .rounded(px(8.))
-                    .cursor(CursorStyle::PointingHand)
-                    .bg(if is_now {
-                        theme::accent().opacity(0.12)
-                    } else {
-                        theme::bg_card().opacity(0.0)
-                    })
-                    .on_click(cl)
-                    .child(
-                        div()
-                            .w(px(40.))
-                            .h(px(40.))
-                            .rounded(px(6.))
-                            .relative()
-                            .flex_shrink_0()
-                            .overflow_hidden()
-                            .child(theme::gradient_cover((light, dark), 6.0))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        IconView::new(MusicIcon::Note)
-                                            .size(px(17.))
-                                            .text_color(gpui::white().opacity(0.4)),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(if is_now {
-                                        theme::accent_light()
-                                    } else {
-                                        theme::text()
-                                    })
-                                    .text_ellipsis()
-                                    .child(t.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(theme::text3())
-                                    .text_ellipsis()
-                                    .child(t.artist.clone()),
-                            ),
-                    )
-                    .child(if is_now {
-                        widgets::eq_bars(playing, theme::accent(), format!("fsq-{qi}"))
-                    } else {
-                        div()
-                            .text_size(px(12.))
-                            .text_color(theme::text3())
-                            .child(crate::model::duration_str(t.duration))
-                            .into_any_element()
-                    })
-                    .into_any_element(),
-            );
-        }
-        if rows.is_empty() {
-            rows.push(
-                div()
-                    .pt(px(20.))
-                    .pb(px(40.))
-                    .text_size(px(13.))
-                    .text_color(theme::text3())
-                    .child("队列为空")
-                    .into_any_element(),
-            );
-        }
-        div().flex().flex_col().children(rows).into_any_element()
-    }
-
-    /// 底部 eq 渐变装饰条（canvas 2-stop 水平渐变，播放中明亮）。
-    fn render_fs_bottom_eq(&mut self, playing: bool) -> AnyElement {
-        let alpha = if playing { 0.6 } else { 0.2 };
-        let body = theme::gradient_cover(
-            (
-                theme::pink().opacity(alpha),
-                theme::accent().opacity(alpha),
+    /// 单句歌词行（v2 `.fs-lyric` 三态样式）。
+    fn lyric_row(&mut self, text: &str, state: LyricState) -> AnyElement {
+        let (size, color, bg, weight) = match state {
+            LyricState::Active => (
+                px(17.),
+                gpui::white(),
+                theme::accent().opacity(0.10),
+                Some(gpui::FontWeight::BOLD),
             ),
-            1.5,
-        );
+            LyricState::Past => (
+                px(15.),
+                gpui::white().opacity(0.13),
+                gpui::transparent_black(),
+                None,
+            ),
+            LyricState::Future => (
+                px(15.),
+                gpui::white().opacity(0.24),
+                gpui::transparent_black(),
+                None,
+            ),
+        };
+        let mut el = div()
+            .px(px(14.))
+            .py(px(10.))
+            .rounded(px(6.))
+            .mb(px(2.))
+            .text_size(size)
+            .text_color(color)
+            .bg(bg);
+        if let Some(w) = weight {
+            el = el.font_weight(w);
+        }
+        el.child(text.to_string()).into_any_element()
+    }
+
+    /// 底部 eq 渐变装饰条（v2 `.fs-eq-bar`：3px、accent→pink，播放 0.5 / 暂停 0.15）。
+    fn render_fs_bottom_eq(&mut self, playing: bool) -> AnyElement {
+        let alpha = if playing { 0.5 } else { 0.15 };
         div()
             .absolute()
             .bottom_0()
             .left_0()
             .right_0()
             .h(px(3.))
-            .child(body)
-            .into_any_element()
-    }
-
-    /// 底部快捷键提示行。
-    fn render_fs_shortcuts(&mut self) -> AnyElement {
-        let keys = [
-            ("Esc", "退出全屏"),
-            ("Space", "播放/暂停"),
-            ("←", "上一首"),
-            ("→", "下一首"),
-        ];
-        div()
-            .absolute()
-            .bottom(px(16.))
-            .left_0()
-            .right_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_x(px(20.))
-            .opacity(0.5)
-            .children(keys.into_iter().map(|(key, label)| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_x(px(4.))
-                    .text_size(px(11.))
-                    .text_color(theme::text3())
-                    .child(
-                        div()
-                            .px(px(5.))
-                            .h(px(20.))
-                            .flex()
-                            .items_center()
-                            .border_1()
-                            .border_color(gpui::white().opacity(0.12))
-                            .rounded(px(4.))
-                            .text_size(px(10.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .bg(gpui::white().opacity(0.04))
-                            .text_color(theme::text3())
-                            .child(key.to_string()),
-                    )
-                    .child(label.to_string())
-                    .into_any_element()
-            }))
+            .child(theme::gradient_cover(
+                (theme::pink().opacity(alpha), theme::accent().opacity(alpha)),
+                1.5,
+            ))
             .into_any_element()
     }
 }

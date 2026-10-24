@@ -9,9 +9,12 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, ObjectFit,
+    ParentElement as _, RenderImage, StatefulInteractiveElement as _, Styled as _, StyledImage,
+    Window, div, img, px,
 };
+
+use std::sync::Arc;
 
 use crate::model::Track;
 
@@ -20,6 +23,47 @@ use super::{MainSection, MusicView, theme, widgets};
 
 /// 歌曲表行高（px，近似原型的行内距）。
 const ROW_H: f32 = 52.0;
+
+/// 40px 列表缩略图（歌曲表行）：有封面 → 铺图（`ObjectFit::Cover`）；无 → 渐变 + 音符回退。
+fn song_thumb_div(cover: Option<Arc<RenderImage>>, (light, dark): (gpui::Hsla, gpui::Hsla)) -> AnyElement {
+    let base: AnyElement = match cover {
+        Some(c) => div()
+            .size_full()
+            .child(
+                img(gpui::ImageSource::Render(c))
+                    .object_fit(ObjectFit::Cover)
+                    .w_full()
+                    .h_full(),
+            )
+            .into_any_element(),
+        None => div()
+            .size_full()
+            .child(theme::gradient_cover((light, dark), 6.0))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        IconView::new(MusicIcon::Note)
+                            .size(px(18.))
+                            .text_color(gpui::white().opacity(0.5)),
+                    ),
+            )
+            .into_any_element(),
+    };
+    div()
+        .w(px(40.))
+        .h(px(40.))
+        .rounded(px(6.))
+        .relative()
+        .flex_shrink_0()
+        .overflow_hidden()
+        .child(base)
+        .into_any_element()
+}
 
 impl super::MusicView {
     /// 主内容区整块。
@@ -320,6 +364,42 @@ impl super::MusicView {
             theme::from_hex_str(&grad.0),
             theme::from_hex_str(&grad.1),
         );
+        // Mix 卡封面：组内第一首有真实封面 → 铺图；无 → 渐变 + 音符回退。
+        let first_cover = self
+            .player
+            .read(cx)
+            .library()
+            .get(first)
+            .and_then(|t| t.cover_path.as_deref())
+            .and_then(|p| self.cover_for(Some(p)));
+        let cover_base: AnyElement = match first_cover {
+            Some(c) => div()
+                .size_full()
+                .child(
+                    img(gpui::ImageSource::Render(c))
+                        .object_fit(ObjectFit::Cover)
+                        .w_full()
+                        .h_full(),
+                )
+                .into_any_element(),
+            None => div()
+                .size_full()
+                .child(theme::gradient_cover((light, dark), 14.0))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            IconView::new(MusicIcon::Note)
+                                .size(px(44.))
+                                .text_color(gpui::white().opacity(0.4)),
+                        ),
+                )
+                .into_any_element(),
+        };
         let cover = div()
             .w(px(180.))
             .h(px(180.))
@@ -327,21 +407,7 @@ impl super::MusicView {
             .relative()
             .overflow_hidden()
             .mx_auto()
-            .child(theme::gradient_cover((light, dark), 14.0))
-            // 内嵌音乐符文本（原型 `.mix-cover-bg .material-icons`）。
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        IconView::new(MusicIcon::Note)
-                            .size(px(44.))
-                            .text_color(gpui::white().opacity(0.4)),
-                    ),
-            )
+            .child(cover_base)
             // hover 播放浮层（右下角 accent 圆钮）。
             .child(
                 div()
@@ -572,29 +638,7 @@ impl super::MusicView {
                 .items_center()
                 .gap_x(px(12.))
                 .min_w(px(0.))
-                .child(
-                    div()
-                        .w(px(40.))
-                        .h(px(40.))
-                        .rounded(px(6.))
-                        .relative()
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .child(theme::gradient_cover((light, dark), 6.0))
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    IconView::new(MusicIcon::Note)
-                                        .size(px(18.))
-                                        .text_color(gpui::white().opacity(0.5)),
-                                ),
-                        ),
-                )
+                .child(song_thumb_div(self.cover_for(t.cover_path.as_deref()), (light, dark)))
                 .child(
                     div()
                         .min_w(px(0.))

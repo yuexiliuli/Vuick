@@ -15,6 +15,7 @@ pub mod library;
 pub mod model;
 pub mod player;
 pub mod view;
+mod cover;  // 私有：封面图像解码（同名 .jpg/.png/.webp → RenderImage）
 mod decode; // 私有：libloading 桥
 mod sink;   // 私有：cpal AudioSink
 

@@ -7,6 +7,7 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 
@@ -14,6 +15,84 @@ use super::theme;
 use super::{MusicEvent, MusicView};
 use crate::model::Track;
 use crate::player::MusicPlayer;
+
+/// 极小有效 PNG（2×1 纯红）字节：作为同名封面侧车装进临时库。
+fn tiny_png_bytes() -> Vec<u8> {
+    let img: image::RgbaImage =
+        image::ImageBuffer::from_pixel(2, 1, image::Rgba([255u8, 0, 0, 255]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .expect("png 编码应成功");
+    out.into_inner()
+}
+
+/// 推进虚拟时钟一段（250ms/拍 × 真实小睡）驱动 MusicView 常驻 tick（250ms）+ 解码任务
+/// 落地。fake 调度器对 render/spawn 轮询不足，用 advance_clock + run_until_parked 双拍
+/// 合拍（对齐仓库 pdf/editor 惯用法）。
+fn pump_ticks(cx: &mut VisualTestContext, rounds: usize) {
+    for _ in 0..rounds {
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(3));
+        cx.run_until_parked();
+    }
+}
+
+/// 建含「1 首有同名 png 封面 + 1 首无封面」的临时库播放器。
+fn library_with_cover(cx: &mut TestAppContext) -> (std::path::PathBuf, Entity<MusicPlayer>) {
+    let dir = std::env::temp_dir().join(format!("gpui-music-cover-reg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    write_tiny_wav(&dir, "周杰伦 - 晴天.wav");
+    std::fs::write(dir.join("周杰伦 - 晴天.png"), tiny_png_bytes()).unwrap();
+    write_tiny_wav(&dir, "林俊杰 - 江南.wav");
+    let player: Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+    cx.update(|app| {
+        player.update(app, |p, cx| p.load_dir(&dir, cx));
+    });
+    (dir, player)
+}
+
+/// 封面端到端回归：scan(同名 png) → load_dir → 数拍 tick 后 `covers` 填充；随后播放
+/// 当前曲 → `cover_for_current` 为 Some（真机「右侧大图/底栏缩略图/全屏封面」的取值链）。
+/// 历史缺陷：`spawn_cover_decode` 的 `Task` drop 即取消解码 → `covers` 恒空、三处全渐变。
+#[gpui::test]
+async fn library_cover_decodes_into_cache_and_current(cx: &mut TestAppContext) {
+    let (dir, player) = library_with_cover(cx);
+    // 库内第一首应有同名封面（scan 侧车已挂）；第二首无封面。
+    let cover_path = cx.update(|cx| player.read(cx).library()[0].cover_path.clone());
+    assert!(cover_path.is_some(), "同名 png 应被 scan 挂为 cover_path");
+
+    let (view, cx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 数拍后全库缺失封面应入缓存（含未播放的当前曲）。
+    let mut filled = false;
+    for _ in 0..10 {
+        pump_ticks(cx, 1);
+        let (n_covers, loading) = cx.update(|_w, cx| {
+            let v = view.read(cx);
+            (v.covers.len(), v.cover_loading.len())
+        });
+        if n_covers == 1 && loading == 0 {
+            filled = true;
+            break;
+        }
+    }
+    assert!(filled, "tick 扫描后 covers 应恰好含该封面（无在途）");
+
+    // 播放当前曲（headless 不真出声；current 即置位）→ cover_for_current 有图。
+    cx.update(|_w, cx| {
+        view.update(cx, |v, cx| v.handle_play_idx(0, cx));
+    });
+    pump_ticks(cx, 2);
+    let has_current_cover = cx.update(|_w, cx| {
+        view.update(cx, |v, cx| v.cover_for_current(cx).is_some())
+    });
+    assert!(has_current_cover, "播放当前曲目后 cover_for_current 应 Some");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 
 /// 手写 0.4s 双声道 16bit 44.1k WAV（只作文件名/库元数据，不真解码）。
 fn write_tiny_wav(dir: &Path, name: &str) {
@@ -82,6 +161,8 @@ fn filter_matches_case_insensitive_and_chinese() {
         album: String::new(),
         duration: 0.0,
         grad: (0x7c, 0x5c, 0xfc),
+        cover_path: None,
+        lyrics: None,
     };
     let tracks = vec![
         mk(0, "周杰伦", "晴天"),

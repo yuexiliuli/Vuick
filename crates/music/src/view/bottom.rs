@@ -5,7 +5,7 @@
 
 use gpui::{
     AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, StyledImage, Window, div, img, px,
 };
 
 use crate::model::RepeatMode;
@@ -68,6 +68,34 @@ impl super::MusicView {
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| {
             this.like_current(cx);
         });
+        // 底栏缩略图：有真实封面 → 铺图；无 → 渐变 + 音符回退。
+        let thumb_children: Vec<gpui::AnyElement> = if let Some(c) = self.cover_for_current(cx) {
+            vec![div()
+                .size_full()
+                .child(
+                    img(gpui::ImageSource::Render(c))
+                        .object_fit(gpui::ObjectFit::Cover)
+                        .w_full()
+                        .h_full(),
+                )
+                .into_any_element()]
+        } else {
+            vec![
+                theme::gradient_cover((light, dark), 8.0).into_any_element(),
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        IconView::new(MusicIcon::Note)
+                            .size(px(22.))
+                            .text_color(gpui::white().opacity(0.4)),
+                    )
+                    .into_any_element(),
+            ]
+        };
         div()
             .w(px(280.))
             .flex_shrink_0()
@@ -82,20 +110,7 @@ impl super::MusicView {
                     .relative()
                     .flex_shrink_0()
                     .overflow_hidden()
-                    .child(theme::gradient_cover((light, dark), 8.0))
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                IconView::new(MusicIcon::Note)
-                                    .size(px(22.))
-                                    .text_color(gpui::white().opacity(0.4)),
-                            ),
-                    ),
+                    .children(thumb_children),
             )
             .child(
                 div()

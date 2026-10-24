@@ -10,9 +10,12 @@
 //!
 //! 驱动：`new` 起一个常驻 `cx.spawn` tick 循环（250ms）——① `player.tick` 消费 worker
 //! 事件（Opened/Finished/Error，事件变化内部已 notify）；② 仅**播放中**才 `cx.notify()`
-//! 刷新进度/均衡器（path 限制：暂停/空闲不持续重绘，K12）；③ toast 过期清理。
+//! 刷新进度/均衡器/歌词/封面（path 限制：暂停/空闲不持续重绘，K12）；③ toast 过期清理。
 //! 焦点：根 `track_focus` + `on_key_down` 处理全局快捷键（Space/←/→/Esc/F/1/2/3），
 //! 搜索框持焦时让路（不抢输入键）。
+//! 封面：`cover.rs` 解码同名 `.jpg/.png/.webp` 成 `RenderImage`（BGRA），本文件用
+//! `covers` 缓存 + 懒加载（后台线程解码 → 主线程入缓存 + notify）；渲染位（全屏封面/
+//! 正在播放/底栏缩略图/列表缩略图）一律先问 [`MusicView::cover_for`]，None 回退渐变。
 
 pub mod theme;
 mod bottom;
@@ -24,16 +27,19 @@ mod sidebar;
 mod widgets;
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     App, AnyElement, Bounds, ClipboardItem, Context, CursorStyle, DefiniteLength, Entity,
     EntityInputHandler, EventEmitter, Focusable, FocusHandle, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Point, Pixels,
-    Render, SharedString, Styled as _, TextInputConfiguration, UTF16Selection, Window, div, point,
-    px, size,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement as _,
+    Point, Pixels, Render, RenderImage, SharedString, Styled as _, StyledImage,
+    TextInputConfiguration, UTF16Selection, Window, div, img, point, px, size,
 };
 
 use crate::model::{RepeatMode, Track};
@@ -61,16 +67,6 @@ pub enum RightTab {
     Queue,
 }
 
-/// 全屏浮层右侧 tab。
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum FsTab {
-    /// 控制（进度/控制/音量）。
-    #[default]
-    Controls,
-    Lyrics,
-    Queue,
-}
-
 /// 视图本地状态（播放器状态在 [`MusicPlayer`] 里读）。
 #[derive(Default)]
 pub struct ViewState {
@@ -82,8 +78,6 @@ pub struct ViewState {
     pub search: String,
     /// 全屏浮层是否打开。
     pub fs_open: bool,
-    /// 全屏浮层右侧 tab。
-    pub fs_tab: FsTab,
     /// 进度条悬停 x（窗口坐标；预留扩展）。
     #[allow(dead_code)]
     pub hover_x: Option<f32>,
@@ -122,6 +116,11 @@ pub struct MusicView {
     last_error: Option<String>,
     /// 常驻 tick 循环句柄（view 销毁即取消）。
     _tick: Option<gpui::Task<()>>,
+    // ---- 封面图像缓存（懒加载 + 库预取；后台解码 → 主线程入缓存） ----
+    /// 已解码成功的封面（path → BGRA `RenderImage`，供渲染复用）。
+    covers: HashMap<PathBuf, Arc<RenderImage>>,
+    /// 正在解码的封面 path（防重复派发任务）。
+    cover_loading: HashSet<PathBuf>,
     // ---- 可交互条（进度/音量）的窗口坐标盒（canvas prepaint 记录） ----
     np_progress: Rc<Cell<Bounds<Pixels>>>,
     bb_progress: Rc<Cell<Bounds<Pixels>>>,
@@ -130,6 +129,8 @@ pub struct MusicView {
     fs_vol: Rc<Cell<Bounds<Pixels>>>,
     // ---- 悬停状态（hover 触发一次重绘即可，无需持续动画） ----
     hover_mix: Option<usize>,
+    /// 全屏浮层当前悬停元素 id（按钮高亮/进度条圆点显示用；同一指针只有一个悬停）。
+    fs_hover: Option<&'static str>,
 }
 
 impl MusicView {
@@ -160,13 +161,32 @@ impl MusicView {
             bb_vol: Rc::new(Cell::new(Bounds::default())),
             fs_vol: Rc::new(Cell::new(Bounds::default())),
             hover_mix: None,
+            fs_hover: None,
+            covers: HashMap::new(),
+            cover_loading: HashSet::new(),
         }
+    }
+
+    /// 全屏元素悬停状态：hover 进入置 id、离开清空（同一指针同时只悬停一个元素）。
+    /// 触发一次 notify 让高亮/进度圆点立即更新。
+    pub(super) fn set_fs_hover(
+        &mut self,
+        id: &'static str,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.fs_hover = if hovered { Some(id) } else { None };
+        cx.notify();
     }
 
     /// 常驻 tick（250ms）：消费 worker 事件（内部已 notify）+ 播放中刷新进度 +
     /// toast 过期清理。空闲（非播放）不 notify → 不持续重绘（K12）。
     fn on_tick(&mut self, cx: &mut Context<Self>) {
         self.player.update(cx, |p, cx| p.tick(cx));
+        // 封面懒加载 + 库预取：每拍扫描库缺失封面的曲目派解码任务（幂等；58 首每 250ms
+        // 查 HashSet 开销可忽略）。不用一次性 latch——「库晚于首次 tick 才 load / 事后放图」
+        // 时旧实现预取空转 + latch 卡死，封面永不呈现（K29 类）。
+        self.ensure_library_covers(cx);
         // 播放错误浮现（如缺 media_ffmpeg.dll / 打开失败）：仅在错误值**变化**时弹一次
         // toast，避免每拍重复；错误清除后记录复位（下次再错能再弹）。
         let err = self.player.read(cx).error().map(ToString::to_string);
@@ -185,6 +205,90 @@ impl MusicView {
         // 播放中才高频刷新进度条/均衡器位置；toast 在期也刷新（保证按时出现/消失）。
         if self.player.read(cx).playing() || self.toast.is_some() {
             cx.notify();
+        }
+    }
+
+    // ---- 封面图像懒加载（解码在后台线程；渲染只读缓存，None 回退渐变） ----
+
+    /// 懒加载某曲封面：未缓存/未在途 → 派后台解码任务（幂等，`cover_loading` 防重）。
+    /// 任务必须 `.detach()`：gpui `Task` 句柄 drop 即取消 future——旧实现 `let _ =
+    /// cx.spawn(...)` 把任务当场取消（`cover_loading` 卡死、封面永不入缓存，真机三处
+    /// 全渐变占位的根因）。解码放 `background_executor`（240ms 级大图不卡主线程），
+    /// 完成后回主线程入缓存 + notify。
+    fn spawn_cover_decode(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.covers.contains_key(path) || self.cover_loading.contains(path) {
+            return;
+        }
+        self.cover_loading.insert(path.to_path_buf());
+        let weak = cx.weak_entity();
+        let p = path.to_path_buf();
+        let p2 = p.clone();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::cover::cover_from_file(&p) })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.cover_loading.remove(&p2);
+                if let Ok(render) = result {
+                    this.covers.insert(p2.clone(), render);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 纯读：某曲封面位图（None = 无封面/尚未就绪，渲染回退渐变）。
+    pub(super) fn cover_for(&self, path: Option<&Path>) -> Option<Arc<RenderImage>> {
+        let path = path?;
+        self.covers.get(path).cloned()
+    }
+
+    /// 当前播放曲目的封面（None = 无封面/尚未就绪）。
+    pub(super) fn cover_for_current(&mut self, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
+        let path = self
+            .player
+            .read(cx)
+            .current_track()
+            .and_then(|t| t.cover_path.clone());
+        self.cover_for(path.as_deref())
+    }
+
+    /// 每 tick 扫描全库「缺失封面」的曲目并派解码任务（预取 + 当前曲兜底合一）：
+    /// 已在缓存 / 已在途的跳过；新曲、换目录（`load_dir` 重扫）、事后放图都能在下一拍补上。
+    /// 58 首 × HashSet contains_key 每 250ms 开销可忽略，不做一次性 latch。
+    fn ensure_library_covers(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .player
+            .read(cx)
+            .library()
+            .iter()
+            .filter_map(|t| t.cover_path.clone())
+            .filter(|p| !self.covers.contains_key(p) && !self.cover_loading.contains(p))
+            .collect();
+        for p in paths {
+            self.spawn_cover_decode(&p, cx);
+        }
+    }
+
+    /// 通用封面渲染：有图 → 铺满的 `img`（`ObjectFit::Cover`）；无图 → `fallback`。
+    pub(super) fn render_cover_or(
+        &self,
+        cover: Option<Arc<RenderImage>>,
+        fallback: AnyElement,
+    ) -> AnyElement {
+        match cover {
+            Some(render) => div()
+                .size_full()
+                .child(
+                    img(gpui::ImageSource::Render(render))
+                        .object_fit(ObjectFit::Cover)
+                        .w_full()
+                        .h_full(),
+                )
+                .into_any_element(),
+            None => fallback,
         }
     }
 
@@ -297,11 +401,6 @@ impl MusicView {
 
     fn set_right_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         self.state.right_tab = tab;
-        cx.notify();
-    }
-
-    fn set_fs_tab(&mut self, tab: FsTab, cx: &mut Context<Self>) {
-        self.state.fs_tab = tab;
         cx.notify();
     }
 

@@ -2824,6 +2824,7 @@ dependencies = [
  "config",
  "cpal",
  "gpui",
+ "image",
  "libloading",
 ]
 

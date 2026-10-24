@@ -12,6 +12,9 @@ pub const AUDIO_EXTENSIONS: &[&str] = &[
     "ogg", "flac", "mp3", "m4a", "aac", "wav", "wma", "opus", "ape",
 ];
 
+/// 可识别的封面扩展名（小写；优先顺序即匹配优先级）。
+pub const COVER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+
 /// 某路径是否音频文件（扩展名大小写不敏感）。
 pub fn is_audio_extension(p: &Path) -> bool {
     p.extension()
@@ -22,7 +25,8 @@ pub fn is_audio_extension(p: &Path) -> bool {
 
 /// 递归扫描 `root` 下的音频文件：手写栈遍历；跳过以 `.` 开头的隐藏目录与
 /// `target`/`node_modules`/`.git`/`vendor`/`session` 构建/缓存目录；结果按路径自然排序。
-/// `scan` 只按扩展名收集，**不读文件内容**（时长先置 0，由 [`probe_duration`] 后台补）。
+/// `scan` 按扩展名收集（时长先置 0，由 [`probe_duration`] 后台补），并顺带挂每首歌的
+/// 同名 `.lrc` 歌词与同名封面图（`.jpg/.jpeg/.png/.webp`）侧车（都失败静默 → None）。
 pub fn scan_dir(root: &Path) -> Vec<Track> {
     let mut stack = vec![root.to_path_buf()];
     let mut files: Vec<PathBuf> = Vec::new();
@@ -62,6 +66,8 @@ fn track_from_path(path: PathBuf) -> Track {
         .to_string();
     let (artist, title) = parse_meta(&stem);
     let grad = grad_from_hash(&format!("{artist} - {title}"));
+    let lyrics = read_lrc_sidecar(&path);
+    let cover_path = find_cover_sidecar(&path);
     Track {
         path,
         title,
@@ -69,7 +75,78 @@ fn track_from_path(path: PathBuf) -> Track {
         album: String::new(),
         duration: 0.0,
         grad,
+        cover_path,
+        lyrics,
     }
+}
+
+/// 找歌曲旁同名封面图（`.jpg/.jpeg/.png/.webp`，扩展名大小写不敏感，按 [`COVER_EXTENSIONS`]
+/// 顺序优先）；无 → None。
+fn find_cover_sidecar(audio: &Path) -> Option<PathBuf> {
+    let dir = audio.parent()?;
+    let stem_l = audio.file_stem()?.to_string_lossy().to_lowercase();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    // 先做一次目录快照再按优先级挑
+    let mut candidates: Vec<(usize, PathBuf)> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        let Some(rank) = COVER_EXTENSIONS
+            .iter()
+            .position(|x| x.eq_ignore_ascii_case(ext))
+        else {
+            continue;
+        };
+        let stem_ok = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .is_some_and(|s| s == stem_l);
+        if stem_ok {
+            candidates.push((rank, p));
+        }
+    }
+    candidates.sort_by_key(|(rank, _)| *rank);
+    candidates.into_iter().next().map(|(_, p)| p)
+}
+
+/// 找歌曲旁同名 `.lrc` 歌词侧车（扩展名大小写不敏感），读取解析；无/失败 → None。
+fn read_lrc_sidecar(audio: &Path) -> Option<crate::model::Lyrics> {
+    let lrc = find_lrc_sidecar(audio)?;
+    let content = std::fs::read_to_string(lrc).ok()?;
+    crate::model::parse_lrc(&content)
+}
+
+/// 在歌曲同目录找同名（stem）`.lrc`：精确优先，退化为大小写不敏感匹配。
+fn find_lrc_sidecar(audio: &Path) -> Option<PathBuf> {
+    let dir = audio.parent()?;
+    let stem = audio.file_stem()?;
+    let exact = dir.join(format!("{}.lrc", stem.to_string_lossy()));
+    if exact.is_file() {
+        return Some(exact);
+    }
+    let stem_l = stem.to_string_lossy().to_lowercase();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        let ext_ok = p
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("lrc"));
+        let stem_ok = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .is_some_and(|s| s == stem_l);
+        if ext_ok && stem_ok {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// 按艺术家稳定分组（首现顺序），每组记录 `library` 下标与 `"N首"` 副标题；
@@ -163,6 +240,92 @@ mod tests {
     }
 
     #[test]
+    fn scan_loads_lrc_sidecar() {
+        let dir = std::env::temp_dir().join(format!("gpui-music-lrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("周杰伦 - 晴天.ogg"), b"ogg").unwrap();
+        std::fs::write(
+            dir.join("周杰伦 - 晴天.lrc"),
+            "[00:01.00]歌词第一句\n[00:05]歌词第二句\n",
+        )
+        .unwrap();
+        // 无歌词侧车的歌保持 None
+        std::fs::write(dir.join("林俊杰 - 江南.MP3"), b"id3").unwrap();
+
+        let tracks = scan_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(tracks.len(), 2);
+        let with_lyric = tracks.iter().find(|t| t.title == "晴天").unwrap();
+        let l = with_lyric.lyrics.as_ref().expect("同名 .lrc 应被装载");
+        assert_eq!(l.lines.len(), 2);
+        assert_eq!(l.lines[0].text, "歌词第一句");
+        let without = tracks.iter().find(|t| t.title == "江南").unwrap();
+        assert!(without.lyrics.is_none(), "无 .lrc 的歌 lyrics 应为 None");
+    }
+
+    #[test]
+    fn scan_lrc_extension_case_insensitive() {
+        let dir = std::env::temp_dir().join(format!("gpui-music-lrc-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("陈奕迅 - 十年.ogg"), b"ogg").unwrap();
+        std::fs::write(dir.join("陈奕迅 - 十年.LRC"), "[00:01]十年之前\n").unwrap();
+        let tracks = scan_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = &tracks[0];
+        assert_eq!(
+            t.lyrics.as_ref().map(|l| l.lines[0].text.as_str()),
+            Some("十年之前"),
+            "扩展名大小写不敏感也应装载"
+        );
+    }
+
+    #[test]
+    fn scan_finds_cover_sidecar_by_stem_priority() {
+        let dir = std::env::temp_dir().join(format!("gpui-music-cover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("初音未来 (初音ミク) - 月西江.ogg"), b"ogg").unwrap();
+        std::fs::write(dir.join("初音未来 (初音ミク) - 月西江.jpg"), b"jpg").unwrap();
+        std::fs::write(dir.join("心华 - 音符成诗.ogg"), b"ogg").unwrap();
+        std::fs::write(dir.join("心华 - 音符成诗.png"), b"png").unwrap();
+        // 无封面歌保持 None
+        std::fs::write(dir.join("蔡琴 - 我要如何不想他.ogg"), b"ogg").unwrap();
+
+        let tracks = scan_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(tracks.len(), 3);
+        let moon = tracks.iter().find(|t| t.title == "月西江").unwrap();
+        assert_eq!(
+            moon.cover_path.as_ref().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()),
+            Some("初音未来 (初音ミク) - 月西江.jpg".to_string())
+        );
+        let song = tracks.iter().find(|t| t.title == "音符成诗").unwrap();
+        assert!(song.cover_path.is_some());
+        let no_cover = tracks.iter().find(|t| t.title == "我要如何不想他").unwrap();
+        assert!(no_cover.cover_path.is_none(), "无封面图应 None");
+    }
+
+    #[test]
+    fn cover_sidecar_extension_case_insensitive_and_priority() {
+        let dir = std::env::temp_dir().join(format!("gpui-music-cover-pr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("歌.ogg"), b"ogg").unwrap();
+        // png 与 jpeg 同名 → 按 COVER_EXTENSIONS 顺序优先 jpeg
+        std::fs::write(dir.join("歌.png"), b"png").unwrap();
+        std::fs::write(dir.join("歌.JPEG"), b"jpeg").unwrap();
+        let tracks = scan_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = &tracks[0];
+        assert_eq!(
+            t.cover_path.as_ref().map(|p| p.extension().unwrap().to_string_lossy().to_ascii_lowercase()),
+            Some("jpeg".to_string())
+        );
+    }
+
+    #[test]
     fn build_mix_groups_groups_by_artist_in_first_seen_order() {
         // 构造 3 首：周杰伦×2、林俊杰×1（下标 0/2 同艺术家）
         let mk = |i: usize, artist: &str, title: &str| Track {
@@ -172,6 +335,8 @@ mod tests {
             album: String::new(),
             duration: 0.0,
             grad: (0, 0, 0),
+            cover_path: None,
+            lyrics: None,
         };
         let tracks = vec![
             mk(0, "周杰伦", "晴天"),
@@ -203,6 +368,8 @@ mod tests {
             album: String::new(),
             duration: 0.0,
             grad: (0, 0, 0),
+            cover_path: None,
+            lyrics: None,
         }];
         let g = build_mix_groups(&tracks);
         assert_eq!(g.len(), 1);

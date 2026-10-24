@@ -51,7 +51,19 @@ pub fn eq_bars(playing: bool, accent: Hsla, prefix: String) -> AnyElement {
 
 /// 黑胶圈：给定直径的圆环 + 顶端缺口点（让旋转可见）。`playing` 时绕中心匀速旋转
 /// （`svg().with_transformation`，`div` 无 transform；`prefix` 保证动画 id 唯一）。
+/// 默认 8s 一圈顺时针（legacy 姿势）。
 pub fn vinyl_ring(diameter: f32, playing: bool, prefix: String) -> AnyElement {
+    vinyl_ring_at(diameter, playing, prefix, Duration::from_secs(8), false)
+}
+
+/// 黑胶圈（可配周期/转向）：全屏 v2 封面三层圈用不同周期 + 反向旋转增强层次感。
+pub fn vinyl_ring_at(
+    diameter: f32,
+    playing: bool,
+    prefix: String,
+    period: Duration,
+    reverse: bool,
+) -> AnyElement {
     let mark = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
   fill="none" stroke="currentColor" stroke-width="0.7" stroke-linecap="round">
@@ -65,11 +77,10 @@ pub fn vinyl_ring(diameter: f32, playing: bool, prefix: String) -> AnyElement {
         .path(mark)
         .text_color(gpui::white().opacity(0.06));
     if playing {
-        ring.with_animation(
-            prefix,
-            Animation::new(Duration::from_secs(8)).repeat(),
-            |this, d| this.with_transformation(Transformation::rotate(radians(d * 360.0))),
-        )
+        ring.with_animation(prefix, Animation::new(period).repeat(), move |this, d| {
+            let deg = if reverse { -d * 360.0 } else { d * 360.0 };
+            this.with_transformation(Transformation::rotate(radians(deg)))
+        })
         .into_any_element()
     } else {
         ring.with_transformation(Transformation::rotate(radians(0.0)))
