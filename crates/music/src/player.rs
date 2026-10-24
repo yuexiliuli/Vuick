@@ -84,6 +84,10 @@ pub struct MusicPlayer {
     /// flush 已落地、此后增量直接取 `clock`（否则 flush 后时钟从 0 重走仍照旧锚点
     /// 起算，会在 seek 落点上方「冻结满 C 秒再突然跃升」）。
     flush_seen: Cell<bool>,
+    /// 库/收藏变更计数器：`load_dir`（整体换库、下标漂移）与 `toggle_like`（收藏集变化）
+    /// 递增。主区列表渲染按它做「过滤/分组显示模型缓存」失效键——搜索词不变且本计数不变
+    /// 时复用缓存，避免每帧重过滤 + 深克隆 `Track`（性能优化第二步）。
+    mutation: u64,
 }
 
 impl MusicPlayer {
@@ -115,6 +119,7 @@ impl MusicPlayer {
             seek_clock_base: 0.0,
             scrubbing: false,
             flush_seen: Cell::new(false),
+            mutation: 0,
         }
     }
 
@@ -177,6 +182,8 @@ impl MusicPlayer {
         self.library = scan_dir(&dir);
         self.mix_groups = build_mix_groups(&self.library);
         self.dir = Some(dir);
+        // 库整体替换 → 视图侧「过滤/分组显示模型」缓存失效。
+        self.mutation += 1;
         let reidx = |i: usize, lib: &[Track]| {
             old_paths
                 .get(i)
@@ -469,7 +476,14 @@ impl MusicPlayer {
         if !self.liked.remove(&p) {
             self.liked.insert(p);
         }
+        // 收藏集变化 → 视图侧「过滤/分组显示模型」缓存（Liked 分区依赖 liked 集）失效。
+        self.mutation += 1;
         cx.notify();
+    }
+
+    /// 库/收藏变更计数（主区列表渲染缓存失效键，见 [`Self::mutation`] 注释）。
+    pub fn mutation(&self) -> u64 {
+        self.mutation
     }
 
     pub fn is_liked(&self, idx: usize) -> bool {

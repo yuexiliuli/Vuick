@@ -47,7 +47,7 @@ use crate::model::{RepeatMode, Track};
 use crate::player::MusicPlayer;
 
 /// 侧栏主导航分区。
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum MainSection {
     /// 首页（推荐 Mix + 热门歌曲表）。
     #[default]
@@ -184,6 +184,13 @@ pub struct MusicView {
     lyrics_manual_last_y: f32,
     /// 当前参与歌词跟随的曲目路径（切歌/换曲时复位跟随态，新曲从自动跟随开始）。
     lyrics_track_path: Option<PathBuf>,
+    // ---- 主区列表虚拟化（性能优化第二步）：可视窗行 + 显示模型缓存 ----
+    /// 主区列表滚动句柄（Library/Liked/Home 单一活跃滚动容器共用；`track_scroll` 绑定、
+    /// 偏移驱动可见行窗——见 `main::MainList::visible_range`）。
+    main_scroll: ScrollHandle,
+    /// 主区「过滤/分组显示模型」缓存（`(分区, 搜索词)` → `(库变更计数, Rc<显示模型>)`）：
+    /// 同一搜索词且 `player.mutation()` 不变则复用——消除每帧重过滤 + `Vec<Track>` 深克隆。
+    main_list_cache: HashMap<(MainSection, String), (u64, Rc<main::MainList>)>,
 }
 
 /// 进度条拖拽真实 seek 节流（ms）：与视频查看器同量级；节流窗口内只更新显示基准
@@ -230,6 +237,8 @@ impl MusicView {
             lyrics_manual_since: None,
             lyrics_manual_last_y: 0.0,
             lyrics_track_path: None,
+            main_scroll: ScrollHandle::new(),
+            main_list_cache: HashMap::new(),
         }
     }
 

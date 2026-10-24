@@ -14,7 +14,7 @@ use gpui::{AppContext as _, Bounds, Entity, MouseButton, Pixels, TestAppContext,
 
 use super::fullscreen::LYRIC_ROW_H;
 use super::theme;
-use super::{MusicEvent, MusicView, RightTab};
+use super::{MainSection, MusicEvent, MusicView, RightTab};
 use crate::model::Track;
 use crate::player::MusicPlayer;
 
@@ -123,6 +123,85 @@ fn write_tiny_wav(dir: &Path, name: &str) {
     wav.extend_from_slice(&data_len.to_le_bytes());
     wav.extend_from_slice(&data);
     std::fs::write(dir.join(name), wav).unwrap();
+}
+
+/// 迷你 WAV（0.02s ≈ 3.5KB）：大库性能探针/虚拟化回归用——只作文件名/元数据，不真解码。
+fn write_tiny_wav_short(dir: &Path, name: &str) {
+    const RATE: u32 = 44_100;
+    const CH: usize = 2;
+    let total = (RATE as f64 * 0.02 * CH as f64).round() as usize;
+    let mut data = Vec::with_capacity(total * 2);
+    for _ in 0..total / CH {
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+    }
+    let mut wav = Vec::new();
+    let data_len = data.len() as u32;
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&(CH as u16).to_le_bytes());
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * CH as u32 * 2).to_le_bytes());
+    wav.extend_from_slice(&(CH as u16 * 2).to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&data);
+    std::fs::write(dir.join(name), wav).unwrap();
+}
+
+/// 建含 `n` 曲的临时库：5 位艺术家轮转（`艺人{i%5}`）+ 唯一歌名（Library 分组、Home 热门表
+/// 虚拟化回归用）。目录名带全局自增序号防并行互删。
+static N_LIB_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
+fn library_with_n(cx: &mut TestAppContext, n: usize) -> Entity<MusicPlayer> {
+    let seq = N_LIB_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "gpui-music-nlib-{}-{seq}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..n {
+        write_tiny_wav_short(&dir, &format!("艺人{} - 歌曲{i}.wav", i % 5));
+    }
+    let player: Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+    cx.update(|app| {
+        player.update(app, |p, cx| p.load_dir(&dir, cx));
+    });
+    player
+}
+
+/// 性能探针（K27 留数）：`n` 首大库下主区列表稳态单帧墙钟 ms（首帧暖一次后计时第二帧的
+/// draw + `run_until_parked`）。before=全量物化+Track 深克隆（r199=true），after=可视窗虚拟化+
+/// 零克隆（r199=false）。报告里给对比数；断言只放宽松阈值（<10s）防误伤，数字本身才是产出。
+/// 不引用新实现字段（`main_scroll`），保证同探针可对改造前/后代跑。
+#[gpui::test]
+async fn render_main_lists_wallclock_200(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 200);
+    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let t0 = std::time::Instant::now();
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let r0 = wcx.debug_bounds("song-row-0").is_some();
+    let r199 = wcx.debug_bounds("song-row-199").is_some();
+    eprintln!(
+        "[perf] render_main_lists@200 steady_frame_ms={ms:.1} materialized=(r0={r0},r199={r199})"
+    );
+    assert!(
+        ms < 10_000.0,
+        "稳态单帧应在宽松阈值内（性能探针不设严格红线）：实测 {ms:.1}ms"
+    );
 }
 
 /// 建一个含 3 曲的临时音乐库播放器（中文文件名）。目录名带全局自增序号：多测试并行
@@ -1657,5 +1736,191 @@ fn hover_tooltip_switches_anchor_between_buttons(cx: &mut TestAppContext) {
         "换钮后提示应跟随到新钮上方（不固定在某处）：ta.x={:.1} tb.x={:.1}",
         ta.origin.x.as_f32(),
         tb.origin.x.as_f32()
+    );
+}
+
+// ---- 主区列表虚拟化（性能优化第二步）回归：可视窗 ± 缓冲物化、下标映射、分组头、滚动 ----
+
+/// 用例 V1（虚拟化契约，旧全量实现=RED）：Home 大库**顶部**只物化可视窗 ± 缓冲行，
+/// 屏外末行不物化（旧实现 r119 全量在 → 断言 is_none 失败）。
+#[gpui::test]
+async fn home_list_only_materializes_visible_window(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 120);
+    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("song-row-0").is_some(),
+        "顶部应物化首行（可视窗内）"
+    );
+    assert!(
+        wcx.debug_bounds("song-row-5").is_some(),
+        "顶部近端行应物化"
+    );
+    assert!(
+        wcx.debug_bounds("song-row-119").is_none(),
+        "屏外末行不应被物化（只物化可视窗±缓冲；旧全量实现此断言 RED）"
+    );
+}
+
+/// 用例 V2（滚动行窗 + 点击下标映射）：滚到第 20 行 → 首行窗 = floor(offset/ROW_H)、第 20 行
+/// 物化 / 首行出屏；点击第 20 行 → `handle_play_idx(20)`（虚拟化下标映射不漂移）。
+#[gpui::test]
+async fn home_scroll_moves_window_and_click_maps_real_index(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 120);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let handle = wcx.cx.read(|app| view.read(app).main_scroll.clone());
+    // 滚到下行 20×52=1040px（显示「首行窗 = 20」）。
+    handle.set_offset(gpui::point(px(0.), px(-(52.0 * 20.0))));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("song-row-20").is_some(),
+        "滚到第 20 行时该行应物化"
+    );
+    assert!(
+        wcx.debug_bounds("song-row-0").is_none(),
+        "滚到中部后首行应出屏（不物化）"
+    );
+    // 像素点击第 20 行 → 真实库下标 20 随行对象被 `handle_play_idx` 命中。
+    let r20 = wcx.debug_bounds("song-row-20").expect("第 20 行应有盒");
+    let click = gpui::Point::new(
+        px(r20.origin.x.as_f32() + 30.0),
+        px(r20.origin.y.as_f32() + r20.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_mouse_down(click, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(click, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let cur = wcx.cx.read(|app| player.read(app).current());
+    assert_eq!(cur, Some(20), "点击滚后可视行应命中真实库下标 20，实得 {cur:?}");
+}
+
+/// 用例 V3（Library 分组）：分组头固定高物化在列表首；点击组内首行 → 正确真实下标。
+#[gpui::test]
+async fn library_groups_header_and_first_row_click(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 40); // 5 艺术家 × 8 首
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Library);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 首组「艺人0」组头 + 组内首行（idx=0）应物化。
+    let gh = wcx.debug_bounds("song-group-艺人0").expect("艺人0 组头应物化");
+    assert!(
+        wcx.debug_bounds("song-group-艺人4").is_none(),
+        "屏外尾组头不应物化（分组前缀反查生效）"
+    );
+    let r0 = wcx.debug_bounds("song-row-0").expect("艺人0 组内首行应物化");
+    assert!(
+        (r0.origin.y.as_f32() - (gh.origin.y.as_f32() + 48.0)).abs() < 2.0,
+        "组头(48)后应紧接该组首行：gh.y={:.1} r0.y={:.1}",
+        gh.origin.y.as_f32(),
+        r0.origin.y.as_f32()
+    );
+    let click = gpui::Point::new(
+        px(r0.origin.x.as_f32() + 30.0),
+        px(r0.origin.y.as_f32() + 20.0),
+    );
+    wcx.simulate_mouse_down(click, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(click, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let cur = wcx.cx.read(|app| player.read(app).current());
+    assert_eq!(cur, Some(0), "点击艺人0 组内首行应命中库下标 0");
+}
+
+/// 用例 V4（Library 滚动跨组）：滚到中部组区间 → 该组头物化、首组头出屏（混合行高前缀反查）。
+#[gpui::test]
+async fn library_scroll_crosses_groups_window(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 40); // 组高 48 + 8×52 = 464/组
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Library);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let handle = wcx.cx.read(|app| view.read(app).main_scroll.clone());
+    // 第 2 组顶 ≈ 464×2 = 928 → 滚到 1000（组2 头 + 部分行可视）。
+    handle.set_offset(gpui::point(px(0.), px(-1000.0)));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("song-group-艺人2").is_some(),
+        "滚到中部应物化该组组头（艺人2）"
+    );
+    assert!(
+        wcx.debug_bounds("song-group-艺人0").is_none(),
+        "滚到中部首组头应出屏（混合行高前缀反查）"
+    );
+}
+
+/// 用例 V5（搜索过滤缓存）：查询串变化 → 只物化命中行；空命中 → 空态（列表区不渲染歌行）。
+#[gpui::test]
+async fn search_filters_main_list_rows(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 40);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("song-row-1").is_some(), "空查询应物化第 1 行");
+    // 搜索「艺人0」→ 命中 artist=艺人0（i%5==0）：i=0,5,…,35 共 8 首；i=8（艺人1）不命中。
+    wcx.update(|_w, app| {
+        view.update(app, |v, _| v.state.search = "艺人0".into());
+    });
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("song-row-0").is_some(), "命中行应物化（idx0）");
+    assert!(
+        wcx.debug_bounds("song-row-8").is_none(),
+        "未命中行（艺人1）不应物化（搜索过滤生效）"
+    );
+    let cached = wcx.cx.read(|app| {
+        let v = view.read(app);
+        v.main_list_cache
+            .get(&(MainSection::Home, "艺人0".to_string()))
+            .map(|(_rev, l)| l.total)
+    });
+    assert_eq!(cached, Some(8), "搜索模型缓存应含 8 首命中，实得 {cached:?}");
+}
+
+/// 用例 V6（Liked + 收藏变更失效缓存）：无收藏 → 空态；收藏 1 首 → 该行物化（mutation 升，
+/// 显示模型缓存失效重建）。
+#[gpui::test]
+async fn liked_list_updates_after_like_invalidation(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 12);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Liked);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("song-row-0").is_none(),
+        "无收藏时收藏列表应为空（不物化任何行）"
+    );
+    // 收藏第 0 首（mutation 递增 → 缓存失效）→ 重绘后该行物化。
+    wcx.update(|_w, app| {
+        player.update(app, |p, cx| p.toggle_like(0, cx));
+    });
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("song-row-0").is_some(),
+        "收藏后该行应物化（缓存失效重建）"
     );
 }
