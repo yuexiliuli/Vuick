@@ -604,115 +604,165 @@ pub fn prev_index(queue_len: usize, pos: usize, repeat: RepeatMode) -> Option<us
     }
 }
 
+/// worker 运行上下文（命令分发两侧共用：主轮询 + 回压等待）。
+struct WorkerCtx {
+    buf: Vec<f32>,
+    codec: Option<decode::AudioCodec>,
+    active: bool,
+    /// 当前 Load 代序号：Opened/Finished/Error 事件都带它，主线程据此过滤陈旧事件。
+    cur_gen: u64,
+    /// 待落地 Load 目标（命令里攒下，处理完成统一落地，避免在 match 分支重入）。
+    load: Option<(u64, PathBuf, u32)>,
+}
+
+/// 处理单条命令：更新 ctx。返回 `true` = 退出 worker（Shutdown）。
+/// 主轮询与回压等待共用，保证 Seek/Pause/Stop/Load/Shutdown 在任何时机都能被及时处理。
+fn dispatch(
+    cmd: WorkerCmd,
+    ctx: &mut WorkerCtx,
+    sink: &AudioSink,
+    evt_tx: &mpsc::Sender<Event>,
+) -> bool {
+    match cmd {
+        WorkerCmd::Shutdown => return true,
+        WorkerCmd::Stop => {
+            ctx.codec = None;
+            ctx.active = false;
+            ctx.buf.clear();
+            let _ = sink.pause();
+            sink.flush();
+        }
+        WorkerCmd::Pause => {
+            let _ = sink.pause();
+        }
+        WorkerCmd::Resume => {
+            let _ = sink.play();
+        }
+        WorkerCmd::Seek { seconds, .. } => {
+            if let Some(c) = &mut ctx.codec {
+                if c.seek(seconds).is_ok() {
+                    sink.flush();
+                } else {
+                    let _ = evt_tx.send(Event::Error {
+                        gen_id: ctx.cur_gen,
+                        message: "音频 seek 失败".to_string(),
+                    });
+                }
+            }
+        }
+        WorkerCmd::Load { gen_id, path, rate } => {
+            ctx.load = Some((gen_id, path, rate));
+        }
+    }
+    false
+}
+
+/// 落地挂起的 Load（关旧 codec 开新、flush、Opened 事件、起播）。
+fn apply_load(ctx: &mut WorkerCtx, sink: &AudioSink, evt_tx: &mpsc::Sender<Event>) {
+    let Some((gen_id, path, rate)) = ctx.load.take() else {
+        return;
+    };
+    ctx.cur_gen = gen_id;
+    ctx.codec = None;
+    ctx.active = false;
+    ctx.buf.clear();
+    sink.flush();
+    match decode::open_audio(&path, rate) {
+        Ok(c) => {
+            let duration = c.params().duration;
+            ctx.codec = Some(c);
+            ctx.active = true;
+            let _ = sink.play();
+            let _ = evt_tx.send(Event::Opened { gen_id, duration });
+        }
+        Err(e) => {
+            let _ = evt_tx.send(Event::Error {
+                gen_id,
+                message: format!("打开音频失败: {e}"),
+            });
+        }
+    }
+}
+
 /// worker 主循环：单线程串行处理命令 + 流式解码推送。
 /// - `Load`：关旧 codec 开新（open+params+Opened 事件），进入流式解码；
-/// - 流式期每拍 `try_recv` 一条命令（回压积压 > 1s 样本时短眠让设备排空）；
+/// - 流式推进前**阻塞回压**：队列积压 >1s 样本时原地等待（每 5ms 复查 + 顺带抓命令），
+///   直到降到阈值下才推下一块。解码比实时快约 9 倍，旧实现「睡 5ms 照推」会把队列打满
+///   `QUEUE_MAX_SAMPLES`，`sink.push` 被迫从**队头（即将播放处）丢最旧样本** → 内容前跳
+///   （快进）+ 硬切杂音（视频 audio_worker 同款阻塞姿势，见 workers.rs audio_worker）。
 /// - EOF → `Finished` 事件（主线程按 repeat/shuffle 决策）；
 /// - `Shutdown`/通道断开 → 退出（Drop 时 `join` 保证 dll/cpal 干净释放）。
 fn worker_main(rx: mpsc::Receiver<WorkerCmd>, evt_tx: mpsc::Sender<Event>, sink: AudioSink) {
-    let mut buf: Vec<f32> = Vec::new();
-    let mut codec: Option<decode::AudioCodec> = None;
-    let mut active = false;
-    // 当前 Load 代序号：Opened/Finished/Error 事件都带它，主线程据此过滤陈旧事件。
-    let mut cur_gen: u64 = 0;
+    let mut ctx = WorkerCtx {
+        buf: Vec::new(),
+        codec: None,
+        active: false,
+        cur_gen: 0,
+        load: None,
+    };
     let rate = sink.sample_rate().max(1);
     // 回压阈值：≈1 秒立体声样本。
     let backpressure = rate as usize * 2;
 
     loop {
-        // 取待处理命令：活跃期短轮询，空闲期阻塞等
-        let cmd = if active {
-            if sink.queued_len() > backpressure {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+        // 取待处理命令：活跃期非阻塞（回压等待段会再抓），空闲期阻塞等
+        let cmd = if ctx.active {
             rx.try_recv().ok()
         } else {
             match rx.recv() {
                 Ok(c) => Some(c),
-                Err(_) => break,
+                Err(_) => return,
             }
         };
-
-        // 待重载的 Load 目标（避免在 match 分支里重入导致混乱）
-        let mut load: Option<(u64, PathBuf, u32)> = None;
-
-        if let Some(cmd) = cmd {
-            match cmd {
-                WorkerCmd::Shutdown => break,
-                WorkerCmd::Stop => {
-                    codec = None;
-                    active = false;
-                    buf.clear();
-                    let _ = sink.pause();
-                    sink.flush();
-                }
-                WorkerCmd::Pause => {
-                    let _ = sink.pause();
-                }
-                WorkerCmd::Resume => {
-                    let _ = sink.play();
-                }
-                WorkerCmd::Seek { seconds, .. } => {
-                    if let Some(c) = &mut codec {
-                        if c.seek(seconds).is_ok() {
-                            sink.flush();
-                        } else {
-                            let _ = evt_tx.send(Event::Error {
-                                gen_id: cur_gen,
-                                message: "音频 seek 失败".to_string(),
-                            });
-                        }
-                    }
-                }
-                WorkerCmd::Load { gen_id, path, rate: r } => {
-                    load = Some((gen_id, path, r));
-                }
-            }
+        if let Some(cmd) = cmd
+            && dispatch(cmd, &mut ctx, &sink, &evt_tx)
+        {
+            return;
         }
-
-        if let Some((gen_id, path, rate)) = load {
-            cur_gen = gen_id;
-            codec = None;
-            active = false;
-            buf.clear();
-            sink.flush();
-            match decode::open_audio(&path, rate) {
-                Ok(c) => {
-                    let duration = c.params().duration;
-                    codec = Some(c);
-                    active = true;
-                    let _ = sink.play();
-                    let _ = evt_tx.send(Event::Opened { gen_id, duration });
-                }
-                Err(e) => {
-                    let _ = evt_tx.send(Event::Error {
-                        gen_id,
-                        message: format!("打开音频失败: {e}"),
-                    });
-                }
-            }
+        // Load 落地（换代：关旧开新 + flush + 起播）
+        apply_load(&mut ctx, &sink, &evt_tx);
+        if !ctx.active {
             continue;
         }
 
-        // 无待处理命令：推进解码
-        if !active {
-            continue;
+        // 阻塞回压：队列积压 >1s → 等队列排到阈值下再推下一块（对齐视频 audio_worker）。
+        // 等待期间每 5ms 抓一次命令，Seek/Pause/Stop/Load 仍及时；来了就就地处理并回主
+        // 循环（不在等待块里深埋逻辑）。这是「音乐正常速度/无杂音」的核心：不守这条，
+        // 解码（≈9×实时）会把队列打满上限，push 从队头丢最旧样本 = 快进 + 硬切杂音。
+        if sink.queued_len() > backpressure {
+            loop {
+                if let Ok(cmd) = rx.try_recv()
+                    && dispatch(cmd, &mut ctx, &sink, &evt_tx)
+                {
+                    return;
+                }
+                apply_load(&mut ctx, &sink, &evt_tx);
+                if sink.queued_len() <= backpressure {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !ctx.active {
+                continue;
+            }
         }
-        match codec.as_mut().expect("active 必有 codec").next_pcm(&mut buf) {
-            Ok(Some(_pts)) => sink.push(&buf),
+
+        // 解码推进
+        match ctx.codec.as_mut().expect("active 必有 codec").next_pcm(&mut ctx.buf) {
+            Ok(Some(_pts)) => sink.push(&ctx.buf),
             Ok(None) => {
                 // EOF：关 codec，发 Finished（自动下一首由主线程决策）
-                codec = None;
-                active = false;
-                buf.clear();
-                let _ = evt_tx.send(Event::Finished { gen_id: cur_gen });
+                ctx.codec = None;
+                ctx.active = false;
+                ctx.buf.clear();
+                let _ = evt_tx.send(Event::Finished { gen_id: ctx.cur_gen });
             }
             Err(e) => {
-                codec = None;
-                active = false;
-                buf.clear();
+                ctx.codec = None;
+                ctx.active = false;
+                ctx.buf.clear();
                 let _ = evt_tx.send(Event::Error {
-                    gen_id: cur_gen,
+                    gen_id: ctx.cur_gen,
                     message: format!("解码失败: {e}"),
                 });
             }
@@ -887,6 +937,19 @@ mod tests {
         };
         assert!(pos > 0.0, "position 应 >0");
 
+        // 回压回归（生产者丢样本）：播放若干拍后 push 不得从队头丢最旧样本（否则 = 内容
+        // 前跳/快进 + 硬切杂音）。旧 worker「睡 5ms 照推」会把队列打满上限导致 dropped>
+        // 0；阻塞式回压后应恒 0。
+        let st = cx.update(|app| {
+            player.read(app).sink.as_ref().map(|s| s.stats())
+        });
+        if let Some((_calls, _underrun, _lockfail, _played, dropped)) = st {
+            assert_eq!(
+                dropped, 0,
+                "播放中不得从队头丢样本（回压失效 → 快进+杂音）: stats={st:?}"
+            );
+        }
+
         // pause：position 冻结（worker 已暂停 sink → 播放时钟静止）
         cx.update(|app| {
             player.update(app, |p, cx| p.pause(cx));
@@ -923,3 +986,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+

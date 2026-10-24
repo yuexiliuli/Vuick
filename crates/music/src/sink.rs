@@ -36,10 +36,13 @@ struct SinkInner {
     volume: Arc<AtomicU32>,
     /// 回调累计次数。
     cb_calls: Arc<AtomicU64>,
-    /// 累计欠载样本数（回调时队列已空，填了静音）。
+    /// 播放/丢弃健康：设备侧欠载样本数（回调时队列已空，填了静音）。
     cb_underrun: Arc<AtomicU64>,
-    /// 累计锁竞争失败次数（整块静音）。
+    /// 设备侧锁竞争失败次数（整块静音）。
     cb_lockfail: Arc<AtomicU64>,
+    /// **生产者侧**丢弃样本数（`push` 超过队列上限从队头弹出）。解码过快 + 回压不守
+    /// 阈值时此值飙升 = 内容前跳（快进）+ 硬切杂音；正常回压下应恒 0。
+    dropped_samples: Arc<AtomicU64>,
 }
 
 impl AudioSink {
@@ -66,6 +69,7 @@ impl AudioSink {
         let cb_calls = Arc::new(AtomicU64::new(0));
         let cb_underrun = Arc::new(AtomicU64::new(0));
         let cb_lockfail = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
         let err_fn = |e: cpal::Error| eprintln!("[music] 音频输出流错误：{e}");
 
         let format = supported.sample_format();
@@ -95,6 +99,7 @@ impl AudioSink {
                 cb_calls,
                 cb_underrun,
                 cb_lockfail,
+                dropped_samples: dropped,
             }),
         })
     }
@@ -123,6 +128,8 @@ impl AudioSink {
     }
 
     /// 解码线程入队一块 F32 交错样本（有界：超出上限丢弃最旧，保实时）。
+    /// `dropped_samples` 计数队头丢弃量——**正常回压（worker 阻塞等队列下降）下恒 0**；
+    /// 解码过快且不守回压时飙升（内容前跳 = 快进 + 硬切杂音，设备侧 underrun 数不到）。
     pub(crate) fn push(&self, samples: &[f32]) {
         let mut q = self.inner.queue.lock().unwrap();
         if q.len() + samples.len() > QUEUE_MAX_SAMPLES {
@@ -130,6 +137,7 @@ impl AudioSink {
             for _ in 0..drop {
                 q.pop_front();
             }
+            self.inner.dropped_samples.fetch_add(drop as u64, Ordering::Relaxed);
         }
         q.extend(samples);
     }
@@ -140,16 +148,17 @@ impl AudioSink {
         self.inner.played_frames.store(0, Ordering::Relaxed);
     }
 
-    /// 播放进度/健康统计：`(回调次数, 欠载样本, 锁失败次数, 已播帧数)`。
-    /// Phase A 未消费（调试/取证用），保留与 video 同款实现。
+    /// 播放进度/健康统计：`(回调次数, 欠载样本, 锁失败次数, 已播帧数, 生产者丢弃样本)`。
+    /// Phase A 未消费（调试/取证用），保留与 video 同款实现 + 丢弃计数扩展。
     #[allow(dead_code)]
-    pub(crate) fn stats(&self) -> (u64, u64, u64, u64) {
+    pub(crate) fn stats(&self) -> (u64, u64, u64, u64, u64) {
         let i = &self.inner;
         (
             i.cb_calls.load(Ordering::Relaxed),
             i.cb_underrun.load(Ordering::Relaxed),
             i.cb_lockfail.load(Ordering::Relaxed),
             i.played_frames.load(Ordering::Relaxed),
+            i.dropped_samples.load(Ordering::Relaxed),
         )
     }
 
@@ -240,3 +249,4 @@ fn pump<T>(
     }
     played.fetch_add(frame_count as u64, Ordering::Relaxed);
 }
+
