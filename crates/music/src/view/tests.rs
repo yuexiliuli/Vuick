@@ -13,7 +13,9 @@ use std::time::Duration;
 use gpui::{AppContext as _, Bounds, Entity, MouseButton, Pixels, TestAppContext, VisualTestContext, px};
 
 use super::fullscreen::LYRIC_ROW_H;
+use super::icon::MusicIcon;
 use super::theme;
+use super::titlebar::{TITLE_BAR_H, max_icon};
 use super::{MainSection, MusicEvent, MusicView, RightTab};
 use crate::model::{RepeatMode, Track};
 use crate::player::MusicPlayer;
@@ -1794,8 +1796,10 @@ async fn fs_progress_click_does_not_leak_to_sidebar_playlist(cx: &mut TestAppCon
     });
     let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
     // 用户窗口：缩小到 fs 进度条与侧栏歌单行**几何重叠**（默认 1280x800 不重叠 → 旧 headless
-    // 用例全绿却漏真机穿透）。
-    wcx.simulate_resize(gpui::size(px(900.), px(716.)));
+    // 用例全绿却漏真机穿透）。高 756 = 716 + 40：主界面标题栏（`music-title-bar` 36px）把
+    // 侧栏行下移 36，fs 浮层 absolute inset-0 盖整窗、左列在 body 竖直居中 → 多给 ~40px
+    // 让「fs 进度条 ⇄ 歌单行」重新恢复重叠（补偿值；仍满足「缩小窗口」的夹具语义）。
+    wcx.simulate_resize(gpui::size(px(900.), px(756.)));
     wcx.update(|window, app| {
         view.update(app, |v, _| v.state.fs_open = true);
         window.draw(app).clear(app);
@@ -2420,5 +2424,128 @@ async fn liked_list_updates_after_like_invalidation(cx: &mut TestAppContext) {
     assert!(
         wcx.debug_bounds("song-row-0").is_some(),
         "收藏后该行应物化（缓存失效重建）"
+    );
+}
+
+// ---- Windows 风格标题栏（主界面顶层；窗口控制钮走 window_control_area 原生机制）----
+
+/// 最大化/还原图标选择（纯函数，双路注入断言）：未最大化 →「最大化」图标；已最大化 →
+/// 「向下还原」图标（对应 shell chrome.rs:419 的 `is_maximized` 分支）。headless 测试平台
+/// `is_maximized()` 恒返回 false 且 `minimize()` 未实现，真实翻转只能由系统/真机完成，
+/// 故这里对**选择方向**注入两种状态断言（K30：headless 证机制、真实路径待真机复验）。
+#[test]
+fn title_max_icon_selector_flips_direction() {
+    assert_eq!(
+        max_icon(false),
+        MusicIcon::Maximize,
+        "未最大化应显示「最大化」图标"
+    );
+    assert_eq!(
+        max_icon(true),
+        MusicIcon::Restore,
+        "已最大化应切换为「向下还原」图标"
+    );
+}
+
+/// 标题栏布局：`music-title-bar` 置顶（origin.y=0、高 [`TITLE_BAR_H`]、通窗宽）；三窗口
+/// 控制钮（`title-minimize`/`title-maximize`/`title-close`，id 对齐 shell）在窗宽内、
+/// 互不重叠、从左到右 min<max<close 且贴右缘；左标题文字在钮左、空白拖动区在两者之间。
+#[gpui::test]
+async fn title_bar_controls_layout_within_window(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+
+    let bar = wcx.debug_bounds("music-title-bar").expect("标题栏应在渲染");
+    let win_w = wcx.update(|window, _| window.bounds().size.width.as_f32());
+    let right = |b: &Bounds<Pixels>| b.origin.x.as_f32() + b.size.width.as_f32();
+    assert_eq!(bar.origin.y.as_f32(), 0.0, "标题栏应置顶");
+    assert!(
+        (bar.size.height.as_f32() - TITLE_BAR_H).abs() < 0.5,
+        "标题栏高应为 {TITLE_BAR_H}px，实得 {}",
+        bar.size.height.as_f32()
+    );
+    assert!(
+        (bar.size.width.as_f32() - win_w).abs() < 0.5,
+        "标题栏应通窗宽：bar={} win={win_w}",
+        bar.size.width.as_f32()
+    );
+
+    let min = wcx.debug_bounds("title-minimize").expect("最小化钮应有 debug 盒");
+    let maxb = wcx.debug_bounds("title-maximize").expect("最大化钮应有 debug 盒");
+    let close = wcx.debug_bounds("title-close").expect("关闭钮应有 debug 盒");
+    let text = wcx.debug_bounds("music-title-text").expect("标题文字应有 debug 盒");
+    let drag = wcx.debug_bounds("music-title-drag").expect("空白拖动区应有 debug 盒");
+
+    // 三钮在窗宽内、从左到右 min<max<close、不重叠；钮高=标题栏高（整条可点）。
+    assert!(min.origin.x.as_f32() >= 0.0 && right(&close) <= win_w, "三钮应在窗宽内");
+    assert!(right(&min) <= maxb.origin.x.as_f32() + 0.01, "最小化应在最大化左侧");
+    assert!(right(&maxb) <= close.origin.x.as_f32() + 0.01, "最大化应在关闭左侧");
+    assert_eq!(min.size.height.as_f32(), TITLE_BAR_H, "钮高应=标题栏高");
+    assert_eq!(close.size.height.as_f32(), TITLE_BAR_H);
+    // 标题文字在最小化钮左侧；空白拖动区夹在标题右与最小化钮左之间。
+    assert!(right(&text) <= min.origin.x.as_f32(), "标题文字应在钮左");
+    assert!(drag.origin.x.as_f32() >= right(&text), "拖动区应在标题文字右侧");
+    assert!(right(&drag) <= min.origin.x.as_f32() + 0.01, "拖动区应在最小化钮左侧");
+}
+
+/// 标题栏不抢下方内容：主区首行（`song-row-0`）仍物化且顶部压在标题栏之下
+/// （origin.y ≥ 标题栏底边）——标题栏只占新增的顶部行，不压缩/覆盖三栏（既有行点击、
+/// 滚动测试已兜底命中语义，这里只证布局不重叠）。
+#[gpui::test]
+async fn title_bar_does_not_overlap_content_below(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+
+    let bar = wcx.debug_bounds("music-title-bar").expect("标题栏应在渲染");
+    let bar_bottom = bar.origin.y.as_f32() + bar.size.height.as_f32();
+    let row0 = wcx.debug_bounds("song-row-0").expect("主区首行应仍物化");
+    assert!(
+        row0.origin.y.as_f32() >= bar_bottom - 0.01,
+        "三栏内容应从标题栏之下开始（不重叠）：row0.y={} bar_bottom={bar_bottom}",
+        row0.origin.y.as_f32()
+    );
+    assert!(
+        row0.origin.y.as_f32() > bar.origin.y.as_f32(),
+        "首行应位于标题栏之下（标题栏只占新顶部行）"
+    );
+}
+
+/// 全屏浮层（fs）盖住标题栏：标题栏仅常驻主界面，`fs_open` 时 `music-fs` 浮层 absolute
+/// inset-0 覆盖整窗（含标题栏区域），不新增第二条标题栏（既有溢出/命中由 fs 层级隔离）。
+#[gpui::test]
+async fn fullscreen_overlay_does_not_add_second_title_bar(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| v.toggle_fs(cx));
+    });
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+
+    let fs = wcx.debug_bounds("music-fs").expect("全屏浮层应在渲染");
+    assert_eq!(fs.origin.y.as_f32(), 0.0, "fs 浮层应覆盖到窗口顶（含标题栏区域）");
+    let fs_w = wcx.update(|window, _| window.bounds().size.width.as_f32());
+    assert!(
+        (fs.size.width.as_f32() - fs_w).abs() < 0.5,
+        "fs 浮层应通窗宽覆盖"
+    );
+    // fs 态仍是同一个标题栏元素（无第二个标题栏 id 变体）。
+    assert!(
+        wcx.debug_bounds("music-title-bar").is_some(),
+        "fs 下主界面标题栏元素仍在树内（被浮层覆盖、非新增）"
     );
 }

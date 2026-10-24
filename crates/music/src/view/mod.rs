@@ -5,8 +5,9 @@
 //! 不依赖 `ui` 等其它 crate。播放逻辑全走 Phase A 的 [`crate::player::MusicPlayer`]，
 //! 本模块只做 view：读取状态、派发播放器动作、渲染子视图。
 //!
-//! 布局：根 = flex 列 → `[侧栏 240 | 主区 flex_1 | 右栏 320]`（flex 行）+ 底部播放栏
-//! 80px；`fs_open` 时在末尾挂全屏浮层（absolute inset-0，最后子元素 → 绘制/命中最上）。
+//! 布局：根 = flex 列 → 顶部 Windows 风格标题栏 36px（[`titlebar`]）+ `[侧栏 240 |
+//! 主区 flex_1 | 右栏 320]`（flex 行）+ 底部播放栏 80px；`fs_open` 时在末尾挂全屏浮层
+//! （absolute inset-0，最后子元素 → 绘制/命中最上，覆盖标题栏/三栏/底栏）。
 //!
 //! 驱动：`new` 起一个常驻 `cx.spawn` tick 循环（250ms）——① `player.tick` 消费 worker
 //! 事件（Opened/Finished/Error，事件变化内部已 notify）；② 仅**播放中**才 `cx.notify()`
@@ -24,6 +25,7 @@ mod icon;
 mod main;
 mod right;
 mod sidebar;
+mod titlebar;
 mod widgets;
 
 use std::cell::Cell;
@@ -923,8 +925,10 @@ impl Render for MusicView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_root_mouse_down));
-        // 上三栏（侧栏 240 / 主区 flex_1 / 右栏 320）+ 底部播放栏 80。
+        // 主界面顶层：Windows 风格标题栏（左 logo+标题、中拖动区、右三钮），真实作用于
+        // 应用窗口（`window_control_area` 原生最小化/最大化/关闭 + 拖动/双击切换）。
         root = root
+            .child(titlebar::render(window, cx))
             .child(
                 div()
                     .flex()

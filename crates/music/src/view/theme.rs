@@ -124,6 +124,35 @@ pub fn glass() -> Hsla {
     c_a(0x141132eb)
 }
 
+// ---- Windows 风格标题栏窗口控制钮取色（对齐项目 shell 标题栏 `ui::theme::ChromeColors`） ----
+
+/// 窗口控制钮 hover 填充（8% 白）：同 `ui::theme::ChromeColors::dark().hover_fill`
+/// `0xffffff14` 与原型 `.win-btn:hover { background: rgba(255,255,255,0.08) }`。
+pub const CTRL_HOVER_FILL: u32 = 0xffffff14;
+/// 窗口控制钮按压填充（约 14% 白）：同 shell `pressed_fill` 暗色档 `0xffffff24`。
+pub const CTRL_PRESSED_FILL: u32 = 0xffffff24;
+/// 关闭钮 hover 底红（Win11 危险红 `#e81123`）：同 shell `close_hover`。
+pub const CLOSE_HOVER: u32 = 0xe81123;
+/// 关闭钮按压底红（深一档 `#a70d1a`）：同 shell `close_pressed`（危险红亮暗同值）。
+pub const CLOSE_PRESSED: u32 = 0xa70d1a;
+
+/// 窗口控制钮 hover 填充色。
+pub fn ctrl_hover_fill() -> Hsla {
+    c_a(CTRL_HOVER_FILL)
+}
+/// 窗口控制钮按压填充色。
+pub fn ctrl_pressed_fill() -> Hsla {
+    c_a(CTRL_PRESSED_FILL)
+}
+/// 关闭钮 hover 底红。
+pub fn close_hover() -> Hsla {
+    c(CLOSE_HOVER)
+}
+/// 关闭钮按压底红。
+pub fn close_pressed() -> Hsla {
+    c(CLOSE_PRESSED)
+}
+
 /// 由 model `Track.grad`（主色 `(r,g,b)`）派生渐变双色：主色 + 加深 55% 变体
 /// （与 `model::gradient_pair` 的加深系数一致，保证封面观感同源）。
 pub fn gradient_pair_of((r, g, b): (u32, u32, u32)) -> (Hsla, Hsla) {
@@ -262,5 +291,22 @@ mod tests {
         let d: gpui::Rgba = dark.into();
         let l: gpui::Rgba = light.into();
         assert!(d.r < l.r && d.g < l.g && d.b < l.b, "加深变体各分量更暗");
+    }
+
+    #[test]
+    fn title_ctrl_colors_match_shell_chrome() {
+        // 逐字钉死项目 shell 标题栏取色源（`ui::theme::ChromeColors`：
+        // hover_fill 暗档 0xffffff14 / pressed_fill 0xffffff24 /
+        // close_hover #e81123 / close_pressed #a70d1a），防抄写漂移。
+        assert_eq!(CTRL_HOVER_FILL, 0xffffff14);
+        assert_eq!(CTRL_PRESSED_FILL, 0xffffff24);
+        assert_eq!(CLOSE_HOVER, 0xe81123);
+        assert_eq!(CLOSE_PRESSED, 0xa70d1a);
+        let hover: gpui::Rgba = close_hover().into();
+        let pressed: gpui::Rgba = close_pressed().into();
+        assert!(
+            pressed.r < hover.r && pressed.g < hover.g && pressed.b < hover.b,
+            "关闭按压红应比 hover 红深一档"
+        );
     }
 }

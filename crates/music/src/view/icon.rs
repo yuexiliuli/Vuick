@@ -67,6 +67,14 @@ pub enum MusicIcon {
     Badge,
     /// 黑胶唱片（logo / 封面占位）。
     Disc,
+    /// 窗口最小化（横向短杠，Win11 语义）。
+    Minimize,
+    /// 窗口最大化（单方块）。
+    Maximize,
+    /// 窗口向下还原（双错位方块）。
+    Restore,
+    /// 窗口关闭（×）。
+    Close,
 }
 
 impl MusicIcon {
@@ -155,6 +163,19 @@ impl MusicIcon {
             }
             MusicIcon::Disc => {
                 "<circle cx=\"12\" cy=\"12\" r=\"9\"/><circle cx=\"12\" cy=\"12\" r=\"2\" fill=\"currentColor\" stroke=\"currentColor\"/>"
+            }
+            MusicIcon::Minimize => {
+                "<line x1=\"5\" y1=\"12\" x2=\"19\" y2=\"12\"/>"
+            }
+            MusicIcon::Maximize => {
+                "<rect x=\"5\" y=\"5\" width=\"14\" height=\"14\" rx=\"1\"/>"
+            }
+            // 还原 = 两个错位方块（右下前景 + 左上背景上边/左边），对齐原型 restore-group。
+            MusicIcon::Restore => {
+                "<rect x=\"9\" y=\"9\" width=\"13\" height=\"13\" rx=\"1.5\"/><path d=\"M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1\"/>"
+            }
+            MusicIcon::Close => {
+                "<line x1=\"6\" y1=\"6\" x2=\"18\" y2=\"18\"/><line x1=\"18\" y1=\"6\" x2=\"6\" y2=\"18\"/>"
             }
         };
         format!("{H}{inner}{T}")
@@ -314,6 +335,10 @@ mod tests {
             MusicIcon::PlaylistAdd,
             MusicIcon::Badge,
             MusicIcon::Disc,
+            MusicIcon::Minimize,
+            MusicIcon::Maximize,
+            MusicIcon::Restore,
+            MusicIcon::Close,
         ];
         for name in names {
             let m = name.svg_markup();
