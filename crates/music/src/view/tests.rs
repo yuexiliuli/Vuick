@@ -458,6 +458,179 @@ async fn bb_progress_drag_release_outside_bar_lands_at_last_target(cx: &mut Test
     assert!(!scrubbing, "条外松手应退出拖拽态（scrub 不泄漏）");
 }
 
+// ---- 性能优化第一步：拖动实时跟手回归（view notify；动画降频后不依赖寄生动画帧） ----
+
+/// 开全屏浮层并渲染一帧（fs_progress 盒与 fs_fill_box 由 prepaint 写入），返回视图。
+fn open_fs_seek_view<'a>(
+    cx: &'a mut TestAppContext,
+    player: &Entity<MusicPlayer>,
+) -> (Entity<MusicView>, &'a mut VisualTestContext) {
+    let player = player.clone();
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.fs_open = true);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    (view, wcx)
+}
+
+/// 用例 R（拖动实时跟手·播放中）：音频动画已降频（with_max_fps 15）+ tick 250ms——若拖拽不
+/// 给 MusicView 自己 notify，进度视觉只能寄生动画/tick 帧。**全屏进度条** down@50% → 按住
+/// move@30%（**不推进虚拟时钟**：无 tick、无动画帧）→ `run_until_parked`。
+///
+/// 判定信号：`App::observe(&view)` 计数器——它只在本视图 `cx.notify()` 时触发（gpui
+/// `invalidate_view` → `Effect::Notify{emitter=view}` → `apply_notify_effect` 按 emitter 派发观察
+/// 者；player 实体 notify 走 emitter=player，不触发本观察者）。旧代码点/拖只 `player.update`
+/// （notify player 实体）→ 观察者不触发 → RED；修复后 `apply_strip`/`seek_to_fraction` 补
+/// `cx.notify()`（MusicView）→ 观察者触发 → GREEN。
+/// 附视觉护栏：实测本 gpui 版本按 render「实体访问」追踪（window.rs `record_entities_accessed`，
+/// render 读了 player → player 被窗口追踪 → player.notify 也会使窗口变脏重绘），故填充盒更新
+/// 分不清视图 notify；计数断言才是给定语义的真判别。
+#[gpui::test]
+async fn fs_progress_drag_refreshes_fill_without_clock(cx: &mut TestAppContext) {
+    let dur = 100.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, cx| {
+            p.test_start_playing(0);
+            p.set_test_duration(dur);
+            p.seek(0.0, cx);
+        });
+    });
+    let (view, wcx) = open_fs_seek_view(cx, &player);
+    // 视图 notify 精确计数（只对 MusicView 自身的 cx.notify 触发）。
+    let view_notifies = Rc::new(Cell::new(0usize));
+    wcx.update(|_window, app| {
+        let c = view_notifies.clone();
+        app.observe(&view, move |_, _| c.set(c.get() + 1)).detach();
+    });
+    wcx.run_until_parked();
+    let b = wcx.cx.read(|app| view.read(app).fs_progress.get());
+    let bar_w = b.size.width.as_f32();
+    assert!(bar_w > 0.0, "fs-progress 盒应已布局（宽>0），实得 {b:?}");
+    let fill_at = |wcx: &mut VisualTestContext| {
+        wcx.cx.read(|app| view.read(app).fs_fill_box.get())
+    };
+    // 初始帧（pos=0）→ 填充≈0。
+    let f0 = fill_at(wcx);
+    assert!(f0.size.width.as_f32() < 2.0, "初始填充应≈0，实得 {f0:?}");
+    // 点按 50% + 按住拖到 30%：不推进虚拟时钟（不加 tick/动画帧）。
+    // 先记基线（播放中 eq/vinyl 动画帧可能已送达过 1 次 notify，与拖拽无关——以增量为判别）。
+    let base = view_notifies.get();
+    wcx.simulate_mouse_down(at_frac(&b, 0.50), MouseButton::Left, Default::default());
+    wcx.simulate_mouse_move(at_frac(&b, 0.30), Some(MouseButton::Left), Default::default());
+    wcx.run_until_parked();
+    // 判别：点/拖必须产生**额外的**视图自已 notify（拖拽跟手的承诺）。旧代码无视图 notify →
+    // 计数停在基线 → RED。
+    assert!(
+        view_notifies.get() > base,
+        "拖拽应触发 MusicView 自身 notify（动画降频后不靠寄生帧/player 实体 notify）：计数 {} → {}（无 cx.notify=RED）",
+        base,
+        view_notifies.get()
+    );
+    // 视觉护栏：真实重绘后填充应落在 ≈30%（本 gpui 版本 player 访问追踪也会触发重绘，仅护栏）。
+    let f1 = fill_at(wcx);
+    let want = bar_w * 0.30;
+    assert!(
+        (f1.size.width.as_f32() - want).abs() < 4.0,
+        "拖到 30% 填充应更新到 ≈{want:.1}，实得 {:.1}",
+        f1.size.width.as_f32()
+    );
+    // 再拖到 10% → 继续实时跟随回落（view notify 每 move 一次）。
+    let after_first = view_notifies.get();
+    wcx.simulate_mouse_move(at_frac(&b, 0.10), Some(MouseButton::Left), Default::default());
+    wcx.run_until_parked();
+    assert!(
+        view_notifies.get() > after_first,
+        "再拖一次也该再触发视图 notify（每 move 实时跟手）：计数 {after_first} → {}",
+        view_notifies.get()
+    );
+    let f2 = fill_at(wcx);
+    let want2 = bar_w * 0.10;
+    assert!(
+        (f2.size.width.as_f32() - want2).abs() < 4.0,
+        "再拖到 10% 填充应实时回落 ≈{want2:.1}，实得 {:.1}",
+        f2.size.width.as_f32()
+    );
+    // 松手收尾：停在 10%（不闪跳）。
+    wcx.simulate_mouse_up(at_frac(&b, 0.10), MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let pos = wcx.cx.read(|app| view.read(app).player.read(app).position());
+    assert!((pos - dur * 0.10).abs() < 1.0, "松手应停在 10%，实得 {pos:.1}");
+}
+
+/// 用例 S（拖动实时跟手·暂停态）：playing=false 无 tick 无动画帧 → 点/拖**必须**由视图自己
+/// notify 才重绘（旧代码暂停态拖动画面冻结）。以 `App::observe(&view)` 计数为判别：radio 至少
+/// 触发一次；附填充更新护栏。seek 不误伤暂停（playing/paused 不变）。
+#[gpui::test]
+async fn fs_progress_drag_refreshes_fill_when_paused(cx: &mut TestAppContext) {
+    let dur = 120.0;
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, cx| {
+            p.set_test_duration(dur);
+            p.pause(cx);
+        });
+    });
+    let (view, wcx) = open_fs_seek_view(cx, &player);
+    let view_notifies = Rc::new(Cell::new(0usize));
+    wcx.update(|_window, app| {
+        let c = view_notifies.clone();
+        app.observe(&view, move |_, _| c.set(c.get() + 1)).detach();
+    });
+    wcx.run_until_parked();
+    let b = wcx.cx.read(|app| view.read(app).fs_progress.get());
+    let bar_w = b.size.width.as_f32();
+    assert!(bar_w > 0.0, "fs-progress 盒应已布局（宽>0），实得 {b:?}");
+    let fill_at = |wcx: &mut VisualTestContext| {
+        wcx.cx.read(|app| view.read(app).fs_fill_box.get())
+    };
+    let f0 = fill_at(wcx);
+    assert!(f0.size.width.as_f32() < 2.0, "暂停初始填充应≈0，实得 {f0:?}");
+    // 点按 30% + 按住 move@30%（不推时钟）→ 视图 notify → GREEN；无 notify → RED。
+    let base = view_notifies.get();
+    wcx.simulate_mouse_down(at_frac(&b, 0.30), MouseButton::Left, Default::default());
+    wcx.simulate_mouse_move(at_frac(&b, 0.30), Some(MouseButton::Left), Default::default());
+    wcx.run_until_parked();
+    assert!(
+        view_notifies.get() > base,
+        "暂停态拖拽也该触发视图 notify（拖动跟手不依赖 tick/动画）：计数 {base} → {}（无 cx.notify=RED）",
+        view_notifies.get()
+    );
+    let f1 = fill_at(wcx);
+    let want = bar_w * 0.30;
+    assert!(
+        (f1.size.width.as_f32() - want).abs() < 4.0,
+        "暂停态拖到 30% 填充应更新到 ≈{want:.1}，实得 {:.1}",
+        f1.size.width.as_f32()
+    );
+    // 再拖到 80% → 继续实时跟随。
+    let after_first = view_notifies.get();
+    wcx.simulate_mouse_move(at_frac(&b, 0.80), Some(MouseButton::Left), Default::default());
+    wcx.run_until_parked();
+    assert!(
+        view_notifies.get() > after_first,
+        "再拖一次也该再触发视图 notify：计数 {after_first} → {}",
+        view_notifies.get()
+    );
+    let f2 = fill_at(wcx);
+    let want2 = bar_w * 0.80;
+    assert!(
+        (f2.size.width.as_f32() - want2).abs() < 4.0,
+        "暂停态再拖到 80% 填充应跟随 ≈{want2:.1}，实得 {:.1}",
+        f2.size.width.as_f32()
+    );
+    wcx.simulate_mouse_up(at_frac(&b, 0.80), MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let s = wcx.cx.read(|app| {
+        let p = view.read(app).player.read(app);
+        (p.position(), p.playing(), p.paused())
+    });
+    assert!((s.0 - dur * 0.80).abs() < 1.0, "暂停态松手仍停 80%，实得 {:.1}", s.0);
+    assert!(!s.1 && s.2, "seek 不误伤暂停（playing/paused 不变）");
+}
+
 // ---- 歌词面板：可滚浏览全部 + 自动跟随当前句（手动滚动暂停、停止约 3 秒恢复） ----
 
 /// 建含第 0 首有 LRC 歌词的临时库播放器（歌名「歌手 - 歌词歌」；无设备 → 纯状态播放，
@@ -702,9 +875,12 @@ async fn lyrics_track_change_resets_follow(cx: &mut TestAppContext) {
     play_at_pos(&player, cx, 450.0);
     let (view, wcx) = open_lyrics_tab(cx, &player);
     pump_ticks(wcx, 4);
-    // 手动滚远 → 暂停跟随。
-    let handle = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
-    handle.set_offset(gpui::point(px(0.), px(-700.)));
+    // 手动滚轮 → 暂停跟随（真实用户滚动通道；**不能用超界 set_offset(-700) 直写**：音频
+    // 动画降频（with_max_fps 15）后播放中会按周期 notify 重绘，生产路径滚动偏移早就被布局
+    // 钳回 [0,max]，下一拍读到的永远是「钳位后」值——旧测试靠 fake 调度器不给动画送帧才
+    // 看到未钳位的 -700，属测试假象。滚轮监听（fullscreen.rs `on_scroll_wheel`）才是手动
+    // 滚动主信号，与 G/H 用例一致）。
+    wheel_on_lyrics(wcx, &view);
     pump_ticks(wcx, 1);
     assert!(wcx.cx.read(|app| view.read(app).lyrics_manual_since.is_some()));
     // 切到第 1 首（path 变化 → 跟随态复位 → 新曲从自动跟随开始，不沿用手动暂停）。
@@ -713,7 +889,8 @@ async fn lyrics_track_change_resets_follow(cx: &mut TestAppContext) {
     });
     pump_ticks(wcx, 3);
     let expected = expected_follow_y(&view, wcx, 2);
-    let got = handle.offset().y.as_f32();
+    let got = wcx.cx.read(|app| view.read(app).lyrics_scroll.clone());
+    let got = got.offset().y.as_f32();
     assert!(
         (got - expected).abs() < 2.0,
         "换曲后应复位并在新曲上跟随：got={got} expected={expected}"

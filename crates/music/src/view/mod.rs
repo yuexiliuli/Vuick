@@ -789,29 +789,36 @@ impl MusicView {
             self.state.last_scrub_retarget = Some(Instant::now());
             self.state.scrub_seeked = Some(target);
             self.player.update(cx, |p, cx| p.seek(target, cx));
-            return;
-        }
-        let due = match self.state.last_scrub_retarget {
-            Some(t) => t.elapsed() >= Duration::from_millis(SCRUB_RETARGET_MS),
-            None => true,
-        };
-        if due {
-            self.state.last_scrub_retarget = Some(Instant::now());
-            self.state.scrub_seeked = Some(target);
-            self.player.update(cx, |p, cx| p.seek(target, cx));
         } else {
-            // 节流窗口内：显示仍逐 move 实时跟手（仅更新显示基准，不发 worker seek）。
-            self.player.update(cx, |p, cx| p.set_seek_base(target, cx));
+            let due = match self.state.last_scrub_retarget {
+                Some(t) => t.elapsed() >= Duration::from_millis(SCRUB_RETARGET_MS),
+                None => true,
+            };
+            if due {
+                self.state.last_scrub_retarget = Some(Instant::now());
+                self.state.scrub_seeked = Some(target);
+                self.player.update(cx, |p, cx| p.seek(target, cx));
+            } else {
+                // 节流窗口内：显示仍逐 move 实时跟手（仅更新显示基准，不发 worker seek）。
+                self.player.update(cx, |p, cx| p.set_seek_base(target, cx));
+            }
         }
+        // 拖动/点按跟手不寄生动画/刻度（tick）：音频动画已降频（eq/vinyl `with_max_fps(15.)`）
+        // 且暂停态无任何 tick——进度/音量视觉必须由**本视图**自己 notify 驱动重绘。
+        // （player 实体 notify 只通知该实体，不等价于重绘本视图；这里补一次幂等通知。）
+        cx.notify();
     }
 
     /// 应用拖拽比例（点按/音量共用入口）：进度 → 立即真实 seek(f×duration) 并进拖拽态
-    /// 状态由调用方先置好；音量 → set_volume(f)。
+    /// 状态由调用方先置好；音量 → set_volume(f)。拖拽路径统一补视图 notify（见
+    /// [`Self::seek_to_fraction`] 注释）——音量分支在此补，seek 分支内已 notify。
     fn apply_strip(&mut self, is_seek: bool, f: f32, cx: &mut Context<Self>) {
         if is_seek {
             self.seek_to_fraction(f, true, cx);
         } else {
             self.player.update(cx, |p, cx| p.set_volume(f, cx));
+            // 音量视觉同进度：视图自身 notify，点/拖即时刷新、不寄生动画/tick 帧。
+            cx.notify();
         }
     }
 

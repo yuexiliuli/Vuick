@@ -4,6 +4,12 @@
 //! [`AnimationExt::with_animation`]（`Repeat` 循环）驱动小柱高度变化 + 相位错开；
 //! 黑胶圈用 `svg().with_transformation(Transformation::rotate(..))` 作圆环旋转
 //! （裸 `div` 无 transform 支持）。`playing=false` 时返回静态形态（挂上即停）。
+//!
+//! **播放中动画降频**（性能优化第一步）：`Repeat` 动画默认每帧 `request_animation_frame()` →
+//! 每动画帧重绘整棵 MusicView 树（侧栏+主列表+右栏+底栏+全屏），播放中 ≈60fps 整树重建常驻
+//! =「全局迟缓」。故循环动画统一 `repeat_synced().with_max_fps(15.)`：共享时钟协同各元素相位，
+//! `max_fps` 走 timer 驱动 notify 而非每帧，播放中整树重建降到 ≤15fps。`reduce_motion` 由 gpui
+//! 自动尊重（渲染静态起态、不再请求帧）。
 
 use std::time::Duration;
 
@@ -15,6 +21,8 @@ use gpui::{
 /// 均衡器小柱组（当前播放行「♪」指示）：四根小柱以不同高度基线 + 相位跳动，
 /// 三角波 easing 让高度在基线 ↔ 峰值间往返（近似原型 `eq-bounce` scaleY）。
 /// `prefix` 用于区分同一屏内的多组 eq（元素动画 id 须全局唯一）。
+/// 循环动画节流到 15fps（`repeat_synced` + `with_max_fps`——本仓库性能优化第一步，防
+/// 播放中 ~60fps 整树重建；`reduce_motion` 由 gpui 尊重）。
 pub fn eq_bars(playing: bool, accent: Hsla, prefix: String) -> AnyElement {
     // (基线高, 相位偏移)；相位用 easing 折叠：同一 animator 输出错开的高度。
     let specs = [(6.0f32, 0.00f32), (10.0, 0.30), (4.0, 0.55), (8.0, 0.15)];
@@ -29,7 +37,10 @@ pub fn eq_bars(playing: bool, accent: Hsla, prefix: String) -> AnyElement {
             let bar: AnyElement = if playing {
                 bar.with_animation(
                     format!("{prefix}-eq-{i}"),
-                    Animation::new(Duration::from_millis(650)).repeat().with_easing({
+                    Animation::new(Duration::from_millis(650))
+                        .repeat_synced()
+                        .with_max_fps(15.)
+                        .with_easing({
                         let p = phase;
                         move |x| {
                             // 三角波 0..1：先升后降，相位错开让四柱像「跳动」而非同起同落。
@@ -57,6 +68,8 @@ pub fn vinyl_ring(diameter: f32, playing: bool, prefix: String) -> AnyElement {
 }
 
 /// 黑胶圈（可配周期/转向）：全屏 v2 封面三层圈用不同周期 + 反向旋转增强层次感。
+/// 循环动画节流到 15fps（`repeat_synced` + `with_max_fps`，同上性能优化；`reduce_motion`
+/// 由 gpui 尊重）。
 pub fn vinyl_ring_at(
     diameter: f32,
     playing: bool,
@@ -77,10 +90,14 @@ pub fn vinyl_ring_at(
         .path(mark)
         .text_color(gpui::white().opacity(0.06));
     if playing {
-        ring.with_animation(prefix, Animation::new(period).repeat(), move |this, d| {
-            let deg = if reverse { -d * 360.0 } else { d * 360.0 };
-            this.with_transformation(Transformation::rotate(radians(deg)))
-        })
+        ring.with_animation(
+            prefix,
+            Animation::new(period).repeat_synced().with_max_fps(15.),
+            move |this, d| {
+                let deg = if reverse { -d * 360.0 } else { d * 360.0 };
+                this.with_transformation(Transformation::rotate(radians(deg)))
+            },
+        )
         .into_any_element()
     } else {
         ring.with_transformation(Transformation::rotate(radians(0.0)))
