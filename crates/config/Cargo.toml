@@ -10,6 +10,12 @@ base = { path = "../base" }
 gpui = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+# 测试隔离（K8 根因）：消费方测试构建（经 dev-dependencies）打开，使 config 作依赖
+# 编译时 `config_path()`/`session_dir()` 落一次性临时目录，不碰真实 %APPDATA%；
+# config 自身测试走 cfg!(test) 等效。
+test-mode = []
+
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
 gpui = { workspace = true, features = ["test-support"] }

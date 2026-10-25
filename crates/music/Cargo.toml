@@ -16,3 +16,6 @@ config = { path = "../config" }
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
 gpui = { workspace = true, features = ["test-support"] }
+# K8 根因（同 shell）：config 作依赖在 music 测试二进制中自身 cfg(test) 不生效 → 直读真实
+# %APPDATA% 配置/会话；dev 下打开 test-mode 使其落隔离临时目录（仅测试构建启用，生产路径不变）。
+config = { path = "../config", features = ["test-mode"] }

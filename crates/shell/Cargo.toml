@@ -51,3 +51,8 @@ video = ["dep:video"]
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
 gpui = { workspace = true, features = ["test-support"] }
+# K8 根因：config 作依赖编译不带自身 cfg(test) → 其 load() 在 shell 测试里直读真实
+# %APPDATA% 配置。此处 dev 下显式打开 test-mode，让 config_path()/session_dir()/load()/save()
+# 全部落在隔离临时目录，杜绝真实配置/会话泄漏进测试（dev-dep 仅测试构建启用，不影响
+# `cargo build --bin gpui-editor` 的生产路径）。
+config = { path = "../config", features = ["test-mode"] }

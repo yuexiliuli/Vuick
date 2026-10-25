@@ -97,12 +97,20 @@ pub struct UserPrefs {
 }
 
 impl UserPrefs {
-    /// 配置文件完整路径：环境变量覆盖 → APPDATA → 当前目录回退。
+    /// 配置文件完整路径：环境变量覆盖 → 测试隔离临时目录 → APPDATA → 当前目录回退。
     pub fn config_path() -> PathBuf {
         if let Ok(over) = std::env::var("GPUI_EDITOR_CONFIG")
             && !over.trim().is_empty()
         {
             return PathBuf::from(over);
+        }
+        // 测试构建隔离（K8 根因根治）。注意：config 作依赖被 shell/music 测试编译时，其
+        // 自身 `cfg!(test)` **不生效**（编译期仅对「被测试的 crate」置位）→ 由消费方
+        // dev-dependencies 打开 `test-mode` feature 补上，等效于 cfg!(test)。两路都落
+        // 「一次性临时目录」，绝不触碰真实 `%APPDATA%`；显式 `GPUI_EDITOR_CONFIG` 恒优先。
+        #[cfg(any(test, feature = "test-mode"))]
+        {
+            return Self::test_config_path();
         }
         if let Ok(appdata) = std::env::var("APPDATA")
             && !appdata.trim().is_empty()
@@ -110,6 +118,20 @@ impl UserPrefs {
             return PathBuf::from(appdata).join("gpui-editor").join("config.json");
         }
         PathBuf::from("gpui-editor-config.json")
+    }
+
+    /// 测试构建隔离目录：`%TEMP%\gpui-editor-test-<进程ID>\config.json`（进程唯一、惰性
+    /// 分配一次），`session_dir()` 随之派生到同目录 `session/` 子目录。平行 `cargo test`
+    /// 会话/进程互不共享，天然隔离真实 `%APPDATA%`；测试结束不清理（留在 %TEMP%，无碍）。
+    #[cfg(any(test, feature = "test-mode"))]
+    fn test_config_path() -> PathBuf {
+        use std::sync::OnceLock;
+        static TEST_CFG_DIR: OnceLock<PathBuf> = OnceLock::new();
+        TEST_CFG_DIR
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!("gpui-editor-test-{}", std::process::id()))
+            })
+            .join("config.json")
     }
 
     /// 会话临时文件目录 = 配置文件所在目录下的 `session/` 子目录

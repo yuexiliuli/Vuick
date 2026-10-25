@@ -22,3 +22,4 @@ include!("tests/find.rs");
 include!("tests/goto.rs");
 include!("tests/close_tray.rs");
 include!("tests/recent.rs");
+include!("tests/config_isolation.rs");
