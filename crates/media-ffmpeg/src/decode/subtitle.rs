@@ -4,7 +4,7 @@
 //! [`super::FFMPEG_LOCK`]、日志收敛 [`super::quiet_ffmpeg_log_once`] 在此复用；自由函数
 //! [`active_subtitle_index`] 供 reader 读口与生产对拍（与 `video` crate 同口径）。
 
-use super::{FFMPEG_LOCK, quiet_ffmpeg_log_once};
+use super::{FFMPEG_LOCK, OPEN_DEFAULT_TIMEOUT, open_input_interruptible, quiet_ffmpeg_log_once};
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -85,8 +85,7 @@ impl SubtitleReader {
             ffmpeg::init().context("ffmpeg init 失败")?;
             quiet_ffmpeg_log_once();
 
-            let ictx = ffmpeg::format::input(path)
-                .with_context(|| format!("打开媒体失败：{}", path.display()))?;
+            let ictx = open_input_interruptible(path, OPEN_DEFAULT_TIMEOUT)?;
 
             // 查找字幕流
             let stream = ictx

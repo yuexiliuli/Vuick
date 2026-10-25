@@ -27,6 +27,83 @@ macro_rules! fixture_or_skip {
     }};
 }
 
+/// P0-A 看门狗回归：损坏/畸形媒体探测**不再永久卡死**（无媒体夹具依赖——临时目录写假
+/// mp4）。短 deadline（300ms）→ [`open_input_interruptible`] 快速 Err；已过期 deadline →
+/// 确定性验证中断回调立即使探测 abort；最后证明锁/武装无残留（不存在路径快速 Err +
+/// 真视频夹具正常打开）。全部在持 [`FFMPEG_LOCK`] 下调用（看门狗契约）。
+#[test]
+fn open_watchdog_interrupts_corrupt_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpui-editor-mff-corrupt-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.mp4");
+    std::fs::write(&bad, b"not a real video").unwrap();
+
+    // 1) 短 deadline：真实挂起（无看门狗）会永久卡死；有限 deadline 必须快速失败
+    let err = {
+        let _g = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = std::time::Instant::now();
+        let r = open_input_interruptible(&bad, std::time::Duration::from_millis(300));
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "损坏媒体应在 <2s 内快速失败（实际 {elapsed:?}，疑似仍卡死）"
+        );
+        match r {
+            Ok(_) => panic!("损坏媒体应失败而非打开成功"),
+            Err(e) => e,
+        }
+    };
+    assert!(
+        format!("{err:#}").contains("打开媒体"),
+        "错误信息应可辨媒体打开失败/超时：{err:#}"
+    );
+
+    // 2) 已过期 deadline：确定性验证中断回调立即生效（probe 首查即 abort → AVERROR_EXIT）
+    {
+        let _g = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = std::time::Instant::now();
+        let r = open_input_interruptible(&bad, std::time::Duration::ZERO);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "已过期 deadline 应立即中断探测"
+        );
+        let msg = match r {
+            Ok(_) => panic!("已过期 deadline 的打开不应成功"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("超时/被取消"),
+            "被中断错误应标识「打开超时/被取消」：{msg}"
+        );
+    }
+
+    // 3) 无残留：中断后可再开（不存在路径快速 Err + 真视频夹具正常打开）
+    {
+        let _g = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = std::time::Instant::now();
+        let r = open_input_interruptible(&dir.join("missing.mp4"), OPEN_DEFAULT_TIMEOUT);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "不存在文件应快速 Err（锁未卡死）"
+        );
+        assert!(r.is_err(), "不存在文件应失败");
+        let fixture = fixture();
+        if fixture.exists() {
+            assert!(
+                open_input_interruptible(&fixture, OPEN_DEFAULT_TIMEOUT).is_ok(),
+                "中断后真视频应仍可正常打开（锁/deadline 无残留）"
+            );
+        } else {
+            eprintln!("SKIP: missing target/video测试.mp4, 跳过真视频打开断言");
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn open_reads_params() {
     let r = VideoReader::open(&fixture_or_skip!()).unwrap();

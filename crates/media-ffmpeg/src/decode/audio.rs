@@ -4,7 +4,10 @@
 //! [`super::FFMPEG_LOCK`]、时间换算 [`super::pts_to_seconds`]、日志收敛
 //! [`super::quiet_ffmpeg_log_once`] 在此复用。
 
-use super::{FFMPEG_LOCK, pts_to_seconds, quiet_ffmpeg_log_once};
+use super::{
+    FFMPEG_LOCK, OPEN_DEFAULT_TIMEOUT, open_input_interruptible, pts_to_seconds,
+    quiet_ffmpeg_log_once,
+};
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -75,8 +78,7 @@ impl AudioReader {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ffmpeg::init().context("ffmpeg init 失败")?;
         quiet_ffmpeg_log_once();
-        let ictx = ffmpeg::format::input(path)
-            .with_context(|| format!("打开媒体失败: {}", path.display()))?;
+        let ictx = open_input_interruptible(path, OPEN_DEFAULT_TIMEOUT)?;
         let stream = ictx
             .streams()
             .best(Type::Audio)

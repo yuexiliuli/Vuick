@@ -13,8 +13,9 @@
 //! `LIBCLANG_PATH`（bindgen 用）。开发机一键装填见 `scripts/setup-ffmpeg.ps1`。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 
@@ -46,12 +47,85 @@ pub(crate) use subtitle::{SubtitleEntry, active_subtitle_index};
 
 // ---------------- 全局 FFmpeg 串行闸 + 日志收敛 ----------------
 
+
 /// 进程级 FFmpeg 闸：本构建（ffmpeg 9.0 gyan）里**并发的 FFmpeg 操作**会互相占死——
 /// 实测切 72.MP4：新视频线程 `avformat_open_input` 与音频线程解码/再打开并行时直接卡死
 /// 在 `format::input`（开放闸只串 open 无效，open 与解码也会互相卡）。因此**所有 FFI
 /// 调用**（open / seek / next_frame / next_pcm / subtitle）都过此互斥量串行；单次操作毫秒级，
 /// 视频 2 帧通道 + 音频 1s 缓冲足以吸收串行抖动。打开后、解码途中均释放，不长期持锁。
 pub(crate) static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
+
+// ---------------- open 看门狗（AVIOInterruptCB 截止时间中断） ----------------
+
+/// 默认打开看门狗时长：正常本地打开 <1s；8s 给畸形/慢设备探测留足余量。超过即中断
+/// `avformat_open_input` 的探测 → 快速失败返回 Err——根治损坏文件（无 ftyp/moov 的假
+/// mp4 等）探测**永久卡死**：此前卡死 = 持 [`FFMPEG_LOCK`] 卡死 = worker 线程泄漏 +
+/// 整个媒体子系统（视频/音频/字幕）冻结。
+pub(crate) const OPEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// open 看门狗全局状态。
+///
+/// # 并发不变式
+/// [`FFMPEG_LOCK`] 进程级串行（见上）→ deadline 只在**持锁内**设/清，无并发写；
+/// 中断回调**只读**这两个原子。**回调内严禁碰 `FFMPEG_LOCK` 或任何锁**——回调由
+/// FFmpeg 在 `avformat_open_input` 探测循环里同步调用，此时同线程已持该锁，
+/// 再做任何加锁即死锁。
+static OPEN_DEADLINE_NS: AtomicU64 = AtomicU64::new(u64::MAX); // UNIX epoch 纳秒（SystemTime）；u64::MAX=未武装
+static OPEN_ABORT: AtomicBool = AtomicBool::new(false);
+
+fn watchdog_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// 看门狗中断回调体：纯原子读、零锁、无 panic 分支（ffmpeg-next 的 `interrupt::new`
+/// 回调对 panic 会 `process::abort`——本函数绝不含可 panic 处）。`true` = 到点/被取消。
+fn watchdog_should_abort() -> bool {
+    OPEN_ABORT.load(Ordering::Relaxed)
+        || watchdog_now_ns() >= OPEN_DEADLINE_NS.load(Ordering::Relaxed)
+}
+
+/// 打开媒体探测的看门狗入口。**必须在持 [`FFMPEG_LOCK`] 下调用**（调用方：
+/// [`VideoReader`] open 各路径 / [`AudioReader`] / [`SubtitleReader`]；测试同）。
+///
+/// 复用 ffmpeg-next 自带 `ffmpeg::format::input_with_interrupt`（`avformat_alloc_context`
+/// → 设 `interrupt_callback` → `avformat_open_input` → `avformat_find_stream_info` →
+/// `Input::wrap_with_interrupt` 把回调盒保活进 `Destructor`，drop 顺序安全——先
+/// `avformat_close_input` 后释放回调盒，见 ffmpeg-next `format/context/destructor.rs`）。
+/// deadline 在锁内、调用前武装，返回（含失败路径）后清除——符合「open 前设、open 后清」
+/// 约定：打开成功后的 find_stream_info / 包读取 / seek 不再被本 deadline 中断。
+/// 被中断 → Err（信息可辨「打开超时/被取消」）；普通打开失败 → Err（信息同既有
+/// `格式::input` 的「打开媒体失败」，不吞错误、不 panic、不泄漏已分配上下文）。
+pub(crate) fn open_input_interruptible(
+    path: &Path,
+    deadline: Duration,
+) -> Result<ffmpeg::format::context::Input> {
+    // 武装：deadline 存为「当前单调纳秒 + 时长」，撞 u64::MAX 保险丝减一防误判「未武装」
+    let deadline_ns = watchdog_now_ns()
+        .saturating_add(deadline.as_nanos().min(u64::MAX as u128) as u64)
+        .min(u64::MAX.saturating_sub(1));
+    OPEN_DEADLINE_NS.store(deadline_ns, Ordering::Relaxed);
+    OPEN_ABORT.store(false, Ordering::Relaxed);
+
+    let result = ffmpeg::format::input_with_interrupt(path, || watchdog_should_abort());
+
+    // 捕获「是否真被中断」（区分超时 vs 普通打开失败），随后清除武装：残留会让后续
+    // 该 Input 的解码/seek 意外中断，违背「open 返回后清除」约定。
+    let interrupted = watchdog_should_abort();
+    OPEN_DEADLINE_NS.store(u64::MAX, Ordering::Relaxed);
+    OPEN_ABORT.store(false, Ordering::Relaxed);
+
+    match result {
+        Ok(input) => Ok(input),
+        Err(e) if interrupted => Err(anyhow!(
+            "打开媒体超时/被取消（>{deadline:?} 未返回）: {}: {e}",
+            path.display()
+        )),
+        Err(e) => Err(anyhow!("打开媒体失败: {}: {e}", path.display())),
+    }
+}
 
 /// FFmpeg 日志级别一次性收敛到 `Error`（进程内仅执行一次）：ffmpeg 默认 `Warning` 会把
 /// 大量良性抖动打到 stderr（如 mp4/mov 的 `udta` 盒布局异常 → `UDTA parsing failed
@@ -243,8 +317,7 @@ impl VideoReader {
         ffmpeg::init().context("ffmpeg init 失败")?;
         quiet_ffmpeg_log_once();
 
-        let ictx = ffmpeg::format::input(path)
-            .with_context(|| format!("打开媒体失败: {}", path.display()))?;
+        let ictx = open_input_interruptible(path, OPEN_DEFAULT_TIMEOUT)?;
         let stream = ictx
             .streams()
             .best(Type::Video)
@@ -358,8 +431,7 @@ impl VideoReader {
         ffmpeg::init().context("ffmpeg init 失败")?;
         quiet_ffmpeg_log_once();
 
-        let ictx = ffmpeg::format::input(path)
-            .with_context(|| format!("打开媒体失败: {}", path.display()))?;
+        let ictx = open_input_interruptible(path, OPEN_DEFAULT_TIMEOUT)?;
         let stream = ictx
             .streams()
             .best(Type::Video)
