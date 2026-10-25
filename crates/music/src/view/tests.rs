@@ -3123,3 +3123,65 @@ async fn fullscreen_overlay_does_not_add_second_title_bar(cx: &mut TestAppContex
         "fs 下主界面标题栏元素仍在树内（被浮层覆盖、非新增）"
     );
 }
+
+/// 回归 H7（列对齐）：Home「热门歌曲」歌行各列在不同标题长度下必须上下对齐。根因：歌行
+/// 歌曲列 `flex_grow(2.0)` 不改 flex-basis（taffy 默认 auto→flex-base=max-content），长标题
+/// 撑宽该列、逐行推移专辑/时长/心形列（默认 980 下 song-album.x 曾 467/481/492/522 错位、
+/// 专辑列被压到 8–33px）→ 表头/歌行 flex 列显式 `flex_basis(px(0.))` 后列宽纯由 grow 分配、
+/// 与内容无关。断言默认/加宽/回缩三档窗口下各 `song-album-*` 左缘 x 一致（spread < 0.5px）。
+#[gpui::test]
+async fn home_hot_song_columns_align_across_title_widths(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("gpui-music-align-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // 同一艺术家、标题宽度梯度（短/中/超长/中/短/短）——只让「歌曲」flex 列产生差异。
+    let stems = [
+        "艺 - 短.wav",
+        "艺 - 中长度的标题.wav",
+        "艺 - 啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊超长标题.wav",
+        "艺 - 又一个比较长的歌名标题.wav",
+        "艺 - 甲.wav",
+        "艺 - 乙.wav",
+    ];
+    for s in &stems {
+        write_tiny_wav_short(&dir, s);
+    }
+    let player: Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+    cx.update(|app| {
+        player.update(app, |p, cx| p.load_dir(&dir, cx));
+    });
+    drain_scan(cx);
+    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    for (label, w) in [("default980", 980.0), ("wide1400", 1400.0), ("back980", 980.0)] {
+        wcx.simulate_resize(gpui::size(px(w), px(720.)));
+        wcx.update(|window, app| window.draw(app).clear(app));
+        wcx.run_until_parked();
+        let xs: Vec<f32> = (0..stems.len())
+            .filter_map(|i| {
+                let sel = match i {
+                    0 => "song-album-0",
+                    1 => "song-album-1",
+                    2 => "song-album-2",
+                    3 => "song-album-3",
+                    4 => "song-album-4",
+                    _ => "song-album-5",
+                };
+                wcx.debug_bounds(sel).map(|b| b.origin.x.as_f32())
+            })
+            .collect();
+        assert_eq!(xs.len(), stems.len(), "{label}: 歌行专辑列都应物化");
+        let min = xs.iter().cloned().fold(f32::MAX, f32::min);
+        let max = xs.iter().cloned().fold(f32::MIN, f32::max);
+        eprintln!(
+            "[regr] home hot columns @{label}: album.x range [{min:.1},{max:.1}] spread={:.1}px",
+            max - min
+        );
+        assert!(
+            max - min < 0.5,
+            "{label}: 各歌行专辑列左缘应对齐（spread {:.1}px >= 0.5）: xs={xs:?}",
+            max - min
+        );
+    }
+}

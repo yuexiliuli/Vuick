@@ -796,8 +796,8 @@ impl super::MusicView {
                     .text_size(px(11.))
                     .text_color(theme::text3())
                     .when(h == "#", |d| d.w(px(36.)).text_align(gpui::TextAlign::Center))
-                    .when(h == "歌曲", |d| d.flex_grow(2.0))
-                    .when(h == "专辑", |d| d.flex_grow(1.0))
+                    .when(h == "歌曲", |d| d.flex_grow(2.0).flex_basis(px(0.)))
+                    .when(h == "专辑", |d| d.flex_grow(1.0).flex_basis(px(0.)))
                     .when(h == "时长", |d| d.w(px(56.)).text_align(gpui::TextAlign::Right))
                     .when(h == "", |d| d.w(px(40.)).text_align(gpui::TextAlign::Center))
                     .child(h.to_string())
@@ -871,6 +871,7 @@ impl super::MusicView {
         .child(
             div()
                 .flex_grow(2.0)
+                .flex_basis(px(0.))
                 .flex()
                 .items_center()
                 .gap_x(px(12.))
@@ -902,6 +903,8 @@ impl super::MusicView {
         )
         .child(
             div()
+                .id(format!("song-album-{idx}"))
+                .debug_selector(move || format!("song-album-{idx}"))
                 .flex_1()
                 .text_size(px(13.))
                 .text_color(theme::text2())
