@@ -14,7 +14,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{Context, IntoElement, Render, Window};
 
@@ -34,6 +34,10 @@ pub enum WorkerCmd {
     Stop,
     Shutdown,
 }
+
+/// 播放中周期持久化间隔（秒）：进度条不逐帧写盘——`MusicView::on_tick`（250ms 心跳）下
+/// 按此粒度合并，禁止逐帧写（K11）。暂停/停止/seek/切歌等离散事件仍即时触发持久化。
+const PREFS_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
 
 /// worker → 主线程事件。
 pub enum Event {
@@ -68,6 +72,33 @@ pub struct MusicPlayer {
     error: Option<String>,
     duration: f64,
     liked: HashSet<String>,
+    /// 收藏路径的「新→旧」顺序记录（与 `liked` 镜像；写盘用——配置字段文档即「新→旧」）。
+    liked_order: Vec<String>,
+    /// 上次播放/选中曲目绝对路径（配置字段 `music_last_track` 的内存镜像；`play_track` 更新）。
+    last_track_pref: Option<String>,
+    /// 上次播放位置（秒；配置字段 `music_progress_secs` 的内存镜像；pause/stop/seek/周期更新）。
+    progress_pref: Option<f64>,
+    /// 持久化脏标记：volume / liked / last_track / progress 任一变化即置真；
+    /// [`Self::flush_prefs`] 成功后清假（K10：一处脏标记 + 统一 flush，禁散点直调丢状态）。
+    prefs_dirty: bool,
+    /// 持久化 flush 计数（测试探针：断言「该发生落盘的事件触发了 flush」，对齐 shell 的
+    /// `search_scan_count` 先例）。music 自身测试构建（`cargo test -p music`）下写盘被屏蔽
+    /// （见 [`Self::flush_prefs`]），此计数仍记录「应写盘」次数。
+    prefs_flush_count: u64,
+    /// 上次周期持久化检查时刻（[`PREFS_PERSIST_INTERVAL`] 粒度；播放中不逐帧写）。
+    last_prefs_attempt: Option<Instant>,
+    /// 打开音乐模式待恢复的上次状态 `(last_track 路径, 进度秒)`：由 [`Self::apply_saved_prefs`]
+    /// 置入，首个 [`Self::commit_scan`] 库就绪后消费恢复选中（不自动播放）。
+    pending_restore: Option<(Option<String>, Option<f64>)>,
+    /// 恢复已执行标记：只在打开音乐模式**首次**装配时恢复一次，之后的 `load_dir` 换代
+    /// （换目录 / 播放外部文件重扫）**不**重复恢复——防换目录后被旧 prefs 拉回丢显式意图。
+    restore_done: bool,
+    /// 恢复选中的曲目 `(下标, 上次进度)`：仅当用户对该曲**显式播放**（`play_track` 且
+    /// `idx == current`、进度 > 0）时才 `seek` 续播；对其它曲目从头播。库换代即清（下标已漂移）。
+    resume_restore: Option<(usize, f64)>,
+    /// 待 `Opened` 后异步 seek 的续播落点（秒）：worker 在无 codec 时收到 `Seek` 是空操作，
+    /// Load 后 codec 从 0 起播 → 续播必须等 `Opened`（时长就绪）再真 seek（seek 内 clamp）。
+    resume_on_open: Option<f64>,
     /// Load 代序号：每次 `play_track` 递增，worker 回送 Opened.gen_id 与之匹配过滤陈旧。
     generation: u64,
     /// 显示基准（秒）：最近一次 seek / 拖拽预览的目标。sink.flush 会归零播放时钟，
@@ -101,9 +132,14 @@ pub struct MusicPlayer {
 
 impl MusicPlayer {
     /// 新建播放器：事件通道读端就位（worker 在首次开 sink 时才启动并换入新通道），
-    /// 事件经 `tick` 消费（见模块文档驱动模型）。
+    /// 事件经 `tick` 消费（见模块文档驱动模型）。启动时读一次偏好：把 `music_liked`
+    /// 接线进收藏集、`music_volume` 应用到初始音量（任一打开路径都恢复；上次曲目/进度的
+    /// 恢复选中需库就绪，由打开音乐模式时的 `apply_saved_prefs` + 首个 `commit_scan` 完成）。
+    /// K8：music 自身测试构建不读真实配置，见 [`Self::prefs`]。
     pub fn new(_cx: &mut Context<Self>) -> Self {
         let (_evt_tx, evt_rx) = mpsc::channel::<Event>();
+        let prefs = Self::prefs();
+        let liked_prefs = prefs.music_liked;
         Self {
             library: Vec::new(),
             mix_groups: Vec::new(),
@@ -115,14 +151,24 @@ impl MusicPlayer {
             paused: false,
             repeat: RepeatMode::Off,
             shuffle: false,
-            volume: 1.0,
+            volume: prefs.music_volume.unwrap_or(1.0).clamp(0.0, 1.0),
             sink: None,
             worker_tx: None,
             worker_join: None,
             evt_rx,
             error: None,
             duration: 0.0,
-            liked: HashSet::new(),
+            liked: liked_prefs.iter().cloned().collect(),
+            liked_order: liked_prefs,
+            last_track_pref: None,
+            progress_pref: None,
+            prefs_dirty: false,
+            prefs_flush_count: 0,
+            last_prefs_attempt: None,
+            pending_restore: None,
+            restore_done: false,
+            resume_restore: None,
+            resume_on_open: None,
             generation: 0,
             seek_base: 0.0,
             seek_clock_base: 0.0,
@@ -133,6 +179,18 @@ impl MusicPlayer {
             scan_gen: 0,
             pending_path: None,
         }
+    }
+
+    /// 读用户偏好：music 自身测试构建（`cargo test -p music`）下 `config` 是依赖编译、
+    /// 不受其自身 `cfg!(test)` 门控 → 这里按本 crate 测试态屏蔽，防读真实
+    /// `%APPDATA%\gpui-editor\config.json` 污染测试（K8）。
+    #[cfg(test)]
+    fn prefs() -> config::user::UserPrefs {
+        config::user::UserPrefs::default()
+    }
+    #[cfg(not(test))]
+    fn prefs() -> config::user::UserPrefs {
+        config::user::UserPrefs::load()
     }
 
     /// 消费 worker 事件（外部驱动口：Phase B 的 UI 在渲染/交互节拍调用；测试显式调用）。
@@ -166,6 +224,12 @@ impl MusicPlayer {
                 self.reset_playhead_base();
                 self.playing = true;
                 self.paused = false;
+                // 续播（恢复选中的那首）：worker 此时 codec 就绪，再真 seek(saved) 才生效
+                // ——worker 无 codec 时 Seek 是空操作，Load 后 codec 从 0 起播。seek 内 clamp
+                // 到真实 duration（恢复时 duration 未探测，落到 Opened 才知其上限）。
+                if let Some(saved) = self.resume_on_open.take() {
+                    self.seek(saved, cx);
+                }
             }
             Event::Finished { gen_id } => {
                 if gen_id != self.generation {
@@ -247,6 +311,20 @@ impl MusicPlayer {
             None => 0,
         };
         self.error = None;
+        // 恢复上次状态：仅在「打开音乐模式首次装配」执行一次——`pending_restore` 由
+        // `load_default_dir`（首次进入音乐模式）置入；此后的 `load_dir` 换代（换目录/
+        // 播放外部文件重扫）**不**重复恢复，防换目录后被旧 prefs 拉回丢失显式意图。
+        if !self.restore_done {
+            self.restore_done = true;
+            if let Some((last, prog)) = self.pending_restore.take() {
+                self.apply_restore(last, prog, cx);
+            }
+        } else {
+            // 库换代：首次恢复的续播候选下标已失效，清掉防陈旧误命中（用户换到其它曲目
+            // 播放不受影响；换回上次恢复曲目也从头播——恢复续播只对首次选中生效）。
+            self.resume_restore = None;
+            self.resume_on_open = None;
+        }
         // 外部文件待播：新库就绪后按路径重定位播放（play_path 的异步延续）。
         if let Some(p) = self.pending_path.take() {
             if let Some(idx) = self.library.iter().position(|t| t.path == *p) {
@@ -313,11 +391,149 @@ impl MusicPlayer {
         self.scanning
     }
 
+    // ---- 偏好接线 + 启动恢复 + 统一落盘（K10：一处脏标记 + 唯一 flush） ----
+
+    /// 打开音乐模式时把上次偏好接线进播放器（[`crate::view::MusicView::load_default_dir`]
+    /// 入口调用）：
+    /// - 音量 → 立即应用（`None` 用播放器默认 1.0；`set_volume` 内 clamp 0..1）；
+    /// - 收藏集 → 替换内存镜像（新→旧序保留，与配置字段文档一致）；
+    /// - 上次曲目/进度 → 暂存 `pending_restore`，等首个 [`Self::commit_scan`] 库就绪后
+    ///   恢复选中定位（**不自动播放**）。
+    pub(crate) fn apply_saved_prefs(
+        &mut self,
+        prefs: &config::user::UserPrefs,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_volume(prefs.music_volume.unwrap_or(1.0), cx);
+        self.liked = prefs.music_liked.iter().cloned().collect();
+        self.liked_order = prefs.music_liked.clone();
+        self.pending_restore = Some((prefs.music_last_track.clone(), prefs.music_progress_secs));
+    }
+
+    /// 恢复上次选中（首个 `commit_scan` 调用，库已就绪）：
+    /// - 无 `last_track`（从未播放过）→ 不自动选中，保持无 current（空态/首次打开原样）；
+    /// - 在库 → `current` 指向该下标（选中高亮）、`playing=false` 不自动播放、进度显示
+    ///   `seek_base = last progress`（clamp 到已测 duration；未探测时由 position() 在探测后
+    ///   min 钳位）。续播候选 `resume_restore`：仅用户显式播放该曲时 `seek` 续播；
+    /// - 不在库（目录变/文件删）→ 落库首选中、进度清 0，并标记脏回写清理旧进度；
+    /// - 库空 → 无 current、空态正常。
+    fn apply_restore(
+        &mut self,
+        last_track: Option<String>,
+        progress: Option<f64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.playing = false;
+        self.paused = false;
+        let Some(path) = last_track else {
+            return; // 从未播放过：不自动选中
+        };
+        let Some(idx) = self.library.iter().position(|t| t.path.to_string_lossy() == path) else {
+            // 上次曲目不在库（目录变/文件删）→ 落库首选中、进度清 0，回写清理旧 prefs。
+            if !self.library.is_empty() {
+                self.queue = (0..self.library.len()).collect();
+                self.queue_pos = 0;
+                self.current = Some(0);
+                self.last_track_pref = Some(self.library[0].path.to_string_lossy().to_string());
+                self.progress_pref = Some(0.0);
+                self.prefs_dirty = true;
+            }
+            self.error = None;
+            self.mutation += 1;
+            cx.notify();
+            return;
+        };
+        let dur = self.library[idx].duration;
+        let saved = progress.unwrap_or(0.0).max(0.0);
+        // 越界钳位到已测 duration；未探测（0）保留原值——显示层 position() 与续播 seek()
+        // 在 duration 就绪后二次 min 钳位（「progress > duration → clamp；duration≤0 → 0」）。
+        let clamped = if dur > 0.0 { saved.min(dur) } else { saved };
+        self.queue = (0..self.library.len()).collect();
+        self.queue_pos = idx;
+        self.current = Some(idx);
+        self.seek_base = clamped;
+        self.seek_clock_base = 0.0;
+        self.flush_seen.set(false);
+        self.scrubbing = false;
+        self.last_track_pref = Some(path);
+        self.progress_pref = Some(clamped);
+        if clamped > 0.0 {
+            // 续播候选：仅用户对该曲显式播放时 seek 续播；恢复选中本身绝不启动 sink。
+            self.resume_restore = Some((idx, clamped));
+        }
+        self.error = None;
+        self.mutation += 1;
+        cx.notify();
+    }
+
+    /// 统一落盘入口（K10）：脏才写。先 [`Self::prefs`] 合并既有偏好（防丢 theme/font_size
+    /// 等其它字段），仅覆写音乐字段再 `save()`；成功后清脏。每次「应写盘」即自增
+    /// `prefs_flush_count`（测试探针）。music 自身测试构建下 `config` 是依赖编译、其自身
+    /// `cfg!(test)` 门控不生效 → 这里按本 crate 测试态跳过真实写盘（防污染 `%APPDATA%`，
+    /// K8），只数探针；生产/其它构建真写。写失败静默回退（保持内存态，与 config 一致）。
+    pub fn flush_prefs(&mut self) {
+        if !self.prefs_dirty {
+            return;
+        }
+        self.prefs_flush_count += 1;
+        let mut prefs = Self::prefs();
+        prefs.music_volume = Some(self.volume);
+        prefs.music_last_track = self.last_track_pref.clone();
+        prefs.music_progress_secs = self.progress_pref;
+        prefs.music_liked = self.liked_order.clone();
+        if !cfg!(test) {
+            prefs.save();
+        }
+        self.prefs_dirty = false;
+    }
+
+    /// 把当前播放位置写入进度偏好并 flush（暂停/停止/退出音乐模式等事件驱动点）：
+    /// 无当前曲目时位置无意义，跳过进度写入（仍 flush 其它待写脏项，如刚收藏）。
+    pub fn save_progress_and_flush(&mut self) {
+        if self.current.is_some() {
+            self.progress_pref = Some(self.position());
+            self.prefs_dirty = true;
+        }
+        self.flush_prefs();
+    }
+
+    /// 播放中周期持久化（[`crate::view::MusicView::on_tick`] 每拍调）：每
+    /// ≥[`PREFS_PERSIST_INTERVAL`] 一次、**且位置确有变化**才写入进度偏好并 flush
+    /// （K11 粒度合并：播放中 5s 落盘一次，禁止逐帧写）。暂停态位置不变 → 不重复写。
+    /// 无当前曲目时进度无意义（由暂停/停止/退出等事件已落盘），但仍走统一 flush —— 收藏/
+    /// 音量等其它脏项不因「无 current」滞留（K10 一处脏标记 + 统一 flush 收口）。
+    pub fn persist_progress_periodic(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        if self
+            .last_prefs_attempt
+            .is_some_and(|t| now.duration_since(t) < PREFS_PERSIST_INTERVAL)
+        {
+            return;
+        }
+        self.last_prefs_attempt = Some(now);
+        if self.current.is_some() {
+            let pos = self.position();
+            if self.progress_pref.map_or(true, |p| (p - pos).abs() > 1e-6) {
+                self.progress_pref = Some(pos);
+                self.prefs_dirty = true;
+            }
+        }
+        self.flush_prefs();
+    }
+
     /// 播放 `library[idx]`：queue 空则先建全库队列（shuffle 洗牌）；`idx` 不在队列则
     /// 追加；sink 首次打开（失败 → error 提示，纯状态播放）；发 `Load`、置状态、notify。
     pub fn play_track(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx >= self.library.len() {
             return;
+        }
+        // 切歌前落盘旧进度：换到不同曲目且此前有 current 时，把旧位置写入偏好并立即
+        // flush（（旧曲, 旧位置）一致对落盘；随后本函数把 last_track/progress 切到新曲
+        // 并待下次事件/周期 flush（新曲, 0）——崩溃窗口内磁盘仍是自洽旧对）。
+        if self.current.is_some_and(|c| c != idx) {
+            self.progress_pref = Some(self.position());
+            self.prefs_dirty = true;
+            self.flush_prefs();
         }
         if self.queue.is_empty() {
             let mut q: Vec<usize> = (0..self.library.len()).collect();
@@ -338,6 +554,30 @@ impl MusicPlayer {
         self.paused = false;
         self.playing = true;
         self.reset_playhead_base();
+        // 续播：用户显式播放「恢复选中的那首」 → 先用 saved 基准显示（seek_base=saved），
+        // 真实音频 seek 延到 Opened 后（worker 无 codec 时 Seek 是空操作）；对其它曲目 → 从头播
+        // （seek_base 已复位 0）。恢复选中本身只定位、绝不启动 sink——续播只在用户显式播放时。
+        let resume = match self.resume_restore {
+            Some((ri, p)) if ri == idx && p > 0.0 => {
+                self.resume_restore = None; // 一次性：续播用完即止，此后重播从头
+                Some(p)
+            }
+            _ => None,
+        };
+        if let Some(saved) = resume {
+            self.seek_base = saved;
+            self.seek_clock_base = self.sink.as_ref().map(|s| s.position()).unwrap_or(0.0);
+            self.flush_seen.set(false);
+            self.resume_on_open = Some(saved);
+        } else {
+            // 前一轮「待 Opened 续播」未消费（用户等不到 Opened 就切歌/重播/播放外部文件）→
+            // 必须清掉：否则残留落点会被**下一首** Opened 消费，把新曲误 seek 到旧曲位置。
+            self.resume_on_open = None;
+        }
+        // 当前曲目/进度持久化：新曲从 saved（续播）或 0 起，标记脏统一 flush。
+        self.last_track_pref = Some(self.library[idx].path.to_string_lossy().to_string());
+        self.progress_pref = resume.or(Some(0.0));
+        self.prefs_dirty = true;
         let path = self.library[idx].path.clone();
         let rate = match &self.sink {
             Some(s) => s.sample_rate(),
@@ -403,6 +643,8 @@ impl MusicPlayer {
         if let Some(tx) = &self.worker_tx {
             let _ = tx.send(WorkerCmd::Pause);
         }
+        // 暂停：当前播放位置写入进度偏好并立即 flush（事件驱动，K11 粒度）。
+        self.save_progress_and_flush();
         cx.notify();
     }
 
@@ -469,6 +711,7 @@ impl MusicPlayer {
     /// seek 到 `seconds`（clamp 到 [0, 探测时长]）；flush 在 worker 内完成。
     /// 同步把显示基准 `seek_base` 置为目标：即使 worker 异步 flush 归零 sink 时钟，
     /// `position()` 也从落点继续走（不再从 0 重走）——进度条点/拖「显示到落点」的关键。
+    /// seek 后把落点写入进度偏好并标记脏（不即时 flush——拖拽节流下防刷盘，周期 flush 收）。
     pub fn seek(&mut self, seconds: f64, cx: &mut Context<Self>) {
         let max = if self.duration > 0.0 {
             self.duration
@@ -479,6 +722,8 @@ impl MusicPlayer {
         self.seek_base = t;
         self.seek_clock_base = self.sink.as_ref().map(|s| s.position()).unwrap_or(0.0);
         self.flush_seen.set(false);
+        self.progress_pref = Some(t);
+        self.prefs_dirty = true;
         let gen_id = self.generation;
         if let Some(tx) = &self.worker_tx {
             let _ = tx.send(WorkerCmd::Seek { gen_id, seconds: t });
@@ -521,6 +766,8 @@ impl MusicPlayer {
         if let Some(s) = &self.sink {
             s.set_volume(self.volume);
         }
+        // 音量变化 → 标记持久化脏（统一 flush，K10）。
+        self.prefs_dirty = true;
         cx.notify();
     }
 
@@ -535,17 +782,24 @@ impl MusicPlayer {
         cx.notify();
     }
 
-    /// 收藏/取消收藏 `library[idx]`（按路径字符串）。
+    /// 收藏/取消收藏 `library[idx]`（按路径字符串）。收藏变化 → 标记持久化脏并更新
+    /// 新→旧顺序镜像 `liked_order`（统一 flush，K10）。
     pub fn toggle_like(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(t) = self.library.get(idx) else {
             return;
         };
         let p = t.path.to_string_lossy().to_string();
         if !self.liked.remove(&p) {
-            self.liked.insert(p);
+            self.liked.insert(p.clone());
+            // 新收藏 → 新→旧序头插（对齐配置字段文档）。
+            self.liked_order.insert(0, p);
+        } else {
+            self.liked_order.retain(|x| x != &p);
         }
         // 收藏集变化 → 视图侧「过滤/分组显示模型」缓存（Liked 分区依赖 liked 集）失效。
         self.mutation += 1;
+        // 收藏集变化 → 标记持久化脏（K10 一处脏标记 + 统一 flush）。
+        self.prefs_dirty = true;
         cx.notify();
     }
 
@@ -561,8 +815,10 @@ impl MusicPlayer {
             .unwrap_or(false)
     }
 
-    /// 停止：关输出、复位播放状态（保留 library/dir/liked）。
+    /// 停止：关输出、复位播放状态（保留 library/dir/liked）。停止前把当前播放位置写入
+    /// 进度偏好并立即 flush（事件驱动落盘点）。
     pub fn stop(&mut self, cx: &mut Context<Self>) {
+        let pos = self.position();
         if let Some(tx) = &self.worker_tx {
             let _ = tx.send(WorkerCmd::Stop);
         }
@@ -570,13 +826,22 @@ impl MusicPlayer {
             let _ = s.pause();
             s.flush();
         }
+        if self.current.is_some() {
+            self.progress_pref = Some(pos);
+            self.prefs_dirty = true;
+        }
         self.playing = false;
         self.paused = false;
         self.queue.clear();
         self.queue_pos = 0;
         self.current = None;
+        // 未消费的续播落点/候选随停止清掉：停止后播放任何曲目都从头起，不得残留旧续播
+        // 被下一首 Opened 消费（防跨曲目 seek 污染，同 play_track 非续播分支）。
+        self.resume_on_open = None;
+        self.resume_restore = None;
         self.duration = 0.0;
         self.reset_playhead_base();
+        self.flush_prefs();
         cx.notify();
     }
 
@@ -1286,6 +1551,563 @@ mod tests {
         assert_eq!(s2, Some(1), "next 后 current 应切到第 2 首");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 偏好持久化 + 启动恢复（本轮新功能）----
+
+    /// 驱动异步扫库到主线程装配完成（scan→commit→probe 全落地）。
+    fn drain_scan(cx: &mut TestAppContext) {
+        for _ in 0..3 {
+            cx.background_executor.run_until_parked();
+        }
+    }
+
+    /// 建含两首 wav 的临时库，返回 `(dir, 首曲路径, 次曲路径, player)`（未 load_dir）。
+    fn two_track_library(
+        cx: &mut TestAppContext,
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, gpui::Entity<MusicPlayer>) {
+        let dir = std::env::temp_dir().join(format!("gpui-music-persist-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p0 = dir.join("甲 - one.wav");
+        let p1 = dir.join("乙 - two.wav");
+        write_test_wav(&p0, 1.5);
+        write_test_wav(&p1, 1.5);
+        let player: gpui::Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+        (dir, p0, p1, player)
+    }
+
+    /// 按路径查库内下标（scan_dir 按 UTF-8 字节序排序——中文文件名「乙/丁」字节序在
+    /// 「甲/丙」之前，测试不得假定词序=下标序，统一按路径定位）。
+    fn idx_of(
+        player: &gpui::Entity<MusicPlayer>,
+        cx: &mut TestAppContext,
+        path: &std::path::Path,
+    ) -> usize {
+        let path = path.to_path_buf();
+        cx.read(|app| {
+            player
+                .read(app)
+                .library()
+                .iter()
+                .position(|t| t.path == path)
+                .expect("曲目应已在库中")
+        })
+    }
+
+    /// 恢复语义回归：音量恢复到上次保存值；上次曲目在库 → 选中定位（不自动播放、不启动
+    /// sink）；进度条显示上次位置（复用 seek_base 显示基准）。
+    #[gpui::test]
+    async fn restore_selects_last_track_and_volume_without_playing(cx: &mut TestAppContext) {
+        let (dir, _p0, p1, player) = two_track_library(cx, "restore-sel");
+        let p1_str = p1.to_string_lossy().to_string();
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_volume = Some(0.33);
+        prefs.music_last_track = Some(p1_str.clone());
+        prefs.music_progress_secs = Some(12.0);
+        cx.update(|app| {
+            player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx));
+        });
+        cx.update(|app| {
+            player.update(app, |p, cx| p.load_dir(&dir, cx));
+        });
+        drain_scan(cx);
+
+        let (vol, cur, playing, worker_none, last) = cx.read(|app| {
+            let p = player.read(app);
+            (
+                p.volume,
+                p.current,
+                p.playing,
+                p.worker_tx.is_none(),
+                p.last_track_pref.clone(),
+            )
+        });
+        let p1_idx = idx_of(&player, cx, &p1);
+        assert_eq!(vol, 0.33, "音量应恢复到上次保存值");
+        assert_eq!(cur, Some(p1_idx), "上次曲目应选中定位到其下标（按路径）");
+        assert!(!playing, "恢复选中不自动播放");
+        assert!(worker_none, "恢复选中绝不启动 sink");
+        assert_eq!(last.as_deref(), Some(p1_str.as_str()), "last_track 镜像应指向恢复曲目");
+        assert_eq!(cx.read(|app| player.read(app).prefs_flush_count), 0, "恢复本身不写盘");
+
+        // 进度显示：恢复时 duration 未探测 → position 0；注入时长（模拟探测完成）→ 显示 12。
+        assert_eq!(cx.read(|app| player.read(app).position()), 0.0, "duration≤0 时 position 恒 0");
+        cx.update(|app| {
+            player.update(app, |p, _| p.set_test_duration(30.0));
+        });
+        let pos1 = cx.read(|app| player.read(app).position());
+        assert!((pos1 - 12.0).abs() < 1e-9, "进度条应显示上次位置 12，实得 {pos1}");
+        let rr = cx.read(|app| player.read(app).resume_restore);
+        assert_eq!(rr, Some((p1_idx, 12.0)), "续播候选应挂在恢复曲目上");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复语义回归：上次曲目不在库（目录变/文件删）→ 落库首选中、进度清 0、标记脏回写。
+    #[gpui::test]
+    async fn restore_missing_track_falls_back_to_first(cx: &mut TestAppContext) {
+        let (dir, _p0, _p1, player) = two_track_library(cx, "restore-miss");
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_last_track = Some("D:\\gone\\曲目.wav".to_string());
+        prefs.music_progress_secs = Some(5.0);
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let (cur, playing, base, rr, dirty, last) = cx.read(|app| {
+            let p = player.read(app);
+            (p.current, p.playing, p.seek_base, p.resume_restore, p.prefs_dirty, p.last_track_pref.clone())
+        });
+        let first = cx.read(|app| {
+            player
+                .read(app)
+                .library()
+                .first()
+                .map(|t| t.path.to_string_lossy().to_string())
+        });
+        assert_eq!(cur, Some(0), "上次曲目不在库 → 落库首选中");
+        assert!(!playing);
+        assert_eq!(base, 0.0, "进度清 0");
+        assert_eq!(rr, None, "无续播候选");
+        assert!(dirty, "落库首应标记脏回写清理旧进度");
+        assert_eq!(last, first, "last_track 镜像应更新为当前库首曲（按扫描序）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复语义回归：库空 → 无 current、空态正常（不崩）。
+    #[gpui::test]
+    async fn restore_empty_library_keeps_no_current(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("gpui-music-persist-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let player: gpui::Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_last_track = Some("D:\\gone\\x.wav".to_string());
+        prefs.music_progress_secs = Some(5.0);
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let (cur, playing) = cx.read(|app| {
+            let p = player.read(app);
+            (p.current, p.playing)
+        });
+        assert_eq!(cur, None, "库空 → 无 current");
+        assert!(!playing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复语义回归：从未播放过（无 last_track）→ 不自动选中；音量仍恢复。
+    #[gpui::test]
+    async fn restore_without_last_track_selects_nothing(cx: &mut TestAppContext) {
+        let (dir, _p0, _p1, player) = two_track_library(cx, "restore-none");
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_volume = Some(0.5);
+        prefs.music_progress_secs = Some(3.0);
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let (cur, playing, vol) = cx.read(|app| {
+            let p = player.read(app);
+            (p.current, p.playing, p.volume)
+        });
+        assert_eq!(vol, 0.5, "音量仍应恢复");
+        assert_eq!(cur, None, "从未播放过 → 不自动选中");
+        assert!(!playing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复语义回归：music_progress_secs 越界（> duration）→ 显示/续播 entry 均 clamp；
+    /// duration≤0 → 显示 0（「progress > duration → clamp（duration≤0 → 0）」）。
+    #[gpui::test]
+    async fn restore_clamps_progress_to_duration(cx: &mut TestAppContext) {
+        let (dir, p0, _p1, player) = two_track_library(cx, "restore-clamp");
+        let p0_str = p0.to_string_lossy().to_string();
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_last_track = Some(p0_str);
+        prefs.music_progress_secs = Some(999.0);
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        // duration 未探测（0）→ position 恒 0。
+        assert_eq!(cx.read(|app| player.read(app).position()), 0.0, "duration≤0 → 显示 0");
+        // 探测后 duration=30：显示钳位到 30（seek_base=999 → min(duration)）。
+        cx.update(|app| player.update(app, |p, _| p.set_test_duration(30.0)));
+        let pos1 = cx.read(|app| player.read(app).position());
+        assert!((pos1 - 30.0).abs() < 1e-9, "越界进度应钳位到 duration=30，实得 {pos1}");
+        // 续播 seek（Opened 后真 seek 路径里的 seek clamp）同样钳位。
+        cx.update(|app| player.update(app, |p, cx| p.seek(999.0, cx)));
+        let base = cx.read(|app| player.read(app).seek_base);
+        assert!((base - 30.0).abs() < 1e-9, "续播 seek 越界应钳位，实得 {base}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 续播语义回归：只有用户「显式播放恢复选中的那首」才从上次进度续播（seek_base=saved +
+    /// 待 Opened 真 seek）；对其它曲目从头播；恢复选中本身不启动 sink。
+    #[gpui::test]
+    async fn resume_restored_track_seeks_saved_only_for_that_track(cx: &mut TestAppContext) {
+        let (dir, p0, p1, player) = two_track_library(cx, "resume");
+        let p1_str = p1.to_string_lossy().to_string();
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_last_track = Some(p1_str);
+        prefs.music_progress_secs = Some(12.0);
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+
+        let (cur, playing) = cx.read(|app| {
+            let p = player.read(app);
+            (p.current, p.playing)
+        });
+        let p1_idx = idx_of(&player, cx, &p1);
+        assert_eq!((cur, playing), (Some(p1_idx), false), "恢复选中不自动播放（按路径）");
+
+        // 用户显式播放「其它曲目」→ 从头播（seek_base=0），续播候选保留。
+        let other = idx_of(&player, cx, &p0);
+        cx.update(|app| player.update(app, |p, cx| p.play_track(other, cx)));
+        let s0 = cx.read(|app| {
+            let p = player.read(app);
+            (p.seek_base, p.playing, p.resume_on_open, p.resume_restore)
+        });
+        assert_eq!(s0.0, 0.0, "其它曲目应从头播（seek_base=0）");
+        assert!(s0.1);
+        assert_eq!(s0.2, None, "非恢复曲目不挂 resume_on_open");
+        assert_eq!(s0.3, Some((p1_idx, 12.0)), "续播候选仍保留给恢复曲目");
+
+        // 用户显式播放「恢复选中的那首」→ 从上次进度续播（seek_base=saved + 待 Opened 真 seek）。
+        cx.update(|app| player.update(app, |p, cx| p.play_track(p1_idx, cx)));
+        let s1 = cx.read(|app| {
+            let p = player.read(app);
+            (p.seek_base, p.playing, p.resume_on_open, p.resume_restore, p.progress_pref)
+        });
+        assert_eq!(s1.0, 12.0, "续播显示基准应为 saved=12");
+        assert!(s1.1);
+        assert_eq!(s1.2, Some(12.0), "应挂 resume_on_open 待 Opened 真 seek");
+        assert_eq!(s1.3, None, "续播候选一次性消费");
+        assert_eq!(s1.4, Some(12.0), "进度偏好应记为续播落点");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 续播消费残留回归：恢复曲目已点播放（Opened 未到）→ 立即切到其它曲目，旧续播落点
+    /// 必须清掉，不得被下一首 Opened 消费（seek 到错误位置）；stop 同样清掉残留。
+    #[gpui::test]
+    async fn resume_on_open_cleared_when_track_switches_before_opened(cx: &mut TestAppContext) {
+        let (dir, p0, p1, player) = two_track_library(cx, "resume-switch");
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_last_track = Some(p1.to_string_lossy().to_string());
+        prefs.music_progress_secs = Some(12.0);
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let p1_idx = idx_of(&player, cx, &p1);
+        let p0_idx = idx_of(&player, cx, &p0);
+
+        // 点恢复曲目 → 挂 resume_on_open 待 Opened 真 seek。
+        cx.update(|app| player.update(app, |p, cx| p.play_track(p1_idx, cx)));
+        assert_eq!(
+            cx.read(|app| player.read(app).resume_on_open),
+            Some(12.0),
+            "恢复曲目点播应挂 resume_on_open"
+        );
+        // Opened 到达前切到其它曲目：旧续播落点必须清除（不得由下一首 Opened 消费）。
+        cx.update(|app| player.update(app, |p, cx| p.play_track(p0_idx, cx)));
+        assert_eq!(
+            cx.read(|app| player.read(app).resume_on_open),
+            None,
+            "切到其它曲目应清掉未消费的续播落点"
+        );
+
+        // 再恢复选中并播放（resume_restore 已消费 → 从头播、不挂续播）；随后 stop 也应清
+        // 掉任何残留（停止后播放任何曲目都不得续播到旧落点）。
+        cx.update(|app| player.update(app, |p, cx| p.play_track(p1_idx, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.stop(cx)));
+        assert_eq!(
+            cx.read(|app| player.read(app).resume_on_open),
+            None,
+            "stop 应清掉未消费的续播落点"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 切歌前落盘旧进度：换到不同曲目 → 立即 flush（旧曲, 旧位置）一致对；新曲 last_track
+    /// 切换、进度清 0（待统一 flush）。
+    #[gpui::test]
+    async fn switch_track_saves_old_progress_and_new_starts_zero(cx: &mut TestAppContext) {
+        let (dir, _p0, p1, player) = two_track_library(cx, "switch");
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let i0 = idx_of(&player, cx, &_p0);
+        let i1 = idx_of(&player, cx, &p1);
+        cx.update(|app| player.update(app, |p, _| p.test_start_playing(i0)));
+        cx.update(|app| player.update(app, |p, _| p.set_test_duration(30.0)));
+        cx.update(|app| player.update(app, |p, cx| p.seek(20.0, cx)));
+        let (before, dirty0) = cx.read(|app| {
+            let p = player.read(app);
+            (p.progress_pref, p.prefs_dirty)
+        });
+        assert_eq!(before, Some(20.0), "seek 后进度偏好应=20");
+        assert!(dirty0);
+
+        cx.update(|app| player.update(app, |p, cx| p.play_track(i1, cx)));
+        let (count, cur, last, prog, base, playing) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.current, p.last_track_pref.clone(), p.progress_pref, p.seek_base, p.playing)
+        });
+        assert_eq!(count, 1, "切歌前应立即 flush 旧进度（旧曲, 旧位置一致对）");
+        assert_eq!(cur, Some(i1));
+        assert_eq!(last.as_deref(), Some(p1.to_string_lossy().as_ref()), "last_track 应切到新曲（按路径）");
+        assert_eq!(prog, Some(0.0), "新曲从头起、进度清 0");
+        assert_eq!(base, 0.0);
+        assert!(playing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// pause / stop / seek 的进度持久化：seek 标记脏但**不即时 flush**；pause/stop 事件驱动
+    /// 即时 flush（prefs_flush_count 探针）。
+    #[gpui::test]
+    async fn pause_stop_seek_flush_progress_probe(cx: &mut TestAppContext) {
+        let (dir, _p0, _p1, player) = two_track_library(cx, "pause-stop");
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        cx.update(|app| player.update(app, |p, _| p.test_start_playing(0)));
+        cx.update(|app| player.update(app, |p, _| p.set_test_duration(30.0)));
+        cx.update(|app| player.update(app, |p, cx| p.seek(12.0, cx)));
+        let (prog, dirty, count0) = cx.read(|app| {
+            let p = player.read(app);
+            (p.progress_pref, p.prefs_dirty, p.prefs_flush_count)
+        });
+        assert_eq!(prog, Some(12.0));
+        assert!(dirty, "seek 应标记脏（不即时 flush，防拖拽刷盘）");
+        assert_eq!(count0, 0, "seek 不即时 flush");
+
+        // pause：位置写入并即时 flush。
+        cx.update(|app| player.update(app, |p, cx| p.pause(cx)));
+        let (prog, dirty, count) = cx.read(|app| {
+            let p = player.read(app);
+            (p.progress_pref, p.prefs_dirty, p.prefs_flush_count)
+        });
+        assert_eq!(prog, Some(12.0), "暂停应保存当前播放位置");
+        assert!(!dirty, "pause flush 后应清脏");
+        assert_eq!(count, 1, "pause 应触发一次 flush");
+
+        // resume 后再 stop：停止前位置写入并即时 flush。
+        cx.update(|app| player.update(app, |p, cx| p.resume(cx)));
+        cx.update(|app| player.update(app, |p, cx| p.stop(cx)));
+        let (prog, count, cur) = cx.read(|app| {
+            let p = player.read(app);
+            (p.progress_pref, p.prefs_flush_count, p.current)
+        });
+        assert_eq!(prog, Some(12.0), "停止应保存停止前位置");
+        assert_eq!(count, 2, "stop 应再触发一次 flush");
+        assert_eq!(cur, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 播放中周期持久化：≥5s 一次且位置确有变化才 flush（K11 粒度合并，防逐帧写）；
+    /// 5s 窗口内 seek 更新不落盘。
+    #[gpui::test]
+    async fn periodic_persist_is_5s_gated_and_merges_dirty(cx: &mut TestAppContext) {
+        let (dir, _p0, _p1, player) = two_track_library(cx, "periodic");
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        cx.update(|app| player.update(app, |p, _| p.test_start_playing(0)));
+        cx.update(|app| player.update(app, |p, _| p.set_test_duration(60.0)));
+        cx.update(|app| player.update(app, |p, cx| p.seek(9.0, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.persist_progress_periodic(cx)));
+        let (count, dirty) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.prefs_dirty)
+        });
+        assert_eq!(count, 1, "首次周期检查应 flush 脏进度");
+        assert!(!dirty);
+
+        // 5s 窗口内：seek 更新后周期检查不落盘（门控）。
+        cx.update(|app| player.update(app, |p, cx| p.seek(10.0, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.persist_progress_periodic(cx)));
+        let (count, prog) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.progress_pref)
+        });
+        assert_eq!(count, 1, "5s 窗口内不得重复落盘");
+        assert_eq!(prog, Some(10.0));
+
+        // 过 5s 且位置变化 → 再次落盘。
+        cx.background_executor.advance_clock(Duration::from_secs(6));
+        cx.update(|app| player.update(app, |p, cx| p.seek(11.0, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.persist_progress_periodic(cx)));
+        let (count, dirty) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.prefs_dirty)
+        });
+        assert_eq!(count, 2, "过 5s 且位置变化应再落盘");
+        assert!(!dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空 current 下的脏项收口：无当前曲目（浏览态）收藏后不即时 flush（K10 统一 flush），
+    /// 但周期检查仍应把收藏/音量脏项收口——不得因「无 current」让脏数据滞留到退出丢盘。
+    #[gpui::test]
+    async fn periodic_flush_collects_like_dirty_without_current(cx: &mut TestAppContext) {
+        let (dir, p0, p1, player) = two_track_library(cx, "like-idle");
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let i0 = idx_of(&player, cx, &p0);
+        let i1 = idx_of(&player, cx, &p1);
+        let p0s = p0.to_string_lossy().to_string();
+        let p1s = p1.to_string_lossy().to_string();
+        // 无 current（浏览态）收藏：只标记脏，不散点直写。
+        cx.update(|app| player.update(app, |p, cx| p.toggle_like(i0, cx)));
+        let (dirty, count) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_dirty, p.prefs_flush_count)
+        });
+        assert!(dirty);
+        assert_eq!(count, 0, "收藏不散点直写");
+
+        // 首周期检查：last_prefs_attempt 无基准 → 立即统一 flush 收口（无 current 也 flush）。
+        cx.update(|app| player.update(app, |p, cx| p.persist_progress_periodic(cx)));
+        let (count, dirty, liked) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.prefs_dirty, p.liked_order.clone())
+        });
+        assert_eq!(count, 1, "无 current 也应 flush 脏收藏");
+        assert!(!dirty);
+        assert_eq!(liked, vec![p0s.clone()]);
+
+        // 再收藏另一首 → 脏；5s 窗口内周期检查不得落盘。
+        cx.update(|app| player.update(app, |p, cx| p.toggle_like(i1, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.persist_progress_periodic(cx)));
+        let (count, dirty, liked) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.prefs_dirty, p.liked_order.clone())
+        });
+        assert!(dirty, "5s 窗口内收藏更新不落盘（门控）");
+        assert_eq!(count, 1);
+        assert_eq!(liked, vec![p1s.clone(), p0s.clone()], "新→旧序镜像随后续 flush 一起写");
+
+        // 过 5s → 周期检查再次收口。
+        cx.background_executor.advance_clock(Duration::from_secs(6));
+        cx.update(|app| player.update(app, |p, cx| p.persist_progress_periodic(cx)));
+        let (count, dirty) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.prefs_dirty)
+        });
+        assert_eq!(count, 2, "过 5s 门控应再次 flush");
+        assert!(!dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// toggle_like：标记持久化脏 + 更新新→旧序镜像，不散点直写；统一 flush 计数 +1 并清脏。
+    #[gpui::test]
+    async fn toggle_like_marks_dirty_and_flush_probe(cx: &mut TestAppContext) {
+        let (dir, p0, p1, player) = two_track_library(cx, "like");
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let p0s = p0.to_string_lossy().to_string();
+        let p1s = p1.to_string_lossy().to_string();
+        let i0 = idx_of(&player, cx, &p0);
+        let i1 = idx_of(&player, cx, &p1);
+        cx.update(|app| player.update(app, |p, cx| p.toggle_like(i0, cx)));
+        let (liked0, order, dirty, count) = cx.read(|app| {
+            let p = player.read(app);
+            (p.is_liked(i0), p.liked_order.clone(), p.prefs_dirty, p.prefs_flush_count)
+        });
+        assert!(liked0);
+        assert_eq!(order, vec![p0s.clone()], "新收藏应为新→旧序头");
+        assert!(dirty, "toggle_like 应标记持久化脏");
+        assert_eq!(count, 0, "不散点直写");
+
+        cx.update(|app| player.update(app, |p, cx| p.toggle_like(i1, cx)));
+        let order = cx.read(|app| player.read(app).liked_order.clone());
+        assert_eq!(order, vec![p1s.clone(), p0s.clone()], "新收藏应在头部、旧收藏下移");
+
+        cx.update(|app| player.update(app, |p, _| p.flush_prefs()));
+        let (count, dirty) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.prefs_dirty)
+        });
+        assert_eq!(count, 1, "统一 flush 应恰好一次");
+        assert!(!dirty);
+
+        cx.update(|app| player.update(app, |p, cx| p.toggle_like(i0, cx)));
+        let (liked0, order, dirty) = cx.read(|app| {
+            let p = player.read(app);
+            (p.is_liked(i0), p.liked_order.clone(), p.prefs_dirty)
+        });
+        assert!(!liked0);
+        assert_eq!(order, vec![p1s], "取消收藏应从序列表移除");
+        assert!(dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// music_liked 启动接线：`apply_saved_prefs`（load_default_dir 入口）把 prefs 收藏集
+    /// 并入 liked / 序镜像；库内路径即匹配。
+    #[gpui::test]
+    async fn liked_loads_from_saved_prefs_at_open(cx: &mut TestAppContext) {
+        let (dir, p0, _p1, player) = two_track_library(cx, "like-open");
+        let p0s = p0.to_string_lossy().to_string();
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_liked = vec![p0s.clone()];
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let i0 = idx_of(&player, cx, &p0);
+        let (is0, order) = cx.read(|app| {
+            let p = player.read(app);
+            (p.is_liked(i0), p.liked_order.clone())
+        });
+        assert!(is0, "启动时应把 music_liked 接线进 liked（按路径匹配）");
+        assert_eq!(order, vec![p0s], "顺序镜像应与 prefs 一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 切库不重复恢复：首次装配恢复选中一次；之后 `load_dir` 换代（换目录）不重复恢复，
+    /// 也不保留旧库的续播候选（下标已失效）。
+    #[gpui::test]
+    async fn dir_switch_does_not_re_restore(cx: &mut TestAppContext) {
+        let d1 = std::env::temp_dir().join(format!("gpui-music-persist-d1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d1);
+        std::fs::create_dir_all(&d1).unwrap();
+        write_test_wav(&d1.join("甲 - one.wav"), 1.5);
+        let d2 = std::env::temp_dir().join(format!("gpui-music-persist-d2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d2);
+        std::fs::create_dir_all(&d2).unwrap();
+        write_test_wav(&d2.join("丙 - three.wav"), 1.5);
+        write_test_wav(&d2.join("丁 - four.wav"), 1.5);
+
+        let player: gpui::Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_last_track = Some(d1.join("甲 - one.wav").to_string_lossy().to_string());
+        prefs.music_progress_secs = Some(12.0);
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&d1, cx)));
+        drain_scan(cx);
+        let (cur1, restore_done) = cx.read(|app| {
+            let p = player.read(app);
+            (p.current, p.restore_done)
+        });
+        assert_eq!(cur1, Some(0), "首次装配应恢复选中");
+        assert!(restore_done);
+
+        // 换目录：不重复恢复；旧库曲目不在新库 → 落库首（新库第一首），续播候选清理。
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&d2, cx)));
+        drain_scan(cx);
+        let (cur2, rr) = cx.read(|app| {
+            let p = player.read(app);
+            (p.current, p.resume_restore)
+        });
+        assert!(restore_done, "换代后仍保持恢复已执行");
+        assert_eq!(cur2, Some(0), "换目录不重复恢复：应落库首");
+        assert_eq!(rr, None, "旧库续播候选应清理");
+        let first = cx.read(|app| {
+            let p = player.read(app);
+            p.library().first().map(|t| t.path.clone())
+        });
+        assert!(
+            first.as_ref().is_some_and(|p| p.starts_with(&d2)),
+            "current 0 应指向新库第一首（非旧库曲目），实际 {first:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d1);
+        let _ = std::fs::remove_dir_all(&d2);
     }
 }
 

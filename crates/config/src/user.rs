@@ -88,6 +88,12 @@ pub struct UserPrefs {
     pub music_dir: Option<String>,
     /// 音乐收藏（歌曲路径字符串，新→旧）。
     pub music_liked: Vec<String>,
+    /// 音乐播放器音量（0..=1）。`None` = 未设置过，用播放器默认 1.0。
+    pub music_volume: Option<f32>,
+    /// 上次播放/选中的曲目绝对路径（跨重启恢复选中定位；`None` = 从未播放过）。
+    pub music_last_track: Option<String>,
+    /// 上次播放位置（秒；随 [`UserPrefs::music_last_track`] 一起恢复；`None` = 从头起）。
+    pub music_progress_secs: Option<f64>,
 }
 
 impl UserPrefs {
@@ -151,6 +157,19 @@ impl UserPrefs {
                 prefs.music_dir = Some(s.clone());
             }
         }
+        if let Some(Value::Number(n)) = map.get("music_volume")
+            && let Some(v) = n.as_f64()
+        {
+            prefs.music_volume = Some(v as f32);
+        }
+        if let Some(Value::String(s)) = map.get("music_last_track") {
+            if !s.is_empty() {
+                prefs.music_last_track = Some(s.clone());
+            }
+        }
+        if let Some(Value::Number(n)) = map.get("music_progress_secs") {
+            prefs.music_progress_secs = n.as_f64();
+        }
         // 最近打开（文件夹 / 文件）：读取字符串数组，非数组 / 缺省 → 空；
         // 元素非字符串跳过；截断至 RECENT_MAX（安全护栏，防手改配置超长）。
         prefs.recent_folders = Self::read_string_array(map, "recent_folders");
@@ -183,6 +202,9 @@ impl UserPrefs {
             "recent_files": self.recent_files,
             "music_dir": self.music_dir,
             "music_liked": self.music_liked,
+            "music_volume": self.music_volume,
+            "music_last_track": self.music_last_track,
+            "music_progress_secs": self.music_progress_secs,
         })
     }
 
@@ -257,6 +279,9 @@ mod tests {
             recent_files: Vec::new(),
             music_dir: None,
             music_liked: Vec::new(),
+            music_volume: None,
+            music_last_track: None,
+            music_progress_secs: None,
         };
         let back = UserPrefs::from_json_value(&p.to_json_value());
         assert_eq!(back.session_restore, Some(false));
@@ -400,16 +425,24 @@ mod tests {
     }
 
     /// 音乐播放器字段 roundtrip：music_dir（None = 未设置 / 空串回退 None；Some 写入并
-    /// 读回）、music_liked（字符串数组，非数组/缺省 → 空）。走纯函数，不触碰真实配置。
+    /// 读回）、music_liked（字符串数组，非数组/缺省 → 空）、music_volume / music_last_track /
+    /// music_progress_secs（None = 未设置；Some 写入并读回；非法值回退 None）。走纯函数，
+    /// 不触碰真实配置。
     #[test]
     fn music_prefs_json_roundtrip() {
         // None / 缺省：JSON 值为 null、读回 None；music_liked 空数组。
         let v = UserPrefs::default().to_json_value();
         assert_eq!(v["music_dir"], Value::Null);
         assert_eq!(v["music_liked"], serde_json::json!([]));
+        assert_eq!(v["music_volume"], Value::Null);
+        assert_eq!(v["music_last_track"], Value::Null);
+        assert_eq!(v["music_progress_secs"], Value::Null);
         let back = UserPrefs::from_json_value(&v);
         assert_eq!(back.music_dir, None);
         assert!(back.music_liked.is_empty());
+        assert_eq!(back.music_volume, None);
+        assert_eq!(back.music_last_track, None);
+        assert_eq!(back.music_progress_secs, None);
 
         // Some(路径) 与收藏 roundtrip（其余字段不受影响）。
         let p = UserPrefs {
@@ -418,6 +451,9 @@ mod tests {
                 "D:\\music\\music\\周杰伦 - 晴天.ogg".to_string(),
                 "D:\\music\\music\\林俊杰 - 江南.mp3".to_string(),
             ],
+            music_volume: Some(0.42),
+            music_last_track: Some("D:\\music\\music\\林俊杰 - 江南.mp3".to_string()),
+            music_progress_secs: Some(123.25),
             ..UserPrefs::default()
         };
         let back = UserPrefs::from_json_value(&p.to_json_value());
@@ -427,15 +463,38 @@ mod tests {
             p.music_liked,
             "音乐收藏应 roundtrip 且保持顺序"
         );
+        assert_eq!(back.music_volume, Some(0.42), "音量应 roundtrip");
+        assert_eq!(
+            back.music_last_track.as_deref(),
+            Some("D:\\music\\music\\林俊杰 - 江南.mp3"),
+            "上次曲目应 roundtrip"
+        );
+        assert_eq!(back.music_progress_secs, Some(123.25), "播放进度应 roundtrip");
         assert_eq!(back.theme, ThemePref::Follow, "其余字段不受影响");
 
-        // 非法值：music_dir 空串 / 非字符串 → None；music_liked 非数组 → 空。
+        // 非法值：music_dir 空串 / 非字符串 → None；music_liked 非数组 → 空；
+        // music_volume 非数字 → None（数字原样存，越界由播放器 set_volume clamp）；
+        // music_last_track 空串 / 非字符串 → None；music_progress_secs 非数字 → None。
         let v = serde_json::json!({ "music_dir": "" });
         assert_eq!(UserPrefs::from_json_value(&v).music_dir, None);
         let v = serde_json::json!({ "music_dir": 42 });
         assert_eq!(UserPrefs::from_json_value(&v).music_dir, None);
         let v = serde_json::json!({ "music_liked": "x" });
         assert!(UserPrefs::from_json_value(&v).music_liked.is_empty());
+        let v = serde_json::json!({ "music_volume": "loud" });
+        assert_eq!(UserPrefs::from_json_value(&v).music_volume, None);
+        let v = serde_json::json!({ "music_volume": 5.0 });
+        assert_eq!(
+            UserPrefs::from_json_value(&v).music_volume,
+            Some(5.0),
+            "音量越界数字仍原样存（player 侧 clamp）"
+        );
+        let v = serde_json::json!({ "music_last_track": "" });
+        assert_eq!(UserPrefs::from_json_value(&v).music_last_track, None);
+        let v = serde_json::json!({ "music_last_track": 42 });
+        assert_eq!(UserPrefs::from_json_value(&v).music_last_track, None);
+        let v = serde_json::json!({ "music_progress_secs": "mid" });
+        assert_eq!(UserPrefs::from_json_value(&v).music_progress_secs, None);
         let back = UserPrefs::from_json_value(&Value::Null);
         assert_eq!(back.music_dir, None);
         assert!(back.music_liked.is_empty());

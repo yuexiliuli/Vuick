@@ -250,6 +250,9 @@ impl EditorApp {
             recent_files: self.recent_files.clone(),
             music_dir: existing.music_dir,
             music_liked: existing.music_liked,
+            music_volume: existing.music_volume,
+            music_last_track: existing.music_last_track,
+            music_progress_secs: existing.music_progress_secs,
         }
         .save();
     }

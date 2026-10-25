@@ -446,6 +446,9 @@ impl MusicView {
     /// 树稳态不 notify → 0 整树重绘；仅 fs 打开（进度/时间/整块仍在父内）才父按拍重绘。
     fn on_tick(&mut self, cx: &mut Context<Self>) {
         self.player.update(cx, |p, cx| p.tick(cx));
+        // 播放中周期持久化（位置 → 偏好 + flush）：每 ~5s 一次「脏则 flush」，防抖合并
+        // 防逐帧写盘（K11）。事件驱动点（暂停/停止/seek/切歌/Esc 退出）已即时落盘。
+        self.player.update(cx, |p, cx| p.persist_progress_periodic(cx));
         // 封面懒加载 + 库预取：每拍扫描库缺失封面的曲目派解码任务（幂等；58 首每 250ms
         // 查 HashSet 开销可忽略）。不用一次性 latch——「库晚于首次 tick 才 load / 事后放图」
         // 时旧实现预取空转 + latch 卡死，封面永不呈现（K29 类）。
@@ -617,6 +620,9 @@ impl MusicView {
                     self.state.fs_open = false;
                     cx.notify();
                 } else {
+                    // 退出音乐模式：把当前播放位置写入偏好并 flush（Esc 退出是一致性落盘点；
+                    // Ctrl+M 退出由 on_tick 周期 flush ≤5s 兜底）。
+                    self.player.update(cx, |p, _| p.save_progress_and_flush());
                     cx.emit(MusicEvent::ExitRequested);
                 }
             }
@@ -642,14 +648,27 @@ impl MusicView {
 
     /// 载入默认音乐目录（shell 集成入口）：先读 `UserPrefs::music_dir`（未设置/空 →
     /// [`config::limits::DEFAULT_MUSIC_DIR`] 兜底），随后 `MusicPlayer::load_dir`。
-    /// 目录不存在/为空 → 库为空（UI 显示空态），不报错。
+    /// 同时把上次音乐偏好接线进播放器（音量 → 立即应用；上次曲目/进度 → 首个库装配后
+    /// 恢复选中，不自动播放）。目录不存在/为空 → 库为空（UI 显示空态），不报错。
+    /// 仅「首次打开音乐模式」经 shell 的 `dir().is_none()` 守卫调用一次——恢复天然只执行一次。
     pub fn load_default_dir(&mut self, cx: &mut Context<Self>) {
-        let dir = config::user::UserPrefs::load()
+        // music 自身测试构建不读真实配置（config 依赖编译不受其 cfg!(test) 门控 → 这里按
+        // 本 crate 测试态屏蔽，防读真实 `%APPDATA%` 配置污染测试，K8）。
+        let prefs = if cfg!(test) {
+            config::user::UserPrefs::default()
+        } else {
+            config::user::UserPrefs::load()
+        };
+        let dir = prefs
             .music_dir
+            .clone()
             .filter(|d| !d.is_empty())
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(config::limits::DEFAULT_MUSIC_DIR));
-        self.player.update(cx, |p, cx| p.load_dir(dir, cx));
+        self.player.update(cx, |p, cx| {
+            p.apply_saved_prefs(&prefs, cx);
+            p.load_dir(dir, cx);
+        });
     }
 
     // ---- 播放器接线（view → player，均极薄转发） ----
