@@ -125,6 +125,8 @@ impl EditorApp {
             search_scope_manual: false,
             folder_search: None,
             folder_search_gen: 0,
+            quick_open_gen: 0,
+            goto_line_toast_key: None,
             search_scan_count: 0,
             search_committed: String::new(),
             search_pending: String::new(),

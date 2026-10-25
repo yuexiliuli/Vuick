@@ -125,6 +125,14 @@ pub const TOGGLE_COMMAND_PALETTE: Command = Command {
     key: "ctrl-shift-p",
     ctx: BindingCtx::Root,
 };
+pub const GOTO_LINE: Command = Command {
+    id: "goto-line",
+    label: "跳转到行",
+    menu_label: "跳转到行",
+    shortcut: "Ctrl+G",
+    key: "ctrl-g",
+    ctx: BindingCtx::Root,
+};
 /// 根级：查看/设置命令。
 pub const TOGGLE_MUSIC_PLAYER: Command = Command {
     id: "toggle-music-player",
@@ -252,8 +260,8 @@ pub const THEME: Command = Command {
 /// 全部命令（表投影源；测试/文档用）。菜单与面板按各自结构引用其中部分常量。
 pub const ALL_COMMANDS: &[Command] = &[
     NEW_FILE, OPEN_FILE, OPEN_FOLDER, SAVE, SAVE_AS, QUIT, CLOSE_TAB, QUICK_OPEN,
-    TOGGLE_COMMAND_PALETTE, TOGGLE_MUSIC_PLAYER, TOGGLE_WRAP, INCREASE_FONT, DECREASE_FONT,
-    RESET_FONT, FOLLOW_THEME, UNDO, REDO, CUT, COPY, PASTE, SELECT_ALL, PREVIEW,
+    TOGGLE_COMMAND_PALETTE, GOTO_LINE, TOGGLE_MUSIC_PLAYER, TOGGLE_WRAP, INCREASE_FONT,
+    DECREASE_FONT, RESET_FONT, FOLLOW_THEME, UNDO, REDO, CUT, COPY, PASTE, SELECT_ALL, PREVIEW,
     TOGGLE_SIDEBAR, THEME,
 ];
 
@@ -270,6 +278,7 @@ pub fn root_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new(CLOSE_TAB.key, CloseTab, None),
         KeyBinding::new(QUICK_OPEN.key, QuickOpenFile, None),
         KeyBinding::new(TOGGLE_COMMAND_PALETTE.key, ToggleCommandPalette, None),
+        KeyBinding::new(GOTO_LINE.key, GoToLine, None),
         KeyBinding::new(TOGGLE_MUSIC_PLAYER.key, ToggleMusicPlayer, None),
         KeyBinding::new(TOGGLE_WRAP.key, ToggleWordWrap, None),
         KeyBinding::new(INCREASE_FONT.key, IncreaseFontSize, None),
@@ -312,6 +321,7 @@ mod tests {
             ("ctrl-w".into(), "editor_app::CloseTab".into()),
             ("ctrl-p".into(), "editor_app::QuickOpenFile".into()),
             ("ctrl-shift-p".into(), "editor_app::ToggleCommandPalette".into()),
+            ("ctrl-g".into(), "editor_app::GoToLine".into()),
             ("ctrl-m".into(), "editor_app::ToggleMusicPlayer".into()),
             ("ctrl-alt-w".into(), "editor_app::ToggleWordWrap".into()),
             ("ctrl-=".into(), "editor_app::IncreaseFontSize".into()),

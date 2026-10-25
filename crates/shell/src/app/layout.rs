@@ -416,6 +416,11 @@ impl EditorApp {
                     this.quick_open_file(window, cx);
                 }),
             )
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &GoToLine, window, cx| {
+                    this.toggle_goto_line(window, cx);
+                }),
+            )
             // 音乐播放器：Ctrl+M 切换整窗音乐模式（同 music 模式壳 div 的 on_action 并存，
             // 见 `render` 顶部音乐模式分支——任一命中都走 `toggle_music_player`）。
             .on_action(

@@ -488,3 +488,819 @@
         );
     }
 
+    // ---------------------------------------------------------------------
+    // 命令面板闭环：GoToLine（Ctrl+G）+ quick open 模糊文件检索（Ctrl+P）
+    // ---------------------------------------------------------------------
+
+    use crate::actions::GoToLine;
+    use crate::app::palette::{
+        parse_goto, quick_open_collect, QUICK_OPEN_MAX_FILE_BYTES, QUICK_OPEN_MAX_FILES,
+    };
+
+    /// GoToLine 词法解析（纯函数）：行[:列]（1 基）；非法 → None。
+    #[test]
+    fn goto_parse_rules() {
+        assert_eq!(parse_goto("42"), Some((42, None)));
+        assert_eq!(parse_goto("42:7"), Some((42, Some(7))));
+        assert_eq!(parse_goto(" 42 : 7 "), Some((42, Some(7))));
+        assert_eq!(parse_goto("0"), Some((0, None)));
+        assert_eq!(parse_goto("-3"), Some((-3, None)));
+        assert_eq!(parse_goto("abc"), None);
+        assert_eq!(parse_goto("42:7:9"), None, "多个冒号应非法");
+        assert_eq!(parse_goto("42:"), None, "空列应非法");
+        assert_eq!(parse_goto(""), None, "空字符串应非法");
+        assert_eq!(parse_goto(":"), None);
+        assert_eq!(parse_goto("42:x"), None);
+    }
+
+    /// 测试辅助：泵后台 quick open 扫描直到完成（轮询上限内未完成 → panic 防死循环）。
+    fn qo_wait_scan(app: &gpui::Entity<EditorApp>, cx: &mut VisualTestContext) {
+        for _ in 0..600 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let done = cx.update(|_w, cx| {
+                app.read(cx)
+                    .palette
+                    .as_ref()
+                    .map(|p| !p.read(cx).scanning())
+                    .unwrap_or(true)
+            });
+            if done {
+                return;
+            }
+        }
+        panic!("quick open 扫描未在轮询上限内完成");
+    }
+
+    /// GoToLine「42」：Ctrl+G 打开（输入框自动聚焦）→ 键入 42 + Enter →
+    /// 跳到第 42 行（0 基 41）、光标置行首、滚动可见、面板关闭、焦点归还编辑区。
+    #[gpui::test]
+    async fn goto_line_open_jump_and_close(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("goto-line-{}.txt", std::process::id()));
+        let mut lines: Vec<String> = (0..60).map(|i| format!("line-{i}")).collect();
+        lines[41] = "abcdefg".to_string();
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 聚焦编辑区后 Ctrl+G → GoToLine 面板打开，输入框持有焦点。
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        let (mode, sel, input_focused) = cx.update(|window, cx| {
+            let p = palette.read(cx);
+            (
+                p.mode(),
+                p.selected(),
+                window.focused(cx) == Some(p.input_handle(cx)),
+            )
+        });
+        assert_eq!(mode, ui::palette::PaletteMode::GotoLine, "Ctrl+G 应为跳转行模式");
+        assert_eq!(sel, Some(0), "单条目应恒选中");
+        assert!(input_focused, "打开时输入框应自动聚焦");
+
+        // 键入 42 + Enter → 跳到第 42 行（0 基 41）行首，滚动可见，面板关闭，焦点归还。
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("42", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let label = cx.update(|_w, cx| {
+            palette.read(cx).visible_label(0).map(str::to_string)
+        });
+        assert_eq!(label.as_deref(), Some("42"), "单条目 label 应实时跟随输入");
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (closed, pos, top) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let ed = a.tabs[a.active_tab].editor.read(cx);
+            (a.palette.is_none(), ed.cursor_position(), ed.viewport_top_line())
+        });
+        assert!(closed, "Enter 跳转后面板应关闭");
+        assert_eq!(pos, (41, 0), "「42」应跳到第 42 行行首，实际 {pos:?}");
+        // 滚动可见：目标行在视口内（非视口之上，且已离开顶部说明确实滚动了）。
+        assert!(
+            top > 0 && top <= 41,
+            "第 42 行应滚动进视口顶部之下：viewport_top={top}"
+        );
+        let focused = cx.update(|window, cx| window.focused(cx));
+        let expected = cx.update(|_w, cx| app.read(cx).editor_focus_handle(cx));
+        assert_eq!(
+            focused.as_ref(),
+            Some(&expected),
+            "跳转后焦点应归还编辑区"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// GoToLine「行:列」与 clamp：42:7 → (41,6)；42:999 列超宽 → 钳到行宽；(41,7)；
+    /// 9999 超行数 → 末行；0 / 负数 → 首行。超限均带 toast 提示。
+    #[gpui::test]
+    async fn goto_line_col_and_clamping(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("goto-line-clamp-{}.txt", std::process::id()));
+        let mut lines: Vec<String> = (0..60).map(|i| format!("line-{i}")).collect();
+        lines[41] = "abcdefg".to_string();
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+
+        // 42:7 → (41, 6)（均 1 基转 0 基）。
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("42:7", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pos1 = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].editor.read(cx).cursor_position()
+        });
+        assert_eq!(pos1, (41, 6), "42:7 应跳到 0 基 (41,6)，实际 {pos1:?}");
+
+        // 42:999 列超行宽（行宽 7）→ 钳到行尾 (41,7)（静默，不 toast，同 VSCode）。
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("42:999", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pos2 = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].editor.read(cx).cursor_position()
+        });
+        assert_eq!(pos2, (41, 7), "列超宽应钳到行宽，实际 {pos2:?}");
+
+        // 9999 超行数（60 行）→ 末行 60（0 基 59）行首 + 已钳制 toast。
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("9999", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pos3 = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].editor.read(cx).cursor_position()
+        });
+        assert_eq!(pos3, (59, 0), "超行数应钳到末行，实际 {pos3:?}");
+        let row_clamp_toast = cx.update(|_w, cx| {
+            app.read(cx)
+                .notifications
+                .iter()
+                .any(|n| n.message_str().contains("已钳制"))
+        });
+        assert!(row_clamp_toast, "超行数应 toast 提示已钳制");
+
+        // 0 → 首行 (0,0)。
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("0", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pos4 = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].editor.read(cx).cursor_position()
+        });
+        assert_eq!(pos4, (0, 0), "0 应钳到首行，实际 {pos4:?}");
+
+        // -5 → 首行 (0,0)。
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("-5", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (pos5, closed) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let p5 = a.tabs[a.active_tab].editor.read(cx).cursor_position();
+            (p5, a.palette.is_none())
+        });
+        assert_eq!(pos5, (0, 0), "负数应钳到首行，实际 {pos5:?}");
+        assert!(closed, "钳制后面板仍应关闭");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// GoToLine：空输入 / 非数字 → 无跳转、面板关闭（不崩）；非法输入 toast「不是有效行号」；
+    /// 非文本选项卡（图片阅读器）→ toast「当前选项卡不支持跳转行」。
+    #[gpui::test]
+    async fn goto_line_invalid_and_non_text(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("goto-line-inv-{}.txt", std::process::id()));
+        std::fs::write(&p, "a\nb\nc\nd\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+
+        // ① 非数字（文本选项卡）+ Enter → 无跳转、面板关闭、toast「不是有效行号」。
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("abc", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (closed1, invalid_toast) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.palette.is_none(),
+                a.notifications
+                    .iter()
+                    .any(|n| n.message_str().contains("不是有效行号")),
+            )
+        });
+        assert!(closed1, "非法输入后面板应关闭（不崩）");
+        assert!(invalid_toast, "非法输入应 toast「不是有效行号」");
+
+        // ② 空输入（文本选项卡）+ Enter → 无跳转、面板关闭、不 toast。
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let closed2 = cx.update(|_w, cx| app.read(cx).palette.is_none());
+        assert!(closed2, "空输入后面板应关闭");
+
+        // ③ 把活动选项卡「换成」图片阅读器（模拟打开图片：非文本）→ Enter 只 toast。
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                let viewer =
+                    cx.new(|cx| image_viewer::ImageViewer::new(std::path::PathBuf::from("___"), cx));
+                app.tabs[app.active_tab].reader = MediaReader::Image(viewer);
+            });
+        });
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("3", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (closed3, unsupported) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.palette.is_none(),
+                a.notifications
+                    .iter()
+                    .any(|n| n.message_str().contains("不支持跳转行")),
+            )
+        });
+        assert!(closed3, "非文本选项卡 Enter 后面板应关闭（不崩）");
+        assert!(unsupported, "非文本应 toast「当前选项卡不支持跳转行」");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// GoToLine 空文档：任何行号 → 不跳转、不发「已钳制」误导 toast、面板照常关闭。
+    #[gpui::test]
+    async fn goto_line_empty_doc_silent_no_misleading_toast(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("goto-line-empty-{}.txt", std::process::id()));
+        std::fs::write(&p, "").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(GoToLine);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("5", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (closed, clamped_toast) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.palette.is_none(),
+                a.notifications
+                    .iter()
+                    .any(|n| n.message_str().contains("已钳制")),
+            )
+        });
+        assert!(closed, "空文档 Enter 后面板应关闭（不崩）");
+        assert!(!clamped_toast, "空文档不应发「已钳制」误导 toast");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// quick open：无打开文件夹 → 面板提示「请先打开文件夹…」，仍列出已打开文件与
+    /// 「打开文件…」入口；不触发后台扫描（scanning 恒 false）。
+    #[gpui::test]
+    async fn quick_open_no_folder_shows_notice(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 确保无已打开文件夹（K8：真实 config 可能带 restored folder）。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, _| a.sidebar.files.set_root(None));
+        });
+        let pa = std::env::temp_dir().join(format!("gpui-qq-a-{}.txt", std::process::id()));
+        std::fs::write(&pa, "A").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(pa.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(QuickOpenFile);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        let (mode, notice, scanning, n, has_dialog) = cx.update(|_w, cx| {
+            let p = palette.read(cx);
+            let mut has_dialog = false;
+            for i in 0..p.visible_len() {
+                if p.visible_label(i) == Some("打开文件…") {
+                    has_dialog = true;
+                }
+            }
+            (
+                p.mode(),
+                p.notice().to_string(),
+                p.scanning(),
+                p.visible_len(),
+                has_dialog,
+            )
+        });
+        assert_eq!(mode, ui::palette::PaletteMode::Files);
+        assert!(
+            notice.contains("请先打开文件夹"),
+            "无文件夹应提示「请先打开文件夹…」，实际 {notice:?}"
+        );
+        assert!(!scanning, "无文件夹不应触发后台扫描");
+        assert!(n >= 2, "应列出已打开文件 + 打开文件…入口，实际 {n}");
+        assert!(has_dialog, "应保留「打开文件…」入口");
+        let _ = std::fs::remove_file(&pa);
+    }
+
+    /// quick open：递归检索 + 跳过清单 + 路径兜底模糊 + 回车直接打开。
+    /// 目录结构：a_top.rs / sub/b_nested.md / sub/deep/c_leaf.txt，
+    /// 跳过 target/skip_rs / .git/x.rs / node_modules/y.rs / pic.png / huge.txt(>5MB)。
+    #[gpui::test]
+    async fn quick_open_scan_filter_and_open(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let base = std::env::temp_dir().join(format!("gpui-qq-dir-{}", std::process::id()));
+        let sub = base.join("sub");
+        let deep = sub.join("deep");
+        let target = base.join("target");
+        let git = base.join(".git");
+        let nm = base.join("node_modules");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(base.join("a_top.rs"), "fn a() {}").unwrap();
+        std::fs::write(sub.join("b_nested.md"), "# B").unwrap();
+        std::fs::write(deep.join("c_leaf.txt"), "c").unwrap();
+        std::fs::write(target.join("skip_me.rs"), "fn skip() {}").unwrap();
+        std::fs::write(git.join("x.rs"), "fn x() {}").unwrap();
+        std::fs::write(nm.join("y.rs"), "fn y() {}").unwrap();
+        std::fs::write(base.join("pic.png"), [0u8; 8]).unwrap();
+        std::fs::write(
+            base.join("huge.txt"),
+            vec![b'x'; (QUICK_OPEN_MAX_FILE_BYTES as usize) + 1024],
+        )
+        .unwrap();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(base.clone(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 关掉侧边栏展开并不影响 quick open（根已设好即可）。
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(QuickOpenFile);
+        // 小目录在调度内即可扫完——不做「瞬时 scanning==true」竞态断言（headless 下
+        // 不保证可观察到）；空态文案区分由 `ui::palette::files_empty_text` 单测覆盖。
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        qo_wait_scan(&app, cx);
+        assert!(
+            cx.update(|_w, cx| !palette.read(cx).scanning()),
+            "扫描完成后 scanning 应复位"
+        );
+
+        // 递归命中：过滤 b_nested → 只应命中 sub/b_nested.md（basename 前缀）。
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("b_nested", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (len, label, detail) = cx.update(|_w, cx| {
+            let p = palette.read(cx);
+            (
+                p.visible_len(),
+                p.visible_label(0).map(str::to_string),
+                p.visible_detail(0).map(str::to_string),
+            )
+        });
+        assert_eq!(len, 1, "递归命中 b_nested 应唯一，实际 {len}");
+        assert_eq!(label.as_deref(), Some("b_nested.md"), "label 应为文件名");
+        assert!(
+            detail.as_deref().unwrap_or("").contains("sub"),
+            "detail 应为相对路径，实际 {detail:?}"
+        );
+
+        // 跳过清单验证：这些名字在任何过滤下都不出现。
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("skip_me", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| palette.read(cx).visible_len()),
+            0,
+            "target/ 下的文件应被跳过清单排除"
+        );
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("pic", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| palette.read(cx).visible_len()),
+            0,
+            "二进制扩展名应被跳过"
+        );
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("huge", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| palette.read(cx).visible_len()),
+            0,
+            "超大文件应被跳过"
+        );
+
+        // 路径兜底模糊：query「deep」只命中相对路径 sub/deep/c_leaf.txt（basename 无 deep）。
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("deep", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (len_d, label_d) = cx.update(|_w, cx| {
+            let p = palette.read(cx);
+            (p.visible_len(), p.visible_label(0).map(str::to_string))
+        });
+        assert_eq!(len_d, 1, "路径兜底应命中 c_leaf，实际 {len_d}");
+        assert_eq!(label_d.as_deref(), Some("c_leaf.txt"));
+
+        // 回车打开候选 → 复用 file_ops 打开（新选项卡），面板关闭。
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("a_top", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes("enter");
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let (closed, opened_path) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let has = a
+                .tabs
+                .iter()
+                .any(|t| t.file_path.as_deref() == Some(base.join("a_top.rs").as_path()));
+            (a.palette.is_none(), has)
+        });
+        assert!(closed, "回车打开候选后面板应关闭");
+        assert!(opened_path, "应复用 file_ops 打开 a_top.rs");
+
+        // 已打开文件不重复列为候选：重开 Ctrl+P 过滤 a_top → 只应有 1 行（已打开条目，
+        // 不叠加同名候选）。
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(QuickOpenFile);
+        let palette2 = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        qo_wait_scan(&app, cx);
+        cx.update(|window, cx| {
+            let input = palette2.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("a_top", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let deduped = cx.update(|_w, cx| palette2.read(cx).visible_len());
+        assert_eq!(deduped, 1, "已打开文件不得重复列为候选，实际 {deduped}");
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// quick open：换工作区 → 代际丢弃，不串库（旧根文件不再出现）。
+    #[gpui::test]
+    async fn quick_open_generation_discards_on_folder_switch(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir_a = std::env::temp_dir().join(format!("gpui-qq-ga-{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("gpui-qq-gb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("a_only.rs"), "a").unwrap();
+        std::fs::write(dir_b.join("b_only.rs"), "b").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(dir_a.clone(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(QuickOpenFile);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        qo_wait_scan(&app, cx);
+        // 旧根可命中。
+        cx.update(|window, cx| {
+            let p = app.read(cx).palette.as_ref().unwrap().clone();
+            let input = p.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("a_only", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| app
+                .read(cx)
+                .palette
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .visible_len()),
+            1,
+            "旧根 a_only 应命中"
+        );
+        // Esc → 换另一个工作区 → 再 Ctrl+P：只出新根文件，旧根不复现（代际丢弃）。
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(dir_b.clone(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.dispatch_action(QuickOpenFile);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        qo_wait_scan(&app, cx);
+        cx.update(|window, cx| {
+            let p = app.read(cx).palette.as_ref().unwrap().clone();
+            let input = p.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("b_only", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (hits_b, hits_a) = cx.update(|_w, cx| {
+            let p = app.read(cx).palette.as_ref().unwrap().read(cx);
+            let mut hb = 0;
+            let mut ha = 0;
+            for i in 0..p.visible_len() {
+                if p.visible_label(i) == Some("b_only.rs") {
+                    hb += 1;
+                }
+                if p.visible_label(i) == Some("a_only.rs") {
+                    ha += 1;
+                }
+            }
+            (hb, ha)
+        });
+        assert_eq!(hits_b, 1, "新根 b_only 应命中");
+        assert_eq!(hits_a, 0, "换根后旧根 a_only 不得残留（代际丢弃）");
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_b).ok();
+    }
+
+    /// quick open 纯函数：候选上限 500 截断；黑名单扩展名 / 超大 / 黑名单目录不入候选。
+    #[test]
+    fn quick_open_collect_caps_and_skip_list() {
+        let base = std::env::temp_dir().join(format!("gpui-qq-unit-{}", std::process::id()));
+        let sub = base.join("sub");
+        let target = base.join("target");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        // 500 个候选 + 超上限若干。
+        for i in 0..530 {
+            std::fs::write(sub.join(format!("f{i:04}.txt")), "x").unwrap();
+        }
+        std::fs::write(base.join("pic.png"), [0u8; 4]).unwrap();
+        std::fs::write(base.join("big.bin"), [0u8; 4]).unwrap();
+        std::fs::write(
+            base.join("huge.txt"),
+            vec![b'x'; (QUICK_OPEN_MAX_FILE_BYTES as usize) + 1],
+        )
+        .unwrap();
+        std::fs::write(target.join("skip_me.rs"), "fn s() {}").unwrap();
+        let sess = std::env::temp_dir().join("gpui-qq-session");
+
+        let mut out = Vec::new();
+        quick_open_collect(&base, &sess, &mut out);
+        assert_eq!(out.len(), QUICK_OPEN_MAX_FILES, "候选应截断到 500");
+        assert!(
+            out.iter().all(|(p, _)| p != &base.join("pic.png")
+                && p != &base.join("big.bin")
+                && p != &base.join("huge.txt")
+                && p != &target.join("skip_me.rs")),
+            "二进制/超大/黑名单目录文件不得入候选"
+        );
+        // 全部候选都在 base 根下（相对路径非空）。
+        assert!(out.iter().all(|(_, rel)| !rel.is_empty()));
+        // 目录读失败不 panic：传给不存在的根。
+        let mut out2 = Vec::new();
+        quick_open_collect(&base.join("不存在"), &sess, &mut out2);
+        assert!(out2.is_empty(), "不存在的根应空返回不 panic");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+

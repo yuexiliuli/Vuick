@@ -13,6 +13,7 @@ use crate::commands::{
     PASTE, PREVIEW, QUIT, REDO, RESET_FONT, SAVE, SAVE_AS, SELECT_ALL, THEME, TOGGLE_SIDEBAR,
     TOGGLE_WRAP, UNDO,
 };
+use ui::notification::{Notification, NotificationKind};
 use ui::palette::{CommandPalette, PaletteItem, PaletteMode};
 
 impl EditorApp {
@@ -27,29 +28,156 @@ impl EditorApp {
             return;
         }
         let items = self.command_palette_items(cx);
-        self.open_palette(PaletteMode::Commands, items, window, cx);
+        self.open_palette(PaletteMode::Commands, items, window, cx, "");
     }
 
-    /// 文件模式（Ctrl+P）：打开文件快选（已打开文件 + 「打开文件…」系统对话框入口）。
+    /// 文件模式（Ctrl+P）：打开文件快选（已打开文件 + 「打开文件…」系统对话框入口 +
+    /// 当前工作区递归候选）。有打开文件夹 → 后台分块扫描候选（主线程零同步读盘），
+    /// 扫描未完成先显示已打开文件，完成后一次 `set_items` 刷新；无打开文件夹 →
+    /// 面板内提示「请先打开文件夹…」，仍保留已打开文件与对话框条目。
     pub(super) fn quick_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
             self.close_palette(window, cx);
             return;
         }
+        let root = self.sidebar.files.root.clone();
         let items = self.file_palette_items(cx);
-        self.open_palette(PaletteMode::Files, items, window, cx);
+        let notice = if root.is_some() {
+            ""
+        } else {
+            "请先打开文件夹（文件 → 打开文件夹）"
+        };
+        self.open_palette(PaletteMode::Files, items, window, cx, notice);
+        if let Some(root) = root {
+            self.start_quick_open_scan(root, window, cx);
+        }
+    }
+
+    /// 跳转行模式（Ctrl+G）：打开 GoToLine 面板（未打开则开、已打开则关）。
+    pub(super) fn toggle_goto_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+            return;
+        }
+        let items = vec![self.goto_line_item(cx)];
+        self.open_palette(PaletteMode::GotoLine, items, window, cx, "");
+    }
+
+    /// GoToLine 面板的唯一候选条目：label 随输入实时改写（面板 GotoLine 模式内建），
+    /// 确认时经 `new_with_query` 把当前查询词带出提交跳转——复用既有 activate 路径，
+    /// 不新增平行提交通道；运行器也不得 `read` 面板实体（其自身 update 中会 panic）。
+    fn goto_line_item(&self, cx: &Context<Self>) -> PaletteItem {
+        let weak = cx.weak_entity();
+        let w = weak.clone();
+        PaletteItem::new_with_query(
+            "输入跳转行号（可 行:列）…",
+            "跳转到行",
+            "Ctrl+G",
+            move |q, _window, cx| {
+                let _ = w.update(cx, |this, cx| this.goto_line_submit(q, cx));
+            },
+        )
+    }
+
+    /// 执行 GoToLine 跳转：解析「行[:列]」→ clamp → 光标落位 + 滚动可见。
+    /// 空输入 / 非法格式 / 非文本选项卡 / 无活动选项卡 → 无跳转、面板照常关闭（不崩）。
+    fn goto_line_submit(&mut self, input: &str, cx: &mut Context<Self>) {
+        let trimmed = input.trim();
+        // 先克隆编辑器句柄，随后不再借用 self.tabs（避免与「self 可变调用」冲突）。
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return; // 零选项卡欢迎页：无活动选项卡 → 静默关闭
+        };
+        let ed = tab.editor.clone();
+        // 非文本选项卡（PDF/图片/视频/EPUB；音乐整窗模式同样无文本跳转语义）。
+        if self.music_mode || tab.reader.is_reader() || tab.readonly_preview {
+            self.goto_line_toast("当前选项卡不支持跳转行");
+            cx.notify();
+            return;
+        }
+        if trimmed.is_empty() {
+            return; // 空输入：无跳转、面板关闭（不 toast，不崩）
+        }
+        let Some((row1, col1)) = parse_goto(trimmed) else {
+            self.goto_line_toast("不是有效行号：请输入「行」或「行:列」");
+            cx.notify();
+            return;
+        };
+        let line_count = ed.read(cx).line_count();
+        // 空文档 / 大文档后台打开尚未挂载 → 跳过定位（不崩；也不发「已钳制」误导确认，
+        // 因为跳转实际不会发生）。
+        if ed.read(cx).char_count() == 0 {
+            return;
+        }
+        // clamp：0/负数 → 1；超行数 → 末行；列 < 1 → 1（列超行宽由 offset_for_line_col 钳制）。
+        let mut clamped = false;
+        let row1 = if row1 < 1 {
+            clamped = true;
+            1
+        } else if row1 as usize > line_count {
+            clamped = true;
+            line_count
+        } else {
+            row1 as usize
+        };
+        let col1 = match col1 {
+            Some(c) if c < 1 => {
+                clamped = true;
+                1
+            }
+            Some(c) => c as usize,
+            None => 1,
+        };
+        if clamped {
+            self.goto_line_toast(&format!("已钳制跳转位置：第 {row1} 行 第 {col1} 列"));
+        }
+        ed.update(cx, |ed, cx| {
+            let row0 = row1 - 1;
+            let col0 = col1 - 1;
+            let offset = ed.offset_for_line_col(row0, col0);
+            ed.scroll_to_line(row0);
+            ed.set_selection_range(offset..offset, cx);
+        });
+        cx.notify();
+    }
+
+    /// GoToLine 提示（进入 toast，替换上一条同款提示，不堆积）。
+    fn goto_line_toast(&mut self, msg: &str) {
+        // 先移除上一条（自持 key，只在跳转行路径使用）。
+        if let Some(key) = self.goto_line_toast_key.take() {
+            self.remove_notification1::<GotoLineToast>(key);
+        }
+        let key = gpui::ElementId::from(SharedString::from(format!(
+            "goto-line-toast-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )));
+        self.goto_line_toast_key = Some(key.clone());
+        self.push_notification(
+            Notification::new()
+                .id1::<GotoLineToast>(key)
+                .title("跳转到行")
+                .message(msg)
+                .with_type(NotificationKind::Error),
+        );
     }
 
     /// 创建面板实体 + 聚焦查询框 + 订阅关闭（关闭即清引用；与新开面板同生命周期）。
+    /// `notice`：面板提示行文案（空 = 不显示；文件模式未打开文件夹时给出引导）。
     fn open_palette(
         &mut self,
         mode: PaletteMode,
         items: Vec<PaletteItem>,
         window: &mut Window,
         cx: &mut Context<Self>,
+        notice: &str,
     ) {
         let previous_focus = window.focused(cx);
         let palette = cx.new(|cx| CommandPalette::new(window, cx, mode, items, previous_focus));
+        if !notice.is_empty() {
+            palette.update(cx, |p, _| p.set_notice(notice));
+        }
         let sub = cx.subscribe(&palette, |this, _e, _: &DismissEvent, cx| {
             // 面板自关（选择/Esc/点击外）→ 清空持有引用，实体随之释放。
             this.palette = None;
@@ -158,8 +286,15 @@ impl EditorApp {
     /// 复用侧边栏搜索的「文件名匹配 + 点击激活选项卡」语义（`sidebar_search_file_rows`），
     /// 但只列**已打开文件**，不做全文检索（那是侧栏搜索的职责）；过滤走面板过滤。
     fn file_palette_items(&self, cx: &Context<Self>) -> Vec<PaletteItem> {
+        let mut items = self.file_palette_opened_items(cx);
+        items.push(Self::file_dialog_item(cx));
+        items
+    }
+
+    /// 已打开选项卡条目（不含「打开文件…」入口；quick open 扫描刷新时复用打头部分）。
+    fn file_palette_opened_items(&self, cx: &Context<Self>) -> Vec<PaletteItem> {
         let weak = cx.weak_entity();
-        let mut items: Vec<PaletteItem> = Vec::with_capacity(self.tabs.len() + 1);
+        let mut items: Vec<PaletteItem> = Vec::with_capacity(self.tabs.len());
         for (idx, tab) in self.tabs.iter().enumerate() {
             let name = tab
                 .file_path
@@ -181,10 +316,231 @@ impl EditorApp {
                 let _ = w.update(cx, |this, cx| this.activate_tab(idx, window, cx));
             }));
         }
-        let w = weak.clone();
-        items.push(PaletteItem::new("打开文件…", "系统文件对话框", "Ctrl+O", move |window, cx| {
-            let _ = w.update(cx, |this, cx| this.open_dialog(window, cx));
-        }));
         items
+    }
+
+    /// 「打开文件…」系统对话框入口（复用于文件模式基础条目与 quick open 刷新）。
+    fn file_dialog_item(cx: &Context<Self>) -> PaletteItem {
+        let w = cx.weak_entity();
+        PaletteItem::new(
+            "打开文件…",
+            "系统文件对话框",
+            "Ctrl+O",
+            move |window, cx| {
+                let _ = w.update(cx, |this, cx| this.open_dialog(window, cx));
+            },
+        )
+    }
+
+    /// quick open 扫描完成后的完整候选集 = 已打开文件 + 工作区递归候选 + 「打开文件…」
+    /// 入口（对话框条目恒在末尾，保持既有行为）。候选 label = 文件名（basename，
+    /// 过滤权重高于路径）、detail = 相对工作区根目录的路径。
+    fn build_quick_open_items(
+        &self,
+        collected: Vec<(PathBuf, String)>,
+        cx: &Context<Self>,
+    ) -> Vec<PaletteItem> {
+        let mut items = self.file_palette_opened_items(cx);
+        let weak = cx.weak_entity();
+        // 已打开文件不重复列为候选（去重；标题栏部分复用打头，避免同一文件出现两行）。
+        let opened: std::collections::HashSet<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.file_path.clone())
+            .collect();
+        let mut candidates: Vec<PaletteItem> = Vec::with_capacity(collected.len());
+        for (path, rel) in collected.into_iter().take(QUICK_OPEN_MAX_FILES) {
+            if opened.contains(&path) {
+                continue; // 已打开选项卡已在标题栏列出，跳过重复候选
+            }
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| rel.clone());
+            let w = weak.clone();
+            candidates.push(PaletteItem::new(name, rel, "", move |window, cx| {
+                let _ = w.update(cx, |this, cx| this.open_path_or_activate(&path, window, cx));
+            }));
+        }
+        // 候选夹在已打开文件与「打开文件…」入口之间（扫描结果按查询过滤，不压既有两类）。
+        items.extend(candidates);
+        items.push(Self::file_dialog_item(cx));
+        items
+    }
+
+    /// 发起一把 quick open 后台扫描（对齐 sidebar WP-A 姿势）：生产者在后台线程递归
+    /// 收文件路径（有界 channel 分块外推），主线程零同步读盘；扫描未完成面板先显示
+    /// 已打开文件，完成后一次 `set_items` 刷新候选。换代（重开面板 / 换工作区）时
+    /// 旧代异步回调按代丢弃，不串库。
+    fn start_quick_open_scan(
+        &mut self,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.quick_open_gen.wrapping_add(1);
+        self.quick_open_gen = generation;
+        let Some(palette) = self.palette.clone() else {
+            return;
+        };
+        // 扫描中：文件模式空态显示「正在扫描…」而非误报「无匹配文件」。
+        palette.update(cx, |p, _| p.set_scanning(true));
+        let entity = cx.entity();
+        let session_dir = UserPrefs::session_dir();
+        let (tx, rx) = futures::channel::mpsc::channel::<QuickOpenScanUpdate>(4);
+        window
+            .spawn(cx, async move |cx| {
+                use futures::{SinkExt as _, StreamExt as _};
+                // ---- 生产者（后台线程）：递归扫文件夹 → 收文件路径按块外推 ----
+                let mut prod_tx = tx.clone();
+                let prod_root = root;
+                let prod_sess = session_dir;
+                cx.background_executor()
+                    .spawn(async move {
+                        let mut collected: Vec<(PathBuf, String)> = Vec::new();
+                        quick_open_collect(&prod_root, &prod_sess, &mut collected);
+                        let _ = prod_tx.send(QuickOpenScanUpdate::Chunk(collected)).await;
+                        let _ = prod_tx.send(QuickOpenScanUpdate::Done).await;
+                    })
+                    .detach();
+                // 原始 sender 立即释放：生产者外推完毕后 channel 关闭 → 消费者收完退出。
+                drop(tx);
+
+                // ---- 消费者（主线程任务）：收齐后一次刷新候选 ----
+                let mut rx = rx;
+                let mut collected: Vec<(PathBuf, String)> = Vec::new();
+                while let Some(update) = rx.next().await {
+                    match update {
+                        QuickOpenScanUpdate::Chunk(files) => collected.extend(files),
+                        QuickOpenScanUpdate::Done => break,
+                    }
+                }
+                let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
+                    if this.quick_open_gen != generation {
+                        return; // 已被重新打开 / 换工作区取代 → 丢弃旧代结果
+                    }
+                    let Some(palette) = this.palette.clone() else {
+                        return; // 面板已关闭 → 丢弃扫描结果
+                    };
+                    let items = this.build_quick_open_items(collected, cx);
+                    palette.update(cx, |p, pcx| {
+                        p.set_items(items);
+                        pcx.notify();
+                    });
+                    cx.notify();
+                });
+            })
+            .detach();
+    }
+}
+
+/// GoToLine 提示通知的（伪）类型标签：配合唯一 key 精确移除（见 `goto_line_toast`）。
+struct GotoLineToast;
+
+/// 解析跳转输入「行[:列]」（均为 1 基）：行可省略列；非法（非数字 / 多个冒号 /
+/// 空段）→ `None`。正负与 0 由提交侧 clamp（本函数只做词法解析）。
+pub(super) fn parse_goto(s: &str) -> Option<(i64, Option<i64>)> {
+    let (row_s, col_s) = match s.split_once(':') {
+        Some((r, c)) => (r, Some(c)),
+        None => (s, None),
+    };
+    if col_s.map_or(false, |c| c.contains(':')) {
+        return None; // 多个冒号 → 非法
+    }
+    let row = row_s.trim().parse::<i64>().ok()?;
+    let col = match col_s {
+        Some(c) => Some(c.trim().parse::<i64>().ok()?),
+        None => None,
+    };
+    Some((row, col))
+}
+
+/// quick open 后台扫描 → 主线程的一块更新（有界 channel，见 `start_quick_open_scan`）。
+#[derive(Debug)]
+pub(super) enum QuickOpenScanUpdate {
+    /// 一批扫描到的文件（绝对路径 + 相对工作区根的位置串），生产者外推完即 `Done`。
+    Chunk(Vec<(PathBuf, String)>),
+    /// 扫描完成（消费者据此一次性刷新候选）。
+    Done,
+}
+
+/// quick open 跳过的目录名（黑名单，对齐 sidebar WP-A 文件夹搜索）。
+pub(super) const QUICK_OPEN_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
+/// quick open 跳过的**超大文件**阈值：> 5MB 不列入候选（元数据判断，不读盘）。
+pub(super) const QUICK_OPEN_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+/// quick open 候选上限：超过即截断（文件夹内文件增删只按「打开面板/切文件夹」刷新）。
+pub(super) const QUICK_OPEN_MAX_FILES: usize = 500;
+/// 二进制 / 非文本扩展名黑名单（按 bool 跳过，不列入候选）。
+pub(super) const QUICK_OPEN_BINARY_EXT: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svgz", "mp4", "mkv", "avi", "mov",
+    "wmv", "flv", "webm", "mp3", "wav", "flac", "m4a", "ogg", "wma", "aac", "pdf", "exe",
+    "dll", "bin", "obj", "lib", "so", "dylib", "zip", "7z", "rar", "gz", "xz", "tar",
+    "iso", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "ttf", "otf", "woff", "woff2", "eot",
+];
+
+/// 后台递归收集候选文件路径（**不在主线程执行**）：跳过黑名单目录 / 会话目录、跳过
+/// 超大文件与二进制扩展名（扩张名黑名单即可，不读盘测内容）。显式栈 DFS（避免深目录
+/// 递归爆栈）；单目录读失败 / 单条目元数据失败 → 跳过该条目继续，不中断、不抛错。
+/// 条目按文件名排序保证确定性；达到 [`QUICK_OPEN_MAX_FILES`] 即截断。
+pub(super) fn quick_open_collect(
+    root: &std::path::Path,
+    session_dir: &std::path::Path,
+    out: &mut Vec<(PathBuf, String)>,
+) {
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= QUICK_OPEN_MAX_FILES {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue; // 单目录读失败 → 跳过继续
+        };
+        let mut entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if out.len() >= QUICK_OPEN_MAX_FILES {
+                return;
+            }
+            let path = entry.path();
+            // 目录判定用 `entry.file_type()`（**不跟随**符号链接）：链接指向的目录一律
+            // 不递归进栈，防「目录循环引用 → 扫描无限循环」（同 sidebar WP-A 姿势）。
+            let Ok(ft) = entry.file_type() else {
+                continue; // 单条目元数据失败 → 跳过
+            };
+            if ft.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if QUICK_OPEN_SKIP_DIRS.contains(&name) || path == *session_dir {
+                    continue;
+                }
+                stack.push(path);
+            } else {
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue; // 单条目元数据失败 → 跳过
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                if meta.len() > QUICK_OPEN_MAX_FILE_BYTES {
+                    continue; // 超大文件：不列入候选
+                }
+                // 二进制 / 非文本扩展名黑名单（扩张名即可，不必读内容嗅探）。
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let ext = ext.to_ascii_lowercase();
+                    if QUICK_OPEN_BINARY_EXT.contains(&ext.as_str()) {
+                        continue;
+                    }
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((path, rel));
+            }
+        }
     }
 }

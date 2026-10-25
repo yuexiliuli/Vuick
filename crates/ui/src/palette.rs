@@ -29,13 +29,15 @@ use crate::ui::motion::hover_spring;
 use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 use crate::ui::theme::{ChromeColors, FLOAT_ACRYLIC_ALPHA_DARK, FLOAT_ACRYLIC_ALPHA_LIGHT, Theme};
 
-/// 面板模式（创建时定死；Ctrl+Shift+P / Ctrl+P 各自新建一个面板实体）。
+/// 面板模式（创建时定死；Ctrl+Shift+P / Ctrl+P / Ctrl+G 各自新建一个面板实体）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteMode {
     /// 命令模式（Ctrl+Shift+P）：全部命令。
     Commands,
-    /// 文件模式（Ctrl+P）：已打开文件快选。
+    /// 文件模式（Ctrl+P）：已打开文件快选 + 工作区模糊检索。
     Files,
+    /// 跳转行模式（Ctrl+G）：单条目随输入实时改写 label。
+    GotoLine,
 }
 
 /// 条目执行器：确认时（Enter / 点击）运行，与 `PopupMenuItem` 的处理器同型。
@@ -51,6 +53,11 @@ pub struct PaletteItem {
     pub shortcut: String,
     /// 确认时执行（Enter / 点击）。
     pub run: PaletteRunner,
+    /// 确认时**带当前查询词**执行（GotoLine 单条目用；其余恒为 `None`）。与 `run`
+    /// 走同一条 `activate` 提交路径（不新增平行 Enter 通道），只是把查询词随条目标在
+    /// 实体外 — 运行器在 `activate`（面板实体自身 update 内）执行时不得再去 `read`
+    /// 本面板实体（会「read while updating」panic，K14 同类陷阱）。
+    pub run_with_query: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
 }
 
 impl PaletteItem {
@@ -66,7 +73,36 @@ impl PaletteItem {
             detail: detail.into(),
             shortcut: shortcut.into(),
             run: Rc::new(run),
+            run_with_query: None,
         }
+    }
+
+    /// 带当前查询词的构造（GotoLine 单条目用）：确认时把面板当前查询随条目标在实体外
+    /// 运行——运行器不得 `read` 面板实体（面板正在被更新），只能消费传入的 `&str`。
+    pub fn new_with_query(
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        shortcut: impl Into<String>,
+        run: impl Fn(&str, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            shortcut: shortcut.into(),
+            run: Rc::new(|_, _| {}),
+            run_with_query: Some(Rc::new(run)),
+        }
+    }
+}
+
+/// 文件模式空态文案（「扫描中」区分于「无匹配」，不误报）。
+fn files_empty_text(scanning: bool, items_empty: bool) -> &'static str {
+    if scanning {
+        "正在扫描工作区…"
+    } else if items_empty {
+        "尚未打开任何文件"
+    } else {
+        "无匹配文件"
     }
 }
 
@@ -137,6 +173,12 @@ pub struct CommandPalette {
     /// 列表滚动句柄：`#command-palette-scroll`（`overflow_y_scroll` + `track_scroll`）
     /// 跟踪它，右侧 `Scrollbar::vertical` 自绘跟随（宿主原生滚动条在此 GPUI 不绘制）。
     scroll_handle: ScrollHandle,
+    /// 面板内提示行（查询框与列表之间的一条静默文本）：宿主注入的说明（如文件模式
+    /// 未打开文件夹时「请先打开文件夹…」）。空 = 不渲染。命令模式恒为空。
+    notice: String,
+    /// 后台检索是否仍在进行（文件模式 quick open 扫描中）：仅影响空态文案
+    /// （「正在扫描文件夹…」区分于「无匹配文件」，不误报）。
+    scanning: bool,
 }
 
 impl CommandPalette {
@@ -151,6 +193,7 @@ impl CommandPalette {
         let placeholder = match mode {
             PaletteMode::Commands => "输入命令名以过滤…",
             PaletteMode::Files => "输入文件名以过滤已打开文件…",
+            PaletteMode::GotoLine => "输入跳转行号（可 行:列）…",
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let input_entity = input.clone();
@@ -174,16 +217,46 @@ impl CommandPalette {
             previous_focus,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
+            notice: String::new(),
+            scanning: false,
         }
+    }
+
+    /// 单条目模式的过滤得分：命令 / 跳转行只按 label；文件模式按「basename（label）
+    /// 权重高于路径（detail）」——basename 命中得分翻倍优先，只命中路径（子串/
+    /// 子序列）也能进候选但权重减半，二者都未命中才剔除。
+    fn item_score(&self, it: &PaletteItem) -> Option<u32> {
+        if self.mode == PaletteMode::Files {
+            let base = fuzzy_score(&self.query, &it.label);
+            let path = fuzzy_score(&self.query, &it.detail);
+            return match (base, path) {
+                (Some(b), Some(p)) => Some(b.saturating_mul(2).saturating_add(p / 2)),
+                (Some(b), None) => Some(b.saturating_mul(2)),
+                (None, Some(p)) => Some(p),
+                (None, None) => None,
+            };
+        }
+        fuzzy_score(&self.query, &it.label)
     }
 
     /// 重算过滤：对全部条目打分、稳定降序，得出可见序。
     fn recompute_filter(&mut self) {
+        // 跳转行模式：单条目的 label 实时跟随输入（空输入显示引导文案），
+        // 使这条目恒可见（query 即其 label，前缀命中）。
+        if self.mode == PaletteMode::GotoLine
+            && let Some(first) = self.items.first_mut()
+        {
+            first.label = if self.query.is_empty() {
+                "输入跳转行号（可 行:列）…".to_string()
+            } else {
+                self.query.clone()
+            };
+        }
         let mut scored: Vec<(u32, usize)> = self
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, it)| fuzzy_score(&self.query, &it.label).map(|s| (s, i)))
+            .filter_map(|(i, it)| self.item_score(it).map(|s| (s, i)))
             .collect();
         // `sort_by_key` 与 `sort_by` 同为稳定排序：同分保持原顺序。
         scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
@@ -217,8 +290,15 @@ impl CommandPalette {
             return;
         };
         let runner = self.items[idx].run.clone();
+        let query_runner = self.items[idx].run_with_query.clone();
         cx.stop_propagation();
-        runner(window, cx);
+        // GotoLine 单条目：同一 activate 提交路径，查询词随条目带出（不读本面板实体）。
+        if let Some(f) = query_runner {
+            let q = self.query.clone();
+            f(&q, window, cx);
+        } else {
+            runner(window, cx);
+        }
         let focus_left = self.focus_left(window, cx);
         self.selected = None;
         cx.emit(DismissEvent);
@@ -296,6 +376,25 @@ impl CommandPalette {
         self.input.clone()
     }
 
+    /// 整体替换候选条目（文件模式 quick open 后台扫描完成后由宿主刷新用）：
+    /// 保留当前查询重算过滤并复位选中；同时清除「扫描中」标记。
+    pub fn set_items(&mut self, items: Vec<PaletteItem>) {
+        self.items = items;
+        self.scanning = false;
+        self.recompute_filter();
+        self.selected = (!self.filtered.is_empty()).then_some(0);
+    }
+
+    /// 注入面板提示行文案（未打开文件夹的 quick open 引导）。空 = 不渲染。
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = notice.into();
+    }
+
+    /// 标记后台检索是否仍在进行（仅影响空态文案，不参与过滤）。
+    pub fn set_scanning(&mut self, scanning: bool) {
+        self.scanning = scanning;
+    }
+
     // -- 测试可见性 --
 
     #[allow(dead_code)] // 测试断言用（app::tests）
@@ -335,6 +434,27 @@ impl CommandPalette {
             .and_then(|&i| self.items.get(i))
             .map(|it| it.label.as_str())
     }
+
+    /// 可见行 `row` 的次要文案（测试断言路径/分类结果用）。
+    #[allow(dead_code)] // 测试断言用（app::tests）
+    pub fn visible_detail(&self, row: usize) -> Option<&str> {
+        self.filtered
+            .get(row)
+            .and_then(|&i| self.items.get(i))
+            .map(|it| it.detail.as_str())
+    }
+
+    /// 提示行是否已注入（测试断言「未打开文件夹的引导」用）。
+    #[allow(dead_code)] // 测试断言用（app::tests）
+    pub fn notice(&self) -> &str {
+        &self.notice
+    }
+
+    /// 后台检索是否仍在进行（测试断言「扫描中 ≠ 无匹配」用）。
+    #[allow(dead_code)] // 测试断言用（app::tests）
+    pub fn scanning(&self) -> bool {
+        self.scanning
+    }
 }
 
 impl EventEmitter<DismissEvent> for CommandPalette {}
@@ -370,6 +490,7 @@ impl Render for CommandPalette {
         let hint = match self.mode {
             PaletteMode::Commands => "命令面板",
             PaletteMode::Files => "打开文件",
+            PaletteMode::GotoLine => "跳转到行",
         };
         let query_box = div()
             .id("command-palette-query")
@@ -455,17 +576,13 @@ impl Render for CommandPalette {
             })
             .collect();
 
-        // 空态提示（命令模式「无匹配命令」；文件模式按有无文件区分文案）。
+        // 空态提示（命令模式「无匹配命令」；文件模式按「扫描中 / 有无文件」区分文案；
+        // 跳转行模式单条目恒可见，正常不会进空态）。
         let list_empty: Option<AnyElement> = if rows.is_empty() {
             let msg = match self.mode {
                 PaletteMode::Commands => "无匹配命令",
-                PaletteMode::Files => {
-                    if self.items.is_empty() {
-                        "尚未打开任何文件"
-                    } else {
-                        "无匹配文件"
-                    }
-                }
+                PaletteMode::Files => files_empty_text(self.scanning, self.items.is_empty()),
+                PaletteMode::GotoLine => "输入有效行号以跳转",
             };
             Some(
                 div()
@@ -521,6 +638,18 @@ impl Render for CommandPalette {
                     .child(div().text_size(px(11.)).text_color(fg_muted).child(hint)),
             )
             .child(query_box)
+            // 提示行（如「请先打开文件夹（文件 → 打开文件夹）」）：查询框与列表之间一条
+            // 静默说明（仅文件模式未打开文件夹时注入；空 = 不渲染）。
+            .when(!self.notice.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_size(px(11.))
+                        .text_color(fg_muted)
+                        .child(self.notice.clone()),
+                )
+            })
             .child(
                 div()
                     .id("command-palette-list")
@@ -611,5 +740,17 @@ mod tests {
         // 空查询匹配全部（得分 0，保持原顺序）
         assert_eq!(fuzzy_score("", "anything"), Some(0));
         let _ = fuzzy_score("", "");
+    }
+
+    /// 文件模式空态文案：扫描中 ≠ 无匹配，也不误报「尚未打开任何文件」。
+    #[test]
+    fn files_empty_text_distinguishes_scanning() {
+        // 扫描中 → 一律显示「正在扫描…」（即使 items 空也不误报无匹配）。
+        assert_eq!(files_empty_text(true, true), "正在扫描工作区…");
+        assert_eq!(files_empty_text(true, false), "正在扫描工作区…");
+        // 扫描完成且无任何文件 → 尚未打开任何文件。
+        assert_eq!(files_empty_text(false, true), "尚未打开任何文件");
+        // 扫描完成、有文件但过滤后无匹配 → 无匹配文件。
+        assert_eq!(files_empty_text(false, false), "无匹配文件");
     }
 }

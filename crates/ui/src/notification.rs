@@ -89,6 +89,15 @@ impl Notification {
         &self.key
     }
 
+    /// 供 App（含测试）读取文案（构建器方法同命名为史，故用 `_str` 后缀区分）。
+    pub fn title_str(&self) -> &SharedString {
+        &self.title
+    }
+
+    pub fn message_str(&self) -> &SharedString {
+        &self.message
+    }
+
     /// 卡片外观：左侧类型色点 + 标题 +（可选）多行消息。
     ///
     /// 不含关闭交互——关闭由 App 用 [`Notification::id_type`] + [`Notification::key`] 接线，

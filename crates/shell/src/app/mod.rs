@@ -457,6 +457,11 @@ pub struct EditorApp {
     /// 文件夹扫描**代**：每发起一次新扫描 +1，异步回调携带发起时代，与当前代不符即丢弃
     /// （防「换查询后旧扫描结果晚到覆盖新结果」）。
     pub(crate) folder_search_gen: u64,
+    /// quick open 后台扫描**代**：每打开一次 Ctrl+P / 换工作区即 +1，异步回调按代丢弃
+    /// （防「旧扫描晚到覆盖新面板结果 / 串工作区」；同 `folder_search_gen` 姿势）。
+    pub(crate) quick_open_gen: u64,
+    /// 最近一条 GoToLine 提示通知的 key（自托管：下次跳转行提示先移除上一条，不堆积）。
+    goto_line_toast_key: Option<gpui::ElementId>,
     /// 实际执行过的搜索扫描次数（每次命中缓存复用不改）。测试用：验证「查询未变
     /// 时反复渲染不重扫」这一优化真实生效。
     pub(crate) search_scan_count: usize,
