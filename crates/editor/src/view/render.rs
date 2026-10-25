@@ -7,12 +7,12 @@ use std::ops::Range;
 use gpui::{
     div, list, point, px, size, AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId,
     ElementInputHandler, Entity, EventEmitter, Focusable, FocusHandle, GlobalElementId, HighlightStyle,
-    Hsla, InteractiveElement, IntoElement, LayoutId, ListState, MouseButton, ParentElement, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
-    StyledText, Window, prelude::FluentBuilder as _,
+    Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, ListState, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Window, prelude::FluentBuilder as _,
 };
 use crate::actions::{
-    Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart, Enter,
+    Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart,
     IndentInline, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
     MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, OutdentInline, Paste,
     Redo, SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart,
@@ -24,7 +24,7 @@ use config::layout::{
     BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_WIDTH, EDITOR_RULER_COLUMNS,
 };
 use super::{
-    CARET_WIDTH_PX, CodeEditor, EditorEvent, FOLD_ARROW_SLOT_PX, GUTTER_LEFT_PAD_PX,
+    CARET_WIDTH_PX, CodeEditor, EditorEvent, FIND_BAR_H, FOLD_ARROW_SLOT_PX, GUTTER_LEFT_PAD_PX,
     GUTTER_RIGHT_PAD_PX, MIN_VISIBLE_ROWS, RowData, RowView,
 };
 
@@ -128,7 +128,12 @@ impl Render for CodeEditor {
             // `ScrollableElement::vertical_scrollbar`（默认 Scrolling 模式，
             // 空闲 2s 自动隐藏，用户误以为滚动条“时有时无/不准确”）。
             .child(self.vscrollbar_overlay(list_state, content_w_px))
-            .child(self.hscrollbar_overlay());
+            .child(self.hscrollbar_overlay())
+            // 编辑区内查找条（Ctrl+F 打开）：顶部内部浮层，盖在内容/滚动条之上（只占顶部
+            // 一条，不与右侧/底部滚动条命中区重叠；元素 id find-* 命名）。
+            .when(self.find.open, |this| {
+                this.child(self.render_find_bar(window, cx))
+            });
 
         EditorElement::new(entity, core.into_any_element())
     }
@@ -531,6 +536,122 @@ impl CodeEditor {
                     .viewport_from_layout(),
             )
     }
+
+    /// 编辑区内查找条（Ctrl+F 打开）。顶部内部浮层：输入框（`ui::InputState`，IME/编辑/
+    /// 焦点自理）+ 状态文案。
+    ///
+    /// Enter/Shift+Enter/Escape 在 `on_key_down` 原样按键处理（用 modifiers 区分 shift）。
+    /// 关键：此处**不挂 `on_action(&Enter)` 拦截**——gpui 键动作**先于** KeyDownEvent
+    /// 派发：`dispatch_key_event` 先跑绑定动作（window.rs 6189 行），动作泡阶段命中任意
+    /// `Enter` 监听即默认 `stop_propagation`（window.rs `dispatch_action_on_node_inner`
+    /// 6597 行）后提前 return → KeyDownEvent 不再派发，导航与 Shift+Enter 区分都会
+    /// 失效。故编辑区 `attach_input_actions` 的 `on_action(&Enter)` 换行处理已整体移除
+    /// （改走编辑区核心 `on_key_down`，见 `CodeEditor::on_key_down`）——只要路径上无人
+    /// 拦 `Enter` 动作，按键就落到本层原样 key_down：Enter=下一个、Shift+Enter=上一个，
+    /// 由本层 `stop_propagation` 保证不冒泡到编辑区换行。
+    fn render_find_bar(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let status = self.find.status();
+        let input = self.find_input.clone();
+        let fg = self.fg;
+        let bar_bg = self.bg;
+        let hairline = self.fg.opacity(0.12);
+        let bar = div()
+            .id("find-bar")
+            .debug_selector(|| "find-bar".into())
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            // 不覆盖右侧纵向滚动条轨道（不破坏 scrollbar 命中）：右缘在轨道内侧收住。
+            .right(ui::scrollbar::scrollbar_width() + px(2.))
+            .h(px(FIND_BAR_H as f32))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .pl(px(10.))
+            .pr(px(10.))
+            .bg(bar_bg)
+            // 底部发丝分隔线（与编辑区内容区分）。
+            .child(
+                div()
+                    .id("find-bar-rule")
+                    .debug_selector(|| "find-bar-rule".into())
+                    .absolute()
+                    .bottom(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(px(1.))
+                    .bg(hairline),
+            )
+            // 点击 find 条空白处不再穿透到编辑区（移动光标）。
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::find_bar_mouse_down))
+            // Esc / Enter / Shift+Enter：原样按键处理（用 modifiers 区分 shift）。
+            // ⚠️ 这里**不能**再挂 `on_action(&Enter)` 拦截：gpui 键动作先于 KeyDownEvent
+            // 派发、被 `stop_propagation` 后 KeyDownEvent 直接不再派发（window.rs
+            // `dispatch_key_event` 提前 return）→ 会同时丢掉 Enter 导航与 Shift+Enter
+            // 的上一个。换行抑制靠「编辑区 `on_action(&Enter)` 已整体移除 + 本层先
+            // `stop_propagation`」双重保证（见 `attach_input_actions` 与
+            // `CodeEditor::on_key_down`）。
+            .on_key_down(cx.listener(Self::find_bar_key_down))
+            .child(
+                div()
+                    .id("find-bar-input-wrap")
+                    .debug_selector(|| "find-bar-input-wrap".into())
+                    .w(px(220.))
+                    .h(px(24.))
+                    .child(
+                        input
+                            .map(|i| i.into_any_element())
+                            .unwrap_or_else(|| div().into_any_element()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("find-bar-status")
+                    .debug_selector(|| "find-bar-status".into())
+                    .flex()
+                    .flex_none()
+                    .text_color(fg.opacity(0.6))
+                    .text_size(px(12.))
+                    .child(status),
+            );
+        bar
+    }
+
+    /// find 条空白处点按：不穿透到编辑区（防止误把光标搬走）。
+    fn find_bar_mouse_down(
+        &mut self,
+        _e: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+    }
+
+    /// find 条按键：Escape=关条（移除高亮、焦点归还）；Enter/Shift+Enter=下一个/上一个。
+    fn find_bar_key_down(
+        &mut self,
+        e: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let k = &e.keystroke;
+        match k.key.to_ascii_lowercase().as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.close_find(window, cx);
+            }
+            "enter" => {
+                cx.stop_propagation();
+                window.prevent_default();
+                self.find_step(!k.modifiers.shift, cx);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 把键盘/鼠标/输入 action 挂到核心元素上（keymap 由 `crate::actions::bind_input_keys`
@@ -636,11 +757,6 @@ fn attach_input_actions(
         }))
         .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &DeleteToNextWordEnd, _w, cx| {
             ed.delete_word_forward(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &Enter, _w, cx| {
-            ed.insert_newline(cx);
-            ed.undo.set_cooperative(false);
             cx.stop_propagation()
         }))
         .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &IndentInline, _w, cx| {
@@ -992,6 +1108,77 @@ pub(crate) fn merge_highlights(
             }
         if sel.as_ref().is_some_and(|s| a >= s.start && b <= s.end) {
             style.background_color = Some(sel_bg);
+        }
+        if style != HighlightStyle::default() {
+            out.push((a..b, style));
+        }
+    }
+    out
+}
+
+/// 通用版 `merge_highlights`：叠加**一组**（互不重叠、升序）overlay 段，每段覆盖
+/// `background_color`（`merge_highlights` 只支持单个选区的特化；find 高亮层有多段、
+/// 两种底色：当前命中/其余匹配）。
+///
+/// 输入：`runs`（非重叠、升序，含既有语法/选区合并结果）与 `overlays`（非重叠、升序）
+/// 均按字节区间切单元，产出严格递增、不重叠、每段都在行内的合并结果。overlay 只改
+/// 底色，其余样式保留 base run 的。
+pub(crate) fn merge_multi_highlights(
+    runs: &[(Range<usize>, HighlightStyle)],
+    overlays: &[(Range<usize>, HighlightStyle)],
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    if overlays.is_empty() {
+        return runs.to_vec();
+    }
+    // 收集所有切分边界：样式段边界 ∪ overlay 边界。
+    let mut bounds: Vec<usize> = Vec::with_capacity(runs.len() * 2 + overlays.len() * 2 + 2);
+    for (r, _) in runs {
+        let s = r.start.min(r.end);
+        let e = r.end.max(r.start);
+        if e <= s {
+            continue;
+        }
+        bounds.push(s);
+        bounds.push(e);
+    }
+    for (r, _) in overlays {
+        let s = r.start.min(r.end);
+        let e = r.end.max(r.start);
+        if e <= s {
+            continue;
+        }
+        bounds.push(s);
+        bounds.push(e);
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut ri = 0usize;
+    let mut oi = 0usize;
+    for (i, a) in bounds.iter().copied().enumerate() {
+        let Some(&b) = bounds.get(i + 1) else { break };
+        if b <= a {
+            continue;
+        }
+        while ri < runs.len() && runs[ri].0.end <= a {
+            ri += 1;
+        }
+        while oi < overlays.len() && overlays[oi].0.end <= a {
+            oi += 1;
+        }
+        let mut style = HighlightStyle::default();
+        if let Some((r, s)) = runs.get(ri)
+            && r.start < b {
+                style = *s;
+            }
+        // overlays 互不重叠：首个 `end > a` 者即唯一可能覆盖本单元的 overlay。
+        if let Some((o, os)) = overlays.get(oi)
+            && o.start < b
+            && o.end > a
+            && let Some(bg) = os.background_color
+        {
+            style.background_color = Some(bg);
         }
         if style != HighlightStyle::default() {
             out.push((a..b, style));

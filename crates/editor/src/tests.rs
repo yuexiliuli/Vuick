@@ -3,3 +3,4 @@
 // Split by theme (M2.4): include! splices text within the tests module, so test paths/count stay identical to before.
 include!("tests/logic.rs");
 include!("tests/view.rs");
+include!("tests/find.rs");

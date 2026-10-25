@@ -421,6 +421,23 @@ impl EditorApp {
                     this.toggle_goto_line(window, cx);
                 }),
             )
+            // 编辑区内查找：Ctrl+F 打开查找条；F3 / Shift+F3 复用上次查询上一个/下一个
+            // （分发到活动文本选项卡的 CodeEditor；非文本选项卡 toast「不支持查找」不崩）。
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &Find, window, cx| {
+                    this.find_in_active_tab(window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &FindNext, window, cx| {
+                    this.find_step_in_active_tab(window, cx, true);
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &FindPrev, window, cx| {
+                    this.find_step_in_active_tab(window, cx, false);
+                }),
+            )
             // 音乐播放器：Ctrl+M 切换整窗音乐模式（同 music 模式壳 div 的 on_action 并存，
             // 见 `render` 顶部音乐模式分支——任一命中都走 `toggle_music_player`）。
             .on_action(

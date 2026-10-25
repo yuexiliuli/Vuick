@@ -133,6 +133,31 @@ pub const GOTO_LINE: Command = Command {
     key: "ctrl-g",
     ctx: BindingCtx::Root,
 };
+/// 编辑区内查找（Ctrl+F 打开查找条 / 输入即高亮；只在活动文本选项卡有意义）。
+pub const FIND: Command = Command {
+    id: "find",
+    label: "查找",
+    menu_label: "查找",
+    shortcut: "Ctrl+F",
+    key: "ctrl-f",
+    ctx: BindingCtx::Root,
+};
+pub const FIND_NEXT: Command = Command {
+    id: "find-next",
+    label: "查找下一个",
+    menu_label: "查找下一个",
+    shortcut: "F3",
+    key: "f3",
+    ctx: BindingCtx::Root,
+};
+pub const FIND_PREV: Command = Command {
+    id: "find-prev",
+    label: "查找上一个",
+    menu_label: "查找上一个",
+    shortcut: "Shift+F3",
+    key: "shift-f3",
+    ctx: BindingCtx::Root,
+};
 /// 根级：查看/设置命令。
 pub const TOGGLE_MUSIC_PLAYER: Command = Command {
     id: "toggle-music-player",
@@ -260,9 +285,9 @@ pub const THEME: Command = Command {
 /// 全部命令（表投影源；测试/文档用）。菜单与面板按各自结构引用其中部分常量。
 pub const ALL_COMMANDS: &[Command] = &[
     NEW_FILE, OPEN_FILE, OPEN_FOLDER, SAVE, SAVE_AS, QUIT, CLOSE_TAB, QUICK_OPEN,
-    TOGGLE_COMMAND_PALETTE, GOTO_LINE, TOGGLE_MUSIC_PLAYER, TOGGLE_WRAP, INCREASE_FONT,
-    DECREASE_FONT, RESET_FONT, FOLLOW_THEME, UNDO, REDO, CUT, COPY, PASTE, SELECT_ALL, PREVIEW,
-    TOGGLE_SIDEBAR, THEME,
+    TOGGLE_COMMAND_PALETTE, GOTO_LINE, FIND, FIND_NEXT, FIND_PREV, TOGGLE_MUSIC_PLAYER,
+    TOGGLE_WRAP, INCREASE_FONT, DECREASE_FONT, RESET_FONT, FOLLOW_THEME, UNDO, REDO, CUT, COPY,
+    PASTE, SELECT_ALL, PREVIEW, TOGGLE_SIDEBAR, THEME,
 ];
 
 /// 全部根级快捷键（`src/main.rs` 自此取代手写键串）。键串来自本表 [`Command::key`]，
@@ -279,6 +304,9 @@ pub fn root_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new(QUICK_OPEN.key, QuickOpenFile, None),
         KeyBinding::new(TOGGLE_COMMAND_PALETTE.key, ToggleCommandPalette, None),
         KeyBinding::new(GOTO_LINE.key, GoToLine, None),
+        KeyBinding::new(FIND.key, Find, None),
+        KeyBinding::new(FIND_NEXT.key, FindNext, None),
+        KeyBinding::new(FIND_PREV.key, FindPrev, None),
         KeyBinding::new(TOGGLE_MUSIC_PLAYER.key, ToggleMusicPlayer, None),
         KeyBinding::new(TOGGLE_WRAP.key, ToggleWordWrap, None),
         KeyBinding::new(INCREASE_FONT.key, IncreaseFontSize, None),
@@ -322,6 +350,9 @@ mod tests {
             ("ctrl-p".into(), "editor_app::QuickOpenFile".into()),
             ("ctrl-shift-p".into(), "editor_app::ToggleCommandPalette".into()),
             ("ctrl-g".into(), "editor_app::GoToLine".into()),
+            ("ctrl-f".into(), "editor_app::Find".into()),
+            ("f3".into(), "editor_app::FindNext".into()),
+            ("shift-f3".into(), "editor_app::FindPrev".into()),
             ("ctrl-m".into(), "editor_app::ToggleMusicPlayer".into()),
             ("ctrl-alt-w".into(), "editor_app::ToggleWordWrap".into()),
             ("ctrl-=".into(), "editor_app::IncreaseFontSize".into()),

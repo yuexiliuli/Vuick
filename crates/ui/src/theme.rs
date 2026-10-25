@@ -141,6 +141,12 @@ pub struct ColorScheme {
     /// （暗 #242525 中性灰 / 亮 #E6EFF8）；暗色与折叠行（#172931）区分开。稳定持焦
     /// 高亮，不受光标闪烁影响；存在非坍缩选区时不高亮整行（只高亮选中字符本身）。
     pub editor_active_line_bg: Rgba,
+    /// 编辑器「查找」（Ctrl+F）**非当前**匹配的字符底色（明 #FFE497 / 暗 #4A3F16，
+    /// 弱黄系：一眼看出全部命中、又明显弱于「当前命中」的强橙）。
+    pub editor_find_match_bg: Rgba,
+    /// 编辑器「查找」**当前命中**（导航所指）的字符底色（明 #FFB703 / 暗 #FFB703 同
+    /// 一饱和橙黄，比非当前更醒目，与选区/折叠底都可辨）。
+    pub editor_find_current_bg: Rgba,
 }
 
 impl ColorScheme {
@@ -186,6 +192,8 @@ impl ColorScheme {
             editor_selection_bg: rgba(0x619bd373),
             editor_fold_bg: rgb(0xe6eff8),
             editor_active_line_bg: rgb(0xe6eff8),
+            editor_find_match_bg: rgb(0xffe497),
+            editor_find_current_bg: rgb(0xffb703),
         }
     }
 
@@ -233,6 +241,8 @@ impl ColorScheme {
             editor_selection_bg: rgba(0x3ab5e973),
             editor_fold_bg: rgb(0x172931),
             editor_active_line_bg: rgb(0x242525),
+            editor_find_match_bg: rgb(0x4a3f16),
+            editor_find_current_bg: rgb(0xffb703),
         }
     }
 }
@@ -635,6 +645,26 @@ mod tests {
         assert_ne!(dark.editor_selection_bg, light.editor_selection_bg, "选区底色随明暗");
         assert_ne!(dark.editor_fold_bg, light.editor_fold_bg, "折叠底色随明暗");
         assert_ne!(dark.editor_active_line_bg, light.editor_active_line_bg, "光标行底色随明暗");
+    }
+
+    #[gpui::test]
+    fn find_highlight_tokens_pinned_both_themes(_cx: &mut TestAppContext) {
+        // 编辑器查找高亮两 token：当前命中（强橙）与非当前（弱黄）亮暗两套都钉死，
+        // 且「当前 ≠ 非当前」保证导航所指一目了然。
+        let light = Theme::light().colors;
+        let dark = Theme::dark().colors;
+        assert_eq!(light.editor_find_match_bg, rgb(0xffe497), "亮非当前=弱黄");
+        assert_eq!(light.editor_find_current_bg, rgb(0xffb703), "亮当前=强橙");
+        assert_eq!(dark.editor_find_match_bg, rgb(0x4a3f16), "暗非当前=弱黄暗档");
+        assert_eq!(dark.editor_find_current_bg, rgb(0xffb703), "暗当前=强橙");
+        assert_ne!(
+            light.editor_find_match_bg, light.editor_find_current_bg,
+            "亮：当前 ≠ 非当前（同档可辨）"
+        );
+        assert_ne!(
+            dark.editor_find_match_bg, dark.editor_find_current_bg,
+            "暗：当前 ≠ 非当前（同档可辨）"
+        );
     }
 
     #[gpui::test]

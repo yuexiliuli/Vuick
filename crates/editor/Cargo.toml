@@ -11,6 +11,8 @@ gpui = { workspace = true }
 ropey = { workspace = true }
 # 编辑器代码高亮：syntect 解析默认语法集（features 对齐：parsing + default-syntaxes + regex-fancy）。
 syntect = { workspace = true }
+# 编辑区内查找（Ctrl+F）：匹配用字面文本正则（regex::escape 转义），既有 workspace 依赖。
+regex = { workspace = true }
 config = { path = "../config" }
 base = { path = "../base" }
 ime = { path = "../ime" }

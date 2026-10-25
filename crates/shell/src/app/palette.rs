@@ -163,6 +163,71 @@ impl EditorApp {
         );
     }
 
+    /// Ctrl+F：活动文本选项卡打开查找条；非文本选项卡（PDF/图片/视频/EPUB/音乐整窗）
+    /// → toast「当前选项卡不支持查找」，不崩、不开条。
+    pub(super) fn find_in_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return; // 零选项卡欢迎页 → 静默
+        };
+        // 守卫对齐 goto_line 的判定：音乐整窗 / MediaReader / EPUB 只读预览。
+        if self.music_mode || tab.reader.is_reader() || tab.readonly_preview {
+            self.find_toast("当前选项卡不支持查找");
+            cx.notify();
+            return;
+        }
+        let ed = tab.editor.clone();
+        ed.update(cx, |ed, cx| ed.open_find(window, cx));
+        cx.notify();
+    }
+
+    /// F3 / Shift+F3：活动文本选项卡复用上次查询 → 下一个 / 上一个；无上次查询不动作。
+    /// 非文本选项卡不 toast（同 VS Code：查找快捷键对非文本源静默）。
+    pub(super) fn find_step_in_active_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        next: bool,
+    ) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if self.music_mode || tab.reader.is_reader() || tab.readonly_preview {
+            return;
+        }
+        let ed = tab.editor.clone();
+        ed.update(cx, |ed, cx| {
+            if next {
+                ed.find_next(cx);
+            } else {
+                ed.find_prev(cx);
+            }
+        });
+        let _ = window;
+        cx.notify();
+    }
+
+    /// Find「不支持查找」提示（进入 toast，替换上一条同款提示，不堆积）。
+    fn find_toast(&mut self, msg: &str) {
+        if let Some(key) = self.find_toast_key.take() {
+            self.remove_notification1::<FindToast>(key);
+        }
+        let key = gpui::ElementId::from(SharedString::from(format!(
+            "find-toast-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )));
+        self.find_toast_key = Some(key.clone());
+        self.push_notification(
+            Notification::new()
+                .id1::<FindToast>(key)
+                .title("查找")
+                .message(msg)
+                .with_type(NotificationKind::Error),
+        );
+    }
+
     /// 创建面板实体 + 聚焦查询框 + 订阅关闭（关闭即清引用；与新开面板同生命周期）。
     /// `notice`：面板提示行文案（空 = 不显示；文件模式未打开文件夹时给出引导）。
     fn open_palette(
@@ -437,6 +502,9 @@ impl EditorApp {
 
 /// GoToLine 提示通知的（伪）类型标签：配合唯一 key 精确移除（见 `goto_line_toast`）。
 struct GotoLineToast;
+
+/// Find「不支持查找」提示通知的（伪）类型标签：配合唯一 key 精确移除（见 `find_toast`）。
+struct FindToast;
 
 /// 解析跳转输入「行[:列]」（均为 1 基）：行可省略列；非法（非数字 / 多个冒号 /
 /// 空段）→ `None`。正负与 0 由提交侧 clamp（本函数只做词法解析）。

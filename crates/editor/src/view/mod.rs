@@ -37,9 +37,9 @@ use std::{
 };
 
 use gpui::{
-    point, px, rgb, App, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla,
-    KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollHandle, SharedString, Window,
+    point, px, rgb, App, AppContext, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle,
+    Hsla, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, SharedString, Window,
 };
 use ropey::Rope;
 
@@ -492,6 +492,18 @@ pub struct CodeEditor {
     /// （仅测试）后台折叠候选/括号配对落地的**整篇**次数（兜底/打开收尾轮次）。
     #[cfg(test)]
     scan_full_landings: Cell<usize>,
+
+    // —— 编辑区内查找（Ctrl+F / F3）——
+    /// 查找状态机/匹配表/导航（纯逻辑，见 `crate::editor::find`）。
+    find: crate::editor::find::FindOverlay,
+    /// 查找输入框「文本变化 → 置脏 + 防抖」订阅句柄（首开时懒创建）。
+    _find_sub: Option<gpui::Subscription>,
+    /// 查找「非当前匹配」高亮底色（主题 `editor_find_match_bg`，见 `refresh_metrics`）。
+    find_match_bg: Hsla,
+    /// 查找「当前命中」高亮底色（主题 `editor_find_current_bg`，见 `refresh_metrics`）。
+    find_current_bg: Hsla,
+    /// 查找输入框实体（`ui::InputState`，IME/编辑/焦点自理；首次打开懒创建）。
+    find_input: Option<gpui::Entity<ui::input::InputState>>,
 }
 
 impl CodeEditor {
@@ -576,6 +588,11 @@ impl CodeEditor {
             scan_inc_landings: Cell::new(0),
             #[cfg(test)]
             scan_full_landings: Cell::new(0),
+            find: crate::editor::find::FindOverlay::default(),
+            _find_sub: None,
+            find_match_bg: rgb(0xffe497).into(),
+            find_current_bg: rgb(0xffb703).into(),
+            find_input: None,
         }
     }
 
@@ -698,6 +715,8 @@ impl CodeEditor {
     fn reset_document_impl(&mut self, defer_scans: bool, keep_highlight: bool) {
         self.undo.clear();
         self.selection = Selection::collapsed(0);
+        // 整篇替换 = 文档被换掉：查找匹配表全部失效，关条清高亮（保留 last_query 不重置）。
+        self.find.close_bar();
         // 整篇替换 = 文档在光标下被换掉：任何进行中的鼠标拖选都失去意义，一并取消。
         // （否则 `set_text` 只收拢选区、却残留 `dragging=true`，宿主切回视图后仅移动
         // 鼠标就从 anchor=0 自动扩选——见 app::tests::*wysiwyg_toggle_off* 回归。
@@ -773,6 +792,8 @@ impl CodeEditor {
         self.selection = Selection::collapsed(0);
         self.last_edit = None;
         self.marked_range = None;
+        // 批量写回 = 文档在光标下被整篇改写：查找匹配表作废、关条清高亮（保留 last_query）。
+        self.find.close_bar();
     }
 
     /// WYSIWYG 编辑日志**按序重放**（切回「预览编辑测试」有改动路径，方案2）：把 live2
@@ -817,11 +838,12 @@ impl CodeEditor {
         self.selection = Selection::collapsed(0);
         self.last_edit = None;
         self.marked_range = None;
+        // 批量写回 = 文档被整篇改写：查找匹配表作废、关条清高亮（保留 last_query）。
+        self.find.close_bar();
         self.live_replay_calls
             .set(self.live_replay_calls.get() + 1);
         true
     }
-
     /// （仅测试）本实例成功走 `apply_live_replay`（方案2 op 重放）的次数。
     // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
     pub fn live_replay_calls(&self) -> usize {
@@ -1274,6 +1296,9 @@ impl CodeEditor {
         // 光标所在行（持焦且 head 落行内）的整行高亮底色 = 主题 `editor_active_line_bg`
         // （与折叠行同色；稳定持焦高亮，不受光标闪烁影响）。
         self.active_line_bg = colors.editor_active_line_bg.into();
+        // 查找高亮两色（当前命中 / 其余匹配）。
+        self.find_match_bg = colors.editor_find_match_bg.into();
+        self.find_current_bg = colors.editor_find_current_bg.into();
 
         let digits = self.buffer.line_count().max(1).to_string().len();
         self.gutter_chars = digits.max(3);
@@ -1607,8 +1632,19 @@ impl CodeEditor {
             } else {
                 Rc::new(RowContent::materialize(&self.buffer, logical, styles))
             };
+            // 选区合并层 + 查找高亮层：选区动态合并（`row_highlight_override`）之上再叠
+            // find 匹配底色（当前命中/其余匹配）。find 已关闭或无本行命中 → 不分配。
+            let mut hl_override = self.row_highlight_override(logical, &content);
+            if self.find.is_active() {
+                let ov = self.find_row_overlays(logical);
+                if !ov.is_empty() {
+                    let base: &[(Range<usize>, HighlightStyle)] =
+                        hl_override.as_deref().unwrap_or(&content.highlights);
+                    hl_override = Some(render::merge_multi_highlights(base, &ov));
+                }
+            }
             out.push(RowData {
-                highlight_override: self.row_highlight_override(logical, &content),
+                highlight_override: hl_override,
                 caret: self.row_caret(window, logical, show_caret),
                 folded: self.row_folded(window, logical),
                 active,
@@ -1923,10 +1959,18 @@ impl CodeEditor {
         let vis = self.folds.visual_row(row);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
         let scrollbar = ui::scrollbar::scrollbar_width().as_f32();
+        // find 条打开时顶部 `FIND_BAR_H`(32px) 被浮层盖住：把「可视上缘」下移一条所
+        // 占行数，当前命中揭示到浮层之下、不藏在条后面（滚动中段导航到视口上方匹配时
+        // 尤需此偏移；文档顶无滚动余量时保持原位）。
+        let bar_rows = if self.find.open {
+            ((FIND_BAR_H + 2.0) / lh as f64).ceil() as usize
+        } else {
+            0
+        };
         let rows_visible = ((view - scrollbar) / lh).floor().max(1.) as usize;
         let cur_top = (self.scroll_top_px() / lh).floor() as usize;
-        if vis < cur_top {
-            self.scroll_to_px(vis as f32 * lh);
+        if vis < cur_top + bar_rows {
+            self.scroll_to_px(vis.saturating_sub(bar_rows) as f32 * lh);
         } else if vis >= cur_top + rows_visible {
             let target = vis.saturating_add(1).saturating_sub(rows_visible);
             self.scroll_to_px(target as f32 * lh);
@@ -2417,9 +2461,25 @@ impl CodeEditor {
     /// 统一按键：仅处理 keymap 未覆盖的 **Shift+方向**（gpui-component 的
     /// Select{Left,Right,Up,Down} 是组件内部 action、公共 keymap 用了它但我们无法
     /// 注册 handler，故在原样 key_down 层处理）。其余键全部走 `on_action`。
+    ///
+    /// **Enter/Shift+Enter 也在此处理**（换成行）：不能挂在 `on_action(&Enter)` 上——
+    /// 动作层在泡泡阶段命中任意 `Enter` 监听即 `stop_propagation`（gpui 动作默认
+    /// 停传播，window.rs `dispatch_action_on_node_inner` 6597 行），KeyDownEvent 会被
+    /// 提前吞掉、不再派发；而 find 条（编辑区内查找）需要在**原样 key_down** 层区分
+    /// Enter（下一个）与 Shift+Enter（上一个）——只有本层（或 find 条）不依赖动作层
+    /// 拦截时，find 条聚焦后回车才不会被编辑区换行抢先。空 Enter key 在 IME/字体
+    /// 路径之前优先处理。
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
         let m = k.modifiers;
+        if k.key.eq_ignore_ascii_case("enter") {
+            // find 条输入框持焦时其 on_key_down 已 stop（导航），走不到这里；
+            // 编辑器持焦（含 find 条打开但焦点在编辑器）：回车=换行（含 Shift+Enter）。
+            self.insert_newline(cx);
+            self.undo.set_cooperative(false);
+            cx.stop_propagation();
+            return;
+        }
         // 无修饰可打印字符 → IME/InputHandler
         if !m.control && !m.alt && !m.platform && k.key_char.is_some() {
             return;
@@ -3004,6 +3064,8 @@ impl CodeEditor {
         });
         self.kick_caret();
         self.reveal_caret();
+        // 文本变更：查找匹配表按 buffer 版本失效重算（防抖同一条路径，见 `find_edit_invalidate`）。
+        self.find_edit_invalidate(cx);
         cx.emit(EditorEvent::Edited);
         cx.notify();
     }
@@ -3199,6 +3261,8 @@ impl CodeEditor {
         self.resync_list(true);
         self.kick_caret();
         self.reveal_caret();
+        // 撤销 = 文本变更：查找匹配表失效重算。
+        self.find_edit_invalidate(cx);
         cx.emit(EditorEvent::Edited);
         cx.notify();
     }
@@ -3255,12 +3319,218 @@ impl CodeEditor {
         self.resync_list(true);
         self.kick_caret();
         self.reveal_caret();
+        // 重做 = 文本变更：查找匹配表失效重算。
+        self.find_edit_invalidate(cx);
         cx.emit(EditorEvent::Edited);
         cx.notify();
     }
 }
 
+// -------------------------------------------------------------------------
+// 编辑区内查找（Ctrl+F / F3 / Shift+F3）——接线层：状态机在 `crate::editor::find`，
+// 本层只做输入框/焦点/防抖/滚动/绘制接线，不堆积匹配逻辑。
+// -------------------------------------------------------------------------
 
+/// 输入防抖时长（ms）：输入停止后这么多毫秒才重算匹配（打字不逐键全量扫）。
+const FIND_DEBOUNCE_MS: u64 = 200;
+
+/// 编辑区内查找条高度（px）：`render_find_bar` 与 `reveal_row` 共用（reveal 要把
+/// 当前命中揭示到浮层之下，须知道浮层占多少行）。
+pub(crate) const FIND_BAR_H: f64 = 32.0;
+
+impl CodeEditor {
+    /// 打开 find 条（Ctrl+F）：输入框自动聚焦 + 自动带上最近一次查询（若有）。
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 首次打开懒创建输入框实体 + 订阅「文本变化 → 置脏 + 防抖」。
+        if self.find_input.is_none() {
+            let input = cx
+                .new(|cx| ui::input::InputState::new(window, cx).placeholder("查找…"));
+            let input_entity = input.clone();
+            self._find_sub = Some(cx.subscribe(&input, move |ed, _src, ev, cx| {
+                if matches!(ev, ui::input::InputEvent::Change) {
+                    let q = input_entity.read(cx).value().to_string();
+                    ed.find_query_changed(q, cx);
+                }
+            }));
+            self.find_input = Some(input);
+        }
+        let was_open = self.find.open;
+        self.find.open_bar();
+        // 首次打开（或上次 Esc 关闭后再次打开）：把最近一次查询带进输入框回显。
+        if !was_open
+            && let Some(input) = self.find_input.clone()
+        {
+            let q = self.find.query.clone();
+            input.update(cx, |s, scx| s.replace(q, window, scx));
+        }
+        // 输入框自动聚焦（已打开时重复 Ctrl+F 也聚焦回输入框）。
+        if let Some(input) = self.find_input.clone() {
+            let fh = input.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        }
+        cx.notify();
+    }
+
+    /// 关闭 find 条（Esc）：移除全部高亮、保留 last query 供 F3 复用、焦点归还编辑器。
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.close_bar();
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// F3：复用该 tab 上次查询 → 下一个；无上次查询则不动作。
+    pub fn find_next(&mut self, cx: &mut Context<Self>) {
+        self.find_step(true, cx);
+    }
+
+    /// Shift+F3：复用该 tab 上次查询 → 上一个；无上次查询则不动作。
+    pub fn find_prev(&mut self, cx: &mut Context<Self>) {
+        self.find_step(false, cx);
+    }
+
+    /// 输入框文本变化（订阅回调）：更新查询词并走防抖重算。
+    fn find_query_changed(&mut self, query: String, cx: &mut Context<Self>) {
+        self.find.query = query;
+        self.find.invalidate();
+        self.schedule_find_debounce(cx);
+        cx.notify();
+    }
+
+    /// 文本编辑失效（insert/undo/redo 编辑主链调用）：匹配表按版本重算（防抖同一条路径）。
+    fn find_edit_invalidate(&mut self, cx: &mut Context<Self>) {
+        if !self.find.open && !self.find.visible {
+            return; // 未在查找（也未经 F3 拉高亮）：编辑无需重算。
+        }
+        self.find.invalidate();
+        self.schedule_find_debounce(cx);
+    }
+
+    /// 防抖调度：每变化一次起一个 200ms 任务；到期用「最新查询词」重扫，仅最新代号落地。
+    fn schedule_find_debounce(&mut self, cx: &mut Context<Self>) {
+        let epoch = self.find.scan_epoch;
+        cx.spawn(async move |this, cx| {
+            let _ = cx
+                .background_executor()
+                .timer(Duration::from_millis(FIND_DEBOUNCE_MS))
+                .await;
+            let _ = this.update(cx, |ed, cx| {
+                if epoch == ed.find.scan_epoch {
+                    ed.find_scan_land(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 用**当前查询词**重扫并落地（同步；防抖到期 / Enter / F3 导航共用）。
+    fn find_scan_land(&mut self, cx: &mut Context<Self>) {
+        let query = self.find.query.clone();
+        let ver = self.buffer.version();
+        let (matches, capped) = crate::editor::find::compute_matches(
+            &self.buffer,
+            &query,
+            crate::editor::find::FIND_MATCH_CAP,
+        );
+        self.find.dirty = false; // 本次落地即消费脏标记（否则每次导航都误判「待重算」重定位回首个）
+        self.find.land(ver, query, matches, capped, true);
+        self.reveal_current_find();
+        cx.notify();
+    }
+
+    /// 导航前保证匹配表新鲜：编辑/换词/关条后按 `(版本, 词)` 失效重扫。
+    fn ensure_find_fresh(&mut self, cx: &mut Context<Self>) {
+        let ver = self.buffer.version();
+        let q = self.find.query.clone();
+        if !self.find.fresh_for(ver, &q) || !self.find.visible {
+            self.find.scan_epoch = self.find.scan_epoch.wrapping_add(1);
+            self.find_scan_land(cx);
+        }
+    }
+
+    /// F3 / Shift+F3 / Enter（find 条内）统一导航：当前命中 → 下一个/上一个（回绕），
+    /// 滚动使当前命中可见；无匹配不动作、不回绕。
+    fn find_step(&mut self, next: bool, cx: &mut Context<Self>) {
+        // 无查询词（从未查找过）→ 不动作。
+        if self.find.query.is_empty() {
+            return;
+        }
+        self.ensure_find_fresh(cx);
+        if let Some((idx, off)) = self.find.step(next) {
+            self.find.current = Some(idx);
+            self.set_caret_to(off);
+            self.reveal_current_find();
+        }
+        cx.notify();
+    }
+
+    /// 当前命中所处行滚进可视区（纵向；当前命中必在当前环境可见）。
+    fn reveal_current_find(&mut self) {
+        if let Some(r) = self.find.current.and_then(|i| self.find.matches.get(i)) {
+            let row = self.buffer.line_of_offset(r.start);
+            self.reveal_row(row);
+        }
+    }
+
+    /// 某逻辑行的查找高亮样式段（行本地字节区间 + 底色：当前命中用强调色、其余普通色）。
+    fn find_row_overlays(&self, logical: usize) -> Vec<(Range<usize>, HighlightStyle)> {
+        let mut out = Vec::new();
+        for (r, cur) in self.find.row_highlights(&self.buffer, logical) {
+            out.push((
+                r,
+                HighlightStyle {
+                    background_color: Some(if cur {
+                        self.find_current_bg
+                    } else {
+                        self.find_match_bg
+                    }),
+                    ..Default::default()
+                },
+            ));
+        }
+        out
+    }
+
+    // —— 测试探针 ——
+    // cfg(test) 探针面：拆 editor crate 后被 shell 测试跨 crate 消费，转无条件 pub。
+
+    /// 查找状态快照 `(打开, 可见, 匹配数, 当前下标, 查询词)`（测试探针）。
+    pub fn test_find_state(&self) -> (bool, bool, usize, Option<usize>, String) {
+        (
+            self.find.open,
+            self.find.visible,
+            self.find.matches.len(),
+            self.find.current,
+            self.find.query.clone(),
+        )
+    }
+
+    /// 状态栏文案（测试探针：行为表断言「i/N 个匹配 / 无匹配 / >N 个匹配」）。
+    pub fn test_find_status(&self) -> String {
+        self.find.status()
+    }
+
+    /// 匹配表（全文字节区间；测试探针：「高亮全部匹配」断言用）。
+    pub fn test_find_matches(&self) -> Vec<std::ops::Range<usize>> {
+        self.find.matches.clone()
+    }
+
+    /// 当前命中的字节区间（`None` = 无匹配/未定位；测试探针）。
+    pub fn test_find_current_range(&self) -> Option<std::ops::Range<usize>> {
+        self.find.current.and_then(|i| self.find.matches.get(i)).cloned()
+    }
+
+    /// find 输入框实体（测试探针：驱动输入/断言焦点）。
+    pub fn test_find_input(&self) -> Option<&gpui::Entity<ui::input::InputState>> {
+        self.find_input.as_ref()
+    }
+
+    /// 同步走一次「防抖到期重扫」落地（测试探针：fake 执行器不轮询定时 spawn，
+    /// 测试需确定性驱动重算路径；与 `test_scan_sync_land` 同姿势）。
+    pub fn test_find_scan_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        self.find_scan_land(cx);
+    }
+}
 
 /// 行首空白字节数（空格/Tab；缩进折叠启发式用）。
 fn leading_ws_len(s: &str) -> usize {
