@@ -16,9 +16,9 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, ObjectFit,
+    AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, MouseButton, ObjectFit,
     ParentElement as _, RenderImage, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _,
-    StyledImage, Window, div, img, px,
+    StyledImage, Window, div, img, point, px,
 };
 
 use std::collections::HashMap;
@@ -29,6 +29,10 @@ use crate::model::Track;
 
 use super::icon::{IconView, MusicIcon};
 use super::{MainSection, MusicView, theme};
+
+/// 主区横向内边距（px，左右同值）：`#music-main` 内容区留白；overlay 滚动条用
+/// `right(-MAIN_PAD_X)` 贴主区右缘（跨过右 padding），两端共用同一常量防漂移。
+const MAIN_PAD_X: f32 = 28.0;
 
 /// 歌曲表行高（px，近似原型的行内距）。
 const ROW_H: f32 = 52.0;
@@ -55,6 +59,16 @@ pub(super) const HOME_EMPTY_H: f32 = 120.0;
 
 /// 可视窗上下各多物化 N 行（缓冲）：快速滚动不至于露白/闪。
 const VISIBLE_BUFFER: usize = 6;
+
+/// 主区列表滚动条自动隐藏延时（ms）：最后一次滚动活动（滚轮/拖拽 thumb）后 3s 无新
+/// 滚动活动 → 淡出隐藏（「鼠标移动不算动作」——列表内移动不刷新计时）。
+const SCROLLBAR_HIDE_MS: u64 = 3000;
+
+/// 主区列表滚动条宽度（px，对齐原型全局 6px overlay 细条；圆角 3px）。
+const SCROLLBAR_W: f32 = 6.0;
+
+/// 滚动条 thumb 最小高（px）与最大宽（占可视窗）：列表极长时 thumb 不致过小。
+const SCROLLBAR_THUMB_MIN_H: f32 = 24.0;
 
 /// 首帧未布局（scroll 容器 viewport=0）时的兜底物化行数（防空窗）。
 const FALLBACK_FIRST_ROWS: usize = 8;
@@ -208,7 +222,7 @@ impl super::MusicView {
             .min_h(px(0.))
             .flex()
             .flex_col()
-            .px(px(28.))
+            .px(px(MAIN_PAD_X))
             .pt(px(24.))
             .child(self.render_main_header(window, cx))
             .child(body)
@@ -704,6 +718,8 @@ impl super::MusicView {
 
     /// 虚拟化列表（[`MainList`] 可视窗 → 物化 ± 缓冲行）：顶部/底部定高垫片保内容总高
     /// （= [`MainList::total_h`]，全范围可滚）；屏外行不物化、不画渐变、不建 debug_selector。
+    /// 外层包 `relative` 供右侧 overlay 滚动条（[`Self::main_scrollbar`]）叠放（absolute 不随
+    /// 内容滚）；滚动容器本身仍 flex_1 撑满。
     fn render_list(&mut self, list: &Rc<MainList>, cx: &mut Context<Self>) -> AnyElement {
         let scroll_y = (-self.main_scroll.offset().y.as_f32()).max(0.0);
         let viewport = self.main_scroll.bounds().size.height.as_f32();
@@ -711,12 +727,19 @@ impl super::MusicView {
         let top_h = list.prefix[first] as f32;
         let bottom_h = (list.total_h() - list.prefix[last] as f32).max(0.0);
         let items = &list.items;
-        div()
+        let list_el = div()
             .id("music-list")
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
             .track_scroll(&self.main_scroll)
+            .on_scroll_wheel(cx.listener(|this: &mut MusicView, _ev, _w, cx| {
+                // 滚轮 = 滚动活动：刷新滚动条显示计时（此前隐藏则这次补 notify 显示）。
+                this.scrollbar_last_activity = Some(cx.background_executor().now());
+                if !this.scrollbar_shown_last {
+                    cx.notify();
+                }
+            }))
             .child(div().h(px(top_h)))
             .children((first..last).map(|i| match &items[i] {
                 MainItem::Row { idx, rank } => self.song_row(*idx, *rank, cx),
@@ -726,8 +749,153 @@ impl super::MusicView {
                 MainItem::HomeHotTitle { total } => self.home_hot_title(*total),
                 MainItem::HomeEmpty => self.home_empty(cx),
             }))
-            .child(div().h(px(bottom_h)))
+            .child(div().h(px(bottom_h)));
+        let scrollbar = self.main_scrollbar(list, cx);
+        div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(list_el)
+            .child(scrollbar)
             .into_any_element()
+    }
+
+    /// 主区列表右侧 overlay 滚动条（原型 6px 圆角细条）：thumb 高/位置由
+    /// `main_scroll` 偏移与 [`MainList::total_h`] 反算；**仅滚动活动驱动显示**
+    /// [`SCROLLBAR_HIDE_MS`] 后淡出；thumb 可鼠标拖拽定位（track 挂 `bounds_canvas` +
+    /// 窗口坐标 fraction 反算，对齐 bottom::strip 同款姿势）。
+    fn main_scrollbar(&mut self, list: &Rc<MainList>, cx: &mut Context<Self>) -> AnyElement {
+        let viewport = self.main_scroll.bounds().size.height.as_f32();
+        let total = list.total_h();
+        if total <= viewport {
+            // 内容不满可视窗 → 无可滚、不显示滚动条。
+            self.scrollbar_shown_last = false;
+            return div().into_any_element();
+        }
+        self.scrollbar_shown_last = self.main_scrollbar_shown(cx);
+        let offset_y = (-self.main_scroll.offset().y.as_f32()).max(0.0);
+        let max_scroll = total - viewport;
+        let thumb_h = (viewport * viewport / total)
+            .max(SCROLLBAR_THUMB_MIN_H)
+            .min(viewport);
+        let roll = (viewport - thumb_h).max(1.0);
+        // clamp：底部惯性/动量过滚（offset 短暂越界）时 thumb 钉在底部不失形（原实现
+        // thumb_top 越界画出 track 下缘、可见长度变短——用户实测「滚到底继续滚、滚动条缩短」）。
+        let thumb_top = (offset_y / max_scroll.max(1.0) * roll).clamp(0.0, roll);
+        let color = if self.scrollbar_hovered || self.scrollbar_dragging {
+            theme::text3()
+        } else {
+            theme::bg_hover()
+        };
+        let bounds = self.main_sb_bounds.clone();
+        let shown = self.scrollbar_shown_last;
+        let sb = div()
+            .id("music-main-scrollbar")
+            .debug_selector(|| "music-main-scrollbar".into())
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(-MAIN_PAD_X))
+            .w(px(SCROLLBAR_W))
+            .cursor(CursorStyle::PointingHand)
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(thumb_top))
+                    .h(px(thumb_h))
+                    .rounded(px(3.))
+                    .bg(color)
+                    .opacity(if shown { 1.0 } else { 0.0 })
+                    .debug_selector(|| "music-main-scrollbar-thumb".into()),
+            )
+            .child(theme::bounds_canvas(bounds.clone()));
+        // hover 换色（不参与显隐，鼠标移动不算动作）。按下（点即跳）后 **move 由根视图
+        // `on_root_mouse_move` 冒泡兜底**——gpui 无隐式 pointer-capture，move 只派发给 hover
+        // 元素；拖出 6px 窄 track 后 track 收不到 move、回来才按新位置跳。根兜底后拖拽全程
+        // （含移出 track）持续更新 offset（clamp 到 track 分数），松手由根 `on_mouse_up` 收尾。
+        let sb = sb
+            .on_hover(
+                cx.listener(|this: &mut MusicView, hovered, _w, cx| {
+                    this.scrollbar_hovered = *hovered;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut MusicView, ev: &gpui::MouseDownEvent, _w, cx| {
+                    this.scrollbar_dragging = true;
+                    this.scrollbar_last_activity = Some(cx.background_executor().now());
+                    if let Some(o) = this.sb_offset_from_pos(ev.position) {
+                        this.main_scroll.set_offset(point(px(0.), px(-o)));
+                    }
+                    cx.notify();
+                }),
+            );
+        sb.into_any_element()
+    }
+
+    /// 主区滚动条拖拽 move（由根 `on_mouse_move` 冒泡送达，见 [`Self::main_scrollbar`]）：
+    /// 拖拽中按鼠标位置 fraction 持续更新 offset（clamp，移出 track 上下界也钉住）。
+    pub(super) fn on_main_sb_drag_move(
+        &mut self,
+        ev: &gpui::MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.scrollbar_dragging {
+            return;
+        }
+        self.scrollbar_last_activity = Some(cx.background_executor().now());
+        if let Some(o) = self.sb_offset_from_pos(ev.position) {
+            self.main_scroll.set_offset(point(px(0.), px(-o)));
+        }
+        cx.notify();
+    }
+
+    /// 滚动条是否应显示：有滚动活动（[`SCROLLBAR_HIDE_MS`] 内）或正在拖拽 thumb。
+    /// 鼠标移动不刷新（按「仅滚动驱动显示」契约）。
+    pub(super) fn main_scrollbar_shown(&self, cx: &Context<Self>) -> bool {
+        if self.scrollbar_dragging {
+            return true;
+        }
+        self.scrollbar_last_activity.is_some_and(|at| {
+            cx.background_executor().now().duration_since(at).as_millis() < SCROLLBAR_HIDE_MS as u128
+        })
+    }
+
+    /// 拖拽/hover 反算：鼠标 y（窗口坐标）→ 主列表应滚到的 offset（≥0）。读当前分区显示
+    /// 模型总高与滚动容器视口；内容不满视口返回 None。
+    fn sb_offset_from_pos(&self, pos: gpui::Point<gpui::Pixels>) -> Option<f32> {
+        let b = self.main_sb_bounds.get();
+        if b.size.height.as_f32() <= 0.0 {
+            return None;
+        }
+        let (viewport, total) = self.sb_metrics()?;
+        if total <= viewport {
+            return None;
+        }
+        let thumb_h = (viewport * viewport / total)
+            .max(SCROLLBAR_THUMB_MIN_H)
+            .min(viewport);
+        let roll = (viewport - thumb_h).max(1.0);
+        let frac = ((pos.y.as_f32() - b.origin.y.as_f32() - thumb_h / 2.0) / roll).clamp(0.0, 1.0);
+        Some(frac * (total - viewport))
+    }
+
+    /// 当前分区主列表显示模型（渲染期缓存；无 = None）。
+    fn main_list_now(&self) -> Option<Rc<MainList>> {
+        let key = (self.state.section.clone(), self.state.search.clone());
+        self.main_list_cache.get(&key).map(|(_rev, l)| l.clone())
+    }
+
+    /// 当前滚动条可视窗高与内容总高 `(viewport, total)`。
+    fn sb_metrics(&self) -> Option<(f32, f32)> {
+        let viewport = self.main_scroll.bounds().size.height.as_f32();
+        let total = self.main_list_now()?.total_h();
+        Some((viewport, total))
     }
 
     /// 艺术家分组头（固定高 [`GROUP_H`]，竖向居中）：组标题 + 首数；样式色/字号同旧。
