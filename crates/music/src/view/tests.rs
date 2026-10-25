@@ -2739,6 +2739,268 @@ async fn liked_list_updates_after_like_invalidation(cx: &mut TestAppContext) {
     );
 }
 
+// ---- Home 整页竖向虚拟滚动（我的推荐 Mix 卡横滑 + 滚轮拦截）回归 ----
+
+/// 用例 H1（Home 头部虚拟项）：Home 列表前 3 项 = 「我的推荐」标题 / Mix 卡横滑行 /
+/// 「热门歌曲」标题+表头（固定高虚拟项，随整页滚）；Library/Liked 不插（total_h 不变）。
+/// 旧实现（推荐块在滚动区外）下 items[0] 直接是歌行、无 home-* 元素 → 本用例 RED。
+#[gpui::test]
+async fn home_header_items_lead_virtual_list_only_for_home(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 12);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let (home_items, home_total_h) = wcx.cx.read(|app| {
+        let v = view.read(app);
+        let home = v
+            .main_list_cache
+            .get(&(MainSection::Home, String::new()))
+            .map(|(_rev, l)| l.clone())
+            .expect("Home 列表应在缓存");
+        (home.items.clone(), home.total_h())
+    });
+    use super::main::MainItem;
+    assert!(
+        matches!(home_items[0], MainItem::HomeRecTitle)
+            && matches!(home_items[1], MainItem::HomeMixRow)
+            && matches!(home_items[2], MainItem::HomeHotTitle { .. }),
+        "Home 列表头部应为三个固定虚拟项，实得前 3 项 {:?}",
+        &home_items[..3]
+    );
+    assert_eq!(
+        home_items.len(),
+        3 + 12,
+        "Home 头部 3 项 + 12 首歌曲行"
+    );
+    // 头部固定高参与总高：含推荐块（需求 1：随滚）——滚动量程 = 头部 + 歌曲总高。
+    let expect_home_h = super::main::REC_TITLE_H
+        + super::main::REC_CARDS_H
+        + super::main::HOT_TITLE_H
+        + 12.0 * 52.0;
+    assert!(
+        (home_total_h - expect_home_h).abs() < 1.0,
+        "Home total_h 应含头部虚拟块：got={home_total_h} expect={expect_home_h}"
+    );
+    // Library/Liked 不插 Home 头部项（回归约束）：Library 显示模型只含既有 分组头+歌行。
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Library);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let (lib_len, lib_has_home_variants) = wcx.cx.read(|app| {
+        let v = view.read(app);
+        let lib = v
+            .main_list_cache
+            .get(&(MainSection::Library, String::new()))
+            .map(|(_rev, l)| l.clone())
+            .expect("Library 列表应在缓存");
+        let has_home = lib
+            .items
+            .iter()
+            .any(|it| matches!(it, MainItem::HomeRecTitle | MainItem::HomeMixRow | MainItem::HomeHotTitle { .. } | MainItem::HomeEmpty));
+        (lib.items.len(), has_home)
+    });
+    assert!(
+        !lib_has_home_variants,
+        "Library 不应含 Home 头部虚拟项"
+    );
+    assert_eq!(lib_len, 5 + 12, "Library = 5 组头 + 12 行（组头是 Library 既有模型）");
+}
+
+/// 用例 H2（需求 1/3：整页随竖向滚推荐块滚出）：滚到列表中部/底部 → 推荐块虚拟项
+/// 已滚出可视窗（home-rec-title/home-mix-row 不再物化）、末行可见；旧实现推荐块在滚动区外
+/// 固定不滚 → 无 home-* 元素可断言 → RED。
+#[gpui::test]
+async fn home_scroll_to_bottom_scrolls_rec_block_out(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 120);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 顶部：推荐块 + 歌曲首行都物化（整页一起可见）。
+    assert!(wcx.debug_bounds("home-rec-title").is_some(), "顶部应物化推荐标题");
+    assert!(wcx.debug_bounds("home-mix-row").is_some(), "顶部应物化 Mix 行");
+    assert!(wcx.debug_bounds("song-row-0").is_some(), "顶部歌曲首行应物化");
+    // 滚到底：等价的 visible_range 首项应超过推荐块下标（0..2 出窗）。
+    let handle = wcx.cx.read(|app| view.read(app).main_scroll.clone());
+    let max = handle.max_offset().y.as_f32();
+    let (list, first, last) = wcx.cx.read(|app| {
+        let v = view.read(app);
+        let home = v
+            .main_list_cache
+            .get(&(MainSection::Home, String::new()))
+            .map(|(_rev, l)| l.clone())
+            .expect("Home 列表应在缓存");
+        let viewport = handle.bounds().size.height.as_f32();
+        let (f, l) = home.visible_range(max, viewport);
+        (home.total_h(), f, l)
+    });
+    assert!(
+        first > 2,
+        "滚到底推荐块应滚出可视窗（visible_range 首项 > 2）：first={first}"
+    );
+    assert!(last > 2, "滚到底可视窗应越过推荐块：last={last}");
+    assert!(
+        list > 120.0 * 52.0,
+        "Home 总高应含推荐块：got={list}"
+    );
+    // 真实滚到底：推荐块不物化、末行可见。
+    handle.set_offset(gpui::point(px(0.), px(-max)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("home-rec-title").is_none() && wcx.debug_bounds("home-mix-row").is_none(),
+        "滚到底推荐块应出屏（不物化）"
+    );
+    assert!(
+        wcx.debug_bounds("song-row-119").is_some(),
+        "滚到底应物化最后一行（song-row-119）"
+    );
+}
+
+/// 用例 H3（需求 2：滚轮在 Mix 卡区只横向、不带动整页）：对 `#music-mix` 行模拟**竖向**
+/// 滚轮 → `main_mix_scroll`（横滚句柄）offset.x < 0（Mix 卡横向滑动）+ 外层 `main_scroll`
+/// offset.y 不变（整页不动）。旧实现竖向滚会带动外层（Mix 横滚容器无拦截）→ offset.y 变、RED。
+#[gpui::test]
+async fn wheel_over_mix_row_scrolls_mix_horizontally_not_page(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+    let player = library_with_n(cx, 120); // 5 组 Mix 卡；缩窗后内容宽 > 视口 → 横滚量程非 0
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    // 缩窄窗口让 Mix 卡行产生横向溢出（默认 1920 宽下 5 卡 964px 不溢出、可滚量程为 0）。
+    wcx.simulate_resize(gpui::size(px(900.), px(800.)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let main_handle = wcx.cx.read(|app| view.read(app).main_scroll.clone());
+    let mix_handle = wcx.cx.read(|app| view.read(app).main_mix_scroll.clone());
+    let y0 = main_handle.offset().y.as_f32();
+    let x0 = mix_handle.offset().x.as_f32();
+    assert!(
+        mix_handle.max_offset().x.as_f32() > 0.0,
+        "窄窗下 Mix 行应可横滚（max_offset.x={:?} > 0）",
+        mix_handle.max_offset()
+    );
+    let b = wcx.debug_bounds("home-mix-row").expect("Mix 行应有 debug 盒");
+    let pos = gpui::Point::new(
+        px(b.origin.x.as_f32() + b.size.width.as_f32() * 0.5),
+        px(b.origin.y.as_f32() + b.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_event(ScrollWheelEvent {
+        position: pos,
+        delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    });
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let x1 = mix_handle.offset().x.as_f32();
+    let y1 = main_handle.offset().y.as_f32();
+    assert!(
+        x1 < x0,
+        "竖向滚轮应把 Mix 卡横向滑动（横滚 offset 更负）：x0={x0} x1={x1}"
+    );
+    assert!(
+        (y1 - y0).abs() < 0.01,
+        "滚 Mix 卡不得带动整页竖向滚：y0={y0} y1={y1}"
+    );
+}
+
+/// 用例 H4（需求 3：滚轮在「热门歌曲」标题区 → 整页竖向滚）：对 `home-hot-title` 模拟竖向
+/// 滚轮 → 外层 `main_scroll` offset.y 变化（整页一起滚）。旧实现标题区是列表外固定块 → 滚轮
+/// 只滚列表、标题不动 → 语义不同（此用例验证新「整页滚」语义）。
+#[gpui::test]
+async fn wheel_over_hot_title_scrolls_whole_page(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+    let player = library_with_n(cx, 120);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let main_handle = wcx.cx.read(|app| view.read(app).main_scroll.clone());
+    let y0 = main_handle.offset().y.as_f32();
+    let b = wcx.debug_bounds("home-hot-title").expect("热门标题行应有 debug 盒");
+    let pos = gpui::Point::new(
+        px(b.origin.x.as_f32() + b.size.width.as_f32() * 0.5),
+        px(b.origin.y.as_f32() + b.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_event(ScrollWheelEvent {
+        position: pos,
+        delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    });
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let y1 = main_handle.offset().y.as_f32();
+    assert!(y1 < y0, "滚热门标题区应整页竖向滚（offset 更负）：y0={y0} y1={y1}");
+}
+
+/// 用例 H5（小窗口）：小视口下 Home `total_h` 含推荐块高度（> 纯歌曲总高），滚到底可显示末行
+/// ——小窗口也能滚到全部内容（需求 3）。旧实现滚动区只含歌曲行、推荐块固定占掉有限空间 → 语义不同。
+#[gpui::test]
+async fn home_small_window_total_h_includes_rec_block_and_bottom_reachable(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 120);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    wcx.simulate_resize(gpui::size(px(900.), px(500.)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let (list, n_rows) = wcx.cx.read(|app| {
+        let v = view.read(app);
+        let home = v
+            .main_list_cache
+            .get(&(MainSection::Home, String::new()))
+            .map(|(_rev, l)| l.clone())
+            .expect("Home 列表应在缓存");
+        (home.total_h(), home.total)
+    });
+    assert_eq!(n_rows, 120);
+    assert!(
+        list > 120.0 * 52.0,
+        "小窗口下 Home total_h 应含推荐块高度（> 歌曲总高）：{list}"
+    );
+    // 滚到底（超界 offset 会钳位到 -max）→ 末行物化。
+    let handle = wcx.cx.read(|app| view.read(app).main_scroll.clone());
+    handle.set_offset(gpui::point(px(0.), px(-(list + 1000.0))));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("song-row-119").is_some(),
+        "小窗口滚到底应显示末行（song-row-119）"
+    );
+}
+
+/// 用例 H6（空库/搜索 0 命中）：Home 头部占位项稳定可滚、空态行在列表内、不 panic。
+#[gpui::test]
+async fn home_empty_or_zero_hit_keeps_header_placeholders(cx: &mut TestAppContext) {
+    // 空库（未 load_dir）：正在扫描/无歌占位行 + 头部三项都在。
+    let player: Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("home-rec-title").is_some(), "空库也要物化推荐标题");
+    assert!(wcx.debug_bounds("home-mix-row").is_some(), "空库也要物化 Mix 行");
+    assert!(wcx.debug_bounds("home-hot-title").is_some(), "空库也要物化热门标题");
+    assert!(wcx.debug_bounds("home-empty").is_some(), "空库应物化空态占位行");
+    // 搜索到 0 命中（非空库）：头部项仍占位 + 空态行 + 无歌行、不 panic。
+    let player2 = library_with_n(cx, 12);
+    let (view2, wcx2) = cx.add_window_view(|_w, cx| MusicView::new(player2, cx));
+    wcx2.update(|_w, app| view2.update(app, |v, _| v.state.search = "不存在".into()));
+    wcx2.update(|window, app| window.draw(app).clear(app));
+    wcx2.run_until_parked();
+    assert!(wcx2.debug_bounds("home-rec-title").is_some(), "0 命中也要物化推荐标题");
+    assert!(wcx2.debug_bounds("home-empty").is_some(), "0 命中应物化空态占位行");
+    assert!(
+        wcx2.debug_bounds("song-row-0").is_none(),
+        "0 命中不应物化歌行"
+    );
+}
+
+
 // ---- Windows 风格标题栏（主界面顶层；窗口控制钮走 window_control_area 原生机制）----
 
 /// 最大化/还原图标选择（纯函数，双路注入断言）：未最大化 →「最大化」图标；已最大化 →

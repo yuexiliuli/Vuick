@@ -17,8 +17,8 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, RenderImage, StatefulInteractiveElement as _, Styled as _, StyledImage,
-    Window, div, img, px,
+    ParentElement as _, RenderImage, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _,
+    StyledImage, Window, div, img, px,
 };
 
 use std::collections::HashMap;
@@ -37,6 +37,22 @@ const ROW_H: f32 = 52.0;
 /// 归一为整 48、垂直居中（外观近似；`GROUP_H`/`ROW_H` 固定是「仅物化可视窗」的前提）。
 const GROUP_H: f32 = 48.0;
 
+/// Home「我的推荐」标题行高（px，虚拟行固定高；「我的推荐」+「查看全部 →」）。
+pub(super) const REC_TITLE_H: f32 = 40.0;
+
+/// Home Mix 卡横滑行高（px，虚拟行固定高）：180 封面 + 标题/副标题 + 底留白，
+/// 内嵌横向滚动容器（`overflow_x_scroll` + `track_scroll(&main_mix_scroll)`）。行高固定是
+/// 前缀反查的前提——内容溢出由行内横滚裁剪，不求全卡高度。
+pub(super) const REC_CARDS_H: f32 = 240.0;
+
+/// Home「热门歌曲」标题（+共 N 首）+ 歌曲表头行高（px，虚拟行固定高）：标题行
+/// 与表头随整页滚动；表头只一行、滚走合理（`render_song_header` 并入本行）。
+pub(super) const HOT_TITLE_H: f32 = 90.0;
+
+/// Home 空态占位行高（px，虚拟行固定高）：空库/扫描中/搜索 0 命中时仍在列表内占位
+/// （稳定竖向布局，随整页可滚、不 panic）。
+pub(super) const HOME_EMPTY_H: f32 = 120.0;
+
 /// 可视窗上下各多物化 N 行（缓冲）：快速滚动不至于露白/闪。
 const VISIBLE_BUFFER: usize = 6;
 
@@ -50,6 +66,15 @@ pub(super) enum MainItem {
     GroupHeader { artist: Arc<str>, count: usize },
     /// 歌行：`idx` = 真实库下标（点击 `handle_play_idx(idx)` 映射），`rank` = 组内/过滤序。
     Row { idx: usize, rank: usize },
+    // ---- Home 固定高头部虚拟项（只由 `build_main_list(Home)` 插在歌曲行前；Library/Liked 不插）----
+    /// Home「我的推荐」标题行（固定高 [`REC_TITLE_H`]）。
+    HomeRecTitle,
+    /// Home Mix 卡横滑行（固定高 [`REC_CARDS_H`]；内部横向滚动，竖向滚轮在此行被拦截转横向）。
+    HomeMixRow,
+    /// Home「热门歌曲」标题（共 N 首）+ 歌曲表头行（固定高 [`HOT_TITLE_H`]）。
+    HomeHotTitle { total: usize },
+    /// Home 空态占位行（固定高 [`HOME_EMPTY_H`]；空库/扫描中/搜索 0 命中时列表仍可滚）。
+    HomeEmpty,
 }
 
 /// 主区「过滤+分组」后的扁平显示模型（一次构建、缓存复用）：
@@ -72,6 +97,10 @@ impl MainList {
             acc += match it {
                 MainItem::Row { .. } => ROW_H as i32,
                 MainItem::GroupHeader { .. } => GROUP_H as i32,
+                MainItem::HomeRecTitle => REC_TITLE_H as i32,
+                MainItem::HomeMixRow => REC_CARDS_H as i32,
+                MainItem::HomeHotTitle { .. } => HOT_TITLE_H as i32,
+                MainItem::HomeEmpty => HOME_EMPTY_H as i32,
             };
             prefix.push(acc);
         }
@@ -81,7 +110,7 @@ impl MainList {
     /// 可视行窗 `[first,last)`（item 下标，含缓冲）：`scroll_y` = 容器向下滚动 px（≥0），
     /// `viewport` = 容器可视高。按 prefix 二分反查；首帧未布局（viewport=0）用
     /// [`FALLBACK_FIRST_ROWS`] 兜底；钳位 + 至少 1 行、空态 (0,0)。
-    fn visible_range(&self, scroll_y: f32, viewport: f32) -> (usize, usize) {
+    pub(super) fn visible_range(&self, scroll_y: f32, viewport: f32) -> (usize, usize) {
         let n = self.items.len();
         if n == 0 {
             return (0, 0);
@@ -112,7 +141,7 @@ impl MainList {
     }
 
     /// 总内容高（px，滚动量程）：顶部/底部垫片之和保底此值。
-    fn total_h(&self) -> f32 {
+    pub(super) fn total_h(&self) -> f32 {
         self.prefix[self.items.len()] as f32
     }
 }
@@ -349,8 +378,53 @@ impl super::MusicView {
     // ---- Home：我的推荐 Mix 卡 + 热门歌曲表 ----
 
     fn render_home(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let p = self.player.read(cx);
-        let groups: Vec<(String, String, Vec<usize>, (String, String))> = p
+        // Home 整页并入 `#music-list` 单一竖向虚拟滚动：「我的推荐」（标题+Mix 卡横滑行）+
+        // 「热门歌曲」（标题+表头）都在滚动区内的固定高虚拟项里，随歌曲行一起滚；
+        // 问候/搜索头部保持固定（用户点名范围外）。空库/空命中头部仍占位稳定。
+        let list = self.main_list_for(MainSection::Home, cx);
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(self.render_list(&list, cx))
+            .into_any_element()
+    }
+
+    /// Home「我的推荐」标题行（虚拟项固定高 [`REC_TITLE_H`]；随整页滚）。
+    fn home_rec_title(&mut self) -> AnyElement {
+        div()
+            .id("home-rec-title")
+            .debug_selector(|| "home-rec-title".into())
+            .h(px(REC_TITLE_H))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(18.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(theme::text())
+                    .child("我的推荐"),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme::accent_light())
+                    .child("查看全部 →"),
+            )
+            .into_any_element()
+    }
+
+    /// Home Mix 卡横滑行（虚拟项固定高 [`REC_CARDS_H`]）：固定高壳 + 内部 `overflow_x_scroll`
+    /// 横滑容器（`track_scroll(&main_mix_scroll)` **持久化横滚位置**——虚拟化滚出再滚回不丢）。
+    /// **滚轮拦截（需求 2）**：竖向滚轮经 `overflow_x_scroll`（x 可滚、y 不可滚）原生自动转
+    /// 横向消费，本壳 `on_scroll_wheel` 只 `stop_propagation()` 阻止冒泡到外层 `#music-list`
+    /// 竖向滚——「滚 Mix 卡只横向、不带动整页」；横向滚轮同理放行。无 mix 组时渲染空行占位。
+    fn home_mix_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let groups = self
+            .player
+            .read(cx)
             .mix_groups()
             .iter()
             .take(6)
@@ -362,15 +436,46 @@ impl super::MusicView {
                     g.grad.clone(),
                 )
             })
+            .collect::<Vec<_>>();
+        let cards: Vec<AnyElement> = groups
+            .into_iter()
+            .filter(|g| !g.2.is_empty())
+            .map(|(title, sub, tracks, grad)| self.mix_card(title, sub, tracks, grad, cx))
             .collect();
-        let total = p.library().len();
-        let list = self.main_list_for(MainSection::Home, cx);
+        let stop = cx.listener(
+            |_this: &mut MusicView, _ev: &ScrollWheelEvent, _w: &mut Window, cx: &mut Context<Self>| {
+                // 竖向滚轮已被行内 `overflow_x_scroll` 转横向消费；这里只拦冒泡，防外层整页竖向滚。
+                cx.stop_propagation();
+            },
+        );
         div()
-            .flex_1()
-            .min_h(px(0.))
+            .id("home-mix-row")
+            .debug_selector(|| "home-mix-row".into())
+            .h(px(REC_CARDS_H))
+            .overflow_hidden()
+            .on_scroll_wheel(stop)
+            .child(
+                div()
+                    .id("music-mix-scroll")
+                    .size_full()
+                    .flex()
+                    .gap_x(px(16.))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.main_mix_scroll)
+                    .pb(px(10.))
+                    .children(cards),
+            )
+            .into_any_element()
+    }
+
+    /// Home「热门歌曲」标题（共 N 首）+ 歌曲表头行（虚拟项固定高 [`HOT_TITLE_H`]；随整页滚）。
+    fn home_hot_title(&mut self, total: usize) -> AnyElement {
+        div()
+            .id("home-hot-title")
+            .debug_selector(|| "home-hot-title".into())
+            .h(px(HOT_TITLE_H))
             .flex()
             .flex_col()
-            .child(self.render_mix_scroll(groups, cx))
             .child(
                 div()
                     .flex()
@@ -393,61 +498,40 @@ impl super::MusicView {
                     ),
             )
             .child(self.render_song_header())
-            .child(if list.total == 0 {
-                // 空态：异步扫库装配中给弱提示，否则真无歌（搜索无命中）。
-                let p = self.player.read(cx);
-                if p.scanning() && p.library().is_empty() {
-                    super::empty_state("正在扫描音乐库…", "大目录首次装载需要片刻")
-                        .into_any_element()
-                } else {
-                    super::empty_state("没有匹配的歌曲", "清空搜索或换个关键词").into_any_element()
-                }
-            } else {
-                self.render_list(&list, cx)
-            })
             .into_any_element()
     }
 
-    /// 「我的推荐」横滑 Mix 卡组（`overflow_x_scroll`）。
-    fn render_mix_scroll(
-        &mut self,
-        groups: Vec<(String, String, Vec<usize>, (String, String))>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let cards: Vec<AnyElement> = groups
-            .into_iter()
-            .filter(|g| !g.2.is_empty())
-            .map(|(title, sub, tracks, grad)| self.mix_card(title, sub, tracks, grad, cx))
-            .collect();
-        div().flex().flex_col()
+    /// Home 空态占位行（虚拟项固定高 [`HOME_EMPTY_H`]）：空库/扫描中/搜索 0 命中时列表仍可滚、
+    /// 头部占位稳定。文案渲染期读 player（拆「正在扫描」与「无匹配」两况）。
+    fn home_empty(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.player.read(cx);
+        let (title, sub) = if p.scanning() && p.library().is_empty() {
+            ("正在扫描音乐库…", "大目录首次装载需要片刻")
+        } else {
+            ("没有匹配的歌曲", "清空搜索或换个关键词")
+        };
+        div()
+            .id("home-empty")
+            .debug_selector(|| "home-empty".into())
+            .h(px(HOME_EMPTY_H))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .text_color(theme::text2())
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .pb(px(14.))
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(theme::text())
-                            .child("我的推荐"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme::accent_light())
-                            .child("查看全部 →"),
-                    ),
+                    .text_size(px(15.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text2())
+                    .child(title.to_string()),
             )
             .child(
                 div()
-                    .id("music-mix-scroll")
-                    .flex()
-                    .gap_x(px(16.))
-                    .overflow_x_scroll()
-                    .pb(px(10.))
-                    .children(cards),
+                    .pt_1()
+                    .text_size(px(12.))
+                    .text_color(theme::text3())
+                    .child(sub.to_string()),
             )
             .into_any_element()
     }
@@ -637,6 +721,10 @@ impl super::MusicView {
             .children((first..last).map(|i| match &items[i] {
                 MainItem::Row { idx, rank } => self.song_row(*idx, *rank, cx),
                 MainItem::GroupHeader { artist, count } => self.group_header(artist, *count),
+                MainItem::HomeRecTitle => self.home_rec_title(),
+                MainItem::HomeMixRow => self.home_mix_row(cx),
+                MainItem::HomeHotTitle { total } => self.home_hot_title(*total),
+                MainItem::HomeEmpty => self.home_empty(cx),
             }))
             .child(div().h(px(bottom_h)))
             .into_any_element()
@@ -917,7 +1005,20 @@ fn build_main_list(
             Rc::new(MainList::new(items, rank))
         }
         MainSection::Home => {
-            let mut items = Vec::new();
+            // Home 头部三个固定高虚拟项（「我的推荐」标题 / Mix 卡横滑行 / 「热门歌曲」标题+表头）
+            // 插在歌曲行前，使整页并入 `#music-list` 竖向虚拟滚动一起滚；Library/Liked 不插。
+            // 空库/搜索 0 命中时追加固定高空态占位项（头部仍占位稳定、列表可滚不 panic）。
+            let mut items = Vec::with_capacity(lib.len() + 3);
+            items.push(MainItem::HomeRecTitle);
+            items.push(MainItem::HomeMixRow);
+            let total = lib
+                .iter()
+                .filter(|t| filter_pass(&t.title, &t.artist, q))
+                .count();
+            items.push(MainItem::HomeHotTitle { total });
+            if total == 0 {
+                items.push(MainItem::HomeEmpty);
+            }
             let mut rank = 0usize;
             for (i, t) in lib.iter().enumerate() {
                 if filter_pass(&t.title, &t.artist, q) {
@@ -925,7 +1026,7 @@ fn build_main_list(
                     rank += 1;
                 }
             }
-            Rc::new(MainList::new(items, rank))
+            Rc::new(MainList::new(items, total))
         }
     }
 }

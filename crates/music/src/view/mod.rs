@@ -186,6 +186,10 @@ pub struct MusicView {
     /// 主区列表滚动句柄（Library/Liked/Home 单一活跃滚动容器共用；`track_scroll` 绑定、
     /// 偏移驱动可见行窗——见 `main::MainList::visible_range`）。
     main_scroll: ScrollHandle,
+    /// Home「我的推荐」Mix 卡横滑滚动句柄：`track_scroll` 绑定行内 `#music-mix-scroll`，
+    /// **持久化横滚位置**——HomeMixRow 虚拟行滚出再滚回不丢；竖向滚轮经 `overflow_x_scroll`
+    /// 原生转横向写回此句柄，行壳 `stop_propagation` 阻止整页竖向滚（见 `main::home_mix_row`）。
+    main_mix_scroll: ScrollHandle,
     /// 主区「过滤/分组显示模型」缓存（`(分区, 搜索词)` → `(库变更计数, Rc<显示模型>)`）：
     /// 同一搜索词且 `player.mutation()` 不变则复用——消除每帧重过滤 + `Vec<Track>` 深克隆。
     main_list_cache: HashMap<(MainSection, String), (u64, Rc<main::MainList>)>,
@@ -243,6 +247,7 @@ impl MusicView {
             covers: HashMap::new(),
             cover_loading: HashSet::new(),
             main_scroll: ScrollHandle::new(),
+            main_mix_scroll: ScrollHandle::new(),
             main_list_cache: HashMap::new(),
             eq_main: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "row-current")),
             eq_queue: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "queue-current")),
