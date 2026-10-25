@@ -127,7 +127,13 @@
 
     /// 视频右键「锁定」：右键在光标处弹菜单 → 点「锁定」→ 进入纯视频（外壳隐藏、视频
     /// 充满窗口）；再右键 → 点「锁定」→ 解锁回归。解码失败（假字节）不影响锁定状态机。
+    /// ⚠️ `#[ignore]`（P0-A 挂起处置）：本测试创建真 `VideoViewer`（假 mp4 字节），FFmpeg
+    /// `avformat_open_input` 探测损坏文件会**永久卡死**、测试进程无法结束（实测单跑 60s 只
+    /// 打印 `moov atom not found` 后挂起，与 `media_loads_share_common_fields` 同病）。恢复
+    /// 条件：video 打开损坏文件有超时/看门狗、或本测试改用可解析视频夹具后摘除 `#[ignore]`
+    /// （断言保留，`-- --ignored` 可手动驱动）。
     #[cfg(feature = "video")]
+    #[ignore]
     #[gpui::test]
     async fn video_right_click_lock_menu_toggles(cx: &mut TestAppContext) {
         init_test(cx);
