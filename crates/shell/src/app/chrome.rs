@@ -207,22 +207,12 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 把当前偏好（主题三态 / 字号 / 侧栏宽度 / 最近打开）原子写盘。
-    /// 侧栏宽度只在用户手动拖过（`width_auto == false`）时才持久化，
-    /// 否则下次启动仍保持随内容自适应。
-    /// **测试构建不写盘**（config crate 是依赖编译、不受其自身 `cfg!(test)` 门控，
-    /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
-    pub(super) fn persist_prefs(&self) {
-        // 用 `cfg!(test)` 而不是 `#[cfg(test)] return;`：后者在测试构建里把后续写成
-        // 不可达代码抛 `unreachable_code` 警告；cfg! 为运行时常量，不剪枝可达性。
-        // 测试构建不写盘（config crate 是依赖编译、不受其自身 cfg!(test) 门控，
-        // 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
-        if cfg!(test) {
-            return;
-        }
-        // 音乐播放器偏好（music_dir / music_liked）不由 shell 维护：本处写盘是 主题/字号/
-        // 最近打开 等其它设置的持久化，须沿用已存值，否则每次保存都会把音乐目录/收藏
-        // 覆盖回空（K10 派生状态一次性读回）。
+    /// 汇总当前偏好（主题三态 / 字号 / 侧栏宽度 / 会话与托盘开关 / 打开文件夹根 /
+    /// 最近打开），供持久化与「导出设置」（`settings_xfer`）共用同一口径——导出即
+    /// 「当前交互态」，两者始终一致。
+    pub(super) fn collect_prefs(&self) -> UserPrefs {
+        // 音乐播放器偏好（music_dir / music_liked / 音量 / 上次曲目）不由 shell 维护：
+        // 此处沿用已存值（与持久化既有口径一致，避免放空音乐目录/收藏）。
         let existing = UserPrefs::load();
         UserPrefs {
             theme: self.theme_pref,
@@ -254,7 +244,20 @@ impl EditorApp {
             music_last_track: existing.music_last_track,
             music_progress_secs: existing.music_progress_secs,
         }
-        .save();
+    }
+
+    /// 把当前偏好（主题三态 / 字号 / 侧栏宽度 / 最近打开）原子写盘。
+    /// 侧栏宽度只在用户手动拖过（`width_auto == false`）时才持久化，
+    /// 否则下次启动仍保持随内容自适应。
+    /// **测试构建不写盘**（config crate 是依赖编译、不受其自身 `cfg!(test)` 门控，
+    /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
+    pub(super) fn persist_prefs(&self) {
+        // 用 `cfg!(test)` 而不是 `#[cfg(test)] return;`：后者在测试构建里把后续写成
+        // 不可达代码抛 `unreachable_code` 警告；cfg! 为运行时常量，不剪枝可达性。
+        if cfg!(test) {
+            return;
+        }
+        self.collect_prefs().save();
     }
     /// 窗口控制钮图标前景（Win11「注入感」）：只换色、粗细/几何不动。
     /// - 关闭：空闲次要灰 → hover/按压 白 ×（红底白×，与 P1-7 `close_pressed` 搭配）

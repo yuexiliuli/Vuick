@@ -143,9 +143,9 @@ impl UserPrefs {
         }
     }
 
-    /// 从 JSON 对象解析（纯函数，供 `load` 与测试使用）：字段缺省 / 类型不符 /
+    /// 从 JSON 对象解析（纯函数，供 `load`、导入设置与测试使用）：字段缺省 / 类型不符 /
     /// 值非法一律回退默认，绝不 panic。
-    fn from_json_value(v: &Value) -> Self {
+    pub fn from_json_value(v: &Value) -> Self {
         let mut prefs = Self::default();
         let Some(map) = v.as_object() else {
             return prefs;
@@ -211,8 +211,8 @@ impl UserPrefs {
             .collect()
     }
 
-    /// 序列化成 JSON 对象（纯函数，供 `save` 与测试使用）。
-    fn to_json_value(&self) -> Value {
+    /// 序列化成 JSON 对象（纯函数，供 `save`、「导出设置」与测试使用）。
+    pub fn to_json_value(&self) -> Value {
         json!({
             "theme": self.theme.as_str(),
             "font_size": self.font_size,

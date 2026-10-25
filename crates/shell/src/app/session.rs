@@ -95,7 +95,9 @@ impl SessionTab {
 }
 
 impl SessionManifest {
-    fn to_value(&self) -> Value {
+    /// 序列化成 JSON 对象。`pub(crate)`：除会话持久化外，「导出设置」也要把清单嵌入
+    /// 导出包（同一序列化口径，避免复制清单格式）。
+    pub(crate) fn to_value(&self) -> Value {
         json!({
             "version": self.version,
             "active_tab": self.active_tab,
@@ -104,7 +106,8 @@ impl SessionManifest {
     }
 
     /// 清单回退语义：非对象 / 缺字段 / 损坏 → 最小可用清单（不 panic）。
-    fn from_value(v: &Value) -> SessionManifest {
+    /// `pub(crate)`：除 `read_manifest` 外，「导入设置」也要从导出包解析清单。
+    pub(crate) fn from_value(v: &Value) -> SessionManifest {
         let Some(obj) = v.as_object() else {
             return Self::default();
         };
@@ -189,6 +192,64 @@ pub(crate) fn clear_session(dir: &Path) -> bool {
     }
     let _ = fs::remove_file(manifest_path(dir));
     true
+}
+
+/// 导入槽位正文大小上限（字节）：防护恶意/退化导出包用超大槽位撑爆磁盘或内存。
+/// 64 MiB 对正常未命名大文档富余；超限 → 拒掉**整个**会话（零写入，不半途落盘）。
+/// `pub(crate)`：测试直接按此边界断言（+1 拒、边界内收）。
+pub(crate) const MAX_IMPORT_SLOT_BYTES: usize = 64 * 1024 * 1024;
+
+/// 槽位名必须是「单一文件名」：非空、长度有界、不含任何路径分隔符 / 盘符前导 /
+/// NUL（`/`、`\`、`:` 全拒——`../x`、`C:\…`、`c:foo` 盘符相对等路径穿越/越界一律
+/// 进不来），非 `.`/`..`，非绝对路径，且不占用清单名 `session.json`。导入包是**不可信
+/// 输入**，`dir.join(slot)` 未经此校验会把槽位写出 `session` 目录任意位置（任意写盘）；
+/// 本应用自产槽位恒为 `t0..tN`，天然满足，不破坏 roundtrip。
+fn safe_slot_name(slot: &str) -> bool {
+    !slot.is_empty()
+        && slot.len() <= 256
+        && !slot.contains('/')
+        && !slot.contains('\\')
+        && !slot.contains(':')
+        && !slot.contains('\0')
+        && slot != "."
+        && slot != ".."
+        && slot != "session.json"
+        && !Path::new(slot).is_absolute()
+}
+
+/// 把「导入设置」的会话数据写回会话目录（下一启动 [`restore_session_from`] 恢复）：
+/// 先建目录、再各槽位内容、最后清单（清单 = 可恢复的原子信号，与 [`write_manifest`] /
+/// `save_session_to` 同一信号语义）。槽位缺失/写失败 → false（清单不写，不留半个会话）。
+///
+/// **安全**：写任何槽位前先整体预检——每个槽位名过 [`safe_slot_name`]（防路径穿越 /
+/// 越界任意写盘）+ 正文大小上限；清单引用的槽位名同样受检（否则可用 `slots` 之外的受控
+/// 清单绕过）。任一不合格 → 整体拒绝、零写入（不留半个会话）。`pub(crate)`：测试直接
+/// 驱动显式临时目录。
+pub(crate) fn write_imported_session(
+    dir: &Path,
+    manifest: &SessionManifest,
+    slots: &[(String, String)],
+) -> bool {
+    for (slot, content) in slots {
+        if !safe_slot_name(slot) || content.len() > MAX_IMPORT_SLOT_BYTES {
+            return false;
+        }
+    }
+    if manifest.tabs.iter().any(|t| match t {
+        SessionTab::New { slot, .. } => !safe_slot_name(slot),
+        _ => false,
+    }) {
+        return false;
+    }
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    for (slot, content) in slots {
+        if !write_slot(dir, slot, content) {
+            return false;
+        }
+    }
+    write_manifest(dir, manifest)
 }
 
 /// 清理孤儿槽位（纯函数，可测）：删除 `dir` 内**不是** `session.json`、**不是**
@@ -308,6 +369,40 @@ fn content_hash(s: &str) -> u64 {
     h.finish()
 }
 
+/// 从当前选项卡集合生成会话数据（清单 + 各未命名槽位内容，纯内存、无磁盘副作用）。
+/// [`EditorApp::save_session_to`] 与「导出设置」（`settings_xfer`）共用同一序列化口径：
+/// 文件选项卡只记路径、未命名选项卡经 [`EditorApp::tab_effective_text`] 取有效内容
+/// （live2/WYSIWYG 开启时读 WyEditor 实时内容）。槽位名 `t0..tN` 随未命名顺序位移。
+pub(crate) fn collect_session_data(
+    app: &EditorApp,
+    cx: &App,
+) -> (SessionManifest, Vec<(String, String)>) {
+    let mut tabs = Vec::new();
+    let mut slots = Vec::new();
+    let mut n_slots = 0usize;
+    for (idx, tab) in app.tabs.iter().enumerate() {
+        match &tab.file_path {
+            Some(p) => tabs.push(SessionTab::File { path: p.clone() }),
+            None => {
+                let slot = format!("t{n_slots}");
+                n_slots += 1;
+                let text = app.tab_effective_text(idx, cx);
+                slots.push((slot.clone(), text));
+                tabs.push(SessionTab::New {
+                    slot,
+                    name: "未命名".to_string(),
+                });
+            }
+        }
+    }
+    let manifest = SessionManifest {
+        version: 1,
+        active_tab: app.active_tab,
+        tabs,
+    };
+    (manifest, slots)
+}
+
 /// 保存会话（纯逻辑，显式目录，可测试）：开关关闭 → 只清不做；否则先写槽位内容、
     /// 再原子写清单（清单是"本次会话可恢复"的原子信号）。文件选项卡只记路径，未命名
     /// 选项卡经 [`EditorApp::tab_effective_text`]（与手动保存同口径：live2/WYSIWYG 开启
@@ -319,6 +414,7 @@ fn content_hash(s: &str) -> u64 {
     /// [`prune_unreferenced_slots`] 清理。
     /// 写清单成功后顺带 [`prune_unreferenced_slots`] 清理不再被引用的陈旧槽位
     /// （`remove_tab` 后重编号产生的孤儿），保证「否→删除临时文件」真正落盘。
+    /// 会话数据生成已抽到 [`collect_session_data`]（导出设置共用，不复制逻辑）。
     pub(crate) fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool {
         if !app.session_restore {
             // 开关关闭：清盘面 + 清指纹（重开时旧指纹会误判「盘上有同内容」而跳过写槽位
@@ -327,44 +423,27 @@ fn content_hash(s: &str) -> u64 {
             app.session_last_manifest_digest = None;
             return clear_session(dir);
         }
-        let mut tabs = Vec::new();
-        let mut n_slots = 0usize;
-        for (idx, tab) in app.tabs.iter().enumerate() {
-            match &tab.file_path {
-                Some(p) => tabs.push(SessionTab::File { path: p.clone() }),
-                None => {
-                    let slot = format!("t{n_slots}");
-                    n_slots += 1;
-                    let text = app.tab_effective_text(idx, cx);
-                    let h = content_hash(&text);
-                    // 槽位名与指纹都未变 → 内容与盘面一致，跳过重写（消除切选项卡/结构
-                    // 变化时的全量同步磁盘写）。写失败仅当确实要写时返回（跳过不影响盘面）。
-                    let unchanged = app.session_slot_hashes.get(&slot).copied() == Some(h);
-                    if !unchanged {
-                        if !write_slot(dir, &slot, &text) {
-                            return false;
-                        }
-                        app.session_slot_hashes.insert(slot.clone(), h);
-                    }
-                    tabs.push(SessionTab::New {
-                        slot,
-                        name: "未命名".to_string(),
-                    });
+        let (manifest, slots) = collect_session_data(app, cx);
+        for (slot, text) in &slots {
+            let h = content_hash(text);
+            // 槽位名与指纹都未变 → 内容与盘面一致，跳过重写（消除切选项卡/结构
+            // 变化时的全量同步磁盘写）。写失败仅当确实要写时返回（跳过不影响盘面）。
+            let unchanged = app.session_slot_hashes.get(slot).copied() == Some(h);
+            if !unchanged {
+                if !write_slot(dir, slot, text) {
+                    return false;
                 }
+                app.session_slot_hashes.insert(slot.clone(), h);
             }
         }
         // 收敛指纹表规模：本次不再存在的旧槽位（选项卡被关/重编号后）直接淘汰，
         // 避免 HashMap 随「反复新建/关闭未命名选项卡」长期累积（内存不放大）。
+        let n_slots = slots.len();
         app.session_slot_hashes.retain(|slot, _| {
             slot.strip_prefix('t')
                 .and_then(|s| s.parse::<usize>().ok())
                 .map_or(false, |n| n < n_slots)
         });
-        let manifest = SessionManifest {
-            version: 1,
-            active_tab: app.active_tab,
-            tabs,
-        };
         // 清单是"本次会话可恢复"的原子信号，但写它恰是切选项卡/新建时最贵的原语
         // （本机防病毒下原子写 ~5-25ms）。清单未变（`new_tab` 紧随 `make_tab` 的二次
         // 即时落盘、内容防抖收敛后的等价重写等「无变化重入」）→ 字节级相同，盘面已最

@@ -56,6 +56,7 @@ mod layout;
 mod media;
 mod preview;
 mod session;
+mod settings_xfer;
 mod sync;
 mod tab_drag;
 
@@ -464,6 +465,8 @@ pub struct EditorApp {
     goto_line_toast_key: Option<gpui::ElementId>,
     /// 最近一条 Find「当前选项卡不支持查找」提示通知的 key（自托管，同 goto_line 姿势）。
     find_toast_key: Option<gpui::ElementId>,
+    /// 最近一条「导出/导入设置」结果提示通知的 key（自托管，下次提示先移除上一条，不堆积）。
+    settings_toast_key: Option<gpui::ElementId>,
     /// 实际执行过的搜索扫描次数（每次命中缓存复用不改）。测试用：验证「查询未变
     /// 时反复渲染不重扫」这一优化真实生效。
     pub(crate) search_scan_count: usize,

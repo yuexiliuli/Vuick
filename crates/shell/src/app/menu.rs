@@ -93,6 +93,20 @@ impl EditorApp {
             |this, window, cx| this.save_as(window, cx),
         ))
         .separator()
+        // 「导出/导入设置…」：配置 + 会话全量打包为单个 .json（系统保存/打开对话框）。
+        .item(Self::menu_action_item(
+            "导出设置…",
+            "",
+            weak.clone(),
+            |this, window, cx| this.export_settings(window, cx),
+        ))
+        .item(Self::menu_action_item(
+            "导入设置…",
+            "",
+            weak.clone(),
+            |this, window, cx| this.import_settings(window, cx),
+        ))
+        .separator()
         .item(Self::session_restore_menu_item(weak.clone()))
         .item(Self::close_to_tray_menu_item(weak.clone()))
         .separator()
