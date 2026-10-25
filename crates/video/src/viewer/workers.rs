@@ -17,6 +17,7 @@ impl super::VideoViewer {
                         "缺少视频运行库（media_ffmpeg.dll 或 avcodec-63.dll / avformat-63.dll 等 FFmpeg 运行库），视频功能不可用。请把它们放到程序 exe 同目录后重新打开。"
                             .to_string(),
                     );
+                    this.stop_pump_on_failure();
                     cx.notify();
                 });
                 return;
@@ -89,6 +90,7 @@ impl super::VideoViewer {
                     let _ = weak.update(cx, |this, cx| {
                         this.loading = false;
                         this.load_error = Some(e);
+                        this.stop_pump_on_failure();
                         cx.notify();
                     });
                 }
@@ -96,6 +98,7 @@ impl super::VideoViewer {
                     // 超时：至少把 loading 关掉（画面静态，不卡佔位）
                     let _ = weak.update(cx, |this, cx| {
                         this.loading = false;
+                        this.stop_pump_on_failure();
                         cx.notify();
                     });
                 }
@@ -1109,6 +1112,20 @@ impl super::VideoViewer {
     /// 上屏前 `pending_seek` 也可能短暂为空，但预览要跟着手指走）。
     pub(super) fn pump_wanted(&self) -> bool {
         self.playing || self.pending_seek.is_some() || self.scrubbing
+    }
+
+
+    /// 终局性打开/解码失败专用的「停泵」清理：清掉全部 [`Self::pump_wanted`] 依赖源
+    ///（`playing` / `pending_seek` / `scrubbing`），让正在运行的自续 pump 在下一拍
+    /// `pump_wanted()==false` 即退出、不再自续定时器。之前失败分支只关 `loading`，
+    /// `playing`（new 默认 true）与 `pending_seek`（`start_decoder_at` 置 Some、仅首个帧
+    /// 上屏才清）残留 → `pump_wanted()` 恒真 → pump 无限自续：测试执行器永不静止
+    ///（shell 两个开损坏视频的测试挂死）、生产态打开损坏视频后遗留永久空转 pump。
+    /// 只应在终局失败分支调用；成功/正常播放/seek 路径不得触碰。
+    pub(super) fn stop_pump_on_failure(&mut self) {
+        self.playing = false;
+        self.pending_seek = None;
+        self.scrubbing = false;
     }
 
 
