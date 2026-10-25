@@ -504,6 +504,15 @@ pub struct CodeEditor {
     find_current_bg: Hsla,
     /// 查找输入框实体（`ui::InputState`，IME/编辑/焦点自理；首次打开懒创建）。
     find_input: Option<gpui::Entity<ui::input::InputState>>,
+    /// find 卡片图标按钮的悬停提示状态（按钮内 hover + 卡片内小浮层）。
+    find_tip: FindTipState,
+    // —— 编辑区内跳转行（Ctrl+G）——
+    /// 跳转行状态机/输入缓存/防抖代号/内联提示（纯逻辑，见 `crate::editor::goto`）。
+    goto: crate::editor::goto::GoToOverlay,
+    /// 跳转行输入框「文本变化 → 置脏 + 防抖」订阅句柄（首开时懒创建）。
+    _goto_sub: Option<gpui::Subscription>,
+    /// 跳转行输入框实体（`ui::InputState`，IME/编辑/焦点自理；首次打开懒创建）。
+    goto_input: Option<gpui::Entity<ui::input::InputState>>,
 }
 
 impl CodeEditor {
@@ -593,6 +602,10 @@ impl CodeEditor {
             find_match_bg: rgb(0xffe497).into(),
             find_current_bg: rgb(0xffb703).into(),
             find_input: None,
+            find_tip: FindTipState::default(),
+            goto: crate::editor::goto::GoToOverlay::default(),
+            _goto_sub: None,
+            goto_input: None,
         }
     }
 
@@ -1959,18 +1972,14 @@ impl CodeEditor {
         let vis = self.folds.visual_row(row);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
         let scrollbar = ui::scrollbar::scrollbar_width().as_f32();
-        // find 条打开时顶部 `FIND_BAR_H`(32px) 被浮层盖住：把「可视上缘」下移一条所
-        // 占行数，当前命中揭示到浮层之下、不藏在条后面（滚动中段导航到视口上方匹配时
-        // 尤需此偏移；文档顶无滚动余量时保持原位）。
-        let bar_rows = if self.find.open {
-            ((FIND_BAR_H + 2.0) / lh as f64).ceil() as usize
-        } else {
-            0
-        };
+        // find 卡片（Ctrl+F）已改为编辑区**右上角**小卡片（见 `render_find_card`），
+        // 不再像旧顶部通栏那样整段盖住可视上缘 → `FIND_BAR_H`（32px 整行偏移）已删，
+        // 此处无需把「可视上缘」下移一条。顶部右上角卡片若正好压住当前命中属可接受
+        // 现象（VS Code 同款），用户随手滚动即露。
         let rows_visible = ((view - scrollbar) / lh).floor().max(1.) as usize;
         let cur_top = (self.scroll_top_px() / lh).floor() as usize;
-        if vis < cur_top + bar_rows {
-            self.scroll_to_px(vis.saturating_sub(bar_rows) as f32 * lh);
+        if vis < cur_top {
+            self.scroll_to_px(vis as f32 * lh);
         } else if vis >= cur_top + rows_visible {
             let target = vis.saturating_add(1).saturating_sub(rows_visible);
             self.scroll_to_px(target as f32 * lh);
@@ -3334,9 +3343,72 @@ impl CodeEditor {
 /// 输入防抖时长（ms）：输入停止后这么多毫秒才重算匹配（打字不逐键全量扫）。
 const FIND_DEBOUNCE_MS: u64 = 200;
 
-/// 编辑区内查找条高度（px）：`render_find_bar` 与 `reveal_row` 共用（reveal 要把
-/// 当前命中揭示到浮层之下，须知道浮层占多少行）。
-pub(crate) const FIND_BAR_H: f64 = 32.0;
+/// 跳转行输入防抖时长（ms）：每次输入变化防抖这么多毫秒后解析 + clamp + 跳转
+/// （实时逐键跳转但不做无谓重活；Enter 立即 flush 取消防抖）。
+const GOTO_DEBOUNCE_MS: u64 = 300;
+
+/// find 卡片图标按钮（上一项 / 下一项 / 关闭）：渲染层入口 + 悬停提示标识。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum FindBtn {
+    #[default]
+    Prev,
+    Next,
+    Close,
+}
+
+impl FindBtn {
+    /// 按钮内嵌字形（基础 unicode，非 emoji/COLR；主题色下可辨）。
+    pub(crate) fn glyph(&self) -> &'static str {
+        match self {
+            FindBtn::Prev => "↑",
+            FindBtn::Next => "↓",
+            FindBtn::Close => "×",
+        }
+    }
+
+    /// 元素 id（既有 find-* 命名稳定性约束内新增）。
+    pub(crate) fn id(&self) -> &'static str {
+        match self {
+            FindBtn::Prev => "find-prev-btn",
+            FindBtn::Next => "find-next-btn",
+            FindBtn::Close => "find-close-btn",
+        }
+    }
+
+    /// 悬停提示文案（中文小浮层）。
+    pub(crate) fn tip_label(&self) -> &'static str {
+        match self {
+            FindBtn::Prev => "上一项",
+            FindBtn::Next => "下一项",
+            FindBtn::Close => "关闭",
+        }
+    }
+}
+
+/// find 卡片按钮悬停提示状态（本地小浮层，无全局浮层机制）：当前悬停按钮 +
+/// 是否已过延迟显示期。延迟排单走 `cx.spawn` + 后台 timer（到点仍悬停该钮才 shown），
+/// 无需跨帧持久计时器（离开即清、关闭即复位）。
+#[derive(Debug, Default)]
+pub(crate) struct FindTipState {
+    /// 当前悬停的按钮（None = 未悬停）。
+    pub(crate) hover: Option<FindBtn>,
+    /// 是否已显示提示（延迟 [`FIND_TIP_DELAY_MS`] 到期且仍悬停该钮）。
+    pub(crate) shown: bool,
+}
+
+impl FindTipState {
+    /// 当前应显示的提示按钮（hover 且已过延迟）；无则 `None`。
+    pub(crate) fn shown_btn(&self) -> Option<FindBtn> {
+        if self.shown {
+            self.hover
+        } else {
+            None
+        }
+    }
+}
+
+/// find 卡片按钮悬停提示的浮现延迟（ms）：扫过按钮时不闪现，停留该时长仍悬停才显示。
+const FIND_TIP_DELAY_MS: u64 = 400;
 
 impl CodeEditor {
     /// 打开 find 条（Ctrl+F）：输入框自动聚焦 + 自动带上最近一次查询（若有）。
@@ -3356,6 +3428,7 @@ impl CodeEditor {
         }
         let was_open = self.find.open;
         self.find.open_bar();
+        self.find_tip = FindTipState::default();
         // 首次打开（或上次 Esc 关闭后再次打开）：把最近一次查询带进输入框回显。
         if !was_open
             && let Some(input) = self.find_input.clone()
@@ -3374,6 +3447,7 @@ impl CodeEditor {
     /// 关闭 find 条（Esc）：移除全部高亮、保留 last query 供 F3 复用、焦点归还编辑器。
     pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find.close_bar();
+        self.find_tip = FindTipState::default();
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -3463,6 +3537,71 @@ impl CodeEditor {
         cx.notify();
     }
 
+    /// find 卡片按钮是否可用：上一项/下一项需「有查询词 + 有匹配」；关闭恒可用。
+    fn find_btn_enabled(&self, btn: FindBtn) -> bool {
+        match btn {
+            FindBtn::Prev | FindBtn::Next => {
+                !self.find.query.is_empty() && !self.find.matches.is_empty()
+            }
+            FindBtn::Close => true,
+        }
+    }
+
+    /// find 卡片按钮点击：上一项/下一项/关闭即 Shift+Enter/Enter/Esc 的鼠标等价通道。
+    /// 禁态（0 匹配 / 无查询）不动作不崩；导航后回焦输入框（连续查找不丢输入），
+    /// 关闭则由 `close_find` 把焦点还编辑器。
+    fn find_btn_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>, btn: FindBtn) {
+        match btn {
+            FindBtn::Prev => {
+                if self.find_btn_enabled(FindBtn::Prev) {
+                    self.find_step(false, cx);
+                }
+            }
+            FindBtn::Next => {
+                if self.find_btn_enabled(FindBtn::Next) {
+                    self.find_step(true, cx);
+                }
+            }
+            FindBtn::Close => {
+                self.close_find(window, cx);
+                return;
+            }
+        }
+        if self.find.open
+            && let Some(input) = self.find_input.clone()
+        {
+            let fh = input.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        }
+    }
+
+    /// find 卡片按钮悬停：进入登记悬停钮 + 排一单「延迟显示提示」（到点仍悬停该钮
+    /// 才 `shown`；换钮/移出后旧单到点自检丢弃）；移出立即清 hover + 隐藏提示。
+    fn find_btn_hover(&mut self, cx: &mut Context<Self>, btn: FindBtn, hovered: bool) {
+        if hovered {
+            if self.find_tip.hover != Some(btn) {
+                self.find_tip.hover = Some(btn);
+                self.find_tip.shown = false;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(FIND_TIP_DELAY_MS))
+                        .await;
+                    let _ = this.update(cx, |ed, cx| {
+                        if ed.find_tip.hover == Some(btn) {
+                            ed.find_tip.shown = true;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+        } else if self.find_tip.hover == Some(btn) {
+            self.find_tip.hover = None;
+            self.find_tip.shown = false;
+        }
+        cx.notify();
+    }
+
     /// 当前命中所处行滚进可视区（纵向；当前命中必在当前环境可见）。
     fn reveal_current_find(&mut self) {
         if let Some(r) = self.find.current.and_then(|i| self.find.matches.get(i)) {
@@ -3504,7 +3643,7 @@ impl CodeEditor {
         )
     }
 
-    /// 状态栏文案（测试探针：行为表断言「i/N 个匹配 / 无匹配 / >N 个匹配」）。
+    /// 计数文案（测试探针：行为表断言「i/N / 无匹配 / i/N+」）。
     pub fn test_find_status(&self) -> String {
         self.find.status()
     }
@@ -3524,11 +3663,172 @@ impl CodeEditor {
         self.find_input.as_ref()
     }
 
+    /// find 卡片按钮悬停提示快照 `(悬停按钮, 是否已显示)`（测试探针：hover 显隐断言）。
+    pub(crate) fn test_find_tip_state(&self) -> Option<(FindBtn, bool)> {
+        self.find_tip.hover.map(|b| (b, self.find_tip.shown))
+    }
+
     /// 同步走一次「防抖到期重扫」落地（测试探针：fake 执行器不轮询定时 spawn，
     /// 测试需确定性驱动重算路径；与 `test_scan_sync_land` 同姿势）。
     pub fn test_find_scan_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = window;
         self.find_scan_land(cx);
+    }
+
+    // -----------------------------------------------------------------
+    // 编辑区内跳转行（Ctrl+G）
+    // -----------------------------------------------------------------
+
+    /// 打开跳转行卡片（Ctrl+G 分发到活动文本 tab）：输入框自动聚焦；再次打开回显
+    /// 最近一次输入并防抖重跳（recall，同 find Esc 后 F3 复用语义）。
+    pub fn open_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 首次打开懒创建输入框实体 + 订阅「文本变化 → 置脏 + 防抖」。
+        if self.goto_input.is_none() {
+            let input = cx
+                .new(|cx| ui::input::InputState::new(window, cx).placeholder("行号（可 行:列）"));
+            let input_entity = input.clone();
+            self._goto_sub = Some(cx.subscribe(&input, move |ed, _src, ev, cx| {
+                if matches!(ev, ui::input::InputEvent::Change) {
+                    let q = input_entity.read(cx).value().to_string();
+                    ed.goto_input_changed(q, cx);
+                }
+            }));
+            self.goto_input = Some(input);
+        }
+        let was_open = self.goto.open;
+        self.goto.open_bar();
+        // 再次打开（上次 Esc/点外关闭）：把最近一次输入带进输入框回显（发 Change →
+        // 订阅自动置脏 + 排防抖重跳）。
+        if !was_open
+            && let Some(input) = self.goto_input.clone()
+        {
+            let q = self.goto.cached.clone();
+            input.update(cx, |s, scx| s.replace(q, window, scx));
+        }
+        // 输入框自动聚焦（已打开时重复 Ctrl+G 也聚焦回输入框）。
+        if let Some(input) = self.goto_input.clone() {
+            let fh = input.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        }
+        cx.notify();
+    }
+
+    /// 关闭跳转行卡片（Esc / 点击卡片外）：保留输入缓存、焦点归还编辑器。
+    pub fn close_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.goto.close_bar();
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// 输入框文本变化（订阅回调）：更新输入缓存并立即刷新内联提示（非法/目标预览
+    /// 即时反馈），随后排一次防抖跳转（实际落点等防抖）。
+    fn goto_input_changed(&mut self, text: String, cx: &mut Context<Self>) {
+        self.goto.cached = text;
+        self.goto.invalidate();
+        self.refresh_goto_hint();
+        self.schedule_goto_debounce(cx);
+        cx.notify();
+    }
+
+    /// 防抖调度：每变化一次起一个 [`GOTO_DEBOUNCE_MS`] 任务；到期用最新输入 flush，
+    /// 仅最新代号落地（陈旧任务被作废）。
+    fn schedule_goto_debounce(&mut self, cx: &mut Context<Self>) {
+        let epoch = self.goto.flush_epoch;
+        cx.spawn(async move |this, cx| {
+            let _ = cx
+                .background_executor()
+                .timer(Duration::from_millis(GOTO_DEBOUNCE_MS))
+                .await;
+            let _ = this.update(cx, |ed, cx| {
+                if epoch == ed.goto.flush_epoch {
+                    ed.goto_flush(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// flush（防抖到期 / Enter 共用）：用最新输入解析 + clamp + 跳转（滚动可见 +
+    /// 光标落位）+ 内联提示。空输入 / 非法 / 空文档 → 不跳（提示区呈现、不崩）。
+    /// 卡片不关、焦点不移（Enter 后输入框保持焦点）。
+    fn goto_flush(&mut self, cx: &mut Context<Self>) {
+        // 卡片已关闭（Esc/点外）→ 丢弃残留防抖：Esc 或点外关闭后老 Task 到期不得再
+        // 落地「幽灵跳」（fake 执行器测不到此竞态，真实定时器会触发；K26 同类）。
+        if !self.goto.open {
+            return;
+        }
+        self.goto.dirty = false;
+        // 空文档 / 大文档后台打开尚未挂载 → 跳过定位（不崩；不发误导性目标文案，
+        // 跳转实际不会发生，沿旧 shell 空文档防护）。
+        if self.buffer.char_count() > 0 {
+            let line_count = self.buffer.line_count();
+            let parsed = crate::editor::goto::parse_and_clamp(&self.goto.cached, line_count);
+            if let Some(t) = parsed {
+                let row0 = t.row1 - 1;
+                let col0 = t.col1 - 1;
+                let offset = self.offset_for_line_col(row0, col0);
+                self.scroll_to_line(row0);
+                self.set_selection_range(offset..offset, cx);
+                // 用**真实落点**（含「列超行宽」被 offset_for_line_col 静默钳制的最终列）
+                // 刷新提示；「已钳制」指示沿用解析结论（行/列 < 1 / 超行数）。
+                let (r, c) = self.cursor_position();
+                self.goto.last = Some((r + 1, c + 1));
+                let landed = crate::editor::goto::GotoTarget {
+                    row1: r + 1,
+                    col1: c + 1,
+                    clamped: t.clamped,
+                };
+                let (h, e) = crate::editor::goto::hint_for(&self.goto.cached, Some(&landed));
+                self.goto.hint = h;
+                self.goto.hint_error = e;
+                cx.notify();
+                return;
+            }
+        }
+        // 非法 / 空 / 空文档：不跳（提示区呈现，实时反馈文案为准）。
+        self.refresh_goto_hint();
+        cx.notify();
+    }
+
+    /// 按当前输入刷新内联提示（解析 + clamp + 文案；不跳转）。`goto_input_changed`
+    /// 与 `goto_flush` 共用，保证「即时反馈」与「落点确认」同一条文案口径。
+    fn refresh_goto_hint(&mut self) {
+        // 空文档：任何输入都不跳 → 提示区留空（不发误导性目标/已钳制文案）。
+        if self.buffer.char_count() == 0 {
+            self.goto.hint.clear();
+            self.goto.hint_error = false;
+            return;
+        }
+        let line_count = self.buffer.line_count();
+        let target = crate::editor::goto::parse_and_clamp(&self.goto.cached, line_count);
+        let (h, e) = crate::editor::goto::hint_for(&self.goto.cached, target.as_ref());
+        self.goto.hint = h;
+        self.goto.hint_error = e;
+    }
+
+    // —— 测试探针 ——
+
+    /// 跳转行状态快照 `(打开, 输入缓存, 最近目标, 内联提示文案, 是否错误)`（测试探针）。
+    pub fn test_goto_state(&self) -> (bool, String, Option<(usize, usize)>, String, bool) {
+        (
+            self.goto.open,
+            self.goto.cached.clone(),
+            self.goto.last,
+            self.goto.hint.clone(),
+            self.goto.hint_error,
+        )
+    }
+
+    /// 跳转行输入框实体（测试探针：驱动输入/断言焦点）。
+    pub fn test_goto_input(&self) -> Option<&gpui::Entity<ui::input::InputState>> {
+        self.goto_input.as_ref()
+    }
+
+    /// 同步走一次「防抖到期 flush」落地（测试探针：fake 执行器不轮询定时 spawn，
+    /// 测试需确定性驱动跳转路径；与 `test_find_scan_now` 同姿势）。
+    pub fn test_goto_flush_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        self.goto_flush(cx);
     }
 }
 

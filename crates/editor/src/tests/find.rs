@@ -74,7 +74,7 @@ fn find_open_focuses_input_and_recalls_query(cx: &mut TestAppContext) {
     assert_eq!(shown, "aa", "输入框文本应回显最近查询");
 }
 
-/// 输入词 → 防抖后：高亮全部匹配 + 首个为当前命中 + 状态「i/N 个匹配」。
+/// 输入词 → 防抖后：高亮全部匹配 + 首个为当前命中 + 状态「i/N」。
 #[gpui::test]
 fn find_input_highlights_all_and_first_as_current(cx: &mut TestAppContext) {
     let text = "hello world hello\nHELLO hi hello\n别处";
@@ -90,7 +90,7 @@ fn find_input_highlights_all_and_first_as_current(cx: &mut TestAppContext) {
     assert_eq!(n, 4, "大小写不敏感命中 4 处：行 0×2 + 行 1（HELLO/hello）×2");
     assert_eq!(cur, Some(0), "首个匹配为当前命中");
     assert_eq!(q, "hello");
-    assert_eq!(cx.update(|_, cx| ed.read(cx).test_find_status()), "1/4 个匹配");
+    assert_eq!(cx.update(|_, cx| ed.read(cx).test_find_status()), "1/4");
 
     // 渲染层：行 0 消费段含两段查找底色、当前（0..5）与非当前（12..17）底色不同。
     let row0 = cx.update(|window, cx| {
@@ -279,7 +279,7 @@ fn find_no_match_enter_noop(cx: &mut TestAppContext) {
     let _ = input;
 }
 
-/// 匹配上限截断：>FIND_MATCH_CAP 匹配 → 只收集上限个数、状态「>N 个匹配」、导航限内回绕。
+/// 匹配上限截断：>FIND_MATCH_CAP 匹配 → 只收集上限个数、状态截断版「i/N+」、导航限内回绕。
 #[gpui::test]
 fn find_cap_truncates_and_status(cx: &mut TestAppContext) {
     let (host, cx) = open(cx, &"x ".repeat(6000));
@@ -295,9 +295,9 @@ fn find_cap_truncates_and_status(cx: &mut TestAppContext) {
     assert_eq!(cur, Some(0..1), "首 N 个匹配快显且首个为当前");
     assert_eq!(
         cx.update(|_, cx| ed.read(cx).test_find_status()),
-        format!(">{} 个匹配", crate::editor::find::FIND_MATCH_CAP)
+        format!("1/{}+", crate::editor::find::FIND_MATCH_CAP)
     );
-    // 导航在 0..5000 内回绕（从 0 向前到上限末）。
+    // 导航在 0..FIND_MATCH_CAP 内回绕（从 0 向前到上限末）。
     cx.update(|_, cx| ed.update(cx, |e, ecx| e.find_prev(ecx)));
     let last_off = (crate::editor::find::FIND_MATCH_CAP - 1) * 2;
     let cur = cx.update(|_, cx| ed.read(cx).test_find_current_range());
@@ -366,7 +366,7 @@ fn find_bar_does_not_break_scrolling(cx: &mut TestAppContext) {
     let _ = input;
 }
 
-/// 大文档（约 130k 行）匹配收集：到上限截断、状态「>N 个匹配」、不崩。
+/// 大文档（约 130k 行）匹配收集：到上限截断、状态截断版「i/N+」、不崩。
 /// 默认 `#[ignore]`（真机墙钟探针——收集墙钟在 debug 下随机器抖动，K3 只比相对值）；
 /// 常规套件用中小夹具覆盖同一逻辑（`find_cap_truncates_and_status`）。
 #[gpui::test]
@@ -383,6 +383,213 @@ fn find_large_doc_ignored_cap(cx: &mut TestAppContext) {
         (e.test_find_state().2, e.test_find_status())
     });
     assert_eq!(n, crate::editor::find::FIND_MATCH_CAP, "大文档命中应被上限截断");
-    assert_eq!(status, format!(">{} 个匹配", crate::editor::find::FIND_MATCH_CAP));
+    assert_eq!(status, format!("1/{}+", crate::editor::find::FIND_MATCH_CAP));
+    let _ = input;
+}
+
+/// 点击指定元素 id 中心（模拟 move+down+up → on_click）；滚动/几何断言与 `debug_bounds`
+/// 同坐标空间。
+fn click_element(cx: &mut VisualTestContext, id: &'static str) {
+    let b = cx.debug_bounds(id).expect("目标元素应渲染");
+    let p = point(px(b.center().x.as_f32()), px(b.center().y.as_f32()));
+    cx.simulate_mouse_move(p, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_down(p, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(p, MouseButton::Left, Modifiers::default());
+    settle(cx);
+}
+
+/// 卡片为编辑区右上角内缘的紧凑浮层：贴顶 ~8px、右缘避让滚动条 ~8px、整卡宽 < 编辑区
+/// 1/3；计数 + 三按钮齐备（几何断言：取代旧顶部通栏 FIND_BAR_H 整行偏移）。
+#[gpui::test]
+fn find_card_compact_at_top_right(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "aa bb aa");
+    focus(&host, cx);
+    let input = open_find(&host, cx);
+    type_query(&host, cx, "aa", &input);
+
+    let card = cx.debug_bounds("find-bar").expect("find 卡片应渲染");
+    let ed = cx.debug_bounds("code-editor").expect("编辑区应渲染");
+    // 顶部小边距（~8px）：卡片上缘 ≈ 编辑区上缘 + 8。
+    assert!(
+        (card.origin.y - ed.origin.y).as_f32().abs() < 12.,
+        "卡片应贴编辑区顶部内缘（~8px）：card={card:?}"
+    );
+    // 右缘避开滚动条（~8px 空隙）：不遮右侧滚动条命中区。
+    let expect_right =
+        ed.origin.x + ed.size.width - ui::scrollbar::scrollbar_width() - px(8.);
+    let card_right = card.origin.x + card.size.width;
+    assert!(
+        (card_right - expect_right).as_f32().abs() < 2.,
+        "卡片右缘应让出滚动条（card_right={card_right:?} expect={expect_right:?}）"
+    );
+    // 紧凑：整卡宽 < 编辑区宽 1/3。
+    assert!(
+        card.size.width < ed.size.width / 3.,
+        "卡片应紧凑（宽 {:.0}px）：{card:?}",
+        card.size.width.as_f32()
+    );
+    // 计数 + 上一项/下一项/关闭按钮齐备。
+    assert!(cx.debug_bounds("find-count").is_some(), "find-count 应渲染");
+    for id in ["find-prev-btn", "find-next-btn", "find-close-btn"] {
+        assert!(cx.debug_bounds(id).is_some(), "{id} 应渲染");
+    }
+    let _ = input;
+}
+
+/// ↑↓ 按钮点击 = Shift+Enter/Enter 的鼠标等价通道：导航走同一条 `find_step`，且点击后
+/// 输入框**保持/恢复焦点**（连续查找不丢输入）。
+#[gpui::test]
+fn find_buttons_navigate_and_keep_input_focus(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "aa bb aa");
+    let ed = ed_of(&host, cx);
+    focus(&host, cx);
+    let input = open_find(&host, cx);
+    type_query(&host, cx, "aa", &input);
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_find_current_range()),
+        Some(0..2),
+        "首个匹配为当前"
+    );
+
+    // ↓（下一项）：0 → 1（第 2 个 aa @ 6..8），等价 Enter。
+    click_element(cx, "find-next-btn");
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_find_current_range()),
+        Some(6..8),
+        "↓ 应导航到下一个匹配（等价 Enter）"
+    );
+    // 点击后输入框仍持焦（连续查找）。
+    let focused = cx.update(|window, cx| {
+        let i = input.read(cx).focus_handle(cx);
+        window.focused(cx) == Some(i)
+    });
+    assert!(focused, "点击 ↓ 后输入框应保持/恢复焦点");
+
+    // ↑（上一项）：1 → 0，等价 Shift+Enter。
+    click_element(cx, "find-prev-btn");
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_find_current_range()),
+        Some(0..2),
+        "↑ 应导航到上一个匹配（等价 Shift+Enter）"
+    );
+}
+
+/// ×（关闭按钮）= Esc：关卡片清高亮、焦点还编辑器。
+#[gpui::test]
+fn find_close_button_equals_esc(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "aa bb aa");
+    let ed = ed_of(&host, cx);
+    focus(&host, cx);
+    let input = open_find(&host, cx);
+    type_query(&host, cx, "aa", &input);
+    assert!(
+        cx.update(|_, cx| ed.read(cx).test_find_state().1),
+        "输入后有高亮"
+    );
+
+    click_element(cx, "find-close-btn");
+    let (open, vis, n, cur) = cx.update(|_, cx| {
+        let e = ed.read(cx);
+        (
+            e.test_find_state().0,
+            e.test_find_state().1,
+            e.test_find_state().2,
+            e.test_find_state().3,
+        )
+    });
+    assert!(!open && !vis && n == 0 && cur.is_none(), "× 应关闭卡片并清高亮");
+    let focused = cx.update(|window, cx| {
+        let fh = ed.read(cx).focus_handle();
+        window.focused(cx) == Some(fh)
+    });
+    assert!(focused, "× 关闭后焦点归还编辑器");
+    let _ = input;
+}
+
+/// 0 匹配 / 空状态：↑↓ 按钮置灰、点击不动作不崩（只读状态不变），关闭恒可用。
+#[gpui::test]
+fn find_buttons_disabled_on_no_match_noop(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "abc def ghi");
+    let ed = ed_of(&host, cx);
+    focus(&host, cx);
+    let input = open_find(&host, cx);
+    type_query(&host, cx, "zzz", &input);
+    assert_eq!(cx.update(|_, cx| ed.read(cx).test_find_status()), "无匹配");
+
+    let head0 = cx.update(|_, cx| ed.read(cx).selection().head());
+    click_element(cx, "find-prev-btn");
+    click_element(cx, "find-next-btn");
+    let head1 = cx.update(|_, cx| ed.read(cx).selection().head());
+    assert_eq!(head0, head1, "0 匹配时 ↑↓ 点击不动作（不崩）");
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_find_current_range()),
+        None,
+        "0 匹配时无当前命中"
+    );
+
+    // 关闭仍可用。
+    click_element(cx, "find-close-btn");
+    assert!(
+        !cx.update(|_, cx| ed.read(cx).test_find_state().0),
+        "0 匹配时关闭仍可用"
+    );
+    let _ = input;
+}
+
+/// 悬停提示显隐：按钮 hover 进入 → 登记悬停、延迟（FIND_TIP_DELAY_MS）未到不显示；
+/// 时钟推进到点仍悬停 → 显示中文提示小浮层；移出 → 立即消失。
+#[gpui::test]
+fn find_button_hover_tooltip_shows_after_delay_and_hides(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "aa bb aa");
+    let ed = ed_of(&host, cx);
+    focus(&host, cx);
+    let input = open_find(&host, cx);
+    type_query(&host, cx, "aa", &input);
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_find_tip_state()),
+        None,
+        "初始无悬停提示"
+    );
+
+    // 悬停「下一项」按钮中心 → 登记按钮、延迟未到不显示。
+    let b = cx.debug_bounds("find-next-btn").expect("下一项按钮应渲染");
+    let p = point(px(b.center().x.as_f32()), px(b.center().y.as_f32()));
+    cx.simulate_mouse_move(p, MouseButton::Left, Modifiers::default());
+    settle(cx);
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_find_tip_state()),
+        Some((crate::view::FindBtn::Next, false)),
+        "进入悬停 → 登记按钮、延迟未到不显示"
+    );
+    assert!(
+        cx.debug_bounds("find-tip").is_none(),
+        "延迟未到 → 提示浮层不渲染"
+    );
+
+    // 时钟推进到点（>FIND_TIP_DELAY_MS）→ 显示提示 小浮层。
+    cx.executor().advance_clock(std::time::Duration::from_millis(450));
+    settle(cx);
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_find_tip_state()),
+        Some((crate::view::FindBtn::Next, true)),
+        "延迟到点仍悬停 → 显示提示"
+    );
+    assert!(
+        cx.debug_bounds("find-tip").is_some(),
+        "提示小浮层应渲染"
+    );
+
+    // 移出按钮（到编辑区空白）→ 提示立即消失。
+    cx.simulate_mouse_move(point(px(10.), px(10.)), MouseButton::Left, Modifiers::default());
+    settle(cx);
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_find_tip_state()),
+        None,
+        "移出 → 提示立即消失"
+    );
+    assert!(
+        cx.debug_bounds("find-tip").is_none(),
+        "移出 → 提示浮层移除"
+    );
     let _ = input;
 }

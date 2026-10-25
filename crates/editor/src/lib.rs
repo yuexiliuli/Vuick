@@ -37,6 +37,7 @@
 pub mod buffer;
 pub mod find;
 pub mod fold;
+pub mod goto;
 pub mod highlight;
 mod markdown;
 pub mod movement;

@@ -418,7 +418,7 @@ impl EditorApp {
             )
             .on_action(
                 cx.listener(|this: &mut EditorApp, _: &GoToLine, window, cx| {
-                    this.toggle_goto_line(window, cx);
+                    this.goto_line_in_active_tab(window, cx);
                 }),
             )
             // 编辑区内查找：Ctrl+F 打开查找条；F3 / Shift+F3 复用上次查询上一个/下一个

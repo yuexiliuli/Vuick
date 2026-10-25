@@ -53,94 +53,25 @@ impl EditorApp {
         }
     }
 
-    /// 跳转行模式（Ctrl+G）：打开 GoToLine 面板（未打开则开、已打开则关）。
-    pub(super) fn toggle_goto_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() {
-            self.close_palette(window, cx);
-            return;
-        }
-        let items = vec![self.goto_line_item(cx)];
-        self.open_palette(PaletteMode::GotoLine, items, window, cx, "");
-    }
-
-    /// GoToLine 面板的唯一候选条目：label 随输入实时改写（面板 GotoLine 模式内建），
-    /// 确认时经 `new_with_query` 把当前查询词带出提交跳转——复用既有 activate 路径，
-    /// 不新增平行提交通道；运行器也不得 `read` 面板实体（其自身 update 中会 panic）。
-    fn goto_line_item(&self, cx: &Context<Self>) -> PaletteItem {
-        let weak = cx.weak_entity();
-        let w = weak.clone();
-        PaletteItem::new_with_query(
-            "输入跳转行号（可 行:列）…",
-            "跳转到行",
-            "Ctrl+G",
-            move |q, _window, cx| {
-                let _ = w.update(cx, |this, cx| this.goto_line_submit(q, cx));
-            },
-        )
-    }
-
-    /// 执行 GoToLine 跳转：解析「行[:列]」→ clamp → 光标落位 + 滚动可见。
-    /// 空输入 / 非法格式 / 非文本选项卡 / 无活动选项卡 → 无跳转、面板照常关闭（不崩）。
-    fn goto_line_submit(&mut self, input: &str, cx: &mut Context<Self>) {
-        let trimmed = input.trim();
-        // 先克隆编辑器句柄，随后不再借用 self.tabs（避免与「self 可变调用」冲突）。
+    /// Ctrl+G：活动文本选项卡打开跳转行卡片（`ed.open_goto`）；非文本选项卡
+    /// （PDF/图片/视频/EPUB/音乐整窗）→ toast「当前选项卡不支持跳转行」，不崩、不开卡。
+    /// （旧命令面板 GoToLine 已被编辑区顶部居中卡片取代，见 `crates/editor/src/goto.rs`。）
+    pub(super) fn goto_line_in_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
-            return; // 零选项卡欢迎页：无活动选项卡 → 静默关闭
+            return; // 零选项卡欢迎页 → 静默
         };
-        let ed = tab.editor.clone();
-        // 非文本选项卡（PDF/图片/视频/EPUB；音乐整窗模式同样无文本跳转语义）。
+        // 守卫对齐 find 的判定：音乐整窗 / MediaReader / EPUB 只读预览。
         if self.music_mode || tab.reader.is_reader() || tab.readonly_preview {
             self.goto_line_toast("当前选项卡不支持跳转行");
             cx.notify();
             return;
         }
-        if trimmed.is_empty() {
-            return; // 空输入：无跳转、面板关闭（不 toast，不崩）
-        }
-        let Some((row1, col1)) = parse_goto(trimmed) else {
-            self.goto_line_toast("不是有效行号：请输入「行」或「行:列」");
-            cx.notify();
-            return;
-        };
-        let line_count = ed.read(cx).line_count();
-        // 空文档 / 大文档后台打开尚未挂载 → 跳过定位（不崩；也不发「已钳制」误导确认，
-        // 因为跳转实际不会发生）。
-        if ed.read(cx).char_count() == 0 {
-            return;
-        }
-        // clamp：0/负数 → 1；超行数 → 末行；列 < 1 → 1（列超行宽由 offset_for_line_col 钳制）。
-        let mut clamped = false;
-        let row1 = if row1 < 1 {
-            clamped = true;
-            1
-        } else if row1 as usize > line_count {
-            clamped = true;
-            line_count
-        } else {
-            row1 as usize
-        };
-        let col1 = match col1 {
-            Some(c) if c < 1 => {
-                clamped = true;
-                1
-            }
-            Some(c) => c as usize,
-            None => 1,
-        };
-        if clamped {
-            self.goto_line_toast(&format!("已钳制跳转位置：第 {row1} 行 第 {col1} 列"));
-        }
-        ed.update(cx, |ed, cx| {
-            let row0 = row1 - 1;
-            let col0 = col1 - 1;
-            let offset = ed.offset_for_line_col(row0, col0);
-            ed.scroll_to_line(row0);
-            ed.set_selection_range(offset..offset, cx);
-        });
+        let ed = tab.editor.clone();
+        ed.update(cx, |ed, cx| ed.open_goto(window, cx));
         cx.notify();
     }
 
-    /// GoToLine 提示（进入 toast，替换上一条同款提示，不堆积）。
+    /// 非文本选项卡 Ctrl+G「不支持跳转行」提示（进入 toast，替换上一条同款提示，不堆积）。
     fn goto_line_toast(&mut self, msg: &str) {
         // 先移除上一条（自持 key，只在跳转行路径使用）。
         if let Some(key) = self.goto_line_toast_key.take() {
@@ -500,29 +431,12 @@ impl EditorApp {
     }
 }
 
-/// GoToLine 提示通知的（伪）类型标签：配合唯一 key 精确移除（见 `goto_line_toast`）。
+/// GoToLine「不支持跳转行」提示通知的（伪）类型标签：配合唯一 key 精确移除
+/// （见 `goto_line_toast`）。
 struct GotoLineToast;
 
 /// Find「不支持查找」提示通知的（伪）类型标签：配合唯一 key 精确移除（见 `find_toast`）。
 struct FindToast;
-
-/// 解析跳转输入「行[:列]」（均为 1 基）：行可省略列；非法（非数字 / 多个冒号 /
-/// 空段）→ `None`。正负与 0 由提交侧 clamp（本函数只做词法解析）。
-pub(super) fn parse_goto(s: &str) -> Option<(i64, Option<i64>)> {
-    let (row_s, col_s) = match s.split_once(':') {
-        Some((r, c)) => (r, Some(c)),
-        None => (s, None),
-    };
-    if col_s.map_or(false, |c| c.contains(':')) {
-        return None; // 多个冒号 → 非法
-    }
-    let row = row_s.trim().parse::<i64>().ok()?;
-    let col = match col_s {
-        Some(c) => Some(c.trim().parse::<i64>().ok()?),
-        None => None,
-    };
-    Some((row, col))
-}
 
 /// quick open 后台扫描 → 主线程的一块更新（有界 channel，见 `start_quick_open_scan`）。
 #[derive(Debug)]

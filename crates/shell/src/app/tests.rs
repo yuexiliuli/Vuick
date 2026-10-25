@@ -19,5 +19,6 @@ include!("tests/palette.rs");
 include!("tests/splitter.rs");
 include!("tests/session.rs");
 include!("tests/find.rs");
+include!("tests/goto.rs");
 include!("tests/close_tray.rs");
 include!("tests/recent.rs");

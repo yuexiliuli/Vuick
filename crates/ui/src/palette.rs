@@ -29,15 +29,13 @@ use crate::ui::motion::hover_spring;
 use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 use crate::ui::theme::{ChromeColors, FLOAT_ACRYLIC_ALPHA_DARK, FLOAT_ACRYLIC_ALPHA_LIGHT, Theme};
 
-/// 面板模式（创建时定死；Ctrl+Shift+P / Ctrl+P / Ctrl+G 各自新建一个面板实体）。
+/// 面板模式（创建时定死；Ctrl+Shift+P / Ctrl+P 各自新建一个面板实体）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteMode {
     /// 命令模式（Ctrl+Shift+P）：全部命令。
     Commands,
     /// 文件模式（Ctrl+P）：已打开文件快选 + 工作区模糊检索。
     Files,
-    /// 跳转行模式（Ctrl+G）：单条目随输入实时改写 label。
-    GotoLine,
 }
 
 /// 条目执行器：确认时（Enter / 点击）运行，与 `PopupMenuItem` 的处理器同型。
@@ -53,11 +51,6 @@ pub struct PaletteItem {
     pub shortcut: String,
     /// 确认时执行（Enter / 点击）。
     pub run: PaletteRunner,
-    /// 确认时**带当前查询词**执行（GotoLine 单条目用；其余恒为 `None`）。与 `run`
-    /// 走同一条 `activate` 提交路径（不新增平行 Enter 通道），只是把查询词随条目标在
-    /// 实体外 — 运行器在 `activate`（面板实体自身 update 内）执行时不得再去 `read`
-    /// 本面板实体（会「read while updating」panic，K14 同类陷阱）。
-    pub run_with_query: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
 }
 
 impl PaletteItem {
@@ -73,24 +66,6 @@ impl PaletteItem {
             detail: detail.into(),
             shortcut: shortcut.into(),
             run: Rc::new(run),
-            run_with_query: None,
-        }
-    }
-
-    /// 带当前查询词的构造（GotoLine 单条目用）：确认时把面板当前查询随条目标在实体外
-    /// 运行——运行器不得 `read` 面板实体（面板正在被更新），只能消费传入的 `&str`。
-    pub fn new_with_query(
-        label: impl Into<String>,
-        detail: impl Into<String>,
-        shortcut: impl Into<String>,
-        run: impl Fn(&str, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        Self {
-            label: label.into(),
-            detail: detail.into(),
-            shortcut: shortcut.into(),
-            run: Rc::new(|_, _| {}),
-            run_with_query: Some(Rc::new(run)),
         }
     }
 }
@@ -193,7 +168,6 @@ impl CommandPalette {
         let placeholder = match mode {
             PaletteMode::Commands => "输入命令名以过滤…",
             PaletteMode::Files => "输入文件名以过滤已打开文件…",
-            PaletteMode::GotoLine => "输入跳转行号（可 行:列）…",
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let input_entity = input.clone();
@@ -222,7 +196,7 @@ impl CommandPalette {
         }
     }
 
-    /// 单条目模式的过滤得分：命令 / 跳转行只按 label；文件模式按「basename（label）
+    /// 单条目模式的过滤得分：命令 / 文件按 label；文件模式按「basename（label）
     /// 权重高于路径（detail）」——basename 命中得分翻倍优先，只命中路径（子串/
     /// 子序列）也能进候选但权重减半，二者都未命中才剔除。
     fn item_score(&self, it: &PaletteItem) -> Option<u32> {
@@ -241,17 +215,6 @@ impl CommandPalette {
 
     /// 重算过滤：对全部条目打分、稳定降序，得出可见序。
     fn recompute_filter(&mut self) {
-        // 跳转行模式：单条目的 label 实时跟随输入（空输入显示引导文案），
-        // 使这条目恒可见（query 即其 label，前缀命中）。
-        if self.mode == PaletteMode::GotoLine
-            && let Some(first) = self.items.first_mut()
-        {
-            first.label = if self.query.is_empty() {
-                "输入跳转行号（可 行:列）…".to_string()
-            } else {
-                self.query.clone()
-            };
-        }
         let mut scored: Vec<(u32, usize)> = self
             .items
             .iter()
@@ -290,15 +253,8 @@ impl CommandPalette {
             return;
         };
         let runner = self.items[idx].run.clone();
-        let query_runner = self.items[idx].run_with_query.clone();
         cx.stop_propagation();
-        // GotoLine 单条目：同一 activate 提交路径，查询词随条目带出（不读本面板实体）。
-        if let Some(f) = query_runner {
-            let q = self.query.clone();
-            f(&q, window, cx);
-        } else {
-            runner(window, cx);
-        }
+        runner(window, cx);
         let focus_left = self.focus_left(window, cx);
         self.selected = None;
         cx.emit(DismissEvent);
@@ -490,7 +446,6 @@ impl Render for CommandPalette {
         let hint = match self.mode {
             PaletteMode::Commands => "命令面板",
             PaletteMode::Files => "打开文件",
-            PaletteMode::GotoLine => "跳转到行",
         };
         let query_box = div()
             .id("command-palette-query")
@@ -576,13 +531,11 @@ impl Render for CommandPalette {
             })
             .collect();
 
-        // 空态提示（命令模式「无匹配命令」；文件模式按「扫描中 / 有无文件」区分文案；
-        // 跳转行模式单条目恒可见，正常不会进空态）。
+        // 空态提示（命令模式「无匹配命令」；文件模式按「扫描中 / 有无文件」区分文案）。
         let list_empty: Option<AnyElement> = if rows.is_empty() {
             let msg = match self.mode {
                 PaletteMode::Commands => "无匹配命令",
                 PaletteMode::Files => files_empty_text(self.scanning, self.items.is_empty()),
-                PaletteMode::GotoLine => "输入有效行号以跳转",
             };
             Some(
                 div()

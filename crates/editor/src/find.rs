@@ -12,7 +12,7 @@
 //! - 大小写**不敏感**（本阶段无开关），字面文本查找（`regex::escape` 转义）；
 //! - **非重叠**匹配（正则 `find_iter` 天然向前推进）；
 //! - 匹配上限 [`FIND_MATCH_CAP`]：到上限**立即停止收集**（先收满/到限即刷新的「首 N 个
-//!   快显」），状态显示「>N 个匹配」，导航只在上限内回绕；
+//!   快显」），状态显示截断版「i/N+」，导航只在上限内回绕；
 //! - 文本插删 / 撤销重做后按 `(buffer 版本, 查询词)` 失效重算（防抖同一条路径）；
 //! - 光标移动不重算匹配表（缓存只随版本/词失效），只重定位当前命中。
 
@@ -21,7 +21,8 @@ use std::ops::Range;
 use crate::buffer::Buffer;
 
 /// 匹配收集上限：达到即停止收集（`capped=true`），导航只在上限内回绕。
-pub const FIND_MATCH_CAP: usize = 5000;
+/// 200 = 首屏高频查询的实用上限：再多匹配对「跳下一个」无增益且拖慢收集/内存/绘制。
+pub const FIND_MATCH_CAP: usize = 200;
 
 /// 编辑区查找状态机（per-`CodeEditor` 一份；CodeEditor 本身 per-tab → find 状态随 tab
 /// 实体独立释放，切换/关闭 tab 无残留高亮/句柄）。
@@ -39,7 +40,7 @@ pub struct FindOverlay {
     pub matches: Vec<Range<usize>>,
     /// 当前命中在 `matches` 的下标。
     pub current: Option<usize>,
-    /// 是否因达到上限而截断（状态显示「>N 个匹配」）。
+    /// 是否因达到上限而截断（状态显示截断版「i/N+」）。
     pub capped: bool,
     /// 匹配表对应的 buffer 版本（文本插删/撤销重做后失效重算）。
     pub matches_version: u64,
@@ -57,15 +58,21 @@ impl FindOverlay {
         self.visible && !self.matches.is_empty()
     }
 
-    /// 状态栏文案：`i/N 个匹配` / `无匹配` / `>N 个匹配`。
+    /// 计数文案（紧凑卡片版）：`i/N` / `无匹配` / `i/N+`（`N+` = 达到
+    /// [`FIND_MATCH_CAP`] 上限截断，总数为 N 而实为更多）。
     pub fn status(&self) -> String {
+        // 当前命中序（1 基）：`current` 越界（人工构造/陈旧）时退回 1，防显示越界序。
+        let i = self
+            .current
+            .filter(|c| *c < self.matches.len())
+            .map(|c| c + 1)
+            .unwrap_or(1);
         if self.capped {
-            format!(">{} 个匹配", FIND_MATCH_CAP)
+            format!("{i}/{}+", FIND_MATCH_CAP)
         } else if self.matches.is_empty() {
             "无匹配".to_string()
         } else {
-            let i = self.current.map(|c| c + 1).unwrap_or(1);
-            format!("{}/{} 个匹配", i, self.matches.len())
+            format!("{i}/{}", self.matches.len())
         }
     }
 
@@ -323,12 +330,12 @@ mod tests {
         assert_eq!(f.status(), "无匹配");
         f.matches = vec![0..1, 2..3, 4..5];
         f.current = Some(0);
-        assert_eq!(f.status(), "1/3 个匹配");
+        assert_eq!(f.status(), "1/3");
         f.current = Some(2);
-        assert_eq!(f.status(), "3/3 个匹配");
+        assert_eq!(f.status(), "3/3");
         f.matches = vec![0..1];
         f.capped = true;
-        assert_eq!(f.status(), ">5000 个匹配");
+        assert_eq!(f.status(), format!("1/{}+", FIND_MATCH_CAP));
     }
 
     #[test]

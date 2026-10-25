@@ -5,11 +5,12 @@ use std::cell::Cell;
 use std::ops::Range;
 
 use gpui::{
-    div, list, point, px, size, AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId,
-    ElementInputHandler, Entity, EventEmitter, Focusable, FocusHandle, GlobalElementId, HighlightStyle,
-    Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, ListState, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, StyledText, Window, prelude::FluentBuilder as _,
+    div, list, point, px, size, AnyElement, AnimationExt, App, Bounds, Context, DispatchPhase,
+    Element, ElementId, ElementInputHandler, Entity, EventEmitter, Focusable, FocusHandle,
+    GlobalElementId, HighlightStyle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
+    ListState, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledText, Window,
+    prelude::FluentBuilder as _,
 };
 use crate::actions::{
     Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart,
@@ -24,7 +25,7 @@ use config::layout::{
     BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_WIDTH, EDITOR_RULER_COLUMNS,
 };
 use super::{
-    CARET_WIDTH_PX, CodeEditor, EditorEvent, FIND_BAR_H, FOLD_ARROW_SLOT_PX, GUTTER_LEFT_PAD_PX,
+    CARET_WIDTH_PX, CodeEditor, EditorEvent, FindBtn, FOLD_ARROW_SLOT_PX, GUTTER_LEFT_PAD_PX,
     GUTTER_RIGHT_PAD_PX, MIN_VISIBLE_ROWS, RowData, RowView,
 };
 
@@ -129,10 +130,16 @@ impl Render for CodeEditor {
             // 空闲 2s 自动隐藏，用户误以为滚动条“时有时无/不准确”）。
             .child(self.vscrollbar_overlay(list_state, content_w_px))
             .child(self.hscrollbar_overlay())
-            // 编辑区内查找条（Ctrl+F 打开）：顶部内部浮层，盖在内容/滚动条之上（只占顶部
-            // 一条，不与右侧/底部滚动条命中区重叠；元素 id find-* 命名）。
+            // 编辑区内查找卡片（Ctrl+F 打开）：编辑区右上角内缘的紧凑悬浮卡片（输入框
+            // + 计数 + 上一项/下一项/关闭按钮），盖在内容/滚动条之上；右缘避开滚动条命中
+            // 区（元素 id find-* 命名；本卡片取代旧顶部通栏 `render_find_bar`）。
             .when(self.find.open, |this| {
-                this.child(self.render_find_bar(window, cx))
+                this.child(self.render_find_card(window, cx))
+            })
+            // 编辑区内跳转行卡片（Ctrl+G）：顶部居中的紧凑悬浮卡片（可复用输入框 +
+            // 内联提示区），盖在内容/滚动条之上；与右上 find 卡可共存（id/命中原样）。
+            .when(self.goto.open, |this| {
+                this.child(self.render_goto_card(window, cx))
             });
 
         EditorElement::new(entity, core.into_any_element())
@@ -537,88 +544,171 @@ impl CodeEditor {
             )
     }
 
-    /// 编辑区内查找条（Ctrl+F 打开）。顶部内部浮层：输入框（`ui::InputState`，IME/编辑/
-    /// 焦点自理）+ 状态文案。
+    /// 编辑区内查找卡片（Ctrl+F 打开）。取代旧顶部通栏 `render_find_bar`：一段紧凑
+    /// 悬浮卡片锚在**编辑区右上角内缘**（顶部 ~8px、右缘让出滚动条 ~8px），含：
+    /// ①输入框 ②index/count 计数（紧凑「i/N / 无匹配 / i/N+」）③上一项 ↑ ④下一项 ↓
+    /// ⑤关闭 ×。圆角 + 边框 + 阴影，背景/边框/文字/按钮悬停色全走 `ui::theme` 语义色
+    /// （亮暗双主题可读）。
     ///
-    /// Enter/Shift+Enter/Escape 在 `on_key_down` 原样按键处理（用 modifiers 区分 shift）。
-    /// 关键：此处**不挂 `on_action(&Enter)` 拦截**——gpui 键动作**先于** KeyDownEvent
-    /// 派发：`dispatch_key_event` 先跑绑定动作（window.rs 6189 行），动作泡阶段命中任意
-    /// `Enter` 监听即默认 `stop_propagation`（window.rs `dispatch_action_on_node_inner`
-    /// 6597 行）后提前 return → KeyDownEvent 不再派发，导航与 Shift+Enter 区分都会
-    /// 失效。故编辑区 `attach_input_actions` 的 `on_action(&Enter)` 换行处理已整体移除
-    /// （改走编辑区核心 `on_key_down`，见 `CodeEditor::on_key_down`）——只要路径上无人
-    /// 拦 `Enter` 动作，按键就落到本层原样 key_down：Enter=下一个、Shift+Enter=上一个，
-    /// 由本层 `stop_propagation` 保证不冒泡到编辑区换行。
-    fn render_find_bar(
+    /// 键盘语义零改动：Enter/Shift+Enter/Escape 在 `on_key_down` 原样按键处理（用
+    /// modifiers 区分 shift）——关键：此处**不挂 `on_action(&Enter)` 拦截**（gpui 键动作
+    /// 先于 KeyDownEvent 派发，拦截会同时丢掉 Enter 导航与 Shift+Enter 的上一个，见旧
+    /// render_find_bar 注释）。按钮只是附加鼠标通道，点击仍走同一套
+    /// `find_step`/`close_find`（见 [`CodeEditor::find_btn_clicked`]），回焦输入框。
+    ///
+    /// 事件互斥（K15）：卡片自身 `on_mouse_down` stop——点卡片任意处（含按钮）不落
+    /// 编辑区光标/不误触编辑；卡片**外**照常编辑文本。
+    ///
+    /// 元素链不变式（feature-delivery §6）：卡片为 `.absolute()` 叠层，链上不再新增
+    /// `.relative()` 覆盖既有 `.absolute()`；既有 `find-bar`/`find-bar-input-wrap` id
+    /// 保持稳定，新增 `find-count` / `find-prev-btn` / `find-next-btn` / `find-close-btn`
+    /// 及无 id 的悬停提示小浮层（无 id → 无 hitbox → 不拦鼠标、不抢焦点）。
+    fn render_find_card(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let status = self.find.status();
         let input = self.find_input.clone();
-        let fg = self.fg;
-        let bar_bg = self.bg;
-        let hairline = self.fg.opacity(0.12);
-        let bar = div()
+        let colors = ui::theme::Theme::global(cx).colors;
+        // 悬浮卡片语义色：背景用「弹层卡」色（亮白/暗灰，与编辑区底区分）、边框/文字/
+        // 悬停/禁用全走主题（亮暗双主题可读，禁止裸色）。
+        let card_bg: Hsla = colors.popover_bg.into();
+        let border: Hsla = colors.border.into();
+        let fg: Hsla = colors.fg.into();
+        let fg_muted: Hsla = colors.fg_muted.into();
+        let fg_disabled: Hsla = colors.fg_disabled.into();
+        let hover_fill: Hsla = colors.selected_bg.into();
+
+        // 卡片：右上角内缘，右缘让出滚动条命中区（沿用既有「right=scrollbar_width+边距」
+        // 做法，顶边距 ~8px）。高度自适应内容；宽度紧凑自适（输入框 ≥160px）。
+        let card_w = ui::scrollbar::scrollbar_width() + px(8.);
+        let mut card = div()
             .id("find-bar")
             .debug_selector(|| "find-bar".into())
             .absolute()
-            .top(px(0.))
-            .left(px(0.))
-            // 不覆盖右侧纵向滚动条轨道（不破坏 scrollbar 命中）：右缘在轨道内侧收住。
-            .right(ui::scrollbar::scrollbar_width() + px(2.))
-            .h(px(FIND_BAR_H as f32))
+            .top(px(8.))
+            .right(card_w)
             .flex()
             .items_center()
-            .gap(px(8.))
-            .pl(px(10.))
-            .pr(px(10.))
-            .bg(bar_bg)
-            // 底部发丝分隔线（与编辑区内容区分）。
-            .child(
-                div()
-                    .id("find-bar-rule")
-                    .debug_selector(|| "find-bar-rule".into())
-                    .absolute()
-                    .bottom(px(0.))
-                    .left(px(0.))
-                    .right(px(0.))
-                    .h(px(1.))
-                    .bg(hairline),
-            )
-            // 点击 find 条空白处不再穿透到编辑区（移动光标）。
+            .gap(px(4.))
+            .pl(px(8.))
+            .pr(px(4.))
+            .py(px(3.))
+            .bg(card_bg)
+            .border_1()
+            .border_color(border)
+            .rounded_lg()
+            // 悬浮阴影（弱单层，同 ui::tooltip 卡片）。
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.18))
+                    .blur_radius(px(8.)),
+            ])
+            // 点击卡片任意处不穿透到编辑区（移动光标）；Esc/Enter/Shift+Enter 原样按键。
             .on_mouse_down(MouseButton::Left, cx.listener(Self::find_bar_mouse_down))
-            // Esc / Enter / Shift+Enter：原样按键处理（用 modifiers 区分 shift）。
-            // ⚠️ 这里**不能**再挂 `on_action(&Enter)` 拦截：gpui 键动作先于 KeyDownEvent
-            // 派发、被 `stop_propagation` 后 KeyDownEvent 直接不再派发（window.rs
-            // `dispatch_key_event` 提前 return）→ 会同时丢掉 Enter 导航与 Shift+Enter
-            // 的上一个。换行抑制靠「编辑区 `on_action(&Enter)` 已整体移除 + 本层先
-            // `stop_propagation`」双重保证（见 `attach_input_actions` 与
-            // `CodeEditor::on_key_down`）。
-            .on_key_down(cx.listener(Self::find_bar_key_down))
-            .child(
+            .on_key_down(cx.listener(Self::find_bar_key_down));
+
+        // ①输入框（`ui::InputState`，IME/组合/UTF-16 依赖其既有实现，本任务不动）。
+        card = card.child(
+            div()
+                .id("find-bar-input-wrap")
+                .debug_selector(|| "find-bar-input-wrap".into())
+                .w(px(180.))
+                .h(px(24.))
+                .child(
+                    input
+                        .map(|i| i.into_any_element())
+                        .unwrap_or_else(|| div().into_any_element()),
+                ),
+        );
+        // ②index/count 计数（紧凑「i/N / 无匹配 / i/N+」）。
+        card = card.child(
+            div()
+                .id("find-count")
+                .debug_selector(|| "find-count".into())
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(px(24.))
+                .px(px(2.))
+                .text_color(fg_muted)
+                .text_size(px(12.))
+                .child(status),
+        );
+        // ③④⑤ 上一项 / 下一项 / 关闭（图标钮，`FindBtn` 自管 glyph/id/提示文案）。
+        for (btn, enabled) in [
+            (FindBtn::Prev, self.find_btn_enabled(FindBtn::Prev)),
+            (FindBtn::Next, self.find_btn_enabled(FindBtn::Next)),
+            (FindBtn::Close, true),
+        ] {
+            card = card.child(self.find_icon_button(btn, enabled, fg, fg_disabled, hover_fill, cx));
+        }
+        // 悬停提示小浮层：按钮 hover 延迟后显示中文提示，锚在卡片下方右缘（按钮簇右侧
+        // 下方），无 id → 无 hitbox → 不拦鼠标、不抢焦点。
+        if let Some(btn) = self.find_tip.shown_btn() {
+            card = card.child(
                 div()
-                    .id("find-bar-input-wrap")
-                    .debug_selector(|| "find-bar-input-wrap".into())
-                    .w(px(220.))
-                    .h(px(24.))
-                    .child(
-                        input
-                            .map(|i| i.into_any_element())
-                            .unwrap_or_else(|| div().into_any_element()),
-                    ),
-            )
-            .child(
-                div()
-                    .id("find-bar-status")
-                    .debug_selector(|| "find-bar-status".into())
-                    .flex()
-                    .flex_none()
-                    .text_color(fg.opacity(0.6))
+                    .debug_selector(|| "find-tip".into())
+                    .absolute()
+                    .top(px(32.))
+                    .right(px(0.))
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(border)
+                    .rounded_lg()
+                    .px_2()
+                    .py_1()
+                    .whitespace_nowrap()
                     .text_size(px(12.))
-                    .child(status),
+                    .text_color(fg_muted)
+                    .child(btn.tip_label().to_string()),
             );
-        bar
+        }
+        card
+    }
+
+    /// find 卡片图标按钮：glyph + 悬停底色 + 悬停提示 + 点击导航。禁态（无匹配/无查询）
+    /// 置灰文字、点击不动作（`find_btn_clicked` 内守卫）；关闭钮恒可用。点击导航后
+    /// `find_btn_clicked` 回焦输入框，按钮自身不抢键盘焦点。
+    fn find_icon_button(
+        &self,
+        btn: FindBtn,
+        enabled: bool,
+        fg: Hsla,
+        fg_disabled: Hsla,
+        hover_fill: Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // 悬停态由 `self.find_tip.hover == Some(btn)` 派生（按钮内 hover 状态）。
+        let hovered = self.find_tip.hover == Some(btn);
+        let id = btn.id();
+        // 事件（hover/click）先挂在本体元素上，`with_spring` 最后包装只做底色淡入
+        // （对齐 ui::menu 同款顺序：事件监听留在内层元素，弹簧包装不改变命中/派发）。
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .flex()
+            .flex_none()
+            .size(px(22.))
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_size(px(15.))
+            .text_color(if enabled { fg } else { fg_disabled })
+            .child(btn.glyph().to_string())
+            .on_hover(cx.listener(move |this, hovered, _window, cx| {
+                this.find_btn_hover(cx, btn, *hovered);
+            }))
+            .on_click(cx.listener(move |this, _e, window, cx| {
+                this.find_btn_clicked(window, cx, btn);
+            }))
+            // 悬停底色淡入（对齐 ui::menu 同款 hover_spring），弹簧态按按钮 id 键控。
+            .with_spring(
+                format!("find-{id}-hover-bg"),
+                ui::motion::hover_spring(if hovered { 1.0 } else { 0.0 }),
+                move |d, v| d.bg(hover_fill.opacity(v)),
+            )
     }
 
     /// find 条空白处点按：不穿透到编辑区（防止误把光标搬走）。
@@ -648,6 +738,149 @@ impl CodeEditor {
                 cx.stop_propagation();
                 window.prevent_default();
                 self.find_step(!k.modifiers.shift, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// 编辑区内跳转行卡片（Ctrl+G）。取代旧 shell 命令面板 GoToLine：一段紧凑悬浮卡片
+    /// **顶部居中**（水平居中于编辑区，非整行通栏；不遮右上角 find 卡），含：
+    /// ①输入框 ②内联提示区（钳制 / 非法 / 空）。圆角 + 边框 + 阴影，背景/边框/文字
+    /// 全走 `ui::theme` 语义色（亮暗双主题可读）。
+    ///
+    /// 键盘语义：Enter = 立即 flush（取消防抖、当场跳转，卡片**不关**、输入框保持焦点）；
+    /// Esc = 关闭（焦点归还编辑器）。点击卡片内部不穿透编辑区（on_mouse_down stop）；
+    /// **点击卡片外**（含编辑区文本 / 滚动条）→ `on_mouse_down_out`（Capture 阶段按
+    /// 「鼠标不在本卡 hitbox 内」触发）关闭卡片并还焦点，落点点击语义由编辑区
+    /// `on_mouse_down` 照常处理（不吞事件）。
+    ///
+    /// 元素 id：`goto-card` / `goto-card-input` / `goto-card-hint`（新，稳定可测）。
+    /// 链不变式：absolute 链不新增 relative 覆盖既有 absolute；卡片可与 find 卡（右上）
+    /// 共存（id/命中原样）。
+    fn render_goto_card(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let input = self.goto_input.clone();
+        let colors = ui::theme::Theme::global(cx).colors;
+        // 悬浮卡片语义色：背景用「弹层卡」色（与编辑区底区分）、边框/文字/错误提示
+        // 全走主题（亮暗双主题可读，禁止裸色）。
+        let card_bg: Hsla = colors.popover_bg.into();
+        let border: Hsla = colors.border.into();
+        let fg_muted: Hsla = colors.fg_muted.into();
+        let error: Hsla = colors.error.into();
+        // 内联提示文案（owned：`.when` 闭包内 child 需 'static）。
+        let hint = self.goto.hint.clone();
+        let is_err = self.goto.hint_error;
+
+        // 卡片：顶部居中（外层通栏 absolute + flex 居中，无 id → 无 hitbox → 不拦鼠标、
+        // 不抢焦点）；高度自适应内容；宽度紧凑自适。
+        let mut card = div()
+            .id("goto-card")
+            .debug_selector(|| "goto-card".into())
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .pl(px(8.))
+            .pr(px(8.))
+            .py(px(3.))
+            .bg(card_bg)
+            .border_1()
+            .border_color(border)
+            .rounded_lg()
+            // 悬浮阴影（弱单层，同 find 卡片）。
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.18))
+                    .blur_radius(px(8.)),
+            ])
+            // 点击卡片任意处不穿透到编辑区（不落光标）；点击卡片外（Capture 阶段按
+            // hitbox 判定）关闭卡片；Enter/Esc 原样按键（Enter flush 不关、Esc 关闭）。
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::goto_card_mouse_down))
+            .on_mouse_down_out(cx.listener(Self::goto_card_mouse_down_out))
+            .on_key_down(cx.listener(Self::goto_card_key_down));
+
+        // ①输入框（`ui::InputState`，IME/组合/UTF-16 依赖其既有实现，本任务不动）。
+        card = card.child(
+            div()
+                .id("goto-card-input")
+                .debug_selector(|| "goto-card-input".into())
+                .w(px(120.))
+                .h(px(24.))
+                .child(
+                    input
+                        .map(|i| i.into_any_element())
+                        .unwrap_or_else(|| div().into_any_element()),
+                ),
+        );
+        // ②内联提示区（钳制 / 非法 / 空）：非法用错误色，其余次要前景。
+        card = card.child(
+            div()
+                .id("goto-card-hint")
+                .debug_selector(|| "goto-card-hint".into())
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(px(24.))
+                .px(px(2.))
+                .text_size(px(12.))
+                .text_color(if is_err { error } else { fg_muted })
+                .whitespace_nowrap()
+                .when(!hint.is_empty(), |this| this.child(hint.clone())),
+        );
+
+        // 外层：顶部通栏 absolute 定位 + 水平居中（无 id → 无 hitbox → 不拦鼠标）。
+        div()
+            .absolute()
+            .top(px(8.))
+            .left(px(0.))
+            .right(px(0.))
+            .flex()
+            .justify_center()
+            .child(card)
+    }
+
+    /// goto 卡片内部点按：不穿透到编辑区（防止误把光标搬走）。
+    fn goto_card_mouse_down(
+        &mut self,
+        _e: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+    }
+
+    /// 点击卡片外（含编辑区文本 / 滚动条 / find 卡）：关闭卡片并还焦点编辑器；落点
+    /// 点击语义由编辑区 `on_mouse_down` 照常处理（本钩子不 stop_propagation）。
+    fn goto_card_mouse_down_out(
+        &mut self,
+        _e: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_goto(window, cx);
+    }
+
+    /// goto 卡片按键：Enter = 立即 flush（取消防抖、当场跳转，卡片不关、输入框保持
+    /// 焦点）；Esc = 关闭（焦点还编辑器）。
+    fn goto_card_key_down(
+        &mut self,
+        e: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let k = &e.keystroke;
+        match k.key.to_ascii_lowercase().as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.close_goto(window, cx);
+            }
+            "enter" => {
+                cx.stop_propagation();
+                window.prevent_default();
+                // 取消防抖（新代号作废旧任务）→ 立即就地 flush（不关卡、输入框仍持焦）。
+                self.goto.invalidate();
+                self.goto_flush(cx);
             }
             _ => {}
         }
