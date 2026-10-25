@@ -53,6 +53,7 @@ GPUI 应用内**全部 UI 组件均为自研**，替代已移除的 `gpui-compon
 | 语法高亮 | `syntect`（解析）→ 自研 `GitHubTheme` / `SemanticStyleResolver` |
 | 数学排版 | `ratex-parser` / `ratex-layout` / `ratex-render`（KaTeX 字体，纯 CPU 光栅） |
 | 异步 | `futures`（大文档「分块读盘·渐进装配」通道） |
+| 编码 | `encoding_rs`（GBK/GB18030/UTF-16 等非 UTF-8 解码；保存按各选项卡源编码回写） |
 | PDF | `pdfium-render` |
 | EPUB / 压缩 | `roxmltree` · `zip` |
 | 图像 | `image`（+ webp） |
@@ -126,8 +127,8 @@ src/
 - `LIBCLANG_PATH` → 指向含 `libclang.dll` 的目录（bindgen 必需，装 LLVM 即得）。
 
 一键装环境：`pwsh scripts/setup-ffmpeg.ps1`（下载 / 配置提示、写用户环境变量，新终端生效）。
-跳过视频功能可 `cargo build --workspace --no-default-features --exclude video-ffmpeg`（不编译
-`src/video/`，也不构建 `video-ffmpeg` cdylib——否则默认 workspace 构建仍需要 FFmpeg 环境）。
+跳过视频功能可 `cargo build --workspace --no-default-features --exclude media-ffmpeg`（不编译
+`src/video/`，也不构建 `media-ffmpeg` cdylib——否则默认 workspace 构建仍需要 FFmpeg 环境）。
 
 PDF 预览依赖 pdfium 动态库：前往 https://github.com/bblanchon/pdfium-binaries/releases 下载，解压得到 `pdfium.dll`，重命名并放于 `resources/pdfium/pdfium-154.0.8035.0.dll`（构建时若探测到会**内嵌进 exe**，分发免带）。
 
@@ -138,7 +139,7 @@ cargo run
 # 发布（Release profile 已配 opt-level=z / LTO / strip / panic=abort）
 cargo build --release
 
-# 分发打包（release exe + video_ffmpeg.dll + FFmpeg 运行库 → dist\gpui-editor-win64\）
+# 分发打包（release exe + media_ffmpeg.dll + FFmpeg 运行库 → dist\gpui-editor-win64\）
 pwsh scripts/package.ps1
 
 # 全量测试
@@ -163,15 +164,15 @@ PDF / EPUB / 图片 / 大文档测试的 fixture **已提交至仓库**（`fixtu
 
 ## 发布 / 打包分发
 
-视频解码内核已拆成独立 cdylib（`video-ffmpeg` 工作区成员，产物 `video_ffmpeg.dll`）：
+视频解码内核已拆成独立 cdylib（`media-ffmpeg` 工作区成员，产物 `media_ffmpeg.dll`）：
 主 exe **不静态导入**任何 FFmpeg dll，只在打开视频时经 libloading **运行时**加载它。
 所以：
-- **exe 缺 `video_ffmpeg.dll` / FFmpeg 运行库也能正常启动**——不开视频照常使用全部其它功能，开视频时在窗口内提示「缺少视频运行库」；
-- 要让视频功能可用，分发时必须把 `video_ffmpeg.dll` 与全部 FFmpeg dll 和 exe **放到同一目录**（清单见下方「视频组件所需 DLL」）。一键打包：
+- **exe 缺 `media_ffmpeg.dll` / FFmpeg 运行库也能正常启动**——不开视频照常使用全部其它功能，开视频时在窗口内提示「缺少视频运行库」；
+- 要让视频功能可用，分发时必须把 `media_ffmpeg.dll` 与全部 FFmpeg dll 和 exe **放到同一目录**（清单见下方「视频组件所需 DLL」）。一键打包：
 
 ```bash
-# 构建 release 并导出「exe + video_ffmpeg.dll + 全部 FFmpeg 运行库」到 dist\gpui-editor-win64\
-# 脚本自动校验：exe 无 FFmpeg 静态导入、video_ffmpeg.dll 所需的 FFmpeg dll 全部在包内
+# 构建 release 并导出「exe + media_ffmpeg.dll + 全部 FFmpeg 运行库」到 dist\gpui-editor-win64\
+# 脚本自动校验：exe 无 FFmpeg 静态导入、media_ffmpeg.dll 所需的 FFmpeg dll 全部在包内
 pwsh scripts/package.ps1
 ```
 
@@ -179,7 +180,7 @@ pwsh scripts/package.ps1
 
 | 文件 | 来源 | 说明 |
 | --- | --- | --- |
-| `video_ffmpeg.dll` | 本仓库 `target\release\`（cdylib） | 视频解码内核：主 exe 打开视频时经 libloading **运行时**加载它 |
+| `media_ffmpeg.dll` | 本仓库 `target\release\`（cdylib） | 视频解码内核：主 exe 打开视频时经 libloading **运行时**加载它 |
 | `avcodec-63.dll` | `FFMPEG_DIR\bin` | 音视频编解码 |
 | `avformat-63.dll` | `FFMPEG_DIR\bin` | 容器格式（MP4 / MKV / AVI / MOV…）解封装 |
 | `avutil-61.dll` | `FFMPEG_DIR\bin` | 通用工具库（内存 / 数学 / 字典…） |
