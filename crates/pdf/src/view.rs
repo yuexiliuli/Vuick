@@ -242,9 +242,6 @@ pub struct PdfViewer {
     /// `PAGE_WIDTH`）。窗口 / 侧边栏拉宽拉窄 → 每帧 [`open`] 的 `ensure_window` 重算
     /// 基线并重排页列，页面随之缩放；Ctrl+滚轮在基线上再乘 `zoom` 倍率。
     pub(crate) base_w: f32,
-    /// 上次 `compute_layout` 所用的 `page_width`（= `base_w * zoom`）。基线与 `unchanged`
-    /// 时跳过无谓重算；宽 / 缩放变化时据此判断是否需要重排页列（新基线或新倍率）。
-    pub(crate) layout_pw: f32,
     /// 静态帧门控签名（Sprint 5）：上一非门帧的变化签名（[`WindowSig`]）；与当前帧
     /// 一致是「静置候选」的前提，不一致/首帧（`None`）绝不门。供 `ensure_window`
     /// 门控判定，另供 pdf::tests 回归测试断言「静置 → 滚动恢复」转换。
@@ -321,7 +318,6 @@ mod tests {
                     search_seq: 0,
                     zoom: 1.0,
                     base_w: PAGE_WIDTH,
-                    layout_pw: 0.0,
                     window_sig: None,
                     window_settled: false,
                     idle_gate_skips: 0,

@@ -56,7 +56,6 @@ impl PdfViewer {
             search_seq: 0,
             zoom: 1.0,
             base_w: PAGE_WIDTH,
-            layout_pw: 0.0,
             window_sig: None,
             window_settled: false,
             idle_gate_skips: 0,
@@ -90,7 +89,6 @@ impl PdfViewer {
                         let (tops, total) = compute_layout(&this.dims, this.page_width());
                         this.page_tops = tops;
                         this.total_height = total;
-                        this.layout_pw = this.page_width();
                         this.slots = vec![Slot::default(); this.dims.len()];
                         this.loading = false;
                         if timing_view() {
@@ -291,7 +289,6 @@ impl PdfViewer {
             let (tops, total) = compute_layout(&self.dims, pw);
             self.page_tops = tops;
             self.total_height = total;
-            self.layout_pw = pw;
             if timing_view() {
                 eprintln!(
                     "[{:.1}ms] [VIEW-REFIT] base_w={:.0} page_width={:.0} view_w={:.0} zoom={:.2}",

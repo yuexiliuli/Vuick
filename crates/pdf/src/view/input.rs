@@ -78,7 +78,6 @@ impl PdfViewer {
         let (tops, total) = compute_layout(&self.dims, new_w);
         self.page_tops = tops;
         self.total_height = total;
-        self.layout_pw = new_w;
         cx.notify();
     }
 
