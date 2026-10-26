@@ -172,10 +172,12 @@ impl EditorApp {
             _music_sub: None,
         };
         app.register_window(window, cx);
-        // 打开文件夹持久化 → 启动恢复：prefs.opened_folder 存在且目录仍有效 → 设为
-        // 文件树根 + 展开根（后台读根直接子项）+ 侧边栏切到「文件」视图展开。
+        // 打开文件夹持久化 → 启动恢复：**仅当「恢复上次会话」开启时生效**（与恢复上次
+        // 选项卡同一开关——关闭恢复 = 干净启动，不再自动重开上次打开的文件夹）。
+        // opened_folder 仍持久化，手动打开文件夹 / 导入设置不受此门控影响。
         // 路径失效 / 不存在 → 不设根，首次 `persist_prefs` 时清掉（写 null）。
-        if let Some(folder) = opened_folder {
+        let restore_folder = opened_folder.filter(|_| app.session_restore);
+        if let Some(folder) = restore_folder {
             let p = PathBuf::from(&folder);
             if p.is_dir() {
                 app.sidebar.files.set_root(Some(p.clone()));

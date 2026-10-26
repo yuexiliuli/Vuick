@@ -354,3 +354,68 @@
         assert_eq!(kids, 0, "无效路径应清空全部子项缓存");
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// 启动时「上次打开的文件夹（opened_folder 持久化）」的自动重开**跟随「恢复上次会话」
+    /// 开关**：关闭恢复 = 干净启动不重开上次文件夹；显式开启才把文件树恢复到该文件夹并
+    /// 切「文件」视图。回归：用户关掉「恢复上次会话」后每次启动仍被重开（如 D:\cache）。
+    #[gpui::test]
+    async fn startup_folder_restore_gated_by_session_restore(cx: &mut TestAppContext) {
+        init_test(cx);
+        let base =
+            std::env::temp_dir().join(format!("gpui-startup-folder-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("子目录")).unwrap();
+        std::fs::write(base.join("a.txt"), "AAA").unwrap();
+        // JSON 里用正斜杠避免反斜杠转义坏包；PathBuf 在 Windows 接受该形式。
+        let folder_json = base.to_string_lossy().replace('\\', "/");
+        let cfg =
+            std::env::temp_dir().join(format!("gpui-folder-cfg-{}.json", std::process::id()));
+
+        // ① 关闭「恢复上次会话」→ 启动不重开上次文件夹。
+        std::fs::write(
+            &cfg,
+            format!(r#"{{"opened_folder": "{folder_json}", "session_restore": false}}"#),
+        )
+        .unwrap();
+        unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+        let (app_off, cx) = add_app(cx);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let root_off = cx.update(|_w, cx| app_off.read(cx).sidebar.files.root.clone());
+        unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+        assert_eq!(
+            root_off,
+            None,
+            "关闭恢复上次会话 → 启动不应重开上次打开的文件夹"
+        );
+
+        // ② 显式开启「恢复上次会话」→ 启动把文件树恢复到上次文件夹并切「文件」视图。
+        std::fs::write(
+            &cfg,
+            format!(r#"{{"opened_folder": "{folder_json}", "session_restore": true}}"#),
+        )
+        .unwrap();
+        unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+        let (app_on, cx) = add_app(cx);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (root_on, view_on) = cx.update(|_w, cx| {
+            let a = app_on.read(cx);
+            (a.sidebar.files.root.clone(), a.sidebar.view)
+        });
+        unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+        let _ = std::fs::remove_file(&cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            root_on,
+            Some(base.clone()),
+            "开启恢复 → 启动恢复上次打开的文件夹"
+        );
+        assert_eq!(
+            view_on,
+            crate::app::sidebar::SidebarView::Files,
+            "并切到「文件」视图"
+        );
+    }
