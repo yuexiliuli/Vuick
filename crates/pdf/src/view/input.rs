@@ -22,23 +22,36 @@ impl PdfViewer {
     pub(super) fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // 仅 Ctrl+滚轮缩放；普通滚轮不拦截（交给滚动容器）。
-        if !event.modifiers.control {
+        //
+        // Ctrl 判定 = 事件自带修饰键 ∪ 窗口侧当前修饰键（并集）：
+        // gpui_windows 给每个滚轮事件附的 modifiers 来自 `current_modifiers()`
+        // （= GetKeyState(VK_CONTROL)，gpui_windows/events.rs:1751），它反映的是
+        // 线程消息队列态而非实时硬件态，真机曾实测恒 false；故再并入窗口侧公开
+        // API `Window::modifiers()`（gpui/src/window.rs:3405，pub fn）取当前修饰键，
+        // 任一来源为 true 即按 Ctrl 处理。普通滚轮保持不拦截（不调 stop_propagation）。
+        let event_ctrl = event.modifiers.control;
+        let win_ctrl = window.modifiers().control;
+        if !(event_ctrl || win_ctrl) {
             if timing_view() {
                 eprintln!(
-                    "[{:.1}ms] [VIEW-WHEEL] 普通滚轮 control=false 不缩放",
-                    crate::pdf::timing_ms()
+                    "[{:.1}ms] [VIEW-WHEEL] 普通滚轮 ev_ctrl={} win_ctrl={} 不缩放",
+                    crate::pdf::timing_ms(),
+                    event_ctrl,
+                    win_ctrl,
                 );
             }
             return;
         }
         if timing_view() {
             eprintln!(
-                "[{:.1}ms] [VIEW-WHEEL] Ctrl control=true delta_y={:.0} zoom_before={:.2}",
+                "[{:.1}ms] [VIEW-WHEEL] Ctrl ev_ctrl={} win_ctrl={} delta_y={:.0} zoom_before={:.2}",
                 crate::pdf::timing_ms(),
+                event_ctrl,
+                win_ctrl,
                 pan_zoom::wheel_delta_y(event),
                 self.zoom,
             );
