@@ -16,6 +16,12 @@ base = { path = "../base" }
 ui = { path = "../ui" }
 viewer = { path = "../viewer" }
 
+# Windows 实时硬件键探测（Ctrl+滚轮缩放兜底）：gpui 事件/window 修饰键在真机恒 false
+# （GetKeyState 线程消息队列态带不出），用 GetAsyncKeyState(VK_CONTROL) 读实时硬件态。
+# 版本对齐 Cargo.lock 既有 windows-sys 0.61.2（polling 等传递依赖），避免多版本冲突。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
 gpui = { workspace = true, features = ["test-support"] }

@@ -13,6 +13,20 @@
 
 use super::*;
 
+/// Windows 实时硬件态 Ctrl 探测：gpui 事件/window 修饰键在真机恒 false（GetKeyState
+/// 线程消息队列态带不出），以 `GetAsyncKeyState(VK_CONTROL)` 读实时硬件态兜底——
+/// 高位置位（bit 15 = 0x8000）即按下。非 Windows 平台恒为 false（无生效路径）。
+#[cfg(target_os = "windows")]
+fn os_ctrl_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
+    unsafe { GetAsyncKeyState(VK_CONTROL as i32) as i32 & 0x8000 != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn os_ctrl_down() -> bool {
+    false
+}
+
 impl PdfViewer {
     // ---- 滚轮缩放 ----
 
@@ -27,31 +41,36 @@ impl PdfViewer {
     ) {
         // 仅 Ctrl+滚轮缩放；普通滚轮不拦截（交给滚动容器）。
         //
-        // Ctrl 判定 = 事件自带修饰键 ∪ 窗口侧当前修饰键（并集）：
+        // Ctrl 判定 = 事件自带修饰键 ∪ 窗口侧当前修饰键 ∪ Windows 实时硬件键（三重并集）：
         // gpui_windows 给每个滚轮事件附的 modifiers 来自 `current_modifiers()`
         // （= GetKeyState(VK_CONTROL)，gpui_windows/events.rs:1751），它反映的是
-        // 线程消息队列态而非实时硬件态，真机曾实测恒 false；故再并入窗口侧公开
-        // API `Window::modifiers()`（gpui/src/window.rs:3405，pub fn）取当前修饰键，
+        // 线程消息队列态而非实时硬件态，真机曾实测恒 false；窗口侧公开 API
+        // `Window::modifiers()`（gpui/src/window.rs:3405，pub fn）在真机同样恒 false；
+        // 故再并入 [`os_ctrl_down`]（Windows 走 GetAsyncKeyState 读实时硬件态）兜底，
         // 任一来源为 true 即按 Ctrl 处理。普通滚轮保持不拦截（不调 stop_propagation）。
         let event_ctrl = event.modifiers.control;
         let win_ctrl = window.modifiers().control;
-        if !(event_ctrl || win_ctrl) {
+        let os_ctrl = os_ctrl_down();
+        let ctrl = event_ctrl || win_ctrl || os_ctrl;
+        if !ctrl {
             if timing_view() {
                 eprintln!(
-                    "[{:.1}ms] [VIEW-WHEEL] 普通滚轮 ev_ctrl={} win_ctrl={} 不缩放",
+                    "[{:.1}ms] [VIEW-WHEEL] 普通滚轮 ev_ctrl={} win_ctrl={} os_ctrl={} 不缩放",
                     crate::pdf::timing_ms(),
                     event_ctrl,
                     win_ctrl,
+                    os_ctrl,
                 );
             }
             return;
         }
         if timing_view() {
             eprintln!(
-                "[{:.1}ms] [VIEW-WHEEL] Ctrl ev_ctrl={} win_ctrl={} delta_y={:.0} zoom_before={:.2}",
+                "[{:.1}ms] [VIEW-WHEEL] Ctrl ev_ctrl={} win_ctrl={} os_ctrl={} delta_y={:.0} zoom_before={:.2}",
                 crate::pdf::timing_ms(),
                 event_ctrl,
                 win_ctrl,
+                os_ctrl,
                 pan_zoom::wheel_delta_y(event),
                 self.zoom,
             );
