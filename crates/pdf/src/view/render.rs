@@ -135,6 +135,21 @@ fn search_overlays_for_page(
     out
 }
 
+/// 页卡底图选择（缩放期防闪的纯逻辑，见 [`PdfViewer::build_visible_page_cards`]）：
+/// 返回本帧应铺满整页的位图，优先级 **当前密度封面（锐利）→ 旧密度封面
+/// （[`Slot::prev_cover`]，缩放过渡期 CSS 拉伸兜底）→ 中清 → 缩略**；全空 → `None`
+/// （调用方显示「第 N 页 加载中…」——仅首开/极速拖动这类真的没有任何位图的页才出现）。
+/// 缩放瞬间 `cover_now` 为 `None`，但只要旧封面还在，底图就是旧封面而非占位——
+/// 「宁可瞬时模糊也不闪白」。抽成纯函数便于单测钉死该优先级。
+pub(super) fn page_base_image(
+    cover_now: Option<&Arc<RenderImage>>,
+    cover_stale: Option<&Arc<RenderImage>>,
+    mid: Option<&Arc<RenderImage>>,
+    thumb: Option<&Arc<RenderImage>>,
+) -> Option<Arc<RenderImage>> {
+    cover_now.or(cover_stale).or(mid).or(thumb).cloned()
+}
+
 impl PdfViewer {
     /// 把「可视窗口内 [start, end] 的页」逐个铺成**绝对定位**的页卡片列表
     /// （页列虚拟化的核心，被 [`Render::render`] 的已加载分支调用）。
@@ -173,7 +188,7 @@ impl PdfViewer {
             let tile_ok = (slot.tile_scale - scale).abs() <= 1e-4;
             let slot_thumb = slot.thumb.clone();
             let slot_mid = slot.mid.clone();
-            // 首屏整页锐化封面（满显示密度；缩放过期时 schedule_tiles 已丢弃，顶层保险）。
+            // 首屏整页锐化封面（满显示密度；缩放过期时 schedule_tiles 已移入 prev_cover）。
             let slot_cover = if (slot.cover_scale - cover_scale(dim, page_width, scale_factor))
                 .abs()
                 <= 1e-4
@@ -182,6 +197,9 @@ impl PdfViewer {
             } else {
                 None
             };
+            // 缩放过渡期兜底：旧密度封面（schedule_tiles 从 cover 移入）在新密度封面到位前
+            // 按新页宽 CSS 拉伸铺满，防「Ctrl+滚轮缩放期间每档闪一次『加载中』」空白。
+            let slot_prev_cover = slot.prev_cover.clone();
             let mut tiles: Vec<(f32, f32, f32, f32, Arc<RenderImage>)> = Vec::new();
             if tile_ok {
                 tiles.reserve(slot.tiles.len());
@@ -236,12 +254,15 @@ impl PdfViewer {
                 .border_color(page_border)
                 .overflow_hidden();
 
-            // 三层合成：底图（封面 → 中清 → 缩略图，先瞬时锐化铺满首屏、占位兜底）
-            // → 瓦片（逐片绝对定位，opaque 覆盖底图）→ 选区/检索高亮。
-            let base = slot_cover
-                .clone()
-                .or_else(|| slot_mid.clone())
-                .or_else(|| slot_thumb.clone());
+            // 三层合成：底图（当前密度封面 → 旧密度封面拉伸兜底 → 中清 → 缩略图，
+            // 缩放期不闪白：宁可瞬时模糊也要有底图）→ 瓦片（逐片绝对定位，opaque 覆盖
+            // 底图）→ 选区/检索高亮。全空（首开/极速拖动）才落「加载中」占位。
+            let base = page_base_image(
+                slot_cover.as_ref(),
+                slot_prev_cover.as_ref(),
+                slot_mid.as_ref(),
+                slot_thumb.as_ref(),
+            );
             let inner: gpui::AnyElement = if !tiles.is_empty() {
                 let mut c = div().size_full().relative();
                 if let Some(base) = base {

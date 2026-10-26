@@ -198,6 +198,9 @@ impl PdfViewer {
             if let Some(arc) = slot.cover.take() {
                 drops.push(arc);
             }
+            if let Some(arc) = slot.prev_cover.take() {
+                drops.push(arc);
+            }
             if let Some(arc) = slot.thumb.take() {
                 drops.push(arc);
             }

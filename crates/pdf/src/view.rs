@@ -389,4 +389,61 @@ mod tests {
             "缩小到下限"
         );
     }
+
+    /// 缩放期防闪底图选择（纯逻辑，封住 [`render::page_base_image`] 的优先级）：
+    /// 缩放瞬间「当前密度封面未就绪（`cover_now=None`）× 旧密度封面仍在（`prev_cover`）」
+    /// 时，底图必须是**旧封面**（CSS 拉伸兜底）而非 `None`——`None` 正是「第 N 页 加载中…」
+    /// 闪白的根因。旧封面缺位才回落到中清/缩略；四者全空（首开/极速拖动）才允许落占位。
+    #[test]
+    fn zoom_transition_keeps_old_cover_as_base_not_placeholder() {
+        let mk = |ch: u8| -> std::sync::Arc<gpui::RenderImage> {
+            render_image_from_bgra(vec![ch, ch, ch, 255], 1, 1).expect("构造 1×1 测试位图")
+        };
+        let cur_cover = mk(0x20);
+        let old_cover = mk(0x30); // 缩放前驻留的旧密度封面
+        let mid = mk(0x40);
+        let thumb = mk(0x50);
+
+        // 缩放过渡中：新密度封面还没回来（cover_now=None）→ 底图 = 旧封面，而非 None。
+        let base = super::render::page_base_image(
+            None,
+            Some(&old_cover),
+            Some(&mid),
+            Some(&thumb),
+        );
+        let base = base.expect("缩放过渡期只要有旧资产就不能落「加载中」");
+        assert!(
+            std::sync::Arc::ptr_eq(&base, &old_cover),
+            "旧密度封面应优先于中清/缩略作底图"
+        );
+
+        // 当前密度封面就绪（锐利）→ 优先于旧封面。
+        let base2 = super::render::page_base_image(
+            Some(&cur_cover),
+            Some(&old_cover),
+            Some(&mid),
+            Some(&thumb),
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&base2.expect("有封面必有底图"), &cur_cover),
+            "当前密度封面最优先"
+        );
+
+        // 无封面（含旧封面）时：中清 > 缩略 > 全空。
+        assert!(std::sync::Arc::ptr_eq(
+            &super::render::page_base_image(None, None, Some(&mid), Some(&thumb))
+                .expect("中清存在"),
+            &mid,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &super::render::page_base_image(None, None, None, Some(&thumb))
+                .expect("缩略存在"),
+            &thumb,
+        ));
+        // 四者全空（首开/极速拖动且旧资产也被回收）→ None，此时才显示「加载中」占位。
+        assert!(
+            super::render::page_base_image(None, None, None, None).is_none(),
+            "全空才落「加载中」占位"
+        );
+    }
 }

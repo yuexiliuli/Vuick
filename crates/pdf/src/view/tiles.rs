@@ -204,12 +204,14 @@ impl PdfViewer {
         for page in cover_order {
             let dim = self.dims[page];
             let cscale = cover_scale(dim, page_width, scale_factor);
-            // 缩放过期（缩放/DPI 已变）→ 丢弃旧封面
+            // 缩放过期（缩放/DPI 已变）→ 旧封面移入 `prev_cover` 作 CSS 拉伸兜底底图
+            // （不再立即下线：本帧渲染还靠它铺满新页宽，防「Ctrl+滚轮缩放」闪「加载中」）。
+            // `cover` 置空 → 下方按新密度重派封面，新封面到位后取代并下线旧封面。
             if let Some(slot) = self.slots.get_mut(page) {
                 let stale = slot.cover.is_some() && (slot.cover_scale - cscale).abs() > 1e-4;
                 if stale
                     && let Some(old) = slot.cover.take() {
-                        self.pending_drops.push(old);
+                        slot.prev_cover = Some(old);
                     }
             }
             // 整页不超预算 且 无封面 且 未在途 → 派发
@@ -608,6 +610,10 @@ impl PdfViewer {
                 if let Some(old) = s.cover.replace(img) {
                     self.pending_drops.push(old);
                 }
+                // 新密度封面到位 → 旧密度兜底底图（prev_cover）随之下线回收。
+                if let Some(prev) = s.prev_cover.take() {
+                    self.pending_drops.push(prev);
+                }
                 s.cover_scale = cscale;
                 // 封面 = 全页同密度整页位图：该页的瓦片（~整页 12-15 片）与中清（~2MB 占位）
                 // 全部冗余 → 立即回收内存/显存；渲染直接以封面为底图，无任何视觉回退。
@@ -636,6 +642,11 @@ impl PdfViewer {
         for (page, slot) in self.slots.iter_mut().enumerate() {
             if slot.cover.is_some() && (page < wanted_first || page > wanted_last)
                 && let Some(old) = slot.cover.take() {
+                    drops.push(old);
+                }
+            // 旧密度封面兜底同样只保留在当前封面窗口内（窗外随滚即回收，防越滚越积）。
+            if slot.prev_cover.is_some() && (page < wanted_first || page > wanted_last)
+                && let Some(old) = slot.prev_cover.take() {
                     drops.push(old);
                 }
         }
