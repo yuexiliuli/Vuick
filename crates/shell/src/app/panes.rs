@@ -241,9 +241,22 @@ impl EditorApp {
             .into_any_element()
     }
 
+    /// 是否开启本覆盖层滚轮的诊断探针（`GPUI_EDITOR_WHEEL=1`，进程内缓存一次）：与 PDF
+    /// 侧 `[VIEW-WHEEL]` 探针（`GPUI_EDITOR_PDF_TIMING=1`）对位，两处日志确认 Ctrl+滚轮
+    /// 的修饰键命中（ev_ctrl / win_ctrl）与事件是否到达查看器。
+    fn wheel_probe() -> bool {
+        static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *EN.get_or_init(|| {
+            std::env::var_os("GPUI_EDITOR_WHEEL").is_some_and(|v| v == "1" || v == "true")
+        })
+    }
+
     /// 编辑区 / 预览区共用的 Ctrl+滚轮缩放覆盖层（Ctrl+滚轮改全局字号；普通滚轮透传）。
     /// 挂在整个内容区之上（最后绘制、命中测试最靠前），让编辑区与预览区都以同一个
     /// `change_font_size` 为唯一缩放入口，三处（编辑/预览/WYSIWYG）字号保持一致。
+    /// ⚠️ 只挂在「不自处理滚轮的文本宿主」之上：PDF / 图片 / 视频 等自带阅读器一律不挂
+    /// （见 [`Self::render_preview_pane`] / [`Self::render_fullscreen_preview`]）——否则
+    /// 本层作为最靠前命中在 Ctrl+滚轮时先消费并 stop_propagation，媒体自身缩放失效。
     fn zoom_overlay(cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .id("zoom-overlay")
@@ -256,8 +269,15 @@ impl EditorApp {
             .on_scroll_wheel(cx.listener(
                 |this: &mut EditorApp,
                  event: &gpui::ScrollWheelEvent,
-                 _window,
+                 window: &mut gpui::Window,
                  cx| {
+                    if Self::wheel_probe() {
+                        eprintln!(
+                            "[SHELL-WHEEL] zoom_overlay ev_ctrl={} win_ctrl={}",
+                            event.modifiers.control,
+                            window.modifiers().control,
+                        );
+                    }
                     if !event.modifiers.control {
                         return;
                     }
@@ -339,6 +359,23 @@ impl EditorApp {
             return self.md_wy_host_children(window, cx, false, grow);
         }
         // PDF / 图片 / 视频（自包含阅读器）。
+        let mut preview_pane = div()
+            .id("preview-pane")
+            .flex_1()
+            .min_w(px(0.))
+            .bg(self.panel_bg())
+            .relative()
+            // PDF → PdfViewer（整页原样）；其余 → Markdown 渲染器。
+            // Entity 直接作为子元素渲染（内部 size_full）。
+            .child(Self::preview_element(&self.tabs[self.active_tab]));
+        // 自包含阅读器（PDF/图片/视频）各自处理滚轮：不再挂全局 zoom_overlay（对齐
+        // `render_fullscreen_preview` 同一口径）。否则绝对定位的覆盖层（命中测试最靠前）
+        // 会在 Ctrl+滚轮时**先于阅读器**消费并 `stop_propagation`，媒体自身 Ctrl+滚轮
+        // 缩放失效——普通滚轮则被不拦截地透传到阅读器。仅非阅读器占位（无 md_wy 的
+        // 文本/纯文本等）保留全局字号入口。
+        if !self.tabs[self.active_tab].reader.is_reader() {
+            preview_pane = preview_pane.child(Self::zoom_overlay(cx));
+        }
         div()
             .flex()
             .flex_row()
@@ -354,19 +391,7 @@ impl EditorApp {
                     this.open_dropped_paths(paths, window, cx);
                 },
             ))
-            .child(
-                div()
-                    .id("preview-pane")
-                    .flex_1()
-                    .min_w(px(0.))
-                    .bg(self.panel_bg())
-                    .relative()
-                    // PDF → PdfViewer（整页原样）；其余 → Markdown 渲染器。
-                    // Entity 直接作为子元素渲染（内部 size_full）。
-                    .child(Self::preview_element(&self.tabs[self.active_tab]))
-                    // Ctrl+滚轮缩放（同一入口 change_font_size）：预览区也参与全局字号调节。
-                    .child(Self::zoom_overlay(cx)),
-            )
+            .child(preview_pane)
             .into_any_element()
     }
 
@@ -535,13 +560,10 @@ impl EditorApp {
             .bg(self.panel_bg())
             .child(Self::preview_element(tab));
         // 图片/视频查看器：自处理滚轮（图片：单滚切换 / Ctrl+滚轮缩放），不再挂全局
-        // zoom_overlay（否则 Ctrl+滚轮会被全局字号缩放抢走，媒体缩放失效）；
-        // PDF / 其余（无自处理滚轮）继续挂 zoom_overlay。
-        #[cfg(feature = "video")]
-        let media_self_wheel = !matches!(&tab.reader, MediaReader::Image(_) | MediaReader::Video(_));
-        #[cfg(not(feature = "video"))]
-        let media_self_wheel = !matches!(&tab.reader, MediaReader::Image(_));
-        if media_self_wheel {
+        // zoom_overlay（否则 Ctrl+滚轮会被全局字号缩放抢走，媒体缩放失效）。PDF 自身
+        // 已有 Ctrl+滚轮缩放 → 与图片/视频同归「媒体自处理」，同样不挂；仅非阅读器占位
+        // （无 md_wy 的文本/纯文本等）保留全局字号入口。
+        if !tab.reader.is_reader() {
             el = el.child(Self::zoom_overlay(cx));
         }
         el.into_any_element()
