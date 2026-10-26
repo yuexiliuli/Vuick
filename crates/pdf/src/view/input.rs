@@ -27,11 +27,33 @@ impl PdfViewer {
     ) {
         // 仅 Ctrl+滚轮缩放；普通滚轮不拦截（交给滚动容器）。
         if !event.modifiers.control {
+            if timing_view() {
+                eprintln!(
+                    "[{:.1}ms] [VIEW-WHEEL] 普通滚轮 control=false 不缩放",
+                    crate::pdf::timing_ms()
+                );
+            }
             return;
+        }
+        if timing_view() {
+            eprintln!(
+                "[{:.1}ms] [VIEW-WHEEL] Ctrl control=true delta_y={:.0} zoom_before={:.2}",
+                crate::pdf::timing_ms(),
+                pan_zoom::wheel_delta_y(event),
+                self.zoom,
+            );
         }
         let delta_y = pan_zoom::wheel_delta_y(event);
         // 实测本平台：向上滚动 delta.y>0 → 放大；向下 <0 → 缩小（与编辑器字号缩放一致）
         self.adjust_zoom(pan_zoom::zoom_factor(delta_y, ZOOM_STEP), cx);
+        if timing_view() {
+            eprintln!(
+                "[{:.1}ms] [VIEW-WHEEL] adjust_zoom 后 zoom={:.2} page_width={:.0}",
+                crate::pdf::timing_ms(),
+                self.zoom,
+                self.page_width(),
+            );
+        }
         cx.stop_propagation();
     }
 
@@ -56,6 +78,7 @@ impl PdfViewer {
         let (tops, total) = compute_layout(&self.dims, new_w);
         self.page_tops = tops;
         self.total_height = total;
+        self.layout_pw = new_w;
         cx.notify();
     }
 

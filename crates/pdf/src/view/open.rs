@@ -55,6 +55,8 @@ impl PdfViewer {
             search_pending_seq: 0,
             search_seq: 0,
             zoom: 1.0,
+            base_w: PAGE_WIDTH,
+            layout_pw: 0.0,
             window_sig: None,
             window_settled: false,
             idle_gate_skips: 0,
@@ -88,6 +90,7 @@ impl PdfViewer {
                         let (tops, total) = compute_layout(&this.dims, this.page_width());
                         this.page_tops = tops;
                         this.total_height = total;
+                        this.layout_pw = this.page_width();
                         this.slots = vec![Slot::default(); this.dims.len()];
                         this.loading = false;
                         if timing_view() {
@@ -236,9 +239,10 @@ impl PdfViewer {
         self.search_pending = None;
     }
 
-    /// 当前页列显示宽度（随 Ctrl+滚轮缩放变化）。
+    /// 当前页列显示宽度 = 自适应容器宽的基线 `base_w` × 缩放 `zoom`。
+    /// 打开即「适应窗口宽」（见 [`Self::base_w`]），Ctrl+滚轮在其上缩放。
     pub(crate) fn page_width(&self) -> f32 {
-        PAGE_WIDTH * self.zoom
+        self.base_w * self.zoom
     }
 
     /// 书签目录访问器（侧边栏目录使用）。
@@ -269,6 +273,36 @@ impl PdfViewer {
         }
         if self.dims.is_empty() || self.worker.is_none() {
             return;
+        }
+        // **自适应窗口宽**：页宽基线 = 滚动容器可视宽 − 两侧页边距（容器首帧未布局宽为
+        // 0 → 回退窗口宽；侧边栏/分屏使可视区窄于窗口时按容器实宽，页列不相对可视区偏）。
+        // 窗口/侧边栏拉宽拉窄 → 基线变 → 重排页列布局（页面随窗口缩放），瓦片按新密度
+        // 由 `schedule_tiles` 惰性重渲；Ctrl+滚轮在基线上再乘 `zoom`（`adjust_zoom` 重排）。
+        let container_w = f32::from(self.scroll.bounds().size.width);
+        let view_w = if container_w > 0.0 {
+            container_w
+        } else {
+            window.bounds().size.width.as_f32()
+        };
+        let new_base = (view_w - 2.0 * PAGE_PAD_X).max(1.0);
+        if (new_base - self.base_w).abs() > 1e-4 {
+            self.base_w = new_base;
+            let pw = self.page_width();
+            let (tops, total) = compute_layout(&self.dims, pw);
+            self.page_tops = tops;
+            self.total_height = total;
+            self.layout_pw = pw;
+            if timing_view() {
+                eprintln!(
+                    "[{:.1}ms] [VIEW-REFIT] base_w={:.0} page_width={:.0} view_w={:.0} zoom={:.2}",
+                    crate::pdf::timing_ms(),
+                    self.base_w,
+                    pw,
+                    view_w,
+                    self.zoom,
+                );
+            }
+            cx.notify();
         }
         let scale_factor = window.scale_factor();
         let page_width = self.page_width();

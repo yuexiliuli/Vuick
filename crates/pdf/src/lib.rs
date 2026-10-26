@@ -1060,29 +1060,37 @@ mod tests {
             for _ in 0..6 {
                 cx.run_until_parked();
             }
+            // fit-width 自适应：让每帧装配按最新容器宽重设页宽基线（同 resize 测试口径）。
+            for _ in 0..10 {
+                let _ = cx.update(|w, _| w.refresh());
+                cx.run_until_parked();
+            }
             let scroll = cx.debug_bounds("pdf-scroll").expect("应有滚动容器");
             let pages = cx
                 .debug_bounds("pdf-pages")
                 .expect("应有页列（宽=页宽）");
             assert_eq!(scroll.size.width.as_f32(), pane_w, "滚动可视区宽应为 pane 宽");
             let left_pad = (pages.left() - scroll.left()).as_f32();
-            if pane_w > 840.0 + 2.0 * config::pdf::PAGE_PAD_X {
-                let right_pad = (scroll.right() - pages.right()).as_f32();
-                let center_off = (pages.center().x - scroll.center().x).as_f32();
-                assert!(
-                    center_off.abs() < 1.0,
-                    "宽区页列应居中：center_off={center_off:.3}px（left={left_pad:.1} right={right_pad:.1}）"
-                );
-            } else {
-                assert!(
-                    (left_pad - config::pdf::PAGE_PAD_X).abs() < 1.0,
-                    "窄区页面色左对齐加 PAGE_PAD_X 边距：left_pad={left_pad:.1}"
-                );
-                assert!(
-                    pages.right().as_f32() > scroll.right().as_f32() + 1.0,
-                    "窄区页面应横向溢出以触发横向滚动"
-                );
-            }
+            // **自适应窗口宽**（fit-width）：页宽 = 容器宽 − 2·页边距，宽/窄 pane 都收
+            // 进可视区、保持 PAGE_PAD_X 左缘边距并居中，不再横向溢出（窄 pane 收窄页面）。
+            assert!(
+                (pages.size.width.as_f32() - (pane_w - 2.0 * config::pdf::PAGE_PAD_X)).abs() < 2.0,
+                "页宽应自适应容器宽 {pane_w}：实际={}",
+                pages.size.width.as_f32()
+            );
+            assert!(
+                (left_pad - config::pdf::PAGE_PAD_X).abs() < 1.0,
+                "左缘应保持 PAGE_PAD_X 边距：left_pad={left_pad:.1}"
+            );
+            assert!(
+                pages.right().as_f32() <= scroll.right().as_f32() + 1.0,
+                "页应完全落入可视区（自适应，不应横向溢出）"
+            );
+            let center_off = (pages.center().x - scroll.center().x).as_f32();
+            assert!(
+                center_off.abs() < 1.0,
+                "页列应居中：center_off={center_off:.3}px"
+            );
         }
     }
 
@@ -1147,7 +1155,10 @@ mod tests {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (v.page_width(), v.total_height)
         });
-        assert!((w0 - 840.0).abs() < 1.0, "初始页宽应为 PAGE_WIDTH");
+        assert!(
+            (w0 - (1200.0 - 2.0 * config::pdf::PAGE_PAD_X)).abs() < 2.0,
+            "初始页宽应适应宿主容器宽（1200 − 2·pad）：{w0}"
+        );
         // 先滚到第 5 页，留出纵向滚动余量；布局稳定后记录滚动偏移作为缩放锚点
         cx.update(|_w, cx| {
             let pdf = holder.borrow().as_ref().unwrap().clone();
@@ -1237,6 +1248,120 @@ mod tests {
             "Ctrl 缩小也不应滚动：锚定 y={exp_y3:.1} 实际 y={:.1}",
             off3.y.as_f32()
         );
+    }
+
+    /// 回归：**窗口拉宽/拉窄 → 页面自适应**。页宽基线 = 容器宽 − 两侧页边距，随
+    /// `simulate_resize` 变化自动重排；缩放倍率 `zoom` 保持不变（页面等比缩放）。
+    #[gpui::test]
+    async fn pdf_resize_refits_page_width(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct FitProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for FitProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试.pdf");
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            FitProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let loaded = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let pad = config::pdf::PAGE_PAD_X;
+        // 「强制重绘 + 泵」：真机里窗口 resize 必触发重绘 → `ensure_window` 每帧按最新
+        // 容器宽重算基线；测试平台的假时钟不会自带重绘，需显式 refresh 驱动同一路径。
+        let pump = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..10 {
+                // 窗口本体重绘（非 app.refresh_windows）：确保 foreground 帧被调度后泵掉
+                let _ = cx.update(|w, _| w.refresh());
+                cx.run_until_parked();
+            }
+        };
+        let read = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.page_width(),
+                    v.zoom,
+                    v.total_height,
+                    f32::from(v.scroll.bounds().size.width),
+                )
+            })
+        };
+
+        // ① 宽窗：页宽 = 容器宽 − 2·页边距（自适应窗口宽），zoom 保持 1.0。
+        pump(cx);
+        let (w_wide, z0, total_wide, container_wide) = read(cx);
+        assert!(
+            (w_wide - (container_wide - 2.0 * pad)).abs() < 2.0,
+            "宽窗应适应容器宽 {container_wide}：期望 {}，实际={w_wide}",
+            container_wide - 2.0 * pad
+        );
+        assert!(w_wide > 200.0, "页宽应明显非零：{w_wide}");
+        assert!((z0 - 1.0).abs() < 1e-4, "起始 zoom 应保持 1.0：{z0}");
+
+        // ② 拉窄窗口 → 页宽跟容器变小（自适应重排），zoom 倍率不变，整列高缩小。
+        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+        pump(cx);
+        let (w_narrow, z1, total_narrow, container_narrow) = read(cx);
+        assert!(
+            container_narrow < container_wide,
+            "容器应变窄：{container_wide} → {container_narrow}"
+        );
+        assert!(
+            (w_narrow - (container_narrow - 2.0 * pad)).abs() < 2.0,
+            "窄窗应自适应到容器宽 {container_narrow}：期望 {}，实际={w_narrow}",
+            container_narrow - 2.0 * pad
+        );
+        assert!(w_narrow < w_wide, "页宽应变小：{w_wide} → {w_narrow}");
+        assert!((z1 - z0).abs() < 1e-4, "resize 不应改 zoom 倍率：{z0}→{z1}");
+        assert!(
+            total_narrow < total_wide * 0.99,
+            "页宽收窄后整列高应随之减小：{total_wide} → {total_narrow}"
+        );
+
+        // ③ 拉回宽窗 → 页宽弹回适配宽度（zoom 仍保持）。
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        pump(cx);
+        let (w_back, z2, _, container_back) = read(cx);
+        assert!(
+            (w_back - (container_back - 2.0 * pad)).abs() < 2.0,
+            "拉回宽窗应恢复适配宽 {container_back}：实际={w_back}"
+        );
+        assert!(w_back > w_narrow, "拉宽后页宽应更大：{w_narrow} → {w_back}");
+        assert!((z2 - z0).abs() < 1e-4, "全程不应改 zoom 倍率：{z0}→{z2}");
     }
 
     /// 瓦片管线端到端（视口驱动）：打开 pdf测试.pdf 后，视口覆盖的首页应经
