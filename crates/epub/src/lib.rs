@@ -265,7 +265,11 @@ fn xhtml_to_markdown(
     on_img: &mut dyn FnMut(&str, &str) -> Option<String>,
     notes: &mut std::collections::BTreeMap<usize, String>,
 ) -> String {
-    let doc = match roxmltree::Document::parse(html) {
+    // roxmltree 不支持 DTD：真实 EPUB 的 XHTML 章节几乎都带 `<!DOCTYPE html
+    // PUBLIC "…//DTD XHTML…dtd">`，直接解析会整章失败（"XML with DTD detected"）
+    // → 每章输出空 → 整书空文档（打开黑屏无字）。解析前先剥离 DOCTYPE。
+    let html = strip_doctype(html);
+    let doc = match roxmltree::Document::parse(&html) {
         Ok(d) => d,
         Err(_) => return String::new(),
     };
@@ -288,6 +292,34 @@ fn xhtml_to_markdown(
         result.push('\n');
     }
     result
+}
+
+/// 剥离 `<!DOCTYPE …>` 声明（可跨行、可含内部子集 `[ … ]`；正文不需要 DTD）。
+///
+/// 返回新串：`<!DOCTYPE` 起始处（按字节，ASCII 大小写不敏感）被整体移除，
+/// 声明之前（如 `<?xml …?>` 前导，roxmltree 可正常处理）与声明之后的内容保留。
+fn strip_doctype(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let Some(start) = lower.find("<!doctype") else {
+        return html.to_string();
+    };
+    let bytes = html.as_bytes();
+    let mut i = start + "<!doctype".len();
+    let mut bracket_depth = 0i32;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth -= 1,
+            b'>' if bracket_depth <= 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    let rest = (i + 1).min(bytes.len());
+    let mut out = String::with_capacity(html.len());
+    out.push_str(&html[..start]);
+    out.push_str(&html[rest..]);
+    out
 }
 
 /// 递归遍历正文元素。
@@ -844,5 +876,30 @@ mod tests {
         assert_eq!(join_zip_path("OEBPS", "text/ch1.xhtml"), "OEBPS/text/ch1.xhtml");
         assert_eq!(join_zip_path("OEBPS", "../META-INF/container.xml"), "META-INF/container.xml");
         assert_eq!(join_zip_path("", "text/ch1.xhtml"), "text/ch1.xhtml");
+    }
+
+    #[test]
+    fn xhtml_with_doctype_still_extracts_text() {
+        // 回归：真实 EPUB 的 XHTML 几乎都带 `<!DOCTYPE …>`（XHTML 1.1 DTD），roxmltree
+        // 不支持 DTD 会整章解析失败（"XML with DTD detected"）→ 每章空 → 整书空文档
+        // （打开一片黑、看不到文字）。剥离 DOCTYPE 后应照常提取标题/段落。
+        let html = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\"\n  \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">\n\
+<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><h1>第一章</h1><p class=\"text\">正文内容。</p></body></html>";
+        let no: Option<String> = None;
+        let mut notes = std::collections::BTreeMap::new();
+        let md = xhtml_to_markdown(html, &mut |_s, _a| no.clone(), &mut notes);
+        assert!(md.contains("# 第一章"), "带 DOCTYPE 的 XHTML 应提取标题：{md:?}");
+        assert!(md.contains("正文内容。"), "带 DOCTYPE 的 XHTML 应提取段落：{md:?}");
+    }
+
+    #[test]
+    fn strip_doctype_removes_internal_subset() {
+        // DOCTYPE 带内部子集 `[ … ]`（内含 `>`）不应提前截断；声明整体移除、正文保留。
+        let html = "<!DOCTYPE html [ <!ENTITY x \"y\"> ]><html><body><p>正文</p></body></html>";
+        let s = strip_doctype(html);
+        assert!(!s.contains("<!DOCTYPE"), "DOCTYPE 应整体移除：{s:?}");
+        assert!(s.starts_with("<html>"), "内部子集后的 <html> 应保留：{s:?}");
+        assert!(s.contains("正文"), "声明前后的内容都应保留：{s:?}");
     }
 }
