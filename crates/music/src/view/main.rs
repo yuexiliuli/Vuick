@@ -213,6 +213,7 @@ impl super::MusicView {
             MainSection::Home => self.render_home(window, cx),
             MainSection::Library => self.render_library(window, cx),
             MainSection::Liked => self.render_liked(window, cx),
+            MainSection::Recent => self.render_recent(window, cx),
         };
         div()
             .id("music-main")
@@ -705,7 +706,25 @@ impl super::MusicView {
             .into_any_element()
     }
 
-    /// 分区标题（音乐库/收藏）：固定于列表滚动区之上（同表头/搜索——只列表滚动）。
+    /// 最近播放：本次会话播放历史（最近先、同曲去重置顶；与 Liked 同款「路径集过滤 +
+    /// 搜索词过滤」记入列表显示模型）。历史为空 → 空态。
+    fn render_recent(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let list = self.main_list_for(MainSection::Recent, cx);
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(self.section_title("最近播放"))
+            .child(if list.total == 0 {
+                super::empty_state("暂无播放记录", "本会话播放过的歌曲会出现在这里").into_any_element()
+            } else {
+                self.render_list(&list, cx)
+            })
+            .into_any_element()
+    }
+
+    /// 分区标题（音乐库/收藏/最近播放）：固定于列表滚动区之上（同表头/搜索——只列表滚动）。
     fn section_title(&self, title: &str) -> AnyElement {
         div()
             .text_size(px(20.))
@@ -939,7 +958,12 @@ impl super::MusicView {
             } else {
                 None
             };
-            build_main_list(section, p.library(), &key.1, liked)
+            let recent = if section == MainSection::Recent {
+                Some(p.recent())
+            } else {
+                None
+            };
+            build_main_list(section, p.library(), &key.1, liked, recent)
         };
         self.main_list_cache
             .insert(key, (mutation, list.clone()));
@@ -1125,12 +1149,14 @@ fn filter_pass(title: &str, artist: &str, q: &str) -> bool {
 }
 
 /// 构建主区某分区的过滤/分组显示模型（纯索引，零 `Track` 克隆；`main_list_for` 在
-/// 搜索词 × 库/收藏变更加速键变化时调用）。Liked 需 `liked`（已收藏路径集）过滤。
+/// 搜索词 × 库/收藏/历史变更（mutation）加速键变化时调用）。Liked 需 `liked`（已收藏
+/// 路径集）、Recent 需 `recent`（会话播放历史序，最近先）过滤。
 fn build_main_list(
     section: MainSection,
     lib: &[Track],
     q: &str,
     liked: Option<&std::collections::HashSet<String>>,
+    recent: Option<&[String]>,
 ) -> Rc<MainList> {
     match section {
         MainSection::Library => {
@@ -1169,6 +1195,34 @@ fn build_main_list(
                     l.contains(&t.path.to_string_lossy().to_string())
                 });
                 if is_liked && filter_pass(&t.title, &t.artist, q) {
+                    items.push(MainItem::Row { idx: i, rank });
+                    rank += 1;
+                }
+            }
+            Rc::new(MainList::new(items, rank))
+        }
+        MainSection::Recent => {
+            // 最近播放：按会话历史序（最近先）逐 path 从库里取行，搜索词过滤同 Liked；
+            // 历史为空 → 空列表（`render_recent` 空态接管）。
+            let Some(recent) = recent else {
+                return Rc::new(MainList::new(Vec::new(), 0));
+            };
+            // path → 库下标映射（免逐 path 线性扫库；换库/清空时缓存已整体失效重建）。
+            let mut idx_by_path: HashMap<String, usize> = HashMap::new();
+            for (i, t) in lib.iter().enumerate() {
+                idx_by_path
+                    .entry(t.path.to_string_lossy().to_string())
+                    .or_insert(i);
+            }
+            let mut items = Vec::new();
+            let mut rank = 0usize;
+            for path in recent {
+                let Some(&i) = idx_by_path.get(path) else {
+                    // 历史路径已不在当前库（库换代/文件被删）→ 跳过不显示。
+                    continue;
+                };
+                let t = &lib[i];
+                if filter_pass(&t.title, &t.artist, q) {
                     items.push(MainItem::Row { idx: i, rank });
                     rank += 1;
                 }

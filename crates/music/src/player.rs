@@ -128,6 +128,9 @@ pub struct MusicPlayer {
     /// `play_path` 待播路径：目标不在当前库时以父目录异步重扫，扫完在 `commit_scan` 中按路径
     /// 重定位并播放（保持「播放外部文件」语义不被异步化打断）。
     pending_path: Option<PathBuf>,
+    /// 本次会话播放历史（仅内存、不持久化）：会话内「真正开始播放/切换曲目」的曲目路径，
+    /// 最近先、同一曲去重后置顶。`load_dir`（首次打开/换库重扫）时清空——不跨库/跨会话保留。
+    recent: Vec<String>,
 }
 
 impl MusicPlayer {
@@ -178,6 +181,7 @@ impl MusicPlayer {
             scanning: false,
             scan_gen: 0,
             pending_path: None,
+            recent: Vec::new(),
         }
     }
 
@@ -256,6 +260,10 @@ impl MusicPlayer {
     /// 重定位（重扫后下标可能漂移）。不打断播放。换目录重扫由 `scan_gen` 作废旧结果（防竞态）。
     pub fn load_dir(&mut self, dir: impl AsRef<Path>, cx: &mut Context<Self>) {
         let dir = dir.as_ref().to_path_buf();
+        // 换库/首次装载 = 新会话起点：本次会话播放历史清空（最近播放不跨库/跨会话保留），
+        // 并递增 mutation 令视图侧「最近播放」显示模型缓存立即失效（不显示旧历史）。
+        self.recent.clear();
+        self.mutation += 1;
         self.scanning = true;
         self.scan_gen = self.scan_gen.wrapping_add(1);
         let scan_id = self.scan_gen;
@@ -549,6 +557,11 @@ impl MusicPlayer {
             self.queue_pos = self.queue.len() - 1;
         }
         self.current = Some(idx);
+        // 会话播放历史记录（所有播放/切歌路径均收敛于此：行点击/next/prev/play_path/恢复，
+        // 记在此处不重不漏；最近先、同曲去重后置顶，toString_lossy 与视图侧路径键一致）。
+        self.push_recent(self.library[idx].path.to_string_lossy().to_string());
+        // 历史顺序变化 → 视图侧「最近播放」显示模型缓存失效（同 toggle_like 对 Liked 的理由）。
+        self.mutation += 1;
         self.error = None;
         self.duration = 0.0;
         self.paused = false;
@@ -936,6 +949,17 @@ impl MusicPlayer {
     }
     pub fn liked_paths(&self) -> &HashSet<String> {
         &self.liked
+    }
+
+    /// 本次会话播放历史（最近先；空 = 无记录）。仅内存、不持久化，`load_dir` 时清空。
+    pub fn recent(&self) -> &[String] {
+        &self.recent
+    }
+
+    /// 记录一次播放：同一曲去重后置顶（`retain` 移除旧位置再头插）。
+    fn push_recent(&mut self, path: String) {
+        self.recent.retain(|p| p != &path);
+        self.recent.insert(0, path);
     }
 
     /// 播完自动推进：按 repeat 决定下一首；`Off`（含 shuffle）队尾 → 停（不再自动播）。

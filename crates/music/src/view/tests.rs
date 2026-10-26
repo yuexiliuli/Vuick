@@ -3544,3 +3544,219 @@ async fn main_scrollbar_thumb_pins_at_bottom_when_over_scrolled(cx: &mut TestApp
         "过滚后 thumb 顶应停在 roll：top={thumb_top_rel} roll={roll}"
     );
 }
+
+// ---- 「最近播放」分区（本次会话播放历史） ----
+
+/// 读取会话播放历史（映射为库下标；最近先、去重后）。
+fn recent_idxs(app: &gpui::App, player: &Entity<MusicPlayer>) -> Vec<usize> {
+    let p = player.read(app);
+    p.recent()
+        .iter()
+        .map(|path| {
+            p.library()
+                .iter()
+                .position(|t| t.path.to_string_lossy().as_ref() == path)
+                .expect("历史路径应仍在当前库中")
+        })
+        .collect()
+}
+
+/// 导航点击：侧栏「最近播放」→ 切到 Recent 分区；无历史 → 主区空态（不物化歌行）。
+#[gpui::test]
+async fn recent_nav_click_switches_section_and_empty_state(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let nav = wcx
+        .debug_bounds("music-nav-最近播放")
+        .expect("侧栏「最近播放」导航项应物化");
+    let pos = gpui::Point::new(
+        px(nav.origin.x.as_f32() + 40.0),
+        px(nav.origin.y.as_f32() + nav.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_mouse_down(pos, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(pos, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let sec = wcx.cx.read(|app| view.read(app).state.section);
+    assert_eq!(sec, MainSection::Recent, "点击「最近播放」应切到 Recent 分区");
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("song-row-0").is_none(),
+        "无播放记录时最近播放应为空态（不物化任何歌行）"
+    );
+}
+
+/// 历史记录：播放 0→2→4 后最近先 [4,2,0]；重播 2 → 去重并置顶 [2,4,0]。
+#[gpui::test]
+async fn play_records_session_history_recent_first_dedup(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 5);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    for idx in [0usize, 2, 4] {
+        wcx.update(|_w, app| {
+            view.update(app, |v, cx| v.handle_play_idx(idx, cx));
+        });
+    }
+    let first = wcx.cx.read(|app| recent_idxs(app, &player));
+    assert_eq!(first, vec![4, 2, 0], "播放 0→2→4 后历史应为最近先 [4,2,0]");
+    // 重播 2：去重 + 置顶（不产生重复项）。
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| v.handle_play_idx(2, cx));
+    });
+    let dedup = wcx.cx.read(|app| recent_idxs(app, &player));
+    assert_eq!(dedup, vec![2, 4, 0], "重复播放 2 应去重并置顶：历史应 [2,4,0]");
+}
+
+/// 最近播放分区渲染：最近先行序 + `mutation` 升缓存失效重建 + 点击历史行播放该曲。
+#[gpui::test]
+async fn recent_section_renders_recent_first_and_click_plays(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 5);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 播放 1→4→1：去重后历史 [1,4]。
+    for idx in [1usize, 4, 1] {
+        wcx.update(|_w, app| {
+            view.update(app, |v, cx| v.handle_play_idx(idx, cx));
+        });
+    }
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Recent);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let r1 = wcx.debug_bounds("song-row-1").expect("最近首行(1)应物化");
+    let r4 = wcx.debug_bounds("song-row-4").expect("其次(4)应物化");
+    assert!(
+        r1.origin.y.as_f32() < r4.origin.y.as_f32(),
+        "历史序最近先：row-1 应排在 row-4 上方"
+    );
+    assert!(
+        wcx.debug_bounds("song-row-0").is_none(),
+        "未播放过的行不应出现在最近列表"
+    );
+    // 再播放 2（记录置顶 + mutation 升 → 显示模型缓存失效重建）：新行应出现且排最上。
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| v.handle_play_idx(2, cx));
+    });
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let r2 = wcx.debug_bounds("song-row-2").expect("新播放行(2)应物化");
+    let r1b = wcx.debug_bounds("song-row-1").expect("row-1 应仍在列表");
+    assert!(
+        r2.origin.y.as_f32() < r1b.origin.y.as_f32(),
+        "新播放应置顶：row-2 应排在 row-1 上方（缓存失效重建）"
+    );
+    // 点击历史列表行 → 播放该曲（复用行点击行为）。
+    let pos = gpui::Point::new(
+        px(r1b.origin.x.as_f32() + 30.0),
+        px(r1b.origin.y.as_f32() + r1b.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_mouse_down(pos, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(pos, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let cur = wcx.cx.read(|app| player.read(app).current());
+    assert_eq!(cur, Some(1), "点击历史列表行应播放该曲");
+}
+
+/// 最近播放分区搜索过滤：与 Liked 同款「路径集 + 搜索词」语义。
+#[gpui::test]
+async fn recent_section_filters_by_search_query(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 5);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    for idx in [1usize, 3] {
+        wcx.update(|_w, app| {
+            view.update(app, |v, cx| v.handle_play_idx(idx, cx));
+        });
+    }
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Recent);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 搜索「艺人3」→ 历史 [3,1] 中只命中 idx3。
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.search = "艺人3".into());
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("song-row-3").is_some(),
+        "「艺人3」命中行应物化"
+    );
+    assert!(
+        wcx.debug_bounds("song-row-1").is_none(),
+        "未命中「艺人3」的历史行不应物化"
+    );
+}
+
+/// 切换音乐库目录（load_dir 换代）→ 本次会话播放历史清空。
+#[gpui::test]
+async fn switching_music_dir_clears_session_recent(cx: &mut TestAppContext) {
+    // 两个目录都先建好（add_window_view 后 cx 已借给 wcx，不能再取 &mut）。
+    let (dir_a, _pa) = n_library_dir(cx, 3);
+    let (dir_b, _pb) = n_library_dir(cx, 4);
+    let player: Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+    cx.update(|app| {
+        player.update(app, |p, cx| p.load_dir(&dir_a, cx));
+    });
+    drain_scan(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| v.handle_play_idx(0, cx));
+    });
+    assert!(
+        !wcx.cx.read(|app| player.read(app).recent().is_empty()),
+        "播放后应有会话历史"
+    );
+    // 换库（load_dir 换成另一目录）：清空是 load_dir 起始处的同步动作，断言无需等扫库完成。
+    wcx.update(|_w, app| {
+        player.update(app, |p, cx| p.load_dir(&dir_b, cx));
+    });
+    assert!(
+        wcx.cx.read(|app| player.read(app).recent().is_empty()),
+        "切换音乐库目录后会话播放历史应清空"
+    );
+}
+
+/// 占位不变式：「本地下载/发现/电台」仍为 ComingSoon——点击弹 toast、不切分区。
+#[gpui::test]
+async fn placeholder_nav_items_still_toast_coming_soon(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    for (label, sel, expected) in [
+        ("本地下载", "music-nav-本地下载", "本地下载即将到来"),
+        ("发现", "music-nav-发现", "发现即将到来"),
+        ("电台", "music-nav-电台", "电台即将到来"),
+    ] {
+        let nav = wcx
+            .debug_bounds(sel)
+            .expect("占位导航项应物化");
+        let pos = gpui::Point::new(
+            px(nav.origin.x.as_f32() + 40.0),
+            px(nav.origin.y.as_f32() + nav.size.height.as_f32() * 0.5),
+        );
+        wcx.simulate_mouse_down(pos, MouseButton::Left, Default::default());
+        wcx.simulate_mouse_up(pos, MouseButton::Left, Default::default());
+        wcx.run_until_parked();
+        let toast = wcx
+            .cx
+            .read(|app| view.read(app).toast.as_ref().map(|(s, _)| s.to_string()));
+        assert_eq!(
+            toast.as_deref(),
+            Some(expected),
+            "点击「{label}」应弹「{expected}」toast"
+        );
+        let sec = wcx.cx.read(|app| view.read(app).state.section);
+        assert_eq!(sec, MainSection::Home, "「{label}」占位项不应切换分区");
+    }
+}

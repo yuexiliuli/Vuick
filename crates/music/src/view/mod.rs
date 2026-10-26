@@ -64,6 +64,8 @@ pub enum MainSection {
     Library,
     /// 收藏（只列已收藏）。
     Liked,
+    /// 最近播放（本次会话播放历史，最近先；切库/重开音乐模式清空）。
+    Recent,
 }
 
 /// 右侧「正在播放」面板 tab。
@@ -79,7 +81,7 @@ pub enum RightTab {
 /// 视图本地状态（播放器状态在 [`MusicPlayer`] 里读）。
 #[derive(Default)]
 pub struct ViewState {
-    /// 主导航分区（首页/音乐库/收藏）。
+    /// 主导航分区（首页/音乐库/收藏/最近播放）。
     pub section: MainSection,
     /// 右侧面板 tab（歌曲/歌词/队列）。
     pub right_tab: RightTab,

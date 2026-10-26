@@ -1,7 +1,7 @@
 //! 左侧导航栏（240px）：logo + 菜单组（菜单/我的/歌单）+ 底部用户卡。
 //!
 //! 复刻原型 `.sidebar`：bg_primary 底 + 右缘发丝线；菜单/我的组为「导航项」，
-//! 首页/音乐库/收藏可切换（高亮：accent 渐变底 + 左缘 3px 竖条）；电台/最近播放/
+//! 首页/音乐库/收藏/最近播放可切换（高亮：accent 渐变底 + 左缘 3px 竖条）；电台/发现/
 //! 本地下载/歌单只弹 toast「即将到来」；歌单条目由 `mix_groups` 前几项生成
 //! （色点 = 组渐变首色）。
 
@@ -186,11 +186,11 @@ impl super::MusicView {
         ]
     }
 
-    /// 「我的」组：收藏（可切）/ 最近播放 / 本地下载（toast）。
+    /// 「我的」组：收藏（可切）/ 最近播放（可切）/ 本地下载（toast）。
     fn nav_items_mine(&self) -> Vec<(MusicIcon, &'static str, NavAction)> {
         vec![
             (MusicIcon::Heart, "收藏", NavAction::Section(MainSection::Liked)),
-            (MusicIcon::History, "最近播放", NavAction::ComingSoon("最近播放即将到来")),
+            (MusicIcon::History, "最近播放", NavAction::Section(MainSection::Recent)),
             (MusicIcon::Download, "本地下载", NavAction::ComingSoon("本地下载即将到来")),
         ]
     }
