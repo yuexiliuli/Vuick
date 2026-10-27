@@ -56,12 +56,21 @@ pub struct AudioReader {
     /// 且落点边界常落在 AAC 帧中间（MKV 1ms lacing vs AAC 21.33ms 帧长）→ HE-AAC SBR
     /// 断链坏帧，解码报 `env_facs_q ... is invalid`。两者都靠本锚点截断。
     skip_until: f64,
+    /// 常驻重采样输出帧（F32 交错，见 [`Self::ensure_resample_capacity`]）+ 为其分配
+    /// 的容量（`nb_samples`）。R2-2：复用消除每块 `ffmpeg::frame::Audio::new`
+    ///（`av_frame_get_buffer` 分配 + 清零）与 `flush` 的 1s 全量分配；容量不足（更大块 /
+    /// 排空 1s 帧）时重建，稳态只分配一次。
+    resample_out: Option<std::mem::ManuallyDrop<ffmpeg::frame::Audio>>,
+    resample_cap: usize,
 }
 
 impl Drop for AudioReader {
     fn drop(&mut self) {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
+            if let Some(out) = &mut self.resample_out {
+                std::mem::ManuallyDrop::drop(out);
+            }
             std::mem::ManuallyDrop::drop(&mut self.resampler);
             std::mem::ManuallyDrop::drop(&mut self.decoder);
             std::mem::ManuallyDrop::drop(&mut self.ictx);
@@ -132,6 +141,8 @@ impl AudioReader {
             // 从头播放 stderr 不刷 `env_facs_q ... invalid`；对 clean 头零影响（首帧
             // pts≥0 直接返回）。真 seek 时 [`Self::seek`] 用精确 target 覆盖本值。
             skip_until: 0.0,
+            resample_out: None,
+            resample_cap: 0,
         })
     }
 
@@ -163,6 +174,13 @@ impl AudioReader {
 
     /// 把重采样器内部残留全部排空并返回样本（调用方丢弃即「清残留」，如 seek；EOF 处
     /// 则作为收尾块直接返回）。
+    pub(crate) fn flush_resampler(&mut self) -> Vec<f32> {
+        let mut all = Vec::new();
+        self.flush_resampler_into(&mut all);
+        all
+    }
+
+    /// 重采样器残留排空核心：内部/输出缓冲样本逐次 flush 追加进 `out`，返回产出样本数。
     ///
     /// ffmpeg-next 的 `Context::flush` 对**全空** out 帧会因 `swr_convert_frame` 的
     /// `config_changed` 检查（空帧 format=NONE/layout=0 ≠ 输出 F32/STEREO）直接报
@@ -172,25 +190,68 @@ impl AudioReader {
     /// 仍返回非零（引擎内插延迟），按它判会死循环（实证排空后 delay≈17 仍 `Some`）。
     /// `plane()` 长度 = `linesize` 全容量并非实际样本数，须按 `samples()×channels`
     /// 截到真实产出，否则返回 1 秒容量整段的未定尾。
-    pub(crate) fn flush_resampler(&mut self) -> Vec<f32> {
+    fn flush_resampler_into(&mut self, out: &mut Vec<f32>) -> usize {
         let d = self.resampler.output();
-        let mut out = ffmpeg::frame::Audio::new(d.format, d.rate as usize, d.channel_layout);
-        let mut all = Vec::new();
+        // R2-2：常驻输出帧复用（1s 容量＝swr flush 最坏上界），不再每次 seek/EOF 全量
+        // `av_frame_get_buffer`（768KB@48k 分配+清零），排空后 cap 恒为该上界。
+        self.ensure_resample_capacity(d.rate as usize);
+        let start = out.len();
         loop {
-            match self.resampler.flush(&mut out) {
-                Ok(Some(_)) if out.samples() > 0 => {
-                    let n = out.samples() * out.channels() as usize;
-                    let plane = Self::collect_f32(&out);
+            // 还原全容量再喂 flush（同上：swr 把 nb_samples 当容量、完成后覆写为实际数）
+            self.resample_out
+                .as_deref_mut()
+                .expect("已确保容量")
+                .set_samples(self.resample_cap);
+            let flushed = self
+                .resampler
+                .flush(self.resample_out.as_deref_mut().expect("已确保容量"));
+            if let Ok(Some(_)) = flushed {
+                let frame = self.resample_out.as_deref().expect("已确保容量");
+                if frame.samples() > 0 {
+                    let n = frame.samples() * frame.channels() as usize;
+                    let plane = frame.plane::<f32>(0);
                     let take = n.min(plane.len());
-                    all.extend_from_slice(&plane[..take]);
+                    out.extend_from_slice(&plane[..take]);
+                    continue;
                 }
-                _ => break,
             }
+            break;
         }
-        all
+        out.len() - start
+    }
+
+    /// 确保常驻重采样输出帧容量（`nb_samples`）≥ `nb`，不足时重建（旧帧 av_frame_free）。
+    /// R2-2：稳态每次只分配一次（块容量 ≤ 上界，排空 1s 帧后 cap 固定为 max），
+    /// 消除每块 `ffmpeg::frame::Audio::new` 的分配 + 清零抖动。
+    ///
+    /// **每次调用都把复用帧 `nb_samples` 还原为全容量**——`swr_convert_frame` 把帧当前
+    /// `nb_samples` 当**输出容量**用（仅 0 时才按 linesize 重算）、完成后覆写为实际产出
+    ///（swresample_frame.c `convert_frame`）。复用帧若不还原，下一次 run/flush 的容量被
+    /// 钉死在上一块的实际产出数：+64 余量失效、变速/变长输入被截断、欠产堆积到 EOF 才
+    /// 以尾部爆块吐出（R2-2 回归：`reused_resample_frame_must_restore_capacity_before_next_run`）。
+    fn ensure_resample_capacity(&mut self, nb: usize) {
+        if nb > self.resample_cap {
+            let d = self.resampler.output();
+            if let Some(out) = &mut self.resample_out {
+                // SAFETY: 本函数随即整体替换 `resample_out`，旧 ManuallyDrop 帧显式释放
+                unsafe { std::mem::ManuallyDrop::drop(out) };
+            }
+            self.resample_out = Some(std::mem::ManuallyDrop::new(ffmpeg::frame::Audio::new(
+                d.format,
+                nb,
+                d.channel_layout,
+            )));
+            self.resample_cap = nb;
+        }
+        if let Some(out) = &mut self.resample_out {
+            out.set_samples(self.resample_cap);
+        }
     }
 
     /// 把重采样输出帧读成 F32 样本（空/未分配帧返回空，避免读 plane 越界）。
+    /// `#[cfg(test)]`：生产 FFI（`vff_audio_pcm`）走 [`Self::next_pcm_f32_into`]，
+    /// 本便捷壳（连同 [`Self::next_pcm_f32`]）仅测试消费。
+    #[cfg(test)]
     fn collect_f32(out: &ffmpeg::frame::Audio) -> Vec<f32> {
         if out.planes() == 0 {
             return Vec::new();
@@ -204,6 +265,11 @@ impl AudioReader {
     /// seek 窗口内（[`Self::skip_until`] ≥ 0）：跳过落点前的包（不喂解码器）与坏/残缺帧
     ///（SBR 断链等解码错误不中止读取，让下个包重同步），直到第一个 pts ≥ 落点的 clean
     /// 帧输出后复位——保证起播音精确从落点开始、不夹 SBR 断链坏帧的杂音/不出错断流。
+    ///
+    /// R2-2：内部复用常驻输出帧（省每块帧分配），返回的 `Vec` 一次性拷贝给 Rust 侧
+    /// 调用方（`#[cfg(test)]` 便捷壳）；播放 FFI 走 [`Self::next_pcm_f32_into`]（连
+    /// `to_vec` 也省）。
+    #[cfg(test)]
     pub fn next_pcm_f32(&mut self) -> Result<Option<(f64, Vec<f32>)>> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -261,11 +327,99 @@ impl AudioReader {
                 let out_nb = ((in_nb * u64::from(d.rate) + u64::from(in_rate) - 1)
                     / u64::from(in_rate)) as usize
                     + 64;
-                let mut out = ffmpeg::frame::Audio::new(d.format, out_nb, d.channel_layout);
-                self.resampler.run(&decoded, &mut out).context("音频重采样失败")?;
-                let samples = Self::collect_f32(&out);
+                self.ensure_resample_capacity(out_nb);
+                let out_frame = self.resample_out.as_deref_mut().expect("已确保容量");
+                self.resampler
+                    .run(&decoded, out_frame)
+                    .context("音频重采样失败")?;
+                let samples = Self::collect_f32(out_frame);
                 if !samples.is_empty() {
                     return Ok(Some((pts, samples)));
+                }
+            }
+        }
+    }
+
+    /// 推进到**下一块**并直接写进调用方缓冲 `out`（须 ≥ 单块上界，一般按 2s×立体声预分
+    /// 配；不足返回 Err）。返回 `(pts 秒, 样本数)`；`None` = EOF。
+    ///
+    /// **R2-2 生产路径**（FFI `vff_audio_pcm` 走这里）：内部复用常驻输出帧，样本直接
+    /// 拷入 `out`，消除每块「帧分配 + `to_vec` 分配 + FFI 再拷贝」里的前两处分配——
+    /// 采样字节与 [`Self::next_pcm_f32`] 逐字一致。EOF 处同样把重采样器残留排进 `out`。
+    pub fn next_pcm_f32_into(&mut self, out: &mut [f32]) -> Result<Option<(f64, usize)>> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let packet = self.next_audio_packet();
+            // 包级跳过（同 [`Self::next_pcm_f32`]）
+            if self.skip_until >= 0.0
+                && let Some(p) = packet.as_ref().and_then(|p| p.pts())
+            {
+                let p_sec = pts_to_seconds(p, self.time_base);
+                if p_sec < self.skip_until {
+                    continue;
+                }
+            }
+            let packet = match packet {
+                Some(p) => p,
+                None => {
+                    if !self.drained {
+                        self.decoder.send_eof().ok();
+                        self.drained = true;
+                    }
+                    let mut tail = Vec::new();
+                    self.flush_resampler_into(&mut tail);
+                    if !tail.is_empty() {
+                        if tail.len() > out.len() {
+                            return Err(anyhow!(
+                                "音频输出缓冲过小: {} < 需要 {}",
+                                out.len(),
+                                tail.len()
+                            ));
+                        }
+                        let n = tail.len();
+                        out[..n].copy_from_slice(&tail);
+                        return Ok(Some((self.last_pts, n)));
+                    }
+                    return Ok(None);
+                }
+            };
+            if let Err(e) = self.decoder.send_packet(&packet) {
+                if self.skip_until >= 0.0 {
+                    continue;
+                }
+                return Err(anyhow!("音频 decoder send_packet 失败: {e}"));
+            }
+            let mut decoded = ffmpeg::frame::Audio::empty();
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                let pts = pts_to_seconds(decoded.pts().unwrap_or(0), self.time_base);
+                self.last_pts = pts;
+                if self.skip_until >= 0.0 && pts < self.skip_until {
+                    continue;
+                }
+                self.skip_until = -1.0;
+                // 上采样容量修复（同 [`Self::next_pcm_f32`]）+ 常驻帧复用
+                let d = self.resampler.output();
+                let in_rate = decoded.rate().max(1);
+                let in_nb = decoded.samples() as u64;
+                let out_nb = ((in_nb * u64::from(d.rate) + u64::from(in_rate) - 1)
+                    / u64::from(in_rate)) as usize
+                    + 64;
+                self.ensure_resample_capacity(out_nb);
+                let out_frame = self.resample_out.as_deref_mut().expect("已确保容量");
+                self.resampler
+                    .run(&decoded, out_frame)
+                    .context("音频重采样失败")?;
+                let n = out_frame.plane::<f32>(0).len();
+                if n > out.len() {
+                    return Err(anyhow!(
+                        "音频输出缓冲过小: {} < 需要 {}",
+                        out.len(),
+                        n
+                    ));
+                }
+                if n > 0 {
+                    out[..n].copy_from_slice(&out_frame.plane::<f32>(0));
+                    return Ok(Some((pts, n)));
                 }
             }
         }
@@ -279,5 +433,83 @@ impl AudioReader {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R2-2 回归：复用重采样输出帧时，每次 run/flush 前必须把帧 `nb_samples` 还原为
+    /// 全容量——`swr_convert_frame` 把帧当前 `nb_samples` 当**输出容量**、完成后覆写为
+    /// 实际产出（swresample_frame.c `convert_frame`）；复用的常驻帧若不还原，下次调用
+    /// 容量被钉死在上一块实际数（+64 余量失效、变速/变长输入被截断、欠产堆积到 EOF）。
+    ///
+    /// 用 44100→48000 **分数上采样**（输出随输入样本数分数放大，逐块必有 ±1 抖动）直接
+    /// 实证：输入从 1024 增到 2048 样本后，容量还原时第二块应产出 ≈ 2048×48000/44100 ≈
+    /// 2229 样本；不还原（陈旧 nb_samples=第一块 ≈1115）则第二块被钉在 ≈1115。无夹具。
+    #[test]
+    fn reused_resample_frame_must_restore_capacity_before_next_run() {
+        use ffmpeg::channel_layout::ChannelLayout;
+        use ffmpeg::format::Sample;
+        use ffmpeg::software::resampling;
+
+        let _g = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ffmpeg::init().unwrap();
+        let mut ctx = resampling::Context::get(
+            Sample::F32(ffmpeg::format::sample::Type::Packed),
+            ChannelLayout::STEREO,
+            44100,
+            Sample::F32(ffmpeg::format::sample::Type::Packed),
+            ChannelLayout::STEREO,
+            48000,
+        )
+        .unwrap();
+
+        // 常驻输出帧（复刻 AudioReader 的 ensure_resample_capacity 复用姿势）：
+        // 2048 输入上界 ≈ 2048*48000/44100+64 → 2294
+        let cap = 2294usize;
+        let mut out = ffmpeg::frame::Audio::new(
+            Sample::F32(ffmpeg::format::sample::Type::Packed),
+            cap,
+            ChannelLayout::STEREO,
+        );
+
+        let mk_input = |samples: usize| {
+            let mut f = ffmpeg::frame::Audio::new(
+                Sample::F32(ffmpeg::format::sample::Type::Packed),
+                samples,
+                ChannelLayout::STEREO,
+            );
+            f.plane_mut::<(f32, f32)>(0).fill((1.0f32, -1.0f32));
+            f.set_rate(44100);
+            f
+        };
+
+        let n1 = {
+            ctx.run(&mk_input(1024), &mut out).unwrap();
+            out.plane::<(f32, f32)>(0).len()
+        };
+        assert!(
+            (1080..=1150).contains(&n1),
+            "1024 输入在 44100→48000 应产 ≈1115 样本，实得 {n1}"
+        );
+
+        // 修复点：每次 run 前把容量还原为全容量（AudioReader::ensure_resample_capacity
+        // 现保证复用帧 nb_samples == 容量），swr 才按伸缩后的输入完整产出。
+        out.set_samples(cap);
+        let n2 = {
+            ctx.run(&mk_input(2048), &mut out).unwrap();
+            out.plane::<(f32, f32)>(0).len()
+        };
+        assert!(
+            (2160..=2310).contains(&n2),
+            "2048 输入在 44100→48000 应产 ≈2229 样本，实得 {n2}——复用帧 nb_samples \
+             未还原导致容量被钉在上一块实际数（+64 余量失效、变长输入截断）"
+        );
+        assert!(
+            n2 > n1 + 1000,
+            "第二块（2048 输入）应显著大于第一块（1024 输入）：n1={n1} n2={n2}"
+        );
     }
 }

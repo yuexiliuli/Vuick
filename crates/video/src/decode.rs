@@ -39,18 +39,6 @@ pub struct VideoParams {
 #[allow(dead_code)] // 便捷壳 [`VideoReader::next_frame_bgra`] 用；播放 worker 走 `_into`（复用缓冲）
 pub type DecodedFrame = (f64, u32, u32, Vec<u8>);
 
-/// 音频顶层参数。
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)] // cdylib 侧（media-ffmpeg 的 ParamFFI→AudioParams）在用；主侧暂不直接构造
-pub struct AudioParams {
-    /// 输出采样率（统一重采样到该率）。
-    pub sample_rate: u32,
-    /// 输出声道数（统一 2，STERO 交错）。
-    pub channels: u32,
-    /// 音轨总时长（秒）。
-    pub duration: f64,
-}
-
 // ---------------- 运行时 FFI 桥 ----------------
 
 /// 与 `media-ffmpeg` 的 `ParamFFI` 布局一致。
@@ -75,16 +63,6 @@ impl From<ParamFFI> for VideoParams {
             frame_rate: (p.frame_rate_num > 0 && p.frame_rate_den > 0)
                 .then_some((p.frame_rate_num, p.frame_rate_den)),
             has_audio: p.has_audio != 0,
-        }
-    }
-}
-
-impl From<ParamFFI> for AudioParams {
-    fn from(p: ParamFFI) -> Self {
-        AudioParams {
-            sample_rate: p.sample_rate,
-            channels: p.channels,
-            duration: p.duration,
         }
     }
 }
@@ -151,9 +129,9 @@ type FnOpenSubtitle = unsafe extern "C" fn(*const CChar, *mut *mut std::ffi::c_v
 type FnSubtitleCount = unsafe extern "C" fn(*mut std::ffi::c_void) -> usize;
 type FnSubtitleGetInfo = unsafe extern "C" fn(*mut std::ffi::c_void, usize, *mut SubtitleEntryFFI) -> CInt;
 type FnSubtitleGetText = unsafe extern "C" fn(*mut std::ffi::c_void, usize, *mut u8, usize) -> CInt;
-type FnSubtitleAt = unsafe extern "C" fn(*mut std::ffi::c_void, f64) -> CInt;
-type FnSubtitleSeek = unsafe extern "C" fn(*mut std::ffi::c_void, f64) -> CInt;
 type FnCloseSubtitle = unsafe extern "C" fn(*mut std::ffi::c_void);
+// R2-4：打开失败分类（dll 新增 additive 导出；老 dll 缺符号 → 桥可选解析、回退通用文案）
+type FnLastError = unsafe extern "C" fn() -> *const CChar;
 
 /// 已加载的动态函数集（持有 `Library` 保句柄存活；符号指针在进程生命周期内有效）。
 struct Bridge {
@@ -164,8 +142,6 @@ struct Bridge {
     video_skip_to_bgra: libloading::Symbol<'static, FnSkipToBgra>,
     open_audio: libloading::Symbol<'static, FnOpenAudio>,
     video_params: libloading::Symbol<'static, FnParams>,
-    #[allow(dead_code)] // 音轨时长由视频 params 带出；保留以对齐 cdylib 接口
-    audio_params: libloading::Symbol<'static, FnParams>,
     video_seek: libloading::Symbol<'static, FnSeek>,
     audio_seek: libloading::Symbol<'static, FnSeek>,
     video_frame: libloading::Symbol<'static, FnFrame>,
@@ -187,11 +163,10 @@ struct Bridge {
     #[allow(dead_code)]
     subtitle_get_text: libloading::Symbol<'static, FnSubtitleGetText>,
     #[allow(dead_code)]
-    subtitle_at: libloading::Symbol<'static, FnSubtitleAt>,
-    #[allow(dead_code)]
-    subtitle_seek: libloading::Symbol<'static, FnSubtitleSeek>,
-    #[allow(dead_code)]
     close_subtitle: libloading::Symbol<'static, FnCloseSubtitle>,
+    /// R2-4（可选）：打开失败分类串读取口。老 dll 无 `vff_last_error_message` → `None`，
+    /// 打开失败回落通用文案（ABI 向后兼容）；新 dll → 打开失败时把分类带进错误提示。
+    last_error: Option<libloading::Symbol<'static, FnLastError>>,
     #[allow(dead_code)] // 保底：Library 被进程级持有，符号才始终有效
     _lib: libloading::Library,
 }
@@ -232,7 +207,6 @@ fn load_bridge() -> Option<Bridge> {
         video_skip_to_bgra: sym!(b"vff_video_skip_to_bgra\0", FnSkipToBgra),
         open_audio: sym!(b"vff_open_audio\0", FnOpenAudio),
         video_params: sym!(b"vff_video_params\0", FnParams),
-        audio_params: sym!(b"vff_audio_params\0", FnParams),
         video_seek: sym!(b"vff_video_seek\0", FnSeek),
         audio_seek: sym!(b"vff_audio_seek\0", FnSeek),
         video_frame: sym!(b"vff_video_frame\0", FnFrame),
@@ -250,11 +224,46 @@ fn load_bridge() -> Option<Bridge> {
         subtitle_count: sym!(b"vff_subtitle_count\0", FnSubtitleCount),
         subtitle_get_info: sym!(b"vff_subtitle_get_info\0", FnSubtitleGetInfo),
         subtitle_get_text: sym!(b"vff_subtitle_get_text\0", FnSubtitleGetText),
-        subtitle_at: sym!(b"vff_subtitle_at\0", FnSubtitleAt),
-        subtitle_seek: sym!(b"vff_subtitle_seek\0", FnSubtitleSeek),
         close_subtitle: sym!(b"vff_close_subtitle\0", FnCloseSubtitle),
+        // R2-4 additive：新 dll 才导出 `vff_last_error_message`——**可选解析**（.ok()），
+        // 老 dll 缺符号不使整桥加载失败，打开失败回落通用文案。
+        last_error: {
+            let s = unsafe { lib.get::<FnLastError>(b"vff_last_error_message\0") }.ok();
+            s.map(|sym| unsafe {
+                std::mem::transmute::<libloading::Symbol<'_, FnLastError>, libloading::Symbol<'static, FnLastError>>(sym)
+            })
+        },
         _lib: lib,
     })
+}
+
+/// R2-4：取 dll 侧最近一次打开失败分类串（`vff_last_error_message` 可选符号；桥里有且
+/// 是在**同一线程**先失败后立即读取——视频/音频 worker 在 open 失败处同线程调用）。
+/// 老 dll / 桥不可用 → `None`（上层回落通用「打开媒体失败」文案）。
+fn dll_last_error() -> Option<String> {
+    let b = bridge()?;
+    let sym = b.last_error.as_ref()?;
+    let p = unsafe { (sym)() };
+    if p.is_null() {
+        return None;
+    }
+    let cstr = unsafe { std::ffi::CStr::from_ptr(p) };
+    let s = cstr.to_string_lossy();
+    if s.trim().is_empty() {
+        return None;
+    }
+    Some(s.trim_end().to_string())
+}
+
+/// R2-4：打开失败错误构造——dll 侧有分类串则附到主文案后（`（原因: …）`），无（老 dll /
+/// 桥不可用 / 串为空）则原样返回通用文案。分类串取首行并截断，避免长 anyhow 链刷屏。
+fn open_error_with_detail(base: String) -> anyhow::Error {
+    let Some(detail) = dll_last_error() else {
+        return anyhow::anyhow!("{base}");
+    };
+    let first_line = detail.split('\n').next().unwrap_or("").trim();
+    let capped: String = first_line.chars().take(200).collect();
+    anyhow::anyhow!("{base}（{}）", capped)
 }
 
 /// 视频运行库是否可用（`media_ffmpeg.dll` 与其 FFmpeg 依赖能否被加载，进程内缓存一次）。
@@ -399,7 +408,8 @@ impl VideoReader {
         let mut handle: Handle = std::ptr::null_mut();
         let rc = unsafe { (b.open_video)(cpath.as_ptr(), max_dim, &mut handle) };
         if rc != 0 || handle.is_null() {
-            return Err(anyhow::anyhow!("打开媒体失败: {}", path.display()));
+            // R2-4：打开失败把 dll 侧分类串带进 viewer 错误提示（老 dll 无符号 → 原样通用文案）
+            return Err(open_error_with_detail(format!("打开媒体失败: {}", path.display())));
         }
         // 直接读参数算顶格容量（不经 `VideoReader` 临时值——其 Drop 会 close 句柄，造成 UAF）
         let mut ffi = ParamFFI {
@@ -437,7 +447,7 @@ impl VideoReader {
         let mut handle: Handle = std::ptr::null_mut();
         let rc = unsafe { (b.open_video_hw_prefer)(cpath.as_ptr(), max_dim, &mut handle) };
         if rc != 0 || handle.is_null() {
-            return Err(anyhow::anyhow!("打开媒体失败: {}", path.display()));
+            return Err(open_error_with_detail(format!("打开媒体失败: {}", path.display())));
         }
         let mut ffi = ParamFFI {
             width: 0,
@@ -611,7 +621,7 @@ impl VideoReader {
             (b.open_video_hw)(cpath.as_ptr(), u32::MAX, device, device_context, &mut handle)
         };
         if rc != 0 || handle.is_null() {
-            return Err(anyhow::anyhow!("硬件解码打开失败: {}", path.display()));
+            return Err(open_error_with_detail(format!("硬件解码打开失败: {}", path.display())));
         }
         // 尺寸/时长经 `vff_video_params` 读取（与软解同姿势；HW 帧不经 sws，cap 不预分配）
         let mut ffi = ParamFFI {
@@ -714,27 +724,10 @@ impl AudioReader {
         let mut handle: Handle = std::ptr::null_mut();
         let rc = unsafe { (b.open_audio)(cpath.as_ptr(), sample_rate, &mut handle) };
         if rc != 0 || handle.is_null() {
-            return Err(anyhow::anyhow!("打开音频失败: {}", path.display()));
+            // R2-4：打开失败把 dll 侧分类串带进错误提示（"打开媒体失败/媒体中没有音轨"…）
+            return Err(open_error_with_detail(format!("打开音频失败: {}", path.display())));
         }
         Ok(Self { handle })
-    }
-
-    /// 已确定的输出参数（速率/声道/时长）。
-    #[allow(dead_code)] // cdylib 侧在用；主侧供音频 worker 可选读取
-    pub fn params(&self) -> AudioParams {
-        let b = bridge().expect("reader 持有期桥必在");
-        let mut ffi = ParamFFI {
-            width: 0,
-            height: 0,
-            duration: 0.0,
-            frame_rate_num: 0,
-            frame_rate_den: 0,
-            has_audio: 0,
-            sample_rate: 0,
-            channels: 0,
-        };
-        unsafe { (b.audio_params)(self.handle, &mut ffi) }
-        ffi.into()
     }
 
     /// 跳转到 `seconds`：decode flush + drain 复位。
@@ -747,30 +740,42 @@ impl AudioReader {
         Ok(())
     }
 
-    /// 推进到**下一块** F32 交错样本。`(pts 秒, 样本)`（样本数为偶数=立体声）；
+    /// 推进到**下一块**并把 F32 交错样本写进 `out`（复用调用方常驻缓冲；返回块首 pts）。
     /// `None` = EOF（之后可再 `seek` 复用）。
-    pub fn next_pcm_f32(&mut self) -> Result<Option<(f64, Vec<f32>)>> {
+    ///
+    /// **R2-2**：`out` 由调用方跨块复用——只按需 `reserve` 工作容量（65536 样本），
+    /// `clear`+`set_len` 写回，**稳态零分配零 memset**；消除旧 `next_pcm_f32` 每块
+    /// `vec![0f32; cap]`（256KB）的全零初始化 + 分配热点。
+    pub fn next_pcm_f32_into(&mut self, out: &mut Vec<f32>) -> Result<Option<f64>> {
         let b = bridge().context("视频运行库不可用")?;
-        // 音频块一般 ≤ 2s×通道；给足量缓冲（内部每次拉一小块交还）。
-        let cap = 1 << 16; // 65536 样本（≈0.68s@48k 立体声）——见 worker 循环，多调几次拼块
-        let mut buf = vec![0f32; cap];
+        // 工作容量恒 65536 样本（≈0.68s@48k 立体声，dll 单块 ≤ 输出规格容量）；容量不足
+        // 才 reserve（不清零），clear 只管 len、稳态零写入。
+        const WORK_CAP: usize = 1 << 16;
+        if out.capacity() < WORK_CAP {
+            out.reserve(WORK_CAP - out.capacity());
+        }
+        out.clear();
         let mut pts = 0.0f64;
         let mut written = 0usize;
         let rc = unsafe {
             (b.audio_pcm)(
                 self.handle,
-                buf.as_mut_ptr(),
-                buf.len(),
+                out.as_mut_ptr(),
+                out.capacity().min(WORK_CAP),
                 &mut pts,
                 &mut written,
             )
         };
         match rc {
             1 => {
-                buf.truncate(written);
-                Ok(Some((pts, buf)))
+                // SAFETY: dll 保证 `written ≤ 容量`（越界返回 -1 不写缓冲）
+                unsafe { out.set_len(written) };
+                Ok(Some(pts))
             }
-            0 => Ok(None),
+            0 => {
+                out.clear();
+                Ok(None)
+            }
             _ => Err(anyhow::anyhow!("解码音频失败")),
         }
     }
@@ -881,7 +886,8 @@ impl SubtitleReader {
 
 /// 仅测试构建存在：当前时间应显示的字幕（生产显示走 `crate::subtitle::find_active_subtitle`；
 /// 本测试读口**直接委托它**——单一真值、重叠窗口"最近开始"口径不漂移；FFI
-/// `vff_subtitle_at` 在 media-ffmpeg 侧同款语义，见其 `active_subtitle_index`）。
+/// `vff_subtitle_at` 已在 media-ffmpeg 侧随 R2-5 死导出清理删除；同源语义见其
+/// `active_subtitle_index`（本方法直接委托 `find_active_subtitle`，口径单一）。
 #[cfg(test)]
 impl SubtitleReader {
     pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
@@ -892,9 +898,36 @@ impl SubtitleReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subtitle::find_active_subtitle;
     use std::path::PathBuf;
     use std::time::Instant;
+
+    /// R2-4 端到端：打开失败时，桥把 dll 侧分类串（`vff_last_error_message`，新 dll 有
+    /// 该 additive 符号）附加进错误提示——用户不再只见「打开媒体失败」空话。**缺失符号
+    /// 容忍**：老 dll 缺符号 → 桥 `last_error=None`（`load_bridge` 用 `.ok()` 可选解析，
+    /// 不会使整桥加载失败）→ 仅 `if` 守卫跳过附加断言、主文案仍保通用词。缺桥 SKIP。
+    #[test]
+    fn open_failure_carries_dll_classification_when_symbol_present() {
+        if !available() {
+            eprintln!("SKIP: media_ffmpeg.dll 不可用");
+            return;
+        }
+        let missing = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such-classify.mp4");
+        let msg = match VideoReader::open_scaled(&missing, u32::MAX) {
+            Ok(_) => panic!("不存在路径应打开失败"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("打开媒体失败"),
+            "主文案应保留通用词，实得 {msg}"
+        );
+        if bridge().is_some_and(|b| b.last_error.is_some()) {
+            assert!(
+                msg.contains("（"),
+                "dll 分类串应附加进错误提示（符号在位），实得 {msg}"
+            );
+            eprintln!("[R2-4] 打开失败提示带分类：{msg}");
+        }
+    }
 
     /// 基准文件：`VFF_BENCH_VIDEO` 指定，缺省仓库 `target/视频测试.mp4`（1280x720 h264@30）。
     fn bench_video() -> std::path::PathBuf {
@@ -955,76 +988,6 @@ mod tests {
         assert!(
             r.subtitle_at(22.04).is_none(),
             "22.04s 应不命中（超出首条窗口）"
-        );
-    }
-
-    /// 对拍（跨 crate）：同一份真实字幕数据分别走 video 生产实现
-    /// [`find_active_subtitle`](`crate::subtitle::find_active_subtitle`) 与 cdylib 侧
-    /// `vff_subtitle_at`（经运行时 FFI 桥 `Bridge::subtitle_at`，内部即
-    /// `active_subtitle_index`），在密集采样时间点上逐点断言两实现返回同一活动字幕
-    /// **索引**（FFI 返回 `>=0` 为索引、`-1` 为无）。缺桥/缺夹具 SKIP 不 FAIL。
-    ///
-    /// 这里的 `vff_subtitle_at` 是**真 FFI 调用**（走已加载的 `media_ffmpeg.dll`，
-    /// 非本地镜像），对拍的是两份独立实现的口径是否漂移。
-    #[test]
-    fn subtitle_ffi_active_index_agrees_with_find_active_subtitle() {
-        if !available() {
-            eprintln!("SKIP: media_ffmpeg.dll 不可用");
-            return;
-        }
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/视频测试字幕.mkv");
-        if !path.exists() {
-            eprintln!("SKIP: missing target/视频测试字幕.mkv（字幕夹具不入库，手动装配）");
-            return;
-        }
-        let r = SubtitleReader::open(&path).expect("打开字幕失败");
-        let subs = r.subtitles();
-        assert!(!subs.is_empty(), "应提取到字幕，实得 {} 条", subs.len());
-
-        // 采样时间点：窗口内/紧贴端点（含边界）各 ±ε、窗口间隙，再铺一层 0.5s 均匀网格
-        // 跨全片；另加首条之前 / 0 时刻 / 尾部越界兜底点。
-        let mut times: Vec<f64> = Vec::new();
-        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-        for s in subs.iter() {
-            lo = lo.min(s.start_pts);
-            hi = hi.max(s.end_pts);
-            times.push(s.start_pts - 0.05);
-            times.push(s.start_pts);
-            times.push((s.start_pts + s.end_pts) * 0.5);
-            times.push(s.end_pts);
-            times.push(s.end_pts + 0.05);
-        }
-        let mut t = lo - 1.0;
-        while t <= hi + 1.0 {
-            times.push(t);
-            t += 0.5;
-        }
-        times.push(-1.0);
-        times.push(0.0);
-        times.push(hi + 10.0);
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        times.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
-
-        let Some(b) = bridge() else {
-            eprintln!("SKIP: media_ffmpeg.dll 不可用");
-            return;
-        };
-        let mut mismatches: Vec<(f64, Option<usize>, Option<usize>)> = Vec::new();
-        for t in times {
-            let video = find_active_subtitle(subs, t)
-                .map(|e| subs.iter().position(|s| std::ptr::eq(s, e)).unwrap());
-            let ffi = unsafe { (b.subtitle_at)(r.handle, t) };
-            let ffi_id = if ffi >= 0 { Some(ffi as usize) } else { None };
-            if video != ffi_id {
-                mismatches.push((t, video, ffi_id));
-            }
-        }
-        let shown = mismatches.len().min(8);
-        assert!(
-            mismatches.is_empty(),
-            "对拍分歧 {} 处（t, find_active_subtitle idx, vff_subtitle_at idx）前 {shown} 处：{:?}",
-            mismatches.len(),
-            &mismatches[..shown]
         );
     }
 

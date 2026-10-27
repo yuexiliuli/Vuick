@@ -186,10 +186,11 @@
                 return;
             }
         };
+        let mut buf: Vec<f32> = Vec::new();
         for target in [0.1, 6.0, 1.5, 9.9] {
             r.seek(target).unwrap();
-            let (pts, samples) = match r.next_pcm_f32() {
-                Ok(Some(x)) => x,
+            let pts = match r.next_pcm_f32_into(&mut buf) {
+                Ok(Some(p)) => p,
                 Ok(None) => panic!("seek 后不应 EOF（target={target}）"),
                 Err(_) => panic!("音频复用 seek 解码失败（target={target}）"),
             };
@@ -200,7 +201,7 @@
                 "音频复用 seek 首块落点偏离 target={target} pts={pts}"
             );
             assert!(
-                !samples.is_empty() && samples.iter().all(|s| s.is_finite()),
+                !buf.is_empty() && buf.iter().all(|s| s.is_finite()),
                 "首块样本应非空且有限"
             );
         }

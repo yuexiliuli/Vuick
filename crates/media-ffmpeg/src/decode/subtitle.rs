@@ -292,6 +292,9 @@ impl SubtitleReader {
     }
     
     /// 跳转到指定时间（秒），返回该时间之后的第一个字幕索引。
+    /// **R2-5 dormant**：原 FFI 入口 `vff_subtitle_seek` 及其主侧解析已随死导出清理删除，
+    /// 本方法（连同 `current_index`/`next_subtitle`）保留为「逐条拉取」预留 API。
+    #[allow(dead_code)] // 预留「逐条拉取」遍历 API（配合 [`Self::seek`] 定位起点）
     pub fn seek(&mut self, seconds: f64) -> usize {
         // 二分查找第一个 start_pts >= seconds 的字幕
         let idx = self.subtitles.partition_point(|s| s.start_pts < seconds);
@@ -316,8 +319,8 @@ impl SubtitleReader {
     /// 二分定位最后一个 `start_pts ≤ seconds`，从该处**往前回扫**找命中。重叠窗口
     /// （同一时间多条活跃）取「最近开始」那条，与 `video` crate 生产路径
     /// `subtitle::find_active_subtitle` **同口径**（显示最新对白）。dormancy：显示已走
-    /// `find_active_subtitle`；本方法供保留导出的 FFI `vff_subtitle_at` 与本 crate 单测
-    /// 对拍，保持与生产一致以消除三份实现的口径漂移。
+    /// `find_active_subtitle`；本方法供本 crate 单测对拍（原 FFI `vff_subtitle_at` 已随
+    /// R2-5 死导出清理删除），保持与生产一致以消除三份实现的口径漂移。
     pub fn active_subtitle_index(&self, seconds: f64) -> Option<usize> {
         active_subtitle_index(&self.subtitles, seconds)
     }

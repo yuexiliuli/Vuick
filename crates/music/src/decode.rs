@@ -183,25 +183,41 @@ impl AudioCodec {
     /// 起点过小会在低采样率源/高设备速率（upsample 比例大）时被 `vff_audio_pcm` 返回 -1，
     /// 而 retry 时该帧已随 `next_pcm_f32` 推进被丢弃（`-1` 不写缓冲）→ 起始丢帧/隔帧丢。
     /// 大起步 + 下方 -1 扩容仅作超上限的防御兜底（单帧 >2s×2ch 实际不可能）。
+    ///
+    /// **R2-2**：容量用 `reserve` 增长、`clear`+`set_len` 写回——消除旧 `resize(192000,0)`
+    /// 每块 768KB 全零 memset（稳态容量已足，零写入）；采样字节与逐字语义不变。
     pub(crate) fn next_pcm(&mut self, out: &mut Vec<f32>) -> Result<Option<f64>> {
         let b = bridge().context("media_ffmpeg.dll 缺失（缺少视频/音乐运行库）")?;
-        out.resize(48_000 * 2 * 2, 0.0);
+        const START_CAP: usize = 48_000 * 2 * 2; // ≈2s 立体声
+        if out.capacity() < START_CAP {
+            out.reserve(START_CAP - out.capacity());
+        }
+        out.clear();
         loop {
             let mut pts = 0.0f64;
             let mut written = 0usize;
-            let rc = unsafe { (b.pcm)(self.handle, out.as_mut_ptr(), out.len(), &mut pts, &mut written) };
+            let rc = unsafe {
+                (b.pcm)(
+                    self.handle,
+                    out.as_mut_ptr(),
+                    out.capacity(),
+                    &mut pts,
+                    &mut written,
+                )
+            };
             match rc {
                 1 => {
-                    out.truncate(written);
+                    // SAFETY: dll 保证 `written ≤ out.capacity()`（越界返回 -1 不写缓冲）
+                    unsafe { out.set_len(written) };
                     return Ok(Some(pts));
                 }
                 0 => {
                     out.clear();
                     return Ok(None);
                 }
-                -1 if out.len() < (1 << 22) => {
+                -1 if out.capacity() < (1 << 22) => {
                     // 缓冲过小（dll 单块超过当前容量）：扩容重试
-                    out.resize(out.len() * 4, 0.0);
+                    out.reserve(out.capacity() * 4);
                 }
                 _ => {
                     out.clear();

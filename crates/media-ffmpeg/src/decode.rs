@@ -32,7 +32,7 @@ mod tests;
 // 供视频正文（VideoReader）引用的硬解内部名：裸名直达，正文复用拆分前原样。
 use self::hw::{
     HardwareDecode, HwFramePin, build_external_d3d11_device_ctx, is_hw_frame, try_open_hw_decoder,
-    warm_external_d3d11_frames_pool,
+    warm_external_d3d11_frames_pool_with,
 };
 
 // 再导出：让 `decode::{AudioReader, SubtitleReader, VideoReader, HwFrame, FFMPEG_LOCK,
@@ -252,6 +252,11 @@ pub struct VideoReader {
     drained: bool,
     /// 硬件解码状态（`None` = 软件路径）。
     hw: Option<HardwareDecode>,
+    /// 常驻 sws 输出帧（BGRA，`out_width×out_height`）＋为其分配的尺寸：消除每帧
+    /// `av_frame_get_buffer`(32 对齐) 全量分配 + 释放的抖动（1080p ≈2.3MB/帧，
+    /// 见 [`Self::convert_bgra_into`]）。输出尺寸在 reader 生命周期内固定，首个转换帧
+    /// 懒建一次后复用；存尺寸字段只是防御性 `out_width/out_height` 变化时重建。
+    bgra_out: Option<(u32, u32, ffmpeg::frame::Video)>,
 }
 
 /// 释放持 [`FFMPEG_LOCK`]（见 [`AudioReader`] 同款说明）：`avformat_close_input` 与
@@ -409,6 +414,7 @@ impl VideoReader {
             time_base,
             drained: false,
             hw,
+            bgra_out: None,
         })
     }
 
@@ -478,9 +484,14 @@ impl VideoReader {
         // 其它驱动无害。不再做 SHR 能力门控（SHR 探测仅留作诊断/测试，见 `decode::hw`）。
         // teardown 兼容护栏：实测 Arc 上 open_external_hw 在注入设备上预跑一次最小帧池
         // 初始化可稳定窗口释放 `ID3D11DeviceContext`（偶发 0xc0000005；机制未完全定位、
-        // 非因果陈述，见 [`warm_external_d3d11_frames_pool`]）。
-        warm_external_d3d11_frames_pool(device, device_context);
+        // 非因果陈述，见 [`warm_external_d3d11_frames_pool_with`]）。
+        // R2-3：warm 预跑与真实解码器挂接**共用同一已构建 ctx**（同线程、同设备类型、
+        // 引用计数平衡——`build_external_d3d11_device_ctx` 只对 device/device_context 各
+        // AddRef 一次，FFmpeg uninit 统一 Release；warm 的帧池上下文经 `av_buffer_ref`
+        // 自持另一份引用、用完即 unref，不改变本 ctx 的余额）。省掉每次 open 对同一
+        // 设备/上下文的双重 alloc/init/AddRef/Release。
         let device_buf = build_external_d3d11_device_ctx(device, device_context, false)?;
+        warm_external_d3d11_frames_pool_with(&device_buf);
 
         let context = ffmpeg::codec::context::Context::from_parameters(params_for_decoder)
             .context("解析视频流参数失败")?;
@@ -521,6 +532,7 @@ impl VideoReader {
             time_base,
             drained: false,
             hw: Some(HardwareDecode { device: device_buf }),
+            bgra_out: None,
         })
     }
 
@@ -751,37 +763,50 @@ impl VideoReader {
             })
         }
     }
+}
 
-    /// 取（或惰性创建）sws 缩放器：输入 = `src_format` 的 `src_w×src_h`，输出 =
-    /// `out_width×out_height` BGRA。首个解码帧调用时建一次，之后复用。
-    fn scaler_for(
-        &mut self,
-        src_format: ffmpeg::format::Pixel,
-        src_w: u32,
-        src_h: u32,
-    ) -> Result<&mut ffmpeg::software::scaling::Context> {
-        if self.scaler.is_none() {
-            let scaler = ffmpeg::software::scaling::Context::get(
-                src_format,
-                src_w,
-                src_h,
-                ffmpeg::format::Pixel::BGRA,
-                self.out_width,
-                self.out_height,
-                ffmpeg::software::scaling::Flags::BILINEAR,
-            )
-            .context("初始化 sws 缩放失败")?;
-            self.scaler = Some(std::mem::ManuallyDrop::new(scaler));
-        }
-        Ok(self.scaler.as_mut().expect("scaler 已就绪"))
+/// 取（或惰性创建）sws 缩放器：输入 = `src_format` 的 `src_w×src_h`，输出 =
+/// `out_width×out_height` BGRA。首个解码帧调用时建一次，之后复用。
+///
+/// 实现为**自由函数**（非方法）：调用方 [`VideoReader::convert_bgra_into`] 需同时可变借用
+/// `self.scaler` 与 `self.bgra_out` 两个不同字段，方法的 `&mut self` 接收器会整体
+/// 借用冲突（E0502）。
+fn scaler_for(
+    scaler: &mut Option<std::mem::ManuallyDrop<ffmpeg::software::scaling::Context>>,
+    src_format: ffmpeg::format::Pixel,
+    src_w: u32,
+    src_h: u32,
+    out_width: u32,
+    out_height: u32,
+) -> Result<&mut ffmpeg::software::scaling::Context> {
+    if scaler.is_none() {
+        let ctx = ffmpeg::software::scaling::Context::get(
+            src_format,
+            src_w,
+            src_h,
+            ffmpeg::format::Pixel::BGRA,
+            out_width,
+            out_height,
+            ffmpeg::software::scaling::Flags::BILINEAR,
+        )
+        .context("初始化 sws 缩放失败")?;
+        *scaler = Some(std::mem::ManuallyDrop::new(ctx));
     }
+    Ok(scaler.as_mut().expect("scaler 已就绪"))
+}
 
+impl VideoReader {
     /// 把解码帧转 BGRA 并写进 `out`（须 ≥ 输出 w×h×4）；无 pts 的帧跳过（返回 `None`）。
     /// 尺寸用 sws 输出（decode-to-display 下采样目标），与 `out_width/out_height` 一致。
     ///
     /// 硬件路径：解码帧为 opaque GPU 帧 → `av_hwframe_transfer_data` 回读到系统内存
     /// （NV12/P010 等软件格式）→ 按该真实格式惰性建 sws → 转 BGRA。
     /// 软件路径：直接按解码器输出格式建 sws（首个软件帧触发）。
+    ///
+    /// **R2-1 常驻输出帧**：sws 直接写进 [`Self::bgra_out`] 常驻帧（懒建一次、含 32 对齐
+    /// 行步长）——不再每帧 `Video::empty` + scaler `run` 内部 `av_frame_get_buffer`
+    /// 全量分配 + Drop 释放（ffmpeg-next scaling `run` 对空输出帧自动 `alloc`，1080p
+    /// ≈2.3MB/帧分配+清零抖动，30fps = 每秒 30×）。逐行仍按 stride 拷进调用方 `out`。
     fn convert_bgra_into(
         &mut self,
         f: &ffmpeg::frame::Video,
@@ -790,7 +815,24 @@ impl VideoReader {
         let Some(pts) = f.pts() else {
             return Ok(None);
         };
-        let mut bgra = ffmpeg::frame::Video::empty();
+        // 常驻 BGRA 输出帧懒建（含尺寸字段防御重建）；随后 sws 复用其 data 缓冲
+        if self
+            .bgra_out
+            .as_ref()
+            .map(|(w, h, _)| (*w, *h))
+            != Some((self.out_width, self.out_height))
+        {
+            self.bgra_out = Some((
+                self.out_width,
+                self.out_height,
+                ffmpeg::frame::Video::new(
+                    ffmpeg::format::Pixel::BGRA,
+                    self.out_width,
+                    self.out_height,
+                ),
+            ));
+        }
+        let bgra = &mut self.bgra_out.as_mut().expect("常驻 BGRA 帧已建").2;
         if self.hw.is_some() && is_hw_frame(f) {
             // 回读：dst 为空帧即可（transfer 内部按 sw_format 分配数据；Drop 时 av_frame_free）。
             let mut sw = ffmpeg::frame::Video::empty();
@@ -801,15 +843,29 @@ impl VideoReader {
             }
             let fmt = sw.format();
             let (w, h) = (sw.width(), sw.height());
-            self.scaler_for(fmt, w, h)?
-                .run(&sw, &mut bgra)
-                .context("sws 转换失败")?;
+            scaler_for(
+                &mut self.scaler,
+                fmt,
+                w,
+                h,
+                self.out_width,
+                self.out_height,
+            )?
+            .run(&sw, bgra)
+            .context("sws 转换失败")?;
         } else {
             let fmt = f.format();
             let (w, h) = (f.width(), f.height());
-            self.scaler_for(fmt, w, h)?
-                .run(f, &mut bgra)
-                .context("sws 转换失败")?;
+            scaler_for(
+                &mut self.scaler,
+                fmt,
+                w,
+                h,
+                self.out_width,
+                self.out_height,
+            )?
+            .run(f, bgra)
+            .context("sws 转换失败")?;
         }
         let need = (self.out_width as usize) * (self.out_height as usize) * 4;
         if out.len() < need {

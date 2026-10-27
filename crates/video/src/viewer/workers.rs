@@ -1074,6 +1074,10 @@ impl super::VideoViewer {
         // FFMPEG_LOCK（重开期间长持锁会拖延视频落点帧 ——「点击进度条后画面要等片刻」
         // 的残余主因）。换文件或倍速（out_rate 变）才重开。
         let mut active: Option<(std::path::PathBuf, u32, AudioReader)> = None;
+        // R2-2：常驻音频块缓冲（跨命令/复用 reader 全程复用，省旧 `next_pcm_f32` 每块
+        // `vec![0f32; 65536]` 256KB 全零初始化 + 分配热点——`next_pcm_f32_into` 只按需
+        // 扩容、`truncate(set_len)` 写回，稳态零分配）。
+        let mut pcm_buf: Vec<f32> = Vec::new();
         while let Ok(cmd) = rx.recv() {
             cmd.sink.flush();
             let same = matches!(&active, Some((p, r, _)) if *p == cmd.path && *r == cmd.out_rate);
@@ -1088,8 +1092,8 @@ impl super::VideoViewer {
             let reader = &mut active.as_mut().expect("复用分支已确保有 reader").2;
             let _ = reader.seek(cmd.target);
             while gen_arc.load(Ordering::SeqCst) == cmd.generation {
-                match reader.next_pcm_f32() {
-                    Ok(Some((_pts, samples))) => {
+                match reader.next_pcm_f32_into(&mut pcm_buf) {
+                    Ok(Some(_pts)) => {
                         // 回压：缓冲满时等待（不把整段音频预解码塞爆内存）
                         while gen_arc.load(Ordering::SeqCst) == cmd.generation
                             && cmd.sink.queued_len() >= AUDIO_QUEUE_AIM
@@ -1099,7 +1103,7 @@ impl super::VideoViewer {
                         if gen_arc.load(Ordering::SeqCst) != cmd.generation {
                             break;
                         }
-                        cmd.sink.push(&samples);
+                        cmd.sink.push(&pcm_buf);
                     }
                     _ => break, // EOF / 解码错误：本代结束
                 }

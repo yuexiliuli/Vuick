@@ -506,6 +506,13 @@ fn bench_leg_canonical(name: &str, mut r: VideoReader, frames: u32, warmup: u32)
 fn bench_leg_breakdown(name: &str, mut r: VideoReader, frames: u32) -> anyhow::Result<()> {
     let cap = (r.out_width as usize) * (r.out_height as usize) * 4;
     let mut out = vec![0u8; cap];
+    // 常驻 BGRA 输出帧（镜像生产 `VideoReader::bgra_out` 的懒建一次姿势，R2-1——拆账的
+    // sws 阶段不再含每帧 av_frame_get_buffer 分配，与生产路径逐字一致）
+    let mut bgra = ffmpeg::frame::Video::new(
+        ffmpeg::format::Pixel::BGRA,
+        r.out_width,
+        r.out_height,
+    );
     let mut stage = [0.0f64; 5];
     let mut n: u32 = 0;
     while n < frames {
@@ -527,7 +534,7 @@ fn bench_leg_breakdown(name: &str, mut r: VideoReader, frames: u32) -> anyhow::R
                     if !ok {
                         break;
                     }
-                    if bench_convert_stage(&mut r, &f, &mut out, &mut stage)?.is_some() {
+                    if bench_convert_stage(&mut r, &f, &mut out, &mut bgra, &mut stage)?.is_some() {
                         n += 1;
                     }
                 }
@@ -548,7 +555,7 @@ fn bench_leg_breakdown(name: &str, mut r: VideoReader, frames: u32) -> anyhow::R
             if !ok {
                 break;
             }
-            if bench_convert_stage(&mut r, &f, &mut out, &mut stage)?.is_some() {
+            if bench_convert_stage(&mut r, &f, &mut out, &mut bgra, &mut stage)?.is_some() {
                 n += 1;
             }
         }
@@ -571,12 +578,12 @@ fn bench_convert_stage(
     r: &mut VideoReader,
     f: &ffmpeg::frame::Video,
     out: &mut [u8],
+    bgra: &mut ffmpeg::frame::Video,
     stage: &mut [f64; 5],
 ) -> anyhow::Result<Option<(f64, u32, u32)>> {
     let Some(pts) = f.pts() else {
         return Ok(None);
     };
-    let mut bgra = ffmpeg::frame::Video::empty();
     if r.hw.is_some() && is_hw_frame(f) {
         let mut sw = ffmpeg::frame::Video::empty();
         let t = std::time::Instant::now();
@@ -589,17 +596,31 @@ fn bench_convert_stage(
         let fmt = sw.format();
         let (w, h) = (sw.width(), sw.height());
         let t = std::time::Instant::now();
-        r.scaler_for(fmt, w, h)?
-            .run(&sw, &mut bgra)
-            .context("sws 转换失败")?;
+        scaler_for(
+            &mut r.scaler,
+            fmt,
+            w,
+            h,
+            r.out_width,
+            r.out_height,
+        )?
+        .run(&sw, bgra)
+        .context("sws 转换失败")?;
         stage[ST_SWS] += t.elapsed().as_secs_f64();
     } else {
         let fmt = f.format();
         let (w, h) = (f.width(), f.height());
         let t = std::time::Instant::now();
-        r.scaler_for(fmt, w, h)?
-            .run(f, &mut bgra)
-            .context("sws 转换失败")?;
+        scaler_for(
+            &mut r.scaler,
+            fmt,
+            w,
+            h,
+            r.out_width,
+            r.out_height,
+        )?
+        .run(f, bgra)
+        .context("sws 转换失败")?;
         stage[ST_SWS] += t.elapsed().as_secs_f64();
     }
     let need = (r.out_width as usize) * (r.out_height as usize) * 4;
@@ -1115,9 +1136,10 @@ fn active_subtitle_index_prefers_latest_start_match() {
 }
 
 /// 对拍（评审 SUGGESTION-8 补强）：与 `video` crate `subtitle::tests::
-/// find_active_subtitle_edge_case_battery` **逐字同源**的样例集跑 FFI 骨干实现
-/// `active_subtitle_index`（即 `vff_subtitle_at` 的单一实现）——覆盖重叠窗口、相邻紧贴、
-/// 0 时刻起点、窗口间隙、尾部越界、空集；相同采样点断言相同索引，锁死两份实现口径一致。
+/// find_active_subtitle_edge_case_battery` **逐字同源**的样例集跑字幕骨干实现
+/// `active_subtitle_index`（原 FFI `vff_subtitle_at` 的单一实现，R2-5 后仅内部用）——
+/// 覆盖重叠窗口、相邻紧贴、0 时刻起点、窗口间隙、尾部越界、空集；相同采样点断言相同
+/// 索引，锁死两份实现口径一致。
 #[test]
 fn active_subtitle_index_edge_case_battery_cross_check() {
     let subs = vec![
@@ -1423,4 +1445,155 @@ fn subtitle_bom_is_stripped_and_ass_dialogue_detected() {
     let e = SubtitleReader::parse_subtitle_packet(&pkt, Rational::new(1, 1000), SubtitleFormat::ASS)
         .expect("MKV 新块带 BOM 应解析出条目");
     assert_eq!(e.text, "第二句字幕", "MKV 新块应取正文且无 BOM");
+}
+
+// ---------------- R2-4：FFI 打开失败错误分类 ----------------
+
+/// 读 dll 侧 `vff_last_error_message` 当前串（保底非空指针；NUL 结尾转 String）。
+fn ffi_last_error_str() -> String {
+    let p = unsafe { crate::vff_last_error_message() };
+    assert!(!p.is_null(), "vff_last_error_message 不应返回空指针");
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 临时目录写一个内容损坏的假 mp4（同 `open_watchdog_interrupts_corrupt_file` 姿势；
+/// 不入库，PID 后缀防并行测试撞目录）。
+fn corrupt_fixture_path() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "gpui-editor-mff-classify-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("corrupt.mp4");
+    std::fs::write(&p, b"not a real video at all").unwrap();
+    p
+}
+
+/// R2-4 打开失败分类（`vff_last_error_message` thread-local）：
+/// 事件「打不开（不存在/损坏）→ 无媒体流文件 → 缺解码器」返回**不同**分类串；成功
+/// open 后清空；读口恒非 null。夹具：`target/audio_only_test.mp4`（仅音轨，无视频流）
+/// 与 `target/av1_only_test.mp4`（AV1 视频，slim 无 AV1 解码器）手动装配（§5，缺则
+/// SKIP 对应段；损坏文件就地生成，无夹具依赖）。
+#[test]
+fn ffi_open_failure_classification_distinct() {
+    // 基准：无失败状态 → 空串
+    assert_eq!(ffi_last_error_str(), "", "无失败时分类串应为空");
+
+    // CString 辅助
+    let to_c = |s: &str| std::ffi::CString::new(s).unwrap();
+
+    // ① 不存在的路径：分类「打开媒体失败」
+    let mut h: crate::Handle = std::ptr::null_mut();
+    let missing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such-ffi.mp4");
+    let rc = unsafe {
+        crate::vff_open_video(
+            to_c(&missing.to_string_lossy()).as_ptr(),
+            u32::MAX,
+            &mut h,
+        )
+    };
+    assert_eq!(rc, -1, "不存在路径应打开失败");
+    let e1 = ffi_last_error_str();
+    assert!(
+        e1.contains("打开媒体失败"),
+        "打不开（不存在）应分类「打开媒体失败」，实得 {e1:?}"
+    );
+
+    // ② 损坏文件：同样「打开媒体失败」（probe 失败），但 root 原因串与 ① 不同
+    let bad = corrupt_fixture_path();
+    let mut h2: crate::Handle = std::ptr::null_mut();
+    let rc = unsafe {
+        crate::vff_open_video(to_c(&bad.to_string_lossy()).as_ptr(), u32::MAX, &mut h2)
+    };
+    assert_eq!(rc, -1, "损坏文件应打开失败");
+    let e2 = ffi_last_error_str();
+    assert!(e2.contains("打开媒体失败"), "打不开（损坏）应分类同词根，实得 {e2:?}");
+
+    // ③ 无视频流文件（仅音轨）：分类「媒体中没有视频流」
+    let only_audio = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/audio_only_test.mp4");
+    if only_audio.exists() {
+        let mut h3: crate::Handle = std::ptr::null_mut();
+        let rc = unsafe {
+            crate::vff_open_video(
+                to_c(&only_audio.to_string_lossy()).as_ptr(),
+                u32::MAX,
+                &mut h3,
+            )
+        };
+        assert_eq!(rc, -1, "无视频流文件打开为视频应失败");
+        let e3 = ffi_last_error_str();
+        assert!(
+            e3.contains("媒体中没有视频流"),
+            "无媒体流文件应分类「媒体中没有视频流」，实得 {e3:?}"
+        );
+        assert_ne!(e3, e1, "「无视频流」应与「打不开」分类不同，实得 {e3:?}");
+    } else {
+        eprintln!("SKIP: missing target/audio_only_test.mp4（夹具不入库）");
+    }
+
+    // ④ 缺解码器：引擎在 `open` 期的解码器查找是惰性的（`Context::decoder()` 不校验
+    // 解码器存在，`send_packet`/`receive_frame` 才报）→ **缺解码器不在 open 分类窗口**：
+    // 验证该文件 open 仍成功（与「打不开/无视频流」不同的自然边界），不错误归到
+    // 打开失败分类。真正的中途解码错误不进 open 分类串（R2-4 保持最小范围）。
+    let av1 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/av1_only_test.mp4");
+    if av1.exists() {
+        let mut h4: crate::Handle = std::ptr::null_mut();
+        let rc = unsafe {
+            crate::vff_open_video(to_c(&av1.to_string_lossy()).as_ptr(), u32::MAX, &mut h4)
+        };
+        assert!(
+            !h4.is_null() || rc != 0,
+            "AV1 文件 open 应为成功（惰性解码器）或明确的打开失败"
+        );
+        if !h4.is_null() {
+            unsafe { crate::vff_close_video(h4) };
+            eprintln!(
+                "[R2-4] 缺解码器文件 open 成功（解码器惰性），打开失败分类不覆盖解码期错误——符合设计"
+            );
+        }
+    } else {
+        eprintln!("SKIP: missing target/av1_only_test.mp4（夹具不入库）");
+    }
+
+    // ⑤ 成功 open 清空分类串：旧错误不残留误导诊断
+    let video = fixture();
+    if video.exists() {
+        let mut h5: crate::Handle = std::ptr::null_mut();
+        let rc = unsafe {
+            crate::vff_open_video(to_c(&video.to_string_lossy()).as_ptr(), u32::MAX, &mut h5)
+        };
+        assert_eq!(rc, 0, "真视频应打开成功");
+        assert!(!h5.is_null());
+        unsafe { crate::vff_close_video(h5) };
+        assert_eq!(
+            ffi_last_error_str(),
+            "",
+            "成功 open 后分类串应清空（不残留上一个失败）"
+        );
+    } else {
+        eprintln!("SKIP: missing target/video测试.mp4（夹具不入库）");
+    }
+
+    // ⑥ 音频侧同样接分类：不存在路径 → 「打开媒体失败」
+    let mut ha: crate::Handle = std::ptr::null_mut();
+    let rc = unsafe {
+        crate::vff_open_audio(
+            to_c(&missing.to_string_lossy()).as_ptr(),
+            48000,
+            &mut ha,
+        )
+    };
+    assert_eq!(rc, -1, "音频打开不存在路径应失败");
+    assert!(
+        ffi_last_error_str().contains("打开媒体失败"),
+        "音频打开失败应分类「打开媒体失败」，实得 {:?}",
+        ffi_last_error_str()
+    );
+
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!(
+        "gpui-editor-mff-classify-{}",
+        std::process::id()
+    )));
 }

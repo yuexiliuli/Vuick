@@ -372,18 +372,17 @@ pub(crate) fn d3d11_supports_shader_bound_textures(
 ///（[`d3d11_supports_shader_bound_textures`]）恰也包含一次 `av_hwframe_ctx_init`，曾被误作
 /// 直通门控必需；废除门控后由本护栏承接同一「预跑一次帧池初始化」职责：DECODER-only
 /// 构建通常成功（无失败日志噪音），仅首次打开时一次、热路径零成本，其它驱动无害。
-pub(crate) fn warm_external_d3d11_frames_pool(
-    device: *mut std::ffi::c_void,
-    device_context: *mut std::ffi::c_void,
-) {
+///
+/// R2-3：接收**已经构建好**的设备 ctx（`&AvBuf`，调用方 [`decode::VideoReader::open_external_hw`]
+/// 与真实解码路径共用），不再内部二次 `build_external_d3d11_device_ctx`——每次 open 对同一
+/// D3D11 设备/上下文的双重 alloc/init/AddRef/Release 消除。帧池上下文经 `av_buffer_ref` 自持
+/// 另一份引用、用完即 `av_buffer_unref`，不改 `dev` 的引用余额；同线程、同设备类型，符合
+/// K22/K23（各线程独享 context、AVBufferRef 引用计数正确）。
+pub(crate) fn warm_external_d3d11_frames_pool_with(dev: &AvBuf) {
     use ffmpeg::ffi::{AVBufferRef, AVD3D11VAFramesContext, AVHWFramesContext};
-    let Ok(dev) = build_external_d3d11_device_ctx(device, device_context, false) else {
-        return;
-    };
     unsafe {
         let frames = ffmpeg::ffi::av_hwframe_ctx_alloc(ffmpeg::ffi::av_buffer_ref(dev.0));
         if frames.is_null() {
-            drop(dev);
             return;
         }
         let fc = (*frames).data as *mut AVHWFramesContext;
@@ -402,7 +401,6 @@ pub(crate) fn warm_external_d3d11_frames_pool(
         let _ = ffmpeg::ffi::av_hwframe_ctx_init(frames);
         ffmpeg::ffi::av_buffer_unref(&mut (frames as *mut AVBufferRef));
     }
-    drop(dev);
 }
 
 /// 单帧 HW 帧的 `AVBufferRef` 引用钉：把解码帧的 AVBufferRef 引用复制一份私有持有，

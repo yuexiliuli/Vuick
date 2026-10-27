@@ -55,9 +55,55 @@ fn reader<'a, T>(h: Handle) -> &'a mut T {
     unsafe { &mut *(h as *mut T) }
 }
 
+// ---------------- 打开失败错误分类（R2-4：可观测化） ----------------
+
+/// 最近一次打开/探测失败的分类串缓冲容量（字节）。原始错误链（`anyhow` 链）第一条消息
+/// 通常已含分类词（"打开媒体失败 / 打开媒体超时、被取消 / 媒体中没有视频流 / 媒体中
+/// 没有音轨 / 媒体中没有字幕流 / 硬件解码不可用"…），本设施只把它带出 FFI。
+const LAST_ERROR_CAP: usize = 2048;
+
+std::thread_local! {
+    /// 本线程最近一次 open/probe 失败的错误串（NUL 结尾缓冲；成功 open 会清零）。
+    /// thread-local：视频/音频/字幕各由各自 worker 线程 open，读取与写入同线程，
+    /// 无需跨线程同步；新失败/成功覆盖旧值，指针在持有该 TLS 缓冲期间恒有效。
+    static LAST_OPEN_ERROR: std::cell::RefCell<[u8; LAST_ERROR_CAP]> =
+        const { std::cell::RefCell::new([0u8; LAST_ERROR_CAP]) };
+    static LAST_OPEN_ERROR_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 记录一次打开失败的分类串（把 `anyhow` 错误格式化后截断写入 TLS 缓冲）。
+fn record_last_open_error(e: &anyhow::Error) {
+    let msg = format!("{e:#}");
+    LAST_OPEN_ERROR.with(|c| {
+        let mut buf = c.borrow_mut();
+        buf.fill(0);
+        let n = msg.len().min(LAST_ERROR_CAP - 1);
+        buf[..n].copy_from_slice(&msg.as_bytes()[..n]);
+    });
+    LAST_OPEN_ERROR_SET.with(|c| c.set(true));
+}
+
+/// 清除本线程最近一次打开失败的分类串（成功 open 后调用，防陈旧错误误导诊断）：
+/// 归零整个缓冲，`vff_last_error_message` 读回空串。成功 open 低频，归零成本可忽略。
+fn clear_last_open_error() {
+    LAST_OPEN_ERROR.with(|c| c.borrow_mut().fill(0));
+    LAST_OPEN_ERROR_SET.with(|c| c.set(false));
+}
+
+/// **新增（additive，R2-4）**：取本线程最近一次打开/探测失败的错误分类串（UTF-8，
+/// NUL 结尾，截断 ≤ [`LAST_ERROR_CAP`] 字节；无失败/已被成功 open 清除 → 空串）。
+/// 返回指针恒有效（TLS 缓冲），调用方应**立即**读取；与 `vff_open_*` 同线程先失败
+/// 后读取。符号缺失 = 旧 dll → 主侧桥可选解析、回退通用文案（ABI 向后兼容）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_last_error_message() -> *const c_char {
+    LAST_OPEN_ERROR.with(|c| c.borrow().as_ptr() as *const c_char)
+}
+
 // ---------------- 视频 ----------------
 
 /// 打开视频：`max_dim` 为 sws 长边封顶（`u32::MAX` 全尺寸）。成功写 `*out` 句柄返回 0。
+/// 失败返回 -1 并经 [`vff_last_error_message`] 记录分类串（"打开媒体失败/超时、被取消/
+/// 媒体中没有视频流/解析视频流参数失败/硬件解码不可用"…，R2-4）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_open_video(
     path: *const c_char,
@@ -72,8 +118,12 @@ pub unsafe extern "C" fn vff_open_video(
     };
     let r = match VideoReader::open_scaled(p, max_dim) {
         Ok(r) => r,
-        Err(_) => return -1,
+        Err(e) => {
+            record_last_open_error(&e);
+            return -1;
+        }
     };
+    clear_last_open_error();
     unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
     0
 }
@@ -97,8 +147,12 @@ pub unsafe extern "C" fn vff_open_video_hw_prefer(
     };
     let r = match VideoReader::open_scaled_hw(p, max_dim) {
         Ok(r) => r,
-        Err(_) => return -1,
+        Err(e) => {
+            record_last_open_error(&e);
+            return -1;
+        }
     };
+    clear_last_open_error();
     unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
     0
 }
@@ -251,8 +305,12 @@ pub unsafe extern "C" fn vff_open_video_hw(
     };
     let r = match VideoReader::open_external_hw(p, max_dim, device_ptr, device_ctx_ptr) {
         Ok(r) => r,
-        Err(_) => return -1,
+        Err(e) => {
+            record_last_open_error(&e);
+            return -1;
+        }
     };
+    clear_last_open_error();
     unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
     0
 }
@@ -306,6 +364,8 @@ pub unsafe extern "C" fn vff_video_frame_release(frame_ptr: *mut c_void) {
 // ---------------- 音频 ----------------
 
 /// 打开音轨并重采样到 `sample_rate`/立体声/F32 交错。成功写 `*out` 句柄返回 0。
+/// 失败返回 -1 并经 [`vff_last_error_message`] 记录分类串（"打开媒体失败/媒体中没有
+/// 音轨/解析音轨参数失败"…，R2-4）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_open_audio(
     path: *const c_char,
@@ -320,8 +380,12 @@ pub unsafe extern "C" fn vff_open_audio(
     };
     let r = match AudioReader::open_pcm_f32(p, sample_rate) {
         Ok(r) => r,
-        Err(_) => return -1,
+        Err(e) => {
+            record_last_open_error(&e);
+            return -1;
+        }
     };
+    clear_last_open_error();
     unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
     0
 }
@@ -358,16 +422,18 @@ pub unsafe extern "C" fn vff_audio_pcm(
     pts: *mut f64,
     written: *mut usize,
 ) -> c_int {
+    if out_buf.is_null() {
+        return -1;
+    }
     let r = reader::<AudioReader>(h);
-    match r.next_pcm_f32() {
-        Ok(Some((p, samples))) => {
-            if out_buf.is_null() || samples.len() > out_cap {
-                return -1;
-            }
+    // R2-2：样本直接写进调用方预分配缓冲（`next_pcm_f32_into` 内部复用常驻输出帧，
+    // 不再每块新建 out 帧 + `to_vec` 中间分配）——采样字节与旧路径逐字一致。
+    let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
+    match r.next_pcm_f32_into(out) {
+        Ok(Some((p, n))) => {
             unsafe {
-                std::ptr::copy_nonoverlapping(samples.as_ptr(), out_buf, samples.len());
                 *pts = p;
-                *written = samples.len();
+                *written = n;
             }
             1
         }
@@ -401,7 +467,8 @@ pub struct SubtitleParamsFFI {
     pub format: SubtitleFormatFFI,
 }
 
-/// 打开字幕流：成功写 `*out` 句柄返回 0。
+/// 打开字幕流：成功写 `*out` 句柄返回 0。失败返回 -1 并经 [`vff_last_error_message`]
+/// 记录分类串（"打开媒体失败/媒体中没有字幕流"…，R2-4）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_open_subtitle(
     path: *const c_char,
@@ -415,8 +482,12 @@ pub unsafe extern "C" fn vff_open_subtitle(
     };
     let r = match SubtitleReader::open(p) {
         Ok(r) => r,
-        Err(_) => return -1,
+        Err(e) => {
+            record_last_open_error(&e);
+            return -1;
+        }
     };
+    clear_last_open_error();
     unsafe { *out = Box::into_raw(Box::new(r)) as *mut c_void }
     0
 }
@@ -497,28 +568,12 @@ pub unsafe extern "C" fn vff_subtitle_get_text(
     0
 }
 
-/// 获取当前时间应显示的字幕索引（-1 = 无）。
-///
-/// **dormancy（dormant）**：显示路径已被视频端 `find_active_subtitle` 取代（crates/video
-/// 逐帧在 render 用预加载清单二分命中），本符号**不再被生产消费**——仅因主程序 FFI
-/// 加载器（`crates/video/src/decode.rs` 的 `load_bridge`）仍按 `vff_subtitle_at\0` 解析
-/// 符号而**保留导出**（缺符号会导致整桥加载失败 → 视频不可用）。语义与生产
-/// `find_active_subtitle` 同口径（重叠窗口取「最近开始」），经 `active_subtitle_index`
-/// 单一实现以消除三份拷贝的匹配口径漂移。
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vff_subtitle_at(h: *mut c_void, seconds: f64) -> c_int {
-    let r = reader::<SubtitleReader>(h);
-    match r.active_subtitle_index(seconds) {
-        Some(i) => i as c_int,
-        None => -1,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vff_subtitle_seek(h: *mut c_void, seconds: f64) -> c_int {
-    let r = reader::<SubtitleReader>(h);
-    r.seek(seconds) as c_int
-}
+/// **R2-5 死导出清理**：`vff_subtitle_at` / `vff_subtitle_seek` 为生产零调用哑导出，
+/// 随本批从 `lib.rs` 导出表与主侧桥（`crates/video/src/decode.rs` 的 `load_bridge`）
+/// **同步移除**——互约定发布，不存在「旧 exe 桥需单边解析」的兼容期。显示路径
+/// 走视频端 `find_active_subtitle`（预加载清单二分）；字幕语义单一实现
+/// `SubtitleReader::active_subtitle_index`（`decode::subtitle::active_subtitle_index`
+/// 纯函数）仍被本 crate 单测使用，口径不丢失。
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_close_subtitle(h: *mut c_void) {

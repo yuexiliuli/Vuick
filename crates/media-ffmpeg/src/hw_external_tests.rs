@@ -350,7 +350,7 @@ fn hw_external_release_never_leaks_slot() {
 /// 外部设备注入 **open→drop（不解码）** teardown 回归：打开外部 D3D11VA reader 后**一帧
 /// 不解**立即 drop，断言窗口释放设备/上下文干净无 AV。Arc 实测：注入路径若从未在注入
 /// 设备上 init 过 `AVHWFramesContext`，释放 `ID3D11DeviceContext` 偶发 0xc0000005（机制未
-/// 完全定位、非因果陈述，由 [`warm_external_d3d11_frames_pool`] 护栏兜底）；本测覆盖
+/// 完全定位、非因果陈述，由 [`warm_external_d3d11_frames_pool_with`] 护栏兜底）；本测覆盖
 /// 「无解码直关」子路径（`hw_external_decode_frames` 已覆盖 open→decode→drop；open 内置的
 /// 预热帧池 AVBufferRef 随 reader 一起建/弃，顺带覆盖帧池缓冲 drop）。缺夹具 / 无 D3D11
 /// 设备 → SKIP。
