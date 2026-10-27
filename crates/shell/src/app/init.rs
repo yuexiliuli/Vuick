@@ -13,7 +13,7 @@ impl EditorApp {
     /// `ui::root::Root` 宿主包裹）。
     /// P5：shell 独立 crate 后由二进制壳 `main.rs` 消费，`pub(crate)` → `pub`。
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
-        Self::new_impl(window, cx, None, false)
+        Self::new_impl(window, cx, None, false, true)
     }
 
     /// 「拖出拆分」创建独立文件窗口：首个选项卡直接采用拖出的选项卡快照。
@@ -23,7 +23,14 @@ impl EditorApp {
         cx: &mut Context<Self>,
         first_tab: DetachedTab,
     ) -> EditorApp {
-        Self::new_impl(window, cx, Some(first_tab), true)
+        Self::new_impl(window, cx, Some(first_tab), true, false)
+    }
+
+    /// 「媒体在新窗口打开」创建的独立媒体窗口：普通拖拽语义（`is_detached=false`），
+    /// 但**不承担**启动/退出职责（不读 CLI 首参、不恢复会话、不挂退出/托盘钩子）——这些
+    /// 职责只属于首个主窗口。媒体由调用方在窗口创建后经 `open_file_here` 补开（media_window.rs）。
+    pub(super) fn new_media_window(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
+        Self::new_impl(window, cx, None, false, false)
     }
 
     pub(super) fn new_impl(
@@ -31,6 +38,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
         first_tab: Option<DetachedTab>,
         is_detached: bool,
+        startup: bool,
     ) -> EditorApp {
         let focus_handle = cx.focus_handle();
         // 侧边栏搜索输入框：内容变化 → 重刷 app（从而重算并展示搜索结果）
@@ -89,6 +97,18 @@ impl EditorApp {
             session_restore: prefs.session_restore.unwrap_or(true),
             // 关闭到托盘开关：None（未设置）= 默认关（点 × 直接退出）。
             close_to_tray: prefs.close_to_tray.unwrap_or(false),
+            // 媒体打开位置开关：None（未设置）= 默认开。
+            media_new_window: prefs.media_new_window.unwrap_or(true),
+            reuse_media_window: prefs.reuse_media_window.unwrap_or(true),
+            // 媒体窗口记录尺寸：None（未记录）= 新开跟随发起窗口大小。
+            music_window_size: prefs
+                .music_window_size
+                .map(|(w, h)| gpui::size(px(w), px(h))),
+            video_window_size: prefs
+                .video_window_size
+                .map(|(w, h)| gpui::size(px(w), px(h))),
+            // 媒体窗口尺寸落盘防抖（可重入、代序作废，仿会话防抖姿势，见 media_window.rs）。
+            media_size_flush_debounce: SeqAfter::default(),
             // 会话持久化防抖（可重入、代序作废） / 恢复期间抑制标记 / 槽位指纹表（见 session 模块）。
             session_flush_debounce: SeqAfter::default(),
             session_restoring: false,
@@ -139,6 +159,9 @@ impl EditorApp {
             last_title_ctrl_fg: None,
             tab_dragging: None,
             is_detached,
+            // 会话持久化责任：仅首个主窗口（`startup` 仅 `new` 传 true；new_media_window /
+            // new_detached 传 false）——会话清单单份全局，非主窗口参与写会顶替主窗口会话。
+            session_persist: startup,
             media_lock_menu_pos: None,
             media_lock_menu_entity: None,
             media_lock_menu_sub: None,
@@ -167,6 +190,9 @@ impl EditorApp {
             focus_handle,
             md_scroll_sync: MdScrollSync::default(),
             _appearance_sub: None,
+            // 专用媒体窗口尺寸变化订阅：仅 `new_media_window` 构造并在下方注册（未注册 =
+            // None，见 `!startup && !is_detached` 分支）。
+            _bounds_sub: None,
             palette: None,
             _palette_sub: None,
             // A：旧 live2 实体延迟回收队列（`commit_live` 暂存、下一帧 on_next_frame 清空）。
@@ -226,6 +252,18 @@ impl EditorApp {
                 }
             },
         ));
+        // 专用媒体窗口（`new_media_window` 创建 = `!startup && !is_detached`）尺寸变化订阅：
+        // 用户 resize 后按当前角色自动记录音乐/视频窗口尺寸到 config.json（下次新开按记录
+        // 尺寸）。主窗口 / 拖出 / 复用目标不注册（不记录，尺寸各自沿用自身，见 media_window.rs）。
+        // 最大化/全屏不记录（尺寸随系统态跳变无意义）；重复 resize 去重在 `record_media_window_size`。
+        if !startup && !is_detached {
+            app._bounds_sub = Some(cx.observe_window_bounds(window, |this, window, cx| {
+                if window.is_maximized() || window.is_fullscreen() {
+                    return;
+                }
+                this.record_media_window_size(window.bounds().size, cx);
+            }));
+        }
         if let Some(first_tab) = first_tab {
             // 拆出/拖拽产生的独立窗口：首个选项卡直接收纳（不额外建空选项卡）。
             app.adopt_tab(first_tab, Some(window), cx);
@@ -237,7 +275,10 @@ impl EditorApp {
         // 命令行参数：第一个参数作为初始打开文件（`open_file` 新建一个选项卡载入；
         // 之前的「复用首个空选项卡」随零 tab 启动模型一并移除——效果等价，都是只留
         // 打开的那个文件选项卡）。**显式打开文件时跳过会话恢复**（显式意图优先）。
-        if !is_detached {
+        // 仅首个主窗口（`startup=true`）执行；`new_detached` / `new_media_window` 不读
+        // CLI 首参、不恢复会话——否则媒体重定向到新窗口后，新窗口会再次读同一 CLI 参数
+        // 造成重定向循环，且会重复恢复全量会话（media_window 侧设计决策，见该模块）。
+        if startup {
             let mut args = std::env::args_os();
             args.next(); // 跳过程序名
             let mut opened_cli_file = false;
@@ -271,7 +312,7 @@ impl EditorApp {
         // 已核实本平台/GPUI 版本下最后一个窗口关闭触发 quit 不走 `App::shutdown()` →
         // `on_app_quit`（退出钩子在此是死路），故本钩子仅作**兜底**：万一某平台确实
         // 触发仍做最终同步落盘（无害）。常态保存依赖「状态变化即持久化」的连续落盘。
-        if !is_detached {
+        if startup {
             #[cfg(not(test))]
             {
                 cx.on_app_quit(|this, cx| {

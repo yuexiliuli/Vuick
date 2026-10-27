@@ -1055,11 +1055,26 @@ impl EditorApp {
         self.load_media(idx, &p, MediaKind::Pdf, window, cx);
     }
 
-    /// 打开文件：新建一个文件选项卡并在其中载入文件内容，随后把焦点移到新选项卡的编辑区。
+    /// 打开文件的中心入口：sidebar/files、palette、recent_panel、file_dialog、init CLI
+    /// 首参、会话恢复等**全部既有调用点仍调本函数**。本函数只做「媒体窗口重定向」包装——
+    /// 对音频/视频且 `media_new_window` 开启时，按纯决策分流（新窗口 / 复用媒体窗口 /
+    /// 当前窗口，见 [`crate::app::media_window`]）；否则原样在当前窗口打开。
+    /// 主体逻辑下沉到 [`Self::open_file_here`]（永不重定向，供新窗口 / 复用目标直调）。
+    pub(super) fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.maybe_redirect_media_open(path, window, cx) {
+            return;
+        }
+        self.open_file_here(path, window, cx);
+    }
+
+    /// 打开文件**本体**（由 [`Self::open_file`] 调用；新窗口/复用媒体窗口也直调本函数，
+    /// **永不重定向**——媒体重定向只发生在 `open_file` 那一个入口，防循环）。新建一个
+    /// 文件选项卡并在其中载入文件内容，随后把焦点移到新选项卡的编辑区。
     ///
     /// 先确认内容可读/可解析再创建选项卡：读取失败时只给出错误提示，
     /// 不再生成一个内容空白的标签页。
-    pub(super) fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// `pub(super)`：媒体窗口重定向（`app::media_window`，同级模块）跨窗口直调本函数。
+    pub(super) fn open_file_here(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let p = PathBuf::from(path.trim());
         // 音频文件：整窗切到音乐模式播放（不进文本/媒体选项卡路由）。此拦截在 EPUB/PDF/
         // 图片/视频/文本分类**之前**——覆盖文件树双击、打开对话框、拖放、会话恢复、

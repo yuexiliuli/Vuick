@@ -317,12 +317,18 @@ impl EditorApp {
         let _ = restore_session_from(self, &UserPrefs::session_dir(), window, cx);
     }
 
-    /// 把当前主窗口选项卡集合**立即**持久化到会话目录（连续持久化核心：关闭程序时
+    /// 把当前**主窗口**选项卡集合**立即**持久化到会话目录（连续持久化核心：关闭程序时
     /// 状态本就在盘上，天然覆盖全部退出路径——退出钩子在部分平台不触发）。
-    /// 仅在非 detached、开关开启、非恢复期间落盘；测试构建恒跳过（**绝不**触碰真实
-    /// 会话目录，验证走显式临时目录的纯逻辑 [`save_session_to`]，见 `tests/session.rs`）。
+    /// 仅在**会话责任窗口**（首个主窗口 `session_persist`）、非 detached、开关开启、
+    /// 非恢复期间落盘；测试构建恒跳过（**绝不**触碰真实会话目录，验证走显式临时目录的
+    /// 纯逻辑 [`save_session_to`]，见 `tests/session.rs`）。
+    /// `session_persist` 门控（2026-10）：媒体窗口 / 拆出窗口共享**单份**全局会话清单，
+    /// 若参与写盘会用自身选项卡（视频 tab 或空）顶替主窗口会话 → 下次启动丢失。由
+    /// `new_impl` 的 `startup` 标志初始化（media_window.rs 的 `new_media_window` 传
+    /// `startup=false`），与「退出/托盘钩子只挂主窗口」同一职责划分。
     pub(super) fn persist_session(&mut self, cx: &mut Context<Self>) {
-        if self.is_detached
+        if !self.session_persist
+            || self.is_detached
             || !self.session_restore
             || self.session_restoring
             // cfg!(test) 为编译期常量，测试构建恒短路早退；磁盘写不触碰真实 APPDATA。

@@ -226,6 +226,18 @@ impl EditorApp {
             session_restore: Some(self.session_restore),
             // 关闭到托盘开关随其它偏好一并落盘（否则一次字号/主题保存就把它重置回默认关）。
             close_to_tray: Some(self.close_to_tray),
+            // 媒体打开位置两个开关随其它偏好一并落盘（否则一次字号/主题保存就把开关重置
+            // 回默认开；K10/K41 副作用收敛：collect_prefs 是持久化唯一口径）。
+            media_new_window: Some(self.media_new_window),
+            reuse_media_window: Some(self.reuse_media_window),
+            // 媒体窗口记录尺寸一并落盘（否则一次字号/主题保存就把记录清空回 None，白记）。
+            // Size<Pixels> → (f32, f32) 逻辑像素；None（未记录）→ JSON null。
+            music_window_size: self
+                .music_window_size
+                .map(|s| (s.width.as_f32(), s.height.as_f32())),
+            video_window_size: self
+                .video_window_size
+                .map(|s| (s.width.as_f32(), s.height.as_f32())),
             // 打开文件夹的根路径随偏好落盘（首次写前为空；路径失效时 `files.root` 为
             // None → 这里写 null，下次启动不再恢复该失效文件夹）。
             opened_folder: self

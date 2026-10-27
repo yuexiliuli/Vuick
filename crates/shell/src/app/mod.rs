@@ -54,6 +54,7 @@ mod file_tree_prompt;
 mod init;
 mod layout;
 mod media;
+mod media_window;
 mod pdf_bookmarks;
 mod pdf_menu;
 mod preview;
@@ -73,8 +74,9 @@ use gpui::{
     anchored, deferred, div, px, white, Anchor, AnimationExt, AnyWindowHandle, App,
     AppContext, Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, Edges, ExternalPaths,
     FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, PromptLevel, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, VisualContext, Window, WindowBounds, WindowOptions,
+    ParentElement, Pixels, Point, PromptLevel, Render, SharedString, Size,
+    StatefulInteractiveElement, Styled, Subscription, VisualContext, Window, WindowBounds,
+    WindowOptions,
 };
 use ui::input::{InputEvent, InputState};
 use ui::menu::{PopupMenu, PopupMenuItem};
@@ -411,6 +413,23 @@ pub struct EditorApp {
     /// 「关闭到系统托盘」开关（文件 → 菜单切换，随 [`UserPrefs`] 立即持久化；默认关）。
     /// 开启时点标题栏 × / Alt+F4 隐藏到系统托盘图标（托盘菜单「退出」才真正退出）。
     close_to_tray: bool,
+    /// 「媒体在新窗口打开」开关（查看 → 菜单切换，随 [`UserPrefs`] 立即持久化；默认开）。
+    /// 开启时打开音乐/视频不在当前窗口、而在同进程新窗口（或复用已有媒体窗口，见
+    /// [`Self::reuse_media_window`]）；关闭时保持现行行为（当前窗口打开）。
+    media_new_window: bool,
+    /// 「复用已有媒体窗口」开关（查看 → 菜单切换，随 [`UserPrefs`] 立即持久化；默认开）。
+    /// 仅 `media_new_window` 开启时生效：开 = 复用最近的媒体窗口；关 = 每次新开独立窗口。
+    reuse_media_window: bool,
+    /// 音乐窗口的已记录尺寸（逻辑像素；来自 [`UserPrefs::music_window_size`]，随专用媒体
+    /// 窗口 resize 自动写回）。`Some` = 新开音乐窗口按该尺寸居中；`None` = 跟随发起窗口。
+    music_window_size: Option<Size<Pixels>>,
+    /// 视频窗口的已记录尺寸（与 [`Self::music_window_size`] 对称，音乐/视频分开记录）。
+    video_window_size: Option<Size<Pixels>>,
+    /// 媒体窗口尺寸记录的防抖落盘（[`media_window::EditorApp::record_media_window_size`]）：
+    /// 连续 resize 不逐事件写盘，停顿 [`MEDIA_SIZE_FLUSH_DEBOUNCE_MS`] 后才 persist 一次。
+    /// （读取点被 `#[cfg(not(test))]` 门控 → 测试构建报未读，属性注释压掉噪声。）
+    #[cfg_attr(test, allow(dead_code))]
+    media_size_flush_debounce: SeqAfter,
     /// 会话持久化防抖（`schedule_session_flush`）：可重入、代序作废（仿侧边栏搜索
     /// 防抖 [`Self::search_debounce`]）。内容变化 300ms 停顿后才写盘一次，不逐键写盘。
     /// （读取点 `schedule_session_flush` 被 `#[cfg(not(test))]` 门控 → 测试构建报该字段
@@ -499,6 +518,12 @@ pub struct EditorApp {
     /// 本窗口是否为「拖出拆分」生成的独立文件窗口。是 → 把选项卡拖出窗口 = 还原回主窗口；
     /// 否（主窗口）→ 把选项卡拖出窗口 = 拆分出新的独立窗口。
     is_detached: bool,
+    /// 会话持久化责任窗口：仅**首个主窗口**（`new_impl` 的 `startup=true`）为 true。
+    /// 媒体窗口 / 拆出窗口为 false——会话清单是**单份全局文件**（`session/session.json`），
+    /// 非主窗口若参与 `persist_session` 会用它自己的选项卡覆盖主窗口清单（打开视频即触发
+    /// `make_tab` 的即时落盘 → 下次启动主窗口会话被视频选项卡顶替丢失）。见 session.rs
+    /// `persist_session` 门控与 init.rs `new_impl`。
+    session_persist: bool,
     /// 图片/视频右键「锁定/解锁」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
     media_lock_menu_pos: Option<Point<Pixels>>,
     /// 已打开的媒体右键菜单实体（随位置同生同灭）。
@@ -564,6 +589,10 @@ pub struct EditorApp {
     /// 「跟随系统主题」时的外观变化订阅（`Window::observe_window_appearance`）；
     /// 离开跟随模式后回调只是空返，切换回跟随会立即按当前系统落地一次。
     _appearance_sub: Option<Subscription>,
+    /// 专用媒体窗口（`new_media_window` 创建）的尺寸变化订阅（`observe_window_bounds`）：
+    /// 用户 resize 后按当前角色自动记录音乐/视频窗口尺寸到 config.json（下次新开按记录
+    /// 尺寸）。主窗口 / 拖出窗口 / 复用目标不注册（不记录），`None` 即未注册。
+    _bounds_sub: Option<Subscription>,
     /// 命令面板（P2-8）：打开时为 `Some`，选择/Esc/点击外（`DismissEvent`）关闭后清空。
     /// 面板是独立 `CommandPalette` 实体（query/选中/模式/条目自持），新建即情境。
     palette: Option<gpui::Entity<ui::palette::CommandPalette>>,

@@ -233,9 +233,82 @@ impl EditorApp {
         .item(Self::menu_action_item(
             TOGGLE_MUSIC_PLAYER.menu_label,
             TOGGLE_MUSIC_PLAYER.shortcut,
-            weak,
+            weak.clone(),
             |this, window, cx| this.toggle_music_player(window, cx),
         ))
+        .separator()
+        // 媒体打开位置偏好（与「音乐播放器」同区、加分隔）：媒体在新窗口打开 /
+        // 复用已有媒体窗口（☑/☐ 动态项，切换即持久化，见 media_window.rs）。
+        .item(Self::media_new_window_menu_item(weak.clone()))
+        .item(Self::reuse_media_window_menu_item(weak))
+    }
+
+    /// 「媒体在新窗口打开」菜单项：动态显示当前开关状态（前导 ☑/☐），点击切换并立即
+    /// 持久化（同 [`Self::wrap_menu_item`] 的 ☑/☐ 动态项模式）。
+    fn media_new_window_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        let weak2 = weak.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let on = weak
+                .upgrade()
+                .map(|e| e.read(cx).media_new_window)
+                .unwrap_or(true);
+            let chrome = ui::theme::ChromeColors::for_mode(
+                ui::theme::Theme::global(cx).is_dark(),
+            );
+            let label = format!("{} {}", if on { "☑" } else { "☐" }, "媒体在新窗口打开");
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(label)
+                .child(div().text_color(chrome.text_tertiary).child(""))
+        })
+        .on_click(move |_, window, cx| {
+            let _ = weak2.update(cx, |this, cx| this.toggle_media_new_window(window, cx));
+        })
+    }
+
+    /// 「复用已有媒体窗口」菜单项：动态显示当前开关状态（前导 ☑/☐），点击切换并立即
+    /// 持久化。`media_new_window` 关闭时**置灰**（渲染期灰字 + 点击期兜底拒绝）——该项
+    /// 只在「新窗口打开」开启时才有意义。
+    fn reuse_media_window_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        let weak2 = weak.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let enabled = weak
+                .upgrade()
+                .map(|e| e.read(cx).media_new_window)
+                .unwrap_or(true);
+            let on = weak
+                .upgrade()
+                .map(|e| e.read(cx).reuse_media_window)
+                .unwrap_or(true);
+            let chrome = ui::theme::ChromeColors::for_mode(
+                ui::theme::Theme::global(cx).is_dark(),
+            );
+            let label = format!("{} {}", if on { "☑" } else { "☐" }, "复用已有媒体窗口");
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                // 置灰：media_new_window 关闭时该开关无意义（popup 菜单项 disabled 在构件
+                // 期设置、此处无 App 上下文，改用渲染期灰字 + 点击期兜底拒绝，双保险）。
+                .child(
+                    div()
+                        .text_color(if enabled {
+                            chrome.text_primary
+                        } else {
+                            chrome.text_tertiary
+                        })
+                        .child(label),
+                )
+        })
+        .on_click(move |_, window, cx| {
+            let _ = weak2.update(cx, |this, cx| this.toggle_reuse_media_window(window, cx));
+        })
     }
 
     /// "帮助"菜单。

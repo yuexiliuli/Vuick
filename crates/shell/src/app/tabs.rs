@@ -1114,7 +1114,11 @@ impl EditorApp {
                 if !app.tabs.is_empty() {
                     app.remove_tab(0, w, cx); // 占位空选项卡让位
                 }
-                app.open_path_or_activate(&reopen, w, cx);
+                // 直调 `open_file_here`（而非 `open_file`）：本动作的目标窗口就是刚建的新
+                // detached 窗口，若走 `open_file` 的媒体重定向，视频会被再投到媒体窗口、
+                // 留下空 detached 窗口（media_window.rs 分流只认 `open_file` 一个入口）。
+                // 新窗口不含该路径 → 无需「已开则激活」分支。
+                app.open_file_here(&reopen.to_string_lossy(), w, cx);
             });
         });
     }

@@ -228,6 +228,16 @@ impl EditorApp {
             // 会话恢复 / 关闭到托盘开关：以导入值为准（诚实跟随，含显式 false）。
             self.session_restore = prefs.session_restore.unwrap_or(true);
             self.close_to_tray = prefs.close_to_tray.unwrap_or(false);
+            // 媒体打开位置两个开关：以导入值为准（诚实跟随，含显式 false），即时生效。
+            self.media_new_window = prefs.media_new_window.unwrap_or(true);
+            self.reuse_media_window = prefs.reuse_media_window.unwrap_or(true);
+            // 媒体窗口记录尺寸：以导入值为准（None = 还原为「新开跟随发起窗口大小」）。
+            self.music_window_size = prefs
+                .music_window_size
+                .map(|(w, h)| gpui::size(px(w), px(h)));
+            self.video_window_size = prefs
+                .video_window_size
+                .map(|(w, h)| gpui::size(px(w), px(h)));
             // 最近打开列表随配置恢复。
             self.recent_folders = prefs.recent_folders;
             self.recent_files = prefs.recent_files;

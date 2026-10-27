@@ -9,6 +9,7 @@ include!("tests/preview.rs");
 include!("tests/scroll_sync.rs");
 include!("tests/tab_bar.rs");
 include!("tests/file_open.rs");
+include!("tests/media_window.rs");
 include!("tests/music.rs");
 include!("tests/file_tree.rs");
 include!("tests/pdf_epub.rs");

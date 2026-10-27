@@ -109,7 +109,12 @@
         std::fs::write(&p, b"OggS placeholder").unwrap();
         let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+            app.update(cx, |app, cx| {
+                // 断言对象是「当前窗口音乐模式路由」：显式关掉媒体重定向开关（默认开），
+                // 否则 `open_file` 会把音频改投同进程新窗口（见 media_window.rs 行为表）。
+                app.media_new_window = false;
+                app.open_file(p.to_str().unwrap(), window, cx);
+            });
         });
         for _ in 0..8 {
             cx.run_until_parked();
