@@ -12,7 +12,16 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1.0"
 # 构建期需 FFMPEG_DIR（头文件/导入库）+ LIBCLANG_PATH（bindgen），见仓库 scripts/setup-ffmpeg.ps1。
-ffmpeg-next = "9.0"
+# feature 剪枝（2026-10-27）：default 含 device/filter 但代码不用（无 filter graph / 无设备输入），
+# 关掉后 avdevice-*.dll / avfilter-*.dll 不再被链接器导入 → 分发从 FFMPEG_DIR\bin\*.dll 全量
+# （约 230MB）降到仅 5 件（avcodec/avformat/avutil/swresample/swscale，约 121MB）。
+# 硬解（d3d11va/dxva2）走 avutil `av_hwdevice_*` 与 avcodec hwaccel，不依赖这两个 feature。
+ffmpeg-next = { version = "9.0", default-features = false, features = [
+    "codec",
+    "format",
+    "software-resampling",
+    "software-scaling",
+] }
 # 外部 D3D11 设备注入（零回读 GPU 直通）：open_external_hw 用 windows::core::IUnknown 的
 # AddRef/Release 持有调用方设备引用；测试用 D3D11CreateDevice 建设备。features 仅取所需
 # 最小集（版本随 workspace 0.62）：Direct3D11 生成的类型内部引用 Direct3D（D3D_DRIVER_TYPE/
