@@ -270,6 +270,26 @@ impl Drop for VideoReader {
     }
 }
 
+/// `decoder.receive_frame` 返回分类（F5）：`Ok` = 产出一帧；`Eof` = `AVERROR_EOF` 优雅
+/// 结束（解码器已把缓冲排空，这是正常的流末尾，语义保持 `Ok(None)`）；`Error` = 真实
+/// 解码/分配失败（如 GFP 帧分配失败、解码器内部错误），**必须上报**而不得静默当成
+/// EOF 结束——否则视频中途解码失败会表现为「干净播完」的静默停播，无法诊断。
+#[derive(Debug)]
+enum ReceiveStatus {
+    Ok,
+    Eof,
+    Error(ffmpeg::Error),
+}
+
+/// 见 [`ReceiveStatus`]：`receive_frame` 的返回 → 分类（纯函数、无 FFmpeg 实例，可单测）。
+fn classify_receive(r: Result<(), ffmpeg::Error>) -> ReceiveStatus {
+    match r {
+        Ok(()) => ReceiveStatus::Ok,
+        Err(ffmpeg::Error::Eof) => ReceiveStatus::Eof,
+        Err(e) => ReceiveStatus::Error(e),
+    }
+}
+
 impl VideoReader {
     /// 打开媒体并定位视频流（失败返回带原因的 [Error] 链）；按源码全尺寸解码。
     #[allow(dead_code)] // 测试与外部语义入口用；查看器走 `open_scaled`（不额外预开 reader）
@@ -578,9 +598,23 @@ impl VideoReader {
                         self.drained = true;
                     }
                     let mut f = ffmpeg::frame::Video::empty();
-                    while self.decoder.receive_frame(&mut f).is_ok() {
-                        if let Some(v) = accept(self, &f)? {
-                            return Ok(Some(v));
+                    // F5：`receive_frame(...).is_ok()` 会把**真实解码错误**（GFP 帧分配失败 /
+                    // 解码器内部错误等非 AVERROR_EOF 负码）也一律当 EOF 吞掉 → 中途解码失败
+                    // 表现为「干净播完」的静默停播，无法诊断。这里区分 EOF（优雅结束，返回
+                    // Ok(None)）与真实错误（返回 Err 上报，不再静默当 EOF）。
+                    loop {
+                        match classify_receive(self.decoder.receive_frame(&mut f)) {
+                            ReceiveStatus::Ok => {
+                                if let Some(v) = accept(self, &f)? {
+                                    return Ok(Some(v));
+                                }
+                            }
+                            ReceiveStatus::Eof => break, // 优雅结束：缓冲 drain 完
+                            ReceiveStatus::Error(e) => {
+                                return Err(anyhow!(
+                                    "视频解码 drain 中途失败（非 EOF 的真实错误，不再静默当播完）: {e}"
+                                ));
+                            }
                         }
                     }
                     return Ok(None);
@@ -781,13 +815,34 @@ impl VideoReader {
         if out.len() < need {
             return Err(anyhow!("解码输出缓冲过小: {} < 需要 {}", out.len(), need));
         }
-        out[..need].copy_from_slice(&bgra.data(0)[..need]);
+        copy_bgra_rows(
+            &mut out[..need],
+            bgra.data(0),
+            bgra.stride(0),
+            self.out_width as usize,
+            self.out_height as usize,
+        );
         let secs = self.pts_seconds(pts);
         Ok(Some((secs, self.out_width, self.out_height)))
     }
 }
 
 // ---------------- 尺寸换算（decode-to-display）----------------
+
+/// 逐行拷贝 BGRA：sws 输出帧的 `linesize`（`stride`）按 32 字节对齐，
+/// 输出宽 `w*4 % 32 != 0`（即 `w % 8 != 0`，奇宽源或降采样 round 出非 8 倍数）时
+/// **每行行尾有填充**——整段 `copy_from_slice` 会把下一行起点错位、成斜纹错画。
+/// 这里按源行步长 `src_linesize` 逐行拷 `w*4` 实字节进**连续**的 `dst`，行尾填充
+/// 丢弃（`dst` 是上层连续 BGRA 缓冲，每行 w*4 字节）。
+fn copy_bgra_rows(dst: &mut [u8], src: &[u8], src_linesize: usize, w: usize, h: usize) {
+    let row = w * 4;
+    debug_assert!(dst.len() >= row * h, "输出缓冲不足: {} < {}*4*{}", dst.len(), w, h);
+    for r in 0..h {
+        let s_off = r * src_linesize;
+        let d_off = r * row;
+        dst[d_off..d_off + row].copy_from_slice(&src[s_off..s_off + row]);
+    }
+}
 
 /// 按「长边 ≤ `max_dim`」下采样保持宽高比：源码已在界内则原样返回；
 /// `max_dim=0` 视为不限制。输出至少 1×1（避免 sws 空输出）。

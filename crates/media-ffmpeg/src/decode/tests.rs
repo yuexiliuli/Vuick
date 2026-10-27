@@ -1321,3 +1321,106 @@ fn audio_seek_mkv_env_facsq_filter_path_runs() {
     assert!(decoded > 0, "MKV 音轨 seek 后应解出音频，实得 {decoded}");
     assert!(after >= before, "过滤计数不倒退");
 }
+
+/// F2 回归：BGRA 输出行步长（pitch）假定 → 斜纹错画。sws 输出帧 `linesize` 32 字节对齐
+/// 且通常 > `w*4`（输出宽 `w%8≠0` 时必有行尾填充），旧整段 `copy_from_slice` 会把下一行
+/// 起点错位成斜纹。`copy_bgra_rows` 逐行按 `w*4` 拷、丢弃行尾填充——构造
+/// `linesize=64 > w*4=20` 的假源（行尾填 0xEE 模拟填充区），断言输出逐行逐像素无错位。
+#[test]
+fn copy_bgra_rows_drops_padding_no_skew() {
+    let (w, h) = (5usize, 3usize); // w*4=20；linesize=64 → 行尾 44 字节填充
+    let row = w * 4;
+    let linesize = 64usize;
+    let mut src = vec![0xEEu8; linesize * h];
+    for r in 0..h {
+        for (i, px) in src[r * linesize..r * linesize + row].chunks_mut(4).enumerate() {
+            px.copy_from_slice(&[r as u8, i as u8, (r + i) as u8, 255]);
+        }
+    }
+    let mut dst = vec![0u8; row * h];
+    copy_bgra_rows(&mut dst, &src, linesize, w, h);
+    for r in 0..h {
+        for i in 0..w {
+            let off = (r * w + i) * 4;
+            assert_eq!(
+                &dst[off..off + 4],
+                &[r as u8, i as u8, (r + i) as u8, 255],
+                "行 {r} 像素 {i} 错位（斜纹未修：整段拷贝把填充算进行距）"
+            );
+        }
+    }
+    // 行尾填充确实被丢弃：dst 恒为连续 row*h 字节（无 0xEE 泄漏）
+    assert!(
+        !dst.contains(&0xEE),
+        "行尾填充不得泄漏进连续输出缓冲"
+    );
+}
+
+/// F5 回归：`classify_receive` 把 `receive_frame` 返回分三类——`Ok` 出帧 / `AVERROR_EOF`
+/// 优雅结束 / 其它负码 = 真实解码错误（不得静默当 EOF 吞掉）。无需 FFmpeg 实例，直接对
+/// 假返回值测各分支。
+#[test]
+fn classify_receive_distinguishes_eof_from_real_errors() {
+    match classify_receive(Ok(())) {
+        ReceiveStatus::Ok => {}
+        other => panic!("Ok 应分类为 Ok，实得 {other:?}"),
+    }
+    match classify_receive(Err(ffmpeg::Error::Eof)) {
+        ReceiveStatus::Eof => {}
+        other => panic!("AVERROR_EOF 应分类为 Eof，实得 {other:?}"),
+    }
+    match classify_receive(Err(ffmpeg::Error::InvalidData)) {
+        ReceiveStatus::Error(_) => {}
+        other => panic!("真实解码错误应分类为 Error，实得 {other:?}"),
+    }
+    // GFP 分配失败（AVERROR(ENOMEM) → Other{errno}）必须归 Error 而非 Eof
+    match classify_receive(Err(ffmpeg::Error::Other { errno: 12 })) {
+        ReceiveStatus::Error(_) => {}
+        other => panic!("GFP ENOMEM 应分类为 Error，实得 {other:?}"),
+    }
+}
+
+/// F6 回归：字幕文本 UTF-8 BOM（\u{FEFF}）剥除。带 BOM 的 SRT/ASS 包 → 首字符无 BOM；
+/// 旧式 ASS `Dialogue:` 整行带 BOM 也能被识别（走行内时间解析，而非错误地落包 PTS 分支
+/// 导致时间错位）；MKV 新块格式带 BOM 同样取正文无 BOM。
+#[test]
+fn subtitle_bom_is_stripped_and_ass_dialogue_detected() {
+    use ffmpeg::Rational;
+
+    // SRT 带 BOM：首字符不应残留 \u{feff}
+    let srt = "\u{feff}第一句字幕";
+    let pkt = ffmpeg::packet::Packet::copy(srt.as_bytes());
+    let e = SubtitleReader::parse_subtitle_packet(&pkt, Rational::new(1, 1000), SubtitleFormat::SRT)
+        .expect("SRT 带 BOM 应解析出条目");
+    assert!(
+        !e.text.starts_with('\u{feff}'),
+        "SRT 首字符不应残留 BOM，实得 {:?}",
+        e.text
+    );
+    assert_eq!(e.text, "第一句字幕");
+
+    // 旧式 ASS `Dialogue:` 整行带 BOM：必须命中 Dialogue 分支（行内时间生效）
+    let ass = "\u{feff}Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好世界";
+    let pkt = ffmpeg::packet::Packet::copy(ass.as_bytes());
+    let e = SubtitleReader::parse_subtitle_packet(&pkt, Rational::new(1, 1000), SubtitleFormat::ASS)
+        .expect("ASS Dialogue 带 BOM 应解析出条目");
+    assert!(!e.text.starts_with('\u{feff}'), "ASS 文本不应残留 BOM");
+    assert_eq!(e.text, "你好世界", "Dialogue 行应走行内时间解析提取正文");
+    assert!(
+        (e.start_pts - 1.0).abs() < 1e-9,
+        "Dialogue 行内开始时间 1.0s 应生效，实得 {:.4}",
+        e.start_pts
+    );
+    assert!(
+        (e.end_pts - 2.0).abs() < 1e-9,
+        "Dialogue 行内结束时间 2.0s 应生效，实得 {:.4}",
+        e.end_pts
+    );
+
+    // Matroska 新块格式（无 Dialogue 前缀）带 BOM：剥后仍按包 PTS 分支取第 9 字段正文
+    let mkv_block = "\u{feff}0,0,Default,,0,0,0,,第二句字幕";
+    let pkt = ffmpeg::packet::Packet::copy(mkv_block.as_bytes());
+    let e = SubtitleReader::parse_subtitle_packet(&pkt, Rational::new(1, 1000), SubtitleFormat::ASS)
+        .expect("MKV 新块带 BOM 应解析出条目");
+    assert_eq!(e.text, "第二句字幕", "MKV 新块应取正文且无 BOM");
+}

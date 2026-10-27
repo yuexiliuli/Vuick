@@ -158,15 +158,20 @@ impl SubtitleReader {
     ///    开始/结束时间不在行内，由**包 PTS + duration** 提供）。本仓 `视频测试字幕.mkv`
     ///    即此姿势：首包数据 `0,0,Default,,0,0,0,,<字幕文本>`，pts=20050ms、
     ///    duration=1980ms → start≈20.05s、end≈22.03s。
-    fn parse_subtitle_packet(
+    pub(crate) fn parse_subtitle_packet(
         pkt: &ffmpeg::Packet,
         time_base: ffmpeg::Rational,
         format: SubtitleFormat,
     ) -> Option<SubtitleEntry> {
         let data = pkt.data()?;
-        let Ok(text) = std::str::from_utf8(data) else {
+        let Ok(mut text) = std::str::from_utf8(data) else {
             return None;
         };
+        // F6：剥 UTF-8 BOM（\u{FEFF}）：SRT/MKV 带 BOM 时 `trim()` 不去 BOM（BOM 不是
+        // 空白），首字符会残留 BOM；且 ASS 老式 `Dialogue:` 行因 BOM 前缀 `starts_with`
+        // 不命中 → 错误走包 PTS 分支、时间错位。在解析入口剥一次，`Dialogue:` 与 8/9
+        // 字段检查都在剥之后进行。
+        text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let text = text.trim();
         if text.is_empty() {
             return None;
