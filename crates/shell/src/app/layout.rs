@@ -271,8 +271,9 @@ impl EditorApp {
             out.push(self.render_body_sidebar(body, window, cx).into_any_element());
             out.push(self.render_status_bar(window, cx).into_any_element());
         }
-        // 右键菜单 Overlay（媒体锁定 + 选项卡栏 + 文件树）恒在最上层（通知层提升到外层根最后绘制，见 render_root）
+        // 右键菜单 Overlay（媒体锁定 + PDF 页操作 + 选项卡栏 + 文件树）恒在最上层（通知层提升到外层根最后绘制，见 render_root）
         out.push(self.render_media_lock_menu(window, cx).into_any_element());
+        out.push(self.render_pdf_menu(window, cx).into_any_element());
         out.push(self.render_tab_bar_menu(window, cx).into_any_element());
         out.push(self.render_file_tree_menu(window, cx).into_any_element());
         out.push(self.render_recent_panel(window, cx).into_any_element());

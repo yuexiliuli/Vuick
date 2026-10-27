@@ -35,14 +35,69 @@ impl EditorApp {
     /// 订阅**随选项卡持有**（`_pdf_sub`）：多 PDF 并存各自独立，取代旧单槽 `_pdf_observe`
     /// （被后打开者覆盖 → 先打开 PDF 的 notify 丢失）；关选项卡 / 拔除时随 `EditorTab`
     /// 一起 drop 自动退订。
+    /// Phase B2：observe 回调里顺带对 `last_modify_error` **变化**（None→Some）弹一次
+    /// toast——页操作（插页/删页/注释/提取）的异步 worker 失败在这里透出（K29/K30：
+    /// 成功由重载后的可见变化呈现，失败必须有用户可见提示）。
     pub(super) fn subscribe_pdf(
         &mut self,
         idx: usize,
         pdf: &gpui::Entity<pdf::PdfViewer>,
         cx: &mut Context<Self>,
     ) {
+        let pdf2 = pdf.clone();
         let tab = self.tabs.get_mut(idx).expect("PDF 订阅需选项卡在场");
-        tab._pdf_sub = Some(cx.observe(pdf, |_this, _e, cx| cx.notify()));
+        tab._pdf_sub = Some(cx.observe(pdf, move |this, _e, cx| {
+            // 待保存模型（P1）：observe 顺带把 PDF 的 dirty（待存注释/页面操作）同步到
+            // 选项卡 `dirty`——tab 栏圆点／关闭提示据此生效。
+            this.sync_pdf_dirty(&pdf2, cx);
+            // 另存为后 viewer.path 重指向新路径 → 选项卡标题/路径随之同步（否则 tab 栏
+            // 仍显示旧文件名，与实际保存位置不符）。
+            this.sync_pdf_path(&pdf2, cx);
+            this.pdf_notify_last_error(&pdf2, cx);
+            cx.notify();
+        }));
+    }
+
+    /// 把 PDF 阅读器的当前真实路径同步回选项卡 `file_path`（另存为后随 `viewer.path`
+    /// 重指向新路径；tab 栏标题 / 书签 / 会话持久化据此保持正确）。只按变化写（幂等，
+    /// 避免每次 observe 通知都写）。对非 PDF 路径无副作用。
+    pub(super) fn sync_pdf_path(
+        &mut self,
+        pdf: &gpui::Entity<pdf::PdfViewer>,
+        cx: &App,
+    ) {
+        let path = pdf.read(cx).path();
+        let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.reader, MediaReader::Pdf(p) if p.entity_id() == pdf.entity_id()))
+        else {
+            return;
+        };
+        if self.tabs[idx].file_path.as_deref() != Some(path) {
+            self.tabs[idx].file_path = Some(path.to_path_buf());
+        }
+    }
+
+    /// 把 PDF 阅读器的「是否有待保存修改」同步到承载它的选项卡 `dirty`（P1 待保存模型）：
+    /// 注释/页面操作 → 置真（tab 圆点亮、关闭弹保存提示）；`save()` 成功后 observe 再来 →
+    /// 置假。只按 `dirty` 从假→真 或 真→假 变化时写（幂等，避免每帧刷写）。
+    pub(super) fn sync_pdf_dirty(
+        &mut self,
+        pdf: &gpui::Entity<pdf::PdfViewer>,
+        cx: &App,
+    ) {
+        let dirty = pdf.read(cx).is_dirty();
+        let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.reader, MediaReader::Pdf(p) if p.entity_id() == pdf.entity_id()))
+        else {
+            return;
+        };
+        if self.tabs[idx].dirty != dirty {
+            self.tabs[idx].dirty = dirty;
+        }
     }
 
     /// 编辑器「光标 / 选区变化」（不修改文本）：刷新选项卡缓存的行/列。轻量路径——

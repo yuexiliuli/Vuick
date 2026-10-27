@@ -105,6 +105,43 @@ impl WindowSig {
     }
 }
 
+/// Phase B1：选中文字后自动弹出的操作卡片（复制/高亮/删除线/下划线）状态。
+/// 拖选结束（`mouse_up` 且曾 `selecting`）且选区非空 → 弹卡；点卡片外 / 重新拖选 /
+/// 滚动 / Esc → 关闭。`scroll` 快照用于在 `ensure_window` 里侦测「滚动即关闭」。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelCard {
+    /// 卡片锚点（**窗口坐标**，供 `deferred(anchored(Window))` 定位）。
+    pub pos: gpui::Point<Pixels>,
+    /// 打开瞬间的滚动容器偏移（随后滚动即关闭）。
+    pub scroll: gpui::Point<Pixels>,
+}
+
+/// 一条**待保存**注释（待保存模型 P1）：只进内存叠加层渲染，`save()` 时才由 worker
+/// 合并写盘。`quads_pt` 为页内 PDF 点矩形（y 向上），与写回几何共用同一坐标语义。
+#[derive(Debug, Clone)]
+pub(crate) struct PendingAnnot {
+    /// 本阅读器内自增唯一 id（撤销/删除注释定位用；不改动写回内容）。
+    pub id: u64,
+    /// 所属页（0 基；页面操作插入/删除后随页号平移/丢弃）。
+    pub page: usize,
+    /// 注释类型（高亮/删除线/下划线）。
+    pub kind: AnnotKind,
+    /// 覆盖该条注释的字符区域（PDF 点矩形，可多行）。
+    pub quads_pt: Vec<QuadPt>,
+}
+
+/// 待保存撤销栈条目（`VecDeque` 尾部 = 最近；Ctrl+Z 弹尾部逆操作）。
+#[derive(Debug)]
+pub(crate) enum UndoEntry {
+    /// 撤销「添加注释」：按 id 从 pending 移除该条。
+    RemoveAnnot { id: u64 },
+    /// 撤销「删除注释」：把整条注释重新加回 pending。
+    AddAnnotBack { annot: PendingAnnot },
+    /// 撤销「插入/删除页面」：恢复页面操作前的内存工作副本字节 + 操作前待存注释快照，
+    /// 并把页操作计数回退（渲染由 worker 内存级重载完成）。
+    RestoreMemory { bytes: Vec<u8>, annots_before: Vec<PendingAnnot> },
+}
+
 use config::pdf::{
     COVER_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES,
     TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE,
@@ -117,8 +154,9 @@ use crate::pdf::layout::{
     selection_spans_pt, visible_tile_range, Slot, TileSlot,
 };
 use crate::pdf::{
-    render_image_from_bgra, DocId, PageText, PdfOutlineEntry, PdfSearchHit, PdfSearchResults,
-    PdfWorker, RenderRequest, RenderResult, TileRequest, TileResult,
+    render_image_from_bgra, AnnotKind, AnnotateItem, AnnotationInfo, DocId, PageText,
+    PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfWorker, QuadPt, RenderRequest,
+    RenderResult, TileRequest, TileResult,
 };
 use viewer::pan_zoom;
 /// 是否开启视图侧计时日志（`GPUI_EDITOR_PDF_TIMING=1`，进程内缓存一次）。
@@ -253,6 +291,27 @@ pub struct PdfViewer {
     /// 已被静态帧门控跳过的帧计数（Sprint 5）：门控分支每命中一次 +1。纯观测计数
     /// （静态跳过分支每次 ~1ns），供回归测试断言「静置帧确实跳过调度、变化帧不门」。
     pub(crate) idle_gate_skips: u64,
+    /// 重载锚点：写回成功后重开文档应恢复到的目标页（0 基；None=维持当前第一可见页）。
+    /// 由 [`super::open::PdfViewer::submit_modify`] 在提交时按操作语义设定，`start_load`
+    /// 打开成功铺槽后消费（插入保持在原页之后 / 删除夹取到合法页）。
+    pub(crate) reload_anchor: Option<usize>,
+    /// 最近一次写回/页操作失败的文案（成功或未操作时为 None）。Phase B 弹卡/提示用。
+    pub(crate) last_modify_error: Option<String>,
+    /// Phase B1：选中文字后自动弹出的操作卡片（`None` = 未弹出）。
+    pub(crate) sel_card: Option<SelCard>,
+    // ---- 待保存模型（P1）：内存待存注释 / 撤销栈 / 页面操作待存 / 灰框焦 ----
+    /// 待保存注释列表（内存叠加层渲染；`save()` 时合并写盘后清空）。
+    pub(crate) pending_annots: Vec<PendingAnnot>,
+    /// 待保存撤销栈（尾部 = 最近；Ctrl+Z 弹尾部执行逆操作；save 后清空）。
+    pub(crate) undo_stack: VecDeque<UndoEntry>,
+    /// 页面结构操作计数（插入/删除在途即 +1；撤销复原 -1；save 后清零）。
+    /// dirty = `注释非空 || 页操作计数 != 0` 的派生源，见 [`Self::is_dirty`]。
+    pub(crate) pending_page_ops: usize,
+    /// 注释 id 自增计数器（[`PendingAnnot::id`] 分配用）。
+    pub(crate) next_annot_id: u64,
+    /// 当前点击命中的「灰框」注释 id（点击注释文字显示其包围灰框；右键 → 菜单
+    /// 含「删除注释」）。`None` = 无灰框。
+    pub(crate) focused_annot: Option<u64>,
 }
 
 // 实现（impl）按职责拆分至 `view/<sub>.rs` 子模块：
@@ -321,6 +380,14 @@ mod tests {
                     window_sig: None,
                     window_settled: false,
                     idle_gate_skips: 0,
+                    reload_anchor: None,
+                    last_modify_error: None,
+                    sel_card: None,
+                    pending_annots: Vec::new(),
+                    undo_stack: VecDeque::new(),
+                    pending_page_ops: 0,
+                    next_annot_id: 0,
+                    focused_annot: None,
                 };
                 // 先滚到文档中段（纵向负偏移），作为缩放重锚的基准
                 v.scroll.set_offset(gpui::point(px(-40.0), px(-1200.0)));
@@ -445,5 +512,105 @@ mod tests {
             super::render::page_base_image(None, None, None, None).is_none(),
             "全空才落「加载中」占位"
         );
+    }
+
+    /// 待保存模型（P1）纯逻辑状态机（最小 viewer，无 worker / 无 pdfium）：加注释 →
+    /// dirty / pending / 撤销栈；Ctrl+Z 撤销 → 移除该条；删除注释（灰框右键）→ dirty 回落；
+    /// 再撤销 → 恢复该条。全链路零磁盘（无 worker 即证不触碰磁盘路径）。
+    #[gpui::test]
+    async fn pending_annot_lifecycle_add_undo_delete(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        let viewer: gpui::Entity<PdfViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let dims = vec![(612.0, 792.0)];
+                let (tops, total) = compute_layout(&dims, PAGE_WIDTH);
+                PdfViewer {
+                    path: "dummy.pdf".into(),
+                    worker: None,
+                    doc_id: 0,
+                    dims,
+                    page_tops: tops,
+                    total_height: total,
+                    slots: Vec::new(),
+                    pending_thumb: HashMap::new(),
+                    pending_mid: HashMap::new(),
+                    mid_lru: VecDeque::new(),
+                    pending_tiles: HashMap::new(),
+                    pending_cover: HashMap::new(),
+                    tile_bytes: 0,
+                    tile_pump_running: false,
+                    last_scroll_y: 0.0,
+                    scroll_velocity: 0.0,
+                    prev_fast: false,
+                    scroll: ScrollHandle::new(),
+                    loading: false,
+                    load_error: None,
+                    bg: None,
+                    pending_drops: Vec::new(),
+                    outlines: Vec::new(),
+                    focus_handle: cx.focus_handle(),
+                    text_pages: HashMap::new(),
+                    text_lru: VecDeque::new(),
+                    pending_text: HashMap::new(),
+                    sel_anchor: None,
+                    sel_active: None,
+                    selecting: false,
+                    search_query: String::new(),
+                    search_matches: Vec::new(),
+                    search_truncated: false,
+                    search_active: 0,
+                    search_pending: None,
+                    search_pending_seq: 0,
+                    search_seq: 0,
+                    zoom: 1.0,
+                    base_w: PAGE_WIDTH,
+                    window_sig: None,
+                    window_settled: false,
+                    idle_gate_skips: 0,
+                    reload_anchor: None,
+                    last_modify_error: None,
+                    sel_card: None,
+                    pending_annots: Vec::new(),
+                    undo_stack: VecDeque::new(),
+                    pending_page_ops: 0,
+                    next_annot_id: 0,
+                    focused_annot: None,
+                }
+            })
+        });
+
+        let quad = || vec![[60.0_f32, 100.0, 200.0, 120.0]];
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                assert!(!v.is_dirty(), "初始非脏");
+                // 加一条高亮 → pending/dirty/撤销栈
+                v.add_annotation(0, AnnotKind::Highlight, quad(), cx);
+                assert_eq!(v.pending_annot_count(), 1, "加注释后 pending=1");
+                assert!(v.is_dirty(), "加注释后置脏");
+                assert_eq!(v.undo_stack.len(), 1, "加注释记一条撤销");
+
+                // Ctrl+Z → 移除该条、dirty 回 0
+                v.undo_last(cx);
+                assert_eq!(v.pending_annot_count(), 0, "撤销后 pending=0");
+                assert!(!v.is_dirty(), "撤销后非脏");
+
+                // 再加一条 → 灰框右键删除（delete_pending_annot）→ pending=0、dirty 回 0
+                v.add_annotation(0, AnnotKind::Underline, quad(), cx);
+                let id = v.pending_annots[0].id;
+                assert!(v.focused_annot_id().is_none(), "未点击前无灰框焦");
+                v.delete_pending_annot(id, cx);
+                assert_eq!(v.pending_annot_count(), 0, "删除注释后 pending=0");
+                assert!(!v.is_dirty(), "删空后非脏");
+
+                // Ctrl+Z 恢复删除 → pending=1/dirty；再 Ctrl+Z 撤销添加 → 归零且撤销栈空
+                v.undo_last(cx);
+                assert_eq!(v.pending_annot_count(), 1, "撤销删除后该注释恢复");
+                assert!(v.is_dirty(), "恢复后置脏");
+                v.undo_last(cx);
+                assert_eq!(v.pending_annot_count(), 0, "撤销添加后 pending=0");
+                assert!(!v.is_dirty(), "全撤销后非脏");
+                assert!(v.undo_stack.is_empty(), "撤销栈耗尽");
+            })
+        });
     }
 }

@@ -7,6 +7,7 @@
 //! 叠加函数（`selection_overlays_for_page` / `search_overlays_for_page`）亦在本模块。
 
 use super::*;
+use gpui::prelude::FluentBuilder as _;
 
 /// 选区背景色（半透蓝；深浅两版，与 markdown 预览同一套色值，视觉统一）。
 fn selection_color(cx: &App) -> Hsla {
@@ -83,6 +84,143 @@ fn search_hit_color(cx: &App) -> Hsla {
 /// 检索激活命中的高亮色：橙（更醒目）。
 fn search_active_color() -> Hsla {
     rgba(0xf59e0bcc).into()
+}
+
+// ---- 待保存注释叠加层（P1：内存叠加渲染，零重载零闪烁；save() 才落盘）----
+
+/// 待存高亮底色：半透明黄（叠在纸面之上、不遮正文；与写盘默认注释色同源系）。
+fn annot_highlight_color() -> Hsla {
+    rgba(0xffe67866).into()
+}
+
+/// 待存删除线色：红（不透明细条）。
+fn annot_strike_color() -> Hsla {
+    rgba(0xe63c3cff).into()
+}
+
+/// 待存下划线色：蓝（不透明细条）。
+fn annot_underline_color() -> Hsla {
+    rgba(0x3c78e6ff).into()
+}
+
+/// 灰框（点击命中的待存注释包围盒）边框色：中性灰——与选中高亮蓝（`selection_color`）、
+/// 检索命中蓝/橙、折叠/点击高亮等所有既有叠加色**均可区分**（仓库既有「点击 vs 折叠
+/// 高亮颜色必须不同」先例同精神）。
+fn annot_focus_frame_color() -> Hsla {
+    rgba(0x6b6b6bdd).into()
+}
+
+/// 某页的**待存注释**叠加层元素（卡片局部坐标，原点 = 卡片左上，Y 向下）：
+/// - 高亮（Highlight）= 半透明黄整块填充 quad；
+/// - 删除线（Strikeout）= 穿过 quad 垂直中心的细红条；
+/// - 下划线（Underline）= 贴 quad 底缘的细蓝条。
+/// 每条注释可多 quad（跨行选区）。quads 为 PDF 点（y up），经 `pt_to_local` 转卡片局部，
+/// 与选区高亮/瓦片逐像素对齐（同一套几何管道）。
+fn pending_annot_overlays_for_page(
+    page: usize,
+    pending: &[PendingAnnot],
+    dim: (f32, f32),
+    display_w: f32,
+    scale: f32,
+) -> Vec<gpui::AnyElement> {
+    let mut out = Vec::new();
+    let strike_col = annot_strike_color();
+    let under_col = annot_underline_color();
+    for annot in pending.iter().filter(|a| a.page == page) {
+        if annot.kind == AnnotKind::Highlight {
+            for q in &annot.quads_pt {
+                let (x0, y_top) = pt_to_local(q.x0, q.y1, dim.0, dim.1, display_w, scale);
+                let (x1, y_bottom) = pt_to_local(q.x1, q.y0, dim.0, dim.1, display_w, scale);
+                out.push(
+                    div()
+                        .absolute()
+                        .left(px(x0))
+                        .top(px(y_top))
+                        .w(px((x1 - x0).max(1.0)))
+                        .h(px((y_bottom - y_top).max(1.0)))
+                        .bg(annot_highlight_color())
+                        .into_any_element(),
+                );
+            }
+        } else {
+            // 删除线/下划线：细条厚度随显示缩放（~3pt），视宽随 quad 宽
+            let bar_h = (scale * 3.0).clamp(1.5, 6.0);
+            for q in &annot.quads_pt {
+                let (x0, y_top) = pt_to_local(q.x0, q.y1, dim.0, dim.1, display_w, scale);
+                let (x1, y_bottom) = pt_to_local(q.x1, q.y0, dim.0, dim.1, display_w, scale);
+                let w = (x1 - x0).max(1.0);
+                let h = (y_bottom - y_top).max(1.0);
+                // 删除线 = 垂直中心细条（pt y 中点 → local）；下划线 = 贴底缘
+                let y_bar = if annot.kind == AnnotKind::Strikeout {
+                    let mid_pt = (q.y0 + q.y1) * 0.5;
+                    let (_, y_mid) = pt_to_local(0.0, mid_pt, dim.0, dim.1, display_w, scale);
+                    y_mid - bar_h * 0.5
+                } else {
+                    y_top + h - bar_h
+                };
+                let color = if annot.kind == AnnotKind::Strikeout {
+                    strike_col
+                } else {
+                    under_col
+                };
+                out.push(
+                    div()
+                        .absolute()
+                        .left(px(x0))
+                        .top(px(y_bar))
+                        .w(px(w))
+                        .h(px(bar_h))
+                        .bg(color)
+                        .into_any_element(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// 某页的「灰框」焦注释包围盒（卡片局部坐标）：点击命中的那条注释的全部 quads 取
+/// 外接矩形，画灰色边框框住文字区域（点非注释文字则无框）。`None` = 本页无焦注释。
+fn annot_focus_frame_overlay_for_page(
+    page: usize,
+    focused: Option<u64>,
+    pending: &[PendingAnnot],
+    dim: (f32, f32),
+    display_w: f32,
+    scale: f32,
+) -> Option<gpui::AnyElement> {
+    let annot = pending
+        .iter()
+        .find(|a| a.page == page && Some(a.id) == focused)?;
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for q in &annot.quads_pt {
+        min_x = min_x.min(q.x0.min(q.x1));
+        max_x = max_x.max(q.x0.max(q.x1));
+        min_y = min_y.min(q.y0.min(q.y1));
+        max_y = max_y.max(q.y0.max(q.y1));
+    }
+    if !(min_x.is_finite()) {
+        return None;
+    }
+    // 外框略外扩（视觉包住高亮条），PDF 点 → 卡片局部
+    let pad = 2.0;
+    let (x0, y_top) = pt_to_local(min_x - pad, max_y + pad, dim.0, dim.1, display_w, scale);
+    let (x1, y_bottom) = pt_to_local(max_x + pad, min_y - pad, dim.0, dim.1, display_w, scale);
+    Some(
+        div()
+            .absolute()
+            .left(px(x0))
+            .top(px(y_top))
+            .w(px((x1 - x0).max(1.0)))
+            .h(px((y_bottom - y_top).max(1.0)))
+            .border_1()
+            .border_color(annot_focus_frame_color())
+            .bg(rgba(0x6b6b6b14))
+            .into_any_element(),
+    )
 }
 
 /// 某页的检索命中高亮元素（**卡片局部**坐标，原点 = 卡片左上角，Y 向下）。
@@ -235,6 +373,25 @@ impl PdfViewer {
                     active_color,
                 ));
             }
+            // 待保存注释叠加层（P1：内存叠加渲染，零重载零闪烁；坐标与选区同源）
+            overlays.extend(pending_annot_overlays_for_page(
+                i,
+                &self.pending_annots,
+                dim,
+                page_width,
+                scale,
+            ));
+            // 灰框（点击命中的待存注释包围盒）
+            if let Some(frame) = annot_focus_frame_overlay_for_page(
+                i,
+                self.focused_annot,
+                &self.pending_annots,
+                dim,
+                page_width,
+                scale,
+            ) {
+                overlays.push(frame);
+            }
             // 卡片保持 **absolute 定位**（页列虚拟化的根基）。⚠️ 不可改成
             // `.relative()`：`absolute`/`relative` 同是 position 设置器、后调用者胜，
             // 一旦覆盖成 relative，页列绝对定位整体失效 → 页距被拉远、滚动跳页、
@@ -340,6 +497,8 @@ impl Render for PdfViewer {
         } else {
             self.render_pdf_pages(window, cx, page_width, page_bg, page_border)
         };
+        // Phase B1：选中弹卡（独立 deferred 浮层，随滚动/重选/点外/Esc 关闭）。
+        let sel_overlay = self.sel_card_element(window, cx);
 
         // 外层：PDF 主体铺满画布。目录已统一由侧边栏提供，此处不再有内部目录面板。
         div()
@@ -382,6 +541,150 @@ impl Render for PdfViewer {
                             ),
                     ),
             )
+            .when_some(sel_overlay, |this, o| this.child(o))
+    }
+}
+
+impl PdfViewer {
+    /// Phase B1：选中文字后的操作卡片浮层（有选中弹卡时返回 `Some`）。沿用
+    /// `note_card` / `image_edit_card` 的 `deferred(anchored(Window))` 约定（逃逸滚动
+    /// 容器裁剪/命中）：锚定在选区**上缘中心**上方，越界 `snap_to_window_with_margin`
+    /// 夹回窗口；点卡片外（`on_mouse_down_out`）关闭。四项 —— 复制 / 高亮 / 删除线 /
+    /// 下划线。
+    fn sel_card_element(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let card_state = self.sel_card?;
+        use gpui::{
+            Anchor, AnchoredPositionMode, Edges, InteractiveElement, IntoElement, ParentElement,
+        };
+        let colors = ui::theme::Theme::global(cx).colors;
+        let ed = cx.entity();
+        let colors_fg: gpui::Hsla = colors.fg.into();
+        let border: gpui::Hsla = colors.border.into();
+        let popover_bg: gpui::Hsla = colors.popover_bg.into();
+
+        // 每一格按钮：hover 底色 + 点击回调（捕获各自的注释类型 / 关闭动作）。
+        let copy_item = Self::sel_card_item(
+            "pdf-sel-card-copy",
+            "复制",
+            colors_fg,
+            popover_bg,
+            cx,
+            |this: &mut PdfViewer, _: &gpui::ClickEvent, window, cx| {
+                this.copy_selection(window, cx);
+                // 复制不清选区（可反复复制）；仅收卡。
+                this.close_sel_card(cx);
+            },
+        );
+        let hl_item = Self::sel_card_item(
+            "pdf-sel-card-highlight",
+            "高亮",
+            colors_fg,
+            popover_bg,
+            cx,
+            |this: &mut PdfViewer, _: &gpui::ClickEvent, _w, cx| {
+                this.annotate_selection(AnnotKind::Highlight, cx);
+            },
+        );
+        let st_item = Self::sel_card_item(
+            "pdf-sel-card-strike",
+            "删除线",
+            colors_fg,
+            popover_bg,
+            cx,
+            |this: &mut PdfViewer, _: &gpui::ClickEvent, _w, cx| {
+                this.annotate_selection(AnnotKind::Strikeout, cx);
+            },
+        );
+        let ul_item = Self::sel_card_item(
+            "pdf-sel-card-underline",
+            "下划线",
+            colors_fg,
+            popover_bg,
+            cx,
+            |this: &mut PdfViewer, _: &gpui::ClickEvent, _w, cx| {
+                this.annotate_selection(AnnotKind::Underline, cx);
+            },
+        );
+
+        let card = div()
+            .id("pdf-sel-card")
+            .debug_selector(|| "pdf-sel-card".into())
+            // 点卡片外任意处 → 关闭（浮层内点击不外发，不误关；K15 事件互斥）。
+            .on_mouse_down_out(move |_: &gpui::MouseDownEvent, _w, cx| {
+                let ed = ed.clone();
+                ed.update(cx, |e, cx| e.close_sel_card(cx));
+            })
+            .occlude()
+            .flex()
+            .flex_row()
+            .gap_x(px(2.))
+            .p(px(3.))
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(popover_bg)
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(6.), gpui::hsla(0., 0., 0., 0.18))
+                    .blur_radius(px(12.)),
+                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.12))
+                    .blur_radius(px(4.)),
+            ])
+            .child(copy_item)
+            .child(hl_item)
+            .child(st_item)
+            .child(ul_item);
+
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position_mode(AnchoredPositionMode::Window)
+                    .anchor(Anchor::TopLeft)
+                    .position(card_state.pos)
+                    .snap_to_window_with_margin(Edges::all(px(8.)))
+                    .child(card),
+            )
+            .with_priority(100)
+            .into_any_element(),
+        )
+    }
+}
+
+impl PdfViewer {
+    /// 选中弹卡里的一格操作按钮（id/debug_selector 供测试定位）。
+    #[allow(clippy::too_many_arguments)] // 四色 + 回调，与 toc_item_frame 同构
+    fn sel_card_item<F>(
+        id: &'static str,
+        label: &'static str,
+        colors_fg: gpui::Hsla,
+        popover_bg: gpui::Hsla,
+        cx: &mut Context<PdfViewer>,
+        handler: F,
+    ) -> gpui::AnyElement
+    where
+        F: Fn(&mut PdfViewer, &gpui::ClickEvent, &mut Window, &mut Context<PdfViewer>) + 'static,
+    {
+        let id2 = id;
+        div()
+            .id(gpui::ElementId::from(id))
+            .debug_selector(move || id2.into())
+            .h(px(28.))
+            .px_2()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor(gpui::CursorStyle::PointingHand)
+            .text_size(px(12.5))
+            .text_color(colors_fg)
+            .hover(|style| style.bg(popover_bg.opacity(0.5)))
+            .active(|style| style.bg(popover_bg.opacity(0.8)))
+            .on_click(cx.listener(handler))
+            .child(label)
+            .into_any_element()
     }
 }
 

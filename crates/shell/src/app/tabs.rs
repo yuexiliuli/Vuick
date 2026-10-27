@@ -116,29 +116,88 @@ impl EditorApp {
                 let idx_ans = answer.await.unwrap_or(2);
                 let should_close = match idx_ans {
                     0 => {
-                        let (saved, need_dialog) = cx
-                            .update_window_entity(&entity, |this, _window, cx| match this
-                                .tabs
-                                .get(idx)
-                                .and_then(|t| t.file_path.clone())
-                            {
-                                Some(p) => {
-                                    // 走统一口径：live2 开启时读 WyEditor 实时内容
-                                    // （否则关闭保存的是陈旧的源码编辑区，丢整段编辑）。
-                                    let text = this.tab_effective_text(idx, cx);
-                                    (Some(this.write_to_path(idx, &p, text, cx)), false)
-                                }
-                                None => (None, true),
+                        // PDF 选项卡：走待保存模型——触发 PdfViewer::save，等完成信号；
+                        // 保存成功（或本就无待存）才关，失败保留标签（observe 已 toast）。
+                        let is_pdf = cx
+                            .update_window_entity(&entity, |this, _w, _cx| {
+                                this.tabs
+                                    .get(idx)
+                                    .is_some_and(|t| matches!(t.reader, MediaReader::Pdf(_)))
                             })
-                            .unwrap_or((None, false));
-                        if need_dialog {
-                            let _ =
-                                cx.update_window_entity(&entity, |this, window, cx| {
-                                    this.save_unnamed_and_close(idx, window, cx);
-                                });
-                            false
+                            .unwrap_or(false);
+                        if is_pdf {
+                            // 触发 PdfViewer::save（fire-and-forget，成功清 dirty + notify）；
+                            // 随后在**前台**用 timer 轮询 dirty 是否清（save 成功即清）。不在
+                            // 后台做阻塞 recv / 长自旋——与 save 自身的 worker 任务零竞争
+                            // （后台线程池被阻塞 recv 占住会让 save 的 worker 任务饿死）。
+                            let started = cx
+                                .update_window_entity(&entity, |this, _w, cx| {
+                                    let p = this
+                                        .tabs
+                                        .get(idx)
+                                        .and_then(|t| match &t.reader {
+                                            MediaReader::Pdf(p) => Some(p.clone()),
+                                            _ => None,
+                                        });
+                                    p.map(|p| p.update(cx, |v, cx| v.save(cx)))
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false);
+                            if !started {
+                                true // 无待存 → 直接关
+                            } else {
+                                // 等 save 完成（dirty 清）：200 × 25ms = 5s 上限；
+                                // save 失败 → dirty 保持 → 超时返回 false → 保留标签。
+                                let mut saved = false;
+                                for _ in 0..200 {
+                                    let clean = cx
+                                        .update_window_entity(&entity, |this, _w, cx| {
+                                            this.tabs
+                                                .get(idx)
+                                                .map(|t| match &t.reader {
+                                                    MediaReader::Pdf(p) => {
+                                                        !p.read(cx).is_dirty()
+                                                    }
+                                                    _ => true,
+                                                })
+                                                .unwrap_or(true)
+                                        })
+                                        .unwrap_or(true);
+                                    if clean {
+                                        saved = true;
+                                        break;
+                                    }
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(25))
+                                        .await;
+                                }
+                                saved
+                            }
                         } else {
-                            saved.unwrap_or(false)
+                            let (saved, need_dialog) = cx
+                                .update_window_entity(&entity, |this, _window, cx| match this
+                                    .tabs
+                                    .get(idx)
+                                    .and_then(|t| t.file_path.clone())
+                                {
+                                    Some(p) => {
+                                        // 走统一口径：live2 开启时读 WyEditor 实时内容
+                                        // （否则关闭保存的是陈旧的源码编辑区，丢整段编辑）。
+                                        let text = this.tab_effective_text(idx, cx);
+                                        (Some(this.write_to_path(idx, &p, text, cx)), false)
+                                    }
+                                    None => (None, true),
+                                })
+                                .unwrap_or((None, false));
+                            if need_dialog {
+                                let _ =
+                                    cx.update_window_entity(&entity, |this, window, cx| {
+                                        this.save_unnamed_and_close(idx, window, cx);
+                                    });
+                                false
+                            } else {
+                                saved.unwrap_or(false)
+                            }
                         }
                     }
                     1 => true,

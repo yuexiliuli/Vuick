@@ -186,6 +186,16 @@ impl PopupMenu {
         (self.menu_items.len(), separators)
     }
 
+    /// 测试/诊断：第 `index` 项是否被禁用（含分割线下标；越界/分割线 → `false`）。
+    /// shell PDF 右键「唯一页时删除页面禁用」断言用。
+    #[allow(dead_code)] // shell 测试断言用
+    pub fn is_item_disabled(&self, index: usize) -> bool {
+        match self.menu_items.get(index) {
+            Some(PopupMenuItem::ElementItem { disabled, .. }) => *disabled,
+            _ => false,
+        }
+    }
+
     /// 确认选中项：执行回调并关闭菜单（点击项 or Enter）。
     /// `keep_open` 项只执行回调、**不关闭**（如「打开最近…」保持文件菜单展开）。
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {

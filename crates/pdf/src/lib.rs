@@ -31,8 +31,9 @@ mod view;
 // 后续 P3（搜索，PdfTextChar 字符盒），测试亦经此引用；bin crate 无外部消费方故需 allow。
 #[allow(unused_imports)]
 pub use parser::{
-    DocId, PageText, PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfTextChar, PdfWorker,
-    RenderRequest, RenderResult, TileRequest, TileResult,
+    AnnotKind, AnnotateItem, AnnotationInfo, DocId, MemOpResult, PageText, PdfOutlineEntry,
+    PdfSearchHit, PdfSearchResults, PdfTextChar, PdfWorker, QuadPt, RenderRequest, RenderResult,
+    TileRequest, TileResult, is_writeback_busy_error,
 };
 pub use view::PdfViewer;
 
@@ -2449,5 +2450,435 @@ mod tests {
             thumbs,
             est / 1024 / 1024,
         );
+    }
+
+    // ---- Phase A：标准注释写回 / 页面插入·删除 / 提取（真夹具，照既有测试模式）----
+
+    /// 拷贝夹具到 temp 独立文件（Phase A 写回测试操作副本，不污染仓库夹具）。
+    fn temp_pdf_copy(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let dst = dir.join(format!(
+            "{name}-{}-{}.pdf",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::copy(test_pdf_paths()[0].clone(), &dst).expect("拷贝夹具到 temp");
+        dst
+    }
+
+    /// 三态注释写回 → 重开同一文件读回类型与几何一致（±1pt），页数不变。
+    /// 效果断言（K37）：重开用的是**从磁盘重读**的新 bytes——读到注释即证明真的落盘。
+    #[test]
+    fn writeback_annotations_persist_and_read_back() {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        let path = temp_pdf_copy("annot");
+        let bytes0 = std::fs::read(&path).expect("读夹具");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes0.clone()).expect("打开应成功");
+
+        // 写回前：该页应无注释（读回为空）
+        assert!(
+            worker.annotations_for_page(doc_id, 0).expect("读回").is_empty(),
+            "写回前第 0 页应无注释"
+        );
+
+        // 一条覆盖页中部大区域的 quad，三条不同类型注释叠在同一区域
+        let (pw, ph) = dims[0];
+        let quads = vec![QuadPt {
+            x0: 60.0,
+            y0: ph * 0.55,
+            x1: pw - 60.0,
+            y1: ph * 0.62,
+        }];
+        let items = vec![
+            AnnotateItem { page_index: 0, kind: AnnotKind::Highlight, quads: quads.clone() },
+            AnnotateItem { page_index: 0, kind: AnnotKind::Strikeout, quads: quads.clone() },
+            AnnotateItem { page_index: 0, kind: AnnotKind::Underline, quads: quads.clone() },
+        ];
+        let added = worker.annotate(doc_id, items, path.clone()).expect("写回注释应成功");
+        assert_eq!(added, 3, "应写入 3 条注释");
+        worker.close(doc_id);
+
+        // 渲染可见性（FPDF_RENDER_ANNOT 默认开启）：写回前 vs 重开后同区域像素出现差异
+        // = 注释真的渲染出来了（不是只落了文件没显示）。
+        let (wa, da, _) = PdfWorker::open_and_dims(bytes0).expect("原始打开");
+        let rx = wa.request_render(da, RenderRequest { page: 0, scale: 1.0 });
+        let before = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("收到渲染")
+            .expect("渲染成功");
+        wa.close(da);
+
+        // 从磁盘重读字节 → 重开（效果断言）
+        let (w2, d2, dims2) =
+            PdfWorker::open_and_dims(std::fs::read(&path).expect("改后重读")).expect("重开改后文件");
+        assert_eq!(dims2, dims, "写回注释不应改变页数与页尺寸");
+        let rx2 = w2.request_render(d2, RenderRequest { page: 0, scale: 1.0 });
+        let after = rx2
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("收到渲染")
+            .expect("渲染成功");
+        assert_eq!((before.width, before.height), (after.width, after.height), "渲染尺寸应一致");
+        // 全页像素 diff：注释带在 PDF 系（y-up）而位图是 y-down，按假定带采样容易翻转错位；
+        // 直接比整页最稳——高亮/删除线/下划线横跨页宽，只要渲染出来了 diff 必然远超阈值。
+        // PDF y-up 0.55ph..0.62ph 的注释带在 y-down 位图里对应 (1-0.62)ph..(1-0.55)ph，
+        // 全页比较无需依赖该映射。
+        let w = after.width as usize;
+        let hgt = after.height as usize;
+        let mut diff = 0u32;
+        for y in 0..hgt {
+            for x in 0..w {
+                let o = (y * w + x) * 4;
+                let d = (0..4)
+                    .map(|c| (before.bgra[o + c] as i64 - after.bgra[o + c] as i64).abs())
+                    .sum::<i64>();
+                if d > 24 {
+                    diff += 1;
+                }
+            }
+        }
+        assert!(
+            diff > 200,
+            "写回注释后整页渲染应出现可见差异（diff={diff} px）"
+        );
+
+        // 读回类型与几何
+        let infos = w2.annotations_for_page(d2, 0).expect("读回注释");
+        assert_eq!(infos.len(), 3, "应读回 3 条注释");
+        let expect_kinds =
+            [AnnotKind::Highlight, AnnotKind::Strikeout, AnnotKind::Underline];
+        for (got, want) in infos.iter().zip(expect_kinds.iter()) {
+            assert_eq!(&got.kind, want, "注释类型应一致");
+            assert_eq!(got.quads.len(), 1, "每条注释应 1 个 quad");
+            let (q, e) = (got.quads[0], quads[0]);
+            for (a, b, msg) in [
+                (q.x0, e.x0, "x0"),
+                (q.y0, e.y0, "y0"),
+                (q.x1, e.x1, "x1"),
+                (q.y1, e.y1, "y1"),
+            ] {
+                assert!((a - b).abs() <= 1.0, "quad {msg} 应在容差内: {a} vs {b}");
+            }
+        }
+        w2.close(d2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 插入空白页：末尾追加 + 中间插入，重开后页数/新页尺寸保持（落盘效果断言）。
+    #[test]
+    fn insert_blank_page_persists_dimensions() {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        let path = temp_pdf_copy("insert");
+        let (worker, doc_id, dims) =
+            PdfWorker::open_and_dims(std::fs::read(&path).expect("读夹具")).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 2, "夹具应足量页");
+
+        // 末尾追加一页 300x400
+        let new_count = worker
+            .insert_blank_page(doc_id, n, 300.0, 400.0, path.clone())
+            .expect("末尾插入应成功");
+        assert_eq!(new_count, n + 1, "追加后页数 +1");
+
+        // 中间插入：at_index=1（成为第 2 页）
+        let new_count2 = worker
+            .insert_blank_page(doc_id, 1, 200.0, 220.0, path.clone())
+            .expect("中间插入应成功");
+        assert_eq!(new_count2, n + 2, "再插后页数 +1");
+        worker.close(doc_id);
+
+        // 从磁盘重读重开：页数与各插入页尺寸保持
+        let (w2, d2, dims2) =
+            PdfWorker::open_and_dims(std::fs::read(&path).expect("改后重读")).expect("重开改后文件");
+        assert_eq!(dims2.len(), n + 2, "重开后页数保持");
+        let mid = dims2[1];
+        assert!(
+            (mid.0 - 200.0).abs() < 0.5 && (mid.1 - 220.0).abs() < 0.5,
+            "中间插入页尺寸应保持: {mid:?}"
+        );
+        let last = dims2[n + 1]; // 原 n 页 + 中插 1 页后，末尾是末尾追加的
+        assert!(
+            (last.0 - 300.0).abs() < 0.5 && (last.1 - 400.0).abs() < 0.5,
+            "末尾追加页尺寸应保持: {last:?}"
+        );
+        w2.close(d2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 删除页面：页数 -1 且重开保持；越界/仅剩 1 页返回错误。
+    #[test]
+    fn delete_page_persists_and_guards_single_page() {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        let path = temp_pdf_copy("del");
+        let (worker, doc_id, dims) =
+            PdfWorker::open_and_dims(std::fs::read(&path).expect("读夹具")).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 2, "夹具应足量页");
+
+        let new_count = worker.delete_page(doc_id, 0, path.clone()).expect("删除首页应成功");
+        assert_eq!(new_count, n - 1, "删除后页数 -1");
+        worker.close(doc_id);
+
+        let (w2, d2, dims2) =
+            PdfWorker::open_and_dims(std::fs::read(&path).expect("改后重读")).expect("重开改后文件");
+        assert_eq!(dims2.len(), n - 1, "重开后页数保持");
+        // 越界删除 → Err
+        assert!(
+            w2.delete_page(d2, dims2.len() + 5, path.clone()).is_err(),
+            "越界删除应报错"
+        );
+        w2.close(d2);
+
+        // 单页文档：提取第 0 页成单页文件后删除 → Err「仅剩 1 页」
+        let single = {
+            let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+            let _ = std::fs::create_dir_all(&dir);
+            let p = dir.join(format!("single-{}.pdf", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            p
+        };
+        let (w3, d3, _) = PdfWorker::open_and_dims(std::fs::read(&path).expect("读夹具")).expect("打开");
+        w3.extract_page_to(d3, 0, single.clone()).expect("提取单页");
+        w3.close(d3);
+        let (w4, d4, dims4) =
+            PdfWorker::open_and_dims(std::fs::read(&single).expect("读单页")).expect("打开单页文档");
+        assert_eq!(dims4.len(), 1, "提取产物应为单页");
+        assert!(
+            w4.delete_page(d4, 0, single.clone()).is_err(),
+            "删除仅剩 1 页应报错"
+        );
+        w4.close(d4);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&single);
+    }
+
+    /// 提取单页成独立 PDF：产物页数 == 1，尺寸与原页一致（落盘效果断言）。
+    #[test]
+    fn extract_page_creates_single_page_document() {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        let path = temp_pdf_copy("extract");
+        let out = {
+            let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+            let _ = std::fs::create_dir_all(&dir);
+            let p = dir.join(format!("extracted-{}.pdf", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            p
+        };
+        let (worker, doc_id, dims) =
+            PdfWorker::open_and_dims(std::fs::read(&path).expect("读夹具")).expect("打开应成功");
+        let target = dims.len() / 2;
+        worker
+            .extract_page_to(doc_id, target, out.clone())
+            .expect("提取应成功");
+        worker.close(doc_id);
+
+        let (w2, d2, dims2) =
+            PdfWorker::open_and_dims(std::fs::read(&out).expect("读提取产物")).expect("打开提取文件");
+        assert_eq!(dims2.len(), 1, "提取产物应为单页");
+        let (ew, eh) = dims[target];
+        assert!(
+            (dims2[0].0 - ew).abs() < 0.5 && (dims2[0].1 - eh).abs() < 0.5,
+            "提取页尺寸应与原页一致: {:?} vs ({ew},{eh})",
+            dims2[0]
+        );
+        w2.close(d2);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // ---- 待保存模型（P1）：内存页面操作不写盘 / 镜像恢复 / 保存后才落盘 ----
+
+    /// 页面操作**待存**（worker 层）：内存级插入/删除只改 stores 内存工作副本、**磁盘文件
+    /// 字节原样**；撤销恢复经 MemRestoreBytes 精确还原镜像；显式 save 才落盘且重开页数一致。
+    /// 用真实 PDF 夹具 + 唯一 temp 副本（不污染 `target/pdf测试.pdf`）。
+    #[test]
+    fn mem_page_ops_do_not_touch_disk_until_save() {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        let path = temp_pdf_copy("memop");
+        let disk0 = std::fs::read(&path).expect("读夹具");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(disk0.clone()).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 2, "夹具应足量页");
+
+        // ① 内存插入：只回传新镜像，磁盘字节必须原样
+        let r1 = worker
+            .mem_insert_blank_page(doc_id, 1, 300.0, 400.0)
+            .expect("内存插入应成功");
+        assert_eq!(r1.count, n + 1, "内存插入后页数 +1");
+        assert_eq!(
+            std::fs::read(&path).expect("重读磁盘"),
+            disk0,
+            "内存插入后磁盘 bytes 必须不变（待保存）"
+        );
+        // stores 应同步为新镜像（后续操作/保存基于新内容）
+        assert_eq!(worker.mem_bytes(doc_id), Some(r1.after.clone()), "stores 应同步新镜像");
+
+        // ② 内存删除（回到 n 页）
+        let r2 = worker.mem_delete_page(doc_id, 0).expect("内存删除应成功");
+        assert_eq!(r2.count, n, "内存删除后页数复原");
+        assert_eq!(
+            std::fs::read(&path).expect("重读磁盘"),
+            disk0,
+            "内存删除后磁盘 bytes 必须不变（待保存）"
+        );
+
+        // ③ 撤销恢复：MemRestoreBytes 换成原始镜像 → stores 回滚 + 其后保存页数复原
+        worker
+            .mem_restore_bytes(doc_id, disk0.clone())
+            .expect("恢复镜像应成功");
+        assert_eq!(worker.mem_bytes(doc_id), Some(disk0.clone()), "恢复后 stores == 原始镜像");
+
+        // ④ 显式 save → 磁盘变化、重开读回页数复原
+        worker.save(doc_id, path.clone()).expect("保存应成功");
+        let (w2, d2, dims2) =
+            PdfWorker::open_and_dims(std::fs::read(&path).expect("保存后重读")).expect("重开改后文件");
+        assert_eq!(dims2.len(), n, "恢复镜像后保存 → 重开页数复原（= 原始 n）");
+        w2.close(d2);
+
+        worker.close(doc_id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 待保存模型 viewer 层（真夹具，`#[gpui::test]`）：插入/删除页只内存级（磁盘 bytes
+    /// 全程不变）、dirty 随操作置真；Ctrl+Z 撤销页操作后页数复原 + 清脏；注释只进内存；
+    /// `save()` 才落盘（磁盘变化 + 重开读回注释 + 清 pending/dirty）。无窗口驱动（纯实体级）。
+    #[gpui::test]
+    async fn pending_viewer_page_ops_undo_save_real_fixture(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = test_util::lock().lock().unwrap();
+        use gpui::AppContext as _;
+        use std::time::Duration;
+
+        let src = test_util::test_pdf_paths()[0].clone();
+        let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(format!("pending-op-{}.pdf", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        std::fs::copy(&src, &p).expect("拷贝夹具");
+        let disk0 = std::fs::read(&p).expect("读初始磁盘");
+
+        let viewer = cx.update(|app| app.new(|cx| crate::pdf::PdfViewer::new(p.clone(), cx)));
+        fn wait(
+            cx: &mut gpui::TestAppContext,
+            pred: &mut dyn FnMut(&mut gpui::TestAppContext) -> bool,
+        ) -> bool {
+            for _ in 0..800 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                if pred(cx) {
+                    return true;
+                }
+            }
+            false
+        }
+        let vid = viewer.clone();
+        let loaded = wait(cx, &mut |cx| cx.update(|app| vid.read(app).is_loaded()));
+        assert!(loaded, "应加载完成");
+
+        let n0 = cx.update(|app| viewer.read(app).page_count());
+        assert!(n0 >= 2, "夹具应足量页");
+
+        // ① 插入页（内存级）：页数 +1、dirty、磁盘不变
+        cx.update(|app| viewer.update(app, |v, cx| v.insert_blank_page_after(0, cx)));
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).page_count() == n0 + 1)),
+            "插入后页数 +1"
+        );
+        assert!(cx.update(|app| viewer.read(app).is_dirty()), "插入后置脏");
+        assert_eq!(
+            std::fs::read(&p).expect("重读磁盘"),
+            disk0,
+            "插入页只进内存：磁盘 bytes 必须不变"
+        );
+
+        // ② Ctrl+Z 撤销插入：页数复原、清脏、磁盘仍不变
+        cx.update(|app| viewer.update(app, |v, cx| v.undo_last(cx)));
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| {
+                let v = vid.read(app);
+                v.page_count() == n0 && !v.is_dirty()
+            })),
+            "撤销插入后页数复原且清脏"
+        );
+        assert_eq!(std::fs::read(&p).expect("重读磁盘"), disk0, "撤销后磁盘仍不变");
+
+        // ③ 删除页（内存级）：页数 -1、dirty → 撤销复原
+        cx.update(|app| viewer.update(app, |v, cx| v.delete_page(0, cx)));
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).page_count() == n0 - 1)),
+            "删除后页数 -1"
+        );
+        assert!(cx.update(|app| viewer.read(app).is_dirty()), "删除后置脏");
+        assert_eq!(std::fs::read(&p).expect("重读磁盘"), disk0, "删除页只进内存：磁盘不变");
+        cx.update(|app| viewer.update(app, |v, cx| v.undo_last(cx)));
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| {
+                let v = vid.read(app);
+                v.page_count() == n0 && !v.is_dirty()
+            })),
+            "撤销删除后页数复原且清脏"
+        );
+
+        // ④ 注释只进内存（磁盘不变）→ save 才落盘（dirty/pending 清 + 重开读回）
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.add_annotation(0, AnnotKind::Highlight, vec![[60.0, 300.0, 200.0, 330.0]], cx)
+            })
+        });
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).pending_annot_count() == 1)),
+            "加注释后 pending=1"
+        );
+        assert_eq!(
+            std::fs::read(&p).expect("重读磁盘"),
+            disk0,
+            "注释只进内存：磁盘 bytes 必须不变"
+        );
+        cx.update(|app| viewer.update(app, |v, cx| v.save(cx)));
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| {
+                let v = vid.read(app);
+                !v.is_dirty() && v.pending_annot_count() == 0
+            })),
+            "保存后清 pending 与 dirty"
+        );
+        // ⑤ save 后 live 文档应重载为「含已写注释」：叠加层虽清，基础文档必须带上已写
+        // 注释，否则高亮在 save 后从视图中消失直到重开（评审 D1 回归：不重开也能读回）。
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| {
+                let v = vid.read(app);
+                v.is_loaded()
+                    && v.annotations_for_page(0)
+                        .map(|a| a.iter().any(|x| x.kind == AnnotKind::Highlight))
+                        .unwrap_or(false)
+            })),
+            "save 后 live 文档应含高亮（保存触发重载，注释不过期上图）"
+        );
+        let saved = std::fs::read(&p).expect("保存后重读");
+        assert_ne!(saved, disk0, "保存后磁盘应变化（注释合并写盘）");
+        let (w2, d2, _) = PdfWorker::open_and_dims(saved).expect("重开改后文件");
+        let anns = w2.annotations_for_page(d2, 0).expect("读回注释");
+        assert!(
+            anns.iter().any(|a| a.kind == AnnotKind::Highlight),
+            "保存后重开应读回 Highlight（效果断言）"
+        );
+        w2.close(d2);
+
+        let _ = std::fs::remove_file(&p);
     }
 }

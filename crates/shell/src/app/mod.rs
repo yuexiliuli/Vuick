@@ -54,6 +54,8 @@ mod file_tree_prompt;
 mod init;
 mod layout;
 mod media;
+mod pdf_bookmarks;
+mod pdf_menu;
 mod preview;
 mod session;
 mod settings_xfer;
@@ -503,6 +505,18 @@ pub struct EditorApp {
     media_lock_menu_entity: Option<gpui::Entity<ui::menu::PopupMenu>>,
     /// 媒体右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     media_lock_menu_sub: Option<Subscription>,
+    /// PDF 右键「添加书签/插入页面/删除页面/提取页面」上下文菜单：弹出位置（窗口坐标）。
+    pdf_menu_pos: Option<Point<Pixels>>,
+    /// 已打开的 PDF 右键菜单实体（随位置同生同灭）。
+    pdf_menu_entity: Option<gpui::Entity<PopupMenu>>,
+    /// PDF 右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
+    pdf_menu_sub: Option<Subscription>,
+    /// 最近一次对 PDF 页操作失败已提示过的错误文案：`_pdf_sub` 的 observe 里
+    /// 对比「变化」才 toast 一次（成功/未操作置 None），防同一错误重复弹提示。
+    pdf_last_error_seen: Option<String>,
+    /// Phase B3：PDF 阅读位置书签（规范化路径 → 列表）。启动经 `UserPrefs::config_path()`
+    /// 同目录 `pdf_bookmarks.json` 加载；添加/删除即改内存 + 原子落盘。
+    pdf_bookmarks: std::collections::HashMap<String, Vec<pdf_bookmarks::PdfBookmark>>,
     /// 选项卡栏右键「新建/打开」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
     tab_bar_menu_pos: Option<Point<Pixels>>,
     /// 已打开的选项卡栏右键菜单实体（随位置同生同灭）。

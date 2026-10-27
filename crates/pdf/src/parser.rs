@@ -23,10 +23,13 @@
 //! [`PdfViewer`]: super::view::PdfViewer
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::io::Write;
+use std::os::raw::{c_int, c_ulong, c_void};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use pdfium_render::prelude::*;
 
 /// 进程级单例：pdfium 动态库路径（只定位一次）。
@@ -289,6 +292,73 @@ pub struct PdfOutlineEntry {
     pub page_index: usize,
 }
 
+/// 写回注释的类型：映 PDF 标准 annotation 子类型（Highlight / StrikeOut / Underline）。
+///
+/// 数值 = pdfium 的 `FPDF_ANNOT_*` 常量（对照本机 pdfium_7881 bindgen 已核实：
+/// `FPDF_ANNOT_HIGHLIGHT=9`、`FPDF_ANNOT_UNDERLINE=10`、`FPDF_ANNOT_STRIKEOUT=12`；
+/// FPDFPage_CreateAnnot 的 `subtype` 实参即此 C 枚举值）。Phase B 由 UI 提供类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotKind {
+    Highlight,
+    Strikeout,
+    Underline,
+}
+
+impl AnnotKind {
+    /// FPDF_ANNOT_* 子类型数值（见类型注释来源）。
+    fn fpdf_subtype(self) -> i32 {
+        match self {
+            AnnotKind::Highlight => 9,
+            AnnotKind::Underline => 10,
+            AnnotKind::Strikeout => 12,
+        }
+    }
+
+    /// 默认标准着色（R,G,B，0-255）：高亮柔和黄 / 删除线红 / 下划线蓝。
+    /// Phase B 由「复制/高亮/删除线/下划线」弹卡的 UI 定制，此处仅默认值。
+    fn default_color(self) -> (u32, u32, u32) {
+        match self {
+            AnnotKind::Highlight => (255, 230, 120),
+            AnnotKind::Strikeout => (230, 60, 60),
+            AnnotKind::Underline => (60, 120, 230),
+        }
+    }
+}
+
+/// 一个写回选区矩形的 PDF 点坐标（y 向上、原点页左下；与 [`PdfTextChar`] 同坐标语义，
+/// 由 view/layout 层在调用前把屏幕选区换算成 PDF 点，worker 不做坐标数学）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuadPt {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+/// 一条待写回的注释：页号 + 类型 + 若干 quad 矩形（同一页可跨行成多个矩形）。
+#[derive(Debug, Clone)]
+pub struct AnnotateItem {
+    pub page_index: usize,
+    pub kind: AnnotKind,
+    pub quads: Vec<QuadPt>,
+}
+
+/// 重开文档后读回的注释摘要（类型 + 每个 quad 的 PDF 点坐标）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnotationInfo {
+    pub kind: AnnotKind,
+    pub quads: Vec<QuadPt>,
+}
+
+/// FPDF_ANNOT_FLAG_PRINT：注释随打印输出（去掉了默认的 INVISIBLE/HIDDEN 显隐影响，
+/// 默认 0 = 可见 + 可打印位置 1）。
+const FPDF_ANNOT_FLAG_PRINT: c_int = 4;
+/// FPDFANNOT_COLORTYPE_Color：注释描边/填充色（0）。
+const FPDFANNOT_COLORTYPE_COLOR: u32 = 0;
+
+/// 写回落盘临时文件序号（同目录并发写回防撞名；worker 单线程串行本不应并发，兜底）。
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 enum WorkerMsg {
     Open(
         DocId,
@@ -313,6 +383,37 @@ enum WorkerMsg {
     Text(DocId, usize, mpsc::Sender<Option<PageText>>),
     /// 请求文档级检索（懒加载，低优先级；全页文本层扫描）。
     Search(DocId, String, mpsc::Sender<Option<PdfSearchResults>>),
+    /// **写回注释并落盘**：worker 内把内存 bytes 载入「自有 raw 句柄」
+    /// （`FPDF_LoadMemDocument64`）→ 在 raw doc 上建注释 → `FPDF_SaveAsCopy`
+    /// （自制 `FPDF_FILEWRITE`，先写同目录临时文件再原子替换 `output_path`）。
+    /// 成功回传实际写入的注释条数，并更新内存 bytes（后续操作基于新内容）。
+    /// viewer 收到成功后走 Close→Open 同 path 流程重载（见 view 的 modify 相关方法）。
+    Annotate(DocId, Vec<AnnotateItem>, PathBuf, mpsc::Sender<Result<usize>>),
+    /// 插入空白页并落盘：`at_index` = 新页插入位置（0 基；= page_count 即末尾追加）。
+    /// 成功回传**新页数**。
+    InsertBlankPage(DocId, usize, f32, f32, PathBuf, mpsc::Sender<Result<usize>>),
+    /// 删除页面并落盘（index 越界或仅剩 1 页 → Err）。成功回传**新页数**。
+    DeletePage(DocId, usize, PathBuf, mpsc::Sender<Result<usize>>),
+    /// 把单页提取成独立 PDF 文件（raw 句柄：`FPDF_CreateNewDocument` + `FPDF_ImportPages`）。
+    ExtractPage(DocId, usize, PathBuf, mpsc::Sender<Result<()>>),
+    /// 显式把当前内存 bytes 重新编码落盘到 `path`（无内容修改的另存/刷新）。
+    Save(DocId, PathBuf, mpsc::Sender<Result<()>>),
+    /// **内存级**插入空白页（待保存模型）：只改 worker 内 stores 内存工作副本（新镜像
+    /// 用 [`save_raw_doc_to_bytes`] 产出），**不碰磁盘**。成功回传 [`MemOpResult`]
+    /// （before=操作前镜像 / after=新镜像 / count=新页数）。与 [`WorkerMsg::InsertBlankPage`]
+    /// 区别：后者落盘到 `output_path`，本消息仅内存。
+    MemOpInsert(DocId, usize, f32, f32, mpsc::Sender<Result<MemOpResult>>),
+    /// **内存级**删除页面（待保存模型）：守卫同磁盘版（越界 / 仅剩 1 页 → Err），
+    /// 只改 stores、不碰磁盘。成功回传 [`MemOpResult`]。
+    MemOpDelete(DocId, usize, mpsc::Sender<Result<MemOpResult>>),
+    /// 用给定 bytes 直接替换 stores 镜像（待保存模型撤销「页面操作」用；本消息不做任何
+    /// pdfium 操作、零开销）。回传替换后镜像长度（存在性校验）。
+    MemRestoreBytes(DocId, Vec<u8>, mpsc::Sender<Result<usize>>),
+    /// 读回 stores 当前内存镜像（撤销快照 / 测试 MD5 / shell 另存共用；None=文档不存在）。
+    MemGetBytes(DocId, mpsc::Sender<Option<Vec<u8>>>),
+    /// 读回某页注释（only-read，pdfium-render 高层 `page.annotations()`，供测试断言）。
+    /// 低优先级，与 Text/Search 同位（不抢栅格化）。
+    ReadAnnotations(DocId, usize, mpsc::Sender<Result<Vec<AnnotationInfo>>>),
 }
 
 /// 进程级单例工作线程句柄。所有 [`PdfViewer`] 通过克隆它共享同一个 pdfium 线程。
@@ -424,6 +525,130 @@ impl PdfWorker {
         rx
     }
 
+    // ---- Phase A：写回 / 页操作 / 注释读回（同步等 worker 结果；FPDF 调用全在 worker 线程）----
+
+    /// 把一批注释写回 PDF 文件并落盘（worker 内全流程；成功后更新内存镜像）。
+    /// 成功回传实际写入的注释条数；`output_path` 为用户当前打开的源文件路径。
+    pub fn annotate(
+        &self,
+        doc_id: DocId,
+        items: Vec<AnnotateItem>,
+        output_path: PathBuf,
+    ) -> Result<usize> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::Annotate(doc_id, items, output_path, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// 在 `at_index` 处插入一页空白页并落盘（`at_index` 0 基；= 当前页数即末尾追加；
+    /// viewer 侧「当前页后插入」传 `page_index + 1`）。成功回传**新页数**。
+    pub fn insert_blank_page(
+        &self,
+        doc_id: DocId,
+        at_index: usize,
+        width_pt: f32,
+        height_pt: f32,
+        output_path: PathBuf,
+    ) -> Result<usize> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::InsertBlankPage(doc_id, at_index, width_pt, height_pt, output_path, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// 删除第 `index` 页并落盘（仅剩 1 页 / 越界 → Err）。成功回传**新页数**。
+    pub fn delete_page(&self, doc_id: DocId, index: usize, output_path: PathBuf) -> Result<usize> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::DeletePage(doc_id, index, output_path, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// 把第 `index` 页提取成独立 PDF 文件（`out_path` 原子替换）。
+    pub fn extract_page_to(
+        &self,
+        doc_id: DocId,
+        index: usize,
+        out_path: PathBuf,
+    ) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::ExtractPage(doc_id, index, out_path, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// 显式把当前内存 bytes 重新编码落盘到 `path`（无内容修改的另存/刷新）。
+    pub fn save(&self, doc_id: DocId, path: PathBuf) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::Save(doc_id, path, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    // ---- 待保存模型（P1）：内存工作副本操作——只改 stores、不碰磁盘 ----
+
+    /// **内存级**插入空白页（`at_index` 0 基；= 当前页数即末尾追加）：只改 worker 内
+    /// 内存工作副本并回传 [`MemOpResult`]（before/after/count），**不写盘**。
+    /// viewer 拿到 `after` 做内存级重载（页面操作待存语义）。
+    pub fn mem_insert_blank_page(
+        &self,
+        doc_id: DocId,
+        at_index: usize,
+        width_pt: f32,
+        height_pt: f32,
+    ) -> Result<MemOpResult> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::MemOpInsert(doc_id, at_index, width_pt, height_pt, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// **内存级**删除第 `index` 页（仅剩 1 页 / 越界 → Err）：只改 stores、不写盘。
+    pub fn mem_delete_page(&self, doc_id: DocId, index: usize) -> Result<MemOpResult> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::MemOpDelete(doc_id, index, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// 用给定 bytes 直接替换 stores 内存镜像（撤销「页面操作」用；零 pdfium 操作）。
+    pub fn mem_restore_bytes(&self, doc_id: DocId, bytes: Vec<u8>) -> Result<usize> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::MemRestoreBytes(doc_id, bytes, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// 读回 stores 当前内存镜像（`None` = 文档不存在；测试 MD5 / 撤销快照 / 另存用）。
+    pub fn mem_bytes(&self, doc_id: DocId) -> Option<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::MemGetBytes(doc_id, tx));
+        rx.recv().ok().flatten()
+    }
+
+    /// 读回某页的注释摘要（类型 + quad 点坐标；只读 pdfium-render 高层 API）。
+    /// 供测试断言与 Phase B 展示已写回注释。
+    pub fn annotations_for_page(
+        &self,
+        doc_id: DocId,
+        page_index: usize,
+    ) -> Result<Vec<AnnotationInfo>> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WorkerMsg::ReadAnnotations(doc_id, page_index, tx))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
     /// 工作线程主体（进程内唯一）：绑定 pdfium 一次 → 循环处理命令。
     fn run(rx: mpsc::Receiver<WorkerMsg>, dll: PathBuf) {
         let bindings = match Pdfium::bind_to_library(&dll) {
@@ -434,8 +659,15 @@ impl PdfWorker {
             }
         };
         let pdfium = Pdfium::new(bindings);
+        // 借出进程级 bindings（同一原生库句柄）：写回/页操作的低层 FPDF_* 调用都走它，
+        // 与 PdfDocument 渲染共用同一 pdfium 实例（单工作线程不变式，见模块头注释）。
+        let fpdf: &dyn PdfiumLibraryBindings = PdfiumLibraryBindingsAccessor::bindings(&pdfium);
         // 文档存活期 = `pdfium` 存活期；所有 `PdfDocument<'a>` 都借用上面的 `pdfium`。
         let mut docs: HashMap<DocId, PdfDocument<'_>> = HashMap::new();
+        // 各文档在内存中的源 bytes（与 `docs` 同生命周期）：写回/提取/另存时把 bytes
+        // 载入**自有 raw 句柄**做修改再落盘，不动正在渲染的 PdfDocument；落盘后同步镜像，
+        // 保证后续操作基于最新内容（重开显示由 viewer 的 Close→Open 负责）。
+        let mut stores: HashMap<DocId, Vec<u8>> = HashMap::new();
         // 本地优先级队列：按类分桶（render > mid > thumb > 其余），桶内 FIFO——
         // **Render 永不排在 Text 之后**（滚动画帧的栅格化优先于懒加载的文本提取），
         // 同优先级保持到达顺序。替代原「单队 + 每轮 `iter().position()+remove(i)`」的
@@ -490,11 +722,15 @@ impl PdfWorker {
                 }
                 continue;
             }
-            // 3) 其余 FIFO：Open / Close / Text / Search。Search 只登记成分片状态、不在此阻塞。
+            // 3) 其余 FIFO：Open / Close / Text / Search / 写回·页操作·注释读回。
+            //    Search 只登记成分片状态、不在此阻塞；写回类（Annotate/Insert/Delete/Extract/Save）
+            //    与注释读回属低频结构操作，放这里不抢栅格化（Render 总是最先出队）。
             if let Some(msg) = rest_q.pop_front() {
                 match msg {
                     WorkerMsg::Open(doc_id, bytes, tx) => {
                         let t0 = std::time::Instant::now();
+                        // 先克隆一份源 bytes 存内存镜像（写回/提取用），原始 bytes 移给渲染 doc
+                        let store_bytes = bytes.clone();
                         let result = match pdfium.load_pdf_from_byte_vec(bytes, None) {
                             Ok(doc) => {
                                 let t1 = std::time::Instant::now();
@@ -527,6 +763,7 @@ impl PdfWorker {
                                     );
                                 }
                                 docs.insert(doc_id, doc);
+                                stores.insert(doc_id, store_bytes);
                                 Ok((dims, outlines))
                             }
                             Err(e) => Err(anyhow::anyhow!("PDF 解析失败：{e}")),
@@ -535,6 +772,7 @@ impl PdfWorker {
                     }
                     WorkerMsg::Close(doc_id) => {
                         docs.remove(&doc_id);
+                        stores.remove(&doc_id);
                     }
                     WorkerMsg::Text(doc_id, page, tx) => {
                         let result = docs
@@ -563,7 +801,133 @@ impl PdfWorker {
                             let _ = tx.send(None);
                         }
                     }
-                    _ => unreachable!("rest_q 只入 Open/Close/Text/Search"),
+                    // ---- 写回 / 页操作 / 注释读回（全部 worker 单线程内，见各 handler）----
+                    WorkerMsg::Annotate(doc_id, items, out, tx) => {
+                        let result = writeback_edit(&mut stores, fpdf, doc_id, &out, |b, raw| {
+                            apply_annotations_raw(b, raw, &items)
+                        });
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::InsertBlankPage(doc_id, at, w, h, out, tx) => {
+                        let result = writeback_edit(&mut stores, fpdf, doc_id, &out, |b, raw| {
+                            let page = unsafe { b.FPDFPage_New(raw, at as c_int, w as f64, h as f64) };
+                            if page.is_null() {
+                                return Err(anyhow!("插入空白页失败（at={at} {w:.1}x{h:.1}pt）"));
+                            }
+                            // 新页句柄须 Close 释放（同 FPDF_LoadPage 的对称语义）
+                            unsafe { b.FPDF_ClosePage(page) };
+                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                        });
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::DeletePage(doc_id, index, out, tx) => {
+                        // 越界/单页守卫以**实际待写 bytes**（stores←raw 句柄页数）为准，而非
+                        // `docs`（渲染文档可能在连环操作中滞后于 stores，旧计数会误判/漏判）。
+                        let result = writeback_edit(&mut stores, fpdf, doc_id, &out, |b, raw| {
+                            let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                            if count <= 1 {
+                                return Err(anyhow!("不能删除仅剩的 1 页（当前 {count} 页）"));
+                            }
+                            if index >= count {
+                                return Err(anyhow!("页码越界：删除第 {index} 页（共 {count} 页）"));
+                            }
+                            unsafe { b.FPDFPage_Delete(raw, index as c_int) };
+                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                        });
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::ExtractPage(doc_id, index, out, tx) => {
+                        let result = (|| -> Result<()> {
+                            let bytes = stores
+                                .get(&doc_id)
+                                .ok_or_else(|| anyhow!("文档 {doc_id} 不存在"))?
+                                .clone();
+                            unsafe {
+                                let raw_src = load_raw_doc(fpdf, &bytes)?;
+                                let raw_dst = fpdf.FPDF_CreateNewDocument();
+                                if raw_dst.is_null() {
+                                    fpdf.FPDF_CloseDocument(raw_src);
+                                    return Err(anyhow!("FPDF_CreateNewDocument 失败"));
+                                }
+                                // pagerange 为 1 基页码串；index=0 表示插入到新文档开头
+                                let range = (index + 1).to_string();
+                                let ok = fpdf.FPDF_ImportPages(raw_dst, raw_src, &range, 0);
+                                if !fpdf.is_true(ok) {
+                                    fpdf.FPDF_CloseDocument(raw_dst);
+                                    fpdf.FPDF_CloseDocument(raw_src);
+                                    return Err(anyhow!("提取第 {index} 页失败"));
+                                }
+                                let res = save_raw_doc_to_file(fpdf, raw_dst, &out);
+                                fpdf.FPDF_CloseDocument(raw_dst);
+                                fpdf.FPDF_CloseDocument(raw_src);
+                                res
+                            }
+                        })();
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::Save(doc_id, out, tx) => {
+                        let result = (|| -> Result<()> {
+                            let bytes = stores
+                                .get(&doc_id)
+                                .ok_or_else(|| anyhow!("文档 {doc_id} 不存在"))?
+                                .clone();
+                            unsafe {
+                                let raw = load_raw_doc(fpdf, &bytes)?;
+                                let res = save_raw_doc_to_file(fpdf, raw, &out);
+                                fpdf.FPDF_CloseDocument(raw);
+                                res
+                            }
+                        })();
+                        let _ = tx.send(result);
+                    }
+                    // 待保存模型：内存级页面操作 / 镜像替换——只改 stores，不写盘。
+                    WorkerMsg::MemOpInsert(doc_id, at, w, h, tx) => {
+                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                            let page = unsafe { b.FPDFPage_New(raw, at as c_int, w as f64, h as f64) };
+                            if page.is_null() {
+                                return Err(anyhow!("插入空白页失败（at={at} {w:.1}x{h:.1}pt）"));
+                            }
+                            unsafe { b.FPDF_ClosePage(page) };
+                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                        });
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::MemOpDelete(doc_id, index, tx) => {
+                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                            let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                            if count <= 1 {
+                                return Err(anyhow!("不能删除仅剩的 1 页（当前 {count} 页）"));
+                            }
+                            if index >= count {
+                                return Err(anyhow!("页码越界：删除第 {index} 页（共 {count} 页）"));
+                            }
+                            unsafe { b.FPDFPage_Delete(raw, index as c_int) };
+                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                        });
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::MemRestoreBytes(doc_id, bytes, tx) => {
+                        let result = if stores.contains_key(&doc_id) {
+                            stores.insert(doc_id, bytes);
+                            Ok(stores.get(&doc_id).map(|b| b.len()).unwrap_or(0))
+                        } else {
+                            Err(anyhow!("文档 {doc_id} 不存在（无法恢复镜像）"))
+                        };
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::MemGetBytes(doc_id, tx) => {
+                        let r = stores.get(&doc_id).cloned();
+                        let _ = tx.send(r);
+                    }
+                    WorkerMsg::ReadAnnotations(doc_id, page, tx) => {
+                        let result = match docs.get(&doc_id) {
+                            Some(doc) => read_annotations(doc, page)
+                                .ok_or_else(|| anyhow!("文档或第 {page} 页不存在")),
+                            None => Err(anyhow!("文档 {doc_id} 不存在")),
+                        };
+                        let _ = tx.send(result);
+                    }
+                    _ => unreachable!("rest_q 只入 Open/Close/Text/Search/写回/页操作/注释读回"),
                 }
                 continue;
             }
@@ -607,6 +971,462 @@ fn enqueue_msg(
         _ => rest_q.push_back(msg),
     }
 }
+
+// ---- 写回 / 页操作（Phase A）：worker 单线程内的低层 FPDF 调用 ----
+//
+// 关键原则（单工作线程不变式，勿破坏）：所有 FPDF_* 调用（含 FPDF_SaveAsCopy /
+// FPDFPage_CreateAnnot / FPDFPage_New/Delete / FPDF_ImportPages）全部发生在 worker
+// 线程内、经进程级 bindings（`fpdf`）进行；viewer 线程只发消息收结果，绝不触碰 FPDF。
+//
+// 原生句柄生命周期：
+//   FPDF_LoadMemDocument64 → FPDF_DOCUMENT（结束须 FPDF_CloseDocument）
+//   FPDF_LoadPage → FPDF_PAGE（结束须 FPDF_ClosePage）
+//   FPDFPage_CreateAnnot → FPDF_ANNOTATION（结束须 FPDFPage_CloseAnnot）
+//   FPDF_CreateNewDocument → FPDF_DOCUMENT（结束须 FPDF_CloseDocument，含失败分支）
+// 任一环节失败都在归还前 Close 已打开的更内层句柄（防柄泄漏；参照 pdfium-render drop 语义）。
+
+/// 取 pdfium 最近一次错误码的简短描述（诊断用）。
+fn fpdf_last_error(bindings: &dyn PdfiumLibraryBindings) -> String {
+    let code = unsafe { bindings.FPDF_GetLastError() };
+    match code {
+        0 => "未知".into(),
+        v => format!("0x{v:x}"),
+    }
+}
+
+/// 把内存 bytes 载入**自有 raw 句柄**文档（写回/提取的独立副本，不动渲染中 PdfDocument）。
+unsafe fn load_raw_doc(
+    bindings: &dyn PdfiumLibraryBindings,
+    bytes: &[u8],
+) -> Result<FPDF_DOCUMENT> {
+    let h = unsafe { bindings.FPDF_LoadMemDocument64(bytes, None) };
+    if h.is_null() {
+        return Err(anyhow!("载入 PDF 失败（FPDF_GetLastError={}）", fpdf_last_error(bindings)));
+    }
+    Ok(h)
+}
+
+/// 自制 `FPDF_FILEWRITE` 回调结构（与 pdfium-render 的 `FpdfFileWriteExt` / bindgen
+/// `FPDF_FILEWRITE_` 同内存布局：`version` + `write_block` 前置两字段，pdfium 只读这两
+/// 字段；后缀自定义 `file` 字段由回调经指针还原访问）。禁止改动首两字段的类型/顺序。
+#[repr(C)]
+struct RawFileWrite<'a> {
+    version: c_int,
+    write_block: Option<unsafe extern "C" fn(*mut FPDF_FILEWRITE, *const c_void, c_ulong) -> c_int>,
+    file: &'a mut std::fs::File,
+}
+
+/// FPDF_SaveAsCopy 的写块回调：把 pdfium 产出的字节流直接写进目标临时文件（同步立即）。
+unsafe extern "C" fn raw_file_write_block(
+    this_: *mut FPDF_FILEWRITE,
+    data: *const c_void,
+    size: c_ulong,
+) -> c_int {
+    let this = unsafe { &mut *(this_ as *mut RawFileWrite) };
+    match this
+        .file
+        .write_all(unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) })
+    {
+        Ok(()) => 1,
+        Err(_) => 0,
+    }
+}
+
+/// 写回目标「被占用/只读」时的可操作指引文案（R1 专用）：唯一判据 = 用户可读句子，
+/// 供 [`is_writeback_busy_error`] 匹配 `last_modify_error`（改措辞须同步测试与 shell 层）。
+const WRITEBACK_BUSY_INSTRUCTION: &str =
+    "PDF 正被其他程序打开或文件只读；请关闭占用它的程序后重试";
+
+/// 判断 `last_modify_error` 文案是否属「目标文件被其他程序占用/只读」（shell 层 toast
+/// 据此补第二条路：另存为新副本）。
+pub fn is_writeback_busy_error(msg: &str) -> bool {
+    msg.contains(WRITEBACK_BUSY_INSTRUCTION)
+}
+
+/// Windows `rename` 覆盖被占用（无 FILE_SHARE_DELETE）/只读目标返回 ERROR_ACCESS_DENIED
+/// （std 映射 `io::ErrorKind::PermissionDenied`）：杀软/预览器可能瞬时锁住 → 短重试；
+/// 常驻占用与非「被占用/只读」类错误（磁盘满/网络/目录无权限）不重试、直接上抛。
+fn is_access_denied(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5)
+}
+
+/// 原子替换前的短重试（R2）：首跑 + ≤2 次重试、间隔 50ms（应对杀软/预览器瞬时锁）。
+/// 重试只对「被占用/只读」类错误生效；重试耗尽即最终失败，交 [`map_write_io_error`] 呈现。
+fn rename_with_retry(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    const EXTRA_RETRIES: usize = 2;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    for attempt in 0..=EXTRA_RETRIES {
+        match std::fs::rename(tmp, target) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_access_denied(&e) && attempt < EXTRA_RETRIES => {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("重试循环必然 return")
+}
+
+/// 把 rename/写盘 io 错误映射成用户可操作中文（R1）：ERROR_ACCESS_DENIED（被占用/只读）
+/// → 专属指引（注明不破坏原文件）；其余 io 错误保原文案、前缀「写回 PDF 失败：」。
+fn map_write_io_error(e: std::io::Error) -> String {
+    if is_access_denied(&e) {
+        format!("{WRITEBACK_BUSY_INSTRUCTION}（原文件未受影响、不会被破坏；修改仍在本应用内）")
+    } else {
+        format!("写回 PDF 失败：{e}")
+    }
+}
+
+/// 原子替换提交（R0a）：rename 成功则临时文件已随操作移走；失败则清理临时文件
+/// （防 `.pid.seq.tmp.pdf` 点文件残留）并映射错误文案后上抛。
+fn commit_rename(tmp: &Path, target: &Path) -> Result<()> {
+    match rename_with_retry(tmp, target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(tmp);
+            Err(anyhow!("{}", map_write_io_error(e)))
+        }
+    }
+}
+
+/// 自制 `FPDF_FILEWRITE` 回调结构（写进 `Vec<u8>` 内存缓冲）：与 [`RawFileWrite`] 同
+/// 内存布局（`version` + `write_block` 前置两字段），只把产出字节追加进缓冲而非文件。
+/// 供「待保存」内存工作副本的页面操作（插页/删页/撤销恢复）使用——不动磁盘。
+#[repr(C)]
+struct RawFileWriteVec<'a> {
+    version: c_int,
+    write_block: Option<unsafe extern "C" fn(*mut FPDF_FILEWRITE, *const c_void, c_ulong) -> c_int>,
+    buf: &'a mut Vec<u8>,
+}
+
+/// `FPDF_SaveAsCopy` 的写块回调：把 pdfium 产出的字节流直接追加进内存 `Vec<u8>`。
+unsafe extern "C" fn raw_file_write_vec_block(
+    this_: *mut FPDF_FILEWRITE,
+    data: *const c_void,
+    size: c_ulong,
+) -> c_int {
+    let this = unsafe { &mut *(this_ as *mut RawFileWriteVec) };
+    this.buf
+        .extend_from_slice(unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) });
+    1
+}
+
+/// 把 raw 句柄文档重新编码成内存 bytes（等效 [`save_raw_doc_to_file`] 但零磁盘）。
+/// 供 worker 内存工作副本（stores）的页面操作产出新镜像，由 viewer 内存级重载。
+unsafe fn save_raw_doc_to_bytes(
+    bindings: &dyn PdfiumLibraryBindings,
+    doc_handle: FPDF_DOCUMENT,
+) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut w = RawFileWriteVec {
+        version: 1,
+        write_block: Some(raw_file_write_vec_block),
+        buf: &mut buf,
+    };
+    let ok = unsafe {
+        bindings.FPDF_SaveAsCopy(doc_handle, (&mut w as *mut RawFileWriteVec).cast(), 0)
+    };
+    drop(w); // 结束对 buf 的借用；回调已同步返回
+    if !bindings.is_true(ok) {
+        return Err(anyhow!("FPDF_SaveAsCopy 失败（err={}）", fpdf_last_error(bindings)));
+    }
+    Ok(buf)
+}
+
+/// 把 raw 句柄文档保存到 `target`：先写**同目录临时文件**，成功后再原子替换目标
+/// （Windows 上 `std::fs::rename` = `MoveFileExW + MOVEFILE_REPLACE_EXISTING`，可覆盖已存
+/// 文件）。任一步失败都保留原目标文件完好（先落盘再替换，防中途损坏原文件）。
+unsafe fn save_raw_doc_to_file(
+    bindings: &dyn PdfiumLibraryBindings,
+    doc_handle: FPDF_DOCUMENT,
+    target: &Path,
+) -> Result<()> {
+    let dir = match target.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::env::temp_dir(),
+    };
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    // 同目录 . 前缀隐藏文件，随进程 id + 序号唯一；同名写回/重载无碰撞风险
+    let tmp = dir.join(format!(".{}.{seq}.tmp.pdf", std::process::id()));
+    let mut file = std::fs::File::create(&tmp)?;
+    let mut w = RawFileWrite {
+        version: 1,
+        write_block: Some(raw_file_write_block),
+        file: &mut file,
+    };
+    let ok = unsafe { bindings.FPDF_SaveAsCopy(doc_handle, (&mut w as *mut RawFileWrite).cast(), 0) };
+    drop(w); // 结束对 file 的借用；回调已同步返回
+    file.sync_all().ok();
+    drop(file); // 释放句柄后才能 rename（Windows 语义）
+    if !bindings.is_true(ok) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!("FPDF_SaveAsCopy 失败（err={}）", fpdf_last_error(bindings)));
+    }
+    // rename 成功 → 临时文件随操作移走；失败（被占用/只读/磁盘满等） → commit_rename
+    // 内清理临时文件并映射成用户可操作的中文文案（防 `.pid.seq.tmp.pdf` 点文件残留）。
+    commit_rename(&tmp, target)
+}
+
+/// worker 内“载入 raw 句柄 → edit 修改 → **内存**产出新 bytes → 更新 stores 镜像”。
+///
+/// 待保存模型（P1）的页面操作：只改 worker 内内存工作副本（stores，`FPDF_SaveAsCopy`
+/// 到 `Vec`），**绝不碰磁盘**。`before` = 操作前 stores 快照（撤销恢复用），`after` =
+/// 操作后新镜像，两者都由 viewer 持有/消费。
+fn writeback_edit_mem(
+    stores: &mut HashMap<DocId, Vec<u8>>,
+    bindings: &dyn PdfiumLibraryBindings,
+    doc_id: DocId,
+    edit: impl FnOnce(&dyn PdfiumLibraryBindings, FPDF_DOCUMENT) -> Result<usize>,
+) -> Result<MemOpResult> {
+    let before = stores
+        .get(&doc_id)
+        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法内存操作）"))?
+        .clone();
+    unsafe {
+        let raw = load_raw_doc(bindings, &before)?;
+        let count = match edit(bindings, raw) {
+            Ok(n) => n,
+            Err(e) => {
+                bindings.FPDF_CloseDocument(raw);
+                return Err(e);
+            }
+        };
+        let after = match save_raw_doc_to_bytes(bindings, raw) {
+            Ok(b) => b,
+            Err(e) => {
+                bindings.FPDF_CloseDocument(raw);
+                return Err(e);
+            }
+        };
+        bindings.FPDF_CloseDocument(raw);
+        stores.insert(doc_id, after.clone());
+        Ok(MemOpResult { before, after, count })
+    }
+}
+
+/// 页面操作的结果载荷（[`WorkerMsg::MemOpInsert`] / [`WorkerMsg::MemOpDelete`]）：含操作前
+/// 内存镜像（撤销 / 测试 MD5 用）、操作后新镜像（viewer 内存级重载）与新页数。
+#[derive(Debug, Clone)]
+pub struct MemOpResult {
+    /// 操作前的内存工作副本（撤销恢复用）。
+    pub before: Vec<u8>,
+    /// 操作后的新内存工作副本（viewer 重载显示用）。
+    pub after: Vec<u8>,
+    /// 操作后的页数。
+    pub count: usize,
+}
+
+/// worker 内“载入 raw 句柄 → edit 修改 → 落盘 → 收尾”的统一骨架。
+///
+/// - `edit` 闭包在 raw 句柄上做修改并返回「结果数」（注释条数 / 新页数）；
+/// - 成功路径：`FPDF_SaveAsCopy` 落到 `output_path`（原子替换），然后**更新内存 bytes**
+///   镜像（后续操作基于新内容）；
+/// - 失败路径：关闭 raw 句柄后原样上抛，目标文件不受影响。
+fn writeback_edit(
+    stores: &mut HashMap<DocId, Vec<u8>>,
+    bindings: &dyn PdfiumLibraryBindings,
+    doc_id: DocId,
+    output_path: &Path,
+    edit: impl FnOnce(&dyn PdfiumLibraryBindings, FPDF_DOCUMENT) -> Result<usize>,
+) -> Result<usize> {
+    let bytes = stores
+        .get(&doc_id)
+        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法写回）"))?
+        .clone();
+    unsafe {
+        let raw = load_raw_doc(bindings, &bytes)?;
+        let result_out = match edit(bindings, raw) {
+            Ok(n) => {
+                if let Err(e) = save_raw_doc_to_file(bindings, raw, output_path) {
+                    bindings.FPDF_CloseDocument(raw);
+                    return Err(e);
+                }
+                // 读回已写入的新文件 bytes 作内存镜像（后续写回/重载基于新内容）
+                if let Ok(new_bytes) = std::fs::read(output_path) {
+                    stores.insert(doc_id, new_bytes);
+                }
+                n
+            }
+            Err(e) => {
+                bindings.FPDF_CloseDocument(raw);
+                return Err(e);
+            }
+        };
+        bindings.FPDF_CloseDocument(raw);
+        Ok(result_out)
+    }
+}
+
+/// 在 raw 句柄文档上逐条创建标准注释（Highlight / StrikeOut / Underline）并回填几何。
+///
+/// 坐标约定：`QuadsPt` 为 PDF 用户空间坐标（y 向上、原点页左下）。PDF 的 QuadPoints
+/// 顶点序按 pdfium-render 官方姿势（自底左起逆时针：BL→BR→TR→TL，见其
+/// create_squiggly_annotation_under_object）；注释外接矩形 = 全部 quad 的包围盒。
+fn apply_annotations_raw(
+    bindings: &dyn PdfiumLibraryBindings,
+    doc_handle: FPDF_DOCUMENT,
+    items: &[AnnotateItem],
+) -> Result<usize> {
+    for item in items {
+        let page = unsafe { bindings.FPDF_LoadPage(doc_handle, item.page_index as c_int) };
+        if page.is_null() {
+            return Err(anyhow!("写回注释：无法加载第 {} 页", item.page_index));
+        }
+        let annot = unsafe { bindings.FPDFPage_CreateAnnot(page, item.kind.fpdf_subtype()) };
+        if annot.is_null() {
+            unsafe { bindings.FPDF_ClosePage(page) };
+            return Err(anyhow!(
+                "写回注释：FPDFPage_CreateAnnot 失败（第 {} 页）",
+                item.page_index
+            ));
+        }
+        // 默认色（Phase B 由 UI 定制）；注释级透明度 /CA：高亮半透明、删除线/下划线不透明
+        let (r, g, b) = item.kind.default_color();
+        let ca_alpha = if item.kind == AnnotKind::Highlight {
+            APOBJ_HIGHLIGHT_A
+        } else {
+            255
+        };
+        unsafe {
+            bindings.FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_COLOR, r, g, b, ca_alpha);
+        }
+        // 外接矩形（FS_RECTF 字段为 left/top/right/bottom，PDF 用户空间 y 向上）
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        let mut bottom = f32::INFINITY;
+        let mut top = f32::NEG_INFINITY;
+        for q in &item.quads {
+            left = left.min(q.x0.min(q.x1));
+            right = right.max(q.x0.max(q.x1));
+            bottom = bottom.min(q.y0.min(q.y1));
+            top = top.max(q.y0.max(q.y1));
+        }
+        if !(left.is_finite() && right.is_finite() && bottom.is_finite() && top.is_finite()) {
+            unsafe { bindings.FPDFPage_CloseAnnot(annot) };
+            unsafe { bindings.FPDF_ClosePage(page) };
+            return Err(anyhow!("写回注释：quad 坐标非法（第 {} 页）", item.page_index));
+        }
+        let rect = FS_RECTF {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        unsafe {
+            bindings.FPDFAnnot_SetRect(annot, &rect);
+            for q in &item.quads {
+                let qp = FS_QUADPOINTSF {
+                    x1: q.x0, y1: q.y0, // 左下
+                    x2: q.x1, y2: q.y0, // 右下
+                    x3: q.x1, y3: q.y1, // 右上
+                    x4: q.x0, y4: q.y1, // 左上
+                };
+                bindings.FPDFAnnot_AppendAttachmentPoints(annot, &qp);
+            }
+            // 默认可见 + 随打印输出（PDF 标准 AnnotationFlag 的 Print 位）
+            bindings.FPDFAnnot_SetFlags(annot, FPDF_ANNOT_FLAG_PRINT);
+        }
+        // 生成外观流（关键，诊断实证）：只设 Rect/QuadPoints/Color 的话，存盘后注释字典里
+        // **没有 /AP**（文件里有 /Annots+/Subtype+/QuadPoints 但无 /AP），重新打开渲染时
+        // pdfium 对无外观流的注释整页像素零差异；FPDFAnnot_AppendObject 仅支持 ink/stamp
+        // 子类型（Highlight/Underline/StrikeOut 都会失败）→ 只能用 `FPDFAnnot_SetAP` 手写
+        // 外观内容。实测本机 pdfium(.8035)：SetAP 生成的 /AP/N Form XObject 的 **BBox =
+        // 注释矩形（页用户空间坐标）**、无 /Matrix，即内容按**页坐标**绘制（不是 BBox 的
+        // 0..W×0..H 局部坐标）——若按局部坐标写会被裁剪在注释矩形外、整页像素零差异。
+        let (fr, fg, fb) = item.kind.default_color();
+        // 高亮半透明：pdfium 的 SetAP 已自动在 AP 的 /Resources 里生成
+        // `ExtGState/GS (CA=.431)`（因为 SetColor 传了 alpha<255），内容里须显式 `/GS gs`
+        // 激活它才会半透明（否则 ExtGState 定义但未被引用 = 纯色填充覆盖正文）；不透明类型无 gs。
+        let mut content = String::from("q\n");
+        if item.kind == AnnotKind::Highlight {
+            content.push_str("/GS gs\n");
+        }
+        content.push_str(&format!(
+            "{} {} {} rg\n",
+            fr as f32 / 255.0,
+            fg as f32 / 255.0,
+            fb as f32 / 255.0
+        ));
+        for q in &item.quads {
+            let (qx0, qy0) = (q.x0.min(q.x1), q.y0.min(q.y1));
+            let (qx1, qy1) = (q.x0.max(q.x1), q.y0.max(q.y1));
+            let (qw, qh) = ((qx1 - qx0).max(1.0), (qy1 - qy0).max(1.0));
+            let (ly, lh) = match item.kind {
+                // 高亮整块填充；删除线居中细条；下划线贴底——全部用页坐标
+                AnnotKind::Highlight => (qy0, qh),
+                AnnotKind::Strikeout => {
+                    let c = (qy0 + qy1) * 0.5;
+                    (c - APOBJ_LINE_H * 0.5, APOBJ_LINE_H)
+                }
+                AnnotKind::Underline => (qy0 - APOBJ_LINE_H * 0.25, APOBJ_LINE_H),
+            };
+            content.push_str(&format!("{} {} {} {} re f\n", qx0, ly, qw, lh));
+        }
+        content.push('Q');
+        // FPDF_WIDESTRING（FPDFAnnot_SetAP 只收指针无长度）按 pdfium C 约定必须 C 风格
+        // **u16 零结尾**（对照 pdfium-render utils::utf16le 注释「expects C-style null
+        // termination」）——补尾零防 pdfium 端 wcslen 越过缓冲区读到随机零（隐性越界）。
+        let mut wide: Vec<u16> = content.encode_utf16().collect();
+        wide.push(0);
+        let ok = unsafe {
+            bindings.FPDFAnnot_SetAP(
+                annot,
+                0, // FPDF_ANNOT_APPEARANCEMODE_NORMAL
+                wide.as_ptr(),
+            )
+        };
+        if !bindings.is_true(ok) {
+            unsafe {
+                bindings.FPDFPage_CloseAnnot(annot);
+                bindings.FPDF_ClosePage(page);
+            }
+            return Err(anyhow!("写回注释：FPDFAnnot_SetAP 失败（第 {} 页）", item.page_index));
+        }
+        unsafe {
+            bindings.FPDFPage_CloseAnnot(annot);
+            bindings.FPDF_ClosePage(page);
+        }
+    }
+    Ok(items.len())
+}
+
+/// 删除线/下划线细条的视觉厚度（PDF 点，~1px@72dpi）。
+const APOBJ_LINE_H: f32 = 3.0;
+/// 高亮注释注释级透明度（/CA，0-255）：≈0.43 半透明，正文不被遮挡。
+const APOBJ_HIGHLIGHT_A: u32 = 110;
+
+/// 读回某页注释（only-read，走 pdfium-render 高层 `page.annotations()`；供测试断言/Phase B）。
+/// 只摘 Highlight/Underline/Strikeout 的几何：每个附件点多边形折算成 quad 包围盒（PDF 点）。
+fn read_annotations(doc: &PdfDocument<'_>, page_index: usize) -> Option<Vec<AnnotationInfo>> {
+    use PdfPageAnnotationType as T;
+    let page = doc.pages().get(page_index as i32).ok()?;
+    let mut out = Vec::new();
+    for a in page.annotations().iter() {
+        let kind = match a.annotation_type() {
+            T::Highlight => AnnotKind::Highlight,
+            T::Underline => AnnotKind::Underline,
+            T::Strikeout => AnnotKind::Strikeout,
+            _ => continue,
+        };
+        let mut quads = Vec::new();
+        for qp in a.attachment_points().iter() {
+            let (l, r) = (qp.left().value.min(qp.right().value), qp.left().value.max(qp.right().value));
+            let (b, t) = (qp.bottom().value.min(qp.top().value), qp.bottom().value.max(qp.top().value));
+            quads.push(QuadPt {
+                x0: l,
+                y0: b,
+                x1: r,
+                y1: t,
+            });
+        }
+        if quads.is_empty() {
+            continue;
+        }
+        out.push(AnnotationInfo { kind, quads });
+    }
+    Some(out)
+}
+
 
 /// 全局自增文档 ID（进程级原子）。
 fn next_doc_id() -> DocId {
@@ -996,6 +1816,78 @@ fn search_slice(docs: &mut HashMap<DocId, PdfDocument<'_>>, ps: &mut PendingSear
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R1/R4（纯逻辑，不触 pdfium）：错误映射按 io kind 区分——PermissionDenied →
+    /// 可操作中文 + 注明不破坏原文件；其余 io 错误保原文案、前缀「写回 PDF 失败：」。
+    #[test]
+    fn write_io_error_maps_busy_vs_other() {
+        let busy = map_write_io_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(is_writeback_busy_error(&busy), "被占用/只读应命中 busy 文案: {busy}");
+        assert!(
+            busy.contains("PDF 正被其他程序打开或文件只读；请关闭占用它的程序后重试")
+                && busy.contains("原文件未受影响"),
+            "busy 文案应含指引与不破坏原文件说明: {busy}"
+        );
+        let other = map_write_io_error(std::io::Error::new(std::io::ErrorKind::Other, "磁盘空间不足"));
+        assert!(!is_writeback_busy_error(&other), "非占用错误不应命中 busy: {other}");
+        assert!(
+            other.starts_with("写回 PDF 失败：") && other.contains("磁盘空间不足"),
+            "其余 io 错误应保原文案加前缀: {other}"
+        );
+        // is_access_denied 的 Windows 裸码分支：ERROR_ACCESS_DENIED = 5
+        assert!(is_access_denied(&std::io::Error::from_raw_os_error(5)));
+        assert!(!is_access_denied(&std::io::Error::from_raw_os_error(112)));
+    }
+
+    /// R2/R4：rename 成功分支与「重试耗尽最终失败」分支（目标为已存在目录 → rename 必败）。
+    #[test]
+    fn rename_with_retry_succeeds_or_gives_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "pdf-rename-retry-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录应成功");
+        // 成功分支：tmp → target（同目录），rename 应移走 tmp 并落到 target
+        let tmp_ok = dir.join("src.pdf");
+        let tgt_ok = dir.join("dst.pdf");
+        std::fs::write(&tmp_ok, b"hello").expect("写 tmp 应成功");
+        rename_with_retry(&tmp_ok, &tgt_ok).expect("正常 rename 应成功");
+        assert!(!tmp_ok.exists() && tgt_ok.is_file(), "成功应移走 tmp 并生成 target");
+        // 最终失败分支：target 为已存在目录 → 任何平台 rename 都必败（重试耗尽后上抛）
+        let tmp_fail = dir.join("src2.pdf");
+        std::fs::write(&tmp_fail, b"hello").expect("写 tmp 应成功");
+        let tgt_dir = dir.join("existing_dir");
+        std::fs::create_dir_all(&tgt_dir).expect("建目录应成功");
+        let r = rename_with_retry(&tmp_fail, &tgt_dir);
+        assert!(r.is_err(), "覆盖已存在目录应失败");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R0a/R4：rename 失败时临时文件必须被清理（不留 `.pid.seq.tmp.pdf` 点文件），
+    /// 且错误上抛为带语义的 anyhow（非裸 io Display「拒绝访问」）。
+    #[test]
+    fn commit_rename_failure_cleans_tmp() {
+        let dir = std::env::temp_dir().join(format!(
+            "pdf-commit-clean-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录应成功");
+        let tmp = dir.join(".pid.seq.tmp.pdf");
+        std::fs::write(&tmp, b"hello").expect("写 tmp 应成功");
+        let tgt_dir = dir.join("existing_dir");
+        std::fs::create_dir_all(&tgt_dir).expect("建目录应成功");
+        let err = commit_rename(&tmp, &tgt_dir).expect_err("覆盖已存在目录应失败");
+        assert!(!tmp.exists(), "rename 失败后临时文件应被清理: {}", tmp.display());
+        let msg = format!("{err:#}");
+        assert!(!msg.is_empty(), "错误文案不应为空");
+        assert!(
+            msg.contains("写回 PDF 失败：") || is_writeback_busy_error(&msg),
+            "错误文案应带写回语义前缀或占用指引: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 校验内嵌 byte 确实是有效 PE 可执行（`MZ` + `PE\0\0`）。
     /// 若磁盘上的 dll 仍在，再确认内嵌与磁盘一致（embed 来源正确）。

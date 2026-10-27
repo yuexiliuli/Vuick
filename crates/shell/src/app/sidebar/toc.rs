@@ -3,6 +3,7 @@
 
 use super::*;
 use ::toc; // 显式导入外部 crate `toc`（本子模块名与之同名，需显式绑定避免 glob 遮蔽）
+use super::super::pdf_bookmarks; // Phase B3：PDF 书签存储模块（app 私有子模块）
 
 impl EditorApp {
     /// 折叠/展开某个目录父项（仅「有下级」的条目可折叠）。
@@ -61,10 +62,19 @@ impl EditorApp {
         let page_col_w = 34.0f32;
         let max_row = if let MediaReader::Pdf(pdf) = &tab.reader {
             let outlines = pdf.read(cx).outlines();
-            outlines
+            let mut w = outlines
                 .iter()
                 .map(|e| Self::toc_row_width(e.level, &e.title, font_px) + page_col_w)
-                .fold(0.0f32, f32::max)
+                .fold(0.0f32, f32::max);
+            // Phase B3：书签区段行宽（标题 + 页码 + 删除 × 的额外列）。
+            let bm_path = pdf.read(cx).path().to_path_buf();
+            if let Some(bms) = self.pdf_bookmarks_for(&bm_path) {
+                w = bms
+                    .iter()
+                    .map(|b| Self::toc_row_width(0, &b.title, font_px) + page_col_w + 22.0)
+                    .fold(w, f32::max);
+            }
+            w
         } else {
             // P4-2：MD / EPUB 目录都来自统一 WyEditor 只读宿主。
             let entries = self
@@ -148,23 +158,53 @@ impl EditorApp {
         let inner: gpui::AnyElement = match self.tabs.get(self.active_tab) {
             Some(tab) => {
                 let collapsed = self.sidebar.toc_collapsed.clone();
-                // PDF 书签目录
+                // PDF 书签目录 + Phase B3 「书签」区段（阅读位置书签：点击跳页、× 删除）
                 if let MediaReader::Pdf(pdf) = &tab.reader {
                     let outlines = pdf.read(cx).outlines().to_vec();
+                    let mut blocks: Vec<gpui::AnyElement> = Vec::new();
                     if outlines.is_empty() {
-                        ui::empty_state::compact_empty_state(
-                            "sidebar-toc-empty",
-                            IconName::File,
-                            "当前 PDF 无书签目录",
-                            cx,
-                        )
+                        blocks.push(
+                            ui::empty_state::compact_empty_state(
+                                "sidebar-toc-empty",
+                                IconName::File,
+                                "当前 PDF 无书签目录",
+                                cx,
+                            )
+                            .into_any_element(),
+                        );
                     } else {
                         let rows = self.sidebar_toc_pdf_rows(
                             window, &outlines, &collapsed, fg, muted, active_bg, accent,
                             pdf.clone(), cx,
                         );
-                        div().flex().flex_col().py_1().children(rows).into_any_element()
+                        blocks.push(
+                            div().flex().flex_col().py_1().children(rows).into_any_element(),
+                        );
                     }
+                    // 书签区段：路径关联持久化（pdf_bookmarks）；无书签不占版面。
+                    let bm_path = pdf.read(cx).path().to_path_buf();
+                    if let Some(bms) = self.pdf_bookmarks_for(&bm_path)
+                        && !bms.is_empty()
+                    {
+                        blocks.push(
+                            div()
+                                .id("sidebar-toc-bookmarks")
+                                .debug_selector(|| "sidebar-toc-bookmarks".into())
+                                .flex()
+                                .items_center()
+                                .px(px(8.))
+                                .h(px(26.))
+                                .text_size(px(11.))
+                                .text_color(muted)
+                                .child("书签")
+                                .into_any_element(),
+                        );
+                        let rows = self.sidebar_toc_bookmark_rows(
+                            window, &bm_path, bms, fg, muted, active_bg, accent, pdf.clone(), cx,
+                        );
+                        blocks.push(div().flex().flex_col().pb_1().children(rows).into_any_element());
+                    }
+                    div().flex().flex_col().children(blocks).into_any_element()
                 } else {
                     // Markdown 标题（P4-2：MD / EPUB 目录都来自统一 WyEditor 宿主）。
                     let tab = self.tabs.get(active);
@@ -363,6 +403,107 @@ impl EditorApp {
                 toggle_collapse,
             ));
         }
+        rows
+    }
+
+    /// Phase B3：PDF「书签」区段条目（阅读位置书签：页码 + 标题）。点击 → 跳页
+    /// （`scroll_to_page`）；右侧小「×」→ 删除该条（`stop_propagation` 防误触跳转，
+    /// 对照 toc caret 折叠防误点同款姿势）。
+    fn sidebar_toc_bookmark_rows(
+        &self,
+        window: &mut Window,
+        path: &std::path::Path,
+        bms: &[pdf_bookmarks::PdfBookmark],
+        fg: gpui::Hsla,
+        muted: gpui::Hsla,
+        hover_bg: gpui::Hsla,
+        accent: gpui::Hsla,
+        pdf: gpui::Entity<pdf::PdfViewer>,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(bms.len());
+        for (i, bm) in bms.iter().enumerate() {
+            let page_index = bm.page_index;
+            let title = bm.title.clone();
+            let wk = pdf.clone();
+            let del_path = path.to_path_buf();
+            let del_id = format!("sidebar-toc-bookmark-del-{i}");
+            // 删除钮（小 ×）：stop_propagation 防触发整行跳页。
+            let del = div()
+                .id(SharedString::from(del_id.clone()))
+                .debug_selector(move || del_id.clone())
+                .w(px(18.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .text_size(px(12.))
+                .text_color(muted)
+                .hover(|style| style.bg(hover_bg))
+                .active(|style| style.bg(hover_bg.opacity(0.8)))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .on_click(cx.listener(
+                    move |this: &mut EditorApp, _ev: &gpui::ClickEvent, _w, cx| {
+                        cx.stop_propagation();
+                        this.remove_pdf_bookmark(&del_path, i, cx);
+                    },
+                ))
+                .child("×");
+            let row_id = format!("sidebar-toc-bookmark-{i}");
+            let row_id2 = row_id.clone();
+            let row = div()
+                .id(SharedString::from(row_id))
+                .debug_selector(move || row_id2.clone())
+                .h(px(28.))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .pl(px(10.))
+                .pr(px(6.))
+                .rounded(px(4.))
+                .hover(|style| style.bg(hover_bg))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .on_click(cx.listener(
+                    move |_: &mut EditorApp, _ev: &gpui::ClickEvent, _w, cx| {
+                        wk.update(cx, |v, cx| {
+                            v.scroll_to_page(page_index);
+                            cx.notify();
+                        });
+                    },
+                ))
+                .child(
+                    div()
+                        .w(px(5.))
+                        .h(px(5.))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(accent),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                        .text_size(px(12.5))
+                        .text_color(fg)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .pl_2()
+                        .text_size(px(10.5))
+                        .text_color(muted)
+                        .child((page_index + 1).to_string()),
+                )
+                .child(del);
+            rows.push(row.into_any_element());
+        }
+        let _ = window;
         rows
     }
 

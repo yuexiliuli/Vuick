@@ -67,15 +67,26 @@ impl EditorApp {
         reader.is_lockable().then_some(reader)
     }
 
-    /// 图片/视频右键 → 在光标处弹「锁定/解锁」上下文菜单（仅活动选项卡是图片/视频时
-    /// 生效）。锁定 = 隐藏全部非媒体 UI、媒体充满窗口；解锁回归。就地换掉旧的（若已打开）。
-    /// 装配/焦点/订阅闭环收敛自 `ui::menu::spawn_context_menu`。
+    /// 右键 → 活动选项卡是媒体（图片/视频/PDF）时弹相应上下文菜单。图片/视频 →
+    /// 「锁定/解锁」；PDF → Phase B2 的 PdfViewer 页操作菜单（`on_pdf_right_click`，
+    /// PDF 无锁定语义，归入菜单槽位分派）。
     pub(super) fn on_media_right_click(
         &mut self,
         ev: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Phase B2：PDF 分支（此前 `is_lockable()` 过滤掉了 Pdf）。事件统一经根元素
+        // 冒泡到此，PDF 无「锁定」菜单，直接分派给页操作菜单。
+        let is_pdf = self
+            .tabs
+            .get(self.active_tab)
+            .map(|t| matches!(t.reader, MediaReader::Pdf(_)))
+            .unwrap_or(false);
+        if is_pdf {
+            self.on_pdf_right_click(ev, window, cx);
+            return;
+        }
         let Some(media) = self.active_media_viewer() else {
             return;
         };

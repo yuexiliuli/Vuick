@@ -25,6 +25,31 @@ impl PdfViewer {
         }
     }
 
+    /// 测试探针（shell `app::tests` 用）：**同步**把某页文本读入缓存（阻塞等 worker，
+    /// 超时/失败返回 false）。摆脱「可见页预取」时序——shell 测试定位字符盒（拖选起点）
+    /// 前先调它，保证 `char_window_pos` 对任意页可用。缺文本层的页返回 `true`（空文本）。
+    pub fn load_text_for_test(&mut self, page: usize) -> bool {
+        let Some(worker) = self.worker.clone() else {
+            return false;
+        };
+        if page >= self.dims.len() || self.doc_id == 0 {
+            return false;
+        }
+        if self.text_pages.contains_key(&page) {
+            return true;
+        }
+        let rx = worker.request_text(self.doc_id, page);
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(res) => {
+                if let Some(text) = res {
+                    self.cache_text_page(page, text);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// 回收已完成的在途文本结果。返回是否有**新**文本入缓存（供调用方决定是否重绘）。
     pub(super) fn collect_text_results(&mut self) -> bool {
         let finished: Vec<(usize, Option<PageText>)> = self

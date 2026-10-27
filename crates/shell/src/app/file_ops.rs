@@ -1324,6 +1324,21 @@ impl EditorApp {
         let Some(tab) = self.tabs.get(idx) else {
             return false;
         };
+        // PDF 选项卡（待保存模型）：**绝不允许**走文本 `write_to_path`（编辑区为空，
+        // 那会把 PDF 整文件覆写成空文本）。改为触发 `PdfViewer::save`（待存注释合并 +
+        // 内存工作副本原子写盘）；无待存 → 视为已保存。
+        if let MediaReader::Pdf(pdf) = &tab.reader {
+            let dirty = pdf.read(cx).is_dirty();
+            if !dirty {
+                self.status = SharedString::from("已保存（无未保存修改）");
+                self.status_ok = true;
+                return true;
+            }
+            // save 异步完成：成功清 dirty + notify（observe 同步 tab dirty 圆点回落；
+            // 失败经 last_modify_error → observe toast）。此处不写「保存中」状态
+            // （异步完成时刻不再收口 status，避免留下过期的「正在保存…」文案）。
+            return pdf.update(cx, |v, cx| v.save(cx));
+        }
         let Some(p) = tab.file_path.clone() else {
             return self.save_tab_as(idx, window, cx);
         };
@@ -1341,6 +1356,54 @@ impl EditorApp {
     ) -> bool {
         if idx >= self.tabs.len() {
             return false;
+        }
+        // PDF 另存为（待保存模型）：把内存工作副本（含待存注释合并）写到用户选的新路径；
+        // 成功后阅读器重指新路径并清 dirty（原文件保持原样）。另存走 PdfViewer::save_as。
+        let pdf: Option<gpui::Entity<pdf::PdfViewer>> = self
+            .tabs
+            .get(idx)
+            .and_then(|t| match &t.reader {
+                MediaReader::Pdf(p) => Some(p.clone()),
+                _ => None,
+            });
+        if let Some(pdf) = pdf {
+            let base_name = pdf
+                .read(cx)
+                .path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "document".to_string());
+            let entity = cx.entity();
+            #[cfg(not(test))]
+            {
+                let pdf2 = pdf.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        let Some(file) = rfd::AsyncFileDialog::new()
+                            .set_title("另存为 PDF")
+                            .set_file_name(format!("{base_name}_另存.pdf"))
+                            .save_file()
+                            .await
+                        else {
+                            return;
+                        };
+                        let out = file.path().to_path_buf();
+                        let _ = cx.update_window_entity(&entity, |this, _w, cx| {
+                            let p = pdf2.clone();
+                            p.update(cx, |v, cx| v.save_as(out, cx));
+                            if let Some(err) = pdf2.read(cx).last_modify_error().map(|s| s.to_string()) {
+                                this.pdf_toast("另存为失败", crate::app::pdf_menu::pdf_modify_error_msg(&err));
+                            }
+                        });
+                    })
+                    .detach();
+                let _ = base_name;
+            }
+            #[cfg(test)]
+            {
+                let _ = (window, cx, pdf, base_name, entity);
+            }
+            return true;
         }
         let file_name = self.tab_file_name(idx);
         // 同 `save_tab`：WYSIWYG 开启时读 WyEditor 实时内容，而非陈旧的编辑区。

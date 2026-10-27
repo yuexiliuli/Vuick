@@ -59,6 +59,14 @@ impl PdfViewer {
             window_sig: None,
             window_settled: false,
             idle_gate_skips: 0,
+            reload_anchor: None,
+            last_modify_error: None,
+            sel_card: None,
+            pending_annots: Vec::new(),
+            undo_stack: VecDeque::new(),
+            pending_page_ops: 0,
+            next_annot_id: 0,
+            focused_annot: None,
         };
         this.start_load(cx);
         this
@@ -82,29 +90,7 @@ impl PdfViewer {
             let _ = weak.update(cx, |this, cx| {
                 match result {
                     Ok((worker, doc_id, dims, outlines)) => {
-                        this.worker = Some(worker);
-                        this.doc_id = doc_id;
-                        this.dims = dims;
-                        this.outlines = outlines;
-                        let (tops, total) = compute_layout(&this.dims, this.page_width());
-                        this.page_tops = tops;
-                        this.total_height = total;
-                        this.slots = vec![Slot::default(); this.dims.len()];
-                        this.loading = false;
-                        if timing_view() {
-                            eprintln!(
-                                "[{:.1}ms] [VIEW-OPEN-DONE] pages={} tops0={:.1} total={:.1}",
-                                crate::pdf::timing_ms(),
-                                this.dims.len(),
-                                this.page_tops.first().copied().unwrap_or(0.0),
-                                this.total_height,
-                            );
-                        }
-                        // 关键：`refresh_windows()` 无条件要求重绘（不依赖实体被窗口 tracking）。
-                        // 仅 `notify()` 在实体未注册 window invalidator 时是空操作 → 首帧后
-                        // 永远不会再跑 `ensure_window` → 瓦片/封面从未被调度（“CPU 低、不变化”）。
-                        cx.refresh_windows();
-                        cx.notify();
+                        this.apply_loaded(worker, doc_id, dims, outlines, cx);
                     }
                     Err(e) => {
                         this.loading = false;
@@ -116,6 +102,70 @@ impl PdfViewer {
             });
         })
         .detach();
+    }
+
+    /// 打开成功后的统一装配（`start_load` 磁盘打开与待保存模型 `open_from_bytes`
+    /// 内存打开共用）：铺页槽、旧位图转 pending_drops、恢复重载锚点、刷新窗口。
+    fn apply_loaded(
+        &mut self,
+        worker: PdfWorker,
+        doc_id: DocId,
+        dims: Vec<(f32, f32)>,
+        outlines: Vec<PdfOutlineEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.worker = Some(worker);
+        self.doc_id = doc_id;
+        self.dims = dims;
+        self.outlines = outlines;
+        let (tops, total) = compute_layout(&self.dims, self.page_width());
+        self.page_tops = tops;
+        self.total_height = total;
+        // 替换槽位前，旧槽的 GPU 位图（封面/缩略/中清/瓦片）先转入 pending_drops，
+        // 由下一帧 ensure_window 逐个 cx.drop_image 下线（仅丢 Arc 不 drop_image
+        // 会累积显存提交，K14；写回重载路径此前漏此步 → 每次修改泄漏整页显存）。
+        let mut old_images: Vec<std::sync::Arc<gpui::RenderImage>> = Vec::new();
+        for mut slot in self.slots.drain(..) {
+            if let Some(arc) = slot.cover.take() {
+                old_images.push(arc);
+            }
+            if let Some(arc) = slot.prev_cover.take() {
+                old_images.push(arc);
+            }
+            if let Some(arc) = slot.thumb.take() {
+                old_images.push(arc);
+            }
+            if let Some(arc) = slot.mid.take() {
+                old_images.push(arc);
+            }
+            for (_, ts) in slot.tiles.drain() {
+                old_images.push(ts.image);
+            }
+        }
+        self.pending_drops.extend(old_images);
+        self.slots = vec![Slot::default(); self.dims.len()];
+        self.loading = false;
+        // 重载锚点：恢复滚动到目标页（越界夹取到末页；None 保持首帧原位）
+        if let Some(anchor) = self.reload_anchor.take() {
+            let p = anchor.min(self.dims.len().saturating_sub(1));
+            if let Some(top) = self.page_tops.get(p).copied() {
+                self.scroll.set_offset(gpui::point(px(0.), px(-top)));
+            }
+        }
+        if timing_view() {
+            eprintln!(
+                "[{:.1}ms] [VIEW-OPEN-DONE] pages={} tops0={:.1} total={:.1}",
+                crate::pdf::timing_ms(),
+                self.dims.len(),
+                self.page_tops.first().copied().unwrap_or(0.0),
+                self.total_height,
+            );
+        }
+        // 关键：`refresh_windows()` 无条件要求重绘（不依赖实体被窗口 tracking）。
+        // 仅 `notify()` 在实体未注册 window invalidator 时是空操作 → 首帧后
+        // 永远不会再跑 `ensure_window` → 瓦片/封面从未被调度（“CPU 低、不变化”）。
+        cx.refresh_windows();
+        cx.notify();
     }
 
     /// 滚动到指定页（目录跳转）。页码越界时忽略。
@@ -130,6 +180,11 @@ impl PdfViewer {
     /// 页数（文档尚未加载完时为 0）。P4 拆 crate 后根包 app::tests 亦消费，取消 `cfg(test)`。
     pub fn page_count(&self) -> usize {
         self.dims.len()
+    }
+
+    /// 当前文档路径（Phase B 书签按路径关联持久化用）。
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// 当前第一张可见页（1 基）与总页数（状态栏滚动位置显示用）。
@@ -234,6 +289,12 @@ impl PdfViewer {
         self.sel_anchor = None;
         self.sel_active = None;
         self.selecting = false;
+        self.sel_card = None;
+        // 待保存状态随文档一起释放（关闭标签 = 放弃待存；磁盘从未被触碰）
+        self.pending_annots.clear();
+        self.undo_stack.clear();
+        self.pending_page_ops = 0;
+        self.focused_annot = None;
         // 检索随文档一起释放
         self.search_query.clear();
         self.search_matches.clear();
@@ -271,6 +332,12 @@ impl PdfViewer {
         }
         for arc in std::mem::take(&mut self.pending_drops) {
             cx.drop_image(arc, Some(window));
+        }
+        // Phase B1：选中弹卡挂起期间任一来源的滚动（滚轮 / 滚动条 / 跳页）都使偏移变化
+        // → 关闭卡片，防卡片锚点贴死旧选区位置（与鼠标跟随的重选不同源）。
+        if self.sel_card.is_some() && self.sel_card.as_ref().is_some_and(|s| s.scroll != self.scroll.offset()) {
+            self.sel_card = None;
+            cx.notify();
         }
         if self.dims.is_empty() || self.worker.is_none() {
             return;
@@ -460,4 +527,460 @@ impl PdfViewer {
         //    `ensure_window` 才收集——启动 ~16ms 泵直到在途瓦片清空（静置也能出图）。
         self.ensure_tile_pump(cx);
     }
+
+    // ---- 待保存模型（P1）：注释只进内存叠加层 + 页面操作内存级 + save() 才写盘 ----
+
+    /// 追加一条**待保存**注释（只进内存叠加层 + 置脏；**零磁盘零重载**，`save()` 时才由
+    /// worker 合并写盘）。`quads_pt` = 页内 PDF 点矩形 `[x0, y0, x1, y1]`（y 向上；每页
+    /// 可传多个矩形即跨行选区）。
+    pub fn add_annotation(
+        &mut self,
+        page_index: usize,
+        kind: AnnotKind,
+        quads_pt: Vec<[f32; 4]>,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_pending_annot(
+            page_index,
+            kind,
+            quads_pt
+                .into_iter()
+                .map(|q| QuadPt { x0: q[0], y0: q[1], x1: q[2], y1: q[3] })
+                .collect(),
+            cx,
+        );
+    }
+
+    /// 内部：把一条注释记入 pending + 撤销栈 + 置脏（页号越界 / 无几何 → 忽略）。零磁盘。
+    pub(super) fn push_pending_annot(
+        &mut self,
+        page_index: usize,
+        kind: AnnotKind,
+        quads_pt: Vec<QuadPt>,
+        cx: &mut Context<Self>,
+    ) {
+        if page_index >= self.dims.len() {
+            self.last_modify_error = Some(format!("页码越界：第 {page_index} 页"));
+            return;
+        }
+        if quads_pt.is_empty() {
+            return;
+        }
+        self.next_annot_id += 1;
+        let annot = PendingAnnot { id: self.next_annot_id, page: page_index, kind, quads_pt };
+        self.pending_annots.push(annot.clone());
+        self.undo_stack.push_back(UndoEntry::RemoveAnnot { id: annot.id });
+        cx.notify();
+    }
+
+    /// 把一批注释（跨页选区）全部记入**待存**（Phase A 的批量落盘改为批量待存）：撤销栈
+    /// 逐条记录、dirty 派生置真；**零磁盘零 reload**（叠加层渲染即时上屏）。
+    pub(super) fn submit_annotations(&mut self, items: Vec<AnnotateItem>, cx: &mut Context<Self>) {
+        for item in items {
+            self.push_pending_annot(item.page_index, item.kind, item.quads, cx);
+        }
+    }
+
+    /// 是否有待保存修改（注释非空 || 页面操作计数非 0）。壳层关闭提示 / dirty 圆点用。
+    pub fn is_dirty(&self) -> bool {
+        !self.pending_annots.is_empty() || self.pending_page_ops != 0
+    }
+
+    /// 待存注释条数（测试 / 壳层断言）。
+    pub fn pending_annot_count(&self) -> usize {
+        self.pending_annots.len()
+    }
+
+    /// 当前「灰框」焦注释 id（右键「删除注释」用；None = 无）。
+    pub fn focused_annot_id(&self) -> Option<u64> {
+        self.focused_annot
+    }
 }
+
+/// 待保存页面操作的种类（[`PdfViewer::submit_mem_op`]）：只改 worker 内存工作副本。
+enum MemOpKind {
+    /// 在 `at_index` 处插入一页空白页（0 基；= 当前页数即末尾追加）。
+    Insert { at_index: usize, w: f32, h: f32, anchor: usize },
+    /// 删除第 `index` 页。
+    Delete { index: usize, anchor: usize },
+}
+
+impl PdfViewer {
+    /// 提交一次**内存级**页面操作（插页/删页）：worker 只改内存工作副本、**不写盘**，
+    /// 成功回传新镜像 → viewer 内存级重载；待存注释页号随后平移/丢弃；撤销栈记录
+    /// 逆操作（恢复操作前字节镜像 + 注释快照）。失败记 [`Self::last_modify_error`]。
+    fn submit_mem_op(&mut self, op: MemOpKind, cx: &mut Context<Self>) {
+        let Some(worker) = self.worker.clone() else {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        };
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        }
+        let doc_id = self.doc_id;
+        self.last_modify_error = None;
+        let anchor = match op {
+            MemOpKind::Insert { anchor, .. } | MemOpKind::Delete { anchor, .. } => anchor,
+        };
+        // 页号平移闭包：插页 → 原 ≥ at_index 的待存注释 +1；删页 → 原 > index 的 -1、
+        // == index 的丢弃（在待存注释上原地平移，确保结构变化后叠加重载仍对位）。
+        let shift: Box<dyn Fn(&mut Vec<PendingAnnot>) + Send> = match op {
+            MemOpKind::Insert { at_index, .. } => {
+                Box::new(move |annots| {
+                    for a in annots.iter_mut() {
+                        if a.page >= at_index {
+                            a.page += 1;
+                        }
+                    }
+                })
+            }
+            MemOpKind::Delete { index, .. } => {
+                Box::new(move |annots| {
+                    annots.retain(|a| a.page != index);
+                    for a in annots.iter_mut() {
+                        if a.page > index {
+                            a.page -= 1;
+                        }
+                    }
+                })
+            }
+        };
+        // ⚠️ 必须 `.detach()`（K37）：不 detach 句柄在 drop 即取消，页操作静默不执行。
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { match op {
+                MemOpKind::Insert { at_index, w, h, .. } => {
+                    worker.mem_insert_blank_page(doc_id, at_index, w, h)
+                }
+                MemOpKind::Delete { index, .. } => worker.mem_delete_page(doc_id, index),
+            } }).await;
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok(mem) => {
+                    v.last_modify_error = None;
+                    // 撤销条目：恢复操作前的内存镜像 + 操作前待存注释快照
+                    v.undo_stack.push_back(UndoEntry::RestoreMemory {
+                        bytes: mem.before,
+                        annots_before: v.pending_annots.clone(),
+                    });
+                    v.pending_page_ops += 1;
+                    shift(&mut v.pending_annots);
+                    // 结构变了 → 灰框几何可能漂移，清空最稳
+                    v.focused_annot = None;
+                    v.open_from_bytes(mem.after, Some(anchor), cx);
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 在 `page_index` 之后插入一页空白页（**内存级**：只改 worker 内存工作副本并重载，
+    /// **不写盘**；`save()` 时才落盘）。（新页尺寸 = 当前页；插入后滚动到新页。）
+    pub fn insert_blank_page_after(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        let Some(&(w, h)) = self.dims.get(page_index) else {
+            self.last_modify_error = Some(format!("页码越界：第 {page_index} 页"));
+            return;
+        };
+        self.submit_mem_op(
+            MemOpKind::Insert { at_index: page_index + 1, w, h, anchor: page_index + 1 },
+            cx,
+        );
+    }
+
+    /// 删除 `page_index` 页（**内存级**：不写盘；仅剩 1 页拒绝）；删除后滚动保位（夹取）。
+    pub fn delete_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        if page_index >= self.dims.len() {
+            self.last_modify_error = Some(format!("页码越界：第 {page_index} 页"));
+            return;
+        }
+        if self.dims.len() <= 1 {
+            self.last_modify_error = Some("不能删除仅剩的 1 页".into());
+            return;
+        }
+        self.submit_mem_op(MemOpKind::Delete { index: page_index, anchor: page_index }, cx);
+    }
+
+    /// 把 `page_index` 页提取成独立 PDF 文件并原子写盘（源文档不变，**即时生效、不影响
+    /// 当前 dirty**——提取本质是「另存为新文件」）。
+    pub fn extract_page_to(&mut self, page_index: usize, out_path: PathBuf, cx: &mut Context<Self>) {
+        if page_index >= self.dims.len() {
+            self.last_modify_error = Some(format!("页码越界：第 {page_index} 页"));
+            return;
+        }
+        let Some(worker) = self.worker.clone() else {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        };
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        }
+        let doc_id = self.doc_id;
+        self.last_modify_error = None;
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { worker.extract_page_to(doc_id, page_index, out_path) })
+                .await;
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok(_) => {
+                    v.last_modify_error = None;
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 显式保存（Ctrl+S / 保存菜单）：把待存注释合并 + 内存工作副本原子写盘。无待存 →
+    /// 直接返回 false（已是干净态）；发起异步保存返回 true——成功清 pending/undo/dirty
+    /// 并 notify，失败记 [`Self::last_modify_error`]（壳层经 `_pdf_sub` toast 透出）。
+    pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
+        self.submit_save(cx).is_some()
+    }
+
+    /// 另存为：把**当前内容**（内存工作副本 + 待存注释合并）写到 `new_path`，成功后当前
+    /// 阅读器重指新路径并清 dirty（原文件保持原样）。失败记 [`Self::last_modify_error`]，
+    /// 当前文档/待存状态不变。异步 fire-and-forget（壳层「另存为」对话框后调用）。
+    pub fn save_as(&mut self, new_path: PathBuf, cx: &mut Context<Self>) {
+        let Some(worker) = self.worker.clone() else {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        };
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        }
+        let doc_id = self.doc_id;
+        self.last_modify_error = None;
+        let has_annots = !self.pending_annots.is_empty();
+        let items: Vec<AnnotateItem> = self
+            .pending_annots
+            .iter()
+            .map(|a| AnnotateItem { page_index: a.page, kind: a.kind, quads: a.quads_pt.clone() })
+            .collect();
+        let new_path_set = new_path.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    if has_annots {
+                        worker.annotate(doc_id, items, new_path.clone()).map(|_| ())
+                    } else {
+                        worker.save(doc_id, new_path.clone())
+                    }
+                })
+                .await;
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok(_) => {
+                    v.last_modify_error = None;
+                    v.path = new_path_set;
+                    // 另存后：内容已（合并待存/含页操作后）写入新路径 → 一律清待存
+                    // （dirty 回落；worker.annotate 已顺带同步 stores 镜像）。
+                    v.pending_annots.clear();
+                    v.undo_stack.clear();
+                    v.pending_page_ops = 0;
+                    v.focused_annot = None;
+                    v.sel_card = None;
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 显式保存并返回完成信号通道（关闭标签「保存并关闭」用；`None` = 无待存）。
+    /// 接收端 `Ok(())` = 已落盘；`Err` = 保存失败（仍留在待存态）。
+    pub fn save_channels(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<mpsc::Receiver<std::result::Result<(), String>>> {
+        self.submit_save(cx)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn submit_save(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<mpsc::Receiver<std::result::Result<(), String>>> {
+        if !self.is_dirty() {
+            return None;
+        }
+        let worker = self.worker.clone()?;
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return None;
+        }
+        let doc_id = self.doc_id;
+        let path = self.path.clone();
+        self.last_modify_error = None;
+        let items: Vec<AnnotateItem> = self
+            .pending_annots
+            .iter()
+            .map(|a| AnnotateItem { page_index: a.page, kind: a.kind, quads: a.quads_pt.clone() })
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    if items.is_empty() {
+                        worker.save(doc_id, path.clone()).map(|_| None)
+                    } else {
+                        // 注释合并写盘成功后，顺带读回已写文件 bytes 供 live 文档重载——
+                        // 否则 save 清掉叠加层后基础文档并不含注释，高亮会在视图中消失
+                        // 直到重开才回来（b1 旧口径靠「重开读回」绕开了这个可见缺陷）。
+                        worker
+                            .annotate(doc_id, items, path.clone())
+                            .map(|_| std::fs::read(&path).ok())
+                    }
+                })
+                .await;
+            let _ = tx.send(res.as_ref().map(|_| ()).map_err(|e: &anyhow::Error| format!("{e:#}")));
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok(annotated_bytes) => {
+                    v.last_modify_error = None;
+                    v.pending_annots.clear();
+                    v.undo_stack.clear();
+                    v.pending_page_ops = 0;
+                    v.focused_annot = None;
+                    v.sel_card = None;
+                    // 有注释待存 → live 文档重载为「含已写注释的新文件」并保持当前页，
+                    // 叠加层清空后注释仍在基础文档里上图（零闪烁的注释添加路径不受影响）。
+                    if let Some(bytes) = annotated_bytes {
+                        let anchor = v.current_page().map(|(pg, _)| pg.saturating_sub(1));
+                        v.open_from_bytes(bytes, anchor, cx);
+                    }
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        Some(rx)
+    }
+
+    /// 撤销上一条 PDF 编辑（Ctrl+Z）：注释逐条撤（加/删互逆）；页面插入/删除按**操作前
+    /// 内存镜像**恢复（内容精确还原）。无待回退条目 → 空操作。
+    pub fn undo_last(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.undo_stack.pop_back() else {
+            return;
+        };
+        match entry {
+            UndoEntry::RemoveAnnot { id } => {
+                self.pending_annots.retain(|a| a.id != id);
+            }
+            UndoEntry::AddAnnotBack { annot } => {
+                self.pending_annots.push(annot);
+            }
+            UndoEntry::RestoreMemory { bytes, annots_before } => {
+                self.pending_page_ops = self.pending_page_ops.saturating_sub(1);
+                self.pending_annots = annots_before;
+                self.focused_annot = None;
+                let anchor = self.current_page().map(|(pg, _)| pg.saturating_sub(1));
+                self.open_from_bytes(bytes, anchor, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 删除一条待存注释（右键「删除注释」）：从 pending 移除并清灰框焦；撤销栈记录
+    /// 逆操作（Ctrl+Z 可恢复该条）。
+    pub fn delete_pending_annot(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(pos) = self.pending_annots.iter().position(|a| a.id == id) {
+            let annot = self.pending_annots.remove(pos);
+            self.undo_stack.push_back(UndoEntry::AddAnnotBack { annot });
+            if self.focused_annot == Some(id) {
+                self.focused_annot = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// 最近一次写回/页操作的错误文案（None = 无错误）。
+    pub fn last_modify_error(&self) -> Option<&str> {
+        self.last_modify_error.as_deref()
+    }
+
+    /// 读回某一页已**写盘**的注释（类型 + quad 几何）。需要已加载文档；走 worker 读回。
+    /// 待保存模型下只反映 save() 之后落盘的内容；待存注释以 [`Self::pending_annots`]
+    /// 叠加层渲染呈现。
+    pub fn annotations_for_page(&self, page_index: usize) -> Option<Vec<AnnotationInfo>> {
+        let worker = self.worker.as_ref()?;
+        worker.annotations_for_page(self.doc_id, page_index).ok()
+    }
+
+    /// 从**内存字节**（非磁盘）重开文档：worker 侧 Close 旧文档 → 失效渲染派生缓存 →
+    /// 后台打开新 bytes。待保存模型的页面操作/撤销恢复用它做「只一次内存级重载、不写盘」。
+    /// 待存状态（pending_annots / undo / dirty）**保留**（页号已由调用方平移妥当）；
+    /// 渲染派生缓存（文本层/选区/检索/门控）随结构变化全量失效。
+    fn open_from_bytes(&mut self, bytes: Vec<u8>, anchor: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(w) = &self.worker
+            && self.doc_id != 0 {
+                w.close(self.doc_id);
+            }
+        self.worker = None;
+        self.doc_id = 0;
+        // 全量失效渲染派生缓存（同旧 reload_after_modify；不 pending_drops.clear()——
+        // 旧位图应由下一帧 ensure_window 逐个 drop_image 下线，清掉只会泄漏显存提交，K14）。
+        self.text_pages.clear();
+        self.text_lru.clear();
+        self.pending_text.clear();
+        self.pending_thumb.clear();
+        self.pending_mid.clear();
+        self.pending_tiles.clear();
+        self.pending_cover.clear();
+        self.mid_lru.clear();
+        self.tile_bytes = 0;
+        self.tile_pump_running = false;
+        self.sel_anchor = None;
+        self.sel_active = None;
+        self.selecting = false;
+        self.sel_card = None;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_truncated = false;
+        self.search_active = 0;
+        self.search_pending = None;
+        self.window_sig = None;
+        self.window_settled = false;
+        self.reload_anchor = anchor;
+        cx.spawn(async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    PdfWorker::open_and_dims_full(bytes)
+                        .map_err(|e| format!("无法启动 pdfium：{e}"))
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| match result {
+                Ok((worker, doc_id, dims, outlines)) => {
+                    this.apply_loaded(worker, doc_id, dims, outlines, cx);
+                }
+                Err(e) => {
+                    this.loading = false;
+                    this.load_error = Some(e);
+                    cx.refresh_windows();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+}
+
