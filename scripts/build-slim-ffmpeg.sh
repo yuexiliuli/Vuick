@@ -2,6 +2,9 @@
 # ============================================================
 # FFmpeg B1 瘦共享（shared）构建脚本
 #
+# ⚠️ B2 静态单 dll（一次性链进 media_ffmpeg.dll，分发=exe+1 dll，opt-in）见
+#    build-slim-ffmpeg-static-msvc.sh + media-ffmpeg `static-link` feature。
+#
 # 用途：
 #   构建只解码本地 file 协议的 FFmpeg shared 构建包（约 10-13MB），
 #   无 encode / mux / 网络 / 滤镜 / 设备 / bsf / 字幕解码器 / 图片解码器。

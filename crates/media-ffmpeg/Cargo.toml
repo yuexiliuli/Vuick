@@ -9,6 +9,16 @@ description = "FFmpeg 视频/音频解码内核（cdylib），供 gpui-editor �
 [lib]
 crate-type = ["cdylib"]
 
+# B2 静态单 dll（opt-in）：static-link 时 ffmpeg-next/static → ffmpeg-sys-next
+# 以 static= 链 FFMPEG_DIR/lib 下的静态 COFF 归档（scripts/build-slim-ffmpeg-static-msvc.sh
+# 产物），media_ffmpeg.dll 不再导入 av*.dll，分发只需 exe + 1 件 dll。
+# 默认无 feature = B1 shared 链路（5 件 av*.dll），FFMPEG_DIR 仍指 ffmpeg-slim。
+# 开启时须把 FFMPEG_DIR 指到静态包（E:\Rust\temp\ffmpeg-slim-static），系统库
+# 由 build.rs 补 bcrypt/user32/ole32。
+[features]
+default = []
+static-link = ["ffmpeg-next/static"]
+
 [dependencies]
 anyhow = "1.0"
 # 构建期需 FFMPEG_DIR（头文件/导入库）+ LIBCLANG_PATH（bindgen），见仓库 scripts/setup-ffmpeg.ps1。
