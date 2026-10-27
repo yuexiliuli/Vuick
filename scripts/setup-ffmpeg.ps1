@@ -2,7 +2,9 @@
 一键装填视频功能（ffmpeg-next 依赖，位于工作区成员 `media-ffmpeg`）的开发机环境。
 
 需要三样：
-- FFMPEG_DIR    → 指向含 include/ + lib/ + bin/ 的 FFmpeg win64 shared 构建（gyan/BtbN）
+- FFMPEG_DIR    → 指向含 include/ + lib/ + bin/ 的 FFmpeg win64 shared 构建（默认为
+                  本仓库自建瘦包 E:\Rust\temp\ffmpeg-slim，见 scripts/build-slim-ffmpeg.sh；
+                  显式设置过的不覆盖）
 - LIBCLANG_PATH → 指向含 libclang.dll 的目录（bindgen 必需，装 LLVM 即得）
 - PATH 加 ffmpeg bin → 开发期运行/测试动态加载 dll（分发打包见 scripts/package.ps1，随包捆绑）
 
@@ -23,19 +25,31 @@ function Set-UserEnv([string]$Name, [string]$Value) {
 }
 
 # ---------- 1) FFMPEG_DIR（构建期：头文件 + 导入库） ----------
+# 正式链 = 本仓库 scripts/build-slim-ffmpeg.sh 构建的瘦共享包（bin/ 5 件 dll 约 6MB，
+# dll 已静态内嵌 MinGW runtime，自包含可直接分发）；用户级已显式设过 FFMPEG_DIR 且有
+# include/ lib/ 则沿用（尊重显式设置，不覆盖）。
+$slimDir = 'E:\Rust\temp\ffmpeg-slim'
 $ffDir = [Environment]::GetEnvironmentVariable('FFMPEG_DIR', 'User')
+if (-not $ffDir) { $ffDir = $slimDir }
 $ffOk = $ffDir -and (Test-Path (Join-Path $ffDir 'include')) -and (Test-Path (Join-Path $ffDir 'lib'))
 if ($ffOk) {
     Write-Host "[skip] FFMPEG_DIR 已就位: $ffDir"
+    if ($ffDir -eq $slimDir) {
+        Write-Host "      （瘦共享包：scripts/build-slim-ffmpeg.sh 构建产物）"
+    }
 } else {
     Write-Host @"
 
-[需要] FFMPEG_DIR 未配置或其 include/ lib/ 缺失。
-请下载 FFmpeg 的 win64 shared（带 dev 文件）构建：
-  1) https://www.gyan.dev/ffmpeg/builds/            → ffmpeg-release-full-shared（推荐）
-  2) https://github.com/BtbN/FFmpeg-Builds/releases → win64-gpl-shared（9.x 版本）
-解压到固定目录（须含 include/ lib/ bin/ 三层），然后：
+[需要] FFMPEG_DIR（=$ffDir）缺 include/ lib/ 三层。
+正式链用本仓库自建瘦共享包（约 6.2MB，5 件 dll，仅解码+硬解；自包含无 runtime 依赖）：
+  1) 在 MSYS2 UCRT64 环境构建：bash scripts/build-slim-ffmpeg.sh
+     （默认 PREFIX=/e/Rust/temp/ffmpeg-slim，产物即 '$slimDir'）
+  2) 或用现成 FFmpeg win64 shared（带 dev 文件，体积约百MB）：
+     https://www.gyan.dev/ffmpeg/builds/ → ffmpeg-release-full-shared（gyan）
+     https://github.com/BtbN/FFmpeg-Builds/releases → win64-gpl-shared（BtbN）
+解压/构建到固定目录（须含 include/ lib/ bin/ 三层），然后：
   [Environment]::SetEnvironmentVariable('FFMPEG_DIR', '<解压路径>', 'User')
+（已显式设置 FFMPEG_DIR 时，本脚本按你的设置走，不覆盖）
 "@
     exit 1
 }

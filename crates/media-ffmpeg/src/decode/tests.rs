@@ -699,6 +699,73 @@ fn bench_decode_throughput() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// B1 瘦包接管性能探针（`--ignored` 手动跑，不进常规测试计数）：gyan 全量 ↔ slim 瘦包
+/// 的纯解码吞吐对比。完整走一遍真实解码链路——`VideoReader::open_scaled`（默认软解，
+/// `HW_DEFAULT=false` 确定性，正是不受 GPU 影响的 CPU 解码成本）→ 全流
+/// `next_frame_bgra_into`（demux→decode→sws→BGRA）到 EOF，`std::time::Instant` 记
+/// 整段墙钟，输出帧数 + fps + 源信息；同一文件连续复跑 3 次取中位（规避首开热缓存 /
+/// 偶发抖动），供 gyan↔slim 对比——重点量化 `--enable-small` 是否带来可感代价。
+///
+/// 夹具：`target\视频测试.mp4`（1280x720 h264@30，≈311 帧 / 10.2s）；缺失回退
+/// `target\video测试.mp4`（320x240 短样，信号弱）；再缺失打 SKIP 不硬造。
+#[test]
+#[ignore = "B1 手动性能探针"]
+fn bench_b1_decode_gyan_vs_slim() -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let primary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/视频测试.mp4");
+    let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/video测试.mp4");
+    let candidate = if primary.exists() {
+        primary
+    } else if fallback.exists() {
+        eprintln!("[B1PROBE] 视频测试.mp4 缺失，回退 video测试.mp4（帧数少、对比信号弱）");
+        fallback
+    } else {
+        eprintln!("SKIP: missing target/视频测试.mp4 与 target/video测试.mp4（媒体夹具不入库）");
+        return Ok(());
+    };
+
+    // 单次完整解码：open → streams → video frames → swscale 转 BGRA（贴近真实链路）。
+    let run = |i: usize| -> anyhow::Result<(u64, f64, f64)> {
+        let t0 = Instant::now();
+        let mut r = VideoReader::open_scaled(&candidate, 1920).context("打开失败")?;
+        let open_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let p = r.params();
+        let cap = (r.out_width as usize * r.out_height as usize * 4).max(1);
+        let mut out = vec![0u8; cap];
+        let t1 = Instant::now();
+        let mut n: u64 = 0;
+        while r.next_frame_bgra_into(&mut out)?.is_some() {
+            n += 1;
+        }
+        let wall_s = t1.elapsed().as_secs_f64();
+        let fps = n as f64 / wall_s;
+        eprintln!(
+            "[B1PROBE] run{i}: 帧数={n} wall={wall_s:.3}s fps={fps:.1} open={open_ms:.1}ms {} {}x{} hw={}",
+            candidate.file_name().unwrap().to_string_lossy(),
+            p.width,
+            p.height,
+            if r.hw.is_some() { "是" } else { "否" }
+        );
+        Ok((n, wall_s, fps))
+    };
+
+    let (mut frames, mut walls, mut fps) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..3 {
+        let (n, w, f) = run(i)?;
+        frames.push(n);
+        walls.push(w);
+        fps.push(f);
+    }
+    fps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    eprintln!(
+        "[B1PROBE] MEDIAN: 帧数={} wall={:.3}s fps={:.1}（3 次取中位）",
+        frames[1], walls[1], fps[1]
+    );
+    Ok(())
+}
+
 /// seek 预滚成本对照（SW vs HW，`--ignored` 手动跑）：长 GOP 中段落点 seek 后解码到
 /// 「首个 pts ≥ 落点」帧的 wall clock 与预滚帧数——即「点击进度条后 seek2first」的
 /// 解码阶段子项。软路径经 `VFF_VIDEO_SW=1` 强制（默认硬解的机器上也确定性走软解）；
