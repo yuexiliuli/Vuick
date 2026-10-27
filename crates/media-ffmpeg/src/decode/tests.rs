@@ -1243,13 +1243,13 @@ fn subtitle_scan_does_not_block_video_seek() {
 
     eprintln!(
         "[sub-lock] base_seek={base:?} with_concurrent_scan={with:?} delta={:?}",
-        with - base
+        with.saturating_sub(base)
     );
     // 相对增量红线：并发字幕扫描不得把视频 seek 拖慢超过 +250ms（修复前 ≈ 扫描持锁时长 → FAIL）
     assert!(
-        with - base < std::time::Duration::from_millis(250),
+        with.saturating_sub(base) < std::time::Duration::from_millis(250),
         "字幕全文件扫描不应阻塞视频 seek：delta={:?}（应 <250ms）",
-        with - base
+        with.saturating_sub(base)
     );
 }
 
