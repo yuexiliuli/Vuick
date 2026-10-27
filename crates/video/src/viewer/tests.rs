@@ -4515,6 +4515,53 @@
         cx.run_until_parked(); // 让 seek 起的解码 worker / 泵任务收尾
     }
 
+    /// F1 回归：**单文件**循环/随机播完（不是文件夹多文件列表）→ `handle_end` 重播分支
+    /// 必须恢复 `playing=true` 并回 0s 继续播放——修复前 `advance_playhead` 撞结尾置
+    /// `playing=false` 后，`seek(-duration)` 本身不置位、`sink.play()` 又被 `if self.playing`
+    /// 门控，单文件会停在 0s 暂停不自动重播（用户可观测 bug；多文件走 open_folder_index
+    /// 内部置位所以不受影响）。断言状态链与 `toggle_play` 结尾重播分支逐项对齐：
+    /// playing 保持 true、playhead 归零、不切文件、泵继续跑、下一拍仍前进。
+    #[gpui::test]
+    async fn single_file_natural_end_replays_automatically(cx: &mut TestAppContext) {
+        for mode in [PlaybackMode::Loop, PlaybackMode::Shuffle] {
+            let ent = cx.update(|app| app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playback_mode = mode;
+                v.nav = FolderNav::new(vec![fixture()], 0); // 单文件：natural_end_target 回自身
+                v.duration = 2.0;
+                v.playhead = 2.0; // 已到结尾，下一拍 tick 触发自然完
+                v.playing = true;
+                v
+            }));
+            ent.update(cx, |v, cx| {
+                v.tick(cx);
+            });
+            let s = cx.update(|app| {
+                let v = ent.read(app);
+                (v.playing, v.playhead, v.nav.current(), v.pump_wanted())
+            });
+            assert!(
+                s.0,
+                "{mode:?} 单文件播完应自动重播（playing 保持 true，修复前停在暂停）"
+            );
+            assert_eq!(
+                s.1, 0.0,
+                "{mode:?} 单文件播完应 seek 回 0s 重播，实得 {:.3}s",
+                s.1
+            );
+            assert_eq!(s.2, 0, "{mode:?} 单文件重播不切文件");
+            assert!(s.3, "{mode:?} 重播后播放泵应持续运行（pump_wanted true）");
+            // 下一拍仍在播：playhead 继续前进（不再次钉回结尾/不动）
+            ent.update(cx, |v, cx| {
+                v.last_tick = None;
+                v.tick(cx);
+            });
+            let p = cx.update(|app| ent.read(app).playhead);
+            assert!(p > 0.0, "{mode:?} 重播后下一拍应继续前进，实得 {p:.3}");
+            cx.run_until_parked(); // 让 seek 起的解码 worker / 泵任务收尾（不存在解码在后台落错误占位）
+        }
+    }
+
     // ---- M6：截图当前帧存 PNG ----
 
     /// 截图字节序正确性：4×2 纯红（BGRA = B0 G0 R255）互换 R/B 成 RGBA 存 PNG，读回像素

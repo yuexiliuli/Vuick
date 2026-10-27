@@ -307,7 +307,18 @@ impl super::VideoViewer {
             // 顺序播放：停在结尾（既有行为）
             None => {}
             // 单文件循环/随机：seek 0 重播（保留缩放/平移，不重开文件）
-            Some(idx) if idx == self.nav.current() => self.seek(-self.duration, cx),
+            Some(idx) if idx == self.nav.current() => {
+                self.seek(-self.duration, cx);
+                // F1：与 `toggle_play` 结尾重播分支对齐——`seek` 本身不恢复 `playing`
+                //（seek 时保持暂停态、不提前出声），而 `advance_playhead` 撞结尾时已把
+                // `playing` 置 false；此处不补回 `playing=true` 的话，单文件播完会永远
+                // 停在 0s 暂停（`sink.play()` 又被 `if self.playing` 门控）而**不再自动
+                // 重播**。多文件循环/随机走 `open_folder_index`（内部置 playing=true）不受影响。
+                self.playing = true;
+                if let Some(sink) = &self.audio {
+                    let _ = sink.play();
+                }
+            }
             Some(idx) => self.open_folder_index(idx, cx),
         }
     }
