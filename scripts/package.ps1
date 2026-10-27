@@ -18,18 +18,95 @@
 Windows 10/11 系统自带，无需打包；若目标机是精简版 / 旧版 Win10，建议先在本机安装
 「Microsoft Visual C++ 2015-2022 Redistributable」再分发。
 
+媒体分发有两种形态，由 FFMPEG_DIR 指向的构建与 media_ffmpeg.dll 的导入表共同决定（三态自动判定）：
+  - B1 shared（默认）：FFMPEG_DIR 指 ffmpeg-slim（bin\ 有 av*.dll），media_ffmpeg.dll
+    导入表含 avcodec/avformat/avutil/swresample/swscale 五件 → 打包随带这 5 件；
+  - B2 静态（opt-in）：FFMPEG_DIR 指 ffmpeg-slim-static（无 bin\，lib\ 是静态 COFF 归档），
+    media_ffmpeg.dll 已静态链入 FFmpeg、导入表无 av/sw → 打包不拷 FFmpeg dll（dist = exe + media_ffmpeg.dll 两件）。
+
 用法：pwsh scripts/package.ps1 [可选输出目录]
+诊断：pwsh scripts/package.ps1 -Simulate [-KernelDll <media_ffmpeg.dll 路径>]  # 只判三态，不构建不复制
 #>
+param(
+    [switch]$Simulate,            # 只做「三态判定 + 按需 bin/ 校验」，不构建不复制（打包形态断言用）
+    [Parameter(Position = 0)]
+    [string]$OutDir,              # 可选输出目录（兼容旧用法第一个位置参数）
+    [Parameter(Position = 1)]
+    [string]$KernelDll            # -Simulate 被测 media_ffmpeg.dll（缺省 target\release\media_ffmpeg.dll）
+)
 
 $ErrorActionPreference = 'Stop'
 
 # ---------- 0) 前置：FFMPEG_DIR ----------
+# 只校验「已设置 + 目录存在」；bin/ 是否必需由 2b 三态判定后**按需**校验
+# （B1 shared / objdump 回退白名单需要 bin\；B2 静态无 bin\ 属常态，不在此强求）。
 $ffDir = $env:FFMPEG_DIR
-if (-not $ffDir -or -not (Test-Path (Join-Path $ffDir 'bin'))) {
-    Write-Host "[错误] 未找到 FFMPEG_DIR（或缺 bin/）。先跑 scripts/setup-ffmpeg.ps1 装环境。"
+if (-not $ffDir) {
+    Write-Host "[错误] 未设置 FFMPEG_DIR。先跑 scripts/setup-ffmpeg.ps1 装环境（B1 指 ffmpeg-slim；B2 静态指 ffmpeg-slim-static）。"
+    exit 1
+}
+if (-not (Test-Path $ffDir)) {
+    Write-Host "[错误] 未找到 FFMPEG_DIR 目录：$ffDir。先跑 scripts/setup-ffmpeg.ps1 装环境。"
     exit 1
 }
 $ffBin = Join-Path $ffDir 'bin'
+
+# ---------- 0.5) 定位 llvm-objdump（导入表驱动判定依赖它；不可用则回退前缀白名单） ----------
+$objdump = $null
+foreach ($cand in @(
+    'C:\Program Files\LLVM\bin\llvm-objdump.exe',
+    (Join-Path $env:LIBCLANG_PATH 'llvm-objdump.exe')
+)) {
+    if ($cand -and (Test-Path $cand)) { $objdump = $cand; break }
+}
+
+# 三态判定：按 media_ffmpeg.dll 的**实际导入表**决定「要拷哪几个 FFmpeg dll」。
+#   (a) objdump 可用 且 导入表含 av*/sw* → shared 态：待拷 = 导入表命中名（须 FFMPEG_DIR\bin 可取件）
+#   (b) objdump 可用 且 导入表无 av*/sw* → static 态：待拷 = 空（B2 静态，media_ffmpeg.dll 已自含 FFmpeg）
+#   (c) objdump 不可用 → fallback 态：按前缀白名单从 FFMPEG_DIR\bin 取（保留既有回退，不并入 (b)）
+function Get-FfmpegDecision {
+    param([Parameter(Mandatory = $true)][string]$KernelDll)
+    $pattern = 'DLL Name: avcodec-.*\.dll|DLL Name: avformat-.*\.dll|DLL Name: avutil-.*\.dll|DLL Name: swscale-.*\.dll|DLL Name: swresample-.*\.dll|DLL Name: avdevice-.*\.dll|DLL Name: avfilter-.*\.dll'
+    $needed = @()
+    if ($objdump) {
+        $needed = @(& $objdump -p $KernelDll 2>$null |
+            Select-String -Pattern $pattern |
+            ForEach-Object { ($_.ToString().Trim() -replace '^DLL Name:\s*', '') })
+        $needBin = ($needed.Count -gt 0)
+        $state = if ($needBin) { 'shared' } else { 'static' }
+        return [pscustomobject]@{ State = $state; Needed = $needed; NeedBin = $needBin }
+    }
+    # objdump 不可用 → 前缀白名单回退（与 Cargo.toml 剪枝后的必需集一致）
+    if (-not (Test-Path $ffBin)) {
+        return [pscustomobject]@{ State = 'fallback'; Needed = @(); NeedBin = $true }
+    }
+    $needed = @(Get-ChildItem $ffBin -Filter '*.dll' | Where-Object {
+        $_.Name -match '^(avcodec|avformat|avutil|swresample|swscale)-' } | ForEach-Object { $_.Name })
+    return [pscustomobject]@{ State = 'fallback'; Needed = $needed; NeedBin = $true }
+}
+
+# -Simulate：只判定不构建不复制（打包形态断言用；产物用现成 debug/release dll）
+if ($Simulate) {
+    $kernel = if ($KernelDll) { $KernelDll } else { Join-Path (Get-Location) 'target\release\media_ffmpeg.dll' }
+    if (-not (Test-Path $kernel)) {
+        Write-Host "[错误] -Simulate 被测 dll 不存在：$kernel"
+        exit 1
+    }
+    $d = Get-FfmpegDecision -KernelDll $kernel
+    if ($d.NeedBin -and -not (Test-Path $ffBin)) {
+        Write-Host "[错误] 判定为 $($d.State) 态，但 FFMPEG_DIR\bin 不存在：$ffBin"
+        exit 1
+    }
+    Write-Host "Simulate 判定：state=$($d.State)  待拷 $($d.Needed.Count) 件  需 bin=$($d.NeedBin)"
+    if ($d.State -eq 'static') {
+        Write-Host '[静态单 dll 形态] media_ffmpeg.dll 已自含 FFmpeg，无需额外 dll（dist = exe + media_ffmpeg.dll 两件）。'
+    } elseif ($d.Needed.Count -gt 0) {
+        Write-Host "               待拷名单：$($d.Needed -join ', ')"
+    } else {
+        Write-Host '[提示] 未找到 llvm-objdump，FFmpeg dll 按前缀白名单复制（avcodec/avformat/avutil/swresample/swscale）。'
+    }
+    exit 0
+}
 
 # ---------- 1) release 构建（exe 与 media-ffmpeg 分开构建，确保 cdylib 一定产出） ----------
 Write-Host "[1/3] cargo build --release（exe + media-ffmpeg cdylib）..."
@@ -55,49 +132,47 @@ if (-not (Test-Path $kernel)) {
 }
 
 # ---------- 2) 组装 dist 目录 ----------
-$outDir = if ($args.Count -gt 0) { $args[0] } else { Join-Path (Get-Location) 'dist\gpui-editor-win64' }
+$outDir = if ($OutDir) { $OutDir } else { Join-Path (Get-Location) 'dist\gpui-editor-win64' }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-
-# 定位 llvm-objdump（默认 LLVM 安装位 + LIBCLANG_PATH 兜底；导入表驱动的必需件清单依赖它）
-$objdump = $null
-foreach ($cand in @(
-    'C:\Program Files\LLVM\bin\llvm-objdump.exe',
-    (Join-Path $env:LIBCLANG_PATH 'llvm-objdump.exe')
-)) {
-    if ($cand -and (Test-Path $cand)) { $objdump = $cand; break }
-}
 
 Write-Host "[2/3] 复制 exe + media_ffmpeg.dll + FFmpeg 运行库 -> $outDir"
 Copy-Item $exe (Join-Path $outDir 'gpui-editor.exe') -Force
 Copy-Item $kernel (Join-Path $outDir 'media_ffmpeg.dll') -Force
 
-# 2b) FFmpeg 运行库：按 media_ffmpeg.dll 的**实际导入表**驱动，只带必需件。
+# 2b) FFmpeg 运行库：三态判定（Get-FfmpegDecision）按 media_ffmpeg.dll 的实际导入表驱动，只带必需件。
 # media-ffmpeg/Cargo.toml 已剪掉 device/filter feature → avdevice/avfilter 不在导入表，
-# 自动不再复制（本机 FFMPEG_DIR\bin 全量约 230MB → 仅 5 件约 121MB）；今后再改 feature
-# 导入表变，重新打包即自适应，无需改本清单。
-$ffImportsPattern = 'DLL Name: avcodec-.*\.dll|DLL Name: avformat-.*\.dll|DLL Name: avutil-.*\.dll|DLL Name: swscale-.*\.dll|DLL Name: swresample-.*\.dll|DLL Name: avdevice-.*\.dll|DLL Name: avfilter-.*\.dll'
-$ffNeeded = @()
-if ($objdump) {
-    $ffNeeded = @(& $objdump -p $kernel 2>$null |
-        Select-String -Pattern $ffImportsPattern |
-        ForEach-Object { ($_.ToString().Trim() -replace '^DLL Name:\s*', '') })
+# 自动不再复制（本机 FFMPEG_DIR\bin 全量约 230MB → B1 仅 5 件约 121MB）；今后再改 feature
+# 导入表变，重新打包即自适应，无需改本清单。B2 静态态导入表无 av/sw → 什么都不拷。
+$decision = Get-FfmpegDecision -KernelDll $kernel
+$ffNeeded = $decision.Needed
+
+# 按需 bin/ 校验：shared/回退态必须能从 FFMPEG_DIR\bin 取件；静态态不要求 bin（B2 无 bin/ 属常态）
+if ($decision.NeedBin -and -not (Test-Path $ffBin)) {
+    Write-Host "[错误] 判定为 $($decision.State) 态，需要 FFMPEG_DIR\bin 存在：$ffBin"
+    Write-Host "       （B2 静态打包时 media_ffmpeg.dll 应无 av/sw 导入且 FFMPEG_DIR 指向静态目录。）"
+    exit 1
 }
-if ($ffNeeded.Count -eq 0) {
-    # objdump 不可用 → 前缀白名单回退（与 Cargo.toml 剪枝后的必需集一致）
-    $ffNeeded = @(Get-ChildItem $ffBin -Filter '*.dll' | Where-Object {
-        $_.Name -match '^(avcodec|avformat|avutil|swresample|swscale)-' } | ForEach-Object { $_.Name })
-    Write-Host '[提示] 未找到 llvm-objdump，FFmpeg dll 按前缀白名单复制（avcodec/avformat/avutil/swresample/swscale）。'
+
+if ($decision.State -eq 'static') {
+    Write-Host '[静态单 dll 形态] media_ffmpeg.dll 已自含 FFmpeg，无需额外 dll（dist = exe + media_ffmpeg.dll 两件）。'
+    if (-not (Test-Path (Join-Path $ffDir 'lib'))) {
+        Write-Host "[提示] FFMPEG_DIR 下未见 lib/（$ffDir）；静态打包本来也不读它，目录仅用于编译期头/库复现，建议保留。"
+    }
+} else {
+    if ($decision.State -eq 'fallback') {
+        Write-Host '[提示] 未找到 llvm-objdump，FFmpeg dll 按前缀白名单复制（avcodec/avformat/avutil/swresample/swscale）。'
+    }
+    $missingSrc = @()
+    foreach ($n in $ffNeeded) {
+        $src = Join-Path $ffBin $n
+        if (-not (Test-Path $src)) { $missingSrc += $n; continue }
+        Copy-Item $src (Join-Path $outDir $n) -Force
+    }
+    if ($missingSrc.Count -gt 0) {
+        Write-Host "[警告] FFMPEG_DIR\bin 缺以下 dll（ABI 版本与编译期不一致？）：$($missingSrc -join ', ')"
+    }
+    Write-Host "     已复制 media_ffmpeg.dll + $($ffNeeded.Count) 个 FFmpeg dll（$($ffNeeded -join ', ')）"
 }
-$missingSrc = @()
-foreach ($n in $ffNeeded) {
-    $src = Join-Path $ffBin $n
-    if (-not (Test-Path $src)) { $missingSrc += $n; continue }
-    Copy-Item $src (Join-Path $outDir $n) -Force
-}
-if ($missingSrc.Count -gt 0) {
-    Write-Host "[警告] FFMPEG_DIR\bin 缺以下 dll（ABI 版本与编译期不一致？）：$($missingSrc -join ', ')"
-}
-Write-Host "     已复制 media_ffmpeg.dll + $($ffNeeded.Count) 个 FFmpeg dll（$($ffNeeded -join ', ')）"
 
 # ---------- 3) 校验 + 收尾 ----------
 if (-not $objdump) {
