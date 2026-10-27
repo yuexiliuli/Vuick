@@ -128,6 +128,17 @@ impl PdfViewer {
         };
         view.max(page_width + 2.0 * PAGE_PAD_X)
     }
+
+    /// 是否**横向溢出**（内容宽于视口、可横向平移）。两条件缺一不可：
+    /// - `max_offset().x > 1px`：内容确实宽于视口（防 0.x 的舍入抖动）；
+    /// - `zoom > 1`：**放大**产生的溢出才是用户可感知的「被截断」。适配宽（`zoom==1`）
+    ///   时页宽基线随容器收敛，哪怕容器临时窄于页宽+边距（窗口回退基线未收敛的瞬时
+    ///   ~46px 级溢出），也仍按「选中文本」处理——否则 shell b1 在打开头几帧即拖选会
+    ///   被误切进平移（选中路径回归）。
+    /// 溢出时左键拖拽语义从「选中文本」切换为「平移页面」（行为表见 [`Self::on_mouse_down`]）。
+    pub(crate) fn horizontal_overflow(&self) -> bool {
+        self.scroll.max_offset().x > px(1.) && self.zoom > 1.0 + 1e-4
+    }
 }
 
 impl PdfViewer {
@@ -171,6 +182,12 @@ impl PdfViewer {
     /// 鼠标按下：聚焦（供 Ctrl+C）。**同时关闭选中弹卡**（点卡片外 / 重新开始拖选 /
     /// 点击 PDF 任意处都会先走到这里——卡片在独立浮层上，卡片自身点击不会冒泡到此）。
     /// 命中 → 置锚点/活动端并进入拖拽；点空白 → 清空选区。
+    ///
+    /// **左键拖拽行为表**（超宽 vs 适配宽）：
+    /// - 未横向溢出（正常适配宽度）：按下 → 命中选中起点；拖拽 → 扩展选区；
+    ///   松手 → 弹选中菜单（既有语义，完整保留）。
+    /// - 横向溢出（Ctrl+滚轮放大后内容宽于视口）：按下 → 进入平移（`panning=true`）；
+    ///   拖拽 → 页面跟手移动（`on_mouse_move`）；松手 → 结束平移（无选中、无菜单）。
     pub(super) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -180,6 +197,15 @@ impl PdfViewer {
         self.focus_handle.focus(window, cx);
         self.sel_card = None;
         if event.button != MouseButton::Left {
+            return;
+        }
+        // 超宽平移：左键按下即进入平移（不依赖命中文本），不进选中。
+        if self.horizontal_overflow() {
+            self.panning = true;
+            self.pan_origin = event.position;
+            self.pan_offset0 = self.scroll.offset();
+            self.selecting = false;
+            cx.notify();
             return;
         }
         match self.hit_test(window, event.position) {
@@ -198,7 +224,15 @@ impl PdfViewer {
     }
 
     /// 按住左键拖拽 → 活动端随鼠标更新（选区实时扩展/收缩）。
+    /// 平移模式（超宽）：滚动偏移 = 按下时快照 + 指针位移（页面跟手，`window.mouse_position`
+    /// 比拖拽事件 position 即时——gpui 移动事件可被上层消费，mouse_position 是真实光标）。
     pub(super) fn on_mouse_move(&mut self, _: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panning {
+            let delta = window.mouse_position() - self.pan_origin;
+            self.scroll.set_offset(self.pan_offset0 + delta);
+            cx.notify();
+            return;
+        }
         if !self.selecting {
             return;
         }
@@ -211,11 +245,18 @@ impl PdfViewer {
     }
 
     /// 松开：拖拽结束（`selecting` 复位），**选区保留**（anchor + active 都在，可 Ctrl+C）。
-    /// Phase B1：若是一次**真实拖选**（松手时光标 ≠ 按下点，即选区非空）→ 在选区上缘弹
-    /// 操作卡片（复制/高亮/删除线/下划线），并清「灰框」焦（选区高亮接管）；单击（锚==
-    /// 活动）不弹卡 → **灰框命中**：点在待存注释 quads 内 → 框住该注释文字（点非注释
-    /// 文字 → 清灰框）。
+    /// Phase B1：若是一次**真实拖选**（松手时光标 ≠ 按下点，即选区非空）→ 在**松开鼠标处**
+    /// 弹操作菜单（复制/高亮/删除线/下划线，同右键菜单定位在点击处），并清「灰框」焦
+    /// （选区高亮接管）；单击（锚==活动）不弹卡 → **灰框命中**：点在待存注释 quads 内 →
+    /// 框住该注释文字（点非注释文字 → 清灰框）。
     pub(super) fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 平移模式松手：结束平移、不弹选中菜单。放最前（先于 `if !self.selecting`）。
+        if self.panning {
+            self.panning = false;
+            self.selecting = false;
+            cx.notify();
+            return;
+        }
         if !self.selecting {
             return;
         }
@@ -223,12 +264,12 @@ impl PdfViewer {
         let dragged = self.selection().is_some_and(|(a, b)| a != b);
         if dragged {
             self.focused_annot = None;
-            if let Some(pos) = self.selection_card_anchor(window) {
-                self.sel_card = Some(SelCard {
-                    pos,
-                    scroll: self.scroll.offset(),
-                });
-            }
+            // 菜单位于松手处（窗口坐标，锚点 TopLeft，越界由渲染层 snap 夹回）——
+            // 与右键菜单「点在哪出在哪」的交互一致，而非选区几何中心（K39）。
+            self.sel_card = Some(SelCard {
+                pos: event.position,
+                scroll: self.scroll.offset(),
+            });
         } else {
             // 单击：命中待存注释 → 置灰框；点非注释文字 → 清灰框
             let hit = self
@@ -399,8 +440,9 @@ impl PdfViewer {
         (min_x.is_finite()).then_some(((min_x, min_y), (max_x, max_y)))
     }
 
-    /// 弹卡锚点：选区包围盒**上缘中心**上方一点（卡片浮在选区上方；越上下缘由
-    /// `snap_to_window_with_margin` 在渲染层夹回窗口）。取不到包围盒 → `None`。
+    /// 弹卡锚点（**仅测试探针用**：无真实鼠标位置可取）：选区包围盒**上缘中心**上方一点。
+    /// 真实拖选路径已改用「松手处窗口坐标」（`on_mouse_up` 的 `event.position`）。
+    /// 取不到包围盒 → `None`。
     pub(super) fn selection_card_anchor(&self, window: &Window) -> Option<gpui::Point<Pixels>> {
         let ((min_x, min_y), (max_x, _)) = self.selection_window_bounds(window)?;
         Some(gpui::point(

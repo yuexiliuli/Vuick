@@ -105,7 +105,7 @@ impl WindowSig {
     }
 }
 
-/// Phase B1：选中文字后自动弹出的操作卡片（复制/高亮/删除线/下划线）状态。
+/// Phase B1：选中文字后自动弹出的操作菜单（复制/高亮/删除线/下划线，一行一项）状态。
 /// 拖选结束（`mouse_up` 且曾 `selecting`）且选区非空 → 弹卡；点卡片外 / 重新拖选 /
 /// 滚动 / Esc → 关闭。`scroll` 快照用于在 `ensure_window` 里侦测「滚动即关闭」。
 #[derive(Clone, Copy, Debug)]
@@ -312,6 +312,14 @@ pub struct PdfViewer {
     /// 当前点击命中的「灰框」注释 id（点击注释文字显示其包围灰框；右键 → 菜单
     /// 含「删除注释」）。`None` = 无灰框。
     pub(crate) focused_annot: Option<u64>,
+    // ---- 超宽平移：放大后内容宽于视口时左键拖拽 = 平移（见 `horizontal_overflow`）----
+    /// 是否正在「平移页面」：横向溢出（放大后内容宽于视口）时左键拖拽 = 平移，
+    /// 与「选中文本」互斥（行为表见 [`input::PdfViewer::on_mouse_down`]）。
+    pub(crate) panning: bool,
+    /// 平移起始的指针**窗口坐标**（按下点；拖拽期间 `offset = pan_offset0 + 指针位移`）。
+    pub(crate) pan_origin: gpui::Point<Pixels>,
+    /// 按下瞬间的滚动偏移快照（用于平移减法）。
+    pub(crate) pan_offset0: gpui::Point<Pixels>,
 }
 
 // 实现（impl）按职责拆分至 `view/<sub>.rs` 子模块：
@@ -388,6 +396,9 @@ mod tests {
                     pending_page_ops: 0,
                     next_annot_id: 0,
                     focused_annot: None,
+                    panning: false,
+                    pan_origin: gpui::point(px(0.), px(0.)),
+                    pan_offset0: gpui::point(px(0.), px(0.)),
                 };
                 // 先滚到文档中段（纵向负偏移），作为缩放重锚的基准
                 v.scroll.set_offset(gpui::point(px(-40.0), px(-1200.0)));
@@ -575,6 +586,9 @@ mod tests {
                     pending_page_ops: 0,
                     next_annot_id: 0,
                     focused_annot: None,
+                    panning: false,
+                    pan_origin: gpui::point(px(0.), px(0.)),
+                    pan_offset0: gpui::point(px(0.), px(0.)),
                 }
             })
         });
@@ -614,3 +628,4 @@ mod tests {
         });
     }
 }
+

@@ -67,6 +67,9 @@ impl PdfViewer {
             pending_page_ops: 0,
             next_annot_id: 0,
             focused_annot: None,
+            panning: false,
+            pan_origin: gpui::point(px(0.), px(0.)),
+            pan_offset0: gpui::point(px(0.), px(0.)),
         };
         this.start_load(cx);
         this

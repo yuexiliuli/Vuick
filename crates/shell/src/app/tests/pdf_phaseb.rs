@@ -19,7 +19,7 @@ fn temp_pdf_copy(tag: &str) -> std::path::PathBuf {
     let _ = std::fs::create_dir_all(&dir);
     let p = dir.join(format!("{tag}-{}.pdf", std::process::id()));
     let _ = std::fs::remove_file(&p);
-    let _ = std::fs::copy(pdf_fixture(), &p);
+    let _ = pdf::test_util::copy_fixture_writable(&pdf_fixture(), &p);
     p
 }
 
@@ -186,6 +186,42 @@ async fn b1_drag_selection_card_copy_and_highlight(cx: &mut TestAppContext) {
     for sel in ["pdf-sel-card-copy", "pdf-sel-card-highlight", "pdf-sel-card-strike", "pdf-sel-card-underline"] {
         assert!(cx.debug_bounds(sel).is_some(), "弹卡应含「{sel}」");
     }
+    // 布局为「菜单形式」：一行一项（同列对齐、y 单调递增），防回退为横向按钮条（K2）。
+    let items = [
+        "pdf-sel-card-copy",
+        "pdf-sel-card-highlight",
+        "pdf-sel-card-strike",
+        "pdf-sel-card-underline",
+    ]
+    .map(|sel| cx.debug_bounds(sel).expect("弹卡项").center());
+    let xs: Vec<f32> = items.iter().map(|p| p.x.as_f32()).collect();
+    let ys: Vec<f32> = items.iter().map(|p| p.y.as_f32()).collect();
+    assert!(
+        xs.iter().all(|x| (x - xs[0]).abs() < 1.0),
+        "菜单应一行一项（同行对齐）：xs={xs:?}"
+    );
+    assert!(
+        ys.windows(2).all(|w| w[0] < w[1]),
+        "菜单应竖向排列（y 递增）：ys={ys:?}"
+    );
+    // 定位回归断言：menu 出现在「松开鼠标的位置」（同右键菜单定位口径）。水平锚点==松手点
+    // （旧行为=选区几何中心，会落在选区中点而偏左）；垂直受 `snap_to_window_with_margin`
+    // 近窗缘钳制（与右键菜单共享该夹回），故断言松手点落在卡片纵向范围内即满足两态。
+    let card = cx.debug_bounds("pdf-sel-card").expect("弹卡应已定位");
+    let card_origin = card.origin;
+    let card_bottom = card_origin.y.as_f32() + card.size.height.as_f32();
+    assert!(
+        (card_origin.x.as_f32() - b.x.as_f32()).abs() < 8.,
+        "菜单水平应锚在松手点：card x={}，松手点 x={}",
+        card_origin.x.as_f32(),
+        b.x.as_f32()
+    );
+    assert!(
+        card_origin.y.as_f32() <= b.y.as_f32() + 0.5 && card_bottom >= b.y.as_f32() - 0.5,
+        "菜单纵向应覆盖松手点：card top={} bottom={card_bottom}，松手点 y={}",
+        card_origin.y.as_f32(),
+        b.y.as_f32()
+    );
 
     // 点「复制」→ 剪贴板含选中文本；卡片关闭、选区保留
     let copy = cx.debug_bounds("pdf-sel-card-copy").expect("复制项").center();

@@ -109,6 +109,15 @@ pub mod test_util {
     pub fn missing_pdf_fixture() -> bool {
         !test_pdf_paths().iter().all(|p| p.exists())
     }
+
+    /// 拷贝夹具为**可写**独立工作副本（写回类测试用）：源夹具可能带 ReadOnly 属性
+    /// （如下载/标记只读的 PDF——`fs::copy` 会继承该属性），导致注释/页操作写回落盘
+    /// 失败（「文件只读」）。用 `read`+`write` 重建副本（新建即可写），而非 `fs::copy`。
+    pub fn copy_fixture_writable(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        let _ = std::fs::remove_file(dst);
+        std::fs::write(dst, std::fs::read(src)?)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1249,6 +1258,175 @@ mod tests {
             "Ctrl 缩小也不应滚动：锚定 y={exp_y3:.1} 实际 y={:.1}",
             off3.y.as_f32()
         );
+    }
+
+    /// 回归（A 超宽平移）：**左键拖拽区分「超宽平移 / 适配宽选中」**。
+    /// - 阶段 1（适配宽，未横向溢出）：真实拖选命中文本 → 选中并弹卡（既有路径未破坏），
+    ///   `panning` 必须为 false；
+    /// - 阶段 2（Ctrl+滚轮放大 ×2 → 横向溢出）：左键按下即进入平移、拖拽左移、松手结束，
+    ///   断言 `scroll.offset().x` 变负（页面左移）且不弹选中菜单。
+    #[gpui::test]
+    async fn pdf_overflow_pan_while_fit_selects(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct ZoomProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for ZoomProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div()
+                    .id("zoom-pane")
+                    .w(gpui::px(1200.))
+                    .h_full()
+                    .child(self.pdf.clone())
+            }
+        }
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试.pdf");
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            ZoomProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let loaded = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // ---- 阶段 1（适配宽）：真实拖选命中文本 → 选中 + 弹卡，panning 必须为 false ----
+        // 同步预热文本层（`load_text_for_test` 阻塞等 worker），再扫字符盒定位**视口内**
+        // 一段可拖字符（k..k+3）的窗口坐标（此时文档在顶部，offset.y=0，前几页可见；
+        // 同 shell `first_char_range_points` 姿势）。
+        let ((_page, _k), (p1, p3)) = cx.update(|window, cx| {
+            let pv = holder.borrow().as_ref().unwrap().clone();
+            let mut found: Option<(
+                (usize, usize),
+                (gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>),
+            )> = None;
+            for page in 0..12usize {
+                pv.update(cx, |v, _| {
+                    v.load_text_for_test(page);
+                });
+                for k in 0..800usize {
+                    if let (Some(p), Some(q)) = (
+                        pv.read(cx).char_window_pos(window, page, k),
+                        pv.read(cx).char_window_pos(window, page, k + 3),
+                    ) {
+                        if p.y >= gpui::px(0.)
+                            && p.y <= gpui::px(900.)
+                            && q.y >= gpui::px(0.)
+                            && q.y <= gpui::px(900.)
+                        {
+                            found = Some(((page, k), (p, q)));
+                            break;
+                        }
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found.expect("视口内（文档顶部）应存在可用字符盒（文本层未缓存？）")
+        });
+        // 真实拖选：按下 p1 → 拖到 p3 → 松手（与 shell b1 同姿势）
+        let mods = gpui::Modifiers::default();
+        cx.simulate_mouse_move(p1, gpui::MouseButton::Left, mods);
+        cx.simulate_mouse_down(p1, gpui::MouseButton::Left, mods);
+        cx.simulate_mouse_move(p3, gpui::MouseButton::Left, mods);
+        cx.simulate_mouse_up(p3, gpui::MouseButton::Left, mods);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (panning_fit, sel_card_fit) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.panning, v.sel_card.is_some())
+        });
+        assert!(!panning_fit, "适配宽下拖选不应进入平移：panning={panning_fit}");
+        assert!(sel_card_fit, "适配宽下真实拖选应弹选中卡（既有路径未被破坏）");
+
+        // ---- 阶段 2（放大 ×2 → 横向溢出）：左键拖拽 = 平移，无选中/无菜单 ----
+        // 先滚到第 5 页，留出纵向滚动余量（同 pdf_ctrl_wheel_zooms_in_out）。
+        cx.update(|_w, cx| {
+            let pdf = holder.borrow().as_ref().unwrap().clone();
+            pdf.update(cx, |v, cx| {
+                v.scroll_to_page(5);
+                cx.notify();
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            cx.simulate_event(wheel(true, 240.0));
+            for _ in 0..4 {
+                cx.run_until_parked();
+            }
+        }
+        let (overflow, off_before) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.scroll.max_offset().x.as_f32() > 1.0, v.scroll.offset())
+        });
+        assert!(overflow, "Ctrl+滚轮放大 2 档后应横向溢出");
+
+        // 在页内按下 → 进入平移 → **向左拖 120px** → 松手。「跟手」语义：页面随光标移动，
+        // 左缘（offset.x=0）时向右拖无内容可露（precise clamp 到 0），向左拖即露出被截断
+        // 的右侧 → offset.x 更负（scroll 偏移量程 [-max, 0]，见 gpui div.rs clamp）。
+        let press = gpui::point(gpui::px(600.), gpui::px(450.));
+        let released = gpui::point(gpui::px(600. - 120.), gpui::px(450.));
+        cx.simulate_mouse_down(press, gpui::MouseButton::Left, mods);
+        cx.simulate_mouse_move(released, gpui::MouseButton::Left, mods);
+        cx.simulate_mouse_up(released, gpui::MouseButton::Left, mods);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (off_after, panning_after, sel_card_after) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.scroll.offset(), v.panning, v.sel_card.is_some())
+        });
+        assert!(!panning_after, "平移松手后应退出 panning");
+        assert!(
+            off_after.x.as_f32() < off_before.x.as_f32(),
+            "放大超宽后左键拖拽应向左平移（offset.x 更负）：{} → {}",
+            off_before.x.as_f32(),
+            off_after.x.as_f32()
+        );
+        assert!(!sel_card_after, "平移路径不应弹选中菜单");
     }
 
     /// 回归：**窗口拉宽/拉窄 → 页面自适应**。页宽基线 = 容器宽 − 两侧页边距，随
@@ -2465,7 +2643,7 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::copy(test_pdf_paths()[0].clone(), &dst).expect("拷贝夹具到 temp");
+        test_util::copy_fixture_writable(&test_pdf_paths()[0], &dst).expect("拷贝夹具到 temp");
         dst
     }
 
@@ -2760,8 +2938,8 @@ mod tests {
         let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join(format!("pending-op-{}.pdf", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        std::fs::copy(&src, &p).expect("拷贝夹具");
+        let _ =         std::fs::remove_file(&p);
+        test_util::copy_fixture_writable(&src, &p).expect("拷贝夹具");
         let disk0 = std::fs::read(&p).expect("读初始磁盘");
 
         let viewer = cx.update(|app| app.new(|cx| crate::pdf::PdfViewer::new(p.clone(), cx)));
@@ -2882,3 +3060,6 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 }
+
+
+

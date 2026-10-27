@@ -1390,8 +1390,8 @@ fn apply_annotations_raw(
     Ok(items.len())
 }
 
-/// 删除线/下划线细条的视觉厚度（PDF 点，~1px@72dpi）。
-const APOBJ_LINE_H: f32 = 3.0;
+/// 删除线/下划线细条的视觉厚度（PDF 点，~1px@72dpi；与待存叠加层 `render` 的 ~1.5pt 对齐）。
+const APOBJ_LINE_H: f32 = 1.5;
 /// 高亮注释注释级透明度（/CA，0-255）：≈0.43 半透明，正文不被遮挡。
 const APOBJ_HIGHLIGHT_A: u32 = 110;
 

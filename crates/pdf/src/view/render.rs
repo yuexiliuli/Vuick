@@ -143,8 +143,8 @@ fn pending_annot_overlays_for_page(
                 );
             }
         } else {
-            // 删除线/下划线：细条厚度随显示缩放（~3pt），视宽随 quad 宽
-            let bar_h = (scale * 3.0).clamp(1.5, 6.0);
+            // 删除线/下划线：细条厚度随显示缩放（~1.5pt），视宽随 quad 宽
+            let bar_h = (scale * 1.5).clamp(1.0, 3.0);
             for q in &annot.quads_pt {
                 let (x0, y_top) = pt_to_local(q.x0, q.y1, dim.0, dim.1, display_w, scale);
                 let (x1, y_bottom) = pt_to_local(q.x1, q.y0, dim.0, dim.1, display_w, scale);
@@ -532,8 +532,8 @@ impl Render for PdfViewer {
                                     .mode(ScrollbarMode::Always)
                                     .viewport_from_layout(),
                             )
-                            // 横向滚动条：窗口过窄时 scroll 容器内容宽于视口，
-                            // 横向溢出可滚；轴 Always 常驻可见。
+                            // 横向滚动条：窗口过窄/放大超宽时 scroll 容器内容宽于视口，
+                            // 横向溢出可滚；轴 Always 常驻可见（与原实现一致）。
                             .child(
                                 Scrollbar::horizontal(&self.scroll)
                                     .mode(ScrollbarMode::Always)
@@ -546,11 +546,11 @@ impl Render for PdfViewer {
 }
 
 impl PdfViewer {
-    /// Phase B1：选中文字后的操作卡片浮层（有选中弹卡时返回 `Some`）。沿用
+    /// Phase B1：选中文字后的操作菜单浮层（有选中弹卡时返回 `Some`）。沿用
     /// `note_card` / `image_edit_card` 的 `deferred(anchored(Window))` 约定（逃逸滚动
-    /// 容器裁剪/命中）：锚定在选区**上缘中心**上方，越界 `snap_to_window_with_margin`
-    /// 夹回窗口；点卡片外（`on_mouse_down_out`）关闭。四项 —— 复制 / 高亮 / 删除线 /
-    /// 下划线。
+    /// 容器裁剪/命中）：锚定在**松开鼠标处**（窗口坐标，同右键菜单「点在哪出在哪」），
+    /// 越界 `snap_to_window_with_margin` 夹回窗口；点卡片外（`on_mouse_down_out`）关闭。
+    /// 菜单形式（一行一项，同右键 `PopupMenu`）—— 复制 / 高亮 / 删除线 / 下划线。
     fn sel_card_element(
         &self,
         _window: &mut Window,
@@ -566,7 +566,7 @@ impl PdfViewer {
         let border: gpui::Hsla = colors.border.into();
         let popover_bg: gpui::Hsla = colors.popover_bg.into();
 
-        // 每一格按钮：hover 底色 + 点击回调（捕获各自的注释类型 / 关闭动作）。
+        // 每一行菜单项：hover 底色 + 点击回调（捕获各自的注释类型 / 关闭动作）。
         let copy_item = Self::sel_card_item(
             "pdf-sel-card-copy",
             "复制",
@@ -620,9 +620,10 @@ impl PdfViewer {
             })
             .occlude()
             .flex()
-            .flex_row()
-            .gap_x(px(2.))
-            .p(px(3.))
+            .flex_col()
+            .gap_y(px(2.))
+            .p(px(4.))
+            .min_w(px(120.))
             .rounded_lg()
             .border_1()
             .border_color(border)
@@ -654,7 +655,7 @@ impl PdfViewer {
 }
 
 impl PdfViewer {
-    /// 选中弹卡里的一格操作按钮（id/debug_selector 供测试定位）。
+    /// 选中菜单里的一行操作项（id/debug_selector 供测试定位）。
     #[allow(clippy::too_many_arguments)] // 四色 + 回调，与 toc_item_frame 同构
     fn sel_card_item<F>(
         id: &'static str,
@@ -671,12 +672,12 @@ impl PdfViewer {
         div()
             .id(gpui::ElementId::from(id))
             .debug_selector(move || id2.into())
+            .w_full()
             .h(px(28.))
             .px_2()
-            .rounded_md()
+            .rounded_sm()
             .flex()
             .items_center()
-            .justify_center()
             .cursor(gpui::CursorStyle::PointingHand)
             .text_size(px(12.5))
             .text_color(colors_fg)
