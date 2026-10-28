@@ -67,8 +67,10 @@ mod tab_drag;
 mod tests;
 
 use std::any::Any;
+use std::cell::Cell;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{
     anchored, deferred, div, px, white, Anchor, AnimationExt, AnyWindowHandle, App,
@@ -282,33 +284,73 @@ pub(crate) struct MdWyInstall {
     pub(crate) pending_full: Option<(usize, usize)>,
 }
 
-/// 选项卡拖拽携带的数据：目标选项卡下标 + 当前显示名（拖拽幽灵视图用它画“小胶囊”）。
+/// 选项卡拖拽携带的数据：目标选项卡下标 + 当前显示名 + 真实 laid-out 尺寸。
+/// `size` 每帧由 [`crate::app::tabs::TabBoundsRecorder`] 写入（包在选项卡元素外，把
+/// 其 border-box 尺寸抄进来），拖拽预览 / 幽灵窗按它定宽定高——彻底避免「文本估算
+/// 偏窄 → 窗内变小 / 窗外内容溢出被裁」。
 #[derive(Clone, Debug)]
 pub(crate) struct TabDragData {
     idx: usize,
     name: SharedString,
+    size: Rc<Cell<Size<Pixels>>>,
 }
 
-/// 拖拽选项卡时跟随鼠标的“幽灵”小胶囊视图。
+/// 拖拽选项卡时跟随鼠标的「文件选项卡」半透明预览视图：窗内 gpui 拖拽 picture 与窗外
+/// 幽灵窗共用同一根视图（视觉一致）——仿真实选项卡（真实 laid-out 尺寸、圆角、边框、
+/// 标题 + 脏点 + 视觉关闭钮），整体半透明表达「正在拖动」。
+/// 尺寸用真实 tab 的 `size`（每帧由 `tabs::TabBoundsRecorder` 写入）**显式定宽高**：
+/// gpui 拖拽 picture 以 `AvailableSpace::min_size()` 布局（window.rs:3737），无固定宽
+/// 会被 min-content 压窄（逆"窗内变小"）；幽灵窗口也按同一尺寸创建（逆"窗外溢出被裁"）。
 struct TabDragGhost {
     name: SharedString,
+    dirty: bool,
+    size: Rc<Cell<Size<Pixels>>>,
+    /// true = 作为窗外幽灵窗根视图（不画 1px 边框：悬于桌面时该描边会被单独呈现为
+    /// 「四根线条围住选项卡」）；false = 作为窗内拖拽 picture（贴近真实激活选项卡）。
+    ghost: bool,
 }
 
 impl Render for TabDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ui::theme::Theme::global(cx);
-        let ghost_bg =
-            ui::theme::ChromeColors::for_mode(theme.is_dark()).drag_ghost_bg;
-        div()
+        let c = ui::theme::ChromeColors::for_mode(theme.is_dark());
+        let s = self.size.get();
+        let w = if s.width > px(0.) { s.width } else { px(120.) };
+        let h = if s.height > px(0.) { s.height } else { px(26.) };
+        let mut base = div()
             .id("tab-drag-ghost")
             .debug_selector(|| "tab-drag-ghost".into())
-            .px_3()
-            .py_1()
-            .rounded_lg()
-            .bg(ghost_bg)
-            .text_color(white())
-            .text_size(px(12.))
+            .w(w)
+            .h(h)
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded_md()
+            .bg(c.tab_active_bg.opacity(0.85));
+        // 仅在窗内 picture 保留 1px 描边（与真实激活选项卡观感一致）；窗外幽灵窗不描边。
+        if !self.ghost {
+            base = base
+                .border_1()
+                .border_color(c.tab_active_border.opacity(0.7));
+        }
+        base.text_size(px(12.))
+            .text_color(c.text_primary.opacity(0.92))
+            .child(if self.dirty { "● " } else { "" })
             .child(self.name.clone())
+            // 视觉关闭钮（不交互）：与真实 tab 同款拖尾，整体观感更接近原选项卡。
+            .child(
+                div()
+                    .w(px(18.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .text_size(px(13.))
+                    .text_color(c.text_minor.opacity(0.8))
+                    .child("×"),
+            )
     }
 }
 
@@ -386,6 +428,10 @@ pub struct EditorApp {
     tabs: Vec<EditorTab>,
     /// 当前激活的选项卡下标
     active_tab: usize,
+    /// 选项卡栏内各选项卡**上一帧** laid-out 的边界（与拖拽事件 `position` 同一输入坐标
+    /// 空间、含横向滚动偏移）：栏内拖拽排序的**命中测试**用。`render_tab_bar` 每次重建
+    /// （长度 = `tabs.len()`、按下标对应；记录器在 prepaint 阶段把真实边界写回各槽位）。
+    tab_bounds: Vec<Rc<Cell<Bounds<Pixels>>>>,
     /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条）
     tab_bar_hscroll: TableScrollState,
     /// 横向滚动条自动隐藏延迟（`poke_tab_hscroll` 重启）：可重入、代序作废，旧定时器
@@ -515,6 +561,30 @@ pub struct EditorApp {
     /// 正在拖拽的选项卡下标（None = 未在拖拽选项卡）：`on_drag_move<TabDragData>`
     /// 在拖拽确认后写入；鼠标在窗口内/外松开时据此决定还原原位还是拆分/还原窗口。
     tab_dragging: Option<usize>,
+    /// 本次拖拽开始时 gpui 拖拽 picture 的「抓取偏移」（`on_drag` 构造器入参 offset =
+    /// 按下点在选项卡点击矩形内的偏移；拖拽中 picture 恒画在 `鼠标 - offset`）。窗外
+    /// 跟手幽灵窗按同一偏移对齐定位，使「窗内 picture ↔ 窗外幽灵」在窗口边缘**无缝
+    /// 衔接**（不跳变、不卡顿）。`on_drag` 构造器写入，拖拽结束清。
+    tab_drag_grab: Option<Point<Pixels>>,
+    /// 拖拽中的选项卡光标已越出窗口边缘（**尚未松手**）：置位 = 已进入「松开才建窗」
+    /// 预位——真文件窗口只在 `on_mouse_up_out` 松开时建立（`release_tab_drag_outside`），
+    /// 越界瞬间**不再开窗**（旧 tear-off 行为已移除）；回到窗内 / 窗内松开清位、
+    /// 选项卡原位保留。
+    drag_outside_armed: bool,
+    /// 本次 `on_drag_move` 算出的「幽灵窗应显示」决策（= 光标越界 **或** 窗内拖拽 picture
+    /// 将要被窗口边缘遮断，见 `tab_drag::drag_picture_about_to_clip`）：真机由
+    /// `place_drag_ghost`（SetWindowPos 显/隐）执行；测试平台拿不到 HWND 无法观察该调用，
+    /// 故此字段供回归锁定「贴边提前切完整幽灵窗」的显隐决策。
+    drag_ghost_visible: bool,
+    /// 拖出窗外时跟随鼠标的「幽灵胶囊」置顶透明小窗句柄（见 [`Self::update_drag_ghost`]）：
+    /// 让被拖选项卡在窗外**仍跟手可见**（gpui 拖拽幽灵只画在窗内，窗外被裁剪）；
+    /// 回到窗内 / 松开 / 取消即销毁。None = 未建 / 已销毁。
+    drag_ghost: Option<AnyWindowHandle>,
+    /// 拖拽选项卡排序：本次拖拽过程光标下的「插入下标」（相对当前 `tabs`；`tabs.len()`
+    /// = 插到末尾；左半/右半/空隙/首尾全覆盖）。`None` = 光标不在选项卡行内（不排序，
+    /// 拖出窗口仍走拆窗）。`on_drag_move` 每帧刷新；`on_mouse_up`（窗内松开）消费落地后
+    /// 清；拖出窗口（拆窗）时置 None。渲染据此画白色插入指示线。
+    tab_reorder_target: Option<usize>,
     /// 本窗口是否为「拖出拆分」生成的独立文件窗口。是 → 把选项卡拖出窗口 = 还原回主窗口；
     /// 否（主窗口）→ 把选项卡拖出窗口 = 拆分出新的独立窗口。
     is_detached: bool,

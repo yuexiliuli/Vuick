@@ -300,39 +300,65 @@ impl EditorApp {
                     this.open_dropped_paths(paths, window, cx);
                 },
             ))
-            // 多窗口：选项卡拖拽。
-            // on_drag_move 确认「正在拖选项卡」（携带下标）并在光标第一次越过窗口边缘时
-            // 立即 tear-off 成独立窗口（窗口出现在光标处，拖出过程有过渡）；
-            // on_mouse_up(_out) 作为兜底落点——窗口内松开 = 原位/普通点击（仅清状态），
-            // 窗口外松开 = 独立窗口还原回主窗口。
+            // 多窗口：选项卡拖拽——「松开才建窗」预位模型（旧 tear-off「越界即开窗」
+            // 已移除，见 tab_drag.rs 模块注释）：
+            // 拖拽全程（窗内/窗外）由 update_drag_ghost 维护同一个跟手幽灵窗：拖拽开始
+            // 即建、全程跟随鼠标（与窗内 gpui 拖拽 picture 同位对齐，窗口边缘无缝无卡顿）；
+            // 光标越出边缘仅置 drag_outside_armed 预位（不建真窗口）。
+            // 真文件窗口只在 on_mouse_up_out 松开时建立（release_tab_drag_outside）：
+            // 主窗口 → 拆新窗；独立窗口 → 还原回主窗口。
+            // 栏内排序：光标停留在选项卡行内 → 记插入位（渲染白色指示线，窗内松开时
+            // reorder_tab 落地）；拖出窗口 / 不在行内 → 复位，仍原位保留或拆窗。
             .on_drag_move(cx.listener(
                 |this: &mut EditorApp, ev: &DragMoveEvent<TabDragData>, window, cx| {
                     let idx = ev.drag(cx).idx; // 拷贝下标，避免持有对 cx 的借用
-                    // 已被 tear-off（源窗口不再有该选项卡）→ 忽略后续移动
+                    // 已拔出（松开后源窗口不再有该选项卡）→ 忽略后续移动
                     if idx >= this.tabs.len() {
                         return;
                     }
+                    // 真实选项卡 laid-out 尺寸（TabBoundsRecorder 每帧写入），供预览定宽。
+                    let drag_size = ev.drag(cx).size.clone();
                     this.tab_dragging = Some(idx);
                     let pos = ev.event.position;
                     let inside = gpui::Bounds::new(gpui::Point::default(), window.bounds().size)
                         .contains(&pos);
+                    // 越界 = 进入「松开才建窗」预位；回到窗内即复位。真窗口只在松开时建。
+                    // 幽灵窗显示：光标越出窗口、或窗内拖拽 picture 将要被窗口边缘遮断
+                    // （含 4px 余量，见 tab_drag::drag_picture_about_to_clip）——贴边即提前
+                    // 切同位置同尺寸完整版；远离边缘时窗内无浮窗、无蓝块（幽灵窗隐藏）。
+                    this.drag_outside_armed = !inside;
+                    // 栏内排序插入位（仅光标在选项卡行内；拖出窗口 → None 走拆窗）。
+                    this.tab_reorder_target = if inside {
+                        this.tab_insert_index(pos)
+                    } else {
+                        None
+                    };
+                    this.update_drag_ghost(idx, drag_size, pos, !inside, window, cx);
                     cx.notify();
-                    if !inside {
-                        // 拖过窗口边缘 → 立即把选项卡拆进光标处的新窗口（tear-off）
-                        this.tear_off_drag(idx, pos, window, cx);
-                    }
                 },
             ))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
+                    // 窗口内松开：若本次拖拽落在选项卡行内的插入位 → 落地排序；
+                    // 无插入位 = 原位保留。无论与否都撤预位、销毁幽灵窗。
+                    if let Some(from) = this.tab_dragging {
+                        if let Some(target) = this.tab_reorder_target.take() {
+                            this.reorder_tab(from, target, cx);
+                        }
+                        this.drag_outside_armed = false;
+                        this.destroy_drag_ghost(cx);
+                    }
                     this.tab_dragging = None;
+                    this.tab_reorder_target = None;
                     cx.notify();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this: &mut EditorApp, ev: &gpui::MouseUpEvent, window, cx| {
+                    // 窗口外松开 = 拆窗/还原路径，插入位不落地。
+                    this.tab_reorder_target = None;
                     this.release_tab_drag_outside(window, ev.position, cx);
                 }),
             )

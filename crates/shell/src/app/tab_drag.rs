@@ -1,7 +1,55 @@
-//! 跨窗口选项卡搬迁与拖拽：从本窗口「拔出」/收纳选项卡、拖出窗口拆新窗口 /
+//! 跨窗口选项卡搬迁与拖拽：从本窗口「拔出」/收纳选项卡、**松开**拖出窗口拆新窗口 /
 //! 还原回主窗口（多窗口 split/tear-off），以及全局 `EditorAppRegistry` 的读写。
+//!
+//! 拖拽出窗体验模型（2026-10 重构）：旧「光标一越界即 open_window（tear-off）」改作
+//! 「松开才建窗」——越界只置 `drag_outside_armed` 预位 + 用置顶透明幽灵窗让被拖选项卡
+//! 在窗外仍跟手可见（gpui 拖拽幽灵只画在源窗口帧缓冲内，窗外被裁剪），真文件窗口在
+//! `release_tab_drag_outside`（`on_mouse_up_out`）时才建立。
 
 use super::*;
+
+/// 拖拽预告（半透明选项卡）尺寸的**兜底估算**（仅真实 laid-out 尺寸尚未记录的首帧用）：
+/// 宽 = `shape_line` 文本宽 + px_2 两侧(16) + 2×gap(8) + 关闭钮(18) + 边框(4) ≈ +46；
+/// 高 = 选项卡 26。正常情况下 [`crate::app::tabs::TabBoundsRecorder` 已把真实尺寸写入，
+/// 不会走这里。
+fn tab_preview_size(name: &str, dirty: bool, window: &Window) -> Size<Pixels> {
+    let text = if dirty {
+        format!("● {name}")
+    } else {
+        name.to_string()
+    };
+    let line = window
+        .text_system()
+        .shape_line(SharedString::from(text), px(12.), &[], None);
+    let text_w = line.width();
+    gpui::size((text_w + px(46.)).max(px(64.)), px(26.))
+}
+
+/// 窗内拖拽 picture 距窗口边缘小于该值（px）即视为「将要被窗口边缘遮断」→ 提前切到
+/// 同位置、同尺寸的完整版幽灵窗。余量保证：picture 真正开始被裁之前幽灵窗已接管，
+/// 不存在「贴边被切 → 越界才突然完整」的可见跳变。
+pub(super) const DRAG_EDGE_CLIP_MARGIN: f32 = 4.0;
+
+/// 窗内 gpui 拖拽 picture 是否**将要**被窗口边缘遮断（含 [`DRAG_EDGE_CLIP_MARGIN`] 余量）？
+/// 拖拽 picture 恒画在 `鼠标 - 抓取偏移`（gpui window.rs `prepaint_as_root(mouse - cursor_offset)`），
+/// 原点为窗口坐标、越出窗口帧缓冲的部分被窗口边缘裁掉——而光标本身仍可留在窗内（如抓取
+/// 偏移偏大、picture 已探出边缘）。`window_size` 用 `window.bounds().size`（与 `on_drag_move`
+/// 判 `inside` 同一坐标空间）。返回 true → [`EditorApp::update_drag_ghost`] 提前显示
+/// **同位置、同尺寸**的完整幽灵窗（屏幕原点 = `window.bounds().origin + (pos - grab)`，
+/// 与窗内 picture 同位 → 无跳变）。
+pub(super) fn drag_picture_about_to_clip(
+    pos: Point<Pixels>,
+    grab: Point<Pixels>,
+    size: Size<Pixels>,
+    window_size: Size<Pixels>,
+) -> bool {
+    let m = px(DRAG_EDGE_CLIP_MARGIN);
+    let o = pos - grab; // picture 左上角（窗口坐标）
+    o.x < m
+        || o.y < m
+        || o.x + size.width > window_size.width - m
+        || o.y + size.height > window_size.height - m
+}
 
 impl EditorApp {
     /// 从本窗口「拔出」一个选项卡：移除选项卡（**不**释放 PDF 纹理、不重置编辑器——
@@ -69,9 +117,9 @@ impl EditorApp {
     }
 
     /// 移出选项卡前的统一收尾（live2 守卫下沉）：实时预览编辑实体不随选项卡搬迁——
-    /// 先 `commit_live` 把 live2 写回编辑区再取载荷。两处拖拽移出路径（`release_tab_drag_outside`
-    /// 窗口外松开 / `tear_off_drag` 越过窗口缘）此前各自手抄「`live_edit` → `commit_live`」守卫，
-    /// 收敛为此 helper；`take_tab_payload` 本身保持无副作用（测试直调、不隐含 commit）。
+    /// 先 `commit_live` 把 live2 写回编辑区再取载荷。拖拽移出路径（`release_tab_drag_outside`
+    /// 窗口外松开）此前各自手抄「`live_edit` → `commit_live`」守卫，收敛为此 helper；
+    /// `take_tab_payload` 本身保持无副作用（测试直调、不隐含 commit）。
     pub(super) fn commit_live_and_take_tab_payload(
         &mut self,
         idx: usize,
@@ -210,6 +258,9 @@ impl EditorApp {
         release_position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        // 窗口外松开：先销毁越界时创建的跟手幽灵窗，真文件窗口随后按落点建立/还原。
+        self.destroy_drag_ghost(cx);
+        self.drag_outside_armed = false;
         let Some(idx) = self.tab_dragging.take() else {
             return;
         };
@@ -230,30 +281,250 @@ impl EditorApp {
         }
     }
 
-    /// 拖拽中光标**第一次越过窗口边缘** → 立即把选项卡拆进光标处的新窗口（浏览器式
-    /// tear-off），让「拖出窗口」有连续过渡，而不是松开后才突然弹出独立窗口。
-    /// 独立文件窗口不在此拆分：它保持「拖到选项卡栏松开 = 还原回主窗口」的语义。
-    pub(super) fn tear_off_drag(
+    /// 拖拽选项卡期间维护「幽灵胶囊」窗：本次拖拽**开始**（第一次 `on_drag_move`）即
+    /// **隐藏创建**置顶透明小窗并全程复用；显示条件 = 光标越出窗口 **或** 窗内拖拽 picture
+    /// 将要被窗口边缘遮断（含 4px 余量，见 [`drag_picture_about_to_clip`]）——picture 一旦
+    /// 贴边即提前切到同位置、同尺寸的完整版幽灵窗（杜绝「一半被裁 → 越界才突然完整」）。
+    /// 因此：
+    /// - 窗内 picture 远离边缘：只见原有 gpui 小胶囊，**没有浮窗/蓝块**（幽灵窗隐藏）；
+    /// - 贴边 / 拖出拖入：只是「显示 ⇄ 隐藏 + 定位」（一次 `SetWindowPos`），无创建/销毁
+    ///   卡顿、无抓取偏移跳变（窗内 picture 与幽灵窗都画在 `鼠标 - 抓取偏移`）；
+    /// 真文件窗口仍然只在 [`Self::release_tab_drag_outside`] 松开时建立。拖拽结束
+    /// （松开）由 [`Self::destroy_drag_ghost`] 销毁。
+    pub(super) fn update_drag_ghost(
         &mut self,
         idx: usize,
-        position: Point<Pixels>,
-        window: &mut Window,
+        drag_size: Rc<Cell<Size<Pixels>>>,
+        pos: Point<Pixels>,
+        outside: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_detached {
-            return;
-        }
-        if idx >= self.tabs.len() {
-            return;
-        }
-        // 实时预览编辑模式下 tear-off：先写回（实时实体不随选项卡搬）。
-        let Some(payload) = self.commit_live_and_take_tab_payload(idx, window, cx) else {
+        let Some(tab) = self.tabs.get(idx) else {
             return;
         };
-        self.tab_dragging = None;
-        // 结束旧窗口的拖拽：幽灵不再画在旧窗口，也不会被新窗口的首帧绘制出来。
-        let _ = cx.stop_active_drag(window);
-        self.split_tab_to_new_window(payload, position, window, cx);
+        let name: SharedString = tab
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "未命名".to_string())
+            .into();
+        let dirty = tab.dirty;
+        // 幽灵窗/预览尺寸 = 真实选项卡 laid-out 尺寸（`tabs::TabBoundsRecorder` 每帧写入
+        // `drag_size`）；首帧尚无记录时回退到估算。同步给下面创建的窗口 bounds/min_size。
+        let s = drag_size.get();
+        let size = if s.width > px(0.) && s.height > px(0.) {
+            s
+        } else {
+            tab_preview_size(&name, dirty, window)
+        };
+        let grab = self.tab_drag_grab.unwrap_or(Point::default());
+        // 幽灵左上角（屏幕逻辑 px）＝ 源窗口左上角 + (拖拽点 - 抓取偏移)，与 gpui 在
+        // 窗内绘制拖拽 picture 的位置（mouse_position - cursor_offset）完全一致。
+        let screen = window.bounds().origin + (pos - grab);
+        // 幽灵窗显示条件：光标越出窗口（窗外完整版）**或** 窗内 picture 将要被窗口边缘
+        // 遮断（含 4px 余量，见 `drag_picture_about_to_clip`）——贴边即提前切同位置同
+        // 尺寸的完整幽灵窗，杜绝「一半被裁 → 越界才突然完整」。记录决策供测试锁定。
+        let visible = outside
+            || drag_picture_about_to_clip(pos, grab, size, window.bounds().size);
+        self.drag_ghost_visible = visible;
+        self.ensure_drag_ghost(name, dirty, size, drag_size, screen, cx);
+        if let Some(gh) = self.drag_ghost {
+            Self::place_drag_ghost(gh, screen, visible, cx);
+        }
+    }
+
+    /// 懒创建 / 复用本次拖拽的幽灵窗（置顶透明无边框 PopUp，`focus:false` 不抢焦点、
+    /// 不进任务栏），内容是与拖拽幽灵同款的半透明选项卡 [`TabDragGhost`]（持有
+    /// `size_cell`，按真实 laid-out 尺寸渲染自身）。同一拖拽内只建一次、全程复用；
+    /// 命名/脏点随新拖拽更新。
+    /// 关键：**`show:true` + 起点 = 拖拽位置（在屏内）**。gpui_windows 在 `show:false` 时
+    /// 不应用 `window_bounds`（窗口保持 CW_USEDEFAULT 巨大默认尺寸；window.rs:577-589），
+    /// 而 `open_window` 创建时立即 draw 一帧（app.rs:1520）→ 巨大错误帧；之后 SetWindowPos
+    /// 缩放只是裁剪它（即用户所见「更大/直角/文字消失/截断」）。`show:true` 让 placement
+    /// 先落成正确尺寸再画首帧；起点在屏内保证 `check_given_bounds` 通过（**不可用屏外
+    /// 原点**：会回落到默认大窗，display.rs:104-118）。窗口尺寸 = 真实选项卡尺寸 → 内容
+    /// 不溢出、四角圆润。
+    fn ensure_drag_ghost(
+        &mut self,
+        name: SharedString,
+        dirty: bool,
+        size: Size<Pixels>,
+        size_cell: Rc<Cell<Size<Pixels>>>,
+        origin: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(gh) = &self.drag_ghost {
+            // 已有（防御：拖拽结束销毁失败的残留）→ 仅换名/脏点复用。
+            let _ = gh.update(cx, |view, _window, cx| {
+                if let Ok(ghost) = view.downcast::<TabDragGhost>() {
+                    let _ = ghost.update(cx, |view, _cx| {
+                        view.name = name;
+                        view.dirty = dirty;
+                    });
+                }
+            });
+            return;
+        }
+        let bounds = Bounds { origin, size };
+        let titlebar = gpui::TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            ..Default::default()
+        };
+        let handle = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(titlebar),
+                focus: false,
+                show: true,
+                kind: gpui::WindowKind::PopUp,
+                is_movable: false,
+                is_resizable: false,
+                is_minimizable: false,
+                window_background: gpui::WindowBackgroundAppearance::Transparent,
+                ..Default::default()
+            },
+            |_new_window, cx| cx.new(|_| TabDragGhost {
+                name,
+                dirty,
+                size: size_cell,
+                ghost: true,
+            }),
+        );
+        if let Ok(wh) = handle {
+            self.drag_ghost = Some(wh.into());
+            // 建完立刻剥掉 DWM 的圆角/过渡框线（见 strip 注释）。
+            if let Some(gh) = self.drag_ghost {
+                Self::strip_ghost_dwm_frame(gh, cx);
+            }
+        }
+    }
+
+    /// 定位幽灵窗（**纯移动，不缩放**）。gpui 无「运行时移动窗口」API，用原生
+    /// `SetWindowPos` 改原点 + 显/隐；**不带 w/h（SWP_NOSIZE）**——尺寸已在创建时按真实
+    /// 选项卡落定，移动不改变内容尺寸，避免两套 scale/异步 viewport 造成的缩放裁剪/残像。
+    /// 测试平台 rwh 报 NotSupported → 静默 no-op。
+    fn place_drag_ghost(
+        gh: AnyWindowHandle,
+        screen: Point<Pixels>,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = gh.update(cx, |_view, ghost_window, _| {
+            #[cfg(windows)]
+            {
+                use raw_window_handle::HasWindowHandle as _;
+                if let Ok(handle) = ghost_window.window_handle()
+                    && let Ok(raw_window_handle::RawWindowHandle::Win32(win32)) =
+                        raw_window_handle::RawWindowHandle::try_from(handle)
+                {
+                    let scale = ghost_window.scale_factor();
+                    let x = (screen.x.as_f32() * scale).round() as i32;
+                    let y = (screen.y.as_f32() * scale).round() as i32;
+                    let flags = SWP_NOSIZE
+                        | SWP_NOZORDER
+                        | SWP_NOACTIVATE
+                        | if visible { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
+                    unsafe {
+                        SetWindowPos(
+                            win32.hwnd.get() as *mut core::ffi::c_void,
+                            std::ptr::null_mut(),
+                            x,
+                            y,
+                            0,
+                            0,
+                            flags,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// 剥掉幽灵窗的 Windows「四根黑色直线窗框」。根因（两子 agent 一致）：这张卡片的
+    /// 内容层无边框（已去 border）、无 DWM 圆角、无 min-size 抬升，黑线来自**窗口外框
+    /// 合成**——gpui_windows 把 `WindowKind::PopUp` 建成 `dwstyle=0` 的 **WS_OVERLAPPED
+    /// 顶层窗**（window.rs:492-493），Win10/11 DWM 保留约 1px 非客户区框；该环在
+    /// swapchain（只铺 client w×h）之外，被**实心黑类背景刷**（window.rs:1435）画成黑
+    /// 线 = 「四根直线围住卡片」。
+    /// 修复：改回真正的 `WS_POPUP`（无边框 → `GetWindowRect == GetClientRect`，非客户
+    /// 黑环消失）并 `SWP_FRAMECHANGED` 通知 DWM 重建。**不动透明路径**（clear 仍是透明黑、
+    /// DComp premultiplied 直通）。测试平台拿不到 HWND → 静默 no-op。
+    fn strip_ghost_dwm_frame(gh: AnyWindowHandle, cx: &mut Context<Self>) {
+        let _ = gh.update(cx, |_view, ghost_window, _| {
+            #[cfg(windows)]
+            {
+                use raw_window_handle::HasWindowHandle as _;
+                if let Ok(handle) = ghost_window.window_handle()
+                    && let Ok(raw_window_handle::RawWindowHandle::Win32(win32)) =
+                        raw_window_handle::RawWindowHandle::try_from(handle)
+                {
+                    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+                    unsafe {
+                        // DWM 圆角偏好 0（直角） + 关过渡帧（沿用上轮）。
+                        let donotround: u32 = DWMWCP_DONOTROUND;
+                        let no_transition: i32 = 1;
+                        DwmSetWindowAttribute(
+                            hwnd,
+                            DWMWA_WINDOW_CORNER_PREFERENCE,
+                            &donotround as *const u32 as *const core::ffi::c_void,
+                            core::mem::size_of::<u32>() as u32,
+                        );
+                        DwmSetWindowAttribute(
+                            hwnd,
+                            DWMWA_TRANSITIONS_FORCEDISABLED,
+                            &no_transition as *const i32 as *const core::ffi::c_void,
+                            core::mem::size_of::<i32>() as u32,
+                        );
+                        // WS_OVERLAPPED(0x0) → WS_POPUP：无非客户区，黑色外环消失。
+                        let old_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                        let new_style = (old_style | (WS_POPUP as isize))
+                            & !(WS_CAPTION as isize | WS_THICKFRAME as isize | WS_SYSMENU as isize);
+                        SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
+                        SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE
+                                | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                        if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+                            let mut wr = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+                            let mut cr = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+                            GetWindowRect(hwnd, &mut wr);
+                            GetClientRect(hwnd, &mut cr);
+                            eprintln!(
+                                "[GHOSTWND] window={}x{} client={}x{} off=({},{}) dpi={} dcomp_env={} style_after={:#x} bounds={:?} scale={}",
+                                wr.right - wr.left,
+                                wr.bottom - wr.top,
+                                cr.right - cr.left,
+                                cr.bottom - cr.top,
+                                cr.left - wr.left,
+                                cr.top - wr.top,
+                                GetDpiForWindow(hwnd),
+                                std::env::var("GPUI_DISABLE_DIRECT_COMPOSITION")
+                                    .unwrap_or_default(),
+                                new_style,
+                                ghost_window.bounds(),
+                                ghost_window.scale_factor(),
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// 销毁跟随鼠标的幽灵窗口（回到窗内 / 松开 / 取消拖拽时）。幂等。
+    pub(super) fn destroy_drag_ghost(&mut self, cx: &mut Context<Self>) {
+        if let Some(gh) = self.drag_ghost.take() {
+            let _ = gh.update(cx, |_view, w, _| w.remove_window());
+        }
     }
 
     /// 把选项卡拆进一个新开的独立窗口：窗口左上角跟随鼠标释放位置（屏幕坐标 =
@@ -320,4 +591,87 @@ impl EditorApp {
             }
         }
     }
+}
+
+// 幽灵窗口跟随用：Windows 原生 `SetWindowPos`（shell 已依赖 raw-window-handle=0.6 取
+// HWND，不新增任何依赖；非 Windows 目标整块不编译）。
+#[cfg(windows)]
+const SWP_NOSIZE: u32 = 0x0001;
+#[cfg(windows)]
+const SWP_NOMOVE: u32 = 0x0002;
+#[cfg(windows)]
+const SWP_NOZORDER: u32 = 0x0004;
+#[cfg(windows)]
+const SWP_NOACTIVATE: u32 = 0x0010;
+#[cfg(windows)]
+const SWP_FRAMECHANGED: u32 = 0x0020;
+#[cfg(windows)]
+const SWP_SHOWWINDOW: u32 = 0x0040;
+#[cfg(windows)]
+const SWP_HIDEWINDOW: u32 = 0x0080;
+
+// 幽灵窗改 WS_POPUP（去非客户黑环）用。
+#[cfg(windows)]
+const GWL_STYLE: i32 = -16;
+#[cfg(windows)]
+const WS_POPUP: u32 = 0x8000_0000;
+#[cfg(windows)]
+const WS_CAPTION: u32 = 0x00C0_0000;
+#[cfg(windows)]
+const WS_THICKFRAME: u32 = 0x0004_0000;
+#[cfg(windows)]
+const WS_SYSMENU: u32 = 0x0008_0000;
+
+#[cfg(windows)]
+#[repr(C)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    #[allow(non_snake_case)]
+    fn SetWindowPos(
+        hWnd: *mut core::ffi::c_void,
+        hWndInsertAfter: *mut core::ffi::c_void,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        uFlags: u32,
+    ) -> i32;
+    #[allow(non_snake_case)]
+    fn GetWindowLongPtrW(hWnd: *mut core::ffi::c_void, nIndex: i32) -> isize;
+    #[allow(non_snake_case)]
+    fn SetWindowLongPtrW(hWnd: *mut core::ffi::c_void, nIndex: i32, dwNewLong: isize) -> isize;
+    #[allow(non_snake_case)]
+    fn GetWindowRect(hWnd: *mut core::ffi::c_void, lpRect: *mut Rect) -> i32;
+    #[allow(non_snake_case)]
+    fn GetClientRect(hWnd: *mut core::ffi::c_void, lpRect: *mut Rect) -> i32;
+    #[allow(non_snake_case)]
+    fn GetDpiForWindow(hWnd: *mut core::ffi::c_void) -> u32;
+}
+
+// 幽灵窗剥 DWM 框线用：dwmapi 的窗口圆角偏好（零新依赖，`#[link]` 姿势与上面 user32 同款）。
+#[cfg(windows)]
+const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+#[cfg(windows)]
+const DWMWCP_DONOTROUND: u32 = 1;
+#[cfg(windows)]
+const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
+
+#[cfg(windows)]
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    #[allow(non_snake_case)]
+    fn DwmSetWindowAttribute(
+        hwnd: *mut core::ffi::c_void,
+        dwAttribute: u32,
+        pvAttributeValue: *const core::ffi::c_void,
+        cbAttribute: u32,
+    ) -> i32;
 }

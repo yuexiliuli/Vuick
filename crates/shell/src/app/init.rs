@@ -157,7 +157,13 @@ impl EditorApp {
             open_finish_count: 0,
             open_dialog_calls: 0,
             last_title_ctrl_fg: None,
+            tab_bounds: Vec::new(),
             tab_dragging: None,
+            tab_reorder_target: None,
+            tab_drag_grab: None,
+            drag_outside_armed: false,
+            drag_ghost_visible: false,
+            drag_ghost: None,
             is_detached,
             // 会话持久化责任：仅首个主窗口（`startup` 仅 `new` 传 true；new_media_window /
             // new_detached 传 false）——会话清单单份全局，非主窗口参与写会顶替主窗口会话。

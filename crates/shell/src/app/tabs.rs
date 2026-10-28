@@ -5,6 +5,79 @@ use config::timing::TAB_HSCROLL_HIDE_MS;
 use crate::scrollbar::horizontal_scrollbar;
 use ui::motion::hover_spring;
 
+/// 记录子元素（选项卡）每一帧 laid-out 的 border-box **边界**：`size` 供拖拽预览
+/// （[`TabDragGhost`] / 窗外幽灵窗）按真实选项卡尺寸定宽定高；`bounds` 供栏内拖拽排序
+/// 的命中测试（`self.tab_bounds`，与拖拽事件 `position` 同一输入坐标空间）。wrapper 与
+/// child **共享同一 LayoutId**（`request_layout` 直接转发 child 的（`div.rs:4817` 同款
+/// 姿势）），故 `prepaint` 收到的 `bounds` 即 child 的真实布局边界；host `debug_selector`
+/// 仍在 child 上、不受影响。
+struct TabBoundsRecorder {
+    size: Rc<Cell<Size<Pixels>>>,
+    bounds: Rc<Cell<Bounds<Pixels>>>,
+    child: gpui::AnyElement,
+}
+
+impl IntoElement for TabBoundsRecorder {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for TabBoundsRecorder {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> Self::PrepaintState {
+        if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
+            self.size.set(bounds.size);
+            self.bounds.set(bounds);
+        }
+        self.child.prepaint(window, cx);
+        ()
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) {
+        self.child.paint(window, cx);
+    }
+}
+
 /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
 struct TabBarColors {
     text_primary: gpui::Hsla,
@@ -12,6 +85,15 @@ struct TabBarColors {
     tab_active_bg: gpui::Hsla,
     tab_active_border: gpui::Hsla,
     hover_fill: gpui::Hsla,
+}
+
+/// 拖拽排序的白色插入指示线画在哪一侧：`Left` = 本选项卡**左侧**边界（插到它之前）；
+/// `Right` = 本选项卡**右侧**边界（插到它之后 / 末尾）。由 `render_tab_bar` 按
+/// `tab_reorder_target` 指派给对应选项卡元素自行绘制，天然随横向滚动对齐。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReorderSide {
+    Left,
+    Right,
 }
 
 impl EditorApp {
@@ -65,6 +147,73 @@ impl EditorApp {
         self.status = SharedString::from("新建文件");
         self.status_ok = true;
         // make_tab 已即时持久化；此处再安排一次（幂等）以覆盖「新建即激活」语义。
+        self.schedule_session_flush(cx, true);
+        cx.notify();
+    }
+
+    /// 计算拖拽光标（窗口坐标）落在选项卡行内的「插入下标」（相对当前 `tabs`；
+    /// `tabs.len()` = 插到末尾）：
+    /// - 光标不在选项卡行高内（y 越界）→ `None`（不排序；拖出窗口仍走拆窗/原位）
+    /// - 最左 / 最右 / 选项卡间空隙 → 对应插入位
+    /// - 落在某选项卡内 → 左半 = 该选项卡之前（下标 = 该选项卡），右半 = 之后（下标 +1）
+    /// 命中依据 `self.tab_bounds`（上一帧渲染的真实 laid-out 边界，与输入坐标同系）。
+    pub(super) fn tab_insert_index(&self, pos: Point<Pixels>) -> Option<usize> {
+        if self.tabs.is_empty() || self.tab_bounds.is_empty() {
+            return None;
+        }
+        let first = self.tab_bounds[0].get();
+        if first.size.width <= px(0.) {
+            return None; // 尚未渲染出真实边界（首帧）
+        }
+        // 垂直：选项卡共享同一行，光标须落在行高内。
+        let row_bottom = first.bottom_right().y;
+        if pos.y < first.origin.y || pos.y > row_bottom {
+            return None;
+        }
+        let x = pos.x;
+        if x < first.origin.x {
+            return Some(0);
+        }
+        for (i, cell) in self.tab_bounds.iter().enumerate() {
+            let b = cell.get();
+            if x < b.origin.x {
+                return Some(i); // 落在选项卡 i 左侧的空隙
+            }
+            if x <= b.bottom_right().x {
+                let mid = b.origin.x + b.size.width / 2.;
+                return Some(if x < mid { i } else { i + 1 });
+            }
+        }
+        Some(self.tab_bounds.len())
+    }
+
+    /// 栏内拖拽排序落地：把当前下标 `from` 的选项卡移动到「插入下标」`target`
+    /// （`tab_insert_index` 输出，相对当前 `tabs`；`tabs.len()` = 末尾）。
+    /// 插回原位 / 原相邻位（顺序不变）→ 不动作；单选项卡天然不动作。活动下标随移动
+    /// 校正；各选项卡内容/脏点/路径不变；结构变化即时持久化。
+    pub(super) fn reorder_tab(&mut self, from: usize, target: usize, cx: &mut Context<Self>) {
+        let n = self.tabs.len();
+        if n <= 1 || from >= n {
+            return;
+        }
+        let target = target.min(n);
+        // remove(from) 后相对原数组的插入位：`from < target` 时左移一位。
+        if target == from || target == from + 1 {
+            return; // 落回原位 / 原相邻交界 = 顺序无变化
+        }
+        let tab = self.tabs.remove(from);
+        let insert_at = if from < target { target - 1 } else { target };
+        self.tabs.insert(insert_at, tab);
+        // 活动选项卡跟随：被拖动项 = insert_at；其余按「先删后插」的下标迁移校正——
+        // 删 from（>from 者 -1）再插 insert_at（≥insert_at 者 +1）。
+        let a0 = self.active_tab;
+        if a0 == from {
+            self.active_tab = insert_at;
+        } else {
+            let a1 = if a0 > from { a0 - 1 } else { a0 };
+            self.active_tab = if a1 >= insert_at { a1 + 1 } else { a1 };
+        }
+        self.search_scan = None; // 选项卡集合结构变化 → 搜索缓存失效
         self.schedule_session_flush(cx, true);
         cx.notify();
     }
@@ -318,10 +467,14 @@ impl EditorApp {
     }
 
     /// 单个选项卡元素：名称/脏标记/关闭钮/激活顶线 + 拖拽幽灵 + 点击激活。
+    /// `reorder_line` = 拖拽排序时本选项卡要绘制的白色插入指示线侧（None = 不画）；
+    /// `bounds_cell` = 每帧真实 laid-out 边界写入点（`self.tab_bounds` 槽位，排序命中用）。
     fn tab_bar_item(
         tab: &EditorTab,
         idx: usize,
         is_active: bool,
+        reorder_line: Option<ReorderSide>,
+        bounds_cell: Rc<Cell<Bounds<Pixels>>>,
         colors: &TabBarColors,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -403,11 +556,21 @@ impl EditorApp {
         });
         // 多窗口拖拽：按住选项卡拖动 → 跟出“胶囊”幽灵；
         // 在窗口外松开由 EditorApp 根视图决定「拆独立窗口 / 还原回主窗口」。
+        // 真实 laid-out 尺寸记录器：包住最终元素，每帧把选项卡 border-box 抄进 size_cell，
+        // 供拖拽预览 / 幽灵窗以真实尺寸渲染（不缩不被裁）。
+        let size_cell = Rc::new(Cell::new(gpui::Size {
+            width: px(0.),
+            height: px(0.),
+        }));
         let drag_data = TabDragData {
             idx,
             name: SharedString::from(name),
+            size: size_cell.clone(),
         };
         let ghost_name = drag_data.name.clone();
+        // 拖拽开始时 gpui 把「抓取偏移」（按下点在点击矩形内的偏移）交给构造器；窗外
+        // 跟手幽灵窗按同一偏移对齐（picture 恒画在鼠标-偏移处），保证窗口边缘无缝。
+        let app_weak = cx.weak_entity();
         // P2-10：背景弹簧——激活=白卡轻淡入、非激活=hover 填充淡入（同一曲线）；
         // 激活底色 / hover 底色自带 alpha，`opacity` 乘性，v=1 即原色，语义不变。
         let card = if is_active {
@@ -415,11 +578,17 @@ impl EditorApp {
         } else {
             colors.hover_fill
         };
-        el.on_drag(
+        let el = el.on_drag(
             drag_data,
-            move |_value: &TabDragData, _offset, _window, cx| {
+            move |_value: &TabDragData, offset, _window, cx| {
+                if let Some(app) = app_weak.upgrade() {
+                    let _ = app.update(cx, |app, _| app.tab_drag_grab = Some(offset));
+                }
                 cx.new(|_| TabDragGhost {
                     name: ghost_name.clone(),
+                    dirty,
+                    size: (_value).size.clone(),
+                    ghost: false,
                 })
             },
         )
@@ -437,12 +606,41 @@ impl EditorApp {
             cx.listener(move |this: &mut EditorApp, ev, window, cx| {
                 this.on_tab_right_click(idx, ev, window, cx);
             }),
-        )
-        .with_spring(
-            format!("tab-bg-{idx}"),
-            hover_spring(if is_active || hovered { 1.0 } else { 0.0 }),
-            move |this, v| this.bg(card.opacity(v)),
-        )
+        );
+        // 拖拽排序：本次拖拽光标落在「插入到本选项卡左/右边界」→ 在本选项卡边界画白色
+        // 插入指示线（absolute 子元素定位于**本选项卡自身**边界，随横向滚动天然对齐；
+        // 拖拽 picture 覆盖其上为半透明胶囊，不遮蔽整条指示线）。
+        let el = if let Some(side) = reorder_line {
+            let line = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(px(2.))
+                .bg(gpui::white())
+                .rounded_full()
+                .debug_selector(|| "tab-reorder-line".into());
+            match side {
+                ReorderSide::Left => el.child(line.left_0()),
+                ReorderSide::Right => el.child(line.right_0()),
+            }
+        } else {
+            el
+        };
+        let el: gpui::AnyElement = el
+            .with_spring(
+                format!("tab-bg-{idx}"),
+                hover_spring(if is_active || hovered { 1.0 } else { 0.0 }),
+                move |this, v| this.bg(card.opacity(v)),
+            )
+            .into_any_element();
+        // 包上尺寸记录器：由 recorder 持有 size_cell / bounds_cell（拖拽侧另有 Clone），
+        // 每帧把真实 laid-out 尺寸 / 边界写入 → 拖拽预览 / 幽灵窗按真实尺寸渲染、
+        // 栏内排序命中使用。
+        TabBoundsRecorder {
+            size: size_cell,
+            bounds: bounds_cell,
+            child: el,
+        }
         .into_any_element()
     }
 
@@ -560,13 +758,41 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if self.tabs.is_empty() {
+            self.tab_bounds.clear();
             return div().into_any_element();
         }
         let active = self.active_tab;
         let colors = self.tab_bar_colors(cx);
+        // 重建每帧的页卡边界槽（排序命中测试读上一帧值；记录器在 prepaint 写入）。
+        self.tab_bounds = (0..self.tabs.len())
+            .map(|_| Rc::new(Cell::new(Bounds::default())))
+            .collect();
+        // 拖拽排序插入指示线：仅拖拽中按 `tab_reorder_target` 指派——目标 < n → 该目标
+        // 选项卡左缘一线；目标 == n（末尾）→ 最后一个选项卡右缘一线。
+        let reorder_target = if self.tab_dragging.is_some() {
+            self.tab_reorder_target
+        } else {
+            None
+        };
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
-            tabs.push(Self::tab_bar_item(tab, i, i == active, &colors, window, cx));
+            let line = match reorder_target {
+                Some(t) if i == t => Some(ReorderSide::Left),
+                Some(t) if t == self.tabs.len() && i + 1 == self.tabs.len() => {
+                    Some(ReorderSide::Right)
+                }
+                _ => None,
+            };
+            tabs.push(Self::tab_bar_item(
+                tab,
+                i,
+                i == active,
+                line,
+                self.tab_bounds[i].clone(),
+                &colors,
+                window,
+                cx,
+            ));
         }
 
         // 选项卡栏右侧：固定放（按需）眼睛图标；标签过多时由左侧滚动区横向滚动

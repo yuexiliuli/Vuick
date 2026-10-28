@@ -103,8 +103,8 @@
             tab.origin.y + px(tab.size.height.as_f32() / 2.0),
         );
         // 按下 → 移动到超过拖拽阈值（启动 tab 拖拽）→ 移出窗口。
-        // 回归：应在光标刚越过窗口边缘（尚未松手）时立即 tear-off 出独立窗口，
-        // 而不是等到窗口外松开才突然弹窗。
+        // 回归（2026-10「松开才建窗」）：越出窗口边缘（尚未松手）**不得**建独立窗口，
+        // 只置预位 + 跟手幽灵窗；真窗口在窗口外松开时才拆出。
         cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
         cx.simulate_mouse_move(
             gpui::Point::new(start.x + px(40.), start.y),
@@ -119,21 +119,20 @@
         for _ in 0..8 {
             cx.run_until_parked();
         }
+        // 越界未松手：不应有独立窗口、选项卡仍留在主窗口、已进入「松开才建窗」预位。
         let before_up = registry_snapshot(cx);
         assert_eq!(
             before_up.iter().filter(|(d, _, _, _)| *d).count(),
-            1,
-            "越出窗口边缘（未松手）就应已拆出独立窗口，快照={before_up:?}"
+            0,
+            "越出窗口边缘（未松手）不应建窗：松开才建，快照={before_up:?}"
         );
-        assert!(
-            before_up
-                .iter()
-                .find(|(d, _, _, _)| *d)
-                .is_some_and(|(_, n, has_path, text)| {
-                    *n == 1 && *has_path && text.as_deref() == Some("AAA 独立窗口")
-                }),
-            "越出边缘时应已把选项卡放进新窗口，快照={before_up:?}"
-        );
+        let (armed, ghost_alive, tab_count) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_outside_armed, a.drag_ghost.is_some(), a.tabs.len())
+        });
+        assert!(armed, "越界未松手应已置「松开才建窗」预位");
+        assert!(ghost_alive, "越界后应有窗外跟手幽灵窗");
+        assert_eq!(tab_count, 2, "越界未松手选项卡仍留在主窗口");
 
         // 松开（在窗口外）：不应再次拆分（仍是同一个独立窗口）
         cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
@@ -185,6 +184,8 @@
                 && (det_origin.y.as_f32() - expected.y.as_f32()).abs() < 2.0,
             "独立窗口应跟随鼠标释放位置：期望 origin={expected:?}，实际={det_origin:?}"
         );
+        let ghost_after = cx.update(|_w, cx| app.read(cx).drag_ghost.is_none());
+        assert!(ghost_after, "松开后跟手幽灵窗应销毁");
         let _ = std::fs::remove_file(&f);
     }
 
@@ -259,6 +260,93 @@
         let _ = std::fs::remove_file(&f);
     }
 
+    /// 回归（2026-10「松开才建窗」）：独立窗口拖出选项卡到窗外松开 → 还原回主窗口，
+    /// 与主窗口拆窗路径对称：越界未松手不还原、有跟手幽灵窗；松开后主窗口复原文件选项卡。
+    #[gpui::test]
+    async fn detached_drag_out_release_restores_to_primary(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (primary, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join("gpui-multiwin-c.txt");
+        std::fs::write(&f, "CCC 拖出还原").unwrap();
+        cx.update(|window, cx| {
+            primary.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 从主窗口拔出该文件选项卡，交给独立窗口（与 detached_tab_restores_to_primary 同构造）
+        let payload = cx
+            .update(|_w, cx| primary.update(cx, |app, _| app.take_tab_payload(1)))
+            .expect("应有可拔出的选项卡");
+        // 开独立窗口（用 owned 的独立 VisualTestContext 模拟，不借走主窗口上下文；
+        // 松开后独立窗口 `remove_window` 销毁，后续一律经主窗口上下文读取）。
+        let handle = cx.open_window(gpui::size(px(980.), px(720.)), |window, cx| {
+            let app = cx.new(|cx| EditorApp::new_detached(window, cx, payload));
+            ui::root::Root::new(app, window, cx)
+        });
+        let mut det_cx = gpui::VisualTestContext::from_window(handle.into(), &cx);
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let det = cx
+            .update(|_w, cx| {
+                let reg = cx.global::<EditorAppRegistry>();
+                reg.windows
+                    .iter()
+                    .filter_map(|(w, _)| w.upgrade())
+                    .find(|e| e.read_with(cx, |a, _| a.is_detached))
+            })
+            .expect("应存在独立窗口");
+        // 在独立窗口上按下 → 拖出窗外（越界未松手：不还原、幽灵跟手）
+        let tab = det_cx
+            .debug_bounds("tab-0")
+            .expect("独立窗口选项卡应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        det_cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        det_cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let outside = gpui::Point::new(px(-50.), px(60.));
+        det_cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (armed_out, ghost_alive) = cx.update(|_w, cx| {
+            let a = det.read(cx);
+            (a.drag_outside_armed, a.drag_ghost.is_some())
+        });
+        assert!(armed_out, "独立窗口拖出窗外应置「松开才还原」预位");
+        assert!(ghost_alive, "独立窗口拖出窗外应有跟手幽灵窗");
+        // 松开（窗外）→ 还原回主窗口（独立窗口随之销毁）
+        det_cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (has_file, content) = cx.update(|_w, cx| {
+            let a = primary.read(cx);
+            let tab = a.tabs.iter().find(|t| t.file_path.is_some());
+            (
+                tab.is_some(),
+                tab.map(|t| t.editor.read(cx).value().to_string()),
+            )
+        });
+        assert!(has_file, "主窗口应重新持有该文件选项卡");
+        assert_eq!(content.as_deref(), Some("CCC 拖出还原"), "正文应完整还原");
+        let _ = std::fs::remove_file(&f);
+    }
+
     /// 回归：拖拽选项卡但一直停留在窗口内、窗口内松开 → 不拆独立窗口（tear-off 只在
     /// 越出窗口边缘时发生），选项卡仍留在主窗口。
     #[gpui::test]
@@ -284,6 +372,19 @@
         for _ in 0..2 {
             cx.run_until_parked();
         }
+        // 回归（真实尺寸）：拖拽 picture 应等于真实选项卡的 laid-out 尺寸
+        // （`TabBoundsRecorder` 记录 → 预览显式定宽，neither 变小 nor 溢出）。
+        let tab_b = cx.debug_bounds("tab-0").expect("选项卡 tab-0 应渲染");
+        let ghost_b = cx
+            .debug_bounds("tab-drag-ghost")
+            .expect("拖拽 picture 应已布局");
+        assert!(
+            (tab_b.size.width.as_f32() - ghost_b.size.width.as_f32()).abs() < 2.0
+                && (tab_b.size.height.as_f32() - ghost_b.size.height.as_f32()).abs() < 2.0,
+            "拖拽 picture 应与真实选项卡同尺寸：tab={:?} ghost={:?}",
+            tab_b.size,
+            ghost_b.size
+        );
         let moved_inside = gpui::Point::new(start.x + px(120.), start.y + px(40.));
         cx.simulate_mouse_move(moved_inside, MouseButton::Left, Default::default());
         cx.simulate_mouse_up(moved_inside, MouseButton::Left, Default::default());
@@ -302,6 +403,377 @@
             1,
             "主窗口选项卡应保持原样"
         );
+    }
+
+    /// 回归（2026-10「松开才建窗」）：拖出窗外（进预位 + 幽灵窗）再拖回窗口内松开 →
+    /// **取消**：不建独立窗口、选项卡原位保留、预位复位、跟手幽灵窗销毁。
+    #[gpui::test]
+    async fn drag_tab_out_back_inside_cancels(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let tab = cx.debug_bounds("tab-0").expect("选项卡 tab-0 应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // 拖出窗外：进入「松开才建窗」预位 + 跟手幽灵窗
+        cx.simulate_mouse_move(
+            gpui::Point::new(px(-40.), px(60.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (was_armed, ghost_alive) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_outside_armed, a.drag_ghost.is_some())
+        });
+        assert!(was_armed, "拖出窗外应已置「松开才建窗」预位");
+        assert!(ghost_alive, "拖出窗外应有跟手幽灵窗");
+        // 拖回窗内：预位复位；幽灵窗继续全程跟随（拖拽结束才销毁）
+        let back_inside = gpui::Point::new(start.x + px(120.), start.y + px(40.));
+        cx.simulate_mouse_move(back_inside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (armed_after_back, ghost_after_back) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_outside_armed, a.drag_ghost.is_some())
+        });
+        assert!(!armed_after_back, "拖回窗内应复位「松开才建窗」预位");
+        assert!(ghost_after_back, "拖回窗内幽灵窗仍全程跟随（拖拽结束才销毁）");
+        // 窗内松开：取消，不建独立窗口；幽灵窗随拖拽结束销毁
+        cx.simulate_mouse_up(back_inside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let snap = registry_snapshot(cx);
+        assert_eq!(
+            snap.iter().filter(|(d, _, _, _)| *d).count(),
+            0,
+            "拖出再拖回窗内松开不应建独立窗口，快照={snap:?}"
+        );
+        assert!(
+            cx.update(|_w, cx| app.read(cx).drag_ghost.is_none()),
+            "窗内松开后幽灵窗应销毁"
+        );
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            1,
+            "取消拖出后选项卡应原位保留"
+        );
+    }
+
+    /// 回归（2026-10「松开才建窗」）：反复跨界（出→回→再出）不重复建窗、无残留；
+    /// 最终窗外松开才建独立窗口且只建一个。
+    #[gpui::test]
+    async fn drag_tab_out_in_out_again_release_splits_once(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join("gpui-multiwin-d.txt");
+        std::fs::write(&f, "DDD 往返").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let tab = cx.debug_bounds("tab-1").expect("文件选项卡 tab-1 应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // ① 出窗（进入预位 + 幽灵窗）
+        cx.simulate_mouse_move(
+            gpui::Point::new(px(-60.), px(50.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        // ② 回窗内（预位复位；幽灵窗全程跟随不销毁）
+        let back_inside = gpui::Point::new(start.x + px(120.), start.y + px(40.));
+        cx.simulate_mouse_move(back_inside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (armed_mid, ghost_mid) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_outside_armed, a.drag_ghost.is_some())
+        });
+        assert!(!armed_mid, "拖回窗内应复位「松开才建窗」预位");
+        assert!(ghost_mid, "拖回窗内幽灵窗仍全程跟随（窗口全程复用、边缘无卡顿）");
+        // ③ 再出窗（幽灵重新跟手；仍未建真窗口）
+        cx.simulate_mouse_move(
+            gpui::Point::new(px(-80.), px(70.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (armed_again, ghost_again, tab_count) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_outside_armed, a.drag_ghost.is_some(), a.tabs.len())
+        });
+        assert!(armed_again, "再次越界应重新置「松开才建窗」预位");
+        assert!(ghost_again, "再次越界应重新跟手幽灵窗");
+        assert_eq!(tab_count, 2, "再次越界未松手选项卡仍在主窗口");
+        let before_up = registry_snapshot(cx);
+        assert_eq!(
+            before_up.iter().filter(|(d, _, _, _)| *d).count(),
+            0,
+            "再次越界未松手不应建窗，快照={before_up:?}"
+        );
+        // ④ 窗外松开 → 建独立窗口（只建一个）
+        cx.simulate_mouse_up(
+            gpui::Point::new(px(-80.), px(70.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let snap = registry_snapshot(cx);
+        assert_eq!(
+            snap.iter().filter(|(d, _, _, _)| *d).count(),
+            1,
+            "窗外松开应恰好建一个独立窗口，快照={snap:?}"
+        );
+        assert!(
+            cx.update(|_w, cx| app.read(cx).drag_ghost.is_none()),
+            "窗外松开后（拆窗前销毁）幽灵窗应消失"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 回归（2026-10 边缘无缝）：拖拽中幽灵窗在「窗内/窗外」全程跟随同一窗口，
+    /// 窗口边缘穿越不销毁重建（无创建/销毁卡顿）——拖拽开始即建、结束才销毁。
+    #[gpui::test]
+    async fn drag_tab_ghost_lifetime_spans_crossings(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 拖 tab-0：按下 → 窗内移动（拖拽开始即建幽灵）→ 出窗外 → 回窗内 → 窗内松开
+        let tab = cx.debug_bounds("tab-0").expect("选项卡 tab-0 应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // 第二次窗内移动触发 on_drag_move（gpui 拖拽在首次越阈值那拍才建立，on_drag_move
+        // 从下一拍才派发）→ 拖拽开始即建幽灵窗
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(90.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // 拖拽开始（窗内）即已建幽灵窗
+        let (ghost_start, grab_set) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_ghost.is_some(), a.tab_drag_grab.is_some())
+        });
+        assert!(ghost_start, "拖拽开始（窗内）即建幽灵窗");
+        assert!(grab_set, "拖拽开始应已记录抓取偏移");
+        // 出窗外再回窗内：同一幽灵窗仍在（不销毁重建）
+        cx.simulate_mouse_move(
+            gpui::Point::new(px(-60.), px(60.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let ghost_out = cx.update(|_w, cx| app.read(cx).drag_ghost.is_some());
+        assert!(ghost_out, "窗外跟手幽灵窗在");
+        let back_inside = gpui::Point::new(start.x + px(120.), start.y + px(40.));
+        cx.simulate_mouse_move(back_inside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let ghost_back = cx.update(|_w, cx| app.read(cx).drag_ghost.is_some());
+        assert!(ghost_back, "回窗内同一幽灵窗仍在（无销毁重建）");
+        // 窗内松开：本次拖拽结束、幽灵窗销毁
+        cx.simulate_mouse_up(back_inside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| app.read(cx).drag_ghost.is_none()),
+            "拖拽结束幽灵窗应销毁"
+        );
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            1,
+            "窗内松开选卡原位保留"
+        );
+    }
+
+    /// 「提前切完整幽灵窗」几何判定（回归 2026-10 贴边预切）：窗内拖拽 picture（画在
+    /// `鼠标 - 抓取偏移`，越出窗口帧缓冲部分被边缘裁掉）距窗口边缘 < `DRAG_EDGE_CLIP_MARGIN`
+    /// （4px）即判「将要被遮断」→ 返回 true（提前显示同位置同尺寸完整幽灵窗）；远离边缘
+    /// / 恰好贴边缘但未进入余量 = false。光标可在窗内而 picture 已探出边缘（抓取偏移大）。
+    #[test]
+    fn drag_picture_about_to_clip_geometry() {
+        use super::tab_drag::{drag_picture_about_to_clip, DRAG_EDGE_CLIP_MARGIN};
+        let win = gpui::size(px(980.), px(720.));
+        let tab_size = gpui::size(px(120.), px(26.));
+        let grab = gpui::Point::new(px(20.), px(13.));
+        // 远离各边缘：picture 完整可见，false
+        assert!(
+            !drag_picture_about_to_clip(gpui::Point::new(px(400.), px(400.)), grab, tab_size, win),
+            "窗口中央 picture 不应判为将要被遮断"
+        );
+        // 左缘：cursor 在 x=3（窗内），grab=20 → picture 原点=-17 < 4 → 提前切
+        assert!(
+            drag_picture_about_to_clip(gpui::Point::new(px(3.), px(400.)), grab, tab_size, win),
+            "picture 探出左缘（光标仍在窗内）→ 应提前切幽灵窗"
+        );
+        // 左缘恰好 4px：origin=4，4<4 false；右缘未越 → 未遮断，不提前切
+        assert!(
+            !drag_picture_about_to_clip(gpui::Point::new(px(24.), px(400.)), grab, tab_size, win),
+            "picture 距左缘恰 4px（未遮断）不应提前切换"
+        );
+        // 上缘同理：cursor y=3 → origin=-10 < 4
+        assert!(
+            drag_picture_about_to_clip(gpui::Point::new(px(400.), px(3.)), grab, tab_size, win),
+            "picture 探出上缘 → 应提前切幽灵窗"
+        );
+        // 右缘：picture 右边 = pos.x - grab.x + w > win.w - 4。
+        // pos.x=878 → origin=858, right=978 > 976 → true
+        assert!(
+            drag_picture_about_to_clip(gpui::Point::new(px(878.), px(400.)), grab, tab_size, win),
+            "picture 距右缘 <4px → 应提前切幽灵窗"
+        );
+        // 右缘恰好 4px 外：pos.x=876 → origin=856, right=976 = 976 → false（未进入余量）
+        assert!(
+            !drag_picture_about_to_clip(gpui::Point::new(px(876.), px(400.)), grab, tab_size, win),
+            "picture 距右缘恰 4px 不应提前切换"
+        );
+        // 下缘：pos.y=705 → origin=692, bottom=718 > 716 → true
+        assert!(
+            drag_picture_about_to_clip(gpui::Point::new(px(400.), px(705.)), grab, tab_size, win),
+            "picture 距下缘 <4px → 应提前切幽灵窗"
+        );
+        // 余量常量必须 > 0（0 会退回「贴边才切」，仍可能露出被裁的一帧）。
+        assert!(DRAG_EDGE_CLIP_MARGIN > 0.0, "边缘预切余量应为正");
+    }
+
+    /// 回归（2026-10「贴边提前切幽灵窗」）：拖拽 picture 靠近窗口边缘（光标仍在窗内）即
+    /// 判「将遮断」→ 提前切完整幽灵窗（`drag_ghost_visible=true`），而「松开才建窗」预位
+    /// （`drag_outside_armed`）仍保持 false（光标未越界 → 窗内松开不拆窗）；拖回窗内中央
+    /// → 幽灵窗隐藏（窗内用原 gpui picture）；越出窗口 → 预位 + 幽灵窗同时显示。
+    #[gpui::test]
+    async fn drag_tab_near_edge_pre_shows_complete_ghost(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let tab = cx.debug_bounds("tab-0").expect("选项卡 tab-0 应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // 拖到窗口左缘附近（光标 x=2 仍在窗内）：picture 左侧（pos - grab）探出左缘 →
+        // 提前切完整幽灵窗；但光标未越界 → 「松开才建窗」预位仍 false。
+        let near_left = gpui::Point::new(px(2.), start.y);
+        cx.simulate_mouse_move(near_left, MouseButton::Left, Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (ghost_visible, armed) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_ghost_visible, a.drag_outside_armed)
+        });
+        assert!(ghost_visible, "picture 贴左缘（光标仍在窗内）应提前显示完整幽灵窗");
+        assert!(!armed, "光标仍在窗内：不应置「松开才建窗」预位");
+        // 拖回窗口中央：幽灵窗应隐藏（窗内用原 gpui picture，不叠浮窗）。
+        let center = gpui::Point::new(start.x + px(120.), start.y + px(40.));
+        cx.simulate_mouse_move(center, MouseButton::Left, Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let ghost_center = cx.update(|_w, cx| app.read(cx).drag_ghost_visible);
+        assert!(!ghost_center, "拖回窗内中央：幽灵窗应隐藏（用窗内 picture）");
+        // 越出窗口 → 预位 + 幽灵窗同时显示
+        cx.simulate_mouse_move(
+            gpui::Point::new(px(-60.), px(50.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (armed_out, visible_out) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_outside_armed, a.drag_ghost_visible)
+        });
+        assert!(armed_out, "越出窗口应置「松开才建窗」预位");
+        assert!(visible_out, "越出窗口幽灵窗应显示");
+        // 窗内松开：取消拖拽（幽灵窗随拖拽结束销毁），选项卡原位保留
+        cx.simulate_mouse_up(center, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (ghost_gone, tab_count) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_ghost.is_none(), a.tabs.len())
+        });
+        assert!(ghost_gone, "窗内松开幽灵窗应销毁");
+        assert_eq!(tab_count, 1, "窗内松开选卡应原位保留");
     }
 
     /// 大文档交互延迟基准（`BIGDOC_BENCH=1` 才跑，不打断言，只打印每操作墙钟）。
@@ -779,5 +1251,298 @@
             );
         }
         eprintln!("[h2] DONE bounces={bounce} max_off={max_off:.1} max_et={max_et}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // 选项卡栏内拖拽排序（松手插入 + 白色插入指示线）
+    // ---------------------------------------------------------------------------
+
+    /// 读取窗口选项卡顺序（文件名；未命名 = None）。
+    fn tab_order(
+        app: &gpui::Entity<EditorApp>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<Option<String>> {
+        cx.update(|_w, cx| {
+            app.read(cx)
+                .tabs
+                .iter()
+                .map(|t| {
+                    t.file_path
+                        .as_ref()
+                        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                })
+                .collect()
+        })
+    }
+
+    /// 准备「未命名 + A + B」三选项卡；返回各 tab 的 window 边界（供定位）。
+    fn add_three_tabs(
+        app: &gpui::Entity<EditorApp>,
+        cx: &mut VisualTestContext,
+    ) -> (gpui::Bounds<gpui::Pixels>, gpui::Bounds<gpui::Pixels>, gpui::Bounds<gpui::Pixels>) {
+        let f1 = std::env::temp_dir().join("gpui-reorder-a.txt");
+        let f2 = std::env::temp_dir().join("gpui-reorder-b.txt");
+        std::fs::write(&f1, "AAA").unwrap();
+        std::fs::write(&f2, "BBB").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f1.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f2.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let b0 = cx.debug_bounds("tab-0").expect("tab-0 应渲染");
+        let b1 = cx.debug_bounds("tab-1").expect("tab-1 应渲染");
+        let b2 = cx.debug_bounds("tab-2").expect("tab-2 应渲染");
+        let _ = std::fs::remove_file(&f1);
+        let _ = std::fs::remove_file(&f2);
+        (b0, b1, b2)
+    }
+
+    /// 把 tab `from` 拖到 `drop`（窗口坐标）处松开（全程窗内）。
+    async fn drag_tab_release_at(
+        cx: &mut VisualTestContext,
+        start: gpui::Point<gpui::Pixels>,
+        drop: gpui::Point<gpui::Pixels>,
+    ) {
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        cx.simulate_mouse_move(drop, MouseButton::Left, Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.simulate_mouse_up(drop, MouseButton::Left, Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+    }
+
+    /// 拖 B（tab-2）到 A（tab-1）左半松开 → 插入到 A 之前：[未命名, B, A]。
+    #[gpui::test]
+    async fn tab_reorder_drop_on_left_half_inserts_before(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (b0, b1, b2) = add_three_tabs(&app, cx);
+        let _ = b0;
+        let start = gpui::Point::new(
+            b2.origin.x + px(10.),
+            b2.origin.y + px(b2.size.height.as_f32() / 2.0),
+        );
+        // A 的左半（x 取 A 左缘+4，避开与未命名 tab 的 4px 间隙误判）
+        let drop = gpui::Point::new(b1.origin.x + px(4.), b1.origin.y + px(b1.size.height.as_f32() / 2.0));
+        drag_tab_release_at(cx, start, drop).await;
+        assert_eq!(
+            tab_order(&app, cx),
+            vec![None, Some("gpui-reorder-b.txt".into()), Some("gpui-reorder-a.txt".into())],
+            "拖到 A 左半应插到 A 之前"
+        );
+        // 不拆出独立窗口
+        assert_eq!(
+            registry_snapshot(cx).iter().filter(|(d, _, _, _)| *d).count(),
+            0,
+            "栏内松手不应拆窗"
+        );
+    }
+
+    /// 拖 未命名（tab-0）到 A（tab-1）右半松开 → 插入到 A 之后：[A, 未命名, B]。
+    #[gpui::test]
+    async fn tab_reorder_drop_on_right_half_inserts_after(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (b0, b1, b2) = add_three_tabs(&app, cx);
+        let _ = b2;
+        let start = gpui::Point::new(
+            b0.origin.x + px(10.),
+            b0.origin.y + px(b0.size.height.as_f32() / 2.0),
+        );
+        let drop = gpui::Point::new(
+            b1.origin.x + px(b1.size.width.as_f32() * 0.75),
+            b1.origin.y + px(b1.size.height.as_f32() / 2.0),
+        );
+        drag_tab_release_at(cx, start, drop).await;
+        assert_eq!(
+            tab_order(&app, cx),
+            vec![
+                Some("gpui-reorder-a.txt".into()),
+                None,
+                Some("gpui-reorder-b.txt".into())
+            ],
+            "拖到 A 右半应插到 A 之后"
+        );
+    }
+
+    /// 拖 B（tab-2）到最左（未命名左侧空白）松开 → 插到最前面：[B, 未命名, A]。
+    #[gpui::test]
+    async fn tab_reorder_drag_to_bar_start_moves_to_front(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (b0, b1, b2) = add_three_tabs(&app, cx);
+        let _ = b1;
+        let start = gpui::Point::new(
+            b2.origin.x + px(10.),
+            b2.origin.y + px(b2.size.height.as_f32() / 2.0),
+        );
+        let drop = gpui::Point::new(
+            b0.origin.x - px(20.),
+            b0.origin.y + px(b0.size.height.as_f32() / 2.0),
+        );
+        drag_tab_release_at(cx, start, drop).await;
+        assert_eq!(
+            tab_order(&app, cx),
+            vec![
+                Some("gpui-reorder-b.txt".into()),
+                None,
+                Some("gpui-reorder-a.txt".into())
+            ],
+            "拖到最左应插到最前"
+        );
+    }
+
+    /// 排序后活动选项卡跟随被拖项，且各选项卡内容（编辑器正文）不变、不拆窗。
+    #[gpui::test]
+    async fn tab_reorder_preserves_active_and_editor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (b0, _b1, b2) = add_three_tabs(&app, cx);
+        let _ = b0;
+        // 先激活文件 B（点 tab-2），随后拖 B 到 A 左半 → active 应跟到 B 新下标
+        let start = gpui::Point::new(
+            b2.origin.x + px(10.),
+            b2.origin.y + px(b2.size.height.as_f32() / 2.0),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(start, MouseButton::Left, Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let a_bounds = cx.debug_bounds("tab-1").expect("A 应渲染");
+        let drop = gpui::Point::new(
+            a_bounds.origin.x + px(4.),
+            a_bounds.origin.y + px(a_bounds.size.height.as_f32() / 2.0),
+        );
+        drag_tab_release_at(cx, start, drop).await;
+        let order = tab_order(&app, cx);
+        let (active, body) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.active_tab,
+                a.tabs[a.active_tab].editor.read(cx).value().to_string(),
+            )
+        });
+        assert_eq!(
+            order,
+            vec![None, Some("gpui-reorder-b.txt".into()), Some("gpui-reorder-a.txt".into())]
+        );
+        assert_eq!(active, 1, "活动选项卡应跟随被拖的 B 到新下标");
+        assert_eq!(body, "BBB", "被拖选项卡正文不变");
+        assert_eq!(
+            registry_snapshot(cx).iter().filter(|(d, _, _, _)| *d).count(),
+            0,
+            "栏内松手不应拆窗"
+        );
+    }
+
+    /// 窗内拖拽但松开时落在选项卡行外（编辑区上方空白）→ 不排序、原位保留。
+    #[gpui::test]
+    async fn tab_reorder_release_outside_row_keeps_order(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (b0, b1, b2) = add_three_tabs(&app, cx);
+        let _ = b1;
+        let start = gpui::Point::new(
+            b2.origin.x + px(10.),
+            b2.origin.y + px(b2.size.height.as_f32() / 2.0),
+        );
+        // 拖到选项卡行下方（仍在窗口内）→ 不在行内 → 无插入位，原位保留
+        let drop = gpui::Point::new(
+            b2.origin.x + px(60.),
+            b0.origin.y + px(b0.size.height.as_f32() + 30.),
+        );
+        drag_tab_release_at(cx, start, drop).await;
+        assert_eq!(
+            tab_order(&app, cx),
+            vec![None, Some("gpui-reorder-a.txt".into()), Some("gpui-reorder-b.txt".into())],
+            "行外松开不应排序"
+        );
+    }
+
+    /// 拖拽悬停在目标左/右边界时渲染白色插入指示线；松手后消失。
+    #[gpui::test]
+    async fn tab_reorder_line_shown_on_target_then_hidden_after_release(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (_b0, b1, b2) = add_three_tabs(&app, cx);
+        let start = gpui::Point::new(
+            b2.origin.x + px(10.),
+            b2.origin.y + px(b2.size.height.as_f32() / 2.0),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // 悬停在 A 左半 → 指示线应渲染
+        let drop = gpui::Point::new(
+            b1.origin.x + px(4.),
+            b1.origin.y + px(b1.size.height.as_f32() / 2.0),
+        );
+        cx.simulate_mouse_move(drop, MouseButton::Left, Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 拖拽中：光标命中行内目标 → tab_reorder_target 有值 + 指示线渲染
+        let target = cx.update(|_w, cx| app.read(cx).tab_reorder_target);
+        let line = cx.debug_bounds("tab-reorder-line");
+        assert!(target.is_some(), "拖拽悬停目标应有插入位");
+        assert!(line.is_some(), "拖拽悬停目标应渲染白色插入指示线 line={line:?}");
+        // 松开 → 指示线消失
+        cx.simulate_mouse_up(drop, MouseButton::Left, Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let line_after = cx.debug_bounds("tab-reorder-line");
+        let target_after = cx.update(|_w, cx| app.read(cx).tab_reorder_target);
+        assert!(line_after.is_none(), "松手后指示线应消失");
+        assert!(target_after.is_none(), "松手后插入位应清空");
     }
 
