@@ -1095,6 +1095,11 @@ impl DirectXResources {
 
 impl DirectXRenderPipelines {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
+        // C1 墙钟探针（GPUI_EDITOR_DIAG 守卫，平时零开销）：首窗全 miss（~18 次
+        // D3DCompileFromFile 现编译），第二个新窗口起全 hit（近似 0ms），证明 shader
+        // 字节码已被 process 级缓存复用、不再逐窗重编译。
+        #[cfg(debug_assertions)]
+        let diag_t0 = std::env::var_os("GPUI_EDITOR_DIAG").is_some().then(std::time::Instant::now);
         let shadow_pipeline = PipelineState::new(
             device,
             "shadow_pipeline",
@@ -1158,6 +1163,17 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+
+        #[cfg(debug_assertions)]
+        if let Some(t0) = diag_t0 {
+            let cache = shader_resources::shader_blob_cache();
+            eprintln!(
+                "[SHADER] window pipelines new total={:.1}ms hits={} misses={}",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                cache.hits.load(std::sync::atomic::Ordering::Relaxed),
+                cache.misses.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
 
         Ok(Self {
             shadow_pipeline,
@@ -1972,7 +1988,16 @@ pub(crate) mod shader_resources {
         core::{HSTRING, PCSTR},
     };
 
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[cfg(debug_assertions)]
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Mutex, OnceLock,
+        },
+    };
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
     pub(crate) enum ShaderModule {
         Quad,
         Shadow,
@@ -1986,7 +2011,7 @@ pub(crate) mod shader_resources {
         EmojiRasterization,
     }
 
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
     pub(crate) enum ShaderTarget {
         Vertex,
         Fragment,
@@ -2070,9 +2095,39 @@ pub(crate) mod shader_resources {
         }
     }
 
+    /// debug 构建的 shader 编译过程级缓存：`D3DCompileFromFile` 现编译（读盘+编译在主
+    /// 线程）每新窗口重复 ~18 次（9 条管线 × 顶点/片元）。HLSL 编译产物是**设备无关**的
+    /// 原生字节码——每个 (module, target) 相同的源文件/入口/目标 profile/编译旗标完全
+    /// 确定，各窗口只是拿同一份字节码在各自设备上 `create_vertex/pixel_shader`。
+    /// 因此同 (module, target) 全进程只 `D3DCompileFromFile` 一次，跨窗口共享。
+    #[cfg(debug_assertions)]
+    pub(crate) struct ShaderBlobCache {
+        blobs: Mutex<HashMap<(ShaderModule, ShaderTarget), ID3DBlob>>,
+        pub(crate) hits: AtomicU32,
+        pub(crate) misses: AtomicU32,
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) static SHADER_BLOB_CACHE: OnceLock<ShaderBlobCache> = OnceLock::new();
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn shader_blob_cache() -> &'static ShaderBlobCache {
+        SHADER_BLOB_CACHE.get_or_init(|| ShaderBlobCache {
+            blobs: Mutex::new(HashMap::new()),
+            hits: AtomicU32::new(0),
+            misses: AtomicU32::new(0),
+        })
+    }
+
     #[cfg(debug_assertions)]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
-        unsafe {
+        // 命中缓存：同 key 跨窗口/跨管线只编译一次，直接按引用返回同一底层 ID3DBlob。
+        let cache = shader_blob_cache();
+        if let Some(blob) = cache.blobs.lock().unwrap().get(&(entry, target)) {
+            cache.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(blob.clone());
+        }
+        let blob = unsafe {
             use windows::Win32::Graphics::{
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
@@ -2132,8 +2187,15 @@ pub(crate) mod shader_resources {
                 log::error!("Shader compile error: {}", error_string);
                 return Err(anyhow::anyhow!("Compile error: {}", error_string));
             }
-            Ok(compile_blob.unwrap())
-        }
+            compile_blob.unwrap()
+        };
+        cache
+            .blobs
+            .lock()
+            .unwrap()
+            .insert((entry, target), blob.clone());
+        cache.misses.fetch_add(1, Ordering::Relaxed);
+        Ok(blob)
     }
 
     #[cfg(not(debug_assertions))]
@@ -2605,6 +2667,77 @@ mod tests {
                 panic!("HLSL 编译 {entry:?} 失败：{e} {message}");
             }
         }
+    }
+
+    /// C1：debug 下 shader 字节码 process 级缓存——同 (module, target) 连续两次
+    /// `build_shader_blob` 应返回**同一个底层 ID3DBlob**：Id3DBlob 每次 `D3DCompileFromFile`
+    /// 都是新分配，二次调用仍同指针即为「命中缓存、未再编译」的决定性证据（并行测试下
+    /// 全局命中计数会受其它用例抢占，故不做计数断言；本断言与执行顺序/并行无关）。
+    #[test]
+    #[cfg(debug_assertions)]
+    fn test_shader_blob_cache_reuses_same_blob() {
+        use crate::directx_renderer::shader_resources::{
+            build_shader_blob, ShaderModule, ShaderTarget,
+        };
+
+        let blob1 =
+            build_shader_blob(ShaderModule::Quad, ShaderTarget::Vertex).expect("Quad 顶点应可编译");
+        let blob2 = build_shader_blob(ShaderModule::Quad, ShaderTarget::Vertex)
+            .expect("同 key 第二次应命中缓存");
+        unsafe {
+            assert_eq!(blob1.GetBufferSize(), blob2.GetBufferSize());
+            assert_eq!(
+                blob1.GetBufferPointer(),
+                blob2.GetBufferPointer(),
+                "缓存命中应按引用返回同一 ID3DBlob（二次调用不得重新分配）"
+            );
+        }
+    }
+
+    /// C1 墙钟（headless 可量化）：同批 20 个 shader 二轮编译对比——首轮走
+    /// `D3DCompileFromFile` 现编译（= 第一个新窗口成本），第二轮全部命中 process 级缓存
+    /// （= 第二个新窗口成本）。探针行 `[SHADER]` 直接给出「首窗 vs 次窗」墙钟对比，
+    /// 供主 agent/真机对表。
+    #[test]
+    #[cfg(debug_assertions)]
+    fn probe_shader_compile_first_vs_cached_wall() {
+        use crate::directx_renderer::shader_resources::{
+            build_shader_blob, ShaderModule, ShaderTarget,
+        };
+        use std::time::Instant;
+
+        let pairs: Vec<(ShaderModule, ShaderTarget)> = [
+            ShaderModule::Quad,
+            ShaderModule::Shadow,
+            ShaderModule::Underline,
+            ShaderModule::PathRasterization,
+            ShaderModule::PathSprite,
+            ShaderModule::MonochromeSprite,
+            ShaderModule::SubpixelSprite,
+            ShaderModule::PolychromeSprite,
+            ShaderModule::ExternalYuv,
+            ShaderModule::EmojiRasterization,
+        ]
+        .into_iter()
+        .flat_map(|m| [(m, ShaderTarget::Vertex), (m, ShaderTarget::Fragment)])
+        .collect();
+
+        let t0 = Instant::now();
+        for &(m, t) in &pairs {
+            build_shader_blob(m, t).expect("shader 应可编译");
+        }
+        let first_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        for &(m, t) in &pairs {
+            build_shader_blob(m, t).expect("缓存命中应成功");
+        }
+        let second_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!(
+            "[SHADER] {} shaders 首窗现编译={first_ms:.1}ms / 次窗缓存命中={second_ms:.1}ms",
+            pairs.len(),
+        );
     }
 
     /// scene→batch 的接线验证（gpui 自身测试宿主因缺 test-support dev 依赖不可编译，
