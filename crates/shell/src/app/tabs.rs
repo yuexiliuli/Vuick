@@ -151,13 +151,14 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 计算拖拽光标（窗口坐标）落在选项卡行内的「插入下标」（相对当前 `tabs`；
-    /// `tabs.len()` = 插到末尾）：
-    /// - 光标不在选项卡行高内（y 越界）→ `None`（不排序；拖出窗口仍走拆窗/原位）
+    /// 计算拖拽光标 x 落在选项卡行内的「插入下标」（相对当前 `tabs`；`tabs.len()` =
+    /// 插到末尾）：
     /// - 最左 / 最右 / 选项卡间空隙 → 对应插入位
     /// - 落在某选项卡内 → 左半 = 该选项卡之前（下标 = 该选项卡），右半 = 之后（下标 +1）
-    /// 命中依据 `self.tab_bounds`（上一帧渲染的真实 laid-out 边界，与输入坐标同系）。
-    pub(super) fn tab_insert_index(&self, pos: Point<Pixels>) -> Option<usize> {
+    /// 「是否已入行」由调用方 `tab_drag_over_row` 负责（被拖选项卡边缘进入行即算），
+    /// 本函数只按 x 定下标。命中依据 `self.tab_bounds`（上一帧渲染的真实 laid-out
+    /// 边界，与输入坐标同系、含横向滚动）。
+    pub(super) fn tab_insert_index(&self, x: Pixels) -> Option<usize> {
         if self.tabs.is_empty() || self.tab_bounds.is_empty() {
             return None;
         }
@@ -165,12 +166,6 @@ impl EditorApp {
         if first.size.width <= px(0.) {
             return None; // 尚未渲染出真实边界（首帧）
         }
-        // 垂直：选项卡共享同一行，光标须落在行高内。
-        let row_bottom = first.bottom_right().y;
-        if pos.y < first.origin.y || pos.y > row_bottom {
-            return None;
-        }
-        let x = pos.x;
         if x < first.origin.x {
             return Some(0);
         }
@@ -185,6 +180,22 @@ impl EditorApp {
             }
         }
         Some(self.tab_bounds.len())
+    }
+
+    /// 拖拽中的选项卡（picture 盒 `drag`，= `鼠标 - 抓取偏移` 处、按真实 tab 尺寸）的
+    /// 上下边缘是否**进入**选项卡行内的 y 区间（任一边进入即 true）：白线出现的触发——
+    /// **不要求鼠标光标在行内**，只要被拖选项卡的边缘碰到行即可。
+    pub(super) fn tab_drag_over_row(&self, drag: Bounds<Pixels>) -> bool {
+        if self.tab_bounds.is_empty() {
+            return false;
+        }
+        let first = self.tab_bounds[0].get();
+        if first.size.width <= px(0.) {
+            return false; // 尚未渲染出真实边界（首帧）
+        }
+        let row_top = first.origin.y;
+        let row_bottom = first.bottom_right().y;
+        drag.origin.y < row_bottom && (drag.origin.y + drag.size.height) > row_top
     }
 
     /// 栏内拖拽排序落地：把当前下标 `from` 的选项卡移动到「插入下标」`target`

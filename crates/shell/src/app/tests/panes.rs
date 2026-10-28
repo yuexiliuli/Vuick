@@ -1546,3 +1546,53 @@
         assert!(target_after.is_none(), "松手后插入位应清空");
     }
 
+    /// 新触发口径：只要**被拖选项卡的边缘**进入选项卡行（鼠标光标可仍在行外/行下方），
+    /// 白色插入指示线即出现；松手按光标 x 落地插入。
+    #[gpui::test]
+    async fn tab_reorder_line_appears_when_dragged_edge_enters_row(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (_b0, b1, b2) = add_three_tabs(&app, cx);
+        let start = gpui::Point::new(
+            b2.origin.x + px(10.),
+            b2.origin.y + px(b2.size.height.as_f32() / 2.0),
+        );
+        // 目标投放点：x 落在 A（tab-1）左半；y 在选项卡行**下方**（row_bottom+10），
+        // 但被拖选项卡盒（= 鼠标 - 抓取偏移，半高约 13px）的上缘仍进入行内 → 白线应出现。
+        let drop = gpui::Point::new(
+            b1.origin.x + px(4.),
+            b1.bottom_right().y + px(10.),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        cx.simulate_mouse_move(drop, MouseButton::Left, Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let target = cx.update(|_w, cx| app.read(cx).tab_reorder_target);
+        let line = cx.debug_bounds("tab-reorder-line");
+        assert!(target.is_some(), "被拖选项卡边缘入行即应有插入位 target={target:?}");
+        assert!(line.is_some(), "被拖选项卡边缘入行即应出现白线");
+        // 松手 → 按光标 x 落地插入：[未命名, B, A]
+        cx.simulate_mouse_up(drop, MouseButton::Left, Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            tab_order(&app, cx),
+            vec![None, Some("gpui-reorder-b.txt".into()), Some("gpui-reorder-a.txt".into())],
+            "选项卡边缘入行→松手应插到 A（tab-1）之前：[未命名, B, A]"
+        );
+    }
+

@@ -327,9 +327,13 @@ impl EditorApp {
                     // （含 4px 余量，见 tab_drag::drag_picture_about_to_clip）——贴边即提前
                     // 切同位置同尺寸完整版；远离边缘时窗内无浮窗、无蓝块（幽灵窗隐藏）。
                     this.drag_outside_armed = !inside;
-                    // 栏内排序插入位（仅光标在选项卡行内；拖出窗口 → None 走拆窗）。
-                    this.tab_reorder_target = if inside {
-                        this.tab_insert_index(pos)
+                    // 栏内排序插入位：以**被拖选项卡 picture 盒的边缘**是否进入选项卡行为准
+                    // （不再要求鼠标光标在行内）——盒上/下任一边碰到行即激活白线；插入下标
+                    // 按光标 x 判定。拖出窗口 / 盒未入行 → None（不排序 / 拆窗）。
+                    let grab = this.tab_drag_grab.unwrap_or(gpui::Point::default());
+                    let drag_bounds = gpui::Bounds::new(pos - grab, drag_size.get());
+                    this.tab_reorder_target = if inside && this.tab_drag_over_row(drag_bounds) {
+                        this.tab_insert_index(pos.x)
                     } else {
                         None
                     };
