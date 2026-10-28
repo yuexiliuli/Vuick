@@ -2557,6 +2557,13 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// 是否**不**绘制 gpui 内置的「跟随鼠标的 active-drag picture」（`App::active_drag` 的拖拽预览）。
+    /// gpui 会在**每个窗口**的 prepaint 阶段把同一张 drag picture 画进自己的帧缓冲
+    /// （`window.rs` prepaint），本仓库的「跟手幽灵窗」（拖拽出窗时的 PopUp 顶层窗）自身已渲染
+    /// 完整跟手卡片；若再画 drag picture 会导致同窗两层重叠。置位 = 本窗口忽略 `active_drag`
+    /// 的绘制；默认 `false`（其它窗口的拖拽 picture 语义零变化）。
+    pub suppress_active_drag_picture: bool,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2683,6 +2690,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            suppress_active_drag_picture: false,
         }
     }
 }

@@ -651,6 +651,124 @@
         );
     }
 
+    /// 回归（2026-10-28 用户真机复验）：鼠标离开窗口瞬间「屏上多出一个跟手选项卡、与原 tab
+    /// 重叠」——根因 = gpui 每个窗口 prepaint 都会把 **App 级 `active_drag` picture** 画进
+    /// **自己**的帧缓冲（window.rs prepaint：`cx.active_drag.take()` → 画进当前窗口）；本仓
+    /// 拖拽全程的「窗外跟手幽灵窗」（PopUp 顶层窗）是独立窗口，它 prepaint 时 `active_drag`
+    /// 仍为 Some → 把窗内拖拽 picture 又叠进幽灵窗，与其根卡片（`TabDragGhost ghost:true`）
+    /// 同窗成两层 = 用户所见。修复：幽灵窗创建时不绘制 active_drag picture。
+    ///
+    /// headless 复现：拖拽开始（active_drag 在场）后 `ensure_drag_ghost` 创建幽灵窗，其首帧
+    /// prepaint 会把 picture 画进幽灵窗 → 幽灵窗内 `tab-drag-ghost` 记录两条（根卡片 + 跟手
+    /// picture，后者记录在最后）。断言：幽灵窗最后记录的 `tab-drag-ghost` 必须是**其自身根
+    /// 卡片**（origin=(0,0)、尺寸=真实选项卡）——修复前是跟手 picture（origin≠0）→ FAIL。
+    #[gpui::test]
+    async fn drag_ghost_window_renders_only_its_own_card(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join("gpui-ghost-single-card.txt");
+        std::fs::write(&f, "单层跟手卡").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let tab = cx.debug_bounds("tab-1").expect("文件选项卡 tab-1 应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        // 按下 → 初次越阈值移动（建立 App 级 active_drag）→ 再移动触发 on_drag_move（建幽灵窗）
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(90.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let ghost_handle = cx
+            .update(|_w, cx| app.read(cx).drag_ghost)
+            .expect("拖拽开始（窗内）即应建幽灵窗");
+        let mut ghost_cx = gpui::VisualTestContext::from_window(ghost_handle, cx);
+        let root = ghost_cx
+            .debug_bounds("tab-drag-ghost")
+            .expect("幽灵窗首帧应渲染其根卡片");
+        assert_eq!(
+            root.origin,
+            gpui::Point::new(gpui::px(0.), gpui::px(0.)),
+            "幽灵窗内最后记录的 tab-drag-ghost 必须是其自身根卡片（origin=0,0）；\
+             修复前 gpui 会把 App 级 active_drag 跟手 picture 叠进幽灵窗（记录在根卡片之后，\
+             origin≠0）=「窗外多出一张跟手选项卡」根因。root={root:?}"
+        );
+        assert!(
+            (root.size.width.as_f32() - tab.size.width.as_f32()).abs() < 2.0
+                && (root.size.height.as_f32() - tab.size.height.as_f32()).abs() < 2.0,
+            "幽灵窗根卡片尺寸应等于真实选项卡：root={root:?} tab={tab:?}"
+        );
+
+        // 双侧一致之窗内侧：**源窗口**（普通窗口，不置抑制位）仍照常绘制窗内拖拽 picture——
+        // 「其它窗口/窗内拖拽语义不受影响」。源窗口的 picture 画在 `鼠标-抓取偏移`（origin≠0）。
+        let in_window_pic = cx
+            .debug_bounds("tab-drag-ghost")
+            .expect("源窗口仍应绘制窗内拖拽 picture（拖拽跟手）");
+        assert!(
+            in_window_pic.origin != gpui::Point::new(gpui::px(0.), gpui::px(0.))
+                && (in_window_pic.size.width.as_f32() - tab.size.width.as_f32()).abs() < 2.0,
+            "源窗口窗内拖拽 picture 应照常在（origin≠0、尺寸=真实选项卡）：pic={in_window_pic:?}",
+        );
+
+        // 双侧一致（原行为不变）：拖出窗外（幽灵可见）→ 窗外松开 → 仍正确拆出独立窗口，
+        // 幽灵窗随拖拽结束销毁。
+        cx.simulate_mouse_move(
+            gpui::Point::new(px(-60.), px(50.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (armed, ghost_alive) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.drag_outside_armed, a.drag_ghost.is_some())
+        });
+        assert!(armed, "越出窗口未松手应置「松开才拆窗」预位");
+        assert!(ghost_alive, "越出窗口跟手幽灵窗应在");
+        cx.simulate_mouse_up(
+            gpui::Point::new(px(-60.), px(50.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let snap = registry_snapshot(cx);
+        assert_eq!(
+            snap.iter().filter(|(d, _, _, _)| *d).count(),
+            1,
+            "窗外松开仍应拆出独立窗口，快照={snap:?}"
+        );
+        assert!(
+            cx.update(|_w, cx| app.read(cx).drag_ghost.is_none()),
+            "窗外松开后跟手幽灵窗应销毁"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
     /// 「提前切完整幽灵窗」几何判定（回归 2026-10 贴边预切）：窗内拖拽 picture（画在
     /// `鼠标 - 抓取偏移`，越出窗口帧缓冲部分被边缘裁掉）距窗口边缘 < `DRAG_EDGE_CLIP_MARGIN`
     /// （4px）即判「将要被遮断」→ 返回 true（提前显示同位置同尺寸完整幽灵窗）；远离边缘

@@ -1217,6 +1217,9 @@ pub struct Window {
     pub(crate) handle: AnyWindowHandle,
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
+    /// 是否不绘制 App 级 `active_drag` picture（见 [`crate::WindowOptions::suppress_active_drag_picture`]）。
+    /// 幽灵窗等「自身已渲染完整跟手内容」的窗口置位后，prepaint 不再把同一张拖拽 picture 叠进来。
+    pub(crate) suppress_active_drag_picture: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
     pub(crate) display_id: Option<DisplayId>,
     pub(crate) display_observers: SubscriberSet<(), AnyObserver>,
@@ -1599,6 +1602,7 @@ impl Window {
             icon,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
+            suppress_active_drag_picture,
         } = options;
 
         let initial_window_title = titlebar
@@ -2129,6 +2133,7 @@ impl Window {
             handle,
             invalidator,
             removed: false,
+            suppress_active_drag_picture,
             platform_window,
             display_id,
             display_observers: SubscriberSet::new(),
@@ -3731,7 +3736,9 @@ impl Window {
             element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
             prompt_element = Some(element);
             self.prompt = Some(prompt);
-        } else if let Some(active_drag) = cx.active_drag.take() {
+        } else if !self.suppress_active_drag_picture
+            && let Some(active_drag) = cx.active_drag.take()
+        {
             let mut element = active_drag.view.clone().into_any_element();
             let offset = self.mouse_position() - active_drag.cursor_offset;
             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);

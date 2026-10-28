@@ -384,6 +384,11 @@ impl EditorApp {
                 is_resizable: false,
                 is_minimizable: false,
                 window_background: gpui::WindowBackgroundAppearance::Transparent,
+                // 关键（2026-10-28）：幽灵窗**自身**已渲染完整跟手卡片（根视图
+                // `TabDragGhost ghost:true`），而 gpui 每个窗口 prepaint 都会把 App 级
+                // `active_drag` picture 画进自己帧缓冲 → 若不禁用，幽灵窗会把窗内拖拽 picture
+                // 再叠一层 = 用户真机所见「鼠标离窗瞬间屏上多出一张跟手选项卡、与原 tab 重叠」。
+                suppress_active_drag_picture: true,
                 ..Default::default()
             },
             |_new_window, cx| cx.new(|_| TabDragGhost {
