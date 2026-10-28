@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use super::*;
 use config::user::UserPrefs;
@@ -107,9 +108,35 @@ pub(crate) fn load() -> HashMap<String, Vec<PdfBookmark>> {
     from_json(&v)
 }
 
-/// 原子落盘整份书签存储。
+/// A4 进程级书签缓存（`OnceLock<Mutex<Option<_>>>`）：每窗构造都读盘是浪费（构造链
+/// `new_impl` → `pdf_bookmarks::load()`），首次构造读一次、后续复用；`save` 同步回写
+/// 缓存 → 进程内新窗口读到最新书签（本应用单进程，无外部改写，安全）。
+static BOOKMARK_CACHE: OnceLock<StdMutex<Option<HashMap<String, Vec<PdfBookmark>>>>> =
+    OnceLock::new();
+
+fn bookmark_cache() -> &'static StdMutex<Option<HashMap<String, Vec<PdfBookmark>>>> {
+    BOOKMARK_CACHE.get_or_init(|| StdMutex::new(None))
+}
+
+/// 取书签（进程级缓存一次读盘；`save` 更新缓存保证进程内一致）。
+pub(crate) fn load_cached() -> HashMap<String, Vec<PdfBookmark>> {
+    let mut guard = bookmark_cache().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(v) = guard.as_ref() {
+        return v.clone();
+    }
+    let v = load();
+    *guard = Some(v.clone());
+    v
+}
+
+/// 原子落盘整份书签存储；A4：先写好盘面再回写缓存（缓存镜像盘面）。
 pub(crate) fn save(map: &HashMap<String, Vec<PdfBookmark>>) {
-    let _ = base::util::atomic_write(bookmarks_path(), to_json(map).to_string().as_bytes());
+    let ok = base::util::atomic_write(bookmarks_path(), to_json(map).to_string().as_bytes()).is_ok();
+    if ok {
+        if let Ok(mut guard) = bookmark_cache().lock() {
+            *guard = Some(map.clone());
+        }
+    }
 }
 
 impl EditorApp {

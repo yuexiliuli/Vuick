@@ -2662,3 +2662,98 @@ fn long_line_cjk_window_offset_matches_real_layout(cx: &mut TestAppContext) {
     assert!(line.is_char_boundary(w.0.start) && line.is_char_boundary(w.0.end));
 }
 
+    /// 轨 B 基准（ignored）：点击 / 拖选 → paint 末尾「落帧」墙钟分布（min/median/p95）。
+    /// 事件路径 = 生产 `CodeEditor::on_mouse_down/on_mouse_move`（含本轨新增 WY_TRACE
+    /// `op_start("ed_click"/"ed_drag")`），本帧编辑器 paint 末尾 `op_finish_after_paint`
+    /// 同帧结算——每轮计时「模拟事件 → run_until_parked + refresh（真实 paint）→ 落定」。
+    /// 可选项：设 `BENCH_WY_TRACE_OUT=<path>` 时另端到端验证探针在 paint 末尾产出
+    /// `OP kind=ed_click status=done` 行（WY_TRACE 同框架、真机同数据路径）。
+    /// 运行：`cargo test -p editor bench_click_to_paint_frame_wall -- --ignored --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_click_to_paint_frame_wall(cx: &mut TestAppContext) {
+        use std::time::Instant;
+        let text: String = (0..120)
+            .map(|i| format!("line{i} some code content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (host, cx) = open(cx, &text);
+        focus(&host, cx);
+        let lh = cx
+            .update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1)
+            .max(1.);
+        // 预热：编辑区首帧布局
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let mods = Modifiers::default();
+        const N: usize = 30;
+        let mut clicks: Vec<f64> = Vec::with_capacity(N);
+        for i in 0..N {
+            // 点击点：x 避开 gutter，y 循环各行（点击即放置光标 → 重绘一帧）
+            let x = px(40.0 + (i as f32 * 13.0) % 300.0);
+            let y = px(lh * ((i % 15) as f32 + 0.5));
+            cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+            let t0 = Instant::now();
+            cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+            cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+            cx.run_until_parked();
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            clicks.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        // 拖选：按下 → 移动到右侧 → 抬起（移动那步一帧，量「拖选 → 落帧」）
+        let mut drags: Vec<f64> = Vec::with_capacity(N);
+        for i in 0..N {
+            let y = px(lh * ((i % 15) as f32 + 0.5));
+            let x1 = px(40.0);
+            let x2 = px(40.0 + 80.0 + (i as f32 * 5.0) % 100.0);
+            cx.simulate_mouse_move(point(x1, y), MouseButton::Left, mods);
+            cx.simulate_mouse_down(point(x1, y), MouseButton::Left, mods);
+            let t0 = Instant::now();
+            cx.simulate_mouse_move(point(x2, y), MouseButton::Left, mods);
+            cx.run_until_parked();
+            let _ = cx.refresh();
+            cx.simulate_mouse_up(point(x2, y), MouseButton::Left, mods);
+            cx.run_until_parked();
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            drags.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        // 可选项：端到端验证探针在 paint 末尾结算 OP 行（WY_TRACE 同框架）。
+        if let Ok(out) = std::env::var("BENCH_WY_TRACE_OUT") {
+            unsafe { std::env::set_var("WY_TRACE", &out) };
+            let _ = std::fs::remove_file(&out);
+            let x = px(60.);
+            let y = px(lh * 1.5);
+            cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+            cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+            cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+            cx.run_until_parked();
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            let body = std::fs::read_to_string(&out).unwrap_or_default();
+            assert!(
+                body.lines().any(|l| l.contains("kind=ed_click") && l.contains("status=done")),
+                "WY_TRACE 应在 paint 末尾结算 ed_click 行:\n{body}"
+            );
+            unsafe { std::env::remove_var("WY_TRACE") };
+        }
+        let stat =
+            |v: &mut Vec<f64>| -> (f64, f64, f64) {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (
+                v[0],
+                v[v.len() / 2],
+                v[(v.len() as f64 * 0.95) as usize - 1],
+            )
+        };
+        let (c_min, c_med, c_p95) = stat(&mut clicks);
+        let (d_min, d_med, d_p95) = stat(&mut drags);
+        println!("==== 点击/拖选 → 落帧墙钟（debug，headless；真机以 WY_TRACE 的 OP total= 行为准） ====");
+        println!("  单击(ed_click) N={N}: min={c_min:.3}ms median={c_med:.3}ms p95={c_p95:.3}ms");
+        println!("  拖选(ed_drag)  N={N}: min={d_min:.3}ms median={d_med:.3}ms p95={d_p95:.3}ms");
+    }
+

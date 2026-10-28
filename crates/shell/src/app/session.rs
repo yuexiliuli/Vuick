@@ -34,8 +34,9 @@
 
 use super::*;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use syntax::{prewarm_done, prewarm_started};
 
 /// 会话持久化防抖窗口（ms）：内容变化后停顿该时长才写盘一次，压缩打字期间的高频重写。
 /// 结构变化（新建/关闭/切换选项卡、打开文件、保存）不经防抖，立即落盘。
@@ -43,6 +44,10 @@ use std::path::{Path, PathBuf};
 /// 归位，不再退化 `allow(dead_code)`。
 #[cfg(not(test))]
 const SESSION_FLUSH_DEBOUNCE_MS: u64 = 300;
+
+/// A1/A2：等语法预热的让帧上限（≈1s @60fps）。`prewarm` 实际在启动后台线程早于首帧
+/// 完成，正常等待远小于此上限；仅当预热任务异常（不应发生）时兜底，避免恢复挂起。
+const RESTORE_PREWARM_MAX_WAIT_FRAMES: u32 = 60;
 
 /// 清单里单个会话选项卡。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,10 +316,127 @@ impl EditorApp {
     }
 
     /// 启动恢复入口（`new_impl` 里无 CLI 首参时调用）：开关开启且清单存在且有效才恢复。
+    /// **A1 非阻塞化**：首帧前只「读清单 + 登记首帧后逐步恢复」（不打开任何选项卡）；
+    /// 逐选项卡打开从首帧前同步段挪到首帧 render 之后按帧逐个进行（窗口先渲染、tab
+    /// 逐个渐进出现），最终态（顺序 / 活动 / dirty / 内容）与改前同步恢复完全一致
+    /// （见 [`Self::schedule_restore`]／`restore_step`；同步版 [`restore_session_from`]
+    /// 保留给测试/基准/导入设置走显式目录）。
     /// `#[cfg(not(test))]`：见 [`Self::save_session`]。
     #[cfg(not(test))]
     pub(super) fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = restore_session_from(self, &UserPrefs::session_dir(), window, cx);
+        let dir = UserPrefs::session_dir();
+        if !self.session_restore {
+            return;
+        }
+        let Some(manifest) = read_manifest(&dir) else {
+            return;
+        };
+        self.schedule_restore(window, cx, dir, manifest);
+    }
+
+    /// A1：登记「首帧后按帧逐个恢复」的恢复通行证。`manifest` 已由调用方读取
+    /// （[`Self::restore_session`] 内部读真实会话目录；测试直读显式临时目录）。
+    /// 此处只做：置恢复期间抑制持久化 → 把待恢复选项卡排队 → 登记下一帧回调。
+    /// **本函数内不打开任何选项卡**——首个真实 `open_file` 发生在首帧 render 之后
+    /// （`on_next_frame` 保证），因此首帧不含恢复段。
+    /// `pub(super)`：供启动（`restore_session`）与测试（显式目录 + `simulate_next_frame`）共用。
+    pub(super) fn schedule_restore(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        dir: PathBuf,
+        manifest: SessionManifest,
+    ) {
+        // 恢复期间抑制持久化（同 [`restore_session_from`] 语义，覆盖整个渐进恢复窗口）
+        self.session_restoring = true;
+        let SessionManifest { active_tab, tabs, .. } = manifest;
+        let pending = VecDeque::from(tabs);
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.restore_step(window, cx, dir, active_tab, pending, 0);
+        });
+    }
+
+    /// A1 渐进恢复单步：开下一个选项卡并登记下一帧回调；全部完成后统一收尾（活动
+    /// 选项卡 clamp、放行持久化、删除清单/槽位、状态栏、notify）。文件选项卡走既有
+    /// `open_file`（小文档同步挂载、大文档走 `spawn_progressive_open` 后台渐进）——
+    /// 每开一个之间让出一帧，窗口保持响应、tab 逐个渐进出现，最终态与同步恢复一致
+    /// （K35：源活动下标与各 tab 内容/路径/dirty 不变由测试断言）。
+    ///
+    /// A2 语法预热竞态：打开文件选项卡前，若预热已启动但未完成（`prewarm_started &&
+    /// !prewarm_done`），让帧等待（等上限 [`RESTORE_PREWARM_MAX_WAIT_FRAMES`] 帧），
+    /// 保证 `set_language → find_syntax` 全部命中缓存、主线程零冷扫；上限内仍没完成
+    /// （预热任务异常，不应发生）→ 照开，退化到改前的冷扫行为，不挂起。
+    fn restore_step(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        dir: PathBuf,
+        active_tab: usize,
+        mut pending: VecDeque<SessionTab>,
+        prewarm_wait: u32,
+    ) {
+        if let Some(next) = pending.pop_front() {
+            match next {
+                SessionTab::File { path } => {
+                    if path.is_file() {
+                        if prewarm_started()
+                            && !prewarm_done()
+                            && prewarm_wait < RESTORE_PREWARM_MAX_WAIT_FRAMES
+                        {
+                            pending.push_front(SessionTab::File { path });
+                            cx.on_next_frame(window, move |this, window, cx| {
+                                this.restore_step(
+                                    window,
+                                    cx,
+                                    dir,
+                                    active_tab,
+                                    pending,
+                                    prewarm_wait + 1,
+                                );
+                            });
+                            return;
+                        }
+                        self.open_file(&path.to_string_lossy(), window, cx);
+                    }
+                }
+                SessionTab::New { slot, .. } => {
+                    let idx = self.make_tab(window, cx);
+                    let text = read_slot(&dir, &slot).unwrap_or_default();
+                    self.set_tab_text(idx, text, window, cx);
+                }
+            }
+            cx.on_next_frame(window, move |this, window, cx| {
+                this.restore_step(window, cx, dir, active_tab, pending, 0);
+            });
+        } else {
+            // 全部选项卡已恢复：活动选项卡越界收敛到合法值（多开/缺文件只多不少时同 clamp）。
+            self.active_tab = if self.tabs.is_empty() {
+                0
+            } else {
+                active_tab.min(self.tabs.len() - 1)
+            };
+            // 恢复完成放行持久化，随后删除清单/槽位（避免重复恢复）。
+            self.session_restoring = false;
+            clear_session(&dir);
+            // 盘面已被清（槽位/清单删除）：指纹表也必须清，否则此后首次持久化会拿
+            //「恢复前内容」的旧指纹误判「未变」而跳过写槽位/清单 → 恢复出的选项卡内容不再落盘。
+            self.session_slot_hashes.clear();
+            self.session_last_manifest_digest = None;
+            // D1（评审修复）：恢复窗口内结构性变更（新建未命名 tab / 打开文件）的
+            // `schedule_session_flush(immediate)` 被 `session_restoring` 抑制，且结构变更
+            // 不走防抖重排 → 补一发**即时补偿落盘**（此刻 `session_restoring` 已置 false、
+            // 指纹表已清，`persist_session` 会写全新指纹，避免误跳过槽位/清单），把恢复
+            // 出的选项卡集合写回会话目录作新基线——退出/崩溃时未命名 tab 内容不丢。
+            self.schedule_session_flush(cx, true);
+            self.status = SharedString::from("已恢复上次会话");
+            self.status_ok = true;
+            // A1 测量：渐进恢复完成墙钟（发生在首帧之后，[STARTUP] 汇总行打印在前，
+            // 故此处按 boot 基准补打一行，供 before/after 对比「恢复总耗时」）。
+            if let Some(ms) = base::startup::elapsed_ms() {
+                eprintln!("[STARTUP] progressive_restore_done={ms:.1}ms");
+            }
+            cx.notify();
+        }
     }
 
     /// 把当前**主窗口**选项卡集合**立即**持久化到会话目录（连续持久化核心：关闭程序时
@@ -467,10 +589,14 @@ pub(crate) fn collect_session_data(
         true
     }
 
-/// 恢复会话（纯逻辑，显式目录，可测试）：读清单 → 依次开文件 / 建未命名选项卡并
+/// 恢复会话（纯逻辑，显式目录，**同步版**）：读清单 → 依次开文件 / 建未命名选项卡并
 /// 灌槽位内容 → 活动选项卡按清单取并 clamp 到 `[0, tabs.len())` → 删除清单并清理
 /// 槽位（避免重复恢复）。开关关闭 / 清单缺失 → false（不动作）。文件已不存在 → 跳过
 /// （与 CLI 首参打开同口径：`is_file` 才开）。
+/// **A1 之后生产启动不再走本函数**（改走渐进的 [`EditorApp::schedule_restore`]）；此处
+/// 保留为测试与基准（`tests/session.rs`、`tests/bench.rs`、`tests/settings_xfer.rs`）
+/// 的「改前行为基准」驱动，`#[cfg(test)]` 归位避免生产 dead_code。
+#[cfg(test)]
 pub(crate) fn restore_session_from(
     app: &mut EditorApp,
     dir: &Path,

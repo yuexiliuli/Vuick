@@ -708,3 +708,105 @@
         assert_eq!(tabs, 0, "命名干净 tab 应直通 remove_tab");
         let _ = std::fs::remove_file(&f1);
     }
+
+    /// A1 回归：渐进恢复（首帧后逐帧逐个选项卡）最终态与改前同步恢复完全一致；且
+    /// **首帧前不做同步恢复**——`schedule_restore` 只登记帧回调、不开任何 tab。驱动：
+    /// 显式临时目录 + `simulate_next_frame` 逐帧投递（对照 preview 里 on_next_frame
+    /// 测试的既有姿势）。断言：恢复前零 tab / 恢复抑制生效 → 逐帧后 顺序/活动/内容/
+    /// 路径/dirty 与同步版一致 → 清单/槽位被清理 → 放行持久化。
+    #[gpui::test]
+    async fn progressive_restore_matches_sync_final_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let dir = session_temp_dir("progressive_vs_sync");
+        let f1 = std::env::temp_dir().join(format!("gpui-prog-sync-{}-a.rs", std::process::id()));
+        let f2 = std::env::temp_dir().join(format!("gpui-prog-sync-{}-b.txt", std::process::id()));
+        std::fs::write(&f1, "fn main() {\n    let x = 1;\n}\n").unwrap();
+        std::fs::write(&f2, "line1\nline2\nline3\n").unwrap();
+        let m = session::SessionManifest {
+            version: 1,
+            active_tab: 1,
+            tabs: vec![
+                session::SessionTab::File { path: f1.clone() },
+                session::SessionTab::New { slot: "t0".into(), name: "未命名".into() },
+                session::SessionTab::File { path: f2.clone() },
+            ],
+        };
+        assert!(session::write_manifest(&dir, &m), "清单应写入");
+        session::write_slot(&dir, "t0", "未命名内容甲");
+
+        // 同步版基准（改前行为）：同清单恢复后的最终态。
+        let (app_sync, cx_sync) = add_app_zero_tabs(cx);
+        cx_sync.update(|window, cx| {
+            app_sync.update(cx, |app, cx| {
+                assert!(session::restore_session_from(app, &dir, window, cx));
+            });
+        });
+        let sync_snap = cx_sync.update(|_w, cx| {
+            let a = app_sync.read(cx);
+            (
+                a.tabs.len(),
+                a.active_tab,
+                a.tabs
+                    .iter()
+                    .map(|t| t.editor.read(cx).value().to_string())
+                    .collect::<Vec<String>>(),
+                a.tabs.iter().map(|t| t.file_path.clone()).collect::<Vec<Option<PathBuf>>>(),
+                a.tabs.iter().map(|t| t.dirty).collect::<Vec<bool>>(),
+            )
+        });
+
+        // 渐进版：新实例 schedule_restore → 首帧前零 tab（A1 核心）→ 逐帧泵到完成。
+        // 注意：同步版恢复已完成并清盘（清单/槽位被删，属既有语义）→ 此处**重新播种**
+        // 同清单 + 槽位，供渐进版原样恢复（最终态对拍才有意义）。
+        assert!(session::write_manifest(&dir, &m), "渐进版清单应重新写入");
+        session::write_slot(&dir, "t0", "未命名内容甲");
+        let (app_prog, cx_prog) = add_app_zero_tabs(cx);
+        cx_prog.update(|window, cx| {
+            app_prog.update(cx, |app, cx| {
+                let man = session::read_manifest(&dir).expect("清单应可读回");
+                app.schedule_restore(window, cx, dir.clone(), man);
+                assert!(app.tabs.is_empty(), "首帧前（on_next_frame 前）不得同步恢复任何 tab");
+                assert!(app.session_restoring, "恢复期间应抑制持久化");
+            });
+        });
+        let mut ran = 0usize;
+        for _ in 0..16 {
+            cx_prog.run_until_parked();
+            let d = cx_prog.update(|window, cx| window.simulate_next_frame(cx));
+            cx_prog.run_until_parked();
+            if d > 0 {
+                ran += 1;
+            }
+            let restoring = cx_prog.update(|_w, cx| app_prog.read(cx).session_restoring);
+            if !restoring {
+                break;
+            }
+        }
+        assert!(ran >= 3, "渐进恢复应至少逐帧推进 3 次（3 个 tab），实际 {ran}");
+        assert!(
+            !cx_prog.update(|_w, cx| app_prog.read(cx).session_restoring),
+            "恢复完成后应放行持久化"
+        );
+        let prog_snap = cx_prog.update(|_w, cx| {
+            let a = app_prog.read(cx);
+            (
+                a.tabs.len(),
+                a.active_tab,
+                a.tabs
+                    .iter()
+                    .map(|t| t.editor.read(cx).value().to_string())
+                    .collect::<Vec<String>>(),
+                a.tabs.iter().map(|t| t.file_path.clone()).collect::<Vec<Option<PathBuf>>>(),
+                a.tabs.iter().map(|t| t.dirty).collect::<Vec<bool>>(),
+            )
+        });
+        assert_eq!(
+            prog_snap, sync_snap,
+            "渐进恢复最终态应与同步恢复完全一致（顺序/活动/内容/路径/dirty）"
+        );
+        assert!(!dir.join("session.json").exists(), "恢复后清单应删除");
+        assert!(!dir.join("t0").exists(), "恢复后槽位应清理");
+        let _ = std::fs::remove_file(&f1);
+        let _ = std::fs::remove_file(&f2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }

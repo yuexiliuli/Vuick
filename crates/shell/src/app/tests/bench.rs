@@ -1171,4 +1171,157 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// 轨 A 基准（ignored）：启动 → 首帧墙钟（真夹具真墙钟，headless 可复跑，纯 ADD 不改
+    /// 行为）。分段：① 窗口构造（EditorApp::new 真实启动路径 + Root）+ 首帧 render（refresh
+    /// 真实布局/paint）② 会话恢复段（`restore_session_from` 显式临时目录，含逐选项卡同步
+    /// open_file / 建未命名选项卡灌槽位）＝轨 A 改造前首帧成本基线。
+    /// 生产完整 `[STARTUP]` 直读：`GPUI_EDITOR_STARTUP_DIAG=1 target\debug\gpui-editor.exe`
+    /// 的 stderr 首行。运行：
+    /// `cargo test -p shell bench_startup_to_first_frame -- --ignored --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_startup_to_first_frame(cx: &mut TestAppContext) {
+        use session::SessionTab;
+        use std::time::Instant;
+        init_test(cx);
+        // ① 构造 + 首帧（真实启动路径：EditorApp::new = startup=true，restore/tray 在
+        // 测试构建 cfg 掉，量「构造 + 首次 render」的剩余同步成本）。
+        let holder: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<EditorApp>>>> =
+            std::rc::Rc::default();
+        let t_start = Instant::now();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| EditorApp::new(window, cx));
+            *holder.borrow_mut() = Some(app.clone());
+            ui::root::Root::new(app, window, cx)
+        });
+        let app = holder.borrow().clone().unwrap();
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let _ = cx.cx.refresh();
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let construct_frame_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        let _ = app;
+        // ② 会话恢复段：显式临时目录播种 3 文件 + 2 未命名，干净零 tab 实例恢复。
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-session-bench-a-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = Vec::new();
+        for i in 0..3 {
+            let p = dir.join(format!("f{i}.txt"));
+            let body: String = (0..2000)
+                .map(|k| format!("line{k} 一些内容 {i}\n"))
+                .collect();
+            std::fs::write(&p, &body).unwrap();
+            files.push(p);
+        }
+        let m = session::SessionManifest {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![
+                SessionTab::File { path: files[0].clone() },
+                SessionTab::New { slot: "t0".into(), name: "未命名".into() },
+                SessionTab::File { path: files[1].clone() },
+                SessionTab::File { path: files[2].clone() },
+                SessionTab::New { slot: "t1".into(), name: "未命名".into() },
+            ],
+        };
+        assert!(session::write_manifest(&dir, &m), "清单应写入");
+        assert!(session::write_slot(&dir, "t0", "未命名内容甲"));
+        assert!(session::write_slot(&dir, "t1", "未命名内容乙"));
+        let (app2, cx) = add_app_zero_tabs(cx);
+        let t_restore = Instant::now();
+        cx.update(|window, cx| {
+            app2.update(cx, |app, cx| {
+                assert!(session::restore_session_from(app, &dir, window, cx));
+            });
+        });
+        let restore_ms = t_restore.elapsed().as_secs_f64() * 1000.0;
+        let restored = cx.update(|_w, cx| {
+            let a = app2.read(cx);
+            (
+                a.tabs.len(),
+                a.tabs.iter().filter(|t| t.file_path.is_none()).count(),
+            )
+        });
+        assert_eq!(restored, (5, 2), "恢复应得 5 选项卡（3 文件 + 2 未命名）");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("==== 启动→首帧墙钟基准（debug，headless；真机以 GPUI_EDITOR_STARTUP_DIAG=1 的 [STARTUP] 行为准） ====");
+        println!("  窗口构造 + 首帧 render(refresh 真实布局): {construct_frame_ms:.1} ms");
+        println!("  会话恢复段(3 文件 + 2 未命名):            {restore_ms:.1} ms");
+        println!(
+            "  ≈ 启动→首帧合计: {:.1} ms",
+            construct_frame_ms + restore_ms
+        );
+    }
+
+    /// 轨 D 基准（ignored）：新开媒体窗口「触发 → 首次 render 结束」墙钟（headless）。
+    /// 复用 media_window 测试姿势：主窗口开音频（media_new_window/reuse 默认开、无既有
+    /// 媒体窗口）→ `maybe_redirect_media_open` 决策 NewWindow → `open_media_in_new_window`
+    /// 新开窗口 → 媒体路由打开。首帧判据 = 新窗口实体出现且完整进入音乐模式（music_mode
+    /// 且 MusicView 已创建），源窗口 tabs 不变、窗口数 +1（保基准形态正确）。
+    /// 运行：`cargo test -p shell bench_new_media_window_first_frame -- --ignored --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_new_media_window_first_frame(cx: &mut TestAppContext) {
+        use std::time::Instant;
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let s = placeholder_audio("bench-wall");
+        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        // 预热首窗口首帧（排除在计时外）
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        let t0 = Instant::now();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(s.to_str().unwrap(), window, cx));
+        });
+        let dispatch_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // 轮询到新窗口完整进入音乐模式（首屏 render 就绪）
+        let mut ready = false;
+        let mut frames = 0usize;
+        let mut media_ms = 0.0f64;
+        while frames < 200 && !ready {
+            frames += 1;
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            ready = other_app_entity(cx, &app)
+                .into_iter()
+                .any(|e| media_win_snap(cx, &e).0);
+            if ready {
+                media_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+        // 再等几帧让首屏完整 render 结束
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(ready, "媒体窗口应进入音乐模式（首帧就绪）");
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            tabs_before,
+            "源窗口 tabs 应不变"
+        );
+        assert_eq!(registry_window_count(cx), 2, "应恰好多 1 个媒体窗口");
+        println!("==== 新开媒体窗口墙钟基准（debug，headless） ====");
+        println!("  open_file 同步返回(分流决策,不卡 UI): {dispatch_ms:.1} ms");
+        println!("  → 新窗口音乐模式就绪(约首帧): {media_ms:.1} ms（frames={frames}）");
+        println!("  → 额外 settle 后合计: {total_ms:.1} ms");
+        let _ = std::fs::remove_file(&s);
+    }
+
 

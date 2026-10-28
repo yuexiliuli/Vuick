@@ -12,10 +12,33 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
 use gpui::{HighlightStyle, FontStyle};
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
+
+/// 预热生命周期标记：`prewarm_begin`（启动路径把 `prewarm` 派到后台线程**前**同步置位，
+/// 消除「会话恢复先于预热任务运行」的竞态）→ `prewarm` 后台跑完置 `PREWARM_DONE`。
+/// 消费方（shell 会话恢复等）在 `started && !done` 期间让帧等待，保证打开文件时
+/// `find_syntax` 全部命中缓存、主线程零冷扫（syntax crate 注释承认首次认证 ~200-250ms）。
+static PREWARM_STARTED: AtomicBool = AtomicBool::new(false);
+static PREWARM_DONE: AtomicBool = AtomicBool::new(false);
+
+/// 标记「预热已启动」（二进制壳 main.rs 在把 `prewarm` spawn 到后台前同步调用）。
+pub fn prewarm_begin() {
+    PREWARM_STARTED.store(true, Ordering::Release);
+}
+
+/// 预热是否已启动（含完成）。未启动 = 本进程不走预热路径（如测试进程）→ 不应等待。
+pub fn prewarm_started() -> bool {
+    PREWARM_STARTED.load(Ordering::Acquire)
+}
+
+/// 预热是否已完成：完成后 `find_syntax` 全部命中缓存，主线程打开文件零阻塞。
+pub fn prewarm_done() -> bool {
+    PREWARM_DONE.load(Ordering::Acquire)
+}
 
 /// 全局语法集（Windows syntax-based detection）；进程内仅加载一次。
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
@@ -676,6 +699,8 @@ pub fn prewarm() {
     // 明暗 GitHub 色板。
     let _ = github_theme_cached(false);
     let _ = github_theme_cached(true);
+    // 全部就绪：find_syntax 此后全部命中缓存（会话恢复/打开文件不再有主线程冷扫）。
+    PREWARM_DONE.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -706,6 +731,16 @@ mod tests {
             (t2 - t1).as_secs_f64() * 1000.0,
             (t3 - warm_set).as_secs_f64() * 1000.0,
         );
+    }
+
+    /// 预热生命周期标记（A2）：`prewarm_begin` → 预热中/完成；完成后 `prewarm_done()`
+    /// 为 true（会话恢复据此判定「find_syntax 已全量命中缓存」）。
+    #[test]
+    fn prewarm_lifecycle_flags() {
+        prewarm_begin();
+        assert!(prewarm_started(), "prewarm_begin 后应进入「已启动」态");
+        prewarm();
+        assert!(prewarm_done(), "prewarm 完成后应置 done");
     }
 
     /// 解析器可覆盖常见语言；`resolve_styles` 把区间切成无缝隙的样式 run。

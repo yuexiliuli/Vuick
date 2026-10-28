@@ -16,6 +16,10 @@ use ui::theme::{Theme, ThemeMode};
 use config::user::UserPrefs;
 
 fn main() {
+    // 启动首帧墙钟诊断（GPUI_EDITOR_STARTUP_DIAG=1 开启，默认零开销零行为）：锚定
+    // 进程入口起点；后续 open_window 回调 / EditorApp::new 结束（restore 段）/ 首次
+    // render 依次 mark，首次 render 时汇总打一行。轨 A 改动前基线。
+    base::startup::boot();
     gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(980.), px(720.)), cx);
 
@@ -41,6 +45,9 @@ fn main() {
             // 后台预热 syntect 全局语法集与明暗色板（A2）：把「首次代码块同步
             // 反序列化几 MB」的一次性成本移出滚动路径 → 首张图片附近不再卡那一下。
             // LazyLock 并发安全，主线程先命中只会短暂阻塞。
+            // A2：先同步置「预热已启动」，会话恢复据此在预热完成前让帧等待，杜绝
+            // 恢复期打开文件时 `find_syntax` 在主线程冷扫（~200-250ms/语言 窗口期）。
+            syntax::prewarm_begin();
             cx.background_executor()
                 .spawn(async move { prewarm() })
                 .detach();
@@ -65,6 +72,8 @@ fn main() {
                     },
                     |window, cx| {
                         window.set_window_title("GPUI 编辑器");
+                        // 启动首帧分段：open_window 回调到达（config/prefs/键位已就绪）。
+                        base::startup::mark("config");
                         let view = cx.new(|cx| EditorApp::new(window, cx));
                         created = Some(view.clone());
                         // 窗口第一层是自研根视图（ui::root，替代 gpui_component::Root）

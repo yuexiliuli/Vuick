@@ -88,6 +88,10 @@ impl CodeEditor {
         if event.button != MouseButton::Left {
             return;
         }
+        // WY_TRACE 操作级计时（KILO_PROF::op_start，未开 WY_TRACE 时一次借锁检查即返回）：
+        // 单击 → 本帧编辑器 paint 末尾结算（render.rs 的 op_finish_after_paint），产出
+        // `OP kind=ed_click total=墙钟`，量「点击 → 落帧」感知延迟。
+        crate::prof::op_start("ed_click");
         self.focus_handle.focus(window, cx);
         self.undo.set_cooperative(false);
         let local = event.position - self.element_bounds.origin;
@@ -129,6 +133,9 @@ impl CodeEditor {
         if !self.dragging {
             return;
         }
+        // WY_TRACE 操作级计时：拖选每步「移动 → 本帧 paint 结束」一次（与单击同机制，
+        // 量「拖选 → 落帧」逐帧感知延迟）。
+        crate::prof::op_start("ed_drag");
         let local = event.position - self.element_bounds.origin;
         let offset = self.offset_at_point(local, window);
         self.selection.set_head(offset);

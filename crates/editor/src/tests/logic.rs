@@ -1459,6 +1459,53 @@ fn bench_medium_gap_scroll_frames() {
     println!("  静止 settle（一屏有界重锚）: {settle_us}µs");
 }
 
+/// 轨 C 基准（ignored）：滚动帧时间直方图——中速大缺口连续滚动 N 帧，每帧 `Instant`
+/// 记录刷新墙钟 → 打 min/median/p95 + 掉帧计数（单帧 >16.7ms 记掉帧）。
+/// 复用 [`bench_medium_gap_scroll_frames`] 同款帧循环与大文档（120k 行 / 缺口 500 行），
+/// 纯高亮帧路径（syntect 段）＝编辑区滚动帧成本的构成主体。
+/// 运行：`cargo test --bin gpui-editor bench_scroll_frame_histogram -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_scroll_frame_histogram() {
+    use std::time::Instant;
+    let text: String = (0..120_000)
+        .map(|i| match i % 4 {
+            0 => format!("fn foo{i}() {{ // c{i}\n"),
+            1 => format!("let x: u32 = {i} + 1;\n"),
+            2 => format!("core::writeln!(\"fmt {i}\");\n"),
+            _ => format!("struct S{i} {{ a: u32, }}\n"),
+        })
+        .collect();
+    let b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let _ = hl.highlight_window(&b, 0, 108, 16).to_vec(); // 预热（不计时）
+    const GAP: usize = 500;
+    const FRAMES: usize = 90;
+    let mut lo = 0usize;
+    let mut frame_ms: Vec<f64> = Vec::with_capacity(FRAMES);
+    for _ in 0..FRAMES {
+        lo += GAP;
+        let hi = lo + 108;
+        let t = Instant::now();
+        if hl.accept_deferred(lo, hi, 16) {
+            let _ = hl.highlight_window(&b, lo, hi, 16).to_vec();
+        }
+        frame_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mut s = frame_ms.clone();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let min = s[0];
+    let median = s[s.len() / 2];
+    let p95 = s[(s.len() as f64 * 0.95) as usize - 1];
+    let dropped = frame_ms.iter().filter(|&&f| f > 16.7).count();
+    println!("==== 滚动帧时间直方图（缺口 {GAP} 行 ×{FRAMES} 帧） ====");
+    println!(
+        "  min={min:.3}ms median={median:.3}ms p95={p95:.3}ms 掉帧(>16.7ms)={dropped}/{FRAMES}"
+    );
+    println!("  明细(前 20): {:?}", &frame_ms[..20.min(FRAMES)]);
+}
+
 // ---------------------------------------------------------------------------
 // 首屏上色时延基准（方案 A+B）
 // ---------------------------------------------------------------------------

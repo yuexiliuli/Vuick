@@ -194,6 +194,13 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let p = PathBuf::from(path.trim());
+        // 打开墙钟诊断（GPUI_EDITOR_DIAG 守卫，平时零开销零行为）：记录「触发 open_file
+        // 分流 → 决策 / 新窗口就绪」的墙钟，供轨 D 基线（headless 基准同口径对表）。
+        let diag_t0 = if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // 只对音频/视频做重定向；PDF/图片/文本/EPUB 与 `is_video_path` 判定结果
         // 完全一致（同一扩展名清单），不受本开关影响。
         #[cfg(feature = "video")]
@@ -216,8 +223,11 @@ impl EditorApp {
             .try_global::<EditorAppRegistry>()
             .map(|r| r.windows.len())
             .unwrap_or(0);
-        if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
-            eprintln!("[MEDIAWND] path={path} target={target:?} windows={windows_n}");
+        if let Some(t0) = diag_t0 {
+            eprintln!(
+                "[MEDIAWND] path={path} target={target:?} windows={windows_n} wall={:.1}ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
         match target {
             MediaOpenTarget::Here => false,
@@ -271,6 +281,13 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         let owned = p.to_string_lossy().into_owned();
+        // 首帧墙钟诊断（GPUI_EDITOR_DIAG 守卫，平时零开销零行为）：触发起点 = 本函数
+        // 入口；下方 [MEDIAWNDSZ] open / 路由完成两处补 wall 字段（轨 D 基线）。
+        let diag_t0 = if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // 按本次媒体种类取对应记录尺寸（新窗口尚未是媒体窗口，按扩展名决定角色即可）。
         let kind = if music::is_audio_extension(p) {
             MediaWindowKind::Music
@@ -306,12 +323,13 @@ impl EditorApp {
             appears_transparent: true,
             ..Default::default()
         };
-        if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+        if let Some(t0) = diag_t0 {
             eprintln!(
-                "[MEDIAWNDSZ] open kind={kind:?} size={}x{} follow-source={}",
+                "[MEDIAWNDSZ] open kind={kind:?} size={}x{} follow-source={} wall={:.1}ms",
                 bounds.size.width.as_f32().round() as i64,
                 bounds.size.height.as_f32().round() as i64,
                 recorded.is_none(),
+                t0.elapsed().as_secs_f64() * 1000.0,
             );
         }
         let handle: AnyWindowHandle = match cx.open_window(
@@ -335,6 +353,14 @@ impl EditorApp {
             }
         };
         self.route_media_to_window(p, handle, cx);
+        // 墙钟：触发 → 新窗口已创建 + 媒体已路由到目标窗口（`route_media_to_window` 内
+        // 直调目标窗口 `open_file_here` 同步打开）≈ 新窗口首帧前。
+        if let Some(t0) = diag_t0 {
+            eprintln!(
+                "[MEDIAWND] routed path={owned} wall={:.1}ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 
     /// 把媒体文件经目标窗口句柄转交该窗口 EditorApp 本体打开（同进程跨窗口实体 update；

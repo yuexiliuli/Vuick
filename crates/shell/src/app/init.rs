@@ -175,7 +175,8 @@ impl EditorApp {
             pdf_menu_entity: None,
             pdf_menu_sub: None,
             pdf_last_error_seen: None,
-            pdf_bookmarks: pdf_bookmarks::load(),
+            // A4：PDF 书签进程级读盘一次（`load_cached`；每窗构造都读盘是浪费）。
+            pdf_bookmarks: pdf_bookmarks::load_cached(),
             tab_bar_menu_pos: None,
             tab_bar_menu_entity: None,
             tab_bar_menu_sub: None,
@@ -312,6 +313,13 @@ impl EditorApp {
                 app.toggle_live_test(window, cx);
             }
         }
+        // 启动首帧墙钟（GPUI_EDITOR_STARTUP_DIAG=1 门控，默认零开销零行为）：
+        // A1 后本段 ≈ `EditorApp::new` 结束段——`restore_session` 只完成「读清单 +
+        // 登记首帧后渐进恢复」，**首帧前不做任何逐选项卡打开**（恢复在首帧 render
+        // 之后按帧逐个进行，见 session.rs `schedule_restore`／`restore_step`）。
+        if startup {
+            base::startup::mark("restore");
+        }
         // 退出钩子：仅**主窗口**（is_detached == false）实体注册——退出前把主窗口的
         // 选项卡集合保存到会话目录，覆盖全部退出路径（菜单退出 / Ctrl+Q / 命令面板 /
         // 点窗口关闭）。detach 拆分窗口不参与会话持久化/恢复（见 session 模块注释）。
@@ -348,11 +356,18 @@ impl EditorApp {
                         tray::set_main_hwnd(win32.hwnd.get() as isize);
                     }
                     tray::set_close_to_tray(app.close_to_tray);
+                    // A5：托盘图标 / 程序窗口图标 **defer 到首帧后**（窗口先显示、图标随后
+                    // 毫秒级出现）。`add_tray_icon`（建隐藏消息窗口 + 解码 PNG +
+                    // Shell_NotifyIconW）与 `WM_SETICON` 不再挡首帧；`set_main_hwnd` /
+                    // `set_close_to_tray` / `on_window_should_close` 是纯 flag + 注册（零
+                    // 窗口/图标成本），保持首帧前同步。图标在此注册，行为 = 稍晚出现。
                     // 托盘图标常驻（用户要求：任务栏 + 系统托盘都用变色龙；不随开关消失）。
-                    tray::ensure_tray_icon();
-                    // 程序图标：运行时对主窗口 HWND 发 WM_SETICON（任务栏 / Alt+Tab / 标题栏）
-                    // = icon-chameleon_64x64.ico 图标（crates/tray::APP_ICO），HICON 与托盘图标共用一份。
-                    tray::set_window_icon();
+                    window.on_next_frame(move |_window, _cx| {
+                        tray::ensure_tray_icon();
+                        // 程序图标：运行时对主窗口 HWND 发 WM_SETICON（任务栏 / Alt+Tab /
+                        // 标题栏）= icon-chameleon_64x64.ico 图标（tray::APP_ICO，与托盘共用）。
+                        tray::set_window_icon();
+                    });
                     window.on_window_should_close(cx, |_window, _cx| {
                         if tray::should_close_to_tray() {
                             tray::hide_main_window();

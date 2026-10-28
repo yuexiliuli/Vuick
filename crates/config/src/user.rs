@@ -11,7 +11,9 @@
 //! - `cfg!(test)` 下读写为空操作，避免 `cargo test` 污染真实用户配置。
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock as StdLazyLock, Mutex as StdMutex};
+use std::time::SystemTime;
 
 use gpui::WindowAppearance;
 use serde_json::{json, Map, Value};
@@ -107,6 +109,23 @@ pub struct UserPrefs {
     pub music_last_track: Option<String>,
     /// 上次播放位置（秒；随 [`UserPrefs::music_last_track`] 一起恢复；`None` = 从头起）。
     pub music_progress_secs: Option<f64>,
+}
+
+/// A3 进程级偏好缓存：键 = 配置路径 + 文件元数据（mtime+len）。`load` 首访读盘并缓存；
+/// 后续**同一路径且文件未变**直接克隆缓存（启动 `main.rs` 与 `new_impl` 两处不再重复
+/// 读盘解析 JSON；`media_window` 打开动作、`collect_prefs` 持久化口径同享缓存）——
+/// 只做一次 `fs::metadata`（微秒级 stat，非内容读）。文件被改写（mtime/len 变化，含
+/// 测试内同一路径换内容、外部另存）或路径切换（`GPUI_EDITOR_CONFIG` 变）→ 自动重读，
+/// 不串缓存。`save` 写盘成功后同步回写缓存。测试构建（`cfg!(test)`）不触缓存。
+static PREFS_CACHE: StdLazyLock<StdMutex<Option<(PathBuf, Option<SystemTime>, u64, UserPrefs)>>> =
+    StdLazyLock::new(|| StdMutex::new(None));
+
+/// 配置文件的「改版指纹」：(mtime, len)；缺失 → `(None, 0)`。
+fn config_meta(path: &Path) -> (Option<SystemTime>, u64) {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.modified().ok(), m.len()),
+        Err(_) => (None, 0),
+    }
 }
 
 impl UserPrefs {
@@ -275,10 +294,31 @@ impl UserPrefs {
     }
 
     /// 加载用户偏好：缺失 / 损坏 / 字段缺省均回退默认。
+    /// **A3 进程级缓存**：见 [`PREFS_CACHE`]——首访读盘一次，后续同一路径未变直接读
+    /// 缓存（只 stat 一次，不再重复读盘解析）；文件变化/路径切换自动重读。
     pub fn load() -> Self {
         if cfg!(test) {
             return Self::default();
         }
+        let path = Self::config_path();
+        let meta = config_meta(&path);
+        if let Ok(cache) = PREFS_CACHE.lock()
+            && let Some((p, m, len, v)) = cache.as_ref()
+            && *p == path
+            && *m == meta.0
+            && *len == meta.1
+        {
+            return v.clone();
+        }
+        let loaded = Self::load_from_disk();
+        if let Ok(mut cache) = PREFS_CACHE.lock() {
+            *cache = Some((path, meta.0, meta.1, loaded.clone()));
+        }
+        loaded
+    }
+
+    /// 从磁盘读取并解析（`load` 的底层；缺失 / 损坏 / 字段缺省均回退默认）。
+    fn load_from_disk() -> Self {
         let Ok(text) = fs::read_to_string(Self::config_path()) else {
             return Self::default();
         };
@@ -291,6 +331,7 @@ impl UserPrefs {
     /// 保存：同目录临时文件 + rename 原子替换（唯一临时名统一收敛到
     /// `base::util::atomic_write`；Windows `std::fs::rename` 可覆盖既有文件，不再先删旧文件）。
     /// 写失败静默回退：保持内存态、不覆盖磁盘，与既有处置一致。
+    /// **A3**：写盘成功后同步进程级缓存（缓存镜像盘面；失败不更新，`load` 仍读旧盘面）。
     pub fn save(&self) {
         if cfg!(test) {
             return;
@@ -299,6 +340,10 @@ impl UserPrefs {
         let body = self.to_json_value().to_string();
         if base::util::atomic_write(&path, body.as_bytes()).is_err() {
             return;
+        }
+        let meta = config_meta(&path);
+        if let Ok(mut cache) = PREFS_CACHE.lock() {
+            *cache = Some((path, meta.0, meta.1, self.clone()));
         }
     }
 }
