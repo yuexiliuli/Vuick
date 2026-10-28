@@ -262,14 +262,19 @@ impl WindowsWindowInner {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
-        if should_resize_renderer
-            && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
-        {
-            log::error!("Failed to resize renderer, invalidating devices: {}", e);
-            self.state
-                .invalidate_devices
-                .store(true, std::sync::atomic::Ordering::Release);
+        if should_resize_renderer {
+            if self.state.size_move_loop.get() {
+                // 拖拽期：不逐 WM_SIZE 重建渲染资源，只记录 pending 尺寸，EXITSIZEMOVE
+                // 一次收口（渲染结果在收口后与「逐 WM_SIZE 重建」完全一致）。
+                self.state.pending_resize.set(Some((device_size, scale_factor)));
+            } else if let Err(e) = self.state.renderer.borrow_mut().resize(device_size) {
+                log::error!("Failed to resize renderer, invalidating devices: {}", e);
+                self.state
+                    .invalidate_devices
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
+        // resize 回调对 app 层的完整尺寸通知时序不变（拖拽期也照常逐 WM_SIZE 通知）。
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
             self.state.callbacks.resize.set(Some(callback));
@@ -277,6 +282,9 @@ impl WindowsWindowInner {
     }
 
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {
+        // 进入尺寸/移动拖拽：把重绘与渲染资源重建一起收口到 EXITSIZEMOVE（拖拽期不
+        // 逐 WM_SIZE 重建 swapchain/中间纹理/MSAA，命中的是拖动前最后一帧 + STRETCH 顶帧）。
+        self.state.size_move_loop.set(true);
         unsafe {
             let ret = SetTimer(
                 Some(handle),
@@ -297,6 +305,23 @@ impl WindowsWindowInner {
     fn handle_size_move_loop_exit(&self, handle: HWND) -> Option<isize> {
         unsafe {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
+        }
+        self.state.size_move_loop.set(false);
+        // 拖拽期只记录了 pending 尺寸：这里一次性收口重建渲染资源（期间可能有
+        // DPI/显示变化混入，一律以拖拽结束的最新尺寸为准）。
+        if let Some((device_size, _scale_factor)) = self.state.pending_resize.take() {
+            if let Err(e) = self.state.renderer.borrow_mut().resize(device_size) {
+                log::error!("Failed to resize renderer, invalidating devices: {}", e);
+                self.state
+                    .invalidate_devices
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        // 收口一次强制重绘：把拖拽期被延后的帧（含拖动期间到达的 force_render）补上。
+        unsafe {
+            RedrawWindow(Some(handle), None, None, RDW_INVALIDATE)
+                .ok()
+                .log_err();
         }
         None
     }
@@ -1319,6 +1344,18 @@ impl WindowsWindowInner {
 
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        // 拖拽期（WM_ENTERSIZEMOVE→EXITSIZEMOVE）不逐帧重绘：渲染器保持拖动前尺寸，
+        // 由 DComp 的 DXGI_SCALING_STRETCH 顶住拖动前最后一帧，避免把新逻辑尺寸的
+        // scene 画进旧尺寸 RTV/viewport 造成裁剪/错位；EXITSIZEMOVE 收口 resize 后
+        // 统一补一帧。设备恢复的 force_render 也延后到收口执行（force_render_pending 保留）。
+        if self.state.size_move_loop.get() {
+            if force_render {
+                self.state.force_render_pending.set(true);
+            }
+            // ValidateRect 防嵌套消息泵在拖拽期对仍 invalid 的区域反复派发 WM_PAINT。
+            unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+            return Some(0);
+        }
         let Some(_guard) = self.state.draw_coordinator.try_begin_draw() else {
             log::debug!("deferring re-entrant draw of window {handle:?}");
             if force_render {

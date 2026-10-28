@@ -52,6 +52,12 @@ pub struct WindowsWindowState {
     pub background_appearance: Cell<WindowBackgroundAppearance>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
+    /// WM_ENTERSIZEMOVE→WM_EXITSIZEMOVE 窗口期置真：期间不逐 WM_SIZE 重建渲染器
+    /// swapchain/中间纹理/MSAA，仅记录 pending 尺寸、拖拽结束一次收口；同时把逐帧
+    /// 重绘延后到收口，用 DComp 的 DXGI_SCALING_STRETCH 顶住拖动前最后一帧。
+    pub size_move_loop: Cell<bool>,
+    /// 拖拽期记录的最新待应用尺寸（设备像素 + scale）；EXITSIZEMOVE 时一次 flush。
+    pub pending_resize: Cell<Option<(Size<DevicePixels>, f32)>>,
 
     pub callbacks: Callbacks,
     pub frame_signal: Arc<PlatformFrameSignal>,
@@ -167,6 +173,8 @@ impl WindowsWindowState {
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
+            size_move_loop: Cell::new(false),
+            pending_resize: Cell::new(None),
             min_size,
             callbacks,
             frame_signal: Arc::new(PlatformFrameSignal::new()),

@@ -526,6 +526,11 @@ impl DirectXRenderer {
         if self.width == width && self.height == height {
             return Ok(());
         }
+        // C2 真机探针（GPUI_EDITOR_DIAG 守卫）：正常应每个拖拽只在 EXITSIZEMOVE 收口时
+        // 打到一行（拖拽中 WM_SIZE 不再触发 `resize()`）；若无 C2，拖拽过程会每 WM_SIZE 一行。
+        if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+            eprintln!("[RENDERER] resize {width}x{height}");
+        }
         self.width = width;
         self.height = height;
 
