@@ -104,6 +104,9 @@ impl CodeEditor {
             blink_running: false,
             focus_registered: false,
             element_bounds: Bounds::default(),
+            pending_drag: None,
+            #[cfg(test)]
+            drag_flush_calls: Cell::new(0),
             hscroll_tail_gap: 0.0,
             // 固定窗口虚拟化：窗口首行绝对行号（初始 0）。
             window_base: 0,
@@ -125,6 +128,8 @@ impl CodeEditor {
             active_guide_color: rgb(0x000000).into(),
             live_replay_calls: Cell::new(0),
             apply_replaces_calls: Cell::new(0),
+            #[cfg(test)]
+            guide_scan_steps: Cell::new(0),
             #[cfg(test)]
             scan_inc_landings: Cell::new(0),
             #[cfg(test)]

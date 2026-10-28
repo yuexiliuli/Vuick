@@ -52,6 +52,7 @@ use gpui::{
     Hsla,
     ListState,
     Pixels,
+    Point,
     ScrollHandle,
     SharedString,
     Window,
@@ -439,6 +440,14 @@ pub struct CodeEditor {
     blink_running: bool,
     focus_registered: bool,
     element_bounds: Bounds<Pixels>,
+    /// 拖选帧级合并（B2）：`on_mouse_move` 只记**最新拖点**（编辑区本地点），下一帧
+    /// `render` 开头 `flush_pending_drag` 统一换算/落地选区——鼠标事件可比帧快得多，
+    /// 不再逐事件重复 offset 换算 + set_head + emit + notify（对齐 scrollbar
+    /// `pending_target`→prepaint 落地先例的视图层等价物）。
+    pending_drag: Option<Point<Pixels>>,
+    /// （仅测试）`flush_pending_drag` 落地次数（每帧至多一次）。
+    #[cfg(test)]
+    drag_flush_calls: Cell<usize>,
     /// 横向内容的**尾部留白**（px；默认 0）：仅当最宽行**溢出**可视区时才追加到
     /// `content_w_px` 之后——滚到底后最后一个字符与右裁切缘之间留出该空隙，不再贴缘
     /// 被裁/难以点中（数学编辑卡长公式专用；主编辑器保持 0 = 行为不变）。
@@ -504,6 +513,10 @@ pub struct CodeEditor {
     live_replay_calls: Cell<usize>,
     /// （仅测试）`apply_replaces`（行级 diff 兜底）非空调用次数——同上，实例级确定性。
     apply_replaces_calls: Cell<usize>,
+    /// （仅测试）`guide_pair_for_logical_row` 二分后回扫**实际检查**的配对步数（每次
+    /// 调用前清零）——证明「点击块内不再整表线性扫」，典型块内命中应为 O(1) 步。
+    #[cfg(test)]
+    guide_scan_steps: Cell<usize>,
     /// （仅测试）后台折叠候选/括号配对落地的**增量**次数（增量前提成立的刷新轮次）。
     #[cfg(test)]
     scan_inc_landings: Cell<usize>,
@@ -593,6 +606,12 @@ impl CodeEditor {
     /// 测试用：逻辑行 `logical` 应命中的最内层括号块（`open_line`）。
     pub fn test_guide_for_logical_row(&self, logical: usize) -> Option<usize> {
         self.guide_pair_for_logical_row(logical)
+    }
+
+    /// 测试用：最近一次 `guide_pair_for_logical_row` 二分后回扫**实际检查**的配对步数。
+    #[cfg(test)]
+    pub fn test_guide_scan_steps(&self) -> usize {
+        self.guide_scan_steps.get()
     }
 
     /// 测试用：`line` 是否起始一个可折叠候选/激活折叠（gutter 指示器口径）。

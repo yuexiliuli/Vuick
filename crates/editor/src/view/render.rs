@@ -46,6 +46,11 @@ impl Render for CodeEditor {
         let entity = cx.entity();
         let avail_w = self.sync_render_state(window, cx);
 
+        // 拖选帧级合并（B2）：`on_mouse_move` 只记最新拖点，这里每帧开头统一落地
+        // 一次选区/滚动（在行窗口构建**之前** → 当帧即渲染新选区）。详见
+        // `flush_pending_drag` 注释。
+        self.flush_pending_drag(window, cx);
+
         // 行级数据窗口（可见 + 过扫）——vis_top 用**绝对视觉行号**（窗口基址 + 相对
         // 滚动；折叠后视觉行 = 逻辑行 − 其前隐藏行数，行窗口以视觉行为上界）。
         let lh = self.line_height.as_f32().max(1.);

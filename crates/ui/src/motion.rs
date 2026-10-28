@@ -94,8 +94,16 @@ where
     let view_id = window.current_view();
     let st = hover.clone();
     el.on_hover(move |h, _window, cx| {
-        st.update(cx, |v, _| *v = *h);
-        cx.notify(view_id);
+        // 只在悬停态**实际翻转**时通知宿主——连续/重复上报同值不白重建一帧
+        // （hover 通知命中范围收窄，视觉不变：高亮/弹簧仍按翻转起停）。
+        let changed = st.update(cx, |v, _| {
+            let old = *v;
+            *v = *h;
+            old != *h
+        });
+        if changed {
+            cx.notify(view_id);
+        }
     })
     .with_spring(
         spring_key,

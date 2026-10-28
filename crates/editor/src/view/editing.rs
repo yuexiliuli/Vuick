@@ -405,11 +405,23 @@ impl CodeEditor {
     /// 光标逻辑行 L 落在配对跨度 `(open_line, close_line]` 内即命中（点击点亮用）。
     /// 多对命中时取**最深**（`open_line` 最大的那个）——即光标所在的最内层块。
     pub(super) fn guide_pair_for_logical_row(&self, logical: usize) -> Option<usize> {
-        self.bracket_pairs
-            .iter()
-            .filter(|p| p.open_line < logical && logical <= p.close_line)
-            .map(|p| p.open_line)
-            .max()
+        // 配对表按 `open_line` 升序（`recompute_fold_brackets_full` / `refresh_fold_brackets`
+        // 两处落地排序）→ 先二分裁出候选前缀 `open_line < logical`；最内层包含 logical
+        // 的配对 = 前缀中 `close_line >= logical` 且 `open_line` 最大者。配对为规范嵌套
+        // （跨行括号可嵌套/并列，不交叉）→ 从右往左首个 `close_line >= logical` 即最深
+        // 包含（更左配对的 open_line 更小，不可能更深）。典型点击位于块体内 → 一次命中
+        // （O(log N) + O(1)）；仅当光标落在全部配对之后（本行无命中）才线性回扫兜底。
+        #[cfg(test)]
+        self.guide_scan_steps.set(0);
+        let i = self.bracket_pairs.partition_point(|p| p.open_line < logical);
+        for p in self.bracket_pairs[..i].iter().rev() {
+            #[cfg(test)]
+            self.guide_scan_steps.set(self.guide_scan_steps.get() + 1);
+            if p.close_line >= logical {
+                return Some(p.open_line);
+            }
+        }
+        None
     }
 
     /// 同 [`Self::bracket_guide_segments`]，但每个合并段额外带 `bool` = 该段是否命中

@@ -34,7 +34,10 @@ impl CodeEditor {
         }
     }
 
-    pub(super) fn on_blur(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 失焦前把最后未落地的拖点先落地（等价旧「逐事件同步更新」的选区结果），
+        // 再走统一拖选复位（见 [`Self::cancel_mouse_drag`]）。
+        self.flush_pending_drag(window, cx);
         self.focused = false;
         // 失焦 = 编辑器离开活动态：进行中的鼠标拖选失去意义，随生命周期一并复位。
         // 拖选只依赖「按下 → 移动」；松开/失焦/切走任一中断拖拽闭环都不能留
@@ -61,6 +64,12 @@ impl CodeEditor {
                 .unwrap_or(u128::MAX);
             if elapsed >= BLINK_PAUSE_MS as u128 {
                 let _ = this.update(cx, |this, cx| {
+                    // 失焦时光标本就不渲染（`caret_shown_now` 恒 false）→ 翻转不可见，
+                    // 跳过翻转与 notify（否则 500ms 一帧整树重建白耗，且拖选/悬停也不
+                    // 受影响）。重获焦点时 `on_focus` 已重置 `caret_visible=true`。
+                    if !this.focused {
+                        return;
+                    }
                     this.caret_visible = !this.caret_visible;
                     cx.notify();
                 });
@@ -122,6 +131,7 @@ impl CodeEditor {
             self.selection.remember_column(self.buffer.char_column(offset));
         }
         self.dragging = true;
+        self.pending_drag = None;
         self.kick_caret();
         self.reveal_caret_vertical();
         // 鼠标点击移动光标（宿主刷新状态栏光标行列等派生数据）。
@@ -129,7 +139,7 @@ impl CodeEditor {
         cx.notify();
     }
 
-    pub(super) fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.dragging {
             return;
         }
@@ -137,24 +147,46 @@ impl CodeEditor {
         // 量「拖选 → 落帧」逐帧感知延迟）。
         crate::prof::op_start("ed_drag");
         let local = event.position - self.element_bounds.origin;
+        // 帧级合并（B2）：只记**最新拖点**，本帧 `render` 开头 `flush_pending_drag`
+        // 统一换算/落地——鼠标事件可比帧快得多（高分屏/高速鼠标），不再逐事件重复
+        // offset 换算 + set_head + emit + notify。语义不变：拖选仍逐帧实时推进，且
+        // `on_mouse_up/up_out/blur` 会先把最后未落地的拖点落地再收尾（快速
+        // 「按下-移动-抬起」跨帧时也不会丢最后位置）。对齐 scrollbar
+        // `pending_target`→prepaint 落地先例。
+        self.pending_drag = Some(local);
+        cx.notify();
+    }
+
+    /// 拖选帧级合并落地（B2，每帧至多一次）：把 `on_mouse_move` 记下的最新拖点换算
+    /// 成选区头、刷新光标暂停/纵向滚动并广播选区变化（宿主状态栏 Ln/Col 逐帧跟随）。
+    /// 本帧 `render` 开头调用——落地发生在行构建**之前**，当帧即显示新选区。
+    pub(super) fn flush_pending_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(local) = self.pending_drag.take() else {
+            return;
+        };
+        #[cfg(test)]
+        self.drag_flush_calls.set(self.drag_flush_calls.get() + 1);
         let offset = self.offset_at_point(local, window);
         self.selection.set_head(offset);
         self.selection.remember_column(self.buffer.char_column(offset));
         self.kick_caret();
         self.reveal_caret_vertical();
-        // 拖拽扩选过程也实时刷新（状态栏选区头跟随鼠标）。
+        // 拖拽扩选过程实时刷新（状态栏选区头跟随鼠标）。
         cx.emit(EditorEvent::SelectionChanged);
-        cx.notify();
     }
 
-    pub(super) fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub(super) fn on_mouse_up(&mut self, _event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 帧级合并收尾：先把最后未渲染的拖点落地再结束拖选（否则快速
+        // 「按下-移动-抬起」跨帧时该次移动会被丢弃、选区停在按下点）。
+        self.flush_pending_drag(window, cx);
         self.cancel_mouse_drag();
     }
 
     /// 松开点落在元素 hitbox 外 / 顶层叠层 / 窗口外：元素级 `on_mouse_up`（受
     /// `hitbox.is_hovered` 门控）不会派发，本钩子在 Capture 阶段无条件收口拖选态
     /// （对齐本仓 scrollbar / video / image / wysiwyg 的 `on_mouse_up_out` 拖拽清态惯例）。
-    pub(super) fn on_mouse_up_out(&mut self, _event: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub(super) fn on_mouse_up_out(&mut self, _event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_pending_drag(window, cx);
         self.cancel_mouse_drag();
     }
 
@@ -172,5 +204,9 @@ impl CodeEditor {
     /// 残留，切回后仅移动鼠标就从 anchor 自动扩选。
     pub fn cancel_mouse_drag(&mut self) {
         self.dragging = false;
+        // 未落地的拖点一并丢弃：鼠标端点（up/up_out/blur）会先 `flush_pending_drag`
+        // 落地再调用本钩子；其余复位路径（整篇写回/隐藏/切离）丢弃拖点 = 不把旧文档
+        // 坐标的拖点应用到新内容（与旧「逐事件同步更新」的最终选区一致）。
+        self.pending_drag = None;
     }
 }

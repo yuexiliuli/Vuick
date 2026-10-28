@@ -115,6 +115,7 @@ impl EditorApp {
             session_slot_hashes: std::collections::HashMap::new(),
             session_last_manifest_digest: None,
             split_drag: None,
+            pending_split_ratio: None,
             splitter_hovered: false,
             sidebar: sidebar::SidebarChromeState {
                 open: true,

@@ -1408,6 +1408,126 @@ fn guide_click_highlights_pair_and_elsewhere_clears(cx: &mut TestAppContext) {
     assert_eq!(lit, None, "点顶层行 7 应清除点亮");
 }
 
+/// B1 回归：`guide_pair_for_logical_row` 由「整表线性扫」改为「二分 + 从右往左首个
+/// 命中」。① 大表（并列 fn 块 + 各嵌一层 if 块，open_line 单调、close_line 交错）上
+/// 逐逻辑行与线性参考口径**逐位一致**（语义不变）；② 块体内命中只回扫常数步
+/// （`guide_scan_steps` 探针）——不再整表扫（旧实现在 800+ 对上每行全扫）。
+#[gpui::test]
+fn guide_pair_binary_search_matches_linear_reference(cx: &mut TestAppContext) {
+    let mut text = String::new();
+    for i in 0..400u32 {
+        text.push_str(&format!("fn f{i}() {{\n    if x {{\n        y\n    }}\n}}\n"));
+    }
+    let (host, cx) = open(cx, &text);
+    let (pairs, max_row) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.read(cx);
+        let pairs = ed.test_bracket_pairs().to_vec();
+        let max_row = pairs
+            .iter()
+            .map(|p| p.close_line)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(3);
+        (pairs, max_row)
+    });
+    assert!(pairs.len() >= 400, "大表应生成 ≥400 跨行括号配对（实际 {}）", pairs.len());
+    // 线性参考 = 旧实现口径。
+    let linear = |logical: usize| -> Option<usize> {
+        pairs
+            .iter()
+            .filter(|p| p.open_line < logical && logical <= p.close_line)
+            .map(|p| p.open_line)
+            .max()
+    };
+    for logical in 0..=max_row {
+        let got = cx.update(|_, cx| {
+            let ed = host.read(cx).ed.read(cx);
+            ed.test_guide_for_logical_row(logical)
+        });
+        assert_eq!(got, linear(logical), "逻辑行 {logical} 命中应与线性参考一致");
+    }
+    // ② 块体内命中只回扫常数步（右边界前一个即命中），不再整表扫。
+    let steps_inside = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.read(cx);
+        let inner = ed.test_guide_for_logical_row(2); // 首个 fn 块的 if 体内 → 最内层 if 块
+        assert_eq!(inner, Some(1), "行 2 属 if 块（open_line=1），应点亮 open_line=1");
+        ed.test_guide_scan_steps()
+    });
+    assert!(steps_inside <= 2, "块体内命中应只回扫 O(1) 步（实际 {steps_inside}）");
+}
+
+/// B2 回归：拖选改「帧级合并」（`on_mouse_move` 只记最新拖点、每帧 `render` 开头
+/// `flush_pending_drag` 落地）后，选区语义与旧「逐事件同步更新」逐位一致——
+/// ① 逐帧拖到目标位的命中与**直接单击同点**一致；② 快速「连续移动 + 抬起」跨帧时，
+/// mouseup 落地最后一次拖点（不得停在按下点）。锚点 = 按下点（拖选应收敛为选区）。
+#[gpui::test]
+async fn drag_select_frame_coalesced_and_flushes_on_up(cx: &mut TestAppContext) {
+    let text = "line0\nline1\nline2\nline3\n";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    let (lh, gutter) = cx.update(|_, cx| {
+        let m = host.read(cx).ed.read(cx).test_metrics();
+        (m.1.max(1.), m.2)
+    });
+    let mods = Modifiers::default();
+    let row1_start = "line0\n".len();
+    let y = px(lh * 1.5);
+    let caret = cx.update(|_, cx| host.read(cx).ed.clone());
+    // 「真实字符边界 → 命中 offset」参考：直接单击同点，取光标落位（head）。
+    // （不硬编码 col 映射：命中/边界语义由既有 `mouse_click_lands_on_ascii_char_*`
+    // 提测，这里只断言「拖选结果 == 直接点击结果」。）
+    let click_head = |cx: &mut VisualTestContext, col: usize| -> usize {
+        let x = cx.update(|window, cx| {
+            px(gutter + caret.read(cx).test_char_boundary_x(window, 1, col))
+        });
+        cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+        cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+        cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+        settle(cx);
+        editor_selection(&host, cx).head()
+    };
+    let x_down = cx.update(|window, cx| {
+        px(gutter + caret.read(cx).test_char_boundary_x(window, 1, 2))
+    });
+    let x_a = cx.update(|window, cx| {
+        px(gutter + caret.read(cx).test_char_boundary_x(window, 1, 4))
+    });
+    let x_c = cx.update(|window, cx| {
+        px(gutter + caret.read(cx).test_char_boundary_x(window, 1, 12.min(5)))
+    });
+    let ref_a = click_head(cx, 4);
+    let ref_c = click_head(cx, 12.min(5));
+    // 按下于第 1 行 col=2（行首偏 2 字），开始拖选。
+    {
+        let x = x_down;
+        cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+        cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+        settle(cx);
+    }
+    // ① 逐帧拖到 x_a → 选区头随帧落下，等于单击同点的命中。
+    cx.simulate_mouse_move(point(x_a, y), MouseButton::Left, mods);
+    settle(cx);
+    let mid = editor_selection(&host, cx);
+    assert_eq!(mid.head(), ref_a, "拖到该点 → 选区头应等于单击同点命中");
+    assert!(!mid.is_collapsed(), "拖选进行中应收敛为选区");
+    assert_eq!(mid.anchor(), row1_start + 2, "锚点 = 按下点不应漂移");
+    // ② 跨帧收尾：连续两次快速移动 + 抬起（中间不落帧）→ mouseup 落地最后一次。
+    let x_b = cx.update(|window, cx| {
+        px(gutter + caret.read(cx).test_char_boundary_x(window, 1, 8))
+    });
+    cx.simulate_mouse_move(point(x_b, y), MouseButton::Left, mods);
+    cx.simulate_mouse_move(point(x_c, y), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x_c, y), MouseButton::Left, mods);
+    settle(cx);
+    let sel = editor_selection(&host, cx);
+    assert_eq!(
+        sel.head(),
+        ref_c,
+        "mouseup 应落地最后一次拖点（否则选区停在按下点 = 回归）"
+    );
+    assert!(!sel.is_collapsed(), "拖选应收敛为选区（anchor≠head）");
+}
+
 #[gpui::test]
 fn mouse_click_lands_on_ascii_char_boundaries(cx: &mut TestAppContext) {
     // 回归护栏：等宽 ASCII 命中测试在接入真实行布局后仍应精确落在字符边界。

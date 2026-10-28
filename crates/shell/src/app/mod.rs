@@ -499,6 +499,10 @@ pub struct EditorApp {
     session_last_manifest_digest: Option<u64>,
     /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`
     split_drag: Option<(f32, f32)>,
+    /// 拖分割条帧级合并（B4）：`on_mouse_move` 只记**最新目标比例**，本帧 `render`
+    /// 开头统一落地到 `split_ratio`（对齐 scrollbar `pending_target`→prepaint 先例）。
+    /// 语义不变：分割条拖动仍实时跟手（每帧一落），只合并 notify 频率。
+    pending_split_ratio: Option<f32>,
     /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）
     splitter_hovered: bool,
     /// 侧边栏「外壳」状态：可见性 / 视图 / 目录折叠 / 宽度与右缘拖拽
