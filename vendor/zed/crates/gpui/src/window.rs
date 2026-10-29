@@ -5268,7 +5268,15 @@ impl Window {
             Some([r, g, b]) => [to_float(r), to_float(g), to_float(b), 0.0],
             None => [0.0; 4],
         };
-        let switches = [if recolor.ink.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0];
+        // switches.x = ink 是否启用；switches.y = 曲线策略（1=FullBand 全带单调、0=ContentProtect
+        // 双带）——由片元着色器 `recolor_sprite_fragment` 读取分支（与 CPU `apply_recolor_with_curve`
+        // 同策）。z/w 保留。
+        let switches = [
+            if recolor.ink.is_some() { 1.0 } else { 0.0 },
+            if recolor.curve == 1 { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
+        ];
 
         self.next_frame.scene.insert_primitive(RecolorSprite {
             order: 0,

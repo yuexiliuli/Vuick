@@ -1288,10 +1288,10 @@ struct RecolorSprite {
     Bounds content_mask;
     Corners corner_radii;
     AtlasTile tile;
-    // 纸/墨双带重着色参数（与 CPU apply_recolor 同语义；阈值为编译期常量，见片元）。
+    // 纸/墨重着色参数（与 CPU apply_recolor_with_curve 同策；阈值为编译期常量，见片元）。
     float4 bg;        // RGB = 纸色（0..1）；第 4 分量保留。
     float4 ink;       // RGB = 墨色（0..1）；第 4 分量保留。
-    float4 switches;  // x = ink 是否启用（1.0/0.0）。
+    float4 switches;  // x = ink 是否启用（1.0/0.0）；y = 曲线策略（1=FullBand、0=ContentProtect）。
 };
 
 struct RecolorSpriteVertexOutput {
@@ -1336,20 +1336,30 @@ float4 recolor_sprite_fragment(RecolorSpriteFragmentInput input): SV_Target {
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }
-    // 纸/墨双带重着色（与 pdf::recolor::apply_recolor 同语义）：
-    //   luma = 感知亮度 = 0.299R + 0.587G + 0.114B（与 CPU 整数 LUT 索引同权重）;
-    //   纸带 weight = clamp((luma - PAPER_L_LO)/(1 - PAPER_L_LO), 0, 1)，PAPER_L_LO=0.90;
-    //   墨带 weight = 1 - clamp(luma / INK_L_HI, 0, 1)，INK_L_HI=0.50（带界一阶连续）;
-    //   中间调（0.50..0.90）原样不动；ink 未启用（switches.x==0）只染纸面。
-    // CPU 侧取整数亮度作 LUT 索引、GPU 侧连续亮度，灰度像素逐位一致、彩色像素允许
-    // ±1/255 通道舍入差——「同语义」非「逐位一致」（T4 简版：真机复核视觉等价）。
+    // 纸/墨重着色（与 pdf::recolor::apply_recolor_with_curve 同策）：
+    //   luma = 感知亮度 = 0.299R + 0.587G + 0.114B（与 CPU 整数 LUT 索引同权重）。
+    //   switches.y = 曲线策略（1 = FullBand 全带单调、0 = ContentProtect 双带）：
+    //   - FullBand（且 ink 启用）：out = bg + (ink-bg)*(1-luma)——整段亮度单调映射，
+    //     纯黑→墨色、纯白→纸色、中间灰平滑插值，无“原样保留”平台（CPU FULLBAND_WEIGHT_LUT）。
+    //   - ContentProtect：纸带 clamp((luma-0.90)/0.10,0,1) → 纸色，墨带
+    //     1 - clamp(luma/0.50,0,1)（带界一阶连续）→ 墨色，中间调（0.50..0.90）原样。
+    //   ink 未启用（switches.x==0）两策略都只染纸面。CPU 侧取整数亮度作 LUT 索引、GPU 侧
+    //   连续亮度，灰度像素逐位一致、彩色像素允许 ±1/255 通道舍入差（「同策」非「逐位一致」）。
     float3 orig = color.rgb;
     float luma = dot(orig, float3(0.299f, 0.587f, 0.114f));
-    float paper_w = saturate((luma - 0.90f) / (1.0f - 0.90f));
-    float3 shaded = orig + (sprite.bg.rgb - orig) * paper_w;
-    if (sprite.switches.x != 0.0f) {
-        float ink_w = 1.0f - saturate(luma / 0.50f);
-        shaded = shaded + (sprite.ink.rgb - shaded) * ink_w;
+    float3 shaded = orig;
+    if (sprite.switches.y != 0.0f && sprite.switches.x != 0.0f) {
+        // FullBand（全带单调）：不读原色，整段亮度重映射到纸↔墨轴。
+        float fb = 1.0f - saturate(luma);
+        shaded = sprite.bg.rgb + (sprite.ink.rgb - sprite.bg.rgb) * fb;
+    } else {
+        // ContentProtect（双带）：纸带 + （ink 时）墨带，中间带原样。
+        float paper_w = saturate((luma - 0.90f) / (1.0f - 0.90f));
+        shaded = orig + (sprite.bg.rgb - orig) * paper_w;
+        if (sprite.switches.x != 0.0f) {
+            float ink_w = 1.0f - saturate(luma / 0.50f);
+            shaded = shaded + (sprite.ink.rgb - shaded) * ink_w;
+        }
     }
     color.rgb = shaded;
     color.a *= sprite.opacity * saturate(0.5 - distance);

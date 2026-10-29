@@ -1141,8 +1141,13 @@ impl DirectXResources {
 
 /// T4 GPU 重着色真机诊断门（与 `pdf::recolor` 的 `GPUI_PDF_GPU_RECOLOR` 判定同语义；
 /// gpui_windows 不依赖 pdf crate，这里直接读环境变量——env 在进程启动前已定，安全）。
+/// 与 pdf 侧一致：**生产默认开**（缺省 = 开），显式 `"0"` / 空串 = 关（强制回 CPU）。
+/// 仅控制「recolor 管线就绪」诊断的打印，不影响任何行为。
 fn gpu_recolor_diag_gate() -> bool {
-    std::env::var_os("GPUI_PDF_GPU_RECOLOR").is_some_and(|v| !v.is_empty() && v != "0")
+    match std::env::var_os("GPUI_PDF_GPU_RECOLOR") {
+        None => true,
+        Some(v) => !(v.is_empty() || v == "0"),
+    }
 }
 
 impl DirectXRenderPipelines {

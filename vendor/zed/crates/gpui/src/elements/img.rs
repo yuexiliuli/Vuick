@@ -128,15 +128,19 @@ where
 /// 图片元素级**纸墨重着色参数**（T4 GPU 重着色通道）：`bg` = 纸色（近白纸面像素映射
 /// 至此）、`ink` = 墨色（`Some` 时把近黑墨迹像素提亮至此，深色档用；`None` = 只染纸面）。
 /// R/G/B 0..=255。与 pdf crate 的 `RecolorParams` 同语义——由 `img().recolor(...)` 携带，
-/// 经 `Window::paint_image_recolor` 传给片元着色器在**绘制时**完成双带映射
-///（纸带 L≥0.90 → 纸色、墨带 L≤0.50 → 墨色、中间调原样），worker 不再对显示路径做
-/// CPU 逐像素着色。`None`（默认）走既有 `paint_image`/`PolychromeSprite` 路径，逐字节不变。
+/// 经 `Window::paint_image_recolor` 传给片元着色器在**绘制时**完成重着色（映射策略见
+/// `curve`）、worker 不再对显示路径做 CPU 逐像素着色。`None`（默认）走既有
+/// `paint_image`/`PolychromeSprite` 路径，逐字节不变。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageRecolor {
     /// 纸色（R/G/B，0..=255）。
     pub bg: [u8; 3],
     /// 墨色（R/G/B，0..=255）；`Some` 时把近黑墨迹像素提亮至此色。
     pub ink: Option<[u8; 3]>,
+    /// 曲线策略（进程级 latch 由 pdf crate 填充）：`0` = ContentProtect（纸/墨双带、
+    /// 中间调原样）、`1` = FullBand（整段亮度单调映射，默认）。经
+    /// `RecolorSprite.switches.y` 进入片元着色器分支；同 CPU `apply_recolor_with_curve`。
+    pub curve: u32,
 }
 
 /// The style of an image element.

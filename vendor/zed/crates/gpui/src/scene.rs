@@ -877,7 +877,8 @@ pub struct RecolorSprite {
     pub bg: [f32; 4],
     /// 墨色（RGB 0..=255 → f32 0..=1）；第 4 分量对齐保留。
     pub ink: [f32; 4],
-    /// `x` = ink 是否启用（1.0/0.0），其余保留。
+    /// `x` = ink 是否启用（1.0/0.0）；`y` = 曲线策略（1.0 = FullBand 全带单调、0.0 =
+    /// ContentProtect 双带），片元着色器据此分支；z/w 保留。
     pub switches: [f32; 4],
 }
 
