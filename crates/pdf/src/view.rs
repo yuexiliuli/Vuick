@@ -60,6 +60,7 @@ use gpui::{
 use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 use crate::recolor::RecolorParams;
+use crate::pdf::parser::RawKind;
 
 /// 在途瓦片请求记录：`(派发时密度 scale, 结果通道)`。
 pub(crate) type PendingTileEntry = (f32, mpsc::Receiver<Option<TileResult>>);
@@ -159,7 +160,7 @@ use crate::pdf::layout::{
 use crate::pdf::{
     render_image_from_bgra, AnnotKind, AnnotateItem, AnnotationInfo, DocId, PageText,
     PdfImageBox, PdfImagePixels, PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfWorker,
-    QuadPt, RenderRequest, RenderResult, TileRequest, TileResult,
+    QuadPt, RecolorEntry, RenderRequest, RenderResult, TileRequest, TileResult,
 };
 use viewer::pan_zoom;
 /// 是否开启视图侧计时日志（`GPUI_EDITOR_PDF_TIMING=1`，进程内缓存一次）。
@@ -225,6 +226,13 @@ pub struct PdfViewer {
     pub(crate) pending_tiles: HashMap<(usize, u32, u32), PendingTileEntry>,
     /// 在途**封面**（首屏整页锐化）请求：`页` → (密度 scale, 结果通道)。
     pub(crate) pending_cover: HashMap<usize, (f32, mpsc::Receiver<Option<RenderResult>>)>,
+    /// 在途**重着色刷新**结果接收通道（`set_recolor` 时向 worker 请求）：worker 把已缓存
+    /// 原图现算新着色副本逐条回传，本通道 drain 完（断开）即清。驱动一次「切档不重栅」
+    /// 的显示刷新；非 None 期间自刷新泵持续出帧直到收完（防晚到结果无帧可收集）。
+    pub(crate) pending_recolor: Option<mpsc::Receiver<RecolorEntry>>,
+    /// 本阅读器累计向 worker 派发的**栅格类请求数**（Render/RenderTile/Mid/Thumb）。
+    /// 纯回归计数（无副作用）：`切档不重栅`测试断言「重着色切换前后该计数不变」。
+    pub(crate) raster_reqs: u64,
     /// 当前已驻留瓦片的估算字节（近似 RGBA 内存；淘汰时重算自愈漂移）。
     pub(crate) tile_bytes: u64,
     /// 瓦片自刷新泵是否在途：派发瓦片后若无用户输入就不会再有重绘，而瓦片结果要等
@@ -374,6 +382,8 @@ mod tests {
                     mid_lru: VecDeque::new(),
                     pending_tiles: HashMap::new(),
                     pending_cover: HashMap::new(),
+                    pending_recolor: None,
+                    raster_reqs: 0,
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
@@ -569,6 +579,8 @@ mod tests {
                     mid_lru: VecDeque::new(),
                     pending_tiles: HashMap::new(),
                     pending_cover: HashMap::new(),
+                    pending_recolor: None,
+                    raster_reqs: 0,
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
@@ -654,10 +666,14 @@ mod tests {
         });
     }
 
-    /// R6：view 重着色状态与一次性失效（worker 未就绪路径：`set_recolor` 更新状态、发
-    /// 不出消息也不 panic；同参短值为空操作；变更/清除都重置调度门控 → 下一帧重排重渲）。
+    /// R6：view 重着色状态与「切档不重栅」语义（worker 未就绪路径：`set_recolor` 更新
+    /// 状态、发不出消息也不 panic；同参短值为空操作；变更仍复位门控触发一帧收集/重绘，
+    /// 但**不失效缓存、不停泵**——重着色刷新由 worker 对缓存原图现算回传，不再清槽重栅）。
+    /// 【决策留痕：切档不再重栅】旧语义断言"变更应重置门控（下一帧重排重渲）+ 停泵"；
+    /// 新语义：清槽/停泵已由「worker 重着色刷新」取代，泵运行中的在途瓦片结果仍有效，
+    /// 不应被停。
     #[gpui::test]
-    async fn recolor_setter_updates_state_and_invalidates_without_worker(cx: &mut TestAppContext) {
+    async fn recolor_setter_updates_state_without_reraster(cx: &mut TestAppContext) {
         cx.update(|app| {
             let _viewer = app.new(|cx| {
                 let dims = vec![(612.0, 792.0)];
@@ -675,6 +691,8 @@ mod tests {
                     mid_lru: VecDeque::new(),
                     pending_tiles: HashMap::new(),
                     pending_cover: HashMap::new(),
+                    pending_recolor: None,
+                    raster_reqs: 0,
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
@@ -722,29 +740,32 @@ mod tests {
                     pan_origin: gpui::point(px(0.), px(0.)),
                     pan_offset0: gpui::point(px(0.), px(0.)),
                 };
-                // 先给出「静置已确认」状态，验证变更会重置它（触发重排重渲）。
+                // 先给出「静置已确认」状态，验证变更会复位它（触发一帧收集重着色结果并重绘），
+                // 而**不**清缓存/不停泵（切档不重栅：泵里在途瓦片结果仍有效、须继续收集）。
                 v.window_sig = Some(WindowSig::default());
                 v.window_settled = true;
                 v.tile_pump_running = true;
 
-                let p = RecolorParams { bg: [0x20, 0x20, 0x20] };
+                let p = RecolorParams { bg: [0x20, 0x20, 0x20], ink: None };
                 v.set_recolor(Some(p), cx);
                 assert_eq!(v.recolor, Some(p), "重着色状态应更新（存到 view 侧）");
-                assert_eq!(v.window_sig, None, "变更应重置门控（下一帧重排重渲）");
-                assert!(!v.window_settled, "变更应重置静置确认");
-                assert!(!v.tile_pump_running, "变更应停泵（重派）");
+                assert_eq!(v.window_sig, None, "变更应复位门控（触发一帧收集+重绘）");
+                assert!(!v.window_settled, "变更应复位静置确认");
+                assert!(v.tile_pump_running, "切档不重栅：不应停泵（在途瓦片结果仍有效）");
+                assert!(v.pending_recolor.is_none(), "无 worker 时不发刷新请求、不 panic");
 
-                // 同参短值：不动已确认门控（避免重复全量重渲）。
+                // 同参短值：不动已确认门控（避免重复刷新）。
                 v.window_sig = Some(WindowSig::default());
                 v.window_settled = true;
                 v.set_recolor(Some(p), cx);
                 assert_eq!(v.window_sig, Some(WindowSig::default()), "同参应短路、不失效");
                 assert!(v.window_settled, "同参应短路、不重置静置");
 
-                // 回 None（默认直通）→ 清状态 + 重置门控。
+                // 回 None（默认直通）→ 清状态 + 复位门控（同样不重栅、不停泵）。
                 v.set_recolor(None, cx);
                 assert_eq!(v.recolor, None, "默认档应清除重着色");
-                assert_eq!(v.window_sig, None, "清除同样重置门控");
+                assert_eq!(v.window_sig, None, "清除同样复位门控");
+                assert!(v.tile_pump_running, "回默认同样不停泵");
                 v
             });
         });

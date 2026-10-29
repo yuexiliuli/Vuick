@@ -34,7 +34,8 @@ mod view;
 pub use parser::{
     AnnotKind, AnnotateItem, AnnotationInfo, DocId, MemOpResult, PageText, PdfImageBox,
     PdfImagePixels, PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfTextChar, PdfWorker,
-    QuadPt, RenderRequest, RenderResult, TileRequest, TileResult, is_writeback_busy_error,
+    QuadPt, RecolorEntry, RenderRequest, RenderResult, TileRequest, TileResult,
+    is_writeback_busy_error,
 };
 pub use recolor::{RecolorParams, apply_recolor};
 pub use view::PdfViewer;
@@ -2629,6 +2630,308 @@ mod tests {
             mids,
             thumbs,
             est / 1024 / 1024,
+        );
+    }
+
+    /// 回归（**切档不重栅计数**，真实渲染路径 + 真夹具）：切换夜间档/回默认档后，本阅读器
+    /// 派发的**栅格类请求**（`Render/RenderTile/Mid/Thumb`，即 worker 收到的栅格命令）必须
+    /// 为 0——旧语义清缓存重派导致的 pdfium 全量重栅（夜间档加载慢根因）被根治，只剩下
+    /// 「worker 对缓存原图现算重着色副本」的中继（`pending_recolor` drain 回发即证：有副本
+    /// 回传才会清空到断开）。另断言切档不失效缓存槽（瓦片字节不变）、在位封面/瓦片位图的
+    /// Arc 身份被新着色副本替换（重着色真的替换了显示位图）。与 `parser` 侧纯函数测试
+    /// `recolor_refresh_recolors_cached_raw_and_keeps_raw`（重着色内核正确、raw 单真值不变）
+    /// 组合成 headless 证据链：0 栅格 + 内核正确 + 位图被替换。
+    #[gpui::test]
+    async fn recolor_switch_sends_zero_raster_commands(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+
+        // 首屏停稳：无在途瓦片/封面/泵 → 缓存齐全（worker 侧原图也随栅格化入缓存）。
+        // worker 是真线程：每轮真实 sleep 让它在 test-dispatcher 之外有机会处理栅格请求。
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty()
+                    && v.pending_cover.is_empty()
+                    && v.pending_mid.is_empty()
+                    && v.pending_thumb.is_empty()
+                    && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+
+        // 切档前快照：栅格请求计数、瓦片字节、第 0 槽封面/瓦片位图的 Arc 身份。
+        let (req0, bytes0, cover0, tiles0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let cover_ptr = v.slots.first().and_then(|s| {
+                s.cover.as_ref().map(|c| std::sync::Arc::as_ptr(c) as usize)
+            });
+            let tile_ptrs: Vec<usize> = v
+                .slots
+                .first()
+                .map(|s| {
+                    s.tiles
+                        .values()
+                        .map(|t| std::sync::Arc::as_ptr(&t.image) as usize)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (v.raster_reqs, v.tile_bytes, cover_ptr, tile_ptrs)
+        });
+        assert!(
+            cover0.is_some() || !tiles0.is_empty(),
+            "停稳后第 0 页应有在位封面或瓦片（渲染已落地）"
+        );
+
+        // 切到夜间档。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_recolor(
+                    Some(RecolorParams {
+                        bg: [0x20, 0x20, 0x20],
+                        ink: Some([0xD8, 0xD8, 0xD8]),
+                    }),
+                    cx,
+                );
+            });
+        });
+        // 泵/帧推进到「重着色刷新 drain 完（断开）且再停稳」。
+        let mut drained = false;
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            drained = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_recolor.is_none()
+                    && v.pending_tiles.is_empty()
+                    && v.pending_cover.is_empty()
+                    && !v.tile_pump_running
+            });
+            if drained {
+                break;
+            }
+        }
+        assert!(drained, "切档后重着色刷新应收完（worker 有缓存原图可回传）");
+        let (req1, bytes1, cover1, tiles1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let cover_ptr = v.slots.first().and_then(|s| {
+                s.cover.as_ref().map(|c| std::sync::Arc::as_ptr(c) as usize)
+            });
+            let tile_ptrs: Vec<usize> = v
+                .slots
+                .first()
+                .map(|s| {
+                    s.tiles
+                        .values()
+                        .map(|t| std::sync::Arc::as_ptr(&t.image) as usize)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (v.raster_reqs, v.tile_bytes, cover_ptr, tile_ptrs)
+        });
+        assert_eq!(req1, req0, "切档后 worker 应收到 0 条新栅格命令（Render/RenderTile/Mid/Thumb）");
+        assert_eq!(bytes1, bytes0, "切档不失效缓存槽：瓦片字节应保持不变");
+        assert!(cover1.is_some() || !tiles1.is_empty(), "切档后内容仍在（未清槽）");
+        let image_replaced = cover0.map_or(false, |p| cover1 != Some(p))
+            || tiles0.iter().any(|p| !tiles1.contains(p));
+        assert!(image_replaced, "到位位图应被新着色副本替换（Arc 身份变化）");
+        let recolor_ok = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).recolor()
+        });
+        assert_eq!(
+            recolor_ok,
+            Some(RecolorParams {
+                bg: [0x20, 0x20, 0x20],
+                ink: Some([0xD8, 0xD8, 0xD8]),
+            }),
+            "夜间参数应落地 view 状态"
+        );
+
+        // 切回默认（None）：同样 0 新栅格。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_recolor(None, cx);
+            });
+        });
+        let mut drained2 = false;
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            drained2 = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_recolor.is_none() && !v.tile_pump_running
+            });
+            if drained2 {
+                break;
+            }
+        }
+        assert!(drained2, "切回默认档重着色刷新应收完");
+        let (req2, _bytes2, _cover2, _tiles2) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let cover_ptr = v.slots.first().and_then(|s| {
+                s.cover.as_ref().map(|c| std::sync::Arc::as_ptr(c) as usize)
+            });
+            let tile_ptrs: Vec<usize> = v
+                .slots
+                .first()
+                .map(|s| {
+                    s.tiles
+                        .values()
+                        .map(|t| std::sync::Arc::as_ptr(&t.image) as usize)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (v.raster_reqs, v.tile_bytes, cover_ptr, tile_ptrs)
+        });
+        assert_eq!(req2, req0, "切回默认档同样应收到 0 条新栅格命令");
+        let recolor_back = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).recolor()
+        });
+        assert_eq!(recolor_back, None, "默认档应清回直通");
+    }
+
+    /// 时空基准（切档不重栅墙钟，真实渲染路径 + 真夹具）：测量「首屏停稳 → 切夜间 →
+    /// 重着色刷新收完」的墙钟与栅格请求增量。用法：修复前（旧清槽重栅）跑一次记录，修复后
+    /// 再跑对比——夜间档切档墙钟应显著下降（重栅数百 ms → 重着色刷新数 ms~几十 ms），
+    /// 且 `raster_delta` 为 0。手动 `--ignored` 跑（与 `bench_full_scroll_time_memory` 同步调）。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_recolor_switch_wallclock(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let req0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).raster_reqs);
+        let t0 = Instant::now();
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_recolor(
+                    Some(RecolorParams {
+                        bg: [0x20, 0x20, 0x20],
+                        ink: Some([0xD8, 0xD8, 0xD8]),
+                    }),
+                    cx,
+                );
+            });
+        });
+        let mut drained = false;
+        let mut raster_delta = 0u64;
+        for _ in 0..800 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            let (rc, pr) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.raster_reqs, v.pending_recolor.is_none())
+            });
+            raster_delta = rc.saturating_sub(req0);
+            if pr && raster_delta == 0 {
+                drained = true;
+                break;
+            }
+        }
+        let switch_ms = t0.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "[BENCH-RECOLOR] 切夜间档 重着色刷新收完 switch_ms={:.0}ms raster_delta={raster_delta} drained={drained}",
+            switch_ms
         );
     }
 

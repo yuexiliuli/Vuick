@@ -158,11 +158,11 @@ async fn pdf_bg_preset_flyout_click_applies_and_default_resets(cx: &mut TestAppC
         "夜间预设应立即落到画布"
     );
     assert_eq!(bg_pref(&app, cx), PdfBgPref::Night, "偏好应记夜间档");
-    // R6-3：纸色重着色参数（纸 #202020，内容像素不变）落地到页面位图显示层。
+    // R6-3：纸墨重着色参数（纸 #202020 + 墨色提亮 #D8D8D8，内容中间调不动）落地到位图显示层。
     assert_eq!(
         pdf.read_with(cx, |v, _| v.recolor()),
-        Some(pdf::RecolorParams { bg: [0x20, 0x20, 0x20] }),
-        "夜间预设应落地纸色重着色参数"
+        Some(pdf::RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) }),
+        "夜间预设应落地纸色+墨迹提亮参数"
     );
     assert!(cx.debug_bounds("pdf-menu-bg-night").is_some(), "keep_open：次级应保持展开");
     assert!(cx.debug_bounds("pdf-menu-bg-color").is_some(), "keep_open：父菜单应保持展开");
@@ -206,7 +206,7 @@ async fn pdf_bg_explicit_survives_theme_switch_but_default_follows(cx: &mut Test
     cx.update(|_w, cx| {
         app.update(cx, |a, cx| a.set_pdf_bg(PdfBgPref::Night, None, cx));
     });
-    let night_params = pdf::RecolorParams { bg: [0x20, 0x20, 0x20] };
+    let night_params = pdf::RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
     assert_eq!(pdf.read_with(cx, |v, _| v.background()), Some(gpui::rgb(0x20_20_20).into()));
     assert_eq!(pdf.read_with(cx, |v, _| v.recolor()), Some(night_params));
     // 切主题 → 显式色不被覆盖（画布与重着色均保持）。

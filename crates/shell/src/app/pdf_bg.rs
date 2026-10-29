@@ -23,6 +23,17 @@ pub(super) fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
     Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
 }
 
+/// 深色档墨迹色（浅灰，R/G/B）：夜间/自定义深色画布下文字提亮至此——略柔的浅灰，
+/// 在 #202020 类深底上对比充足（≈11:1）又不刺眼（如需改白字，只动此常量）。
+const DARK_INK: [u8; 3] = [0xD8, 0xD8, 0xD8];
+
+/// 画布色「深色」判定（感知亮度 < 0.5 → 深色）：深色画布配浅墨迹（`DARK_INK`）保证
+/// 文字可读；浅色画布（护眼/羊皮纸/浅色自定义）只染纸面、内容直通。
+fn is_dark_bg(rgb: [u8; 3]) -> bool {
+    let [r, g, b] = rgb;
+    (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0 < 0.5
+}
+
 /// 解析 `#rrggbb` → `Hsla`（画布底色，`alpha=1`）。与 config crate 的存储校验同一套
 /// hex 语法，double 兜底。
 pub(super) fn parse_hex_hsla(s: &str) -> Option<gpui::Hsla> {
@@ -43,20 +54,23 @@ impl EditorApp {
         }
     }
 
-    /// 当前**页面位图显示层纸色重着色**参数（R4）：`None` = 直通（默认档）。
-    /// 只含纸色（`pdf::RecolorParams { bg }`，内容像素由重着色函数保证不变）。
-    /// 深色档画布同步纸色（夜间 canvas=bg=#202020，避免白边）；护眼/羊皮纸同理。
+    /// 当前**页面位图显示层纸墨重着色**参数（R4）：`None` = 直通（默认档）。
+    /// 深色档（夜间/自定义深色）画布同步纸色，并**同时提亮墨迹**（`ink`）：浅纸上的
+    /// 黑字若只改纸面会变成「黑字黑底 + 浅灰描边」不可读（用户复报），须把近黑墨迹
+    /// 一并映射为浅色（只动近黑像素，图片/中间调内容不动，见 `pdf::recolor`）；
+    /// 浅色档（护眼/羊皮纸/浅色自定义）只染纸面、内容直通（既有行为）。
     pub(super) fn pdf_canvas_recolor(&self) -> Option<pdf::RecolorParams> {
+        let dark_ink = is_dark_bg;
         match self.pdf_bg {
             PdfBgPref::Default => None,
-            PdfBgPref::Night => Some(pdf::RecolorParams { bg: [0x20, 0x20, 0x20] }),
-            PdfBgPref::Eye => Some(pdf::RecolorParams { bg: [0xC7, 0xED, 0xCC] }),
-            PdfBgPref::Parchment => Some(pdf::RecolorParams { bg: [0xFB, 0xF0, 0xD9] }),
+            PdfBgPref::Night => Some(pdf::RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some(DARK_INK) }),
+            PdfBgPref::Eye => Some(pdf::RecolorParams { bg: [0xC7, 0xED, 0xCC], ink: None }),
+            PdfBgPref::Parchment => Some(pdf::RecolorParams { bg: [0xFB, 0xF0, 0xD9], ink: None }),
             PdfBgPref::Custom => self
                 .pdf_bg_custom
                 .as_deref()
                 .and_then(parse_hex_rgb)
-                .map(|bg| pdf::RecolorParams { bg }),
+                .map(|bg| pdf::RecolorParams { bg, ink: dark_ink(bg).then_some(DARK_INK) }),
         }
     }
 

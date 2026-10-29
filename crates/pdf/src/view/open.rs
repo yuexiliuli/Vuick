@@ -28,6 +28,8 @@ impl PdfViewer {
             mid_lru: VecDeque::new(),
             pending_tiles: HashMap::new(),
             pending_cover: HashMap::new(),
+            pending_recolor: None,
+            raster_reqs: 0,
             tile_bytes: 0,
             tile_pump_running: false,
             last_scroll_y: 0.0,
@@ -248,66 +250,35 @@ impl PdfViewer {
     }
 
     /// 设置**页面位图显示层**纸墨重着色（`None` = 直通无重着色；只改显示像素、绝不写回
-    /// 文件）。`Some`：本阅读器重着色状态更新，并把新参数推给 worker（受它之后所有
-    /// 栅格化输出沿用）；随后**一次性失效全部已渲缓存**并重置调度门控 → 下一帧按新
-    /// 参数重排可见区重渲。短值同参 → 空操作（避免重复全量重渲）。
+    /// 文件）。`Some`：本阅读器重着色状态更新，并把新参数推给 worker（顺带请求一次
+    /// **重着色刷新**），随后触发一帧重渲。
+    ///
+    /// 【切档不重栅决策留痕：取代旧 `invalidate_recolored_caches` 全量重栅路径】
+    /// 旧语义：变更 → 清全窗页槽缓存 + 重置门控 → 下一帧按新参数重派 → worker 重调 pdfium
+    /// 全量重栅（夜间档加载慢的根因）。新语义：worker 缓存**未着色原图**，本方法只把新参数
+    /// 推给 worker 并对已缓存原图现算新着色副本回传——**不失效缓存槽、不重置调度门控、
+    /// 不重调 pdfium 栅格**；`window_sig`/`window_settled` 仅作「触发一帧调度来收集重着色
+    /// 结果并重绘」的复位（调度因 view 缓存命中而不再派新栅格请求）。同参短值 → 空操作。
     pub fn set_recolor(&mut self, recolor: Option<RecolorParams>, cx: &mut Context<Self>) {
         if self.recolor == recolor {
             return;
         }
         self.recolor = recolor;
         if let Some(w) = self.worker.as_ref() {
-            // 按本文档键控（worker 侧 `SetRecolor(DocId, …)`，多窗口互不干扰）。
-            w.set_recolor(self.doc_id, recolor);
+            // 按本文档键控（worker 侧 `SetRecolor(DocId, …)`，多窗口互不干扰）：
+            // 更新参数 + 请求重着色刷新（worker 对缓存原图重跑内核、回传新着色副本）。
+            self.pending_recolor = Some(w.set_recolor_refresh(self.doc_id, recolor));
         }
-        // 取消在途 + 清已渲缓存（coverage：瓦片/封面/中清/缩略全部失效）→ 重集中。
-        self.invalidate_recolored_caches();
+        // 旧的「清槽重栅失效」已由「重着色刷新」取代（见上方决策留痕）：只复位门控，让
+        // 下一帧走一次调度来收集回传结果并重绘；不碰 slots / pending / 在途请求。
+        self.window_sig = None;
+        self.window_settled = false;
         cx.notify();
     }
 
     /// 当前纸墨重着色参数（`None` = 直通）。测试 / shell 断言用。
     pub fn recolor(&self) -> Option<RecolorParams> {
         self.recolor
-    }
-
-    /// 重着色变更后的**一次性缓存失效**：取消全部在途瓦片/封面/中清/缩略请求（收件箱
-    /// 作废——在途结果不再入缓存；worker 侧因 `SetRecolor` 先行、新派请求已按新参数
-    /// 渲染），把每个页槽已渲图片（瓦片/封面/旧封面/中清/缩略）移入 `pending_drops`
-    /// 下一帧 `drop_image` 显式下线，重置调度门控 → 下一帧 `ensure_window` 按新参数
-    /// 重派渲染。成本与缩放/重载同级的一次性全量重渲，不引入滚动重复重渲。
-    /// 「页位图像素重着色」本就影响每一页，故清全窗页槽（非仅可见页）。
-    pub(super) fn invalidate_recolored_caches(&mut self) {
-        self.pending_tiles.clear();
-        self.pending_cover.clear();
-        self.pending_mid.clear();
-        self.pending_thumb.clear();
-        self.mid_lru.clear();
-        self.tile_bytes = 0;
-        for slot in self.slots.iter_mut() {
-            if let Some(arc) = slot.cover.take() {
-                self.pending_drops.push(arc);
-            }
-            if let Some(arc) = slot.prev_cover.take() {
-                self.pending_drops.push(arc);
-            }
-            if let Some(arc) = slot.thumb.take() {
-                self.pending_drops.push(arc);
-            }
-            if let Some(arc) = slot.mid.take() {
-                self.pending_drops.push(arc);
-            }
-            for (_, ts) in slot.tiles.drain() {
-                self.pending_drops.push(ts.image);
-            }
-            slot.tile_bytes = 0;
-            // 密度标尺清零：调度侧视作「无瓦片、无封面」→ 下一帧重派。
-            slot.tile_scale = 0.0;
-            slot.cover_scale = 0.0;
-        }
-        // 门控重置：下一帧不静置、必跑调度。
-        self.window_sig = None;
-        self.window_settled = false;
-        self.tile_pump_running = false;
     }
 
     /// 当前画布背景色（`set_background` 传入；None = 未设置 → render 回落 `default_canvas`）。
@@ -373,6 +344,7 @@ impl PdfViewer {
         self.pending_mid.clear();
         self.pending_tiles.clear();
         self.pending_cover.clear();
+        self.pending_recolor = None;
         self.tile_bytes = 0;
         self.tile_pump_running = false;
         self.mid_lru.clear();
@@ -494,6 +466,10 @@ impl PdfViewer {
             cx.notify();
         }
         if self.collect_tile_results(scale_factor) {
+            cx.notify();
+        }
+        // 重着色刷新结果收集（切档不重栅：worker 对缓存原图现算的新着色副本，替换显示位图）。
+        if self.collect_recolor_results(scale_factor) {
             cx.notify();
         }
 
@@ -1043,6 +1019,7 @@ impl PdfViewer {
         self.pending_mid.clear();
         self.pending_tiles.clear();
         self.pending_cover.clear();
+        self.pending_recolor = None;
         self.mid_lru.clear();
         self.tile_bytes = 0;
         self.tile_pump_running = false;

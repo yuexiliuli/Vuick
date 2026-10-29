@@ -66,6 +66,11 @@ impl PdfViewer {
         if !self.pending_tiles.is_empty() || !self.pending_cover.is_empty() {
             return true;
         }
+        // 重着色刷新在途：继续出帧直到 worker 回传的新着色副本 drain 完（否则晚到的
+        // 回传没有下一帧可收集，重着色画面停在旧着色上）。
+        if self.pending_recolor.is_some() {
+            return true;
+        }
         if !self.loading && !self.dims.is_empty() && self.load_error.is_none() {
             let viewport_h = f32::from(self.scroll.bounds().size.height);
             if viewport_h <= 0.0 {
@@ -189,6 +194,7 @@ impl PdfViewer {
                         col,
                     },
                 );
+                self.raster_reqs += 1; // 切档不重栅回归计数
                 self.pending_tiles.insert((page, row, col), (scale, rx));
             }
         }
@@ -225,6 +231,7 @@ impl PdfViewer {
                 }
                 let rx =
                     cover_worker.request_render(self.doc_id, RenderRequest { page, scale: cscale });
+                self.raster_reqs += 1; // 切档不重栅回归计数
                 self.pending_cover.insert(page, (cscale, rx));
             }
         }
@@ -379,6 +386,7 @@ impl PdfViewer {
                 }
                 self.slots[page].mid_loading = true;
                 let rx = worker.request_mid(self.doc_id, page, scale_factor);
+                self.raster_reqs += 1; // 切档不重栅回归计数
                 self.pending_mid.insert(page, rx);
                 budget -= 1;
             }
@@ -399,6 +407,7 @@ impl PdfViewer {
                 }
                 self.slots[page].thumb_loading = true;
                 let rx = worker.request_thumb(self.doc_id, page);
+                self.raster_reqs += 1; // 切档不重栅回归计数
                 self.pending_thumb.insert(page, rx);
                 tb -= 1;
             }
@@ -450,6 +459,7 @@ impl PdfViewer {
                             col,
                         },
                     );
+                    self.raster_reqs += 1; // 切档不重栅回归计数
                     self.pending_tiles.insert((page, row, col), (scale, rx));
                 }
             }
@@ -630,6 +640,121 @@ impl PdfViewer {
                 let _ = (w, h);
                 any = true;
             }
+        }
+        any
+    }
+
+    /// 回收**重着色刷新**结果（切档不重栅主路径）：worker 把「已缓存未着色原图 → 按新参数
+    /// 现算的着色副本」逐条回传，本方法按 `kind` 替换对应槽位显示位图（旧图走 `pending_drops`
+    /// 显式下线）。密度守卫与各 `collect_*` 同宗：
+    /// - 封面：`entry.scale` 与当前 `cover_scale` 不符 → 丢弃（缩放已变，旧密度不会显示）；
+    /// - 瓦片：槽内**已有**同格瓦片才替换（view 侧槽位即「正在显示」的真值；已被淘汰/
+    ///   密度失效的格不入新图，避免把过期密度的原图重新塞回），并按新尺寸更新字节账；
+    /// - 中清/缩略：槽内已有相应占位才替换。
+    /// 通道 drain 到 `Disconnected`（worker 发完）即清 `pending_recolor`（泵随之自停）。
+    /// 返回是否有位图被替换（调用方决定重绘）。
+    pub(super) fn collect_recolor_results(&mut self, scale_factor: f32) -> bool {
+        let Some(rx) = self.pending_recolor.as_ref() else {
+            return false;
+        };
+        let page_width = self.page_width();
+        let mut any = false;
+        let mut done = false;
+        loop {
+            let entry = match rx.try_recv() {
+                Ok(e) => e,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            };
+            if entry.page >= self.dims.len() {
+                continue;
+            }
+            let Ok(img) = render_image_from_bgra(entry.bgra, entry.w, entry.h) else {
+                continue;
+            };
+            let page = entry.page;
+            match entry.kind {
+                RawKind::Cover => {
+                    let cscale = cover_scale(self.dims[page], page_width, scale_factor);
+                    if (entry.scale - cscale).abs() > 1e-4 {
+                        self.pending_drops.push(img);
+                        continue;
+                    }
+                    if let Some(s) = self.slots.get_mut(page)
+                        // 只替换「当前正在显示的封面」：页槽无封面（瓦片驱动）时不把整页
+                        // 封面塞回，避免重着色刷新把显示模式从「瓦片」翻成「封面」。
+                        && s.cover.is_some()
+                    {
+                        if let Some(old) = s.cover.replace(img) {
+                            self.pending_drops.push(old);
+                        }
+                        // 旧密度封面兜底（prev_cover）在封面刷新时一并回收（新封面即时覆盖）。
+                        if let Some(prev) = s.prev_cover.take() {
+                            self.pending_drops.push(prev);
+                        }
+                        s.cover_scale = entry.scale;
+                        any = true;
+                    } else {
+                        self.pending_drops.push(img);
+                    }
+                }
+                RawKind::Tile => {
+                    let Some(s) = self.slots.get_mut(page) else {
+                        self.pending_drops.push(img);
+                        continue;
+                    };
+                    let Some(old) = s.tiles.get_mut(&(entry.row, entry.col)) else {
+                        // 该格当前不在显示槽（已被淘汰/密度失效）→ 不把过期密度的原图塞回。
+                        self.pending_drops.push(img);
+                        continue;
+                    };
+                    let ts = TileSlot {
+                        image: img,
+                        x0: entry.x0,
+                        y0: entry.y0,
+                        w: entry.w,
+                        h: entry.h,
+                    };
+                    let old_bytes = old.bytes();
+                    let new_bytes = ts.bytes();
+                    s.tile_bytes = s.tile_bytes.saturating_sub(old_bytes).saturating_add(new_bytes);
+                    self.tile_bytes = self
+                        .tile_bytes
+                        .saturating_sub(old_bytes)
+                        .saturating_add(new_bytes);
+                    let old_img = std::mem::replace(old, ts).image;
+                    self.pending_drops.push(old_img);
+                    any = true;
+                }
+                RawKind::Mid => {
+                    if let Some(s) = self.slots.get_mut(page)
+                        && let Some(old) = s.mid.replace(img.clone())
+                    {
+                        self.mid_lru.retain(|&p| p != page);
+                        self.mid_lru.push_back(page);
+                        self.pending_drops.push(old);
+                        any = true;
+                    } else {
+                        self.pending_drops.push(img);
+                    }
+                }
+                RawKind::Thumb => {
+                    if let Some(s) = self.slots.get_mut(page)
+                        && let Some(old) = s.thumb.replace(img.clone())
+                    {
+                        self.pending_drops.push(old);
+                        any = true;
+                    } else {
+                        self.pending_drops.push(img);
+                    }
+                }
+            }
+        }
+        if done {
+            self.pending_recolor = None;
         }
         any
     }

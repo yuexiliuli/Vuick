@@ -203,6 +203,42 @@ pub struct RenderResult {
     pub height: u32,
 }
 
+/// 重着色刷新的位图来源类别（对应 view 层四个槽位类：整页封面 / 瓦片 / 中清 / 缩略）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawKind {
+    Cover,
+    Tile,
+    Mid,
+    Thumb,
+}
+
+/// 重着色刷新回传：某条**已缓存未着色原图**按当前参数重着色后的显示副本（连同定位
+/// 元数据与密度标尺）。view 层按 `kind` 替换对应槽位图片（密度守卫与各 `collect_*`
+/// 同宗：瓦片比对 `full_w/full_h` 与 `scale`，封面比对 `scale`，中清/缩略只换图）。
+#[derive(Debug)]
+pub struct RecolorEntry {
+    pub kind: RawKind,
+    pub page: usize,
+    pub row: u32,
+    pub col: u32,
+    /// 瓦片在页位图中的左上角 x（含出血）。
+    pub x0: u32,
+    /// 瓦片在页位图中的左上角 y。
+    pub y0: u32,
+    /// 位图实际宽（含出血）。
+    pub w: u32,
+    /// 位图实际高。
+    pub h: u32,
+    /// 页位图全宽（= ceil(页pt宽 × scale)）。
+    pub full_w: u32,
+    /// 页位图全高。
+    pub full_h: u32,
+    /// 该原图的栅格化密度（px/pt；view 侧密度守卫用）。
+    pub scale: f32,
+    /// 按当前重着色参数着色后的 BGRA（`None` 直通时 = 原图副本）。
+    pub bgra: Vec<u8>,
+}
+
 /// 页内单个字符的文本层数据：Unicode + 包围盒。
 ///
 /// 坐标语义：与 pdfium 一致（PDF 用户空间，原点在页**左下角**，Y 轴向上），单位
@@ -493,13 +529,21 @@ enum WorkerMsg {
     /// 读回某页注释（only-read，pdfium-render 高层 `page.annotations()`，供测试断言）。
     /// 低优先级，与 Text/Search 同位（不抢栅格化）。
     ReadAnnotations(DocId, usize, mpsc::Sender<Result<Vec<AnnotationInfo>>>),
-    /// **纸墨重着色参数切换（按文档）**：`None` = 直通（无重着色）；`Some` = 该文档之后
-    /// 所有栅格化输出（瓦片/封面/缩略/中清）都在 return 前经 [`apply_recolor`] 就地重着色。
+    /// **纸墨重着色参数切换（按文档）+ 重着色刷新**：`None` = 直通（无重着色）；`Some` =
+    /// 该文档之后所有栅格化输出都在 return 前经 [`apply_recolor`] 就地重着色。第三个字段
+    /// `up_to_option` 语义：`Some(tx)` = 调用方（view）想要一次**现算现发的重着色刷新**，
+    /// worker 收到后把已缓存原图按新参数重着色、经 `tx` 逐条回传（view 替换显示位图）；
+    /// `None` = 只更新参数不回传（worker 未就绪时的补推/打开首栅用）。
     /// by `run` 在收到消息**当下**按 `doc_id` 落到「文档→参数」映射（早于同批次任何渲染
     /// 出队），不排队。**必须按文档键控**：worker 是进程级单例、多阅读器（多窗口/多标签）
     /// 共享；若用单槽全局值，不同窗口不同偏好会互相覆盖、把错误纸墨渲到对方页面上。
     /// 只改显示像素，绝不写回文件 / 不改 pdfium 解析。
-    SetRecolor(DocId, Option<RecolorParams>),
+    ///
+    /// 【切档不重栅决策留痕】旧语义：切档 → view 清全窗页槽 + 重置门控 → 下一帧按新参数
+    /// 全量重派 → worker 重调 pdfium 重栅（数百 ms，本需求根治对象）。新语义：worker 缓存
+    /// **未着色原图**（[`RawEntry`]），切档只对缓存原图重跑 [`apply_recolor`] 现算新着色
+    /// 副本回传刷新可见区——**不失效缓存槽、不重置门控、不重调 pdfium 栅格**。
+    SetRecolor(DocId, Option<RecolorParams>, Option<mpsc::Sender<RecolorEntry>>),
 }
 
 /// 进程级单例工作线程句柄。所有 [`PdfViewer`] 通过克隆它共享同一个 pdfium 线程。
@@ -595,8 +639,25 @@ impl PdfWorker {
     /// 设置（或清除）`doc_id` 文档的纸墨重着色参数（`None` = 直通无重着色）。只影响该
     /// 文档显示像素，不写回文件。worker 在收到消息当下按文档应用（早于同批次渲染出队），
     /// view 随后重渲的瓦片即用新参数。按文档键控（见 [`WorkerMsg::SetRecolor`]）。
+    /// **不请求重着色刷新**（worker 未就绪时的补推 / 打开首栅用：此时文档原图缓存为空，
+    /// 之后栅格化会自带着色出口，无需回传）。
     pub fn set_recolor(&self, doc_id: DocId, recolor: Option<RecolorParams>) {
-        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor));
+        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor, None));
+    }
+
+    /// 设置（或清除）`doc_id` 文档的纸墨重着色参数，并**请求一次重着色刷新**：worker 对
+    /// 已缓存未着色原图现算新着色副本、经返回通道逐条回传（view 据此替换显示位图）。
+    /// **不失效缓存槽、不重置门控、不重调 pdfium 栅格**——切档即「对缓存原图重跑内核」，
+    /// 根治旧「清槽全量重栅」的夜间档加载慢。同参短路：与 worker 侧已存参数一致时
+    /// 不重复刷新（返回的通道会立刻断开）。按文档键控（见 [`WorkerMsg::SetRecolor`]）。
+    pub fn set_recolor_refresh(
+        &self,
+        doc_id: DocId,
+        recolor: Option<RecolorParams>,
+    ) -> mpsc::Receiver<RecolorEntry> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor, Some(tx)));
+        rx
     }
 
     /// 请求某页文本层数据（异步、低优先级）。返回接收结果的通道。
@@ -804,14 +865,20 @@ impl PdfWorker {
         // match）。进程级单 worker 多阅读器共享 → 绝不能退化成单槽全局值（会跨窗口互相
         // 覆盖、把错误纸墨渲到对方文档上）。
         let mut recolor: HashMap<DocId, Option<RecolorParams>> = HashMap::new();
+        // 未着色原图缓存（**按文档**键控，条目见 [`RawEntry`]）：切档（`SetRecolor`）只对
+        // 缓存内该文档的原图重跑 apply_recolor 现算新着色副本回传刷新可见区——不失效缓存
+        // 槽、不重置门控、不重调 pdfium 栅格（根治「夜间档加载慢」）。与 recolor 同生命周期，
+        // 关闭文档时一并清理（防 doc_id 复用残留旧原图）。
+        let mut raw_cache: HashMap<DocId, Vec<RawEntry>> = HashMap::new();
         loop {
             // 现积压一次性分桶入队（每桶 FIFO；跨类优先序由下方「先取高优先桶」体现）。
             // `SetRecolor` 是控制消息：**当下应用**，不入桶——保证早于同批次的任何渲染
             // 出队（view 先发 SetRecolor、再重派瓦片，二事经单通道 FIFO 保序）。
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    WorkerMsg::SetRecolor(doc_id, params) => {
-                        recolor.insert(doc_id, params);
+                    WorkerMsg::SetRecolor(doc_id, params, refresh) => {
+                        // 更新参数 + 对缓存原图现算重着色副本回传（同参短路、切档不重栅）。
+                        apply_recolor_switch(&mut recolor, &raw_cache, doc_id, params, refresh);
                     }
                     other => enqueue_msg(other, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q),
                 }
@@ -822,12 +889,18 @@ impl PdfWorker {
                 match msg {
                     WorkerMsg::Render(doc_id, req, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
-                        let result = docs.get(&doc_id).and_then(|doc| render_page(doc, req, p));
+                        let doc_cache = raw_cache.entry(doc_id).or_default();
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Cover));
                         let _ = tx.send(result);
                     }
                     WorkerMsg::RenderTile(doc_id, req, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
-                        let result = docs.get(&doc_id).and_then(|doc| render_tile(doc, req, p));
+                        let doc_cache = raw_cache.entry(doc_id).or_default();
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| render_tile(doc, req, p, doc_cache));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("render_q 只入 Render/RenderTile"),
@@ -839,9 +912,10 @@ impl PdfWorker {
                 match msg {
                     WorkerMsg::Mid(doc_id, page, sf, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_mid(doc, page, sf, p));
+                            .and_then(|doc| render_mid(doc, page, sf, p, doc_cache));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("mid_q 只入 Mid"),
@@ -852,9 +926,10 @@ impl PdfWorker {
                 match msg {
                     WorkerMsg::Thumb(doc_id, page, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_thumb(doc, page, p));
+                            .and_then(|doc| render_thumb(doc, page, p, doc_cache));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("thumb_q 只入 Thumb"),
@@ -914,6 +989,8 @@ impl PdfWorker {
                         stores.remove(&doc_id);
                         // 重着色按文档键控：关闭即清理（防 doc_id 复用残留旧参数）。
                         recolor.remove(&doc_id);
+                        // 未着色原图缓存随文档一起清理（释放 CPU 内存，防跨文档残留）。
+                        raw_cache.remove(&doc_id);
                     }
                     WorkerMsg::Text(doc_id, page, tx) => {
                         let result = docs
@@ -1102,8 +1179,9 @@ impl PdfWorker {
             //    `SetRecolor` 与上方 sweep 走同一拦截：收到当下应用，不入桶（否则经
             //    enqueue_msg 落到 rest_q 会撞 `_ => unreachable!` 把工作线程打死）。
             match rx.recv() {
-                Ok(WorkerMsg::SetRecolor(doc_id, params)) => {
-                    recolor.insert(doc_id, params);
+                Ok(WorkerMsg::SetRecolor(doc_id, params, refresh)) => {
+                    // 更新参数 + 对缓存原图现算重着色副本回传（同参短路、切档不重栅）。
+                    apply_recolor_switch(&mut recolor, &raw_cache, doc_id, params, refresh);
                 }
                 Ok(msg) => enqueue_msg(msg, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q),
                 Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
@@ -1640,10 +1718,184 @@ fn timing() -> bool {
     })
 }
 
+/// worker 侧「未着色原图」缓存条目（单真值 = raw bgra；切档重着色由 raw 现算现发）。
+/// 与 view 层 [瓦片 key=(row,col) / 封面单槽 / 中清 / 缩略] 同构键控，另存密度标尺
+/// `scale` 与几何，供重着色刷新回传后 view 侧按原几何替换显示位图。
+struct RawEntry {
+    kind: RawKind,
+    page: usize,
+    row: u32,
+    col: u32,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    full_w: u32,
+    full_h: u32,
+    scale: f32,
+    bgra: Vec<u8>,
+}
+
+impl RawEntry {
+    fn bytes(&self) -> u64 {
+        self.bgra.len() as u64
+    }
+}
+
+/// 把本轮栅格化的**未着色原图**写入文档 raw 缓存（预算超支时先入先出回收最旧）。
+/// 同 key（kind/页/格号）同密度同尺寸 → 复用既有原图、不重复占用，返回 `false`（调用方
+/// 仍可用本轮刚栅格化的同内容 raw 作着色出口）；其余情况写入/替换并返回 `true`。
+/// `budget` = 该缓存的字节预算（生产传 [`config::pdf::RAW_CACHE_BYTES`]；测试可传极小值
+/// 验证 FIFO 回收，K27 证据入仓）。
+fn cache_raw(cache: &mut Vec<RawEntry>, entry: RawEntry, budget: u64) -> bool {
+    let key_same = |e: &RawEntry| {
+        e.kind == entry.kind
+            && e.page == entry.page
+            && e.row == entry.row
+            && e.col == entry.col
+    };
+    if let Some(e) = cache.iter_mut().find(|e| key_same(e)) {
+        if (e.scale - entry.scale).abs() <= 1e-4 && e.w == entry.w && e.h == entry.h {
+            return false; // 同密度同尺寸：内容必然一致，复用既有 raw（不重复占内存）
+        }
+        *e = entry; // 密度/尺寸已变 → 旧条目过期，替换
+    } else {
+        cache.push(entry);
+    }
+    // 预算收敛：超支时回收最旧（队首 = 最早写入；单文档缓存规模有界，O(n) 扫足够）。
+    let mut over: i64 = cache.iter().map(RawEntry::bytes).sum::<u64>() as i64 - budget as i64;
+    while over > 0 && !cache.is_empty() {
+        over -= cache.remove(0).bytes() as i64;
+    }
+    true
+}
+
+/// 栅格化出口统一姿势：把未着色原图存入文档 raw 缓存（同 key 同密度复用），返回**按当前
+/// 重着色参数着色后的显示副本**（`None` 直通 = 原图不变）。不触碰缓存内的 raw（单真值）。
+fn finalize_render(
+    cache: &mut Vec<RawEntry>,
+    kind: RawKind,
+    page: usize,
+    row: u32,
+    col: u32,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    full_w: u32,
+    full_h: u32,
+    scale: f32,
+    mut bgra: Vec<u8>,
+    recolor: Option<RecolorParams>,
+) -> Vec<u8> {
+    let already = cache.iter().any(|e| {
+        e.kind == kind
+            && e.page == page
+            && e.row == row
+            && e.col == col
+            && (e.scale - scale).abs() <= 1e-4
+            && e.w == w
+            && e.h == h
+    });
+    if already {
+        // 已缓存同密度同尺寸原图（重渲同格）：缓存 raw 不重复写入，出口用本轮 raw（内容一致）。
+        if let Some(p) = recolor {
+            apply_recolor(&mut bgra, p);
+        }
+        return bgra;
+    }
+    // 新原图：入缓存 + 出口用克隆着色副本。
+    let mut out = bgra.clone();
+    if let Some(p) = recolor {
+        apply_recolor(&mut out, p);
+    }
+    cache_raw(
+        cache,
+        RawEntry {
+            kind,
+            page,
+            row,
+            col,
+            x0,
+            y0,
+            w,
+            h,
+            full_w,
+            full_h,
+            scale,
+            bgra,
+        },
+        config::pdf::RAW_CACHE_BYTES,
+    );
+    out
+}
+
+/// 对某文档已缓存的原图按 `params` 重着色，产出全部待回传的显示副本（**不触碰缓存 raw**，
+/// 每条约一次 memcpy + 一次 apply_recolor）。`None`（默认档）直通 = 原图副本。纯函数：
+/// 供工作线程 `SetRecolor` 发帧，亦可直接单测（K27 证据入仓）。
+fn recolored_entries(
+    cache: &[RawEntry],
+    params: Option<RecolorParams>,
+) -> Vec<RecolorEntry> {
+    cache
+        .iter()
+        .map(|e| {
+            let mut bgra = e.bgra.clone();
+            if let Some(p) = params {
+                apply_recolor(&mut bgra, p);
+            }
+            RecolorEntry {
+                kind: e.kind,
+                page: e.page,
+                row: e.row,
+                col: e.col,
+                x0: e.x0,
+                y0: e.y0,
+                w: e.w,
+                h: e.h,
+                full_w: e.full_w,
+                full_h: e.full_h,
+                scale: e.scale,
+                bgra,
+            }
+        })
+        .collect()
+}
+
+/// `SetRecolor` 的统一处置（sweep 与空闲 `rx.recv` 两处共用）：更新文档重着色参数 +
+/// （参数有变且调用方要刷新时）对缓存原图现算重着色副本回传。**同参短路**：与已存参数
+/// 一致则什么都不做（不重复刷新）。
+fn apply_recolor_switch(
+    recolor: &mut HashMap<DocId, Option<RecolorParams>>,
+    raw_cache: &HashMap<DocId, Vec<RawEntry>>,
+    doc_id: DocId,
+    params: Option<RecolorParams>,
+    refresh: Option<mpsc::Sender<RecolorEntry>>,
+) {
+    let same = recolor.get(&doc_id).copied().flatten() == params;
+    recolor.insert(doc_id, params);
+    if same {
+        return;
+    }
+    let Some(tx) = refresh else {
+        return;
+    };
+    let entries = recolored_entries(
+        raw_cache.get(&doc_id).map(Vec::as_slice).unwrap_or(&[]),
+        params,
+    );
+    for en in entries {
+        let _ = tx.send(en);
+    }
+    // `tx` 在本函数返回时 drop → 通道断开 → view 侧 drain 完即清 `pending_recolor`。
+}
+
 fn render_page(
     doc: &PdfDocument<'_>,
     req: RenderRequest,
     recolor: Option<RecolorParams>,
+    cache: &mut Vec<RawEntry>,
+    kind: RawKind,
 ) -> Option<RenderResult> {
     let page = doc.pages().get(req.page as i32).ok()?;
     let (pw, ph) = (page.width().value, page.height().value);
@@ -1654,11 +1906,24 @@ fn render_page(
     // pdfium-render 的 `PdfBitmap::render()` 用 `PdfBitmapFormat::default()`（= BGRA）建位图，
     // BGRA 的 stride 恒为 `width*4`（无对齐填充，见 preferred_stride_bytes）。
     // `as_raw_bytes()` 直接返回整块原生 BGRA 缓冲 → 主线程 `Frame::from_raw` 直接包裹。
-    let mut bgra = bmp.as_raw_bytes();
-    // 纸墨重着色（显示层）：`Some` → 就地按亮度映射纸墨；`None` → 直通零开销。
-    if let Some(p) = recolor {
-        apply_recolor(&mut bgra, p);
-    }
+    let bgra = bmp.as_raw_bytes();
+    // 未着色原图入缓存（单真值）+ 出口着色副本（切档可基于缓存 raw 重着色，不重调 pdfium）。
+    let bgra = finalize_render(
+        cache,
+        kind,
+        req.page,
+        0,
+        0,
+        0,
+        0,
+        w as u32,
+        h as u32,
+        w as u32,
+        h as u32,
+        req.scale,
+        bgra,
+        recolor,
+    );
     if timing() {
         eprintln!(
             "[{:.1}ms] [PAGE-RENDER] p{} scale={:.2} render={:.3}ms -> {}x{}",
@@ -1690,6 +1955,7 @@ fn render_tile(
     doc: &PdfDocument<'_>,
     req: TileRequest,
     recolor: Option<RecolorParams>,
+    cache: &mut Vec<RawEntry>,
 ) -> Option<TileResult> {
     let t0 = std::time::Instant::now();
     let page = doc.pages().get(req.page as i32).ok()?;
@@ -1707,11 +1973,24 @@ fn render_tile(
             .set_origin(-(x0 as i32), -(y0 as i32)),
     )
     .ok()?;
-    let mut bgra = dst.as_raw_bytes();
-    // 纸墨重着色（显示层）：`Some` → 就地按亮度映射纸墨；`None` → 直通零开销。
-    if let Some(p) = recolor {
-        apply_recolor(&mut bgra, p);
-    }
+    let bgra = dst.as_raw_bytes();
+    // 未着色原图入缓存（单真值）+ 出口着色副本（切档可基于缓存 raw 重着色，不重调 pdfium）。
+    let bgra = finalize_render(
+        cache,
+        RawKind::Tile,
+        req.page,
+        req.row,
+        req.col,
+        x0,
+        y0,
+        w as u32,
+        h as u32,
+        bmp.0,
+        bmp.1,
+        req.scale,
+        bgra,
+        recolor,
+    );
     let res = TileResult {
         page: req.page,
         row: req.row,
@@ -1748,6 +2027,7 @@ fn render_thumb(
     doc: &PdfDocument<'_>,
     page_index: usize,
     recolor: Option<RecolorParams>,
+    cache: &mut Vec<RawEntry>,
 ) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
@@ -1759,6 +2039,8 @@ fn render_thumb(
             scale,
         },
         recolor,
+        cache,
+        RawKind::Thumb,
     )
 }
 
@@ -1772,6 +2054,7 @@ fn render_mid(
     page_index: usize,
     scale_factor: f32,
     recolor: Option<RecolorParams>,
+    cache: &mut Vec<RawEntry>,
 ) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
@@ -1784,6 +2067,8 @@ fn render_mid(
             scale,
         },
         recolor,
+        cache,
+        RawKind::Mid,
     )
 }
 
@@ -2458,5 +2743,118 @@ mod tests {
         }
         let avg = ms.iter().sum::<u64>() / n as u64;
         eprintln!("BENCH-TEXT: 单页文本提取均值 {avg}ms; 明细 {ms:?}");
+    }
+
+    /// 切档不重栅（worker 侧纯逻辑，零 pdfium）：`recolored_entries` 对已缓存**未着色
+    /// 原图**按新参数现算显示副本——夜间档把纯黑墨迹提亮为墨色、纯白纸面染成纸色，
+    /// 原图 `bgra` 保持未着色单真值不被触碰；`None`（默认档）直通 = 原图副本原样。
+    #[test]
+    fn recolor_refresh_recolors_cached_raw_and_keeps_raw() {
+        // 一份「单瓦片」缓存原图：左像素纯黑（文字墨迹）、右像素纯白（纸面），A=255。
+        let raw: Vec<u8> = vec![0, 0, 0, 255, 255, 255, 255, 255];
+        let cache = vec![RawEntry {
+            kind: RawKind::Tile,
+            page: 0,
+            row: 0,
+            col: 0,
+            x0: 0,
+            y0: 0,
+            w: 2,
+            h: 1,
+            full_w: 16,
+            full_h: 16,
+            scale: 1.0,
+            bgra: raw.clone(),
+        }];
+        let night = RecolorParams {
+            bg: [0x20, 0x20, 0x20],
+            ink: Some([0xD8, 0xD8, 0xD8]),
+        };
+        let entries = recolored_entries(&cache, Some(night));
+        assert_eq!(entries.len(), 1, "每条缓存原图应回传一条重着色副本");
+        let e = &entries[0];
+        assert_eq!(e.kind, RawKind::Tile);
+        assert_eq!(e.page, 0);
+        assert_eq!((e.row, e.col), (0, 0));
+        assert_eq!(e.bgra[0..4], [216, 216, 216, 255], "纯黑墨迹应提亮为墨色 0xD8");
+        assert_eq!(e.bgra[4..8], [32, 32, 32, 255], "纯白纸面应染成纸色 0x20");
+        // 原图（单真值）不被触碰：缓存 raw 仍是未着色原样。
+        assert_eq!(cache[0].bgra, raw, "缓存原图应保持未着色单真值");
+
+        // 默认档（None）直通：副本 = 原图原样（清回默认不重栅、不改像素）。
+        let passthrough = recolored_entries(&cache, None);
+        assert_eq!(passthrough[0].bgra, raw, "None 直通应原样回传原图副本");
+        assert_eq!(cache[0].bgra, raw, "直通路径同样不触碰缓存原图");
+    }
+
+    /// 切档不重栅（worker 侧纯逻辑）：`cache_raw` 同密度同尺寸复用既有原图（不重复占内存）、
+    /// 异密度替换旧条目；`finalize_render` 的「已缓存同密度 → 直用本轮 raw 作出口、不重复
+    /// 写入缓存」分支保持缓存条目数不变。预算超支时先入先出回收最旧（传极小预算直接验证）。
+    #[test]
+    fn raw_cache_reuses_same_density_and_budgets_fifo() {
+        let mut cache: Vec<RawEntry> = Vec::new();
+        let entry = |scale: f32, r: u8, row: u32, col: u32| RawEntry {
+            kind: RawKind::Tile,
+            page: 0,
+            row,
+            col,
+            x0: 0,
+            y0: 0,
+            w: 1,
+            h: 1,
+            full_w: 16,
+            full_h: 16,
+            scale,
+            bgra: vec![r, r, r, 255],
+        };
+        // 首次写入 → 真插入。
+        assert!(cache_raw(&mut cache, entry(1.0, 9, 0, 0), 1 << 20));
+        assert_eq!(cache.len(), 1);
+        // 同密度同尺寸 → 复用既有、不重复插入、不替换（False 分支）。
+        assert!(!cache_raw(&mut cache, entry(1.0, 1, 0, 0), 1 << 20));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].bgra, vec![9, 9, 9, 255], "复用应保留既有原图");
+        // 异密度 → 替换旧条目（缓存仍一格）。
+        assert!(cache_raw(&mut cache, entry(2.0, 2, 0, 0), 1 << 20));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].scale, 2.0);
+
+        // finalize_render：已缓存同密度直用本轮 raw 作出口、不再写入缓存（条目数不变）。
+        let out = finalize_render(
+            &mut cache,
+            RawKind::Tile,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            16,
+            16,
+            2.0,
+            vec![7, 7, 7, 255],
+            Some(RecolorParams { bg: [0x20, 0x20, 0x20], ink: None }),
+        );
+        assert_eq!(cache.len(), 1, "同密度复用不应新增条目");
+        let _ = out;
+
+        // 预算收敛（FIFO 先入先出）：总预算 = 12 字节（= 3 条 × 4 字节）→ 第 4 条写入即
+        // 超支，回收最旧（队首 = 首个写入），缓存保留最近 3 条。
+        let mut tiny: Vec<RawEntry> = Vec::new();
+        let budget = 12u64;
+        let keys = [(0u32, 1u32), (1u32, 1u32), (1u32, 2u32), (0u32, 2u32)];
+        for (i, &(row, col)) in keys.iter().enumerate() {
+            cache_raw(&mut tiny, entry(1.0, 10 + i as u8, row, col), budget);
+        }
+        assert_eq!(tiny.len(), 3, "超预算应变回 3 条（挤出最旧）");
+        assert!(
+            !tiny.iter().any(|e| e.row == 0 && e.col == 1 && e.bgra[0] == 10),
+            "最旧（首个写入 10）应被 FIFO 挤出"
+        );
+        assert!(
+            tiny.iter().any(|e| e.row == 0 && e.col == 2 && e.bgra[0] == 13),
+            "最新（末个写入 13）应存活"
+        );
     }
 }
