@@ -76,6 +76,18 @@ const INK_WEIGHT_LUT: [f32; 256] = {
     t
 };
 
+/// 并行阈值（像素数）：低于此值走单线程路径，避免线程创建开销。
+/// 依据：本机 debug 实测单线程重着色吞吐 ~2-11ns/px（266k px 瓦片 0.5-3ms）；
+/// Windows 下 `std::thread::scope` 每额外线程创建 + join 约 50-150µs（debug 更高）。
+/// 阈值处（0.5Mpx）单线程约 1-6ms，若并行会被 spawn/join 数次开销（~0.2-0.6ms）
+/// 吃掉大半毛收益；高于此（页/封面级）并行毛收益显著、开销占比 <10%。
+/// 取 2^19 = 524288 px 作为「瓦片 vs 页/封面」的分界。
+const PARALLEL_MIN_PX: usize = 1 << 19;
+
+/// 并行度上限：本算法对同一缓冲属内存带宽型（扫描 + 就地写），>4 线程收益递减，
+/// 且每多一线程多一次 spawn/join 固定开销。
+const PARALLEL_MAX_THREADS: usize = 4;
+
 /// 纸墨重着色（纯函数，就地改 `bgra` 像素）：每像素感知亮度取**整数近似**
 /// `li = (299R + 587G + 114B) / 1000 ∈ [0,255]` 作 LUT 索引（纯灰像素 `li` 恰等于
 /// 灰度级本身，与浮点公式逐位一致；彩色像素以亮度灰级近似，允许 ±1 通道舍入差），
@@ -84,6 +96,12 @@ const INK_WEIGHT_LUT: [f32; 256] = {
 /// `out = orig + (ink - orig) × INK_WEIGHT_LUT[li]`——纯黑墨迹趋向墨色、亮度高于
 /// [`INK_L_HI`] 的中间调内容不动。两段作用域（≤0.5 与 ≥0.9）在亮度上不相交，
 /// 顺序无关。A 恒 255。
+///
+/// 大缓冲（≥[`PARALLEL_MIN_PX`] 像素，整页/封面级）：用 `std::thread::scope` 按
+/// [`PARALLEL_MAX_THREADS`]（实际取机器可用并行度封顶）把像素范围切成均匀连续块，
+/// 每线程独立扫描自己那段（互不重叠、无共享可变量；同步等待全部块完成才返回）。
+/// 输出与单线程逐字节一致（等值回归见 tests）。小缓冲（瓦片级）走单线程路径，
+/// 零线程开销。
 ///
 /// 输入为 BGRA 紧凑缓冲（`bgra[i]=B, [i+1]=G, [i+2]=R, [i+3]=A`）；`len` 按 4 对齐取整，
 /// 尾部不足 4 字节忽略。空 / 无参数直通由调用方保证（`None` 不调用本函数）。
@@ -95,6 +113,45 @@ const INK_WEIGHT_LUT: [f32; 256] = {
 pub fn apply_recolor(bgra: &mut [u8], params: RecolorParams) {
     let [bg_r, bg_g, bg_b] = params.bg.map(f32::from);
     let ink = params.ink.map(|[r, g, b]| (f32::from(r), f32::from(g), f32::from(b)));
+    let n = bgra.len() / 4;
+    // 小缓冲（瓦片级）：单线程扫描，输出与既有版本逐字节一致（golden）。
+    if n < PARALLEL_MIN_PX {
+        shade_pixels(bgra, bg_r, bg_g, bg_b, ink);
+        return;
+    }
+    // 取机器可用并行度并封顶；1 核时连 scope 都省，直接单线程。
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get().min(PARALLEL_MAX_THREADS))
+        .unwrap_or(1)
+        .max(1);
+    if workers <= 1 {
+        shade_pixels(bgra, bg_r, bg_g, bg_b, ink);
+        return;
+    }
+    // 均匀连续分块：每块 base 像素，余数分给前 rem 块各 +1，覆盖 [0,n) 不重叠、不留缝。
+    let base = n / workers;
+    let rem = n % workers;
+    std::thread::scope(|s| {
+        let mut start = 0usize;
+        // 逐块按**相对字节差** split，取得像素对齐（4 字节）的独立切片交各线程独占；
+        // `head` 即该块整体，shade_pixels 从 0 扫到末尾，不需要绝对像素下标。
+        // scope 保证全部 join 后才返回。
+        let mut bgra = bgra;
+        for w in 0..workers {
+            let end = start + base + usize::from(w < rem);
+            let (head, tail) = bgra.split_at_mut((end - start) * 4);
+            bgra = tail;
+            s.spawn(move || shade_pixels(head, bg_r, bg_g, bg_b, ink));
+            start = end;
+        }
+    });
+}
+
+/// 对 `bgra` 整段（从下标 0 扫描到 `len/4` 个像素）就地执行同一套双带 LUT 映射
+/// （与旧版单线程逐像素循环逐字节一致）。并行各块切片与单线程路径共用本函数；
+/// 块与块互不重叠故可安全并跑。`#[inline]` 便于每线程循环充分内联。
+#[inline]
+fn shade_pixels(bgra: &mut [u8], bg_r: f32, bg_g: f32, bg_b: f32, ink: Option<(f32, f32, f32)>) {
     let n = bgra.len() / 4;
     let mut i = 0usize;
     for _ in 0..n {
@@ -297,5 +354,103 @@ mod tests {
         // 两端锚点：纯黑 → 墨色 216；纯白 → 纸色 32。
         assert_eq!(out(0), 216, "渐变首端纯黑应提亮为墨色");
         assert_eq!(out(255), 32, "渐变末端纯白应映射为纸色");
+    }
+
+    /// 确定性大缓冲填充：pixel i 的 B/G/R/A 用无依赖乘性伪随机——全亮度覆盖
+    /// （墨/中/纸三带都命中）+ 非灰彩色（覆盖 `li` 整数近似路径）+ A 可变（映射强制 255）。
+    fn big_bgra(n: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(n * 4);
+        for i in 0..n {
+            let x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            buf.extend_from_slice(&[
+                (x & 0xff) as u8,
+                ((x >> 8) & 0xff) as u8,
+                ((x >> 16) & 0xff) as u8,
+                (i & 0xff) as u8,
+            ]);
+        }
+        buf
+    }
+
+    /// 等值回归（需求 3）：同一大缓冲（4Mpx ≫ 并行阈值）下「并行 `apply_recolor` 结果
+    /// == 单线程 `shade_pixels` 结果」逐字节一致；`ink=Some` 与 `ink=None` 各验一遍。
+    /// 小缓冲单线程路径已由其 6 个既有字节级断言锁定 golden（本次未改它们）；本测试
+    /// 只负责把并行路径钉死回单线程基线。
+    #[test]
+    fn apply_recolor_parallel_equals_single_thread() {
+        const N: usize = 4 * 1024 * 1024; // 4Mpx
+        let with_ink = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
+        let (bg_r, bg_g, bg_b) = (f32::from(0x20u8), f32::from(0x20u8), f32::from(0x20u8));
+        let ink = Some((f32::from(0xD8u8), f32::from(0xD8u8), f32::from(0xD8u8)));
+
+        let mut par = big_bgra(N);
+        let mut single = big_bgra(N);
+        // 并行路径（N ≥ PARALLEL_MIN_PX → 进入 scope 分块）。
+        apply_recolor(&mut par, with_ink);
+        // 单线程 golden：同一映射整段逐像素扫描。
+        shade_pixels(&mut single, bg_r, bg_g, bg_b, ink);
+        if par != single {
+            let first = par.iter().zip(&single).position(|(a, b)| a != b);
+            panic!("并行与单线程输出不一致（首个差异字节 @ {first:?}）");
+        }
+
+        // ink=None：仅纸带作用，两路径逐字节也应一致。
+        apply_recolor(&mut par, RecolorParams { bg: [0x20, 0x20, 0x20], ink: None });
+        shade_pixels(&mut single, bg_r, bg_g, bg_b, None);
+        if par != single {
+            let first = par.iter().zip(&single).position(|(a, b)| a != b);
+            panic!("并行与单线程输出不一致（ink=None @ {first:?}）");
+        }
+    }
+
+    /// 墙钟基准（需求 4；默认 `#[ignore]` 不进常规测试）。人工跑：
+    /// `cargo test -p pdf apply_recolor_bench_wall_clock -- --ignored --nocapture`。
+    /// 1Mpx / 8Mpx 缓冲：`apply_recolor`（大缓冲并行）vs `shade_pixels`（单线程 golden），
+    /// 每轮同输入（copy_from_slice 复位），多轮取中位数；报告加速比与线程数（debug 墙钟）。
+    #[test]
+    #[ignore]
+    fn apply_recolor_bench_wall_clock() {
+        use std::time::Instant;
+
+        const ROUNDS: usize = 11;
+        let with_ink = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
+        let (bg_r, bg_g, bg_b) = (f32::from(0x20u8), f32::from(0x20u8), f32::from(0x20u8));
+        let ink = Some((f32::from(0xD8u8), f32::from(0xD8u8), f32::from(0xD8u8)));
+        let workers = std::thread::available_parallelism()
+            .map(|p| p.get().min(PARALLEL_MAX_THREADS))
+            .unwrap_or(1)
+            .max(1);
+        eprintln!("[bench] 并行线程数(封顶4): {workers}");
+
+        for &n in &[1024 * 1024, 8 * 1024 * 1024] {
+            let pristine = big_bgra(n);
+            let mut single_buf = pristine.clone();
+            let mut par_buf = pristine.clone();
+            // 预热（线程/缓存）。
+            shade_pixels(&mut single_buf, bg_r, bg_g, bg_b, ink);
+            apply_recolor(&mut par_buf, with_ink);
+
+            let mut single_t: Vec<f64> = Vec::with_capacity(ROUNDS);
+            let mut par_t: Vec<f64> = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                single_buf.copy_from_slice(&pristine);
+                let t0 = Instant::now();
+                shade_pixels(&mut single_buf, bg_r, bg_g, bg_b, ink);
+                single_t.push(t0.elapsed().as_secs_f64() * 1000.0);
+
+                par_buf.copy_from_slice(&pristine);
+                let t1 = Instant::now();
+                apply_recolor(&mut par_buf, with_ink);
+                par_t.push(t1.elapsed().as_secs_f64() * 1000.0);
+            }
+            single_t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            par_t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let s_med = single_t[ROUNDS / 2];
+            let p_med = par_t[ROUNDS / 2];
+            eprintln!(
+                "[bench] {n}px  单线中位 {s_med:.2}ms → 并行中位 {p_med:.2}ms  加速 {:.2}x",
+                s_med / p_med
+            );
+        }
     }
 }
