@@ -132,6 +132,24 @@ mod tests {
         test_util::lock()
     }
 
+    /// T4 GPU 重着色门控的测试覆盖守卫：构造时把进程级门控设为 `on`，Drop（含 panic）时
+    /// 还原为 `prev`——防断言失败后门控残留 true 泄漏到后续用例（须在持 `pdf_lock` 时用）。
+    struct GpuGateGuard {
+        prev: bool,
+    }
+    impl GpuGateGuard {
+        fn set_on() -> Self {
+            let prev = crate::recolor::gpu_recolor_gate();
+            crate::recolor::set_gpu_recolor_gate_for_test(true);
+            GpuGateGuard { prev }
+        }
+    }
+    impl Drop for GpuGateGuard {
+        fn drop(&mut self) {
+            crate::recolor::set_gpu_recolor_gate_for_test(self.prev);
+        }
+    }
+
     fn test_pdf_paths() -> Vec<std::path::PathBuf> {
         test_util::test_pdf_paths()
     }
@@ -3071,6 +3089,176 @@ mod tests {
             holder.borrow().as_ref().unwrap().read(cx).recolor()
         });
         assert_eq!(recolor_back, None, "默认档应清回直通");
+    }
+
+    /// T4 GPU 重着色通道（worker 侧机制 + 门控，真夹具）：门控开启时 worker 对显示路径
+    /// **不调用 apply_recolor**——`set_recolor(Some(night))` 的渲染结果与 `None`（未着色
+    /// 原图）逐字节一致（CPU 税归零）；门控关闭时恢复既有 CPU 着色（`Some` ≠ `None`）。
+    /// 用「同页同密度渲染对比」作可计数/可字节断言：门控开启的着色档输出 == 原图基准；
+    /// 门控关闭的着色档输出 != 原图基准（与 dbd3236 行为一致）。
+    #[test]
+    fn gpu_gate_worker_skips_cpu_recolor_and_off_keeps_it() {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        // 进程级门控是 worker/view 共读的全局开关：本仓库所有触碰 worker/view 的测试都持
+        // pdfium-test 全局锁，故进程内瞬时一致；用 RAII 守卫，断言失败也会还原。
+        let _gate = GpuGateGuard::set_on();
+        let p = test_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let night = RecolorParams {
+            bg: [0x20, 0x20, 0x20],
+            ink: Some([0xD8, 0xD8, 0xD8]),
+        };
+        // 原图基准（未着色）：门控开启下取 None 档，两次应逐字节一致。
+        worker.set_recolor(doc_id, None);
+        let rx_raw = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
+        let raw = rx_raw
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("原图应返回")
+            .expect("渲染应成功");
+        // 门控开启：设了 night 但显示像素仍是未着色原图（worker 跳过 CPU 着色）。
+        worker.set_recolor(doc_id, Some(night));
+        let rx_gpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
+        let gpu_out = rx_gpu
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("门控开启着色档应返回")
+            .expect("渲染应成功");
+        assert!(
+            gpu_out.bgra == raw.bgra,
+            "门控开启时 recolor 不应改变显示像素（worker 跳过 CPU 着色）：{}",
+            "亮/暗像素应保持未着色原图"
+        );
+
+        // 门控关闭：恢复既有 CPU 着色（回归不变式，与 dbd3236 一致）。
+        crate::recolor::set_gpu_recolor_gate_for_test(false);
+        worker.set_recolor(doc_id, Some(night));
+        let rx_cpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
+        let cpu_out = rx_cpu
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("门控关闭着色档应返回")
+            .expect("渲染应成功");
+        assert!(
+            cpu_out.bgra != raw.bgra,
+            "门控关闭时 recolor 应照常 CPU 着色（与未着色原图不同）"
+        );
+
+        worker.close(doc_id);
+    }
+
+    /// T4 GPU 重着色通道（view 侧 scene 机制 + 门控，真夹具）：门控开启 + 切到夜间档后，
+    /// 页卡片/瓦片的 `img(...).recolor(Some)` 参数进入场景 = `RecolorSprite` 图元携带
+    /// 正确纸/墨参（`switches.x == 1` 启用墨带、`bg` 归一化为纸色）——GPU 绘制时着色的
+    /// 接线成立；切档不派新栅格（`raster_reqs` 不变），故「切档 0 重算 0 重栅」成立。
+    /// GPU 像素无法 headless 断言（K23②），此处只证「机制 + 门控」（真机复核像素等价）。
+    #[gpui::test]
+    async fn gpu_gate_view_attaches_recolor_params_to_scene(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = pdf_lock().lock().unwrap();
+        let _gate = GpuGateGuard::set_on();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        // 首屏停稳（worker 真线程：真实 sleep 给它处理栅格请求的机会）。
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty()
+                    && v.pending_cover.is_empty()
+                    && v.pending_mid.is_empty()
+                    && v.pending_thumb.is_empty()
+                    && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+        let req0 = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).raster_reqs
+        });
+
+        // 切到夜间档（GPU 通道：只改图片参数、0 重算 0 重栅）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_recolor(
+                    Some(RecolorParams {
+                        bg: [0x20, 0x20, 0x20],
+                        ink: Some([0xD8, 0xD8, 0xD8]),
+                    }),
+                    cx,
+                );
+            });
+        });
+        // 泵/帧推进：GPU 通道无 pending_recolor（不派重着色刷新），只需驱动一帧重绘。
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let req1 = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).raster_reqs
+        });
+        assert_eq!(req1, req0, "门控开启切档应 0 新栅格命令（GPU 参数即开关）");
+
+        // 场景断言：页卡/瓦片 img 携带了重着色参数（RecolorSprite 图元，bg/switches 正确）。
+        let sprites = cx.update(|window, _| window.painted_recolor_sprites());
+        assert!(
+            !sprites.is_empty(),
+            "门控开启 + 夜间档应产生 RecolorSprite 场景图元（PDF 显示 img 挂上重着色参数）"
+        );
+        // bg 归一化 0x20/255 ≈ 0.1255；switches.x=1 启用墨带；ink 0xD8/255 ≈ 0.8471。
+        let bg0 = 0x20u8 as f32 / 255.0;
+        let ink0 = 0xD8u8 as f32 / 255.0;
+        let ok = sprites.iter().any(|s| {
+            s.switches[0] == 1.0
+                && (s.bg[0] - bg0).abs() < 1e-3
+                && (s.ink[0] - ink0).abs() < 1e-3
+        });
+        assert!(ok, "至少一个 RecolorSprite 应携带正确的纸/墨参数（ink 启用、bg=0x20、ink=0xD8）");
     }
 
     /// 回归（**切档只刷可见集**，真实渲染路径 + 真夹具）：

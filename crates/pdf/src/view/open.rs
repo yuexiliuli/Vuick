@@ -44,6 +44,7 @@ impl PdfViewer {
             load_error: None,
             bg: None,
             recolor: None,
+            gpu_recolor: crate::recolor::gpu_recolor_gate(),
             pending_drops: Vec::new(),
             outlines: Vec::new(),
             // 焦点句柄须由 Context 创建（gpui 内部注册），同 markdown 预览
@@ -272,15 +273,19 @@ impl PdfViewer {
         self.recolor = recolor;
         if let Some(w) = self.worker.as_ref() {
             // 按本文档键控（worker 侧按 DocId，多窗口互不干扰）：
-            // 1) 置参数（不回传）——之后栅格化/重着色刷新一律按新参数。
+            // 置参数（不回传）——之后栅格化/重着色刷新一律按新参数。
             w.set_recolor(self.doc_id, recolor);
-            // 2) 重着色刷新：圈定「显示槽真实需要的可见集」只刷它（窗外/已淘汰条目保留在
-            //    raw 缓存，滚回重取时现算，互不污染）。scope 按近中心页排序 → worker 分批
-            //    分帧回传时首批即首可视页（首帧尽早呈现）。
-            self.recolor_scope = self.current_recolor_scope();
-            self.recolor_received.clear();
-            let rx = w.request_recolor_refresh(self.doc_id, self.recolor_scope.clone());
-            self.pending_recolor = Some(rx);
+            if !self.gpu_recolor {
+                // CPU 通道：重着色刷新，圈定「显示槽真实需要的可见集」只刷它（窗外/已淘汰
+                // 条目保留在 raw 缓存，滚回重取时现算）。scope 按近中心页排序 → worker 分批
+                // 分帧回传时首批即首可视页（首帧尽早呈现）。
+                self.recolor_scope = self.current_recolor_scope();
+                self.recolor_received.clear();
+                let rx = w.request_recolor_refresh(self.doc_id, self.recolor_scope.clone());
+                self.pending_recolor = Some(rx);
+            }
+            // T4 GPU 通道：切档只改图片元素参数（着色在 GPU 绘制时完成）→ 0 重算 0 重栅，
+            // 不发起重着色刷新（worker 又不会现算新副本——门控下它本就跳过 CPU 着色）。
         }
         // 旧的「清槽重栅失效」已由「重着色刷新」取代（见上方决策留痕）：只复位门控，让
         // 下一帧走一次调度来收集回传结果并重绘；不碰 slots / pending / 在途请求。

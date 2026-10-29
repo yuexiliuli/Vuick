@@ -8,6 +8,7 @@
 
 use super::*;
 use gpui::prelude::FluentBuilder as _;
+use gpui::StyledImage as _;
 
 /// 选区背景色（半透蓝；深浅两版，与 markdown 预览同一套色值，视觉统一）。
 fn selection_color(cx: &App) -> Hsla {
@@ -458,6 +459,13 @@ impl PdfViewer {
             // 滚动条量程错乱。选区高亮需要"定位祖先"做锚点 → 改在**卡片内部**包一层
             // `size_full().relative()` 容器：它不影响卡片自身盒定位，又给绝对定位
             // 的子元素提供以卡片左上角为原点的坐标系。
+            // T4 GPU 重着色通道：门控开启 + 设了重着色时，显示位图统一携带重着色参数
+            // （`img().recolor(...)` → GPU 片元在绘制时着色；worker 已直传未着色原图）。
+            let gpu_params = if self.gpu_recolor {
+                self.recolor.map(crate::recolor::to_image_recolor)
+            } else {
+                None
+            };
             let mut card = div()
                 .id(SharedString::from(format!("pdf-page-{i}")))
                 .absolute()
@@ -486,7 +494,8 @@ impl PdfViewer {
                     c = c.child(
                         img(ImageSource::Render(base.clone()))
                             .w(px(page_width))
-                            .h(px(disp_h)),
+                            .h(px(disp_h))
+                            .recolor(gpu_params),
                     );
                 }
                 for (x, y, w, h, tile_img) in tiles {
@@ -497,7 +506,7 @@ impl PdfViewer {
                             .top(px(y))
                             .w(px(w))
                             .h(px(h))
-                            .child(img(ImageSource::Render(tile_img)).size_full()),
+                            .child(img(ImageSource::Render(tile_img)).size_full().recolor(gpu_params)),
                     );
                 }
                 c.into_any_element()
@@ -509,7 +518,8 @@ impl PdfViewer {
                     .child(
                         img(ImageSource::Render(base))
                             .w(px(page_width))
-                            .h(px(disp_h)),
+                            .h(px(disp_h))
+                            .recolor(gpu_params),
                     )
                     .into_any_element()
             } else {

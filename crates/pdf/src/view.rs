@@ -267,6 +267,10 @@ pub struct PdfViewer {
     /// 纸墨重着色（页面**位图显示**层；None = 直通无重着色）。与 worker 侧 `SetRecolor`
     /// 状态一致（view 在 set 时推送，worker 就位时再补推一次）。
     pub(crate) recolor: Option<RecolorParams>,
+    /// T4 GPU 重着色门控（构造时从进程级开关读入）：开启时编辑器把 raw 直传 + 图片元素
+    /// 携带 `img().recolor(...)` 参数，着色在 **GPU 绘制时**由片元着色器完成（切档只改
+    /// 参数、0 重算 0 重栅）；关闭时行为与 dbd3236 逐字节一致（worker CPU 着色路径照常）。
+    pub(crate) gpu_recolor: bool,
     /// 待释放的旧位图/旧瓦片（替换或回收的，需在下一帧 `drop_image`）。
     pub(crate) pending_drops: Vec<Arc<RenderImage>>,
     /// 书签目录（标题 + 层级 + 目标页码）；无书签时为 `[]`。供侧边栏目录使用。
@@ -409,6 +413,7 @@ mod tests {
                     load_error: None,
                     bg: None,
                     recolor: None,
+                    gpu_recolor: crate::recolor::gpu_recolor_gate(),
                     pending_drops: Vec::new(),
                     outlines: Vec::new(),
                     focus_handle: cx.focus_handle(),
@@ -610,6 +615,7 @@ mod tests {
                     load_error: None,
                     bg: None,
                     recolor: None,
+                    gpu_recolor: crate::recolor::gpu_recolor_gate(),
                     pending_drops: Vec::new(),
                     outlines: Vec::new(),
                     focus_handle: cx.focus_handle(),
@@ -726,6 +732,7 @@ mod tests {
                     load_error: None,
                     bg: None,
                     recolor: None,
+                    gpu_recolor: crate::recolor::gpu_recolor_gate(),
                     pending_drops: Vec::new(),
                     outlines: Vec::new(),
                     focus_handle: cx.focus_handle(),

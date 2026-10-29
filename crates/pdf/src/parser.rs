@@ -932,20 +932,22 @@ impl PdfWorker {
             //    即使渲染消息排在检索/文本之后到，也会先从队列里抽出来执行。
             if let Some(msg) = render_q.pop_front() {
                 match msg {
-                    WorkerMsg::Render(doc_id, req, tx) => {
+                     WorkerMsg::Render(doc_id, req, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Cover));
+                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Cover, gpu));
                         let _ = tx.send(result);
                     }
                     WorkerMsg::RenderTile(doc_id, req, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_tile(doc, req, p, doc_cache));
+                            .and_then(|doc| render_tile(doc, req, p, doc_cache, gpu));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("render_q 只入 Render/RenderTile"),
@@ -957,10 +959,11 @@ impl PdfWorker {
                 match msg {
                     WorkerMsg::Mid(doc_id, page, sf, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_mid(doc, page, sf, p, doc_cache));
+                            .and_then(|doc| render_mid(doc, page, sf, p, doc_cache, gpu));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("mid_q 只入 Mid"),
@@ -971,10 +974,11 @@ impl PdfWorker {
                 match msg {
                     WorkerMsg::Thumb(doc_id, page, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_thumb(doc, page, p, doc_cache));
+                            .and_then(|doc| render_thumb(doc, page, p, doc_cache, gpu));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("thumb_q 只入 Thumb"),
@@ -1265,7 +1269,7 @@ impl PdfWorker {
                         }
                     }
                 }
-                for en in recolored_entries(&batch, pr.params) {
+                for en in recolored_entries(&batch, pr.params, crate::recolor::gpu_recolor_gate()) {
                     let _ = pr.tx.send(en);
                 }
                 if pr.keys.is_empty() {
@@ -1882,6 +1886,8 @@ fn cache_raw(cache: &mut Vec<RawEntry>, entry: RawEntry, budget: u64) -> bool {
 
 /// 栅格化出口统一姿势：把未着色原图存入文档 raw 缓存（同 key 同密度复用），返回**按当前
 /// 重着色参数着色后的显示副本**（`None` 直通 = 原图不变）。不触碰缓存内的 raw（单真值）。
+/// `gpu` = T4 GPU 重着色门控：开启时**跳过 CPU 逐像素着色**，出口即未着色原图
+/// （着色改在 GPU 绘制时完成）——显示路径 CPU 税归零；关闭时行为与既有完全一致。
 fn finalize_render(
     cache: &mut Vec<RawEntry>,
     kind: RawKind,
@@ -1897,6 +1903,7 @@ fn finalize_render(
     scale: f32,
     mut bgra: Vec<u8>,
     recolor: Option<RecolorParams>,
+    gpu: bool,
 ) -> Vec<u8> {
     let already = cache.iter().any(|e| {
         e.kind == kind
@@ -1909,14 +1916,14 @@ fn finalize_render(
     });
     if already {
         // 已缓存同密度同尺寸原图（重渲同格）：缓存 raw 不重复写入，出口用本轮 raw（内容一致）。
-        if let Some(p) = recolor {
+        if !gpu && let Some(p) = recolor {
             apply_recolor(&mut bgra, p);
         }
         return bgra;
     }
     // 新原图：入缓存 + 出口用克隆着色副本。
     let mut out = bgra.clone();
-    if let Some(p) = recolor {
+    if !gpu && let Some(p) = recolor {
         apply_recolor(&mut out, p);
     }
     cache_raw(
@@ -1941,14 +1948,19 @@ fn finalize_render(
 }
 
 /// 对一批已缓存**未着色原图**按 `params` 重着色，产出待回传的显示副本（**不触碰缓存 raw**，
-/// 每条一次 memcpy + 一次 apply_recolor）。`None`（默认档）直通 = 原图副本。纯函数：
-/// 供工作线程分批回传发帧，亦可直接单测（K27 证据入仓）。
-fn recolored_entries(cache: &[&RawEntry], params: Option<RecolorParams>) -> Vec<RecolorEntry> {
+/// 每条一次 memcpy + 一次 apply_recolor）。`None`（默认档）直通 = 原图副本。`gpu` = T4 GPU
+/// 门控：开启时跳过 CPU 着色（只克隆原图副本，着色移到 GPU 绘制时——切档天然 0 重算）。
+/// 纯函数：供工作线程分批回传发帧，亦可直接单测（K27 证据入仓）。
+fn recolored_entries(
+    cache: &[&RawEntry],
+    params: Option<RecolorParams>,
+    gpu: bool,
+) -> Vec<RecolorEntry> {
     cache
         .iter()
         .map(|e| {
             let mut bgra = e.bgra.clone();
-            if let Some(p) = params {
+            if !gpu && let Some(p) = params {
                 apply_recolor(&mut bgra, p);
             }
             RecolorEntry {
@@ -2016,6 +2028,7 @@ fn render_page(
     recolor: Option<RecolorParams>,
     cache: &mut Vec<RawEntry>,
     kind: RawKind,
+    gpu: bool,
 ) -> Option<RenderResult> {
     let page = doc.pages().get(req.page as i32).ok()?;
     let (pw, ph) = (page.width().value, page.height().value);
@@ -2043,6 +2056,7 @@ fn render_page(
         req.scale,
         bgra,
         recolor,
+        gpu,
     );
     if timing() {
         eprintln!(
@@ -2076,6 +2090,7 @@ fn render_tile(
     req: TileRequest,
     recolor: Option<RecolorParams>,
     cache: &mut Vec<RawEntry>,
+    gpu: bool,
 ) -> Option<TileResult> {
     let t0 = std::time::Instant::now();
     let page = doc.pages().get(req.page as i32).ok()?;
@@ -2110,6 +2125,7 @@ fn render_tile(
         req.scale,
         bgra,
         recolor,
+        gpu,
     );
     let res = TileResult {
         page: req.page,
@@ -2148,6 +2164,7 @@ fn render_thumb(
     page_index: usize,
     recolor: Option<RecolorParams>,
     cache: &mut Vec<RawEntry>,
+    gpu: bool,
 ) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
@@ -2161,6 +2178,7 @@ fn render_thumb(
         recolor,
         cache,
         RawKind::Thumb,
+        gpu,
     )
 }
 
@@ -2175,6 +2193,7 @@ fn render_mid(
     scale_factor: f32,
     recolor: Option<RecolorParams>,
     cache: &mut Vec<RawEntry>,
+    gpu: bool,
 ) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
@@ -2189,6 +2208,7 @@ fn render_mid(
         recolor,
         cache,
         RawKind::Mid,
+        gpu,
     )
 }
 
@@ -2890,7 +2910,7 @@ mod tests {
             bg: [0x20, 0x20, 0x20],
             ink: Some([0xD8, 0xD8, 0xD8]),
         };
-        let entries = recolored_entries(&[&cache[0]], Some(night));
+        let entries = recolored_entries(&[&cache[0]], Some(night), false);
         assert_eq!(entries.len(), 1, "每条缓存原图应回传一条重着色副本");
         let e = &entries[0];
         assert_eq!(e.kind, RawKind::Tile);
@@ -2902,7 +2922,7 @@ mod tests {
         assert_eq!(cache[0].bgra, raw, "缓存原图应保持未着色单真值");
 
         // 默认档（None）直通：副本 = 原图原样（清回默认不重栅、不改像素）。
-        let passthrough = recolored_entries(&[&cache[0]], None);
+        let passthrough = recolored_entries(&[&cache[0]], None, false);
         assert_eq!(passthrough[0].bgra, raw, "None 直通应原样回传原图副本");
         assert_eq!(cache[0].bgra, raw, "直通路径同样不触碰缓存原图");
     }
@@ -2952,9 +2972,10 @@ mod tests {
             1,
             16,
             16,
-            2.0,
+             2.0,
             vec![7, 7, 7, 255],
             Some(RecolorParams { bg: [0x20, 0x20, 0x20], ink: None }),
+            false,
         );
         assert_eq!(cache.len(), 1, "同密度复用不应新增条目");
         let _ = out;

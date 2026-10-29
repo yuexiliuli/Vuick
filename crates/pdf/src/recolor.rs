@@ -13,6 +13,46 @@
 //! 提速：墨/纸两带权重按 256 级整数感知亮度预计算成 `const` LUT（编译期求值），
 //! 每像素只做一次整数亮度索引 + 查表，去掉逐像素的 f32 除/round 与 clamp。
 
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicBool, Ordering},
+};
+
+/// T4 GPU 重着色门控（**默认 off**）：环境变量 `GPUI_PDF_GPU_RECOLOR` 非空且非 `"0"`
+/// 时开启。开启后 PDF 显示路径的 raw→着色改在 **GPU 绘制时**由片元着色器完成
+/// （`img().recolor(...)` → `RecolorSprite` 片元），worker **不再对显示路径做 CPU 逐像素
+/// apply_recolor**——CPU 税归零、切档天然 0 重算 0 重栅（只改图片元素参数）。不开启时
+/// 一切行为与 dbd3236 **逐字节一致**（CPU 路径照常）。
+///
+/// GPU 像素输出无法 headless 断言（K23②/③）→ 默认 off，真机由用户复验后翻转默认；
+/// headless 只证「机制 + CPU 税消失 + 门控」（T4 验收口径）。
+pub(crate) static GPU_RECOLOR_GATE: LazyLock<AtomicBool> = LazyLock::new(|| {
+    let on = std::env::var_os("GPUI_PDF_GPU_RECOLOR").is_some_and(|v| !v.is_empty() && v != "0");
+    AtomicBool::new(on)
+});
+
+/// 当前 GPU 重着色门控（进程级：单 worker 单进程，与 worker 单例对齐；生产读一次后
+/// 进程内恒定，不随 env 变化动态翻转）。
+pub(crate) fn gpu_recolor_gate() -> bool {
+    GPU_RECOLOR_GATE.load(Ordering::Relaxed)
+}
+
+/// 测试覆盖：仅可在持 pdfium-test 全局串行锁（`test_util::lock`）时调用——所有触碰
+/// worker/view 的 pdf 测试都持同一把锁，覆盖后进程内瞬时一致；测试结束必须还原。
+#[cfg(test)]
+pub(crate) fn set_gpu_recolor_gate_for_test(v: bool) {
+    GPU_RECOLOR_GATE.store(v, Ordering::Relaxed);
+}
+
+/// 把本 crate 的重着色参数映射为 gpui 图片元素级参数（T4 GPU 通道）：字段同构
+/// （`bg` = 纸色、`ink` = 墨色可选），由 view 在门控开启时挂到 `img().recolor(...)`。
+pub(crate) fn to_image_recolor(p: RecolorParams) -> gpui::ImageRecolor {
+    gpui::ImageRecolor {
+        bg: p.bg,
+        ink: p.ink,
+    }
+}
+
 /// 纸重着色参数：`bg` = 纸色（仅近白纸面像素映射至此）；`ink` = 墨色（`Some` 时把
 /// 近黑内容/文字像素映射至此，深色档用）。RGB 通道（0..=255）；alpha 一贯保持 255。
 /// `ink=None` → 内容像素完全直通（既有「只改纸面」行为）。
