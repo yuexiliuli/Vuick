@@ -10,6 +10,11 @@
 
 use super::*;
 
+/// W2：封面**连续失败**达此阈值即拉黑该页（加入 `cover_blacklist`，回退瓦片供给、
+/// 停止盲目重试封面）。取 3：首载 1 次失败可容忍（pdfium 偶发 OOM），连续 3 次基本
+/// 判定「封面机不可达」，再等只会让该页永久停在占位/模糊（评审 t3 发现）。
+const COVER_FAIL_BLACKLIST_THRESHOLD: u32 = 3;
+
 impl PdfViewer {
     // ---- 瓦片在途自刷新泵 ----
 
@@ -462,6 +467,9 @@ impl PdfViewer {
     /// （`prefetch_cover_scale` 记派发时的 0.5× 密度，render 按当前页宽 CSS 拉伸铺满）。
     /// 若该页此刻已有满密度封面临位/在途（窗口已移到它身上）→ 结果作废直接下线（满封面
     /// 将接管显示，廊封面不与其竞争）。返回是否有新走廊封面入槽（调用方决定重绘）。
+    ///
+    /// WARN-2（评审接受项）：本类瞬态占位无 recolor 世代守卫——切档前入队的旧色廊封面
+    /// 可能短暂落槽闪旧色；瞬态、随后被下一世代满封面/瓦片接管，可接受（不留脏槽）。
     pub(super) fn collect_prefetch_cover_results(&mut self) -> bool {
         let finished = collect_finished(&mut self.pending_prefetch_cover, |(_, rx)| rx.try_recv());
         let mut any = false;
@@ -525,8 +533,10 @@ impl PdfViewer {
                         slot.prev_cover = Some(old);
                     }
             }
-            // 整页不超预算 且 无封面 且 未在途 → 派发
-            if cover_affordable(dim, cscale)
+            // 整页不超预算 且 无封面 且 未在途 → 派发（W2：封面已拉黑页跳过——不盲目重试，
+            // 该页由瓦片供给）。
+            if !self.cover_blacklist.contains(&page)
+                && cover_affordable(dim, cscale)
                 && self.slots[page].cover.is_none()
                 && !self.pending_cover.contains_key(&page)
                 && self.pending_cover.len() < COVER_INFLIGHT
@@ -538,7 +548,8 @@ impl PdfViewer {
                     cover_worker.request_render(self.doc_id, RenderRequest { page, scale: cscale });
                 self.raster_reqs += 1; // 切档不重栅回归计数
                 self.cover_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
-                self.pending_cover.insert(page, (cscale, rx));
+                // 记录**请求时** recolor 世代（NIT：旧世代请求的失败不拉黑，语义纯净）。
+                self.pending_cover.insert(page, (cscale, self.recolor_epoch, rx));
             }
         }
         self.evict_covers(cover_first, cover_last, retire);
@@ -645,9 +656,12 @@ impl PdfViewer {
             let cscale = cover_scale(dim, page_width, scale_factor);
             let cover_serves_tile_density =
                 cover_affordable(dim, cscale) && (cscale - scale).abs() <= 1e-4;
-            let skip_covered = cover_serves_tile_density
-                || (self.slots[page].cover.is_some()
-                    && (self.slots[page].cover_scale - scale).abs() <= 1e-4);
+            // **W2**：封面持续失败的页（`cover_blacklist`）不再由封面供给——skip_covered
+            // 对它失效，回退瓦片核发（否则封面永不再派而瓦片又永远跳过 → 页面停在占位/模糊）。
+            let skip_covered = !self.cover_blacklist.contains(&page)
+                && (cover_serves_tile_density
+                    || (self.slots[page].cover.is_some()
+                        && (self.slots[page].cover_scale - scale).abs() <= 1e-4));
             if skip_covered {
                 continue;
             }
@@ -810,6 +824,13 @@ impl PdfViewer {
             if page >= self.dims.len() {
                 continue;
             }
+            // W1：CPU 回退路径下，切档（SetRecolor/RecolorRefresh）与在途渲染结果走两条
+            // mpsc 无总体次序——worker 按**出队当时** recolor 着色，若该结果晚于新世代
+            // 刷新条目到达，会覆盖新鲜槽位却无后续纠正。世代号守卫：回传世代 ≠ 当前 →
+            // 旧着色结果丢弃（GPU 门控下结果恒为 raw，着色在绘制时，guard 跳过零开销）。
+            if !self.gpu_recolor && res.recolor_epoch != self.recolor_epoch {
+                continue;
+            }
             let scale = render_scale(page_width, scale_factor, self.dims[page].0);
             // 结果一致性守卫：回传格号/页号必须与请求一致、页位图尺寸必须与当前密度
             // 同宗（否则丢弃，防错位拼片）。
@@ -915,26 +936,42 @@ impl PdfViewer {
     /// 回收已完成的在途**封面**结果：worker 回传整页（屏幕密度）BGRA → 装入 `slot.cover`
     /// （首屏锐化，先于瓦片到达；密度守卫：过期即弃）。返回是否有新封面入槽。
     pub(super) fn collect_cover_results(&mut self, scale_factor: f32) -> bool {
-        let finished = collect_finished(&mut self.pending_cover, |(_, rx)| rx.try_recv());
+        let finished = collect_finished(&mut self.pending_cover, |(_, _, rx)| rx.try_recv());
         let mut any = false;
         for (page, res) in finished {
-            let req_scale = self
+            let (req_scale, req_epoch) = self
                 .pending_cover
                 .remove(&page)
-                .map(|(s, _)| s)
-                .unwrap_or(0.0);
+                .map(|(s, e, _)| (s, e))
+                .unwrap_or((0.0, 0));
             let Some(res) = res else {
+                // W2：封面**渲染失败**（worker 返回 None：pdfium 页取不到 / OOM 等）→ 计失败
+                // 并连续达阈值拉黑（不再盲目重试，回退瓦片供给）。旧实现仅 remove 后 continue，
+                // 每帧盲重试、瓦片又因 skip_covered 永不再派 → 该页停在占位/模糊。
+                // **NIT**：仅当前世代请求的失败计数——旧世代请求（切档前入队）的失败不反映
+                // 当前参数供给能力，避免旧色失败误拉黑；GPU 门控无世代守卫，恒计（raw 失败
+                // 与世代无关）。
+                if !self.gpu_recolor && req_epoch != self.recolor_epoch {
+                    continue;
+                }
+                self.cover_failed(page);
                 continue;
             };
             if page >= self.dims.len() {
                 continue;
             }
             let cscale = cover_scale(self.dims[page], self.page_width(), scale_factor);
+            // W1：同 `collect_tile_results` 的世代守卫——旧着色封面晚到即弃。
+            if !self.gpu_recolor && res.recolor_epoch != self.recolor_epoch {
+                continue;
+            }
             if (req_scale - cscale).abs() > 1e-4 {
-                continue; // 缩放/DPI 已变 → 过期封面丢弃
+                continue; // 缩放/DPI 已变 → 过期封面丢弃（用户缩放所致，非封面失败，不计数）
             }
             let (w, h) = (res.width, res.height);
             let Ok(img) = render_image_from_bgra(res.bgra, w, h) else {
+                // W2：建图失败视同封面失败（计数路径同上）。
+                self.cover_failed(page);
                 continue;
             };
             if let Some(s) = self.slots.get_mut(page) {
@@ -973,10 +1010,37 @@ impl PdfViewer {
                 if let Some(old) = s.prefetch_cover.take() {
                     self.pending_drops.push(old);
                 }
+                // W2（NIT 注释修正）：封面成功到位 → 清失败计数与黑名单。主恢复路径其实是
+                // 「滚出封面窗」（`evict_covers` 窗外页复位，瓦片供给已接管）；此处只处理
+                // 「拉黑时仍有在途请求、其后恰好成功」的边角（不常见但无害，恢复封面供给）。
+                self.cover_recovered(page);
                 any = true;
             }
         }
         any
+    }
+
+    /// W2：封面失败计数 → 拉黑。连续失败达 [`COVER_FAIL_BLACKLIST_THRESHOLD`] 后把该页
+    /// 加入 `cover_blacklist`（`plan_tiles_in_window` 对该页回退瓦片供给、`schedule_covers`
+    /// 不再盲目重试）；已拉黑页再次失败不再递增（幂等——已进入瓦片供给，重试无意义）。
+    /// **复位路径**：拉黑页由 `schedule_covers` 停派封面，封面成功几乎不可达——实际复位
+    /// 走「滚出封面窗」（`evict_covers` 窗外页清黑名单/计数，回滚时重新尝试封面）。
+    fn cover_failed(&mut self, page: usize) {
+        if page >= self.dims.len() || self.cover_blacklist.contains(&page) {
+            return;
+        }
+        let n = self.cover_failures.entry(page).or_insert(0);
+        *n += 1;
+        if *n >= COVER_FAIL_BLACKLIST_THRESHOLD {
+            self.cover_blacklist.insert(page);
+        }
+    }
+
+    /// W2：封面成功到位 → 清失败计数与黑名单（该页恢复封面供给；见 `cover_failed` 的
+    /// 复位路径说明——成功复位是「拉黑时仍有在途请求且恰成功」的边角，主路径是滚出封面窗）。
+    fn cover_recovered(&mut self, page: usize) {
+        self.cover_failures.remove(&page);
+        self.cover_blacklist.remove(&page);
     }
 
     /// 回收**重着色刷新**结果（切档不重栅主路径）：worker 把「已缓存未着色原图 → 按新参数
@@ -1114,10 +1178,12 @@ impl PdfViewer {
         retire: Option<usize>,
     ) {
         let mut drops: Vec<Arc<RenderImage>> = Vec::new();
+        let mut out_window: Vec<usize> = Vec::new(); // W2：窗外页（黑名单随窗回收）
         for (page, slot) in self.slots.iter_mut().enumerate() {
             if page >= wanted_first && page <= wanted_last {
                 continue;
             }
+            out_window.push(page);
             if Some(page) == retire {
                 // 刚退位的反向邻居：封面转存为有界过渡底图（prev_cover），不立即下线。
                 if slot.cover.is_some()
@@ -1138,11 +1204,19 @@ impl PdfViewer {
                     }
             }
         }
+        // W2：封面窗外的页清失败计数与黑名单（滚出可视区 → 该页回滚时重新尝试封面）。
+        for page in out_window {
+            self.cover_failures.remove(&page);
+            self.cover_blacklist.remove(&page);
+        }
         self.pending_drops.extend(drops);
     }
 
     /// 回收已完成的在途 **L0 缩略图**结果：worker 回传低清 BGRA → 装入 `slot.thumb`
     /// （纯内存占位，不落盘）。非阻塞：仅检查已就绪通道；返回是否有新缩略图入槽。
+    ///
+    /// WARN-2（评审接受项）：无 recolor 世代守卫——切档前入队的旧色缩略可能短暂落槽闪
+    /// 旧色；瞬态、随后被覆盖，可接受。
     pub(super) fn collect_thumb_results(&mut self) -> bool {
         let finished = collect_finished(&mut self.pending_thumb, |rx| rx.try_recv());
         let mut any = false;
@@ -1171,6 +1245,9 @@ impl PdfViewer {
 
     /// 回收已完成的在途 **L0.5 中清页**结果：worker 回传 ~520px BGRA → 装入 `slot.mid`
     /// （快速拖动占位底图）。非阻塞；返回是否有新中清入槽（调用方决定重绘）。
+    ///
+    /// WARN-2（评审接受项）：无 recolor 世代守卫——切档前入队的旧色中清可能短暂落槽闪
+    /// 旧色；瞬态、随后被当前世代封/瓦片接管，可接受。
     pub(super) fn collect_mid_results(&mut self) -> bool {
         let finished = collect_finished(&mut self.pending_mid, |rx| rx.try_recv());
         let mut any = false;

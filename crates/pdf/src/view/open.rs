@@ -49,6 +49,9 @@ impl PdfViewer {
             load_error: None,
             bg: None,
             recolor: None,
+            recolor_epoch: 0, // W1：随 set_recolor 实际变更 +1
+            cover_failures: HashMap::new(),  // W2
+            cover_blacklist: HashSet::new(), // W2
             gpu_recolor: crate::recolor::gpu_recolor_gate(),
             pending_drops: Vec::new(),
             outlines: Vec::new(),
@@ -141,9 +144,10 @@ impl PdfViewer {
         // 重着色补推：打开/重载时 worker 在 set_recolor 时刻可能尚未就绪，这里在 worker
         // 就位后**总是**把本阅读器的重着色状态按**本文档**推给它（worker 侧按 DocId 键控，
         // 多窗口/多标签各自独立）——保证新文档/重载后的栅格化与 view 状态一致（含 None
-        // 复位：防某文档的全局重着色泄漏到其它文档）。
+        // 复位：防某文档的全局重着色泄漏到其它文档）。**携带 view 世代**：接线前的多次
+        // set_recolor 折叠成这一次补推，worker 靠消息里的最终世代对齐（评审 BLOCK）。
         if let Some(w) = self.worker.as_ref() {
-            w.set_recolor(self.doc_id, self.recolor);
+            w.set_recolor(self.doc_id, self.recolor, self.recolor_epoch);
         }
         let (tops, total) = compute_layout(&self.dims, self.page_width());
         self.page_tops = tops;
@@ -276,10 +280,14 @@ impl PdfViewer {
             return;
         }
         self.recolor = recolor;
+        // W1：世代随参数**实际变更** +1（在 worker 推送之前，保证 view 世代 ≥ worker 世代；
+        // GPU 门控下结果恒为 raw 不涉着色竞态，但世代保持单调无副作用）。view 是世代唯一
+        // 真源：worker 采纳本方法推送时携带的最终世代（评审 BLOCK 对齐）。
+        self.recolor_epoch += 1;
         if let Some(w) = self.worker.as_ref() {
             // 按本文档键控（worker 侧按 DocId，多窗口互不干扰）：
             // 置参数（不回传）——之后栅格化/重着色刷新一律按新参数。
-            w.set_recolor(self.doc_id, recolor);
+            w.set_recolor(self.doc_id, recolor, self.recolor_epoch);
             if !self.gpu_recolor {
                 // CPU 通道：重着色刷新，圈定「显示槽真实需要的可见集」只刷它（窗外/已淘汰
                 // 条目保留在 raw 缓存，滚回重取时现算）。scope 按近中心页排序 → worker 分批

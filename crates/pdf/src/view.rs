@@ -47,7 +47,7 @@
 // 本文件未直接消费的导入（已迁往子模块的职责）由 allow 放行，不做裁剪。
 #![allow(unused_imports)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
@@ -251,8 +251,10 @@ pub struct PdfViewer {
     /// 在途**瓦片**请求：`(页, row, col)` → (请求时密度 scale, 结果通道)。
     /// `scale` 用于结果到达时的密度守卫：缩放/换 DPI 后旧密度瓦片直接丢弃。
     pub(crate) pending_tiles: HashMap<(usize, u32, u32), PendingTileEntry>,
-    /// 在途**封面**（首屏整页锐化）请求：`页` → (密度 scale, 结果通道)。
-    pub(crate) pending_cover: HashMap<usize, (f32, mpsc::Receiver<Option<RenderResult>>)>,
+    /// 在途**封面**（首屏整页锐化）请求：`页` → (密度 scale, **请求时 recolor 世代**, 结果通道)。
+    /// 世代用于 `collect_cover_results` 的失败计数语义（旧世代请求的失败不拉黑，评审 NIT）——
+    /// 成功路径的世代守卫直接用 worker 回传的 `res.recolor_epoch`，不需此值。
+    pub(crate) pending_cover: HashMap<usize, (f32, u64, mpsc::Receiver<Option<RenderResult>>)>,
     /// F4 空闲预取走廊在途请求：`页` → (半密度 scale, 结果通道)。独立于 [`Self::pending_cover`]
     /// （密度守卫不同：0.5× 封面、低优先级、仅空闲期消化），见 `tiles::collect_prefetch_cover_results`
     /// 与 `tiles::prefetch_corridor`。非空期间自刷新泵继续出帧以收集走廊结果。
@@ -311,6 +313,23 @@ pub struct PdfViewer {
     /// 纸墨重着色（页面**位图显示**层；None = 直通无重着色）。与 worker 侧 `SetRecolor`
     /// 状态一致（view 在 set 时推送，worker 就位时再补推一次）。
     pub(crate) recolor: Option<RecolorParams>,
+    /// W1：**重着色世代号**——`set_recolor` 每次**实际变更**参数时 +1（含 worker 未就绪
+    /// 的早期 set，与 `apply_loaded` 的补推无关）。CPU 回退路径下 `collect_tile_results`/
+    /// `collect_cover_results` 丢弃「回传世代 ≠ 当前」的在途结果（worker 在出队渲染时按
+    /// 当时 recolor 着色、结果经独立 mpsc 回传，与 SetRecolor/RecolorRefresh 无总体次序）：
+    /// 旧色重栅结果晚到即被丢弃，杜绝切档后旧色调覆盖新参数。GPU 门控下结果恒为 raw
+    /// （着色在绘制时），guard 跳过无开销。构造 0；与 worker 侧同源（通道 FIFO：worker
+    /// 世代 ≤ 本值、稳态相等）。
+    pub(crate) recolor_epoch: u64,
+    /// W2：**封面失败计数**（按页，CPU/GPU 通用路径）——`collect_cover_results` 在封面
+    /// 失败（`res=None` / 建图失败）时 +1，连续达 [`crate::pdf::view::tiles`] 的
+    /// `COVER_FAIL_BLACKLIST_THRESHOLD` 后把该页加入 [`Self::cover_blacklist`]；封面成功
+    /// 或该页滚出封面窗（`evict_covers`）时复位。纯状态、不触 worker。
+    pub(crate) cover_failures: HashMap<usize, u32>,
+    /// W2：**封面禁用集合**——持续失败的页加入后，`plan_tiles_in_window` 的 skip_covered
+    /// 对该页失效（回退瓦片供给，防「封面持续失败 → 永久占位/模糊」）、`schedule_covers`
+    /// 停止盲目重试封面（直到封面成功或滚出封面窗复位）。
+    pub(crate) cover_blacklist: HashSet<usize>,
     /// T4 GPU 重着色门控（构造时从进程级开关读入）：开启时编辑器把 raw 直传 + 图片元素
     /// 携带 `img().recolor(...)` 参数，着色在 **GPU 绘制时**由片元着色器完成（切档只改
     /// 参数、0 重算 0 重栅）；关闭时行为与 dbd3236 逐字节一致（worker CPU 着色路径照常）。
@@ -462,6 +481,9 @@ mod tests {
                     load_error: None,
                     bg: None,
                     recolor: None,
+                    recolor_epoch: 0,
+                    cover_failures: HashMap::new(),
+                    cover_blacklist: HashSet::new(),
                     gpu_recolor: crate::recolor::gpu_recolor_gate(),
                     pending_drops: Vec::new(),
                     outlines: Vec::new(),
@@ -671,6 +693,9 @@ mod tests {
                     load_error: None,
                     bg: None,
                     recolor: None,
+                    recolor_epoch: 0,
+                    cover_failures: HashMap::new(),
+                    cover_blacklist: HashSet::new(),
                     gpu_recolor: crate::recolor::gpu_recolor_gate(),
                     pending_drops: Vec::new(),
                     outlines: Vec::new(),
@@ -793,6 +818,9 @@ mod tests {
                     load_error: None,
                     bg: None,
                     recolor: None,
+                    recolor_epoch: 0,
+                    cover_failures: HashMap::new(),
+                    cover_blacklist: HashSet::new(),
                     gpu_recolor: crate::recolor::gpu_recolor_gate(),
                     pending_drops: Vec::new(),
                     outlines: Vec::new(),
@@ -860,6 +888,314 @@ mod tests {
                 v
             });
         });
+    }
+
+    /// 最小 pdf viewer（不触碰 pdfium / 无 worker）：1 页占位 dims + 一页槽，供
+    /// `collect_*` 结果守卫与 `plan_tiles_in_window` 纯状态机断言。
+    fn minimal_viewer(cx: &mut gpui::Context<PdfViewer>) -> PdfViewer {
+        let dims = vec![(612.0, 792.0)];
+        let (tops, total) = compute_layout(&dims, PAGE_WIDTH);
+        PdfViewer {
+            path: "dummy.pdf".into(),
+            worker: None,
+            doc_id: 0,
+            dims: dims.clone(),
+            page_tops: tops,
+            total_height: total,
+            slots: vec![Slot::default()],
+            pending_thumb: HashMap::new(),
+            pending_mid: HashMap::new(),
+            mid_lru: VecDeque::new(),
+            pending_tiles: HashMap::new(),
+            pending_cover: HashMap::new(),
+            pending_prefetch_cover: HashMap::new(),
+            prefetch_reqs: 0,
+            loading_placeholder_hits: std::cell::Cell::new(0),
+            pending_recolor: None,
+            raster_reqs: 0,
+            recolor_scope: Vec::new(),
+            recolor_received: Vec::new(),
+            tile_reqs: 0,
+            cover_reqs: 0,
+            tile_bytes: 0,
+            tile_pump_running: false,
+            last_scroll_y: 0.0,
+            scroll_dir: 0,
+            scroll_velocity: 0.0,
+            prev_fast: false,
+            speed_state: SpeedState::Idle,
+            scroll: ScrollHandle::new(),
+            loading: false,
+            load_error: None,
+            bg: None,
+            recolor: None,
+            recolor_epoch: 0,
+            cover_failures: HashMap::new(),
+            cover_blacklist: HashSet::new(),
+            gpu_recolor: false,
+            pending_drops: Vec::new(),
+            outlines: Vec::new(),
+            focus_handle: cx.focus_handle(),
+            text_pages: HashMap::new(),
+            text_lru: VecDeque::new(),
+            pending_text: HashMap::new(),
+            image_pages: HashMap::new(),
+            image_lru: VecDeque::new(),
+            pending_images: HashMap::new(),
+            selected_image: None,
+            sel_anchor: None,
+            sel_active: None,
+            selecting: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_truncated: false,
+            search_active: 0,
+            search_pending: None,
+            search_pending_seq: 0,
+            search_seq: 0,
+            zoom: 1.0,
+            base_w: PAGE_WIDTH,
+            window_sig: None,
+            window_settled: false,
+            idle_gate_skips: 0,
+            reload_anchor: None,
+            last_modify_error: None,
+            sel_card: None,
+            pending_annots: Vec::new(),
+            undo_stack: VecDeque::new(),
+            pending_page_ops: 0,
+            next_annot_id: 0,
+            focused_annot: None,
+            panning: false,
+            pan_origin: gpui::point(px(0.), px(0.)),
+            pan_offset0: gpui::point(px(0.), px(0.)),
+        }
+    }
+
+    /// W1 回归：**CPU 回退路径切档后，旧世代在途渲染结果到达被丢弃、新世代结果被采纳**。
+    /// 修评审 t1-t4 的 W1：worker 按「出队时」recolor 着色、结果经独立 mpsc 回传，与
+    /// SetRecolor/RecolorRefresh 无总体次序 → 旧色瓦片/封面晚到会覆盖新参数槽位且无后续
+    /// 重绘纠正。headless 插桩：先以世代 0 派请求、`set_recolor` 切档使世代 →1、延迟回传
+    /// 世代 0（旧色）结果 → 断言槽位保持原样（被丢弃）；再回传世代 1（新色）结果 → 采纳。
+    #[gpui::test]
+    async fn w1_stale_recolor_epoch_results_dropped_in_cpu_path(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        let rec = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
+        let viewer: gpui::Entity<PdfViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = minimal_viewer(cx);
+                // 切档（此处为演示切到新档）→ view 世代 0→1；旧世代（epoch 0）结果即旧色。
+                v.set_recolor(Some(rec), cx);
+                assert_eq!(v.recolor_epoch, 1, "切档后世代应 +1");
+                v
+            })
+        });
+        let (scale, bmp) = cx.read(|app| {
+            let v = viewer.read(app);
+            let s = render_scale(v.page_width(), 1.0, v.dims[0].0);
+            (s, page_bitmap_size(v.dims[0], s))
+        });
+
+        // ① 旧世代（epoch 0）瓦片晚到 → 丢弃，槽位不被旧色覆盖。
+        cx.update(|app| {
+            viewer.update(app, |v, _cx| {
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(Some(TileResult {
+                    page: 0,
+                    row: 0,
+                    col: 0,
+                    x0: 0,
+                    y0: 0,
+                    w: bmp.0,
+                    h: bmp.1,
+                    full_w: bmp.0,
+                    full_h: bmp.1,
+                    bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
+                    recolor_epoch: 0, // 旧世代（A 色）
+                }));
+                v.pending_tiles.insert((0, 0, 0), (scale, rx));
+                let any = v.collect_tile_results(1.0);
+                assert!(!any, "旧世代瓦片应被丢弃（不返回新位图）");
+                assert!(v.slots[0].tiles.is_empty(), "槽位不应被旧色瓦片覆盖");
+            });
+        });
+
+        // ② 当前世代（epoch 1）瓦片到达 → 采纳。
+        cx.update(|app| {
+            viewer.update(app, |v, _cx| {
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(Some(TileResult {
+                    page: 0,
+                    row: 0,
+                    col: 0,
+                    x0: 0,
+                    y0: 0,
+                    w: bmp.0,
+                    h: bmp.1,
+                    full_w: bmp.0,
+                    full_h: bmp.1,
+                    bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
+                    recolor_epoch: 1, // 当前世代（B 色）
+                }));
+                v.pending_tiles.insert((0, 0, 0), (scale, rx));
+                let any = v.collect_tile_results(1.0);
+                assert!(any, "当前世代瓦片应被采纳");
+                assert!(v.slots[0].tiles.contains_key(&(0, 0)), "槽位应装入新世代瓦片");
+            });
+        });
+
+        // ③ 封面同守卫：旧世代封面晚到 → 丢弃；新世代 → 采纳。
+        let cscale = cx.read(|app| {
+            let v = viewer.read(app);
+            cover_scale(v.dims[0], v.page_width(), 1.0)
+        });
+        cx.update(|app| {
+            viewer.update(app, |v, _cx| {
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(Some(RenderResult {
+                    bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
+                    width: bmp.0,
+                    height: bmp.1,
+                    recolor_epoch: 0, // 旧世代
+                }));
+                v.pending_cover.insert(0, (cscale, 0, rx)); // 请求世代 0（旧）
+                let any = v.collect_cover_results(1.0);
+                assert!(!any, "旧世代封面应被丢弃");
+                assert!(v.slots[0].cover.is_none(), "封面槽不应被旧色覆盖");
+            });
+        });
+        cx.update(|app| {
+            viewer.update(app, |v, _cx| {
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(Some(RenderResult {
+                    bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
+                    width: bmp.0,
+                    height: bmp.1,
+                    recolor_epoch: 1, // 当前世代
+                }));
+                v.pending_cover.insert(0, (cscale, 1, rx)); // 请求世代 1（当前）
+                let any = v.collect_cover_results(1.0);
+                assert!(any, "当前世代封面应被采纳");
+                assert!(v.slots[0].cover.is_some(), "封面槽应装入新世代封面");
+            });
+        });
+
+        // ④ NIT：封面失败计数只在**当前世代**请求时生效——旧世代（请求世代 0）失败不计数
+        // （切档前入队的请求，失败不反映当前参数供给），当前世代失败才累计。
+        cx.update(|app| {
+            viewer.update(app, |v, _cx| {
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(None::<RenderResult>);
+                v.pending_cover.insert(0, (cscale, 0, rx)); // 旧世代失败
+                let _any = v.collect_cover_results(1.0);
+                assert!(
+                    !v.cover_failures.contains_key(&0),
+                    "旧世代封面失败不应计入黑名单计数"
+                );
+            });
+        });
+        cx.update(|app| {
+            viewer.update(app, |v, _cx| {
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(None::<RenderResult>);
+                v.pending_cover.insert(0, (cscale, 1, rx)); // 当前世代失败
+                let _any = v.collect_cover_results(1.0);
+                assert_eq!(
+                    v.cover_failures.get(&0).copied(),
+                    Some(1),
+                    "当前世代封面失败应计数"
+                );
+            });
+        });
+    }
+
+    /// W2 回归：**封面持续失败 → 拉黑该页 → skip_covered 对该页失效、回退瓦片供给**。
+    /// 修评审 t1-t4 的 W2：affordable+同密度页永远跳过瓦片，封面若持续失败（pdfium OOM 等）
+    /// 每帧盲重试、瓦片永不再派 → 停在占位/模糊。断言状态机：连续 3 次 `None` 回传 → 黑名单
+    /// 命中；`plan_tiles_in_window` 在拉黑前返回空（封面供给）→ 拉黑后返回非空（瓦片供给）；
+    /// 失败计数达阈值后不再增长（不盲目重试）。
+    #[gpui::test]
+    async fn w2_cover_failure_blacklist_enables_tile_fallback(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct RootProbe {
+            pdf: gpui::Entity<PdfViewer>,
+        }
+        impl gpui::Render for RootProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<gpui::Entity<PdfViewer>>>> = Rc::default();
+        let (_root, mut cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| minimal_viewer(cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            RootProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        cx.run_until_parked();
+
+        // 封面失败计数注入：`collect_cover_results` 对 `res=None` 计失败。
+        let cscale = cx.read(|app| {
+            let v = holder.borrow().as_ref().unwrap().read(app);
+            cover_scale(v.dims[0], v.page_width(), 1.0)
+        });
+        let drive_failure = |holder: &Rc<RefCell<Option<gpui::Entity<PdfViewer>>>>,
+                             cx: &mut gpui::VisualTestContext|
+         {
+            cx.update(|_w, app| {
+                holder.borrow().as_ref().unwrap().update(app, |v, _cx| {
+                    let (tx, rx) = mpsc::channel();
+                    let _ = tx.send(None::<RenderResult>);
+                    v.pending_cover.insert(0, (cscale, 0, rx)); // 请求世代 0 == 当前（未切档）
+                    let _any = v.collect_cover_results(1.0);
+                });
+            });
+        };
+        drive_failure(&holder, &mut cx);
+        let (f1, bl1) = cx.read(|app| {
+            let v = holder.borrow().as_ref().unwrap().read(app);
+            (v.cover_failures[&0], v.cover_blacklist.contains(&0))
+        });
+        assert_eq!(f1, 1, "第 1 次失败计数");
+        assert!(!bl1, "未达阈值不拉黑");
+        drive_failure(&holder, &mut cx);
+        drive_failure(&holder, &mut cx);
+        let (f3, bl3) = cx.read(|app| {
+            let v = holder.borrow().as_ref().unwrap().read(app);
+            (v.cover_failures[&0], v.cover_blacklist.contains(&0))
+        });
+        assert_eq!(f3, 3, "第 3 次失败计数");
+        assert!(bl3, "达阈值后拉黑");
+
+        // 拉黑后再失败 → 计数不再增长（不盲目重试封面）。
+        drive_failure(&holder, &mut cx);
+        let f4 = cx.read(|app| holder.borrow().as_ref().unwrap().read(app).cover_failures[&0]);
+        assert_eq!(f4, 3, "拉黑后不再递增失败计数（停止盲目重试）");
+
+        // skip_covered 翻转：拉黑前该页（封面 affordable 同密度）不派瓦片；拉黑后回退瓦片。
+        // 「拉黑前」对照用**独立新鲜 viewer**（同一几何，未污染黑名单）。
+        let fresh: gpui::Entity<PdfViewer> = cx.update(|_window, app| app.new(|cx| minimal_viewer(cx)));
+        let (need_before, need_after) = cx.update(|window, cx| {
+            let before = {
+                let v = fresh.read(cx);
+                v.plan_tiles_in_window(0..=0, 0, v.page_width(), 1.0, 0.0, 900.0, window)
+            };
+            let after = {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.plan_tiles_in_window(0..=0, 0, v.page_width(), 1.0, 0.0, 900.0, window)
+            };
+            (before, after)
+        });
+        assert!(need_before.is_empty(), "拉黑前封面供给：该页不应派瓦片");
+        assert!(!need_after.is_empty(), "拉黑后回退瓦片供给：该页应派瓦片");
     }
 }
 

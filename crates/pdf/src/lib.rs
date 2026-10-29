@@ -4134,14 +4134,15 @@ mod tests {
             ink: Some([0xD8, 0xD8, 0xD8]),
         };
         // 原图基准（未着色）：门控开启下取 None 档，两次应逐字节一致。
-        worker.set_recolor(doc_id, None);
+        // （worker 直接调用：epoch 是本测试内部推进的虚拟世代，仅结果不涉 view 守卫。）
+        worker.set_recolor(doc_id, None, 1);
         let rx_raw = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
         let raw = rx_raw
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("原图应返回")
             .expect("渲染应成功");
         // 门控开启：设了 night 但显示像素仍是未着色原图（worker 跳过 CPU 着色）。
-        worker.set_recolor(doc_id, Some(night));
+        worker.set_recolor(doc_id, Some(night), 2);
         let rx_gpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
         let gpu_out = rx_gpu
             .recv_timeout(std::time::Duration::from_secs(30))
@@ -4163,7 +4164,7 @@ mod tests {
 
         // 门控关闭：恢复既有 CPU 着色（回归不变式，与 dbd3236 一致）。
         crate::recolor::set_gpu_recolor_gate_for_test(false);
-        worker.set_recolor(doc_id, Some(night));
+        worker.set_recolor(doc_id, Some(night), 3);
         let rx_cpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
         let cpu_out = rx_cpu
             .recv_timeout(std::time::Duration::from_secs(30))
@@ -4513,6 +4514,106 @@ mod tests {
             scope_keys.first().map(|k| k.1),
             "先刷新距当前可见中心最近页"
         );
+    }
+
+    /// W1-BLOCK 回归（真实开档时序 + 真夹具）：**worker 接线前的多次 recolor 变更，接线后
+    /// 世代必须对齐、结果不被误丢**。评审 BLOCK：view 在 `set_recolor` 实际变更时 +1，而
+    /// apply_loaded 补推（`view/open.rs`）把接线前 N 次变更折叠成 worker 侧一次 → worker
+    /// 世代恒落后 view → `collect_tile/*_results` 世代守卫全部丢弃 → CPU 回退路径整页空白 +
+    /// 渲染/丢弃空转。修复：worker **采纳** view 消息携带的世代（`max(当前, 消息)`，view 为
+    /// 唯一真源，见 `WorkerMsg::SetRecolor` 第三字段）。本测试复刻 shell 开档流：
+    /// `PdfViewer::new`（worker=None）→ 立即**两次不同档** `set_recolor` → 接线后断言
+    /// 页 0 有在位封面/瓦片（结果未被误丢）、无「渲染→丢弃→重派」空转、view 世代 = 2。
+    #[gpui::test]
+    async fn w1_recolor_epoch_aligns_after_prewire_switches(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        // worker 尚未接线（start_load 是异步 spawn，未 run 前 worker=None）→ 两次 set_recolor
+        // 只改 view 状态、不推送 worker：view 世代 0→1→2，正是 BLOCK 的「接线前多次变更」。
+        let p_a = RecolorParams { bg: [0x30, 0x30, 0x30], ink: None };
+        let p_b = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
+        for p in [p_a, p_b] {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                    v.set_recolor(Some(p), cx);
+                });
+            });
+        }
+        let epoch_pre = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).recolor_epoch);
+        assert_eq!(epoch_pre, 2, "接线前两次 set_recolor → view 世代 2");
+
+        // 驱动加载完成 + 首屏停稳。
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let mut settled = false;
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty() && v.pending_cover.is_empty() && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+        assert!(settled, "首屏应停稳（无在途瓦片/封面/泵——世代对齐则结果被采纳，不会空转）");
+
+        // BLOCK 断言：接线后世代对齐 → 结果被采纳 → 页 0 有封面或瓦片；若 worker 世代恒
+        // 落后（旧实现），结果全被丢弃 → 重派 → 永不停稳且页 0 无内容（上面 settled 已证空转）。
+        let (epoch, has_content, cover_reqs) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.recolor_epoch,
+                v.slots
+                    .first()
+                    .map_or(false, |s| s.cover.is_some() || !s.tiles.is_empty()),
+                v.cover_reqs,
+            )
+        });
+        assert_eq!(epoch, 2, "view 世代保持 2（apply_loaded 补推携带，worker 采纳对齐）");
+        assert!(has_content, "页 0 应有在位封面或瓦片（接线前多次切档后结果不被误丢）");
+        assert!(cover_reqs > 0, "封面确实派发过");
     }
 
     /// WARN-2 正向钉死（真实渲染路径 + 真夹具 + 极小预算）：**48MB 预算紧张下的部分刷新是

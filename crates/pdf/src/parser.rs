@@ -182,10 +182,15 @@ pub struct TileResult {
     pub h: u32,
     /// 页位图全宽（= ceil(页pt宽 × scale)）。
     pub full_w: u32,
-    /// 页位图全高。
+    /// 页位图全高（= ceil(页pt高 × scale)）。
     pub full_h: u32,
     /// 紧凑 RGBA 像素（`w*h*4` 字节；pdfium 反字节序后即 RGBA）。
     pub bgra: Vec<u8>,
+    /// W1：渲染该瓦片时 worker 侧该文档的**重着色世代号**（`SetRecolor` 按文档递增世代，
+    /// 见 `run` 循环）。由 `run` 循环按 doc 回填；view 侧 `collect_tile_results` 丢弃
+    /// 世代 ≠ 当前的到达结果——杜绝「CPU 回退路径切档后，旧色重栅结果晚到覆盖新参数」的
+    /// 乱序窗口（GPU 门控下结果恒为 raw，着色在绘制时，不受影响）。构造留 0 占位待回填。
+    pub recolor_epoch: u64,
 }
 
 /// 渲染结果：页面 **BGRA 像素字节** + 位图像素 (宽, 高)。
@@ -201,6 +206,10 @@ pub struct RenderResult {
     pub bgra: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// W1：渲染该结果时 worker 侧该文档的**重着色世代号**（同 [`TileResult::recolor_epoch`]，
+    /// 由 `run` 循环按 doc 回填）。view 侧 `collect_cover_results` 丢弃世代 ≠ 当前的到达
+    /// 结果。构造留 0 占位待回填。
+    pub recolor_epoch: u64,
 }
 
 /// 重着色刷新的位图来源类别（对应 view 层四个槽位类：整页封面 / 瓦片 / 中清 / 缩略）。
@@ -549,6 +558,11 @@ enum WorkerMsg {
     /// **纸墨重着色参数切换（按文档）**：只更新文档重着色参数（`None` = 直通），**不回传
     /// 已渲位图**。重着色刷新由独立的 [`WorkerMsg::RecolorRefresh`] 承担（view 在切档时
     /// 先发本消息置参数、再发刷新请求——二事经单通道 FIFO 保序，首批栅格化即用新参数）。
+    /// 第三字段 `epoch` = view 侧当前**重着色世代号**（[`PdfViewer::recolor_epoch`]）：
+    /// worker **采纳**该值（`max(当前, epoch)`、不独立递增）——修 BLOCK：开档时序中
+    /// worker 接线前的多次 set_recolor 只经 `apply_loaded` 补推一次，若 worker 侧自行计数
+    /// 会永远落后 view（旧色结果全部被世代守卫丢弃 → CPU 路径整页空白）。view 是世代
+    /// 唯一真源，worker 只镜像；通道 FIFO 保证 view 发送值单调。
     /// by `run` 在收到消息**当下**按 `doc_id` 落到「文档→参数」映射（早于同批次任何渲染
     /// 出队），不排队。**必须按文档键控**：worker 是进程级单例、多阅读器（多窗口/多标签）
     /// 共享；若用单槽全局值，不同窗口不同偏好会互相覆盖、把错误纸墨渲到对方页面上。
@@ -558,7 +572,7 @@ enum WorkerMsg {
     /// 全量重派 → worker 重调 pdfium 重栅（数百 ms，本需求根治对象）。新语义：worker 缓存
     /// **未着色原图**（[`RawEntry`]），切档只对缓存原图重跑 [`apply_recolor`] 现算新着色
     /// 副本回传刷新可见区——**不失效缓存槽、不重置门控、不重调 pdfium 栅格**。
-    SetRecolor(DocId, Option<RecolorParams>),
+    SetRecolor(DocId, Option<RecolorParams>, u64),
     /// **重着色刷新（按文档，只刷可见集 + 分批分帧）**：`keys` = view 侧枚举的「显示槽
     /// 真实需要的可见集」（[`RecolorKey`]，按近中心排序），worker 对原始缓存逐条现算新
     /// 着色副本、经 `tx` 分批回传（见 [`RECOLOR_BATCH_BYTES`]），**不触碰 raw 单真值**。
@@ -679,8 +693,10 @@ impl PdfWorker {
     /// [`request_recolor_refresh`](Self::request_recolor_refresh) 单独承担（圈可见集、
     /// 分批分帧回传，不重调 pdfium 栅格）。打开补推（apply_loaded）只置参数：之后栅格化
     /// 会自带着色出口，无需回传。
-    pub fn set_recolor(&self, doc_id: DocId, recolor: Option<RecolorParams>) {
-        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor));
+    /// `epoch` = view 侧当前重着色世代号：worker 采纳（镜像）它而非自行计数——开档时序
+    /// worker 接线前的多次 set_recolor 经补推折叠成一次消息，靠携带的最终世代对齐（BLOCK）。
+    pub fn set_recolor(&self, doc_id: DocId, recolor: Option<RecolorParams>, epoch: u64) {
+        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor, epoch));
     }
 
     /// 请求一次**重着色刷新（只刷可见集）**：`keys` = view 侧枚举的「显示槽真实需要的
@@ -912,6 +928,15 @@ impl PdfWorker {
         // match）。进程级单 worker 多阅读器共享 → 绝不能退化成单槽全局值（会跨窗口互相
         // 覆盖、把错误纸墨渲到对方文档上）。
         let mut recolor: HashMap<DocId, Option<RecolorParams>> = HashMap::new();
+        // **重着色世代号**（按文档）：view 是世代**唯一真源**（`set_recolor` 实际变更时 +1），
+        // worker 只**采纳**消息携带的世代值（`max(当前, 消息)`），绝不自行递增——修评审 BLOCK：
+        // 开档时序 worker 接线前的多次 `set_recolor` 经 `apply_loaded` 补推折叠成一次
+        // `SetRecolor`，若 worker 侧自行计数会永远落后 view（旧色结果全部被 view 世代守卫
+        // 丢弃 → CPU 回退路径整页空白）。worker 出队渲染时把该世代回填进结果
+        // （[`RenderResult::recolor_epoch`] / [`TileResult::recolor_epoch`]），view 据此丢弃
+        // 「切档后仍在途的旧世代结果」——修 W1：SetRecolor/RecolorRefresh 与在途渲染走两条
+        // mpsc 无总体次序，旧色结果晚到会覆盖新参数槽位。缺省=0。
+        let mut recolor_epoch: HashMap<DocId, u64> = HashMap::new();
         // 未着色原图缓存（**按文档**键控，条目见 [`RawEntry`]）：切档（`SetRecolor`）只对
         // 缓存内该文档的原图重跑 apply_recolor 现算新着色副本回传刷新可见区——不失效缓存
         // 槽、不重置门控、不重调 pdfium 栅格（根治「夜间档加载慢」）。与 recolor 同生命周期，
@@ -928,8 +953,12 @@ impl PdfWorker {
             // 二事经单通道 FIFO 保序）。
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    WorkerMsg::SetRecolor(doc_id, params) => {
+                    WorkerMsg::SetRecolor(doc_id, params, epoch) => {
                         // 只更新参数（重着色刷新走 RecolorRefresh）；同参写入幂等，跳过重复。
+                        // BLOCK：worker 采纳 view 消息携带的世代（view 唯一真源；接线前多次
+                        // 变更经补推折叠成一次消息，靠携带的最终世代对齐），不自行递增。
+                        let cur = recolor_epoch.get(&doc_id).copied().unwrap_or(0);
+                        recolor_epoch.insert(doc_id, cur.max(epoch));
                         recolor.insert(doc_id, params);
                     }
                     WorkerMsg::RecolorRefresh(doc_id, keys, tx) => {
@@ -952,31 +981,37 @@ impl PdfWorker {
                 match msg {
                      WorkerMsg::Render(doc_id, req, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let epoch = recolor_epoch.get(&doc_id).copied().unwrap_or(0); // W1
                         let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Cover, gpu));
+                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Cover, gpu))
+                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     WorkerMsg::RenderPreview(doc_id, req, tx) => {
                         // F4 廊封面预览：同 Render 几何与优先级，但 kind=Mid → `finalize_render`
                         // 的 Mid/Thumb 分支：**不入 raw 缓存**（瞬态底图，切档刷新无消费方）。
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let epoch = recolor_epoch.get(&doc_id).copied().unwrap_or(0); // W1
                         let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Mid, gpu));
+                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Mid, gpu))
+                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     WorkerMsg::RenderTile(doc_id, req, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let epoch = recolor_epoch.get(&doc_id).copied().unwrap_or(0); // W1
                         let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_tile(doc, req, p, doc_cache, gpu));
+                            .and_then(|doc| render_tile(doc, req, p, doc_cache, gpu))
+                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("render_q 只入 Render/RenderTile/RenderPreview"),
@@ -988,11 +1023,13 @@ impl PdfWorker {
                 match msg {
                     WorkerMsg::Mid(doc_id, page, sf, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let epoch = recolor_epoch.get(&doc_id).copied().unwrap_or(0); // W1
                         let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_mid(doc, page, sf, p, doc_cache, gpu));
+                            .and_then(|doc| render_mid(doc, page, sf, p, doc_cache, gpu))
+                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("mid_q 只入 Mid"),
@@ -1003,11 +1040,13 @@ impl PdfWorker {
                 match msg {
                     WorkerMsg::Thumb(doc_id, page, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
+                        let epoch = recolor_epoch.get(&doc_id).copied().unwrap_or(0); // W1
                         let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_thumb(doc, page, p, doc_cache, gpu));
+                            .and_then(|doc| render_thumb(doc, page, p, doc_cache, gpu))
+                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("thumb_q 只入 Thumb"),
@@ -1067,6 +1106,9 @@ impl PdfWorker {
                         stores.remove(&doc_id);
                         // 重着色按文档键控：关闭即清理（防 doc_id 复用残留旧参数）。
                         recolor.remove(&doc_id);
+                        // WARN-1（评审）：世代 map 随文档清理，防长期开闭 PDF 后无界增长
+                        // （DocId 单调不复用，残留键永不复用）。
+                        recolor_epoch.remove(&doc_id);
                         last_refreshed.remove(&doc_id);
                         // 未着色原图缓存随文档一起清理（释放 CPU 内存，防跨文档残留）。
                         raw_cache.remove(&doc_id);
@@ -1317,7 +1359,10 @@ impl PdfWorker {
             //    `SetRecolor`/`RecolorRefresh` 与上方 sweep 走同一拦截：收到当下应用，不入桶
             //    （否则经 enqueue_msg 落到 rest_q 会撞 `_ => unreachable!` 把工作线程打死）。
             match rx.recv() {
-                Ok(WorkerMsg::SetRecolor(doc_id, params)) => {
+                Ok(WorkerMsg::SetRecolor(doc_id, params, epoch)) => {
+                    // BLOCK：与上方 sweep 同一「采纳 view 世代」语义（见该分支注释）。
+                    let cur = recolor_epoch.get(&doc_id).copied().unwrap_or(0);
+                    recolor_epoch.insert(doc_id, cur.max(epoch));
                     recolor.insert(doc_id, params);
                 }
                 Ok(WorkerMsg::RecolorRefresh(doc_id, keys, tx)) => {
@@ -2167,6 +2212,7 @@ fn render_page(
         bgra,
         width: w as u32,
         height: h as u32,
+        recolor_epoch: 0, // W1：由 run 循环按 doc 世代回填
     })
 }
 
@@ -2232,6 +2278,7 @@ fn render_tile(
         full_w: bmp.0,
         full_h: bmp.1,
         bgra,
+        recolor_epoch: 0, // W1：由 run 循环按 doc 世代回填
     };
     if timing() {
         let end = std::time::Instant::now();

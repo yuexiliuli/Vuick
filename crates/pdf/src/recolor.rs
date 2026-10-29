@@ -20,8 +20,10 @@
 //! 提速：各策略权重按 256 级整数感知亮度预计算成 `const` LUT（编译期求值），
 //! 每像素只做一次整数亮度索引 + 查表，去掉逐像素的 f32 除/round 与 clamp。
 //! CPU LUT 与 GPU 片元 `recolor_sprite`（`vendor/zed/.../shaders.hlsl`）**同一策略**
-//! （`RecolorSprite.switches.y` 携带曲线、shader 分支）——灰度像素逐位一致、彩色像素
-//! 允许 ±1/255 通道舍入差（同 T4 既有口径）。
+//! （`RecolorSprite.switches.y` 携带曲线、shader 分支）——灰度像素逐位一致；彩色像素的
+//! CPU↔GPU 通道差随策略分档：**FullBand 整段单调（斜率≈1）≤1 LSB**；**ContentProtect
+//! 纸带（斜率 10）彩色近白理论最大 ~10 LSB**（同策不同量化，视觉不可辨，见
+//! [`apply_recolor_with_curve`]）。
 
 use std::sync::{
     LazyLock,
@@ -116,7 +118,9 @@ pub(crate) static RECOLOR_CURVE_LATCH: LazyLock<AtomicU8> = LazyLock::new(|| {
 });
 
 /// 当前曲线策略（进程级）。默认 [`RecolorCurve::FullBand`]；非默认曲线首次读到打一次
-/// stderr 诊断（A/B 切换可追溯；默认路径保持零输出）。
+/// stderr 诊断（A/B 切换可追溯；FullBand 默认路径本诊断零输出——注意「进程零输出」不再
+/// 成立：GPU 门控生产默认开，`gpu_recolor_gate` 每进程首读打一行 `[pdf] gpu recolor
+/// enabled`，N1 口径 = **每进程至多一行 stderr**，一次性非刷屏）。
 pub(crate) fn recolor_curve() -> RecolorCurve {
     let c = match RECOLOR_CURVE_LATCH.load(Ordering::Relaxed) {
         CURVE_CONTENT_PROTECT => RecolorCurve::ContentProtect,
@@ -142,7 +146,9 @@ pub(crate) fn set_recolor_curve_for_test(c: RecolorCurve) {
 }
 
 /// T4 GPU 重着色**真机诊断**基础设施：门控开启时每类只打印一次到 stderr（进程级 latch，
-/// 避免逐瓦片/逐帧刷屏）；正常使用（门控 off）零输出。选 stderr 便于 `2>&1 | grep` 过滤。
+/// 避免逐瓦片/逐帧刷屏）；每个诊断**每进程至多一行**（N1：GPU 门控生产默认开 → 每进程
+/// 启动/首次开 PDF 各至多打印一行 `[gpui] recolor sprite pipeline ok`（vendor）与
+/// `[pdf] gpu recolor enabled`，非「默认零输出」）。选 stderr 便于 `2>&1 | grep` 过滤。
 /// 每条诊断都是「该环节确实发生」的证据，覆盖全链路 4 点：
 ///   1) 门控激活（本模块）；2) worker 原图直传封面/瓦片（parser 调用）；3) view 首个
 ///   img().recolor 挂参（render 调用）；4) gpui 管线就绪（vendor/directx_renderer）。
@@ -157,7 +163,8 @@ pub(crate) static DIAG_GATE_ON: AtomicBool = AtomicBool::new(false);
 pub(crate) static DIAG_RAW_COVER: AtomicBool = AtomicBool::new(false);
 pub(crate) static DIAG_RAW_TILE: AtomicBool = AtomicBool::new(false);
 pub(crate) static DIAG_VIEW_RECOLOR: AtomicBool = AtomicBool::new(false);
-/// A/B 曲线诊断（非默认 ContentProtect 首次读到打一次；默认 FullBand 零输出）。
+/// A/B 曲线诊断（非默认 ContentProtect 首次读到打一次；FullBand 默认**本诊断**零输出——
+/// 但不等于进程零输出，GPU 门控另有每进程一行，见 [`gpu_recolor_gate`] / N1 口径）。
 pub(crate) static DIAG_CURVE_CONTENT_PROTECT: AtomicBool = AtomicBool::new(false);
 
 /// 真机诊断 2/4：worker 跳过 CPU apply_recolor 直传原图——首个封面/首个瓦片各打一次。
@@ -312,9 +319,12 @@ pub fn apply_recolor(bgra: &mut [u8], params: RecolorParams) {
 
 /// 纸墨重着色（纯函数，就地改 `bgra` 像素）：每像素感知亮度取**整数近似**
 /// `li = (299R + 587G + 114B) / 1000 ∈ [0,255]` 作 LUT 索引（纯灰像素 `li` 恰等于
-/// 灰度级本身，与浮点公式逐位一致；彩色像素以亮度灰级近似，允许 ±1 通道舍入差）。
+/// 灰度级本身，与浮点公式逐位一致；彩色像素以亮度灰级近似）。
 /// 曲线由入参显式给定（CPU/GPU 同策的纯函数内核；GPU shader `recolor_sprite_fragment`
-/// 用连续 `luma` 走同一策略，灰度像素逐位一致、彩色 ±1/255 通道差）：
+/// 用连续 `luma` 走同一策略）。**CPU↔GPU 彩色通道差分档**（W3）：灰度像素逐位一致；
+/// FullBand 整段单调（每级 LUT 降 (ink-bg)/255、斜率≈1）→ 彩色 ≤1 LSB；ContentProtect
+/// 纸带 `paper_w` 斜率 = 1/(1-0.90) = 10 → 彩色近白理论最大 ~10 LSB（同策不同量化，
+/// 视觉不可辨）：
 ///
 /// - [`RecolorCurve::ContentProtect`]（双带，既有语义）：纸带
 ///   `out = orig + (bg - orig) × PAPER_WEIGHT_LUT[li]`（近白纸面趋向纸色、低于
@@ -762,8 +772,9 @@ mod tests {
     /// CPU/GPU 一致性（headless 侧，需求 3）：CPU 整数 LUT（`li` = 灰度级）输出 vs 模拟
     /// GPU 片元公式（归一化连续 `luma`、`1-saturate(luma)` / 双带、再 ×255 取整——与
     /// `vendor/.../shaders.hlsl` 的 `recolor_sprite_fragment` 同公式）——对 0..=255 灰渐变
-    /// 逐通道比 **≤1 LSB**。证明「同一策略」下 CPU LUT 与 GPU 连续亮度同策
-    /// （灰度像素逐位一致或 ±1；彩色允许 ±1/255，shader 注释同口径）。
+    /// 逐通道比 **≤1 LSB**。证明「同一策略」下 CPU LUT 与 GPU 连续亮度同策（本测试为
+    /// **纯灰渐变**：灰度像素逐位一致或 ±1；彩色像素 FullBand ≤1 LSB、ContentProtect
+    /// 纸带斜率 10 理论最大 ~10 LSB——W3 已注释分档，彩色不在本灰渐变测试覆盖内）。
     #[test]
     fn apply_recolor_curve_cpu_gpu_consistency() {
         let params = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
