@@ -30,6 +30,8 @@ impl PdfViewer {
             pending_cover: HashMap::new(),
             pending_recolor: None,
             raster_reqs: 0,
+            recolor_scope: Vec::new(),
+            recolor_received: Vec::new(),
             tile_reqs: 0,
             cover_reqs: 0,
             tile_bytes: 0,
@@ -252,30 +254,71 @@ impl PdfViewer {
     }
 
     /// 设置**页面位图显示层**纸墨重着色（`None` = 直通无重着色；只改显示像素、绝不写回
-    /// 文件）。`Some`：本阅读器重着色状态更新，并把新参数推给 worker（顺带请求一次
-    /// **重着色刷新**），随后触发一帧重渲。
+    /// 文件）。`Some`：本阅读器重着色状态更新，把新参数推给 worker（置参数）并请求一次
+    /// **重着色刷新**，随后触发一帧重渲。
     ///
     /// 【切档不重栅决策留痕：取代旧 `invalidate_recolored_caches` 全量重栅路径】
     /// 旧语义：变更 → 清全窗页槽缓存 + 重置门控 → 下一帧按新参数重派 → worker 重调 pdfium
     /// 全量重栅（夜间档加载慢的根因）。新语义：worker 缓存**未着色原图**，本方法只把新参数
-    /// 推给 worker 并对已缓存原图现算新着色副本回传——**不失效缓存槽、不重置调度门控、
-    /// 不重调 pdfium 栅格**；`window_sig`/`window_settled` 仅作「触发一帧调度来收集重着色
-    /// 结果并重绘」的复位（调度因 view 缓存命中而不再派新栅格请求）。同参短值 → 空操作。
+    /// 推给 worker，并对[当前显示槽需要的可见集](Self::current_recolor_scope)（可见页
+    /// 在位封面 + 在位瓦片）现算新着色副本回传——**不失效缓存槽、不重置调度门控、
+    /// 不重调 pdfium 栅格、不刷窗外/已淘汰条目**；`window_sig`/`window_settled`
+    /// 仅作「触发一帧调度来收集重着色结果并重绘」的复位（调度因 view 缓存命中而不再派新
+    /// 栅格请求）。同参短值 → 空操作。
     pub fn set_recolor(&mut self, recolor: Option<RecolorParams>, cx: &mut Context<Self>) {
         if self.recolor == recolor {
             return;
         }
         self.recolor = recolor;
         if let Some(w) = self.worker.as_ref() {
-            // 按本文档键控（worker 侧 `SetRecolor(DocId, …)`，多窗口互不干扰）：
-            // 更新参数 + 请求重着色刷新（worker 对缓存原图重跑内核、回传新着色副本）。
-            self.pending_recolor = Some(w.set_recolor_refresh(self.doc_id, recolor));
+            // 按本文档键控（worker 侧按 DocId，多窗口互不干扰）：
+            // 1) 置参数（不回传）——之后栅格化/重着色刷新一律按新参数。
+            w.set_recolor(self.doc_id, recolor);
+            // 2) 重着色刷新：圈定「显示槽真实需要的可见集」只刷它（窗外/已淘汰条目保留在
+            //    raw 缓存，滚回重取时现算，互不污染）。scope 按近中心页排序 → worker 分批
+            //    分帧回传时首批即首可视页（首帧尽早呈现）。
+            self.recolor_scope = self.current_recolor_scope();
+            self.recolor_received.clear();
+            let rx = w.request_recolor_refresh(self.doc_id, self.recolor_scope.clone());
+            self.pending_recolor = Some(rx);
         }
         // 旧的「清槽重栅失效」已由「重着色刷新」取代（见上方决策留痕）：只复位门控，让
         // 下一帧走一次调度来收集回传结果并重绘；不碰 slots / pending / 在途请求。
         self.window_sig = None;
         self.window_settled = false;
         cx.notify();
+    }
+
+    /// 当前**显示槽需要的重着色刷新可见集**（可见集定义）：遍历全部页槽，只收「在位的
+    /// 页面内容」——在位封面 + 在位瓦片（中清/缩略是快速拖动瞬态占位，不是"正在看"的内容，
+    /// 不参与本次重着色刷新；窗外/已淘汰条目保留在 worker raw 缓存，滚回需要时再现算，
+    /// 互不污染）。顺序按「离当前首可见页的距离」升序（先刷新首可视页；worker 分批分帧
+    /// 按此序回传，首批即首可视页的封面/瓦片）。
+    fn current_recolor_scope(&self) -> Vec<RecolorKey> {
+        // 排序中心 = 当前首可见页（`current_page` 为 1 基）。
+        let center = self
+            .current_page()
+            .map(|(first, _)| first.saturating_sub(1))
+            .unwrap_or(0);
+        let mut pages: Vec<(usize, u64)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.cover.is_some() || !s.tiles.is_empty())
+            .map(|(p, _)| (p, (p as i64 - center as i64).unsigned_abs()))
+            .collect();
+        pages.sort_by_key(|&(p, d)| (d, p));
+        let mut scope = Vec::new();
+        for (page, _) in pages {
+            let slot = &self.slots[page];
+            if slot.cover.is_some() {
+                scope.push(RecolorKey { kind: RawKind::Cover, page, row: 0, col: 0 });
+            }
+            for &(row, col) in slot.tiles.keys() {
+                scope.push(RecolorKey { kind: RawKind::Tile, page, row, col });
+            }
+        }
+        scope
     }
 
     /// 当前纸墨重着色参数（`None` = 直通）。测试 / shell 断言用。
@@ -347,6 +390,8 @@ impl PdfViewer {
         self.pending_tiles.clear();
         self.pending_cover.clear();
         self.pending_recolor = None;
+        self.recolor_scope.clear();
+        self.recolor_received.clear();
         self.tile_bytes = 0;
         self.tile_pump_running = false;
         self.mid_lru.clear();
@@ -1022,6 +1067,8 @@ impl PdfViewer {
         self.pending_tiles.clear();
         self.pending_cover.clear();
         self.pending_recolor = None;
+        self.recolor_scope.clear();
+        self.recolor_received.clear();
         self.mid_lru.clear();
         self.tile_bytes = 0;
         self.tile_pump_running = false;

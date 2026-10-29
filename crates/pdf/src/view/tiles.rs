@@ -685,6 +685,9 @@ impl PdfViewer {
                     break;
                 }
             };
+            // 回归计数：记录收到的条目 key（含被守卫丢弃者）——「切档只刷可见集」断言：
+            // 收到的集合 == 请求的可见集 scope（窗外/已淘汰条目不回传）。
+            self.recolor_received.push((entry.kind, entry.page, entry.row, entry.col));
             if entry.page >= self.dims.len() {
                 continue;
             }

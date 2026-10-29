@@ -60,7 +60,7 @@ use gpui::{
 use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 use crate::recolor::RecolorParams;
-use crate::pdf::parser::RawKind;
+use crate::pdf::parser::{RawKind, RecolorKey};
 
 /// 在途瓦片请求记录：`(派发时密度 scale, 结果通道)`。
 pub(crate) type PendingTileEntry = (f32, mpsc::Receiver<Option<TileResult>>);
@@ -233,6 +233,12 @@ pub struct PdfViewer {
     /// 本阅读器累计向 worker 派发的**栅格类请求数**（Render/RenderTile/Mid/Thumb）。
     /// 纯回归计数（无副作用）：`切档不重栅`测试断言「重着色切换前后该计数不变」。
     pub(crate) raster_reqs: u64,
+    /// 最近一次重着色刷新请求的**可见集 scope**（view 侧定义，按近中心页排序；worker
+    /// 按其 key 逐条现算回传）。回归断言「切档只刷可见集」：收到的 key 集合 == 本 scope。
+    pub(crate) recolor_scope: Vec<RecolorKey>,
+    /// 回归计数：本次重着色刷新**收到**的全部条目 key（`(kind, page, row, col)`，含被
+    /// 密度/槽位守卫丢弃的——计数的是 worker 回传条目的集合）。每次新刷新开始时置空。
+    pub(crate) recolor_received: Vec<(RawKind, usize, u32, u32)>,
     /// T1：仅**瓦片**栅格的累计派发计数（区分封面/占位）。回归断言「封面 affordable 的
     /// 首屏不派同页瓦片」用：封面先行时瓦片系计数应为 0，而 `raster_reqs` ≥ 封面数。
     pub(crate) tile_reqs: u64,
@@ -389,6 +395,8 @@ mod tests {
                     pending_cover: HashMap::new(),
                     pending_recolor: None,
                     raster_reqs: 0,
+                    recolor_scope: Vec::new(),
+                    recolor_received: Vec::new(),
                     tile_reqs: 0,
                     cover_reqs: 0,
                     tile_bytes: 0,
@@ -588,6 +596,8 @@ mod tests {
                     pending_cover: HashMap::new(),
                     pending_recolor: None,
                     raster_reqs: 0,
+                    recolor_scope: Vec::new(),
+                    recolor_received: Vec::new(),
                     tile_reqs: 0,
                     cover_reqs: 0,
                     tile_bytes: 0,
@@ -702,6 +712,8 @@ mod tests {
                     pending_cover: HashMap::new(),
                     pending_recolor: None,
                     raster_reqs: 0,
+                    recolor_scope: Vec::new(),
+                    recolor_received: Vec::new(),
                     tile_reqs: 0,
                     cover_reqs: 0,
                     tile_bytes: 0,

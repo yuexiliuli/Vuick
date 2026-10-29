@@ -204,7 +204,7 @@ pub struct RenderResult {
 }
 
 /// 重着色刷新的位图来源类别（对应 view 层四个槽位类：整页封面 / 瓦片 / 中清 / 缩略）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RawKind {
     Cover,
     Tile,
@@ -217,7 +217,7 @@ pub(crate) enum RawKind {
 /// 同宗：瓦片比对 `full_w/full_h` 与 `scale`，封面比对 `scale`，中清/缩略只换图）。
 #[derive(Debug)]
 pub struct RecolorEntry {
-    pub kind: RawKind,
+    pub(crate) kind: RawKind,
     pub page: usize,
     pub row: u32,
     pub col: u32,
@@ -237,6 +237,18 @@ pub struct RecolorEntry {
     pub scale: f32,
     /// 按当前重着色参数着色后的 BGRA（`None` 直通时 = 原图副本）。
     pub bgra: Vec<u8>,
+}
+
+/// 重着色刷新可精确定位的一条显示位图（kind + 页 + 格号）：**可见集定义** = view 侧按
+/// 「显示槽真实需要的图片」枚举出的 key 集合（在位封面 + 在位瓦片 + 中清/缩略占位）；
+/// worker 侧据此从 raw 缓存逐条现算回传——**只刷可见集**，窗外 / 已淘汰但仍在 raw 缓存
+/// 的条目不参与本次回传（保留在 raw 缓存，用户滚回需要时再走常规渲染现算，互不污染）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RecolorKey {
+    pub kind: RawKind,
+    pub page: usize,
+    pub row: u32,
+    pub col: u32,
 }
 
 /// 页内单个字符的文本层数据：Unicode + 包围盒。
@@ -529,11 +541,9 @@ enum WorkerMsg {
     /// 读回某页注释（only-read，pdfium-render 高层 `page.annotations()`，供测试断言）。
     /// 低优先级，与 Text/Search 同位（不抢栅格化）。
     ReadAnnotations(DocId, usize, mpsc::Sender<Result<Vec<AnnotationInfo>>>),
-    /// **纸墨重着色参数切换（按文档）+ 重着色刷新**：`None` = 直通（无重着色）；`Some` =
-    /// 该文档之后所有栅格化输出都在 return 前经 [`apply_recolor`] 就地重着色。第三个字段
-    /// `up_to_option` 语义：`Some(tx)` = 调用方（view）想要一次**现算现发的重着色刷新**，
-    /// worker 收到后把已缓存原图按新参数重着色、经 `tx` 逐条回传（view 替换显示位图）；
-    /// `None` = 只更新参数不回传（worker 未就绪时的补推/打开首栅用）。
+    /// **纸墨重着色参数切换（按文档）**：只更新文档重着色参数（`None` = 直通），**不回传
+    /// 已渲位图**。重着色刷新由独立的 [`WorkerMsg::RecolorRefresh`] 承担（view 在切档时
+    /// 先发本消息置参数、再发刷新请求——二事经单通道 FIFO 保序，首批栅格化即用新参数）。
     /// by `run` 在收到消息**当下**按 `doc_id` 落到「文档→参数」映射（早于同批次任何渲染
     /// 出队），不排队。**必须按文档键控**：worker 是进程级单例、多阅读器（多窗口/多标签）
     /// 共享；若用单槽全局值，不同窗口不同偏好会互相覆盖、把错误纸墨渲到对方页面上。
@@ -543,7 +553,15 @@ enum WorkerMsg {
     /// 全量重派 → worker 重调 pdfium 重栅（数百 ms，本需求根治对象）。新语义：worker 缓存
     /// **未着色原图**（[`RawEntry`]），切档只对缓存原图重跑 [`apply_recolor`] 现算新着色
     /// 副本回传刷新可见区——**不失效缓存槽、不重置门控、不重调 pdfium 栅格**。
-    SetRecolor(DocId, Option<RecolorParams>, Option<mpsc::Sender<RecolorEntry>>),
+    SetRecolor(DocId, Option<RecolorParams>),
+    /// **重着色刷新（按文档，只刷可见集 + 分批分帧）**：`keys` = view 侧枚举的「显示槽
+    /// 真实需要的可见集」（[`RecolorKey`]，按近中心排序），worker 对原始缓存逐条现算新
+    /// 着色副本、经 `tx` 分批回传（见 [`RECOLOR_BATCH_BYTES`]），**不触碰 raw 单真值**。
+    /// 窗外 / 已淘汰条目不在此集合 → 不参与本次回传（保留 raw，滚回重取时现算）。
+    /// 同参短路（worker 端）：与上次已完成的刷新参数一致时直接断开通道（不重复回传）。
+    RecolorRefresh(DocId, Vec<RecolorKey>, mpsc::Sender<RecolorEntry>),
+    /// 读回某文档 raw 缓存条目数（只读；测试/基准用于「全缓存 vs 可见集」比例证据）。
+    RawCacheLen(DocId, mpsc::Sender<usize>),
 }
 
 /// 进程级单例工作线程句柄。所有 [`PdfViewer`] 通过克隆它共享同一个 pdfium 线程。
@@ -639,25 +657,36 @@ impl PdfWorker {
     /// 设置（或清除）`doc_id` 文档的纸墨重着色参数（`None` = 直通无重着色）。只影响该
     /// 文档显示像素，不写回文件。worker 在收到消息当下按文档应用（早于同批次渲染出队），
     /// view 随后重渲的瓦片即用新参数。按文档键控（见 [`WorkerMsg::SetRecolor`]）。
-    /// **不请求重着色刷新**（worker 未就绪时的补推 / 打开首栅用：此时文档原图缓存为空，
-    /// 之后栅格化会自带着色出口，无需回传）。
+    /// **只更新参数、不回传已渲位图**：切档的「重着色刷新」由
+    /// [`request_recolor_refresh`](Self::request_recolor_refresh) 单独承担（圈可见集、
+    /// 分批分帧回传，不重调 pdfium 栅格）。打开补推（apply_loaded）只置参数：之后栅格化
+    /// 会自带着色出口，无需回传。
     pub fn set_recolor(&self, doc_id: DocId, recolor: Option<RecolorParams>) {
-        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor, None));
+        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor));
     }
 
-    /// 设置（或清除）`doc_id` 文档的纸墨重着色参数，并**请求一次重着色刷新**：worker 对
-    /// 已缓存未着色原图现算新着色副本、经返回通道逐条回传（view 据此替换显示位图）。
-    /// **不失效缓存槽、不重置门控、不重调 pdfium 栅格**——切档即「对缓存原图重跑内核」，
-    /// 根治旧「清槽全量重栅」的夜间档加载慢。同参短路：与 worker 侧已存参数一致时
-    /// 不重复刷新（返回的通道会立刻断开）。按文档键控（见 [`WorkerMsg::SetRecolor`]）。
-    pub fn set_recolor_refresh(
+    /// 请求一次**重着色刷新（只刷可见集）**：`keys` = view 侧枚举的「显示槽真实需要的
+    /// 可见集」（[`RecolorKey`]，按近中心排序），worker 对原始缓存逐条现算新着色副本、
+    /// 经返回通道**分批分帧**回传（view 替换显示位图）。**不失效缓存槽、不重置门控、
+    /// 不重调 pdfium 栅格**——切档即「对可见集原图重跑内核」，根治旧「清槽全量重栅」的
+    /// 夜间档加载慢。同参短路（worker 端）：与上次已完成刷新参数一致时通道立刻断开。
+    /// 按文档键控（见 [`WorkerMsg::RecolorRefresh`]）。
+    pub(crate) fn request_recolor_refresh(
         &self,
         doc_id: DocId,
-        recolor: Option<RecolorParams>,
+        keys: Vec<RecolorKey>,
     ) -> mpsc::Receiver<RecolorEntry> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor, Some(tx)));
+        let _ = self.tx.send(WorkerMsg::RecolorRefresh(doc_id, keys, tx));
         rx
+    }
+
+    /// 读回 `doc_id` 文档当前 raw 缓存条目数（同步；只读，测试/基准用「全缓存 vs 可见集」
+    /// 比例证据）。文档未打开 / 已关闭 → 0。
+    pub fn raw_cache_len(&self, doc_id: DocId) -> usize {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::RawCacheLen(doc_id, tx));
+        rx.recv().unwrap_or(0)
     }
 
     /// 请求某页文本层数据（异步、低优先级）。返回接收结果的通道。
@@ -870,15 +899,31 @@ impl PdfWorker {
         // 槽、不重置门控、不重调 pdfium 栅格（根治「夜间档加载慢」）。与 recolor 同生命周期，
         // 关闭文档时一并清理（防 doc_id 复用残留旧原图）。
         let mut raw_cache: HashMap<DocId, Vec<RawEntry>> = HashMap::new();
+        // 在途的重着色刷新分帧状态（见 [`PendingRefresh`]）：切档只刷可见集、逐批回传。
+        let mut pending_refresh: Option<PendingRefresh> = None;
+        // 各文档最近一次**已完成**刷新所用的参数：worker 端同参短路基准（同参不再重复回传）。
+        let mut last_refreshed: HashMap<DocId, Option<RecolorParams>> = HashMap::new();
         loop {
             // 现积压一次性分桶入队（每桶 FIFO；跨类优先序由下方「先取高优先桶」体现）。
-            // `SetRecolor` 是控制消息：**当下应用**，不入桶——保证早于同批次的任何渲染
-            // 出队（view 先发 SetRecolor、再重派瓦片，二事经单通道 FIFO 保序）。
+            // `SetRecolor`/`RecolorRefresh` 是控制消息：**当下应用**，不入桶——保证早于同一
+            // 批次的任何渲染出队（view 先发 SetRecolor 置参数、再发 RecolorRefresh 圈可见集，
+            // 二事经单通道 FIFO 保序）。
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    WorkerMsg::SetRecolor(doc_id, params, refresh) => {
-                        // 更新参数 + 对缓存原图现算重着色副本回传（同参短路、切档不重栅）。
-                        apply_recolor_switch(&mut recolor, &raw_cache, doc_id, params, refresh);
+                    WorkerMsg::SetRecolor(doc_id, params) => {
+                        // 只更新参数（重着色刷新走 RecolorRefresh）；同参写入幂等，跳过重复。
+                        recolor.insert(doc_id, params);
+                    }
+                    WorkerMsg::RecolorRefresh(doc_id, keys, tx) => {
+                        // 圈定可见集 → 挂分帧状态（首轮循环的 4.5 步开始逐批回传）。
+                        start_recolor_refresh(
+                            &mut pending_refresh,
+                            &mut last_refreshed,
+                            &recolor,
+                            doc_id,
+                            keys,
+                            tx,
+                        );
                     }
                     other => enqueue_msg(other, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q),
                 }
@@ -989,8 +1034,13 @@ impl PdfWorker {
                         stores.remove(&doc_id);
                         // 重着色按文档键控：关闭即清理（防 doc_id 复用残留旧参数）。
                         recolor.remove(&doc_id);
+                        last_refreshed.remove(&doc_id);
                         // 未着色原图缓存随文档一起清理（释放 CPU 内存，防跨文档残留）。
                         raw_cache.remove(&doc_id);
+                        // 关闭本应在途的重着色刷新（残留分帧状态会在空 raw 上空转）。
+                        if pending_refresh.as_ref().is_some_and(|pr| pr.doc_id == doc_id) {
+                            pending_refresh = None;
+                        }
                     }
                     WorkerMsg::Text(doc_id, page, tx) => {
                         let result = docs
@@ -1149,6 +1199,10 @@ impl PdfWorker {
                         let r = stores.get(&doc_id).cloned();
                         let _ = tx.send(r);
                     }
+                    WorkerMsg::RawCacheLen(doc_id, tx) => {
+                        let n = raw_cache.get(&doc_id).map_or(0, |v| v.len());
+                        let _ = tx.send(n);
+                    }
                     WorkerMsg::ReadAnnotations(doc_id, page, tx) => {
                         let result = match docs.get(&doc_id) {
                             Some(doc) => read_annotations(doc, page)
@@ -1175,13 +1229,69 @@ impl PdfWorker {
                 }
                 continue;
             }
-            // 5) 真空闲：阻塞等新消息（只有在既无排队消息也无在途检索时才会真阻塞）。
-            //    `SetRecolor` 与上方 sweep 走同一拦截：收到当下应用，不入桶（否则经
-            //    enqueue_msg 落到 rest_q 会撞 `_ => unreachable!` 把工作线程打死）。
+            // 4.5) 重着色刷新**分帧分批**回传：每轮循环只就地重着色并回传一个
+            //      [`RECOLOR_BATCH_BYTES`] 的批次（≥ 1 条，首批 = scope 首=近中心页），随后
+            //      `continue` 回主循环——渲染/占位消息可在批次间插队，主线程每帧也只收当前
+            //      已到达的批次。全部回传完（keys 空）→ 记录 `last_refreshed`、断通道；
+            //      raw 恒为未着色单真值（现算现发，绝不改缓存）。
+            if let Some(mut pr) = pending_refresh.take() {
+                let mut budget = RECOLOR_BATCH_BYTES as i64;
+                let mut batch: Vec<&RawEntry> = Vec::new();
+                while let Some(key) = pr.keys.front().copied() {
+                    // 查该 key 的缓存原图（已被 FIFO 挤出 → 跳过该 key：view 保持旧着色，
+                    // 用户滚回/缩放到该格时走常规渲染按新参数现算，不补回传）。
+                    let raw = raw_cache
+                        .get(&pr.doc_id)
+                        .and_then(|v| {
+                            v.iter().find(|e| {
+                                e.kind == key.kind
+                                    && e.page == key.page
+                                    && e.row == key.row
+                                    && e.col == key.col
+                            })
+                        });
+                    match raw {
+                        Some(raw) => {
+                            let cost = raw.bgra.len() as i64;
+                            if !batch.is_empty() && cost > budget {
+                                break; // 本批预算满（≥ 1 条已装入）
+                            }
+                            budget -= cost;
+                            batch.push(raw);
+                            pr.keys.pop_front();
+                        }
+                        None => {
+                            pr.keys.pop_front();
+                        }
+                    }
+                }
+                for en in recolored_entries(&batch, pr.params) {
+                    let _ = pr.tx.send(en);
+                }
+                if pr.keys.is_empty() {
+                    // 本批把剩余全发完 → 记录完成参数（同参短路基准），tx 随后 drop 断通道。
+                    last_refreshed.insert(pr.doc_id, pr.params);
+                } else {
+                    pending_refresh = Some(pr); // 下轮循环继续下一批
+                }
+                continue;
+            }
+            // 5) 真空闲：阻塞等新消息（只有在既无排队消息、无在途检索/刷新时才真阻塞）。
+            //    `SetRecolor`/`RecolorRefresh` 与上方 sweep 走同一拦截：收到当下应用，不入桶
+            //    （否则经 enqueue_msg 落到 rest_q 会撞 `_ => unreachable!` 把工作线程打死）。
             match rx.recv() {
-                Ok(WorkerMsg::SetRecolor(doc_id, params, refresh)) => {
-                    // 更新参数 + 对缓存原图现算重着色副本回传（同参短路、切档不重栅）。
-                    apply_recolor_switch(&mut recolor, &raw_cache, doc_id, params, refresh);
+                Ok(WorkerMsg::SetRecolor(doc_id, params)) => {
+                    recolor.insert(doc_id, params);
+                }
+                Ok(WorkerMsg::RecolorRefresh(doc_id, keys, tx)) => {
+                    start_recolor_refresh(
+                        &mut pending_refresh,
+                        &mut last_refreshed,
+                        &recolor,
+                        doc_id,
+                        keys,
+                        tx,
+                    );
                 }
                 Ok(msg) => enqueue_msg(msg, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q),
                 Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
@@ -1830,13 +1940,10 @@ fn finalize_render(
     out
 }
 
-/// 对某文档已缓存的原图按 `params` 重着色，产出全部待回传的显示副本（**不触碰缓存 raw**，
-/// 每条约一次 memcpy + 一次 apply_recolor）。`None`（默认档）直通 = 原图副本。纯函数：
-/// 供工作线程 `SetRecolor` 发帧，亦可直接单测（K27 证据入仓）。
-fn recolored_entries(
-    cache: &[RawEntry],
-    params: Option<RecolorParams>,
-) -> Vec<RecolorEntry> {
+/// 对一批已缓存**未着色原图**按 `params` 重着色，产出待回传的显示副本（**不触碰缓存 raw**，
+/// 每条一次 memcpy + 一次 apply_recolor）。`None`（默认档）直通 = 原图副本。纯函数：
+/// 供工作线程分批回传发帧，亦可直接单测（K27 证据入仓）。
+fn recolored_entries(cache: &[&RawEntry], params: Option<RecolorParams>) -> Vec<RecolorEntry> {
     cache
         .iter()
         .map(|e| {
@@ -1862,32 +1969,45 @@ fn recolored_entries(
         .collect()
 }
 
-/// `SetRecolor` 的统一处置（sweep 与空闲 `rx.recv` 两处共用）：更新文档重着色参数 +
-/// （参数有变且调用方要刷新时）对缓存原图现算重着色副本回传。**同参短路**：与已存参数
-/// 一致则什么都不做（不重复刷新）。
-fn apply_recolor_switch(
-    recolor: &mut HashMap<DocId, Option<RecolorParams>>,
-    raw_cache: &HashMap<DocId, Vec<RawEntry>>,
+/// 重着色刷新**单批回传字节预算**：worker 每轮循环至多就地重着色并回传这么多字节的
+/// 新着色副本（≥ 1 条），下一轮循环再下一批——把「一次把可见集全压到通道/主线程」收敛
+/// 为「按既有泵/收集节奏分帧渐进」；scope 由 view 按近中心排序，首批即首可视页。
+const RECOLOR_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 在途的重着色刷新分帧状态：`keys` 为待回传的可见集 key 队列（view 按近中心排序，
+/// 先入先出 = 先刷新首可视页）。每轮循环只发一批 [`RECOLOR_BATCH_BYTES`]（≥ 1 条），
+/// 发完断通道（`tx` drop）→ view 侧 drain 完即清 `pending_recolor`。
+/// raw 始终保留为未着色单真值（现算现发，绝不着色缓存本体）。
+struct PendingRefresh {
     doc_id: DocId,
+    keys: VecDeque<RecolorKey>,
+    tx: mpsc::Sender<RecolorEntry>,
     params: Option<RecolorParams>,
-    refresh: Option<mpsc::Sender<RecolorEntry>>,
+}
+
+/// `RecolorRefresh` 的登记（sweep 与空闲 `rx.recv` 两处共用）：挂到 `pending_refresh`，
+/// 主循环随后按批分帧回传。**同参短路（worker 端双保险）**：与上次**已完成**的刷新参数
+/// 一致时直接断开通道（不重复回传同样内容）——view 侧同参已短路，此处防重复派发冗余。
+fn start_recolor_refresh(
+    pending_refresh: &mut Option<PendingRefresh>,
+    last_refreshed: &mut HashMap<DocId, Option<RecolorParams>>,
+    recolor: &HashMap<DocId, Option<RecolorParams>>,
+    doc_id: DocId,
+    keys: Vec<RecolorKey>,
+    tx: mpsc::Sender<RecolorEntry>,
 ) {
-    let same = recolor.get(&doc_id).copied().flatten() == params;
-    recolor.insert(doc_id, params);
-    if same {
+    let params = recolor.get(&doc_id).copied().flatten();
+    if last_refreshed.get(&doc_id).copied().flatten() == params {
+        // 同参短路：上次已用同参数完成过刷新 → 无新内容可回传。
+        drop(tx);
         return;
     }
-    let Some(tx) = refresh else {
-        return;
-    };
-    let entries = recolored_entries(
-        raw_cache.get(&doc_id).map(Vec::as_slice).unwrap_or(&[]),
+    *pending_refresh = Some(PendingRefresh {
+        doc_id,
+        keys: keys.into(),
+        tx,
         params,
-    );
-    for en in entries {
-        let _ = tx.send(en);
-    }
-    // `tx` 在本函数返回时 drop → 通道断开 → view 侧 drain 完即清 `pending_recolor`。
+    });
 }
 
 fn render_page(
@@ -2770,7 +2890,7 @@ mod tests {
             bg: [0x20, 0x20, 0x20],
             ink: Some([0xD8, 0xD8, 0xD8]),
         };
-        let entries = recolored_entries(&cache, Some(night));
+        let entries = recolored_entries(&[&cache[0]], Some(night));
         assert_eq!(entries.len(), 1, "每条缓存原图应回传一条重着色副本");
         let e = &entries[0];
         assert_eq!(e.kind, RawKind::Tile);
@@ -2782,7 +2902,7 @@ mod tests {
         assert_eq!(cache[0].bgra, raw, "缓存原图应保持未着色单真值");
 
         // 默认档（None）直通：副本 = 原图原样（清回默认不重栅、不改像素）。
-        let passthrough = recolored_entries(&cache, None);
+        let passthrough = recolored_entries(&[&cache[0]], None);
         assert_eq!(passthrough[0].bgra, raw, "None 直通应原样回传原图副本");
         assert_eq!(cache[0].bgra, raw, "直通路径同样不触碰缓存原图");
     }

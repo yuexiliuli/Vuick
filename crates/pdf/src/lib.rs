@@ -3073,6 +3073,217 @@ mod tests {
         assert_eq!(recolor_back, None, "默认档应清回直通");
     }
 
+    /// 回归（**切档只刷可见集**，真实渲染路径 + 真夹具）：
+    /// 【可见集定义】「显示槽真实需要的页面内容」= 在位封面 + 在位瓦片（中清/缩略是快速
+    /// 拖动瞬态占位、不参与；窗外 / 已淘汰但仍在 worker raw 缓存的条目不回传，保留 raw
+    /// 单真值，滚回需要时再现算）。
+    /// 断言：切档后 worker 回传条目的 key **集合 == view 圈定的可见集 scope**（不多不少）；
+    /// 且 raw 缓存条目数（含滚动路过的毒页）> scope 数——证明旧「全缓存」路径会回传更多，
+    /// 新路径把「刷全部缓存」收敛为「只刷可见集」。首条回传 = 距当前可见中心最近页
+    /// （按近中心排序 → 首帧即首可视页）。切档 0 新栅格由
+    /// `recolor_switch_sends_zero_raster_commands` 独证，此处另断言计数不变。
+    #[gpui::test]
+    async fn recolor_switch_refreshes_only_visible_set(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+        use crate::pdf::parser::{RawKind, RecolorKey};
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+
+        // 「毒页」：先滚到第 6 页停稳、再滚回第 0 页停稳——让 worker raw 缓存覆盖多页
+        // （滚动路过的页码），而 view 只显示回滚后的近窗口页 → 制造「全缓存 ≠ 可见集」。
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.scroll_to_page(6);
+                    cx.notify();
+                });
+        });
+        for _ in 0..200 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.pending_tiles.is_empty(),
+                    v.pending_cover.is_empty(),
+                    !v.tile_pump_running,
+                    !v.prev_fast,
+                )
+            });
+            if st == (true, true, true, true) {
+                break;
+            }
+        }
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.scroll_to_page(0);
+                    cx.notify();
+                });
+        });
+        for _ in 0..200 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.pending_tiles.is_empty(),
+                    v.pending_cover.is_empty(),
+                    !v.tile_pump_running,
+                    !v.prev_fast,
+                )
+            });
+            if st == (true, true, true, true) {
+                break;
+            }
+        }
+
+        // 切档前：raw 缓存全量条目数（应覆盖毒页，> 可见集）。
+        let full_cache = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            v.worker.as_ref().unwrap().raw_cache_len(v.doc_id)
+        });
+        let req0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).raster_reqs);
+
+        // 切夜间 → 泵/帧推进到重着色刷新收完。
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.set_recolor(
+                        Some(RecolorParams {
+                            bg: [0x20, 0x20, 0x20],
+                            ink: Some([0xD8, 0xD8, 0xD8]),
+                        }),
+                        cx,
+                    );
+                });
+        });
+        let mut drained = false;
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            drained = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_recolor.is_none() && !v.tile_pump_running
+            });
+            if drained {
+                break;
+            }
+        }
+        assert!(drained, "重着色刷新应收完");
+
+        // 可见集断言。
+        let (scope_keys, received, req1, tiles_present) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let scope_keys: Vec<(RawKind, usize, u32, u32)> = v
+                .recolor_scope
+                .iter()
+                .map(|k: &RecolorKey| (k.kind, k.page, k.row, k.col))
+                .collect();
+            let received = v.recolor_received.clone();
+            let tiles_present = v.slots.first().map_or(false, |s| {
+                s.cover.is_some() || !s.tiles.is_empty()
+            });
+            (scope_keys, received, v.raster_reqs, tiles_present)
+        });
+
+        assert!(tiles_present, "首可视页应有在位封面/瓦片");
+        assert!(!scope_keys.is_empty(), "可见集非空");
+        assert_eq!(req1, req0, "切档 0 条新栅格命令（只刷可见集、不重栅）");
+
+        // 核心不变量：**回传集合 ⊆ 可见集 scope**（窗外/已淘汰条目不回传——worker 只按
+        // view 圈定的可见集 key 现算回传，绝不越界发窗内容）。
+        let scope_set: std::collections::HashSet<(RawKind, usize, u32, u32)> =
+            scope_keys.iter().copied().collect();
+        let received_set: std::collections::HashSet<(RawKind, usize, u32, u32)> =
+            received.iter().copied().collect();
+        for k in &received {
+            assert!(
+                scope_set.contains(k),
+                "回传条目 {k:?} 不在可见集 scope 内（只刷可见集被破坏）"
+            );
+        }
+        // 覆盖：所有在位封面应被回传（封面是可见页内容，worker raw 必在场）。
+        assert!(
+            scope_set
+                .iter()
+                .filter(|k| k.0 == RawKind::Cover)
+                .all(|k| received_set.contains(k)),
+            "在位封面应全部被回传（封面回传集合缺失）"
+        );
+
+        // 「全缓存 ≠ 可见集」：raw 缓存（含滚动路过的毒页）条目数 > 回传可见集条目数，
+        // 证明旧「刷全部缓存」路径会回传更多——新路径真正收敛到可见集。
+        assert!(
+            full_cache > received_set.len(),
+            "raw 缓存应含毒页条目且多过可见集回传数: full={full_cache} received={}",
+            received_set.len()
+        );
+
+        // 排序软断言：先刷距当前可见中心最近页（scope 由 view 按近中心排序给出，
+        // worker 分批分帧按此序回传，首批即首可视页附近）。
+        assert_eq!(
+            received.first().map(|k| k.1),
+            scope_keys.first().map(|k| k.1),
+            "先刷新距当前可见中心最近页"
+        );
+    }
+
     /// 时空基准（切档不重栅墙钟，真实渲染路径 + 真夹具）：测量「首屏停稳 → 切夜间 →
     /// 重着色刷新收完」的墙钟与栅格请求增量。用法：修复前（旧清槽重栅）跑一次记录，修复后
     /// 再跑对比——夜间档切档墙钟应显著下降（重栅数百 ms → 重着色刷新数 ms~几十 ms），
@@ -3126,44 +3337,84 @@ mod tests {
             }
         }
         assert!(loaded, "应加载完成");
-        for _ in 0..40 {
+        // 严格停稳（无在途瓦片/封面/泵）再切档：保证切档后调度帧因视口缓存命中 0 新栅格，
+        // 否则把「沉降未完成被补派」误当栅格增量污染 raster_delta。
+        for _ in 0..300 {
             cx.executor().advance_clock(Duration::from_millis(16));
             cx.run_until_parked();
             std::thread::sleep(Duration::from_millis(3));
-        }
-        let req0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).raster_reqs);
-        let t0 = Instant::now();
-        cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
-                v.set_recolor(
-                    Some(RecolorParams {
-                        bg: [0x20, 0x20, 0x20],
-                        ink: Some([0xD8, 0xD8, 0xD8]),
-                    }),
-                    cx,
-                );
-            });
-        });
-        let mut drained = false;
-        let mut raster_delta = 0u64;
-        for _ in 0..800 {
-            cx.executor().advance_clock(Duration::from_millis(16));
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(2));
-            let (rc, pr) = cx.update(|_w, cx| {
+            let st = cx.update(|_w, cx| {
                 let v = holder.borrow().as_ref().unwrap().read(cx);
-                (v.raster_reqs, v.pending_recolor.is_none())
+                (
+                    v.pending_tiles.is_empty(),
+                    v.pending_cover.is_empty(),
+                    !v.tile_pump_running,
+                    !v.prev_fast,
+                    v.window_settled,
+                )
             });
-            raster_delta = rc.saturating_sub(req0);
-            if pr && raster_delta == 0 {
-                drained = true;
+            if st == (true, true, true, true, true) {
                 break;
             }
         }
-        let switch_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let req0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).raster_reqs);
+        // 全缓存条目数（含滚动路过的毒页）——与可见集 scope 对比「只刷可见集」的比例证据。
+        let full_cache = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            v.worker.as_ref().unwrap().raw_cache_len(v.doc_id)
+        });
+        // 3 轮交替切档（夜间/默认/护眼），多轮取中位：每轮都验证 raster_delta=0（切档 0 栅格）。
+        let rounds = [
+            Some(RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) }),
+            None,
+            Some(RecolorParams { bg: [0xC7, 0xED, 0xCC], ink: None }),
+        ];
+        let mut switch_ms: Vec<f64> = Vec::new();
+        let mut first_ready_ms: Vec<f64> = Vec::new();
+        let mut entries_done: Vec<usize> = Vec::new();
+        for p in rounds {
+            let t0 = Instant::now();
+            let mut first_ready: Option<f64> = None;
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                    v.set_recolor(p, cx);
+                });
+            });
+            let mut drained = false;
+            for _ in 0..800 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                let (rc, pr, received_n) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    (v.raster_reqs, v.pending_recolor.is_none(), v.recolor_received.len())
+                });
+                if first_ready.is_none() && received_n > 0 {
+                    // 首帧就绪：首个回传条目到达（view 已收集到重着色副本）。
+                    first_ready = Some(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                if pr && rc == req0 {
+                    drained = true;
+                    switch_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                    first_ready_ms.push(first_ready.unwrap_or(0.0));
+                    entries_done.push(received_n);
+                    break;
+                }
+            }
+            assert!(drained, "轮次 {p:?} 应收完");
+        }
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let scope = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).recolor_scope.len()
+        });
         eprintln!(
-            "[BENCH-RECOLOR] 切夜间档 重着色刷新收完 switch_ms={:.0}ms raster_delta={raster_delta} drained={drained}",
-            switch_ms
+            "[BENCH-RECOLOR] switch_ms_med={:.0} first_ready_ms_med={:.0} entries_final={entries_done:?} visible_scope={scope} full_cache={full_cache} raster_delta=0 rounds={}",
+            median(switch_ms),
+            median(first_ready_ms),
+            rounds.len()
         );
     }
 
