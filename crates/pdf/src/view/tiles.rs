@@ -227,12 +227,29 @@ impl PdfViewer {
             }
         }
 
-        // 封面（**后派**）：**只服务封面窗 [cover_first..=cover_last]**（可见页 + 滚动方向
-        // 前瞻 1 页；非 MARGIN 全窗——否则候选页数超驻留上限 → 换页风暴）。请求窗与
-        // `evict_covers` 驻留窗一致，避免「派了即逐」。中心页优先出队。**T1**：封面与瓦片
-        // 同密度的页因规划跳过已无瓦片，封面即是该页唯一供给 → 无同页双渲。
-        let cover_worker = self.worker.clone().unwrap();
+        // 封面（**后派**，`schedule_covers` 内含 evict）：**只服务封面窗 [cover_first..=cover_last]**
+        // （可见页 + 滚动方向前瞻 1 页；非 MARGIN 全窗——否则候选页数超驻留上限 → 换页风暴）。
+        // 请求窗与 `evict_covers` 驻留窗一致，避免「派了即逐」。中心页优先出队。**T1**：封面与
+        // 瓦片同密度的页因规划跳过已无瓦片，封面即是该页唯一供给 → 无同页双渲。
         let center_vis = (vis_first + vis_last) / 2;
+        self.schedule_covers(cover_first, cover_last, center_vis, retire, page_width, scale_factor);
+    }
+
+    /// 封面派发（`schedule_tiles` 停稳帧 与 `schedule_fast_covers` 中速带共用）：只服务封面窗
+    /// [cover_first..=cover_last]，按离可见中心 `center_vis` 近远排序、`COVER_INFLIGHT` 封顶。
+    /// 缩放过期封面移入 `prev_cover` 过渡桥再重派新密度；派后 `evict_covers` 维护封面驻留窗 +
+    /// 方向退位页转存有界桥（F2）。封面 = 满显示密度整页（`cover_scale == render_scale`），
+    /// 一渲铺满、逐片锐化——「滚动即清晰」的中速带主战场。
+    fn schedule_covers(
+        &mut self,
+        cover_first: usize,
+        cover_last: usize,
+        center_vis: usize,
+        retire: Option<usize>,
+        page_width: f32,
+        scale_factor: f32,
+    ) {
+        let cover_worker = self.worker.clone().unwrap();
         let mut cover_order: Vec<usize> = (cover_first..=cover_last).collect();
         cover_order.sort_by_key(|&p| (p as i64 - center_vis as i64).unsigned_abs());
         for page in cover_order {
@@ -398,26 +415,78 @@ impl PdfViewer {
         need
     }
 
-    // ---- 快速拖动占位 ----
+    // ---- 快速拖动占位（F3：中速带满密度封面优先）----
 
-    /// 快速拖动占位：为可见页派发 L0.5 中清（比缩略图清晰，可辨识标题/段落）、
-    /// L0 缩略图（纯内存，无磁盘缓存）。停止后常态调度自动补齐瓦片、替换占位。
-    pub(super) fn schedule_placeholders(
+    /// 中速带（[`SpeedState::Fast`]）调度：**满密度封面优先**——为可见页 + 滚动方向前瞻 1 页
+    /// 按 `schedule_covers` 派发整页锐化封面（复用停稳帧同一封面循环：cover_affordable + 在途
+    /// 守卫 + [`COVER_INFLIGHT`] 预算 + F2 的 cover_first/cover_last 窗与退位桥），新进视口页
+    /// 滚到哪清晰到哪，不再落 520/260 低清占位。**不派瓦片**（渲染队列不加活，防「封面堵在
+    /// 瓦片之后」）。
+    ///
+    /// 对「封面不可负担」（病理性 > [`COVER_SIZE_BUDGET`] 的页）回退 `schedule_placeholders`
+    /// 的中清/缩略占位（保留既有 LOD 路径作回退，不裸退「加载中」）。
+    pub(super) fn schedule_fast_covers(
         &mut self,
         window: &Window,
         start: usize,
         end: usize,
         scroll_y: f32,
         viewport_h: f32,
+        page_width: f32,
+        scale_factor: f32,
+    ) {
+        // 封面窗与 `schedule_tiles` 同源（可见页 + 滚动方向前瞻 1；方向未知退对称 ±1）。
+        let (vis_first, vis_last) =
+            self.visible_page_span(start, end, scroll_y, viewport_h, page_width, window);
+        let vis_first = vis_first.unwrap_or(start);
+        let vis_last = vis_last.unwrap_or(end);
+        let first = vis_first.saturating_sub(1);
+        let last = (vis_last + 1).min(self.dims.len().saturating_sub(1));
+        let (cover_first, cover_last) = match self.scroll_dir {
+            1 => (vis_first, (vis_last + 1).min(self.dims.len().saturating_sub(1))),
+            -1 => (vis_first.saturating_sub(1), vis_last),
+            _ => (first, last),
+        };
+        let retire = match self.scroll_dir {
+            1 => cover_first.checked_sub(1),
+            -1 => cover_last.checked_add(1).filter(|&p| p < self.dims.len()),
+            _ => None,
+        };
+        let center_vis = (vis_first + vis_last) / 2;
+        // ① 满密度封面（封面不可负担的页本循环自然跳过，不派）。
+        self.schedule_covers(cover_first, cover_last, center_vis, retire, page_width, scale_factor);
+        // ② 回退占位：仅「无封面/无封面在途」的页（封面满密度，占位是它的低价兜底，
+        //    不重复占用）；已由 `schedule_covers` 派的页此处跳过。
+        self.schedule_placeholders(window, start, end, scroll_y, viewport_h, scale_factor);
+    }
+
+    /// LOD 占位派发（中速带封面不可负担页的回退路径）：可见页派 L0.5 中清（比缩略图清晰，
+    /// 可辨识标题/段落）、L0 缩略图（纯内存，无磁盘缓存）。**只为「无满密度封面（或在途）」
+    /// 的页派发**——F3 起封面是中速带主供给，中清/缩略只给病理性超预算页兜底；停稳后常态
+    /// 调度自动补齐瓦片、替换占位。旧「减速期瓦片预热」段随 F3 移除（中速带改派满密度封面，
+    /// 停稳帧 `schedule_tiles` 补瓦片；派瓦片只会让封面排在瓦片之后、违背「滚到哪清晰到哪」）。
+    pub(super) fn schedule_placeholders(
+        &mut self,
+        _window: &Window,
+        start: usize,
+        end: usize,
+        _scroll_y: f32,
+        _viewport_h: f32,
         scale_factor: f32,
     ) {
         let worker = self.worker.clone().unwrap();
         // 1) L0.5 中清：优先派发（比缩略图清晰），独立额度不挤占瓦片/缩略图
+        let has_cover = |v: &Self, page: usize| {
+            v.slots[page].cover.is_some() || v.pending_cover.contains_key(&page)
+        };
         if self.pending_mid.len() < MAX_MID_INFLIGHT {
             let mut budget = MAX_MID_INFLIGHT - self.pending_mid.len();
             for page in start..=end {
                 if budget == 0 {
                     break;
+                }
+                if has_cover(self, page) {
+                    continue; // 满密度封面（或在途）在位 → 无需占位代价
                 }
                 if self.mid_cached(page).is_some() {
                     continue; // 主线程缓存命中：直接复用（含 LRU 触摸），不发 WorkerMsg::Mid
@@ -432,12 +501,15 @@ impl PdfViewer {
                 budget -= 1;
             }
         }
-        // 2) L0 缩略图：仅为「无中清/无在途中清」的可见页派发
+        // 2) L0 缩略图：仅为「无中清/无在途中清」且「无封面」的可见页派发
         if self.pending_thumb.len() < MAX_THUMB_INFLIGHT {
             let mut tb = MAX_THUMB_INFLIGHT - self.pending_thumb.len();
             for page in start..=end {
                 if tb == 0 {
                     break;
+                }
+                if has_cover(self, page) {
+                    continue;
                 }
                 if self.slots[page].thumb.is_some()
                     || self.slots[page].thumb_loading
@@ -451,59 +523,6 @@ impl PdfViewer {
                 self.raster_reqs += 1; // 切档不重栅回归计数
                 self.pending_thumb.insert(page, rx);
                 tb -= 1;
-            }
-        }
-        // 3) 减速期可见条带瓦片预热：仍 fast（迟滞未退出）但速度已降到「进入阈值」之下 →
-        //    用户即将停稳。此时把**真正可见页**缺失的瓦片提前派发（中心页优先、
-        //    TILE_INFLIGHT 封顶）：停稳换挡瞬间可见条带多半已被瓦片填满 → “停稳即清晰”
-        //    走快路径（小片 ~2-8ms 逐片出图）。
-        //    ⚠️ 封面是“慢路径”的修正依据：日志佐证 **[PAGE-RENDER] scale=2.47 整页封面
-        //    20-40ms 一张、窗内 2-3 张串行，且堵在瓦片前面**；而“停稳即清晰”的页都是纯瓦片
-        //    填满、没有整页封面。故这里不再派封面（原来预热的封面恰恰制造了“模糊→换挡→
-        //    重新清晰”的慢感）；封面改由停稳帧 `schedule_tiles` 在瓦片之后预取邻居/下折叠。
-        //    ⚠️ 可见区间必须与 `schedule_tiles` 同源（`page_visible_rect` 非空页），不能用
-        //    `keep_window` 的算术中心（含 MARGIN 缓冲页，会偏出真正可见页）。
-        //    风暴安全：速度 > MOVE_THRESHOLD_PX 的长距飞掠不派（避免小片洪流）；同一片
-        //    已在 slot / 在途则跳过；TILE_INFLIGHT 封顶。（本函数只在 `prev_fast` 分支被调用。）
-        if self.scroll_velocity < MOVE_THRESHOLD_PX {
-            let page_width = self.page_width();
-            let (vis_first, vis_last) =
-                self.visible_page_span(start, end, scroll_y, viewport_h, page_width, window);
-            if let (Some(vf), Some(vl)) = (vis_first, vis_last) {
-                // 可见区间中心（非 keep_window 算术中心：含 MARGIN 缓冲页会偏出真正可见页，
-                // 见上方注释）。瓦片几何与停稳帧 `schedule_tiles` 同源（`plan_tiles_in_window`）。
-                let center_vis = (vf + vl) / 2;
-                let mut need = self.plan_tiles_in_window(
-                    vf..=vl,
-                    center_vis,
-                    page_width,
-                    scale_factor,
-                    scroll_y,
-                    viewport_h,
-                    window,
-                );
-                // 中心页/中心行优先，只补在途预算内
-                need.sort_by_key(|&(_, _, _, d)| d);
-                let budget = TILE_INFLIGHT.saturating_sub(self.pending_tiles.len());
-                for (page, row, col, _) in need.into_iter().take(budget) {
-                    if timing_view() {
-                        eprintln!("[{:.1}ms] [VIEW-TILE-REQ] warm p{page} r{row}c{col}", crate::pdf::timing_ms());
-                    }
-                    let scale = render_scale(page_width, scale_factor, self.dims[page].0);
-                    let rx = worker.request_tile(
-                        self.doc_id,
-                        TileRequest {
-                            page,
-                            scale,
-                            tile_size: TILE_SIZE,
-                            row,
-                            col,
-                        },
-                    );
-                    self.raster_reqs += 1; // 切档不重栅回归计数
-                    self.tile_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
-                    self.pending_tiles.insert((page, row, col), (scale, rx));
-                }
             }
         }
     }
@@ -920,17 +939,57 @@ impl PdfViewer {
 
     // ---- 快速拖动判定 / 中清缓存命中 ----
 
-    /// 迟滞比较：进入快速模式用 [`MOVE_THRESHOLD_PX`]，退出用其×
-    /// [`MOVE_THRESHOLD_LOWER_RATIO`]（更小）；中间区间保持上一状态。
-    /// 避免临界速度下 LOD 降级/恢复反复横跳造成调度抖动。
+    /// 迟滞比较（F3 三速状态机）：进入快速态用 [`MOVE_THRESHOLD_PX`]，退出用其×
+    /// [`MOVE_THRESHOLD_LOWER_RATIO`]（更小）；再上跳高速带（VeryFast）用 ×
+    /// [`MOVE_THRESHOLD_VERY_RATIO`]（≈480px/帧），退出再乘退出比率（≈336px/帧）。
+    /// 中间区间保持上一状态，避免临界速度下 LOD 降级/恢复反复横跳造成调度抖动。
+    /// `speed_state` 为新真值，`prev_fast` = `is_fast()` 派生布尔（两者恒同步）。
     pub(super) fn update_fast_flag(&mut self) {
         let enter = MOVE_THRESHOLD_PX;
         let exit = MOVE_THRESHOLD_PX * MOVE_THRESHOLD_LOWER_RATIO;
-        self.prev_fast = if self.prev_fast {
-            self.scroll_velocity > exit
-        } else {
-            self.scroll_velocity > enter
+        let very = MOVE_THRESHOLD_PX * MOVE_THRESHOLD_VERY_RATIO;
+        let very_exit = very * MOVE_THRESHOLD_LOWER_RATIO;
+        let v = self.scroll_velocity;
+        self.speed_state = match self.speed_state {
+            // 非快速带：近静止 → Idle；穿 enter → Fast；高速 flick（首帧即 >very）直接冲进
+            // VeryFast（纯平移，不派新栅格——见 `ensure_window` 的高速带分支）。
+            SpeedState::Idle | SpeedState::Slow => {
+                if v > very {
+                    SpeedState::VeryFast
+                } else if v > enter {
+                    SpeedState::Fast
+                } else if v > 1.0 {
+                    SpeedState::Slow
+                } else {
+                    SpeedState::Idle
+                }
+            }
+            // 中速带内：向上穿 very → VeryFast；向下穿 exit → 慢速（保持进入阈值迟滞）。
+            SpeedState::Fast => {
+                if v > very {
+                    SpeedState::VeryFast
+                } else if v > exit {
+                    SpeedState::Fast
+                } else if v > 1.0 {
+                    SpeedState::Slow
+                } else {
+                    SpeedState::Idle
+                }
+            }
+            // 高速带内：退出用更小的 very_exit（防 480px/帧 附近横跳）；回落幅度大直接进 Fast。
+            SpeedState::VeryFast => {
+                if v > very_exit {
+                    SpeedState::VeryFast
+                } else if v > exit {
+                    SpeedState::Fast
+                } else if v > 1.0 {
+                    SpeedState::Slow
+                } else {
+                    SpeedState::Idle
+                }
+            }
         };
+        self.prev_fast = self.speed_state.is_fast();
     }
 
     /// P2：O(1) 主线程中清缓存命中（`slots[i].mid` 即内存缓存本体）。命中触摸 `mid_lru`

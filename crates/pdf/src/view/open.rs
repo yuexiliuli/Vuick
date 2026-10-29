@@ -40,6 +40,7 @@ impl PdfViewer {
             scroll_dir: 0,
             scroll_velocity: 0.0,
             prev_fast: false,
+            speed_state: SpeedState::Idle,
             scroll: ScrollHandle::new(),
             loading: true,
             load_error: None,
@@ -637,12 +638,29 @@ impl PdfViewer {
             self.pending_drops.extend(dropped);
         }
 
-        // 6) 调度：常态 → 瓦片（视口附近按需栅格化）；快速拖动 → 缩略/中清占位
-        //    （瓦片停止后自动补齐）。之后统一做瓦片字节预算淘汰。
-        if self.prev_fast {
-            self.schedule_placeholders(window, start, end, scroll_y, viewport_h, scale_factor);
-        } else {
-            self.schedule_tiles(window, start, end, page_width, scale_factor, scroll_y);
+        // 6) 调度（F3 三速分带）：常态（Idle/Slow）→ 瓦片+封面（瓦片先派防封面堵小片）；
+        //    中速带（Fast）→ 满密度封面优先、封面不可负担页回退中清/缩略占位；
+        //    高速带（VeryFast）→ 纯平移不派新栅格（含占位，渲染队列不加活），新进页由 F4
+        //    预取走廊兜底。之后统一做瓦片字节预算淘汰。
+        match self.speed_state {
+            SpeedState::Idle | SpeedState::Slow => {
+                self.schedule_tiles(window, start, end, page_width, scale_factor, scroll_y);
+            }
+            SpeedState::Fast => {
+                self.schedule_fast_covers(
+                    window,
+                    start,
+                    end,
+                    scroll_y,
+                    viewport_h,
+                    page_width,
+                    scale_factor,
+                );
+            }
+            SpeedState::VeryFast => {
+                // 纯平移：不派任何新栅格（封面/瓦片/占位一律不加活）。已缓存封面/瓦片原位
+                // 即锐；新进视口未缓存页短暂显示「加载中」，待 F4 预取走廊兜底（本波未实现）。
+            }
         }
         self.evict_tiles(start, end, scale_factor);
 

@@ -2108,6 +2108,307 @@ mod tests {
         );
     }
 
+    /// 滚轮事件（普通滚动，不缩放）构造：`delta_y` 每帧像素 → 滚动速度 EMA → 控制分带。
+    fn test_wheel(delta_y: f32) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(700.), gpui::px(500.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers::default(),
+            ..Default::default()
+        }
+    }
+
+    /// F3/E1：**中速带（Fast）改派满密度封面、不派瓦片**——持续 200px/帧 滚入 Fast 带后：
+    /// - `cover_reqs` 增长（新进视口页按满密度封面调度，取代 520/260 占位）；
+    /// - `tile_reqs` 在 Fast 期内**零增长**（瓦片不在封面前插队、也不受占位支配）
+    ///   → 封面不被瓦片阻塞（F3/B 目标「滚到哪清晰到哪」的 worker 侧前提）；
+    /// - 停稳后**全部可见页以满密度封面临位**（非中清/缩略占位）。
+    #[gpui::test]
+    async fn fast_band_dispatches_full_covers_without_tiles(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_count());
+        assert!(n >= 40, "测试文档应至少有 40 页，实际 {n}");
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty() && v.pending_cover.is_empty() && !v.prev_fast
+                });
+                if st {
+                    return;
+                }
+            }
+            panic!("初始状态应沉降");
+        };
+        settle(cx);
+
+        // 阶段 0：以 200px/帧 推入中速带（速度 EMA→200 ∈ (112, 480)）
+        for _ in 0..8 {
+            cx.simulate_event(test_wheel(200.0));
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let entered = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.speed_state == crate::pdf::view::SpeedState::Fast, v.scroll_velocity)
+        });
+        eprintln!(
+            "[F3-E1] entered_fast={} v={:.0}px/帧（Fast 带 112..480）",
+            entered.0, entered.1
+        );
+        assert!(entered.0, "200px/帧 应进入 Fast 带（EMA={:.0}）", entered.1);
+
+        // 阶段 1：Fast 带内持续滚动 18 帧 → 只派封面不派瓦片
+        let (c0, t0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.tile_reqs)
+        });
+        let mut fast_frames = 0usize;
+        let mut saw_pending_cover = false;
+        let mut tiles_frozen = true;
+        for _ in 0..18 {
+            cx.simulate_event(test_wheel(200.0));
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.speed_state,
+                    v.pending_cover.len(),
+                    v.pending_tiles.len(),
+                    v.cover_reqs,
+                    v.tile_reqs,
+                )
+            });
+            if st.0 == crate::pdf::view::SpeedState::Fast {
+                fast_frames += 1;
+                saw_pending_cover |= st.1 > 0;
+                tiles_frozen &= st.4 == t0 && st.2 == 0;
+            }
+        }
+        let (c1, t1, pc1, pt1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.cover_reqs,
+                v.tile_reqs,
+                v.pending_cover.len(),
+                v.pending_tiles.len(),
+            )
+        });
+        eprintln!(
+            "[F3-E1] fast_frames={fast_frames} cover_reqs {c0}→{c1} tile_reqs {t0}→{t1} pending c={pc1} t={pt1}"
+        );
+        assert!(fast_frames > 0, "阶段 1 应存在 Fast 帧");
+        assert!(
+            c1 > c0,
+            "Fast 带应派发满密度封面（cover_reqs {c0}→{c1}）：滚动到哪清晰到哪"
+        );
+        assert!(
+            t1 == t0 && tiles_frozen,
+            "Fast 带不得派发瓦片（tile_reqs {t0}→{t1}，Fast 期 pending_tiles 恒 0）：封面不被瓦片支配/阻塞"
+        );
+        assert!(
+            saw_pending_cover || c1 - c0 >= 3,
+            "Fast 带应可见封面在途或已派发足额（cover_reqs 增量 {}）",
+            c1 - c0
+        );
+
+        // 阶段 2：停稳后可见页全部以满密度封面临位（B「滚到哪清晰到哪」，非占位）
+        settle(cx);
+        let vis_covered = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let off_y = f32::from(-v.scroll.offset().y);
+            let pw = v.page_width();
+            let vh = f32::from(v.scroll.bounds().size.height).max(1.0);
+            let vis = pdf_visible_pages(v, pw, off_y, vh);
+            (!vis.is_empty(), vis.iter().all(|&p| v.slots[p].cover.is_some()), vis.clone())
+        });
+        assert!(
+            vis_covered.1,
+            "Fast 带滚动停稳后可见页应有满密度封面（中速滚动滚到哪清晰到哪）：vis={:?}",
+            vis_covered.2
+        );
+    }
+
+    /// F3/E2：**高速带（VeryFast）纯平移、不派新栅格**——持续 700px/帧 进入 VeryFast 后，
+    /// 任一帧 `cover_reqs`/`tile_reqs` 均零增长、`pending_cover`/`pending_tiles` 不再增长
+    /// （渲染队列不加活；已缓存封面/瓦片原位即锐，新进页交给 F4 预取走廊兜底，本波未实现）。
+    #[gpui::test]
+    async fn very_fast_band_pure_pan_no_new_raster(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty() && v.pending_cover.is_empty() && !v.prev_fast
+                });
+                if st {
+                    return;
+                }
+            }
+            panic!("初始状态应沉降");
+        };
+        settle(cx);
+
+        // 阶段 0：以 700px/帧 推入高速带（EMA→700 > 480）
+        for _ in 0..10 {
+            cx.simulate_event(test_wheel(700.0));
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let entered = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.speed_state == crate::pdf::view::SpeedState::VeryFast, v.scroll_velocity)
+        });
+        eprintln!(
+            "[F3-E2] entered_veryfast={} v={:.0}px/帧（VeryFast > 480）",
+            entered.0, entered.1
+        );
+        assert!(entered.0, "700px/帧 应进入 VeryFast 带（EMA={:.0}）", entered.1);
+
+        // 阶段 1：VeryFast 内持续平移到滚不动为止 → 不得派任何新栅格
+        let (c0, t0, pc0, pt0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.cover_reqs,
+                v.tile_reqs,
+                v.pending_cover.len(),
+                v.pending_tiles.len(),
+            )
+        });
+        let mut all_very_fast = true;
+        let (mut grew_cover, mut grew_tiles, mut grew_pc, mut grew_pt, mut pan_frames) =
+            (false, false, false, false, 0usize);
+        for _ in 0..12 {
+            cx.simulate_event(test_wheel(700.0));
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.speed_state,
+                    v.cover_reqs,
+                    v.tile_reqs,
+                    v.pending_cover.len(),
+                    v.pending_tiles.len(),
+                )
+            });
+            all_very_fast &= st.0 == crate::pdf::view::SpeedState::VeryFast;
+            grew_cover |= st.1 != c0;
+            grew_tiles |= st.2 != t0;
+            grew_pc |= st.3 > pc0;
+            grew_pt |= st.4 > pt0;
+            pan_frames += 1;
+        }
+        let (c1, t1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.tile_reqs)
+        });
+        eprintln!(
+            "[F3-E2] pan_frames={pan_frames} all_veryfast={all_very_fast} cover {c0}→{c1} tile {t0}→{t1}"
+        );
+        assert!(all_very_fast, "700px/帧 持续滚动应保持 VeryFast 带");
+        assert!(pan_frames > 0, "应有平移帧样本");
+        assert!(!grew_cover && c1 == c0, "VeryFast 纯平移：不得派新封面（cover_reqs {c0}→{c1}）");
+        assert!(!grew_tiles && t1 == t0, "VeryFast 纯平移：不得派新瓦片（tile_reqs {t0}→{t1}）");
+        assert!(!grew_pc, "VeryFast 纯平移：pending_cover 不得增长");
+        assert!(!grew_pt, "VeryFast 纯平移：pending_tiles 不得增长");
+    }
+
     /// 完整滚动一遍（采样停靠）后测渲染驻留内存构成：瓦片字节 + 封面（整页位图按当前
     /// 密度估算）+ 中清/缩略计数 + 封面/瓦片双份持有数。返回
     /// `(tile_bytes, covers, mids, thumbs, double_hold, est_total)`。

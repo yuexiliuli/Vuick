@@ -147,9 +147,9 @@ pub(crate) enum UndoEntry {
 
 use config::pdf::{
     COVER_INFLIGHT, IMAGE_CACHE_PAGES, IMAGE_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT,
-    MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH,
-    TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT,
-    TILE_MARGIN, TILE_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
+    MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, MOVE_THRESHOLD_VERY_RATIO,
+    PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES,
+    TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
 };
 use crate::pdf::layout::{
     advance_match_index, bitmap_display_scales, column_left, compute_layout, content_to_local,
@@ -169,6 +169,33 @@ fn timing_view() -> bool {
     *EN.get_or_init(|| {
         std::env::var_os("GPUI_EDITOR_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
     })
+}
+
+/// 滚动速度分带（F3「滚动即清晰」三速状态机）：把原 `prev_fast: bool` 升级为四态枚举。
+/// `prev_fast` 保持 = `is_fast()` 的派生布尔，既有消费点（自刷新泵 / 静态帧门控 / 文本预取 /
+/// 回归测试）结构不变；本字段决定每帧**调度形态**。迟滞阈值：进 Fast = [`MOVE_THRESHOLD_PX`]，
+/// 退 Fast = 其 × [`MOVE_THRESHOLD_LOWER_RATIO`]；进 VeryFast = × [`MOVE_THRESHOLD_VERY_RATIO`]，
+/// 退 VeryFast = 再 × [`MOVE_THRESHOLD_LOWER_RATIO`]（防 480px/帧 附近横跳）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpeedState {
+    /// 近静止（速度 EMA ≤ 1px/帧）：与 [`SpeedState::Slow`] 同走常态瓦片调度（**真**静置帧
+    /// 由静态帧门控 `window_sig`/`window_settled` 跳过，与速度状态正交）。
+    Idle,
+    /// 慢速常态：瓦片 + 封面常态调度（`schedule_tiles`，瓦片先派防封面堵小片）。
+    Slow,
+    /// 中速带 `(exit, very]`：**满密度封面优先**（`schedule_fast_covers`，封面不可负担的
+    /// 病理性页回退中清/缩略占位），滚到哪清晰到哪——不再落 520/260 低清占位。
+    Fast,
+    /// 高速带 `(very, ∞)`：**纯平移**，不派任何新栅格（渲染队列不加活）；新进视口页交给
+    /// F4 预取走廊兜底（本波未实现，可能短暂占位）。
+    VeryFast,
+}
+
+impl SpeedState {
+    /// 快速态（含中速带与高速带）：泵/门控/文本预取等「拖动期行为」的派生布尔（≡ 旧 `prev_fast`）。
+    pub(crate) fn is_fast(self) -> bool {
+        matches!(self, SpeedState::Fast | SpeedState::VeryFast)
+    }
 }
 
 /// 通用「在途结果回收」：遍历 `pending` 各条目，经 `recv` 投影做非阻塞 `try_recv`，
@@ -259,6 +286,9 @@ pub struct PdfViewer {
     pub(crate) scroll_velocity: f32,
     /// 迟滞判定后的"快速拖动"标志（进入 v>阈值、退出 v<阈值×比率，中间保持）。
     pub(crate) prev_fast: bool,
+    /// 滚动速度分带（F3）：决定每帧调度形态（常态瓦片 / 中速封面 / 高速纯平移）。
+    /// `prev_fast` = `speed_state.is_fast()` 的派生布尔（两者由 `update_fast_flag` 同步更新）。
+    pub(crate) speed_state: SpeedState,
     /// 竖向滚动句柄（页列外层 scroll 容器）。
     pub(crate) scroll: ScrollHandle,
     /// 是否仍在后台解析。
@@ -412,6 +442,7 @@ mod tests {
                     scroll_dir: 0,
                     scroll_velocity: 0.0,
                     prev_fast: false,
+                    speed_state: SpeedState::Idle,
                     scroll: ScrollHandle::new(),
                     loading: false,
                     load_error: None,
@@ -615,6 +646,7 @@ mod tests {
                     scroll_dir: 0,
                     scroll_velocity: 0.0,
                     prev_fast: false,
+                    speed_state: SpeedState::Idle,
                     scroll: ScrollHandle::new(),
                     loading: false,
                     load_error: None,
@@ -733,6 +765,7 @@ mod tests {
                     scroll_dir: 0,
                     scroll_velocity: 0.0,
                     prev_fast: false,
+                    speed_state: SpeedState::Idle,
                     scroll: ScrollHandle::new(),
                     loading: false,
                     load_error: None,

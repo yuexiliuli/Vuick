@@ -32,6 +32,11 @@ pub const MOVE_THRESHOLD_PX: f32 = 160.0;
 /// 速度迟滞退出比率：**进入**快速模式仍用 [`MOVE_THRESHOLD_PX`]，**退出**用它×本
 /// 比率（更小阈值）——临界速度下保持上一状态，避免 LOD 降级/恢复反复横跳。
 pub const MOVE_THRESHOLD_LOWER_RATIO: f32 = 0.7;
+/// 高速带（VeryFast）进入阈值倍数：`MOVE_THRESHOLD_PX × 本常量` ≈ 480px/帧。
+/// 中速带（Fast）已改派满密度封面，高速带再进一步——**只平移已缓存帧、不派任何新栅格**
+/// （已缓存封面/瓦片原位即锐，新进视口页由 F4 预取走廊兜底，本波未实现）。退出用其 ×
+/// [`MOVE_THRESHOLD_LOWER_RATIO`] 迟滞，防 480px/帧 附近横跳。
+pub const MOVE_THRESHOLD_VERY_RATIO: f32 = 3.0;
 // ---- L0 缩略图层（拖动期间"永远有内容"，消除"加载中"白块）。**纯内存**：
 // 不落盘、不编码 WebP；超 [`THUMB_CACHE_PAGES`] 按距离 LRU 淘汰。----
 /// 缩略图目标显示宽（px，LOD 低清层）：pdfium 下采样 ~1ms/张。

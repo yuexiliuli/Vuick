@@ -3109,4 +3109,45 @@ mod tests {
         assert_ne!(out_night, raw, "CPU + Some 应着色（与未着色原图不同）");
         assert_eq!(cpu_cache.len(), 1, "同密度同尺寸复用不新增条目");
     }
+
+    /// F3/E3：worker 渲染队列对 Render（整页封面）与 RenderTile（瓦片）保持**同一 `render_q`
+    /// 内的到达序 FIFO**——「先请求的在先出队」跨类成立。这正是 F3 评估结论的回归护栏：
+    /// 停稳态「瓦片先派防封面堵小片」由 view 的**帧内**派发顺序（先瓦片后封面）保证；若按类
+    /// 拆桶后「tile_q 恒先于 cover_q」会把**先入队的首屏封面**压到后到的瓦片之后（实测拖慢
+    /// 首屏封面 ~1.8s、`tiles_fill_viewport` 变 flaky）——故保留混合 FIFO。快速态（F3）封面
+    /// 不被瓦片阻塞则由 view 侧保证：中速带只派封面不派瓦片（见 `view::tiles::schedule_fast_covers`
+    /// 与回归 `fast_band_dispatches_full_covers_without_tiles`）。
+    #[test]
+    fn enqueue_msg_keeps_cover_and_tile_in_one_fifo() {
+        let mut render_q: VecDeque<WorkerMsg> = VecDeque::new();
+        let mut mid_q: VecDeque<WorkerMsg> = VecDeque::new();
+        let mut thumb_q: VecDeque<WorkerMsg> = VecDeque::new();
+        let mut rest_q: VecDeque<WorkerMsg> = VecDeque::new();
+        let (tx, _rx) = mpsc::channel::<Option<RenderResult>>();
+        let (ttx, _trx) = mpsc::channel::<Option<TileResult>>();
+        // 先入队的封面 → 再入队的瓦片（跨帧真实次序：首屏封面早于后到的瓦片）
+        enqueue_msg(
+            WorkerMsg::Render(7, RenderRequest { page: 7, scale: 2.0 }, tx),
+            &mut render_q,
+            &mut mid_q,
+            &mut thumb_q,
+            &mut rest_q,
+        );
+        enqueue_msg(
+            WorkerMsg::RenderTile(
+                7,
+                TileRequest { page: 7, scale: 2.0, tile_size: 512, row: 0, col: 1 },
+                ttx,
+            ),
+            &mut render_q,
+            &mut mid_q,
+            &mut thumb_q,
+            &mut rest_q,
+        );
+        assert_eq!(render_q.len(), 2, "Render 与 RenderTile 应同居 render_q");
+        // 跨类 FIFO：先到的封面必须先于后到的瓦片出队（否则首屏封面被瓦片压住）。
+        assert!(matches!(render_q.pop_front(), Some(WorkerMsg::Render(..))), "先到的封面应先出队");
+        assert!(matches!(render_q.pop_front(), Some(WorkerMsg::RenderTile(..))), "后到的瓦片随后出队");
+        assert_eq!(mid_q.len() + thumb_q.len() + rest_q.len(), 0, "其余桶应空");
+    }
 }
