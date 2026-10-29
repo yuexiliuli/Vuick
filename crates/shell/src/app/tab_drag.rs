@@ -10,9 +10,9 @@ use super::*;
 
 /// 拖拽预告（半透明选项卡）尺寸的**兜底估算**（仅真实 laid-out 尺寸尚未记录的首帧用）：
 /// 宽 = `shape_line` 文本宽 + px_2 两侧(16) + 2×gap(8) + 关闭钮(18) + 边框(4) ≈ +46；
-/// 高 = 选项卡 26。正常情况下 [`crate::app::tabs::TabBoundsRecorder` 已把真实尺寸写入，
+/// 高 = 选项卡 26。正常情况下 [`crate::app::tabs::TabBoundsRecorder`] 已把真实尺寸写入，
 /// 不会走这里。
-fn tab_preview_size(name: &str, dirty: bool, window: &Window) -> Size<Pixels> {
+pub(super) fn tab_preview_size(name: &str, dirty: bool, window: &Window) -> Size<Pixels> {
     let text = if dirty {
         format!("● {name}")
     } else {
@@ -247,7 +247,11 @@ impl EditorApp {
         self.status_ok = true;
         // 收纳后选项卡集合变化 → 立即持久化（detached 窗口由 persist 内部早退）。
         self.schedule_session_flush(cx, true);
-        cx.notify();
+        // 构造期（`new_detached` → `open_window` 同步首帧紧后）抑制多余 notify：
+        // 入队效果在首帧之后才 flush → 白画一整帧冗余（具体见 `constructing` 字段注释）。
+        if !self.constructing {
+            cx.notify();
+        }
     }
 
     /// 拖拽中的选项卡在**窗口外**松开：主窗口 → 拆成独立窗口；独立窗口 → 还原回主窗口。
@@ -281,11 +285,50 @@ impl EditorApp {
         }
     }
 
-    /// 拖拽选项卡期间维护「幽灵胶囊」窗：本次拖拽**开始**（第一次 `on_drag_move`）即
-    /// **隐藏创建**置顶透明小窗并全程复用；显示条件 = 光标越出窗口 **或** 窗内拖拽 picture
-    /// 将要被窗口边缘遮断（含 4px 余量，见 [`drag_picture_about_to_clip`]）——picture 一旦
-    /// 贴边即提前切到同位置、同尺寸的完整版幽灵窗（杜绝「一半被裁 → 越界才突然完整」）。
-    /// 因此：
+    /// 拖拽**开始**（`on_drag` 越过阈值那一拍）即预建幽灵窗：把 Windows 透明置顶 popup
+    /// 的 OS 创建成本（首帧 DCOMP，真机可达几百 ms）**前移到拖拽起点**，首个
+    /// `on_drag_move` 只做纯 `SetWindowPos` 定位 → 胶囊从拖拽一开始就跟手，不再「先
+    /// 空几百 ms 才出现」。创建仍 `cx.defer` 到本周期 flush（handler 不阻塞）；此时
+    /// `visible=false`（拖拽刚开始光标仍在窗内），初始位置用窗口左上角（在屏内，满足
+    /// popup 落位约束；隐藏态位置无观感）。真实尺寸优先，首帧未记录走兜底估算。
+    pub(super) fn prime_drag_ghost(
+        &mut self,
+        idx: usize,
+        name: SharedString,
+        dirty: bool,
+        size_cell: Rc<Cell<Size<Pixels>>>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag_ghost.is_some() || self.drag_ghost_pending {
+            return;
+        }
+        // on_drag 即拖拽真实开始：登记拖拽下标（否则 `ensure_drag_ghost` 的 defer 回调按
+        // `tab_dragging.is_none()` 判定「拖拽已结束」而跳过创建，前移落空）。on_drag_move
+        // 会重复写同值，幂等。
+        self.tab_dragging = Some(idx);
+        let s = size_cell.get();
+        let size = if s.width > px(0.) && s.height > px(0.) {
+            s
+        } else {
+            tab_preview_size(&name, dirty, window)
+        };
+        self.ensure_drag_ghost(
+            name,
+            dirty,
+            size,
+            size_cell,
+            window.bounds().origin,
+            false,
+            cx,
+        );
+    }
+
+    /// 拖拽选项卡期间维护「幽灵胶囊」窗：本次拖拽**开始**（`on_drag`，见
+    /// [`Self::prime_drag_ghost`]）已**隐藏创建**置顶透明小窗并全程复用；显示条件 = 光标越出窗口
+    /// **或** 窗内拖拽 picture 将要被窗口边缘遮断（含 4px 余量，见 [`drag_picture_about_to_clip`]）
+    /// ——picture 一旦贴边即提前切到同位置、同尺寸的完整版幽灵窗（杜绝「一半被裁 → 越界才
+    /// 突然完整」）。因此：
     /// - 窗内 picture 远离边缘：只见原有 gpui 小胶囊，**没有浮窗/蓝块**（幽灵窗隐藏）；
     /// - 贴边 / 拖出拖入：只是「显示 ⇄ 隐藏 + 定位」（一次 `SetWindowPos`），无创建/销毁
     ///   卡顿、无抓取偏移跳变（窗内 picture 与幽灵窗都画在 `鼠标 - 抓取偏移`）；
@@ -329,7 +372,10 @@ impl EditorApp {
         let visible = outside
             || drag_picture_about_to_clip(pos, grab, size, window.bounds().size);
         self.drag_ghost_visible = visible;
-        self.ensure_drag_ghost(name, dirty, size, drag_size, screen, cx);
+        // B：幽灵窗 open_window 延迟（内部 `cx.defer`）→ 首个 on_drag_move 的 dispatch
+        // 不被 Windows 透明置顶 popup 创建 + 首帧 DCOMP 的 OS 成本阻塞；幽灵窗仍在拖拽
+        // 开始后 1 帧内建成（defer 会跨过可见行构建 / SetWindowPos 前落下）。
+        self.ensure_drag_ghost(name, dirty, size, drag_size, screen, visible, cx);
         if let Some(gh) = self.drag_ghost {
             Self::place_drag_ghost(gh, screen, visible, cx);
         }
@@ -339,6 +385,10 @@ impl EditorApp {
     /// 不进任务栏），内容是与拖拽幽灵同款的半透明选项卡 [`TabDragGhost`]（持有
     /// `size_cell`，按真实 laid-out 尺寸渲染自身）。同一拖拽内只建一次、全程复用；
     /// 命名/脏点随新拖拽更新。
+    /// **创建本身延迟（`cx.defer`）**：`open_window` 立建透明置顶 popup 的首帧 DCOMP
+    /// 是 O(OS) 成本，阻塞首个 `on_drag_move` 会让胶囊几百 ms 不跟手。延迟到本周期
+    /// effect flush 建（仍属「拖拽开始后 1 帧内」），首个移动事件先无阻返回；同周期内
+    /// `drag_ghost_pending` 防重复排程；拖拽已结束（`tab_dragging=None`）不补建。
     /// 关键：**`show:true` + 起点 = 拖拽位置（在屏内）**。gpui_windows 在 `show:false` 时
     /// 不应用 `window_bounds`（窗口保持 CW_USEDEFAULT 巨大默认尺寸；window.rs:577-589），
     /// 而 `open_window` 创建时立即 draw 一帧（app.rs:1520）→ 巨大错误帧；之后 SetWindowPos
@@ -353,6 +403,7 @@ impl EditorApp {
         size: Size<Pixels>,
         size_cell: Rc<Cell<Size<Pixels>>>,
         origin: Point<Pixels>,
+        visible: bool,
         cx: &mut Context<Self>,
     ) {
         if let Some(gh) = &self.drag_ghost {
@@ -367,44 +418,62 @@ impl EditorApp {
             });
             return;
         }
+        // 已延迟在建：同周期第 2 次 on_drag_move 直接跳过（不重复建第 2 个幽灵窗）。
+        if self.drag_ghost_pending {
+            return;
+        }
+        self.drag_ghost_pending = true;
+        let weak = cx.weak_entity();
         let bounds = Bounds { origin, size };
         let titlebar = gpui::TitlebarOptions {
             title: None,
             appears_transparent: true,
             ..Default::default()
         };
-        let handle = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(titlebar),
-                focus: false,
-                show: true,
-                kind: gpui::WindowKind::PopUp,
-                is_movable: false,
-                is_resizable: false,
-                is_minimizable: false,
-                window_background: gpui::WindowBackgroundAppearance::Transparent,
-                // 关键（2026-10-28）：幽灵窗**自身**已渲染完整跟手卡片（根视图
-                // `TabDragGhost ghost:true`），而 gpui 每个窗口 prepaint 都会把 App 级
-                // `active_drag` picture 画进自己帧缓冲 → 若不禁用，幽灵窗会把窗内拖拽 picture
-                // 再叠一层 = 用户真机所见「鼠标离窗瞬间屏上多出一张跟手选项卡、与原 tab 重叠」。
-                suppress_active_drag_picture: true,
-                ..Default::default()
-            },
-            |_new_window, cx| cx.new(|_| TabDragGhost {
-                name,
-                dirty,
-                size: size_cell,
-                ghost: true,
-            }),
-        );
-        if let Ok(wh) = handle {
-            self.drag_ghost = Some(wh.into());
-            // 建完立刻剥掉 DWM 的圆角/过渡框线（见 strip 注释）。
-            if let Some(gh) = self.drag_ghost {
-                Self::strip_ghost_dwm_frame(gh, cx);
+        cx.defer(move |cx| {
+            if let Some(this) = weak.upgrade() {
+                this.update(cx, |this, cx| {
+                    this.drag_ghost_pending = false;
+                    // 拖拽已结束/取消（tab_dragging 已清空）或已另有幽灵窗 → 不再补建。
+                    if this.tab_dragging.is_none() || this.drag_ghost.is_some() {
+                        return;
+                    }
+                    let handle = cx.open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(bounds)),
+                            titlebar: Some(titlebar),
+                            focus: false,
+                            show: true,
+                            kind: gpui::WindowKind::PopUp,
+                            is_movable: false,
+                            is_resizable: false,
+                            is_minimizable: false,
+                            window_background: gpui::WindowBackgroundAppearance::Transparent,
+                            // 关键（2026-10-28）：幽灵窗**自身**已渲染完整跟手卡片（根视图
+                            // `TabDragGhost ghost:true`），而 gpui 每个窗口 prepaint 都会把 App 级
+                            // `active_drag` picture 画进自己帧缓冲 → 若不禁用，幽灵窗会把窗内拖拽 picture
+                            // 再叠一层 = 用户真机所见「鼠标离窗瞬间屏上多出一张跟手选项卡、与原 tab 重叠」。
+                            suppress_active_drag_picture: true,
+                            ..Default::default()
+                        },
+                        |_new_window, cx| cx.new(|_| TabDragGhost {
+                            name,
+                            dirty,
+                            size: size_cell,
+                            ghost: true,
+                        }),
+                    );
+                    if let Ok(wh) = handle {
+                        let gh: AnyWindowHandle = wh.into();
+                        this.drag_ghost = Some(gh.clone());
+                        // 建完立刻剥掉 DWM 的圆角/过渡框线（见 strip 注释），并按创建时
+                        // 落定的「是否可见 + 屏幕位置」定位——首帧不偏位、不闪。
+                        Self::strip_ghost_dwm_frame(gh.clone(), cx);
+                        Self::place_drag_ghost(gh, origin, visible, cx);
+                    }
+                });
             }
-        }
+        });
     }
 
     /// 定位幽灵窗（**纯移动，不缩放**）。gpui 无「运行时移动窗口」API，用原生

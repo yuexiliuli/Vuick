@@ -584,6 +584,14 @@ pub struct EditorApp {
     /// 让被拖选项卡在窗外**仍跟手可见**（gpui 拖拽幽灵只画在窗内，窗外被裁剪）；
     /// 回到窗内 / 松开 / 取消即销毁。None = 未建 / 已销毁。
     drag_ghost: Option<AnyWindowHandle>,
+    /// 拆出窗口**构造期**（`new_detached` → `new_impl` 里首次 `adopt_tab` 收纳）抑制多余
+    /// `cx.notify()`：构造紧随 `open_window` 的**同步首帧**，构造期入队的 Notify/RefreshWindows
+    /// 效果要在首帧**之后**的 effect flush 才应用 → 新窗口白画一整帧冗余重绘（大档首帧
+    /// ~27-40ms，松手→新窗肉眼延时的大头之一）。仅构造期置位，其余常态路径不受影响。
+    constructing: bool,
+    /// 幽灵窗创建已 `cx.defer` 延迟在建（防同周期内第 2 次 `on_drag_move` 重复排程建第 2 个
+    /// 幽灵窗）；defer 回调落地（建成或放弃）后清 false。
+    drag_ghost_pending: bool,
     /// 拖拽选项卡排序：本次拖拽过程光标下的「插入下标」（相对当前 `tabs`；`tabs.len()`
     /// = 插到末尾；左半/右半/空隙/首尾全覆盖）。`None` = 光标不在选项卡行内（不排序，
     /// 拖出窗口仍走拆窗）。`on_drag_move` 每帧刷新；`on_mouse_up`（窗内松开）消费落地后

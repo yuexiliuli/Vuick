@@ -165,6 +165,8 @@ impl EditorApp {
             drag_outside_armed: false,
             drag_ghost_visible: false,
             drag_ghost: None,
+            constructing: false,
+            drag_ghost_pending: false,
             is_detached,
             // 会话持久化责任：仅首个主窗口（`startup` 仅 `new` 传 true；new_media_window /
             // new_detached 传 false）——会话清单单份全局，非主窗口参与写会顶替主窗口会话。
@@ -232,14 +234,20 @@ impl EditorApp {
         }
         // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，
         // 首帧前完成，避免「先亮后暗」闪一下）。
-        ui::theme::Theme::set(
-            if app.dark_mode {
-                ui::theme::ThemeMode::Dark
-            } else {
-                ui::theme::ThemeMode::Light
-            },
-            cx,
-        );
+        // 主题模式未变则跳过 `Theme::set`：它内部会 `refresh_windows`（入队 RefreshWindows
+        // 效果），构造期入队的该效果会在 `open_window` 同步首帧**之后**才 flush → 新窗口
+        // 白画一整帧冗余重绘（大档拆窗松手延时的大头之一）。跳过不丢视觉（同模式同色板）。
+        let want_dark = app.dark_mode;
+        if ui::theme::Theme::global(cx).is_dark() != want_dark {
+            ui::theme::Theme::set(
+                if want_dark {
+                    ui::theme::ThemeMode::Dark
+                } else {
+                    ui::theme::ThemeMode::Light
+                },
+                cx,
+            );
+        }
         // 运行中跟随系统深浅色：事件订阅（Windows 经 WM_SETTINGCHANGE 驱动）。
         // 仅在「跟随」模式生效；强制档下外观变化被忽略，切回跟随由
         // `follow_system_theme` 立即按当前系统落地。
@@ -274,7 +282,12 @@ impl EditorApp {
         }
         if let Some(first_tab) = first_tab {
             // 拆出/拖拽产生的独立窗口：首个选项卡直接收纳（不额外建空选项卡）。
+            // 构造期抑制 adopt/activate 的 `cx.notify()`（存入 effect 队列）——它们会在
+            // `open_window` 同步首帧之后才 flush，白画一整帧冗余；构造后紧接同步首帧，
+            // 无需这些预渲染 notifies（见字段 `constructing` 注释）。
+            app.constructing = true;
             app.adopt_tab(first_tab, Some(window), cx);
+            app.constructing = false;
         }
         // 不再给普通窗口预建初始空选项卡：新模型下启动即「零选项卡 → 欢迎页」，
         // 只有用户点了「新建文件」、双击欢迎页或打开文件（内部 `open_file` → `make_tab`）

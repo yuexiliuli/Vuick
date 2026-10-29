@@ -1324,4 +1324,141 @@
         let _ = std::fs::remove_file(&s);
     }
 
+    /// 探针（BIGDOC_BENCH=1）：大文档选项卡「拖出拆新窗」的松手→新窗可见墙钟断点：
+    /// 按下 / 首个 on_drag（建拖拽实体+预建幽灵窗）/ 首个 on_drag_move（幽灵窗定位）/
+    /// 松手同步（含 open_window 同步首帧）。作为拖拽拆窗流畅度的回归对比基准（#ignore）。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_probe_drag_split_wall(cx: &mut TestAppContext) {
+        if std::env::var_os("BIGDOC_BENCH").is_none() {
+            return;
+        }
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = r"../../fixtures/大文档测试.rs";
+        assert!(std::path::Path::new(p).is_file(), "{p} 缺失");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p, window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            frames += 1;
+            cx.run_until_parked();
+            let (pending, lines) = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                (
+                    a.tabs[i].editor_pending,
+                    a.tabs[i].editor.read(cx).line_count(),
+                )
+            });
+            if !pending && lines > 1000 {
+                break;
+            }
+            if frames > 400 {
+                break;
+            }
+        }
+        println!(
+            "【大档就绪】tab 数={}",
+            cx.update(|_w, cx| app.read(cx).tabs.len())
+        );
+        // 拖**文件**选项卡（tab-1）出窗拆新窗 —— 大文档 open_window 首帧主路径
+        let tab = cx
+            .debug_bounds("tab-1")
+            .expect("文件选项卡应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        let t_down = std::time::Instant::now();
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        println!("【按下】dispatch {} ms", t_down.elapsed().as_millis());
+        // 首次移动：越 DRAG_THRESHOLD → on_drag 构造器（记录抓取偏移、建拖拽实体，
+        // 并**预建幽灵窗**——创建前移到拖拽起点，首个 on_drag_move 只 SetWindowPos 定位）
+        let t_thresh = std::time::Instant::now();
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        println!(
+            "【首次移动(越阈值→on_drag+预建幽灵窗)】dispatch {} ms",
+            t_thresh.elapsed().as_millis()
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // 第二次移动：首个 on_drag_move → update_drag_ghost（幽灵窗已就绪，只定位/显隐）
+        let t_firstmove = std::time::Instant::now();
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(90.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        println!(
+            "【第二移(首 on_drag_move→幽灵窗定位)】dispatch {} ms",
+            t_firstmove.elapsed().as_millis()
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let outside = gpui::Point::new(px(-80.), px(120.));
+        cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let t_rel = std::time::Instant::now();
+        cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
+        println!(
+            "【松手同步·大文档】release（含 open_window 同步首帧）{} ms",
+            t_rel.elapsed().as_millis()
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        // 对照 2：拖**未命名空**选项卡（拆分后主窗口仅剩 tab-0）—— open_window 固定开销
+        let start = cx
+            .debug_bounds("tab-0")
+            .map(|t| {
+                gpui::Point::new(
+                    t.origin.x + px(10.),
+                    t.origin.y + px(t.size.height.as_f32() / 2.0),
+                )
+            })
+            .expect("空选项卡应渲染");
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let outside = gpui::Point::new(px(-80.), px(120.));
+        cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let t_rel = std::time::Instant::now();
+        cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
+        println!(
+            "【松手同步】release（含 open_window 同步首帧）{} ms",
+            t_rel.elapsed().as_millis()
+        );
+        let t_settle = std::time::Instant::now();
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        println!(
+            "【新窗稳定】松手后 +6 帧 {} ms",
+            t_settle.elapsed().as_millis()
+        );
+    }
+
 

@@ -247,7 +247,11 @@ impl EditorApp {
             let focus = self.tab_focus_handle(idx, cx);
             window.focus(&focus, cx);
         }
-        cx.notify();
+        // 拆出窗口构造期（`constructing=true`）抑制：`window.focus` 已直接 `refresh`
+        // （首帧前落定、被同步首帧清除），无需再入队 notify 让首帧后补刷一整帧。
+        if !self.constructing {
+            cx.notify();
+        }
     }
 
     pub(super) fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -591,9 +595,23 @@ impl EditorApp {
         };
         let el = el.on_drag(
             drag_data,
-            move |_value: &TabDragData, offset, _window, cx| {
+            move |_value: &TabDragData, offset, window, cx| {
                 if let Some(app) = app_weak.upgrade() {
-                    let _ = app.update(cx, |app, _| app.tab_drag_grab = Some(offset));
+                    let _ = app.update(cx, |app, cx| {
+                        app.tab_drag_grab = Some(offset);
+                        // 拖拽开始即预建幽灵窗（隐藏；本周期 flush 落地）：Windows 透明置顶
+                        // popup 的 OS 创建成本前移到拖拽起点，首个 on_drag_move 只 SetWindowPos
+                        // 定位 → 胶囊从拖动一开始就跟手（原「建在首个 on_drag_move」会几百 ms
+                        // 才出现）。幂等：已有/在建则跳过。
+                        app.prime_drag_ghost(
+                            _value.idx,
+                            _value.name.clone(),
+                            dirty,
+                            _value.size.clone(),
+                            window,
+                            cx,
+                        );
+                    });
                 }
                 cx.new(|_| TabDragGhost {
                     name: ghost_name.clone(),
