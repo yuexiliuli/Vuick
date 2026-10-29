@@ -339,10 +339,12 @@
         let _ = std::fs::remove_file(&f);
     }
 
-    /// 焦点探针（真实菜单链路）：文件菜单「打开最近…」→ 面板 → 点有效文件行，
-    /// 焦点应落在新打开的编辑器上（面板 close 的 `focus_left` 判定动作已带走焦点）。
+    /// 焦点探针（真实菜单链路）：文件菜单「打开最近…」flyout 次级菜单 → 点有效文件行 →
+    /// 打开新选项卡 + **整链关闭**（次级 + 父菜单都不在场），焦点落在新编辑器上
+    /// （组件 `activate_flyout` 的非 keep_open 路径：handler 后 dismiss，动作已带走焦点
+    /// 则不归还 previous_focus——[`PopupMenu`] 的 `dismiss` focus 归还守卫）。
     #[gpui::test]
-    async fn click_recent_file_row_via_file_menu_keeps_focus_on_editor(cx: &mut TestAppContext) {
+    async fn click_recent_file_row_via_file_menu_opens_file_and_closes_chain(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
@@ -352,27 +354,41 @@
         let f = std::env::temp_dir().join("focus-menu-recent.txt");
         std::fs::write(&f, "data").unwrap();
         let s = f.to_string_lossy().into_owned();
+        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
         cx.update(|_w, cx| {
             app.update(cx, |app, _| app.recent_files = vec![s.clone()]);
         });
-        // 点标题栏「文件」菜单按钮 → 「打开最近…」→ 居中大面板打开。
+        // 点标题栏「文件」菜单按钮 → 菜单含「打开最近…」（根行带 › 指示）→ 悬停展开次级。
         cx.simulate_click(gpui::Point::new(px(36.), px(16.)), Default::default());
         pump_panel(cx);
-        let item = cx
+        assert!(
+            cx.debug_bounds("menu-flyout-chevron-3").is_some(),
+            "文件菜单「打开最近…」根行应带 › 箭头指示（flyout 标记）"
+        );
+        let root = cx
             .debug_bounds("recent-menu-open")
             .expect("文件菜单应含「打开最近…」项")
             .center();
-        cx.simulate_click(item, Default::default());
+        cx.simulate_mouse_move(root, None, Default::default());
         pump_panel(cx);
         let row = cx
             .debug_bounds("recent-file-row-0")
-            .expect("最近面板文件行应渲染")
+            .expect("flyout 次级应含最近文件行")
             .center();
+        // 先移入次级子项再点（悬停守卫新鲜：点次级面板不会被父面板 capture 的
+        // on_mouse_down_out 当「面板外」误关整链——真实用户路径鼠标必然先悬停再点）。
+        cx.simulate_mouse_move(row, None, Default::default());
+        pump_panel(cx);
         cx.simulate_click(row, Default::default());
-        for _ in 0..5 {
-            cx.run_until_parked();
-        }
-        let focused = cx.update(|window, cx| window.focused(cx));
+        pump_panel(cx);
+        let (tabs, focused, menu_gone, fly_gone) = {
+            let tabs = cx.update(|_w, cx| app.read(cx).tabs.len());
+            let focused = cx.update(|window, cx| window.focused(cx));
+            (tabs, focused, cx.debug_bounds("recent-menu-open").is_none(), cx.debug_bounds("menu-flyout").is_none())
+        };
+        assert_eq!(tabs, tabs_before + 1, "点 flyout 最近文件行应打开新选项卡");
+        assert!(fly_gone, "点行后次级菜单应关闭（menu-flyout 不在场）");
+        assert!(menu_gone, "点行后父菜单应整链关闭（recent-menu-open 不在场）");
         let expected = cx.update(|_w, cx| app.read(cx).editor_focus_handle(cx));
         assert_eq!(
             focused.as_ref(),
@@ -598,60 +614,161 @@
         assert!(!panel, "Clear 后面板应关闭");
     }
 
-    /// 反馈 1（真实菜单链路）：文件菜单「打开最近…」→ 文件菜单**保持展开**（不关闭）、
-    /// 居中大面板在窗口中间打开；Esc 关面板后文件菜单仍展开——留到自身下一次外部
-    /// 点击才收起；面板打开期间 occlude 拦截对菜单的点击（不穿透）。
+    /// 反馈 1/2 新形态（真实菜单链路）：文件菜单「打开最近…」改为 **flyout 悬浮次级菜单**
+    /// ——悬停根行 → 右侧展开次级（不再打开居中大面板，recent_panel 存 dormancy）；
+    /// 父菜单其它项保持可见（不原地替换）；空最近列表 → 次级显示**单个禁用占位项**
+    /// 「暂无最近记录」，点击不可点（菜单保持展开、不打开任何东西）。
     #[gpui::test]
-    async fn file_menu_stays_open_when_panel_opens(cx: &mut TestAppContext) {
+    async fn file_menu_recent_flyout_empty_shows_disabled_placeholder(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let f = std::env::temp_dir().join("menu-recent.txt").to_string_lossy().into_owned();
+        // 清空最近两类（K8：config load 无 cfg(test) 门控，勿依赖机器真实 config）。
         cx.update(|_w, cx| {
-            app.update(cx, |app, _| app.recent_files = vec![f.clone()]);
+            app.update(cx, |app, _| {
+                app.recent_folders.clear();
+                app.recent_files.clear();
+            });
         });
-        // 点击标题栏「文件」菜单按钮（菜单栏首按钮，pl_2 + w56 → 中心约 (36,16)）。
+        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        // 点标题栏「文件」菜单按钮 → 悬停「打开最近…」根行。
         cx.simulate_click(gpui::Point::new(px(36.), px(16.)), Default::default());
         pump_panel(cx);
-        let item = cx
+        let root = cx
             .debug_bounds("recent-menu-open")
             .expect("文件菜单应含「打开最近…」项")
             .center();
-        cx.simulate_click(item, Default::default());
+        cx.simulate_mouse_move(root, None, Default::default());
         pump_panel(cx);
-        // 面板打开：居中大面板存在 + 文件菜单仍展开（反馈 1）。
-        assert!(
-            cx.update(|_w, cx| app.read(cx).recent_panel.is_some()),
-            "点「打开最近…」后面板实体应注册"
-        );
-        assert!(cx.debug_bounds("recent-panel").is_some(), "居中大面板应渲染");
-        assert!(
-            cx.debug_bounds("recent-menu-open").is_some(),
-            "反馈 1：点「打开最近…」后文件菜单应保持展开（keep_open 不 dismiss）"
-        );
-        assert!(
-            cx.update(|_w, cx| app.read(cx).recent_files.clone()) == vec![f.clone()],
-            "面板打开不篡改最近列表"
-        );
-        // Esc 关面板：面板关闭 + 文件菜单仍展开。
-        cx.simulate_keystrokes("escape");
+        // 空列表 → 禁用占位项「暂无最近记录」；父项保持可见（反馈 1：不原地替换）。
+        assert!(cx.debug_bounds("menu-flyout").is_some(), "悬停「打开最近…」应展开次级");
+        assert!(cx.debug_bounds("recent-empty").is_some(), "空列表应显示禁用占位项");
+        assert!(cx.debug_bounds("recent-folder-row-0").is_none(), "空列表无文件夹行");
+        assert!(cx.debug_bounds("recent-file-row-0").is_none(), "空列表无文件行");
+        assert!(cx.debug_bounds("recent-clear").is_none(), "空列表不显示清空行");
+        assert!(cx.debug_bounds("recent-menu-open").is_some(), "悬停后父项「打开最近…」保持可见");
+        assert!(cx.debug_bounds("menu-item-0").is_some(), "悬停后父项「新建文件」保持可见");
+        // 点占位项 → 不可点（不打开新 tab、菜单保持展开）。先移入占位项（触发次级面板
+        // hover，armed 点击守卫）：真实用户路径鼠标必先悬停面板/行再点；禁用行无自身
+        // hover，但面板级 on_hover 会置位 flyout_panel_hover。
+        let empty = cx
+            .debug_bounds("recent-empty")
+            .expect("占位项应在场")
+            .center();
+        cx.simulate_mouse_move(empty, None, Default::default());
+        pump_panel(cx);
+        cx.simulate_click(empty, Default::default());
+        pump_panel(cx);
+        let tabs = cx.update(|_w, cx| app.read(cx).tabs.len());
+        assert_eq!(tabs, tabs_before, "点禁用占位项不应打开任何东西");
+        assert!(cx.debug_bounds("menu-flyout").is_some(), "点禁用占位项后菜单应保持展开");
+        assert!(cx.debug_bounds("recent-menu-open").is_some(), "点禁用占位项后父菜单保持展开");
+    }
+
+    /// 悬停「打开最近…」→ flyout 次级结构：最近文件夹 ≤10 → 分隔线 → 最近文件 ≤10 →
+    /// 分隔线 → 「清空最近记录」；次级顶部 ≈ 根行顶部、左缘贴父菜单右缘（Dropdown 宿主
+    /// 未接 parent_pos → 走组件流式兄弟 fallback；近窗缘适配受限，报告已注明，文件菜单
+    /// 位于顶部影响小）。父项保持可见。
+    #[gpui::test]
+    async fn file_menu_recent_flyout_hover_shows_sections_and_geometry(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join("recent-flyout-dir");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = std::env::temp_dir().join("recent-flyout-file.txt");
+        std::fs::write(&f, "data").unwrap();
+        let (fd, fs) = (dir.to_string_lossy().into_owned(), f.to_string_lossy().into_owned());
+        cx.update(|_w, cx| {
+            app.update(cx, |app, _| {
+                app.recent_folders = vec![fd.clone()];
+                app.recent_files = vec![fs.clone()];
+            });
+        });
+        // 打开文件菜单 → 悬停「打开最近…」。
+        cx.simulate_click(gpui::Point::new(px(36.), px(16.)), Default::default());
         pump_panel(cx);
         assert!(
-            cx.update(|_w, cx| app.read(cx).recent_panel.is_none()),
-            "Esc 应关闭面板"
+            cx.debug_bounds("menu-flyout-chevron-3").is_some(),
+            "「打开最近…」根行应带 › 箭头指示"
         );
-        assert!(
-            cx.debug_bounds("recent-menu-open").is_some(),
-            "面板关闭后文件菜单仍展开（留到其自身下一次外部点击才收起）"
-        );
-        // 下一次外部点击（面板外空白）→ 文件菜单才收起。
-        cx.simulate_click(gpui::Point::new(px(300.), px(200.)), Default::default());
+        let root = cx
+            .debug_bounds("recent-menu-open")
+            .expect("「打开最近…」应在场")
+            .center();
+        cx.simulate_mouse_move(root, None, Default::default());
         pump_panel(cx);
-        assert!(
-            cx.debug_bounds("recent-menu-open").is_none(),
-            "文件菜单应在其自身下一次外部点击后收起"
-        );
+        // 次级结构：文件夹行 + 文件行 + 清空行（分隔线不单独可断言 debug 时以结构行为主）。
+        assert!(cx.debug_bounds("menu-flyout").is_some(), "悬停应展开次级");
+        assert!(cx.debug_bounds("recent-folder-row-0").is_some(), "次级应含最近文件夹行");
+        assert!(cx.debug_bounds("recent-file-row-0").is_some(), "次级应含最近文件行");
+        assert!(cx.debug_bounds("recent-clear").is_some(), "次级应含「清空最近记录」行");
+        // 父项保持可见。
+        assert!(cx.debug_bounds("recent-menu-open").is_some(), "父项保持可见");
+        assert!(cx.debug_bounds("menu-item-0").is_some(), "父菜单其它项保持可见");
+        // 几何：次级顶部 ≈ 「打开最近…」行顶部（容差内）；左缘贴父菜单右缘（右邻、不压父）。
+        let fly = cx.debug_bounds("menu-flyout").expect("次级应在场");
+        let row = cx.debug_bounds("recent-menu-open").expect("根行应在场");
+        let panel = cx.debug_bounds("menu-panel").expect("父面板应在场");
+        let dy = (fly.top() - row.top()).abs();
+        assert!(dy <= px(6.), "次级顶部应≈「打开最近…」行顶部，实际差 {dy:?}");
+        let dx = fly.left() - panel.right();
+        assert!(dx >= -px(6.), "次级左缘应贴父菜单右缘（右邻），实际偏移 {dx:?}");
+        assert!(fly.right() > panel.right(), "次级应在父菜单右缘右侧");
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 点「清空最近记录」→ 两类最近列表清空 + 落盘 + **整链关闭**（次级 + 父菜单）。
+    #[gpui::test]
+    async fn file_menu_recent_flyout_clear_empties_and_closes_chain(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join("recent-clear-flyout-dir");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = std::env::temp_dir().join("recent-clear-flyout.txt");
+        std::fs::write(&f, "data").unwrap();
+        let (fd, fs) = (dir.to_string_lossy().into_owned(), f.to_string_lossy().into_owned());
+        cx.update(|_w, cx| {
+            app.update(cx, |app, _| {
+                app.recent_folders = vec![fd.clone()];
+                app.recent_files = vec![fs.clone()];
+            });
+        });
+        cx.simulate_click(gpui::Point::new(px(36.), px(16.)), Default::default());
+        pump_panel(cx);
+        let root = cx
+            .debug_bounds("recent-menu-open")
+            .expect("「打开最近…」应在场")
+            .center();
+        cx.simulate_mouse_move(root, None, Default::default());
+        pump_panel(cx);
+        let clear = cx
+            .debug_bounds("recent-clear")
+            .expect("清空行应在场")
+            .center();
+        // 先移入次级再点（见 file 行点击测试注释：悬停守卫新鲜，点次级不误触面板外关闭）。
+        cx.simulate_mouse_move(clear, None, Default::default());
+        pump_panel(cx);
+        cx.simulate_click(clear, Default::default());
+        pump_panel(cx);
+        let (folders, files) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.recent_folders.clone(), a.recent_files.clone())
+        });
+        assert!(folders.is_empty() && files.is_empty(), "清空应清两类最近记录");
+        assert!(cx.debug_bounds("menu-flyout").is_none(), "清空后次级应关闭");
+        assert!(cx.debug_bounds("recent-menu-open").is_none(), "清空后父菜单应整链关闭");
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2,6 +2,12 @@
 //! 同款样式——更大（600px 宽、窗口 2/3 高）、Acrylic 圆角浮动卡片、**出现在窗口
 //! 中间**（水平居中）、带滚动条与弹簧淡入，而不是旧的小弹层。
 //!
+//! # Dormancy：已被 flyout 悬浮次级菜单取代
+//! 文件菜单「打开最近…」现走 `ui::menu` 的 flyout 语义（悬停展开到右侧、子项点击即整链
+//! 关闭，见 `menu.rs` 的 `recent_flyout_items` / [`super::menu::EditorApp::open_recent_panel`]）。
+//! 本面板保留源码 + 既有测试作 dormancy 回归（K24）：`open_recent_panel` 仍可直连打开
+//! 面板实体、recent.rs 的相关用例保持绿色；不参与「打开最近」的生产路径。
+//!
 //! # 结构与复用
 //! 本组件是**独立实体**（`mode` / 选中 / 最近列表快照自持），由宿主 `EditorApp`
 //! 经 `Option<Entity<Self>>` 持有：打开时 `open_recent_panel` 创建 + 聚焦 + 订阅

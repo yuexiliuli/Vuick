@@ -546,7 +546,14 @@ impl PopupMenu {
         }
     }
 
-    /// 关闭菜单：清选中与 flyout 状态、发 `DismissEvent`（宿主据此收起）、归还焦点（若点击没带走焦点）。
+    /// 关闭菜单：清选中与 flyout 状态、发 `DismissEvent`（宿主据此收起）、归还焦点
+    /// （若点击没带走焦点）。
+    ///
+    /// 焦点归还语义对齐 `recent_panel::RecentPanel::close` 的 `focus_left` 守卫：
+    /// **仅当焦点仍留在菜单内**（`focus_still_inside` = 动作未把焦点移走，如 Esc /
+    /// 点外 / 未移动焦点的普通项点击）才归还开菜单前的焦点；动作**已把焦点带走**（如
+    /// flyout 子项 `open_file` → 聚焦新编辑器 / `open_dialog` → 原生对话框）则**不归还**
+    /// ——否则 dismiss 会把动作刚拿到的焦点抢回无用的 `previous_focus` 句柄。
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_index = None;
         self.open_flyout = None;
@@ -554,7 +561,7 @@ impl PopupMenu {
         self.flyout_panel_hover = false;
         cx.emit(DismissEvent);
         let focus_still_inside = self.focus_handle.contains_focused(window, cx);
-        if !focus_still_inside
+        if focus_still_inside
             && let Some(handle) = self.previous_focus.take()
         {
             window.focus(&handle, cx);
@@ -893,6 +900,15 @@ impl Render for PopupMenu {
             .id("items")
             .debug_selector(|| "menu-panel".into())
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
+            // 菜单弹出层存活期间的左键按下拦截（bubble 阶段 + 命中面板才拦）：gpui 鼠标
+            // 事件按监听器注册顺序派发（bubble 逆序），弹层（`deferred(anchored())`）监听器
+            // 晚于主层 viewer 注册 → 这里先于下层 PdfViewer 的 `on_mouse_down` stop →
+            // 弹层内左键按下到不了 viewer。若不拦，viewer 命中文本即置 `selecting=true`，
+            // 而 mouseup 被菜单项 on_click 的 stop_propagation 吃掉 → viewer 收不到 mouseup
+            // → selecting 滞留 → 之后移动鼠标都被当成拖选（用户反馈根因）。注意必须用
+            // bubble 而非 capture：capture stop 会跳过整轮 bubble，菜单项自身的
+            // pending_mouse_down（click 依赖）也在 bubble 记录 → 点不了菜单。
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .flex()
             .flex_col()
             .p(PANEL_PADDING)
@@ -950,6 +966,9 @@ impl Render for PopupMenu {
                     this.flyout_panel_hover = *hovered;
                     cx.notify();
                 }))
+                // 次级面板同样拦截左键按下（bubble）：flyout 次级是独立 deferred 层，父面板
+                // 的拦截不覆盖它——否则点次级内的 mousedown 仍会穿透到下层 viewer。
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .bg(surface.opacity(if is_dark {
                     crate::ui::theme::FLOAT_ACRYLIC_ALPHA_DARK
                 } else {
@@ -1964,6 +1983,74 @@ mod tests {
         assert_eq!(dismisses.get(), 0, "keep_open 次级项不应关闭菜单");
         assert!(cx.debug_bounds("menu-flyout").is_some(), "keep_open 下次级面板保持展开");
         assert!(cx.debug_bounds("root-bg").is_some(), "父菜单保持展开");
+    }
+
+    /// 非 keep_open 的 flyout 子项点击 → 执行回调后**整链关闭**（次级 + 父菜单，
+    /// dismiss=1、二级面板消失）——「打开最近」flyout 子项（打开路径/清空）即此形态：
+    /// 点击后整链关 + 动作生效，与 PDF 背景色（子项全 keep_open）语义对照。
+    /// keep_open 分支已由 [`flyout_click_preset_executes_and_keeps_open`] 覆盖。
+    #[gpui::test]
+    fn flyout_click_item_dismisses_chain(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let clicks = Rc::new(Cell::new(0usize));
+        let dismisses = Rc::new(Cell::new(0usize));
+        let (_, cx) = cx.add_window_view({
+            let clicks = clicks.clone();
+            let dismisses = dismisses.clone();
+            move |window, cx| {
+                let sub_click = clicks.clone();
+                let sub = vec![PopupMenuItem::element(move |_, _| {
+                    div()
+                        .debug_selector(|| "flyout-open".into())
+                        .child("打开文件")
+                        .into_any_element()
+                })
+                .on_click(move |_, _, _| sub_click.set(sub_click.get() + 1))];
+                let menu = PopupMenu::build(window, cx, |menu, _w, _cx| {
+                    menu.item(
+                        PopupMenuItem::element(|_, _| {
+                            div()
+                                .debug_selector(|| "root-open".into())
+                                .child("打开最近…")
+                                .into_any_element()
+                        })
+                        .flyout(sub),
+                    )
+                    .item(
+                        PopupMenuItem::element(|_, _| {
+                            div()
+                                .debug_selector(|| "root-close".into())
+                                .child("关闭项")
+                                .into_any_element()
+                        })
+                        .on_click(|_, _, _| {}),
+                    )
+                });
+                menu.read(cx).focus_handle(cx).focus(window, cx);
+                menu.update(cx, |m, _| m.set_parent_pos(point(px(0.), px(0.))));
+                let d = dismisses.clone();
+                window
+                    .subscribe(&menu, cx, move |_, _: &DismissEvent, _, _| {
+                        d.set(d.get() + 1);
+                    })
+                    .detach();
+                MenuHost { menu }
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // 悬停 flyout 根项 → 次级展开。
+        hover_center(cx, "root-open");
+        assert!(cx.debug_bounds("menu-flyout").is_some(), "悬停应展开次级");
+        // 移入次级子项再点（悬停守卫新鲜，不误触「面板外」关闭）→ 回调执行 + 整链关闭。
+        hover_center(cx, "flyout-open");
+        let sub = cx.debug_bounds("flyout-open").expect("子项应在场").center();
+        cx.simulate_click(sub, Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(clicks.get(), 1, "点击非 keep_open 子项应执行回调");
+        assert_eq!(dismisses.get(), 1, "点击非 keep_open 子项应整链关闭（dismiss=1）");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("menu-flyout").is_none(), "dismiss 后次级菜单应消失");
     }
 
     #[gpui::test]

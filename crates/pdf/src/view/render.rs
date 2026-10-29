@@ -122,9 +122,9 @@ fn image_select_frame_color(cx: &App) -> Hsla {
 }
 
 /// 选中图片的描框叠加层（**卡片局部**坐标）：对 `(page, obj_index)` 命中的图片盒
-/// 画 1px 描边 + 极淡同色底（提示可点区域），盒外扩 2px（同灰框 pad，视觉包住）。
-/// 页图片盒未缓存 / 该页无选中图 → `None`。颜色由调用方经 [`image_select_frame_color`]
-/// 传入（与选区/检索叠加同款「渲染帧内取主题色」约定）。
+/// 只画 1px 描边（**不盖任何底色**——图片内容颜色不得被选中高亮改变），盒外扩 2px
+/// （同灰框 pad，视觉包住）。页图片盒未缓存 / 该页无选中图 → `None`。颜色由调用方经
+/// [`image_select_frame_color`] 传入（与选区/检索叠加同款「渲染帧内取主题色」约定）。
 #[allow(clippy::too_many_arguments)] // 几何/颜色参数互为正交，与 selection/search 叠加同构
 fn image_select_frame_overlay_for_page(
     page: usize,
@@ -153,7 +153,6 @@ fn image_select_frame_overlay_for_page(
             .h(px((y_bottom - y_top).max(1.0)))
             .border_1()
             .border_color(color)
-            .bg(color.opacity(0.08))
             .into_any_element(),
     )
 }

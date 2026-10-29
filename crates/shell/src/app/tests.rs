@@ -15,6 +15,7 @@ include!("tests/file_tree.rs");
 include!("tests/pdf_epub.rs");
 include!("tests/pdf_phaseb.rs");
 include!("tests/pdf_bg.rs");
+include!("tests/pdf_menu_select_regression.rs");
 include!("tests/epub_wy.rs");
 include!("tests/bench.rs");
 include!("tests/panes.rs");

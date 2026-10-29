@@ -323,10 +323,19 @@ impl PdfViewer {
     /// 按住左键拖拽 → 活动端随鼠标更新（选区实时扩展/收缩）。
     /// 平移模式（超宽）：滚动偏移 = 按下时快照 + 指针位移（页面跟手，`window.mouse_position`
     /// 比拖拽事件 position 即时——gpui 移动事件可被上层消费，mouse_position 是真实光标）。
-    pub(super) fn on_mouse_move(&mut self, _: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.panning {
             let delta = window.mouse_position() - self.pan_origin;
             self.scroll.set_offset(self.pan_offset0 + delta);
+            cx.notify();
+            return;
+        }
+        // 兜底自愈：`selecting` 臂若因任一路径漏配 `mouse_up` 而滞留（菜单/弹层关闭、
+        // 事件被上层 stop_propagation 吃掉等），下一次「未按住左键」的移动即复位——
+        // 防止菜单点击后无按键移动被误当拖选。正常拖选期间移动事件携带
+        // `pressed_button=Left`（`dragging()` 为真）不触发；松手由 `on_mouse_up` 正常复位。
+        if self.selecting && !event.dragging() {
+            self.selecting = false;
             cx.notify();
             return;
         }

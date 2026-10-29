@@ -44,7 +44,25 @@ impl EditorApp {
     }
 
     /// "文件"菜单。label / 快捷键来自公共命令表（`crate::commands` 单一真值）。
-    fn file_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
+    /// 「打开最近…」已由「keep_open + 居中大面板」改为 **flyout 悬浮次级菜单**
+    /// （悬停展开到右侧，见 [`Self::recent_flyout_items`]）；`cx` 用于在每次菜单
+    /// 打开时快照最近列表（与 recent_panel「每次打开取最新」同语义）。
+    fn file_items(
+        menu: PopupMenu,
+        weak: gpui::WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        // 打开菜单时快照最近列表：菜单实体在本次开合周期内保持，快照在该周期内恒定
+        // （recent_panel 的「每次打开取最新」语义；列表更新仍走 file_ops 记录/落盘）。
+        let recent_folders = weak
+            .upgrade()
+            .map(|e| e.read(cx).recent_folders.clone())
+            .unwrap_or_default();
+        let recent_files = weak
+            .upgrade()
+            .map(|e| e.read(cx).recent_files.clone())
+            .unwrap_or_default();
         menu.item(Self::menu_action_item(
             NEW_FILE.menu_label,
             NEW_FILE.shortcut,
@@ -65,20 +83,17 @@ impl EditorApp {
             weak.clone(),
             |this, window, cx| this.open_folder_dialog(window, cx),
         ))
-        // 「打开最近…」：`.keep_open()` → 点击**不关闭**文件菜单（反馈 1：文件菜单
-        // 保持展开），打开居中大面板（`recent_panel::RecentPanel`，Ctrl+P 同款样式）。
+        // 「打开最近…」：flyout 悬浮次级菜单（悬停展开到右侧；子项点击 → 打开/清理
+        // + 整链关闭）。取代旧的 keep_open + 居中大面板（recent_panel 存 dormancy）。
+        // 注意根行内容**不用 `w_full`**：flyout 根行右侧由组件自动追加「›」指示
+        // （`ml_auto` 占满剩余宽），若内容撑满整行会把箭头挤出/错位（PDF 背景色同款姿势）。
         .item({
-            let weak2 = weak.clone();
             PopupMenuItem::element(move |_, _| {
                 div()
-                    .w_full()
                     .debug_selector(|| "recent-menu-open".into())
                     .child("打开最近…")
             })
-            .keep_open()
-            .on_click(move |_click, window, cx| {
-                let _ = weak2.update(cx, |this, cx| this.open_recent_panel(window, cx));
-            })
+            .flyout(Self::recent_flyout_items(&weak, recent_folders, recent_files))
         })
         .item(Self::menu_action_item(
             SAVE.menu_label,
@@ -118,8 +133,171 @@ impl EditorApp {
         ))
     }
 
+    /// 「打开最近…」flyout 次级菜单每类（文件夹 / 文件）的**最大行数**：与 recent_panel
+    /// 四区域「每类 ≤10」对齐，避免一次子菜单塞满全部 [RECENT_MAX]（50 条）把次级面板
+    /// 顶出窗口底缘（近窗缘适配受限时尤其明显）。
+    const RECENT_FLYOUT_REGION_MAX: usize = 10;
+
+    /// 「打开最近…」的 flyout 次级菜单项装配：最近文件夹（≤[`RECENT_FLYOUT_REGION_MAX`]）
+    /// → 分隔线 → 最近文件（≤上限）→ 分隔线 → 「清空最近记录」。
+    /// `folders`/`files` 是**打开菜单时**的最近列表快照（每次打开取最新）。
+    /// 两类全空 → 单个禁用占位项「暂无最近记录」（不可点）。
+    /// 所有子项都不 `keep_open` → 点击后**整链关闭**（次级 + 父菜单，组件
+    /// `activate_flyout` 的非 keep_open 路径——与「打开某路径/清空」动作一起生效）。
+    fn recent_flyout_items(
+        weak: &gpui::WeakEntity<Self>,
+        folders: Vec<String>,
+        files: Vec<String>,
+    ) -> Vec<PopupMenuItem> {
+        if folders.is_empty() && files.is_empty() {
+            return vec![PopupMenuItem::element(move |_, cx| {
+                let chrome = ui::theme::ChromeColors::for_mode(
+                    ui::theme::Theme::global(cx).is_dark(),
+                );
+                div()
+                    .w_full()
+                    .debug_selector(|| "recent-empty".into())
+                    .text_color(chrome.text_tertiary)
+                    .child("暂无最近记录")
+            })
+            .disabled(true)];
+        }
+        let mut children = Vec::new();
+        for (i, p) in folders
+            .iter()
+            .take(Self::RECENT_FLYOUT_REGION_MAX)
+            .enumerate()
+        {
+            children.push(Self::recent_row_item(weak.clone(), true, p, i));
+        }
+        // 分隔线只在**其上方区域非空**时插入：单类为空（另一类非空）时避免「首行悬浮
+        // 分隔线 / 两类间双分隔线」的可见瑕疵（recent_panel 空区域有「暂无」占位，此处
+        // 空区域整段省略）。
+        if !folders.is_empty() {
+            children.push(PopupMenuItem::separator());
+        }
+        for (i, p) in files
+            .iter()
+            .take(Self::RECENT_FLYOUT_REGION_MAX)
+            .enumerate()
+        {
+            children.push(Self::recent_row_item(weak.clone(), false, p, i));
+        }
+        if !files.is_empty() {
+            children.push(PopupMenuItem::separator());
+        }
+        children.push(Self::recent_clear_item(weak.clone()));
+        children
+    }
+
+    /// 最近列表行（文件夹/文件）：**复用 recent_panel 的行命名**（`recent-folder-row-{i}` /
+    /// `recent-file-row-{i}`，各测试的 debug 定位共用）；标签 = 名称（截断）+ 完整路径
+    /// 灰字副文本（封顶宽截断，不把 flyout 面板撑出窗口）。
+    /// 点击：路径存在 → 走打开中心入口（[`open_folder_path`] / [`open_file`]）；
+    /// 失效 → 从对应列表移除 + 状态栏提示（与 recent_panel `run_item` 一致）。
+    /// 非 keep_open → 点击后整链关闭。
+    fn recent_row_item(
+        weak: gpui::WeakEntity<Self>,
+        is_folder: bool,
+        path: &str,
+        idx: usize,
+    ) -> PopupMenuItem {
+        let path = path.to_string();
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let debug = if is_folder {
+            format!("recent-folder-row-{idx}")
+        } else {
+            format!("recent-file-row-{idx}")
+        };
+        // 渲染闭包与点击闭包各自持有一份（两个 `move` 闭包不能共享所有权，克隆待用）。
+        let name_render = name.clone();
+        let path_render = path.clone();
+        let debug_render = debug.clone();
+        PopupMenuItem::element(move |_, cx| {
+            // 每次渲染重建本地副本：内层 debug_selector 的 `move` 闭包捕获**本地**（而非
+            // 外层闭包捕获），避免「从 Fn 闭包捕获中移出」。名称/路径同理各建本地。
+            let debug = debug_render.clone();
+            let name = name_render.clone();
+            let path = path_render.clone();
+            let chrome = ui::theme::ChromeColors::for_mode(
+                ui::theme::Theme::global(cx).is_dark(),
+            );
+            div()
+                .w_full()
+                .debug_selector(move || debug.clone())
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w(px(0.))
+                // 名称：占满可伸展、超长截断。
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                        .child(SharedString::from(name)),
+                )
+                // 完整路径：灰字副文本、封顶宽截断。
+                .child(
+                    div()
+                        .max_w(px(120.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                        .text_size(px(11.))
+                        .text_color(chrome.text_tertiary)
+                        .child(SharedString::from(path)),
+                )
+                .into_any_element()
+        })
+        .on_click(move |_click, window, cx| {
+            let _ = weak.update(cx, |app, cx| {
+                if is_folder {
+                    if std::path::Path::new(&path).is_dir() {
+                        app.open_folder_path(std::path::PathBuf::from(&path), window, cx);
+                    } else {
+                        app.remove_recent_folder(&path, window, cx);
+                    }
+                } else if std::path::Path::new(&path).is_file() {
+                    app.open_file(&path, window, cx);
+                } else {
+                    app.remove_recent_file(&path, window, cx);
+                }
+            });
+        })
+    }
+
+    /// 「清空最近记录」：清空文件夹 + 文件两类最近记录并落盘。非 keep_open →
+    /// 点击后整链关闭。
+    fn recent_clear_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        PopupMenuItem::element(|_, _| {
+            div()
+                .w_full()
+                .debug_selector(|| "recent-clear".into())
+                .child("清空最近记录")
+        })
+        .on_click(move |_click, _window, cx| {
+            let _ = weak.update(cx, |app, cx| {
+                app.recent_folders.clear();
+                app.recent_files.clear();
+                app.persist_prefs();
+                cx.notify();
+            });
+        })
+    }
+
     /// "编辑"菜单。
-    fn edit_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
+    fn edit_items(
+        menu: PopupMenu,
+        weak: gpui::WeakEntity<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
         menu.item(Self::menu_action_item(
             UNDO.menu_label,
             UNDO.shortcut,
@@ -161,7 +339,12 @@ impl EditorApp {
     }
 
     /// "查看"菜单。
-    fn view_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
+    fn view_items(
+        menu: PopupMenu,
+        weak: gpui::WeakEntity<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
         menu.item(Self::menu_action_item(
             PREVIEW.menu_label,
             // 快捷键提示走命令表（空串 = 无提示）：P2-8 原 Ctrl+P = 预览切换已改开
@@ -312,7 +495,12 @@ impl EditorApp {
     }
 
     /// "帮助"菜单。
-    fn help_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
+    fn help_items(
+        menu: PopupMenu,
+        weak: gpui::WeakEntity<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
         menu.item(Self::menu_action_item(
             "关于",
             "",
@@ -469,7 +657,12 @@ impl EditorApp {
         let text_primary = self.text_primary();
         let make = |id: &'static str,
                     label: &'static str,
-                    items: fn(PopupMenu, gpui::WeakEntity<Self>) -> PopupMenu,
+                    items: fn(
+                        PopupMenu,
+                        gpui::WeakEntity<Self>,
+                        &mut Window,
+                        &mut Context<PopupMenu>,
+                    ) -> PopupMenu,
                     weak: gpui::WeakEntity<Self>| {
             Button::new(id)
                 .label(label)
@@ -482,7 +675,7 @@ impl EditorApp {
                 .rounded_sm()
                 .text_size(px(13.))
                 .text_color(text_primary)
-                .dropdown_menu(move |menu, _, _| items(menu, weak.clone()))
+                .dropdown_menu(move |menu, window, cx| items(menu, weak.clone(), window, cx))
         };
 
         div()
@@ -496,13 +689,13 @@ impl EditorApp {
             .child(make("menu-btn-help", "帮助", Self::help_items, weak))
     }
 
-    /// 「打开最近」居中大面板入口（文件菜单「打开最近…」点击，反馈 2）：创建
-    /// [`recent_panel::RecentPanel`] 实体（Ctrl+P 命令面板同款 Acrylic 居中卡片）、
-    /// 聚焦面板、订阅 `DismissEvent`（择项/Esc/点击外 → 清引用释放实体）。
-    ///
-    /// 反馈 1：源菜单项 `.keep_open()` → 文件菜单**不 dismiss**（保持展开，面板 occlude
-    /// 盖在其上不穿透）；面板关闭（含择项打开文件后）也不动文件菜单——它留到自身
-    /// 下一次外部点击才收起（无 PopupMenu 句柄，不强行程序关菜单）。
+    /// 「打开最近」居中大面板入口（**Dormancy：已被 [`Self::file_items`] 的 flyout 悬浮
+    /// 次级菜单取代**——文件菜单「打开最近…」现为悬停展开的右侧子菜单，子项点击即整链
+    /// 关闭，不再打开此居中面板）。保留源码 + 测试（recent.rs 经 [`recent_panel`] /
+    /// `open_recent_panel` 直连面板实体做 dormancy 回归）；仅测试引用故标 dead_code。
+    /// 历史行为：`RecentPanel` 是 Ctrl+P 命令面板同款 Acrylic 居中卡片，打开即聚焦、
+    /// 订阅 `DismissEvent`（择项/Esc/点击外 → 清引用释放实体）。
+    #[allow(dead_code)]
     pub(super) fn open_recent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 最近列表快照：面板打开期间被别处更新 → 下次打开才反映最新（面板实体不
         // 在渲染路径反读宿主演变状态，避免 re-entrant borrow；记录逻辑仍走 file_ops）。
