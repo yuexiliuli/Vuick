@@ -37,7 +37,7 @@ pub use parser::{
     QuadPt, RecolorEntry, RenderRequest, RenderResult, TileRequest, TileResult,
     is_writeback_busy_error,
 };
-pub use recolor::{RecolorParams, apply_recolor};
+pub use recolor::{RecolorCurve, RecolorParams, apply_recolor, apply_recolor_with_curve};
 pub use view::PdfViewer;
 
 use std::sync::Arc;
@@ -147,6 +147,24 @@ mod tests {
     impl Drop for GpuGateGuard {
         fn drop(&mut self) {
             crate::recolor::set_gpu_recolor_gate_for_test(self.prev);
+        }
+    }
+
+    /// 曲线策略 latch 的测试覆盖守卫（对称于 `GpuGateGuard`）：构造时设为 `c`，Drop 还原
+    /// 为 `prev`。仅可在持 `pdf_lock` 时用（与 gate 守卫同样的并发纪律）。
+    struct CurveGuard {
+        prev: crate::recolor::RecolorCurve,
+    }
+    impl CurveGuard {
+        fn set(c: crate::recolor::RecolorCurve) -> Self {
+            let prev = crate::recolor::recolor_curve();
+            crate::recolor::set_recolor_curve_for_test(c);
+            CurveGuard { prev }
+        }
+    }
+    impl Drop for CurveGuard {
+        fn drop(&mut self) {
+            crate::recolor::set_recolor_curve_for_test(self.prev);
         }
     }
 
@@ -3161,6 +3179,7 @@ mod tests {
 
         let _guard = pdf_lock().lock().unwrap();
         let _gate = GpuGateGuard::set_on();
+        let _curve = CurveGuard::set(RecolorCurve::FullBand);
         cx.update(crate::test_support::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/pdf测试.pdf");
@@ -3250,15 +3269,20 @@ mod tests {
             !sprites.is_empty(),
             "门控开启 + 夜间档应产生 RecolorSprite 场景图元（PDF 显示 img 挂上重着色参数）"
         );
-        // bg 归一化 0x20/255 ≈ 0.1255；switches.x=1 启用墨带；ink 0xD8/255 ≈ 0.8471。
+        // bg 归一化 0x20/255 ≈ 0.1255；switches.x=1 启用墨带；ink 0xD8/255 ≈ 0.8471；
+        // switches.y=1 = FullBand（曲线 latch 默认/本测试显式设为 FullBand）——shader 分支依据。
         let bg0 = 0x20u8 as f32 / 255.0;
         let ink0 = 0xD8u8 as f32 / 255.0;
         let ok = sprites.iter().any(|s| {
             s.switches[0] == 1.0
+                && s.switches[1] == 1.0
                 && (s.bg[0] - bg0).abs() < 1e-3
                 && (s.ink[0] - ink0).abs() < 1e-3
         });
-        assert!(ok, "至少一个 RecolorSprite 应携带正确的纸/墨参数（ink 启用、bg=0x20、ink=0xD8）");
+        assert!(
+            ok,
+            "至少一个 RecolorSprite 应携带正确的纸/墨参数 + FullBand 曲线（ink 启用、switches.y=1、bg=0x20、ink=0xD8）"
+        );
     }
 
     /// 回归（**切档只刷可见集**，真实渲染路径 + 真夹具）：
