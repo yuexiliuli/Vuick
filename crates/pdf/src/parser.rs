@@ -480,6 +480,11 @@ enum WorkerMsg {
     ),
     #[allow(dead_code)] // 回归测试渲染整页（文本对齐、贴片比对）使用
     Render(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
+    /// F4 预取走廊的**半密度整页预览**渲染（0.5× 封面密度，`request_render_preview` 发送）：
+    /// 与整页 `Render` 同优先（render_q）、同几何（`render_page` 按 `req.scale` 出全页位图），
+    /// 但按 `RawKind::Mid` 语义**不入 raw 缓存、不参与重着色刷新**——廊封面是瞬态低清底图
+    /// （就像中清/缩略一样），raw 入缓存只会挤出可见封面/瓦片原图（预算空转、切档无消费方）。
+    RenderPreview(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
     /// 瓦片渲染（主内容路径）：只栅格化一页的一格（~512px）。与全尺寸 Render 同一
     /// 优先级（视口内容优先），worker 内实现见 [`render_tile`]。
     RenderTile(DocId, TileRequest, mpsc::Sender<Option<TileResult>>),
@@ -646,6 +651,19 @@ impl PdfWorker {
     ) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
         let _ = self.tx.send(WorkerMsg::Mid(doc_id, page, scale_factor, tx));
+        rx
+    }
+
+    /// F4 预取走廊：请求渲染某页的**半密度整页预览**（异步；`scale` = 0.5× `cover_scale`）。
+    /// 与普通封面同级优先级（render_q 视口内容优先），但结果**不入 raw 缓存、不参与重着色
+    /// 刷新**（瞬态底图，同中清/缩略语义），节省 48MB 预算、不挤占切档刷新的可见原图镜像。
+    pub fn request_render_preview(
+        &self,
+        doc_id: DocId,
+        req: RenderRequest,
+    ) -> mpsc::Receiver<Option<RenderResult>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::RenderPreview(doc_id, req, tx));
         rx
     }
 
@@ -941,6 +959,17 @@ impl PdfWorker {
                             .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Cover, gpu));
                         let _ = tx.send(result);
                     }
+                    WorkerMsg::RenderPreview(doc_id, req, tx) => {
+                        // F4 廊封面预览：同 Render 几何与优先级，但 kind=Mid → `finalize_render`
+                        // 的 Mid/Thumb 分支：**不入 raw 缓存**（瞬态底图，切档刷新无消费方）。
+                        let p = recolor.get(&doc_id).copied().flatten();
+                        let gpu = crate::recolor::gpu_recolor_gate();
+                        let doc_cache = raw_cache.entry(doc_id).or_default();
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Mid, gpu));
+                        let _ = tx.send(result);
+                    }
                     WorkerMsg::RenderTile(doc_id, req, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
                         let gpu = crate::recolor::gpu_recolor_gate();
@@ -950,7 +979,7 @@ impl PdfWorker {
                             .and_then(|doc| render_tile(doc, req, p, doc_cache, gpu));
                         let _ = tx.send(result);
                     }
-                    _ => unreachable!("render_q 只入 Render/RenderTile"),
+                    _ => unreachable!("render_q 只入 Render/RenderTile/RenderPreview"),
                 }
                 continue;
             }
@@ -1319,7 +1348,9 @@ fn enqueue_msg(
     rest_q: &mut VecDeque<WorkerMsg>,
 ) {
     match msg {
-        WorkerMsg::Render(..) | WorkerMsg::RenderTile(..) => render_q.push_back(msg),
+        WorkerMsg::Render(..) | WorkerMsg::RenderTile(..) | WorkerMsg::RenderPreview(..) => {
+            render_q.push_back(msg)
+        }
         WorkerMsg::Mid(..) => mid_q.push_back(msg),
         WorkerMsg::Thumb(..) => thumb_q.push_back(msg),
         _ => rest_q.push_back(msg),

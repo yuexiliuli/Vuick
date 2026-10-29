@@ -109,3 +109,16 @@ pub const COVER_SCALE_CAP: f32 = 4.0;
 /// 同时在途的封面渲染上限：可见页封面 + 滚动方向邻居预取封面（空闲预热 1-2 页，
 /// 滚到即立即锐利，不必等整页瓦片逐片来）。
 pub const COVER_INFLIGHT: usize = 3;
+// ---- F4 空闲预取走廊（WPS「好像全部已加载」的来源）：idle 早退前把窗口±2 的
+// 低成本半密度整页底图预取进槽，高速平移切入时新页短暂模糊但不「加载中」----
+/// 走廊封面渲染密度（相对满密度封面 [`crate::pdf::layout::cover_scale`] 的比例）。
+/// 0.5 密度 = 位图像素 1/4（~5MB/页、~5-12ms/页），走廊填得更深更便宜，「滚动即
+/// 清晰」的观感足够（高速平移期只是匆匆一瞥，降速后由满密度封面/瓦片接管）。
+pub const PREFETCH_COVER_DENSITY: f32 = 0.5;
+/// 走廊封面单帧最多新派发数（跨帧预算）：idle 每帧 ≤2，空闲期消化、不洪起 worker 队列。
+pub const PRE_FETCH_COVER_INFLIGHT: usize = 2;
+/// 走廊封面显存/内存总预算（字节）：0.5 密度 A4 适配宽 ~2.6-5MB/页，40MB ≈ 8-15 页走廊。
+/// 独立于窗口封面（`COVER_SIZE_BUDGET`/`COVER_INFLIGHT`），超预算按距视口中心 LRU 收回。
+pub const PREFETCH_COVER_BUDGET_BYTES: u64 = 40 * 1024 * 1024;
+/// 走廊窗口：可见页两侧各外扩的页数（idle 期间预取 [vis±2]，覆盖高速平移一两次大跳）。
+pub const PREFETCH_COVER_MARGIN: usize = 2;

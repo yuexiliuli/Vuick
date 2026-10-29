@@ -324,16 +324,18 @@ fn search_overlays_for_page(
 /// 页卡底图选择（缩放期/方向翻位防闪的纯逻辑，见 [`PdfViewer::build_visible_page_cards`]）：
 /// 返回本帧应铺满整页的位图，优先级 **当前密度封面（锐利）→ 过渡底图
 /// （[`Slot::prev_cover`]：旧密度封面缩放过渡 CSS 拉伸兜底，或 F2 方向翻位退位封面桥）
+/// → 空闲预取走廊封面（[`Slot::prefetch_cover`]：0.5 密度、高速平移切入的即时底图）
 /// → 中清 → 缩略**；全空 → `None`（调用方显示「第 N 页 加载中…」——仅首开/极速拖动这类
 /// 真的没有任何位图的页才出现）。缩放瞬间 `cover_now` 为 `None`，但只要过渡图还在，底图
 /// 就是它而非占位——「宁可瞬时模糊也不闪白」。抽成纯函数便于单测钉死该优先级。
 pub(super) fn page_base_image(
     cover_now: Option<&Arc<RenderImage>>,
     cover_stale: Option<&Arc<RenderImage>>,
+    prefetch: Option<&Arc<RenderImage>>,
     mid: Option<&Arc<RenderImage>>,
     thumb: Option<&Arc<RenderImage>>,
 ) -> Option<Arc<RenderImage>> {
-    cover_now.or(cover_stale).or(mid).or(thumb).cloned()
+    cover_now.or(cover_stale).or(prefetch).or(mid).or(thumb).cloned()
 }
 
 impl PdfViewer {
@@ -387,6 +389,12 @@ impl PdfViewer {
             // 缩放过渡期兜底：旧密度封面（schedule_tiles 从 cover 移入）在新密度封面到位前
             // 按新页宽 CSS 拉伸铺满，防「Ctrl+滚轮缩放期间每档闪一次『加载中』」空白。
             let slot_prev_cover = slot.prev_cover.clone();
+            // F4 空闲预取走廊封面（0.5 密度整页）：高速平移切入的新页在满密度封面/瓦片
+            // 就位前的即时底图（瓦片未到、封面在途时 CSS 拉伸铺满，优于「加载中」白块）。
+            let slot_prefetch = slot
+                .prefetch_cover
+                .clone()
+                .filter(|_| slot.cover.is_none());
             let mut tiles: Vec<(f32, f32, f32, f32, Arc<RenderImage>)> = Vec::new();
             if tile_ok {
                 tiles.reserve(slot.tiles.len());
@@ -485,12 +493,13 @@ impl PdfViewer {
                 .border_color(page_border)
                 .overflow_hidden();
 
-            // 三层合成：底图（当前密度封面 → 旧密度封面拉伸兜底 → 中清 → 缩略图，
-            // 缩放期不闪白：宁可瞬时模糊也要有底图）→ 瓦片（逐片绝对定位，opaque 覆盖
-            // 底图）→ 选区/检索高亮。全空（首开/极速拖动）才落「加载中」占位。
+            // 三层合成：底图（当前密度封面 → 旧密度封面拉伸兜底 → 空闲预取走廊封面 →
+            // 中清 → 缩略图，缩放期不闪白：宁可瞬时模糊也要有底图）→ 瓦片（逐片绝对定位，
+            // opaque 覆盖底图）→ 选区/检索高亮。全空（首开/极速拖动）才落「加载中」占位。
             let base = page_base_image(
                 slot_cover.as_ref(),
                 slot_prev_cover.as_ref(),
+                slot_prefetch.as_ref(),
                 slot_mid.as_ref(),
                 slot_thumb.as_ref(),
             );
@@ -529,6 +538,11 @@ impl PdfViewer {
                     )
                     .into_any_element()
             } else {
+                // F4 观测：此处是「第 N 页 加载中…」唯一来源（底图链 cover→prev_cover→
+                // 廊封面→mid→thumb 全空）。自增计数器供回归断言「常态主路径不再让可见页
+                // 长时间落加载态」（仅剩 worker 未回的第一帧可短暂命中）。
+                self.loading_placeholder_hits
+                    .set(self.loading_placeholder_hits.get() + 1);
                 div()
                     .size_full()
                     .relative()

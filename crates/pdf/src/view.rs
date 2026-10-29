@@ -253,6 +253,17 @@ pub struct PdfViewer {
     pub(crate) pending_tiles: HashMap<(usize, u32, u32), PendingTileEntry>,
     /// 在途**封面**（首屏整页锐化）请求：`页` → (密度 scale, 结果通道)。
     pub(crate) pending_cover: HashMap<usize, (f32, mpsc::Receiver<Option<RenderResult>>)>,
+    /// F4 空闲预取走廊在途请求：`页` → (半密度 scale, 结果通道)。独立于 [`Self::pending_cover`]
+    /// （密度守卫不同：0.5× 封面、低优先级、仅空闲期消化），见 `tiles::collect_prefetch_cover_results`
+    /// 与 `tiles::prefetch_corridor`。非空期间自刷新泵继续出帧以收集走廊结果。
+    pub(crate) pending_prefetch_cover: HashMap<usize, (f32, mpsc::Receiver<Option<RenderResult>>)>,
+    /// F4 观测计数：累计向 worker 派发的**走廊封面**栅格请求数（回归断言 idle 预取确实
+    /// 发生、且窗口移动后不再增长用；纯观测，无副作用）。
+    pub(crate) prefetch_reqs: u64,
+    /// F4 观测计数：「第 N 页 加载中…」占位分支的实际命中次数（`render::page_base_image`
+    /// 全空时才自增；`release` 时归零）。回归断言「常态主路径不再让可见页落加载态」用。
+    /// `Cell<u64>`：渲染路径只持 `&Self`（`build_visible_page_cards`），内部可变性计数。
+    pub(crate) loading_placeholder_hits: std::cell::Cell<u64>,
     /// 在途**重着色刷新**结果接收通道（`set_recolor` 时向 worker 请求）：worker 把已缓存
     /// 原图现算新着色副本逐条回传，本通道 drain 完（断开）即清。驱动一次「切档不重栅」
     /// 的显示刷新；非 None 期间自刷新泵持续出帧直到收完（防晚到结果无帧可收集）。
@@ -430,6 +441,9 @@ mod tests {
                     mid_lru: VecDeque::new(),
                     pending_tiles: HashMap::new(),
                     pending_cover: HashMap::new(),
+                    pending_prefetch_cover: HashMap::new(),
+                    prefetch_reqs: 0,
+                    loading_placeholder_hits: std::cell::Cell::new(0),
                     pending_recolor: None,
                     raster_reqs: 0,
                     recolor_scope: Vec::new(),
@@ -572,6 +586,7 @@ mod tests {
         let base = super::render::page_base_image(
             None,
             Some(&old_cover),
+            None,
             Some(&mid),
             Some(&thumb),
         );
@@ -585,6 +600,7 @@ mod tests {
         let base2 = super::render::page_base_image(
             Some(&cur_cover),
             Some(&old_cover),
+            None,
             Some(&mid),
             Some(&thumb),
         );
@@ -593,20 +609,20 @@ mod tests {
             "当前密度封面最优先"
         );
 
-        // 无封面（含旧封面）时：中清 > 缩略 > 全空。
+        // 无封面（含旧封面）时：中清 > 缩略 > 全空（F4 走廊封面夹在旧封面与中清之间）。
         assert!(std::sync::Arc::ptr_eq(
-            &super::render::page_base_image(None, None, Some(&mid), Some(&thumb))
+            &super::render::page_base_image(None, None, None, Some(&mid), Some(&thumb))
                 .expect("中清存在"),
             &mid,
         ));
         assert!(std::sync::Arc::ptr_eq(
-            &super::render::page_base_image(None, None, None, Some(&thumb))
+            &super::render::page_base_image(None, None, None, None, Some(&thumb))
                 .expect("缩略存在"),
             &thumb,
         ));
-        // 四者全空（首开/极速拖动且旧资产也被回收）→ None，此时才显示「加载中」占位。
+        // 全空（首开/极速拖动且旧资产也被回收，连走廊封面也无）→ None，此时才显示「加载中」占位。
         assert!(
-            super::render::page_base_image(None, None, None, None).is_none(),
+            super::render::page_base_image(None, None, None, None, None).is_none(),
             "全空才落「加载中」占位"
         );
     }
@@ -634,6 +650,9 @@ mod tests {
                     mid_lru: VecDeque::new(),
                     pending_tiles: HashMap::new(),
                     pending_cover: HashMap::new(),
+                    pending_prefetch_cover: HashMap::new(),
+                    prefetch_reqs: 0,
+                    loading_placeholder_hits: std::cell::Cell::new(0),
                     pending_recolor: None,
                     raster_reqs: 0,
                     recolor_scope: Vec::new(),
@@ -753,6 +772,9 @@ mod tests {
                     mid_lru: VecDeque::new(),
                     pending_tiles: HashMap::new(),
                     pending_cover: HashMap::new(),
+                    pending_prefetch_cover: HashMap::new(),
+                    prefetch_reqs: 0,
+                    loading_placeholder_hits: std::cell::Cell::new(0),
                     pending_recolor: None,
                     raster_reqs: 0,
                     recolor_scope: Vec::new(),

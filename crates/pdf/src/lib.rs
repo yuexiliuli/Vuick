@@ -2493,6 +2493,30 @@ mod tests {
         })
     }
 
+    /// F4/D：走廊封面（[`Slot::prefetch_cover`]）驻留内存（独立于窗口封面）：返回
+    /// `(廊封面页数, 粗略字节)`。byte 计 `page_bitmap_size(dim, prefetch_cover_scale)`。
+    #[allow(clippy::type_complexity)]
+    fn prefetch_memory(
+        holder: &std::rc::Rc<
+            std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>,
+        >,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (usize, u64) {
+        cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let mut cnt = 0usize;
+            let mut bytes = 0u64;
+            for (p, s) in v.slots.iter().enumerate() {
+                if s.prefetch_cover.is_some() {
+                    cnt += 1;
+                    let (w, h) = layout::page_bitmap_size(v.dims[p], s.prefetch_cover_scale);
+                    bytes += (w as u64) * (h as u64) * 4;
+                }
+            }
+            (cnt, bytes)
+        })
+    }
+
     /// 回归（内存）：完整滚动一遍整份文档后，渲染驻留内存必须**有界**且消灭“封面 + 瓦片
     /// 双份持有”。修复前：整页封面与同页瓦片/中清并存 → 全量缓存预算合计 ~280MB（瓦片
     /// 96MB + 封面 ~36MB + 中清 32MB + 缩略 15MB + 基座）。修复后：同密度整页封面在位即
@@ -2599,6 +2623,40 @@ mod tests {
             total_est < 220 * 1024 * 1024,
             "zoom1 完整滚动后渲染驻留内存应明显低于修复前（~280MB）：{total_est}"
         );
+        // F4/D：走廊封面独立有界（窗口封面计数/est_total 不受影响）；且 est_total 不超
+        // 8bab7be 基线（z1.0 est 66-69MB）的 120%。settle 只等主队列清空，走廊随后在 idle
+        // 帧填充——先无条件泵若干帧让走廊播种+落定，再泵到走廊在途清空，量稳态尺寸。
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        for _ in 0..200 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let pf_done = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_prefetch_cover.is_empty()
+            });
+            if pf_done {
+                break;
+            }
+        }
+        let (pf_covers, pf_bytes) = prefetch_memory(&holder, cx);
+        eprintln!(
+            "[MEM-PRETCH zoom=1.0] prefetch_covers={pf_covers} bytes={}MB 预算={}MB",
+            pf_bytes / 1024 / 1024,
+            config::pdf::PREFETCH_COVER_BUDGET_BYTES / 1024 / 1024,
+        );
+        assert!(
+            pf_bytes <= config::pdf::PREFETCH_COVER_BUDGET_BYTES,
+            "zoom1 走廊封面字节应 ≤ 预算：{pf_bytes}"
+        );
+        assert!(
+            total_est <= 69 * 1024 * 1024 * 120 / 100,
+            "zoom1 est_total 不应超 8bab7be 基线（~69MB）120%：{total_est}"
+        );
 
         // 再以用户实测量的高倍密度（Ctrl+滚轮放大 → zoom≈1.76 → 渲染密度≈2.48）完整滚动
         // 一遍复测：封面单张变 ~12MB，正是真实场景里 160MB 的主要构成，必须同样有界。
@@ -2663,6 +2721,40 @@ mod tests {
         assert!(
             total_est2 < 150 * 1024 * 1024,
             "zoom1.75 高倍密度下渲染驻留内存也应有界：{total_est2}"
+        );
+        // F4/D：高倍密度下走廊封面仍独立有界（预算按字节强制逐出，超预算页自动裁剪）；
+        // est_total 不超 8bab7be 基线（z1.75 est 105-108MB）120%。同 zoom1.0：先无条件泵
+        // 帧让走廊在最后停靠点播种落定，再泵到走廊在途清空后量稳态。
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let pf_done = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_prefetch_cover.is_empty()
+            });
+            if pf_done {
+                break;
+            }
+        }
+        let (pf_covers2, pf_bytes2) = prefetch_memory(&holder, cx);
+        eprintln!(
+            "[MEM-PRETCH zoom=1.75] prefetch_covers={pf_covers2} bytes={}MB 预算={}MB",
+            pf_bytes2 / 1024 / 1024,
+            config::pdf::PREFETCH_COVER_BUDGET_BYTES / 1024 / 1024,
+        );
+        assert!(
+            pf_bytes2 <= config::pdf::PREFETCH_COVER_BUDGET_BYTES,
+            "zoom1.75 走廊封面字节应仍 ≤ 预算：{pf_bytes2}"
+        );
+        assert!(
+            total_est2 <= 108 * 1024 * 1024 * 120 / 100,
+            "zoom1.75 est_total 不应超 8bab7be 基线（~108MB）120%：{total_est2}"
         );
     }
 
@@ -2875,6 +2967,382 @@ mod tests {
             bridge_pages,
             vec![9],
             "翻回后桥应跟手换到新的反向邻居（第 9 页）且仅此 1 张：{bridge_pages:?}"
+        );
+    }
+
+    /// F4/A 回归（真实渲染路径 + 真夹具）：打开 / 长跳停稳后，每个可见页都应有底图
+    /// （`thumb.is_some() || cover.is_some()`，F4/A 同帧补缩略把常态主路径的「加载中」
+    /// 空窗填掉），且**静置期「加载中」计数零增长**（不再有帧落加载态；只剩跳转途中
+    /// VeryFast 无隙期的短暂命中，属 C 的可接受取舍）。同时上报瞬态诊断（封面在途期
+    /// 是否观测到缩略兜底、可见页全空帧数）供人工核对，不作时序硬断言（机器快慢各异）。
+    #[gpui::test]
+    async fn thumb_backdrop_keeps_normal_roll_loading_free(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        // 暖 60 帧让自适应页宽与滚动容器布局稳定（与 cover_retire_bridge 同款）
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty()
+                        && v.pending_cover.is_empty()
+                        && !v.prev_fast
+                        && !v.tile_pump_running
+                });
+                if st {
+                    return;
+                }
+            }
+            panic!("状态应沉降");
+        };
+        // 校验「打开/长跳停稳后每可见页有底图 + 静置零加载」：阶段 s。
+        let read_hits = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).loading_placeholder_hits.get())
+        };
+        let check_phase = |cx: &mut gpui::VisualTestContext, tag: &str| {
+            // 停稳后再推 5 帧静置，采样「加载中」计数是否零增长
+            for _ in 0..5 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            let hits_before = read_hits(cx);
+            let (vis_missing, vis_count) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let off_y = f32::from(-v.scroll.offset().y);
+                let pw = v.page_width();
+                let vh = f32::from(v.scroll.bounds().size.height).max(1.0);
+                let vis = pdf_visible_pages(v, pw, off_y, vh);
+                let missing: Vec<usize> = vis
+                    .iter()
+                    .copied()
+                    .filter(|&p| {
+                        let s = &v.slots[p];
+                        !(s.cover.is_some() || s.thumb.is_some())
+                    })
+                    .collect();
+                (missing, vis.len())
+            });
+            for _ in 0..5 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            let hits_after = read_hits(cx);
+            eprintln!(
+                "[F4-A/{tag}] visible={vis_count} missing_base={vis_missing:?} loading_hits {hits_before}→{hits_after}"
+            );
+            assert!(
+                vis_missing.is_empty(),
+                "[{tag}] 停稳后每可见页应有底图（thumb||cover）：{vis_missing:?}"
+            );
+            assert!(
+                hits_after == hits_before,
+                "[{tag}] 静置期「加载中」计数应零增长：{hits_before}→{hits_after}"
+            );
+        };
+
+        settle(cx);
+        check_phase(cx, "open"); // 打开 → 停稳
+
+        // 长跳到第 12 页（目的地页无任何既有底图）→ 停稳
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.scroll_to_page(12);
+                    cx.notify();
+                });
+        });
+        settle(cx);
+        check_phase(cx, "jump12");
+    }
+
+    /// F4/B 回归（真实渲染路径 + 真夹具）：idle 空闲期把走廊 [vis±2] 填上半密度封面
+    /// （WPS「好像全部已加载」的来源；`prefetch_reqs` 增长、廊封面入槽、总量 ≤ 预算）；
+    /// 窗口移动（跳页 + 停稳，非 idle 帧）后走廊窗外的旧廊封面按距离回收、新窗内的
+    /// 廊封面保留——内存护栏 [`PREFETCH_COVER_BUDGET_BYTES`] 恒成立（独立于窗口封面计数）。
+    #[gpui::test]
+    async fn idle_prefetch_corridor_bounded_and_reclaims_on_window_move(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    (v.pending_cover.is_empty() && v.pending_tiles.is_empty(), !v.prev_fast)
+                });
+                if st == (true, true) {
+                    return;
+                }
+            }
+            panic!("状态应沉降");
+        };
+        let jump = |cx: &mut gpui::VisualTestContext, page: usize| {
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |v, cx| {
+                        v.scroll_to_page(page);
+                        cx.notify();
+                    });
+            });
+        };
+
+        // ① 跳页 20 停稳（方向向下 → 封面窗 [20..21]；18/19/22 为走廊候选页）
+        jump(cx, 20);
+        settle(cx);
+        // idle 期推 60 帧：空闲分支逐帧派发走廊 + 泵收集，直到 [vis±2] 填满/预算
+        let p0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).prefetch_reqs);
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let (p1, pf_covers, pf_bytes, off_y) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let off_y = f32::from(-v.scroll.offset().y);
+            let mut cnt = 0usize;
+            let mut bytes = 0u64;
+            let pages: Vec<usize> = v
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.prefetch_cover.is_some())
+                .map(|(p, s)| {
+                    cnt += 1;
+                    let (w, h) = layout::page_bitmap_size(v.dims[p], s.prefetch_cover_scale);
+                    bytes += (w as u64) * (h as u64) * 4;
+                    p
+                })
+                .collect();
+            (v.prefetch_reqs, pages, bytes, off_y)
+        });
+        eprintln!(
+            "[F4-B] phase1 prefetch_reqs {p0}→{p1} covers={pf_covers:?} bytes={}MB off_y={off_y:.0}",
+            pf_bytes / 1024 / 1024,
+        );
+        assert!(p1 > p0, "idle 期应实际派发走廊封面（prefetch_reqs 应增长）");
+        assert!(!pf_covers.is_empty(), "idle 期后走廊页应有廊封面入槽");
+        let vis_first = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let off_y = f32::from(-v.scroll.offset().y);
+            layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), off_y)
+        });
+        let (lo, hi) = (
+            vis_first.saturating_sub(config::pdf::PREFETCH_COVER_MARGIN),
+            vis_first + config::pdf::PREFETCH_COVER_MARGIN,
+        );
+        assert!(
+            pf_covers.iter().all(|&p| p >= lo && p <= hi),
+            "廊封面应全部落在走廊 [vis-2..vis+2]：[{lo}..{hi}] 内，实际 {pf_covers:?}"
+        );
+        assert!(
+            pf_bytes <= config::pdf::PREFETCH_COVER_BUDGET_BYTES,
+            "廊封面总字节应 ≤ 预算：{pf_bytes} > {}",
+            config::pdf::PREFETCH_COVER_BUDGET_BYTES
+        );
+
+        // ② 窗口移动（跳页 23 停稳 → 非 idle 帧）→ 走廊外旧廊封面按距离回收
+        jump(cx, 23);
+        settle(cx);
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let (pf_covers2, off_y2, bytes2) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let off_y = f32::from(-v.scroll.offset().y);
+            let mut bytes = 0u64;
+            let pages: Vec<usize> = v
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.prefetch_cover.is_some())
+                .map(|(p, s)| {
+                    let (w, h) = layout::page_bitmap_size(v.dims[p], s.prefetch_cover_scale);
+                    bytes += (w as u64) * (h as u64) * 4;
+                    p
+                })
+                .collect();
+            (pages, off_y, bytes)
+        });
+        eprintln!(
+            "[F4-B] phase2 covers={pf_covers2:?} bytes={}MB off_y={off_y2:.0}",
+            bytes2 / 1024 / 1024,
+        );
+        let vis_first2 = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let off_y = f32::from(-v.scroll.offset().y);
+            layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), off_y)
+        });
+        let (lo2, hi2) = (
+            vis_first2.saturating_sub(config::pdf::PREFETCH_COVER_MARGIN),
+            vis_first2 + config::pdf::PREFETCH_COVER_MARGIN,
+        );
+        assert!(
+            pf_covers2.iter().all(|&p| p >= lo2 && p <= hi2),
+            "窗口移动后廊封面应全部落在新走廊 [{lo2}..{hi2}] 内：{pf_covers2:?}"
+        );
+        assert!(
+            bytes2 <= config::pdf::PREFETCH_COVER_BUDGET_BYTES,
+            "窗口移动后廊封面字节仍 ≤ 预算：{bytes2}"
+        );
+        // 走廊外（旧位置 18/19）的廊封面应已被回收
+        assert!(
+            !pf_covers2.contains(&18) && !pf_covers2.contains(&19),
+            "旧走廊（18/19）廊封面应在窗口移动后被回收：{pf_covers2:?}"
+        );
+
+        // ③（评审 F2）空闲消化会收敛：窗口**不动**继续 idle 泵若干帧 → 走廊填满后
+        // `pending_prefetch_cover` 收敛到 0、`prefetch_reqs` 不再增长（不会无限泵/无限走廊增长）。
+        // 先泵到走廊完全落定（在途清空，再多的派发也发生在收敛之前），再取收敛基线。
+        for _ in 0..200 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let pf_done = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_prefetch_cover.is_empty()
+            });
+            if pf_done {
+                break;
+            }
+        }
+        let (prefetch_reqs_before, pf_converged) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.prefetch_reqs, v.pending_prefetch_cover.is_empty())
+        });
+        // 再连推 30 帧静置：走廊在途保持 0、预取请求数不再增长（收敛而非空转）。
+        let mut pf_never_nonempty = true;
+        let mut reqs_stable = true;
+        for _ in 0..30 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let (pf_inflight, reqs_now) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.pending_prefetch_cover.is_empty(), v.prefetch_reqs)
+            });
+            pf_never_nonempty &= pf_inflight;
+            reqs_stable &= reqs_now == prefetch_reqs_before;
+        }
+        eprintln!(
+            "[F4-B] phase3 converge pf_inflight_empty={pf_converged} reqs_stable_in_30frames={reqs_stable}"
+        );
+        assert!(pf_converged, "窗口不动 idle 泵后走廊在途应收敛到 0");
+        assert!(
+            reqs_stable && pf_never_nonempty,
+            "收敛后继续静置不得再派走廊/在途保持 0（空闲消化会收敛）：reqs_stable={reqs_stable}"
+        );
+        assert!(
+            prefetch_reqs_before > 0,
+            "phase3 前应已有走廊预取发生过（收敛才有意义）"
         );
     }
 

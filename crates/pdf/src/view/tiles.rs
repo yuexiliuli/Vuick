@@ -66,6 +66,16 @@ impl PdfViewer {
         if !self.pending_tiles.is_empty() || !self.pending_cover.is_empty() {
             return true;
         }
+        // F4/B：中清/缩略在途也要续帧收集——否则 Fast 带派发的中清/缩略在换挡后
+        // `pump_still_needed` 停泵、结果滞留无人收集（静置 idle 门/预取走廊要求四队列
+        // 全空才能触发，滞留会让走廊永远等不到空闲帧）。中清/缩略渲染 ~1-5ms，多出几帧即清。
+        if !self.pending_mid.is_empty() || !self.pending_thumb.is_empty() {
+            return true;
+        }
+        // F4 走廊封面在途：继续出帧收集空闲预取结果（idle 分支派发后自启动泵的延续）。
+        if !self.pending_prefetch_cover.is_empty() {
+            return true;
+        }
         // 重着色刷新在途：继续出帧直到 worker 回传的新着色副本 drain 完（否则晚到的
         // 回传没有下一帧可收集，重着色画面停在旧着色上）。
         if self.pending_recolor.is_some() {
@@ -231,8 +241,258 @@ impl PdfViewer {
         // （可见页 + 滚动方向前瞻 1 页；非 MARGIN 全窗——否则候选页数超驻留上限 → 换页风暴）。
         // 请求窗与 `evict_covers` 驻留窗一致，避免「派了即逐」。中心页优先出队。**T1**：封面与
         // 瓦片同密度的页因规划跳过已无瓦片，封面即是该页唯一供给 → 无同页双渲。
+        // **F4/A 兜底（评审 F1 修正：不可与封面同帧双渲）**：封面**派完之后**再给「可见且
+        // 封面机不可负担/封面在途预算卡满未能派发」的页补一枚 L0 缩略——worker 每轮先
+        // render_q 后 thumb_q（parser.rs），同帧「缩略+封面」时封面先渲、缩略非但没先填窗反成
+        // 同页双渲浪费。故缩略**只服务「封面真的不会马上来」的页**：本帧已被 `schedule_covers`
+        // 派封面（或更早在途）的页由 `pending_cover` 守卫跳过；封面可负担且预算有空 → 封面
+        // 必然马上派到，缩略即是双渲冗余，同样跳过。缩略实际兜底的正是「封面不可负担
+        // （病理性页）或封面在途预算卡满」这两类空窗。封面到位时 `collect_cover_results`
+        // 顺带下线缩略（F2 既有语义）。只服务真正可见页（不铺 MARGIN 缓冲页，避免缩略驻留
+        // 超 `THUMB_CACHE_PAGES`）。
         let center_vis = (vis_first + vis_last) / 2;
         self.schedule_covers(cover_first, cover_last, center_vis, retire, page_width, scale_factor);
+        self.schedule_thumb_backdrops(vis_first, vis_last, page_width, scale_factor);
+    }
+
+    /// F4/A：常态 `schedule_tiles` 主路径的**缩略待底图补发**（评审 F1 修正后语义）——在
+    /// `schedule_covers` **之后**调用，只对「封面真的不会马上来」的**可见**页派一枚 L0 缩略
+    /// （~1-5ms/页）：封面不可负担（病理性超预算页）或封面在途已占满 [`COVER_INFLIGHT`]、
+    /// 本帧未给该页派封面（也非更早在途）→ 页卡有缩略先显（底图链 cover→prev_cover→廊封面→
+    /// mid→thumb，缩略即最后兜底），`collect_cover_results` 在封面最终到位时顺带下线缩略。
+    /// **杜绝同页 cover+thumb 双渲（T1 纪律）**：本帧已被派封面（`pending_cover` 含该页）的页
+    /// 直接跳过；封面可负担且封面在途预算未满 → 封面必然马上到，缩略即双渲冗余也跳过。
+    /// `MAX_THUMB_INFLIGHT` 独立额度。只服务可见页（不铺 MARGIN 缓冲页）。
+    pub(super) fn schedule_thumb_backdrops(
+        &mut self,
+        vis_first: usize,
+        vis_last: usize,
+        page_width: f32,
+        scale_factor: f32,
+    ) {
+        if self.pending_thumb.len() >= MAX_THUMB_INFLIGHT {
+            return;
+        }
+        let Some(worker) = self.worker.clone() else {
+            return;
+        };
+        let mut budget = MAX_THUMB_INFLIGHT - self.pending_thumb.len();
+        let cover_inflight_full = self.pending_cover.len() >= COVER_INFLIGHT;
+        for page in vis_first..=vis_last {
+            if budget == 0 {
+                break;
+            }
+            // ① 封面本帧已派 / 更早在途 → 缩略跳过（不双渲）。排在 schedule_covers 之后，
+            //    `pending_cover` 已含本帧所有封面派发，正是「同帧 cover+thumb 双渲」的守门。
+            if self.pending_cover.contains_key(&page) {
+                continue;
+            }
+            let dim = self.dims[page];
+            let cscale = cover_scale(dim, page_width, scale_factor);
+            // ② 封面可负担且封面在途预算未满 → 封面必然马上派到（下帧/本帧即补），缩略是冗余。
+            //    只有「封面不可负担」或「COVER_INFLIGHT 满、本帧派不到它」才落到缩略兜底。
+            if cover_affordable(dim, cscale) && !cover_inflight_full {
+                continue;
+            }
+            let slot = &self.slots[page];
+            let has_base = slot.cover.is_some()
+                || slot.mid.is_some()
+                || slot.thumb.is_some()
+                || slot.prev_cover.is_some()
+                || slot.prefetch_cover.is_some();
+            if has_base || slot.thumb_loading || slot.mid_loading {
+                continue;
+            }
+            self.slots[page].thumb_loading = true;
+            let rx = worker.request_thumb(self.doc_id, page);
+            self.raster_reqs += 1; // 切档不重栅回归计数
+            self.pending_thumb.insert(page, rx);
+            budget -= 1;
+        }
+    }
+
+    // ---- F4 空闲预取走廊（WPS「好像全部已加载」的来源）----
+
+    /// F4/B 守卫化走廊预取入口：仅「非快速态 + 四个主在途队列全空」（即真正的空闲/清尾帧）
+    /// 才派发走廊封面。Idle/Slow 清尾帧与 idle 静置帧共用本入口——正是「最后一帧工作清空后
+    /// 泵仍须续出几帧把走廊填掉」的关键：非 idle 路径在队尾调用本方法，派发在途即让
+    /// `pump_still_needed` 保持 true，泵继续驱动 idle 帧直到走廊填满/预算。
+    pub(super) fn maybe_prefetch_corridor(
+        &mut self,
+        vis_first: usize,
+        page_width: f32,
+        scale_factor: f32,
+    ) {
+        if self.prev_fast
+            || !self.pending_tiles.is_empty()
+            || !self.pending_cover.is_empty()
+            || !self.pending_mid.is_empty()
+            || !self.pending_thumb.is_empty()
+        {
+            return;
+        }
+        self.prefetch_corridor(vis_first, page_width, scale_factor);
+    }
+
+    /// F4/B：**空闲预取走廊**——在 `ensure_window` 静置早退**之前**为走廊 [vis±2] 的空闲页
+    /// 派发 0.5 密度整页封面（每帧 ≤ [`PRE_FETCH_COVER_INFLIGHT`]，跨帧预算）。idle 时四个
+    /// 在途队列本就空，worker 队列无竞争 → 「空闲期把窗口两侧的底图消化掉」，高速平移
+    /// （VeryFast）切入时新页大概率已有可显示底图（WPS「好像全部已加载」的来源）。
+    /// worker 只有空闲期消费（`request_render_preview` 出图后 view 收进 `slot.prefetch_cover`），
+    /// 优先/几何同封面、但按 Mid 语义不写 raw 缓存（廊封面是瞬态底图，不挤占重着色刷新）。
+    ///
+    /// 触发前提（调用方 `open::ensure_window` 的 idle 门）全为真：非 fast、四在途队列空、
+    /// `window_settled` 且签名一致。本函数只管「选中走廊页 + 跨帧限流 + 回收旧廊封面」。
+    pub(super) fn prefetch_corridor(
+        &mut self,
+        vis_center: usize,
+        page_width: f32,
+        scale_factor: f32,
+    ) {
+        // ① 先按当前可见中心收回走廊外的旧廊封面（窗口移动 → 距离/预算 LRU）。
+        self.evict_prefetch_covers(vis_center);
+        // ② 跨帧预算派发：只派「无满封面/无廊封面/无在途、可负担、在走廊内」的页。
+        if self.pending_prefetch_cover.len() >= config::pdf::PRE_FETCH_COVER_INFLIGHT {
+            return;
+        }
+        let n = self.dims.len();
+        if n == 0 {
+            return;
+        }
+        let lo = vis_center.saturating_sub(config::pdf::PREFETCH_COVER_MARGIN);
+        let hi = (vis_center + config::pdf::PREFETCH_COVER_MARGIN).min(n - 1);
+        let mut order: Vec<usize> = (lo..=hi).collect();
+        order.sort_by_key(|&p| (p as i64 - vis_center as i64).unsigned_abs());
+        let Some(worker) = self.worker.clone() else {
+            return;
+        };
+        let mut budget = config::pdf::PRE_FETCH_COVER_INFLIGHT
+            .saturating_sub(self.pending_prefetch_cover.len());
+        for page in order {
+            if budget == 0 {
+                break;
+            }
+            let slot = &self.slots[page];
+            // 已有满密度封面/廊封面/任一在途 → 无需再派（不重复派发）。
+            if slot.cover.is_some()
+                || slot.prefetch_cover.is_some()
+                || self.pending_prefetch_cover.contains_key(&page)
+                || self.pending_cover.contains_key(&page)
+            {
+                continue;
+            }
+            let dim = self.dims[page];
+            let cscale = cover_scale(dim, page_width, scale_factor);
+            // 0.5 密度：像素 1/4、~5-12ms/页；可负担才派（病理性页跳过，交给常态路径）。
+            let pscale = (cscale * config::pdf::PREFETCH_COVER_DENSITY)
+                .min(config::pdf::COVER_SCALE_CAP);
+            if !cover_affordable(dim, pscale) {
+                continue;
+            }
+            // 走 `request_render_preview`（RenderPreview 消息）：与封面同优先/同几何，但按
+            // Mid 语义**不入 raw 缓存、不参与重着色刷新**——廊封面是瞬态低清底图，raw 入缓存
+            // 只会挤出可见封面/瓦片原图（切档刷新无消费方，白占 RAW_CACHE_BYTES 预算）。
+            let rx = worker.request_render_preview(self.doc_id, RenderRequest { page, scale: pscale });
+            self.raster_reqs += 1; // 切档不重栅回归计数
+            self.prefetch_reqs += 1; // F4 观测计数（断言 idle 预取确实发生）
+            self.pending_prefetch_cover.insert(page, (pscale, rx));
+            budget -= 1;
+        }
+        // 派发在途后由调用方（idle 分支）`ensure_tile_pump` 启动收图泵。
+    }
+
+    /// F4/B：走廊封面回收（距视口中心距离 LRU + 字节预算 [`PREFETCH_COVER_BUDGET_BYTES`]）。
+    /// 任一非 idle 帧（窗口移动）与 idle 期派发前都调用：只作用于 `slot.prefetch_cover`
+    /// （独立于窗口 `slot.cover`，不参与封面驻留计数）。
+    /// ① 走廊窗 [vis±MARGIN] 外的全部收回（最远优先）；② 窗内超字节预算再逐最远页。
+    /// 逐出的纹理走 `pending_drops` 显式 `drop_image` 下线（防显存/提交内存缓慢累积）。
+    pub(super) fn evict_prefetch_covers(&mut self, vis_center: usize) {
+        let n = self.dims.len();
+        if n == 0 {
+            return;
+        }
+        let margin = config::pdf::PREFETCH_COVER_MARGIN;
+        let lo = vis_center.saturating_sub(margin);
+        let hi = (vis_center + margin).min(n - 1);
+        let dist = |p: usize| (p as i64 - vis_center as i64).unsigned_abs();
+        let est = |dim: (f32, f32), s: f32| -> u64 {
+            let (w, h) = page_bitmap_size(dim, s);
+            (w as u64) * (h as u64) * 4
+        };
+        let mut drops: Vec<Arc<RenderImage>> = Vec::new();
+        let mut in_window: Vec<usize> = Vec::new();
+        for (p, slot) in self.slots.iter_mut().enumerate() {
+            if slot.prefetch_cover.is_none() {
+                continue;
+            }
+            if p < lo || p > hi {
+                // ① 走廊窗外 → 收回
+                if let Some(img) = slot.prefetch_cover.take() {
+                    drops.push(img);
+                }
+            } else {
+                in_window.push(p);
+            }
+        }
+        // ② 窗内超字节预算 → 逐最远页
+        let total: u64 = in_window
+            .iter()
+            .map(|&p| est(self.dims[p], self.slots[p].prefetch_cover_scale))
+            .sum();
+        if total > config::pdf::PREFETCH_COVER_BUDGET_BYTES {
+            in_window.sort_by(|&a, &b| dist(b).cmp(&dist(a))); // 最远优先
+            let mut cur = total;
+            for p in in_window {
+                if cur <= config::pdf::PREFETCH_COVER_BUDGET_BYTES {
+                    break;
+                }
+                if let Some(slot) = self.slots.get_mut(p) {
+                    let b = est(self.dims[p], slot.prefetch_cover_scale);
+                    if let Some(img) = slot.prefetch_cover.take() {
+                        drops.push(img);
+                        cur = cur.saturating_sub(b);
+                    }
+                }
+            }
+        }
+        self.pending_drops.extend(drops);
+    }
+
+    /// F4/B：回收在途**走廊封面**（0.5 密度整页）：worker 回传 → 装入 `slot.prefetch_cover`
+    /// （`prefetch_cover_scale` 记派发时的 0.5× 密度，render 按当前页宽 CSS 拉伸铺满）。
+    /// 若该页此刻已有满密度封面临位/在途（窗口已移到它身上）→ 结果作废直接下线（满封面
+    /// 将接管显示，廊封面不与其竞争）。返回是否有新走廊封面入槽（调用方决定重绘）。
+    pub(super) fn collect_prefetch_cover_results(&mut self) -> bool {
+        let finished = collect_finished(&mut self.pending_prefetch_cover, |(_, rx)| rx.try_recv());
+        let mut any = false;
+        for (page, res) in finished {
+            let req_scale = self
+                .pending_prefetch_cover
+                .remove(&page)
+                .map(|(s, _)| s)
+                .unwrap_or(0.0);
+            let Some(res) = res else {
+                continue;
+            };
+            if page >= self.dims.len() {
+                continue;
+            }
+            // 满密度封面已在位/在途 → 走廊结果作废（不与其竞争显示）。
+            if self.slots[page].cover.is_some() || self.pending_cover.contains_key(&page) {
+                continue;
+            }
+            let Ok(img) = render_image_from_bgra(res.bgra, res.width, res.height) else {
+                continue;
+            };
+            if let Some(s) = self.slots.get_mut(page) {
+                if let Some(old) = s.prefetch_cover.replace(img) {
+                    self.pending_drops.push(old);
+                }
+                s.prefetch_cover_scale = req_scale;
+                any = true;
+            }
+        }
+        any
     }
 
     /// 封面派发（`schedule_tiles` 停稳帧 与 `schedule_fast_covers` 中速带共用）：只服务封面窗
@@ -706,6 +966,11 @@ impl PdfViewer {
                 // 有界 prev_cover 桥（方向翻位的反向邻居）或 mid/thumb；封面可负担页无瓦片，
                 // 若既无桥又无低清占位（更远窗外页回翻重渲期间）仍可能瞬时落「加载中」。
                 if let Some(old) = s.thumb.take() {
+                    self.pending_drops.push(old);
+                }
+                // **F4**：满密度封面到位 = 该页显示由整页封面供给 → 同页空闲预取走廊封面
+                // 同时回收（廊封面只是高速平移切入的瞬时底图，满封面接管即下线，不双份驻留）。
+                if let Some(old) = s.prefetch_cover.take() {
                     self.pending_drops.push(old);
                 }
                 any = true;

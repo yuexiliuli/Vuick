@@ -47,6 +47,14 @@ pub(crate) struct Slot {
     pub(crate) mid: Option<std::sync::Arc<gpui::RenderImage>>,
     /// 中清页是否正在后台渲染（避免重复派发）。
     pub(crate) mid_loading: bool,
+    /// F4 空闲预取走廊的**半密度整页封面**（独立于 [`Slot::cover`] 的满密度窗口封面）：
+    /// 空闲期把 [vis±2] 走廊页的低成本底图预取进槽，高速平移切入时新页已有可显示底图
+    /// （WPS「好像全部已加载」的来源）。生命周期：`view/tiles::evict_prefetch_covers` 按
+    /// 距离/字节预算 LRU 收回；该页进入封面窗、满密度封面到位（`view/tiles::
+    /// collect_cover_results`）时即下线回收。不参与窗口封面驻留计数（`cover` 不变）。
+    pub(crate) prefetch_cover: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// 走廊封面对应的渲染倍率（px/pt，= 0.5× `cover_scale`）；render 按新页宽 CSS 拉伸铺满。
+    pub(crate) prefetch_cover_scale: f32,
 }
 
 /// 一块已完成栅格化的瓦片：图像本体 + 它在页位图中的几何。

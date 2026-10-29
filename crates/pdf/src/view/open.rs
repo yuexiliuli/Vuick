@@ -28,6 +28,9 @@ impl PdfViewer {
             mid_lru: VecDeque::new(),
             pending_tiles: HashMap::new(),
             pending_cover: HashMap::new(),
+            pending_prefetch_cover: HashMap::new(),
+            prefetch_reqs: 0,
+            loading_placeholder_hits: std::cell::Cell::new(0),
             pending_recolor: None,
             raster_reqs: 0,
             recolor_scope: Vec::new(),
@@ -370,6 +373,9 @@ impl PdfViewer {
             if let Some(arc) = slot.mid.take() {
                 drops.push(arc);
             }
+            if let Some(arc) = slot.prefetch_cover.take() {
+                drops.push(arc);
+            }
             for (_, ts) in slot.tiles.drain() {
                 drops.push(ts.image);
             }
@@ -396,6 +402,9 @@ impl PdfViewer {
         self.pending_mid.clear();
         self.pending_tiles.clear();
         self.pending_cover.clear();
+        self.pending_prefetch_cover.clear();
+        self.prefetch_reqs = 0;
+        self.loading_placeholder_hits.set(0);
         self.pending_recolor = None;
         self.recolor_scope.clear();
         self.recolor_received.clear();
@@ -519,6 +528,10 @@ impl PdfViewer {
         if self.collect_cover_results(scale_factor) {
             cx.notify();
         }
+        // F4 空闲预取走廊结果收集（0.5 密度整页底图，独立于封面/瓦片密度守卫）。
+        if self.collect_prefetch_cover_results() {
+            cx.notify();
+        }
         if self.collect_tile_results(scale_factor) {
             cx.notify();
         }
@@ -568,6 +581,13 @@ impl PdfViewer {
                 );
             }
             self.idle_gate_skips += 1;
+            // F4 空闲预取走廊（WPS「好像全部已加载」的来源）：静置帧早退**之前**为走廊
+            // [vis±2] 补 0.5 密度封面——idle 四队列全空（上方已核），把低成本整页底图在
+            // 空闲期消化掉；高速平移（VeryFast）切入时新页大概率已有可显示底图。派发在途后
+            // 自启一帧收图泵（idle 分支本会早退，不泵则下一帧不会来、走廊结果无人收集）。
+            let vis_first = first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y);
+            self.maybe_prefetch_corridor(vis_first, page_width, scale_factor);
+            self.ensure_tile_pump(cx);
             // 不更新 `window_sig`/`window_settled`：保持同一静置签名与确认状态。
             return;
         }
@@ -659,10 +679,18 @@ impl PdfViewer {
             }
             SpeedState::VeryFast => {
                 // 纯平移：不派任何新栅格（封面/瓦片/占位一律不加活）。已缓存封面/瓦片原位
-                // 即锐；新进视口未缓存页短暂显示「加载中」，待 F4 预取走廊兜底（本波未实现）。
+                // 即锐；新进视口未缓存页由 F4 预取走廊兜底（idle/Fast 期已把 [vis±2] 填上半
+                // 密度封面；进入极快导致无隙时短暂「加载中」、降速即恢复，属可接受取舍）。
             }
         }
+        // F4/B：非 idle 帧（窗口有移动/调度运行）按当前可见中心收回走廊窗外的旧廊封面
+        // （距离 LRU + 字节预算）。idle 静置期的挂在 idle 分支的 `maybe_prefetch_corridor` 内。
+        let vis_first = first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y);
+        self.evict_prefetch_covers(vis_first);
         self.evict_tiles(start, end, scale_factor);
+        // F4/B：清尾帧（非快速 + 四主队列全空）也尝试派发走廊——「最后一帧工作清空后泵
+        // 须续出几帧把走廊填掉」，否则没有任何 idle 帧会到来（泵在清尾帧即停）。
+        self.maybe_prefetch_corridor(vis_first, page_width, scale_factor);
 
         // 更新门控状态（本轮已真实跑过调度）：签名对齐当前帧；settled = 非快速态
         // 且调度后无在途瓦片/封面（即确认「已无待派的新 tile 请求」→ 下帧可门）。
