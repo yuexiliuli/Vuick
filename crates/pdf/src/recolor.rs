@@ -34,7 +34,60 @@ pub(crate) static GPU_RECOLOR_GATE: LazyLock<AtomicBool> = LazyLock::new(|| {
 /// 当前 GPU 重着色门控（进程级：单 worker 单进程，与 worker 单例对齐；生产读一次后
 /// 进程内恒定，不随 env 变化动态翻转）。
 pub(crate) fn gpu_recolor_gate() -> bool {
-    GPU_RECOLOR_GATE.load(Ordering::Relaxed)
+    let on = GPU_RECOLOR_GATE.load(Ordering::Relaxed);
+    if on {
+        // 真机诊断 1/4：门控激活（进程级首次读为真时打一次；门控 off 完全静默）。
+        diag_once(&DIAG_GATE_ON, || {
+            eprintln!("[pdf] gpu recolor enabled (GPUI_PDF_GPU_RECOLOR=on)");
+        });
+    }
+    on
+}
+
+/// T4 GPU 重着色**真机诊断**基础设施：门控开启时每类只打印一次到 stderr（进程级 latch，
+/// 避免逐瓦片/逐帧刷屏）；正常使用（门控 off）零输出。选 stderr 便于 `2>&1 | grep` 过滤。
+/// 每条诊断都是「该环节确实发生」的证据，覆盖全链路 4 点：
+///   1) 门控激活（本模块）；2) worker 原图直传封面/瓦片（parser 调用）；3) view 首个
+///   img().recolor 挂参（render 调用）；4) gpui 管线就绪（vendor/directx_renderer）。
+/// headless 测试里打到 stderr 属正常，不改变任何断言语义。
+pub(crate) fn diag_once(fired: &AtomicBool, msg: impl FnOnce()) {
+    if !fired.swap(true, Ordering::Relaxed) {
+        msg();
+    }
+}
+
+pub(crate) static DIAG_GATE_ON: AtomicBool = AtomicBool::new(false);
+pub(crate) static DIAG_RAW_COVER: AtomicBool = AtomicBool::new(false);
+pub(crate) static DIAG_RAW_TILE: AtomicBool = AtomicBool::new(false);
+pub(crate) static DIAG_VIEW_RECOLOR: AtomicBool = AtomicBool::new(false);
+
+/// 真机诊断 2/4：worker 跳过 CPU apply_recolor 直传原图——首个封面/首个瓦片各打一次。
+/// `finalize_render`（整页/瓦片渲染）与 `recolored_entries`（切档刷新）共用同一组 latch：
+/// 进程内每类只报一次，最早触发者先手。
+pub(crate) fn diag_raw_passthrough(kind: crate::parser::RawKind) {
+    match kind {
+        crate::parser::RawKind::Cover => diag_once(&DIAG_RAW_COVER, || {
+            eprintln!("[pdf] gpu: raw passthrough cover");
+        }),
+        crate::parser::RawKind::Tile => diag_once(&DIAG_RAW_TILE, || {
+            eprintln!("[pdf] gpu: raw passthrough tile");
+        }),
+        crate::parser::RawKind::Mid | crate::parser::RawKind::Thumb => {}
+    }
+}
+
+/// 真机诊断 3/4：view 首个 `img().recolor(Some)` 挂参（打印实际纸/墨参数，便于与 CPU
+/// 路径对表/核对夜间档是否走对参数）。
+pub(crate) fn diag_view_recolor(bg: [u8; 3], ink: Option<[u8; 3]>) {
+    diag_once(&DIAG_VIEW_RECOLOR, || {
+        let ink_s = ink
+            .map(|[r, g, b]| format!("0x{r:02X}{g:02X}{b:02X}"))
+            .unwrap_or_else(|| "none".to_string());
+        eprintln!(
+            "[pdf] gpu: img.recolor attached bg=0x{:02X}{:02X}{:02X} ink={}",
+            bg[0], bg[1], bg[2], ink_s
+        );
+    });
 }
 
 /// 测试覆盖：仅可在持 pdfium-test 全局串行锁（`test_util::lock`）时调用——所有触碰

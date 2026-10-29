@@ -1905,6 +1905,10 @@ fn finalize_render(
     recolor: Option<RecolorParams>,
     gpu: bool,
 ) -> Vec<u8> {
+    if gpu && recolor.is_some() {
+        // 真机诊断 2/4：门控下跳过 CPU 着色直传原图——首个封面/瓦片各打一次（latch）。
+        crate::recolor::diag_raw_passthrough(kind);
+    }
     let already = cache.iter().any(|e| {
         e.kind == kind
             && e.page == page
@@ -1959,6 +1963,10 @@ fn recolored_entries(
     cache
         .iter()
         .map(|e| {
+            if gpu && params.is_some() {
+                // 真机诊断 2/4：切档刷新路径同样直传（与 finalize_render 共用 latch）。
+                crate::recolor::diag_raw_passthrough(e.kind);
+            }
             let mut bgra = e.bgra.clone();
             if !gpu && let Some(p) = params {
                 apply_recolor(&mut bgra, p);

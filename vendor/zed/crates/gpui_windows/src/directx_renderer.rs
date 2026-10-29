@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     slice,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}},
 };
 
 use anyhow::{Context, Result};
@@ -1139,6 +1139,12 @@ impl DirectXResources {
     }
 }
 
+/// T4 GPU 重着色真机诊断门（与 `pdf::recolor` 的 `GPUI_PDF_GPU_RECOLOR` 判定同语义；
+/// gpui_windows 不依赖 pdf crate，这里直接读环境变量——env 在进程启动前已定，安全）。
+fn gpu_recolor_diag_gate() -> bool {
+    std::env::var_os("GPUI_PDF_GPU_RECOLOR").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 impl DirectXRenderPipelines {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
         // C1 墙钟探针（GPUI_EDITOR_DIAG 守卫，平时零开销）：首窗全 miss（~18 次
@@ -1209,6 +1215,14 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        // 真机诊断 4/4：recolor_sprite_pipeline 创建成功 = RecolorSprite HLSL 已编译 +
+        // 顶点/片元/D3D 资源就绪（每窗创建一次、进程级只打一次；门控关时零输出）。
+        if gpu_recolor_diag_gate() {
+            static DIAG_RECOLOR_PIPELINE: AtomicBool = AtomicBool::new(false);
+            if !DIAG_RECOLOR_PIPELINE.swap(true, Ordering::Relaxed) {
+                eprintln!("[gpui] recolor sprite pipeline ok");
+            }
+        }
         let yuv_sprites = PipelineState::new(
             device,
             "external_yuv_sprite_pipeline",

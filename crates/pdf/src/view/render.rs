@@ -462,7 +462,13 @@ impl PdfViewer {
             // T4 GPU 重着色通道：门控开启 + 设了重着色时，显示位图统一携带重着色参数
             // （`img().recolor(...)` → GPU 片元在绘制时着色；worker 已直传未着色原图）。
             let gpu_params = if self.gpu_recolor {
-                self.recolor.map(crate::recolor::to_image_recolor)
+                if let Some(rc) = self.recolor {
+                    // 真机诊断 3/4：首个带 recolor 的 img 挂参打一次（门控开启时；latch）。
+                    crate::recolor::diag_view_recolor(rc.bg, rc.ink);
+                    Some(crate::recolor::to_image_recolor(rc))
+                } else {
+                    None
+                }
             } else {
                 None
             };
