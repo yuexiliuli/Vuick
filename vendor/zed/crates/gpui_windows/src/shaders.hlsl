@@ -1275,6 +1275,89 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 
 /*
 **
+**              Recolor sprites (T4 GPU recolor)
+**
+*/
+
+struct RecolorSprite {
+    uint order;
+    uint pad;
+    uint grayscale;
+    float opacity;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    AtlasTile tile;
+    // 纸/墨双带重着色参数（与 CPU apply_recolor 同语义；阈值为编译期常量，见片元）。
+    float4 bg;        // RGB = 纸色（0..1）；第 4 分量保留。
+    float4 ink;       // RGB = 墨色（0..1）；第 4 分量保留。
+    float4 switches;  // x = ink 是否启用（1.0/0.0）。
+};
+
+struct RecolorSpriteVertexOutput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 tile_position: POSITION;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct RecolorSpriteFragmentInput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 tile_position: POSITION;
+};
+
+StructuredBuffer<RecolorSprite> recolor_sprites: register(t1);
+
+RecolorSpriteVertexOutput recolor_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint sprite_id = batch_start_index + instance_id;
+    RecolorSprite sprite = recolor_sprites[sprite_id];
+    float4 device_position = to_device_position(unit_vertex, sprite.bounds);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
+                                                    sprite.content_mask);
+    float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
+
+    RecolorSpriteVertexOutput output;
+    output.position = device_position;
+    output.tile_position = tile_position;
+    output.sprite_id = sprite_id;
+    output.clip_distance = clip_distance;
+    return output;
+}
+
+float4 recolor_sprite_fragment(RecolorSpriteFragmentInput input): SV_Target {
+    RecolorSprite sprite = recolor_sprites[input.sprite_id];
+    float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
+    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+
+    float4 color = sample;
+    if (sprite.grayscale != 0u) {
+        float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
+        color = float4(grayscale, sample.a);
+    }
+    // 纸/墨双带重着色（与 pdf::recolor::apply_recolor 同语义）：
+    //   luma = 感知亮度 = 0.299R + 0.587G + 0.114B（与 CPU 整数 LUT 索引同权重）;
+    //   纸带 weight = clamp((luma - PAPER_L_LO)/(1 - PAPER_L_LO), 0, 1)，PAPER_L_LO=0.90;
+    //   墨带 weight = 1 - clamp(luma / INK_L_HI, 0, 1)，INK_L_HI=0.50（带界一阶连续）;
+    //   中间调（0.50..0.90）原样不动；ink 未启用（switches.x==0）只染纸面。
+    // CPU 侧取整数亮度作 LUT 索引、GPU 侧连续亮度，灰度像素逐位一致、彩色像素允许
+    // ±1/255 通道舍入差——「同语义」非「逐位一致」（T4 简版：真机复核视觉等价）。
+    float3 orig = color.rgb;
+    float luma = dot(orig, float3(0.299f, 0.587f, 0.114f));
+    float paper_w = saturate((luma - 0.90f) / (1.0f - 0.90f));
+    float3 shaded = orig + (sprite.bg.rgb - orig) * paper_w;
+    if (sprite.switches.x != 0.0f) {
+        float ink_w = 1.0f - saturate(luma / 0.50f);
+        shaded = shaded + (sprite.ink.rgb - shaded) * ink_w;
+    }
+    color.rgb = shaded;
+    color.a *= sprite.opacity * saturate(0.5 - distance);
+    return color;
+}
+
+/*
+**
 **              External YUV sprites
 **
 */

@@ -53,6 +53,7 @@ pub struct Scene {
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
+    pub recolor_sprites: Vec<RecolorSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub external_yuv_sprites: Vec<ExternalYuvSprite>,
 }
@@ -70,6 +71,7 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
+        self.recolor_sprites.clear();
         self.surfaces.clear();
         self.external_yuv_sprites.clear();
     }
@@ -135,6 +137,10 @@ impl Scene {
                 sprite.order = order;
                 self.polychrome_sprites.push(*sprite);
             }
+            Primitive::RecolorSprite(sprite) => {
+                sprite.order = order;
+                self.recolor_sprites.push(*sprite);
+            }
             Primitive::ExternalYuv(sprite) => {
                 sprite.order = order;
                 self.external_yuv_sprites.push(sprite.clone());
@@ -169,6 +175,8 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.recolor_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.external_yuv_sprites.sort_by_key(|sprite| sprite.order);
     }
@@ -196,6 +204,8 @@ impl Scene {
             subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
             polychrome_sprites_start: 0,
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+            recolor_sprites_start: 0,
+            recolor_sprites_iter: self.recolor_sprites.iter().peekable(),
             external_yuv_sprites_start: 0,
             external_yuv_sprites_iter: self.external_yuv_sprites.iter().peekable(),
             surfaces_start: 0,
@@ -221,6 +231,7 @@ pub(crate) enum PrimitiveKind {
     MonochromeSprite,
     SubpixelSprite,
     PolychromeSprite,
+    RecolorSprite,
     ExternalYuv,
     Surface,
 }
@@ -241,6 +252,7 @@ pub enum Primitive {
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
+    RecolorSprite(RecolorSprite),
     ExternalYuv(ExternalYuvSprite),
     Surface(PaintSurface),
 }
@@ -256,6 +268,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
+            Primitive::RecolorSprite(sprite) => &sprite.bounds,
             Primitive::ExternalYuv(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
         }
@@ -270,6 +283,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
+            Primitive::RecolorSprite(sprite) => &sprite.content_mask,
             Primitive::ExternalYuv(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
         }
@@ -298,6 +312,8 @@ struct BatchIterator<'a> {
     subpixel_sprites_iter: Peekable<slice::Iter<'a, SubpixelSprite>>,
     polychrome_sprites_start: usize,
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
+    recolor_sprites_start: usize,
+    recolor_sprites_iter: Peekable<slice::Iter<'a, RecolorSprite>>,
     external_yuv_sprites_start: usize,
     external_yuv_sprites_iter: Peekable<slice::Iter<'a, ExternalYuvSprite>>,
     surfaces_start: usize,
@@ -330,6 +346,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.polychrome_sprites_iter.peek().map(|s| s.order),
                 PrimitiveKind::PolychromeSprite,
+            ),
+            (
+                self.recolor_sprites_iter.peek().map(|s| s.order),
+                PrimitiveKind::RecolorSprite,
             ),
             (
                 self.external_yuv_sprites_iter.peek().map(|s| s.order),
@@ -470,6 +490,27 @@ impl<'a> Iterator for BatchIterator<'a> {
                     range: sprites_start..sprites_end,
                 })
             }
+            PrimitiveKind::RecolorSprite => {
+                let texture_id = self.recolor_sprites_iter.peek().unwrap().tile.texture_id;
+                let sprites_start = self.recolor_sprites_start;
+                let mut sprites_end = sprites_start + 1;
+                self.recolor_sprites_iter.next();
+                while self
+                    .recolor_sprites_iter
+                    .next_if(|sprite| {
+                        (sprite.order, batch_kind) < max_order_and_kind
+                            && sprite.tile.texture_id == texture_id
+                    })
+                    .is_some()
+                {
+                    sprites_end += 1;
+                }
+                self.recolor_sprites_start = sprites_end;
+                Some(PrimitiveBatch::RecolorSprites {
+                    texture_id,
+                    range: sprites_start..sprites_end,
+                })
+            }
             PrimitiveKind::ExternalYuv => {
                 let sprites_start = self.external_yuv_sprites_start;
                 let mut sprites_end = sprites_start + 1;
@@ -529,6 +570,10 @@ pub enum PrimitiveBatch {
         texture_id: AtlasTextureId,
         range: Range<usize>,
     },
+    RecolorSprites {
+        texture_id: AtlasTextureId,
+        range: Range<usize>,
+    },
     ExternalYuv(Range<usize>),
     Surfaces(Range<usize>),
 }
@@ -558,6 +603,13 @@ impl PrimitiveBatch {
             Self::PolychromeSprites { texture_id, range } => {
                 format!(
                     "polychrome sprites ({}) on atlas {}",
+                    range.len(),
+                    texture_id.index
+                )
+            }
+            Self::RecolorSprites { texture_id, range } => {
+                format!(
+                    "recolor sprites ({}) on atlas {}",
                     range.len(),
                     texture_id.index
                 )
@@ -801,6 +853,45 @@ impl From<PolychromeSprite> for Primitive {
         Primitive::PolychromeSprite(sprite)
     }
 }
+
+/// 一个带**纸墨重着色参数**的位图精灵（T4 GPU 重着色通道）：布局与 [`PolychromeSprite`]
+/// 前 8 个字段逐字节一致（order/bounds/content_mask/corner_radii/opacity/tile），
+/// 尾部追加三组 float4 携带重着色参数——`bg` = 纸色 RGB、`ink` = 墨色 RGB
+/// （`ink=None` 即 `switches.x == 0` 时只染纸面）、`switches` 保留（`x` = ink 是否启用）。
+/// 片元着色器在**绘制时**完成与 CPU `apply_recolor` 相同语义的双带映射
+/// （纸带 L≥0.90 → 纸色、墨带 L≤0.50 → 墨色、中间调原样），worker 不再对显示路径做
+/// CPU 逐像素着色（守 K23②：像素输出真机复核，headless 只证机制 + 门控）。
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct RecolorSprite {
+    pub order: DrawOrder,
+    pub pad: u32,
+    pub grayscale: PaddedBool32,
+    pub opacity: f32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub tile: AtlasTile,
+    /// 纸色（RGB 0..=255 → f32 0..=1）；第 4 分量对齐保留。
+    pub bg: [f32; 4],
+    /// 墨色（RGB 0..=255 → f32 0..=1）；第 4 分量对齐保留。
+    pub ink: [f32; 4],
+    /// `x` = ink 是否启用（1.0/0.0），其余保留。
+    pub switches: [f32; 4],
+}
+
+impl From<RecolorSprite> for Primitive {
+    fn from(sprite: RecolorSprite) -> Self {
+        Primitive::RecolorSprite(sprite)
+    }
+}
+
+/// 与 HLSL `RecolorSprite` StructuredBuffer 元素严格同尺寸/同布局（16 字节对齐）：
+/// 前 8 字段与 [`PolychromeSprite`] 一致（order..tile = 16+16+16+16+32），尾部
+/// bg/ink/switches 各 float4。D3D11 直传 `&[RecolorSprite]` 即该缓冲，尺寸漂移会静默
+/// 破坏 shader 读取 → 编译期钉死。
+const _: () = assert!(std::mem::size_of::<RecolorSprite>() == 144);
 
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]

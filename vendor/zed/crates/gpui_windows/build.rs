@@ -44,6 +44,7 @@ mod shader_compilation {
             "monochrome_sprite",
             "subpixel_sprite",
             "polychrome_sprite",
+            "recolor_sprite",
             "external_yuv",
         ];
 

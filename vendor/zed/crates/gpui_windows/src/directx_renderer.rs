@@ -116,6 +116,7 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    recolor_sprites: PipelineState<RecolorSprite>,
     yuv_sprites: PipelineState<ExternalYuvInstance>,
 }
 
@@ -417,6 +418,9 @@ impl DirectXRenderer {
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
+                PrimitiveBatch::RecolorSprites { texture_id, range } => {
+                    self.draw_recolor_sprites(texture_id, range.start, range.len())
+                }
                 PrimitiveBatch::ExternalYuv(range) => {
                     self.draw_external_yuv(&scene.external_yuv_sprites[range])
                 }
@@ -617,6 +621,14 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.polychrome_sprites,
+            )?;
+        }
+
+        if !scene.recolor_sprites.is_empty() {
+            self.pipelines.recolor_sprites.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &scene.recolor_sprites,
             )?;
         }
 
@@ -865,6 +877,35 @@ impl DirectXRenderer {
             return Ok(());
         };
         self.pipelines.poly_sprites.draw_range_with_texture(
+            &devices.device_context,
+            &texture_view,
+            self.globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?,
+            slice::from_ref(&self.globals.sampler),
+            start as u32,
+            len as u32,
+        )
+    }
+
+    /// 绘制一批带纸墨重着色参数的精灵（T4 GPU 通道）：与 [`draw_polychrome_sprites`]
+    /// 同一姿势——按 atlas texture 复用 [`draw_range_with_texture`]（纹理绑 t0、实例
+    /// StructuredBuffer 绑 t1），片元由 `recolor_sprite` 着色器完成纸/墨双带映射。
+    fn draw_recolor_sprites(
+        &mut self,
+        texture_id: AtlasTextureId,
+        start: usize,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let Some(texture_view) = self.atlas.get_texture_view(texture_id) else {
+            return Ok(());
+        };
+        self.pipelines.recolor_sprites.draw_range_with_texture(
             &devices.device_context,
             &texture_view,
             self.globals
@@ -1161,6 +1202,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let recolor_sprites = PipelineState::new(
+            device,
+            "recolor_sprite_pipeline",
+            ShaderModule::RecolorSprite,
+            16,
+            create_blend_state(device)?,
+        )?;
         let yuv_sprites = PipelineState::new(
             device,
             "external_yuv_sprite_pipeline",
@@ -1189,6 +1237,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            recolor_sprites,
             yuv_sprites,
         })
     }
@@ -2012,6 +2061,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        RecolorSprite,
         ExternalYuv,
         EmojiRasterization,
     }
@@ -2086,6 +2136,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::RecolorSprite => match target {
+                    ShaderTarget::Vertex => RECOLOR_SPRITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => RECOLOR_SPRITE_FRAGMENT_BYTES,
                 },
                 ShaderModule::ExternalYuv => match target {
                     ShaderTarget::Vertex => EXTERNAL_YUV_VERTEX_BYTES,
@@ -2218,6 +2272,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::RecolorSprite => "recolor_sprite",
                 ShaderModule::ExternalYuv => "external_yuv",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
@@ -2417,8 +2472,8 @@ mod tests {
     // 不能用 `use super::*`：父模块带 `Direct3D11::*` 等巨型 glob 导入，会撞
     // rustc（1.96 / edition 2024）`#[test]` 展开的递归限制，故全部显式导入。
     use gpui::{
-        Bounds, ContentMask, Corners, ExternalYuvSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
-        Size, point, size,
+        Bounds, ContentMask, Corners, ExternalYuvSprite, PrimitiveBatch, Quad, RecolorSprite,
+        ScaledPixels, Scene, Size, point, size,
     };
     use windows::Win32::{
         Foundation::HMODULE,
@@ -2674,6 +2729,58 @@ mod tests {
         }
     }
 
+    /// 静态编译验证 `recolor_sprite_*` HLSL 入口（T4 GPU 重着色通道；与 debug 运行时 /
+    /// release fxc 同源的 D3DCompileFromFile 前端）：无 GUI 也能兜住着色器语法错误
+    ///（float4 参数布局、双带映射权重、中文注释编码）。
+    #[test]
+    fn test_recolor_shader_compiles() {
+        use windows::Win32::Graphics::{
+            Direct3D::{
+                Fxc::{D3DCompileFromFile, D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION},
+                ID3DInclude,
+            },
+            Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        };
+        use windows::core::{HSTRING, PCSTR};
+
+        let shader_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/shaders.hlsl");
+        let include_handler = &unsafe {
+            std::mem::transmute::<usize, ID3DInclude>(D3D_COMPILE_STANDARD_FILE_INCLUDE as usize)
+        };
+        for (entry, target) in [
+            ("recolor_sprite_vertex", "vs_4_1"),
+            ("recolor_sprite_fragment", "ps_4_1"),
+        ] {
+            let entry = format!("{entry}\0");
+            let target = format!("{target}\0");
+            let mut compile_blob = None;
+            let mut error_blob = None;
+            let result = unsafe {
+                D3DCompileFromFile(
+                    &HSTRING::from(shader_path.to_str().unwrap()),
+                    None,
+                    include_handler,
+                    PCSTR::from_raw(entry.as_ptr()),
+                    PCSTR::from_raw(target.as_ptr()),
+                    D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                    0,
+                    &mut compile_blob,
+                    Some(&mut error_blob),
+                )
+            };
+            if let Err(e) = result {
+                let message = error_blob
+                    .map(|blob| {
+                        unsafe { std::ffi::CStr::from_ptr(blob.GetBufferPointer() as *const i8) }
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_default();
+                panic!("HLSL 编译 {entry:?} 失败：{e} {message}");
+            }
+        }
+    }
+
     /// C1：debug 下 shader 字节码 process 级缓存——同 (module, target) 连续两次
     /// `build_shader_blob` 应返回**同一个底层 ID3DBlob**：Id3DBlob 每次 `D3DCompileFromFile`
     /// 都是新分配，二次调用仍同指针即为「命中缓存、未再编译」的决定性证据（并行测试下
@@ -2720,6 +2827,7 @@ mod tests {
             ShaderModule::MonochromeSprite,
             ShaderModule::SubpixelSprite,
             ShaderModule::PolychromeSprite,
+            ShaderModule::RecolorSprite,
             ShaderModule::ExternalYuv,
             ShaderModule::EmojiRasterization,
         ]

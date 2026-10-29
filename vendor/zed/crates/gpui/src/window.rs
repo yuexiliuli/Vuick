@@ -10,11 +10,11 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, ExternalYuvSprite, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Hsla, ImageRecolor, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, RecolorSprite, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
@@ -2897,6 +2897,13 @@ impl Window {
         self.rendered_frame.scene.underlines.clone()
     }
 
+    /// Returns the纸墨重着色精灵（T4 GPU 通道）in the most recently rendered frame's scene,
+    /// so tests can assert an image element carried recolor params without rasterizing.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_recolor_sprites(&self) -> Vec<RecolorSprite> {
+        self.rendered_frame.scene.recolor_sprites.clone()
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
@@ -5155,6 +5162,126 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+        });
+        Ok(())
+    }
+
+    /// Paint an image into the scene **with 纸墨重着色参数**（T4 GPU 重着色通道）。
+    ///
+    /// 与 [`paint_image`](Self::paint_image) 同源（同一 atlas 上传 + sub-tile 裁剪），但插入
+    /// 的图元是 [`RecolorSprite`]——片元着色器在**绘制时**完成与 CPU `apply_recolor`
+    /// 相同语义的纸/墨双带映射（纸带 L≥0.90 → 纸色、墨带 L≤0.50 → 墨色、中间调原样），
+    /// 调用方（PDF 显示层）不再对 raw 做 CPU 逐像素着色。门控关闭时不走本方法，
+    /// 既有 `paint_image`/`PolychromeSprite`/`grayscale`/`opacity` 路径完全不受影响。
+    ///
+    /// 参数语义与 [`paint_image`](Self::paint_image) 一致；`recolor.bg` = 纸色、`recolor.ink`
+    /// = 墨色（`None` = 仅染纸面）。此方法只应在元素 paint 阶段调用。
+    pub fn paint_image_recolor(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        recolor: ImageRecolor,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let visible_bounds = bounds.intersect(&image_bounds);
+        if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
+            return Ok(());
+        }
+        if image_bounds.size.width <= Pixels::ZERO || image_bounds.size.height <= Pixels::ZERO {
+            return Ok(());
+        }
+
+        let params = RenderImageParams {
+            image_id: data.id,
+            frame_index,
+        };
+
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(params.into(), &mut || {
+                Ok(Some((
+                    data.size(frame_index),
+                    Cow::Borrowed(
+                        data.as_bytes(frame_index)
+                            .expect("It's the caller's job to pass a valid frame index"),
+                    ),
+                )))
+            })?
+            .expect("Callback above only returns Some");
+
+        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
+
+        let sub_tile = if visible_bounds == image_bounds {
+            tile
+        } else {
+            let x_offset_ratio =
+                (visible_bounds.origin.x - image_bounds.origin.x) / image_bounds.size.width;
+            let y_offset_ratio =
+                (visible_bounds.origin.y - image_bounds.origin.y) / image_bounds.size.height;
+            let width_ratio = visible_bounds.size.width / image_bounds.size.width;
+            let height_ratio = visible_bounds.size.height / image_bounds.size.height;
+
+            let tile_origin_x = tile.bounds.origin.x.0;
+            let tile_origin_y = tile.bounds.origin.y.0;
+            let tile_width = tile.bounds.size.width.0;
+            let tile_height = tile.bounds.size.height.0;
+
+            let sub_origin_x = tile_origin_x + (x_offset_ratio * tile_width as f32).round() as i32;
+            let sub_origin_y = tile_origin_y + (y_offset_ratio * tile_height as f32).round() as i32;
+            let sub_width = (width_ratio * tile_width as f32).round() as i32;
+            let sub_height = (height_ratio * tile_height as f32).round() as i32;
+
+            let max_x = tile_origin_x + tile_width;
+            let max_y = tile_origin_y + tile_height;
+
+            let clamped_origin_x = sub_origin_x.clamp(tile_origin_x, max_x);
+            let clamped_origin_y = sub_origin_y.clamp(tile_origin_y, max_y);
+            let clamped_width = sub_width.min(max_x - clamped_origin_x).max(0);
+            let clamped_height = sub_height.min(max_y - clamped_origin_y).max(0);
+
+            AtlasTile {
+                bounds: Bounds {
+                    origin: point(
+                        DevicePixels(clamped_origin_x),
+                        DevicePixels(clamped_origin_y),
+                    ),
+                    size: size(DevicePixels(clamped_width), DevicePixels(clamped_height)),
+                },
+                ..tile
+            }
+        };
+
+        let content_mask = self.snapped_content_mask();
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(visible_bounds.size)
+            .scale(self.scale_factor());
+        let opacity = self.element_opacity();
+
+        let to_float = |v: u8| v as f32 / 255.0;
+        let bg = [to_float(recolor.bg[0]), to_float(recolor.bg[1]), to_float(recolor.bg[2]), 0.0];
+        let ink = match recolor.ink {
+            Some([r, g, b]) => [to_float(r), to_float(g), to_float(b), 0.0],
+            None => [0.0; 4],
+        };
+        let switches = [if recolor.ink.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0];
+
+        self.next_frame.scene.insert_primitive(RecolorSprite {
+            order: 0,
+            pad: 0,
+            grayscale: grayscale.into(),
+            opacity,
+            bounds: visible_bounds_snapped,
+            content_mask,
+            corner_radii,
+            tile: sub_tile,
+            bg,
+            ink,
+            switches,
         });
         Ok(())
     }

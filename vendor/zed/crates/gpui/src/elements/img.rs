@@ -125,9 +125,24 @@ where
     }
 }
 
+/// 图片元素级**纸墨重着色参数**（T4 GPU 重着色通道）：`bg` = 纸色（近白纸面像素映射
+/// 至此）、`ink` = 墨色（`Some` 时把近黑墨迹像素提亮至此，深色档用；`None` = 只染纸面）。
+/// R/G/B 0..=255。与 pdf crate 的 `RecolorParams` 同语义——由 `img().recolor(...)` 携带，
+/// 经 `Window::paint_image_recolor` 传给片元着色器在**绘制时**完成双带映射
+///（纸带 L≥0.90 → 纸色、墨带 L≤0.50 → 墨色、中间调原样），worker 不再对显示路径做
+/// CPU 逐像素着色。`None`（默认）走既有 `paint_image`/`PolychromeSprite` 路径，逐字节不变。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageRecolor {
+    /// 纸色（R/G/B，0..=255）。
+    pub bg: [u8; 3],
+    /// 墨色（R/G/B，0..=255）；`Some` 时把近黑墨迹像素提亮至此色。
+    pub ink: Option<[u8; 3]>,
+}
+
 /// The style of an image element.
 pub struct ImageStyle {
     grayscale: bool,
+    recolor: Option<ImageRecolor>,
     object_fit: ObjectFit,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
@@ -137,6 +152,7 @@ impl Default for ImageStyle {
     fn default() -> Self {
         Self {
             grayscale: false,
+            recolor: None,
             object_fit: ObjectFit::Contain,
             loading: None,
             fallback: None,
@@ -152,6 +168,13 @@ pub trait StyledImage: Sized {
     /// Set the image to be displayed in grayscale.
     fn grayscale(mut self, grayscale: bool) -> Self {
         self.image_style().grayscale = grayscale;
+        self
+    }
+
+    /// Set 纸墨重着色参数（T4 GPU 通道）：`Some(params)` 时图片经片元着色器在绘制时完成
+    /// 纸/墨双带映射（CPU 不再逐像素着色）；`None`（默认）走既有直通渲染，逐字节不变。
+    fn recolor(mut self, recolor: Option<ImageRecolor>) -> Self {
+        self.image_style().recolor = recolor;
         self
     }
 
@@ -492,16 +515,32 @@ impl Element for Img {
                         .object_fit
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
-                    window
-                        .paint_image(
-                            bounds,
-                            new_bounds,
-                            corner_radii,
-                            data,
-                            layout_state.frame_index,
-                            self.style.grayscale,
-                        )
-                        .log_err();
+                    if let Some(recolor) = self.style.recolor {
+                        // T4 GPU 重着色通道：图片元素携带重着色参数，绘制时由片元着色器
+                        // 完成纸/墨双带映射（worker 不再对显示路径 CPU 逐像素着色）。
+                        window
+                            .paint_image_recolor(
+                                bounds,
+                                new_bounds,
+                                corner_radii,
+                                data,
+                                layout_state.frame_index,
+                                self.style.grayscale,
+                                recolor,
+                            )
+                            .log_err();
+                    } else {
+                        window
+                            .paint_image(
+                                bounds,
+                                new_bounds,
+                                corner_radii,
+                                data,
+                                layout_state.frame_index,
+                                self.style.grayscale,
+                            )
+                            .log_err();
+                    }
                 } else if let Some(replacement) = &mut layout_state.replacement {
                     replacement.paint(window, cx);
                 }
