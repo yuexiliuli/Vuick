@@ -233,6 +233,11 @@ pub struct PdfViewer {
     /// 本阅读器累计向 worker 派发的**栅格类请求数**（Render/RenderTile/Mid/Thumb）。
     /// 纯回归计数（无副作用）：`切档不重栅`测试断言「重着色切换前后该计数不变」。
     pub(crate) raster_reqs: u64,
+    /// T1：仅**瓦片**栅格的累计派发计数（区分封面/占位）。回归断言「封面 affordable 的
+    /// 首屏不派同页瓦片」用：封面先行时瓦片系计数应为 0，而 `raster_reqs` ≥ 封面数。
+    pub(crate) tile_reqs: u64,
+    /// T1：仅**封面**栅格的累计派发计数（与 `tile_reqs` 共同给出首屏「栅格命令构成」）。
+    pub(crate) cover_reqs: u64,
     /// 当前已驻留瓦片的估算字节（近似 RGBA 内存；淘汰时重算自愈漂移）。
     pub(crate) tile_bytes: u64,
     /// 瓦片自刷新泵是否在途：派发瓦片后若无用户输入就不会再有重绘，而瓦片结果要等
@@ -384,6 +389,8 @@ mod tests {
                     pending_cover: HashMap::new(),
                     pending_recolor: None,
                     raster_reqs: 0,
+                    tile_reqs: 0,
+                    cover_reqs: 0,
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
@@ -581,6 +588,8 @@ mod tests {
                     pending_cover: HashMap::new(),
                     pending_recolor: None,
                     raster_reqs: 0,
+                    tile_reqs: 0,
+                    cover_reqs: 0,
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
@@ -693,6 +702,8 @@ mod tests {
                     pending_cover: HashMap::new(),
                     pending_recolor: None,
                     raster_reqs: 0,
+                    tile_reqs: 0,
+                    cover_reqs: 0,
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,

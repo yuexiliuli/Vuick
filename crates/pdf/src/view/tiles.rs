@@ -157,7 +157,9 @@ impl PdfViewer {
             }
         }
         // 瓦片规划（与快速拖动占位的瓦片预热共用同一份几何，见 `plan_tiles_in_window`）：
-        // 「整页封面已在当前密度下覆盖整页」的页在那里被跳过（省渲染与内存）。
+        // **T1**：`plan_tiles_in_window` 会跳过「封面 affordable 且与瓦片同密度」的页
+        // （封面将整页一次到位），只有「封面不可负担/被 COVER_SCALE_CAP 截断的底图+精修」
+        // 页才产生瓦片——首屏不再出现「同页瓦片先派 + 同密度封面后到再整体作废」的双渲。
         let mut need = self.plan_tiles_in_window(
             first..=last,
             center,
@@ -168,11 +170,11 @@ impl PdfViewer {
             window,
         );
 
-        // 瓦片（**先派**）：可见页瓦片先进 worker 队列 → 停稳瞬间可见条带每片 ~2-8ms
-        // 逐片出图、首片 ~5ms 就清晰。日志佐证：快速澄清的页没有 `[PAGE-RENDER] scale=2.47`
-        // 全页封面、纯靠瓦片填满；慢的页是「整页封面 20-40ms 堵在瓦片前面」才清晰。故把
-        // 封面调度排到瓦片之后：可见页的封面/下折叠与邻居预取仍会整页锐化，只是不再阻塞
-        // 首屏瓦片（封面候选集合、驻留与淘汰语义完全不变，风暴安全无回归）。
+        // 瓦片（**先派**，仅「封面不可负担」的页）：可见页瓦片先进 worker 队列 → 停稳瞬间
+        // 可见条带每片 ~2-8ms 逐片出图、首片 ~5ms 就清晰。**保持封面后派**：worker 的
+        // render_q 是严格 FIFO，把大封面排到瓦片前面会阻塞「底图+精修」的细瓦片（static_gate
+        // 无真机 sleep 的 300 帧停不稳即此类）。T1 的「同页不双渲」由规划跳过保证，与派发
+        // 先后无关。
         if need.is_empty() {
             if timing_view() {
                 eprintln!("[{:.1}ms] [VIEW-SCHED] need empty pending_t={}", crate::pdf::timing_ms(), self.pending_tiles.len());
@@ -195,15 +197,15 @@ impl PdfViewer {
                     },
                 );
                 self.raster_reqs += 1; // 切档不重栅回归计数
+                self.tile_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
                 self.pending_tiles.insert((page, row, col), (scale, rx));
             }
         }
 
-        // 封面（**后派**）：**只服务想看的窗 [first..=last]**（真正可见页 ±1 邻居，见上方
-        // 求值；非 MARGIN 全窗——否则候选页数超驻留上限 → 换页风暴）。中心页优先出队。
+        // 封面（**后派**）：**只服务想看的窗 [first..=last]**（可见页 ±1 邻居；非 MARGIN
+        // 全窗——否则候选页数超驻留上限 → 换页风暴）。中心页优先出队。**T1**：封面与瓦片
+        // 同密度的页因规划跳过已无瓦片，封面即是该页唯一供给 → 无同页双渲。
         let cover_worker = self.worker.clone().unwrap();
-        // 封面按「离可视中心远近」派发：正在看的页封面先出队（预览/整页锐化优先级更高，
-        // 但已在瓦片之后，不再与首屏瓦片抢 worker）。
         let center_vis = (vis_first + vis_last) / 2;
         let mut cover_order: Vec<usize> = (first..=last).collect();
         cover_order.sort_by_key(|&p| (p as i64 - center_vis as i64).unsigned_abs());
@@ -232,6 +234,7 @@ impl PdfViewer {
                 let rx =
                     cover_worker.request_render(self.doc_id, RenderRequest { page, scale: cscale });
                 self.raster_reqs += 1; // 切档不重栅回归计数
+                self.cover_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
                 self.pending_cover.insert(page, (cscale, rx));
             }
         }
@@ -328,8 +331,20 @@ impl PdfViewer {
             };
             // 整页封面已在当前密度下覆盖整页 → 该页瓦片全部冗余，**不再派发**（省渲染与
             // 内存：封面即全页锐化底图，瓦片只服务于「无封面/封面被密度上限截断」的页）。
-            let skip_covered = self.slots[page].cover.is_some()
-                && (self.slots[page].cover_scale - scale).abs() <= 1e-4;
+            // **T1：封面 affordable 且与瓦片同密度**（`cover_scale == scale`，封面可整页
+            // 一次到位取代瓦片）的页同样跳过瓦片——这类页由 `schedule_tiles` 的同帧封面
+            // 派发供给（瓦片跳过后封面即该页唯一栅格），首屏/翻页不再出现「瓦片先派 +
+            // 同密度封面后到再作废」的双重栅格。本函数
+            // 是 `schedule_tiles` 与快速拖动减速预热 `schedule_placeholders` 的共用几何，
+            // 后者因此也不会在停稳前预派这类页的瓦片（避免补封面时双渲）。仅当封面密度被
+            // COVER_SCALE_CAP 截断（`cscale < scale`，超高倍率「底图+精修」——瓦片更细）
+            // 或页位图超 COVER_SIZE_BUDGET（纯瓦片路径）时，才继续按瓦片派发。
+            let cscale = cover_scale(dim, page_width, scale_factor);
+            let cover_serves_tile_density =
+                cover_affordable(dim, cscale) && (cscale - scale).abs() <= 1e-4;
+            let skip_covered = cover_serves_tile_density
+                || (self.slots[page].cover.is_some()
+                    && (self.slots[page].cover_scale - scale).abs() <= 1e-4);
             if skip_covered {
                 continue;
             }
@@ -460,6 +475,7 @@ impl PdfViewer {
                         },
                     );
                     self.raster_reqs += 1; // 切档不重栅回归计数
+                    self.tile_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
                     self.pending_tiles.insert((page, row, col), (scale, rx));
                 }
             }
@@ -625,19 +641,19 @@ impl PdfViewer {
                     self.pending_drops.push(prev);
                 }
                 s.cover_scale = cscale;
-                // 封面 = 全页同密度整页位图：该页的瓦片（~整页 12-15 片）与中清（~2MB 占位）
-                // 全部冗余 → 立即回收内存/显存；渲染直接以封面为底图，无任何视觉回退。
-                let tile_bytes = s.tile_bytes;
-                s.tile_bytes = 0;
-                self.tile_bytes = self.tile_bytes.saturating_sub(tile_bytes);
-                for (_, ts) in s.tiles.drain() {
-                    self.pending_drops.push(ts.image);
-                }
+                // **T1**：封面 = 全页同密度整页位图，覆盖整页 → **不再在封面到位时把该页
+                // 已示瓦片整体作废/drain**（旧语义「同密度封面一到即清空瓦片」= 把「瓦片
+                // 先派」的成果一轮作废，恰是首屏双重栅格税的后半段；封面先行后本分支应
+                // 已无瓦片）。保留的瓦片与封面同密度、显示外观逐像素一致；统一由
+                // `evict_tiles` 的「同密度封面冗余」每帧清扫回收（内存回归守卫
+                // `double_hold == 0` 不变，封面与瓦片不会长期双份驻留）。
+                // 中清占位仍随封面到位回收（低清占位被整页锐化封面取代；存量由
+                // `mid_lru` 预算兜底，此处只清本页那份）。
+                let _ = (w, h);
                 if let Some(old) = s.mid.take() {
                     self.mid_lru.retain(|&p| p != page);
                     self.pending_drops.push(old);
                 }
-                let _ = (w, h);
                 any = true;
             }
         }

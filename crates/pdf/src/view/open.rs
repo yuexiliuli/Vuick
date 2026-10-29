@@ -30,6 +30,8 @@ impl PdfViewer {
             pending_cover: HashMap::new(),
             pending_recolor: None,
             raster_reqs: 0,
+            tile_reqs: 0,
+            cover_reqs: 0,
             tile_bytes: 0,
             tile_pump_running: false,
             last_scroll_y: 0.0,

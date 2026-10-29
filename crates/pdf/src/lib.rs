@@ -2305,6 +2305,238 @@ mod tests {
         );
     }
 
+    /// 回归（**T1 封面先行，真实渲染路径 + 真夹具**）：封面 **affordable 且与瓦片同密度**
+    /// 的页面不得同页双渲。旧语义「瓦片先派、封面后到再把已示瓦片整体作废」= 首屏
+    /// 36 瓦片 + 3 封面双渲。
+    /// 夹具用 `pdf测试2.pdf`（A4 页面）。测试平台为 2× DPI（`window.scale_factor()==2`），
+    /// 故小窗 1000px → 在屏密度 ≈3.2 < COVER_SCALE_CAP=4：封面 affordable 且与瓦片
+    /// **同密度**（封面是真替代物）。断言首屏 + 远跳翻页（快速占位→停稳补封面）后：
+    /// - 瓦片系栅格命令数为 0（`tile_reqs` 不变）；
+    /// - 目标页由封面供给（`cover` 在位、同页无瓦片）。
+    #[gpui::test]
+    async fn cover_first_first_screen_skips_same_page_tiles(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        // 小窗（页宽 ≈960px → A4 在屏密度 ≈3.2 < COVER_SCALE_CAP=4）→ 封面与瓦片同密度。
+        cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+
+        // 停稳探针（对齐 `full_scroll_memory` 既有口径：只看瓦片/封面/泵——快速跳过后的
+        // 占位中清/缩略可能无泵帧暂留，与本回归的「瓦片 vs 封面」构成无关）。
+        let settled_now = |cx: &mut gpui::VisualTestContext| -> bool {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty() && v.pending_cover.is_empty() && !v.tile_pump_running
+                });
+                if st {
+                    return true;
+                }
+            }
+            false
+        };
+        assert!(settled_now(cx), "首屏应在 400 帧内停稳");
+        let t0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).tile_reqs);
+
+        // 远跳翻页（快速态走占位 → 停稳补封面）：目标页同样 affordable 且同密度 →
+        // 封面先行供给、不得派发瓦片（旧语义翻页会补一屏瓦片 → `tile_reqs` 增长）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(12);
+                cx.notify();
+            });
+        });
+        assert!(settled_now(cx), "翻页后应在 400 帧内停稳");
+        let (t1, cover_reqs, raster_reqs, n, sf) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.tile_reqs,
+                v.cover_reqs,
+                v.raster_reqs,
+                v.page_count(),
+                _w.scale_factor(),
+            )
+        });
+        assert!(n >= 1, "夹具应有页");
+        // 封面 affordable 判定与调度同源（用**真实**窗口 scale_factor，测试平台为 2×）。
+        let (affordable0, all_assertible, density_match0, cover_present, tiles_on_page) =
+            cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let pw = v.page_width();
+                let sf = _w.scale_factor();
+                let page = v.current_page().map(|(p, _)| p - 1).unwrap_or(0);
+                let dim = v.dims[page];
+                let (c, s) = (
+                    layout::cover_scale(dim, pw, sf),
+                    layout::render_scale(pw, sf, dim.0),
+                );
+                let all = (0..n.min(6)).all(|p| {
+                    let cc = layout::cover_scale(v.dims[p], pw, sf);
+                    let ss = layout::render_scale(pw, sf, v.dims[p].0);
+                    layout::cover_affordable(v.dims[p], cc) && (cc - ss).abs() <= 1e-4
+                });
+                let slot = v.slots.get(page).expect("应有槽");
+                (
+                    layout::cover_affordable(dim, c),
+                    all,
+                    (c - s).abs() <= 1e-4,
+                    slot.cover.is_some(),
+                    !slot.tiles.is_empty(),
+                )
+            });
+        eprintln!(
+            "[T1-FIRST-SCREEN] n={n} sf={sf} affordable0={affordable0} all_assertible={all_assertible} density_match0={density_match0} cover_present={cover_present} tiles_on_page={tiles_on_page} tile_reqs={t0}->{t1} cover_reqs={cover_reqs} raster_reqs={raster_reqs}"
+        );
+        if all_assertible {
+            // 封面先行主路径：从首屏停稳到远跳翻页停稳，瓦片系派发增量为 0（旧语义这次
+            // 翻页会补一屏瓦片 → `tile_reqs` 增长 = 双渲回归）；目标页由封面供给、同页无瓦片。
+            // 注：`tile_reqs` 非零部分来自开档初始最大化窗（页宽使密度 > COVER_SCALE_CAP
+            // 的「底图+精修」合法瓦片，与本「同密度封面 vs 瓦片」回归口径无关）。
+            assert_eq!(t1, t0, "封面 affordable 首屏/翻页不应派发新增瓦片栅格命令");
+            assert!(cover_present, "封面 affordable 目标页应已由封面供给");
+            assert!(!tiles_on_page, "封面 affordable 目标页不得同页持瓦片（无双渲）");
+            assert!(
+                cover_reqs >= 1,
+                "affordable 屏幕应派发了封面：cover_reqs={cover_reqs}"
+            );
+        } else if affordable0 {
+            // 首页同密度可负担、部分页不可 → 目标页须封面先行且同页无瓦片。
+            assert!(cover_present, "同密度可负担的目标页应已由封面供给");
+            assert!(!tiles_on_page, "同密度可负担的目标页不得同页持瓦片");
+        } else {
+            // 目标页不可负担 → 纯瓦片回退（无封面、瓦片在位），同样无双渲。
+            assert!(!cover_present, "不可负担时目标页不应有同密度封面");
+            assert!(t1 > t0 && tiles_on_page, "不可负担应由瓦片供给");
+        }
+    }
+
+    /// T1 时空基准（首屏**就绪墙钟** + 栅格命令构成，真实渲染路径 + 真夹具）：测量「加载
+    /// 完成 → 首屏停稳（无在途瓦片/封面/泵）」的墙钟与 tile/cover 派发计数。用 1000px 小窗
+    /// （测试平台 2× DPI → A4 在屏密度 ≈3.2 < COVER_SCALE_CAP=4）：封面 affordable 且与
+    /// 瓦片同密度 → **封面先行后瓦片命令为 0**。手动 `--ignored` 跑多轮取中位写进 T1 报告，
+    /// 对比 ae02310 基线（首屏 36 瓦片 + 3 封面双渲；此处应只剩封面命令——栅格命令数与
+    /// 就绪墙钟都应显著下降）。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_first_screen_wallclock(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let t0 = Instant::now();
+        let mut settled = false;
+        for _ in 0..800 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty()
+                    && v.pending_cover.is_empty()
+                    && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+        let ready_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let (tile_reqs, cover_reqs, raster_reqs, sf, dw, dh) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.tile_reqs, v.cover_reqs, v.raster_reqs, _w.scale_factor(), v.dims[0].0, v.dims[0].1)
+        });
+        eprintln!(
+            "[BENCH-FIRST-SCREEN] ready_ms={:.0} tile_reqs={tile_reqs} cover_reqs={cover_reqs} raster_reqs={raster_reqs} settled={settled} sf={sf} dim0={dw:.0}x{dh:.0}",
+            ready_ms
+        );
+    }
+
     /// 回归（Sprint 5 静态帧门控，真实渲染路径）：加载 + 首屏调度/泵结束进入「静态
     /// 停靠」后应进入静置确认（`window_settled`）；连发无变化帧被门控跳过（`idle_gate_skips`
     /// 单调增）且不产生待派、不饿死渲染；跳页（变化帧）立即复位门控并恢复调度（在途
