@@ -29,11 +29,13 @@ pub(crate) struct Slot {
     pub(crate) cover: Option<std::sync::Arc<gpui::RenderImage>>,
     /// 封面对应的渲染倍率（px/pt）；缩放变化后视为过期并丢弃。
     pub(crate) cover_scale: f32,
-    /// **旧密度封面**（缩放过渡期兜底底图）：缩放/换 DPI 后 `schedule_tiles` 把旧封面从
-    /// [`Slot::cover`] 移入此处暂留，并在新密度封面到位前按新页宽 **CSS 拉伸铺满**，
-    /// 防「Ctrl+滚轮缩放时每档闪一次『加载中』」；新封面到位（`collect_cover_results`）、
-    /// 该页离开封面窗口（`evict_covers`）或视图释放（`release`）时即下线回收——
-    /// 只作瞬态过渡底图，**非新增常驻缓存**（同一时间每页至多一份旧封面，不影响预算账本）。
+    /// **旧密度封面/退位过渡底图**（缩放过渡期 + F2 方向翻位兜底）：缩放/换 DPI 后
+    /// `schedule_tiles` 把旧封面从 [`Slot::cover`] 移入此处暂留，在新密度封面到位前按新页宽
+    /// **CSS 拉伸铺满**，防「Ctrl+滚轮缩放时每档闪一次『加载中』」；F2 评审 D1 兜底另把
+    /// 「方向翻位时刚退位的反向邻居」封面转存此处（`evict_covers` 的 `retire` 分支，同一时刻
+    /// 至多 1 张），反向微调滚动期间作该页底图桥。两者均在新封面到位（`collect_cover_results`）、
+    /// 该页离开封面窗口且不再是退位页（`evict_covers`）或视图释放（`release`）时即下线回收——
+    /// 只作瞬态过渡底图，**非新增常驻缓存**（同一时间每页至多一份，不影响预算账本）。
     pub(crate) prev_cover: Option<std::sync::Arc<gpui::RenderImage>>,
     /// L0 缩略图（低清层）：全尺寸瓦片缺席时先展示，拖动期间"永远有内容"；
     /// 快速拖动时全页只有缩略图占位，停止后按需补齐瓦片。

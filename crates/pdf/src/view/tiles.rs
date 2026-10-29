@@ -138,6 +138,31 @@ impl PdfViewer {
         let vis_last = vis_last.unwrap_or(end);
         let first = vis_first.saturating_sub(1);
         let last = (vis_last + 1).min(self.dims.len().saturating_sub(1));
+        // **F2 封面单向预取（收窄驻留窗）**：封面请求与驻留窗收窄为「可见页 + 滚动方向
+        // 前瞻 1 页」。方向未知（初始未滚动，`scroll_dir==0`）→ 退化为旧保守对称窗
+        // （可见页 ±1），首开/缩放帧不缩水。
+        //
+        // **回看/反向清晰度（评审 D1 修正，注意非「瓦片全程兜底」）**：封面可负担页
+        // （典型 A4）因 T1 跳瓦片从不产生瓦片，封面到位又把 mid/thumb 回收 → 反向微调
+        // 滚动（overshoot 一档再回）时，方向翻位刚退位的那一页若直接丢封面就「无底图闪
+        // 加载中」。故退位页封面**转存为有界 `prev_cover` 桥底图**（`evict_covers` 的
+        // `retire` 分支，同一时刻至多 1 张），反向重读该页期间底图链 cover→prev_cover→
+        // mid→thumb 恒非空。仅地缘上相邻的退位页有桥；更远窗外页（≥2 页）回翻重渲期间
+        // 仍可能瞬时落「加载中」（既有行为，不在本兜底范围）。
+        let (cover_first, cover_last) = match self.scroll_dir {
+            1 => (vis_first, (vis_last + 1).min(self.dims.len().saturating_sub(1))),
+            -1 => (vis_first.saturating_sub(1), vis_last),
+            _ => (first, last),
+        };
+        // 方向翻位时的「退位页」= 反方向一侧刚出窗的那一页（其封面转存有界 prev_cover）。
+        // 对称退化窗（dir=0）两侧邻居都在窗内 → 无退位页。
+        // ⚠️ 必须用 checked_sub/add（惰性求值）：走值语义的 `(p>0).then_some(p-1)` 会**先**算
+        // `p-1`，p==0 时 debug 下直接算术下溢 panic（首帧滚动到页 0 即触发）。
+        let retire = match self.scroll_dir {
+            1 => cover_first.checked_sub(1),
+            -1 => cover_last.checked_add(1).filter(|&p| p < self.dims.len()),
+            _ => None,
+        };
         let center = (start + end) / 2;
 
         // 惰性失效：缩放/DPI 已变 → 清该页旧密度瓦片（在途旧密度结果由 scale 守卫丢弃）。
@@ -202,12 +227,13 @@ impl PdfViewer {
             }
         }
 
-        // 封面（**后派**）：**只服务想看的窗 [first..=last]**（可见页 ±1 邻居；非 MARGIN
-        // 全窗——否则候选页数超驻留上限 → 换页风暴）。中心页优先出队。**T1**：封面与瓦片
+        // 封面（**后派**）：**只服务封面窗 [cover_first..=cover_last]**（可见页 + 滚动方向
+        // 前瞻 1 页；非 MARGIN 全窗——否则候选页数超驻留上限 → 换页风暴）。请求窗与
+        // `evict_covers` 驻留窗一致，避免「派了即逐」。中心页优先出队。**T1**：封面与瓦片
         // 同密度的页因规划跳过已无瓦片，封面即是该页唯一供给 → 无同页双渲。
         let cover_worker = self.worker.clone().unwrap();
         let center_vis = (vis_first + vis_last) / 2;
-        let mut cover_order: Vec<usize> = (first..=last).collect();
+        let mut cover_order: Vec<usize> = (cover_first..=cover_last).collect();
         cover_order.sort_by_key(|&p| (p as i64 - center_vis as i64).unsigned_abs());
         for page in cover_order {
             let dim = self.dims[page];
@@ -238,7 +264,7 @@ impl PdfViewer {
                 self.pending_cover.insert(page, (cscale, rx));
             }
         }
-        self.evict_covers(first, last);
+        self.evict_covers(cover_first, cover_last, retire);
     }
 
     /// 页 `page` 在当前视口内**可见**的卡片局部矩形 `(x0, y0, x1, y1)`（CSS px），
@@ -654,6 +680,15 @@ impl PdfViewer {
                     self.mid_lru.retain(|&p| p != page);
                     self.pending_drops.push(old);
                 }
+                // **F2**：封面到位 = 该页显示由整页封面供给 → 同页缩略图同时回收（省每页
+                // ~0.37MB，取消「封面+缩略」双份驻留）。回看路径在封面被逐后才走缩略图
+                // （`page_base_image` 链 cover→prev_cover→mid→thumb）属既有语义，此处只
+                // 回收「已被覆盖」页的冗余缩略。⚠️ 封面退位后该页底图靠 `evict_covers` 的
+                // 有界 prev_cover 桥（方向翻位的反向邻居）或 mid/thumb；封面可负担页无瓦片，
+                // 若既无桥又无低清占位（更远窗外页回翻重渲期间）仍可能瞬时落「加载中」。
+                if let Some(old) = s.thumb.take() {
+                    self.pending_drops.push(old);
+                }
                 any = true;
             }
         }
@@ -778,21 +813,46 @@ impl PdfViewer {
         any
     }
 
-    /// 封面内存管理：**只保留当前想要的封面 `[wanted_first..=wanted_last]`（可见页 ±1
-    /// 邻居），窗外封面逐帧回收**。窗口内 ≤ 可见页+2 页，内存有界且**绝不触发换页风暴**：
-    /// 当前窗口的封面永不被淘汰 → 不会被反复重请求；窗外的旧封面（随滚动累积）下帧即清。
-    pub(super) fn evict_covers(&mut self, wanted_first: usize, wanted_last: usize) {
+    /// 封面内存管理：**只保留当前想要的封面 `[wanted_first..=wanted_last]`**——F2 起该窗为
+    /// 「可见页 + 滚动方向前瞻 1 页」（方向未知时退化对称可见页 ±1），窗外封面逐帧回收。
+    /// 窗内 ≤ 可见页+1 页，内存有界且**绝不触发换页风暴**：当前窗口的封面永不被淘汰 →
+    /// 不会被反复重请求；窗外的旧封面（随滚动累积）下帧即清。
+    ///
+    /// `retire` = 方向翻位时**刚退位**的反向相邻页（评审 D1 兜底）：其封面不直接下线，
+    /// 转存为有界 `prev_cover`（同一时刻至多 1 张）作该页过渡底图——反向微调滚动重读
+    /// 该页、且新封面在途时，底图链 cover→prev_cover→mid→thumb 仍非空，不落「加载中」；
+    /// 该页重新入窗（新封面到位由 `collect_cover_results` 顺带回收桥）、或让位给新的
+    /// 退位页时即释放。更远窗外页（≥2 页）回翻重渲期间仍可能瞬时落「加载中」（既有行为）。
+    pub(super) fn evict_covers(
+        &mut self,
+        wanted_first: usize,
+        wanted_last: usize,
+        retire: Option<usize>,
+    ) {
         let mut drops: Vec<Arc<RenderImage>> = Vec::new();
         for (page, slot) in self.slots.iter_mut().enumerate() {
-            if slot.cover.is_some() && (page < wanted_first || page > wanted_last)
-                && let Some(old) = slot.cover.take() {
-                    drops.push(old);
-                }
-            // 旧密度封面兜底同样只保留在当前封面窗口内（窗外随滚即回收，防越滚越积）。
-            if slot.prev_cover.is_some() && (page < wanted_first || page > wanted_last)
-                && let Some(old) = slot.prev_cover.take() {
-                    drops.push(old);
-                }
+            if page >= wanted_first && page <= wanted_last {
+                continue;
+            }
+            if Some(page) == retire {
+                // 刚退位的反向邻居：封面转存为有界过渡底图（prev_cover），不立即下线。
+                if slot.cover.is_some()
+                    && let Some(old) = slot.cover.take() {
+                        if let Some(prev) = slot.prev_cover.replace(old) {
+                            drops.push(prev); // 旧过渡图（如缩放陈旧封面）逐出，保持有界 1 张
+                        }
+                    }
+            } else {
+                if slot.cover.is_some()
+                    && let Some(old) = slot.cover.take() {
+                        drops.push(old);
+                    }
+                // 旧的过渡兜底同样只保留在当前封面窗口/退位页内（窗外随滚即回收，防越滚越积）。
+                if slot.prev_cover.is_some()
+                    && let Some(old) = slot.prev_cover.take() {
+                        drops.push(old);
+                    }
+            }
         }
         self.pending_drops.extend(drops);
     }

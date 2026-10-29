@@ -37,6 +37,7 @@ impl PdfViewer {
             tile_bytes: 0,
             tile_pump_running: false,
             last_scroll_y: 0.0,
+            scroll_dir: 0,
             scroll_velocity: 0.0,
             prev_fast: false,
             scroll: ScrollHandle::new(),
@@ -525,8 +526,17 @@ impl PdfViewer {
             cx.notify();
         }
 
-        // 2) 滚动速度估计（EMA，px/帧）+ 迟滞判定
-        let dy = (scroll_y - self.last_scroll_y).abs();
+        // 2) 滚动速度估计（EMA，px/帧）+ 迟滞判定 + 滚动方向（F2 封面单向预取用）
+        let jump = scroll_y - self.last_scroll_y;
+        // 方向：>0 向下（页号增大）、<0 向上；delta==0（静止帧）保持上一方向（迟滞，
+        // 稳态封面窗口不因「停稳」扩回对称 ±1）。缩放（`adjust_zoom` 同比缩放偏移）只在
+        // 交互瞬间给一次伪方向，可见页恒在窗口内，无碍。
+        self.scroll_dir = match jump.partial_cmp(&0.0) {
+            Some(core::cmp::Ordering::Greater) => 1,
+            Some(core::cmp::Ordering::Less) => -1,
+            _ => self.scroll_dir,
+        };
+        let dy = jump.abs();
         self.scroll_velocity = self.scroll_velocity * 0.7 + dy * 0.3;
         self.update_fast_flag();
         self.last_scroll_y = scroll_y;

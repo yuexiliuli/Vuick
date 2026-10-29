@@ -251,6 +251,9 @@ pub struct PdfViewer {
     pub(crate) tile_pump_running: bool,
     /// 上一帧滚动偏移（预测滚动方向用：delta>0 正在往下滚 → 预取下方页）。
     pub(crate) last_scroll_y: f32,
+    /// 滚动方向（F2 封面单向预取用）：1=向下（页号增大）、-1=向上、0=方向未知
+    /// （初始未滚过 / 静止时保持上一方向，见 `ensure_window` 的递推）。
+    pub(crate) scroll_dir: i8,
     /// 滚动速度估计（px/帧，EMA)：> [`MOVE_THRESHOLD_PX`] 视为快速拖动 →
     /// 改派缩略/中清占位、暂停瓦片派发（避免小片洪流），停止后瓦片立即补齐。
     pub(crate) scroll_velocity: f32,
@@ -406,6 +409,7 @@ mod tests {
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
+                    scroll_dir: 0,
                     scroll_velocity: 0.0,
                     prev_fast: false,
                     scroll: ScrollHandle::new(),
@@ -608,6 +612,7 @@ mod tests {
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
+                    scroll_dir: 0,
                     scroll_velocity: 0.0,
                     prev_fast: false,
                     scroll: ScrollHandle::new(),
@@ -725,6 +730,7 @@ mod tests {
                     tile_bytes: 0,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
+                    scroll_dir: 0,
                     scroll_velocity: 0.0,
                     prev_fast: false,
                     scroll: ScrollHandle::new(),

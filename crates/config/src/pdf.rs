@@ -39,17 +39,17 @@ pub const THUMB_WIDTH: f32 = 260.0;
 /// 同时在途的缩略图请求上限（独立于瓦片/中清额度）。
 pub const MAX_THUMB_INFLIGHT: usize = 4;
 /// 内存中保留的缩略图页数上限（超限丢离视口中心最远者；每张 ~0.37MB RGBA，
-/// 18 张 ≈ 7MB——覆盖快速拖动最近 ~2.5 屏，兼顾内存）。
-pub const THUMB_CACHE_PAGES: usize = 18;
+/// 12 张 ≈ 5MB——覆盖快速拖动最近 ~1.5 屏，兼顾内存；封面到位即回收该页缩略（F2））。
+pub const THUMB_CACHE_PAGES: usize = 12;
 // ---- L0.5 中清 LOD（快速拖动时的清晰度）：260px 缩略图拉 3.2× 到 840px 必然糊，
 // 加一档 ~520px 中清页，拖动时可辨识标题/段落结构，且比瓦片整屏便宜（~5ms/张）----
 /// 中清目标显示宽（px）：快速拖动时优先派发/显示，作瓦片下方的占位底图。
 pub const MID_WIDTH: f32 = 520.0;
 /// 同时在途的中清请求上限（仅快速拖动期使用，独立于瓦片/缩略图在途）。
 pub const MAX_MID_INFLIGHT: usize = 4;
-/// 内存中保留的中清页数上限（每张 ~1.5MB RGBA，8 张 ≈ 12MB；中清可 ~5ms 重建，
+/// 内存中保留的中清页数上限（每张 ~1.5MB RGBA，6 张 ≈ 9MB；中清可 ~5ms 重建，
 /// 且整页封面到来即回收该页中清——低驻留即可，快速拖动最近 ~1 屏）。
-pub const MID_CACHE_PAGES: usize = 8;
+pub const MID_CACHE_PAGES: usize = 6;
 /// 文本层 LRU 缓存页数上限（每页 ~20-100KB，24 页 <3MB；选中/复制/搜索用）。
 pub const TEXT_CACHE_PAGES: usize = 24;
 /// 同时并发预取的文本页数上限（低优先级，不抢栅格化带宽）。

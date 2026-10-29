@@ -1783,7 +1783,7 @@ mod tests {
             );
             assert!(
                 covers_held <= 5,
-                "第 {target} 页停稳后仅保留当前窗口±1 封面（{covers_held} > 5 = 封面在累积）"
+                "第 {target} 页停稳后封面驻留有界（F2 起窗口=可见页+方向预取 1，上限更小；{covers_held} > 5 = 封面在累积）"
             );
         }
     }
@@ -2278,7 +2278,10 @@ mod tests {
             cap / 1024 / 1024,
         );
         assert!(tile_bytes <= cap, "zoom1 瓦片占用应不超预算：{tile_bytes} > {cap}");
-        assert!(covers <= 5, "zoom1 封面驻留应 ≤ 5：{covers}");
+        // F2：封面驻留上界 = 可见页数 + 滚动方向预取 1。本夹具（1500×900 视口、A4 适配宽）
+        // 停稳后可见页恒为 1（旧对称窗 3 页 = 可见 1 + 两侧各 1 即基线 covers=3），
+        // 故相对上界 = 1 + 1 = 2——不锁死宽泛绝对数字，随可见页数变化。
+        assert!(covers <= 2, "zoom1 封面驻留应 ≤ 可见页+方向预取 1（当前视口 1 页 → ≤2）：{covers}");
         assert!(
             mids <= config::pdf::MID_CACHE_PAGES,
             "zoom1 中清驻留应 ≤ 上限：{mids}"
@@ -2340,7 +2343,10 @@ mod tests {
             tile_bytes2 <= cap,
             "zoom1.75 瓦片占用应不超预算：{tile_bytes2} > {cap}"
         );
-        assert!(covers2 <= 5, "zoom1.75 封面驻留应 ≤ 5：{covers2}");
+        assert!(
+            covers2 <= 2,
+            "zoom1.75 封面驻留应 ≤ 可见页+方向预取 1（当前视口 1 页 → ≤2）：{covers2}"
+        );
         assert!(
             mids2 <= config::pdf::MID_CACHE_PAGES,
             "zoom1.75 中清驻留应 ≤ 上限：{mids2}"
@@ -2356,6 +2362,218 @@ mod tests {
         assert!(
             total_est2 < 150 * 1024 * 1024,
             "zoom1.75 高倍密度下渲染驻留内存也应有界：{total_est2}"
+        );
+    }
+
+    /// 回归（**F2 评审 D1 兜底**）：方向翻位时「刚退位的反向邻居」封面必须转存为**有界
+    /// `prev_cover` 桥底图**，反向微调滚动（overshoot 一档再回、新封面在途）期间该页底图链
+    /// （cover→prev_cover→mid→thumb）非空、不落「第 N 页 加载中…」；桥严格有界（同一时刻
+    /// 至多 1 张），该页重新入窗、新封面到位即替换释放。
+    /// 真实渲染路径 + 真夹具：下滚停稳第 10 页（dir=1，封面窗 [10..11]，10/11 封面驻留）
+    /// → 上翻停稳第 9 页（dir=-1，封面窗 [8..9]，第 10 页退位）→ 断言第 10 页 `cover=None`
+    /// 且 `prev_cover=Some`（桥在场）、全局 prev_cover 计数 ==1 → 翻回第 10 页停稳后断言
+    /// 第 10 页由新封面供给、桥已被替换释放。
+    #[gpui::test]
+    async fn cover_retire_bridge_prevents_flash_on_direction_swap(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let n = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).page_count()
+        });
+        assert!(n >= 40, "测试文档应至少有 40 页，实际 {n}");
+
+        // 等待封面在途清空 + 退出快速态。⚠️ 只等封面/快速态、**不等瓦片**：D1 断言只依赖
+        // 封面/prev_cover 槽位状态；瓦片在途（如本机 worker 渲染较重时）可能长时间悬着，
+        // 与兜底逻辑正交（memory 全量滚动测试已证瓦片可沉降且预算有界）。
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    (v.pending_cover.is_empty(), !v.prev_fast)
+                });
+                if st == (true, true) {
+                    return;
+                }
+            }
+            panic!("状态应沉降（封面在途/快速态应清空）");
+        };
+        let jump = |cx: &mut gpui::VisualTestContext, page: usize| {
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |v, cx| {
+                        v.scroll_to_page(page);
+                        cx.notify();
+                    });
+            });
+        };
+
+        // ① 下滚到第 10 页停稳：dir=1 → 封面窗 [10..11]，10（可见）+11（方向前瞻）都驻留。
+        // ⚠️ 先暖 60 帧让自适应页宽（`base_w` 收敛）与滚动容器布局稳定：`scroll_to_page`
+        // 按 `page_tops` 定位，若在 refit 尚未收敛时跳页，随后 refit 重算 page_tops 会把
+        // 视口偏移带走（实测跳 10 却落在 ~13），掩盖本测试要对的 D1 语义。
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let pre_cover_pages = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let c: Vec<usize> = v
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.cover.is_some())
+                .map(|(p, _)| p)
+                .collect();
+            (c, f32::from(-v.scroll.offset().y), v.scroll_dir)
+        });
+        eprintln!(
+            "[D1-TEST] PRE-jump off_y={:.0} dir={} covers={:?}",
+            pre_cover_pages.1, pre_cover_pages.2, pre_cover_pages.0
+        );
+        jump(cx, 10);
+        settle(cx);
+        let (have10, have11, stray_bridges, cover_pages) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let cover_pages: Vec<usize> = v
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.cover.is_some())
+                .map(|(p, _)| p)
+                .collect();
+            (
+                v.slots[10].cover.is_some(),
+                v.slots[11].cover.is_some(),
+                v.slots.iter().filter(|s| s.prev_cover.is_some()).count(),
+                cover_pages,
+            )
+        });
+        eprintln!(
+            "[D1-TEST] phase1 jump=10 off_y={:.0} dir={} cover_pages={cover_pages:?} tops10/12/13={:?}",
+            cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                f32::from(-v.scroll.offset().y)
+            }),
+            cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.scroll_dir
+            }),
+            cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.page_tops.get(10).copied(),
+                    v.page_tops.get(12).copied(),
+                    v.page_tops.get(13).copied(),
+                )
+            }),
+        );
+        assert!(have10, "第 10 页（可见）应有封面");
+        assert!(have11, "第 11 页（方向前瞻 1）应有封面");
+        assert_eq!(stray_bridges, 0, "下滚稳态不应存在残留过渡桥");
+
+        // ② 上翻到第 9 页停稳：dir 翻转为 -1 → 封面窗 [8..9]，第 10 页成为「刚退位的反向
+        //    邻居」→ 其封面应转存为有界 prev_cover 桥（而非直接下线 → 反向重读不至于闪白）。
+        jump(cx, 9);
+        settle(cx);
+        let (cover_gone, bridged, bridge_count) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let s = &v.slots[10];
+            (
+                s.cover.is_none(),
+                s.prev_cover.is_some(),
+                v.slots.iter().filter(|s| s.prev_cover.is_some()).count(),
+            )
+        });
+        assert!(
+            cover_gone,
+            "第 10 页退出封面窗后 cover 应收走（否则无法收窄驻留）"
+        );
+        assert!(
+            bridged,
+            "退位页第 10 页应有 prev_cover 桥底图（D1 兜底：反向重读不落「加载中」）"
+        );
+        assert_eq!(bridge_count, 1, "过渡桥应严格有界 1 张，不得累积");
+
+        // ③ 翻回第 10 页停稳：dir 翻回 +1 → 第 10 页重新入窗 [10..11]，新封面到位即把旧桥
+        //    （page=10）替换释放；同时本帧新「反向邻居」= 第 9 页接棒持有桥（dir=+1 的
+        //    退位页 = vis_first-1）——桥仍严格有界 1 张，只是跟手换页。
+        jump(cx, 10);
+        settle(cx);
+        let (recovered, bridge_released, bridge_pages) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pages: Vec<usize> = v
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.prev_cover.is_some())
+                .map(|(p, _)| p)
+                .collect();
+            (
+                v.slots[10].cover.is_some(),
+                v.slots[10].prev_cover.is_none(),
+                pages,
+            )
+        });
+        eprintln!("[D1-TEST] phase3 bridge_pages={bridge_pages:?}");
+        assert!(recovered, "第 10 页重新入窗后应由新封面供给");
+        assert!(
+            bridge_released,
+            "新封面到位后第 10 页的过渡桥应被替换释放（不残留常驻缓存）"
+        );
+        assert_eq!(
+            bridge_pages,
+            vec![9],
+            "翻回后桥应跟手换到新的反向邻居（第 9 页）且仅此 1 张：{bridge_pages:?}"
         );
     }
 
@@ -4486,6 +4704,7 @@ mod tests {
         assert_eq!(sel_img2, None, "点空白应清除图片选中");
     }
 }
+
 
 
 

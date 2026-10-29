@@ -321,12 +321,12 @@ fn search_overlays_for_page(
     out
 }
 
-/// 页卡底图选择（缩放期防闪的纯逻辑，见 [`PdfViewer::build_visible_page_cards`]）：
-/// 返回本帧应铺满整页的位图，优先级 **当前密度封面（锐利）→ 旧密度封面
-/// （[`Slot::prev_cover`]，缩放过渡期 CSS 拉伸兜底）→ 中清 → 缩略**；全空 → `None`
-/// （调用方显示「第 N 页 加载中…」——仅首开/极速拖动这类真的没有任何位图的页才出现）。
-/// 缩放瞬间 `cover_now` 为 `None`，但只要旧封面还在，底图就是旧封面而非占位——
-/// 「宁可瞬时模糊也不闪白」。抽成纯函数便于单测钉死该优先级。
+/// 页卡底图选择（缩放期/方向翻位防闪的纯逻辑，见 [`PdfViewer::build_visible_page_cards`]）：
+/// 返回本帧应铺满整页的位图，优先级 **当前密度封面（锐利）→ 过渡底图
+/// （[`Slot::prev_cover`]：旧密度封面缩放过渡 CSS 拉伸兜底，或 F2 方向翻位退位封面桥）
+/// → 中清 → 缩略**；全空 → `None`（调用方显示「第 N 页 加载中…」——仅首开/极速拖动这类
+/// 真的没有任何位图的页才出现）。缩放瞬间 `cover_now` 为 `None`，但只要过渡图还在，底图
+/// 就是它而非占位——「宁可瞬时模糊也不闪白」。抽成纯函数便于单测钉死该优先级。
 pub(super) fn page_base_image(
     cover_now: Option<&Arc<RenderImage>>,
     cover_stale: Option<&Arc<RenderImage>>,
