@@ -1244,6 +1244,10 @@ impl PdfWorker {
                 while let Some(key) = pr.keys.front().copied() {
                     // 查该 key 的缓存原图（已被 FIFO 挤出 → 跳过该 key：view 保持旧着色，
                     // 用户滚回/缩放到该格时走常规渲染按新参数现算，不补回传）。
+                    // 【预期行为】48MB 预算紧张（`RAW_CACHE_BYTES`）下「滚出再滚回」的首可视页
+                    // 封面恰是最早写入的最旧条目，最易被挤出 → 刷新对该 key 为空跳过 = **部分
+                    // 刷新**（回传 ⊆ 仍驻留缓存的可见集子集），靠下一交互重渲恢复——这是预算
+                    // 取舍下的预期行为，不是缺陷（WARN-1 注释 + WARN-2 专项测试钉死）。
                     let raw = raw_cache
                         .get(&pr.doc_id)
                         .and_then(|v| {
@@ -1856,6 +1860,32 @@ impl RawEntry {
     }
 }
 
+/// 测试覆盖（仅 `#[cfg(test)]`）：raw 缓存预算的进程级覆盖——`set_raw_cache_budget_for_test`
+/// 可把预算压到极小（如 2MB）以钉死「48MB 预算紧张 → 首可视页封面被 FIFO 挤出 → 切档部分
+/// 刷新」的预期行为（WARN-2 专项测试）。0 = 用生产常量 [`config::pdf::RAW_CACHE_BYTES`]。
+/// 须像门控/曲线一样持 pdfium 全局串行锁时设置、测试结束还原（同 K28 并发纪律）。
+#[cfg(test)]
+static RAW_CACHE_BUDGET_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) fn set_raw_cache_budget_for_test(v: u64) {
+    RAW_CACHE_BUDGET_OVERRIDE.store(v, Ordering::Relaxed);
+}
+#[cfg(test)]
+pub(crate) fn raw_cache_budget_override() -> u64 {
+    RAW_CACHE_BUDGET_OVERRIDE.load(Ordering::Relaxed)
+}
+/// 当前 raw 缓存预算：测试覆盖非 0 → 用它（极小值钉死 FIFO 回收）；默认生产常量。
+pub(crate) fn raw_cache_budget() -> u64 {
+    #[cfg(test)]
+    {
+        let o = RAW_CACHE_BUDGET_OVERRIDE.load(Ordering::Relaxed);
+        if o != 0 {
+            return o;
+        }
+    }
+    config::pdf::RAW_CACHE_BYTES
+}
+
 /// 把本轮栅格化的**未着色原图**写入文档 raw 缓存（预算超支时先入先出回收最旧）。
 /// 同 key（kind/页/格号）同密度同尺寸 → 复用既有原图、不重复占用，返回 `false`（调用方
 /// 仍可用本轮刚栅格化的同内容 raw 作着色出口）；其余情况写入/替换并返回 `true`。
@@ -1886,8 +1916,10 @@ fn cache_raw(cache: &mut Vec<RawEntry>, entry: RawEntry, budget: u64) -> bool {
 
 /// 栅格化出口统一姿势：把未着色原图存入文档 raw 缓存（同 key 同密度复用），返回**按当前
 /// 重着色参数着色后的显示副本**（`None` 直通 = 原图不变）。不触碰缓存内的 raw（单真值）。
-/// `gpu` = T4 GPU 重着色门控：开启时**跳过 CPU 逐像素着色**，出口即未着色原图
-/// （着色改在 GPU 绘制时完成）——显示路径 CPU 税归零；关闭时行为与既有完全一致。
+/// `gpu` = T4 GPU 重着色门控：开启时**跳过 CPU 逐像素着色且不写入 raw 缓存**，出口即
+/// 未着色原图本身（着色改在 GPU 绘制时完成；原图由 view 持有、worker 侧缓存 0 消费者）——
+/// 显示路径 CPU 税归零、默认路径缓存冗余归零、无 `bgra.clone()` 瞬态 2× 尖峰；
+/// 关闭时写缓存 + 着色副本，行为与既有完全一致（CPU 重着色回退路径）。
 fn finalize_render(
     cache: &mut Vec<RawEntry>,
     kind: RawKind,
@@ -1909,45 +1941,68 @@ fn finalize_render(
         // 真机诊断 2/4：门控下跳过 CPU 着色直传原图——首个封面/瓦片各打一次（latch）。
         crate::recolor::diag_raw_passthrough(kind);
     }
-    let already = cache.iter().any(|e| {
-        e.kind == kind
-            && e.page == page
-            && e.row == row
-            && e.col == col
-            && (e.scale - scale).abs() <= 1e-4
-            && e.w == w
-            && e.h == h
-    });
-    if already {
-        // 已缓存同密度同尺寸原图（重渲同格）：缓存 raw 不重复写入，出口用本轮 raw（内容一致）。
-        if !gpu && let Some(p) = recolor {
-            apply_recolor(&mut bgra, p);
-        }
+    if gpu {
+        // 内存去冗余（GPU 门控默认路径）：worker 侧 raw 缓存 **0 消费者**——GPU 模式下
+        // view 持原图、着色在绘制时 `img().recolor` 现算；切档只改图元参数、不派
+        // `RecolorRefresh`（见 `view/open.rs::set_recolor` 的 `if !gpu_recolor` 分支）→
+        // 不写缓存（默认路径缓存冗余归零），`bgra` **move 直传**出口（不克隆，消除一次性
+        // 2× 尖峰）。条件只取决于 GPU/CPU 门控、不取决于当前 recolor 是否 Some：CPU 模式
+        // 即使当前 recolor=None 也应保持缓存（用户随时可开夜间，缓存供
+        // `SetRecolor`/`RecolorRefresh` 消费、回看按新参现算）。
         return bgra;
     }
-    // 新原图：入缓存 + 出口用克隆着色副本。
-    let mut out = bgra.clone();
-    if !gpu && let Some(p) = recolor {
+    // CPU 重着色回退路径：raw 缓存只服务「重着色刷新」的消费方（`RecolorRefresh` 圈定的
+    // 可见集 = 在位封面 + 瓦片，见 `current_recolor_scope`）；Mid/Thumb 是快速拖动瞬态占位、
+    // **不参与重着色刷新** → 其 raw 入缓存属死重（占用预算挤出封面/瓦片原图、切换时无消费
+    // 方）。因此只有 Cover/Tile 的 raw 入缓存——预算语义统一为「封面 + 瓦片原图镜像」
+    // （对齐 [`config::pdf::RAW_CACHE_BYTES`] = 高倍可见集的 3×封面 + 瓦片）。
+    if matches!(kind, RawKind::Cover | RawKind::Tile) {
+        let already = cache.iter().any(|e| {
+            e.kind == kind
+                && e.page == page
+                && e.row == row
+                && e.col == col
+                && (e.scale - scale).abs() <= 1e-4
+                && e.w == w
+                && e.h == h
+        });
+        if already {
+            // 已缓存同密度同尺寸原图（重渲同格）：缓存 raw 不重复写入，出口用本轮 raw（内容一致）。
+            if let Some(p) = recolor {
+                apply_recolor(&mut bgra, p);
+            }
+            return bgra;
+        }
+        // 新原图：入缓存 + 出口用克隆着色副本。
+        let mut out = bgra.clone();
+        if let Some(p) = recolor {
+            apply_recolor(&mut out, p);
+        }
+        cache_raw(
+            cache,
+            RawEntry {
+                kind,
+                page,
+                row,
+                col,
+                x0,
+                y0,
+                w,
+                h,
+                full_w,
+                full_h,
+                scale,
+                bgra,
+            },
+            raw_cache_budget(),
+        );
+        return out;
+    }
+    // Mid/Thumb：瞬态占位不入缓存，出口 `bgra` move 直用 + 着色副本（免克隆）。
+    let mut out = bgra;
+    if let Some(p) = recolor {
         apply_recolor(&mut out, p);
     }
-    cache_raw(
-        cache,
-        RawEntry {
-            kind,
-            page,
-            row,
-            col,
-            x0,
-            y0,
-            w,
-            h,
-            full_w,
-            full_h,
-            scale,
-            bgra,
-        },
-        config::pdf::RAW_CACHE_BYTES,
-    );
     out
 }
 
@@ -3005,5 +3060,53 @@ mod tests {
             tiny.iter().any(|e| e.row == 0 && e.col == 2 && e.bgra[0] == 13),
             "最新（末个写入 13）应存活"
         );
+    }
+
+    /// 内存去冗余（worker 侧缓存条件化，纯逻辑零 pdfium）：GPU 门控（`gpu=true`）下
+    /// `finalize_render` **不写 raw 缓存**且 `bgra` **move 直传**（返回 == 入参原图，逐字节
+    /// 等值，无 clone 副本）；CPU 回退（`gpu=false`）照常写缓存 + 着色副本。条件只取决于
+    /// GPU/CPU 门控、不取决于当前 recolor 是否 Some：CPU 模式即使 recolor=None 也应保持缓存。
+    #[test]
+    fn finalize_render_gpu_skips_cache_and_cpu_writes_it() {
+        let raw = vec![7u8, 7, 7, 255];
+        let arg = |cache: &mut Vec<RawEntry>,
+                   bgra: Vec<u8>,
+                   recolor: Option<RecolorParams>,
+                   gpu: bool| {
+            finalize_render(
+                cache,
+                RawKind::Tile,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                16,
+                16,
+                1.0,
+                bgra,
+                recolor,
+                gpu,
+            )
+        };
+        let night = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
+
+        // GPU 门控：即使 recolor=Some 也不写缓存、不克隆，出口 == 原图逐字节等值。
+        let mut gpu_cache: Vec<RawEntry> = Vec::new();
+        let out = arg(&mut gpu_cache, raw.clone(), Some(night), true);
+        assert!(gpu_cache.is_empty(), "GPU 门控不应写 raw 缓存");
+        assert_eq!(out, raw, "GPU 出口应 move 直传原图（逐字节等值，无克隆副本）");
+
+        // CPU 门控：照常写缓存 + 着色副本；recolor=None 也应保持缓存（用户随时可切夜间，
+        // 缓存供 SetRecolor/RecolorRefresh 消费）。
+        let mut cpu_cache: Vec<RawEntry> = Vec::new();
+        let out_none = arg(&mut cpu_cache, raw.clone(), None, false);
+        assert_eq!(cpu_cache.len(), 1, "CPU 路径（recolor=None）也应写缓存");
+        assert_eq!(out_none, raw, "None 直通出口 = 原图");
+        let out_night = arg(&mut cpu_cache, raw.clone(), Some(night), false);
+        assert_ne!(out_night, raw, "CPU + Some 应着色（与未着色原图不同）");
+        assert_eq!(cpu_cache.len(), 1, "同密度同尺寸复用不新增条目");
     }
 }

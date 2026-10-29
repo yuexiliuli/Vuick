@@ -150,6 +150,24 @@ mod tests {
         }
     }
 
+    /// raw 缓存预算覆盖的测试守卫（对称于 `GpuGateGuard`）：构造时把预算压到极小（钉死
+    /// FIFO 挤出语义），Drop（含 panic）时还原。仅可在持 `pdf_lock` 时用。
+    struct RawBudgetGuard {
+        prev: u64,
+    }
+    impl RawBudgetGuard {
+        fn set(budget: u64) -> Self {
+            let prev = crate::pdf::parser::raw_cache_budget_override();
+            crate::pdf::parser::set_raw_cache_budget_for_test(budget);
+            RawBudgetGuard { prev }
+        }
+    }
+    impl Drop for RawBudgetGuard {
+        fn drop(&mut self) {
+            crate::pdf::parser::set_raw_cache_budget_for_test(self.prev);
+        }
+    }
+
     /// 曲线策略 latch 的测试覆盖守卫（对称于 `GpuGateGuard`）：构造时设为 `c`，Drop 还原
     /// 为 `prev`。仅可在持 `pdf_lock` 时用（与 gate 守卫同样的并发纪律）。
     struct CurveGuard {
@@ -3147,6 +3165,14 @@ mod tests {
             "门控开启时 recolor 不应改变显示像素（worker 跳过 CPU 着色）：{}",
             "亮/暗像素应保持未着色原图"
         );
+        // 内存去冗余（本线目标）：GPU 门控默认路径 worker 不写 raw 缓存（0 消费者，view
+        // 持原图、着色在绘制时 img().recolor 现算），缓存长度为 0；出口 move 直传原图
+        // （返回位图 == 原图，上文已字节等值断言）。
+        assert_eq!(
+            worker.raw_cache_len(doc_id),
+            0,
+            "GPU 门控路径不应驻留 worker raw 缓存（0 消费者，默认缓存冗余归零）"
+        );
 
         // 门控关闭：恢复既有 CPU 着色（回归不变式，与 dbd3236 一致）。
         crate::recolor::set_gpu_recolor_gate_for_test(false);
@@ -3159,6 +3185,10 @@ mod tests {
         assert!(
             cpu_out.bgra != raw.bgra,
             "门控关闭时 recolor 应照常 CPU 着色（与未着色原图不同）"
+        );
+        assert!(
+            worker.raw_cache_len(doc_id) > 0,
+            "CPU 回退路径应照常写入 raw 缓存（供 SetRecolor/RecolorRefresh 消费）"
         );
 
         worker.close(doc_id);
@@ -3289,10 +3319,13 @@ mod tests {
     /// 【可见集定义】「显示槽真实需要的页面内容」= 在位封面 + 在位瓦片（中清/缩略是快速
     /// 拖动瞬态占位、不参与；窗外 / 已淘汰但仍在 worker raw 缓存的条目不回传，保留 raw
     /// 单真值，滚回需要时再现算）。
-    /// 断言：切档后 worker 回传条目的 key **集合 == view 圈定的可见集 scope**（不多不少）；
-    /// 且 raw 缓存条目数（含滚动路过的毒页）> scope 数——证明旧「全缓存」路径会回传更多，
-    /// 新路径把「刷全部缓存」收敛为「只刷可见集」。首条回传 = 距当前可见中心最近页
-    /// （按近中心排序 → 首帧即首可视页）。切档 0 新栅格由
+    /// 断言：切档后 worker 回传条目的 key **集合 ⊆ view 圈定的可见集 scope**（只刷可见集，
+    /// 绝不越界发窗内容）+ 回传非空 + 切档 0 新栅格 —— 证明新路径把旧「刷全部缓存」收敛为
+    /// 「只刷可见集」。**48MB 预算语义**（`RAW_CACHE_BYTES` = 高倍可见集 3×封面 + 瓦片）：
+    /// FIFO 按最早写入回收最旧，滚动路过页/旧全页封面原图超出预算即被回收 → 不再断言
+    /// 「在位封面必全部回传」（96MB 时代的强保证，随预算收窄为「缓存内可见集原图必回传、
+    /// 不在缓存的可由后续交互重渲恢复」）。首条回传（若有）= 距当前可见中心最近页（按近
+    /// 中心排序 → 首帧即首可视页）。切档 0 新栅格另由
     /// `recolor_switch_sends_zero_raster_commands` 独证，此处另断言计数不变。
     #[gpui::test]
     async fn recolor_switch_refreshes_only_visible_set(cx: &mut gpui::TestAppContext) {
@@ -3344,7 +3377,7 @@ mod tests {
         }
         assert!(loaded, "应加载完成");
 
-        // 「毒页」：先滚到第 6 页停稳、再滚回第 0 页停稳——让 worker raw 缓存覆盖多页
+        // 「毒页」：先滚到第 3 页停稳、再滚回第 0 页停稳——让 worker raw 缓存覆盖多页
         // （滚动路过的页码），而 view 只显示回滚后的近窗口页 → 制造「全缓存 ≠ 可见集」。
         cx.update(|_w, cx| {
             holder
@@ -3352,7 +3385,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .update(cx, |v, cx| {
-                    v.scroll_to_page(6);
+                    v.scroll_to_page(3);
                     cx.notify();
                 });
         });
@@ -3459,7 +3492,8 @@ mod tests {
         assert_eq!(req1, req0, "切档 0 条新栅格命令（只刷可见集、不重栅）");
 
         // 核心不变量：**回传集合 ⊆ 可见集 scope**（窗外/已淘汰条目不回传——worker 只按
-        // view 圈定的可见集 key 现算回传，绝不越界发窗内容）。
+        // view 圈定的可见集 key 现算回传，绝不越界发窗内容）。这是「只刷可见集」的收敛证明，
+        // 无论缓存如何被 FIFO 回收都成立。
         let scope_set: std::collections::HashSet<(RawKind, usize, u32, u32)> =
             scope_keys.iter().copied().collect();
         let received_set: std::collections::HashSet<(RawKind, usize, u32, u32)> =
@@ -3470,20 +3504,18 @@ mod tests {
                 "回传条目 {k:?} 不在可见集 scope 内（只刷可见集被破坏）"
             );
         }
-        // 覆盖：所有在位封面应被回传（封面是可见页内容，worker raw 必在场）。
-        assert!(
-            scope_set
-                .iter()
-                .filter(|k| k.0 == RawKind::Cover)
-                .all(|k| received_set.contains(k)),
-            "在位封面应全部被回传（封面回传集合缺失）"
-        );
 
-        // 「全缓存 ≠ 可见集」：raw 缓存（含滚动路过的毒页）条目数 > 回传可见集条目数，
-        // 证明旧「刷全部缓存」路径会回传更多——新路径真正收敛到可见集。
+        // CPU 模式缓存仍在（48MB 预算下按 FIFO 回收最旧，但缓存非空、刷新确有回传——
+        // 回传证明 worker 对缓存的可见集原图现算着色副本的机制链路在 CPU 模式下完好）。
+        assert!(full_cache > 0, "CPU 模式 raw 缓存应非空");
+        assert!(!received.is_empty(), "CPU 模式重着色刷新应有回传条目");
+        // 「全缓存 ⊇ 可见集回传」：缓存持有多于刷新回传的残留条目（滚动路过的毒页/非可见
+        // 封面原图可留在缓存中不被回传）——证明刷新只消费可见集、不越界刷全缓存。48MB
+        // FIFO 预算下旧/非可见封面原图可能已被回收，故此处为「≥」而非原「>」——缓存计数
+        // 与回传计数都是预算相关的派生量，匹配新语义（见 [`config::pdf::RAW_CACHE_BYTES`]）。
         assert!(
-            full_cache > received_set.len(),
-            "raw 缓存应含毒页条目且多过可见集回传数: full={full_cache} received={}",
+            full_cache >= received_set.len(),
+            "raw 缓存应至少持有全部回传条目: full={full_cache} received={}",
             received_set.len()
         );
 
@@ -3494,6 +3526,157 @@ mod tests {
             scope_keys.first().map(|k| k.1),
             "先刷新距当前可见中心最近页"
         );
+    }
+
+    /// WARN-2 正向钉死（真实渲染路径 + 真夹具 + 极小预算）：**48MB 预算紧张下的部分刷新是
+    /// 预期行为**——把 raw 缓存预算压到 2MB（≈ 1 瓦片；整页封面 ~11MB 永不驻留），「首可视
+    /// 页封面（最早写入）被 FIFO 挤出」成为确定事实：切档刷新只回传**仍驻留缓存的可见集
+    /// 子集**（驻留瓦片按新参数重着色回传）、**被挤出的封面 key 不回传**、切档 0 新栅格、
+    /// 过程不崩（drained）——「部分刷新」不是缺陷（配套 WARN-1 注释）。
+    #[gpui::test]
+    async fn recolor_switch_partial_refresh_when_visible_cover_evicted(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+        use crate::pdf::parser::{RawKind, RecolorKey};
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let _budget = RawBudgetGuard::set(2 * 1024 * 1024);
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty()
+                    && v.pending_cover.is_empty()
+                    && v.pending_mid.is_empty()
+                    && v.pending_thumb.is_empty()
+                    && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+        let req0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).raster_reqs);
+        let full_cache = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            v.worker.as_ref().unwrap().raw_cache_len(v.doc_id)
+        });
+
+        // 切夜间（CPU 通道 → RecolorRefresh）→ 泵/帧推进到重着色刷新收完。
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.set_recolor(
+                        Some(RecolorParams {
+                            bg: [0x20, 0x20, 0x20],
+                            ink: Some([0xD8, 0xD8, 0xD8]),
+                        }),
+                        cx,
+                    );
+                });
+        });
+        let mut drained = false;
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            drained = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_recolor.is_none() && !v.tile_pump_running
+            });
+            if drained {
+                break;
+            }
+        }
+        assert!(drained, "重着色刷新应收完（部分刷新不崩）");
+
+        let (scope_keys, received, req1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let scope_keys: Vec<(RawKind, usize, u32, u32)> = v
+                .recolor_scope
+                .iter()
+                .map(|k: &RecolorKey| (k.kind, k.page, k.row, k.col))
+                .collect();
+            (scope_keys, v.recolor_received.clone(), v.raster_reqs)
+        });
+        let scope_set: std::collections::HashSet<(RawKind, usize, u32, u32)> =
+            scope_keys.iter().copied().collect();
+        let received_set: std::collections::HashSet<(RawKind, usize, u32, u32)> =
+            received.iter().copied().collect();
+        let scope_covers: Vec<_> = scope_keys
+            .iter()
+            .filter(|k| k.0 == RawKind::Cover)
+            .copied()
+            .collect();
+
+        // ① 可见集确实含在位封面（渲染到 slot 了），但其原图未被 2MB 预算留下。
+        assert!(!scope_covers.is_empty(), "可见集应含在位封面");
+        // ② 回传 ⊆ 仍驻留缓存的可见集子集（只刷可见集，绝不越界发窗内容）。
+        for k in &received {
+            assert!(
+                scope_set.contains(k),
+                "回传 {k:?} 不在可见集 scope 内（只刷可见集被破坏）"
+            );
+        }
+        // ③ 被 FIFO 挤出的封面 key 不回传（「部分刷新」的直接证据）。
+        for k in &scope_covers {
+            assert!(
+                !received_set.contains(k),
+                "被挤出的封面 {k:?} 不应回传（部分刷新：只回驻留原图）"
+            );
+        }
+        // ④ 部分刷新仍在发生：驻留的可见瓦片子集被重着色回传（非空）。
+        assert!(!received.is_empty(), "部分刷新应有回传（驻留瓦片重着色）");
+        // ⑤ 切档 0 新栅格（被挤出的封面不触发重栅，靠下一交互常规渲染恢复）。
+        assert_eq!(req1, req0, "切档 0 条新栅格命令（部分刷新不重栅）");
+        // ⑥ 极小预算自证：缓存条目被压缩到远小于正常加载（残留瓦片级）。
+        assert!(full_cache < 32, "2MB 预算下缓存条目应被压缩: full={full_cache}");
     }
 
     /// 时空基准（切档不重栅墙钟，真实渲染路径 + 真夹具）：测量「首屏停稳 → 切夜间 →
