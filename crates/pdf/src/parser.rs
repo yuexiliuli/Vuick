@@ -49,30 +49,38 @@ const PDFIUM_VERSIONED_NAME: &str = "pdfium-154.0.8035.0.dll";
 
 /// 内嵌的 pdfium 字节（仅当 `build.rs` 探测到 dll 存在时启用 `embed_pdfium` cfg）。
 ///
-/// 通过编译期 `include_bytes!` 把 dll 打包进可执行文件，实现**单文件分发**：
-/// 运行时把字节解出到临时目录再动态加载（Windows 的 `libloading` 必须从磁盘加载 dll，
-/// 无法直接内存加载）。若本机没有该 dll（未触发 `embed_pdfium`），则退化为仅磁盘查找。
+/// `build.rs` 已用 **zstd level 19** 压缩（6.9MiB→~2.9MiB），这里嵌入的是**压缩载荷**；
+/// 运行期由 [`extract_embedded_pdfium`] 一次性解压到临时目录再动态加载
+/// （Windows 的 `libloading` 必须从磁盘加载 dll，无法直接内存加载）。
+/// 若本机没有该 dll（未触发 `embed_pdfium`），则退化为仅磁盘查找。
 ///
-/// 路径由 `build.rs` 通过 `cargo:rustc-env=PDFIUM_DLL_PATH` 注入（指向
-/// `resources/pdfium/pdfium-<版本>.dll`）。
+/// 路径由 `build.rs` 通过 `cargo:rustc-env=PDFIUM_ZST_PATH` 注入（指向 OUT_DIR 内压缩中间文件）。
 #[cfg(embed_pdfium)]
-const EMBEDDED_PDFIUM: &[u8] = include_bytes!(env!("PDFIUM_DLL_PATH"));
+const EMBEDDED_PDFIUM: &[u8] = include_bytes!(env!("PDFIUM_ZST_PATH"));
+
+/// 原始（未压缩）dll 字节数，由 `build.rs` 注入：运行期解压的容量预算与临时文件复用判据。
+#[cfg(embed_pdfium)]
+static PDFIUM_RAW_SIZE: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env!("PDFIUM_RAW_SIZE").parse::<usize>().unwrap());
 
 /// 在临时目录解出内嵌的 pdfium 并返回其路径。
 ///
 /// 文件命名为 `gpui-editor/pdfium-<版本>.dll`（仅首次写入；内容与 `include_bytes!`
-/// 一致时直接复用，退出后由临时目录清理，不污染项目目录）。
+/// 解压后一致时直接复用，退出后由临时目录清理，不污染项目目录）。
 #[cfg(embed_pdfium)]
 fn extract_embedded_pdfium() -> PathBuf {
     let dir = std::env::temp_dir().join("gpui-editor");
     let path = dir.join(PDFIUM_VERSIONED_NAME);
-    // 已存在且长度一致 → 直接复用（避免每次启动重写 7MB；长度校验足够，跨版本名唯一）
-    let reuse = path.is_file() && path.metadata().map(|m| m.len() as usize).unwrap_or(0) == EMBEDDED_PDFIUM.len();
+    // 已存在且长度等于原始 dll 大小 → 直接复用（避免每次启动重解压 ~3MB writes；跨版本名唯一）
+    let reuse = path.is_file()
+        && path.metadata().map(|m| m.len() as usize).unwrap_or(0) == *PDFIUM_RAW_SIZE;
     if reuse {
         return path;
     }
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(&path, EMBEDDED_PDFIUM);
+    let raw = zstd::bulk::decompress(EMBEDDED_PDFIUM, *PDFIUM_RAW_SIZE)
+        .expect("解压内嵌 pdfium 失败");
+    let _ = std::fs::write(&path, raw);
     path
 }
 
@@ -1889,32 +1897,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 校验内嵌 byte 确实是有效 PE 可执行（`MZ` + `PE\0\0`）。
-    /// 若磁盘上的 dll 仍在，再确认内嵌与磁盘一致（embed 来源正确）。
+    /// 校验内嵌的 **zstd 压缩载荷** 能解压回有效 PE 可执行（`MZ` + `PE\0\0`）。
+    /// 若磁盘上的 dll 仍在，再确认解压后与磁盘一致（embed 来源正确）。
     /// 不触碰 pdfium（无需串行锁）。
     #[test]
     fn embedded_pdfium_is_valid_pe_and_matches_disk() {
         #[cfg(embed_pdfium)]
         {
-            let bytes = EMBEDDED_PDFIUM;
+            let raw = zstd::bulk::decompress(EMBEDDED_PDFIUM, *PDFIUM_RAW_SIZE)
+                .expect("内嵌压缩载荷应能解压");
+            assert_eq!(raw.len(), *PDFIUM_RAW_SIZE, "解压长度应与原始 dll 一致");
             // PE 校验：MZ 头 + e_lfanew(0x3C) → 指向 "PE\0\0"
-            assert_eq!(&bytes[..2], b"MZ", "内嵌 pdfium 应以 MZ 开头");
-            let pe_off = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
+            assert_eq!(&raw[..2], b"MZ", "解压出的 pdfium 应以 MZ 开头");
+            let pe_off = u32::from_le_bytes(raw[0x3C..0x40].try_into().unwrap()) as usize;
             assert_eq!(
-                &bytes[pe_off..pe_off + 4],
+                &raw[pe_off..pe_off + 4],
                 b"PE\x00\x00",
                 "MZ 头应指向合法 PE 签名"
             );
-            // 若磁盘 dll 尚在（build.rs 注入的是编译期路径），比对一致性
-            if let Ok(disk) = std::fs::read(env!("PDFIUM_DLL_PATH")) {
-                assert_eq!(bytes.len(), disk.len(), "内嵌与磁盘长度应一致");
-                assert_eq!(bytes[..16], disk[..16], "内嵌与磁盘头部应一致");
+            assert!(EMBEDDED_PDFIUM.len() < raw.len(), "内嵌应存压缩载荷而非原始 dll");
+            // 若磁盘 dll 尚在（development 树 resources/pdfium/），比对一致性
+            let disk_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../resources/pdfium")
+                .join(PDFIUM_VERSIONED_NAME);
+            if let Ok(disk) = std::fs::read(&disk_path) {
+                assert_eq!(raw.len(), disk.len(), "解压与磁盘长度应一致");
+                assert_eq!(raw[..16], disk[..16], "解压与磁盘头部应一致");
             }
         }
         // 非 embed 配置下该测试无意义——直接通过（无断言）
     }
 
-    /// 内嵌字节能正确解出到临时目录并返回存在的文件路径。
+    /// 内嵌的压缩字节能正确解压、解出到临时目录并返回存在的文件路径。
     ///
     /// 注意：**不清理**解出的文件——pdf 测试并行跑，别的测试（worker_renders_* /
     /// parses_all）可能正并发复用同一个临时 dll；此处清理会让它们读盘时文件已消失。
@@ -1925,7 +1939,7 @@ mod tests {
         let path = extract_embedded_pdfium();
         assert!(path.is_file(), "解出的 dll 文件应存在: {}", path.display());
         let written = std::fs::read(&path).expect("应能读回解出的 dll");
-        assert_eq!(written.len(), EMBEDDED_PDFIUM.len(), "解出内容长度应一致");
+        assert_eq!(written.len(), *PDFIUM_RAW_SIZE, "解出内容长度应等于原始 dll 大小");
         assert_eq!(&written[..2], b"MZ", "解出文件应以 MZ 开头");
     }
 

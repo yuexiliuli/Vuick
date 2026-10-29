@@ -3284,6 +3284,7 @@ dependencies = [
  "ui",
  "viewer",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]

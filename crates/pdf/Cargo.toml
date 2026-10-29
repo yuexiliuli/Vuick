@@ -11,10 +11,14 @@ gpui = { workspace = true }
 pdfium-render = { workspace = true }
 image = { workspace = true }
 anyhow = { workspace = true }
+zstd = { workspace = true }
 config = { path = "../config" }
 base = { path = "../base" }
 ui = { path = "../ui" }
 viewer = { path = "../viewer" }
+
+[build-dependencies]
+zstd = { workspace = true }
 
 # Windows 实时硬件键探测（Ctrl+滚轮缩放兜底）：gpui 事件/window 修饰键在真机恒 false
 # （GetKeyState 线程消息队列态带不出），用 GetAsyncKeyState(VK_CONTROL) 读实时硬件态。

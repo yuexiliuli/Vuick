@@ -209,7 +209,7 @@ pwsh scripts/package.ps1
   Windows 10/11 系统自带，无需打包；对方是精简版 / 旧版系统缺 `VCRUNTIME140.dll` 时，安装
   「Microsoft Visual C++ 2015–2022 Redistributable (x64)」即可；
 - DLL 须与编译期是**同一个** FFmpeg 构建（脚本直接从 `FFMPEG_DIR\bin` 取，版本号一致，不会 ABI 错位）；
-- **PDF 无需额外分发**：pdfium dll 构建时已内嵌进 exe（`embed_pdfium`），运行时自动解出。
+- **PDF 无需额外分发**：pdfium dll 构建时经 zstd-19 压缩（6.9MiB→~2.9MiB）后内嵌进 exe（`embed_pdfium`），运行时一次性解压到临时目录再自动加载。
 
 ## 用户偏好（配置文件）
 

@@ -95,6 +95,9 @@ ropey = { version = "=2.0.0-beta.1", features = [
 ] }
 # PDF 栅格化用 native pdfium
 pdfium-render = "0.9.3"
+# pdfium dll 体积剪枝：build.rs 用 zstd level 19 压缩内嵌载荷（6.9MiB→2.9MiB），运行期一次性解压。
+# 许可 BSD-3-Clause/MIT（zstd），构建期编译自带 C 源（cc + MSVC，与 ffmpeg-sys-next 同工具链）。
+zstd = "0.13"
 image = { version = "0.25", features = ["webp"] }
 # LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = "0.1"
