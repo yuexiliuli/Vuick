@@ -67,7 +67,7 @@ fn pdf_bg_custom_item(app: gpui::Entity<EditorApp>) -> PopupMenuItem {
 }
 
 /// 「背景色」右侧的 **返回项**：点击换回上一级菜单（`PopupMenuItem::back`，不关闭）。
-/// 已随 flyout 改造休眠：真悬浮路径 hover 离开即收起、无需返回项（保留源码作备用）。
+/// 已随 flyout 改造休眠：真悬浮路径下附属于次级菜单、无需返回项（保留源码作备用）。
 #[allow(dead_code)]
 fn pdf_bg_back_item() -> PopupMenuItem {
     PopupMenuItem::element(|_, _| {
@@ -134,7 +134,8 @@ impl EditorApp {
             pdf.update(cx, |v, cx| v.select_image(page, obj, cx));
         }
         // 背景色二级子列表（默认/夜间/护眼/羊皮纸/自定义）：悬停「背景色」→ 次级菜单在
-        // 父菜单右侧自动展开（真悬浮 flyout，父项保持可见；无「返回」项，hover 离开即收起）。
+        // 父菜单右侧自动展开（真悬浮 flyout，父项保持可见；无「返回」项，次级一旦展开即持久，
+        // 移入次级面板/间隙或途中驻留不收起，直到移到其它选项 / Esc / 点外才变化）。
         let fly_items: Vec<PopupMenuItem> = vec![
             pdf_bg_preset_item("默认", PdfBgPref::Default, "pdf-menu-bg-default", app.clone()),
             pdf_bg_preset_item("夜间", PdfBgPref::Night, "pdf-menu-bg-night", app.clone()),

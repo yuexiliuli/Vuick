@@ -374,13 +374,17 @@ pub struct PopupMenu {
     /// （[`PopupMenuItem::back`]）时弹栈换回。只存一层深度通常够用，栈式可嵌套扩展。
     /// Dormancy：已被 [`PopupMenuItem::flyout`] 真悬浮路径取代，暂留作备用。
     sub_stack: Vec<Vec<PopupMenuItem>>,
-    /// 真悬浮二级菜单：当前展开 flyout 的**根项下标**（悬停带 flyout 的根项时置位）。
-    /// 渲染时按「双源」派生是否真正展开：根行悬停（`selected_index`）或次级面板内
-    /// 任一子项悬停（`flyout_selected`）/ 面板悬停（`flyout_panel_hover`）任一为真。
+    /// 真悬浮二级菜单：当前展开的**根项下标**（悬停/键盘选中带 flyout 的根项，或 Enter
+    /// 激活时置位）。**持久化语义（2026-10 修订）**：一旦置位即保持展开——从根项移开进入
+    /// 间隙/空白/次级面板都不会自动关闭（修复「慢速穿越间隙时次级先消失」竞态，见行为表）。
+    /// 仅由四种情况改变：悬停/选中**另一个带 flyout 的根项**（切换下标）、**另一个无 flyout
+    /// 的根项**（关闭）、Esc（先关次级）、整链 dismiss（全清）。
     open_flyout: Option<usize>,
-    /// 次级菜单内当前悬停子项下标（面板内子项高亮 + 兼作保持展开的「armed」源）。
+    /// 次级菜单内当前悬停子项下标（面板内子项高亮；点击命中守卫 `on_mouse_down_out` 用）。
+    /// 不再是「保持展开」的来源——展开与否由持久化的 `open_flyout` 决定。
     flyout_selected: Option<usize>,
-    /// 指针是否在次级菜单**面板**内（覆盖子项间隙/边距，防「根行 → 次级菜单」途中误关）。
+    /// 指针是否在次级菜单**面板**内（覆盖子项间隙/边距）：点击守卫 `on_mouse_down_out`
+    /// 据此放行「点次级面板预设不误关整链」。同样不再是「保持展开」的来源。
     flyout_panel_hover: bool,
     /// 父菜单在窗口中的**请求锚点**（左上角；宿主打开右键菜单时写入，见
     /// [`Self::set_parent_pos`]）。flyout 的窗口边缘空间适配据此 + 窗口尺寸用**常量估算**
@@ -606,6 +610,9 @@ impl PopupMenu {
     fn set_selected(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_index != Some(ix) {
             self.selected_index = Some(ix);
+            // 键盘 ↑↓ 移到另一个根项：镜像悬停语义（移到带 flyout 项 → 切/开次级，
+            // 移到普通项 → 关次级）——「移动到其他选项」规则对键盘路径同样成立。
+            self.root_govern_flyout(ix);
             cx.notify();
         }
     }
@@ -649,16 +656,38 @@ impl PopupMenu {
         }
     }
 
-    /// 次级菜单是否**当前可见**（双源派生：根行悬停 OR 次级面板悬停其一为真）。
-    /// 与 `Render` 用同一谓词，保证 Esc 优先级与可见态一致。
+    /// 次级菜单是否**当前可见**：`open_flyout` 持久化后，只要「已置位 + 下标仍指向带 flyout
+    /// 的根项」即为可见——不再要求根行/次级面板悬停源，因此指针停在根项与次级之间的
+    /// 间隙/空白时次级保持展开（慢速穿越不丢）。与 `Render` 用同一谓词，保证 Esc 优先级
+    /// 与可见态一致。
     fn flyout_visible(&self) -> bool {
         self.open_flyout.is_some_and(|ix| {
             self.menu_items.get(ix).is_some_and(|it| {
                 matches!(it, PopupMenuItem::ElementItem { flyout: Some(_), .. })
-            }) && (self.selected_index == Some(ix)
-                || self.flyout_selected.is_some()
-                || self.flyout_panel_hover)
+            })
         })
+    }
+
+    /// 根项被悬停/键盘选中时的次级开/关治理（鼠标与键盘共用同一语义，见行为表）：
+    /// 带 flyout 的根项 → 展开/切换为其次级（并清掉上一 flyout 的子项 armed 态，避免
+    /// 新旧二次级高亮/点击守卫残留）；不带 flyout 的根项（= 普通选项）→ 关闭次级
+    /// （「移动到其他选项」）。不改动 `selected_index`（高亮由调用方管理）。
+    fn root_govern_flyout(&mut self, ix: usize) {
+        let has_flyout = self.menu_items.get(ix).is_some_and(|it| {
+            matches!(it, PopupMenuItem::ElementItem { flyout: Some(_), .. })
+        });
+        if has_flyout {
+            self.flyout_selected = None;
+            self.flyout_panel_hover = false;
+            self.open_flyout = Some(ix);
+        } else {
+            // 关闭次级时**同步清 armed**（子项高亮/点击守卫）：否则关闭后残留
+            // flyout_selected/panel_hover 会让下一次「点面板外」被守卫误拦、菜单关不掉
+            // （键盘关次级/指针仍在原次级位置立即点击的边界路径）。与 Esc 分支同款清法。
+            self.open_flyout = None;
+            self.flyout_selected = None;
+            self.flyout_panel_hover = false;
+        }
     }
 
     fn on_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -698,7 +727,9 @@ impl PopupMenu {
         // 单层菜单 + flyout：任何「根面板外」按下都关闭整链——但**次级面板内**的按下除外
         // （flyout 子项自身处理点击；根面板 `contains` 不含被平移出的次级面板，需按悬停态
         // 放行，否则点次级面板预设会被当成「面板外」误关整菜单）。
-        if self.flyout_selected.is_some() || self.flyout_panel_hover {
+        // 放行以「次级当前**可见** 且 指针 armed 在次级上」为前提（双保险）：次级已关闭
+        // 时即使 armed 残留也照常整链关闭，杜绝「关掉次级后点空白不关」的边界。
+        if self.flyout_visible() && (self.flyout_selected.is_some() || self.flyout_panel_hover) {
             return;
         }
         let _ = e;
@@ -755,36 +786,24 @@ impl PopupMenu {
                             .on_hover(cx.listener(move |this, hovered, _, cx| {
                                 if *hovered {
                                     if is_flyout {
-                                        // 次级菜单子项：悬停即 armed（保持展开的「第二源」，
-                                        // 与根行悬停并存 → 从根行移进次级菜单途中不被误关）。
+                                        // 次级菜单子项：悬停即高亮（面板内 armed）。持久化后
+                                        // 展开与否不再依赖它——它只负责高亮与点击守卫。
                                         this.flyout_selected = Some(ix);
                                     } else {
+                                        // 根项：悬停即高亮；次级开/关由「根项本身是否带 flyout」
+                                        // 决定（切/开或关），与「悬停后是否离开」解耦 → 移开进
+                                        // 间隙/空白不再误关次级（本轮核心修复）。
                                         this.selected_index = Some(ix);
-                                        // 带 flyout 的根项悬停 → 展开其 flyout；普通项 → 关闭已展开的。
-                                        let has_flyout = this.menu_items.get(ix).is_some_and(
-                                            |it| {
-                                                matches!(
-                                                    it,
-                                                    PopupMenuItem::ElementItem {
-                                                        flyout: Some(_),
-                                                        ..
-                                                    }
-                                                )
-                                            },
-                                        );
-                                        if has_flyout {
-                                            this.flyout_selected = None;
-                                            this.flyout_panel_hover = false;
-                                            this.open_flyout = Some(ix);
-                                        } else {
-                                            this.open_flyout = None;
-                                        }
+                                        this.root_govern_flyout(ix);
                                     }
                                 } else if is_flyout {
+                                    // 次级子项移开：只清子项高亮，不动 open_flyout（面板保持）。
                                     if this.flyout_selected == Some(ix) {
                                         this.flyout_selected = None;
                                     }
                                 } else if this.selected_index == Some(ix) {
+                                    // 根项移开：只清高亮，**不关次级**——间隙/空白/途中驻留时
+                                    // 次级保持（用户规则：没移动到其他选项就不会自动消失）。
                                     this.selected_index = None;
                                 }
                                 cx.notify();
@@ -843,7 +862,8 @@ impl Render for PopupMenu {
         let items_count = self.menu_items.len();
         let selected = self.selected_index;
 
-        // 次级菜单是否展开：双源派生（根行悬停 OR 次级面板内悬停其一为真）。
+        // 次级菜单是否展开：open_flyout 持久化（一旦展开保持——间隙/空白驻留不关；悬停/
+        // 选中普通根项、Esc 或整链 dismiss 才变化）。
         let flyout_ix = self
             .open_flyout
             .filter(|_| self.flyout_visible());
@@ -1691,6 +1711,125 @@ mod tests {
         hover_center(cx, "root-insert");
         assert!(cx.debug_bounds("menu-flyout").is_none(), "悬停普通项应关闭次级");
         assert!(cx.debug_bounds("root-bg").is_some(), "父项保持在场");
+    }
+
+    /// 慢速穿越回归（用户反馈核心）：打开次级后把指针移到「根项行之间的空隙 / 父面板空白」
+    /// 驻留 ≥10 帧，次级**必须保持展开**——旧实现根项 hover 离开即清 selected_index、
+    /// flyout_visible 双源全灭 → 次级在鼠标到达前消失；本轮 open_flyout 持久化后不丢。
+    #[gpui::test]
+    fn flyout_persists_while_pointer_dwells_in_gap(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (cx, _, _) = flyout_harness(cx);
+        hover_center(cx, "root-bg");
+        assert!(cx.debug_bounds("menu-flyout").is_some(), "悬停背景色应展开次级");
+
+        // 取「背景色行」与「插入项行」之间的行间空隙中点（父面板内、不落在任何根项上，
+        // x 在次级面板左侧）——真实慢速穿越最常驻留的位置。
+        let row1 = cx.debug_bounds("menu-item-1").expect("背景色行应在场");
+        let row2 = cx.debug_bounds("menu-item-2").expect("插入项行应在场");
+        assert!(row1.bottom() < row2.top(), "行间应有空隙（rows {row1:?} / {row2:?}）");
+        let gap = gpui::point(
+            row1.left() + px(20.),
+            row1.bottom() + (row2.top() - row1.bottom()) * 0.5,
+        );
+        cx.simulate_mouse_move(gap, None, Modifiers::default());
+        cx.run_until_parked();
+
+        // 驻留 ≥10 帧（模拟慢速移动在途中停留——旧实现此刻次级已消失）。
+        for _ in 0..10 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert!(
+            cx.debug_bounds("menu-flyout").is_some(),
+            "间隙/空白驻留 ≥10 帧次级应保持展开（慢速穿越不丢）"
+        );
+        assert!(cx.debug_bounds("flyout-a").is_some(), "次级子项应仍在场");
+        assert!(cx.debug_bounds("root-bg").is_some(), "父项仍在场");
+
+        // 从间隙移到无 flyout 的普通根项 → 关闭次级（行为表：「移动到其他选项」）。
+        hover_center(cx, "root-insert");
+        assert!(cx.debug_bounds("menu-flyout").is_none(), "移到普通根项应关闭次级");
+    }
+
+    /// 悬停到**另一个带 flyout 的根项** → 次级**切换**为该根项的子列表（旧 A 关、新 B 开）；
+    /// 再悬停普通根项 → 关闭。构造双 flyout 根项菜单验证行为表的「切换」行。
+    #[gpui::test]
+    fn flyout_switches_between_flyout_roots(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let dismisses = Rc::new(Cell::new(0usize));
+        let (_, cx) = cx.add_window_view({
+            let dismisses = dismisses.clone();
+            move |window, cx| {
+                let sub_a = vec![
+                    PopupMenuItem::element(|_, _| {
+                        div().debug_selector(|| "fly-a1".into()).child("默认").into_any_element()
+                    })
+                    .keep_open()
+                    .on_click(|_, _, _| {}),
+                    PopupMenuItem::element(|_, _| {
+                        div().debug_selector(|| "fly-a2".into()).child("夜间").into_any_element()
+                    })
+                    .keep_open()
+                    .on_click(|_, _, _| {}),
+                ];
+                let sub_b = vec![PopupMenuItem::element(|_, _| {
+                    div().debug_selector(|| "fly-b1".into()).child("形状一").into_any_element()
+                })
+                .keep_open()
+                .on_click(|_, _, _| {})];
+                let menu = PopupMenu::build(window, cx, |menu, _w, _cx| {
+                    menu.item(
+                        PopupMenuItem::element(|_, _| {
+                            div().debug_selector(|| "root-bg".into()).child("背景色").into_any_element()
+                        })
+                        .flyout(sub_a),
+                    )
+                    .item(
+                        PopupMenuItem::element(|_, _| {
+                            div().debug_selector(|| "root-shape".into()).child("形状").into_any_element()
+                        })
+                        .flyout(sub_b),
+                    )
+                    .item(
+                        PopupMenuItem::element(|_, _| {
+                            div().debug_selector(|| "root-insert".into()).child("插入项").into_any_element()
+                        })
+                        .on_click(|_, _, _| {}),
+                    )
+                });
+                menu.read(cx).focus_handle(cx).focus(window, cx);
+                menu.update(cx, |m, _| m.set_parent_pos(point(px(0.), px(0.))));
+                let d = dismisses.clone();
+                window
+                    .subscribe(&menu, cx, move |_, _: &DismissEvent, _, _| {
+                        d.set(d.get() + 1);
+                    })
+                    .detach();
+                MenuHost { menu }
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // 悬停背景色 → A 次级展开，B 不在场。
+        hover_center(cx, "root-bg");
+        assert!(cx.debug_bounds("menu-flyout").is_some(), "悬停背景色应展开次级");
+        assert!(cx.debug_bounds("fly-a1").is_some(), "A 次级应在场");
+        assert!(cx.debug_bounds("fly-b1").is_none(), "B 次级不应在场");
+
+        // 悬停另一个带 flyout 的根项 → 次级**切换**为 B（A 关、B 开）。
+        hover_center(cx, "root-shape");
+        assert!(cx.debug_bounds("fly-b1").is_some(), "悬停形状应切换为 B 次级");
+        assert!(cx.debug_bounds("fly-a1").is_none(), "切走后 A 次级应关闭");
+
+        // 切回背景色 → 恢复 A。
+        hover_center(cx, "root-bg");
+        assert!(cx.debug_bounds("fly-a1").is_some(), "切回背景色应恢复 A 次级");
+        assert!(cx.debug_bounds("fly-b1").is_none(), "B 次级应关闭");
+
+        // 悬停普通根项 → 关闭次级（行为表：移动到其他选项）；仅悬停不触发整链 dismiss。
+        hover_center(cx, "root-insert");
+        assert!(cx.debug_bounds("menu-flyout").is_none(), "悬停普通根项应关闭次级");
+        assert_eq!(dismisses.get(), 0, "仅悬停移动不应触发整链 dismiss");
     }
 
     /// 几何：次级菜单顶部 ≈ 背景色行顶部；左缘 ≈ 父菜单右缘（容差 FLYOUT_GEOM_TOL 内）。
