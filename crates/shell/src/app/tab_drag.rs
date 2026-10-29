@@ -218,7 +218,8 @@ impl EditorApp {
         // 无需再喂 MarkdownPreview（该后端已删除）。
         match self.tabs[idx].reader.clone() {
             MediaReader::Pdf(pdf) => {
-                pdf.update(cx, |view, _| view.set_background(canvas_bg));
+                // PDF 画布底色按当前偏好恢复（默认跟随主题；显式档保持冻结色）。
+                self.apply_pdf_background(&pdf, cx);
                 // PDF 订阅随选项卡重建（换位后订阅跟 tab 走；多 PDF 并存各自独立）
                 self.subscribe_pdf(idx, &pdf, cx);
             }

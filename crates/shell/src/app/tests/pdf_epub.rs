@@ -643,10 +643,18 @@
         };
 
         // 不假设初始明暗（测试环境可能亮也可能暗）：记录打开时的背景。
-        let pdf0 = reader_bg(cx, i_pdf).expect("PDF 打开应有画布背景");
+        // PDF 默认档（pdf_bg=Default）打开不存显式画布色——bg=None，render 经
+        // default_canvas（= 当前主题 window_bg，open.rs render）跟随主题；图片/视频仍存
+        // 快照 Some(window_bg)。PDF 显式色跟随/冻结语义由 tests/pdf_bg.rs 覆盖。
+        let pdf0_stored = reader_bg(cx, i_pdf);
+        assert!(
+            pdf0_stored.is_none(),
+            "PDF 默认档打开不存显式画布色（跟随主题走 render 层 default_canvas）"
+        );
         let img0 = reader_bg(cx, i_img).expect("图片打开应有画布背景");
+        let bg0: gpui::Hsla = cx.update(|_w, cx| app.read(cx).window_bg());
 
-        // 切到另一主题（真路径 refresh_theme_ui）→ 阅读器背景同步翻转（背景赋值在
+        // 切到另一主题（真路径 refresh_theme_ui）→ 图片背景同步翻转（背景赋值在
         // refresh_theme_ui 内同步完成，无需 pump 渲染即可读）。回归点：曾漏刷非 PDF 阅读器。
         cx.update(|_w, cx| {
             app.update(cx, |a, cx| {
@@ -656,11 +664,15 @@
             });
         });
         let toggled_bg: gpui::Hsla = cx.update(|_w, cx| app.read(cx).window_bg());
-        assert_ne!(pdf0, toggled_bg, "翻转明暗后 window_bg 应变化（测试前提）");
-        assert_eq!(reader_bg(cx, i_pdf), Some(toggled_bg), "PDF 背景应随主题翻转");
+        assert_ne!(bg0, toggled_bg, "翻转明暗后 window_bg 应变化（测试前提）");
+        assert_eq!(
+            reader_bg(cx, i_pdf),
+            None,
+            "PDF 默认档切主题存储仍 None（渲染色经 default_canvas 跟随主题）"
+        );
         assert_eq!(reader_bg(cx, i_img), Some(toggled_bg), "图片背景应随主题翻转（回归）");
 
-        // 切回 → 阅读器背景还原到打开时值。
+        // 切回 → 图片背景还原到打开时值；PDF 默认档仍 None。
         cx.update(|_w, cx| {
             app.update(cx, |a, cx| {
                 a.dark_mode = !a.dark_mode;
@@ -668,7 +680,7 @@
                 cx.notify();
             });
         });
-        assert_eq!(reader_bg(cx, i_pdf), Some(pdf0), "还原后 PDF 背景应回初值");
+        assert_eq!(reader_bg(cx, i_pdf), None, "还原后 PDF 默认档仍 None");
         assert_eq!(reader_bg(cx, i_img), Some(img0), "还原后图片背景应回初值");
         let _ = std::fs::remove_dir_all(&dir);
     }

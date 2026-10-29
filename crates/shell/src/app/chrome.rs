@@ -181,10 +181,14 @@ impl EditorApp {
             match &tab.reader {
                 MediaReader::Pdf(pdf) => {
                     let pv = pdf.clone();
-                    pv.update(cx, |view, cx| {
-                        view.set_background(canvas_bg);
-                        cx.notify();
-                    });
+                    // R6 守卫：PDF 画布背景**显式设置过**（非「默认」）→ 主题切换不得覆盖
+                    // 画布色；仅「默认」档才跟随主题（回落 default_canvas = 新主题 window_bg）。
+                    if self.pdf_bg == PdfBgPref::Default {
+                        pv.update(cx, |view, cx| {
+                            view.clear_background();
+                            cx.notify();
+                        });
+                    }
                 }
                 MediaReader::Image(img) => {
                     let iv = img.clone();
@@ -255,6 +259,9 @@ impl EditorApp {
             music_volume: existing.music_volume,
             music_last_track: existing.music_last_track,
             music_progress_secs: existing.music_progress_secs,
+            // PDF 画布背景偏好随其它偏好一并落盘（否则一次字号/主题保存就把它重置回默认）。
+            pdf_bg: self.pdf_bg,
+            pdf_bg_custom: self.pdf_bg_custom.clone(),
         }
     }
 

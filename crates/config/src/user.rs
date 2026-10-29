@@ -64,6 +64,47 @@ impl ThemePref {
     }
 }
 
+/// PDF 阅读器画布背景预设（字符串标识写入 JSON，见 [`PdfBgPref::as_str`]）。
+/// 只改**画布**（页面四周壁纸色），绝不动 PDF 位图/文件本身。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PdfBgPref {
+    /// 跟随主题（默认）：画布取当前主题 `window_bg`，切主题随之变化。
+    #[default]
+    Default,
+    /// 夜间深色（#202020）。
+    Night,
+    /// 护眼豆沙绿（#C7EDCC）。
+    Eye,
+    /// 羊皮纸（#FBF0D9）。
+    Parchment,
+    /// 自定义（颜色取 [`UserPrefs::pdf_bg_custom`] 的 `#rrggbb`；非法值应用层回退默认）。
+    Custom,
+}
+
+impl PdfBgPref {
+    /// 写盘用的紧凑标识。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PdfBgPref::Default => "default",
+            PdfBgPref::Night => "night",
+            PdfBgPref::Eye => "eye",
+            PdfBgPref::Parchment => "parchment",
+            PdfBgPref::Custom => "custom",
+        }
+    }
+
+    /// 从字符串解析（未知值 / 缺省回退跟随主题）。
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "night" => PdfBgPref::Night,
+            "eye" => PdfBgPref::Eye,
+            "parchment" => PdfBgPref::Parchment,
+            "custom" => PdfBgPref::Custom,
+            _ => PdfBgPref::Default,
+        }
+    }
+}
+
 /// 用户偏好（所有字段可缺省，`load` 时逐字段回退）。
 /// 注意：不再派生 `Copy`——`opened_folder` 为 `Option<String>` 非 Copy 类型；
 /// 全仓已核对无代码依赖 `UserPrefs` 的复制语义（只有 `load`/构造/按字段读取）。
@@ -109,6 +150,10 @@ pub struct UserPrefs {
     pub music_last_track: Option<String>,
     /// 上次播放位置（秒；随 [`UserPrefs::music_last_track`] 一起恢复；`None` = 从头起）。
     pub music_progress_secs: Option<f64>,
+    /// PDF 阅读画布背景预设（`default` 跟随主题；显式预设/自定义后主题切换不再覆盖）。
+    pub pdf_bg: PdfBgPref,
+    /// PDF 自定义画布底色（`#rrggbb`；仅 `pdf_bg == Custom` 时消费；非法值应用层回退默认）。
+    pub pdf_bg_custom: Option<String>,
 }
 
 /// A3 进程级偏好缓存：键 = 配置路径 + 文件元数据（mtime+len）。`load` 首访读盘并缓存；
@@ -230,6 +275,12 @@ impl UserPrefs {
         if let Some(Value::Number(n)) = map.get("music_progress_secs") {
             prefs.music_progress_secs = n.as_f64();
         }
+        // PDF 画布背景：`pdf_bg` 字符串标识（未知 / 缺省回退跟随主题）；
+        // `pdf_bg_custom` 仅 `#rrggbb` 合法（格式非法 → None，应用层再兜底回退默认）。
+        if let Some(Value::String(s)) = map.get("pdf_bg") {
+            prefs.pdf_bg = PdfBgPref::from_str(s);
+        }
+        prefs.pdf_bg_custom = Self::read_hex_color(map, "pdf_bg_custom");
         // 媒体窗口记录尺寸（音乐/视频分开）：数组 `[w, h]`；缺省 / 非数组 / 非两个数 /
         // NaN / 负 / 零 / ∞ 一律回退 None（安全护栏）。
         prefs.music_window_size = Self::read_size_tuple(map, "music_window_size");
@@ -270,6 +321,25 @@ impl UserPrefs {
             .collect()
     }
 
+    /// 从 JSON 对象里读「自定义画布底色」（`#rrggbb`，见 [`UserPrefs::from_json_value`]）：
+    /// 非字符串 / 格式非法（非 `#`+6 个十六进制位）→ `None`（安全护栏，防手改配置）。
+    fn read_hex_color(map: &Map<String, Value>, key: &str) -> Option<String> {
+        let Value::String(s) = map.get(key)? else {
+            return None;
+        };
+        let s = s.trim();
+        if Self::is_valid_hex_color(s) {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// `#rrggbb` 格式校验（`r/g/b` 为十六进制位，大小写均可）。
+    fn is_valid_hex_color(s: &str) -> bool {
+        s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
     /// 序列化成 JSON 对象（纯函数，供 `save`、「导出设置」与测试使用）。
     pub fn to_json_value(&self) -> Value {
         json!({
@@ -290,6 +360,8 @@ impl UserPrefs {
             "music_volume": self.music_volume,
             "music_last_track": self.music_last_track,
             "music_progress_secs": self.music_progress_secs,
+            "pdf_bg": self.pdf_bg.as_str(),
+            "pdf_bg_custom": self.pdf_bg_custom,
         })
     }
 
@@ -397,6 +469,8 @@ mod tests {
             music_volume: None,
             music_last_track: None,
             music_progress_secs: None,
+            pdf_bg: PdfBgPref::default(),
+            pdf_bg_custom: None,
         };
         let back = UserPrefs::from_json_value(&p.to_json_value());
         assert_eq!(back.session_restore, Some(false));
@@ -731,5 +805,77 @@ mod tests {
         let back = UserPrefs::from_json_value(&Value::Null);
         assert_eq!(back.music_dir, None);
         assert!(back.music_liked.is_empty());
+    }
+
+    /// PDF 画布背景两字段 roundtrip：pdf_bg（default 缺省；预设/自定义 roundtrip 保留，
+    /// 未知值回退 default）+ pdf_bg_custom（`#rrggbb` 保留、大小写均可；格式非法 /
+    /// 非字符串 / 缺省 → None）。走纯函数，不触碰真实配置路径。
+    #[test]
+    fn pdf_bg_json_roundtrip() {
+        // 缺省：pdf_bg = default、pdf_bg_custom = null；读回默认。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["pdf_bg"], serde_json::json!("default"));
+        assert_eq!(v["pdf_bg_custom"], Value::Null);
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.pdf_bg, PdfBgPref::Default);
+        assert_eq!(back.pdf_bg_custom, None);
+
+        // 预设 / 自定义 roundtrip（其余字段不受影响）。
+        for (s, pref) in [
+            ("night", PdfBgPref::Night),
+            ("eye", PdfBgPref::Eye),
+            ("parchment", PdfBgPref::Parchment),
+            ("custom", PdfBgPref::Custom),
+        ] {
+            let p = UserPrefs { pdf_bg: pref, ..UserPrefs::default() };
+            assert_eq!(p.to_json_value()["pdf_bg"], serde_json::json!(s));
+            let back = UserPrefs::from_json_value(&p.to_json_value());
+            assert_eq!(back.pdf_bg, pref, "pdf_bg={s} 应 roundtrip");
+            assert_eq!(back.theme, ThemePref::Follow, "其余字段不受影响");
+        }
+        let p = UserPrefs {
+            pdf_bg: PdfBgPref::Custom,
+            pdf_bg_custom: Some("#1a2B3c".to_string()),
+            ..UserPrefs::default()
+        };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(back.pdf_bg, PdfBgPref::Custom);
+        assert_eq!(back.pdf_bg_custom.as_deref(), Some("#1a2B3c"), "自定义色应原样保留（大小写均可）");
+        assert_eq!(back.music_volume, None, "其余字段不受影响");
+
+        // 未知 / 非字符串 pdf_bg → 回退 default。
+        assert_eq!(PdfBgPref::from_str("garbage"), PdfBgPref::Default);
+        assert_eq!(PdfBgPref::from_str(""), PdfBgPref::Default);
+        let v = serde_json::json!({ "pdf_bg": 42 });
+        assert_eq!(UserPrefs::from_json_value(&v).pdf_bg, PdfBgPref::Default);
+
+        // pdf_bg_custom：格式非法（长度/前缀/非法位/非字符串/缺省）一律 None（安全护栏）。
+        for bad in [
+            serde_json::json!({ "pdf_bg_custom": "#12345" }),
+            serde_json::json!({ "pdf_bg_custom": "#1234567" }),
+            serde_json::json!({ "pdf_bg_custom": "123456" }),
+            serde_json::json!({ "pdf_bg_custom": "#zzzzzz" }),
+            serde_json::json!({ "pdf_bg_custom": "#12 34 56" }),
+            serde_json::json!({ "pdf_bg_custom": 0x123456 }),
+            serde_json::json!({ "pdf_bg_custom": "" }),
+        ] {
+            assert_eq!(
+                UserPrefs::from_json_value(&bad).pdf_bg_custom,
+                None,
+                "非法 hex 应回退 None：{bad}"
+            );
+        }
+        // 合法小写与带前后空白（trim 后合法）→ 保留。
+        let v = serde_json::json!({ "pdf_bg_custom": "#abcdef" });
+        assert_eq!(
+            UserPrefs::from_json_value(&v).pdf_bg_custom.as_deref(),
+            Some("#abcdef")
+        );
+        let v = serde_json::json!({ "pdf_bg_custom": "  #ABCDEF " });
+        assert_eq!(
+            UserPrefs::from_json_value(&v).pdf_bg_custom.as_deref(),
+            Some("#ABCDEF"),
+            "前后空白应 trim 后校验、去空白存储"
+        );
     }
 }

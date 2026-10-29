@@ -59,6 +59,8 @@ use gpui::{
 };
 use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
+use crate::recolor::RecolorParams;
+
 /// 在途瓦片请求记录：`(派发时密度 scale, 结果通道)`。
 pub(crate) type PendingTileEntry = (f32, mpsc::Receiver<Option<TileResult>>);
 
@@ -143,9 +145,10 @@ pub(crate) enum UndoEntry {
 }
 
 use config::pdf::{
-    COVER_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES,
-    TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE,
-    ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
+    COVER_INFLIGHT, IMAGE_CACHE_PAGES, IMAGE_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT,
+    MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH,
+    TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT,
+    TILE_MARGIN, TILE_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
 };
 use crate::pdf::layout::{
     advance_match_index, bitmap_display_scales, column_left, compute_layout, content_to_local,
@@ -155,8 +158,8 @@ use crate::pdf::layout::{
 };
 use crate::pdf::{
     render_image_from_bgra, AnnotKind, AnnotateItem, AnnotationInfo, DocId, PageText,
-    PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfWorker, QuadPt, RenderRequest,
-    RenderResult, TileRequest, TileResult,
+    PdfImageBox, PdfImagePixels, PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfWorker,
+    QuadPt, RenderRequest, RenderResult, TileRequest, TileResult,
 };
 use viewer::pan_zoom;
 /// 是否开启视图侧计时日志（`GPUI_EDITOR_PDF_TIMING=1`，进程内缓存一次）。
@@ -242,6 +245,9 @@ pub struct PdfViewer {
     pub(crate) load_error: Option<String>,
     /// 阅读画布背景（页面“纸面”之外底色；None 用主题推导）。
     pub(crate) bg: Option<Hsla>,
+    /// 纸墨重着色（页面**位图显示**层；None = 直通无重着色）。与 worker 侧 `SetRecolor`
+    /// 状态一致（view 在 set 时推送，worker 就位时再补推一次）。
+    pub(crate) recolor: Option<RecolorParams>,
     /// 待释放的旧位图/旧瓦片（替换或回收的，需在下一帧 `drop_image`）。
     pub(crate) pending_drops: Vec<Arc<RenderImage>>,
     /// 书签目录（标题 + 层级 + 目标页码）；无书签时为 `[]`。供侧边栏目录使用。
@@ -254,6 +260,16 @@ pub struct PdfViewer {
     pub(crate) text_lru: VecDeque<usize>,
     /// 在途文本请求（worker 回传通道）。
     pub(crate) pending_text: HashMap<usize, mpsc::Receiver<Option<PageText>>>,
+    /// 页**图片盒**缓存（懒加载，LRU 上限 [`IMAGE_CACHE_PAGES`]；点击/右键命中图片 +
+    /// 「复制图片」取数用）。`Vec<PdfImageBox>` 空 = 该页无 raster 图片。
+    pub(crate) image_pages: HashMap<usize, Vec<PdfImageBox>>,
+    /// 图片盒 LRU 顺序（最近使用在队尾）。
+    pub(crate) image_lru: VecDeque<usize>,
+    /// 在途图片盒请求（worker 回传通道）。
+    pub(crate) pending_images: HashMap<usize, mpsc::Receiver<Option<Vec<PdfImageBox>>>>,
+    /// 当前选中的图片：`(页号, 对象下标)`（`image_pages` 内条目）。左键单击命中图片
+    /// 置位（青色描框高亮，与文本选区蓝/注释灰框区分）；点非图片清空。`None` = 未选中。
+    pub(crate) selected_image: Option<(usize, usize)>,
     /// 选区锚点（鼠标按下点：(页号, 字符索引)）。松手后保留（作为选区一端）。
     pub(crate) sel_anchor: Option<(usize, usize)>,
     /// 选区活动端（拖拽中随鼠标更新）。
@@ -367,12 +383,17 @@ mod tests {
                     loading: false,
                     load_error: None,
                     bg: None,
+                    recolor: None,
                     pending_drops: Vec::new(),
                     outlines: Vec::new(),
                     focus_handle: cx.focus_handle(),
                     text_pages: HashMap::new(),
                     text_lru: VecDeque::new(),
                     pending_text: HashMap::new(),
+                    image_pages: HashMap::new(),
+                    image_lru: VecDeque::new(),
+                    pending_images: HashMap::new(),
+                    selected_image: None,
                     sel_anchor: None,
                     sel_active: None,
                     selecting: false,
@@ -557,12 +578,17 @@ mod tests {
                     loading: false,
                     load_error: None,
                     bg: None,
+                    recolor: None,
                     pending_drops: Vec::new(),
                     outlines: Vec::new(),
                     focus_handle: cx.focus_handle(),
                     text_pages: HashMap::new(),
                     text_lru: VecDeque::new(),
                     pending_text: HashMap::new(),
+                    image_pages: HashMap::new(),
+                    image_lru: VecDeque::new(),
+                    pending_images: HashMap::new(),
+                    selected_image: None,
                     sel_anchor: None,
                     sel_active: None,
                     selecting: false,
@@ -625,6 +651,102 @@ mod tests {
                 assert!(!v.is_dirty(), "全撤销后非脏");
                 assert!(v.undo_stack.is_empty(), "撤销栈耗尽");
             })
+        });
+    }
+
+    /// R6：view 重着色状态与一次性失效（worker 未就绪路径：`set_recolor` 更新状态、发
+    /// 不出消息也不 panic；同参短值为空操作；变更/清除都重置调度门控 → 下一帧重排重渲）。
+    #[gpui::test]
+    async fn recolor_setter_updates_state_and_invalidates_without_worker(cx: &mut TestAppContext) {
+        cx.update(|app| {
+            let _viewer = app.new(|cx| {
+                let dims = vec![(612.0, 792.0)];
+                let (tops, total) = compute_layout(&dims, PAGE_WIDTH);
+                let mut v = PdfViewer {
+                    path: "dummy.pdf".into(),
+                    worker: None,
+                    doc_id: 0,
+                    dims: dims.clone(),
+                    page_tops: tops,
+                    total_height: total,
+                    slots: Vec::new(),
+                    pending_thumb: HashMap::new(),
+                    pending_mid: HashMap::new(),
+                    mid_lru: VecDeque::new(),
+                    pending_tiles: HashMap::new(),
+                    pending_cover: HashMap::new(),
+                    tile_bytes: 0,
+                    tile_pump_running: false,
+                    last_scroll_y: 0.0,
+                    scroll_velocity: 0.0,
+                    prev_fast: false,
+                    scroll: ScrollHandle::new(),
+                    loading: false,
+                    load_error: None,
+                    bg: None,
+                    recolor: None,
+                    pending_drops: Vec::new(),
+                    outlines: Vec::new(),
+                    focus_handle: cx.focus_handle(),
+                    text_pages: HashMap::new(),
+                    text_lru: VecDeque::new(),
+                    pending_text: HashMap::new(),
+                    image_pages: HashMap::new(),
+                    image_lru: VecDeque::new(),
+                    pending_images: HashMap::new(),
+                    selected_image: None,
+                    sel_anchor: None,
+                    sel_active: None,
+                    selecting: false,
+                    search_query: String::new(),
+                    search_matches: Vec::new(),
+                    search_truncated: false,
+                    search_active: 0,
+                    search_pending: None,
+                    search_pending_seq: 0,
+                    search_seq: 0,
+                    zoom: 1.0,
+                    base_w: PAGE_WIDTH,
+                    window_sig: None,
+                    window_settled: false,
+                    idle_gate_skips: 0,
+                    reload_anchor: None,
+                    last_modify_error: None,
+                    sel_card: None,
+                    pending_annots: Vec::new(),
+                    undo_stack: VecDeque::new(),
+                    pending_page_ops: 0,
+                    next_annot_id: 0,
+                    focused_annot: None,
+                    panning: false,
+                    pan_origin: gpui::point(px(0.), px(0.)),
+                    pan_offset0: gpui::point(px(0.), px(0.)),
+                };
+                // 先给出「静置已确认」状态，验证变更会重置它（触发重排重渲）。
+                v.window_sig = Some(WindowSig::default());
+                v.window_settled = true;
+                v.tile_pump_running = true;
+
+                let p = RecolorParams { bg: [0x20, 0x20, 0x20] };
+                v.set_recolor(Some(p), cx);
+                assert_eq!(v.recolor, Some(p), "重着色状态应更新（存到 view 侧）");
+                assert_eq!(v.window_sig, None, "变更应重置门控（下一帧重排重渲）");
+                assert!(!v.window_settled, "变更应重置静置确认");
+                assert!(!v.tile_pump_running, "变更应停泵（重派）");
+
+                // 同参短值：不动已确认门控（避免重复全量重渲）。
+                v.window_sig = Some(WindowSig::default());
+                v.window_settled = true;
+                v.set_recolor(Some(p), cx);
+                assert_eq!(v.window_sig, Some(WindowSig::default()), "同参应短路、不失效");
+                assert!(v.window_settled, "同参应短路、不重置静置");
+
+                // 回 None（默认直通）→ 清状态 + 重置门控。
+                v.set_recolor(None, cx);
+                assert_eq!(v.recolor, None, "默认档应清除重着色");
+                assert_eq!(v.window_sig, None, "清除同样重置门控");
+                v
+            });
         });
     }
 }

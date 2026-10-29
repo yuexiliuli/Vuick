@@ -90,6 +90,9 @@ impl EditorApp {
             dark_mode: start_dark,
             // 手动切主题会退到强制档；此处仅为「跟随 / 强制」的偏好记录。
             theme_pref: prefs.theme,
+            // PDF 画布背景偏好：启动即随配置恢复（默认跟随主题；显式档在打开时冻结）。
+            pdf_bg: prefs.pdf_bg,
+            pdf_bg_custom: prefs.pdf_bg_custom.clone(),
             split_ratio: 0.5,
             // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。
             wrap_enabled: false,

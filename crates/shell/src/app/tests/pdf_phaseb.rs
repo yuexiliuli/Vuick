@@ -857,3 +857,185 @@ async fn d1_save_as_updates_tab_path_and_writes_annots(cx: &mut TestAppContext) 
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(&out);
 }
+
+// ---------------------------------------------------------------------------
+// 图片交互（B2 扩展）：右键命中页内图片 → 「复制图片」；左键选中态由 pdf crate 交互
+// 测试覆盖（`image_click_selects_and_clears`）。夹具无图 → SKIP（文本型夹具常态）。
+// ---------------------------------------------------------------------------
+
+/// 找第一张**可定位大图**的 `(页, obj, 命中点窗口坐标)`：同步读入前 20 页图片盒，
+/// 过滤紧凑噪声盒（≥10pt），滚到该页后取中心窗口坐标（图不在视口会收不到派发）。
+/// 夹具无图 → `None`（调用方 SKIP）。
+#[allow(clippy::type_complexity)]
+fn first_image_hit_point(
+    app: &Entity<EditorApp>,
+    cx: &mut VisualTestContext,
+) -> Option<(usize, usize, gpui::Point<gpui::Pixels>)> {
+    let mut target: Option<(usize, usize)> = None;
+    cx.update(|_w, cx| {
+        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+            .expect("活动选项卡应挂 PDF")
+            .clone();
+        for page in 0..20usize {
+            pv.update(cx, |v, _| {
+                v.load_images_for_test(page);
+            });
+            let hit = pv.read(cx).image_boxes(page).and_then(|boxes| {
+                boxes
+                    .iter()
+                    .find(|b| b.x1 - b.x0 > 10.0 && b.y1 - b.y0 > 10.0)
+                    .map(|b| (page, b.obj_index))
+            });
+            if hit.is_some() {
+                target = hit;
+                break;
+            }
+        }
+    });
+    let (page, obj) = target?;
+    cx.update(|_w, cx| {
+        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+            .expect("活动选项卡应挂 PDF")
+            .clone();
+        pv.update(cx, |v, cx| {
+            v.scroll_to_page(page);
+            cx.notify();
+        });
+    });
+    settle_frames(cx, 8);
+    cx.update(|window, cx| {
+        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])?;
+        pv.read(cx).image_pos(window, page, obj)
+    })
+    .map(|pos| (page, obj, pos))
+}
+
+/// 右键**命中页内图片** → 菜单除基四项外追加「复制图片」（`pdf-menu-copy-image`）；
+/// 右键**空白/页边距** → 无「复制图片」项、菜单仍含书签项。选中描框态由 pdf crate
+/// 交互测试覆盖。夹具无图 → SKIP。
+#[gpui::test]
+async fn image_right_click_shows_and_hides_copy_image_menu(cx: &mut TestAppContext) {
+    if missing_pdf() {
+        eprintln!("SKIP: missing target/pdf测试*.pdf");
+        return;
+    }
+    let _guard = pdf::test_util::lock().lock().unwrap();
+    init_test(cx);
+    let (app, cx) = add_app(cx);
+    cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+    for _ in 0..3 {
+        cx.run_until_parked();
+    }
+    let p = temp_pdf_copy("imgmenu");
+    open_pdf(&app, cx, &p);
+    let Some((_page, _obj, pos)) = first_image_hit_point(&app, cx) else {
+        eprintln!("SKIP: pdf测试.pdf 前 20 页无可定位大图（文本型夹具无图）");
+        return;
+    };
+    let mods = gpui::Modifiers::default();
+
+    // 右键在图片上 → 菜单含「复制图片」+ 基项仍在
+    cx.simulate_mouse_down(pos, gpui::MouseButton::Right, mods);
+    cx.simulate_mouse_up(pos, gpui::MouseButton::Right, mods);
+    settle_frames(cx, 3);
+    assert!(
+        cx.debug_bounds("pdf-menu-copy-image").is_some(),
+        "右键命中图片应含「复制图片」"
+    );
+    assert!(
+        cx.debug_bounds("pdf-menu-bookmark").is_some(),
+        "命中图片时基项「添加书签」仍在"
+    );
+
+    // 右键空白页边距（左上角沟槽）→ 无「复制图片」、书签项仍在
+    let blank = gpui::Point::new(px(30.), px(30.));
+    cx.simulate_mouse_down(blank, gpui::MouseButton::Right, mods);
+    cx.simulate_mouse_up(blank, gpui::MouseButton::Right, mods);
+    settle_frames(cx, 3);
+    assert!(
+        cx.debug_bounds("pdf-menu-copy-image").is_none(),
+        "右键非图片不应含「复制图片」"
+    );
+    assert!(
+        cx.debug_bounds("pdf-menu-bookmark").is_some(),
+        "右键空白处基项「添加书签」仍在"
+    );
+}
+
+/// 右键图片 → 点「复制图片」→ 剪贴板 CF_DIB 回读像素与该图 worker 直接取数**逐字节**
+/// 一致（端到端：菜单 → pdf 异步取数 → tray 写剪贴板）。剪贴板不可用 → 优雅 SKIP。
+/// 夹具无图 → SKIP。
+#[cfg(windows)]
+#[gpui::test]
+async fn image_copy_image_writes_clipboard_dib(cx: &mut TestAppContext) {
+    if missing_pdf() {
+        eprintln!("SKIP: missing target/pdf测试*.pdf");
+        return;
+    }
+    let _guard = pdf::test_util::lock().lock().unwrap();
+    init_test(cx);
+    let (app, cx) = add_app(cx);
+    cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+    for _ in 0..3 {
+        cx.run_until_parked();
+    }
+    let p = temp_pdf_copy("imgcopy");
+    open_pdf(&app, cx, &p);
+    let Some((page, obj, pos)) = first_image_hit_point(&app, cx) else {
+        eprintln!("SKIP: pdf测试.pdf 前 20 页无可定位大图（文本型夹具无图）");
+        return;
+    };
+    let mods = gpui::Modifiers::default();
+
+    // 期望像素：与菜单动作同源（view request_image_pixels → worker ImagePixels），
+    // 测试线程同步取（阻塞等结果，真实对比源）。
+    let expected = cx.update(|_w, cx| {
+        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])?;
+        pv.read(cx).request_image_pixels(page, obj)
+    });
+    let Some(rx) = expected else {
+        eprintln!("SKIP: 无法向 worker 请求图片像素（对象失效）");
+        return;
+    };
+    let expect_pix = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("worker 应返回像素")
+        .expect("按自然分辨率取像应成功");
+    assert!(
+        expect_pix.width > 0 && expect_pix.height > 0,
+        "期望像素应正尺寸"
+    );
+
+    // 右键图片 → 点「复制图片」
+    cx.simulate_mouse_down(pos, gpui::MouseButton::Right, mods);
+    cx.simulate_mouse_up(pos, gpui::MouseButton::Right, mods);
+    settle_frames(cx, 3);
+    let item = cx
+        .debug_bounds("pdf-menu-copy-image")
+        .expect("右键命中图片应出现「复制图片」")
+        .center();
+    cx.simulate_mouse_down(item, gpui::MouseButton::Left, mods);
+    cx.simulate_mouse_up(item, gpui::MouseButton::Left, mods);
+
+    // 泵到剪贴板 CF_DIB 就绪（异步菜单动作 + worker + tray 写）
+    let ok = pump_until(cx, |cx| {
+        cx.update(|_w, _| tray::read_clipboard_image_bgra().is_some())
+    });
+    if !ok {
+        eprintln!("SKIP: 剪贴板不可用（无交互会话/被占用），未读到 CF_DIB");
+        return;
+    }
+    let (back, bw, bh) = cx
+        .update(|_w, _| tray::read_clipboard_image_bgra())
+        .expect("已读到 CF_DIB");
+    assert_eq!(
+        (bw, bh),
+        (expect_pix.width, expect_pix.height),
+        "剪贴板 DIB 尺寸应与原图自然分辨率一致"
+    );
+    assert_eq!(
+        back, expect_pix.bgra,
+        "剪贴板 CF_DIB 像素应与 worker 直接取数逐字节一致（原图嵌入分辨率）"
+    );
+}
+

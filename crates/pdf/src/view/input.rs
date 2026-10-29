@@ -29,6 +29,9 @@ fn os_ctrl_down() -> bool {
 
 /// 灰框/删除注释命中的点击容差（PDF 点，~4pt ≈ 2-3px@100%）：紧贴高亮边缘点击也应命中。
 const ANNOT_HIT_TOL_PT: f32 = 4.0;
+/// 图片命中点击容差（PDF 点，~1pt ≈ 0.7px@100%）：点图片描框线边缘也算命中；
+/// 比注释容差更紧——图片是大块命中体，容差过大会把图旁紧邻的文字误判成图。
+const IMAGE_HIT_TOL_PT: f32 = 1.0;
 
 impl PdfViewer {
     // ---- 滚轮缩放 ----
@@ -179,6 +182,86 @@ impl PdfViewer {
         hit_char(text, px_, py_).map(|ci| (page, ci))
     }
 
+    // ---- 图片命中 / 选中 / 「复制图片」取数（P 图片对象交互）----
+    //
+    // 与文本层同款坐标链（`window_to_pt` → 页内 PDF 点 → `image_pages` 页图片盒），
+    // 页图片盒由 [`super::PdfViewer::prefetch_images`] 与文本层同节奏懒加载预取；
+    // 未缓存/未命中 → `None`（回落到文本划选语义）。
+
+    /// 窗口坐标 → (页号, 对象下标)：点落在某页某张图片盒内（1pt 容差）→ 取**该页最上层**
+    /// （对象顺序最靠后）命中盒；否则 `None`。页图片盒未缓存（预取未落地）视为未命中。
+    pub fn image_at_window_pos(
+        &self,
+        window: &Window,
+        pos: Point<Pixels>,
+    ) -> Option<(usize, usize)> {
+        let (page, px_, py_) = self.window_to_pt(window, pos)?;
+        let boxes = self.image_pages.get(&page)?;
+        // 倒序找最上层：后绘制图片覆盖先绘制者（点击上层命中上层，同注释最近优先精神）。
+        boxes
+            .iter()
+            .rev()
+            .find(|b| b.contains_pt_tol(px_, py_, IMAGE_HIT_TOL_PT))
+            .map(|b| (page, b.obj_index))
+    }
+
+    /// 图片盒 → **窗口坐标**（盒中心；测试探针/右键命中定位用）。页图片盒未缓存或
+    /// 对象下标不存在 → `None`。坐标链与 [`Self::char_window_pos`] 同源（`pt_to_local`
+    /// 翻转 → `page_local_to_window`）。
+    pub fn image_pos(
+        &self,
+        window: &Window,
+        page: usize,
+        obj_index: usize,
+    ) -> Option<gpui::Point<Pixels>> {
+        if page >= self.dims.len() {
+            return None;
+        }
+        let b = self.image_pages.get(&page)?.iter().find(|b| b.obj_index == obj_index)?;
+        let dim = self.dims[page];
+        let page_width = self.page_width();
+        let scale = render_scale(page_width, window.scale_factor(), dim.0);
+        let (lx0, ly0) = pt_to_local(b.x0, b.y1, dim.0, dim.1, page_width, scale); // (left, top → 小 y)
+        let (lx1, ly1) = pt_to_local(b.x1, b.y0, dim.0, dim.1, page_width, scale); // (right, bottom → 大 y)
+        Some(self.page_local_to_window(
+            window,
+            page,
+            (lx0 + lx1) / 2.0,
+            (ly0 + ly1) / 2.0,
+        ))
+    }
+
+    /// 页图片盒访问器（shell 测试/定位用）：页未缓存（预取未落地）→ `None`；
+    /// 页已缓存但无图 → `Some(&[])`。返回的盒为 PDF 点、y 向上。
+    pub fn image_boxes(&self, page: usize) -> Option<&[PdfImageBox]> {
+        self.image_pages.get(&page).map(Vec::as_slice)
+    }
+
+    /// 把某图置为选中（右键「未选中则先选中」/ 测试直接驱动）。不触碰文本选区
+    /// （互斥只发生在**左键**点击路径，右键仅选中图片、保留文本选区语义）。
+    pub fn select_image(&mut self, page: usize, obj_index: usize, cx: &mut Context<Self>) {
+        if self.selected_image != Some((page, obj_index)) {
+            self.selected_image = Some((page, obj_index));
+            cx.notify();
+        }
+    }
+
+    /// 触发「复制图片」取数：按选中图**自然分辨率**经 worker 取紧凑 BGRA 像素，
+    /// 返回结果通道（oneshot：`Some(PdfImagePixels)` / 无选中/对象失效/取位图失败
+    /// `None`）。取数是**按需一次性**、不缓存像素（大图驻留浪费，只过一手剪贴板）。
+    pub fn request_image_pixels(
+        &self,
+        page: usize,
+        obj_index: usize,
+    ) -> Option<mpsc::Receiver<Option<PdfImagePixels>>> {
+        let worker = self.worker.as_ref()?;
+        let boxes = self.image_pages.get(&page)?;
+        let b = boxes.iter().find(|b| b.obj_index == obj_index)?;
+        let w = b.natural_w.max(1);
+        let h = b.natural_h.max(1);
+        Some(worker.image_pixels(self.doc_id, page, obj_index, w, h))
+    }
+
     /// 鼠标按下：聚焦（供 Ctrl+C）。**同时关闭选中弹卡**（点卡片外 / 重新开始拖选 /
     /// 点击 PDF 任意处都会先走到这里——卡片在独立浮层上，卡片自身点击不会冒泡到此）。
     /// 命中 → 置锚点/活动端并进入拖拽；点空白 → 清空选区。
@@ -207,6 +290,20 @@ impl PdfViewer {
             self.selecting = false;
             cx.notify();
             return;
+        }
+        // 图片命中优先于文本划选：左键单击页内图片 → 选中该图（描框高亮）+ **互斥清除**
+        // 文本选区（不回落到拖选起点、不弹卡）。
+        if let Some(img) = self.image_at_window_pos(window, event.position) {
+            self.selected_image = Some(img);
+            self.sel_anchor = None;
+            self.sel_active = None;
+            self.selecting = false;
+            cx.notify();
+            return;
+        }
+        // 未命中图片（点文字/空白）：清除图片选中（文本选区逻辑不变）。
+        if self.selected_image.take().is_some() {
+            cx.notify();
         }
         match self.hit_test(window, event.position) {
             Some(pos) => {

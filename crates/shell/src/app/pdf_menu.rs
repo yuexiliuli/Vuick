@@ -19,6 +19,66 @@ pub(crate) fn pdf_modify_error_msg(err: &str) -> String {
     }
 }
 
+/// 「背景色」二级子菜单的**预设项**：当前生效档前导 ✓（media.rs 勾选行同款）；
+/// 点击 → 应用 + 持久化，菜单不关闭（`keep_open`，用户可连续试色后「返回」/ Esc / 点外关闭）。
+fn pdf_bg_preset_item(
+    label: &'static str,
+    pref: config::user::PdfBgPref,
+    debug_id: &'static str,
+    app: gpui::Entity<EditorApp>,
+) -> PopupMenuItem {
+    let app2 = app.clone();
+    PopupMenuItem::element(move |_, cx| {
+        let checked = app.read(cx).pdf_bg == pref;
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().w(px(18.)).child(if checked { "✓" } else { "" }))
+            .child(label)
+            .debug_selector(move || debug_id.into())
+            .into_any_element()
+    })
+    .keep_open()
+    .on_click(move |_, _window, cx| {
+        let _ = app2.update(cx, |this, cx| this.set_pdf_bg(pref, None, cx));
+    })
+}
+
+/// 「背景色」二级子菜单的**自定义项**：Windows 原生取色对话框（确定 → 应用 + 持久化；
+/// 取消 → 不变）。当前档前导 ✓；`keep_open`（试色过程菜单保持展开）。
+fn pdf_bg_custom_item(app: gpui::Entity<EditorApp>) -> PopupMenuItem {
+    let app2 = app.clone();
+    PopupMenuItem::element(move |_, cx| {
+        let checked = app.read(cx).pdf_bg == config::user::PdfBgPref::Custom;
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().w(px(18.)).child(if checked { "✓" } else { "" }))
+            .child("自定义")
+            .debug_selector(|| "pdf-menu-bg-custom".into())
+            .into_any_element()
+    })
+    .keep_open()
+    .on_click(move |_click, window, cx| {
+        let _ = app2.update(cx, |this, cx| this.pick_custom_pdf_bg(window, cx));
+    })
+}
+
+/// 「背景色」右侧的 **返回项**：点击换回上一级菜单（`PopupMenuItem::back`，不关闭）。
+/// 已随 flyout 改造休眠：真悬浮路径 hover 离开即收起、无需返回项（保留源码作备用）。
+#[allow(dead_code)]
+fn pdf_bg_back_item() -> PopupMenuItem {
+    PopupMenuItem::element(|_, _| {
+        div()
+            .debug_selector(|| "pdf-menu-bg-back".into())
+            .child("返回")
+            .into_any_element()
+    })
+    .back()
+}
+
 impl EditorApp {
     /// 一条 PDF 操作结果提示（自托管 key：下次先移除上一条，不堆积）。
     pub(crate) fn pdf_toast(&mut self, title: &str, msg: String) {
@@ -66,6 +126,22 @@ impl EditorApp {
         let focused_id = pdf.update(cx, |v, cx| {
             v.focus_annot_at_window_pos(window, ev.position, cx)
         });
+        // 图片命中（「复制图片」）：右键命中页内图片 → 未选中则先选中该图（青绿描框，
+        // 与左键单击同一选中态）；菜单据此追加「复制图片」。未命中 → 无该项、不主动清除
+        // 已选图片（右键只看命中，不改变图片选中态之外的状态）。
+        let image_hit = pdf.read(cx).image_at_window_pos(window, ev.position);
+        if let Some((page, obj)) = image_hit {
+            pdf.update(cx, |v, cx| v.select_image(page, obj, cx));
+        }
+        // 背景色二级子列表（默认/夜间/护眼/羊皮纸/自定义）：悬停「背景色」→ 次级菜单在
+        // 父菜单右侧自动展开（真悬浮 flyout，父项保持可见；无「返回」项，hover 离开即收起）。
+        let fly_items: Vec<PopupMenuItem> = vec![
+            pdf_bg_preset_item("默认", PdfBgPref::Default, "pdf-menu-bg-default", app.clone()),
+            pdf_bg_preset_item("夜间", PdfBgPref::Night, "pdf-menu-bg-night", app.clone()),
+            pdf_bg_preset_item("护眼", PdfBgPref::Eye, "pdf-menu-bg-eye", app.clone()),
+            pdf_bg_preset_item("羊皮纸", PdfBgPref::Parchment, "pdf-menu-bg-parchment", app.clone()),
+            pdf_bg_custom_item(app.clone()),
+        ];
         let (menu, sub) = ui::menu::spawn_context_menu(
             window,
             cx,
@@ -85,6 +161,26 @@ impl EditorApp {
                             .on_click(move |_, _w, cx| {
                                 app_del.update(cx, |this, cx| {
                                     this.pdf_delete_annot_action(&pdf_del, id, cx);
+                                });
+                            }),
+                        )
+                        .separator();
+                }
+                // 落在页内图片上：追加「复制图片」（按自然分辨率写剪贴板 CF_DIB）。
+                if let Some((page, obj)) = image_hit {
+                    let app_img = app.clone();
+                    let pdf_img = pdf.clone();
+                    menu = menu
+                        .item(
+                            PopupMenuItem::element(move |_w, _cx| {
+                                div()
+                                    .debug_selector(|| "pdf-menu-copy-image".into())
+                                    .child("复制图片")
+                                    .into_any_element()
+                            })
+                            .on_click(move |_, window, cx| {
+                                app_img.update(cx, |this, cx| {
+                                    this.pdf_copy_image_action(window, &pdf_img, page, obj, cx);
                                 });
                             }),
                         )
@@ -162,6 +258,17 @@ impl EditorApp {
                         });
                     }),
                 )
+                .separator()
+                // 背景色：真悬浮二级菜单（悬停展开于父菜单右侧，父项保持可见）。
+                .item(
+                    PopupMenuItem::element(|_w, _cx| {
+                        div()
+                            .debug_selector(|| "pdf-menu-bg-color".into())
+                            .child("背景色")
+                            .into_any_element()
+                    })
+                    .flyout(fly_items),
+                )
             },
             |this, emitter, cx| {
                 // 关闭（选择/Esc/点击外）→ 按 emitter 身份校验清理本菜单槽位。
@@ -173,6 +280,8 @@ impl EditorApp {
             },
         );
         self.pdf_menu_pos = Some(ev.position);
+        // 写入父菜单窗口锚点：flyout 据此做窗口边缘空间适配（翻左/翻上、自夹持、逐帧恒定）。
+        menu.update(cx, |m, _| m.set_parent_pos(ev.position));
         self.pdf_menu_entity = Some(menu);
         self.pdf_menu_sub = Some(sub);
         cx.notify();
@@ -206,7 +315,8 @@ impl EditorApp {
                 .position_mode(gpui::AnchoredPositionMode::Window)
                 .anchor(Anchor::TopLeft)
                 .position(pos)
-                .snap_to_window_with_margin(Edges::all(px(8.)))
+                // 边缘留白与 PopupMenu 自夹持使用同一常量 → 父面板顶/左估算逐像素一致。
+                .snap_to_window_with_margin(Edges::all(ui::menu::MENU_EDGE_MARGIN))
                 .child(menu),
         )
         .with_priority(100)
@@ -359,6 +469,65 @@ impl EditorApp {
             let _ = (window, cx, pdf);
             let _ = (base_name, entity, pdf2, page_index, page1);
         }
+    }
+
+    /// 「复制图片」动作：经 pdf view 按**自然分辨率**取回 BGRA 像素（异步 worker）→
+    /// `tray::set_clipboard_image_bgra` 写系统剪贴板 CF_DIB。成功 toast 尺寸；取图失败
+    /// （文档已关闭 / 对象失效 / worker 超时）或剪贴板被占用 → toast 失败文案。
+    /// 取数是**按需一次性**、不缓存大图像素（只过一手剪贴板）。
+    pub(crate) fn pdf_copy_image_action(
+        &mut self,
+        window: &mut Window,
+        pdf: &gpui::Entity<pdf::PdfViewer>,
+        page: usize,
+        obj: usize,
+        cx: &mut Context<Self>,
+    ) {
+        // 同步拿结果通道（无选中/对象失效即 None → 静默返回，菜单项只在命中时呈现）。
+        let Some(rx) = pdf.read(cx).request_image_pixels(page, obj) else {
+            return;
+        };
+        let entity = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                // 有界轮询 worker 结果（每次 50ms，不整段阻塞异步执行器；超时 10s → 失败）。
+                let pix = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        loop {
+                            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                                Ok(res) => break res,
+                                Err(_) if std::time::Instant::now() < deadline => continue,
+                                Err(_) => break None,
+                            }
+                        }
+                    })
+                    .await;
+                // 剪贴板 Win32 调用回到 UI 线程（tray 契约：单 UI 线程 OpenClipboard/Write）。
+                let _ = cx.update_window_entity(&entity, |this, _window, _cx| {
+                    match pix {
+                        Some(pix) => {
+                            match tray::set_clipboard_image_bgra(&pix.bgra, pix.width, pix.height) {
+                                Ok(()) => {
+                                    this.pdf_toast(
+                                        "已复制图片",
+                                        format!("{} × {} 像素", pix.width, pix.height),
+                                    );
+                                }
+                                Err(e) => {
+                                    this.pdf_toast("复制图片失败", e.to_string());
+                                }
+                            }
+                        }
+                        None => {
+                            this.pdf_toast("复制图片失败", "取图失败或文档已关闭".into());
+                        }
+                    }
+                });
+            })
+            .detach();
     }
 
     /// PDF 页操作失败 toast（供 `_pdf_sub` observe 变化时调用；`last_modify_error`

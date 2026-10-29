@@ -216,7 +216,12 @@ impl EditorApp {
             // 主题即时生效：偏好三态落地 + 刷新全局主题与各预览/画布背景。
             self.theme_pref = prefs.theme;
             self.dark_mode = prefs.theme.resolved_dark(cx.window_appearance());
+            // PDF 画布背景偏好：**先于** refresh_theme_ui 落地（其 default 守卫按新值走），
+            // 之后再按偏好应用显式色到各 PDF 画布（default 档由守卫回落主题）。
+            self.pdf_bg = prefs.pdf_bg;
+            self.pdf_bg_custom = prefs.pdf_bg_custom.clone();
             self.refresh_theme_ui(cx);
+            self.apply_pdf_backgrounds(cx);
             // 字号即时生效（沿用启动同款 clamp / 默认口径）。
             self.font_size = prefs
                 .font_size

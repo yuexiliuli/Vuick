@@ -54,6 +54,14 @@ pub const MID_CACHE_PAGES: usize = 8;
 pub const TEXT_CACHE_PAGES: usize = 24;
 /// 同时并发预取的文本页数上限（低优先级，不抢栅格化带宽）。
 pub const TEXT_INFLIGHT: usize = 4;
+// ---- 图片盒懒加载缓存（点击/右键命中图片 + 「复制图片」用）----
+// 页图片盒数据极小（每页仅若干包围盒 + 自然尺寸，KB 级），缓存大一点无内存压力；
+// 命中测试/选中描框需「点击即知」→ 可见页图片盒像文本层一样**按页预取**（懒加载），
+// 无任何图片交互时零开销（worker 侧 PageImages 低优先级不抢栅格化）。
+/// 图片盒 LRU 缓存页数上限（每页 KB 级，兜底可见页滑动窗口）。
+pub const IMAGE_CACHE_PAGES: usize = 48;
+/// 同时并发预取的图片盒页数上限（低优先级，同文本层）。
+pub const IMAGE_INFLIGHT: usize = 4;
 // ---- 瓦片（Tile）渲染：SumatraPDF 式分块，内存按「视口」而非「页面积」封顶 ----
 /// 瓦片边长（位图像素）：每片独立后台栅格化。内存 = 可见瓦片数 × TILE_SIZE² × 4，
 /// 视口 2K 屏（1920×1080 @1x）约 3×3=9 片 ≈ 9MB，不再随整页缩放面积爆炸。

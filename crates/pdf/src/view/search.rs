@@ -96,6 +96,91 @@ impl PdfViewer {
         }
     }
 
+    // ---- 图片盒懒加载缓存（同文本层模式）：点击/右键命中图片 + 选中描框 + 「复制图片」----
+    // 与文本层的 text_pages/text_lru/pending_text 全套对称：可见页按需预取（无图片交互
+    // 零开销），LRU 淘汰，结果在帧循环收集。图片盒数据极小（每页 KB 级），缓存上限放宽。
+
+    /// 图片盒页入 LRU 缓存（超上限淘汰最久未用）。
+    pub(super) fn cache_image_page(&mut self, page: usize, boxes: Vec<PdfImageBox>) {
+        self.image_lru.retain(|&p| p != page);
+        self.image_lru.push_back(page);
+        self.image_pages.insert(page, boxes);
+        while self.image_pages.len() > IMAGE_CACHE_PAGES {
+            if let Some(evict) = self.image_lru.pop_front() {
+                self.image_pages.remove(&evict);
+                // 被淘汰页上若正选中某图 → 同步清空（文档未换，仅缓存腾退）。
+                if self.selected_image.as_ref().is_some_and(|(p, _)| *p == evict) {
+                    self.selected_image = None;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// 回收已完成的在途图片盒结果。返回是否有**新**数据入缓存（供调用方决定重绘）。
+    pub(super) fn collect_image_results(&mut self) -> bool {
+        let finished = collect_finished(&mut self.pending_images, |rx| rx.try_recv());
+        let mut any = false;
+        for (page, res) in finished {
+            self.pending_images.remove(&page);
+            if let Some(boxes) = res {
+                self.cache_image_page(page, boxes);
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// 可见窗口图片盒预取（低优先级懒加载，封顶 [`IMAGE_INFLIGHT`] 并发）：
+    /// 与 [`Self::prefetch_texts`] 同步调用，保证用户点击/右键命中图片时盒已就绪。
+    pub(super) fn prefetch_images(&mut self, start: usize, end: usize) {
+        let Some(worker) = self.worker.clone() else {
+            return;
+        };
+        if self.pending_images.len() >= IMAGE_INFLIGHT {
+            return;
+        }
+        let mut budget = IMAGE_INFLIGHT - self.pending_images.len();
+        let last = self.dims.len().saturating_sub(1);
+        for page in start..=end.min(last) {
+            if budget == 0 {
+                break;
+            }
+            if self.image_pages.contains_key(&page) || self.pending_images.contains_key(&page) {
+                continue;
+            }
+            let rx = worker.page_images(self.doc_id, page);
+            self.pending_images.insert(page, rx);
+            budget -= 1;
+        }
+    }
+
+    /// 测试探针（shell `app::tests` 用）：**同步**把某页图片盒读入缓存（阻塞等 worker，
+    /// 超时/失败返回 false）。摆脱「可见页预取」时序——shell 测试定位图盒（右键命中点）
+    /// 前先调它，保证 `image_pos` 对任意页可用。页无图片 → true（空列表）。
+    pub fn load_images_for_test(&mut self, page: usize) -> bool {
+        let Some(worker) = self.worker.clone() else {
+            return false;
+        };
+        if page >= self.dims.len() || self.doc_id == 0 {
+            return false;
+        }
+        if self.image_pages.contains_key(&page) {
+            return true;
+        }
+        let rx = worker.page_images(self.doc_id, page);
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(res) => {
+                if let Some(boxes) = res {
+                    self.cache_image_page(page, boxes);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     // ---- P3 全文检索：由**侧边栏搜索框**驱动（PDF 内不自建搜索框）----
     //
     // 查询经 [`super::PdfViewer::set_search`] 注入 → 250ms 防抖 → worker 后台全页扫描 →

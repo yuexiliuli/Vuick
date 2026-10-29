@@ -25,16 +25,18 @@
 
 mod layout;
 mod parser;
+mod recolor;
 mod view;
 
 // `PageText`/`PdfTextChar` 为模块公开 API：非测试构建的消费方在 view 层（PageText）与
 // 后续 P3（搜索，PdfTextChar 字符盒），测试亦经此引用；bin crate 无外部消费方故需 allow。
 #[allow(unused_imports)]
 pub use parser::{
-    AnnotKind, AnnotateItem, AnnotationInfo, DocId, MemOpResult, PageText, PdfOutlineEntry,
-    PdfSearchHit, PdfSearchResults, PdfTextChar, PdfWorker, QuadPt, RenderRequest, RenderResult,
-    TileRequest, TileResult, is_writeback_busy_error,
+    AnnotKind, AnnotateItem, AnnotationInfo, DocId, MemOpResult, PageText, PdfImageBox,
+    PdfImagePixels, PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfTextChar, PdfWorker,
+    QuadPt, RenderRequest, RenderResult, TileRequest, TileResult, is_writeback_busy_error,
 };
+pub use recolor::{RecolorParams, apply_recolor};
 pub use view::PdfViewer;
 
 use std::sync::Arc;
@@ -3058,6 +3060,249 @@ mod tests {
         w2.close(d2);
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// 图片盒懒提取（worker 层）：真实夹具前若干页抽取页图片盒——几何夹在页内、
+    /// 自然尺寸为正、盒正宽高、带所属页号；取到第一张图后按**自然分辨率**取
+    /// `ImagePixels`（紧凑 `w*h*4` 且非全零/全透明）。夹具无 raster 图片 → SKIP 提示
+    /// （pdf测试.pdf 为文本型配置表/扫描件，图片对象并非必然存在）。
+    #[test]
+    fn extracts_page_images_and_pixels_from_real_pdf() {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        use std::time::Duration;
+        let p = test_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let mut found: Option<PdfImageBox> = None;
+        let mut image_pages = 0usize;
+        for page in 0..20.min(dims.len()) {
+            let rx = worker.page_images(doc_id, page);
+            let boxes = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("应收到图片盒结果")
+                .expect("页应存在");
+            if boxes.is_empty() {
+                continue;
+            }
+            image_pages += 1;
+            let (pw, ph) = dims[page];
+            for b in &boxes {
+                assert!(
+                    b.x0 >= 0.0 && b.x1 <= pw && b.y0 >= 0.0 && b.y1 <= ph,
+                    "图片盒应夹在页内（{pw}×{ph}pt）：第 {page} 页 {b:?}"
+                );
+                assert!(
+                    b.x1 > b.x0 && b.y1 > b.y0,
+                    "盒应正宽高：第 {page} 页 {b:?}"
+                );
+                assert!(b.natural_w > 0 && b.natural_h > 0, "自然尺寸应为正: {b:?}");
+                assert_eq!(b.page_index, page, "盒应带所属页号");
+            }
+            if found.is_none() {
+                found = boxes.first().copied();
+            }
+        }
+        let Some(b) = found else {
+            eprintln!(
+                "SKIP 图片盒: pdf测试.pdf 前 {} 页无 raster Image 对象（文本型夹具不含图片，复制图片无法该夹具端到端；共有图页数={image_pages}）",
+                20.min(dims.len())
+            );
+            worker.close(doc_id);
+            return;
+        };
+        eprintln!(
+            "[IMAGE-BOX] 找到图片 p{} obj{} 盒 [{:.1},{:.1} {:.1},{:.1}]pt 自然 {}×{}px",
+            b.page_index, b.obj_index, b.x0, b.y0, b.x1, b.y1, b.natural_w, b.natural_h
+        );
+        let rx = worker.image_pixels(doc_id, b.page_index, b.obj_index, b.natural_w, b.natural_h);
+        let pix = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("应收到像素结果")
+            .expect("按自然分辨率取像应成功");
+        assert_eq!(
+            pix.bgra.len(),
+            (pix.width as usize) * (pix.height as usize) * 4,
+            "紧凑 BGRA 应为纯 w*h*4（无 stride）"
+        );
+        assert!(
+            pix.width > 0 && pix.height > 0,
+            "像素尺寸应为正: {}×{}",
+            pix.width,
+            pix.height
+        );
+        let opaque_or_ink = pix.bgra.chunks_exact(4).any(|px| {
+            px[0] != 0 || px[1] != 0 || px[2] != 0 || px[3] != 0
+        });
+        assert!(opaque_or_ink, "图片像素不应全空（编码失败会产出零缓冲）");
+        eprintln!(
+            "[IMAGE-PIX] p{} obj{} → {}×{}px, bgra {}B",
+            b.page_index,
+            b.obj_index,
+            pix.width,
+            pix.height,
+            pix.bgra.len()
+        );
+        worker.close(doc_id);
+    }
+
+    /// 图片命中 + 左键单击交互（gpui 端到端）：真实夹具内有图片页上——正中点命中
+    /// `image_at_window_pos` 且 `image_pos` 可定位；左键单击图 → `selected_image` 置位 +
+    /// 文本选区互斥清空（预置一条选区）；再点页内空白 → `selected_image` 清除 + 选区
+    /// 逻辑不受影响。夹具无图 → SKIP。
+    #[gpui::test]
+    async fn image_click_selects_and_clears(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{
+            AppContext as _, Entity, InteractiveElement as _, IntoElement, MouseButton,
+            ParentElement as _, Render, Styled as _,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct ImageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for ImageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div()
+                    .id("image-pane")
+                    .w(gpui::px(1200.))
+                    .h_full()
+                    .child(self.pdf.clone())
+            }
+        }
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试.pdf");
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            ImageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PdfViewer 应加载完成");
+
+        // 同步读入前若干页图片盒，找第一张可定位的图
+        let mut target: Option<(usize, usize)> = None;
+        cx.update(|_w, cx| {
+            let pdf = holder.borrow().as_ref().unwrap().clone();
+            for page in 0..20usize {
+                pdf.update(cx, |v, _| {
+                    v.load_images_for_test(page);
+                });
+                let pv = pdf.read(cx);
+                let Some(boxes) = pv.image_pages.get(&page) else {
+                    continue;
+                };
+                if let Some(b) = boxes.first().filter(|b| b.x1 - b.x0 > 10.0 && b.y1 - b.y0 > 10.0)
+                {
+                    // 过滤掉「紧贴页边 / 极小」的噪声盒（真正可点的大图才有意义）
+                    target = Some((page, b.obj_index));
+                    break;
+                }
+            }
+        });
+        let Some((page, obj)) = target else {
+            eprintln!("SKIP 图片命中: pdf测试.pdf 前 20 页无可定位大图（文本型夹具无图）");
+            return;
+        };
+        // 先滚到该页（image_pos 是窗口坐标，图不在视口内则收不到派发）
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().clone().update(cx, |v, cx| {
+                v.scroll_to_page(page);
+                cx.notify();
+            });
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let center = cx
+            .update(|window, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .image_pos(window, page, obj)
+            })
+            .expect("滚到该页后应可定位图中心");
+        eprintln!(
+            "[IMAGE-CLICK] 目标图 p{page} obj{obj} 命中点 ({:.0},{:.0})px",
+            center.x.as_f32(),
+            center.y.as_f32()
+        );
+
+        let hit = cx.update(|window, cx| {
+            let pv = holder.borrow().as_ref().unwrap().clone();
+            pv.read(cx).image_at_window_pos(window, center)
+        });
+        assert_eq!(hit, Some((page, obj)), "图中心应命中该图 (p{page} obj{obj})");
+
+        // 预置一条文本选区（模拟「已有文本选中」），验证左键点图互斥清除
+        cx.update(|window, cx| {
+            let pdf = holder.borrow().as_ref().unwrap().clone();
+            pdf.update(cx, |v, cx| {
+                v.open_selection_card_for_test((page, 0), (page, 1), window, cx);
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let had_sel = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).sel_anchor.is_some()
+        });
+        assert!(had_sel, "预置文本选区应存在（互斥前提）");
+
+        // 左键单击图中心 → 选中该图 + 文本选区被清
+        let mods = gpui::Modifiers::default();
+        cx.simulate_mouse_move(center, MouseButton::Left, mods);
+        cx.simulate_mouse_down(center, MouseButton::Left, mods);
+        cx.simulate_mouse_up(center, MouseButton::Left, mods);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (sel_img, sel_clear) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.selected_image, v.sel_anchor.is_none())
+        });
+        assert_eq!(sel_img, Some((page, obj)), "点图应选中该图");
+        assert!(sel_clear, "点图应互斥清除文本选区");
+
+        // 点页内空白（左上角页边距区域）→ 清除图片选中
+        let blank = gpui::point(gpui::px(30.), gpui::px(30.));
+        cx.simulate_mouse_move(blank, MouseButton::Left, mods);
+        cx.simulate_mouse_down(blank, MouseButton::Left, mods);
+        cx.simulate_mouse_up(blank, MouseButton::Left, mods);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let sel_img2 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).selected_image);
+        assert_eq!(sel_img2, None, "点空白应清除图片选中");
     }
 }
 

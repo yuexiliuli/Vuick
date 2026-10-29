@@ -960,7 +960,8 @@ impl EditorApp {
         if kind == MediaKind::Pdf {
             // PdfViewer：自包含阅读器（异步读文件+解析+页级按需栅格化，不解析为 Markdown）
             let viewer = cx.new(|cx| pdf::PdfViewer::new(p.to_path_buf(), cx));
-            viewer.update(cx, |view, _| view.set_background(canvas_bg));
+            // 画布底色按当前 pdf_bg 偏好：默认 → 跟随主题；显式预设/自定义 → 打开即冻结。
+            self.apply_pdf_background(&viewer, cx);
             // 订阅阅读器 notify：检索结果/加载进度到达 → 重绘 app（侧边栏 PDF 命中计数/
             // 页列表更新）。订阅收进**选项卡**（`_pdf_sub`）而非全局单槽：多 PDF 并存各自
             // 独立、不被后打开者覆盖（旧 `_pdf_observe` 单槽即此缺陷）。单一写点

@@ -110,6 +110,54 @@ fn annot_focus_frame_color() -> Hsla {
     rgba(0x6b6b6bdd).into()
 }
 
+/// 图片选中描框色：**青绿系** rgb(0x2E_CC_8F)（暗处/亮处两版同色阶，透明度区分）。
+/// 选择依据：与既有叠加色全部**明显可分**——选区蓝（`0x4d6bfe`）、检索蓝/橙、注释
+/// 灰框、折叠/点击高亮均非青绿（对立色相），且对深色图片底也醒目（亮青描框）。
+fn image_select_frame_color(cx: &App) -> Hsla {
+    if ui::theme::Theme::global(cx).is_dark() {
+        rgba(0x2ecc8fff).into()
+    } else {
+        rgba(0x12a866ff).into()
+    }
+}
+
+/// 选中图片的描框叠加层（**卡片局部**坐标）：对 `(page, obj_index)` 命中的图片盒
+/// 画 1px 描边 + 极淡同色底（提示可点区域），盒外扩 2px（同灰框 pad，视觉包住）。
+/// 页图片盒未缓存 / 该页无选中图 → `None`。颜色由调用方经 [`image_select_frame_color`]
+/// 传入（与选区/检索叠加同款「渲染帧内取主题色」约定）。
+#[allow(clippy::too_many_arguments)] // 几何/颜色参数互为正交，与 selection/search 叠加同构
+fn image_select_frame_overlay_for_page(
+    page: usize,
+    selected: Option<(usize, usize)>,
+    images: Option<&Vec<PdfImageBox>>,
+    dim: (f32, f32),
+    display_w: f32,
+    scale: f32,
+    color: Hsla,
+) -> Option<gpui::AnyElement> {
+    let (sel_page, sel_obj) = selected?;
+    if sel_page != page {
+        return None;
+    }
+    let b = images?.iter().find(|b| b.obj_index == sel_obj)?;
+    // 外框略外扩（视觉包住图片本身），PDF 点 → 卡片局部（同灰框 pad=2.0）。
+    let pad = 2.0;
+    let (x0, y_top) = pt_to_local(b.x0 - pad, b.y1 + pad, dim.0, dim.1, display_w, scale);
+    let (x1, y_bottom) = pt_to_local(b.x1 + pad, b.y0 - pad, dim.0, dim.1, display_w, scale);
+    Some(
+        div()
+            .absolute()
+            .left(px(x0))
+            .top(px(y_top))
+            .w(px((x1 - x0).max(1.0)))
+            .h(px((y_bottom - y_top).max(1.0)))
+            .border_1()
+            .border_color(color)
+            .bg(color.opacity(0.08))
+            .into_any_element(),
+    )
+}
+
 /// 某页的**待存注释**叠加层元素（卡片局部坐标，原点 = 卡片左上，Y 向下）：
 /// - 高亮（Highlight）= 半透明黄整块填充 quad；
 /// - 删除线（Strikeout）= 穿过 quad 垂直中心的细红条；
@@ -308,6 +356,7 @@ impl PdfViewer {
         searching: bool,
         hit_color: Hsla,
         active_color: Hsla,
+        img_color: Hsla,
         page_bg: Hsla,
         page_border: Hsla,
     ) -> Vec<gpui::AnyElement> {
@@ -389,6 +438,18 @@ impl PdfViewer {
                 dim,
                 page_width,
                 scale,
+            ) {
+                overlays.push(frame);
+            }
+            // 图片选中描框（左键/右键命中图片 → 青绿色描边；页图片盒未缓存则该帧暂缺）
+            if let Some(frame) = image_select_frame_overlay_for_page(
+                i,
+                self.selected_image,
+                self.image_pages.get(&i),
+                dim,
+                page_width,
+                scale,
+                img_color,
             ) {
                 overlays.push(frame);
             }
@@ -722,6 +783,8 @@ impl PdfViewer {
         // 快速拖动时**跳过**——正在飞掠的页文本提取纯属浪费；停止后恢复预取。
         if !self.prev_fast {
             self.prefetch_texts(start, end);
+            // 图片盒同理（点击/右键命中图片用）：与文本层同节奏懒加载预取。
+            self.prefetch_images(start, end);
         }
         let total = self.total_height;
         // P2 选区：render 帧内稳定的快照（高亮渲染用）
@@ -731,6 +794,8 @@ impl PdfViewer {
         let hit_color = search_hit_color(cx);
         let active_color = search_active_color();
         let searching = !self.search_query.trim().is_empty();
+        // 图片选中描框色（青绿系，与选区蓝/检索/灰框均可区分）
+        let img_color = image_select_frame_color(cx);
         let scale_factor = window.scale_factor();
 
         let cards = self.build_visible_page_cards(
@@ -743,6 +808,7 @@ impl PdfViewer {
             searching,
             hit_color,
             active_color,
+            img_color,
             page_bg,
             page_border,
         );

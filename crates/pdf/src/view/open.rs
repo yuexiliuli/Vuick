@@ -37,6 +37,7 @@ impl PdfViewer {
             loading: true,
             load_error: None,
             bg: None,
+            recolor: None,
             pending_drops: Vec::new(),
             outlines: Vec::new(),
             // 焦点句柄须由 Context 创建（gpui 内部注册），同 markdown 预览
@@ -44,6 +45,10 @@ impl PdfViewer {
             text_pages: HashMap::new(),
             text_lru: VecDeque::new(),
             pending_text: HashMap::new(),
+            image_pages: HashMap::new(),
+            image_lru: VecDeque::new(),
+            pending_images: HashMap::new(),
+            selected_image: None,
             sel_anchor: None,
             sel_active: None,
             selecting: false,
@@ -121,6 +126,13 @@ impl PdfViewer {
         self.doc_id = doc_id;
         self.dims = dims;
         self.outlines = outlines;
+        // 重着色补推：打开/重载时 worker 在 set_recolor 时刻可能尚未就绪，这里在 worker
+        // 就位后**总是**把本阅读器的重着色状态按**本文档**推给它（worker 侧按 DocId 键控，
+        // 多窗口/多标签各自独立）——保证新文档/重载后的栅格化与 view 状态一致（含 None
+        // 复位：防某文档的全局重着色泄漏到其它文档）。
+        if let Some(w) = self.worker.as_ref() {
+            w.set_recolor(self.doc_id, self.recolor);
+        }
         let (tops, total) = compute_layout(&self.dims, self.page_width());
         self.page_tops = tops;
         self.total_height = total;
@@ -228,6 +240,76 @@ impl PdfViewer {
         self.bg = Some(bg);
     }
 
+    /// 清空显式画布背景（回退默认）：`bg` 置 `None` → render 回落 [`Self::default_canvas`]
+    /// （= 跟随主题 `window_bg`）。PDF 右键「背景色 → 默认」用；主题切换时 default 档也
+    /// 走它保持跟随（显式档跳过，见 chrome.rs `refresh_theme_ui` 守卫）。
+    pub fn clear_background(&mut self) {
+        self.bg = None;
+    }
+
+    /// 设置**页面位图显示层**纸墨重着色（`None` = 直通无重着色；只改显示像素、绝不写回
+    /// 文件）。`Some`：本阅读器重着色状态更新，并把新参数推给 worker（受它之后所有
+    /// 栅格化输出沿用）；随后**一次性失效全部已渲缓存**并重置调度门控 → 下一帧按新
+    /// 参数重排可见区重渲。短值同参 → 空操作（避免重复全量重渲）。
+    pub fn set_recolor(&mut self, recolor: Option<RecolorParams>, cx: &mut Context<Self>) {
+        if self.recolor == recolor {
+            return;
+        }
+        self.recolor = recolor;
+        if let Some(w) = self.worker.as_ref() {
+            // 按本文档键控（worker 侧 `SetRecolor(DocId, …)`，多窗口互不干扰）。
+            w.set_recolor(self.doc_id, recolor);
+        }
+        // 取消在途 + 清已渲缓存（coverage：瓦片/封面/中清/缩略全部失效）→ 重集中。
+        self.invalidate_recolored_caches();
+        cx.notify();
+    }
+
+    /// 当前纸墨重着色参数（`None` = 直通）。测试 / shell 断言用。
+    pub fn recolor(&self) -> Option<RecolorParams> {
+        self.recolor
+    }
+
+    /// 重着色变更后的**一次性缓存失效**：取消全部在途瓦片/封面/中清/缩略请求（收件箱
+    /// 作废——在途结果不再入缓存；worker 侧因 `SetRecolor` 先行、新派请求已按新参数
+    /// 渲染），把每个页槽已渲图片（瓦片/封面/旧封面/中清/缩略）移入 `pending_drops`
+    /// 下一帧 `drop_image` 显式下线，重置调度门控 → 下一帧 `ensure_window` 按新参数
+    /// 重派渲染。成本与缩放/重载同级的一次性全量重渲，不引入滚动重复重渲。
+    /// 「页位图像素重着色」本就影响每一页，故清全窗页槽（非仅可见页）。
+    pub(super) fn invalidate_recolored_caches(&mut self) {
+        self.pending_tiles.clear();
+        self.pending_cover.clear();
+        self.pending_mid.clear();
+        self.pending_thumb.clear();
+        self.mid_lru.clear();
+        self.tile_bytes = 0;
+        for slot in self.slots.iter_mut() {
+            if let Some(arc) = slot.cover.take() {
+                self.pending_drops.push(arc);
+            }
+            if let Some(arc) = slot.prev_cover.take() {
+                self.pending_drops.push(arc);
+            }
+            if let Some(arc) = slot.thumb.take() {
+                self.pending_drops.push(arc);
+            }
+            if let Some(arc) = slot.mid.take() {
+                self.pending_drops.push(arc);
+            }
+            for (_, ts) in slot.tiles.drain() {
+                self.pending_drops.push(ts.image);
+            }
+            slot.tile_bytes = 0;
+            // 密度标尺清零：调度侧视作「无瓦片、无封面」→ 下一帧重派。
+            slot.tile_scale = 0.0;
+            slot.cover_scale = 0.0;
+        }
+        // 门控重置：下一帧不静置、必跑调度。
+        self.window_sig = None;
+        self.window_settled = false;
+        self.tile_pump_running = false;
+    }
+
     /// 当前画布背景色（`set_background` 传入；None = 未设置 → render 回落 `default_canvas`）。
     pub fn background(&self) -> Option<Hsla> {
         self.bg
@@ -282,6 +364,11 @@ impl PdfViewer {
         self.text_pages.clear();
         self.text_lru.clear();
         self.pending_text.clear();
+        // 图片盒缓存与选中图片随文档一起释放
+        self.image_pages.clear();
+        self.image_lru.clear();
+        self.pending_images.clear();
+        self.selected_image = None;
         self.pending_thumb.clear();
         self.pending_mid.clear();
         self.pending_tiles.clear();
@@ -394,6 +481,9 @@ impl PdfViewer {
             cx.notify();
         }
         if self.collect_text_results() {
+            cx.notify();
+        }
+        if self.collect_image_results() {
             cx.notify();
         }
         if self.collect_search_results() {
@@ -944,6 +1034,11 @@ impl PdfViewer {
         self.text_pages.clear();
         self.text_lru.clear();
         self.pending_text.clear();
+        // 图片盒缓存与选中图片随结构变化全量失效（页号可能已平移）。
+        self.image_pages.clear();
+        self.image_lru.clear();
+        self.pending_images.clear();
+        self.selected_image = None;
         self.pending_thumb.clear();
         self.pending_mid.clear();
         self.pending_tiles.clear();

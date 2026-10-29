@@ -143,6 +143,37 @@ pub fn read_clipboard_file_drop() -> Option<(Vec<std::path::PathBuf>, DropEffect
     }
 }
 
+/// 把 **紧凑 BGRA** 像素写为系统剪贴板图片（`CF_DIB`，32bpp BI_RGB、`biHeight` 负数
+/// 顶朝上）。语义 = 任意图片查看器/编辑器「粘贴 / 插入图片」直接可用。**像素字节即
+/// DIB 像素区**（`w × h × 4`，无 stride），blob = `BITMAPINFOHEADER(40B) + 像素`。
+/// 剪贴板被其它进程占用 / 内存不足 → `Err`（调用方提示，不 panic）。
+/// 非 `windows` 目标编译为 no-op 错误（不破坏跨平台）。
+pub fn set_clipboard_image_bgra(bgra: &[u8], w: u32, h: u32) -> Result<(), &'static str> {
+    #[cfg(windows)]
+    {
+        imp::set_clipboard_image_bgra_impl(bgra, w, h)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (bgra, w, h);
+        Err("该平台不支持剪贴板图片")
+    }
+}
+
+/// 读回当前系统剪贴板的 `CF_DIB` 图片：返回 `(BGRA 像素, 宽, 高)`（32bpp 归一；
+/// 底朝上 DIB 自动翻转为顶朝上、与 [`set_clipboard_image_bgra`] 写入布局一致，便于
+/// 逐字节对拍）。剪贴板无该格式 / 非 32bpp / 被占用 → `None`。**测试对拍与粘贴扩展用**。
+pub fn read_clipboard_image_bgra() -> Option<(Vec<u8>, u32, u32)> {
+    #[cfg(windows)]
+    {
+        imp::read_clipboard_image_bgra_impl()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// 构造 `explorer /select,<绝对路径>` 定位命令（**只构造不 spawn**；spawn 由 UI 动作
 /// 路径负责并在失败时提示/静默）。`explorer.exe` 单参数 `"/select,<path>"` 是 Windows
 /// 标准姿势（选中该文件/目录的资源管理器窗口）。
@@ -223,6 +254,44 @@ pub(crate) fn parse_dropfiles_bytes(bytes: &[u8]) -> Vec<String> {
         i += 2; // 跳过本路径结尾 `\0`（若未触及缓冲末尾）
     }
     out
+}
+
+/// 解析 CF_DIB blob → `(BGRA 像素[顶朝上], 宽, 高)`。仅支持 **32bpp BI_RGB**（本 crate
+/// 写入与「粘贴图片」的通用形态）；`biHeight` 为正（底朝上）时自动翻转为顶朝上。
+/// 头 < 40B / 尺寸越界 / 非 32bpp → `None`。纯函数，可单测字节级对拍。
+pub(crate) fn parse_dib_bytes(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if bytes.len() < 40 {
+        return None;
+    }
+    let bi_size = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+    const HDR_MIN: usize = 40;
+    if bi_size < HDR_MIN || bytes.len() < bi_size {
+        return None;
+    }
+    let hdr = &bytes[..bi_size];
+    let width = i32::from_le_bytes(hdr[4..8].try_into().ok()?);
+    let height = i32::from_le_bytes(hdr[8..12].try_into().ok()?);
+    let planes = u16::from_le_bytes(hdr[12..14].try_into().ok()?);
+    let bit_count = u16::from_le_bytes(hdr[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(hdr[16..20].try_into().ok()?);
+    if width <= 0 || height == 0 || planes != 1 || bit_count != 32 || compression != 0 {
+        return None;
+    }
+    let bottom_up = height > 0;
+    let (w, h) = (width as u32, height.unsigned_abs());
+    let row_bytes = (w as usize) * 4;
+    // 像素区从 `biSize` 偏移开始；32bpp 行天然 4 字节对齐（DIB 无对齐填充）。
+    let data = &bytes[bi_size..];
+    if data.len() < row_bytes * h as usize {
+        return None;
+    }
+    let mut bgra = Vec::with_capacity(row_bytes * h as usize);
+    for row in 0..h as usize {
+        let src_row = if bottom_up { h as usize - 1 - row } else { row };
+        let src = &data[src_row * row_bytes..(src_row + 1) * row_bytes];
+        bgra.extend_from_slice(&src[..row_bytes]);
+    }
+    Some((bgra, w, h))
 }
 
 #[cfg(windows)]
@@ -718,6 +787,116 @@ mod imp {
         }
     }
 
+    /// 写剪贴板 DIB 图片（CF_DIB，32bpp BI_RGB，`biHeight` 负数 **顶朝上**）。
+    /// 同一 unsafe 家庭成员（OpenClipboard → Empty → GlobalAlloc → SetClipboardData → Close；
+    /// 失败路径 `GlobalFree` 归还、成功路径剪贴板接管）。单 UI 线程调用。
+    /// blob 布局 = `BITMAPINFOHEADER(40B) + w*h*4 BGRA 像素`（紧凑、无 stride），
+    /// 正是系统/Office/画图「粘贴图片」消费的 CF_DIB 标准形态。
+    pub(super) fn set_clipboard_image_bgra_impl(
+        bgra: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<(), &'static str> {
+        use windows::Win32::Foundation::{GlobalFree, HANDLE};
+        use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GLOBAL_ALLOC_FLAGS, GMEM_MOVEABLE, GMEM_ZEROINIT};
+        use windows::Win32::System::Ole::CF_DIB;
+
+        let expected = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if w == 0 || h == 0 || bgra.len() != expected {
+            return Err("无效图片尺寸或像素缓冲");
+        }
+        let header_bytes = std::mem::size_of::<BITMAPINFOHEADER>();
+        let blob_len = header_bytes + expected;
+        let gflags = GLOBAL_ALLOC_FLAGS(GMEM_MOVEABLE.0 | GMEM_ZEROINIT.0);
+        // SAFETY：系统剪贴板标准协议（OpenClipboard → EmptyClipboard → SetClipboardData，
+        // 全局内存经 GlobalAlloc/Lock/Copy/Unlock）。Windows 上单 UI 线程串行调用，无并发。
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return Err("无法访问系统剪贴板（可能被其它程序占用）");
+            }
+            let result = (|| {
+                EmptyClipboard().ok();
+                let hmem = match GlobalAlloc(gflags, blob_len) {
+                    Ok(h) => h,
+                    Err(_) => return Err("系统内存不足"),
+                };
+                let p = GlobalLock(hmem);
+                if p.is_null() {
+                    let _ = GlobalFree(Some(hmem));
+                    return Err("系统内存不足");
+                }
+                let p_bytes = p.cast::<u8>();
+                // BITMAPINFOHEADER：biHeight 取负 → 顶朝上（row0 = 图片顶行），像素区即
+                // 调用方传来的 BGRA（pdfium 位图本就是顶朝上布局，与 DIB 负高约定天然一致）。
+                let hdr: BITMAPINFOHEADER = std::mem::zeroed(); // 未用字段全部零（biClrUsed=0）
+                let hdr = BITMAPINFOHEADER {
+                    biSize: header_bytes as u32,
+                    biWidth: w as i32,
+                    biHeight: -(h as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..hdr
+                };
+                std::ptr::copy_nonoverlapping(
+                    (&hdr as *const BITMAPINFOHEADER).cast::<u8>(),
+                    p_bytes,
+                    header_bytes,
+                );
+                std::ptr::copy_nonoverlapping(bgra.as_ptr(), p_bytes.add(header_bytes), expected);
+                GlobalUnlock(hmem).ok();
+                if SetClipboardData(CF_DIB.0 as u32, Some(HANDLE(hmem.0))).is_err() {
+                    let _ = GlobalFree(Some(hmem));
+                    return Err("写入剪贴板失败");
+                }
+                Ok(())
+            })();
+            CloseClipboard().ok();
+            result
+        }
+    }
+
+    /// 读回剪贴板 `CF_DIB` 图片为 `(BGRA, w, h)`（32bpp 归一，底朝上自动翻转为顶朝上，
+    /// 供测试逐字节对拍与粘贴扩展）。非 32bpp / 无该格式 / 占用 → `None`；不 panic。
+    pub(super) fn read_clipboard_image_bgra_impl() -> Option<(Vec<u8>, u32, u32)> {
+        use windows::Win32::Foundation::HGLOBAL;
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, OpenClipboard,
+        };
+        use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+        use windows::Win32::System::Ole::CF_DIB;
+
+        // SAFETY：OpenClipboard 期间 GetClipboardData 返回句柄、GlobalLock 映射为字节视图、
+        // 用后 Unlock + CloseClipboard（读不改全局态）。
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return None;
+            }
+            let result = (|| {
+                let h = GetClipboardData(CF_DIB.0 as u32).ok()?;
+                if h.0.is_null() {
+                    return None;
+                }
+                let hg = HGLOBAL(h.0);
+                let size = GlobalSize(hg);
+                let p = GlobalLock(hg);
+                if p.is_null() {
+                    return None;
+                }
+                let bytes = std::slice::from_raw_parts(p.cast::<u8>(), size);
+                let out = super::parse_dib_bytes(bytes);
+                GlobalUnlock(hg).ok();
+                out
+            })();
+            CloseClipboard().ok();
+            result
+        }
+    }
+
     /// 隐藏窗口的窗口过程：托盘点按回调 / 菜单命令都经此分发。
     unsafe extern "system" fn hidden_wnd_proc(
         hwnd: HWND,
@@ -952,6 +1131,80 @@ mod tests {
         let (paths2, effect2) = crate::read_clipboard_file_drop().expect("剪切后应能读回");
         assert_eq!(paths2, vec![target.to_path_buf()]);
         assert_eq!(effect2, crate::DropEffect::Move, "MOVE 写入 → 效果应为移动");
+    }
+
+    /// DIB 字节解析纯函数：32bpp blob 头建 40B BITMAPINFOHEADER + 像素 → 原样还原
+    /// （顶朝上原序；底朝上自动翻行）；非 32bpp / 头越界 / 尺寸越界 → `None`。
+    #[test]
+    fn dib_parse_pure_functions() {
+        let w = 2u32;
+        let h = 2u32;
+        let mk_blob = || -> Vec<u8> {
+            let mut blob = vec![0u8; 40 + (w * h * 4) as usize];
+            blob[0..4].copy_from_slice(&40u32.to_le_bytes());
+            blob[4..8].copy_from_slice(&(w as i32).to_le_bytes());
+            blob[8..12].copy_from_slice(&(-(h as i32)).to_le_bytes()); // 顶朝上
+            blob[12..14].copy_from_slice(&1u16.to_le_bytes());
+            blob[14..16].copy_from_slice(&32u16.to_le_bytes());
+            blob[16..20].copy_from_slice(&0u32.to_le_bytes()); // BI_RGB
+            blob[40..].copy_from_slice(&[
+                // 顶朝上：row0 = px0 红, px1 绿；row1 = px2 蓝, px3 黑（BGRA）
+                0, 0, 255, 255,
+                0, 255, 0, 255,
+                255, 0, 0, 255,
+                0, 0, 0, 255,
+            ]);
+            blob
+        };
+        let px_top_down: Vec<u8> = vec![
+            0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255,
+        ];
+        let (bgra, bw, bh) = crate::parse_dib_bytes(&mk_blob()).expect("顶朝上应解析");
+        assert_eq!((bw, bh), (w, h));
+        assert_eq!(bgra, px_top_down, "顶朝上 → 原行序返回");
+
+        // 底朝上（biHeight 为正）→ 行翻转后与顶朝上同布局
+        let mut bottom_up = mk_blob();
+        bottom_up[8..12].copy_from_slice(&(h as i32).to_le_bytes());
+        let (bgra2, bw2, bh2) = crate::parse_dib_bytes(&bottom_up).expect("底朝上应解析");
+        assert_eq!((bw2, bh2), (w, h));
+        let px_bottom_down: Vec<u8> = vec![
+            255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255,
+        ];
+        assert_eq!(bgra2, px_bottom_down, "底朝上应翻转为顶朝上（row0 互为镜像）");
+
+        // 非 32bpp → None
+        let mut bad = mk_blob();
+        bad[14..16].copy_from_slice(&24u16.to_le_bytes());
+        assert!(crate::parse_dib_bytes(&bad).is_none(), "24bpp 应拒绝");
+        // 头越界 → None
+        assert!(crate::parse_dib_bytes(&mk_blob()[..20]).is_none(), "头不足 40B 应拒绝");
+        // 像素区不足 → None
+        let mut short = mk_blob();
+        short.truncate(40 + 8);
+        assert!(crate::parse_dib_bytes(&short).is_none(), "像素区不足应拒绝");
+    }
+
+    /// 剪贴板图片写→读回真实对拍（CF_DIB）：32bpp BGRA 像素进出系统剪贴板应**逐字节**
+    /// 一致（这是「复制图片」端到端回读与粘贴方消费同一信号源的地基）。`OpenClipboard`
+    /// 失败（无交互会话/被占用）→ **优雅 skip**（K21）；写盘前备份原剪贴板、RAII 还原。
+    #[cfg(windows)]
+    #[test]
+    fn clipboard_dib_roundtrip() {
+        let _guard = CLIP_LOCK.lock().unwrap();
+        let _restore = ClipRestoreGuard(backup_clipboard());
+        let (w, h) = (3u32, 2u32);
+        let mut bgra = Vec::new();
+        for i in 0..(w * h) as u8 {
+            bgra.extend_from_slice(&[i, i.wrapping_mul(2), i.wrapping_mul(3) + 1, 255]);
+        }
+        if let Err(e) = crate::set_clipboard_image_bgra(&bgra, w, h) {
+            eprintln!("[SKIP] 剪贴板不可用，跳过 CF_DIB 写读对拍：{e}");
+            return;
+        }
+        let (back, bw, bh) = crate::read_clipboard_image_bgra().expect("写入后应能读回 CF_DIB");
+        assert_eq!((bw, bh), (w, h), "CF_DIB 尺寸应一致：{}x{}", bw, bh);
+        assert_eq!(back, bgra, "CF_DIB 往返应逐字节一致（顶朝上 BGRA）");
     }
 
     /// 剪贴板备份：对拍测试写盘前的原始内容（读失败项为 `None`，还原时跳过该格式）。

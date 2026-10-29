@@ -32,6 +32,8 @@ use std::sync::{mpsc, OnceLock};
 use anyhow::{anyhow, Context as _, Result};
 use pdfium_render::prelude::*;
 
+use crate::recolor::{RecolorParams, apply_recolor};
+
 /// 进程级单例：pdfium 动态库路径（只定位一次）。
 static PDFIUM_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
@@ -241,6 +243,61 @@ pub struct PageText {
     pub synthetic_count: usize,
 }
 
+/// 页内单个光栅图片（raster Image 对象）的包围盒与自然分辨率。
+///
+/// 坐标语义与 [`PdfTextChar`] 一致：PDF 用户空间（原点在页**左下角**、Y 轴向上），
+/// 单位 PDF 点；到屏幕坐标的翻转与缩放由 view 层映射负责。**自包含**、可跨线程传给
+/// 阅读器（供图片命中测试 / 选中描框 / 右键「复制图片」取数）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfImageBox {
+    /// 所属页号（0 基）。
+    pub page_index: usize,
+    /// 页对象集合内的对象下标（`PdfPage::objects().get(obj_index)` 可再取回该对象）。
+    pub obj_index: usize,
+    /// 包围盒左缘（PDF 点）。
+    pub x0: f32,
+    /// 包围盒下缘（PDF 点）。
+    pub y0: f32,
+    /// 包围盒右缘（PDF 点）。
+    pub x1: f32,
+    /// 包围盒上缘（PDF 点）。
+    pub y1: f32,
+    /// 图片**自然宽**（嵌入分辨率，位图像素；`PdfPageImageObject::width()`）。
+    pub natural_w: u32,
+    /// 图片**自然高**（嵌入分辨率，位图像素；`PdfPageImageObject::height()`）。
+    pub natural_h: u32,
+}
+
+impl PdfImageBox {
+    /// 盒是否可用于命中测试（正宽高 + 有限值）。
+    fn valid(self) -> bool {
+        self.x1 - self.x0 > 0.0
+            && self.y1 - self.y0 > 0.0
+            && self.x0.is_finite()
+            && self.x1.is_finite()
+            && self.y0.is_finite()
+            && self.y1.is_finite()
+    }
+
+    /// 页内 PDF 点是否落在盒内（含 1pt 级容差，与注释命中 [`ANNOT_HIT_TOL_PT`]
+    /// 同一精神——点框线边缘也算命中）。
+    pub(crate) fn contains_pt_tol(&self, px: f32, py: f32, tol: f32) -> bool {
+        px >= self.x0 - tol && px <= self.x1 + tol && py >= self.y0 - tol && py <= self.y1 + tol
+    }
+}
+
+/// 从图片对象按自然分辨率取回的**紧凑 BGRA** 像素（纯 `w*h*4`、无 stride）。
+/// 拷贝到剪贴板（CF_DIB）与测试对拍共用。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PdfImagePixels {
+    /// BGRA（B、G、R、A 字节序）紧凑像素；`width × height × 4` 字节。
+    pub bgra: Vec<u8>,
+    /// 位图逻辑宽（px）。
+    pub width: u32,
+    /// 位图逻辑高（px）。
+    pub height: u32,
+}
+
 /// 字符包围盒（PDF 点）。仅 worker 内部临时结构。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CharBox {
@@ -389,6 +446,20 @@ enum WorkerMsg {
     /// 请求某页文本层数据（懒加载：仅选中/复制/搜索时调用）。**低优先级**：
     /// worker 调度保证绝不排在栅格化（Render）之后执行。
     Text(DocId, usize, mpsc::Sender<Option<PageText>>),
+    /// 请求某页的**光栅图片盒列表**（懒加载：仅点击/右键命中图片时按需调用）。
+    /// 低优先级（同 Text），回传该页全部 raster Image 对象的 PDF 点包围盒 + 自然分辨率
+    /// （空 vec = 该页无图片；None = 文档/页不存在）。
+    PageImages(DocId, usize, mpsc::Sender<Option<Vec<PdfImageBox>>>),
+    /// 请求某页某图片对象按**自然分辨率**取回紧凑 BGRA 像素（「复制图片」专用；
+    /// 应用滤镜/掩码后的 processed 位图）。`obj_index` 对不上 / 取位图失败 → None。
+    ImagePixels(
+        DocId,
+        usize,
+        usize,
+        u32,
+        u32,
+        mpsc::Sender<Option<PdfImagePixels>>,
+    ),
     /// 请求文档级检索（懒加载，低优先级；全页文本层扫描）。
     Search(DocId, String, mpsc::Sender<Option<PdfSearchResults>>),
     /// **写回注释并落盘**：worker 内把内存 bytes 载入「自有 raw 句柄」
@@ -422,6 +493,13 @@ enum WorkerMsg {
     /// 读回某页注释（only-read，pdfium-render 高层 `page.annotations()`，供测试断言）。
     /// 低优先级，与 Text/Search 同位（不抢栅格化）。
     ReadAnnotations(DocId, usize, mpsc::Sender<Result<Vec<AnnotationInfo>>>),
+    /// **纸墨重着色参数切换（按文档）**：`None` = 直通（无重着色）；`Some` = 该文档之后
+    /// 所有栅格化输出（瓦片/封面/缩略/中清）都在 return 前经 [`apply_recolor`] 就地重着色。
+    /// by `run` 在收到消息**当下**按 `doc_id` 落到「文档→参数」映射（早于同批次任何渲染
+    /// 出队），不排队。**必须按文档键控**：worker 是进程级单例、多阅读器（多窗口/多标签）
+    /// 共享；若用单槽全局值，不同窗口不同偏好会互相覆盖、把错误纸墨渲到对方页面上。
+    /// 只改显示像素，绝不写回文件 / 不改 pdfium 解析。
+    SetRecolor(DocId, Option<RecolorParams>),
 }
 
 /// 进程级单例工作线程句柄。所有 [`PdfViewer`] 通过克隆它共享同一个 pdfium 线程。
@@ -514,6 +592,13 @@ impl PdfWorker {
         let _ = self.tx.send(WorkerMsg::Close(doc_id));
     }
 
+    /// 设置（或清除）`doc_id` 文档的纸墨重着色参数（`None` = 直通无重着色）。只影响该
+    /// 文档显示像素，不写回文件。worker 在收到消息当下按文档应用（早于同批次渲染出队），
+    /// view 随后重渲的瓦片即用新参数。按文档键控（见 [`WorkerMsg::SetRecolor`]）。
+    pub fn set_recolor(&self, doc_id: DocId, recolor: Option<RecolorParams>) {
+        let _ = self.tx.send(WorkerMsg::SetRecolor(doc_id, recolor));
+    }
+
     /// 请求某页文本层数据（异步、低优先级）。返回接收结果的通道。
     ///
     /// 只应在用户开始选中/搜索时按需调用（懒加载：不交互则零开销）。
@@ -522,6 +607,32 @@ impl PdfWorker {
     pub fn request_text(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<PageText>> {
         let (tx, rx) = mpsc::channel();
         let _ = self.tx.send(WorkerMsg::Text(doc_id, page, tx));
+        rx
+    }
+
+    /// 请求某页的**光栅图片盒列表**（异步、低优先级，同 Text 不抢栅格化）。
+    /// 返回接收结果的通道；文档/页不存在 → `None`，页无图片 → `Some([])`。
+    /// 只在点击/右键命中图片时按需调用（懒加载：无交互则零开销）。
+    pub fn page_images(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<Vec<PdfImageBox>>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::PageImages(doc_id, page, tx));
+        rx
+    }
+
+    /// 请求某页某图片对象按 `w × h` 自然分辨率取回紧凑 BGRA 像素（异步、低优先级）。
+    /// 返回接收结果的通道；对象下标失效 / 取位图失败 → `None`。
+    pub fn image_pixels(
+        &self,
+        doc_id: DocId,
+        page: usize,
+        obj_index: usize,
+        w: u32,
+        h: u32,
+    ) -> mpsc::Receiver<Option<PdfImagePixels>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self
+            .tx
+            .send(WorkerMsg::ImagePixels(doc_id, page, obj_index, w, h, tx));
         rx
     }
 
@@ -688,21 +799,35 @@ impl PdfWorker {
         // 保证检索期间到达的 Render/RenderTile 可以插队先跑——否则一次全量扫描会冻结所有
         // 瓦片/封面（87 页文本 PDF 实测检索 ~440ms，期间渲染被整段堵住 → 随机页先模糊）。
         let mut pending_search: Option<PendingSearch> = None;
+        // 纸墨重着色参数（**按文档**键控；`Option`：None = 直通）。每次栅格化 return 前经
+        // apply_recolor 就地重着色；SetRecolor 在收到当下按 doc_id 写入（见下方 sweep 的
+        // match）。进程级单 worker 多阅读器共享 → 绝不能退化成单槽全局值（会跨窗口互相
+        // 覆盖、把错误纸墨渲到对方文档上）。
+        let mut recolor: HashMap<DocId, Option<RecolorParams>> = HashMap::new();
         loop {
             // 现积压一次性分桶入队（每桶 FIFO；跨类优先序由下方「先取高优先桶」体现）。
+            // `SetRecolor` 是控制消息：**当下应用**，不入桶——保证早于同批次的任何渲染
+            // 出队（view 先发 SetRecolor、再重派瓦片，二事经单通道 FIFO 保序）。
             while let Ok(msg) = rx.try_recv() {
-                enqueue_msg(msg, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q);
+                match msg {
+                    WorkerMsg::SetRecolor(doc_id, params) => {
+                        recolor.insert(doc_id, params);
+                    }
+                    other => enqueue_msg(other, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q),
+                }
             }
             // 1) 渲染永远最优先：全尺寸 Render / RenderTile（瓦片与整页同为视口内容），
             //    即使渲染消息排在检索/文本之后到，也会先从队列里抽出来执行。
             if let Some(msg) = render_q.pop_front() {
                 match msg {
                     WorkerMsg::Render(doc_id, req, tx) => {
-                        let result = docs.get(&doc_id).and_then(|doc| render_page(doc, req));
+                        let p = recolor.get(&doc_id).copied().flatten();
+                        let result = docs.get(&doc_id).and_then(|doc| render_page(doc, req, p));
                         let _ = tx.send(result);
                     }
                     WorkerMsg::RenderTile(doc_id, req, tx) => {
-                        let result = docs.get(&doc_id).and_then(|doc| render_tile(doc, req));
+                        let p = recolor.get(&doc_id).copied().flatten();
+                        let result = docs.get(&doc_id).and_then(|doc| render_tile(doc, req, p));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("render_q 只入 Render/RenderTile"),
@@ -713,7 +838,10 @@ impl PdfWorker {
             if let Some(msg) = mid_q.pop_front() {
                 match msg {
                     WorkerMsg::Mid(doc_id, page, sf, tx) => {
-                        let result = docs.get(&doc_id).and_then(|doc| render_mid(doc, page, sf));
+                        let p = recolor.get(&doc_id).copied().flatten();
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| render_mid(doc, page, sf, p));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("mid_q 只入 Mid"),
@@ -723,7 +851,10 @@ impl PdfWorker {
             if let Some(msg) = thumb_q.pop_front() {
                 match msg {
                     WorkerMsg::Thumb(doc_id, page, tx) => {
-                        let result = docs.get(&doc_id).and_then(|doc| render_thumb(doc, page));
+                        let p = recolor.get(&doc_id).copied().flatten();
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| render_thumb(doc, page, p));
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("thumb_q 只入 Thumb"),
@@ -781,11 +912,25 @@ impl PdfWorker {
                     WorkerMsg::Close(doc_id) => {
                         docs.remove(&doc_id);
                         stores.remove(&doc_id);
+                        // 重着色按文档键控：关闭即清理（防 doc_id 复用残留旧参数）。
+                        recolor.remove(&doc_id);
                     }
                     WorkerMsg::Text(doc_id, page, tx) => {
                         let result = docs
                             .get(&doc_id)
                             .and_then(|doc| extract_page_text(doc, page));
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::PageImages(doc_id, page, tx) => {
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| extract_page_images(doc, page));
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::ImagePixels(doc_id, page, obj_index, w, h, tx) => {
+                        let result = docs.get(&doc_id).and_then(|doc| {
+                            extract_image_pixels(doc, page, obj_index, w, h)
+                        });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::Search(doc_id, needle, tx) => {
@@ -935,7 +1080,7 @@ impl PdfWorker {
                         };
                         let _ = tx.send(result);
                     }
-                    _ => unreachable!("rest_q 只入 Open/Close/Text/Search/写回/页操作/注释读回"),
+                    _ => unreachable!("rest_q 只入 Open/Close/Text/PageImages/ImagePixels/Search/写回/页操作/注释读回"),
                 }
                 continue;
             }
@@ -954,7 +1099,12 @@ impl PdfWorker {
                 continue;
             }
             // 5) 真空闲：阻塞等新消息（只有在既无排队消息也无在途检索时才会真阻塞）。
+            //    `SetRecolor` 与上方 sweep 走同一拦截：收到当下应用，不入桶（否则经
+            //    enqueue_msg 落到 rest_q 会撞 `_ => unreachable!` 把工作线程打死）。
             match rx.recv() {
+                Ok(WorkerMsg::SetRecolor(doc_id, params)) => {
+                    recolor.insert(doc_id, params);
+                }
                 Ok(msg) => enqueue_msg(msg, &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q),
                 Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
             }
@@ -1490,7 +1640,11 @@ fn timing() -> bool {
     })
 }
 
-fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult> {
+fn render_page(
+    doc: &PdfDocument<'_>,
+    req: RenderRequest,
+    recolor: Option<RecolorParams>,
+) -> Option<RenderResult> {
     let page = doc.pages().get(req.page as i32).ok()?;
     let (pw, ph) = (page.width().value, page.height().value);
     let w = (pw * req.scale).ceil().max(1.0) as i32;
@@ -1500,7 +1654,11 @@ fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult
     // pdfium-render 的 `PdfBitmap::render()` 用 `PdfBitmapFormat::default()`（= BGRA）建位图，
     // BGRA 的 stride 恒为 `width*4`（无对齐填充，见 preferred_stride_bytes）。
     // `as_raw_bytes()` 直接返回整块原生 BGRA 缓冲 → 主线程 `Frame::from_raw` 直接包裹。
-    let bgra = bmp.as_raw_bytes();
+    let mut bgra = bmp.as_raw_bytes();
+    // 纸墨重着色（显示层）：`Some` → 就地按亮度映射纸墨；`None` → 直通零开销。
+    if let Some(p) = recolor {
+        apply_recolor(&mut bgra, p);
+    }
     if timing() {
         eprintln!(
             "[{:.1}ms] [PAGE-RENDER] p{} scale={:.2} render={:.3}ms -> {}x{}",
@@ -1528,7 +1686,11 @@ fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult
 ///
 /// 内存：每片恒 ≈ TILE_SIZE² × 4，**与缩放倍数无关**；同一页切成 视口可见 的几片，
 /// 不再存在"4× 缩放一页 = 64MB 整页位图"的内存/density 上限墙。
-fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
+fn render_tile(
+    doc: &PdfDocument<'_>,
+    req: TileRequest,
+    recolor: Option<RecolorParams>,
+) -> Option<TileResult> {
     let t0 = std::time::Instant::now();
     let page = doc.pages().get(req.page as i32).ok()?;
     let t_get = std::time::Instant::now();
@@ -1545,6 +1707,11 @@ fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
             .set_origin(-(x0 as i32), -(y0 as i32)),
     )
     .ok()?;
+    let mut bgra = dst.as_raw_bytes();
+    // 纸墨重着色（显示层）：`Some` → 就地按亮度映射纸墨；`None` → 直通零开销。
+    if let Some(p) = recolor {
+        apply_recolor(&mut bgra, p);
+    }
     let res = TileResult {
         page: req.page,
         row: req.row,
@@ -1555,7 +1722,7 @@ fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
         h,
         full_w: bmp.0,
         full_h: bmp.1,
-        bgra: dst.as_raw_bytes(),
+        bgra,
     };
     if timing() {
         let end = std::time::Instant::now();
@@ -1577,14 +1744,22 @@ fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
 ///
 /// 缩放按目标宽度 [`THUMB_WIDTH`](config::pdf::THUMB_WIDTH) 推导并夹在
 /// `[0.1, 1.0]`（防止超大页 / 极小页产生荒谬分辨率）；pdfium 下采样极快（~1ms/张）。
-fn render_thumb(doc: &PdfDocument<'_>, page_index: usize) -> Option<RenderResult> {
+fn render_thumb(
+    doc: &PdfDocument<'_>,
+    page_index: usize,
+    recolor: Option<RecolorParams>,
+) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
     let scale = (config::pdf::THUMB_WIDTH / pw).clamp(0.1, 1.0);
-    render_page(doc, RenderRequest {
-        page: page_index,
-        scale,
-    })
+    render_page(
+        doc,
+        RenderRequest {
+            page: page_index,
+            scale,
+        },
+        recolor,
+    )
 }
 
 /// 在工作线程内：栅格化某页的 **L0.5 中清页**（~520px × DPI 宽，~5ms/张，用于快速拖动）。
@@ -1596,15 +1771,20 @@ fn render_mid(
     doc: &PdfDocument<'_>,
     page_index: usize,
     scale_factor: f32,
+    recolor: Option<RecolorParams>,
 ) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
     let target_w = config::pdf::MID_WIDTH * scale_factor.max(1.0);
     let scale = (target_w / pw).clamp(0.1, 1.0);
-    render_page(doc, RenderRequest {
-        page: page_index,
-        scale,
-    })
+    render_page(
+        doc,
+        RenderRequest {
+            page: page_index,
+            scale,
+        },
+        recolor,
+    )
 }
 
 /// 打开文档并取每页 (宽, 高)（PDF 点单位）。dll 路径自动定位（进程级缓存）。
@@ -1673,6 +1853,103 @@ fn extract_page_text(doc: &PdfDocument<'_>, page_index: usize) -> Option<PageTex
         height: page_h,
         chars,
         synthetic_count,
+    })
+}
+
+/// 在工作线程内：抽取单页全部 **raster Image 对象**的包围盒与自然分辨率（懒加载，
+/// 仅在点击/右键命中图片时调用）。只收集类型为 [`PdfPageObjectType::Image`] 的对象
+/// （路径/文本/表单/未支持对象跳过）；页或文档不存在 → `None`，页无图片 → `Some([])`。
+/// 盒按 pdfium 对象顺序排列，`obj_index` 即 `objects().iter()` 的下标（`objects().get`
+/// 取回后再 `as_image_object()` 即原图），供命中测试与「复制图片」取像素回指。
+fn extract_page_images(
+    doc: &PdfDocument<'_>,
+    page_index: usize,
+) -> Option<Vec<PdfImageBox>> {
+    let page = doc.pages().get(page_index as i32).ok()?;
+    let (page_w, page_h) = (page.width().value, page.height().value);
+    let mut images = Vec::new();
+    for (idx, obj) in page.objects().iter().enumerate() {
+        if obj.object_type() != PdfPageObjectType::Image {
+            continue;
+        }
+        let Some(img) = obj.as_image_object() else {
+            continue;
+        };
+        let Ok(bounds) = obj.bounds() else {
+            continue;
+        };
+        let rect = bounds.to_rect();
+        // 自然分辨率取对象内嵌尺寸（失败按 0 → 命中/取数层跳过该盒）。
+        let natural_w = img.width().map(|v| v.max(0) as u32).unwrap_or(0);
+        let natural_h = img.height().map(|v| v.max(0) as u32).unwrap_or(0);
+        let mut b = PdfImageBox {
+            page_index,
+            obj_index: idx,
+            x0: rect.left().value,
+            y0: rect.bottom().value,
+            x1: rect.right().value,
+            y1: rect.top().value,
+            natural_w,
+            natural_h,
+        };
+        // 夹到页内并丢弃退化盒（空/越界不可命中，取数也不可靠）。
+        b.x0 = b.x0.clamp(0.0, page_w);
+        b.x1 = b.x1.clamp(0.0, page_w);
+        b.y0 = b.y0.clamp(0.0, page_h);
+        b.y1 = b.y1.clamp(0.0, page_h);
+        if b.valid() && b.natural_w > 0 && b.natural_h > 0 {
+            images.push(b);
+        }
+    }
+    Some(images)
+}
+
+/// 在工作线程内：按给定 `req_w × req_h`（= 图片自然分辨率）取回某图片对象的
+/// **processed** 位图（应用滤镜 / 图像掩码 / 对象变换，`get_processed_bitmap_with_size`），
+/// 归一化为紧凑 **BGRA**（`w*h*4`，无 stride；RGBA→BGRA 交换一次）。灰度位图自动
+/// 扩三通道 + 不透明。对象下标失效 / 文档页不存在 / 位图尺寸异常 → `None`。
+fn extract_image_pixels(
+    doc: &PdfDocument<'_>,
+    page_index: usize,
+    obj_index: usize,
+    req_w: u32,
+    req_h: u32,
+) -> Option<PdfImagePixels> {
+    let page = doc.pages().get(page_index as i32).ok()?;
+    let obj = page.objects().get(obj_index).ok()?;
+    let img = obj.as_image_object()?;
+    // 目标尺寸夹到 i32 正整数域（Pixels=i32；真正图片嵌入尺寸都在合理范围内，仅防病态）。
+    let w = req_w.clamp(1, i32::MAX as u32) as i32;
+    let h = req_h.clamp(1, i32::MAX as u32) as i32;
+    let bmp = img
+        .get_processed_bitmap_with_size(doc, w, h)
+        .ok()?;
+    let bw = bmp.width();
+    let bh = bmp.height();
+    if bw <= 0 || bh <= 0 {
+        return None;
+    }
+    let (bw, bh) = (bw as u32, bh as u32);
+    // `as_rgba_bytes()` 归一化为紧凑 RGBA；Gray 格式返回原始单通道字节（`w*h`）。
+    let rgba = bmp.as_rgba_bytes();
+    let px_count = (bw as usize) * (bh as usize);
+    let mut bgra = Vec::with_capacity(px_count * 4);
+    if rgba.len() == px_count * 4 {
+        // RGBA → BGRA：交换 R/B 一次（退化为逐 4 字节 flat_map，零分配）。
+        bgra.extend(rgba.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], px[3]]));
+    } else if rgba.len() == px_count {
+        // 灰度：单字节 → 三通道同值 + 不透明（DIB 32bpp 必需）。
+        bgra.reserve(rgba.len() * 4);
+        for &g in &rgba {
+            bgra.extend_from_slice(&[g, g, g, 255]);
+        }
+    } else {
+        return None;
+    }
+    Some(PdfImagePixels {
+        bgra,
+        width: bw,
+        height: bh,
     })
 }
 

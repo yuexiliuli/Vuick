@@ -57,6 +57,7 @@ mod media;
 mod media_window;
 mod pdf_bookmarks;
 mod pdf_menu;
+mod pdf_bg;
 mod preview;
 mod session;
 mod settings_xfer;
@@ -96,7 +97,7 @@ use config::layout::{
     DEFAULT_FONT_SIZE, FONT_MAX, FONT_MIN, MENU_BAR_H, SIDEBAR_WIDTH, SPLIT_RATIO_MAX,
     SPLIT_RATIO_MIN,
 };
-use config::user::{ThemePref, UserPrefs};
+use config::user::{PdfBgPref, ThemePref, UserPrefs};
 use crate::scrollbar::TableScrollState;
 
 /// 一个文件选项卡：独立持有自研编辑器组件状态、文件路径与脏标记。
@@ -618,6 +619,12 @@ pub struct EditorApp {
     pdf_menu_entity: Option<gpui::Entity<PopupMenu>>,
     /// PDF 右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     pdf_menu_sub: Option<Subscription>,
+    /// PDF 阅读画布背景预设（config `pdf_bg`；**只改画布**，绝不动 PDF 位图/文件）。
+    /// `default` 跟随主题；显式预设/自定义后主题切换不再覆盖（见 chrome.rs 守卫）。
+    pdf_bg: PdfBgPref,
+    /// PDF 自定义画布底色（config `pdf_bg_custom`，`#rrggbb`；仅 `pdf_bg == Custom` 档
+    /// 消费，非法值应用层回退默认）。
+    pdf_bg_custom: Option<String>,
     /// 最近一次对 PDF 页操作失败已提示过的错误文案：`_pdf_sub` 的 observe 里
     /// 对比「变化」才 toast 一次（成功/未操作置 None），防同一错误重复弹提示。
     pdf_last_error_seen: Option<String>,
