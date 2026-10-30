@@ -2877,7 +2877,7 @@ impl Window {
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
+    pub fn render_to_image(&self) -> anyhow::Result<kimg::RgbaImage> {
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
     }

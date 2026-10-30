@@ -11,5 +11,5 @@ description = "gpui-editor 系统托盘 crate（Windows 托盘图标 / 关闭到
 windows = { workspace = true }
 # 程序图标 ICO 解码（PNG 条目 → RGBA → BGRA → CreateIconIndirect 构造 HICON）：
 # CreateIconFromResourceEx 实测对这批图标（条目 wPlanes=0）返回空句柄，改用
-# image 解码 + 手建 DIB 的已验证路线（手绘版托盘即此路，真机可用）。
-image = { workspace = true }
+# kimg 解码 + 手建 DIB 的已验证路线（手绘版托盘即此路，真机可用）。
+kimg = { workspace = true }

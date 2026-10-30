@@ -11,8 +11,8 @@ regex = { workspace = true }
 config = { path = "../config" }
 base = { path = "../base" }
 ime = { path = "../ime" }
-# 应用图标（变色龙 128×128 ICO，PNG 编码）解码：image 0.25 默认特性已含 ico 容器。
-image = { workspace = true }
+# 应用图标（变色龙 128×128 ICO，PNG 编码）解码：kimg 默认特性已含 ico 容器。
+kimg = { workspace = true }
 
 [features]
 # video 相关图标变体（IconName::Play/Pause/Volume/…）的开关；本 feature 无实际内容，纯 cfg 门。

@@ -10,7 +10,7 @@ gpui = { workspace = true }
 cpal = { workspace = true }
 libloading = { workspace = true }
 anyhow = { workspace = true }
-image = { workspace = true }
+kimg = { workspace = true }
 config = { path = "../config" }
 
 [dev-dependencies]

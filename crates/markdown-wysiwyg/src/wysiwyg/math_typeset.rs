@@ -7,7 +7,7 @@
 //! 与 zorite 完全同构，仅裁剪掉 `ratex-gpui` 的编辑/光标部分、只留显示管线。
 
 use gpui::{Hsla, RenderImage, Rgba};
-use image::{Frame, RgbaImage};
+use kimg::{Frame, RgbaImage};
 use ratex_layout::{LayoutOptions, layout, to_display_list};
 use ratex_parser::parse;
 use ratex_render::{RenderOptions, render_to_png};
@@ -64,7 +64,7 @@ fn rasterize(
         ..Default::default()
     };
     let png = render_to_png(&dl, &opts).ok()?;
-    let rgba = image::load_from_memory(&png).ok()?.into_rgba8();
+    let rgba = kimg::load_from_memory(&png).ok()?.into_rgba8();
     let (w, h) = rgba.dimensions();
     let mut bytes = rgba.into_raw();
     // RaTeX 光栅黑底白字 → 重着色为 `rgb`、透明底：像素明度反转成字形 alpha

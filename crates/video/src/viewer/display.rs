@@ -47,13 +47,13 @@ impl super::VideoViewer {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    image::save_buffer_with_format(
+                    kimg::save_buffer_with_format(
                         &path,
                         &rgba,
                         w,
                         h,
-                        image::ExtendedColorType::Rgba8,
-                        image::ImageFormat::Png,
+                        kimg::ExtendedColorType::Rgba8,
+                        kimg::ImageFormat::Png,
                     )
                 })
                 .await;

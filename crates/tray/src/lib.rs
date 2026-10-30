@@ -437,7 +437,7 @@ mod imp {
     /// 常用档，W32 缩放质量最好且 GDI 位图小）→ BGRA straight →
     /// [`create_hicon_from_bgra`]（CreateDIBSection + CreateIconIndirect，先前真机验证可用）。
     fn create_hicon_from_ico() -> Result<HICON, ()> {
-        let img = image::ImageReader::new(std::io::Cursor::new(crate::APP_ICO))
+        let img = kimg::ImageReader::new(std::io::Cursor::new(crate::APP_ICO))
             .with_guessed_format()
             .map_err(|_| ())?
             .decode()
@@ -446,7 +446,7 @@ mod imp {
         // 更大的 HICON 在 W32 图标路径缩放质量/兼容性更差且 GDI 位图更大）。
         let rgba = img.to_rgba8();
         let small =
-            image::imageops::resize(&rgba, 64, 64, image::imageops::FilterType::Lanczos3);
+            kimg::imageops::resize(&rgba, 64, 64, kimg::imageops::FilterType::Lanczos3);
         let (w, h) = small.dimensions();
         debug_assert_eq!((w, h), (64, 64), "缩到 64 后尺寸不符");
         // RGBA → BGRA straight（Win32 DIB 以 BGRA 字节序消费）。

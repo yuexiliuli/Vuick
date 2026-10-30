@@ -157,8 +157,8 @@ fn inline_math_grown_row_off_band_reuses_shaped_height(cx: &mut TestAppContext) 
     let vcx: &mut VisualTestContext = vcx;
     let h_real = vcx.update(|window, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
-        let buf = image::RgbaImage::from_raw(40, 140, vec![0u8; 40 * 140 * 4]).unwrap();
-        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+        let buf = kimg::RgbaImage::from_raw(40, 140, vec![0u8; 40 * 140 * 4]).unwrap();
+        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![kimg::Frame::new(buf)]));
         ed.read(cx).math_slots().borrow_mut().insert(
             super::super::inline_math_key("\\int_0^1 x^2 dx"),
             super::super::MathSlot::Ready(img, 20., 70.),

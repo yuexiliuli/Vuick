@@ -1,7 +1,7 @@
 use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
 use smallvec::SmallVec;
 
-use image::{Delay, Frame};
+use kimg::{Delay, Frame};
 use std::{
     borrow::Cow,
     fmt,

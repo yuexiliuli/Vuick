@@ -51,9 +51,9 @@ use async_task::Runnable;
 use collections::FxHashMap;
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
-use image::RgbaImage;
-use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, DynamicImage, Frame};
+use kimg::RgbaImage;
+use kimg::codecs::gif::GifDecoder;
+use kimg::{AnimationDecoder as _, DynamicImage, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -2561,7 +2561,7 @@ pub struct WindowOptions {
     pub window_decorations: Option<WindowDecorations>,
 
     /// Icon image (X11 only)
-    pub icon: Option<Arc<image::RgbaImage>>,
+    pub icon: Option<Arc<kimg::RgbaImage>>,
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
@@ -2625,7 +2625,7 @@ pub struct WindowParams {
 
     /// An image to set as the window icon (x11 only)
     #[cfg_attr(feature = "wayland", allow(dead_code))]
-    pub icon: Option<Arc<image::RgbaImage>>,
+    pub icon: Option<Arc<kimg::RgbaImage>>,
 
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub display_id: Option<DisplayId>,
@@ -3245,16 +3245,16 @@ pub struct Image {
 
 pub(crate) fn decode_static_image(
     bytes: &[u8],
-    format: image::ImageFormat,
+    format: kimg::ImageFormat,
 ) -> Result<SmallVec<[Frame; 1]>> {
-    let decoder = image::ImageReader::with_format(Cursor::new(bytes), format)
+    let decoder = kimg::ImageReader::with_format(Cursor::new(bytes), format)
         .into_decoder()
         .context("creating image decoder")?;
     decode_static_image_from_decoder(decoder)
 }
 
 pub(crate) fn decode_static_image_from_decoder(
-    mut decoder: impl image::ImageDecoder,
+    mut decoder: impl kimg::ImageDecoder,
 ) -> Result<SmallVec<[Frame; 1]>> {
     let orientation = decoder
         .orientation()
@@ -3358,18 +3358,18 @@ impl Image {
 
                 frames
             }
-            ImageFormat::Png => decode_static_image(&self.bytes, image::ImageFormat::Png)?,
-            ImageFormat::Jpeg => decode_static_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => decode_static_image(&self.bytes, image::ImageFormat::WebP)?,
-            ImageFormat::Bmp => decode_static_image(&self.bytes, image::ImageFormat::Bmp)?,
-            ImageFormat::Tiff => decode_static_image(&self.bytes, image::ImageFormat::Tiff)?,
-            ImageFormat::Ico => decode_static_image(&self.bytes, image::ImageFormat::Ico)?,
+            ImageFormat::Png => decode_static_image(&self.bytes, kimg::ImageFormat::Png)?,
+            ImageFormat::Jpeg => decode_static_image(&self.bytes, kimg::ImageFormat::Jpeg)?,
+            ImageFormat::Webp => decode_static_image(&self.bytes, kimg::ImageFormat::WebP)?,
+            ImageFormat::Bmp => decode_static_image(&self.bytes, kimg::ImageFormat::Bmp)?,
+            ImageFormat::Tiff => decode_static_image(&self.bytes, kimg::ImageFormat::Tiff)?,
+            ImageFormat::Ico => decode_static_image(&self.bytes, kimg::ImageFormat::Ico)?,
             ImageFormat::Svg => {
                 return svg_renderer
                     .render_single_frame(&self.bytes, 1.0)
                     .map_err(Into::into);
             }
-            ImageFormat::Pnm => decode_static_image(&self.bytes, image::ImageFormat::Pnm)?,
+            ImageFormat::Pnm => decode_static_image(&self.bytes, kimg::ImageFormat::Pnm)?,
         };
 
         Ok(Arc::new(RenderImage::new(frames)))

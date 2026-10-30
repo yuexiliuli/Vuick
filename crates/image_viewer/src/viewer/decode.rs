@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{Context, RenderImage};
-use image::Frame;
+use kimg::Frame;
 
 use config::image::{
     CACHE_MAX_BYTES, CACHE_MAX_ITEMS, MAX_DECODE, PREFETCH_BACKWARD, PREFETCH_FORWARD,

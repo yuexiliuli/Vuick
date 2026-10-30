@@ -16,7 +16,7 @@ use crate::{
     app::{GpuiBorrow, GpuiMode},
 };
 use anyhow::Result;
-use image::RgbaImage;
+use kimg::RgbaImage;
 use std::{future::Future, rc::Rc, sync::Arc, time::Duration};
 
 /// A cross-platform headless app context for tests that need real text shaping.

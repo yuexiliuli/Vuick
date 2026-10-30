@@ -13,7 +13,7 @@
 use std::sync::{Arc, OnceLock};
 
 use gpui::{ImageSource, InteractiveElement, IntoElement, ParentElement, RenderImage, Styled};
-use image::{Frame, GenericImageView, ImageReader};
+use kimg::{Frame, GenericImageView, ImageReader};
 
 /// 应用图标 PNG 字节。
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app-icon-228x228.png");
@@ -34,9 +34,9 @@ pub fn app_icon_render() -> Arc<RenderImage> {
             // gpui `RenderImage` 文档明示缓冲按 **BGRA** 字节序消费（pdf 同款姿势：
             // 把 bgra 字节标成 RgbaImage 喂入即正确显示）；`image` 解码给的是 RGBA →
             // 交换 R/B 再包 `Frame`，否则上屏 R/B 互换（青蓝变橙黄，真机取证确认）。
-            let bgra = image::ImageBuffer::from_fn(w, h, |x, y| {
+            let bgra = kimg::ImageBuffer::from_fn(w, h, |x, y| {
                 let p = rgba.get_pixel(x, y);
-                image::Rgba([p[2], p[1], p[0], p[3]])
+                kimg::Rgba([p[2], p[1], p[0], p[3]])
             });
             Arc::new(RenderImage::new(vec![Frame::new(bgra)]))
         })

@@ -59,7 +59,7 @@ use gpui::{
     ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledImage, Window, anchored, canvas,
     deferred, div, img, point, px, prelude::FluentBuilder as _,
 };
-use image::{Frame, RgbaImage};
+use kimg::{Frame, RgbaImage};
 
 use ui::button::Button;
 use ui::button::ButtonVariants as _;

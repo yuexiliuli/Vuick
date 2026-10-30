@@ -10,8 +10,6 @@ description = "gpui-editor 自研 Markdown 渲染 + WYSIWYG 所见即所得编�
 gpui = { workspace = true }
 # 大文档「分块读盘·渐进装配」/ 解析报错上下文。
 anyhow = { workspace = true }
-# 位图（WebP/PNG 图片行、EPUB 内存图）栅格化。
-image = { workspace = true }
 # LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = { workspace = true }
 ratex-layout = { workspace = true }

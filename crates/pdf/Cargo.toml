@@ -9,7 +9,7 @@ build = "build.rs"
 [dependencies]
 gpui = { workspace = true }
 pdfium-render = { workspace = true }
-image = { workspace = true }
+kimg = { workspace = true }
 anyhow = { workspace = true }
 zstd = { workspace = true }
 config = { path = "../config" }

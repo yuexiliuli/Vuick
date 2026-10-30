@@ -21,7 +21,7 @@ pub struct ImageReader<R: Read + Seek> {
 }
 
 /// `Reader` 的命名迁移别名。
-#[deprecated(note = "此类型已迁移并改名为 image::ImageReader")]
+#[deprecated(note = "此类型已迁移并改名为 kimg::ImageReader")]
 pub type Reader<R> = ImageReader<R>;
 
 impl<'a, R: 'a + BufRead + Seek> ImageReader<R> {

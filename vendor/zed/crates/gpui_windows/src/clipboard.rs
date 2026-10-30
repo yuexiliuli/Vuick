@@ -221,12 +221,12 @@ fn write_image(item: &Image) -> Result<()> {
 
 fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
     let img_format = gpui_to_image_format(format)?;
-    let image = image::load_from_memory_with_format(bytes, img_format)
+    let image = kimg::load_from_memory_with_format(bytes, img_format)
         .map_err(|e| log::warn!("Failed to decode image for PNG conversion: {e}"))
         .ok()?;
     let mut buf = Vec::new();
     image
-        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .write_to(&mut std::io::Cursor::new(&mut buf), kimg::ImageFormat::Png)
         .map_err(|e| log::warn!("Failed to encode PNG: {e}"))
         .ok()?;
     Some(buf)
@@ -325,14 +325,14 @@ fn log_unsupported_clipboard_formats() {
     }
 }
 
-fn gpui_to_image_format(value: ImageFormat) -> Option<image::ImageFormat> {
+fn gpui_to_image_format(value: ImageFormat) -> Option<kimg::ImageFormat> {
     match value {
-        ImageFormat::Png => Some(image::ImageFormat::Png),
-        ImageFormat::Jpeg => Some(image::ImageFormat::Jpeg),
-        ImageFormat::Webp => Some(image::ImageFormat::WebP),
-        ImageFormat::Gif => Some(image::ImageFormat::Gif),
-        ImageFormat::Bmp => Some(image::ImageFormat::Bmp),
-        ImageFormat::Tiff => Some(image::ImageFormat::Tiff),
+        ImageFormat::Png => Some(kimg::ImageFormat::Png),
+        ImageFormat::Jpeg => Some(kimg::ImageFormat::Jpeg),
+        ImageFormat::Webp => Some(kimg::ImageFormat::WebP),
+        ImageFormat::Gif => Some(kimg::ImageFormat::Gif),
+        ImageFormat::Bmp => Some(kimg::ImageFormat::Bmp),
+        ImageFormat::Tiff => Some(kimg::ImageFormat::Tiff),
         other => {
             log::warn!("No image crate equivalent for format: {other:?}");
             None

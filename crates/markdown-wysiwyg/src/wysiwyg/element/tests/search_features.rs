@@ -662,10 +662,10 @@ fn mermaid_wheel_zooms_block(cx: &mut TestAppContext) {
 fn rasterize_mm_png(
     placed: &[super::MmPlaced],
     edges: &[super::MmPolylineEdge],
-) -> (image::RgbaImage, usize) {
+) -> (kimg::RgbaImage, usize) {
     const PAD: i32 = 40;
     if placed.is_empty() {
-        return (image::RgbaImage::new(1, 1), 0);
+        return (kimg::RgbaImage::new(1, 1), 0);
     }
     let mut x0f = f32::MAX;
     let mut y0f = f32::MAX;
@@ -680,7 +680,7 @@ fn rasterize_mm_png(
     let w = ((x1f - x0f) as i32 + 2 * PAD).max(8);
     let h = ((y1f - y0f) as i32 + 2 * PAD).max(8);
     let mut img =
-        image::RgbaImage::from_pixel(w as u32, h as u32, image::Rgba([255, 255, 255, 255]));
+        kimg::RgbaImage::from_pixel(w as u32, h as u32, kimg::Rgba([255, 255, 255, 255]));
     let ox = -x0f as i32 + PAD;
     let oy = -y0f as i32 + PAD;
     let mut ink = 0usize;
@@ -725,7 +725,7 @@ fn rasterize_mm_png(
 }
 
 fn mm_blit(
-    img: &mut image::RgbaImage,
+    img: &mut kimg::RgbaImage,
     ink: &mut usize,
     x0: i32,
     y0: i32,

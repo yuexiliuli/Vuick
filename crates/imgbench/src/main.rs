@@ -11,9 +11,9 @@
 //! 输出行带 `BENCH <fmt> ...` 便于 grep 归档。
 #![allow(dead_code)]
 
-use image::codecs::gif::GifDecoder;
-use image::AnimationDecoder;
-use image::ImageReader;
+use kimg::codecs::gif::GifDecoder;
+use kimg::AnimationDecoder;
+use kimg::ImageReader;
 use std::{
     ffi::OsStr,
     fs,

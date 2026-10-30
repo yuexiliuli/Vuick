@@ -8,7 +8,7 @@ use crate::{
 };
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
-use image::RgbaImage;
+use kimg::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{

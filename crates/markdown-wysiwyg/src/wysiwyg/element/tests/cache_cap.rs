@@ -75,8 +75,8 @@ fn install_open_clears_math_and_code_caches(cx: &mut TestAppContext) {
     let vcx: &mut VisualTestContext = vcx;
     vcx.update(|_window, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
-        let buf = image::RgbaImage::from_raw(8, 8, vec![0u8; 8 * 8 * 4]).unwrap();
-        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+        let buf = kimg::RgbaImage::from_raw(8, 8, vec![0u8; 8 * 8 * 4]).unwrap();
+        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![kimg::Frame::new(buf)]));
         // 换源前：math_slots 有一个 Ready + 一个 Loading；code_parse 有一条待办缓存。
         {
             let cache = ed.read(cx).math_slots();

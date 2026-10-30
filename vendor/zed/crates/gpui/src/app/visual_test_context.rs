@@ -6,7 +6,7 @@ use crate::{
     Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
 };
 use anyhow::anyhow;
-use image::RgbaImage;
+use kimg::RgbaImage;
 use std::{future::Future, rc::Rc, sync::Arc, time::Duration};
 
 /// A test context that uses real macOS rendering instead of mocked rendering.

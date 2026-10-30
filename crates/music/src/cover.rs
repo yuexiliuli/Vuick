@@ -14,10 +14,10 @@ use gpui::RenderImage;
 
 /// 解码图片字节为 BGRA `RenderImage`（单帧静态；失败给可读错误不是 panic）。
 pub(crate) fn decode_to_render(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
-    let img = image::load_from_memory(bytes).map_err(|e| format!("无法解码封面：{e}"))?;
+    let img = kimg::load_from_memory(bytes).map_err(|e| format!("无法解码封面：{e}"))?;
     let mut rgba = img.to_rgba8();
     swap_rb_in_place(rgba.as_mut());
-    let frame = image::Frame::new(rgba);
+    let frame = kimg::Frame::new(rgba);
     Ok(Arc::new(RenderImage::new(vec![frame])))
 }
 
@@ -40,11 +40,11 @@ mod tests {
 
     /// 生成 2×1 的纯红 PNG（R=255, G=B=0）字节，供解码回归用。
     fn tiny_red_png() -> Vec<u8> {
-        let img: image::RgbaImage =
-            image::ImageBuffer::from_pixel(2, 1, image::Rgba([255u8, 0, 0, 255]));
+        let img: kimg::RgbaImage =
+            kimg::ImageBuffer::from_pixel(2, 1, kimg::Rgba([255u8, 0, 0, 255]));
         let mut out = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(img)
-            .write_to(&mut out, image::ImageFormat::Png)
+        kimg::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, kimg::ImageFormat::Png)
             .expect("png 编码应成功");
         out.into_inner()
     }

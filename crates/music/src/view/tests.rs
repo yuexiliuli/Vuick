@@ -22,11 +22,11 @@ use crate::player::MusicPlayer;
 
 /// 极小有效 PNG（2×1 纯红）字节：作为同名封面侧车装进临时库。
 fn tiny_png_bytes() -> Vec<u8> {
-    let img: image::RgbaImage =
-        image::ImageBuffer::from_pixel(2, 1, image::Rgba([255u8, 0, 0, 255]));
+    let img: kimg::RgbaImage =
+        kimg::ImageBuffer::from_pixel(2, 1, kimg::Rgba([255u8, 0, 0, 255]));
     let mut out = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut out, image::ImageFormat::Png)
+    kimg::DynamicImage::ImageRgba8(img)
+        .write_to(&mut out, kimg::ImageFormat::Png)
         .expect("png 编码应成功");
     out.into_inner()
 }

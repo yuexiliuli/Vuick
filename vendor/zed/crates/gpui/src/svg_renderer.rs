@@ -2,7 +2,7 @@ use crate::{
     AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,
 };
-use image::Frame;
+use kimg::Frame;
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
@@ -207,7 +207,7 @@ impl SvgRenderer {
         };
         let pixmap = rasterize_tree(&svg.0, size)?;
         let mut buffer =
-            image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
+            kimg::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
 
         for pixel in buffer.chunks_exact_mut(4) {
             swap_rgba_pa_to_bgra(pixel);

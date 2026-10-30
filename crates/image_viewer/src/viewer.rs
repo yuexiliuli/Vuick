@@ -26,7 +26,7 @@
 //!   AVX2/SSE2 IDCT 降档 + 直出 BGRA，无 `DynamicImage` 中间拷贝）按 [`Self::display_need`]
 //!   档位解码。选档规则 = **解码分辨率 ≥ 显示需要的像素**（上限 1/8，需要涨则分母落，
 //!   需要超过原图才全解）——GPU 只缩小不放大 → **显示不糊**；单帧内存 75MB→~20MB。
-//! - **PNG 同款降档**：PNG 走 `image::codecs::png::PngDecoder` 全量解出 RGBA8（palette/
+//! - **PNG 同款降档**：PNG 走 `kimg::codecs::png::PngDecoder` 全量解出 RGBA8（palette/
 //!   灰度/16bit 展开归一）后按同一选档规则**盒式降采样**到展示档（rayon 行组并行，小图
 //!   退串行）——缓存/GPU 上传像素数按 den² 缩小，放大升档链路与 JPEG 对齐。
 //! - **内存/CPU 有界**：解码并发照旧 [`MAX_DECODE`]-1 预取封顶，且 [`Self::pump_prefetch`]
@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{App, Context, Hsla, RenderImage, ScrollHandle, Window};
-use image::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
+use kimg::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
 use libjpeg_turbo_rs::{Decoder as LtjDecoder, PixelFormat as LtjPixelFormat, ScalingFactor};
 
 use config::image::{BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS};
@@ -764,17 +764,17 @@ fn box_downsample_bgra_or_rgba_rayon(buf: &[u8], iw: u32, ih: u32, den: u8) -> (
 /// PngDecoder 固定 EXPAND 变换：palette 已展开为 Rgb/Rgba、<8bit 已升到 8bit，但 16bit
 /// 通道仍为 L16/La16/Rgb16/Rgba16（`read_image` 已按契约转本机字节序）——这里统一按
 /// 高字节右移 8 归一为 u8（与 image 16→8 缩放惯例一致）。
-fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> Option<Vec<u8>> {
+fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: kimg::ColorType) -> Option<Vec<u8>> {
     let n = (w as usize).checked_mul(h as usize)?;
     let mut out = vec![0u8; n * 4];
     match color {
-        image::ColorType::Rgba8 => {
+        kimg::ColorType::Rgba8 => {
             if buf.len() != n * 4 {
                 return None;
             }
             out.copy_from_slice(buf);
         }
-        image::ColorType::Rgb8 => {
+        kimg::ColorType::Rgb8 => {
             if buf.len() != n * 3 {
                 return None;
             }
@@ -783,7 +783,7 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> O
                 dst[3] = 255;
             }
         }
-        image::ColorType::L8 => {
+        kimg::ColorType::L8 => {
             if buf.len() != n {
                 return None;
             }
@@ -794,7 +794,7 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> O
                 dst[3] = 255;
             }
         }
-        image::ColorType::La8 => {
+        kimg::ColorType::La8 => {
             if buf.len() != n * 2 {
                 return None;
             }
@@ -805,7 +805,7 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> O
                 dst[3] = p[1];
             }
         }
-        image::ColorType::Rgba16 => {
+        kimg::ColorType::Rgba16 => {
             if buf.len() != n * 8 {
                 return None;
             }
@@ -816,7 +816,7 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> O
                 dst[3] = (u16::from_ne_bytes([p[6], p[7]]) >> 8) as u8;
             }
         }
-        image::ColorType::Rgb16 => {
+        kimg::ColorType::Rgb16 => {
             if buf.len() != n * 6 {
                 return None;
             }
@@ -827,7 +827,7 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> O
                 dst[3] = 255;
             }
         }
-        image::ColorType::L16 => {
+        kimg::ColorType::L16 => {
             if buf.len() != n * 2 {
                 return None;
             }
@@ -839,7 +839,7 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> O
                 dst[3] = 255;
             }
         }
-        image::ColorType::La16 => {
+        kimg::ColorType::La16 => {
             if buf.len() != n * 4 {
                 return None;
             }
@@ -857,7 +857,7 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: image::ColorType) -> O
     Some(out)
 }
 
-/// PNG 按展示需要**降档解码**（`image::codecs::png::PngDecoder` 解全量位图，非 RGBA8 先
+/// PNG 按展示需要**降档解码**（`kimg::codecs::png::PngDecoder` 解全量位图，非 RGBA8 先
 /// 展开，再对全量做盒式降采样到展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。
 /// 选档复用 [`pick_jpeg_denom`]（与格式无关的「解码 ≥ 显示」语义）。
 /// - den=1 → 与改动前 `image` 全解**逐像素一致**（RGBA swap 成 BGRA，尺寸=原始）；
@@ -867,10 +867,10 @@ fn decode_png_display(
     bytes: &[u8],
     need: (f32, f32),
 ) -> Result<(Vec<u8>, u32, u32, u8), String> {
-    let mut dec = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
+    let mut dec = kimg::codecs::png::PngDecoder::new(Cursor::new(bytes))
         .map_err(|e| format!("PNG 解码器初始化失败：{e}"))?;
     // 与 `image` 全解一致的上限护栏（Limits::default()：max_alloc=512MB / 最大宽高 65535）
-    dec.set_limits(image::Limits::default())
+    dec.set_limits(kimg::Limits::default())
         .map_err(|e| format!("PNG 尺寸超限：{e}"))?;
     let (iw, ih) = dec.dimensions();
     let den = pick_jpeg_denom(iw, ih, need);
@@ -880,7 +880,7 @@ fn decode_png_display(
     dec.read_image(&mut raw)
         .map_err(|e| format!("PNG 解码失败：{e}"))?;
     // 8bit RGBA 直接复用读出缓冲（零拷贝）；其余色彩逐一展开到 RGBA8
-    let mut rgba = if color == image::ColorType::Rgba8 {
+    let mut rgba = if color == kimg::ColorType::Rgba8 {
         raw
     } else {
         expand_png_to_rgba8(&raw, iw, ih, color).ok_or("PNG 色彩转换失败")?
@@ -911,7 +911,7 @@ fn bgra_single_frame(bgra: Vec<u8>, w: u32, h: u32) -> Option<Frame> {
 /// 单帧静态解码：`image` 全解取首帧 → **BGRA** 帧序列（GIF 异常回退等独立路径用，
 /// 不递归 GifDecoder）。
 fn decode_static_first_frame(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
-    let img = image::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
+    let img = kimg::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
     let mut rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     swap_rb_in_place(rgba.as_mut());
@@ -922,7 +922,7 @@ fn decode_static_first_frame(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), Str
 /// 也解不动时返回原始 GIF 错误（顶层仍以加载错误呈现，不 panic）。
 fn decode_static_first_frame_or(
     bytes: &[u8],
-    gif_err: image::ImageError,
+    gif_err: kimg::ImageError,
 ) -> Result<(Vec<Frame>, u32, u32), String> {
     match decode_static_first_frame(bytes) {
         Ok(out) => Ok(out),
@@ -942,20 +942,20 @@ fn decode_static_first_frame_or(
 /// 2. 帧尺寸与逻辑屏不一致（异常文件）→ 整体回退「首帧静态」；
 /// 3. 全帧解码失败 → [`decode_static_first_frame_or`] 回退「首帧静态」，绝不硬失败。
 fn decode_gif_frames(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
-    let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+    let mut decoder = kimg::codecs::gif::GifDecoder::new(Cursor::new(bytes))
         .map_err(|e| format!("无法解码图片：{e}"))?;
     // 资源护栏①：套上 image 默认 Limits（max_alloc=512MB）——`GifDecoder::new` 内部是
     // `Limits::no_limits()`，直接 `into_frames` 会在首个帧前就按逻辑屏画布预分配无上限
     // 的 RGBA 画布（荒谬超大逻辑屏描述符可瞬间吃爆内存）；默认 limits 在 `reserve` 阶段
     // 用 512MB 单分配预算拦下，超额以 `ImageResult` 报错，不 panic。
     decoder
-        .set_limits(image::Limits::default())
+        .set_limits(kimg::Limits::default())
         .map_err(|e| format!("无法解码图片：{e}"))?;
     let (w, h) = decoder.dimensions();
     let frames = match decoder
         .into_frames()
         .take(MAX_GIF_FRAMES)
-        .collect::<image::ImageResult<Vec<_>>>()
+        .collect::<kimg::ImageResult<Vec<_>>>()
     {
         Ok(frames) => frames,
         Err(e) => return decode_static_first_frame_or(bytes, e),
@@ -1057,7 +1057,7 @@ mod tests {
     /// 写一张真实 PNG（`image` 默认特性可编码；JPEG 不支持 RGBA 编码，故其它
     /// 扩展名用例直接用占位字节——扫描只看扩展名，不看内容）。
     fn write_png(path: &Path, w: u32, h: u32) {
-        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([200_u8, 30, 10, 255]));
+        let img = kimg::RgbaImage::from_pixel(w, h, kimg::Rgba([200_u8, 30, 10, 255]));
         img.save(path).expect("本测试自产 PNG 应能写出");
     }
 
@@ -1365,8 +1365,8 @@ mod tests {
     fn gray_and_16bit_png_expand_to_rgba8() {
         let dir = tmp_dir("png_ex");
         let g8 = dir.join("g8.png");
-        let img: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
-            image::ImageBuffer::from_pixel(4, 3, image::Luma([128]));
+        let img: kimg::ImageBuffer<kimg::Luma<u8>, Vec<u8>> =
+            kimg::ImageBuffer::from_pixel(4, 3, kimg::Luma([128]));
         img.save(&g8).expect("写出灰度 PNG 应成功");
         let bytes8 = std::fs::read(&g8).unwrap();
         let (b8, w8, h8, _) = decode_png_display(&bytes8, (1000.0, 1000.0)).unwrap();
@@ -1374,8 +1374,8 @@ mod tests {
         assert_eq!(b8.len(), 4 * 3 * 4);
         assert_eq!([b8[0], b8[1], b8[2], b8[3]], [128, 128, 128, 255], "灰度 → R=G=B");
         let g16 = dir.join("g16.png");
-        let img16: image::ImageBuffer<image::Luma<u16>, Vec<u16>> =
-            image::ImageBuffer::from_pixel(2, 2, image::Luma([0xABCDu16]));
+        let img16: kimg::ImageBuffer<kimg::Luma<u16>, Vec<u16>> =
+            kimg::ImageBuffer::from_pixel(2, 2, kimg::Luma([0xABCDu16]));
         img16.save(&g16).expect("写出 16bit 灰度 PNG 应成功");
         let bytes16 = std::fs::read(&g16).unwrap();
         let (b16, w16, h16, _) = decode_png_display(&bytes16, (1000.0, 1000.0)).unwrap();
@@ -1509,13 +1509,13 @@ mod tests {
         let bytes = std::fs::read(&p).unwrap();
         let need = (1376.0, 1032.0);
         // 独立复刻 decode 的「全量解码」步骤，只计时「降采样」两版本
-        let dec = image::codecs::png::PngDecoder::new(Cursor::new(&bytes)).unwrap();
+        let dec = kimg::codecs::png::PngDecoder::new(Cursor::new(&bytes)).unwrap();
         let (iw, ih) = dec.dimensions();
         let color = dec.color_type();
         let n = usize::try_from(dec.total_bytes()).unwrap();
         let mut raw = vec![0u8; n];
         dec.read_image(&mut raw).unwrap();
-        let rgba = if color == image::ColorType::Rgba8 {
+        let rgba = if color == kimg::ColorType::Rgba8 {
             raw
         } else {
             expand_png_to_rgba8(&raw, iw, ih, color).unwrap()
@@ -1546,18 +1546,18 @@ mod tests {
     /// 编码一张 N 帧测试 GIF（每帧统一 4×3 逻辑屏全画布；(0,0) 像素为 `color`、帧 delay 为
     /// `ms`）。用 `GifEncoder`（image 0.25 默认特性含 gif 编码）。GIF 编码 delay 精度
     /// 10ms（写盘时除 10 取整），测试参数须用 10 的倍数才能精确往返。
-    fn encode_test_gif(frames: &[(image::Rgba<u8>, u32)]) -> Vec<u8> {
+    fn encode_test_gif(frames: &[(kimg::Rgba<u8>, u32)]) -> Vec<u8> {
         let (w, h) = (4u32, 3u32);
         let mut out = Vec::new();
-        let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+        let mut enc = kimg::codecs::gif::GifEncoder::new(&mut out);
         for (color, ms) in frames {
-            let mut buf = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
+            let mut buf = kimg::RgbaImage::from_pixel(w, h, kimg::Rgba([0, 0, 0, 0]));
             buf.put_pixel(0, 0, *color);
             let frame = Frame::from_parts(
                 buf,
                 0,
                 0,
-                image::Delay::from_numer_denom_ms(*ms, 1),
+                kimg::Delay::from_numer_denom_ms(*ms, 1),
             );
             enc.encode_frame(frame).expect("测试自产 GIF 应能编码");
         }
@@ -1569,8 +1569,8 @@ mod tests {
     fn gif_anim_decodes_frames_preserves_delay_and_bgra() {
         // 帧0：(0,0) 红 delay 100ms；帧1：(0,0) 蓝 delay 200ms
         let bytes = encode_test_gif(&[
-            (image::Rgba([255, 0, 0, 255]), 100),
-            (image::Rgba([0, 0, 255, 255]), 200),
+            (kimg::Rgba([255, 0, 0, 255]), 100),
+            (kimg::Rgba([0, 0, 255, 255]), 200),
         ]);
         let (frames, w, h) = decode_generic(&bytes).expect("自产 GIF 应能解码全帧");
         assert_eq!((w, h), (4, 3), "逻辑屏尺寸");
@@ -1596,7 +1596,7 @@ mod tests {
 
     #[test]
     fn gif_single_frame_decodes_as_one_frame() {
-        let bytes = encode_test_gif(&[(image::Rgba([10, 20, 30, 255]), 0)]);
+        let bytes = encode_test_gif(&[(kimg::Rgba([10, 20, 30, 255]), 0)]);
         let (frames, w, h) = decode_generic(&bytes).expect("单帧 GIF 应能解码");
         assert_eq!((w, h), (4, 3));
         assert_eq!(frames.len(), 1, "单帧 GIF 只有一帧");
@@ -1620,7 +1620,7 @@ mod tests {
     fn gif_frame_cap_keeps_only_first_n_frames() {
         let mut frames = Vec::new();
         for i in 0..(MAX_GIF_FRAMES + 50) {
-            frames.push((image::Rgba([(i % 256) as u8, 0, 0, 255]), 10));
+            frames.push((kimg::Rgba([(i % 256) as u8, 0, 0, 255]), 10));
         }
         let bytes = encode_test_gif(&frames);
         let (got, _, _) = decode_generic(&bytes).expect("超长 GIF 应能解码");
@@ -1639,8 +1639,8 @@ mod tests {
         let dir = tmp_dir("gif_clock");
         let p = dir.join("anim.gif");
         let bytes = encode_test_gif(&[
-            (image::Rgba([10, 20, 30, 255]), 120),
-            (image::Rgba([200, 100, 50, 255]), 120),
+            (kimg::Rgba([10, 20, 30, 255]), 120),
+            (kimg::Rgba([200, 100, 50, 255]), 120),
         ]);
         std::fs::write(&p, &bytes).unwrap();
         let viewer: gpui::Entity<ImageViewer> =
@@ -1730,12 +1730,12 @@ mod tests {
     /// 写一张有内容（渐变）的 JPEG：编码走 `libjpeg-turbo`（`image`(=kimg) 无 JPEG 编码器，
     /// 其 save 只支持 PNG/GIF）。
     fn write_jpeg(path: &Path, w: u32, h: u32) {
-        let mut img = image::RgbImage::new(w, h);
+        let mut img = kimg::RgbImage::new(w, h);
         for (x, y, px) in img.enumerate_pixels_mut() {
             let r = ((x * 255) / w) as u8;
             let g = ((y * 255) / h) as u8;
             let b = ((x + y) * 60 / (w + h)) as u8;
-            *px = image::Rgb([r, g, b]);
+            *px = kimg::Rgb([r, g, b]);
         }
         let jpeg = libjpeg_turbo_rs::compress(
             img.as_raw(),
@@ -2292,12 +2292,12 @@ mod tests {
 
     /// 写一张有内容（渐变）的 PNG——纯色会压缩成接近 0 字节、解码快，测不出差距。
     fn write_pattern_png(path: &Path, w: u32, h: u32) {
-        let mut img = image::RgbaImage::new(w, h);
+        let mut img = kimg::RgbaImage::new(w, h);
         for (x, y, px) in img.enumerate_pixels_mut() {
             let r = ((x * 255) / w) as u8;
             let g = ((y * 255) / h) as u8;
             let b = ((x + y) * 60 / (w + h)) as u8;
-            *px = image::Rgba([r, g, b, 255]);
+            *px = kimg::Rgba([r, g, b, 255]);
         }
         img.save(path).expect("写出渐变 PNG 应成功");
     }

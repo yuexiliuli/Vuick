@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use futures::Future;
 use gpui_util::ResultExt;
-use image::{
+use kimg::{
     AnimationDecoder, ImageError, ImageFormat, Rgba,
     codecs::{gif::GifDecoder, webp::WebPDecoder},
 };
@@ -237,7 +237,7 @@ pub fn img(source: impl Into<ImageSource>) -> Img {
 impl Img {
     /// A list of all format extensions currently supported by this img element
     pub fn extensions() -> &'static [&'static str] {
-        // This is the list in [image::ImageFormat::from_extension] + `svg`
+        // This is the list in [kimg::ImageFormat::from_extension] + `svg`
         &[
             "avif", "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "tga", "dds", "bmp", "ico",
             "hdr", "exr", "pbm", "pam", "ppm", "pgm", "ff", "farbfeld", "qoi", "svg",
@@ -709,7 +709,7 @@ impl Asset for ImageAssetLoader {
                 }
             };
 
-            if let Ok(format) = image::guess_format(&bytes) {
+            if let Ok(format) = kimg::guess_format(&bytes) {
                 let data = match format {
                     ImageFormat::Gif => {
                         let decoder = GifDecoder::new(Cursor::new(&bytes))?;
@@ -836,8 +836,8 @@ impl From<usvg::Error> for ImageCacheError {
     }
 }
 
-impl From<image::ImageError> for ImageCacheError {
-    fn from(value: image::ImageError) -> Self {
+impl From<kimg::ImageError> for ImageCacheError {
+    fn from(value: kimg::ImageError) -> Self {
         Self::Image(Arc::new(value))
     }
 }
@@ -846,7 +846,7 @@ impl From<image::ImageError> for ImageCacheError {
 mod tests {
     use super::*;
     use crate::{ParentElement as _, TestAppContext, canvas, div, point, px, size};
-    use image::{Frame, ImageBuffer, Rgba};
+    use kimg::{Frame, ImageBuffer, Rgba};
 
     const TEST_IMG_ID: &str = "test-img";
 

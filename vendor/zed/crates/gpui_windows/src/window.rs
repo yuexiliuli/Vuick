@@ -1050,7 +1050,7 @@ impl PlatformWindow for WindowsWindow {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<kimg::RgbaImage> {
         self.state
             .renderer
             .borrow_mut()

@@ -4588,16 +4588,16 @@
         for px in buf.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
-        image::save_buffer_with_format(
+        kimg::save_buffer_with_format(
             &path,
             &buf,
             4,
             2,
-            image::ExtendedColorType::Rgba8,
-            image::ImageFormat::Png,
+            kimg::ExtendedColorType::Rgba8,
+            kimg::ImageFormat::Png,
         )
         .unwrap();
-        let img = image::open(&path).unwrap().to_rgba8();
+        let img = kimg::open(&path).unwrap().to_rgba8();
         assert_eq!(img.dimensions(), (4, 2));
         assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255], "红点应还原为 RGBA 红");
         assert_eq!(img.get_pixel(2, 0).0, [0, 255, 255, 255], "青点 BGR→RGB 应为 (0,255,255)");
@@ -4658,8 +4658,8 @@
             px.copy_from_slice(&[0, 0, 255, 255]); // BGRA 红
         }
         bgra[8..12].copy_from_slice(&[255, 255, 0, 255]); // BGRA 青
-        let frame = gpui::RenderImage::new(vec![image::Frame::new(
-            image::RgbaImage::from_raw(w, h, bgra).unwrap(),
+        let frame = gpui::RenderImage::new(vec![kimg::Frame::new(
+            kimg::RgbaImage::from_raw(w, h, bgra).unwrap(),
         )]);
         // 提取调用前确认 size/as_bytes 可及（一旦 gpui 改 API 这里先红）
         assert_eq!(frame.size(0).width.0, 4);

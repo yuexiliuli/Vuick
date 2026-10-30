@@ -454,7 +454,7 @@ impl DirectXRenderer {
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
-    ) -> Result<image::RgbaImage> {
+    ) -> Result<kimg::RgbaImage> {
         // A pending device-lost recovery (`skip_draws`) leaves the atlas holding
         // tile references from the previous device; drawing before the forced
         // re-render rebuilds them panics in `DirectXAtlasTextures::texture`.
@@ -516,11 +516,11 @@ impl DirectXRenderer {
             }
             context.Unmap(&staging, 0);
         }
-        // The render target is BGRA; image::RgbaImage expects RGBA.
+        // The render target is BGRA; kimg::RgbaImage expects RGBA.
         for px in pixels.chunks_exact_mut(4) {
             px.swap(0, 2);
         }
-        image::RgbaImage::from_raw(width, height, pixels)
+        kimg::RgbaImage::from_raw(width, height, pixels)
             .context("Failed to build RgbaImage from staging readback")
     }
 

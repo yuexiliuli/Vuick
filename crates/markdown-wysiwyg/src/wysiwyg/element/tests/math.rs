@@ -602,8 +602,8 @@ fn math_card_height_is_single_value_across_slot_states(cx: &mut TestAppContext) 
             .expect("应扫到一块公式");
         // 未就绪（回退）与就绪（任何位图）卡高必须**完全一致**。
         let h_empty = f32::from(super::math_card_height(ed.read(cx), &reg));
-        let buf = image::RgbaImage::from_raw(40, 24, vec![0u8; 40 * 24 * 4]).unwrap();
-        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+        let buf = kimg::RgbaImage::from_raw(40, 24, vec![0u8; 40 * 24 * 4]).unwrap();
+        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![kimg::Frame::new(buf)]));
         ed.read(cx).math_slots().borrow_mut().insert(
             reg.source.clone().into(),
             super::super::MathSlot::Ready(img, 5000., 68.5),
@@ -747,8 +747,8 @@ fn math_ready_invalidates_only_affected_rows_still_renders_ready(cx: &mut TestAp
         WyHost { ed }
     });
     let vcx: &mut VisualTestContext = vcx;
-    let buf = image::RgbaImage::from_raw(60, 40, vec![0u8; 60 * 40 * 4]).unwrap();
-    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+    let buf = kimg::RgbaImage::from_raw(60, 40, vec![0u8; 60 * 40 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![kimg::Frame::new(buf)]));
     let block_key = vcx.update(|window, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
         ed.update(cx, |e, _| e.set_caret(0));
@@ -840,8 +840,8 @@ fn inline_math_grown_row_caret_and_click_stay_aligned(cx: &mut TestAppContext) {
         let ed = host.read(cx).ed.clone();
         // 注入就绪位图（假数据，纯 CPU，无需 GPU）：40×70 逻辑 px（≈22px 排版的
         // `\int_0^1` 高）→ 行内 fit = min(fs/22×70, 2.2×行高) ≈ 41.8px > 行高 19。
-        let buf = image::RgbaImage::from_raw(80, 140, vec![0u8; 80 * 140 * 4]).unwrap();
-        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+        let buf = kimg::RgbaImage::from_raw(80, 140, vec![0u8; 80 * 140 * 4]).unwrap();
+        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![kimg::Frame::new(buf)]));
         ed.read(cx).math_slots().borrow_mut().insert(
             super::super::inline_math_key("\\int_0^1 x^2 dx"),
             super::super::MathSlot::Ready(img, 40., 70.),
