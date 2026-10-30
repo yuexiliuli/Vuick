@@ -14,7 +14,7 @@ use crate::format::ImageFormat;
 use crate::metadata::Orientation;
 use crate::pixel::{LumaA, Rgb};
 use crate::traits::Pixel;
-use crate::{GenericImage, GenericImageView, ImageDecoder};
+use crate::ImageDecoder;
 
 /// 动态图像：一个规范化通道序的像素矩阵枚举。
 #[derive(Debug, PartialEq, Clone)]

@@ -44,11 +44,12 @@ pub use crate::error::{
 };
 pub use crate::format::ImageFormat;
 pub use crate::free_functions::{
-    guess_format, load_from_memory, load_from_memory_with_format, open, save_buffer_with_format,
+    guess_format, load_from_memory, load_from_memory_with_format, open, save_buffer,
+    save_buffer_with_format,
 };
 #[allow(deprecated)]
 pub use crate::image_reader::{ImageReader, Reader};
 pub use crate::limits::{LimitSupport, Limits};
 pub use crate::metadata::Orientation;
 pub use crate::pixel::{Luma, LumaA, Rgb, Rgba};
-pub use crate::traits::{Pixel, Primitive};
+pub use crate::traits::{Pixel, PixelWithColorType, Primitive};

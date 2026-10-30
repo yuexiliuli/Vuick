@@ -13,7 +13,6 @@ use crate::error::{ImageError, ImageResult, UnsupportedError, UnsupportedErrorKi
 use crate::format::ImageFormat;
 use crate::image_reader::ImageReader;
 use crate::pixel::Rgba;
-use crate::GenericImageView;
 
 pub use crate::format::guess_format;
 
@@ -51,6 +50,19 @@ pub fn save_buffer_with_format(
     let mut file = BufWriter::new(File::create(path)?);
     let encoder = encoder_for_format(format, &mut file)?;
     encoder.write_image(buf, width, height, color)
+}
+
+/// 按路径扩展名推断格式并把原始缓冲存盘（PNG/GIF 可编码，其余格式返回 `Unsupported`）。
+pub fn save_buffer(
+    path: impl AsRef<Path>,
+    buf: &[u8],
+    width: u32,
+    height: u32,
+    color: impl Into<ExtendedColorType>,
+) -> ImageResult<()> {
+    let path = path.as_ref();
+    let format = ImageFormat::from_path(path)?;
+    save_buffer_with_format(path, buf, width, height, color, format)
 }
 
 /// 一次性的编码器 enum（覆盖 kimg 已实现的 PNG/GIF 编码）。

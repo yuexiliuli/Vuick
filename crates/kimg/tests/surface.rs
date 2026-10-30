@@ -189,14 +189,47 @@ fn free_function_consumer_patterns() {
     let _ = kimg::guess_format(&bytes);
 }
 
-/// 复刻 gpui_windows directx_renderer / window：RgbaImage::from_raw 桥接。
+/// 复刻 image_viewer 测试 `write_png`/灰度 PNG 路径：ImageBuffer 的 inherent
+/// `enumerate_pixels_mut`（无 trait 入作用域）+ `save`（PNG，含 16bit 灰度）须可编译可跑。
 #[test]
-fn bgra_to_rgba_consumer_pattern() {
-    let w = 2u32;
-    let h = 1u32;
-    let mut pixels = vec![0u8; (w * h * 4) as usize];
-    for px in pixels.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
+fn imagebuffer_save_and_inherent_iterators() {
+    use kimg::RgbImage;
+
+    let dir = std::env::temp_dir().join("kimg_surface_save");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Rgb8 渐变（用 inherent enumerate_pixels_mut，不 import GenericImage）。
+    let mut rgb = RgbImage::new(40, 20);
+    for (x, y, px) in rgb.enumerate_pixels_mut() {
+        *px = kimg::Rgb([(x * 6) as u8, (y * 12) as u8, 200]);
     }
-    let _img = RgbaImage::from_raw(w, h, pixels).unwrap();
+    let p = dir.join("save_rgb.png");
+    rgb.save(&p).expect("RGB PNG save ok");
+    assert!(std::fs::metadata(&p).unwrap().len() > 0);
+
+    // 读回断言尺寸与像素（kimg 自产自销 roundtrip）。
+    let back = kimg::load_from_memory(&std::fs::read(&p).unwrap()).unwrap();
+    assert_eq!(back.dimensions(), (40, 20));
+    let rgba = back.into_rgba8();
+    assert_eq!(rgba.get_pixel(1, 1).0[0], 6);
+
+    // Luma<u16> 16bit 灰度 PNG。
+    let mut g16 = kimg::Gray16Image::new(4, 4);
+    g16.put_pixel(1, 1, kimg::Luma([257u16]));
+    let p16 = dir.join("save_gray16.png");
+    g16.save(&p16).expect("gray16 PNG save ok");
+    let back16 = kimg::load_from_memory(&std::fs::read(&p16).unwrap()).unwrap();
+    assert_eq!(back16.color(), kimg::ColorType::L16);
+
+    // 自由函数 save_buffer（按扩展名推断格式）。
+    kimg::save_buffer(
+        dir.join("free.png"),
+        &[0u8; 4 * 4],
+        2,
+        2,
+        kimg::ExtendedColorType::Rgba8,
+    )
+    .expect("save_buffer png ok");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -19,7 +19,9 @@ zune-core = "0.5.3"
 
 [dev-dependencies]
 # parity 对照基线：kimg 的测试进程内同时链接 image 与 kimg 两个 crate，互不冲突。
-image = { workspace = true }
+# 显式钉 crates.io image 0.25：П3 前作 parity 对照，P4 会连同 tests/corpus.rs 一起移除。
+# 不能引用 workspace 的 image（alias 后即 kimg 自身）→ 环，必须写死版本。
+image = { version = "0.25", features = ["webp"] }
 
 [package.metadata.docs.rs]
 all-features = true

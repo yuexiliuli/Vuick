@@ -9,7 +9,7 @@ use crate::color::ColorType;
 use crate::error::{DecodingError, ImageError, ImageResult};
 use crate::format::ImageFormat;
 use crate::metadata::Orientation;
-use crate::{AnimationDecoder, GenericImageView, ImageDecoder};
+use crate::{AnimationDecoder, ImageDecoder};
 
 /// WebP 解码器（支持有损/无损/带 alpha/动画）。
 pub struct WebPDecoder<R> {

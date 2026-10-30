@@ -2,10 +2,12 @@
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::path::Path;
 
 use crate::error::{ImageError, ImageResult, ParameterError, ParameterErrorKind};
+use crate::format::ImageFormat;
 use crate::pixel::{Luma, LumaA, Rgb, Rgba};
-use crate::traits::Pixel;
+use crate::traits::{Pixel, PixelWithColorType, Primitive};
 
 /// 只读图像视图。
 pub trait GenericImageView {
@@ -286,6 +288,57 @@ impl<P: Pixel, Container: Deref<Target = [P::Subpixel]>> ImageBuffer<P, Containe
         let ptr = unsafe { self.data.as_ptr().add(index) as *const P };
         unsafe { &*ptr }
     }
+
+    /// 像素只读引用迭代器（行主序；镜像 image 0.25 的 inherent 方法，无需 trait 入作用域）。
+    pub fn pixels(&self) -> Pixels<'_, Self> {
+        let (width, height) = (self.width, self.height);
+        Pixels {
+            image: self,
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    /// 带坐标的像素只读引用迭代器。
+    pub fn enumerate_pixels(&self) -> EnumeratePixels<'_, Self> {
+        let (width, height) = (self.width, self.height);
+        EnumeratePixels {
+            image: self,
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    /// 按扩展名推断格式存盘。仅 PNG/GIF 可编码，其余格式返回 `Unsupported`。
+    pub fn save<Q>(&self, path: Q) -> ImageResult<()>
+    where
+        Q: AsRef<Path>,
+        P: PixelWithColorType,
+    {
+        let path = path.as_ref();
+        let format = ImageFormat::from_path(path)?;
+        self.save_with_format(path, format)
+    }
+
+    /// 按指定格式存盘。
+    pub fn save_with_format<Q>(&self, path: Q, format: ImageFormat) -> ImageResult<()>
+    where
+        Q: AsRef<Path>,
+        P: PixelWithColorType,
+    {
+        crate::save_buffer_with_format(
+            path,
+            pixel_bytes(&self.data[..]),
+            self.width,
+            self.height,
+            <P as PixelWithColorType>::COLOR_TYPE,
+            format,
+        )
+    }
 }
 
 impl<P: Pixel, Container: DerefMut<Target = [P::Subpixel]>> ImageBuffer<P, Container> {
@@ -343,6 +396,30 @@ impl<P: Pixel, Container: DerefMut<Target = [P::Subpixel]>> ImageBuffer<P, Conta
     /// 写像素（越界 panic）。
     pub fn put_pixel(&mut self, x: u32, y: u32, pixel: P) {
         *self.get_pixel_mut(x, y) = pixel;
+    }
+
+    /// 像素可变引用迭代器（行主序；镜像 image 0.25 的 inherent 方法，无需 trait 入作用域）。
+    pub fn pixels_mut(&mut self) -> PixelsMut<'_, Self> {
+        let (width, height) = (self.width, self.height);
+        PixelsMut {
+            image: self,
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    /// 带坐标的像素可变引用迭代器。
+    pub fn enumerate_pixels_mut(&mut self) -> EnumeratePixelsMut<'_, Self> {
+        let (width, height) = (self.width, self.height);
+        EnumeratePixelsMut {
+            image: self,
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
     }
 }
 
@@ -427,5 +504,13 @@ impl<'a, P: Pixel, Container: DerefMut<Target = [P::Subpixel]> + 'a> Iterator
         let data = self.image.as_mut();
         let ptr = unsafe { data.as_mut_ptr().add(index) as *mut P };
         unsafe { Some((x, y, &mut *ptr)) }
+    }
+}
+
+/// 把 `&[Subpixel]` 按内存布局视为 `&[u8]`（u8/u16/f32 均是无填充标量，与 image 的
+/// `EncodableLayout` 语义一致；16bit 输入由 PngEncoder 内部重排为大端）。
+fn pixel_bytes<T: Primitive>(data: &[T]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data))
     }
 }

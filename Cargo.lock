@@ -1877,9 +1877,9 @@ dependencies = [
  "hdrhistogram",
  "heapless",
  "http_client",
- "image",
  "inventory",
  "itertools 0.14.0",
+ "kimg",
  "libc",
  "log",
  "lyon",
@@ -1989,8 +1989,8 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_util",
- "image",
  "itertools 0.14.0",
+ "kimg",
  "log",
  "parking_lot",
  "rand 0.9.5",
@@ -2300,7 +2300,7 @@ version = "0.1.0"
 dependencies = [
  "config",
  "gpui",
- "image",
+ "kimg",
  "libjpeg-turbo-rs",
  "rayon",
  "ui",
@@ -2325,7 +2325,7 @@ dependencies = [
 name = "imgbench"
 version = "0.1.0"
 dependencies = [
- "image",
+ "kimg",
 ]
 
 [[package]]
@@ -2714,8 +2714,8 @@ dependencies = [
  "config",
  "editor",
  "gpui",
- "image",
  "ime",
+ "kimg",
  "ratex-layout",
  "ratex-parser",
  "ratex-render",
@@ -2736,8 +2736,8 @@ dependencies = [
  "config",
  "editor",
  "gpui",
- "image",
  "ime",
+ "kimg",
  "markdown",
  "ratex-layout",
  "ratex-parser",
@@ -2845,7 +2845,7 @@ dependencies = [
  "config",
  "cpal",
  "gpui",
- "image",
+ "kimg",
  "libloading",
 ]
 
@@ -3299,7 +3299,7 @@ dependencies = [
  "base",
  "config",
  "gpui",
- "image",
+ "kimg",
  "pdfium-render",
  "ui",
  "viewer",
@@ -5052,7 +5052,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 name = "tray"
 version = "0.1.0"
 dependencies = [
- "image",
+ "kimg",
  "windows 0.62.2",
 ]
 
@@ -5078,8 +5078,8 @@ dependencies = [
  "base",
  "config",
  "gpui",
- "image",
  "ime",
+ "kimg",
  "regex",
 ]
 
@@ -5265,7 +5265,7 @@ dependencies = [
  "config",
  "cpal",
  "gpui",
- "image",
+ "kimg",
  "libloading",
  "ui",
  "viewer",

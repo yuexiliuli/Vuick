@@ -16,7 +16,7 @@ use crate::format::ImageFormat;
 use crate::limits::{LimitSupport, Limits};
 use crate::metadata::Orientation;
 use crate::traits::Pixel;
-use crate::{AnimationDecoder, GenericImage, ImageDecoder};
+use crate::{AnimationDecoder, ImageDecoder};
 
 /// GIF 解码器。
 pub struct GifDecoder<R: Read> {

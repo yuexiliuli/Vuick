@@ -1727,7 +1727,8 @@ mod tests {
         eprintln!("[GIF-REAL] 渲染冒烟 ✓（解码就绪 + 绘制一帧完成）");
     }
 
-    /// 写一张有内容（渐变）的 JPEG：保存走 `image` 内置 jpeg 编码（default features 支持）。
+    /// 写一张有内容（渐变）的 JPEG：编码走 `libjpeg-turbo`（`image`(=kimg) 无 JPEG 编码器，
+    /// 其 save 只支持 PNG/GIF）。
     fn write_jpeg(path: &Path, w: u32, h: u32) {
         let mut img = image::RgbImage::new(w, h);
         for (x, y, px) in img.enumerate_pixels_mut() {
@@ -1736,7 +1737,16 @@ mod tests {
             let b = ((x + y) * 60 / (w + h)) as u8;
             *px = image::Rgb([r, g, b]);
         }
-        img.save(path).expect("写出渐变 JPEG 应成功");
+        let jpeg = libjpeg_turbo_rs::compress(
+            img.as_raw(),
+            w as usize,
+            h as usize,
+            LtjPixelFormat::Rgb,
+            90,
+            libjpeg_turbo_rs::Subsampling::S420,
+        )
+        .expect("libjpeg-turbo 编码渐变 JPEG 应成功");
+        std::fs::write(path, jpeg).expect("写出渐变 JPEG 应成功");
     }
 
     /// 组合「带 EXIF 嵌入缩略图」的合法 JPEG 字节（SOI + APP1-Exif（TIFF 内嵌缩略 JPEG），

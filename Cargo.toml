@@ -98,7 +98,9 @@ pdfium-render = "0.9.3"
 # pdfium dll 体积剪枝：build.rs 用 zstd level 19 压缩内嵌载荷（6.9MiB→2.9MiB），运行期一次性解压。
 # 许可 BSD-3-Clause/MIT（zstd），构建期编译自带 C 源（cc + MSVC，与 ffmpeg-sys-next 同工具链）。
 zstd = "0.13"
-image = { version = "0.25", features = ["webp"] }
+# image → kimg 替换桥接（П2 alias）：依赖键名保留 `image`，使全部现有 `use image::...`
+# 源码零改动解析到 kimg（package = "kimg"）；P4 会把键名换为 kimg 并逐处改 use。
+image = { package = "kimg", path = "crates/kimg" }
 # LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = "0.1"
 ratex-layout = "0.1"
