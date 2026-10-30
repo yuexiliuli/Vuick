@@ -2479,6 +2479,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kimg"
+version = "0.1.0"
+dependencies = [
+ "gif",
+ "image",
+ "image-webp",
+ "png 0.17.16",
+ "tiff",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

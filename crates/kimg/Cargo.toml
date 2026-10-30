@@ -1,0 +1,25 @@
+[package]
+name = "kimg"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "纯 Rust 图像解码/编码兼容层（镜像 image 0.25 的仓库实际使用子集）。第 3 阶段替换 image 的核心 crate。"
+
+[dependencies]
+# 图像后端（全部纯 Rust）。版本对齐 Cargo.lock 既有锁定（png/gif/image-webp/tiff）。
+# JPEG 用 zune-jpeg（== image 0.25.10 自身所用后端，保证字节级一致）——任务原始方案中的
+# jpeg-decoder 0.3 与 image 的参考输出存在 IDCT ±1 差异，无法达成 parity=0，故按实测替换。
+png = "0.17.16"
+gif = "0.14.2"
+image-webp = "0.2.4"
+tiff = "0.11.3"
+zune-jpeg = "0.5.15"
+zune-core = "0.5.3"
+
+[dev-dependencies]
+# parity 对照基线：kimg 的测试进程内同时链接 image 与 kimg 两个 crate，互不冲突。
+image = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
