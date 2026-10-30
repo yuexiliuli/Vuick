@@ -93,8 +93,10 @@ ropey = { version = "=2.0.0-beta.1", features = [
     "metric_lines_lf",
     "metric_utf16",
 ] }
-# PDF 栅格化用 native pdfium
-pdfium-render = "0.9.3"
+# PDF 栅格化用 native pdfium。default off：取消 default `image_latest`（= image_025，
+# 唯一把 crates.io image 拉进 lock 的 feature）；本仓只用核心栅格 API（PdfDocument/
+# PdfBitmap），保留 pdfium_latest + thread_safe（worker 线程架构的 Send+Sync 不变式）。
+pdfium-render = { version = "=0.9.3", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 # pdfium dll 体积剪枝：build.rs 用 zstd level 19 压缩内嵌载荷（6.9MiB→2.9MiB），运行期一次性解压。
 # 许可 BSD-3-Clause/MIT（zstd），构建期编译自带 C 源（cc + MSVC，与 ffmpeg-sys-next 同工具链）。
 zstd = "0.13"
