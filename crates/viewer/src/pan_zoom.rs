@@ -24,10 +24,19 @@ pub fn wheel_delta_y(event: &ScrollWheelEvent) -> f32 {
     }
 }
 
-/// Ctrl+滚轮缩放因子：`1 + clamp(delta_y, -1, 1) * step`（实测本平台向上滚 `delta.y>0`
-/// → 放大；与编辑器字号缩放一致）。一档 = `1 ± step`。
+/// Ctrl+滚轮缩放因子：放大一档 = `1 + step`；缩小一档 = **精确逆比** `1/(1+step)`。
+///
+/// ⚠️ 旧实现用对称分数 `1 ± step`（放大 `1+s`、缩小 `1-s`）导致往返 `(1+s)(1-s)=1-s²`
+/// 每轮净亏 `s²`（step=0.12 → 每放大再缩小一次页宽 ×0.9856、越滚越小）——用户可见的
+/// 「来回缩放页面逐渐缩水、回不到 100%」根源。逆比对称保证放大 N 档再缩小 N 档严格回到
+/// 原值（f32 仅 ~1ulp），三家查看器（image/video/pdf）共用本函数一改齐治。
 pub fn zoom_factor(delta_y: f32, step: f32) -> f32 {
-    1.0 + delta_y.clamp(-1.0, 1.0) * step
+    let d = delta_y.clamp(-1.0, 1.0);
+    if d >= 0.0 {
+        1.0 + d * step
+    } else {
+        1.0 / (1.0 + d.abs() * step)
+    }
 }
 
 /// 应用缩放并钳位到 `[min, max]`；变化量 < 1e-4 视为无变化（返回 `false`，调用方便可
@@ -74,27 +83,40 @@ pub fn pan_drag_delta(drag: &PanDrag, pos: (f32, f32)) -> (f32, f32) {
 mod tests {
     use super::*;
 
-    /// 共享缩放档位：一档 = `1 ± step`；钳位区间来自调用方参数，三家各不相同。
+    /// 共享缩放档位：放大一档 = `1+step`、缩小一档 = `1/(1+step)`（精确逆比，往返闭合）；
+    /// 钳位区间来自调用方参数，三家各不相同。
     #[test]
     fn zoom_step_and_clamp_are_parameterized() {
         let near = |a: f32, b: f32| (a - b).abs() < 1e-6;
         assert!(near(zoom_factor(1.0, 0.12), 1.12));
-        assert!(near(zoom_factor(-1.0, 0.12), 0.88));
+        assert!(near(zoom_factor(-1.0, 0.12), 1.0 / 1.12), "缩小=放大精确逆比");
+        // 往返精确闭合：放大 1 档再缩小 1 档回到 1.0（旧 `(1+s)(1-s)=1-s²≈0.9856`
+        // 每轮缩水，用户「来回缩放页面越滚越小、回不到 100%」的根源）
+        assert!(near(zoom_factor(1.0, 0.12) * zoom_factor(-1.0, 0.12), 1.0), "往返闭合");
+        // 分数 delta 同样闭合（连续缩放不累积漂移）
+        assert!(near(zoom_factor(0.5, 0.12) * zoom_factor(-0.5, 0.12), 1.0), "分数档闭合");
         // 大于 1 格的 delta 也归一成一档（三家原实现 `clamp(-1,1)` 一致）
         assert!(near(zoom_factor(4.0, 0.12), 1.12));
 
-        // 三家档位区间各不相同：只取决于调用方传入的 min/max
+        // 三家档位区间各不相同：只取决于调用方传入的 min/max；用真实因子（含逆比缩小）
         let cases: [(f32, f32); 3] = [(0.2, 8.0), (0.25, 8.0), (0.5, 4.0)];
         for (min, max) in cases {
             let mut z = 1.0;
             for _ in 0..200 {
-                apply_zoom(&mut z, 1.12, min, max);
+                apply_zoom(&mut z, zoom_factor(1.0, 0.12), min, max);
             }
             assert_eq!(z, max, "升到上限 {max}");
             for _ in 0..200 {
-                apply_zoom(&mut z, 0.88, min, max);
+                apply_zoom(&mut z, zoom_factor(-1.0, 0.12), min, max);
             }
             assert_eq!(z, min, "降到下限 {min}");
+            // 50 次「放大一档+缩小一档」往返后严格回到起点（无系统性缩水）
+            let mut z2 = 1.0;
+            for _ in 0..50 {
+                apply_zoom(&mut z2, zoom_factor(1.0, 0.12), min, max);
+                apply_zoom(&mut z2, zoom_factor(-1.0, 0.12), min, max);
+            }
+            assert!((z2 - 1.0).abs() < 1e-3, "50 次往返不漂移：{z2}");
             // 越界因子（delta=0 情形）不产生变化 → 调用方据此跳过 notify
             assert!(!apply_zoom(&mut z, 1.0, min, max), "delta=0 不应变化");
         }

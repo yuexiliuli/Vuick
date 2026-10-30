@@ -1838,14 +1838,14 @@ mod tests {
                 v
             })
         });
-        // 一档 = 1 + ZOOM_STEP（走共享 controller 的档位生成）；再缩一档 = 1×0.88 =
-        // (1+s)(1-s)=1-s² ≈ 0.9856（非回到 1.0——原行为即如此，逐格独立算因子）。
+        // 一档 = 1 + ZOOM_STEP；再缩一档 = 1/(1+ZOOM_STEP)（精确逆比，往返闭合回到 1.0——
+        // 旧 (1+s)(1-s)=1-s²≈0.9856 会让页宽在反复放大缩小时持续缩水、回不到原值）。
         cx.update(|app| {
             viewer.update(app, |v, cx| {
                 v.adjust_zoom(pan_zoom::zoom_factor(1.0, ZOOM_STEP), cx);
                 assert!((v.zoom - 1.12).abs() < 1e-6, "1 档放大: {}", v.zoom);
                 v.adjust_zoom(pan_zoom::zoom_factor(-1.0, ZOOM_STEP), cx);
-                assert!((v.zoom - 0.9856).abs() < 1e-4, "再缩一档: {}", v.zoom);
+                assert!((v.zoom - 1.0).abs() < 1e-4, "再缩一档回原位: {}", v.zoom);
             })
         });
         // 缩到下限 / 放大到上限

@@ -363,7 +363,23 @@ impl PdfViewer {
         page_border: Hsla,
     ) -> Vec<gpui::AnyElement> {
         let mut cards: Vec<gpui::AnyElement> = Vec::with_capacity(end - start + 1);
-        for (i, &top) in self.page_tops.iter().enumerate().skip(start).take(end - start + 1) {
+        // #1 页卡设备像素网格对齐（去缩放换档「跳一下再归位」pop 本体）：页卡 top 原本是
+        // 布局算出的 f32 分数值 → 旧底图（prev_cover，旧密度）被拉伸到分数设备位的卡片，
+        // 与新栅格（ceil 整数位图像素）的 PDF→设备映射差 ≤1 设备 px/轴，换档瞬间内容
+        // pop ±1px 然后稳。这里把**绘制用** top 先对齐到设备像素网格（`scroll_y` 参与：
+        // 容器平移的分数设备位也被吸收；`snap_to_device` 幂等）——旧拉伸与新栅格共享
+        // 同一放置网格，映射差归零（或 ≤0.5 设备 px）。只对齐放置矩形，不动 scroll、
+        // 不动布局账（`page_tops`/命中链不变，测试读数不受影响）。
+        let scroll_y = f32::from(-self.scroll.offset().y);
+        for (i, &top_unsnapped) in self
+            .page_tops
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start + 1)
+        {
+            let top = crate::pdf::layout::snap_to_device(top_unsnapped + scroll_y, scale_factor)
+                - scroll_y;
             let dim = self.dims[i];
             let disp_h = display_height(dim, page_width);
             // 瓦片按显示密度 1:1 渲染；这里算出位图→CSS 的分轴缩放，放置瓦片与
@@ -391,10 +407,18 @@ impl PdfViewer {
             let slot_prev_cover = slot.prev_cover.clone();
             // F4 空闲预取走廊封面（0.5 密度整页）：高速平移切入的新页在满密度封面/瓦片
             // 就位前的即时底图（瓦片未到、封面在途时 CSS 拉伸铺满，优于「加载中」白块）。
+            // **S2 修正（评审 BLOCK①）**：仅当**当前 cscale 密度** cover 在位才隐藏 preview；
+            // stale cover（`cover_scale≠当前 cscale`，缩放中途旧档）在位时 preview 仍作底图，
+            // 屏显从「旧封面复利拉伸」降为「当前档 0.5 密度」——与 `collect_prefetch_cover_results`
+            // 的「仅当前密度 cover 才弃」对称，共同让原地连续多档缩放的可见页能吃到 preview。
             let slot_prefetch = slot
                 .prefetch_cover
                 .clone()
-                .filter(|_| slot.cover.is_none());
+                .filter(|_| {
+                    slot.cover.is_none()
+                        || (slot.cover_scale - cover_scale(dim, page_width, scale_factor)).abs()
+                            > 1e-4
+                });
             let mut tiles: Vec<(f32, f32, f32, f32, Arc<RenderImage>)> = Vec::new();
             if tile_ok {
                 tiles.reserve(slot.tiles.len());

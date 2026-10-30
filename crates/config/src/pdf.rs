@@ -106,6 +106,13 @@ pub const COVER_SIZE_BUDGET: u64 = 32 * 1024 * 1024;
 /// Open 已近免费），一渲即锐利、不再等瓦片精修。本值只是防病理性超高倍率的护栏
 /// （超预算由 [`COVER_SIZE_BUDGET`] 先拦；更高密度下可见区更小，瓦片本就填得很快）。
 pub const COVER_SCALE_CAP: f32 = 4.0;
+/// 高倍 cover 回收的最低「截断比」（S5）：仅当 `render_scale > cover_scale × 本值`（cap 截断
+/// 造成明显密度差、且该倍率下视口覆盖的瓦片量小、预算可承受）才回收 cap 截断的 cover 交给
+/// 1:1 瓦片接管。取 1.5：中等密度高 DPI（render_scale 仅略超 cap，如 sf=2、zoom 1.25 →
+/// ~4.9 vs 4.0）时可见瓦片集贴近 32MB 预算，若也回收 cover 会落入「全量瓦片 → 逐出 → 重派」
+/// 预算环；真正高倍（zoom ≥ ~2.5 → render_scale ~2.4× cover_scale）视口只盖页的局部、瓦片
+/// 量小而稳定，才进入纯瓦片稳态。cap 不升（4.0 恰顶穿 A4 32MB 预算）。
+pub const COVER_RETIRE_MIN_RATIO: f32 = 1.5;
 /// 同时在途的封面渲染上限：可见页封面 + 滚动方向邻居预取封面（空闲预热 1-2 页，
 /// 滚到即立即锐利，不必等整页瓦片逐片来）。
 pub const COVER_INFLIGHT: usize = 3;
@@ -139,6 +146,27 @@ pub const STOP_DETECT_FRAMES: u32 = 3;
 /// 停稳快进检测位移阈值（px/帧，L1.3）：连续 [`STOP_DETECT_FRAMES`] 帧 |Δy| < 本值 → 判定停稳。
 /// 取 2px：小于单个滚轮 notch（~1 行）的典型位移即为「停」；大于 2px 的持续滚动不误触。
 pub const STOP_DETECT_PX: f32 = 2.0;
+/// 缩放手势防抖帧数（S3）：`zoom_armed` 期间连续 [`ZOOM_DEBOUNCE_FRAMES`] 帧无新 Ctrl+滚轮
+/// 缩放事件 → 清 `zoom_armed` 并强制 Slow，让常态调度 `schedule_tiles` 按**最终 cscale**
+/// 一次性满密收口（在途旧档由既有 scale 守卫自动弃，无需 cancelRendering）。
+/// 取 3：与 [`STOP_DETECT_FRAMES`] 同量级——滚轮事件流（~16ms/档）档间间隙不误收口，
+/// 同时「松手后 ~50ms 内重新锐利」（3×16ms）贴合目标可观测行为；太小则缩放中某档间
+/// 间隙也会误收口抢派满密（复利雾），太大会让松手后的收口延迟在体感之上（回到「加载中」）。
+pub const ZOOM_DEBOUNCE_FRAMES: u32 = 3;
+/// 缩放收口瓦片**一次性出清**预算（S5/E）：防抖到期收口帧对 `cur>4` 页（cap 截断、纯瓦片
+/// 供给）把单一 [`TILE_INFLIGHT`]=6 临时抬到本值，可见瓦片一次入队 → 高倍收口不再
+/// 3-6 帧逐片雾窗。只抬**在途**不增驻留（`TILE_CACHE_BYTES` 不变，worker 串行渲染仍为
+/// 墙钟界）。取 16：> 常规 TILE_INFLIGHT 4 倍、覆盖 2K 视口典型可见片数（6~20）大部；
+/// 再多单帧洪入 worker FIFO 对「中心页先锐」无边际收益、反而挤掉后续常态节流。普通滚动
+/// 不触发（仅 `zoom_armed` 清空的当帧置位）。
+pub const SETTLE_TILE_BURST_MAX: usize = 16;
+/// 封面密度**等效上限**（D cap 刀刃稳健化）：`render_scale` 落在 `[COVER_SCALE_CAP,
+/// 本值]` 区间时，即便被 [`COVER_SCALE_CAP`] 截断（cover 4.0 vs scale 4.06 ≈98.8% 密度、
+/// 1.5% 内视觉无差）也视为「同密度 cover-served」——消除 ×1.12 f32 不幂等在 4.0±1 档
+/// 两侧落在 cover(锐) vs 瓦片雾窗(糊) 两翼的**时锐时糊**翻转。取 4.06：比 cap 高 1.5%，
+/// 恰好包住「一档 1.12 链」在 cap 邻域的落点离散；更高则高倍页过早用 cap 封面顶 1:1 瓦片
+/// （清晰度损失越过可感知线）。仅影响「是否派瓦片/是否视为同密度」的判定，不升 cap 本身。
+pub const COVER_DENSITY_EPS_ZOOM: f32 = 4.06;
 /// 走廊窗口随速度扩大的上限（页，L3.2）：M(v)=clamp(round(v/平均页高)+1, [`PREFETCH_COVER_MARGIN`],
 /// 本值)，高速平移（VeryFast，单帧穿越 4+ 页）期走廊不可能只用 [vis±2] 盖住 → 按速度把滑窗
 /// 拉大、滑窗 [vis±M(v)]。预算仍由 [`PREFETCH_COVER_BUDGET_BYTES`]=40MB LRU 封顶、

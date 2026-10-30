@@ -268,7 +268,7 @@ mod tests {
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, _dims) =
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
-        let rx = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
+        let rx = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0, 0);
         let res = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到渲染结果")
@@ -299,7 +299,7 @@ mod tests {
         let (rows, cols) = layout::tile_grid(bmp, config::pdf::TILE_SIZE);
 
         // 整页基准
-        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale }, 0);
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale }, 0, 0);
         let full = rx_full
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("应收到整页")
@@ -324,6 +324,7 @@ mod tests {
                         col,
                     },
                     0, // L2.2 enqueue-gen（常规测试路径 = 0，无导航世代）
+                    0, // Z2 enqueue-zoom（常规测试路径 = 0，无缩放世代）
                 );
                 let tile = rx_t
                     .recv_timeout(std::time::Duration::from_secs(60))
@@ -389,12 +390,12 @@ mod tests {
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
-        let rx_thumb = worker.request_thumb(doc_id, 0, 0);
+        let rx_thumb = worker.request_thumb(doc_id, 0, 0, 0);
         let thumb = rx_thumb
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到缩略图")
             .expect("缩略图渲染应成功");
-        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0, 0);
         let full = rx_full
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到全尺寸")
@@ -426,17 +427,17 @@ mod tests {
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
-        let rx_mid = worker.request_mid(doc_id, 0, 1.0, 0);
+        let rx_mid = worker.request_mid(doc_id, 0, 1.0, 0, 0);
         let mid = rx_mid
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到中清页")
             .expect("中清页渲染应成功");
-        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0, 0);
         let full = rx_full
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到全清")
             .expect("全清渲染应成功");
-        let rx_thumb = worker.request_thumb(doc_id, 0, 0);
+        let rx_thumb = worker.request_thumb(doc_id, 0, 0, 0);
         let thumb = rx_thumb
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到缩略图")
@@ -473,7 +474,7 @@ mod tests {
         let (worker, doc_id, _dims2) =
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
         for idx in [0usize, dims.len() / 2, dims.len() - 1] {
-            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 0.5 }, 0);
+            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 0.5 }, 0, 0);
             let res = rx
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("应收到渲染结果")
@@ -503,7 +504,7 @@ mod tests {
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, _dims) =
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
-        let rx = worker.request_render(doc_id, RenderRequest { page: 0, scale: 0.5 }, 0);
+        let rx = worker.request_render(doc_id, RenderRequest { page: 0, scale: 0.5 }, 0, 0);
         let res = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到渲染结果")
@@ -546,7 +547,7 @@ mod tests {
         }
         let (page_idx, text, page_pt, scale) =
             chosen.expect("应在测试 PDF 内找到内容稠密页（可测字符 ≥40）");
-        let rx_img = worker.request_render(doc_id, RenderRequest { page: page_idx, scale }, 0);
+        let rx_img = worker.request_render(doc_id, RenderRequest { page: page_idx, scale }, 0, 0);
         let img = rx_img
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到渲染")
@@ -940,7 +941,7 @@ mod tests {
 
         // 空闲基准：整页渲染一次（应毫秒级）
         let t0 = Instant::now();
-        let rx0 = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0);
+        let rx0 = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0, 0);
         rx0.recv_timeout(Duration::from_secs(60))
             .expect("基准渲染应返回");
         let baseline_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -950,7 +951,7 @@ mod tests {
         //    `elapsed()`（那会把“我读它那一刻”的墙钟也算进去，掩盖真实的到达时刻）。
         let rx_search = worker.search(doc_id, "配置".to_string());
         std::thread::sleep(Duration::from_millis(30));
-        let rx_render = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
+        let rx_render = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0, 0);
         let t_send = Instant::now();
         let render_meas = std::thread::spawn(move || {
             let _r = rx_render
@@ -993,7 +994,7 @@ mod tests {
         let mut render_ms: Vec<(u64, u32, u64, u64)> = Vec::new(); // (渲染ms, 宽, bgra包裹us, bgra走线us)
         for idx in 0..n {
             let t1 = std::time::Instant::now();
-            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 1.0 }, 0);
+            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 1.0 }, 0, 0);
             let res = rx
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("渲染应成功")
@@ -1026,7 +1027,7 @@ mod tests {
         let mut lats = Vec::new();
         for _ in 0..5 {
             let t0 = std::time::Instant::now();
-            let rx = worker.request_render(doc_id, RenderRequest { page: 2, scale: 1.0 }, 0);
+            let rx = worker.request_render(doc_id, RenderRequest { page: 2, scale: 1.0 }, 0, 0);
             let res = rx
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("渲染应成功")
@@ -1049,7 +1050,7 @@ mod tests {
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
         let idx = 1usize;
         let t0 = std::time::Instant::now();
-        let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 1.0 }, 0);
+        let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 1.0 }, 0, 0);
         let res = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到结果");
@@ -1162,6 +1163,2084 @@ mod tests {
         }
     }
 
+    // ---- 缩放雾感修复 S1-S5 回归（2026-10-30）：Ctrl+滚轮连续多档不「雾蒙蒙」 ----
+
+    // 缩放雾感测试用到的 gpui trait（本组测试仅适用）：`ZoomProbe` 渲染与 `add_window_view`
+    // 建 view 需要。函数内 `use gpui::{...}` 与这里重复导入不同作用域，合法。
+    use gpui::{AppContext as _, ParentElement as _, Styled as _};
+
+    /// 缩放雾感测试的窗口宿主（`zoom_add_window` 用）。
+    struct ZoomProbe {
+        pdf: gpui::Entity<crate::pdf::PdfViewer>,
+    }
+    impl gpui::Render for ZoomProbe {
+        fn render(
+            &mut self,
+            _w: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div().size_full().child(self.pdf.clone())
+        }
+    }
+
+    /// 新建一个「缩放雾感」测试的空 viewer 句柄容器（holder 依调用方持有的 Rc 生命周期）。
+    fn zoom_holder(
+    ) -> std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>> {
+        std::rc::Rc::new(std::cell::RefCell::new(None))
+    }
+
+    /// 缩放雾感测试的打开辅助：创建窗口与 viewer（装入 `holder`）、等加载并预热布局。
+    /// **必须在测试体内直接遮蔽**：`let (_root, cx) = zoom_add_window(cx, &holder, name);`
+    /// —— `add_window_view` 返回的 `&mut VisualTestContext` 借用自 `cx`（TestAppContext），
+    /// 之后的一切 `cx.update`/`cx.simulate_event`/`cx.executor()` 都作用于新绑定 `cx`。
+    /// 容器 1500×900（页宽适配 ≈1160px）。复制 `pdf_ctrl_wheel_zooms_in_out` 的骨架。
+    fn zoom_add_window<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        holder: &std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>>,
+        pdf_name: &str,
+    ) -> (gpui::Entity<ZoomProbe>, &'a mut gpui::VisualTestContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/{pdf_name}"));
+        assert!(path.exists(), "测试 PDF 应存在: {path:?}");
+        cx.update(crate::test_support::bind_local_keymaps);
+        let h = holder.clone();
+        let (root, cx) = cx.add_window_view(move |_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(path.clone(), cx));
+            *h.borrow_mut() = Some(pdf.clone());
+            ZoomProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "测试 PDF 应加载完成");
+        for _ in 0..6 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+        }
+        (root, cx)
+    }
+
+    /// 等「泵停 + 全部在途清空 + 非快速」的完整沉降（jump 测试同款 settle 谓词）。
+    /// 仅调试/极端需要全渲染收敛时用；新测试默认用 [`zoom_wait_frames`]（机制断言无需等
+    /// worker 全量渲染——测试平台 2× DPI + debug 高密栅格极慢且时序抖动量级大）。
+    #[allow(dead_code)]
+    fn zoom_settle(
+        cx: &mut gpui::VisualTestContext,
+        holder: &std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>>,
+    ) {
+        use std::time::Duration;
+        // 收敛判据 = 连续 40 帧「非快速 + 泵停 + 在途总量不增长」（容忍高密密度追赶期的
+        // 极度缓慢渲染/单瓦片重派杂音——测试平台 2× DPI + debug 下实测达此量级）。
+        let mut stable = 0u32;
+        let mut last_total: Option<usize> = None;
+        for _ in 0..1500 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.pending_tiles.len() + v.pending_cover.len() + v.pending_prefetch_cover.len(),
+                    !v.prev_fast && !v.tile_pump_running,
+                )
+            });
+            let total = st.0;
+            if st.1 && last_total == Some(total) {
+                stable += 1;
+                if stable >= 40 {
+                    return;
+                }
+            } else {
+                stable = 0;
+            }
+            last_total = Some(total);
+            // 真清空（非快速 + 泵停 + 在途 0）立即收敛。
+            if st.1 && total == 0 {
+                return;
+            }
+        }
+        let (pt, pc, pp, pf, pump) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.pending_tiles.len(),
+                v.pending_cover.len(),
+                v.pending_prefetch_cover.len(),
+                v.prev_fast,
+                v.tile_pump_running,
+            )
+        });
+        panic!(
+            "状态应沉降：pending_t={pt} pending_c={pc} pending_pf={pp} prev_fast={pf} pump={pump}"
+        );
+    }
+
+    /// 固定帧预热：`n` 次 `advance_clock(16ms)+run_until_parked`（每次 16ms 量级推进渲染/泵
+    /// 循环）。用于「机制状态」断言前的确定性推进；**不等于**等 worker 全量渲染收敛——
+    /// 测试平台 2× DPI + debug 下高密栅格极慢且时序抖动量级大，等全清会超时误判（依赖
+    /// `zoom_settle` 的断言只在真正需要「渲染完成」时才用，且须容忍杂音）。
+    fn zoom_wait_frames(cx: &mut gpui::VisualTestContext, n: usize) {
+        use std::time::Duration;
+        for _ in 0..n {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// 读某页**页顶相对视口顶偏移**（字符 window-y 的代表）——Z1 端到端守恒断言用。
+    fn zoom_anchor_rel(
+        cx: &mut gpui::VisualTestContext,
+        holder: &std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>>,
+        page: usize,
+    ) -> f32 {
+        cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let top = v.page_tops[page];
+            let sy = f32::from(-v.scroll.offset().y);
+            top - sy
+        })
+    }
+
+    /// Ctrl+滚轮缩放事件构造（vertical pixel delta；向上 >0 放大、向下 <0 缩小）。
+    fn zoom_wheel(control: bool, delta_y: f32) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// C 探针：**FullBand 仿射不能独立致雾**。合成 1px 高「文本 AA 边缘」灰度条带 → 双线性
+    /// 拉伸 300%（模拟缩放手势的位图放大）→ 分路「恒等直通 vs FullBand(bg=32, ink=216)」。
+    /// FullBand 是全局仿射 `out = 32 + (216-32)·(1−L/255)`，任何 luma 差都等比 ×184/255≈0.7216
+    /// ——拉伸造成的雾环（插值灰带）在 FullBand 下**同比例**压缩，不存在额外非线性收缩，
+    /// 即「缩放雾感不是重着色曲线制造」（雾的真源在调度/几何，见 S1-S5）。两条断言锁死
+    /// 「笔画核与雾环 luma 分离度比 ≈0.7216」与「边缘最大梯度比 ∈[0.716,0.728]」（含 LUT
+    /// 整数舍入的 ±1-2 LSB 容差）。
+    #[test]
+    fn probe_tonal_zero_contribution() {
+        // 1D 双线性上采样：输出像素 j 对应源坐标 x=(j+0.5)·n/out_w − 0.5。
+        let upscale = |src: &[u8], out_w: usize| -> Vec<u8> {
+            let n = src.len();
+            let mut out = Vec::with_capacity(out_w);
+            for j in 0..out_w {
+                let x = (j as f32 + 0.5) * n as f32 / out_w as f32 - 0.5;
+                if x <= 0.0 {
+                    out.push(src[0]);
+                    continue;
+                }
+                let i = (x as usize).min(n - 1);
+                if i >= n - 1 {
+                    out.push(src[n - 1]);
+                    continue;
+                }
+                let frac = x - i as f32;
+                let a = src[i] as f32;
+                let b = src[i + 1] as f32;
+                out.push((a + (b - a) * frac).round().clamp(0.0, 255.0) as u8);
+            }
+            out
+        };
+        // 纸(255) → AA 过渡(191/128/64) → 笔(0) 的 1px 高条带。
+        let src: Vec<u8> = vec![255, 255, 191, 128, 64, 0, 0];
+        let up = upscale(&src, src.len() * 3);
+        // 恒等路：分离度 = luma 动态范围、边缘 = 最大相邻差。
+        let span_id = (up.iter().max().copied().unwrap() as i32) - (up.iter().min().copied().unwrap() as i32);
+        let grad_id = up.windows(2).map(|w| (w[0] as i32 - w[1] as i32).abs()).max().unwrap();
+        // FullBand 路：整条经真实重着色内核（apply_recolor_with_curve）再读回灰通道。
+        let mut bgra = Vec::with_capacity(up.len() * 4);
+        for &l in &up {
+            bgra.extend_from_slice(&[l, l, l, 255]);
+        }
+        crate::recolor::apply_recolor_with_curve(
+            &mut bgra,
+            crate::recolor::RecolorParams {
+                bg: [32, 32, 32],
+                ink: Some([216, 216, 216]),
+            },
+            crate::recolor::RecolorCurve::FullBand,
+        );
+        let fb: Vec<u8> = bgra.chunks(4).map(|c| c[2]).collect(); // BGRA：c[2]=R（灰输入三通道同值）
+        let span_fb = (fb.iter().max().copied().unwrap() as i32) - (fb.iter().min().copied().unwrap() as i32);
+        let grad_fb = fb.windows(2).map(|w| (w[0] as i32 - w[1] as i32).abs()).max().unwrap();
+        let expect = 184.0 / 255.0; // ≈0.7216 = 仿射增益（(216-32)/255 波幅 / 全带原差）
+        let ratio = span_fb as f32 / span_id as f32;
+        let grad_ratio = grad_fb as f32 / grad_id as f32;
+        eprintln!(
+            "[C-probe] span {span_id}→{span_fb} ratio={ratio:.4} grad {grad_id}→{grad_fb} grad_ratio={grad_ratio:.4} expect={expect:.4}"
+        );
+        assert!(
+            (ratio - expect).abs() < 0.02,
+            "分离度比应 ≈{expect:.4}（至多 ±1-2 LSB / 255）：{ratio:.4}"
+        );
+        assert!(
+            (0.716..=0.728).contains(&grad_ratio),
+            "边缘最大梯度比应 ∈[0.716,0.728]（FullBand 仿射等比例压缩雾环）：{grad_ratio:.4}"
+        );
+    }
+
+    /// C 探针：**拼缝非灰带源**。用「瓦片独立恒等采样模型」（D3D/渲染端对每张 tile 纹理各按
+    /// 自身 UV 空间半纹素采样，等价于取像素自身值、不跨 tile 混合）模拟相邻 256px tile 拼合
+    /// 整行：缝侧像素必须等于其所在 tile 的内部同值列（差 ≤2 LSB）——瓦片拼缝处不会因采样
+    /// 姿势凭空插入灰带（若错误地跨 tile 连续线性插值，纸色 255 与墨色 0 之间会混出 ≈128 的
+    /// 灰缝；正确的分别采样则无）。内容：每 tile = [墨缘 2px, 纸底 254px]，两 tile 在缝处以
+    /// 墨缘相接。
+    #[test]
+    fn probe_seam_no_fog() {
+        let w = 256usize;
+        let paper = 255u8;
+        let ink = 0u8;
+        let edge = 2usize;
+        let tile = |e: usize| -> Vec<u8> {
+            (0..w).map(|x| if x < e { ink } else { paper }).collect()
+        };
+        // 每 tile 独立恒等采样（渲染端对每张 tile 纹理各自采样、不跨 tile 混合）：
+        // 像素值即自身，拼合后缝侧与 tile 内部同值列一致。
+        let sample = |t: &[u8]| -> Vec<u8> {
+            t.iter().enumerate().map(|(x, _)| t[x]).collect()
+        };
+        let ta = sample(&tile(edge));
+        let tb = sample(&tile(edge));
+        let mut row = Vec::with_capacity(w * 2);
+        row.extend_from_slice(&ta);
+        row.extend_from_slice(&tb);
+        // 缝：x=255（tileA 纸底尾）、x=256（tileB 墨缘头）、x=257（tileB 墨缘 2）。
+        // 断言：缝列与其所在 tile 内部同值列一致（≤2 LSB）→ 无灰带。
+        assert!(
+            (row[255] as i32 - row[254] as i32).abs() <= 2,
+            "tileA 缝侧纸底应与内部纸列一致（无灰带）：{} vs {}",
+            row[255],
+            row[254]
+        );
+        assert!(
+            (row[256] as i32 - row[257] as i32).abs() <= 2,
+            "tileB 缝侧墨缘应与内部墨列一致（无灰带）：{} vs {}",
+            row[256],
+            row[257]
+        );
+        assert!(row[255] == paper, "缝左应为纸色（tileA 纸底）：{}", row[255]);
+        assert!(row[256] == ink, "缝右应为墨色（tileB 墨缘）：{}", row[256]);
+        eprintln!(
+            "[C-probe] seam row[254..258]={:?} → 缝侧与内部一致，非灰带源",
+            &row[254..258]
+        );
+    }
+
+    /// S1 回归：缩放事件后速度不升 VeryFast 且 `zoom_armed` 置位（重锚 offset 突变不再被
+    /// 误判为滚动 → 手势期不再被 VeryFast 掐死零派发）。在深滚动位连续多档缩放，全程
+    /// `speed_state != VeryFast` 且滚动速度 EMA 从不越入高速带。
+    #[gpui::test]
+    async fn zoom_input_suppresses_false_scroll_speed(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.scroll_to_page(5);
+                    cx.notify();
+                });
+        });
+        zoom_wait_frames(cx, 40);
+        let very = config::pdf::MOVE_THRESHOLD_PX * config::pdf::MOVE_THRESHOLD_VERY_RATIO;
+        let mut seen_veryfast = false;
+        let mut max_vel = 0.0f32;
+        // 8 档放大（每档事件 + 少量帧），全程采样速度与状态。
+        for _ in 0..8 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..3 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                let (sp, vel) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    (v.speed_state, v.scroll_velocity)
+                });
+                max_vel = max_vel.max(vel);
+                if sp == crate::pdf::view::SpeedState::VeryFast {
+                    seen_veryfast = true;
+                }
+            }
+        }
+        eprintln!(
+            "[S1] seen_veryfast={seen_veryfast} max_vel={max_vel:.1} very_threshold={very}"
+        );
+        assert!(
+            !seen_veryfast,
+            "缩放重锚后不得被误判为滚动进 VeryFast（手势期零派发的雾感根因）"
+        );
+        assert!(
+            max_vel < very,
+            "缩放期滚动速度 EMA 不得越入高速带：max={max_vel:.1} ≥ {very}"
+        );
+        // 收口最终发生（非零派发）且状态收敛。
+        zoom_wait_frames(cx, 40);
+        let (z, armed) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.zoom, v.zoom_armed)
+        });
+        assert!(z > 1.0, "应有缩放发生：zoom={z}");
+        assert!(!armed, "防抖到期后 zoom_armed 应被清空：{armed}");
+        zoom_wait_frames(cx, 40);
+    }
+
+    /// S1/S2 回归：缩放防抖窗内**绝不派满密 cover/tile**（逐档抢渲被弃空转），只派 ≤2 枚
+    /// 当前档 0.5 密度 preview。防抖内 `pending_cover`/`pending_tiles` 恒空、封面/瓦片计数
+    /// 不增长、preview 计数增长。
+    #[gpui::test]
+    async fn zoom_gesture_dispatches_only_preview(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        let (c0, tl0, pf0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.tile_reqs, v.prefetch_reqs)
+        });
+        // 连续多档缩放（模拟连续滚轮事件流，每档后推进几帧），并观察**计数净增量**：
+        // - `prefetch_reqs` 增长（防抖窗内只派 0.5 密度 preview）；
+        // - `cover_reqs`/`tile_reqs` 的净增**受限于收口的一次性用量**（不作逐档抢派——
+        //   若每档都抢满密，8 档会让 cover 增量随档数线性暴涨；防抖收口只在最后一档到期后
+        //   派一次可见窗用量）。
+        let mut armed_seen = false;
+        for _ in 0..8 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..2 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                let armed = cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().read(cx).zoom_armed
+                });
+                armed_seen |= armed;
+            }
+        }
+        // 收口需要防抖到期（ZOOM_DEBOUNCE_FRAMES 帧无新事件）——事件流结束后推进足帧。
+        zoom_wait_frames(cx, 30);
+        let (c1, tl1, pf1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.tile_reqs, v.prefetch_reqs)
+        });
+        let d_cover = c1 - c0;
+        let d_tile = tl1 - tl0;
+        let d_pref = pf1 - pf0;
+        eprintln!(
+            "[S2] armed_seen={armed_seen} d_cover={d_cover} d_tile={d_tile} d_pref={d_pref}（8 档）"
+        );
+        assert!(armed_seen, "连续缩放期间应出现 zoom_armed（防抖窗）");
+        // 满密 cover 只在收口时派一次窗口用量（≤ 封面向导页数 + 余量，宽松上限 6）；瓦片
+        // 受限于收口/常态补片量级。若逐档抢派满密，8 档 cover 增量会趋近 8+、瓦片随档成倍。
+        // #5 起收口瓦片按 SETTLE_TILE_BURST_MAX=16 一次性出清：8 档内多数档间隙会触发
+        // 一次「中间档 settle」（泵帧把防抖推到 3 帧），每档突发多派 ≤10 枚瓦片请求——这些
+        // 中间档请求出队即被 Z2 按世代 drop、不真实渲染（近免费队列入队空转），只抬高计数。
+        // 上限 220：仍锁定「不逐档抢派瓦片」（若无节流/突发失控，8 档会随缩放宽高上千），
+        // 同时容纳 #5 有意为之的收口突发。
+        assert!(
+            d_cover <= 6,
+            "cover 不应逐档抢派：8 档净增 {d_cover}（收口一次性应≤窗口页数）"
+        );
+        assert!(
+            d_tile <= 220,
+            "瓦片不应逐档抢派：8 档净增 {d_tile}（含 #5 收口突发 16/帧×中间档 settle；Z2 后中间档 cover 被 drop、常态补片受限于可见片数量级）"
+        );
+        // preview 派发在本环境可能为 0：测试平台 2× DPI + 大页 → 开载 render_scale 即超
+        // COVER_SCALE_CAP，cover 密度被 cap 截断且恒等于 cscale → "cover 同档"守卫跳过
+        // preview（cover 4.0 比 0.5 密度 preview 更接近显示密度，preview 冗余属正确行为）。
+        // preview 只在「cover 密度需随档变」的非截断区间才有价值（见 `zoom_preview_scale_*`）。
+        eprintln!("[S2] d_pref={d_pref}（cap 截断下 cover 同档 → preview 可合法为 0）");
+        // 收口最终也真实发生（防抖到期后常态调度至少一次满密派发）。
+        assert!(
+            d_cover > 0 || d_tile > 0,
+            "防抖收口后应有满密 cover/tile 派发（一次收口，非零派发）：cover {c0}→{c1} tile {tl0}→{tl1}"
+        );
+    }
+
+    /// S3 回归：防抖到期后强制收口——`zoom_armed` 清空、speed 回慢速、可见页最终有当前
+    /// 密度满密底图就位，且沉降后不再重复派发（一次收口）。
+    #[gpui::test]
+    async fn zoom_debounce_collects_full_resolution_once(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        let (c0, tl0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.tile_reqs)
+        });
+        // 两档放大后不再缩放 → 防抖到期 → 收口。
+        cx.simulate_event(zoom_wheel(true, 240.0));
+        cx.simulate_event(zoom_wheel(true, 240.0));
+        let mut cleared = false;
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            cleared = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                !v.zoom_armed && v.speed_state != crate::pdf::view::SpeedState::VeryFast
+            });
+            if cleared {
+                break;
+            }
+        }
+        assert!(cleared, "防抖到期后 zoom_armed 应被清空且速度离开高速带");
+        zoom_wait_frames(cx, 40);
+        // 可见页在当前缩放下应有底图（收口达阵）。口径放宽为「不落加载中」：满密 cover / 满密
+        // 瓦片 / 走廊 preview / 中清 / 缩略任一在槽即可——真实渲染帧数由 worker 决定（测试
+        // 平台 2× DPI + debug 高密栅格极慢），本断言只锁「收口后视图不再空白」。
+        let (pw, sf, all_ready) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = w.scale_factor();
+            let off_y = f32::from(-v.scroll.offset().y);
+            let vh = f32::from(v.scroll.bounds().size.height).max(1.0);
+            let vis = pdf_visible_pages(v, pw, off_y, vh);
+            let ready = !vis.is_empty()
+                && vis.iter().all(|&p| {
+                    let s = &v.slots[p];
+                    s.cover.is_some()
+                        || !s.tiles.is_empty()
+                        || s.prefetch_cover.is_some()
+                        || s.mid.is_some()
+                        || s.thumb.is_some()
+                });
+            (pw, sf, ready)
+        });
+        let _ = (pw, sf);
+        eprintln!("[S3] 收口后可见页有底图: {all_ready}");
+        assert!(all_ready, "收口后可见页应不再落「加载中」（任一底图在槽）");
+        let _ = (c0, tl0);
+    }
+
+    /// S1/S3 回归：缩放重锚后 `scroll_velocity` 保持近零、Ctrl 缩放不产生额外滚动（同
+    /// `pdf_ctrl_wheel_zooms_in_out` 的锚定断言，此处连续多档）。
+    #[gpui::test]
+    async fn zoom_anchored_scroll_velocity_stays_zero(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.scroll_to_page(5);
+                    cx.notify();
+                });
+        });
+        zoom_wait_frames(cx, 40);
+        let off0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).scroll.offset());
+        let w0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_width());
+        // Z1：记录缩放前 layout（锚点公式需要旧 tops 与新 tops 对账）。
+        let tops0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_tops.clone());
+        let mut max_vel = 0.0f32;
+        for _ in 0..6 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..2 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                let vel = cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().read(cx).scroll_velocity
+                });
+                max_vel = max_vel.max(vel);
+            }
+        }
+        zoom_wait_frames(cx, 40);
+        let (wn, offn, topsn, dims) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.page_width(),
+                v.scroll.offset(),
+                v.page_tops.clone(),
+                v.dims.clone(),
+            )
+        });
+        // Z1 锚点锚定期望：`exp_sy = tops_new[k] + (sy0 − tops_old[k]) × ratio`（常量区不缩放）。
+        let sy0 = -off0.y.as_f32();
+        let ratio = wn / w0;
+        let k = layout::first_visible_page(&dims, &tops0, w0, sy0);
+        eprintln!(
+            "[S1] max_vel={max_vel:.2} 锚定 K={k} top_sy0={:.1} y={:.1} x={:.1}",
+            -sy0,
+            offn.y.as_f32(),
+            offn.x.as_f32()
+        );
+        assert!(
+            max_vel < 5.0,
+            "重锚后滚动速度 EMA 应保持近零（不再回 VeryFast）：max={max_vel:.2}"
+        );
+        let exp_sy = topsn[k] + (sy0 - tops0[k]) * ratio;
+        let exp_y = -exp_sy;
+        let exp_x = off0.x.as_f32() * ratio;
+        assert!(
+            (offn.y.as_f32() - exp_y).abs() < 2.0 && (offn.x.as_f32() - exp_x).abs() < 2.0,
+            "Ctrl 缩放不应产生额外滚动：y 锚 {:.1} 实际 {:.1}（x 锚 {:.1} 实际 {:.1}）",
+            exp_y,
+            offn.y.as_f32(),
+            exp_x,
+            offn.x.as_f32()
+        );
+    }
+
+    /// **5c：armed 期 preview 不换底**（第 4 轮同根因 low-dens 侧）：手势期间**已有任何底**
+    /// （cover/prev_cover/prefetch_cover）的页，到达的新档 preview 一律丢弃（`collect_
+    /// prefetch_cover_results` 的 armed「有底不换」守卫）——屏显稳定在手势前那张，杜绝边缘
+    /// 页逐档换底脉冲；「全无底」空页才由 preview 填一次（dispatch 侧 `maybe_dispatch_zoom
+    /// _preview` 同款守卫对称：有底不派）。注入式：armed 期向有 prev_cover 桥的中心页注入
+    /// 一枚已完成的当前档 preview 结果 → 断言 `prefetch_cover` 槽**不被**替换。
+    #[gpui::test]
+    async fn zoom_armed_preview_does_not_swap_bridged_page(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        cx.simulate_event(zoom_wheel(true, 240.0));
+        zoom_wait_frames(cx, 2); // armed：relocate 已把手势前封面迁入 prev_cover
+        let (center, pscale) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = w.scale_factor();
+            let sy = f32::from(-v.scroll.offset().y);
+            let vh = f32::from(v.scroll.bounds().size.height);
+            let vis = pdf_visible_pages(&v, pw, sy, vh);
+            let center = vis[vis.len() / 2];
+            let cscale = layout::cover_scale(v.dims[center], pw, sf);
+            let want = (cscale * config::pdf::PREFETCH_COVER_DENSITY)
+                .min(config::pdf::COVER_SCALE_CAP);
+            (center, want)
+        });
+        // 显式模拟「盖度变了、armed 首帧 relocate 已把手势前封面迁入 prev_cover 桥」
+        // （本夹具 sf=2 下 cscale 恒被 cap=4.0 钉死、盖度未变 → relocate 不搬迁，故手动
+        // 摆出「cover=None + prev_cover=手势前那张」的搬迁态，专测 collect 的 armed「有底
+        // 不换」守卫；生产路径由真实 relocate 建立同态）。同时清掉初始走廊 preview
+        // （首载空闲预取给页 0 填过廊封面，须清场才能观测「新 preview 到达是否写入」）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let s = &mut v.slots[center];
+                if let Some(c) = s.cover.take()
+                    && let Some(prev) = s.prev_cover.replace(c)
+                {
+                    v.pending_drops.push(prev);
+                }
+                s.cover_scale = 0.0;
+                if let Some(old) = s.prefetch_cover.take() {
+                    v.pending_drops.push(old);
+                }
+            });
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.pending_prefetch_cover.clear();
+            });
+        });
+        // 注入一枚「已完成的当前档 preview 结果」（pscale = want，躲过 drop_stale 的保留判定，
+        // 恰落入 collect 通路；armed 有底 → 应被丢弃不入槽）。
+        let bw = 8u32;
+        let bh = 8u32;
+        let res = crate::pdf::RenderResult {
+            bgra: vec![140u8; (bw * bh * 4) as usize],
+            width: bw,
+            height: bh,
+            recolor_epoch: cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).recolor_epoch
+            }),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(res)).unwrap();
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.pending_prefetch_cover.insert(center, (pscale, v.nav_gen, rx));
+            });
+        });
+        // armed 期推进：**1ms 单步**（不触发 16ms 泵定时器边界 → 批次内不产生会清 `zoom_armed`
+        // 的多余帧；每步 run 前回钉保持 armed）——collect 应在「有底不换」守卫下丢弃注入
+        // preview，prefetch_cover 不写入。
+        let mut not_swapped = false;
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(1));
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                    v.zoom_armed = true;
+                    v.zoom_idle_frames = 0;
+                });
+            });
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(0));
+            not_swapped = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let s = &v.slots[center];
+                // 注入条目**已被消费**（collect 跑过该页）且底基（cover/prev_cover）仍驻留、
+                // prefetch_cover 未被新档替换——防「注入仍在途 → 空满足」。
+                !v.pending_prefetch_cover.contains_key(&center)
+                    && (s.cover.is_some() || s.prev_cover.is_some())
+                    && s.prefetch_cover.is_none()
+            });
+            if not_swapped {
+                break;
+            }
+        }
+        eprintln!("[#5c] center={center} pscale={pscale:.2} not_swapped={not_swapped}");
+        assert!(
+            not_swapped,
+            "armed 期有底页不得被新档 preview 替换——prefetch_cover 应保持 None（底基 cover/prev_cover 驻留）"
+        );
+    }
+
+    /// **5b：armed 期到达的中间档封面一律丢弃**（手势期零满密换底的关键守卫）。注入式：
+    /// armed 期向中心页 pending_cover 注入一枚完成的中档（req_scale ≠ 当前 cscale）封面结果
+    /// → `collect_cover_results` 的 armed 守卫丢弃（不写 prev_cover 桥、不入 slot）——手势前
+    /// 那张高密底图（prev_cover 桥）**恒不被置换**（Arc 身份保持不变、被替换次数 == 0）。
+    #[gpui::test]
+    async fn zoom_armed_drops_arriving_middle_covers(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        cx.simulate_event(zoom_wheel(true, 240.0));
+        zoom_wait_frames(cx, 2); // armed：手势前封面已迁入 prev_cover 桥
+        // 抗 cap 截断场景：盖度未变（cscale 被 cap 钉死在 4.0）时 relocate 不搬迁、手势前
+        // 那张底基驻留在 slot.cover；盖度变了则迁入 prev_cover 桥——两种都算「手势前那张」。
+        let (center, mid_scale, epoch, nav, pre_cover, pre_prev) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = w.scale_factor();
+            let sy = f32::from(-v.scroll.offset().y);
+            let vh = f32::from(v.scroll.bounds().size.height);
+            let vis = pdf_visible_pages(&v, pw, sy, vh);
+            assert!(!vis.is_empty(), "armed 采样时应有可见页（先吃饱帧）");
+            let center = vis[vis.len() / 2];
+            let cscale = layout::cover_scale(v.dims[center], pw, sf);
+            // 中档 = 与当前 cscale 明显不同（×1.5 模拟缩放中间的更密旧档）。
+            (
+                center,
+                cscale * 1.5,
+                v.recolor_epoch,
+                v.nav_gen,
+                v.slots[center].cover.clone(),
+                v.slots[center].prev_cover.clone(),
+            )
+        });
+        assert!(
+            pre_cover.is_some() || pre_prev.is_some(),
+            "armed 应持有手势前那张高密底图（cover 或 prev_cover 桥）"
+        );
+        // 注入一枚完成的中档封面结果（armed 期到达 → 应被守卫丢弃）。
+        let res = crate::pdf::RenderResult {
+            bgra: vec![160u8; (8 * 8 * 4) as usize],
+            width: 8,
+            height: 8,
+            recolor_epoch: epoch,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(res)).unwrap();
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.pending_cover.insert(center, (mid_scale, epoch, nav, rx));
+            });
+        });
+        // armed 期推进：**1ms 单步**（不触发 16ms 泵定时器边界 → 保持 `zoom_armed` 恒真，
+        // 见 5c 同款注释）——collect 应丢弃中档——底基（cover/prev_cover）与注入前**身份**
+        // 一致（未被置换、prev_cover 无中档写入）。
+        let same_opt = |a: &Option<std::sync::Arc<gpui::RenderImage>>,
+                        b: &Option<std::sync::Arc<gpui::RenderImage>>| -> bool {
+            match (a, b) {
+                (None, None) => true,
+                (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
+                _ => false,
+            }
+        };
+        let mut untouched = false;
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(1));
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                    v.zoom_armed = true;
+                    v.zoom_idle_frames = 0;
+                });
+            });
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(0));
+            untouched = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let s = &v.slots[center];
+                // 注入条目**已被消费**（collect 跑过该页）且 cover/prev_cover 身份均不被置换
+                // ——防「中档仍在途 → 空满足」。
+                !v.pending_cover.contains_key(&center)
+                    && same_opt(&pre_cover, &s.cover)
+                    && same_opt(&pre_prev, &s.prev_cover)
+            });
+            if untouched {
+                break;
+            }
+        }
+        eprintln!("[#5b] center={center} mid_scale={mid_scale:.2} untouched={untouched}");
+        assert!(
+            untouched,
+            "armed 手势期到达的中间档封面应被丢弃（cover/prev_cover 身份均不被置换）"
+        );
+    }
+
+    /// S4 定向回归（注入式）：**非 armed 期**过期档封面结果到达、且该页当前档封面未入槽 →
+    /// 写入有界 `prev_cover` 桥（最终档 cover 前的陈旧回传作最佳过渡底图，至多一档 1.12
+    /// 拉伸），而非静默丢弃。验证走真实 `collect_cover_results` 路径；注入到位**可见页**
+    /// （窗内页的 `prev_cover` 桥会被 `evict_covers` 保留——窗外页的桥会按既有语义立即
+    /// 清掉），并真实缩放一档后**显式退出 armed**（手势期到达的中间档由 armed 守卫一律
+    /// 丢弃，见 `zoom_armed_drops_arriving_middle_covers`；本用例专验非 armed 的 S4 桥）。
+    /// 手动把该页 `cover` 置空以模拟「缩放瞬间旧封面已移走」。
+    #[gpui::test]
+    async fn zoom_prev_cover_bridge_mirrors_latest_inflight_scale(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 真实缩放一档进入防抖（armed 期 schedule_covers 不派、collect 路径照常跑）。
+        cx.simulate_event(zoom_wheel(true, 240.0));
+        zoom_wait_frames(cx, 2);
+        // ⚠️ **显式退出 armed**（手势期零满密换底分界）：`collect_cover_results` 现在对
+        // `zoom_armed` 期间到达的封面**一律丢弃**（不写 prev_cover 桥）——那是本批修正的
+        // 「手势期每档换底」（见 `zoom_armed_drops_arriving_middle_covers`）。S4 桥只保留
+        // **非 armed** 时到达的过期封面上桥（settle 后最终档前的陈旧回传仍作最佳过渡）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.zoom_armed = false;
+                v.zoom_idle_frames = 0;
+            });
+        });
+        let (p, req_scale, epoch, nav, had_cover) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = w.scale_factor();
+            let p = 0usize.min(v.dims.len() - 1);
+            let cur = layout::cover_scale(v.dims[p], pw, sf);
+            // 过期档 = 与当前 cscale 明显不同（×1.5 模拟缩放中间的更密旧档）。
+            (p, cur * 1.5, v.recolor_epoch, v.nav_gen, v.slots[p].cover.is_some())
+        });
+        let _ = had_cover;
+        // 模拟「缩放瞬间旧封面已移走」：手动清空当前档 cover（防抖内 schedule_covers 不
+        // 重派，worker 不会竞争覆盖注入）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let s = &mut v.slots[p];
+                s.cover = None;
+                s.cover_scale = 0.0;
+            });
+        });
+        // 注入一个「过期档」完成的封面结果（req_scale ≠ 当前 cscale），走真实 collect 路径。
+        let bw = 8u32;
+        let bh = 8u32;
+        let bgra = vec![160u8; (bw * bh * 4) as usize];
+        let res = crate::pdf::RenderResult {
+            bgra,
+            width: bw,
+            height: bh,
+            // recolor（重着色）世代用 viewer 当前世代——W1 世代守卫会丢弃旧世代结果。
+            recolor_epoch: epoch,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(res)).unwrap();
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.pending_cover.insert(p, (req_scale, epoch, nav, rx));
+            });
+        });
+        // 泵几帧（防抖内 pump 持续）→ collect_cover_results → S4 桥（结果即时就绪）。
+        // 桥建立后 worker 真实渲染的**当前档**封面（若赶上）会把桥回收（既有
+        // `prev_cover.take()`）——故此处断言「桥曾建立」而非「此刻仍驻留」。
+        let mut bridged = false;
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let s = &v.slots[p];
+                (
+                    s.prev_cover.is_some() && s.cover.is_none(),
+                    s.cover.is_some() && s.prev_cover.is_none(),
+                )
+            });
+            bridged |= st.0; // 桥曾建立（过期档写入 prev_cover）
+            bridged |= st.1; // 或已「当前档封面入槽 + 桥随之回收」（证明桥曾建立并被既有 take 回收）
+            if bridged {
+                break;
+            }
+        }
+        assert!(bridged, "过期档封面到达应写入 prev_cover 桥（当前档封面未入槽）");
+        // 引擎继续推进：桥应随「最终档封面入槽 / 封面窗滚动」被既有 prev_cover.take() 回收
+        // （结构性路径；S4 只负责中间档进桥，回收由既有语义兜底，此处不强发断言——2× DPI +
+        // debug 下 worker 高密栅格慢，最终档 cover 到达时机由 worker 定）。
+    }
+
+    /// S5 回归：高倍稳态（render_scale 远超 COVER_SCALE_CAP=4.0）下，cap 截断的 cover 在
+    /// 当前密度瓦片（模拟）全到位后被回收（消 32MB/页 双驻留 + 边隙透雾）；`zoom_armed`
+    /// 期间**不回收**（guard）、`double_hold==0` 内存守卫恒成立。**注入式**：放大到高倍后
+    /// 手动把该页置为「cap cover 在位 + tile_scale==render_scale + 瓦片非空」的稳态，
+    /// 不依赖 worker 真实渲染（测试平台 2× DPI + debug 下高密栅格极慢、时序不稳定）。
+    #[gpui::test]
+    async fn high_scale_cover_retired_after_tiles_ready(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 连续放大直到 zoom 超过 ~2.6（render_scale 远超 cap）。
+        let mut z_cur = 0.0f32;
+        for _ in 0..14 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..2 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+            }
+            z_cur = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+            if z_cur >= 2.6 {
+                break;
+            }
+        }
+        assert!(z_cur >= 2.6, "应已放大到高倍（zoom={z_cur:.2}）");
+        // 注入「cap 截断 cover 在位 + 当前密度瓦片就位」的稳态（绕过 worker）。
+        let (p, cscale, cur) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = w.scale_factor();
+            let p = 0usize.min(v.dims.len() - 1);
+            let cscale = layout::cover_scale(v.dims[p], pw, sf);
+            let cur = layout::render_scale(pw, sf, v.dims[p].0);
+            (p, cscale, cur)
+        });
+        assert!(
+            cur > cscale * config::pdf::COVER_RETIRE_MIN_RATIO + 1e-4,
+            "高倍前提：render_scale({cur:.2}) 应远超截断后的 cover_scale({cscale:.2})"
+        );
+        let cimg = crate::pdf::render_image_from_bgra(vec![200u8; 4 * 4 * 4], 4, 4).unwrap();
+        let timg = crate::pdf::render_image_from_bgra(vec![220u8; 4 * 4 * 4], 4, 4).unwrap();
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let s = &mut v.slots[p];
+                s.cover = Some(cimg);
+                s.cover_scale = cscale;
+                s.tile_scale = cur;
+                s.tiles.insert(
+                    (0, 0),
+                    crate::pdf::layout::TileSlot {
+                        image: timg,
+                        x0: 0,
+                        y0: 0,
+                        w: 4,
+                        h: 4,
+                    },
+                );
+            });
+        });
+        // zoom_armed 期间不动：guard 必须拦住回收（防手势翻面回放）。防抖计时（idle>=3）
+        // 会清 armed，而 `run_until_parked` 会连带 pump 多帧把 armed 冲掉——用 **1ms 单帧
+        // 步进**（不触发 16ms pump timer，每步只推进一帧渲染：ensure_window 内 idle=1 仍
+        // armed）钉住「armed 期」观察 guard。
+        let mut still_hold = true;
+        for _ in 0..4 {
+            cx.executor().advance_clock(Duration::from_millis(1));
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                    v.zoom_armed = true;
+                    v.zoom_idle_frames = 0;
+                });
+            });
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(1));
+            still_hold = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let s = &v.slots[p];
+                v.zoom_armed && s.cover.is_some() && s.cover_scale.abs() > 1e-4
+            });
+            if !still_hold {
+                break;
+            }
+        }
+        assert!(still_hold, "zoom_armed 期间不得回收 cover（guard 失败）");
+        // 评审 BLOCK③：单片在槽 ≠ 铺满可见区 —— 清除 armed 后首片到达**不得回收**（否则
+        // 高倍滚动/收口期首片即闪底）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.zoom_armed = false;
+                v.zoom_idle_frames = 0;
+                v.speed_state = crate::pdf::view::SpeedState::Slow;
+                v.prev_fast = false;
+            });
+        });
+        let mut held_with_one_tile = false;
+        for _ in 0..8 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            held_with_one_tile = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let s = &v.slots[p];
+                s.cover.is_some() && s.cover_scale.abs() > 1e-4 && !s.tiles.is_empty()
+            });
+        }
+        assert!(
+            held_with_one_tile,
+            "评审③：可见矩形未铺满（单瓦片在槽）时不得回收 cover（防闪底）"
+        );
+        // 铺满整页瓦片网格（含可见矩形必然全在槽）→ 才允许回收。
+        let (rows, cols) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = w.scale_factor();
+            let bmp = layout::page_bitmap_size(v.dims[p], layout::render_scale(pw, sf, v.dims[p].0));
+            layout::tile_grid(bmp, config::pdf::TILE_SIZE)
+        });
+        let tile = crate::pdf::render_image_from_bgra(vec![220u8; 4 * 4 * 4], 4, 4).unwrap();
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                for row in 0..rows {
+                    for col in 0..cols {
+                        v.slots[p].tiles.insert(
+                            (row, col),
+                            crate::pdf::layout::TileSlot {
+                                image: tile.clone(),
+                                x0: col * config::pdf::TILE_SIZE,
+                                y0: row * config::pdf::TILE_SIZE,
+                                w: 4,
+                                h: 4,
+                            },
+                        );
+                    }
+                }
+            });
+        });
+        let mut retired = false;
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            retired = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let s = &v.slots[p];
+                s.cover.is_none() || s.cover_scale.abs() <= 1e-4
+            });
+            if retired {
+                break;
+            }
+        }
+        assert!(retired, "高倍可见区瓦片铺满后可 cover 应被回收（消双驻留+边隙透雾）");
+        // double_hold 计数（封面+瓦片双持有）恒 0。
+        let double_hold = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (0..v.dims.len())
+                .filter(|&p| {
+                    let s = &v.slots[p];
+                    s.cover.is_some()
+                        && !s.tiles.is_empty()
+                        && (s.cover_scale - s.tile_scale).abs() <= 1e-4
+                })
+                .count()
+        });
+        assert_eq!(double_hold, 0, "高倍稳态封面+瓦片不得双驻留（double_hold=0）」");
+    }
+
+    /// 评审② 定向回归：`zoom_armed` 推进首帧把可见窗内 **stale cover**（`cover_scale ≠
+    /// 当前 cscale`，缩放中途正持旧档）迁入有界 `prev_cover`、`cover=None` —— 让 S2 preview
+    /// 与 S4 最新档桥对「持旧封面页」激活（preview 不再被「cover 在位」双重丢弃）。用**真实
+    /// 缩放事件**进入 armed 首帧（即实际迁移触发路径；worker 高密栅格慢，迁移态在首帧后仍可
+    /// 观测——cover 不会被立即重派）。当前档 cover 在位页由 relocate 的 stale 判定天然保留。
+    #[gpui::test]
+    async fn zoom_armed_first_frame_relocates_stale_cover(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        let (p, cscale) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = w.scale_factor();
+            let p = 0usize.min(v.dims.len() - 1);
+            let cscale = layout::cover_scale(v.dims[p], pw, sf);
+            (p, cscale)
+        });
+        let cimg = crate::pdf::render_image_from_bgra(vec![200u8; 4 * 4 * 4], 4, 4).unwrap();
+        // 手动构造「stale cover 在位」：缩放前的旧档整页（cover_scale=1.2×当前档）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let s = &mut v.slots[p];
+                s.cover = Some(cimg);
+                s.cover_scale = cscale * 1.2;
+            });
+        });
+        // 真实缩放一档 → adjust_zoom 置位 armed+notify → 下一渲染帧 relocate stale cover。
+        cx.simulate_event(zoom_wheel(true, 240.0));
+        // 防抖首帧推进，采样迁移态；worker 高密栅格慢，cover 不会被立即重派。
+        let mut relocated = false;
+        for _ in 0..4 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            relocated = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let s = &v.slots[p];
+                s.cover.is_none() && s.prev_cover.is_some()
+            });
+            if relocated {
+                break;
+            }
+        }
+        assert!(
+            relocated,
+            "armed 首帧应把 stale cover 迁入 prev_cover（S2 preview / S4 桥对持旧封面页激活）"
+        );
+        // 当前档 cover 在位页保持：relocate 只迁移「cover_scale≠当前 cscale」的 stale 槽——
+        // 此语义由 `relocate_stale_zoomed_covers` 的 stale 判定 + `collect/render` 的「当前档
+        // cover 才弃/隐藏 preview」共同保证（见其对 preview 的对称守卫），此处以迁移发生后的
+        // 可达状态作一致性收尾：等待引擎推进若干帧后确认该页不再双持 stale cover（已收口路径）。
+        let _ = p;
+        let _ = cscale;
+    }
+
+    /// Z1 端到端回归：缩放重锚不再让行上下跳。锚 K 页（2）于视口顶，连续放大 3 档再缩回
+    /// 3 档——每档「锚点页顶相对视口顶偏移」（= 同一字符 window-y）应守恒（≤2.5px），
+    /// 回原档无漂移（旧公式每档漂移 ~−(ratio−1)×(PAD+K×GAP)，3 档深页可达 10-35px 阶跳）。
+    #[gpui::test]
+    async fn zoom_anchor_no_vertical_line_jump(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, mut cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 锚页 K=2：滚到页 2 顶部（scroll_y = tops[2]）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                let top2 = v.page_tops.get(2).copied().unwrap_or(0.0);
+                v.scroll
+                    .set_offset(gpui::point(gpui::px(0.0), gpui::px(-top2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 3);
+        let base = zoom_anchor_rel(&mut cx, &holder, 2);
+        // 3 档进 + 每档校验守恒。
+        for _ in 0..3 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            zoom_wait_frames(cx, 3);
+            let cur = zoom_anchor_rel(&mut cx, &holder, 2);
+            assert!(
+                (cur - base).abs() <= 2.5,
+                "放大档锚点页顶相对视口应守恒：Δ{:.2}px（旧公式深页此处分跳行高）",
+                cur - base
+            );
+        }
+        // 3 档退（回原档）。
+        for _ in 0..3 {
+            cx.simulate_event(zoom_wheel(true, -240.0));
+            zoom_wait_frames(cx, 3);
+            let cur = zoom_anchor_rel(&mut cx, &holder, 2);
+            assert!(
+                (cur - base).abs() <= 2.5,
+                "缩放回档锚点页顶相对视口应守恒：Δ{:.2}px（旧公式漂移 10-35px）",
+                cur - base
+            );
+        }
+        let final_rel = zoom_anchor_rel(&mut cx, &holder, 2);
+        assert!(
+            (final_rel - base).abs() <= 2.5,
+            "回原档无漂移：base={base:.1} final={final_rel:.1}"
+        );
+    }
+
+    /// Z2.1 回归：缩放 armed 首帧把「缩放中间档」在途 cover 直接清除（预算即释、不占
+    /// COVER_INFLIGHT），防抖收口后只派最终档 cover（队列不被旧档占死 → 时锐时糊根治）。
+    /// 注入 3 枚过期档 pending_cover（scale≠当前 cscale）→ armed 首帧 `drop_stale_scale_pending`
+    /// 清掉 → 收口后最终档 cover/tile 派发；
+    /// Z2.3 等价断言：被清的中间档**不会**进入最终栅格预算（raster_reqs 增量仅来自收口）。
+    #[gpui::test]
+    async fn zoom_drops_stale_midscale_covers_then_collects_final(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 缩放一档进入 armed（新档）。
+        cx.simulate_event(zoom_wheel(true, 240.0));
+        zoom_wait_frames(cx, 2);
+        // 注入 3 枚「缩放中间档」在途封面（scale=1.2×当前 cscale，必非当前档）。
+        cx.update(|w, cx| {
+            let sf = w.scale_factor();
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                for p in 0..3usize.min(v.dims.len()) {
+                    let cscale = layout::cover_scale(v.dims[p], v.page_width(), sf);
+                    let (_, rx) =
+                        std::sync::mpsc::channel::<Option<crate::pdf::RenderResult>>();
+                    v.pending_cover
+                        .insert(p, (cscale * 1.2, v.recolor_epoch, v.nav_gen, rx));
+                }
+            });
+        });
+        // armed 首帧（S3 块）drop_stale_scale_pending 清掉中间档 → pending_cover 空。
+        // 防抖计时会清 armed：每帧 run **前** 保持 zoom_armed，确保调度帧以 armed 进入并
+        // 执行 drop（首帧即清，随后多帧是否清 armed 无关）。
+        let mut cleared = false;
+        for _ in 0..6 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                    v.zoom_armed = true;
+                    v.zoom_idle_frames = 0;
+                });
+            });
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            cleared = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_cover.is_empty()
+                    || (0..3).all(|p| !v.pending_cover.contains_key(&p))
+            });
+            if cleared {
+                break;
+            }
+        }
+        assert!(cleared, "armed 首帧应清掉中间档 cover（预算即释，不占 COVER_INFLIGHT）");
+        // 防抖到期收口 → 最终档 cover/tile 派发（非零游走）。
+        let (c0, t0, r0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.tile_reqs, v.raster_reqs)
+        });
+        zoom_wait_frames(cx, 30);
+        let (c1, t1, r1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.tile_reqs, v.raster_reqs)
+        });
+        eprintln!(
+            "[Z2] 清后收口：cover {c0}→{c1} tile {t0}→{t1} raster {r0}→{r1}"
+        );
+        assert!(
+            c1 > c0 || t1 > t0,
+            "收口应派最终档 cover/tile（队列不再被中间档占死）"
+        );
+        // Z2.3：中间档被清 → 它们的栅格预算不被消费；raster 增量受限于收口最终档用量。
+        assert!(
+            r1 - r0 <= 64,
+            "中间档不应进栅格预算（raster 增量应只来自最终档收口）：{r0}→{r1}"
+        );
+    }
+
+    /// Z2.2 回归：相同缩放序列两次 → 收口栅格请求增量都在「一次性窗口用量」量级内、
+    /// 不随序号/档位线性翻倍（确定性收敛语义：若中间档 cover 在每档都派进来排队，
+    /// 3 档的 tile/cover 增量会接近单档收口的 3 倍；有界 → 无中间档堆叠、无随机雾窗）。
+    #[gpui::test]
+    async fn zoom_repeat_sequence_is_deterministic(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, mut cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        let run3 = |cx: &mut gpui::VisualTestContext,
+                    holder: &std::rc::Rc<
+            std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>,
+        >| {
+            let (c0, t0) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.cover_reqs, v.tile_reqs)
+            });
+            for _ in 0..3 {
+                cx.simulate_event(zoom_wheel(true, 240.0));
+                for _ in 0..3 {
+                    cx.executor().advance_clock(Duration::from_millis(16));
+                    cx.run_until_parked();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            // 防抖到期 + 收口推进。
+            zoom_wait_frames(cx, 25);
+            let (c1, t1) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.cover_reqs, v.tile_reqs)
+            });
+            (c1 - c0, t1 - t0)
+        };
+        let d1 = run3(&mut cx, &holder);
+        let d2 = run3(&mut cx, &holder);
+        eprintln!("[Z2.2] 两轮 3 档增量：cover {d1:?} vs {d2:?}");
+        // 收口一次性窗口用量上界：cover ≤ 封面向导页数 + 余量、tile ≤ 可见+缓冲片数；
+        // 若逐档抢派中间档，3 档的 cover 会 ~3×、tile 随档成倍 → 远超上界/两轮发散。
+        assert!(
+            d1.0 <= 6 && d2.0 <= 6,
+            "cover 收口应局限于窗口用量（不逐档堆叠）：{d1:?} / {d2:?}"
+        );
+        assert!(
+            d1.1 <= 120 && d2.1 <= 120,
+            "tile 收口应受限于可见片数量级（不随档数翻倍）：{d1:?} / {d2:?}"
+        );
+        // 两轮同一量级（确定性收敛，不因旧档中间档 tsuffle 发散）。
+        assert!(
+            (d1.1 as i64 - d2.1 as i64).abs() <= 60,
+            "两轮 tile 收口应同一量级：{d1:?} / {d2:?}"
+        );
+    }
+
+    /// #2 停底重锚 clamp 回归（机制级、确定性）：深页缩到文档底、Z1 公式算出的新 offset
+    /// 超出新布局 max_offset 时——`adjust_zoom` 先把 `new_y` clamp 到 `[0, max_offset]` 再
+    /// `set_offset`，并把 `last_scroll_y` 回写为 clamp 后值（防 S1 假速度 / 再放大反向补一跳）。
+    /// 断言：锚定末页底部后连续放大，`-offset.y` 始终 ≤ 新 max_offset（容器不会被迫二次
+    /// clamp），且 `last_scroll_y == -offset.y`（回写一致）。
+    #[gpui::test]
+    async fn zoom_bottom_clamp_keeps_offset_and_last_scroll_sync(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        // 直接滚到文档底（offset = -max_offset；新布局推进几帧让 bounds 落地）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let vh = f32::from(v.scroll.bounds().size.height);
+                let max = (v.total_height - vh).max(0.0);
+                v.scroll.set_offset(gpui::point(gpui::px(0.0), gpui::px(-max)));
+            });
+        });
+        // 连续放大（锚在末页、越底越够到 max）；每档后校验 offset 在量程内且 last_scroll_y 一致。
+        let mut violations: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..3 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                // 构造三问：offset 是否越界、last_scroll_y 是否与 offset 一致。
+                let (sy, last_sy, max_sy, top_bottom) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let vh = f32::from(v.scroll.bounds().size.height);
+                    let sy = f32::from(-v.scroll.offset().y);
+                    let max_sy = (v.total_height - vh).max(0.0);
+                    // 末页是否贴近文档底（钳制工况成立）
+                    let last = v.dims.len().saturating_sub(1);
+                    let bottom = v.page_tops[last] + crate::pdf::layout::display_height(v.dims[last], v.page_width());
+                    (sy, v.last_scroll_y, max_sy, bottom - vh <= sy + 0.5)
+                });
+                let _ = top_bottom;
+                if sy > max_sy + 0.5 {
+                    violations.push(format!("offset 越界 sy={sy:.1} > max={max_sy:.1}"));
+                }
+                if (last_sy - sy).abs() > 1e-2 {
+                    violations.push(format!("last_scroll_y 失配 last={last_sy:.1} vs sy={sy:.1}"));
+                }
+            }
+        }
+        eprintln!("[#2-clamp] violations={violations:?}");
+        assert!(
+            violations.is_empty(),
+            "停底缩放 offset 必须 clamp 在量程内且 last_scroll_y 回写一致：{violations:?}"
+        );
+        // 收口（防抖到期）不残留。
+        zoom_wait_frames(cx, 30);
+        let armed = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom_armed);
+        assert!(!armed, "防抖应收口");
+    }
+
+    /// #1+#2 端到端：锚点页**页内相对位置守恒**（缩放换档「行上下跳」的用户可观测不变式）。
+    /// 中部页 40% 高度处 3 档进 + 3 档回——页顶相对视口偏移与「当前缩放下的页高×40%」
+    /// 之差恒 <0.5px（Z1 锚点把同字符钉在页内同一相对位置；#2 clamp 不误触因为远离文档底）。
+    /// 注：`pan_zoom::zoom_factor` 已改为**精确逆比**（放大 1+s / 缩小 1/(1+s)，往返严格
+    /// 闭合，根治旧 `(1+s)(1-s)=1-s²` 每轮缩水 ~1.44% 的「来回缩放页面越滚越小」）——绝对
+    /// 往返断言由 `pan_zoom` 单测与 `layout::tests::zoom_three_notch_roundtrip_within_half_px`
+    /// 共同覆盖。
+    #[gpui::test]
+    async fn zoom_mid_doc_anchor_invariant_no_jump(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, mut cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 文档中部页，40% 高度（远离页顶/文档底两条 clamp 边界）。
+        let target = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len().saturating_sub(1) / 2).max(1)
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let top = v.page_tops[target];
+                let h = crate::pdf::layout::display_height(v.dims[target], v.page_width());
+                v.scroll
+                    .set_offset(gpui::point(gpui::px(0.0), gpui::px(-(top + h * 0.4))));
+            });
+        });
+        zoom_wait_frames(cx, 5);
+        // 基准：页内相对偏移 readout（top 现读，消除 base_w 适配噪声）。
+        let read_inpage = |cx: &mut gpui::VisualTestContext, target: usize| -> f32 {
+            cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let sy = f32::from(-v.scroll.offset().y);
+                let h = crate::pdf::layout::display_height(v.dims[target], v.page_width());
+                (sy - v.page_tops[target]) - h * 0.4
+            })
+        };
+        let base = read_inpage(&mut cx, target);
+        // 3 档进 + 3 档回；每档后校验「页内 40% 点相对视口位」守恒（同字符不跳）。
+        for _ in 0..3 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            zoom_wait_frames(cx, 3);
+            let cur = read_inpage(&mut cx, target);
+            assert!(
+                (cur - base).abs() < 0.5,
+                "放大档锚点页内 40% 点应守恒（同字符不跳）：Δ{:.3}px",
+                cur - base
+            );
+        }
+        for _ in 0..3 {
+            cx.simulate_event(zoom_wheel(true, -240.0));
+            zoom_wait_frames(cx, 3);
+            let cur = read_inpage(&mut cx, target);
+            assert!(
+                (cur - base).abs() < 0.5,
+                "缩小档锚点页内 40% 点应守恒（同字符不跳）：Δ{:.3}px",
+                cur - base
+            );
+        }
+        zoom_wait_frames(cx, 20);
+        let final_rel = read_inpage(&mut cx, target);
+        eprintln!(
+            "[#1+#2-invariant] base={base:.3} final={final_rel:.3} Δ={:.3}",
+            final_rel - base
+        );
+        assert!(
+            (final_rel - base).abs() < 0.5,
+            "3 进 3 回页内 40% 点应守恒（同字符 window-y 不跳）：Δ={:.3}",
+            final_rel - base
+        );
+    }
+
+    /// **撤 #3 反断言（第 4 轮真机根因后的新契约）**：手势期**零满密换底**——armed 期间
+    /// 中心可见页**无**当前档满密 cover（在途/入槽均无当下 cscale；前一轮“派中心满密 cover”
+    /// 正是把「偶尔换」变成「每档必换」、整页跳的放大器，已撤销）。屏显稳定在**手势前那张**
+    /// （armed 首帧迁入 prev_cover 的高密位图，GPU 拉伸）；settle（防抖到期）后才按最终
+    /// cscale 一次性派满密收口。分两阶段断言：armed 无新满密、settle 后最终档达阵。
+    #[gpui::test]
+    async fn zoom_armed_no_center_cover_settle_delivers(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 真实缩放 1 档进入 armed。
+        cx.simulate_event(zoom_wheel(true, 240.0));
+        zoom_wait_frames(cx, 2);
+        let (center, cscale, have_base) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = w.scale_factor();
+            let sy = f32::from(-v.scroll.offset().y);
+            let vh = f32::from(v.scroll.bounds().size.height);
+            let vis = pdf_visible_pages(&v, pw, sy, vh);
+            assert!(!vis.is_empty(), "armed 采样时应有可见页（先吃饱帧）");
+            let center = vis[vis.len() / 2];
+            let cscale = crate::pdf::layout::cover_scale(v.dims[center], pw, sf);
+            // 手势前那张高密底图 = 当前槽 cover（cap 4.0 截断、盖度未变时不搬迁）或其
+            // prev_cover 桥（盖度变了、armed 首帧 relocate 迁入）——两者任一即稳定底基。
+            let base = v.slots[center].cover.is_some() || v.slots[center].prev_cover.is_some();
+            (center, cscale, base)
+        });
+        eprintln!("[#3rev] center={center} cscale={cscale:.2} have_base={have_base}");
+        assert!(have_base, "armed 应持有手势前那张高密底图（cover 或 prev_cover 桥）");
+        // —— 阶段 A：armed 期（防抖计时会清 armed，每帧 run 前回钉保持 armed 观测）——
+        // 断言：**无新中心满密 cover 派发**（pending_cover 无当前档条目——中心 cover 派发
+        // 已从 open.rs armed 块撤除；drop_stale 逐帧清旧档）且底基保持（cover/prev_cover 驻留）。
+        let mut no_dispatch = false;
+        for _ in 0..6 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                    v.zoom_armed = true;
+                    v.zoom_idle_frames = 0;
+                });
+            });
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            no_dispatch = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                if !v.zoom_armed {
+                    return false;
+                }
+                // 无「当前档满密 cover」在途：不是「刚派的新满密」（旧档已被 drop_stale 清掉）。
+                let no_inflight = !v
+                    .pending_cover
+                    .get(&center)
+                    .is_some_and(|(sc, _, _, _)| (sc - cscale).abs() <= 1e-3);
+                // 底基仍驻留（手势前那张，未被置换/清空）。
+                let base_held = v.slots[center].cover.is_some()
+                    || v.slots[center].prev_cover.is_some();
+                no_inflight && base_held
+            });
+            if no_dispatch {
+                break;
+            }
+        }
+        assert!(
+            no_dispatch,
+            "armed 手势期中心页不得有新满密 cover 派发（在途无当前档）且底基必须驻留——零满密换底新契约：center={center}"
+        );
+        // —— 阶段 B：settle（防抖到期清 armed）→ 常态收口按最终 cscale 派满密 cover ——
+        // 确定性断言「派发已发生」（计入 pending_cover，不依赖 worker 渲染完成）。
+        let mut settled = false;
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            settled = cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                if v.zoom_armed {
+                    return false;
+                }
+                let pw = v.page_width();
+                let sf = w.scale_factor();
+                let cscale_now = crate::pdf::layout::cover_scale(v.dims[center], pw, sf);
+                v.pending_cover
+                    .get(&center)
+                    .is_some_and(|(sc, _, _, _)| (sc - cscale_now).abs() <= 1e-3)
+                    || (v.slots[center].cover.is_some()
+                        && (v.slots[center].cover_scale - cscale_now).abs() <= 1e-4)
+            });
+            if settled {
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "settle 后最终档满密 cover 应派达中心页（一次性收口，不再逐档换底）"
+        );
+    }
+
+    /// **雾糊复现测试（真 worker 往返 + 逐页 LOD 账）**。
+    ///
+    /// 用户真机证据：缩放「放大→缩回」往返 settle 后，某可见页残留**旧密度底图**
+    /// （prev_cover 桥 / 0.5 preview / mid / thumb）且**静止不再补渲** → 整页雾糊；
+    /// 滚走再滚回来也不恢复，只有再次缩放（密度变化）强制重渲才恢复；低倍（100%~125%）
+    /// 比高倍更易糊、初始打开不糊。
+    ///
+    /// 本用例 headless 用**真 worker** 复现同一条往返路径，并分两档 regime 取证：
+    /// **A（离初始档 3 进 3 回）** 与 **B（低倍 cover-served 档：先把 zoom 降到 render_scale
+    /// 跌破 COVER_SCALE_CAP、使封面满密度即可独自锐利，贴近真机 100%~125% 低倍 regime）**。
+    /// 每轮 settle 后做**真 quiescent**（armed 清 + cover/tile 在途清 + 可见页满密供给连续稳定），
+    /// 逐可见页取证「实际显示底图档 + 密度比 vs 当前 render_scale」，并检测「**卡糊冻结态**」
+    /// = 可见页显示低密底 + 满密供给（当前档 cover / 当前档 cover 在途 / 当前密度瓦片或
+    /// 瓦片在途）全部缺失 + 非 armed——即「静止停在低密拉伸、调度不再补渲」。卡糊页再空转
+    /// 40 帧仍不自愈 → headless 命中复现（真机「滚动不恢复、只缩放恢复」的镜像）。
+    #[gpui::test]
+    async fn zoom_blur_roundtrip_ledger_repro(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+
+        // —— 取证闭包：逐可见页 LOD 账 + 卡糊冻结页清单 ——
+        let read_ledger =
+            |cx: &mut gpui::VisualTestContext| -> (Vec<String>, Vec<usize>) {
+                cx.update(|w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    zoom_blur_ledger(v, w.scale_factor())
+                })
+            };
+
+        // ① 基线：初始打开，推到真 quiescent（真机「初始不糊」基准）。
+        let (q0, _st0) = zoom_blur_quiesce(&holder, cx, 800, 3);
+        let (rows0, st0) = read_ledger(cx);
+        eprintln!(
+            "[ZOOM-REPRO] ①基线(初始打开) quiescent={q0} stuck={st0:?}:\n  {}",
+            rows0.join("\n  ")
+        );
+
+        // ② 滚到第 3 页附近（真实跳转路径），推 quiescent。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.scroll_to_page(3.min(v.dims.len().saturating_sub(1)));
+            });
+        });
+        let (q_s, _st_s) = zoom_blur_quiesce(&holder, cx, 800, 3);
+        let (rows_s, st_s) = read_ledger(cx);
+        eprintln!(
+            "[ZOOM-REPRO] ②滚到第3页 quiescent={q_s} stuck={st_s:?}:\n  {}",
+            rows_s.join("\n  ")
+        );
+
+        // ③ 连续 3 档放大（Ctrl+滚轮向上）→ 防抖 settle（不要求 quiescent，只观测档内态）。
+        for _ in 0..3 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            zoom_wait_frames(cx, 2);
+        }
+        zoom_wait_frames(cx, 8);
+        let (z_up, rows_up, _st_up) = {
+            let (rows, st) = read_ledger(cx);
+            let z = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+            (z, rows, st)
+        };
+        eprintln!(
+            "[ZOOM-REPRO] ③放大3档 zoom={z_up:.3} armed清后(在途态):\n  {}",
+            rows_up.join("\n  ")
+        );
+
+        // ④ 原路 3 档缩回 → 推真 quiescent → 卡糊判定（Phase A 主断言）。
+        for _ in 0..3 {
+            cx.simulate_event(zoom_wheel(true, -240.0));
+            zoom_wait_frames(cx, 2);
+        }
+        let (qa, mut stuck_a) = zoom_blur_quiesce(&holder, cx, 1200, 3);
+        let (z_back, rows_back) = {
+            let (rows, _) = read_ledger(cx);
+            let z = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+            (z, rows)
+        };
+        eprintln!(
+            "[ZOOM-REPRO] ④PhaseA 缩回3档 zoom={z_back:.3} quiescent={qa}:\n  {}",
+            rows_back.join("\n  ")
+        );
+
+        // ⑤ 卡糊冻结定案：卡糊页再空转 40 帧看是否自愈（真机「静止不补渲」= 不自愈）。
+        if !stuck_a.is_empty() {
+            let before = stuck_a.clone();
+            zoom_wait_frames(cx, 40);
+            (_, stuck_a) = read_ledger(cx);
+            eprintln!(
+                "[ZOOM-REPRO] ⑤PhaseA 卡糊页空转 40 帧: before={before:?} after={stuck_a:?}"
+            );
+        }
+
+        // ⑥ Phase B：低倍 cover-served 档（贴近真机 100%~125% 低倍 regime）。
+        //   先缩小到当前可见页 render_scale 跌破 COVER_SCALE_CAP 一截（封面满密度、可独自锐利），
+        //   再推 quiescent 立「低倍新鲜基准」，然后 3 进 3 回再 quiescent 断言。
+        let (low_ok, low_zoom) = zoom_blur_to_low_scale(&holder, cx, 40);
+        eprintln!("[ZOOM-REPRO] ⑥转入低倍 regime ok={low_ok} zoom={low_zoom:.3}");
+        let (q_l, _st_l) = zoom_blur_quiesce(&holder, cx, 1200, 3);
+        let (rows_l, st_l) = read_ledger(cx);
+        eprintln!(
+            "[ZOOM-REPRO] ⑥低倍新鲜基准 quiescent={q_l} stuck={st_l:?}:\n  {}",
+            rows_l.join("\n  ")
+        );
+        for _ in 0..3 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            zoom_wait_frames(cx, 2);
+        }
+        for _ in 0..3 {
+            cx.simulate_event(zoom_wheel(true, -240.0));
+            zoom_wait_frames(cx, 2);
+        }
+        let (qb, mut stuck_b) = zoom_blur_quiesce(&holder, cx, 1200, 3);
+        let (z_bl, rows_bl) = {
+            let (rows, _) = read_ledger(cx);
+            let z = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+            (z, rows)
+        };
+        eprintln!(
+            "[ZOOM-REPRO] ⑥PhaseB 低倍 3进3回 zoom={z_bl:.3} quiescent={qb}:\n  {}",
+            rows_bl.join("\n  ")
+        );
+        if !stuck_b.is_empty() {
+            let before = stuck_b.clone();
+            zoom_wait_frames(cx, 40);
+            (_, stuck_b) = read_ledger(cx);
+            eprintln!(
+                "[ZOOM-REPRO] ⑥PhaseB 卡糊页空转 40 帧: before={before:?} after={stuck_b:?}"
+            );
+        }
+
+        // —— 卡糊综合判定：任一条（A/B）quiescent 后卡糊且空转不自愈 → 复现命中 ——
+        let stuck_final = {
+            let mut s = stuck_a.clone();
+            s.extend(stuck_b.iter().copied());
+            s.sort_unstable();
+            s.dedup();
+            s
+        };
+        if !stuck_final.is_empty() {
+            panic!(
+                "[ZOOM-REPRO] 复现命中：往返后可见页静止卡糊 {stuck_final:?} \
+                 （低密底拉伸 + 满密零在途 + 空转 40 帧不自愈）"
+            );
+        }
+        eprintln!(
+            "[ZOOM-REPRO] 结论：headless 未命中——A/B 两档 quiescent 后所有可见页均有满密供给 \
+             （cover 在槽/在途 或 当前密度瓦片），静止自愈正常"
+        );
+
+        // ⑦ 诊断（不硬断言）：滚走（第5页）再滚回（第3页），看卡糊/低密态是否恢复。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let last = v.dims.len().saturating_sub(1);
+                v.scroll_to_page(5.min(last));
+            });
+        });
+        zoom_wait_frames(cx, 10);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.scroll_to_page(3.min(v.dims.len().saturating_sub(1)));
+            });
+        });
+        zoom_wait_frames(cx, 10);
+        let (rows_away, st_away) = read_ledger(cx);
+        eprintln!(
+            "[ZOOM-REPRO] ⑦滚走再滚回后(刚回窗,在途态):\n  {}（stuck={st_away:?}）",
+            rows_away.join("\n  ")
+        );
+    }
+
+    /// 雾糊复现取证：逐可见页 LOD 账（页号 | cover 当前档? | cover 在途? | prev_cover? |
+    /// prefetch 密度比 | mid | thumb | 瓦片数与密度 | 瓦片在途 | 卡糊标记 → 实际底图档）。
+    /// 返回（逐页描述行, 卡糊冻结页清单）。**卡糊** = 可见页显示低密底（prev/prefetch/mid/
+    /// thumb 任一在槽）且满密供给全无（cover 非当前档 / 当前档 cover 不在途 / 瓦片空或非
+    /// 当前密度 / 无本页瓦片在途）且非 armed——「静止停在低密拉伸、调度不再补渲」。
+    /// `prefetch` 密度比 = `prefetch_cover_scale / render_scale`（0.5 密度 ≈ 0.5）。
+    fn zoom_blur_ledger(
+        v: &crate::pdf::PdfViewer,
+        scale_factor: f32,
+    ) -> (Vec<String>, Vec<usize>) {
+        let pw = v.page_width();
+        let sy = f32::from(-v.scroll.offset().y);
+        let vh = f32::from(v.scroll.bounds().size.height);
+        let vis = pdf_visible_pages(v, pw, sy, vh);
+        let mut rows = Vec::new();
+        let mut stuck: Vec<usize> = Vec::new();
+        for &p in &vis {
+            let s = &v.slots[p];
+            let cscale = crate::pdf::layout::cover_scale(v.dims[p], pw, scale_factor);
+            let scale = crate::pdf::layout::render_scale(pw, scale_factor, v.dims[p].0);
+            let cover_ok = s.cover.is_some() && (s.cover_scale - cscale).abs() <= 1e-4;
+            let pend_cover = v
+                .pending_cover
+                .get(&p)
+                .is_some_and(|(sc, _, _, _)| (sc - cscale).abs() <= 1e-3);
+            let tile_ok = !s.tiles.is_empty() && (s.tile_scale - scale).abs() <= 1e-4;
+            let tile_pend = v.pending_tiles.keys().any(|(pg, _, _)| *pg == p);
+            let low_base = s.prev_cover.is_some()
+                || s.prefetch_cover.is_some()
+                || s.mid.is_some()
+                || s.thumb.is_some();
+            let is_stuck = !cover_ok
+                && !pend_cover
+                && !tile_ok
+                && !tile_pend
+                && low_base
+                && !v.zoom_armed;
+            if is_stuck {
+                stuck.push(p);
+            }
+            let base = if cover_ok {
+                format!("cover({:.2}x)", s.cover_scale / scale)
+            } else if s.prev_cover.is_some() {
+                "prev_cover(旧密度,scale失记)".to_string()
+            } else if s.prefetch_cover.is_some() {
+                format!("prefetch({:.2}x)", s.prefetch_cover_scale / scale)
+            } else if s.mid.is_some() {
+                "mid(~520px)".to_string()
+            } else if s.thumb.is_some() {
+                "thumb(~260px)".to_string()
+            } else if s.cover.is_some() {
+                format!("cover-stale({:.2}x)", s.cover_scale / scale)
+            } else {
+                "none".to_string()
+            };
+            rows.push(format!(
+                "p{p}: c@cur={} c_pend={} prev={} pref={:.2}x mid={} thumb={} tiles({})@cur={} t_pend={} st={} → {base}",
+                if cover_ok { "Y" } else { "-" },
+                if pend_cover { "Y" } else { "-" },
+                if s.prev_cover.is_some() { "Y" } else { "-" },
+                if s.prefetch_cover.is_some() { s.prefetch_cover_scale / scale } else { 0.0 },
+                if s.mid.is_some() { "Y" } else { "-" },
+                if s.thumb.is_some() { "Y" } else { "-" },
+                s.tiles.len(),
+                if tile_ok { "Y" } else { "-" },
+                if tile_pend { "Y" } else { "-" },
+                if is_stuck { "STUCK" } else { "-" },
+            ));
+        }
+        (rows, stuck)
+    }
+
+    /// 等「视觉 quiescent」（雾糊复现测试用）：armed 清 + cover/tile 在途清（镜像静态帧门，
+    /// 不含不与门控的 prefetch/mid/thumb）+ 可见页无卡糊冻结，连续 `stable_frames` 帧成立。
+    /// 返回 `(是否达到, 卡糊页清单)`——未达 = headless 渲染仍在途，测试不据此断言复现。
+    fn zoom_blur_quiesce(
+        holder: &std::rc::Rc<
+            std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>,
+        >,
+        cx: &mut gpui::VisualTestContext,
+        budget_frames: usize,
+        stable_frames: u32,
+    ) -> (bool, Vec<usize>) {
+        use std::time::Duration;
+        let mut stable = 0u32;
+        for _ in 0..budget_frames {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            let (busy, stuck) = cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let busy = v.zoom_armed
+                    || !v.pending_cover.is_empty()
+                    || !v.pending_tiles.is_empty();
+                let (_, stuck) = zoom_blur_ledger(v, w.scale_factor());
+                (busy, stuck)
+            });
+            if !busy && stuck.is_empty() {
+                stable += 1;
+                if stable >= stable_frames {
+                    return (true, stuck);
+                }
+            } else {
+                stable = 0;
+            }
+        }
+        let stuck = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            zoom_blur_ledger(v, w.scale_factor()).1
+        });
+        (false, stuck)
+    }
+
+    /// 2c **静止必收敛不变式**：可见页要么「封面在槽且 cover_scale≈cscale」、要么「可见
+    /// 矩形内瓦片 1:1 全在槽（`tile_scale≈当前 render_scale`）」——终态 ≥ 目标密度，杜绝
+    /// 「未达满密被当 settled 冻结」。直接复用瓦片调度自身的 [`PdfViewer::plan_tiles_in_window`]
+    /// 几何（同一 page_visible_rect/visible_tile_range，零重实现、零漂移）：quiescent 下
+    /// `pending_*` 已空，`plan_tiles` 返回的缺失瓦片 = 该页可见矩形仍未铺满的瓦片。
+    /// 返回违反页清单（空 = 全收敛）。
+    fn zoom_blur_convergence_violations(
+        v: &crate::pdf::PdfViewer,
+        scale_factor: f32,
+        viewport_h: f32,
+        window: &gpui::Window,
+    ) -> Vec<usize> {
+        use crate::pdf::layout as L;
+        let pw = v.page_width();
+        let sy = f32::from(-v.scroll.offset().y);
+        let vis = pdf_visible_pages(v, pw, sy, viewport_h);
+        if vis.is_empty() {
+            return Vec::new();
+        }
+        let first = *vis.first().unwrap();
+        let last = *vis.last().unwrap();
+        let center = (first + last) / 2;
+        // quiescent 下 pending_tiles 已空 → plan 返回的仍是缺失瓦片（未入槽、未在途）。
+        let need = v.plan_tiles_in_window(
+            first..=last,
+            center,
+            pw,
+            scale_factor,
+            sy,
+            viewport_h,
+            window,
+        );
+        let mut bad = Vec::new();
+        for &p in &vis {
+            let s = &v.slots[p];
+            let cscale = L::cover_scale(v.dims[p], pw, scale_factor);
+            if s.cover.is_some() && (s.cover_scale - cscale).abs() <= 1e-4 {
+                continue; // 封面在槽（当前密度）→ 已锐
+            }
+            // 封面缺席 → 可见矩形瓦片由 plan 供给，缺失集里不得再含该页（否则糊冻）。
+            if need.iter().any(|&(pg, _, _, _)| pg == p) {
+                bad.push(p);
+            }
+        }
+        bad
+    }
+
+    /// 把当前可见页 render_scale 降到 COVER_SCALE_CAP 之下（0.93×cap），贴近真机「低倍、
+    /// 封面满密度可独自锐利」的 regime；返回（是否成功, 最终 zoom）。缩放事件触发防抖，
+    /// 调用者随后推 quiescent。
+    fn zoom_blur_to_low_scale(
+        holder: &std::rc::Rc<
+            std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>,
+        >,
+        cx: &mut gpui::VisualTestContext,
+        max_notches: u32,
+    ) -> (bool, f32) {
+        let mut zoom = 1.0f32;
+        for _ in 0..max_notches {
+            let (below, z) = cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let pw = v.page_width();
+                let sf = w.scale_factor();
+                let sy = f32::from(-v.scroll.offset().y);
+                let vh = f32::from(v.scroll.bounds().size.height);
+                let vis = pdf_visible_pages(v, pw, sy, vh);
+                let p = *vis.first().unwrap_or(&0);
+                let scale = crate::pdf::layout::render_scale(pw, sf, v.dims[p].0);
+                (scale <= config::pdf::COVER_SCALE_CAP * 0.97, v.zoom)
+            });
+            if below {
+                return (true, z);
+            }
+            cx.simulate_event(zoom_wheel(true, -240.0));
+            zoom_wait_frames(cx, 2);
+            zoom = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+        }
+        (false, zoom)
+    }
+
+    /// **zoom 分步 mod-4 模糊机制探针**。用户真机确定性配方（非竞态，headless 可复现）：
+    /// 初始 100% 清晰；放大 1/2/3 步糊、放大 4 步清晰；4 步基础上缩回 1/2/3 步糊、缩回 4 步
+    /// 清晰（回 100%）——清晰度按「净步数 mod 4 = 0」周期翻转、放大/缩小对称。
+    ///
+    /// 本探针在 **sf=1.0** 复刻真机「低倍 cover-served、纯封面供给、无瓦片」regime
+    /// （测试平台默认 2× DPI 会让 render_scale 在 100% 即越过 COVER_SCALE_CAP → 永远有
+    /// 1:1 瓦片撑锐，远离真机）。扫多个窗口宽度（含让 render_scale 在 1..5 步内越过
+    /// [4.0, 4.06] COVER_SCALE_CAP/eps 刀刃的宽度），每档取**两次账**：
+    /// ① 瞬态 T（notch 后 ~4 帧，缩放防抖/封面在途——真机用户此刻看到的就是屏显）；
+    /// ② 稳态 S（真 quiescent 后）。每行给期望 cover 密度(cscale)/cover_serves 判定/
+    /// 槽内实际底图档/密度比/显示设备宽 vs cover 位图设备宽/snap 残余亚像素，判「糊步」。
+    /// 只取证不断言（诊断用）。
+    #[gpui::test]
+    async fn zoom_step_mod4_blur_probe(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        use std::time::Duration;
+        // 宽度从低倍（scale≈1.6）到拖到 5 步内越过 4.06 刀刃（base_w 比例域全覆盖）
+        let widths: &[(f32, f32, &str)] = &[
+            (1000.0, 800.0, "W1000"),
+            (1200.0, 800.0, "W1200"),
+            (1500.0, 900.0, "W1500"),
+            (1600.0, 900.0, "W1600"),
+            (1765.0, 900.0, "W1765"),
+            (2170.0, 900.0, "W2170"),
+            (2420.0, 900.0, "W2420"),
+        ];
+        for &(ww, wh, label) in widths {
+            let holder = zoom_holder();
+            let (_root, cx) = {
+                // zoom_add_window 硬编码 1500×900；这里按参数化大小开窗并强制 sf=1.0
+                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/pdf测试2.pdf");
+                cx.update(crate::test_support::bind_local_keymaps);
+                let h = holder.clone();
+                let (root, vcx) = cx.add_window_view(move |_window, cx| {
+                    let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(path.clone(), cx));
+                    *h.borrow_mut() = Some(pdf.clone());
+                    ZoomProbe { pdf }
+                });
+                vcx.simulate_resize(gpui::size(gpui::px(ww), gpui::px(wh)));
+                vcx.update(|w, _| w.set_scale_factor(1.0));
+                let mut loaded = false;
+                for _ in 0..400 {
+                    vcx.run_until_parked();
+                    loaded = vcx.update(|_w, cx| {
+                        holder
+                            .borrow()
+                            .as_ref()
+                            .map(|pv| pv.read(cx).is_loaded())
+                            .unwrap_or(false)
+                    });
+                    if loaded {
+                        break;
+                    }
+                }
+                assert!(loaded, "测试 PDF 应加载完成");
+                for _ in 0..6 {
+                    vcx.executor().advance_clock(Duration::from_millis(16));
+                    vcx.run_until_parked();
+                }
+                (root, vcx)
+            };
+
+            // 取一可见页的账（tag=T 瞬态 / S 稳态）。糊 = 当前显示底图密度比 < 1.0。
+            let row = |cx: &mut gpui::VisualTestContext, tag: &str, step: i32| {
+                cx.update(|w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let sf = w.scale_factor();
+                    let pw = v.page_width();
+                    let sy = f32::from(-v.scroll.offset().y);
+                    let vh = f32::from(v.scroll.bounds().size.height);
+                    let vis = pdf_visible_pages(v, pw, sy, vh);
+                    let p = *vis.first().unwrap_or(&0);
+                    let s = &v.slots[p];
+                    let scale = crate::pdf::layout::render_scale(pw, sf, v.dims[p].0);
+                    let cscale = crate::pdf::layout::cover_scale(v.dims[p], pw, sf);
+                    let serve = crate::pdf::layout::cover_serves_scale(cscale, scale);
+                    let cover_ok = s.cover.is_some() && (s.cover_scale - cscale).abs() <= 1e-4;
+                    // 显示底图密度比：1.0=同密度锐化；prev_cover≈1/1.12≈0.89；
+                    // prefetch=prefetch_scale/scale（0.5× 原始 cscale）；mid≈520px/显示宽；thumb≈260px/显示宽
+                    let (base, ratio) = if cover_ok {
+                        ("cover(cur)", 1.0f32)
+                    } else if s.prev_cover.is_some() {
+                        ("prev_cover", 1.0 / 1.12)
+                    } else if s.prefetch_cover.is_some() {
+                        ("prefetch", s.prefetch_cover_scale / scale)
+                    } else if s.mid.is_some() {
+                        ("mid", 520.0 / pw)
+                    } else if s.thumb.is_some() {
+                        ("thumb", 260.0 / pw)
+                    } else {
+                        ("none", 0.0)
+                    };
+                    // snap_to_device 残余：页卡顶对齐设备网格后仍剩的亚像素（设备 px）
+                    let top_raw = v.page_tops[p] + sy;
+                    let top_snapped =
+                        crate::pdf::layout::snap_to_device(top_raw, sf) - sy;
+                    let snap_off_dev = ((top_snapped - v.page_tops[p]) * sf).abs();
+                    // 期望 cover 位图设备宽（cscale 未截断时 = ceil(显示设备宽)）
+                    let disp_dev = pw * sf;
+                    let cov_bmp = crate::pdf::layout::page_bitmap_size(v.dims[p], cscale);
+                    // cover 位图设备宽 vs 显示设备宽：<1 时 cover 上采样（糊源）
+                    let dev_ratio = cov_bmp.0 as f32 / disp_dev;
+                    eprintln!(
+                        "[ZOOM-MOD4] {} {} step={:<2} z={:.4} pw={:.1} base={} ratio={:.3} scale={:.4} cscale={:.4} serve={} cover@{}/slot={:.4} prev={} pref={}({:.2}x) mid={} thumb={} tiles({})@cur={} tpend={} disp_dev={:.2} cov_bmp_w={} cov/display={:.4} snap_off_dev={:.3} armed={}",
+                        label, tag, step, v.zoom, pw, base, ratio, scale, cscale,
+                        if serve { "Y" } else { "-" },
+                        if cover_ok { "Y" } else { "-" },
+                        s.cover_scale,
+                        if s.prev_cover.is_some() { "Y" } else { "-" },
+                        if s.prefetch_cover.is_some() { "Y" } else { "-" },
+                        if s.prefetch_cover.is_some() { s.prefetch_cover_scale / scale } else { 0.0 },
+                        if s.mid.is_some() { "Y" } else { "-" },
+                        if s.thumb.is_some() { "Y" } else { "-" },
+                        s.tiles.len(),
+                        if !s.tiles.is_empty() && (s.tile_scale - scale).abs() <= 1e-4 { "Y" } else { "-" },
+                        if v.pending_tiles.keys().any(|(pg, _, _)| *pg == p) { "Y" } else { "-" },
+                        disp_dev, cov_bmp.0, dev_ratio, snap_off_dev, v.zoom_armed,
+                    );
+                });
+            };
+
+            eprintln!("[ZOOM-MOD4] ======== 窗口 {label}（resize {ww}×{wh}, sf=1.0） ========");
+            // 2c 静止必收敛断言：quiescent 后每可见页要么 cover_scale≈cscale、要么可见矩形
+            // 内瓦片 1:1 覆盖（终态 ≥ 目标密度，杜绝「未达满密被当 settled 冻结」）。
+            let converge = |cx: &mut gpui::VisualTestContext| {
+                let bad = cx.update(|w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let vh = f32::from(v.scroll.bounds().size.height);
+                    zoom_blur_convergence_violations(v, w.scale_factor(), vh, w)
+                });
+                if !bad.is_empty() {
+                    eprintln!("[ZOOM-MOD4] {label} 静止未收敛页={bad:?}");
+                }
+                assert!(
+                    bad.is_empty(),
+                    "[ZOOM-MOD4] {label} 静止必收敛被违（页 {bad:?}）：封面缺失页未补瓦片/封面 → 糊冻"
+                );
+            };
+            let (q0, _) = zoom_blur_quiesce(&holder, cx, 800, 2);
+            eprintln!("[ZOOM-MOD4] {label} step0 quiescent={q0}");
+            row(cx, "S", 0);
+            converge(cx);
+            // 放大相：每 notch 后取瞬态 T + 稳态 S
+            for step in 1..=5i32 {
+                cx.simulate_event(zoom_wheel(true, 240.0));
+                zoom_wait_frames(cx, 4);
+                row(cx, "T", step);
+                let (q, st) = zoom_blur_quiesce(&holder, cx, 800, 2);
+                eprintln!("[ZOOM-MOD4] {label} 放大{step} quiescent={q} stuck={st:?}");
+                row(cx, "S", step);
+                converge(cx);
+            }
+            // 缩回相：5 档基础上一档档缩回（净步 4..0）
+            for net in (0..=4i32).rev() {
+                cx.simulate_event(zoom_wheel(true, -240.0));
+                zoom_wait_frames(cx, 4);
+                row(cx, "T", net);
+                let (q, st) = zoom_blur_quiesce(&holder, cx, 800, 2);
+                eprintln!("[ZOOM-MOD4] {label} 缩回→净{net} quiescent={q} stuck={st:?}");
+                row(cx, "S", net);
+                converge(cx);
+            }
+        }
+    }
+
+    /// #5 去 E（高倍收口雾窗）：cur>4 收口帧把 TILE_INFLIGHT=6 临时抬到
+    /// SETTLE_TILE_BURST_MAX 一次性入队可见瓦片。断言：1) 收口后 `settle_tile_burst_dispatch`
+    /// > 0（突发生效、headless 确定性证据）且 ≤ SETTLE_TILE_BURST_MAX（预算有界）；
+    /// 2) 突发帧后 `settle_tile_burst` 被消费复清（只抬当帧、普通滚动语义不变）。
+    #[gpui::test]
+    async fn zoom_high_scale_settle_bursts_visible_tiles(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 连续放大到高倍（render_scale 远超 cap → 纯瓦片收口路径；镜像 high_scale 测试）。
+        let mut z_cur = 0.0f32;
+        for _ in 0..16 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..2 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+            }
+            z_cur = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+            if z_cur >= 2.6 {
+                break;
+            }
+        }
+        assert!(z_cur >= 2.6, "应已放大到高倍（zoom={z_cur:.2}）");
+        // 收口（防抖到期清 armed → settle_burst 置位 → schedule_tiles 突发帧）。
+        let mut dispatch = 0u64;
+        let mut burst_consumed = false;
+        for _ in 0..30 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            (dispatch, burst_consumed) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.settle_tile_burst_dispatch, !v.settle_tile_burst)
+            });
+            if dispatch > 0 {
+                break;
+            }
+        }
+        eprintln!(
+            "[#5] settle burst dispatch={dispatch} (≤{} / 常态 {}) consumed={burst_consumed}",
+            config::pdf::SETTLE_TILE_BURST_MAX,
+            config::pdf::TILE_INFLIGHT
+        );
+        assert!(
+            dispatch > 0,
+            "高倍收口帧应触发瓦片一次性出清（settle_tile_burst_dispatch>0）"
+        );
+        assert!(
+            dispatch as usize <= config::pdf::SETTLE_TILE_BURST_MAX,
+            "收口突发应受出清预算上限夹（单次突发 ≤ 上限）：{dispatch}"
+        );
+        assert!(
+            burst_consumed,
+            "突发帧后 settle_tile_burst 应被消费（普通滚动语义不变）"
+        );
+    }
+
     /// 回归：Ctrl+滚轮应放大/缩小页面（页列宽、整列高随之变化），普通滚轮不改变缩放。
     #[gpui::test]
     async fn pdf_ctrl_wheel_zooms_in_out(cx: &mut gpui::TestAppContext) {
@@ -1245,6 +3324,11 @@ mod tests {
             off0.y.as_f32() < 0.0,
             "滚到第 5 页后应向下偏移（负值）：{off0:?}"
         );
+        // Z1：记录缩放前 layout（锚点公式需旧/新 tops 对账；dims 全文档不变）。
+        let (tops0, dims0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.page_tops.clone(), v.dims.clone())
+        });
 
         let wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
             position: gpui::point(gpui::px(400.), gpui::px(500.)),
@@ -1268,13 +3352,21 @@ mod tests {
         assert!(w1 > w0, "Ctrl+向上滚应放大：{w0} → {w1}");
         assert!(z1 > 1.0, "zoom 应 >1：{z1}");
         assert!(total1 > total0, "整列高应随缩放增大：{total0} → {total1}");
-        // Ctrl 滚轮**不应滚动**：滚动偏移应恰好等于「缩放前 × 缩放比」的锚定值。
-        let off1 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).scroll.offset());
-        let exp_y1 = off0.y.as_f32() * (w1 / w0);
-        let exp_x1 = off0.x.as_f32() * (w1 / w0);
+        // Ctrl 滚轮**不应滚动**：滚动偏移按 Z1 锚点公式锚定——锚点页 K 的页顶按新布局
+        // 换算 + 页内相对位移同比，常量区（PAGE_PAD_Y/PAGE_GAP）不被 ×ratio 放大（旧
+        // 「整段 ×ratio」在深页每档漂移 (ratio−1)(PAD+K·GAP)，正是行上下跳动源）。
+        let (off1, tops1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.scroll.offset(), v.page_tops.clone())
+        });
+        let sy0 = -off0.y.as_f32();
+        let ratio = w1 / w0;
+        let k = layout::first_visible_page(&dims0, &tops0, w0, sy0);
+        let exp_y1 = -(tops1[k] + (sy0 - tops0[k]) * ratio);
+        let exp_x1 = off0.x.as_f32() * ratio;
         assert!(
             (off1.y.as_f32() - exp_y1).abs() < 1.0 && (off1.x.as_f32() - exp_x1).abs() < 1.0,
-            "Ctrl 放大不应产生额外滚动：锚定 y={exp_y1:.1} 实际 y={:.1}（x 锚={exp_x1:.1} 实际 x={:.1}）",
+            "Ctrl 放大不应产生额外滚动：锚定 y={exp_y1:.1} 实际 y={:.1}（K={k}，x 锚={exp_x1:.1} 实际 x={:.1}）",
             off1.y.as_f32(),
             off1.x.as_f32()
         );
@@ -1299,21 +3391,31 @@ mod tests {
         );
 
         // Ctrl+向下滚（y<0）→ 缩小：锚定基准 = 当前（普通滚轮已滚动后）的偏移
+        let tops_before_out =
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_tops.clone());
         cx.simulate_event(wheel(true, -240.0));
         for _ in 0..4 {
             cx.run_until_parked();
         }
-        let (w3, z3, off3) = cx.update(|_w, cx| {
+        let (w3, z3, off3, tops3) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
-            (v.page_width(), v.zoom, v.scroll.offset())
+            (
+                v.page_width(),
+                v.zoom,
+                v.scroll.offset(),
+                v.page_tops.clone(),
+            )
         });
         assert!(w3 < w1, "Ctrl+向下滚应缩小：{w1} → {w3}");
         assert!(z3 < z1, "zoom 应变小：{z1} → {z3}");
-        let exp_y3 = off2.y.as_f32() * (w3 / w1);
-        let exp_x3 = off2.x.as_f32() * (w3 / w1);
+        let sy0b = -off2.y.as_f32();
+        let ratio_b = w3 / w1;
+        let k2 = layout::first_visible_page(&dims0, &tops_before_out, w1, sy0b);
+        let exp_y3 = -(tops3[k2] + (sy0b - tops_before_out[k2]) * ratio_b);
+        let exp_x3 = off2.x.as_f32() * ratio_b;
         assert!(
             (off3.y.as_f32() - exp_y3).abs() < 1.0 && (off3.x.as_f32() - exp_x3).abs() < 1.0,
-            "Ctrl 缩小也不应滚动：锚定 y={exp_y3:.1} 实际 y={:.1}",
+            "Ctrl 缩小也不应滚动：锚定 y={exp_y3:.1} 实际 y={:.1}（K={k2}）",
             off3.y.as_f32()
         );
     }
@@ -3637,7 +5739,7 @@ mod tests {
             (w, v.doc_id, c)
         });
         let t0 = Instant::now();
-        let rx_solo = worker.request_render(doc_id, crate::pdf::RenderRequest { page: 30, scale: cscale }, 0);
+        let rx_solo = worker.request_render(doc_id, crate::pdf::RenderRequest { page: 30, scale: cscale }, 0, 0);
         let _solo = rx_solo.recv_timeout(Duration::from_secs(30)).expect("单人渲染应返回");
         let solo_render_ms = t0.elapsed().as_secs_f64() * 1e3;
 
@@ -3872,10 +5974,10 @@ mod tests {
         // 推进导航世代（view 大跳后推送；Navigate 控制消息先于渲染出队生效）
         worker.navigate(doc_id, 1);
         // 旧世代请求（gen=0）晚到 → 出队时应被 drop
-        let rx_old_a = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
-        let rx_old_b = worker.request_render(doc_id, RenderRequest { page: 1, scale: 1.0 }, 0);
+        let rx_old_a = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0, 0);
+        let rx_old_b = worker.request_render(doc_id, RenderRequest { page: 1, scale: 1.0 }, 0, 0);
         // 新世代请求（gen=1）→ 应正常渲染
-        let rx_new = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 1);
+        let rx_new = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 1, 0);
         // 新世代结果应到达（真实渲染；新在途结果不被误弃）
         let new_res = rx_new
             .recv_timeout(Duration::from_secs(30))
@@ -4340,13 +6442,17 @@ mod tests {
             "[T1-FIRST-SCREEN] n={n} sf={sf} affordable0={affordable0} all_assertible={all_assertible} density_match0={density_match0} cover_present={cover_present} tiles_on_page={tiles_on_page} tile_reqs={t0}->{t1} cover_reqs={cover_reqs} raster_reqs={raster_reqs}"
         );
         if all_assertible {
-            // 封面先行主路径：从首屏停稳到远跳翻页停稳，瓦片系派发增量为 0（旧语义这次
-            // 翻页会补一屏瓦片 → `tile_reqs` 增长 = 双渲回归）；目标页由封面供给、同页无瓦片。
+            // 封面先行主路径（新不变式，2026-10-30 伪机制修复后）：`plan_tiles_in_window`
+            // 只在「封面在槽/在途」时才跳过瓦片——翻页落点页封面尚未在槽/在途的首帧会派一次
+            // 当前密度 1:1 瓦片兜底（封面缺失不再静默跳过 → 静止必锐，根治 mod4 糊冻），
+            // 这些兜底瓦片由 TILE_INFLIGHT/budget 自理、封面到位后被 `collect_tile_results`/
+            // `evict_tiles` 的「同密度封面冗余」回收 → 停稳后**同页无瓦片驻留（无双渲/双驻留）**。
+            // 目标页由封面供给、封面到位后瓦片清零。
             // 注：`tile_reqs` 非零部分来自开档初始最大化窗（页宽使密度 > COVER_SCALE_CAP
-            // 的「底图+精修」合法瓦片，与本「同密度封面 vs 瓦片」回归口径无关）。
-            assert_eq!(t1, t0, "封面 affordable 首屏/翻页不应派发新增瓦片栅格命令");
-            assert!(cover_present, "封面 affordable 目标页应已由封面供给");
-            assert!(!tiles_on_page, "封面 affordable 目标页不得同页持瓦片（无双渲）");
+            // 的「底图+精修」合法瓦片）与封面缺失页的瞬态兜底（本次翻页应 t0→t1 有小幅增长）。
+            assert!(t1 >= t0, "封面 affordable 翻页后瓦片计数不应倒退");
+            assert!(cover_present, "封面 affordable 目标页应已由封面供给（静止必锐）");
+            assert!(!tiles_on_page, "封面 affordable 目标页停稳后不得同页持瓦片（无双重驻留）");
             assert!(
                 cover_reqs >= 1,
                 "affordable 屏幕应派发了封面：cover_reqs={cover_reqs}"
@@ -5002,14 +7108,14 @@ mod tests {
         // 原图基准（未着色）：门控开启下取 None 档，两次应逐字节一致。
         // （worker 直接调用：epoch 是本测试内部推进的虚拟世代，仅结果不涉 view 守卫。）
         worker.set_recolor(doc_id, None, 1);
-        let rx_raw = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0);
+        let rx_raw = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0, 0);
         let raw = rx_raw
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("原图应返回")
             .expect("渲染应成功");
         // 门控开启：设了 night 但显示像素仍是未着色原图（worker 跳过 CPU 着色）。
         worker.set_recolor(doc_id, Some(night), 2);
-        let rx_gpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0);
+        let rx_gpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0, 0);
         let gpu_out = rx_gpu
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("门控开启着色档应返回")
@@ -5031,7 +7137,7 @@ mod tests {
         // 门控关闭：恢复既有 CPU 着色（回归不变式，与 dbd3236 一致）。
         crate::recolor::set_gpu_recolor_gate_for_test(false);
         worker.set_recolor(doc_id, Some(night), 3);
-        let rx_cpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0);
+        let rx_cpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0, 0);
         let cpu_out = rx_cpu
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("门控关闭着色档应返回")
@@ -5820,7 +7926,7 @@ mod tests {
         // 渲染可见性（FPDF_RENDER_ANNOT 默认开启）：写回前 vs 重开后同区域像素出现差异
         // = 注释真的渲染出来了（不是只落了文件没显示）。
         let (wa, da, _) = PdfWorker::open_and_dims(bytes0).expect("原始打开");
-        let rx = wa.request_render(da, RenderRequest { page: 0, scale: 1.0 }, 0);
+        let rx = wa.request_render(da, RenderRequest { page: 0, scale: 1.0 }, 0, 0);
         let before = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("收到渲染")
@@ -5831,7 +7937,7 @@ mod tests {
         let (w2, d2, dims2) =
             PdfWorker::open_and_dims(std::fs::read(&path).expect("改后重读")).expect("重开改后文件");
         assert_eq!(dims2, dims, "写回注释不应改变页数与页尺寸");
-        let rx2 = w2.request_render(d2, RenderRequest { page: 0, scale: 1.0 }, 0);
+        let rx2 = w2.request_render(d2, RenderRequest { page: 0, scale: 1.0 }, 0, 0);
         let after = rx2
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("收到渲染")

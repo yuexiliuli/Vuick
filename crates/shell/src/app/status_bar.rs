@@ -58,7 +58,11 @@ impl EditorApp {
         // 中间区数据源（派生自激活选项卡，无新状态）：只读预览页码 / PDF 页码 / 光标行列。
         let epub_page = tab.map(|_| self.epub_page_bounds(window, cx)).unwrap_or(None);
         let pdf_page = tab.and_then(|t| match &t.reader {
-            MediaReader::Pdf(pv) => pv.read(cx).current_page(),
+            MediaReader::Pdf(pv) => {
+                let v = pv.read(cx);
+                v.current_page()
+                    .map(|(page, total)| (page, total, v.zoom_factor()))
+            }
             _ => None,
         });
         let cursor_pos = tab.and_then(|t| {
@@ -260,16 +264,19 @@ impl EditorApp {
     fn status_bar_middle(
         &self,
         epub_page: Option<(usize, usize)>,
-        pdf_page: Option<(usize, usize)>,
+        pdf_page: Option<(usize, usize, f32)>,
         cursor_pos: Option<(usize, usize)>,
     ) -> Option<gpui::Div> {
         // 只读预览（EPUB）：视口分页页码（滚动位置实时）。
         if let Some((page, total)) = epub_page {
             return Some(self.middle_text("status-epub-page", format!("第 {page} / {total} 页")));
         }
-        // PDF：当前第一张可见页 / 总页数（滚动位置）。
-        if let Some((page, total)) = pdf_page {
-            return Some(self.middle_text("status-pdf-page", format!("第 {page} / {total} 页")));
+        // PDF：当前第一张可见页 / 总页数（滚动位置）+ 当前缩放百分比（真机取证 zoom%）。
+        if let Some((page, total, zoom)) = pdf_page {
+            return Some(self.middle_text(
+                "status-pdf-page",
+                format!("第 {page} / {total} 页  {:.0}%", zoom * 100.0),
+            ));
         }
         // 编辑区：有内容才显示 行:列（未命名空文档省略）。
         if let Some((ln, col)) = cursor_pos {

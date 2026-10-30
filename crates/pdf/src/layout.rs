@@ -105,6 +105,32 @@ pub(crate) fn compute_layout(dims: &[(f32, f32)], page_width: f32) -> (Vec<f32>,
     (tops, total)
 }
 
+/// Z1 缩放锚点重锚（纯函数契约）：返回缩放后应保持「锚点页 K 的页内相对位置」的滚动 y。
+///
+/// 页列布局 `tops` 随 `page_width` 线性缩放（页高同比、`display_height` 同源），但
+/// `PAGE_PAD_Y`/`PAGE_GAP` 常量**不随缩放变化**——因此正确重锚是「锚点页 K 的页顶按新布局
+/// 换算 + 页内相对偏移 `(scroll_y − tops_old[K])` 同比缩放」，而不是把整个 scroll 按
+/// `ratio` 乘（后者每档漂移 `-(ratio-1)×(PAD+K×GAP)`，深页可跳 2-3 行高、放大上跳/缩小下跳
+/// 离散跳）。K = `first_visible_page` 语义（scroll 贴页顶时锚在该页；越界 clamp）。
+/// 契约（Z1.1）：`result == tops_new[K] + (scroll_y − tops_old[K]) × ratio`，且缩放回原档
+/// （ratio 互逆、布局对称）无漂移。
+pub(crate) fn zoom_rescroll_anchor(
+    dims: &[(f32, f32)],
+    tops_old: &[f32],
+    tops_new: &[f32],
+    page_width_old: f32,
+    ratio: f32,
+    scroll_y: f32,
+) -> f32 {
+    if tops_old.is_empty() && tops_new.is_empty() {
+        return scroll_y * ratio;
+    }
+    let k = first_visible_page(dims, tops_old, page_width_old, scroll_y);
+    let top_old = tops_old.get(k).copied().unwrap_or(0.0);
+    let top_new = tops_new.get(k).copied().unwrap_or(top_old * ratio);
+    top_new + (scroll_y - top_old) * ratio
+}
+
 /// 当前第一张**可见**页（0 基）：「页面底 > 视口顶」的首张页。
 /// 与 [`keep_window`] 的窗口起点不同——**不含 MARGIN 缓冲**，用于状态栏页码等
 /// 「如实反映视口」的读数；`scroll_y` 为内容已向下滚动的像素数（≥0）。
@@ -210,12 +236,24 @@ pub(crate) fn render_scale(page_width: f32, scale_factor: f32, page_pt_width: f3
 
 // ---- 瓦片（Tile）几何：worker 与 view 共用同一套数学，保证拼片逐像素对齐 ----
 
-/// 页（PDF 点）→ 页位图（物理像素）尺寸。与 pdfium 栅格化的取整一致：`ceil` 且最小 1。
+/// 位图尺寸的「先取整再 ceil」稳定器：`page_width()` 已把显示宽量化到设备像素整数后，
+/// 理论值 `pt×scale` 应为整数，但 f32 的 scale 往返（除法再乘法）可能有数 ULP 抖动 →
+/// 朴素 ceil 会让位图宽 = 整数+1，而显示矩形（GPUI 绘制时 `snap_bounds` 用 round 取整）
+/// = 整数 → 仍差 1px 触发双线性重采样发糊。对落在整数 ε（0.01px，远小于 1px、远大于
+/// ULP）内的值先取整再 ceil，使位图宽恒等于显示设备宽（逐纹素 1:1）；真实分数（高度轴
+/// 常见）不在 ε 内 → 完全不受影响。
+#[inline]
+fn snapped_bitmap_len(v: f32) -> u32 {
+    let r = v.round();
+    let v = if (v - r).abs() < 0.01 { r } else { v.ceil() };
+    v.max(1.0) as u32
+}
+
+/// 页（PDF 点）→ 页位图（物理像素）尺寸。与 pdfium 栅格化的取整一致：`ceil` 且最小 1
+/// （含 [`snapped_bitmap_len`] 的 1:1 稳定化）。worker 与 view 共用同一套数学 → 位图宽
+/// 与显示矩形（设备像素取整）逐纹素对齐，瓦片/封面/高亮几何零漂移。
 pub(crate) fn page_bitmap_size((pw, ph): (f32, f32), scale: f32) -> (u32, u32) {
-    (
-        (pw * scale).ceil().max(1.0) as u32,
-        (ph * scale).ceil().max(1.0) as u32,
-    )
+    (snapped_bitmap_len(pw * scale), snapped_bitmap_len(ph * scale))
 }
 
 /// 页位图 → 卡片显示像素的分轴缩放（宽/高各自独立，吸收两轴 ceil 取整差异）。
@@ -229,6 +267,31 @@ pub(crate) fn bitmap_display_scales(
         display_w / bmp.0.max(1) as f32,
         disp_h / bmp.1.max(1) as f32,
     )
+}
+
+/// 把 CSS px 对齐到**设备像素网格**（0.5 设备 px 内取整）：`(v×sf).round()/sf`。
+/// 缩放换档的「子像素基线 pop」根因是页卡 top 落在分数设备位、旧底图（旧密度）拉伸与新
+/// 栅格（ceil 整数位图像素）共用同一 PDF→设备映射时差 ≤1 设备 px/轴——把**绘制用**放置
+/// 矩形先做一次设备网格对齐（旧拉伸与新栅格共享同一放置网格），换档映射差归零（或
+/// ≤0.5 设备 px）。纯函数、幂等（同输入恒同输出），只改放置不打滚动/布局账。
+pub(crate) fn snap_to_device(v: f32, scale_factor: f32) -> f32 {
+    let sf = scale_factor.max(0.01);
+    (v * sf).round() / sf
+}
+
+/// 封面密度是否**等效**于瓦片密度（D cap 刀刃稳健化的唯一判定点）：
+/// ① 精确到 1e-4 内相等 → 同密度（既有语义）；② `coverscale` 被 [`config::pdf::COVER_SCALE_CAP`]
+/// 截断（≈4.0）、而 `scale ∈ (cap, COVER_DENSITY_EPS_ZOOM]` → 视作同密度 cover-served：
+/// 密度差 ≤1.5%、视觉无差，把分派决策从「cover(锐) vs 瓦片雾窗(糊)」的 cap 刀刃两翼翻转
+/// 中稳定下来（×1.12 f32 不幂等导致同显百分比可落两翼 → 时锐时糊）。超出区间仍按精确
+/// 判定（4.1+ 必须 1:1 瓦片，清晰度达标优先）。
+pub(crate) fn cover_serves_scale(coverscale: f32, scale: f32) -> bool {
+    if (coverscale - scale).abs() <= 1e-4 {
+        return true;
+    }
+    (config::pdf::COVER_SCALE_CAP - coverscale).abs() <= 1e-4
+        && scale > config::pdf::COVER_SCALE_CAP
+        && scale <= config::pdf::COVER_DENSITY_EPS_ZOOM
 }
 
 /// 瓦片网格维度：(行数, 列数)。每格名义 [TILE_SIZE × TILE_SIZE]（页尾/侧不足则为残片）。
@@ -354,14 +417,13 @@ pub(crate) fn pt_to_local(
     scale: f32,
 ) -> (f32, f32) {
     let scale = scale.max(0.01);
-    let bmp_w = (page_pt_w * scale).ceil().max(1.0);
-    let bmp_h = (page_pt_h * scale).ceil().max(1.0);
+    let (bmp_w, bmp_h) = page_bitmap_size((page_pt_w, page_pt_h), scale);
     let disp_h = display_height((page_pt_w, page_pt_h), display_w);
     let bx = px * scale;
     let by = (page_pt_h - py) * scale;
     (
-        bx * (display_w / bmp_w),
-        by * (disp_h / bmp_h),
+        bx * (display_w / bmp_w as f32),
+        by * (disp_h / bmp_h as f32),
     )
 }
 
@@ -375,11 +437,10 @@ pub(crate) fn local_to_pt(
     scale: f32,
 ) -> (f32, f32) {
     let scale = scale.max(0.01);
-    let bmp_w = (page_pt_w * scale).ceil().max(1.0);
-    let bmp_h = (page_pt_h * scale).ceil().max(1.0);
+    let (bmp_w, bmp_h) = page_bitmap_size((page_pt_w, page_pt_h), scale);
     let disp_h = display_height((page_pt_w, page_pt_h), display_w);
-    let bx = lx * (bmp_w / display_w);
-    let by = ly * (bmp_h / disp_h);
+    let bx = lx * (bmp_w as f32 / display_w);
+    let by = ly * (bmp_h as f32 / disp_h);
     (bx / scale, page_pt_h - by / scale)
 }
 
@@ -865,6 +926,96 @@ mod tests {
     }
 
     #[test]
+    fn zoom_rescroll_anchor_contract_locks_anchor_page_linear_scaling() {
+        // Z1 契约：缩放重锚 = 锚点页 K 页顶按新布局换算 + 页内相对偏移同比缩放；
+        // 旧实现「整个 offset × ratio」对 K≥1 的常量区（PAGE_PAD_Y/GAP）也乘因子 → 必漂移。
+        let dims: Vec<(f32, f32)> = vec![a4(); 5]; // 多页同 pt
+        let old_w = 1200.0;
+        let new_w = 1344.0; // ×1.12
+        let ratio = new_w / old_w;
+        let (tops_old, _) = compute_layout(&dims, old_w);
+        let (tops_new, _) = compute_layout(&dims, new_w);
+        // 逐页在中部采样：K=0..=4 都要满足契约（K=0 常量区小、K=4 最大）。
+        for k in 0..dims.len() {
+            let h_k = display_height(dims[k], old_w);
+            let scroll_y = tops_old[k] + h_k * 0.35; // 落在页 k 中部
+            // 锚点语义：scroll 贴页 k 顶→锚 k；此处 mid→first_visible_page 应返回 k。
+            assert_eq!(first_visible_page(&dims, &tops_old, old_w, scroll_y), k, "采样点应锚页 {k}");
+            let got = zoom_rescroll_anchor(&dims, &tops_old, &tops_new, old_w, ratio, scroll_y);
+            let want = tops_new[k] + (scroll_y - tops_old[k]) * ratio;
+            assert!(
+                (got - want).abs() < 1e-2,
+                "页 {k} 契约：got={got} want={want}"
+            );
+            // 旧公式（整段 ×ratio）对 K≥1 必 FAIL（常量区被错乘）。
+            if k >= 1 {
+                let legacy = scroll_y * ratio;
+                let drift = (legacy - want).abs();
+                assert!(
+                    drift > 2.0,
+                    "旧公式对 K={k} 应产生明显漂移（>2px=半行+），实际 {drift:.2}px —— 契约无鉴别力"
+                );
+            }
+        }
+        // 对称性：2 档进 + 2 档退 → 回原档无漂移（来回各步锚点页内位置守恒）。
+        let scroll_0 = tops_old[1] + display_height(dims[1], old_w) * 0.5;
+        let (tops1, _) = compute_layout(&dims, old_w * 1.12);
+        let y1 = zoom_rescroll_anchor(&dims, &tops_old, &tops1, old_w, 1.12, scroll_0);
+        let (tops0b, _) = compute_layout(&dims, old_w);
+        let y_back = zoom_rescroll_anchor(&dims, &tops1, &tops0b, old_w * 1.12, 1.0 / 1.12, y1);
+        assert!(
+            (y_back - scroll_0).abs() < 0.5,
+            "缩放回原档应无漂移：{scroll_0} →退→ {y_back}"
+        );
+    }
+
+    /// #1 往返（Z1.1 扩展）：**3 档进 + 3 档退**（各档用精确逆比 1.12 / 1/1.12、深页 K=4）
+    /// → 同字符 window-y 与初始差 <0.5px（纯公式层：布局/放置/栅格尺寸对同一 page_width
+    /// 两次取一致——`page_bitmap_size`/`bitmap_display_scales`/`snap_to_device` 均幂等）。
+    #[test]
+    fn zoom_three_notch_roundtrip_within_half_px() {
+        let dims: Vec<(f32, f32)> = vec![a4(); 8]; // 深页 K=4（常量区累计最大）
+        let w0 = 1460.0f32; // 实测初始 fit 宽
+        let (tops0, _) = compute_layout(&dims, w0);
+        // 同一 page_width 两次取栅格尺寸/放置一致（幂等）。
+        let r0 = render_scale(w0, 2.0, a4().0);
+        let b0a = page_bitmap_size(a4(), r0);
+        let b0b = page_bitmap_size(a4(), render_scale(w0, 2.0, a4().0));
+        assert_eq!(b0a, b0b, "同一 page_width 两次取栅格尺寸应一致（幂等）");
+        assert_eq!(
+            bitmap_display_scales(b0a, w0, display_height(a4(), w0)),
+            bitmap_display_scales(b0b, w0, display_height(a4(), w0)),
+            "同一 page_width 两次放置缩放应一致"
+        );
+        // 3 档进 + 3 档退（精确逆比）→ 同字符 window-y 与初始差 <0.5px。
+        let k = 4usize;
+        let scroll0 = tops0[k] + display_height(dims[k], w0) * 0.35;
+        let mut w = w0;
+        let mut tops = tops0;
+        let mut y = scroll0;
+        for _ in 0..3 {
+            let w1 = w * 1.12;
+            let (tops1, _) = compute_layout(&dims, w1);
+            y = zoom_rescroll_anchor(&dims, &tops, &tops1, w, 1.12, y);
+            w = w1;
+            tops = tops1;
+        }
+        for _ in 0..3 {
+            let ratio = 1.0 / 1.12;
+            let w1 = w * ratio;
+            let (tops1, _) = compute_layout(&dims, w1);
+            y = zoom_rescroll_anchor(&dims, &tops, &tops1, w, ratio, y);
+            w = w1;
+            tops = tops1;
+        }
+        assert!(
+            (y - scroll0).abs() < 0.5,
+            "3 进 3 退（精确逆比）同字符 window-y 差应 <0.5px：scroll0={scroll0} 回={y} Δ={:.3}",
+            y - scroll0
+        );
+    }
+
+    #[test]
     fn plan_renders_only_unrendered_visible_pages() {
         // 10 页，第 0 页已渲染且代次一致；视口 [0,2] → 只应渲染 1、2
         let rendered = [true, false, false, false, false, false, false, false, false, false];
@@ -1028,6 +1179,124 @@ mod tests {
         assert!(s2 <= MAX_BITMAP_SCALE, "不得突破绝对硬顶: {s2}");
         let s3 = render_scale(840.0, 4.0, 100.0);
         assert!(s3 <= MAX_BITMAP_SCALE, "不得突破绝对硬顶: {s3}");
+    }
+
+    /// #1 页卡设备像素网格对齐：`snap_to_device` 的结果必落在设备像素网格上（幂等、往返闭合），
+    /// 取整方向用 round（沪深各半设备 px），sf=1 时退化为整数取整。
+    #[test]
+    fn snap_to_device_snaps_to_device_grid() {
+        for &sf in &[1.0f32, 1.25, 1.5, 2.0, 3.0] {
+            for &v in &[0.0f32, 13.7, 516.31, 840.0, 0.5, 123.499, 123.501] {
+                let s = snap_to_device(v, sf);
+                // 结果 ×sf 为整数（设备像素网格）……
+                assert!(
+                    (s * sf - (s * sf).round()).abs() < 1e-3,
+                    "snap({v}, sf={sf}) = {s} 应落在设备网格（s×sf 整数）"
+                );
+                // ……且与输入差 ≤ 0.5 设备 px（round 语义）……
+                assert!(
+                    (s - v).abs() * sf <= 0.5 + 1e-3,
+                    "snap({v}, sf={sf}) = {s} 与输入差应 ≤0.5 设备 px"
+                );
+                // ……幂等：同输入两次取同一结果（确定性放置网格）。
+                assert_eq!(s, snap_to_device(s, sf), "snap 应幂等：{s} @sf={sf}");
+            }
+        }
+        // 往返闭合：snap 后再 snap（不同 sf 无意义，同 sf 恒等）。
+        assert_eq!(snap_to_device(snap_to_device(123.456, 2.0), 2.0), snap_to_device(123.456, 2.0));
+        // 极端 sf 含 0 不 panic（内部夹到最小 0.01）。
+        assert!(snap_to_device(1.5, 0.0).is_finite());
+    }
+
+    /// 缩放发糊根治不变式：`page_width()` 经 `snap_to_device` 量化后，任意缩放档下
+    /// `page_width·sf` 恒为整数 → 位图宽 `ceil(page_width·sf)` 与显示矩形（GPUI 绘制时
+    /// `snap_bounds` 对设备像素取整）逐纹素 1:1，绘制 scale≈1（无双线性重采样）。
+    /// 覆盖 fit 宽 × zoom 档 × 多 DPI；仅取 `render_scale` 未被封顶（`MAX_RENDER_SCALE`/
+    /// `MAX_BITMAP_SCALE`，那是独立的「超大位图护栏」）的区间——封顶路径本就确认位图
+    /// 按上限采样、非 1:1 属设计语义。
+    #[test]
+    fn quantized_page_width_is_device_pixel_1_to_1() {
+        let dim = (595.0f32, 842.0f32); // A4
+        let base_ws = [PAGE_WIDTH, 1012.5f32, 1460.0f32];
+        // 缩放档：1.0(适配宽) + 1.12^k 档位链条（含中间分数值，如 985.6/1103.87）+ 缩档 0.75
+        let zooms = [
+            0.5f32, 0.75, 1.0, 1.12, 1.2544, 1.404928, 1.57351936, 2.0,
+        ];
+        let sfs = [1.0f32, 1.25, 1.5, 2.0, 2.5];
+        for &bw in &base_ws {
+            for &z in &zooms {
+                for &sf in &sfs {
+                    let raw = bw * z;
+                    let pw = snap_to_device(raw, sf); // 与 page_width() 同款量化
+                    let dev = pw * sf;
+                    assert!(
+                        (dev - dev.round()).abs() < 1e-3,
+                        "量化后 page_width·sf 应为设备整数：raw={raw} pw={pw} sf={sf} dev={dev}"
+                    );
+                    // 封顶护栏判定：scale 被 cap 夹住（位图按上限采样）→ 跳过 1:1 断言。
+                    let scale = render_scale(pw, sf, dim.0);
+                    let zoom_ratio = (pw / PAGE_WIDTH).max(1.0);
+                    let cap =
+                        (MAX_RENDER_SCALE * zoom_ratio * sf.max(1.0)).min(MAX_BITMAP_SCALE);
+                    let clamped = scale >= cap - 1e-4;
+                    if clamped {
+                        continue;
+                    }
+                    let bmp = page_bitmap_size(dim, scale);
+                    assert_eq!(
+                        bmp.0 as f32,
+                        dev.round(),
+                        "未封顶下位图宽应等于显示设备宽（1:1）：raw={raw} pw={pw} sf={sf} dev={dev}"
+                    );
+                    assert!(
+                        (bmp.0 as f32 / dev - 1.0).abs() < 1e-3,
+                        "绘制 scale≈1（≤1e-3）：raw={raw} dev={dev} bmp_w={}",
+                        bmp.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// #4 cap 刀刃稳健化：`cover_serves_scale` 在 `scale ∈ [cap, COVER_DENSITY_EPS_ZOOM]`
+    /// 恒判 cover-served（跨 cap 的 LOD 决策无 run-to-run 翻转），区间外仍精确判定。
+    #[test]
+    fn cover_serves_scale_covers_cap_blade() {
+        let cap = config::pdf::COVER_SCALE_CAP; // 4.0
+        // ① 未截断区间：cover_scale == render_scale（精确同密度）→ cover-served。
+        assert!(cover_serves_scale(3.99, 3.99), "未截断 3.99 同密度应 cover-served");
+        assert!(cover_serves_scale(cap, cap), "恰 cap 应 cover-served（同密度）");
+        // ② 截断但贴近 cap：coverscale=cap（4.0）、scale ∈ (cap, 4.06] → cover-served。
+        //    4.0→4.02 跨 cap 的 LOD 决策两侧均为 cover-served（无「一个 cover(锐)/一个瓦片(糊)」翻转）。
+        assert!(cover_serves_scale(cap, 4.02), "4.0->4.02 跨 cap 应保持 cover-served（无翻转）");
+        assert!(cover_serves_scale(cap, config::pdf::COVER_DENSITY_EPS_ZOOM), "上界 4.06 应 cover-served");
+        // ③ 区间外（>4.06）或非 cap 截断 → 精确判定（4.1+ 必须回 1:1 瓦片，清晰度优先）。
+        assert!(cover_serves_scale(1.4, 1.4), "精确同密度应 cover-served");
+        assert!(!cover_serves_scale(1.4, 1.5), "非 cap 截断且不等密 → 不 serve");
+        assert!(!cover_serves_scale(cap, 4.2), "超出等效上界（4.2>4.06）→ 回 1:1 瓦片");
+        // 亚 cap 截断值（<cap 的 cover，如 3.9）不得因 scale 靠近 cap 而误判 serve。
+        assert!(!cover_serves_scale(3.9, 3.99), "cover 未到 cap 截断 → 按精确密度判定");
+    }
+
+    /// #4 端到端（纯函数层）：A4 整页在 3.99 / 4.02 跨 cap 两档的「封面是否供给瓦片」决策
+    /// 逐档一致（cover-served），4.06 上界内仍为 cover-served、4.2 必须 1:1 瓦片——与
+    /// `plan_tiles_in_window` 的 `cover_affordable && cover_serves_scale` 判定同构。
+    #[test]
+    fn cap_blade_lod_decision_invariant_across_flip() {
+        let a4 = (595.0f32, 842.0f32);
+        // 判定 = `plan_tiles_in_window` 的 cover_serves_tile_density（去掉黑名单等状态）。
+        let serves = |s: f32| {
+            let c = s.min(config::pdf::COVER_SCALE_CAP);
+            cover_affordable(a4, c) && cover_serves_scale(c, s)
+        };
+        // 3.99 与 4.02 跨 cap 两翼：决策同为 cover-served（无 run-to-run 翻转）。
+        let s399 = serves(3.99);
+        let s402 = serves(4.02);
+        assert!(s399, "3.99（cap 下邻域）应 cover-served");
+        assert!(s402, "4.02（cap 上邻域）应 cover-served");
+        assert_eq!(s399, s402, "跨 cap 的 LOD 决策必须一致（时锐时糊根治）");
+        assert!(serves(config::pdf::COVER_DENSITY_EPS_ZOOM), "4.06 上界内 cover-served");
+        assert!(!serves(4.2), "4.2 超等效上界 → 1:1 瓦片");
     }
 
     /// 页内 pt → 卡片局部 px：Y 翻转、边界与单调性（纯函数，不触 pdfium）。

@@ -15,11 +15,21 @@ use super::*;
 
 /// Windows 实时硬件态 Ctrl 探测：gpui 事件/window 修饰键在真机恒 false（GetKeyState
 /// 线程消息队列态带不出），以 `GetAsyncKeyState(VK_CONTROL)` 读实时硬件态兜底——
-/// 高位置位（bit 15 = 0x8000）即按下。非 Windows 平台恒为 false（无生效路径）。
-#[cfg(target_os = "windows")]
+/// 高位置位（bit 15 = 0x8000）即按下。非 Windows / **测试构建** 恒为 false。
+///
+/// 测试解耦：`GetAsyncKeyState` 读的是**整机实时键态**，测试进程无法空置它——
+/// 若用户当下正按住 Ctrl（如刚在真机测完缩放），pdf_ctrl 类用例会把「普通滚轮」
+/// 误判为 Ctrl+缩放而失败，并毒化全局 pdfium 锁引发整批级联失败。故 test 构建
+/// 强制 false（纯逻辑断言不受真实键盘影响）；生产 exe 仍读真实硬件键。
+#[cfg(all(target_os = "windows", not(test)))]
 fn os_ctrl_down() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
     unsafe { GetAsyncKeyState(VK_CONTROL as i32) as i32 & 0x8000 != 0 }
+}
+
+#[cfg(all(target_os = "windows", test))]
+fn os_ctrl_down() -> bool {
+    false
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -106,16 +116,54 @@ impl PdfViewer {
             return;
         }
         let new_w = self.page_width();
-        // 锚定视口：页列布局随 page_width 线性缩放 → 同一文档点的滚动偏移同比缩放。
         let ratio = new_w / old_w;
+        // Z2 缩放世代步进（view 唯一真源）→ 推送 worker 采纳镜像。渲染请求随后 stamp 新世代；
+        // 停在 worker 队列的缩放**中间档** cover/瓦片/preview 出队时 `stamp < mirror` → 直接
+        // drop 不渲（旧档不再排队空耗 pdfium 时隙；最终档必达、无中间档堆叠）。
+        self.zoom_epoch += 1;
+        if let Some(w) = self.worker.clone() {
+            w.set_zoom_epoch(self.doc_id, self.zoom_epoch);
+        }
+        // Z1 锚点重锚：页列布局随 page_width 线性缩放但 `PAGE_PAD_Y`/`PAGE_GAP` 常量不缩放
+        // → 旧实现「整个 offset × ratio」把常量区也当线性量乘，每档漂移
+        // `-(ratio-1)×(PAD+K×GAP)`（K=锚点页号，深页可跳 2-3 行高，放大上跳/缩小下跳离散跳）。
+        // 改为「锚定 scroll 落在的页 K：页顶线性缩放 + 页内相对偏移同比缩放」（纯函数
+        // [`layout::zoom_rescroll_anchor`] 锁死公式）。横向量列居中同款同比缩放。
         let sx = f32::from(-self.scroll.offset().x);
         let sy = f32::from(-self.scroll.offset().y);
-        self.scroll
-            .set_offset(gpui::point(px(-sx * ratio), px(-sy * ratio)));
-        // 重算布局：瓦片按新密度惰性重渲（见 `schedule_tiles` 的 tile_scale 比对）。
-        let (tops, total) = compute_layout(&self.dims, new_w);
-        self.page_tops = tops;
+        let old_tops = std::mem::take(&mut self.page_tops);
+        let (new_tops, total) = compute_layout(&self.dims, new_w);
+        self.page_tops = new_tops;
         self.total_height = total;
+        let new_y = zoom_rescroll_anchor(&self.dims, &old_tops, &self.page_tops, old_w, ratio, sy);
+        // #2 停底锚点回拉修正：Z1 公式对页尾/文档底附近给出的 `new_y` 可能超出新布局的
+        // `[0, max_offset]` ——gpui 只在**布局**时才 clamp（div.rs `clamp_scroll_position`），
+        // 本帧读到的是未夹值：视觉已停底、`last_scroll_y` 却记了越界假值 → 下一帧
+        // `ensure_window` 算 jump≈「max−越界」假速度（S1 复核期失真）+ 再放大反向补一跳。
+        // 这里按新布局量程先 clamp，并把 `last_scroll_y` 回写为 clamp 后值（防 S1 假速度），
+        // 横向量程同款（内容宽 = 可视宽与页宽+边距的较大者，`zoom==1` 适配宽时恒 0）。
+        let viewport_h = f32::from(self.scroll.bounds().size.height);
+        let max_sy = (self.total_height - viewport_h).max(0.0);
+        let new_y = new_y.clamp(0.0, max_sy);
+        let viewport_w = f32::from(self.scroll.bounds().size.width);
+        let content_w = viewport_w.max(new_w + 2.0 * PAGE_PAD_X);
+        let max_sx = (content_w - viewport_w).max(0.0);
+        let new_x = (sx * ratio).clamp(0.0, max_sx);
+        self.scroll
+            .set_offset(gpui::point(px(-new_x), px(-new_y)));
+        // S1 缩放源头治理：重锚把 scroll offset 同比缩放后，滚动速度「账面」与滚动锚点立即
+        // 同步——下一帧 `ensure_window` 的 `jump = scroll_y - last_scroll_y ≈ 0`，不再把缩放
+        // 重锚误判为滚动（旧实现：同帧 offset 突变 → velocity 飙 → VeryFast → 手势期零派发
+        // + 2-4 帧「加载中」空白 + 屏显恒为手势前旧封面 1.12^k 复利拉伸）。
+        // 强制 Slow 保证该缩放事件帧不被高速带缠住；`zoom_armed` 置位令缩放防抖窗内调度
+        // 只派当前档 preview（绝不满密 cover/tile 逐档抢渲被弃空转），防抖到期才满密收口。
+        // `last_scroll_y` = clamp 后的 `new_y`（#2：与写入 scroll 的 offset 一致，防 S1 假速度）。
+        self.last_scroll_y = new_y;
+        self.scroll_velocity = 0.0;
+        self.speed_state = SpeedState::Slow;
+        self.prev_fast = false;
+        self.zoom_armed = true;
+        self.zoom_idle_frames = 0;
         cx.notify();
     }
 

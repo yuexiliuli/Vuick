@@ -49,6 +49,11 @@ impl PdfViewer {
             jump_target: None,
             last_center_page: None,
             stop_small_frames: 0,
+            zoom_armed: false,
+            settle_tile_burst: false,
+            settle_tile_burst_dispatch: 0,
+            zoom_idle_frames: 0,
+            zoom_epoch: 0,
             scroll: ScrollHandle::new(),
             loading: true,
             load_error: None,
@@ -81,6 +86,7 @@ impl PdfViewer {
             search_seq: 0,
             zoom: 1.0,
             base_w: PAGE_WIDTH,
+            scale_factor: 1.0,
             window_sig: None,
             window_settled: false,
             idle_gate_skips: 0,
@@ -422,6 +428,11 @@ impl PdfViewer {
         self.jump_target = None;
         self.last_center_page = None;
         self.stop_small_frames = 0;
+        // S1/S3：缩放手势状态随文档释放复位（`adjust_zoom` 置位、防抖到期清零）。
+        self.zoom_armed = false;
+        self.zoom_idle_frames = 0;
+        // Z2：缩放世代随文档释放复位（worker 镜像侧重置到 0，新档从 0 起）。
+        self.zoom_epoch = 0;
         self.prefetch_reqs = 0;
         self.loading_placeholder_hits.set(0);
         self.pending_recolor = None;
@@ -447,8 +458,22 @@ impl PdfViewer {
 
     /// 当前页列显示宽度 = 自适应容器宽的基线 `base_w` × 缩放 `zoom`。
     /// 打开即「适应窗口宽」（见 [`Self::base_w`]），Ctrl+滚轮在其上缩放。
+    ///
+    /// **设备像素网格量化**（缩放发糊根治的最小点）：显示矩形在 GPUI 绘制时被
+    /// [`layout::snap_to_device`] 同款/`snap_bounds` 取整到设备像素网格，而 worker 位图宽
+    /// = `ceil(page_width·sf)`（固定取整）→ 当 `page_width·sf` 非整数时，`round(X)/ceil(X)≠1`
+    /// → GPU 双线性重采样，随缩放相位交替糊/清晰。这里把页宽按当前 DPI 量化
+    /// （`round(page_width·sf)/sf`），`page_width·sf` 恒为整数 → 位图与显示矩形逐纹素 1:1。
+    /// 全部消费方（布局/tile 规划/封面/worker 栅格/overlay）都经本 getter → 自动自洽，
+    /// 页宽仅偏移 ≤0.5 设备 px，对 fit-width / Z1 锚定 / scroll 范围无感知影响。
     pub(crate) fn page_width(&self) -> f32 {
-        self.base_w * self.zoom
+        crate::pdf::layout::snap_to_device(self.base_w * self.zoom, self.scale_factor)
+    }
+
+    /// 当前缩放倍数（Ctrl+滚轮在 `base_w` 基线上的倍率；1.0 = 适应窗口宽的 100%）。
+    /// 外壳状态栏缩放百分比显示用：`zoom_factor() * 100` 即 zoom%。
+    pub fn zoom_factor(&self) -> f32 {
+        self.zoom
     }
 
     /// 书签目录访问器（侧边栏目录使用）。
@@ -461,6 +486,9 @@ impl PdfViewer {
     /// 每帧：回收在途结果、估速、刷盘、按视口调度瓦片（常态）/占位（快速拖动）、
     /// 淘汰超预算瓦片。
     pub(super) fn ensure_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 每帧刷新窗口缩放密度：`page_width()` 的 1:1 量化用它（必须在下方 refit/调度
+        // 消费 page_width 之前写入，保证本帧布局/位图/显示全用同一 sf）。
+        self.scale_factor = window.scale_factor();
         if timing_view() {
             eprintln!(
                 "[{:.1}ms] [VIEW-TICK] loading={} dims={} pending_t={} pending_c={} fast={} bounds_h={:.0} off_y={:.0}",
@@ -548,7 +576,7 @@ impl PdfViewer {
             cx.notify();
         }
         // F4 空闲预取走廊结果收集（0.5 密度整页底图，独立于封面/瓦片密度守卫）。
-        if self.collect_prefetch_cover_results() {
+        if self.collect_prefetch_cover_results(scale_factor) {
             cx.notify();
         }
         if self.collect_tile_results(scale_factor) {
@@ -587,9 +615,12 @@ impl PdfViewer {
         //      + 非快速 → `pump_still_needed` 本就为 false，早退不改变任何泵语义）。
         let sig = WindowSig::of(self, scroll_y, page_width, scale_factor, viewport_h);
         let idle_sig = self.window_sig.is_some_and(|s| s == sig);
+        // S3：缩放防抖（zoom_armed）期**必不门**——静态帧早退会跳过 S3 的 idle 计数，
+        // 缩放事件后只剩一帧渲染，`zoom_idle_frames` 到不了 3 帧、防抖永不收口。
         if idle_sig
             && self.window_settled
             && !self.prev_fast
+            && !self.zoom_armed
             && viewport_h > 0.0
             && self.pending_tiles.is_empty()
             && self.pending_cover.is_empty()
@@ -611,6 +642,47 @@ impl PdfViewer {
             self.maybe_prefetch_corridor(vis_first, page_width, scale_factor);
             self.ensure_tile_pump(cx);
             // 不更新 `window_sig`/`window_settled`：保持同一静置签名与确认状态。
+            // --- 真机取证探针（纯只读，不改调度语义，见 view.rs `diag_enabled`）---
+            // 用户真机症状：缩放后在固定比例有时整页雾糊（低密度底图在服务），静止不
+            // 清晰、只能靠再次缩放恢复；headless 单 worker 时序与真机有别无法复现。
+            // 本探针在「糊住不动」的静态帧门控早退前（keep_window 可见窗，含 MARGIN
+            // 缓冲）逐可见页打印 LOD 账：各档底图（cover/prev/pref/mid/thumb/tiles）
+            // 在位情况 + 是否有当前档 cover 在途 + 期望 cover 档，供锁定是哪一档低密
+            // 底图在服务、为何无当前档 cover 补渲。GPUI_EDITOR_DIAG 未设时零开销。
+            if diag_enabled() {
+                let (dstart, dend) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
+                if !self.dims.is_empty() && dstart <= dend {
+                    for p in dstart..=dend {
+                        if let Some(slot) = self.slots.get(p) {
+                            let cover = slot
+                                .cover
+                                .as_ref()
+                                .map(|_| format!("{:.2}", slot.cover_scale))
+                                .unwrap_or_else(|| "none".to_owned());
+                            let prev = if slot.prev_cover.is_some() { "some" } else { "none" };
+                            let pref = slot
+                                .prefetch_cover
+                                .as_ref()
+                                .map(|_| format!("{:.2}", slot.prefetch_cover_scale))
+                                .unwrap_or_else(|| "none".to_owned());
+                            let tiles = if slot.tiles.is_empty() {
+                                "0".to_owned()
+                            } else {
+                                format!("{}@{}", slot.tiles.len(), slot.tile_scale)
+                            };
+                            let cpend = self.pending_cover.contains_key(&p) as u8;
+                            let tpend = self.pending_tiles.keys().any(|(pg, _, _)| *pg == p) as u8;
+                            let want = cover_scale(self.dims[p], page_width, scale_factor);
+                            let line = format!(
+                                "[DIAG-IDLE] p{p} cover={cover} prev={prev} pref={pref} mid={} thumb={} tiles={tiles} cpend={cpend} tpend={tpend} want={want:.2}",
+                                slot.mid.is_some() as u8,
+                                slot.thumb.is_some() as u8,
+                            );
+                            eprintln!("{line}");
+                        }
+                    }
+                }
+            }
             return;
         }
 
@@ -694,20 +766,67 @@ impl PdfViewer {
             self.jump_armed = false;
             self.jump_target = None;
         }
+        // S3 缩放防抖收口：`zoom_armed` 期间每帧自增 idle 计数；连续
+        // [`config::pdf::ZOOM_DEBOUNCE_FRAMES`] 帧无新缩放事件 → 清 `zoom_armed` 并强制
+        // Slow（绕过 EMA 衰减），让下方 Idle/Slow 分支的常态调度 `schedule_tiles` 按
+        // **最终 cscale** 一次性满密 cover+tile 收口（在途旧档由既有 scale 守卫自动弃，
+        // 无需 cancelRendering）。`adjust_zoom` 每档都重置 `zoom_idle_frames=0`，缩放中
+        // 档间间隙不误收口。
+        if self.zoom_armed {
+            // S2/S4 前置（评审 BLOCK②）：armed 推进首帧把可见窗内 stale cover 迁入
+            // prev_cover（cover=None）——手势前那张高密位图转存为唯一平滑底图基（GPU 拉伸），
+            // 手势期**不再置换**（下方 collect 框架 + preview 不换底共同守住；撤 #3）。
+            let reloc = self.relocate_stale_zoomed_covers(start, end, page_width, scale_factor);
+            self.pending_drops.extend(reloc);
+            // Z2 收口前置：释放缩放中间档的在途预算（cover/tile/preview 旧档条目直接移除，
+            // 且 `collect_cover_results` 的 armed 守卫会在已渲染到达层丢弃中间档封面）。
+            self.drop_stale_scale_pending(page_width, scale_factor);
+            // ⚠️ 第 4 轮真机实证：armed 期**不派任何满密 cover**（撤 #3 中心满密 cover 派发）
+            // ——否则每档中间档满密封面经 collect 写入 prev_cover 桥 → 屏显底图每档换密度 →
+            // 每档一次整页栅格重排（「松手瞬间跳一下、整页一起动」）。手势期零满密换底：
+            // 屏显维持手势前那张高密位图（prev_cover 拉伸），settle 一次性按最终档收口。
+            self.zoom_idle_frames += 1;
+            if self.zoom_idle_frames >= config::pdf::ZOOM_DEBOUNCE_FRAMES {
+                self.zoom_armed = false;
+                self.speed_state = SpeedState::Slow;
+                self.prev_fast = false;
+                // #5 去 E（高倍收口雾窗）：收口当帧对 cur>4 纯瓦片页把 TILE_INFLIGHT 临时
+                // 抬到 SETTLE_TILE_BURST_MAX 一次性出清可见瓦片（schedule_tiles 消费后自清）。
+                self.settle_tile_burst = true;
+            }
+        }
         match self.speed_state {
             SpeedState::Idle | SpeedState::Slow => {
-                self.schedule_tiles(window, start, end, page_width, scale_factor, scroll_y);
+                if self.zoom_armed {
+                    // S2 缩放手势防抖窗内（本应落常态调度的 Idle/Slow 帧）：不派满密
+                    // cover/tile——每档 cscale 都在变，满密渲染 ~30ms 大概率被下一档弃掉
+                    // = 逐档抢渲空转；只按当前 cscale 派 ≤PRE_FETCH_COVER_INFLIGHT 枚
+                    // 0.5 密度 preview 顶显示。防抖到期由上方清 `zoom_armed` → 下一帧
+                    // 落回本分支的 `schedule_tiles` 满密收口。
+                    self.maybe_dispatch_zoom_preview(
+                        start, end, scroll_y, viewport_h, page_width, scale_factor, window,
+                    );
+                } else {
+                    self.schedule_tiles(window, start, end, page_width, scale_factor, scroll_y);
+                }
             }
             SpeedState::Fast => {
-                self.schedule_fast_covers(
-                    window,
-                    start,
-                    end,
-                    scroll_y,
-                    viewport_h,
-                    page_width,
-                    scale_factor,
-                );
+                if self.zoom_armed {
+                    // 缩放 + 中速拖拽复合：满密封面同样逐档抢派 → preview 顶住。
+                    self.maybe_dispatch_zoom_preview(
+                        start, end, scroll_y, viewport_h, page_width, scale_factor, window,
+                    );
+                } else {
+                    self.schedule_fast_covers(
+                        window,
+                        start,
+                        end,
+                        scroll_y,
+                        viewport_h,
+                        page_width,
+                        scale_factor,
+                    );
+                }
             }
             SpeedState::VeryFast => {
                 // 极快平移主路径：不派可见页新栅格（封面/瓦片/占位一律不加活）——已缓存
@@ -719,7 +838,16 @@ impl PdfViewer {
                 // 复用既有预算；nav_gen 世代保证快速连续跳只渲染最新落点，旧请求出队即被
                 // worker drop、在途旧结果被 view 清 pending 丢弃）。落点窗全部在槽/在途后
                 // `maybe_dispatch_jump_covers` 自行清零；停稳后由 L1.3 直落 Slow 常态接管。
-                self.maybe_dispatch_jump_covers(page_width, scale_factor);
+                // **S2 缩放 + 高速拖拽复合**：`zoom_armed` 为真（且非大跳）时，VeryFast 纯
+                // 平移原本零派发——缩放期 visible 窗仍按当前 cscale 派 preview 顶住，防抖
+                // 到期收口由常态调度接管；滚动大跳仍走 `jump_armed` 优先。
+                if self.jump_armed {
+                    self.maybe_dispatch_jump_covers(page_width, scale_factor);
+                } else if self.zoom_armed {
+                    self.maybe_dispatch_zoom_preview(
+                        start, end, scroll_y, viewport_h, page_width, scale_factor, window,
+                    );
+                }
             }
         }
         // F4/B：非 idle 帧（窗口有移动/调度运行）按当前可见中心收回走廊窗外的旧廊封面
@@ -727,6 +855,12 @@ impl PdfViewer {
         let vis_first = first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y);
         self.evict_prefetch_covers(vis_first);
         self.evict_tiles(start, end, scale_factor);
+        // S5 高倍 cover 回收（高倍稳态 1:1 瓦片接管后，cap 截断的 4.0 密度 cover 只是
+        // 32MB/页 双驻留 + 边隙透雾的旧密度整页图 → 回收；评审 BLOCK③ 后按可见矩形对账，
+        // 未铺满可见区不回收）。
+        self.retire_high_scale_covers(
+            start, end, scroll_y, viewport_h, page_width, scale_factor, window,
+        );
         // F4/B：清尾帧（非快速 + 四主队列全空）也尝试派发走廊——「最后一帧工作清空后泵
         // 须续出几帧把走廊填掉」，否则没有任何 idle 帧会到来（泵在清尾帧即停）。
         self.maybe_prefetch_corridor(vis_first, page_width, scale_factor);

@@ -65,6 +65,12 @@ impl PdfViewer {
     /// 直到用户下一次输入才换挡补瓦片（实测日志：1.7 秒无 `[VIEW-TICK]`，正是“随机页先
     /// 模糊、数秒后清晰”的根因）。本分支让泵一直驱动到退出快速态并完成清尾，无需输入。
     pub(super) fn pump_still_needed(&self) -> bool {
+        // S3 缩放防抖：`zoom_armed` 期间持续出帧——否则缩放事件后的渲染帧只有一次
+        // （preview 收完泵就停、无输入就无新帧），`zoom_idle_frames` 永远到不了
+        // [`config::pdf::ZOOM_DEBOUNCE_FRAMES`]，防抖永不收敛收口（雾感/空白无从消灭）。
+        if self.zoom_armed {
+            return true;
+        }
         if self.prev_fast {
             return true;
         }
@@ -219,11 +225,29 @@ impl PdfViewer {
             if timing_view() {
                 eprintln!("[{:.1}ms] [VIEW-SCHED] need empty pending_t={}", crate::pdf::timing_ms(), self.pending_tiles.len());
             }
+            self.settle_tile_burst = false;
         } else {
             // 靠近视口的瓦片先渲染（正在看的那片先填）
             need.sort_by_key(|&(_, _, _, d)| d);
             let worker = self.worker.clone().unwrap();
-            let budget = TILE_INFLIGHT.saturating_sub(self.pending_tiles.len());
+            // #5 收口一次性出清：防抖到期收口帧（cur>4 cap 截断、纯瓦片供给页）把单一
+            // [`TILE_INFLIGHT`]=6 临时抬到 [`config::pdf::SETTLE_TILE_BURST_MAX`]，可见瓦片
+            // 一次入队 → 高倍收口不再 3-6 帧逐片雾窗。只抬**在途**不增驻留（TILE_CACHE_BYTES
+            // 不变）；普通滚动恒 false（语义不变）。`settle_burst` 每帧即清：只在收口当帧突发，
+            // 尾片回落常态节流。`settle_tile_burst_dispatch` 取**最近一次突发帧**的净超量
+            // （每突发帧前置零再累加；headless 断言「出清预算到位」的确定性证据，不依赖 worker）。
+            let (budget, burst) = if self.settle_tile_burst {
+                let b = config::pdf::SETTLE_TILE_BURST_MAX
+                    .saturating_sub(self.pending_tiles.len());
+                self.settle_tile_burst_dispatch = 0;
+                (b, b.saturating_sub(TILE_INFLIGHT))
+            } else {
+                (TILE_INFLIGHT.saturating_sub(self.pending_tiles.len()), 0)
+            };
+            self.settle_tile_burst = false;
+            if burst > 0 {
+                self.settle_tile_burst_dispatch += burst as u64;
+            }
             for (page, row, col, _) in need.into_iter().take(budget) {
                 let scale = render_scale(page_width, scale_factor, self.dims[page].0);
                 let rx = worker.request_tile(
@@ -236,6 +260,7 @@ impl PdfViewer {
                         col,
                     },
                     self.nav_gen, // L2.2：发送时打戳当前导航世代
+                    self.zoom_epoch, // Z2：发送时打戳当前缩放世代
                 );
                 self.raster_reqs += 1; // 切档不重栅回归计数
                 self.tile_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
@@ -310,7 +335,7 @@ impl PdfViewer {
                 continue;
             }
             self.slots[page].thumb_loading = true;
-            let rx = worker.request_thumb(self.doc_id, page, self.nav_gen); // L2.2 enqueue-n_gen
+            let rx = worker.request_thumb(self.doc_id, page, self.nav_gen, self.zoom_epoch); // L2.2 enqueue-n_gen
             self.raster_reqs += 1; // 切档不重栅回归计数
             self.pending_thumb.insert(page, (self.nav_gen, rx));
             budget -= 1;
@@ -430,6 +455,7 @@ impl PdfViewer {
                 self.doc_id,
                 RenderRequest { page, scale: pscale },
                 self.nav_gen, // L2.2 enqueue-n_gen
+                self.zoom_epoch, // Z2：发送时打戳当前缩放世代
             );
             self.raster_reqs += 1; // 切档不重栅回归计数
             self.prefetch_reqs += 1; // F4 观测计数（断言 idle 预取确实发生）
@@ -522,7 +548,7 @@ impl PdfViewer {
     ///
     /// WARN-2（评审接受项）：本类瞬态占位无 recolor 世代守卫——切档前入队的旧色廊封面
     /// 可能短暂落槽闪旧色；瞬态、随后被下一世代满封面/瓦片接管，可接受（不留脏槽）。
-    pub(super) fn collect_prefetch_cover_results(&mut self) -> bool {
+    pub(super) fn collect_prefetch_cover_results(&mut self, scale_factor: f32) -> bool {
         let finished = collect_finished(&mut self.pending_prefetch_cover, |(_, _, rx)| rx.try_recv());
         let mut any = false;
         for (page, res) in finished {
@@ -537,12 +563,29 @@ impl PdfViewer {
             if page >= self.dims.len() {
                 continue;
             }
-            // 满密度封面**已入槽** → 走廊结果作废（不与其竞争显示、不留冗余双底图）。
+            // 满密度封面**已按当前 cscale 密度入槽** → 走廊结果作废（已锐利，低密 preview
+            // 不再需要）。
             // ⚠️ **不再因「封面在途」作废**（A 两段式底图前提）：跳变/常态滚动时满密 cover
             // 渲染 ~30ms（串行），在途期间让 0.5 密度 preview 先入槽作过渡底图（替换「加载中」），
             // cover 到位后 `page_base_image` 自然以 cover 优先、preview 仍留 slot（受 40MB 预算
             // 逐出）——只省下「到达的廉价渲染被白弃」的浪费，不改变任何预算/驻留上限。
-            if self.slots[page].cover.is_some() {
+            // **S2 修正（评审 BLOCK①）**：仅当「当前 cscale 密度 cover」在位才弃——缩放中途
+            // stale cover（`cover_scale ≠ 当前 cscale`，正持旧档的可见页原地连续缩放）在位时
+            // preview 应保留入槽，屏显底图从「旧封面 1.12^k 复利拉伸」降为「当前档 0.5 密度」
+            // （与 S4 最新档桥同一目标；配合 armed 首帧的 stale cover 迁移 ② 后该场景激活）。
+            let cscale = cover_scale(self.dims[page], self.page_width(), scale_factor);
+            let s = &self.slots[page];
+            // **手势期 preview 不换底（第 4 轮同根因的 low-dens 侧）**：`zoom_armed` 期间
+            // 已有任何底（cover/prev_cover/prefetch_cover）的页**不**用新档 preview 替换——
+            // 屏显底图链 cover→prev_cover 优先，新 preview 到也只会被链挡住/徒增逐档换密
+            // churn；仅「全无底」的空页（真正 placeholder）才由新 preview 填一次（拍板：
+            // 与 dispatch 侧 `maybe_dispatch_zoom_preview` 的 armed「有底不派」守卫对称）。
+            if self.zoom_armed
+                && (s.cover.is_some() || s.prev_cover.is_some() || s.prefetch_cover.is_some())
+            {
+                continue;
+            }
+            if s.cover.is_some() && (s.cover_scale - cscale).abs() <= 1e-4 {
                 continue;
             }
             let Ok(img) = render_image_from_bgra(res.bgra, res.width, res.height) else {
@@ -590,18 +633,23 @@ impl PdfViewer {
                     }
             }
             // 整页不超预算 且 无封面 且 未在途 → 派发（W2：封面已拉黑页跳过——不盲目重试，
-            // 该页由瓦片供给）。
+            // 该页由瓦片供给）。**S5 防环**：仅「S5 刚回收的高倍页」（`cover_scale` 已被
+            // retire 置 0 且瓦片在位）跳过封面重派——否则 S5 回收后下一帧又会重派 cover，
+            // 形成「回收→重派→渲染→再回收」死环；普通「瓦片在位」页照常由封面接管
+            // （`cover_serves_tile_density` 由 plan_tiles_in_window 决定是否 skip 瓦片）。
             if !self.cover_blacklist.contains(&page)
                 && cover_affordable(dim, cscale)
                 && self.slots[page].cover.is_none()
                 && !self.pending_cover.contains_key(&page)
                 && self.pending_cover.len() < COVER_INFLIGHT
+                && !(self.slots[page].cover_scale.abs() <= 1e-4
+                    && !self.slots[page].tiles.is_empty())
             {
                 if timing_view() {
                     eprintln!("[{:.1}ms] [VIEW-COVER-REQ] page={page}", crate::pdf::timing_ms());
                 }
                 let rx =
-                    cover_worker.request_render(self.doc_id, RenderRequest { page, scale: cscale }, self.nav_gen); // L2.2 enqueue-n_gen
+                    cover_worker.request_render(self.doc_id, RenderRequest { page, scale: cscale }, self.nav_gen, self.zoom_epoch); // L2.2+Z2 stamp
                 self.raster_reqs += 1; // 切档不重栅回归计数
                 self.cover_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
                 // 记录**请求时** recolor 世代（NIT：旧世代请求的失败不拉黑，语义纯净）。
@@ -679,7 +727,8 @@ impl PdfViewer {
     /// - 整页封面同密度在位 → 该页瓦片冗余（跳过，省渲染与内存），判据与两侧完全一致。
     /// - 密度失效的清除是**副作用**（改 `slot.tiles` 与槽位账目 `Slot::tile_bytes`），
     ///   由调用方规划前单独做；本函数只读 `slots` / `pending_tiles`。
-    pub(super) fn plan_tiles_in_window(
+    /// - `pub(crate)`：lib.rs 的「静止必收敛」回归复用本函数作唯一几何权威（零重实现）。
+    pub(crate) fn plan_tiles_in_window(
         &self,
         pages: std::ops::RangeInclusive<usize>,
         center: usize,
@@ -703,22 +752,44 @@ impl PdfViewer {
             // 整页封面已在当前密度下覆盖整页 → 该页瓦片全部冗余，**不再派发**（省渲染与
             // 内存：封面即全页锐化底图，瓦片只服务于「无封面/封面被密度上限截断」的页）。
             // **T1：封面 affordable 且与瓦片同密度**（`cover_scale == scale`，封面可整页
-            // 一次到位取代瓦片）的页同样跳过瓦片——这类页由 `schedule_tiles` 的同帧封面
-            // 派发供给（瓦片跳过后封面即该页唯一栅格），首屏/翻页不再出现「瓦片先派 +
-            // 同密度封面后到再作废」的双重栅格。本函数
+            // 一次到位取代瓦片）的页**在封面真的在槽/在途时**同样跳过瓦片——这类页由
+            // `schedule_tiles` 的同帧封面派发供给（瓦片跳过后封面即该页唯一栅格），首屏/
+            // 翻页不再出现「瓦片先派 + 同密度封面后到再作废」的双重栅格。本函数
             // 是 `schedule_tiles` 与快速拖动减速预热 `schedule_placeholders` 的共用几何，
             // 后者因此也不会在停稳前预派这类页的瓦片（避免补封面时双渲）。仅当封面密度被
             // COVER_SCALE_CAP 截断（`cscale < scale`，超高倍率「底图+精修」——瓦片更细）
             // 或页位图超 COVER_SIZE_BUDGET（纯瓦片路径）时，才继续按瓦片派发。
             let cscale = cover_scale(dim, page_width, scale_factor);
+            // **D cap 刀刃稳健化**：密度判定用 `cover_serves_scale`（含 cap 邻域等效区间
+            // `[COVER_SCALE_CAP, COVER_DENSITY_EPS_ZOOM]` 强制 cover-served）——3.99 vs 4.02
+            // 跨 cap 两翼的 LOD 决策不再一个 cover(锐) 一个瓦片(糊) 翻转（见布局层纯函数）。
             let cover_serves_tile_density =
-                cover_affordable(dim, cscale) && (cscale - scale).abs() <= 1e-4;
-            // **W2**：封面持续失败的页（`cover_blacklist`）不再由封面供给——skip_covered
-            // 对它失效，回退瓦片核发（否则封面永不再派而瓦片又永远跳过 → 页面停在占位/模糊）。
+                cover_affordable(dim, cscale) && crate::pdf::layout::cover_serves_scale(cscale, scale);
+            // **伪机制根治**：skip_covered 必须「封面真的在槽/在途」才成立——仅凭
+            // cover_serves_tile_density（hypothetical「封面 affordable && 能等效瓦片密度」）
+            // 就跳瓦片：真机封面渲染被丢/失败/逐出而未到位（headless 单 worker 封面瞬达
+            // 掩盖）时，该页瓦片也被跳 → 停在低密底图、零在途、静止冻结（糊），只能靠
+            // 再次缩放强制重渲。故 skip = 封面**在槽**（`cover_scale ≈ cscale`）**或**在途
+            // （`pending_cover` 含该页且请求密度 = 当前 cscale——旧密度在途结果到后会被
+            // `collect_cover_results` 密度守卫丢弃，不能作数）；封面缺失即 fall-through 派
+            // 当前密度 1:1 瓦片兜底，瓦片成为最终锐利供给。
+            // - 与既有 T1/同密度语义：schedule_covers 同帧对 affordable 页派封面，仅「在槽/
+            //   在途」页才跳瓦片 → 封面先行主路径的「不双渲」不变；封面缺失页的瓦片由
+            //   TILE_INFLIGHT/budget 自理，封面到位后 `collect_tile_results`/`evict_tiles`
+            //   的「同密度封面冗余」自动回收，不长期双驻留。
+            // - 与 S5 回收（`cover_scale==0` + 瓦片在位）不冲突：S5 页 cover_scale=0 ≠ cscale
+            //   → 在槽判定失败 → 派瓦片（正是「cover 已回收、1:1 瓦片接管」的应有供给）。
+            // - **W2**：封面持续失败的页（`cover_blacklist`）天然在槽/在途都缺 → 回退瓦片
+            //   核发（否则封面永不再派而瓦片又永远跳过 → 页面停在占位/模糊）。
+            let cover_in_slot =
+                self.slots[page].cover.is_some() && (self.slots[page].cover_scale - cscale).abs() <= 1e-4;
+            let cover_inflight = self
+                .pending_cover
+                .get(&page)
+                .is_some_and(|(ps, _, _, _)| (ps - cscale).abs() <= 1e-3);
             let skip_covered = !self.cover_blacklist.contains(&page)
-                && (cover_serves_tile_density
-                    || (self.slots[page].cover.is_some()
-                        && (self.slots[page].cover_scale - scale).abs() <= 1e-4));
+                && cover_serves_tile_density
+                && (cover_in_slot || cover_inflight);
             if skip_covered {
                 continue;
             }
@@ -826,7 +897,7 @@ impl PdfViewer {
                     continue;
                 }
                 self.slots[page].mid_loading = true;
-                let rx = worker.request_mid(self.doc_id, page, scale_factor, self.nav_gen); // L2.2 enqueue-n_gen
+                let rx = worker.request_mid(self.doc_id, page, scale_factor, self.nav_gen, self.zoom_epoch); // L2.2+Z2 stamp
                 self.raster_reqs += 1; // 切档不重栅回归计数
                 self.pending_mid.insert(page, (self.nav_gen, rx));
                 budget -= 1;
@@ -850,7 +921,7 @@ impl PdfViewer {
                     continue;
                 }
                 self.slots[page].thumb_loading = true;
-                let rx = worker.request_thumb(self.doc_id, page, self.nav_gen); // L2.2 enqueue-n_gen
+                let rx = worker.request_thumb(self.doc_id, page, self.nav_gen, self.zoom_epoch); // L2.2 enqueue-n_gen
                 self.raster_reqs += 1; // 切档不重栅回归计数
                 self.pending_thumb.insert(page, (self.nav_gen, rx));
                 tb -= 1;
@@ -877,7 +948,9 @@ impl PdfViewer {
                 .map(|(s, _, _)| s)
                 .unwrap_or(0.0);
             let (page, row, col) = key;
-            let Some(res) = res else { continue };
+            let Some(res) = res else {
+                continue;
+            };
             if page >= self.dims.len() {
                 continue;
             }
@@ -1022,8 +1095,35 @@ impl PdfViewer {
             if !self.gpu_recolor && res.recolor_epoch != self.recolor_epoch {
                 continue;
             }
+            // **手势期零满密换底（第 4 轮真机根因，本批人格分界）**：`zoom_armed` 期间到达的
+            // 封面**一律丢弃**——不写 prev_cover 桥、不入 slot.cover。手势前那张高密位图
+            // （armed 首帧 `relocate_stale_zoomed_covers` 已迁入 prev_cover）保持为唯一平滑底
+            // 基（GPU 拉伸），中间档整页栅格到此为止、不再置换底图 → 无每档整页栅格重排
+            // （「松手瞬间跳一下、整页一起动」的根治）。与 Z2 的分工：Z2 在 worker **出队时**
+            // 对「stamp 超前」才弃，出队恰新的中间档照样渲完到达——本守卫是「已渲染到达」
+            // 层的最后一道闸；settle（armed 清）后走原逻辑（最终档 cover 入 slot、prev_cover
+            // take 归位）。
+            if self.zoom_armed {
+                continue; // 移除了 pending（非封面失败，不计数）
+            }
             if (req_scale - cscale).abs() > 1e-4 {
-                continue; // 缩放/DPI 已变 → 过期封面丢弃（用户缩放所致，非封面失败，不计数）
+                // 缩放/DPI 已变 → 本密度封面过期。**S4 最新档桥**：过期封面正是本手势的
+                // 中间档（req_scale ≠ 当前 cscale），且该页当前档封面尚未入槽 → 比「手势前
+                // 旧封面」更贴近当前显示密度的中间档，转存进有界 `prev_cover` 槽（覆盖旧桥，
+                // 至多一档 1.12 拉伸），而不是直接丢弃让屏显继续用「手势前旧封面」复利拉伸
+                // （1.12^k 雾）。最终档封面入槽后见下方既有 `prev_cover.take()` 自动回收。
+                // 缩小（req_scale > cscale）同理。z 过期若该页当前档封面已入槽则不覆盖
+                // （新封面即锐，桥无用）。
+                if self.slots[page].cover.is_none() {
+                    if let Ok(img) = render_image_from_bgra(res.bgra, res.width, res.height) {
+                        if let Some(s) = self.slots.get_mut(page) {
+                            if let Some(prev) = s.prev_cover.replace(img) {
+                                self.pending_drops.push(prev);
+                            }
+                        }
+                    }
+                }
+                continue; // 移除 pending（非封面失败，不计数）
             }
             let (w, h) = (res.width, res.height);
             let Ok(img) = render_image_from_bgra(res.bgra, w, h) else {
@@ -1594,11 +1694,269 @@ impl PdfViewer {
                 self.doc_id,
                 RenderRequest { page, scale: pscale },
                 self.nav_gen, // L2.2 enqueue-gen（跳变后续世代推进可清 stale，只渲最新落点）
+                self.zoom_epoch, // Z2：发送时打戳当前缩放世代
             );
             self.raster_reqs += 1;
             self.prefetch_reqs += 1; // F4 观测计数（跳变铺底也计走廊预取，预算/收敛语义一致）
             self.pending_prefetch_cover.insert(page, (pscale, self.nav_gen, rx));
         }
+    }
+
+    /// S2 **缩放防抖 preview**：`zoom_armed` 期间对**可见窗**按当前 cscale 派 ≤
+    /// [`config::pdf::PRE_FETCH_COVER_INFLIGHT`] 枚 0.5 密度 RenderPreview（复用走廊
+    /// `request_render_preview`：不入 raw 缓存、不参与重着色刷新、受 40MB 走廊预算 evict
+    /// 兜底），每帧至多 2 枚、绝不派满密 cover/tile——杜绝「每档 cscale 变、满密 ~30ms
+    /// 渲染大概率被下一档弃」的逐档抢渲空转。
+    ///
+    /// 与跳变 preview（`dispatch_jump_preview_base`）的区别：**按当前密度去重**——缩放后
+    /// 旧封面由 `relocate_stale_zoomed_covers` 迁入 `prev_cover`（单档桥），显式底图为
+    /// 「旧封面单档拉伸」为主（`page_base_image` 优先级 cover→prev_cover→preview），
+    /// 本函数派出的当前档 0.5 密度 preview 补位仅对**无封面桥**的页生效，避免复利雾；
+    /// 最终档 cover 到位后 `prev_cover.take()` 自动回收桥。跳变 preview 是一次性突发
+    /// （每页至多一次），本函数是防抖窗内逐帧渐进预算。
+    pub(super) fn maybe_dispatch_zoom_preview(
+        &mut self,
+        start: usize,
+        end: usize,
+        scroll_y: f32,
+        viewport_h: f32,
+        page_width: f32,
+        scale_factor: f32,
+        window: &Window,
+    ) {
+        if !self.zoom_armed {
+            return;
+        }
+        let Some(worker) = self.worker.clone() else {
+            return;
+        };
+        let (Some(vis_first), Some(vis_last)) =
+            self.visible_page_span(start, end, scroll_y, viewport_h, page_width, window)
+        else {
+            return;
+        };
+        let n = self.dims.len();
+        if n == 0 {
+            return;
+        }
+        let vis_last = vis_last.min(n - 1);
+        // 可见页按距中心近远排序（与封面/走廊同款），减去已有在途后的单帧预算。
+        let mut budget = config::pdf::PRE_FETCH_COVER_INFLIGHT
+            .saturating_sub(self.pending_prefetch_cover.len());
+        if budget == 0 {
+            return;
+        }
+        let center = (vis_first + vis_last) / 2;
+        let mut order: Vec<usize> = (vis_first..=vis_last).collect();
+        order.sort_by_key(|&p| (p as i64 - center as i64).unsigned_abs());
+        for page in order {
+            if budget == 0 {
+                break;
+            }
+            let slot = &self.slots[page];
+            let dim = self.dims[page];
+            let cscale = cover_scale(dim, page_width, scale_factor);
+            let pscale = (cscale * config::pdf::PREFETCH_COVER_DENSITY)
+                .min(config::pdf::COVER_SCALE_CAP);
+            // **手势期 preview 只填不换（dispatch 侧）**：`zoom_armed` 期间已有任何底
+            // （cover/prev_cover/prefetch_cover）的页不再派新档 preview——这些页屏显由高密
+            // cover/prev_cover（手势前那张）供给，新 preview 到也只会被链挡住/徒增逐档换密
+            // churn；仅「全无底」的空页（真正 placeholder）才派一次垫底。与 collect 侧
+            // `collect_prefetch_cover_results` 的 armed「有底不换」守卫对称（一面不派、一面
+            // 不写，手势期 low-dens 底稳定）。
+            if slot.cover.is_some() || slot.prev_cover.is_some() || slot.prefetch_cover.is_some() {
+                continue;
+            }
+            // 当前密度守卫：满密 cover 已是当前档 → 页已锐利无需 preview；当前档 preview
+            // 已在槽 / 任一在途 → 不重复派。旧密度 preview（`prefetch_cover_scale≠pscale`）
+            // 不拦——缩放中途要按新档重派（顶显示从旧档抬升到当前档）。
+            if slot.cover.is_some() && (slot.cover_scale - cscale).abs() <= 1e-4 {
+                continue;
+            }
+            if slot.prefetch_cover.is_some()
+                && (slot.prefetch_cover_scale - pscale).abs() <= 1e-4
+            {
+                continue;
+            }
+            if self.pending_prefetch_cover.contains_key(&page)
+                || self.pending_cover.contains_key(&page)
+            {
+                continue;
+            }
+            if !cover_affordable(dim, pscale) {
+                continue;
+            }
+            let rx = worker.request_render_preview(
+                self.doc_id,
+                RenderRequest { page, scale: pscale },
+                self.nav_gen, // L2.2 enqueue-n_gen（世代语义不变：防抖收口后下一档若推进可清 stale）
+                self.zoom_epoch, // Z2：发送时打戳当前缩放世代
+            );
+            self.raster_reqs += 1;
+            self.prefetch_reqs += 1; // F4 观测计数（缩放 preview 与走廊同计通道，预算/收敛语义一致）
+            self.pending_prefetch_cover.insert(page, (pscale, self.nav_gen, rx));
+            budget -= 1;
+        }
+    }
+
+    /// S5 **高倍 cover 回收**：高倍稳态（`render_scale` 超出 [`config::pdf::COVER_SCALE_CAP`]，
+    /// `cover_scale` 被 cap 截断在 4.0）下、可见页瓦片已按 `render_scale` 1:1 全到位
+    /// （`tile_scale` 匹配当前密度且非空）——cover 只是 4.0 密度的旧密度整页图，在
+    /// 显示 4.x~9.66 倍率下必然拉伸发糊，还叠加 32MB/页 的双驻留与边隙透雾 → 回收该页
+    /// `cover`（显式 `drop_image` 下线）。瓦片画在 cover 之上且覆盖可见区，回收后显示不变。
+    ///
+    /// 动态 guard：`zoom_armed` 期间不回收（防手势中翻面回放时还需要 cover）；回收后若
+    /// zoom 反向又需要 cover，由正常 `schedule_covers` 按新密度重派。cap 不升（4.0 恰顶穿
+    /// A4 32MB 预算）。配合既有 `evict_tiles` 的「同密度封面冗余清瓦片」，正反向都不再
+    /// 双驻留，`double_hold == 0` 内存回归恒成立。
+    ///
+    /// **评审 BLOCK③ 收窄**：判定从「`!tiles.is_empty()`（≥1 片在槽）」收紧为「该页**可见
+    /// 矩形**内全部瓦片都在槽且 `tile_scale≈render_scale`」——否则高倍滚动/收口期首片到达
+    /// 就回收 cover，会让未铺满可见区的页瞬间失去底图（闪底）。可见矩形用与瓦片调度同源的
+    /// `page_visible_rect`+`visible_tile_range`（含 `TILE_MARGIN` 缓冲）对账，未铺满不回收。
+    pub(super) fn retire_high_scale_covers(
+        &mut self,
+        start: usize,
+        end: usize,
+        scroll_y: f32,
+        viewport_h: f32,
+        page_width: f32,
+        scale_factor: f32,
+        window: &Window,
+    ) {
+        if self.zoom_armed {
+            return;
+        }
+        let n = self.dims.len();
+        if n == 0 || start > end {
+            return;
+        }
+        let end = end.min(n - 1);
+        let wrap_w = self.wrap_width(window, page_width);
+        let mut drops: Vec<Arc<RenderImage>> = Vec::new();
+        for page in start..=end {
+            let dim = self.dims[page];
+            let cur = render_scale(page_width, scale_factor, dim.0);
+            let cscale = cover_scale(dim, page_width, scale_factor);
+            if self.slots[page].cover.is_none() {
+                continue;
+            }
+            // 阶段一（只读对账）：cover 密度被 cap 截断（cscale < cur）**且截断差明显**、
+            // tile_scale 匹配当前密度、且**可见矩形内全部瓦片在槽**——三者齐备才可回收。
+            if cscale < cur - 1e-4
+                && cur > cscale * config::pdf::COVER_RETIRE_MIN_RATIO
+                && (self.slots[page].tile_scale - cur).abs() <= 1e-4
+            {
+                let Some(rect) =
+                    self.page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
+                else {
+                    continue;
+                };
+                let bmp = page_bitmap_size(dim, cur);
+                let disp_h = display_height(dim, page_width);
+                let Some((r0, c0, r1, c1)) = visible_tile_range(
+                    bmp,
+                    page_width,
+                    disp_h,
+                    rect,
+                    TILE_SIZE,
+                    TILE_MARGIN,
+                ) else {
+                    continue;
+                };
+                let s = &self.slots[page];
+                let mut covered = true;
+                'outer: for row in r0..=r1 {
+                    for col in c0..=c1 {
+                        if !s.tiles.contains_key(&(row, col)) {
+                            covered = false;
+                            break 'outer;
+                        }
+                    }
+                }
+                if !covered {
+                    continue;
+                }
+                // 阶段二（可回收才取 &mut）：离线 cover，置 cover_scale=0（render 侧判等失败、
+                // 兼作「S5 已回收」标记，schedule_covers 跳过重派封面防回收-重派死环）。
+                let slot = &mut self.slots[page];
+                if let Some(old) = slot.cover.take() {
+                    drops.push(old);
+                    slot.cover_scale = 0.0;
+                }
+            }
+        }
+        self.pending_drops.extend(drops);
+    }
+
+    /// S2/S4 前置（评审 BLOCK②）：把可见窗内 `cover_scale ≠ 当前 cscale` 的 **stale cover**
+    /// （缩放中途正持的旧档整页）迁入有界 `prev_cover` 槽（覆盖旧桥、旧桥下线），`cover=None`
+    /// ——让 S2 preview（`collect_prefetch_cover_results` 不再是「cover 在位即弃」……
+    /// 此迁移使其从 stale 转 cover=None 后 preview 必然入槽）与 S4 最新档桥对「持旧封面页」
+    /// 同时激活；最终档封面由常态 `schedule_covers` 按新 cscale 重派。仅 `zoom_armed` 路径
+    /// 调用（jump/滚动语义不受影响——它们走各自既有封面搬迁）。
+    /// 返回被顶替下线的旧桥（调用方入 `pending_drops`）。
+    pub(super) fn relocate_stale_zoomed_covers(
+        &mut self,
+        start: usize,
+        end: usize,
+        page_width: f32,
+        scale_factor: f32,
+    ) -> Vec<Arc<RenderImage>> {
+        let n = self.dims.len();
+        let mut dropped = Vec::new();
+        if n == 0 || start > end {
+            return dropped;
+        }
+        let end = end.min(n - 1);
+        for page in start..=end {
+            let cscale = cover_scale(self.dims[page], page_width, scale_factor);
+            let slot = &mut self.slots[page];
+            let stale =
+                slot.cover.is_some() && (slot.cover_scale - cscale).abs() > 1e-4;
+            if stale
+                && let Some(old) = slot.cover.take()
+            {
+                if let Some(prev) = slot.prev_cover.replace(old) {
+                    dropped.push(prev);
+                }
+                // cover_scale 保留下次 stale 判定所需的旧值？——置 0 表示无封面（render 侧
+                // 不再按旧档判等显示；preview 已随时可见）。
+                slot.cover_scale = 0.0;
+            }
+        }
+        dropped
+    }
+
+    /// Z2 armed 收口前置：立即释放「缩放中间档」的在途预算——`pending_cover`/`pending_tiles`/
+    /// `pending_prefetch_cover` 里 `pscale ≠ 当前 cscale` 的条目**直接移除**（rx drop：worker 侧
+    /// 的 zoom-epoch 镜像会把它 drop 不渲，静默；预算即释、解开 [`COVER_INFLIGHT`]/瓦片在途被
+    /// 中间档占死——P3「队列堆叠」在调度侧的直接释放）。`collect_*` 既有 scale 守卫会弃任何
+    /// 漏网脏结果，无需改。中清/缩略无密度区分，不参与（低清底图缩放无关）。幂等，armed 每帧
+    /// 调用安全。
+    pub(super) fn drop_stale_scale_pending(&mut self, page_width: f32, scale_factor: f32) {
+        // 在途封面：键=页，条目 (scale, recolor_epoch, nav_gen, rx)。
+        self.pending_cover.retain(|page, v| {
+            let s = v.0;
+            *page < self.dims.len()
+                && (s - cover_scale(self.dims[*page], page_width, scale_factor)).abs() <= 1e-4
+        });
+        // 在途瓦片：键=(页,row,col)，条目 (scale, nav_gen, rx)。
+        self.pending_tiles.retain(|key, v| {
+            let s = v.0;
+            key.0 < self.dims.len()
+                && (s - render_scale(page_width, scale_factor, self.dims[key.0].0)).abs() <= 1e-4
+        });
+        // 在途 preview（走廊）：键=页，条目 (pscale, nav_gen, rx)。
+        self.pending_prefetch_cover.retain(|page, v| {
+            let ps = v.0;
+            *page < self.dims.len() && {
+                let cscale = cover_scale(self.dims[*page], page_width, scale_factor);
+                let want = (cscale * config::pdf::PREFETCH_COVER_DENSITY)
+                    .min(config::pdf::COVER_SCALE_CAP);
+                (ps - want).abs() <= 1e-3
+            }
+        });
     }
 
     /// P2：O(1) 主线程中清缓存命中（`slots[i].mid` 即内存缓存本体）。命中触摸 `mid_lru`

@@ -582,6 +582,15 @@ enum WorkerMsg {
     /// 静默失败）→ 丢弃。与 SetRecolor 同路径：sweep 应用、经单通道 FIFO 保证先行于同批渲染出队。
     /// 按文档键控（进程级单 worker 多阅读器共享，绝不能退化成单槽全局值）。
     Navigate(DocId, u64),
+    /// **缩放世代步进（按文档，Z2）**：view 每次缩放（`adjust_zoom` 新档）`zoom_epoch++` 并推送
+    /// 本消息告知 worker——worker 侧只**采纳**（`max(当前, 消息)`）为文档级 `zoom_epoch_mirror`
+    /// 镜像（view 是唯一真源）。worker 出队 render 类消息时，该消息发送时携带的 enqueue-zoom
+    /// stamp < `zoom_epoch_mirror[doc]` → **直接 drop 不渲**（停在 render_q 的中间档 cover/瓦片/
+    /// preview 不再排队空耗 pdfium 时隙——Z2 队列堆叠的根治；最终档请求 stamp==当前镜像必过）。
+    /// 与 [`WorkerMsg::Navigate`] 同路径（sweep 应用、单通道 FIFO 保序）。**独立于 nav_gen**：
+    /// 滚动/大跳时代不变，防浊化导航世代语义；缺省=0 → 常规非缩放零影响。控制消息（Text/Search
+    /// 等非 render）stamp 恒 0 → 不受本 drop 影响。
+    SetZoomEpoch(DocId, u64),
     /// **重着色刷新（按文档，只刷可见集 + 分批分帧）**：`keys` = view 侧枚举的「显示槽
     /// 真实需要的可见集」（[`RecolorKey`]，按近中心排序），worker 对原始缓存逐条现算新
     /// 着色副本、经 `tx` 分批回传（见 [`RECOLOR_BATCH_BYTES`]），**不触碰 raw 单真值**。
@@ -598,11 +607,14 @@ enum WorkerMsg {
 /// 进程级单例工作线程句柄。所有 [`PdfViewer`] 通过克隆它共享同一个 pdfium 线程。
 #[derive(Clone)]
 pub struct PdfWorker {
-    /// 工作通道：item = `(enqueue-n_gen: u64, WorkerMsg)`（L2.2 通道包装）。
+    /// 工作通道：item = `(enqueue-n_gen: u64, enqueue-zoom: u64, WorkerMsg)`（L2.2 通道包装 +
+    /// Z2 缩放 stamp）。
     /// `n_gen` 在发送时由 view 打戳为当时 `nav_gen`；worker 出队 render 类消息时与文档级
-    /// `navigate_gen` 镜像比对，`n_gen < navigate_gen[doc]` → 直接 drop 不渲。控制消息
-    /// （SetRecolor/Navigate/Close）不带 n_gen 语义（sweep 当下应用），发送时打 0。
-    tx: mpsc::Sender<(u64, WorkerMsg)>,
+    /// `navigate_gen` 镜像比对，`n_gen < navigate_gen[doc]` → 直接 drop 不渲。`zoom` 同理
+    /// 打戳为当时 `zoom_epoch`，出队 render 类与 `zoom_epoch_mirror[doc]` 比对，旧档（缩放
+    /// 中间档）请求直接 drop。控制消息（SetRecolor/Navigate/SetZoomEpoch/Close）不带世代
+    /// 语义（sweep 当下应用），发送时打 0。
+    tx: mpsc::Sender<(u64, u64, WorkerMsg)>,
 }
 
 /// 全局单例：第一次调用 [`open_and_dims`](PdfWorker::open_and_dims) 时启动并持有。
@@ -614,7 +626,7 @@ fn shared_worker() -> Result<&'static PdfWorker> {
         return Ok(w);
     }
     let dll = pdfium_dll_path()?.clone();
-    let (tx, rx) = mpsc::channel::<(u64, WorkerMsg)>();
+    let (tx, rx) = mpsc::channel::<(u64, u64, WorkerMsg)>();
     std::thread::Builder::new()
         .name("pdfium-render".into())
         .spawn(move || PdfWorker::run(rx, dll))
@@ -638,7 +650,7 @@ impl PdfWorker {
         let worker = shared_worker()?;
         let (tx, rx) = mpsc::channel();
         let doc_id = next_doc_id();
-        let _ = worker.tx.send((0, WorkerMsg::Open(doc_id, bytes, tx)));
+        let _ = worker.tx.send((0, 0, WorkerMsg::Open(doc_id, bytes, tx)));
         let (dims, outlines) = match rx.recv() {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(anyhow::anyhow!("{e}")),
@@ -656,9 +668,12 @@ impl PdfWorker {
         doc_id: DocId,
         req: RenderRequest,
         nav_gen: u64,
+        zoom_epoch: u64,
     ) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((nav_gen, WorkerMsg::Render(doc_id, req, tx)));
+        let _ = self
+            .tx
+            .send((nav_gen, zoom_epoch, WorkerMsg::Render(doc_id, req, tx)));
         rx
     }
 
@@ -669,9 +684,12 @@ impl PdfWorker {
         doc_id: DocId,
         req: TileRequest,
         nav_gen: u64,
+        zoom_epoch: u64,
     ) -> mpsc::Receiver<Option<TileResult>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((nav_gen, WorkerMsg::RenderTile(doc_id, req, tx)));
+        let _ = self
+            .tx
+            .send((nav_gen, zoom_epoch, WorkerMsg::RenderTile(doc_id, req, tx)));
         rx
     }
 
@@ -683,9 +701,12 @@ impl PdfWorker {
         doc_id: DocId,
         page: usize,
         nav_gen: u64,
+        zoom_epoch: u64,
     ) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((nav_gen, WorkerMsg::Thumb(doc_id, page, tx)));
+        let _ = self
+            .tx
+            .send((nav_gen, zoom_epoch, WorkerMsg::Thumb(doc_id, page, tx)));
         rx
     }
 
@@ -698,9 +719,14 @@ impl PdfWorker {
         page: usize,
         scale_factor: f32,
         nav_gen: u64,
+        zoom_epoch: u64,
     ) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((nav_gen, WorkerMsg::Mid(doc_id, page, scale_factor, tx)));
+        let _ = self.tx.send((
+            nav_gen,
+            zoom_epoch,
+            WorkerMsg::Mid(doc_id, page, scale_factor, tx),
+        ));
         rx
     }
 
@@ -713,21 +739,33 @@ impl PdfWorker {
         doc_id: DocId,
         req: RenderRequest,
         nav_gen: u64,
+        zoom_epoch: u64,
     ) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((nav_gen, WorkerMsg::RenderPreview(doc_id, req, tx)));
+        let _ = self
+            .tx
+            .send((nav_gen, zoom_epoch, WorkerMsg::RenderPreview(doc_id, req, tx)));
         rx
     }
 
     /// **导航世代跳变（L1/L2）**：view 检测到大跳、`nav_gen++` 后推送本消息。worker 侧按文档
     /// 采纳（`max`）为 `navigate_gen` 镜像，出队时据此 drop 旧世代 render 类请求。
     pub fn navigate(&self, doc_id: DocId, nav_gen: u64) {
-        let _ = self.tx.send((0, WorkerMsg::Navigate(doc_id, nav_gen)));
+        let _ = self.tx.send((0, 0, WorkerMsg::Navigate(doc_id, nav_gen)));
+    }
+
+    /// **缩放世代步进（Z2）**：view 每次缩放（新档）`zoom_epoch++` 后推送本消息。worker 侧按
+    /// 文档采纳（`max`）为 `zoom_epoch_mirror` 镜像，出队 render 类请求时据此 drop 旧档
+    /// （中间档 cover/瓦片/preview）——队列不再被旧档占住，最终档必达（时锐时糊根治）。
+    pub fn set_zoom_epoch(&self, doc_id: DocId, zoom_epoch: u64) {
+        let _ = self
+            .tx
+            .send((0, 0, WorkerMsg::SetZoomEpoch(doc_id, zoom_epoch)));
     }
 
     /// 关闭文档，释放 pdfium 侧资源（阅读器关闭时调用）。
     pub fn close(&self, doc_id: DocId) {
-        let _ = self.tx.send((0, WorkerMsg::Close(doc_id)));
+        let _ = self.tx.send((0, 0, WorkerMsg::Close(doc_id)));
     }
 
     /// 设置（或清除）`doc_id` 文档的纸墨重着色参数（`None` = 直通无重着色）。只影响该
@@ -740,7 +778,7 @@ impl PdfWorker {
     /// `epoch` = view 侧当前重着色世代号：worker 采纳（镜像）它而非自行计数——开档时序
     /// worker 接线前的多次 set_recolor 经补推折叠成一次消息，靠携带的最终世代对齐（BLOCK）。
     pub fn set_recolor(&self, doc_id: DocId, recolor: Option<RecolorParams>, epoch: u64) {
-        let _ = self.tx.send((0, WorkerMsg::SetRecolor(doc_id, recolor, epoch)));
+        let _ = self.tx.send((0, 0, WorkerMsg::SetRecolor(doc_id, recolor, epoch)));
     }
 
     /// 请求一次**重着色刷新（只刷可见集）**：`keys` = view 侧枚举的「显示槽真实需要的
@@ -755,7 +793,7 @@ impl PdfWorker {
         keys: Vec<RecolorKey>,
     ) -> mpsc::Receiver<RecolorEntry> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, WorkerMsg::RecolorRefresh(doc_id, keys, tx)));
+        let _ = self.tx.send((0, 0, WorkerMsg::RecolorRefresh(doc_id, keys, tx)));
         rx
     }
 
@@ -763,7 +801,7 @@ impl PdfWorker {
     /// 比例证据）。文档未打开 / 已关闭 → 0。
     pub fn raw_cache_len(&self, doc_id: DocId) -> usize {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, WorkerMsg::RawCacheLen(doc_id, tx)));
+        let _ = self.tx.send((0, 0, WorkerMsg::RawCacheLen(doc_id, tx)));
         rx.recv().unwrap_or(0)
     }
 
@@ -772,7 +810,7 @@ impl PdfWorker {
     /// 用于断言「view 推进世代后 worker 镜像经 Navigate 消息对齐」（复用 w1 世代探针姿势）。
     pub fn navigate_gen(&self, doc_id: DocId) -> u64 {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, WorkerMsg::NavigateGen(doc_id, tx)));
+        let _ = self.tx.send((0, 0, WorkerMsg::NavigateGen(doc_id, tx)));
         rx.recv().unwrap_or(0)
     }
 
@@ -783,7 +821,7 @@ impl PdfWorker {
     /// （P2 会绑定 generation 校验，此处只建立契约）。
     pub fn request_text(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<PageText>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, WorkerMsg::Text(doc_id, page, tx)));
+        let _ = self.tx.send((0, 0, WorkerMsg::Text(doc_id, page, tx)));
         rx
     }
 
@@ -792,7 +830,7 @@ impl PdfWorker {
     /// 只在点击/右键命中图片时按需调用（懒加载：无交互则零开销）。
     pub fn page_images(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<Vec<PdfImageBox>>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, WorkerMsg::PageImages(doc_id, page, tx)));
+        let _ = self.tx.send((0, 0, WorkerMsg::PageImages(doc_id, page, tx)));
         rx
     }
 
@@ -809,7 +847,7 @@ impl PdfWorker {
         let (tx, rx) = mpsc::channel();
         let _ = self
             .tx
-            .send((0, WorkerMsg::ImagePixels(doc_id, page, obj_index, w, h, tx)));
+            .send((0, 0, WorkerMsg::ImagePixels(doc_id, page, obj_index, w, h, tx)));
         rx
     }
 
@@ -817,7 +855,7 @@ impl PdfWorker {
     /// 返回接收结果的通道；文档不存在 → `None`。
     pub fn search(&self, doc_id: DocId, needle: String) -> mpsc::Receiver<Option<PdfSearchResults>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, WorkerMsg::Search(doc_id, needle, tx)));
+        let _ = self.tx.send((0, 0, WorkerMsg::Search(doc_id, needle, tx)));
         rx
     }
 
@@ -833,7 +871,7 @@ impl PdfWorker {
     ) -> Result<usize> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::Annotate(doc_id, items, output_path, tx)))
+            .send((0, 0, WorkerMsg::Annotate(doc_id, items, output_path, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -850,7 +888,7 @@ impl PdfWorker {
     ) -> Result<usize> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::InsertBlankPage(doc_id, at_index, width_pt, height_pt, output_path, tx)))
+            .send((0, 0, WorkerMsg::InsertBlankPage(doc_id, at_index, width_pt, height_pt, output_path, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -859,7 +897,7 @@ impl PdfWorker {
     pub fn delete_page(&self, doc_id: DocId, index: usize, output_path: PathBuf) -> Result<usize> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::DeletePage(doc_id, index, output_path, tx)))
+            .send((0, 0, WorkerMsg::DeletePage(doc_id, index, output_path, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -873,7 +911,7 @@ impl PdfWorker {
     ) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::ExtractPage(doc_id, index, out_path, tx)))
+            .send((0, 0, WorkerMsg::ExtractPage(doc_id, index, out_path, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -882,7 +920,7 @@ impl PdfWorker {
     pub fn save(&self, doc_id: DocId, path: PathBuf) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::Save(doc_id, path, tx)))
+            .send((0, 0, WorkerMsg::Save(doc_id, path, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -901,7 +939,7 @@ impl PdfWorker {
     ) -> Result<MemOpResult> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::MemOpInsert(doc_id, at_index, width_pt, height_pt, tx)))
+            .send((0, 0, WorkerMsg::MemOpInsert(doc_id, at_index, width_pt, height_pt, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -910,7 +948,7 @@ impl PdfWorker {
     pub fn mem_delete_page(&self, doc_id: DocId, index: usize) -> Result<MemOpResult> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::MemOpDelete(doc_id, index, tx)))
+            .send((0, 0, WorkerMsg::MemOpDelete(doc_id, index, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -919,7 +957,7 @@ impl PdfWorker {
     pub fn mem_restore_bytes(&self, doc_id: DocId, bytes: Vec<u8>) -> Result<usize> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::MemRestoreBytes(doc_id, bytes, tx)))
+            .send((0, 0, WorkerMsg::MemRestoreBytes(doc_id, bytes, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -927,7 +965,7 @@ impl PdfWorker {
     /// 读回 stores 当前内存镜像（`None` = 文档不存在；测试 MD5 / 撤销快照 / 另存用）。
     pub fn mem_bytes(&self, doc_id: DocId) -> Option<Vec<u8>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, WorkerMsg::MemGetBytes(doc_id, tx)));
+        let _ = self.tx.send((0, 0, WorkerMsg::MemGetBytes(doc_id, tx)));
         rx.recv().ok().flatten()
     }
 
@@ -940,13 +978,13 @@ impl PdfWorker {
     ) -> Result<Vec<AnnotationInfo>> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, WorkerMsg::ReadAnnotations(doc_id, page_index, tx)))
+            .send((0, 0, WorkerMsg::ReadAnnotations(doc_id, page_index, tx)))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
 
     /// 工作线程主体（进程内唯一）：绑定 pdfium 一次 → 循环处理命令。
-    fn run(rx: mpsc::Receiver<(u64, WorkerMsg)>, dll: PathBuf) {
+    fn run(rx: mpsc::Receiver<(u64, u64, WorkerMsg)>, dll: PathBuf) {
         let bindings = match Pdfium::bind_to_library(&dll) {
             Ok(b) => b,
             Err(e) => {
@@ -970,10 +1008,10 @@ impl PdfWorker {
         // O(n) 扫描抽取；调度语义（严格类优先级 + 同类 FIFO）与原实现完全一致。
         // item = `(enqueue-n_gen, WorkerMsg)`（L2.2）：`n_gen` 供出队时与文档级 `navigate_gen`
         // 镜像比对，render 类消息 `n_gen < navigate_gen[doc]` → drop 不渲（只渲最新落点）。
-        let mut render_q: VecDeque<(u64, WorkerMsg)> = VecDeque::new();
-        let mut mid_q: VecDeque<(u64, WorkerMsg)> = VecDeque::new();
-        let mut thumb_q: VecDeque<(u64, WorkerMsg)> = VecDeque::new();
-        let mut rest_q: VecDeque<(u64, WorkerMsg)> = VecDeque::new();
+        let mut render_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut mid_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut thumb_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut rest_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         // 在途的全文档检索（分片续跑）：worker 无渲染/占位积压时每轮扫一片（几页/几 ms），
         // 保证检索期间到达的 Render/RenderTile 可以插队先跑——否则一次全量扫描会冻结所有
         // 瓦片/封面（87 页文本 PDF 实测检索 ~440ms，期间渲染被整段堵住 → 随机页先模糊）。
@@ -998,6 +1036,13 @@ impl PdfWorker {
         // （只渲染最新落点；快速连续跳的中间页不再烧 pdfium 带宽）；在飞项渲完由 view 侧
         // 清 pending（rx drop）丢弃。缺省=0 → 常规非大跳滚动零影响。
         let mut navigate_gen: HashMap<DocId, u64> = HashMap::new();
+        // **缩放世代**（按文档，Z2）：view 是**唯一真源**（每次缩放新档 `zoom_epoch++` 时经
+        // [`WorkerMsg::SetZoomEpoch`] 推送），worker 只**采纳**（`max(当前, 消息)`）为镜像、绝不
+        // 自行递增。出队 render 类消息时若 `enqueue-zoom < zoom_epoch_mirror[doc]` → 直接 drop
+        // 不渲（中间档 cover/瓦片/preview 留在队列也是白烧 pdfium 带宽；最终档 stamp==镜像必过）。
+        // 与 nav_gen 独立（滚动/大跳时代不变）；缺省=0 → 常规非缩放零影响。控制消息
+        // （Text/Search 等非 render）stamp 恒 0 → 不受本 drop 影响。
+        let mut zoom_epoch_mirror: HashMap<DocId, u64> = HashMap::new();
         // 未着色原图缓存（**按文档**键控，条目见 [`RawEntry`]）：切档（`SetRecolor`）只对
         // 缓存内该文档的原图重跑 apply_recolor 现算新着色副本回传刷新可见区——不失效缓存
         // 槽、不重置门控、不重调 pdfium 栅格（根治「夜间档加载慢」）。与 recolor 同生命周期，
@@ -1013,7 +1058,7 @@ impl PdfWorker {
             // 保证 Navigate 早于同批次的任何渲染出队生效（view 先发 Navigate 推进世代、
             // 再发携带新世代的渲染请求，经单通道 FIFO 保序 → 旧世代请求出队时被 drop）。
             while let Ok(item) = rx.try_recv() {
-                let (n_gen, msg) = item;
+                let (n_gen, z_gen, msg) = item;
                 match msg {
                     WorkerMsg::SetRecolor(doc_id, params, epoch) => {
                         // 只更新参数（重着色刷新走 RecolorRefresh）；同参写入幂等，跳过重复。
@@ -1040,14 +1085,20 @@ impl PdfWorker {
                         let cur = navigate_gen.get(&doc_id).copied().unwrap_or(0);
                         navigate_gen.insert(doc_id, cur.max(nav));
                     }
+                    WorkerMsg::SetZoomEpoch(doc_id, zoom) => {
+                        // Z2：worker 采纳 view 消息携带的缩放世代（view 唯一真源），
+                        // 不自行递增；`max` 兜底消息乱序（单通道 FIFO 下本不会发生）。
+                        let cur = zoom_epoch_mirror.get(&doc_id).copied().unwrap_or(0);
+                        zoom_epoch_mirror.insert(doc_id, cur.max(zoom));
+                    }
                     other => {
-                        enqueue_msg((n_gen, other), &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q)
+                        enqueue_msg((n_gen, z_gen, other), &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q)
                     }
                 }
             }
             // 1) 渲染永远最优先：全尺寸 Render / RenderTile（瓦片与整页同为视口内容），
             //    即使渲染消息排在检索/文本之后到，也会先从队列里抽出来执行。
-            if let Some((n_gen, msg)) = render_q.pop_front() {
+            if let Some((n_gen, z_gen, msg)) = render_q.pop_front() {
                 let doc = match &msg {
                     WorkerMsg::Render(d, ..)
                     | WorkerMsg::RenderTile(d, ..)
@@ -1057,9 +1108,15 @@ impl PdfWorker {
                 // L2.3：出队 drop——`enqueue-n_gen < navigate_gen[doc]` → 直接丢弃不渲。
                 // 快速连续跳时旧世代请求（中间落点页）不再白白消耗 pdfium 带宽；`continue`
                 // 跳过渲染与回传（rx 由 view 侧大跳清 pending 时已 drop，静默无副作用）。
+                // Z2：同理 `enqueue-zoom < zoom_epoch_mirror[doc]` → drop（缩放**中间档**的
+                // cover/瓦片/preview 留在队列也是白烧带宽；最终档请求 stamp==镜像必过）。
                 if let Some(d) = doc {
                     let cur = navigate_gen.get(&d).copied().unwrap_or(0);
                     if n_gen < cur {
+                        continue;
+                    }
+                    let zcur = zoom_epoch_mirror.get(&d).copied().unwrap_or(0);
+                    if z_gen < zcur {
                         continue;
                     }
                 }
@@ -1104,15 +1161,19 @@ impl PdfWorker {
                 continue;
             }
             // 2) LOD 占位：Mid（中清）> Thumb（缩略），低于渲染、高于其余。
-            if let Some((n_gen, msg)) = mid_q.pop_front() {
+            if let Some((n_gen, z_gen, msg)) = mid_q.pop_front() {
                 let doc = match &msg {
                     WorkerMsg::Mid(d, ..) => Some(*d),
                     _ => unreachable!("mid_q 只入 Mid"),
                 };
-                // L2.3：同 render_q 的世代 drop（旧世代中清占位不渲）。
+                // L2.3 + Z2：同 render_q 的世代/缩放 drop（旧世代中清占位不渲）。
                 if let Some(d) = doc {
                     let cur = navigate_gen.get(&d).copied().unwrap_or(0);
                     if n_gen < cur {
+                        continue;
+                    }
+                    let zcur = zoom_epoch_mirror.get(&d).copied().unwrap_or(0);
+                    if z_gen < zcur {
                         continue;
                     }
                 }
@@ -1132,15 +1193,19 @@ impl PdfWorker {
                 }
                 continue;
             }
-            if let Some((n_gen, msg)) = thumb_q.pop_front() {
+            if let Some((n_gen, z_gen, msg)) = thumb_q.pop_front() {
                 let doc = match &msg {
                     WorkerMsg::Thumb(d, ..) => Some(*d),
                     _ => unreachable!("thumb_q 只入 Thumb"),
                 };
-                // L2.3：同 render_q 的世代 drop（旧世代缩略图占位不渲）。
+                // L2.3 + Z2：同 render_q 的世代/缩放 drop（旧世代缩略图占位不渲）。
                 if let Some(d) = doc {
                     let cur = navigate_gen.get(&d).copied().unwrap_or(0);
                     if n_gen < cur {
+                        continue;
+                    }
+                    let zcur = zoom_epoch_mirror.get(&d).copied().unwrap_or(0);
+                    if z_gen < zcur {
                         continue;
                     }
                 }
@@ -1164,8 +1229,8 @@ impl PdfWorker {
             //    Search 只登记成分片状态、不在此阻塞；写回类（Annotate/Insert/Delete/Extract/Save）
             //    与注释读回属低频结构操作，放这里不抢栅格化（Render 总是最先出队）。
             //    L2.3 只对 render 类消息做世代 drop；rest 类（Text/Search/Open/写回…）与导航
-            //    世代无关，`n_gen` 恒忽略。
-            if let Some((_gen, msg)) = rest_q.pop_front() {
+            //    世代无关，`n_gen` 恒忽略（zoom stamp 同理，非渲染类不参与世代比对）。
+            if let Some((_gen, _z, msg)) = rest_q.pop_front() {
                 match msg {
                     WorkerMsg::Open(doc_id, bytes, tx) => {
                         let t0 = std::time::Instant::now();
@@ -1221,6 +1286,8 @@ impl PdfWorker {
                         // L1/L2：导航世代 map 随文档清理（同 recolor_epoch 防残留键增长，
                         // 且防 doc_id 复用读到旧世代把新渲请求全部误 drop）。
                         navigate_gen.remove(&doc_id);
+                        // Z2：缩放世代 map 随文档清理（同 navigate_gen 防残留键增长）。
+                        zoom_epoch_mirror.remove(&doc_id);
                         last_refreshed.remove(&doc_id);
                         // 未着色原图缓存随文档一起清理（释放 CPU 内存，防跨文档残留）。
                         raw_cache.remove(&doc_id);
@@ -1475,13 +1542,13 @@ impl PdfWorker {
             //    `SetRecolor`/`RecolorRefresh`/`Navigate` 与上方 sweep 走同一拦截：收到当下应用，
             //    不入桶（否则经 enqueue_msg 落到 rest_q 会撞 `_ => unreachable!` 把工作线程打死）。
             match rx.recv() {
-                Ok((_gen, WorkerMsg::SetRecolor(doc_id, params, epoch))) => {
+                Ok((_gen, _z, WorkerMsg::SetRecolor(doc_id, params, epoch))) => {
                     // BLOCK：与上方 sweep 同一「采纳 view 世代」语义（见该分支注释）。
                     let cur = recolor_epoch.get(&doc_id).copied().unwrap_or(0);
                     recolor_epoch.insert(doc_id, cur.max(epoch));
                     recolor.insert(doc_id, params);
                 }
-                Ok((_gen, WorkerMsg::RecolorRefresh(doc_id, keys, tx))) => {
+                Ok((_gen, _z, WorkerMsg::RecolorRefresh(doc_id, keys, tx))) => {
                     start_recolor_refresh(
                         &mut pending_refresh,
                         &mut last_refreshed,
@@ -1491,13 +1558,18 @@ impl PdfWorker {
                         tx,
                     );
                 }
-                Ok((_gen, WorkerMsg::Navigate(doc_id, nav))) => {
+                Ok((_gen, _z, WorkerMsg::Navigate(doc_id, nav))) => {
                     // L1/L2：与上方 sweep 同一「采纳 view 导航世代」语义（view 唯一真源）。
                     let cur = navigate_gen.get(&doc_id).copied().unwrap_or(0);
                     navigate_gen.insert(doc_id, cur.max(nav));
                 }
-                Ok((n_gen, msg)) => {
-                    enqueue_msg((n_gen, msg), &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q);
+                Ok((_gen, _z, WorkerMsg::SetZoomEpoch(doc_id, zoom))) => {
+                    // Z2：与上方 sweep 同一「采纳 view 缩放世代」语义（view 唯一真源）。
+                    let cur = zoom_epoch_mirror.get(&doc_id).copied().unwrap_or(0);
+                    zoom_epoch_mirror.insert(doc_id, cur.max(zoom));
+                }
+                Ok((n_gen, z_gen, msg)) => {
+                    enqueue_msg((n_gen, z_gen, msg), &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q);
                 }
                 Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
             }
@@ -1510,19 +1582,19 @@ impl PdfWorker {
 /// 调度语义完全一致，只是每轮取舍从 O(n) 扫描降为 O(1) 取桶头。
 /// `(n_gen, msg)` = L2.2 通道包装（view 发送时打戳 enqueue-n_gen；出队时 render 类按世代 drop）。
 fn enqueue_msg(
-    (n_gen, msg): (u64, WorkerMsg),
-    render_q: &mut VecDeque<(u64, WorkerMsg)>,
-    mid_q: &mut VecDeque<(u64, WorkerMsg)>,
-    thumb_q: &mut VecDeque<(u64, WorkerMsg)>,
-    rest_q: &mut VecDeque<(u64, WorkerMsg)>,
+    (n_gen, z_gen, msg): (u64, u64, WorkerMsg),
+    render_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
+    mid_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
+    thumb_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
+    rest_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
 ) {
     match msg {
         WorkerMsg::Render(..) | WorkerMsg::RenderTile(..) | WorkerMsg::RenderPreview(..) => {
-            render_q.push_back((n_gen, msg))
+            render_q.push_back((n_gen, z_gen, msg))
         }
-        WorkerMsg::Mid(..) => mid_q.push_back((n_gen, msg)),
-        WorkerMsg::Thumb(..) => thumb_q.push_back((n_gen, msg)),
-        _ => rest_q.push_back((n_gen, msg)),
+        WorkerMsg::Mid(..) => mid_q.push_back((n_gen, z_gen, msg)),
+        WorkerMsg::Thumb(..) => thumb_q.push_back((n_gen, z_gen, msg)),
+        _ => rest_q.push_back((n_gen, z_gen, msg)),
     }
 }
 
@@ -2295,8 +2367,10 @@ fn render_page(
 ) -> Option<RenderResult> {
     let page = doc.pages().get(req.page as i32).ok()?;
     let (pw, ph) = (page.width().value, page.height().value);
-    let w = (pw * req.scale).ceil().max(1.0) as i32;
-    let h = (ph * req.scale).ceil().max(1.0) as i32;
+    // 与 view 侧 `layout::page_bitmap_size` 共用同一套取整（含 1:1 稳定化）：位图宽必须
+    // 与显示矩形（设备像素取整）逐纹素一致，否则 GPU 双线性重采样发糊。
+    let (bw, bh) = crate::pdf::layout::page_bitmap_size((pw, ph), req.scale);
+    let (w, h) = (bw as i32, bh as i32);
     let t1 = std::time::Instant::now();
     let bmp = page.render(w, h, None).ok()?;
     // pdfium-render 的 `PdfBitmap::render()` 用 `PdfBitmapFormat::default()`（= BGRA）建位图，
@@ -3321,23 +3395,23 @@ mod tests {
     /// 与回归 `fast_band_dispatches_full_covers_without_tiles`）。
     #[test]
     fn enqueue_msg_keeps_cover_and_tile_in_one_fifo() {
-        let mut render_q: VecDeque<(u64, WorkerMsg)> = VecDeque::new();
-        let mut mid_q: VecDeque<(u64, WorkerMsg)> = VecDeque::new();
-        let mut thumb_q: VecDeque<(u64, WorkerMsg)> = VecDeque::new();
-        let mut rest_q: VecDeque<(u64, WorkerMsg)> = VecDeque::new();
+        let mut render_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut mid_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut thumb_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut rest_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         let (tx, _rx) = mpsc::channel::<Option<RenderResult>>();
         let (ttx, _trx) = mpsc::channel::<Option<TileResult>>();
         // 先入队的封面 → 再入队的瓦片（跨帧真实次序：首屏封面早于后到的瓦片）。
-        // L2.2 通道包装：发送时打戳 enqueue-n_gen（此处模拟 view 常规态 n_gen=0）。
+        // L2.2 通道包装：发送时打戳 enqueue-n_gen（此处模拟 view 常规态 n_gen=0、z=0）。
         enqueue_msg(
-            (0, WorkerMsg::Render(7, RenderRequest { page: 7, scale: 2.0 }, tx)),
+            (0, 0, WorkerMsg::Render(7, RenderRequest { page: 7, scale: 2.0 }, tx)),
             &mut render_q,
             &mut mid_q,
             &mut thumb_q,
             &mut rest_q,
         );
         enqueue_msg(
-            (0, WorkerMsg::RenderTile(7, TileRequest { page: 7, scale: 2.0, tile_size: 512, row: 0, col: 1 }, ttx)),
+            (0, 0, WorkerMsg::RenderTile(7, TileRequest { page: 7, scale: 2.0, tile_size: 512, row: 0, col: 1 }, ttx)),
             &mut render_q,
             &mut mid_q,
             &mut thumb_q,
@@ -3346,11 +3420,11 @@ mod tests {
         assert_eq!(render_q.len(), 2, "Render 与 RenderTile 应同居 render_q");
         // 跨类 FIFO：先到的封面必须先于后到的瓦片出队（否则首屏封面被瓦片压住）。
         assert!(
-            matches!(render_q.pop_front(), Some((_, WorkerMsg::Render(..)))),
+            matches!(render_q.pop_front(), Some((_, _, WorkerMsg::Render(..)))),
             "先到的封面应先出队"
         );
         assert!(
-            matches!(render_q.pop_front(), Some((_, WorkerMsg::RenderTile(..)))),
+            matches!(render_q.pop_front(), Some((_, _, WorkerMsg::RenderTile(..)))),
             "后到的瓦片随后出队"
         );
         assert_eq!(mid_q.len() + thumb_q.len() + rest_q.len(), 0, "其余桶应空");
