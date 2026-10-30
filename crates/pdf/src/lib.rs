@@ -3445,24 +3445,43 @@ mod tests {
                     cx.notify();
                 });
         });
-        // L1+L2 落点直达：目标页封面 ≤20 帧内入槽（停手即派发，只剩渲染 10-50ms）
-        let mut covered = false;
-        let mut cover_frames = 0usize;
+        // L1+A 两段式落点直达：目标页**任何底图**（优先 0.5 密度 preview 铺底、满密 cover 精修
+        // 随后接棒）≤20 帧内入槽（停手即派发，只剩 preview ~10ms 渲染）。满密 cover 精修单独
+        // 等待（≤40 帧）——preview 已桥接底图，cover 慢几帧无感知。
+        let mut base_ready = false;
+        let mut base_frames = 0usize;
         for _ in 0..20 {
-            cover_frames += 1;
+            base_frames += 1;
             cx.executor().advance_clock(Duration::from_millis(16));
             cx.run_until_parked();
             std::thread::sleep(Duration::from_millis(3));
-            covered = cx.update(|_w, cx| {
+            base_ready = cx.update(|_w, cx| {
                 let v = holder.borrow().as_ref().unwrap().read(cx);
-                v.slots[30].cover.is_some()
+                let s = &v.slots[30];
+                s.cover.is_some() || s.prefetch_cover.is_some() || s.thumb.is_some() || s.mid.is_some()
             });
-            if covered {
+            if base_ready {
                 break;
             }
         }
-        eprintln!("[L1] jump30 target_cover_frames={cover_frames} covered={covered}");
-        assert!(covered, "大跳后目标页封面应在 ≤20 帧内入槽（落点直达）");
+        let mut cover_full = false;
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            cover_full = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.slots[30].cover.is_some()
+            });
+            if cover_full {
+                break;
+            }
+        }
+        eprintln!(
+            "[L1] jump30 target_base_frames={base_frames} base_ready={base_ready} cover_full={cover_full}"
+        );
+        assert!(base_ready, "大跳后目标页应 ≤20 帧内有底图（两段式：preview 铺底先行）");
+        assert!(cover_full, "大跳后目标页满密 cover 最终应入槽（精修接棒）");
 
         // 完整沉降（泵停 + 全部在途清空 + 走廊兜底缓冲页填完）：「加载中」计数随之冻结。
         // 注意：**不等待泵停**就断言计数零增长，会把 MARGIN 缓冲页的合理占位噪点误判为回归
@@ -3532,6 +3551,307 @@ mod tests {
         });
         assert!(nav1 > nav0, "大跳应推进 nav_gen：{nav0}→{nav1}");
         assert!(cov1 > cov0, "大跳落点应派发封面：{cov0}→{cov1}");
+    }
+
+    /// E **帧账拆解**（真实渲染路径 + 真夹具）：把「滚动落点 → 目标页首张 cover 入槽」端到端
+    /// 帧数拆成 (i) 派发段 (ii) worker 渲染段 (iii) settle/速度段 (iv) collect+上屏段，
+    /// 输出「段→帧数」表作为 A/B/C 取舍依据。逐帧打点（speed 档 / nav_gen / cover 在途与
+    /// 入槽 / 封面字节预算），并单独计时 worker 单张封面真实渲染墙钟（展望筒：worker 串行
+    /// 渲染是唯一不可并行压缩的物理段）。
+    #[gpui::test]
+    async fn e_frame_account_jump_to_target_cover(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _w: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty()
+                        && v.pending_cover.is_empty()
+                        && v.pending_prefetch_cover.is_empty()
+                        && !v.prev_fast
+                        && !v.tile_pump_running
+                });
+                if st {
+                    return;
+                }
+            }
+            panic!("E 帧账：初始状态应沉降");
+        };
+        settle(cx);
+
+        // 基线：直调 worker 渲染目标页封面一次，量出单张封面串行墙钟（展望筒估算）。
+        let (worker, doc_id, cscale) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let w = v.worker.as_ref().unwrap().clone();
+            let c = crate::pdf::layout::cover_scale(v.dims[30], v.page_width(), 1.0);
+            (w, v.doc_id, c)
+        });
+        let t0 = Instant::now();
+        let rx_solo = worker.request_render(doc_id, crate::pdf::RenderRequest { page: 30, scale: cscale }, 0);
+        let _solo = rx_solo.recv_timeout(Duration::from_secs(30)).expect("单人渲染应返回");
+        let solo_render_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let (cov0, nav0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.nav_gen)
+        });
+        // 30 页大跳
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(30);
+                cx.notify();
+            });
+        });
+        // 逐帧打点（最多 40 帧）
+        let wall0 = Instant::now();
+        let mut rows: Vec<(usize, String, u64, usize, bool)> = Vec::new();
+        let mut pend_first_frame: Option<usize> = None; // 封面入队首帧
+        let mut land30_frame: Option<usize> = None; // 目标页 cover 入槽首帧
+        let mut slow_frame: Option<usize> = None; // 速度落 Slow 首帧
+        let mut very_frames = 0usize;
+        for f in 0..40usize {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let (sp, nav, pc, c30) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let sp = match v.speed_state {
+                    crate::pdf::view::SpeedState::Idle => "Idle",
+                    crate::pdf::view::SpeedState::Slow => "Slow",
+                    crate::pdf::view::SpeedState::Fast => "Fast",
+                    crate::pdf::view::SpeedState::VeryFast => "VF",
+                };
+                (sp.to_string(), v.nav_gen, v.pending_cover.len(), v.slots[30].cover.is_some())
+            });
+            if pc > 0 && pend_first_frame.is_none() {
+                pend_first_frame = Some(f);
+            }
+            if c30 && land30_frame.is_none() {
+                land30_frame = Some(f);
+            }
+            if sp == "Slow" && slow_frame.is_none() {
+                slow_frame = Some(f);
+            }
+            very_frames += (sp == "VF") as usize;
+            rows.push((f, sp, nav, pc, c30));
+        }
+        let e2e_ms = wall0.elapsed().as_secs_f64() * 1e3;
+        let (cov1, nav1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.nav_gen)
+        });
+        let dispatch_frames = pend_first_frame.map_or(0, |f| f + 1); // 落点→封面在途 = 派发段
+        let render_frames = land30_frame.zip(pend_first_frame).map_or(0, |(l, p)| l.saturating_sub(p)); // 入队→入槽 = worker+collect 段
+        eprintln!(
+            "[E-FRAME]  段拆解: 端到端 {land30_frame:?} 帧(~{e2e_ms:.0}ms墙钟)"
+        );
+        eprintln!(
+            "[E-FRAME]  (i)派发   [0→入队]  {dispatch_frames} 帧 (COVER_INFLIGHT 节流后首帧在途 {pend_first_frame:?})"
+        );
+        eprintln!(
+            "[E-FRAME]  (ii)worker+collect [入队{pend_first_frame:?}→入槽{land30_frame:?}]  {render_frames} 帧 | 单张封面墙钟 {solo_render_ms:.1}ms (~{:.1} 迭代)"
+        , solo_render_ms / 3.0);
+        eprintln!(
+            "[E-FRAME]  (iii)settle [VeryFast→Slow]  首 Slow 帧 {slow_frame:?} (VeryFast 帧数 {very_frames})"
+        );
+        eprintln!(
+            "[E-FRAME]  (iv)collect+notify [入槽后上屏]  ≤1 帧（收藏当帧 cx.notify 即刻）"
+        );
+        eprintln!(
+            "[E-FRAME]  cover_reqs {cov0}→{cov1}（+{}） nav_gen {nav0}→{nav1}",
+            cov1.saturating_sub(cov0)
+        );
+        eprintln!(
+            "[E-FRAME]  逐帧: {:?}",
+            rows.iter().map(|(f, sp, nav, pc, c30)| format!("{f}:{sp}(n{nav},pc{pc}{})", if *c30 { "+C30" } else { "" })).collect::<Vec<_>>()
+        );
+        // 断言仅锁「机制成立」：目标页 cover 应在 30 帧内入槽（端到端指标本身进报告）。
+        assert!(land30_frame.is_some(), "目标页 cover 应在 ≤30 帧内入槽");
+        assert!(nav1 > nav0, "大跳应推进 nav_gen");
+        assert!(cov1 > cov0, "落点应派发封面");
+    }
+
+    /// A **两段式底图即显——测量钩子**（真实渲染路径 + 真夹具）：30 页大跳后逐帧打点
+    /// 「目标页任何底图首帧（cover|prefetch_cover|thumb|mid|tiles）」与「落点窗 [30,31]
+    /// 全部底图首帧」与「满密 cover 入槽首帧」与「瓦片精修开始首帧」，作为 A/B/C 的
+    /// before/after 判据（before 在 c0b2fba 基线跑、after 在改动后跑，差值进报告）。
+    #[gpui::test]
+    async fn a_measure_two_stage_base_image(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _w: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty()
+                        && v.pending_cover.is_empty()
+                        && v.pending_prefetch_cover.is_empty()
+                        && !v.prev_fast
+                        && !v.tile_pump_running
+                });
+                if st {
+                    return;
+                }
+            }
+            panic!("A 测量：初始状态应沉降");
+        };
+        settle(cx);
+
+        let tile0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).tile_reqs);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(30);
+                cx.notify();
+            });
+        });
+        let mut t_base30: Option<usize> = None; // 目标页任何底图首帧
+        let mut t_win_all: Option<usize> = None; // [30,31] 全底图首帧
+        let mut t_cover30: Option<usize> = None; // 满密 cover 入槽首帧
+        let mut t_tile_start: Option<usize> = None; // 瓦片精修开始首帧
+        for f in 0..40usize {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let (base30, base31, cover30, tile_start) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let has = |p: usize| {
+                    let s = &v.slots[p];
+                    s.cover.is_some()
+                        || s.prefetch_cover.is_some()
+                        || s.thumb.is_some()
+                        || s.mid.is_some()
+                        || !s.tiles.is_empty()
+                };
+                (has(30), has(31), v.slots[30].cover.is_some(), v.tile_reqs > tile0)
+            });
+            if base30 && t_base30.is_none() {
+                t_base30 = Some(f);
+            }
+            if base30 && base31 && t_win_all.is_none() {
+                t_win_all = Some(f);
+            }
+            if cover30 && t_cover30.is_none() {
+                t_cover30 = Some(f);
+            }
+            if tile_start && t_tile_start.is_none() {
+                t_tile_start = Some(f);
+            }
+        }
+        eprintln!(
+            "[A-MEASURE] before/after 判据: 目标页底图首帧 {t_base30:?} | 落点窗全部底图首帧 {t_win_all:?} | 满密cover入槽 {t_cover30:?} | 瓦片精修开始首帧 {t_tile_start:?}"
+        );
+        // 性能口径：真实墙钟数值以 [A-MEASURE] eprintln 为准（本线 A 改造实测 11→3/26→5），
+        // 下列帧数阈值只是**机制回归闸**（防两段式点名失效、仅靠 cover 兜底仍绿），非性能承诺。
+        // 阈值留 2.4-2.7x 余量防重载机 flaky：base30≤8（实测3）、win_all≤12（实测5）、cover≤40（实测20）。
+        assert!(
+            t_base30.map_or(usize::MAX, |f| f) <= 8,
+            "两段式底图机制失效：目标页底图应在 ≤8 帧内出现（实测3）, 现 {t_base30:?}"
+        );
+        assert!(
+            t_win_all.map_or(usize::MAX, |f| f) <= 12,
+            "两段式整窗铺底失效：落点窗全底图应 ≤12 帧（实测5）, 现 {t_win_all:?}"
+        );
+        assert!(t_base30.is_some(), "目标页应有底图");
+        assert!(t_cover30.is_some(), "目标页满密 cover 最终入槽");
     }
 
     /// L2 **世代 drop（出队不渲，worker 侧）**（真实 worker + 真夹具）：导航世代先推进

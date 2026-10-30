@@ -537,8 +537,12 @@ impl PdfViewer {
             if page >= self.dims.len() {
                 continue;
             }
-            // 满密度封面已在位/在途 → 走廊结果作废（不与其竞争显示）。
-            if self.slots[page].cover.is_some() || self.pending_cover.contains_key(&page) {
+            // 满密度封面**已入槽** → 走廊结果作废（不与其竞争显示、不留冗余双底图）。
+            // ⚠️ **不再因「封面在途」作废**（A 两段式底图前提）：跳变/常态滚动时满密 cover
+            // 渲染 ~30ms（串行），在途期间让 0.5 密度 preview 先入槽作过渡底图（替换「加载中」），
+            // cover 到位后 `page_base_image` 自然以 cover 优先、preview 仍留 slot（受 40MB 预算
+            // 逐出）——只省下「到达的廉价渲染被白弃」的浪费，不改变任何预算/驻留上限。
+            if self.slots[page].cover.is_some() {
                 continue;
             }
             let Ok(img) = render_image_from_bgra(res.bgra, res.width, res.height) else {
@@ -1408,6 +1412,10 @@ impl PdfViewer {
             {
                 // 直落 Slow：绕过 0.7ⁿ 衰减，`schedule_tiles`（含封面）即刻接管落点。prev_fast
                 // 派生同步为 false（`Slow.is_fast()==false`），泵/门控/文本预取等消费点同相。
+                // C 实测（E 帧账）：跳变 end-to-end 已由自然 EMA 衰减在 2 帧内降入 Slow、无
+                // 弹回（首 Slow f2 由 velocity < very_exit 自然触发，早于 K=3 stop 检测）——
+                // 同帧归零 velocity 实测首 Slow 帧/VF 帧数零变化 ⇒ 无帧数收益，按「无收益即
+                // 舍弃」已还原，仅保留 K=3 防误触停稳检测。
                 self.speed_state = SpeedState::Slow;
                 self.prev_fast = false;
             }
@@ -1506,20 +1514,90 @@ impl PdfViewer {
             self.jump_armed = false;
             return;
         }
-        // 落点窗按滚动方向与 normal 封面窗同义（可见页 + 方向前瞻 1）；每次大跳 ≤ COVER_INFLIGHT
-        // 满密度封面，妨碍当前 COVER_INFLIGHT 额度内的派发。
+        // 落点窗按滚动方向与 normal 封面窗同义（可见页 + 方向前瞻 1）。
         let (cf, cl) = match self.scroll_dir {
             1 => (target.min(n - 1), (target + 1).min(n - 1)),
             -1 => (target.saturating_sub(1), target.min(n - 1)),
             _ => (target.saturating_sub(1), (target + 1).min(n - 1)),
         };
-        self.schedule_covers(cf, cl, target, None, page_width, scale_factor);
-        // 落点窗全部在槽/在途 → 清零 jump_armed（后续常态调度接管）。
-        let all_covered =
-            (cf..=cl).all(|p| self.slots[p].cover.is_some() || self.pending_cover.contains_key(&p));
+        // A **两段式底图即显**：跳变突发先把落点整窗以 0.5 密度 RenderPreview 底图**一帧铺满**
+        // （~1-6ms/张，替换「第 N 页 加载中…」占位）——目标页「有底图」从 ~11 帧（满密 cover
+        // 30ms 串行渲染）压到 ~1-2 帧（low-cost preview 先行）；满密 cover→tile 精修交给停稳后
+        // 既有常态调度（schedule_tiles），弹跳窗始终有底图桥接、绝不闪空白。
+        //
+        // ⚠️ **此处特意不派满密 cover**：`collect_prefetch_cover_results` 的守卫对「满密封面
+        // 在途页」直接丢弃 preview（防与封面竞争显示）。若同时派 cover+preview，preview 会在
+        // cover（30ms）仍排队时被弃 → 双渲全白、底图仍等 cover 30ms。二选一时选 preview：
+        // 「更快有底图」是本线目标；精修由停稳调度照常完成。preview 入 `slot.prefetch_cover`
+        // （独立槽），不作废/不覆盖任何满密底图，换档期间存续（L3.4 不变式同源守护）。
+        //
+        // 一次性突发（跳变当帧、非稳态节流），每页至多一次：突破 [`PRE_FETCH_COVER_INFLIGHT`]
+        // =2/帧 的常态节流以整窗一帧铺底，但 0.5 密度字节仍由
+        // [`PREFETCH_COVER_BUDGET_BYTES`]=40MB 的 evict 全局封顶（旁路照常 `evict_prefetch_covers`
+        // 每日回收），不改变任何预算语义。
+        self.dispatch_jump_preview_base(cf, cl, page_width, scale_factor);
+        // 落点窗 preview 全部在槽/在途 → 清零 jump_armed（后续由停稳常态调度接管精修；
+        // 已有满密 cover 也计入「已有底图」）。
+        let all_covered = (cf..=cl).all(|p| {
+            self.slots[p].cover.is_some()
+                || self.slots[p].prefetch_cover.is_some()
+                || self.pending_cover.contains_key(&p)
+                || self.pending_prefetch_cover.contains_key(&p)
+        });
         if all_covered {
             self.jump_armed = false;
             self.jump_target = None;
+        }
+    }
+
+    /// A 两段式底图（第一段：低成本铺底）：对落点窗 `cf..=cl` 内**尚无任何底图**的页一次性
+    /// 派发 0.5 密度 RenderPreview（1.6ms/张量级），一帧内把「加载中」占位替换为可辨识底图。
+    /// 与 `prefetch_corridor` 同款请求（不入 raw 缓存、不参与重着色刷新、瞬态低清），只突破
+    /// 常态 2/帧 节流（见调用方注释，受 40MB 预算 evict 兜底）。
+    fn dispatch_jump_preview_base(
+        &mut self,
+        cf: usize,
+        cl: usize,
+        page_width: f32,
+        scale_factor: f32,
+    ) {
+        let Some(worker) = self.worker.clone() else {
+            return;
+        };
+        let n = self.dims.len();
+        for page in cf..=cl.min(n.saturating_sub(1)) {
+            if page >= n {
+                continue;
+            }
+            let slot = &self.slots[page];
+            // 已有任何底图（满密/廊/缩略/中清）或在途 → 跳过（不重复派发）。
+            if slot.cover.is_some()
+                || slot.prefetch_cover.is_some()
+                || slot.thumb.is_some()
+                || slot.mid.is_some()
+            {
+                continue;
+            }
+            if self.pending_cover.contains_key(&page)
+                || self.pending_prefetch_cover.contains_key(&page)
+            {
+                continue;
+            }
+            let dim = self.dims[page];
+            let cscale = cover_scale(dim, page_width, scale_factor);
+            let pscale = (cscale * config::pdf::PREFETCH_COVER_DENSITY)
+                .min(config::pdf::COVER_SCALE_CAP);
+            if !cover_affordable(dim, pscale) {
+                continue;
+            }
+            let rx = worker.request_render_preview(
+                self.doc_id,
+                RenderRequest { page, scale: pscale },
+                self.nav_gen, // L2.2 enqueue-gen（跳变后续世代推进可清 stale，只渲最新落点）
+            );
+            self.raster_reqs += 1;
+            self.prefetch_reqs += 1; // F4 观测计数（跳变铺底也计走廊预取，预算/收敛语义一致）
+            self.pending_prefetch_cover.insert(page, (pscale, self.nav_gen, rx));
         }
     }
 
