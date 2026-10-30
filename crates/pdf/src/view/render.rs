@@ -429,6 +429,16 @@ impl PdfViewer {
             // 缩放过渡期兜底：旧密度封面（schedule_tiles 从 cover 移入）在新密度封面到位前
             // 按新页宽 CSS 拉伸铺满，防「Ctrl+滚轮缩放期间每档闪一次『加载中』」空白。
             let slot_prev_cover = slot.prev_cover.clone();
+            // **P1 ③（邻居降档封面入视防闪白）**：邻居页封面降到 ~2.0 档后，入视首帧若恰逢
+            // VeryFast（纯平移不跑 schedule 迁移 stale→prev_cover），该 2.0 封面仍在 slot.cover、
+            // 密度 ≠ 当前 cscale → `slot_cover` 缺席 → 无底图 → 闪「加载中」。把「密度不符但在位
+            // 的低档封面」也纳入过渡底图链（与 prev_cover 同角色、CSS 拉伸铺满）；schedule 随后
+            // 迁移 + 满密重派，或满密封面到位即替换——过渡期屏显恒有底图。
+            let slot_cover_stale = if slot_cover.is_some() || slot.cover_scale.abs() <= 1e-4 {
+                None
+            } else {
+                slot.cover.clone()
+            };
             // F4 空闲预取走廊封面（0.5 密度整页）：高速平移切入的新页在满密度封面/瓦片
             // 就位前的即时底图（瓦片未到、封面在途时 CSS 拉伸铺满，优于「加载中」白块）。
             // **S2 修正（评审 BLOCK①）**：仅当**当前 cscale 密度** cover 在位才隐藏 preview；
@@ -444,11 +454,15 @@ impl PdfViewer {
                             > 1e-4
                 });
             // 底图选择提前（本帧「同帧不混叠」门控的输入之一）：当前密度封面 → 旧密度封面
-            // 拉伸兜底 → 空闲预取走廊封面 → 中清 → 缩略图。缩放期不闪白（宁可瞬时模糊也
-            // 要有底图）；全空（首开/极速拖动）才落「加载中」占位。
+            // 拉伸兜底（prev_cover 平移过渡桥 / P1 ③ 低档在位封面）→ 空闲预取走廊封面 → 中清
+            // → 缩略图。缩放期不闪白（宁可瞬时模糊也要有底图）；全空（首开/极速拖动）才落
+            // 「加载中」占位。
+            let cover_stale = slot_prev_cover
+                .as_ref()
+                .or(slot_cover_stale.as_ref());
             let base = page_base_image(
                 slot_cover.as_ref(),
-                slot_prev_cover.as_ref(),
+                cover_stale,
                 slot_prefetch.as_ref(),
                 slot_mid.as_ref(),
                 slot_thumb.as_ref(),
@@ -474,13 +488,14 @@ impl PdfViewer {
                 group_complete = self
                     .page_visible_rect(i, scroll_y, viewport_h, page_width, wrap_w)
                     .and_then(|rect| {
-                        crate::pdf::layout::visible_tile_range(
+                        crate::pdf::layout::visible_tile_range_axis(
                             bmp,
                             page_width,
                             disp_h,
                             rect,
                             TILE_SIZE,
                             TILE_MARGIN,
+                            config::pdf::TILE_MARGIN_COL,
                         )
                     })
                     .is_some_and(|(r0, c0, r1, c1)| {

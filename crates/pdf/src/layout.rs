@@ -72,9 +72,11 @@ pub(crate) struct TileSlot {
 }
 
 impl TileSlot {
-    /// 瓦片占用的近似内存字节（RGBA）。
+    /// 瓦片占用的近似内存字节（RGBA 4BPP / **R8 luma 1BPP**——P2 门控激活时瓦片按单通道
+    /// 亮度编码，-4×；其他路径维持 RGBA）。误按 4BPP 会高估 4×、破坏预算语义。
     pub(crate) fn bytes(&self) -> u64 {
-        (self.w as u64) * (self.h as u64) * 4
+        let bpp = if self.image.is_luma(0) { 1 } else { 4 };
+        (self.w as u64) * (self.h as u64) * bpp
     }
 }
 
@@ -368,14 +370,16 @@ pub(crate) fn tile_range_all_in_slot(
 
 /// 给定卡片局部可见矩形（CSS px，已夹在页内），推算需要覆盖的瓦片网格区间，
 /// 返回 `(row0, col0, row1, col1)`（含端点，已夹进网格）。`rect = (x0, y0, x1, y1)`。
-/// 视口外缘再外扩 `margin` 格以缓冲滚动。无交点 → `None`。
-pub(crate) fn visible_tile_range(
+/// 纵轴（滚动方向）外扩 `row_margin` 格、横轴（跨列/平移方向）外扩 `col_margin` 格以缓冲
+/// 滚动/P1 ①：横向焊死 0，宽轴不再整列进钉住集。无交点 → `None`。
+pub(crate) fn visible_tile_range_axis(
     bmp: (u32, u32),
     display_w: f32,
     disp_h: f32,
     rect: (f32, f32, f32, f32),
     tile_size: u32,
-    margin: u32,
+    row_margin: u32,
+    col_margin: u32,
 ) -> Option<(u32, u32, u32, u32)> {
     if tile_size == 0 {
         return None;
@@ -392,10 +396,10 @@ pub(crate) fn visible_tile_range(
     let clamp = |v: i64, max: i64| -> u32 { v.clamp(0, max.max(0)) as u32 };
     let cell = tile_size as i64;
     // 位图像素区间 → 网格格号区间（含端点）
-    let c0 = ((rx0 / sx) / cell as f32).floor() as i64 - (margin as i64);
-    let c1 = ((rx1 / sx - 1.0).max(0.0) / cell as f32).floor() as i64 + (margin as i64);
-    let r0 = ((ry0 / sy) / cell as f32).floor() as i64 - (margin as i64);
-    let r1 = ((ry1 / sy - 1.0).max(0.0) / cell as f32).floor() as i64 + (margin as i64);
+    let c0 = ((rx0 / sx) / cell as f32).floor() as i64 - (col_margin as i64);
+    let c1 = ((rx1 / sx - 1.0).max(0.0) / cell as f32).floor() as i64 + (col_margin as i64);
+    let r0 = ((ry0 / sy) / cell as f32).floor() as i64 - (row_margin as i64);
+    let r1 = ((ry1 / sy - 1.0).max(0.0) / cell as f32).floor() as i64 + (row_margin as i64);
     let c0 = clamp(c0, cols as i64 - 1);
     let c1 = clamp(c1, cols as i64 - 1);
     let r0 = clamp(r0, rows as i64 - 1);
@@ -406,6 +410,20 @@ pub(crate) fn visible_tile_range(
     Some((r0, c0, r1, c1))
 }
 
+/// 兼容入口：等 margin 双轴（旧约束语义不变，仅纯函数测试沿用；生产路径一律走
+/// `visible_tile_range_axis`）。测试专用，避免非测试构建 dead_code 告警。
+#[cfg(test)]
+pub(crate) fn visible_tile_range(
+    bmp: (u32, u32),
+    display_w: f32,
+    disp_h: f32,
+    rect: (f32, f32, f32, f32),
+    tile_size: u32,
+    margin: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    visible_tile_range_axis(bmp, display_w, disp_h, rect, tile_size, margin, margin)
+}
+
 /// 「整页锐化封面」是否廉价可整渲：该密度下整页位图字节 ≤ [`COVER_SIZE_BUDGET`] 时，
 /// 一个 `render_page` 即铺满首屏（再把瓦片叠上来精修）；超预算（高倍缩放/超大页）→
 /// 纯瓦片路径。
@@ -413,7 +431,12 @@ pub(crate) fn cover_affordable(page_pt: (f32, f32), scale: f32) -> bool {
     if scale < 0.2 || page_pt.0 <= 0.0 || page_pt.1 <= 0.0 {
         return false;
     }
-    let bytes = (page_pt.0 as f64) * (page_pt.1 as f64) * (scale as f64) * (scale as f64) * 4.0;
+    let pixels = (page_pt.0 as f64) * (page_pt.1 as f64) * (scale as f64) * (scale as f64);
+    // P1 ⑤：位图像素面积硬上限（保底护栏，防病理性页把 cover 池顶爆）。
+    if pixels > config::pdf::COVER_AREA_BUDGET as f64 {
+        return false;
+    }
+    let bytes = pixels * 4.0;
     bytes <= config::pdf::COVER_SIZE_BUDGET as f64
 }
 

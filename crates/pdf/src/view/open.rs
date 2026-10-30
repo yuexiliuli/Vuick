@@ -295,6 +295,8 @@ impl PdfViewer {
         if self.recolor == recolor {
             return;
         }
+        // P2：记录翻转前的 R8 门控（GPU + FullBand + ink），用于切档后判定是否需重栅。
+        let old_r8 = crate::recolor::luma_gate_active(self.recolor, self.gpu_recolor);
         self.recolor = recolor;
         // W1：世代随参数**实际变更** +1（在 worker 推送之前，保证 view 世代 ≥ worker 世代；
         // GPU 门控下结果恒为 raw 不涉着色竞态，但世代保持单调无副作用）。view 是世代唯一
@@ -313,14 +315,62 @@ impl PdfViewer {
                 let rx = w.request_recolor_refresh(self.doc_id, self.recolor_scope.clone());
                 self.pending_recolor = Some(rx);
             }
-            // T4 GPU 通道：切档只改图片元素参数（着色在 GPU 绘制时完成）→ 0 重算 0 重栅，
-            // 不发起重着色刷新（worker 又不会现算新副本——门控下它本就跳过 CPU 着色）。
+            // T4 GPU 通道：同门控内的切档只改图片元素参数（着色在 GPU 绘制时完成）→ 0 重算
+            // 0 重栅，不发起重着色刷新（worker 又不会现算新副本——门控下它本就跳过 CPU 着色）。
+        }
+        // P2 GPU 通道 R8 门控翻转：位图数据格式（luma 1BPP ↔ BGRA 4BPP）已变，不能只换图元
+        // 参数（旧格式位图被新参数读取 = 错色）——受影响页**重栅化一次**（用户已接受）。
+        if self.gpu_recolor && old_r8 != crate::recolor::luma_gate_active(self.recolor, self.gpu_recolor)
+        {
+            self.invalidate_page_bitmaps_for_r8_flip();
         }
         // 旧的「清槽重栅失效」已由「重着色刷新」取代（见上方决策留痕）：只复位门控，让
         // 下一帧走一次调度来收集回传结果并重绘；不碰 slots / pending / 在途请求。
         self.window_sig = None;
         self.window_settled = false;
         cx.notify();
+    }
+
+    /// **R8 门控翻转 → 受影响页重栅化一次**（P2 接受口径）：R8 位图（单通道亮度 1BPP）与
+    /// BGRA（4BPP）是**不同数据格式**，不能只改图元参数混显（luma 数据被按 `sample.rgb`
+    /// 读取 = 错色）——门控翻转（`ink` 开↔关 / FullBand 深浅切换）清空显示槽位图 + 丢弃
+    /// 在途请求，下一帧按新格式重派栅格。同门控内的参数微调（纸/墨色值变化）不触发
+    /// （位图格式没变、只改 shader 参数，0 重栅）。旧纹理经 `pending_drops` 显式下线。
+    fn invalidate_page_bitmaps_for_r8_flip(&mut self) {
+        let mut drops: Vec<std::sync::Arc<gpui::RenderImage>> = Vec::new();
+        for slot in self.slots.iter_mut() {
+            if let Some(arc) = slot.cover.take() {
+                drops.push(arc);
+            }
+            if let Some(arc) = slot.prev_cover.take() {
+                drops.push(arc);
+            }
+            if let Some(arc) = slot.thumb.take() {
+                drops.push(arc);
+            }
+            if let Some(arc) = slot.mid.take() {
+                drops.push(arc);
+            }
+            if let Some(arc) = slot.prefetch_cover.take() {
+                drops.push(arc);
+            }
+            slot.cover_scale = 0.0;
+            slot.tile_scale = 0.0;
+            slot.tile_bytes = 0;
+            slot.thumb_loading = false;
+            slot.mid_loading = false;
+            for (_, ts) in slot.tiles.drain() {
+                drops.push(ts.image);
+            }
+        }
+        self.pending_drops.extend(drops);
+        // 丢弃在途请求（rx drop → 结果作废），避免旧格式结果晚到覆盖新槽位。
+        self.pending_cover.clear();
+        self.pending_tiles.clear();
+        self.pending_mid.clear();
+        self.pending_thumb.clear();
+        self.pending_prefetch_cover.clear();
+        self.tile_bytes = 0;
     }
 
     /// 当前**显示槽需要的重着色刷新可见集**（可见集定义）：遍历全部页槽，只收「在位的

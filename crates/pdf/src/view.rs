@@ -158,7 +158,7 @@ use crate::pdf::layout::{
     advance_match_index, bitmap_display_scales, column_left, compute_layout, content_to_local,
     cover_affordable, cover_scale, display_height, first_visible_page, hit_char, keep_window,
     local_to_pt, page_bitmap_size, page_segment_text, pt_to_local, render_scale,
-    selection_spans_pt, visible_tile_range, zoom_rescroll_anchor, Slot, TileSlot,
+    selection_spans_pt, visible_tile_range_axis, zoom_rescroll_anchor, Slot, TileSlot,
 };
 use crate::pdf::{
     render_image_from_bgra, AnnotKind, AnnotateItem, AnnotationInfo, DocId, PageText,
@@ -546,9 +546,15 @@ impl PdfViewer {
             let Some(rect) = self.page_visible_rect(page, sy, viewport_h, pw, wrap_w) else {
                 continue;
             };
-            let Some((r0, c0, r1, c1)) =
-                L::visible_tile_range(bmp, pw, disp_h, rect, TILE_SIZE, TILE_MARGIN)
-            else {
+            let Some((r0, c0, r1, c1)) = L::visible_tile_range_axis(
+                bmp,
+                pw,
+                disp_h,
+                rect,
+                TILE_SIZE,
+                TILE_MARGIN,
+                config::pdf::TILE_MARGIN_COL,
+            ) else {
                 continue;
             };
             let total = (r1 - r0 + 1) * (c1 - c0 + 1);
@@ -1262,6 +1268,7 @@ mod tests {
                     full_h: bmp.1,
                     bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
                     recolor_epoch: 0, // 旧世代（A 色）
+                    luma: false,
                 }));
                 v.pending_tiles.insert((0, 0, 0), (scale, 0, rx));
                 let any = v.collect_tile_results(1.0);
@@ -1286,6 +1293,7 @@ mod tests {
                     full_h: bmp.1,
                     bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
                     recolor_epoch: 1, // 当前世代（B 色）
+                    luma: false,
                 }));
                 v.pending_tiles.insert((0, 0, 0), (scale, 0, rx));
                 let any = v.collect_tile_results(1.0);
@@ -1307,6 +1315,7 @@ mod tests {
                     width: bmp.0,
                     height: bmp.1,
                     recolor_epoch: 0, // 旧世代
+                    luma: false,
                 }));
                 v.pending_cover.insert(0, (cscale, 0, 0, rx)); // 请求世代 0（旧）+ 导航世代 0
                 let any = v.collect_cover_results(1.0);
@@ -1322,6 +1331,7 @@ mod tests {
                     width: bmp.0,
                     height: bmp.1,
                     recolor_epoch: 1, // 当前世代
+                    luma: false,
                 }));
                 v.pending_cover.insert(0, (cscale, 1, 0, rx)); // 请求世代 1（当前）+ 导航世代 0
                 let any = v.collect_cover_results(1.0);
@@ -1632,9 +1642,16 @@ mod tests {
             let rect = v
                 .page_visible_rect(page, scroll_y, viewport_h, pw, wrap_w)
                 .expect("第 0 页应可见");
-            let (r0, c0, r1, c1) =
-                visible_tile_range(bmp, pw, disp_h, rect, TILE_SIZE, TILE_MARGIN)
-                    .expect("可见区应圈中瓦片格");
+            let (r0, c0, r1, c1) = visible_tile_range_axis(
+                bmp,
+                pw,
+                disp_h,
+                rect,
+                TILE_SIZE,
+                TILE_MARGIN,
+                config::pdf::TILE_MARGIN_COL,
+            )
+            .expect("可见区应圈中瓦片格");
             let mut cells: Vec<(u32, u32)> = Vec::new();
             for row in r0..=r1 {
                 for col in c0..=c1 {
@@ -1938,6 +1955,7 @@ mod tests {
                     full_h: bmp.1,
                     bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
                     recolor_epoch: 0,
+                    luma: false,
                 }));
                 v.pending_tiles.insert((0, 0, 0), (scale, 0, rx));
                 // ① collect_tile_results：同密度封面在位 → 新到瓦片被弃、cover 绝不清除。

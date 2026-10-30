@@ -65,6 +65,30 @@ pub fn render_image_from_bgra(bgra: Vec<u8>, w: u32, h: u32) -> Result<Arc<Rende
     Ok(Arc::new(RenderImage::new(vec![Frame::new(buf)])))
 }
 
+/// 由 **R8 单通道感知亮度字节**（`w*h*1`）重建 [`gpui::RenderImage`]（P2：瓦片/封面 R8
+/// 通道）。上传走 Monochrome atlas（1BPP，glyph 同款 `DXGI_FORMAT_R8_UNORM`），GPU shader
+/// 按 R8 读取 —— 存储与传输 -4×。
+pub fn render_image_from_luma(luma: Vec<u8>, w: u32, h: u32) -> Result<Arc<RenderImage>> {
+    Ok(Arc::new(RenderImage::new_luma(vec![gpui::LumaFrame::new(
+        luma, w, h,
+    )])))
+}
+
+/// 按位图数据布局（BGRA 4BPP / R8 luma 1BPP，由 worker 侧 `luma` 标志标定）选择包装路径
+///（view 侧回收结果统一入口）。`luma == true` → 1BPP 亮度包装；否则既有 BGRA 包装。
+pub(crate) fn wrap_render_image(
+    bytes: Vec<u8>,
+    w: u32,
+    h: u32,
+    luma: bool,
+) -> Result<Arc<RenderImage>> {
+    if luma {
+        render_image_from_luma(bytes, w, h)
+    } else {
+        render_image_from_bgra(bytes, w, h)
+    }
+}
+
 /// 进程单调时钟（自**首个**计时日志起算的毫秒数）：`parser`（worker 侧）与 `view`
 /// （主线程侧）的所有计时日志统一用它加时间戳——便于把"任务发起 / worker 完成 /
 /// 主线程收集上屏"的真实时刻精确对齐（定位"本应清晰"与"实际清晰"之间的差距）。
@@ -188,6 +212,24 @@ mod tests {
 
     fn test_pdf_paths() -> Vec<std::path::PathBuf> {
         test_util::test_pdf_paths()
+    }
+
+    /// **A-P2-2（瓦片记账按 bpp）**：`TileSlot::bytes()` 对 R8 luma 瓦片按 1BPP 记账、
+    /// BGRA 瓦片按 4BPP——字节账本与动态预算（`nominal_per_tile` 同源 bpp）一致，
+    /// 「字节 /4 而预算仍按 4BPP 估」的 4× 预算语义错误被钉死。
+    #[test]
+    fn ap2_tile_slot_bytes_accounts_luma_bpp() {
+        let luma_img =
+            crate::pdf::render_image_from_luma(vec![0u8; 64 * 64], 64, 64).expect("luma 位图");
+        let ts = crate::pdf::layout::TileSlot { image: luma_img, x0: 0, y0: 0, w: 64, h: 64 };
+        assert_eq!(ts.bytes(), 64 * 64 * 1, "R8 瓦片记账应为 1BPP（BGRA 的 1/4）");
+        assert!(ts.image.is_luma(0), "R8 瓦片 RenderImage 应判为 luma");
+
+        let bgra_img = crate::pdf::render_image_from_bgra(vec![0u8; 64 * 64 * 4], 64, 64)
+            .expect("BGRA 位图");
+        let ts2 = crate::pdf::layout::TileSlot { image: bgra_img, x0: 0, y0: 0, w: 64, h: 64 };
+        assert_eq!(ts2.bytes(), 64 * 64 * 4, "BGRA 瓦片记账应为 4BPP");
+        assert!(!ts2.image.is_luma(0), "BGRA 瓦片 RenderImage 不应判为 luma");
     }
 
     /// 缺夹具即 SKIP 守卫：无 `target/pdf测试*.pdf` 时打印并 `return`（CI 有夹具则真跑）。
@@ -1776,6 +1818,7 @@ mod tests {
             recolor_epoch: cx.update(|_w, cx| {
                 holder.borrow().as_ref().unwrap().read(cx).recolor_epoch
             }),
+            luma: false,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Some(res)).unwrap();
@@ -1864,6 +1907,7 @@ mod tests {
             width: 8,
             height: 8,
             recolor_epoch: epoch,
+            luma: false,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Some(res)).unwrap();
@@ -1971,6 +2015,7 @@ mod tests {
             height: bh,
             // recolor（重着色）世代用 viewer 当前世代——W1 世代守卫会丢弃旧世代结果。
             recolor_epoch: epoch,
+            luma: false,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Some(res)).unwrap();
@@ -4810,8 +4855,9 @@ mod tests {
         cx.update(|_w, cx| {
             let v = view.read(cx);
             let pw = v.page_width();
-            // 测试窗口为 1× DPI（gpui TestAppContext 默认），缩放因子即 1.0
-            let sf = 1.0f32;
+            // 测试窗口真实 DPI（gpui TestAppContext 默认 2×）：封面/瓦片按**真实密度**驻留，
+            // 估算必须用同一 sf——旧代码硬编码 1.0 把封面字节少算 ~4×（P1 ③ 修复测量基准）。
+            let sf = _w.scale_factor();
             let mut covers_held = 0usize;
             let mut mids_held = 0usize;
             let mut thumbs_held = 0usize;
@@ -4820,8 +4866,14 @@ mod tests {
             for (p, s) in v.slots.iter().enumerate() {
                 if s.cover.is_some() {
                     covers_held += 1;
-                    let (w, h) =
-                        layout::page_bitmap_size(v.dims[p], layout::cover_scale(v.dims[p], pw, sf));
+                    // **P1 ③**：按**实际驻留密度**估算字节（邻居封面已降档 2.0——理论满密度
+                    // 会高估）；cover_scale=0（S5 已回收标记，正常无 cover 并存）回退理论值。
+                    let cs = if s.cover_scale.abs() > 1e-4 {
+                        s.cover_scale
+                    } else {
+                        layout::cover_scale(v.dims[p], pw, sf)
+                    };
+                    let (w, h) = layout::page_bitmap_size(v.dims[p], cs);
                     cover_bytes += (w as u64) * (h as u64) * 4;
                     // 冗余双份 = 封面与瓦片**同密度**且同页并存（应为 0，evict_tiles 每帧回收）。
                     // 密度不同（封面被 COVER_SCALE_CAP 截断、瓦片更细）属正常“底图+精修”，不计。
@@ -5008,6 +5060,14 @@ mod tests {
             total_est < 220 * 1024 * 1024,
             "zoom1 完整滚动后渲染驻留内存应明显低于修复前（~280MB）：{total_est}"
         );
+        // **P1 内存瘦身（真值基准）**：旧断言用 `sf=1.0` 估算封面字节，在测试平台真实 2× DPI
+        // 下把封面少算 ~4×（把 ~100MB 真值误读成 ~60MB）。修正后用真实密度基准：4502f8a
+        // 真值 ~100MB（可见+邻居各 30MB 满密封面 + 37MB 瓦片）→ P1 ③ 后 ~74MB（邻居封面
+        // 降 2.0 档）——断言真值 < 90MB（低于基线 >10%，且远低于用户报的 ~176MB 量级）。
+        assert!(
+            total_est < 90 * 1024 * 1024,
+            "zoom1 真值驻留应低于 4502f8a 真值基线（~100MB）且远小 176MB：{total_est}"
+        );
         // F4/D：走廊封面独立有界（窗口封面计数/est_total 不受影响）；且 est_total 不超
         // 8bab7be 基线（z1.0 est 66-69MB）的 120%。settle 只等主队列清空，走廊随后在 idle
         // 帧填充——先无条件泵若干帧让走廊播种+落定，再泵到走廊在途清空，量稳态尺寸。
@@ -5038,9 +5098,11 @@ mod tests {
             pf_bytes <= config::pdf::PREFETCH_COVER_BUDGET_BYTES,
             "zoom1 走廊封面字节应 ≤ 预算：{pf_bytes}"
         );
+        // P1 ①③④：真值驻留 < 85%×4502f8a 真值基线（~100MB）；走廊 0.5 preview 同页去重
+        // （已有封面/瓦片的页不再双驻）后仍独立 ≤ 预算。
         assert!(
-            total_est <= 69 * 1024 * 1024 * 120 / 100,
-            "zoom1 est_total 不应超 8bab7be 基线（~69MB）120%：{total_est}"
+            total_est < 85 * 1024 * 1024,
+            "zoom1 est_total 应明显低于 4502f8a 真值基线（~100MB）：{total_est}"
         );
 
         // 再以用户实测量的高倍密度（Ctrl+滚轮放大 → zoom≈1.76 → 渲染密度≈2.48）完整滚动
@@ -5152,9 +5214,378 @@ mod tests {
             pf_bytes2 <= config::pdf::PREFETCH_COVER_BUDGET_BYTES,
             "zoom1.75 走廊封面字节应仍 ≤ 预算：{pf_bytes2}"
         );
+        // **P1 ③① 真值降幅**：4502f8a 真值 ≈ 75MB（可见页满密 4.0 cover 30MB + 43MB 瓦片）
+        // → 修后 ~44MB（可见页瓦片接管 + 邻居封面 2.0）：真值降 ≥40%（远低于旧 108×1.2 基准）。
         assert!(
-            total_est2 <= 108 * 1024 * 1024 * 120 / 100,
-            "zoom1.75 est_total 不应超 8bab7be 基线（~108MB）120%：{total_est2}"
+            total_est2 < 55 * 1024 * 1024,
+            "zoom1.75 真值驻留应 ≥40% 低于 4502f8a 真值基线（~75MB）：{total_est2}"
+        );
+    }
+
+    /// **A-P1-1b（高倍×宽高窗十字门）**：旧 memory 测试在测试平台真实 2× DPI 下运行（封面
+    /// 被旧 `sf=1.0` 估算少算 ~4×），且只钉 1 页视口的窄场景——盖不住「高倍 + 宽高窗」的
+    /// 驻留爆发。本测试强制 **1× DPI（真机常规）** + Ctrl+滚轮推到 zoom≈2.4（render_scale
+    /// 越过封面 cap → 纯瓦片 regime）在 1600×1200 宽高窗完整滚动一遍，用**真实密度**量稳态：
+    /// 整体驻留必须**远低于** 4502f8a（用户实测 sf2/z4 单页 ~176MB → 设计目标 ~95-105MB）。
+    /// 此门由「邻居封面降档 2.0（③）+ 瓦片横向 margin 焊死 0（①）+ prefetch 同页去重（④）」
+    /// 三者共同决定——任一回退，真值驻留即弹回 150MB+ 量级、本断言红。
+    #[gpui::test]
+    async fn memory_bounded_at_high_zoom_wide_window(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        // 宽高窗 + 强制 1× DPI（真机常规；测试平台默认 2×）。
+        cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(1200.)));
+        cx.update(|w, _| w.set_scale_factor(1.0));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let n = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).page_count()
+        });
+        assert!(n >= 40, "测试文档应至少有 40 页，实际 {n}");
+        // 暖 60 帧让自适应页宽 / 滚动容器布局稳定。
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        // Ctrl+滚轮推到 zoom≈2.4（12%/档 × ~9 档）。
+        let zoom_wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut z = 0.0f32;
+        for _ in 0..12 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..2 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+            }
+            z = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+            if z >= 2.3 {
+                break;
+            }
+        }
+        assert!(z >= 2.3, "应推到高倍 zoom≥2.3：{z}");
+        // 完整滚动一遍（采样停靠）+ 停稳，真值量稳态。
+        let mut targets: Vec<usize> = Vec::new();
+        for t in (0..n).step_by(9) {
+            let t = t.min(n - 1);
+            if !targets.contains(&t) {
+                targets.push(t);
+            }
+        }
+        for t in [3usize, n - 2, 7, n - 5, 40].into_iter() {
+            let t = t.min(n - 1);
+            if !targets.contains(&t) {
+                targets.push(t);
+            }
+        }
+        let (tile_bytes, covers, mids, thumbs, double_hold, total_est) =
+            full_scroll_memory(&holder, cx, &targets);
+        let budget = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .tile_budget_state
+                .as_ref()
+                .map(|s| s.budget)
+                .unwrap_or(config::pdf::TILE_CACHE_BYTES)
+        });
+        eprintln!(
+            "[MEM-HI 1x z={:.2}] tile_bytes={}MB covers={} mids={} thumbs={} double_hold={} est_total={}MB budget={}MB",
+            z,
+            tile_bytes / 1024 / 1024,
+            covers,
+            mids,
+            thumbs,
+            double_hold,
+            total_est / 1024 / 1024,
+            budget / 1024 / 1024,
+        );
+        assert!(
+            tile_bytes <= budget,
+            "高倍宽高窗瓦片占用应 ≤ 动态预算：{tile_bytes} > {budget}"
+        );
+        assert!(
+            budget <= config::pdf::TILE_CACHE_BYTES_MAX,
+            "高倍宽高窗动态预算应 ≤ 硬顶（128MB）：{budget}"
+        );
+        assert!(
+            covers <= 3,
+            "高倍宽高窗封面驻留应 ≤ 可见页+方向预取（宽窗可见 ≤2 页 → ≤3）：{covers}"
+        );
+        assert!(
+            double_hold == 0,
+            "高倍宽高窗封面在位时不得双份持有瓦片（内存回归）：{double_hold} 页"
+        );
+        // 十字门：真值驻留应远低于 4502f8a 用户实测（sf2/z4 单页 ~176MB；现实 ~95-105MB）。
+        // 用 110MB 硬线（设计目标 +5MB 余量）——回退（邻居满密/横向整列预取/双份 preview）
+        // 必弹回 150MB+，本断言红。
+        assert!(
+            total_est < 110 * 1024 * 1024,
+            "高倍宽高窗真值驻留应 << 4502f8a 用户实测（~176MB → 目标 ~95-105MB）：{total_est}"
+        );
+        // 走廊（0.5 密度整页 preview）独立有界：先泵让走廊播种落定，再泵到在途清空量稳态。
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let pf_done = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_prefetch_cover.is_empty()
+            });
+            if pf_done {
+                break;
+            }
+        }
+        let (pf_covers, pf_bytes) = prefetch_memory(&holder, cx);
+        eprintln!(
+            "[MEM-PRETCH-HI] prefetch_covers={pf_covers} bytes={}MB 预算={}MB",
+            pf_bytes / 1024 / 1024,
+            config::pdf::PREFETCH_COVER_BUDGET_BYTES / 1024 / 1024,
+        );
+        assert!(
+            pf_bytes <= config::pdf::PREFETCH_COVER_BUDGET_BYTES,
+            "高倍宽高窗走廊封面字节应 ≤ 预算：{pf_bytes}"
+        );
+    }
+
+    /// **A-P1-3（邻居封面降档 + 入视满密度无闪白）**：封面窗内「真可见」页封面满密度；
+    /// 仅滑入/滑出的**邻居页**（封面窗内但不可见）封面降到 [`config::pdf::COVER_SCALE_CAP_NEIGHBOR`]
+    /// =2.0 档（P1 ③）。真实渲染路径断言：
+    /// ① 下滚停稳第 10 页（dir=1，封面窗 [10..11]）→ 页 10（可见）`cover_scale ≈` 满 cscale，
+    ///    页 11（邻居）`cover_scale ≈ min(cscale, 2.0)`——可见满密、邻居降档；
+    /// ② 翻页到 11 停稳 → 页 11 重新「真可见」→ **满密度快速就位**（`cover_scale == cscale_full`、
+    ///    cover 在槽），全程 `loading_placeholder_hits` 零增长（stale→prev_cover 桥 + 满密重派，
+    ///    无闪白）。
+    #[gpui::test]
+    async fn neighbor_cover_low_density_then_full_on_enter(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let n = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).page_count()
+        });
+        assert!(n >= 40, "测试文档应至少有 40 页，实际 {n}");
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    (v.pending_cover.is_empty() && v.pending_tiles.is_empty(), !v.prev_fast)
+                });
+                if st == (true, true) {
+                    return;
+                }
+            }
+            panic!("状态应沉降（封面/瓦片在途应清空）");
+        };
+        let jump = |cx: &mut gpui::VisualTestContext, page: usize| {
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |v, cx| {
+                        v.scroll_to_page(page);
+                        cx.notify();
+                    });
+            });
+        };
+        let cover_meta = |cx: &mut gpui::VisualTestContext, p: usize| {
+            cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let cscale_full = layout::cover_scale(
+                    v.dims[p],
+                    v.page_width(),
+                    w.scale_factor(),
+                );
+                let s = &v.slots[p];
+                (
+                    cscale_full,
+                    s.cover_scale,
+                    s.cover.is_some(),
+                    s.prev_cover.is_some(),
+                )
+            })
+        };
+
+        // ① 下滚停稳第 10 页：可见页满密、邻居页降档 2.0。
+        jump(&mut *cx, 10);
+        settle(&mut *cx);
+        let (full10, cs10, has10, _b10) = cover_meta(&mut *cx, 10);
+        let (full11, cs11, has11, _b11) = cover_meta(&mut *cx, 11);
+        eprintln!(
+            "[P1-③] settle@10 full10={full10:.2} cover10_cs={cs10:.2} has10={has10} full11={full11:.2} cover11_cs={cs11:.2} has11={has11}"
+        );
+        assert!(has10, "可见页 10 应有封面");
+        assert!(
+            (cs10 - full10).abs() <= 1e-4,
+            "可见页 10 封面应满密度（cscale={full10:.2}）：cover_scale={cs10:.2}"
+        );
+        assert!(has11, "封面窗内邻居页 11 应有封面（低档供给，供翻页瞬间有底图）");
+        let want11 = full11.min(config::pdf::COVER_SCALE_CAP_NEIGHBOR);
+        assert!(
+            (cs11 - want11).abs() <= 1e-2,
+            "邻居页 11 封面应降到 min(cscale, 2.0)={want11:.2}（而非满密 {full11:.2}）：cover_scale={cs11:.2}"
+        );
+        // ② 翻到 11 停稳 → 11 真可见 → 满密度重派快速就位；**可见页全程恒有底图**（无闪白）。
+        // 注：`loading_placeholder_hits` 会因**窗外 margin 卡**（走廊外 off-screen 页卡，用户
+        // 不可见）持续自增，与本次「邻居→可见翻页」的闪白正交（该口径由既有
+        // `thumb_backdrop_keeps_normal_roll_loading_free` 的「静置零增长」测试覆盖）——此处
+        // 用最精准的判据：翻页全程**可见页**（与视口 bbox 相交）帧帧都有底图（底图判定与
+        // `build_visible_page_cards` 同源），任何一帧缺口即闪白。
+        jump(&mut *cx, 11);
+        let mut no_base_visible = 0u32;
+        let mut flip_vis_frames = 0u32;
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let pw = v.page_width();
+                let sy = f32::from(-v.scroll.offset().y);
+                let vh = f32::from(v.scroll.bounds().size.height);
+                for &p in &pdf_visible_pages(v, pw, sy, vh) {
+                    let s = &v.slots[p];
+                    flip_vis_frames += 1;
+                    let has_base = s.cover.is_some()
+                        || s.prev_cover.is_some()
+                        || s.prefetch_cover.is_some()
+                        || s.mid.is_some()
+                        || s.thumb.is_some();
+                    if !has_base {
+                        no_base_visible += 1;
+                    }
+                }
+                (
+                    v.pending_cover.is_empty() && v.pending_tiles.is_empty(),
+                    !v.prev_fast,
+                )
+            });
+            if st == (true, true) {
+                break;
+            }
+        }
+        eprintln!(
+            "[P1-③] flip@11 no_base_visible_frames={no_base_visible} flip_vis_sampled={flip_vis_frames}"
+        );
+        assert!(
+            flip_vis_frames >= 10,
+            "采样应覆盖翻页过程：flip_vis_sampled={flip_vis_frames}"
+        );
+        assert_eq!(
+            no_base_visible, 0,
+            "邻居→可见翻页全程可见页必须恒有底图（无闪白）：no_base_visible={no_base_visible}"
+        );
+        let (full11b, cs11b, has11b, bridged11) = cover_meta(&mut *cx, 11);
+        eprintln!(
+            "[P1-③] settle@11 full11={full11b:.2} cover11_cs={cs11b:.2} has11={has11b} prev_bridge={bridged11}"
+        );
+        assert!(
+            has11b && (cs11b - full11b).abs() <= 1e-4,
+            "入视后页 11 应由满密度封面供给（cover_scale={cs11b:.2} vs {full11b:.2}）"
         );
     }
 
@@ -7384,10 +7815,10 @@ mod tests {
     }
 
     /// T4 GPU 重着色通道（worker 侧机制 + 门控，真夹具）：门控开启时 worker 对显示路径
-    /// **不调用 apply_recolor**——`set_recolor(Some(night))` 的渲染结果与 `None`（未着色
-    /// 原图）逐字节一致（CPU 税归零）；门控关闭时恢复既有 CPU 着色（`Some` ≠ `None`）。
-    /// 用「同页同密度渲染对比」作可计数/可字节断言：门控开启的着色档输出 == 原图基准；
-    /// 门控关闭的着色档输出 != 原图基准（与 dbd3236 行为一致）。
+    /// **不调用 apply_recolor**；P2 R8 门控（GPU + FullBand + ink）激活时出口编码成单通道
+    /// 感知亮度（`luma=true`、`w*h*1`，-4×）——它等于「原图→luma 编码」，**不是** CPU
+    /// 着色像素（CPU 税归零，着色在 GPU 绘制时）。门控关闭时恢复既有 CPU 着色（`Some` ≠
+    /// `None`）。用「同页同密度渲染对比」作可计数/可字节断言。
     #[test]
     fn gpu_gate_worker_skips_cpu_recolor_and_off_keeps_it() {
         skip_if_missing_pdf_fixture!();
@@ -7395,6 +7826,7 @@ mod tests {
         // 进程级门控是 worker/view 共读的全局开关：本仓库所有触碰 worker/view 的测试都持
         // pdfium-test 全局锁，故进程内瞬时一致；用 RAII 守卫，断言失败也会还原。
         let _gate = GpuGateGuard::set_on();
+        let _curve = CurveGuard::set(RecolorCurve::FullBand);
         let p = test_pdf_paths()[0].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
@@ -7402,7 +7834,7 @@ mod tests {
             bg: [0x20, 0x20, 0x20],
             ink: Some([0xD8, 0xD8, 0xD8]),
         };
-        // 原图基准（未着色）：门控开启下取 None 档，两次应逐字节一致。
+        // 原图基准（未着色）：门控开启下取 None 档（gate off → BGRA 直传）。
         // （worker 直接调用：epoch 是本测试内部推进的虚拟世代，仅结果不涉 view 守卫。）
         worker.set_recolor(doc_id, None, 1);
         let rx_raw = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0, 0);
@@ -7410,21 +7842,31 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("原图应返回")
             .expect("渲染应成功");
-        // 门控开启：设了 night 但显示像素仍是未着色原图（worker 跳过 CPU 着色）。
+        assert!(!raw.luma, "None 档出口应为 BGRA（非 R8）");
+        // 门控开启 + 夜间（FullBand + ink）= **R8**：出口编码成单通道亮度（跳过 CPU 着色）。
         worker.set_recolor(doc_id, Some(night), 2);
         let rx_gpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0, 0);
         let gpu_out = rx_gpu
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("门控开启着色档应返回")
             .expect("渲染应成功");
+        assert!(gpu_out.luma, "GPU + FullBand + ink 出口应为 R8 luma 位图");
+        assert_eq!(
+            gpu_out.bgra.len() as u64,
+            (gpu_out.width as u64) * (gpu_out.height as u64),
+            "R8 出口应为 1BPP（w*h*1）"
+        );
         assert!(
-            gpu_out.bgra == raw.bgra,
-            "门控开启时 recolor 不应改变显示像素（worker 跳过 CPU 着色）：{}",
-            "亮/暗像素应保持未着色原图"
+            gpu_out.bgra != raw.bgra,
+            "R8 出口自应不同于 BGRA 原图（字节 /4），但它必须是原图的 luma 编码而非 CPU 着色"
+        );
+        assert_eq!(
+            gpu_out.bgra,
+            crate::recolor::encode_bgra_to_luma(&raw.bgra),
+            "GPU 出口应为原图的 luma 编码（worker 跳过 CPU apply_recolor）"
         );
         // 内存去冗余（本线目标）：GPU 门控默认路径 worker 不写 raw 缓存（0 消费者，view
-        // 持原图、着色在绘制时 img().recolor 现算），缓存长度为 0；出口 move 直传原图
-        // （返回位图 == 原图，上文已字节等值断言）。
+        // 持原图、着色在绘制时 img().recolor 现算），缓存长度为 0；出口 move 直传原图。
         assert_eq!(
             worker.raw_cache_len(doc_id),
             0,
@@ -7454,8 +7896,11 @@ mod tests {
     /// T4 GPU 重着色通道（view 侧 scene 机制 + 门控，真夹具）：门控开启 + 切到夜间档后，
     /// 页卡片/瓦片的 `img(...).recolor(Some)` 参数进入场景 = `RecolorSprite` 图元携带
     /// 正确纸/墨参（`switches.x == 1` 启用墨带、`bg` 归一化为纸色）——GPU 绘制时着色的
-    /// 接线成立；切档不派新栅格（`raster_reqs` 不变），故「切档 0 重算 0 重栅」成立。
-    /// GPU 像素无法 headless 断言（K23②），此处只证「机制 + 门控」（真机复核像素等价）。
+    /// 接线成立。**P2 R8 门控翻转语义**：`None→夜间`（BGRA→R8）与 `夜间→浅色`（ink
+    /// None，R8→BGRA）因**位图数据格式改变**需重栅化一次（接受口径，`raster_reqs` 增加）；
+    /// **同门控内**调纸/墨色不触发重栅（`raster_reqs` 不变，只改图元参数）——「切档 0 重算
+    /// 0 重栅」承诺在格式不变时仍成立。A-P2-3/A-P2-4 共用：翻转重栅 + R8 上传走 Monochrome
+    /// atlas（1BPP）+ 浅色档回 Polychrome。GPU 像素无法 headless 断言（K23②），此处证机制+门控。
     #[gpui::test]
     async fn gpu_gate_view_attaches_recolor_params_to_scene(cx: &mut gpui::TestAppContext) {
         skip_if_missing_pdf_fixture!();
@@ -7526,8 +7971,29 @@ mod tests {
         let req0 = cx.update(|_w, cx| {
             holder.borrow().as_ref().unwrap().read(cx).raster_reqs
         });
+        // 各切档阶段统一「停稳」：泵/帧推进直到在途请求清空（真实 worker 渲染回传），
+        // 再取 raster_reqs——避免「同门控 0 重栅」断言被未停稳的收尾派发污染。
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..600 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let done = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty()
+                        && v.pending_cover.is_empty()
+                        && v.pending_mid.is_empty()
+                        && v.pending_thumb.is_empty()
+                        && !v.tile_pump_running
+                });
+                if done {
+                    break;
+                }
+            }
+        };
 
-        // 切到夜间档（GPU 通道：只改图片参数、0 重算 0 重栅）。
+        // 切到夜间档（GPU + FullBand + ink = **R8 门控翻转**）：位图数据格式从 BGRA 翻到
+        // R8 luma（-4×），受影响页**重栅化一次**（P2 接受口径）→ 新栅格命令数应增加。
         cx.update(|_w, cx| {
             holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
                 v.set_recolor(
@@ -7539,16 +8005,14 @@ mod tests {
                 );
             });
         });
-        // 泵/帧推进：GPU 通道无 pending_recolor（不派重着色刷新），只需驱动一帧重绘。
-        for _ in 0..60 {
-            cx.executor().advance_clock(Duration::from_millis(16));
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        settle(cx);
         let req1 = cx.update(|_w, cx| {
             holder.borrow().as_ref().unwrap().read(cx).raster_reqs
         });
-        assert_eq!(req1, req0, "门控开启切档应 0 新栅格命令（GPU 参数即开关）");
+        assert!(
+            req1 > req0,
+            "None→夜间门控翻转应重栅化一次（R8 位图格式改变）：{req0}->{req1}"
+        );
 
         // 场景断言：页卡/瓦片 img 携带了重着色参数（RecolorSprite 图元，bg/switches 正确）。
         let sprites = cx.update(|window, _| window.painted_recolor_sprites());
@@ -7557,18 +8021,85 @@ mod tests {
             "门控开启 + 夜间档应产生 RecolorSprite 场景图元（PDF 显示 img 挂上重着色参数）"
         );
         // bg 归一化 0x20/255 ≈ 0.1255；switches.x=1 启用墨带；ink 0xD8/255 ≈ 0.8471；
-        // switches.y=1 = FullBand（曲线 latch 默认/本测试显式设为 FullBand）——shader 分支依据。
+        // switches.y=1 = FullBand；**switches.z=1 = R8 luma 数据源**（P2）——shader 分支依据。
         let bg0 = 0x20u8 as f32 / 255.0;
         let ink0 = 0xD8u8 as f32 / 255.0;
         let ok = sprites.iter().any(|s| {
             s.switches[0] == 1.0
                 && s.switches[1] == 1.0
+                && s.switches[2] == 1.0
                 && (s.bg[0] - bg0).abs() < 1e-3
                 && (s.ink[0] - ink0).abs() < 1e-3
         });
         assert!(
             ok,
-            "至少一个 RecolorSprite 应携带正确的纸/墨参数 + FullBand 曲线（ink 启用、switches.y=1、bg=0x20、ink=0xD8）"
+            "至少一个 RecolorSprite 应携带正确的纸/墨参数 + FullBand + R8 luma 标记（switches.z=1）"
+        );
+        // A-P2-4：R8 门控下显示位图上传走 Monochrome atlas（1BPP）——sprite 的 atlas kind 断言。
+        assert!(
+            sprites
+                .iter()
+                .filter(|s| s.switches[2] == 1.0)
+                .all(|s| s.tile.texture_id.kind == gpui::AtlasTextureKind::Monochrome),
+            "R8 位图 sprite 的 atlas kind 应为 Monochrome（1BPP 上传，DXGI_FORMAT_R8_UNORM）"
+        );
+
+        // 同门控内参数微调（换纸/墨色，仍是 R8 FullBand + ink）→ **0 重栅**（只改图元参数）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_recolor(
+                    Some(RecolorParams {
+                        bg: [0x21, 0x21, 0x21],
+                        ink: Some([0xD7, 0xD7, 0xD7]),
+                    }),
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+        let req2 = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).raster_reqs
+        });
+        assert_eq!(
+            req2, req1,
+            "同 R8 门控内调色应 0 新栅格（GPU 参数即开关，P2 不破此承诺）"
+        );
+
+        // 切到浅色/去重着色（`ink=None`）= **R8 门控翻转回 BGRA** → 受影响页再重栅化一次
+        //（P2 接受口径）；着色仍在 GPU（RecolorSprite 保留），但数据源回到 4BPP。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_recolor(
+                    Some(RecolorParams {
+                        bg: [0xC7, 0xED, 0xCC],
+                        ink: None,
+                    }),
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+        let req3 = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).raster_reqs
+        });
+        assert!(
+            req3 > req2,
+            "R8→浅色门控翻转应再重栅化一次（BGRA 位图格式恢复）：{req2}->{req3}"
+        );
+        let sprites_light = cx.update(|window, _| window.painted_recolor_sprites());
+        assert!(
+            !sprites_light.is_empty(),
+            "浅色档仍应产生 RecolorSprite（着色留在 GPU，只是数据源回 BGRA）"
+        );
+        assert!(
+            !sprites_light.iter().any(|s| s.switches[2] == 1.0),
+            "浅色档（ink=None / 去重着色）不应再有 R8 luma 标志"
+        );
+        assert!(
+            sprites_light
+                .iter()
+                .all(|s| s.tile.texture_id.kind == gpui::AtlasTextureKind::Polychrome),
+            "浅色档位图应全部走 Polychrome atlas（BGRA 4BPP，ContentProtect 需要原色）"
         );
     }
 

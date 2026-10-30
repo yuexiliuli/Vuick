@@ -203,6 +203,48 @@ pub(crate) fn set_gpu_recolor_gate_for_test(v: bool) {
     GPU_RECOLOR_GATE.store(v, Ordering::Relaxed);
 }
 
+/// **R8 单通道（luma）位图门控**：GPU 重着色 + 曲线 [`RecolorCurve::FullBand`] + 墨色启用
+/// （`ink=Some`）时，瓦片/封面/中清/缩略显示位图只存**感知亮度**（1 字节/px，数学无损
+/// -4×）——GPU shader 的 FullBand 分支 `out = bg + (ink-bg)·(1−L)` 只依赖亮度、不读原色，
+/// 位图存 luma 再读回数学无损（≤1 LSB 量化差）。其余档（`ink=None` / ContentProtect
+/// 需要原色 / light 浅色）必须保留原色 → 维持 BGRA。
+/// 本判定在 **worker 编码侧**（`finalize_render`）与 **view 侧**（位图包装 / 字节账本 /
+/// 切档重栅）同源调用——两侧取同一 `(params, gate, curve)`，保证编码与消费一致。
+pub(crate) fn luma_gate_active(recolor: Option<RecolorParams>, gpu: bool) -> bool {
+    gpu && recolor_curve() == RecolorCurve::FullBand && recolor.is_some_and(|p| p.ink.is_some())
+}
+
+/// **瓦片字节/像素**：R8 门控激活 = 1BPP（单通道亮度，-4×）；否则 4BPP（BGRA）。动态预算
+/// （`nominal_per_tile`）与字节账本（`TileSlot::bytes`）按此收敛——避免「字节已除 4 而预算
+/// 仍按 4BPP 估」导致预算语义错 4×。与 [`.luma_gate_active`] 同源（同一判定）。
+pub(crate) fn tile_bytes_per_pixel(recolor: Option<RecolorParams>, gpu: bool) -> u64 {
+    if luma_gate_active(recolor, gpu) {
+        1
+    } else {
+        4
+    }
+}
+
+/// BGRA 紧凑缓冲 → **R8 单通道感知亮度**（`w*h*1` 字节）。公式与 GPU shader
+/// `recolor_sprite_fragment` **逐位同策**：`luma = dot(rgb/255, (0.299,0.587,0.114))`（f32），
+/// 存 `u8 = round(0.299R + 0.587G + 0.114B)`（R 在 BGRA 字节 2）——shader 读回
+/// `L/255`，与 BGRA 路径连续亮度差 ≤1/255，FullBand 输出差 ≤1 LSB（接受口径）。
+/// 纯函数（不依赖任何状态），可单测。
+pub(crate) fn encode_bgra_to_luma(bgra: &[u8]) -> Vec<u8> {
+    let n = bgra.len() / 4;
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0usize;
+    for _ in 0..n {
+        // BGRA：i=B, i+1=G, i+2=R。f32 与 shader 浮点公式同源（逐位一致目标）。
+        let luma = 0.299f32 * (bgra[i + 2] as f32)
+            + 0.587f32 * (bgra[i + 1] as f32)
+            + 0.114f32 * (bgra[i] as f32);
+        out.push(luma.round() as u8);
+        i += 4;
+    }
+    out
+}
+
 /// 把本 crate 的重着色参数映射为 gpui 图片元素级参数（T4 GPU 通道）：字段同构
 /// （`bg` = 纸色、`ink` = 墨色可选），并携带进程级曲线策略（[`recolor_curve`]），
 /// 由 view 在门控开启时挂到 `img().recolor(...)` → `RecolorSprite.switches.y` → shader 分支。
@@ -817,6 +859,76 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// **A-P2-1（一致性）**：R8 单通道位图 vs BGRA 位图在同一 FullBand 片元公式下的输出
+    /// ≤1 LSB。模拟 GPU shader `recolor_sprite_fragment` 两条路径（BGRA 连续亮度 vs
+    /// R8 量化亮度）：BGRA 路 `luma = dot(rgb/255, (0.299,0.587,0.114))`；R8 路先经
+    /// [`encode_bgra_to_luma`] 存 `u8=round(0.299R+0.587G+0.114B)`，shader 读回 `L/255`，
+    /// 再做 `out = bg + (ink−bg)·(1−luma)`（×255 取整）——对灰渐变全 0..=255 × 彩色抽样的
+    /// 每通道差 ≤1 LSB。同时验证编码公式与 shader `0.299f/0.587f/0.114f` 逐位同策。
+    #[test]
+    fn ap2_r8_vs_bgra_shader_consistency_fullband() {
+        let bg = [0x20u8, 0x20, 0x20];
+        let ink = [0xD8u8, 0xD8, 0xD8];
+        let bg_n = bg.map(|v| v as f32 / 255.0);
+        let ink_n = ink.map(|v| v as f32 / 255.0);
+        // FullBand 片元：`orig → luma → fb → out = bg + (ink−bg)·fb`，逐通道 round 到 u8。
+        let fullband_bytes = |luma: f32, c: usize| -> u8 {
+            let fb = 1.0 - luma;
+            ((bg_n[c] + (ink_n[c] - bg_n[c]) * fb) * 255.0).round() as u8
+        };
+        // BGRA 路径：直接对 f32 连续亮度（shader 读 RGBA 后 dot）。
+        let bg_path = |b: u8, g: u8, r: u8| -> [u8; 3] {
+            let luma = 0.299f32 * (r as f32 / 255.0)
+                + 0.587f32 * (g as f32 / 255.0)
+                + 0.114f32 * (b as f32 / 255.0);
+            [fullband_bytes(luma, 0), fullband_bytes(luma, 1), fullband_bytes(luma, 2)]
+        };
+        // R8 路径：编码端存 `round(0.299R+0.587G+0.114B)`，shader 读回 L/255。
+        let r8_path = |b: u8, g: u8, r: u8| -> [u8; 3] {
+            let px = [b, g, r, 255];
+            let l = encode_bgra_to_luma(&px)[0] as f32 / 255.0;
+            [fullband_bytes(l, 0), fullband_bytes(l, 1), fullband_bytes(l, 2)]
+        };
+        // 灰渐变全刻度（0..=255）。
+        for g in 0..=255u8 {
+            let a = bg_path(g, g, g);
+            let b = r8_path(g, g, g);
+            for c in 0..3 {
+                let d = (a[c] as i32 - b[c] as i32).abs();
+                assert!(d <= 1, "灰渐变 R8 vs BGRA 差 {d} > 1 LSB @ g={g} ch{c}");
+            }
+        }
+        // 彩色抽样（非灰，覆盖 li 整数近似/浮点舍入边界）。
+        for (bn, g, r) in [(0u8, 0, 255), (255, 0, 0), (0, 255, 0), (200, 30, 10), (10, 200, 30), (30, 10, 200), (128, 90, 200), (1, 254, 1), (254, 1, 254)] {
+            let a = bg_path(bn, g, r);
+            let b = r8_path(bn, g, r);
+            for c in 0..3 {
+                let d = (a[c] as i32 - b[c] as i32).abs();
+                assert!(d <= 1, "彩色 R8 vs BGRA 差 {d} > 1 LSB @ ({bn},{g},{r}) ch{c}");
+            }
+        }
+    }
+
+    /// **A-P2-2（记账 bpp）**：`tile_bytes_per_pixel` 按 R8 门控给出 1/4 BPP——动态预算
+    ///（`nominal_per_tile`）与字节账本（`TileSlot::bytes`）共用同一判定，避免预算语义错 4×。
+    /// 确定性分支（不依赖进程 latch）直接断言；FullBand+ink 分支受曲线 latch 影响（env
+    /// `GPUI_PDF_RECOLOR_CURVE=0` 时跳过）。
+    #[test]
+    fn ap2_tile_bytes_per_pixel_gate() {
+        let night = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
+        assert_eq!(tile_bytes_per_pixel(None, true), 4, "recolor=None → BGRA 4BPP");
+        assert_eq!(tile_bytes_per_pixel(None, false), 4, "recolor=None（CPU）→ BGRA 4BPP");
+        assert_eq!(tile_bytes_per_pixel(Some(night), false), 4, "GPU 关闭 → BGRA 4BPP");
+        let env_cp = std::env::var_os("GPUI_PDF_RECOLOR_CURVE").is_some_and(|v| v == "0");
+        if !env_cp {
+            assert_eq!(
+                tile_bytes_per_pixel(Some(night), true),
+                1,
+                "GPU + FullBand + ink → R8 1BPP（-4×）"
+            );
         }
     }
 

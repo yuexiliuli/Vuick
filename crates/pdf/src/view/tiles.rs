@@ -282,7 +282,18 @@ impl PdfViewer {
         // 顺带下线缩略（F2 既有语义）。只服务真正可见页（不铺 MARGIN 缓冲页，避免缩略驻留
         // 超 `THUMB_CACHE_PAGES`）。
         let center_vis = (vis_first + vis_last) / 2;
-        self.schedule_covers(cover_first, cover_last, center_vis, retire, page_width, scale_factor);
+        let wrap_w = self.wrap_width(window, page_width);
+        self.schedule_covers(
+            cover_first,
+            cover_last,
+            center_vis,
+            retire,
+            scroll_y,
+            viewport_h,
+            wrap_w,
+            page_width,
+            scale_factor,
+        );
         self.schedule_thumb_backdrops(vis_first, vis_last, page_width, scale_factor);
     }
 
@@ -441,6 +452,15 @@ impl PdfViewer {
                 continue;
             }
             let dim = self.dims[page];
+            // **P1 ④（同页去重）**：当前密度 1:1 瓦片已在位（近期可见、预算未逐的残留片）→
+            // 该页已有 ≥0.5 密度供给，0.5 preview 是与瓦片双驻留的纯浪费，跳过。
+            // 仅「真无底」新页保留 preview（防首帧空白）。旧密度瓦片（缩放中途 tile_scale
+            // 不匹配）不拦——它们马上会被惰性作废，preview 仍是该页过渡底图。
+            if !slot.tiles.is_empty()
+                && (slot.tile_scale - render_scale(page_width, scale_factor, dim.0)).abs() <= 1e-4
+            {
+                continue;
+            }
             let cscale = cover_scale(dim, page_width, scale_factor);
             // 0.5 密度：像素 1/4、~5-12ms/页；可负担才派（病理性页跳过，交给常态路径）。
             let pscale = (cscale * config::pdf::PREFETCH_COVER_DENSITY)
@@ -588,7 +608,9 @@ impl PdfViewer {
             if s.cover.is_some() && (s.cover_scale - cscale).abs() <= 1e-4 {
                 continue;
             }
-            let Ok(img) = render_image_from_bgra(res.bgra, res.width, res.height) else {
+            let Ok(img) =
+                crate::pdf::wrap_render_image(res.bgra, res.width, res.height, res.luma)
+            else {
                 continue;
             };
             if let Some(s) = self.slots.get_mut(page) {
@@ -607,12 +629,21 @@ impl PdfViewer {
     /// 缩放过期封面移入 `prev_cover` 过渡桥再重派新密度；派后 `evict_covers` 维护封面驻留窗 +
     /// 方向退位页转存有界桥（F2）。封面 = 满显示密度整页（`cover_scale == render_scale`），
     /// 一渲铺满、逐片锐化——「滚动即清晰」的中速带主战场。
+    ///
+    /// **P1 ③（邻居降密）**：封面密度按该页**是否真可见**分档——可见页（页与视口 bbox
+    /// 相交）满密度；封面窗内的滑入/滑出邻居页（`page_visible_rect` 为 None）降到
+    /// [`config::pdf::COVER_SCALE_CAP_NEIGHBOR`]（默认 2.0）档，A4 每张从 ~31MB 落到
+    /// ~2MB 量级。邻居入视瞬间：`cover_scale` 与当前满密度不等 → 既有 stale→prev_cover 桥
+    /// + 满密度重派无缝接管，无闪白（`cover_retire_bridge` 类测试守卫不变）。
     fn schedule_covers(
         &mut self,
         cover_first: usize,
         cover_last: usize,
         center_vis: usize,
         retire: Option<usize>,
+        scroll_y: f32,
+        viewport_h: f32,
+        wrap_w: f32,
         page_width: f32,
         scale_factor: f32,
     ) {
@@ -628,10 +659,24 @@ impl PdfViewer {
                 continue;
             }
             let dim = self.dims[page];
-            let cscale = cover_scale(dim, page_width, scale_factor);
+            // **P1 ③**：按「真可见」分档密度——可见页满密度；仅露角/窗外邻居（有封面窗内
+            // 但不可见）降档，低驻留同时靠既有桥机制无缝接管（见方法注释）。
+            let cscale = {
+                let full = cover_scale(dim, page_width, scale_factor);
+                if self
+                    .page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
+                    .is_some()
+                {
+                    full
+                } else {
+                    full.min(config::pdf::COVER_SCALE_CAP_NEIGHBOR)
+                }
+            };
             // 缩放过期（缩放/DPI 已变）→ 旧封面移入 `prev_cover` 作 CSS 拉伸兜底底图
             // （不再立即下线：本帧渲染还靠它铺满新页宽，防「Ctrl+滚轮缩放」闪「加载中」）。
             // `cover` 置空 → 下方按新密度重派封面，新封面到位后取代并下线旧封面。
+            // 含「可见↔邻居」档间翻转：入视（邻居 2.0 → 满密度）与退位（满密度 → 邻居 2.0）
+            // 都经同一 stale→桥→重派通道，无闪白。
             if let Some(slot) = self.slots.get_mut(page) {
                 let stale = slot.cover.is_some() && (slot.cover_scale - cscale).abs() > 1e-4;
                 if stale
@@ -808,8 +853,15 @@ impl PdfViewer {
             }
             let bmp = page_bitmap_size(dim, scale);
             let disp_h = display_height(dim, page_width);
-            let Some((r0, c0, r1, c1)) =
-                visible_tile_range(bmp, page_width, disp_h, rect, tile_size, TILE_MARGIN)
+            let Some((r0, c0, r1, c1)) = visible_tile_range_axis(
+                bmp,
+                page_width,
+                disp_h,
+                rect,
+                tile_size,
+                TILE_MARGIN,
+                config::pdf::TILE_MARGIN_COL,
+            )
             else {
                 continue;
             };
@@ -869,7 +921,17 @@ impl PdfViewer {
         };
         let center_vis = (vis_first + vis_last) / 2;
         // ① 满密度封面（封面不可负担的页本循环自然跳过，不派）。
-        self.schedule_covers(cover_first, cover_last, center_vis, retire, page_width, scale_factor);
+        self.schedule_covers(
+            cover_first,
+            cover_last,
+            center_vis,
+            retire,
+            scroll_y,
+            viewport_h,
+            self.wrap_width(window, page_width),
+            page_width,
+            scale_factor,
+        );
         // ② 回退占位：仅「无封面/无封面在途」的页（封面满密度，占位是它的低价兜底，
         //    不重复占用）；已由 `schedule_covers` 派的页此处跳过。
         self.schedule_placeholders(window, start, end, scroll_y, viewport_h, scale_factor);
@@ -987,7 +1049,7 @@ impl PdfViewer {
             if (req_scale - scale).abs() > 1e-4 {
                 continue; // 缩放/DPI 已变 → 过期密度瓦片丢弃
             }
-            let Ok(img) = render_image_from_bgra(res.bgra, res.w, res.h) else {
+            let Ok(img) = crate::pdf::wrap_render_image(res.bgra, res.w, res.h, res.luma) else {
                 continue;
             };
             if let Some(slot) = self.slots.get_mut(page) {
@@ -1029,7 +1091,7 @@ impl PdfViewer {
     ///   与「`tile_scale` 与当前密度不符 → 过期」两类的瓦片（封面即全页锐化底图、过期片
     ///   回看也必重渲）——这是清扫，**先于且不跳过**钉住判断（钉住格同样被清）。
     /// - **② 预算 LRU 逐出（R1）**：逐出候选**跳过当前钉住格**（`tile_budget_state.pinned`
-    ///   = 各可见页 `visible_tile_range(可见 bbox + TILE_MARGIN)` 覆盖的格子，由
+    ///   = 各可见页 `visible_tile_range_axis(可见 bbox + 纵轴 TILE_MARGIN / 横轴 TILE_MARGIN_COL)` 覆盖的格子，由
     ///   `update_tile_budget_and_degrade` 每帧同源计算）——可见区绝不逐出、下帧不再重请 →
     ///   消灭「逐出→重派→每帧震荡永不收敛」；预算用**动态值**（`tile_budget_state.budget`
     ///   = max(固定, 可见格数×单格字节×1.25)，夹 [`config::pdf::TILE_CACHE_BYTES_MAX`]
@@ -1105,7 +1167,7 @@ impl PdfViewer {
     /// 淘汰前调用，含静态帧门控帧——门控帧也须推进降级计数与钉住态，否则「静态 N 帧」停在 0）。
     ///
     /// 职责三件：
-    /// 1. 用与调度同源的几何（`page_visible_rect` + `visible_tile_range(可见 bbox +
+    /// 1. 用与调度同源的几何（`page_visible_rect` + `visible_tile_range_axis(可见 bbox + 纵轴 TILE_MARGIN / 横轴 TILE_MARGIN_COL`
     ///    TILE_MARGIN)`）算出各可见页钉住格，写入 [`Self::tile_budget_state`]（供
     ///    [`Self::evict_tiles`] 消费：预算与钉住集同帧一致、杜绝漂移）。
     /// 2. 预算 = `max(TILE_CACHE_BYTES, 可见格数 × 单格字节 × 1.25)`、夹
@@ -1128,7 +1190,11 @@ impl PdfViewer {
         scale_factor: f32,
         window: &Window,
     ) -> Vec<Arc<RenderImage>> {
-        let nominal_per_tile = (TILE_SIZE as u64) * (TILE_SIZE as u64) * 4; // 512²×4 ≈ 1MiB
+        // P2 R8：门控激活（GPU + FullBand + ink）时瓦片按单通道亮度编码（1BPP），单格名义
+        // 字节随之 /4——动态预算按**实际 bpp** 收敛，避免「字节已除 4 而预算仍按 4BPP 估」
+        // 导致预算语义错 4 倍（R8 下同一可见格数应允许 4× 更多格驻留、内存更省）。
+        let nominal_per_tile =
+            (TILE_SIZE as u64) * (TILE_SIZE as u64) * crate::recolor::tile_bytes_per_pixel(self.recolor, self.gpu_recolor); // 512²×bpp
         let demand_of = |cells: u64| {
             (cells as f64 * nominal_per_tile as f64
                 * config::pdf::TILE_BUDGET_KEEP_FACTOR as f64) as u64
@@ -1175,7 +1241,7 @@ impl PdfViewer {
                 continue;
             };
             let Some((r0, c0, r1, c1)) =
-                visible_tile_range(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN)
+                visible_tile_range_axis(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN, config::pdf::TILE_MARGIN_COL)
             else {
                 continue;
             };
@@ -1206,7 +1272,7 @@ impl PdfViewer {
                 if let Some(rect) = self
                     .page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
                     && let Some((r0, c0, r1, c1)) =
-                        visible_tile_range(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN)
+                        visible_tile_range_axis(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN, config::pdf::TILE_MARGIN_COL)
                 {
                     for row in r0..=r1 {
                         for col in c0..=c1 {
@@ -1280,7 +1346,7 @@ impl PdfViewer {
             if let Some(rect) = self
                 .page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
                 && let Some((r0, c0, r1, c1)) =
-                    visible_tile_range(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN)
+                    visible_tile_range_axis(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN, config::pdf::TILE_MARGIN_COL)
             {
                 for row in r0..=r1 {
                     for col in c0..=c1 {
@@ -1401,6 +1467,15 @@ impl PdfViewer {
                 continue;
             }
             let cscale = cover_scale(self.dims[page], self.page_width(), scale_factor);
+            // **P1 ③（邻居降密可采）**：封面可接受密度 = 满密度 **或** 邻居降档密度
+            // （`COVER_SCALE_CAP_NEIGHBOR`）。可见页请求满密度、邻居页请求降档——收集侧无
+            // 需区分「当前是否可见」即可接受两者（真正过期档 = 两者都不匹配 → 走 S4 桥）。
+            // 可见↔邻居档间翻转由下次 `schedule_covers` 的 stale 判定（旧档 → 桥 → 重派新档）
+            // 自愈，入视不闪白。
+            let want = |s: f32| {
+                (s - cscale).abs() <= 1e-4
+                    || (s - cscale.min(config::pdf::COVER_SCALE_CAP_NEIGHBOR)).abs() <= 1e-4
+            };
             // W1：同 `collect_tile_results` 的世代守卫——旧着色封面晚到即弃。
             if !self.gpu_recolor && res.recolor_epoch != self.recolor_epoch {
                 continue;
@@ -1416,7 +1491,7 @@ impl PdfViewer {
             if self.zoom_armed {
                 continue; // 移除了 pending（非封面失败，不计数）
             }
-            if (req_scale - cscale).abs() > 1e-4 {
+            if !want(req_scale) {
                 // 缩放/DPI 已变 → 本密度封面过期。**S4 最新档桥**：过期封面正是本手势的
                 // 中间档（req_scale ≠ 当前 cscale），且该页当前档封面尚未入槽 → 比「手势前
                 // 旧封面」更贴近当前显示密度的中间档，转存进有界 `prev_cover` 槽（覆盖旧桥，
@@ -1425,7 +1500,9 @@ impl PdfViewer {
                 // 缩小（req_scale > cscale）同理。z 过期若该页当前档封面已入槽则不覆盖
                 // （新封面即锐，桥无用）。
                 if self.slots[page].cover.is_none() {
-                    if let Ok(img) = render_image_from_bgra(res.bgra, res.width, res.height) {
+                    if let Ok(img) =
+                        crate::pdf::wrap_render_image(res.bgra, res.width, res.height, res.luma)
+                    {
                         if let Some(s) = self.slots.get_mut(page) {
                             if let Some(prev) = s.prev_cover.replace(img) {
                                 self.pending_drops.push(prev);
@@ -1436,7 +1513,7 @@ impl PdfViewer {
                 continue; // 移除 pending（非封面失败，不计数）
             }
             let (w, h) = (res.width, res.height);
-            let Ok(img) = render_image_from_bgra(res.bgra, w, h) else {
+            let Ok(img) = crate::pdf::wrap_render_image(res.bgra, w, h, res.luma) else {
                 // W2：建图失败视同封面失败（计数路径同上）。
                 self.cover_failed(page);
                 continue;
@@ -1449,7 +1526,7 @@ impl PdfViewer {
                 if let Some(prev) = s.prev_cover.take() {
                     self.pending_drops.push(prev);
                 }
-                s.cover_scale = cscale;
+                s.cover_scale = req_scale; // 实际渲染密度（可见满密度 / 邻居降档，P1 ③）
                 // **T1**：封面 = 全页同密度整页位图，覆盖整页 → **不再在封面到位时把该页
                 // 已示瓦片整体作废/drain**（旧语义「同密度封面一到即清空瓦片」= 把「瓦片
                 // 先派」的成果一轮作废，恰是首屏双重栅格税的后半段；封面先行后本分支应
@@ -1699,7 +1776,9 @@ impl PdfViewer {
                     let (w, h) = (res.width, res.height);
                     if let Some(s) = self.slots.get_mut(i) {
                         s.thumb_loading = false;
-                        if let Ok(img) = render_image_from_bgra(res.bgra, w, h) {
+                        if let Ok(img) =
+                            crate::pdf::wrap_render_image(res.bgra, w, h, res.luma)
+                        {
                             s.thumb = Some(img);
                         }
                         any = true;
@@ -1730,7 +1809,9 @@ impl PdfViewer {
                     let (w, h) = (res.width, res.height);
                     if let Some(s) = self.slots.get_mut(i) {
                         s.mid_loading = false;
-                        if let Ok(img) = render_image_from_bgra(res.bgra, w, h) {
+                        if let Ok(img) =
+                            crate::pdf::wrap_render_image(res.bgra, w, h, res.luma)
+                        {
                             // 替换旧中清：旧纹理走 pending_drops 显式下线
                             if let Some(old) = s.mid.replace(img) {
                                 self.pending_drops.push(old);
@@ -1988,6 +2069,14 @@ impl PdfViewer {
             {
                 continue;
             }
+            // **P1 ④（同页去重）**：当前密度 1:1 瓦片在位的页已有 ≥0.5 供给，跳过 preview。
+            if !slot.tiles.is_empty()
+                && (slot.tile_scale - render_scale(page_width, scale_factor, self.dims[page].0))
+                    .abs()
+                    <= 1e-4
+            {
+                continue;
+            }
             if self.pending_cover.contains_key(&page)
                 || self.pending_prefetch_cover.contains_key(&page)
             {
@@ -2088,6 +2177,12 @@ impl PdfViewer {
             {
                 continue;
             }
+            // **P1 ④（同页去重）**：当前密度 1:1 瓦片已在位 → 已有 ≥0.5 供给，跳过 preview。
+            if !slot.tiles.is_empty()
+                && (slot.tile_scale - render_scale(page_width, scale_factor, dim.0)).abs() <= 1e-4
+            {
+                continue;
+            }
             if self.pending_prefetch_cover.contains_key(&page)
                 || self.pending_cover.contains_key(&page)
             {
@@ -2164,13 +2259,14 @@ impl PdfViewer {
                 };
                 let bmp = page_bitmap_size(dim, cur);
                 let disp_h = display_height(dim, page_width);
-                let Some((r0, c0, r1, c1)) = visible_tile_range(
+                let Some((r0, c0, r1, c1)) = visible_tile_range_axis(
                     bmp,
                     page_width,
                     disp_h,
                     rect,
                     TILE_SIZE,
                     TILE_MARGIN,
+                    config::pdf::TILE_MARGIN_COL,
                 ) else {
                     continue;
                 };
@@ -2238,11 +2334,17 @@ impl PdfViewer {
     /// 漏网脏结果，无需改。中清/缩略无密度区分，不参与（低清底图缩放无关）。幂等，armed 每帧
     /// 调用安全。
     pub(super) fn drop_stale_scale_pending(&mut self, page_width: f32, scale_factor: f32) {
-        // 在途封面：键=页，条目 (scale, recolor_epoch, nav_gen, rx)。
+        // 在途封面：键=页，条目 (scale, recolor_epoch, nav_gen, rx)。**P1 ③**：密度判据与
+        // `collect_cover_results`/`schedule_covers` 同源——满密度 **或** 邻居降档密度都视为有效
+        // （否则邻居页 2.0 在途封面会在每个 armed 帧被误清 → 下次 settle 重派 → 逐档抢派计数
+        // 虚增，`zoom_gesture_dispatches_only_preview` 回归命中）。
         self.pending_cover.retain(|page, v| {
             let s = v.0;
-            *page < self.dims.len()
-                && (s - cover_scale(self.dims[*page], page_width, scale_factor)).abs() <= 1e-4
+            *page < self.dims.len() && {
+                let cscale = cover_scale(self.dims[*page], page_width, scale_factor);
+                (s - cscale).abs() <= 1e-4
+                    || (s - cscale.min(config::pdf::COVER_SCALE_CAP_NEIGHBOR)).abs() <= 1e-4
+            }
         });
         // 在途瓦片：键=(页,row,col)，条目 (scale, nav_gen, rx)。
         self.pending_tiles.retain(|key, v| {

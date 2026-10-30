@@ -184,13 +184,17 @@ pub struct TileResult {
     pub full_w: u32,
     /// 页位图全高（= ceil(页pt高 × scale)）。
     pub full_h: u32,
-    /// 紧凑 RGBA 像素（`w*h*4` 字节；pdfium 反字节序后即 RGBA）。
+    /// 紧凑 BGRA 像素（`w*h*4` 字节）或 **R8 luma**（`w*h*1` 字节，`luma == true` 时；
+    /// pdfium 反字节序后即 BGRA）。
     pub bgra: Vec<u8>,
     /// W1：渲染该瓦片时 worker 侧该文档的**重着色世代号**（`SetRecolor` 按文档递增世代，
     /// 见 `run` 循环）。由 `run` 循环按 doc 回填；view 侧 `collect_tile_results` 丢弃
     /// 世代 ≠ 当前的到达结果——杜绝「CPU 回退路径切档后，旧色重栅结果晚到覆盖新参数」的
     /// 乱序窗口（GPU 门控下结果恒为 raw，着色在绘制时，不受影响）。构造留 0 占位待回填。
     pub recolor_epoch: u64,
+    /// P2：`bgra` 是否为 **R8 单通道 luma**（1BPP，`w*h*1`）——GPU 重着色 + FullBand +
+    /// `ink=Some` 门控激活时 worker 编码成 luma（-4× 无损）。view 侧按此选包装路径。
+    pub luma: bool,
 }
 
 /// 渲染结果：页面 **BGRA 像素字节** + 位图像素 (宽, 高)。
@@ -210,6 +214,9 @@ pub struct RenderResult {
     /// 由 `run` 循环按 doc 回填）。view 侧 `collect_cover_results` 丢弃世代 ≠ 当前的到达
     /// 结果。构造留 0 占位待回填。
     pub recolor_epoch: u64,
+    /// P2：`bgra` 是否为 **R8 单通道 luma**（1BPP，`width*height*1`）——GPU 门控激活时
+    /// worker 编码成 luma（-4× 无损）。view 侧按此选包装路径。
+    pub luma: bool,
 }
 
 /// 重着色刷新的位图来源类别（对应 view 层四个槽位类：整页封面 / 瓦片 / 中清 / 缩略）。
@@ -2208,6 +2215,7 @@ fn finalize_render(
     mut bgra: Vec<u8>,
     recolor: Option<RecolorParams>,
     gpu: bool,
+    luma: bool,
 ) -> Vec<u8> {
     if gpu && recolor.is_some() {
         // 真机诊断 2/4：门控下跳过 CPU 着色直传原图——首个封面/瓦片各打一次（latch）。
@@ -2221,6 +2229,11 @@ fn finalize_render(
         // 2× 尖峰）。条件只取决于 GPU/CPU 门控、不取决于当前 recolor 是否 Some：CPU 模式
         // 即使当前 recolor=None 也应保持缓存（用户随时可开夜间，缓存供
         // `SetRecolor`/`RecolorRefresh` 消费、回看按新参现算）。
+        // P2 R8：门控激活（GPU + FullBand + ink）时，出口编码成单通道感知亮度（-4× 无损）——
+        // GPU shader 的 FullBand 分支只依赖亮度、不读原色，位图只存 luma 数学无损。
+        if luma {
+            bgra = crate::recolor::encode_bgra_to_luma(&bgra);
+        }
         return bgra;
     }
     // CPU 重着色回退路径：raw 缓存只服务「重着色刷新」的消费方（`RecolorRefresh` 圈定的
@@ -2377,6 +2390,8 @@ fn render_page(
     // BGRA 的 stride 恒为 `width*4`（无对齐填充，见 preferred_stride_bytes）。
     // `as_raw_bytes()` 直接返回整块原生 BGRA 缓冲 → 主线程 `Frame::from_raw` 直接包裹。
     let bgra = bmp.as_raw_bytes();
+    // P2 R8 门控（GPU + FullBand + ink）：出口编码成单通道亮度（-4× 无损）。
+    let luma = crate::recolor::luma_gate_active(recolor, gpu);
     // 未着色原图入缓存（单真值）+ 出口着色副本（切档可基于缓存 raw 重着色，不重调 pdfium）。
     let bgra = finalize_render(
         cache,
@@ -2394,6 +2409,7 @@ fn render_page(
         bgra,
         recolor,
         gpu,
+        luma,
     );
     if timing() {
         eprintln!(
@@ -2411,6 +2427,7 @@ fn render_page(
         width: w as u32,
         height: h as u32,
         recolor_epoch: 0, // W1：由 run 循环按 doc 世代回填
+        luma,
     })
 }
 
@@ -2447,6 +2464,8 @@ fn render_tile(
     )
     .ok()?;
     let bgra = dst.as_raw_bytes();
+    // P2 R8 门控（GPU + FullBand + ink）：出口编码成单通道亮度（-4× 无损）。
+    let luma = crate::recolor::luma_gate_active(recolor, gpu);
     // 未着色原图入缓存（单真值）+ 出口着色副本（切档可基于缓存 raw 重着色，不重调 pdfium）。
     let bgra = finalize_render(
         cache,
@@ -2464,6 +2483,7 @@ fn render_tile(
         bgra,
         recolor,
         gpu,
+        luma,
     );
     let res = TileResult {
         page: req.page,
@@ -2477,6 +2497,7 @@ fn render_tile(
         full_h: bmp.1,
         bgra,
         recolor_epoch: 0, // W1：由 run 循环按 doc 世代回填
+        luma,
     };
     if timing() {
         let end = std::time::Instant::now();
@@ -3315,6 +3336,7 @@ mod tests {
             vec![7, 7, 7, 255],
             Some(RecolorParams { bg: [0x20, 0x20, 0x20], ink: None }),
             false,
+            false,
         );
         assert_eq!(cache.len(), 1, "同密度复用不应新增条目");
         let _ = out;
@@ -3340,7 +3362,8 @@ mod tests {
 
     /// 内存去冗余（worker 侧缓存条件化，纯逻辑零 pdfium）：GPU 门控（`gpu=true`）下
     /// `finalize_render` **不写 raw 缓存**且 `bgra` **move 直传**（返回 == 入参原图，逐字节
-    /// 等值，无 clone 副本）；CPU 回退（`gpu=false`）照常写缓存 + 着色副本。条件只取决于
+    /// 等值，无 clone 副本）；P2 R8（`luma=true`）出口编码成单通道亮度（1BPP，-4×）——仍
+    /// 不写缓存、不 clone 原图。CPU 回退（`gpu=false`）照常写缓存 + 着色副本。条件只取决于
     /// GPU/CPU 门控、不取决于当前 recolor 是否 Some：CPU 模式即使 recolor=None 也应保持缓存。
     #[test]
     fn finalize_render_gpu_skips_cache_and_cpu_writes_it() {
@@ -3348,7 +3371,8 @@ mod tests {
         let arg = |cache: &mut Vec<RawEntry>,
                    bgra: Vec<u8>,
                    recolor: Option<RecolorParams>,
-                   gpu: bool| {
+                   gpu: bool,
+                   luma: bool| {
             finalize_render(
                 cache,
                 RawKind::Tile,
@@ -3365,23 +3389,35 @@ mod tests {
                 bgra,
                 recolor,
                 gpu,
+                luma,
             )
         };
         let night = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
 
-        // GPU 门控：即使 recolor=Some 也不写缓存、不克隆，出口 == 原图逐字节等值。
+        // GPU 门控 + 非 R8（luma=false）：不写缓存、不克隆，出口 == 原图逐字节等值。
         let mut gpu_cache: Vec<RawEntry> = Vec::new();
-        let out = arg(&mut gpu_cache, raw.clone(), Some(night), true);
+        let out = arg(&mut gpu_cache, raw.clone(), Some(night), true, false);
         assert!(gpu_cache.is_empty(), "GPU 门控不应写 raw 缓存");
         assert_eq!(out, raw, "GPU 出口应 move 直传原图（逐字节等值，无克隆副本）");
+
+        // P2 R8（luma=true）：出口编码成 1BPP 亮度（-4×），仍不写缓存、不克隆原图。
+        let mut r8_cache: Vec<RawEntry> = Vec::new();
+        let out_r8 = arg(&mut r8_cache, raw.clone(), Some(night), true, true);
+        assert!(r8_cache.is_empty(), "GPU+R8 也不应写 raw 缓存");
+        assert_eq!(
+            out_r8,
+            crate::recolor::encode_bgra_to_luma(&raw),
+            "R8 出口应编码成单通道亮度（w*h*1）"
+        );
+        assert_eq!(out_r8.len(), 1, "R8 出口应为 1BPP（原 4BPP 的 1/4）");
 
         // CPU 门控：照常写缓存 + 着色副本；recolor=None 也应保持缓存（用户随时可切夜间，
         // 缓存供 SetRecolor/RecolorRefresh 消费）。
         let mut cpu_cache: Vec<RawEntry> = Vec::new();
-        let out_none = arg(&mut cpu_cache, raw.clone(), None, false);
+        let out_none = arg(&mut cpu_cache, raw.clone(), None, false, false);
         assert_eq!(cpu_cache.len(), 1, "CPU 路径（recolor=None）也应写缓存");
         assert_eq!(out_none, raw, "None 直通出口 = 原图");
-        let out_night = arg(&mut cpu_cache, raw.clone(), Some(night), false);
+        let out_night = arg(&mut cpu_cache, raw.clone(), Some(night), false, false);
         assert_ne!(out_night, raw, "CPU + Some 应着色（与未着色原图不同）");
         assert_eq!(cpu_cache.len(), 1, "同密度同尺寸复用不新增条目");
     }
