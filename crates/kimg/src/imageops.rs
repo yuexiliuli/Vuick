@@ -172,8 +172,12 @@ where
     I::Pixel: Pixel<Subpixel: FloatChannel>,
 {
     let (width, height) = image.dimensions();
+    // 空源语义与 image 0.25 一致：直接返回「请求尺寸」的零图（避免除零与超大中间分配）。
+    if width == 0 || height == 0 {
+        return ImageBuffer::new(nwidth, nheight);
+    }
     let (nwidth, nheight) = resize_dimensions(width, height, nwidth, nheight);
-    if nwidth == 0 || nheight == 0 || width == 0 || height == 0 {
+    if nwidth == 0 || nheight == 0 {
         return ImageBuffer::new(nwidth, nheight);
     }
 

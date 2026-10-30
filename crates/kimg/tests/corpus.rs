@@ -223,47 +223,59 @@ fn parity_corpus() {
                 webp_files += 1;
                 let kd = kimg::codecs::webp::WebPDecoder::new(Cursor::new(&bytes[..]));
                 let id = image::codecs::webp::WebPDecoder::new(Cursor::new(&bytes[..]));
-                if kd.is_ok() && id.is_ok() {
-                    let kf_iter = kd.unwrap().into_frames();
-                    let if_iter = id.unwrap().into_frames();
-                    let kf: Vec<_> = kf_iter.collect();
-                    let im: Vec<_> = if_iter.collect();
-                    if kf.len() != im.len() {
-                        println!("[不一致] {name}: webp 帧数量 {} vs {}", kf.len(), im.len());
-                        stats.mismatch += 1;
-                    } else {
-                        let mut frame_ok = true;
-                        for (k, i) in kf.iter().zip(im.iter()) {
-                            match (k, i) {
-                                (Ok(kf), Ok(im)) => {
-                                    if kf.buffer().as_raw() != im.buffer().as_raw()
-                                        || kf.delay().numer_denom_ms()
-                                            != im.delay().numer_denom_ms()
-                                    {
-                                        println!("[不一致] {name}: webp 帧内容/延迟不同");
+                match (kd, id) {
+                    (Ok(kd), Ok(id)) => {
+                        let kf_iter = kd.into_frames();
+                        let if_iter = id.into_frames();
+                        let kf: Vec<_> = kf_iter.collect();
+                        let im: Vec<_> = if_iter.collect();
+                        if kf.len() != im.len() {
+                            println!("[不一致] {name}: webp 帧数量 {} vs {}", kf.len(), im.len());
+                            stats.mismatch += 1;
+                        } else {
+                            let mut frame_ok = true;
+                            for (k, i) in kf.iter().zip(im.iter()) {
+                                match (k, i) {
+                                    (Ok(kf), Ok(im)) => {
+                                        if kf.buffer().as_raw() != im.buffer().as_raw()
+                                            || kf.delay().numer_denom_ms()
+                                                != im.delay().numer_denom_ms()
+                                        {
+                                            println!("[不一致] {name}: webp 帧内容/延迟不同");
+                                            stats.mismatch += 1;
+                                            frame_ok = false;
+                                            break;
+                                        }
+                                    }
+                                    (Err(ke), Ok(_)) => {
+                                        println!("[不一致] {name}: kimg webp 帧失败({ke:?})");
                                         stats.mismatch += 1;
                                         frame_ok = false;
                                         break;
                                     }
+                                    (Ok(_), Err(ie)) => {
+                                        println!("[不一致] {name}: image webp 帧失败({ie:?})");
+                                        stats.mismatch += 1;
+                                        frame_ok = false;
+                                        break;
+                                    }
+                                    _ => {}
                                 }
-                                (Err(ke), Ok(_)) => {
-                                    println!("[不一致] {name}: kimg webp 帧失败({ke:?})");
-                                    stats.mismatch += 1;
-                                    frame_ok = false;
-                                    break;
-                                }
-                                (Ok(_), Err(ie)) => {
-                                    println!("[不一致] {name}: image webp 帧失败({ie:?})");
-                                    stats.mismatch += 1;
-                                    frame_ok = false;
-                                    break;
-                                }
-                                _ => {}
+                            }
+                            if frame_ok {
+                                stats.ok += 1;
                             }
                         }
-                        if frame_ok {
-                            stats.ok += 1;
-                        }
+                    }
+                    // 双双失败视为行为一致（与静态对照的容错口径一致）。
+                    (Err(_), Err(_)) => stats.ok += 1,
+                    (Err(ke), Ok(_)) => {
+                        println!("[不一致] {name}: kimg webp 解码失败({ke:?})，image 成功");
+                        stats.mismatch += 1;
+                    }
+                    (Ok(_), Err(ie)) => {
+                        println!("[不一致] {name}: image webp 解码失败({ie:?})，kimg 成功");
+                        stats.mismatch += 1;
                     }
                 }
             }

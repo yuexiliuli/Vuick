@@ -150,6 +150,17 @@ fn imageops_resize_sizes() {
     assert_eq!(small.dimensions(), (4, 4));
     assert_eq!(nearest.dimensions(), (4, 4));
     assert_eq!(small.get_pixel(0, 0).0[0], 0);
+
+    // 空源语义（image 0.25 一致）：返回请求尺寸的零图，不 panic、不超大分配。
+    let empty = RgbaImage::from_raw(0, 100, vec![]).unwrap();
+    let r = imageops::resize(&empty, 256, 256, FilterType::Lanczos3);
+    assert_eq!(r.dimensions(), (256, 256));
+    assert!(r.as_raw().iter().all(|&b| b == 0));
+    // 标题栏路径：288→64 精确落点。
+    let icon = RgbaImage::from_pixel(288, 288, Rgba([1, 2, 3, 255]));
+    let ic = imageops::resize(&icon, 64, 64, FilterType::Lanczos3);
+    assert_eq!(ic.dimensions(), (64, 64));
+    assert!(ic.as_raw().chunks_exact(4).any(|p| p[3] == 255));
 }
 
 #[test]
