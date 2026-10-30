@@ -122,3 +122,33 @@ pub const PRE_FETCH_COVER_INFLIGHT: usize = 2;
 pub const PREFETCH_COVER_BUDGET_BYTES: u64 = 40 * 1024 * 1024;
 /// 走廊窗口：可见页两侧各外扩的页数（idle 期间预取 [vis±2]，覆盖高速平移一两次大跳）。
 pub const PREFETCH_COVER_MARGIN: usize = 2;
+// ---- L1 滚动条快速跨页跳（直接送达落点，消灭拖完等救援的空白窗）----
+/// 大跳判定阈值（页数，L1.1）：`ensure_window` 每帧比较当前可见中心页与上帧可见中心页，
+/// 位移超过本值（MARGIN=3 + 走廊 ±2 已够不到的 6-8 页量级）即判定「大跳」→ 置 `jump_armed`
+/// + `jump_target=当前可见中心`，VeryFast 高速带据此对**落点页**满密度派发封面（而非纯平移
+/// 零派发），配合 L2 的 `nav_gen` 世代直接送达落点，消灭「拖完停手后 EMA 0.7ⁿ 衰减
+/// ~150-250ms 才重新调度」的空窗。取 7：介于普通一屏快滚（3-5 页）与滚动条/目录大跳（10+
+/// 页）之间；太小会把普通快滚误判成大跳而每帧 `nav_gen++` 清空在途（浪费），太大会让
+/// VeryFast 纯平移拖到停稳、落点页仍长期「加载中」。
+pub const JUMP_PAGES_THRESHOLD: usize = 7;
+/// 停稳快进检测的连续帧数 K（L1.3）：连续 K 帧滚动位移 < [`STOP_DETECT_PX`] → 速度**直落
+/// Slow**（绕过 0.7ⁿ EMA 衰减），令落点封面立刻被既有 Slow/Idle 调度消费。取 3：滚轮骤停的
+/// 前 1-2 帧惯性微移（1-2px）不误触；拖拽中手指微抖（单帧小位移）也不误触——需连续 3 帧
+/// 才判定停稳。
+pub const STOP_DETECT_FRAMES: u32 = 3;
+/// 停稳快进检测位移阈值（px/帧，L1.3）：连续 [`STOP_DETECT_FRAMES`] 帧 |Δy| < 本值 → 判定停稳。
+/// 取 2px：小于单个滚轮 notch（~1 行）的典型位移即为「停」；大于 2px 的持续滚动不误触。
+pub const STOP_DETECT_PX: f32 = 2.0;
+/// 走廊窗口随速度扩大的上限（页，L3.2）：M(v)=clamp(round(v/平均页高)+1, [`PREFETCH_COVER_MARGIN`],
+/// 本值)，高速平移（VeryFast，单帧穿越 4+ 页）期走廊不可能只用 [vis±2] 盖住 → 按速度把滑窗
+/// 拉大、滑窗 [vis±M(v)]。预算仍由 [`PREFETCH_COVER_BUDGET_BYTES`]=40MB LRU 封顶、
+/// [`PRE_FETCH_COVER_INFLIGHT`]=2/帧 跨帧消化，扩张只影响「先派哪个/先逐哪个」，不改变总预算。
+/// 取 8：0.5 密度 A4 ~2.6-5MB/页、40MB 可驻留 8-15 页，[vis±8]=17 窗口按距中心近远排序
+/// 「近的先派」，预算先覆盖最可能滚到的一圈；idle 速度≈0 时 M 回落基线 2，既有多测语义不变。
+pub const PREFETCH_COVER_MARGIN_MAX: usize = 8;
+/// 方向感知逐出（L3.3）的「回退侧驻留加成」（页数）：`evict_prefetch_covers` 的排序键
+/// `dist − bonus`，本加成只给「当前滚动方向回退侧、且在走廊窗内」的近期过页面——保这些
+/// 退位页的廊封面驻留（滚回瞬间有底图，不落「加载中」）。取 2 = [`PREFETCH_COVER_MARGIN`]：
+/// 只影响**同距离内的竞争顺序**，不改变任何预算/驻留计数（回退侧同距离页比远侧多驻留 2 名
+/// 的量级），既有内存护栏恒成立。
+pub const PREFETCH_RETURN_SIDE_BONUS: usize = 2;

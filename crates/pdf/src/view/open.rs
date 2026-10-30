@@ -44,6 +44,11 @@ impl PdfViewer {
             scroll_velocity: 0.0,
             prev_fast: false,
             speed_state: SpeedState::Idle,
+            nav_gen: 0, // L1/L2：导航世代（view 唯一真源，worker 经 Navigate 镜像）
+            jump_armed: false,
+            jump_target: None,
+            last_center_page: None,
+            stop_small_frames: 0,
             scroll: ScrollHandle::new(),
             loading: true,
             load_error: None,
@@ -411,6 +416,12 @@ impl PdfViewer {
         self.pending_tiles.clear();
         self.pending_cover.clear();
         self.pending_prefetch_cover.clear();
+        // L1/L2：大跳/停稳状态随文档释放复位（worker 侧 navigate_gen 已在 `worker.close` 内
+        // 清掉，nav_gen 单调递增不碍复用——worker 采纳 max，旧世代永不误 drop 新请求）。
+        self.jump_armed = false;
+        self.jump_target = None;
+        self.last_center_page = None;
+        self.stop_small_frames = 0;
         self.prefetch_reqs = 0;
         self.loading_placeholder_hits.set(0);
         self.pending_recolor = None;
@@ -561,6 +572,9 @@ impl PdfViewer {
         let dy = jump.abs();
         self.scroll_velocity = self.scroll_velocity * 0.7 + dy * 0.3;
         self.update_fast_flag();
+        // L1.3 停稳快进：连续 K=3 帧 |Δy|<2px → 速度直落 Slow（绕过 0.7ⁿ EMA 衰减），
+        // 令落点封面立刻可被 Slow/Idle 调度消费（拖拽停稳不再等 150-250ms 的指数衰减）。
+        self.update_stop_detection(dy);
         self.last_scroll_y = scroll_y;
 
         let viewport_h = f32::from(self.scroll.bounds().size.height);
@@ -602,6 +616,10 @@ impl PdfViewer {
 
         let (start, end) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
         let center = (start + end) / 2;
+        // L1.1 大跳检测（每帧 update_fast_flag 后、调度前）：当前可见中心页位移超过
+        // JUMP_PAGES_THRESHOLD → 置 jump_armed/jump_target + nav_gen++ 并清掉旧世代在途
+        // 条目（预算立即释放）；快速连续跳每帧重算落点、后到覆盖先到。
+        self.update_nav_jump(start, end, page_width, scroll_y, viewport_h, window);
 
         // 4) L0 缩略图内存封顶：保留数超 THUMB_CACHE_PAGES 时丢离视口中心最远的，
         //    拆除走 `drop_image`（显式下线 GPU 纹理工卡，否则仅丢 Arc 会累积显存提交）。
@@ -670,6 +688,12 @@ impl PdfViewer {
         //    中速带（Fast）→ 满密度封面优先、封面不可负担页回退中清/缩略占位；
         //    高速带（VeryFast）→ 纯平移不派新栅格（含占位，渲染队列不加活），新进页由 F4
         //    预取走廊兜底。之后统一做瓦片字节预算淘汰。
+        // L1.2：速度离开 VeryFast → 落点直达使命结束（后续由停稳/常态调度接管），清零
+        // `jump_armed`/`jump_target`——防止旧落点标记在下次高速带残留派发旧窗封面。
+        if self.speed_state != SpeedState::VeryFast {
+            self.jump_armed = false;
+            self.jump_target = None;
+        }
         match self.speed_state {
             SpeedState::Idle | SpeedState::Slow => {
                 self.schedule_tiles(window, start, end, page_width, scale_factor, scroll_y);
@@ -686,9 +710,16 @@ impl PdfViewer {
                 );
             }
             SpeedState::VeryFast => {
-                // 纯平移：不派任何新栅格（封面/瓦片/占位一律不加活）。已缓存封面/瓦片原位
-                // 即锐；新进视口未缓存页由 F4 预取走廊兜底（idle/Fast 期已把 [vis±2] 填上半
-                // 密度封面；进入极快导致无隙时短暂「加载中」、降速即恢复，属可接受取舍）。
+                // 极快平移主路径：不派可见页新栅格（封面/瓦片/占位一律不加活）——已缓存
+                // 封面/瓦片原位即锐；新进视口未缓存页由 F4 预取走廊兜底（L3.1 起走廊在
+                // 四主队列空时仍补 0.5 密度封面，≤2/帧、40MB 预算封顶），个别无隙页短暂
+                // 「加载中」、降速即恢复，属可接受取舍。
+                // **L1+L2 大跳落点直达**：`jump_armed` 为真时不再纯平移零派发——转对落点页
+                // （`update_nav_jump` 刚武装的 `jump_target`）满密度派发封面（≤COVER_INFLIGHT
+                // 复用既有预算；nav_gen 世代保证快速连续跳只渲染最新落点，旧请求出队即被
+                // worker drop、在途旧结果被 view 清 pending 丢弃）。落点窗全部在槽/在途后
+                // `maybe_dispatch_jump_covers` 自行清零；停稳后由 L1.3 直落 Slow 常态接管。
+                self.maybe_dispatch_jump_covers(page_width, scale_factor);
             }
         }
         // F4/B：非 idle 帧（窗口有移动/调度运行）按当前可见中心收回走廊窗外的旧廊封面

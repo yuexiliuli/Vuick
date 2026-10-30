@@ -62,8 +62,9 @@ use ui::scrollbar::{Scrollbar, ScrollbarMode};
 use crate::recolor::RecolorParams;
 use crate::pdf::parser::{RawKind, RecolorKey};
 
-/// 在途瓦片请求记录：`(派发时密度 scale, 结果通道)`。
-pub(crate) type PendingTileEntry = (f32, mpsc::Receiver<Option<TileResult>>);
+/// 在途瓦片请求记录：`(派发时密度 scale, 导航世代 nav_gen, 结果通道)`。
+/// `nav_gen` 用于 L2.4：大跳（`nav_gen++`）当帧清掉世代 < 新 gen 的在途条目，预算立即释放。
+pub(crate) type PendingTileEntry = (f32, u64, mpsc::Receiver<Option<TileResult>>);
 
 /// 静态帧门控签名（Sprint 5）：本帧到上帧「滚动 / 缩放 / DPI / 视口尺寸 / 页数」的
 /// 变化判定信号。任一维不同 → 帧状态已变，必须恢复 keep_window/schedule/evict 全量
@@ -146,9 +147,11 @@ pub(crate) enum UndoEntry {
 }
 
 use config::pdf::{
-    COVER_INFLIGHT, IMAGE_CACHE_PAGES, IMAGE_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT,
-    MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, MOVE_THRESHOLD_VERY_RATIO,
-    PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES,
+    COVER_INFLIGHT, IMAGE_CACHE_PAGES, IMAGE_INFLIGHT, PREFETCH_COVER_MARGIN,
+    PREFETCH_COVER_MARGIN_MAX, PREFETCH_RETURN_SIDE_BONUS, JUMP_PAGES_THRESHOLD,
+    MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO,
+    MOVE_THRESHOLD_PX, MOVE_THRESHOLD_VERY_RATIO, PAGE_PAD_X, PAGE_WIDTH, STOP_DETECT_FRAMES,
+    STOP_DETECT_PX, TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES,
     TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
 };
 use crate::pdf::layout::{
@@ -242,23 +245,33 @@ pub struct PdfViewer {
     /// 每页渲染槽（含瓦片缓存 + 缩略/中清占位）。
     pub(crate) slots: Vec<Slot>,
     /// 在途 **L0 缩略图**请求的结果接收通道（独立于瓦片额度）。
-    pub(crate) pending_thumb: HashMap<usize, mpsc::Receiver<Option<RenderResult>>>,
+    /// L2.4：条目为 `(导航世代 nav_gen, 结果通道)`，大跳世代推进时按 `nav_gen` 清旧条目。
+    pub(crate) pending_thumb: HashMap<usize, (u64, mpsc::Receiver<Option<RenderResult>>)>,
     /// 在途 **L0.5 中清页**请求的结果接收通道（快速拖动占位）。
-    pub(crate) pending_mid: HashMap<usize, mpsc::Receiver<Option<RenderResult>>>,
+    /// L2.4：条目为 `(导航世代 nav_gen, 结果通道)`，大跳世代推进时按 `nav_gen` 清旧条目。
+    pub(crate) pending_mid: HashMap<usize, (u64, mpsc::Receiver<Option<RenderResult>>)>,
     /// 中清页内存 LRU 顺序（最近使用在队尾）。纹理本体就在 `slots[i].mid`
     /// （O(1) 主线程查找），本队列只用于淘汰顺序。
     pub(crate) mid_lru: VecDeque<usize>,
-    /// 在途**瓦片**请求：`(页, row, col)` → (请求时密度 scale, 结果通道)。
+    /// 在途**瓦片**请求：`(页, row, col)` → (请求时密度 scale, 导航世代 nav_gen, 结果通道)。
     /// `scale` 用于结果到达时的密度守卫：缩放/换 DPI 后旧密度瓦片直接丢弃。
+    /// `nav_gen` 用于 L2.4：大跳世代推进时按世代清旧条目（预算立即释放，不占死 COVER_INFLIGHT）。
     pub(crate) pending_tiles: HashMap<(usize, u32, u32), PendingTileEntry>,
-    /// 在途**封面**（首屏整页锐化）请求：`页` → (密度 scale, **请求时 recolor 世代**, 结果通道)。
-    /// 世代用于 `collect_cover_results` 的失败计数语义（旧世代请求的失败不拉黑，评审 NIT）——
-    /// 成功路径的世代守卫直接用 worker 回传的 `res.recolor_epoch`，不需此值。
-    pub(crate) pending_cover: HashMap<usize, (f32, u64, mpsc::Receiver<Option<RenderResult>>)>,
-    /// F4 空闲预取走廊在途请求：`页` → (半密度 scale, 结果通道)。独立于 [`Self::pending_cover`]
-    /// （密度守卫不同：0.5× 封面、低优先级、仅空闲期消化），见 `tiles::collect_prefetch_cover_results`
-    /// 与 `tiles::prefetch_corridor`。非空期间自刷新泵继续出帧以收集走廊结果。
-    pub(crate) pending_prefetch_cover: HashMap<usize, (f32, mpsc::Receiver<Option<RenderResult>>)>,
+    /// 在途**封面**（首屏整页锐化）请求：`页` → (密度 scale, **请求时 recolor 世代**,
+    /// **导航世代 nav_gen**, 结果通道)。recolor 世代用于 `collect_cover_results` 的失败计数
+    /// 语义（旧世代请求的失败不拉黑，评审 NIT）；`nav_gen` 用于 L2.4 大跳世代推进清旧条目。
+    pub(crate) pending_cover: HashMap<
+        usize,
+        (f32, u64, u64, mpsc::Receiver<Option<RenderResult>>),
+    >,
+    /// F4 空闲预取走廊在途请求：`页` → (半密度 scale, 导航世代 nav_gen, 结果通道)。独立于
+    /// [`Self::pending_cover`]（密度守卫不同：0.5× 封面、低优先级、仅空闲期消化），见
+    /// `tiles::collect_prefetch_cover_results` 与 `tiles::prefetch_corridor`。非空期间自刷新泵
+    /// 继续出帧以收集走廊结果。`nav_gen` 用于 L2.4 大跳世代推进清旧条目。
+    pub(crate) pending_prefetch_cover: HashMap<
+        usize,
+        (f32, u64, mpsc::Receiver<Option<RenderResult>>),
+    >,
     /// F4 观测计数：累计向 worker 派发的**走廊封面**栅格请求数（回归断言 idle 预取确实
     /// 发生、且窗口移动后不再增长用；纯观测，无副作用）。
     pub(crate) prefetch_reqs: u64,
@@ -302,6 +315,24 @@ pub struct PdfViewer {
     /// 滚动速度分带（F3）：决定每帧调度形态（常态瓦片 / 中速封面 / 高速纯平移）。
     /// `prev_fast` = `speed_state.is_fast()` 的派生布尔（两者由 `update_fast_flag` 同步更新）。
     pub(crate) speed_state: SpeedState,
+    /// L1/L2：**导航世代**（唯一真源在 view；worker 侧经 [`WorkerMsg::Navigate`] 消息镜像，
+    /// 不自行递增）。大跳（见 `update_nav_jump`）每帧至多 +1，当帧清掉世代 < 新 gen 的全部
+    /// 在途条目（预算立即释放）、并让 worker 出队时跳过旧世代请求——快速连续跳只渲染最新
+    /// 落点，消灭「拖完等 EMA 衰减 150-250ms 才调度」的空窗。非大跳的常态滚动保持 0 不影响
+    /// 任何既有路径。与 `recolor_epoch` 正交（世代推进不清黑名单，W2 语义不变）。
+    pub(crate) nav_gen: u64,
+    /// L1.1：大跳派发已武装（VeryFast 高速带跳转到落点页满密度派发封面的开关）。
+    /// 置位后 `dispatch_jump_covers` 以 `jump_target` 为窗派封面；落点窗封面全部在槽/在途或
+    /// 速度离开 VeryFast 后清零。快速连续跳/变向时每帧由 `update_nav_jump` 重算（后到覆盖
+    /// 先到，无积压队列）。
+    pub(crate) jump_armed: bool,
+    /// L1.1：当前大跳落点中心页（`update_nav_jump` 置位时 = 当前可见中心；快速连续跳重算）。
+    pub(crate) jump_target: Option<usize>,
+    /// L1.1：上一帧可见中心页（大跳检测基线；`None` = 首帧，不触发大跳）。
+    pub(crate) last_center_page: Option<usize>,
+    /// L1.3：停稳检测的连续「小位移」帧计数（|Δy| < [`config::pdf::STOP_DETECT_PX`] 时递增、
+    /// 否则清零；达 [`config::pdf::STOP_DETECT_FRAMES`] 即直落 Slow 绕过 EMA 衰减）。
+    pub(crate) stop_small_frames: u32,
     /// 竖向滚动句柄（页列外层 scroll 容器）。
     pub(crate) scroll: ScrollHandle,
     /// 是否仍在后台解析。
@@ -476,6 +507,11 @@ mod tests {
                     scroll_velocity: 0.0,
                     prev_fast: false,
                     speed_state: SpeedState::Idle,
+                    nav_gen: 0,
+                    jump_armed: false,
+                    jump_target: None,
+                    last_center_page: None,
+                    stop_small_frames: 0,
                     scroll: ScrollHandle::new(),
                     loading: false,
                     load_error: None,
@@ -688,6 +724,11 @@ mod tests {
                     scroll_velocity: 0.0,
                     prev_fast: false,
                     speed_state: SpeedState::Idle,
+                    nav_gen: 0,
+                    jump_armed: false,
+                    jump_target: None,
+                    last_center_page: None,
+                    stop_small_frames: 0,
                     scroll: ScrollHandle::new(),
                     loading: false,
                     load_error: None,
@@ -813,6 +854,11 @@ mod tests {
                     scroll_velocity: 0.0,
                     prev_fast: false,
                     speed_state: SpeedState::Idle,
+                    nav_gen: 0,
+                    jump_armed: false,
+                    jump_target: None,
+                    last_center_page: None,
+                    stop_small_frames: 0,
                     scroll: ScrollHandle::new(),
                     loading: false,
                     load_error: None,
@@ -924,6 +970,11 @@ mod tests {
             scroll_velocity: 0.0,
             prev_fast: false,
             speed_state: SpeedState::Idle,
+            nav_gen: 0,
+            jump_armed: false,
+            jump_target: None,
+            last_center_page: None,
+            stop_small_frames: 0,
             scroll: ScrollHandle::new(),
             loading: false,
             load_error: None,
@@ -1013,7 +1064,7 @@ mod tests {
                     bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
                     recolor_epoch: 0, // 旧世代（A 色）
                 }));
-                v.pending_tiles.insert((0, 0, 0), (scale, rx));
+                v.pending_tiles.insert((0, 0, 0), (scale, 0, rx));
                 let any = v.collect_tile_results(1.0);
                 assert!(!any, "旧世代瓦片应被丢弃（不返回新位图）");
                 assert!(v.slots[0].tiles.is_empty(), "槽位不应被旧色瓦片覆盖");
@@ -1037,7 +1088,7 @@ mod tests {
                     bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
                     recolor_epoch: 1, // 当前世代（B 色）
                 }));
-                v.pending_tiles.insert((0, 0, 0), (scale, rx));
+                v.pending_tiles.insert((0, 0, 0), (scale, 0, rx));
                 let any = v.collect_tile_results(1.0);
                 assert!(any, "当前世代瓦片应被采纳");
                 assert!(v.slots[0].tiles.contains_key(&(0, 0)), "槽位应装入新世代瓦片");
@@ -1058,7 +1109,7 @@ mod tests {
                     height: bmp.1,
                     recolor_epoch: 0, // 旧世代
                 }));
-                v.pending_cover.insert(0, (cscale, 0, rx)); // 请求世代 0（旧）
+                v.pending_cover.insert(0, (cscale, 0, 0, rx)); // 请求世代 0（旧）+ 导航世代 0
                 let any = v.collect_cover_results(1.0);
                 assert!(!any, "旧世代封面应被丢弃");
                 assert!(v.slots[0].cover.is_none(), "封面槽不应被旧色覆盖");
@@ -1073,7 +1124,7 @@ mod tests {
                     height: bmp.1,
                     recolor_epoch: 1, // 当前世代
                 }));
-                v.pending_cover.insert(0, (cscale, 1, rx)); // 请求世代 1（当前）
+                v.pending_cover.insert(0, (cscale, 1, 0, rx)); // 请求世代 1（当前）+ 导航世代 0
                 let any = v.collect_cover_results(1.0);
                 assert!(any, "当前世代封面应被采纳");
                 assert!(v.slots[0].cover.is_some(), "封面槽应装入新世代封面");
@@ -1086,7 +1137,7 @@ mod tests {
             viewer.update(app, |v, _cx| {
                 let (tx, rx) = mpsc::channel();
                 let _ = tx.send(None::<RenderResult>);
-                v.pending_cover.insert(0, (cscale, 0, rx)); // 旧世代失败
+                v.pending_cover.insert(0, (cscale, 0, 0, rx)); // 旧世代失败（recolor 世代 0 + nav_gen 0）
                 let _any = v.collect_cover_results(1.0);
                 assert!(
                     !v.cover_failures.contains_key(&0),
@@ -1098,7 +1149,7 @@ mod tests {
             viewer.update(app, |v, _cx| {
                 let (tx, rx) = mpsc::channel();
                 let _ = tx.send(None::<RenderResult>);
-                v.pending_cover.insert(0, (cscale, 1, rx)); // 当前世代失败
+                v.pending_cover.insert(0, (cscale, 1, 0, rx)); // 当前世代失败（recolor 世代 1 + nav_gen 0）
                 let _any = v.collect_cover_results(1.0);
                 assert_eq!(
                     v.cover_failures.get(&0).copied(),
@@ -1154,7 +1205,7 @@ mod tests {
                 holder.borrow().as_ref().unwrap().update(app, |v, _cx| {
                     let (tx, rx) = mpsc::channel();
                     let _ = tx.send(None::<RenderResult>);
-                    v.pending_cover.insert(0, (cscale, 0, rx)); // 请求世代 0 == 当前（未切档）
+                    v.pending_cover.insert(0, (cscale, 0, 0, rx)); // 请求世代 0 == 当前（未切档）
                     let _any = v.collect_cover_results(1.0);
                 });
             });
@@ -1196,6 +1247,241 @@ mod tests {
         });
         assert!(need_before.is_empty(), "拉黑前封面供给：该页不应派瓦片");
         assert!(!need_after.is_empty(), "拉黑后回退瓦片供给：该页应派瓦片");
+    }
+
+    /// 构造 N 页的最小 viewer（复用 `minimal_viewer` 后替换布局/槽位）：纯逻辑
+    /// （L1/L3 走廊/大跳等）测试的几何基座，无 worker / 无 pdfium。
+    fn multi_page_viewer(cx: &mut gpui::Context<PdfViewer>, n: usize) -> PdfViewer {
+        let mut v = minimal_viewer(cx);
+        let dims = vec![(612.0, 792.0); n.max(1)];
+        let (tops, total) = compute_layout(&dims, PAGE_WIDTH);
+        v.dims = dims;
+        v.page_tops = tops;
+        v.total_height = total;
+        v.slots = vec![Slot::default(); n.max(1)];
+        v.scroll_dir = 0;
+        v
+    }
+
+    /// L1.3 **停稳快进（纯状态机）**：连续 K=3 帧 |Δy|<[`STOP_DETECT_PX`] → 速度直落 Slow
+    /// （绕过 0.7ⁿ EMA 衰减）；单帧小位移 / 中途 ≥2px 位移帧清零计数不误触；非快速态（Slow/
+    /// Idle）直落无副作用（保持原档）。
+    #[gpui::test]
+    async fn stop_detection_forces_slow_after_k_small_frames(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        let n = config::pdf::STOP_DETECT_FRAMES;
+        let v: gpui::Entity<PdfViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = multi_page_viewer(cx, 5);
+                v.speed_state = SpeedState::VeryFast;
+                v.prev_fast = true;
+                v
+            })
+        });
+        cx.update(|app| {
+            v.update(app, |v, _cx| {
+                for _ in 0..(n - 1) {
+                    v.update_stop_detection(1.0);
+                }
+                assert_eq!(
+                    v.speed_state,
+                    SpeedState::VeryFast,
+                    "不足 K 帧的微停不误触（保持快速态）"
+                );
+                assert!(v.prev_fast, "不足 K 帧 prev_fast 不变");
+                // 中途一帧 ≥2px → 计数清零；即便后面再补小帧也不直落（须重新连续 K 帧）
+                v.update_stop_detection(5.0);
+                for _ in 0..(n - 1) {
+                    v.update_stop_detection(0.0);
+                }
+                assert_eq!(
+                    v.speed_state,
+                    SpeedState::VeryFast,
+                    "中途大位移帧清零、不直落"
+                );
+                // 连续 K 帧小位移 → 直落 Slow
+                v.update_stop_detection(0.0);
+                assert_eq!(v.speed_state, SpeedState::Slow, "连续 K 帧小位移应直落 Slow");
+                assert!(!v.prev_fast, "直落 Slow 后 prev_fast 派生同步 false");
+                // 已 Slow/Idle 再小帧 → 无副作用（保持原档，不误伤既有状态机）
+                v.speed_state = SpeedState::Idle;
+                v.prev_fast = false;
+                v.update_stop_detection(0.0);
+                assert_eq!(v.speed_state, SpeedState::Idle, "非快速态直落无副作用");
+            });
+        });
+    }
+
+    /// L3.2 **走廊窗口随速度扩大（纯逻辑）**：M(v)=clamp(round(v/平均页高)+1,
+    /// [`PREFETCH_COVER_MARGIN`], [`PREFETCH_COVER_MARGIN_MAX`])——idle v≈0 → 回落基线 2
+    /// （既有 idle 走廊语义不变）；中速按速度放大且单调；极高 `scroll_velocity` 封顶到 MAX。
+    #[gpui::test]
+    async fn corridor_margin_scales_with_velocity_and_clamps(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        let avg_h = {
+            let dims = vec![(612.0, 792.0); 21];
+            let (_tops, total) = compute_layout(&dims, PAGE_WIDTH);
+            total / 21.0
+        };
+        let read_m = |cxt: &mut TestAppContext, vel: f32| -> usize {
+            cxt.update(|app| {
+                let v: gpui::Entity<PdfViewer> = app.new(|cx| multi_page_viewer(cx, 21));
+                v.update(app, |vv, _| vv.scroll_velocity = vel);
+                v.read(app).corridor_margin()
+            })
+        };
+        assert_eq!(
+            read_m(cx, 0.0),
+            config::pdf::PREFETCH_COVER_MARGIN,
+            "idle 速度回落基线"
+        );
+        assert_eq!(read_m(cx, avg_h * 3.0), 4, "v=3×平均页高 → round(3)+1=4");
+        assert_eq!(
+            read_m(cx, avg_h * 6.0),
+            7,
+            "v=6×平均页高 → round(6)+1=7（单调放大）"
+        );
+        assert_eq!(
+            read_m(cx, avg_h * 100.0),
+            config::pdf::PREFETCH_COVER_MARGIN_MAX,
+            "极高速度封顶到 MAX"
+        );
+    }
+
+    /// L3.3 **方向感知逐出（纯状态机）**：`evict_prefetch_covers` 排序键 = `dist − dir_bonus`，
+    /// bonus 只给「当前滚动方向回退侧（向下滚时页号<中心）」近期过页——廊封面超 40MB 预算
+    /// 从「最远/无回退加成」先逐，回退侧同距离页多驻留（滚回瞬间有底图）。只影响竞争顺序，
+    /// 不改变任何预算；窗口外回收语义不变。
+    #[gpui::test]
+    async fn evict_prefetch_direction_bonus_keeps_return_side_longer(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        let v: gpui::Entity<PdfViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = multi_page_viewer(cx, 21);
+                v.scroll_dir = 1; // 向下滚：回退侧 = 页号 < 中心
+                // 每页一枚 1×1 廊封面 + 大 `prefetch_cover_scale` 使估算字节显著 > 预算
+                // （21 枚 × ~5MB = ~100MB > 40MB → 强制窗内逐出，且各页字节相等 → 排序决定谁留）。
+                let img = render_image_from_bgra(vec![0x20, 0x20, 0x20, 255], 1, 1).expect("位图");
+                for slot in v.slots.iter_mut() {
+                    slot.prefetch_cover = Some(img.clone());
+                    slot.prefetch_cover_scale = 1.55;
+                }
+                v
+            })
+        });
+        cx.update(|app| {
+            v.update(app, |v, _cx| {
+                let center = 10usize;
+                let before: Vec<usize> = v
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.prefetch_cover.is_some())
+                    .map(|(p, _)| p)
+                    .collect();
+                assert_eq!(before.len(), 21, "预置 21 页廊封面");
+                v.evict_prefetch_covers(center);
+                let retained: Vec<usize> = v
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.prefetch_cover.is_some())
+                    .map(|(p, _)| p)
+                    .collect();
+                // 预算约束：保留的字节 ≤ 40MB（构造时每页 ~5MB → ≤8 页）；但逐出的**顺序**
+                // 必须回退侧（p<10）后逐：回退侧余页数 ≥ 前向侧余页数、且**最远保留的回退侧页
+                // 距中心 ≥ 最远保留的前向侧页距中心**（bonus=2 让前向侧同距离先逐）。
+                let return_side: Vec<usize> =
+                    retained.iter().copied().filter(|&p| p < center).collect();
+                let fwd_side: Vec<usize> =
+                    retained.iter().copied().filter(|&p| p > center).collect();
+                assert!(retained.contains(&center), "中心页保留");
+                assert!(
+                    return_side.len() >= fwd_side.len(),
+                    "回退侧（近期滚过的）应比前向侧多驻留：ret={return_side:?} fwd={fwd_side:?}"
+                );
+                let farthest_return_dist =
+                    center.saturating_sub(*return_side.first().unwrap_or(&center));
+                let farthest_fwd_dist = fwd_side
+                    .last()
+                    .copied()
+                    .map(|p| p.saturating_sub(center))
+                    .unwrap_or(0);
+                assert!(
+                    farthest_return_dist >= farthest_fwd_dist,
+                    "回退侧最近保留的余页应深于（距中心 ≥）前向侧最远保留页：ret_dist={farthest_return_dist} fwd_dist={farthest_fwd_dist}"
+                );
+                assert!(
+                    retained.len() <= 9,
+                    "超预算逐出后残余应显著小于 21 页：{}",
+                    retained.len()
+                );
+            });
+        });
+    }
+
+    /// L3.4 **cover→tile 换档不变式**：`collect_tile_results` / `evict_tiles` 在「同密度封面在
+    /// 位」的页上**只弃瓦片、绝不清 cover**（PDF.js prevCanvas 同款；换档期间封面是唯一稳定
+    /// 底图）。调度侧 `cover→tile` 的语义翻转（瓦片兜底）不得波及在位封面。
+    #[gpui::test]
+    async fn cover_to_tile_transition_never_clears_cover(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        let v: gpui::Entity<PdfViewer> = cx.update(|app| app.new(|cx| minimal_viewer(cx)));
+        let (cscale, scale, bmp) = cx.update(|app| {
+            let v = v.read(app);
+            let s = render_scale(v.page_width(), 1.0, v.dims[0].0);
+            (cover_scale(v.dims[0], v.page_width(), 1.0), s, page_bitmap_size(v.dims[0], s))
+        });
+        cx.update(|app| {
+            v.update(app, |v, _cx| {
+                // 同密度封面 + 一枚瓦片并存（模拟换档交界状态）
+                let cover = render_image_from_bgra(vec![0x30; 4], 1, 1).expect("封面位图");
+                v.slots[0].cover = Some(cover);
+                v.slots[0].cover_scale = cscale;
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(Some(TileResult {
+                    page: 0,
+                    row: 0,
+                    col: 0,
+                    x0: 0,
+                    y0: 0,
+                    w: bmp.0,
+                    h: bmp.1,
+                    full_w: bmp.0,
+                    full_h: bmp.1,
+                    bgra: vec![0u8; (bmp.0 * bmp.1 * 4) as usize],
+                    recolor_epoch: 0,
+                }));
+                v.pending_tiles.insert((0, 0, 0), (scale, 0, rx));
+                // ① collect_tile_results：同密度封面在位 → 新到瓦片被弃、cover 绝不清除。
+                let any = v.collect_tile_results(1.0);
+                assert!(!any, "同密度封面在位的页其晚到瓦片应被回收（不显示）");
+                assert!(
+                    v.slots[0].cover.is_some(),
+                    "换档期间 cover 不得被 collect_tile_results 清除"
+                );
+                assert!(v.slots[0].tiles.is_empty(), "该页瓦片不应入槽（封面已供给）");
+                // ② evict_tiles：同密度封面冗余清扫只清瓦片、绝不清 cover。
+                v.slots[0].tiles.insert(
+                    (0, 0),
+                    TileSlot {
+                        image: render_image_from_bgra(vec![0x40; 4], 1, 1).expect("瓦片"),
+                        x0: 0,
+                        y0: 0,
+                        w: 1,
+                        h: 1,
+                    },
+                );
+                v.slots[0].tile_scale = scale;
+                v.slots[0].tile_bytes = 4;
+                v.evict_tiles(0, 0, 1.0);
+                assert!(
+                    v.slots[0].cover.is_some(),
+                    "换档期间 cover 不得被 evict_tiles 清除"
+                );
+                assert!(v.slots[0].tiles.is_empty(), "同密度封面冗余瓦片应被清扫");
+            });
+        });
     }
 }
 

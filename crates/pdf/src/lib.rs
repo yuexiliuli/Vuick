@@ -268,7 +268,7 @@ mod tests {
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, _dims) =
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
-        let rx = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 });
+        let rx = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
         let res = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到渲染结果")
@@ -299,7 +299,7 @@ mod tests {
         let (rows, cols) = layout::tile_grid(bmp, config::pdf::TILE_SIZE);
 
         // 整页基准
-        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale });
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale }, 0);
         let full = rx_full
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("应收到整页")
@@ -323,6 +323,7 @@ mod tests {
                         row,
                         col,
                     },
+                    0, // L2.2 enqueue-gen（常规测试路径 = 0，无导航世代）
                 );
                 let tile = rx_t
                     .recv_timeout(std::time::Duration::from_secs(60))
@@ -388,12 +389,12 @@ mod tests {
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
-        let rx_thumb = worker.request_thumb(doc_id, 0);
+        let rx_thumb = worker.request_thumb(doc_id, 0, 0);
         let thumb = rx_thumb
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到缩略图")
             .expect("缩略图渲染应成功");
-        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 });
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
         let full = rx_full
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到全尺寸")
@@ -425,17 +426,17 @@ mod tests {
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
-        let rx_mid = worker.request_mid(doc_id, 0, 1.0);
+        let rx_mid = worker.request_mid(doc_id, 0, 1.0, 0);
         let mid = rx_mid
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到中清页")
             .expect("中清页渲染应成功");
-        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 });
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
         let full = rx_full
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到全清")
             .expect("全清渲染应成功");
-        let rx_thumb = worker.request_thumb(doc_id, 0);
+        let rx_thumb = worker.request_thumb(doc_id, 0, 0);
         let thumb = rx_thumb
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到缩略图")
@@ -472,7 +473,7 @@ mod tests {
         let (worker, doc_id, _dims2) =
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
         for idx in [0usize, dims.len() / 2, dims.len() - 1] {
-            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 0.5 });
+            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 0.5 }, 0);
             let res = rx
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("应收到渲染结果")
@@ -502,7 +503,7 @@ mod tests {
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, _dims) =
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
-        let rx = worker.request_render(doc_id, RenderRequest { page: 0, scale: 0.5 });
+        let rx = worker.request_render(doc_id, RenderRequest { page: 0, scale: 0.5 }, 0);
         let res = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到渲染结果")
@@ -545,7 +546,7 @@ mod tests {
         }
         let (page_idx, text, page_pt, scale) =
             chosen.expect("应在测试 PDF 内找到内容稠密页（可测字符 ≥40）");
-        let rx_img = worker.request_render(doc_id, RenderRequest { page: page_idx, scale });
+        let rx_img = worker.request_render(doc_id, RenderRequest { page: page_idx, scale }, 0);
         let img = rx_img
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到渲染")
@@ -939,7 +940,7 @@ mod tests {
 
         // 空闲基准：整页渲染一次（应毫秒级）
         let t0 = Instant::now();
-        let rx0 = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
+        let rx0 = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0);
         rx0.recv_timeout(Duration::from_secs(60))
             .expect("基准渲染应返回");
         let baseline_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -949,7 +950,7 @@ mod tests {
         //    `elapsed()`（那会把“我读它那一刻”的墙钟也算进去，掩盖真实的到达时刻）。
         let rx_search = worker.search(doc_id, "配置".to_string());
         std::thread::sleep(Duration::from_millis(30));
-        let rx_render = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 });
+        let rx_render = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
         let t_send = Instant::now();
         let render_meas = std::thread::spawn(move || {
             let _r = rx_render
@@ -992,7 +993,7 @@ mod tests {
         let mut render_ms: Vec<(u64, u32, u64, u64)> = Vec::new(); // (渲染ms, 宽, bgra包裹us, bgra走线us)
         for idx in 0..n {
             let t1 = std::time::Instant::now();
-            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 1.0 });
+            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 1.0 }, 0);
             let res = rx
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("渲染应成功")
@@ -1025,7 +1026,7 @@ mod tests {
         let mut lats = Vec::new();
         for _ in 0..5 {
             let t0 = std::time::Instant::now();
-            let rx = worker.request_render(doc_id, RenderRequest { page: 2, scale: 1.0 });
+            let rx = worker.request_render(doc_id, RenderRequest { page: 2, scale: 1.0 }, 0);
             let res = rx
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("渲染应成功")
@@ -1048,7 +1049,7 @@ mod tests {
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
         let idx = 1usize;
         let t0 = std::time::Instant::now();
-        let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 1.0 });
+        let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale: 1.0 }, 0);
         let res = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到结果");
@@ -3346,6 +3347,551 @@ mod tests {
         );
     }
 
+    /// L1+L2 **大跳→落点直达**（真实渲染路径 + 真夹具）：一次性跳 30 页停靠后，目标页封面
+    /// **≤20 帧内入槽**（不再是 VeryFast 纯平移零派发 + 停稳后 EMA 0.7ⁿ 衰减 ~150-250ms 才
+    /// 重新调度）；落点封面入槽后 `loading_placeholder_hits` 不再增长（只允许渲染到达前那
+    /// 1-2 帧的插队增量）；`nav_gen` 随大跳推进（世代机制生效）、落点封面确实派发。
+    #[gpui::test]
+    async fn jump_delivers_landing_cover_without_loading_growth(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _w: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_count());
+        assert!(n >= 40, "测试文档应至少有 40 页，实际 {n}");
+        // 暖 60 帧让自适应页宽/滚动容器布局稳定（thumb_backdrop/cover_retire_bridge 同款）
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty()
+                        && v.pending_cover.is_empty()
+                        && v.pending_prefetch_cover.is_empty()
+                        && !v.prev_fast
+                        && !v.tile_pump_running
+                });
+                if st {
+                    return;
+                }
+            }
+            panic!("初始状态应沉降");
+        };
+        settle(cx);
+
+        let read_hits = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).loading_placeholder_hits.get()
+            })
+        };
+        let hits0 = read_hits(cx);
+        let nav0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).nav_gen);
+        let cov0 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).cover_reqs);
+
+        // 一次性 30 页大跳（模拟滚动条拖到终点：单帧位移 ≫ JUMP_PAGES_THRESHOLD）
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.scroll_to_page(30);
+                    cx.notify();
+                });
+        });
+        // L1+L2 落点直达：目标页封面 ≤20 帧内入槽（停手即派发，只剩渲染 10-50ms）
+        let mut covered = false;
+        let mut cover_frames = 0usize;
+        for _ in 0..20 {
+            cover_frames += 1;
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            covered = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.slots[30].cover.is_some()
+            });
+            if covered {
+                break;
+            }
+        }
+        eprintln!("[L1] jump30 target_cover_frames={cover_frames} covered={covered}");
+        assert!(covered, "大跳后目标页封面应在 ≤20 帧内入槽（落点直达）");
+
+        // 完整沉降（泵停 + 全部在途清空 + 走廊兜底缓冲页填完）：「加载中」计数随之冻结。
+        // 注意：**不等待泵停**就断言计数零增长，会把 MARGIN 缓冲页的合理占位噪点误判为回归
+        // （thumb_backdrop 同款：settle 含 `!tile_pump_running`，check_phase 只查真可见页）。
+        let mut settled = false;
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty()
+                    && v.pending_cover.is_empty()
+                    && v.pending_prefetch_cover.is_empty()
+                    && !v.prev_fast
+                    && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+        assert!(settled, "跳后状态应完整沉降");
+        // 沉降（泵停）后静置 20 帧：「加载中」计数不得再增长（目标页不再长期停占位）
+        let hits1 = read_hits(cx);
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let hits2 = read_hits(cx);
+        // 真可见页全部有底图（thumb_backdrop 同款口径：只查视口内，不含 MARGIN 缓冲页）
+        let (vis_missing, vis_count) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let off_y = f32::from(-v.scroll.offset().y);
+            let pw = v.page_width();
+            let vh = f32::from(v.scroll.bounds().size.height).max(1.0);
+            let vis = pdf_visible_pages(v, pw, off_y, vh);
+            let missing: Vec<usize> = vis
+                .iter()
+                .copied()
+                .filter(|&p| {
+                    let s = &v.slots[p];
+                    !(s.cover.is_some()
+                        || s.thumb.is_some()
+                        || s.mid.is_some()
+                        || !s.tiles.is_empty()
+                        || s.prefetch_cover.is_some())
+                })
+                .collect();
+            (missing, vis.len())
+        });
+        eprintln!(
+            "[L1] loading_hits {hits0}→{hits1}→{hits2} vis_count={vis_count} vis_missing={vis_missing:?}"
+        );
+        assert!(
+            vis_missing.is_empty(),
+            "大跳停稳后每真可见页应有底图：{vis_missing:?}"
+        );
+        assert!(
+            hits2 == hits1,
+            "沉降（泵停）后「加载中」计数零增长（目标页不再长期停占位）"
+        );
+        // 大跳确已发生（nav_gen 推进 + 落点封面派发）
+        let (nav1, cov1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.nav_gen, v.cover_reqs)
+        });
+        assert!(nav1 > nav0, "大跳应推进 nav_gen：{nav0}→{nav1}");
+        assert!(cov1 > cov0, "大跳落点应派发封面：{cov0}→{cov1}");
+    }
+
+    /// L2 **世代 drop（出队不渲，worker 侧）**（真实 worker + 真夹具）：导航世代先推进
+    /// （Navigate(1)，模型 view 大跳后推送）——随后到达的**旧世代请求**（gen=0 `request_render`）
+    /// 在 worker 出队时被 drop（rx 恒 Empty = 从不渲染、从不回传，等价于「旧页 raster_reqs==0」），
+    /// **只渲最新世代**（新 rx 收到真实结果；新在途结果不被误弃）——快速连续跳「只渲最新落点」
+    /// 的 CPU 侧护栏。注：为确定性取「先 Navigate 再旧请求」的晚到序（`头消息经 worker 阻塞
+    /// recv 先取就会在 Navigate 之前入队渲染」，改写成先导航后旧请求即完全确定）；
+    /// 「先旧后新、Navigate 居中」的 view 侧整链已由 `jump_delivers_...` 的百万代真实路径覆盖。
+    #[test]
+    fn navigate_gen_drops_stale_queued_renders() {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = pdf_lock().lock().unwrap();
+        let p = test_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        // 推进导航世代（view 大跳后推送；Navigate 控制消息先于渲染出队生效）
+        worker.navigate(doc_id, 1);
+        // 旧世代请求（gen=0）晚到 → 出队时应被 drop
+        let rx_old_a = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 0);
+        let rx_old_b = worker.request_render(doc_id, RenderRequest { page: 1, scale: 1.0 }, 0);
+        // 新世代请求（gen=1）→ 应正常渲染
+        let rx_new = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 }, 1);
+        // 新世代结果应到达（真实渲染；新在途结果不被误弃）
+        let new_res = rx_new
+            .recv_timeout(Duration::from_secs(30))
+            .expect("新世代应收到结果")
+            .expect("渲染应成功");
+        assert!(new_res.width > 0 && new_res.height > 0, "新世代渲染应有正尺寸");
+        // 旧世代请求在 worker 出队时被 drop → worker 从不渲染/从不回传、其 tx 随消息丢弃 →
+        // rx 呈 **Disconnected**（区别于 Empty：Channel 还活着但没消息 = 可能只是还没轮到）。
+        // 因 FIFO，`new_res` 到达时旧请求必已被出队丢弃，故 Disconnected 是确定结局。
+        assert!(
+            matches!(rx_old_a.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)),
+            "旧世代请求应被 drop（tx 丢弃 → Disconnected，无回传）"
+        );
+        assert!(
+            matches!(rx_old_b.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)),
+            "旧世代请求应被 drop（tx 丢弃 → Disconnected，无回传）"
+        );
+        // 世代同步：worker 镜像与 view 推进对齐
+        assert_eq!(
+            worker.navigate_gen(doc_id),
+            1,
+            "worker navigate_gen 应采纳 Navigate(1)"
+        );
+        worker.close(doc_id);
+    }
+
+    /// L2.4+L2.5 **世代同步 + 预算即释**（真实渲染路径 + 真夹具，复用 w1 探针姿势）：
+    /// 大跳当帧 `nav_gen++` → view 清掉世代 < 新 gen 的全部在途条目（`pending_cover` 随即
+    /// 以 ≤COVER_INFLIGHT 突发重填）、worker `navigate_gen` 镜像经 Navigate 消息与 view 对齐、
+    /// 落点封面确实派发；当前世代落点封面正常入槽（不被世代机制误弃）。
+    #[gpui::test]
+    async fn jump_nav_gen_budget_release_and_worker_sync(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _w: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty()
+                        && v.pending_cover.is_empty()
+                        && v.pending_mid.is_empty()
+                        && v.pending_thumb.is_empty()
+                        && !v.prev_fast
+                });
+                if st {
+                    return;
+                }
+            }
+            panic!("初始状态应沉降");
+        };
+        settle(cx);
+
+        let (nav0, cov0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.nav_gen, v.cover_reqs)
+        });
+        assert_eq!(nav0, 0, "基线世代应 0");
+
+        // 一次性 30 页大跳
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.scroll_to_page(30);
+                    cx.notify();
+                });
+        });
+        for _ in 0..3 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let (nav1, pend1, cov1, mirror1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.nav_gen,
+                v.pending_cover.len(),
+                v.cover_reqs,
+                v.worker.as_ref().unwrap().navigate_gen(v.doc_id),
+            )
+        });
+        assert!(nav1 > nav0, "大跳应推进 nav_gen：{nav0}→{nav1}");
+        assert_eq!(
+            mirror1, nav1,
+            "大跳后 worker navigate_gen 应经 Navigate 消息与 view 对齐（w1 探针同款）"
+        );
+        assert!(
+            pend1 <= config::pdf::COVER_INFLIGHT,
+            "清旧世代后当帧突发应 ≤ COVER_INFLIGHT（预算即释）：pend={pend1}"
+        );
+        assert!(cov1 > cov0, "落点封面已派发");
+
+        // 当前世代落点封面正常入槽（不被世代机制误弃）
+        let mut covered = false;
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            covered = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.slots[30].cover.is_some()
+            });
+            if covered {
+                break;
+            }
+        }
+        assert!(covered, "当前世代落点封面应正常渲染入槽（不被世代机制误弃）");
+    }
+
+    /// L3.1+L3.2 **走廊重武装（真实渲染路径 + 真夹具）**：VeryFast 纯平移期（四主队列空）不再
+    /// 因 `prev_fast` 拒派走廊封面——高速平移中 `prefetch_reqs` 仍增长（重武装）、新增廊封面
+    /// 沿滚动方向前向侧（下滚时页号增大侧）出现、总量仍 ≤ 40MB 预算（与 `idle_prefetch` 的
+    /// 预算护栏同款）。
+    #[gpui::test]
+    async fn corridor_rearmed_during_veryfast_forward_only_bounded(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _w: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        // 初始走廊在 [vis±2] 落定：推进程与 E2 一致（warm 60 帧 + 静置收敛）
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..400 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    v.pending_tiles.is_empty()
+                        && v.pending_cover.is_empty()
+                        && v.pending_prefetch_cover.is_empty()
+                        && !v.prev_fast
+                        && !v.tile_pump_running
+                });
+                if st {
+                    return;
+                }
+            }
+            panic!("走廊重武装测试：初始状态应沉降");
+        };
+        settle(cx);
+
+        let (p0, vis0, off0, pages0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let off_y = f32::from(-v.scroll.offset().y);
+            let vis0 = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), off_y);
+            let pages: Vec<usize> = v
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.prefetch_cover.is_some())
+                .map(|(p, _)| p)
+                .collect();
+            (v.prefetch_reqs, vis0, off_y, pages)
+        });
+        assert!(p0 > 0, "初始 idle 走廊应已预取过（基线非零）");
+        assert!(off0.abs() < 1.0, "起始应在文档顶部");
+
+        // 单帧快滚 3 页（Δ=3 < JUMP_PAGES_THRESHOLD=7 → **不是大跳**：无跳变派发、主队列保持空、
+        // 速度瞬时冲进 VeryFast）——这正是 L3.1「VeryFast 高速带 + 四主队列空 → 走廊重武装」的
+        // 触发场景（此前 `prev_fast` 直接拒派，走廊不补）。滚动目标页 3、4、5 此前无封面 →
+        // 走廊沿前向侧补 0.5 密度廊封面。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(3);
+                cx.notify();
+            });
+        });
+        let mut saw_veryfast = false;
+        let mut grew = false;
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.prefetch_reqs,
+                    v.speed_state == crate::pdf::view::SpeedState::VeryFast,
+                )
+            });
+            saw_veryfast |= st.1;
+            grew |= st.0 > p0;
+        }
+        // 停稳补清：让重武装期派发的廊封面落地（worker 真渲 0.5 密度整页，需几十 ms）
+        let mut settled = false;
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_prefetch_cover.is_empty()
+                    && v.pending_cover.is_empty()
+                    && v.pending_tiles.is_empty()
+                    && !v.prev_fast
+                    && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+        assert!(settled, "重武装后应补清（走廊在途落定）");
+        let (p1, bytes, pages1, vis1, off_y1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let off_y = f32::from(-v.scroll.offset().y);
+            let vis1 = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), off_y);
+            let mut bytes = 0u64;
+            let pages: Vec<usize> = v
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.prefetch_cover.is_some())
+                .map(|(p, s)| {
+                    let (w, h) = layout::page_bitmap_size(v.dims[p], s.prefetch_cover_scale);
+                    bytes += (w as u64) * (h as u64) * 4;
+                    p
+                })
+                .collect();
+            (v.prefetch_reqs, bytes, pages, vis1, off_y)
+        });
+        eprintln!(
+            "[L3] corridor_rearm prefetch {p0}→{p1} saw_veryfast={saw_veryfast} vis {vis0}→{vis1} off {off0:.0}→{off_y1:.0} pages0={pages0:?} pages1={pages1:?} bytes={}MB",
+            bytes / 1024 / 1024
+        );
+        assert!(saw_veryfast, "快滚应短暂进入 VeryFast（Δ<阈值且无跳变派发）");
+        assert!(off_y1 > 1.0, "应已滚到第 3 页附近（off_y1={off_y1:.0}）");
+        assert!(
+            grew && p1 > p0,
+            "VeryFast 期四主队列空时走廊应重武装（prefetch_reqs 增长 {p0}→{p1}）"
+        );
+        assert!(
+            bytes <= config::pdf::PREFETCH_COVER_BUDGET_BYTES,
+            "VeryFast 期走廊字节仍 ≤ 40MB 预算（budget 护栏不破）"
+        );
+        // 方向单侧增长：滚动后至少有一个「前向侧新页」（页号 > 滚动起点可见页）拿到廊封面
+        let new_forward: Vec<usize> = pages1
+            .iter()
+            .copied()
+            .filter(|&p| p > vis0 && !pages0.contains(&p))
+            .collect();
+        assert!(
+            !new_forward.is_empty(),
+            "重武装期新增廊封面应沿方向前向侧出现（前向新页 > 滚动起点可见页 {vis0}）：{pages1:?}"
+        );
+    }
+
     /// 回归（**T1 封面先行，真实渲染路径 + 真夹具**）：封面 **affordable 且与瓦片同密度**
     /// 的页面不得同页双渲。旧语义「瓦片先派、封面后到再把已示瓦片整体作废」= 首屏
     /// 36 瓦片 + 3 封面双渲。
@@ -4136,14 +4682,14 @@ mod tests {
         // 原图基准（未着色）：门控开启下取 None 档，两次应逐字节一致。
         // （worker 直接调用：epoch 是本测试内部推进的虚拟世代，仅结果不涉 view 守卫。）
         worker.set_recolor(doc_id, None, 1);
-        let rx_raw = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
+        let rx_raw = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0);
         let raw = rx_raw
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("原图应返回")
             .expect("渲染应成功");
         // 门控开启：设了 night 但显示像素仍是未着色原图（worker 跳过 CPU 着色）。
         worker.set_recolor(doc_id, Some(night), 2);
-        let rx_gpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
+        let rx_gpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0);
         let gpu_out = rx_gpu
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("门控开启着色档应返回")
@@ -4165,7 +4711,7 @@ mod tests {
         // 门控关闭：恢复既有 CPU 着色（回归不变式，与 dbd3236 一致）。
         crate::recolor::set_gpu_recolor_gate_for_test(false);
         worker.set_recolor(doc_id, Some(night), 3);
-        let rx_cpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 });
+        let rx_cpu = worker.request_render(doc_id, RenderRequest { page: 0, scale: 2.0 }, 0);
         let cpu_out = rx_cpu
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("门控关闭着色档应返回")
@@ -4954,7 +5500,7 @@ mod tests {
         // 渲染可见性（FPDF_RENDER_ANNOT 默认开启）：写回前 vs 重开后同区域像素出现差异
         // = 注释真的渲染出来了（不是只落了文件没显示）。
         let (wa, da, _) = PdfWorker::open_and_dims(bytes0).expect("原始打开");
-        let rx = wa.request_render(da, RenderRequest { page: 0, scale: 1.0 });
+        let rx = wa.request_render(da, RenderRequest { page: 0, scale: 1.0 }, 0);
         let before = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("收到渲染")
@@ -4965,7 +5511,7 @@ mod tests {
         let (w2, d2, dims2) =
             PdfWorker::open_and_dims(std::fs::read(&path).expect("改后重读")).expect("重开改后文件");
         assert_eq!(dims2, dims, "写回注释不应改变页数与页尺寸");
-        let rx2 = w2.request_render(d2, RenderRequest { page: 0, scale: 1.0 });
+        let rx2 = w2.request_render(d2, RenderRequest { page: 0, scale: 1.0 }, 0);
         let after = rx2
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("收到渲染")

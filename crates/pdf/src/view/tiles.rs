@@ -235,10 +235,11 @@ impl PdfViewer {
                         row,
                         col,
                     },
+                    self.nav_gen, // L2.2：发送时打戳当前导航世代
                 );
                 self.raster_reqs += 1; // 切档不重栅回归计数
                 self.tile_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
-                self.pending_tiles.insert((page, row, col), (scale, rx));
+                self.pending_tiles.insert((page, row, col), (scale, self.nav_gen, rx));
             }
         }
 
@@ -309,27 +310,31 @@ impl PdfViewer {
                 continue;
             }
             self.slots[page].thumb_loading = true;
-            let rx = worker.request_thumb(self.doc_id, page);
+            let rx = worker.request_thumb(self.doc_id, page, self.nav_gen); // L2.2 enqueue-n_gen
             self.raster_reqs += 1; // 切档不重栅回归计数
-            self.pending_thumb.insert(page, rx);
+            self.pending_thumb.insert(page, (self.nav_gen, rx));
             budget -= 1;
         }
     }
 
     // ---- F4 空闲预取走廊（WPS「好像全部已加载」的来源）----
 
-    /// F4/B 守卫化走廊预取入口：仅「非快速态 + 四个主在途队列全空」（即真正的空闲/清尾帧）
-    /// 才派发走廊封面。Idle/Slow 清尾帧与 idle 静置帧共用本入口——正是「最后一帧工作清空后
-    /// 泵仍须续出几帧把走廊填掉」的关键：非 idle 路径在队尾调用本方法，派发在途即让
-    /// `pump_still_needed` 保持 true，泵继续驱动 idle 帧直到走廊填满/预算。
+    /// F4/B 守卫化走廊预取入口：仅当「四个主在途队列全空」（真正的空闲/清尾帧）才派发走廊
+    /// 封面。Idle/Slow 清尾帧与 idle 静置帧共用本入口——正是「最后一帧工作清空后泵仍须续出
+    /// 几帧把走廊填掉」的关键：非 idle 路径在队尾调用本方法，派发在途即让 `pump_still_needed`
+    /// 保持 true，泵继续驱动 idle 帧直到走廊填满/预算。
+    /// **L3.1 走廊重武装**：不再直接因 `prev_fast` 拒派——高速平移（VeryFast→Fast 交界、各主
+    /// 队列恰好排空的帧）也能补 0.5 密度廊封面，让新进视口页在高速期就有低清底图（WPS
+    /// 「好像全部已加载」的观感在高速带也成立）；只要任一主队列有在途即仍拒派（不抢栅格化
+    /// 带宽）。速度越高窗口越大的收缩由 [`prefetch_corridor`] 的 M(v) 与 [`evict_prefetch_covers`]
+    /// 的 40MB 预算兜底，不会因放开 `prev_fast` 而失控。
     pub(super) fn maybe_prefetch_corridor(
         &mut self,
         vis_first: usize,
         page_width: f32,
         scale_factor: f32,
     ) {
-        if self.prev_fast
-            || !self.pending_tiles.is_empty()
+        if !self.pending_tiles.is_empty()
             || !self.pending_cover.is_empty()
             || !self.pending_mid.is_empty()
             || !self.pending_thumb.is_empty()
@@ -337,6 +342,28 @@ impl PdfViewer {
             return;
         }
         self.prefetch_corridor(vis_first, page_width, scale_factor);
+    }
+
+    /// L3.2：**走廊窗口随速度扩大**——M(v)=clamp(round(v/平均页高)+1, [`PREFETCH_COVER_MARGIN`],
+    /// [`PREFETCH_COVER_MARGIN_MAX`])，滑窗 [vis±M(v)]。高速平移（VeryFast，单帧穿越多页）期
+    /// 走廊不可能只用基线 [vis±2] 盖住「一次平移 4+ 页」，按速度把滑窗拉大；`v` 由
+    /// [`Self::scroll_velocity`]（px/帧 EMA）给出，「平均页高」用 `total_height/页数` 近似
+    /// （含间隙/边距，只作速度→页数的除法量纲）。v=0（idle）→ M 回落到基线 2，既有 idle
+    /// 走廊语义/回归（`idle_prefetch_corridor` 的 [vis±2] 断言）不变。预算仍由
+    /// [`PREFETCH_COVER_BUDGET_BYTES`]=40MB LRU + [`PRE_FETCH_COVER_INFLIGHT`]=2/帧封顶——
+    /// 扩张只影响「先派哪个/留哪个」，不改变总占用。
+    pub(super) fn corridor_margin(&self) -> usize {
+        let n = self.dims.len();
+        let avg_page_h = if n > 0 && self.total_height > 0.0 {
+            self.total_height / n as f32
+        } else {
+            PAGE_WIDTH // 兜底：未知布局时用页宽近似
+        };
+        let v = self.scroll_velocity;
+        let m = ((v / avg_page_h).round() as isize + 1)
+            .max(config::pdf::PREFETCH_COVER_MARGIN as isize)
+            .min(config::pdf::PREFETCH_COVER_MARGIN_MAX as isize) as usize;
+        m
     }
 
     /// F4/B：**空闲预取走廊**——在 `ensure_window` 静置早退**之前**为走廊 [vis±2] 的空闲页
@@ -364,8 +391,10 @@ impl PdfViewer {
         if n == 0 {
             return;
         }
-        let lo = vis_center.saturating_sub(config::pdf::PREFETCH_COVER_MARGIN);
-        let hi = (vis_center + config::pdf::PREFETCH_COVER_MARGIN).min(n - 1);
+        // L3.2：窗口随速度扩大（`corridor_margin`），滑窗 [vis±M(v)]（idle v≈0 → M=2 基线）。
+        let margin = self.corridor_margin();
+        let lo = vis_center.saturating_sub(margin);
+        let hi = (vis_center + margin).min(n - 1);
         let mut order: Vec<usize> = (lo..=hi).collect();
         order.sort_by_key(|&p| (p as i64 - vis_center as i64).unsigned_abs());
         let Some(worker) = self.worker.clone() else {
@@ -397,10 +426,14 @@ impl PdfViewer {
             // 走 `request_render_preview`（RenderPreview 消息）：与封面同优先/同几何，但按
             // Mid 语义**不入 raw 缓存、不参与重着色刷新**——廊封面是瞬态低清底图，raw 入缓存
             // 只会挤出可见封面/瓦片原图（切档刷新无消费方，白占 RAW_CACHE_BYTES 预算）。
-            let rx = worker.request_render_preview(self.doc_id, RenderRequest { page, scale: pscale });
+            let rx = worker.request_render_preview(
+                self.doc_id,
+                RenderRequest { page, scale: pscale },
+                self.nav_gen, // L2.2 enqueue-n_gen
+            );
             self.raster_reqs += 1; // 切档不重栅回归计数
             self.prefetch_reqs += 1; // F4 观测计数（断言 idle 预取确实发生）
-            self.pending_prefetch_cover.insert(page, (pscale, rx));
+            self.pending_prefetch_cover.insert(page, (pscale, self.nav_gen, rx));
             budget -= 1;
         }
         // 派发在途后由调用方（idle 分支）`ensure_tile_pump` 启动收图泵。
@@ -409,17 +442,31 @@ impl PdfViewer {
     /// F4/B：走廊封面回收（距视口中心距离 LRU + 字节预算 [`PREFETCH_COVER_BUDGET_BYTES`]）。
     /// 任一非 idle 帧（窗口移动）与 idle 期派发前都调用：只作用于 `slot.prefetch_cover`
     /// （独立于窗口 `slot.cover`，不参与封面驻留计数）。
-    /// ① 走廊窗 [vis±MARGIN] 外的全部收回（最远优先）；② 窗内超字节预算再逐最远页。
+    /// ① 走廊窗 [vis±M(v)]（L3.2 随速度扩大，idle 回落基线 2）外的全部收回（最远优先）；
+    /// ② 窗内超字节预算再逐最远页。**L3.3 方向感知逐出**：排序键 `dist − dir_bonus`，bonus 只给
+    /// 「当前滚动方向回退侧」的近期过页——保退位页廊封面驻留（滚回瞬间有底图，不落「加载中」）；
+    /// 只影响同距离内的竞争顺序，不改变任何预算/驻留计数。
     /// 逐出的纹理走 `pending_drops` 显式 `drop_image` 下线（防显存/提交内存缓慢累积）。
     pub(super) fn evict_prefetch_covers(&mut self, vis_center: usize) {
         let n = self.dims.len();
         if n == 0 {
             return;
         }
-        let margin = config::pdf::PREFETCH_COVER_MARGIN;
+        // L3.2：窗口随速度扩大（`corridor_margin`），滑窗 [vis±M(v)]（idle v≈0 → M=2 基线）。
+        let margin = self.corridor_margin();
         let lo = vis_center.saturating_sub(margin);
         let hi = (vis_center + margin).min(n - 1);
         let dist = |p: usize| (p as i64 - vis_center as i64).unsigned_abs();
+        // L3.3：回退侧加成——仅给「当前滚动方向回退侧、且在走廊窗内」的页（正滚向下时回退侧
+        // 在视口上方 p<vis_center；反滚时在下方 p>vis_center；方向未知/静止（dir=0）不加成）。
+        let dir = self.scroll_dir;
+        let bonus = |p: usize| {
+            if (dir == 1 && p < vis_center) || (dir == -1 && p > vis_center) {
+                config::pdf::PREFETCH_RETURN_SIDE_BONUS as u64
+            } else {
+                0u64
+            }
+        };
         let est = |dim: (f32, f32), s: f32| -> u64 {
             let (w, h) = page_bitmap_size(dim, s);
             (w as u64) * (h as u64) * 4
@@ -445,7 +492,12 @@ impl PdfViewer {
             .map(|&p| est(self.dims[p], self.slots[p].prefetch_cover_scale))
             .sum();
         if total > config::pdf::PREFETCH_COVER_BUDGET_BYTES {
-            in_window.sort_by(|&a, &b| dist(b).cmp(&dist(a))); // 最远优先
+            // L3.3：排序键 = dist − dir_bonus（回退侧同距离页排名靠后 = 后逐、多驻留）。
+            in_window.sort_by(|&a, &b| {
+                let ka = dist(a).saturating_sub(bonus(a));
+                let kb = dist(b).saturating_sub(bonus(b));
+                kb.cmp(&ka) // 键越大（距中心越远/无回退加成）优先逐
+            });
             let mut cur = total;
             for p in in_window {
                 if cur <= config::pdf::PREFETCH_COVER_BUDGET_BYTES {
@@ -471,13 +523,13 @@ impl PdfViewer {
     /// WARN-2（评审接受项）：本类瞬态占位无 recolor 世代守卫——切档前入队的旧色廊封面
     /// 可能短暂落槽闪旧色；瞬态、随后被下一世代满封面/瓦片接管，可接受（不留脏槽）。
     pub(super) fn collect_prefetch_cover_results(&mut self) -> bool {
-        let finished = collect_finished(&mut self.pending_prefetch_cover, |(_, rx)| rx.try_recv());
+        let finished = collect_finished(&mut self.pending_prefetch_cover, |(_, _, rx)| rx.try_recv());
         let mut any = false;
         for (page, res) in finished {
             let req_scale = self
                 .pending_prefetch_cover
                 .remove(&page)
-                .map(|(s, _)| s)
+                .map(|(s, _, _)| s)
                 .unwrap_or(0.0);
             let Some(res) = res else {
                 continue;
@@ -545,11 +597,12 @@ impl PdfViewer {
                     eprintln!("[{:.1}ms] [VIEW-COVER-REQ] page={page}", crate::pdf::timing_ms());
                 }
                 let rx =
-                    cover_worker.request_render(self.doc_id, RenderRequest { page, scale: cscale });
+                    cover_worker.request_render(self.doc_id, RenderRequest { page, scale: cscale }, self.nav_gen); // L2.2 enqueue-n_gen
                 self.raster_reqs += 1; // 切档不重栅回归计数
                 self.cover_reqs += 1; // T1 首屏「封面 vs 瓦片」构成计数
                 // 记录**请求时** recolor 世代（NIT：旧世代请求的失败不拉黑，语义纯净）。
-                self.pending_cover.insert(page, (cscale, self.recolor_epoch, rx));
+                // L2.4：记录导航世代 nav_gen（大跳世代推进时按世代清旧条目、预算立即释放）。
+                self.pending_cover.insert(page, (cscale, self.recolor_epoch, self.nav_gen, rx));
             }
         }
         self.evict_covers(cover_first, cover_last, retire);
@@ -769,9 +822,9 @@ impl PdfViewer {
                     continue;
                 }
                 self.slots[page].mid_loading = true;
-                let rx = worker.request_mid(self.doc_id, page, scale_factor);
+                let rx = worker.request_mid(self.doc_id, page, scale_factor, self.nav_gen); // L2.2 enqueue-n_gen
                 self.raster_reqs += 1; // 切档不重栅回归计数
-                self.pending_mid.insert(page, rx);
+                self.pending_mid.insert(page, (self.nav_gen, rx));
                 budget -= 1;
             }
         }
@@ -793,9 +846,9 @@ impl PdfViewer {
                     continue;
                 }
                 self.slots[page].thumb_loading = true;
-                let rx = worker.request_thumb(self.doc_id, page);
+                let rx = worker.request_thumb(self.doc_id, page, self.nav_gen); // L2.2 enqueue-n_gen
                 self.raster_reqs += 1; // 切档不重栅回归计数
-                self.pending_thumb.insert(page, rx);
+                self.pending_thumb.insert(page, (self.nav_gen, rx));
                 tb -= 1;
             }
         }
@@ -807,7 +860,7 @@ impl PdfViewer {
     /// （密度守卫：请求时的 `scale` ≠ 当前 `scale` → 丢弃，缩放已变）。替换旧瓦片时
     /// 旧纹理走 `pending_drops` 显式下线。返回是否有新瓦片入槽（调用方决定重绘）。
     pub(super) fn collect_tile_results(&mut self, scale_factor: f32) -> bool {
-        let finished = collect_finished(&mut self.pending_tiles, |(_s, rx)| rx.try_recv());
+        let finished = collect_finished(&mut self.pending_tiles, |(_, _, rx)| rx.try_recv());
         if finished.is_empty() {
             return false;
         }
@@ -817,7 +870,7 @@ impl PdfViewer {
             let req_scale = self
                 .pending_tiles
                 .remove(&key)
-                .map(|(s, _)| s)
+                .map(|(s, _, _)| s)
                 .unwrap_or(0.0);
             let (page, row, col) = key;
             let Some(res) = res else { continue };
@@ -936,13 +989,13 @@ impl PdfViewer {
     /// 回收已完成的在途**封面**结果：worker 回传整页（屏幕密度）BGRA → 装入 `slot.cover`
     /// （首屏锐化，先于瓦片到达；密度守卫：过期即弃）。返回是否有新封面入槽。
     pub(super) fn collect_cover_results(&mut self, scale_factor: f32) -> bool {
-        let finished = collect_finished(&mut self.pending_cover, |(_, _, rx)| rx.try_recv());
+        let finished = collect_finished(&mut self.pending_cover, |(_, _, _, rx)| rx.try_recv());
         let mut any = false;
         for (page, res) in finished {
             let (req_scale, req_epoch) = self
                 .pending_cover
                 .remove(&page)
-                .map(|(s, e, _)| (s, e))
+                .map(|(s, e, _g, _)| (s, e))
                 .unwrap_or((0.0, 0));
             let Some(res) = res else {
                 // W2：封面**渲染失败**（worker 返回 None：pdfium 页取不到 / OOM 等）→ 计失败
@@ -1171,6 +1224,11 @@ impl PdfViewer {
     /// 该页、且新封面在途时，底图链 cover→prev_cover→mid→thumb 仍非空，不落「加载中」；
     /// 该页重新入窗（新封面到位由 `collect_cover_results` 顺带回收桥）、或让位给新的
     /// 退位页时即释放。更远窗外页（≥2 页）回翻重渲期间仍可能瞬时落「加载中」（既有行为）。
+    /// **L3.3 方向感知（与走廊同款精神）**：本函数的「回退侧驻留」由两处现存机制承担——
+    /// ① 封面窗的 `cover_first`（正滚时 = 可见首页，含刚滚过的回退侧邻居页）；② `retire` 桥
+    /// （方向翻位瞬间的反向邻居）。窗口封面驻留数不随方向权重扩张（`covers ≤ 可见+1` 内存
+    /// 断言不受影响），更远的退位页回翻底图由 L3.2/L3.3 的走廊（0.5 密度、独立 40MB 预算）
+    /// 供给——滚动方向一侧的近期过页廊封面已按 `dist−dir_bonus` 保驻留。
     pub(super) fn evict_covers(
         &mut self,
         wanted_first: usize,
@@ -1218,7 +1276,7 @@ impl PdfViewer {
     /// WARN-2（评审接受项）：无 recolor 世代守卫——切档前入队的旧色缩略可能短暂落槽闪
     /// 旧色；瞬态、随后被覆盖，可接受。
     pub(super) fn collect_thumb_results(&mut self) -> bool {
-        let finished = collect_finished(&mut self.pending_thumb, |rx| rx.try_recv());
+        let finished = collect_finished(&mut self.pending_thumb, |(_, rx)| rx.try_recv());
         let mut any = false;
         for (i, res) in finished {
             self.pending_thumb.remove(&i);
@@ -1249,7 +1307,7 @@ impl PdfViewer {
     /// WARN-2（评审接受项）：无 recolor 世代守卫——切档前入队的旧色中清可能短暂落槽闪
     /// 旧色；瞬态、随后被当前世代封/瓦片接管，可接受。
     pub(super) fn collect_mid_results(&mut self) -> bool {
-        let finished = collect_finished(&mut self.pending_mid, |rx| rx.try_recv());
+        let finished = collect_finished(&mut self.pending_mid, |(_, rx)| rx.try_recv());
         let mut any = false;
         for (i, res) in finished {
             self.pending_mid.remove(&i);
@@ -1332,6 +1390,137 @@ impl PdfViewer {
             }
         };
         self.prev_fast = self.speed_state.is_fast();
+    }
+
+    // ---- L1 快速跨页跳：停稳快进 / 大跳检测 / 落点直达派发 / 世代失效 ----
+
+    /// L1.3 **停稳快进**：`ensure_window` 每帧在 `update_fast_flag` 后调用。连续
+    /// [`config::pdf::STOP_DETECT_FRAMES`] 帧 |Δy| < [`config::pdf::STOP_DETECT_PX`] → 速度**直落
+    /// Slow**（绕过 0.7ⁿ EMA 衰减）——拖拽停稳瞬间不再等 ~150-250ms 的指数衰减，落点封面立刻
+    /// 可被既有 Slow/Idle 调度（`schedule_tiles`）消费。需 **K 帧连续**约束：拖拽中单帧微停/
+    /// 手指微抖不误触；任何 ≥2px 位移帧清零计数。只影响快速态（Fast/VeryFast）——本就 Slow/
+    /// Idle 时直落无意义（且不破坏 E1/E2/E3 速度门：200/700px/帧 的 dy 恒 > 2px，计数恒 0）。
+    pub(super) fn update_stop_detection(&mut self, dy: f32) {
+        if dy < config::pdf::STOP_DETECT_PX {
+            self.stop_small_frames = self.stop_small_frames.saturating_add(1);
+            if self.stop_small_frames >= config::pdf::STOP_DETECT_FRAMES
+                && self.speed_state.is_fast()
+            {
+                // 直落 Slow：绕过 0.7ⁿ 衰减，`schedule_tiles`（含封面）即刻接管落点。prev_fast
+                // 派生同步为 false（`Slow.is_fast()==false`），泵/门控/文本预取等消费点同相。
+                self.speed_state = SpeedState::Slow;
+                self.prev_fast = false;
+            }
+        } else {
+            self.stop_small_frames = 0;
+        }
+    }
+
+    /// L1.1 **大跳检测**（每帧在 `update_fast_flag` 后、调度前调用；需已算 `start..=end`）：
+    /// 比较当前可见中心页与上帧可见中心页，位移超过 [`config::pdf::JUMP_PAGES_THRESHOLD`]
+    /// （MARGIN 与走廊覆盖够不到的 ~6-8 页）→ 判定「大跳」：置 `jump_armed=true`、
+    /// `jump_target=当前可见中心`，并 L2.4 推进 `nav_gen`（**每帧每 doc 至多一次**）+ 清掉
+    /// 世代 < 新 n_gen 的全部在途条目（预算立即释放，解开 COVER_INFLIGHT 被旧在途占死）。
+    /// 快速连续跳/变向时每帧以当前中心重算（后到覆盖先到，无积压队列）。速度离开快速带
+    /// （VeryFast/Fast）后 `jump_armed` 由调用方随 `dispatch_jump_covers` 落点全到位清空；
+    /// 本方法只负责「检测 + 武装 + 世代推进」，不动调度分派。
+    pub(super) fn update_nav_jump(
+        &mut self,
+        start: usize,
+        end: usize,
+        page_width: f32,
+        scroll_y: f32,
+        viewport_h: f32,
+        window: &Window,
+    ) {
+        let n = self.dims.len();
+        if n == 0 {
+            self.last_center_page = None;
+            return;
+        }
+        let start = start.min(n - 1);
+        let end = end.max(start).min(n - 1);
+        // 当前可见中心页：优先取「真可见页 span」的算术中心（`keep_window` 中心含 MARGIN 缓冲，
+        // 与本帧落点窗口径一致），span 为空（极端横溢/空视口）退化为 keep_window 中心。
+        let center = match self.visible_page_span(start, end, scroll_y, viewport_h, page_width, window)
+        {
+            (Some(a), Some(b)) => (a + b) / 2,
+            _ => (start + end) / 2,
+        };
+        let jumped = self
+            .last_center_page
+            .is_some_and(|prev| center.abs_diff(prev) > config::pdf::JUMP_PAGES_THRESHOLD);
+        if jumped {
+            self.jump_armed = true;
+            self.jump_target = Some(center);
+            // L2.4：nav_gen++ 当帧清掉世代 < 新 n_gen 的在途条目（预算立即释放）+ 通知 worker
+            // 镜像（控制消息，sweep 当下应用；FIFO 保证早于本帧新渲染请求出队生效）。
+            self.nav_gen = self.nav_gen.saturating_add(1);
+            if let Some(w) = self.worker.as_ref() {
+                w.navigate(self.doc_id, self.nav_gen);
+            }
+            self.clear_stale_pending();
+        }
+        self.last_center_page = Some(center);
+    }
+
+    /// L2.4 **预算即释**：清掉世代 < 当前 `nav_gen` 的全部在途条目（含封面/瓦片/中清/缩略/
+    /// 走廊封面）——`nav_gen++` 当帧调用，旧在途条目即刻不再占 `COVER_INFLIGHT`/各额度，目标
+    /// 封面能立刻被派发；到达结果若对应 pending 已不存在则丢弃（rx drop 后 worker 的
+    /// `let _ = tx.send(...)` 静默失败）。只清世代标记：**不清** `cover_failures`/`cover_blacklist`
+    /// （W2 语义：封面失败按 recolor 世代判定、黑名单随封面窗滚动复位，与导航世代正交）。
+    fn clear_stale_pending(&mut self) {
+        let n_gen = self.nav_gen;
+        self.pending_cover.retain(|_, e| e.2 >= n_gen);
+        self.pending_tiles.retain(|_, e| e.1 >= n_gen);
+        self.pending_mid.retain(|_, e| e.0 >= n_gen);
+        self.pending_thumb.retain(|_, e| e.0 >= n_gen);
+        self.pending_prefetch_cover.retain(|_, e| e.1 >= n_gen);
+    }
+
+    /// L1.2 **VeryFast 落点直达派发**：`jump_armed` 时以 `jump_target`（落点中心）为窗、
+    /// 距中心近远排序、≤[`COVER_INFLIGHT`] 满密度封面派发（复用既有 `schedule_covers` 预算，
+    /// 不加新预算）——高速带不再纯平移零派发，停靠目标页封面立即在途。落点窗封面全部在槽/
+    /// 在途后清零 `jump_armed`（后续由停稳后常态调度接管）；速度离开 VeryFast 时本方法不再被
+    /// 调用，`jump_armed` 由调用方清零。
+    ///
+    /// ⚠️ 落点窗与 `schedule_tiles`/`schedule_fast_covers` 的封面窗同义（`[vis..=vis+dir前骤]`），
+    /// **不带** `retire` 桥、也不把回退侧邻居拉进窗：大跳是一次性远距离平移（含 jump 前就在
+    /// 窗内、被整体清掉的旧页），没有「方向翻位刚退位」的邻居要桥接——带上 retire 会把
+    /// 落在窗缘外侧的孤立页（如向下跳时 `cf-1`）转存成桥，而该页不会被回翻复用 → 残留过渡桥
+    /// 破坏 `cover_retire_bridge` 的「下滚稳态零残留」断言（回归实测命中）。
+    pub(super) fn maybe_dispatch_jump_covers(
+        &mut self,
+        page_width: f32,
+        scale_factor: f32,
+    ) {
+        if !self.jump_armed {
+            return;
+        }
+        let Some(target) = self.jump_target else {
+            self.jump_armed = false;
+            return;
+        };
+        let n = self.dims.len();
+        if n == 0 {
+            self.jump_armed = false;
+            return;
+        }
+        // 落点窗按滚动方向与 normal 封面窗同义（可见页 + 方向前瞻 1）；每次大跳 ≤ COVER_INFLIGHT
+        // 满密度封面，妨碍当前 COVER_INFLIGHT 额度内的派发。
+        let (cf, cl) = match self.scroll_dir {
+            1 => (target.min(n - 1), (target + 1).min(n - 1)),
+            -1 => (target.saturating_sub(1), target.min(n - 1)),
+            _ => (target.saturating_sub(1), (target + 1).min(n - 1)),
+        };
+        self.schedule_covers(cf, cl, target, None, page_width, scale_factor);
+        // 落点窗全部在槽/在途 → 清零 jump_armed（后续常态调度接管）。
+        let all_covered =
+            (cf..=cl).all(|p| self.slots[p].cover.is_some() || self.pending_cover.contains_key(&p));
+        if all_covered {
+            self.jump_armed = false;
+            self.jump_target = None;
+        }
     }
 
     /// P2：O(1) 主线程中清缓存命中（`slots[i].mid` 即内存缓存本体）。命中触摸 `mid_lru`
