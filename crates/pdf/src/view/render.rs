@@ -321,6 +321,25 @@ fn search_overlays_for_page(
     out
 }
 
+/// 三层合成中「新密度瓦片层是否允许上屏」的纯判定（S 系列双密度混叠根治，R1/R2/R3）。
+///
+/// 用户反馈放大缩小 PDF「似乎有东西盖在 PDF 上」、代码区缩放中「块状抖动」：settle 收口期
+/// 新密度瓦片**逐块异步到位**、盖在「旧档封面被 CSS 拉伸」的底图上 → 同一页出现
+/// `锐瓦片区 vs 糊底区` 的**扁平密度差**块状混叠。本判定是「同帧不混叠」不变式的唯一
+/// 门控点，三条件任一满足才允许把瓦片层叠上屏：
+/// - **`cover_now`（当前密度整页封面）在位** → 允许：底图与瓦片同密度，无密度差可混叠
+///   （cap 邻域 `cover_serves_scale` 语义已把 4.0 封面视作等效当前密度，沿袭既有判定）；
+/// - **全无底图**（`base == false`）→ 允许：首开/高速平移切入的**从未显示过**的新页没有
+///   任何旧/低密度底可混 → 保持既有逐片流式出片（R3，不得误伤）；
+/// - **瓦片整组就位**（`group_complete`，可见矩形 + `TILE_MARGIN` 每格都在槽，见
+///   [`crate::pdf::layout::tile_range_all_in_slot`]）→ 允许：新密度内容对「已有旧底」的页
+///   **整页一次换**（旧状 → 整页 sharp 一次跳变，R2 原子换）。
+/// 三者全不满足（底图为旧/低密度 `prev_cover`/`prefetch`/`mid`/`thumb`，瓦片只部分到达）→
+/// **禁止**绘制任何部分瓦片：整页统一显示旧底拉伸（**宁糊不混**），块状混叠从根上杜绝。
+pub(crate) fn tiles_layer_allowed(cover_now: bool, base: bool, group_complete: bool) -> bool {
+    cover_now || !base || group_complete
+}
+
 /// 页卡底图选择（缩放期/方向翻位防闪的纯逻辑，见 [`PdfViewer::build_visible_page_cards`]）：
 /// 返回本帧应铺满整页的位图，优先级 **当前密度封面（锐利）→ 过渡底图
 /// （[`Slot::prev_cover`]：旧密度封面缩放过渡 CSS 拉伸兜底，或 F2 方向翻位退位封面桥）
@@ -353,6 +372,8 @@ impl PdfViewer {
         end: usize,
         page_width: f32,
         scale_factor: f32,
+        viewport_h: f32,
+        wrap_w: f32,
         selection: Option<((usize, usize), (usize, usize))>,
         sel_color: Hsla,
         searching: bool,
@@ -363,6 +384,9 @@ impl PdfViewer {
         page_border: Hsla,
     ) -> Vec<gpui::AnyElement> {
         let mut cards: Vec<gpui::AnyElement> = Vec::with_capacity(end - start + 1);
+        // 观测探针：整次页列渲染前清零，pass 内逐页累加（本帧挂入的瓦片 img 元素总数，
+        // 多页窗 = 各页之和；渲染未跑/无页 = 0）。
+        self.last_frame_tiles_drawn.set(0);
         // #1 页卡设备像素网格对齐（去缩放换档「跳一下再归位」pop 本体）：页卡 top 原本是
         // 布局算出的 f32 分数值 → 旧底图（prev_cover，旧密度）被拉伸到分数设备位的卡片，
         // 与新栅格（ceil 整数位图像素）的 PDF→设备映射差 ≤1 设备 px/轴，换档瞬间内容
@@ -419,8 +443,19 @@ impl PdfViewer {
                         || (slot.cover_scale - cover_scale(dim, page_width, scale_factor)).abs()
                             > 1e-4
                 });
+            // 底图选择提前（本帧「同帧不混叠」门控的输入之一）：当前密度封面 → 旧密度封面
+            // 拉伸兜底 → 空闲预取走廊封面 → 中清 → 缩略图。缩放期不闪白（宁可瞬时模糊也
+            // 要有底图）；全空（首开/极速拖动）才落「加载中」占位。
+            let base = page_base_image(
+                slot_cover.as_ref(),
+                slot_prev_cover.as_ref(),
+                slot_prefetch.as_ref(),
+                slot_mid.as_ref(),
+                slot_thumb.as_ref(),
+            );
             let mut tiles: Vec<(f32, f32, f32, f32, Arc<RenderImage>)> = Vec::new();
-            if tile_ok {
+            let mut group_complete = false;
+            if tile_ok && !slot.tiles.is_empty() {
                 tiles.reserve(slot.tiles.len());
                 for ts in slot.tiles.values() {
                     tiles.push((
@@ -431,6 +466,40 @@ impl PdfViewer {
                         ts.image.clone(),
                     ));
                 }
+                // 新密度瓦片「整组就位」判定（R2 原子换）：与瓦片调度同源几何
+                // （`page_visible_rect` + `visible_tile_range`，含 TILE_MARGIN：调度侧只派
+                // 可见矩形 + margin 的格子 → 组 = 该集合，不是整页 rows×cols——高倍/大页的
+                // 页高远超视口，整页组永远不会到齐，会永久停在糊底）。与
+                // `retire_high_scale_covers` 的「可见区铺满」对账同一套数学。
+                group_complete = self
+                    .page_visible_rect(i, scroll_y, viewport_h, page_width, wrap_w)
+                    .and_then(|rect| {
+                        crate::pdf::layout::visible_tile_range(
+                            bmp,
+                            page_width,
+                            disp_h,
+                            rect,
+                            TILE_SIZE,
+                            TILE_MARGIN,
+                        )
+                    })
+                    .is_some_and(|(r0, c0, r1, c1)| {
+                        crate::pdf::layout::tile_range_all_in_slot(&slot.tiles, r0, c0, r1, c1)
+                    });
+            }
+            // **S 系列双密度混叠根治门控**：底图链为非当前密度（`cover_now` 缺席 →
+            // prev_cover/prefetch/mid/thumb 其一在供）且瓦片只**部分**到达 → 本帧不绘制任何
+            // 新密度瓦片，整页统一显示旧底（宁糊不混）；新密度对「已有旧底」的页整组一次换。
+            // 仅「当前密度封面在位」或「全无底图（全新页，无旧底可混 → 保持流式）」例外。
+            let render_tiles = tile_ok
+                && !tiles.is_empty()
+                && tiles_layer_allowed(slot_cover.is_some(), base.is_some(), group_complete);
+            if render_tiles {
+                // 观测探针：本帧实际挂入卡片 DOM 的瓦片 img 元素数（S-series 原子换回归断言，
+                // 区分「旧底图 img」与「新瓦片 img」：修复前部分瓦片即 element 落树）。
+                // pass 级累加（见函数首清零），多页窗 = 各页之和。
+                self.last_frame_tiles_drawn
+                    .set(self.last_frame_tiles_drawn.get() + tiles.len());
             }
             let mut overlays = selection_overlays_for_page(
                 i,
@@ -520,14 +589,9 @@ impl PdfViewer {
             // 三层合成：底图（当前密度封面 → 旧密度封面拉伸兜底 → 空闲预取走廊封面 →
             // 中清 → 缩略图，缩放期不闪白：宁可瞬时模糊也要有底图）→ 瓦片（逐片绝对定位，
             // opaque 覆盖底图）→ 选区/检索高亮。全空（首开/极速拖动）才落「加载中」占位。
-            let base = page_base_image(
-                slot_cover.as_ref(),
-                slot_prev_cover.as_ref(),
-                slot_prefetch.as_ref(),
-                slot_mid.as_ref(),
-                slot_thumb.as_ref(),
-            );
-            let inner: gpui::AnyElement = if !tiles.is_empty() {
+            // 瓦片分支受上方 `render_tiles` 门控：旧底 + 部分瓦片 → 走「底图铺满」分支，
+            // 本帧不含任何瓦片元素（宁糊不混）。
+            let inner: gpui::AnyElement = if render_tiles {
                 let mut c = div().size_full().relative();
                 if let Some(base) = base {
                     c = c.child(
@@ -856,6 +920,8 @@ impl PdfViewer {
             end,
             page_width,
             scale_factor,
+            viewport_h,
+            self.wrap_width(window, page_width),
             selection,
             sel_color,
             searching,
@@ -908,5 +974,37 @@ impl PdfViewer {
                     .child(content),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tiles_layer_allowed;
+
+    /// S 系列「同帧不混叠」门控纯函数表（R1/R2/R3）：
+    /// 旧底 + 部分瓦片 → 禁止；当前密度 cover / 全新页（无底）/ 瓦片整组就位 → 允许。
+    #[test]
+    fn tiles_layer_allowed_only_uniform_density_or_full_group() {
+        // R1 核心不变式：无当前密度 cover、有底图（旧/低密度）、瓦片**部分**到达 → 禁止绘制。
+        assert!(
+            !tiles_layer_allowed(false, true, false),
+            "旧密度底图 + 部分瓦片：宁糊不混，禁止本帧出现瓦片层"
+        );
+        // R2 原子换：组齐全（全部可见格在槽）→ 允许一次全量呈现。
+        assert!(
+            tiles_layer_allowed(false, true, true),
+            "底图旧但不混叠：整组一次换允许"
+        );
+        // 允许三例外：
+        assert!(
+            tiles_layer_allowed(true, true, false),
+            "当前密度 cover 在位 → 底图与瓦片同密度，无密度差可混叠"
+        );
+        assert!(
+            tiles_layer_allowed(false, false, false),
+            "全无底图 → 全新页保持逐片流式（R3）"
+        );
+        assert!(tiles_layer_allowed(true, false, false), "cover 在位即允许");
+        assert!(tiles_layer_allowed(true, true, true), "全满足当然允许");
     }
 }

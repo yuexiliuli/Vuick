@@ -31,6 +31,7 @@ impl PdfViewer {
             pending_prefetch_cover: HashMap::new(),
             prefetch_reqs: 0,
             loading_placeholder_hits: std::cell::Cell::new(0),
+            last_frame_tiles_drawn: std::cell::Cell::new(0),
             pending_recolor: None,
             raster_reqs: 0,
             recolor_scope: Vec::new(),
@@ -38,6 +39,10 @@ impl PdfViewer {
             tile_reqs: 0,
             cover_reqs: 0,
             tile_bytes: 0,
+            tile_budget_state: None,
+            degrade_frames: HashMap::new(),
+            degraded: HashSet::new(),
+            tile_budget_cap_override: None,
             tile_pump_running: false,
             last_scroll_y: 0.0,
             scroll_dir: 0,
@@ -606,6 +611,22 @@ impl PdfViewer {
         self.last_scroll_y = scroll_y;
 
         let viewport_h = f32::from(self.scroll.bounds().size.height);
+        let (start, end) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
+
+        // 2.4) **动态瓦片预算 + 钉住集 + R4 均匀降级状态机**（每帧，含静态帧门控早退帧——
+        // 门控帧也须推进降级计数/保持钉住状态一致，跳过会让「静态 N 帧」解码停在 0）。
+        // 计算本帧预算/pinned（`evict_tiles` 消费）与降级激活（远距离页放不下 → 均匀 0.5 底）；
+        // 返回本帧因降级退休的 cover/清出的瓦片（入 `pending_drops` 下帧 drop_image）。
+        let degrade_drops = self.update_tile_budget_and_degrade(
+            start,
+            end,
+            scroll_y,
+            viewport_h,
+            page_width,
+            scale_factor,
+            window,
+        );
+        self.pending_drops.extend(degrade_drops);
 
         // 2.5) **静态帧门控（Sprint 5）**：滚动/缩放/DPI/视口/页数全未变 + 在途清空 +
         //      上帧已常态调度确认无待派（`window_settled`）→ 本帧 keep_window/内存封顶/
@@ -686,7 +707,7 @@ impl PdfViewer {
             return;
         }
 
-        let (start, end) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
+        // `start`/`end` 已在 2.4 处计算（keep_window 同源），此处直接沿用。
         let center = (start + end) / 2;
         // L1.1 大跳检测（每帧 update_fast_flag 后、调度前）：当前可见中心页位移超过
         // JUMP_PAGES_THRESHOLD → 置 jump_armed/jump_target + nav_gen++ 并清掉旧世代在途

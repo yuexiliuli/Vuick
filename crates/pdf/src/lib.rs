@@ -3241,6 +3241,262 @@ mod tests {
         );
     }
 
+    /// **A1 收敛十字门（高倍钉住收敛，R1-R3）**：真实 A4 fixture + 1200×1400 窗 +
+    /// `set_scale_factor(1.5)` 与 `2.0` + `adjust_zoom` 推到 zoom=4 + quiescent 后，断言每个
+    /// 可见页 `visible_tile_range(可见 bbox + TILE_MARGIN)` 覆盖的**每一格**都在 `slot.tiles`
+    /// ——高倍稳态仍是 1:1 锐利、无「缺格露糊底」的方形格子。修前（固定 32MiB 预算逐出可见
+    /// 片）sf=2.0 工作集（~42 格 ≈42MiB）超容量 → 崩缺格（红）；修后（动态预算 = max(固定,
+    /// 可见格×单格×1.25) + 钉住不逐出 + 视口相对排名）→ 全收敛（绿）。沿用
+    /// `zoom_blur_convergence_violations` 的同源几何，但把 sf 从 1.0 抬到 1.5/2.0 跑满
+    /// （1.0 时 cover 满密度、绕开预算十字门）。
+    #[gpui::test]
+    async fn high_zoom_convergence_pins_all_visible_tiles(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        for sf in [1.5f32, 2.0] {
+            let holder = zoom_holder();
+            let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+            // 1200×1400 视口：sf2.0 zoom4 可见格 ≈42 → 超 32MiB 固定预算（修前崩缺格红）；
+            // sf1.5 zoom4 ≈30 格贴预算线。两档都低于 scale-16 密度上限、渲染可收敛。
+            cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1400.)));
+            for _ in 0..3 {
+                cx.run_until_parked();
+            }
+            cx.update(|w, _| w.set_scale_factor(sf));
+            for _ in 0..3 {
+                cx.run_until_parked();
+            }
+            // Ctrl+滚轮推到 zoom=4（ZOOM_MAX；12%/档，需 ~13 档）。
+            let mut z = 0.0f32;
+            for _ in 0..40 {
+                cx.simulate_event(zoom_wheel(true, 240.0));
+                for _ in 0..2 {
+                    cx.executor().advance_clock(Duration::from_millis(16));
+                    cx.run_until_parked();
+                }
+                z = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+                if z >= config::pdf::ZOOM_MAX - 0.05 {
+                    break;
+                }
+            }
+            assert!(
+                z >= config::pdf::ZOOM_MAX - 0.05,
+                "[A1] sf={sf} 应推到 zoom=4：z={z}"
+            );
+            let (q, _stuck) = zoom_blur_quiesce(&holder, cx, 1100, 2);
+            // 注：修前固定 32MiB 预算逐出可见片 → 调度/逐出震荡、quiescent 恒不达（q=false），
+            // 且可见格崩缺（missing>0）；修后 q=true 且 missing=∅。q 仅取证，不符合仍以缺格
+            // 断言为准（worker 串行高密渲染受墙钟抖动影响，最慢帧可拖到预算帧之外）。
+            eprintln!("[A1] sf={sf} zoom4 quiescent={q}");
+            // 逐可见页断言「可见矩形 + MARGIN 每格都在槽」（与 A1 验收口径逐字：格子全在、
+            // 无缺格）。修前逐出可见片 → missing>0（红）。
+            let (missing, cell_total, tile_bytes, budget, npin) = cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let vh = f32::from(v.scroll.bounds().size.height);
+                let rows = v.visible_tile_presence(w.scale_factor(), vh, w);
+                let cell_total: u64 = rows.iter().map(|&(_, _, t)| t as u64).sum();
+                let missing: Vec<(usize, u32, u32)> =
+                    rows.into_iter().filter(|&(_, m, _)| m > 0).collect();
+                let bs = v.tile_budget_state.as_ref();
+                (
+                    missing,
+                    cell_total,
+                    v.tile_bytes,
+                    bs.map(|s| s.budget).unwrap_or(0),
+                    bs.map(|s| s.pinned.len()).unwrap_or(0),
+                )
+            });
+            eprintln!(
+                "[A1] sf={sf} cell_total={cell_total} tile_bytes={tile_bytes} budget={budget} npin={npin} missing={missing:?}"
+            );
+            assert!(
+                missing.is_empty(),
+                "[A1] sf={sf} zoom=4 可见格未全收敛（缺格即高倍方形格子根因未除）：{missing:?}"
+            );
+        }
+    }
+
+    /// **A2 无震荡（R1-R3 收敛后稳定）**：高倍 quiescent 后再连跑 2 帧，断言可见格集合与
+    /// 瓦片占用字节**不变**、`plan_tiles_in_window`（可见页窗）返回 need==∅——即不再
+    /// 「逐出→重派→逐出」每帧震荡（修前固定预算在 sf2.0 曾把 pending 顶满、quiescent 不达）。
+    #[gpui::test]
+    async fn high_zoom_converged_no_oscillation(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1400.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|w, _| w.set_scale_factor(2.0));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut z = 0.0f32;
+        for _ in 0..40 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..2 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+            }
+            z = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+            if z >= config::pdf::ZOOM_MAX - 0.05 {
+                break;
+            }
+        }
+        assert!(z >= config::pdf::ZOOM_MAX - 0.05, "[A2] 应推到 zoom=4：z={z}");
+        let (q, _) = zoom_blur_quiesce(&holder, cx, 1100, 2);
+        eprintln!("[A2] quiescent={q}");
+        let snapshot = |cx: &mut gpui::VisualTestContext| -> (Vec<(usize, u32, u32)>, u64, usize) {
+            cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let pw = v.page_width();
+                let sy = f32::from(-v.scroll.offset().y);
+                let vh = f32::from(v.scroll.bounds().size.height);
+                let vis = pdf_visible_pages(v, pw, sy, vh);
+                let first = *vis.first().unwrap_or(&0);
+                let last = *vis.last().unwrap_or(&0);
+                let center = (first + last) / 2;
+                let missing = v
+                    .visible_tile_presence(w.scale_factor(), vh, w)
+                    .into_iter()
+                    .filter(|&(_, m, _)| m > 0)
+                    .collect::<Vec<_>>();
+                let need = v.plan_tiles_in_window(
+                    first..=last,
+                    center,
+                    pw,
+                    w.scale_factor(),
+                    sy,
+                    vh,
+                    w,
+                );
+                (missing, v.tile_bytes, need.len())
+            })
+        };
+        let (m0, b0, need0) = snapshot(&mut *cx);
+        let (m1, b1, need1) = snapshot(&mut *cx);
+        assert_eq!(m1, m0, "[A2] 可见格集合不应变化（收敛后无逐出震荡）：{m1:?} vs {m0:?}");
+        assert_eq!(b1, b0, "[A2] 瓦片占用字节不应变化（无逐出/重派）：{b1} vs {b0}");
+        assert_eq!(need0, 0, "[A2] quiescent 后可见页 plan 不应再派瓦片：need={need0}");
+        assert_eq!(need1, 0, "[A2] 2 帧后可见页 plan 仍不应派瓦片：need={need1}");
+    }
+
+    /// **A3 预算触顶 R4 均匀降级 + 自愈（无死锁）**：高倍收敛后把动态预算硬顶覆写为小值
+    /// （测试钩子构造「预算触顶 + 可见组不齐」）→ 连续静态 N 帧后该页进入**均匀 0.5 降级**
+    /// （瓦片清空、cap 截断 cover 退休、派发 0.5 密度 preview 垫底 = 宁均匀不格子、非整页永糊）；
+    /// 随后移除覆写 + 缩小视口 → 帧不再触顶 → 降级自愈、可见格恢复 1:1。
+    #[gpui::test]
+    async fn budget_capped_uniform_degrade_then_recovers(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use std::time::Duration;
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1400.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|w, _| w.set_scale_factor(2.0));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut z = 0.0f32;
+        for _ in 0..40 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..2 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+            }
+            z = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+            if z >= config::pdf::ZOOM_MAX - 0.05 {
+                break;
+            }
+        }
+        assert!(z >= config::pdf::ZOOM_MAX - 0.05, "[A3] 应推到 zoom=4：z={z}");
+        let (q, _) = zoom_blur_quiesce(&holder, cx, 1100, 2);
+        eprintln!("[A3] 初始收敛 quiescent={q}");
+        // ① 覆写预算硬顶 → 构造「预算触顶 + 组不齐」。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.tile_budget_cap_override = Some(6 * 1024 * 1024);
+            });
+        });
+        // ② 推进静态帧（含静态帧门控早退帧）→ 连续 DEGRADE_STATIC_FRAMES 帧后激活降级。
+        let mut degraded = false;
+        let mut tiles_drained = true;
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            (degraded, tiles_drained) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.degraded.contains(&0), v.slots[0].tiles.is_empty())
+            });
+            if degraded && tiles_drained {
+                break;
+            }
+        }
+        assert!(
+            degraded && tiles_drained,
+            "[A3] 连续静态 N 帧后应进入 R4 均匀降级（瓦片清空）：degraded={degraded} drained={tiles_drained}"
+        );
+        // ③ 等 0.5 均匀 preview 落地（非格子、非整页永糊：有统一垫底）。
+        let mut prefetch_ok = false;
+        for _ in 0..80 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            prefetch_ok = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.slots[0].prefetch_cover.is_some()
+                    && (v.slots[0].prefetch_cover_scale
+                        - (crate::pdf::layout::cover_scale(v.dims[0], v.page_width(), 2.0)
+                            * config::pdf::PREFETCH_COVER_DENSITY)
+                            .min(config::pdf::COVER_SCALE_CAP))
+                        .abs()
+                        <= 1e-4
+            });
+            if prefetch_ok {
+                break;
+            }
+        }
+        assert!(
+            prefetch_ok,
+            "[A3] 降级页应有均匀 0.5 密度 preview 垫底（宁均匀不格子、非整页永糊）：prefetch_ok={prefetch_ok}"
+        );
+        // ④ 自愈：移除覆写 + 缩小视口 → 帧不再触顶 → 恢复 1:1（可见格全在槽）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.tile_budget_cap_override = None;
+            });
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(1100.)));
+        let mut recovered = false;
+        for _ in 0..1200 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            recovered = cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let vh = f32::from(v.scroll.bounds().size.height);
+                v.visible_tile_presence(w.scale_factor(), vh, w)
+                    .iter()
+                    .all(|&(_, m, _)| m == 0)
+            });
+            if recovered {
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "[A3] 预算回落（视口缩小）后应自愈回 1:1（可见格全在槽）：recovered={recovered}"
+        );
+    }
+
     /// 回归：Ctrl+滚轮应放大/缩小页面（页列宽、整列高随之变化），普通滚轮不改变缩放。
     #[gpui::test]
     async fn pdf_ctrl_wheel_zooms_in_out(cx: &mut gpui::TestAppContext) {
@@ -4694,18 +4950,44 @@ mod tests {
 
         let measure = full_scroll_memory(&holder, cx, &targets);
         let (tile_bytes, covers, mids, thumbs, double_hold, total_est) = measure;
-        let cap = config::pdf::TILE_CACHE_BYTES;
+        // R3：预算随可见钉住集伸缩（max(固定 32MB, 可见格×单格×1.25），硬顶 128MB）。
+        // 本夹具（pdf测试2.pdf 适配宽 render_scale≈4.9、cover 被 cap 截在 4.0 → 纯瓦片供给）
+        // 可见工作集 ~30 格 ≈30MB 即贴近旧固定 32MB；钉住不逐出 + 1.25 余量 → 预算升至 ~37MB。
+        // 「瓦片占用 ≤ 动态预算、且预算 ≤ 硬顶、远非满额」即本变更后稳态内存不变式。
+        let budget = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .tile_budget_state
+                .as_ref()
+                .map(|s| s.budget)
+                .unwrap_or(config::pdf::TILE_CACHE_BYTES)
+        });
         eprintln!(
-            "[MEM zoom=1.0] tile_bytes={}MB covers={} mids={} thumbs={} double_hold={} est_total={}MB cap={}MB",
+            "[MEM zoom=1.0] tile_bytes={}MB covers={} mids={} thumbs={} double_hold={} est_total={}MB budget={}MB",
             tile_bytes / 1024 / 1024,
             covers,
             mids,
             thumbs,
             double_hold,
             total_est / 1024 / 1024,
-            cap / 1024 / 1024,
+            budget / 1024 / 1024,
         );
-        assert!(tile_bytes <= cap, "zoom1 瓦片占用应不超预算：{tile_bytes} > {cap}");
+        assert!(
+            tile_bytes <= budget,
+            "zoom1 瓦片占用应 ≤ 动态预算（可见钉住集×1.25 的收缩内存）：{tile_bytes} > {budget}"
+        );
+        assert!(
+            budget <= config::pdf::TILE_CACHE_BYTES_MAX,
+            "zoom1 动态预算应 ≤ 硬顶（128MB），否则内存无界：{budget}"
+        );
+        assert!(
+            tile_bytes < config::pdf::TILE_CACHE_BYTES_MAX,
+            "zoom1 瓦片占用应远小于硬顶（非满额驻留）：{tile_bytes} >= {}",
+            config::pdf::TILE_CACHE_BYTES_MAX
+        );
         // F2：封面驻留上界 = 可见页数 + 滚动方向预取 1。本夹具（1500×900 视口、A4 适配宽）
         // 停稳后可见页恒为 1（旧对称窗 3 页 = 可见 1 + 两侧各 1 即基线 covers=3），
         // 故相对上界 = 1 + 1 = 2——不锁死宽泛绝对数字，随可见页数变化。
@@ -4791,19 +5073,34 @@ mod tests {
         }
         let (tile_bytes2, covers2, mids2, thumbs2, double_hold2, total_est2) =
             full_scroll_memory(&holder, cx, &targets);
+        let budget2 = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .tile_budget_state
+                .as_ref()
+                .map(|s| s.budget)
+                .unwrap_or(config::pdf::TILE_CACHE_BYTES)
+        });
         eprintln!(
-            "[MEM zoom=1.75(d=2.47)] tile_bytes={}MB covers={} mids={} thumbs={} double_hold={} est_total={}MB cap={}MB",
+            "[MEM zoom=1.75(d=2.47)] tile_bytes={}MB covers={} mids={} thumbs={} double_hold={} est_total={}MB budget={}MB",
             tile_bytes2 / 1024 / 1024,
             covers2,
             mids2,
             thumbs2,
             double_hold2,
             total_est2 / 1024 / 1024,
-            cap / 1024 / 1024,
+            budget2 / 1024 / 1024,
         );
         assert!(
-            tile_bytes2 <= cap,
-            "zoom1.75 瓦片占用应不超预算：{tile_bytes2} > {cap}"
+            tile_bytes2 <= budget2,
+            "zoom1.75 瓦片占用应 ≤ 动态预算（可见钉住集×1.25 的收缩内存）：{tile_bytes2} > {budget2}"
+        );
+        assert!(
+            budget2 <= config::pdf::TILE_CACHE_BYTES_MAX,
+            "zoom1.75 动态预算应 ≤ 硬顶（128MB），否则内存无界：{budget2}"
         );
         assert!(
             covers2 <= 2,

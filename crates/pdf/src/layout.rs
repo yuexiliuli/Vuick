@@ -337,6 +337,35 @@ pub(crate) fn tile_rect(
     Some((x0, y0, x1 - x0, y1 - y0))
 }
 
+/// 判断可见瓦片区间 `(r0, c0)–(r1, c1)`（含端点，即调度侧
+/// [`visible_tile_range`] + `TILE_MARGIN` 的同一组格）的**每一格**是否都已收敛在槽位
+/// （O(格数) 纯函数）。
+///
+/// 供两处共用同一套几何：
+/// - 「S 系列双密度混叠根治」原子换判定（render 侧）：新密度瓦片首次呈现必须整组
+///   **一次**就位，绝不部分浮现盖在旧密度底图上；
+/// - [`super::view::tiles::PdfViewer::retire_high_scale_covers`] 的「可见区已铺满」对账
+///   （未铺满不回收 cover，防闪底）。
+///
+/// `tiles` 必须已是**当前密度**的瓦片集（调用方须先确认 `tile_scale ≈ render_scale`，
+/// 否则栅格密度不对齐，本判定无意义）。
+pub(crate) fn tile_range_all_in_slot(
+    tiles: &HashMap<(u32, u32), TileSlot>,
+    r0: u32,
+    c0: u32,
+    r1: u32,
+    c1: u32,
+) -> bool {
+    for row in r0..=r1 {
+        for col in c0..=c1 {
+            if !tiles.contains_key(&(row, col)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// 给定卡片局部可见矩形（CSS px，已夹在页内），推算需要覆盖的瓦片网格区间，
 /// 返回 `(row0, col0, row1, col1)`（含端点，已夹进网格）。`rect = (x0, y0, x1, y1)`。
 /// 视口外缘再外扩 `margin` 格以缓冲滚动。无交点 → `None`。
@@ -1636,5 +1665,31 @@ mod tests {
             }
         }
         assert_eq!(count, (rows * cols) as usize, "整页应圈出全部 2×2 格");
+    }
+
+    /// `tile_range_all_in_slot`：仅在区间每一格都在槽位时返回 true（S 系列原子换 /
+    /// S5 回收共用的可见区铺满判定）。
+    #[test]
+    fn tile_range_all_in_slot_requires_every_cell_present() {
+        let mut tiles: HashMap<(u32, u32), TileSlot> = HashMap::new();
+        let mk = || TileSlot {
+            image: crate::pdf::render_image_from_bgra(vec![0u8; 4 * 4 * 4], 4, 4).unwrap(),
+            x0: 0,
+            y0: 0,
+            w: 4,
+            h: 4,
+        };
+        // 空槽：任何区间都不完整。
+        assert!(!tile_range_all_in_slot(&tiles, 0, 0, 1, 1), "空槽应判不完整");
+        // 只放 (0,0) → 1×1 区间完整、2×2 区间缺 (0,1)/(1,0)/(1,1)。
+        tiles.insert((0, 0), mk());
+        assert!(tile_range_all_in_slot(&tiles, 0, 0, 0, 0), "单格在场应完整");
+        assert!(!tile_range_all_in_slot(&tiles, 0, 0, 1, 1), "缺格应判不完整");
+        // 补齐 2×2 → 完整。
+        tiles.insert((0, 1), mk());
+        tiles.insert((1, 0), mk());
+        assert!(!tile_range_all_in_slot(&tiles, 0, 0, 1, 1), "仍缺一格应不完整");
+        tiles.insert((1, 1), mk());
+        assert!(tile_range_all_in_slot(&tiles, 0, 0, 1, 1), "2×2 齐备应完整");
     }
 }

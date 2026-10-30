@@ -620,6 +620,13 @@ impl PdfViewer {
         let mut cover_order: Vec<usize> = (cover_first..=cover_last).collect();
         cover_order.sort_by_key(|&p| (p as i64 - center_vis as i64).unsigned_abs());
         for page in cover_order {
+            // R4：已降级/降级候选页不派封面——已降级页显示由均匀 0.5 preview/既有底图链供给
+            // （瓦片调度同源跳过）；候选页（预算触顶静态计数中）也不派，避免「candidate 期间
+            // 重派 cap cover → activation 的 preview 派发被 pending_cover 挡住」的互相挡住
+            // （且其显示由既有底图链经 settle 门控统一，宁均匀不格子）。
+            if self.degraded.contains(&page) || self.degrade_frames.contains_key(&page) {
+                continue;
+            }
             let dim = self.dims[page];
             let cscale = cover_scale(dim, page_width, scale_factor);
             // 缩放过期（缩放/DPI 已变）→ 旧封面移入 `prev_cover` 作 CSS 拉伸兜底底图
@@ -743,6 +750,12 @@ impl PdfViewer {
         let mut need: Vec<(usize, u32, u32, u64)> = Vec::new();
         for page in pages {
             let dim = self.dims[page];
+            // R4：预算触顶的降级候选/已降级页（`update_tile_budget_and_degrade` 维护）——
+            // 不再派瓦片。已降级页由均匀 0.5 底提供显示；候选页（静态计数中）显示由既有
+            // cap 封面整页统一底提供，两者都不再「派→逐→重派」震荡。
+            if self.degrade_frames.contains_key(&page) || self.degraded.contains(&page) {
+                continue;
+            }
             let scale = render_scale(page_width, scale_factor, dim.0);
             let Some(rect) =
                 self.page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
@@ -978,6 +991,12 @@ impl PdfViewer {
                 continue;
             };
             if let Some(slot) = self.slots.get_mut(page) {
+                // R4：降级页不接受新瓦片（预算释放、显示由 0.5 均匀底提供）——否则 in-flight
+                // 旧瓦片晚到会重填槽、被逐出/重派震荡。
+                if self.degraded.contains(&page) {
+                    self.pending_drops.push(img);
+                    continue;
+                }
                 // 该页此时已有同密度整页封面 → 瓦片冗余（调度侧已不派新的，此处兜底收到
                 // 封面到位前/后仍可能在途的老瓦片）：直接回收，不占内存不占显存。
                 if slot.cover.is_some() && (slot.cover_scale - scale).abs() <= 1e-4 {
@@ -1005,14 +1024,23 @@ impl PdfViewer {
         any
     }
 
-    /// 瓦片字节预算淘汰（LRU by 距视口中心远近）。先重算精确占用（自愈记账漂移），
-    /// 超预算时从最远瓦片开始移除，旧纹理走 `pending_drops` 显式下线 GPU 纹理。
-    /// **每帧全局清理（同密度封面瓦片冗余 + 过期密度瓦片）**：`schedule_tiles` 只对窗内
-    /// 页做密度失效，窗外页的旧密度瓦片会滞留到 32MB 预算满——这里对**所有页**统一清：
-/// - 同密度整页封面在位（`cover_scale≈当前密度`）→ 瓦片冗余，清（封面即全页锐化底图）；
-/// - `tile_scale` 与当前密度不符 → 瓦片已过期（回看也必重渲），清。
-///
-/// 只留下「无封面、当前密度」的窗外页瓦片作滚动回看缓存，受 [`TILE_CACHE_BYTES`] 约束。
+    /// 瓦片字节预算淘汰。**R1/R2/R3 改造**（高倍「方形格子、清晰度不一」根治）：
+    /// - **① 正确性清扫先行（不变）**：对**所有页**统一清「同密度整页封面在位 → 瓦片冗余」
+    ///   与「`tile_scale` 与当前密度不符 → 过期」两类的瓦片（封面即全页锐化底图、过期片
+    ///   回看也必重渲）——这是清扫，**先于且不跳过**钉住判断（钉住格同样被清）。
+    /// - **② 预算 LRU 逐出（R1）**：逐出候选**跳过当前钉住格**（`tile_budget_state.pinned`
+    ///   = 各可见页 `visible_tile_range(可见 bbox + TILE_MARGIN)` 覆盖的格子，由
+    ///   `update_tile_budget_and_degrade` 每帧同源计算）——可见区绝不逐出、下帧不再重请 →
+    ///   消灭「逐出→重派→每帧震荡永不收敛」；预算用**动态值**（`tile_budget_state.budget`
+    ///   = max(固定, 可见格数×单格字节×1.25)，夹 [`config::pdf::TILE_CACHE_BYTES_MAX`]
+    ///   硬顶），钉住集 ≤ 预算**天然成立**。
+    /// - **③ 淘汰排名（R2）改视口相对**：`|page − 可见中心页|×1e6 + |row − 该页可见行中心|`
+    ///   （与 `plan_tiles_in_window` 派发优先级同源语义），消除「留已滚过的顶行、逐出刚入视
+    ///   的行」。
+    ///
+    /// `tile_budget_state == None`（未走 `ensure_window` 的直接调用，如单测）→ 回退旧语义：
+    /// 固定 [`config::pdf::TILE_CACHE_BYTES`] 预算、无钉住、绝对行号排名。旧纹理走
+    /// `pending_drops` 显式下线 GPU 纹理。
     pub(super) fn evict_tiles(&mut self, start: usize, end: usize, scale_factor: f32) {
         let pw = self.page_width();
         // 统一从各槽位账簿汇总全局占用（O(页)）：替代原「O(页×瓦片) 全扫自愈重算」——
@@ -1036,21 +1064,31 @@ impl PdfViewer {
             }
             self.pending_drops.extend(drops);
         }
-        if self.tile_bytes <= TILE_CACHE_BYTES {
+        // R3 预算 + R1 钉住集（None = 直接调用回退固定预算/无钉住/绝对行号排名）。
+        let (budget, center, pinned, mid_rows) = match &self.tile_budget_state {
+            Some(s) => (s.budget, s.center, Some(&s.pinned), Some(&s.mid_rows)),
+            None => (TILE_CACHE_BYTES, (start + end) / 2, None, None),
+        };
+        if self.tile_bytes <= budget {
             return;
         }
-        let center = (start + end) / 2;
         let mut candidates: Vec<(u64, usize, u32, u32)> = Vec::new();
         for (page, slot) in self.slots.iter().enumerate() {
             for &(row, col) in slot.tiles.keys() {
+                // R1：钉住格（可见矩形 + TILE_MARGIN）绝不逐出。
+                if pinned.is_some_and(|ps| ps.contains(&(page, row, col))) {
+                    continue;
+                }
+                // R2：视口相对排名（该页可见行中心；无钉住态的页回落绝对行号=旧语义）。
+                let mid = mid_rows.and_then(|m| m.get(&page)).copied().unwrap_or(0);
                 let d = (page as i64 - center as i64).unsigned_abs() * 1_000_000
-                    + row as u64;
+                    + (row as i64 - mid as i64).unsigned_abs();
                 candidates.push((d, page, row, col));
             }
         }
         candidates.sort_by_key(|c| std::cmp::Reverse(c.0)); // 最远优先
         for (_, page, row, col) in candidates {
-            if self.tile_bytes <= TILE_CACHE_BYTES {
+            if self.tile_bytes <= budget {
                 break;
             }
             if let Some(slot) = self.slots.get_mut(page)
@@ -1061,6 +1099,274 @@ impl PdfViewer {
                     self.pending_drops.push(ts.image);
                 }
         }
+    }
+
+    /// **R1/R3 动态瓦片预算 + R4 均匀降级状态机**（每帧由 `open::ensure_window` 在调度/
+    /// 淘汰前调用，含静态帧门控帧——门控帧也须推进降级计数与钉住态，否则「静态 N 帧」停在 0）。
+    ///
+    /// 职责三件：
+    /// 1. 用与调度同源的几何（`page_visible_rect` + `visible_tile_range(可见 bbox +
+    ///    TILE_MARGIN)`）算出各可见页钉住格，写入 [`Self::tile_budget_state`]（供
+    ///    [`Self::evict_tiles`] 消费：预算与钉住集同帧一致、杜绝漂移）。
+    /// 2. 预算 = `max(TILE_CACHE_BYTES, 可见格数 × 单格字节 × 1.25)`、夹
+    ///    [`config::pdf::TILE_CACHE_BYTES_MAX`]；未触顶 → 全钉住（R1：可见区绝不逐出）。
+    /// 3. 预算触顶（可见格 >~102）→ 从**最远可见页**起把放不下的页选为 **R4 降级候选**
+    ///    （静态 + 连续 [`config::pdf::DEGRADE_STATIC_FRAMES`] 帧）→ 激活
+    ///    [`Self::degraded`]：清瓦片 + 退休 cap 截断 cover + 派发**均匀 0.5 密度 preview**
+    ///    垫底（宁均匀不格子、内存有界、无死锁；正常路径预算够时 cap cover 照旧）。
+    ///    候选/已降级页退出钉住 → `plan_tiles_in_window`/`schedule_covers` 跳过派发（无震荡）；
+    ///    帧不再触顶或页滑出可见窗 → 清除降级态并自愈回 1:1。
+    ///
+    /// 返回本帧因降级退休的 cover 与清出的瓦片 `Arc`（调用方入 `pending_drops`）。
+    pub(super) fn update_tile_budget_and_degrade(
+        &mut self,
+        start: usize,
+        end: usize,
+        scroll_y: f32,
+        viewport_h: f32,
+        page_width: f32,
+        scale_factor: f32,
+        window: &Window,
+    ) -> Vec<Arc<RenderImage>> {
+        let nominal_per_tile = (TILE_SIZE as u64) * (TILE_SIZE as u64) * 4; // 512²×4 ≈ 1MiB
+        let demand_of = |cells: u64| {
+            (cells as f64 * nominal_per_tile as f64
+                * config::pdf::TILE_BUDGET_KEEP_FACTOR as f64) as u64
+        };
+        let mut drops: Vec<Arc<RenderImage>> = Vec::new();
+        let n = self.dims.len();
+        if n == 0 || start > end || viewport_h <= 0.0 {
+            self.tile_budget_state = None;
+            self.degrade_frames.clear();
+            self.recover_degraded();
+            return drops;
+        }
+        let end = end.min(n - 1);
+        let wrap_w = self.wrap_width(window, page_width);
+        // ① 各可见页钉住几何（页 → (格数, 行中心)）。
+        let (v_first, v_last) =
+            self.visible_page_span(start, end, scroll_y, viewport_h, page_width, window);
+        let (Some(vis_first), Some(vis_last)) = (v_first, v_last) else {
+            self.tile_budget_state = Some(TileBudgetState {
+                budget: TILE_CACHE_BYTES,
+                center: (start + end) / 2,
+                pinned: HashSet::new(),
+                mid_rows: HashMap::new(),
+            });
+            self.degrade_frames.clear();
+            self.recover_degraded();
+            return drops;
+        };
+        let vis_last = vis_last.min(n - 1);
+        let center_vis = (vis_first + vis_last) / 2;
+        #[derive(Clone, Copy)]
+        struct Pin {
+            demand: u64,
+            mid_row: u32,
+        }
+        let mut pins: Vec<(usize, Pin)> = Vec::new();
+        for page in vis_first..=vis_last {
+            let dim = self.dims[page];
+            let scale = render_scale(page_width, scale_factor, dim.0);
+            let bmp = page_bitmap_size(dim, scale);
+            let disp_h = display_height(dim, page_width);
+            let Some(rect) = self.page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
+            else {
+                continue;
+            };
+            let Some((r0, c0, r1, c1)) =
+                visible_tile_range(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN)
+            else {
+                continue;
+            };
+            let cells = (r1 - r0 + 1) as u64 * (c1 - c0 + 1) as u64;
+            pins.push((
+                page,
+                Pin {
+                    demand: demand_of(cells),
+                    mid_row: (r0 + r1) / 2,
+                },
+            ));
+        }
+        // ② 未触顶：全钉住（预算自动包住钉住集 ≤ 1.25×），清一切降级态。
+        //    硬顶可被测试钩子覆写（`tile_budget_cap_override` → 构造「预算触顶」场景）。
+        let max_budget = self
+            .tile_budget_cap_override
+            .unwrap_or(config::pdf::TILE_CACHE_BYTES_MAX);
+        let total_requested = pins.iter().map(|&(_, p)| p.demand).sum::<u64>();
+        if total_requested <= max_budget {
+            let mut pinned = HashSet::new();
+            let mut mid_rows = HashMap::new();
+            for &(page, pin) in &pins {
+                mid_rows.insert(page, pin.mid_row);
+                let dim = self.dims[page];
+                let scale = render_scale(page_width, scale_factor, dim.0);
+                let bmp = page_bitmap_size(dim, scale);
+                let disp_h = display_height(dim, page_width);
+                if let Some(rect) = self
+                    .page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
+                    && let Some((r0, c0, r1, c1)) =
+                        visible_tile_range(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN)
+                {
+                    for row in r0..=r1 {
+                        for col in c0..=c1 {
+                            pinned.insert((page, row, col));
+                        }
+                    }
+                }
+            }
+            self.tile_budget_state = Some(TileBudgetState {
+                budget: total_requested.max(TILE_CACHE_BYTES),
+                center: center_vis,
+                pinned,
+                mid_rows,
+            });
+            self.degrade_frames.clear();
+            self.recover_degraded();
+            return drops;
+        }
+        // ③ 触顶：从最远可见页起，放不下的页 → R4 降级候选/已降级（它们退出钉住、不占预算）。
+        let mut order: Vec<(usize, Pin)> = pins.clone();
+        order.sort_by_key(|&(p, _)| core::cmp::Reverse((p as i64 - center_vis as i64).unsigned_abs()));
+        let mut remaining = max_budget as u64;
+        let mut sharp: HashSet<usize> = HashSet::new();
+        for &(page, pin) in &order {
+            if self.degraded.contains(&page) {
+                continue; // 已降级页不占预算、保持降级（稳定不抖动）
+            }
+            if pin.demand > remaining {
+                continue; // 放不下 → 候选（连续静态 N 帧后激活降级）
+            }
+            remaining -= pin.demand;
+            sharp.insert(page);
+        }
+        let static_ok = !self.zoom_armed && !self.speed_state.is_fast();
+        // 候选页 = 可见页 ∩ 非 sharp ∩ 非已降级（已降级保持）。
+        let candidate_set: HashSet<usize> = pins
+            .iter()
+            .map(|&(p, _)| p)
+            .filter(|p| !sharp.contains(p) && !self.degraded.contains(p))
+            .collect();
+        if static_ok {
+            for &page in &candidate_set {
+                let e = self.degrade_frames.entry(page).or_insert(0);
+                *e = e.saturating_add(1);
+                if *e >= config::pdf::DEGRADE_STATIC_FRAMES {
+                    drops.extend(self.activate_degrade(page, page_width, scale_factor));
+                }
+            }
+            // 计数只保留候选页（已激活的移走、非候选/滑出可见窗的清除）。
+            self.degrade_frames.retain(|p, _| candidate_set.contains(p));
+        } else {
+            self.degrade_frames.clear(); // 运动中不推进降级计数
+        }
+        // 钉住集 = sharp 可见页的格子；预算 = sharp 需求之和（≤ 硬顶）。
+        let sharp_demand = pins
+            .iter()
+            .filter(|&(p, _)| sharp.contains(p))
+            .map(|&(_, pin)| pin.demand)
+            .sum::<u64>();
+        let mut pinned = HashSet::new();
+        let mut mid_rows = HashMap::new();
+        for &(page, pin) in &pins {
+            if !sharp.contains(&page) {
+                continue;
+            }
+            mid_rows.insert(page, pin.mid_row);
+            let dim = self.dims[page];
+            let scale = render_scale(page_width, scale_factor, dim.0);
+            let bmp = page_bitmap_size(dim, scale);
+            let disp_h = display_height(dim, page_width);
+            if let Some(rect) = self
+                .page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
+                && let Some((r0, c0, r1, c1)) =
+                    visible_tile_range(bmp, page_width, disp_h, rect, TILE_SIZE, TILE_MARGIN)
+            {
+                for row in r0..=r1 {
+                    for col in c0..=c1 {
+                        pinned.insert((page, row, col));
+                    }
+                }
+            }
+        }
+        self.tile_budget_state = Some(TileBudgetState {
+            budget: sharp_demand.max(TILE_CACHE_BYTES).min(max_budget),
+            center: center_vis,
+            pinned,
+            mid_rows,
+        });
+        drops
+    }
+
+    /// R4 降级激活：把页 `page` 从「1:1 瓦片」切到「**均匀 0.5 密度 preview**」——
+    /// 清空该页瓦片（不再显示、不再派发、立即回内存）、退休 cap 截断 cover（render 侧判等
+    /// 失败 → `cover_now=false` → settle 门控对部分瓦片整帧禁用 → 屏显整页统一底图，
+    /// **宁均匀不格子**）、并派发一版 0.5 密度 preview 作垫底（复用
+    /// [`config::pdf::PREFETCH_COVER_DENSITY`] 机制/几何：`request_render_preview` →
+    /// `slot.prefetch_cover`）。preview 不可负担（病理性超大页）→ 放弃降级（保持 cap cover
+    /// 均匀底，虽糊但非格子、内存有界）。返回被线下/退休的位图（调用方入 `pending_drops`）。
+    fn activate_degrade(
+        &mut self,
+        page: usize,
+        page_width: f32,
+        scale_factor: f32,
+    ) -> Vec<Arc<RenderImage>> {
+        let mut drops = Vec::new();
+        let dim = self.dims[page];
+        let cscale = cover_scale(dim, page_width, scale_factor);
+        let pscale = (cscale * config::pdf::PREFETCH_COVER_DENSITY)
+            .min(config::pdf::COVER_SCALE_CAP);
+        // 0.5 preview 都渲不动（病理性超大页）→ 放弃降级（保持现状，宁糊不空）。
+        if !cover_affordable(dim, pscale) {
+            return drops;
+        }
+        self.degraded.insert(page);
+        self.degrade_frames.remove(&page);
+        {
+            let slot = &mut self.slots[page];
+            // 清瓦片：从 1:1 供给撤下（不显示、不再派发），内存立即释放。
+            let bytes = slot.tile_bytes;
+            slot.tile_bytes = 0;
+            self.tile_bytes = self.tile_bytes.saturating_sub(bytes);
+            for (_, ts) in slot.tiles.drain() {
+                drops.push(ts.image);
+            }
+            // 退休 cap 截断 cover：render 侧判等失败 → settle 门控「宁糊不混」统一底图生效。
+            if let Some(old) = slot.cover.take() {
+                drops.push(old);
+            }
+            slot.cover_scale = 0.0;
+        }
+        // 派发均匀 0.5 底（已有同密度 preview/在途则不重复派）。不设 `pending_cover` 守卫：
+        // 在途 cap cover 结果到达时会被 `collect_cover_results` 的 degraded 守卫丢弃，双在途
+        // 无害（preview 才是降级页的唯一底图）。
+        let has_preview = self.slots[page]
+            .prefetch_cover
+            .as_ref()
+            .is_some_and(|_| (self.slots[page].prefetch_cover_scale - pscale).abs() <= 1e-4);
+        if !has_preview
+            && !self.pending_prefetch_cover.contains_key(&page)
+            && let Some(worker) = self.worker.clone()
+        {
+            let rx = worker.request_render_preview(
+                self.doc_id,
+                RenderRequest { page, scale: pscale },
+                self.nav_gen, // L2.2 enqueue-n_gen（世代语义不变）
+                self.zoom_epoch, // Z2：发送时打戳当前缩放世代
+            );
+            self.raster_reqs += 1;
+            self.prefetch_reqs += 1; // F4 观测计数（降级 preview 与走廊同计通道，预算语义一致）
+            self.pending_prefetch_cover.insert(page, (pscale, self.nav_gen, rx));
+        }
+        drops
+    }
+
+    /// 清退所有降级页（帧未触顶 / 无可见页时调）：把 `self.degraded` 逐页复原
+    /// （瓦片由常态调度重新派发、封面可重派 → 恢复 1:1）。只遍历小的降级集，O(降级数)；
+    /// 降级页的瓦片/封面已在 activate 时清空，此处仅复位状态标记让调度恢复供给，
+    /// 残留的 0.5 preview 底图由既有走廊预算/封面到位逻辑自然下线。
+    fn recover_degraded(&mut self) {
+        self.degraded.clear();
     }
 
     /// 回收已完成的在途**封面**结果：worker 回传整页（屏幕密度）BGRA → 装入 `slot.cover`
@@ -1088,6 +1394,10 @@ impl PdfViewer {
                 continue;
             };
             if page >= self.dims.len() {
+                continue;
+            }
+            // R4：降级页不接受新封面（退休的 cap cover 不重填；其显示由 0.5 均匀底供给）。
+            if self.degraded.contains(&page) {
                 continue;
             }
             let cscale = cover_scale(self.dims[page], self.page_width(), scale_factor);
@@ -1865,16 +2175,9 @@ impl PdfViewer {
                     continue;
                 };
                 let s = &self.slots[page];
-                let mut covered = true;
-                'outer: for row in r0..=r1 {
-                    for col in c0..=c1 {
-                        if !s.tiles.contains_key(&(row, col)) {
-                            covered = false;
-                            break 'outer;
-                        }
-                    }
-                }
-                if !covered {
+                // 与 render 侧「原子换」判定共用同一几何（`tile_range_all_in_slot`）：
+                // 可见矩形 + margin 每格都在槽 → 瓦片已整组覆盖可见区，cover 可安全回收。
+                if !crate::pdf::layout::tile_range_all_in_slot(&s.tiles, r0, c0, r1, c1) {
                     continue;
                 }
                 // 阶段二（可回收才取 &mut）：离线 cover，置 cover_scale=0（render 侧判等失败、

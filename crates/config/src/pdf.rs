@@ -81,7 +81,19 @@ pub const TILE_INFLIGHT: usize = 6;
 /// 瓦片内存字节预算（512²×4≈1MB/片；32MB ≈ 32 片，覆盖整页封面未覆盖场景——高倍缩放
 /// 封面超预算走纯瓦片、或缩放出封面的瞬间。常态下有同密度封面驻留的页不再双份持有瓦片，
 /// 故预算可按需下调）。超预算按「离视口中心最远」LRU 淘汰并显式 `drop_image`。
+/// **本值是动态预算的下限**（R3）：高倍钉住收敛下，可见格数 × 单格字节 ×
+/// [`TILE_BUDGET_KEEP_FACTOR`] 可能超过本值（sf2 zoom4 宽窗 ≈30–98 片 ≈30–98MB）——
+/// 见 [`TILE_CACHE_BYTES_MAX`]，动态预算在 `[本值, 上限]` 内随可见集伸缩。
 pub const TILE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// 动态瓦片预算**硬顶**（字节，R3）：预算 = `max(TILE_CACHE_BYTES, 可见格数 × 单格字节 ×
+/// 1.25)`，夹在本值与无上限之间。取 128MiB：覆盖最恶劣可见窗口（如 sf2.0 zoom4 宽窗
+/// ~98 片 ×1.25 ≈122MiB），且钉住集 ≤ 预算**天然成立**——稳态仍绑定工作集、非满额。
+/// 再超本值（可见格 >~102）→ R4 均匀 0.5 降级兜底（宁均匀不格子、内存有界、无死锁）。
+pub const TILE_CACHE_BYTES_MAX: u64 = 128 * 1024 * 1024;
+/// 动态瓦片预算相对「可见钉住集」的**余量系数**（R3）：预算 = `max(固定, 可见格数 ×
+/// 单格字节 × 本值)`。1.25 覆盖「可见矩形 + TILE_MARGIN 边格 + 边缘残片 + 派发在途瞬时
+/// 叠加」的名义字节估算余量，令钉住集在有界内存内稳定收敛、不被逐出不震荡。
+pub const TILE_BUDGET_KEEP_FACTOR: f32 = 1.25;
 /// worker 侧「未着色原图」缓存总预算（CPU 字节，**CPU 重着色回退缓存**）：仅 CPU 重着色
 /// 路径（GPU 门控关闭 / `GPUI_PDF_GPU_RECOLOR=0`）填充并消费——GPU 门控默认路径 0 消费者、
 /// 不写缓存（见 `pdf::parser::finalize_render`）。切档（`SetRecolor`）不再清 view 缓存、重调
@@ -108,11 +120,11 @@ pub const COVER_SIZE_BUDGET: u64 = 32 * 1024 * 1024;
 pub const COVER_SCALE_CAP: f32 = 4.0;
 /// 高倍 cover 回收的最低「截断比」（S5）：仅当 `render_scale > cover_scale × 本值`（cap 截断
 /// 造成明显密度差、且该倍率下视口覆盖的瓦片量小、预算可承受）才回收 cap 截断的 cover 交给
-/// 1:1 瓦片接管。取 1.5：中等密度高 DPI（render_scale 仅略超 cap，如 sf=2、zoom 1.25 →
-/// ~4.9 vs 4.0）时可见瓦片集贴近 32MB 预算，若也回收 cover 会落入「全量瓦片 → 逐出 → 重派」
-/// 预算环；真正高倍（zoom ≥ ~2.5 → render_scale ~2.4× cover_scale）视口只盖页的局部、瓦片
-/// 量小而稳定，才进入纯瓦片稳态。cap 不升（4.0 恰顶穿 A4 32MB 预算）。
-pub const COVER_RETIRE_MIN_RATIO: f32 = 1.5;
+/// 1:1 瓦片接管。**1.5 → 1.3（R5）**：动态预算（[`TILE_CACHE_BYTES_MAX`]）下高倍可见瓦片集
+/// 必被钉住收敛，cap cover 的截断密度差阈值收紧（1.3×）让其在收敛后**提前退席**、消掉
+/// 高倍整页 cover 的驻留峰值；仅「render_scale ≈1.3–1.5× cover_scale」的中档仍保 cover
+/// （避免 4.0 vs ~5.2-6.0 处的回收-重派环；≤1.3× 属同密度/刀刃区，本不回收）。cap 不升。
+pub const COVER_RETIRE_MIN_RATIO: f32 = 1.3;
 /// 同时在途的封面渲染上限：可见页封面 + 滚动方向邻居预取封面（空闲预热 1-2 页，
 /// 滚到即立即锐利，不必等整页瓦片逐片来）。
 pub const COVER_INFLIGHT: usize = 3;
@@ -143,6 +155,11 @@ pub const JUMP_PAGES_THRESHOLD: usize = 7;
 /// 前 1-2 帧惯性微移（1-2px）不误触；拖拽中手指微抖（单帧小位移）也不误触——需连续 3 帧
 /// 才判定停稳。
 pub const STOP_DETECT_FRAMES: u32 = 3;
+/// R4 均匀降级「静态帧」阈值：可见页「组不齐 + 预算触硬顶」需连续多少**静态帧**才降级到
+/// 均匀 0.5 底。取 3：与 [`STOP_DETECT_FRAMES`] 同量级——瓦片在途串行渲染的瞬时缺口、
+/// 滚动静置前的动量帧不误降级；连续 3 帧静态仍不齐 = 结构性超预算 → 切均匀底
+/// （宁均匀不格子、内存有界、无死锁）。
+pub const DEGRADE_STATIC_FRAMES: u32 = 3;
 /// 停稳快进检测位移阈值（px/帧，L1.3）：连续 [`STOP_DETECT_FRAMES`] 帧 |Δy| < 本值 → 判定停稳。
 /// 取 2px：小于单个滚轮 notch（~1 行）的典型位移即为「停」；大于 2px 的持续滚动不误触。
 pub const STOP_DETECT_PX: f32 = 2.0;

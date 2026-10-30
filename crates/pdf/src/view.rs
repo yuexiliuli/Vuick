@@ -236,6 +236,22 @@ mod tiles;
 mod search;
 mod render;
 
+/// R1-R3 动态瓦片预算与钉住集的**本帧快照**（由 `update_tile_budget_and_degrade` 计算、
+/// `evict_tiles` 消费——同一帧两处共用同一几何，杜绝「预算算一套、淘汰用另一套」漂移）：
+/// - `budget`：本帧有效预算 = `max(固定, 钉住需求×1.25)`、夹在 `TILE_CACHE_BYTES` 与
+///   `TILE_CACHE_BYTES_MAX` 之间；
+/// - `pinned`：**不可淘汰**的当前钉住格集 = 各可见页 `visible_tile_range(可见 bbox +
+///   TILE_MARGIN)` 覆盖的格子（R1 逐出跳过、R3 预算天然包住）；
+/// - `center`：可见中心页（淘汰排名 anchor，与调度派发优先级同源）；
+/// - `mid_rows`：各可见页可见行中心（R2 淘汰排名 = `|page−center|×1e6+|row−mid|`）。
+#[derive(Default)]
+pub(crate) struct TileBudgetState {
+    pub(crate) budget: u64,
+    pub(crate) center: usize,
+    pub(crate) pinned: std::collections::HashSet<(usize, u32, u32)>,
+    pub(crate) mid_rows: std::collections::HashMap<usize, u32>,
+}
+
 /// PDF 阅读器：自包含的瓦片级虚拟化视图。
 pub struct PdfViewer {
     /// 文件路径（含文件名，标题用）。
@@ -287,6 +303,11 @@ pub struct PdfViewer {
     /// 全空时才自增；`release` 时归零）。回归断言「常态主路径不再让可见页落加载态」用。
     /// `Cell<u64>`：渲染路径只持 `&Self`（`build_visible_page_cards`），内部可变性计数。
     pub(crate) loading_placeholder_hits: std::cell::Cell<u64>,
+    /// S 系列「原子换」观测探针：**最近一帧**实际挂入页卡 DOM 的瓦片 img 元素总数
+    /// （`render::PdfViewer::build_visible_page_cards` 每帧覆写：门控通过 = 本帧瓦片数、
+    /// 未通过/无瓦片 = 0）。供回归断言「旧密度底图 + 部分新密度瓦片」同帧不混叠——
+    /// 部分瓦片在场时本值必须为 0（整组一次换），补齐整组后本值 == 可见组大小。
+    pub(crate) last_frame_tiles_drawn: std::cell::Cell<usize>,
     /// 在途**重着色刷新**结果接收通道（`set_recolor` 时向 worker 请求）：worker 把已缓存
     /// 原图现算新着色副本逐条回传，本通道 drain 完（断开）即清。驱动一次「切档不重栅」
     /// 的显示刷新；非 None 期间自刷新泵持续出帧直到收完（防晚到结果无帧可收集）。
@@ -307,6 +328,20 @@ pub struct PdfViewer {
     pub(crate) cover_reqs: u64,
     /// 当前已驻留瓦片的估算字节（近似 RGBA 内存；淘汰时重算自愈漂移）。
     pub(crate) tile_bytes: u64,
+    /// R1-R3 **动态瓦片预算/钉住集状态**（本帧有效值，由 `open::ensure_window` 每帧经
+    /// [`crate::pdf::view::tiles::PdfViewer::update_tile_budget_and_degrade`] 计算、`evict_tiles`
+    /// 消费）：`None` 仅在未走 `ensure_window` 的直接调用路径（如单测）出现 → 回退固定
+    /// 32MiB 预算 + 无钉住 + 绝对行号排名（旧语义），保证既有测试语义不变。
+    pub(crate) tile_budget_state: Option<TileBudgetState>,
+    /// R4 均匀降级**候选页计数器**（页 → 连续「静态 + 可见组不齐 + 预算触硬顶」帧数；
+    /// 达 [`config::pdf::DEGRADE_STATIC_FRAMES`] 即 degrade 激活并移入 [`Self::degraded`]）。
+    pub(crate) degrade_frames: HashMap<usize, u32>,
+    /// R4 当前处于**均匀 0.5 降级**的页集合（`Slot.tiles` 已清、不再派瓦片/封面、底图由
+    /// 0.5 密度 preview 提供 = 「宁均匀不格子」）。帧不再触顶/滑出可见窗即清除并自愈。
+    pub(crate) degraded: HashSet<usize>,
+    /// R4 动态预算**硬顶覆写**（仅测试钩子，`None` = 用 [`config::pdf::TILE_CACHE_BYTES_MAX`]）：
+    /// 供 headless 回归构造「预算触顶 + 组不齐」场景（A3），无需真实超大视口/病理性大页。
+    pub(crate) tile_budget_cap_override: Option<u64>,
     /// 瓦片自刷新泵是否在途：派发瓦片后若无用户输入就不会再有重绘，而瓦片结果要等
     /// 下一次 `ensure_window` 才收集拼图——此泵每 ~16ms 触发一次重绘直到在途瓦片清空。
     pub(crate) tile_pump_running: bool,
@@ -490,6 +525,43 @@ pub struct PdfViewer {
     pub(crate) pan_offset0: gpui::Point<Pixels>,
 }
 
+impl PdfViewer {
+    /// A1 收敛十字门辅助（仅测试）：逐可见页返回 `(page, missing, total)`……
+    #[cfg(test)]
+    pub(crate) fn visible_tile_presence(
+        &self,
+        scale_factor: f32,
+        viewport_h: f32,
+        window: &gpui::Window,
+    ) -> Vec<(usize, u32, u32)> {
+        use crate::pdf::layout as L;
+        let pw = self.page_width();
+        let sy = f32::from(-self.scroll.offset().y);
+        let wrap_w = self.wrap_width(window, pw);
+        let mut out = Vec::new();
+        for (page, dim) in self.dims.iter().enumerate() {
+            let scale = L::render_scale(pw, scale_factor, dim.0);
+            let bmp = L::page_bitmap_size(*dim, scale);
+            let disp_h = L::display_height(*dim, pw);
+            let Some(rect) = self.page_visible_rect(page, sy, viewport_h, pw, wrap_w) else {
+                continue;
+            };
+            let Some((r0, c0, r1, c1)) =
+                L::visible_tile_range(bmp, pw, disp_h, rect, TILE_SIZE, TILE_MARGIN)
+            else {
+                continue;
+            };
+            let total = (r1 - r0 + 1) * (c1 - c0 + 1);
+            let have = (r0..=r1)
+                .flat_map(|row| (c0..=c1).map(move |col| (row, col)))
+                .filter(|&(row, col)| self.slots[page].tiles.contains_key(&(row, col)))
+                .count();
+            out.push((page, total - have as u32, total));
+        }
+        out
+    }
+}
+
 // 实现（impl）按职责拆分至 `view/<sub>.rs` 子模块：
 // - `view/open.rs`：new / start_load / 状态访问器 / release / ensure_window
 // - `view/input.rs`：滚轮缩放 / hit_test / 鼠标键盘 / 选区复制
@@ -529,6 +601,7 @@ mod tests {
                     pending_prefetch_cover: HashMap::new(),
                     prefetch_reqs: 0,
                     loading_placeholder_hits: std::cell::Cell::new(0),
+                    last_frame_tiles_drawn: std::cell::Cell::new(0),
                     pending_recolor: None,
                     raster_reqs: 0,
                     recolor_scope: Vec::new(),
@@ -536,6 +609,10 @@ mod tests {
                     tile_reqs: 0,
                     cover_reqs: 0,
                     tile_bytes: 0,
+                    tile_budget_state: None,
+                    degrade_frames: HashMap::new(),
+                    degraded: HashSet::new(),
+                    tile_budget_cap_override: None,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
                     scroll_dir: 0,
@@ -762,6 +839,7 @@ mod tests {
                     pending_prefetch_cover: HashMap::new(),
                     prefetch_reqs: 0,
                     loading_placeholder_hits: std::cell::Cell::new(0),
+                    last_frame_tiles_drawn: std::cell::Cell::new(0),
                     pending_recolor: None,
                     raster_reqs: 0,
                     recolor_scope: Vec::new(),
@@ -769,6 +847,10 @@ mod tests {
                     tile_reqs: 0,
                     cover_reqs: 0,
                     tile_bytes: 0,
+                    tile_budget_state: None,
+                    degrade_frames: HashMap::new(),
+                    degraded: HashSet::new(),
+                    tile_budget_cap_override: None,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
                     scroll_dir: 0,
@@ -898,6 +980,7 @@ mod tests {
                     pending_prefetch_cover: HashMap::new(),
                     prefetch_reqs: 0,
                     loading_placeholder_hits: std::cell::Cell::new(0),
+                    last_frame_tiles_drawn: std::cell::Cell::new(0),
                     pending_recolor: None,
                     raster_reqs: 0,
                     recolor_scope: Vec::new(),
@@ -905,6 +988,10 @@ mod tests {
                     tile_reqs: 0,
                     cover_reqs: 0,
                     tile_bytes: 0,
+                    tile_budget_state: None,
+                    degrade_frames: HashMap::new(),
+                    degraded: HashSet::new(),
+                    tile_budget_cap_override: None,
                     tile_pump_running: false,
                     last_scroll_y: 0.0,
                     scroll_dir: 0,
@@ -1020,6 +1107,7 @@ mod tests {
             pending_prefetch_cover: HashMap::new(),
             prefetch_reqs: 0,
             loading_placeholder_hits: std::cell::Cell::new(0),
+            last_frame_tiles_drawn: std::cell::Cell::new(0),
             pending_recolor: None,
             raster_reqs: 0,
             recolor_scope: Vec::new(),
@@ -1027,6 +1115,10 @@ mod tests {
             tile_reqs: 0,
             cover_reqs: 0,
             tile_bytes: 0,
+            tile_budget_state: None,
+            degrade_frames: HashMap::new(),
+            degraded: HashSet::new(),
+            tile_budget_cap_override: None,
             tile_pump_running: false,
             last_scroll_y: 0.0,
             scroll_dir: 0,
@@ -1474,6 +1566,174 @@ mod tests {
                 "封面缺失（stale 标记）应回退瓦片（不冻结）"
             );
         });
+    }
+
+    /// A1（**S 系列双密度混叠根治，真实渲染路径**）：settle 收口期一页绝不呈现
+    /// 「旧密度底图 + 新密度瓦片」同帧混叠——新密度内容对「已有旧底」的页**整页一次换**，
+    /// 逐块渐进只保留给「从未显示过」的新页。
+    ///
+    /// 复现（先红后绿）：`multi_page_viewer`（无 worker → 调度早退，状态确定性）在真实
+    /// 窗口渲染框架下，直接制造真实缩放收口产物的**病理三元态**——高倍页封面不可负担 →
+    /// `cover` 恒 `None`、旧档封面迁入 `prev_cover`（旧密度底）、瓦片按当前 `render_scale`
+    /// 只**部分**到达（可见组缺一格）：
+    /// 1) 渲染一帧 → 断言本帧**不含任何瓦片 img 元素**（`last_frame_tiles_drawn == 0`，
+    ///    虽有部分瓦片在槽）——旧实现把部分瓦片直接挂树（红）；门控后整页只显示旧底（绿）。
+    /// 2) 补齐可见组缺格 → 渲染一帧 → 断言本帧瓦片 img 数 == 可见组大小且一次全到位
+    ///    （原子换）。
+    /// 3) 全程 `loading_placeholder_hits` 零增长（底图链恒非空，R4）。
+    ///
+    /// 判定粒度 = 渲染路径每帧实际挂入卡片 DOM 的瓦片 img 元素计数探针
+    /// （`last_frame_tiles_drawn`；旧底图 img 恒在 `prev_cover` 分支，两者可区分）。
+    /// 「组」= 可见矩形 + [`TILE_MARGIN`] 的格集（与调度 `page_visible_rect` 同源；高倍/
+    /// 大页整页 `rows×cols` 永不 到齐，不能作原子换门槛）。
+    #[gpui::test]
+    async fn settle_prevents_mixed_density_tiles_on_stale_cover(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        struct RootProbe {
+            pdf: gpui::Entity<PdfViewer>,
+        }
+        impl gpui::Render for RootProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<PdfViewer>>>> =
+            std::rc::Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| multi_page_viewer(cx, 1));
+            *holder.borrow_mut() = Some(pdf.clone());
+            RootProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // 读取渲染态几何（与 `build_visible_page_cards` / `schedule_tiles` 同一套数学）：
+        // 当前页 + 当前 render_scale + 可见矩形（含 margin）的瓦片格集。
+        let (page, group_cells, scale, total) = cx.update(|window, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let page = 0;
+            let dim = v.dims[page];
+            let pw = v.page_width();
+            let sf = window.scale_factor();
+            let scale = render_scale(pw, sf, dim.0);
+            let bmp = page_bitmap_size(dim, scale);
+            let disp_h = display_height(dim, pw);
+            let viewport_h = f32::from(v.scroll.bounds().size.height);
+            assert!(viewport_h > 0.0, "滚动容器应在渲染后布局完成：viewport_h={viewport_h}");
+            let scroll_y = f32::from(-v.scroll.offset().y);
+            let wrap_w = v.wrap_width(window, pw);
+            let rect = v
+                .page_visible_rect(page, scroll_y, viewport_h, pw, wrap_w)
+                .expect("第 0 页应可见");
+            let (r0, c0, r1, c1) =
+                visible_tile_range(bmp, pw, disp_h, rect, TILE_SIZE, TILE_MARGIN)
+                    .expect("可见区应圈中瓦片格");
+            let mut cells: Vec<(u32, u32)> = Vec::new();
+            for row in r0..=r1 {
+                for col in c0..=c1 {
+                    cells.push((row, col));
+                }
+            }
+            let total = (r1 - r0 + 1) * (c1 - c0 + 1);
+            (page, cells, scale, total)
+        });
+        assert!(total > 1, "测试页可见瓦片组应 >1 格：total={total}");
+        let make_img = || render_image_from_bgra(vec![0u8; 4 * 4 * 4], 4, 4).expect("测试位图");
+
+        // 阶段 1：制造「封面不可负担」病理三元态——旧密度底（prev_cover）+ 部分新密度瓦片。
+        let hits0 = cx.update(|_w, cx| {
+            let ent = holder.borrow().as_ref().unwrap().clone();
+            ent.update(cx, |v, _| {
+                let slot = &mut v.slots[page];
+                slot.cover = None;
+                slot.cover_scale = 0.0;
+                slot.prev_cover = Some(make_img());
+                slot.tile_scale = scale;
+                slot.tiles.clear();
+                for &(row, col) in group_cells.iter().take(total as usize - 1) {
+                    slot.tiles.insert(
+                        (row, col),
+                        TileSlot {
+                            image: make_img(),
+                            x0: 0,
+                            y0: 0,
+                            w: 4,
+                            h: 4,
+                        },
+                    );
+                }
+            });
+            ent.read(cx).loading_placeholder_hits.get()
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |_v, cx| cx.notify());
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (drawn1, partial, hits1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.last_frame_tiles_drawn.get(),
+                v.slots[page].tiles.len(),
+                v.loading_placeholder_hits.get(),
+            )
+        });
+        assert!(
+            partial > 0 && (partial as usize) < total as usize,
+            "应存在部分瓦片（缺一格）：partial={partial} total={total}"
+        );
+        assert_eq!(
+            drawn1,
+            0,
+            "部分新密度瓦片在场时本帧不得绘制任何瓦片元素（同帧不混叠，宁糊不混）：partial={partial}"
+        );
+        assert_eq!(hits1, hits0, "底图链恒非空，过渡期不得落「加载中」（R4）");
+
+        // 阶段 2：补齐整组瓦片 → 下帧一次全到位呈现（原子换）。
+        cx.update(|_w, cx| {
+            let ent = holder.borrow().as_ref().unwrap().clone();
+            ent.update(cx, |v, cx| {
+                let slot = &mut v.slots[page];
+                for &(row, col) in &group_cells {
+                    slot.tiles.entry((row, col)).or_insert(TileSlot {
+                        image: make_img(),
+                        x0: 0,
+                        y0: 0,
+                        w: 4,
+                        h: 4,
+                    });
+                }
+                cx.notify();
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (drawn2, full, hits2) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.last_frame_tiles_drawn.get(),
+                v.slots[page].tiles.len(),
+                v.loading_placeholder_hits.get(),
+            )
+        });
+        assert_eq!(
+            full as usize, total as usize,
+            "整组瓦片应全部在槽：full={full} total={total}"
+        );
+        assert_eq!(
+            drawn2, total as usize,
+            "整组就位后本帧应一次全量呈现全部瓦片（原子换）：drawn={drawn2} total={total}"
+        );
+        assert_eq!(hits2, hits0, "补齐过渡同样不得落「加载中」（R4）");
     }
 
     /// 构造 N 页的最小 viewer（复用 `minimal_viewer` 后替换布局/槽位）：纯逻辑
