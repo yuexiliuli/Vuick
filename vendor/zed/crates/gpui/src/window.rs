@@ -5090,6 +5090,7 @@ impl Window {
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
+            luma: data.is_luma(frame_index),
         };
 
         let tile = self
@@ -5199,6 +5200,7 @@ impl Window {
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
+            luma: data.is_luma(frame_index),
         };
 
         let tile = self
@@ -5269,12 +5271,13 @@ impl Window {
             None => [0.0; 4],
         };
         // switches.x = ink 是否启用；switches.y = 曲线策略（1=FullBand 全带单调、0=ContentProtect
-        // 双带）——由片元着色器 `recolor_sprite_fragment` 读取分支（与 CPU `apply_recolor_with_curve`
-        // 同策）。z/w 保留。
+        // 双带）；switches.z = 数据源是否为 R8 单通道 luma（1=单通道，片元读 `sample.rrr`）——
+        // 由片元着色器 `recolor_sprite_fragment` 读取分支（与 CPU `apply_recolor_with_curve`
+        // 同策）。w 保留。
         let switches = [
             if recolor.ink.is_some() { 1.0 } else { 0.0 },
             if recolor.curve == 1 { 1.0 } else { 0.0 },
-            0.0,
+            if data.is_luma(frame_index) { 1.0 } else { 0.0 },
             0.0,
         ];
 
@@ -5355,6 +5358,8 @@ impl Window {
             let params = RenderImageParams {
                 image_id: data.id,
                 frame_index,
+                // 与 paint 路径同键（含 luma 标志）——否则 R8 图片的 atlas 条目删不掉（K14 同款）。
+                luma: data.is_luma(frame_index),
             };
 
             self.sprite_atlas.remove(&params.clone().into());
@@ -5372,6 +5377,7 @@ impl Window {
                     &RenderImageParams {
                         image_id: data.id,
                         frame_index,
+                        luma: data.is_luma(frame_index),
                     }
                     .into(),
                 )

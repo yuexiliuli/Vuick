@@ -1716,7 +1716,15 @@ impl AtlasKey {
                 }
             }
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
-            AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
+            AtlasKey::Image(params) => {
+                if params.luma {
+                    // R8 单通道 luma 图片（PDF 瓦片/封面 R8 通道）→ 单通道 atlas（1BPP，
+                    // `DXGI_FORMAT_R8_UNORM`，glyph 同款）。上传按 1BPP 算行距，无需新增格式。
+                    AtlasTextureKind::Monochrome
+                } else {
+                    AtlasTextureKind::Polychrome
+                }
+            }
         }
     }
 }
@@ -3528,6 +3536,16 @@ mod atlas_tests {
         AtlasKey::Image(RenderImageParams {
             image_id: crate::ImageId(image_id),
             frame_index: 0,
+            luma: false,
+        })
+    }
+
+    /// luma 图片 key：`luma: true` 应路由到 Monochrome atlas（1BPP）。
+    fn luma_image_key(image_id: usize) -> AtlasKey {
+        AtlasKey::Image(RenderImageParams {
+            image_id: crate::ImageId(image_id),
+            frame_index: 0,
+            luma: true,
         })
     }
 
@@ -3595,6 +3613,25 @@ mod atlas_tests {
         assert_eq!(reset_calls, 1);
         assert!(!state.contains(&other_key));
         assert_eq!(state.backend.removed_tiles, vec![tile]);
+        Ok(())
+    }
+
+    /// luma 图片 key 路由（R8 通道机制）：`luma: true` 的图片 key 应走 Monochrome atlas
+    /// （1BPP / `DXGI_FORMAT_R8_UNORM`），普通图片仍 Polychrome——上传侧据此选行距。
+    #[test]
+    fn luma_image_key_routes_to_monochrome() -> Result<()> {
+        let mut state = AtlasState::new(RecordingAtlasBackend::default());
+        let key = luma_image_key(1);
+        let tile = state
+            .get_or_insert_with(key.clone(), &mut build_tile)?
+            .context("builder should produce a tile")?;
+        assert_eq!(
+            tile.texture_id.kind,
+            AtlasTextureKind::Monochrome,
+            "luma 图片应走 Monochrome atlas（R8 1BPP）"
+        );
+        assert_eq!(tile.texture_id.kind, key.texture_kind());
+        assert_eq!(image_key(2).texture_kind(), AtlasTextureKind::Polychrome, "普通图片仍 Polychrome");
         Ok(())
     }
 }

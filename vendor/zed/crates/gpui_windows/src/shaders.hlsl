@@ -1291,7 +1291,8 @@ struct RecolorSprite {
     // 纸/墨重着色参数（与 CPU apply_recolor_with_curve 同策；阈值为编译期常量，见片元）。
     float4 bg;        // RGB = 纸色（0..1）；第 4 分量保留。
     float4 ink;       // RGB = 墨色（0..1）；第 4 分量保留。
-    float4 switches;  // x = ink 是否启用（1.0/0.0）；y = 曲线策略（1=FullBand、0=ContentProtect）。
+    float4 switches;  // x = ink 是否启用（1.0/0.0）；y = 曲线策略（1=FullBand、0=ContentProtect）；
+                      // z = 数据源是否 R8 单通道 luma（1.0 = 单通道，片元读 sample.rrr）。
 };
 
 struct RecolorSpriteVertexOutput {
@@ -1330,6 +1331,13 @@ float4 recolor_sprite_fragment(RecolorSpriteFragmentInput input): SV_Target {
     RecolorSprite sprite = recolor_sprites[input.sprite_id];
     float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    if (sprite.switches.z != 0.0f) {
+        // R8 单通道 luma 源（PDF 瓦片/封面 R8 通道）：单通道纹理 G/B 恒 0、A 恒 1，展开成
+        // 三通道同值亮度 `(L,L,L)`——`luma = dot((L,L,L), 0.299,0.587,0.114) = L`，与 BGRA
+        // 源比只引入每 texel ≤1/255 量化差（编码端 CPU 侧 round 同一 BT.601 亮度），
+        // FullBand 分支输出差 ≤1 LSB。必须先展开（rgrb 展开在色前、grayscale 也能吃到）。
+        sample = float4(sample.rrr, 1.0f);
+    }
 
     float4 color = sample;
     if (sprite.grayscale != 0u) {

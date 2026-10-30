@@ -376,6 +376,7 @@ mod tests {
         AtlasKey::Image(RenderImageParams {
             image_id: ImageId(image_id),
             frame_index: 0,
+            luma: false,
         })
     }
 
