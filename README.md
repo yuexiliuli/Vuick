@@ -57,7 +57,7 @@ GPUI 应用内**全部 UI 组件均为自研**，替代已移除的 `gpui-compon
 | 编码 | `encoding_rs`（GBK/GB18030/UTF-16 等非 UTF-8 解码；保存按各选项卡源编码回写） |
 | PDF | `pdfium-render` |
 | EPUB / 压缩 | `roxmltree` · `zip` |
-| 图像 | `image`（+ webp） |
+| 图像 | 自研 `kimg`（纯 Rust：PNG/JPEG/WebP/GIF/BMP/ICO/PNM/TIFF 解码，PNG/GIF 编码）|
 | 视频 | `ffmpeg-next`（FFmpeg 9.0 解码 / 重采样）· `cpal`（音频输出） |
 | 序列化 | `serde` · `serde_json` |
 | 测试 | GPUI `test-support`（`cargo test`；shell 全量 ~80s、271 passed，测试默认隔离落 `%TEMP%`） |

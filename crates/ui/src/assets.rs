@@ -13,7 +13,7 @@
 use std::sync::{Arc, OnceLock};
 
 use gpui::{ImageSource, InteractiveElement, IntoElement, ParentElement, RenderImage, Styled};
-use kimg::{Frame, GenericImageView, ImageReader};
+use kimg::{Frame, ImageReader};
 
 /// 应用图标 PNG 字节。
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app-icon-228x228.png");
