@@ -2177,6 +2177,7 @@ dependencies = [
  "flate2",
  "image-webp",
  "kimg",
+ "libjpeg-turbo-rs",
  "libpng-vendored-sys",
  "libwebp-sys",
  "png",
