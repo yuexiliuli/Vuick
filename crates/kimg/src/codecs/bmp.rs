@@ -36,6 +36,22 @@ const MAX_WIDTH_HEIGHT: i32 = 0xFFFF;
 
 const RLE_ESCAPE: u8 = 0;
 
+/// `KIMG_BMP_NO_SIMD=1` 强制 BMP 行内核走标量（量化 SIMD 收益；与 pngsimd/webp 同款姿势）。
+/// 首次访问缓存环境变量，之后仅一次 Relaxed 原子读——正常热循环开销可忽略。
+fn bmp_no_simd() -> bool {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static OFF: AtomicBool = AtomicBool::new(false);
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let off = std::env::var("KIMG_BMP_NO_SIMD")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        OFF.store(off, Relaxed);
+    });
+    OFF.load(Relaxed)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ImageType {
     Palette,
@@ -610,16 +626,31 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
             None => self.bitfields.as_ref().unwrap(),
         };
         let channels = self.num_channels();
-        let padding_len = self.width as usize % 2 * 2;
+        let width = self.width as usize;
+        let padding_len = width % 2 * 2;
 
+        // 每通道预计算 LUT（覆盖该掩码全部取指），语义与 Bitfield::read 逐项一致（含
+        // LOOKUP_3/4/5/6BIT 查表——与算术位重复展宽不同，必须保查表才能字节一致）。
+        let rl = bitfield_lut(&bf.r);
+        let gl = bitfield_lut(&bf.g);
+        let bl = bitfield_lut(&bf.b);
+        let al = bitfield_lut(&bf.a);
+
+        // 整行读取再批量展开（消除逐像素 read_u16_le 调用）。
+        let mut raw = vec![0u8; width * 2];
         for row in self.rows_mut(buf) {
-            for pixel in row.chunks_mut(channels) {
-                let data = u32::from(read_u16_le(&mut self.reader)?);
-                pixel[0] = bf.r.read(data);
-                pixel[1] = bf.g.read(data);
-                pixel[2] = bf.b.read(data);
+            self.reader.read_exact(&mut raw)?;
+            for (i, pixel) in row.chunks_mut(channels).enumerate() {
+                let data = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+                pixel[0] = rl[((data >> bf.r.shift) & ((1 << bf.r.len) - 1)) as usize];
+                pixel[1] = gl[((data >> bf.g.shift) & ((1 << bf.g.len) - 1)) as usize];
+                pixel[2] = bl[((data >> bf.b.shift) & ((1 << bf.b.len) - 1)) as usize];
                 if channels == 4 {
-                    pixel[3] = if bf.a.len != 0 { bf.a.read(data) } else { 0xFF };
+                    pixel[3] = if bf.a.len != 0 {
+                        al[((data >> bf.a.shift) & ((1 << bf.a.len) - 1)) as usize]
+                    } else {
+                        0xFF
+                    };
                 }
             }
             let mut pad = [0u8; 2];
@@ -630,14 +661,33 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
 
     fn read_32bit_bitfields(&mut self, buf: &mut [u8], bf: &Bitfields) -> ImageResult<()> {
         let channels = self.num_channels();
+        let width = self.width as usize;
+
+        let rl = bitfield_lut(&bf.r);
+        let gl = bitfield_lut(&bf.g);
+        let bl = bitfield_lut(&bf.b);
+        let al = bitfield_lut(&bf.a);
+
+        // 32bit 行无填充（行宽必为 4 倍数），整行读取批量展开。
+        let mut raw = vec![0u8; width * 4];
         for row in self.rows_mut(buf) {
-            for pixel in row.chunks_mut(channels) {
-                let data = read_u32_le(&mut self.reader)?;
-                pixel[0] = bf.r.read(data);
-                pixel[1] = bf.g.read(data);
-                pixel[2] = bf.b.read(data);
+            self.reader.read_exact(&mut raw)?;
+            for (i, pixel) in row.chunks_mut(channels).enumerate() {
+                let data = u32::from_le_bytes([
+                    raw[4 * i],
+                    raw[4 * i + 1],
+                    raw[4 * i + 2],
+                    raw[4 * i + 3],
+                ]);
+                pixel[0] = rl[((data >> bf.r.shift) & ((1 << bf.r.len) - 1)) as usize];
+                pixel[1] = gl[((data >> bf.g.shift) & ((1 << bf.g.len) - 1)) as usize];
+                pixel[2] = bl[((data >> bf.b.shift) & ((1 << bf.b.len) - 1)) as usize];
                 if channels == 4 {
-                    pixel[3] = if bf.a.len != 0 { bf.a.read(data) } else { 0xFF };
+                    pixel[3] = if bf.a.len != 0 {
+                        al[((data >> bf.a.shift) & ((1 << bf.a.len) - 1)) as usize]
+                    } else {
+                        0xFF
+                    };
                 }
             }
         }
@@ -646,26 +696,109 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
 
     fn read_full_bytes(&mut self, buf: &mut [u8], bpp: usize, skip_bpp4: bool) -> ImageResult<()> {
         let channels = self.num_channels();
+        let width = self.width as usize;
         let row_padding = match bpp {
-            3 => (4 - (self.width as usize * 3) % 4) % 4,
+            3 => (4 - (width * 3) % 4) % 4,
             _ => 0,
         };
+        // SIMD 行内批处理：整行一次性读入（消除逐像素 read_exact 调用），
+        // SSSE3/AVX2 shuffle 重排通道，标量尾收齐 SIMD 未覆盖的像素。
+        let simd = cfg!(target_arch = "x86_64")
+            && !bmp_no_simd()
+            && std::arch::is_x86_feature_detected!("ssse3");
+        let raw_len = width * bpp;
+        let mut raw = vec![0u8; raw_len];
+        let mut pad = [0u8; 4];
 
         for row in self.rows_mut(buf) {
-            for pixel in row.chunks_mut(channels) {
-                if skip_bpp4 {
-                    read_u8_val(&mut self.reader)?;
+            if !simd {
+                // 原始逐像素路径（标量回退，语义与改动前逐字节一致）。
+                for pixel in row.chunks_mut(channels) {
+                    if skip_bpp4 {
+                        read_u8_val(&mut self.reader)?;
+                    }
+                    self.reader.read_exact(&mut pixel[..3])?;
+                    pixel[..3].reverse();
+                    if bpp == 4 && !skip_bpp4 {
+                        self.reader.read_exact(&mut pixel[3..4])?;
+                    } else if channels == 4 {
+                        pixel[3] = 0xFF;
+                    }
                 }
-                self.reader.read_exact(&mut pixel[..3])?;
-                pixel[..3].reverse();
-                if bpp == 4 && !skip_bpp4 {
-                    self.reader.read_exact(&mut pixel[3..4])?;
-                } else if channels == 4 {
-                    pixel[3] = 0xFF;
-                }
+                let mut pad = [0u8; 4];
+                self.reader.read_exact(&mut pad[..row_padding])?;
+                continue;
             }
-            let mut pad = [0u8; 4];
-            self.reader.read_exact(&mut pad[..row_padding])?;
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                match (bpp, channels) {
+                    (3, 3) => {
+                        // BGR→RGB 3→3（源为独立 raw 缓冲，无回写冲突）。
+                        self.reader.read_exact(&mut raw)?;
+                        let n = unsafe { bgr_ops::bgr24_to_rgb(&raw, row, width) };
+                        for i in n..width {
+                            row[3 * i] = raw[3 * i + 2];
+                            row[3 * i + 1] = raw[3 * i + 1];
+                            row[3 * i + 2] = raw[3 * i];
+                        }
+                    }
+                    (3, 4) => {
+                        // BGR→RGBA（alpha=255），供 ICO/强制 alpha 的 24bit 输出。
+                        self.reader.read_exact(&mut raw)?;
+                        let mut x = 0;
+                        if std::arch::is_x86_feature_detected!("avx2") {
+                            x += unsafe { bgr_ops::bgr24_to_rgba_avx2(&raw, row, width) };
+                        }
+                        if x < width {
+                            x += unsafe {
+                                bgr_ops::bgr24_to_rgba_ssse3(
+                                    &raw[3 * x..],
+                                    &mut row[4 * x..],
+                                    width - x,
+                                )
+                            };
+                        }
+                        for i in x..width {
+                            row[4 * i] = raw[3 * i + 2];
+                            row[4 * i + 1] = raw[3 * i + 1];
+                            row[4 * i + 2] = raw[3 * i];
+                            row[4 * i + 3] = 0xFF;
+                        }
+                    }
+                    (4, 3) => {
+                        // RGB32（BI_RGB 32bit）：源每像素 [X,B,G,R] → 输出 [R,G,B]，丢弃 X。
+                        self.reader.read_exact(&mut raw)?;
+                        let n = unsafe { bgr_ops::xbgr_to_rgb(&raw, row, width) };
+                        for i in n..width {
+                            row[3 * i] = raw[4 * i + 3];
+                            row[3 * i + 1] = raw[4 * i + 2];
+                            row[3 * i + 2] = raw[4 * i + 1];
+                        }
+                    }
+                    (4, 4) => {
+                        // RGBA32：源每像素 [B,G,R,A] → [R,G,B,A]，整行读入 row 后原位 4→4 重排。
+                        self.reader.read_exact(row)?;
+                        let mut x = 0;
+                        if std::arch::is_x86_feature_detected!("avx2") {
+                            x += unsafe { bgr_ops::bgra_to_rgba_avx2(row, width) };
+                        }
+                        if x < width {
+                            x += unsafe { bgr_ops::bgra_to_rgba_ssse3(&mut row[4 * x..], width - x) };
+                        }
+                        for i in x..width {
+                            row.swap(4 * i, 4 * i + 2);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                self.reader.read_exact(&mut pad[..row_padding])?;
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (bpp, channels, row_padding);
+                unreachable!("非 x86_64 上 simd 恒 false，不应进入本分支");
+            }
         }
         Ok(())
     }
@@ -803,16 +936,155 @@ fn read_u8_val(reader: &mut impl Read) -> ImageResult<u8> {
     Ok(b[0])
 }
 
-fn read_u16_le(reader: &mut impl Read) -> ImageResult<u16> {
-    let mut b = [0u8; 2];
-    reader.read_exact(&mut b)?;
-    Ok(u16::from_le_bytes(b))
+/// 把 `Bitfield` 的抽位+展宽语义预计算为 256 项 LUT：`lut[(data>>shift) & (2^len-1)]`
+/// == `bf.read(data)`，其中取指掩码内对齐到通道长度（与 `read` 内部一致）。len==0 通道
+/// 不含在查表范围（调用处按旧语义写 0xFF），此处按 `read(0)` 兜底不 panic。
+fn bitfield_lut(bf: &Bitfield) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    if bf.len == 0 {
+        lut.fill(0xFF);
+        return lut;
+    }
+    for i in 0..256usize {
+        let idx = i & ((1 << bf.len) - 1);
+        lut[i] = bf.read((idx as u32) << bf.shift);
+    }
+    lut
 }
 
-fn read_u32_le(reader: &mut impl Read) -> ImageResult<u32> {
-    let mut b = [0u8; 4];
-    reader.read_exact(&mut b)?;
-    Ok(u32::from_le_bytes(b))
+/// SIMD 行内核（x86_64；非 x86_64 一律走标量回退）。每核返回「已处理的像素数」，
+/// 调用方用标量尾（= 旧语义逐像素姿势）补齐向量主径未覆盖的像素，保证字节级一致。
+#[cfg(target_arch = "x86_64")]
+mod bgr_ops {
+    use std::arch::x86_64::*;
+
+    /// BGR→RGB（3 字节/像素，3→3）：源每像素 [B,G,R] → 输出 [R,G,B]。SSSE3 每批 4 像素
+    /// （16 字节载/存；输出字节 12..15 为 spill，由后批/标量尾重写，源为独立 raw 缓冲无冲突）。
+    #[target_feature(enable = "ssse3")]
+    pub(crate) unsafe fn bgr24_to_rgb(src: &[u8], dst: &mut [u8], width: usize) -> usize {
+        unsafe {
+            let m = _mm_setr_epi8(
+                2, 1, 0, 5, 4, 3, 8, 7, 6, 11, 10, 9, -128, -128, -128, -128,
+            );
+            let s = src.as_ptr();
+            let d = dst.as_mut_ptr();
+            let mut x = 0usize;
+            while 3 * x + 16 <= 3 * width {
+                let v = _mm_loadu_si128(s.add(3 * x) as *const __m128i);
+                _mm_storeu_si128(d.add(3 * x) as *mut __m128i, _mm_shuffle_epi8(v, m));
+                x += 4;
+            }
+            x
+        }
+    }
+
+    /// BGR→RGBA（alpha=255）：SSSE3 每批 4 像素。掩码 {2,1,0,-128} ×4 + OR 0xFF000000。
+    #[target_feature(enable = "ssse3")]
+    pub(crate) unsafe fn bgr24_to_rgba_ssse3(src: &[u8], dst: &mut [u8], width: usize) -> usize {
+        unsafe {
+            let m = _mm_setr_epi8(
+                2, 1, 0, -128, 5, 4, 3, -128, 8, 7, 6, -128, 11, 10, 9, -128,
+            );
+            let a = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
+            let s = src.as_ptr();
+            let d = dst.as_mut_ptr();
+            let mut x = 0usize;
+            while 3 * x + 16 <= 3 * width {
+                let v = _mm_loadu_si128(s.add(3 * x) as *const __m128i);
+                let out = _mm_or_si128(_mm_shuffle_epi8(v, m), a);
+                _mm_storeu_si128(d.add(4 * x) as *mut __m128i, out);
+                x += 4;
+            }
+            x
+        }
+    }
+
+    /// BGR→RGBA（alpha=255）AVX2：每批 8 像素（两次 16 字节载入各出 4 RGBA，拼 256 位一次写）。
+    /// 移位边条件与 pngsimd `rgb8_to_rgba_avx2` 同款：`3x+28 <= 3w` 保证两次载入整段在行内。
+    #[target_feature(enable = "avx2", enable = "ssse3")]
+    pub(crate) unsafe fn bgr24_to_rgba_avx2(src: &[u8], dst: &mut [u8], width: usize) -> usize {
+        unsafe {
+            let m = _mm_setr_epi8(
+                2, 1, 0, -128, 5, 4, 3, -128, 8, 7, 6, -128, 11, 10, 9, -128,
+            );
+            let a = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
+            let s = src.as_ptr();
+            let d = dst.as_mut_ptr();
+            let mut x = 0usize;
+            while 3 * x + 28 <= 3 * width {
+                let v0 = _mm_loadu_si128(s.add(3 * x) as *const __m128i);
+                let v1 = _mm_loadu_si128(s.add(3 * x + 12) as *const __m128i);
+                let o0 = _mm_or_si128(_mm_shuffle_epi8(v0, m), a);
+                let o1 = _mm_or_si128(_mm_shuffle_epi8(v1, m), a);
+                _mm256_storeu_si256(d.add(4 * x) as *mut __m256i, _mm256_set_m128i(o1, o0));
+                x += 8;
+            }
+            x
+        }
+    }
+
+    /// RGB32（BI_RGB 32bit）4→3 打包：源每像素 [X,B,G,R] → 输出 [R,G,B]（丢弃 X）。
+    /// SSSE3 每批 4 像素：16 字节载入 → 低 12 字节 {3,2,1}/{7,6,5}/{11,10,9}/{15,14,13}，
+    /// 字节 12..15 清 0（spill，由后批/标量尾重写）。
+    #[target_feature(enable = "ssse3")]
+    pub(crate) unsafe fn xbgr_to_rgb(src: &[u8], dst: &mut [u8], width: usize) -> usize {
+        unsafe {
+            let m = _mm_setr_epi8(
+                3, 2, 1, 7, 6, 5, 11, 10, 9, 15, 14, 13, -128, -128, -128, -128,
+            );
+            let s = src.as_ptr();
+            let d = dst.as_mut_ptr();
+            let mut x = 0usize;
+            while x + 4 <= width && 3 * x + 16 <= 3 * width {
+                let v = _mm_loadu_si128(s.add(4 * x) as *const __m128i);
+                _mm_storeu_si128(d.add(3 * x) as *mut __m128i, _mm_shuffle_epi8(v, m));
+                x += 4;
+            }
+            x
+        }
+    }
+
+    /// RGBA32 原位 4→4 重排 [B,G,R,A]→[R,G,B,A]：SSSE3 每批 4 像素（载/写同一 16 字节组，
+    /// 组间无重叠，原位安全）。
+    #[target_feature(enable = "ssse3")]
+    pub(crate) unsafe fn bgra_to_rgba_ssse3(buf: &mut [u8], width: usize) -> usize {
+        unsafe {
+            let m = _mm_setr_epi8(
+                2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
+            );
+            let d = buf.as_mut_ptr();
+            let mut x = 0usize;
+            while x + 4 <= width {
+                let v = _mm_loadu_si128(d.add(4 * x) as *const __m128i);
+                _mm_storeu_si128(d.add(4 * x) as *mut __m128i, _mm_shuffle_epi8(v, m));
+                x += 4;
+            }
+            x
+        }
+    }
+
+    /// RGBA32 原位 4→4 重排 AVX2：每批 8 像素。注意 `_mm256_shuffle_epi8` 按 128 位 lane
+    /// 独立取指，故 256 掩码须为同一 16 字节模式复制两份（lane 内相对下标）。
+    #[target_feature(enable = "avx2", enable = "ssse3")]
+    pub(crate) unsafe fn bgra_to_rgba_avx2(buf: &mut [u8], width: usize) -> usize {
+        unsafe {
+            let m = _mm256_setr_epi8(
+                2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15, //
+                2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
+            );
+            let d = buf.as_mut_ptr();
+            let mut x = 0usize;
+            while x + 8 <= width {
+                let v = _mm256_loadu_si256(d.add(4 * x) as *const __m256i);
+                _mm256_storeu_si256(
+                    d.add(4 * x) as *mut __m256i,
+                    _mm256_shuffle_epi8(v, m),
+                );
+                x += 8;
+            }
+            x
+        }
+    }
 }
 
 impl<R: BufRead + Seek> ImageDecoder for BmpDecoder<R> {
