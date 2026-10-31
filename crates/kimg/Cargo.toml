@@ -16,6 +16,15 @@ image-webp = "0.2.4"
 tiff = "0.11.3"
 zune-jpeg = "0.5.15"
 zune-core = "0.5.3"
+# 自研 PNG 解码热路径（移植 SimdCodecs）：IDAT zlib 解压用 fdeflate（lock 0.3.7，纯 Rust，
+# 也是 png crate 0.17 自身的解码后端——与其逐字节同算法的同时避免 miniz_oxide 的 ~3× 解压慢）。
+# 块 CRC 校验用 crc32fast（lock 1.5.0）。两者 workspace 已锁定，不引入新版本。
+fdeflate = "0.3"
+crc32fast = "1.4"
+
+[dev-dependencies]
+# 仅测试用：生成 fixture 时仍走 png crate 编码；手写 filter 行的 PNG 构造器需要 zlib 压缩。
+flate2 = "1.1"
 
 [package.metadata.docs.rs]
 all-features = true

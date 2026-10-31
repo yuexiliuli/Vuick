@@ -5,6 +5,7 @@ pub mod gif;
 pub(crate) mod ico;
 pub(crate) mod jpeg;
 pub mod png;
+pub(crate) mod pngsimd;
 pub(crate) mod pnm;
 pub(crate) mod tiff;
 pub mod webp;

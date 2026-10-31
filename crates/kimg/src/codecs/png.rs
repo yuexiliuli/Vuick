@@ -1,12 +1,17 @@
-//! PNG 解码器与编码器（`png` crate 0.17 封装；行为与 image 0.25.10 一致）。
+//! PNG 解码器与编码器。
+//!
+//! 解码热路径 = 自研引擎 `pngsimd`（SimdCodecs 移植：SIMD 反滤波 + EXPAND 展开，字节级对齐 png crate
+//! `Transformations::EXPAND`）；`png` crate 仅保留给编码（`PngEncoder`）与测试对照，不再进解码热路径。
+//! 对外 API / 语义与现有一致：`PngDecoder` 的 new/set_limits/dimensions/color_type/total_bytes/
+//! read_image/read_image_with_progress/orientation 签名不变。
 
 use std::io::{BufRead, Seek, Write};
 
+use crate::codecs::pngsimd::PngEngine;
 use crate::color::{ColorType, ExtendedColorType};
 use crate::dynamic_image::DynamicImage;
 use crate::error::{
-    DecodingError, ImageError, ImageResult, LimitError, LimitErrorKind, ParameterError,
-    ParameterErrorKind, UnsupportedError, UnsupportedErrorKind,
+    ImageError, ImageResult, UnsupportedError, UnsupportedErrorKind,
 };
 use crate::format::ImageFormat;
 use crate::limits::{LimitSupport, Limits};
@@ -16,8 +21,9 @@ use crate::ImageDecoder;
 /// PNG 解码器：构造即读取头信息，输出颜色类型与 image 0.25 一致（EXPAND 变换、16bit 保留）。
 pub struct PngDecoder<R: BufRead + Seek> {
     color_type: ColorType,
-    reader: png::Reader<R>,
+    engine: PngEngine,
     limits: Limits,
+    reader: std::marker::PhantomData<R>,
 }
 
 impl<R: BufRead + Seek> PngDecoder<R> {
@@ -26,50 +32,24 @@ impl<R: BufRead + Seek> PngDecoder<R> {
         Self::with_limits(r, Limits::no_limits())
     }
 
-    /// 带限制构造（限制在 `read_info` 前校验尺寸并传给 png crate 字节预算）。
-    pub fn with_limits(r: R, limits: Limits) -> ImageResult<PngDecoder<R>> {
+    /// 带限制构造（限制在 `read_image` 前校验尺寸；自研引擎在解析阶段已做防炸弹拦截）。
+    pub fn with_limits(mut r: R, limits: Limits) -> ImageResult<PngDecoder<R>> {
         limits.check_support(&LimitSupport::default())?;
-
-        let max_bytes = usize::try_from(limits.max_alloc.unwrap_or(u64::MAX)).unwrap_or(usize::MAX);
-        let mut decoder = png::Decoder::new_with_limits(r, png::Limits { bytes: max_bytes });
-        decoder.set_ignore_text_chunk(false);
-
-        let info = decoder.read_header_info().map_err(ImageError::from_kimg_png)?;
-        limits.check_dimensions(info.width, info.height)?;
-
-        decoder.set_transformations(png::Transformations::EXPAND);
-        let reader = decoder.read_info().map_err(ImageError::from_kimg_png)?;
-        let (color_type, bits) = reader.output_color_type();
-        let color_type = match (color_type, bits) {
-            (png::ColorType::Grayscale, png::BitDepth::Eight) => ColorType::L8,
-            (png::ColorType::Grayscale, png::BitDepth::Sixteen) => ColorType::L16,
-            (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => ColorType::La8,
-            (png::ColorType::GrayscaleAlpha, png::BitDepth::Sixteen) => ColorType::La16,
-            (png::ColorType::Rgb, png::BitDepth::Eight) => ColorType::Rgb8,
-            (png::ColorType::Rgb, png::BitDepth::Sixteen) => ColorType::Rgb16,
-            (png::ColorType::Rgba, png::BitDepth::Eight) => ColorType::Rgba8,
-            (png::ColorType::Rgba, png::BitDepth::Sixteen) => ColorType::Rgba16,
-            _ => {
-                return Err(ImageError::Unsupported(
-                    UnsupportedError::from_format_and_kind(
-                        ImageFormat::Png.into(),
-                        UnsupportedErrorKind::Color(ExtendedColorType::Unknown(bits as u8)),
-                    ),
-                ))
-            }
-        };
-
+        let engine = PngEngine::parse(&mut r)?;
+        limits.check_dimensions(engine.width(), engine.height())?;
+        let color_type = engine.color_type();
         Ok(PngDecoder {
             color_type,
-            reader,
+            engine,
             limits,
+            reader: std::marker::PhantomData,
         })
     }
 }
 
 impl<R: BufRead + Seek> ImageDecoder for PngDecoder<R> {
     fn dimensions(&self) -> (u32, u32) {
-        self.reader.info().size()
+        (self.engine.width(), self.engine.height())
     }
 
     fn color_type(&self) -> ColorType {
@@ -77,12 +57,7 @@ impl<R: BufRead + Seek> ImageDecoder for PngDecoder<R> {
     }
 
     fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self
-            .reader
-            .info()
-            .exif_metadata
-            .as_ref()
-            .map(|x| x.to_vec()))
+        Ok(self.engine.exif())
     }
 
     fn orientation(&mut self) -> ImageResult<Orientation> {
@@ -92,11 +67,11 @@ impl<R: BufRead + Seek> ImageDecoder for PngDecoder<R> {
             .unwrap_or(Orientation::NoTransforms))
     }
 
-    fn read_image(mut self, buf: &mut [u8]) -> ImageResult<()> {
+    fn read_image(self, buf: &mut [u8]) -> ImageResult<()> {
         assert_eq!(u64::try_from(buf.len()), Ok(self.total_bytes()));
-        self.reader.next_frame(buf).map_err(ImageError::from_kimg_png)?;
+        self.engine.decode(buf, self.limits.max_alloc)?;
         // PNG 为大道在前；16bit 及以上需重排成本机字节序。
-        let bpc = self.color_type().bytes_per_pixel() / self.color_type().channel_count();
+        let bpc = self.color_type.bytes_per_pixel() / self.color_type.channel_count();
         match bpc {
             1 => (),
             2 => buf.as_chunks_mut::<2>().0.iter_mut().for_each(|c| {
@@ -109,8 +84,7 @@ impl<R: BufRead + Seek> ImageDecoder for PngDecoder<R> {
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
         limits.check_support(&LimitSupport::default())?;
-        let info = self.reader.info();
-        limits.check_dimensions(info.width, info.height)?;
+        limits.check_dimensions(self.engine.width(), self.engine.height())?;
         self.limits = limits;
         Ok(())
     }
@@ -120,24 +94,7 @@ impl<R: BufRead + Seek> ImageDecoder for PngDecoder<R> {
     }
 }
 
-impl ImageError {
-    /// png crate 错误 → kimg `ImageError`（与 image 0.25 分类一致）。
-    pub(crate) fn from_kimg_png(err: png::DecodingError) -> ImageError {
-        use png::DecodingError::*;
-        match err {
-            IoError(err) => ImageError::IoError(err),
-            err @ Format(_) => ImageError::Decoding(DecodingError::new(ImageFormat::Png.into(), err)),
-            err @ Parameter(_) => ImageError::Parameter(ParameterError::from_kind(
-                ParameterErrorKind::Generic(err.to_string()),
-            )),
-            LimitsExceeded => {
-                ImageError::Limits(LimitError::from_kind(LimitErrorKind::InsufficientMemory))
-            }
-        }
-    }
-}
-
-/// PNG 编码器（供 `write_to(Png)` / `save_buffer_with_format(Png)` 使用）。
+/// PNG 编码器（供 `write_to(Png)` / `save_buffer_with_format(Png)` 使用；沿用 png crate）。
 pub struct PngEncoder<W: Write> {
     w: W,
 }
