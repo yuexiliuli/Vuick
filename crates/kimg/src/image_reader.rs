@@ -4,14 +4,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::Path;
 
+use crate::ImageDecoder;
 use crate::codecs::GenericDecoder;
 use crate::dynamic_image::DynamicImage;
 use crate::error::{
-    ImageError, ImageResult, UnsupportedError, UnsupportedErrorKind, ImageFormatHint,
+    ImageError, ImageFormatHint, ImageResult, UnsupportedError, UnsupportedErrorKind,
 };
 use crate::format::{self, ImageFormat};
 use crate::limits::Limits;
-use crate::{ImageDecoder};
 
 /// 多格式图像读取器。包装一个输入流，自动识别格式并分发解码器。
 pub struct ImageReader<R: Read + Seek> {
@@ -74,7 +74,7 @@ impl<'a, R: 'a + BufRead + Seek> ImageReader<R> {
     }
 
     /// 转换成解码器。
-    pub fn into_decoder(mut self) -> ImageResult<GenericDecoder<R>> {
+    pub fn into_decoder(mut self) -> ImageResult<GenericDecoder<'a, R>> {
         let format = self.require_format()?;
         let mut decoder = make_decoder(format, self.inner)?;
         decoder.set_limits(self.limits)?;
@@ -132,17 +132,25 @@ impl ImageReader<BufReader<File>> {
     }
 }
 
-/// 按格式构造解码器。
-fn make_decoder<R: BufRead + Seek>(format: ImageFormat, reader: R) -> ImageResult<GenericDecoder<R>> {
+/// 按格式构造解码器（通用读取器路径：自有输入，无借用 → 'static）。
+fn make_decoder<R: BufRead + Seek>(
+    format: ImageFormat,
+    reader: R,
+) -> ImageResult<GenericDecoder<'static, R>> {
     GenericDecoder::new(format, reader)
 }
 
 /// 从读取器读出前 16 字节做魔数猜测（会恢复游标）。
-fn guess_format_from_reader<R: BufRead + Seek>(reader: &mut R) -> std::io::Result<Option<ImageFormat>> {
+fn guess_format_from_reader<R: BufRead + Seek>(
+    reader: &mut R,
+) -> std::io::Result<Option<ImageFormat>> {
     use std::io::{Cursor, SeekFrom};
     let mut start = [0u8; 16];
     let cur = reader.stream_position()?;
-    let len = std::io::copy(&mut reader.by_ref().take(16), &mut Cursor::new(&mut start[..]))?;
+    let len = std::io::copy(
+        &mut reader.by_ref().take(16),
+        &mut Cursor::new(&mut start[..]),
+    )?;
     reader.seek(SeekFrom::Start(cur))?;
     Ok(format::guess_format_impl(&start[..len as usize]))
 }

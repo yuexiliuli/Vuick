@@ -133,7 +133,9 @@ fn packed_rows(width: usize, height: usize, ct: u8, depth: u8, seed: u64) -> Vec
         let mut row = vec![0u8; row_len];
         for x in 0..width {
             for s in 0..samples {
-                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let v = ((lcg >> 40) as u16) & max;
                 write_sample(&mut row, x, s, samples, depth, v);
             }
@@ -212,11 +214,27 @@ fn build_stream(
         }
     } else {
         // Adam7：pass 行顺序入流。
-        let passes = [(0usize, 0usize, 8usize, 8usize), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
+        let passes = [
+            (0usize, 0usize, 8usize, 8usize),
+            (4, 0, 8, 8),
+            (0, 4, 4, 8),
+            (2, 0, 4, 4),
+            (0, 2, 2, 4),
+            (1, 0, 2, 2),
+            (0, 1, 1, 2),
+        ];
         let mut idx = 0usize;
         for (x0, y0, dx, dy) in passes {
-            let pw = if width > x0 { (width - x0 + dx - 1) / dx } else { 0 };
-            let ph = if height > y0 { (height - y0 + dy - 1) / dy } else { 0 };
+            let pw = if width > x0 {
+                (width - x0 + dx - 1) / dx
+            } else {
+                0
+            };
+            let ph = if height > y0 {
+                (height - y0 + dy - 1) / dy
+            } else {
+                0
+            };
             if pw == 0 || ph == 0 {
                 continue;
             }
@@ -295,7 +313,9 @@ fn compare(label: &str, png_bytes: &[u8]) -> (usize, usize, Option<String>) {
         return (
             0,
             1,
-            Some(format!("{label}: 色彩类型不符 new={new_ct:?} ref={ref_ct:?}")),
+            Some(format!(
+                "{label}: 色彩类型不符 new={new_ct:?} ref={ref_ct:?}"
+            )),
         );
     }
     if new_out != ref_out {
@@ -354,6 +374,8 @@ fn parity_full_matrix_vs_png_crate() {
         (2, 16, true),
         (3, 4, true),
         (3, 8, true),
+        (3, 1, true),
+        (3, 2, true),
         (0, 1, true),
     ];
 
@@ -405,9 +427,20 @@ fn parity_full_matrix_vs_png_crate() {
                     _ => (None, None),
                 };
 
-                let (stream, _bpp) = build_stream(w as usize, h as usize, ct, depth, il, seed_for(ct, depth, w, h, trns_on));
+                let (stream, _bpp) = build_stream(
+                    w as usize,
+                    h as usize,
+                    ct,
+                    depth,
+                    il,
+                    seed_for(ct, depth, w, h, trns_on),
+                );
                 let png_bytes = assemble_png(
-                    w, h, ct, depth, il,
+                    w,
+                    h,
+                    ct,
+                    depth,
+                    il,
                     palette.as_deref(),
                     trns.as_deref(),
                     &stream,
@@ -433,7 +466,11 @@ fn parity_full_matrix_vs_png_crate() {
 }
 
 fn seed_for(ct: u8, depth: u8, w: u32, h: u32, trns: bool) -> u64 {
-    u64::from(ct) << 40 | u64::from(depth) << 32 | u64::from(w) << 16 | u64::from(h) | (trns as u64) << 8
+    u64::from(ct) << 40
+        | u64::from(depth) << 32
+        | u64::from(w) << 16
+        | u64::from(h)
+        | (trns as u64) << 8
 }
 
 // ---------------------------------------------------------------------------
@@ -444,11 +481,21 @@ fn seed_for(ct: u8, depth: u8, w: u32, h: u32, trns: bool) -> u64 {
 fn parity_forced_filters_every_row() {
     // 对每种 (ct, depth)：行 filter 循环打满 5 种，且每次解码与 gzip 无关地覆盖 Sub/Paeth 链。
     let combos: &[(u8, u8)] = &[
-        (0, 1), (0, 2), (0, 4), (0, 8), (0, 16),
-        (2, 8), (2, 16),
-        (4, 8), (4, 16),
-        (6, 8), (6, 16),
-        (3, 1), (3, 2), (3, 4), (3, 8),
+        (0, 1),
+        (0, 2),
+        (0, 4),
+        (0, 8),
+        (0, 16),
+        (2, 8),
+        (2, 16),
+        (4, 8),
+        (4, 16),
+        (6, 8),
+        (6, 16),
+        (3, 1),
+        (3, 2),
+        (3, 4),
+        (3, 8),
     ];
     // 行数 18（%5 覆盖 0..4 各≥3 行）
     let (w, h) = (129u32, 18u32);
@@ -456,8 +503,18 @@ fn parity_forced_filters_every_row() {
     let mut bad = 0;
     let mut first_bad = None;
     for &(ct, depth) in combos {
-        let (stream, bpp) = build_stream(w as usize, h as usize, ct, depth, 0, seed_for(ct, depth, w, h, false));
-        assert_eq!(stream.len(), (h as usize) * (1 + sample_row_bytes(w as usize, samples_per_pixel(ct), depth)));
+        let (stream, bpp) = build_stream(
+            w as usize,
+            h as usize,
+            ct,
+            depth,
+            0,
+            seed_for(ct, depth, w, h, false),
+        );
+        assert_eq!(
+            stream.len(),
+            (h as usize) * (1 + sample_row_bytes(w as usize, samples_per_pixel(ct), depth))
+        );
         let _ = bpp;
         // 索引色需要 PLTE。
         let palette = if ct == 3 {
@@ -482,7 +539,11 @@ fn parity_forced_filters_every_row() {
     // 显式断言 5 种 filter 全出现（逐行已循环覆盖）。
     let mut seen = [false; 5];
     let (stream, _) = build_stream(w as usize, h as usize, 6, 8, 0, 12345);
-    for (i, byte) in stream.iter().enumerate().step_by(1 + sample_row_bytes(w as usize, 4, 8)) {
+    for (i, byte) in stream
+        .iter()
+        .enumerate()
+        .step_by(1 + sample_row_bytes(w as usize, 4, 8))
+    {
         let f = *byte;
         if f <= 4 {
             seen[f as usize] = true;
@@ -497,8 +558,473 @@ fn parity_forced_filters_every_row() {
 }
 
 // ---------------------------------------------------------------------------
+// 测试：双核管道（B）与顺序单线程（A）逐字节一致
+// ---------------------------------------------------------------------------
+
+/// 以指定车道解码（env 控制；B 态强开管道）。返回输出字节（不重排，灰度/16bit 原样）。
+fn decode_with_level(png_bytes: &[u8], level: &str) -> Vec<u8> {
+    // 2024 edition：set_var 为 unsafe。
+    unsafe {
+        std::env::set_var("KIMG_PNG_LEVEL", level);
+        if level == "B" {
+            std::env::set_var("KIMG_PNG_PIPELINE", "1");
+        } else {
+            std::env::set_var("KIMG_PNG_PIPELINE", "0");
+        }
+    }
+    let dec = PngDecoder::new(Cursor::new(png_bytes)).unwrap();
+    let mut out = vec![0u8; dec.total_bytes() as usize];
+    dec.read_image(&mut out).unwrap();
+    out
+}
+
+/// KIMG_PNG_LEVEL=A（顺序）与 B（双核管道）输出必须逐字节一致，并与 png crate 参照一致。
+/// 覆盖：Copy 恒等路径（灰度/RGB/RGBA 8·16 位）、展开路径（调色板 + tRNS）、大图（触发
+/// 阈值/线程重叠）与隔行（管道对 Adam7 必须忽略，仍顺序解码）。
+#[test]
+fn pipeline_a_b_byte_identical() {
+    // 串行化 env 修改，避免与并发测试交错（管道输出本就与顺序逐字节一致，故即便并发
+    // 被连带切到 B 态也不影响各 parity 断言，这里再加锁双保险）。
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _g = ENV_LOCK.lock().unwrap();
+
+    let cases: Vec<(u8, u8, u32, u32, bool)> = vec![
+        (6, 8, 1024, 1024, false), // RGBA8 大图（Copy 路径 + 阈值开管道）
+        (2, 8, 1024, 1024, false), // RGB8
+        (0, 8, 1024, 1024, false), // Gray8（bpp=1 Sub 前缀和向量）
+        (6, 16, 640, 480, false),  // RGBA16（16bit 大端 u8 字节语义）
+        (2, 16, 640, 480, false),
+        (3, 8, 960, 540, false), // 调色板→Rgb8
+        (3, 8, 960, 540, true),  // 调色板 + tRNS → Rgba8（展开 2 槽）
+        (6, 8, 33, 5, false),    // 小图（不开线程，仍须一致）
+    ];
+    for (ct, depth, w, h, trns_on) in cases {
+        let (palette, trns): (Option<Vec<u8>>, Option<Vec<u8>>) = if ct == 3 {
+            let entries = 32usize;
+            let mut pal = Vec::with_capacity(entries * 3);
+            for i in 0..entries {
+                pal.extend_from_slice(&[(i * 7) as u8, (i * 13) as u8, (i * 29) as u8]);
+            }
+            let tr = if trns_on {
+                Some((0..entries).map(|i| (i * 11) as u8).collect::<Vec<u8>>())
+            } else {
+                None
+            };
+            (Some(pal), tr)
+        } else {
+            (None, None)
+        };
+        let (stream, _) = build_stream(
+            w as usize,
+            h as usize,
+            ct,
+            depth,
+            0,
+            seed_for(ct, depth, w, h, trns_on),
+        );
+        let bytes = assemble_png(
+            w,
+            h,
+            ct,
+            depth,
+            0,
+            palette.as_deref(),
+            trns.as_deref(),
+            &stream,
+        );
+
+        let a = decode_with_level(&bytes, "A");
+        let b = decode_with_level(&bytes, "B");
+        assert_eq!(
+            a, b,
+            "pipeline B≠A：ct={ct} depth={depth} trns={trns_on} {w}x{h}"
+        );
+        let (ref_ct, ref_out) = reference_expand(&bytes);
+        let _ = ref_ct;
+        assert_eq!(
+            a, ref_out,
+            "A 态与 png crate 参照不一致：ct={ct} depth={depth} trns={trns_on} {w}x{h}"
+        );
+    }
+
+    // 隔行：即便 B 态也必须忽略管道走顺序（管道仅非隔行），输出与 A 一致。
+    let (stream, _) = build_stream(257, 40, 6, 8, 1, 12345);
+    let bytes = assemble_png(257, 40, 6, 8, 1, None, None, &stream);
+    let a = decode_with_level(&bytes, "A");
+    let b = decode_with_level(&bytes, "B");
+    assert_eq!(b, a, "隔行 B≠A（管道必须被忽略）");
+}
+
+/// B 态在对同一文件交替解码时应稳定（多轮线程重叠无竞态）。
+#[test]
+fn pipeline_b_stable_multi_round() {
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _g = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("KIMG_PNG_LEVEL", "B");
+        std::env::set_var("KIMG_PNG_PIPELINE", "1");
+    }
+    let (w, h) = (1200u32, 900u32);
+    let (stream, _) = build_stream(w as usize, h as usize, 6, 8, 0, 99);
+    let bytes = assemble_png(w, h, 6, 8, 0, None, None, &stream);
+    let reference = decode_with_level(&bytes, "B");
+    for _ in 0..5 {
+        let again = decode_with_level(&bytes, "B");
+        assert_eq!(again, reference, "B 态多轮输出不一致（竞态）");
+    }
+}
+
+/// B 态错误传播：IDAT 损坏/截断不得 panic、不得挂死（消费者错误/生产者错误双端收敛）。
+#[test]
+fn pipeline_b_corrupt_input_errors_cleanly() {
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _g = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("KIMG_PNG_LEVEL", "B");
+        std::env::set_var("KIMG_PNG_PIPELINE", "1");
+    }
+    let (w, h) = (1024u32, 1024u32);
+    let (stream, _) = build_stream(w as usize, h as usize, 6, 8, 0, 123);
+    let good = assemble_png(w, h, 6, 8, 0, None, None, &stream);
+    // 参照：好文件 B 态可解。
+    decode_with_level(&good, "B");
+
+    for corruption in 0..6u8 {
+        let mut bytes = good.clone();
+        match corruption {
+            // 在 IDAT 载荷中段翻转若干字节（破坏 deflate 流/长度）。
+            0 => {
+                let mid = bytes.len() / 2;
+                for i in mid..(mid + 40).min(bytes.len()) {
+                    bytes[i] ^= 0xFF;
+                }
+            }
+            // 把 IDAT 载荷扫零。
+            1 => {
+                let mut pos = 8usize;
+                while pos + 8 <= bytes.len() {
+                    let len = u32::from_be_bytes([
+                        bytes[pos],
+                        bytes[pos + 1],
+                        bytes[pos + 2],
+                        bytes[pos + 3],
+                    ]) as usize;
+                    if &bytes[pos + 4..pos + 8] == b"IDAT" {
+                        bytes[pos + 8..pos + 8 + len].fill(0);
+                        break;
+                    }
+                    pos += 12 + len;
+                }
+            }
+            // 截断图像数据（声明 1024 行但只剩一半 → 解压长度不符）。
+            2 => {
+                let mut pos = 8usize;
+                let mut cut = bytes.len();
+                while pos + 8 <= bytes.len() {
+                    let len = u32::from_be_bytes([
+                        bytes[pos],
+                        bytes[pos + 1],
+                        bytes[pos + 2],
+                        bytes[pos + 3],
+                    ]) as usize;
+                    if &bytes[pos + 4..pos + 8] == b"IEND" {
+                        cut = pos;
+                        break;
+                    }
+                    pos += 12 + len;
+                }
+                bytes.truncate(cut);
+            }
+            // 抽出单条 IDAT 载荷削掉一半。
+            _ => {
+                let mut pos = 8usize;
+                while pos + 8 <= bytes.len() {
+                    let len = u32::from_be_bytes([
+                        bytes[pos],
+                        bytes[pos + 1],
+                        bytes[pos + 2],
+                        bytes[pos + 3],
+                    ]) as usize;
+                    if &bytes[pos + 4..pos + 8] == b"IDAT" {
+                        let new_len = len / 2;
+                        // 重写长度字段（载荷截半）。CRC 未校验（VERIFY_IDAT_CRC=false），
+                        // 但 deflate 流非法 → 解压报错。
+                        bytes[pos..pos + 4].copy_from_slice(&(new_len as u32).to_be_bytes());
+                        bytes.truncate(pos + 8 + new_len);
+                        break;
+                    }
+                    pos += 12 + len;
+                }
+            }
+        }
+        // 必须返回错误或至少不 panic/不挂死；个别破坏可能恰好仍可解（不可依赖具体值），
+        // 但「不 panic」是硬要求：调用必须正常返回。
+        let r = PngDecoder::new(Cursor::new(&bytes)).and_then(|mut d| {
+            let mut out = vec![0u8; d.total_bytes() as usize];
+            d.read_image(&mut out)
+        });
+        let _ = r;
+    }
+    // 明确会失败的一类：截断图像数据必须报错（生产者长度校验）。
+    {
+        let mut bytes = good.clone();
+        bytes.truncate(bytes.len() - 8);
+        let r = PngDecoder::new(Cursor::new(&bytes)).and_then(|mut d| {
+            let mut out = vec![0u8; d.total_bytes() as usize];
+            d.read_image(&mut out)
+        });
+        assert!(r.is_err(), "B 态截断输入必须报错（不得静默成功或挂死）");
+    }
+    // 明确的管道期错误：IDAT 载荷削半 → 解析通过但解压长度/流不符 → 必须 Err 且不挂死。
+    {
+        let mut bytes = good.clone();
+        let mut pos = 8usize;
+        while pos + 8 <= bytes.len() {
+            let len =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            if &bytes[pos + 4..pos + 8] == b"IDAT" {
+                let new_len = len / 2;
+                bytes[pos..pos + 4].copy_from_slice(&(new_len as u32).to_be_bytes());
+                bytes.truncate(pos + 8 + new_len);
+                break;
+            }
+            pos += 12 + len;
+        }
+        let r = PngDecoder::new(Cursor::new(&bytes)).and_then(|mut d| {
+            let mut out = vec![0u8; d.total_bytes() as usize];
+            d.read_image(&mut out)
+        });
+        assert!(r.is_err(), "B 态 IDAT 削半必须报错（管道错误收敛）");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 测试：corpus 抽样（target/imgbench-corpus；缺语料 SKIP）
 // ---------------------------------------------------------------------------
+
+/// 把单条 zlib 流拆成多条 IDAT 块（PNG 规范允许连续多个 IDAT，同一条 zlib 流）——
+/// 验证 A2 `IdatCursor` 跨块逐窗口喂 fdeflate（不再拼接连续缓冲）的解码正确性。
+fn assemble_png_split_idat(
+    width: u32,
+    height: u32,
+    ct: u8,
+    depth: u8,
+    interlace: u8,
+    palette: Option<&[u8]>,
+    trns: Option<&[u8]>,
+    stream: &[u8],
+    chunk_len: usize,
+) -> Vec<u8> {
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&be32(width));
+    ihdr.extend_from_slice(&be32(height));
+    ihdr.push(depth);
+    ihdr.push(ct);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(interlace);
+    out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    if let Some(palette) = palette {
+        out.extend_from_slice(&chunk(b"PLTE", palette));
+    }
+    if let Some(trns) = trns {
+        out.extend_from_slice(&chunk(b"tRNS", trns));
+    }
+    // 先压缩（同 `assemble_png`），再把 zlib 流切成多条 IDAT 块。
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(stream).unwrap();
+    let z = enc.finish().unwrap();
+    for part in z.chunks(chunk_len) {
+        out.extend_from_slice(&chunk(b"IDAT", part));
+    }
+    out.extend_from_slice(&chunk(b"IEND", &[]));
+    out
+}
+
+/// A2：多条 IDAT 块（跨块窗口喂入）与单块逐字节一致，且与 png crate 参考一致。
+#[test]
+fn parity_multi_idat_chunks() {
+    let combos: &[(u8, u8)] = &[
+        (0, 8),
+        (0, 16),
+        (2, 8),
+        (2, 16),
+        (4, 8),
+        (6, 8),
+        (6, 16),
+        (3, 4),
+        (3, 8),
+    ];
+    // 宽/高让压缩流足够长（>1 块），并覆盖字节流跨块边界。
+    let (w, h) = (129u32, 40u32);
+    for &(ct, depth) in combos {
+        let palette = if ct == 3 {
+            let entries = if depth < 8 { 1usize << depth } else { 32 };
+            let mut pal = Vec::with_capacity(entries * 3);
+            for i in 0..entries {
+                pal.extend_from_slice(&[(i * 7) as u8, (i * 13) as u8, (i * 29) as u8]);
+            }
+            Some(pal)
+        } else {
+            None
+        };
+        let (stream, _bpp) = build_stream(
+            w as usize,
+            h as usize,
+            ct,
+            depth,
+            0,
+            seed_for(ct, depth, w, h, false),
+        );
+        // 单块 + 两种切块。
+        let single = assemble_png(w, h, ct, depth, 0, palette.as_deref(), None, &stream);
+        let split_small =
+            assemble_png_split_idat(w, h, ct, depth, 0, palette.as_deref(), None, &stream, 7);
+        let split_32k = assemble_png_split_idat(
+            w,
+            h,
+            ct,
+            depth,
+            0,
+            palette.as_deref(),
+            None,
+            &stream,
+            32 * 1024,
+        );
+        let (ref_ct, ref_out) = reference_expand(&single);
+        for (label, bytes) in [
+            ("single", &single),
+            ("split-7B", &split_small),
+            ("split-32K", &split_32k),
+        ] {
+            let (new_ct, new_out) = new_decode(bytes)
+                .unwrap_or_else(|e| panic!("{label} ct={ct} d={depth} 解码失败 {e}"));
+            assert_eq!(new_ct, ref_ct, "{label} ct={ct} d={depth} 色彩类型不符");
+            assert_eq!(new_out, ref_out, "{label} ct={ct} d={depth} 字节不一致");
+        }
+    }
+    // 隔行也要在多块下正确（Adam7 不拼 IDAT 但喂入走同一 IdatCursor）。
+    let (stream, _) = build_stream(w as usize, h as usize, 6, 8, 1, 12345);
+    let single = assemble_png(w, h, 6, 8, 1, None, None, &stream);
+    let split = assemble_png_split_idat(w, h, 6, 8, 1, None, None, &stream, 11);
+    let (rc, ro) = reference_expand(&single);
+    let (nc, no) = new_decode(&split).unwrap();
+    assert_eq!(nc, rc);
+    assert_eq!(no, ro, "Adam7 多 IDAT 块不一致");
+}
+
+/// A1：零拷贝借用输入（`from_slice`）与读入自有（`new`/`from_vec`）在整帧输出上逐字节一致，
+/// 且与 png crate 参考一致。覆盖 8/16 位全色彩 + 强制 5 filter（走 src≠dst 反滤波的 Copy/展开双路径）。
+#[test]
+fn zero_copy_from_slice_matches_owned() {
+    let combos: &[(u8, u8)] = &[
+        (0, 1),
+        (0, 8),
+        (0, 16),
+        (2, 8),
+        (2, 16),
+        (4, 8),
+        (4, 16),
+        (6, 8),
+        (6, 16),
+        (3, 1),
+        (3, 4),
+        (3, 8),
+    ];
+    let (w, h) = (67u32, 23u32);
+    let mut ok = 0usize;
+    for &(ct, depth) in combos {
+        let palette = if ct == 3 {
+            let entries = if depth < 8 { 1usize << depth } else { 32 };
+            let mut pal = Vec::with_capacity(entries * 3);
+            for i in 0..entries {
+                pal.extend_from_slice(&[(i * 7) as u8, (i * 13) as u8, (i * 29) as u8]);
+            }
+            Some(pal)
+        } else {
+            None
+        };
+        // 有无 tRNS 双态，走 Copy 与展开。
+        for trns_on in [false, true] {
+            if (ct == 4 || ct == 6) && trns_on {
+                continue; // GrayAlpha/RGBA 不合法 tRNS
+            }
+            let trns = match ct {
+                3 => {
+                    if trns_on {
+                        let entries = if depth < 8 { 1usize << depth } else { 32 };
+                        Some((0..entries).map(|i| (i * 11) as u8).collect::<Vec<u8>>())
+                    } else {
+                        None
+                    }
+                }
+                0 | 2 => {
+                    if trns_on {
+                        let key: u16 = match depth {
+                            1 => 1,
+                            4 => 7,
+                            8 => 200,
+                            _ => 40000,
+                        };
+                        Some(vec![key.to_be_bytes(); if ct == 0 { 1 } else { 3 }].concat())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let (stream, _) = build_stream(
+                w as usize,
+                h as usize,
+                ct,
+                depth,
+                0,
+                seed_for(ct, depth, w, h, trns_on),
+            );
+            let bytes = assemble_png(
+                w,
+                h,
+                ct,
+                depth,
+                0,
+                palette.as_deref(),
+                trns.as_deref(),
+                &stream,
+            );
+            let (ref_ct, ref_out) = reference_expand(&bytes);
+
+            // from_slice（借用输入，零拷贝）
+            let sl = kimg::codecs::png::PngDecoder::from_slice(&bytes).unwrap();
+            let sl_ct = sl.color_type();
+            let mut sl_out = vec![0u8; sl.total_bytes() as usize];
+            sl.read_image(&mut sl_out).unwrap();
+            // from_vec（自有）
+            let fv = kimg::codecs::png::PngDecoder::from_vec(bytes.clone()).unwrap();
+            let fv_ct = fv.color_type();
+            let mut fv_out = vec![0u8; fv.total_bytes() as usize];
+            fv.read_image(&mut fv_out).unwrap();
+            // new（读取器读入自有）
+            let (ow_ct, ow_out) = new_decode(&bytes).unwrap();
+
+            assert_eq!(sl_ct, ref_ct, "ct={ct} d={depth} trns={trns_on}");
+            assert_eq!(
+                sl_out, ref_out,
+                "from_slice ct={ct} d={depth} trns={trns_on}"
+            );
+            assert_eq!(fv_ct, ref_ct, "from_vec ct={ct} d={depth} trns={trns_on}");
+            assert_eq!(fv_out, ref_out, "from_vec ct={ct} d={depth} trns={trns_on}");
+            assert_eq!(ow_ct, ref_ct, "new ct={ct} d={depth} trns={trns_on}");
+            assert_eq!(ow_out, ref_out, "new ct={ct} d={depth} trns={trns_on}");
+            ok += 1;
+        }
+    }
+    eprintln!("[zero-copy] combos={ok} 全一致");
+}
 
 #[test]
 fn corpus_against_png_crate() {
@@ -600,4 +1126,31 @@ fn corrupt_and_bomb_inputs_rejected() {
     dec.read_image(&mut buf).unwrap();
     let (_, ref_out) = reference_expand(&png_bytes);
     assert_eq!(buf, ref_out);
+
+    // CRC 合法、声明 max×max 的恶意 PNG：破坏性尺寸不得让「每行字节×行数」u64 溢出 panic，
+    // 且必须被防炸弹比例检查拒绝（饱和到 u64::MAX 后必然命中）。回归：chunk.rs inflated_size。
+    {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&u32::MAX.to_be_bytes());
+        ihdr.extend_from_slice(&u32::MAX.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        out.extend_from_slice(&chunk(
+            b"IDAT",
+            &[
+                0x78, 0x01, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01,
+            ],
+        ));
+        out.extend_from_slice(&chunk(b"IEND", &[]));
+        let r = PngDecoder::new(Cursor::new(&out));
+        let err = match r {
+            Ok(_) => panic!("max 尺寸恶意 PNG 应被拒绝而非解码成功"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ImageError::Decoding(_) | ImageError::Limits(_)),
+            "期望 Decoding/Limits 拒绝，实际 {err:?}"
+        );
+    }
 }

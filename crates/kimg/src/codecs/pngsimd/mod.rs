@@ -8,13 +8,16 @@
 
 pub(crate) mod chunk;
 pub(crate) mod expand;
+pub(crate) mod pipeline;
 pub(crate) mod predict;
 
-use std::io::Read;
+use std::io::BufRead;
 
-use crate::codecs::pngsimd::chunk::{pass_extent, FileHeader, ADAM7_PASSES};
-use crate::codecs::pngsimd::expand::{output_bpp, ExpandKind};
-use crate::codecs::pngsimd::predict::{packed_row_bytes, prediction_bpp, unfilter_row};
+use crate::codecs::pngsimd::chunk::{ADAM7_PASSES, FileHeader, pass_extent};
+use crate::codecs::pngsimd::expand::{ExpandKind, output_bpp};
+use crate::codecs::pngsimd::predict::{
+    packed_row_bytes, prediction_bpp, unfilter_row, unfilter_to,
+};
 use crate::color::ColorType;
 use crate::error::{
     DecodingError, ImageError, ImageFormatHint, ImageResult, LimitError, LimitErrorKind,
@@ -41,9 +44,114 @@ pub(crate) fn simd_ok(feature: &str) -> bool {
     }
 }
 
+/// 诊断用 SIMD 全局开关：`KIMG_PNG_NO_SIMD=1` 强制反滤波/展开走标量（量化 SIMD 收益）。
+/// 首次访问缓存环境变量，随后仅一次 Relaxed 原子读——正常路径对热循环开销可忽略。
+pub(crate) fn simd_forced_off() -> bool {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static OFF: AtomicBool = AtomicBool::new(false);
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let off = std::env::var("KIMG_PNG_NO_SIMD")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        OFF.store(off, Relaxed);
+    });
+    OFF.load(Relaxed)
+}
+
+/// 分阶段计时探针（`stage_profile` feature）：decode 按 inflate / unfilter / expand / copy 累计耗时。
+/// 正常构建（未开 feature）下结构体照常幸存但无计时指令，仅多一次 `&mut Stages` 透传——零开销。
+#[derive(Default, Clone, Copy)]
+#[cfg_attr(not(feature = "stage_profile"), allow(dead_code))]
+pub(crate) struct Stages {
+    /// decode 整体墙钟。
+    total_ns: u64,
+    /// IDAT → inflate 缓冲。
+    inflate_ns: u64,
+    /// 反滤波总耗时。
+    unfilter_ns: u64,
+    /// EXPAND 展开总耗时。
+    expand_ns: u64,
+    /// 逐行/逐像素拷贝（含 Adam7 scatter）。
+    copy_ns: u64,
+}
+
+/// 阶段计时工具（仅 `stage_profile` feature 编译）。
+#[cfg(feature = "stage_profile")]
+mod stage_probe {
+    use super::Stages;
+    use std::time::Instant;
+
+    #[inline]
+    pub(super) fn ns(t0: Instant, t1: Instant) -> u64 {
+        t1.duration_since(t0).as_nanos() as u64
+    }
+
+    /// 首次调用读取一次环境变量（进程级缓存）。
+    fn enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("KIMG_PNG_STAGE_PROFILE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+    }
+
+    /// 打印 `STAGE <label> pipeline=a|b inflate=..ms unfilter=..ms expand=..ms copy=..ms others=..ms wall=..ms inflated=..`
+    /// 行（仅 env 开启时）。`pipeline` = 是否双核管道（B）。
+    pub(super) fn report(st: &Stages, label: &str, inflated: usize, pipeline: bool) {
+        if !enabled() {
+            return;
+        }
+        let ms = |v: u64| v as f64 / 1e6;
+        let others = st
+            .total_ns
+            .saturating_sub(st.inflate_ns + st.unfilter_ns + st.expand_ns + st.copy_ns);
+        println!(
+            "STAGE {label} pipeline={} inflate={:.3}ms unfilter={:.3}ms expand={:.3}ms copy={:.3}ms others={:.3}ms wall={:.3}ms inflated={inflated}",
+            if pipeline { "b" } else { "a" },
+            ms(st.inflate_ns),
+            ms(st.unfilter_ns),
+            ms(st.expand_ns),
+            ms(st.copy_ns),
+            ms(others),
+            ms(st.total_ns),
+        );
+    }
+}
+
+/// PNG 引擎的输入载体（零拷贝 A1）：借用外部切片，或自有缓冲区。
+///
+/// `from_slice` 路径（`&[u8]` / `Cursor<&[u8]>` 的 `load_from_memory`）直接借用调用方输入，
+/// 省掉一次整帧 `extend_from_slice` 复制（大图 MB 级输入可到亚毫秒量级，峰值内存同步下降）；
+/// 读取器 / 文件路径仍走 `parse_with_capacity` 读入 `Owned`。两路在解析后字节语义完全一致。
+#[derive(Clone)]
+pub(crate) enum Input<'a> {
+    /// 借用调用方切片（零拷贝；生命周期 ≤ 输入存活期）。
+    Borrowed(&'a [u8]),
+    /// 自有缓冲区（读取器/字符串构造路径）。
+    Owned(Vec<u8>),
+}
+
+impl<'a> Input<'a> {
+    /// 只读视图。
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Input::Borrowed(b) => b,
+            Input::Owned(v) => v,
+        }
+    }
+}
+
 /// 解析好的 PNG 引擎：持有整份输入（供解码时按 IDAT 偏移流式喂给 inflate，避免重新拼接拷贝）与头信息。
-pub(crate) struct PngEngine {
-    data: Vec<u8>,
+///
+/// 输入可为 `Input::Borrowed`（零拷贝借用，`'a` = 输入切片存活期）或 `Input::Owned`（自有，无借用，
+/// 协变为任意 `'a`）。所有解码方法只读 `as_slice()`，与输入形态无关。
+pub(crate) struct PngEngine<'a> {
+    data: Input<'a>,
     header: FileHeader,
 }
 
@@ -58,13 +166,60 @@ fn err_limits() -> ImageError {
     ImageError::Limits(LimitError::from_kind(LimitErrorKind::InsufficientMemory))
 }
 
-impl PngEngine {
-    /// 从读取器读入全部字节并解析（kimg 的输入通常在内存中；读整份换取解析/装 IDAT 的简洁与零寻址）。
-    pub(crate) fn parse(r: &mut impl Read) -> ImageResult<PngEngine> {
+impl<'a> PngEngine<'a> {
+    /// 从读取器读入全部字节并解析（仅测试用；生产走 [`Self::parse_with_capacity`]）。
+    #[cfg(test)]
+    pub(crate) fn parse(r: &mut impl BufRead) -> ImageResult<PngEngine<'static>> {
+        Self::parse_with_capacity(r, 0)
+    }
+
+    /// 同 [`Self::parse`]，但可按读取器剩余长度预留容量。读入用 `BufRead::fill_buf` +
+    /// `consume` 循环：Cursor<&[u8]> / `&[u8]` 的 `fill_buf` **零拷贝返回整段剩余**，一次
+    /// `extend_from_slice` 完成（单次 memcpy）；`read_to_end` 会走几十次 4KB 小缓冲 `read`
+    /// 调用 + Vec 扩容拷贝（实测 8.3MB 输入 2-3ms → 单次 memcpy ~0.2-0.5ms）。`capacity_hint`
+    /// 仅是预留给（不进逻辑/不出错），0 表示未知走扩容路径。
+    /// 返回自有输入引擎（`'static`，可协变到任意 `'a`）。
+    pub(crate) fn parse_with_capacity(
+        r: &mut impl BufRead,
+        capacity_hint: usize,
+    ) -> ImageResult<PngEngine<'static>> {
         let mut data = Vec::new();
-        r.read_to_end(&mut data).map_err(ImageError::IoError)?;
+        if capacity_hint > 0 {
+            data.try_reserve_exact(capacity_hint)
+                .map_err(|_| err_limits())?;
+        }
+        loop {
+            let buf = r.fill_buf().map_err(ImageError::IoError)?;
+            if buf.is_empty() {
+                break;
+            }
+            let n = buf.len();
+            data.extend_from_slice(buf);
+            r.consume(n);
+        }
         let header = chunk::parse_png(&data)?;
-        Ok(PngEngine { data, header })
+        Ok(PngEngine {
+            data: Input::Owned(data),
+            header,
+        })
+    }
+
+    /// 零拷贝构造：直接借用调用方切片解析（不再复制整份输入）。
+    pub(crate) fn from_slice(bytes: &'a [u8]) -> ImageResult<PngEngine<'a>> {
+        let header = chunk::parse_png(bytes)?;
+        Ok(PngEngine {
+            data: Input::Borrowed(bytes),
+            header,
+        })
+    }
+
+    /// 自有缓冲构造（调用方已持有完整 PNG 字节）。
+    pub(crate) fn from_vec(data: Vec<u8>) -> ImageResult<PngEngine<'static>> {
+        let header = chunk::parse_png(&data)?;
+        Ok(PngEngine {
+            data: Input::Owned(data),
+            header,
+        })
     }
 
     pub(crate) fn width(&self) -> u32 {
@@ -96,25 +251,88 @@ impl PngEngine {
     pub(crate) fn decode(&self, buf: &mut [u8], max_alloc: Option<u64>) -> ImageResult<()> {
         debug_assert_eq!(buf.len() as u64, self.total_bytes());
         let h = &self.header;
-        let inflated = inflate_idat(h, &self.data, max_alloc)?;
-        if h.interlace == 1 {
-            decode_adam7(h, &inflated, buf)
+        let mut st = Stages::default();
+        #[cfg(feature = "stage_profile")]
+        let t0 = std::time::Instant::now();
+
+        let data = self.data.as_slice();
+        // 期望解压尺寸（防炸弹预检已保证不溢出到分配）。
+        let expected = usize::try_from(chunk::inflated_size(
+            h.width,
+            h.height,
+            h.bit_depth,
+            h.color_type,
+            h.interlace == 1,
+        ))
+        .unwrap_or(usize::MAX);
+        let compressed: usize = h.idat_chunks.iter().map(|&(_, l)| l).sum();
+        let pipelined = pipeline::pipeline_enabled(h, compressed, expected);
+
+        let rows = if pipelined {
+            // 双核管道（仅非隔行；内部自起生产者线程）。
+            pipeline::decode_scanlines_pipelined(h, data, buf, expected, max_alloc, &mut st)
         } else {
-            decode_scanlines(h, &inflated, buf)
+            #[cfg(feature = "stage_profile")]
+            let t1 = std::time::Instant::now();
+            let inflated = match inflate_idat(h, data, max_alloc) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+            #[cfg(feature = "stage_profile")]
+            let t2 = std::time::Instant::now();
+            let r = if h.interlace == 1 {
+                decode_adam7(h, &inflated, buf, &mut st)
+            } else {
+                decode_scanlines(h, &inflated, buf, &mut st)
+            };
+            #[cfg(feature = "stage_profile")]
+            {
+                st.inflate_ns = stage_probe::ns(t1, t2);
+            }
+            r
+        };
+        match rows {
+            Ok(()) => {
+                #[cfg(feature = "stage_profile")]
+                {
+                    st.total_ns = stage_probe::ns(t0, std::time::Instant::now());
+                    stage_probe::report(&st, &self.stage_label(), expected, pipelined);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
+    }
+
+    /// STAGE 行场景标签（`宽x高 色彩类型`）。
+    #[cfg(feature = "stage_profile")]
+    fn stage_label(&self) -> String {
+        let ct = match output_color_type(&self.header) {
+            ColorType::L8 => "L8",
+            ColorType::L16 => "L16",
+            ColorType::La8 => "La8",
+            ColorType::La16 => "La16",
+            ColorType::Rgb8 => "Rgb8",
+            ColorType::Rgb16 => "Rgb16",
+            ColorType::Rgba8 => "Rgba8",
+            ColorType::Rgba16 => "Rgba16",
+            _ => "?",
+        };
+        format!("{}x{} {}", self.header.width, self.header.height, ct)
     }
 
     /// 仅诊断：分阶段计时。
     #[cfg(test)]
     fn decode_timed(&self, buf: &mut [u8]) -> ImageResult<()> {
         let h = &self.header;
+        let mut st = Stages::default();
         let t0 = std::time::Instant::now();
-        let inflated = inflate_idat(h, &self.data, None)?;
+        let inflated = inflate_idat(h, self.data.as_slice(), None)?;
         let t1 = std::time::Instant::now();
         if h.interlace == 1 {
-            decode_adam7(h, &inflated, buf)?;
+            decode_adam7(h, &inflated, buf, &mut st)?;
         } else {
-            decode_scanlines(h, &inflated, buf)?;
+            decode_scanlines(h, &inflated, buf, &mut st)?;
         }
         let t2 = std::time::Instant::now();
         eprintln!(
@@ -128,69 +346,143 @@ impl PngEngine {
     }
 }
 
-/// 跨多个 IDAT 块按 32KB 递送压缩字节（`next` 填满 buf，返回实际字节数；块边界处续接，不拼接拷贝）。
-struct IdatReader<'a> {
-    data: &'a [u8],
-    chunks: &'a [(usize, usize)],
-    ci: usize,
-    co: usize,
+/// IDAT 载荷的跨块窗口读取器（A2）：多个 IDAT 块本就是一个连续 zlib 流，但散落在输入不同偏移。
+/// 以 ≤`CHUNK` 窗口顺序喂给 fdeflate，**避免多块拼接的一次整流 memcpy**——单块直接借用原始
+/// 输入切片（零拷贝），多块也逐窗口借用原始切片、仅在块尾 `<8` 字节残余处做 ≤7 字节拼贴。
+///
+/// 喂入约束（fdeflate 语义，见 `decompress.rs` 的 8 字节粒度位缓冲）：`read` 每次只整吞 8 的
+/// 倍数字节；不足 8 字节的窗口返回 (0,0) 无法推进。故本读取器保证**非流尾窗口一律为 8 的
+/// 倍数**（算法：窗口取 ≤max 且对齐 8；块尾残余 <8 字节缓存到 `scratch`，与下一块头拼贴），
+/// 只有全流最后一个窗口允许非对齐。
+enum Window<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
 }
 
-impl<'a> IdatReader<'a> {
+struct IdatCursor<'a> {
+    data: &'a [u8],
+    chunks: &'a [(usize, usize)],
+    /// 当前块下标。
+    ci: usize,
+    /// 当前块内已消费偏移。
+    cpos: usize,
+    /// 上一块的 <8 字节残余（跨块拼贴，最多 7 字节）。
+    scratch: Vec<u8>,
+}
+
+impl<'a> IdatCursor<'a> {
     fn new(data: &'a [u8], chunks: &'a [(usize, usize)]) -> Self {
-        IdatReader {
+        IdatCursor {
             data,
             chunks,
             ci: 0,
-            co: 0,
+            cpos: 0,
+            scratch: Vec::with_capacity(8),
         }
     }
 
-    /// 每个 IDAT 块内部为连续字节；把下一段 ≤`fill.len()` 的压缩数据拷入 `fill`，返回实际字节数。
+    /// 跳过已消费尽的块。
     #[inline]
-    fn next(&mut self, fill: &mut [u8]) -> usize {
-        let mut filled = 0usize;
-        while filled < fill.len() && self.ci < self.chunks.len() {
-            let (off, len) = self.chunks[self.ci];
-            let avail = len - self.co;
-            if avail == 0 {
-                self.ci += 1;
-                self.co = 0;
-                continue;
-            }
-            let n = avail.min(fill.len() - filled);
-            fill[filled..filled + n]
-                .copy_from_slice(&self.data[off + self.co..off + self.co + n]);
-            self.co += n;
-            filled += n;
+    fn skip_done(&mut self) {
+        while self.ci < self.chunks.len() && self.cpos >= self.chunks[self.ci].1 {
+            self.ci += 1;
+            self.cpos = 0;
         }
-        filled
+    }
+
+    /// 当前块内剩余字节。
+    #[inline]
+    fn chunk_remain(&self) -> usize {
+        if self.ci < self.chunks.len() {
+            self.chunks[self.ci].1 - self.cpos
+        } else {
+            0
+        }
+    }
+
+    /// 取下一窗口（≤`max`；空 = 流耗尽）。非流尾窗口是 8 的倍数。
+    fn next_window(&mut self, max: usize) -> Window<'a> {
+        if !self.scratch.is_empty() {
+            return self.stitch(max);
+        }
+        self.skip_done();
+        if self.ci >= self.chunks.len() {
+            return Window::Borrowed(&[]);
+        }
+        let remain = self.chunk_remain();
+        let is_last = self.ci + 1 >= self.chunks.len();
+        let mut n = remain.min(max);
+        if !is_last && n % 8 != 0 {
+            n -= n % 8; // 对齐到 8 的倍数（非流尾时否则 fdeflate 无法吞 <8 尾）。
+            if n == 0 {
+                // 整块 <8：全部归入 scratch，交给拼贴窗口。
+                let (off, _) = self.chunks[self.ci];
+                self.scratch
+                    .extend_from_slice(&self.data[off + self.cpos..off + self.cpos + remain]);
+                self.cpos += remain;
+                return self.next_window(max);
+            }
+        }
+        let (off, _) = self.chunks[self.ci];
+        let win = &self.data[off + self.cpos..off + self.cpos + n];
+        self.cpos += n;
+        Window::Borrowed(win)
+    }
+
+    /// 拼贴窗口：`scratch`(≤7) + 当前/后继块头，直到 ≥8 对齐或流尽。
+    fn stitch(&mut self, max: usize) -> Window<'a> {
+        let mut w = std::mem::take(&mut self.scratch);
+        // 拉满到 max（跨块）。
+        while w.len() < max {
+            self.skip_done();
+            if self.ci >= self.chunks.len() {
+                break;
+            }
+            let remain = self.chunk_remain();
+            let take = remain.min(max - w.len());
+            let (off, _) = self.chunks[self.ci];
+            w.extend_from_slice(&self.data[off + self.cpos..off + self.cpos + take]);
+            self.cpos += take;
+        }
+        // 补齐到 8 的倍数（若仍有后续输入）。
+        while w.len() % 8 != 0 {
+            self.skip_done();
+            if self.ci >= self.chunks.len() {
+                break;
+            }
+            let (off, _) = self.chunks[self.ci];
+            w.push(self.data[off + self.cpos]);
+            self.cpos += 1;
+        }
+        Window::Owned(w)
     }
 }
 
 /// 把 IDAT 解压到有界缓冲（长度 = 反滤波后线性尺寸，解析期已用 1032:1 预检防炸弹）。
 ///
-/// 性能关键（实测 debug）：fdeflate 的 `read` 必须**分块（32KB，同 png crate 的
+/// 性能关键（实测 debug/release）：fdeflate 的 `read` 必须**分块（32KB，同 png crate 的
 /// `CHUNK_BUFFER_SIZE`）喂入且 `end_of_input=false`**，末尾才用一次 `end_of_input=true`
 /// （空输入）flush 校验 Adler-32。一次性把整段 IDAT 交给 `read`（或每调用都传 eoi=true，
-/// 如 `decompress_to_vec_bounded` 内部）会触发慢路径：同样 8.3MB，3ms vs 53ms（~18×）。
-/// 输出缓冲按期望尺寸预先分配，`out_pos` 直接喂给 fdeflate 供回看引用，零重分配。
-fn inflate_idat(
-    h: &FileHeader,
-    data: &[u8],
-    max_alloc: Option<u64>,
-) -> ImageResult<Vec<u8>> {
+/// 如 `decompress_to_vec_bounded` 内部）会触发慢路径：同样 8.3MB，1.1ms vs 10ms（~9×）。
+/// 输入经 [`IdatCursor`] 逐窗口借用原始 IDAT 块（A2：多块不再拼接成连续缓冲）；输出缓冲按
+/// 期望尺寸预先分配，`out_pos` 直接喂给 fdeflate 供回看引用，零重分配。后端保持 fdeflate。
+fn inflate_idat(h: &FileHeader, data: &[u8], max_alloc: Option<u64>) -> ImageResult<Vec<u8>> {
     /// fdeflate 输入分块大小（同 png crate `CHUNK_BUFFER_SIZE`）。
     const CHUNK: usize = 32 * 1024;
 
-    let expected = chunk::inflated_size(h.width, h.height, h.bit_depth, h.color_type, h.interlace == 1);
+    let expected = chunk::inflated_size(
+        h.width,
+        h.height,
+        h.bit_depth,
+        h.color_type,
+        h.interlace == 1,
+    );
     if let Some(max) = max_alloc {
         if expected > max {
             return Err(err_limits());
         }
     }
-    let expected =
-        usize::try_from(expected).map_err(|_| err_decode("解压尺寸超出平台表示范围"))?;
+    let expected = usize::try_from(expected).map_err(|_| err_decode("解压尺寸超出平台表示范围"))?;
 
     let mut dc = fdeflate::Decompressor::new();
     // 与 png crate 解码路径一致：跳过 Adler-32 校验（其默认 ignore_adler32=true）。
@@ -198,18 +490,22 @@ fn inflate_idat(
     // 校验仍生效，目标目录与被替换的 png crate 路径行为持平。真需要校验可去掉此行。
     dc.ignore_adler32();
     let mut inflated = vec![0u8; expected];
-    let mut reader = IdatReader::new(data, &h.idat_chunks);
-    let mut chunk_buf = [0u8; CHUNK];
+    let mut idat = IdatCursor::new(data, h.idat_chunks.as_slice());
     let mut out_pos = 0usize;
     'main: loop {
         if dc.is_done() {
             break;
         }
-        let got = reader.next(&mut chunk_buf);
-        if got == 0 {
+        // Owned 窗口（跨块拼贴）需在本迭代保持存活以被借用喂入。
+        let win = idat.next_window(CHUNK);
+        let win_slice: &[u8] = match &win {
+            Window::Borrowed(w) => w,
+            Window::Owned(w) => w,
+        };
+        if win_slice.is_empty() {
             break; // 压缩输入耗尽，走末尾 flush
         }
-        let mut input = &chunk_buf[..got];
+        let mut input = win_slice;
         loop {
             if dc.is_done() {
                 break 'main;
@@ -220,7 +516,7 @@ fn inflate_idat(
             input = &input[consumed..];
             out_pos += produced;
             if input.is_empty() {
-                break; // 本块消费完，取下一块
+                break; // 本窗口消费完，取下一窗口
             }
             if produced == 0 {
                 break 'main; // 输出已满且无进展 → 长度不符/炸弹，由末尾检查报错
@@ -256,7 +552,9 @@ fn next_byte(inf: &[u8], pos: &mut usize) -> ImageResult<u8> {
 #[inline]
 fn next_row<'a>(inf: &'a [u8], pos: &mut usize, len: usize) -> ImageResult<&'a [u8]> {
     let start = *pos;
-    let end = start.checked_add(len).ok_or_else(|| err_decode("行偏移溢出"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| err_decode("行偏移溢出"))?;
     if end > inf.len() {
         return Err(err_decode("IDAT 流过早结束"));
     }
@@ -316,7 +614,12 @@ pub(crate) fn output_color_type(h: &FileHeader) -> ColorType {
 // 非隔行
 // ---------------------------------------------------------------------------
 
-fn decode_scanlines(h: &FileHeader, inflated: &[u8], buf: &mut [u8]) -> ImageResult<()> {
+fn decode_scanlines(
+    h: &FileHeader,
+    inflated: &[u8],
+    buf: &mut [u8],
+    #[cfg_attr(not(feature = "stage_profile"), allow(unused_variables))] st: &mut Stages,
+) -> ImageResult<()> {
     let width = h.width as usize;
     let height = h.height as usize;
     let spp = h.samples_per_pixel();
@@ -331,39 +634,58 @@ fn decode_scanlines(h: &FileHeader, inflated: &[u8], buf: &mut [u8]) -> ImageRes
     let mut pos = 0usize;
 
     if matches!(kind, ExpandKind::Copy) {
-        // 恒等路径：先从解压缓冲拷贝到目标行，再就地反滤波（源行字节 == 输出行字节）。
-        // 上一行取自目标缓冲（已反滤波完成），零中间样本分配。
+        // 恒等路径：直接反滤波进目标缓冲（A2 src≠dst，0 额外槽）。
+        // 源行活在解压缓冲 `inflated` 里，上一行取自目标缓冲（已反滤波完成），
+        // 无需先拷贝一行、零中间样本分配。仅在 Copy（srow==out_row 且无展开）时成立。
         debug_assert_eq!(srow, out_row);
         let zeros = vec![0u8; srow];
         for y in 0..height {
             let f = next_byte(inflated, &mut pos)?;
             let src = next_row(inflated, &mut pos, out_row)?;
-            let (row, above): (&mut [u8], &[u8]) = if y == 0 {
+            let (dst, above): (&mut [u8], &[u8]) = if y == 0 {
                 let (_, rest) = buf.split_at_mut(0);
-                let (row, _) = rest.split_at_mut(out_row);
-                (row, &zeros)
+                let (dst, _) = rest.split_at_mut(out_row);
+                (dst, &zeros)
             } else {
                 let (before, rest) = buf.split_at_mut(y * out_row);
-                let (row, _) = rest.split_at_mut(out_row);
+                let (dst, _) = rest.split_at_mut(out_row);
                 let above = &before[(y - 1) * out_row..y * out_row];
-                (row, above)
+                (dst, above)
             };
-            row.copy_from_slice(src);
-            unfilter_row(f, row, above, fbpp);
+            #[cfg(feature = "stage_profile")]
+            let c0 = std::time::Instant::now();
+            unfilter_to(f, src, dst, above, fbpp);
+            #[cfg(feature = "stage_profile")]
+            let c1 = std::time::Instant::now();
+            #[cfg(feature = "stage_profile")]
+            {
+                st.unfilter_ns += stage_probe::ns(c0, c1);
+            }
         }
     } else {
-        // 需要展开：行缓冲复用（cur/above 两槽，槽位轮流当上一行），展开写目标行。
+        // 需要展开：行缓冲复用（A2 src≠dst 2 槽 cur/above，槽位轮流当上一行），
+        // unfilter_to 把反滤波结果直接写进槽位（免拷贝），展开写目标行。
         debug_assert_eq!(buf.len(), out_row * height);
         let mut cur = vec![0u8; srow];
         let mut above = vec![0u8; srow];
         for y in 0..height {
             let f = next_byte(inflated, &mut pos)?;
             let src = next_row(inflated, &mut pos, srow)?;
-            cur.copy_from_slice(src);
-            unfilter_row(f, &mut cur, &above, fbpp);
+            #[cfg(feature = "stage_profile")]
+            let c0 = std::time::Instant::now();
+            unfilter_to(f, src, &mut cur, &above, fbpp);
+            #[cfg(feature = "stage_profile")]
+            let c1 = std::time::Instant::now();
             let dst = &mut buf[y * out_row..y * out_row + out_row];
             expand::expand_row(&kind, &table, &cur, dst, width);
+            #[cfg(feature = "stage_profile")]
+            let c2 = std::time::Instant::now();
             std::mem::swap(&mut cur, &mut above);
+            #[cfg(feature = "stage_profile")]
+            {
+                st.unfilter_ns += stage_probe::ns(c0, c1);
+                st.expand_ns += stage_probe::ns(c1, c2);
+            }
         }
     }
 
@@ -374,7 +696,12 @@ fn decode_scanlines(h: &FileHeader, inflated: &[u8], buf: &mut [u8]) -> ImageRes
 // Adam7 隔行
 // ---------------------------------------------------------------------------
 
-fn decode_adam7(h: &FileHeader, inflated: &[u8], buf: &mut [u8]) -> ImageResult<()> {
+fn decode_adam7(
+    h: &FileHeader,
+    inflated: &[u8],
+    buf: &mut [u8],
+    #[cfg_attr(not(feature = "stage_profile"), allow(unused_variables))] st: &mut Stages,
+) -> ImageResult<()> {
     let width = h.width as usize;
     let height = h.height as usize;
     let spp = h.samples_per_pixel();
@@ -403,16 +730,38 @@ fn decode_adam7(h: &FileHeader, inflated: &[u8], buf: &mut [u8]) -> ImageResult<
         for r in 0..ph {
             let f = next_byte(inflated, &mut pos)?;
             let src = next_row(inflated, &mut pos, srow)?;
+            #[cfg(feature = "stage_profile")]
+            let c0 = std::time::Instant::now();
             cur[..srow].copy_from_slice(src);
+            #[cfg(feature = "stage_profile")]
+            let c1 = std::time::Instant::now();
             let (crow, _) = cur.split_at_mut(srow);
             let (ab, _) = above.split_at(srow);
             unfilter_row(f, crow, ab, fbpp);
+            #[cfg(feature = "stage_profile")]
+            let c2 = std::time::Instant::now();
             let erow = &mut expanded[..pw * out_bpp];
             expand::expand_row(&kind, &table, crow, erow, pw);
+            #[cfg(feature = "stage_profile")]
+            let c3 = std::time::Instant::now();
             let y = y0 + r * dy;
             let dst_start = y * out_row + x0 * out_bpp;
-            scatter(&expanded[..pw * out_bpp], &mut buf[dst_start..], pw, out_bpp, dx);
+            scatter(
+                &expanded[..pw * out_bpp],
+                &mut buf[dst_start..],
+                pw,
+                out_bpp,
+                dx,
+            );
+            #[cfg(feature = "stage_profile")]
+            let c4 = std::time::Instant::now();
             std::mem::swap(&mut cur, &mut above);
+            #[cfg(feature = "stage_profile")]
+            {
+                st.copy_ns += stage_probe::ns(c0, c1) + stage_probe::ns(c3, c4);
+                st.unfilter_ns += stage_probe::ns(c1, c2);
+                st.expand_ns += stage_probe::ns(c2, c3);
+            }
         }
     }
 
@@ -430,6 +779,82 @@ fn scatter(src: &[u8], dst: &mut [u8], count: usize, pixel_bytes: usize, step: u
 }
 
 #[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    /// 构建一个最小合法 PNG（ct/depth 自定，1 行数据）。
+    fn make_mini_png(ct: u8, depth: u8, row_data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        let crc = |bytes: &[u8]| {
+            let mut h = crc32fast::Hasher::new();
+            h.update(bytes);
+            h.finalize()
+        };
+        let chunk = |name: &[u8; 4], payload: &[u8]| -> Vec<u8> {
+            let mut c = Vec::new();
+            c.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            c.extend_from_slice(name);
+            c.extend_from_slice(payload);
+            let mut cov = name.to_vec();
+            cov.extend_from_slice(payload);
+            c.extend_from_slice(&crc(&cov).to_be_bytes());
+            c
+        };
+        out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[depth, ct, 0, 0, 0]);
+        out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(row_data).unwrap();
+        let z = enc.finish().unwrap();
+        out.extend_from_slice(&chunk(b"IDAT", &z));
+        out.extend_from_slice(&chunk(b"IEND", &[]));
+        out
+    }
+
+    /// A1：零拷贝路径的 `Input` 变体断言 + 三路（借用/自有解析/自有 vec）输出逐字节一致。
+    #[test]
+    fn input_borrow_vs_owned_paths_identical() {
+        // 1x1 RGBA：filter 0 + 4 样本。
+        let png = make_mini_png(6, 8, &[0, 10, 20, 30, 255]);
+
+        let borrowed = PngEngine::from_slice(&png).unwrap();
+        assert!(
+            matches!(borrowed.data, Input::Borrowed(_)),
+            "from_slice 必须走借用路径"
+        );
+        assert_eq!(borrowed.data.as_slice(), png.as_slice());
+
+        let owned_slice = PngEngine::from_vec(png.clone()).unwrap();
+        assert!(
+            matches!(owned_slice.data, Input::Owned(_)),
+            "from_vec 必须走自有路径"
+        );
+
+        let mut parsed = std::io::Cursor::new(&png[..]);
+        let owned_read = PngEngine::parse_with_capacity(&mut parsed, png.len()).unwrap();
+        assert!(
+            matches!(owned_read.data, Input::Owned(_)),
+            "读取器路径必须走自有路径"
+        );
+
+        // 输出逐字节一致。
+        let mut b1 = vec![0u8; borrowed.total_bytes() as usize];
+        let mut b2 = vec![0u8; owned_slice.total_bytes() as usize];
+        let mut b3 = vec![0u8; owned_read.total_bytes() as usize];
+        borrowed.decode(&mut b1, None).unwrap();
+        owned_slice.decode(&mut b2, None).unwrap();
+        owned_read.decode(&mut b3, None).unwrap();
+        assert_eq!(b1, b2, "from_slice 与 from_vec 输出不一致");
+        assert_eq!(b1, b3, "from_slice 与读取器路径输出不一致");
+        assert_eq!(b1, [10, 20, 30, 255]);
+    }
+}
+
+#[cfg(test)]
 mod diag_tests {
     use super::*;
 
@@ -443,7 +868,9 @@ mod diag_tests {
         let mut img = Vec::with_capacity(row * h as usize);
         let mut lcg = 0x9E3779B97F4A7C15u64;
         for _ in 0..(row * h as usize) {
-            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             img.push((lcg >> 40) as u8);
         }
         let mut bytes = Vec::new();
@@ -459,9 +886,12 @@ mod diag_tests {
         let idat = {
             let mut pos = 8usize;
             loop {
-                let len =
-                    u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-                        as usize;
+                let len = u32::from_be_bytes([
+                    bytes[pos],
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                ]) as usize;
                 if &bytes[pos + 4..pos + 8] == b"IDAT" {
                     break bytes[pos + 8..pos + 8 + len].to_vec();
                 }
@@ -644,7 +1074,59 @@ mod diag_tests {
             PngEngine::parse(&mut &bytes[..]).unwrap();
             durations.push(t.elapsed().as_secs_f64() * 1e3);
         }
-        eprintln!("[diag-parse] parse (whole file) = {durations:?}ms  input={}B", bytes.len());
+        eprintln!(
+            "[diag-parse] parse (whole file) = {durations:?}ms  input={}B",
+            bytes.len()
+        );
+
+        // parse 归因：fill_buf 单次 memcpy vs parse_png 扫描。
+        {
+            use std::io::BufRead as _;
+            let mut durations = Vec::new();
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let mut data = Vec::new();
+                data.reserve(bytes.len());
+                let mut r: &[u8] = &bytes;
+                loop {
+                    let buf = r.fill_buf().unwrap();
+                    if buf.is_empty() {
+                        break;
+                    }
+                    let n = buf.len();
+                    data.extend_from_slice(buf);
+                    r.consume(n);
+                }
+                durations.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            eprintln!("[diag-parse] fill_buf 单次 memcpy only = {durations:?}ms");
+            // 对照：to_owned（整块 memcpy）与 copy_nonoverlapping。
+            let mut durations = Vec::new();
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let _data = bytes.to_owned();
+                durations.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            eprintln!("[diag-parse] to_owned（整块） = {durations:?}ms");
+            let mut durations = Vec::new();
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let mut data = Vec::with_capacity(bytes.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_mut_ptr(), bytes.len());
+                    data.set_len(bytes.len());
+                }
+                durations.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            eprintln!("[diag-parse] copy_nonoverlapping = {durations:?}ms");
+            let mut durations = Vec::new();
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let _ = chunk::parse_png(&bytes).unwrap();
+                durations.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            eprintln!("[diag-parse] parse_png only = {durations:?}ms");
+        }
 
         // 输出分配（vec![0; N] debug 零化）
         let mut durations = Vec::new();
@@ -661,6 +1143,174 @@ mod diag_tests {
         for _ in 0..3 {
             engine.decode_timed(&mut buf).unwrap();
         }
+
+        // 生产路径实测（PngDecoder::new 走 with_limits 的预留容量解析 + read_image 全解码）。
+        {
+            use crate::ImageDecoder as _;
+            let mut durations = Vec::new();
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let dec =
+                    crate::codecs::png::PngDecoder::new(std::io::Cursor::new(&bytes[..])).unwrap();
+                let mut out = vec![0u8; dec.total_bytes() as usize];
+                dec.read_image(&mut out).unwrap();
+                durations.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            eprintln!("[diag] PngDecoder::new + read_image（生产路径） = {durations:?}ms");
+            // 只测构造（解析 + 预留容量 read_to_end），不含解码。
+            let mut durations = Vec::new();
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let _ =
+                    crate::codecs::png::PngDecoder::new(std::io::Cursor::new(&bytes[..])).unwrap();
+                durations.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            eprintln!("[diag] PngDecoder::new 仅构造（解析+预留 read_to_end） = {durations:?}ms");
+        }
+    }
+
+    /// 分阶段计时诊断：gray8 1920x1080（bench 同款 `photo_bytes`）inflate vs rows 拆分 + filter 分布。
+    /// `#[ignore]` 手动：`cargo test -p kimg --release --lib pngsimd::diag -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "手动运行"]
+    fn decode_phase_timing_gray8() {
+        let (w, h) = (1920u32, 1080u32);
+        let mut img = Vec::with_capacity((w * h) as usize);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let base = ((x as f64 * 1.3 + y as f64 * 0.7) as usize & 0x3F) as u8;
+                let s = (x as f64 / 37.0 * std::f64::consts::PI * 2.0).sin();
+                let s2 = (y as f64 / 41.0 + x as f64 / 97.0) * std::f64::consts::PI * 2.0;
+                let v = (base as f64 + 96.0 * s + 64.0 * s2.sin() + 48.0).clamp(0.0, 255.0) as u8;
+                img.push(v);
+            }
+        }
+        let mut bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, w, h);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.set_compression(png::Compression::Fast);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(&img).unwrap();
+        }
+        // filter 分布：解压后逐行取 filter 字节。
+        let engine = PngEngine::parse(&mut &bytes[..]).unwrap();
+        let inflated = inflate_idat(&engine.header, engine.data.as_slice(), None).unwrap();
+        let srow = packed_row_bytes(engine.header.width as usize, 1, 8);
+        let mut counts = [0u32; 5];
+        let mut pos = 0usize;
+        for _y in 0..engine.header.height as usize {
+            let f = inflated[pos];
+            if f < 5 {
+                counts[f as usize] += 1;
+            }
+            pos += 1 + srow;
+        }
+        eprintln!("[diag-gray8] filter 分布(逐行): None/Sub/Up/Avg/Paeth = {counts:?}");
+
+        let mut buf = vec![0u8; engine.total_bytes() as usize];
+        for _ in 0..3 {
+            engine.decode_timed(&mut buf).unwrap();
+        }
+        // png crate 参照全解码。
+        let mut durations = Vec::new();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let dec = png::Decoder::new(&bytes[..]);
+            let mut r = dec.read_info().unwrap();
+            let mut out = vec![0u8; r.output_buffer_size()];
+            r.next_frame(&mut out).unwrap();
+            durations.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        eprintln!("[diag-gray8] png crate 全解码 = {durations:?}ms");
+    }
+
+    /// 4K（3840×2160 rgba8）分阶段计时：inflate vs rows 的占比——决定行级并行（rayon）是否有实益。
+    /// `#[ignore]` 手动。若 inflate（单线程）占大头，行级并行的最大收益被卡死。
+    #[test]
+    #[ignore = "手动运行"]
+    fn decode_phase_timing_4k() {
+        let (w, h) = (3840u32, 2160u32);
+        let row = w as usize * 4;
+        let mut img = Vec::with_capacity(row * h as usize);
+        let mut lcg = 0x9E3779B97F4A7C15u64;
+        for _ in 0..(row * h as usize) {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            img.push((lcg >> 40) as u8);
+        }
+        let mut bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.set_compression(png::Compression::Fast);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(&img).unwrap();
+        }
+        let engine = PngEngine::parse(&mut &bytes[..]).unwrap();
+        let mut buf = vec![0u8; engine.total_bytes() as usize];
+        for _ in 0..3 {
+            engine.decode_timed(&mut buf).unwrap();
+        }
+    }
+
+    /// RGB8（bpp3）1920x1080 分阶段计时：inflate vs rows——定位 rgb8「略慢」的gap在解压还是行处理。
+    /// `#[ignore]` 手动。
+    #[test]
+    #[ignore = "手动运行"]
+    fn decode_phase_timing_rgb8() {
+        let (w, h) = (1920u32, 1080u32);
+        let row = w as usize * 3;
+        let mut img = Vec::with_capacity(row * h as usize);
+        let mut lcg = 0x9E3779B97F4A7C15u64;
+        for _ in 0..(row * h as usize) {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            img.push((lcg >> 40) as u8);
+        }
+        let mut bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, w, h);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.set_compression(png::Compression::Fast);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(&img).unwrap();
+        }
+        let engine = PngEngine::parse(&mut &bytes[..]).unwrap();
+        // filter 分布（解压后逐行取 filter 字节）。
+        {
+            let inflated = inflate_idat(&engine.header, engine.data.as_slice(), None).unwrap();
+            let srow = packed_row_bytes(engine.header.width as usize, 3, 8);
+            let mut counts = [0u32; 5];
+            let mut pos = 0usize;
+            for _y in 0..engine.header.height as usize {
+                let f = inflated[pos];
+                if f < 5 {
+                    counts[f as usize] += 1;
+                }
+                pos += 1 + srow;
+            }
+            eprintln!("[diag-rgb8] filter 分布(逐行): None/Sub/Up/Avg/Paeth = {counts:?}");
+        }
+        let mut buf = vec![0u8; engine.total_bytes() as usize];
+        for _ in 0..3 {
+            engine.decode_timed(&mut buf).unwrap();
+        }
+        let mut durations = Vec::new();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let dec = png::Decoder::new(&bytes[..]);
+            let mut r = dec.read_info().unwrap();
+            let mut out = vec![0u8; r.output_buffer_size()];
+            r.next_frame(&mut out).unwrap();
+            durations.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        eprintln!("[diag-rgb8] png crate 全解码 = {durations:?}ms");
     }
 
     /// 分阶段计时诊断：纯标量、纯 SIMD 反滤波对照。`#[ignore]` 手动。
@@ -681,11 +1331,11 @@ mod diag_tests {
                 lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
                 *b = (lcg >> 40) as u8;
             }
-            
+
             let t0 = std::time::Instant::now();
             for _ in 0..rows {
                 unfilter_row(filter, &mut row, &above, 4);
-                            }
+            }
             t_simd += t0.elapsed();
             let t1 = std::time::Instant::now();
             for _ in 0..rows {
@@ -713,7 +1363,11 @@ mod diag_tests {
                 _ => {
                     let l = if i >= bpp { i32::from(row[i - bpp]) } else { 0 };
                     let a = i32::from(above[i]);
-                    let c = if i >= bpp { i32::from(above[i - bpp]) } else { 0 };
+                    let c = if i >= bpp {
+                        i32::from(above[i - bpp])
+                    } else {
+                        0
+                    };
                     let p = l + a - c;
                     let pa = (p - l).abs();
                     let pb = (p - a).abs();

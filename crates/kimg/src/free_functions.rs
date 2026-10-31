@@ -4,14 +4,18 @@ use std::fs::File;
 use std::io::{BufWriter, Cursor, Write};
 use std::path::Path;
 
+use crate::ImageDecoder as _;
 use crate::buffer::{RgbImage, RgbaImage};
 use crate::codecs::gif::GifEncoder;
 use crate::codecs::png::PngEncoder;
 use crate::color::ExtendedColorType;
 use crate::dynamic_image::DynamicImage;
-use crate::error::{ImageError, ImageResult, UnsupportedError, UnsupportedErrorKind, ImageFormatHint};
+use crate::error::{
+    ImageError, ImageFormatHint, ImageResult, UnsupportedError, UnsupportedErrorKind,
+};
 use crate::format::ImageFormat;
 use crate::image_reader::ImageReader;
+use crate::limits::Limits;
 use crate::pixel::Rgba;
 
 pub use crate::format::guess_format;
@@ -32,9 +36,16 @@ pub fn load_from_memory(buf: &[u8]) -> ImageResult<DynamicImage> {
 }
 
 /// 从内存字节按指定格式解码。
+///
+/// A1 零拷贝：内存切片统一经 `GenericDecoder::new_slice` 特判——PNG 直接借用输入切片
+/// （[`crate::codecs::png::PngDecoder::from_slice`]，不整份复制），其余格式沿用通用读取路径。
 pub fn load_from_memory_with_format(buf: &[u8], format: ImageFormat) -> ImageResult<DynamicImage> {
-    let reader = ImageReader::with_format(Cursor::new(buf), format);
-    reader.decode()
+    let reader = Cursor::new(buf);
+    let mut decoder = crate::codecs::GenericDecoder::new_slice(format, reader)?;
+    let mut limits = Limits::default();
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    DynamicImage::from_decoder(decoder)
 }
 
 /// 按路径与格式把原始缓冲存盘。

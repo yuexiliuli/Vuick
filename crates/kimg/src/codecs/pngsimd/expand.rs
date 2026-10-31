@@ -44,9 +44,7 @@ pub(crate) fn build_expand_kind(h: &FileHeader) -> ExpandKind {
                         key: h.transparent_color[0],
                     }
                 } else {
-                    ExpandKind::SubByteL {
-                        depth: h.bit_depth,
-                    }
+                    ExpandKind::SubByteL { depth: h.bit_depth }
                 }
             }
             8 => {
@@ -315,11 +313,22 @@ fn rgb8_rgba8(
     key: [u8; 4],
 ) {
     let mut x = 0usize;
-    // SSSE3 主径覆盖 4 像素/批；每次载入 16 源字节（多读尾字节保证边界安全，不越界）。
+    // AVX2 主径：每批 8 像素（24 源字节 → 32 输出字节，256 位 shuffle+blend）。
+    // SSSE3 主径：每批 4 像素（16 源字节 → 16 输出字节）。一律多读尾字节保证边界安全，不越界。
+    // 两者都返回「处理掉的像素数」，链式接力后再由标量尾补齐。
     #[cfg(target_arch = "x86_64")]
-    if crate::codecs::pngsimd::simd_ok("ssse3") {
+    if !crate::codecs::pngsimd::simd_forced_off() && crate::codecs::pngsimd::simd_ok("avx2") {
         unsafe {
-            x = pg_simd::rgb8_to_rgba_ssse3(src, dst, width);
+            x = pg_simd::rgb8_to_rgba_avx2(&src[3 * x..], &mut dst[4 * x..], width - x);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if x < width
+        && !crate::codecs::pngsimd::simd_forced_off()
+        && crate::codecs::pngsimd::simd_ok("ssse3")
+    {
+        unsafe {
+            x += pg_simd::rgb8_to_rgba_ssse3(&src[3 * x..], &mut dst[4 * x..], width - x);
         }
     }
     // 标量尾补齐向量主径未覆盖的像素（最多 3 个），保证全宽度写出。
@@ -337,7 +346,7 @@ fn clear_key_alpha8(rgba: &mut [u8], width: usize, key: [u8; 4]) {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::is_x86_feature_detected;
-        if is_x86_feature_detected!("sse2") {
+        if !crate::codecs::pngsimd::simd_forced_off() && is_x86_feature_detected!("sse2") {
             unsafe {
                 x = pg_simd::clear_key_alpha8_sse2(rgba, width, key);
             }
@@ -420,14 +429,37 @@ fn emit_palette(table: &PaletteTable, dst: &mut [u8], x: usize, idx: usize, rgba
 mod pg_simd {
     use std::arch::x86_64::*;
 
+    /// RGB8 → RGBA8（alpha=255）AVX2：每批 8 像素（24 源字节 → 32 输出字节）。
+    /// 8 像素 = 24 字节跨 16 字节道界且不在像素边界上，故不直接用 32 字节 shuffle；改为两次
+    /// 128 位载入（偏移 3x 与 3x+12，各含 4 像素整 12 字节 + 4 尾字节）各做一次 SSSE3 重排，
+    /// 拼成 256 位一次性写出（少一半循环/存储指令；SSSE3 主径照旧仅作回退）。返回处理掉的像素数。
+    #[target_feature(enable = "avx2", enable = "ssse3")]
+    pub(crate) unsafe fn rgb8_to_rgba_avx2(src: &[u8], dst: &mut [u8], width: usize) -> usize {
+        unsafe {
+            let m = _mm_setr_epi8(0, 1, 2, -128, 3, 4, 5, -128, 6, 7, 8, -128, 9, 10, 11, -128);
+            let alpha = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
+            let s = src.as_ptr();
+            let d = dst.as_mut_ptr();
+            let mut x = 0usize;
+            // 两次 16 字节载入（3x 与 3x+12）都须整段在行内：3x+12+16<=3w ⇒ 3x+28<=3w。
+            while 3 * x + 28 <= 3 * width {
+                let v0 = _mm_loadu_si128(s.add(3 * x) as *const __m128i);
+                let v1 = _mm_loadu_si128(s.add(3 * x + 12) as *const __m128i);
+                let out0 = _mm_or_si128(_mm_shuffle_epi8(v0, m), alpha);
+                let out1 = _mm_or_si128(_mm_shuffle_epi8(v1, m), alpha);
+                _mm256_storeu_si256(d.add(4 * x) as *mut __m256i, _mm256_set_m128i(out1, out0));
+                x += 8;
+            }
+            x
+        }
+    }
+
     /// RGB8 → RGBA8（alpha=255）：16 字节一次处理 5.33 像素的外循环与 C# `Rgb8` 同款，
     /// `while 3x + 16 <= 3·width`。掩码 `m` 与源行字节一一对应。
     #[target_feature(enable = "ssse3")]
     pub(crate) unsafe fn rgb8_to_rgba_ssse3(src: &[u8], dst: &mut [u8], width: usize) -> usize {
         unsafe {
-            let m = _mm_setr_epi8(
-                0, 1, 2, -128, 3, 4, 5, -128, 6, 7, 8, -128, 9, 10, 11, -128,
-            );
+            let m = _mm_setr_epi8(0, 1, 2, -128, 3, 4, 5, -128, 6, 7, 8, -128, 9, 10, 11, -128);
             let alpha = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
             let s = src.as_ptr();
             let d = dst.as_mut_ptr();
@@ -490,12 +522,105 @@ mod tests {
     }
 
     fn lcg(seed: &mut u64) -> u8 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (*seed >> 56) as u8
     }
 
+    /// A2 断言：sub-byte / palette / tRNS 合成路径**不得**走 Copy（恒等）——它们必须进
+    /// `decode_scanlines` 的展开分支，否则源行以输出行字节数被误读（`srow != out_row`）。
+    /// Copy 只允许在「源字节 == 输出字节」的恒等组合（灰阶/RGB 8·16 位无 tRNS，灰α/RGBA）。
+    #[test]
+    fn synth_paths_not_copy_identity_only() {
+        // 合成路径（srow != out_row 或需调色板/tRNS 变换）：必须非 Copy。
+        for (ct, depth, trns, palette) in [
+            (0u8, 1u8, false, false), // sub-byte 灰阶
+            (0, 2, false, false),
+            (0, 4, false, false),
+            (0, 4, true, false), // sub-byte + tRNS
+            (0, 8, true, false), // 灰阶 8 + tRNS → La8
+            (0, 16, true, false),
+            (2, 8, true, false), // RGB + tRNS → Rgba
+            (2, 16, true, false),
+            (3, 1, false, true), // 调色板（全部位深，恒不恒等）
+            (3, 2, false, true),
+            (3, 4, false, true),
+            (3, 8, false, true),
+            (3, 8, true, true), // 调色板 + tRNS → Rgba
+        ] {
+            let file_header = {
+                let mut fh = FileHeader {
+                    width: 64,
+                    height: 1,
+                    bit_depth: depth,
+                    color_type: ct,
+                    interlace: 0,
+                    palette: if palette {
+                        vec![0u8; 3 * 32]
+                    } else {
+                        Vec::new()
+                    },
+                    transparent_color: if trns { vec![0u8; 3] } else { Vec::new() },
+                    has_trns: trns,
+                    exif: None,
+                    idat_chunks: Vec::new(),
+                };
+                if ct == 0 || ct == 2 {
+                    // 灰阶/RGB 的 tRNS 样本键占 2/6 字节（低字节语义见 chunk.rs 解析）。
+                    fh.transparent_color = if trns {
+                        vec![0x00u8; if ct == 0 { 2 } else { 6 }]
+                    } else {
+                        Vec::new()
+                    };
+                    fh.has_trns = trns;
+                }
+                fh
+            };
+            let kind = build_expand_kind(&file_header);
+            assert!(
+                !matches!(kind, ExpandKind::Copy),
+                "(ct={ct} depth={depth} trns={trns} pal={palette}) 合成路径不得走 Copy，得 {kind:?}"
+            );
+        }
+        // 恒等组合：必须 Copy。
+        for (ct, depth, trns) in [
+            (0u8, 8u8, false),
+            (0, 16, false),
+            (2, 8, false),
+            (2, 16, false),
+            (4, 8, false),
+            (4, 16, false),
+            (6, 8, false),
+            (6, 16, false),
+        ] {
+            let fh = FileHeader {
+                width: 64,
+                height: 1,
+                bit_depth: depth,
+                color_type: ct,
+                interlace: 0,
+                palette: Vec::new(),
+                transparent_color: Vec::new(),
+                has_trns: trns,
+                exif: None,
+                idat_chunks: Vec::new(),
+            };
+            let kind = build_expand_kind(&fh);
+            assert!(
+                matches!(kind, ExpandKind::Copy),
+                "(ct={ct} depth={depth} trns={trns}) 恒等路径应为 Copy，得 {kind:?}"
+            );
+        }
+    }
+
     /// 参考实现：逐像素展开（不经 SIMD）。
-    fn reference_expand(kind: &ExpandKind, table: &PaletteTable, src: &[u8], width: usize) -> Vec<u8> {
+    fn reference_expand(
+        kind: &ExpandKind,
+        table: &PaletteTable,
+        src: &[u8],
+        width: usize,
+    ) -> Vec<u8> {
         let bpp = output_len_for_scalar(kind, width, src.len());
         let mut dst = vec![0u8; bpp];
         match *kind {
@@ -503,13 +628,13 @@ mod tests {
             ExpandKind::SubByteL { depth } => {
                 for x in 0..width {
                     let level = sample_at(src, x, depth);
-                    dst[x] = ((level as u16 * 255) / (((1u16 << depth) - 1))) as u8;
+                    dst[x] = ((level as u16 * 255) / ((1u16 << depth) - 1)) as u8;
                 }
             }
             ExpandKind::SubByteLa { depth, key } => {
                 for x in 0..width {
                     let level = sample_at(src, x, depth);
-                    dst[2 * x] = ((level as u16 * 255) / (((1u16 << depth) - 1))) as u8;
+                    dst[2 * x] = ((level as u16 * 255) / ((1u16 << depth) - 1)) as u8;
                     dst[2 * x + 1] = if level == key { 0 } else { 0xFF };
                 }
             }
@@ -522,7 +647,11 @@ mod tests {
             ExpandKind::G16ToLa16 { key } => {
                 for x in 0..width {
                     dst[4 * x..4 * x + 2].copy_from_slice(&src[2 * x..2 * x + 2]);
-                    let a = if src[2 * x..2 * x + 2] == key { [0, 0] } else { [0xFF, 0xFF] };
+                    let a = if src[2 * x..2 * x + 2] == key {
+                        [0, 0]
+                    } else {
+                        [0xFF, 0xFF]
+                    };
                     dst[4 * x + 2..4 * x + 4].copy_from_slice(&a);
                 }
             }
@@ -540,7 +669,11 @@ mod tests {
             ExpandKind::Rgb16ToRgba16 { key } => {
                 for x in 0..width {
                     dst[8 * x..8 * x + 6].copy_from_slice(&src[6 * x..6 * x + 6]);
-                    let a = if src[6 * x..6 * x + 6] == key { [0, 0] } else { [0xFF, 0xFF] };
+                    let a = if src[6 * x..6 * x + 6] == key {
+                        [0, 0]
+                    } else {
+                        [0xFF, 0xFF]
+                    };
                     dst[8 * x + 6..8 * x + 8].copy_from_slice(&a);
                 }
             }
@@ -626,6 +759,74 @@ mod tests {
             ExpandKind::G16ToLa16 { .. } => width * 2,
             ExpandKind::Rgb8ToRgba8 { .. } => width * 3,
             ExpandKind::Rgb16ToRgba16 { .. } => width * 6,
+        }
+    }
+
+    /// RGB8→RGBA8：SSSE3 / AVX2 / 纯标量 三条路径字节级一致（含 SIMD 尾段的标量补齐）。
+    /// 按运行 CPU 特性单开其 SIMD 主径，其余路径全开以互相锁定；宽度覆盖向量主径 + 各路尾数。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn rgbsimd_paths_byte_identical() {
+        use std::arch::is_x86_feature_detected;
+        let widths = [
+            1usize, 3, 4, 7, 8, 9, 12, 15, 16, 17, 24, 25, 31, 32, 33, 56, 63, 64, 65, 96, 128,
+            129, 1000,
+        ];
+        let mut seed = 0x0F0F_0F0F_0F0Fu64;
+        for width in widths {
+            let src: Vec<u8> = (0..3 * width).map(|_| lcg(&mut seed)).collect();
+            // 纯标量参考。
+            let mut scalar = vec![0u8; 4 * width];
+            for x in 0..width {
+                scalar[4 * x..4 * x + 3].copy_from_slice(&src[3 * x..3 * x + 3]);
+                scalar[4 * x + 3] = 0xFF;
+            }
+            // SSSE3 路径（主径 + 标量尾）。
+            let mut ssse3 = vec![0u8; 4 * width];
+            if is_x86_feature_detected!("ssse3") {
+                let n = unsafe { super::pg_simd::rgb8_to_rgba_ssse3(&src, &mut ssse3, width) };
+                for x in n..width {
+                    ssse3[4 * x..4 * x + 3].copy_from_slice(&src[3 * x..3 * x + 3]);
+                    ssse3[4 * x + 3] = 0xFF;
+                }
+                assert_eq!(ssse3, scalar, "SSSE3 与标量不一致 width={width}");
+            }
+            // AVX2 路径（主径 + 标量尾）。
+            let mut avx2 = vec![0u8; 4 * width];
+            if is_x86_feature_detected!("avx2") {
+                let n = unsafe { super::pg_simd::rgb8_to_rgba_avx2(&src, &mut avx2, width) };
+                for x in n..width {
+                    avx2[4 * x..4 * x + 3].copy_from_slice(&src[3 * x..3 * x + 3]);
+                    avx2[4 * x + 3] = 0xFF;
+                }
+                assert_eq!(avx2, scalar, "AVX2 与标量不一致 width={width}");
+            }
+            // AVX2→SSSE3 接力（走 dispatch 同款串联）：两段 SIMD 后再标量尾 == 标量。
+            let mut chained = vec![0u8; 4 * width];
+            let mut x = 0usize;
+            if is_x86_feature_detected!("avx2") {
+                x = unsafe {
+                    super::pg_simd::rgb8_to_rgba_avx2(
+                        &src[3 * x..],
+                        &mut chained[4 * x..],
+                        width - x,
+                    )
+                };
+            }
+            if x < width && is_x86_feature_detected!("ssse3") {
+                x += unsafe {
+                    super::pg_simd::rgb8_to_rgba_ssse3(
+                        &src[3 * x..],
+                        &mut chained[4 * x..],
+                        width - x,
+                    )
+                };
+            }
+            for xx in x..width {
+                chained[4 * xx..4 * xx + 3].copy_from_slice(&src[3 * xx..3 * xx + 3]);
+                chained[4 * xx + 3] = 0xFF;
+            }
+            assert_eq!(chained, scalar, "AVX2→SSSE3 接力与标量不一致 width={width}");
         }
     }
 }

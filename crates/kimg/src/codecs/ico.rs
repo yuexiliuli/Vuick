@@ -2,13 +2,15 @@
 
 use std::io::{BufRead, Read, Seek, SeekFrom};
 
+use crate::ImageDecoder;
 use crate::codecs::bmp::BmpDecoder;
 use crate::codecs::png::PngDecoder;
 use crate::color::ColorType;
-use crate::error::{DecodingError, ImageError, ImageResult, UnsupportedError, UnsupportedErrorKind};
+use crate::error::{
+    DecodingError, ImageError, ImageResult, UnsupportedError, UnsupportedErrorKind,
+};
 use crate::format::ImageFormat;
 use crate::metadata::Orientation;
-use crate::{ImageDecoder};
 
 pub(crate) const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
@@ -56,11 +58,15 @@ fn read_entry<R: Read>(r: &mut R) -> ImageResult<DirEntry> {
     // 若为大热区（CUR）坐标，校验不超过 256；ICO 的 planes 应为 0/1。
     let planes = read_u16(r)?;
     if planes > 256 {
-        return Err(ico_err("ICO image entry has too many color planes or too large hotspot value"));
+        return Err(ico_err(
+            "ICO image entry has too many color planes or too large hotspot value",
+        ));
     }
     d.bits_per_pixel = read_u16(r)?;
     if d.bits_per_pixel > 256 {
-        return Err(ico_err("ICO image entry has too many bits per pixel or too large hotspot value"));
+        return Err(ico_err(
+            "ICO image entry has too many bits per pixel or too large hotspot value",
+        ));
     }
     d.image_length = read_u32(r)?;
     d.image_offset = read_u32(r)?;
@@ -69,7 +75,9 @@ fn read_entry<R: Read>(r: &mut R) -> ImageResult<DirEntry> {
 
 /// 选出「位深最大，其次面积最大」的条目（与 image 0.25 相同）。
 fn best_entry(mut entries: Vec<DirEntry>) -> ImageResult<DirEntry> {
-    let mut best = entries.pop().ok_or_else(|| ico_err("ICO directory contains no image"))?;
+    let mut best = entries
+        .pop()
+        .ok_or_else(|| ico_err("ICO directory contains no image"))?;
     let mut best_score = (
         best.bits_per_pixel,
         u32::from(best.real_width()) * u32::from(best.real_height()),
@@ -89,7 +97,7 @@ fn best_entry(mut entries: Vec<DirEntry>) -> ImageResult<DirEntry> {
 
 enum InnerDecoder<R: BufRead + Seek> {
     Bmp(BmpDecoder<R>),
-    Png(Box<PngDecoder<R>>),
+    Png(Box<PngDecoder<'static, R>>),
 }
 
 /// ICO 解码器。
@@ -185,7 +193,9 @@ impl<R: BufRead + Seek> ImageDecoder for IcoDecoder<R> {
         match self.inner_decoder {
             InnerDecoder::Png(decoder) => {
                 if self.selected_entry.image_length < PNG_SIGNATURE.len() as u32 {
-                    return Err(ico_err("Entry specified a length that is shorter than PNG header!"));
+                    return Err(ico_err(
+                        "Entry specified a length that is shorter than PNG header!",
+                    ));
                 }
                 let (width, height) = decoder.dimensions();
                 if !self.selected_entry.matches_dimensions(width, height) {

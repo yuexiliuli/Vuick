@@ -50,8 +50,15 @@ impl FileHeader {
 }
 
 /// Adam7 七遍：pass k 持有列 `X0 + i·Dx`、行 `Y0 + j·Dy` 的像素（PNG 规范 §8.2）。
-pub(crate) const ADAM7_PASSES: [(usize, usize, usize, usize); 7] =
-    [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
+pub(crate) const ADAM7_PASSES: [(usize, usize, usize, usize); 7] = [
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+];
 
 /// 一遍在一侧的像素数（图像不足以到达其起始位时返回 0）。
 #[inline]
@@ -67,6 +74,12 @@ pub(crate) fn pass_extent(size: usize, start: usize, step: usize) -> usize {
 /// 膨胀出声明图像所需字节，伪造头在到达分配前就被拒（防解压炸弹，不 OOM）。
 const MAX_INFLATE_RATIO: u64 = 1032;
 const MAX_INFLATE_SLACK: u64 = 1024;
+
+/// 载荷完整性取舍：IDAT 载荷跳过逐块 CRC32（内容完整性非显示必需——deflate 结构 + 末尾
+/// Adler-32 已由解压后端校验，位翻转要么解压报错、要么像素失真，与 png crate 解码路径
+/// 「内容位不逐块校验」等价；且 IDAT 是体积大头，大图下逐块 CRC 是纯固定开销）。关键头块
+/// （IHDR/PLTE/tRNS，以及 eXIf 等小附属块）仍逐块校验。想恢复严格校验把此常量置 true。
+const VERIFY_IDAT_CRC: bool = false;
 
 fn err_decode(msg: impl Into<String>) -> ImageError {
     ImageError::Decoding(DecodingError::new(
@@ -114,15 +127,18 @@ pub(crate) fn parse_png(data: &[u8]) -> ImageResult<FileHeader> {
             data[pos + 8 + len + 2],
             data[pos + 8 + len + 3],
         ]);
-        // 校验块 CRC：与 png crate 默认行为一致（目录也含类型 4 字节）。
-        let mut crc_ctx = crc32fast::Hasher::new();
-        crc_ctx.update(chunk_type);
-        crc_ctx.update(payload);
-        if declared != crc_ctx.finalize() {
-            return Err(err_decode(format!(
-                "块 '{:?}' 在第 {pos} 字节 CRC 不匹配：声明 0x{declared:08X}",
-                String::from_utf8_lossy(chunk_type)
-            )));
+        // 校验块 CRC：关键头块（IHDR/PLTE/tRNS 等小块）逐块校验；IDAT 按 `VERIFY_IDAT_CRC`
+        // 取舍跳过（见常量注释），"目录也含类型 4 字节"（与 png crate 默认行为一致）。
+        if VERIFY_IDAT_CRC || chunk_type != b"IDAT" {
+            let mut crc_ctx = crc32fast::Hasher::new();
+            crc_ctx.update(chunk_type);
+            crc_ctx.update(payload);
+            if declared != crc_ctx.finalize() {
+                return Err(err_decode(format!(
+                    "块 '{:?}' 在第 {pos} 字节 CRC 不匹配：声明 0x{declared:08X}",
+                    String::from_utf8_lossy(chunk_type)
+                )));
+            }
         }
 
         match chunk_type {
@@ -231,9 +247,14 @@ pub(crate) fn parse_png(data: &[u8]) -> ImageResult<FileHeader> {
     }
 
     // 防炸弹预检：期望解压字节数 vs 压缩量（伪造头在分配前被拒）。
+    // `inflated_size` 已对恶意超大尺寸饱和；此处比较用 saturating 防 `compressed*1032` 本身溢出。
     let inflated_size = inflated_size(w, h, depth, ct, interlace == 1);
     let compressed: u64 = idat_chunks.iter().map(|&(_, l)| l as u64).sum();
-    if inflated_size > compressed * MAX_INFLATE_RATIO + MAX_INFLATE_SLACK {
+    if inflated_size
+        > compressed
+            .saturating_mul(MAX_INFLATE_RATIO)
+            .saturating_add(MAX_INFLATE_SLACK)
+    {
         return Err(err_decode(format!(
             "{compressed} 字节图像数据无法膨胀出 {w}×{h} 图像所需的 {inflated_size} 字节"
         )));
@@ -324,15 +345,17 @@ pub(crate) fn inflated_size(
     .samples_per_pixel();
     let bits_per_pixel = samples * bit_depth as usize;
     let row_bytes_for = |w: usize| -> u64 { ((w as u64 * bits_per_pixel as u64) + 7) / 8 };
+    // 恶意头（如 max×max）会让「每行字节数 × 行数」溢出 u64；此处饱和到 u64::MAX，
+    // 后续防炸弹比例检查（`inflated_size > compressed*1032`）必然命中拒绝——不许 panic（K：解压炸弹 CHECKED）。
     if !interlaced {
-        return (row_bytes_for(width as usize) + 1) * height as u64;
+        return (row_bytes_for(width as usize) + 1).saturating_mul(height as u64);
     }
     let mut total = 0u64;
     for (x0, y0, dx, dy) in ADAM7_PASSES {
         let pw = pass_extent(width as usize, x0, dx);
         let ph = pass_extent(height as usize, y0, dy);
         if pw > 0 && ph > 0 {
-            total += (row_bytes_for(pw) + 1) * ph as u64;
+            total = total.saturating_add((row_bytes_for(pw) + 1).saturating_mul(ph as u64));
         }
     }
     total

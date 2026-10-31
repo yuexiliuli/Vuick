@@ -6,11 +6,12 @@ pub(crate) mod ico;
 pub(crate) mod jpeg;
 pub mod png;
 pub(crate) mod pngsimd;
+pub(crate) mod png_encoder;
 pub(crate) mod pnm;
 pub(crate) mod tiff;
 pub mod webp;
 
-use std::io::{BufRead, Seek};
+use std::io::{BufRead, Cursor, Seek};
 
 use crate::color::ColorType;
 use crate::error::{ImageError, ImageResult, UnsupportedError, UnsupportedErrorKind};
@@ -20,8 +21,11 @@ use crate::metadata::Orientation;
 use crate::{ImageDecoder, ImageFormatHint};
 
 /// 按格式分发到具体解码器的通用解码器（供 `ImageReader` 使用）。
-pub enum GenericDecoder<R: BufRead + Seek> {
-    Png(png::PngDecoder<R>),
+///
+/// 生命周期 `'a` 仅为 PNG 零拷贝路径携带（Png 变体可借用外部输入切片）；其余格式一律自有输入，
+/// `'a` 仅协变透传，不影响使用。
+pub enum GenericDecoder<'a, R: BufRead + Seek> {
+    Png(png::PngDecoder<'a, R>),
     Jpeg(jpeg::JpegDecoder<R>),
     Gif(gif::GifDecoder<R>),
     WebP(webp::WebPDecoder<R>),
@@ -31,8 +35,9 @@ pub enum GenericDecoder<R: BufRead + Seek> {
     Pnm(pnm::PnmDecoder<R>),
 }
 
-impl<R: BufRead + Seek> GenericDecoder<R> {
+impl<'a, R: BufRead + Seek> GenericDecoder<'a, R> {
     /// 按格式构造解码器；不支持的格式返回 `Unsupported`。
+    /// PNG 走「通用读取器 → 读入自有输入」路径（内存切片读者用 [`Self::new_slice`] 零拷贝）。
     pub(crate) fn new(format: ImageFormat, reader: R) -> ImageResult<Self> {
         use ImageFormat::*;
         match format {
@@ -54,7 +59,26 @@ impl<R: BufRead + Seek> GenericDecoder<R> {
     }
 }
 
-impl<R: BufRead + Seek> ImageDecoder for GenericDecoder<R> {
+/// 特判：内存切片读者 `Cursor<&[u8]>` 的零拷贝构造入口（A1，对应 `load_from_memory` 的
+/// `&[u8]` 输入经 `Cursor` 包装的路径）。PNG 直接借用输入切片（不整份复制，省一次 MB 级
+/// memcpy 与峰值内存）；其余格式沿用 [`Self::new`] 通用读取路径。
+/// （裸 `&[u8]` 不实现 `Seek`，故泛型 `GenericDecoder<R: BufRead+Seek>` 不实例化它——
+/// 裸切片由 `PngDecoder::from_slice` 直接承接，见 `free_functions.rs`。）
+impl<'a> GenericDecoder<'a, Cursor<&'a [u8]>> {
+    /// 由 `Cursor<&[u8]>` 构造（`load_from_memory` 的内存字节路径）。
+    pub(crate) fn new_slice(format: ImageFormat, reader: Cursor<&'a [u8]>) -> ImageResult<Self> {
+        match format {
+            ImageFormat::Png => {
+                // 借用 reader 里的外部切片（数据在调用方，'a = 调用方 buf 存活期）。
+                let dec = png::PngDecoder::from_slice(reader.get_ref())?;
+                Ok(GenericDecoder::Png(dec))
+            }
+            _ => GenericDecoder::new(format, reader),
+        }
+    }
+}
+
+impl<'a, R: BufRead + Seek> ImageDecoder for GenericDecoder<'a, R> {
     fn dimensions(&self) -> (u32, u32) {
         match self {
             GenericDecoder::Png(d) => d.dimensions(),
