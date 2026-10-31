@@ -13,3 +13,5 @@ docs/
 /dist
 
 fixtures/*
+
+.cargo/config.toml
