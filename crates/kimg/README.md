@@ -2,64 +2,77 @@
 
 纯 Rust 图像解码/编码 crate，`image 0.25.10` 的 API 兼容镜像，供 gpui-editor 全仓泛用解码路径（`ImageReader→decode→to_rgba8`）直接替换 crates.io `image`。许可 Apache-2.0 自持，不引入 AGPL 等传染性依赖。
 
-与 `image` 的关系：在同一组纯 Rust 后端的**逐位对齐复用**下重挂裁切——PNG/GIF/WebP/JPEG/TIFF 直接复用 `image 0.25.10` 自身依赖锁定的后端（其中 JPEG 与 image 同用 `zune-jpeg`，保证字节级一致性）；BMP/ICO/PNM 为仓内手写实现，补齐 image 自带的解析能力。
+与 `image` 的关系：PNG、WebP 为仓内自研核心（PNG 全链路 pngsimd + png_encoder；WebP container + VP8L + VP8 + ALPH），GIF/JPEG/TIFF 复用既有第三方纯 Rust 后端（JPEG 为 `zune-jpeg`，与 image 同源保证字节级一致性）；BMP/ICO/PNM 为仓内手写实现，补齐 image 自带的解析能力。
 
 ## 支持格式
 
 | 方向 | 格式 | 后端 | 备注 |
 |---|---|---|---|
-| decode | PNG | png crate | 16bit / Adam7 |
-| decode | JPEG | zune-jpeg | baseline + progressive + CMYK（与 image 0.25.10 同后端） |
-| decode | WebP | image-webp | 有损 / 无损 / alpha / 动画 |
+| decode | PNG | 自研 pngsimd | 16bit / Adam7 / 调色板 / 1–4bit |
+| decode | WebP | 自研 container + VP8L + VP8 + ALPH | 有损 / 无损 / alpha / lossy-alpha；动画走 image-webp 兜底 |
 | decode | GIF | gif crate | 动画合成 |
-| decode | BMP | 手写 | 含 RLE / bitfields |
-| decode | ICO | 手写（容器） | PNG + BMP 条目 |
-| decode | PNM | 手写 | P1–P7 / PAM |
+| decode | JPEG | zune-jpeg | baseline + progressive + CMYK |
+| decode | BMP | kimg 手写 | 含 RLE / bitfields |
+| decode | ICO | kimg 手写（容器） | PNG + BMP 条目 |
+| decode | PNM | kimg 手写 | P1–P7 / PAM |
 | decode | TIFF | tiff crate | — |
-| encode | PNG | png crate | — |
+| encode | PNG | 自研 png_encoder | fdeflate + adler32 自产，零 png crate 运行时依赖 |
 | encode | GIF | gif crate | — |
-| encode | JPEG | 无 | 测试夹具走 libjpeg-turbo-rs |
+| encode | WebP / JPEG | 无 | JPEG 测试夹具走 libjpeg-turbo-rs |
 
 ## 性能对比（关键交付）
 
-同口径：`cargo run -p imgbench`（debug），语料固化在 `target/imgbench-corpus`（83 文件，gitignore），逐格式 `total_ms` / `median_ms`。before = `image 0.25.10`（提交 `98dd1f3`），after = kimg（当前提交 `1874281`）。相对变化为 after vs before，`+` = 变慢、`-` = 变快。
+口径：release / opt-level=3、本机、多轮**中位**。语料 `target/imgbench-corpus`（PNG 34 真图；WebP 116+ 含 2400×3600 大图）。
 
-| 格式 | 文件数 | before total | after total | before median | after median | total 变化 | median 变化 |
-|---|---|---|---|---|---|---|---|
-| bmp | 6 | 7583.8 | 8381.0 | 1262.87 | 1387.66 | +10.5% | +9.9% |
-| gif | 7 | 32166.9 | 23959.0 | 4523.92 | 3194.16 | **−25.5%** | **−29.4%** |
-| ico | 1 | 4.1 | 4.3 | 4.10 | 4.28 | +4.9% | +4.4% |
-| jpg | 19 | 14987.2 | 15795.3 | 903.28 | 949.08 | +5.4% | +5.1% |
-| png | 34 | 15014.5 | 16332.1 | 226.66 | 231.45 | +8.8% | +2.1% |
-| webp | 16 | 12171.1 | 12868.2 | 671.74 | 715.26 | +5.7% | +6.5% |
+**PNG**（imgbench corpus，34 真图）：
 
-体积/依赖面对比：
+| 参照 | corpus 相对时间 | 说明 |
+|---|---|---|
+| vs `png` crate | ≈0.85~0.92（反超） | 灰度 / 调色板 / 16bit 快，rgba8 ≈1.0 |
+| vs libpng 1.6.0（vendored，SSE2） | ≈0.70（≈快 1.4×） | 全场景快 |
 
-| 项 | before（image 0.25.10） | after（kimg） | 变化 |
+关键点：双核管道（inflate∥unfilter+expand）、Paeth FPNGE 全 8 位 lane SSE4.1/AVX2、IDAT CRC 跳过、`unfilter_to` 零额外拷贝。
+
+**WebP**（webp_release_bench，语料 116+）：
+
+| 模式 | vs image-webp | vs libwebp 1.6.0 SIMD | 说明 |
 |---|---|---|---|
-| exe（debug，`target\debug\gpui-editor.exe`） | 70,194,688 B | 58,920,960 B | **−16.1%** |
-| Cargo.lock image 依赖树 | 37 个包条目 | 19 个包条目（image 包本身已移除，留存 kimg 复用后端） | −18 条目 |
+| lossy | ≈0.74×（快 26%） | ≈1.51×（起点 2.4×） | 自研接管静态族 |
+| lossless | ≈1.29×（慢） | ≈1.5× | 熵层未 bundle，头号优化点 |
 
-结论如实：**解码吞吐与 image 基本持平**——bmp/ico/jpg/png/webp 差异均在 debug 噪声带内（约 ±2% ~ +10%，单文件数少时抖动明显），GIF 出现较明显加速（−25~29%，动画合成路径）；**体积与依赖面显著下降**是替换的核心收益。不做「凭空加速」的夸大表述。自研的 BMP/ICO/PNM 解码路径凭手写实现维持与 image 内置实现同一量级。
+SIMD：YUV→RGB SSE4.1（2.5×）、帧内预测 SSSE3（端到端 −9%）、IDCT SSE2（−4%）、VP8L subtract-green / argb→rgba SSE；环路滤波三轮实证无益→维持标量。多线程：VP8 双线程重建∥滤波管道（libwebp `-mt` 式，宽图 1.62–1.72×）。
+
+结论如实：lossy 静态 WebP 与 PNG 主路径均反超既有参照，lossless WebP 仍慢于 image-webp；不做「凭空加速」的夸大表述。
+
+## 引擎开关
+
+| 变量 | 取值 | 说明 |
+|---|---|---|
+| `KIMG_WEBP_BACKEND` | `ours` / `imagewebp` / `auto` | AUTO 默认仍 image-webp，ours 接管静态族 |
+| `KIMG_WEBP_NO_SIMD` | `1` | 关闭 WebP SIMD 路径 |
+| `KIMG_WEBP_THREADS` | `0` / `1` / `2` / `auto` | VP8 双线程重建∥滤波 |
+| `KIMG_PNG_LEVEL` | `A` / `B` / `auto` | unfilter 引擎档位 |
+| `KIMG_PNG_PIPELINE` | `1` | 双核 inflate∥unfilter+expand 管道 |
+| `KIMG_PNG_PAETH_LEGACY` | `1` | 回退标量 Paeth 实现 |
 
 ## 方法与复现
 
 ```powershell
-cargo run -p imgbench   # debug；语料 target/imgbench-corpus（gitignore，不含仓库）
+cargo bench -p imgbench --bench png_release_bench [--features libpng-ref]
+cargo bench -p imgbench --bench webp_release_bench --features libpng-ref  # libwebp-sys vendored 1.6.0 SIMD
 ```
 
-- 语料：镜像 gpui/editor 泛用解码路径（`ImageReader→decode→to_rgba8`；GIF 走 `into_frames`），83 文件固化于 `target/imgbench-corpus`。
-- 方法学（debug 相对比较）：debug ≈ release 的 ~10×，只看**相对变化**与稳定子项，不看绝对值；窗宽抖动与单格式样本数有限时，±10% 内视为噪声持平，不做显著性断言。
-- 基准命令即 `imgbench` crate（`crates/imgbench`），其 Cargo 依赖已从 `image` 改为 `kimg`。
+- 语料：`target/imgbench-corpus`（gitignore，不入仓库）+ 外部 `E:\Rust\SimdCodecs\测试图片`；kimg 测试经 `tests/fixtures/webp/mod.rs` 解析外部语料，缺则 SKIP。
+- 方法学：release / opt-level=3、本机、多轮中位；debug ≈ release 的 ~10×，只看相对变化。
 
 ## 已知缺口 / 边界
 
-- 16bit PNG 直测样例缺（解码路径已实现，缺语料覆盖）。
-- BMP RLE / bitfields 缺真机样例（手写路径无真实样本回归）。
-- TIFF 样例缺。
-- JPEG 编码无（`image` 侧 JPEG 编码亦经 libjpeg 系，测试夹具走 libjpeg-turbo-rs）。
+- WebP 动画未自研（image-webp 兜底）。
+- 已知 10 个 webp 小/大文件 vs image-webp/libwebp 有记录未判失败的 diff（详见 docs 交接 §3.2/§4 与 `VP8_EXTRA_DIFF`/`VP8L_EXTRA_DIFF` 打印），不作决断、只如实记录。
+- 16bit PNG / BMP RLE / TIFF 真机样例缺（parity 靠合成/语料）。
+- WebP / JPEG 编码无（JPEG 测试夹具走 libjpeg-turbo-rs）。
 - APNG 不支持（与 `image 0.25` 默认一致）。
 
 ## 许可 / 归属
 
-kimg 本体 Apache-2.0 自持；后端 `png`/`gif`/`image-webp`/`tiff`/`zune-jpeg`/`zune-core` 各依其自身许可证。
+kimg 本体 Apache-2.0 自持；后端 `gif`/`image-webp`（动画兜底）/`tiff`/`zune-jpeg`/`zune-core` 各依其自身许可证；fixtures golden 源 sdcb/SimdCodecs 为 MIT。
