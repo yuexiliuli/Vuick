@@ -13,6 +13,11 @@ png = "0.17.16"
 # 可选对照通道：vendored 静态 libpng 1.6（cmake 构建）。仅 `libpng-ref` feature 下启用
 # （libpng-src 是其自带 build-dependency，无需在此重复声明）。默认不构建，避免污染懒编译面。
 libpng-vendored-sys = { version = "0.1.2", optional = true }
+# 可选对照通道：vendored 静态 libwebp 1.6.0（cc 源码构建静态库，非 cmake）。
+# x64 MSVC 无 config.h 构建下，libwebp src/dsp/cpu.h 的 WEBP_MSC_SSE2/SSE41/AVX2（MSVC>=1700）
+# 自动开启 SSE2/SSE4.1/AVX2 且走运行时 CPU 检测（VP8GetCPUInfo），即本通道为 SIMD 版。
+# 仅 `libwebp-ref` feature 下启用；kimg/editor 主链不消费本 crate，默认不构建避免污染懒编译面。
+libwebp-sys = { version = "0.14.4", optional = true }
 # flate2：默认 rust_backend（miniz_oxide 纯 Rust），供夹具编码（ZlibEncoder）与假面对照；
 # `inflate-probe` feature 给同一 flate2 叠加 `zlib-ng` backend（C 构建，cmake+MSVC），
 # 借以对比 fdeflate 纯 Rust 与 C zlib-ng 的纯解压差距。imgbench 是 bench-only 非 default
@@ -28,6 +33,10 @@ stage-profile = ["kimg/stage_profile"]
 # 启用 libpng 1.6 真机对照通道（bench 专用）。未启用时 benches/png_release_bench.rs
 # 的 libpng 列输出 N/A。kimg/editor 主链不消费本 crate，故该 C 构建不影响主链依赖图。
 libpng-ref = ["dep:libpng-vendored-sys"]
+# 启用 libwebp 1.6.0 SIMD 真机对照通道（bench 专用）。未启用时 benches/webp_release_bench.rs
+# 的 libwebp 列输出 N/A。kimg 的 WebP 后端（image-webp 0.2.4 纯 Rust）走 kimg 公开 API 即可，
+# 无需此 feature；该 C 构建同样不影响主链依赖图。
+libwebp-ref = ["dep:libwebp-sys"]
 # IDAT 解压后端对比探针（fdeflate 纯 Rust vs C zlib-ng），量化「纯解压天花板」。imgbench
 # 专属 dev 探针；feature 未开时 benches/inflate_probe.rs 打印 N/A。
 inflate-probe = ["flate2/zlib-ng"]
@@ -38,6 +47,9 @@ inflate-probe = ["flate2/zlib-ng"]
 crc32fast = "1.4"
 # inflate 探针的纯 Rust 基准（与 kimg 锁版本一致：lock 0.3.7，也是 png crate 自身的解压后端）。
 fdeflate = "0.3"
+# image-webp crate 0.2.4 直连对照通道（纯 Rust WebP 解码，kimg 的 WebP 后端同为 0.2.4，见
+# kimg/src/codecs/webp.rs）。仅 bench 使用，故只入 dev-dependencies；默认图里该版本已随 kimg 出现。
+image-webp = "0.2.4"
 
 [[bench]]
 name = "png_release_bench"
@@ -52,4 +64,9 @@ harness = false
 [[bench]]
 name = "stage_parse_probe"
 # 自定义输出格式（PARSE_PROBE 行），不用 Cargo 默认 bench harness。
+harness = false
+
+[[bench]]
+name = "webp_release_bench"
+# 自定义输出格式（WEBP_RELEASE_BENCH 行），不用 Cargo 默认 bench harness。
 harness = false

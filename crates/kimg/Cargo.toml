@@ -41,6 +41,9 @@ flate2 = "1.1"
 # png 0.17.16 仅测试/基准用——解码读回逐字节对照（tests/encode_self.rs 的 cross oracle）、
 # png_port_parity / png_port_bench / idat_backend_bench 的参照端。imgbench 属基准对照 crate，保留 png。
 png = "0.17.16"
+# WebP oracle harness（tests/webp_oracle.rs）：对 fixture 算 dwebp golden 同款 sha256(RGBA)
+# 逐 fixture 对比；与 SimdCodecs WebpOracleTests.cs 的哈希口径一致。
+sha2 = "0.10"
 # inflate 后端的一次性对比微基准（idat_backend_bench `#[ignore]`）需要拿 zlib-rs / zune-inflate
 # 与 fdeflate 对照以复跑选型结论——仅 dev，不进入运行时依赖面（结论见上方 fdeflate 注释）。
 zlib-rs = "0.6.8"
