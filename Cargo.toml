@@ -223,7 +223,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
 ]
 [profile.release]
-opt-level = "z"        # 优化目标改为最小体积（而非速度）
+opt-level = 3           # 优化目标改为速度（图像解码/解压热路径带宽优先）
 lto = true             # 跨 crate 链接时优化，消除重复代码
 strip = true           # 剥离符号表和调试信息
 panic = "abort"        # 移除 unwind 表

@@ -8,3 +8,48 @@ description = "图像解码性能基准（image 基线 / kimg 替换后对比）
 
 [dependencies]
 kimg = { workspace = true }
+# 对照通道：png crate 0.17 解码（EXPAND 语义对齐）。lock 已锁定 0.17.16。
+png = "0.17.16"
+# 可选对照通道：vendored 静态 libpng 1.6（cmake 构建）。仅 `libpng-ref` feature 下启用
+# （libpng-src 是其自带 build-dependency，无需在此重复声明）。默认不构建，避免污染懒编译面。
+libpng-vendored-sys = { version = "0.1.2", optional = true }
+# flate2：默认 rust_backend（miniz_oxide 纯 Rust），供夹具编码（ZlibEncoder）与假面对照；
+# `inflate-probe` feature 给同一 flate2 叠加 `zlib-ng` backend（C 构建，cmake+MSVC），
+# 借以对比 fdeflate 纯 Rust 与 C zlib-ng 的纯解压差距。imgbench 是 bench-only 非 default
+# member、主链无人消费，故 C 构建不影响主链。绝不进 kimg 主线（见 benches/inflate_probe.rs）。
+# 注意：同一包不允许 dev+optional 双名并存（Cargo 报 multiple times），故只作普通依赖。
+flate2 = "1.1"
+
+[features]
+default = []
+# 转发 kimg 的 stage_profile 探针：PNG_RELEASE_BENCH 同场景输出 `STAGE` 分阶段计时行
+# （运行前设 KIMG_PNG_STAGE_PROFILE=1；KIMG_PNG_NO_SIMD=1 可量化 SIMD 收益）。
+stage-profile = ["kimg/stage_profile"]
+# 启用 libpng 1.6 真机对照通道（bench 专用）。未启用时 benches/png_release_bench.rs
+# 的 libpng 列输出 N/A。kimg/editor 主链不消费本 crate，故该 C 构建不影响主链依赖图。
+libpng-ref = ["dep:libpng-vendored-sys"]
+# IDAT 解压后端对比探针（fdeflate 纯 Rust vs C zlib-ng），量化「纯解压天花板」。imgbench
+# 专属 dev 探针；feature 未开时 benches/inflate_probe.rs 打印 N/A。
+inflate-probe = ["flate2/zlib-ng"]
+
+[dev-dependencies]
+# 仅 bench 夹具构建用：手工 Adam7 PNG 需要 zlib 压缩（ZlibEncoder）、chunk CRC 用 crc32fast。
+# （flate2 本体在 [dependencies]，此处只留 crc32fast。）
+crc32fast = "1.4"
+# inflate 探针的纯 Rust 基准（与 kimg 锁版本一致：lock 0.3.7，也是 png crate 自身的解压后端）。
+fdeflate = "0.3"
+
+[[bench]]
+name = "png_release_bench"
+# 自定义输出格式（PNG_RELEASE_BENCH 行），不用 Cargo 默认 bench harness。
+harness = false
+
+[[bench]]
+name = "inflate_probe"
+# 自定义输出格式（INFLATE_PROBE 行），不用 Cargo 默认 bench harness。
+harness = false
+
+[[bench]]
+name = "stage_parse_probe"
+# 自定义输出格式（PARSE_PROBE 行），不用 Cargo 默认 bench harness。
+harness = false
