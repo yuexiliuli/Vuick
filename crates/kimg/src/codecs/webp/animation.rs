@@ -176,14 +176,34 @@ fn decode_frames_parallel(
     Some(results.into_iter().map(|r| r.unwrap()).collect())
 }
 
+/// #2 内存护栏：自研动画构建期全量解码全部帧（`OursAnimated.frames` 各持一帧 RGBA，
+/// n×画布峰值，K76），对真尺寸大动画该峰值可能与画布×帧数同量级。按保守上界
+/// `帧数×画布宽×高×4 + 画布宽×高×4`（每帧最多全画布）估算；超 `KIMG_WEBP_ANIM_CAP_MB`
+/// （默认 256MB）→ `decode_animation` 返回 None，`WebPDecoder::new` 自动落到 image-webp
+/// 后端的流式动画解码（无 n×画布峰值）。小 fixture 远低于阈值，行为不变仍自研接管。
+fn anim_mem_estimate_exceeds_cap(c: &super::container::WebpContainer) -> bool {
+    let canvas_bytes = u64::from(c.width) * u64::from(c.height) * 4;
+    let estimate = canvas_bytes.saturating_mul(c.frames.len() as u64 + 1);
+    let cap_mb = std::env::var("KIMG_WEBP_ANIM_CAP_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(256);
+    estimate > cap_mb.saturating_mul(1024 * 1024)
+}
+
 /// 自研动画解码入口：后端允许 + 家族=Animated 时由 `WebPDecoder::new` 调用。
 /// 返回 `Some(ours)` 表示接管成功；`None` 表示不可接管（回 image-webp 兜底）。
+/// 入口先走 #2 内存护栏：预估内存超阈值 → 直接 `Ok(None)` 放弃自研接管（不付解码成本）。
 pub(crate) fn decode_animation(data: &[u8]) -> ImageResult<Option<OursAnimated>> {
     let c = match container::parse(data) {
         Ok(c) => c,
         Err(_) => return Ok(None),
     };
     if c.family != container::Family::Animated {
+        return Ok(None);
+    }
+    // #2 内存护栏：预估超阈值 → 回 image-webp 后端动画解码（持续流式合成，无 n×画布峰值）。
+    if anim_mem_estimate_exceeds_cap(&c) {
         return Ok(None);
     }
     let frames = match decode_frames_parallel(data, &c.frames) {
@@ -408,8 +428,9 @@ impl CanvasCompositor {
         }
     }
 
-    /// 合成一帧（dispose → 覆盖/混合），返回合成后全画布 RGBA 快照。
-    pub(crate) fn compose(&mut self, f: &AnimatedRawFrame) -> Vec<u8> {
+    /// 把一帧合成进工作缓冲并推进 dispose/blend 帧间状态（`compose`/`compose_to` 共用；
+    /// dispose/blend 语义与 image-webp 对齐，见 `composite_frame`）。
+    fn composite_into_canvas(&mut self, f: &AnimatedRawFrame) {
         let clear_color = if self.dispose_next_frame {
             self.background_color
         } else {
@@ -449,7 +470,32 @@ impl CanvasCompositor {
         self.previous_width = f.width;
         self.previous_height = f.height;
         self.dispose_next_frame = f.dispose_to_background;
+    }
+
+    /// 合成一帧（dispose → 覆盖/混合），返回合成后全画布 RGBA 快照（`first_frame_rgba` 用：
+    /// 整图读取仅取首帧，非播放热路径，直接 clone）。
+    pub(crate) fn compose(&mut self, f: &AnimatedRawFrame) -> Vec<u8> {
+        self.composite_into_canvas(f);
         self.canvas.clone()
+    }
+
+    /// 合成一帧并把全画布快照**单次直出**到 `out`（#4 优化）。
+    /// 合并旧的「`compose` 返回 `self.canvas.clone()` → 非 alpha 再整画布 repack 重建新 Vec」
+    /// 两遍整画布拷贝为一遍：`rgba_out=true` 直拷 RGBA；`false` 逐像素单遍 RGB+255 直写
+    /// （输出尺寸同为 w*h*4，逐字节与旧的「clone 后再 repack」完全一致）。dispose/blend
+    /// 仍先在 RGBA 工作缓冲完成（跨帧状态依赖真 alpha），快照才在末了单遍产出。
+    pub(crate) fn compose_to(&mut self, f: &AnimatedRawFrame, out: &mut Vec<u8>, rgba_out: bool) {
+        self.composite_into_canvas(f);
+        out.clear();
+        if rgba_out {
+            out.extend_from_slice(&self.canvas);
+        } else {
+            out.resize(self.canvas.len(), 0);
+            for (dst, src) in out.chunks_exact_mut(4).zip(self.canvas.chunks_exact(4)) {
+                dst[..3].copy_from_slice(&src[..3]);
+                dst[3] = 255;
+            }
+        }
     }
 }
 
@@ -481,19 +527,11 @@ impl Iterator for OursFramesIterator {
     fn next(&mut self) -> Option<Self::Item> {
         let f = self.frames.next()?;
         let delay = f.duration_ms;
-        let canvas = self.composer.compose(&f);
-        let buf = if self.has_alpha_flag {
-            canvas
-        } else {
-            // RGB8 → RGBA8（补 A=255），对齐现 image-webp 路径的读帧转换语义。
-            let mut rgba = Vec::with_capacity(canvas.len() / 4 * 4);
-            for px in canvas.chunks_exact(4) {
-                rgba.extend_from_slice(&px[..3]);
-                rgba.push(255);
-            }
-            rgba
-        };
-        let img = RgbaImage::from_raw(self.width, self.height, buf).expect("画布尺寸与帧快照一致");
+        // #4：合成时直出快照到临时缓冲（alpha 直拷 / 非 alpha RGB+255 单遍直写），
+        // 替代旧「compose 返回 clone + 非 alpha 再 repack」两遍整画布拷贝。
+        let mut canvas = Vec::new();
+        self.composer.compose_to(&f, &mut canvas, self.has_alpha_flag);
+        let img = RgbaImage::from_raw(self.width, self.height, canvas).expect("画布尺寸与帧快照一致");
         Some(Ok(Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(delay, 1))))
     }
 }
@@ -640,6 +678,35 @@ mod tests {
             errors.len()
         );
         assert!(checked >= 8, "至少 8 个动画 fixture 应对拍，实际 {checked}");
+    }
+
+    /// #2 内存护栏：预估内存超 `KIMG_WEBP_ANIM_CAP_MB` → 自研动画接管让位 image-webp
+    /// 兜底（`decode_animation` 返回 None）；复位 cap 后小 fixture 仍自研接管。
+    /// （env 读写沿用既有 `KIMG_WEBP_THREADS` 测试姿势：本模块按 `--test-threads=1` 串行跑。）
+    #[test]
+    fn anim_cap_fallback_to_imagewebp() {
+        set_webp_backend(BACKEND_AUTO);
+        let Some(data) = webp_fixtures_support::webp_fixture_path("anim-webpmux-combinations.webp")
+            .map(|p| std::fs::read(p).unwrap())
+        else {
+            eprintln!("SKIP anim-webpmux-combinations.webp 外部语料缺失");
+            return;
+        };
+        // 默认 cap（256MB）：小 fixture 必须被自研接管。
+        assert!(
+            decode_animation(&data)
+                .expect("decode_animation 不应 Err")
+                .is_some(),
+            "默认 cap 下小动画 fixture 应被自研接管"
+        );
+        // cap=0：预估必超阈值 → 触发回退（`WebPDecoder::new` 会落 image-webp 动画）。
+        unsafe { std::env::set_var("KIMG_WEBP_ANIM_CAP_MB", "0") };
+        let guarded = decode_animation(&data).expect("decode_animation 不应 Err");
+        unsafe { std::env::remove_var("KIMG_WEBP_ANIM_CAP_MB") };
+        assert!(
+            guarded.is_none(),
+            "cap=0 时应放弃自研动画解码（回 image-webp 兜底）"
+        );
     }
 
     /// 帧级并行解码与串行逐字节一致（先解码并行、后合成串行管道的硬闸）。
