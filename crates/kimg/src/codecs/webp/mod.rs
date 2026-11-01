@@ -19,6 +19,7 @@ use crate::metadata::Orientation;
 use crate::pixel::Rgba;
 use crate::{AnimationDecoder, ImageDecoder};
 
+pub(crate) mod animation;
 pub(crate) mod container;
 pub(crate) mod simd;
 pub(crate) mod vp8;
@@ -107,6 +108,8 @@ enum WebPDecoderInner<R> {
     },
     /// 自研路径：容器 + VP8L 静态无损已解码缓冲（P2 起启用）。
     Ours(OursStatic),
+    /// 自研动画路径：ANMF 帧原始解码 + 画布合成（P6 起启用，`KIMG_WEBP_BACKEND=ours`）。
+    OursAnimated(animation::OursAnimated),
 }
 
 /// WebP 解码器（支持有损/无损/带 alpha/动画；P2 起无损静态族可走自研内核）。
@@ -126,9 +129,18 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
         }
 
         if ours_allowed() {
-            // 容器解析判定家族：VP8L 静态无损 / VP8 静态有损 → 自研接管（解码兜到
-            // `decode_static_lossless` / `decode_static_lossy`；其余家族本期仍落 image-webp 兜底）。
+            // 容器解析判定家族：VP8L 静态无损 / VP8 静态有损 / 动画 → 自研接管（解码兜到
+            // `decode_static_lossless` / `decode_static_lossy` / `decode_animation`；其余家族
+            // 本期仍落 image-webp 兜底）。
             if let Ok(c) = container::parse(&data) {
+                if c.family == container::Family::Animated {
+                    if let Some(ours) = crate::codecs::webp::animation::decode_animation(&data)? {
+                        return Ok(Self {
+                            inner: WebPDecoderInner::OursAnimated(ours),
+                            orientation: None,
+                        });
+                    }
+                }
                 if c.family.is_static_lossless() {
                     if let Some(ours) = crate::codecs::webp::decode_static_lossless(&data)? {
                         return Ok(Self {
@@ -166,6 +178,7 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
         match &self.inner {
             WebPDecoderInner::ImageWebp { dec, .. } => dec.is_animated(),
             WebPDecoderInner::Ours(_) => false,
+            WebPDecoderInner::OursAnimated(_) => true,
         }
     }
 
@@ -176,6 +189,12 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 .set_background_color(color.0)
                 .map_err(ImageError::from_kimg_webp),
             WebPDecoderInner::Ours(_) => Ok(()),
+            // 记录背景色，`into_frames` 合成时按 image-webp 语义使用：
+            // Some(0,0,0,0)=透明画布 + dispose 清矩形为透明黑；None=dispose 不清矩形。
+            WebPDecoderInner::OursAnimated(anim) => {
+                anim.background_color = Some(color.0);
+                Ok(())
+            }
         }
     }
 }
@@ -185,6 +204,7 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
         match &self.inner {
             WebPDecoderInner::ImageWebp { dec, .. } => dec.dimensions(),
             WebPDecoderInner::Ours(o) => (o.width, o.height),
+            WebPDecoderInner::OursAnimated(a) => (a.width, a.height),
         }
     }
 
@@ -204,6 +224,14 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                     ColorType::Rgb8
                 }
             }
+            // 与 image-webp `has_alpha()` 口径一致（VP8X alpha flag）。
+            WebPDecoderInner::OursAnimated(a) => {
+                if a.has_alpha_flag {
+                    ColorType::Rgba8
+                } else {
+                    ColorType::Rgb8
+                }
+            }
         }
     }
 
@@ -213,6 +241,7 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                 .exif_metadata()
                 .map_err(ImageError::from_kimg_webp)?,
             WebPDecoderInner::Ours(o) => o.exif.as_ref().cloned(),
+            WebPDecoderInner::OursAnimated(a) => a.exif.as_ref().cloned(),
         };
         self.orientation = Some(
             exif.as_ref()
@@ -228,6 +257,7 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                 .icc_profile()
                 .map_err(ImageError::from_kimg_webp)?,
             WebPDecoderInner::Ours(o) => o.icc.as_ref().cloned(),
+            WebPDecoderInner::OursAnimated(a) => a.icc.as_ref().cloned(),
         })
     }
 
@@ -237,6 +267,7 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                 .xmp_metadata()
                 .map_err(ImageError::from_kimg_webp)?,
             WebPDecoderInner::Ours(o) => o.xmp.clone(),
+            WebPDecoderInner::OursAnimated(a) => a.xmp.as_ref().cloned(),
         })
     }
 
@@ -278,6 +309,40 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                 }
                 Ok(())
             }
+            // 动画整图读取 = 首帧（image-webp 语义）。
+            WebPDecoderInner::OursAnimated(a) => {
+                let (canvas, w, h) = match animation::first_frame_rgba(&a) {
+                    Some(v) => v,
+                    None => {
+                        return Err(ImageError::Decoding(DecodingError::new(
+                            ImageFormat::WebP.into(),
+                            "Ours 动画无帧可读",
+                        )))
+                    }
+                };
+                if a.has_alpha_flag {
+                    let target = (w as usize) * (h as usize) * 4;
+                    if buf.len() != target {
+                        return Err(ImageError::Decoding(DecodingError::new(
+                            ImageFormat::WebP.into(),
+                            "Ours 动画解码缓冲长度与像素缓冲不一致",
+                        )));
+                    }
+                    buf.copy_from_slice(&canvas);
+                } else {
+                    let target = (w as usize) * (h as usize) * 3;
+                    if buf.len() != target {
+                        return Err(ImageError::Decoding(DecodingError::new(
+                            ImageFormat::WebP.into(),
+                            "Ours 动画解码缓冲长度与像素缓冲不一致",
+                        )));
+                    }
+                    for (px, out) in canvas.chunks_exact(4).zip(buf.chunks_exact_mut(3)) {
+                        out.copy_from_slice(&px[..3]);
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -291,6 +356,14 @@ impl<'a, R: 'a + BufRead + Seek> AnimationDecoder<'a> for WebPDecoder<R> {
         let img = match &self.inner {
             WebPDecoderInner::ImageWebp { dec, .. } => dec,
             WebPDecoderInner::Ours(_) => return LoopCount::Finite(1.try_into().unwrap()),
+            WebPDecoderInner::OursAnimated(a) => {
+                return if a.loop_count == 0 {
+                    LoopCount::Infinite
+                } else {
+                    // image-webp 口径：非 0 存值直传（0 才映射 Forever）。
+                    LoopCount::Finite(a.loop_count.try_into().unwrap())
+                }
+            }
         };
         match img.loop_count() {
             image_webp::LoopCount::Forever => LoopCount::Infinite,
@@ -299,60 +372,62 @@ impl<'a, R: 'a + BufRead + Seek> AnimationDecoder<'a> for WebPDecoder<R> {
     }
 
     fn into_frames(self) -> Frames<'a> {
-        struct FramesInner {
-            decoder: Option<image_webp::WebPDecoder<Cursor<Vec<u8>>>>,
-            current: u32,
-            width: u32,
-            height: u32,
-        }
-        impl Iterator for FramesInner {
-            type Item = ImageResult<Frame>;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                let dec = self.decoder.as_mut()?;
-                if self.current == dec.num_frames() {
-                    return None;
-                }
-                self.current += 1;
-
-                let (img, delay) = if dec.has_alpha() {
-                    let mut img = RgbaImage::new(self.width, self.height);
-                    match dec.read_frame(img.as_mut()) {
-                        Ok(delay) => (img, delay),
-                        Err(image_webp::DecodingError::NoMoreFrames) => return None,
-                        Err(e) => return Some(Err(ImageError::from_kimg_webp(e))),
-                    }
-                } else {
-                    let mut img = RgbImage::new(self.width, self.height);
-                    match dec.read_frame(img.as_mut()) {
-                        Ok(delay) => {
-                            // RGB → RGBA。
-                            let mut rgba = RgbaImage::new(self.width, self.height);
-                            for (x, y, p) in img.enumerate_pixels() {
-                                rgba.put_pixel(x, y, Rgba([p[0], p[1], p[2], 255]));
-                            }
-                            (rgba, delay)
-                        }
-                        Err(image_webp::DecodingError::NoMoreFrames) => return None,
-                        Err(e) => return Some(Err(ImageError::from_kimg_webp(e))),
-                    }
-                };
-
-                Some(Ok(Frame::from_parts(
-                    img,
-                    0,
-                    0,
-                    Delay::from_numer_denom_ms(delay, 1),
-                )))
+        let frames = match self.inner {
+            // 自研动画：逐帧合成迭代器（背景色/合成语义已在构造时定稿）。
+            WebPDecoderInner::OursAnimated(anim) => {
+                return Frames::new(Box::new(animation::OursFramesIterator::new(anim)))
             }
-        }
-
-        match self.inner {
-            WebPDecoderInner::Ours(_) => {
-                // 自研静态无损：非动画，无帧。
-                Frames::new(Box::new(std::iter::empty()))
-            }
+            // 自研静态无损：非动画，无帧。
+            WebPDecoderInner::Ours(_) => Frames::new(Box::new(std::iter::empty())),
             WebPDecoderInner::ImageWebp { dec, .. } => {
+                struct FramesInner {
+                    decoder: Option<image_webp::WebPDecoder<Cursor<Vec<u8>>>>,
+                    current: u32,
+                    width: u32,
+                    height: u32,
+                }
+                impl Iterator for FramesInner {
+                    type Item = ImageResult<Frame>;
+
+                    fn next(&mut self) -> Option<Self::Item> {
+                        let dec = self.decoder.as_mut()?;
+                        if self.current == dec.num_frames() {
+                            return None;
+                        }
+                        self.current += 1;
+
+                        let (img, delay) = if dec.has_alpha() {
+                            let mut img = RgbaImage::new(self.width, self.height);
+                            match dec.read_frame(img.as_mut()) {
+                                Ok(delay) => (img, delay),
+                                Err(image_webp::DecodingError::NoMoreFrames) => return None,
+                                Err(e) => return Some(Err(ImageError::from_kimg_webp(e))),
+                            }
+                        } else {
+                            let mut img = RgbImage::new(self.width, self.height);
+                            match dec.read_frame(img.as_mut()) {
+                                Ok(delay) => {
+                                    // RGB → RGBA。
+                                    let mut rgba = RgbaImage::new(self.width, self.height);
+                                    for (x, y, p) in img.enumerate_pixels() {
+                                        rgba.put_pixel(x, y, Rgba([p[0], p[1], p[2], 255]));
+                                    }
+                                    (rgba, delay)
+                                }
+                                Err(image_webp::DecodingError::NoMoreFrames) => return None,
+                                Err(e) => return Some(Err(ImageError::from_kimg_webp(e))),
+                            }
+                        };
+
+                        Some(Ok(Frame::from_parts(
+                            img,
+                            0,
+                            0,
+                            Delay::from_numer_denom_ms(delay, 1),
+                        )))
+                    }
+                }
+
                 let (width, height) = dec.dimensions();
                 Frames::new(Box::new(FramesInner {
                     decoder: Some(dec),
@@ -361,7 +436,8 @@ impl<'a, R: 'a + BufRead + Seek> AnimationDecoder<'a> for WebPDecoder<R> {
                     height,
                 }))
             }
-        }
+        };
+        frames
     }
 }
 
@@ -462,7 +538,8 @@ pub(crate) fn decode_static_lossy(
 
 /// 解码并反滤波 ALPH chunk（`alpha_chunk[0]` 为头字节）为 alpha 平面（w*h 字节）。
 /// 与 C# `WebpDecoder.DecodeAndUnfilterAlpha` 同款（压缩 0/1 + 滤波 0-3 全支持）。
-fn decode_and_unfilter_alpha(alpha_chunk: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+/// 供动画帧（VP8+ALPH）与静态 LossyAlpha 共用。
+pub(crate) fn decode_and_unfilter_alpha(alpha_chunk: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     if alpha_chunk.is_empty() {
         return None;
     }

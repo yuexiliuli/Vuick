@@ -79,7 +79,12 @@ pub(crate) struct WebpContainerFrame {
 pub(crate) struct WebpContainer<'a> {
     pub width: u32,
     pub height: u32,
+    /// 启发式 alpha 判定（含首帧几何/后续 dispose 推导，见下方 `has_alpha` 计算）。
     pub has_alpha: bool,
+    /// VP8X features 原始 alpha 位（0x10）。与 image-webp `has_alpha()` 口径一致（动画输出
+    /// RGBA8 vs RGB8 的判定键）。动画时 `has_alpha` 可能与该位不一致（启发式差异），
+    /// 故单独暴露供动画阶段复刻 image-webp 语义。
+    pub alpha_flag: bool,
     pub format: WebpFormat,
     pub frame_count: u32,
     pub family: Family,
@@ -488,6 +493,7 @@ pub(crate) fn parse(data: &[u8]) -> Result<WebpContainer<'_>, ContainerError> {
         width: canvas_w,
         height: canvas_h,
         has_alpha,
+        alpha_flag,
         format,
         frame_count,
         family,
