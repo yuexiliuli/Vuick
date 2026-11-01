@@ -189,6 +189,34 @@ fn turbo_version() -> &'static str {
     "libjpeg-turbo-rs 0.8 (pure-Rust, SSE2/AVX2 SIMD)"
 }
 
+/// 临时对照通道：kimg 替换前的 `image` crate 0.25.10 BMP 解码（生产姿态 to_rgba8），
+/// 返回 RGBA8 字节数。仅 `image-ref` feature 启用（测完即删）。
+#[cfg(feature = "image-ref")]
+fn image_crate_decode_bmp(bytes: &[u8]) -> Option<usize> {
+    let img = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Bmp)
+        .decode()
+        .ok()?;
+    let rgba = img.to_rgba8();
+    let expected = (rgba.width() as usize)
+        .saturating_mul(rgba.height() as usize)
+        .saturating_mul(4);
+    let len = rgba.into_raw().len();
+    if len != expected {
+        return None;
+    }
+    Some(len)
+}
+
+#[cfg(feature = "image-ref")]
+fn image_ref_version() -> &'static str {
+    "image crate 0.25.10 (替换前后端)"
+}
+
+#[cfg(not(feature = "image-ref"))]
+fn image_ref_version() -> &'static str {
+    "n/a (feature image-ref 未启用)"
+}
+
 #[cfg(not(feature = "libjpeg-turbo-ref"))]
 fn turbo_version() -> &'static str {
     "n/a (feature libjpeg-turbo-ref 未启用)"
@@ -266,8 +294,27 @@ fn bench_scenario(
                 },
                 rounds,
             );
+            #[cfg(feature = "image-ref")]
+            {
+                let img_ms = median_ms(
+                    || {
+                        for (_, _, b) in files {
+                            let _ = image_crate_decode_bmp(b).expect("探测已保证可解");
+                        }
+                    },
+                    rounds,
+                );
+                println!(
+                    "GIF_JPEG_BMP_RELEASE_BENCH Bmp files={} kimg={:.3}ms image_crate={img_ms:.3}ms ratio_kimg_vs_image={:.3}",
+                    files.len(),
+                    kimg_ms,
+                    kimg_ms / img_ms
+                );
+                return;
+            }
+            #[cfg(not(feature = "image-ref"))]
             println!(
-                "GIF_JPEG_BMP_RELEASE_BENCH Bmp files={} kimg={:.3}ms turbo=N/A (BMP 无 turbo 对照)",
+                "GIF_JPEG_BMP_RELEASE_BENCH Bmp files={} kimg={:.3}ms turbo=N/A (BMP 无 turbo 对照; 启用 --features image-ref 可与 image crate 对比)",
                 files.len(),
                 kimg_ms
             );
