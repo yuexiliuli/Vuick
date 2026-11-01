@@ -179,6 +179,14 @@ impl DynamicImage {
     pub fn to_rgba8(&self) -> RgbaImage {
         match self {
             DynamicImage::ImageRgba8(x) => x.clone(),
+            // Rgb8→Rgba8 是纯 3→4 扩写（alpha 恒 255）：走 SSSE3 快道（有 SIMD 时），
+            // 字节恒等于逐像素 `px.to_rgba()`（K53 测量：像素循环 22.7ms/8.6MP 是大头）。
+            DynamicImage::ImageRgb8(img) => {
+                let (w, h) = img.dimensions();
+                let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+                crate::codecs::webp::simd::rgb8_to_rgba8(img.as_raw(), &mut out);
+                RgbaImage::from_raw(w, h, out).expect("尺寸已校验")
+            }
             x => {
                 let (w, h) = x.dimensions();
                 let mut out = RgbaImage::new(w, h);

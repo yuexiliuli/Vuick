@@ -1364,7 +1364,7 @@ fn prepare_above(
     uv_pitch: usize,
     mbx: usize,
     mby: usize,
-    width: usize,
+    mbw: usize,
 ) {
     if mby == 0 {
         above_y.fill(127);
@@ -1399,24 +1399,36 @@ fn prepare_above(
         above_v[1 + c] = v[ul + 1 + mbx * 8 + c];
     }
     let right = mbx * 16 + 16;
-    if right + 4 <= width {
+    if mbx + 1 < mbw {
+        // 非末列宏块：右上 4 像素取上一行真实重建值（右侧宏块上行的列 right..right+4；
+        // 右缘不完整宏块情形下这些列可能落在 padded 区，但同为上一行已重建定稿的字节）。
         for i in 0..4 {
             above_y[17 + i] = y[yl + 1 + right + i];
         }
     } else {
-        for i in 0..4 {
-            above_y[17 + i] = y[yl + 1 + (right + i).min(width - 1)];
+        // 末列宏块：镜像本宏块上行第 16 列（列 mbx*16+15，padded 末位）——与参照
+        // image-webp `create_border_luma` 的 `mbx == mbw-1` 分支逐字节一致。此前用
+        // `(right + i).min(width - 1)` 夹到可见末列，右缘不完整宏块下与该参照偏差
+        // （RFC 6386 右缘 B_PRED 子块 LD/VL 引用右上像素时错一源，宽 W%16 图右缘偏出）。
+        let mirror = y[yl + 1 + mbx * 16 + 15];
+        for a in above_y[17..21].iter_mut() {
+            *a = mirror;
         }
     }
 }
 
-/// 分阶段计时（性能探针用）：`#[cfg(not(test))]` 下为 `f()` 直通（零开销、不手写重复），
-/// `#[cfg(test)]` 下累计各阶段耗时（只读不改写，字节不受影响）。探针 `lossy_stage_split_big`
-/// 在 release 测试二进制里跑真墙钟，输出熵/预测/变换/滤波各占比以定热点投入方向（K53）。
+/// 分阶段计时（性能探针用）：
+/// - 普通构建（无 feature、非 test）：全部为 `f()` 直通（零开销、不手写重复）。
+/// - `cfg(test)`：累计各阶段耗时到进程级原子（只读不改写，字节不受影响）。探针
+///   `lossy_stage_split_big` 在 release 测试二进制里跑真墙钟，输出熵/预测/变换/滤波占比。
+/// - `cfg(feature="stage_profile")`：release 分账用，各阶段**恒计时**到进程级原子（跨滤波
+///   线程安全），供 imgbench `vp8_stage_probe`（K59 统一基座 / K53 测量先行）。
 pub(crate) mod stage_clock {
     #[cfg(test)]
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-    #[cfg(test)]
+    use std::sync::atomic::AtomicBool;
+    #[cfg(any(test, feature = "stage_profile"))]
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    #[cfg(any(test, feature = "stage_profile"))]
     use std::time::Instant;
 
     #[cfg(test)]
@@ -1429,6 +1441,35 @@ pub(crate) mod stage_clock {
     static IDCT: AtomicU64 = AtomicU64::new(0);
     #[cfg(test)]
     static FILTER: AtomicU64 = AtomicU64::new(0);
+
+    // release stage_profile 分账累计（进程级原子：滤波线程/主线程分属两线程，均 fetch_add）。
+    #[cfg(feature = "stage_profile")]
+    static P_ENTROPY: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_PREDICT: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_IDCT: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_FILTER: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_YUV: AtomicU64 = AtomicU64::new(0);
+    // 主线程 scope 前后串行段（帧头解析+熵 init / 末段紧密平面拷贝）分账累计（K53 测量先行）。
+    #[cfg(feature = "stage_profile")]
+    static P_HEADER: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_COPY: AtomicU64 = AtomicU64::new(0);
+    // 管道 scope 墙钟（主线程，join 阻塞含 worker 全跑；K53 定位 pipeline slack）。
+    #[cfg(feature = "stage_profile")]
+    static P_SCOPE: AtomicU64 = AtomicU64::new(0);
+    // 管道前 setup（分配+平面 memset+装饰器/熵 init）墙钟（主线程；K53 分账）。
+    #[cfg(feature = "stage_profile")]
+    static P_SETUP: AtomicU64 = AtomicU64::new(0);
+    // 管道前 setup 与 scope 之间的剩余（token 解码器/above/row_filters 分配）墙钟（主线程）。
+    #[cfg(feature = "stage_profile")]
+    static P_MID: AtomicU64 = AtomicU64::new(0);
+    // scope join 后、返回前的尾段（Vp8Yuv 构建 + planes 释放）墙钟（主线程）。
+    #[cfg(feature = "stage_profile")]
+    static P_END: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(test)]
     pub fn set(on: bool) {
@@ -1452,80 +1493,549 @@ pub(crate) mod stage_clock {
         )
     }
 
-    #[cfg(test)]
-    #[inline]
-    pub fn entropy<R>(f: impl FnOnce() -> R) -> R {
-        if !ON.load(Relaxed) {
-            return f();
-        }
-        let t = Instant::now();
-        let r = f();
-        ENTROPY.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-        r
+    /// 清零一次解码的分账累计（`stage_profile` 入口 `stage_decode` 调用）。
+    #[cfg(feature = "stage_profile")]
+    pub fn reset_profile() {
+        P_ENTROPY.store(0, Relaxed);
+        P_PREDICT.store(0, Relaxed);
+        P_IDCT.store(0, Relaxed);
+        P_FILTER.store(0, Relaxed);
+        P_YUV.store(0, Relaxed);
+        P_HEADER.store(0, Relaxed);
+        P_COPY.store(0, Relaxed);
+        P_SCOPE.store(0, Relaxed);
+        P_SETUP.store(0, Relaxed);
+        P_MID.store(0, Relaxed);
+        P_END.store(0, Relaxed);
     }
-    #[cfg(test)]
-    #[inline]
-    pub fn predict<R>(f: impl FnOnce() -> R) -> R {
-        if !ON.load(Relaxed) {
-            return f();
-        }
-        let t = Instant::now();
-        let r = f();
-        PREDICT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-        r
-    }
-    #[cfg(test)]
-    #[inline]
-    pub fn idct<R>(f: impl FnOnce() -> R) -> R {
-        if !ON.load(Relaxed) {
-            return f();
-        }
-        let t = Instant::now();
-        let r = f();
-        IDCT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-        r
-    }
-    #[cfg(test)]
-    #[inline]
-    pub fn filter<R>(f: impl FnOnce() -> R) -> R {
-        if !ON.load(Relaxed) {
-            return f();
-        }
-        let t = Instant::now();
-        let r = f();
-        FILTER.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-        r
+    /// 读取一次解码各阶段累计 ns：(entropy, predict, idct, filter, yuv, header, copy, scope, setup, mid, end)。
+    #[cfg(feature = "stage_profile")]
+    pub fn profile_totals() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+        (
+            P_ENTROPY.load(Relaxed),
+            P_PREDICT.load(Relaxed),
+            P_IDCT.load(Relaxed),
+            P_FILTER.load(Relaxed),
+            P_YUV.load(Relaxed),
+            P_HEADER.load(Relaxed),
+            P_COPY.load(Relaxed),
+            P_SCOPE.load(Relaxed),
+            P_SETUP.load(Relaxed),
+            P_MID.load(Relaxed),
+            P_END.load(Relaxed),
+        )
     }
 
-    #[cfg(not(test))]
     #[inline(always)]
     pub fn entropy<R>(f: impl FnOnce() -> R) -> R {
-        f()
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_ENTROPY.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            #[cfg(test)]
+            {
+                if !ON.load(Relaxed) {
+                    return f();
+                }
+                let t = Instant::now();
+                let r = f();
+                ENTROPY.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                return r;
+            }
+            #[cfg(not(test))]
+            {
+                f()
+            }
+        }
     }
-    #[cfg(not(test))]
     #[inline(always)]
     pub fn predict<R>(f: impl FnOnce() -> R) -> R {
-        f()
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_PREDICT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            #[cfg(test)]
+            {
+                if !ON.load(Relaxed) {
+                    return f();
+                }
+                let t = Instant::now();
+                let r = f();
+                PREDICT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                return r;
+            }
+            #[cfg(not(test))]
+            {
+                f()
+            }
+        }
     }
-    #[cfg(not(test))]
     #[inline(always)]
     pub fn idct<R>(f: impl FnOnce() -> R) -> R {
-        f()
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_IDCT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            #[cfg(test)]
+            {
+                if !ON.load(Relaxed) {
+                    return f();
+                }
+                let t = Instant::now();
+                let r = f();
+                IDCT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                return r;
+            }
+            #[cfg(not(test))]
+            {
+                f()
+            }
+        }
     }
-    #[cfg(not(test))]
     #[inline(always)]
     pub fn filter<R>(f: impl FnOnce() -> R) -> R {
-        f()
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_FILTER.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            #[cfg(test)]
+            {
+                if !ON.load(Relaxed) {
+                    return f();
+                }
+                let t = Instant::now();
+                let r = f();
+                FILTER.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                return r;
+            }
+            #[cfg(not(test))]
+            {
+                f()
+            }
+        }
     }
+    /// YUV 定稿直出（fancy 上采样 + YUV→RGBA）阶段计时：普通/测试构建直通，`stage_profile`
+    /// 下累计到 `P_YUV`。`emit_rows_into_rgba`（串行 + P-B 滤波线程两路径）调用。
+    #[inline(always)]
+    pub fn yuv<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_YUV.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// 帧头解析 + 熵 init（主线程，管道开启前）计时：`stage_profile` 下累计到 `P_HEADER`。
+    #[inline(always)]
+    pub fn header<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_HEADER.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// 末段紧密平面抽取（主线程，scope join 后）计时：`stage_profile` 下累计到 `P_COPY`。
+    #[inline(always)]
+    pub fn copy<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_COPY.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// 管道 scope 整段墙钟：`stage_profile` 下累计到 `P_SCOPE`（主线程 join 阻塞全景）。
+    #[inline(always)]
+    pub fn scope_wall<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_SCOPE.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// 管道前 setup（分配+平面 memset）墙钟：`stage_profile` 下累计到 `P_SETUP`。
+    #[inline(always)]
+    pub fn setup<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_SETUP.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// setup 与 scope 之间的剩余（token 解码器/above/row_filters）：累计到 `P_MID`。
+    #[inline(always)]
+    pub fn mid<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_MID.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// scope join 后、返回前尾段（Vp8Yuv 构建 + planes 释放）：累计到 `P_END`。
+    #[inline(always)]
+    pub fn end<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_END.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+}
+
+/// VP8 有损阶帧分账（`stage_profile` feature 下由 `stage_decode` 填充；供 imgbench
+/// `vp8_stage_probe`，K59 统一基座）。本结构体无条件编译（供签名线程），计时仅 feature 下发生，
+/// feature 关闭时零运行时影响。
+#[cfg_attr(not(feature = "stage_profile"), allow(dead_code))]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Vp8StageProfile {
+    pub width: u32,
+    pub height: u32,
+    /// 熵解码（宏块模式 + 残差 token 解析 + bool+去量化）。
+    pub entropy_ns: u64,
+    /// 帧内预测（prepare_above + 16x16/8x8 平面预测）。
+    pub predict_ns: u64,
+    /// 逆变换（WHT + 4x4 IDCT(成对/单块) + B_PRED 子块预测）。
+    pub idct_ns: u64,
+    /// 环路滤波（filter_macroblock_row）。
+    pub filter_ns: u64,
+    /// YUV 定稿直出（fancy 上采样 + YUV→RGBA）。
+    pub yuv_ns: u64,
+    /// 帧头解析 + 熵 init（主线程，管道开启前；K53 分账）。
+    pub header_ns: u64,
+    /// 末段紧密平面抽取（主线程，scope join 后；K53 分账）。
+    pub copy_ns: u64,
+    /// 管道 `std::thread::scope` 整段墙钟（主线程 join 阻塞，含 worker 全跑 + 调度等待）。
+    pub scope_ns: u64,
+    /// 管道前 setup（planes memset + rgba 分配；主线程）。
+    pub setup_ns: u64,
+    /// setup 与 scope 之间剩余（token 解码器/above/row_filters 分配）。
+    pub mid_ns: u64,
+    /// scope join 后、返回前尾段（Vp8Yuv 构建）。
+    pub end_ns: u64,
+    /// 全链墙钟（含帧头解析与平面拷贝）。
+    pub total_ns: u64,
+    /// 是否走了 P-B 滤波线程管线（true 时 filter/yuv 在独立线程累计）。
+    pub pipelined: bool,
 }
 
 /// 完整解码：解析帧头 + 重建全部宏块 → 紧密 YUV 4:2:0（V2 暂不含环路滤波，V3 接入）。
 pub(crate) fn decode_vp8(frame: &[u8], width: u32, height: u32) -> Result<Vp8Yuv> {
-    let fh = parse_frame_header(frame)?;
+    let fh = stage_clock::header(|| parse_frame_header(frame))?;
     if fh.width != width || fh.height != height {
         return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
     }
     decode_from_header(fh)
+}
+
+/// 阶段分账解码（`stage_profile` feature 门控；供 imgbench `vp8_stage_probe`，K59 统一基座）。
+/// 与 [`decode_vp8`] 语义逐字节一致，另按【熵 / 预测 / 逆变换 / 环路滤波 / YUV 直出】统计各段
+/// 墙钟（进程级原子，P-B 滤波线程路径跨线程累计）。`frame` 为 VP8 帧载荷。仅计时（返回 profile）。
+#[cfg(feature = "stage_profile")]
+pub fn stage_decode(frame: &[u8], width: u32, height: u32) -> Result<Vp8StageProfile> {
+    use std::time::Instant;
+    stage_clock::reset_profile();
+    let t0 = Instant::now();
+    let yuv = decode_vp8(frame, width, height)?;
+    let total_ns = t0.elapsed().as_nanos() as u64;
+    std::hint::black_box(&yuv.rgba);
+    let (e, p, i, f, y, h, c, s, su, m, e2) = stage_clock::profile_totals();
+    Ok(Vp8StageProfile {
+        width,
+        height,
+        entropy_ns: e,
+        predict_ns: p,
+        idct_ns: i,
+        filter_ns: f,
+        yuv_ns: y,
+        header_ns: h,
+        copy_ns: c,
+        scope_ns: s,
+        setup_ns: su,
+        mid_ns: m,
+        end_ns: e2,
+        total_ns,
+        pipelined: filter_mt_enabled(
+            (width as usize + 15) / 16,
+            (height as usize + 15) / 16,
+        ),
+    })
+}
+
+/// 未初始化 `Vec<u8>`：调用方必须保证返回后 `len` 字节在被读取前全部写入（见各调用点
+/// Safety 注释）。省去 `vec![0u8; len]` 的全量 memset——大缓冲（RGBA 输出/紧密平面）零化
+/// 在主线程关键路径上（P-B 直出已覆盖全部字节），逐字节恒等。
+#[inline]
+unsafe fn uninit_vec_u8(len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len);
+    v.set_len(len);
+    v
+}
+
+// ---------------------------------------------------------------------------
+// 新 MT 管道（t1=串行熵 / t2=预测+IDCT+重建+滤波+YUV）的宏块行包与共享阶段函数。
+// 串行路径（`filter_mt_enabled`==false）与 MT 两路径共用 `entropy_macroblock` /
+// `reconstruct_macroblock` 同一函数体 → 逐字节一致是结构性成立（硬闸
+// `threads2_matches_serial_byte_exact` / `static_lossy_threads2_matches_serial_byte_exact`）。
+// ---------------------------------------------------------------------------
+
+/// 单宏块熵解码产物（t1 → t2 的唯一交接对象）。含去量化后的 i16 系数（DC 捷径/双指针核在
+/// `reconstruct_macroblock` 按串行同款复用，字节不变）。`Default` 全零 = 未写系数位恒 0。
+struct MbPacket {
+    y_mode: u8,
+    uv_mode: u8,
+    /// y_mode==4（16x16）时为真；调用方沿用本仓 `i16` 命名习惯（值命名空间可遮蔽原语类型名）。
+    i16: bool,
+    nonzero_mask: u32,
+    ac_mask: u32,
+    b_modes: [u8; 16],
+    mb: [[i16; 16]; 25],
+}
+
+impl Default for MbPacket {
+    fn default() -> Self {
+        MbPacket {
+            y_mode: 0,
+            uv_mode: 0,
+            i16: false,
+            nonzero_mask: 0,
+            ac_mask: 0,
+            b_modes: [0; 16],
+            mb: [[0i16; 16]; 25],
+        }
+    }
+}
+
+/// 单一宏块行的完成包：`mbs[mbx]`（t2 重建输入）+ `filters[mbx]`（t2 滤波输入，原行滤波参数表
+/// `(level, inner)`）。随通道按序交给 t2，t2 依序重建行 r 后滤行 r-1（串行同序）。整包按值
+/// 移动（零大块拷贝）；t1 只持有通道发送端。
+struct RowPacket {
+    filters: Vec<(u8, u8)>,
+    mbs: Vec<MbPacket>,
+}
+
+/// 单宏块熵解码（模式 + 残差 token + 去量化），产出 [`MbPacket`] 与行滤波参数 `(level, inner)`。
+/// 逐条对应原 `decode_from_header::reconstruct_row` 的「阶段一」，只是把 `mb`/`b_modes` 收进
+/// 包（每宏块零初始化，与串行 mb 复用数组在「写入前全零」语义上等价——未写位恒 0）。
+/// 熵态（`header`/`td` bool 解码器与 `above_nz`/`left_nz`/`above_b`/`left_b`）全程留在 t1。
+#[allow(clippy::too_many_arguments)]
+fn entropy_macroblock(
+    header: &mut Vp8BoolDecoder<'_>,
+    td: &mut Vp8BoolDecoder<'_>,
+    segment_probs: Option<&[u8; 3]>,
+    skip_probability: i32,
+    probs: &[u8],
+    seg_params: &[SegmentParameters; 4],
+    above_b: &mut [u8; 4],
+    left_b: &mut [u8; 4],
+    above_nz: &mut u32,
+    left_nz: &mut u32,
+    pkt: &mut MbPacket,
+) -> (u8, u8) {
+    let (y_mode, uv_mode, is_i16, sp, masks) = stage_clock::entropy(|| {
+        let modes = read_macroblock_modes(header, segment_probs, skip_probability, above_b, left_b, &mut pkt.b_modes);
+        let segment = (modes & 3) as usize;
+        let skip = (modes & 4) != 0;
+        let y_mode = ((modes >> 3) & 7) as u8;
+        let uv_mode = (modes >> 6) as u8;
+        let is_i16 = y_mode != 4;
+        let sp = seg_params[segment];
+        let masks = if skip {
+            let keep = if is_i16 { 0 } else { NZ_Y2 };
+            *above_nz &= keep;
+            *left_nz &= keep;
+            0u64
+        } else {
+            parse_residuals(td, probs, &mut pkt.mb, &sp, is_i16, above_nz, left_nz)
+        };
+        (y_mode, uv_mode, is_i16, sp, masks)
+    });
+    pkt.y_mode = y_mode;
+    pkt.uv_mode = uv_mode;
+    pkt.i16 = is_i16;
+    pkt.nonzero_mask = masks as u32;
+    pkt.ac_mask = (masks >> 32) as u32;
+    let level = if is_i16 { sp.filter_level_i16 } else { sp.filter_level_i4 };
+    let inner = if pkt.nonzero_mask == 0 && is_i16 { 0u8 } else { 1u8 };
+    (level, inner)
+}
+
+/// 单宏块帧内预测 + 逆变换 + 残差写回（原 `decode_from_header`「阶段二/三」，逐字节不变）。
+/// t2 依序重建时 `prepare_above` 读到的上一行是**已重建未滤波**像素，与串行（整帧重建毕再滤波）
+/// 语义一致 → 字节恒等不依赖行顺序，只依赖「预测读未滤、滤波读已建」。`pkt.mb` 可变：
+/// WHT 把 DC 写入 luma 块、用后清零，与串行共享 `mb` 数组的写序完全同构。
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_macroblock(
+    y: &mut [u8],
+    y_pitch: usize,
+    u: &mut [u8],
+    v: &mut [u8],
+    uv_pitch: usize,
+    above_y: &mut [u8; 21],
+    above_u: &mut [u8; 9],
+    above_v: &mut [u8; 9],
+    mbx: usize,
+    mby: usize,
+    mbw: usize,
+    pkt: &mut MbPacket,
+) {
+    let nonzero_mask = pkt.nonzero_mask;
+    let ac_mask = pkt.ac_mask;
+    let is_i16 = pkt.i16;
+    let y_mode = pkt.y_mode;
+    let uv_mode = pkt.uv_mode;
+    let dy = mby * 16;
+    let dx = mbx * 16;
+    let dyu = mby * 8;
+    let dxu = mbx * 8;
+
+    stage_clock::predict(|| {
+        prepare_above(
+            above_y, above_u, above_v,
+            y, u, v, y_pitch, uv_pitch, mbx, mby, mbw,
+        );
+        if is_i16 {
+            super::simd::predict_large(y, y_pitch, dy, dx, 16, y_mode, mby > 0, mbx > 0, &above_y[..17]);
+        }
+        super::simd::predict_large(u, uv_pitch, dyu, dxu, 8, uv_mode, mby > 0, mbx > 0, &above_u[..9]);
+        super::simd::predict_large(v, uv_pitch, dyu, dxu, 8, uv_mode, mby > 0, mbx > 0, &above_v[..9]);
+    });
+
+    stage_clock::idct(|| {
+        let mb = &mut pkt.mb;
+        let b_modes = &pkt.b_modes;
+        if is_i16 && (nonzero_mask & NZ_Y2) != 0 {
+            let y2 = mb[24];
+            inverse_walsh_to_blocks(&y2, mb, (ac_mask & NZ_Y2) != 0);
+            mb[24].fill(0);
+        }
+
+        if is_i16 {
+            for by in 0..4 {
+                let row0 = dy + by * 4;
+                for pair_base in [0usize, 2] {
+                    let a = by * 4 + pair_base;
+                    let b = a + 1;
+                    if ((nonzero_mask >> a) & 1) != 0
+                        || mb[a][0] != 0
+                        || ((nonzero_mask >> b) & 1) != 0
+                        || mb[b][0] != 0
+                    {
+                        if (((ac_mask >> a) | (ac_mask >> b)) & 1) != 0 {
+                            super::simd::inverse_dct_add_two(
+                                &mb[a], &mb[b], y, y_pitch, row0, dx + pair_base * 4,
+                            );
+                        } else {
+                            super::simd::dc_add_two(
+                                mb[a][0], mb[b][0], y, y_pitch, row0, dx + pair_base * 4,
+                            );
+                        }
+                        mb[a].fill(0);
+                        mb[b].fill(0);
+                    }
+                }
+            }
+        } else {
+            for block in 0..16 {
+                let bx = block & 3;
+                let by = block >> 2;
+                let row0 = dy + by * 4;
+                let col0 = dx + bx * 4;
+                let above = subblock_above(y, y_pitch, row0, col0, bx, by, above_y);
+                super::simd::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
+                let coeff = mb[block];
+                if ((nonzero_mask >> block) & 1) != 0 || coeff[0] != 0 {
+                    inverse_dct_add(&coeff, y, y_pitch, row0, col0, ((ac_mask >> block) & 1) != 0);
+                    mb[block].fill(0);
+                }
+            }
+        }
+
+        if (nonzero_mask & 0xff0000) != 0 {
+            for a in [16usize, 18, 20, 22] {
+                let b = a + 1;
+                let row0 = dyu + ((a >> 1) & 1) * 4;
+                let nz_a = ((nonzero_mask >> a) & 1) != 0 || mb[a][0] != 0;
+                let nz_b = ((nonzero_mask >> b) & 1) != 0 || mb[b][0] != 0;
+                if !(nz_a || nz_b) {
+                    continue;
+                }
+                let has_ac = ((ac_mask >> a) | (ac_mask >> b)) & 1 != 0;
+                if a < 20 {
+                    if has_ac {
+                        super::simd::inverse_dct_add_two(&mb[a], &mb[b], u, uv_pitch, row0, dxu);
+                    } else {
+                        super::simd::dc_add_two(mb[a][0], mb[b][0], u, uv_pitch, row0, dxu);
+                    }
+                } else if has_ac {
+                    super::simd::inverse_dct_add_two(&mb[a], &mb[b], v, uv_pitch, row0, dxu);
+                } else {
+                    super::simd::dc_add_two(mb[a][0], mb[b][0], v, uv_pitch, row0, dxu);
+                }
+                mb[a].fill(0);
+                mb[b].fill(0);
+            }
+        }
+    });
 }
 
 fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
@@ -1541,227 +2051,194 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
     let uv_pitch = uw + 1;
     let seg_params = compute_segment_parameters(&fh.segments, &fh.quantizers, &fh.filter);
 
-    let mut y = vec![0u8; ch * y_pitch];
-    let mut u = vec![0u8; uh * uv_pitch];
-    let mut v = vec![0u8; uh * uv_pitch];
-    for r in 0..ch {
-        y[r * y_pitch] = 129;
-    }
-    for r in 0..uh {
-        u[r * uv_pitch] = 129;
-        v[r * uv_pitch] = 129;
-    }
+    // L3 分配收敛：y/u/v 三平面合一缓冲（按首尾分段），堆分配 3 → 1。解码全程不 realloc，
+    // 依赖其长度固定即指针稳定（与下方裸指针同前提）。字节恒等：合并仅改变分配粒度，
+    // 各段内容、写入次序与既有三 Vec 完全一致（全部字节仍在 129 左列初始化 + 重建覆盖内）。
+    let y_vec_len = ch * y_pitch;
+    let uv_vec_len = uh * uv_pitch;
+    let (mut planes, mut rgba, mut out_y, mut out_u, mut out_v) = stage_clock::setup(|| {
+        let mut planes = vec![0u8; y_vec_len + 2 * uv_vec_len];
+        {
+            let (y, uv_rest) = planes.split_at_mut(y_vec_len);
+            let (u, v) = uv_rest.split_at_mut(uv_vec_len);
+            for r in 0..ch {
+                y[r * y_pitch] = 129;
+            }
+            for r in 0..uh {
+                u[r * uv_pitch] = 129;
+                v[r * uv_pitch] = 129;
+            }
+        }
+        // 行定稿直出 RGBA 缓冲（整帧；worker/串行路径按 MB 行滚动填写）。
+        // L3：未初始化分配——两条直出路径（pipelined `filter_t3_loop` / 串行
+        // `filter_and_emit_serial`）都逐行写满 `[0,height)×width×4`，返回前无任何字节读 rgba，
+        // 错误路径直接 Err（不构造 Vp8Yuv），故省略全量 memset 逐字节不变（仅省零化墙钟）。
+        let rgba = unsafe { uninit_vec_u8(width * height * 4) };
+        // 紧密平面输出缓冲（真实宽高；Vp8Yuv API/测试仍需）。L3 未初始化：MT 由 t3 直出、
+        // 串行由尾段 `extract_tight_rows` 写满，返回前不被读，省略 memset 逐字节不变。
+        let cwu = (width + 1) / 2;
+        let chu = (height + 1) / 2;
+        let out_y = unsafe { uninit_vec_u8(width * height) };
+        let out_u = unsafe { uninit_vec_u8(cwu * chu) };
+        let out_v = unsafe { uninit_vec_u8(cwu * chu) };
+        (planes, rgba, out_y, out_u, out_v)
+    });
+    let (mut y, uv_rest) = planes.split_at_mut(y_vec_len);
+    let (mut u, mut v) = uv_rest.split_at_mut(uv_vec_len);
 
     let mut header = fh.header;
-    let partition_count = fh.partitions.len();
-    let mut token_decoders: Vec<Vp8BoolDecoder<'_>> =
-        fh.partitions.iter().map(|p| Vp8BoolDecoder::new(p)).collect();
-    let probs = fh.coefficient_probabilities;
-    let skip_probability = if fh.skip_flag_present {
-        i32::from(fh.skip_probability)
-    } else {
-        -1
-    };
-    let segment_probs: Option<&[u8; 3]> = if fh.segments.enabled && fh.segments.update_map {
-        Some(&fh.segments.map_probabilities)
-    } else {
-        None
-    };
+    let (
+        partition_count,
+        mut token_decoders,
+        probs,
+        skip_probability,
+        segment_probs,
+        mut above_b,
+        mut above_nz,
+        mut above_y,
+        mut above_u,
+        mut above_v,
+        mut row_filters,
+        pipelined,
+    ) = stage_clock::mid(|| {
+        let partition_count = fh.partitions.len();
+        let token_decoders: Vec<Vp8BoolDecoder<'_>> =
+            fh.partitions.iter().map(|p| Vp8BoolDecoder::new(p)).collect();
+        let probs = fh.coefficient_probabilities;
+        let skip_probability = if fh.skip_flag_present {
+            i32::from(fh.skip_probability)
+        } else {
+            -1
+        };
+        let segment_probs: Option<&[u8; 3]> = if fh.segments.enabled && fh.segments.update_map {
+            Some(&fh.segments.map_probabilities)
+        } else {
+            None
+        };
+        let mut above_b = vec![0u8; mbw * 4];
+        let mut above_nz = vec![0u32; mbw];
+        let above_y = [127u8; 21];
+        let above_u = [127u8; 9];
+        let above_v = [127u8; 9];
+        // 每行宏块的 (滤波等级, 是否滤内部边)，仅串行路径消费（MT 行包自带滤波参数）。
+        let row_filters = vec![(0u8, 0u8); mbw * mbh];
+        let pipelined = filter_mt_enabled(mbw, mbh);
+        (
+            partition_count,
+            token_decoders,
+            probs,
+            skip_probability,
+            segment_probs,
+            above_b,
+            above_nz,
+            above_y,
+            above_u,
+            above_v,
+            row_filters,
+            pipelined,
+        )
+    });
 
-    let mut above_b = vec![0u8; mbw * 4];
-    let mut above_nz = vec![0u32; mbw];
-    let mut b_modes = [0u8; 16];
-    let mut mb = [[0i16; 16]; 25];
-    let mut above_y = [127u8; 21];
-    let mut above_u = [127u8; 9];
-    let mut above_v = [127u8; 9];
-
-    // 每行宏块的 (滤波等级, 是否滤内部边)，供 V3。
-    let mut row_filters = vec![(0u8, 0u8); mbw * mbh];
-
-    // 滤波线程共享视图的裸指针（重建闭包借用前取；y/u/v/row_filters 长度固定不扩容，
-    // 解码全程不 reallocate，指针始终有效）。P-B 管道语义见 `filter_pipeline_thread`。
-    let (y_ptr, u_ptr, v_ptr) = (y.as_mut_ptr(), u.as_mut_ptr(), v.as_mut_ptr());
-    let (y_len, uv_len) = (y.len(), u.len()); // u 与 v 等长
-    let rf_ptr = row_filters.as_mut_ptr();
-    let rf_len = row_filters.len();
-
-    // P-B 真重叠管道（libwebp `-mt` 式：重建主线程逐行产出、滤波线程滞后 1 行消费）vs 串行
-    // （重建毕→整帧滤波）。两种路径输出逐字节一致（硬闸 `threads2_matches_serial_byte_exact`
-    // 与集成 `static_lossy_threads2_matches_serial_byte_exact`）。
-    let pipelined = filter_mt_enabled(mbw, mbh);
-    let mut reconstruct_row = |mby: usize| {
-        // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
-        let mut left_b = [0u8; 4];
-        let mut left_nz = 0u32;
-        // 行内复用该分区的 token 解码器（&mut 边界，熵态在宏块级函数内部寄存器驻留）。
-        let td = &mut token_decoders[mby & (partition_count - 1)];
-        for mbx in 0..mbw {
-            // 阶段一：熵解码。探针计时关闭时为零开销直通（字节不变）。
-            let (y_mode, uv_mode, i16, sp, masks) = stage_clock::entropy(|| {
-                let modes = {
-                    let above_m: &mut [u8; 4] = (&mut above_b[mbx * 4..mbx * 4 + 4]).try_into().unwrap();
-                    read_macroblock_modes(
+    if pipelined {
+        // 新 3 线程管道：t1(主) = 串行熵/去量化 → 依序产**行包**；t2 = 预测+IDCT+重建（planes_A，
+        // 恒未滤波）→ 依序把重建定稿行打包 `RowPixels` 交 t3；t3 = 在自有 planes_B 上滤波 +
+        // 行定稿直出 RGBA + 抽紧密平面。通道均 `sync_channel(2)` 按值移动，容量 2 = 上一级最多
+        // 领先 2 行，自然背压限内存。y/u/v(planes_A)/planes_B/rgba/out_* 各线程独占，零 unsafe。
+        // 字节恒等论证见 `recon_loop` / `filter_t3_loop`：planes_A 恒未滤波、planes_B 同源拷贝、
+        // 滤波/直出/抽取行序与串行完全一致 → 逐字节同（硬闸 threads2/static_lossy 覆盖）。
+        // 熵态（bool 解码器 / above_nz / above_b / left_*）全留 thread1。
+    std::thread::scope(|s| {
+        // 通道在 scope 闭包内创建：闭包返回时 `tx`/`tx2` 随其 drop（先于 scope 回收子线程），
+        // t2/t3 的 `rx.iter()` 随即收到断开（Err）→ 收尾退出，无死锁。
+        stage_clock::scope_wall(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RowPacket>(2);
+        let (tx2, rx2) = std::sync::mpsc::sync_channel::<RowPixels>(2);
+            let yb = &mut *y;
+            let ub = &mut *u;
+            let vb = &mut *v;
+            let rb = &mut *rgba;
+            let oy = &mut *out_y;
+            let ou = &mut *out_u;
+            let ov = &mut *out_v;
+            s.spawn(move || {
+                recon_loop(rx, tx2, yb, y_pitch, ub, vb, uv_pitch, mbw)
+            });
+            s.spawn(move || {
+                filter_t3_loop(rx2, y_pitch, uv_pitch, rb, oy, ou, ov, mbw, mbh, width, height, &fh.filter)
+            });
+            for mby in 0..mbh {
+                // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
+                let mut left_b = [0u8; 4];
+                let mut left_nz = 0u32;
+                // 行内复用该分区的 token 解码器（&mut 边界，熵态在宏块级函数内部寄存器驻留）。
+                let td = &mut token_decoders[mby & (partition_count - 1)];
+                let mut row = RowPacket {
+                    filters: Vec::with_capacity(mbw),
+                    mbs: Vec::with_capacity(mbw),
+                };
+                for mbx in 0..mbw {
+                    let above_b_slot: &mut [u8; 4] =
+                        (&mut above_b[mbx * 4..mbx * 4 + 4]).try_into().unwrap();
+                    // 就地填充：`MbPacket::default()` 直接写零进 Vec 槽位，`entropy_macroblock` 就地
+                    // 覆盖需解码字段 → 省去「栈零化 + 拷贝入 Vec」的整包搬移（每宏块 ~830B，t1 热路径）。
+                    row.mbs.push(MbPacket::default());
+                    let (level, inner) = entropy_macroblock(
                         &mut header,
+                        td,
                         segment_probs,
                         skip_probability,
-                        above_m,
+                        &probs,
+                        &seg_params,
+                        above_b_slot,
                         &mut left_b,
-                        &mut b_modes,
-                    )
-                };
-                let segment = (modes & 3) as usize;
-                let skip = (modes & 4) != 0;
-                let y_mode = ((modes >> 3) & 7) as u8;
-                let uv_mode = (modes >> 6) as u8;
-                let i16 = y_mode != 4;
-                let sp = seg_params[segment];
-                let masks = if skip {
-                    let keep = if i16 { 0 } else { NZ_Y2 };
-                    above_nz[mbx] &= keep;
-                    left_nz &= keep;
-                    0u64
-                } else {
-                    parse_residuals(td, &probs, &mut mb, &sp, i16, &mut above_nz[mbx], &mut left_nz)
-                };
-                (y_mode, uv_mode, i16, sp, masks)
-            });
-            let nonzero_mask = masks as u32;
-            let ac_mask = (masks >> 32) as u32;
-            let (lvl, inner) = {
-                let l = if i16 { sp.filter_level_i16 } else { sp.filter_level_i4 };
-                (l, if nonzero_mask == 0 && i16 { 0u8 } else { 1u8 })
-            };
-            row_filters[mby * mbw + mbx] = (lvl, inner);
-
-            let dy = mby * 16;
-            let dx = mbx * 16;
-            let dyu = mby * 8;
-            let dxu = mbx * 8;
-
-            // 阶段二：帧内预测。
-            stage_clock::predict(|| {
-                prepare_above(
-                    &mut above_y, &mut above_u, &mut above_v,
-                    &y, &u, &v, y_pitch, uv_pitch, mbx, mby, width,
-                );
-                if i16 {
-                    super::simd::predict_large(&mut y, y_pitch, dy, dx, 16, y_mode, mby > 0, mbx > 0, &above_y[..17]);
+                        &mut above_nz[mbx],
+                        &mut left_nz,
+                        row.mbs.last_mut().unwrap(),
+                    );
+                    row.filters.push((level, inner));
                 }
-                super::simd::predict_large(&mut u, uv_pitch, dyu, dxu, 8, uv_mode, mby > 0, mbx > 0, &above_u[..9]);
-                super::simd::predict_large(&mut v, uv_pitch, dyu, dxu, 8, uv_mode, mby > 0, mbx > 0, &above_v[..9]);
-            });
-
-            // 阶段三：逆变换 + 残差写回（亮块成对批处理；色度暂逐块隔离验证）。
-            stage_clock::idct(|| {
-                if i16 && (nonzero_mask & NZ_Y2) != 0 {
-                    let y2 = mb[24];
-                    inverse_walsh_to_blocks(&y2, &mut mb, (ac_mask & NZ_Y2) != 0);
-                    mb[24].fill(0);
+                if tx.send(row).is_err() {
+                    // worker 已退出（异常收尾）：中断产出，scope join 兜底。
+                    break;
                 }
-
-                if i16 {
-                    for by in 0..4 {
-                        let row0 = dy + by * 4;
-                        for pair_base in [0usize, 2] {
-                            let a = by * 4 + pair_base;
-                            let b = a + 1;
-                            if ((nonzero_mask >> a) & 1) != 0
-                                || mb[a][0] != 0
-                                || ((nonzero_mask >> b) & 1) != 0
-                                || mb[b][0] != 0
-                            {
-                                let ca = mb[a];
-                                let cb = mb[b];
-                                super::simd::inverse_dct_add_two(
-                                    &ca, &cb, &mut y, y_pitch, row0, dx + pair_base * 4,
-                                );
-                                mb[a].fill(0);
-                                mb[b].fill(0);
-                            }
-                        }
-                    }
-                } else {
-                    for block in 0..16 {
-                        let bx = block & 3;
-                        let by = block >> 2;
-                        let row0 = dy + by * 4;
-                        let col0 = dx + bx * 4;
-                        let above = subblock_above(&y, y_pitch, row0, col0, bx, by, &above_y);
-                        super::simd::predict_subblock(&mut y, y_pitch, row0, col0, b_modes[block], &above);
-                        let coeff = mb[block];
-                        if ((nonzero_mask >> block) & 1) != 0 || coeff[0] != 0 {
-                            inverse_dct_add(&coeff, &mut y, y_pitch, row0, col0, ((ac_mask >> block) & 1) != 0);
-                            mb[block].fill(0);
-                        }
-                    }
-                }
-
-                if (nonzero_mask & 0xff0000) != 0 {
-                    // 色度 8 块 = 4 个水平对（V 上原 brow = (block>>1)&1 循环 0,1,0,1）：
-                    // 对首块号 a ∈ {16,18,20,22}，行偏移 dyu + ((a>>1)&1)*4，列恒为 dxu
-                    // （对内第二个块 +4 由 inverse_dct_add_two 处理）；a<20 走 u，否则走 v。
-                    for a in [16usize, 18, 20, 22] {
-                        let b = a + 1;
-                        let row0 = dyu + ((a >> 1) & 1) * 4;
-                        let ca = mb[a];
-                        let cb = mb[b];
-                        let nz_a = ((nonzero_mask >> a) & 1) != 0 || ca[0] != 0;
-                        let nz_b = ((nonzero_mask >> b) & 1) != 0 || cb[0] != 0;
-                        if !(nz_a || nz_b) {
-                            continue;
-                        }
-                        if a < 20 {
-                            super::simd::inverse_dct_add_two(&ca, &cb, &mut u, uv_pitch, row0, dxu);
-                        } else {
-                            super::simd::inverse_dct_add_two(&ca, &cb, &mut v, uv_pitch, row0, dxu);
-                        }
-                        mb[a].fill(0);
-                        mb[b].fill(0);
-                    }
-                }
-            });
-        }
-    };
-
-    // 行定稿直出 RGBA 缓冲（整帧；滤波线程/串行路径按 MB 行滚动填写）。
-    let mut rgba = vec![0u8; width * height * 4];
-
-    // P-B 管道：主线程重建，滤波线程并行消费（滞后 1 行）；滤波线程过滤宏块行后随即把
-    // 已定稿行 fancy 上采样 + YUV→RGBA 直出 `rgba`（与重建重叠，不占主线程关键路径）。
-    if pipelined {
-        std::thread::scope(|s| {
-            let (tx, rx) = std::sync::mpsc::channel::<usize>();
-            let filter_cfg = &fh.filter;
-            let args = FilterThreadArgs {
-                y_ptr,
-                y_len,
-                y_pitch,
-                u_ptr,
-                v_ptr,
-                uv_pitch,
-                uv_len,
-                rf_ptr,
-                rf_len,
-                mbw,
-                mbh,
-                rgba_ptr: rgba.as_mut_ptr(),
-                rgba_len: rgba.len(),
-                width,
-                height,
-            };
-            s.spawn(move || filter_pipeline_thread(rx, args, filter_cfg));
-            for mby in 0..mbh {
-                reconstruct_row(mby);
-                let _ = tx.send(mby);
             }
-            // 全部行重建完成 → 滤波线程滤末行后退出（末行 m=mbh-1 的滞后=1 由 k==mbh 满足）。
-            let _ = tx.send(mbh);
         });
+        });
+        // scope join 完成：t3 已滤波+直出+抽紧密平面全部行。
 
     } else {
+        // 串行：逐宏块「熵 → 预测+IDCT+重建」（与 MT 共用 `entropy_macroblock` /
+        // `reconstruct_macroblock`，字节恒等结构性成立），整帧重建毕再滤波直出。
         for mby in 0..mbh {
-            reconstruct_row(mby);
+            // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
+            let mut left_b = [0u8; 4];
+            let mut left_nz = 0u32;
+            // 行内复用该分区的 token 解码器（&mut 边界，熵态在宏块级函数内部寄存器驻留）。
+            let td = &mut token_decoders[mby & (partition_count - 1)];
+            for mbx in 0..mbw {
+                let above_b_slot: &mut [u8; 4] =
+                    (&mut above_b[mbx * 4..mbx * 4 + 4]).try_into().unwrap();
+                let mut pkt = MbPacket::default();
+                let (level, inner) = entropy_macroblock(
+                    &mut header,
+                    td,
+                    segment_probs,
+                    skip_probability,
+                    &probs,
+                    &seg_params,
+                    above_b_slot,
+                    &mut left_b,
+                    &mut above_nz[mbx],
+                    &mut left_nz,
+                    &mut pkt,
+                );
+                row_filters[mby * mbw + mbx] = (level, inner);
+                reconstruct_macroblock(
+                    &mut y, y_pitch, &mut u, &mut v, uv_pitch,
+                    &mut above_y, &mut above_u, &mut above_v,
+                    mbx, mby, mbw, &mut pkt,
+                );
+            }
         }
 
         // 串行：整帧重建后按宏块行「环路滤波 → 行定稿直出 RGBA」（等价 C# 逐行滤波 +
@@ -1772,36 +2249,30 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
             &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw, mbh, &fh.filter, &row_filters,
             width, height, &mut rgba, &mut scratch,
         );
+
+        // 抽紧密平面（仅串行路径主线程尾段；MT 路径 t3 已直出）。L3：out_* 已未初始化分配，
+        // 下方逐行写满（读已整帧滤波的 y/u/v padded 平面），返回前不被读，省略 memset 逐字节不变。
+        stage_clock::copy(|| {
+            extract_tight_rows(
+                &y, y_pitch, &u, &v, uv_pitch,
+                0, height, width, &mut out_y, &mut out_u, &mut out_v,
+            );
+        });
     }
 
-    // 抽紧密平面（真实宽高；Vp8Yuv API/测试仍需）。
-    let cwu = (width + 1) / 2;
-    let chu = (height + 1) / 2;
-    let mut out_y = vec![0u8; width * height];
-    for r in 0..height {
-        out_y[r * width..(r + 1) * width]
-            .copy_from_slice(&y[r * y_pitch + 1..r * y_pitch + 1 + width]);
-    }
-    let mut out_u = vec![0u8; cwu * chu];
-    let mut out_v = vec![0u8; cwu * chu];
-    for r in 0..chu {
-        out_u[r * cwu..(r + 1) * cwu].copy_from_slice(&u[r * uv_pitch + 1..r * uv_pitch + 1 + cwu]);
-        out_v[r * cwu..(r + 1) * cwu].copy_from_slice(&v[r * uv_pitch + 1..r * uv_pitch + 1 + cwu]);
-    }
-
-    Ok(Vp8Yuv {
+    // scope join 后、返回前尾段（Vp8Yuv 构建）：主线程墙钟全部归账，无隐藏盲区（K53）。
+    stage_clock::end(|| Ok(Vp8Yuv {
         width: fh.width,
         height: fh.height,
         y: out_y,
         u: out_u,
         v: out_v,
         rgba,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // V3：环路滤波（RFC 6386 §15，标量；C# `Vp8LoopFilter.cs`/标量 FilterEdge 同款算术）
-// ---------------------------------------------------------------------------
 
 /// 有符号 8bit 饱和：`p+delta` 到 [-128,127]。
 #[inline]
@@ -1973,8 +2444,10 @@ pub(crate) fn filter_edge(
 }
 
 /// 每宏块行滤波：按 C# `FilterMacroblockRow` 的顺序（左→内竖→上→内横），逐宏块滤波。
-/// 本函数是环路滤波的**串行语义源**：双线程分带只调度它，行内/宏块内/边顺序与算术完全不变，
-/// 故任一“带”的输出与串行路径逐字节一致（硬闸：`threads2_matches_serial_byte_exact`）。
+/// `row_filters` 为**本行** `mbw` 个 `(level, inner)`（调用方按行切窗/按行包传递，见
+/// `filter_and_emit_serial` 与 `worker_loop`）。本函数是环路滤波的**串行语义源**：串行与
+/// 新 MT 两路径只调度它，行内/宏块内/边顺序与算术完全不变，故任一路径的输出与串行逐字节
+/// 一致（硬闸：`threads2_matches_serial_byte_exact`）。
 #[allow(clippy::too_many_arguments)]
 fn filter_macroblock_row(
     y: &mut [u8],
@@ -1991,7 +2464,7 @@ fn filter_macroblock_row(
     let uv_row = mby * 8;
     stage_clock::filter(|| {
     for mbx in 0..mbw {
-        let (level, inner) = row_filters[mby * mbw + mbx];
+        let (level, inner) = row_filters[mbx];
         if level == 0 {
             continue;
         }
@@ -2076,10 +2549,12 @@ fn filter_macroblock_row(
     });
 }
 
-/// 环路滤波双线程门控（auto 宏块总数下限）。`mbw*mbh >= MT_MIN_MB_TOTAL`（≈1MP，如 1024×1024、
-/// 2400×3600=33750 MB）才开双带并行；窄/小图线程开销>收益，保持串行（复用滤波「向量化负收益
-/// 即回退」的教训；收益实测见探针 `lossy_mt_probe` 与 `WEBP_MT`）。
-const MT_MIN_MB_TOTAL: usize = 4096;
+/// 环路滤波双线程门控（auto 宏块总数下限）。`mbw*mbh >= MT_MIN_MB_TOTAL`（≈0.6MP，如 768×768；
+/// 2026-11 微调 4096→2304：3600-MB 级（1280×720/800×1144）文件原本恒定串行、落入分账探针
+/// 「最差 lw_ratio 档」（1.13-1.20x libwebp），线程开拔开销 ~20-50µs 相对其 ~15-25ms 解码可
+/// 忽略，滤波+YUV 重叠收益 > 开销；字节一致由 `threads2_matches_serial_byte_exact` 全覆盖
+/// （与阈值无关）。
+const MT_MIN_MB_TOTAL: usize = 2304;
 
 /// `KIMG_WEBP_THREADS=auto|0|1|2`（默认 auto）：
 /// - `0` / `1` / `off` / `serial`：强制串行（重建毕→整帧滤波；输出恒与并行逐字节一致）。
@@ -2100,105 +2575,158 @@ fn filter_mt_enabled(mbw: usize, mbh: usize) -> bool {
     mbw * mbh >= MT_MIN_MB_TOTAL
 }
 
-/// P-B 真重叠管道：滤波线程主体（libwebp `-mt` 式「重建线程逐行产出、滤波线程滞后 N 行消费」，
-/// 由 `decode_from_header` 在宽图/强制 `2` 时启用）。滤完每行后随即把已定稿行
-/// `[emitted, mbY*16+8)` 直出 RGBA（`filter_and_emit_serial` 的行定稿语义同款：滤行 m 后
-/// 行 `[0.., m*16+8)` 只被 m 的滤波定稿，下一行滤波只触及 13..15/chroma 5..7）。
-///
-/// 滞后 1 行的字节一致论证（重建主线程与滤波线程旁路并行）：
-/// - 行 `m` 的环滤只读写像素行区间 `[m*16-4, m*16+15]`（H_top 读至 m*16-4、写至 m*16-3；
-///   V/H_inner 均在 `[m*16, m*16+15]`）→ 滤行 m 最多写到 `(m+1)*16-1`。
-/// - 重建线程对行 r 的**读**（帧内预测 `prepare_above` 读上一行）结束于重建完 r+1；此后重建
-///   只写 `(r+2)*16` 起的行。本线程滤行 m 前先收到「行 k=m+1 重建完成」（滞后 1）→ 滤波
-///   写集 `≤(m+1)*16-1` 与重建写集 `≥(m+2)*16` 恒不相交；滤波读集也在行 m+1 定稿之后 →
-///   无 C11 数据竞争，且每行滤波仍在与其他行完全相同的已发布值上、同串行顺序执行 →
-///   输出与串行 `filter_and_emit_serial` 逐字节一致（硬闸测试复核）。
-/// - RGBA 直出同理：emit 读集 ⊆ 已滤行 `[emitted, m*16+8)`（上采样相邻 chroma ≤ m*8+4），
-///   写集为此行段独有的 `rgba` 区间；重建线程只写 `≥(m+2)*16` 行 → 无竞争；各线程用各自
-///   `EmitScratch` 工作区（不共享）。
-///
-/// 信号：`rx` 收到 `k`（0..=mbh-1 表示行 k 已重建完成；`k == mbh` 表示全部完成）。
-/// 共享平面经裸指针传入（y/u/v/row_filters 长度固定不扩容；借用隔离由上述互斥时间窗 +
-/// mpsc happens-before 保证，思路同 pngsimd pipeline `InflateShared` 契约）。
-struct FilterThreadArgs {
-    y_ptr: *mut u8,
-    y_len: usize,
-    y_pitch: usize,
-    u_ptr: *mut u8,
-    v_ptr: *mut u8,
-    uv_pitch: usize,
-    uv_len: usize,
-    rf_ptr: *mut (u8, u8),
-    rf_len: usize,
-    mbw: usize,
-    mbh: usize,
-    rgba_ptr: *mut u8,
-    rgba_len: usize,
-    width: usize,
-    height: usize,
+/// t2 → t3 的交接包：宏观行 r 重建定稿后的整行 padded 像素（与 planes_A 布局逐字节一致：16 行 luma +
+/// 8 行 U + 8 行 V，全含左侧 129 列）+ 本行滤波参数表。随 `sync_channel(2)` 按值移动（零大块
+/// 二次拷贝；容量 2 = t2 最多领先 t3 两行，自然背压限内存）。t3 借此在**自有** planes_B 上重建
+/// 同布局，滤波/直出几何与 planes_A 完全同源 → 字节恒等由构造保证。
+struct RowPixels {
+    /// 16 × y_pitch 字节（luma padded 行，含左列）。
+    luma: Vec<u8>,
+    /// 8 × uv_pitch（U） + 8 × uv_pitch（V）。
+    chroma: Vec<u8>,
+    /// 本行宏块滤波参数 (level, inner)，t3 滤波输入。
+    filters: Vec<(u8, u8)>,
 }
 
-// SAFETY：只携带裸指针与整数，不携带任何 Rust 引用；共享内存的借用隔离由
-// `filter_pipeline_thread` 的滞后时间窗契约（mpsc happens-before）保证，见其上注释。
-unsafe impl Send for FilterThreadArgs {}
-
+/// 新 MT 管道 t2：依序消费 t1 行包，**预测+IDCT+重建**行 r 到 planes_A（本线程独占、恒未滤波），
+/// 随即把本 MB 行重建定稿像素打包成 [`RowPixels`] 交给 t3。预测读上一行未滤波像素 —— planes_A
+/// 从不滤波 → 与串行「predict 用未滤波值」逐字节同。`above_*` 为本线程局部（planes_A 行窗口）。
 #[allow(clippy::too_many_arguments)]
-fn filter_pipeline_thread(
-    rx: std::sync::mpsc::Receiver<usize>,
-    args: FilterThreadArgs,
+fn recon_loop(
+    rx: std::sync::mpsc::Receiver<RowPacket>,
+    tx2: std::sync::mpsc::SyncSender<RowPixels>,
+    y: &mut [u8],
+    y_pitch: usize,
+    u: &mut [u8],
+    v: &mut [u8],
+    uv_pitch: usize,
+    mbw: usize,
+) {
+    let mut above_y = [127u8; 21];
+    let mut above_u = [127u8; 9];
+    let mut above_v = [127u8; 9];
+    for (r, mut rowpkt) in rx.iter().enumerate() {
+        for (mbx, pkt) in rowpkt.mbs.iter_mut().enumerate() {
+            reconstruct_macroblock(
+                y, y_pitch, u, v, uv_pitch,
+                &mut above_y, &mut above_u, &mut above_v,
+                mbx, r, mbw, pkt,
+            );
+        }
+        // 打包本 MB 行（行 r 已在 planes_A 定稿重建）→ t3（通道按值移动，无共享可变内存）。
+        let luma_len = 16 * y_pitch;
+        let uv_len = 8 * uv_pitch;
+        let mut luma = Vec::with_capacity(luma_len);
+        for i in 0..16 {
+            let o = (r * 16 + i) * y_pitch;
+            luma.extend_from_slice(&y[o..o + y_pitch]);
+        }
+        let mut chroma = Vec::with_capacity(2 * uv_len);
+        for i in 0..8 {
+            let o = (r * 8 + i) * uv_pitch;
+            chroma.extend_from_slice(&u[o..o + uv_pitch]);
+        }
+        for i in 0..8 {
+            let o = (r * 8 + i) * uv_pitch;
+            chroma.extend_from_slice(&v[o..o + uv_pitch]);
+        }
+        let pkt = RowPixels { luma, chroma, filters: rowpkt.filters };
+        if tx2.send(pkt).is_err() {
+            // t3 已退出（异常收尾）：中断产出，外层 scope join 兜底。
+            break;
+        }
+    }
+}
+
+/// 从已定稿（滤波后）padded 平面抽紧密平面行段 `[first, end)`（luma 行 first..end、chroma 行
+/// first/2 ..= (end-1)/2）。语义与旧整帧尾段拷贝逐字节一致（旧拷贝 = 本函数 0..height 单次调用）。
+#[allow(clippy::too_many_arguments)]
+fn extract_tight_rows(
+    y: &[u8],
+    y_pitch: usize,
+    u: &[u8],
+    v: &[u8],
+    uv_pitch: usize,
+    first: usize,
+    end: usize,
+    width: usize,
+    out_y: &mut [u8],
+    out_u: &mut [u8],
+    out_v: &mut [u8],
+) {
+    let cwu = (width + 1) / 2;
+    if end == 0 {
+        return;
+    }
+    for r in first..end {
+        out_y[r * width..(r + 1) * width].copy_from_slice(&y[r * y_pitch + 1..r * y_pitch + 1 + width]);
+    }
+    let cfirst = first / 2;
+    let clast = (end - 1) / 2;
+    for c in cfirst..=clast {
+        let off = c * cwu;
+        out_u[off..off + cwu].copy_from_slice(&u[c * uv_pitch + 1..c * uv_pitch + 1 + cwu]);
+        out_v[off..off + cwu].copy_from_slice(&v[c * uv_pitch + 1..c * uv_pitch + 1 + cwu]);
+    }
+}
+
+/// 新 MT 管道 t3：依序消费 t2 的重建行包，在**自有** planes_B（同布局 padded 缓冲，经
+/// [`RowPixels`] 逐行填入）上做【环路滤波 → 行定稿直出 RGBA → 抽紧密平面】。本体恒等论证：
+/// - plans_B 内容 = planes_A（未滤波重建）逐字节拷贝 → 滤波输入与串行「滤波读已重建行」同。
+/// - 滤波/直出/紧密抽取完全复用 `filter_macroblock_row` / `emit_rows_into_rgba` /
+///   `extract_tight_rows`，行序 m 升序、段序 `[emitted, m*16+8)` 与串行一致 → 逐字节同。
+/// - planes_A 恒未滤波（t2 独占），故 t3 滤波不需要等 t2 的下一步预测 —— 无 1 行滞后约束。
+/// 所有权：本线程独占 planes_B / rgba / out_*，零 unsafe，无共享可变内存。
+#[allow(clippy::too_many_arguments)]
+fn filter_t3_loop(
+    rx: std::sync::mpsc::Receiver<RowPixels>,
+    y_pitch: usize,
+    uv_pitch: usize,
+    rgba: &mut [u8],
+    out_y: &mut [u8],
+    out_u: &mut [u8],
+    out_v: &mut [u8],
+    mbw: usize,
+    mbh: usize,
+    width: usize,
+    height: usize,
     filter: &FilterSettings,
 ) {
-    let FilterThreadArgs {
-        y_ptr,
-        y_len,
-        y_pitch,
-        u_ptr,
-        v_ptr,
-        uv_pitch,
-        uv_len,
-        rf_ptr,
-        rf_len,
-        mbw,
-        mbh,
-        rgba_ptr,
-        rgba_len,
-        width,
-        height,
-    } = args;
+    // t3 独占的全 padded 重建缓冲（planes_B）：与 planes_A 同布局（含左列；字节在写入前恒 0，
+    // 滤波/直出只读已写入行段，未初始化亦安全——保持 memset 以结构性地杜绝任何读空风险）。
+    let y_vec_len = mbh * 16 * y_pitch;
+    let uv_vec_len = mbh * 8 * uv_pitch;
+    let mut planes_b = vec![0u8; y_vec_len + 2 * uv_vec_len];
+    let (yb, rest) = planes_b.split_at_mut(y_vec_len);
+    let (ub, vb) = rest.split_at_mut(uv_vec_len);
     let cw = (width + 1) >> 1;
     let ch = (height + 1) >> 1;
     let mut scratch = EmitScratch::new(width);
-    let mut next = 0usize;
     let mut emitted = 0usize;
-    let mut avail: Option<usize> = None;
-    loop {
-        if next >= mbh {
-            break;
+    for (r, pkt) in rx.iter().enumerate() {
+        // 本 MB 行重建行像素写入 planes_B（布局与 planes_A 一致 → 滤波/直出几何完全同源）。
+        for i in 0..16 {
+            let dst = (r * 16 + i) * y_pitch;
+            yb[dst..dst + y_pitch].copy_from_slice(&pkt.luma[i * y_pitch..(i + 1) * y_pitch]);
         }
-        let need = next + 1; // 滞后 1：滤行 next 需行 next+1 重建完成
-        while avail.map_or(true, |k| k < need) {
-            match rx.recv() {
-                Ok(k) => avail = Some(k),
-                Err(_) => {
-                    // 通道关闭：主线程已结束（正常收尾经 k==mbh 表达；异常由主线程 panic 接管）。
-                    return;
-                }
-            }
+        for i in 0..8 {
+            let dst = (r * 8 + i) * uv_pitch;
+            ub[dst..dst + uv_pitch].copy_from_slice(&pkt.chroma[i * uv_pitch..(i + 1) * uv_pitch]);
+            vb[dst..dst + uv_pitch].copy_from_slice(&pkt.chroma[(8 + i) * uv_pitch..(8 + i + 1) * uv_pitch]);
         }
-        // SAFETY：滞后时间窗契约（上文）——此刻滤波读写集与重建写集不相交，相关行已发布定稿。
-        let y = unsafe { std::slice::from_raw_parts_mut(y_ptr, y_len) };
-        let u = unsafe { std::slice::from_raw_parts_mut(u_ptr, uv_len) };
-        let v = unsafe { std::slice::from_raw_parts_mut(v_ptr, uv_len) };
-        let rf = unsafe { std::slice::from_raw_parts_mut(rf_ptr, rf_len) };
-        filter_macroblock_row(y, y_pitch, u, v, uv_pitch, mbw, next, filter, rf);
-        // 行定稿直出：与串行 `filter_and_emit_serial` 同语义（滤完当前行即出 `[emitted,end)`）。
-        let end = if next == mbh - 1 { height } else { next * 16 + 8 };
+        // 本行滤波 + 行定稿直出 + 抽紧密平面（串行同序：先滤 m 再 emit m；末段 end=height 同语义）。
+        filter_macroblock_row(yb, y_pitch, ub, vb, uv_pitch, mbw, r, filter, &pkt.filters);
+        let end = if r == mbh - 1 { height } else { r * 16 + 8 };
         if end > emitted {
-            let unsafe_rgba = unsafe { std::slice::from_raw_parts_mut(rgba_ptr, rgba_len) };
-            emit_rows_into_rgba(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, unsafe_rgba, &mut scratch);
+            emit_rows_into_rgba(yb, y_pitch, ub, vb, uv_pitch, width, cw, ch, emitted, end, rgba, &mut scratch);
+            stage_clock::copy(|| {
+                extract_tight_rows(
+                    yb, y_pitch, ub, vb, uv_pitch,
+                    emitted, end, width, out_y, out_u, out_v,
+                );
+            });
             emitted = end;
         }
-        next += 1;
     }
 }
 
@@ -2290,6 +2818,7 @@ fn emit_rows_into_rgba(
     rgba: &mut [u8],
     ws: &mut EmitScratch,
 ) {
+    stage_clock::yuv(|| {
     for row in first..end {
         let chroma_row = row >> 1;
         let adjacent = if row % 2 == 0 {
@@ -2310,6 +2839,7 @@ fn emit_rows_into_rgba(
         super::simd::upsample_fancy_into(&v[u0..u0 + cw], &v[u1..u1 + cw], &mut ws.v_up, &mut ws.t_ws);
         super::simd::yuv_row_to_rgba(&y[yba..yba + width], &ws.u_up, &ws.v_up, &mut rgba[row * width * 4..(row + 1) * width * 4]);
     }
+    });
 }
 
 /// 串行路径：逐宏块行「环路滤波 → 行定稿直出 RGBA」。`end = mbY==末行 ? height : mbY*16+8`：
@@ -2336,7 +2866,7 @@ fn filter_and_emit_serial(
     let ch = (height + 1) >> 1;
     let mut emitted = 0usize;
     for mby in 0..mbh {
-        filter_macroblock_row(y, y_pitch, u, v, uv_pitch, mbw, mby, filter, row_filters);
+        filter_macroblock_row(y, y_pitch, u, v, uv_pitch, mbw, mby, filter, &row_filters[mby * mbw..(mby + 1) * mbw]);
         let end = if mby == mbh - 1 { height } else { mby * 16 + 8 };
         if end > emitted {
             emit_rows_into_rgba(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws);
@@ -2747,7 +3277,7 @@ mod v4_rgba_parity_tests {
         if ours.width != c.width || ours.height != c.height {
             return None;
         }
-        Some((ours.width, ours.height, ours.rgba))
+        Some((ours.width, ours.height, ours.rgba.as_bytes().to_vec()))
     }
 
     #[test]
@@ -3041,9 +3571,9 @@ mod perf_stage_tests {
                     let (mut by, mut bu, mut bv) = (ay.clone(), au.clone(), av.clone());
                     for mby in 0..mbh {
                         set_simd_part_override("flt", Some(true));
-                        filter_macroblock_row(&mut ay, y_pitch, &mut au, &mut av, uv_pitch, mbw, mby, &flt, &rf);
+                        filter_macroblock_row(&mut ay, y_pitch, &mut au, &mut av, uv_pitch, mbw, mby, &flt, &rf[mby * mbw..(mby + 1) * mbw]);
                         set_simd_part_override("flt", Some(false));
-                        filter_macroblock_row(&mut by, y_pitch, &mut bu, &mut bv, uv_pitch, mbw, mby, &flt, &rf);
+                        filter_macroblock_row(&mut by, y_pitch, &mut bu, &mut bv, uv_pitch, mbw, mby, &flt, &rf[mby * mbw..(mby + 1) * mbw]);
                         assert_eq!(ay, by, "Y 熔合 vs 标量 simple={simple} sharp={sharpness} mby={mby}");
                         assert_eq!(au, bu, "U 熔合 vs 标量 simple={simple} sharp={sharpness} mby={mby}");
                         assert_eq!(av, bv, "V 熔合 vs 标量 simple={simple} sharp={sharpness} mby={mby}");

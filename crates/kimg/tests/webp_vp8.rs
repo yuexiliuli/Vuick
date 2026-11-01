@@ -227,3 +227,44 @@ fn lossy_sample_matches_dwebp_fancy_golden() {
     assert!(checked >= 3, "应至少抽查 3 个 fixture，实 {checked}");
     eprintln!("VP8_FANCY_GOLDEN_SPOT\t{checked}");
 }
+
+/// 右缘不完整宏块路径回归（V7 修为真 BUG 后的硬闸）：5 张代表图（含 w%16=1/2/3）
+/// OURS fancy RGBA 必须 == libwebp 1.6.0 golden sha256。
+/// 回归前此路径 OURS 唯一偏出（Y 平面右缘 1-4 宏块列，源自 `prepare_above` 右上像素
+/// 夹到可见末列 vs 参照镜像 padded 末列）；golden 文本入仓、图片外部语料缺失 SKIP。
+#[test]
+fn right_edge_incomplete_mb_matches_libwebp_golden() {
+    let golden_path = golden_dir().join("webp-right-edge-golden.tsv");
+    let text = std::fs::read_to_string(&golden_path).expect("右缘 golden TSV");
+    let mut rows: Vec<(String, u32, u32, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let p: Vec<&str> = line.split('\t').collect();
+        if p.len() == 4 {
+            rows.push((p[0].to_string(), p[1].parse().unwrap(), p[2].parse().unwrap(), p[3].to_lowercase()));
+        }
+    }
+    let mut checked = 0usize;
+    for (name, gw, gh, ghsh) in rows {
+        let Some(path) = fixtures::webp::webp_fixture_path(&name) else {
+            eprintln!("SKIP {name} 外部语料缺失");
+            continue;
+        };
+        let data = std::fs::read(&path).unwrap();
+        let (w, h, rgba) = decode_rgba_byte_exact(&data, true);
+        assert_eq!((w, h), (gw, gh), "{name} 尺寸 vs libwebp golden");
+        // 修复前（`prepare_above` 夹到 width-1）此处 FAIL：5 图 diff 9..2207 px。
+        let got = sha256_hex(&rgba);
+        assert_eq!(got, ghsh, "{name} OURS fancy RGBA 应与 libwebp 1.6.0 golden 一致");
+        checked += 1;
+    }
+    set_webp_backend(BACKEND_OURS);
+    assert!(
+        checked >= 3,
+        "应至少核对 3 个右缘 golden 条目（当前 {checked}；缺外部语料）"
+    );
+    eprintln!("VP8_RIGHT_EDGE_GOLDEN\t{checked}");
+}

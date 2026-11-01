@@ -46,7 +46,108 @@ pub(crate) struct DecodedImage {
     /// VP8L 头 alpha 位。
     pub has_alpha: bool,
     /// RGBA8 紧凑像素（w*h*4）。
-    pub rgba: Vec<u8>,
+    pub rgba: RgbaBytes,
+}
+
+/// RGBA8 像素缓冲。两种后端保底，均满足「归还 Layout == 分配 Layout」：
+/// - `U32`（无损路径）：接管 ARGB `Vec<u32>` 原地收尾后的缓冲，零拷贝、省一次整帧拷贝；
+///   所有权由 `Vec<u32>` 持有，归还恒为原 Layout（align 4、size = 4×u32 容量），
+///   `GlobalAlloc::dealloc` 同 Layout 契约由 Vec 的 Drop 保证（不降 align）。
+/// - `U8`（有损路径）：解码直出的 `Vec<u8>`，沿用既有分配。
+/// `as_bytes()` 只借出不可变 `&[u8]`（U32 臂为按字节只读重借，无写入别名；U32 均为合法位型）。
+/// 不实现 Clone（单一所有权）。
+pub(crate) struct RgbaBytes {
+    inner: RgbaBytesKind,
+}
+
+enum RgbaBytesKind {
+    U32(Vec<u32>),
+    U8(Vec<u8>),
+}
+
+impl RgbaBytes {
+    /// 空缓冲（未分配像素）。
+    pub(crate) fn empty() -> Self {
+        RgbaBytes {
+            inner: RgbaBytesKind::U32(Vec::new()),
+        }
+    }
+
+    /// 接管已完成 ARGB→RGBA8（内存字节序 [R,G,B,A]）的 `Vec<u32>`，零拷贝收尾。
+    /// 前置：每个 u32 已完成字节序交换且 len×4 字节均已写出。
+    pub(crate) fn from_argb_vec(inner: Vec<u32>) -> Self {
+        RgbaBytes {
+            inner: RgbaBytesKind::U32(inner),
+        }
+    }
+
+    /// 接收直出的 `Vec<u8>` RGBA8 缓冲（有损路径；沿用既有分配）。
+    pub(crate) fn from_vec_u8(inner: Vec<u8>) -> Self {
+        RgbaBytes {
+            inner: RgbaBytesKind::U8(inner),
+        }
+    }
+
+    /// RGBA8 只读字节视图。
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        match &self.inner {
+            RgbaBytesKind::U32(v) => {
+                // 只读按字节重借：u32 缓冲内均为合法位型，无写入别名，sound。
+                let ptr = v.as_ptr().cast::<u8>();
+                let len = v.len() * 4;
+                unsafe { std::slice::from_raw_parts(ptr, len) }
+            }
+            RgbaBytesKind::U8(v) => v.as_slice(),
+        }
+    }
+
+    /// RGBA8 字节数（= w*h*4）。
+    pub(crate) fn len(&self) -> usize {
+        match &self.inner {
+            RgbaBytesKind::U32(v) => v.len() * 4,
+            RgbaBytesKind::U8(v) => v.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        match &self.inner {
+            RgbaBytesKind::U32(v) => v.is_empty(),
+            RgbaBytesKind::U8(v) => v.is_empty(),
+        }
+    }
+}
+
+impl Default for RgbaBytes {
+    fn default() -> Self {
+        RgbaBytes::empty()
+    }
+}
+
+/// VP8L 无损解码分阶段计时（K59/K60 测量先行，供 imgbench 阶段分账探针）。
+/// 字段为本轮解码各阶段墙钟纳秒：`transforms_head_ns`=变换头解析（含各变换数据子图熵解码、
+/// 构建）；`entropy_ns`=主图像流熵解码（**不含**颜色缓存段）；`cache_ns`=颜色缓存 lazy 填充 +
+/// 命中（熵解码内部分离段）；`transforms_ns`=逆变换应用（predictor/color/subtract-green/
+/// color-indexing）；`to_rgba_ns`=收尾 ARGB→RGBA8 拷贝；`total_ns`=全链墙钟。
+/// `cache_symbols/cache_fill_pixels` 为缓存符号与填充像素计数（聚类依据）。
+/// 本结构体无条件编译（供内部签名线程），计时器体仅在 `stage_profile` feature 下启用，
+/// feature 关闭时经 `None` 透传、零运行时影响。
+#[cfg_attr(not(feature = "stage_profile"), allow(dead_code))]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Vp8lStageProfile {
+    pub width: u32,
+    pub height: u32,
+    pub transforms_head_ns: u64,
+    pub entropy_ns: u64,
+    pub cache_ns: u64,
+    pub transforms_ns: u64,
+    pub to_rgba_ns: u64,
+    pub total_ns: u64,
+    pub cache_symbols: u64,
+    pub cache_fill_pixels: u64,
+    /// 主熵流 `read_symbol` 总调用次数（含码长树等小头）。
+    pub symbol_reads: u64,
+    /// 其中命中二级表（码长 > ROOT_BITS）的次数 → 子表命中率。
+    pub subtable_hits: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +280,13 @@ impl<'a> BitReader<'a> {
 const ROOT_BITS: u32 = 8;
 const SUBTABLE_FLAG: u32 = 0x100;
 
+// 探针计数（仅 `stage_profile` feature；read_symbol 命中子表频率 → 量化「更大 root 主表」收益上限）。
+#[cfg(feature = "stage_profile")]
+thread_local! {
+    static SYMBOL_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SUBTABLE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// 解码一个符号（入口 ≥15 位缓冲）。根条目 = `(symbol<<16)|length` 或
 /// 二级表指针 `(start<<16)|SUBTABLE_FLAG|subBits`。
 /// 热路径用裸指针：`table` 指向 `tables.data + 通道偏移`，该区域长度在建表期已
@@ -187,8 +295,12 @@ const SUBTABLE_FLAG: u32 = 0x100;
 #[inline(always)]
 fn read_symbol(table: *const u32, root_mask: u32, buffer: &mut u64, bits: &mut u32) -> u32 {
     unsafe {
+        #[cfg(feature = "stage_profile")]
+        SYMBOL_READS.with(|c| c.set(c.get() + 1));
         let entry = *table.add((*buffer as u32 & root_mask) as usize);
         let entry = if entry & SUBTABLE_FLAG != 0 {
+            #[cfg(feature = "stage_profile")]
+            SUBTABLE_HITS.with(|c| c.set(c.get() + 1));
             let index =
                 (entry >> 16) + ((*buffer as u32 >> ROOT_BITS) & ((1 << (entry & 0xff)) - 1));
             *table.add(index as usize)
@@ -876,18 +988,22 @@ fn decode_image_stream(
 ) -> Result<Vec<u32>> {
     let pixel_count = (width as usize) * (height as usize);
     let mut result = vec![0u32; pixel_count];
-    decode_image_stream_into(reader, width, height, has_meta_prefix, &mut result)?;
+    decode_image_stream_into(reader, width, height, has_meta_prefix, &mut result, None)?;
     Ok(result)
 }
 
 /// 版本：写入外部缓冲（缓冲长度须恰为 width*height；供主图像流在颜色索引
 /// 原地扩展时分配 pixelCount 尺寸、只填前 encoded 个）。
+/// `profile`：仅 `stage_profile` feature 时由顶层探针传入 `Some`；其余路径 `None` 透传
+/// （结构体无条件编译，feature 关闭零运行时影响）。
+#[allow(clippy::too_many_arguments)]
 fn decode_image_stream_into(
     reader: &mut BitReader<'_>,
     width: u32,
     height: u32,
     has_meta_prefix: bool,
     result: &mut [u32],
+    profile: Option<&mut Vp8lStageProfile>,
 ) -> Result<()> {
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(Vp8LError::new("VP8L 子图像尺寸非法"));
@@ -990,6 +1106,7 @@ fn decode_image_stream_into(
         &tables,
         cache.as_deref_mut(),
         cache_bits,
+        profile,
     )?;
     reader.throw_if_truncated()?;
     Ok(())
@@ -1010,7 +1127,11 @@ fn decode_pixels(
     tables: &HuffmanTables,
     mut cache: Option<&mut [u32]>,
     cache_bits: u32,
+    mut profile: Option<&mut Vp8lStageProfile>,
 ) -> Result<()> {
+    // feature 关闭时 `profile` 未消费传播，借位一次防 unused 告警（零运行成本）。
+    #[cfg(not(feature = "stage_profile"))]
+    let _ = &mut profile;
     let (mut buffer, mut bits) = reader.load();
     let block_mask = (1u32 << prefix_bits).wrapping_sub(1);
     let mut position = 0usize;
@@ -1091,8 +1212,12 @@ fn decode_pixels(
         }
 
         // 颜色缓存码：绿字母表 ≥ 280 必有缓存。
+        #[cfg(feature = "stage_profile")]
+        let cache_t0 = std::time::Instant::now();
         let cache = cache.as_mut().ok_or_else(|| Vp8LError::new("VP8L 颜色缓存缺失"))?;
         let shift = 32 - cache_bits;
+        #[cfg(feature = "stage_profile")]
+        let fill_from = cached;
         for i in cached..position {
             let value = result[i];
             let hash = (0x1e35a7bdu32.wrapping_mul(value)) >> shift;
@@ -1100,6 +1225,14 @@ fn decode_pixels(
         }
         cached = position;
         unsafe { *result.get_unchecked_mut(position) = cache[(symbol - 280) as usize]; }
+        #[cfg(feature = "stage_profile")]
+        {
+            if let Some(p) = profile.as_mut() {
+                p.cache_symbols += 1;
+                p.cache_fill_pixels += (position - fill_from) as u64;
+                p.cache_ns += cache_t0.elapsed().as_nanos() as u64;
+            }
+        }
         position += 1;
         x += 1;
         if x == width {
@@ -1208,7 +1341,7 @@ fn decode_image(reader: &mut BitReader<'_>, width: u32, height: u32) -> Result<V
 
     let mut pixels = vec![0u32; pixel_count];
     let encoded_count = (encoded_width as usize) * (encoded_height as usize);
-    decode_image_stream_into(reader, encoded_width, encoded_height, true, &mut pixels[..encoded_count])?;
+    decode_image_stream_into(reader, encoded_width, encoded_height, true, &mut pixels[..encoded_count], None)?;
     for t in transforms.iter().rev() {
         apply_transform(&mut pixels, t)?;
     }
@@ -1230,6 +1363,8 @@ fn read_header(bitstream: &[u8]) -> Result<(u32, u32, bool)> {
 }
 
 /// ARGB 像素 → RGBA8 字节（内存序交换 B/R；SIMD 版 + 标量回退见 `simd::argb_to_rgba`）。
+/// 生产路径 `decode` 已改走原地 `argb_to_rgba_inplace`；此处仅 stage_profile 探针使用。
+#[cfg_attr(not(feature = "stage_profile"), allow(dead_code))]
 fn to_rgba(pixels: &[u32], out: &mut [u8]) {
     super::simd::argb_to_rgba(pixels, out)
 }
@@ -1239,18 +1374,136 @@ pub(crate) fn decode(bitstream: &[u8]) -> Result<DecodedImage> {
     let (width, height, has_alpha) = read_header(bitstream)?;
     let pixel_count = (width as usize) * (height as usize);
     let mut reader = BitReader::new(&bitstream[5..]);
-    let pixels = decode_image(&mut reader, width, height)?;
+    let mut pixels = decode_image(&mut reader, width, height)?;
     if pixels.len() != pixel_count {
         return Err(Vp8LError::new("VP8L 像素数不一致"));
     }
-    let mut rgba = vec![0u8; pixel_count * 4];
-    to_rgba(&pixels, &mut rgba);
+    // 原地 ARGB→RGBA8（字节序交换）后直接把 u32 缓冲收进 `RgbaBytes`（零拷贝）：省一次
+    // 整帧 RGBA 分配 + 全量拷贝（大图整帧各 ~36MB 级）。逐字节=旧 `to_rgba` 路径。
+    // 归还 Layout = 原始 Vec<u32> 分配（align 4），由 RgbaBytes 内部 Vec 的 Drop 保证同契约。
+    super::simd::argb_to_rgba_inplace(&mut pixels);
+    let rgba = RgbaBytes::from_argb_vec(pixels);
     Ok(DecodedImage {
         width,
         height,
         has_alpha,
         rgba,
     })
+}
+
+/// 校准单次 `Instant::now()` 调用固有开销（ns/次），用于扣除逐缓存符号计时器的测量噪音。
+/// `black_box` 阻止 QPC 调用被优化消除。仅 `stage_profile` feature 编译。
+#[cfg(feature = "stage_profile")]
+fn calibrate_instant_ns() -> u64 {
+    use std::time::Instant;
+    const ITERS: u32 = 40_000;
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        std::hint::black_box(Instant::now());
+    }
+    t0.elapsed().as_nanos() as u64 / ITERS as u64
+}
+
+/// 阶段分账解码（`stage_profile` feature 门控；供 imgbench 探针，K59 统一基座）。
+/// 与 [`decode`] 语义逐字节一致，另按【变换头 / 主熵流(+色缓存段) / 逆变换 / 收尾拷贝】
+/// 统计各段墙钟。`bitstream` 为 VP8L chunk 载荷（首字节 0x2f）。仅计时（丢弃像素）。
+#[cfg(feature = "stage_profile")]
+pub fn stage_decode(bitstream: &[u8]) -> Result<Vp8lStageProfile> {
+    let (width, height, _) = read_header(bitstream)?;
+    let pixel_count = (width as usize) * (height as usize);
+    let mut rgba = vec![0u8; pixel_count * 4];
+    let profile = stage_decode_into(bitstream, &mut rgba)?;
+    std::hint::black_box(&rgba);
+    Ok(profile)
+}
+
+/// `stage_decode` 的写缓冲版：`rgba` 长度须为 w*h*4，解码后将 RGBA8 像素写入（供 K27 证据
+/// 测试与生产路径 [`decode`] 逐字节对拍）。
+#[cfg(feature = "stage_profile")]
+pub fn stage_decode_into(bitstream: &[u8], rgba: &mut [u8]) -> Result<Vp8lStageProfile> {
+    use std::time::Instant;
+    let (width, height, _has_alpha) = read_header(bitstream)?;
+    let pixel_count = (width as usize) * (height as usize);
+    let mut reader = BitReader::new(&bitstream[5..]);
+    let t0 = Instant::now();
+
+    let mut transforms: Vec<Transform> = Vec::new();
+    let mut seen = [false; 4];
+    let mut encoded_width = width;
+    let encoded_height = height;
+    while reader.read_bit()? != 0 {
+        let ty = reader.read_bits(2)? as usize;
+        if seen[ty] {
+            return Err(Vp8LError::new("VP8L 变换序列非法（重复类型）"));
+        }
+        seen[ty] = true;
+        let transform = read_transform(&mut reader, ty as u8, encoded_width, encoded_height)?;
+        if ty == 3 {
+            encoded_width = (encoded_width + (1 << transform.bits) - 1) >> transform.bits;
+        }
+        transforms.push(transform);
+    }
+    let transforms_head_ns = t0.elapsed().as_nanos() as u64;
+
+    let mut pixels = vec![0u32; pixel_count];
+    let encoded_count = (encoded_width as usize) * (encoded_height as usize);
+    let mut profile = Vp8lStageProfile {
+        width,
+        height,
+        ..Default::default()
+    };
+    // 重置符号级探针计数，只统计主熵流窗口。
+    #[cfg(feature = "stage_profile")]
+    {
+        SYMBOL_READS.with(|c| c.set(0));
+        SUBTABLE_HITS.with(|c| c.set(0));
+    }
+    let t1 = Instant::now();
+    decode_image_stream_into(
+        &mut reader,
+        encoded_width,
+        encoded_height,
+        true,
+        &mut pixels[..encoded_count],
+        Some(&mut profile),
+    )?;
+    reader.throw_if_truncated()?;
+    #[cfg(feature = "stage_profile")]
+    {
+        profile.symbol_reads = SYMBOL_READS.with(|c| c.get());
+        profile.subtable_hits = SUBTABLE_HITS.with(|c| c.get());
+    }
+    let entropy_wall = t1.elapsed().as_nanos() as u64;
+    // 扣除逐缓存符号计时器固有开销（同进程 QPC 校准）：缓存分支内 1 次 `t0.elapsed()` 落入
+    // cache_ns、1 次 `cache_t0 = Instant::now()` 落入熵墙钟。二者各以 cache_symbols×单次 QPC
+    // 从相应桶扣回，得真实段耗时（probe 口径；feature 关闭无此逻辑）。
+    let per_instant = calibrate_instant_ns();
+    let cache_timer_cost = profile.cache_symbols * per_instant;
+    // cache 桶扣其内置 `t0.elapsed()` 开销；熵墙钟内含 cache 分支的 `cache_t0 = Instant::now()`
+    // （cache_symbols×QPC），从熵桶再扣一份——先按未扣 cache 原始值相减，避免两次扣除相消。
+    let cache_raw = profile.cache_ns;
+    profile.cache_ns = cache_raw.saturating_sub(cache_timer_cost);
+    profile.entropy_ns =
+        entropy_wall.saturating_sub(cache_raw).saturating_sub(cache_timer_cost);
+
+    let t2 = Instant::now();
+    for t in transforms.iter().rev() {
+        apply_transform(&mut pixels, t)?;
+    }
+    let transforms_ns = t2.elapsed().as_nanos() as u64;
+
+    let t3 = Instant::now();
+    if rgba.len() != pixel_count * 4 {
+        return Err(Vp8LError::new("VP8L 探针输出缓冲尺寸不符"));
+    }
+    to_rgba(&pixels, rgba);
+    let to_rgba_ns = t3.elapsed().as_nanos() as u64;
+
+    profile.transforms_head_ns = transforms_head_ns;
+    profile.transforms_ns = transforms_ns;
+    profile.to_rgba_ns = to_rgba_ns;
+    profile.total_ns = Instant::now().duration_since(t0).as_nanos() as u64;
+    Ok(profile)
 }
 
 /// 解码 ALPH chunk 的 VP8L 载荷（**无 5 字节 VP8L 头**，尺寸由调用方给定）为 alpha 平面
@@ -1326,6 +1579,7 @@ mod perf_stage_tests {
                 encoded_height,
                 true,
                 &mut pixels[..encoded_count],
+                None,
             )
             .unwrap();
             let t2 = Instant::now();
@@ -1369,6 +1623,42 @@ mod perf_stage_tests {
                 Instant::now().duration_since(t0).as_secs_f64() * 1e3,
             );
         }
+    }
+
+    /// 探针路径 `stage_decode` 与生产路径 `decode` 逐字节一致（K27：证明性断言落仓可复跑）。
+    /// `stage_profile` feature 下跑：`cargo test -p kimg vp8l --features stage_profile -- --ignored --test-threads=1 stage_decode_matches_decode`
+    #[cfg(feature = "stage_profile")]
+    #[test]
+    #[ignore = "手动运行（需 feature + 外部语料）"]
+    fn stage_decode_matches_decode() {
+        let gen_path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/imgbench-corpus/WEBP/gen28-photo-lossless.webp"
+        ));
+        let data = if gen_path.is_file() {
+            std::fs::read(gen_path).unwrap()
+        } else {
+            let p = webp_fixtures_support::webp_fixture_path("lossless-near60.webp")
+                .unwrap_or_else(|| panic!("夹具缺失（外部语料）：lossless-near60.webp"));
+            std::fs::read(p).unwrap()
+        };
+        let c = crate::codecs::webp::container::parse(&data).unwrap();
+        let bs = c.bitstream.unwrap().to_vec();
+        let prod = decode(&bs).unwrap();
+        let mut rgba = vec![0u8; prod.rgba.len()];
+        let prof = stage_decode_into(&bs, &mut rgba).unwrap();
+        assert_eq!((prof.width, prof.height), (prod.width, prod.height));
+        // ARGB→RGBA8 字节逐字节一致（探针路径 == 生产路径）。
+        assert_eq!(&rgba[..], prod.rgba.as_bytes());
+        eprintln!(
+            "VP8L_STAGE_DECODE_PARITY_OK {}x{} entropy={}ms cache={}ms transforms={}ms total={}ms",
+            prof.width,
+            prof.height,
+            (prof.entropy_ns + prof.cache_ns) / 1_000_000,
+            prof.cache_ns / 1_000_000,
+            prof.transforms_ns / 1_000_000,
+            prof.total_ns / 1_000_000,
+        );
     }
 }
 
@@ -1556,7 +1846,7 @@ mod tests {    use super::*;
         let img = decode(&data).expect("稀疏高位组下标应可解码（不 panic 不 OOM）");
         assert_eq!((img.width, img.height), (2, 2));
         // 4 像素全为 0xFF1234AB → RGBA 字节 {0x12, 0xAB, 0x34, 0xFF}。
-        assert!(img.rgba.chunks_exact(4).all(|p| p == [0x12, 0xAB, 0x34, 0xFF]));
+        assert!(img.rgba.as_bytes().chunks_exact(4).all(|p| p == [0x12, 0xAB, 0x34, 0xFF]));
     }
 
     #[test]
@@ -1693,8 +1983,8 @@ mod parity_tests {
                 fails.push((name.clone(), format!("尺寸 {}x{} vs {}x{}", ours.width, ours.height, rw, rh)));
                 continue;
             }
-            if ours.rgba != ref_rgba {
-                describe_diff(&name, &ours.rgba, &ref_rgba);
+            if ours.rgba.as_bytes() != &ref_rgba[..] {
+                describe_diff(&name, ours.rgba.as_bytes(), &ref_rgba);
                 // 金标准不匹配=失败；越界语料（gen*/用户大图）仅记录不判失败。
                 if golden {
                     fails.push((name.clone(), "像素逐字节不一致".into()));
@@ -1769,7 +2059,7 @@ mod parity_tests {
             }
             let ours = decode(c.bitstream.unwrap()).expect("自研解码");
             let mut h = Sha256::new();
-            h.update(&ours.rgba);
+            h.update(ours.rgba.as_bytes());
             let hash = format!("{:x}", h.finalize());
             let (nofancy, fancy) = &rows[name_lc];
             // lossless：fancy==nofancy；dwebp RGBA 与自研必须逐字节同哈希。

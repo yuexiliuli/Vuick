@@ -1,0 +1,18 @@
+# webp-right-edge-golden.tsv — VP8 有损「右缘不完整宏块」路径的 libwebp 1.6.0 golden。
+# fixture<TAB>width<TAB>height<TAB>sha256(fancy RGBA)（libwebp 1.6.0 WebPDecodeRGBA，
+# 默认 fancy 上采样；与 webp-oracle-golden.tsv 的 dwebp 1.6.0 fancy 列同口径）。
+# 生成：libwebp-sys 0.14.4（vendor libwebp 1.6.0，FileVersion=1.6.0）release 全量编译后
+#   WebPDecodeRGBA(fixture) -> sha256(RGBA)；与 image-webp 0.2.4 逐字节互证（52 golden 之外
+#   的此 5 图此前 OURS 唯一偏出）。
+# 别名同源（sha256 同字节）：00==019、03==035、04_05_fixed==036、07==002、11==006。
+# 图片不入仓（AGENTS K64），运行时只读本 TSV 文本；夹具缺失打印 SKIP 属常态。
+00.webp	2162	1512	6d1178f9e6f48637d1cdf4dfa71c18f2f82de2052785ca2f3aabdc14bb84de3c
+03.webp	1073	1514	a3b1b49ea9d82b168829886e4c88a42fbb8dc20efa0ee34bef15d494c22824b8
+04_05_fixed.webp	2146	1496	a970e34a184a497b1bd0ec3ed4fc821a2df790d8846c9356392a3d9c801c5f74
+07.webp	1075	1514	7a763bb1bfbc30f17e01f56c5452d8e51f6e8956a5a8159fdade39ecb22330e6
+11.webp	1075	1514	1defc4c0048f2703d88248bc5bb2387acc40d8fd14ffc3c20521d6985311c79f
+019.webp	2162	1512	6d1178f9e6f48637d1cdf4dfa71c18f2f82de2052785ca2f3aabdc14bb84de3c
+035.webp	1073	1514	a3b1b49ea9d82b168829886e4c88a42fbb8dc20efa0ee34bef15d494c22824b8
+036.webp	2146	1496	a970e34a184a497b1bd0ec3ed4fc821a2df790d8846c9356392a3d9c801c5f74
+002.webp	1075	1514	7a763bb1bfbc30f17e01f56c5452d8e51f6e8956a5a8159fdade39ecb22330e6
+006.webp	1075	1514	1defc4c0048f2703d88248bc5bb2387acc40d8fd14ffc3c20521d6985311c79f

@@ -87,7 +87,8 @@ fn decode_frame(data: &[u8], f: &container::WebpContainerFrame) -> Option<Animat
         container::WebpFormat::Lossless => {
             let img = vp8l::decode(bitstream).ok()?;
             // 与 image-webp 同口径：VP8L 帧恒视为带 alpha（`frame_has_alpha=true`）。
-            (img.rgba, true)
+            // 动画帧缓冲为自有 `Vec<u8>`：此处一次性拷贝（动画非静态无损热路径）。
+            (img.rgba.as_bytes().to_vec(), true)
         }
         container::WebpFormat::Animated => return None, // ANMF 子块内不会出现该格式
     };

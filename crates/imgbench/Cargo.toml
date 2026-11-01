@@ -84,6 +84,26 @@ name = "webp_release_bench"
 harness = false
 
 [[bench]]
+name = "vp8l_stage_probe"
+# 自定义输出格式（VP8L_STAGE_PROBE 行），不用 Cargo 默认 bench harness。
+harness = false
+
+[[bench]]
+name = "vp8_stage_probe"
+# 自定义输出格式（VP8_STAGE_PROBE 行），不用 Cargo 默认 bench harness。
+harness = false
+
+[[bench]]
+name = "webp_gap_attribution"
+# 自定义输出格式（GAP_ATTR / STAGE_ATTR 行），不用 Cargo 默认 bench harness。
+harness = false
+
+[[bench]]
+name = "webp_dual_conv_probe"
+# 自定义输出格式（DUAL_CONV 行），不用 Cargo 默认 bench harness。
+harness = false
+
+[[bench]]
 name = "gif_jpeg_bmp_release_bench"
 # 自定义输出格式（GIF_JPEG_BMP_RELEASE_BENCH 行），不用 Cargo 默认 bench harness。
 harness = false

@@ -25,6 +25,54 @@ pub(crate) mod simd;
 pub(crate) mod vp8;
 pub(crate) mod vp8l;
 
+// 阶段分账探针公共入口（仅 `stage_profile` feature 编译；供 imgbench 探针调用，K59 统一基座）。
+// feature 关闭时零代码影响（正常构建路径不变）。
+#[cfg(feature = "stage_profile")]
+pub use vp8l::Vp8lStageProfile;
+
+/// 从完整 WEBP 文件抽出 VP8L 位流载荷（`stage_profile` feature 门控；imgbench 探针用）。
+#[cfg(feature = "stage_profile")]
+pub fn vp8l_extract_bitstream(data: &[u8]) -> Option<Vec<u8>> {
+    let c = container::parse(data).ok()?;
+    c.bitstream.map(|b| b.to_vec())
+}
+
+/// 阶段分账解码（`stage_profile` feature 门控；`bitstream` 为 VP8L chunk 载荷，首字节 0x2f）。
+/// 出错返回 `Err(String)`（畸形输入不 panic）。
+#[cfg(feature = "stage_profile")]
+pub fn vp8l_stage_decode(bitstream: &[u8]) -> std::result::Result<Vp8lStageProfile, String> {
+    vp8l::stage_decode(bitstream).map_err(|e| e.0)
+}
+
+// VP8 有损阶帧分账探针公共入口（`stage_profile` feature 门控；供 imgbench `vp8_stage_probe`，
+// K59 统一基座）。feature 关闭时零代码影响（正常构建路径不变）。镜像上方 vp8l 探针姿势。
+#[cfg(feature = "stage_profile")]
+pub use vp8::Vp8StageProfile;
+
+/// 从完整 WEBP 文件抽出 VP8 有损帧（`stage_profile` feature 门控；imgbench 探针用）。
+/// 返回 (VP8 帧载荷, 宽, 高, 是否 LossyAlpha)；非静态有损/解析失败返回 `None`。
+#[cfg(feature = "stage_profile")]
+pub fn vp8_extract_frame(data: &[u8]) -> Option<(Vec<u8>, u32, u32, bool)> {
+    let c = container::parse(data).ok()?;
+    let lossy_alpha = c.family == container::Family::LossyAlpha;
+    if c.family != container::Family::StaticLossy && !lossy_alpha {
+        return None;
+    }
+    let frame = c.bitstream?.to_vec();
+    Some((frame, c.width, c.height, lossy_alpha))
+}
+
+/// 阶段分账解码（`stage_profile` feature 门控；`frame` 为 VP8 帧载荷，`width/height` 来自容器）。
+/// 出错返回 `Err(String)`（畸形输入不 panic）。
+#[cfg(feature = "stage_profile")]
+pub fn vp8_stage_decode(
+    frame: &[u8],
+    width: u32,
+    height: u32,
+) -> std::result::Result<Vp8StageProfile, String> {
+    vp8::stage_decode(frame, width, height).map_err(|e| e.0)
+}
+
 // 外部语料定位助手（与集成测试共享，见 tests/fixtures/webp/mod.rs）。
 #[cfg(test)]
 #[path = "../../../tests/fixtures/webp/mod.rs"]
@@ -34,9 +82,9 @@ mod webp_fixtures_support;
 // 后端开关（M3）
 // ---------------------------------------------------------------------------
 
-/// 自动（默认）：本阶段=image-webp（M6：默认不翻转；待 P3 有损族就绪后一起接管）。
+/// 自动（默认）：自研核优先，未实现/不可解家族自动回 image-webp 兜底（M6 翻转，2026-11）。
 pub const BACKEND_AUTO: u8 = 0;
-/// 强制自研（仅已实现家族=VP8L 静态无损 + VP8 静态有损，未实现家族仍回 image-webp）。
+/// 强制自研（全部已实现家族：VP8/VP8L/ALPH/动画；未实现家族仍回 image-webp）。
 pub const BACKEND_OURS: u8 = 1;
 /// 强制 image-webp（含自研已实现家族）。
 pub const BACKEND_IMAGEWEBP: u8 = 2;
@@ -59,11 +107,13 @@ pub(crate) fn resolved_backend() -> u8 {
     }
     let resolved = match std::env::var("KIMG_WEBP_BACKEND") {
         Ok(v) => match v.to_ascii_lowercase().as_str() {
+            // 显式二进制选择：`ours` 自研 / `imagewebp` 强制兜底。
             "ours" => BACKEND_OURS,
             "imagewebp" | "image-webp" => BACKEND_IMAGEWEBP,
-            _ => BACKEND_AUTO,
+            // `auto` / 其它未知名 / 未设：M6 翻转后默认自研核（2026-11）。
+            _ => BACKEND_OURS,
         },
-        Err(_) => BACKEND_AUTO,
+        Err(_) => BACKEND_OURS,
     };
     match WEBP_BACKEND.compare_exchange(
         BACKEND_AUTO,
@@ -76,10 +126,10 @@ pub(crate) fn resolved_backend() -> u8 {
     }
 }
 
-/// 是否允许自研路径接管：仅 `OURS` 强制态（M6：本阶段默认 AUTO=image-webp，待有损族就绪后
-/// 一起翻转默认；`KIMG_WEBP_BACKEND=ours` 或测试 `set_webp_backend(OURS)` 显式开启）。
+/// 是否允许自研路径接管：AUTO（M6 翻转后默认）与 `OURS` 强制态都放行；仅显式
+/// `KIMG_WEBP_BACKEND=imagewebp`（或测试 `set_webp_backend(IMAGEWEBP)`）强制回兜底。
 fn ours_allowed() -> bool {
-    resolved_backend() == BACKEND_OURS
+    resolved_backend() != BACKEND_IMAGEWEBP
 }
 
 // ---------------------------------------------------------------------------
@@ -89,8 +139,8 @@ fn ours_allowed() -> bool {
 /// 容器解析 + 自研解码产物（P1/P2 填充）。
 #[derive(Default)]
 pub(crate) struct OursStatic {
-    /// 解码后的 RGBA8 像素（长度 = w*h*4）。
-    pub rgba: Vec<u8>,
+    /// 解码后的 RGBA8 像素（长度 = w*h*4；零拷贝封装，见 `vp8l::RgbaBytes`）。
+    pub rgba: vp8l::RgbaBytes,
     pub width: u32,
     pub height: u32,
     /// 实际是否存在 alpha（决定输出 RGBA8 还是 RGB8）。
@@ -293,7 +343,7 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                             "Ours 解码缓冲长度与像素缓冲不一致",
                         )));
                     }
-                    buf.copy_from_slice(&o.rgba);
+                    buf.copy_from_slice(o.rgba.as_bytes());
                 } else {
                     // RGB8 目标：从 RGBA 抽 RGB（buf.len()==w*h*3）。
                     let target = (o.width as usize) * (o.height as usize) * 3;
@@ -303,9 +353,7 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                             "Ours 解码缓冲长度与像素缓冲不一致",
                         )));
                     }
-                    for (px, out) in o.rgba.chunks_exact(4).zip(buf.chunks_exact_mut(3)) {
-                        out.copy_from_slice(&px[..3]);
-                    }
+                    simd::rgba8_to_rgb8(o.rgba.as_bytes(), buf);
                 }
                 Ok(())
             }
@@ -337,9 +385,7 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                             "Ours 动画解码缓冲长度与像素缓冲不一致",
                         )));
                     }
-                    for (px, out) in canvas.chunks_exact(4).zip(buf.chunks_exact_mut(3)) {
-                        out.copy_from_slice(&px[..3]);
-                    }
+                    simd::rgba8_to_rgb8(&canvas, buf);
                 }
                 Ok(())
             }
@@ -526,7 +572,7 @@ pub(crate) fn decode_static_lossy(
         }
     }
     Ok(Some(crate::codecs::webp::OursStatic {
-        rgba,
+        rgba: vp8l::RgbaBytes::from_vec_u8(rgba),
         width: c.width,
         height: c.height,
         has_alpha,

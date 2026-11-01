@@ -1579,17 +1579,18 @@ pub(crate) unsafe fn lf_filter_macroblock(
 // 两个块同行处理，dest 为 8 像素行首。字节==标量唯一标准；随机 parity 断言见模块底部。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn idct_add_two_sse2(src: *const i16, dst: *mut u8, stride: isize) {
+unsafe fn idct_add_two_sse2(coeff_a: *const i16, coeff_b: *const i16, dst: *mut u8, stride: isize) {
     use std::arch::x86_64::*;
     unsafe {
         let k1 = _mm_set1_epi16(20091);
         let k2 = _mm_set1_epi16(-30068);
-        // 各读 4 个 i16（低 64 位），与第二块同排拼成 8 个 i16。
-        let la = |o: usize| _mm_loadl_epi64(src.add(o) as *const __m128i);
-        let in0 = _mm_unpacklo_epi64(la(0), la(16));
-        let in1 = _mm_unpacklo_epi64(la(4), la(20));
-        let in2 = _mm_unpacklo_epi64(la(8), la(24));
-        let in3 = _mm_unpacklo_epi64(la(12), la(28));
+        // 各读 4 个 i16（低 64 位），与第二块同排拼成 8 个 i16（两指针独立取数，无连续缓冲拷贝）。
+        let la = |o: usize| _mm_loadl_epi64(coeff_a.add(o) as *const __m128i);
+        let lb = |o: usize| _mm_loadl_epi64(coeff_b.add(o) as *const __m128i);
+        let in0 = _mm_unpacklo_epi64(la(0), lb(0));
+        let in1 = _mm_unpacklo_epi64(la(4), lb(4));
+        let in2 = _mm_unpacklo_epi64(la(8), lb(8));
+        let in3 = _mm_unpacklo_epi64(la(12), lb(12));
         // 第一遍（行混合）。
         let a = _mm_add_epi16(in0, in2);
         let b = _mm_sub_epi16(in0, in2);
@@ -1607,23 +1608,42 @@ unsafe fn idct_add_two_sse2(src: *const i16, dst: *mut u8, stride: isize) {
         let tmp3 = _mm_sub_epi16(a, d);
         // 转置。
         let (t0, t1, t2, t3) = transpose_2_4x4_16b_sse2(tmp0, tmp1, tmp2, tmp3);
-        // 第二遍（(x+4)>>3 舍入并入）。
-        let four = _mm_set1_epi16(4);
-        let dc = _mm_add_epi16(t0, four);
-        let a2 = _mm_add_epi16(dc, t2);
-        let b2 = _mm_sub_epi16(dc, t2);
-        let c2 = _mm_add_epi16(
-            _mm_sub_epi16(_mm_mulhi_epi16(t1, k2), _mm_mulhi_epi16(t3, k1)),
-            _mm_sub_epi16(t1, t3),
-        );
-        let d2 = _mm_add_epi16(
-            _mm_add_epi16(_mm_mulhi_epi16(t1, k1), _mm_mulhi_epi16(t3, k2)),
-            _mm_add_epi16(t1, t3),
-        );
-        let s0 = _mm_srai_epi16(_mm_add_epi16(a2, d2), 3);
-        let s1 = _mm_srai_epi16(_mm_add_epi16(b2, c2), 3);
-        let s2 = _mm_srai_epi16(_mm_sub_epi16(b2, c2), 3);
-        let s3 = _mm_srai_epi16(_mm_sub_epi16(a2, d2), 3);
+        // 第二遍（(x+4)>>3 舍入并入）：以 i32 中间量计算，杜绝 `_mm_add_epi16` 模 2^16 回绕后
+        // `srai_epi16` 与标量 i32 `((a+4)>>3)` 的偏出（满幅系数 ±32767/-32768 单系数即可触发，
+        // a2+d2、b2±c2 等和超出 i16 域；真实解量化系数量级远小于此，此改动只让内核与标量全输入域一致）。
+        // 高位乘项：`mh16(x,k2)`=`(x*(-30068))>>16`=标量 `(x*35468)>>16` - x（-30068≡35468 mod 2^16），
+        // 故 `(x*35468)>>16 = mh16(x,k2) + x`；`mh16(x,k1)` 即标量 `(x*20091)>>16`。各 i16 项
+        // 符号扩展到 i32 后相加，恒等标量两遍 butterfly 的 i32 中间量（值域容 i32，不溢出）。
+        let m1k2 = _mm_mulhi_epi16(t1, k2); // (t1*35468)>>16 - t1
+        let m3k1 = _mm_mulhi_epi16(t3, k1); // (t3*20091)>>16
+        let m12 = _mm_mulhi_epi16(t1, k1); // (t1*20091)>>16
+        let m32 = _mm_mulhi_epi16(t3, k2); // (t3*35468)>>16 - t3
+        // 拆 A/B 两半并 i16→i32 符号扩展（interleave 各半，保持两块同构独立计算）。
+        let sign_ext = |x: __m128i| {
+            let sm = _mm_srai_epi16(x, 15);
+            (_mm_unpacklo_epi16(x, sm), _mm_unpackhi_epi16(x, sm))
+        };
+        let (t0a, t0b) = sign_ext(t0);
+        let (t1a, t1b) = sign_ext(t1);
+        let (t2a, t2b) = sign_ext(t2);
+        let (t3a, t3b) = sign_ext(t3);
+        let (m1k2a, m1k2b) = sign_ext(m1k2);
+        let (m3k1a, m3k1b) = sign_ext(m3k1);
+        let (m12a, m12b) = sign_ext(m12);
+        let (m32a, m32b) = sign_ext(m32);
+        let (sa0, sa1, sa2, sa3) =
+            idct_pass2_shift32_sse2(t0a, t1a, t2a, t3a, m1k2a, m3k1a, m12a, m32a);
+        let (sb0, sb1, sb2, sb3) =
+            idct_pass2_shift32_sse2(t0b, t1b, t2b, t3b, m1k2b, m3k1b, m12b, m32b);
+        // 打包回 i16（(x+4)>>3 结果恒落 i16 域，饱和=精确）并交还 A/B 组合布局。
+        let pack_ab = |a: __m128i, b: __m128i| {
+            let z = _mm_setzero_si128();
+            _mm_unpacklo_epi64(_mm_packs_epi32(a, z), _mm_packs_epi32(b, z))
+        };
+        let s0 = pack_ab(sa0, sb0);
+        let s1 = pack_ab(sa1, sb1);
+        let s2 = pack_ab(sa2, sb2);
+        let s3 = pack_ab(sa3, sb3);
         let (r0, r1, r2, r3) = transpose_2_4x4_16b_sse2(s0, s1, s2, s3);
         // 加回像素并 clamp [0,255]（packus）再存 8 字节每行。
         let zero = _mm_setzero_si128();
@@ -1656,19 +1676,100 @@ pub(crate) fn inverse_dct_add_two(
 ) {
     #[cfg(target_arch = "x86_64")]
     if part_simd_on("dct", "sse2") {
-        // libwebp 内核按「两 4×4 块在内存中紧邻（32 个 i16）」取数；两个入参是分离数组，
-        // 必须拷进连续缓冲（绝不能依赖栈上巧合相邻——那是不定行为，real 管线曾因 UB 出错）。
-        let mut buf = [0i16; 32];
-        buf[..16].copy_from_slice(coeff_a);
-        buf[16..].copy_from_slice(coeff_b);
+        // 两个入参是分离数组：内核直接按两指针各取 4 个 i16 拼装，不再拷 32 个 i16 连续缓冲
+        // （原先的 `buf` 拷贝是每次调用 64B 的纯开销；两指针加载寄存器内容逐字节相同）。
         let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
         unsafe {
-            idct_add_two_sse2(buf.as_ptr(), dst, pitch as isize);
+            idct_add_two_sse2(coeff_a.as_ptr(), coeff_b.as_ptr(), dst, pitch as isize);
         }
         return;
     }
     super::vp8::inverse_dct_add(coeff_a, plane, pitch, row0, col0, true);
     super::vp8::inverse_dct_add(coeff_b, plane, pitch, row0, col0 + 4, true);
+}
+
+/// 两个水平相邻 4×4 块仅 DC（无 AC）的逆变换捷径：残差恒 `(dc+4)>>3`（与完整两遍变换对
+/// 仅 DC 块逐字节一致，既有 `inverse_dct_has_ac_shortcut_equivalence` 已证）。SSE2 下省去
+/// 两遍 butterfly，直接 16 像素加 DC；无 SIMD 回退逐块 `vp8::inverse_dct_add(has_ac=true)`
+/// （对 [dc,0..0] 块与捷径同输出）。调用方以 `ac_mask` 双块位全 0 判定后进入本路径。
+pub(crate) fn dc_add_two(
+    dc_a: i16,
+    dc_b: i16,
+    plane: &mut [u8],
+    pitch: usize,
+    row0: usize,
+    col0: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if part_simd_on("dct", "sse2") {
+        let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
+        unsafe {
+            dc_add_two_sse2(dc_a, dc_b, dst, pitch as isize);
+        }
+        return;
+    }
+    let mut ca = [0i16; 16];
+    let mut cb = [0i16; 16];
+    ca[0] = dc_a;
+    cb[0] = dc_b;
+    super::vp8::inverse_dct_add(&ca, plane, pitch, row0, col0, true);
+    super::vp8::inverse_dct_add(&cb, plane, pitch, row0, col0 + 4, true);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn dc_add_two_sse2(dc_a: i16, dc_b: i16, dst: *mut u8, stride: isize) {
+    use std::arch::x86_64::*;
+    unsafe {
+        // 残差 = (dc+4)>>3（i32 算术再截 i16；值域 [-4095,4095] 恒落 i16，与标量 `as i16` 相等）。
+        let da = _mm_set1_epi16(((i32::from(dc_a) + 4) >> 3) as i16);
+        let db = _mm_set1_epi16(((i32::from(dc_b) + 4) >> 3) as i16);
+        let zero = _mm_setzero_si128();
+        for r in 0..4isize {
+            let o = r * stride;
+            // 每行载 4 像素（块 a 在 dst，块 b 在 dst+4）。用严格 4 字节非对齐读写：
+            // 右缘块 b 的 +4..+8 超出平面右端（pitch=cw+1），不能用 loadl_epi64 读 8 字节。
+            let a4 = std::ptr::read_unaligned(dst.offset(o) as *const u32);
+            let b4 = std::ptr::read_unaligned(dst.offset(o + 4) as *const u32);
+            let ba = _mm_unpacklo_epi8(_mm_cvtsi32_si128(a4 as i32), zero);
+            let bb = _mm_unpacklo_epi8(_mm_cvtsi32_si128(b4 as i32), zero);
+            let sa = _mm_packus_epi16(_mm_add_epi16(ba, da), zero);
+            let sb = _mm_packus_epi16(_mm_add_epi16(bb, db), zero);
+            std::ptr::write_unaligned(dst.offset(o) as *mut u32, _mm_cvtsi128_si32(sa) as u32);
+            std::ptr::write_unaligned(dst.offset(o + 4) as *mut u32, _mm_cvtsi128_si32(sb) as u32);
+        }
+    }
+}
+
+/// 第二遍一维逆变换的单块 4×i32 版本：入参为已符号扩展的 i32 列向量 t0..t3 与对应高位乘项
+/// `m1k2`=`(t1*35468)>>16 - t1`、`m3k1`=`(t3*20091)>>16`、`m12`=`(t1*20091)>>16`、
+/// `m32`=`(t3*35468)>>16 - t3`。全 i32 相加（无 i16 回绕）后算术右移 3，与标量
+/// `(transform_1d 输出 + 4) >> 3` 逐字节一致；结果恒落 i16 域（≤±16 位），可直接饱和打包。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn idct_pass2_shift32_sse2(
+    t0: __m128i,
+    t1: __m128i,
+    t2: __m128i,
+    t3: __m128i,
+    m1k2: __m128i,
+    m3k1: __m128i,
+    m12: __m128i,
+    m32: __m128i,
+) -> (__m128i, __m128i, __m128i, __m128i) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let four = _mm_set1_epi32(4);
+        let a = _mm_add_epi32(_mm_add_epi32(t0, t2), four);
+        let b = _mm_sub_epi32(_mm_add_epi32(t0, four), t2);
+        let c = _mm_sub_epi32(_mm_add_epi32(m1k2, t1), _mm_add_epi32(t3, m3k1));
+        let d = _mm_add_epi32(_mm_add_epi32(_mm_add_epi32(t1, m12), m32), t3);
+        let s0 = _mm_srai_epi32(_mm_add_epi32(a, d), 3);
+        let s1 = _mm_srai_epi32(_mm_add_epi32(b, c), 3);
+        let s2 = _mm_srai_epi32(_mm_sub_epi32(b, c), 3);
+        let s3 = _mm_srai_epi32(_mm_sub_epi32(a, d), 3);
+        (s0, s1, s2, s3)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2072,7 +2173,9 @@ pub(crate) fn upsample_fancy_into(current: &[u8], adjacent: &[u8], out: &mut [u8
     debug_assert!(out.len() >= 2 * cw - 1);
     let width = out.len();
     let t = &mut t_ws[..cw + 8];
-    t.fill(0);
+    // 仅清零 8 个读安全 padding（`t[0..cw]` 紧随其后整体覆写，无需先零）；padding 值恒零、
+    // 只作末组 SSE 越界读的保护，不参与任何输出字节（逐字节与全场清零恒等）。
+    t[cw..].fill(0);
     for col in 0..cw {
         t[col] = 3 * u16::from(current[col]) + u16::from(adjacent[col]);
     }
@@ -2158,10 +2261,35 @@ unsafe fn upsample_fancy_sse2(t_base: *const u16, out: *mut u8) {
 // ---------------------------------------------------------------------------
 
 /// ARGB 像素（u32：A<<24|R<<16|G<<8|B，内存小端字节序 [B,G,R,A]）→ RGBA8 字节。
-/// 即 vp8l.rs `to_rgba` 的字节序交换（B/R 对调）；SSSE3 每 4 像素一次 shuffle，尾列标量。
+/// 即 vp8l.rs `to_rgba` 的字节序交换（B/R 对调）；AVX2 每 8 像素一次 shuffle，SSSE3 4 像素
+/// 收尾、尾列标量（AVX2 隐含 SSSE3）。字节恒等：shuffle 逐字节独立。
 pub(crate) fn argb_to_rgba(pixels: &[u32], out: &mut [u8]) {
     debug_assert_eq!(out.len(), pixels.len() * 4);
     let n = pixels.len();
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") && n >= 8 {
+        let mut i = 0usize;
+        unsafe {
+            while i + 8 <= n {
+                argb8_to_rgba_avx2(pixels.as_ptr().add(i).cast::<u8>(), out.as_mut_ptr().add(i * 4));
+                i += 8;
+            }
+            while i + 4 <= n {
+                argb4_to_rgba_ssse3(pixels.as_ptr().add(i).cast::<u8>(), out.as_mut_ptr().add(i * 4));
+                i += 4;
+            }
+            while i < n {
+                let p = *pixels.get_unchecked(i);
+                let o = i * 4;
+                *out.get_unchecked_mut(o) = (p >> 16) as u8;
+                *out.get_unchecked_mut(o + 1) = (p >> 8) as u8;
+                *out.get_unchecked_mut(o + 2) = p as u8;
+                *out.get_unchecked_mut(o + 3) = (p >> 24) as u8;
+                i += 1;
+            }
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if simd_on("ssse3") && n >= 4 {
         let mut i = 0usize;
@@ -2190,6 +2318,87 @@ pub(crate) fn argb_to_rgba(pixels: &[u32], out: &mut [u8]) {
     }
 }
 
+/// 原地版 ARGB→RGBA 收尾（`decode()` 复用同一缓冲，省整帧 RGBA 拷贝/分配）：
+/// 每个 u32 的字节 0(B) 与 2(R) 对调（字节 3=A、1=G 原样）→ 内存序即 [R,G,B,A]。
+/// 与 `argb_to_rgba` 逐字节同语义；AVX2/SSSE3 用 32/16 字节 shuffle 原地读写
+/// （load→shuffle→store 同一地址，32 字节全量覆写，安全）。
+pub(crate) fn argb_to_rgba_inplace(pixels: &mut [u32]) {
+    let n = pixels.len();
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") && n >= 8 {
+        unsafe {
+            let p = pixels.as_mut_ptr().cast::<u8>();
+            let mut i = 0usize;
+            while i + 8 <= n {
+                argb8_to_rgba_inplace_avx2(p.add(i * 4));
+                i += 8;
+            }
+            while i + 4 <= n {
+                argb4_to_rgba_inplace_ssse3(p.add(i * 4));
+                i += 4;
+            }
+            while i < n {
+                let b = *pixels.get_unchecked(i);
+                *pixels.get_unchecked_mut(i) =
+                    (b & 0xff00_ff00) | ((b & 0xff) << 16) | ((b >> 16) & 0xff);
+                i += 1;
+            }
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("ssse3") && n >= 4 {
+        unsafe {
+            let p = pixels.as_mut_ptr().cast::<u8>();
+            let mut i = 0usize;
+            while i + 4 <= n {
+                argb4_to_rgba_inplace_ssse3(p.add(i * 4));
+                i += 4;
+            }
+            while i < n {
+                let b = *pixels.get_unchecked(i);
+                *pixels.get_unchecked_mut(i) =
+                    (b & 0xff00_ff00) | ((b & 0xff) << 16) | ((b >> 16) & 0xff);
+                i += 1;
+            }
+        }
+        return;
+    }
+    for px in pixels {
+        let b = *px;
+        *px = (b & 0xff00_ff00) | ((b & 0xff) << 16) | ((b >> 16) & 0xff);
+    }
+}
+
+/// AVX2：8 像素 [B,G,R,A]×8 → [R,G,B,A]×8（原地 B/R 对调）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn argb8_to_rgba_inplace_avx2(px: *mut u8) {
+    use std::arch::x86_64::*;
+    unsafe {
+    let v = _mm256_loadu_si256(px as *const __m256i);
+    // 低 16 字节 4 像素与高 16 字节 4 像素同一 mask（高半区索引 16..31 映射到 shuf 常量）。
+    let shuf = _mm256_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
+                                2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+    let out_v = _mm256_shuffle_epi8(v, shuf);
+    _mm256_storeu_si256(px as *mut __m256i, out_v);
+    }
+}
+
+/// AVX2：8 像素 [B,G,R,A]×8 → [R,G,B,A]×8（写独立输出缓冲）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn argb8_to_rgba_avx2(px: *const u8, out: *mut u8) {
+    use std::arch::x86_64::*;
+    unsafe {
+    let v = _mm256_loadu_si256(px as *const __m256i);
+    let shuf = _mm256_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
+                                2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+    let out_v = _mm256_shuffle_epi8(v, shuf);
+    _mm256_storeu_si256(out as *mut __m256i, out_v);
+    }
+}
+
 /// SSSE3：4 像素 [B,G,R,A]×4 → [R,G,B,A]×4（字节重排：每像素取原 2,1,0,3）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
@@ -2203,10 +2412,47 @@ unsafe fn argb4_to_rgba_ssse3(px: *const u8, out: *mut u8) {
     }
 }
 
+/// SSSE3：4 像素原地 B/R 对调（load→shuffle→store 同一地址，16 字节全量覆写）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn argb4_to_rgba_inplace_ssse3(px: *mut u8) {
+    use std::arch::x86_64::*;
+    unsafe {
+    let v = _mm_loadu_si128(px as *const __m128i);
+    let shuf = _mm_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+    let out_v = _mm_shuffle_epi8(v, shuf);
+    _mm_storeu_si128(px as *mut __m128i, out_v);
+    }
+}
+
 /// Subtract-Green 逆变换（标量语义 `apply_subtract_green`）：R/G 通道 + G 通道（mod 256）。
-/// 像素内存字节 [B,G,R,A]：把 G 字节加到 B 与 R 字节，G/A 原样保留。SSE4.1 每 4 像素，尾列标量。
+/// 像素内存字节 [B,G,R,A]：把 G 字节加到 B 与 R 字节，G/A 原样保留。AVX2 每 8 像素、
+/// SSE4.1 每 4 像素、尾列标量（AVX2 隐含 SSE4.1）。
 pub(crate) fn subtract_green(pixels: &mut [u32]) {
     let n = pixels.len();
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") && n >= 8 {
+        let mut i = 0usize;
+        unsafe {
+            while i + 8 <= n {
+                subtract_green8_avx2(pixels.as_mut_ptr().add(i).cast::<u8>());
+                i += 8;
+            }
+            while i + 4 <= n {
+                subtract_green4_sse41(pixels.as_mut_ptr().add(i).cast::<u8>());
+                i += 4;
+            }
+            while i < n {
+                let p = *pixels.get_unchecked(i);
+                let green = (p >> 8) & 0xff;
+                let red = (((p >> 16) & 0xff).wrapping_add(green)) & 0xff;
+                let blue = ((p & 0xff).wrapping_add(green)) & 0xff;
+                *pixels.get_unchecked_mut(i) = (p & 0xff00_ff00) | (red << 16) | blue;
+                i += 1;
+            }
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if simd_on("sse4.1") && n >= 8 {
         let mut i = 0usize;
@@ -2247,6 +2493,104 @@ unsafe fn subtract_green4_sse41(px: *mut u8) {
     // mask 0xFF00FF00（LE bytes [00,FF,00,FF]）：byte1/byte3 取原值（P），byte0/2 取 sum。
     let res = _mm_blendv_epi8(sum, v, _mm_set1_epi32(0xFF00FF00u32 as i32));
     _mm_storeu_si128(px as *mut __m128i, res);
+    }
+}
+
+/// AVX2：8 像素 Subtract-Green（同 `subtract_green4_sse41` 算术，256 位 1 步 8 像素）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,sse4.1")]
+unsafe fn subtract_green8_avx2(px: *mut u8) {
+    use std::arch::x86_64::*;
+    unsafe {
+    let v = _mm256_loadu_si256(px as *const __m256i);
+    // 每个 16 字节半区：byte1 广播到该像素 4 字节（G→[G,G,G,G]）。
+    let gb = _mm256_shuffle_epi8(v, _mm256_setr_epi8(1, 1, 1, 1, 5, 5, 5, 5, 9, 9, 9, 9, 13, 13, 13, 13,
+                                                      1, 1, 1, 1, 5, 5, 5, 5, 9, 9, 9, 9, 13, 13, 13, 13));
+    let sum = _mm256_add_epi8(v, gb);
+    let res = _mm256_blendv_epi8(sum, v, _mm256_set1_epi32(0xFF00FF00u32 as i32));
+    _mm256_storeu_si256(px as *mut __m256i, res);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RGBA8 ↔ RGB8 通道重排（4→3 抽条 / 3→4 扩写，alpha 恒 255）——双转换去成本
+// （K53 测量：to_rgba8 的 Rgb8 分支像素循环 22.7ms/8.6MP 是大头；SSSE3 扩写 ~6-13ms）。
+// 字节恒等：ssse3 只做逐字节重排 + OR 常量 0xFF，不经任何算术。
+// ---------------------------------------------------------------------------
+
+/// RGBA8 → RGB8 抽条（4→3）：SSSE3 每 4 像素（16B 入 → 12B 出 = 8B 存 + 4B 存），
+/// 尾像素标量（同现有 `chunks_exact` 语义）。无 SSSE3 → 全标量。输入长度须为 4 的倍数。
+pub(crate) fn rgba8_to_rgb8(src: &[u8], dst: &mut [u8]) {
+    debug_assert!(src.len() % 4 == 0);
+    debug_assert_eq!(dst.len(), src.len() / 4 * 3);
+    let n = src.len() / 4;
+    let mut i = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd_on("ssse3") {
+            let s = src.as_ptr();
+            let d = dst.as_mut_ptr();
+            unsafe {
+                while i + 4 <= n {
+                    let v = _mm_loadu_si128(s.add(i * 4) as *const __m128i);
+                    let out = _mm_shuffle_epi8(
+                        v,
+                        _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0, 0, 0, 0),
+                    );
+                    let o = d.add(i * 3);
+                    _mm_storel_epi64(o as *mut __m128i, out);
+                    let hi =
+                        _mm_cvtsi128_si32(_mm_srli_si128(out, 8)) as u32;
+                    std::ptr::write_unaligned(o.add(8) as *mut u32, hi);
+                    i += 4;
+                }
+            }
+        }
+    }
+    // 尾像素 + 无 SIMD 标量兜底（与既有 `chunks_exact(4) → copy_from_slice(&px[..3])` 同字节）。
+    for (px, out) in src[i * 4..].chunks_exact(4).zip(dst[i * 3..].chunks_exact_mut(3)) {
+        out.copy_from_slice(&px[..3]);
+    }
+}
+
+/// RGB8 → RGBA8 扩写（3→4，alpha 恒 255）：SSSE3 每 4 像素（12B 读 → 16B 写；12B 读
+/// 不越界：offset=(n-4)*3 恰 12B ≤ n*3），尾像素标量。无 SSSE3 → 全标量。
+/// 与 `Pixel::to_rgba` 的 `[r,g,b,255]` 逐字节一致。
+pub(crate) fn rgb8_to_rgba8(src: &[u8], dst: &mut [u8]) {
+    debug_assert!(src.len() % 3 == 0);
+    debug_assert_eq!(dst.len(), src.len() / 3 * 4);
+    let n = src.len() / 3;
+    let mut i = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd_on("ssse3") {
+            let s = src.as_ptr();
+            let d = dst.as_mut_ptr();
+            unsafe {
+                while i + 4 <= n {
+                    let lo = _mm_loadl_epi64(s.add(i * 3) as *const __m128i);
+                    let hi32 = std::ptr::read_unaligned(s.add(i * 3 + 8) as *const u32) as i32;
+                    let hi = _mm_cvtsi32_si128(hi32);
+                    let data = _mm_unpacklo_epi64(lo, hi);
+                    // pshufb 索引 0xFF（位 7 置位）→ 输出字节 0；OR 常量 0xFF 得 alpha=255。
+                    let shuf = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
+                    let alpha = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
+                    let out = _mm_shuffle_epi8(data, shuf);
+                    _mm_storeu_si128(
+                        d.add(i * 4) as *mut __m128i,
+                        _mm_or_si128(out, alpha),
+                    );
+                    i += 4;
+                }
+            }
+        }
+    }
+    // 尾像素 + 无 SIMD 标量兜底（与既有 `[r,g,b,255]` 逐字节一致）。
+    for (px, out) in src[i * 3..].chunks_exact(3).zip(dst[i * 4..].chunks_exact_mut(4)) {
+        out[0] = px[0];
+        out[1] = px[1];
+        out[2] = px[2];
+        out[3] = 255;
     }
 }
 
@@ -2885,7 +3229,7 @@ mod tests {
     #[test]
     fn argb_to_rgba_and_subtract_green_match_scalar() {
         let mut rng = Lcg(0x0123456789abcdef);
-        for n in [0usize, 1, 2, 3, 4, 5, 8, 9, 16, 33, 200] {
+        for n in [0usize, 1, 2, 3, 4, 5, 8, 9, 12, 16, 33, 200] {
             let mut px: Vec<u32> = (0..n).map(|_| rng.next() as u32).collect();
             let mut out_simd = vec![0u8; n * 4];
             argb_to_rgba(&px, &mut out_simd);
@@ -2897,6 +3241,21 @@ mod tests {
                 out_scalar[i * 4 + 3] = (p >> 24) as u8;
             }
             assert_eq!(out_simd, out_scalar, "argb_to_rgba n={n}");
+
+            // 原地版：SIMD 收尾 vs 标量逐字节（B/R 对调；覆盖 AVX2 8px / SSSE3 4px / 尾列长）。
+            let mut ip_simd = px.clone();
+            argb_to_rgba_inplace(&mut ip_simd);
+            let ip_ref: Vec<u32> = px
+                .iter()
+                .map(|&p| (p & 0xff00_ff00) | ((p & 0xff) << 16) | ((p >> 16) & 0xff))
+                .collect();
+            assert_eq!(ip_simd, ip_ref, "argb_to_rgba_inplace n={n}");
+            // 原地版逐字节 = 非原地版输出（同一输入）。
+            let ip_bytes: Vec<u8> = ip_simd
+                .iter()
+                .flat_map(|&p| p.to_le_bytes())
+                .collect();
+            assert_eq!(ip_bytes, out_simd, "argb_to_rgba inplace vs out-of-place n={n}");
 
             let simd_px = px.clone();
             subtract_green(&mut px);
@@ -3234,6 +3593,44 @@ mod tests {
         eprintln!("INVERSE_DCT_TWO_SIMD_PARITY\t{checked}");
     }
 
+    #[test]
+    fn dc_add_two_simd_matches_scalar() {
+        if !simd_on("sse2") {
+            eprintln!("SIMD_TEST SKIP (无 sse2)");
+            return;
+        }
+        set_simd_part_override("dct", Some(true)); // 强制 SSE2：DC 捷径内核（仅 DC 块）逐字节==标量
+        let mut rng = Lcg(0x76543210fedcba98);
+        let pitch = 64usize;
+        let mut plane_simd = vec![0u8; 64 * 64];
+        let mut plane_scalar = vec![0u8; 64 * 64];
+        let mut checked = 0usize;
+        for trial in 0..400 {
+            let dc_a = coeff_i16(&mut rng);
+            let dc_b = coeff_i16(&mut rng);
+            for px in plane_simd.iter_mut() {
+                *px = rng.byte();
+            }
+            let (row0, col0) = (8 + (trial % 8), 8 + (trial % 8));
+            plane_scalar.copy_from_slice(&plane_simd);
+            super::dc_add_two(dc_a, dc_b, &mut plane_simd, pitch, row0, col0);
+            // 标量参考：逐块恒 has_ac=true（[dc,0..0] 完整变换残差恒 (dc+4)>>3）。
+            let mut ca = [0i16; 16];
+            let mut cb = [0i16; 16];
+            ca[0] = dc_a;
+            cb[0] = dc_b;
+            super::super::vp8::inverse_dct_add(&ca, &mut plane_scalar, pitch, row0, col0, true);
+            super::super::vp8::inverse_dct_add(&cb, &mut plane_scalar, pitch, row0, col0 + 4, true);
+            assert_eq!(
+                plane_simd, plane_scalar,
+                "dc_add_two trial={trial} dc_a={dc_a} dc_b={dc_b} row0={row0} col0={col0}"
+            );
+            checked += 1;
+        }
+        set_simd_part_override("dct", None);
+        eprintln!("DC_ADD_TWO_SIMD_PARITY\t{checked}");
+    }
+
     // -----------------------------------------------------------------------
     // VP8L 预测器 / 色变换：SIMD（块段分派）与标量逐字节一致
     // -----------------------------------------------------------------------
@@ -3414,5 +3811,115 @@ mod tests {
             }
         }
         eprintln!("VP8L_COLOR_SIMD_PARITY\t{checked}");
+    }
+
+    /// RGBA8↔RGB8 通道重排：SIMD 核（有 SSSE3 时走宽道）与标量逐字节一致
+    /// （长度覆盖：标量尾分支 / SSSE3 整组 / 奇数右缘 / 大缓冲）。
+    #[test]
+    fn rgba8_rgb8_repack_matches_scalar() {
+        let mut rng = Lcg(0x55aa_55aa_55aa_55aa);
+        for n in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 17, 33, 257, 4096] {
+            // 4→3 抽条。
+            let rgba: Vec<u8> = (0..n * 4).map(|_| rng.byte()).collect();
+            let mut rgb_simd = vec![0u8; n * 3];
+            let mut rgb_ref = vec![0u8; n * 3];
+            rgba8_to_rgb8(&rgba, &mut rgb_simd);
+            for (px, out) in rgba.chunks_exact(4).zip(rgb_ref.chunks_exact_mut(3)) {
+                out.copy_from_slice(&px[..3]);
+            }
+            assert_eq!(rgb_simd, rgb_ref, "4→3 n={n}");
+
+            // 3→4 扩写（alpha 恒 255）。
+            let rgb: Vec<u8> = (0..n * 3).map(|_| rng.byte()).collect();
+            let mut rgba_simd = vec![0u8; n * 4];
+            let mut rgba_ref = vec![0u8; n * 4];
+            rgb8_to_rgba8(&rgb, &mut rgba_simd);
+            for (i, px) in rgb.chunks_exact(3).enumerate() {
+                let o = i * 4;
+                rgba_ref[o] = px[0];
+                rgba_ref[o + 1] = px[1];
+                rgba_ref[o + 2] = px[2];
+                rgba_ref[o + 3] = 255;
+            }
+            assert_eq!(rgba_simd, rgba_ref, "3→4 n={n}");
+        }
+        // 边界值：全 0 / 全 255 / 交替（覆盖 OR 0xFF 与 0 字节路径）。
+        for val in [0u8, 1u8, 127, 128, 254, 255] {
+            let rgba = vec![val; 16 * 4];
+            let mut rgb_simd = vec![0u8; 16 * 3];
+            rgba8_to_rgb8(&rgba, &mut rgb_simd);
+            assert!(rgb_simd.iter().all(|&b| b == val), "4→3 flat {val}");
+            let rgb = vec![val; 16 * 3];
+            let mut rgba_simd = vec![0u8; 16 * 4];
+            rgb8_to_rgba8(&rgb, &mut rgba_simd);
+            assert!(
+                rgba_simd
+                    .chunks_exact(4)
+                    .enumerate()
+                    .all(|(_, px)| px[0] == val && px[1] == val && px[2] == val && px[3] == 255),
+                "3→4 flat {val}"
+            );
+        }
+        eprintln!("RGBA_RGB_REPACK_PARITY_OK");
+    }
+
+    /// P2（B3 评审残留→B5 已修）：`idct_add_two_sse2` 双指针核的对抗随机对拍——满幅随机 dc/ac、
+    /// 跨 0/±4095/±4096/±4097 边界、多种子（static override 互踩由调用方 `--test-threads=1` 隔离）。
+    /// 该测试曾因第二遍 i16 回绕偏出（2026-11-01 定位），B5 已改 i32 中间量修复并翻绿；
+    /// 若再偏出，FAIL 并将 seed/trial/系数打屏定位。
+    #[test]
+    fn idct_add_two_full_scale_random_parity() {
+        if !simd_on("sse2") {
+            eprintln!("SIMD_TEST SKIP idct_two (无 sse2)");
+            return;
+        }
+        set_simd_part_override("dct", Some(true)); // 强制 SSE2 双指针核
+        let boundaries: [i16; 16] = [
+            0, 1, -1, 4095, -4095, 4096, -4096, 4097, -4097, 2047, -2048, 8192, -8192, 32767, -32768, 16384,
+        ];
+        let pitch = 64usize;
+        let mut plane_simd = vec![0u8; 64 * 64];
+        let mut plane_scalar = vec![0u8; 64 * 64];
+        let mut checked = 0usize;
+        for seed in [
+            0x1234_5678_9abc_def0u64,
+            0x0bad_cafe_f00d_1111,
+            0xfeed_f00d_abcd_2222,
+            0xdead_beef_1234_3333,
+        ] {
+            let mut rng = Lcg(seed);
+            for trial in 0..300 {
+                let mut ca = [0i16; 16];
+                let mut cb = [0i16; 16];
+                for k in 0..16 {
+                    // 满幅均匀随机（全 i16 值域），偶发注入跨 0/±4096 边界值。
+                    ca[k] = if rng.next() % 7 == 0 {
+                        boundaries[(rng.next() as usize) % boundaries.len()]
+                    } else {
+                        (rng.next() as u16) as i16
+                    };
+                    cb[k] = if rng.next() % 7 == 0 {
+                        boundaries[(rng.next() as usize) % boundaries.len()]
+                    } else {
+                        (rng.next() as u16) as i16
+                    };
+                }
+                for px in plane_simd.iter_mut() {
+                    *px = rng.byte();
+                }
+                let (row0, col0) = (8 + (trial % 9), 8 + (trial % 9));
+                plane_scalar.copy_from_slice(&plane_simd);
+                super::inverse_dct_add_two(&ca, &cb, &mut plane_simd, pitch, row0, col0);
+                super::super::vp8::inverse_dct_add(&ca, &mut plane_scalar, pitch, row0, col0, true);
+                super::super::vp8::inverse_dct_add(&cb, &mut plane_scalar, pitch, row0, col0 + 4, true);
+                assert_eq!(
+                    plane_simd, plane_scalar,
+                    "idct_two seed=0x{seed:016x} trial={trial} row0={row0} col0={col0} ca={ca:?} cb={cb:?}"
+                );
+                checked += 1;
+            }
+        }
+        set_simd_part_override("dct", None);
+        eprintln!("IDCT_TWO_FULLSCALE_RANDOM_PARITY\t{checked}");
     }
 }
