@@ -237,3 +237,21 @@ impl ImageError {
         ImageError::IoError(err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 栈足迹回归护栏（2026-11-02）：自研 GIF 的 `LzwDecoder`（4 条 4096 定长表 ≈48KB）
+    /// 曾按值嵌入 `Scratch`，把 `GenericDecoder` 枚举撑到 ~49KB——启动首帧欢迎页经
+    /// `ImageReader::decode()` 在 1MB 主线程栈构造该枚举即爆栈（STATUS_STACK_OVERFLOW）。
+    /// 装箱后 `GifDecoder` 须保持百字节级，防止按值回退再次把枚举撑大。
+    #[test]
+    fn gif_decoder_stack_footprint_is_small() {
+        let size = std::mem::size_of::<GifDecoder<std::io::Cursor<&'static [u8]>>>();
+        assert!(
+            size < 1024,
+            "GifDecoder 应为堆分配小对象，实际 {size}B（防 48KB LzwDecoder 按值回退）"
+        );
+    }
+}

@@ -13,8 +13,13 @@ use super::container::{clip_rect, Disposal, GifFrame};
 use super::lzw::{LzwDecoder, gather_sub_blocks};
 
 /// 跨帧复用缓冲：LZW 表 + 码流 + 索引。分配只升不降。
+///
+/// `lzw` 走堆分配（`Box<LzwDecoder>`）：`LzwDecoder` 内含 4 条 4096 定长表（≈48KB），
+/// 若按值嵌入会撑大 `GenericDecoder` 枚举（由最大变体定大小）到 ~49KB——启动首帧
+/// 欢迎页经 `ImageReader::decode()` 在 1MB 主线程栈上构造该枚举即爆栈（STATUS_STACK_OVERFLOW，
+/// 见 commit 6770194 引入自研 GIF 后的栈回溯）。装箱后 `GifDecoder` ≈ 百字节级，枚举随之缩小。
 pub(crate) struct Scratch {
-    pub lzw: LzwDecoder,
+    pub lzw: Box<LzwDecoder>,
     codes: Vec<u8>,
     indices: Vec<u8>,
 }
@@ -22,7 +27,7 @@ pub(crate) struct Scratch {
 impl Scratch {
     pub fn new() -> Scratch {
         Scratch {
-            lzw: LzwDecoder::default(),
+            lzw: Box::new(LzwDecoder::default()),
             codes: Vec::new(),
             indices: Vec::new(),
         }
