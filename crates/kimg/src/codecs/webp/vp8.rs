@@ -1059,17 +1059,18 @@ const BLOCK_LEFT_CONTEXT_BIT: [u32; 25] = [
 const NZ_Y2: u32 = 1 << 24;
 
 /// RFC 6386 §13.2 DCT_CAT3..6 子树（p8 之后）附额外位。熵态按值携带（寄存器驻留）。
+/// 概率读用裸指针游标 `p`（`tokens` 传入，指向当前 p_idx 处）：读 `p[k]`（k=8..10）。
+/// 不变量与 `tokens` 同证：p_idx ≤ 253、p_idx+10 ≤ 263 < 264（每型概率表长）→ 恒不越界。
 #[inline(always)]
 fn read_category_3_to_6<'a>(
     mut d: Vp8BoolDecoder<'a>,
-    probs: &[u8],
-    p_idx: usize,
+    p: *const u8,
 ) -> (Vp8BoolDecoder<'a>, i32) {
     let (extra, base): (&[u8], i32) = {
-        let (dd, b) = d.read_bit_val(probs[p_idx + 8]);
+        let (dd, b) = d.read_bit_val(unsafe { *p.add(8) });
         d = dd;
         if b == 0 {
-            let (dd, b) = d.read_bit_val(probs[p_idx + 9]);
+            let (dd, b) = d.read_bit_val(unsafe { *p.add(9) });
             d = dd;
             if b == 0 {
                 (&PCAT3, 11)
@@ -1077,7 +1078,7 @@ fn read_category_3_to_6<'a>(
                 (&PCAT4, 19)
             }
         } else {
-            let (dd, b) = d.read_bit_val(probs[p_idx + 10]);
+            let (dd, b) = d.read_bit_val(unsafe { *p.add(10) });
             d = dd;
             if b == 0 {
                 (&PCAT5, 35)
@@ -1110,14 +1111,23 @@ fn tokens<'a>(
     dc_factor: i32,
     ac_factor: i32,
 ) -> (Vp8BoolDecoder<'a>, usize) {
-    let mut p_idx = BAND_ROW_OFFSETS[position] + context * 11;
+    // 熵概率读不变量（证明）：`BAND_ROW_OFFSETS` 最大 231（position≤15），context≤2、
+    // next_context∈{11,22} ⇒ p_idx ≤ 253；概率表按型分块 8*33=264 字节、`probabilities` 切片长
+    // 恒 ≥ 264（`parse_residuals` 传 `probs[ty*264..]`，表总长 1056）⇒ p_idx+10 ≤ 263 < 264。
+    // 故裸指针游标 `p = base.add(p_idx)` 读 `p[k]`（k≤10）恒不越界——用指针游标省去每次
+    // `probabilities[p_idx+k]` 的边界检查，读到的概率字节与下标版逐字节相同（libwebp vp8_dec.c
+    // 的 `const uint8_t* p` 滑动游标同款姿势，参考不抄）。
+    let p_idx = BAND_ROW_OFFSETS[position] + context * 11;
+    debug_assert!(p_idx + 10 < probabilities.len());
+    let base = probabilities.as_ptr();
+    let mut p = unsafe { base.add(p_idx) };
     stage_clock::acct();
     let mut last = 0usize;
-    let (dd, b) = d.read_bit_val(probabilities[p_idx]);
+    let (dd, b) = d.read_bit_val(unsafe { *p });
     d = dd;
     if b != 0 {
         loop {
-            let (dd, b) = d.read_bit_val(probabilities[p_idx + 1]);
+            let (dd, b) = d.read_bit_val(unsafe { *p.add(1) });
             d = dd;
             if b == 0 {
                 stage_clock::acct();
@@ -1126,32 +1136,32 @@ fn tokens<'a>(
                     break;
                 }
                 stage_clock::acct();
-                p_idx = BAND_ROW_OFFSETS[position];
+                p = unsafe { base.add(BAND_ROW_OFFSETS[position]) };
                 continue;
             }
             let (value, next_context): (i32, usize) = {
-                let (dd, b) = d.read_bit_val(probabilities[p_idx + 2]);
+                let (dd, b) = d.read_bit_val(unsafe { *p.add(2) });
                 d = dd;
                 if b == 0 {
                     (1, 11)
                 } else {
-                    let (dd, b) = d.read_bit_val(probabilities[p_idx + 3]);
+                    let (dd, b) = d.read_bit_val(unsafe { *p.add(3) });
                     d = dd;
                     if b == 0 {
-                        let (dd, b) = d.read_bit_val(probabilities[p_idx + 4]);
+                        let (dd, b) = d.read_bit_val(unsafe { *p.add(4) });
                         d = dd;
                         if b == 0 {
                             (2, 22)
                         } else {
-                            let (dd, b) = d.read_bit_val(probabilities[p_idx + 5]);
+                            let (dd, b) = d.read_bit_val(unsafe { *p.add(5) });
                             d = dd;
                             (3 + b as i32, 22)
                         }
                     } else {
-                        let (dd, b) = d.read_bit_val(probabilities[p_idx + 6]);
+                        let (dd, b) = d.read_bit_val(unsafe { *p.add(6) });
                         d = dd;
                         if b == 0 {
-                            let (dd, b) = d.read_bit_val(probabilities[p_idx + 7]);
+                            let (dd, b) = d.read_bit_val(unsafe { *p.add(7) });
                             d = dd;
                             if b == 0 {
                                 let (dd, b) = d.read_bit_val(159);
@@ -1166,7 +1176,7 @@ fn tokens<'a>(
                                 (7 + (high | b) as i32, 22)
                             }
                         } else {
-                            let (dd, cat) = read_category_3_to_6(d, probabilities, p_idx);
+                            let (dd, cat) = read_category_3_to_6(d, p);
                             d = dd;
                             (cat, 22)
                         }
@@ -1187,8 +1197,8 @@ fn tokens<'a>(
                 break;
             }
             stage_clock::acct();
-            p_idx = BAND_ROW_OFFSETS[position] + next_context;
-            let (dd, b) = d.read_bit_val(probabilities[p_idx]);
+            p = unsafe { base.add(BAND_ROW_OFFSETS[position] + next_context) };
+            let (dd, b) = d.read_bit_val(unsafe { *p });
             d = dd;
             if b == 0 {
                 break; // 下一位置 EOB。
@@ -1268,6 +1278,10 @@ fn parse_residuals(
 }
 
 /// 树遍历：node + read_bit_val(prob[node>>1]) 沿树下行，叶子（≤0）返回 -child。熵态按值携带。
+/// 概率读用裸指针（去边界检查）：全部三处调用（SEGMENT_ID / KEYFRAME_Y_MODE / UV_MODE）的可达
+/// 节点 node∈{0,2,4,6}（逐树验证于 vp8_tables.rs）⇒ node>>1 ≤ 3 且 < 表长；
+/// 三处 probs 表长 3/4/3，len-3 表实际最大下标 2。新增调用点须复查本不变量，
+/// 否则改回 `probabilities[node >> 1]` 有界读。
 #[inline(always)]
 fn read_tree<'a>(
     mut d: Vp8BoolDecoder<'a>,
@@ -1275,8 +1289,10 @@ fn read_tree<'a>(
     probabilities: &[u8],
 ) -> (Vp8BoolDecoder<'a>, u32) {
     let mut node = 0usize;
+    let base = probabilities.as_ptr();
     loop {
-        let (dd, bit) = d.read_bit_val(probabilities[node >> 1]);
+        debug_assert!((node >> 1) < probabilities.len());
+        let (dd, bit) = d.read_bit_val(unsafe { *base.add(node >> 1) });
         d = dd;
         let child = tree[node + bit as usize];
         if child <= 0 {
@@ -3145,7 +3161,8 @@ impl EmitScratch {
         EmitScratch {
             u_up: vec![0u8; width],
             v_up: vec![0u8; width],
-            t_ws: vec![0u16; cw + 8],
+            // U/V 两行 t 工作区共存（`upsample_fancy_into_uv` 各用 cw+8）。
+            t_ws: vec![0u16; 2 * (cw + 8)],
         }
     }
 }
@@ -3187,8 +3204,11 @@ fn emit_rows_into_rgba(
         let yba = row * y_pitch + 1;
         let u0 = chroma_row * uv_pitch + 1;
         let u1 = adjacent * uv_pitch + 1;
-        super::simd::upsample_fancy_into(&u[u0..u0 + cw], &u[u1..u1 + cw], &mut ws.u_up, &mut ws.t_ws);
-        super::simd::upsample_fancy_into(&v[u0..u0 + cw], &v[u1..u1 + cw], &mut ws.v_up, &mut ws.t_ws);
+        super::simd::upsample_fancy_into_uv(
+            &u[u0..u0 + cw], &u[u1..u1 + cw],
+            &v[u0..u0 + cw], &v[u1..u1 + cw],
+            &mut ws.u_up, &mut ws.v_up, &mut ws.t_ws,
+        );
         super::simd::yuv_row_to_rgba(&y[yba..yba + width], &ws.u_up, &ws.v_up, &mut rgba[row * width * 4..(row + 1) * width * 4]);
     }
     });
@@ -3241,8 +3261,8 @@ pub(crate) fn yuv_to_rgba_fancy(yuv: &mut Vp8Yuv) -> Vec<u8> {
     let mut rgba = vec![0u8; w * h * 4];
     let mut u_up = vec![0u8; w];
     let mut v_up = vec![0u8; w];
-    // 复用上采样工作区（t 行缓冲），避免逐行分配。
-    let mut t_ws = vec![0u16; cw + 8];
+    // 复用上采样工作区（U/V 两行 t 缓冲共存，`upsample_fancy_into_uv` 各用 cw+8），避免逐行分配。
+    let mut t_ws = vec![0u16; 2 * (cw + 8)];
     for row in 0..h {
         let chroma_row = row >> 1;
         let adjacent = if row % 2 == 0 {
@@ -3260,8 +3280,7 @@ pub(crate) fn yuv_to_rgba_fancy(yuv: &mut Vp8Yuv) -> Vec<u8> {
         let u_adj = &yuv.u[adjacent * cw..(adjacent + 1) * cw];
         let v_row = &yuv.v[chroma_row * cw..(chroma_row + 1) * cw];
         let v_adj = &yuv.v[adjacent * cw..(adjacent + 1) * cw];
-        super::simd::upsample_fancy_into(u_row, u_adj, &mut u_up, &mut t_ws);
-        super::simd::upsample_fancy_into(v_row, v_adj, &mut v_up, &mut t_ws);
+        super::simd::upsample_fancy_into_uv(u_row, u_adj, v_row, v_adj, &mut u_up, &mut v_up, &mut t_ws);
         let y_row = &yuv.y[row * w..(row + 1) * w];
         let out = &mut rgba[row * w * 4..(row + 1) * w * 4];
         super::simd::yuv_row_to_rgba(y_row, &u_up, &v_up, out);

@@ -2261,6 +2261,8 @@ pub(crate) fn upsample_fancy_row(current: &[u8], adjacent: &[u8], width: usize) 
 }
 
 /// fancy 上采样写入调用方缓冲（复用 `out`/`t_ws`，避免逐行分配；`t_ws` 须 ≥ `cw+8`）。
+/// 生产热路径改走 [`upsample_fancy_into_uv`]（U/V 合并）；本函数保留为标量对拍参考/测试路径。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn upsample_fancy_into(current: &[u8], adjacent: &[u8], out: &mut [u8], t_ws: &mut [u16]) {
     debug_assert_eq!(current.len(), adjacent.len());
     let cw = current.len();
@@ -2270,8 +2272,24 @@ pub(crate) fn upsample_fancy_into(current: &[u8], adjacent: &[u8], out: &mut [u8
     // 仅清零 8 个读安全 padding（`t[0..cw]` 紧随其后整体覆写，无需先零）；padding 值恒零、
     // 只作末组 SSE 越界读的保护，不参与任何输出字节（逐字节与全场清零恒等）。
     t[cw..].fill(0);
-    for col in 0..cw {
+    // t 行 `3*cur + adj`：SSE2 每 16 列一组（u16 16-lane），不足 16 列尾标量；经 unpack 零扩展
+    // 后逐值等于标量（3*255+255=1020 < 2^16 无溢出），`t[0..cw]` 写满语义不变。
+    let mut col = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("sse2") {
+        let cp = current.as_ptr();
+        let ap = adjacent.as_ptr();
+        let tp = t.as_mut_ptr();
+        unsafe {
+            while col + 16 <= cw {
+                upsample_fancy_trow_sse2(cp.add(col), ap.add(col), tp.add(col));
+                col += 16;
+            }
+        }
+    }
+    while col < cw {
         t[col] = 3 * u16::from(current[col]) + u16::from(adjacent[col]);
+        col += 1;
     }
     let out = &mut out[..width];
 
@@ -2315,6 +2333,131 @@ pub(crate) fn upsample_fancy_into(current: &[u8], adjacent: &[u8], out: &mut [u8
 
     // 无 SIMD / 未满 6 列：直接复用 vp8 标量（单一算术源，边界语义零漂移）。
     out.copy_from_slice(&super::vp8::upsample_fancy(current, adjacent, width));
+}
+
+/// SSE2：一次载入 `current`/`adjacent` 的 16 字节 → unpack 零扩展成 16 u16 → 算
+/// `t = 3*current + adjacent` 写 16 个 u16。与标量 `t[i] = 3*cur[i] + adj[i]` 逐值相等
+/// （3*255+255=1020 < u16::MAX 无溢出；调用方保证 `col+16 ≤ cw` 不越界）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn upsample_fancy_trow_sse2(cur: *const u8, adj: *const u8, t: *mut u16) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let c = _mm_loadu_si128(cur as *const __m128i);
+        let a = _mm_loadu_si128(adj as *const __m128i);
+        let three = _mm_set1_epi16(3);
+        let zero = _mm_setzero_si128();
+        let clo = _mm_unpacklo_epi8(c, zero);
+        let chi = _mm_unpackhi_epi8(c, zero);
+        let alo = _mm_unpacklo_epi8(a, zero);
+        let ahi = _mm_unpackhi_epi8(a, zero);
+        let tlo = _mm_add_epi16(_mm_mullo_epi16(clo, three), alo);
+        let thi = _mm_add_epi16(_mm_mullo_epi16(chi, three), ahi);
+        _mm_storeu_si128(t as *mut __m128i, tlo);
+        _mm_storeu_si128((t as *mut __m128i).add(1), thi);
+    }
+}
+
+/// fancy 上采样 U/V 两行一次完成（参照 D2 `lf_uv_pair` 的 U/V 双平面打包先例，把两次
+/// `upsample_fancy_into` 合并成同一循环构建两 t 行 + 同一循环处理两输出平面，省散布往返）。
+/// 语义与逐平面调用 [`upsample_fancy_into`] 完全一致（逐字节）：t 行 `3*cur+adj`、边界列、
+/// 中间列对 `(3*t±邻居+8)>>4` 全同算术，仅调用形态合并。`t_ws` 须 ≥ `2*(cw+8)`（低半 U、高半 V）。
+pub(crate) fn upsample_fancy_into_uv(
+    u_cur: &[u8],
+    u_adj: &[u8],
+    v_cur: &[u8],
+    v_adj: &[u8],
+    u_out: &mut [u8],
+    v_out: &mut [u8],
+    t_ws: &mut [u16],
+) {
+    let cw = u_cur.len();
+    debug_assert_eq!(u_cur.len(), u_adj.len());
+    debug_assert_eq!(v_cur.len(), v_adj.len());
+    debug_assert_eq!(u_cur.len(), v_cur.len());
+    debug_assert!(u_out.len() >= 2 * cw - 1);
+    debug_assert_eq!(u_out.len(), v_out.len());
+    let width = u_out.len();
+    debug_assert!(t_ws.len() >= 2 * (cw + 8));
+    let (tu, tv) = t_ws.split_at_mut(cw + 8);
+    // padding 值恒零、只作末组 SSE 越界读保护（语义同单平面版）。
+    tu[cw..].fill(0);
+    tv[cw..].fill(0);
+    // t 行合并构建：同一循环内向量化两平面（U/V 各 16 列/组），尾部标量。
+    let mut col = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("sse2") {
+        let ucp = u_cur.as_ptr();
+        let uap = u_adj.as_ptr();
+        let vcp = v_cur.as_ptr();
+        let vap = v_adj.as_ptr();
+        let tup = tu.as_mut_ptr();
+        let tvp = tv.as_mut_ptr();
+        unsafe {
+            while col + 16 <= cw {
+                upsample_fancy_trow_sse2(ucp.add(col), uap.add(col), tup.add(col));
+                upsample_fancy_trow_sse2(vcp.add(col), vap.add(col), tvp.add(col));
+                col += 16;
+            }
+        }
+    }
+    while col < cw {
+        tu[col] = 3 * u16::from(u_cur[col]) + u16::from(u_adj[col]);
+        tv[col] = 3 * u16::from(v_cur[col]) + u16::from(v_adj[col]);
+        col += 1;
+    }
+    let uo = &mut u_out[..width];
+    let vo = &mut v_out[..width];
+
+    // 边界列（U/V 同款算术，两平面并算）。
+    let (fu, fv) = (tu[0], tv[0]);
+    uo[0] = ((4 * fu + 8) >> 4) as u8;
+    vo[0] = ((4 * fv + 8) >> 4) as u8;
+    if width > 1 {
+        let (nu, nv) = if cw > 1 { (tu[1], tv[1]) } else { (fu, fv) };
+        uo[1] = ((3 * fu + nu + 8) >> 4) as u8;
+        vo[1] = ((3 * fv + nv + 8) >> 4) as u8;
+    }
+    if cw > 1 {
+        let last_col = cw - 1;
+        let (cu, cv) = (tu[last_col], tv[last_col]);
+        let oc = last_col * 2;
+        uo[oc] = ((3 * cu + tu[last_col - 1] + 8) >> 4) as u8;
+        vo[oc] = ((3 * cv + tv[last_col - 1] + 8) >> 4) as u8;
+        if oc + 1 < width {
+            uo[oc + 1] = ((4 * cu + 8) >> 4) as u8;
+            vo[oc + 1] = ((4 * cv + 8) >> 4) as u8;
+        }
+    }
+
+    // 中间列对（col=1..cw-2）：每 4 列一组 SSSE3 各推 8 字节（同一迭代内 U/V），尾列标量。
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("ssse3") && cw >= 6 {
+        let mut col = 1usize;
+        unsafe {
+            // 窗口 t[col-1..col+5]（6 个 u16）+ 8 填充保证 8 u16 读安全：col+5 ≤ cw。
+            while col + 4 < cw {
+                upsample_fancy_sse2(tu.as_ptr().add(col - 1), uo.as_mut_ptr().add(col * 2));
+                upsample_fancy_sse2(tv.as_ptr().add(col - 1), vo.as_mut_ptr().add(col * 2));
+                col += 4;
+            }
+        }
+        while col < cw.saturating_sub(1) {
+            let oc = col * 2;
+            let cu = tu[col];
+            let cv = tv[col];
+            uo[oc] = ((3 * cu + tu[col - 1] + 8) >> 4) as u8;
+            uo[oc + 1] = ((3 * cu + tu[col + 1] + 8) >> 4) as u8;
+            vo[oc] = ((3 * cv + tv[col - 1] + 8) >> 4) as u8;
+            vo[oc + 1] = ((3 * cv + tv[col + 1] + 8) >> 4) as u8;
+            col += 1;
+        }
+        return;
+    }
+
+    // 无 SIMD / 未满 6 列：直接复用 vp8 标量（单一算术源，边界语义零漂移）。
+    uo.copy_from_slice(&super::vp8::upsample_fancy(u_cur, u_adj, width));
+    vo.copy_from_slice(&super::vp8::upsample_fancy(v_cur, v_adj, width));
 }
 
 /// SSSE3：处理 `t_base` 处的 8 个 u16（t[col-1..col+6]，后者可有填充），对 4 个连续
@@ -3391,6 +3534,39 @@ mod tests {
             }
         }
         eprintln!("UPSAMPLE_FANCY_SIMD_PARITY_OK");
+    }
+
+    /// fancy 上采样 U/V 合并路径 vs 单平面路径（单平面已与 vp8 标量逐字节对拍）逐字节一致。
+    /// 覆盖 cw∈{1,2,…} 奇偶输出宽与 cw≤1 边界（cw=0 无输出宽，跳过与单平面测试一致）。
+    #[test]
+    fn upsample_fancy_uv_matches_single() {
+        let mut rng = Lcg(0x9e3779b97f4a7c15);
+        for cw in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 64, 129] {
+            for wmul in [0usize, 1] {
+                if cw == 0 {
+                    continue;
+                }
+                // 输出宽 = 2*cw 或 2*cw-1（奇数原宽时末列仅左像素）。
+                let width = 2 * cw - wmul;
+                let u_cur: Vec<u8> = (0..cw).map(|_| rng.byte()).collect();
+                let u_adj: Vec<u8> = (0..cw).map(|_| rng.byte()).collect();
+                let v_cur: Vec<u8> = (0..cw).map(|_| rng.byte()).collect();
+                let v_adj: Vec<u8> = (0..cw).map(|_| rng.byte()).collect();
+                // 单平面（对照）路径。
+                let u_single = upsample_fancy_row(&u_cur, &u_adj, width);
+                let v_single = upsample_fancy_row(&v_cur, &v_adj, width);
+                // 合并路径。
+                let mut u_out = vec![0u8; width];
+                let mut v_out = vec![0u8; width];
+                let mut t_ws = vec![0u16; 2 * (cw + 8)];
+                upsample_fancy_into_uv(
+                    &u_cur, &u_adj, &v_cur, &v_adj, &mut u_out, &mut v_out, &mut t_ws,
+                );
+                assert_eq!(u_out, u_single, "U cw={cw} width={width}: 合并 vs 单平面");
+                assert_eq!(v_out, v_single, "V cw={cw} width={width}: 合并 vs 单平面");
+            }
+        }
+        eprintln!("UPSAMPLE_FANCY_UV_PARITY_OK");
     }
 
     // -----------------------------------------------------------------------
