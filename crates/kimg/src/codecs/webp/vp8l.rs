@@ -123,19 +123,20 @@ impl<'a> BitReader<'a> {
         if bits < 15 {
             self.refill(&mut buffer, &mut bits)?;
         }
-        let sym = read_symbol(table, root_mask, &mut buffer, &mut bits);
+        let sym = read_symbol(table.as_ptr(), root_mask, &mut buffer, &mut bits);
         self.buffer = buffer;
         self.bits = bits;
         Ok(sym)
     }
 
     /// 把 `bits`（入口 <56）至少补到 56。
+    /// `#[inline(always)]`：对齐 vp8.rs 参考（81a9438）熵态寄存器驻留手法。
+    #[inline(always)]
     fn refill(&mut self, buffer: &mut u64, bits: &mut u32) -> Result<()> {
         if self.pos + 8 <= self.data.len() {
-            // 整 8 字节非对齐读入（区内安全）。
-            let mut chunk = [0u8; 8];
-            chunk.copy_from_slice(&self.data[self.pos..self.pos + 8]);
-            let loaded = u64::from_le_bytes(chunk);
+            // 整 8 字节非对齐直读（区长度已保证读前 pos+8<=len，x86 LE 单条加载）。
+            let loaded =
+                unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
             *buffer |= loaded << *bits;
             let take = (63 - *bits) >> 3;
             self.pos += take as usize;
@@ -180,15 +181,17 @@ const SUBTABLE_FLAG: u32 = 0x100;
 
 /// 解码一个符号（入口 ≥15 位缓冲）。根条目 = `(symbol<<16)|length` 或
 /// 二级表指针 `(start<<16)|SUBTABLE_FLAG|subBits`。
-/// 热路径用 `get_unchecked`：`table` 长度在建表期已 `ensure`（≥ 1<<ROOT_BITS + 二级表），
-/// 索引恒在界内（K42 上限在建表校验），parity 全量覆盖标量/向量一致性。
-fn read_symbol(table: &[u32], root_mask: u32, buffer: &mut u64, bits: &mut u32) -> u32 {
+/// 热路径用裸指针：`table` 指向 `tables.data + 通道偏移`，该区域长度在建表期已
+/// `ensure`（≥ 1<<ROOT_BITS + 二级表），索引恒在区域内（K42 上限在建表校验），
+/// parity 全量覆盖标量/向量一致性。
+#[inline(always)]
+fn read_symbol(table: *const u32, root_mask: u32, buffer: &mut u64, bits: &mut u32) -> u32 {
     unsafe {
-        let entry = *table.get_unchecked((*buffer as u32 & root_mask) as usize);
+        let entry = *table.add((*buffer as u32 & root_mask) as usize);
         let entry = if entry & SUBTABLE_FLAG != 0 {
             let index =
                 (entry >> 16) + ((*buffer as u32 >> ROOT_BITS) & ((1 << (entry & 0xff)) - 1));
-            *table.get_unchecked(index as usize)
+            *table.add(index as usize)
         } else {
             entry
         };
@@ -244,14 +247,20 @@ fn distance(value: u32, width: u32) -> Result<u32> {
 }
 
 /// 重叠/非重叠 LZ77 回看拷贝（对齐 C# `CopyBackward`）。
+/// 调用点已自证 `distance <= position` 与 `position + length <= len`，
+/// 本函数不再重复全量界查（≤16 短环走裸指针；distance==1 走批量填充）。
 fn copy_backward(pixels: &mut [u32], position: usize, distance: usize, length: usize) {
     debug_assert!(distance <= position);
     debug_assert!(position + length <= pixels.len());
     let source = position - distance;
     if length <= 16 {
+        // 短距离去界查（前置不变式已穷尽入界）。前向逐写保持重叠语义。
+        let p = pixels.as_mut_ptr();
         for i in 0..length {
-            let v = pixels[source + i];
-            pixels[position + i] = v;
+            unsafe {
+                let v = p.add(source + i).read();
+                p.add(position + i).write(v);
+            }
         }
         return;
     }
@@ -261,9 +270,9 @@ fn copy_backward(pixels: &mut [u32], position: usize, distance: usize, length: u
     }
     if distance == 1 {
         let v = pixels[source];
-        for p in &mut pixels[position..position + length] {
-            *p = v;
-        }
+        // 相邻回写 = 值先读自 source（= position-1）后批量填充，无重叠读依赖；
+        // `fill` 让 LLVM 生成宽存储。
+        pixels[position..position + length].fill(v);
         return;
     }
     let mut copied = 0;
@@ -289,20 +298,21 @@ struct Transform {
 
 }
 
-fn add_argb(a: u32, b: u32) -> u32 {
+// 以下标量助手对 simd.rs 公开（SIMD 段核/标量尾共用同一语义源，保证字节一致）。
+pub(crate) fn add_argb(a: u32, b: u32) -> u32 {
     (((((a >> 24) & 0xff) + ((b >> 24) & 0xff)) & 0xff) << 24)
         | ((((a >> 16) & 0xff) + ((b >> 16) & 0xff)) & 0xff) << 16
         | ((((a >> 8) & 0xff) + ((b >> 8) & 0xff)) & 0xff) << 8
         | ((a & 0xff) + (b & 0xff)) & 0xff
 }
 
-fn color_delta(transform: u32, color: u32) -> i32 {
+pub(crate) fn color_delta(transform: u32, color: u32) -> i32 {
     let t = (transform as u8 as i8) as i32;
     let c = (color as u8 as i8) as i32;
     t.wrapping_mul(c) >> 5
 }
 
-fn average(a: u32, b: u32) -> u32 {
+pub(crate) fn average(a: u32, b: u32) -> u32 {
     ((((a >> 24) & 0xff) + ((b >> 24) & 0xff)) >> 1) << 24
         | ((((a >> 16) & 0xff) + ((b >> 16) & 0xff)) >> 1) << 16
         | ((((a >> 8) & 0xff) + ((b >> 8) & 0xff)) >> 1) << 8
@@ -313,21 +323,31 @@ fn clamp_byte(v: i32) -> u32 {
     v.clamp(0, 255) as u32
 }
 
-fn clamp_add(a: u32, b: u32, c: u32) -> u32 {
+pub(crate) fn clamp_add(a: u32, b: u32, c: u32) -> u32 {
+    // 逐字节 clamp(a + b - c, 0, 255)。与 libwebp `ClampedAddSubtractFull`（i16 lane）一致。
     (clamp_byte((a >> 24) as i32 + (b >> 24) as i32 - (c >> 24) as i32) << 24)
-        | (clamp_byte((a >> 16) as i32 + (b >> 16) as i32 - (c >> 16) as i32) << 16)
-        | (clamp_byte((a >> 8) as i32 + (b >> 8) as i32 - (c >> 8) as i32) << 8)
-        | clamp_byte((a as i32) + (b as i32) - (c as i32))
+        | (clamp_byte(
+            ((a >> 16) & 0xff) as i32 + ((b >> 16) & 0xff) as i32 - ((c >> 16) & 0xff) as i32,
+        ) << 16)
+        | (clamp_byte(
+            ((a >> 8) & 0xff) as i32 + ((b >> 8) & 0xff) as i32 - ((c >> 8) & 0xff) as i32,
+        ) << 8)
+        | clamp_byte((a & 0xff) as i32 + (b & 0xff) as i32 - (c & 0xff) as i32)
 }
 
-fn clamp_half(a: u32, b: u32) -> u32 {
+pub(crate) fn clamp_half(a: u32, b: u32) -> u32 {
+    // 逐字节 clamp(a + (a - b)/2, 0, 255)（`/2` 截断除，与 libwebp `ClampedAddSubtractHalf` 一致）。
     (clamp_byte((a >> 24) as i32 + ((a >> 24) as i32 - (b >> 24) as i32) / 2) << 24)
-        | (clamp_byte((a >> 16) as i32 + ((a >> 16) as i32 - (b >> 16) as i32) / 2) << 16)
-        | (clamp_byte((a >> 8) as i32 + ((a >> 8) as i32 - (b >> 8) as i32) / 2) << 8)
-        | clamp_byte((a as i32) + ((a as i32) - (b as i32)) / 2)
+        | (clamp_byte(
+            ((a >> 16) & 0xff) as i32 + (((a >> 16) & 0xff) as i32 - ((b >> 16) & 0xff) as i32) / 2,
+        ) << 16)
+        | (clamp_byte(
+            ((a >> 8) & 0xff) as i32 + (((a >> 8) & 0xff) as i32 - ((b >> 8) & 0xff) as i32) / 2,
+        ) << 8)
+        | clamp_byte((a & 0xff) as i32 + (((a & 0xff) as i32 - (b & 0xff) as i32) / 2))
 }
 
-fn select(left: u32, top: u32, top_left: u32) -> u32 {
+pub(crate) fn select(left: u32, top: u32, top_left: u32) -> u32 {
     let la = (left >> 24) as i32;
     let lr = ((left >> 16) & 0xff) as i32;
     let lg = ((left >> 8) & 0xff) as i32;
@@ -345,7 +365,7 @@ fn select(left: u32, top: u32, top_left: u32) -> u32 {
     if dl < dt { left } else { top }
 }
 
-const BLACK: u32 = 0xff00_0000;
+pub(crate) const BLACK: u32 = 0xff00_0000;
 
 fn predict(mode: u32, x: u32, y: u32, _width: u32, left: u32, top: u32, top_left: u32, top_right: u32) -> Result<u32> {
     if x == 0 && y == 0 {
@@ -376,12 +396,20 @@ fn predict(mode: u32, x: u32, y: u32, _width: u32, left: u32, top: u32, top_left
     })
 }
 
-/// 预测器逆变换（标量，对齐 C# `ApplyPredictorScalar`）。
+/// 预测器逆变换（标量回退见下方；SIMD 快路径在 `simd::predictor_inverse`）。
 fn apply_predictor(pixels: &mut [u32], t: &Transform) -> Result<()> {
     let width = t.width as usize;
     let height = t.height as usize;
-    let block_w = (width + (1usize << t.bits) - 1) >> t.bits;
     let data = t.data.as_ref().expect("predictor data");
+    // SIMD 快路径：块段分派（段内 mode 恒定取一次）+ 5/6/7/12/13 等核；字节==标量。
+    // 非法模式（>13）由其预检返回 None → 回退下方标量（产出结构化 Err）。
+    #[cfg(target_arch = "x86_64")]
+    if super::simd::vp8l_predictor_ready() {
+        return super::simd::predictor_inverse(pixels, width, height, t.bits, data)
+            .ok_or_else(|| Vp8LError::new("VP8L 预测器模式非法"));
+    }
+    let bits = t.bits as usize;
+    let block_w = (width + (1usize << bits) - 1) >> bits;
     for y in 0..height {
         for x in 0..width {
             let index = y * width + x;
@@ -407,8 +435,12 @@ fn apply_predictor(pixels: &mut [u32], t: &Transform) -> Result<()> {
 fn apply_color_transform(pixels: &mut [u32], t: &Transform) {
     let width = t.width as usize;
     let height = t.height as usize;
-    let block_w = (width + (1usize << t.bits) - 1) >> t.bits;
+    let bits = t.bits as usize;
     let data = t.data.as_ref().expect("color transform data");
+    if super::simd::color_transform_inverse(pixels, width, height, t.bits, data) {
+        return;
+    }
+    let block_w = (width + (1usize << bits) - 1) >> bits;
     for y in 0..height {
         for x in 0..width {
             let index = y * width + x;
@@ -830,6 +862,11 @@ fn select_group(
     Ok(idx)
 }
 
+unsafe fn group_ref(groups: &[Option<HuffmanGroup>], idx: usize) -> &HuffmanGroup {
+    // 前置：select_group 只返回 `idx < len && groups[idx].is_some()` 的组。
+    unsafe { groups.get_unchecked(idx).as_ref().unwrap_unchecked() }
+}
+
 /// 解码一个熵编码子图（宽高为编码尺寸）。
 fn decode_image_stream(
     reader: &mut BitReader<'_>,
@@ -981,29 +1018,31 @@ fn decode_pixels(
     let mut x = 0u32;
     let mut y = 0u32;
     let mut group_idx = select_group(groups, entropy, entropy_width, prefix_bits, 0, 0)?;
+    // 块边界处解析一次组引用（select_group 已保证非 None）；组切换点同步刷新。
+    let mut g = unsafe { group_ref(groups, group_idx) };
+    // 表池基址提升（对齐 C# `ref uint tableBase`）：解码期不再增长，偏移恒有效。
+    let tbl = tables.data.as_ptr();
 
     while position < pixel_count {
         if bits < 32 {
             reader.refill(&mut buffer, &mut bits)?;
         }
-        let g = groups[group_idx]
-            .as_ref()
-            .ok_or_else(|| Vp8LError::new("VP8L meta prefix 组缺失"))?;
-        let symbol = read_symbol(&tables.data[g.green..], g.green_mask, &mut buffer, &mut bits);
+        let symbol = unsafe { read_symbol(tbl.add(g.green), g.green_mask, &mut buffer, &mut bits) };
         if symbol < 256 {
             let color;
             if g.trivial_literal {
                 color = g.literal | (symbol << 8);
             } else {
-                let red = read_symbol(&tables.data[g.red..], g.red_mask, &mut buffer, &mut bits);
+                let red = unsafe { read_symbol(tbl.add(g.red), g.red_mask, &mut buffer, &mut bits) };
                 if bits < 32 {
                     reader.refill(&mut buffer, &mut bits)?;
                 }
-                let blue = read_symbol(&tables.data[g.blue..], g.blue_mask, &mut buffer, &mut bits);
-                let alpha = read_symbol(&tables.data[g.alpha..], g.alpha_mask, &mut buffer, &mut bits);
+                let blue = unsafe { read_symbol(tbl.add(g.blue), g.blue_mask, &mut buffer, &mut bits) };
+                let alpha = unsafe { read_symbol(tbl.add(g.alpha), g.alpha_mask, &mut buffer, &mut bits) };
                 color = (alpha << 24) | (red << 16) | (symbol << 8) | blue;
             }
-            result[position] = color;
+            // 写入在 `position < pixel_count` 循环前置下恒界内。
+            unsafe { *result.get_unchecked_mut(position) = color; }
             position += 1;
             x += 1;
             if x == width {
@@ -1013,8 +1052,10 @@ fn decode_pixels(
                     break;
                 }
                 group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
+                g = unsafe { group_ref(groups, group_idx) };
             } else if (x & block_mask) == 0 {
                 group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
+                g = unsafe { group_ref(groups, group_idx) };
             }
             continue;
         }
@@ -1025,8 +1066,9 @@ fn decode_pixels(
             if bits < 32 {
                 reader.refill(&mut buffer, &mut bits)?;
             }
-            let distance_code =
-                read_symbol(&tables.data[g.distance..], g.distance_mask, &mut buffer, &mut bits);
+            let distance_code = unsafe {
+                read_symbol(tbl.add(g.distance), g.distance_mask, &mut buffer, &mut bits)
+            };
             if bits < 32 {
                 reader.refill(&mut buffer, &mut bits)?;
             }
@@ -1043,6 +1085,7 @@ fn decode_pixels(
                 y = (position / width as usize) as u32;
                 x = (position % width as usize) as u32;
                 group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
+                g = unsafe { group_ref(groups, group_idx) };
             }
             continue;
         }
@@ -1056,7 +1099,7 @@ fn decode_pixels(
             cache[hash as usize] = value;
         }
         cached = position;
-        result[position] = cache[(symbol - 280) as usize];
+        unsafe { *result.get_unchecked_mut(position) = cache[(symbol - 280) as usize]; }
         position += 1;
         x += 1;
         if x == width {
@@ -1066,8 +1109,10 @@ fn decode_pixels(
                 break;
             }
             group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
+            g = unsafe { group_ref(groups, group_idx) };
         } else if (x & block_mask) == 0 {
             group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
+            g = unsafe { group_ref(groups, group_idx) };
         }
     }
 

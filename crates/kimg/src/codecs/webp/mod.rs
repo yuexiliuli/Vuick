@@ -427,14 +427,14 @@ pub(crate) fn decode_static_lossy(
         Some(b) => b,
         None => return Ok(None),
     };
-    let yuv = match vp8::decode_vp8(bitstream, c.width, c.height) {
+    let mut yuv = match vp8::decode_vp8(bitstream, c.width, c.height) {
         Ok(y) => y,
         Err(e) => {
             let _ = e;
             return Ok(None);
         }
     };
-    let mut rgba = vp8::yuv_to_rgba_fancy(&yuv);
+    let mut rgba = vp8::yuv_to_rgba_fancy(&mut yuv);
     let mut has_alpha = false;
     if c.family == container::Family::LossyAlpha {
         if let Some(alpha_range) = c.frames.first().and_then(|f| f.alpha.clone()) {

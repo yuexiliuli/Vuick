@@ -43,7 +43,9 @@ impl Vp8Error {
 
 type Result<T> = std::result::Result<T, Vp8Error>;
 
-/// VP8 解码产物：紧密 YUV 4:2:0 平面（y=w*h，u/v=(w+1)/2 × (h+1)/2），环路滤波后。
+/// VP8 解码产物：紧密 YUV 4:2:0 平面（y=w*h，u/v=(w+1)/2 × (h+1)/2），环路滤波后；
+/// `rgba` 为「行定稿直出」产物（fancy 上采样 + YUV→RGBA），由 `decode_from_header`
+/// 在滤波每宏块行后即时写出并缓存——`yuv_to_rgba_fancy` 取用后置空，避免二次全帧 pass。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Vp8Yuv {
     pub width: u32,
@@ -51,6 +53,7 @@ pub(crate) struct Vp8Yuv {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+    pub rgba: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,7 +1724,11 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
         }
     };
 
-    // P-B 管道：主线程重建，滤波线程并行消费（滞后 1 行）。
+    // 行定稿直出 RGBA 缓冲（整帧；滤波线程/串行路径按 MB 行滚动填写）。
+    let mut rgba = vec![0u8; width * height * 4];
+
+    // P-B 管道：主线程重建，滤波线程并行消费（滞后 1 行）；滤波线程过滤宏块行后随即把
+    // 已定稿行 fancy 上采样 + YUV→RGBA 直出 `rgba`（与重建重叠，不占主线程关键路径）。
     if pipelined {
         std::thread::scope(|s| {
             let (tx, rx) = std::sync::mpsc::channel::<usize>();
@@ -1738,6 +1745,10 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
                 rf_len,
                 mbw,
                 mbh,
+                rgba_ptr: rgba.as_mut_ptr(),
+                rgba_len: rgba.len(),
+                width,
+                height,
             };
             s.spawn(move || filter_pipeline_thread(rx, args, filter_cfg));
             for mby in 0..mbh {
@@ -1753,13 +1764,17 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
             reconstruct_row(mby);
         }
 
-        // 整帧重建后按宏块行做环路滤波（等价 C# 逐行滤波：预测读未滤波行、滤波读已重建行，顺序一致）。
-        apply_loop_filter(
+        // 串行：整帧重建后按宏块行「环路滤波 → 行定稿直出 RGBA」（等价 C# 逐行滤波 +
+        // `RgbaSink.Emit`：预测读未滤波行、滤波读已重建行，顺序一致；每滤完一行立即输出
+        // 已定稿行 `[emitted, mbY*16+8)`，无需等整帧、无第二趟）。
+        let mut scratch = EmitScratch::new(width);
+        filter_and_emit_serial(
             &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw, mbh, &fh.filter, &row_filters,
+            width, height, &mut rgba, &mut scratch,
         );
     }
 
-    // 抽紧密平面（真实宽高）。
+    // 抽紧密平面（真实宽高；Vp8Yuv API/测试仍需）。
     let cwu = (width + 1) / 2;
     let chu = (height + 1) / 2;
     let mut out_y = vec![0u8; width * height];
@@ -1780,6 +1795,7 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
         y: out_y,
         u: out_u,
         v: out_v,
+        rgba,
     })
 }
 
@@ -2084,26 +2100,10 @@ fn filter_mt_enabled(mbw: usize, mbh: usize) -> bool {
     mbw * mbh >= MT_MIN_MB_TOTAL
 }
 
-/// 串行环路滤波：整帧重建完成后逐宏块行滤波（环路滤波的**语义源**；P-B 滤波线程逐行调用
-/// `filter_macroblock_row`，与其输出逐字节一致——见 `threads2_matches_serial_byte_exact`）。
-fn apply_loop_filter(
-    y: &mut [u8],
-    y_pitch: usize,
-    u: &mut [u8],
-    v: &mut [u8],
-    uv_pitch: usize,
-    mbw: usize,
-    mbh: usize,
-    filter: &FilterSettings,
-    row_filters: &[(u8, u8)],
-) {
-    for mby in 0..mbh {
-        filter_macroblock_row(y, y_pitch, u, v, uv_pitch, mbw, mby, filter, row_filters);
-    }
-}
-
 /// P-B 真重叠管道：滤波线程主体（libwebp `-mt` 式「重建线程逐行产出、滤波线程滞后 N 行消费」，
-/// 由 `decode_from_header` 在宽图/强制 `2` 时启用）。
+/// 由 `decode_from_header` 在宽图/强制 `2` 时启用）。滤完每行后随即把已定稿行
+/// `[emitted, mbY*16+8)` 直出 RGBA（`filter_and_emit_serial` 的行定稿语义同款：滤行 m 后
+/// 行 `[0.., m*16+8)` 只被 m 的滤波定稿，下一行滤波只触及 13..15/chroma 5..7）。
 ///
 /// 滞后 1 行的字节一致论证（重建主线程与滤波线程旁路并行）：
 /// - 行 `m` 的环滤只读写像素行区间 `[m*16-4, m*16+15]`（H_top 读至 m*16-4、写至 m*16-3；
@@ -2112,7 +2112,10 @@ fn apply_loop_filter(
 ///   只写 `(r+2)*16` 起的行。本线程滤行 m 前先收到「行 k=m+1 重建完成」（滞后 1）→ 滤波
 ///   写集 `≤(m+1)*16-1` 与重建写集 `≥(m+2)*16` 恒不相交；滤波读集也在行 m+1 定稿之后 →
 ///   无 C11 数据竞争，且每行滤波仍在与其他行完全相同的已发布值上、同串行顺序执行 →
-///   输出与串行 `apply_loop_filter` 逐字节一致（硬闸测试复核）。
+///   输出与串行 `filter_and_emit_serial` 逐字节一致（硬闸测试复核）。
+/// - RGBA 直出同理：emit 读集 ⊆ 已滤行 `[emitted, m*16+8)`（上采样相邻 chroma ≤ m*8+4），
+///   写集为此行段独有的 `rgba` 区间；重建线程只写 `≥(m+2)*16` 行 → 无竞争；各线程用各自
+///   `EmitScratch` 工作区（不共享）。
 ///
 /// 信号：`rx` 收到 `k`（0..=mbh-1 表示行 k 已重建完成；`k == mbh` 表示全部完成）。
 /// 共享平面经裸指针传入（y/u/v/row_filters 长度固定不扩容；借用隔离由上述互斥时间窗 +
@@ -2129,6 +2132,10 @@ struct FilterThreadArgs {
     rf_len: usize,
     mbw: usize,
     mbh: usize,
+    rgba_ptr: *mut u8,
+    rgba_len: usize,
+    width: usize,
+    height: usize,
 }
 
 // SAFETY：只携带裸指针与整数，不携带任何 Rust 引用；共享内存的借用隔离由
@@ -2153,8 +2160,16 @@ fn filter_pipeline_thread(
         rf_len,
         mbw,
         mbh,
+        rgba_ptr,
+        rgba_len,
+        width,
+        height,
     } = args;
+    let cw = (width + 1) >> 1;
+    let ch = (height + 1) >> 1;
+    let mut scratch = EmitScratch::new(width);
     let mut next = 0usize;
+    let mut emitted = 0usize;
     let mut avail: Option<usize> = None;
     loop {
         if next >= mbh {
@@ -2176,6 +2191,13 @@ fn filter_pipeline_thread(
         let v = unsafe { std::slice::from_raw_parts_mut(v_ptr, uv_len) };
         let rf = unsafe { std::slice::from_raw_parts_mut(rf_ptr, rf_len) };
         filter_macroblock_row(y, y_pitch, u, v, uv_pitch, mbw, next, filter, rf);
+        // 行定稿直出：与串行 `filter_and_emit_serial` 同语义（滤完当前行即出 `[emitted,end)`）。
+        let end = if next == mbh - 1 { height } else { next * 16 + 8 };
+        if end > emitted {
+            let unsafe_rgba = unsafe { std::slice::from_raw_parts_mut(rgba_ptr, rgba_len) };
+            emit_rows_into_rgba(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, unsafe_rgba, &mut scratch);
+            emitted = end;
+        }
         next += 1;
     }
 }
@@ -2230,8 +2252,106 @@ pub(crate) fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     (clamp_byte(red), clamp_byte(green), clamp_byte(blue))
 }
 
+/// 行定稿直出 RGBA（复用工作区）。
+struct EmitScratch {
+    u_up: Vec<u8>,
+    v_up: Vec<u8>,
+    t_ws: Vec<u16>,
+}
+
+impl EmitScratch {
+    fn new(width: usize) -> Self {
+        let cw = (width + 1) >> 1;
+        EmitScratch {
+            u_up: vec![0u8; width],
+            v_up: vec![0u8; width],
+            t_ws: vec![0u16; cw + 8],
+        }
+    }
+}
+
+/// 从**滤波后** padded 平面把已定稿行 `[first, end)` fancy 上采样 + YUV→RGBA 直出到 `rgba`。
+/// 算术与 `yuv_to_rgba_fancy`（旧二趟）完全一致，只是读 padded 平面（跳过左侧 129 列）而非
+/// tight 平面（tight 只是顺序拷贝，字节相同）。行 `end` 的选取保证 `[first,end)` 各行及其
+/// 上采样相邻 chroma 行均已环路滤波定稿（C# `RgbaSink.Emit` 的 `end=mbY*16+8` 语义，注释于
+/// `decode_from_header`）。
+#[allow(clippy::too_many_arguments)]
+fn emit_rows_into_rgba(
+    y: &[u8],
+    y_pitch: usize,
+    u: &[u8],
+    v: &[u8],
+    uv_pitch: usize,
+    width: usize,
+    cw: usize,
+    ch: usize,
+    first: usize,
+    end: usize,
+    rgba: &mut [u8],
+    ws: &mut EmitScratch,
+) {
+    for row in first..end {
+        let chroma_row = row >> 1;
+        let adjacent = if row % 2 == 0 {
+            if chroma_row == 0 {
+                0
+            } else {
+                chroma_row - 1
+            }
+        } else if chroma_row == ch - 1 {
+            chroma_row
+        } else {
+            chroma_row + 1
+        };
+        let yba = row * y_pitch + 1;
+        let u0 = chroma_row * uv_pitch + 1;
+        let u1 = adjacent * uv_pitch + 1;
+        super::simd::upsample_fancy_into(&u[u0..u0 + cw], &u[u1..u1 + cw], &mut ws.u_up, &mut ws.t_ws);
+        super::simd::upsample_fancy_into(&v[u0..u0 + cw], &v[u1..u1 + cw], &mut ws.v_up, &mut ws.t_ws);
+        super::simd::yuv_row_to_rgba(&y[yba..yba + width], &ws.u_up, &ws.v_up, &mut rgba[row * width * 4..(row + 1) * width * 4]);
+    }
+}
+
+/// 串行路径：逐宏块行「环路滤波 → 行定稿直出 RGBA」。`end = mbY==末行 ? height : mbY*16+8`：
+/// 行 `[emitted, mbY*16+8)` 只被第 mbY 行的滤波读写定稿（下一行滤波只触及本行 13..15 及
+/// chroma 5..7），故滤完即出，无需等待整帧。上采样相邻 chroma 行最远取 `mbY*8+4`，同属本
+/// MB 行、已在本次滤波定稿。
+#[allow(clippy::too_many_arguments)]
+fn filter_and_emit_serial(
+    y: &mut [u8],
+    y_pitch: usize,
+    u: &mut [u8],
+    v: &mut [u8],
+    uv_pitch: usize,
+    mbw: usize,
+    mbh: usize,
+    filter: &FilterSettings,
+    row_filters: &[(u8, u8)],
+    width: usize,
+    height: usize,
+    rgba: &mut [u8],
+    ws: &mut EmitScratch,
+) {
+    let cw = (width + 1) >> 1;
+    let ch = (height + 1) >> 1;
+    let mut emitted = 0usize;
+    for mby in 0..mbh {
+        filter_macroblock_row(y, y_pitch, u, v, uv_pitch, mbw, mby, filter, row_filters);
+        let end = if mby == mbh - 1 { height } else { mby * 16 + 8 };
+        if end > emitted {
+            emit_rows_into_rgba(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws);
+            emitted = end;
+        }
+    }
+}
+
 /// YUV 4:2:0 → RGBA8（fancy 上采样默认，等价 image-webp Bilinear / dwebp fancy 列）。alpha 恒 255。
-pub(crate) fn yuv_to_rgba_fancy(yuv: &Vp8Yuv) -> Vec<u8> {
+/// `decode_vp8` 已把行定稿直出的 RGBA 缓存在 `yuv.rgba`，此处直接取走（`mem::take`，零重算、
+/// 零拷贝）；若为空（手工构造的 `Vp8Yuv`）回退旧整帧二趟路径，输出逐字节一致。
+pub(crate) fn yuv_to_rgba_fancy(yuv: &mut Vp8Yuv) -> Vec<u8> {
+    if !yuv.rgba.is_empty() {
+        return std::mem::take(&mut yuv.rgba);
+    }
     let w = yuv.width as usize;
     let h = yuv.height as usize;
     let cw = (w + 1) >> 1;
@@ -2787,9 +2907,9 @@ mod perf_stage_tests {
             let c = super::super::container::parse(&data).unwrap();
             for _ in 0..3 {
                 let t0 = Instant::now();
-                let yuv = decode_vp8(c.bitstream.unwrap(), c.width, c.height).unwrap();
+                let mut yuv = decode_vp8(c.bitstream.unwrap(), c.width, c.height).unwrap();
                 let t1 = Instant::now();
-                let rgba = yuv_to_rgba_fancy(&yuv);
+                let rgba = yuv_to_rgba_fancy(&mut yuv);
                 let t2 = Instant::now();
                 let (_r, _g, _b) = (rgba[0], rgba[1], rgba[2]);
                 eprintln!(
@@ -2838,9 +2958,9 @@ mod perf_stage_tests {
         for _ in 0..rounds {
             stage_clock::reset();
             let t0 = Instant::now();
-            let yuv = decode_vp8(c.bitstream.unwrap(), w, h).unwrap();
+            let mut yuv = decode_vp8(c.bitstream.unwrap(), w, h).unwrap();
             let t1 = Instant::now();
-            let _rgba = yuv_to_rgba_fancy(&yuv);
+            let _rgba = yuv_to_rgba_fancy(&mut yuv);
             let t2 = Instant::now();
             let (e, p, i, f) = stage_clock::totals();
             rec_ms += t1.duration_since(t0).as_secs_f64() * 1e3;
@@ -2949,8 +3069,8 @@ mod perf_stage_tests {
             let p = webp_fixtures_support::webp_fixture_path("testsrc2-320x240-q75.webp")?;
             let data = std::fs::read(p).expect("read fixture");
             let c = super::super::super::container::parse(&data).expect("容器解析");
-            let yuv = decode_vp8(c.bitstream.unwrap(), c.width, c.height).expect("VP8 解码");
-            let rgba = yuv_to_rgba_fancy(&yuv);
+            let mut yuv = decode_vp8(c.bitstream.unwrap(), c.width, c.height).expect("VP8 解码");
+            let rgba = yuv_to_rgba_fancy(&mut yuv);
             Some((yuv.y, yuv.u, yuv.v, rgba))
         }
     }
@@ -3018,8 +3138,8 @@ mod perf_stage_tests {
                     ),
                     median(
                         || {
-                            let yuv = decode_vp8(c.bitstream.unwrap(), w, h).unwrap();
-                            let _rgba = yuv_to_rgba_fancy(&yuv);
+                            let mut yuv = decode_vp8(c.bitstream.unwrap(), w, h).unwrap();
+                            let _rgba = yuv_to_rgba_fancy(&mut yuv);
                         },
                         rounds,
                     ),
@@ -3308,8 +3428,8 @@ mod mt_tests {
             std::env::set_var("KIMG_WEBP_THREADS", threads);
         }
         let c = container::parse(data).ok()?;
-        let yuv = decode_vp8(c.bitstream?, c.width, c.height).ok()?;
-        let rgba = yuv_to_rgba_fancy(&yuv);
+        let mut yuv = decode_vp8(c.bitstream?, c.width, c.height).ok()?;
+        let rgba = yuv_to_rgba_fancy(&mut yuv);
         Some((yuv, rgba))
     }
 
