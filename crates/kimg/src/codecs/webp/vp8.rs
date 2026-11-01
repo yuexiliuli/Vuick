@@ -73,6 +73,23 @@ use vp8_tables::*;
 // V1：RFC 6386 §7 boolean 熵解码器（宽窗口版）
 // ---------------------------------------------------------------------------
 
+/// 熵 renorm 跳过开关：`KIMG_WEBP_ENT_RENORM_SKIP`（默认「开」＝启用跳过）：
+/// range≥128 时 renorm 位移恒为 0（no-op），跳过 lzcnt+shl；设 `0`/`false`/`off` 装回
+/// 无条件 renorm（同二进制 A/B 与双路径字节恒等交叉验证）。首次访问读一次 env 并缓存
+/// （同 simd.rs `webp_no_simd`/`yuv_u16_enabled` 的惰性 OnceLock 姿势，不引新依赖）。
+#[inline]
+fn ent_renorm_skip() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("KIMG_WEBP_ENT_RENORM_SKIP")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+    })
+}
+
 /// RFC 6386 §7 宽窗口 bool 解码器：`value` 持有 8 位比较窗口 + 其下 `bits` 位后续输入，
 /// 一次 refill 读 7 字节。越过数据末尾后输入读作零位（§7.3 参考行为）。`range` 保持「减一」：
 /// split-1 = ((range-1)*p)>>8 恰一次乘移，判定 = 窗口 > split-1。
@@ -128,10 +145,18 @@ impl<'a> Vp8BoolDecoder<'a> {
             range = split_minus1 + 1;
             bit = 0;
         }
-        // range ∈ [1,255]，移回 [128,255]。
-        let shift = range.leading_zeros() - 24;
-        self.range_minus1 = (range << shift) - 1;
-        self.bits -= shift as i32;
+        // range ∈ [1,255]，移回 [128,255]。范围分裂后约 2/3 的位 range≥128 → lzcnt=24 → shift=0，
+        // renorm 为 no-op（只须把 range_minus1 落到 (range<<0)-1，value/bits 不变）。此处外提
+        // `range < 128` 分支（range≥128 是多数，预测友好）：跳过 lzcnt+shl+位数调整；分支按构造
+        // 恒等——无条件路径 shift=lzcnt(range)-24，range≥128 时 shift=0。`KIMG_WEBP_ENT_RENORM_SKIP=0`
+        // 时恒走左支（装回无条件 lzcnt renorm）作 A/B 对照。
+        if range < 128 || !ent_renorm_skip() {
+            let shift = range.leading_zeros() - 24;
+            self.range_minus1 = (range << shift) - 1;
+            self.bits -= shift as i32;
+        } else {
+            self.range_minus1 = range - 1;
+        }
         (self, bit)
     }
 
@@ -154,9 +179,16 @@ impl<'a> Vp8BoolDecoder<'a> {
         self.value -= (dec_bit as u32 as u64) << (self.bits as u32);
         // bit=1: range - split；bit=0: split+1。
         let new_range = (split_minus1 + 1 + ((range - 2 * split_minus1 - 1) & mask)) as u32;
-        let shift = new_range.leading_zeros() - 24;
-        self.range_minus1 = (new_range << shift) - 1;
-        self.bits -= shift as i32;
+        // prob=128 符号位 renorm 特化（推导，逐操作对齐通用 lzcnt 路径）：
+        //   r = range_minus1 ∈ [127,254]（减一状态不变量）；split-1 = r>>1。
+        //   bit=0 → nr = (r>>1)+1；bit=1 → nr = r-(r>>1)。两者合成 nr ∈ [64,128]
+        //   （唯一退化 nr=128 ⇔ r=254 ∧ bit=0，即解码器初始态首个读——通用路径在此 shift=0）。
+        //   通用 shift = lzcnt(nr)-24：nr ∈ [64,127] → 25-24 = 1；nr=128 → 24-24 = 0；
+        //   故 shift = 1-(nr>>7) ∈ {0,1}（nr≥128 ⇔ nr=128 ⇔ bit7 置位），逐字节恒等于通用路径：
+        //   range 分裂 → 新 range shift=1（或退化 shift=0）→ value 不变 → bits 减 shift。
+        let sh = 1u32 - (new_range >> 7);
+        self.range_minus1 = (new_range << sh) - 1;
+        self.bits -= sh as i32;
         // mask=0 → magnitude；mask=-1 → ~m + 1 = -m（补码）。
         (self, (magnitude ^ mask) - mask)
     }
