@@ -4,7 +4,8 @@
 //! 「输出字节与改动前逐字节一致」。口径：同一输入 → `load_from_memory` → `to_rgba8()`
 //! → sha256(RGBA 字节) 与金指纹常量比对。
 //!
-//! 语料（缺则 SKIP，仓库惯例）：`target/imgbench-corpus/BMP/*.bmp`（6 张 24bit 大图）与
+//! 语料（缺则 SKIP，仓库惯例）：`target/imgbench-corpus/BMP/*.bmp`（26 张：001–020 为用户
+//! 新增 10–26MB 大图 + 021–026 既有 24bit 大图，逐文件金指纹哈希表覆盖）与
 //! `target/imgbench-corpus/ico/1.ico`（ICO 容器，6 条 32bpp BMP 条目，走 ICO 内嵌 BMP
 //! 路径 + AND 掩码）。合成用例不依赖语料，始终运行。
 //!
@@ -610,7 +611,10 @@ fn corpus_dir(sub: &str) -> std::path::PathBuf {
         .join(sub)
 }
 
-/// `target/imgbench-corpus/BMP/*.bmp`（6 张 24bit 大图）。
+/// `target/imgbench-corpus/BMP/*.bmp`（26 张，001–026；金指纹为逐文件哈希表）。
+/// simd 优化前、字节正确解码器（8c4957d 验证）采集；语料由 `测试图片\BMP` 快照拷贝而来（不入库）。
+/// 目录缺失/为空 → SKIP；某张个别缺失 → 不在目录里即不测（SKIP 常态，非回归）；
+/// 目录出现哈希表未收录文件 → 显式失败提示更新金指纹，不静默跳过。
 #[test]
 fn corpus_bmp_golden() {
     let dir = corpus_dir("BMP");
@@ -624,22 +628,45 @@ fn corpus_bmp_golden() {
         .unwrap_or_default();
     files.sort();
     if files.is_empty() {
-        eprintln!("[bmp-parity] SKIP: target/imgbench-corpus/BMP 缺失或无 .bmp（expected 6）");
+        eprintln!("[bmp-parity] SKIP: target/imgbench-corpus/BMP 缺失或无 .bmp（expected 26）");
         return;
     }
-    for p in &files {
-        let data = std::fs::read(p).expect("读语料");
-        let name = p.file_name().unwrap().to_string_lossy();
-        let golden = match name.as_ref() {
+    // 文件名 → RGBA8 sha256 金指纹（decode_rgba_sha 口径）。
+    let golden = |name: &str| -> &'static str {
+        match name {
+            "001.bmp" => "320b18512b9e42d859ba4c80efad01f9046c40e8c19727067ef26f66dfe0dd11",
+            "002.bmp" => "060ad11dadf5899978849402d6cc02b21867dd8acc63bfe05661f4b772fdcb23",
+            "003.bmp" => "1dfb3ea5ab0e86093231e3587c3ae226cc63c3a95cb64e2783600ef6bcdc493b",
+            "004.bmp" => "085caaf8e590f0bfbee92aa09ee97e1336f80246f6c3c8deab9798a3255b24d1",
+            "005.bmp" => "bb09008ce983f1d092e442adb6aded50f4cc437aa78745a507e7bcd64f88e80f",
+            "006.bmp" => "176169c66f86d188fe073d5f7e9e8e647497acebeb3d37ff343d71823c2bd121",
+            "007.bmp" => "17655d60a0b27e0c55f96646675f697e6b083aa4fe4576db1a9d986f3c0d7136",
+            "008.bmp" => "c43e9036eb756c0572307ec69a58dc2c39c9587236dd38962df5572b43e3bad3",
+            "009.bmp" => "fc918a5c9c785095e9d27d60d1f37943b5ecafa095400266b2c5fa2840059e41",
+            "010.bmp" => "19863e795613e634f8d1b3aaae6994519bb761b0d12319e73593b043c33d1c4b",
+            "011.bmp" => "eaf003b1262946c7cc19ecac4e00908b2070e4d5216b3a6899028b6de0907887",
+            "012.bmp" => "0ec66577d7414087f2056338e72eff7fc66483bd40c384007d960d33666b0bc4",
+            "013.bmp" => "18d830f9445c486baac7267df573606ed87010fac0b315e815202b65bd502e53",
+            "014.bmp" => "582df53507bbe72bad784cca0f5f8458f2ac8ed505d534f186d9b622fba73de9",
+            "015.bmp" => "416cc7c8b185aefe8ccd9a544ffe2ef965411b40a89974c66575f8102ceb12b5",
+            "016.bmp" => "e680e82737c297f515afa4793b52ae764361a70fda84431451ac8fdbdbe87c4b",
+            "017.bmp" => "e278ee01e28c94a3fe41336163e6723aa62dcb2ee1f0f810b801b3af8ec1b9b1",
+            "018.bmp" => "6a6bbfac581631ef07ca02c518357c50eee88dd9347b6fc2ec5f066534f4fda0",
+            "019.bmp" => "72f332679ab27f2c86d711b774335c405415030d24c38379f493b14095c69da3",
+            "020.bmp" => "2a35336f65f668df5d5cdb227b4a138cdbb4241789fa384a0ccd62095beced83",
             "021.bmp" => "9049d20f7888e157e719793424f07c9ec8bcb550c0d7007af28460634eaad42a",
             "022.bmp" => "7afcf57fb458db540cfb5f05e41022286f0a9d681dbe109f256e2bd1361ab65e",
             "023.bmp" => "0afbb0257407a7b431b3a50a02cbfb330d79984e542becf86bc8182cd3315b4e",
             "024.bmp" => "3effb555238f2be177240c4994ec8b15731618781e73b02b7f554b2de1aa34d8",
             "025.bmp" => "213c242a9b1c8ceb9faa4e7a25e5c9a8141858b4134310373c953814a5d48c0a",
             "026.bmp" => "05176c60ffae131c9f45fdd9ddb559ae9fea2d7f8c2c6c416cb5484430cbf91c",
-            other => panic!("语料目录出现未收录文件 {other}（期望 021–026.bmp）"),
-        };
-        check_hash(&format!("corpus-{name}"), &data, golden);
+            other => panic!("语料目录出现未收录文件 {other}（需更新哈希表或移除多余语料）"),
+        }
+    };
+    for p in &files {
+        let data = std::fs::read(p).expect("读语料");
+        let name = p.file_name().unwrap().to_string_lossy();
+        check_hash(&format!("corpus-{name}"), &data, golden(name.as_ref()));
     }
 }
 
