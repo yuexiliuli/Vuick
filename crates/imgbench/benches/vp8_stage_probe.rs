@@ -81,6 +81,17 @@ fn collect_lossy() -> Vec<(String, Vec<u8>, u32, u32, bool)> {
     }
     out.sort_by(|a, b| (b.2 as u64 * b.3 as u64).cmp(&(a.2 as u64 * a.3 as u64)));
     out.truncate(130);
+    // 子集控制（K53 定向/复现）：`KIMG_WEBP_STAGE_SUBSET` = 数量 N（取像素最大前 N）或
+    // `;` 分隔文件名（精确匹配）。缺省全收。
+    if let Ok(sel) = std::env::var("KIMG_WEBP_STAGE_SUBSET") {
+        let sel = sel.trim();
+        if let Ok(n) = sel.parse::<usize>() {
+            out.truncate(n);
+        } else {
+            let names: Vec<String> = sel.split(';').map(|s| s.trim().to_string()).collect();
+            out.retain(|(n, _, _, _, _)| names.iter().any(|x| x == n));
+        }
+    }
     out
 }
 
@@ -117,6 +128,19 @@ fn median_profile(frame: &[u8], w: u32, h: u32, rounds: usize) -> kimg::codecs::
         "mid_ns",
         "end_ns",
         "total_ns",
+        "idct_i16_ns",
+        "idct_i4_ns",
+        "idct_wht_ns",
+        "idct_uv_ns",
+        "mb_i16",
+        "mb_i4",
+        "mb_wht",
+        "ent_modes_ns",
+        "ent_tokens_ns",
+        "modes_bits",
+        "tokens_bits",
+        "acct_count",
+        "dq_count",
     ] {
         let mut v: Vec<u64> = acc.iter().map(|p| field(p, f)).collect();
         v.sort_unstable();
@@ -143,6 +167,19 @@ fn field(p: &kimg::codecs::webp::Vp8StageProfile, f: &str) -> u64 {
         "mid_ns" => p.mid_ns,
         "end_ns" => p.end_ns,
         "total_ns" => p.total_ns,
+        "idct_i16_ns" => p.idct_i16_ns,
+        "idct_i4_ns" => p.idct_i4_ns,
+        "idct_wht_ns" => p.idct_wht_ns,
+        "idct_uv_ns" => p.idct_uv_ns,
+        "mb_i16" => p.mb_i16,
+        "mb_i4" => p.mb_i4,
+        "mb_wht" => p.mb_wht,
+        "ent_modes_ns" => p.ent_modes_ns,
+        "ent_tokens_ns" => p.ent_tokens_ns,
+        "modes_bits" => p.modes_bits,
+        "tokens_bits" => p.tokens_bits,
+        "acct_count" => p.acct_count,
+        "dq_count" => p.dq_count,
         _ => unreachable!(),
     }
 }
@@ -162,6 +199,19 @@ fn set_field(p: &mut kimg::codecs::webp::Vp8StageProfile, f: &str, v: u64) {
         "mid_ns" => p.mid_ns = v,
         "end_ns" => p.end_ns = v,
         "total_ns" => p.total_ns = v,
+        "idct_i16_ns" => p.idct_i16_ns = v,
+        "idct_i4_ns" => p.idct_i4_ns = v,
+        "idct_wht_ns" => p.idct_wht_ns = v,
+        "idct_uv_ns" => p.idct_uv_ns = v,
+        "mb_i16" => p.mb_i16 = v,
+        "mb_i4" => p.mb_i4 = v,
+        "mb_wht" => p.mb_wht = v,
+        "ent_modes_ns" => p.ent_modes_ns = v,
+        "ent_tokens_ns" => p.ent_tokens_ns = v,
+        "modes_bits" => p.modes_bits = v,
+        "tokens_bits" => p.tokens_bits = v,
+        "acct_count" => p.acct_count = v,
+        "dq_count" => p.dq_count = v,
         _ => unreachable!(),
     }
 }
@@ -231,17 +281,65 @@ fn libwebp_median_ms(_data: &[u8], _rounds: usize) -> Option<f64> {
 
 #[cfg(feature = "stage-profile")]
 fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
+    // Task A/B 细分：熵内部三类操作的单位耗时校准（与插桩构建同源，K53 换算口径）。
+    let (c_bit, c_acct, c_dq) = kimg::codecs::webp::vp8_probe_entropy_op_costs(2_000_000);
+    println!(
+        "VP8_ENT_OPCOST c_bit={:.3}ns c_acct={:.3}ns c_dq={:.3}ns",
+        c_bit, c_acct, c_dq
+    );
     let mut tot_entropy = 0.0f64;
     let mut tot_idct = 0.0f64;
     let mut tot_total = 0.0f64;
     let mut tot_cut = 0.0f64; // Task B：ceiling 墙钟相对现墙钟的切割%（按文件（名义全链）等权平均）
     let mut tot_cut_new = 0.0f64; // 新 MT 架构模型（t1=熵、t2=pred+idct+filter+yuv）的等权平均切割%
+    let mut tot_idct_i16 = 0.0f64;
+    let mut tot_idct_i4 = 0.0f64;
+    let mut tot_i4_ratio = 0.0f64;
+    let mut tot_bool = 0.0f64;
+    let mut tot_acct = 0.0f64;
+    let mut tot_dq = 0.0f64;
     for (name, frame, w, h, has_alpha) in files {
         let p = median_profile(frame, *w, *h, ROUNDS);
         let ms = |n: u64| n as f64 / 1e6;
         // 干净全链 = 各段之和；原始墙钟另列。
         let sum = p.entropy_ns + p.predict_ns + p.idct_ns + p.filter_ns + p.yuv_ns;
         let pct = |n: u64| n as f64 / sum as f64 * 100.0;
+        // Task A 细分（IDCT 内部）：i16「2 块 SSE2 成对」 vs i4x4 标量逐块（含子块预测） vs WHT vs UV。
+        {
+            let idc = p.idct_i16_ns + p.idct_i4_ns + p.idct_wht_ns + p.idct_uv_ns;
+            let ipc = |n: u64| n as f64 / idc.max(1) as f64 * 100.0;
+            let mb_total = (p.mb_i16 + p.mb_i4).max(1);
+            println!(
+                "VP8_IDCT_SUB {name} {}x{} idct={:.3}ms i16_pairs={:.3}ms({:.1}%) i4_scalar={:.3}ms({:.1}%) wht={:.3}ms({:.1}%) uv={:.3}ms({:.1}%) mb_i16={} mb_i4={} mb_wht={} i4_ratio={:.1}%",
+                w, h, ms(p.idct_ns), ms(p.idct_i16_ns), ipc(p.idct_i16_ns),
+                ms(p.idct_i4_ns), ipc(p.idct_i4_ns), ms(p.idct_wht_ns), ipc(p.idct_wht_ns),
+                ms(p.idct_uv_ns), ipc(p.idct_uv_ns), p.mb_i16, p.mb_i4, p.mb_wht,
+                p.mb_i4 as f64 / mb_total as f64 * 100.0
+            );
+            tot_idct_i16 += p.idct_i16_ns as f64 / idc.max(1) as f64;
+            tot_idct_i4 += p.idct_i4_ns as f64 / idc.max(1) as f64;
+            tot_i4_ratio += p.mb_i4 as f64 / mb_total as f64;
+        }
+        // Task B 细分（熵内部）：bool 读 / token 记账·游标·索引 / 去量化+zigzag 写回。
+        // 换算 = 操作计数 × 校准单位耗时（模式+残差 bool 读同源计数）。
+        {
+            let bt = (p.modes_bits + p.tokens_bits) as f64 * c_bit;
+            let at = p.acct_count as f64 * c_acct;
+            let dt = p.dq_count as f64 * c_dq;
+            let et = (bt + at + dt).max(1e-9);
+            println!(
+                "VP8_ENT_SUB {name} {}x{} ent={:.3}ms modes={:.3}ms({:.1}%) tokens={:.3}ms({:.1}%) bits_mode={} bits_token={} acct={} dq={} bool_read={:.1}% token_acct={:.1}% dequant_zigzag={:.1}%",
+                w, h, ms(p.entropy_ns), ms(p.ent_modes_ns),
+                p.ent_modes_ns as f64 / p.entropy_ns.max(1) as f64 * 100.0,
+                ms(p.ent_tokens_ns),
+                p.ent_tokens_ns as f64 / p.entropy_ns.max(1) as f64 * 100.0,
+                p.modes_bits, p.tokens_bits, p.acct_count, p.dq_count,
+                bt / et * 100.0, at / et * 100.0, dt / et * 100.0
+            );
+            tot_bool += bt / et;
+            tot_acct += at / et;
+            tot_dq += dt / et;
+        }
         // B：每线程忙时（Task B，线程拆分天花板）。pipelined 下 filter/yuv 在滤波线程累计
         // （重粒子 yuv≈19% + filter≈13% 均在 thread2），熵/预测/IDCT 恒在主线程。
         // 拆分上限：把 IDCT+重建劈到 thread2 后，墙钟 ≈ max(主线程剩熵+预测, 滤波线程
@@ -378,6 +476,20 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
          wall'≈max(entropy, predict+idct+filter+yuv))",
         files.len(),
         tot_cut_new / n
+    );
+    println!(
+        "VP8_IDCT_SUB SUMMARY files={} mean_i16_pairs_idctshare={:.1}% mean_i4_scalar_idctshare={:.1}% mean_i4_mb_ratio={:.1}%",
+        files.len(),
+        tot_idct_i16 / n * 100.0,
+        tot_idct_i4 / n * 100.0,
+        tot_i4_ratio / n * 100.0
+    );
+    println!(
+        "VP8_ENT_SUB SUMMARY files={} mean_bool_read_share={:.1}% mean_token_acct_share={:.1}% mean_dequant_zigzag_share={:.1}%",
+        files.len(),
+        tot_bool / n * 100.0,
+        tot_acct / n * 100.0,
+        tot_dq / n * 100.0
     );
     eprintln!("[vp8_stage_probe] done");
 }

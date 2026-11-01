@@ -1662,6 +1662,78 @@ unsafe fn idct_add_two_sse2(coeff_a: *const i16, coeff_b: *const i16, dst: *mut 
     }
 }
 
+/// 单个 4×4 块的逆 DCT + 残差写回（1-block SSE2，字节==既有标量）。
+/// 与 `idct_add_two_sse2` 共用同一套两遍 butterfly + i32 pass2 算术（A 半边），但 B 块不拼装
+/// （无配对/合批）：i4x4 块间存在重建像素串行依赖（块 b 的左上下文读块 a 的「重建后」像素，
+/// 必须先 predict b 再逐块 add，故禁止 2 块合批——S7/K15 同版约束）。末段加回像素并 clamp
+/// [0,255] 只落低 4 像素/行（严格 4 字节读写，右缘块不越出平面右端，同 `dc_add_two_sse2` 姿势）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn idct_add_one_sse2(coeff: *const i16, dst: *mut u8, stride: isize) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let k1 = _mm_set1_epi16(20091);
+        let k2 = _mm_set1_epi16(-30068);
+        let z = _mm_setzero_si128();
+        // 四行系数各读 4 个 i16（低 64）。
+        let in0 = _mm_loadl_epi64(coeff.add(0) as *const __m128i);
+        let in1 = _mm_loadl_epi64(coeff.add(4) as *const __m128i);
+        let in2 = _mm_loadl_epi64(coeff.add(8) as *const __m128i);
+        let in3 = _mm_loadl_epi64(coeff.add(12) as *const __m128i);
+        // 第一遍（行混合）：与 `idct_add_two_sse2` 同序（高 64 恒 0，仅 A 半边载值）。
+        let a = _mm_add_epi16(in0, in2);
+        let b = _mm_sub_epi16(in0, in2);
+        let c = _mm_add_epi16(
+            _mm_sub_epi16(_mm_mulhi_epi16(in1, k2), _mm_mulhi_epi16(in3, k1)),
+            _mm_sub_epi16(in1, in3),
+        );
+        let d = _mm_add_epi16(
+            _mm_add_epi16(_mm_mulhi_epi16(in1, k1), _mm_mulhi_epi16(in3, k2)),
+            _mm_add_epi16(in1, in3),
+        );
+        let tmp0 = _mm_add_epi16(a, d);
+        let tmp1 = _mm_add_epi16(b, c);
+        let tmp2 = _mm_sub_epi16(b, c);
+        let tmp3 = _mm_sub_epi16(a, d);
+        // 转置：返回各寄存器低 64 = 列 i（4 行），高 64 恒 0。
+        let (t0, t1, t2, t3) = transpose_2_4x4_16b_sse2(tmp0, tmp1, tmp2, tmp3);
+        // 第二遍：只对低 64（A 半边）符号扩展做 i32 pass2（高位乘项同理，高半恒 0）。
+        let sign_ext = |x: __m128i| _mm_unpacklo_epi16(x, _mm_srai_epi16(x, 15));
+        let m1k2 = sign_ext(_mm_mulhi_epi16(t1, k2));
+        let m3k1 = sign_ext(_mm_mulhi_epi16(t3, k1));
+        let m12 = sign_ext(_mm_mulhi_epi16(t1, k1));
+        let m32 = sign_ext(_mm_mulhi_epi16(t3, k2));
+        let (s0, s1, s2, s3) = idct_pass2_shift32_sse2(
+            sign_ext(t0),
+            sign_ext(t1),
+            sign_ext(t2),
+            sign_ext(t3),
+            m1k2,
+            m3k1,
+            m12,
+            m32,
+        );
+        // 打包回 i16（列布局）→ 转置回行布局（r_i = 行 i 残差 4 i16，高 64 恒 0）。
+        let s0 = _mm_packs_epi32(s0, z);
+        let s1 = _mm_packs_epi32(s1, z);
+        let s2 = _mm_packs_epi32(s2, z);
+        let s3 = _mm_packs_epi32(s3, z);
+        let (r0, r1, r2, r3) = transpose_2_4x4_16b_sse2(s0, s1, s2, s3);
+        // 每行载 4 像素（零扩展）、加残差、packus clamp、落 4 字节（右缘不越界）。
+        let load_row = |o: isize| {
+            _mm_unpacklo_epi8(_mm_cvtsi32_si128(std::ptr::read_unaligned(dst.offset(o) as *const u32) as i32), z)
+        };
+        let store_row = |s: __m128i, o: isize| {
+            let px = _mm_packus_epi16(_mm_add_epi16(load_row(o), s), z);
+            std::ptr::write_unaligned(dst.offset(o) as *mut u32, _mm_cvtsi128_si32(px) as u32);
+        };
+        store_row(r0, 0);
+        store_row(r1, stride);
+        store_row(r2, 2 * stride);
+        store_row(r3, 3 * stride);
+    }
+}
+
 /// 两个水平相邻 4×4 块的逆 DCT + 残差写回（字节==既有标量）。
 /// `coeff_a`/`coeff_b` 为 [i16;16]，`col0` 为块 `a` 的左上列（帧坐标），块 `b` 在 `col0+4`。
 /// 标量回退：逐块走 `vp8::inverse_dct_add`（恒以 has_ac=true —— 对全零块/仅 DC 块结果与
@@ -1686,6 +1758,28 @@ pub(crate) fn inverse_dct_add_two(
     }
     super::vp8::inverse_dct_add(coeff_a, plane, pitch, row0, col0, true);
     super::vp8::inverse_dct_add(coeff_b, plane, pitch, row0, col0 + 4, true);
+}
+
+/// 单个 4×4 块的逆 DCT + 残差写回（i4x4 用，字节==既有标量）。
+/// `coeff` 为 [i16;16]。SIMD 走单块核 `idct_add_one_sse2`（与 i16 的 DCT 部件同门控
+/// `part_simd_on("dct","sse2")`）；标量回退恒 has_ac=true（对仅 DC 块与既有捷径逐字节一致，
+/// 见 `inverse_dct_has_ac_shortcut_equivalence`）。调用方在 AC 位为准时进入本入口，DC 捷径仍走标量。
+pub(crate) fn inverse_dct_add_one(
+    coeff: &[i16; 16],
+    plane: &mut [u8],
+    pitch: usize,
+    row0: usize,
+    col0: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if part_simd_on("dct", "sse2") {
+        let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
+        unsafe {
+            idct_add_one_sse2(coeff.as_ptr(), dst, pitch as isize);
+        }
+        return;
+    }
+    super::vp8::inverse_dct_add(coeff, plane, pitch, row0, col0, true);
 }
 
 /// 两个水平相邻 4×4 块仅 DC（无 AC）的逆变换捷径：残差恒 `(dc+4)>>3`（与完整两遍变换对
@@ -3591,6 +3685,73 @@ mod tests {
         }
         set_simd_part_override("dct", None);
         eprintln!("INVERSE_DCT_TWO_SIMD_PARITY\t{checked}");
+    }
+
+    /// 单块 i4x4 1-block SSE2 核与标量逐字节一致：满幅 i16 系数 + 随机平面 + 随机 DC，
+    /// 跨 0/±4095/±4096/±4097 边界，偶发全零 / 仅 DC 块（映射标量 has_ac=true 路径）。
+    #[test]
+    fn inverse_dct_one_simd_matches_scalar() {
+        if !simd_on("sse2") {
+            eprintln!("SIMD_TEST SKIP idct_one (无 sse2)");
+            return;
+        }
+        set_simd_part_override("dct", Some(true)); // 强制 SSE2 单块核
+        let boundaries: [i16; 16] = [
+            0, 1, -1, 4095, -4095, 4096, -4096, 4097, -4097, 2047, -2048, 8192, -8192, 32767, -32768, 16384,
+        ];
+        let pitch = 64usize;
+        let mut plane_simd = vec![0u8; 64 * 64];
+        let mut plane_scalar = vec![0u8; 64 * 64];
+        let mut checked = 0usize;
+        for seed in [
+            0x1357_9bdf_2468_ace0u64,
+            0x0bad_cafe_f00d_3333,
+            0xfeed_f00d_abcd_4444,
+            0xdead_beef_1234_5555,
+        ] {
+            let mut rng = Lcg(seed);
+            for trial in 0..300 {
+                let mut c = [0i16; 16];
+                for k in 0..16 {
+                    // 满幅均匀随机（全 i16 值域），偶发注入跨 0/±4096 边界值。
+                    c[k] = if rng.next() % 7 == 0 {
+                        boundaries[(rng.next() as usize) % boundaries.len()]
+                    } else {
+                        (rng.next() as u16) as i16
+                    };
+                }
+                // 偶发整块零 / 仅 DC。
+                if trial % 41 == 0 {
+                    c = [0i16; 16];
+                }
+                if trial % 61 == 0 {
+                    let mut dc_only = [0i16; 16];
+                    dc_only[0] = boundaries[(rng.next() as usize) % boundaries.len()];
+                    c = dc_only;
+                }
+                for px in plane_simd.iter_mut() {
+                    *px = rng.byte();
+                }
+                // 覆盖右缘/下缘：块 4x4 输出列 col0+1..col0+4、行 row0..row0+3，落 64x64
+                // 平面内 col0 顶到 59（尾列 63）、row0 顶到 60（尾行 63），验证 4 字节读写不越界。
+                let (row0, col0) = match trial % 23 {
+                    0 => (60usize, 59usize),
+                    1 => (60, 4 + (trial % 11)),
+                    2 => (4 + (trial % 11), 59),
+                    _ => (4 + (trial % 11), 4 + (trial % 11)),
+                };
+                plane_scalar.copy_from_slice(&plane_simd);
+                super::inverse_dct_add_one(&c, &mut plane_simd, pitch, row0, col0);
+                super::super::vp8::inverse_dct_add(&c, &mut plane_scalar, pitch, row0, col0, true);
+                assert_eq!(
+                    plane_simd, plane_scalar,
+                    "idct_one seed=0x{seed:016x} trial={trial} row0={row0} col0={col0} c={c:?}"
+                );
+                checked += 1;
+            }
+        }
+        set_simd_part_override("dct", None);
+        eprintln!("INVERSE_DCT_ONE_SIMD_PARITY\t{checked}");
     }
 
     #[test]

@@ -112,6 +112,7 @@ impl<'a> Vp8BoolDecoder<'a> {
     /// `ReadBit(ref decoder, ref value, ref bits, ref range, prob)` 的 Load/Store 模式。
     #[inline(always)]
     pub(crate) fn read_bit_val(mut self, probability: u8) -> (Self, u32) {
+        stage_clock::bit();
         let prob = u32::from(probability);
         if self.bits < 0 {
             self = self.refill();
@@ -139,6 +140,7 @@ impl<'a> Vp8BoolDecoder<'a> {
     /// 与 `read_bit(128)+符号分支` 逐位同语义。`magnitude` 为系数幅值，返回取符号结果。
     #[inline(always)]
     pub(crate) fn read_signed_val(mut self, magnitude: i32) -> (Self, i32) {
+        stage_clock::bit();
         if self.bits < 0 {
             self = self.refill();
         }
@@ -1109,6 +1111,7 @@ fn tokens<'a>(
     ac_factor: i32,
 ) -> (Vp8BoolDecoder<'a>, usize) {
     let mut p_idx = BAND_ROW_OFFSETS[position] + context * 11;
+    stage_clock::acct();
     let mut last = 0usize;
     let (dd, b) = d.read_bit_val(probabilities[p_idx]);
     d = dd;
@@ -1117,10 +1120,12 @@ fn tokens<'a>(
             let (dd, b) = d.read_bit_val(probabilities[p_idx + 1]);
             d = dd;
             if b == 0 {
+                stage_clock::acct();
                 position += 1;
                 if position == 16 {
                     break;
                 }
+                stage_clock::acct();
                 p_idx = BAND_ROW_OFFSETS[position];
                 continue;
             }
@@ -1172,12 +1177,16 @@ fn tokens<'a>(
             // 无分支符号（C# ReadSigned：符号是抛硬币，分支一半预测失败）。
             let (dd, signed) = d.read_signed_val(value);
             d = dd;
+            stage_clock::dq();
             output[ZIGZAG[position] as usize] = (signed * factor) as i16;
+            stage_clock::acct();
             last = position + 1;
+            stage_clock::acct();
             position += 1;
             if position == 16 {
                 break;
             }
+            stage_clock::acct();
             p_idx = BAND_ROW_OFFSETS[position] + next_context;
             let (dd, b) = d.read_bit_val(probabilities[p_idx]);
             d = dd;
@@ -1224,6 +1233,7 @@ fn parse_residuals(
         let above_bit = BLOCK_ABOVE_CONTEXT_BIT[block];
         let left_bit = BLOCK_LEFT_CONTEXT_BIT[block];
         let context = (((above >> above_bit) & 1) + ((left >> left_bit) & 1)) as usize;
+        stage_clock::acct();
         let (s2, last) = tokens(
             st,
             &probabilities[ty * 8 * 33..],
@@ -1241,6 +1251,7 @@ fn parse_residuals(
         if last > 1 {
             masks |= 1u64 << (block + 32);
         }
+        stage_clock::acct();
         if block == 24 {
             block = 0;
         } else {
@@ -1471,6 +1482,43 @@ pub(crate) mod stage_clock {
     #[cfg(feature = "stage_profile")]
     static P_END: AtomicU64 = AtomicU64::new(0);
 
+    // ---- 细分探针（2026-11-01，Task A/B：IDCT 内 i16 vs i4、熵内 bool/记账/去量化）----
+    // IDCT 内部子段墙钟（t2 重建线程，跨线程原子累计，同 P_IDCT 姿势）。
+    #[cfg(feature = "stage_profile")]
+    static P_IDCT_I16: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_IDCT_I4: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_IDCT_WHT: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_IDCT_UV: AtomicU64 = AtomicU64::new(0);
+    // 每文件宏块模式计数（i4/i16/WHT 执行次数）；供「i4 宏块占比 / WHT 次数」汇总。
+    #[cfg(feature = "stage_profile")]
+    static P_MB_I16: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_MB_I4: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_MB_WHT: AtomicU64 = AtomicU64::new(0);
+    // 熵内部子段：模式段 / 残差段墙钟。
+    #[cfg(feature = "stage_profile")]
+    static P_ENT_MODES: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_ENT_TOKENS: AtomicU64 = AtomicU64::new(0);
+    // 熵内部三类操作计数（换算时间占比用，K53 口径）：
+    // P_BITS = read_bit_val/read_signed_val 抛币总次数（header 段读也计入，靠段内 delta 归位）；
+    // P_MODES_BITS / P_TOKENS_BITS = 模式段 / 残差段各自的 bool 读次数（段闭包内 delta 累加）；
+    // P_ACCT = token 记账/游标/索引次数；P_DQ = 去量化+zigzag 写回次数。
+    #[cfg(feature = "stage_profile")]
+    static P_BITS: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_MODES_BITS: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_TOKENS_BITS: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_ACCT: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_DQ: AtomicU64 = AtomicU64::new(0);
+
     #[cfg(test)]
     pub fn set(on: bool) {
         ON.store(on, Relaxed);
@@ -1507,6 +1555,20 @@ pub(crate) mod stage_clock {
         P_SETUP.store(0, Relaxed);
         P_MID.store(0, Relaxed);
         P_END.store(0, Relaxed);
+        P_IDCT_I16.store(0, Relaxed);
+        P_IDCT_I4.store(0, Relaxed);
+        P_IDCT_WHT.store(0, Relaxed);
+        P_IDCT_UV.store(0, Relaxed);
+        P_MB_I16.store(0, Relaxed);
+        P_MB_I4.store(0, Relaxed);
+        P_MB_WHT.store(0, Relaxed);
+        P_ENT_MODES.store(0, Relaxed);
+        P_ENT_TOKENS.store(0, Relaxed);
+        P_BITS.store(0, Relaxed);
+        P_MODES_BITS.store(0, Relaxed);
+        P_TOKENS_BITS.store(0, Relaxed);
+        P_ACCT.store(0, Relaxed);
+        P_DQ.store(0, Relaxed);
     }
     /// 读取一次解码各阶段累计 ns：(entropy, predict, idct, filter, yuv, header, copy, scope, setup, mid, end)。
     #[cfg(feature = "stage_profile")]
@@ -1524,6 +1586,198 @@ pub(crate) mod stage_clock {
             P_MID.load(Relaxed),
             P_END.load(Relaxed),
         )
+    }
+
+    /// 细分探针读取（IDCT 内部子段 / 宏块模式计数 / 熵内部子段与操作计数）。feature 外不存在。
+    #[cfg(feature = "stage_profile")]
+    #[derive(Default, Clone, Copy)]
+    pub(crate) struct ProfileSub {
+        pub idct_i16: u64,
+        pub idct_i4: u64,
+        pub idct_wht: u64,
+        pub idct_uv: u64,
+        pub mb_i16: u64,
+        pub mb_i4: u64,
+        pub mb_wht: u64,
+        pub ent_modes: u64,
+        pub ent_tokens: u64,
+        /// 模式段 bool 读次数（P_BITS delta）。
+        pub modes_bits: u64,
+        /// 残差段 bool 读次数（P_BITS delta）。
+        pub tokens_bits: u64,
+        /// 去量化+zigzag 写回次数。
+        pub dq: u64,
+        /// token 记账/游标/索引次数。
+        pub acct: u64,
+    }
+    /// 读取细分探针累计。
+    #[cfg(feature = "stage_profile")]
+    pub fn profile_sub() -> ProfileSub {
+        ProfileSub {
+            idct_i16: P_IDCT_I16.load(Relaxed),
+            idct_i4: P_IDCT_I4.load(Relaxed),
+            idct_wht: P_IDCT_WHT.load(Relaxed),
+            idct_uv: P_IDCT_UV.load(Relaxed),
+            mb_i16: P_MB_I16.load(Relaxed),
+            mb_i4: P_MB_I4.load(Relaxed),
+            mb_wht: P_MB_WHT.load(Relaxed),
+            ent_modes: P_ENT_MODES.load(Relaxed),
+            ent_tokens: P_ENT_TOKENS.load(Relaxed),
+            modes_bits: P_MODES_BITS.load(Relaxed),
+            tokens_bits: P_TOKENS_BITS.load(Relaxed),
+            dq: P_DQ.load(Relaxed),
+            acct: P_ACCT.load(Relaxed),
+        }
+    }
+
+    /// 熵·模式段子计时：累加墙钟到 `P_ENT_MODES`，并把段内 `read_bit_val`/`read_signed_val`
+    /// 调用数（`P_BITS` delta）累加进 `P_MODES_BITS`。feature 外纯透传（不改变行为）。
+    #[inline(always)]
+    pub fn entropy_modes<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let b0 = P_BITS.load(Relaxed);
+            let r = f();
+            P_ENT_MODES.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            P_MODES_BITS.fetch_add(P_BITS.load(Relaxed) - b0, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// 熵·残差段子计时：同熵·模式段，占 `P_ENT_TOKENS` / `P_TOKENS_BITS`。
+    #[inline(always)]
+    pub fn entropy_tokens<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let b0 = P_BITS.load(Relaxed);
+            let r = f();
+            P_ENT_TOKENS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            P_TOKENS_BITS.fetch_add(P_BITS.load(Relaxed) - b0, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// IDCT·i16（16x16/8x8：2 块 SSE2 `inverse_dct_add_two`/`dc_add_two`）子计时。
+    #[inline(always)]
+    pub fn idct_i16<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_IDCT_I16.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// IDCT·i4x4 标量逐块（含 `predict_subblock` 子块预测 + `inverse_dct_add`）子计时。
+    #[inline(always)]
+    pub fn idct_i4<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_IDCT_I4.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// IDCT·WHT（`inverse_walsh_to_blocks`）子计时。
+    #[inline(always)]
+    pub fn idct_wht<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_IDCT_WHT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// IDCT·UV 成对（i16 与 i4 共用的色度 2 块路径；单独列以便 IDCT 内分账闭包对齐）。
+    #[inline(always)]
+    pub fn idct_uv<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_IDCT_UV.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
+    /// 宏块模式计数：每宏块恰好一次（i16⇔y_mode!=4 之外即 i4）。feature 外空操作。
+    #[inline(always)]
+    pub fn mb_mode(is_i16: bool) {
+        #[cfg(feature = "stage_profile")]
+        {
+            if is_i16 {
+                P_MB_I16.fetch_add(1, Relaxed);
+            } else {
+                P_MB_I4.fetch_add(1, Relaxed);
+            }
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {}
+    }
+    /// WHT 执行次数（`mb[24]` WHT 实际运行的宏块计数）。
+    #[inline(always)]
+    pub fn mb_wht() {
+        #[cfg(feature = "stage_profile")]
+        {
+            P_MB_WHT.fetch_add(1, Relaxed);
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {}
+    }
+    /// bool 位读取计数（`read_bit_val` / `read_signed_val` 抛币各一次）。
+    #[inline(always)]
+    pub fn bit() {
+        #[cfg(feature = "stage_profile")]
+        {
+            P_BITS.fetch_add(1, Relaxed);
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {}
+    }
+    /// token 记账/游标/索引计数（position/p_idx/last/块序 bookkeeping）。
+    #[inline(always)]
+    pub fn acct() {
+        #[cfg(feature = "stage_profile")]
+        {
+            P_ACCT.fetch_add(1, Relaxed);
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {}
+    }
+    /// 去量化+zigzag 写回计数（每非零系数一次）。
+    #[inline(always)]
+    pub fn dq() {
+        #[cfg(feature = "stage_profile")]
+        {
+            P_DQ.fetch_add(1, Relaxed);
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {}
     }
 
     #[inline(always)]
@@ -1776,6 +2030,23 @@ pub struct Vp8StageProfile {
     pub total_ns: u64,
     /// 是否走了 P-B 滤波线程管线（true 时 filter/yuv 在独立线程累计）。
     pub pipelined: bool,
+    /// IDCT 内部子段墙钟（仅 `stage_profile` 探针填充；feature 外恒 0）。
+    pub idct_i16_ns: u64,
+    pub idct_i4_ns: u64,
+    pub idct_wht_ns: u64,
+    pub idct_uv_ns: u64,
+    /// 宏块模式计数（每文件）：i16 宏块数 / i4(B_PRED) 宏块数 / WHT 执行次数。
+    pub mb_i16: u64,
+    pub mb_i4: u64,
+    pub mb_wht: u64,
+    /// 熵内部墙钟：模式段 / 残差段。
+    pub ent_modes_ns: u64,
+    pub ent_tokens_ns: u64,
+    /// 熵内部操作计数：模式段 bool 读 / 残差段 bool 读 / 记账·游标·索引 / 去量化+zigzag 写回。
+    pub modes_bits: u64,
+    pub tokens_bits: u64,
+    pub acct_count: u64,
+    pub dq_count: u64,
 }
 
 /// 完整解码：解析帧头 + 重建全部宏块 → 紧密 YUV 4:2:0（V2 暂不含环路滤波，V3 接入）。
@@ -1799,6 +2070,7 @@ pub fn stage_decode(frame: &[u8], width: u32, height: u32) -> Result<Vp8StagePro
     let total_ns = t0.elapsed().as_nanos() as u64;
     std::hint::black_box(&yuv.rgba);
     let (e, p, i, f, y, h, c, s, su, m, e2) = stage_clock::profile_totals();
+    let sub = stage_clock::profile_sub();
     Ok(Vp8StageProfile {
         width,
         height,
@@ -1818,7 +2090,68 @@ pub fn stage_decode(frame: &[u8], width: u32, height: u32) -> Result<Vp8StagePro
             (width as usize + 15) / 16,
             (height as usize + 15) / 16,
         ),
+        idct_i16_ns: sub.idct_i16,
+        idct_i4_ns: sub.idct_i4,
+        idct_wht_ns: sub.idct_wht,
+        idct_uv_ns: sub.idct_uv,
+        mb_i16: sub.mb_i16,
+        mb_i4: sub.mb_i4,
+        mb_wht: sub.mb_wht,
+        ent_modes_ns: sub.ent_modes,
+        ent_tokens_ns: sub.ent_tokens,
+        modes_bits: sub.modes_bits,
+        tokens_bits: sub.tokens_bits,
+        acct_count: sub.acct,
+        dq_count: sub.dq,
     })
+}
+
+/// 熵内部三类操作的单位耗时探针（`stage_profile` feature 门控；供 imgbench `vp8_stage_probe`
+/// 把操作计数换算成时间占比，K53 测量口径）。返回每操作纳秒：`(bool 位读取, 记账·游标, 去量化+zigzag 写回)`。
+/// 在同一（已插桩）构建里测量 → 与产线探针的分账自洽（换算分母与实测熵占比同源）。
+#[cfg(feature = "stage_profile")]
+pub fn probe_entropy_op_costs(reps: u32) -> (f64, f64, f64) {
+    use std::time::Instant;
+    // 1) bool 位读取：read_bit_val 实函数热循环（含 refill 分支，概率用 128 典型值）。
+    let data = vec![0x55u8; 4096];
+    let mut d = Vp8BoolDecoder::new(&data);
+    let mut acc = 0u64;
+    let t = Instant::now();
+    for _ in 0..reps {
+        let (s, b) = d.read_bit_val(128);
+        d = s;
+        acc = acc.wrapping_add(u64::from(b));
+    }
+    let c_bit = t.elapsed().as_nanos() as f64 / reps as f64;
+    // 2) 记账·游标·索引：tokens 里 position/last/p_idx + BAND_ROW_OFFSETS 序列。
+    let mut pos = 0usize;
+    let mut last = 0usize;
+    let mut p_i = 0usize;
+    let t = Instant::now();
+    for _ in 0..reps {
+        pos += 1;
+        if pos == 16 {
+            pos = 0;
+        }
+        p_i = BAND_ROW_OFFSETS[pos] + 11;
+        last = pos + 1;
+    }
+    std::hint::black_box((p_i, last, pos));
+    let c_acct = t.elapsed().as_nanos() as f64 / reps as f64;
+    // 3) 去量化+zigzag 写回：乘 factor + ZIGZAG 索引 + s16 存储。
+    let mut out = [0i16; 16];
+    let mut pos = 0usize;
+    let mut signed = if (acc & 1) == 0 { 17i32 } else { -17i32 };
+    let t = Instant::now();
+    for _ in 0..reps {
+        pos = (pos + 1) & 15;
+        out[ZIGZAG[pos] as usize] = (signed.wrapping_mul(53)) as i16;
+    }
+    std::hint::black_box(&out);
+    std::hint::black_box(signed);
+    let c_dq = t.elapsed().as_nanos() as f64 / reps as f64;
+    std::hint::black_box(acc);
+    (c_bit, c_acct, c_dq)
 }
 
 /// 未初始化 `Vec<u8>`：调用方必须保证返回后 `len` 字节在被读取前全部写入（见各调用点
@@ -1892,7 +2225,10 @@ fn entropy_macroblock(
     pkt: &mut MbPacket,
 ) -> (u8, u8) {
     let (y_mode, uv_mode, is_i16, sp, masks) = stage_clock::entropy(|| {
-        let modes = read_macroblock_modes(header, segment_probs, skip_probability, above_b, left_b, &mut pkt.b_modes);
+        let modes =
+            stage_clock::entropy_modes(|| {
+                read_macroblock_modes(header, segment_probs, skip_probability, above_b, left_b, &mut pkt.b_modes)
+            });
         let segment = (modes & 3) as usize;
         let skip = (modes & 4) != 0;
         let y_mode = ((modes >> 3) & 7) as u8;
@@ -1905,7 +2241,9 @@ fn entropy_macroblock(
             *left_nz &= keep;
             0u64
         } else {
-            parse_residuals(td, probs, &mut pkt.mb, &sp, is_i16, above_nz, left_nz)
+            stage_clock::entropy_tokens(|| {
+                parse_residuals(td, probs, &mut pkt.mb, &sp, is_i16, above_nz, left_nz)
+            })
         };
         (y_mode, uv_mode, is_i16, sp, masks)
     });
@@ -1963,78 +2301,92 @@ fn reconstruct_macroblock(
     stage_clock::idct(|| {
         let mb = &mut pkt.mb;
         let b_modes = &pkt.b_modes;
+        stage_clock::mb_mode(is_i16);
         if is_i16 && (nonzero_mask & NZ_Y2) != 0 {
-            let y2 = mb[24];
-            inverse_walsh_to_blocks(&y2, mb, (ac_mask & NZ_Y2) != 0);
-            mb[24].fill(0);
+            stage_clock::idct_wht(|| {
+                let y2 = mb[24];
+                inverse_walsh_to_blocks(&y2, mb, (ac_mask & NZ_Y2) != 0);
+                mb[24].fill(0);
+            });
+            stage_clock::mb_wht();
         }
 
         if is_i16 {
-            for by in 0..4 {
-                let row0 = dy + by * 4;
-                for pair_base in [0usize, 2] {
-                    let a = by * 4 + pair_base;
-                    let b = a + 1;
-                    if ((nonzero_mask >> a) & 1) != 0
-                        || mb[a][0] != 0
-                        || ((nonzero_mask >> b) & 1) != 0
-                        || mb[b][0] != 0
-                    {
-                        if (((ac_mask >> a) | (ac_mask >> b)) & 1) != 0 {
-                            super::simd::inverse_dct_add_two(
-                                &mb[a], &mb[b], y, y_pitch, row0, dx + pair_base * 4,
-                            );
-                        } else {
-                            super::simd::dc_add_two(
-                                mb[a][0], mb[b][0], y, y_pitch, row0, dx + pair_base * 4,
-                            );
+            stage_clock::idct_i16(|| {
+                for by in 0..4 {
+                    let row0 = dy + by * 4;
+                    for pair_base in [0usize, 2] {
+                        let a = by * 4 + pair_base;
+                        let b = a + 1;
+                        if ((nonzero_mask >> a) & 1) != 0
+                            || mb[a][0] != 0
+                            || ((nonzero_mask >> b) & 1) != 0
+                            || mb[b][0] != 0
+                        {
+                            if (((ac_mask >> a) | (ac_mask >> b)) & 1) != 0 {
+                                super::simd::inverse_dct_add_two(
+                                    &mb[a], &mb[b], y, y_pitch, row0, dx + pair_base * 4,
+                                );
+                            } else {
+                                super::simd::dc_add_two(
+                                    mb[a][0], mb[b][0], y, y_pitch, row0, dx + pair_base * 4,
+                                );
+                            }
+                            mb[a].fill(0);
+                            mb[b].fill(0);
                         }
-                        mb[a].fill(0);
-                        mb[b].fill(0);
                     }
                 }
-            }
+            });
         } else {
-            for block in 0..16 {
-                let bx = block & 3;
-                let by = block >> 2;
-                let row0 = dy + by * 4;
-                let col0 = dx + bx * 4;
-                let above = subblock_above(y, y_pitch, row0, col0, bx, by, above_y);
-                super::simd::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
-                let coeff = mb[block];
-                if ((nonzero_mask >> block) & 1) != 0 || coeff[0] != 0 {
-                    inverse_dct_add(&coeff, y, y_pitch, row0, col0, ((ac_mask >> block) & 1) != 0);
-                    mb[block].fill(0);
+            stage_clock::idct_i4(|| {
+                for block in 0..16 {
+                    let bx = block & 3;
+                    let by = block >> 2;
+                    let row0 = dy + by * 4;
+                    let col0 = dx + bx * 4;
+                    let above = subblock_above(y, y_pitch, row0, col0, bx, by, above_y);
+                    super::simd::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
+                    let coeff = mb[block];
+                    if ((nonzero_mask >> block) & 1) != 0 || coeff[0] != 0 {
+                        if ((ac_mask >> block) & 1) != 0 {
+                            super::simd::inverse_dct_add_one(&coeff, y, y_pitch, row0, col0);
+                        } else {
+                            inverse_dct_add(&coeff, y, y_pitch, row0, col0, false);
+                        }
+                        mb[block].fill(0);
+                    }
                 }
-            }
+            });
         }
 
-        if (nonzero_mask & 0xff0000) != 0 {
-            for a in [16usize, 18, 20, 22] {
-                let b = a + 1;
-                let row0 = dyu + ((a >> 1) & 1) * 4;
-                let nz_a = ((nonzero_mask >> a) & 1) != 0 || mb[a][0] != 0;
-                let nz_b = ((nonzero_mask >> b) & 1) != 0 || mb[b][0] != 0;
-                if !(nz_a || nz_b) {
-                    continue;
-                }
-                let has_ac = ((ac_mask >> a) | (ac_mask >> b)) & 1 != 0;
-                if a < 20 {
-                    if has_ac {
-                        super::simd::inverse_dct_add_two(&mb[a], &mb[b], u, uv_pitch, row0, dxu);
-                    } else {
-                        super::simd::dc_add_two(mb[a][0], mb[b][0], u, uv_pitch, row0, dxu);
+        stage_clock::idct_uv(|| {
+            if (nonzero_mask & 0xff0000) != 0 {
+                for a in [16usize, 18, 20, 22] {
+                    let b = a + 1;
+                    let row0 = dyu + ((a >> 1) & 1) * 4;
+                    let nz_a = ((nonzero_mask >> a) & 1) != 0 || mb[a][0] != 0;
+                    let nz_b = ((nonzero_mask >> b) & 1) != 0 || mb[b][0] != 0;
+                    if !(nz_a || nz_b) {
+                        continue;
                     }
-                } else if has_ac {
-                    super::simd::inverse_dct_add_two(&mb[a], &mb[b], v, uv_pitch, row0, dxu);
-                } else {
-                    super::simd::dc_add_two(mb[a][0], mb[b][0], v, uv_pitch, row0, dxu);
+                    let has_ac = ((ac_mask >> a) | (ac_mask >> b)) & 1 != 0;
+                    if a < 20 {
+                        if has_ac {
+                            super::simd::inverse_dct_add_two(&mb[a], &mb[b], u, uv_pitch, row0, dxu);
+                        } else {
+                            super::simd::dc_add_two(mb[a][0], mb[b][0], u, uv_pitch, row0, dxu);
+                        }
+                    } else if has_ac {
+                        super::simd::inverse_dct_add_two(&mb[a], &mb[b], v, uv_pitch, row0, dxu);
+                    } else {
+                        super::simd::dc_add_two(mb[a][0], mb[b][0], v, uv_pitch, row0, dxu);
+                    }
+                    mb[a].fill(0);
+                    mb[b].fill(0);
                 }
-                mb[a].fill(0);
-                mb[b].fill(0);
             }
-        }
+        });
     });
 }
 

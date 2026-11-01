@@ -73,6 +73,13 @@ pub fn vp8_stage_decode(
     vp8::stage_decode(frame, width, height).map_err(|e| e.0)
 }
 
+/// 熵内部三类操作的单位耗时探针（`stage_profile` feature 门控；imgbench `vp8_stage_probe` 用，
+/// 把 bool 读/记账/去量化 计数换算成时间占比）。返回每操作 ns：`(bool 读, 记账·游标, 去量化+zigzag)`。
+#[cfg(feature = "stage_profile")]
+pub fn vp8_probe_entropy_op_costs(reps: u32) -> (f64, f64, f64) {
+    vp8::probe_entropy_op_costs(reps)
+}
+
 // 外部语料定位助手（与集成测试共享，见 tests/fixtures/webp/mod.rs）。
 #[cfg(test)]
 #[path = "../../../tests/fixtures/webp/mod.rs"]
