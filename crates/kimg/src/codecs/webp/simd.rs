@@ -6,16 +6,19 @@
 //! 非 x86_64 一律标量回退。注释中文。
 //!
 //! 本模块实现 C 项：
-//! - `yuv_row_to_rgba`：每 8 像素一组 SSE4.1 i32 lane（`mullo_epi32`+`srai_epi32` 保持
-//!   `(x*c)>>8`、bias 减后再 `>>6` 的严格同序，无重结合），饱和 `packus` 即 `clamp(0,255)`。
+//! - `yuv_row_to_rgba`：AVX2 每 16 像素一组（8×i32 lane ×2 段 interleave；同源算术
+//!   `mullo_epi32`+`srai_epi32` 保持 `(x*c)>>8`、bias 减后再 `>>6` 严格同序，无重结合），
+//!   否则 SSE4.1 每 8 像素一组；饱和 `packus` 即 `clamp(0,255)`。u16-mulhi 变体
+//!   （vpmulhuw 系数+max-then-subtract，对标 C# `ConvertRowAvx2`）为 AVX2 默认生产路径，
+//!   `KIMG_WEBP_YUV_U16=0` 回退 i32 定点方案（两方案逐字节一致）。
 //! - `upsample_fancy_row`：SSE2 16-bit lane 算 fancy 上采样中间列对（`3*t[i]±邻居+8)>>4`），
 //!   首/末列因边界算术特殊保留标量，尾列标量收尾。
 //! - D1 `predict_subblock`/`predict_large`（SSSE3）：4×4 十模式 + 16×16/8×8 整块，经
 //!   `KIMG_WEBP_NO_SIMD`/`KIMG_WEBP_NO_SIMD_PRED` 门控接入（实测内核 1.6×~30× 提速，启用）。
-//! - D2 `filter_edge`（SSE2）：环路滤波 Simple/Normal/Inner、16×8/8×8 转置梯（字节精确 vs
-//!   标量，见模块底部断言）——**已实现+逐字节验证，但实测为持平/微负（垂直 16-lane 转置路径
-//!   1.08~1.20× 更慢），按「字节优先宁可回退」原则默认不接入生产**（vp8.rs `apply_loop_filter`
-//!   仍走标量）；保留本实现与 `KIMG_WEBP_NO_SIMD_FLT` 开关供复测/按平台启用。
+//! - D2 环路滤波：`filter_edge`（SSE2 per-edge）与 `lf_filter_macroblock`（SSE2 宏块熔合，
+//!   U/V 打包、宏块一次全 12 核，C# `Vp8Decoder.FilterMacroblock` 同款；字节精确 vs 标量见
+//!   模块底部断言）——**熔合版默认接入生产**（vp8.rs `filter_macroblock_row` 经
+//!   `part_simd_on("flt","sse2")` 路由；`KIMG_WEBP_NO_SIMD_FLT=1` / `KIMG_WEBP_SIMD_FLT=0` 回退）。
 
 use std::arch::is_x86_feature_detected;
 #[cfg(target_arch = "x86_64")]
@@ -35,6 +38,19 @@ pub(crate) fn webp_no_simd() -> bool {
         OFF.store(off, Relaxed);
     });
     OFF.load(Relaxed)
+}
+
+/// `KIMG_WEBP_YUV_U16`（默认开，u16-mulhi 变体为生产路径）：`0`/`false`/`off` → 关，
+/// 走 i32 定点 AVX2 方案（A/B 对照保留；两个方案逐字节一致，分别对标 C# `ConvertRowAvx2`
+/// 与既有 i32 标量源）。首次访问缓存。
+#[inline]
+fn yuv_u16_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let t = std::env::var("KIMG_WEBP_YUV_U16").unwrap_or_default().trim().to_string();
+        !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+    })
 }
 
 /// 运行时 CPU 特性查询（x86_64；非 x86_64 一律 false 走标量回退）。已并入 `webp_no_simd` 闸。
@@ -144,19 +160,23 @@ pub(crate) fn part_simd_on(part: &str, feature: &str) -> bool {
     if webp_no_simd() || part_env_off(part) {
         return false;
     }
-    // D2 环路滤波默认不接入生产（实测旧 16×8 转置 SSE2 为微负，保持标量）；
-    // 显式 KIMG_WEBP_SIMD_FLT=1 才启用（A/B 复测用）。非测试探针经 override 绕过此闸。
+    // D2 环路滤波：宏块熔合 SIMD（`lf_filter_macroblock`，字节不变）默认接入生产；
+    // `KIMG_WEBP_SIMD_FLT=0` / `KIMG_WEBP_NO_SIMD_FLT=1` / `KIMG_WEBP_NO_SIMD=1` 一票否决回退标量。
     if part == "flt" && !flt_enabled() {
         return false;
     }
     simd_on(feature)
 }
 
-/// `KIMG_WEBP_SIMD_FLT=1` 显式启用 D2 环路滤波 SIMD（默认关；首次访问缓存）。
+/// `KIMG_WEBP_SIMD_FLT`（默认开）：`0`/`false`/`off` → 关（A/B 对照保留）；其余/缺省 → 开。
 fn flt_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("KIMG_WEBP_SIMD_FLT"))
+    *ON.get_or_init(|| {
+        let v = std::env::var("KIMG_WEBP_SIMD_FLT").unwrap_or_default();
+        let t = v.trim();
+        !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,6 +1368,208 @@ unsafe fn lf_filter_edge_sse2(
     }
 }
 
+// ---------------------------------------------------------------------------
+// D2v3：宏块级熔合环路滤波（C# `Vp8Decoder.FilterMacroblock` + `Vp8LoopFilter` 同款）
+// ---------------------------------------------------------------------------
+// 一个宏块把全 12 个核熔合成一次调用：luma 竖直×4、chroma 竖直×2（U/V 打包成 16-lane）、
+// luma 水平×4、chroma 水平×2（U/V 打包）。边次序与 vp8.rs `filter_macroblock_row` 标量完全
+// 一致（左 MB 竖 → 内竖×3 → 上 MB 横 → 内横×3），熔合只改调用形态、不改任何算术/读序 →
+// 逐字节相同。U/V 打包把两平面拼一个向量：lane 逐样本独立，不做任何跨 U/V 混合，纯省调用与
+// 向量粒度；掩码 lane 结果为原值，故「从不对 lane 跳过」也保证未滤 lane 字节不变。
+
+/// 读一条 16-lane 色度行（低 8 = U、高 8 = V，同偏移行各 8 字节）—— C# `LoadPair` 同款。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn lf_uv_pair_row(u: *const u8, v: *const u8, off: isize) -> __m128i {
+    let ul = _mm_loadl_epi64(u.offset(off) as *const __m128i);
+    let vl = _mm_loadl_epi64(v.offset(off) as *const __m128i);
+    _mm_unpacklo_epi64(ul, vl)
+}
+
+/// 写回一条 16-lane 色度行（低 8 → U、高 8 → V）—— C# `StorePair` 同款。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn lf_uv_pair_store(u: *mut u8, v: *mut u8, off: isize, val: __m128i) {
+    _mm_storel_epi64(u.offset(off) as *mut __m128i, val);
+    _mm_storel_epi64(v.offset(off) as *mut __m128i, _mm_srli_si128(val, 8));
+}
+
+/// 竖直色度边（U/V 打包，8+8=16 lane）：`u`/`v` 指向 q0 列（行 uv_row、列 uvx），每侧 8 行 8 列
+/// 经 Load16x8/Store16x8 转置成 8 列、每列 16 lane（低 8 = U 行、高 8 = V 行）一次滤完 ——
+/// C# `ChromaVertical` 同款。补齐 D2v2 `lf_filter_edge_sse2` 的 8 宽竖直标量回退。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn lf_edge_v8_pair(
+    u: *mut u8,
+    v: *mut u8,
+    stride: isize,
+    interior: i32,
+    edge: i32,
+    hev: i32,
+    macroblock_edge: bool,
+    simple: bool,
+) {
+    let ul = u.offset(-4);
+    let vl = v.offset(-4);
+    let mut c = load16x8(ul, stride, vl, stride);
+    unsafe {
+        if simple {
+            let (p0n, q0n) = lf_do_filter2(c[2], c[3], c[4], c[5], edge);
+            c[3] = p0n;
+            c[4] = q0n;
+        } else {
+            let mx = lf_max_diff(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+            let mask = lf_mask_composite(
+                lf_needs_filter(_mm_set1_epi8(-1), c[2], c[3], c[4], c[5], edge),
+                mx,
+                interior,
+            );
+            if macroblock_edge {
+                let (p2n, p1n, p0n, q0n, q1n, q2n) =
+                    lf_do_filter6(c[1], c[2], c[3], c[4], c[5], c[6], mask, hev);
+                c[1] = p2n;
+                c[2] = p1n;
+                c[3] = p0n;
+                c[4] = q0n;
+                c[5] = q1n;
+                c[6] = q2n;
+            } else {
+                let (p1n, p0n, q0n, q1n) = lf_do_filter4(c[2], c[3], c[4], c[5], mask, hev);
+                c[2] = p1n;
+                c[3] = p0n;
+                c[4] = q0n;
+                c[5] = q1n;
+            }
+        }
+    }
+    store16x8(ul, stride, vl, stride, c);
+}
+
+/// 水平色度边（U/V 打包）：`u`/`v` 指向 q0 行（行 uv_row±k、列 uvx），同偏移行各 8 字节拼一个
+/// 16-lane 向量一次滤完 —— C# `ChromaHorizontal` 同款 LoadPair/StorePair。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn lf_edge_h_pair(
+    u: *mut u8,
+    v: *mut u8,
+    stride: isize,
+    interior: i32,
+    edge: i32,
+    hev: i32,
+    macroblock_edge: bool,
+    simple: bool,
+) {
+    unsafe {
+        if simple {
+            let (p0n, q0n) = lf_do_filter2(
+                lf_uv_pair_row(u, v, -2 * stride),
+                lf_uv_pair_row(u, v, -1 * stride),
+                lf_uv_pair_row(u, v, 0),
+                lf_uv_pair_row(u, v, stride),
+                edge,
+            );
+            lf_uv_pair_store(u, v, -1 * stride, p0n);
+            lf_uv_pair_store(u, v, 0, q0n);
+            return;
+        }
+        let p3 = lf_uv_pair_row(u, v, -4 * stride);
+        let p2 = lf_uv_pair_row(u, v, -3 * stride);
+        let p1 = lf_uv_pair_row(u, v, -2 * stride);
+        let p0 = lf_uv_pair_row(u, v, -1 * stride);
+        let q0 = lf_uv_pair_row(u, v, 0);
+        let q1 = lf_uv_pair_row(u, v, stride);
+        let q2 = lf_uv_pair_row(u, v, 2 * stride);
+        let q3 = lf_uv_pair_row(u, v, 3 * stride);
+        let mx = lf_max_diff(p3, p2, p1, p0, q0, q1, q2, q3);
+        let mask = lf_mask_composite(
+            lf_needs_filter(_mm_set1_epi8(-1), p1, p0, q0, q1, edge),
+            mx,
+            interior,
+        );
+        if macroblock_edge {
+            let (p2n, p1n, p0n, q0n, q1n, q2n) = lf_do_filter6(p2, p1, p0, q0, q1, q2, mask, hev);
+            lf_uv_pair_store(u, v, -3 * stride, p2n);
+            lf_uv_pair_store(u, v, -2 * stride, p1n);
+            lf_uv_pair_store(u, v, -1 * stride, p0n);
+            lf_uv_pair_store(u, v, 0, q0n);
+            lf_uv_pair_store(u, v, stride, q1n);
+            lf_uv_pair_store(u, v, 2 * stride, q2n);
+        } else {
+            let (p1n, p0n, q0n, q1n) = lf_do_filter4(p1, p0, q0, q1, mask, hev);
+            lf_uv_pair_store(u, v, -2 * stride, p1n);
+            lf_uv_pair_store(u, v, -1 * stride, p0n);
+            lf_uv_pair_store(u, v, 0, q0n);
+            lf_uv_pair_store(u, v, stride, q1n);
+        }
+    }
+}
+
+/// 宏块级熔合环路滤波入口（生产；C# `Vp8Decoder.FilterMacroblock` 同款）。一次宏块完成
+/// 全 12 个 16-lane 核调用，边次序与标量 `vp8::filter_macroblock_row` 完全一致，逐字节相同。
+/// 参数为滤波强度实值（调用方已算好 interior/edge_limit/sub_limit/hev）。
+/// 指针语义：`yc` 指向 (行 mby*16、列 mbx*16) 的 q0（= center = y*pitch+1+x），`uc`/`vc` 同理
+/// 指向色度 q0；跨块读（左列 -4 / 上行 -4）落在解码平面 4 像素边距内（与标量同界）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn lf_filter_macroblock(
+    yc: *mut u8,
+    y_pitch: isize,
+    uc: *mut u8,
+    vc: *mut u8,
+    uv_pitch: isize,
+    left: bool,
+    top: bool,
+    inner: bool,
+    simple: bool,
+    interior: i32,
+    edge_limit: i32,
+    sub_limit: i32,
+    hev: i32,
+) {
+    // 竖直段：左 MB 边 → 内竖×3（与标量同序：后边读前边已滤像素）。
+    if left {
+        lf_edge_v16(yc.offset(-4), y_pitch, interior, edge_limit, hev, true, simple);
+        if !simple {
+            lf_edge_v8_pair(uc, vc, uv_pitch, interior, edge_limit, hev, true, false);
+        }
+    }
+    if inner {
+        lf_edge_v16(yc, y_pitch, interior, sub_limit, hev, false, simple);
+        lf_edge_v16(yc.offset(4), y_pitch, interior, sub_limit, hev, false, simple);
+        lf_edge_v16(yc.offset(8), y_pitch, interior, sub_limit, hev, false, simple);
+        if !simple {
+            lf_edge_v8_pair(uc.offset(4), vc.offset(4), uv_pitch, interior, sub_limit, hev, false, false);
+        }
+    }
+    // 水平段：上 MB 边 → 内横×3。
+    if top {
+        lf_edge_h(yc, y_pitch, 16, interior, edge_limit, hev, true, simple);
+        if !simple {
+            lf_edge_h_pair(uc, vc, uv_pitch, interior, edge_limit, hev, true, false);
+        }
+    }
+    if inner {
+        lf_edge_h(yc.offset(4 * y_pitch), y_pitch, 16, interior, sub_limit, hev, false, simple);
+        lf_edge_h(yc.offset(8 * y_pitch), y_pitch, 16, interior, sub_limit, hev, false, simple);
+        lf_edge_h(yc.offset(12 * y_pitch), y_pitch, 16, interior, sub_limit, hev, false, simple);
+        if !simple {
+            lf_edge_h_pair(
+                uc.offset(4 * uv_pitch),
+                vc.offset(4 * uv_pitch),
+                uv_pitch,
+                interior,
+                sub_limit,
+                hev,
+                false,
+                false,
+            );
+        }
+    }
+}
+
 
 
 // 算术：RFC 6386 §14.4 与 vp8.rs `inverse_dct_short` 完全同序——用 k1=20091 / k2=-30068 的
@@ -1486,13 +1708,61 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     super::vp8::yuv_to_rgb(y, u, v)
 }
 
-/// 一行 YUV→RGBA8（alpha 恒 255）：SSE4.1 每 8 像素批量 + 标量尾；无 SIMD 全标量。
+/// 一行 YUV→RGBA8（alpha 恒 255）：AVX2 每 16 像素批量（SSE4.1 段收尾）+ 标量尾；
+/// 无 AVX2 则 SSE4.1 每 8 像素批量 + 标量尾；无 SIMD 全标量。逐字节恒等于标量
+/// `vp8::yuv_to_rgb`（各路径同一算术源，见内核注释）。
 /// 输入三平面各 `n` 字节，输出 `4*n` 字节。
 pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
     debug_assert_eq!(y.len(), u.len());
     debug_assert_eq!(y.len(), v.len());
     debug_assert_eq!(out.len(), y.len() * 4);
     let n = y.len();
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") && n >= 16 {
+        // 默认 u16-mulhi 变体（`KIMG_WEBP_YUV_U16=0` 回退 i32 定点；两者逐字节一致）。
+        let u16 = yuv_u16_enabled();
+        let mut col = 0usize;
+        unsafe {
+            while col + 16 <= n {
+                if u16 {
+                    yuv16_to_rgba_avx2_u16(
+                        y.as_ptr().add(col),
+                        u.as_ptr().add(col),
+                        v.as_ptr().add(col),
+                        out.as_mut_ptr().add(col * 4),
+                    );
+                } else {
+                    yuv16_to_rgba_avx2(
+                        y.as_ptr().add(col),
+                        u.as_ptr().add(col),
+                        v.as_ptr().add(col),
+                        out.as_mut_ptr().add(col * 4),
+                    );
+                }
+                col += 16;
+            }
+            // AVX2 隐含 SSE4.1：剩余 8..16 像素段走 8px SSE4.1 核。
+            while col + 8 <= n {
+                yuv8_to_rgba_sse41(
+                    y.as_ptr().add(col),
+                    u.as_ptr().add(col),
+                    v.as_ptr().add(col),
+                    out.as_mut_ptr().add(col * 4),
+                );
+                col += 8;
+            }
+            // 尾列（0..8 像素）逐像素标量。
+            for i in col..n {
+                let (r, g, b) = yuv_to_rgb(y[i], u[i], v[i]);
+                let o = i * 4;
+                *out.get_unchecked_mut(o) = r;
+                *out.get_unchecked_mut(o + 1) = g;
+                *out.get_unchecked_mut(o + 2) = b;
+                *out.get_unchecked_mut(o + 3) = 255;
+            }
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if simd_on("sse4.1") && n >= 8 {
         let mut col = 0usize;
@@ -1605,6 +1875,177 @@ unsafe fn yuv8_to_rgba_sse41(
     let out_hi = _mm_unpackhi_epi16(rg, ba);
     _mm_storeu_si128(out as *mut __m128i, out_lo);
     _mm_storeu_si128((out as *mut __m128i).add(1), out_hi);
+    }
+}
+
+/// AVX2：16 像素（8×i32 lane × 2 组）定点 YUV→RGBA。算术与 [`yuv8_to_rgba_sse41`] 严格同源
+/// （`(x*c)>>8` → bias 减 → `>>6` → min/max clamp [0,255]，`mullo_epi32`+`srai_epi32` 语义一致），
+/// 只扩宽到 256-bit：`vpmovzxbd` 每 8 字节段提升成 8 个 i32 lane，低 8 像素/高 8 像素各一遍通道，
+/// 再按 128-bit 段 pack 成 16 字节平面、256-bit 逐 lane unpack 交错成 RGBA——逐字节等于两个
+/// 独立的 8px SSE4.1 调用（每 128-bit lane 的内层 unpack/pack 与 SSE4.1 完全同款）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv16_to_rgba_avx2(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        // 每 8 字节段（8 像素）经 vpmovzxbd 提升到 ymm 的 8 个 i32 lane（非对齐 8 字节读）。
+        let y0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y as *const __m128i));
+        let y1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y.add(8) as *const __m128i));
+        let u0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u as *const __m128i));
+        let u1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u.add(8) as *const __m128i));
+        let v0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v as *const __m128i));
+        let v1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v.add(8) as *const __m128i));
+
+        let c19077 = _mm256_set1_epi32(19077);
+        let c26149 = _mm256_set1_epi32(26149);
+        let c6419 = _mm256_set1_epi32(6419);
+        let c13320 = _mm256_set1_epi32(13320);
+        let c33050 = _mm256_set1_epi32(33050);
+        let c14234 = _mm256_set1_epi32(14234);
+        let c8708 = _mm256_set1_epi32(8708);
+        let c17685 = _mm256_set1_epi32(17685);
+
+        macro_rules! channel {
+            ($yv:expr, $uv:expr, $vv:expr) => {{
+                let yv = $yv;
+                let uv = $uv;
+                let vv = $vv;
+                let yt = _mm256_srai_epi32(_mm256_mullo_epi32(yv, c19077), 8);
+                let vr = _mm256_srai_epi32(_mm256_mullo_epi32(vv, c26149), 8);
+                let ug = _mm256_srai_epi32(_mm256_mullo_epi32(uv, c6419), 8);
+                let vg = _mm256_srai_epi32(_mm256_mullo_epi32(vv, c13320), 8);
+                let ub = _mm256_srai_epi32(_mm256_mullo_epi32(uv, c33050), 8);
+                let r = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_add_epi32(yt, vr), c14234), 6);
+                let g = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(_mm256_sub_epi32(yt, ug), vg), c8708), 6);
+                let b = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_add_epi32(yt, ub), c17685), 6);
+                let zero = _mm256_setzero_si256();
+                let c255 = _mm256_set1_epi32(255);
+                (
+                    _mm256_min_epi32(_mm256_max_epi32(r, zero), c255),
+                    _mm256_min_epi32(_mm256_max_epi32(g, zero), c255),
+                    _mm256_min_epi32(_mm256_max_epi32(b, zero), c255),
+                )
+            }};
+        }
+
+        let (r0, g0, b0) = channel!(y0, u0, v0);
+        let (r1, g1, b1) = channel!(y1, u1, v1);
+
+        // 三平面 → 16 字节平面（低 128 位=8 像素，高 128 位=另 8 像素）。
+        let r8 = pack8_bytes_avx2(r0, r1);
+        let g8 = pack8_bytes_avx2(g0, g1);
+        let b8 = pack8_bytes_avx2(b0, b1);
+        let a8 = _mm256_set1_epi8(-1);
+
+        // 三平面 → RGBA 交错（256-bit unpacklo_epi8/16 逐 128-bit lane，无跨 lane 干扰）：
+        // 每 lane 得 [r,g,b,α] 四元组字节序，与 SSE4.1 的 8px 组逐一相同。
+        let rg = _mm256_unpacklo_epi8(r8, g8);
+        let ba = _mm256_unpacklo_epi8(b8, a8);
+        let out_lo = _mm256_unpacklo_epi16(rg, ba);
+        let out_hi = _mm256_unpackhi_epi16(rg, ba);
+        // 逐 lane unpack 后 out_lo=[px0-3,px8-11]、out_hi=[px4-7,px12-15]（lane0/lane1），
+        // 不能顺序直存（会写成 [0-3][8-11][4-7][12-15]）。先 vperm2i128 按 128-bit 块重排成
+        // [0-3][4-7]（=out_lo.l0,out_hi.l0）与 [8-11][12-15]（=out_lo.l1,out_hi.l1）再存。
+        // 立即数编码：imm[1:0] 选 lane0 源、imm[5:4] 选 lane1 源（imm[3]/imm[7] 为 lane0/1 清零位）。
+        let p01 = _mm256_permute2x128_si256(out_lo, out_hi, 0x20); // [lo.l0, hi.l0] = px0-7
+        let p23 = _mm256_permute2x128_si256(out_lo, out_hi, 0x31); // [lo.l1, hi.l1] = px8-15
+        _mm256_storeu_si256(out as *mut __m256i, p01);
+        _mm256_storeu_si256((out as *mut __m256i).add(1), p23);
+    }
+}
+
+/// AVX2 helper：两个 8-i32 lane 分量堆（各低/高 128 位含 4 像素）→ 16 字节平面字节序。
+/// 低 128 位 = 前 8 像素、高 128 位 = 后 8 像素（每段先 4 i32 → 4 i16 → 4 u8，饱和即恒等，
+/// 值已在 [0,255]，与 SSE4.1 的 pack 同款）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack8_bytes_avx2(a: __m256i, b: __m256i) -> __m256i {
+    use std::arch::x86_64::*;
+    unsafe {
+        let al = _mm256_castsi256_si128(a);
+        let ah = _mm256_extracti128_si256(a, 1);
+        let bl = _mm256_castsi256_si128(b);
+        let bh = _mm256_extracti128_si256(b, 1);
+        let lo = _mm_packus_epi16(_mm_packs_epi32(al, ah), _mm_setzero_si128());
+        let hi = _mm_packus_epi16(_mm_packs_epi32(bl, bh), _mm_setzero_si128());
+        _mm256_set_m128i(hi, lo)
+    }
+}
+
+/// AVX2 u16-mulhi 变体：16 像素/步。与 [`yuv16_to_rgba_avx2`]（i32 定点）逐字节相等——对标
+/// C# `WebpDecoder.ConvertRowAvx2`（libwebp 式 vpmulhuw）：像素字节先放到 u16 高位（左移 8），
+/// `mulhi_epu16(px<<8, k) = (px*k)>>8` 与标量 `(x*c)>>8` 逐位同截断；bias 减用 max-then-subtract
+/// 在 u16 域钳 0（预偏置和恒 < 2^16：yTerm≤19020、r 和≤45077、g 两项和≤27728/19688、b 和≤51890，
+/// 均不溢出），末段 `srli >>6` 逻辑右移 + packus 饱和把负数/超限映射到 [0,255]——与标量
+/// `srai>>6` 后 clamp 逐字节同。
+/// 门控：`KIMG_WEBP_YUV_U16=1` 时生产走本变体（实验性；任一对拍差一字节即弃，保持 i32 方案）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv16_to_rgba_avx2_u16(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        // 16 像素载入 → 16 i16（低位=像素）→ 左移 8 让像素落高字节（=×256）。
+        let yv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(y as *const __m128i)), 8);
+        let uv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(u as *const __m128i)), 8);
+        let vv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(v as *const __m128i)), 8);
+
+        let k_y = _mm256_set1_epi16(19077);
+        let k_vr = _mm256_set1_epi16(26149);
+        let k_ug = _mm256_set1_epi16(6419);
+        let k_vg = _mm256_set1_epi16(13320);
+        // 33050 > i16::MAX → 补码表示（-32486 = 0x811A）；mulhi_epu16 按 u16 位模式读，恒为 33050。
+        let k_ub = _mm256_set1_epi16(-32486);
+        let b_r = _mm256_set1_epi16(14234);
+        let b_g = _mm256_set1_epi16(8708);
+        let b_b = _mm256_set1_epi16(17685);
+
+        let yt = _mm256_mulhi_epu16(yv, k_y);
+        let vr = _mm256_mulhi_epu16(vv, k_vr);
+        let ug = _mm256_mulhi_epu16(uv, k_ug);
+        let vg = _mm256_mulhi_epu16(vv, k_vg);
+        let ub = _mm256_mulhi_epu16(uv, k_ub);
+
+        // 负数偏置：max(和, bias)-bias 在 u16 域钳 0，等价标量负值走 srai 后 clamp 0。
+        let rd = _mm256_srli_epi16(
+            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, vr), b_r), b_r),
+            6,
+        );
+        let gn = _mm256_add_epi16(ug, vg);
+        let gr = _mm256_srli_epi16(
+            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, b_g), gn), gn),
+            6,
+        );
+        let bl = _mm256_srli_epi16(
+            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, ub), b_b), b_b),
+            6,
+        );
+
+        // 每 16 i16 → 16 u8 平面：packus(r, 0) 得低 128 位 [px0-7,0×8]、高 128 位 [px8-15,0×8]，
+        // 与 i32 路径的 16 字节平面同构（unpack 逐 lane 取低 8 字节即像素段）。
+        let r8 = _mm256_packus_epi16(rd, _mm256_setzero_si256());
+        let g8 = _mm256_packus_epi16(gr, _mm256_setzero_si256());
+        let b8 = _mm256_packus_epi16(bl, _mm256_setzero_si256());
+        let a8 = _mm256_set1_epi8(-1);
+
+        // 与 i32 变体同款交错+重排。
+        let rg = _mm256_unpacklo_epi8(r8, g8);
+        let ba = _mm256_unpacklo_epi8(b8, a8);
+        let out_lo = _mm256_unpacklo_epi16(rg, ba);
+        let out_hi = _mm256_unpackhi_epi16(rg, ba);
+        let p01 = _mm256_permute2x128_si256(out_lo, out_hi, 0x20);
+        let p23 = _mm256_permute2x128_si256(out_lo, out_hi, 0x31);
+        _mm256_storeu_si256(out as *mut __m256i, p01);
+        _mm256_storeu_si256((out as *mut __m256i).add(1), p23);
     }
 }
 
@@ -2039,6 +2480,7 @@ mod tests {
             eprintln!("SIMD_TEST SKIP (无 sse2)");
             return;
         }
+        set_simd_part_override("flt", Some(true));
         let mut rng = Lcg(0xfeedfacecafebeef);
         let pitch = 80usize;
         let n = 80usize;
@@ -2076,6 +2518,7 @@ mod tests {
             );
             checked += 1;
         }
+        set_simd_part_override("flt", None);
         eprintln!("FILTER_EDGE_SIMD_PARITY\t{checked}");
     }
 

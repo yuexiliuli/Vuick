@@ -1973,6 +1973,7 @@ fn filter_macroblock_row(
 ) {
     let y_row = mby * 16;
     let uv_row = mby * 8;
+    stage_clock::filter(|| {
     for mbx in 0..mbw {
         let (level, inner) = row_filters[mby * mbw + mbx];
         if level == 0 {
@@ -1992,6 +1993,36 @@ fn filter_macroblock_row(
         let simple = filter.simple;
         let x = mbx * 16;
         let uvx = mbx * 8;
+
+        // SIMD 熔合路径（D2v3）：一次宏块全 12 核（C# FilterMacroblock 同款），边次序与下方
+        // 标量完全一致 → 逐字节相同；`KIMG_WEBP_NO_SIMD=1` / `KIMG_WEBP_NO_SIMD_FLT=1` /
+        // `KIMG_WEBP_SIMD_FLT=0` 回退标量（门控见 simd::part_simd_on）。
+        #[cfg(target_arch = "x86_64")]
+        {
+            if super::simd::part_simd_on("flt", "sse2") {
+                unsafe {
+                    let yc = y.as_mut_ptr().add(y_row * y_pitch + 1 + x);
+                    let uc = u.as_mut_ptr().add(uv_row * uv_pitch + 1 + uvx);
+                    let vc = v.as_mut_ptr().add(uv_row * uv_pitch + 1 + uvx);
+                    super::simd::lf_filter_macroblock(
+                        yc,
+                        y_pitch as isize,
+                        uc,
+                        vc,
+                        uv_pitch as isize,
+                        mbx > 0,
+                        mby > 0,
+                        !skip_inner,
+                        simple,
+                        interior,
+                        edge_limit,
+                        sub_limit,
+                        hev,
+                    );
+                }
+                continue;
+            }
+        }
 
         if mbx > 0 {
             filter_edge(y, y_pitch, x, y_row, 16, true, true, simple, interior, edge_limit, hev);
@@ -2026,6 +2057,7 @@ fn filter_macroblock_row(
             }
         }
     }
+    });
 }
 
 /// 环路滤波双线程门控（auto 宏块总数下限）。`mbw*mbh >= MT_MIN_MB_TOTAL`（≈1MP，如 1024×1024、
@@ -2838,6 +2870,76 @@ mod perf_stage_tests {
             flt / rec * 100.0,
             rec - inner
         );
+    }
+
+    /// 熔合 SIMD vs 标量全路径逐字节：随机小帧 + 随机滤波强度（level/inner/sharpness/simple
+    /// 全跨），以生产 `filter_macroblock_row` 为对象 —— 覆盖真实强度求值、宏块左/上/内边全组合
+    /// 与「后边读前边已滤像素」的顺序依赖。SIMD 路由经进程内 override 强制开/关对拍。
+    /// level 采样 0..63（与真实解码 `clamp(0,63)` 一致；真实 bitstream 不会产生 ≥84 的
+    /// level，故 edge_limit < 256，SIMD 掩码 `edge as i8` 截断不触发 —— 与 libwebp/C# 同行为）。
+    #[test]
+    fn filter_macroblock_simd_matches_scalar() {
+        use super::super::simd::{set_simd_part_override, simd_on};
+        if !simd_on("sse2") {
+            eprintln!("SIMD_TEST SKIP (无 sse2)");
+            return;
+        }
+        let mut rng = Lcg(0xf1a7b0c0ffee1234);
+        let (mbw, mbh) = (5usize, 2usize);
+        let y_pitch = mbw * 16 + 32;
+        let uv_pitch = mbw * 8 + 32;
+        let y_rows = mbh * 16 + 32;
+        let uv_rows = mbh * 8 + 32;
+        let mut checked = 0usize;
+        for simple in [false, true] {
+            for sharpness in [0u8, 1, 4, 5, 7] {
+                for _trial in 0..4 {
+                    let mut rf = Vec::with_capacity(mbw * mbh);
+                    for _ in 0..mbw * mbh {
+                        // level 覆盖：0（跳过）、hev 阈值上下 15/39/40、普通 2/63、随机 ≤63。
+                        let level = match rng.next() % 7 {
+                            0 => 0u8,
+                            1 => 2,
+                            2 => 15,
+                            3 => 39,
+                            4 => 40,
+                            5 => 63,
+                            _ => (rng.byte() % 64),
+                        };
+                        let inner = if (rng.next() & 1) == 0 { 1u8 } else { 0u8 };
+                        rf.push((level, inner));
+                    }
+                    let mut flt = FilterSettings::default();
+                    flt.simple = simple;
+                    flt.sharpness = sharpness;
+                    let mut ay = vec![0u8; y_rows * y_pitch];
+                    let mut au = vec![0u8; uv_rows * uv_pitch];
+                    let mut av = vec![0u8; uv_rows * uv_pitch];
+                    fill_rand_byte(&mut rng, &mut ay);
+                    fill_rand_byte(&mut rng, &mut au);
+                    fill_rand_byte(&mut rng, &mut av);
+                    let (mut by, mut bu, mut bv) = (ay.clone(), au.clone(), av.clone());
+                    for mby in 0..mbh {
+                        set_simd_part_override("flt", Some(true));
+                        filter_macroblock_row(&mut ay, y_pitch, &mut au, &mut av, uv_pitch, mbw, mby, &flt, &rf);
+                        set_simd_part_override("flt", Some(false));
+                        filter_macroblock_row(&mut by, y_pitch, &mut bu, &mut bv, uv_pitch, mbw, mby, &flt, &rf);
+                        assert_eq!(ay, by, "Y 熔合 vs 标量 simple={simple} sharp={sharpness} mby={mby}");
+                        assert_eq!(au, bu, "U 熔合 vs 标量 simple={simple} sharp={sharpness} mby={mby}");
+                        assert_eq!(av, bv, "V 熔合 vs 标量 simple={simple} sharp={sharpness} mby={mby}");
+                        checked += 1;
+                    }
+                    set_simd_part_override("flt", None);
+                }
+            }
+        }
+        eprintln!("FILTER_MACROBLOCK_SIMD_PARITY\t{checked}");
+    }
+
+    fn fill_rand_byte(rng: &mut Lcg, plane: &mut [u8]) {
+        for b in plane.iter_mut() {
+            *b = rng.byte();
+        }
     }
 
     mod helper {
