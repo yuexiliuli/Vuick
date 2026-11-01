@@ -96,12 +96,22 @@ impl<'a> Vp8BoolDecoder<'a> {
         }
     }
 
-    /// 读 1 位（概率 0..=255）。
-    #[inline]
+    /// 冷路径（帧头/分区解析）`&mut` 外壳，委托热路径按值实现，保证单一语义源。
+    #[inline(always)]
     pub(crate) fn read_bit(&mut self, probability: u8) -> u32 {
+        let (s, bit) = self.read_bit_val(probability);
+        *self = s;
+        bit
+    }
+
+    /// 热路径按值读位（概率 0..=255）：熵态 {value,bits,range_minus1} 由调用者以值携带
+    /// （`Copy`，小结构），整个宏块内联后落寄存器、无跨调用点内存往返——对照 C#
+    /// `ReadBit(ref decoder, ref value, ref bits, ref range, prob)` 的 Load/Store 模式。
+    #[inline(always)]
+    pub(crate) fn read_bit_val(mut self, probability: u8) -> (Self, u32) {
         let prob = u32::from(probability);
         if self.bits < 0 {
-            self.refill();
+            self = self.refill();
         }
         let range_minus1 = self.range_minus1;
         let split_minus1 = (range_minus1 * prob) >> 8;
@@ -118,7 +128,32 @@ impl<'a> Vp8BoolDecoder<'a> {
         let shift = range.leading_zeros() - 24;
         self.range_minus1 = (range << shift) - 1;
         self.bits -= shift as i32;
-        bit
+        (self, bit)
+    }
+
+    /// 热路径按值读「概率 128 符号位」并算术取符号（C# `ReadSigned`）：符号是抛硬币，
+    /// 分支约半数预测失败；用 `mask = (split - (window))>>31` 全表达式消除分支，
+    /// 与 `read_bit(128)+符号分支` 逐位同语义。`magnitude` 为系数幅值，返回取符号结果。
+    #[inline(always)]
+    pub(crate) fn read_signed_val(mut self, magnitude: i32) -> (Self, i32) {
+        if self.bits < 0 {
+            self = self.refill();
+        }
+        // range 持有减一状态 [127,254]；prob=128 时 split-1 = (range*128)>>8 = range>>1。
+        let range = self.range_minus1 as i32;
+        let split_minus1 = range >> 1;
+        // mask = -1 ⇔ 窗口 > split-1（bit=1）；否则 0。窗口 < 256，强转 i32 安全。
+        let mask = (split_minus1 - (self.value >> (self.bits as u32)) as i32) >> 31;
+        // bit=1 时减 (split+1) << bits（C# `(split+1) & mask` 的存储位数形式）。
+        let dec_bit = (split_minus1 + 1) & mask;
+        self.value -= (dec_bit as u32 as u64) << (self.bits as u32);
+        // bit=1: range - split；bit=0: split+1。
+        let new_range = (split_minus1 + 1 + ((range - 2 * split_minus1 - 1) & mask)) as u32;
+        let shift = new_range.leading_zeros() - 24;
+        self.range_minus1 = (new_range << shift) - 1;
+        self.bits -= shift as i32;
+        // mask=0 → magnitude；mask=-1 → ~m + 1 = -m（补码）。
+        (self, (magnitude ^ mask) - mask)
     }
 
     /// 读带符号值：`bitCount` 位无符号 + 1 位符号（概率 128）。
@@ -140,24 +175,31 @@ impl<'a> Vp8BoolDecoder<'a> {
         v
     }
 
-    /// 需要输入：`bits < 0` 时 refill。整 8 字节非对齐读入（区内安全），只消费 7 字节。
-    #[inline]
-    fn refill(&mut self) {
+    /// 需要输入：`bits < 0` 时 refill。整 8 字节非对齐直读（区内安全），只消费 7 字节。
+    #[inline(always)]
+    fn refill(self) -> Self {
         if self.data.len() - self.pos >= 8 {
-            let mut chunk = [0u8; 8];
-            chunk.copy_from_slice(&self.data[self.pos..self.pos + 8]);
-            // ReverseEndianness(读入 ulong) = 大端解释。
-            let raw = u64::from_be_bytes(chunk);
-            self.value = (self.value << 56) | (raw >> 8);
-            self.pos += 7;
-            self.bits += 56;
+            // 安全性：分支保证 pos + 8 <= len，且输入缓冲由调用方保证至少按需可读 8 字节
+            // （同 `data[pos..pos+8]` 切片界）；`read_unaligned` 自行处理非对齐载荷，
+            // 只读取内存不越界。`pos` 恒 <= len（仅消费路径推进），`as_ptr().add` 不越界。
+            // `u64::from_be` = C# `ReverseEndianness(ReadUnaligned<ulong>)` 的大端解释。
+            let raw = unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
+            let raw = u64::from_be(raw);
+            let mut s = self;
+            s.value = (s.value << 56) | (raw >> 8);
+            s.pos += 7;
+            s.bits += 56;
+            s
         } else {
-            self.refill_tail();
+            self.refill_tail()
         }
     }
 
-    /// 尾部逐字节补充，越过末尾补零。
-    fn refill_tail(&mut self) {
+    /// 尾部逐字节补充，越过末尾补零（仅数据末尾触发，冷路径但也必须内联：byval 结构体参数
+    /// 在 Win64 上会把调用方结构体槽位地址传进来 → 熵态 alloca 逃逸 → SROA 放弃提升、逐位回写栈；
+    /// `#[inline(always)]` 消除该函数边界，保住寄存器驻留）。
+    #[inline(always)]
+    fn refill_tail(mut self) -> Self {
         loop {
             let next = if self.pos < self.data.len() {
                 let b = self.data[self.pos];
@@ -172,6 +214,7 @@ impl<'a> Vp8BoolDecoder<'a> {
                 break;
             }
         }
+        self
     }
 }
 
@@ -196,6 +239,9 @@ impl Clone for Vp8BoolDecoder<'_> {
         }
     }
 }
+
+// 全字段 Copy（含 &'a [u8]），热路径按值携带熵态必须。
+impl Copy for Vp8BoolDecoder<'_> {}
 
 // ---------------------------------------------------------------------------
 // V1：帧头解析
@@ -1007,45 +1053,67 @@ const BLOCK_LEFT_CONTEXT_BIT: [u32; 25] = [
 /// Y2 块的掩码位（低 32 位掩码的位 24）。
 const NZ_Y2: u32 = 1 << 24;
 
-/// RFC 6386 §13.2 DCT_CAT3..6 子树（p8 之后）附额外位。
-fn read_category_3_to_6(d: &mut Vp8BoolDecoder<'_>, probs: &[u8], p_idx: usize) -> i32 {
-    let (extra, base): (&[u8], i32) = if d.read_bit(probs[p_idx + 8]) == 0 {
-        if d.read_bit(probs[p_idx + 9]) == 0 {
-            (&PCAT3, 11)
+/// RFC 6386 §13.2 DCT_CAT3..6 子树（p8 之后）附额外位。熵态按值携带（寄存器驻留）。
+#[inline(always)]
+fn read_category_3_to_6<'a>(
+    mut d: Vp8BoolDecoder<'a>,
+    probs: &[u8],
+    p_idx: usize,
+) -> (Vp8BoolDecoder<'a>, i32) {
+    let (extra, base): (&[u8], i32) = {
+        let (dd, b) = d.read_bit_val(probs[p_idx + 8]);
+        d = dd;
+        if b == 0 {
+            let (dd, b) = d.read_bit_val(probs[p_idx + 9]);
+            d = dd;
+            if b == 0 {
+                (&PCAT3, 11)
+            } else {
+                (&PCAT4, 19)
+            }
         } else {
-            (&PCAT4, 19)
+            let (dd, b) = d.read_bit_val(probs[p_idx + 10]);
+            d = dd;
+            if b == 0 {
+                (&PCAT5, 35)
+            } else {
+                (&PCAT6, 67)
+            }
         }
-    } else if d.read_bit(probs[p_idx + 10]) == 0 {
-        (&PCAT5, 35)
-    } else {
-        (&PCAT6, 67)
     };
     let mut value = 0i32;
     let mut i = 0;
     while extra[i] != 0 {
-        value = (value << 1) | d.read_bit(extra[i]) as i32;
+        let (dd, b) = d.read_bit_val(extra[i]);
+        d = dd;
+        value = (value << 1) | b as i32;
         i += 1;
     }
-    base + value
+    (d, base + value)
 }
 
 /// 读一个块的系数 token（RFC 6386 §13.2），去量化后按 zigzag 写回 `output`（调用前须清零）。
-/// 返回最后非零 token 的 zigzag 位置 + 1（无 token 返回 0）。
-fn tokens(
-    d: &mut Vp8BoolDecoder<'_>,
+/// 返回最后非零 token 的 zigzag 位置 + 1（无 token 返回 0）。熵态按值携带 + `#[inline(always)]`
+/// 使每宏块 25 次调用内联成单函数、{value,bits,range} 全程寄存器驻留（C# `Tokens(ref …)` 同款）。
+#[inline(always)]
+fn tokens<'a>(
+    mut d: Vp8BoolDecoder<'a>,
     probabilities: &[u8],
     context: usize,
     mut position: usize,
     output: &mut [i16; 16],
     dc_factor: i32,
     ac_factor: i32,
-) -> usize {
+) -> (Vp8BoolDecoder<'a>, usize) {
     let mut p_idx = BAND_ROW_OFFSETS[position] + context * 11;
     let mut last = 0usize;
-    if d.read_bit(probabilities[p_idx]) != 0 {
+    let (dd, b) = d.read_bit_val(probabilities[p_idx]);
+    d = dd;
+    if b != 0 {
         loop {
-            // ZERO → 下一位置，σ=0 语境。
-            if d.read_bit(probabilities[p_idx + 1]) == 0 {
+            let (dd, b) = d.read_bit_val(probabilities[p_idx + 1]);
+            d = dd;
+            if b == 0 {
                 position += 1;
                 if position == 16 {
                     break;
@@ -1053,44 +1121,76 @@ fn tokens(
                 p_idx = BAND_ROW_OFFSETS[position];
                 continue;
             }
-            let (value, next_context): (i32, usize) = if d.read_bit(probabilities[p_idx + 2]) == 0 {
-                (1, 11)
-            } else {
-                if d.read_bit(probabilities[p_idx + 3]) == 0 {
-                    if d.read_bit(probabilities[p_idx + 4]) == 0 {
-                        (2, 22)
-                    } else {
-                        (3 + d.read_bit(probabilities[p_idx + 5]) as i32, 22)
-                    }
-                } else if d.read_bit(probabilities[p_idx + 6]) == 0 {
-                    if d.read_bit(probabilities[p_idx + 7]) == 0 {
-                        (5 + d.read_bit(159) as i32, 22)
-                    } else {
-                        let high = d.read_bit(165) << 1;
-                        (7 + (high | d.read_bit(145)) as i32, 22)
-                    }
+            let (value, next_context): (i32, usize) = {
+                let (dd, b) = d.read_bit_val(probabilities[p_idx + 2]);
+                d = dd;
+                if b == 0 {
+                    (1, 11)
                 } else {
-                    (read_category_3_to_6(d, probabilities, p_idx), 22)
+                    let (dd, b) = d.read_bit_val(probabilities[p_idx + 3]);
+                    d = dd;
+                    if b == 0 {
+                        let (dd, b) = d.read_bit_val(probabilities[p_idx + 4]);
+                        d = dd;
+                        if b == 0 {
+                            (2, 22)
+                        } else {
+                            let (dd, b) = d.read_bit_val(probabilities[p_idx + 5]);
+                            d = dd;
+                            (3 + b as i32, 22)
+                        }
+                    } else {
+                        let (dd, b) = d.read_bit_val(probabilities[p_idx + 6]);
+                        d = dd;
+                        if b == 0 {
+                            let (dd, b) = d.read_bit_val(probabilities[p_idx + 7]);
+                            d = dd;
+                            if b == 0 {
+                                let (dd, b) = d.read_bit_val(159);
+                                d = dd;
+                                (5 + b as i32, 22)
+                            } else {
+                                let (dd, b) = d.read_bit_val(165);
+                                d = dd;
+                                let high = b << 1;
+                                let (dd, b) = d.read_bit_val(145);
+                                d = dd;
+                                (7 + (high | b) as i32, 22)
+                            }
+                        } else {
+                            let (dd, cat) = read_category_3_to_6(d, probabilities, p_idx);
+                            d = dd;
+                            (cat, 22)
+                        }
+                    }
                 }
             };
             let factor = if position == 0 { dc_factor } else { ac_factor };
-            let magn = if d.read_bit(128) != 0 { -value } else { value };
-            output[ZIGZAG[position] as usize] = (magn * factor) as i16;
+            // 无分支符号（C# ReadSigned：符号是抛硬币，分支一半预测失败）。
+            let (dd, signed) = d.read_signed_val(value);
+            d = dd;
+            output[ZIGZAG[position] as usize] = (signed * factor) as i16;
             last = position + 1;
             position += 1;
             if position == 16 {
                 break;
             }
             p_idx = BAND_ROW_OFFSETS[position] + next_context;
-            if d.read_bit(probabilities[p_idx]) == 0 {
+            let (dd, b) = d.read_bit_val(probabilities[p_idx]);
+            d = dd;
+            if b == 0 {
                 break; // 下一位置 EOB。
             }
         }
     }
-    last
+    (d, last)
 }
 
 /// 解析一个宏块全部系数（Y2 先于 luma 当 i16）。返回两块掩码：低 32 = 每块非零，高 32 = 有 AC。
+/// 每宏块一次 Load/Store（对照 C# `ParseResiduals`）。函数边界用 `&mut` + 熵态局部标量拷贝：
+/// byval 结构体参数在 Win64 ABI 会逐位回写内存（asm 实证 24/32/36(%ptr) 每 bit store），
+/// `&mut` 只在进出各一次 {data,pos,value,bits,range}；内部 tokens 内联后全为 SSA 寄存器。
+#[inline(never)]
 fn parse_residuals(
     d: &mut Vp8BoolDecoder<'_>,
     probabilities: &[u8],
@@ -1100,6 +1200,7 @@ fn parse_residuals(
     above_nz: &mut u32,
     left_nz: &mut u32,
 ) -> u64 {
+    let mut st = *d;
     let mut above = *above_nz;
     let mut left = *left_nz;
     let mut masks = 0u64;
@@ -1120,8 +1221,8 @@ fn parse_residuals(
         let above_bit = BLOCK_ABOVE_CONTEXT_BIT[block];
         let left_bit = BLOCK_LEFT_CONTEXT_BIT[block];
         let context = (((above >> above_bit) & 1) + ((left >> left_bit) & 1)) as usize;
-        let last = tokens(
-            d,
+        let (s2, last) = tokens(
+            st,
             &probabilities[ty * 8 * 33..],
             context,
             start,
@@ -1129,6 +1230,7 @@ fn parse_residuals(
             dc,
             ac,
         );
+        st = s2;
         let nonzero = if last > 0 { 1u32 } else { 0u32 };
         above = (above & !(1 << above_bit)) | (nonzero << above_bit);
         left = (left & !(1 << left_bit)) | (nonzero << left_bit);
@@ -1145,25 +1247,35 @@ fn parse_residuals(
             }
         }
     }
+    *d = st;
     *above_nz = above;
     *left_nz = left;
     masks
 }
 
-/// 树遍历：node + read_bit(prob[node>>1]) 沿树下行，叶子（≤0）返回 -child。
-fn read_tree(d: &mut Vp8BoolDecoder<'_>, tree: &[i8], probabilities: &[u8]) -> u32 {
+/// 树遍历：node + read_bit_val(prob[node>>1]) 沿树下行，叶子（≤0）返回 -child。熵态按值携带。
+#[inline(always)]
+fn read_tree<'a>(
+    mut d: Vp8BoolDecoder<'a>,
+    tree: &[i8],
+    probabilities: &[u8],
+) -> (Vp8BoolDecoder<'a>, u32) {
     let mut node = 0usize;
     loop {
-        let bit = d.read_bit(probabilities[node >> 1]);
+        let (dd, bit) = d.read_bit_val(probabilities[node >> 1]);
+        d = dd;
         let child = tree[node + bit as usize];
         if child <= 0 {
-            return -child as u32;
+            return (d, -child as u32);
         }
         node = child as usize;
     }
 }
 
 /// RFC 6386 §11.5 宏块模式（segment / skip / ymode / 16 个 bmode（仅 B_PRED） / uvmode）。
+/// 每宏块一次 Load/Store（对照 C# `ReadMacroBlockModes`）。函数边界 `&mut` + 熵态局部拷贝，
+/// 与 parse_residuals 同理（byval 会逐位回写内存，本形态保寄存器驻留）。
+#[inline(never)]
 fn read_macroblock_modes(
     header: &mut Vp8BoolDecoder<'_>,
     segment_probabilities: Option<&[u8; 3]>,
@@ -1172,16 +1284,24 @@ fn read_macroblock_modes(
     left_modes: &mut [u8; 4],
     block_modes: &mut [u8; 16],
 ) -> u32 {
+    let mut st = *header;
     let segment = match segment_probabilities {
-        Some(probs) => read_tree(header, &SEGMENT_ID_TREE, probs),
+        Some(probs) => {
+            let (s, v) = read_tree(st, &SEGMENT_ID_TREE, probs);
+            st = s;
+            v
+        }
         None => 0,
     };
     let skip = if skip_probability < 0 {
         0
     } else {
-        header.read_bit(skip_probability as u8)
+        let (s, b) = st.read_bit_val(skip_probability as u8);
+        st = s;
+        b
     };
-    let y_mode = read_tree(header, &KEYFRAME_Y_MODE_TREE, &KEYFRAME_Y_MODE_PROBS);
+    let (s, y_mode) = read_tree(st, &KEYFRAME_Y_MODE_TREE, &KEYFRAME_Y_MODE_PROBS);
+    st = s;
     if y_mode == 4 {
         for i in 0..16 {
             let above = if i < 4 { above_modes[i] } else { block_modes[i - 4] };
@@ -1194,7 +1314,8 @@ fn read_macroblock_modes(
                 [..9];
             let mut node = 0usize;
             loop {
-                let bit = header.read_bit(p[node >> 1]);
+                let (s, bit) = st.read_bit_val(p[node >> 1]);
+                st = s;
                 let child = BLOCK_MODE_TREE[node + bit as usize];
                 if child <= 0 {
                     block_modes[i] = -child as u8;
@@ -1221,7 +1342,8 @@ fn read_macroblock_modes(
             *m = derived;
         }
     }
-    let uv_mode = read_tree(header, &UV_MODE_TREE, &KEYFRAME_UV_MODE_PROBS);
+    let (s, uv_mode) = read_tree(st, &UV_MODE_TREE, &KEYFRAME_UV_MODE_PROBS);
+    *header = s;
     segment | (skip << 2) | (y_mode << 3) | (uv_mode << 6)
 }
 
@@ -1469,13 +1591,21 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
         // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
         let mut left_b = [0u8; 4];
         let mut left_nz = 0u32;
+        // 行内复用该分区的 token 解码器（&mut 边界，熵态在宏块级函数内部寄存器驻留）。
         let td = &mut token_decoders[mby & (partition_count - 1)];
         for mbx in 0..mbw {
             // 阶段一：熵解码。探针计时关闭时为零开销直通（字节不变）。
             let (y_mode, uv_mode, i16, sp, masks) = stage_clock::entropy(|| {
                 let modes = {
                     let above_m: &mut [u8; 4] = (&mut above_b[mbx * 4..mbx * 4 + 4]).try_into().unwrap();
-                    read_macroblock_modes(&mut header, segment_probs, skip_probability, above_m, &mut left_b, &mut b_modes)
+                    read_macroblock_modes(
+                        &mut header,
+                        segment_probs,
+                        skip_probability,
+                        above_m,
+                        &mut left_b,
+                        &mut b_modes,
+                    )
                 };
                 let segment = (modes & 3) as usize;
                 let skip = (modes & 4) != 0;
