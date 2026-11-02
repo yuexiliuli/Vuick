@@ -64,7 +64,7 @@ SIMD：YUV→RGB SSE4.1（2.5×）、帧内预测 SSSE3（端到端 −9%）、I
 
 | 变量 | 取值 | 说明 |
 |---|---|---|
-| `KIMG_WEBP_BACKEND` | `ours` / `imagewebp` / `auto` | AUTO 默认仍 image-webp，ours 接管静态族 |
+| `KIMG_WEBP_BACKEND` | `ours` / `imagewebp`（已忽略） / `auto` | 默认与 `auto` = 自研（自包含，无 image-webp 运行时）；`imagewebp` 值接受但忽略并提示一次，等同 ours |
 | `KIMG_WEBP_NO_SIMD` | `1` | 关闭 WebP SIMD 路径 |
 | `KIMG_WEBP_THREADS` | `0` / `1` / `2` / `auto` | VP8 双线程重建∥滤波 |
 | `KIMG_PNG_LEVEL` | `A` / `B` / `auto` | unfilter 引擎档位 |

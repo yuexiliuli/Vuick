@@ -1,17 +1,20 @@
-//! WebP 解码器：image-webp 0.2.4 兜底 + 自研容器/VP8L 静态无损内核（P0 基建 + P1 容器 + P2 VP8L）。
+//! WebP 解码器：自研容器 + VP8L 无损 + VP8 有损 + ALPH + 动画内核（自包含）。
 //!
 //! 对外 API（`WebPDecoder<R>` 的 `ImageDecoder`+`AnimationDecoder`）与 image 0.25 一致。
-//! 后端开关（M3）：`WEBP_BACKEND` 原子位 AUTO/OURS/IMAGEWEBP，环境变量 `KIMG_WEBP_BACKEND`
+//! 后端开关（M3 演化）：`WEBP_BACKEND` 原子位 AUTO/OURS，环境变量 `KIMG_WEBP_BACKEND`
 //! 仅首次惰性解析一次（防每次解码 `env::var` 的 std::env 并发问题）；`pub(crate) set_webp_backend`
 //! 供测试直设。家族判定（VP8/VP8L/动画/ALPH）在容器解析后按 VP8X features byte + 是否含 ANIM
 //! chunk 判定（P1 起），不按首 4 字节盲判。
+//!
+//! 自包含（P7，2026-11）：image-webp 0.2.4 已从 `[dependencies]` 移入 `[dev-dependencies]`
+//! （仅测试/基准 oracle 参照）。坏输入 / 超限（动画 `KIMG_WEBP_ANIM_CAP_MB`，默认 256MB）不再
+//! 静默降级 image-webp，一律显式 `ImageError::Decoding`。
 
-use std::io::{BufRead, Cursor, Seek};
+use std::io::{BufRead, Seek};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::animation::{Delay, Frame, Frames, LoopCount};
-use crate::buffer::{RgbImage, RgbaImage};
+use crate::animation::{Frames, LoopCount};
 use crate::color::ColorType;
 use crate::error::{DecodingError, ImageError, ImageResult};
 use crate::format::ImageFormat;
@@ -103,27 +106,26 @@ pub fn vp8_probe_clock_costs(reps: u32) -> (f64, f64) {
 mod webp_fixtures_support;
 
 // ---------------------------------------------------------------------------
-// 后端开关（M3）
+// 后端开关（M3 演化 → 自包含，2026-11）
 // ---------------------------------------------------------------------------
 
-/// 自动（默认）：自研核优先，未实现/不可解家族自动回 image-webp 兜底（M6 翻转，2026-11）。
+/// 自动（默认）：自研核（自包含后与 OURS 同义，无其它后端可选）。
 pub const BACKEND_AUTO: u8 = 0;
-/// 强制自研（全部已实现家族：VP8/VP8L/ALPH/动画；未实现家族仍回 image-webp）。
+/// 强制自研（全部已实现家族：VP8/VP8L/ALPH/动画）。
 pub const BACKEND_OURS: u8 = 1;
-/// 强制 image-webp（含自研已实现家族）。
-pub const BACKEND_IMAGEWEBP: u8 = 2;
 
 static WEBP_BACKEND: AtomicU8 = AtomicU8::new(BACKEND_AUTO);
 
 /// 直设后端（测试/对照用；不触发环境变量解析）。
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn set_webp_backend(v: u8) {
-    debug_assert!(v <= BACKEND_IMAGEWEBP);
+    debug_assert!(v <= BACKEND_OURS);
     WEBP_BACKEND.store(v, Ordering::SeqCst);
 }
 
 /// 解析后端：首次调用（状态为 AUTO 且从未被直设）才读一次环境变量 `KIMG_WEBP_BACKEND`
 /// （`auto|ours|imagewebp`），并发下 CAS 保证只由先到者写入。此后恒定。
+/// 自包含后 `imagewebp` 值不再切换后端：接受 + 忽略（等同 ours），仅 eprintln 提示一次。
 pub(crate) fn resolved_backend() -> u8 {
     let cur = WEBP_BACKEND.load(Ordering::Relaxed);
     if cur != BACKEND_AUTO {
@@ -131,10 +133,15 @@ pub(crate) fn resolved_backend() -> u8 {
     }
     let resolved = match std::env::var("KIMG_WEBP_BACKEND") {
         Ok(v) => match v.to_ascii_lowercase().as_str() {
-            // 显式二进制选择：`ours` 自研 / `imagewebp` 强制兜底。
             "ours" => BACKEND_OURS,
-            "imagewebp" | "image-webp" => BACKEND_IMAGEWEBP,
-            // `auto` / 其它未知名 / 未设：M6 翻转后默认自研核（2026-11）。
+            // image-webp 运行时兜底已随自包含移除：接受但忽略，等同 ours（仅提示一次）。
+            "imagewebp" | "image-webp" => {
+                eprintln!(
+                    "KIMG_WEBP_BACKEND=imagewebp 已被忽略：WebP 已自包含，运行时等同自研（ours）"
+                );
+                BACKEND_OURS
+            }
+            // `auto` / 其它未知名 / 未设：默认自研核（2026-11）。
             _ => BACKEND_OURS,
         },
         Err(_) => BACKEND_OURS,
@@ -150,10 +157,11 @@ pub(crate) fn resolved_backend() -> u8 {
     }
 }
 
-/// 是否允许自研路径接管：AUTO（M6 翻转后默认）与 `OURS` 强制态都放行；仅显式
-/// `KIMG_WEBP_BACKEND=imagewebp`（或测试 `set_webp_backend(IMAGEWEBP)`）强制回兜底。
+/// 是否允许自研路径接管：自包含后恒为 true（已无 image-webp 运行时兜底）。保留调用以维持
+/// `KIMG_WEBP_BACKEND` 解析语义（`imagewebp` 值仅打印提示，不再切换后端）。
 fn ours_allowed() -> bool {
-    resolved_backend() != BACKEND_IMAGEWEBP
+    let _ = resolved_backend();
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -178,83 +186,94 @@ pub(crate) struct OursStatic {
     pub xmp: Option<Vec<u8>>,
 }
 
-enum WebPDecoderInner<R> {
-    /// image-webp 兜底：构造时统一读全量字节（做家族判定），重开 `Cursor<Vec<u8>>`。
-    ImageWebp {
-        dec: image_webp::WebPDecoder<Cursor<Vec<u8>>>,
-        _r: PhantomData<R>,
-    },
-    /// 自研路径：容器 + VP8L 静态无损已解码缓冲（P2 起启用）。
+enum WebPDecoderInner {
+    /// 自研静态路径：容器 + VP8L/VP8 已解码缓冲（P2 起启用）。
     Ours(OursStatic),
-    /// 自研动画路径：ANMF 帧原始解码 + 画布合成（P6 起启用，`KIMG_WEBP_BACKEND=ours`）。
+    /// 自研动画路径：ANMF 帧原始解码 + 画布合成（P6 起启用）。
     OursAnimated(animation::OursAnimated),
 }
 
-/// WebP 解码器（支持有损/无损/带 alpha/动画；P2 起无损静态族可走自研内核）。
+/// WebP 解码器（支持有损/无损/带 alpha/动画；自包含，全部家族走自研内核）。
 pub struct WebPDecoder<R> {
-    inner: WebPDecoderInner<R>,
+    inner: WebPDecoderInner,
     orientation: Option<Orientation>,
+    _r: PhantomData<R>,
 }
 
 impl<R: BufRead + Seek> WebPDecoder<R> {
-    /// 构造：读全量字节 → 后端决策（自研接管 VP8L 静态无损 或 image-webp 兜底）。
+    /// 构造：读全量字节 → 容器解析判定家族 → 自研内核解码（VP8/VP8L/ALPH/动画）。
+    /// 自包含（P7）：坏输入 / 超限（动画 `KIMG_WEBP_ANIM_CAP_MB`，默认 256MB）/ 解码失败一律
+    /// 显式 `ImageError::Decoding`，不再静默降级 image-webp。
     pub fn new(r: R) -> ImageResult<Self> {
         let mut data = Vec::new();
         {
             let mut br = r;
-            br.read_to_end(&mut data)
-                .map_err(ImageError::IoError)?;
+            br.read_to_end(&mut data).map_err(ImageError::IoError)?;
         }
+        // 自包含后恒允许自研路径；此调用仅为维持 `KIMG_WEBP_BACKEND` 解析语义
+        // （`imagewebp` 值只打印提示，不再切换后端）。
+        let _ = ours_allowed();
 
-        if ours_allowed() {
-            // 容器解析判定家族：VP8L 静态无损 / VP8 静态有损 / 动画 → 自研接管（解码兜到
-            // `decode_static_lossless` / `decode_static_lossy` / `decode_animation`；其余家族
-            // 本期仍落 image-webp 兜底）。
-            if let Ok(c) = container::parse(&data) {
-                if c.family == container::Family::Animated {
-                    if let Some(ours) = crate::codecs::webp::animation::decode_animation(&data)? {
-                        return Ok(Self {
-                            inner: WebPDecoderInner::OursAnimated(ours),
-                            orientation: None,
-                        });
-                    }
-                }
-                if c.family.is_static_lossless() {
-                    if let Some(ours) = crate::codecs::webp::decode_static_lossless(&data)? {
-                        return Ok(Self {
-                            inner: WebPDecoderInner::Ours(ours),
-                            orientation: None,
-                        });
-                    }
-                }
-                if c.family == container::Family::StaticLossy
-                    || c.family == container::Family::LossyAlpha
-                {
-                    if let Some(ours) = crate::codecs::webp::decode_static_lossy(&data)? {
-                        return Ok(Self {
-                            inner: WebPDecoderInner::Ours(ours),
-                            orientation: None,
-                        });
-                    }
-                }
+        let c = match container::parse(&data) {
+            Ok(c) => c,
+            Err(_) => {
+                return Err(ImageError::Decoding(DecodingError::new(
+                    ImageFormat::WebP.into(),
+                    "WebP 容器解析失败（RIFF/WEBP 结构无效）",
+                )));
             }
+        };
+        if c.family == container::Family::Animated {
+            return match crate::codecs::webp::animation::decode_animation(&data) {
+                Ok(Some(ours)) => Ok(Self {
+                    inner: WebPDecoderInner::OursAnimated(ours),
+                    orientation: None,
+                    _r: PhantomData,
+                }),
+                Ok(None) => Err(ImageError::Decoding(DecodingError::new(
+                    ImageFormat::WebP.into(),
+                    "WebP 动画解码失败或超出 KIMG_WEBP_ANIM_CAP_MB 内存护栏（默认 256MB；已自包含，无 image-webp 兜底）",
+                ))),
+                Err(e) => Err(e),
+            };
         }
-
-        let dec = image_webp::WebPDecoder::new(Cursor::new(data))
-            .map_err(ImageError::from_kimg_webp)?;
-        Ok(Self {
-            inner: WebPDecoderInner::ImageWebp {
-                dec,
-                _r: PhantomData,
-            },
-            orientation: None,
-        })
+        if c.family.is_static_lossless() {
+            return match crate::codecs::webp::decode_static_lossless(&data)? {
+                Some(ours) => Ok(Self {
+                    inner: WebPDecoderInner::Ours(ours),
+                    orientation: None,
+                    _r: PhantomData,
+                }),
+                None => Err(ImageError::Decoding(DecodingError::new(
+                    ImageFormat::WebP.into(),
+                    "WebP 无损静态解码失败（已自包含，无 image-webp 兜底）",
+                ))),
+            };
+        }
+        if c.family == container::Family::StaticLossy
+            || c.family == container::Family::LossyAlpha
+        {
+            return match crate::codecs::webp::decode_static_lossy(&data)? {
+                Some(ours) => Ok(Self {
+                    inner: WebPDecoderInner::Ours(ours),
+                    orientation: None,
+                    _r: PhantomData,
+                }),
+                None => Err(ImageError::Decoding(DecodingError::new(
+                    ImageFormat::WebP.into(),
+                    "WebP 有损静态解码失败（已自包含，无 image-webp 兜底）",
+                ))),
+            };
+        }
+        Err(ImageError::Decoding(DecodingError::new(
+            ImageFormat::WebP.into(),
+            "WebP 家族不受支持（已自包含，无 image-webp 兜底）",
+        )))
     }
 
     /// 是否为动画。
     pub fn has_animation(&self) -> bool {
         match &self.inner {
-            WebPDecoderInner::ImageWebp { dec, .. } => dec.is_animated(),
             WebPDecoderInner::Ours(_) => false,
             WebPDecoderInner::OursAnimated(_) => true,
         }
@@ -263,9 +282,6 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
     /// 设置动画背景色。
     pub fn set_background_color(&mut self, color: Rgba<u8>) -> ImageResult<()> {
         match &mut self.inner {
-            WebPDecoderInner::ImageWebp { dec, .. } => dec
-                .set_background_color(color.0)
-                .map_err(ImageError::from_kimg_webp),
             WebPDecoderInner::Ours(_) => Ok(()),
             // 记录背景色，`into_frames` 合成时按 image-webp 语义使用：
             // Some(0,0,0,0)=透明画布 + dispose 清矩形为透明黑；None=dispose 不清矩形。
@@ -280,7 +296,6 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
 impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
     fn dimensions(&self) -> (u32, u32) {
         match &self.inner {
-            WebPDecoderInner::ImageWebp { dec, .. } => dec.dimensions(),
             WebPDecoderInner::Ours(o) => (o.width, o.height),
             WebPDecoderInner::OursAnimated(a) => (a.width, a.height),
         }
@@ -288,13 +303,6 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
 
     fn color_type(&self) -> ColorType {
         match &self.inner {
-            WebPDecoderInner::ImageWebp { dec, .. } => {
-                if dec.has_alpha() {
-                    ColorType::Rgba8
-                } else {
-                    ColorType::Rgb8
-                }
-            }
             WebPDecoderInner::Ours(o) => {
                 if o.has_alpha {
                     ColorType::Rgba8
@@ -315,9 +323,6 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
 
     fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
         let exif = match &mut self.inner {
-            WebPDecoderInner::ImageWebp { dec, .. } => dec
-                .exif_metadata()
-                .map_err(ImageError::from_kimg_webp)?,
             WebPDecoderInner::Ours(o) => o.exif.as_ref().cloned(),
             WebPDecoderInner::OursAnimated(a) => a.exif.as_ref().cloned(),
         };
@@ -331,9 +336,6 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
 
     fn icc_profile(&mut self) -> ImageResult<Option<Vec<u8>>> {
         Ok(match &mut self.inner {
-            WebPDecoderInner::ImageWebp { dec, .. } => dec
-                .icc_profile()
-                .map_err(ImageError::from_kimg_webp)?,
             WebPDecoderInner::Ours(o) => o.icc.as_ref().cloned(),
             WebPDecoderInner::OursAnimated(a) => a.icc.as_ref().cloned(),
         })
@@ -341,9 +343,6 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
 
     fn xmp_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
         Ok(match &mut self.inner {
-            WebPDecoderInner::ImageWebp { dec, .. } => dec
-                .xmp_metadata()
-                .map_err(ImageError::from_kimg_webp)?,
             WebPDecoderInner::Ours(o) => o.xmp.clone(),
             WebPDecoderInner::OursAnimated(a) => a.xmp.as_ref().cloned(),
         })
@@ -359,9 +358,6 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
     fn read_image(self, buf: &mut [u8]) -> ImageResult<()> {
         assert_eq!(u64::try_from(buf.len()), Ok(self.total_bytes()));
         match self.inner {
-            WebPDecoderInner::ImageWebp { mut dec, .. } => {
-                dec.read_image(buf).map_err(ImageError::from_kimg_webp)
-            }
             WebPDecoderInner::Ours(o) => {
                 if o.has_alpha {
                     let target = (o.width as usize) * (o.height as usize) * 4;
@@ -432,106 +428,34 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
 
 impl<'a, R: 'a + BufRead + Seek> AnimationDecoder<'a> for WebPDecoder<R> {
     fn loop_count(&self) -> LoopCount {
-        let img = match &self.inner {
-            WebPDecoderInner::ImageWebp { dec, .. } => dec,
-            WebPDecoderInner::Ours(_) => return LoopCount::Finite(1.try_into().unwrap()),
+        match &self.inner {
+            WebPDecoderInner::Ours(_) => LoopCount::Finite(1.try_into().unwrap()),
             WebPDecoderInner::OursAnimated(a) => {
-                return if a.loop_count == 0 {
+                if a.loop_count == 0 {
                     LoopCount::Infinite
                 } else {
                     // image-webp 口径：非 0 存值直传（0 才映射 Forever）。
                     LoopCount::Finite(a.loop_count.try_into().unwrap())
                 }
             }
-        };
-        match img.loop_count() {
-            image_webp::LoopCount::Forever => LoopCount::Infinite,
-            image_webp::LoopCount::Times(n) => LoopCount::Finite(n.into()),
         }
     }
 
     fn into_frames(self) -> Frames<'a> {
-        let frames = match self.inner {
+        match self.inner {
             // 自研动画：逐帧合成迭代器（背景色/合成语义已在构造时定稿）。
             WebPDecoderInner::OursAnimated(anim) => {
-                return Frames::new(Box::new(animation::OursFramesIterator::new(anim)))
+                Frames::new(Box::new(animation::OursFramesIterator::new(anim)))
             }
-            // 自研静态无损：非动画，无帧。
+            // 自研静态：非动画，无帧。
             WebPDecoderInner::Ours(_) => Frames::new(Box::new(std::iter::empty())),
-            WebPDecoderInner::ImageWebp { dec, .. } => {
-                struct FramesInner {
-                    decoder: Option<image_webp::WebPDecoder<Cursor<Vec<u8>>>>,
-                    current: u32,
-                    width: u32,
-                    height: u32,
-                }
-                impl Iterator for FramesInner {
-                    type Item = ImageResult<Frame>;
-
-                    fn next(&mut self) -> Option<Self::Item> {
-                        let dec = self.decoder.as_mut()?;
-                        if self.current == dec.num_frames() {
-                            return None;
-                        }
-                        self.current += 1;
-
-                        let (img, delay) = if dec.has_alpha() {
-                            let mut img = RgbaImage::new(self.width, self.height);
-                            match dec.read_frame(img.as_mut()) {
-                                Ok(delay) => (img, delay),
-                                Err(image_webp::DecodingError::NoMoreFrames) => return None,
-                                Err(e) => return Some(Err(ImageError::from_kimg_webp(e))),
-                            }
-                        } else {
-                            let mut img = RgbImage::new(self.width, self.height);
-                            match dec.read_frame(img.as_mut()) {
-                                Ok(delay) => {
-                                    // RGB → RGBA。
-                                    let mut rgba = RgbaImage::new(self.width, self.height);
-                                    for (x, y, p) in img.enumerate_pixels() {
-                                        rgba.put_pixel(x, y, Rgba([p[0], p[1], p[2], 255]));
-                                    }
-                                    (rgba, delay)
-                                }
-                                Err(image_webp::DecodingError::NoMoreFrames) => return None,
-                                Err(e) => return Some(Err(ImageError::from_kimg_webp(e))),
-                            }
-                        };
-
-                        Some(Ok(Frame::from_parts(
-                            img,
-                            0,
-                            0,
-                            Delay::from_numer_denom_ms(delay, 1),
-                        )))
-                    }
-                }
-
-                let (width, height) = dec.dimensions();
-                Frames::new(Box::new(FramesInner {
-                    decoder: Some(dec),
-                    current: 0,
-                    width,
-                    height,
-                }))
-            }
-        };
-        frames
-    }
-}
-
-impl ImageError {
-    pub(crate) fn from_kimg_webp(e: image_webp::DecodingError) -> ImageError {
-        match e {
-            image_webp::DecodingError::IoError(e) => ImageError::IoError(e),
-            _ => ImageError::Decoding(DecodingError::new(ImageFormat::WebP.into(), e)),
         }
     }
 }
 
-/// 自研 VP8L 静态无损解码入口（P2）：后端允许 + 家族=StaticLossless 时调用，解析容器并解码。
-/// 返回 `Some(ours)` 表示自研接管成功；`None` 表示不可接管（应回 image-webp 兜底）。
-/// 自研解码出错也回 `Ok(None)`（降级 image-webp，守住「正确性优先」；后续自研稳后再考虑硬错）。
+/// 自研 VP8L 静态无损解码入口（P2）：家族=StaticLossless 时调用，解析容器并解码。
+/// 返回 `Some(ours)` 表示自研接管成功；`None` 表示不可接管（解码失败；调用方转为显式错误，
+/// 自包含后无 image-webp 兜底）。
 pub(crate) fn decode_static_lossless(
     data: &[u8],
 ) -> ImageResult<Option<crate::codecs::webp::OursStatic>> {
@@ -549,7 +473,7 @@ pub(crate) fn decode_static_lossless(
     let img = match vp8l::decode(bitstream) {
         Ok(i) => i,
         Err(e) => {
-            // 自研解码失败 → 降级 image-webp（见上注释）。
+            // 自研解码失败 → Ok(None)（调用方转为显式错误）。
             let _ = e;
             return Ok(None);
         }
@@ -592,11 +516,11 @@ pub fn decode_static_lossless_rgba8_into(data: &[u8], out: &mut [u8]) -> ImageRe
     }
 }
 
-/// 自研 VP8 静态有损解码入口（P3 有损族，V4+ 接管）：后端允许 + 家族=StaticLossy/LossyAlpha 时
+/// 自研 VP8 静态有损解码入口（P3 有损族，V4+ 接管）：家族=StaticLossy/LossyAlpha 时
 /// 调用。解析容器 → VP8 YUV → fancy RGB 直出。opaque（StaticLossy，无 alpha）：`decode_vp8_rgb3`
 /// 直出 **RGB3**（`OursStatic.rgb`，w*h*3，消 RGBA4 中间帧 / 4→3 转换 / 整帧 RGBA 分配）；
 /// LossyAlpha：`decode_vp8`+RGBA4 后附 ALPH 反滤波 alpha 合并。出错/不可接管回 `Ok(None)`
-/// （降级 image-webp，正确性优先）。
+/// （调用方转为显式错误，自包含后无 image-webp 兜底）。
 pub(crate) fn decode_static_lossy(
     data: &[u8],
 ) -> ImageResult<Option<crate::codecs::webp::OursStatic>> {
@@ -749,25 +673,23 @@ pub(crate) fn decode_and_unfilter_alpha(alpha_chunk: &[u8], width: u32, height: 
 #[cfg(test)]
 mod tests {
     // backend 开关单测（不读环境变量路径：直设后断言 resolve）。
-    use super::{resolved_backend, set_webp_backend, BACKEND_AUTO, BACKEND_IMAGEWEBP, BACKEND_OURS};
+    use super::{resolved_backend, set_webp_backend, BACKEND_AUTO, BACKEND_OURS};
 
     #[test]
     fn backend_setter_and_resolve() {
         set_webp_backend(BACKEND_OURS);
         assert_eq!(resolved_backend(), BACKEND_OURS);
-        set_webp_backend(BACKEND_IMAGEWEBP);
-        assert_eq!(resolved_backend(), BACKEND_IMAGEWEBP);
-        // 复位 AUTO：环境变量未设时解析回 AUTO（解析仅一次）。
+        // 复位 AUTO：环境变量未设时解析回自研核（自包含后无 IMAGEWEBP 后端）。
         set_webp_backend(BACKEND_AUTO);
         let rb = resolved_backend();
-        assert!(rb == BACKEND_AUTO || rb == BACKEND_OURS || rb == BACKEND_IMAGEWEBP);
+        assert!(rb == BACKEND_AUTO || rb == BACKEND_OURS);
     }
 }
 
 #[cfg(test)]
 mod metadata_tests {
-    //! P1 容器元数据对照：自研 `container::parse` vs image-webp（经 kimg `WebPDecoder`）在
-    //! 全部 fixture 上一致；畸形输入不 panic 不 OOM。放在 crate 内测试（container 为 pub(crate)）。
+    //! P1 容器元数据对照：自研 `container::parse` vs 自研 `WebPDecoder` 视图在全部 fixture 上
+    //! 一致；畸形输入不 panic 不 OOM。放在 crate 内测试（container 为 pub(crate)）。
 
     use std::io::Cursor;
 
@@ -787,8 +709,8 @@ mod metadata_tests {
             .collect()
     }
 
-    /// image-webp 视图；解析失败返回 None（供 SKIP 分流）。
-    fn imagewebp_view(data: &[u8]) -> Option<(u32, u32, bool, bool, u32, bool, bool, bool)> {
+    /// kimg 解码器视图；解析失败返回 None（供 SKIP 分流）。
+    fn decoder_view(data: &[u8]) -> Option<(u32, u32, bool, bool, u32, bool, bool, bool)> {
         let mut dec = crate::codecs::webp::WebPDecoder::new(Cursor::new(data)).ok()?;
         let (w, h) = dec.dimensions();
         let alpha = dec.color_type() == crate::ColorType::Rgba8;
@@ -824,29 +746,30 @@ mod metadata_tests {
                     continue;
                 }
             };
-            let Some((dw, dh, dalpha, danim, dloop, dexif, dicc, dxmp)) = imagewebp_view(&data)
+            let Some((dw, dh, dalpha, danim, dloop, dexif, dicc, dxmp)) =
+                decoder_view(&data)
             else {
-                eprintln!("SKIP {name} image-webp 解析失败");
+                eprintln!("SKIP {name} kimg 解码失败");
                 skipped += 1;
                 continue;
             };
             if (c.width, c.height) != (dw, dh) {
                 mismatches.push(format!(
-                    "{name}: dims 容器 {}x{} vs image-webp {}x{}",
+                    "{name}: dims 容器 {}x{} vs kimg {}x{}",
                     c.width, c.height, dw, dh
                 ));
             }
             if (c.family == container::Family::Animated) != danim {
                 mismatches.push(format!(
-                    "{name}: animated 容器 {} vs image-webp {danim}",
+                    "{name}: animated 容器 {} vs kimg {danim}",
                     c.family == container::Family::Animated
                 ));
             }
             // 动画 has_alpha 是启发式且引擎各异（SimdCodecs 按首帧覆盖/不透明/背景置位推导，
-            // image-webp 按自身帧序）→ 动画仅比对静态元数据；静态严格比对。
+            // 自研解码器按自身帧序）→ 动画仅比对静态元数据；静态严格比对。
             if !danim && c.has_alpha != dalpha {
                 mismatches.push(format!(
-                    "{name}: has_alpha 容器 {} vs image-webp {}",
+                    "{name}: has_alpha 容器 {} vs kimg {}",
                     c.has_alpha, dalpha
                 ));
             }
@@ -854,22 +777,22 @@ mod metadata_tests {
                 let clo = if c.loop_count == 0 { 0 } else { c.loop_count };
                 if clo != dloop {
                     mismatches.push(format!(
-                        "{name}: loop_count 容器 {clo} vs image-webp {dloop}"
+                        "{name}: loop_count 容器 {clo} vs kimg {dloop}"
                     ));
                 }
             }
             let e1 = c.exif.is_some();
             if e1 != dexif {
-                mismatches.push(format!("{name}: exif 存在性 容器 {e1} vs image-webp {dexif}"));
+                mismatches.push(format!("{name}: exif 存在性 容器 {e1} vs kimg {dexif}"));
             }
             if c.icc_profile.is_some() != dicc {
                 mismatches.push(format!(
-                    "{name}: icc 存在性 容器 {} vs image-webp {dicc}",
+                    "{name}: icc 存在性 容器 {} vs kimg {dicc}",
                     c.icc_profile.is_some()
                 ));
             }
             if c.xmp.is_some() != dxmp {
-                mismatches.push(format!("{name}: xmp 存在性 容器 {} vs image-webp {dxmp}", c.xmp.is_some()));
+                mismatches.push(format!("{name}: xmp 存在性 容器 {} vs kimg {dxmp}", c.xmp.is_some()));
             }
             checked += 1;
         }
@@ -878,7 +801,7 @@ mod metadata_tests {
         }
         assert!(
             mismatches.is_empty(),
-            "{} 处容器元数据与 image-webp 不一致（见上）",
+            "{} 处容器元数据与 kimg 解码器不一致（见上）",
             mismatches.len()
         );
         eprintln!("WEBP_CONTAINER_CHECKED\t{checked}, skipped={skipped}");
@@ -896,7 +819,7 @@ mod metadata_tests {
             &[0x52, 0x49, 0x46, 0x46, 0x04, 0x00, 0x00, 0x00, b'W', b'E', b'B', b'P', 0xff, 0xff, 0xff, 0xff][..],
         ] {
             let _ = container::parse(c); // 不 panic 即通过
-            let _ = crate::codecs::webp::WebPDecoder::new(Cursor::new(c)); // 兜底路径不 panic
+            let _ = crate::codecs::webp::WebPDecoder::new(Cursor::new(c)); // 坏输入显式 Err 不 panic
         }
     }
 
@@ -930,15 +853,15 @@ mod metadata_tests {
 
 /// ALPH 滤波 1/2/3 parity（V6 收口补盲）：corpus 的 7 个有损-alpha fixture 全部 filter=0
 /// （含 comp=0/1），滤波 1（水平）/2（垂直）/3（梯度）路径从未被覆盖——此测试以合成
-/// VP8X+ALPH+VP8 容器（compression=0）+ 编码侧滤波字节，对 OURS/IMAGEWEBP 双后端解码
-/// 逐字节对拍 + alpha 通道与真实 alpha 平面回比（K27：证明性实验落仓可复跑）。
+/// VP8X+ALPH+VP8 容器（compression=0）+ 编码侧滤波字节，对自研 / image-webp（dev oracle）
+/// 双通道解码逐字节对拍 + alpha 通道与真实 alpha 平面回比（K27：证明性实验落仓可复跑）。
 #[cfg(test)]
 mod alpha_filter_tests {
     use std::io::Cursor;
 
     use super::{
         container, decode_and_unfilter_alpha, set_webp_backend, WebPDecoder, BACKEND_AUTO,
-        BACKEND_IMAGEWEBP, BACKEND_OURS,
+        BACKEND_OURS,
     };
     use super::webp_fixtures_support;
     use crate::{ColorType, ImageDecoder};
@@ -1024,13 +947,25 @@ mod alpha_filter_tests {
         out
     }
 
+    /// 解码为 RGBA：ours=true 走自研 `WebPDecoder`；false 直连 `image_webp::WebPDecoder`
+    /// （dev oracle；自研已自包含，运行时零依赖）。
     fn decode_rgba(data: &[u8], ours: bool) -> (Vec<u8>, bool) {
-        set_webp_backend(if ours { BACKEND_OURS } else { BACKEND_IMAGEWEBP });
-        let dec = WebPDecoder::new(Cursor::new(data)).expect("WebPDecoder::new 应成功");
-        let has_a = dec.color_type() == ColorType::Rgba8;
-        let mut buf = vec![0u8; dec.total_bytes() as usize];
-        dec.read_image(&mut buf).expect("read_image 应成功");
-        (buf, has_a)
+        if ours {
+            set_webp_backend(BACKEND_OURS);
+            let dec = WebPDecoder::new(Cursor::new(data)).expect("WebPDecoder::new 应成功");
+            let has_a = dec.color_type() == ColorType::Rgba8;
+            let mut buf = vec![0u8; dec.total_bytes() as usize];
+            dec.read_image(&mut buf).expect("read_image 应成功");
+            (buf, has_a)
+        } else {
+            let mut dec = image_webp::WebPDecoder::new(Cursor::new(data))
+                .expect("image_webp::new 应成功");
+            let has_a = dec.has_alpha();
+            let n = dec.output_buffer_size().expect("image_webp 缓冲大小");
+            let mut buf = vec![0u8; n];
+            dec.read_image(&mut buf).expect("image_webp read_image 应成功");
+            (buf, has_a)
+        }
     }
 
     #[test]

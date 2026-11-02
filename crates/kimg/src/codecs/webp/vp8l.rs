@@ -1959,27 +1959,26 @@ mod parity_tests {
     use super::decode_into_rgba8;
     use super::webp_fixtures_support;
     use crate::codecs::webp::container;
-    use crate::codecs::webp::{set_webp_backend, WebPDecoder, BACKEND_AUTO, BACKEND_IMAGEWEBP};
+    use crate::codecs::webp::WebPDecoder;
     use crate::ImageDecoder as _;
 
     /// golden TSV 保留在仓内；图片取外部语料。
     const GOLDEN_TSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/webp/webp-oracle-golden.tsv");
 
-    /// 经 kimg WebPDecoder（**强制 image-webp 现路径**）解为 RGBA8 字节。
+    /// 直连 image_webp（dev oracle）解为 RGBA8 字节。
     fn reference_rgba(data: &[u8]) -> (u32, u32, Vec<u8>) {
-        set_webp_backend(BACKEND_IMAGEWEBP);
-        let r = reference_rgba_impl(data);
-        set_webp_backend(BACKEND_AUTO);
-        r
+        reference_rgba_impl(data)
     }
 
-    /// 经 WebPDecoder 现路径解为 RGBA8（后端由当前静态开关决定）。
+    /// 直连 image_webp（dev oracle）解为 RGBA8 字节。
     fn reference_rgba_impl(data: &[u8]) -> (u32, u32, Vec<u8>) {
-        let dec = WebPDecoder::new(Cursor::new(data)).expect("image-webp 解码失败");
+        let mut dec =
+            image_webp::WebPDecoder::new(Cursor::new(data)).expect("image_webp 解码失败");
         let (w, h) = dec.dimensions();
-        let has_alpha = dec.color_type() == crate::ColorType::Rgba8;
-        let mut buf = vec![0u8; dec.total_bytes() as usize];
-        dec.read_image(&mut buf).expect("image-webp read 失败");
+        let has_alpha = dec.has_alpha();
+        let n = dec.output_buffer_size().expect("image_webp 缓冲大小");
+        let mut buf = vec![0u8; n];
+        dec.read_image(&mut buf).expect("image_webp read 失败");
         if has_alpha {
             (w, h, buf)
         } else {
@@ -2135,27 +2134,23 @@ mod parity_tests {
         assert!(checked >= 1, "应至少对拍 1 个 VP8L 静态 fixture（当前 {checked}）");
     }
 
-    /// 经 WebPDecoder 现路径解为 RGBA8；解码失败返回 None（供 SKIP 分流）。
+    /// 直连 image_webp（dev oracle）解为 RGBA8；解码失败返回 None（供 SKIP 分流）。
     fn reference_rgba_opt(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-        set_webp_backend(BACKEND_IMAGEWEBP);
-        let r = (|| {
-            let dec = WebPDecoder::new(Cursor::new(data)).ok()?;
-            let (w, h) = dec.dimensions();
-            let has_alpha = dec.color_type() == crate::ColorType::Rgba8;
-            let mut buf = vec![0u8; dec.total_bytes() as usize];
-            dec.read_image(&mut buf).ok()?;
-            if has_alpha {
-                Some((w, h, buf))
-            } else {
-                let mut rgba = Vec::with_capacity(buf.len() / 3 * 4);
-                for px in buf.chunks_exact(3) {
-                    rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-                }
-                Some((w, h, rgba))
+        let mut dec = image_webp::WebPDecoder::new(Cursor::new(data)).ok()?;
+        let (w, h) = dec.dimensions();
+        let has_alpha = dec.has_alpha();
+        let n = dec.output_buffer_size()?;
+        let mut buf = vec![0u8; n];
+        dec.read_image(&mut buf).ok()?;
+        if has_alpha {
+            Some((w, h, buf))
+        } else {
+            let mut rgba = Vec::with_capacity(buf.len() / 3 * 4);
+            for px in buf.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
-        })();
-        set_webp_backend(BACKEND_AUTO);
-        r
+            Some((w, h, rgba))
+        }
     }
 
     #[test]
@@ -2204,7 +2199,7 @@ mod parity_tests {
 
     #[test]
     fn ours_backend_routes_static_lossless_through_vp8l() {
-        // 显式 OURS：静态无损必须走自研路径（与 image-webp 逐字节同）；IMAGEWEBP 强制不接管。
+        // 显式 OURS：静态无损必须走自研路径（与 image_webp oracle 逐字节同）。
         let name = "lossless-near60.webp";
         let Some(path) = webp_fixtures_support::webp_fixture_path(name) else {
             eprintln!("SKIP {name} 外部语料缺失");
@@ -2214,16 +2209,27 @@ mod parity_tests {
 
         crate::codecs::webp::set_webp_backend(crate::codecs::webp::BACKEND_OURS);
         let ours = reference_rgba_via_decoder(&data);
-        crate::codecs::webp::set_webp_backend(crate::codecs::webp::BACKEND_IMAGEWEBP);
-        let forced = reference_rgba_impl(&data).2;
         crate::codecs::webp::set_webp_backend(crate::codecs::webp::BACKEND_AUTO);
+        let forced = reference_rgba_impl(&data).2;
 
-        assert_eq!(ours, forced, "OURS 路由（VP8L 静态）应与 image-webp 兜底逐字节一致");
+        assert_eq!(ours, forced, "OURS 路由（VP8L 静态）应与 image_webp oracle 逐字节一致");
     }
 
-    /// 经 WebPDecoder 现路径解为 RGBA8（后端由当前静态开关决定）。
+    /// 经 kimg WebPDecoder（后端由当前静态开关决定）解为 RGBA8。
     fn reference_rgba_via_decoder(data: &[u8]) -> Vec<u8> {
-        reference_rgba_impl(data).2
+        let dec = WebPDecoder::new(Cursor::new(data)).expect("kimg WebPDecoder 解码失败");
+        let has_alpha = dec.color_type() == crate::ColorType::Rgba8;
+        let mut buf = vec![0u8; dec.total_bytes() as usize];
+        dec.read_image(&mut buf).expect("kimg read_image 失败");
+        if has_alpha {
+            buf
+        } else {
+            let mut rgba = Vec::with_capacity(buf.len() / 3 * 4);
+            for px in buf.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            rgba
+        }
     }
 
     /// P2 性能初步（可后置基线）：ours(VP8L 标量) vs image-webp（kimg 现路径）lossless 场景

@@ -2,13 +2,14 @@
 //!
 //! 口径：全部静态有损（无 ALPH）fixture，RGBA8 逐字节一致（主判）；另抽样 fixture 与
 //! `webp-oracle-golden.tsv` 的 fancy 列 sha256 对照（dwebp 1.6.0 fancy golden 双 oracle 等价）。
-//! 后端切换经 `kimg::codecs::webp::set_webp_backend`（pub 测试口），逐 fixture 切 OURS/IMAGEWEBP。
+//! 自研侧经 `kimg::codecs::webp::WebPDecoder`（自研内核），参照侧直连 `image_webp::WebPDecoder`
+//! （dev oracle；kimg 已自包含，运行时零 image-webp 依赖）。
 
 use std::io::Cursor;
 
 use sha2::{Digest, Sha256};
 
-use kimg::codecs::webp::{BACKEND_IMAGEWEBP, BACKEND_OURS, WebPDecoder, set_webp_backend};
+use kimg::codecs::webp::{BACKEND_OURS, WebPDecoder, set_webp_backend};
 use kimg::ImageDecoder;
 
 mod fixtures;
@@ -28,20 +29,39 @@ fn fixture_bytes(name: &str) -> Option<Vec<u8>> {
 
 /// 按当前后端解码静态 fixture 为 RGBA8（无 alpha → 补 255）。
 fn decode_rgba_byte_exact(data: &[u8], ours: bool) -> (u32, u32, Vec<u8>) {
-    set_webp_backend(if ours { BACKEND_OURS } else { BACKEND_IMAGEWEBP });
-    let dec = WebPDecoder::new(Cursor::new(data)).expect("WebPDecoder::new 应成功");
-    let (w, h) = dec.dimensions();
-    let has_alpha = dec.color_type() == kimg::ColorType::Rgba8;
-    let mut buf = vec![0u8; dec.total_bytes() as usize];
-    dec.read_image(&mut buf).expect("read_image 应成功");
-    if has_alpha {
-        (w, h, buf)
-    } else {
-        let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
-        for px in buf.chunks_exact(3) {
-            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+    if ours {
+        set_webp_backend(BACKEND_OURS);
+        let dec = WebPDecoder::new(Cursor::new(data)).expect("WebPDecoder::new 应成功");
+        let (w, h) = dec.dimensions();
+        let has_alpha = dec.color_type() == kimg::ColorType::Rgba8;
+        let mut buf = vec![0u8; dec.total_bytes() as usize];
+        dec.read_image(&mut buf).expect("read_image 应成功");
+        if has_alpha {
+            (w, h, buf)
+        } else {
+            let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+            for px in buf.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            (w, h, rgba)
         }
-        (w, h, rgba)
+    } else {
+        // dev oracle：直连 image_webp::WebPDecoder（自研已自包含，运行时零依赖）。
+        let mut dec = image_webp::WebPDecoder::new(Cursor::new(data)).expect("image_webp::new 应成功");
+        let (w, h) = dec.dimensions();
+        let has_alpha = dec.has_alpha();
+        let n = dec.output_buffer_size().expect("image_webp 缓冲大小");
+        let mut buf = vec![0u8; n];
+        dec.read_image(&mut buf).expect("image_webp read_image 应成功");
+        if has_alpha {
+            (w, h, buf)
+        } else {
+            let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+            for px in buf.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            (w, h, rgba)
+        }
     }
 }
 
@@ -69,7 +89,6 @@ fn static_ours_matches_imagewebp_byte_exact() {
         };
         let data = std::fs::read(&path).expect("read fixture");
         let (w1, h1, ours) = decode_rgba_byte_exact(&data, true);
-        set_webp_backend(BACKEND_IMAGEWEBP);
         let (w2, h2, img) = decode_rgba_byte_exact(&data, false);
         assert_eq!((w1, h1), (w2, h2), "{name} 尺寸 OURS vs image-webp");
         assert_eq!(ours.len(), img.len(), "{name} 缓冲长");

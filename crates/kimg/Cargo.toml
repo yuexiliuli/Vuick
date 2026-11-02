@@ -7,14 +7,15 @@ license = "Apache-2.0"
 description = "纯 Rust 图像解码/编码兼容层（镜像 image 0.25 的仓库实际使用子集）。第 3 阶段替换 image 的核心 crate。"
 
 [dependencies]
-# 图像后端（全部纯 Rust）。版本对齐 Cargo.lock 既有锁定（gif/image-webp/tiff）。
+# 图像后端（全部纯 Rust）。版本对齐 Cargo.lock 既有锁定（gif/tiff）。
 # PNG 已自研解/编（pngsimd + png_encoder，见 codecs/png_encoder.rs），运行时不再依赖 png crate
 # （png 0.17.16 移入 dev-dependencies 仅作测试/基准对照，见下方说明）。
 # JPEG 用 zune-jpeg（== image 0.25.10 自身所用后端，保证字节级一致）——任务原始方案中的
 # jpeg-decoder 0.3 与 image 的参考输出存在 IDCT ±1 差异，无法达成 parity=0，故按实测替换。
 # GIF 已自研解/编（codecs/gif/，移植 SimdCodecs：容器+LZW+画布+编码器），运行时不再依赖 gif crate
 # （gif 0.14.2 移入 dev-dependencies 仅作测试/oracle 对照，见下方说明）。
-image-webp = "0.2.4"
+# WebP 已自研解/编（codecs/webp/：容器+VP8L+VP8+ALPH+动画），运行时不再依赖 image-webp crate
+# （image-webp 0.2.4 移入 dev-dependencies 仅作测试/oracle 对照，见下方说明）。
 tiff = "0.11.3"
 zune-jpeg = "0.5.15"
 zune-core = "0.5.3"
@@ -45,6 +46,10 @@ gif = "0.14.2"
 # png 0.17.16 仅测试/基准用——解码读回逐字节对照（tests/encode_self.rs 的 cross oracle）、
 # png_port_parity / png_port_bench / idat_backend_bench 的参照端。imgbench 属基准对照 crate，保留 png。
 png = "0.17.16"
+# WebP oracle 对照（tests/webp_*.rs + src 内 parity / alpha_filter）：kimg WebP 已自研
+# （codecs/webp/，运行时零 image-webp 依赖），image-webp 0.2.4 仅测试/基准 oracle——dev oracle
+# 直连 image_webp::WebPDecoder 与自研逐字节对拍（同 gif/png 的 dev-dep 先例）。
+image-webp = "0.2.4"
 # WebP oracle harness（tests/webp_oracle.rs）：对 fixture 算 dwebp golden 同款 sha256(RGBA)
 # 逐 fixture 对比；与 SimdCodecs WebpOracleTests.cs 的哈希口径一致。
 sha2 = "0.10"

@@ -127,8 +127,8 @@ fn parallel_enabled(frames: &[container::WebpContainerFrame]) -> bool {
     total_px >= (1 << 18)
 }
 
-/// 全部帧独立解码（先解码并行 → 后合成串行管道）。任一帧失败返回 None（调用方降级
-/// image-webp，守住「正确性优先」）。
+/// 全部帧独立解码（先解码并行 → 后合成串行管道）。任一帧失败返回 None（调用方转显式错误，
+/// 自包含后无 image-webp 兜底）。
 fn decode_frames_parallel(
     data: &[u8],
     frames: &[container::WebpContainerFrame],
@@ -179,8 +179,9 @@ fn decode_frames_parallel(
 /// #2 内存护栏：自研动画构建期全量解码全部帧（`OursAnimated.frames` 各持一帧 RGBA，
 /// n×画布峰值，K76），对真尺寸大动画该峰值可能与画布×帧数同量级。按保守上界
 /// `帧数×画布宽×高×4 + 画布宽×高×4`（每帧最多全画布）估算；超 `KIMG_WEBP_ANIM_CAP_MB`
-/// （默认 256MB）→ `decode_animation` 返回 None，`WebPDecoder::new` 自动落到 image-webp
-/// 后端的流式动画解码（无 n×画布峰值）。小 fixture 远低于阈值，行为不变仍自研接管。
+/// （默认 256MB）→ `decode_animation` 返回 None，`WebPDecoder::new` 转为**显式错误**
+/// （自包含后无 image-webp 流式兜底；需求方可调大该 env 换取完整自研解码）。小 fixture
+/// 远低于阈值，行为不变仍自研接管。
 fn anim_mem_estimate_exceeds_cap(c: &super::container::WebpContainer) -> bool {
     let canvas_bytes = u64::from(c.width) * u64::from(c.height) * 4;
     let estimate = canvas_bytes.saturating_mul(c.frames.len() as u64 + 1);
@@ -191,8 +192,9 @@ fn anim_mem_estimate_exceeds_cap(c: &super::container::WebpContainer) -> bool {
     estimate > cap_mb.saturating_mul(1024 * 1024)
 }
 
-/// 自研动画解码入口：后端允许 + 家族=Animated 时由 `WebPDecoder::new` 调用。
-/// 返回 `Some(ours)` 表示接管成功；`None` 表示不可接管（回 image-webp 兜底）。
+/// 自研动画解码入口：家族=Animated 时由 `WebPDecoder::new` 调用。
+/// 返回 `Some(ours)` 表示接管成功；`None` 表示不可接管（超内存护栏 / 解码失败；调用方转为
+/// 显式错误，自包含后无 image-webp 兜底）。
 /// 入口先走 #2 内存护栏：预估内存超阈值 → 直接 `Ok(None)` 放弃自研接管（不付解码成本）。
 pub(crate) fn decode_animation(data: &[u8]) -> ImageResult<Option<OursAnimated>> {
     let c = match container::parse(data) {
@@ -202,7 +204,7 @@ pub(crate) fn decode_animation(data: &[u8]) -> ImageResult<Option<OursAnimated>>
     if c.family != container::Family::Animated {
         return Ok(None);
     }
-    // #2 内存护栏：预估超阈值 → 回 image-webp 后端动画解码（持续流式合成，无 n×画布峰值）。
+    // #2 内存护栏：预估超阈值 → `Ok(None)`，`WebPDecoder::new` 转为显式错误（带 env 提示）。
     if anim_mem_estimate_exceeds_cap(&c) {
         return Ok(None);
     }
@@ -551,7 +553,7 @@ mod tests {
     use super::super::webp_fixtures_support;
     use std::io::Cursor;
     use crate::codecs::webp::set_webp_backend;
-    use crate::codecs::webp::{BACKEND_AUTO, BACKEND_IMAGEWEBP, BACKEND_OURS};
+    use crate::codecs::webp::{BACKEND_AUTO, BACKEND_OURS};
     use crate::{AnimationDecoder, ImageDecoder};
 
     fn loop_label(l: crate::LoopCount) -> &'static str {
@@ -561,8 +563,46 @@ mod tests {
         }
     }
 
+    /// image-webp dev oracle：直连 `image_webp::WebPDecoder` 逐帧解码动画为
+    /// `((w,h), loop, [(RGBA, delay_ms)…])`（RGB 帧补 alpha=255，与 kimg `into_frames` RGBA 同口径）。
+    fn imagewebp_anim_reference(
+        data: &[u8],
+    ) -> ((u32, u32), crate::LoopCount, Vec<(Vec<u8>, u32)>) {
+        let mut dec =
+            image_webp::WebPDecoder::new(Cursor::new(data)).expect("image_webp::new 应成功");
+        let dims = dec.dimensions();
+        let loop_count = match dec.loop_count() {
+            image_webp::LoopCount::Forever => crate::LoopCount::Infinite,
+            image_webp::LoopCount::Times(n) => crate::LoopCount::Finite(n.into()),
+        };
+        let has_a = dec.has_alpha();
+        let n = dec.output_buffer_size().expect("image_webp 缓冲大小");
+        let mut buf = vec![0u8; n];
+        let mut out = Vec::new();
+        loop {
+            match dec.read_frame(&mut buf) {
+                Ok(delay_ms) => {
+                    let rgba = if has_a {
+                        buf.clone()
+                    } else {
+                        let mut rgba = Vec::with_capacity(n / 3 * 4);
+                        for px in buf.chunks_exact(3) {
+                            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                        }
+                        rgba
+                    };
+                    out.push((rgba, delay_ms));
+                }
+                Err(image_webp::DecodingError::NoMoreFrames) => break,
+                Err(e) => panic!("image_webp read_frame 失败: {e}"),
+            }
+        }
+        (dims, loop_count, out)
+    }
+
     /// 全部动画 fixture（SimdCodecs 8 个 anim-* + 用户语料）必须被自研动画解码接管
-    /// （Some），且与 image-webp 逐帧 RGBA/delay 全等（两后端都经 kimg `into_frames`）。
+    /// （Some），且与 image-webp 逐帧 RGBA/delay 全等（自研经 kimg `into_frames`，
+    /// 参照经直连 `image_webp::WebPDecoder`）。
     /// 帧数 < image-webp 或多帧不符 → 失败；缺外部语料 SKIP。
     #[test]
     fn animated_fixtures_ours_matches_imagewebp() {
@@ -589,13 +629,12 @@ mod tests {
             if !ours_dec.has_animation() {
                 continue; // 静态图，非本测试对象
             }
-            // 自研接管硬证：直接调 `decode_animation` 必须产出 Some，否则本测试只是
-            // image-webp 对 image-webp 的空转对拍。
+            // 自研接管硬证：直接调 `decode_animation` 必须产出 Some，否则本测试只是空转。
             let direct = crate::codecs::webp::animation::decode_animation(&data)
                 .expect("decode_animation 不应 Err");
             assert!(
                 direct.is_some(),
-                "{name}: OURS 动画解码应接管而非降级 image-webp"
+                "{name}: OURS 动画解码应接管而非显式报错"
             );
             let ours_loop = ours_dec.loop_count();
             let mk = |d: crate::codecs::webp::WebPDecoder<Cursor<Vec<u8>>>| {
@@ -613,13 +652,8 @@ mod tests {
                     .collect();
                 (n, out)
             };
-            let ours = mk(ours_dec);
-
-            set_webp_backend(crate::codecs::webp::BACKEND_IMAGEWEBP);
-            let img_dec = crate::codecs::webp::WebPDecoder::new(Cursor::new(data.clone()))
-                .expect("image-webp 应能解码动画");
-            let img_loop = img_dec.loop_count();
-            let img = mk(img_dec);
+            let (ours_dims, ours_frames) = mk(ours_dec);
+            let (img_dims, img_loop, img_frames) = imagewebp_anim_reference(&data);
 
             let loop_same = match (ours_loop, img_loop) {
                 (crate::LoopCount::Infinite, crate::LoopCount::Infinite) => true,
@@ -633,17 +667,20 @@ mod tests {
                     loop_label(img_loop)
                 ));
             }
-            if ours.0 != img.0 {
-                errors.push(format!("{name}: 尺寸不一致 {:?} vs {:?}", ours.0, img.0));
+            if ours_dims != img_dims {
+                errors.push(format!(
+                    "{name}: 尺寸不一致 {:?} vs {:?}",
+                    ours_dims, img_dims
+                ));
             }
-            if ours.1.len() != img.1.len() {
+            if ours_frames.len() != img_frames.len() {
                 errors.push(format!(
                     "{name}: 帧数不一致 {} vs {}",
-                    ours.1.len(),
-                    img.1.len()
+                    ours_frames.len(),
+                    img_frames.len()
                 ));
             } else {
-                for (i, (ours_f, img_f)) in ours.1.iter().zip(&img.1).enumerate() {
+                for (i, (ours_f, img_f)) in ours_frames.iter().zip(&img_frames).enumerate() {
                     if ours_f.0 != img_f.0 {
                         let d = ours_f
                             .0
@@ -680,11 +717,12 @@ mod tests {
         assert!(checked >= 8, "至少 8 个动画 fixture 应对拍，实际 {checked}");
     }
 
-    /// #2 内存护栏：预估内存超 `KIMG_WEBP_ANIM_CAP_MB` → 自研动画接管让位 image-webp
-    /// 兜底（`decode_animation` 返回 None）；复位 cap 后小 fixture 仍自研接管。
+    /// #2 内存护栏（自包含语义）：预估内存超 `KIMG_WEBP_ANIM_CAP_MB` → `decode_animation`
+    /// 返回 None，`WebPDecoder::new` 将其转为**显式错误**（自研已自包含，无 image-webp 兜底）；
+    /// 复位 cap 后小 fixture 仍自研接管。
     /// （env 读写沿用既有 `KIMG_WEBP_THREADS` 测试姿势：本模块按 `--test-threads=1` 串行跑。）
     #[test]
-    fn anim_cap_fallback_to_imagewebp() {
+    fn anim_cap_is_explicit_error_no_fallback() {
         set_webp_backend(BACKEND_AUTO);
         let Some(data) = webp_fixtures_support::webp_fixture_path("anim-webpmux-combinations.webp")
             .map(|p| std::fs::read(p).unwrap())
@@ -699,14 +737,13 @@ mod tests {
                 .is_some(),
             "默认 cap 下小动画 fixture 应被自研接管"
         );
-        // cap=0：预估必超阈值 → 触发回退（`WebPDecoder::new` 会落 image-webp 动画）。
+        // cap=0：预估必超阈值 → decode_animation 放弃（None）+ WebPDecoder::new 显式 Err。
         unsafe { std::env::set_var("KIMG_WEBP_ANIM_CAP_MB", "0") };
         let guarded = decode_animation(&data).expect("decode_animation 不应 Err");
+        let new_err = crate::codecs::webp::WebPDecoder::new(Cursor::new(data.clone())).is_err();
         unsafe { std::env::remove_var("KIMG_WEBP_ANIM_CAP_MB") };
-        assert!(
-            guarded.is_none(),
-            "cap=0 时应放弃自研动画解码（回 image-webp 兜底）"
-        );
+        assert!(guarded.is_none(), "cap=0 时应放弃自研动画解码");
+        assert!(new_err, "cap=0 时 WebPDecoder::new 应显式报错（无 image-webp 兜底）");
     }
 
     /// 帧级并行解码与串行逐字节一致（先解码并行、后合成串行管道的硬闸）。
@@ -750,21 +787,19 @@ mod tests {
         let dec = crate::codecs::webp::WebPDecoder::new(Cursor::new(data.clone()))
             .expect("自研动画接管");
         assert!(dec.has_animation(), "alpha-hint 动画应走 OURS");
-        set_webp_backend(crate::codecs::webp::BACKEND_IMAGEWEBP);
-        let img = crate::codecs::webp::WebPDecoder::new(Cursor::new(data)).expect("image-webp");
         let ours_frames = dec.into_frames().collect_frames().unwrap();
-        let img_frames = img.into_frames().collect_frames().unwrap();
         set_webp_backend(BACKEND_AUTO);
+        let (_, _, img_frames) = imagewebp_anim_reference(&data);
         // 帧数一致 + 尺寸一致（逐字节在 animated_fixtures_ours_matches_imagewebp 已覆盖）。
         assert_eq!(
             ours_frames.len(),
             img_frames.len(),
             "alpha-hint 帧数应与 image-webp 一致"
         );
-        for (o, i) in ours_frames.iter().zip(&img_frames) {
+        for (o, (i, _)) in ours_frames.iter().zip(&img_frames) {
             assert_eq!(
                 o.buffer().as_raw(),
-                i.buffer().as_raw(),
+                i,
                 "alpha-hint 逐帧 RGBA 应与 image-webp 一致"
             );
         }

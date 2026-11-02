@@ -4149,15 +4149,16 @@ mod v4_rgba_parity_tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::codecs::webp::{BACKEND_AUTO, BACKEND_IMAGEWEBP, BACKEND_OURS, WebPDecoder, set_webp_backend};
+    use crate::codecs::webp::{BACKEND_AUTO, BACKEND_OURS, WebPDecoder, set_webp_backend};
     use crate::ImageDecoder;
 
+    /// image-webp dev oracle：直连 `image_webp::WebPDecoder` 解静态图为 RGBA8。
     fn imagewebp_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-        set_webp_backend(BACKEND_IMAGEWEBP);
-        let dec = WebPDecoder::new(Cursor::new(data)).ok()?;
+        let mut dec = image_webp::WebPDecoder::new(Cursor::new(data)).ok()?;
         let (w, h) = dec.dimensions();
-        let has_alpha = dec.color_type() == crate::ColorType::Rgba8;
-        let mut buf = vec![0u8; dec.total_bytes() as usize];
+        let has_alpha = dec.has_alpha();
+        let n = dec.output_buffer_size()?;
+        let mut buf = vec![0u8; n];
         dec.read_image(&mut buf).ok()?;
         if has_alpha {
             Some((w, h, buf))
@@ -4286,7 +4287,7 @@ mod v4_rgba_parity_tests {
         let mut buf = vec![0u8; dec.total_bytes() as usize];
         dec.read_image(&mut buf).unwrap();
         assert_eq!(buf.len(), (w * h * 3) as usize);
-        set_webp_backend(BACKEND_IMAGEWEBP);
+        set_webp_backend(BACKEND_AUTO);
     }
 }
 
