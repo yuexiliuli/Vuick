@@ -2199,7 +2199,28 @@ pub(crate) fn decode_vp8(frame: &[u8], width: u32, height: u32) -> Result<Vp8Yuv
     if fh.width != width || fh.height != height {
         return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
     }
-    decode_from_header(fh, false, 4)
+    decode_from_header(fh, false, 4, None)
+}
+
+/// lossy-alpha 专用：同 [`decode_vp8`]（`need_tight=false`），但行定稿直出时把 `alpha` 平面
+/// （w*h 字节，`decode_and_unfilter_alpha` 的整帧结果）逐行并入 RGBA 发射内层——每像素 4 字节
+/// 一次写好（YUV→RGB 结果 R/G/B 与 alpha 同拍），消灭「RGBA4 全帧发射 + 事后独立标量逐像素
+/// 写 alpha」两遍合成。`alpha=None`（无 ALPH chunk 的 malformed 输入）时 α 恒 255，与
+/// `decode_vp8` 逐字节一致。产物落 `Vp8Yuv.rgba`。
+pub(crate) fn decode_vp8_with_alpha(
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    alpha: Option<&[u8]>,
+) -> Result<Vp8Yuv> {
+    let fh = stage_clock::header(|| parse_frame_header(frame))?;
+    if fh.width != width || fh.height != height {
+        return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
+    }
+    if let Some(a) = alpha {
+        debug_assert_eq!(a.len(), (width as usize) * (height as usize));
+    }
+    decode_from_header(fh, false, 4, alpha)
 }
 
 /// opaque 静态有损专用：同 [`decode_vp8`]（`need_tight=false`）且行定稿直出 **RGB3**（w*h*3，
@@ -2210,7 +2231,7 @@ pub(crate) fn decode_vp8_rgb3(frame: &[u8], width: u32, height: u32) -> Result<V
     if fh.width != width || fh.height != height {
         return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
     }
-    decode_from_header(fh, false, 3)
+    decode_from_header(fh, false, 3, None)
 }
 
 /// 测试/兼容路径：同 [`decode_vp8`] 且一并抽紧密 y/u/v 平面（V2/V3 YUV golden 对拍用）。
@@ -2220,7 +2241,7 @@ pub(crate) fn decode_vp8_tight(frame: &[u8], width: u32, height: u32) -> Result<
     if fh.width != width || fh.height != height {
         return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
     }
-    decode_from_header(fh, true, 4)
+    decode_from_header(fh, true, 4, None)
 }
 
 /// 阶段分账解码（`stage_profile` feature 门控；供 imgbench `vp8_stage_probe`，K59 统一基座）。
@@ -2555,7 +2576,7 @@ fn reconstruct_macroblock(
     });
 }
 
-fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize) -> Result<Vp8Yuv> {
+fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, alpha: Option<&[u8]>) -> Result<Vp8Yuv> {
     debug_assert!(channels == 3 || channels == 4);
     let width = fh.width as usize;
     let height = fh.height as usize;
@@ -2690,7 +2711,7 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize) ->
                 recon_loop(rx, tx2, yb, y_pitch, ub, vb, uv_pitch, mbw)
             });
             s.spawn(move || {
-                filter_t3_loop(rx2, y_pitch, uv_pitch, rb, oy, ou, ov, mbw, mbh, width, height, &fh.filter, need_tight, channels)
+                filter_t3_loop(rx2, y_pitch, uv_pitch, rb, oy, ou, ov, mbw, mbh, width, height, &fh.filter, need_tight, channels, alpha)
             });
             for mby in 0..mbh {
                 // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
@@ -2773,7 +2794,7 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize) ->
         let mut scratch = EmitScratch::new(width);
         filter_and_emit_serial(
             &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw, mbh, &fh.filter, &row_filters,
-            width, height, &mut rgba, &mut scratch, channels,
+            width, height, &mut rgba, &mut scratch, channels, alpha,
         );
 
         // 抽紧密平面（仅测试/兼容 API 路径 need_tight；生产 rgba 直出路径跳过 = 省整帧写）。
@@ -3231,6 +3252,7 @@ fn filter_t3_loop(
     filter: &FilterSettings,
     need_tight: bool,
     channels: usize,
+    alpha: Option<&[u8]>,
 ) {
     // t3 独占的全 padded 重建缓冲（planes_B）：与 planes_A 同布局（含左列；字节在写入前恒 0，
     // 滤波/直出只读已写入行段，未初始化亦安全——保持 memset 以结构性地杜绝任何读空风险）。
@@ -3261,7 +3283,7 @@ fn filter_t3_loop(
             if channels == 3 {
                 emit_rows_into_rgb3(yb, y_pitch, ub, vb, uv_pitch, width, cw, ch, emitted, end, rgba, &mut scratch);
             } else {
-                emit_rows_into_rgba(yb, y_pitch, ub, vb, uv_pitch, width, cw, ch, emitted, end, rgba, &mut scratch);
+                emit_rows_into_rgba(yb, y_pitch, ub, vb, uv_pitch, width, cw, ch, emitted, end, rgba, &mut scratch, alpha);
             }
             if need_tight {
                 stage_clock::copy(|| {
@@ -3364,6 +3386,7 @@ fn emit_rows_into_rgba(
     end: usize,
     rgba: &mut [u8],
     ws: &mut EmitScratch,
+    alpha: Option<&[u8]>,
 ) {
     stage_clock::yuv(|| {
     for row in first..end {
@@ -3387,7 +3410,12 @@ fn emit_rows_into_rgba(
             &v[u0..u0 + cw], &v[u1..u1 + cw],
             &mut ws.u_up, &mut ws.v_up, &mut ws.t_ws,
         );
-        super::simd::yuv_row_to_rgba(&y[yba..yba + width], &ws.u_up, &ws.v_up, &mut rgba[row * width * 4..(row + 1) * width * 4]);
+        // lossy-alpha：alpha 行随本行直出并入发射内层（单遍 RGBA；`None` 时 α 恒 255）。
+        super::simd::yuv_row_to_rgba_alpha(
+            &y[yba..yba + width], &ws.u_up, &ws.v_up,
+            alpha.map(|a| &a[row * width..(row + 1) * width]),
+            &mut rgba[row * width * 4..(row + 1) * width * 4],
+        );
     }
     });
 }
@@ -3457,6 +3485,7 @@ fn filter_and_emit_serial(
     rgba: &mut [u8],
     ws: &mut EmitScratch,
     channels: usize,
+    alpha: Option<&[u8]>,
 ) {
     let cw = (width + 1) >> 1;
     let ch = (height + 1) >> 1;
@@ -3468,16 +3497,17 @@ fn filter_and_emit_serial(
             if channels == 3 {
                 emit_rows_into_rgb3(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws);
             } else {
-                emit_rows_into_rgba(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws);
+                emit_rows_into_rgba(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws, alpha);
             }
             emitted = end;
         }
     }
 }
 
-/// YUV 4:2:0 → RGBA8（fancy 上采样默认，等价 image-webp Bilinear / dwebp fancy 列）。alpha 恒 255。
-/// `decode_vp8` 已把行定稿直出的 RGBA 缓存在 `yuv.rgba`，此处直接取走（`mem::take`，零重算、
-/// 零拷贝）；若为空（手工构造的 `Vp8Yuv`）回退旧整帧二趟路径，输出逐字节一致。
+/// YUV 4:2:0 → RGBA8（fancy 上采样默认，等价 image-webp Bilinear / dwebp fancy 列）。
+/// `decode_vp8(_with_alpha)` 已把行定稿直出的 RGBA（lossy-alpha 已含真实 A 通道）缓存在
+/// `yuv.rgba`，此处直接取走（`mem::take`，零重算、零拷贝）；若为空（手工构造的 `Vp8Yuv`）
+/// 回退旧整帧二趟路径，回退路径 alpha 恒 255，输出逐字节一致。
 pub(crate) fn yuv_to_rgba_fancy(yuv: &mut Vp8Yuv) -> Vec<u8> {
     if !yuv.rgba.is_empty() {
         return std::mem::take(&mut yuv.rgba);

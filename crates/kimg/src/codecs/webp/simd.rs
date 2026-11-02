@@ -1908,9 +1908,21 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
 /// `vp8::yuv_to_rgb`（各路径同一算术源，见内核注释）。
 /// 输入三平面各 `n` 字节，输出 `4*n` 字节。
 pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
+    yuv_row_to_rgba_alpha(y, u, v, None, out);
+}
+
+/// 一行 YUV→RGBA8，alpha 来自可选 alpha 行（`Some` 时每像素第 4 字节 = alpha[i]；
+/// `None` 时恒 255）。批量结构与 [`yuv_row_to_rgba`] 完全同源，仅 A 通道由常量 255 改为
+/// 逐组载入 alpha 行——`Some` 时逐字节恒等于「旧 `yuv_row_to_rgba` + 事后标量
+/// `rgba[i*4+3]=alpha[i]`」两遍合成（lossy-alpha 发射融合后单遍写出的字节契约）。
+/// 输入三平面加 alpha 行各 `n` 字节，输出 `4*n` 字节。
+pub(crate) fn yuv_row_to_rgba_alpha(y: &[u8], u: &[u8], v: &[u8], alpha: Option<&[u8]>, out: &mut [u8]) {
     debug_assert_eq!(y.len(), u.len());
     debug_assert_eq!(y.len(), v.len());
     debug_assert_eq!(out.len(), y.len() * 4);
+    if let Some(a) = alpha {
+        debug_assert_eq!(a.len(), y.len());
+    }
     let n = y.len();
     #[cfg(target_arch = "x86_64")]
     if simd_on("avx2") && n >= 16 {
@@ -1918,6 +1930,8 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
         let u16 = yuv_u16_enabled();
         let mut col = 0usize;
         unsafe {
+            // alpha 行按列偏移取指针（None=常量 255 填 A 通道，与旧 `yuv_row_to_rgba` 恒等）。
+            let aptr = |col: usize| alpha.map(|a| a.as_ptr().add(col));
             // 主批量：32 像素/步（YUV 加宽内核），余数 16px / 8px(SSE4.1) / 标量收尾。
             while col + 32 <= n {
                 if u16 {
@@ -1925,6 +1939,7 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
                         y.as_ptr().add(col),
                         u.as_ptr().add(col),
                         v.as_ptr().add(col),
+                        aptr(col),
                         out.as_mut_ptr().add(col * 4),
                     );
                 } else {
@@ -1932,6 +1947,7 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
                         y.as_ptr().add(col),
                         u.as_ptr().add(col),
                         v.as_ptr().add(col),
+                        aptr(col),
                         out.as_mut_ptr().add(col * 4),
                     );
                 }
@@ -1943,6 +1959,7 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
                         y.as_ptr().add(col),
                         u.as_ptr().add(col),
                         v.as_ptr().add(col),
+                        aptr(col),
                         out.as_mut_ptr().add(col * 4),
                     );
                 } else {
@@ -1950,6 +1967,7 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
                         y.as_ptr().add(col),
                         u.as_ptr().add(col),
                         v.as_ptr().add(col),
+                        aptr(col),
                         out.as_mut_ptr().add(col * 4),
                     );
                 }
@@ -1961,6 +1979,7 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
                     y.as_ptr().add(col),
                     u.as_ptr().add(col),
                     v.as_ptr().add(col),
+                    aptr(col),
                     out.as_mut_ptr().add(col * 4),
                 );
                 col += 8;
@@ -1968,11 +1987,12 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
             // 尾列（0..8 像素）逐像素标量。
             for i in col..n {
                 let (r, g, b) = yuv_to_rgb(y[i], u[i], v[i]);
+                let a = alpha.map_or(255, |a| a[i]);
                 let o = i * 4;
                 *out.get_unchecked_mut(o) = r;
                 *out.get_unchecked_mut(o + 1) = g;
                 *out.get_unchecked_mut(o + 2) = b;
-                *out.get_unchecked_mut(o + 3) = 255;
+                *out.get_unchecked_mut(o + 3) = a;
             }
         }
         return;
@@ -1981,11 +2001,13 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
     if simd_on("sse4.1") && n >= 8 {
         let mut col = 0usize;
         unsafe {
+            let aptr = |col: usize| alpha.map(|a| a.as_ptr().add(col));
             while col + 8 <= n {
                 yuv8_to_rgba_sse41(
                     y.as_ptr().add(col),
                     u.as_ptr().add(col),
                     v.as_ptr().add(col),
+                    aptr(col),
                     out.as_mut_ptr().add(col * 4),
                 );
                 col += 8;
@@ -1993,21 +2015,23 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
             // 尾列（0..8 像素）逐像素标量。
             for i in col..n {
                 let (r, g, b) = yuv_to_rgb(y[i], u[i], v[i]);
+                let a = alpha.map_or(255, |a| a[i]);
                 let o = i * 4;
                 *out.get_unchecked_mut(o) = r;
                 *out.get_unchecked_mut(o + 1) = g;
                 *out.get_unchecked_mut(o + 2) = b;
-                *out.get_unchecked_mut(o + 3) = 255;
+                *out.get_unchecked_mut(o + 3) = a;
             }
         }
         return;
     }
     for i in 0..n {
         let (r, g, b) = yuv_to_rgb(y[i], u[i], v[i]);
+        let a = alpha.map_or(255, |a| a[i]);
         out[i * 4] = r;
         out[i * 4 + 1] = g;
         out[i * 4 + 2] = b;
-        out[i * 4 + 3] = 255;
+        out[i * 4 + 3] = a;
     }
 }
 
@@ -2023,6 +2047,7 @@ unsafe fn yuv8_to_rgba_sse41(
     y: *const u8,
     u: *const u8,
     v: *const u8,
+    a: Option<*const u8>,
     out: *mut u8,
 ) {
     use std::arch::x86_64::*;
@@ -2079,7 +2104,11 @@ unsafe fn yuv8_to_rgba_sse41(
     let r8 = _mm_packus_epi16(r16, r16);
     let g8 = _mm_packus_epi16(g16, g16);
     let b8 = _mm_packus_epi16(b16, b16);
-    let a8 = _mm_set1_epi8(-1);
+    let a8 = match a {
+        // alpha 行 8 字节 → A 平面（低 8 字节为像素序列，unpacklo 只取低 8）。
+        Some(p) => _mm_loadl_epi64(p as *const __m128i),
+        None => _mm_set1_epi8(-1),
+    };
 
     // 三平面 → RGBA 交错：先 r/g 与 b/α 字节交错成两路 16 位 lane，再两两交错成 RGBA 四元组
     // （unpacklo_epi16 才得到 [r,g,b,α] 的字节次序：lane0=(r0,g0)、lane1=(b0,α) 交替）。
@@ -2106,6 +2135,7 @@ unsafe fn yuv16_core_avx2(
     u1: __m256i,
     v0: __m256i,
     v1: __m256i,
+    a: Option<*const u8>,
     out: *mut u8,
 ) {
     use std::arch::x86_64::*;
@@ -2149,7 +2179,15 @@ unsafe fn yuv16_core_avx2(
         let r8 = pack8_bytes_avx2(r0, r1);
         let g8 = pack8_bytes_avx2(g0, g1);
         let b8 = pack8_bytes_avx2(b0, b1);
-        let a8 = _mm256_set1_epi8(-1);
+        let a8 = match a {
+            // alpha 行 16 字节 → A 平面：低 128 位 = 前 8 像素、高 128 位 = 后 8 像素
+            // （与 r/g/b 平面同布局，unpacklo/unpackhi 逐 lane 交替取像素段）。
+            Some(p) => _mm256_set_m128i(
+                _mm_loadl_epi64(p.add(8) as *const __m128i),
+                _mm_loadl_epi64(p as *const __m128i),
+            ),
+            None => _mm256_set1_epi8(-1),
+        };
 
         // 三平面 → RGBA 交错（256-bit unpacklo_epi8/16 逐 128-bit lane，无跨 lane 干扰）：
         // 每 lane 得 [r,g,b,α] 四元组字节序，与 SSE4.1 的 8px 组逐一相同。
@@ -2175,6 +2213,7 @@ unsafe fn yuv16_to_rgba_avx2(
     y: *const u8,
     u: *const u8,
     v: *const u8,
+    a: Option<*const u8>,
     out: *mut u8,
 ) {
     use std::arch::x86_64::*;
@@ -2186,7 +2225,7 @@ unsafe fn yuv16_to_rgba_avx2(
         let u1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u.add(8) as *const __m128i));
         let v0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v as *const __m128i));
         let v1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v.add(8) as *const __m128i));
-        yuv16_core_avx2(y0, y1, u0, u1, v0, v1, out);
+        yuv16_core_avx2(y0, y1, u0, u1, v0, v1, a, out);
     }
 }
 
@@ -2200,6 +2239,7 @@ unsafe fn yuv32_to_rgba_avx2(
     y: *const u8,
     u: *const u8,
     v: *const u8,
+    a: Option<*const u8>,
     out: *mut u8,
 ) {
     use std::arch::x86_64::*;
@@ -2220,7 +2260,7 @@ unsafe fn yuv32_to_rgba_avx2(
         let u1 = _mm256_cvtepu8_epi32(_mm_srli_si128(ulo, 8));
         let v0 = _mm256_cvtepu8_epi32(vlo);
         let v1 = _mm256_cvtepu8_epi32(_mm_srli_si128(vlo, 8));
-        yuv16_core_avx2(g0, g1, u0, u1, v0, v1, out);
+        yuv16_core_avx2(g0, g1, u0, u1, v0, v1, a, out);
         // 高 16 像素组：qword0 = 高 128 位（字节 16..23），qword1 = srli8（字节 24..31）。
         let g0 = _mm256_cvtepu8_epi32(yhi);
         let g1 = _mm256_cvtepu8_epi32(_mm_srli_si128(yhi, 8));
@@ -2228,7 +2268,7 @@ unsafe fn yuv32_to_rgba_avx2(
         let u1 = _mm256_cvtepu8_epi32(_mm_srli_si128(uhi, 8));
         let v0 = _mm256_cvtepu8_epi32(vhi);
         let v1 = _mm256_cvtepu8_epi32(_mm_srli_si128(vhi, 8));
-        yuv16_core_avx2(g0, g1, u0, u1, v0, v1, out.add(64));
+        yuv16_core_avx2(g0, g1, u0, u1, v0, v1, a.map(|p| p.add(16)), out.add(64));
     }
 }
 
@@ -2255,7 +2295,7 @@ unsafe fn pack8_bytes_avx2(a: __m256i, b: __m256i) -> __m256i {
 /// [`yuv16_to_rgba_avx2_u16`] 文档）。`out` 写出 64 字节（16 像素 RGBA）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn yuv16_core_avx2_u16(yv: __m256i, uv: __m256i, vv: __m256i, out: *mut u8) {
+unsafe fn yuv16_core_avx2_u16(yv: __m256i, uv: __m256i, vv: __m256i, a: Option<*const u8>, out: *mut u8) {
     use std::arch::x86_64::*;
     unsafe {
         let k_y = _mm256_set1_epi16(19077);
@@ -2294,7 +2334,13 @@ unsafe fn yuv16_core_avx2_u16(yv: __m256i, uv: __m256i, vv: __m256i, out: *mut u
         let r8 = _mm256_packus_epi16(rd, _mm256_setzero_si256());
         let g8 = _mm256_packus_epi16(gr, _mm256_setzero_si256());
         let b8 = _mm256_packus_epi16(bl, _mm256_setzero_si256());
-        let a8 = _mm256_set1_epi8(-1);
+        let a8 = match a {
+            Some(p) => _mm256_set_m128i(
+                _mm_loadl_epi64(p.add(8) as *const __m128i),
+                _mm_loadl_epi64(p as *const __m128i),
+            ),
+            None => _mm256_set1_epi8(-1),
+        };
 
         // 与 i32 变体同款交错+重排。
         let rg = _mm256_unpacklo_epi8(r8, g8);
@@ -2321,6 +2367,7 @@ unsafe fn yuv16_to_rgba_avx2_u16(
     y: *const u8,
     u: *const u8,
     v: *const u8,
+    a: Option<*const u8>,
     out: *mut u8,
 ) {
     use std::arch::x86_64::*;
@@ -2329,7 +2376,7 @@ unsafe fn yuv16_to_rgba_avx2_u16(
         let yv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(y as *const __m128i)), 8);
         let uv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(u as *const __m128i)), 8);
         let vv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(v as *const __m128i)), 8);
-        yuv16_core_avx2_u16(yv, uv, vv, out);
+        yuv16_core_avx2_u16(yv, uv, vv, a, out);
     }
 }
 
@@ -2342,6 +2389,7 @@ unsafe fn yuv32_to_rgba_avx2_u16(
     y: *const u8,
     u: *const u8,
     v: *const u8,
+    a: Option<*const u8>,
     out: *mut u8,
 ) {
     use std::arch::x86_64::*;
@@ -2357,8 +2405,8 @@ unsafe fn yuv32_to_rgba_avx2_u16(
         let vl = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vb));
         let vh = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vb, 1));
         // 低 16 像素 → out[0..64]，高 16 像素 → out[64..128]。
-        yuv16_core_avx2_u16(_mm256_slli_epi16(yl, 8), _mm256_slli_epi16(ul, 8), _mm256_slli_epi16(vl, 8), out);
-        yuv16_core_avx2_u16(_mm256_slli_epi16(yh, 8), _mm256_slli_epi16(uh, 8), _mm256_slli_epi16(vh, 8), out.add(64));
+        yuv16_core_avx2_u16(_mm256_slli_epi16(yl, 8), _mm256_slli_epi16(ul, 8), _mm256_slli_epi16(vl, 8), a, out);
+        yuv16_core_avx2_u16(_mm256_slli_epi16(yh, 8), _mm256_slli_epi16(uh, 8), _mm256_slli_epi16(vh, 8), a.map(|p| p.add(16)), out.add(64));
     }
 }
 
@@ -4174,6 +4222,64 @@ mod tests {
             }
         }
         eprintln!("YUV_ROW_RGB3_PARITY_OK");
+    }
+
+    /// lossy-alpha 发射融合核：`yuv_row_to_rgba_alpha(Some(&alpha))` 逐字节恒等于
+    /// 「旧二趟 `yuv_row_to_rgba` + 事后标量 `rgba[i*4+3]=alpha[i]`」合成（单遍≡两遍字节契约），
+    /// 且 `None` 时与 `yuv_row_to_rgba`（α=255）完全一致；直接对标量 RGB 参考（覆盖全档
+    /// avx2/i32、avx2/u16、sse4.1、标量尾列与边界长）。
+    #[test]
+    fn yuv_row_rgba_alpha_matches_two_pass_merge() {
+        let mut rng = Lcg(0x51ed270b8c2d5f01);
+        if !simd_on("sse4.1") {
+            eprintln!("SIMD_TEST SKIP (无 sse4.1)");
+            return;
+        }
+        for n in [0usize, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 128, 257] {
+            let y: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let u: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let v: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let a: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            // 两遍合成参考：`yuv_row_to_rgba`（α=255）→ 事后标量写 alpha。
+            let mut two_pass = vec![0u8; n * 4];
+            yuv_row_to_rgba(&y, &u, &v, &mut two_pass);
+            for (i, &av) in a.iter().enumerate() {
+                two_pass[i * 4 + 3] = av;
+            }
+            // 单遍融合核（alpha 并入发射内层）。
+            let mut fused = vec![0u8; n * 4];
+            yuv_row_to_rgba_alpha(&y, &u, &v, Some(&a), &mut fused);
+            assert_eq!(fused, two_pass, "n={n}: 单遍融合应逐字节等于两遍合成");
+            // 直接对标量 RGB 参考（A 通道=alpha[i]）。
+            for i in 0..n {
+                let (r, g, b) = yuv_to_rgb(y[i], u[i], v[i]);
+                assert_eq!(&fused[i * 4..i * 4 + 3], &[r, g, b], "n={n} px={i} RGB");
+                assert_eq!(fused[i * 4 + 3], a[i], "n={n} px={i} A");
+            }
+            // None（无 ALPH）≡ 旧 `yuv_row_to_rgba`（α=255）。
+            let mut none_out = vec![0u8; n * 4];
+            yuv_row_to_rgba_alpha(&y, &u, &v, None, &mut none_out);
+            let mut plain = vec![0u8; n * 4];
+            yuv_row_to_rgba(&y, &u, &v, &mut plain);
+            assert_eq!(none_out, plain, "n={n}: None 恒 255 应与 yuv_row_to_rgba 一致");
+        }
+        // 边界值灰阶 + 全 0/全 255 alpha。
+        for val in [0u8, 1, 64, 128, 254, 255] {
+            let y = vec![val; 16];
+            let u = vec![val; 16];
+            let v = vec![val; 16];
+            for av in [0u8, 128, 255] {
+                let a = vec![av; 16];
+                let mut fused = vec![0u8; 64];
+                yuv_row_to_rgba_alpha(&y, &u, &v, Some(&a), &mut fused);
+                for i in 0..16 {
+                    let (r, g, b) = yuv_to_rgb(val, val, val);
+                    assert_eq!(&fused[i * 4..i * 4 + 3], &[r, g, b], "flat {val} av={av} px={i}");
+                    assert_eq!(fused[i * 4 + 3], av, "flat {val} av={av} A");
+                }
+            }
+        }
+        eprintln!("YUV_ROW_RGBA_ALPHA_MERGE_PARITY_OK");
     }
 
     /// ARGB→RGBA 输出与 Subtract-Green：SIMD vs 标量逐字节（含奇偶边界与全通道路径）。
