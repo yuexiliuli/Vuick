@@ -43,9 +43,11 @@ impl Vp8Error {
 
 type Result<T> = std::result::Result<T, Vp8Error>;
 
-/// VP8 解码产物：紧密 YUV 4:2:0 平面（y=w*h，u/v=(w+1)/2 × (h+1)/2），环路滤波后；
-/// `rgba` 为「行定稿直出」产物（fancy 上采样 + YUV→RGBA），由 `decode_from_header`
-/// 在滤波每宏块行后即时写出并缓存——`yuv_to_rgba_fancy` 取用后置空，避免二次全帧 pass。
+/// VP8 解码产物：`rgba` 为「行定稿直出」产物（fancy 上采样 + YUV→RGBA，α=255），由
+/// `decode_from_header` 在滤波每宏块行后即时写出并缓存——`yuv_to_rgba_fancy` 取用后置空，避免
+/// 二次全帧 pass；`y/u/v` 紧密 4:2:0 平面（环路滤波后）在生产路径默认为空（rgba 直出为输出，
+/// 紧密平面纯浪费，见 `decode_vp8` 的 `need_tight`），仅供 `decode_vp8_tight`（测试/兼容 API）
+/// 与手工构造回退 `yuv_to_rgba_fancy` 使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Vp8Yuv {
     pub width: u32,
@@ -2098,12 +2100,24 @@ pub struct Vp8StageProfile {
 }
 
 /// 完整解码：解析帧头 + 重建全部宏块 → 紧密 YUV 4:2:0（V2 暂不含环路滤波，V3 接入）。
+/// 生产路径（`need_tight=false`）跳过紧密 y/u/v 抽平面与分配——输出以 `Vp8Yuv.rgba`（行定稿
+/// 直出）为准，`y/u/v` 为空 Vec；测试/兼容 API 用 [`decode_vp8_tight`] 取紧密平面。
 pub(crate) fn decode_vp8(frame: &[u8], width: u32, height: u32) -> Result<Vp8Yuv> {
     let fh = stage_clock::header(|| parse_frame_header(frame))?;
     if fh.width != width || fh.height != height {
         return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
     }
-    decode_from_header(fh)
+    decode_from_header(fh, false)
+}
+
+/// 测试/兼容路径：同 [`decode_vp8`] 且一并抽紧密 y/u/v 平面（V2/V3 YUV golden 对拍用）。
+#[cfg(test)]
+pub(crate) fn decode_vp8_tight(frame: &[u8], width: u32, height: u32) -> Result<Vp8Yuv> {
+    let fh = stage_clock::header(|| parse_frame_header(frame))?;
+    if fh.width != width || fh.height != height {
+        return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
+    }
+    decode_from_header(fh, true)
 }
 
 /// 阶段分账解码（`stage_profile` feature 门控；供 imgbench `vp8_stage_probe`，K59 统一基座）。
@@ -2438,7 +2452,7 @@ fn reconstruct_macroblock(
     });
 }
 
-fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
+fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool) -> Result<Vp8Yuv> {
     let width = fh.width as usize;
     let height = fh.height as usize;
     let mbw = fh.mb_width;
@@ -2474,13 +2488,20 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
         // `filter_and_emit_serial`）都逐行写满 `[0,height)×width×4`，返回前无任何字节读 rgba，
         // 错误路径直接 Err（不构造 Vp8Yuv），故省略全量 memset 逐字节不变（仅省零化墙钟）。
         let rgba = unsafe { uninit_vec_u8(width * height * 4) };
-        // 紧密平面输出缓冲（真实宽高；Vp8Yuv API/测试仍需）。L3 未初始化：MT 由 t3 直出、
-        // 串行由尾段 `extract_tight_rows` 写满，返回前不被读，省略 memset 逐字节不变。
+        // 紧密平面输出缓冲（真实宽高；仅供测试/兼容 API 消费，生产 rgba 路径弃用 = 纯浪费，
+        // 由 `need_tight` 门控跳过以省 1-2 遍整帧写）。L3 未初始化：MT 由 t3 直出、串行由尾段
+        // `extract_tight_rows` 写满，返回前不被读，省略 memset 逐字节不变。
         let cwu = (width + 1) / 2;
         let chu = (height + 1) / 2;
-        let out_y = unsafe { uninit_vec_u8(width * height) };
-        let out_u = unsafe { uninit_vec_u8(cwu * chu) };
-        let out_v = unsafe { uninit_vec_u8(cwu * chu) };
+        let (out_y, out_u, out_v) = if need_tight {
+            (
+                unsafe { uninit_vec_u8(width * height) },
+                unsafe { uninit_vec_u8(cwu * chu) },
+                unsafe { uninit_vec_u8(cwu * chu) },
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         (planes, rgba, out_y, out_u, out_v)
     });
     let (mut y, uv_rest) = planes.split_at_mut(y_vec_len);
@@ -2564,7 +2585,7 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
                 recon_loop(rx, tx2, yb, y_pitch, ub, vb, uv_pitch, mbw)
             });
             s.spawn(move || {
-                filter_t3_loop(rx2, y_pitch, uv_pitch, rb, oy, ou, ov, mbw, mbh, width, height, &fh.filter)
+                filter_t3_loop(rx2, y_pitch, uv_pitch, rb, oy, ou, ov, mbw, mbh, width, height, &fh.filter, need_tight)
             });
             for mby in 0..mbh {
                 // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
@@ -2650,14 +2671,17 @@ fn decode_from_header(fh: FrameHeader<'_>) -> Result<Vp8Yuv> {
             width, height, &mut rgba, &mut scratch,
         );
 
-        // 抽紧密平面（仅串行路径主线程尾段；MT 路径 t3 已直出）。L3：out_* 已未初始化分配，
-        // 下方逐行写满（读已整帧滤波的 y/u/v padded 平面），返回前不被读，省略 memset 逐字节不变。
-        stage_clock::copy(|| {
-            extract_tight_rows(
-                &y, y_pitch, &u, &v, uv_pitch,
-                0, height, width, &mut out_y, &mut out_u, &mut out_v,
-            );
-        });
+        // 抽紧密平面（仅测试/兼容 API 路径 need_tight；生产 rgba 直出路径跳过 = 省整帧写）。
+        // L3：out_* 已未初始化分配，下方逐行写满（读已整帧滤波的 y/u/v padded 平面），
+        // 返回前不被读，省略 memset 逐字节不变。
+        if need_tight {
+            stage_clock::copy(|| {
+                extract_tight_rows(
+                    &y, y_pitch, &u, &v, uv_pitch,
+                    0, height, width, &mut out_y, &mut out_u, &mut out_v,
+                );
+            });
+        }
     }
 
     // scope join 后、返回前尾段（Vp8Yuv 构建）：主线程墙钟全部归账，无隐藏盲区（K53）。
@@ -3091,6 +3115,7 @@ fn filter_t3_loop(
     width: usize,
     height: usize,
     filter: &FilterSettings,
+    need_tight: bool,
 ) {
     // t3 独占的全 padded 重建缓冲（planes_B）：与 planes_A 同布局（含左列；字节在写入前恒 0，
     // 滤波/直出只读已写入行段，未初始化亦安全——保持 memset 以结构性地杜绝任何读空风险）。
@@ -3119,12 +3144,14 @@ fn filter_t3_loop(
         let end = if r == mbh - 1 { height } else { r * 16 + 8 };
         if end > emitted {
             emit_rows_into_rgba(yb, y_pitch, ub, vb, uv_pitch, width, cw, ch, emitted, end, rgba, &mut scratch);
-            stage_clock::copy(|| {
-                extract_tight_rows(
-                    yb, y_pitch, ub, vb, uv_pitch,
-                    emitted, end, width, out_y, out_u, out_v,
-                );
-            });
+            if need_tight {
+                stage_clock::copy(|| {
+                    extract_tight_rows(
+                        yb, y_pitch, ub, vb, uv_pitch,
+                        emitted, end, width, out_y, out_u, out_v,
+                    );
+                });
+            }
             emitted = end;
         }
     }
@@ -3460,7 +3487,7 @@ mod v2_tests {
         if c.family != super::super::container::Family::StaticLossy {
             return None;
         }
-        let yuv = decode_vp8(c.bitstream.unwrap(), c.width, c.height).ok()?;
+        let yuv = decode_vp8_tight(c.bitstream.unwrap(), c.width, c.height).ok()?;
         Some((yuv, (c.width, c.height)))
     }
 
@@ -3539,7 +3566,7 @@ mod v2_tests {
             if c.family != super::super::container::Family::StaticLossy {
                 continue;
             }
-            let yuv = decode_vp8(c.bitstream.unwrap(), c.width, c.height)
+            let yuv = decode_vp8_tight(c.bitstream.unwrap(), c.width, c.height)
                 .unwrap_or_else(|e| panic!("{name} V2 解码失败: {e}"));
             let (w, h) = (c.width as usize, c.height as usize);
             assert_eq!(yuv.y.len(), w * h, "{name} Y 长度");
@@ -3607,7 +3634,7 @@ mod v3_yuv_golden_tests {    use super::*;
                 if c.family != super::super::container::Family::StaticLossy {
                     return None;
                 }
-                let yuv = decode_vp8(c.bitstream?, c.width, c.height).ok()?;
+                let yuv = decode_vp8_tight(c.bitstream?, c.width, c.height).ok()?;
                 Some((yuv, c.width as usize, c.height as usize))
             })() else {
                 continue;
@@ -4002,7 +4029,7 @@ mod perf_stage_tests {
             let p = webp_fixtures_support::webp_fixture_path("testsrc2-320x240-q75.webp")?;
             let data = std::fs::read(p).expect("read fixture");
             let c = super::super::super::container::parse(&data).expect("容器解析");
-            let mut yuv = decode_vp8(c.bitstream.unwrap(), c.width, c.height).expect("VP8 解码");
+            let mut yuv = decode_vp8_tight(c.bitstream.unwrap(), c.width, c.height).expect("VP8 解码");
             let rgba = yuv_to_rgba_fancy(&mut yuv);
             Some((yuv.y, yuv.u, yuv.v, rgba))
         }

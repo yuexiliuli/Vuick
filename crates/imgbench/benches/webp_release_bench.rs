@@ -126,7 +126,7 @@ fn collect_corpus_webps() -> Vec<(Scenario, String, Vec<u8>)> {
         println!("WEBP_RELEASE_BENCH corpus SKIP (target/imgbench-corpus/WEBP 缺失)");
     }
 
-    let extra = std::path::Path::new(r"E:\Rust\SimdCodecs\tests\Sdcb.SimdCodecs.Tests\Fixtures\webp");
+    let extra = std::path::Path::new(r"D:\WorkSpace\1\csharp\SimdCodecs\tests\Sdcb.SimdCodecs.Tests\Fixtures\webp");
     let mut extra_files = Vec::new();
     collect_dir(extra, &mut extra_files);
     if extra_files.is_empty() {

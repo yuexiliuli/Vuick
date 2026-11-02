@@ -1903,7 +1903,7 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     super::vp8::yuv_to_rgb(y, u, v)
 }
 
-/// 一行 YUV→RGBA8（alpha 恒 255）：AVX2 每 16 像素批量（SSE4.1 段收尾）+ 标量尾；
+/// 一行 YUV→RGBA8（alpha 恒 255）：AVX2 每 32 像素批量（含 16/8px 段收尾）+ 标量尾；
 /// 无 AVX2 则 SSE4.1 每 8 像素批量 + 标量尾；无 SIMD 全标量。逐字节恒等于标量
 /// `vp8::yuv_to_rgb`（各路径同一算术源，见内核注释）。
 /// 输入三平面各 `n` 字节，输出 `4*n` 字节。
@@ -1918,6 +1918,25 @@ pub(crate) fn yuv_row_to_rgba(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
         let u16 = yuv_u16_enabled();
         let mut col = 0usize;
         unsafe {
+            // 主批量：32 像素/步（YUV 加宽内核），余数 16px / 8px(SSE4.1) / 标量收尾。
+            while col + 32 <= n {
+                if u16 {
+                    yuv32_to_rgba_avx2_u16(
+                        y.as_ptr().add(col),
+                        u.as_ptr().add(col),
+                        v.as_ptr().add(col),
+                        out.as_mut_ptr().add(col * 4),
+                    );
+                } else {
+                    yuv32_to_rgba_avx2(
+                        y.as_ptr().add(col),
+                        u.as_ptr().add(col),
+                        v.as_ptr().add(col),
+                        out.as_mut_ptr().add(col * 4),
+                    );
+                }
+                col += 32;
+            }
             while col + 16 <= n {
                 if u16 {
                     yuv16_to_rgba_avx2_u16(
@@ -2073,29 +2092,24 @@ unsafe fn yuv8_to_rgba_sse41(
     }
 }
 
-/// AVX2：16 像素（8×i32 lane × 2 组）定点 YUV→RGBA。算术与 [`yuv8_to_rgba_sse41`] 严格同源
-/// （`(x*c)>>8` → bias 减 → `>>6` → min/max clamp [0,255]，`mullo_epi32`+`srai_epi32` 语义一致），
-/// 只扩宽到 256-bit：`vpmovzxbd` 每 8 字节段提升成 8 个 i32 lane，低 8 像素/高 8 像素各一遍通道，
-/// 再按 128-bit 段 pack 成 16 字节平面、256-bit 逐 lane unpack 交错成 RGBA——逐字节等于两个
-/// 独立的 8px SSE4.1 调用（每 128-bit lane 的内层 unpack/pack 与 SSE4.1 完全同款）。
+/// AVX2：16 像素（8×i32 lane × 2 组）定点 YUV→RGBA 核心（已 vpmovzxbd 提升的 6 个 8-i32 堆）。
+/// 算术与 [`yuv8_to_rgba_sse41`] 严格同源（`(x*c)>>8` → bias 减 → `>>6` → min/max clamp [0,255]，
+/// `mullo_epi32`+`srai_epi32` 语义一致），低 8 像素/高 8 像素各一遍通道，再按 128-bit 段 pack 成
+/// 16 字节平面、256-bit 逐 lane unpack 交错成 RGBA——逐字节等于两个独立的 8px SSE4.1 调用。
+/// `out` 写出 64 字节（16 像素 RGBA）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn yuv16_to_rgba_avx2(
-    y: *const u8,
-    u: *const u8,
-    v: *const u8,
+unsafe fn yuv16_core_avx2(
+    y0: __m256i,
+    y1: __m256i,
+    u0: __m256i,
+    u1: __m256i,
+    v0: __m256i,
+    v1: __m256i,
     out: *mut u8,
 ) {
     use std::arch::x86_64::*;
     unsafe {
-        // 每 8 字节段（8 像素）经 vpmovzxbd 提升到 ymm 的 8 个 i32 lane（非对齐 8 字节读）。
-        let y0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y as *const __m128i));
-        let y1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y.add(8) as *const __m128i));
-        let u0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u as *const __m128i));
-        let u1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u.add(8) as *const __m128i));
-        let v0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v as *const __m128i));
-        let v1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v.add(8) as *const __m128i));
-
         let c19077 = _mm256_set1_epi32(19077);
         let c26149 = _mm256_set1_epi32(26149);
         let c6419 = _mm256_set1_epi32(6419);
@@ -2154,6 +2168,70 @@ unsafe fn yuv16_to_rgba_avx2(
     }
 }
 
+/// AVX2：16 像素（8×i32 lane × 2 组）定点 YUV→RGBA 包装（载入并宽 + 核心）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv16_to_rgba_avx2(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        // 每 8 字节段（8 像素）经 vpmovzxbd 提升到 ymm 的 8 个 i32 lane（非对齐 8 字节读）。
+        let y0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y as *const __m128i));
+        let y1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y.add(8) as *const __m128i));
+        let u0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u as *const __m128i));
+        let u1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u.add(8) as *const __m128i));
+        let v0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v as *const __m128i));
+        let v1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v.add(8) as *const __m128i));
+        yuv16_core_avx2(y0, y1, u0, u1, v0, v1, out);
+    }
+}
+
+/// AVX2：32 像素/步（Req: 16→32px 加宽）。载 32 字节 → 拆低/高 16 字节两组，每组视作两个
+/// 8 字节 qword（低 16 像素组：低 qword+`srli 8`；高 16 像素组：高 128 位 + `srli 8`）经
+/// vpmovzxbd 提升 → [`yuv16_core_avx2`]，写 128 字节 RGBA。算术与 16px 内核逐位相同 → 逐字节
+/// 恒等于两个相邻 16px 调用；循环步长减半、单次 32B 载入替代两次 16B，依赖链交错提 ILP。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv32_to_rgba_avx2(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let yb = _mm256_loadu_si256(y as *const __m256i);
+        let ub = _mm256_loadu_si256(u as *const __m256i);
+        let vb = _mm256_loadu_si256(v as *const __m256i);
+        let ylo = _mm256_castsi256_si128(yb);
+        let yhi = _mm256_extracti128_si256(yb, 1);
+        let ulo = _mm256_castsi256_si128(ub);
+        let uhi = _mm256_extracti128_si256(ub, 1);
+        let vlo = _mm256_castsi256_si128(vb);
+        let vhi = _mm256_extracti128_si256(vb, 1);
+        // 低 16 像素组：qword0 = 低 128 位原样（字节 0..7），qword1 = srli8（字节 8..15）。
+        let g0 = _mm256_cvtepu8_epi32(ylo);
+        let g1 = _mm256_cvtepu8_epi32(_mm_srli_si128(ylo, 8));
+        let u0 = _mm256_cvtepu8_epi32(ulo);
+        let u1 = _mm256_cvtepu8_epi32(_mm_srli_si128(ulo, 8));
+        let v0 = _mm256_cvtepu8_epi32(vlo);
+        let v1 = _mm256_cvtepu8_epi32(_mm_srli_si128(vlo, 8));
+        yuv16_core_avx2(g0, g1, u0, u1, v0, v1, out);
+        // 高 16 像素组：qword0 = 高 128 位（字节 16..23），qword1 = srli8（字节 24..31）。
+        let g0 = _mm256_cvtepu8_epi32(yhi);
+        let g1 = _mm256_cvtepu8_epi32(_mm_srli_si128(yhi, 8));
+        let u0 = _mm256_cvtepu8_epi32(uhi);
+        let u1 = _mm256_cvtepu8_epi32(_mm_srli_si128(uhi, 8));
+        let v0 = _mm256_cvtepu8_epi32(vhi);
+        let v1 = _mm256_cvtepu8_epi32(_mm_srli_si128(vhi, 8));
+        yuv16_core_avx2(g0, g1, u0, u1, v0, v1, out.add(64));
+    }
+}
+
 /// AVX2 helper：两个 8-i32 lane 分量堆（各低/高 128 位含 4 像素）→ 16 字节平面字节序。
 /// 低 128 位 = 前 8 像素、高 128 位 = 后 8 像素（每段先 4 i32 → 4 i16 → 4 u8，饱和即恒等，
 /// 值已在 [0,255]，与 SSE4.1 的 pack 同款）。
@@ -2172,28 +2250,14 @@ unsafe fn pack8_bytes_avx2(a: __m256i, b: __m256i) -> __m256i {
     }
 }
 
-/// AVX2 u16-mulhi 变体：16 像素/步。与 [`yuv16_to_rgba_avx2`]（i32 定点）逐字节相等——对标
-/// C# `WebpDecoder.ConvertRowAvx2`（libwebp 式 vpmulhuw）：像素字节先放到 u16 高位（左移 8），
-/// `mulhi_epu16(px<<8, k) = (px*k)>>8` 与标量 `(x*c)>>8` 逐位同截断；bias 减用 max-then-subtract
-/// 在 u16 域钳 0（预偏置和恒 < 2^16：yTerm≤19020、r 和≤45077、g 两项和≤27728/19688、b 和≤51890，
-/// 均不溢出），末段 `srli >>6` 逻辑右移 + packus 饱和把负数/超限映射到 [0,255]——与标量
-/// `srai>>6` 后 clamp 逐字节同。
-/// 门控：`KIMG_WEBP_YUV_U16=1` 时生产走本变体（实验性；任一对拍差一字节即弃，保持 i32 方案）。
+/// AVX2 u16 16px 核心（已载入并左移 8 的 16-u16 y/u/v）：mulhi → max-sub → srli6 → packus →
+/// 逐 lane 交错 RGBA → 两次 256-bit 存储。算术与标量 `(x*c)>>8` 逐位同截断（见
+/// [`yuv16_to_rgba_avx2_u16`] 文档）。`out` 写出 64 字节（16 像素 RGBA）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn yuv16_to_rgba_avx2_u16(
-    y: *const u8,
-    u: *const u8,
-    v: *const u8,
-    out: *mut u8,
-) {
+unsafe fn yuv16_core_avx2_u16(yv: __m256i, uv: __m256i, vv: __m256i, out: *mut u8) {
     use std::arch::x86_64::*;
     unsafe {
-        // 16 像素载入 → 16 i16（低位=像素）→ 左移 8 让像素落高字节（=×256）。
-        let yv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(y as *const __m128i)), 8);
-        let uv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(u as *const __m128i)), 8);
-        let vv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(v as *const __m128i)), 8);
-
         let k_y = _mm256_set1_epi16(19077);
         let k_vr = _mm256_set1_epi16(26149);
         let k_ug = _mm256_set1_epi16(6419);
@@ -2244,6 +2308,60 @@ unsafe fn yuv16_to_rgba_avx2_u16(
     }
 }
 
+/// AVX2 u16-mulhi 变体：16 像素/步。与 [`yuv16_to_rgba_avx2`]（i32 定点）逐字节相等——对标
+/// C# `WebpDecoder.ConvertRowAvx2`（libwebp 式 vpmulhuw）：像素字节先放到 u16 高位（左移 8），
+/// `mulhi_epu16(px<<8, k) = (px*k)>>8` 与标量 `(x*c)>>8` 逐位同截断；bias 减用 max-then-subtract
+/// 在 u16 域钳 0（预偏置和恒 < 2^16：yTerm≤19020、r 和≤45077、g 两项和≤27728/19688、b 和≤51890，
+/// 均不溢出），末段 `srli >>6` 逻辑右移 + packus 饱和把负数/超限映射到 [0,255]——与标量
+/// `srai>>6` 后 clamp 逐字节同。
+/// 门控：`KIMG_WEBP_YUV_U16=1` 时生产走本变体（实验性；任一对拍差一字节即弃，保持 i32 方案）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv16_to_rgba_avx2_u16(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        // 16 像素载入 → 16 i16（低位=像素）→ 左移 8 让像素落高字节（=×256）。
+        let yv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(y as *const __m128i)), 8);
+        let uv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(u as *const __m128i)), 8);
+        let vv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(v as *const __m128i)), 8);
+        yuv16_core_avx2_u16(yv, uv, vv, out);
+    }
+}
+
+/// AVX2 u16-mulhi 变体：32 像素/步（Req: 16→32px 加宽）。载 32 字节 → 拆低/高 16 像素两组，
+/// 每组经 [`yuv16_core_avx2_u16`]（算术逐位同 16px 内核）→ 128 字节 RGBA。循环步长减半、
+/// 载入并宽 3×32B 替代 6×16B，依赖链交错提 ILP；逐字节恒等于两个相邻 16px 内核调用。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv32_to_rgba_avx2_u16(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        // 32 字节（32 像素）一次载入，拆低/高 16 字节两组。
+        let yb = _mm256_loadu_si256(y as *const __m256i);
+        let ub = _mm256_loadu_si256(u as *const __m256i);
+        let vb = _mm256_loadu_si256(v as *const __m256i);
+        let yl = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(yb));
+        let yh = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(yb, 1));
+        let ul = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(ub));
+        let uh = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(ub, 1));
+        let vl = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vb));
+        let vh = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vb, 1));
+        // 低 16 像素 → out[0..64]，高 16 像素 → out[64..128]。
+        yuv16_core_avx2_u16(_mm256_slli_epi16(yl, 8), _mm256_slli_epi16(ul, 8), _mm256_slli_epi16(vl, 8), out);
+        yuv16_core_avx2_u16(_mm256_slli_epi16(yh, 8), _mm256_slli_epi16(uh, 8), _mm256_slli_epi16(vh, 8), out.add(64));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // fancy 上采样（SSE2 16-bit lane；语义对齐 vp8.rs `upsample_fancy`：`3*cur+adj` 的 t 行 +
 // 偶数/奇数对的 `(3t±邻居+8)>>4`，无重结合）
@@ -2272,9 +2390,21 @@ pub(crate) fn upsample_fancy_into(current: &[u8], adjacent: &[u8], out: &mut [u8
     // 仅清零 8 个读安全 padding（`t[0..cw]` 紧随其后整体覆写，无需先零）；padding 值恒零、
     // 只作末组 SSE 越界读的保护，不参与任何输出字节（逐字节与全场清零恒等）。
     t[cw..].fill(0);
-    // t 行 `3*cur + adj`：SSE2 每 16 列一组（u16 16-lane），不足 16 列尾标量；经 unpack 零扩展
-    // 后逐值等于标量（3*255+255=1020 < 2^16 无溢出），`t[0..cw]` 写满语义不变。
+    // t 行 `3*cur + adj`：AVX2 每 32 列一组、SSE2 每 16 列一组（u16 16-lane），不足尾标量；
+    // 经 unpack 零扩展后逐值等于标量（3*255+255=1020 < 2^16 无溢出），`t[0..cw]` 写满语义不变。
     let mut col = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") {
+        let cp = current.as_ptr();
+        let ap = adjacent.as_ptr();
+        let tp = t.as_mut_ptr();
+        unsafe {
+            while col + 32 <= cw {
+                upsample_fancy_trow_avx2(cp.add(col), ap.add(col), tp.add(col));
+                col += 32;
+            }
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     if simd_on("sse2") {
         let cp = current.as_ptr();
@@ -2310,12 +2440,28 @@ pub(crate) fn upsample_fancy_into(current: &[u8], adjacent: &[u8], out: &mut [u8
         }
     }
 
+    // 中间列对（col=1..cw-2）：AVX2 16 对/步 主批量 → 共享收尾；无 AVX2 直接 ssse3/标量。
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") && cw >= 18 {
+        let mut col = 1usize;
+        unsafe {
+            // 16 对/步（C# `ChromaPairShuffleIndices` 同款）：current=t[col..col+16]、
+            // 左邻 t[col-1..col+15]、右邻 t[col+1..col+17]，数学右读 ≤ t[cw-1]。
+            while col + 17 <= cw {
+                upsample_fancy_avx2(t.as_ptr().add(col), out.as_mut_ptr().add(col * 2));
+                col += 16;
+            }
+        }
+        if col < cw.saturating_sub(1) {
+            upsample_fancy_tail(t, out, col, cw);
+        }
+        return;
+    }
     // 中间列对（col=1..cw-2）：每 4 列一组 SSSE3 推 8 个输出字节；尾列标量。
     #[cfg(target_arch = "x86_64")]
     if simd_on("ssse3") && cw >= 6 {
         let mut col = 1usize;
         unsafe {
-            // 窗口 t[col-1..col+5]（6 个 u16）+ 8 填充保证 8 u16 读安全：col+5 ≤ cw。
             while col + 4 < cw {
                 upsample_fancy_sse2(t.as_ptr().add(col - 1), out.as_mut_ptr().add(col * 2));
                 col += 4;
@@ -2358,6 +2504,53 @@ unsafe fn upsample_fancy_trow_sse2(cur: *const u8, adj: *const u8, t: *mut u16) 
     }
 }
 
+/// AVX2：一次载入 `current`/`adjacent` 的 32 字节 → 拆低/高 16 字节并宽成 32 u16 → 算
+/// `t = 3*current + adjacent` 写 32 个 u16（t[col..col+32]）。与标量逐值相等，逐字节等于两次
+/// [`upsample_fancy_trow_sse2`]（每 16 列组算术同源；调用方保证 `col+32 ≤ cw` 不越界）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn upsample_fancy_trow_avx2(cur: *const u8, adj: *const u8, t: *mut u16) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let c = _mm256_loadu_si256(cur as *const __m256i);
+        let a = _mm256_loadu_si256(adj as *const __m256i);
+        let three = _mm256_set1_epi16(3);
+        let zero = _mm256_setzero_si256();
+        // 低 16 列 → t[col..col+16]，高 16 列 → t[col+16..col+32]。
+        let clo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(c));
+        let chi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(c, 1));
+        let alo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(a));
+        let ahi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(a, 1));
+        let tlo = _mm256_add_epi16(_mm256_mullo_epi16(clo, three), alo);
+        let thi = _mm256_add_epi16(_mm256_mullo_epi16(chi, three), ahi);
+        _mm256_storeu_si256(t as *mut __m256i, tlo);
+        _mm256_storeu_si256((t as *mut __m256i).add(1), thi);
+    }
+}
+
+/// 中间列对收尾：从 `col` 起 4 对/步 SSSE3 + 标量尾（与 `upsample_fancy` 标量同算术）。
+/// 供 AVX2 16 对/步主批量推进后复用（SSSE3 未启用时全标量）。
+#[cfg(target_arch = "x86_64")]
+fn upsample_fancy_tail(t: &[u16], out: &mut [u8], mut col: usize, cw: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("ssse3") && cw >= 6 {
+        unsafe {
+            // 窗口 t[col-1..col+5]（6 个 u16）+ 8 填充保证 8 u16 读安全：col+5 ≤ cw。
+            while col + 4 < cw {
+                upsample_fancy_sse2(t.as_ptr().add(col - 1), out.as_mut_ptr().add(col * 2));
+                col += 4;
+            }
+        }
+    }
+    while col < cw.saturating_sub(1) {
+        let c = t[col];
+        let oc = col * 2;
+        out[oc] = ((3 * c + t[col - 1] + 8) >> 4) as u8;
+        out[oc + 1] = ((3 * c + t[col + 1] + 8) >> 4) as u8;
+        col += 1;
+    }
+}
+
 /// fancy 上采样 U/V 两行一次完成（参照 D2 `lf_uv_pair` 的 U/V 双平面打包先例，把两次
 /// `upsample_fancy_into` 合并成同一循环构建两 t 行 + 同一循环处理两输出平面，省散布往返）。
 /// 语义与逐平面调用 [`upsample_fancy_into`] 完全一致（逐字节）：t 行 `3*cur+adj`、边界列、
@@ -2383,8 +2576,24 @@ pub(crate) fn upsample_fancy_into_uv(
     // padding 值恒零、只作末组 SSE 越界读保护（语义同单平面版）。
     tu[cw..].fill(0);
     tv[cw..].fill(0);
-    // t 行合并构建：同一循环内向量化两平面（U/V 各 16 列/组），尾部标量。
+    // t 行合并构建：同一循环内向量化两平面（AVX2 32 列 / SSE2 16 列每组），尾部标量。
     let mut col = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") {
+        let ucp = u_cur.as_ptr();
+        let uap = u_adj.as_ptr();
+        let vcp = v_cur.as_ptr();
+        let vap = v_adj.as_ptr();
+        let tup = tu.as_mut_ptr();
+        let tvp = tv.as_mut_ptr();
+        unsafe {
+            while col + 32 <= cw {
+                upsample_fancy_trow_avx2(ucp.add(col), uap.add(col), tup.add(col));
+                upsample_fancy_trow_avx2(vcp.add(col), vap.add(col), tvp.add(col));
+                col += 32;
+            }
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     if simd_on("sse2") {
         let ucp = u_cur.as_ptr();
@@ -2430,6 +2639,24 @@ pub(crate) fn upsample_fancy_into_uv(
         }
     }
 
+    // 中间列对（col=1..cw-2）：AVX2 16 对/步 主批量（U/V 同一迭代）→ 共享收尾；否则 ssse3/标量。
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") && cw >= 18 {
+        let mut col = 1usize;
+        unsafe {
+            // 16 对/步（C# `ChromaPairShuffleIndices` 同款）：右读 ≤ t[cw-1]。
+            while col + 17 <= cw {
+                upsample_fancy_avx2(tu.as_ptr().add(col), uo.as_mut_ptr().add(col * 2));
+                upsample_fancy_avx2(tv.as_ptr().add(col), vo.as_mut_ptr().add(col * 2));
+                col += 16;
+            }
+        }
+        if col < cw.saturating_sub(1) {
+            upsample_fancy_tail(tu, uo, col, cw);
+            upsample_fancy_tail(tv, vo, col, cw);
+        }
+        return;
+    }
     // 中间列对（col=1..cw-2）：每 4 列一组 SSSE3 各推 8 字节（同一迭代内 U/V），尾列标量。
     #[cfg(target_arch = "x86_64")]
     if simd_on("ssse3") && cw >= 6 {
@@ -2489,6 +2716,38 @@ unsafe fn upsample_fancy_sse2(t_base: *const u16, out: *mut u8) {
     let shuf = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 11, 3, 10, 2, 9, 1, 8, 0);
     let interleaved = _mm_shuffle_epi8(p, shuf);
     _mm_storel_epi64(out as *mut __m128i, interleaved);
+    }
+}
+
+/// AVX2：16 对/步（C# `UpsampleFancyVector128Core` 的 Avx2 段同款）。`t_base=&t[pair]`，
+/// 载 16 个 u16 current（t[pair..pair+16]）+ 左邻（pair-1）+ 右邻（pair+1）各 16 u16 →
+/// `even=(3*cur+left+8)>>4`、`odd=(3*cur+right+8)>>4` → packus 分开偶/奇 → 逐 128-bit lane
+/// shuffle 交错（每 lane 内 8 对、lanes 各持 pairs 0-7/8-15，天然按输出序）→ 32 字节输出。
+/// 算术同 [`upsample_fancy_sse2`]（`mid*3+左/右邻+8 >>4`），逐字节等于两次 4 对 SSE2 十分之一
+/// 组（调用方保证 `pair+17 ≤ cw`：右读 t[pair+16] ≤ t[cw-1]，数学恒正不越界）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn upsample_fancy_avx2(t_base: *const u16, out: *mut u8) {
+    use std::arch::x86_64::*;
+    unsafe {
+    let w = _mm256_loadu_si256(t_base as *const __m256i);        // t[pair..pair+16]
+    let left = _mm256_loadu_si256(t_base.sub(1) as *const __m256i); // t[pair-1..pair+15]
+    let right = _mm256_loadu_si256(t_base.add(1) as *const __m256i); // t[pair+1..pair+17]
+    let three = _mm256_set1_epi16(3);
+    let bias8 = _mm256_set1_epi16(8);
+
+    let even = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(_mm256_mullo_epi16(w, three), left), bias8), 4);
+    let odd = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(_mm256_mullo_epi16(w, three), right), bias8), 4);
+
+    // packus：偶 16 列 → 低/高 128 位各 8 字节，奇 16 列 → 同样布局；每 lane 内 shuffle 把该
+    // lane 的偶/奇字节交错成 [e0,o0,e1,o1,...]（每 lane 全 16 字节：0..15 完整逐对交错）。
+    let p = _mm256_packus_epi16(even, odd);
+    let shuf = _mm256_set_epi8(
+        15, 7, 14, 6, 13, 5, 12, 4, 11, 3, 10, 2, 9, 1, 8, 0,
+        15, 7, 14, 6, 13, 5, 12, 4, 11, 3, 10, 2, 9, 1, 8, 0,
+    );
+    let interleaved = _mm256_shuffle_epi8(p, shuf);
+    _mm256_storeu_si256(out as *mut __m256i, interleaved);
     }
 }
 
