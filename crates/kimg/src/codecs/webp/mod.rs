@@ -566,6 +566,32 @@ pub(crate) fn decode_static_lossless(
     }))
 }
 
+/// 自研 VP8L 静态直写调用方 RGBA8 缓冲（`C# DecodeTo` 镜像：暖态零分配；`data` 为完整
+/// WEBP 文件，`out` 长度须 == w*h*4）。仅 VP8L 静态族（无损 / 无损-alpha，含不带 alpha 的
+/// 无损）且自研可解时接管直写并返回 `Ok(true)`（`out` 已写满 RGBA8）；非可接管家族（VP8
+/// 有损等）返回 `Ok(false)`，调用方自回退既有路径；畸形/自研解码失败返回 `Err`。
+/// 供复用缓冲零分配解码（kimg & imgbench 探针），不改既有 `WebPDecoder` 默认语义。
+pub fn decode_static_lossless_rgba8_into(data: &[u8], out: &mut [u8]) -> ImageResult<bool> {
+    let c = match container::parse(data) {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
+    };
+    if !c.family.is_static_lossless() {
+        return Ok(false);
+    }
+    let bitstream = match c.bitstream {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+    match vp8l::decode_into_rgba8(bitstream, out) {
+        Ok(()) => Ok(true),
+        Err(e) => Err(ImageError::Decoding(DecodingError::new(
+            ImageFormat::WebP.into(),
+            e.0,
+        ))),
+    }
+}
+
 /// 自研 VP8 静态有损解码入口（P3 有损族，V4+ 接管）：后端允许 + 家族=StaticLossy/LossyAlpha 时
 /// 调用。解析容器 → VP8 YUV → fancy RGB 直出。opaque（StaticLossy，无 alpha）：`decode_vp8_rgb3`
 /// 直出 **RGB3**（`OursStatic.rgb`，w*h*3，消 RGBA4 中间帧 / 4→3 转换 / 整帧 RGBA 分配）；

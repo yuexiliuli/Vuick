@@ -1322,12 +1322,48 @@ fn read_transform(reader: &mut BitReader<'_>, ty: u8, width: u32, height: u32) -
     })
 }
 
-/// 解码主图像（含变换序列）为 ARGB 像素。
+/// 无初始化像素缓冲（跳过 `vec![0u32; n]` 的整帧清零——解码随后全量覆写 = 纯浪费）。
+/// sound：`u32` 无 Drop glue，中途 Err 时整体 Drop 仅归还分配、不读元素；解码期「读未写槽」
+/// 的唯一风险由 [`decode_image_into`] 的全覆写不变式排除。
+fn uninit_u32_vec(len: usize) -> Vec<u32> {
+    let mut v = Vec::with_capacity(len);
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// 解码主图像（含变换序列）为 ARGB 像素（内部分配，无预清零）。
 fn decode_image(reader: &mut BitReader<'_>, width: u32, height: u32) -> Result<Vec<u32>> {
     let pixel_count = (width as usize) * (height as usize);
+    let mut pixels = uninit_u32_vec(pixel_count);
+    decode_image_into(reader, width, height, &mut pixels)?;
+    Ok(pixels)
+}
+
+/// 解码主图像（含变换序列）到外部缓冲 `pixels`（长度须恰为 width*height）。
+///
+/// 全覆写不变式（预清零 / 调用方复用缓冲均安全）：
+/// - 熵流按位序**顺序**写满 `pixels[..encoded_count]`（`decode_pixels` 的
+///   `while position < pixel_count` 单调推进，position 恒先写后读；`copy_backward`
+///   只读已写前缀）；
+/// - 若存在颜色索引变换（缩小编码尺寸 → encoded_count < pixel_count），其按编码逆序
+///   应用时**先于**其它逆变换把尾段 `pixels[encoded_count..]` 全量写出（对齐 libwebp
+///   的 ApplyInverseTransforms 尺寸演绎），故任何读邻像素的逆变换发生前全数组已写；
+/// - 中途 `Err` 直接返回，调用方 Drop/忽略，不读未写槽。
+fn decode_image_into(
+    reader: &mut BitReader<'_>,
+    width: u32,
+    height: u32,
+    pixels: &mut [u32],
+) -> Result<()> {
+    let pixel_count = (width as usize) * (height as usize);
+    if pixels.len() != pixel_count {
+        return Err(Vp8LError::new("VP8L 主图像输出缓冲尺寸不符"));
+    }
     let mut transforms: Vec<Transform> = Vec::new();
     let mut seen = [false; 4];
     let mut encoded_width = width;
+    // 刻意只缩横不缩纵（对齐 libwebp DecodeImageStream 的「颜色索引仅缩宽」怪癖）：
+    // 这是 decode_image_into「全覆写不变式」的几何前提，勿单独改纵。
     let encoded_height = height;
 
     while reader.read_bit()? != 0 {
@@ -1343,13 +1379,19 @@ fn decode_image(reader: &mut BitReader<'_>, width: u32, height: u32) -> Result<V
         transforms.push(transform);
     }
 
-    let mut pixels = vec![0u32; pixel_count];
     let encoded_count = (encoded_width as usize) * (encoded_height as usize);
-    decode_image_stream_into(reader, encoded_width, encoded_height, true, &mut pixels[..encoded_count], None)?;
+    decode_image_stream_into(
+        reader,
+        encoded_width,
+        encoded_height,
+        true,
+        &mut pixels[..encoded_count],
+        None,
+    )?;
     for t in transforms.iter().rev() {
-        apply_transform(&mut pixels, t)?;
+        apply_transform(pixels, t)?;
     }
-    Ok(pixels)
+    Ok(())
 }
 
 fn read_header(bitstream: &[u8]) -> Result<(u32, u32, bool)> {
@@ -1393,6 +1435,39 @@ pub(crate) fn decode(bitstream: &[u8]) -> Result<DecodedImage> {
         has_alpha,
         rgba,
     })
+}
+
+/// 直接解码 VP8L 位流到调用方 RGBA8 缓冲（`C# DecodeTo` 镜像：暖态零分配）。
+/// `out` 长度须恰为 w*h*4。`out` 4 字节对齐时整帧零拷贝直写 + 原地字节交换；未对齐时
+/// 兜底 = 内部缓冲 + 一次拷贝（常态调用方 `Vec<u8>` 均满对齐，走快道）。
+pub(crate) fn decode_into_rgba8(bitstream: &[u8], out: &mut [u8]) -> Result<()> {
+    let (width, height, _has_alpha) = read_header(bitstream)?;
+    let pixel_count = (width as usize) * (height as usize);
+    if out.len() != pixel_count * 4 {
+        return Err(Vp8LError::new("VP8L 输出缓冲长度须为 w*h*4"));
+    }
+    if out.as_ptr() as usize % std::mem::align_of::<u32>() == 0 {
+        // 把调用方缓冲重借为 `&mut [u32]`：熵解码/逆变换以 ARGB 直写其中（全覆写不变式见
+        // decode_image_into），再原地字节交换为 RGBA8。raw 派生重借（语义等同 bytemuck
+        // cast_slice_mut），重借存活期不触碰 `out`；缓冲由调用方持有，无 Drop 冲突。
+        let px = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u32>(), pixel_count)
+        };
+        let mut reader = BitReader::new(&bitstream[5..]);
+        decode_image_into(&mut reader, width, height, px)?;
+        super::simd::argb_to_rgba_inplace(px);
+        Ok(())
+    } else {
+        let mut reader = BitReader::new(&bitstream[5..]);
+        let mut pixels = decode_image(&mut reader, width, height)?;
+        if pixels.len() != pixel_count {
+            return Err(Vp8LError::new("VP8L 像素数不一致"));
+        }
+        super::simd::argb_to_rgba_inplace(&mut pixels);
+        let rgba = RgbaBytes::from_argb_vec(pixels);
+        out.copy_from_slice(rgba.as_bytes());
+        Ok(())
+    }
 }
 
 /// 校准单次 `Instant::now()` 调用固有开销（ns/次），用于扣除逐缓存符号计时器的测量噪音。
@@ -1449,7 +1524,7 @@ pub fn stage_decode_into(bitstream: &[u8], rgba: &mut [u8]) -> Result<Vp8lStageP
     }
     let transforms_head_ns = t0.elapsed().as_nanos() as u64;
 
-    let mut pixels = vec![0u32; pixel_count];
+    let mut pixels = uninit_u32_vec(pixel_count);
     let encoded_count = (encoded_width as usize) * (encoded_height as usize);
     let mut profile = Vp8lStageProfile {
         width,
@@ -1881,6 +1956,7 @@ mod parity_tests {
     use sha2::{Digest, Sha256};
 
     use super::decode;
+    use super::decode_into_rgba8;
     use super::webp_fixtures_support;
     use crate::codecs::webp::container;
     use crate::codecs::webp::{set_webp_backend, WebPDecoder, BACKEND_AUTO, BACKEND_IMAGEWEBP};
@@ -2006,6 +2082,57 @@ mod parity_tests {
         // 11 个 lossless 静态 fixture（SimdCodecs 金光标）应全过。
         assert!(checked >= 11, "lossless 静态 parity 应全过，当前 {checked}（fail {}）", fails.len());
         assert!(fails.is_empty(), "{} 个 lossless fixture parity 失败", fails.len());
+    }
+
+    /// 直写 [`decode_into_rgba8`] 与 [`decode`] 路径逐字节一致；调用方复用缓冲（预填垃圾，
+    /// 验证全覆写不变式不读旧值）与未对齐（偏移 1 → 兜底拷贝路径）均应产出同字节。
+    #[test]
+    fn decode_into_rgba8_matches_decode() {
+        let mut checked = 0usize;
+        let mut names = webp_fixtures_support::webp_fixture_names();
+        names.sort();
+        for name in names {
+            if !name.ends_with(".webp") || name.starts_with("anim-") {
+                continue;
+            }
+            let Some(path) = webp_fixtures_support::webp_fixture_path(&name) else {
+                continue;
+            };
+            let data = std::fs::read(&path).unwrap();
+            let c = match container::parse(&data) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if !c.family.is_static_lossless() {
+                continue;
+            }
+            let bs = c.bitstream.unwrap();
+            let expect = match decode(bs) {
+                Ok(o) => o.rgba.as_bytes().to_vec(),
+                Err(_) => continue, // 非金标准越界语料解不了 → 跳过
+            };
+            // 对齐快道 + 复用缓冲预填垃圾（证明不复用旧值）。
+            let mut aligned = vec![0xA5u8; expect.len()];
+            decode_into_rgba8(bs, &mut aligned).unwrap();
+            assert_eq!(aligned, expect, "{name} 对齐直写应等于 decode");
+            // 未对齐兜底（偏移到 4 字节不对齐）。
+            let mut unaligned = vec![0xA5u8; expect.len() + 3];
+            let align = std::mem::align_of::<u32>() as usize;
+            let mut start = 0usize;
+            while (unaligned.as_ptr() as usize + start) % align == 0 {
+                start += 1;
+                assert!(start <= 3);
+            }
+            decode_into_rgba8(bs, &mut unaligned[start..start + expect.len()]).unwrap();
+            assert_eq!(
+                &unaligned[start..start + expect.len()],
+                &expect[..],
+                "{name} 未对齐兜底应等于 decode"
+            );
+            checked += 1;
+        }
+        eprintln!("WEBP_DECODE_INTO_RGBA8_CHECKED\t{checked}");
+        assert!(checked >= 1, "应至少对拍 1 个 VP8L 静态 fixture（当前 {checked}）");
     }
 
     /// 经 WebPDecoder 现路径解为 RGBA8；解码失败返回 None（供 SKIP 分流）。
