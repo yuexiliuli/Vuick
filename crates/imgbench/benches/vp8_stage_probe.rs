@@ -132,6 +132,13 @@ fn median_profile(frame: &[u8], w: u32, h: u32, rounds: usize) -> kimg::codecs::
         "idct_i4_ns",
         "idct_wht_ns",
         "idct_uv_ns",
+        "i4_predict_ns",
+        "i4_idct_add_ns",
+        "i4_predict_blocks",
+        "i4_idct_add_blocks",
+        "i4_above_blocks",
+        "i4_fill0_blocks",
+        "i4_add_ac_blocks",
         "mb_i16",
         "mb_i4",
         "mb_wht",
@@ -171,6 +178,13 @@ fn field(p: &kimg::codecs::webp::Vp8StageProfile, f: &str) -> u64 {
         "idct_i4_ns" => p.idct_i4_ns,
         "idct_wht_ns" => p.idct_wht_ns,
         "idct_uv_ns" => p.idct_uv_ns,
+        "i4_predict_ns" => p.i4_predict_ns,
+        "i4_idct_add_ns" => p.i4_idct_add_ns,
+        "i4_predict_blocks" => p.i4_predict_blocks,
+        "i4_idct_add_blocks" => p.i4_idct_add_blocks,
+        "i4_above_blocks" => p.i4_above_blocks,
+        "i4_fill0_blocks" => p.i4_fill0_blocks,
+        "i4_add_ac_blocks" => p.i4_add_ac_blocks,
         "mb_i16" => p.mb_i16,
         "mb_i4" => p.mb_i4,
         "mb_wht" => p.mb_wht,
@@ -203,6 +217,13 @@ fn set_field(p: &mut kimg::codecs::webp::Vp8StageProfile, f: &str, v: u64) {
         "idct_i4_ns" => p.idct_i4_ns = v,
         "idct_wht_ns" => p.idct_wht_ns = v,
         "idct_uv_ns" => p.idct_uv_ns = v,
+        "i4_predict_ns" => p.i4_predict_ns = v,
+        "i4_idct_add_ns" => p.i4_idct_add_ns = v,
+        "i4_predict_blocks" => p.i4_predict_blocks = v,
+        "i4_idct_add_blocks" => p.i4_idct_add_blocks = v,
+        "i4_above_blocks" => p.i4_above_blocks = v,
+        "i4_fill0_blocks" => p.i4_fill0_blocks = v,
+        "i4_add_ac_blocks" => p.i4_add_ac_blocks = v,
         "mb_i16" => p.mb_i16 = v,
         "mb_i4" => p.mb_i4 = v,
         "mb_wht" => p.mb_wht = v,
@@ -287,6 +308,18 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
         "VP8_ENT_OPCOST c_bit={:.3}ns c_acct={:.3}ns c_dq={:.3}ns",
         c_bit, c_acct, c_dq
     );
+    // Task C 折算基座（K83 修正，2026-11-02）：i4 段内五类操作单位耗时，与产线同构建测量。
+    let oc = kimg::codecs::webp::vp8_probe_i4_op_costs(2_000_000);
+    println!(
+        "VP8_I4_OPCOST c_above={:.2}ns c_predict={:.2}ns c_add_dc={:.2}ns c_add_ac={:.2}ns c_fill={:.2}ns",
+        oc.c_above, oc.c_predict, oc.c_add_dc, oc.c_add_ac, oc.c_fill
+    );
+    // 探针自身开销（K83 修正续）：粗钟 Instant + 段内原子计数都落在 i4_total 总账内，须扣除。
+    let (c_atomic, c_instant) = kimg::codecs::webp::vp8_probe_clock_costs(2_000_000);
+    println!(
+        "VP8_CLOCK_COST c_atomic={:.2}ns c_instant={:.2}ns",
+        c_atomic, c_instant
+    );
     let mut tot_entropy = 0.0f64;
     let mut tot_idct = 0.0f64;
     let mut tot_total = 0.0f64;
@@ -295,12 +328,18 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
     let mut tot_idct_i16 = 0.0f64;
     let mut tot_idct_i4 = 0.0f64;
     let mut tot_i4_ratio = 0.0f64;
+    let mut tot_i4_predict = 0.0f64;
+    let mut tot_i4_idct_add = 0.0f64;
+    let mut tot_i4_shell = 0.0f64;
+    let mut tot_i4_total = 0.0f64;
+    let mut tot_shell_fixed = 0.0f64;
     let mut tot_bool = 0.0f64;
     let mut tot_acct = 0.0f64;
     let mut tot_dq = 0.0f64;
     for (name, frame, w, h, has_alpha) in files {
         let p = median_profile(frame, *w, *h, ROUNDS);
         let ms = |n: u64| n as f64 / 1e6;
+        let msf = |n: f64| n / 1e6;
         // 干净全链 = 各段之和；原始墙钟另列。
         let sum = p.entropy_ns + p.predict_ns + p.idct_ns + p.filter_ns + p.yuv_ns;
         let pct = |n: u64| n as f64 / sum as f64 * 100.0;
@@ -319,6 +358,63 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
             tot_idct_i16 += p.idct_i16_ns as f64 / idc.max(1) as f64;
             tot_idct_i4 += p.idct_i4_ns as f64 / idc.max(1) as f64;
             tot_i4_ratio += p.mb_i4 as f64 / mb_total as f64;
+        }
+        // Task C 细分（i4 段内部，2026-11-02，K83 修正方案）：撤 per-block Instant（插桩通胀，
+        // 旧稿 per-block 残差 ~18% 不可信），改【外层 `idct_i4` 粗钟总账 + 原子计数 × 单操作成本折算】。
+        // 折算：payload = predict块×c_predict + add_AC块×c_add_ac + add_DC块×c_add_dc；
+        // fill(0) / above 单列；shell = i4_total − payload（掩码/分支/分发/指针/循环控制）；
+        // shell_fixed = shell − above − fill（纯循环壳操作）。
+        {
+            let i4total = p.idct_i4_ns as f64;
+            let predict_ms = p.i4_predict_blocks as f64 * oc.c_predict;
+            let add_dc_n = p.i4_idct_add_blocks.saturating_sub(p.i4_add_ac_blocks) as f64;
+            let add_ms = p.i4_add_ac_blocks as f64 * oc.c_add_ac + add_dc_n * oc.c_add_dc;
+            let fill_ms = p.i4_fill0_blocks as f64 * oc.c_fill;
+            let above_ms = p.i4_above_blocks as f64 * oc.c_above;
+            let payload_ms = predict_ms + add_ms;
+            let shell_raw_ms = (i4total - payload_ms).max(0.0);
+            // 探针自身开销（同行校准）：段内原子计数次数 × c_atomic + per-MB 粗钟 2×Instant。
+            let fetch_adds =
+                (p.i4_predict_blocks + p.i4_above_blocks + p.i4_idct_add_blocks + p.i4_fill0_blocks
+                    + p.i4_add_ac_blocks) as f64;
+            let counter_ms = fetch_adds * c_atomic;
+            let instant_ms = p.mb_i4 as f64 * 2.0 * c_instant;
+            let clock_ovh_ms = counter_ms + instant_ms;
+            let shell_ms = (shell_raw_ms - clock_ovh_ms).max(0.0);
+            // 真循环壳 = shell_true − above − fill（纯掩码/分支/分发/指针/循环/常数拷贝）。
+            let shell_fixed = (shell_ms - fill_ms - above_ms).max(0.0);
+            let shell_fullchain = shell_ms / sum as f64 * 100.0;
+            let shell_raw_fullchain = shell_raw_ms / sum as f64 * 100.0;
+            let ac_ratio = p.i4_idct_add_blocks as f64 / p.i4_above_blocks.max(1) as f64 * 100.0;
+            println!(
+                "VP8_I4_SHELL {name} {}x{} i4_total(coarse)={:.3}ms predict+add_ref={:.3}ms \
+                 shell_net_raw={:.3}ms({:.2}%_fc) -clock_ovh={:.3}ms(=counters+instant) \
+                 shell_net_true={:.3}ms({:.2}%_fc) shell_fixed={:.3}ms above={:.3}ms fill={:.3}ms \
+                 payload_predict={:.3}ms payload_add={:.3}ms blk_pred={} blk_add={} add_ac={} ac_ratio={:.1}%",
+                w,
+                h,
+                msf(i4total),
+                msf(payload_ms),
+                msf(shell_raw_ms),
+                shell_raw_fullchain,
+                msf(clock_ovh_ms),
+                msf(shell_ms),
+                shell_fullchain,
+                msf(shell_fixed),
+                msf(above_ms),
+                msf(fill_ms),
+                msf(predict_ms),
+                msf(add_ms),
+                p.i4_predict_blocks,
+                p.i4_idct_add_blocks,
+                p.i4_add_ac_blocks,
+                ac_ratio
+            );
+            tot_i4_predict += predict_ms / i4total.max(1.0) * 100.0;
+            tot_i4_idct_add += add_ms / i4total.max(1.0) * 100.0;
+            tot_i4_shell += shell_fullchain;
+            tot_i4_total += i4total / sum as f64 * 100.0;
+            tot_shell_fixed += shell_fixed / shell_ms.max(1.0);
         }
         // Task B 细分（熵内部）：bool 读 / token 记账·游标·索引 / 去量化+zigzag 写回。
         // 换算 = 操作计数 × 校准单位耗时（模式+残差 bool 读同源计数）。
@@ -483,6 +579,15 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
         tot_idct_i16 / n * 100.0,
         tot_idct_i4 / n * 100.0,
         tot_i4_ratio / n * 100.0
+    );
+    println!(
+        "VP8_I4_SHELL SUMMARY files={} mean_i4_fullchain={:.2}% mean_shell_true_fullchain={:.2}% mean_shell_fixed_share={:.1}% mean_predict_share_of_i4={:.1}% mean_add_share_of_i4={:.1}%",
+        files.len(),
+        tot_i4_total / n,
+        tot_i4_shell / n,
+        tot_shell_fixed / n * 100.0,
+        tot_i4_predict / n,
+        tot_i4_idct_add / n
     );
     println!(
         "VP8_ENT_SUB SUMMARY files={} mean_bool_read_share={:.1}% mean_token_acct_share={:.1}% mean_dequant_zigzag_share={:.1}%",

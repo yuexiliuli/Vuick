@@ -80,6 +80,23 @@ pub fn vp8_probe_entropy_op_costs(reps: u32) -> (f64, f64, f64) {
     vp8::probe_entropy_op_costs(reps)
 }
 
+/// i4 段内五类操作的单位耗时探针（`stage_profile` feature 门控；imgbench `vp8_stage_probe` 用，
+/// K83 修正方案：外层粗钟 + 原子计数折算）。返回各操作 ns，见 `I4OpCosts`。
+#[cfg(feature = "stage_profile")]
+pub use vp8::I4OpCosts;
+
+/// `probe_i4_op_costs` 的模块级入口（供 imgbench `vp8_stage_probe`）。
+#[cfg(feature = "stage_profile")]
+pub fn vp8_probe_i4_op_costs(reps: u32) -> I4OpCosts {
+    vp8::probe_i4_op_costs(reps)
+}
+
+/// 探针自身开销校准入口（`stage_profile` feature 门控）：`(原子计数 ns/次, Instant::now() ns/次)`。
+#[cfg(feature = "stage_profile")]
+pub fn vp8_probe_clock_costs(reps: u32) -> (f64, f64) {
+    vp8::probe_clock_costs(reps)
+}
+
 // 外部语料定位助手（与集成测试共享，见 tests/fixtures/webp/mod.rs）。
 #[cfg(test)]
 #[path = "../../../tests/fixtures/webp/mod.rs"]

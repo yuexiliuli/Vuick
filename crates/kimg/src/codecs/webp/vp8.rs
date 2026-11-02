@@ -1634,6 +1634,24 @@ pub(crate) mod stage_clock {
     static P_IDCT_WHT: AtomicU64 = AtomicU64::new(0);
     #[cfg(feature = "stage_profile")]
     static P_IDCT_UV: AtomicU64 = AtomicU64::new(0);
+    // i4 段内子段（2026-11-02，i4 帧内预测向量化决策）：B_PRED 子块预测 vs IDCT-add 各占多少。
+    #[cfg(feature = "stage_profile")]
+    static P_I4_PREDICT: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_I4_IDCT_ADD: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_I4_PREDICT_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_I4_IDCT_ADD_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    // i4 段内 shell 计数（2026-11-02，K83 修正：撤 per-block Instant、改「外层粗钟 + 原子计数折算」）：
+    // subblock_above 抽取次数（恒=predict 块数）/ `mb[i].fill(0)` 清零次数（恒=add 块数）/
+    // has-ac `inverse_dct_add_one` 路径块数（拆 add 的 AC 与 DC-only 分账）。
+    #[cfg(feature = "stage_profile")]
+    static P_I4_ABOVE: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_I4_FILL0: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "stage_profile")]
+    static P_I4_ADD_AC: AtomicU64 = AtomicU64::new(0);
     // 每文件宏块模式计数（i4/i16/WHT 执行次数）；供「i4 宏块占比 / WHT 次数」汇总。
     #[cfg(feature = "stage_profile")]
     static P_MB_I16: AtomicU64 = AtomicU64::new(0);
@@ -1701,6 +1719,13 @@ pub(crate) mod stage_clock {
         P_IDCT_I4.store(0, Relaxed);
         P_IDCT_WHT.store(0, Relaxed);
         P_IDCT_UV.store(0, Relaxed);
+        P_I4_PREDICT.store(0, Relaxed);
+        P_I4_IDCT_ADD.store(0, Relaxed);
+        P_I4_PREDICT_BLOCKS.store(0, Relaxed);
+        P_I4_IDCT_ADD_BLOCKS.store(0, Relaxed);
+        P_I4_ABOVE.store(0, Relaxed);
+        P_I4_FILL0.store(0, Relaxed);
+        P_I4_ADD_AC.store(0, Relaxed);
         P_MB_I16.store(0, Relaxed);
         P_MB_I4.store(0, Relaxed);
         P_MB_WHT.store(0, Relaxed);
@@ -1738,6 +1763,16 @@ pub(crate) mod stage_clock {
         pub idct_i4: u64,
         pub idct_wht: u64,
         pub idct_uv: u64,
+        pub i4_predict_ns: u64,
+        pub i4_idct_add_ns: u64,
+        pub i4_predict_blocks: u64,
+        pub i4_idct_add_blocks: u64,
+        /// subblock_above 抽取次数（恒 = predict 块数）笼罩子块循环壳构成分账。
+        pub i4_above_blocks: u64,
+        /// `mb[i].fill(0)` 清零次数（恒 = add 块数）。
+        pub i4_fill0_blocks: u64,
+        /// has-ac `inverse_dct_add_one` 块数（add = AC 路径 + 标量 DC-only 捷径）。
+        pub i4_add_ac_blocks: u64,
         pub mb_i16: u64,
         pub mb_i4: u64,
         pub mb_wht: u64,
@@ -1760,6 +1795,13 @@ pub(crate) mod stage_clock {
             idct_i4: P_IDCT_I4.load(Relaxed),
             idct_wht: P_IDCT_WHT.load(Relaxed),
             idct_uv: P_IDCT_UV.load(Relaxed),
+            i4_predict_ns: P_I4_PREDICT.load(Relaxed),
+            i4_idct_add_ns: P_I4_IDCT_ADD.load(Relaxed),
+            i4_predict_blocks: P_I4_PREDICT_BLOCKS.load(Relaxed),
+            i4_idct_add_blocks: P_I4_IDCT_ADD_BLOCKS.load(Relaxed),
+            i4_above_blocks: P_I4_ABOVE.load(Relaxed),
+            i4_fill0_blocks: P_I4_FILL0.load(Relaxed),
+            i4_add_ac_blocks: P_I4_ADD_AC.load(Relaxed),
             mb_i16: P_MB_I16.load(Relaxed),
             mb_i4: P_MB_I4.load(Relaxed),
             mb_wht: P_MB_WHT.load(Relaxed),
@@ -1865,6 +1907,39 @@ pub(crate) mod stage_clock {
         #[cfg(not(feature = "stage_profile"))]
         {
             f()
+        }
+    }
+    /// i4 段内·B_PRED 子块预测（per-block `predict_subblock` + `subblock_above`）。
+    /// K83 修正（2026-11-02）：不再逐块 `Instant::now()`（插桩通胀），只累加原子计数
+    /// （predict 块 + above 抽取各一次，恒 16×mark）；时间由外层 `idct_i4` 粗钟与
+    /// `probe_i4_op_costs` 折算。feature 外纯透传（不改变行为）。
+    #[inline(always)]
+    pub fn i4_predict<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            P_I4_PREDICT_BLOCKS.fetch_add(1, Relaxed);
+            P_I4_ABOVE.fetch_add(1, Relaxed);
+        }
+        f()
+    }
+    /// i4 段内·IDCT-add（`inverse_dct_add_one` / 标量 `inverse_dct_add` + `fill(0)`）。
+    /// K83 修正（2026-11-02）：同 `i4_predict`，只累加原子计数（add 块 + fill(0) 各一次）。
+    #[inline(always)]
+    pub fn i4_idct_add<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            P_I4_IDCT_ADD_BLOCKS.fetch_add(1, Relaxed);
+            P_I4_FILL0.fetch_add(1, Relaxed);
+        }
+        f()
+    }
+    /// i4 段内·has-ac `inverse_dct_add_one` 路径计数（拆 add 的 AC 与 DC-only 分账）。
+    /// feature 外空操作（不改变行为）。
+    #[inline(always)]
+    pub fn i4_add_ac() {
+        #[cfg(feature = "stage_profile")]
+        {
+            P_I4_ADD_AC.fetch_add(1, Relaxed);
         }
     }
     /// 宏块模式计数：每宏块恰好一次（i16⇔y_mode!=4 之外即 i4）。feature 外空操作。
@@ -2177,6 +2252,16 @@ pub struct Vp8StageProfile {
     pub idct_i4_ns: u64,
     pub idct_wht_ns: u64,
     pub idct_uv_ns: u64,
+    /// i4 段内子段墙钟：B_PRED 子块预测 vs IDCT-add（仅 `stage_profile` 探针填充）。
+    pub i4_predict_ns: u64,
+    pub i4_idct_add_ns: u64,
+    /// i4 段内块计数：predict 子块次数（恒 16×mb_i4）/ idct-add 子块次数（非零块）。
+    pub i4_predict_blocks: u64,
+    pub i4_idct_add_blocks: u64,
+    /// i4 段内 shell 计数（折算用）：above 抽取 / fill(0) / has-ac add 块数。
+    pub i4_above_blocks: u64,
+    pub i4_fill0_blocks: u64,
+    pub i4_add_ac_blocks: u64,
     /// 宏块模式计数（每文件）：i16 宏块数 / i4(B_PRED) 宏块数 / WHT 执行次数。
     pub mb_i16: u64,
     pub mb_i4: u64,
@@ -2259,6 +2344,13 @@ pub fn stage_decode(frame: &[u8], width: u32, height: u32) -> Result<Vp8StagePro
         idct_i4_ns: sub.idct_i4,
         idct_wht_ns: sub.idct_wht,
         idct_uv_ns: sub.idct_uv,
+        i4_predict_ns: sub.i4_predict_ns,
+        i4_idct_add_ns: sub.i4_idct_add_ns,
+        i4_predict_blocks: sub.i4_predict_blocks,
+        i4_idct_add_blocks: sub.i4_idct_add_blocks,
+        i4_above_blocks: sub.i4_above_blocks,
+        i4_fill0_blocks: sub.i4_fill0_blocks,
+        i4_add_ac_blocks: sub.i4_add_ac_blocks,
         mb_i16: sub.mb_i16,
         mb_i4: sub.mb_i4,
         mb_wht: sub.mb_wht,
@@ -2317,6 +2409,136 @@ pub fn probe_entropy_op_costs(reps: u32) -> (f64, f64, f64) {
     let c_dq = t.elapsed().as_nanos() as f64 / reps as f64;
     std::hint::black_box(acc);
     (c_bit, c_acct, c_dq)
+}
+
+/// i4 段内各操作的单位耗时（ns/op），供「原子计数 → 时间」折算。
+#[cfg(feature = "stage_profile")]
+#[derive(Default, Clone, Copy)]
+pub struct I4OpCosts {
+    /// `subblock_above` 一抽（含 block_y==0 / 中列 / 右列三分支）。
+    pub c_above: f64,
+    /// `predict_subblock` 本体（above 已备好；左列读取 + 10 模式写回，等权平均）。
+    pub c_predict: f64,
+    /// `inverse_dct_add(has_ac=false)` DC-only 标量捷径。
+    pub c_add_dc: f64,
+    /// `inverse_dct_add_one` has-ac 路径（SSE2 单块核，与产线同门控）。
+    pub c_add_ac: f64,
+    /// `[i16;16].fill(0)`。
+    pub c_fill: f64,
+}
+
+/// i4 段内五类操作的单位耗时探针（`stage_profile` feature 门控；供 imgbench `vp8_stage_probe`
+/// 把 predict / idct_add / fill(0) / subblock_above 原子计数折算成时间）。K83 修正方案
+/// （2026-11-02）：per-block 墙钟插桩通胀（残差 ~18% 不可信）→ 外层 `idct_i4` 粗钟给总账，
+/// 块内操作按本探针单位成本折算，差即循环壳净成本。与产线同构建测量（同 release / 同 feature），
+/// 模拟单 i4 宏块 16 块暖缓存布局（pitch=17、块按 bx/by 顺序扫），代表真实解码 L1 缓存域。
+#[cfg(feature = "stage_profile")]
+pub fn probe_i4_op_costs(reps: u32) -> I4OpCosts {
+    use std::time::Instant;
+    let pitch = 17usize;
+    let mut plane = vec![128u8; pitch * 64];
+    let above_y = [42u8; 21];
+    // 每块一个固定 above 行（形态同真实 `subblock_above` 输出；模式 0..10 等权循环）。
+    let mut a_blk = [[0u8; 9]; 16];
+    for (i, a) in a_blk.iter_mut().enumerate() {
+        for (j, v) in a.iter_mut().enumerate() {
+            *v = (i as u8).wrapping_mul(13).wrapping_add(j as u8);
+        }
+    }
+    let modes = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5];
+    let mut acc = 0u64;
+
+    // 1) subblock_above 本体（三分支按块位均摊）。
+    let t = Instant::now();
+    for k in 0..reps {
+        let bx = (k & 3) as usize;
+        let by = ((k >> 2) & 3) as usize;
+        let a = subblock_above(&plane, pitch, by * 4, bx * 4, bx, by, &above_y);
+        acc = acc.wrapping_add(u64::from(a[0] + a[8]));
+    }
+    std::hint::black_box(&plane);
+    let c_above = t.elapsed().as_nanos() as f64 / reps as f64;
+
+    // 2) predict_subblock 本体（above 已备好，仅左列读取 + 写回）。
+    let t = Instant::now();
+    for k in 0..reps {
+        let bx = (k & 3) as usize;
+        let by = ((k >> 2) & 3) as usize;
+        let i = (k & 15) as usize;
+        super::simd::predict_subblock(&mut plane, pitch, by * 4, bx * 4, modes[i], &a_blk[i]);
+    }
+    std::hint::black_box(&plane);
+    let c_predict = t.elapsed().as_nanos() as f64 / reps as f64;
+
+    // 3) inverse_dct_add DC-only 标量捷径（has_ac=false，非零 DC）。
+    let mut coeff = [0i16; 16];
+    coeff[0] = 19;
+    let t = Instant::now();
+    for k in 0..reps {
+        let bx = (k & 3) as usize;
+        let by = ((k >> 2) & 3) as usize;
+        inverse_dct_add(&coeff, &mut plane, pitch, by * 4, bx * 4, false);
+    }
+    std::hint::black_box(&plane);
+    let c_add_dc = t.elapsed().as_nanos() as f64 / reps as f64;
+
+    // 4) inverse_dct_add_one（has-ac，AC 系数非零；SSE2 单块核，与产线同门控）。
+    let mut c = [0i16; 16];
+    c[0] = 17;
+    c[1] = 23;
+    c[2] = -9;
+    c[3] = 11;
+    c[4] = -7;
+    let t = Instant::now();
+    for k in 0..reps {
+        let bx = (k & 3) as usize;
+        let by = ((k >> 2) & 3) as usize;
+        super::simd::inverse_dct_add_one(&c, &mut plane, pitch, by * 4, bx * 4);
+    }
+    std::hint::black_box(&plane);
+    let c_add_ac = t.elapsed().as_nanos() as f64 / reps as f64;
+
+    // 5) [i16;16].fill(0)。
+    let mut blk = [7i16; 16];
+    let t = Instant::now();
+    for _ in 0..reps {
+        std::hint::black_box(&mut blk);
+        blk.fill(0);
+        acc = acc.wrapping_add(u64::from(blk[0] as u16));
+    }
+    std::hint::black_box(&blk);
+    let c_fill = t.elapsed().as_nanos() as f64 / reps as f64;
+
+    std::hint::black_box(acc);
+    I4OpCosts {
+        c_above,
+        c_predict,
+        c_add_dc,
+        c_add_ac,
+        c_fill,
+    }
+}
+
+/// 探针自身开销校准（`stage_profile` feature 门控）：i4 段外层粗钟是 per-MB `Instant::now()`、
+/// 段内是 per-block Relaxed 原子计数 —— 二者本身都落在粗钟总账内，须从 shell 中扣除以得
+/// 「真循环壳」。返回 ns：`(单次同线程 Relaxed fetch_add, 单次 Instant::now())`。
+#[cfg(feature = "stage_profile")]
+pub fn probe_clock_costs(reps: u32) -> (f64, f64) {
+    use std::time::Instant;
+    use std::sync::atomic::AtomicU64;
+    let cnt = AtomicU64::new(0);
+    let t = Instant::now();
+    for _ in 0..reps {
+        cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let c_atomic = t.elapsed().as_nanos() as f64 / reps as f64;
+    std::hint::black_box(cnt.load(std::sync::atomic::Ordering::Relaxed));
+    let t = Instant::now();
+    for _ in 0..reps {
+        std::hint::black_box(Instant::now());
+    }
+    let c_instant = t.elapsed().as_nanos() as f64 / reps as f64;
+    (c_atomic, c_instant)
 }
 
 /// 未初始化 `Vec<u8>`：调用方必须保证返回后 `len` 字节在被读取前全部写入（见各调用点
@@ -2510,16 +2732,21 @@ fn reconstruct_macroblock(
                     let by = block >> 2;
                     let row0 = dy + by * 4;
                     let col0 = dx + bx * 4;
-                    let above = subblock_above(y, y_pitch, row0, col0, bx, by, above_y);
-                    super::simd::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
+                    stage_clock::i4_predict(|| {
+                        let above = subblock_above(y, y_pitch, row0, col0, bx, by, above_y);
+                        super::simd::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
+                    });
                     let coeff = mb[block];
                     if ((nonzero_mask >> block) & 1) != 0 || coeff[0] != 0 {
-                        if ((ac_mask >> block) & 1) != 0 {
-                            super::simd::inverse_dct_add_one(&coeff, y, y_pitch, row0, col0);
-                        } else {
-                            inverse_dct_add(&coeff, y, y_pitch, row0, col0, false);
-                        }
-                        mb[block].fill(0);
+                        stage_clock::i4_idct_add(|| {
+                            if ((ac_mask >> block) & 1) != 0 {
+                                stage_clock::i4_add_ac();
+                                super::simd::inverse_dct_add_one(&coeff, y, y_pitch, row0, col0);
+                            } else {
+                                inverse_dct_add(&coeff, y, y_pitch, row0, col0, false);
+                            }
+                            mb[block].fill(0);
+                        });
                     }
                 }
             });
