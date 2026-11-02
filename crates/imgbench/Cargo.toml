@@ -59,8 +59,9 @@ libjpeg-turbo-ref = ["dep:libjpeg-turbo-rs"]
 crc32fast = "1.4"
 # inflate 探针的纯 Rust 基准（与 kimg 锁版本一致：lock 0.3.7，也是 png crate 自身的解压后端）。
 fdeflate = "0.3"
-# image-webp crate 0.2.4 直连对照通道（纯 Rust WebP 解码，kimg 的 WebP 后端同为 0.2.4，见
-# kimg/src/codecs/webp.rs）。仅 bench 使用，故只入 dev-dependencies；默认图里该版本已随 kimg 出现。
+# image-webp crate 0.2.4 直连对照通道（纯 Rust WebP 解码）。kimg 的 WebP 已自研自包含
+# （codecs/webp/，运行时零 image-webp 依赖），本通道仅作 bench 参照 oracle；同 kimg 的
+# dev-dep 先例。仅 bench 使用，故只入 dev-dependencies。
 image-webp = "0.2.4"
 
 [[bench]]
