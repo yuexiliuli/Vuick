@@ -133,70 +133,37 @@ impl<'a> Vp8BoolDecoder<'a> {
     /// 热路径按值读位（概率 0..=255）：熵态 {value,bits,range_minus1} 由调用者以值携带
     /// （`Copy`，小结构），整个宏块内联后落寄存器、无跨调用点内存往返——对照 C#
     /// `ReadBit(ref decoder, ref value, ref bits, ref range, prob)` 的 Load/Store 模式。
+    /// cold 入口委托标量热路径 `ent_read_bit`（算术单源），一次调用只读一次 OnceLock。
     #[inline(always)]
     pub(crate) fn read_bit_val(mut self, probability: u8) -> (Self, u32) {
-        stage_clock::bit();
-        let prob = u32::from(probability);
-        if self.bits < 0 {
-            self = self.refill();
-        }
-        let range_minus1 = self.range_minus1;
-        let split_minus1 = (range_minus1 * prob) >> 8;
-        let (range, bit);
-        if (self.value >> (self.bits as u32)) > u64::from(split_minus1) {
-            self.value -= (u64::from(split_minus1 + 1)) << (self.bits as u32);
-            range = range_minus1 - split_minus1;
-            bit = 1;
-        } else {
-            range = split_minus1 + 1;
-            bit = 0;
-        }
-        // range ∈ [1,255]，移回 [128,255]。范围分裂后约 2/3 的位 range≥128 → lzcnt=24 → shift=0，
-        // renorm 为 no-op（只须把 range_minus1 落到 (range<<0)-1，value/bits 不变）。此处外提
-        // `range < 128` 分支（range≥128 是多数，预测友好）：跳过 lzcnt+shl+位数调整；分支按构造
-        // 恒等——无条件路径 shift=lzcnt(range)-24，range≥128 时 shift=0。`KIMG_WEBP_ENT_RENORM_SKIP=0`
-        // 时恒走左支（装回无条件 lzcnt renorm）作 A/B 对照。
-        if range < 128 || !ent_renorm_skip() {
-            let shift = range.leading_zeros() - 24;
-            self.range_minus1 = (range << shift) - 1;
-            self.bits -= shift as i32;
-        } else {
-            self.range_minus1 = range - 1;
-        }
+        let renorm_skip = ent_renorm_skip();
+        let bit = ent_read_bit(
+            self.data,
+            &mut self.pos,
+            &mut self.value,
+            &mut self.bits,
+            &mut self.range_minus1,
+            renorm_skip,
+            probability,
+        );
         (self, bit)
     }
 
     /// 热路径按值读「概率 128 符号位」并算术取符号（C# `ReadSigned`）：符号是抛硬币，
     /// 分支约半数预测失败；用 `mask = (split - (window))>>31` 全表达式消除分支，
     /// 与 `read_bit(128)+符号分支` 逐位同语义。`magnitude` 为系数幅值，返回取符号结果。
+    /// cold 入口委托标量热路径 `ent_read_signed`（算术单源）。
     #[inline(always)]
     pub(crate) fn read_signed_val(mut self, magnitude: i32) -> (Self, i32) {
-        stage_clock::bit();
-        if self.bits < 0 {
-            self = self.refill();
-        }
-        // range 持有减一状态 [127,254]；prob=128 时 split-1 = (range*128)>>8 = range>>1。
-        let range = self.range_minus1 as i32;
-        let split_minus1 = range >> 1;
-        // mask = -1 ⇔ 窗口 > split-1（bit=1）；否则 0。窗口 < 256，强转 i32 安全。
-        let mask = (split_minus1 - (self.value >> (self.bits as u32)) as i32) >> 31;
-        // bit=1 时减 (split+1) << bits（C# `(split+1) & mask` 的存储位数形式）。
-        let dec_bit = (split_minus1 + 1) & mask;
-        self.value -= (dec_bit as u32 as u64) << (self.bits as u32);
-        // bit=1: range - split；bit=0: split+1。
-        let new_range = (split_minus1 + 1 + ((range - 2 * split_minus1 - 1) & mask)) as u32;
-        // prob=128 符号位 renorm 特化（推导，逐操作对齐通用 lzcnt 路径）：
-        //   r = range_minus1 ∈ [127,254]（减一状态不变量）；split-1 = r>>1。
-        //   bit=0 → nr = (r>>1)+1；bit=1 → nr = r-(r>>1)。两者合成 nr ∈ [64,128]
-        //   （唯一退化 nr=128 ⇔ r=254 ∧ bit=0，即解码器初始态首个读——通用路径在此 shift=0）。
-        //   通用 shift = lzcnt(nr)-24：nr ∈ [64,127] → 25-24 = 1；nr=128 → 24-24 = 0；
-        //   故 shift = 1-(nr>>7) ∈ {0,1}（nr≥128 ⇔ nr=128 ⇔ bit7 置位），逐字节恒等于通用路径：
-        //   range 分裂 → 新 range shift=1（或退化 shift=0）→ value 不变 → bits 减 shift。
-        let sh = 1u32 - (new_range >> 7);
-        self.range_minus1 = (new_range << sh) - 1;
-        self.bits -= sh as i32;
-        // mask=0 → magnitude；mask=-1 → ~m + 1 = -m（补码）。
-        (self, (magnitude ^ mask) - mask)
+        let v = ent_read_signed(
+            self.data,
+            &mut self.pos,
+            &mut self.value,
+            &mut self.bits,
+            &mut self.range_minus1,
+            magnitude,
+        );
+        (self, v)
     }
 
     /// 读带符号值：`bitCount` 位无符号 + 1 位符号（概率 128）。
@@ -216,48 +183,6 @@ impl<'a> Vp8BoolDecoder<'a> {
             v = (v << 1) | self.read_bit(128) as i32;
         }
         v
-    }
-
-    /// 需要输入：`bits < 0` 时 refill。整 8 字节非对齐直读（区内安全），只消费 7 字节。
-    #[inline(always)]
-    fn refill(self) -> Self {
-        if self.data.len() - self.pos >= 8 {
-            // 安全性：分支保证 pos + 8 <= len，且输入缓冲由调用方保证至少按需可读 8 字节
-            // （同 `data[pos..pos+8]` 切片界）；`read_unaligned` 自行处理非对齐载荷，
-            // 只读取内存不越界。`pos` 恒 <= len（仅消费路径推进），`as_ptr().add` 不越界。
-            // `u64::from_be` = C# `ReverseEndianness(ReadUnaligned<ulong>)` 的大端解释。
-            let raw = unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
-            let raw = u64::from_be(raw);
-            let mut s = self;
-            s.value = (s.value << 56) | (raw >> 8);
-            s.pos += 7;
-            s.bits += 56;
-            s
-        } else {
-            self.refill_tail()
-        }
-    }
-
-    /// 尾部逐字节补充，越过末尾补零（仅数据末尾触发，冷路径但也必须内联：byval 结构体参数
-    /// 在 Win64 上会把调用方结构体槽位地址传进来 → 熵态 alloca 逃逸 → SROA 放弃提升、逐位回写栈；
-    /// `#[inline(always)]` 消除该函数边界，保住寄存器驻留）。
-    #[inline(always)]
-    fn refill_tail(mut self) -> Self {
-        loop {
-            let next = if self.pos < self.data.len() {
-                let b = self.data[self.pos];
-                self.pos += 1;
-                u64::from(b)
-            } else {
-                0
-            };
-            self.value = (self.value << 8) | next;
-            self.bits += 8;
-            if self.bits >= 0 {
-                break;
-            }
-        }
-        self
     }
 }
 
@@ -285,6 +210,115 @@ impl Clone for Vp8BoolDecoder<'_> {
 
 // 全字段 Copy（含 &'a [u8]），热路径按值携带熵态必须。
 impl Copy for Vp8BoolDecoder<'_> {}
+
+// ---------------------------------------------------------------------------
+// 熵热路径标量化（TOP1/TOP4：反 40B-byval 结构 + (Self,u32) 元组逐位回写栈）
+// ---------------------------------------------------------------------------
+// SimdCodecs 对热环的解法是 `ReadBit(ref Vp8BoolDecoder source, ref ulong value, ref int bits,
+// ref uint range, int probability)`：熵态三标量 {value,bits,range} 由调用方局部变量携带（读位
+// 时只动局部，宏块进出各一次 Load/Store），`source` 仅保输入游标 {data,pos}，每 56 位
+// （refill）才触碰一次。本实现同构：`ent_read_bit`/`ent_read_signed`/`ent_refill` 为纯标量
+// in/out（调用方局部变量，mem2reg 恒落寄存器），`data`/`pos` 只在 refill 分支使用——避免
+// 旧 `read_bit_val`/`tokens` 的「40B 结构按值 + (Self,u32) 返回值」形态把 {value,bits,range}
+// 每比特挤出寄存器经栈 store→load 回环（Haswell store-forward 3-5c，在误预测后清空的
+// OoO 窗口全量暴露——照片端被窗口吞掉、高熵噪声端全量显现，正解释 2.09×/1.24× 差序）。
+// `renorm_skip`（ent_renorm_skip() 的 OnceLock 判定）由调用方每宏块入口求一次并全程以 bool
+// 参数携带（TOP4：主环零 OnceLock load）。cold 路径（帧头解析等）经 `read_bit_val`/
+// `read_signed_val` 委托本组函数，算术单源不分裂。
+
+/// refill：`bits < 0` 时读入后续位（快速路径整 8 字节非对齐直读、只消费 7 字节；尾部逐字节、
+/// 越过末尾补零）。与 `Vp8BoolDecoder::refill`/`refill_tail` 逐位同算术。
+#[inline(always)]
+fn ent_refill(data: &[u8], pos: &mut usize, value: &mut u64, bits: &mut i32) {
+    if data.len() - *pos >= 8 {
+        // 安全性：分支保证 *pos + 8 <= len；`read_unaligned` 自行处理非对齐载荷（同 refill）。
+        let raw = unsafe { (data.as_ptr().add(*pos) as *const u64).read_unaligned() };
+        let raw = u64::from_be(raw);
+        *value = (*value << 56) | (raw >> 8);
+        *pos += 7;
+        *bits += 56;
+    } else {
+        loop {
+            let next = if *pos < data.len() {
+                let b = data[*pos];
+                *pos += 1;
+                u64::from(b)
+            } else {
+                0
+            };
+            *value = (*value << 8) | next;
+            *bits += 8;
+            if *bits >= 0 {
+                break;
+            }
+        }
+    }
+}
+
+/// 热路径读位（概率 0..=255）：`read_bit_val` 的标量 in/out 版，逐位算术完全一致，唯熵态不再
+/// 装进 40B 结构按值周转。`renorm_skip` 由调用方宏块入口判定一次（TOP4）。
+#[inline(always)]
+fn ent_read_bit(
+    data: &[u8],
+    pos: &mut usize,
+    value: &mut u64,
+    bits: &mut i32,
+    range_minus1: &mut u32,
+    renorm_skip: bool,
+    probability: u8,
+) -> u32 {
+    stage_clock::bit();
+    let prob = u32::from(probability);
+    if *bits < 0 {
+        ent_refill(data, pos, value, bits);
+    }
+    let rm1 = *range_minus1;
+    let split_minus1 = (rm1 * prob) >> 8;
+    let (range, bit);
+    if (*value >> (*bits as u32)) > u64::from(split_minus1) {
+        *value -= (u64::from(split_minus1 + 1)) << (*bits as u32);
+        range = rm1 - split_minus1;
+        bit = 1;
+    } else {
+        range = split_minus1 + 1;
+        bit = 0;
+    }
+    // 与 read_bit_val 同：`range < 128 || !renorm_skip` 恒等（renorm_skip=false 时时走 lzcnt）。
+    if range < 128 || !renorm_skip {
+        let shift = range.leading_zeros() - 24;
+        *range_minus1 = (range << shift) - 1;
+        *bits -= shift as i32;
+    } else {
+        *range_minus1 = range - 1;
+    }
+    bit
+}
+
+/// 热路径读「概率 128 符号位」并算术取符号（`read_signed_val` 的标量 in/out 版，逐位一致）。
+#[inline(always)]
+fn ent_read_signed(
+    data: &[u8],
+    pos: &mut usize,
+    value: &mut u64,
+    bits: &mut i32,
+    range_minus1: &mut u32,
+    magnitude: i32,
+) -> i32 {
+    stage_clock::bit();
+    if *bits < 0 {
+        ent_refill(data, pos, value, bits);
+    }
+    let rm1 = *range_minus1 as i32;
+    let split_minus1 = rm1 >> 1;
+    let mask = (split_minus1 - (*value >> (*bits as u32)) as i32) >> 31;
+    let dec_bit = (split_minus1 + 1) & mask;
+    *value -= (dec_bit as u32 as u64) << (*bits as u32);
+    let new_range = (split_minus1 + 1 + ((rm1 - 2 * split_minus1 - 1) & mask)) as u32;
+    let sh = 1u32 - (new_range >> 7);
+    *range_minus1 = (new_range << sh) - 1;
+    *bits -= sh as i32;
+    (magnitude ^ mask) - mask
+}
 
 // ---------------------------------------------------------------------------
 // V1：帧头解析
@@ -1096,28 +1130,31 @@ const BLOCK_LEFT_CONTEXT_BIT: [u32; 25] = [
 /// Y2 块的掩码位（低 32 位掩码的位 24）。
 const NZ_Y2: u32 = 1 << 24;
 
-/// RFC 6386 §13.2 DCT_CAT3..6 子树（p8 之后）附额外位。熵态按值携带（寄存器驻留）。
-/// 概率读用裸指针游标 `p`（`tokens` 传入，指向当前 p_idx 处）：读 `p[k]`（k=8..10）。
-/// 不变量与 `tokens` 同证：p_idx ≤ 253、p_idx+10 ≤ 263 < 264（每型概率表长）→ 恒不越界。
+/// RFC 6386 §13.2 DCT_CAT3..6 子树（p8 之后）附额外位。熵态以调用方局部标量携带（寄存器驻留，
+/// 同 `tokens` 标量化 Load/Store 姿势；`data`/`pos` 仅在 refill 触碰）。概率读用裸指针游标 `p`
+/// （`tokens` 传入，指向当前 p_idx 处）：读 `p[k]`（k=8..10）。不变量与 `tokens` 同证：
+/// p_idx ≤ 253、p_idx+10 ≤ 263 < 264（每型概率表长）→ 恒不越界。
 #[inline(always)]
-fn read_category_3_to_6<'a>(
-    mut d: Vp8BoolDecoder<'a>,
+fn read_category_3_to_6(
+    data: &[u8],
+    pos: &mut usize,
+    value: &mut u64,
+    bits: &mut i32,
+    range_minus1: &mut u32,
+    renorm_skip: bool,
     p: *const u8,
-) -> (Vp8BoolDecoder<'a>, i32) {
+) -> i32 {
     let (extra, base): (&[u8], i32) = {
-        let (dd, b) = d.read_bit_val(unsafe { *p.add(8) });
-        d = dd;
+        let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(8) });
         if b == 0 {
-            let (dd, b) = d.read_bit_val(unsafe { *p.add(9) });
-            d = dd;
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(9) });
             if b == 0 {
                 (&PCAT3, 11)
             } else {
                 (&PCAT4, 19)
             }
         } else {
-            let (dd, b) = d.read_bit_val(unsafe { *p.add(10) });
-            d = dd;
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(10) });
             if b == 0 {
                 (&PCAT5, 35)
             } else {
@@ -1125,30 +1162,35 @@ fn read_category_3_to_6<'a>(
             }
         }
     };
-    let mut value = 0i32;
+    let mut mag = 0i32;
     let mut i = 0;
     while extra[i] != 0 {
-        let (dd, b) = d.read_bit_val(extra[i]);
-        d = dd;
-        value = (value << 1) | b as i32;
+        let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, extra[i]);
+        mag = (mag << 1) | b as i32;
         i += 1;
     }
-    (d, base + value)
+    base + mag
 }
 
 /// 读一个块的系数 token（RFC 6386 §13.2），去量化后按 zigzag 写回 `output`（调用前须清零）。
-/// 返回最后非零 token 的 zigzag 位置 + 1（无 token 返回 0）。熵态按值携带 + `#[inline(always)]`
-/// 使每宏块 25 次调用内联成单函数、{value,bits,range} 全程寄存器驻留（C# `Tokens(ref …)` 同款）。
+/// 返回最后非零 token 的 zigzag 位置 + 1（无 token 返回 0）。熵态以调用方局部标量携带 +
+/// `#[inline(always)]` 使每宏块 25 次调用内联成单函数、{value,bits,range} 全程寄存器驻留
+/// （C# `Tokens(ref v, ref b, ref r)` 同款 Load/Store；`data`/`pos` 仅在 refill 触碰）。
 #[inline(always)]
-fn tokens<'a>(
-    mut d: Vp8BoolDecoder<'a>,
+fn tokens(
+    data: &[u8],
+    pos: &mut usize,
+    value: &mut u64,
+    bits: &mut i32,
+    range_minus1: &mut u32,
+    renorm_skip: bool,
     probabilities: &[u8],
     context: usize,
     mut position: usize,
     output: &mut [i16; 16],
     dc_factor: i32,
     ac_factor: i32,
-) -> (Vp8BoolDecoder<'a>, usize) {
+) -> usize {
     // 熵概率读不变量（证明）：`BAND_ROW_OFFSETS` 最大 231（position≤15），context≤2、
     // next_context∈{11,22} ⇒ p_idx ≤ 253；概率表按型分块 8*33=264 字节、`probabilities` 切片长
     // 恒 ≥ 264（`parse_residuals` 传 `probs[ty*264..]`，表总长 1056）⇒ p_idx+10 ≤ 263 < 264。
@@ -1161,12 +1203,10 @@ fn tokens<'a>(
     let mut p = unsafe { base.add(p_idx) };
     stage_clock::acct();
     let mut last = 0usize;
-    let (dd, b) = d.read_bit_val(unsafe { *p });
-    d = dd;
+    let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
     if b != 0 {
         loop {
-            let (dd, b) = d.read_bit_val(unsafe { *p.add(1) });
-            d = dd;
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(1) });
             if b == 0 {
                 stage_clock::acct();
                 position += 1;
@@ -1177,45 +1217,35 @@ fn tokens<'a>(
                 p = unsafe { base.add(BAND_ROW_OFFSETS[position]) };
                 continue;
             }
-            let (value, next_context): (i32, usize) = {
-                let (dd, b) = d.read_bit_val(unsafe { *p.add(2) });
-                d = dd;
+            let (mag, next_context): (i32, usize) = {
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(2) });
                 if b == 0 {
                     (1, 11)
                 } else {
-                    let (dd, b) = d.read_bit_val(unsafe { *p.add(3) });
-                    d = dd;
+                    let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(3) });
                     if b == 0 {
-                        let (dd, b) = d.read_bit_val(unsafe { *p.add(4) });
-                        d = dd;
+                        let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(4) });
                         if b == 0 {
                             (2, 22)
                         } else {
-                            let (dd, b) = d.read_bit_val(unsafe { *p.add(5) });
-                            d = dd;
+                            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(5) });
                             (3 + b as i32, 22)
                         }
                     } else {
-                        let (dd, b) = d.read_bit_val(unsafe { *p.add(6) });
-                        d = dd;
+                        let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(6) });
                         if b == 0 {
-                            let (dd, b) = d.read_bit_val(unsafe { *p.add(7) });
-                            d = dd;
+                            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(7) });
                             if b == 0 {
-                                let (dd, b) = d.read_bit_val(159);
-                                d = dd;
+                                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 159);
                                 (5 + b as i32, 22)
                             } else {
-                                let (dd, b) = d.read_bit_val(165);
-                                d = dd;
+                                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 165);
                                 let high = b << 1;
-                                let (dd, b) = d.read_bit_val(145);
-                                d = dd;
+                                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 145);
                                 (7 + (high | b) as i32, 22)
                             }
                         } else {
-                            let (dd, cat) = read_category_3_to_6(d, p);
-                            d = dd;
+                            let cat = read_category_3_to_6(data, pos, value, bits, range_minus1, renorm_skip, p);
                             (cat, 22)
                         }
                     }
@@ -1223,8 +1253,7 @@ fn tokens<'a>(
             };
             let factor = if position == 0 { dc_factor } else { ac_factor };
             // 无分支符号（C# ReadSigned：符号是抛硬币，分支一半预测失败）。
-            let (dd, signed) = d.read_signed_val(value);
-            d = dd;
+            let signed = ent_read_signed(data, pos, value, bits, range_minus1, mag);
             stage_clock::dq();
             output[ZIGZAG[position] as usize] = (signed * factor) as i16;
             stage_clock::acct();
@@ -1236,20 +1265,19 @@ fn tokens<'a>(
             }
             stage_clock::acct();
             p = unsafe { base.add(BAND_ROW_OFFSETS[position] + next_context) };
-            let (dd, b) = d.read_bit_val(unsafe { *p });
-            d = dd;
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
             if b == 0 {
                 break; // 下一位置 EOB。
             }
         }
     }
-    (d, last)
+    last
 }
 
 /// 解析一个宏块全部系数（Y2 先于 luma 当 i16）。返回两块掩码：低 32 = 每块非零，高 32 = 有 AC。
-/// 每宏块一次 Load/Store（对照 C# `ParseResiduals`）。函数边界用 `&mut` + 熵态局部标量拷贝：
-/// byval 结构体参数在 Win64 ABI 会逐位回写内存（asm 实证 24/32/36(%ptr) 每 bit store），
-/// `&mut` 只在进出各一次 {data,pos,value,bits,range}；内部 tokens 内联后全为 SSA 寄存器。
+/// 每宏块一次 Load/Store（对照 C# `ParseResiduals` 的 `decoder.Load(out v, out b, out r)` /
+/// `decoder.Store(v, b, r)`）：熵态三标量出结构入本地 SSA，函数边界用 `&mut` 只在进出各一次
+/// {value,bits,range}，`data`/`pos` 仅在 refill 触碰；内部 tokens 内联后全为寄存器。
 #[inline(never)]
 fn parse_residuals(
     d: &mut Vp8BoolDecoder<'_>,
@@ -1260,7 +1288,16 @@ fn parse_residuals(
     above_nz: &mut u32,
     left_nz: &mut u32,
 ) -> u64 {
-    let mut st = *d;
+    // Load（每宏块一次，仿 C# `ParseResiduals` 的 `decoder.Load(out v, out b, out r)`）：
+    // 熵态三标量出结构入调用方局部变量，走完 Store 回——热环内 {value,bits,range} 全程 SSA
+    // 寄存器，无 40B-byval 结构的逐位回写栈（Top1 主攻点）。`renorm_skip` 也在此判定一次
+    // （TOP4：OnceLock 每宏块一读，主环零 OnceLock load）。
+    let renorm_skip = ent_renorm_skip();
+    let data = d.data;
+    let mut pos = d.pos;
+    let mut value = d.value;
+    let mut bits = d.bits;
+    let mut range_minus1 = d.range_minus1;
     let mut above = *above_nz;
     let mut left = *left_nz;
     let mut masks = 0u64;
@@ -1282,8 +1319,13 @@ fn parse_residuals(
         let left_bit = BLOCK_LEFT_CONTEXT_BIT[block];
         let context = (((above >> above_bit) & 1) + ((left >> left_bit) & 1)) as usize;
         stage_clock::acct();
-        let (s2, last) = tokens(
-            st,
+        let last = tokens(
+            data,
+            &mut pos,
+            &mut value,
+            &mut bits,
+            &mut range_minus1,
+            renorm_skip,
             &probabilities[ty * 8 * 33..],
             context,
             start,
@@ -1291,7 +1333,6 @@ fn parse_residuals(
             dc,
             ac,
         );
-        st = s2;
         let nonzero = if last > 0 { 1u32 } else { 0u32 };
         above = (above & !(1 << above_bit)) | (nonzero << above_bit);
         left = (left & !(1 << left_bit)) | (nonzero << left_bit);
@@ -1309,40 +1350,51 @@ fn parse_residuals(
             }
         }
     }
-    *d = st;
+    // Store（每宏块一次，仿 C# `decoder.Store(v, b, r)`）。
+    d.data = data;
+    d.pos = pos;
+    d.value = value;
+    d.bits = bits;
+    d.range_minus1 = range_minus1;
     *above_nz = above;
     *left_nz = left;
     masks
 }
 
-/// 树遍历：node + read_bit_val(prob[node>>1]) 沿树下行，叶子（≤0）返回 -child。熵态按值携带。
+/// 树遍历：node + read_bit_val(prob[node>>1]) 沿树下行，叶子（≤0）返回 -child。熵态以调用方
+/// 局部标量携带（同 `read_macroblock_modes` Load/Store；`data`/`pos` 仅在 refill 触碰）。
 /// 概率读用裸指针（去边界检查）：全部三处调用（SEGMENT_ID / KEYFRAME_Y_MODE / UV_MODE）的可达
 /// 节点 node∈{0,2,4,6}（逐树验证于 vp8_tables.rs）⇒ node>>1 ≤ 3 且 < 表长；
 /// 三处 probs 表长 3/4/3，len-3 表实际最大下标 2。新增调用点须复查本不变量，
 /// 否则改回 `probabilities[node >> 1]` 有界读。
 #[inline(always)]
-fn read_tree<'a>(
-    mut d: Vp8BoolDecoder<'a>,
+fn read_tree(
+    data: &[u8],
+    pos: &mut usize,
+    value: &mut u64,
+    bits: &mut i32,
+    range_minus1: &mut u32,
+    renorm_skip: bool,
     tree: &[i8],
     probabilities: &[u8],
-) -> (Vp8BoolDecoder<'a>, u32) {
+) -> u32 {
     let mut node = 0usize;
     let base = probabilities.as_ptr();
     loop {
         debug_assert!((node >> 1) < probabilities.len());
-        let (dd, bit) = d.read_bit_val(unsafe { *base.add(node >> 1) });
-        d = dd;
+        let bit = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *base.add(node >> 1) });
         let child = tree[node + bit as usize];
         if child <= 0 {
-            return (d, -child as u32);
+            return -child as u32;
         }
         node = child as usize;
     }
 }
 
 /// RFC 6386 §11.5 宏块模式（segment / skip / ymode / 16 个 bmode（仅 B_PRED） / uvmode）。
-/// 每宏块一次 Load/Store（对照 C# `ReadMacroBlockModes`）。函数边界 `&mut` + 熵态局部拷贝，
-/// 与 parse_residuals 同理（byval 会逐位回写内存，本形态保寄存器驻留）。
+/// 熵态三标量 {value,bits,range} 每宏块一次 Load/Store（对照 C# `ReadMacroBlockModes` 的
+/// `header.Load(out v, out b, out r)` / `header.Store(v, b, r)`）；`data`/`pos` 仅在 refill 触碰。
+/// 函数边界 `&mut` + 熵态局部标量拷贝（byval 会逐位回写内存，本形态保寄存器驻留）。
 #[inline(never)]
 fn read_macroblock_modes(
     header: &mut Vp8BoolDecoder<'_>,
@@ -1352,24 +1404,48 @@ fn read_macroblock_modes(
     left_modes: &mut [u8; 4],
     block_modes: &mut [u8; 16],
 ) -> u32 {
-    let mut st = *header;
+    let renorm_skip = ent_renorm_skip();
+    let data = header.data;
+    let mut pos = header.pos;
+    let mut value = header.value;
+    let mut bits = header.bits;
+    let mut range_minus1 = header.range_minus1;
     let segment = match segment_probabilities {
-        Some(probs) => {
-            let (s, v) = read_tree(st, &SEGMENT_ID_TREE, probs);
-            st = s;
-            v
-        }
+        Some(probs) => read_tree(
+            data,
+            &mut pos,
+            &mut value,
+            &mut bits,
+            &mut range_minus1,
+            renorm_skip,
+            &SEGMENT_ID_TREE,
+            probs,
+        ),
         None => 0,
     };
     let skip = if skip_probability < 0 {
         0
     } else {
-        let (s, b) = st.read_bit_val(skip_probability as u8);
-        st = s;
-        b
+        ent_read_bit(
+            data,
+            &mut pos,
+            &mut value,
+            &mut bits,
+            &mut range_minus1,
+            renorm_skip,
+            skip_probability as u8,
+        )
     };
-    let (s, y_mode) = read_tree(st, &KEYFRAME_Y_MODE_TREE, &KEYFRAME_Y_MODE_PROBS);
-    st = s;
+    let y_mode = read_tree(
+        data,
+        &mut pos,
+        &mut value,
+        &mut bits,
+        &mut range_minus1,
+        renorm_skip,
+        &KEYFRAME_Y_MODE_TREE,
+        &KEYFRAME_Y_MODE_PROBS,
+    );
     if y_mode == 4 {
         for i in 0..16 {
             let above = if i < 4 { above_modes[i] } else { block_modes[i - 4] };
@@ -1382,8 +1458,7 @@ fn read_macroblock_modes(
                 [..9];
             let mut node = 0usize;
             loop {
-                let (s, bit) = st.read_bit_val(p[node >> 1]);
-                st = s;
+                let bit = ent_read_bit(data, &mut pos, &mut value, &mut bits, &mut range_minus1, renorm_skip, p[node >> 1]);
                 let child = BLOCK_MODE_TREE[node + bit as usize];
                 if child <= 0 {
                     block_modes[i] = -child as u8;
@@ -1410,8 +1485,21 @@ fn read_macroblock_modes(
             *m = derived;
         }
     }
-    let (s, uv_mode) = read_tree(st, &UV_MODE_TREE, &KEYFRAME_UV_MODE_PROBS);
-    *header = s;
+    let uv_mode = read_tree(
+        data,
+        &mut pos,
+        &mut value,
+        &mut bits,
+        &mut range_minus1,
+        renorm_skip,
+        &UV_MODE_TREE,
+        &KEYFRAME_UV_MODE_PROBS,
+    );
+    header.data = data;
+    header.pos = pos;
+    header.value = value;
+    header.bits = bits;
+    header.range_minus1 = range_minus1;
     segment | (skip << 2) | (y_mode << 3) | (uv_mode << 6)
 }
 
