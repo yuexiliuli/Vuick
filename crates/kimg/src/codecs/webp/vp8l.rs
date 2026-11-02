@@ -1113,6 +1113,10 @@ fn decode_image_stream_into(
 }
 
 #[allow(clippy::too_many_arguments)]
+// 隔离熵主环的寄存器分配：内联进 decode_image_stream_into 后巨型函数（~1600 行 asm）
+// 逼迫 LLVM 把 loop 常数（buffer/bits/position/x/y/g/tbl/result）全栈式溢出重载。
+// 独立成函数后 LLVM 只面对本循环活区间，栈流量应显著下降（asm 审计举证见报告）。
+#[inline(never)]
 fn decode_pixels(
     reader: &mut BitReader<'_>,
     result: &mut [u32],
