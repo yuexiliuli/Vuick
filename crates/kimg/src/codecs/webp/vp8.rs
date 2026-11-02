@@ -850,6 +850,11 @@ pub(crate) fn predict_large(
 /// 构造 4x4 块的 above 行（`above[0]`=左上，`above[1..9]`=上 8 像素）：
 /// 顶行块取宏块 above 缓冲；下方块取已重建上一行；右列块的 above-right 取自宏块 above 缓冲
 /// 第 16..19（RFC 6386 §12.3 的 16×8 边界不可重排语义）。
+/// I4 热路径逐块调用（16×/宏块 × ~80% 宏块）：读用裸指针免边界检查。
+/// 越界不变量：`block_y>0` 时读行 `row_above=row0-1`，列范围
+/// `col0-1 ..= col0+7`——`col0=dx+bx*4`，bx≤3 → 最大列 `dx+15 < cw`，最小 `dx-1` 为左边界
+/// 129 列（`pitch` 行首格）；故最大平面下标 `(ch-1)*pitch+1+cw-1 < ch*pitch`（=y 平面长度）
+/// 恒不越界（`plane_at`/`plane_at_l` 行布局见 645 注释；`debug_assert` 守形状边界）。
 fn subblock_above(
     plane: &[u8],
     pitch: usize,
@@ -859,29 +864,31 @@ fn subblock_above(
     block_y: usize,
     above_y: &[u8; 21],
 ) -> [u8; 9] {
-    let mut a = [0u8; 9];
     if block_y == 0 {
         let base = 4 * block_x;
+        let mut a = [0u8; 9];
         a[0] = above_y[base];
-        for k in 0..8 {
-            a[1 + k] = above_y[base + 1 + k];
-        }
+        a[1..9].copy_from_slice(&above_y[base + 1..base + 9]);
         return a;
     }
     let row_above = row0 - 1;
-    a[0] = plane[plane_at_l(row_above, pitch) + col0];
+    let base = unsafe { plane.as_ptr().add(row_above * pitch) };
+    let mut a = [0u8; 9];
+    debug_assert!(row_above * pitch + col0 + 8 < plane.len());
     if block_x < 3 {
+        a[0] = unsafe { *base.add(col0) };
         for k in 0..8 {
-            a[1 + k] = plane[plane_at(row_above, pitch, col0 + k)];
+            a[1 + k] = unsafe { *base.add(col0 + 1 + k) };
         }
-        return a;
-    }
-    // block_x == 3：右侧 4 像素取宏块 aboveY[16..19]。
-    for k in 0..4 {
-        a[1 + k] = plane[plane_at(row_above, pitch, col0 + k)];
-    }
-    for k in 0..4 {
-        a[5 + k] = above_y[17 + k];
+    } else {
+        // block_x == 3：右侧 4 像素取宏块 aboveY[16..19]。
+        a[0] = unsafe { *base.add(col0) };
+        for k in 0..4 {
+            a[1 + k] = unsafe { *base.add(col0 + 1 + k) };
+        }
+        for k in 0..4 {
+            a[5 + k] = above_y[17 + k];
+        }
     }
     a
 }
@@ -1197,6 +1204,11 @@ fn tokens(
     // 故裸指针游标 `p = base.add(p_idx)` 读 `p[k]`（k≤10）恒不越界——用指针游标省去每次
     // `probabilities[p_idx+k]` 的边界检查，读到的概率字节与下标版逐字节相同（libwebp vp8_dec.c
     // 的 `const uint8_t* p` 滑动游标同款姿势，参考不抄）。
+    //
+    // 环内 `get_unchecked` 不变量（A 记账压紧·减少每系数索引算术）：`position` 两侧自增后必先
+    // 判 `position == 16` break 才续用（1208-1272），故三处 `BAND_ROW_OFFSETS[position]` /
+    // `ZIGZAG[position]`（1217/1258/1267）恒有 position ≤ 15 < 16——去掉必然不触发的边界检查
+    // 每次索引省 1-2 uop（cmp+溢出分支），读值与下标版逐字节相同。
     let p_idx = BAND_ROW_OFFSETS[position] + context * 11;
     debug_assert!(p_idx + 10 < probabilities.len());
     let base = probabilities.as_ptr();
@@ -1214,7 +1226,7 @@ fn tokens(
                     break;
                 }
                 stage_clock::acct();
-                p = unsafe { base.add(BAND_ROW_OFFSETS[position]) };
+                p = unsafe { base.add(*BAND_ROW_OFFSETS.get_unchecked(position)) };
                 continue;
             }
             let (mag, next_context): (i32, usize) = {
@@ -1255,7 +1267,7 @@ fn tokens(
             // 无分支符号（C# ReadSigned：符号是抛硬币，分支一半预测失败）。
             let signed = ent_read_signed(data, pos, value, bits, range_minus1, mag);
             stage_clock::dq();
-            output[ZIGZAG[position] as usize] = (signed * factor) as i16;
+            output[unsafe { *ZIGZAG.get_unchecked(position) } as usize] = (signed * factor) as i16;
             stage_clock::acct();
             last = position + 1;
             stage_clock::acct();
@@ -1264,7 +1276,7 @@ fn tokens(
                 break;
             }
             stage_clock::acct();
-            p = unsafe { base.add(BAND_ROW_OFFSETS[position] + next_context) };
+            p = unsafe { base.add(*BAND_ROW_OFFSETS.get_unchecked(position) + next_context) };
             let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
             if b == 0 {
                 break; // 下一位置 EOB。
@@ -2726,27 +2738,55 @@ fn reconstruct_macroblock(
                 }
             });
         } else {
+            // I4：把 predict/add 的 SIMD 特性判定提升出子块循环——`part_simd_on` 含 CPU 特性
+            // 探测与多个 OnceLock，逐块调用在汇编上是真函数 call（热路径每块付一次）；判定结果
+            // 在整帧解码内恒定（env/特性探测只跑一次），本宏块开头取一次。对比旧路径二处省写：
+            // ① add 分支去 `ac_mask` 判断并统一走单块核——仅 DC 块原走标量 `inverse_dct_add
+            //   (has_ac=false)`（15.95ns/块，反比 `inverse_dct_add_one` 的 SSE2 单块核 10.56ns/块
+            //   慢），且 `idct_add_one_sse2` 对仅 DC 块与标量捷径逐字节一致
+            //   （`inverse_dct_has_ac_shortcut_equivalence`）；② 去 `let coeff = mb[block]` 全量
+            //   16 系数拷贝（原实现 32B 栈拷 + 回读每块都付，零块也付），核直接借用 `&mb[block]`。
+            let pred_simd = super::simd::part_simd_on("pred", "ssse3");
+            let dct_simd = super::simd::part_simd_on("dct", "sse2");
             stage_clock::idct_i4(|| {
-                for block in 0..16 {
-                    let bx = block & 3;
-                    let by = block >> 2;
+                // 逐 4×4 子块重建。子块间串行依赖：块 (bx,by) 预测读左/上已重建像素、add 随后
+                // 覆写，predict→add 逐块次序不可重排（S7 同版约束）。外层按子块行 / 内层按列扫，
+                // `row0`/`col0` 用循环增量直算（删 block→bx/by 反解 &3 / >>2），字节输出与旧
+                // 路径逐块次序完全一致。
+                let mut block = 0usize;
+                for by in 0..4usize {
                     let row0 = dy + by * 4;
-                    let col0 = dx + bx * 4;
-                    stage_clock::i4_predict(|| {
-                        let above = subblock_above(y, y_pitch, row0, col0, bx, by, above_y);
-                        super::simd::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
-                    });
-                    let coeff = mb[block];
-                    if ((nonzero_mask >> block) & 1) != 0 || coeff[0] != 0 {
-                        stage_clock::i4_idct_add(|| {
-                            if ((ac_mask >> block) & 1) != 0 {
-                                stage_clock::i4_add_ac();
-                                super::simd::inverse_dct_add_one(&coeff, y, y_pitch, row0, col0);
+                    for bx in 0..4usize {
+                        let col0 = dx + bx * 4;
+                        stage_clock::i4_predict(|| {
+                            let above = subblock_above(y, y_pitch, row0, col0, bx, by, above_y);
+                            if pred_simd {
+                                // Safety：`pred_simd` 已在循环外判定 `part_simd_on("pred","ssse3")`
+                                // 为真且本块内恒定，SSSE3 核指令可用。
+                                unsafe {
+                                    super::simd::predict_subblock_forced(y, y_pitch, row0, col0, b_modes[block], &above)
+                                }
                             } else {
-                                inverse_dct_add(&coeff, y, y_pitch, row0, col0, false);
+                                super::simd::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
                             }
-                            mb[block].fill(0);
                         });
+                        if ((nonzero_mask >> block) & 1) != 0 || mb[block][0] != 0 {
+                            stage_clock::i4_idct_add(|| {
+                                // 计数器语义=「走单块 add 核的块数」：非零块统一走 add_one。
+                                stage_clock::i4_add_ac();
+                                if dct_simd {
+                                    // Safety：`dct_simd` 已在循环外判定 `part_simd_on("dct","sse2")`
+                                    // 为真且本块内恒定，SSE2 核指令可用。
+                                    unsafe {
+                                        super::simd::idct_add_one_forced(&mb[block], y, y_pitch, row0, col0)
+                                    }
+                                } else {
+                                    super::simd::inverse_dct_add_one(&mb[block], y, y_pitch, row0, col0);
+                                }
+                                mb[block].fill(0);
+                            });
+                        }
+                        block += 1;
                     }
                 }
             });

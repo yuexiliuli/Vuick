@@ -223,6 +223,34 @@ pub(crate) fn predict_subblock(
     super::vp8::predict_subblock(plane, pitch, row0, col0, mode, above);
 }
 
+/// 预判定后的 4×4 预测核直调：`part_simd_on("pred","ssse3")` 已由调用方提升出子块循环
+/// （该判定含 CPU 特性探测与多个 OnceLock，逐块调用在汇编上是真函数 call；判定结果在整帧
+/// 解码内恒定，`reconstruct_macroblock` 每宏块取一次）。**Safety**：调用方须保证 ssse3
+/// 可用（如先判定返回 true），且 `row0/col0/pitch` 在平面内——其余语义同
+/// `predict_subblock` 的 SSSE3 分支，输出逐字节一致。
+#[inline]
+pub(crate) unsafe fn predict_subblock_forced(
+    plane: &mut [u8],
+    pitch: usize,
+    row0: usize,
+    col0: usize,
+    mode: u8,
+    above: &[u8; 9],
+) {
+    // x86_64：内核使用 x86-only intrinsic，仅在该目标编译（SSSE3 核指令可用性由调用方保证）。
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { predict_subblock_ssse3(plane, pitch, row0, col0, mode, above) }
+        return;
+    }
+    // 非 x86_64：x86 intrinsic 不存在，恒走标量兜底（运行时不达：调用方
+    // `part_simd_on("pred","ssse3")` 在非 x86_64 恒为 false）。
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        super::vp8::predict_subblock(plane, pitch, row0, col0, mode, above);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 unsafe fn predict_subblock_ssse3(
@@ -1780,6 +1808,36 @@ pub(crate) fn inverse_dct_add_one(
         return;
     }
     super::vp8::inverse_dct_add(coeff, plane, pitch, row0, col0, true);
+}
+
+/// 预判定后的单块逆变换核直调：`part_simd_on("dct","sse2")` 已由调用方提升出 i4 子块循环
+/// （同 `predict_subblock_forced` 姿势，避免逐块特性判定 call）。**Safety**：调用方须保证
+/// sse2 可用（如先判定返回 true），越界语义同 `inverse_dct_add_one` 的 SSE2 分支（`row0/col0`
+/// 落在平面内）；仅 DC（无 AC）块亦走本核——`idct_add_one_sse2` 对仅 DC 块与标量 DC 捷径
+/// 逐字节一致（`inverse_dct_has_ac_shortcut_equivalence`）。
+#[inline]
+pub(crate) unsafe fn idct_add_one_forced(
+    coeff: &[i16; 16],
+    plane: &mut [u8],
+    pitch: usize,
+    row0: usize,
+    col0: usize,
+) {
+    // x86_64：内核使用 x86-only intrinsic，仅在该目标编译（SSE2 核指令可用性由调用方保证）。
+    #[cfg(target_arch = "x86_64")]
+    {
+        let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
+        unsafe {
+            idct_add_one_sse2(coeff.as_ptr(), dst, pitch as isize);
+        }
+        return;
+    }
+    // 非 x86_64：x86 intrinsic 不存在，恒走标量全变换兜底（运行时不达：调用方
+    // `part_simd_on("dct","sse2")` 在非 x86_64 恒为 false）。
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        super::vp8::inverse_dct_add(coeff, plane, pitch, row0, col0, true);
+    }
 }
 
 /// 两个水平相邻 4×4 块仅 DC（无 AC）的逆变换捷径：残差恒 `(dc+4)>>3`（与完整两遍变换对
