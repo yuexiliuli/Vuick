@@ -2363,6 +2363,421 @@ unsafe fn yuv32_to_rgba_avx2_u16(
 }
 
 // ---------------------------------------------------------------------------
+// RGB3（3 通道）直出：opaque 静态有损路径消 RGBA4 中间帧（4→3 转换 / 整帧 RGBA 分配）。
+// 算术与上方 `yuv_row_to_rgba` 完全同源（同一 channel!/u16 计算），仅末段平面交错由 4 步长
+// 改 3 步长、alpha 不写 → 每像素前 3 字节恒等于 RGBA 路径（`yuv_row_rgb3_matches_rgba`
+// 硬闸断言）。以下按 8/16/32px 镜像 RGBA 核，共用 `store_rgb3_planes8` 把三平面交错存成
+// 24 字节 RGB 段。
+// ---------------------------------------------------------------------------
+
+/// 三平面（各 8 相关字节，低 8 字节为 r/g/b 像素序列）→ 24 字节 RGB 交错存储（两组 4 像素：
+/// 移位拼接 `[r4 | g4<<4 | b4<<8]` 后 pshufb 抽 12 字节）。仅字节重排 + 移位/OR，不经算术
+/// → 与「RGBA 前 3 字节」逐字节恒等。`out` 不保证对齐（storel_epi64/未对齐 u32 写安全）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn store_rgb3_planes8(r8: __m128i, g8: __m128i, b8: __m128i, out: *mut u8) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let shuf = _mm_setr_epi8(0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, 0, 0, 0, 0);
+        // 保留低 4 字节的掩码（剔除平面高位，防 OR 拼接时 r/g/b 段互相污染：`_mm_srli_si128`
+        // 只做位移不清高位，未掩码会把 r4..r7 叠进 g 段、g4..g7 叠进 b 段）。
+        let keep4 = _mm_set_epi32(0, 0, 0, -1);
+        // 两组 4 像素（`_mm_srli_si128` 位移为编译期立即数，须显式展开）。
+        // 低 4 像素：r/g/b 各自低 4 字节 → [r0..r3 | g0..g3 | b0..b3] → 抽 12 字节 RGB。
+        let r4 = _mm_and_si128(_mm_srli_si128(r8, 0), keep4);
+        let g4 = _mm_and_si128(_mm_srli_si128(g8, 0), keep4);
+        let b4 = _mm_and_si128(_mm_srli_si128(b8, 0), keep4);
+        let tmp = _mm_or_si128(
+            _mm_or_si128(r4, _mm_slli_si128(g4, 4)),
+            _mm_slli_si128(b4, 8),
+        );
+        let out12 = _mm_shuffle_epi8(tmp, shuf);
+        _mm_storel_epi64(out as *mut __m128i, out12);
+        std::ptr::write_unaligned(
+            out.add(8) as *mut u32,
+            _mm_cvtsi128_si32(_mm_srli_si128(out12, 8)) as u32,
+        );
+        // 高 4 像素：r/g/b 各自字节 4..7。
+        let r4 = _mm_and_si128(_mm_srli_si128(r8, 4), keep4);
+        let g4 = _mm_and_si128(_mm_srli_si128(g8, 4), keep4);
+        let b4 = _mm_and_si128(_mm_srli_si128(b8, 4), keep4);
+        let tmp = _mm_or_si128(
+            _mm_or_si128(r4, _mm_slli_si128(g4, 4)),
+            _mm_slli_si128(b4, 8),
+        );
+        let out12 = _mm_shuffle_epi8(tmp, shuf);
+        let o = out.add(12);
+        _mm_storel_epi64(o as *mut __m128i, out12);
+        std::ptr::write_unaligned(
+            o.add(8) as *mut u32,
+            _mm_cvtsi128_si32(_mm_srli_si128(out12, 8)) as u32,
+        );
+    }
+}
+
+/// SSE4.1：8 像素定点 YUV→RGB3。数学与 [`yuv8_to_rgba_sse41`] 逐位相同（同一 `channel!` 宏），
+/// 仅末段由 RGBA 交错改为 `store_rgb3_planes8`（24 字节）。`out` 写出 24 字节。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn yuv8_to_rgb3_sse41(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let y0 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(std::ptr::read_unaligned(y as *const u32) as i32));
+        let y1 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(std::ptr::read_unaligned((y as *const u32).add(1)) as i32));
+        let u0 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(std::ptr::read_unaligned(u as *const u32) as i32));
+        let u1 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(std::ptr::read_unaligned((u as *const u32).add(1)) as i32));
+        let v0 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(std::ptr::read_unaligned(v as *const u32) as i32));
+        let v1 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(std::ptr::read_unaligned((v as *const u32).add(1)) as i32));
+
+        let c19077 = _mm_set1_epi32(19077);
+        let c26149 = _mm_set1_epi32(26149);
+        let c6419 = _mm_set1_epi32(6419);
+        let c13320 = _mm_set1_epi32(13320);
+        let c33050 = _mm_set1_epi32(33050);
+        let c14234 = _mm_set1_epi32(14234);
+        let c8708 = _mm_set1_epi32(8708);
+        let c17685 = _mm_set1_epi32(17685);
+
+        macro_rules! channel {
+            ($yv:expr, $uv:expr, $vv:expr) => {{
+                let yv = $yv;
+                let uv = $uv;
+                let vv = $vv;
+                let yt = _mm_srai_epi32(_mm_mullo_epi32(yv, c19077), 8);
+                let vr = _mm_srai_epi32(_mm_mullo_epi32(vv, c26149), 8);
+                let ug = _mm_srai_epi32(_mm_mullo_epi32(uv, c6419), 8);
+                let vg = _mm_srai_epi32(_mm_mullo_epi32(vv, c13320), 8);
+                let ub = _mm_srai_epi32(_mm_mullo_epi32(uv, c33050), 8);
+                let r = _mm_srai_epi32(_mm_sub_epi32(_mm_add_epi32(yt, vr), c14234), 6);
+                let g = _mm_srai_epi32(_mm_add_epi32(_mm_sub_epi32(_mm_sub_epi32(yt, ug), vg), c8708), 6);
+                let b = _mm_srai_epi32(_mm_sub_epi32(_mm_add_epi32(yt, ub), c17685), 6);
+                let zero = _mm_setzero_si128();
+                let c255 = _mm_set1_epi32(255);
+                (
+                    _mm_min_epi32(_mm_max_epi32(r, zero), c255),
+                    _mm_min_epi32(_mm_max_epi32(g, zero), c255),
+                    _mm_min_epi32(_mm_max_epi32(b, zero), c255),
+                )
+            }};
+        }
+
+        let (r0, g0, b0) = channel!(y0, u0, v0);
+        let (r1, g1, b1) = channel!(y1, u1, v1);
+
+        let r16 = _mm_packs_epi32(r0, r1);
+        let g16 = _mm_packs_epi32(g0, g1);
+        let b16 = _mm_packs_epi32(b0, b1);
+        let r8 = _mm_packus_epi16(r16, r16);
+        let g8 = _mm_packus_epi16(g16, g16);
+        let b8 = _mm_packus_epi16(b16, b16);
+        store_rgb3_planes8(r8, g8, b8, out);
+    }
+}
+
+/// AVX2：16 像素 i32 定点 YUV→RGB3 核心。数学与 [`yuv16_core_avx2`] 逐位相同（同一 `channel!`），
+/// 仅末段 `pack8_bytes_avx2` 平面按 128 位半区各调 `store_rgb3_planes8`（24+24 字节）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv16_core_avx2_rgb3(
+    y0: __m256i,
+    y1: __m256i,
+    u0: __m256i,
+    u1: __m256i,
+    v0: __m256i,
+    v1: __m256i,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let c19077 = _mm256_set1_epi32(19077);
+        let c26149 = _mm256_set1_epi32(26149);
+        let c6419 = _mm256_set1_epi32(6419);
+        let c13320 = _mm256_set1_epi32(13320);
+        let c33050 = _mm256_set1_epi32(33050);
+        let c14234 = _mm256_set1_epi32(14234);
+        let c8708 = _mm256_set1_epi32(8708);
+        let c17685 = _mm256_set1_epi32(17685);
+
+        macro_rules! channel {
+            ($yv:expr, $uv:expr, $vv:expr) => {{
+                let yv = $yv;
+                let uv = $uv;
+                let vv = $vv;
+                let yt = _mm256_srai_epi32(_mm256_mullo_epi32(yv, c19077), 8);
+                let vr = _mm256_srai_epi32(_mm256_mullo_epi32(vv, c26149), 8);
+                let ug = _mm256_srai_epi32(_mm256_mullo_epi32(uv, c6419), 8);
+                let vg = _mm256_srai_epi32(_mm256_mullo_epi32(vv, c13320), 8);
+                let ub = _mm256_srai_epi32(_mm256_mullo_epi32(uv, c33050), 8);
+                let r = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_add_epi32(yt, vr), c14234), 6);
+                let g = _mm256_srai_epi32(_mm256_add_epi32(_mm256_sub_epi32(_mm256_sub_epi32(yt, ug), vg), c8708), 6);
+                let b = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_add_epi32(yt, ub), c17685), 6);
+                let zero = _mm256_setzero_si256();
+                let c255 = _mm256_set1_epi32(255);
+                (
+                    _mm256_min_epi32(_mm256_max_epi32(r, zero), c255),
+                    _mm256_min_epi32(_mm256_max_epi32(g, zero), c255),
+                    _mm256_min_epi32(_mm256_max_epi32(b, zero), c255),
+                )
+            }};
+        }
+
+        let (r0, g0, b0) = channel!(y0, u0, v0);
+        let (r1, g1, b1) = channel!(y1, u1, v1);
+
+        let r8 = pack8_bytes_avx2(r0, r1);
+        let g8 = pack8_bytes_avx2(g0, g1);
+        let b8 = pack8_bytes_avx2(b0, b1);
+        store_rgb3_planes8(_mm256_castsi256_si128(r8), _mm256_castsi256_si128(g8), _mm256_castsi256_si128(b8), out);
+        store_rgb3_planes8(_mm256_extracti128_si256(r8, 1), _mm256_extracti128_si256(g8, 1), _mm256_extracti128_si256(b8, 1), out.add(24));
+    }
+}
+
+/// AVX2：16 像素 i32 定点 YUV→RGB3 包装（载入并宽 + 核心）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv16_to_rgb3_avx2(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let y0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y as *const __m128i));
+        let y1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y.add(8) as *const __m128i));
+        let u0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u as *const __m128i));
+        let u1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(u.add(8) as *const __m128i));
+        let v0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v as *const __m128i));
+        let v1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(v.add(8) as *const __m128i));
+        yuv16_core_avx2_rgb3(y0, y1, u0, u1, v0, v1, out);
+    }
+}
+
+/// AVX2：32 像素/步 i32 定点 YUV→RGB3（对照 [`yuv32_to_rgba_avx2`]：载 32 字节拆两组 ×
+/// `yuv16_core_avx2_rgb3`，写 48+48 字节）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv32_to_rgb3_avx2(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let yb = _mm256_loadu_si256(y as *const __m256i);
+        let ub = _mm256_loadu_si256(u as *const __m256i);
+        let vb = _mm256_loadu_si256(v as *const __m256i);
+        let g0 = _mm256_cvtepu8_epi32(_mm256_castsi256_si128(yb));
+        let g1 = _mm256_cvtepu8_epi32(_mm_srli_si128(_mm256_castsi256_si128(yb), 8));
+        let u0 = _mm256_cvtepu8_epi32(_mm256_castsi256_si128(ub));
+        let u1 = _mm256_cvtepu8_epi32(_mm_srli_si128(_mm256_castsi256_si128(ub), 8));
+        let v0 = _mm256_cvtepu8_epi32(_mm256_castsi256_si128(vb));
+        let v1 = _mm256_cvtepu8_epi32(_mm_srli_si128(_mm256_castsi256_si128(vb), 8));
+        yuv16_core_avx2_rgb3(g0, g1, u0, u1, v0, v1, out);
+        let g0 = _mm256_cvtepu8_epi32(_mm256_extracti128_si256(yb, 1));
+        let g1 = _mm256_cvtepu8_epi32(_mm_srli_si128(_mm256_extracti128_si256(yb, 1), 8));
+        let u0 = _mm256_cvtepu8_epi32(_mm256_extracti128_si256(ub, 1));
+        let u1 = _mm256_cvtepu8_epi32(_mm_srli_si128(_mm256_extracti128_si256(ub, 1), 8));
+        let v0 = _mm256_cvtepu8_epi32(_mm256_extracti128_si256(vb, 1));
+        let v1 = _mm256_cvtepu8_epi32(_mm_srli_si128(_mm256_extracti128_si256(vb, 1), 8));
+        yuv16_core_avx2_rgb3(g0, g1, u0, u1, v0, v1, out.add(48));
+    }
+}
+
+/// AVX2 u16-mulhi 变体：16 像素 YUV→RGB3 核心。数学与 [`yuv16_core_avx2_u16`] 逐位相同，
+/// 仅末段平面按 128 位半区分割后 `store_rgb3_planes8`。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv16_core_avx2_u16_rgb3(yv: __m256i, uv: __m256i, vv: __m256i, out: *mut u8) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let k_y = _mm256_set1_epi16(19077);
+        let k_vr = _mm256_set1_epi16(26149);
+        let k_ug = _mm256_set1_epi16(6419);
+        let k_vg = _mm256_set1_epi16(13320);
+        let k_ub = _mm256_set1_epi16(-32486);
+        let b_r = _mm256_set1_epi16(14234);
+        let b_g = _mm256_set1_epi16(8708);
+        let b_b = _mm256_set1_epi16(17685);
+
+        let yt = _mm256_mulhi_epu16(yv, k_y);
+        let vr = _mm256_mulhi_epu16(vv, k_vr);
+        let ug = _mm256_mulhi_epu16(uv, k_ug);
+        let vg = _mm256_mulhi_epu16(vv, k_vg);
+        let ub = _mm256_mulhi_epu16(uv, k_ub);
+
+        let rd = _mm256_srli_epi16(
+            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, vr), b_r), b_r),
+            6,
+        );
+        let gn = _mm256_add_epi16(ug, vg);
+        let gr = _mm256_srli_epi16(
+            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, b_g), gn), gn),
+            6,
+        );
+        let bl = _mm256_srli_epi16(
+            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, ub), b_b), b_b),
+            6,
+        );
+
+        let r8 = _mm256_packus_epi16(rd, _mm256_setzero_si256());
+        let g8 = _mm256_packus_epi16(gr, _mm256_setzero_si256());
+        let b8 = _mm256_packus_epi16(bl, _mm256_setzero_si256());
+        store_rgb3_planes8(_mm256_castsi256_si128(r8), _mm256_castsi256_si128(g8), _mm256_castsi256_si128(b8), out);
+        store_rgb3_planes8(_mm256_extracti128_si256(r8, 1), _mm256_extracti128_si256(g8, 1), _mm256_extracti128_si256(b8, 1), out.add(24));
+    }
+}
+
+/// AVX2 u16-mulhi 变体：16 像素/步 YUV→RGB3 包装。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv16_to_rgb3_avx2_u16(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let yv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(y as *const __m128i)), 8);
+        let uv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(u as *const __m128i)), 8);
+        let vv = _mm256_slli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128(v as *const __m128i)), 8);
+        yuv16_core_avx2_u16_rgb3(yv, uv, vv, out);
+    }
+}
+
+/// AVX2 u16-mulhi 变体：32 像素/步 YUV→RGB3（对照 [`yuv32_to_rgba_avx2_u16`]）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn yuv32_to_rgb3_avx2_u16(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    out: *mut u8,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let yb = _mm256_loadu_si256(y as *const __m256i);
+        let ub = _mm256_loadu_si256(u as *const __m256i);
+        let vb = _mm256_loadu_si256(v as *const __m256i);
+        let yl = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(yb));
+        let yh = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(yb, 1));
+        let ul = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(ub));
+        let uh = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(ub, 1));
+        let vl = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vb));
+        let vh = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vb, 1));
+        yuv16_core_avx2_u16_rgb3(_mm256_slli_epi16(yl, 8), _mm256_slli_epi16(ul, 8), _mm256_slli_epi16(vl, 8), out);
+        yuv16_core_avx2_u16_rgb3(_mm256_slli_epi16(yh, 8), _mm256_slli_epi16(uh, 8), _mm256_slli_epi16(vh, 8), out.add(48));
+    }
+}
+
+/// 一行 YUV→RGB3（alpha 不写，3 字节/像素）：AVX2/SSE4.1/标量逐档镜像 [`yuv_row_to_rgba`] 的
+/// 调度与内核（u16-mulhi 变体经 `yuv_u16_enabled` 同款门控）。每像素前 3 字节恒等于
+/// `yuv_row_to_rgba` 同输入——新 RGB3 直出路径与旧 RGBA 路径的字节契约。
+/// 输入三平面各 `n` 字节，输出 `3*n` 字节。
+pub(crate) fn yuv_row_to_rgb3(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) {
+    debug_assert_eq!(y.len(), u.len());
+    debug_assert_eq!(y.len(), v.len());
+    debug_assert_eq!(out.len(), y.len() * 3);
+    let n = y.len();
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") && n >= 16 {
+        let u16 = yuv_u16_enabled();
+        let mut col = 0usize;
+        unsafe {
+            while col + 32 <= n {
+                if u16 {
+                    yuv32_to_rgb3_avx2_u16(
+                        y.as_ptr().add(col),
+                        u.as_ptr().add(col),
+                        v.as_ptr().add(col),
+                        out.as_mut_ptr().add(col * 3),
+                    );
+                } else {
+                    yuv32_to_rgb3_avx2(
+                        y.as_ptr().add(col),
+                        u.as_ptr().add(col),
+                        v.as_ptr().add(col),
+                        out.as_mut_ptr().add(col * 3),
+                    );
+                }
+                col += 32;
+            }
+            while col + 16 <= n {
+                if u16 {
+                    yuv16_to_rgb3_avx2_u16(
+                        y.as_ptr().add(col),
+                        u.as_ptr().add(col),
+                        v.as_ptr().add(col),
+                        out.as_mut_ptr().add(col * 3),
+                    );
+                } else {
+                    yuv16_to_rgb3_avx2(
+                        y.as_ptr().add(col),
+                        u.as_ptr().add(col),
+                        v.as_ptr().add(col),
+                        out.as_mut_ptr().add(col * 3),
+                    );
+                }
+                col += 16;
+            }
+            while col + 8 <= n {
+                yuv8_to_rgb3_sse41(
+                    y.as_ptr().add(col),
+                    u.as_ptr().add(col),
+                    v.as_ptr().add(col),
+                    out.as_mut_ptr().add(col * 3),
+                );
+                col += 8;
+            }
+            for i in col..n {
+                let (r, g, b) = yuv_to_rgb(y[i], u[i], v[i]);
+                let o = i * 3;
+                *out.get_unchecked_mut(o) = r;
+                *out.get_unchecked_mut(o + 1) = g;
+                *out.get_unchecked_mut(o + 2) = b;
+            }
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("sse4.1") && n >= 8 {
+        let mut col = 0usize;
+        unsafe {
+            while col + 8 <= n {
+                yuv8_to_rgb3_sse41(
+                    y.as_ptr().add(col),
+                    u.as_ptr().add(col),
+                    v.as_ptr().add(col),
+                    out.as_mut_ptr().add(col * 3),
+                );
+                col += 8;
+            }
+            for i in col..n {
+                let (r, g, b) = yuv_to_rgb(y[i], u[i], v[i]);
+                let o = i * 3;
+                *out.get_unchecked_mut(o) = r;
+                *out.get_unchecked_mut(o + 1) = g;
+                *out.get_unchecked_mut(o + 2) = b;
+            }
+        }
+        return;
+    }
+    for i in 0..n {
+        let (r, g, b) = yuv_to_rgb(y[i], u[i], v[i]);
+        out[i * 3] = r;
+        out[i * 3 + 1] = g;
+        out[i * 3 + 2] = b;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fancy 上采样（SSE2 16-bit lane；语义对齐 vp8.rs `upsample_fancy`：`3*cur+adj` 的 t 行 +
 // 偶数/奇数对的 `(3t±邻居+8)>>4`，无重结合）
 // ---------------------------------------------------------------------------
@@ -3719,6 +4134,46 @@ mod tests {
             assert_eq!(simd_out, scalar_out, "flat {val}: SIMD vs 标量");
         }
         eprintln!("YUV_ROW_SIMD_PARITY_OK");
+    }
+
+    /// RGB3 直出核：`yuv_row_to_rgb3` 每像素前 3 字节恒等于 `yuv_row_to_rgba` 同输入
+    /// RGB3 直出核：`yuv_row_to_rgb3` 每像素前 3 字节恒等于 `yuv_row_to_rgba` 同输入
+    /// （opaque 有损直出 RGB3 的字节契约硬闸）。覆盖全档（avx2/u16、sse4.1、标量）与边界长
+    /// （0/1/2/7/8/9/15/16/17/32/33/128/257 及全 0/全 255 灰阶）。
+    #[test]
+    fn yuv_row_rgb3_matches_rgba() {
+        let mut rng = Lcg(0x9e3779b97f4a7c15);
+        // 强制/直走各档长度，验证任一 SIMD 或标量路径 RGB3 与 RGBA 前 3 字节恒等。
+        for n in [0usize, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 128, 257] {
+            let y: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let u: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let v: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let mut rgba = vec![0u8; n * 4];
+            yuv_row_to_rgba(&y, &u, &v, &mut rgba);
+            let mut rgb3 = vec![0u8; n * 3];
+            yuv_row_to_rgb3(&y, &u, &v, &mut rgb3);
+            for i in 0..n {
+                assert_eq!(
+                    rgb3[i * 3..i * 3 + 3],
+                    rgba[i * 4..i * 4 + 3],
+                    "n={n} px={i}: RGB3 前 3 字节应等于 RGBA 前 3 字节"
+                );
+            }
+        }
+        // 边界值灰阶（负数/超限 clamp 路径）。
+        for val in [0u8, 1, 16, 64, 128, 129, 254, 255] {
+            let y = vec![val; 16];
+            let u = vec![val; 16];
+            let v = vec![val; 16];
+            let mut rgba = vec![0u8; 64];
+            let mut rgb3 = vec![0u8; 48];
+            yuv_row_to_rgba(&y, &u, &v, &mut rgba);
+            yuv_row_to_rgb3(&y, &u, &v, &mut rgb3);
+            for i in 0..16 {
+                assert_eq!(rgb3[i * 3..i * 3 + 3], rgba[i * 4..i * 4 + 3], "flat {val} px={i}");
+            }
+        }
+        eprintln!("YUV_ROW_RGB3_PARITY_OK");
     }
 
     /// ARGB→RGBA 输出与 Subtract-Green：SIMD vs 标量逐字节（含奇偶边界与全通道路径）。

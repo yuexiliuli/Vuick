@@ -147,7 +147,11 @@ fn ours_allowed() -> bool {
 #[derive(Default)]
 pub(crate) struct OursStatic {
     /// 解码后的 RGBA8 像素（长度 = w*h*4；零拷贝封装，见 `vp8l::RgbaBytes`）。
+    /// alpha/无损路径持有；opaque 有损路径为空（该路径放 `rgb`）。
     pub rgba: vp8l::RgbaBytes,
+    /// opaque 静态有损直出的 RGB8 像素（长度 = w*h*3；消 RGBA4 中间帧 / 4→3 转换；见
+    /// `vp8::decode_vp8_rgb3`）。非 opaque 路径恒空；此时像素在 `rgba`。
+    pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
     /// 实际是否存在 alpha（决定输出 RGBA8 还是 RGB8）。
@@ -352,7 +356,8 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                     }
                     buf.copy_from_slice(o.rgba.as_bytes());
                 } else {
-                    // RGB8 目标：从 RGBA 抽 RGB（buf.len()==w*h*3）。
+                    // RGB8 目标：buf.len()==w*h*3。opaque 静态有损直出（`o.rgb`，RGB3→RGB3 直拷，
+                    // 消 4→3 SIMD 转换）；无损/动画路径仍持 RGBA4 → 4→3 抽条（既有语义不变）。
                     let target = (o.width as usize) * (o.height as usize) * 3;
                     if buf.len() != target {
                         return Err(ImageError::Decoding(DecodingError::new(
@@ -360,7 +365,11 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                             "Ours 解码缓冲长度与像素缓冲不一致",
                         )));
                     }
-                    simd::rgba8_to_rgb8(o.rgba.as_bytes(), buf);
+                    if !o.rgb.is_empty() {
+                        buf.copy_from_slice(&o.rgb);
+                    } else {
+                        simd::rgba8_to_rgb8(o.rgba.as_bytes(), buf);
+                    }
                 }
                 Ok(())
             }
@@ -530,6 +539,7 @@ pub(crate) fn decode_static_lossless(
     };
     Ok(Some(crate::codecs::webp::OursStatic {
         rgba: img.rgba,
+        rgb: Vec::new(),
         width: img.width,
         height: img.height,
         has_alpha: img.has_alpha,
@@ -540,8 +550,10 @@ pub(crate) fn decode_static_lossless(
 }
 
 /// 自研 VP8 静态有损解码入口（P3 有损族，V4+ 接管）：后端允许 + 家族=StaticLossy/LossyAlpha 时
-/// 调用。解析容器 → VP8 YUV → fancy RGBA8（LossyAlpha 附 ALPH 反滤波 alpha）。出错/不可接管
-/// 回 `Ok(None)`（降级 image-webp，正确性优先）。
+/// 调用。解析容器 → VP8 YUV → fancy RGB 直出。opaque（StaticLossy，无 alpha）：`decode_vp8_rgb3`
+/// 直出 **RGB3**（`OursStatic.rgb`，w*h*3，消 RGBA4 中间帧 / 4→3 转换 / 整帧 RGBA 分配）；
+/// LossyAlpha：`decode_vp8`+RGBA4 后附 ALPH 反滤波 alpha 合并。出错/不可接管回 `Ok(None)`
+/// （降级 image-webp，正确性优先）。
 pub(crate) fn decode_static_lossy(
     data: &[u8],
 ) -> ImageResult<Option<crate::codecs::webp::OursStatic>> {
@@ -556,33 +568,52 @@ pub(crate) fn decode_static_lossy(
         Some(b) => b,
         None => return Ok(None),
     };
-    let mut yuv = match vp8::decode_vp8(bitstream, c.width, c.height) {
+    if c.family == container::Family::LossyAlpha {
+        // 有 alpha：仍走 RGBA4（末尾 alpha 按像素写入），语义/字节与既有完全一致。
+        let mut yuv = match vp8::decode_vp8(bitstream, c.width, c.height) {
+            Ok(y) => y,
+            Err(e) => {
+                let _ = e;
+                return Ok(None);
+            }
+        };
+        let mut rgba = vp8::yuv_to_rgba_fancy(&mut yuv);
+        if let Some(alpha_range) = c.frames.first().and_then(|f| f.alpha.clone()) {
+            if let Some(plane) = decode_and_unfilter_alpha(&data[alpha_range], c.width, c.height) {
+                for (i, &a) in plane.iter().enumerate() {
+                    rgba[i * 4 + 3] = a;
+                }
+            } else {
+                // ALPH 解析失败 → 保守降级。
+                return Ok(None);
+            }
+        }
+        return Ok(Some(crate::codecs::webp::OursStatic {
+            rgba: vp8l::RgbaBytes::from_vec_u8(rgba),
+            rgb: Vec::new(),
+            width: c.width,
+            height: c.height,
+            has_alpha: true,
+            exif: c.exif.map(|e| e.to_vec()),
+            icc: c.icc_profile.map(|e| e.to_vec()),
+            xmp: c.xmp.map(|e| e.to_vec()),
+        }));
+    }
+    // opaque 静态有损：RGB3 直出（无 alpha，`OursStatic.rgb` 持有 w*h*3）。
+    let mut yuv = match vp8::decode_vp8_rgb3(bitstream, c.width, c.height) {
         Ok(y) => y,
         Err(e) => {
             let _ = e;
             return Ok(None);
         }
     };
-    let mut rgba = vp8::yuv_to_rgba_fancy(&mut yuv);
-    let mut has_alpha = false;
-    if c.family == container::Family::LossyAlpha {
-        if let Some(alpha_range) = c.frames.first().and_then(|f| f.alpha.clone()) {
-            if let Some(plane) = decode_and_unfilter_alpha(&data[alpha_range], c.width, c.height) {
-                for (i, &a) in plane.iter().enumerate() {
-                    rgba[i * 4 + 3] = a;
-                }
-                has_alpha = true;
-            } else {
-                // ALPH 解析失败 → 保守降级。
-                return Ok(None);
-            }
-        }
-    }
+    let rgb = vp8::yuv_to_rgb_fancy(&mut yuv);
     Ok(Some(crate::codecs::webp::OursStatic {
-        rgba: vp8l::RgbaBytes::from_vec_u8(rgba),
+        rgba: vp8l::RgbaBytes::empty(),
+        rgb,
         width: c.width,
         height: c.height,
-        has_alpha,
+        has_alpha: false,
         exif: c.exif.map(|e| e.to_vec()),
         icc: c.icc_profile.map(|e| e.to_vec()),
         xmp: c.xmp.map(|e| e.to_vec()),
@@ -989,5 +1020,75 @@ mod alpha_filter_tests {
             eprintln!("VP8_ALPHA_FILTER_PARITY_OK\tfilter={filter}\t({w}x{h})");
         }
         set_webp_backend(BACKEND_AUTO);
+    }
+}
+
+/// opaque 静态有损 RGB3 直出硬闸：`OursStatic.rgb`（w*h*3）恒等于「旧路径 RGBA4 → 前 3 字节」，
+/// 且无 RGBA 缓冲（alloc 减少）、经公开 `WebPDecoder::read_image` 直拷出同字节。
+/// 全部 opaque（StaticLossy 非 LossyAlpha）fixture 对拍；缺失外部语料则 SKIP（AGENTS §5）。
+#[cfg(test)]
+mod rgb3_path_tests {
+    use std::io::Cursor;
+
+    use super::webp_fixtures_support;
+    use super::{container, decode_static_lossy, set_webp_backend, vp8, WebPDecoder};
+    use super::{BACKEND_AUTO, BACKEND_OURS};
+    use crate::{ColorType, ImageDecoder};
+
+    /// 旧路径参考：`decode_vp8` + `yuv_to_rgba_fancy`（RGBA4，改前生产路径逐字节形态）。
+    fn old_path_rgba(payload: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let mut yuv = vp8::decode_vp8(payload, w, h).expect("decode_vp8");
+        vp8::yuv_to_rgba_fancy(&mut yuv)
+    }
+
+    #[test]
+    fn opaque_lossy_rgb3_direct_matches_old_rgba() {
+        let mut checked = 0usize;
+        for name in webp_fixtures_support::webp_fixture_names() {
+            let Some(p) = webp_fixtures_support::webp_fixture_path(&name) else {
+                continue;
+            };
+            let data = std::fs::read(&p).expect("read fixture");
+            let Ok(c) = container::parse(&data) else {
+                continue;
+            };
+            if c.family != container::Family::StaticLossy {
+                continue;
+            }
+            let payload = c.bitstream.unwrap();
+            // 新路径：OursStatic 对 opaque 应只持 `rgb`（RGB3，w*h*3）+ rgba 空（alloc 减少）。
+            let ours = decode_static_lossy(&data)
+                .ok()
+                .expect("decode_static_lossy 应 Ok")
+                .expect("opaque 有损应被自研接管");
+            let n_px = (c.width as usize) * (c.height as usize);
+            assert!(!ours.has_alpha, "{name}: opaque 不应判有 alpha");
+            assert!(ours.rgba.is_empty(), "{name}: opaque 不应持 RGBA4 整帧缓冲");
+            assert_eq!(ours.rgb.len(), n_px * 3, "{name}: rgb 应为 w*h*3");
+            // 逐像素：RGB3 前 3 字节 ≡ 旧 RGBA4 前 3 字节。
+            let old_rgba = old_path_rgba(payload, c.width, c.height);
+            assert_eq!(old_rgba.len(), n_px * 4, "{name}: 旧路径缓冲长");
+            for (i, px) in ours.rgb.chunks_exact(3).enumerate() {
+                assert_eq!(
+                    px,
+                    &old_rgba[i * 4..i * 4 + 3],
+                    "{name} px={i}: RGB3 直出应等于旧 RGBA 前 3 字节"
+                );
+            }
+            // 经公开 API：color_type 仍 Rgb8、read_image 直拷 OursStatic.rgb（无 4→3 转换）。
+            set_webp_backend(BACKEND_OURS);
+            let dec = WebPDecoder::new(Cursor::new(&data)).expect("WebPDecoder");
+            assert_eq!(dec.color_type(), ColorType::Rgb8, "{name}: opaque 动态分类仍 Rgb8");
+            let mut buf = vec![0u8; dec.total_bytes() as usize];
+            dec.read_image(&mut buf).expect("read_image");
+            assert_eq!(buf, ours.rgb, "{name}: read_image 应直拷 OursStatic.rgb");
+            checked += 1;
+        }
+        set_webp_backend(BACKEND_AUTO);
+        eprintln!("WEBP_RGB3_OPAQUE_PARITY\t{checked}");
+        assert!(
+            checked >= 1,
+            "应至少对拍 1 个 opaque 有损 fixture（当前 {checked}；缺外部语料）"
+        );
     }
 }
