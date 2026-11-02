@@ -536,25 +536,31 @@ pub(crate) fn decode_static_lossy(
         None => return Ok(None),
     };
     if c.family == container::Family::LossyAlpha {
-        // 有 alpha：仍走 RGBA4（末尾 alpha 按像素写入），语义/字节与既有完全一致。
-        let mut yuv = match vp8::decode_vp8(bitstream, c.width, c.height) {
+        // 先把整帧 ALPH 反滤波平面解出（独立于 VP8 解码），随后把 alpha 行并入 VP8 发射内层
+        // （YUV→RGB 结果 R/G/B 与 alpha 同拍单遍写 RGBA，消灭「RGBA4 全帧发射 + 事后独立
+        // 标量逐像素写 alpha」两遍合成）；语义/字节与既有完全一致。
+        let alpha_plane = match c.frames.first().and_then(|f| f.alpha.clone()) {
+            Some(range) => match decode_and_unfilter_alpha(&data[range], c.width, c.height) {
+                Some(plane) => Some(plane),
+                // ALPH 解析失败 → 保守降级。
+                None => return Ok(None),
+            },
+            // 无 ALPH chunk（malformed）→ alpha=255，与旧 `yuv_to_rgba_fancy` 发射语义一致。
+            None => None,
+        };
+        let mut yuv = match vp8::decode_vp8_with_alpha(
+            bitstream,
+            c.width,
+            c.height,
+            alpha_plane.as_deref(),
+        ) {
             Ok(y) => y,
             Err(e) => {
                 let _ = e;
                 return Ok(None);
             }
         };
-        let mut rgba = vp8::yuv_to_rgba_fancy(&mut yuv);
-        if let Some(alpha_range) = c.frames.first().and_then(|f| f.alpha.clone()) {
-            if let Some(plane) = decode_and_unfilter_alpha(&data[alpha_range], c.width, c.height) {
-                for (i, &a) in plane.iter().enumerate() {
-                    rgba[i * 4 + 3] = a;
-                }
-            } else {
-                // ALPH 解析失败 → 保守降级。
-                return Ok(None);
-            }
-        }
+        let rgba = vp8::yuv_to_rgba_fancy(&mut yuv);
         return Ok(Some(crate::codecs::webp::OursStatic {
             rgba: vp8l::RgbaBytes::from_vec_u8(rgba),
             rgb: Vec::new(),
