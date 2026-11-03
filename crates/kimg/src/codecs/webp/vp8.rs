@@ -2648,29 +2648,41 @@ fn entropy_macroblock(
     left_nz: &mut u32,
     pkt: &mut MbPacket,
 ) -> (u8, u8) {
-    let (y_mode, uv_mode, is_i16, sp, masks) = stage_clock::entropy(|| {
-        let modes =
-            stage_clock::entropy_modes(|| {
-                read_macroblock_modes(header, segment_probs, skip_probability, above_b, left_b, &mut pkt.b_modes)
-            });
-        let segment = (modes & 3) as usize;
-        let skip = (modes & 4) != 0;
-        let y_mode = ((modes >> 3) & 7) as u8;
-        let uv_mode = (modes >> 6) as u8;
-        let is_i16 = y_mode != 4;
-        let sp = seg_params[segment];
-        let masks = if skip {
-            let keep = if is_i16 { 0 } else { NZ_Y2 };
-            *above_nz &= keep;
-            *left_nz &= keep;
-            0u64
-        } else {
+    // 阶段①（熵计时）：模式/段/skip 解码。
+    let modes = stage_clock::entropy(|| {
+        stage_clock::entropy_modes(|| {
+            read_macroblock_modes(header, segment_probs, skip_probability, above_b, left_b, &mut pkt.b_modes)
+        })
+    });
+    let segment = (modes & 3) as usize;
+    let skip = (modes & 4) != 0;
+    let y_mode = ((modes >> 3) & 7) as u8;
+    let uv_mode = (modes >> 6) as u8;
+    let is_i16 = y_mode != 4;
+    let sp = seg_params[segment];
+    // 惰性零化（A：MbPacket 帧内池 + 仅 touched-宏块零化；不在任何熵计时闭合内，避免把「内容
+    // 无关写」算进熵账，也避免探针 Instant/原子与 memset 相互干扰）。
+    // - 非跳过：`parse_residuals` 的 `tokens` 只写非零系数位、未写位必须为 0（`MbPacket::default`
+    //   等价语义），因此整包零化——复用槽位即使残留脏块也被清掉，逐字节不变由结构保证。
+    // - 跳过：重建侧只把 `mb[0..16][0]` 当 DC 门控读（i16 的 WHT/UV 段与 i4 均不读其余位），
+    //   仅零化 16 个 DC 槽（32B），免去整包 830B 内容无关写。
+    let masks = if skip {
+        for b in pkt.mb.iter_mut().take(16) {
+            b[0] = 0;
+        }
+        let keep = if is_i16 { 0 } else { NZ_Y2 };
+        *above_nz &= keep;
+        *left_nz &= keep;
+        0u64
+    } else {
+        pkt.mb = [[0i16; 16]; 25];
+        // 阶段②（熵计时）：残差 token + 去量化。
+        stage_clock::entropy(|| {
             stage_clock::entropy_tokens(|| {
                 parse_residuals(td, probs, &mut pkt.mb, &sp, is_i16, above_nz, left_nz)
             })
-        };
-        (y_mode, uv_mode, is_i16, sp, masks)
-    });
+        })
+    };
     pkt.y_mode = y_mode;
     pkt.uv_mode = uv_mode;
     pkt.i16 = is_i16;
@@ -2971,6 +2983,13 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
         stage_clock::scope_wall(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<RowPacket>(2);
         let (tx2, rx2) = std::sync::mpsc::sync_channel::<RowPixels>(2);
+            // A：t1→t2 行包回收通道（t2 重建完把 `mbs`/`filters` Vec 空包送回 t1 复用——
+            // 消灭每行 `with_capacity(mbw)` ×2 的分配/首触缺页，≥2304 MB 大图帧内 ~540 次 alloc
+            // 摊销到 ~4 个槽位）。回收通道一律 `try_send`/`try_recv`：满/空时双方不阻塞、
+            // 各自退回新建兜底，杜绝跨通道死锁。
+            let (tx_ar, rx_ar) = std::sync::mpsc::sync_channel::<RowPacket>(2);
+            // B：t2→t3 行像素带回收（t3 滤波完把 strip Vec 送回 t2 复用）。
+            let (tx_br, rx_br) = std::sync::mpsc::sync_channel::<RowPixels>(2);
             let yb = &mut *y;
             let ub = &mut *u;
             let vb = &mut *v;
@@ -2979,10 +2998,10 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
             let ou = &mut *out_u;
             let ov = &mut *out_v;
             s.spawn(move || {
-                recon_loop(rx, tx2, yb, y_pitch, ub, vb, uv_pitch, mbw)
+                recon_loop(rx, tx2, rx_br, tx_ar, yb, y_pitch, ub, vb, uv_pitch, mbw)
             });
             s.spawn(move || {
-                filter_t3_loop(rx2, y_pitch, uv_pitch, rb, oy, ou, ov, mbw, mbh, width, height, &fh.filter, need_tight, channels, alpha)
+                filter_t3_loop(rx2, tx_br, y_pitch, uv_pitch, rb, oy, ou, ov, mbw, mbh, width, height, &fh.filter, need_tight, channels, alpha)
             });
             for mby in 0..mbh {
                 // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
@@ -2990,16 +3009,28 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
                 let mut left_nz = 0u32;
                 // 行内复用该分区的 token 解码器（&mut 边界，熵态在宏块级函数内部寄存器驻留）。
                 let td = &mut token_decoders[mby & (partition_count - 1)];
-                let mut row = RowPacket {
-                    filters: Vec::with_capacity(mbw),
-                    mbs: Vec::with_capacity(mbw),
+                // 行包帧内池：优先复用 t2 送回的空包（`mbs`/`filters` Vec 容量保活、页已暖），
+                // 池空（首几行或回收慢）才新建兜底。`resize(mbw, default)`：回收包 len 恒为
+                // mbw → no-op；新建包一次性全量零化打底（后续槽位由 `entropy_macroblock` 惰性零化接管）。
+                let mut row = match rx_ar.try_recv() {
+                    Ok(rp) => rp,
+                    Err(_) => RowPacket {
+                        filters: Vec::with_capacity(mbw),
+                        mbs: Vec::with_capacity(mbw),
+                    },
                 };
+                row.filters.clear();
+                // 不用 `resize`（那要求 MbPacket: Clone，使综述里 `#[derive(Clone)]` 变成"被依赖"伪死代码）：
+                // 回收包 len 恒为 mbw → no-op；新建包按 `Default` 逐槽构造（仅 Default，无 Clone 需求）。
+                if row.mbs.len() < mbw {
+                    row.mbs.extend((0..mbw - row.mbs.len()).map(|_| MbPacket::default()));
+                }
                 for mbx in 0..mbw {
                     let above_b_slot: &mut [u8; 4] =
                         (&mut above_b[mbx * 4..mbx * 4 + 4]).try_into().unwrap();
-                    // 就地填充：`MbPacket::default()` 直接写零进 Vec 槽位，`entropy_macroblock` 就地
-                    // 覆盖需解码字段 → 省去「栈零化 + 拷贝入 Vec」的整包搬移（每宏块 ~830B，t1 热路径）。
-                    row.mbs.push(MbPacket::default());
+                    // 就地填充复用槽位：`entropy_macroblock` 内按 skip 惰性零化（`mb`）并覆写全部
+                    // 头字段（y/uv/i16/masks/b_modes），未写位恒 0 语义由该函数建立 → 免去每宏块
+                    // `MbPacket::default()` 整包 830B 栈零化 + 拷贝入 Vec。
                     let (level, inner) = entropy_macroblock(
                         &mut header,
                         td,
@@ -3011,7 +3042,7 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
                         &mut left_b,
                         &mut above_nz[mbx],
                         &mut left_nz,
-                        row.mbs.last_mut().unwrap(),
+                        &mut row.mbs[mbx],
                     );
                     row.filters.push((level, inner));
                 }
@@ -3027,6 +3058,11 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
     } else {
         // 串行：逐宏块「熵 → 预测+IDCT+重建」（与 MT 共用 `entropy_macroblock` /
         // `reconstruct_macroblock`，字节恒等结构性成立），整帧重建毕再滤波直出。
+        // 串行逐宏块「熵 → 预测+IDCT+重建」：单 `MbPacket` 槽位整帧复用——`entropy_macroblock`
+        // 内按 skip 惰性零化建立「未写位恒 0」语义，重建用后按块 `fill(0)`，逐字节与旧
+        // 「每宏块 `MbPacket::default()`」等价（硬闸 threads2/static_lossy 覆盖），且省去整帧
+        // ~27MB 的 830B 内容无关零化（跳过宏块仅零化 16 个 DC 槽 32B）。
+        let mut pkt = MbPacket::default();
         for mby in 0..mbh {
             // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
             let mut left_b = [0u8; 4];
@@ -3036,7 +3072,6 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
             for mbx in 0..mbw {
                 let above_b_slot: &mut [u8; 4] =
                     (&mut above_b[mbx * 4..mbx * 4 + 4]).try_into().unwrap();
-                let mut pkt = MbPacket::default();
                 let (level, inner) = entropy_macroblock(
                     &mut header,
                     td,
@@ -3425,6 +3460,8 @@ struct RowPixels {
 fn recon_loop(
     rx: std::sync::mpsc::Receiver<RowPacket>,
     tx2: std::sync::mpsc::SyncSender<RowPixels>,
+    rx_br: std::sync::mpsc::Receiver<RowPixels>,
+    tx_ar: std::sync::mpsc::SyncSender<RowPacket>,
     y: &mut [u8],
     y_pitch: usize,
     u: &mut [u8],
@@ -3443,15 +3480,26 @@ fn recon_loop(
                 mbx, r, mbw, pkt,
             );
         }
-        // 打包本 MB 行（行 r 已在 planes_A 定稿重建）→ t3（通道按值移动，无共享可变内存）。
+        // 打包本 MB 行（行 r 已在 planes_A 定稿重建）→ t3。B：strip Vec 帧内池——优先复用
+        // t3 滤波完送回（经 `rx_br`，`luma`/`chroma` 容量保活、页已暖），池空才新建；
+        // 复用前 `clear()` 重写全部字节（未读残留，dirty 语义由「整行覆写」保证）。
+        let RowPacket { filters, mbs } = rowpkt;
         let luma_len = 16 * y_pitch;
         let uv_len = 8 * uv_pitch;
-        let mut luma = Vec::with_capacity(luma_len);
+        let mut luma = match rx_br.try_recv() {
+            Ok(s) => s.luma,
+            Err(_) => Vec::with_capacity(luma_len),
+        };
+        luma.clear();
         for i in 0..16 {
             let o = (r * 16 + i) * y_pitch;
             luma.extend_from_slice(&y[o..o + y_pitch]);
         }
-        let mut chroma = Vec::with_capacity(2 * uv_len);
+        let mut chroma = match rx_br.try_recv() {
+            Ok(s) => s.chroma,
+            Err(_) => Vec::with_capacity(2 * uv_len),
+        };
+        chroma.clear();
         for i in 0..8 {
             let o = (r * 8 + i) * uv_pitch;
             chroma.extend_from_slice(&u[o..o + uv_pitch]);
@@ -3460,11 +3508,14 @@ fn recon_loop(
             let o = (r * 8 + i) * uv_pitch;
             chroma.extend_from_slice(&v[o..o + uv_pitch]);
         }
-        let pkt = RowPixels { luma, chroma, filters: rowpkt.filters };
+        // `filters` 随像素带进 t3（滤波输入），体积仅 mbw×2B 级，克隆代价 ~0.2KB/行可忽略；
+        // 原 `filters`/`mbs` Vec 整体送回 t1 复用（A 池）。
+        let pkt = RowPixels { luma, chroma, filters: filters.clone() };
         if tx2.send(pkt).is_err() {
             // t3 已退出（异常收尾）：中断产出，外层 scope join 兜底。
             break;
         }
+        let _ = tx_ar.try_send(RowPacket { filters, mbs });
     }
 }
 
@@ -3510,6 +3561,7 @@ fn extract_tight_rows(
 #[allow(clippy::too_many_arguments)]
 fn filter_t3_loop(
     rx: std::sync::mpsc::Receiver<RowPixels>,
+    tx_br: std::sync::mpsc::SyncSender<RowPixels>,
     y_pitch: usize,
     uv_pitch: usize,
     rgba: &mut [u8],
@@ -3566,6 +3618,9 @@ fn filter_t3_loop(
             }
             emitted = end;
         }
+        // B 回收：把用过的 strip（luma/chroma/filters 全部重写后送回）交还 t2 复用；
+        // 通道满则丢弃（t2 回退新建兜底），`try_send` 不阻塞 → 无死锁。
+        let _ = tx_br.try_send(pkt);
     }
 }
 
