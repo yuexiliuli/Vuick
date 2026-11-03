@@ -1,10 +1,11 @@
 //! `ImageReader`：多格式读取器（镜像 image 0.25 的 Reader 语义；`Reader` 为弃用别名）。
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 use std::path::Path;
 
 use crate::ImageDecoder;
+use crate::buffer::ImageBuffer;
 use crate::codecs::GenericDecoder;
 use crate::dynamic_image::DynamicImage;
 use crate::error::{
@@ -97,6 +98,41 @@ impl<'a, R: 'a + BufRead + Seek> ImageReader<R> {
     pub fn decode(mut self) -> ImageResult<DynamicImage> {
         let format = self.require_format()?;
         let mut limits = self.limits.clone();
+        if format == ImageFormat::WebP {
+            // VP8L 静态族「生产直写」出口：读全量字节 → 容器预检（可接管时拿尺寸）→
+            // 以 `decode_static_lossless_rgba8_into` 直写 RGBA8 到唯一缓冲，`into_rgba8`
+            // 即可零拷贝移交调用方（消「内部解一次 + read_image 4→3 + to_rgba8 3→4」
+            // 两次整帧冗余写；to_rgba8 公共语义不变）。不可接管（VP8 有损 / 动画 / 畸形）
+            // 回退既有解码路径，错误口径与现状一致。
+            let mut bytes = Vec::new();
+            self.inner.read_to_end(&mut bytes).map_err(ImageError::IoError)?;
+            match crate::codecs::webp::lossless_static_size(&bytes) {
+                Some((w, h, total_bytes)) => {
+                    // 与既有解码路径严格限制等价：先查严格尺寸（`set_limits` 的
+                    // `check_dimensions` 口径），再按与现状一致的体积扣 `max_alloc`。
+                    limits.check_dimensions(w, h)?;
+                    limits.reserve(total_bytes as u64)?;
+                    // 未初始化缓冲（免整帧清零）：直写核 Ok 前全量覆写 RGBA8（与 vp8l
+                    // `decode_into_rgba8` 的全覆写不变式一致）；Err 时缓冲被丢弃回退。
+                    let mut rgba = crate::codecs::webp::uninit_rgba8_vec((w as usize) * (h as usize) * 4);
+                    match crate::codecs::webp::decode_static_lossless_rgba8_into(&bytes, &mut rgba) {
+                        Ok(true) => {
+                            return Ok(DynamicImage::ImageRgba8(
+                                ImageBuffer::from_raw(w, h, rgba).expect("缓冲尺寸已校验"),
+                            ))
+                        }
+                        // 解码失败（畸形 VP8L 载荷等）→ 归还预留并回退常规路径，保证显式
+                        // 错误与现状一致（回退路径会重新 `reserve` 等价体积）。
+                        _ => limits.free(total_bytes as u64),
+                    }
+                }
+                None => {}
+            }
+            let mut decoder = make_decoder(format, Cursor::new(bytes))?;
+            limits.reserve(decoder.total_bytes())?;
+            decoder.set_limits(limits)?;
+            return DynamicImage::from_decoder(decoder);
+        }
         let mut decoder = make_decoder(format, self.inner)?;
         limits.reserve(decoder.total_bytes())?;
         decoder.set_limits(limits)?;

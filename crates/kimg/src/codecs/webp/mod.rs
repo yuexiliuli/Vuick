@@ -516,6 +516,41 @@ pub fn decode_static_lossless_rgba8_into(data: &[u8], out: &mut [u8]) -> ImageRe
     }
 }
 
+/// VP8L 静态族「生产直写」预检：解析容器并确认可被 [`decode_static_lossless_rgba8_into`]
+/// 直写接管（静态无损 / 无损-alpha）。返回 `(宽, 高, 目标缓冲字节数)`，其中缓冲字节数
+/// 沿用既有 `WebPDecoder::total_bytes` 口径（has_alpha → w*h*4；无 alpha → w*h*3，
+/// 与 `color_type()` 的 Rgb8 对齐），供调用方先按与现状一致的体积做 `Limits::reserve`。
+///
+/// 不可接管（VP8 有损 / 动画 / 容器畸形 / 无 VP8L 位流）或尺寸乘法上溢返回 `None`，
+/// 调用方回退既有解码路径（错误口径与现状一致，不改变 VP8L 之外任何家族行为）。
+/// 供 `ImageReader::decode` / `load_from_memory*` 的 VP8L 直写出口使用：先预检拿尺寸，
+/// 再以 [`decode_static_lossless_rgba8_into`] 直写调用方分配的 RGBA8 缓冲（单一全帧写，
+/// 消「内部解一次 + read_image 4→3 + to_rgba8 3→4」两次整帧冗余写）。
+pub(crate) fn lossless_static_size(data: &[u8]) -> Option<(u32, u32, usize)> {
+    let c = container::parse(data).ok()?;
+    if !c.family.is_static_lossless() {
+        return None;
+    }
+    // 与 `decode_static_lossless_rgba8_into` 同一取位流姿势（`c.bitstream` 为 VP8L 载荷）。
+    let bitstream = c.bitstream?;
+    let (width, height, has_alpha) = container::read_vp8l_dimensions(bitstream).ok()?;
+    let bytes_per_px: usize = if has_alpha { 4 } else { 3 };
+    let total = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(bytes_per_px)?;
+    Some((width, height, total))
+}
+
+/// 未初始化 RGBA8 输出缓冲（跳过 `vec![0u8; n]` 的整帧清零——直写核随后全量覆写 = 纯浪费）。
+/// sound：`u8` 无 Drop glue，`decode_into_rgba8` 在返回 Ok 前按「全覆写不变式」写满
+/// `out`（对齐快道 `decode_image_into` 顺序全写 + 原地字节交换；未对齐兜底整段拷贝）；
+/// 中途 Err 时缓冲由调用方丢弃（回退常规解码路径），无未初始化字节泄漏到图像之外。
+pub(crate) fn uninit_rgba8_vec(len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len);
+    unsafe { v.set_len(len) };
+    v
+}
+
 /// 自研 VP8 静态有损解码入口（P3 有损族，V4+ 接管）：家族=StaticLossy/LossyAlpha 时
 /// 调用。解析容器 → VP8 YUV → fancy RGB 直出。opaque（StaticLossy，无 alpha）：`decode_vp8_rgb3`
 /// 直出 **RGB3**（`OursStatic.rgb`，w*h*3，消 RGBA4 中间帧 / 4→3 转换 / 整帧 RGBA 分配）；

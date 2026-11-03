@@ -5,7 +5,7 @@ use std::io::{BufWriter, Cursor, Write};
 use std::path::Path;
 
 use crate::ImageDecoder as _;
-use crate::buffer::{RgbImage, RgbaImage};
+use crate::buffer::{ImageBuffer, RgbImage, RgbaImage};
 use crate::codecs::gif::GifEncoder;
 use crate::codecs::png::PngEncoder;
 use crate::color::ExtendedColorType;
@@ -40,6 +40,35 @@ pub fn load_from_memory(buf: &[u8]) -> ImageResult<DynamicImage> {
 /// A1 零拷贝：内存切片统一经 `GenericDecoder::new_slice` 特判——PNG 直接借用输入切片
 /// （[`crate::codecs::png::PngDecoder::from_slice`]，不整份复制），其余格式沿用通用读取路径。
 pub fn load_from_memory_with_format(buf: &[u8], format: ImageFormat) -> ImageResult<DynamicImage> {
+    if format == ImageFormat::WebP {
+        // VP8L 静态族「生产直写」出口（镜像 `ImageReader::decode`）：内存切片已含全量字节，
+        // 直接预检 + 直写 RGBA8 唯一缓冲；不可接管 / 解码失败回退既有解码路径。
+        let mut limits = Limits::default();
+        match crate::codecs::webp::lossless_static_size(buf) {
+            Some((w, h, total_bytes)) => {
+                // 与既有解码路径严格限制等价：先查严格尺寸（`set_limits` 的
+                // `check_dimensions` 口径），再按与现状一致的体积扣 `max_alloc`。
+                limits.check_dimensions(w, h)?;
+                limits.reserve(total_bytes as u64)?;
+                // 未初始化缓冲（免整帧清零）：直写核 Ok 前全量覆写 RGBA8（全覆写不变式）。
+                let mut rgba = crate::codecs::webp::uninit_rgba8_vec((w as usize) * (h as usize) * 4);
+                match crate::codecs::webp::decode_static_lossless_rgba8_into(buf, &mut rgba) {
+                    Ok(true) => {
+                        return Ok(DynamicImage::ImageRgba8(
+                            ImageBuffer::from_raw(w, h, rgba).expect("缓冲尺寸已校验"),
+                        ))
+                    }
+                    _ => limits.free(total_bytes as u64),
+                }
+            }
+            None => {}
+        }
+        let reader = Cursor::new(buf);
+        let mut decoder = crate::codecs::GenericDecoder::new_slice(format, reader)?;
+        limits.reserve(decoder.total_bytes())?;
+        decoder.set_limits(limits)?;
+        return DynamicImage::from_decoder(decoder);
+    }
     let reader = Cursor::new(buf);
     let mut decoder = crate::codecs::GenericDecoder::new_slice(format, reader)?;
     let mut limits = Limits::default();
