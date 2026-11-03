@@ -84,8 +84,13 @@ use vp8_tables::*;
 /// range≥128 时 renorm 位移恒为 0（no-op），跳过 lzcnt+shl；设 `0`/`false`/`off` 装回
 /// 无条件 renorm（同二进制 A/B 与双路径字节恒等交叉验证）。首次访问读一次 env 并缓存
 /// （同 simd.rs `webp_no_simd`/`yuv_u16_enabled` 的惰性 OnceLock 姿势，不引新依赖）。
+/// `#[cfg(test)]` 可经 `set_renorm_skip_override` 进程内翻转（优先于 env，RC2 同窗 A/B 用）。
 #[inline]
 fn ent_renorm_skip() -> bool {
+    #[cfg(test)]
+    if let Some(v) = renorm_skip_override::get() {
+        return v;
+    }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -95,6 +100,33 @@ fn ent_renorm_skip() -> bool {
             .to_string();
         !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
     })
+}
+
+/// `#[cfg(test)]` renorm_skip 进程内覆盖（优先于 env；RC2 同窗 A/B 用，同 simd `part_override` 姿势）。
+#[cfg(test)]
+mod renorm_skip_override {
+    use std::sync::atomic::{AtomicI8, Ordering::Relaxed};
+    static V: AtomicI8 = AtomicI8::new(-1);
+    pub fn set(v: Option<bool>) {
+        let val = match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        };
+        V.store(val, Relaxed);
+    }
+    pub fn get() -> Option<bool> {
+        match V.load(Relaxed) {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_renorm_skip_override(v: Option<bool>) {
+    renorm_skip_override::set(v);
 }
 
 /// RFC 6386 §7 宽窗口 bool 解码器：`value` 持有 8 位比较窗口 + 其下 `bits` 位后续输入，
@@ -1291,6 +1323,128 @@ fn tokens(
 /// 每宏块一次 Load/Store（对照 C# `ParseResiduals` 的 `decoder.Load(out v, out b, out r)` /
 /// `decoder.Store(v, b, r)`）：熵态三标量出结构入本地 SSA，函数边界用 `&mut` 只在进出各一次
 /// {value,bits,range}，`data`/`pos` 仅在 refill 触碰；内部 tokens 内联后全为寄存器。
+///
+/// **RC1 双路径**：`parse_residuals` 为分发器，按运行时一次判定进 `parse_residuals_bmi`
+/// （`#[target_feature(enable="lzcnt,bmi1,bmi2")]` 快道）或 `parse_residuals_base`（基线
+/// bsr+xor/mov→cl）。两变体函数体由下方宏展开自同一算术源——保证「bmi ≡ baseline」逐字节
+/// 一致是结构性的（仅指令选择不同）：inlined `tokens`/`ent_read_bit` 的 `range.leading_zeros()`
+/// 快道发 `lzcnt`（Haswell 1c vs bsr 3c）、变长移位发 `shrx/shlx`（免 `mov→cl` 依赖链）；
+/// 基线路径与 RC1 前逐指令相同（bsr+xorl $31）。分发每宏块一次（`ent_bmi_enabled()` 惰性
+/// OnceLock 原子读 + 恒定可预测分支），t1 主循环（MT 与串行共用 `entropy_macroblock`）都受益。
+macro_rules! parse_residuals_impl {
+    (
+        $d:ident, $probabilities:ident, $mb:ident, $sp:ident, $i16:ident, $above_nz:ident, $left_nz:ident
+    ) => ({
+        // Load（每宏块一次，仿 C# `ParseResiduals` 的 `decoder.Load(out v, out b, out r)`）：
+        // 熵态三标量出结构入调用方局部变量，走完 Store 回——热环内 {value,bits,range} 全程 SSA
+        // 寄存器，无 40B-byval 结构的逐位回写栈（Top1 主攻点）。`renorm_skip` 也在此判定一次
+        // （TOP4：OnceLock 每宏块一读，主环零 OnceLock load）。
+        let renorm_skip = ent_renorm_skip();
+        let data = $d.data;
+        let mut pos = $d.pos;
+        let mut value = $d.value;
+        let mut bits = $d.bits;
+        let mut range_minus1 = $d.range_minus1;
+        let mut above = *$above_nz;
+        let mut left = *$left_nz;
+        let mut masks = 0u64;
+        let mut block = if $i16 { 24usize } else { 0usize };
+        let (luma_type, luma_start, luma_dc) = if $i16 {
+            (0usize, 1usize, 1i32)
+        } else {
+            (3usize, 0usize, $sp.y_dc)
+        };
+        loop {
+            let (ty, start, dc, ac) = if block < 16 {
+                (luma_type, luma_start, luma_dc, $sp.y_ac)
+            } else if block < 24 {
+                (2usize, 0usize, $sp.uv_dc, $sp.uv_ac)
+            } else {
+                (1usize, 0usize, $sp.y2_dc, $sp.y2_ac)
+            };
+            let above_bit = BLOCK_ABOVE_CONTEXT_BIT[block];
+            let left_bit = BLOCK_LEFT_CONTEXT_BIT[block];
+            let context = (((above >> above_bit) & 1) + ((left >> left_bit) & 1)) as usize;
+            stage_clock::acct();
+            let last = tokens(
+                data,
+                &mut pos,
+                &mut value,
+                &mut bits,
+                &mut range_minus1,
+                renorm_skip,
+                &$probabilities[ty * 8 * 33..],
+                context,
+                start,
+                &mut $mb[block],
+                dc,
+                ac,
+            );
+            let nonzero = if last > 0 { 1u32 } else { 0u32 };
+            above = (above & !(1 << above_bit)) | (nonzero << above_bit);
+            left = (left & !(1 << left_bit)) | (nonzero << left_bit);
+            masks |= u64::from(nonzero) << block;
+            if last > 1 {
+                masks |= 1u64 << (block + 32);
+            }
+            stage_clock::acct();
+            if block == 24 {
+                block = 0;
+            } else {
+                block += 1;
+                if block == 24 {
+                    break;
+                }
+            }
+        }
+        // Store（每宏块一次，仿 C# `decoder.Store(v, b, r)`）。
+        $d.data = data;
+        $d.pos = pos;
+        $d.value = value;
+        $d.bits = bits;
+        $d.range_minus1 = range_minus1;
+        *$above_nz = above;
+        *$left_nz = left;
+        masks
+    })
+}
+
+/// 基线变体：与 RC1 前完全相同的指令选择（bsr+xorl $31 / mov→cl），旧 CPU 与
+/// `KIMG_WEBP_ENT_NO_BMI=1` 强制侧走本条。字节恒等由「bmi≡baseline」硬闸对拍。
+#[inline(never)]
+fn parse_residuals_base(
+    d: &mut Vp8BoolDecoder<'_>,
+    probabilities: &[u8],
+    mb: &mut [[i16; 16]; 25],
+    sp: &SegmentParameters,
+    i16: bool,
+    above_nz: &mut u32,
+    left_nz: &mut u32,
+) -> u64 {
+    parse_residuals_impl!(d, probabilities, mb, sp, i16, above_nz, left_nz)
+}
+
+/// BMI1/2+lzcnt 快道变体：`leading_zeros`→`lzcnt`、变长移位→`shrx/shlx`（免 cl 依赖）；
+/// 语义与基线逐字节一致（同宏体），仅指令选择不同。**Safety**：仅当 `ent_bmi_enabled()`
+/// 为真（`bmi2` 可用 ⇒ `bmi1`/`lzcnt` 亦可用）时被调用——`lzcnt` 在无 BMI1 CPU 上会被解码成
+/// `bsr`（语义反转→错字节），故绝不裸发；非 x86_64 本函数不存在（cfg 剔除）。
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "lzcnt,bmi1,bmi2")]
+unsafe fn parse_residuals_bmi(
+    d: &mut Vp8BoolDecoder<'_>,
+    probabilities: &[u8],
+    mb: &mut [[i16; 16]; 25],
+    sp: &SegmentParameters,
+    i16: bool,
+    above_nz: &mut u32,
+    left_nz: &mut u32,
+) -> u64 {
+    parse_residuals_impl!(d, probabilities, mb, sp, i16, above_nz, left_nz)
+}
+
+/// 熵系数解码分发器：见上方「RC1 双路径」说明。快道与基线由同一宏体展开（算术单源不分裂），
+/// 仅指令选择不同（`parse_residuals_impl!`）。
 #[inline(never)]
 fn parse_residuals(
     d: &mut Vp8BoolDecoder<'_>,
@@ -1301,77 +1455,13 @@ fn parse_residuals(
     above_nz: &mut u32,
     left_nz: &mut u32,
 ) -> u64 {
-    // Load（每宏块一次，仿 C# `ParseResiduals` 的 `decoder.Load(out v, out b, out r)`）：
-    // 熵态三标量出结构入调用方局部变量，走完 Store 回——热环内 {value,bits,range} 全程 SSA
-    // 寄存器，无 40B-byval 结构的逐位回写栈（Top1 主攻点）。`renorm_skip` 也在此判定一次
-    // （TOP4：OnceLock 每宏块一读，主环零 OnceLock load）。
-    let renorm_skip = ent_renorm_skip();
-    let data = d.data;
-    let mut pos = d.pos;
-    let mut value = d.value;
-    let mut bits = d.bits;
-    let mut range_minus1 = d.range_minus1;
-    let mut above = *above_nz;
-    let mut left = *left_nz;
-    let mut masks = 0u64;
-    let mut block = if i16 { 24usize } else { 0usize };
-    let (luma_type, luma_start, luma_dc) = if i16 {
-        (0usize, 1usize, 1i32)
-    } else {
-        (3usize, 0usize, sp.y_dc)
-    };
-    loop {
-        let (ty, start, dc, ac) = if block < 16 {
-            (luma_type, luma_start, luma_dc, sp.y_ac)
-        } else if block < 24 {
-            (2usize, 0usize, sp.uv_dc, sp.uv_ac)
-        } else {
-            (1usize, 0usize, sp.y2_dc, sp.y2_ac)
-        };
-        let above_bit = BLOCK_ABOVE_CONTEXT_BIT[block];
-        let left_bit = BLOCK_LEFT_CONTEXT_BIT[block];
-        let context = (((above >> above_bit) & 1) + ((left >> left_bit) & 1)) as usize;
-        stage_clock::acct();
-        let last = tokens(
-            data,
-            &mut pos,
-            &mut value,
-            &mut bits,
-            &mut range_minus1,
-            renorm_skip,
-            &probabilities[ty * 8 * 33..],
-            context,
-            start,
-            &mut mb[block],
-            dc,
-            ac,
-        );
-        let nonzero = if last > 0 { 1u32 } else { 0u32 };
-        above = (above & !(1 << above_bit)) | (nonzero << above_bit);
-        left = (left & !(1 << left_bit)) | (nonzero << left_bit);
-        masks |= u64::from(nonzero) << block;
-        if last > 1 {
-            masks |= 1u64 << (block + 32);
-        }
-        stage_clock::acct();
-        if block == 24 {
-            block = 0;
-        } else {
-            block += 1;
-            if block == 24 {
-                break;
-            }
-        }
+    #[cfg(target_arch = "x86_64")]
+    if super::simd::ent_bmi_enabled() {
+        // Safety：ent_bmi_enabled() 保证 bmi2（⇒bmi1/lzcnt）可用；快道与基线逐字节一致
+        // （「bmi≡baseline」硬闸覆盖），仅指令选择不同。
+        return unsafe { parse_residuals_bmi(d, probabilities, mb, sp, i16, above_nz, left_nz) };
     }
-    // Store（每宏块一次，仿 C# `decoder.Store(v, b, r)`）。
-    d.data = data;
-    d.pos = pos;
-    d.value = value;
-    d.bits = bits;
-    d.range_minus1 = range_minus1;
-    *above_nz = above;
-    *left_nz = left;
-    masks
+    parse_residuals_base(d, probabilities, mb, sp, i16, above_nz, left_nz)
 }
 
 /// 树遍历：node + read_bit_val(prob[node>>1]) 沿树下行，叶子（≤0）返回 -child。熵态以调用方
@@ -1408,6 +1498,150 @@ fn read_tree(
 /// 熵态三标量 {value,bits,range} 每宏块一次 Load/Store（对照 C# `ReadMacroBlockModes` 的
 /// `header.Load(out v, out b, out r)` / `header.Store(v, b, r)`）；`data`/`pos` 仅在 refill 触碰。
 /// 函数边界 `&mut` + 熵态局部标量拷贝（byval 会逐位回写内存，本形态保寄存器驻留）。
+///
+/// **RC1 双路径**（同 `parse_residuals`）：分发器按运行时一次判定进 `read_macroblock_modes_bmi`
+/// （lzcnt/bmi 快道）或 `read_macroblock_modes_base`（基线 bsr）。两变体函数体由宏
+/// `read_macroblock_modes_impl!` 展开自同一算术源——树路由（`read_tree`/内联 `ent_read_bit`）的
+/// 指令选择不同不影响字节。`ent_read_signed`（符号位）恒等 sh=1-(range>>7) 免 lzcnt，保持不动。
+macro_rules! read_macroblock_modes_impl {
+    (
+        $header:ident, $segment_probabilities:ident, $skip_probability:ident,
+        $above_modes:ident, $left_modes:ident, $block_modes:ident
+    ) => ({
+        let renorm_skip = ent_renorm_skip();
+        let data = $header.data;
+        let mut pos = $header.pos;
+        let mut value = $header.value;
+        let mut bits = $header.bits;
+        let mut range_minus1 = $header.range_minus1;
+        let segment = match $segment_probabilities {
+            Some(probs) => read_tree(
+                data,
+                &mut pos,
+                &mut value,
+                &mut bits,
+                &mut range_minus1,
+                renorm_skip,
+                &SEGMENT_ID_TREE,
+                probs,
+            ),
+            None => 0,
+        };
+        let skip = if $skip_probability < 0 {
+            0
+        } else {
+            ent_read_bit(
+                data,
+                &mut pos,
+                &mut value,
+                &mut bits,
+                &mut range_minus1,
+                renorm_skip,
+                $skip_probability as u8,
+            )
+        };
+        let y_mode = read_tree(
+            data,
+            &mut pos,
+            &mut value,
+            &mut bits,
+            &mut range_minus1,
+            renorm_skip,
+            &KEYFRAME_Y_MODE_TREE,
+            &KEYFRAME_Y_MODE_PROBS,
+        );
+        if y_mode == 4 {
+            for i in 0..16 {
+                let above = if i < 4 { $above_modes[i] } else { $block_modes[i - 4] };
+                let leftv = if (i & 3) == 0 {
+                    $left_modes[i >> 2]
+                } else {
+                    $block_modes[i - 1]
+                };
+                let p = &KEYFRAME_BLOCK_MODE_PROBS[(usize::from(above) * 10 + usize::from(leftv)) * 9..]
+                    [..9];
+                let mut node = 0usize;
+                loop {
+                    let bit = ent_read_bit(data, &mut pos, &mut value, &mut bits, &mut range_minus1, renorm_skip, p[node >> 1]);
+                    let child = BLOCK_MODE_TREE[node + bit as usize];
+                    if child <= 0 {
+                        $block_modes[i] = -child as u8;
+                        break;
+                    }
+                    node = child as usize;
+                }
+            }
+            for i in 0..4 {
+                $above_modes[i] = $block_modes[12 + i];
+                $left_modes[i] = $block_modes[i * 4 + 3];
+            }
+        } else {
+            let derived = match y_mode {
+                0 => 0u8,
+                1 => 2,
+                2 => 3,
+                _ => 1,
+            };
+            for m in $above_modes.iter_mut() {
+                *m = derived;
+            }
+            for m in $left_modes.iter_mut() {
+                *m = derived;
+            }
+        }
+        let uv_mode = read_tree(
+            data,
+            &mut pos,
+            &mut value,
+            &mut bits,
+            &mut range_minus1,
+            renorm_skip,
+            &UV_MODE_TREE,
+            &KEYFRAME_UV_MODE_PROBS,
+        );
+        $header.data = data;
+        $header.pos = pos;
+        $header.value = value;
+        $header.bits = bits;
+        $header.range_minus1 = range_minus1;
+        segment | (skip << 2) | (y_mode << 3) | (uv_mode << 6)
+    })
+}
+
+/// 基线变体：与 RC1 前完全相同的指令选择（bsr+xorl $31 / mov→cl）；旧 CPU 与
+/// `KIMG_WEBP_ENT_NO_BMI=1` 强制侧走本条。字节恒等由「bmi≡baseline」硬闸对拍。
+#[inline(never)]
+fn read_macroblock_modes_base(
+    header: &mut Vp8BoolDecoder<'_>,
+    segment_probabilities: Option<&[u8; 3]>,
+    skip_probability: i32,
+    above_modes: &mut [u8; 4],
+    left_modes: &mut [u8; 4],
+    block_modes: &mut [u8; 16],
+) -> u32 {
+    read_macroblock_modes_impl!(header, segment_probabilities, skip_probability, above_modes, left_modes, block_modes)
+}
+
+/// BMI1/2+lzcnt 快道变体：`leading_zeros`→`lzcnt`、变长移位→`shrx/shlx`（免 cl 依赖）；
+/// 语义与基线逐字节一致（同宏体），仅指令选择不同。**Safety**：仅当 `ent_bmi_enabled()`
+/// 为真（`bmi2` 可用 ⇒ `bmi1`/`lzcnt` 亦可用）时被调用——`lzcnt` 在无 BMI1 CPU 上会被解码成
+/// `bsr`（语义反转→错字节），故绝不裸发；非 x86_64 本函数不存在（cfg 剔除）。
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "lzcnt,bmi1,bmi2")]
+unsafe fn read_macroblock_modes_bmi(
+    header: &mut Vp8BoolDecoder<'_>,
+    segment_probabilities: Option<&[u8; 3]>,
+    skip_probability: i32,
+    above_modes: &mut [u8; 4],
+    left_modes: &mut [u8; 4],
+    block_modes: &mut [u8; 16],
+) -> u32 {
+    read_macroblock_modes_impl!(header, segment_probabilities, skip_probability, above_modes, left_modes, block_modes)
+}
+
+/// 宏块模式解码分发器：见「RC1 双路径」说明。树路由/符号位/renorm 全部熵位读落在快道或基线
+/// 变体内，两变体由同一宏体展开（算术单源不分裂），仅指令选择不同。
 #[inline(never)]
 fn read_macroblock_modes(
     header: &mut Vp8BoolDecoder<'_>,
@@ -1417,103 +1651,29 @@ fn read_macroblock_modes(
     left_modes: &mut [u8; 4],
     block_modes: &mut [u8; 16],
 ) -> u32 {
-    let renorm_skip = ent_renorm_skip();
-    let data = header.data;
-    let mut pos = header.pos;
-    let mut value = header.value;
-    let mut bits = header.bits;
-    let mut range_minus1 = header.range_minus1;
-    let segment = match segment_probabilities {
-        Some(probs) => read_tree(
-            data,
-            &mut pos,
-            &mut value,
-            &mut bits,
-            &mut range_minus1,
-            renorm_skip,
-            &SEGMENT_ID_TREE,
-            probs,
-        ),
-        None => 0,
-    };
-    let skip = if skip_probability < 0 {
-        0
-    } else {
-        ent_read_bit(
-            data,
-            &mut pos,
-            &mut value,
-            &mut bits,
-            &mut range_minus1,
-            renorm_skip,
-            skip_probability as u8,
-        )
-    };
-    let y_mode = read_tree(
-        data,
-        &mut pos,
-        &mut value,
-        &mut bits,
-        &mut range_minus1,
-        renorm_skip,
-        &KEYFRAME_Y_MODE_TREE,
-        &KEYFRAME_Y_MODE_PROBS,
-    );
-    if y_mode == 4 {
-        for i in 0..16 {
-            let above = if i < 4 { above_modes[i] } else { block_modes[i - 4] };
-            let leftv = if (i & 3) == 0 {
-                left_modes[i >> 2]
-            } else {
-                block_modes[i - 1]
-            };
-            let p = &KEYFRAME_BLOCK_MODE_PROBS[(usize::from(above) * 10 + usize::from(leftv)) * 9..]
-                [..9];
-            let mut node = 0usize;
-            loop {
-                let bit = ent_read_bit(data, &mut pos, &mut value, &mut bits, &mut range_minus1, renorm_skip, p[node >> 1]);
-                let child = BLOCK_MODE_TREE[node + bit as usize];
-                if child <= 0 {
-                    block_modes[i] = -child as u8;
-                    break;
-                }
-                node = child as usize;
-            }
-        }
-        for i in 0..4 {
-            above_modes[i] = block_modes[12 + i];
-            left_modes[i] = block_modes[i * 4 + 3];
-        }
-    } else {
-        let derived = match y_mode {
-            0 => 0u8,
-            1 => 2,
-            2 => 3,
-            _ => 1,
+    #[cfg(target_arch = "x86_64")]
+    if super::simd::ent_bmi_enabled() {
+        // Safety：ent_bmi_enabled() 保证 bmi2（⇒bmi1/lzcnt）可用；快道与基线逐字节一致
+        // （「bmi≡baseline」硬闸覆盖），仅指令选择不同。
+        return unsafe {
+            read_macroblock_modes_bmi(
+                header,
+                segment_probabilities,
+                skip_probability,
+                above_modes,
+                left_modes,
+                block_modes,
+            )
         };
-        for m in above_modes.iter_mut() {
-            *m = derived;
-        }
-        for m in left_modes.iter_mut() {
-            *m = derived;
-        }
     }
-    let uv_mode = read_tree(
-        data,
-        &mut pos,
-        &mut value,
-        &mut bits,
-        &mut range_minus1,
-        renorm_skip,
-        &UV_MODE_TREE,
-        &KEYFRAME_UV_MODE_PROBS,
-    );
-    header.data = data;
-    header.pos = pos;
-    header.value = value;
-    header.bits = bits;
-    header.range_minus1 = range_minus1;
-    segment | (skip << 2) | (y_mode << 3) | (uv_mode << 6)
+    read_macroblock_modes_base(
+        header,
+        segment_probabilities,
+        skip_probability,
+        above_modes,
+        left_modes,
+        block_modes,
+    )
 }
 
 /// 构造宏块 (mbx, mby) 的 above 缓冲：`above_y[0]`=左上、`[1..17]`=上 16、`[17..21]`=右上 4；
@@ -5107,5 +5267,348 @@ mod mt_tests {
             "WEBP_MT {name} {w}x{h} before={before:.3}ms after={after:.3}ms ratio={:.3}",
             before / after
         );
+    }
+
+    /// RC1 硬闸「bmi ≡ baseline」：同一宏体（`parse_residuals_impl!` /
+    /// `read_macroblock_modes_impl!`）展开的快道（lzcnt/bmi）与基线（bsr）逐字节一致——双路径仅
+    /// 指令选择不同，字节必须恒等。对有损 + lossy-alpha fixture 双态对拍三路：串行·基线 vs
+    /// 串行·BMI vs 双线程·BMI 全等。CPU 无 bmi2 → SKIP（快道不可合法执行，本闸自动退化为
+    /// 基线自对，不崩）。配合既有 MT parity（默认 ent=auto→bmi）即把「双路径字节恒等」钉全
+    /// （AGENTS §5：缺夹具 SKIP 是常态不是回归）。
+    #[test]
+    fn ent_bmi_matches_baseline_byte_exact() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // bmi2 可用性直接问 CPU（绕过 env 部件开关；覆盖 `set_simd_part_override` 不越权）。
+        let bmi2 = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                std::arch::is_x86_feature_detected!("bmi2")
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                false
+            }
+        };
+        let mut checked = 0usize;
+        let mut names: Vec<String> = webp_fixtures_support::webp_fixture_names();
+        names.sort();
+        for name in names {
+            let Some(p) = webp_fixtures_support::webp_fixture_path(&name) else {
+                continue;
+            };
+            let data = std::fs::read(&p).expect("read fixture");
+            let Ok(c) = container::parse(&data) else {
+                continue;
+            };
+            if c.family != container::Family::StaticLossy
+                && c.family != container::Family::LossyAlpha
+            {
+                continue;
+            }
+            // 基线（串行）：强制 ent 走 `*_base`（bsr 指令选择）。
+            super::super::simd::set_simd_part_override("ent", Some(false));
+            let Some(base) = decode_with_threads(&data, "0") else {
+                eprintln!("SKIP {name} 基线串行解码失败（外部语料不可解）");
+                continue;
+            };
+            if !bmi2 {
+                eprintln!("SKIP {name}（CPU 无 bmi2，快道不可用，仅基线自对）");
+                continue;
+            }
+            // 快道（串行 + 双线程）：强制 ent 走 `*_bmi`（lzcnt/bmi 指令选择）。
+            super::super::simd::set_simd_part_override("ent", Some(true));
+            let Some(bmi_serial) = decode_with_threads(&data, "0") else {
+                panic!("{name} 快道串行解码失败（基线已成功）");
+            };
+            let Some(bmi_para) = decode_with_threads(&data, "2") else {
+                panic!("{name} 快道 threads=2 解码失败（基线已成功）");
+            };
+            assert_eq!(
+                base.0, bmi_serial.0,
+                "{name}: entropy BMI vs baseline 串行 YUV/RGBA 逐字节"
+            );
+            assert_eq!(
+                base.1, bmi_serial.1,
+                "{name}: entropy BMI vs baseline 串行 RGBA 逐字节"
+            );
+            assert_eq!(
+                bmi_serial.0, bmi_para.0,
+                "{name}: entropy BMI 串行 vs 双线程 YUV/RGBA 逐字节"
+            );
+            assert_eq!(
+                bmi_serial.1, bmi_para.1,
+                "{name}: entropy BMI 串行 vs 双线程 RGBA 逐字节"
+            );
+            checked += 1;
+        }
+        super::super::simd::set_simd_part_override("ent", None);
+        unsafe {
+            std::env::remove_var("KIMG_WEBP_THREADS");
+        }
+        assert!(
+            checked >= 3 || !bmi2,
+            "应至少对拍 3 个有损 fixture（当前 {checked}；缺外部语料；无 bmi2 时退化为基线自对，不判失败）"
+        );
+        eprintln!("WEBP_ENT_BMI_PARITY_OK\t{checked}\t(serial_bmi≡baseline ∧ MT_bmi≡serial_bmi)");
+    }
+
+    /// RC1 A/B 同窗对拍（release 手动跑 `-- --ignored`）：进程内 override 只翻「熵走快道还是
+    /// 基线」，同二进制同布局——隔离的恰是本改动的纯指令选择差异（比跨构建对比更公平）。
+    /// 输出 tri：`entropy_stage`（stage_clock 熵段累计，含 per-MB Instant 插桩，看相对变化）、
+    /// `decode`（`decode_vp8` 整帧墙钟，无插桩，主标尺）、串行与双线程两档。
+    #[test]
+    #[ignore = "手动运行（release）"]
+    fn ent_bmi_ab_probe() {
+        use std::time::Instant;
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("imgbench-corpus")
+            .join("WEBP");
+        // 4K 高熵组（renorm 触发 65-85%，双路径收益主战场）+ 纯 VP8 photo 各档（低熵，须无回归）。
+        let files: [&str; 6] = [
+            "syn-noise-3840x2160.webp",
+            "syn-mandel-3840x2160.webp",
+            "syn-testsrc2-3840x2160.webp",
+            "strip-h6-lossy.webp",
+            "img_v3_0216r_0836ba29-7fe2-4c91-b768-77565ad841eg_MIDDLE_WEBP.webp",
+            "try-it-in-slintpad.webp",
+        ];
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let measure = |data: &[u8], w: u32, h: u32, threads: &str, bmi: bool, rounds: usize, clock: bool| -> (f64, f64) {
+            super::super::simd::set_simd_part_override("ent", Some(bmi));
+            unsafe {
+                std::env::set_var("KIMG_WEBP_THREADS", threads);
+            }
+            let mut wall = Vec::new();
+            let mut ent = Vec::new();
+            for _ in 0..2 {
+                let _ = decode_vp8(data, w, h).unwrap();
+            }
+            for _ in 0..rounds {
+                if clock {
+                    stage_clock::reset();
+                    stage_clock::set(true);
+                }
+                let t = Instant::now();
+                let _ = decode_vp8(data, w, h).unwrap();
+                wall.push(t.elapsed().as_secs_f64() * 1e3);
+                let e = if clock {
+                    let (ev, _, _, _) = stage_clock::totals();
+                    stage_clock::set(false);
+                    ev
+                } else {
+                    0.0
+                };
+                ent.push(e);
+            }
+            (median(&mut wall), median(&mut ent))
+        };
+        let _g = ENV_LOCK.lock().unwrap();
+        for name in files {
+            let p = corpus.join(name);
+            if !p.is_file() {
+                eprintln!("SKIP {name}（外部语料缺失）");
+                continue;
+            }
+            let data = std::fs::read(&p).unwrap();
+            let Ok(c) = container::parse(&data) else {
+                eprintln!("SKIP {name}（container 不可解析）");
+                continue;
+            };
+            if c.family != container::Family::StaticLossy {
+                eprintln!("SKIP {name}（family != StaticLossy，非本双路径测试对象）");
+                continue;
+            }
+            let Some(bs) = c.bitstream else {
+                eprintln!("SKIP {name}（bitstream=None）");
+                continue;
+            };
+            let (w, h) = (c.width, c.height);
+            if decode_vp8(bs, w, h).is_err() {
+                eprintln!("SKIP {name}（decode_vp8 不可解，排除非本测试对象）");
+                continue;
+            }
+            let rounds = if w * h >= 3840 * 2160 { 7 } else { 11 };
+            for threads in ["0", "2"] {
+                // 同窗交错 A/B（K68：单窗 off→on 顺序块会被热迁移/频率漂移污染）：
+                // 每轮 off/on 交错采样，两边同窗均完成；`measure` 只做单侧采样。
+                super::super::simd::set_simd_part_override("ent", Some(false));
+                unsafe {
+                    std::env::set_var("KIMG_WEBP_THREADS", threads);
+                }
+                let mut w_off = Vec::new();
+                let mut e_off = Vec::new();
+                let mut w_on = Vec::new();
+                let mut e_on = Vec::new();
+                let run = |bmi: bool, wall: &mut Vec<f64>, ent: &mut Vec<f64>| {
+                    super::super::simd::set_simd_part_override("ent", Some(bmi));
+                    for _ in 0..1 {
+                        let _ = decode_vp8(bs, w, h).unwrap();
+                    }
+                    stage_clock::reset();
+                    stage_clock::set(true);
+                    let t = Instant::now();
+                    let _ = decode_vp8(bs, w, h).unwrap();
+                    wall.push(t.elapsed().as_secs_f64() * 1e3);
+                    let (ev, _, _, _) = stage_clock::totals();
+                    ent.push(ev);
+                    stage_clock::set(false);
+                };
+                for _ in 0..2 {
+                    run(false, &mut w_off, &mut e_off);
+                    run(true, &mut w_on, &mut e_on);
+                }
+                for _ in 0..rounds {
+                    run(false, &mut w_off, &mut e_off);
+                    run(true, &mut w_on, &mut e_on);
+                }
+                super::super::simd::set_simd_part_override("ent", None);
+                let (w_off_m, e_off_m) = (median(&mut w_off), median(&mut e_off));
+                let (w_on_m, e_on_m) = (median(&mut w_on), median(&mut e_on));
+                eprintln!(
+                    "WEBP_ENT_AB {name} {w}x{h} thr={threads}: decode {}ms vs {}ms (ratio {:.3}) | \
+                     ent_stage {}ms vs {}ms (ratio {:.3})  [interleaved]",
+                    w_off_m,
+                    w_on_m,
+                    w_off_m / w_on_m,
+                    e_off_m,
+                    e_on_m,
+                    e_off_m / e_on_m
+                );
+            }
+        }
+        super::super::simd::set_simd_part_override("ent", None);
+        // 整 lossy 集汇总（74//71 有损 fixture：每只 decode_vp8 一次，off/on 各一遍，墙钟累加；
+        // 覆盖率反映「整体 lossy(71)」验收口径，大图（4K noise）主导；此处 clean 墙钟（无插桩）。
+        for threads in ["0", "2"] {
+            let mut off_sum = 0.0f64;
+            let mut on_sum = 0.0f64;
+            let mut n = 0usize;
+            for name in webp_fixtures_support::webp_fixture_names() {
+                let Some(p) = webp_fixtures_support::webp_fixture_path(&name) else {
+                    continue;
+                };
+                let data = std::fs::read(&p).expect("read fixture");
+                let Ok(c) = container::parse(&data) else {
+                    continue;
+                };
+                if c.family != container::Family::StaticLossy {
+                    continue;
+                }
+                let Some(bs) = c.bitstream else {
+                    continue;
+                };
+                let (w, h) = (c.width, c.height);
+                if decode_vp8(bs, w, h).is_err() {
+                    continue; // 非本解码器可解（如动画帧包），不在 lossy(71) 口径内
+                }
+                let (wo, _) = measure(bs, w, h, threads, false, 1, false);
+                let (won, _) = measure(bs, w, h, threads, true, 1, false);
+                off_sum += wo;
+                on_sum += won;
+                n += 1;
+            }
+            eprintln!(
+                "WEBP_ENT_CORPUS_SUM thr={threads} fixtures={n}: decode {}ms vs {}ms (ratio {:.3})",
+                off_sum,
+                on_sum,
+                off_sum / on_sum
+            );
+        }
+        unsafe {
+            std::env::remove_var("KIMG_WEBP_THREADS");
+        }
+    }
+
+    /// RC2 A/B：熵快道（ent 强制 ON）上 `KIMG_WEBP_ENT_RENORM_SKIP` 开（默认，range≥128 跳过
+    /// lzcnt+shl）vs 关（无条件 renorm）——lzcnt=1c 后「跳过」收益变化，本探针重新对拍。
+    /// 进程内 override（`set_renorm_skip_override`）交错同窗，测 noise/testsrc2/photo。
+    /// 【评审实测结论（2026-11-03）】净口径「持平偏正」：noise 反而嫌 skipped（decode
+    /// ratio~0.96，无 skip 略快），testsrc2/photo 持平/略负——即 skip 分支整体不带来可测收益，
+    /// 亦无系统性伤害。因净口径不显著，保留默认开（既有语义）、不做外提/移除（证据驱动不硬动）。
+    #[test]
+    #[ignore = "手动运行（release；RC2）"]
+    fn ent_renorm_skip_ab_probe() {
+        use std::time::Instant;
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("imgbench-corpus")
+            .join("WEBP");
+        let files: [&str; 3] = [
+            "syn-noise-3840x2160.webp",
+            "syn-testsrc2-3840x2160.webp",
+            "strip-h6-lossy.webp",
+        ];
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let _g = ENV_LOCK.lock().unwrap();
+        super::super::simd::set_simd_part_override("ent", Some(true));
+        unsafe {
+            std::env::set_var("KIMG_WEBP_THREADS", "0");
+        }
+        for name in files {
+            let p = corpus.join(name);
+            if !p.is_file() {
+                eprintln!("SKIP {name}（外部语料缺失）");
+                continue;
+            }
+            let data = std::fs::read(&p).unwrap();
+            let Ok(c) = container::parse(&data) else {
+                continue;
+            };
+            let Some(bs) = c.bitstream else {
+                continue;
+            };
+            let (w, h) = (c.width, c.height);
+            let rounds = if w * h >= 3840 * 2160 { 7 } else { 11 };
+            let run = |skip: bool, wall: &mut Vec<f64>, ent: &mut Vec<f64>| {
+                set_renorm_skip_override(Some(skip));
+                for _ in 0..1 {
+                    let _ = decode_vp8(bs, w, h).unwrap();
+                }
+                stage_clock::reset();
+                stage_clock::set(true);
+                let t = Instant::now();
+                let _ = decode_vp8(bs, w, h).unwrap();
+                wall.push(t.elapsed().as_secs_f64() * 1e3);
+                let (ev, _, _, _) = stage_clock::totals();
+                ent.push(ev);
+                stage_clock::set(false);
+            };
+            let (mut w_on, mut e_on, mut w_off, mut e_off) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..2 {
+                run(true, &mut w_on, &mut e_on);
+                run(false, &mut w_off, &mut e_off);
+            }
+            for _ in 0..rounds {
+                run(true, &mut w_on, &mut e_on);
+                run(false, &mut w_off, &mut e_off);
+            }
+            eprintln!(
+                "WEBP_ENT_RENORM_AB {name} {w}x{h} thr=0: decode(skipOn) {}ms vs {}ms (ratio {:.3}) | \
+                 ent_stage {}ms vs {}ms (ratio {:.3})  [skip=ON vs OFF, 快道]",
+                median(&mut w_on),
+                median(&mut w_off),
+                median(&mut w_on) / median(&mut w_off),
+                median(&mut e_on),
+                median(&mut e_off),
+                median(&mut e_on) / median(&mut e_off)
+            );
+        }
+        set_renorm_skip_override(None);
+        super::super::simd::set_simd_part_override("ent", None);
+        unsafe {
+            std::env::remove_var("KIMG_WEBP_THREADS");
+        }
     }
 }

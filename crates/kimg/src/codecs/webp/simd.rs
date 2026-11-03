@@ -66,6 +66,8 @@ pub(crate) fn simd_on(feature: &str) -> bool {
             "ssse3" => is_x86_feature_detected!("ssse3"),
             "sse4.1" => is_x86_feature_detected!("sse4.1"),
             "avx2" => is_x86_feature_detected!("avx2"),
+            // RC1 熵核双路径：`bmi2` ⇒ `bmi1` ⇒ `lzcnt`（语义安全链，`simd_on` 判定一次）。
+            "bmi2" => is_x86_feature_detected!("bmi2"),
             _ => false,
         }
     }
@@ -95,16 +97,24 @@ fn part_env_off(part: &str) -> bool {
     static PRED: AtomicBool = AtomicBool::new(false);
     static FLT: AtomicBool = AtomicBool::new(false);
     static DCT: AtomicBool = AtomicBool::new(false);
+    static ENT: AtomicBool = AtomicBool::new(false);
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         PRED.store(env_flag("KIMG_WEBP_NO_SIMD_PRED"), Relaxed);
         FLT.store(env_flag("KIMG_WEBP_NO_SIMD_FLT"), Relaxed);
         DCT.store(env_flag("KIMG_WEBP_NO_SIMD_DCT"), Relaxed);
+        // 熵核双路径（RC1）：`KIMG_WEBP_ENT_NO_BMI=1`（本功能专用名，brief 定）或部件一致性
+        // 名 `KIMG_WEBP_NO_SIMD_ENT=1`（同 PRED/FLT/DCT）任一 → 强制熵走基线（bsr+xor/mov→cl）。
+        ENT.store(
+            env_flag("KIMG_WEBP_ENT_NO_BMI") || env_flag("KIMG_WEBP_NO_SIMD_ENT"),
+            Relaxed,
+        );
     });
     match part {
         "pred" => PRED.load(Relaxed),
         "flt" => FLT.load(Relaxed),
         "dct" => DCT.load(Relaxed),
+        "ent" => ENT.load(Relaxed),
         _ => false,
     }
 }
@@ -115,6 +125,7 @@ mod part_override {
     static PRED: AtomicI8 = AtomicI8::new(-1);
     static FLT: AtomicI8 = AtomicI8::new(-1);
     static DCT: AtomicI8 = AtomicI8::new(-1);
+    static ENT: AtomicI8 = AtomicI8::new(-1);
     pub fn set(part: &str, on: Option<bool>) {
         let v = match on {
             Some(true) => 1,
@@ -125,6 +136,7 @@ mod part_override {
             "pred" => PRED.store(v, Relaxed),
             "flt" => FLT.store(v, Relaxed),
             "dct" => DCT.store(v, Relaxed),
+            "ent" => ENT.store(v, Relaxed),
             _ => {}
         }
     }
@@ -133,6 +145,7 @@ mod part_override {
             "pred" => PRED.load(Relaxed),
             "flt" => FLT.load(Relaxed),
             "dct" => DCT.load(Relaxed),
+            "ent" => ENT.load(Relaxed),
             _ => return None,
         };
         match v {
@@ -166,6 +179,17 @@ pub(crate) fn part_simd_on(part: &str, feature: &str) -> bool {
         return false;
     }
     simd_on(feature)
+}
+
+/// 熵核 BMI1/2+lzcnt 快道判定（x86_64；RC1 熵/token 指令选择双路径）：`KIMG_WEBP_ENT_NO_BMI=1`
+/// / `KIMG_WEBP_NO_SIMD_ENT=1` / `KIMG_WEBP_NO_SIMD=1` → 强制基线（bsr+xor/mov→cl，
+/// 「bmi ≡ baseline」字节恒等对拍的强制侧）；缺省按运行时 `bmi2` 判定（bmi2 ⇒ bmi1 ⇒ lzcnt
+/// 语义安全链，老 CPU 自动回落基线）。非 x86_64 恒 false。`#[cfg(test)]` 可经
+/// `set_simd_part_override("ent", ...)` 进程内翻转（优先于 env，同 pred/flt/dct 姿势）。
+/// 首次访问缓存一次 env+特性检测，之后仅 Relaxed 原子读——正常热循环开销可忽略。
+#[inline]
+pub(crate) fn ent_bmi_enabled() -> bool {
+    part_simd_on("ent", "bmi2")
 }
 
 /// `KIMG_WEBP_SIMD_FLT`（默认开）：`0`/`false`/`off` → 关（A/B 对照保留）；其余/缺省 → 开。
