@@ -187,6 +187,11 @@ pub(crate) struct OursStatic {
     pub exif: Option<Vec<u8>>,
     pub icc: Option<Vec<u8>>,
     pub xmp: Option<Vec<u8>>,
+    /// 直写惰性载荷：有损静态（opaque / LossyAlpha）时持原始压缩字节（Box）、像素未预解；
+    /// 无损 / 急切路径恒 None（像素在 `rgba`）。`read_image` 见 `raw_data` 即走
+    /// `decode_static_lossy_rgba8_into` 直写调用方缓冲——不经中间 `Vp8Yuv.rgba` 整帧分配 +
+    /// `read_image` 整帧拷贝（镜像无损 `decode_static_lossless_rgba8_into` 的直写姿势）。
+    pub raw_data: Option<Box<[u8]>>,
 }
 
 enum WebPDecoderInner {
@@ -256,17 +261,33 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
         if c.family == container::Family::StaticLossy
             || c.family == container::Family::LossyAlpha
         {
-            return match crate::codecs::webp::decode_static_lossy(&data)? {
-                Some(ours) => Ok(Self {
-                    inner: WebPDecoderInner::Ours(ours),
-                    orientation: None,
-                    _r: PhantomData,
+            // 有损静态：不再急切整帧解码。持压缩载荷（`raw_data`），`read_image` 经
+            // `decode_static_lossy_rgba8_into` 直写调用方缓冲——消「内部 `Vp8Yuv.rgba` 整帧分配 +
+            // `read_image` 整帧拷贝」两笔 w*h*4 税（字节恒等：直写核与既有 `decode_static_lossy`
+            // 同一 `decode_from_header` 发射路径，仅输出目标不同）。尺寸/元数据由容器解析即得，
+            // 无需像素。有损输出恒 RGBA8（opaque 有损 α 恒 255、LossyAlpha 真实 A 通道），
+            // 与既有 `decode_static_lossy`/`color_type` 语义一致（`has_alpha=true`）。
+            let (lossy_w, lossy_h) = (c.width, c.height);
+            let lossy_exif = c.exif.map(|e| e.to_vec());
+            let lossy_icc = c.icc_profile.map(|e| e.to_vec());
+            let lossy_xmp = c.xmp.map(|e| e.to_vec());
+            // 元数据/尺寸已抽到本地，`c` 不再借用 `data` → 可安全整体移入惰性载荷。
+            let raw = data.into_boxed_slice();
+            return Ok(Self {
+                inner: WebPDecoderInner::Ours(OursStatic {
+                    rgba: vp8l::RgbaBytes::default(),
+                    rgb: Vec::new(),
+                    width: lossy_w,
+                    height: lossy_h,
+                    has_alpha: true,
+                    exif: lossy_exif,
+                    icc: lossy_icc,
+                    xmp: lossy_xmp,
+                    raw_data: Some(raw),
                 }),
-                None => Err(ImageError::Decoding(DecodingError::new(
-                    ImageFormat::WebP.into(),
-                    "WebP 有损静态解码失败（已自包含，无 image-webp 兜底）",
-                ))),
-            };
+                orientation: None,
+                _r: PhantomData,
+            });
         }
         Err(ImageError::Decoding(DecodingError::new(
             ImageFormat::WebP.into(),
@@ -362,6 +383,27 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
         assert_eq!(u64::try_from(buf.len()), Ok(self.total_bytes()));
         match self.inner {
             WebPDecoderInner::Ours(o) => {
+                // 有损静态直写进口：`OursStatic` 持原始压缩字节（惰性 `raw_data`），
+                // `decode_static_lossy_rgba8_into` 把 VP8 行定稿直出直接写调用方 `buf`，不经
+                // 中间 `Vp8Yuv.rgba` 整帧分配 + 本函数整帧拷贝（opaque 与 LossyAlpha 两族同走，
+                // 镜像无损 `decode_into_rgba8` 直写姿势；输出恒 RGBA8 缓冲）。
+                if let Some(data) = o.raw_data.as_deref() {
+                    let target = (o.width as usize) * (o.height as usize) * 4;
+                    if buf.len() != target {
+                        return Err(ImageError::Decoding(DecodingError::new(
+                            ImageFormat::WebP.into(),
+                            "Ours 解码缓冲长度与像素缓冲不一致",
+                        )));
+                    }
+                    return match crate::codecs::webp::decode_static_lossy_rgba8_into(data, buf) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(ImageError::Decoding(DecodingError::new(
+                            ImageFormat::WebP.into(),
+                            "有损静态直写接管失败（家族已核，不应发生）",
+                        ))),
+                        Err(e) => Err(e),
+                    };
+                }
                 if o.has_alpha {
                     let target = (o.width as usize) * (o.height as usize) * 4;
                     if buf.len() != target {
@@ -491,6 +533,7 @@ pub(crate) fn decode_static_lossless(
         exif: c.exif.map(|e| e.to_vec()),
         icc: c.icc_profile.map(|e| e.to_vec()),
         xmp: c.xmp.map(|e| e.to_vec()),
+        raw_data: None,
     }))
 }
 
@@ -512,6 +555,53 @@ pub fn decode_static_lossless_rgba8_into(data: &[u8], out: &mut [u8]) -> ImageRe
         None => return Ok(false),
     };
     match vp8l::decode_into_rgba8(bitstream, out) {
+        Ok(()) => Ok(true),
+        Err(e) => Err(ImageError::Decoding(DecodingError::new(
+            ImageFormat::WebP.into(),
+            e.0,
+        ))),
+    }
+}
+
+/// 自研 VP8 静态直写调用方 RGBA8 缓冲（`C# DecodeTo` 镜像：暖态零分配；`data` 为完整 WEBP
+/// 文件，`out` 长度须 == w*h*4）。仅 VP8 静态族（opaque 有损 / 有损-alpha）且自研可解时接管
+/// 直写并返回 `Ok(true)`（`out` 已写满 RGBA8——行定稿直出直写，不经整帧 `Vp8Yuv.rgba` 中间
+/// 缓冲，消 w*h*4 分配 + 整帧拷贝）；非可接管家族（VP8L 无损 / 动画等）返回 `Ok(false)`，
+/// 调用方自回退既有路径；畸形/自研解码失败返回 `Err`。
+/// 供 `WebPDecoder::read_image` 的有损静态直写出口使用（镜像
+/// [`decode_static_lossless_rgba8_into`] 的直写姿势），不改既有 `decode_static_lossy`
+/// /`WebPDecoder` 公共语义。
+pub fn decode_static_lossy_rgba8_into(data: &[u8], out: &mut [u8]) -> ImageResult<bool> {
+    let c = match container::parse(data) {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
+    };
+    if c.family != container::Family::StaticLossy && c.family != container::Family::LossyAlpha {
+        return Ok(false);
+    }
+    let bitstream = match c.bitstream {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+    let result = if c.family == container::Family::LossyAlpha {
+        // ALPH 反滤波平面先整帧解出（独立于 VP8 解码），随后把 alpha 行并入 VP8 发射内层、
+        // 直接写 `out`——与 `decode_static_lossy` 同语义，仅输出目标由内部 rgba 变为调用方
+        // 缓冲（alpha 平面 w*h 沿用既有形态，非本次优化对象）。
+        let alpha_plane = match c.frames.first().and_then(|f| f.alpha.clone()) {
+            Some(range) => match decode_and_unfilter_alpha(&data[range], c.width, c.height) {
+                Some(p) => Some(p),
+                // ALPH chunk 存在但不可解码：与急切 `decode_static_lossy` 的「保守降级显式错」
+                // 语义对齐——拒绝接通直写（`Ok(false)` → read_image 回显式 Decoding 接管失败），
+                // 禁用 α=255 静默错像素输出。
+                None => return Ok(false),
+            },
+            None => None,
+        };
+        vp8::decode_vp8_with_alpha_into(bitstream, c.width, c.height, alpha_plane.as_deref(), out)
+    } else {
+        vp8::decode_vp8_into(bitstream, c.width, c.height, out)
+    };
+    match result {
         Ok(()) => Ok(true),
         Err(e) => Err(ImageError::Decoding(DecodingError::new(
             ImageFormat::WebP.into(),
@@ -561,6 +651,7 @@ pub(crate) fn uninit_rgba8_vec(len: usize) -> Vec<u8> {
 /// `to_rgba8`/`into_rgba8` 零拷贝，消 RGB3→RGBA4 展开+零值分配税）；
 /// LossyAlpha：`decode_vp8_with_alpha` 把 ALPH 反滤波 alpha 行并入发射内层。出错/不可接管
 /// 回 `Ok(None)`（调用方转为显式错误，自包含后无 image-webp 兜底）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_static_lossy(
     data: &[u8],
 ) -> ImageResult<Option<crate::codecs::webp::OursStatic>> {
@@ -610,6 +701,7 @@ pub(crate) fn decode_static_lossy(
             exif: c.exif.map(|e| e.to_vec()),
             icc: c.icc_profile.map(|e| e.to_vec()),
             xmp: c.xmp.map(|e| e.to_vec()),
+            raw_data: None,
         }));
     }
     // opaque 静态有损：单遍 YUV→RGBA4 直出（α 恒 0xFF 熔入发射内层、无 alpha 平面融合，镜像
@@ -634,6 +726,7 @@ pub(crate) fn decode_static_lossy(
         exif: c.exif.map(|e| e.to_vec()),
         icc: c.icc_profile.map(|e| e.to_vec()),
         xmp: c.xmp.map(|e| e.to_vec()),
+        raw_data: None,
     }))
 }
 
@@ -1124,14 +1217,15 @@ mod opaque_rgba_path_tests {
                     "{name} px={i}: RGB 前 3 字节应等于旧 RGB3 直出"
                 );
             }
-            // 经公开 API：color_type=Rgba8、read_image RGBA 目标直拷 OursStatic.rgba。
+            // 经公开 API：color_type=Rgba8、read_image RGBA 目标直写（`WebPDecoder` 有损现走
+            // 惰性 `decode_static_lossy_rgba8_into` 直写 `buf`，不经中间 `Vp8Yuv.rgba`）。
             set_webp_backend(BACKEND_OURS);
             let dec = WebPDecoder::new(Cursor::new(&data)).expect("WebPDecoder");
             assert_eq!(dec.color_type(), ColorType::Rgba8, "{name}: opaque 动态分类应 Rgba8");
             let mut buf = vec![0u8; dec.total_bytes() as usize];
             dec.read_image(&mut buf).expect("read_image");
             assert_eq!(buf.len(), n_px * 4, "{name}: read_image 目标应为 w*h*4");
-            assert_eq!(buf, ours_rgba, "{name}: read_image 应直拷 OursStatic.rgba");
+            assert_eq!(buf, ours_rgba, "{name}: read_image 直写应与 eager decode_static_lossy 逐字节一致");
             checked += 1;
         }
         set_webp_backend(BACKEND_AUTO);

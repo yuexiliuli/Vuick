@@ -2701,7 +2701,7 @@ pub(crate) fn decode_vp8(frame: &[u8], width: u32, height: u32) -> Result<Vp8Yuv
     if fh.width != width || fh.height != height {
         return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
     }
-    decode_from_header(fh, false, 4, None)
+    decode_from_header(fh, false, 4, None, None)
 }
 
 /// lossy-alpha 专用：同 [`decode_vp8`]（`need_tight=false`），但行定稿直出时把 `alpha` 平面
@@ -2709,6 +2709,9 @@ pub(crate) fn decode_vp8(frame: &[u8], width: u32, height: u32) -> Result<Vp8Yuv
 /// 一次写好（YUV→RGB 结果 R/G/B 与 alpha 同拍），消灭「RGBA4 全帧发射 + 事后独立标量逐像素
 /// 写 alpha」两遍合成。`alpha=None`（无 ALPH chunk 的 malformed 输入）时 α 恒 255，与
 /// `decode_vp8` 逐字节一致。产物落 `Vp8Yuv.rgba`。
+/// lossy-alpha 专用直写入口见 [`decode_vp8_with_alpha_into`]；本急切收缓冲版本保留供测试/
+/// 参考（K24 dormancy，生产热路径已直写）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_vp8_with_alpha(
     frame: &[u8],
     width: u32,
@@ -2722,7 +2725,42 @@ pub(crate) fn decode_vp8_with_alpha(
     if let Some(a) = alpha {
         debug_assert_eq!(a.len(), (width as usize) * (height as usize));
     }
-    decode_from_header(fh, false, 4, alpha)
+    decode_from_header(fh, false, 4, alpha, None)
+}
+
+/// 直写有损解码（opaque）：同 [`decode_vp8`]（`need_tight=false`，α=255 熔入发射内层）但行定稿
+/// 直出直接写调用方 `out`（RGBA4），不经内部整帧 `Vp8Yuv.rgba`——消 w*h*4 中间分配 + 事后整帧
+/// 拷贝。`out` 长度须为 w*h*4。字节恒等：与 [`decode_vp8`] 同一 `decode_from_header` 发射路径，
+/// 仅「输出写入目标」不同。供 `decode_static_lossy_rgba8_into` 直写热路径使用。
+pub(crate) fn decode_vp8_into(frame: &[u8], width: u32, height: u32, out: &mut [u8]) -> Result<()> {
+    let fh = stage_clock::header(|| parse_frame_header(frame))?;
+    if fh.width != width || fh.height != height {
+        return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
+    }
+    decode_from_header(fh, false, 4, None, Some(out))?;
+    Ok(())
+}
+
+/// 直写有损解码（lossy-alpha）：同 [`decode_vp8_with_alpha`] 但行定稿直出直接写调用方 `out`
+/// （alpha 行并入发射内层，同 [`decode_vp8_into`] 的直写姿势）。`out` 长度须为 w*h*4；字节
+/// 恒等 = 与 [`decode_vp8_with_alpha`] 同一 `decode_from_header` 发射路径。供
+/// `decode_static_lossy_rgba8_into` 直写热路径使用。
+pub(crate) fn decode_vp8_with_alpha_into(
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    alpha: Option<&[u8]>,
+    out: &mut [u8],
+) -> Result<()> {
+    let fh = stage_clock::header(|| parse_frame_header(frame))?;
+    if fh.width != width || fh.height != height {
+        return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
+    }
+    if let Some(a) = alpha {
+        debug_assert_eq!(a.len(), (width as usize) * (height as usize));
+    }
+    decode_from_header(fh, false, 4, alpha, Some(out))?;
+    Ok(())
 }
 
 /// 【dormancy，K24】opaque 有损 RGB3 直出旧入口：同 [`decode_vp8`]（`need_tight=false`）且行定稿
@@ -2736,7 +2774,7 @@ pub(crate) fn decode_vp8_rgb3(frame: &[u8], width: u32, height: u32) -> Result<V
     if fh.width != width || fh.height != height {
         return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
     }
-    decode_from_header(fh, false, 3, None)
+    decode_from_header(fh, false, 3, None, None)
 }
 
 /// 测试/兼容路径：同 [`decode_vp8`] 且一并抽紧密 y/u/v 平面（V2/V3 YUV golden 对拍用）。
@@ -2746,7 +2784,7 @@ pub(crate) fn decode_vp8_tight(frame: &[u8], width: u32, height: u32) -> Result<
     if fh.width != width || fh.height != height {
         return Err(Vp8Error::new("VP8 与容器尺寸不一致"));
     }
-    decode_from_header(fh, true, 4, None)
+    decode_from_header(fh, true, 4, None, None)
 }
 
 /// 阶段分账解码（`stage_profile` feature 门控；供 imgbench `vp8_stage_probe`，K59 统一基座）。
@@ -3281,7 +3319,13 @@ fn reconstruct_macroblock(
     });
 }
 
-fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, alpha: Option<&[u8]>) -> Result<Vp8Yuv> {
+fn decode_from_header(
+    fh: FrameHeader<'_>,
+    need_tight: bool,
+    channels: usize,
+    alpha: Option<&[u8]>,
+    out: Option<&mut [u8]>,
+) -> Result<Vp8Yuv> {
     debug_assert!(channels == 3 || channels == 4);
     let width = fh.width as usize;
     let height = fh.height as usize;
@@ -3313,12 +3357,16 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
                 v[r * uv_pitch] = 129;
             }
         }
-        // 行定稿直出缓冲（整帧；worker/串行路径按 MB 行滚动填写）。`channels`=3（RGB3 opaque
-        // 有损直出）/4（RGBA）。
+        // 行定稿直出缓冲：`out=Some`（直写调用方缓冲）时跳过整帧 w*h*channels 自分配——由
+        // 调用方缓冲承担，结构性省一次整帧分配；两分支（Pipelined/串行）随后都以 `dst` 为
+        // 唯一写入目标。`channels`=3（RGB3 opaque 有损直出）/4（RGBA）。
         // L3：未初始化分配——两条直出路径（pipelined `filter_t3_loop` / 串行
         // `filter_and_emit_serial`）都逐行写满 `[0,height)×width×channels`，返回前无任何字节读，
         // 错误路径直接 Err（不构造 Vp8Yuv），故省略全量 memset 逐字节不变（仅省零化墙钟）。
-        let rgba = unsafe { uninit_vec_u8(width * height * channels) };
+        let rgba = match &out {
+            Some(_) => Vec::new(),
+            None => unsafe { uninit_vec_u8(width * height * channels) },
+        };
         // 紧密平面输出缓冲（真实宽高；仅供测试/兼容 API 消费，生产 rgba 路径弃用 = 纯浪费，
         // 由 `need_tight` 门控跳过以省 1-2 遍整帧写）。L3 未初始化：MT 由 t3 直出、串行由尾段
         // `extract_tight_rows` 写满，返回前不被读，省略 memset 逐字节不变。
@@ -3337,6 +3385,23 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
     });
     let (mut y, uv_rest) = planes.split_at_mut(y_vec_len);
     let (mut u, mut v) = uv_rest.split_at_mut(uv_vec_len);
+
+    // 行定稿直出目标：`out=Some`（调用方缓冲，`decode_vp8_into`/`decode_vp8_with_alpha_into`
+    // 直写入口）或内部整帧 `rgba`（既有收缓冲路径）。长度校验先于任何像素写入，直接 Err
+    // 而非静默截断——与无损侧 `decode_into_rgba8` 的「输出缓冲长度须为 w*h*4」同口径。
+    let dst: &mut [u8] = match out {
+        Some(o) => {
+            let expect = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(channels))
+                .ok_or_else(|| Vp8Error::new("VP8 直写缓冲尺寸溢出"))?;
+            if o.len() != expect {
+                return Err(Vp8Error::new("VP8 直写缓冲长度须为 w*h*channels"));
+            }
+            o
+        }
+        None => &mut rgba,
+    };
 
     let mut header = fh.header;
     let (
@@ -3415,7 +3480,7 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
             let yb = &mut *y;
             let ub = &mut *u;
             let vb = &mut *v;
-            let rb = &mut *rgba;
+            let rb = &mut *dst;
             let oy = &mut *out_y;
             let ou = &mut *out_u;
             let ov = &mut *out_v;
@@ -3522,7 +3587,7 @@ fn decode_from_header(fh: FrameHeader<'_>, need_tight: bool, channels: usize, al
         let mut scratch = EmitScratch::new(width);
         filter_and_emit_serial(
             &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw, mbh, &fh.filter, &row_filters,
-            width, height, &mut rgba, &mut scratch, channels, alpha,
+            width, height, dst, &mut scratch, channels, alpha,
         );
 
         // 抽紧密平面（仅测试/兼容 API 路径 need_tight；生产 rgba 直出路径跳过 = 省整帧写）。

@@ -4965,6 +4965,42 @@ mod tests {
         eprintln!("DC_ADD_TWO_SIMD_PARITY\t{checked}");
     }
 
+    #[test]
+    fn dc_add_one_simd_matches_scalar() {
+        if !simd_on("sse2") {
+            eprintln!("SIMD_TEST SKIP (无 sse2)");
+            return;
+        }
+        set_simd_part_override("dct", Some(true)); // 强制 SSE2：i4 纯 DC 捷径核（单块）逐字节==标量全核
+        let mut rng = Lcg(0x0123456789abcdef);
+        let pitch = 64usize;
+        let mut plane_simd = vec![0u8; 64 * 64];
+        let mut plane_scalar = vec![0u8; 64 * 64];
+        let mut checked = 0usize;
+        for trial in 0..400 {
+            let dc = coeff_i16(&mut rng);
+            for px in plane_simd.iter_mut() {
+                *px = rng.byte();
+            }
+            let (row0, col0) = (8 + (trial % 8), 8 + (trial % 8));
+            plane_scalar.copy_from_slice(&plane_simd);
+            // SIMD 捷径核：`ac_mask` 位 0 分发的 i4 纯 DC 块（生产路径 `dc_add_one_forced`）。
+            unsafe { super::dc_add_one_forced(dc, &mut plane_simd, pitch, row0, col0) };
+            // 标量参考：对仅 DC 块走完整逆变换（[dc,0..0] 残差恒 (dc+4)>>3，与捷径同输出，
+            // 同 `dc_add_two_simd_matches_scalar` 的既有等价性姿势）。
+            let mut c = [0i16; 16];
+            c[0] = dc;
+            super::super::vp8::inverse_dct_add(&c, &mut plane_scalar, pitch, row0, col0, true);
+            assert_eq!(
+                plane_simd, plane_scalar,
+                "dc_add_one trial={trial} dc={dc} row0={row0} col0={col0}"
+            );
+            checked += 1;
+        }
+        set_simd_part_override("dct", None);
+        eprintln!("DC_ADD_ONE_SIMD_PARITY\t{checked}");
+    }
+
     // -----------------------------------------------------------------------
     // VP8L 预测器 / 色变换：SIMD（块段分派）与标量逐字节一致
     // -----------------------------------------------------------------------
