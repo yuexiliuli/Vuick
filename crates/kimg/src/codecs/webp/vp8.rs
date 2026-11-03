@@ -3361,7 +3361,7 @@ fn decode_from_header(
         // 调用方缓冲承担，结构性省一次整帧分配；两分支（Pipelined/串行）随后都以 `dst` 为
         // 唯一写入目标。`channels`=3（RGB3 opaque 有损直出）/4（RGBA）。
         // L3：未初始化分配——两条直出路径（pipelined `filter_t3_loop` / 串行
-        // `filter_and_emit_serial`）都逐行写满 `[0,height)×width×channels`，返回前无任何字节读，
+        // `filter_emit_serial_row`）都逐行写满 `[0,height)×width×channels`，返回前无任何字节读，
         // 错误路径直接 Err（不构造 Vp8Yuv），故省略全量 memset 逐字节不变（仅省零化墙钟）。
         let rgba = match &out {
             Some(_) => Vec::new(),
@@ -3550,6 +3550,8 @@ fn decode_from_header(
         // 「每宏块 `MbPacket::default()`」等价（硬闸 threads2/static_lossy 覆盖），且省去整帧
         // ~27MB 的 830B 内容无关零化（跳过宏块仅零化 16 个 DC 槽 32B）。
         let mut pkt = MbPacket::default();
+        let mut scratch = EmitScratch::new(width);
+        let mut emitted = 0usize;
         for mby in 0..mbh {
             // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
             let mut left_b = [0u8; 4];
@@ -3579,16 +3581,30 @@ fn decode_from_header(
                     mbx, mby, mbw, &mut pkt,
                 );
             }
+            // 行窗：重建行 mby 后，上一行 mby-1 的滤波输入已全部就绪（bottom 邻行 mby 已做），
+            // 立即滤波上一行并发射其已定稿行 —— 滤波/YUV 读的都是刚写出的热行（消整帧重建毕
+            // 再滤波的冷平面重读）。字节恒等：与旧「整帧重建毕 → filter_and_emit_serial」滤波
+            // 行序完全一致（filter 0,1,…,mbh-1，逐宏块行同序），且本方案滤波 mby-1 恰在重建
+            // mby 之后（bottom 邻行已重建、非滤波污染），预测读未滤波行的不变式保持。
+            if mby >= 1 {
+                emitted = filter_emit_serial_row(
+                    &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw,
+                    mby - 1, mbh, &fh.filter, &row_filters[(mby - 1) * mbw..mby * mbw],
+                    width, height, dst, &mut scratch, channels, alpha, emitted,
+                );
+            }
         }
-
-        // 串行：整帧重建后按宏块行「环路滤波 → 行定稿直出」（等价 C# 逐行滤波 +
-        // `RgbaSink.Emit`：预测读未滤波行、滤波读已重建行，顺序一致；每滤完一行立即输出
-        // 已定稿行 `[emitted, mbY*16+8)`，无需等整帧、无第二趟）。
-        let mut scratch = EmitScratch::new(width);
-        filter_and_emit_serial(
-            &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw, mbh, &fh.filter, &row_filters,
-            width, height, dst, &mut scratch, channels, alpha,
-        );
+        // 收尾：最后一行 mbh-1（其 bottom 邻行为 padded 末行，整帧重建毕），滤波并发射剩余行。
+        // mbh==0（0 高帧，未见实际语料）时旧整帧路径 filter_and_emit_serial 直接空跑，此处
+        // 同样跳过（`mbh-1` 会下溢）。
+        if mbh > 0 {
+            #[allow(unused_assignments)]
+            let emitted = filter_emit_serial_row(
+                &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw,
+                mbh - 1, mbh, &fh.filter, &row_filters[(mbh - 1) * mbw..mbh * mbw],
+                width, height, dst, &mut scratch, channels, alpha, emitted,
+            );
+        }
 
         // 抽紧密平面（仅测试/兼容 API 路径 need_tight；生产 rgba 直出路径跳过 = 省整帧写）。
         // L3：out_* 已未初始化分配，下方逐行写满（读已整帧滤波的 y/u/v padded 平面），
@@ -3797,7 +3813,7 @@ pub(crate) fn filter_edge(
 
 /// 每宏块行滤波：按 C# `FilterMacroblockRow` 的顺序（左→内竖→上→内横），逐宏块滤波。
 /// `row_filters` 为**本行** `mbw` 个 `(level, inner)`（调用方按行切窗/按行包传递，见
-/// `filter_and_emit_serial` 与 `worker_loop`）。本函数是环路滤波的**串行语义源**：串行与
+/// `filter_emit_serial_row` 与 `worker_loop`）。本函数是环路滤波的**串行语义源**：串行与
 /// 新 MT 两路径只调度它，行内/宏块内/边顺序与算术完全不变，故任一路径的输出与串行逐字节
 /// 一致（硬闸：`threads2_matches_serial_byte_exact`）。
 #[allow(clippy::too_many_arguments)]
@@ -4278,18 +4294,25 @@ fn emit_rows_into_rgb3(
     });
 }
 
-/// 串行路径：逐宏块行「环路滤波 → 行定稿直出」（RGBA4 当 `channels=4`；RGB3 当 `channels=3`）。
-/// `end = mbY==末行 ? height : mbY*16+8`：行 `[emitted, mbY*16+8)` 只被第 mbY 行的滤波读写定稿
-/// （下一行滤波只触及本行 13..15 及 chroma 5..7），故滤完即出，无需等待整帧。上采样相邻
-/// chroma 行最远取 `mbY*8+4`，同属本 MB 行、已在本次滤波定稿。
+/// 串行路径行窗步进：滤波单个已重建宏块行 `mby`（读其 top 邻行 mby-1、bottom 邻行 mby+1，
+/// 两者均须已重建），然后发射已定稿行 `[emitted, end)`（RGBA4 当 `channels=4`；RGB3 当
+/// `channels=3`），返回新的 `emitted` 水位。
+///
+/// `end = mby==mbh-1 ? height : mby*16+8`（等价 C# `RgbaSink.Emit` 的 `end=mbY*16+8` 语义）：
+/// 行 `[emitted, mby*16+8)` 只被第 mby 行的滤波读写定稿——下一行滤波只触及本行 13..15 及
+/// chroma 5..7，故滤完即出；上采样相邻 chroma 行最远取 `mby*8+4`，同属本 MB 行、已在本次
+/// 滤波定稿。本函数的滤波行序与旧 `filter_and_emit_serial` 完全一致：第 mby 行滤波恰排在
+/// 上一行滤波之后（调用方按 mby=0..mbh-1 逐行调用，末行在整帧重建毕后调用），故发射的
+/// 字节段序与旧路径恒等。
 #[allow(clippy::too_many_arguments)]
-fn filter_and_emit_serial(
+fn filter_emit_serial_row(
     y: &mut [u8],
     y_pitch: usize,
     u: &mut [u8],
     v: &mut [u8],
     uv_pitch: usize,
     mbw: usize,
+    mby: usize,
     mbh: usize,
     filter: &FilterSettings,
     row_filters: &[(u8, u8)],
@@ -4299,22 +4322,21 @@ fn filter_and_emit_serial(
     ws: &mut EmitScratch,
     channels: usize,
     alpha: Option<&[u8]>,
-) {
-    let cw = (width + 1) >> 1;
-    let ch = (height + 1) >> 1;
-    let mut emitted = 0usize;
-    for mby in 0..mbh {
-        filter_macroblock_row(y, y_pitch, u, v, uv_pitch, mbw, mby, filter, &row_filters[mby * mbw..(mby + 1) * mbw]);
-        let end = if mby == mbh - 1 { height } else { mby * 16 + 8 };
-        if end > emitted {
-            if channels == 3 {
-                emit_rows_into_rgb3(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws);
-            } else {
-                emit_rows_into_rgba(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws, alpha);
-            }
-            emitted = end;
+    mut emitted: usize,
+) -> usize {
+    filter_macroblock_row(y, y_pitch, u, v, uv_pitch, mbw, mby, filter, row_filters);
+    let end = if mby == mbh - 1 { height } else { mby * 16 + 8 };
+    if end > emitted {
+        let cw = (width + 1) >> 1;
+        let ch = (height + 1) >> 1;
+        if channels == 3 {
+            emit_rows_into_rgb3(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws);
+        } else {
+            emit_rows_into_rgba(y, y_pitch, u, v, uv_pitch, width, cw, ch, emitted, end, rgba, ws, alpha);
         }
+        emitted = end;
     }
+    emitted
 }
 
 /// YUV 4:2:0 → RGBA8（fancy 上采样默认，等价 image-webp Bilinear / dwebp fancy 列）。
