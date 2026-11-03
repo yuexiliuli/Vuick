@@ -1966,6 +1966,52 @@ unsafe fn dc_add_two_sse2(dc_a: i16, dc_b: i16, dst: *mut u8, stride: isize) {
     }
 }
 
+/// 单个 4×4 块仅 DC（无 AC）的逆变换捷径（`dc_add_two_sse2` 的单块版）：残差恒
+/// `(dc+4)>>3`（与完整两遍变换对仅 DC 块逐字节一致，同 `dc_add_two_sse2` 的既有等价性）。
+/// 每行只读写 4 字节（块右缘不越出平面右端，同 `idct_add_one_sse2` 姿势）。i4 路径按块级
+/// AC 位（`ac_mask`）把纯 DC 块分发到本核——省去两遍 butterfly + 转置（~118 uops → ~20）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn dc_add_one_sse2(dc: i16, dst: *mut u8, stride: isize) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let d = _mm_set1_epi16(((i32::from(dc) + 4) >> 3) as i16);
+        let zero = _mm_setzero_si128();
+        for r in 0..4isize {
+            let o = r * stride;
+            let a4 = std::ptr::read_unaligned(dst.offset(o) as *const u32);
+            let ba = _mm_unpacklo_epi8(_mm_cvtsi32_si128(a4 as i32), zero);
+            let sa = _mm_packus_epi16(_mm_add_epi16(ba, d), zero);
+            std::ptr::write_unaligned(dst.offset(o) as *mut u32, _mm_cvtsi128_si32(sa) as u32);
+        }
+    }
+}
+
+/// 预判定后的单块 DC 捷径核直调：`part_simd_on("dct","sse2")` 已由调用方提升出 i4 子块循环
+/// （同 `idct_add_one_forced` 姿势）。**Safety**：调用方须保证 sse2 可用，且本块确为纯 DC
+/// （调用方按 `ac_mask` 位 0 分发，见 `reconstruct_macroblock` i4 分支）；越界语义同
+/// `dc_add_two`（`row0/col0` 落在平面内）。
+#[inline]
+pub(crate) unsafe fn dc_add_one_forced(dc: i16, plane: &mut [u8], pitch: usize, row0: usize, col0: usize) {
+    // x86_64：内核使用 x86-only intrinsic，仅在该目标编译（SSE2 核指令可用性由调用方保证）。
+    #[cfg(target_arch = "x86_64")]
+    {
+        let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
+        unsafe {
+            dc_add_one_sse2(dc, dst, pitch as isize);
+        }
+        return;
+    }
+    // 非 x86_64：x86 intrinsic 不存在，恒走标量全变换兜底（运行时不达：调用方
+    // `part_simd_on("dct","sse2")` 在非 x86_64 恒为 false）。
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut c = [0i16; 16];
+        c[0] = dc;
+        super::vp8::inverse_dct_add(&c, plane, pitch, row0, col0, true);
+    }
+}
+
 /// 第二遍一维逆变换的单块 4×i32 版本：入参为已符号扩展的 i32 列向量 t0..t3 与对应高位乘项
 /// `m1k2`=`(t1*35468)>>16 - t1`、`m3k1`=`(t3*20091)>>16`、`m12`=`(t1*20091)>>16`、
 /// `m32`=`(t3*35468)>>16 - t3`。全 i32 相加（无 i16 回绕）后算术右移 3，与标量

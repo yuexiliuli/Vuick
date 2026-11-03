@@ -1706,6 +1706,7 @@ fn read_tree(
     loop {
         debug_assert!((node >> 1) < probabilities.len());
         let bit = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *base.add(node >> 1) });
+        debug_assert!((node + bit as usize) < tree.len());
         #[cfg(feature = "stage_profile")]
         {
             // 树身份区分决策点：三棵调用树各用一处 site 计数（段/亮度模式/色度模式）。
@@ -1718,7 +1719,9 @@ fn read_tree(
             };
             skew_clock::bump(site, bit);
         }
-        let child = tree[node + bit as usize];
+        // 子节点索引裸指针读（并行去边界检查）：树是静态表，`node + bit` 恒 ≤ 表长-1
+        // （逐树验证于 vp8_tables.rs；同概率裸读不变量，K32 贴既有机制）。
+        let child = unsafe { *tree.as_ptr().add(node + bit as usize) };
         if child <= 0 {
             return -child as u32;
         }
@@ -1795,10 +1798,16 @@ macro_rules! read_macroblock_modes_impl {
                 let p = &KEYFRAME_BLOCK_MODE_PROBS[(usize::from(above) * 10 + usize::from(leftv)) * 9..]
                     [..9];
                 let mut node = 0usize;
+                // 裸指针（同 read_tree 不变量）：`p` 恒长 9、可达 node≤16 ⇒ node>>1 ≤ 8 < 9；
+                // `BLOCK_MODE_TREE` 静态表长 18，可达 node≤16 ⇒ node+bit ≤ 17 < 18 → 均去边界检查读。
+                let pb = p.as_ptr();
+                let tb = BLOCK_MODE_TREE.as_ptr();
                 loop {
-                    let bit = ent_read_bit(data, &mut pos, &mut value, &mut bits, &mut range_minus1, renorm_skip, p[node >> 1]);
+                    debug_assert!((node >> 1) < p.len());
+                    let bit = ent_read_bit(data, &mut pos, &mut value, &mut bits, &mut range_minus1, renorm_skip, unsafe { *pb.add(node >> 1) });
+                    debug_assert!((node + bit as usize) < BLOCK_MODE_TREE.len());
                     probe_skew!(skew_clock::BMODE, bit);
-                    let child = BLOCK_MODE_TREE[node + bit as usize];
+                    let child = unsafe { *tb.add(node + bit as usize) };
                     if child <= 0 {
                         $block_modes[i] = -child as u8;
                         break;
@@ -3203,16 +3212,34 @@ fn reconstruct_macroblock(
                             }
                         });
                         if ((nonzero_mask >> block) & 1) != 0 || mb[block][0] != 0 {
+                            // 块级 AC 分发（镜像 i16/UV 的 `ac_mask` 双块位判定）：`nonzero 位 1 且
+                            // ac 位 0` = 纯 DC 块（`tokens` 返回 last==1，非 DC 系数恒 0）——走单块
+                            // DC 捷径 `dc_add_one_forced`（(dc+4)>>3 广播，~20 uops，替代全 4×4
+                            // IDCT ~118 uops，字节恒等）；ac 位 1 = 有 AC，仍走全 IDCT 核。
+                            let has_ac = ((ac_mask >> block) & 1) != 0;
                             stage_clock::i4_idct_add(|| {
-                                // 计数器语义=「走单块 add 核的块数」：非零块统一走 add_one。
-                                stage_clock::i4_add_ac();
-                                if dct_simd {
-                                    // Safety：`dct_simd` 已在循环外判定 `part_simd_on("dct","sse2")`
-                                    // 为真且本块内恒定，SSE2 核指令可用。
+                                // 计数器语义：`i4_add_ac` 只计 AC 块；DC-only 块不计（探针折算
+                                // `add_dc_n = i4_idct_add_blocks − i4_add_ac_blocks` 即纯 DC 块数）。
+                                if has_ac {
+                                    stage_clock::i4_add_ac();
+                                    if dct_simd {
+                                        // Safety：`dct_simd` 已在循环外判定 `part_simd_on("dct","sse2")`
+                                        // 为真且本块内恒定，SSE2 核指令可用。
+                                        unsafe {
+                                            super::simd::idct_add_one_forced(&mb[block], y, y_pitch, row0, col0)
+                                        }
+                                    } else {
+                                        super::simd::inverse_dct_add_one(&mb[block], y, y_pitch, row0, col0);
+                                    }
+                                } else if dct_simd {
+                                    // Safety：同 `has_ac` 分支——SSE2 核指令可用；纯 DC 分发由
+                                    // `has_ac==false` 保证（非 DC 系数全 0），捷径输出与全 IDCT 恒等。
                                     unsafe {
-                                        super::simd::idct_add_one_forced(&mb[block], y, y_pitch, row0, col0)
+                                        super::simd::dc_add_one_forced(mb[block][0], y, y_pitch, row0, col0)
                                     }
                                 } else {
+                                    // 标量回退：`inverse_dct_add_one` 恒 has_ac=true，对纯 DC 块与
+                                    // DC 捷径逐字节一致（既有 `inverse_dct_has_ac_shortcut_equivalence`）。
                                     super::simd::inverse_dct_add_one(&mb[block], y, y_pitch, row0, col0);
                                 }
                                 mb[block].fill(0);
