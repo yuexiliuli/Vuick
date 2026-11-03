@@ -288,8 +288,45 @@ fn ent_refill(data: &[u8], pos: &mut usize, value: &mut u64, bits: &mut i32) {
     }
 }
 
+/// 位读判定前置（单源）：本次符号的 refill + split 预求值，返回（比较窗口值, split-1, rm1）。
+/// `ent_read_bit`（cmov 全算形）与 RC3 预测分支形共用同一算术——两者输出逐字节恒等是结构性的
+/// （仅控制流不同）。`bit=1` 侧还需 `*value -= (sp+1) << bits`、`range = rm1 - sp`；`bit=0` 侧
+/// `range = sp + 1`；renorm 由共享 `ent_renorm_apply` 落 `range_minus1`/`bits`。
+#[inline(always)]
+fn ent_split_pre(
+    data: &[u8],
+    pos: &mut usize,
+    value: &mut u64,
+    bits: &mut i32,
+    range_minus1: &mut u32,
+    probability: u8,
+) -> (u64, u32, u32) {
+    stage_clock::bit();
+    let prob = u32::from(probability);
+    if *bits < 0 {
+        ent_refill(data, pos, value, bits);
+    }
+    let rm1 = *range_minus1;
+    let split_minus1 = (rm1 * prob) >> 8;
+    (*value >> (*bits as u32), split_minus1, rm1)
+}
+
+/// renorm 应用（单源）：`range`（位判定结果）落 `range_minus1`/`bits`。与 read_bit_val 同：
+/// `range < 128 || !renorm_skip` 恒等（renorm_skip=false 时时走 lzcnt）。
+#[inline(always)]
+fn ent_renorm_apply(bits: &mut i32, range_minus1: &mut u32, range: u32, renorm_skip: bool) {
+    if range < 128 || !renorm_skip {
+        let shift = range.leading_zeros() - 24;
+        *range_minus1 = (range << shift) - 1;
+        *bits -= shift as i32;
+    } else {
+        *range_minus1 = range - 1;
+    }
+}
+
 /// 热路径读位（概率 0..=255）：`read_bit_val` 的标量 in/out 版，逐位算术完全一致，唯熵态不再
-/// 装进 40B 结构按值周转。`renorm_skip` 由调用方宏块入口判定一次（TOP4）。
+/// 装进 40B 结构按值周转。`renorm_skip` 由调用方宏块入口判定一次（TOP4）。**cmov 全算形**：
+/// 位判定选 `range`/`bit` 走无分支 select，供抛硬币/近硬币点用（RC3 预测分支形只留给高偏斜点）。
 #[inline(always)]
 fn ent_read_bit(
     data: &[u8],
@@ -300,34 +337,28 @@ fn ent_read_bit(
     renorm_skip: bool,
     probability: u8,
 ) -> u32 {
-    stage_clock::bit();
-    let prob = u32::from(probability);
-    if *bits < 0 {
-        ent_refill(data, pos, value, bits);
-    }
-    let rm1 = *range_minus1;
-    let split_minus1 = (rm1 * prob) >> 8;
-    let (range, bit);
-    if (*value >> (*bits as u32)) > u64::from(split_minus1) {
-        *value -= (u64::from(split_minus1 + 1)) << (*bits as u32);
-        range = rm1 - split_minus1;
-        bit = 1;
+    let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, probability);
+    let (range, bit) = if vs > u64::from(sp) {
+        *value -= (u64::from(sp + 1)) << (*bits as u32);
+        (rm1 - sp, 1)
     } else {
-        range = split_minus1 + 1;
-        bit = 0;
-    }
-    // 与 read_bit_val 同：`range < 128 || !renorm_skip` 恒等（renorm_skip=false 时时走 lzcnt）。
-    if range < 128 || !renorm_skip {
-        let shift = range.leading_zeros() - 24;
-        *range_minus1 = (range << shift) - 1;
-        *bits -= shift as i32;
-    } else {
-        *range_minus1 = range - 1;
-    }
+        (sp + 1, 0)
+    };
+    ent_renorm_apply(bits, range_minus1, range, renorm_skip);
     bit
 }
 
 /// 热路径读「概率 128 符号位」并算术取符号（`read_signed_val` 的标量 in/out 版，逐位一致）。
+#[cfg(feature = "stage_profile")]
+macro_rules! probe_skew {
+    ($site:expr, $b:expr) => {
+        skew_clock::bump($site, $b as u32)
+    };
+}
+#[cfg(not(feature = "stage_profile"))]
+macro_rules! probe_skew {
+    ($site:expr, $b:expr) => {};
+}
 #[inline(always)]
 fn ent_read_signed(
     data: &[u8],
@@ -350,7 +381,70 @@ fn ent_read_signed(
     let sh = 1u32 - (new_range >> 7);
     *range_minus1 = (new_range << sh) - 1;
     *bits -= sh as i32;
+    probe_skew!(skew_clock::SIGN, mask as u32);
     (magnitude ^ mask) - mask
+}
+
+// ---------------------------------------------------------------------------
+// RC3 探针：决策点偏斜计数（仅 `stage_profile` feature；验证「cmov 全算 → 预测分支形」
+// 是否值得投，K60 ≥8% 才投）。feature 关闭时 `probe_skew!` 展开为空、本模块不存在，
+// 产品路径零代码影响（行为/字节不变）。
+// ---------------------------------------------------------------------------
+#[cfg(feature = "stage_profile")]
+pub(crate) mod skew_clock {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Counts {
+        pub c0: u64,
+        pub c1: u64,
+    }
+
+    macro_rules! sites_const {
+        ($($name:ident = $v:expr),* $(,)?) => {
+            $( pub(crate) const $name: usize = $v; )*
+        };
+    }
+    sites_const! {
+        EOB = 0, ZERO = 1, ONE = 2, LT5 = 3, TWO = 4, F34 = 5, G5 = 6,
+        F67 = 7, F159 = 8, F165 = 9, F145 = 10, CAT8 = 11, CAT9 = 12,
+        CAT10 = 13, EXTRA = 14, SIGN = 15, SEGMENT = 16, YMODE = 17,
+        UVMODE = 18, SKIP = 19, BMODE = 20,
+    }
+    /// 决策点总数（与上方站点枚举一一对应）。
+    pub(crate) const N: usize = 21;
+    pub(crate) const NAMES: [&str; N] = [
+        "EOB", "ZERO", "ONE", "LT5", "TWO", "F34", "G5", "F67", "F159", "F165",
+        "F145", "CAT8", "CAT9", "CAT10", "EXTRA", "SIGN", "SEGMENT", "YMODE",
+        "UVMODE", "SKIP", "BMODE",
+    ];
+
+    static C0: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static C1: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    #[inline(always)]
+    pub(crate) fn bump(site: usize, bit: u32) {
+        if bit != 0 {
+            C1[site].fetch_add(1, Relaxed);
+        } else {
+            C0[site].fetch_add(1, Relaxed);
+        }
+    }
+
+    pub(crate) fn reset() {
+        for i in 0..N {
+            C0[i].store(0, Relaxed);
+            C1[i].store(0, Relaxed);
+        }
+    }
+
+    pub(crate) fn all() -> Vec<(&'static str, Counts)> {
+        let mut out = Vec::with_capacity(N);
+        for i in 0..N {
+            out.push((NAMES[i], Counts { c0: C0[i].load(Relaxed), c1: C1[i].load(Relaxed) }));
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,6 +1268,10 @@ const NZ_Y2: u32 = 1 << 24;
 /// 同 `tokens` 标量化 Load/Store 姿势；`data`/`pos` 仅在 refill 触碰）。概率读用裸指针游标 `p`
 /// （`tokens` 传入，指向当前 p_idx 处）：读 `p[k]`（k=8..10）。不变量与 `tokens` 同证：
 /// p_idx ≤ 253、p_idx+10 ≤ 263 < 264（每型概率表长）→ 恒不越界。
+///
+/// **RC3**：CAT8/9/10（p[8..10]，偏斜极高但低频）随 ZERO/G5 同机制做预测分支形——位判定与
+/// 调用点 `if b==0` 体合并为同一分支（`ent_branch=true`，默认）；false 走旧 cmov 形。两形输出
+/// 逐字节一致（共享 `ent_split_pre`/`ent_renorm_apply` 单源算术）。
 #[inline(always)]
 fn read_category_3_to_6(
     data: &[u8],
@@ -1182,23 +1280,65 @@ fn read_category_3_to_6(
     bits: &mut i32,
     range_minus1: &mut u32,
     renorm_skip: bool,
+    ent_branch: bool,
     p: *const u8,
 ) -> i32 {
     let (extra, base): (&[u8], i32) = {
-        let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(8) });
-        if b == 0 {
-            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(9) });
-            if b == 0 {
-                (&PCAT3, 11)
+        if ent_branch {
+            // 预测分支形：CAT8 位判定直接路由（多数方 bit=0 只算本路熵态，单误判点）。
+            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(8) });
+            if vs > u64::from(sp) {
+                // bit=1（少数方 0.2%）：CAT10 分支（偏斜 0.94，多数方 bit=0）。
+                *value -= (u64::from(sp + 1)) << (*bits as u32);
+                ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
+                probe_skew!(skew_clock::CAT8, 1);
+                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(10) });
+                if vs > u64::from(sp) {
+                    *value -= (u64::from(sp + 1)) << (*bits as u32);
+                    ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
+                    probe_skew!(skew_clock::CAT10, 1);
+                    (&PCAT6, 67)
+                } else {
+                    ent_renorm_apply(bits, range_minus1, sp + 1, renorm_skip);
+                    probe_skew!(skew_clock::CAT10, 0);
+                    (&PCAT5, 35)
+                }
             } else {
-                (&PCAT4, 19)
+                // bit=0（多数方 99.8%，预测命中）：CAT9 分支（偏斜 0.893，多数方 bit=0）。
+                ent_renorm_apply(bits, range_minus1, sp + 1, renorm_skip);
+                probe_skew!(skew_clock::CAT8, 0);
+                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(9) });
+                if vs > u64::from(sp) {
+                    *value -= (u64::from(sp + 1)) << (*bits as u32);
+                    ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
+                    probe_skew!(skew_clock::CAT9, 1);
+                    (&PCAT4, 19)
+                } else {
+                    ent_renorm_apply(bits, range_minus1, sp + 1, renorm_skip);
+                    probe_skew!(skew_clock::CAT9, 0);
+                    (&PCAT3, 11)
+                }
             }
         } else {
-            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(10) });
+            // cmov 全算（A/B 对照侧）：与分支形逐字节一致，唯指令选择不同。
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(8) });
+            probe_skew!(skew_clock::CAT8, b);
             if b == 0 {
-                (&PCAT5, 35)
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(9) });
+                probe_skew!(skew_clock::CAT9, b);
+                if b == 0 {
+                    (&PCAT3, 11)
+                } else {
+                    (&PCAT4, 19)
+                }
             } else {
-                (&PCAT6, 67)
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(10) });
+                probe_skew!(skew_clock::CAT10, b);
+                if b == 0 {
+                    (&PCAT5, 35)
+                } else {
+                    (&PCAT6, 67)
+                }
             }
         }
     };
@@ -1206,6 +1346,7 @@ fn read_category_3_to_6(
     let mut i = 0;
     while extra[i] != 0 {
         let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, extra[i]);
+        probe_skew!(skew_clock::EXTRA, b);
         mag = (mag << 1) | b as i32;
         i += 1;
     }
@@ -1224,6 +1365,7 @@ fn tokens(
     bits: &mut i32,
     range_minus1: &mut u32,
     renorm_skip: bool,
+    ent_branch: bool,
     probabilities: &[u8],
     context: usize,
     mut position: usize,
@@ -1248,50 +1390,79 @@ fn tokens(
     let mut p = unsafe { base.add(p_idx) };
     stage_clock::acct();
     let mut last = 0usize;
-    let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
-    if b != 0 {
-        loop {
-            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(1) });
+
+    // ── RC3：ZERO/G5 两高偏斜决策点（p[1]/p[6]）在「预测分支形（默认）」与「cmov 全算
+    // （KIMG_WEBP_ENT_BRANCH=0 强制）」间运行时切换。两形体共用下方局部宏（体只写一份），
+    // bmi/base 两变体同调本函数 → 宏单源同步获得同一分支结构（K 约束）。分支形把位判定与
+    // 调用点 `if b==0` 体合并为同一分支（避免同一位双分支双误判；多数方命中只算本路熵态）。
+    /// G5 的多数方（bit=0，偏斜 89.6%）体：F67→F159 / F165+F145 链，产出 (mag, 22)。
+    /// F67/F159/F165/F145 偏斜 54-64% 净负，保留 cmov 形不动（抛硬币/近硬币点禁止改）。
+    macro_rules! g5_zero_body {
+        () => {{
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(7) });
+            probe_skew!(skew_clock::F67, b);
             if b == 0 {
-                stage_clock::acct();
-                position += 1;
-                if position == 16 {
-                    break;
-                }
-                stage_clock::acct();
-                p = unsafe { base.add(*BAND_ROW_OFFSETS.get_unchecked(position)) };
-                continue;
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 159);
+                probe_skew!(skew_clock::F159, b);
+                (5 + b as i32, 22)
+            } else {
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 165);
+                probe_skew!(skew_clock::F165, b);
+                let high = b << 1;
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 145);
+                probe_skew!(skew_clock::F145, b);
+                (7 + (high | b) as i32, 22)
             }
+        }};
+    }
+    /// 非零 token 体：幅值树（ONE/LT5/TWO/F34/G5）→ 符号 → 去量 → zigzag 写回 → 下一位置 EOB。
+    /// 以块表达式产出 (mag, next_context) 后走共享尾部；G5 决策点据此切换分支/cmov 两形。
+    macro_rules! nonzero_token_body {
+        () => {{
             let (mag, next_context): (i32, usize) = {
                 let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(2) });
+                probe_skew!(skew_clock::ONE, b);
                 if b == 0 {
                     (1, 11)
                 } else {
                     let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(3) });
+                    probe_skew!(skew_clock::LT5, b);
                     if b == 0 {
                         let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(4) });
+                        probe_skew!(skew_clock::TWO, b);
                         if b == 0 {
                             (2, 22)
                         } else {
                             let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(5) });
+                            probe_skew!(skew_clock::F34, b);
                             (3 + b as i32, 22)
                         }
                     } else {
-                        let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(6) });
-                        if b == 0 {
-                            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(7) });
-                            if b == 0 {
-                                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 159);
-                                (5 + b as i32, 22)
+                        // G5 决策（p[6]，多数方 bit=0 偏斜 89.6%）：分支形与 cmov 形运行时切换。
+                        if ent_branch {
+                            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(6) });
+                            if vs > u64::from(sp) {
+                                // bit=1（少数方 10.4%）：DCT_CAT3..6。
+                                *value -= (u64::from(sp + 1)) << (*bits as u32);
+                                ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
+                                probe_skew!(skew_clock::G5, 1);
+                                let cat = read_category_3_to_6(data, pos, value, bits, range_minus1, renorm_skip, ent_branch, p);
+                                (cat, 22)
                             } else {
-                                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 165);
-                                let high = b << 1;
-                                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 145);
-                                (7 + (high | b) as i32, 22)
+                                // bit=0（多数方 89.6%，预测命中）：F67 链。
+                                ent_renorm_apply(bits, range_minus1, sp + 1, renorm_skip);
+                                probe_skew!(skew_clock::G5, 0);
+                                g5_zero_body!()
                             }
                         } else {
-                            let cat = read_category_3_to_6(data, pos, value, bits, range_minus1, renorm_skip, p);
-                            (cat, 22)
+                            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(6) });
+                            probe_skew!(skew_clock::G5, b);
+                            if b == 0 {
+                                g5_zero_body!()
+                            } else {
+                                let cat = read_category_3_to_6(data, pos, value, bits, range_minus1, renorm_skip, ent_branch, p);
+                                (cat, 22)
+                            }
                         }
                     }
                 }
@@ -1311,8 +1482,54 @@ fn tokens(
             stage_clock::acct();
             p = unsafe { base.add(*BAND_ROW_OFFSETS.get_unchecked(position) + next_context) };
             let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
+            probe_skew!(skew_clock::EOB, b);
             if b == 0 {
                 break; // 下一位置 EOB。
+            }
+        }};
+    }
+    /// 零 token 体：前进到下一位置（零 token 不写字），位置到 16 退出。
+    macro_rules! zero_token_body {
+        () => {{
+            stage_clock::acct();
+            position += 1;
+            if position == 16 {
+                break;
+            }
+            stage_clock::acct();
+            p = unsafe { base.add(*BAND_ROW_OFFSETS.get_unchecked(position)) };
+            continue;
+        }};
+    }
+
+    let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
+    probe_skew!(skew_clock::EOB, b);
+    if b != 0 {
+        loop {
+            // ZERO 决策（p[1]，多数方 bit=0 偏斜 85.2%）：分支形与 cmov 形运行时切换。分支形把
+            // 位判定与 `if b==0` 体合并为同一分支（单误判点；多数方命中只算本路熵态），两形共享
+            // 单源算术（`ent_split_pre`/`ent_renorm_apply`）→ 输出逐字节一致。
+            if ent_branch {
+                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(1) });
+                if vs > u64::from(sp) {
+                    // bit=1（少数方 14.8%）：零未命中，更新熵态后落入非零 token 体。
+                    *value -= (u64::from(sp + 1)) << (*bits as u32);
+                    ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
+                    probe_skew!(skew_clock::ZERO, 1);
+                    nonzero_token_body!();
+                } else {
+                    // bit=0（多数方 85.2%，预测命中）：只算本路熵态，直接落零 token 体。
+                    ent_renorm_apply(bits, range_minus1, sp + 1, renorm_skip);
+                    probe_skew!(skew_clock::ZERO, 0);
+                    zero_token_body!();
+                }
+            } else {
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(1) });
+                probe_skew!(skew_clock::ZERO, b);
+                if b == 0 {
+                    zero_token_body!();
+                }
+                nonzero_token_body!();
             }
         }
     }
@@ -1340,6 +1557,8 @@ macro_rules! parse_residuals_impl {
         // 寄存器，无 40B-byval 结构的逐位回写栈（Top1 主攻点）。`renorm_skip` 也在此判定一次
         // （TOP4：OnceLock 每宏块一读，主环零 OnceLock load）。
         let renorm_skip = ent_renorm_skip();
+        // RC3：分支形开关每宏块判定一次（OnceLock 一读 + 恒定可预测分支），主环零开关开销。
+        let ent_branch = super::simd::ent_branch_enabled();
         let data = $d.data;
         let mut pos = $d.pos;
         let mut value = $d.value;
@@ -1373,6 +1592,7 @@ macro_rules! parse_residuals_impl {
                 &mut bits,
                 &mut range_minus1,
                 renorm_skip,
+                ent_branch,
                 &$probabilities[ty * 8 * 33..],
                 context,
                 start,
@@ -1486,6 +1706,18 @@ fn read_tree(
     loop {
         debug_assert!((node >> 1) < probabilities.len());
         let bit = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *base.add(node >> 1) });
+        #[cfg(feature = "stage_profile")]
+        {
+            // 树身份区分决策点：三棵调用树各用一处 site 计数（段/亮度模式/色度模式）。
+            let site = if std::ptr::eq(tree, &SEGMENT_ID_TREE) {
+                skew_clock::SEGMENT
+            } else if std::ptr::eq(tree, &KEYFRAME_Y_MODE_TREE) {
+                skew_clock::YMODE
+            } else {
+                skew_clock::UVMODE
+            };
+            skew_clock::bump(site, bit);
+        }
         let child = tree[node + bit as usize];
         if child <= 0 {
             return -child as u32;
@@ -1530,7 +1762,7 @@ macro_rules! read_macroblock_modes_impl {
         let skip = if $skip_probability < 0 {
             0
         } else {
-            ent_read_bit(
+            let b = ent_read_bit(
                 data,
                 &mut pos,
                 &mut value,
@@ -1538,7 +1770,9 @@ macro_rules! read_macroblock_modes_impl {
                 &mut range_minus1,
                 renorm_skip,
                 $skip_probability as u8,
-            )
+            );
+            probe_skew!(skew_clock::SKIP, b);
+            b
         };
         let y_mode = read_tree(
             data,
@@ -1563,6 +1797,7 @@ macro_rules! read_macroblock_modes_impl {
                 let mut node = 0usize;
                 loop {
                     let bit = ent_read_bit(data, &mut pos, &mut value, &mut bits, &mut range_minus1, renorm_skip, p[node >> 1]);
+                    probe_skew!(skew_clock::BMODE, bit);
                     let child = BLOCK_MODE_TREE[node + bit as usize];
                     if child <= 0 {
                         $block_modes[i] = -child as u8;
@@ -4694,11 +4929,143 @@ mod perf_stage_tests {
         );
     }
 
+    /// RC3 探针：各熵决策点结果偏斜（`stage_profile` feature 门控；`#[ignore]` 手动 debug 跑）。
+    /// 遍历全部静态有损 fixture，累计每个决策点 bit0/bit1 次数 + 熵预算（tokens+modes 墙钟）。
+    /// 判定「cmov 全算 → 预测分支形」是否值得投（K60 ≥8% 熵墙钟才投）；纯测量不改产品行为。
+    #[test]
+    #[ignore = "手动运行：RC3 偏斜探针"]
+    #[cfg(feature = "stage_profile")]
+    fn ent_skew_by_decision() {
+        use std::time::Instant;
+        let names = webp_fixtures_support::webp_fixture_names();
+        let t0 = Instant::now();
+        let mut decoded = 0usize;
+        let mut skipped = 0usize;
+        let mut ent_ns: u64 = 0;
+        let mut bits: u64 = 0;
+        let mut acct: u64 = 0;
+        let mut dq: u64 = 0;
+        // 32767 是 max dimension false positive 硬上限检查用的哨兵，正常 fixture 不触发。
+        let mut total_px: u64 = 0;
+        skew_clock::reset();
+        for name in &names {
+            let Some(path) = webp_fixtures_support::webp_fixture_path(name) else {
+                continue;
+            };
+            let Ok(data) = std::fs::read(&path) else { continue };
+            let Ok(c) = super::super::container::parse(&data) else {
+                skipped += 1;
+                continue;
+            };
+            if c.family != super::super::container::Family::StaticLossy
+                && c.family != super::super::container::Family::LossyAlpha
+            {
+                skipped += 1;
+                continue;
+            }
+            let Some(frame) = c.bitstream else {
+                skipped += 1;
+                continue;
+            };
+            total_px += u64::from(c.width) * u64::from(c.height);
+            match stage_decode(&frame, c.width, c.height) {
+                Ok(p) => {
+                    ent_ns += p.ent_tokens_ns + p.ent_modes_ns;
+                    bits += p.tokens_bits + p.modes_bits;
+                    acct += p.acct_count;
+                    dq += p.dq_count;
+                    decoded += 1;
+                }
+                Err(e) => {
+                    eprintln!("SKIP {name}: {e}");
+                    skipped += 1;
+                }
+            }
+        }
+        let (c_bit, c_acct, c_dq) = probe_entropy_op_costs(2_000_000);
+        eprintln!(
+            "RC3_SKEW fixtures_decoded={decoded} skipped={skipped} px={total_px} wall={:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+        eprintln!("RC3_SKEW ent_ns={ent_ns} bits={bits} acct={acct} dq={dq}");
+        eprintln!("RC3_SKEW c_bit={c_bit:.3}ns c_acct={c_acct:.3}ns c_dq={c_dq:.3}ns");
+        eprintln!(
+            "\nRC3_SKEW 决策点偏斜表（熵墙钟预算 = ent_tokens+ent_modes {:.3}ms, bits={})",
+            ent_ns as f64 / 1e6,
+            bits
+        );
+        eprintln!("RC3_SKEW\t点 | count0/count1 | 偏斜m | 少数r | 仿uop净(sym) | 误判罚(sym) | 次数");
+        let mut all_sym_cycles = 0f64;
+        for (name, counts) in skew_clock::all() {
+            let total = counts.c0 + counts.c1;
+            if total == 0 {
+                continue;
+            }
+            let hi = counts.c0.max(counts.c1);
+            let m = hi as f64 / total as f64;
+            let r = 1.0 - m;
+            let net = (1.0 - 2.0 * r) * 7.0;
+            let misp = r * 20.0;
+            let sym = net - misp;
+            all_sym_cycles += sym * total as f64;
+            eprintln!(
+                "RC3_SKEW\t{name} | {}/{} | {:.4} | {:.4} | {:+.2} | {:.2} | {}",
+                counts.c0, counts.c1, m, r, sym, misp, total
+            );
+        }
+        // 折入熵墙钟%：模型每符号（一次 bit 解码）≈7 cycle（汇编取证 ent_read_bit ~28-30uop
+        // 吞吐受限）；以同构建 c_bit_ns/7 把模型 cycle→ns 换算，占比 = 净省 ns / 实测熵墙钟 ns。
+        let cyc_ns = c_bit / 7.0;
+        let save_ns = all_sym_cycles * cyc_ns;
+        let pct = save_ns / ent_ns.max(1) as f64 * 100.0;
+        eprintln!(
+            "\nRC3_SKEW 合计（全部点，含抛硬币点 cost>0）净省 ≈ {:.2} Mcy → {:.2} ms → 熵墙钟 {:.2}%",
+            all_sym_cycles / 1e6,
+            save_ns / 1e6,
+            pct
+        );
+        // 候选点 = 偏斜 ≥85% 且 net>0（分支形确有正收益者）。
+        eprintln!("RC3_SKEW 候选点（偏斜≥85% 且净收益>0）：");
+        let mut c_cycles = 0f64;
+        for (name, counts) in skew_clock::all() {
+            let total = counts.c0 + counts.c1;
+            if total == 0 {
+                continue;
+            }
+            let hi = counts.c0.max(counts.c1);
+            let m = hi as f64 / total as f64;
+            let r = 1.0 - m;
+            let sym = (1.0 - 2.0 * r) * 7.0 - r * 20.0;
+            if m >= 0.85 && sym > 0.0 {
+                c_cycles += sym * total as f64;
+                eprintln!(
+                    "RC3_SKEW\t   {name}: m={:.4} r={:.4} net={:+.2}cy/sym × {total}次 = {:.2} Mcy ({:.3}ms)",
+                    m,
+                    r,
+                    sym,
+                    sym * total as f64 / 1e6,
+                    sym * total as f64 * cyc_ns / 1e6
+                );
+            }
+        }
+        let c_ns = c_cycles * cyc_ns;
+        let c_pct = c_ns / ent_ns.max(1) as f64 * 100.0;
+        eprintln!(
+            "RC3_SKEW 候选点净省 ≈ {:.2} Mcy → {:.3} ms → 熵墙钟 {:.2}%",
+            c_cycles / 1e6,
+            c_ns / 1e6,
+            c_pct
+        );
+        eprintln!(
+            "RC3_SKEW 口径：c_bit={c_bit:.3}ns/bit（同构建），模型 7cy/bit ⇒ 1cy ≈ {:.4}ns；熵墙钟=实测 ent_tokens+ent_modes",
+            cyc_ns
+        );
+        assert!(decoded > 0, "应至少解出 >0 个静态有损 fixture，实 {decoded}");
+    }
+
     /// 熔合 SIMD vs 标量全路径逐字节：随机小帧 + 随机滤波强度（level/inner/sharpness/simple
     /// 全跨），以生产 `filter_macroblock_row` 为对象 —— 覆盖真实强度求值、宏块左/上/内边全组合
     /// 与「后边读前边已滤像素」的顺序依赖。SIMD 路由经进程内 override 强制开/关对拍。
-    /// level 采样 0..63（与真实解码 `clamp(0,63)` 一致；真实 bitstream 不会产生 ≥84 的
-    /// level，故 edge_limit < 256，SIMD 掩码 `edge as i8` 截断不触发 —— 与 libwebp/C# 同行为）。
     #[test]
     fn filter_macroblock_simd_matches_scalar() {
         use super::super::simd::{set_simd_part_override, simd_on};
@@ -5350,6 +5717,252 @@ mod mt_tests {
             "应至少对拍 3 个有损 fixture（当前 {checked}；缺外部语料；无 bmi2 时退化为基线自对，不判失败）"
         );
         eprintln!("WEBP_ENT_BMI_PARITY_OK\t{checked}\t(serial_bmi≡baseline ∧ MT_bmi≡serial_bmi)");
+    }
+
+    /// RC3 硬闸「branch ≡ cmov」：同宏体（`tokens`/`read_category_3_to_6`，bmi/base 共享）的
+    /// 预测分支形（ZERO/G5/CAT8-10，默认开）与 cmov 全算形（`set_ent_branch_override(false)`）
+    /// 输出**逐字节一致**——纯控制流重构，双形仅分支/codegen 不同。对有损 + lossy-alpha fixture
+    /// 三路对拍：串行·cmov vs 串行·branch vs 双线程·branch 全等（同 `ent_bmi_matches_baseline_byte_exact`
+    /// 姿势；生产默认熵路径 auto→bmi，RC1 已独立保证 bmi≡base，故本闸不重复翻 ent 双模）。
+    /// 缺夹具 SKIP 是常态不是回归（AGENTS §5）。
+    #[test]
+    fn ent_branch_matches_cmov_byte_exact() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut checked = 0usize;
+        let mut names: Vec<String> = webp_fixtures_support::webp_fixture_names();
+        names.sort();
+        for name in names {
+            let Some(p) = webp_fixtures_support::webp_fixture_path(&name) else {
+                continue;
+            };
+            let data = std::fs::read(&p).expect("read fixture");
+            let Ok(c) = container::parse(&data) else {
+                continue;
+            };
+            if c.family != container::Family::StaticLossy
+                && c.family != container::Family::LossyAlpha
+            {
+                continue;
+            }
+            // cmov 全算（对照侧）：分支形强制关。
+            super::super::simd::set_ent_branch_override(Some(false));
+            let Some(cmov) = decode_with_threads(&data, "0") else {
+                eprintln!("SKIP {name} 基线串行解码失败（外部语料不可解）");
+                continue;
+            };
+            // 预测分支形（默认侧）：串行 + 双线程。
+            super::super::simd::set_ent_branch_override(Some(true));
+            let Some(branch_serial) = decode_with_threads(&data, "0") else {
+                panic!("{name} 分支形串行解码失败（基线已成功）");
+            };
+            let Some(branch_para) = decode_with_threads(&data, "2") else {
+                panic!("{name} 分支形 threads=2 解码失败（基线已成功）");
+            };
+            assert_eq!(
+                cmov.0, branch_serial.0,
+                "{name}: 熵分支形 vs cmov 串行 YUV/RGBA 逐字节"
+            );
+            assert_eq!(
+                cmov.1, branch_serial.1,
+                "{name}: 熵分支形 vs cmov 串行 RGBA 逐字节"
+            );
+            assert_eq!(
+                branch_serial.0, branch_para.0,
+                "{name}: 熵分支形串行 vs 双线程 YUV/RGBA 逐字节"
+            );
+            assert_eq!(
+                branch_serial.1, branch_para.1,
+                "{name}: 熵分支形串行 vs 双线程 RGBA 逐字节"
+            );
+            checked += 1;
+        }
+        super::super::simd::set_ent_branch_override(None);
+        unsafe {
+            std::env::remove_var("KIMG_WEBP_THREADS");
+        }
+        assert!(
+            checked >= 3,
+            "应至少对拍 3 个有损 fixture（当前 {checked}；缺外部语料）"
+        );
+        eprintln!(
+            "WEBP_ENT_BRANCH_PARITY_OK\t{checked}\t(serial_cmov≡branch ∧ MT_branch≡serial_branch)"
+        );
+    }
+
+    /// RC3 A/B 同窗对拍（release 手动跑 `-- --ignored`）：进程内 override 只翻「分支形开/关」，
+    /// 同二进制同布局——隔离的恰是本改动的控制流差异（比跨构建对比更公平）。
+    /// 输出 tri：`entropy_stage`（stage_clock 熵段累计，含 per-MB Instant 插桩，看相对变化）、
+    /// `decode`（`decode_vp8` 整帧墙钟，无插桩，主标尺）、串行与双线程两档。
+    /// 裁决（K55/K60）：熵墙钟或 71 decode 净提升 ≥8%（噪声带外）→ 默认开；≤0 → 回退全部 RC3；
+    /// 0~8% → 报真实数字由主 agent 定。
+    #[test]
+    #[ignore = "手动运行（release）"]
+    fn ent_branch_ab_probe() {
+        use std::time::Instant;
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("imgbench-corpus")
+            .join("WEBP");
+        // 4K 高熵组（ZERO/G5 触发量大，双路径收益主战场）+ 纯 VP8 photo 各档（低熵，须无回归）。
+        let files: [&str; 6] = [
+            "syn-noise-3840x2160.webp",
+            "syn-mandel-3840x2160.webp",
+            "syn-testsrc2-3840x2160.webp",
+            "strip-h6-lossy.webp",
+            "img_v3_0216r_0836ba29-7fe2-4c91-b768-77565ad841eg_MIDDLE_WEBP.webp",
+            "try-it-in-slintpad.webp",
+        ];
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let measure =
+            |data: &[u8], w: u32, h: u32, threads: &str, branch: bool, rounds: usize, clock: bool| -> (f64, f64) {
+                super::super::simd::set_ent_branch_override(Some(branch));
+                unsafe {
+                    std::env::set_var("KIMG_WEBP_THREADS", threads);
+                }
+                let mut wall = Vec::new();
+                let mut ent = Vec::new();
+                for _ in 0..2 {
+                    let _ = decode_vp8(data, w, h).unwrap();
+                }
+                for _ in 0..rounds {
+                    if clock {
+                        stage_clock::reset();
+                        stage_clock::set(true);
+                    }
+                    let t = Instant::now();
+                    let _ = decode_vp8(data, w, h).unwrap();
+                    wall.push(t.elapsed().as_secs_f64() * 1e3);
+                    let e = if clock {
+                        let (ev, _, _, _) = stage_clock::totals();
+                        stage_clock::set(false);
+                        ev
+                    } else {
+                        0.0
+                    };
+                    ent.push(e);
+                }
+                (median(&mut wall), median(&mut ent))
+            };
+        let _g = ENV_LOCK.lock().unwrap();
+        for name in files {
+            let p = corpus.join(name);
+            if !p.is_file() {
+                eprintln!("SKIP {name}（外部语料缺失）");
+                continue;
+            }
+            let data = std::fs::read(&p).unwrap();
+            let Ok(c) = container::parse(&data) else {
+                eprintln!("SKIP {name}（container 不可解析）");
+                continue;
+            };
+            if c.family != container::Family::StaticLossy {
+                eprintln!("SKIP {name}（family != StaticLossy，非本双路径测试对象）");
+                continue;
+            }
+            let Some(bs) = c.bitstream else {
+                eprintln!("SKIP {name}（bitstream=None）");
+                continue;
+            };
+            let (w, h) = (c.width, c.height);
+            if decode_vp8(bs, w, h).is_err() {
+                eprintln!("SKIP {name}（decode_vp8 不可解，排除非本测试对象）");
+                continue;
+            }
+            let rounds = if w * h >= 3840 * 2160 { 7 } else { 11 };
+            for threads in ["0", "2"] {
+                // 同窗交错 A/B（K68：单窗 off→on 顺序块会被热迁移/频率漂移污染）：
+                // 每轮 off/on 交错采样，两边同窗均完成；`measure` 只做单侧采样。
+                super::super::simd::set_ent_branch_override(Some(false));
+                unsafe {
+                    std::env::set_var("KIMG_WEBP_THREADS", threads);
+                }
+                let mut w_off = Vec::new();
+                let mut e_off = Vec::new();
+                let mut w_on = Vec::new();
+                let mut e_on = Vec::new();
+                let run = |branch: bool, wall: &mut Vec<f64>, ent: &mut Vec<f64>| {
+                    super::super::simd::set_ent_branch_override(Some(branch));
+                    for _ in 0..1 {
+                        let _ = decode_vp8(bs, w, h).unwrap();
+                    }
+                    stage_clock::reset();
+                    stage_clock::set(true);
+                    let t = Instant::now();
+                    let _ = decode_vp8(bs, w, h).unwrap();
+                    wall.push(t.elapsed().as_secs_f64() * 1e3);
+                    let (ev, _, _, _) = stage_clock::totals();
+                    ent.push(ev);
+                    stage_clock::set(false);
+                };
+                for _ in 0..2 {
+                    run(false, &mut w_off, &mut e_off);
+                    run(true, &mut w_on, &mut e_on);
+                }
+                for _ in 0..rounds {
+                    run(false, &mut w_off, &mut e_off);
+                    run(true, &mut w_on, &mut e_on);
+                }
+                super::super::simd::set_ent_branch_override(None);
+                let (w_off_m, e_off_m) = (median(&mut w_off), median(&mut e_off));
+                let (w_on_m, e_on_m) = (median(&mut w_on), median(&mut e_on));
+                eprintln!(
+                    "WEBP_ENT_BRANCH_AB {name} {w}x{h} thr={threads}: decode {}ms vs {}ms (ratio {:.3}) | \
+                     ent_stage {}ms vs {}ms (ratio {:.3})  [interleaved; off=cmov on=branch]",
+                    w_off_m,
+                    w_on_m,
+                    w_off_m / w_on_m,
+                    e_off_m,
+                    e_on_m,
+                    e_off_m / e_on_m
+                );
+            }
+        }
+        super::super::simd::set_ent_branch_override(None);
+        // 整 lossy 集汇总（74//71 有损 fixture：每只 decode_vp8 一次，off/on 各一遍，墙钟累加；
+        // 覆盖率反映「整体 lossy(71)」验收口径，大图（4K noise）主导；此处 clean 墙钟（无插桩）。
+        for threads in ["0", "2"] {
+            let mut off_sum = 0.0f64;
+            let mut on_sum = 0.0f64;
+            let mut n = 0usize;
+            for name in webp_fixtures_support::webp_fixture_names() {
+                let Some(p) = webp_fixtures_support::webp_fixture_path(&name) else {
+                    continue;
+                };
+                let data = std::fs::read(&p).expect("read fixture");
+                let Ok(c) = container::parse(&data) else {
+                    continue;
+                };
+                if c.family != container::Family::StaticLossy {
+                    continue;
+                }
+                let Some(bs) = c.bitstream else {
+                    continue;
+                };
+                let (w, h) = (c.width, c.height);
+                if decode_vp8(bs, w, h).is_err() {
+                    continue; // 非本解码器可解（如动画帧包），不在 lossy(71) 口径内
+                }
+                let (wo, _) = measure(bs, w, h, threads, false, 1, false);
+                let (won, _) = measure(bs, w, h, threads, true, 1, false);
+                off_sum += wo;
+                on_sum += won;
+                n += 1;
+            }
+            eprintln!(
+                "WEBP_ENT_BRANCH_CORPUS_SUM thr={threads} fixtures={n}: decode {}ms vs {}ms (ratio {:.3})",
+                off_sum,
+                on_sum,
+                off_sum / on_sum
+            );
+        }
+        unsafe {
+            std::env::remove_var("KIMG_WEBP_THREADS");
+        }
     }
 
     /// RC1 A/B 同窗对拍（release 手动跑 `-- --ignored`）：进程内 override 只翻「熵走快道还是

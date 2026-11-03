@@ -192,6 +192,55 @@ pub(crate) fn ent_bmi_enabled() -> bool {
     part_simd_on("ent", "bmi2")
 }
 
+/// 熵分支形开关（RC3）：高偏斜决策点（tokens 的 ZERO p[1] / G5 p[6]，及顺带的
+/// CAT8/9/10 p[8..10]）的位读出用「预测分支形」（默认开）还是「cmov 全算」——纯控制流重构、
+/// 输出逐字节一致（`branch ≡ cmov` 硬闸对拍），本开关仅为同二进制的 A/B 决策默认值（K55）。
+/// `KIMG_WEBP_ENT_BRANCH=0`/`false`/`off` → 强制旧 cmov（A/B 对照侧）；其余/缺省 → 开（分支形）。
+/// 与 `ent_bmi_enabled()` 正交：分支形同时作用于 bmi 与 base 两熵变体（共享 tokens 宏体）。
+/// `#[cfg(test)]` 可经 `set_ent_branch_override` 进程内翻转（优先于 env，同 renorm_skip 姿势）。
+/// 首次访问读一次 env 缓存，之后仅 Relaxed 原子读——热环开销可忽略。
+#[inline]
+pub(crate) fn ent_branch_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = ent_branch_override::get() {
+        return v;
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("KIMG_WEBP_ENT_BRANCH").unwrap_or_default();
+        let t = v.trim();
+        !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+    })
+}
+
+/// `#[cfg(test)]` 熵分支形进程内覆盖（优先于 env；RC3 同窗 A/B 用，同 `renorm_skip_override` 姿势）。
+#[cfg(test)]
+mod ent_branch_override {
+    use std::sync::atomic::{AtomicI8, Ordering::Relaxed};
+    static V: AtomicI8 = AtomicI8::new(-1);
+    pub fn set(v: Option<bool>) {
+        let val = match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        };
+        V.store(val, Relaxed);
+    }
+    pub fn get() -> Option<bool> {
+        match V.load(Relaxed) {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_ent_branch_override(v: Option<bool>) {
+    ent_branch_override::set(v);
+}
+
 /// `KIMG_WEBP_SIMD_FLT`（默认开）：`0`/`false`/`off` → 关（A/B 对照保留）；其余/缺省 → 开。
 fn flt_enabled() -> bool {
     use std::sync::OnceLock;
