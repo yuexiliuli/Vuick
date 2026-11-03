@@ -43,12 +43,13 @@ impl Vp8Error {
 
 type Result<T> = std::result::Result<T, Vp8Error>;
 
-/// VP8 解码产物：`rgba`/`rgb` 为「行定稿直出」产物（fancy 上采样 + YUV→RGBA/RGB3），由
-/// `decode_from_header` 在滤波每宏块行后即时写出并缓存——`yuv_to_rgba_fancy`/`yuv_to_rgb_fancy`
-/// 取用后置空，避免二次全帧 pass。opaque 有损路径（`decode_vp8_rgb3`）只填 `rgb`（w*h*3、
-/// 消 RGBA4 中间帧）；alpha/兼容路径只填 `rgba`（w*h*4，α=255），另一个恒空。
-/// `y/u/v` 紧密 4:2:0 平面（环路滤波后）在生产路径默认为空（直出为输出，紧密平面纯浪费，
-/// 见 `decode_vp8` 的 `need_tight`），仅供 `decode_vp8_tight`（测试/兼容 API）与手工构造回退
+/// VP8 解码产物：`rgba` 为「行定稿直出」产物（fancy 上采样 + YUV→RGBA4），由
+/// `decode_from_header` 在滤波每宏块行后即时写出并缓存——`yuv_to_rgba_fancy`
+/// 取用后置空，避免二次全帧 pass。opaque 有损路径（经 `decode_vp8`，T1 起）与
+/// alpha/兼容路径一样填 `rgba`（w*h*4，α=255 熔入发射内层、单遍直出）；`rgb`（RGB3 直出，
+/// T1 前 opaque 形态）恒空（dormancy，K24）。`y/u/v` 紧密 4:2:0 平面（环路滤波后）在生产
+/// 路径默认为空（直出为输出，紧密平面纯浪费，见 `decode_vp8` 的 `need_tight`），仅供
+/// `decode_vp8_tight`（测试/兼容 API）与手工构造回退
 /// `yuv_to_rgba_fancy`/`yuv_to_rgb_fancy` 使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Vp8Yuv {
@@ -2320,9 +2321,12 @@ pub(crate) fn decode_vp8_with_alpha(
     decode_from_header(fh, false, 4, alpha)
 }
 
-/// opaque 静态有损专用：同 [`decode_vp8`]（`need_tight=false`）且行定稿直出 **RGB3**（w*h*3，
-/// alpha 不写），产物落 `Vp8Yuv.rgb`——消 RGBA4 中间帧 / 4→3 转换 / 整帧 RGBA 分配。
-/// 每像素前 3 字节与 `decode_vp8` 的 RGBA 恒等（`yuv_row_to_rgb3` 字节契约 + 硬闸）。
+/// 【dormancy，K24】opaque 有损 RGB3 直出旧入口：同 [`decode_vp8`]（`need_tight=false`）且行定稿
+/// 直出 **RGB3**（w*h*3，alpha 不写），产物落 `Vp8Yuv.rgb`。自 T1 起 opaque 有损改用
+/// [`decode_vp8`]（RGBA4 α=255 单遍直出，`to_rgba8`/`into_rgba8` 零拷贝），本入口与
+/// `emit_rows_into_rgb3`/`yuv_to_rgb_fancy` 保留作旧口径参考（`ours_backend_webpdecoder`/
+/// 硬闸对拍）+ 手工构造回退，不删（K24）。每像素前 3 字节仍与 `decode_vp8` 的 RGBA 恒等。
+#[allow(dead_code)]
 pub(crate) fn decode_vp8_rgb3(frame: &[u8], width: u32, height: u32) -> Result<Vp8Yuv> {
     let fh = stage_clock::header(|| parse_frame_header(frame))?;
     if fh.width != width || fh.height != height {
@@ -3813,9 +3817,12 @@ pub(crate) fn yuv_to_rgba_fancy(yuv: &mut Vp8Yuv) -> Vec<u8> {
     rgba
 }
 
-/// YUV 4:2:0 → RGB3（w*h*3，alpha 不写）：opaque 静态有损直出。`decode_vp8_rgb3` 已把行定稿
-/// 直出的 RGB3 缓存在 `yuv.rgb`，此处直接取走（`mem::take`，零重算、零拷贝）；若为空（手工
-/// 构造的 `Vp8Yuv`）回退旧整帧二趟路径（走 `yuv_row_to_rgb3`，逐字节与 RGBA 前 3 字节一致）。
+/// 【dormancy，K24】YUV 4:2:0 → RGB3（w*h*3，alpha 不写）：T1 前 opaque 静态有损直出入口。
+/// [`decode_vp8_rgb3`] 已把行定稿直出的 RGB3 缓存在 `yuv.rgb`，此处直接取走（`mem::take`，
+/// 零重算、零拷贝）；若为空（手工构造的 `Vp8Yuv`）回退旧整帧二趟路径（走 `yuv_row_to_rgb3`，
+/// 逐字节与 RGBA 前 3 字节一致）。opaque 有损现走 `yuv_to_rgba_fancy`（RGBA4 直出），保留
+/// 作硬闸/测试参考与手工构造回退（K24）。
+#[allow(dead_code)]
 pub(crate) fn yuv_to_rgb_fancy(yuv: &mut Vp8Yuv) -> Vec<u8> {
     if !yuv.rgb.is_empty() {
         return std::mem::take(&mut yuv.rgb);
@@ -4214,7 +4221,8 @@ mod v4_rgba_parity_tests {
         if ours.width != c.width || ours.height != c.height {
             return None;
         }
-        // 有 alpha：RGBA4 原样；opaque 有损：直出 RGB3，此处 3→4（alpha=255）扩成 RGBA 对拍口径。
+        // 有 alpha：RGBA4 原样；opaque 有损自 T1 起亦持 RGBA4（α=255，`ours.rgba` 直出）→
+        // 同上分支；`rgb` 遗留恒空（dormancy），else 分支仅作手工构造回退。
         if !ours.rgba.is_empty() {
             Some((ours.width, ours.height, ours.rgba.as_bytes().to_vec()))
         } else {
@@ -4300,7 +4308,8 @@ mod v4_rgba_parity_tests {
         );
     }
 
-    /// 冒烟：经 `WebPDecoder`（OURS 后端）解码同 fixture 与直接调用一致，且格式为 Rgb8。
+    /// 冒烟：经 `WebPDecoder`（OURS 后端）解码同 fixture 与直接调用一致，且格式为 Rgba8
+    /// （T1：opaque 有损恒定 RGBA8 α=255，`read_image` RGBA 目标直拷，`into_rgba8` 零拷贝）。
     #[test]
     fn ours_backend_webpdecoder() {
         set_webp_backend(BACKEND_OURS);
@@ -4313,10 +4322,12 @@ mod v4_rgba_parity_tests {
         let dec = WebPDecoder::new(Cursor::new(&data)).unwrap();
         let (w, h) = dec.dimensions();
         assert_eq!((w, h), (320, 240));
-        assert_eq!(dec.color_type(), crate::ColorType::Rgb8);
+        assert_eq!(dec.color_type(), crate::ColorType::Rgba8);
         let mut buf = vec![0u8; dec.total_bytes() as usize];
         dec.read_image(&mut buf).unwrap();
-        assert_eq!(buf.len(), (w * h * 3) as usize);
+        assert_eq!(buf.len(), (w * h * 4) as usize);
+        // α 通道恒 0xFF（opaque 有损单遍直出熔入）。
+        assert!(buf.chunks_exact(4).all(|px| px[3] == 0xFF));
         set_webp_backend(BACKEND_AUTO);
     }
 }

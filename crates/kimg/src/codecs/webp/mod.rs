@@ -172,14 +172,17 @@ fn ours_allowed() -> bool {
 #[derive(Default)]
 pub(crate) struct OursStatic {
     /// 解码后的 RGBA8 像素（长度 = w*h*4；零拷贝封装，见 `vp8l::RgbaBytes`）。
-    /// alpha/无损路径持有；opaque 有损路径为空（该路径放 `rgb`）。
+    /// 全部静态路径持有：alpha/无损路径（真实 A 通道），以及 opaque 有损（α 恒 0xFF、
+    /// 单遍 YUV→RGBA4 直出，消 RGB3→RGBA4 展开+分配税，见 `decode_static_lossy`）。
     pub rgba: vp8l::RgbaBytes,
-    /// opaque 静态有损直出的 RGB8 像素（长度 = w*h*3；消 RGBA4 中间帧 / 4→3 转换；见
-    /// `vp8::decode_vp8_rgb3`）。非 opaque 路径恒空；此时像素在 `rgba`。
+    /// 遗留 RGB3 直出字段（长度 = w*h*3）：被 opaque RGBA4 直出取代后恒空（K24 dormancy，
+    /// 见 `vp8::decode_vp8_rgb3`）。非空时像素在 `rgba`。
     pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    /// 实际是否存在 alpha（决定输出 RGBA8 还是 RGB8）。
+    /// 输出像素是否为 RGBA8（决定 `color_type`/`read_image` 的字节/像素口径）。opaque 有损
+    /// 现恒为 true：输出 RGBA8 α=255，`to_rgba8`/`into_rgba8` 零拷贝；容器/文件层无 alpha
+    /// 概念（与 image-webp 的 Rgb8 口径有意分道，T1 生产消费姿态 RGBA8 直出）。
     pub has_alpha: bool,
     pub exif: Option<Vec<u8>>,
     pub icc: Option<Vec<u8>>,
@@ -369,8 +372,9 @@ impl<R: BufRead + Seek> ImageDecoder for WebPDecoder<R> {
                     }
                     buf.copy_from_slice(o.rgba.as_bytes());
                 } else {
-                    // RGB8 目标：buf.len()==w*h*3。opaque 静态有损直出（`o.rgb`，RGB3→RGB3 直拷，
-                    // 消 4→3 SIMD 转换）；无损/动画路径仍持 RGBA4 → 4→3 抽条（既有语义不变）。
+                    // RGB8 目标：buf.len()==w*h*3。opaque 有损自 T1 起走 RGBA 分支（`has_alpha`
+                    // true，`rgba` 直拷，零拷贝）；本分支现仅为「无损-无 alpha（VP8L 不透明）」
+                    // 服务：`o.rgb` 遗留恒空（K24 dormancy）→ rgba4 抽条（既有语义不变）。
                     let target = (o.width as usize) * (o.height as usize) * 3;
                     if buf.len() != target {
                         return Err(ImageError::Decoding(DecodingError::new(
@@ -552,10 +556,11 @@ pub(crate) fn uninit_rgba8_vec(len: usize) -> Vec<u8> {
 }
 
 /// 自研 VP8 静态有损解码入口（P3 有损族，V4+ 接管）：家族=StaticLossy/LossyAlpha 时
-/// 调用。解析容器 → VP8 YUV → fancy RGB 直出。opaque（StaticLossy，无 alpha）：`decode_vp8_rgb3`
-/// 直出 **RGB3**（`OursStatic.rgb`，w*h*3，消 RGBA4 中间帧 / 4→3 转换 / 整帧 RGBA 分配）；
-/// LossyAlpha：`decode_vp8`+RGBA4 后附 ALPH 反滤波 alpha 合并。出错/不可接管回 `Ok(None)`
-/// （调用方转为显式错误，自包含后无 image-webp 兜底）。
+/// 调用。解析容器 → VP8 YUV → fancy RGBA 直出（单遍）。opaque（StaticLossy，无 alpha）：
+/// `decode_vp8`（α=255 熔入发射内层）直出 **RGBA4**（`OursStatic.rgba`，w*h*4，
+/// `to_rgba8`/`into_rgba8` 零拷贝，消 RGB3→RGBA4 展开+零值分配税）；
+/// LossyAlpha：`decode_vp8_with_alpha` 把 ALPH 反滤波 alpha 行并入发射内层。出错/不可接管
+/// 回 `Ok(None)`（调用方转为显式错误，自包含后无 image-webp 兜底）。
 pub(crate) fn decode_static_lossy(
     data: &[u8],
 ) -> ImageResult<Option<crate::codecs::webp::OursStatic>> {
@@ -607,21 +612,25 @@ pub(crate) fn decode_static_lossy(
             xmp: c.xmp.map(|e| e.to_vec()),
         }));
     }
-    // opaque 静态有损：RGB3 直出（无 alpha，`OursStatic.rgb` 持有 w*h*3）。
-    let mut yuv = match vp8::decode_vp8_rgb3(bitstream, c.width, c.height) {
+    // opaque 静态有损：单遍 YUV→RGBA4 直出（α 恒 0xFF 熔入发射内层、无 alpha 平面融合，镜像
+    // lossy-alpha 姿势去掉 alpha 行并入）。`decode_vp8`（`alpha=None` → α=255，行定稿直出
+    // RGBA4 w*h*4）零重算，`yuv_to_rgba_fancy` 零拷贝取走。合并后 opaque/有损-alpha/无损
+    // 统一持 `rgba` 直出：`to_rgba8`/`into_rgba8` 零拷贝移交（消旧 RGB3 直出→`to_rgba8`
+    // SIMD 3→4 扩写 + w*h*4 零值分配税，K52 同窗 -9.9% 全链摊）。
+    let mut yuv = match vp8::decode_vp8(bitstream, c.width, c.height) {
         Ok(y) => y,
         Err(e) => {
             let _ = e;
             return Ok(None);
         }
     };
-    let rgb = vp8::yuv_to_rgb_fancy(&mut yuv);
+    let rgba = vp8::yuv_to_rgba_fancy(&mut yuv);
     Ok(Some(crate::codecs::webp::OursStatic {
-        rgba: vp8l::RgbaBytes::empty(),
-        rgb,
+        rgba: vp8l::RgbaBytes::from_vec_u8(rgba),
+        rgb: Vec::new(),
         width: c.width,
         height: c.height,
-        has_alpha: false,
+        has_alpha: true,
         exif: c.exif.map(|e| e.to_vec()),
         icc: c.icc_profile.map(|e| e.to_vec()),
         xmp: c.xmp.map(|e| e.to_vec()),
@@ -808,7 +817,11 @@ mod metadata_tests {
             }
             // 动画 has_alpha 是启发式且引擎各异（SimdCodecs 按首帧覆盖/不透明/背景置位推导，
             // 自研解码器按自身帧序）→ 动画仅比对静态元数据；静态严格比对。
-            if !danim && c.has_alpha != dalpha {
+            // 例外：StaticLossy（opaque 有损）自 T1 起经 `decode_static_lossy` 恒输出 RGBA8
+            // （α=0xFF 直出）——容器层无 alpha 概念（has_alpha=false），与 kimg 的 Rgba8 口径
+            // 有意分道（生产消费姿态 to_rgba8/into_rgba8 零拷贝），故不比对 has_alpha。
+            let opaque_lossy = c.family == container::Family::StaticLossy;
+            if !danim && !opaque_lossy && c.has_alpha != dalpha {
                 mismatches.push(format!(
                     "{name}: has_alpha 容器 {} vs kimg {}",
                     c.has_alpha, dalpha
@@ -1042,11 +1055,13 @@ mod alpha_filter_tests {
     }
 }
 
-/// opaque 静态有损 RGB3 直出硬闸：`OursStatic.rgb`（w*h*3）恒等于「旧路径 RGBA4 → 前 3 字节」，
-/// 且无 RGBA 缓冲（alloc 减少）、经公开 `WebPDecoder::read_image` 直拷出同字节。
+/// opaque 静态有损 RGBA4 直出硬闸（T1）：`OursStatic` 对 opaque 持 `rgba`（w*h*4，α 恒 0xFF）、
+/// `rgb` 恒空、`has_alpha=true`；`rgba` 逐字节 ≡ 「旧路径 RGBA4 直出」（`decode_vp8`+
+/// `yuv_to_rgba_fancy`）；经公开 `WebPDecoder::read_image` RGBA 目标直拷同字节。RGB 前 3 字节
+/// 恒等旧 RGB3 直出路径（`decode_vp8_rgb3` 遗留 dormant，字节契约不变）。
 /// 全部 opaque（StaticLossy 非 LossyAlpha）fixture 对拍；缺失外部语料则 SKIP（AGENTS §5）。
 #[cfg(test)]
-mod rgb3_path_tests {
+mod opaque_rgba_path_tests {
     use std::io::Cursor;
 
     use super::webp_fixtures_support;
@@ -1054,14 +1069,20 @@ mod rgb3_path_tests {
     use super::{BACKEND_AUTO, BACKEND_OURS};
     use crate::{ColorType, ImageDecoder};
 
-    /// 旧路径参考：`decode_vp8` + `yuv_to_rgba_fancy`（RGBA4，改前生产路径逐字节形态）。
+    /// 旧路径参考：`decode_vp8` + `yuv_to_rgba_fancy`（RGBA4 直出，改动前生产路径字节形态）。
     fn old_path_rgba(payload: &[u8], w: u32, h: u32) -> Vec<u8> {
         let mut yuv = vp8::decode_vp8(payload, w, h).expect("decode_vp8");
         vp8::yuv_to_rgba_fancy(&mut yuv)
     }
 
+    /// 遗留旧 RGB3 直出参考：`decode_vp8_rgb3` + `yuv_to_rgb_fancy`（dormant，T1 前 opaque 形态）。
+    fn old_path_rgb3(payload: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let mut yuv = vp8::decode_vp8_rgb3(payload, w, h).expect("decode_vp8_rgb3");
+        vp8::yuv_to_rgb_fancy(&mut yuv)
+    }
+
     #[test]
-    fn opaque_lossy_rgb3_direct_matches_old_rgba() {
+    fn opaque_lossy_rgba4_direct_matches_old_paths() {
         let mut checked = 0usize;
         for name in webp_fixtures_support::webp_fixture_names() {
             let Some(p) = webp_fixtures_support::webp_fixture_path(&name) else {
@@ -1075,36 +1096,46 @@ mod rgb3_path_tests {
                 continue;
             }
             let payload = c.bitstream.unwrap();
-            // 新路径：OursStatic 对 opaque 应只持 `rgb`（RGB3，w*h*3）+ rgba 空（alloc 减少）。
+            // 新不变式：opaque 应持 `rgba`（RGBA4，w*h*4）+ `rgb` 恒空 + has_alpha（RGBA8 输出）。
             let ours = decode_static_lossy(&data)
                 .ok()
                 .expect("decode_static_lossy 应 Ok")
                 .expect("opaque 有损应被自研接管");
             let n_px = (c.width as usize) * (c.height as usize);
-            assert!(!ours.has_alpha, "{name}: opaque 不应判有 alpha");
-            assert!(ours.rgba.is_empty(), "{name}: opaque 不应持 RGBA4 整帧缓冲");
-            assert_eq!(ours.rgb.len(), n_px * 3, "{name}: rgb 应为 w*h*3");
-            // 逐像素：RGB3 前 3 字节 ≡ 旧 RGBA4 前 3 字节。
+            assert!(ours.has_alpha, "{name}: opaque 输出应为 RGBA8（has_alpha=true）");
+            assert!(ours.rgb.is_empty(), "{name}: opaque 不应持 RGB3 缓冲（rgb 恒空）");
+            assert_eq!(ours.rgba.len(), n_px * 4, "{name}: rgba 应为 w*h*4");
+            // 逐字节：RGBA4 直出 ≡ 旧 RGBA4 路径（含 α=0xFF），且 RGB 前 3 字节 ≡ 旧 RGB3 直出。
             let old_rgba = old_path_rgba(payload, c.width, c.height);
+            let old_rgb3 = old_path_rgb3(payload, c.width, c.height);
             assert_eq!(old_rgba.len(), n_px * 4, "{name}: 旧路径缓冲长");
-            for (i, px) in ours.rgb.chunks_exact(3).enumerate() {
+            assert_eq!(old_rgb3.len(), n_px * 3, "{name}: 旧 RGB3 路径缓冲长");
+            let ours_rgba = ours.rgba.as_bytes();
+            for i in 0..n_px {
                 assert_eq!(
-                    px,
-                    &old_rgba[i * 4..i * 4 + 3],
-                    "{name} px={i}: RGB3 直出应等于旧 RGBA 前 3 字节"
+                    &ours_rgba[i * 4..i * 4 + 4],
+                    &old_rgba[i * 4..i * 4 + 4],
+                    "{name} px={i}: RGBA4 直出应等于旧 RGBA 路径"
+                );
+                assert_eq!(ours_rgba[i * 4 + 3], 0xFF, "{name} px={i}: opaque α 恒 255");
+                assert_eq!(
+                    &ours_rgba[i * 4..i * 4 + 3],
+                    &old_rgb3[i * 3..i * 3 + 3],
+                    "{name} px={i}: RGB 前 3 字节应等于旧 RGB3 直出"
                 );
             }
-            // 经公开 API：color_type 仍 Rgb8、read_image 直拷 OursStatic.rgb（无 4→3 转换）。
+            // 经公开 API：color_type=Rgba8、read_image RGBA 目标直拷 OursStatic.rgba。
             set_webp_backend(BACKEND_OURS);
             let dec = WebPDecoder::new(Cursor::new(&data)).expect("WebPDecoder");
-            assert_eq!(dec.color_type(), ColorType::Rgb8, "{name}: opaque 动态分类仍 Rgb8");
+            assert_eq!(dec.color_type(), ColorType::Rgba8, "{name}: opaque 动态分类应 Rgba8");
             let mut buf = vec![0u8; dec.total_bytes() as usize];
             dec.read_image(&mut buf).expect("read_image");
-            assert_eq!(buf, ours.rgb, "{name}: read_image 应直拷 OursStatic.rgb");
+            assert_eq!(buf.len(), n_px * 4, "{name}: read_image 目标应为 w*h*4");
+            assert_eq!(buf, ours_rgba, "{name}: read_image 应直拷 OursStatic.rgba");
             checked += 1;
         }
         set_webp_backend(BACKEND_AUTO);
-        eprintln!("WEBP_RGB3_OPAQUE_PARITY\t{checked}");
+        eprintln!("WEBP_OPAQUE_RGBA4_PARITY\t{checked}");
         assert!(
             checked >= 1,
             "应至少对拍 1 个 opaque 有损 fixture（当前 {checked}；缺外部语料）"
