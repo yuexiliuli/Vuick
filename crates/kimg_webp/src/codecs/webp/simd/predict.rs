@@ -29,7 +29,7 @@ pub(crate) fn predict_subblock(
 /// 解码内恒定，`reconstruct_macroblock` 每宏块取一次）。**Safety**：调用方须保证 ssse3
 /// 可用（如先判定返回 true），且 `row0/col0/pitch` 在平面内——其余语义同
 /// `predict_subblock` 的 SSSE3 分支，输出逐字节一致。
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn predict_subblock_forced(
     plane: &mut [u8],
     pitch: usize,
@@ -53,6 +53,10 @@ pub(crate) unsafe fn predict_subblock_forced(
 }
 
 #[cfg(target_arch = "x86_64")]
+// Coder Iteration 4：`#[inline]`（`#[inline(always)]` 与 `#[target_feature]` 互斥，E0658）——
+// 仅当调用方启用 ssse3 时 LLVM 才内联（非 ssse3 调用方受特征不符限制仍为 call，不变性不受影响），
+// 使 `reconstruct_i4_mb_ssse3` 内本核内联、above 向量不再经栈往返（壳≈30%/AC 块 的主消除对象）。
+#[inline]
 #[target_feature(enable = "ssse3")]
 unsafe fn predict_subblock_ssse3(
     plane: &mut [u8],

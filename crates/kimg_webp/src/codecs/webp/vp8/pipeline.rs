@@ -244,6 +244,35 @@ pub(crate) fn reconstruct_macroblock(
             // 透传 `idct_add_one_forced`，循环内用局部 bool。
             let i16_en = super::simd::idct_i16_enabled();
             stage_clock::idct_i4(|| {
+                if pred_simd {
+                    // Coder Iteration 4：i4 子块壳批量化——把整段 16 块 predict→add 提升进单个
+                    // `#[target_feature(enable="ssse3")]` 汇聚函数 `reconstruct_i4_mb_ssse3`：
+                    // SSSE3/SIMD 核在函数内可内联（调用方特征 ⊇ 被调方），above/系数/常数寄存器
+                    // 驻留，消除旧路径每块真 `callq predict_subblock_ssse3` 与栈往返（壳≈30%/AC 块）。
+                    // Safety：`pred_simd` = `KIMG_WEBP_I4_SIMD`（含测试覆盖）开 && `part_simd_on(
+                    // "pred","ssse3")` 为真（含 `is_x86_feature_detected!("ssse3")` 运行时探测）→
+                    // 调用 SSSE3 汇聚函数安全；其余指针/越界语义与逐块路径一致（`subblock_above`
+                    // 不变量）。`dct_simd`/`i16_en` 判定同在外层（本宏块内恒定）透传。
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        unsafe {
+                            reconstruct_i4_mb_ssse3(
+                                y, y_pitch, above_y, &mut *mb, b_modes, nonzero_mask, ac_mask, dct_simd,
+                                i16_en, dy, dx,
+                            )
+                        }
+                        return;
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        // 非 x86_64：`pred_simd` 恒为假（`simd_on` 恒 false），本段不可达；占位避免
+                        // 对仅 x86_64 编译的 `reconstruct_i4_mb_ssse3` 的引用。
+                        unreachable!("pred_simd 在非 x86_64 恒为 false")
+                    }
+                }
+                // 标量逐块路径原样保留（字节恒等基线）：`pred_simd` 为假 = `KIMG_WEBP_I4_SIMD=0` /
+                // pred SSSE3 关 / 非 x86_64 → 每块直调 vp8 标量 predict，add 分发不变（上方
+                // SSSE3 分支 `return` 后走到本段）。
                 // 逐 4×4 子块重建。子块间串行依赖：块 (bx,by) 预测读左/上已重建像素、add 随后
                 // 覆写，predict→add 逐块次序不可重排（S7 同版约束）。外层按子块行 / 内层按列扫，
                 // `row0`/`col0` 用循环增量直算（删 block→bx/by 反解 &3 / >>2），字节输出与旧
@@ -387,6 +416,107 @@ pub(crate) fn reconstruct_macroblock(
             }
         });
     });
+}
+
+/// Coder Iteration 4：i4 子块壳批量化汇聚函数——把「Y 平面一个 i4 宏块的 16 个 4×4 块」的
+/// predict→idct-add 完整循环整体提升进单个 `#[target_feature(enable="ssse3")]` 函数（SSSE3
+/// 可用路径；非 x86_64 经 `#[cfg]` 剔除）。效果：`predict_subblock_forced`/`idct_add_one_forced`/
+/// `dc_add_one_forced` 在本函数内可内联（调用方特征 ssse3 ⊇ 被调方 sse2/ssse3），消灭旧路径
+/// 「非 ssse3 的 `reconstruct_macroblock` 调 SSSE3/SIMD 核」的逐块真 `callq` 与 above/系数栈
+/// 往返，above/常数/指针寄存器驻留（壳≈30%/AC 块）。**字节恒等硬闸**：块序、predict→add
+/// 逐块次序、行缓存（66fcbc9）、AC/DC 分发、`dct_simd`/`i16_en` 关闭途径与
+/// `reconstruct_macroblock` 的 i4 标量逐块路径完全同构；predict 本函数内恒走 SSSE3 核（调用方
+/// 仅在 `pred_simd` 为真时进入，无需标量回退分支）。
+/// **Safety**：调用方须保证 CPU 具 ssse3（`pred_simd` = `i4_simd_enabled()` &&
+/// `part_simd_on("pred","ssse3")` 为真，经 `is_x86_feature_detected!("ssse3")` 运行时探测）；
+/// `y`/`above_y` 越界语义同 i4 逐块路径（`subblock_above` 不变量注释）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn reconstruct_i4_mb_ssse3(
+    y: &mut [u8],
+    y_pitch: usize,
+    above_y: &[u8; 21],
+    mb: &mut [[i16; 16]; 25],
+    b_modes: &[u8; 16],
+    nonzero_mask: u32,
+    ac_mask: u32,
+    dct_simd: bool,
+    i16_en: bool,
+    dy: usize,
+    dx: usize,
+) {
+    // 逐 4×4 子块重建。子块间串行依赖：块 (bx,by) 预测读左/上已重建像素、add 随后覆写，
+    // predict→add 逐块次序不可重排（S7 同版约束）。外层按子块行 / 内层按列扫，`row0`/`col0`
+    // 用循环增量直算，字节输出与标量逐块路径逐块次序完全一致。
+    let mut block = 0usize;
+    for by in 0..4usize {
+        let row0 = dy + by * 4;
+        // 行缓存：by>0 时本子块行上方的 17 字节平面行（raw 偏移 `(row0-1)*pitch+dx..dx+16`）
+        // 一次读入，本行 4 个子块复用（by==0 顶行走既有 `subblock_above` 的 above_y 缓冲，
+        // 无需平面读）。语义：本宏块只写行 dy+4by..dy+4by+3，by 迭代启动时上方行已由上一子块
+        // 行写毕 → 与逐块读原平面逐字节同源，可安全提升到循环外。
+        let mut above_row = [0u8; 17];
+        if by > 0 {
+            let row_above = row0 - 1;
+            debug_assert!(row_above * y_pitch + dx + 16 < y.len());
+            let base = unsafe { y.as_ptr().add(row_above * y_pitch).add(dx) };
+            for k in 0..17usize {
+                above_row[k] = unsafe { *base.add(k) };
+            }
+        }
+        for bx in 0..4usize {
+            let col0 = dx + bx * 4;
+            stage_clock::i4_predict(|| {
+                let above = if by == 0 {
+                    subblock_above(y, y_pitch, row0, col0, bx, by, above_y)
+                } else {
+                    subblock_above_row(&above_row, bx, above_y)
+                };
+                // Safety：本函数仅在 `pred_simd`（内含 ssse3 运行时探测）为真时被调用，SSSE3
+                // 核指令可用；predict 恒走向量核（调用方已保证 pred_simd，无标量回退分支）。
+                unsafe {
+                    super::simd::predict_subblock_forced(y, y_pitch, row0, col0, b_modes[block], &above)
+                }
+            });
+            if ((nonzero_mask >> block) & 1) != 0 || mb[block][0] != 0 {
+                // 块级 AC 分发（镜像 i16/UV 的 `ac_mask` 双块位判定）：`nonzero 位 1 且
+                // ac 位 0` = 纯 DC 块（`tokens` 返回 last==1，非 DC 系数恒 0）——走单块
+                // DC 捷径 `dc_add_one_forced`（(dc+4)>>3 广播，字节恒等）；ac 位 1 = 有 AC，
+                // 仍走全 IDCT 核。
+                let has_ac = ((ac_mask >> block) & 1) != 0;
+                stage_clock::i4_idct_add(|| {
+                    // 计数器语义：`i4_add_ac` 只计 AC 块；DC-only 块不计（探针折算
+                    // `add_dc_n = i4_idct_add_blocks − i4_add_ac_blocks` 即纯 DC 块数）。
+                    if has_ac {
+                        stage_clock::i4_add_ac();
+                        if dct_simd {
+                            // Safety：`dct_simd` 由调用方提升判定 `part_simd_on("dct","sse2")`
+                            // 为真且本块内恒定（sse2 ⊆ ssse3，本函数内可内联）。
+                            unsafe {
+                                super::simd::idct_add_one_forced(&mb[block], y, y_pitch, row0, col0, i16_en)
+                            }
+                        } else {
+                            // 标量：直调 vp8 标量核（恒 has_ac=true）。`KIMG_WEBP_I4_SIMD=0` /
+                            // `KIMG_WEBP_NO_SIMD_DCT=1` 关闭途径保留（dct_simd 为假分支）。
+                            super::inverse_dct_add(&mb[block], y, y_pitch, row0, col0, true);
+                        }
+                    } else if dct_simd {
+                        // Safety：同 `has_ac` 分支——SSE2 核指令可用；纯 DC 分发由
+                        // `has_ac==false` 保证（非 DC 系数全 0），捷径输出与全 IDCT 恒等。
+                        unsafe {
+                            super::simd::dc_add_one_forced(mb[block][0], y, y_pitch, row0, col0)
+                        }
+                    } else {
+                        // 标量回退：`super::inverse_dct_add` 恒 has_ac=true，对纯 DC 块与
+                        // DC 捷径逐字节一致（既有 `inverse_dct_has_ac_shortcut_equivalence`）。
+                        super::inverse_dct_add(&mb[block], y, y_pitch, row0, col0, true);
+                    }
+                    mb[block].fill(0);
+                });
+            }
+            block += 1;
+        }
+    }
 }
 
 pub(crate) fn decode_from_header(

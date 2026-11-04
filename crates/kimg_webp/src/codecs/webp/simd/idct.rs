@@ -113,6 +113,10 @@ unsafe fn idct_add_two_sse2(
 /// 必须先 predict b 再逐块 add，故禁止 2 块合批——S7/K15 同版约束）。末段加回像素并 clamp
 /// [0,255] 只落低 4 像素/行（严格 4 字节读写，右缘块不越出平面右端，同 `dc_add_two_sse2` 姿势）。
 #[cfg(target_arch = "x86_64")]
+// Coder Iteration 4：`#[inline]`（`#[inline(always)]` 与 `#[target_feature]` 互斥，E0658）——
+// sse2 ⊆ ssse3，使 `reconstruct_i4_mb_ssse3` 内本核内联（非 sse2 调用方受特征限制仍为 call）；
+// 消 i4 每块真 `callq` 与系数栈往返。
+#[inline]
 #[target_feature(enable = "sse2")]
 unsafe fn idct_add_one_sse2(coeff: *const i16, dst: *mut u8, stride: isize, i16_en: bool) {
     use std::arch::x86_64::*;
@@ -277,7 +281,7 @@ pub(crate) fn inverse_dct_add_one(
 /// sse2 可用（如先判定返回 true），越界语义同 `inverse_dct_add_one` 的 SSE2 分支（`row0/col0`
 /// 落在平面内）；仅 DC（无 AC）块亦走本核——`idct_add_one_sse2` 对仅 DC 块与标量 DC 捷径
 /// 逐字节一致（`inverse_dct_has_ac_shortcut_equivalence`）。
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn idct_add_one_forced(
     coeff: &[i16; 16],
     plane: &mut [u8],
@@ -395,6 +399,9 @@ unsafe fn dc_add_two_sse2(dc_a: i16, dc_b: i16, dst: *mut u8, stride: isize) {
 /// 每行只读写 4 字节（块右缘不越出平面右端，同 `idct_add_one_sse2` 姿势）。i4 路径按块级
 /// AC 位（`ac_mask`）把纯 DC 块分发到本核——省去两遍 butterfly + 转置（~118 uops → ~20）。
 #[cfg(target_arch = "x86_64")]
+// Coder Iteration 4：`#[inline]`（`#[inline(always)]` 与 `#[target_feature]` 互斥，E0658）——
+// 同上，i4 DC 捷径核于 `reconstruct_i4_mb_ssse3` 内内联，消逐块 `callq` 与栈往返。
+#[inline]
 #[target_feature(enable = "sse2")]
 unsafe fn dc_add_one_sse2(dc: i16, dst: *mut u8, stride: isize) {
     use std::arch::x86_64::*;
@@ -415,7 +422,7 @@ unsafe fn dc_add_one_sse2(dc: i16, dst: *mut u8, stride: isize) {
 /// （同 `idct_add_one_forced` 姿势）。**Safety**：调用方须保证 sse2 可用，且本块确为纯 DC
 /// （调用方按 `ac_mask` 位 0 分发，见 `reconstruct_macroblock` i4 分支）；越界语义同
 /// `dc_add_two`（`row0/col0` 落在平面内）。
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn dc_add_one_forced(dc: i16, plane: &mut [u8], pitch: usize, row0: usize, col0: usize) {
     // x86_64：内核使用 x86-only intrinsic，仅在该目标编译（SSE2 核指令可用性由调用方保证）。
     #[cfg(target_arch = "x86_64")]
