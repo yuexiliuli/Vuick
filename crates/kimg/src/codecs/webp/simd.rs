@@ -241,6 +241,54 @@ pub(crate) fn set_ent_branch_override(v: Option<bool>) {
     ent_branch_override::set(v);
 }
 
+/// IDCT 第二遍 i16 域开关（K93 双路径）：`KIMG_WEBP_IDCT_I16=0`/`false`/`off` → 强制旧 i32
+/// pass2（基线，全输入域与 i32 标量逐字节恒等）；其余/缺省 → i16 域 pass2（与 libwebp
+/// `Transform_SSE2` 水平遍逐 op 对齐，可达域 ∥c∥≤2212 内与标量恒等；∥c∥>2212 码流可达时
+/// i16 回绕与 i32 相位差——显式接受，见 `idct_pass2_shift16_sse2` 语义注释）。
+/// `#[cfg(test)]` 可经 `set_idct_i16_override` 进程内翻转（优先于 env，同 `set_ent_branch_override` 姿势）。
+/// 首次访问读一次 env 缓存，之后仅 Relaxed 原子读——热环开销可忽略（同 `ent_branch_enabled`）。
+#[inline]
+pub(crate) fn idct_i16_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = idct_i16_override::get() {
+        return v;
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("KIMG_WEBP_IDCT_I16").unwrap_or_default();
+        let t = v.trim();
+        !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+    })
+}
+
+/// `#[cfg(test)]` IDCT i16 域进程内覆盖（优先于 env；K93 同窗 A/B 用，同 `ent_branch_override` 姿势）。
+#[cfg(test)]
+mod idct_i16_override {
+    use std::sync::atomic::{AtomicI8, Ordering::Relaxed};
+    static V: AtomicI8 = AtomicI8::new(-1);
+    pub fn set(v: Option<bool>) {
+        let val = match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        };
+        V.store(val, Relaxed);
+    }
+    pub fn get() -> Option<bool> {
+        match V.load(Relaxed) {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_idct_i16_override(v: Option<bool>) {
+    idct_i16_override::set(v);
+}
+
 /// `KIMG_WEBP_SIMD_FLT`（默认开）：`0`/`false`/`off` → 关（A/B 对照保留）；其余/缺省 → 开。
 fn flt_enabled() -> bool {
     use std::sync::OnceLock;
@@ -1384,6 +1432,11 @@ unsafe fn lf_edge_v16(
     let (q0, q1, q2, q3) = lf_load16x4(pt.offset(4), stride);
     let mx = lf_max_diff(p3, p2, p1, p0, q0, q1, q2, q3);
     let mask = lf_mask_composite(lf_needs_filter(_mm_set1_epi8(-1), p1, p0, q0, q1, edge), mx, interior);
+    // 全零 mask：任何 lane 都无需改（do_filter4/6 的 delta 逐 lane 被 mask 清零 → 输出==输入），
+    // 跳过重排+store，字节恒等平凡成立。
+    if _mm_movemask_epi8(mask) == 0 {
+        return;
+    }
     if macroblock_edge {
         let (p2n, p1n, p0n, q0n, q1n, q2n) = lf_do_filter6(p2, p1, p0, q0, q1, q2, mask, hev);
         let (mut a0, mut a1, mut a2, mut a3) = (p3, p2n, p1n, p0n);
@@ -1423,6 +1476,10 @@ unsafe fn lf_edge_h(
     }
     let mx = lf_max_diff(p3, p2, p1, p0, q0, q1, q2, q3);
     let mask = lf_mask_composite(lf_needs_filter(_mm_set1_epi8(-1), p1, p0, q0, q1, edge), mx, interior);
+    // 全零 mask：任何 lane 都无需改（do_filter 的 delta 逐 lane 被清 → 输出==输入），跳过 store。
+    if _mm_movemask_epi8(mask) == 0 {
+        return;
+    }
     if macroblock_edge {
         let (p2n, p1n, p0n, q0n, q1n, q2n) = lf_do_filter6(p2, p1, p0, q0, q1, q2, mask, hev);
         let rows = [(p2n, -3isize), (p1n, -2), (p0n, -1), (q0n, 0), (q1n, 1), (q2n, 2)];
@@ -1526,6 +1583,10 @@ unsafe fn lf_edge_v8_pair(
                 mx,
                 interior,
             );
+            // 全零 mask：任何 lane 都无需改（输出==输入），跳过 store（c 原值不变则存回既存既等）。
+            if _mm_movemask_epi8(mask) == 0 {
+                return;
+            }
             if macroblock_edge {
                 let (p2n, p1n, p0n, q0n, q1n, q2n) =
                     lf_do_filter6(c[1], c[2], c[3], c[4], c[5], c[6], mask, hev);
@@ -1589,6 +1650,10 @@ unsafe fn lf_edge_h_pair(
             mx,
             interior,
         );
+        // 全零 mask：任何 lane 都无需改（输出==输入），跳过 store。
+        if _mm_movemask_epi8(mask) == 0 {
+            return;
+        }
         if macroblock_edge {
             let (p2n, p1n, p0n, q0n, q1n, q2n) = lf_do_filter6(p2, p1, p0, q0, q1, q2, mask, hev);
             lf_uv_pair_store(u, v, -3 * stride, p2n);
@@ -1677,7 +1742,9 @@ pub(crate) unsafe fn lf_filter_macroblock(
 // i16-mulhi 技巧（K = k + 65536，故 (x*K)>>16 = (x*k)>>16 + x，见 libwebp dec_sse2.c 注释），
 // 两个 4×4 块（水平相邻）各一行装进一个 128-bit 寄存器做并行 butterfly；中间 i16 回绕与标量
 // `as i16` 逐字节一致；末段 (x+4)>>3 用先加 4 再 srai_epi16（=算术右移，等价标量整除方向）。
-// 两个块同行处理，dest 为 8 像素行首。字节==标量唯一标准；随机 parity 断言见模块底部。
+// 第二遍默认走 **i16 域 pass2**（add-4-then-srai，逐 op 对齐 libwebp `Transform_SSE2`，可达域
+// ∥c∥≤2212 与标量逐字节一致）；`KIMG_WEBP_IDCT_I16=0` 强制旧 i32 域 pass2（K93 基线，全输入域
+// 恒等）。字节==标量唯一标准；随机 parity 断言见模块底部。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn idct_add_two_sse2(coeff_a: *const i16, coeff_b: *const i16, dst: *mut u8, stride: isize) {
@@ -1709,42 +1776,48 @@ unsafe fn idct_add_two_sse2(coeff_a: *const i16, coeff_b: *const i16, dst: *mut 
         let tmp3 = _mm_sub_epi16(a, d);
         // 转置。
         let (t0, t1, t2, t3) = transpose_2_4x4_16b_sse2(tmp0, tmp1, tmp2, tmp3);
-        // 第二遍（(x+4)>>3 舍入并入）：以 i32 中间量计算，杜绝 `_mm_add_epi16` 模 2^16 回绕后
-        // `srai_epi16` 与标量 i32 `((a+4)>>3)` 的偏出（满幅系数 ±32767/-32768 单系数即可触发，
-        // a2+d2、b2±c2 等和超出 i16 域；真实解量化系数量级远小于此，此改动只让内核与标量全输入域一致）。
-        // 高位乘项：`mh16(x,k2)`=`(x*(-30068))>>16`=标量 `(x*35468)>>16` - x（-30068≡35468 mod 2^16），
-        // 故 `(x*35468)>>16 = mh16(x,k2) + x`；`mh16(x,k1)` 即标量 `(x*20091)>>16`。各 i16 项
-        // 符号扩展到 i32 后相加，恒等标量两遍 butterfly 的 i32 中间量（值域容 i32，不溢出）。
-        let m1k2 = _mm_mulhi_epi16(t1, k2); // (t1*35468)>>16 - t1
-        let m3k1 = _mm_mulhi_epi16(t3, k1); // (t3*20091)>>16
-        let m12 = _mm_mulhi_epi16(t1, k1); // (t1*20091)>>16
-        let m32 = _mm_mulhi_epi16(t3, k2); // (t3*35468)>>16 - t3
-        // 拆 A/B 两半并 i16→i32 符号扩展（interleave 各半，保持两块同构独立计算）。
-        let sign_ext = |x: __m128i| {
-            let sm = _mm_srai_epi16(x, 15);
-            (_mm_unpacklo_epi16(x, sm), _mm_unpackhi_epi16(x, sm))
+        // 第二遍：默认 i16 域 pass2（add-4-then-srai，逐 op 对齐 libwebp Transform_SSE2，可达域
+        // ∥c∥≤2212 与标量恒等）；`KIMG_WEBP_IDCT_I16=0`（或测试 override）强制旧 i32 域 pass2
+        //（全输入域与标量恒等，K93 基线 A/B 侧）。
+        let (s0, s1, s2, s3) = if idct_i16_enabled() {
+            idct_pass2_shift16_sse2(t0, t1, t2, t3)
+        } else {
+            // 高位乘项：`mh16(x,k2)`=`(x*(-30068))>>16`=标量 `(x*35468)>>16` - x（-30068≡35468 mod 2^16），
+            // 故 `(x*35468)>>16 = mh16(x,k2) + x`；`mh16(x,k1)` 即标量 `(x*20091)>>16`。各 i16 项
+            // 符号扩展到 i32 后相加，恒等标量两遍 butterfly 的 i32 中间量（值域容 i32，不溢出）。
+            let m1k2 = _mm_mulhi_epi16(t1, k2); // (t1*35468)>>16 - t1
+            let m3k1 = _mm_mulhi_epi16(t3, k1); // (t3*20091)>>16
+            let m12 = _mm_mulhi_epi16(t1, k1); // (t1*20091)>>16
+            let m32 = _mm_mulhi_epi16(t3, k2); // (t3*35468)>>16 - t3
+            // 拆 A/B 两半并 i16→i32 符号扩展（interleave 各半，保持两块同构独立计算）。
+            let sign_ext = |x: __m128i| {
+                let sm = _mm_srai_epi16(x, 15);
+                (_mm_unpacklo_epi16(x, sm), _mm_unpackhi_epi16(x, sm))
+            };
+            let (t0a, t0b) = sign_ext(t0);
+            let (t1a, t1b) = sign_ext(t1);
+            let (t2a, t2b) = sign_ext(t2);
+            let (t3a, t3b) = sign_ext(t3);
+            let (m1k2a, m1k2b) = sign_ext(m1k2);
+            let (m3k1a, m3k1b) = sign_ext(m3k1);
+            let (m12a, m12b) = sign_ext(m12);
+            let (m32a, m32b) = sign_ext(m32);
+            let (sa0, sa1, sa2, sa3) =
+                idct_pass2_shift32_sse2(t0a, t1a, t2a, t3a, m1k2a, m3k1a, m12a, m32a);
+            let (sb0, sb1, sb2, sb3) =
+                idct_pass2_shift32_sse2(t0b, t1b, t2b, t3b, m1k2b, m3k1b, m12b, m32b);
+            // 打包回 i16（(x+4)>>3 结果恒落 i16 域，饱和=精确）并交还 A/B 组合布局。
+            let pack_ab = |a: __m128i, b: __m128i| {
+                let z = _mm_setzero_si128();
+                _mm_unpacklo_epi64(_mm_packs_epi32(a, z), _mm_packs_epi32(b, z))
+            };
+            (
+                pack_ab(sa0, sb0),
+                pack_ab(sa1, sb1),
+                pack_ab(sa2, sb2),
+                pack_ab(sa3, sb3),
+            )
         };
-        let (t0a, t0b) = sign_ext(t0);
-        let (t1a, t1b) = sign_ext(t1);
-        let (t2a, t2b) = sign_ext(t2);
-        let (t3a, t3b) = sign_ext(t3);
-        let (m1k2a, m1k2b) = sign_ext(m1k2);
-        let (m3k1a, m3k1b) = sign_ext(m3k1);
-        let (m12a, m12b) = sign_ext(m12);
-        let (m32a, m32b) = sign_ext(m32);
-        let (sa0, sa1, sa2, sa3) =
-            idct_pass2_shift32_sse2(t0a, t1a, t2a, t3a, m1k2a, m3k1a, m12a, m32a);
-        let (sb0, sb1, sb2, sb3) =
-            idct_pass2_shift32_sse2(t0b, t1b, t2b, t3b, m1k2b, m3k1b, m12b, m32b);
-        // 打包回 i16（(x+4)>>3 结果恒落 i16 域，饱和=精确）并交还 A/B 组合布局。
-        let pack_ab = |a: __m128i, b: __m128i| {
-            let z = _mm_setzero_si128();
-            _mm_unpacklo_epi64(_mm_packs_epi32(a, z), _mm_packs_epi32(b, z))
-        };
-        let s0 = pack_ab(sa0, sb0);
-        let s1 = pack_ab(sa1, sb1);
-        let s2 = pack_ab(sa2, sb2);
-        let s3 = pack_ab(sa3, sb3);
         let (r0, r1, r2, r3) = transpose_2_4x4_16b_sse2(s0, s1, s2, s3);
         // 加回像素并 clamp [0,255]（packus）再存 8 字节每行。
         let zero = _mm_setzero_si128();
@@ -1764,7 +1837,8 @@ unsafe fn idct_add_two_sse2(coeff_a: *const i16, coeff_b: *const i16, dst: *mut 
 }
 
 /// 单个 4×4 块的逆 DCT + 残差写回（1-block SSE2，字节==既有标量）。
-/// 与 `idct_add_two_sse2` 共用同一套两遍 butterfly + i32 pass2 算术（A 半边），但 B 块不拼装
+/// 与 `idct_add_two_sse2` 共用同一套两遍 butterfly + i16 域 pass2（K93 双路径：默认 i16、
+/// `KIMG_WEBP_IDCT_I16=0` 走 i32 基线），但 B 块不拼装
 /// （无配对/合批）：i4x4 块间存在重建像素串行依赖（块 b 的左上下文读块 a 的「重建后」像素，
 /// 必须先 predict b 再逐块 add，故禁止 2 块合批——S7/K15 同版约束）。末段加回像素并 clamp
 /// [0,255] 只落低 4 像素/行（严格 4 字节读写，右缘块不越出平面右端，同 `dc_add_two_sse2` 姿势）。
@@ -1798,27 +1872,36 @@ unsafe fn idct_add_one_sse2(coeff: *const i16, dst: *mut u8, stride: isize) {
         let tmp3 = _mm_sub_epi16(a, d);
         // 转置：返回各寄存器低 64 = 列 i（4 行），高 64 恒 0。
         let (t0, t1, t2, t3) = transpose_2_4x4_16b_sse2(tmp0, tmp1, tmp2, tmp3);
-        // 第二遍：只对低 64（A 半边）符号扩展做 i32 pass2（高位乘项同理，高半恒 0）。
-        let sign_ext = |x: __m128i| _mm_unpacklo_epi16(x, _mm_srai_epi16(x, 15));
-        let m1k2 = sign_ext(_mm_mulhi_epi16(t1, k2));
-        let m3k1 = sign_ext(_mm_mulhi_epi16(t3, k1));
-        let m12 = sign_ext(_mm_mulhi_epi16(t1, k1));
-        let m32 = sign_ext(_mm_mulhi_epi16(t3, k2));
-        let (s0, s1, s2, s3) = idct_pass2_shift32_sse2(
-            sign_ext(t0),
-            sign_ext(t1),
-            sign_ext(t2),
-            sign_ext(t3),
-            m1k2,
-            m3k1,
-            m12,
-            m32,
-        );
-        // 打包回 i16（列布局）→ 转置回行布局（r_i = 行 i 残差 4 i16，高 64 恒 0）。
-        let s0 = _mm_packs_epi32(s0, z);
-        let s1 = _mm_packs_epi32(s1, z);
-        let s2 = _mm_packs_epi32(s2, z);
-        let s3 = _mm_packs_epi32(s3, z);
+        // 第二遍：默认 i16 域 pass2（8-lane，A 低 64 / B 高 64 恒 0 → 仅低 4 列携带有效值，与
+        // `idct_add_two_sse2` 同算术）；`KIMG_WEBP_IDCT_I16=0` 强制旧 i32 域 pass2（基线，全幅恒等）。
+        let (s0, s1, s2, s3) = if idct_i16_enabled() {
+            idct_pass2_shift16_sse2(t0, t1, t2, t3)
+        } else {
+            // 只对低 64（A 半边）符号扩展做 i32 pass2（高位乘项同理，高半恒 0）。
+            let sign_ext = |x: __m128i| _mm_unpacklo_epi16(x, _mm_srai_epi16(x, 15));
+            let m1k2 = sign_ext(_mm_mulhi_epi16(t1, k2));
+            let m3k1 = sign_ext(_mm_mulhi_epi16(t3, k1));
+            let m12 = sign_ext(_mm_mulhi_epi16(t1, k1));
+            let m32 = sign_ext(_mm_mulhi_epi16(t3, k2));
+            let (s0, s1, s2, s3) = idct_pass2_shift32_sse2(
+                sign_ext(t0),
+                sign_ext(t1),
+                sign_ext(t2),
+                sign_ext(t3),
+                m1k2,
+                m3k1,
+                m12,
+                m32,
+            );
+            // 打包回 i16（列布局，高 64 恒 0）。
+            (
+                _mm_packs_epi32(s0, z),
+                _mm_packs_epi32(s1, z),
+                _mm_packs_epi32(s2, z),
+                _mm_packs_epi32(s3, z),
+            )
+        };
+        // 转置回行布局（r_i = 行 i 残差 4 i16，高 64 恒 0）。
         let (r0, r1, r2, r3) = transpose_2_4x4_16b_sse2(s0, s1, s2, s3);
         // 每行载 4 像素（零扩展）、加残差、packus clamp、落 4 字节（右缘不越界）。
         let load_row = |o: isize| {
@@ -2039,6 +2122,52 @@ unsafe fn idct_pass2_shift32_sse2(
         let s1 = _mm_srai_epi32(_mm_add_epi32(b, c), 3);
         let s2 = _mm_srai_epi32(_mm_sub_epi32(b, c), 3);
         let s3 = _mm_srai_epi32(_mm_sub_epi32(a, d), 3);
+        (s0, s1, s2, s3)
+    }
+}
+
+/// 第二遍一维逆变换的 i16 域版本（8-lane A/B 组合布局，与 libwebp `Transform_SSE2` 水平遍
+/// 逐 op 对齐）：先 `dc=T0+4`（**add-4 先于合**，随后 a/b/c/d 全 i16 回绕算术 mod 2^16），
+/// mulhi 项为 K1=20091/K2=-30068 之 `(x*k)>>16`（K = k + 2^16 技巧），c/d 两项按 libwebp
+/// 「先算差/和（c3/d3）再算子项差/和（c4/d4）最后合」的求值顺序，末 `srai_epi16(x,3)`
+/// （算术右移，等价标量 i32 `(x+4)>>3` 的整除方向）。
+///
+/// **语义（显式记录，对抗评审定案）**：∃ ∥c∥>2212（码流可达）时 i16 中间量回绕与 i32 相位差 →
+/// 本核即不等于 i32（标量/SIMD）；可达域 ∥c∥≤2212 内任一 i16 中间量不越 ±32767
+/// （`idct_add_two_reachable_domain_parity` 直断），与本文件 i32 pass2 ≡ 标量逐字节一致。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn idct_pass2_shift16_sse2(
+    t0: __m128i,
+    t1: __m128i,
+    t2: __m128i,
+    t3: __m128i,
+) -> (__m128i, __m128i, __m128i, __m128i) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let k1 = _mm_set1_epi16(20091);
+        let k2 = _mm_set1_epi16(-30068);
+        let four = _mm_set1_epi16(4);
+        // 与 libwebp dec_sse2.c 水平遍同序：dc=T0+4 → a=dc+T2、b=dc-T2。
+        let dc = _mm_add_epi16(t0, four);
+        let a = _mm_add_epi16(dc, t2);
+        let b = _mm_sub_epi16(dc, t2);
+        // c = MUL(t1,K2) − MUL(t3,K1) = mulhi(t1,k2) − mulhi(t3,k1) + t1 − t3（先差后合）。
+        let c1 = _mm_mulhi_epi16(t1, k2);
+        let c2 = _mm_mulhi_epi16(t3, k1);
+        let c3 = _mm_sub_epi16(t1, t3);
+        let c4 = _mm_sub_epi16(c1, c2);
+        let c = _mm_add_epi16(c3, c4);
+        // d = MUL(t1,K1) + MUL(t3,K2) = mulhi(t1,k1) + mulhi(t3,k2) + t1 + t3（先和后合）。
+        let d1 = _mm_mulhi_epi16(t1, k1);
+        let d2 = _mm_mulhi_epi16(t3, k2);
+        let d3 = _mm_add_epi16(t1, t3);
+        let d4 = _mm_add_epi16(d1, d2);
+        let d = _mm_add_epi16(d3, d4);
+        let s0 = _mm_srai_epi16(_mm_add_epi16(a, d), 3);
+        let s1 = _mm_srai_epi16(_mm_add_epi16(b, c), 3);
+        let s2 = _mm_srai_epi16(_mm_sub_epi16(b, c), 3);
+        let s3 = _mm_srai_epi16(_mm_sub_epi16(a, d), 3);
         (s0, s1, s2, s3)
     }
 }
@@ -3327,6 +3456,269 @@ pub(crate) fn upsample_fancy_into_uv(
     vo.copy_from_slice(&super::vp8::upsample_fancy(v_cur, v_adj, width));
 }
 
+/// SSE2：一次载入 `top`/`cur` 各 16 字节 → 零扩展成 16 u16 → 写两行 t（**共享一次装入/乘加**）：
+/// 奇行 `t_odd = 3*top + cur`、偶行 `t_even = 3*cur + top`。与标量逐值相等（3*255+255=1020
+/// < u16::MAX 无溢出；调用方保证 `col+16 ≤ cw` 不越界）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn upsample_fancy_trow_pair_sse2(
+    top: *const u8,
+    cur: *const u8,
+    t_odd: *mut u16,
+    t_even: *mut u16,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let tp = _mm_loadu_si128(top as *const __m128i);
+        let cp = _mm_loadu_si128(cur as *const __m128i);
+        let three = _mm_set1_epi16(3);
+        let z = _mm_setzero_si128();
+        let (tlo, thi) = (_mm_unpacklo_epi8(tp, z), _mm_unpackhi_epi8(tp, z));
+        let (clo, chi) = (_mm_unpacklo_epi8(cp, z), _mm_unpackhi_epi8(cp, z));
+        _mm_storeu_si128(t_odd as *mut __m128i, _mm_add_epi16(_mm_mullo_epi16(tlo, three), clo));
+        _mm_storeu_si128(
+            t_odd.add(8) as *mut __m128i,
+            _mm_add_epi16(_mm_mullo_epi16(thi, three), chi),
+        );
+        _mm_storeu_si128(t_even as *mut __m128i, _mm_add_epi16(_mm_mullo_epi16(clo, three), tlo));
+        _mm_storeu_si128(
+            t_even.add(8) as *mut __m128i,
+            _mm_add_epi16(_mm_mullo_epi16(chi, three), thi),
+        );
+    }
+}
+
+/// AVX2：一次载入 `top`/`cur` 各 32 字节 → 宽成 32 u16 → 写两行 t（奇 `3*top+cur`、偶
+/// `3*cur+top`，共享一次装入/乘加）。与标量逐值相等，逐字节等于两次
+/// [`upsample_fancy_trow_pair_sse2`] 的每 16 列组（调用方保证 `col+32 ≤ cw`）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn upsample_fancy_trow_pair_avx2(
+    top: *const u8,
+    cur: *const u8,
+    t_odd: *mut u16,
+    t_even: *mut u16,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let tp = _mm256_loadu_si256(top as *const __m256i);
+        let cp = _mm256_loadu_si256(cur as *const __m256i);
+        let three = _mm256_set1_epi16(3);
+        let (tlo, thi) = (
+            _mm256_cvtepu8_epi16(_mm256_castsi256_si128(tp)),
+            _mm256_cvtepu8_epi16(_mm256_extracti128_si256(tp, 1)),
+        );
+        let (clo, chi) = (
+            _mm256_cvtepu8_epi16(_mm256_castsi256_si128(cp)),
+            _mm256_cvtepu8_epi16(_mm256_extracti128_si256(cp, 1)),
+        );
+        _mm256_storeu_si256(
+            t_odd as *mut __m256i,
+            _mm256_add_epi16(_mm256_mullo_epi16(tlo, three), clo),
+        );
+        _mm256_storeu_si256(
+            t_odd.add(16) as *mut __m256i,
+            _mm256_add_epi16(_mm256_mullo_epi16(thi, three), chi),
+        );
+        _mm256_storeu_si256(
+            t_even as *mut __m256i,
+            _mm256_add_epi16(_mm256_mullo_epi16(clo, three), tlo),
+        );
+        _mm256_storeu_si256(
+            t_even.add(16) as *mut __m256i,
+            _mm256_add_epi16(_mm256_mullo_epi16(chi, three), thi),
+        );
+    }
+}
+
+/// 行对 fancy 上采样（U/V × 奇/偶两输出行一次完成，libwebp `UpsampleLinePair` 同趟 top/bottom
+/// 语义）：对相邻 chroma 行对 `(top=C_k, cur=C_{k+1})` 生成输出行 **2k+1（奇）** 的整行 U/V
+/// fancy（t = 3*top + cur）与 **2k+2（偶）** 的整行 U/V fancy（t = 3*cur + top）。与逐行两次
+/// 调用 [`upsample_fancy_into_uv`] 完全一致（**同算术、逐字节**，`upsample_pair_matches_twice_into_uv`
+/// 对拍 0 差）：两 chroma 行只装入一次、t 行融合构建（四行 t 同一循环）、fancy 中间列循环把
+/// U/V × 奇/偶 四 t 行并进同一迭代（比逐行两次省一次 chroma 内存往返 + 循环 scaffold 一半）。
+/// 语义取舍：与各输出行独立调用相比，加法树完全一致（t = 3*cur+adj 只是把「当前行」在奇偶行
+/// 的交换显式化），无任何重结合 → 字节恒等由构造保证。`t_ws` ≥ **4**(cw+8) u16：低半 U（奇/偶）、
+/// 高半 V（奇/偶），每行 cw+8 尾填充供 SSE 越界读保护。
+pub(crate) fn upsample_fancy_into_uv_pair(
+    u_top: &[u8],
+    u_cur: &[u8],
+    v_top: &[u8],
+    v_cur: &[u8],
+    u_odd_out: &mut [u8],
+    v_odd_out: &mut [u8],
+    u_even_out: &mut [u8],
+    v_even_out: &mut [u8],
+    t_ws: &mut [u16],
+) {
+    let cw = u_top.len();
+    debug_assert_eq!(u_top.len(), u_cur.len());
+    debug_assert_eq!(v_top.len(), v_cur.len());
+    debug_assert_eq!(u_top.len(), v_top.len());
+    let width = u_odd_out.len();
+    debug_assert_eq!(u_odd_out.len(), v_odd_out.len());
+    debug_assert_eq!(u_odd_out.len(), u_even_out.len());
+    debug_assert_eq!(u_even_out.len(), v_even_out.len());
+    debug_assert!(t_ws.len() >= 4 * (cw + 8));
+    let (tu, tv) = t_ws.split_at_mut(2 * (cw + 8));
+    let (tu_odd, tu_even) = tu.split_at_mut(cw + 8);
+    let (tv_odd, tv_even) = tv.split_at_mut(cw + 8);
+    // padding（恒 0）只作末组 SSE 越界读保护，不参与任何输出字节（语义同单行版）。
+    tu_odd[cw..].fill(0);
+    tu_even[cw..].fill(0);
+    tv_odd[cw..].fill(0);
+    tv_even[cw..].fill(0);
+    // t 行融合构建：AVX2 32 列 / SSE2 16 列每组（U/V 各一对），尾部标量。
+    let mut col = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") {
+        let (u_tp, u_cp) = (u_top.as_ptr(), u_cur.as_ptr());
+        let (v_tp, v_cp) = (v_top.as_ptr(), v_cur.as_ptr());
+        unsafe {
+            while col + 32 <= cw {
+                upsample_fancy_trow_pair_avx2(
+                    u_tp.add(col),
+                    u_cp.add(col),
+                    tu_odd.as_mut_ptr().add(col),
+                    tu_even.as_mut_ptr().add(col),
+                );
+                upsample_fancy_trow_pair_avx2(
+                    v_tp.add(col),
+                    v_cp.add(col),
+                    tv_odd.as_mut_ptr().add(col),
+                    tv_even.as_mut_ptr().add(col),
+                );
+                col += 32;
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("sse2") {
+        let (u_tp, u_cp) = (u_top.as_ptr(), u_cur.as_ptr());
+        let (v_tp, v_cp) = (v_top.as_ptr(), v_cur.as_ptr());
+        unsafe {
+            while col + 16 <= cw {
+                upsample_fancy_trow_pair_sse2(
+                    u_tp.add(col),
+                    u_cp.add(col),
+                    tu_odd.as_mut_ptr().add(col),
+                    tu_even.as_mut_ptr().add(col),
+                );
+                upsample_fancy_trow_pair_sse2(
+                    v_tp.add(col),
+                    v_cp.add(col),
+                    tv_odd.as_mut_ptr().add(col),
+                    tv_even.as_mut_ptr().add(col),
+                );
+                col += 16;
+            }
+        }
+    }
+    while col < cw {
+        let ut = u16::from(u_top[col]);
+        let uc = u16::from(u_cur[col]);
+        let vt = u16::from(v_top[col]);
+        let vc = u16::from(v_cur[col]);
+        tu_odd[col] = 3 * ut + uc;
+        tu_even[col] = 3 * uc + ut;
+        tv_odd[col] = 3 * vt + vc;
+        tv_even[col] = 3 * vc + vt;
+        col += 1;
+    }
+    let w = width;
+    let (uo_o, vo_o) = (&mut u_odd_out[..w], &mut v_odd_out[..w]);
+    let (uo_e, vo_e) = (&mut u_even_out[..w], &mut v_even_out[..w]);
+
+    // 边界列（U/V × 奇/偶 四 t 行同款标量算术，`upsample_fancy_into_uv` 边界逐项对应）。
+    let (fuo, feo, fvo, fve) = (tu_odd[0], tu_even[0], tv_odd[0], tv_even[0]);
+    uo_o[0] = ((4 * fuo + 8) >> 4) as u8;
+    uo_e[0] = ((4 * feo + 8) >> 4) as u8;
+    vo_o[0] = ((4 * fvo + 8) >> 4) as u8;
+    vo_e[0] = ((4 * fve + 8) >> 4) as u8;
+    if width > 1 {
+        let (nuo, neo, nvo, nve) = if cw > 1 {
+            (tu_odd[1], tu_even[1], tv_odd[1], tv_even[1])
+        } else {
+            (fuo, feo, fvo, fve)
+        };
+        uo_o[1] = ((3 * fuo + nuo + 8) >> 4) as u8;
+        uo_e[1] = ((3 * feo + neo + 8) >> 4) as u8;
+        vo_o[1] = ((3 * fvo + nvo + 8) >> 4) as u8;
+        vo_e[1] = ((3 * fve + nve + 8) >> 4) as u8;
+    }
+    if cw > 1 {
+        let last = cw - 1;
+        let oc = last * 2;
+        uo_o[oc] = ((3 * tu_odd[last] + tu_odd[last - 1] + 8) >> 4) as u8;
+        uo_e[oc] = ((3 * tu_even[last] + tu_even[last - 1] + 8) >> 4) as u8;
+        vo_o[oc] = ((3 * tv_odd[last] + tv_odd[last - 1] + 8) >> 4) as u8;
+        vo_e[oc] = ((3 * tv_even[last] + tv_even[last - 1] + 8) >> 4) as u8;
+        if oc + 1 < width {
+            uo_o[oc + 1] = ((4 * tu_odd[last] + 8) >> 4) as u8;
+            uo_e[oc + 1] = ((4 * tu_even[last] + 8) >> 4) as u8;
+            vo_o[oc + 1] = ((4 * tv_odd[last] + 8) >> 4) as u8;
+            vo_e[oc + 1] = ((4 * tv_even[last] + 8) >> 4) as u8;
+        }
+    }
+
+    // 中间列对（col=1..cw-2）：AVX2 16 对/步（U/V × 奇/偶 四 t 行同一迭代）→ 共享收尾。
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("avx2") && cw >= 18 {
+        let mut col = 1usize;
+        unsafe {
+            while col + 17 <= cw {
+                upsample_fancy_avx2(tu_odd.as_ptr().add(col), uo_o.as_mut_ptr().add(col * 2));
+                upsample_fancy_avx2(tu_even.as_ptr().add(col), uo_e.as_mut_ptr().add(col * 2));
+                upsample_fancy_avx2(tv_odd.as_ptr().add(col), vo_o.as_mut_ptr().add(col * 2));
+                upsample_fancy_avx2(tv_even.as_ptr().add(col), vo_e.as_mut_ptr().add(col * 2));
+                col += 16;
+            }
+        }
+        if col < cw.saturating_sub(1) {
+            upsample_fancy_tail(tu_odd, uo_o, col, cw);
+            upsample_fancy_tail(tu_even, uo_e, col, cw);
+            upsample_fancy_tail(tv_odd, vo_o, col, cw);
+            upsample_fancy_tail(tv_even, vo_e, col, cw);
+        }
+        return;
+    }
+    // 中间列对（col=1..cw-2）：每 4 列一组 SSSE3（四 t 行同一迭代），尾列标量。
+    #[cfg(target_arch = "x86_64")]
+    if simd_on("ssse3") && cw >= 6 {
+        let mut col = 1usize;
+        unsafe {
+            while col + 4 < cw {
+                upsample_fancy_sse2(tu_odd.as_ptr().add(col - 1), uo_o.as_mut_ptr().add(col * 2));
+                upsample_fancy_sse2(tu_even.as_ptr().add(col - 1), uo_e.as_mut_ptr().add(col * 2));
+                upsample_fancy_sse2(tv_odd.as_ptr().add(col - 1), vo_o.as_mut_ptr().add(col * 2));
+                upsample_fancy_sse2(tv_even.as_ptr().add(col - 1), vo_e.as_mut_ptr().add(col * 2));
+                col += 4;
+            }
+        }
+        while col < cw.saturating_sub(1) {
+            let oc = col * 2;
+            uo_o[oc] = ((3 * tu_odd[col] + tu_odd[col - 1] + 8) >> 4) as u8;
+            uo_o[oc + 1] = ((3 * tu_odd[col] + tu_odd[col + 1] + 8) >> 4) as u8;
+            uo_e[oc] = ((3 * tu_even[col] + tu_even[col - 1] + 8) >> 4) as u8;
+            uo_e[oc + 1] = ((3 * tu_even[col] + tu_even[col + 1] + 8) >> 4) as u8;
+            vo_o[oc] = ((3 * tv_odd[col] + tv_odd[col - 1] + 8) >> 4) as u8;
+            vo_o[oc + 1] = ((3 * tv_odd[col] + tv_odd[col + 1] + 8) >> 4) as u8;
+            vo_e[oc] = ((3 * tv_even[col] + tv_even[col - 1] + 8) >> 4) as u8;
+            vo_e[oc + 1] = ((3 * tv_even[col] + tv_even[col + 1] + 8) >> 4) as u8;
+            col += 1;
+        }
+        return;
+    }
+
+    // 无 SIMD / 未满 6 列：逐行复用 vp8 标量（单一算术源，边界语义零漂移）。
+    uo_o.copy_from_slice(&super::vp8::upsample_fancy(u_top, u_cur, width));
+    uo_e.copy_from_slice(&super::vp8::upsample_fancy(u_cur, u_top, width));
+    vo_o.copy_from_slice(&super::vp8::upsample_fancy(v_top, v_cur, width));
+    vo_e.copy_from_slice(&super::vp8::upsample_fancy(v_cur, v_top, width));
+}
+
+
+
 /// SSSE3：处理 `t_base` 处的 8 个 u16（t[col-1..col+6]，后者可有填充），对 4 个连续
 /// 中间列（col..col+3）各算一对输出 `out[(col)*2 .. col*2+8]`：
 /// `even=(3*t[i]+t[i-1]+8)>>4`、`odd=(3*t[i]+t[i+1]+8)>>4`（全部正数，逻辑右移即对）。
@@ -4566,6 +4958,61 @@ mod tests {
         eprintln!("UPSAMPLE_FANCY_UV_PARITY_OK");
     }
 
+    /// P2 行对熔合字节恒等 oracle：`upsample_fancy_into_uv_pair`（奇行 t=3*top+cur、偶行
+    /// t=3*cur+top 一次成）≡ 逐行两次 `upsample_fancy_into_uv`（后者已分别对拍 vp8 标量）。
+    /// 覆盖输出宽奇偶（2cw / 2cw-1）、cw 边界小值/批量阈值、像素饱和值。
+    #[test]
+    fn upsample_pair_matches_twice_into_uv() {
+        let mut rng = Lcg(0x6a09e667f3bcc909);
+        let mut checked = 0usize;
+        for cw in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 18, 63, 64, 65, 128, 129, 256] {
+            for wmul in [0usize, 1] {
+                let width = 2 * cw - wmul;
+                for _ in 0..8 {
+                    let mut u_top = vec![0u8; cw];
+                    let mut u_cur = vec![0u8; cw];
+                    let mut v_top = vec![0u8; cw];
+                    let mut v_cur = vec![0u8; cw];
+                    for dst in [&mut u_top, &mut u_cur, &mut v_top, &mut v_cur] {
+                        for px in dst.iter_mut() {
+                            *px = match rng.next() % 10 {
+                                0 => 0,
+                                1 => 1,
+                                2 => 254,
+                                3 => 255,
+                                _ => rng.byte(),
+                            };
+                        }
+                    }
+                    // 逐行对照（各自 `upsample_fancy_into_uv`，语义=2 次单行）。
+                    let mut u_odd_ref = vec![0u8; width];
+                    let mut v_odd_ref = vec![0u8; width];
+                    let mut u_even_ref = vec![0u8; width];
+                    let mut v_even_ref = vec![0u8; width];
+                    let mut t2 = vec![0u16; 2 * (cw + 8)];
+                    upsample_fancy_into_uv(&u_top, &u_cur, &v_top, &v_cur, &mut u_odd_ref, &mut v_odd_ref, &mut t2);
+                    upsample_fancy_into_uv(&u_cur, &u_top, &v_cur, &v_top, &mut u_even_ref, &mut v_even_ref, &mut t2);
+                    // 熔合路径。
+                    let mut u_odd = vec![0u8; width];
+                    let mut v_odd = vec![0u8; width];
+                    let mut u_even = vec![0u8; width];
+                    let mut v_even = vec![0u8; width];
+                    let mut t4 = vec![0u16; 4 * (cw + 8)];
+                    upsample_fancy_into_uv_pair(
+                        &u_top, &u_cur, &v_top, &v_cur,
+                        &mut u_odd, &mut v_odd, &mut u_even, &mut v_even, &mut t4,
+                    );
+                    assert_eq!(u_odd, u_odd_ref, "U 奇行 cw={cw} width={width}");
+                    assert_eq!(v_odd, v_odd_ref, "V 奇行 cw={cw} width={width}");
+                    assert_eq!(u_even, u_even_ref, "U 偶行 cw={cw} width={width}");
+                    assert_eq!(v_even, v_even_ref, "V 偶行 cw={cw} width={width}");
+                    checked += 1;
+                }
+            }
+        }
+        eprintln!("UPSAMPLE_PAIR_EQ_TWICE_INTO_UV\t{checked}");
+    }
+
     // -----------------------------------------------------------------------
     // D1：4×4 十模式 × 邻居组合 + 16×16/8×8 四模式，SIMD 与标量逐字节一致
     // -----------------------------------------------------------------------
@@ -4862,6 +5309,8 @@ mod tests {
 
     /// 单块 i4x4 1-block SSE2 核与标量逐字节一致：满幅 i16 系数 + 随机平面 + 随机 DC，
     /// 跨 0/±4095/±4096/±4097 边界，偶发全零 / 仅 DC 块（映射标量 has_ac=true 路径）。
+    /// **K93 基线侧自检**：强制 `KIMG_WEBP_IDCT_I16` 关（i32 域 pass2）——满幅系数 i16 域会回绕
+    /// 偏出，属 i32 基线的全输入域恒等域（i16 域可达性对拍见 `idct_add_one_reachable_domain_parity`）。
     #[test]
     fn inverse_dct_one_simd_matches_scalar() {
         if !simd_on("sse2") {
@@ -4869,6 +5318,7 @@ mod tests {
             return;
         }
         set_simd_part_override("dct", Some(true)); // 强制 SSE2 单块核
+        set_idct_i16_override(Some(false)); // K93 基线侧：i32 pass2（全幅恒等）
         let boundaries: [i16; 16] = [
             0, 1, -1, 4095, -4095, 4096, -4096, 4097, -4097, 2047, -2048, 8192, -8192, 32767, -32768, 16384,
         ];
@@ -4924,6 +5374,7 @@ mod tests {
             }
         }
         set_simd_part_override("dct", None);
+        set_idct_i16_override(None); // 恢复 i16 默认（可达域）
         eprintln!("INVERSE_DCT_ONE_SIMD_PARITY\t{checked}");
     }
 
@@ -5233,17 +5684,260 @@ mod tests {
         eprintln!("RGBA_RGB_REPACK_PARITY_OK");
     }
 
-    /// P2（B3 评审残留→B5 已修）：`idct_add_two_sse2` 双指针核的对抗随机对拍——满幅随机 dc/ac、
-    /// 跨 0/±4095/±4096/±4097 边界、多种子（static override 互踩由调用方 `--test-threads=1` 隔离）。
-    /// 该测试曾因第二遍 i16 回绕偏出（2026-11-01 定位），B5 已改 i32 中间量修复并翻绿；
-    /// 若再偏出，FAIL 并将 seed/trial/系数打屏定位。
+    /// 可达域双块对拍 HELPER（P1 专用）：ca/cb 双块 → 三路（i16 域 SIMD / i32 标量 / i32 SIMD
+    /// K93 回退期）逐字节一致；域断言与 pre-shift 直断由调用方完成。仅测试用（模块内）。
+    fn assert_reachable_pair_parity(
+        ca: &[i16; 16],
+        cb: &[i16; 16],
+        pitch: usize,
+        row0: usize,
+        col0: usize,
+        rng: &mut Lcg,
+    ) {
+        let mut plane_i16 = vec![0u8; pitch * pitch];
+        let mut plane_scalar = vec![0u8; pitch * pitch];
+        let mut plane_i32 = vec![0u8; pitch * pitch];
+        for px in plane_i16.iter_mut() {
+            *px = rng.byte();
+        }
+        plane_scalar.copy_from_slice(&plane_i16);
+        plane_i32.copy_from_slice(&plane_i16);
+        // i16 域 SIMD（默认路径，被测侧）。
+        super::inverse_dct_add_two(ca, cb, &mut plane_i16, pitch, row0, col0);
+        // i32 标量参考（逐块恒 has_ac=true）。
+        super::super::vp8::inverse_dct_add(ca, &mut plane_scalar, pitch, row0, col0, true);
+        super::super::vp8::inverse_dct_add(cb, &mut plane_scalar, pitch, row0, col0 + 4, true);
+        assert_eq!(
+            plane_i16, plane_scalar,
+            "i16 SIMD ≠ i32 标量 (可达域) ca={ca:?} cb={cb:?}"
+        );
+        // K93 基线回退：i32 域 SIMD ≡ i16 域 SIMD（同序列 fixture 逐字节，进程内 A/B）。
+        set_idct_i16_override(Some(false));
+        super::inverse_dct_add_two(ca, cb, &mut plane_i32, pitch, row0, col0);
+        set_idct_i16_override(Some(true));
+        assert_eq!(
+            plane_i16, plane_i32,
+            "i16 SIMD ≠ i32 SIMD（K93 回退破坏字节恒等）ca={ca:?} cb={cb:?}"
+        );
+    }
+
+    /// 标量两遍逆变换 max|pre-shift tmp|（对拍 HELPER）：i32 全程无回绕，值 = 第二遍
+    /// `srai(x,3)` 前的最大 |x|——"pre-shift ≤ 32767"即 i16 域 pass2 免回绕充要条件（K70 直断口径）。
+    fn scalar_idct_max_pre_shift(c: &[i16; 16]) -> i32 {
+        const K1: i32 = 20091;
+        const K2: i32 = -30068;
+        let mulhi = |a: i32, b: i32| (a * b) >> 16;
+        let mut t = [[0i32; 4]; 4]; // t[col][row]
+        for r in 0..4 {
+            let (i0, i1, i2, i3) = (
+                i32::from(c[r * 4]),
+                i32::from(c[r * 4 + 1]),
+                i32::from(c[r * 4 + 2]),
+                i32::from(c[r * 4 + 3]),
+            );
+            let a = i0 + i2;
+            let b = i0 - i2;
+            let cc = (mulhi(i1, K2) - mulhi(i3, K1)) + (i1 - i3);
+            let dd = (mulhi(i1, K1) + mulhi(i3, K2)) + (i1 + i3);
+            let tmp = [a + dd, b + cc, b - cc, a - dd];
+            for col in 0..4 {
+                t[col][r] = tmp[col];
+            }
+        }
+        let mut max = 0i32;
+        for lane in 0..4 {
+            let (t0, t1, t2, t3) = (t[0][lane], t[1][lane], t[2][lane], t[3][lane]);
+            let dc = t0 + 4;
+            let a2 = dc + t2;
+            let b2 = dc - t2;
+            let cc = (mulhi(t1, K2) - mulhi(t3, K1)) + (t1 - t3);
+            let dd = (mulhi(t1, K1) + mulhi(t3, K2)) + (t1 + t3);
+            max = max
+                .max((a2 + dd).abs())
+                .max((b2 + cc).abs())
+                .max((b2 - cc).abs())
+                .max((a2 - dd).abs());
+        }
+        max
+    }
+
+    /// P1：`idct_add_two_sse2` i16 域 pass2 可达域对拍（对抗评审定案口径，K70）——随机系数
+    /// ∥c∥≤2212（偶发 0/±2047/±2048/±2212 边界注入；**禁 8192/±32767/-32768**）双块、跨随机
+    /// 平面位置、多种子。每块先直断：① max|c|≤2212；② scalar-pre-shift ≤ 32767（越界即告停，
+    /// 勿静默改断言——若真实码流系数超 2212 会在此暴露）。验证 i16 SIMD ≡ i32 标量 ≡ i32 SIMD
+    /// （K93 回退同窗字节恒等）。DC 孤立大值（±4096，真实码流 DC 可及）作独立边界块补充。
     #[test]
-    fn idct_add_two_full_scale_random_parity() {
+    fn idct_add_two_reachable_domain_parity() {
         if !simd_on("sse2") {
             eprintln!("SIMD_TEST SKIP idct_two (无 sse2)");
             return;
         }
         set_simd_part_override("dct", Some(true)); // 强制 SSE2 双指针核
+        set_idct_i16_override(Some(true)); // 被测侧：i16 域 pass2
+        let boundaries: [i16; 8] = [0, 1, -1, 2047, -2047, 2048, -2048, 2212];
+        let pitch = 64usize;
+        let mut checked = 0usize;
+        // 主语料：全系数 ∥c∥≤2212。
+        for seed in [
+            0x1234_5678_9abc_def0u64,
+            0x0bad_cafe_f00d_1111,
+            0xfeed_f00d_abcd_2222,
+            0xdead_beef_1234_3333,
+        ] {
+            let mut rng = Lcg(seed);
+            for trial in 0..300 {
+                let mut ca = [0i16; 16];
+                let mut cb = [0i16; 16];
+                for k in 0..16 {
+                    // 可达域随机（[-2212,2212]），偶发边界注入。
+                    ca[k] = if rng.next() % 9 == 0 {
+                        boundaries[(rng.next() as usize) % boundaries.len()]
+                    } else {
+                        ((rng.next() % 4425) as i32 - 2212) as i16
+                    };
+                    cb[k] = if rng.next() % 9 == 0 {
+                        boundaries[(rng.next() as usize) % boundaries.len()]
+                    } else {
+                        ((rng.next() % 4425) as i32 - 2212) as i16
+                    };
+                }
+                // 偶发整块零 / 仅 DC（小值，标量 has_ac 分支差异最大考验）。
+                if trial % 37 == 0 {
+                    ca = [0i16; 16];
+                }
+                if trial % 53 == 0 {
+                    let mut dc_only = [0i16; 16];
+                    dc_only[0] = boundaries[(rng.next() as usize) % boundaries.len()];
+                    cb = dc_only;
+                }
+                for c in [&ca, &cb] {
+                    assert!(
+                        c.iter().all(|&x| x.abs() <= 2212),
+                        "语料超 2212（禁 8192，K70）seed=0x{seed:016x} trial={trial} c={c:?}"
+                    );
+                    let pre = scalar_idct_max_pre_shift(c);
+                    assert!(
+                        pre <= 32767,
+                        "pre-shift={pre} 越 ±32767（i16 域不成立，勿静默改断言）seed=.. trial={trial} c={c:?}"
+                    );
+                }
+                let (row0, col0) = (8 + (trial % 9), 8 + (trial % 9));
+                assert_reachable_pair_parity(&ca, &cb, pitch, row0, col0, &mut rng);
+                checked += 1;
+            }
+        }
+        // DC 孤立大值边界块（真实码流 DC 可及）：dc ∈ {0, ±2048, ±4096}，AC 仍 ≤2212。
+        for seed in [
+            0x1357_9bdf_2468_ace0u64,
+            0x0bad_cafe_f00d_4444,
+            0xfeed_f00d_abcd_5555,
+            0xdead_beef_1234_6666,
+        ] {
+            let mut rng = Lcg(seed);
+            for trial in 0..120 {
+                let dcs: [i16; 5] = [0, 2048, -2048, 4096, -4096];
+                let mut ca = [0i16; 16];
+                let mut cb = [0i16; 16];
+                ca[0] = dcs[(rng.next() as usize) % dcs.len()];
+                cb[0] = dcs[(rng.next() as usize) % dcs.len()];
+                for k in 1..16 {
+                    ca[k] = ((rng.next() % 4425) as i32 - 2212) as i16;
+                    cb[k] = ((rng.next() % 4425) as i32 - 2212) as i16;
+                }
+                for c in [&ca, &cb] {
+                    assert!(
+                        c[0].abs() <= 4096 && c[1..].iter().all(|&x| x.abs() <= 2212),
+                        "DC 边界块越界 seed=0x{seed:016x} trial={trial} c={c:?}"
+                    );
+                    let pre = scalar_idct_max_pre_shift(c);
+                    assert!(
+                        pre <= 32767,
+                        "DC 边界 pre-shift={pre} 越 ±32767 seed=0x{seed:016x} trial={trial} c={c:?}"
+                    );
+                }
+                let (row0, col0) = (8 + (trial % 9), 8 + (trial % 9));
+                assert_reachable_pair_parity(&ca, &cb, pitch, row0, col0, &mut rng);
+                checked += 1;
+            }
+        }
+        set_simd_part_override("dct", None);
+        set_idct_i16_override(None); // 恢复 i16 默认
+        eprintln!("IDCT_TWO_REACHABLE_DOMAIN_PARITY\t{checked}");
+    }
+
+    /// P1：单块核 `idct_add_one_sse2` 的 i16 域可达域对拍（i4 路径）：随机 ∥c∥≤2212 + DC ±4096
+    /// 边界块，i16 SIMD ≡ i32 标量 ≡ i32 SIMD（K93 回退）。
+    #[test]
+    fn idct_add_one_reachable_domain_parity() {
+        if !simd_on("sse2") {
+            eprintln!("SIMD_TEST SKIP idct_one_res (无 sse2)");
+            return;
+        }
+        set_simd_part_override("dct", Some(true));
+        set_idct_i16_override(Some(true));
+        let pitch = 64usize;
+        let mut checked = 0usize;
+        for seed in [0x99aa_bbcc_ddee_ff00u64, 0x1234_5678_9012_3456, 0xa5a5_a5a5_5a5a_5a5a] {
+            let mut rng = Lcg(seed);
+            for trial in 0..300 {
+                let mut c = [0i16; 16];
+                for k in 0..16 {
+                    c[k] = ((rng.next() % 4425) as i32 - 2212) as i16;
+                }
+                if trial % 29 == 0 {
+                    c = [0i16; 16];
+                }
+                if trial % 43 == 0 {
+                    let mut dc_only = [0i16; 16];
+                    dc_only[0] = [0, 2048, -2048][(rng.next() as usize) % 3];
+                    c = dc_only;
+                }
+                assert!(
+                    c.iter().all(|&x| x.abs() <= 2212),
+                    "单块语料超 2212 seed=0x{seed:016x} trial={trial} c={c:?}"
+                );
+                let pre = scalar_idct_max_pre_shift(&c);
+                assert!(pre <= 32767, "单块 pre-shift={pre} 越界 seed=0x{seed:016x} trial={trial} c={c:?}");
+                let mut plane_i16 = vec![0u8; pitch * pitch];
+                let mut plane_scalar = vec![0u8; pitch * pitch];
+                let mut plane_i32 = vec![0u8; pitch * pitch];
+                for px in plane_i16.iter_mut() {
+                    *px = rng.byte();
+                }
+                let (row0, col0) = match trial % 23 {
+                    0 => (60usize, 59usize),
+                    1 => (60, 4 + (trial % 11)),
+                    2 => (4 + (trial % 11), 59),
+                    _ => (4 + (trial % 11), 4 + (trial % 11)),
+                };
+                plane_scalar.copy_from_slice(&plane_i16);
+                plane_i32.copy_from_slice(&plane_i16);
+                super::inverse_dct_add_one(&c, &mut plane_i16, pitch, row0, col0);
+                super::super::vp8::inverse_dct_add(&c, &mut plane_scalar, pitch, row0, col0, true);
+                assert_eq!(plane_i16, plane_scalar, "单块 i16 ≠ 标量 seed=.. trial={trial} c={c:?}");
+                set_idct_i16_override(Some(false));
+                super::inverse_dct_add_one(&c, &mut plane_i32, pitch, row0, col0);
+                set_idct_i16_override(Some(true));
+                assert_eq!(plane_i16, plane_i32, "单块 i16 ≠ i32 SIMD（K93 回退）trial={trial} c={c:?}");
+                checked += 1;
+            }
+        }
+        set_simd_part_override("dct", None);
+        set_idct_i16_override(None);
+        eprintln!("IDCT_ONE_REACHABLE_DOMAIN_PARITY\t{checked}");
+    }
+
+    /// P3（K93 基线侧自检）：`idct_add_two_sse2` i32 域 pass2 全幅 parity（满幅 i16 系数，含
+    /// 8192/±32767/-32768 等）——i32 SIMD ≡ i32 标量全输入域恒等。与 `inverse_dct_one_simd_matches_scalar`
+    /// 对称，是 i16 可达域对拍的基线对照（i16 域不跑满幅，见 `idct_add_two_reachable_domain_parity`）。
+    #[test]
+    fn idct_add_two_full_scale_i32_baseline_parity() {
+        if !simd_on("sse2") {
+            eprintln!("SIMD_TEST SKIP idct_two_base (无 sse2)");
+            return;
+        }
+        set_simd_part_override("dct", Some(true));
+        set_idct_i16_override(Some(false)); // K93 基线侧：i32 域 pass2（全幅恒等）
         let boundaries: [i16; 16] = [
             0, 1, -1, 4095, -4095, 4096, -4096, 4097, -4097, 2047, -2048, 8192, -8192, 32767, -32768, 16384,
         ];
@@ -5262,7 +5956,6 @@ mod tests {
                 let mut ca = [0i16; 16];
                 let mut cb = [0i16; 16];
                 for k in 0..16 {
-                    // 满幅均匀随机（全 i16 值域），偶发注入跨 0/±4096 边界值。
                     ca[k] = if rng.next() % 7 == 0 {
                         boundaries[(rng.next() as usize) % boundaries.len()]
                     } else {
@@ -5284,12 +5977,14 @@ mod tests {
                 super::super::vp8::inverse_dct_add(&cb, &mut plane_scalar, pitch, row0, col0 + 4, true);
                 assert_eq!(
                     plane_simd, plane_scalar,
-                    "idct_two seed=0x{seed:016x} trial={trial} row0={row0} col0={col0} ca={ca:?} cb={cb:?}"
+                    "i32 基线 seed=0x{seed:016x} trial={trial} row0={row0} col0={col0} ca={ca:?} cb={cb:?}"
                 );
                 checked += 1;
             }
         }
         set_simd_part_override("dct", None);
-        eprintln!("IDCT_TWO_FULLSCALE_RANDOM_PARITY\t{checked}");
+        set_idct_i16_override(None);
+        eprintln!("IDCT_TWO_I32_BASELINE_FULLSCALE_PARITY\t{checked}");
     }
+
 }

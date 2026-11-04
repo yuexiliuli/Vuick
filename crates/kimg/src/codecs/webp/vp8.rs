@@ -1020,6 +1020,24 @@ fn subblock_above(
     a
 }
 
+/// `subblock_above` 的 by>0 分支行缓存变体：`row` 为本子块行上方 17 字节平面行（raw 偏移
+/// `(row0-1)*pitch + dx .. dx+16`，即帧列 dx..dx+16），按 `block_x` 切出与 `subblock_above`
+/// by>0 分支逐字节相同的 `[u8;9]`——同一平面同源读取，只是把 4 个子块各自重叠读升级为一次
+/// 行缓存复用；右列块（block_x==3）的 above-right 仍取宏块 `above_y[17..21]`（RFC §12.3
+/// 16×8 边界不可重排语义，与 `subblock_above` 完全一致）。
+fn subblock_above_row(row: &[u8; 17], block_x: usize, above_y: &[u8; 21]) -> [u8; 9] {
+    let base = 4 * block_x;
+    let mut a = [0u8; 9];
+    a[0] = row[base];
+    a[1..5].copy_from_slice(&row[base + 1..base + 5]);
+    if block_x < 3 {
+        a[5..9].copy_from_slice(&row[base + 5..base + 9]);
+    } else {
+        a[5..9].copy_from_slice(&above_y[17..21]);
+    }
+    a
+}
+
 /// 4x4 luma 预测（10 模式）。`above[0]`=左上，`above[1..9]`=上 8 像素；左列读平面。
 /// `pub(crate)`：`webp::simd` 的向量版以此为标量回退/对拍基准（D1）。
 #[allow(clippy::too_many_lines)]
@@ -1481,10 +1499,28 @@ fn tokens(
             }
             stage_clock::acct();
             p = unsafe { base.add(*BAND_ROW_OFFSETS.get_unchecked(position) + next_context) };
-            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
-            probe_skew!(skew_clock::EOB, b);
-            if b == 0 {
-                break; // 下一位置 EOB。
+            // ── C2：下一位置 EOB 决策点（p[0]）分支形/cmov 切换（同 RC3 ZERO 样式）：分支形把位
+            // 判定与「break/续读」体合并为同一分支（单误判点；预测命中方只算本路熵态）。稀疏多数方
+            // bit=0 → EOB 命中 break；噪声多数方 bit=1 → 续读环顶。
+            if ent_branch {
+                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p });
+                if vs > u64::from(sp) {
+                    // bit=1（续读）：更新熵态，回环顶续读下一系数。
+                    *value -= (u64::from(sp + 1)) << (*bits as u32);
+                    ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
+                    probe_skew!(skew_clock::EOB, 1);
+                } else {
+                    // bit=0（EOB 命中，多数方）：只算本路熵态，块结束。
+                    ent_renorm_apply(bits, range_minus1, sp + 1, renorm_skip);
+                    probe_skew!(skew_clock::EOB, 0);
+                    break;
+                }
+            } else {
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
+                probe_skew!(skew_clock::EOB, b);
+                if b == 0 {
+                    break; // 下一位置 EOB。
+                }
             }
         }};
     }
@@ -1502,9 +1538,31 @@ fn tokens(
         }};
     }
 
-    let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
-    probe_skew!(skew_clock::EOB, b);
-    if b != 0 {
+    // ── C2：EOB 初始决策点（p[0]，块首）在「预测分支形（默认）」与「cmov 全算（KIMG_WEBP_ENT_BRANCH=0
+    // 强制）」间运行时切换，与 RC3 ZERO/G5 同构：分支形把位判定与「进环/空块」体合并为同一分支
+    // （单误判点；预测命中方只算本路熵态）。EOB 全带高偏斜（稀疏块 m≈0.88 bit=0、噪声块 m≈0.99
+    // bit=1，均 ≥85%）→ 默认开、无需内容门控。bit=0 = 空块（不读系数）。
+    'eob: {
+        if ent_branch {
+            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p });
+            if vs > u64::from(sp) {
+                // bit=1（块有内容）：更新熵态后进系数环。
+                *value -= (u64::from(sp + 1)) << (*bits as u32);
+                ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
+                probe_skew!(skew_clock::EOB, 1);
+            } else {
+                // bit=0（空块，多数方命中）：只算本路熵态，整块空。
+                ent_renorm_apply(bits, range_minus1, sp + 1, renorm_skip);
+                probe_skew!(skew_clock::EOB, 0);
+                break 'eob;
+            }
+        } else {
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
+            probe_skew!(skew_clock::EOB, b);
+            if b == 0 {
+                break 'eob;
+            }
+        }
         loop {
             // ZERO 决策（p[1]，多数方 bit=0 偏斜 85.2%）：分支形与 cmov 形运行时切换。分支形把
             // 位判定与 `if b==0` 体合并为同一分支（单误判点；多数方命中只算本路熵态），两形共享
@@ -3235,10 +3293,28 @@ fn reconstruct_macroblock(
                 let mut block = 0usize;
                 for by in 0..4usize {
                     let row0 = dy + by * 4;
+                    // 行缓存：by>0 时本子块行上方的 17 字节平面行（raw 偏移 `(row0-1)*pitch+dx..dx+16`）
+                    // 一次读入，本行 4 个子块复用（by==0 顶行走既有 `subblock_above` 的 above_y 缓冲，
+                    // 无需平面读）。语义：`row1..dy+4by-1` 行在本轮 by 迭代内不被任何子块写（本宏块
+                    // 只写行 dy+4by..dy+4by+3），且 by 迭代启动时该行已由上一子块行写毕 → 与逐块
+                    // 读原平面逐字节同源，可安全提升到循环外。
+                    let mut above_row = [0u8; 17];
+                    if by > 0 {
+                        let row_above = row0 - 1;
+                        debug_assert!(row_above * y_pitch + dx + 16 < y.len());
+                        let base = unsafe { y.as_ptr().add(row_above * y_pitch).add(dx) };
+                        for k in 0..17usize {
+                            above_row[k] = unsafe { *base.add(k) };
+                        }
+                    }
                     for bx in 0..4usize {
                         let col0 = dx + bx * 4;
                         stage_clock::i4_predict(|| {
-                            let above = subblock_above(y, y_pitch, row0, col0, bx, by, above_y);
+                            let above = if by == 0 {
+                                subblock_above(y, y_pitch, row0, col0, bx, by, above_y)
+                            } else {
+                                subblock_above_row(&above_row, bx, above_y)
+                            };
                             if pred_simd {
                                 // Safety：`pred_simd` 已在循环外判定 `part_simd_on("pred","ssse3")`
                                 // 为真且本块内恒定，SSSE3 核指令可用。
@@ -4181,6 +4257,9 @@ pub(crate) fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
 struct EmitScratch {
     u_up: Vec<u8>,
     v_up: Vec<u8>,
+    // 行对熔合（P2）：偶行第二输出行缓冲（`u_up`/`v_up` 存奇行），避免逐行分配。
+    u_up2: Vec<u8>,
+    v_up2: Vec<u8>,
     t_ws: Vec<u16>,
 }
 
@@ -4190,8 +4269,11 @@ impl EmitScratch {
         EmitScratch {
             u_up: vec![0u8; width],
             v_up: vec![0u8; width],
-            // U/V 两行 t 工作区共存（`upsample_fancy_into_uv` 各用 cw+8）。
-            t_ws: vec![0u16; 2 * (cw + 8)],
+            u_up2: vec![0u8; width],
+            v_up2: vec![0u8; width],
+            // U/V × 奇/偶 四行 t 工作区共存（`upsample_fancy_into_uv_pair` 各用 cw+8；单行路径
+            // `upsample_fancy_into_uv` 只需 2*(cw+8)，多倍缓冲仅容量富余，语义不变）。
+            t_ws: vec![0u16; 4 * (cw + 8)],
         }
     }
 }
@@ -4218,7 +4300,40 @@ fn emit_rows_into_rgba(
     alpha: Option<&[u8]>,
 ) {
     stage_clock::yuv(|| {
-    for row in first..end {
+    let mut row = first;
+    while row < end {
+        // 行对熔合（P2，libwebp `UpsampleLinePair` 同趟 top/bottom 语义）：奇行 2k+1 与紧随
+        // 偶行 2k+2 共享同一对 adjacent chroma 行 (C_k, C_{k+1})，`upsample_fancy_into_uv_pair`
+        // 一次装入两 chroma 行 + 构建 4 条 t 行 + 两输出行 fancy（与逐行两次
+        // `upsample_fancy_into_uv` 逐字节恒等，`upsample_pair_matches_twice_into_uv` 对拍 0 差）。
+        // 行 0 / 尾奇行（镜像邻）/ 任意无配对余行回落单行路径（原逻辑逐字节）。
+        if row & 1 == 1 && row + 1 < end {
+            let k = row >> 1;
+            let u0 = k * uv_pitch + 1;
+            let u1 = (k + 1) * uv_pitch + 1;
+            super::simd::upsample_fancy_into_uv_pair(
+                &u[u0..u0 + cw], &u[u1..u1 + cw],
+                &v[u0..u0 + cw], &v[u1..u1 + cw],
+                &mut ws.u_up, &mut ws.v_up,   // 奇行 2k+1 上采样 U/V
+                &mut ws.u_up2, &mut ws.v_up2, // 偶行 2k+2 上采样 U/V
+                &mut ws.t_ws,
+            );
+            let yb = row * y_pitch + 1;
+            let yb2 = (row + 1) * y_pitch + 1;
+            // lossy-alpha：alpha 行随各行直出并入发射内层（单遍 RGBA；`None` 时 α 恒 255）。
+            super::simd::yuv_row_to_rgba_alpha(
+                &y[yb..yb + width], &ws.u_up, &ws.v_up,
+                alpha.map(|a| &a[row * width..(row + 1) * width]),
+                &mut rgba[row * width * 4..(row + 1) * width * 4],
+            );
+            super::simd::yuv_row_to_rgba_alpha(
+                &y[yb2..yb2 + width], &ws.u_up2, &ws.v_up2,
+                alpha.map(|a| &a[(row + 1) * width..(row + 2) * width]),
+                &mut rgba[(row + 1) * width * 4..(row + 2) * width * 4],
+            );
+            row += 2;
+            continue;
+        }
         let chroma_row = row >> 1;
         let adjacent = if row % 2 == 0 {
             if chroma_row == 0 {
@@ -4245,6 +4360,7 @@ fn emit_rows_into_rgba(
             alpha.map(|a| &a[row * width..(row + 1) * width]),
             &mut rgba[row * width * 4..(row + 1) * width * 4],
         );
+        row += 1;
     }
     });
 }
@@ -4268,7 +4384,34 @@ fn emit_rows_into_rgb3(
     ws: &mut EmitScratch,
 ) {
     stage_clock::yuv(|| {
-    for row in first..end {
+    let mut row = first;
+    while row < end {
+        // 行对熔合（P2）：同 `emit_rows_into_rgba` 的奇偶行对共享语义，仅末段走 `yuv_row_to_rgb3`
+        // （3 步长，alpha 不写）；每像素前 3 字节恒等于 RGBA 路径（硬闸）。
+        if row & 1 == 1 && row + 1 < end {
+            let k = row >> 1;
+            let u0 = k * uv_pitch + 1;
+            let u1 = (k + 1) * uv_pitch + 1;
+            super::simd::upsample_fancy_into_uv_pair(
+                &u[u0..u0 + cw], &u[u1..u1 + cw],
+                &v[u0..u0 + cw], &v[u1..u1 + cw],
+                &mut ws.u_up, &mut ws.v_up,
+                &mut ws.u_up2, &mut ws.v_up2,
+                &mut ws.t_ws,
+            );
+            let yb = row * y_pitch + 1;
+            let yb2 = (row + 1) * y_pitch + 1;
+            super::simd::yuv_row_to_rgb3(
+                &y[yb..yb + width], &ws.u_up, &ws.v_up,
+                &mut rgb[row * width * 3..(row + 1) * width * 3],
+            );
+            super::simd::yuv_row_to_rgb3(
+                &y[yb2..yb2 + width], &ws.u_up2, &ws.v_up2,
+                &mut rgb[(row + 1) * width * 3..(row + 2) * width * 3],
+            );
+            row += 2;
+            continue;
+        }
         let chroma_row = row >> 1;
         let adjacent = if row % 2 == 0 {
             if chroma_row == 0 {
@@ -4290,6 +4433,7 @@ fn emit_rows_into_rgb3(
             &mut ws.u_up, &mut ws.v_up, &mut ws.t_ws,
         );
         super::simd::yuv_row_to_rgb3(&y[yba..yba + width], &ws.u_up, &ws.v_up, &mut rgb[row * width * 3..(row + 1) * width * 3]);
+        row += 1;
     }
     });
 }
