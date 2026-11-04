@@ -18,7 +18,7 @@ LAST_AUDIT_PATCH: 2026-10-24-001
 | 验证 / 编译 | §3 执行协议 |
 | 收报告后核对 | §4 上下文收敛 |
 | 子 agent 验收口径 | §5 |
-| 撞到坑 / 规则模糊 | §6 经验知识库 K1–K56 |
+| 撞到坑 / 规则模糊 | §6 经验知识库 K1–K95 |
 | 调工具 / 加载 skill | §8 工具与技能调度 |
 | 定位 gpui/zed 依赖图 | §9 |
 
@@ -157,6 +157,10 @@ M. brief 落地前回显一份「派发卡」（≤3 行）：任务类型 / 边
 | 长命令后台化 | 预计 >2min → `background_process start` + `schedule_wakeup` 轮询；logs 只取尾部 ≤20 行（**主 agent 自己**的后台姿势；**子 agent 相反**，见下一条） |
 | 子 agent 长命令 | 派测量/回归类子 agent 时 brief 必写「长命令前台阻塞到结束，禁止后台化 + 提前返回」（bgp/wakeup 随子会话结束即消失=任务白跑，K86）；全量回归只在最终提交前跑一次 |
 | cargo 汇总抓取 | 抓测试汇总用 `Select-String "test result:|Running"` 或 `-Last 25`；**禁用 `-Last 3/4`**（尾段常是空 doctest target，曾多次把「0 通过」误读成「0 测试」致白跑重跑，K43） |
+| 伪挂起识别 | 判子 agent「挂住」前先对目标进程取样 5s CPU：**CPU 活动=进行中勿杀**（kimg lib 全量 ≈8.5min 属有界长跑，先立预算表再判）；`Select-Object -First N` 截断 cargo 输出=上游管道关、子进程成孤儿继续跑=**伪挂起源**，禁用于 cargo/test（K91） |
+| 同窗证据 | 结论只下**同一窗口**：同会话、同二进制、交错中位、间隔内无 build；跨 run/跨构建数（±10-30% 噪声）只能当方向不可下结论（K94）；brief 首段给「已有证据表」禁重复取证 |
+| 汇编归因 | 结构墙后下钻指令层：`cargo rustc -p <crate> --release --lib -- --emit=asm`（Rust）/ `DOTNET_TieredCompilation=0 DOTNET_JitDisasm`（C#），查 lzcnt/shrx(BMI2)/spill/store-forward——编译器/指令选择级差常白拿 5-20%（K92 案例） |
+| 热改运行时开关 | 结构性热改默认「快道+基线双路径 + env 门控 + 同二进制 A/B」，提交安全、回退零代码（K93；`KIMG_WEBP_ENT_NO_BMI` / `KIMG_WEBP_ENT_BRANCH` 既是先例） |
 | 运行时冒烟采样 | 窗口生命周期/对话框/持久化类 brief 必含测试代码验证项；真机冒烟项仅用户明示要开 GUI 时含（复用 feature-delivery 探针，新探针沉淀回技能）；平台钩子（`on_app_quit`/`on_window_should_close` 等）先实测再采信 |
 | GUI 冒烟取证终止 | 真机取证（截图/像素/OCR 任一路）连续失败 2 次即停：交互已有单测兜底 → 报告写「已实现+单测过、未冒烟」并立即返回；OCR 仅人工辅助，禁止当作子 agent 自动验证通道 |
 | 被中止子 Agent 恢复 | 子 agent 任务现值 abort/超时返回：主 agent 先 `cargo build --bin gpui-editor` + 定向测试复证残余交付立于可编译态；改型/逻辑类改动无论是否人工确认过，均补一次独立评审后才准提交 |
@@ -284,6 +288,11 @@ M. brief 落地前回显一份「派发卡」（≤3 行）：任务类型 / 边
 | K88 | 对比外部实现先自证己方：断言「我们 X 是标量 / 缺 Y」前，先 grep 自家代码里 X/Y 证明它真是那样再写进对比结论——一条 grep 可证伪一个断言（simd.rs:210 的 `predict_subblock_ssse3` 早已用，对比分析却写「i4 预测我们标量」）（错误后果：错误前提定了半小时方案才被 grep 推翻）（2026-11-02） |
 | K89 | K85 执行化 / 微改禁付整轮 A/B：预期 <2% 的微改（去边界检查、合并查表、DC 核类）**不跑 stash+2 构建+6 轮 bench 整轮 A/B**（20-30min/次）——验收 = 字节恒等 oracle + 结构证明（省写可引）+ 可选一次探针方向；整轮 A/B 预算只给预期 ≥3% 的候选（错误后果：DC 核实测 +0.16%、get_unchecked 预期 ≤1%，各付一轮整 A/B，全是可预判噪声）（2026-11-02） |
 | K90 | 「无肉」结论后走显式选型闸：诚实分析得出「无 >2% 顺手项」时，给用户三选一（接受现状 / 微批 ≤1% 攒批一次收口 / 高风险大改仅当产品要求），**不机械顺着劲执行边际项**（错误后果：结构重构靶子已没，仍把 DC 微改整轮跑完）（2026-11-02） |
+| K91 | 伪挂起识别（2026-11-03 复盘 WebP 战役）：判子 agent「挂住」前先对目标进程取样 5s CPU——**CPU 活动=进行中勿杀**（曾把 kimg lib 全量 ≈8.5min 有界长跑误判成热循环掐死，白耗 ~30-40min）；已知长套件立预算表（kimg lib 全量≈8.5min，fuzz+全夹具主导）；`Select-Object -First N` 截断 cargo 输出=上游管道关、子进程成孤儿继续跑=**伪挂起源**，禁用于 cargo/test；套件真状态用 `--no-fail-fast` + 完整日志（fail-fast 在预存失败处中止会掩盖套件） |
+| K92 | 汇编级归因（2026-11-03）：结构墙后别停手，下钻指令层——代码对比/阶段分账到天花板（熵与参照逐 op 同构、语料单分区不可并行）时，取 `cargo rustc -p <crate> --release --lib -- --emit=asm` / C# 侧 `DOTNET_TieredCompilation=0 DOTNET_JitDisasm` 找**编译器/指令选择级差**。本会话整仓未开 BMI1/2 → `leading_zeros` 全退化为 `bsr+xor`（lzcnt 1c vs bsr 3c，落在 range 归一化 loop-carried 链）→ 运行时双路径白拿高熵 -5~20%；又用「Σsites==P_BITS 账闭合」偏斜计数定位 ZERO/G5 分支形 +7~9%。要先查 lzcnt/shrx(BMI2)/spill/store-forward（错误后果：本可直接拿的 5-15% 差点留在「结构性天花板」结论里） |
+| K93 | 结构性热改默认运行时开关双路径（2026-11-03）：`#[target_feature]` 快道 + 基线兜底 + 一次 `is_x86_feature_detected!` 分发（同 simd.rs 姿势）/ 行为开关（如 `KIMG_WEBP_ENT_BRANCH=0` 强制旧形），默认按同二进制 A/B 实证定；commit 安全、回退零代码、可灰度。lzcnt 在无 BMI1 CPU 上被解码为 bsr=语义反转**出错像素**，快道只经运行时检测后 unsafe 调，**禁裸发/禁整仓 target-cpu 冒进**（错误后果：若整仓 `-C target-cpu=x86-64-v3` 部署到旧 CPU 会静默错字节） |
+| K94 | 跨窗禁下结论 + 证据单仓（2026-11-03）：结论只下同一窗口（同会话、同二进制、交错中位、间隔无 build）；跨 run 数（±10-30% 噪声）只当方向（C# lossy 1652↔1792 / kimg 1924↔2297 跨窗漂移致多轮「再测确认」重复劳动）；brief 首段「已有证据表」禁重复取证；TEMP 探针/插桩结束必须清零或 feature 门控（写入 exit condition） |
+| K95 | 架构大改必走「设计 agent → 对抗评审」+ 收益假说定量（2026-11-03）：≥300 行/推翻现有结构前先设计出方案，再由独立对抗评审打**收益假说**要定量证真/证伪——P1「58MB 触碰拖慢 t1 熵」被 sync_channel(2) 反压 + 32MB/s 带宽推算证伪→NO-GO 省 300-450 行；P3 熵波前因语料单分区门禁 STOP 零码。收益假说写码前不可验证 → 探针/门禁先行（错误后果：按乐观假说直接实现，大概率撞 -8% 闸白耗） |
 
 ## 7. 实现要点速查（正向指令）
 
