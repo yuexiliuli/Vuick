@@ -166,6 +166,10 @@ pub(crate) fn reconstruct_macroblock(
             // 只跑一次），本宏块开头取一次，循环内改调 `_forced` 变体。`KIMG_WEBP_NO_SIMD_DCT=1`
             // / `KIMG_WEBP_NO_SIMD=1` / 非 x86_64 被判为假时走标量回退，关闭途径保留。
             let dct_simd = super::simd::part_simd_on("dct", "sse2");
+            // IDCT 第二遍 i16 域开关同样提升出对循环（同 `dct_simd` 姿势，K93 双路径）：
+            // `idct_i16_enabled()` 内部是 OnceLock 读取 + 分支（asm 每块 `movl ON(%rip);testl;jne`），
+            // 判定在整帧解码内恒定，本宏块取一次、循环内经 `_forced` 核透传局部 bool。
+            let i16_en = super::simd::idct_i16_enabled();
             stage_clock::idct_i16(|| {
                 for by in 0..4 {
                     let row0 = dy + by * 4;
@@ -183,7 +187,7 @@ pub(crate) fn reconstruct_macroblock(
                                     // 为真且本对块内恒定，SSE2 核指令可用。
                                     unsafe {
                                         super::simd::inverse_dct_add_two_forced(
-                                            &mb[a], &mb[b], y, y_pitch, row0, dx + pair_base * 4,
+                                            &mb[a], &mb[b], y, y_pitch, row0, dx + pair_base * 4, i16_en,
                                         )
                                     }
                                 } else {
@@ -235,6 +239,10 @@ pub(crate) fn reconstruct_macroblock(
             let i4_simd = super::simd::i4_simd_enabled();
             let pred_simd = i4_simd && super::simd::part_simd_on("pred", "ssse3");
             let dct_simd = i4_simd && super::simd::part_simd_on("dct", "sse2");
+            // `idct_i16_enabled()`（K93 第二遍 i16 域开关）同提升：逐块调用是同一 OnceLock 读取
+            // + 分支（asm 每块 `movl ON(%rip);testl;jne`），判定在整帧解码内恒定，本宏块取一次
+            // 透传 `idct_add_one_forced`，循环内用局部 bool。
+            let i16_en = super::simd::idct_i16_enabled();
             stage_clock::idct_i4(|| {
                 // 逐 4×4 子块重建。子块间串行依赖：块 (bx,by) 预测读左/上已重建像素、add 随后
                 // 覆写，predict→add 逐块次序不可重排（S7 同版约束）。外层按子块行 / 内层按列扫，
@@ -293,7 +301,7 @@ pub(crate) fn reconstruct_macroblock(
                                         // Safety：`dct_simd` 已在循环外判定 `part_simd_on("dct","sse2")`
                                         // 为真且本块内恒定，SSE2 核指令可用。
                                         unsafe {
-                                            super::simd::idct_add_one_forced(&mb[block], y, y_pitch, row0, col0)
+                                            super::simd::idct_add_one_forced(&mb[block], y, y_pitch, row0, col0, i16_en)
                                         }
                                     } else {
                                         // 标量：直调 vp8 标量核（恒 has_ac=true）。不可走
@@ -327,6 +335,10 @@ pub(crate) fn reconstruct_macroblock(
                 // 循环外判定一次，循环内改调 `_forced` 变体；关闭途径（`KIMG_WEBP_NO_SIMD_DCT=1`
                 // / `KIMG_WEBP_NO_SIMD=1` / 非 x86_64）走标量回退保留。
                 let dct_simd = super::simd::part_simd_on("dct", "sse2");
+                // `idct_i16_enabled()`（K93 第二遍 i16 域开关）同提升出 UV 对循环：判定在整帧
+                // 解码内恒定，本宏块取一次、经 `inverse_dct_add_two_forced` 透传，省去逐对
+                // OnceLock 读取 + 分支（asm 每对 `movl ON(%rip);testl;jne`）。
+                let i16_en = super::simd::idct_i16_enabled();
                 for a in [16usize, 18, 20, 22] {
                     let b = a + 1;
                     let row0 = dyu + ((a >> 1) & 1) * 4;
@@ -347,7 +359,7 @@ pub(crate) fn reconstruct_macroblock(
                         if has_ac {
                             unsafe {
                                 super::simd::inverse_dct_add_two_forced(
-                                    &mb[a], &mb[b], plane, uv_pitch, row0, col0,
+                                    &mb[a], &mb[b], plane, uv_pitch, row0, col0, i16_en,
                                 )
                             }
                         } else {

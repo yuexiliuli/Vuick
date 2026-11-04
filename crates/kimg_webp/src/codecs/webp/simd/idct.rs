@@ -11,7 +11,13 @@ use std::arch::x86_64::*;
 // 恒等）。字节==标量唯一标准；随机 parity 断言见模块底部。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn idct_add_two_sse2(coeff_a: *const i16, coeff_b: *const i16, dst: *mut u8, stride: isize) {
+unsafe fn idct_add_two_sse2(
+    coeff_a: *const i16,
+    coeff_b: *const i16,
+    dst: *mut u8,
+    stride: isize,
+    i16_en: bool,
+) {
     use std::arch::x86_64::*;
     unsafe {
         let k1 = _mm_set1_epi16(20091);
@@ -43,7 +49,7 @@ unsafe fn idct_add_two_sse2(coeff_a: *const i16, coeff_b: *const i16, dst: *mut 
         // 第二遍：默认 i16 域 pass2（add-4-then-srai，逐 op 对齐 libwebp Transform_SSE2，可达域
         // ∥c∥≤2212 与标量恒等）；`KIMG_WEBP_IDCT_I16=0`（或测试 override）强制旧 i32 域 pass2
         //（全输入域与标量恒等，K93 基线 A/B 侧）。
-        let (s0, s1, s2, s3) = if idct_i16_enabled() {
+        let (s0, s1, s2, s3) = if i16_en {
             idct_pass2_shift16_sse2(t0, t1, t2, t3)
         } else {
             // 高位乘项：`mh16(x,k2)`=`(x*(-30068))>>16`=标量 `(x*35468)>>16` - x（-30068≡35468 mod 2^16），
@@ -108,7 +114,7 @@ unsafe fn idct_add_two_sse2(coeff_a: *const i16, coeff_b: *const i16, dst: *mut 
 /// [0,255] 只落低 4 像素/行（严格 4 字节读写，右缘块不越出平面右端，同 `dc_add_two_sse2` 姿势）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn idct_add_one_sse2(coeff: *const i16, dst: *mut u8, stride: isize) {
+unsafe fn idct_add_one_sse2(coeff: *const i16, dst: *mut u8, stride: isize, i16_en: bool) {
     use std::arch::x86_64::*;
     unsafe {
         let k1 = _mm_set1_epi16(20091);
@@ -138,7 +144,7 @@ unsafe fn idct_add_one_sse2(coeff: *const i16, dst: *mut u8, stride: isize) {
         let (t0, t1, t2, t3) = transpose_2_4x4_16b_sse2(tmp0, tmp1, tmp2, tmp3);
         // 第二遍：默认 i16 域 pass2（8-lane，A 低 64 / B 高 64 恒 0 → 仅低 4 列携带有效值，与
         // `idct_add_two_sse2` 同算术）；`KIMG_WEBP_IDCT_I16=0` 强制旧 i32 域 pass2（基线，全幅恒等）。
-        let (s0, s1, s2, s3) = if idct_i16_enabled() {
+        let (s0, s1, s2, s3) = if i16_en {
             idct_pass2_shift16_sse2(t0, t1, t2, t3)
         } else {
             // 只对低 64（A 半边）符号扩展做 i32 pass2（高位乘项同理，高半恒 0）。
@@ -200,7 +206,7 @@ pub(crate) fn inverse_dct_add_two(
         // （原先的 `buf` 拷贝是每次调用 64B 的纯开销；两指针加载寄存器内容逐字节相同）。
         let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
         unsafe {
-            idct_add_two_sse2(coeff_a.as_ptr(), coeff_b.as_ptr(), dst, pitch as isize);
+            idct_add_two_sse2(coeff_a.as_ptr(), coeff_b.as_ptr(), dst, pitch as isize, idct_i16_enabled());
         }
         return;
     }
@@ -209,7 +215,9 @@ pub(crate) fn inverse_dct_add_two(
 }
 
 /// 预判定后的双块逆变换核直调：`part_simd_on("dct","sse2")` 已由调用方提升出 i16/UV 对循环
-/// （同 `idct_add_one_forced` 姿势，避免逐对特性判定 call）。**Safety**：调用方须保证 sse2
+/// （同 `idct_add_one_forced` 姿势，避免逐对特性判定 call）；`i16_en` 为调用方提升出循环的
+/// `idct_i16_enabled()` 结果（K93 双路径，值在整帧解码内恒定），透传内核省去逐对 OnceLock
+/// 读取 + 分支。**Safety**：调用方须保证 sse2
 /// 可用（如先判定返回 true），越界语义同 `inverse_dct_add_two` 的 SSE2 分支（`row0/col0`
 /// 落在平面内）。
 #[inline]
@@ -220,13 +228,14 @@ pub(crate) unsafe fn inverse_dct_add_two_forced(
     pitch: usize,
     row0: usize,
     col0: usize,
+    i16_en: bool,
 ) {
     // x86_64：内核使用 x86-only intrinsic，仅在该目标编译（SSE2 核指令可用性由调用方保证）。
     #[cfg(target_arch = "x86_64")]
     {
         let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
         unsafe {
-            idct_add_two_sse2(coeff_a.as_ptr(), coeff_b.as_ptr(), dst, pitch as isize);
+            idct_add_two_sse2(coeff_a.as_ptr(), coeff_b.as_ptr(), dst, pitch as isize, i16_en);
         }
         return;
     }
@@ -254,7 +263,7 @@ pub(crate) fn inverse_dct_add_one(
     if part_simd_on("dct", "sse2") {
         let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
         unsafe {
-            idct_add_one_sse2(coeff.as_ptr(), dst, pitch as isize);
+            idct_add_one_sse2(coeff.as_ptr(), dst, pitch as isize, idct_i16_enabled());
         }
         return;
     }
@@ -262,7 +271,9 @@ pub(crate) fn inverse_dct_add_one(
 }
 
 /// 预判定后的单块逆变换核直调：`part_simd_on("dct","sse2")` 已由调用方提升出 i4 子块循环
-/// （同 `predict_subblock_forced` 姿势，避免逐块特性判定 call）。**Safety**：调用方须保证
+/// （同 `predict_subblock_forced` 姿势，避免逐块特性判定 call）；`i16_en` 为调用方提升出循环的
+/// `idct_i16_enabled()` 结果（K93 双路径，值在整帧解码内恒定），透传内核省去逐块 OnceLock
+/// 读取 + 分支。**Safety**：调用方须保证
 /// sse2 可用（如先判定返回 true），越界语义同 `inverse_dct_add_one` 的 SSE2 分支（`row0/col0`
 /// 落在平面内）；仅 DC（无 AC）块亦走本核——`idct_add_one_sse2` 对仅 DC 块与标量 DC 捷径
 /// 逐字节一致（`inverse_dct_has_ac_shortcut_equivalence`）。
@@ -273,13 +284,14 @@ pub(crate) unsafe fn idct_add_one_forced(
     pitch: usize,
     row0: usize,
     col0: usize,
+    i16_en: bool,
 ) {
     // x86_64：内核使用 x86-only intrinsic，仅在该目标编译（SSE2 核指令可用性由调用方保证）。
     #[cfg(target_arch = "x86_64")]
     {
         let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
         unsafe {
-            idct_add_one_sse2(coeff.as_ptr(), dst, pitch as isize);
+            idct_add_one_sse2(coeff.as_ptr(), dst, pitch as isize, i16_en);
         }
         return;
     }
