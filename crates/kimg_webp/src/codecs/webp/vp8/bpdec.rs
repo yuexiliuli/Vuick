@@ -230,21 +230,33 @@ pub(crate) fn ent_split_pre(
     if *bits < 0 {
         ent_refill(data, pos, value, bits);
     }
+    // bits 上界不变量（证明）：初始 -8；refill 快道 +56（自 <0）→[48,55]、慢道 +8 出环 ≥0→[0,7]；
+    // renorm 仅 `*bits -= shift`（shift∈[0,7]，`ent_renorm_apply`/`ent_read_signed` 均 ±≤8）。
+    // 故本点（refill 后）恒有 bits ∈ [0,55] < 64。单点载入 `b` 并对其下界假设，移位直接用该 `b`
+    // （保证假设与移位共用同一 SSA 值，KnownBits 传导后 x86 变量移位前 `andl $63` 判恒等折叠删除；
+    // 掩码值本仅喂移位计数，字节恒等不变）。debug 构建假设转真实断言（验证期兜底）。
+    // Safety：上方不变量证明 b<64 恒成立。
+    let b = *bits as u32;
+    unsafe { core::hint::assert_unchecked(b < 64) };
     let rm1 = *range_minus1;
     let split_minus1 = (rm1 * prob) >> 8;
-    (*value >> (*bits as u32), split_minus1, rm1)
+    (*value >> b, split_minus1, rm1)
 }
 
-/// renorm 应用（单源）：`range`（位判定结果）落 `range_minus1`/`bits`。与 read_bit_val 同：
-/// `range < 128 || !renorm_skip` 恒等（renorm_skip=false 时时走 lzcnt）。
+/// renorm 应用（单源）：`range`（位判定结果）落 `range_minus1`/`bits`。跳过条件
+/// `renorm_skip && range >= 128` 与 `range < 128 || !renorm_skip` 德摩根等价
+/// （renorm_skip=false 时恒走 lzcnt），输出逐字节一致。
 #[inline(always)]
 pub(crate) fn ent_renorm_apply(bits: &mut i32, range_minus1: &mut u32, range: u32, renorm_skip: bool) {
-    if range < 128 || !renorm_skip {
+    // renorm 跳过 = `renorm_skip && range >= 128`（原 `range < 128 || !renorm_skip` 的德摩根等价，
+    // 输出逐字节一致）。写成分支嵌套：先测 renorm_skip（宏块级不变量，可留寄存器），再对 range
+    // 直接 `cmp+jb`（用 `cmpl` 旗标，免 `seta` 物化 `range>=128` 后再 `testb` 合并）。
+    if renorm_skip && range >= 128 {
+        *range_minus1 = range - 1;
+    } else {
         let shift = range.leading_zeros() - 24;
         *range_minus1 = (range << shift) - 1;
         *bits -= shift as i32;
-    } else {
-        *range_minus1 = range - 1;
     }
 }
 
@@ -262,8 +274,13 @@ pub(crate) fn ent_read_bit(
     probability: u8,
 ) -> u32 {
     let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, probability);
+    // 减法位移位数与 ent_split_pre 同源（其间 bits 不被改写）：单点载入并对同一 SSA 下界假设
+    // （见 `ent_split_pre`，bits ∈ [0,55] < 64 可证；debug 转真实断言）。
+    // Safety：b<64 恒成立。
+    let b = *bits as u32;
+    unsafe { core::hint::assert_unchecked(b < 64) };
     let (range, bit) = if vs > u64::from(sp) {
-        *value -= (u64::from(sp + 1)) << (*bits as u32);
+        *value -= (u64::from(sp + 1)) << b;
         (rm1 - sp, 1)
     } else {
         (sp + 1, 0)
@@ -296,11 +313,16 @@ pub(crate) fn ent_read_signed(
     if *bits < 0 {
         ent_refill(data, pos, value, bits);
     }
+    // 同 `ent_split_pre` 的 bits 上界不变量（refill 后 bits ∈ [0,55] < 64，可证）；单点载入 `b`
+    // 并对其下界假设、两处移位共用该 `b`（删 `andl $63`）；debug 转真实断言。
+    // Safety：b<64 恒成立。
+    let b = *bits as u32;
+    unsafe { core::hint::assert_unchecked(b < 64) };
     let rm1 = *range_minus1 as i32;
     let split_minus1 = rm1 >> 1;
-    let mask = (split_minus1 - (*value >> (*bits as u32)) as i32) >> 31;
+    let mask = (split_minus1 - (*value >> b) as i32) >> 31;
     let dec_bit = (split_minus1 + 1) & mask;
-    *value -= (dec_bit as u32 as u64) << (*bits as u32);
+    *value -= (dec_bit as u32 as u64) << b;
     let new_range = (split_minus1 + 1 + ((rm1 - 2 * split_minus1 - 1) & mask)) as u32;
     let sh = 1u32 - (new_range >> 7);
     *range_minus1 = (new_range << sh) - 1;
