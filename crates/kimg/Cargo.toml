@@ -4,59 +4,27 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
-description = "纯 Rust 图像解码/编码兼容层（镜像 image 0.25 的仓库实际使用子集）。第 3 阶段替换 image 的核心 crate。"
+description = "纯 Rust 图像解码/编码兼容层（镜像 image 0.25 的仓库实际使用子集）。第 3 阶段替换 image 的核心 crate。kimg 拆分为门面 crate：共享类型来自 kimg_core，各格式编解码器来自 kimg_png/kimg_gif/kimg_webp/kimg_jpeg/kimg_tiff/kimg_bmp/kimg_ico/kimg_pnm。"
 
 [dependencies]
-# 图像后端（全部纯 Rust）。版本对齐 Cargo.lock 既有锁定（gif/tiff）。
-# PNG 已自研解/编（pngsimd + png_encoder，见 codecs/png_encoder.rs），运行时不再依赖 png crate
-# （png 0.17.16 移入 dev-dependencies 仅作测试/基准对照，见下方说明）。
-# JPEG 用 zune-jpeg（== image 0.25.10 自身所用后端，保证字节级一致）——任务原始方案中的
-# jpeg-decoder 0.3 与 image 的参考输出存在 IDCT ±1 差异，无法达成 parity=0，故按实测替换。
-# GIF 已自研解/编（codecs/gif/，移植 SimdCodecs：容器+LZW+画布+编码器），运行时不再依赖 gif crate
-# （gif 0.14.2 移入 dev-dependencies 仅作测试/oracle 对照，见下方说明）。
-# WebP 已自研解/编（codecs/webp/：容器+VP8L+VP8+ALPH+动画），运行时不再依赖 image-webp crate
-# （image-webp 0.2.4 移入 dev-dependencies 仅作测试/oracle 对照，见下方说明）。
-tiff = "0.11.3"
-zune-jpeg = "0.5.15"
-zune-core = "0.5.3"
-# 自研 PNG 解码热路径（移植 SimdCodecs）：IDAT zlib 解压用 fdeflate（lock 0.3.7，纯 Rust，
-# 也是 png crate 0.17 自身的解码后端）。选型依据（2026-10-31 实测，release -z）：zlib-rs 0.6.8 /
-# zune-inflate 0.2.54 在同批真图 IDAT 的亚 10% 聚合优势主要来自高压缩语料；本仓基准的合成单图
-# fdeflate 独占优势——随机内容 8.3MB RGBA 流 fdeflate 分块喂入 ~3.1-4.1ms vs zlib-rs
-# `decompress_slice` ~9.9ms；photo 平滑内容 8.3MB 流 fdeflate 19.5ms vs zlib-rs 25.8ms。
-# 两种内容下 zlib-rs 都不更快（一次性能 API 还会触发 IDAT 拼接拷贝），故按计划保持 fdeflate。
-# 块 CRC 校验用 crc32fast（lock 1.5.0）。
-fdeflate = "0.3"
-crc32fast = "1.4"
+# kimg 拆分（2026-11）：共享核心 + 8 个格式 crate。本 crate 只做聚合分发（GenericDecoder /
+# DynamicImage / ImageReader / 门面自由函数）与对旧 `kimg::` 公共路径的全量重导出，消费方零改动。
+kimg_core = { path = "../kimg_core" }
+kimg_png = { path = "../kimg_png" }
+kimg_gif = { path = "../kimg_gif" }
+kimg_webp = { path = "../kimg_webp" }
+kimg_jpeg = { path = "../kimg_jpeg" }
+kimg_tiff = { path = "../kimg_tiff" }
+kimg_bmp = { path = "../kimg_bmp" }
+kimg_ico = { path = "../kimg_ico" }
+kimg_pnm = { path = "../kimg_pnm" }
 
 [features]
 default = []
-# 分阶段计时探针（仅诊断 bench）：pngsimd 解码热路径逐阶段累计耗时，环境变量
-# KIMG_PNG_STAGE_PROFILE=1 时随每次解码打印 `STAGE ...` 行；KIMG_PNG_NO_SIMD=1 时强制
-# 反滤波/展开走标量（量化 SIMD 收益）。不开本 feature 即零代码影响（正常构建路径不变）。
-stage_profile = []
+# 分阶段计时探针（仅诊断 bench）：转发到各格式 crate 的 stage_profile 探针 feature
+# （pngsimd / WebP 解码热路径分阶段耗时），供 imgbench 的 stage-profile feature 使用。
+stage_profile = ["kimg_png/stage_profile", "kimg_webp/stage_profile"]
 
 [dev-dependencies]
-# 仅测试用：生成 fixture 时仍走 png crate 编码；手写 filter 行的 PNG 构造器需要 zlib 压缩。
-flate2 = "1.1"
-# GIF oracle 对照（tests/gif_oracle.rs）：对语料/夹具双解逐帧 RGBA8 逐字节对比 + 自研 encoder →
-# gif crate decoder 反向回环。运行时零 gif 依赖（同 png crate 的 dev-dep 先例）。
-gif = "0.14.2"
-# PNG cross-oracle 对照与 fixture 生成：PngEncoder 已自研（codecs/png_encoder.rs，运行时零 png 依赖），
-# png 0.17.16 仅测试/基准用——解码读回逐字节对照（tests/encode_self.rs 的 cross oracle）、
-# png_port_parity / png_port_bench / idat_backend_bench 的参照端。imgbench 属基准对照 crate，保留 png。
-png = "0.17.16"
-# WebP oracle 对照（tests/webp_*.rs + src 内 parity / alpha_filter）：kimg WebP 已自研
-# （codecs/webp/，运行时零 image-webp 依赖），image-webp 0.2.4 仅测试/基准 oracle——dev oracle
-# 直连 image_webp::WebPDecoder 与自研逐字节对拍（同 gif/png 的 dev-dep 先例）。
-image-webp = "0.2.4"
-# WebP oracle harness（tests/webp_oracle.rs）：对 fixture 算 dwebp golden 同款 sha256(RGBA)
-# 逐 fixture 对比；与 SimdCodecs WebpOracleTests.cs 的哈希口径一致。
-sha2 = "0.10"
-# inflate 后端的一次性对比微基准（idat_backend_bench `#[ignore]`）需要拿 zlib-rs / zune-inflate
-# 与 fdeflate 对照以复跑选型结论——仅 dev，不进入运行时依赖面（结论见上方 fdeflate 注释）。
-zlib-rs = "0.6.8"
-zune-inflate = "0.2.54"
-
-[package.metadata.docs.rs]
-all-features = true
+# 门面冒烟测试（tests/basic.rs, tests/surface.rs）只用 kimg 自身能力，无需外部 oracle 依赖；
+# 各格式的 oracle 对照依赖（png/gif/image-webp/sha2/flate2/zlib-rs/zune-inflate）已随测试迁往对应格式 crate。

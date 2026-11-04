@@ -1,0 +1,33 @@
+[package]
+name = "kimg_png"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "kimg 拆分的 PNG 编解码 crate（codecs/png + codecs/pngsimd + codecs/png_encoder，自研 IDAT 热路径）。"
+
+[dependencies]
+kimg_core = { path = "../kimg_core" }
+# 自研 PNG 解码热路径（移植 SimdCodecs）：IDAT zlib 解压用 fdeflate（纯 Rust，png crate 0.17 自身后端）。
+# 块 CRC 校验用 crc32fast。
+fdeflate = "0.3"
+crc32fast = "1.4"
+
+[features]
+default = []
+# 分阶段计时探针（仅诊断 bench）：pngsimd 解码热路径逐阶段累计耗时，环境变量
+# KIMG_PNG_STAGE_PROFILE=1 时随每次解码打印 `STAGE ...` 行；KIMG_PNG_NO_SIMD=1 时强制
+# 反滤波/展开走标量（量化 SIMD 收益）。不开本 feature 即零代码影响（正常构建路径不变）。
+stage_profile = []
+
+[dev-dependencies]
+# 仅测试用：生成 fixture 时仍走 png crate 编码；手写 filter 行的 PNG 构造器需要 zlib 压缩。
+flate2 = "1.1"
+# PNG cross-oracle 对照与 fixture 生成：PngEncoder 已自研（运行时零 png 依赖），
+# png 0.17.16 仅测试/基准用——解码读回逐字节对照（encode_self 的 cross oracle）、
+# png_port_parity / png_port_bench / idat_backend_bench 的参照端。
+png = "0.17.16"
+# inflate 后端的一次性对比微基准（idat_backend_bench `#[ignore]`）需要拿 zlib-rs / zune-inflate
+# 与 fdeflate 对照以复跑选型结论——仅 dev，不进入运行时依赖面。
+zlib-rs = "0.6.8"
+zune-inflate = "0.2.54"

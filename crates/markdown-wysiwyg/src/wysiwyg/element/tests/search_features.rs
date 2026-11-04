@@ -225,6 +225,7 @@ fn mermaid_renders_diagram_to_image(cx: &mut TestAppContext) {
     // mermaid 卡片：层式布局（4 节点 3 边）+ 高度按层数算 + 把**同一套几何**
     // 光栅化成 PNG（盒子+连线+箭头），供外部识图核验“真图”。
     use super::{BlockCard, mm_layout};
+    use kimg::ImageBufferExt;
     let out_dir = std::env::temp_dir().join("kilo");
     let _ = std::fs::create_dir_all(&out_dir);
     const SRC: &str = "A[开始] --> B{判断}\nB -->|是| C[完成]\nB -->|否| D[返回]";

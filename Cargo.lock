@@ -2501,18 +2501,91 @@ dependencies = [
 name = "kimg"
 version = "0.1.0"
 dependencies = [
+ "kimg_bmp",
+ "kimg_core",
+ "kimg_gif",
+ "kimg_ico",
+ "kimg_jpeg",
+ "kimg_png",
+ "kimg_pnm",
+ "kimg_tiff",
+ "kimg_webp",
+]
+
+[[package]]
+name = "kimg_bmp"
+version = "0.1.0"
+dependencies = [
+ "kimg_core",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "kimg_core"
+version = "0.1.0"
+
+[[package]]
+name = "kimg_gif"
+version = "0.1.0"
+dependencies = [
+ "gif",
+ "kimg_core",
+]
+
+[[package]]
+name = "kimg_ico"
+version = "0.1.0"
+dependencies = [
+ "kimg_bmp",
+ "kimg_core",
+ "kimg_png",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "kimg_jpeg"
+version = "0.1.0"
+dependencies = [
+ "kimg_core",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "kimg_png"
+version = "0.1.0"
+dependencies = [
  "crc32fast",
  "fdeflate",
  "flate2",
- "gif",
- "image-webp",
+ "kimg_core",
  "png 0.17.16",
- "sha2 0.10.9",
- "tiff",
  "zlib-rs",
- "zune-core",
  "zune-inflate",
- "zune-jpeg",
+]
+
+[[package]]
+name = "kimg_pnm"
+version = "0.1.0"
+dependencies = [
+ "kimg_core",
+]
+
+[[package]]
+name = "kimg_tiff"
+version = "0.1.0"
+dependencies = [
+ "kimg_core",
+ "tiff",
+]
+
+[[package]]
+name = "kimg_webp"
+version = "0.1.0"
+dependencies = [
+ "image-webp",
+ "kimg_core",
+ "sha2 0.10.9",
 ]
 
 [[package]]

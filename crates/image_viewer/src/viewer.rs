@@ -1043,6 +1043,7 @@ mod tests {
     use gpui::AppContext as _;
     use gpui::TestAppContext;
     use gpui::VisualTestContext;
+    use kimg::ImageBufferExt;
 
     /// 每测试独立的临时目录（按进程 id + 标签隔离，避免并行测试互相踩）。
     fn tmp_dir(tag: &str) -> PathBuf {

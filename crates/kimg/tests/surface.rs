@@ -8,8 +8,8 @@ use kimg::codecs::gif::{GifDecoder, GifEncoder};
 use kimg::codecs::png::PngDecoder;
 use kimg::codecs::webp::WebPDecoder;
 use kimg::{
-    AnimationDecoder, DynamicImage, Frame, GenericImageView, ImageBuffer, ImageDecoder, ImageFormat,
-    ImageReader, Limits, Rgba, RgbaImage,
+    AnimationDecoder, DynamicImage, Frame, GenericImageView, ImageBuffer, ImageBufferExt,
+    ImageDecoder, ImageFormat, ImageReader, Limits, Rgba, RgbaImage,
 };
 
 /// 复刻 gpui `platform.rs` / `img.rs` / `image_viewer` 的 PngDecoder + ImageDecoder 消费路径。

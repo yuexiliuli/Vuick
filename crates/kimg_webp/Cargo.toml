@@ -1,0 +1,26 @@
+[package]
+name = "kimg_webp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "kimg 拆分的 WebP 解/编 crate（codecs/webp：容器+VP8L+VP8+ALPH+动画+SIMD，自研热路径）。"
+
+[dependencies]
+kimg_core = { path = "../kimg_core" }
+
+[features]
+default = []
+# 分阶段计时探针（仅诊断 bench）：VP8 / VP8L 解码热路径逐阶段耗时结构（Vp8StageProfile /
+# Vp8lStageProfile / I4OpCosts + vp8_vp8l 各 stage_decode / probe 函数），由 imgbench 的
+# stage-profile feature 经 kimg 门面转发开启。不开本 feature 即零代码影响。
+stage_profile = []
+
+[dev-dependencies]
+# WebP oracle 对照（tests/webp_*.rs + src 内 parity / alpha_filter）：kimg WebP 已自研
+# （运行时零 image-webp 依赖），image-webp 0.2.4 仅测试/基准 oracle——dev oracle
+# 直连 image_webp::WebPDecoder 与自研逐字节对拍。
+image-webp = "0.2.4"
+# WebP oracle harness（tests/webp_oracle.rs）：对 fixture 算 dwebp golden 同款 sha256(RGBA)
+# 逐 fixture 对比；与 SimdCodecs WebpOracleTests.cs 的哈希口径一致。
+sha2 = "0.10"

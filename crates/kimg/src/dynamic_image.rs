@@ -7,7 +7,7 @@ use crate::buffer::{
     Rgba16Image, Rgba32FImage, Rgb32FImage, RgbaImage,
 };
 use crate::codecs::gif::GifEncoder;
-use crate::codecs::png;
+use crate::codecs::png::PngEncoder;
 use crate::color::{ColorType, ExtendedColorType};
 use crate::error::{ImageError, ImageResult};
 use crate::format::ImageFormat;
@@ -77,6 +77,8 @@ impl DynamicImage {
             Rgba16 => Self::ImageRgba16(ImageBuffer::new(w, h)),
             Rgb32F => Self::ImageRgb32F(ImageBuffer::new(w, h)),
             Rgba32F => Self::ImageRgba32F(ImageBuffer::new(w, h)),
+            // `ColorType` 为 non_exhaustive：未来新增变体无法对应任何 `DynamicImage` 变体。
+            other => panic!("DynamicImage::new 不支持颜色类型 {other:?}"),
         }
     }
 
@@ -122,6 +124,13 @@ impl DynamicImage {
             )),
             ColorType::Rgba32F => Ok(DynamicImage::ImageRgba32F(
                 ImageBuffer::from_raw(w, h, f32_vec(&buf)).expect("buffer size checked"),
+            )),
+            // `ColorType` 为 non_exhaustive：未来新增变体不落入任何 `DynamicImage` 布局。
+            other => Err(ImageError::Unsupported(
+                crate::error::UnsupportedError::from_format_and_kind(
+                    crate::error::ImageFormatHint::Unknown,
+                    crate::error::UnsupportedErrorKind::Color(other.into()),
+                ),
             )),
         }
     }
@@ -184,7 +193,7 @@ impl DynamicImage {
             DynamicImage::ImageRgb8(img) => {
                 let (w, h) = img.dimensions();
                 let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
-                crate::codecs::webp::simd::rgb8_to_rgba8(img.as_raw(), &mut out);
+                kimg_webp::rgb8_to_rgba8(img.as_raw(), &mut out);
                 RgbaImage::from_raw(w, h, out).expect("尺寸已校验")
             }
             x => {
@@ -343,7 +352,7 @@ impl DynamicImage {
     /// 编码写入 writer。
     pub fn write_to<W: Write + Seek>(&self, mut w: W, format: ImageFormat) -> ImageResult<()> {
         match format {
-            ImageFormat::Png => png::encode_dynamic_png(self, &mut w),
+            ImageFormat::Png => encode_dynamic_png(self, &mut w),
             ImageFormat::Gif => {
                 let (data, width, height, color) = self.buffer_and_color();
                 if color != ExtendedColorType::Rgba8 {
@@ -467,4 +476,11 @@ impl From<Rgba32FImage> for DynamicImage {
     fn from(image: Rgba32FImage) -> Self {
         DynamicImage::ImageRgba32F(image)
     }
+}
+
+/// 把 `DynamicImage` 编码为 PNG（`write_to(Png)` 路径用；原属 codecs::png，kimg 拆分后
+/// 因跨 crate 环形依赖迁移到门面，底层仍走 kimg_png::PngEncoder）。
+pub(crate) fn encode_dynamic_png(img: &DynamicImage, out: &mut impl Write) -> ImageResult<()> {
+    let (data, w, h, color) = img.buffer_and_color();
+    PngEncoder::new(out).write_image(data, w, h, color)
 }

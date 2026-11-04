@@ -1,15 +1,41 @@
-//! 解码器实现：PNG / JPEG / GIF / WebP / TIFF / BMP / ICO / PNM 与格式分发。
+//! 解码器分发门面：按格式聚合各格式 crate 的解码器（kimg_png / kimg_gif / kimg_webp /
+//! kimg_jpeg / kimg_tiff / kimg_bmp / kimg_ico / kimg_pnm）并提供 `GenericDecoder`。
 
-pub(crate) mod bmp;
-pub mod gif;
-pub(crate) mod ico;
-pub(crate) mod jpeg;
-pub mod png;
-pub(crate) mod pngsimd;
-pub(crate) mod png_encoder;
-pub(crate) mod pnm;
-pub(crate) mod tiff;
-pub mod webp;
+pub mod bmp {
+    pub use kimg_bmp::BmpDecoder;
+}
+pub mod gif {
+    pub use kimg_gif::{GifDecoder, GifEncoder, Repeat};
+}
+pub mod ico {
+    pub use kimg_ico::IcoDecoder;
+}
+pub mod jpeg {
+    pub use kimg_jpeg::JpegDecoder;
+}
+pub mod png {
+    pub use kimg_png::{PngDecoder, PngEncoder};
+}
+pub mod pnm {
+    pub use kimg_pnm::{PnmDecoder, PnmSubtype, SampleEncoding};
+}
+pub mod tiff {
+    pub use kimg_tiff::TiffDecoder;
+}
+pub mod webp {
+    pub use kimg_webp::{
+        set_webp_backend, BACKEND_AUTO, BACKEND_OURS, WebPDecoder,
+        decode_static_lossless_rgba8_into, decode_static_lossy_rgba8_into,
+    };
+    // 静态族直写辅助：kimg_webp 根面未 re-export，从 `codecs::webp` 子模块取。
+    pub use kimg_webp::codecs::webp::{lossless_static_size, uninit_rgba8_vec};
+    #[cfg(feature = "stage_profile")]
+    pub use kimg_webp::{
+        vp8_extract_frame, vp8_probe_clock_costs, vp8_probe_entropy_op_costs,
+        vp8_probe_i4_op_costs, vp8_stage_decode, vp8l_extract_bitstream, vp8l_stage_decode,
+        I4OpCosts, Vp8StageProfile, Vp8lStageProfile,
+    };
+}
 
 use std::io::{BufRead, Cursor, Seek};
 

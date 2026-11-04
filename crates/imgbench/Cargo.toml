@@ -85,6 +85,11 @@ name = "webp_release_bench"
 harness = false
 
 [[bench]]
+name = "webp_vs_csharp_probe"
+# 自定义输出格式（WEBP_C_PROBE 行），不用 Cargo 默认 bench harness。
+harness = false
+
+[[bench]]
 name = "vp8l_stage_probe"
 # 自定义输出格式（VP8L_STAGE_PROBE 行），不用 Cargo 默认 bench harness。
 harness = false

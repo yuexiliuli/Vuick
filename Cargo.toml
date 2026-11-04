@@ -50,7 +50,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["crates/media-ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/markdown", "crates/markdown-wysiwyg", "crates/toc", "crates/pdf", "crates/image_viewer", "crates/video", "crates/epub", "crates/shell", "crates/tray", "crates/music", "crates/imgbench", "crates/kimg", "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
+members = ["crates/media-ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/markdown", "crates/markdown-wysiwyg", "crates/toc", "crates/pdf", "crates/image_viewer", "crates/video", "crates/epub", "crates/shell", "crates/tray", "crates/music", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp", "crates/kimg_ico", "crates/kimg_pnm", "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`media_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。
@@ -102,6 +102,17 @@ pdfium-render = { version = "=0.9.3", default-features = false, features = ["pdf
 zstd = "0.13"
 # image → kimg 收尾（P4）：依赖键名换为 `kimg`，全仓源码已改 `use kimg::...`。
 kimg = { path = "crates/kimg" }
+# kimg 拆分（2026-11）：共享核心 + 每格式独立 crate。消费方仍只依赖 `kimg` 门面（全量重导出），
+# 各格式 crate 由 kimg 门面依赖，仅 imgbench 经门面转发 stage_profile 探针 feature。
+kimg_core = { path = "crates/kimg_core" }
+kimg_png = { path = "crates/kimg_png" }
+kimg_gif = { path = "crates/kimg_gif" }
+kimg_webp = { path = "crates/kimg_webp" }
+kimg_jpeg = { path = "crates/kimg_jpeg" }
+kimg_tiff = { path = "crates/kimg_tiff" }
+kimg_bmp = { path = "crates/kimg_bmp" }
+kimg_ico = { path = "crates/kimg_ico" }
+kimg_pnm = { path = "crates/kimg_pnm" }
 # LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = "0.1"
 ratex-layout = "0.1"
@@ -228,3 +239,26 @@ lto = true             # 跨 crate 链接时优化，消除重复代码
 strip = true           # 剥离符号表和调试信息
 panic = "abort"        # 移除 unwind 表
 codegen-units = 1      # 单线程编译，最大化优化机会（编译变慢）
+
+# ---------------------------------------------------------------------------
+# 编译提速（2026-11，Cargo Book 官方 build-performance 推荐）：
+# - dev 默认只生成「行表」调试信息（可用 panic 回溯到行号，省去全量 debuginfo 的
+#   大幅编译/链接/PDB 成本）；依赖一律零调试信息。需要完整调试（本地变量/断点探值）时
+#   用 `cargo build --profile debugging` / `cargo test --profile debugging` 显式选用。
+# - bench 不再吃 release 的 `lto=true+codegen-units=1`（cargo bench 默认继承 release，
+#   曾有 20-30 分钟级构建）：改 thin-LTO + 16 codegen-units，运行期差距可忽略。
+# - 注意：本条改变 dev 产物形态，首次生效会触发一次全量重编（target 目录级重建）。
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+debug = 0

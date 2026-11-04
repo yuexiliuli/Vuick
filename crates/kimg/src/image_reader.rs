@@ -188,5 +188,7 @@ fn guess_format_from_reader<R: BufRead + Seek>(
         &mut Cursor::new(&mut start[..]),
     )?;
     reader.seek(SeekFrom::Start(cur))?;
-    Ok(format::guess_format_impl(&start[..len as usize]))
+    // `guess_format_impl` 是 kimg_core 私有函数，门面经公开 `guess_format`（返回
+    // `ImageResult`）取 `Option` 语义：无法识别返回 `None`，与旧行为一致。
+    Ok(format::guess_format(&start[..len as usize]).ok())
 }
