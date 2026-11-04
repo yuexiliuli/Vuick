@@ -441,11 +441,13 @@ pub(crate) fn filter_t3_loop(
     channels: usize,
     alpha: Option<&[u8]>,
 ) {
-    // t3 独占的全 padded 重建缓冲（planes_B）：与 planes_A 同布局（含左列；字节在写入前恒 0，
-    // 滤波/直出只读已写入行段，未初始化亦安全——保持 memset 以结构性地杜绝任何读空风险）。
+    // t3 独占的全 padded 重建缓冲（planes_B）：与 planes_A 同布局（含左列）。L3 死写削减：
+    // 每 MB 行进入时 16×y_pitch（luma）+ 16×uv_pitch（chroma）整行 `copy_from_slice` 覆写全部
+    // 字节，其后滤波/直出/抽紧密只读已写入行段（上方邻行亦于上一迭代满写；行首行先写后读）
+    // → 全量 memset 为死写，未初始化分配 + 整行覆写与 memset 版逐字节同，无未初始化读。
     let y_vec_len = mbh * 16 * y_pitch;
     let uv_vec_len = mbh * 8 * uv_pitch;
-    let mut planes_b = vec![0u8; y_vec_len + 2 * uv_vec_len];
+    let mut planes_b = unsafe { super::uninit_vec_u8(y_vec_len + 2 * uv_vec_len) };
     let (yb, rest) = planes_b.split_at_mut(y_vec_len);
     let (ub, vb) = rest.split_at_mut(uv_vec_len);
     let cw = (width + 1) >> 1;

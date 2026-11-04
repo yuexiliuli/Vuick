@@ -127,6 +127,7 @@ fn median_profile(frame: &[u8], w: u32, h: u32, rounds: usize) -> kimg::codecs::
         "setup_ns",
         "mid_ns",
         "end_ns",
+        "serial_loop_ns",
         "total_ns",
         "idct_i16_ns",
         "idct_i4_ns",
@@ -173,6 +174,7 @@ fn field(p: &kimg::codecs::webp::Vp8StageProfile, f: &str) -> u64 {
         "setup_ns" => p.setup_ns,
         "mid_ns" => p.mid_ns,
         "end_ns" => p.end_ns,
+        "serial_loop_ns" => p.serial_loop_ns,
         "total_ns" => p.total_ns,
         "idct_i16_ns" => p.idct_i16_ns,
         "idct_i4_ns" => p.idct_i4_ns,
@@ -212,6 +214,7 @@ fn set_field(p: &mut kimg::codecs::webp::Vp8StageProfile, f: &str, v: u64) {
         "setup_ns" => p.setup_ns = v,
         "mid_ns" => p.mid_ns = v,
         "end_ns" => p.end_ns = v,
+        "serial_loop_ns" => p.serial_loop_ns = v,
         "total_ns" => p.total_ns = v,
         "idct_i16_ns" => p.idct_i16_ns = v,
         "idct_i4_ns" => p.idct_i4_ns = v,
@@ -498,6 +501,7 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
                 "VP8_STAGE_PROBE {name} {}x{} entropy={:.3}ms({:.1}%) predict={:.3}ms({:.1}%) \
                  idct={:.3}ms({:.1}%) filter={:.3}ms({:.1}%) yuv={:.3}ms({:.1}%) \
                  inner_sum={:.3}ms raw_wall={:.3}ms head={:.3}ms scope_w={:.3}ms copy={:.3}ms setup={:.3}ms \
+                 mid={:.3}ms end={:.3}ms sl={:.3}ms \
                  lw_total={:.3}ms lw_ratio={:.2} alpha={} pipeline={}",
                 w,
                 h,
@@ -517,6 +521,9 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
                 ms(p.scope_ns),
                 ms(p.copy_ns),
                 ms(p.setup_ns),
+                ms(p.mid_ns),
+                ms(p.end_ns),
+                ms(p.serial_loop_ns),
                 lwt,
                 ms(p.total_ns) / lwt,
                 has_alpha,
@@ -525,7 +532,8 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
             None => println!(
                 "VP8_STAGE_PROBE {name} {}x{} entropy={:.3}ms({:.1}%) predict={:.3}ms({:.1}%) \
                  idct={:.3}ms({:.1}%) filter={:.3}ms({:.1}%) yuv={:.3}ms({:.1}%) \
-                 inner_sum={:.3}ms raw_wall={:.3}ms head={:.3}ms scope_w={:.3}ms copy={:.3}ms setup={:.3}ms alpha={} pipeline={}",
+                 inner_sum={:.3}ms raw_wall={:.3}ms head={:.3}ms scope_w={:.3}ms copy={:.3}ms setup={:.3}ms \
+                 mid={:.3}ms end={:.3}ms sl={:.3}ms alpha={} pipeline={}",
                 w,
                 h,
                 ms(p.entropy_ns),
@@ -544,6 +552,9 @@ fn run_probe(files: &[(String, Vec<u8>, u32, u32, bool)]) {
                 ms(p.scope_ns),
                 ms(p.copy_ns),
                 ms(p.setup_ns),
+                ms(p.mid_ns),
+                ms(p.end_ns),
+                ms(p.serial_loop_ns),
                 has_alpha,
                 p.pipelined,
             ),

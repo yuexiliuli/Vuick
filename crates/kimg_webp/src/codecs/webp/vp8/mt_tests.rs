@@ -66,6 +66,61 @@
         eprintln!("WEBP_MT_PARITY_OK\t{checked}");
     }
 
+    /// 硬闸：i4 段（4×4 B_PRED 子块预测 + IDCT＋add）SIMD 快道（`KIMG_WEBP_I4_SIMD` 默认开，
+    /// 经 `set_i4_simd_override` 进程内翻转）与强制标量回退输出**逐字节一致**（YUV+RGBA 全平面）。
+    /// 覆盖全部静态有损 fixture（缺则 SKIP）。CPU 无 ssse3/sse2 时两路径本就同源，自对不判失败。
+    /// 该门控只动 i4 子块段（i16/UV 逆变换与 16×16/8×8 大块预测不受影响）。
+    #[test]
+    fn i4_simd_matches_scalar_byte_exact() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut checked = 0usize;
+        let mut names: Vec<String> = webp_fixtures_support::webp_fixture_names();
+        names.sort();
+        for name in names {
+            let Some(p) = webp_fixtures_support::webp_fixture_path(&name) else {
+                continue;
+            };
+            let data = std::fs::read(&p).expect("read fixture");
+            let Ok(c) = container::parse(&data) else {
+                continue;
+            };
+            if c.family != container::Family::StaticLossy
+                && c.family != container::Family::LossyAlpha
+            {
+                continue;
+            }
+            // 快道（i4 SIMD 开）。
+            super::super::simd::set_i4_simd_override(Some(true));
+            let Some((simd_yuv, simd_rgba)) = decode_with_threads(&data, "0") else {
+                eprintln!("SKIP {name} 快道串行解码失败（外部语料不可解）");
+                continue;
+            };
+            // 标量回退（i4 门控强制关；i16/UV/D1 大块 SIMD 保持默认不受影响）。
+            super::super::simd::set_i4_simd_override(Some(false));
+            let Some((scalar_yuv, scalar_rgba)) = decode_with_threads(&data, "0") else {
+                panic!("{name} 标量串行解码失败（快道已成功）");
+            };
+            assert_eq!(
+                simd_yuv, scalar_yuv,
+                "{name}: i4 SIMD 与标量 YUV 平面逐字节一致"
+            );
+            assert_eq!(
+                simd_rgba, scalar_rgba,
+                "{name}: i4 SIMD 与标量 RGBA 逐字节一致"
+            );
+            checked += 1;
+        }
+        super::super::simd::set_i4_simd_override(None);
+        unsafe {
+            std::env::remove_var("KIMG_WEBP_THREADS");
+        }
+        assert!(
+            checked >= 3,
+            "应至少对拍 3 个有损 fixture（当前 {checked}；缺外部语料）"
+        );
+        eprintln!("WEBP_I4_SIMD_PARITY_OK\t{checked}");
+    }
+
     /// 大图双线程滤波中位墙钟（release 手动跑 `-- --ignored`）：输出
     /// `WEBP_MT <name> <w>x<h> before=..ms after=..ms ratio=..`，供「是否默认开」决策（K53；
     /// before=threads=0 串行中位，after=threads=2 中位，ratio=before/after）。

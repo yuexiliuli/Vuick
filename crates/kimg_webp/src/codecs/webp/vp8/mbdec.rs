@@ -411,6 +411,10 @@ pub(crate) mod stage_clock {
     // scope join 后、返回前的尾段（Vp8Yuv 构建 + planes 释放）墙钟（主线程）。
     #[cfg(feature = "stage_profile")]
     static P_END: AtomicU64 = AtomicU64::new(0);
+    // 串行分支整段墙钟（EmitScratch 构建 + 逐宏块行「熵→重建→滤波→直出」循环）：B 线拆账
+    // 「未分账其余」的串行 margin = serial_loop − Σ5 阶段（K101 统一基座）。
+    #[cfg(feature = "stage_profile")]
+    static P_SERIAL_LOOP: AtomicU64 = AtomicU64::new(0);
 
     // ---- 细分探针（2026-11-01，Task A/B：IDCT 内 i16 vs i4、熵内 bool/记账/去量化）----
     // IDCT 内部子段墙钟（t2 重建线程，跨线程原子累计，同 P_IDCT 姿势）。
@@ -503,6 +507,7 @@ pub(crate) mod stage_clock {
         P_SETUP.store(0, Relaxed);
         P_MID.store(0, Relaxed);
         P_END.store(0, Relaxed);
+        P_SERIAL_LOOP.store(0, Relaxed);
         P_IDCT_I16.store(0, Relaxed);
         P_IDCT_I4.store(0, Relaxed);
         P_IDCT_WHT.store(0, Relaxed);
@@ -525,9 +530,9 @@ pub(crate) mod stage_clock {
         P_ACCT.store(0, Relaxed);
         P_DQ.store(0, Relaxed);
     }
-    /// 读取一次解码各阶段累计 ns：(entropy, predict, idct, filter, yuv, header, copy, scope, setup, mid, end)。
+    /// 读取一次解码各阶段累计 ns：(entropy, predict, idct, filter, yuv, header, copy, scope, setup, mid, end, serial_loop)。
     #[cfg(feature = "stage_profile")]
-    pub fn profile_totals() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    pub fn profile_totals() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             P_ENTROPY.load(Relaxed),
             P_PREDICT.load(Relaxed),
@@ -540,6 +545,7 @@ pub(crate) mod stage_clock {
             P_SETUP.load(Relaxed),
             P_MID.load(Relaxed),
             P_END.load(Relaxed),
+            P_SERIAL_LOOP.load(Relaxed),
         )
     }
 
@@ -999,6 +1005,21 @@ pub(crate) mod stage_clock {
             f()
         }
     }
+    /// 串行分支整段墙钟（EmitScratch 构建 + 逐宏块行循环）：累计到 `P_SERIAL_LOOP`。
+    #[inline(always)]
+    pub fn serial_loop<R>(f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "stage_profile")]
+        {
+            let t = Instant::now();
+            let r = f();
+            P_SERIAL_LOOP.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            return r;
+        }
+        #[cfg(not(feature = "stage_profile"))]
+        {
+            f()
+        }
+    }
 }
 
 /// VP8 有损阶帧分账（`stage_profile` feature 下由 `stage_decode` 填充；供 imgbench
@@ -1031,6 +1052,8 @@ pub struct Vp8StageProfile {
     pub mid_ns: u64,
     /// scope join 后、返回前尾段（Vp8Yuv 构建）。
     pub end_ns: u64,
+    /// 串行分支整段墙钟（EmitScratch 构建 + 逐宏块行「熵→重建→滤波→直出」循环；feature 外恒 0）。
+    pub serial_loop_ns: u64,
     /// 全链墙钟（含帧头解析与平面拷贝）。
     pub total_ns: u64,
     /// 是否走了 P-B 滤波线程管线（true 时 filter/yuv 在独立线程累计）。

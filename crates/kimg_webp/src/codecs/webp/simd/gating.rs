@@ -276,6 +276,55 @@ fn flt_enabled() -> bool {
     })
 }
 
+/// `KIMG_WEBP_I4_SIMD`（默认开）：i4 段（4×4 B_PRED 子块预测 + IDCT＋add）专用运行时间控
+/// （K93 双路径）。`0`/`false`/`off` → 强制 i4 段走标量（`vp8` 的 `predict_subblock`/
+/// `inverse_dct_add`，字节恒等基线，供同窗 A/B 与安全回退）；其余/缺省 → 开（i4 仍随
+/// `part_simd_on("pred"/"dct")` 既有部件门控取舍，行为取向不变）。只影响 i4 子块段，
+/// 不动 i16/UV 逆变换与 16×16/8×8 大块预测。`#[cfg(test)]` 可经 `set_i4_simd_override`
+/// 进程内翻转（优先于 env，同 `set_idct_i16_override` 姿势）。
+#[inline]
+pub(crate) fn i4_simd_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = i4_simd_override::get() {
+        return v;
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("KIMG_WEBP_I4_SIMD").unwrap_or_default();
+        let t = v.trim();
+        !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+    })
+}
+
+/// `#[cfg(test)]` i4 段 SIMD 进程内覆盖（优先于 env；同窗 A/B 与字节恒等对拍用，
+/// 同 `idct_i16_override` 姿势）。
+#[cfg(test)]
+mod i4_simd_override {
+    use std::sync::atomic::{AtomicI8, Ordering::Relaxed};
+    static V: AtomicI8 = AtomicI8::new(-1);
+    pub fn set(v: Option<bool>) {
+        let val = match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        };
+        V.store(val, Relaxed);
+    }
+    pub fn get() -> Option<bool> {
+        match V.load(Relaxed) {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_i4_simd_override(v: Option<bool>) {
+    i4_simd_override::set(v);
+}
+
 
 /// 每 4×4 模式（2..=9）的 32 字节 shuffle 表：前 16 个索引取 `avg3` 向量、后 16 个取 `avg2`
 /// （255 = 该位不取，pshufb 对高位索引输出 0，OR 合并两种取源）。与 C# `SubblockShuffles` 逐字节同表。

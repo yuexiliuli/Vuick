@@ -12,7 +12,7 @@ pub fn stage_decode(frame: &[u8], width: u32, height: u32) -> Result<Vp8StagePro
     let yuv = decode_vp8(frame, width, height)?;
     let total_ns = t0.elapsed().as_nanos() as u64;
     std::hint::black_box(&yuv.rgba);
-    let (e, p, i, f, y, h, c, s, su, m, e2) = stage_clock::profile_totals();
+    let (e, p, i, f, y, h, c, s, su, m, e2, sl) = stage_clock::profile_totals();
     let sub = stage_clock::profile_sub();
     Ok(Vp8StageProfile {
         width,
@@ -28,6 +28,7 @@ pub fn stage_decode(frame: &[u8], width: u32, height: u32) -> Result<Vp8StagePro
         setup_ns: su,
         mid_ns: m,
         end_ns: e2,
+        serial_loop_ns: sl,
         total_ns,
         pipelined: filter_mt_enabled(
             (width as usize + 15) / 16,

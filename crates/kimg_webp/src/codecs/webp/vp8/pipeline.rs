@@ -195,8 +195,9 @@ pub(crate) fn reconstruct_macroblock(
             //   慢），且 `idct_add_one_sse2` 对仅 DC 块与标量捷径逐字节一致
             //   （`inverse_dct_has_ac_shortcut_equivalence`）；② 去 `let coeff = mb[block]` 全量
             //   16 系数拷贝（原实现 32B 栈拷 + 回读每块都付，零块也付），核直接借用 `&mb[block]`。
-            let pred_simd = super::simd::part_simd_on("pred", "ssse3");
-            let dct_simd = super::simd::part_simd_on("dct", "sse2");
+            let i4_simd = super::simd::i4_simd_enabled();
+            let pred_simd = i4_simd && super::simd::part_simd_on("pred", "ssse3");
+            let dct_simd = i4_simd && super::simd::part_simd_on("dct", "sse2");
             stage_clock::idct_i4(|| {
                 // 逐 4×4 子块重建。子块间串行依赖：块 (bx,by) 预测读左/上已重建像素、add 随后
                 // 覆写，predict→add 逐块次序不可重排（S7 同版约束）。外层按子块行 / 内层按列扫，
@@ -234,7 +235,10 @@ pub(crate) fn reconstruct_macroblock(
                                     super::simd::predict_subblock_forced(y, y_pitch, row0, col0, b_modes[block], &above)
                                 }
                             } else {
-                                super::simd::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
+                                // 标量：直调 vp8 标量核。注意不可再走 `simd::predict_subblock`——
+                                // 其内部按部件门控 `part_simd_on("pred","ssse3")` 判定，`KIMG_WEBP_I4_SIMD=0`
+                                // 只关 i4 时该门控仍为真会误入 SSSE3，破坏「i4 标量回退」语义。
+                                super::predict_subblock(y, y_pitch, row0, col0, b_modes[block], &above);
                             }
                         });
                         if ((nonzero_mask >> block) & 1) != 0 || mb[block][0] != 0 {
@@ -255,7 +259,10 @@ pub(crate) fn reconstruct_macroblock(
                                             super::simd::idct_add_one_forced(&mb[block], y, y_pitch, row0, col0)
                                         }
                                     } else {
-                                        super::simd::inverse_dct_add_one(&mb[block], y, y_pitch, row0, col0);
+                                        // 标量：直调 vp8 标量核（恒 has_ac=true）。不可走
+                                        // `simd::inverse_dct_add_one`——其内部按部件门控判定，
+                                        // `KIMG_WEBP_I4_SIMD=0` 只关 i4 时会误入 SSE2。
+                                        super::inverse_dct_add(&mb[block], y, y_pitch, row0, col0, true);
                                     }
                                 } else if dct_simd {
                                     // Safety：同 `has_ac` 分支——SSE2 核指令可用；纯 DC 分发由
@@ -264,9 +271,9 @@ pub(crate) fn reconstruct_macroblock(
                                         super::simd::dc_add_one_forced(mb[block][0], y, y_pitch, row0, col0)
                                     }
                                 } else {
-                                    // 标量回退：`inverse_dct_add_one` 恒 has_ac=true，对纯 DC 块与
+                                    // 标量回退：`super::inverse_dct_add` 恒 has_ac=true，对纯 DC 块与
                                     // DC 捷径逐字节一致（既有 `inverse_dct_has_ac_shortcut_equivalence`）。
-                                    super::simd::inverse_dct_add_one(&mb[block], y, y_pitch, row0, col0);
+                                    super::inverse_dct_add(&mb[block], y, y_pitch, row0, col0, true);
                                 }
                                 mb[block].fill(0);
                             });
@@ -329,11 +336,14 @@ pub(crate) fn decode_from_header(
 
     // L3 分配收敛：y/u/v 三平面合一缓冲（按首尾分段），堆分配 3 → 1。解码全程不 realloc，
     // 依赖其长度固定即指针稳定（与下方裸指针同前提）。字节恒等：合并仅改变分配粒度，
-    // 各段内容、写入次序与既有三 Vec 完全一致（全部字节仍在 129 左列初始化 + 重建覆盖内）。
+    // 各段内容、写入次序与既有三 Vec 完全一致。
+    // L3 死写削减：全量零化是死写——预测/IDCT 逐宏块整块写满数据区，滤波/发射只读已重建
+    // 行段；重建前仅「左 129 列」（`r*pitch+0`，供 `predict_large` H/TM 与 `predict_subblock`
+    // 左缘读）被预测读取，故只对该列确定性初始化，省全量 memset。无未初始化读（见下）。
     let y_vec_len = ch * y_pitch;
     let uv_vec_len = uh * uv_pitch;
     let (mut planes, mut rgba, mut out_y, mut out_u, mut out_v) = stage_clock::setup(|| {
-        let mut planes = vec![0u8; y_vec_len + 2 * uv_vec_len];
+        let mut planes = unsafe { uninit_vec_u8(y_vec_len + 2 * uv_vec_len) };
         {
             let (y, uv_rest) = planes.split_at_mut(y_vec_len);
             let (u, v) = uv_rest.split_at_mut(uv_vec_len);
@@ -537,6 +547,8 @@ pub(crate) fn decode_from_header(
         // 内按 skip 惰性零化建立「未写位恒 0」语义，重建用后按块 `fill(0)`，逐字节与旧
         // 「每宏块 `MbPacket::default()`」等价（硬闸 threads2/static_lossy 覆盖），且省去整帧
         // ~27MB 的 830B 内容无关零化（跳过宏块仅零化 16 个 DC 槽 32B）。
+        // 串行分支整段墙钟（B 线拆账：margin = serial_loop − Σ5 阶段；feature 外零开销）。
+        stage_clock::serial_loop(|| {
         let mut pkt = MbPacket::default();
         let mut scratch = EmitScratch::new(width);
         let mut emitted = 0usize;
@@ -605,6 +617,7 @@ pub(crate) fn decode_from_header(
                 );
             });
         }
+        });
     }
 
     // scope join 后、返回前尾段（Vp8Yuv 构建）：主线程墙钟全部归账，无隐藏盲区（K53）。
