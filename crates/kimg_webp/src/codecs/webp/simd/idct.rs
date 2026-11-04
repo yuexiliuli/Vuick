@@ -208,6 +208,37 @@ pub(crate) fn inverse_dct_add_two(
     super::vp8::inverse_dct_add(coeff_b, plane, pitch, row0, col0 + 4, true);
 }
 
+/// 预判定后的双块逆变换核直调：`part_simd_on("dct","sse2")` 已由调用方提升出 i16/UV 对循环
+/// （同 `idct_add_one_forced` 姿势，避免逐对特性判定 call）。**Safety**：调用方须保证 sse2
+/// 可用（如先判定返回 true），越界语义同 `inverse_dct_add_two` 的 SSE2 分支（`row0/col0`
+/// 落在平面内）。
+#[inline]
+pub(crate) unsafe fn inverse_dct_add_two_forced(
+    coeff_a: &[i16; 16],
+    coeff_b: &[i16; 16],
+    plane: &mut [u8],
+    pitch: usize,
+    row0: usize,
+    col0: usize,
+) {
+    // x86_64：内核使用 x86-only intrinsic，仅在该目标编译（SSE2 核指令可用性由调用方保证）。
+    #[cfg(target_arch = "x86_64")]
+    {
+        let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
+        unsafe {
+            idct_add_two_sse2(coeff_a.as_ptr(), coeff_b.as_ptr(), dst, pitch as isize);
+        }
+        return;
+    }
+    // 非 x86_64：x86 intrinsic 不存在，恒走标量全变换兜底（运行时不达：调用方
+    // `part_simd_on("dct","sse2")` 在非 x86_64 恒为 false）。
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        super::vp8::inverse_dct_add(coeff_a, plane, pitch, row0, col0, true);
+        super::vp8::inverse_dct_add(coeff_b, plane, pitch, row0, col0 + 4, true);
+    }
+}
+
 /// 单个 4×4 块的逆 DCT + 残差写回（i4x4 用，字节==既有标量）。
 /// `coeff` 为 [i16;16]。SIMD 走单块核 `idct_add_one_sse2`（与 i16 的 DCT 部件同门控
 /// `part_simd_on("dct","sse2")`）；标量回退恒 has_ac=true（对仅 DC 块与既有捷径逐字节一致，
@@ -286,6 +317,40 @@ pub(crate) fn dc_add_two(
     cb[0] = dc_b;
     super::vp8::inverse_dct_add(&ca, plane, pitch, row0, col0, true);
     super::vp8::inverse_dct_add(&cb, plane, pitch, row0, col0 + 4, true);
+}
+
+/// 预判定后的双块 DC 捷径核直调：`part_simd_on("dct","sse2")` 已由调用方提升出 i16/UV 对循环
+/// （同 `dc_add_one_forced` 姿势）。**Safety**：调用方须保证 sse2 可用，且该对块确为纯 DC
+/// （调用方按 `ac_mask` 双块位 0 分发）；越界语义同 `dc_add_two`（`row0/col0` 落在平面内）。
+#[inline]
+pub(crate) unsafe fn dc_add_two_forced(
+    dc_a: i16,
+    dc_b: i16,
+    plane: &mut [u8],
+    pitch: usize,
+    row0: usize,
+    col0: usize,
+) {
+    // x86_64：内核使用 x86-only intrinsic，仅在该目标编译（SSE2 核指令可用性由调用方保证）。
+    #[cfg(target_arch = "x86_64")]
+    {
+        let dst = unsafe { plane.as_mut_ptr().add(row0 * pitch + 1 + col0) };
+        unsafe {
+            dc_add_two_sse2(dc_a, dc_b, dst, pitch as isize);
+        }
+        return;
+    }
+    // 非 x86_64：x86 intrinsic 不存在，恒走标量全变换兜底（运行时不达：调用方
+    // `part_simd_on("dct","sse2")` 在非 x86_64 恒为 false）。
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut ca = [0i16; 16];
+        let mut cb = [0i16; 16];
+        ca[0] = dc_a;
+        cb[0] = dc_b;
+        super::vp8::inverse_dct_add(&ca, plane, pitch, row0, col0, true);
+        super::vp8::inverse_dct_add(&cb, plane, pitch, row0, col0 + 4, true);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

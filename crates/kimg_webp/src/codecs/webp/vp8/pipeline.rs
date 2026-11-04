@@ -160,6 +160,12 @@ pub(crate) fn reconstruct_macroblock(
         }
 
         if is_i16 {
+            // DCT SIMD 判定提升出 i16 对循环（补齐与 i4 段 pipeline.rs `dct_simd` 的不对称）：
+            // `part_simd_on` 含 CPU 特性探测与多个 OnceLock，逐对调用在汇编上是真函数 call
+            // （热路径每宏块 8 对各付一次 ≈15-25ns/调）；判定在整帧解码内恒定（env/特性探测
+            // 只跑一次），本宏块开头取一次，循环内改调 `_forced` 变体。`KIMG_WEBP_NO_SIMD_DCT=1`
+            // / `KIMG_WEBP_NO_SIMD=1` / 非 x86_64 被判为假时走标量回退，关闭途径保留。
+            let dct_simd = super::simd::part_simd_on("dct", "sse2");
             stage_clock::idct_i16(|| {
                 for by in 0..4 {
                     let row0 = dy + by * 4;
@@ -171,14 +177,45 @@ pub(crate) fn reconstruct_macroblock(
                             || ((nonzero_mask >> b) & 1) != 0
                             || mb[b][0] != 0
                         {
-                            if (((ac_mask >> a) | (ac_mask >> b)) & 1) != 0 {
-                                super::simd::inverse_dct_add_two(
-                                    &mb[a], &mb[b], y, y_pitch, row0, dx + pair_base * 4,
-                                );
+                            if dct_simd {
+                                if (((ac_mask >> a) | (ac_mask >> b)) & 1) != 0 {
+                                    // Safety：`dct_simd` 已在循环外判定 `part_simd_on("dct","sse2")`
+                                    // 为真且本对块内恒定，SSE2 核指令可用。
+                                    unsafe {
+                                        super::simd::inverse_dct_add_two_forced(
+                                            &mb[a], &mb[b], y, y_pitch, row0, dx + pair_base * 4,
+                                        )
+                                    }
+                                } else {
+                                    // Safety：同 AC 分支——SSE2 核可用；纯 DC 分发由 `ac_mask`
+                                    // 双块位 0 保证（非 DC 系数全 0），捷径输出与全 IDCT 恒等。
+                                    unsafe {
+                                        super::simd::dc_add_two_forced(
+                                            mb[a][0], mb[b][0], y, y_pitch, row0, dx + pair_base * 4,
+                                        )
+                                    }
+                                }
                             } else {
-                                super::simd::dc_add_two(
-                                    mb[a][0], mb[b][0], y, y_pitch, row0, dx + pair_base * 4,
-                                );
+                                // 标量：直调 vp8 标量核（恒 has_ac=true，对纯 DC 块与 DC 捷径逐字节
+                                // 一致，既有 `inverse_dct_has_ac_shortcut_equivalence`）。不可再走
+                                // `simd::inverse_dct_add_two`/`dc_add_two`——其内部会重判门控，本分支
+                                // 已被 `dct_simd` 判为假（如 `KIMG_WEBP_NO_SIMD_DCT=1`），须保留关闭途径
+                                // 的标量语义。
+                                if (((ac_mask >> a) | (ac_mask >> b)) & 1) != 0 {
+                                    super::inverse_dct_add(
+                                        &mb[a], y, y_pitch, row0, dx + pair_base * 4, true,
+                                    );
+                                    super::inverse_dct_add(
+                                        &mb[b], y, y_pitch, row0, dx + pair_base * 4 + 4, true,
+                                    );
+                                } else {
+                                    let mut ca = [0i16; 16];
+                                    let mut cb = [0i16; 16];
+                                    ca[0] = mb[a][0];
+                                    cb[0] = mb[b][0];
+                                    super::inverse_dct_add(&ca, y, y_pitch, row0, dx + pair_base * 4, true);
+                                    super::inverse_dct_add(&cb, y, y_pitch, row0, dx + pair_base * 4 + 4, true);
+                                }
                             }
                             mb[a].fill(0);
                             mb[b].fill(0);
@@ -286,6 +323,10 @@ pub(crate) fn reconstruct_macroblock(
 
         stage_clock::idct_uv(|| {
             if (nonzero_mask & 0xff0000) != 0 {
+                // DCT SIMD 判定提升出 UV 对循环（同 i16 段 `dct_simd` 姿势）：每宏块 4 对，
+                // 循环外判定一次，循环内改调 `_forced` 变体；关闭途径（`KIMG_WEBP_NO_SIMD_DCT=1`
+                // / `KIMG_WEBP_NO_SIMD=1` / 非 x86_64）走标量回退保留。
+                let dct_simd = super::simd::part_simd_on("dct", "sse2");
                 for a in [16usize, 18, 20, 22] {
                     let b = a + 1;
                     let row0 = dyu + ((a >> 1) & 1) * 4;
@@ -295,16 +336,38 @@ pub(crate) fn reconstruct_macroblock(
                         continue;
                     }
                     let has_ac = ((ac_mask >> a) | (ac_mask >> b)) & 1 != 0;
-                    if a < 20 {
+                    let (plane, col0) = if a < 20 {
+                        (&mut *u, dxu)
+                    } else {
+                        (&mut *v, dxu)
+                    };
+                    if dct_simd {
+                        // Safety：`dct_simd` 已在循环外判定 `part_simd_on("dct","sse2")` 为真且
+                        // 本对块内恒定，SSE2 核可用；纯 DC 分发由 `ac_mask` 双块位 0 保证。
                         if has_ac {
-                            super::simd::inverse_dct_add_two(&mb[a], &mb[b], u, uv_pitch, row0, dxu);
+                            unsafe {
+                                super::simd::inverse_dct_add_two_forced(
+                                    &mb[a], &mb[b], plane, uv_pitch, row0, col0,
+                                )
+                            }
                         } else {
-                            super::simd::dc_add_two(mb[a][0], mb[b][0], u, uv_pitch, row0, dxu);
+                            unsafe {
+                                super::simd::dc_add_two_forced(
+                                    mb[a][0], mb[b][0], plane, uv_pitch, row0, col0,
+                                )
+                            }
                         }
                     } else if has_ac {
-                        super::simd::inverse_dct_add_two(&mb[a], &mb[b], v, uv_pitch, row0, dxu);
+                        // 标量：直调 vp8 标量核（同 i16 段 `dct_simd==false` 分支，保留关闭途径）。
+                        super::inverse_dct_add(&mb[a], plane, uv_pitch, row0, col0, true);
+                        super::inverse_dct_add(&mb[b], plane, uv_pitch, row0, col0 + 4, true);
                     } else {
-                        super::simd::dc_add_two(mb[a][0], mb[b][0], v, uv_pitch, row0, dxu);
+                        let mut ca = [0i16; 16];
+                        let mut cb = [0i16; 16];
+                        ca[0] = mb[a][0];
+                        cb[0] = mb[b][0];
+                        super::inverse_dct_add(&ca, plane, uv_pitch, row0, col0, true);
+                        super::inverse_dct_add(&cb, plane, uv_pitch, row0, col0 + 4, true);
                     }
                     mb[a].fill(0);
                     mb[b].fill(0);
