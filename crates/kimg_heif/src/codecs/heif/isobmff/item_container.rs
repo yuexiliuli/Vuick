@@ -158,7 +158,8 @@ impl<'a> ItemContainer<'a> {
 
     /// item 全部 extent 的总字节数。
     pub fn get_item_length(item: &Item) -> i64 {
-        item.extents.iter().map(|e| e.length).sum()
+        // wrapping：与 C# unchecked 相加回绕一致（extent 长度是攻击者可控制的字段）
+        item.extents.iter().fold(0i64, |a, e| a.wrapping_add(e.length))
     }
 
     /// 把单个 extent 解析为 `data` 的切片，应用构造方法：

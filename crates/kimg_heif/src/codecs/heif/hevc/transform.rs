@@ -91,8 +91,10 @@ impl Scaler {
         if !(2..=5).contains(&log2_size) || !(8..=16).contains(&bit_depth) {
             return Err(HeifError::invalid("变换尺寸或位深越界。"));
         }
-        if !(0..=51).contains(&qp) {
-            return Err(HeifError::invalid("QP 越界（0..51）。"));
+        // C# 无上界检查（10-bit/12-bit 高 QP 时 QP′=QpY+6·(bd−8) 可达 63，合法流）；
+        // 仅防负 QP（C# 对负 qp 会数组越界），与 C# LevelScale[qp%6] 语义一致。
+        if qp < 0 {
+            return Err(HeifError::invalid("QP 为负。"));
         }
         let bd_shift = bit_depth + log2_size - 5;
         let scale = (LEVEL_SCALE[(qp % 6) as usize] as i64) << (qp / 6);

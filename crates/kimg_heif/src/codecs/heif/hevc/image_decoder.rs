@@ -22,6 +22,17 @@ pub fn decode_item(
     config: &HevcDecoderConfiguration,
     payload: &[u8],
 ) -> HeifResult<HevcPicture> {
+    decode_item_flags(config, payload, false, false)
+}
+
+/// 与 [`decode_item`] 相同，但可消融 in-loop 滤波（oracle `_nofilter` 对照）。
+/// `skip_deblock`/`skip_sao` 为真时跳过对应环节，输出 = C# `-deblock -sao` 消融。
+pub fn decode_item_flags(
+    config: &HevcDecoderConfiguration,
+    payload: &[u8],
+    skip_deblock: bool,
+    skip_sao: bool,
+) -> HeifResult<HevcPicture> {
     let mut sps: Option<HevcSps> = None;
     let mut pps: Option<HevcPps> = None;
     let mut slices: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -113,5 +124,6 @@ pub fn decode_item(
     }
 
     let mut decoder = HevcFrameDecoder::new(sps, pps, false, false)?;
+    decoder.set_skip_filters(skip_deblock, skip_sao);
     decoder.decode(slices)
 }

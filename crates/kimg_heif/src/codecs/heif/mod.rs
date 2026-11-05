@@ -74,8 +74,8 @@ pub fn decode_yuv(data: &[u8]) -> HeifResult<YuvPlanes> {
     ))
 }
 
-/// 解码一张**单 tile** HEIC 图画为 4:2:0 YUV 平面（in-loop 滤波前的帧内重建；Phase-3 未接）。
-/// grid 图像（多 tile）不支持，返回错误。供单 tile oracle 对照与新解码脸调试使用。
+/// 解码一张**单 tile** HEIC 图画为 4:2:0 YUV 平面（含 in-loop 滤波后的重建平面）。
+/// grid 图像（多 tile）不支持，返回错误。供单 tile oracle 对照与新解码调试使用。
 pub fn decode_yuv_bytes(data: &[u8]) -> HeifResult<YuvPlanes> {
     let container = container::HeifContainer::parse(data)?;
     if container.tiles.len() != 1 {
@@ -85,6 +85,10 @@ pub fn decode_yuv_bytes(data: &[u8]) -> HeifResult<YuvPlanes> {
     let items = &container.items;
     let item = &items.items[container.tiles[0]];
     let length = isobmff::item_container::ItemContainer::get_item_length(item);
+    // 先校验 payload 不超出文件再分配（镜像 C# Tiles.Extract 的 `length > data.Length` 拒绝）
+    if length < 0 || length > data.len() as i64 {
+        return Err(HeifError::invalid("图像 item 大于文件。"));
+    }
     let mut payload = vec![0u8; length as usize];
     items.resolve(item, &mut payload)?;
     let pic = hevc::decode_item(&config, &payload)?;

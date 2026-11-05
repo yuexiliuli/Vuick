@@ -6,9 +6,9 @@
 //! 亮度帧内模式、QpY、transquant-bypass CU 的 noLoopFilter 标志以及去块边强度。tile 与 PCM
 //! 不支持，构造器直接拒绝。
 //!
-//! **Phase-3 未接**：`filter_picture` 只留占位（C# `HevcLoopFilter.cs` 的 `Deblock()`/`Sao()`，
-//! 待后续 `loop_filter`/`sao` 模块按 partial class 接入）。本阶段输出 = 无 in-loop 滤波的帧内重建，
-//! 与 oracle `_t0_nofilter.yuv` 逐字节一致。
+//! **Phase-3 已接**：`filter_picture` 经 `loop_filter` 模块跑 C# `HevcLoopFilter.cs` 的
+//! `Deblock()`/`ApplySao()`（§8.7）。本阶段输出 = 带 in-loop 滤波的帧内重建，
+//! 与 oracle `_t0.yuv` 逐字节一致；`set_skip_filters` 消融 = `_t0_nofilter.yuv`。
 //!
 //! 字节恒等纪律：`<<`/`>>` 越位宽按 C# 的 mod-位数语义用 `wrapping_shl/shr` 或显式分支保恒等；
 //! `unchecked`/`%` 算术按 C# 语义对齐（C# `%` 对非负操作数与 Rust `%` 一致，参数恒非负处直接用 `%`）；
@@ -112,24 +112,29 @@ impl SaoParams {
 /// `decode` 期间 CABAC 引擎借用当前切片的去转义 RBSP（`HevcCabac` 带生命周期），由 `decode` 循环
 /// 以 `&mut HevcCabac` 传入各语法方法；当前切片头与 CU 状态存于此结构体字段。
 pub struct HevcFrameDecoder {
-    sps: HevcSps,
-    pps: HevcPps,
-    picture: HevcPicture,
+    pub(crate) sps: HevcSps,
+    pub(crate) pps: HevcPps,
+    pub(crate) picture: HevcPicture,
 
-    w4: i32,
+    pub(crate) w4: i32,
     ct_depth: Vec<u8>,
     intra_mode: Vec<u8>,
-    qp_y: Vec<i8>,
-    no_filter: Vec<u8>,
+    pub(crate) qp_y: Vec<i8>,
+    pub(crate) no_filter: Vec<u8>,
     // 每个已重建 4×4 亮度块的 SliceAddrRs，-1 表示尚未解码（帧内参考可用性）。
     decoded: Vec<i32>,
-    // bS：每个 4×4 块左缘 / 上缘的变换边强度（Phase-3 去块用）。
-    edge_ver: Vec<u8>,
-    edge_hor: Vec<u8>,
+    // bS：每个 4×4 块左缘 / 上缘的变换边强度（去块用）。
+    pub(crate) edge_ver: Vec<u8>,
+    pub(crate) edge_hor: Vec<u8>,
     // 每个 CTB 所属切片的 SliceAddrRs，-1 表示未解码。
-    ctb_slice_addr: Vec<i32>,
-    // SAO 参数（Phase-3 用；语法已在 ParseSao 全量读走）。
-    sao: Vec<SaoParams>,
+    pub(crate) ctb_slice_addr: Vec<i32>,
+    // 每个 CTB 所属切片头（C# `_ctbSlice`）：去块 β/tC 偏移与 SAO 标志按 CTB 查。
+    pub(crate) ctb_slice: Vec<HevcSliceHeader>,
+    // SAO 参数（语法已在 ParseSao 全量读走）。
+    pub(crate) sao: Vec<SaoParams>,
+    // 滤波消融（oracle `_nofilter` 对照）：真 = 跳过对应环节。
+    skip_deblock: bool,
+    skip_sao: bool,
     // CTB 内最小编码变换块的 morton 序（§6.5.2）。
     zscan: Vec<i32>,
     zscan_shift: i32,
@@ -237,7 +242,10 @@ impl HevcFrameDecoder {
             edge_ver: vec![0u8; blocks],
             edge_hor: vec![0u8; blocks],
             ctb_slice_addr: vec![-1i32; ctbs],
+            ctb_slice: vec![HevcSliceHeader::default(); ctbs],
             sao: vec![SaoParams::default(); ctbs],
+            skip_deblock: false,
+            skip_sao: false,
             zscan,
             zscan_shift,
             qp_bd_offset_y,
@@ -300,18 +308,29 @@ impl HevcFrameDecoder {
         {
             return Err(HeifError::invalid("图画的切片没有覆盖每个 CTB。"));
         }
-        self.filter_picture();
+        self.filter_picture()?;
         let mut dummy = HevcPicture::new(0, 0, 0, 0, 0);
         std::mem::swap(&mut self.picture, &mut dummy);
         Ok(dummy)
     }
 
-    /// 全图 in-loop 滤波：先去块，再 SAO（§8.7）。**Phase-3 todo**：C# `HevcLoopFilter.cs` 的
-    /// `Deblock()`/`Sao()` 尚未移植；`_nofilter` oracle 与当前输出一致。
-    #[allow(clippy::let_and_return)]
-    fn filter_picture(&mut self) {
-        // Phase-3：`if !SkipDeblock { Deblock() }`、`if !SkipSao { ApplySao() }`。
-        let _ = (&self.sao.len(), &self.edge_ver.len(), &self.edge_hor.len(), &self.ct_depth.len());
+    /// 全图 in-loop 滤波：先去块，再 SAO（§8.7）。移植自 C# `HevcLoopFilter.cs` 的
+    /// `Deblock()`/`ApplySao()`（`skip_*` 供 oracle `_nofilter` 消融对照）。
+    fn filter_picture(&mut self) -> HeifResult<()> {
+        if !self.skip_deblock {
+            self.deblock()?;
+        }
+        if !self.skip_sao {
+            self.apply_sao()?;
+        }
+        Ok(())
+    }
+
+    /// 查询/开启滤波消融（测试用）：`skip_all = true` 时去块与 SAO 都跳过，
+    /// 输出 = `_t0_nofilter.yuv` 的 C# `-deblock -sao` 消融。
+    pub fn set_skip_filters(&mut self, skip_deblock: bool, skip_sao: bool) {
+        self.skip_deblock = skip_deblock;
+        self.skip_sao = skip_sao;
     }
 
     // ───────────────────────────── 切片数据（7.3.8.1） ─────────────────────────────
@@ -355,6 +374,7 @@ impl HevcFrameDecoder {
             first = false;
 
             self.ctb_slice_addr[self.ctb_addr_rs as usize] = header.slice_addr_rs;
+            self.ctb_slice[self.ctb_addr_rs as usize] = header.clone();
             self.coding_tree_unit(cabac, ctb_x, ctb_y)?;
             count += 1;
 
@@ -992,12 +1012,15 @@ impl HevcFrameDecoder {
         }
         let x_end = (x0 + size).min(self.sps.width);
         let y_end = (y0 + size).min(self.sps.height);
+        // 竖直边：该 TB 左缘自 y0 起每 4 行一块（Block(x0, y) 逐行跳 w4），C# 逐 y 重算下标。
         if (x0 & 7) == 0 && x0 > 0 && self.edge_allowed(x0 - 1, y0) {
-            let b = self.block(x0, y0);
-            let n_blocks = ((y_end - y0) >> 2) as usize;
-            let end = (b + n_blocks).min(self.edge_ver.len());
-            for i in b..end {
-                self.edge_ver[i] = 2;
+            let mut y = y0;
+            while y < y_end {
+                let b = self.block(x0, y);
+                if b < self.edge_ver.len() {
+                    self.edge_ver[b] = 2;
+                }
+                y += 4;
             }
         }
         if (y0 & 7) == 0 && y0 > 0 && self.edge_allowed(x0, y0 - 1) {
@@ -1228,8 +1251,8 @@ impl HevcFrameDecoder {
         Self::chroma_qp_table(q_pi) + self.qp_bd_offset_c
     }
 
-    /// 表 8-10（ChromaArrayType 1）。
-    fn chroma_qp_table(q_pi: i32) -> i32 {
+    /// 表 8-10（ChromaArrayType 1）。`pub(crate)`：`loop_filter` 模块去块色度边复用。
+    pub(crate) fn chroma_qp_table(q_pi: i32) -> i32 {
         const TABLE: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
         if q_pi < 30 {
             return q_pi;

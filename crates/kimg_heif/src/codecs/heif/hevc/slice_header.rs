@@ -4,7 +4,7 @@ use crate::codecs::heif::error::{HeifError, HeifResult};
 use crate::codecs::heif::hevc::bit_reader::HevcBitReader;
 use crate::codecs::heif::hevc::parameter_sets::{HevcPps, HevcSps};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HevcSliceHeader {
     pub first_slice_segment_in_pic: bool,
     pub dependent_slice_segment: bool,
