@@ -19,6 +19,7 @@ pub mod transform;
 pub use bit_reader::HevcBitReader;
 pub use nal::Nal;
 pub use hvcc::HevcDecoderConfiguration;
+pub use image_decoder::decode_item;
 pub use parameter_sets::{HevcPps, HevcScan, HevcScalingList, HevcSps};
 pub use picture::HevcPicture;
 pub use slice_header::HevcSliceHeader;

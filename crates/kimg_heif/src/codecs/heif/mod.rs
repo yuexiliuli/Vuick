@@ -74,6 +74,30 @@ pub fn decode_yuv(data: &[u8]) -> HeifResult<YuvPlanes> {
     ))
 }
 
+/// 解码一张**单 tile** HEIC 图画为 4:2:0 YUV 平面（in-loop 滤波前的帧内重建；Phase-3 未接）。
+/// grid 图像（多 tile）不支持，返回错误。供单 tile oracle 对照与新解码脸调试使用。
+pub fn decode_yuv_bytes(data: &[u8]) -> HeifResult<YuvPlanes> {
+    let container = container::HeifContainer::parse(data)?;
+    if container.tiles.len() != 1 {
+        return Err(HeifError::invalid("decode_yuv_bytes 只支持单 tile 图像。"));
+    }
+    let config = container.tile_configs[0].clone();
+    let items = &container.items;
+    let item = &items.items[container.tiles[0]];
+    let length = isobmff::item_container::ItemContainer::get_item_length(item);
+    let mut payload = vec![0u8; length as usize];
+    items.resolve(item, &mut payload)?;
+    let pic = hevc::decode_item(&config, &payload)?;
+    Ok(YuvPlanes {
+        y: pic.planes[0].clone(),
+        cb: pic.planes[1].clone(),
+        cr: pic.planes[2].clone(),
+        width: pic.width,
+        height: pic.height,
+        bit_depth: pic.bit_depth_y,
+    })
+}
+
 /// 解码显示朝向的 RGBA。**Phase-1 桩**：返回 `NotImplemented`。
 pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)> {
     let _ = (data, destination);
