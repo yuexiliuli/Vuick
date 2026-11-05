@@ -8,6 +8,7 @@
 //! 范围：仅 baseline 顺序 JPEG（含灰度/4:4:4/4:2:0/restart marker/非交织多 SOS）。
 //! progressive（SOF2）/算术编码/lossless/hierarchical/12-bit → 返回 `Unsupported`。
 
+mod avx2;
 mod bitstream;
 mod color;
 mod error;

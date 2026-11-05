@@ -398,10 +398,10 @@ fn convert_16(
 ) {
     match output_colorspace {
         ColorSpace::RGB => {
-            ycbcr_to_rgb_inner_16_scalar::<false>(y, cb, cr, out, &mut 0);
+            crate::codecs::jpeg2::avx2::ycbcr_to_rgb_16(y, cb, cr, out, &mut 0);
         }
         ColorSpace::RGBA => {
-            ycbcr_to_rgba_inner_16_scalar::<false>(y, cb, cr, out, &mut 0);
+            crate::codecs::jpeg2::avx2::ycbcr_to_rgba_16(y, cb, cr, out, &mut 0);
         }
         _ => unreachable!("只支持 RGB/RGBA 输出的 YCbCr 换算"),
     }

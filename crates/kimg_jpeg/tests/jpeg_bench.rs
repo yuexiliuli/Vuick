@@ -18,7 +18,8 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use kimg_jpeg::JpegDecoder;
+use kimg_jpeg::JpegDecoder as OldJpeg;
+use kimg_jpeg::codecs::jpeg2::JpegDecoder as NewJpeg;
 use kimg_core::ImageDecoder as _;
 
 // ---------------------------------------------------------------------------
@@ -51,10 +52,10 @@ fn collect_jpegs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// 读文件并取得输出缓冲尺寸。
+/// 读文件并取得输出缓冲尺寸。返回 (name, bytes, old 路径输出字节数)。
 fn load(path: &Path) -> Option<(String, Vec<u8>, usize)> {
     let bytes = std::fs::read(path).ok()?;
-    let dec = JpegDecoder::new(Cursor::new(&bytes)).ok()?;
+    let dec = OldJpeg::new(Cursor::new(&bytes)).ok()?;
     let n = dec.total_bytes() as usize;
     Some((path.file_name()?.to_string_lossy().into_owned(), bytes, n))
 }
@@ -64,18 +65,21 @@ fn load(path: &Path) -> Option<(String, Vec<u8>, usize)> {
 // ---------------------------------------------------------------------------
 
 fn old_decode(bytes: &[u8], out: &mut [u8]) -> Result<(), String> {
-    JpegDecoder::new(Cursor::new(bytes))
+    OldJpeg::new(Cursor::new(bytes))
         .map_err(|e| e.to_string())?
         .read_image(out)
         .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
-// 新路径（自研引擎就位后接入；未就位时落旧路径占位）
+// 新路径（jpeg2 自研引擎）
 // ---------------------------------------------------------------------------
 
 fn new_decode(bytes: &[u8], out: &mut [u8]) -> Result<(), String> {
-    old_decode(bytes, out)
+    NewJpeg::new(Cursor::new(bytes))
+        .map_err(|e| e.to_string())?
+        .read_image(out)
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
