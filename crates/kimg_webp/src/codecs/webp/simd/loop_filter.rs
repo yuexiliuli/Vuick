@@ -646,8 +646,10 @@ unsafe fn lf_simple2(a: __m128i, p0: __m128i, q0: __m128i) -> (__m128i, __m128i)
 
 /// Load8x4：读 8 行 × 4 列（围绕竖直边），返回 (col0 的 8 行 + col1 的 8 行) 与 (col2+col3)。
 /// 端口 libwebp `Load8x4_SSE2`（WebPMemToInt32 等价 read_unaligned<i32>）。
+/// dormancy：已被 `lf_edge_v16` 的全向量 `load16x8` 取代（K24），保留供对照/回退。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn lf_load8x4(b: *const u8, stride: isize) -> (__m128i, __m128i) {
     use std::arch::x86_64::*;
     let r = |i: isize| -> i32 {
@@ -670,8 +672,10 @@ unsafe fn lf_load8x4(b: *const u8, stride: isize) -> (__m128i, __m128i) {
 
 /// Load16x4：读 16 行 × 4 列（竖直边 p1/p0/q0/q1 四列），返回四列各 16 字节 lane。
 /// 端口 libwebp `Load16x4_SSE2`。
+/// dormancy：已被 `lf_edge_v16` 的全向量 `load16x8` 取代（K24），保留供对照/回退。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn lf_load16x4(b: *const u8, stride: isize) -> (__m128i, __m128i, __m128i, __m128i) {
     use std::arch::x86_64::*;
     // r0=行0..7 的四列，r8=行8..15。
@@ -688,8 +692,10 @@ unsafe fn lf_load16x4(b: *const u8, stride: isize) -> (__m128i, __m128i, __m128i
 }
 
 /// Store4x4：把 4 个 lane 写回 4 行 × 4 列（每行一个 i32）。
+/// dormancy：已被 `lf_edge_v16` 的全向量 `store16x8` 取代（K24），保留供对照/回退。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn lf_store4x4(x: &mut __m128i, dst: *mut u8, stride: isize) {
     use std::arch::x86_64::*;
     for i in 0..4isize {
@@ -701,8 +707,10 @@ unsafe fn lf_store4x4(x: &mut __m128i, dst: *mut u8, stride: isize) {
 
 /// Store16x4：4 个列向量（c0..c3 = col0..col3，各 16 行字节）写回 16 行。端口 libwebp `Store16x4_SSE2`。
 /// 注意 unpack 顺序与 C 一致：先 (col0,col1) 与 (col2,col3) 按字节交错，再按 i16 交错还原 4×4。
+/// dormancy：已被 `lf_edge_v16` 的全向量 `store16x8` 取代（K24），保留供对照/回退。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn lf_store16x4(
     c0: &mut __m128i, c1: &mut __m128i, c2: &mut __m128i, c3: &mut __m128i,
     r0: *mut u8, r8: *mut u8, stride: isize,
@@ -831,7 +839,12 @@ pub(crate) unsafe fn lf_max_diff(p3: __m128i, p2: __m128i, p1: __m128i, p0: __m1
     m
 }
 
-/// 竖直边（our vertical=true）16-wide。`pt` 指向 (行 y, 帧列 x-4)（p3 列；simple 时自动 +2 至 p1）。
+/// 竖直边（our vertical=true）16-wide。`pt` 指向 (行 y, 帧列 x-4)（p3 列；simple 只更新 p0/q0）。
+/// 全向量 16×8 转置梯（`load16x8`/`store16x8`，同 chroma `lf_edge_v8_pair` 姿势）：一次装载
+/// pt..pt+7 全部 8 列（p3..q3）、滤波后一次写回——替换旧 `lf_load16x4`/`lf_store16x4`（其内部
+/// `lf_load8x4`/`lf_store4x4` 是逐行标量 i32 存取，每 MB 4 条竖边 = 64 标量 load + 64 store）。
+/// 列向量布局与旧路径逐元素一致（c[j] 低 8 字节 = 行 0..7、高 8 = 行 8..15），且 `store16x8`
+/// 是 `load16x8` 的精确逆 → 同一值集合、同一写址 → 输出逐位不变。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 #[allow(clippy::too_many_arguments)]
@@ -839,36 +852,37 @@ pub(crate) unsafe fn lf_edge_v16(
     pt: *mut u8, stride: isize,
     interior: i32, edge: i32, hev: i32, macroblock_edge: bool, simple: bool,
 ) {
+    let mut c = load16x8(pt, stride, pt.offset(8 * stride), stride);
     if simple {
-        let bp = pt.offset(2);
-        let (p1, p0, q0, q1) = lf_load16x4(bp, stride);
-        let (p0n, q0n) = lf_do_filter2(p1, p0, q0, q1, edge);
-        let (mut a0, mut a1, mut a2, mut a3) = (p1, p0n, q0n, q1);
-        lf_store16x4(&mut a0, &mut a1, &mut a2, &mut a3, bp, bp.offset(8 * stride), stride);
+        let (p0n, q0n) = lf_do_filter2(c[2], c[3], c[4], c[5], edge);
+        c[3] = p0n;
+        c[4] = q0n;
+        store16x8(pt, stride, pt.offset(8 * stride), stride, c);
         return;
     }
-    let (p3, p2, p1, p0) = lf_load16x4(pt, stride);
-    let (q0, q1, q2, q3) = lf_load16x4(pt.offset(4), stride);
-    let mx = lf_max_diff(p3, p2, p1, p0, q0, q1, q2, q3);
-    let mask = lf_mask_composite(lf_needs_filter(_mm_set1_epi8(-1), p1, p0, q0, q1, edge), mx, interior);
+    let mx = lf_max_diff(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+    let mask = lf_mask_composite(lf_needs_filter(_mm_set1_epi8(-1), c[2], c[3], c[4], c[5], edge), mx, interior);
     // 全零 mask：任何 lane 都无需改（do_filter4/6 的 delta 逐 lane 被 mask 清零 → 输出==输入），
-    // 跳过重排+store，字节恒等平凡成立。
+    // 跳过 store（c 原值不变则存回既存既等），字节恒等平凡成立。movemask 早退保留（66fcbc9）。
     if _mm_movemask_epi8(mask) == 0 {
         return;
     }
     if macroblock_edge {
-        let (p2n, p1n, p0n, q0n, q1n, q2n) = lf_do_filter6(p2, p1, p0, q0, q1, q2, mask, hev);
-        let (mut a0, mut a1, mut a2, mut a3) = (p3, p2n, p1n, p0n);
-        let (mut b0, mut b1, mut b2, mut b3) = (q0n, q1n, q2n, q3);
-        lf_store16x4(&mut a0, &mut a1, &mut a2, &mut a3, pt, pt.offset(8 * stride), stride);
-        lf_store16x4(&mut b0, &mut b1, &mut b2, &mut b3, pt.offset(4), pt.offset(4 + 8 * stride), stride);
+        let (p2n, p1n, p0n, q0n, q1n, q2n) = lf_do_filter6(c[1], c[2], c[3], c[4], c[5], c[6], mask, hev);
+        c[1] = p2n;
+        c[2] = p1n;
+        c[3] = p0n;
+        c[4] = q0n;
+        c[5] = q1n;
+        c[6] = q2n;
     } else {
-        let (p1n, p0n, q0n, q1n) = lf_do_filter4(p1, p0, q0, q1, mask, hev);
-        let (mut a0, mut a1, mut a2, mut a3) = (p3, p2, p1n, p0n);
-        let (mut b0, mut b1, mut b2, mut b3) = (q0n, q1n, q2, q3);
-        lf_store16x4(&mut a0, &mut a1, &mut a2, &mut a3, pt, pt.offset(8 * stride), stride);
-        lf_store16x4(&mut b0, &mut b1, &mut b2, &mut b3, pt.offset(4), pt.offset(4 + 8 * stride), stride);
+        let (p1n, p0n, q0n, q1n) = lf_do_filter4(c[2], c[3], c[4], c[5], mask, hev);
+        c[2] = p1n;
+        c[3] = p0n;
+        c[4] = q0n;
+        c[5] = q1n;
     }
+    store16x8(pt, stride, pt.offset(8 * stride), stride, c);
 }
 
 /// 水平边（our vertical=false）16/8-wide。`pt` 指向 (行 y, 帧列 x)（q0 行首）；n=16/8。
