@@ -2,6 +2,7 @@
 //! `decoder.rs::decode_headers_internal` 的解析语义）。
 
 use core::cmp::max;
+use std::time::Instant;
 
 use crate::codecs::jpeg::error::DecodeError;
 use crate::codecs::jpeg::huffman::HuffmanTable;
@@ -12,8 +13,19 @@ pub(crate) const MAX_COMPONENTS: usize = 4;
 pub(crate) const DCT_BLOCK: usize = 64;
 
 /// 阶段计时探针：`KIMG_JPEG_STAGE_PROFILE=1` 时在热路径累加各阶段耗时。
-/// 默认关闭：`timer()`/`stop()` 只做一次可预测分支，`Instant::now()` 仅启用时构造，
-/// 探针关闭为零开销（不读 env、不构造 Instant）。env 判定进程级缓存，热环不重复读。
+///
+/// 两种时钟（本机单 vCPU VMware 实测，2026-11-05）：
+/// - **墙钟**（`Instant::now()`）：绝对可信，但本机每次调用 ~61.6ns 且触发 VM exit；
+///   只在**粗粒度**（整轮 decode、每 MCU 行、每行 post_process）使用——调用次数 ≤ 行数级，
+///   开销可忽略。`rows/post/up/color/total/setup/header/mcu_rest` 走此路。
+/// - **忙钟**（`_rdtsc()`）：~10.8ns/次，可逐块计；但 guest TSC 在内存停顿/宿主机争用期
+///   不前进（墙钟≈RDTSC×7-10），内存密集型阶段（entropy 表查找、idct 负载）被系统性低估、
+///   纯 ALU 循环骨架被相对放大（旧版 RDTSC 探针曾把 `inner` 伪占 75-90%）。故 entropy/idct
+///   只作忙钟交叉参考，不据其定靶；权威 entropy/idct/loop 占比用「阶段消融 A/B」
+///   （`KIMG_JPEG_SKIP_ENTROPY=1` / `KIMG_JPEG_SKIP_IDCT=1`，仅 profile 模式生效）以墙钟差值得出。
+///
+/// 默认关闭零开销：`timer()`/`stop()` 只做一次可预测分支，时钟对象仅启用时构造，
+/// 不读 env、不构造时钟。env 判定进程级缓存，热环不重复读。
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Stage {
     Entropy,
@@ -28,59 +40,55 @@ pub(crate) enum Stage {
     McuRest,
 }
 
+/// 单次 `wall_timer()+stop_wall()` 的探针开销（2 次 `Instant::now()`，本机实测 61.6ns/次）。
+/// 从墙钟阶段中扣除，避免把探针成本算进被测阶段。
+const PROBE_WALL_NS: u64 = 123;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct StageProfile {
     pub(crate) enabled: bool,
-    entropy_us: u128,
-    idct_us: u128,
-    upsample_us: u128,
-    color_us: u128,
-    total_us: u128,
-    header_us: u128,
-    setup_us: u128,
-    rows_us: u128,
-    post_us: u128,
+    /// 墙钟阶段累计（µs，f64 便于扣探针开销后的亚 µs 精度）。
+    total_us: f64,
+    header_us: f64,
+    setup_us: f64,
+    rows_us: f64,
+    post_us: f64,
+    upsample_us: f64,
+    color_us: f64,
+    mcu_rest_us: f64,
+    /// 忙钟（rdtsc）阶段累计（µs）；仅供交叉参考，分布以消融 A/B 为准。
+    entropy_us: f64,
+    idct_us: f64,
     /// 调用计数（辅助解释 per-call 耗时时使用）。
     pub(crate) n_entropy: u64,
     pub(crate) n_idct: u64,
     pub(crate) n_rows: u64,
-    pub(crate) mcu_rest_us: u128,
-}
-
-#[inline]
-fn rdtsc() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe { core::arch::x86_64::_rdtsc() }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // 非 x86：以 ns 计时（ns_per_tick=1.0 使换算成立）。
-        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_nanos() as u64,
-            Err(_) => 0,
-        }
-    }
 }
 
 /// x86 TSC 计数 → ns 换算系数（进程内校准一次；非 x86 恒为 1ns/tick）。
+/// 注意：校准循环写入易失变量防止编译器整体消除（曾因消除致 ns_per_tick 为垃圾值）。
 fn ns_per_tick() -> f64 {
     #[cfg(target_arch = "x86_64")]
     {
+        use core::sync::atomic::{compiler_fence, Ordering};
         use std::sync::OnceLock;
         static V: OnceLock<f64> = OnceLock::new();
         *V.get_or_init(|| {
-            let t0 = rdtsc();
+            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+            compiler_fence(Ordering::SeqCst);
             let s0 = std::time::Instant::now();
             let mut x: u64 = 0;
             for _ in 0..2_000_000 {
                 x = x.wrapping_add(1);
             }
+            unsafe {
+                core::ptr::write_volatile(&mut x, x);
+            }
             let s1 = std::time::Instant::now();
-            let t1 = rdtsc();
+            compiler_fence(Ordering::SeqCst);
+            let t1 = unsafe { core::arch::x86_64::_rdtsc() };
             let ns = s1.duration_since(s0).as_nanos().max(1) as f64;
             let ticks = t1.wrapping_sub(t0).max(1) as f64;
-            let _ = x;
             ns / ticks
         })
     }
@@ -101,30 +109,94 @@ impl StageProfile {
         })
     }
 
+    /// 消融开关：profile 模式 + `KIMG_JPEG_SKIP_ENTROPY=1` 跳过 entropy 实际解码
+    /// （`inner_decode_mcu_width` 直接填零 tmp），用于墙钟差值求 entropy 占比。
+    pub(crate) fn skip_entropy() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            Self::enabled_by_env()
+                && std::env::var("KIMG_JPEG_SKIP_ENTROPY")
+                    .map(|v| v.trim() == "1")
+                    .unwrap_or(false)
+        })
+    }
+
+    /// 消融开关：profile 模式 + `KIMG_JPEG_SKIP_IDCT=1` 跳过 IDCT 实际写回。
+    pub(crate) fn skip_idct() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            Self::enabled_by_env()
+                && std::env::var("KIMG_JPEG_SKIP_IDCT")
+                    .map(|v| v.trim() == "1")
+                    .unwrap_or(false)
+        })
+    }
+
+    /// 墙钟计时（粗粒度调用点）。
     #[inline]
-    pub(crate) fn timer(&self) -> Option<u64> {
+    pub(crate) fn timer(&self) -> Option<Instant> {
         if self.enabled {
-            Some(rdtsc())
+            Some(Instant::now())
         } else {
             None
         }
     }
 
+    /// 墙钟结算（粗粒度调用点）。
     #[inline]
-    pub(crate) fn stop(&mut self, stage: Stage, t: Option<u64>) {
+    pub(crate) fn stop(&mut self, stage: Stage, t: Option<Instant>) {
         if let Some(t) = t {
-            let us = ((rdtsc().wrapping_sub(t)) as f64 * ns_per_tick() / 1000.0) as u128;
+            let ns = t.elapsed().as_nanos().saturating_sub(u128::from(PROBE_WALL_NS));
+            let us = ns as f64 / 1000.0;
             match stage {
-                Stage::Entropy => self.entropy_us += us,
-                Stage::Idct => self.idct_us += us,
-                Stage::Upsample => self.upsample_us += us,
-                Stage::Color => self.color_us += us,
                 Stage::Total => self.total_us += us,
                 Stage::Header => self.header_us += us,
                 Stage::Setup => self.setup_us += us,
                 Stage::DecodeRows => self.rows_us += us,
                 Stage::Post => self.post_us += us,
+                Stage::Upsample => self.upsample_us += us,
+                Stage::Color => self.color_us += us,
                 Stage::McuRest => self.mcu_rest_us += us,
+                // 逐块熵/IDCT 用忙钟，见 `busy_timer/busy_stop`。
+                Stage::Entropy | Stage::Idct => {}
+            }
+        }
+    }
+
+    /// 忙钟（rdtsc）计时——仅逐块熵/IDCT 交叉参考用，开销 ~10.8ns/次。
+    #[inline]
+    pub(crate) fn busy_timer(&self) -> Option<u64> {
+        if self.enabled {
+            #[cfg(target_arch = "x86_64")]
+            {
+                Some(unsafe { core::arch::x86_64::_rdtsc() })
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                Some(0)
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 忙钟结算——逐块熵/IDCT。
+    #[inline]
+    pub(crate) fn busy_stop(&mut self, stage: Stage, t: Option<u64>) {
+        if let Some(t) = t {
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = t;
+            #[cfg(target_arch = "x86_64")]
+            {
+                let us =
+                    unsafe { core::arch::x86_64::_rdtsc().wrapping_sub(t) } as f64
+                        * ns_per_tick()
+                        / 1000.0;
+                match stage {
+                    Stage::Entropy => self.entropy_us += us,
+                    Stage::Idct => self.idct_us += us,
+                    _ => {}
+                }
             }
         }
     }
@@ -134,30 +206,24 @@ impl StageProfile {
         if !self.enabled {
             return;
         }
-        // 占比分母 = header + mcu 解码全时段
-        let full = (self.header_us + self.total_us).max(1);
-        let pct = |us: u128| (us as f64) / (full as f64) * 100.0;
-        let other = self
-            .total_us
-            .saturating_sub(self.setup_us + self.rows_us + self.post_us);
-        let rest = self
-            .rows_us
-            .saturating_sub(self.entropy_us + self.idct_us + self.mcu_rest_us);
+        // 占比分母 = header + mcu 解码全时段（墙钟）
+        let full = (self.header_us + self.total_us).max(1.0);
+        let pct = |us: f64| us / full * 100.0;
+        let other = (self.total_us - self.setup_us - self.rows_us - self.post_us).max(0.0);
         println!(
-            "STAGE-DECODE header={:.3}ms mcu_total={:.3}ms rows={:.3}ms x{}[nidct={}] loop=(ent{:.3}+idct{:.3})+mcuRest{:.3}+inner{:.3} post={:.3}ms[up={:.3}+color={:.3}] other={:.3}ms({:.1}%)",
-            self.header_us as f64 / 1000.0,
-            self.total_us as f64 / 1000.0,
-            self.rows_us as f64 / 1000.0,
+            "STAGE-DECODE header={:.3}ms mcu_total={:.3}ms rows={:.3}ms x{}[nidct={}] loop=(ent(busy){:.3}+idct(busy){:.3})+mcuRest{:.3} post={:.3}ms[up={:.3}+color={:.3}] other={:.3}ms({:.1}%) | entropy/idct 真值看消融 A/B",
+            self.header_us / 1000.0,
+            self.total_us / 1000.0,
+            self.rows_us / 1000.0,
             self.n_rows,
             self.n_idct,
-            self.entropy_us as f64 / 1000.0,
-            self.idct_us as f64 / 1000.0,
-            self.mcu_rest_us as f64 / 1000.0,
-            rest as f64 / 1000.0,
-            self.post_us as f64 / 1000.0,
-            self.upsample_us as f64 / 1000.0,
-            self.color_us as f64 / 1000.0,
-            other as f64 / 1000.0,
+            self.entropy_us / 1000.0,
+            self.idct_us / 1000.0,
+            self.mcu_rest_us / 1000.0,
+            self.post_us / 1000.0,
+            self.upsample_us / 1000.0,
+            self.color_us / 1000.0,
+            other / 1000.0,
             pct(other),
         );
     }

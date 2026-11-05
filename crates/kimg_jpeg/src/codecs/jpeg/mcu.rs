@@ -3,13 +3,14 @@
 use core::cmp::{max, min};
 
 use crate::codecs::jpeg::avx2::{idct4x4, idct_int, zero_tmp_window};
-use crate::codecs::jpeg::bitstream::BitStream;
+use crate::codecs::jpeg::bitstream::{BitStream, HotStream};
 use crate::codecs::jpeg::color::color_convert;
 use crate::codecs::jpeg::error::DecodeError;
 use crate::codecs::jpeg::idct::idct_int_1x1;
 use crate::codecs::jpeg::io::{ByteReader, Marker};
 use crate::codecs::jpeg::segment::{
-    calculate_padded_width, ColorSpace, Decoder, SampleRatios, Stage, DCT_BLOCK, MAX_COMPONENTS,
+    calculate_padded_width, ColorSpace, Decoder, SampleRatios, Stage, StageProfile, DCT_BLOCK,
+    MAX_COMPONENTS,
 };
 use crate::codecs::jpeg::upsampler::{upsample, upsample_generic, upsample_no_op};
 
@@ -448,6 +449,14 @@ impl<'a> Decoder<'a> {
         // 上次 MCU 解码写入了 tmp 的多少：只用于 `fill` 的优化。
         let mut clobber_more_than_4x4 = true;
 
+        // 消融开关（仅 profile 模式生效，进程内只读一次）：墙钟差值得 entropy/idct 占比。
+        let skip_entropy = StageProfile::skip_entropy();
+        let skip_idct = StageProfile::skip_idct();
+
+        // 寄存器化位流局部状态：整行 MCU 逐块解码共用一份，免逐块经 `stream` 内存往返
+        // （省每块 6 字段快照/回写 + 独立函数调用/寄存器盘存）。
+        let mut hot = HotStream::from_stream(stream);
+
         // 非交织（PROGRESSIVE=true）时按该分量的实际数据单元数迭代
         let mut scan_du_width = if PROGRESSIVE {
             let k = z_scans[0];
@@ -510,14 +519,20 @@ impl<'a> Decoder<'a> {
                     };
 
                     for h_samp in h_step {
-                        let t_entropy = self.stage.timer();
+                        let t_entropy = self.stage.busy_timer();
 
-                        let result = if component_samples_needed {
+                        let result = if skip_entropy {
+                            // 消融：跳过熵解码，tmp 填零、len=64（不消费位流；restart 语义靠调用方不触发）
+                            if component_samples_needed {
+                                zero_tmp_window(tmp, 64);
+                            }
+                            Ok(64u16)
+                        } else if component_samples_needed {
                             let clobber_len = if !clobber_more_than_4x4 { 32 } else { 64 };
 
                             zero_tmp_window(tmp, clobber_len);
 
-                            stream.decode_mcu_block(
+                            hot.decode_mcu_block(
                                 &mut self.reader,
                                 dc_table,
                                 ac_table,
@@ -526,10 +541,10 @@ impl<'a> Decoder<'a> {
                                 &mut component.dc_pred,
                             )
                         } else {
-                            stream.discard_mcu_block(&mut self.reader, dc_table, ac_table)
+                            hot.discard_mcu_block(&mut self.reader, dc_table, ac_table)
                         };
 
-                        self.stage.stop(Stage::Entropy, t_entropy);
+                        self.stage.busy_stop(Stage::Entropy, t_entropy);
                         self.stage.n_entropy += 1;
 
                         let len = match result {
@@ -562,15 +577,17 @@ impl<'a> Decoder<'a> {
                                 }
                             };
 
-                            let t_idct = self.stage.timer();
-                            if len <= 1 {
-                                idct_int_1x1(tmp, idct_pos, component.width_stride);
-                            } else if len <= 10 {
-                                idct4x4(tmp, idct_pos, component.width_stride);
-                            } else {
-                                idct_int(tmp, idct_pos, component.width_stride);
+                            let t_idct = self.stage.busy_timer();
+                            if !skip_idct {
+                                if len <= 1 {
+                                    idct_int_1x1(tmp, idct_pos, component.width_stride);
+                                } else if len <= 10 {
+                                    idct4x4(tmp, idct_pos, component.width_stride);
+                                } else {
+                                    idct_int(tmp, idct_pos, component.width_stride);
+                                }
                             }
-                            self.stage.stop(Stage::Idct, t_idct);
+                            self.stage.busy_stop(Stage::Idct, t_idct);
                             self.stage.n_idct += 1;
                         }
                     }
@@ -580,8 +597,11 @@ impl<'a> Decoder<'a> {
             let t_mcu = self.stage.timer();
             self.todo = self.todo.wrapping_sub(1);
 
+            // 把 hot 状态同步回 stream，供 handle_rst_main / marker 检查消费。
+            hot.write_back(stream);
             if self.todo == 0 {
                 self.handle_rst_main(stream)?;
+                hot.reload(stream);
                 continue;
             }
 
@@ -591,6 +611,7 @@ impl<'a> Decoder<'a> {
             self.stage.stop(Stage::McuRest, t_mcu);
         }
 
+        hot.write_back(stream);
         self.check_stream_marker_after_mcu_width(stream)
     }
 
@@ -1053,79 +1074,81 @@ impl<'a> Decoder<'a> {
 
             for i in 0..mcu_height {
                 for j in 0..mcu_width {
-                    let t_entropy = self.stage.timer();
-                    if self.spec_start != 0 && self.succ_high == 0 && stream.eob_run > 0 {
-                        // 在此处理 EOB RUN 的整块跳过
-                        stream.eob_run -= 1;
-                    } else {
-                        let start = 64 * (j + i * (width_stride / 8));
-
-                        let data: &mut [i16; 64] = buffer
-                            .get_mut(k)
-                            .ok_or_else(|| DecodeError::Format("Invalid image".to_string()))?
-                            .get_mut(start..start + 64)
-                            .ok_or_else(|| DecodeError::Format("Slice to Small".to_string()))?
-                            .try_into()
-                            .map_err(|_| DecodeError::Format("Slice to Small".to_string()))?;
-
-                        if self.spec_start == 0 {
-                            // DC 谱段（含 DC refine）
-                            let pos = self.components[k].dc_huff_table & (MAX_COMPONENTS - 1);
-
-                            let dc_table = self
-                                .dc_huffman_tables
-                                .get(pos)
-                                .ok_or_else(|| {
-                                    DecodeError::Format(
-                                        "No huffman table for DC component".to_string(),
-                                    )
-                                })?
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    DecodeError::Format(
-                                        "Huffman table at index  not initialized".to_string(),
-                                    )
-                                })?;
-
-                            let dc_pred = &mut self.components[k].dc_pred;
-
-                            if self.succ_high == 0 {
-                                stream.decode_prog_dc_first(
-                                    &mut self.reader,
-                                    dc_table,
-                                    &mut data[0],
-                                    dc_pred,
-                                )?;
-                            } else {
-                                stream.decode_prog_dc_refine(&mut self.reader, &mut data[0])?;
-                            }
+                    let t_entropy = self.stage.busy_timer();
+                    if !StageProfile::skip_entropy() {
+                        if self.spec_start != 0 && self.succ_high == 0 && stream.eob_run > 0 {
+                            // 在此处理 EOB RUN 的整块跳过
+                            stream.eob_run -= 1;
                         } else {
-                            // AC 谱段（含 AC refine）
-                            let pos = self.components[k].ac_huff_table;
+                            let start = 64 * (j + i * (width_stride / 8));
 
-                            let ac_table = self
-                                .ac_huffman_tables
-                                .get(pos)
-                                .ok_or_else(|| {
-                                    DecodeError::Format(format!(
-                                        "No huffman table for component:{pos}"
-                                    ))
-                                })?
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    DecodeError::Format(format!(
-                                        "Huffman table at index  {pos} not initialized"
-                                    ))
-                                })?;
+                            let data: &mut [i16; 64] = buffer
+                                .get_mut(k)
+                                .ok_or_else(|| DecodeError::Format("Invalid image".to_string()))?
+                                .get_mut(start..start + 64)
+                                .ok_or_else(|| DecodeError::Format("Slice to Small".to_string()))?
+                                .try_into()
+                                .map_err(|_| DecodeError::Format("Slice to Small".to_string()))?;
 
-                            if self.succ_high == 0 {
-                                stream.decode_mcu_ac_first(&mut self.reader, ac_table, data)?;
+                            if self.spec_start == 0 {
+                                // DC 谱段（含 DC refine）
+                                let pos = self.components[k].dc_huff_table & (MAX_COMPONENTS - 1);
+
+                                let dc_table = self
+                                    .dc_huffman_tables
+                                    .get(pos)
+                                    .ok_or_else(|| {
+                                        DecodeError::Format(
+                                            "No huffman table for DC component".to_string(),
+                                        )
+                                    })?
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        DecodeError::Format(
+                                            "Huffman table at index  not initialized".to_string(),
+                                        )
+                                    })?;
+
+                                let dc_pred = &mut self.components[k].dc_pred;
+
+                                if self.succ_high == 0 {
+                                    stream.decode_prog_dc_first(
+                                        &mut self.reader,
+                                        dc_table,
+                                        &mut data[0],
+                                        dc_pred,
+                                    )?;
+                                } else {
+                                    stream.decode_prog_dc_refine(&mut self.reader, &mut data[0])?;
+                                }
                             } else {
-                                stream.decode_mcu_ac_refine(&mut self.reader, ac_table, data)?;
+                                // AC 谱段（含 AC refine）
+                                let pos = self.components[k].ac_huff_table;
+
+                                let ac_table = self
+                                    .ac_huffman_tables
+                                    .get(pos)
+                                    .ok_or_else(|| {
+                                        DecodeError::Format(format!(
+                                            "No huffman table for component:{pos}"
+                                        ))
+                                    })?
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        DecodeError::Format(format!(
+                                            "Huffman table at index  {pos} not initialized"
+                                        ))
+                                    })?;
+
+                                if self.succ_high == 0 {
+                                    stream.decode_mcu_ac_first(&mut self.reader, ac_table, data)?;
+                                } else {
+                                    stream.decode_mcu_ac_refine(&mut self.reader, ac_table, data)?;
+                                }
                             }
                         }
                     }
-                    self.stage.stop(Stage::Entropy, t_entropy);
+                    self.stage.busy_stop(Stage::Entropy, t_entropy);
 
                     self.todo = self.todo.wrapping_sub(1);
 
@@ -1203,19 +1226,21 @@ impl<'a> Decoder<'a> {
                                     DecodeError::Format("Invalid image".to_string())
                                 })?;
 
-                                let t_entropy = self.stage.timer();
-                                if self.succ_high == 0 {
-                                    stream.decode_prog_dc_first(
-                                        &mut self.reader,
-                                        huff_table,
-                                        data,
-                                        &mut component.dc_pred,
-                                    )?;
-                                } else {
-                                    stream.decode_prog_dc_refine(&mut self.reader, data)?;
+                                let t_entropy = self.stage.busy_timer();
+                                if !StageProfile::skip_entropy() {
+                                    if self.succ_high == 0 {
+                                        stream.decode_prog_dc_first(
+                                            &mut self.reader,
+                                            huff_table,
+                                            data,
+                                            &mut component.dc_pred,
+                                        )?;
+                                    } else {
+                                        stream.decode_prog_dc_refine(&mut self.reader, data)?;
+                                    }
                                 }
-                        self.stage.stop(Stage::Entropy, t_entropy);
-                        self.stage.n_entropy += 1;
+                                self.stage.busy_stop(Stage::Entropy, t_entropy);
+                                self.stage.n_entropy += 1;
                             }
                         }
                     }
@@ -1304,21 +1329,23 @@ impl<'a> Decoder<'a> {
                             ));
                         };
 
-                        let t_idct = self.stage.timer();
+                        let t_idct = self.stage.busy_timer();
 
-                        // 反量化
-                        for ((x, out), qt_val) in
-                            qt_slice.iter().zip(tmp.iter_mut()).zip(qt_table.iter())
-                        {
-                            *out = i32::from(*x) * qt_val;
+                        if !StageProfile::skip_idct() {
+                            // 反量化
+                            for ((x, out), qt_val) in
+                                qt_slice.iter().zip(tmp.iter_mut()).zip(qt_table.iter())
+                            {
+                                *out = i32::from(*x) * qt_val;
+                            }
+
+                            let sl = &mut temp_channel[idct_pos..];
+
+                            idct_pos += 8;
+                            // tmp 现为反量化后的块，做 IDCT（整块右移 & clamp 与 baseline 同源）
+                            idct_int(&mut tmp, sl, component.width_stride);
                         }
-
-                        let sl = &mut temp_channel[idct_pos..];
-
-                        idct_pos += 8;
-                        // tmp 现为反量化后的块，做 IDCT（整块右移 & clamp 与 baseline 同源）
-                        idct_int(&mut tmp, sl, component.width_stride);
-                        self.stage.stop(Stage::Idct, t_idct);
+                        self.stage.busy_stop(Stage::Idct, t_idct);
                     }
                     // 每写完 8 行后跳过 7 个 stride 至下一垂直块行
                     idct_pos += 7 * component.width_stride;
