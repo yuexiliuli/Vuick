@@ -290,6 +290,8 @@ pub(crate) struct Component {
     pub(crate) ac_huff_table: usize,
     pub(crate) quantization_table_number: u8,
     pub(crate) quantization_table: [i32; 64],
+    /// C# `ZigQ` 融合表（`build_zigzag_quant` 由 natural-order 量化表派生，基线 AC 反量化单装载）。
+    pub(crate) quantization_zq: [u32; ZIGZAG_QUANT_LEN],
     pub(crate) dc_pred: i32,
     pub(crate) up_sampler: UpSampler,
     /// 行宽（水平采样 × mcu_x × 8）。
@@ -382,6 +384,7 @@ impl Component {
             dc_huff_table: 0,
             ac_huff_table: 0,
             quantization_table: [0; 64],
+            quantization_zq: [0; ZIGZAG_QUANT_LEN],
             dc_pred: 0,
             up_sampler: upsample_no_op,
             width_stride: horizontal_sample,
@@ -1227,4 +1230,23 @@ where
     }
 
     output
+}
+
+/// C# `ZigQ` 融合表长度（64 系数 + 16 哨兵，对齐 `UN_ZIGZAG` 防越界布局）。
+pub(crate) const ZIGZAG_QUANT_LEN: usize = 80;
+
+/// 由 natural-order 量化表构建 C# `ZigQ` 融合表
+/// （JpegCore.cs:164 `ZigQ[k] = Dezigzag[k]<<16 | Dequant[Dezigzag[k]]`）：
+/// 单装载 `zq[pos]` 同时给出 natural-order 目标下标（高 16 位）与量化值（低 16 位），
+/// 基线 AC 反量化省一次 `UN_ZIGZAG` + 量化表装载。pos≥64 的哨兵 = natural 63，与
+/// `UN_ZIGZAG[min(pos,63)]` 恒等，`min` 兜底随之常消。<br>
+/// JPEG DQT 量化为 u8/u16 读取（≤65535），低 16 位恰好装下，`as u32` 保真；乘积/截断
+/// 语义与旧 `(v * qt_table[t_pos]) as i16` 在模 2^16 下恒等。
+pub(crate) fn build_zigzag_quant(qt_natural: &[i32; DCT_BLOCK]) -> [u32; ZIGZAG_QUANT_LEN] {
+    let mut zq = [0u32; ZIGZAG_QUANT_LEN];
+    for (i, slot) in zq.iter_mut().enumerate() {
+        let natural = UN_ZIGZAG[i]; // i<64 ∈0..63，i≥64 哨兵=63，直接安全
+        *slot = ((natural as u32) << 16) | (qt_natural[natural] as u32);
+    }
+    zq
 }

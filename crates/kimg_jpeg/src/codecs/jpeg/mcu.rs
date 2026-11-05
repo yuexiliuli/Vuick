@@ -8,7 +8,7 @@ use crate::codecs::jpeg::cs::{CsInput, R_ONE_TO_ONE};
 use crate::codecs::jpeg::error::DecodeError;
 use crate::codecs::jpeg::io::{ByteReader, Marker};
 use crate::codecs::jpeg::segment::{
-    ColorSpace, Decoder, SampleRatios, Stage, StageProfile, DCT_BLOCK,
+    build_zigzag_quant, ColorSpace, Decoder, SampleRatios, Stage, StageProfile, DCT_BLOCK,
     MAX_COMPONENTS,
 };
 use crate::codecs::jpeg::upsampler::{upsample_generic, upsample_no_op};
@@ -58,6 +58,8 @@ impl<'a> Decoder<'a> {
                 })?;
 
             component.quantization_table = qt_table;
+            // C# `ZigQ` 融合表：由 natural-order 量化表派生一次，基线 AC 反量化单装载用。
+            component.quantization_zq = build_zigzag_quant(&qt_table);
             // 初始 stride 含水平次采样，乘上（每行 MCU 数 × 8）
             component.width_stride *= self.mcu_x * 8;
         }
@@ -493,6 +495,7 @@ impl<'a> Decoder<'a> {
                                 dc_table,
                                 ac_table,
                                 qt_table,
+                                &component.quantization_zq,
                                 tmp,
                                 &mut component.dc_pred,
                             )
@@ -1279,13 +1282,27 @@ impl<'a> Decoder<'a> {
 
         self.init_cs_tail();
 
+        // 逐分量 natural-order i16 量化系数（`q as i16` = 低 16 位模表示，与 i32 乘积
+        // 后截断写回 i16 在模 2^16 下恒等——16 位精度量化表同样成立）。
+        let mut qt16: [[i16; 64]; MAX_COMPONENTS] = [[0; 64]; MAX_COMPONENTS];
+        for (position, component) in self.components.iter().enumerate() {
+            for (dst, &q) in qt16[position]
+                .iter_mut()
+                .zip(component.quantization_table.iter())
+            {
+                *dst = q as i16;
+            }
+        }
+
         // 反量化、IDCT、输出（逐 MCU 行）
+        // A/B 门控（进程内一次）：`KIMG_JPEG_PROG_FASTPATH=0` → 仅向量化反量化、恒全量
+        // IDCT（旧路径），缺省 → DC-only 快路径路由。同二进制 A/B（K93 姿势）。
+        let fastpath = prog_fastpath_enabled();
         for i in 0..mcu_height {
             for (position, component) in self.components.iter_mut().enumerate() {
                 if !component.needed {
                     continue;
                 }
-                let qt_table = &component.quantization_table;
 
                 // step = 该分量一整行 MCU 的系数个数
                 let step = block[position].len() / mcu_height;
@@ -1312,17 +1329,40 @@ impl<'a> Decoder<'a> {
                         let t_idct = self.stage.busy_timer();
 
                         if !StageProfile::skip_idct() {
-                            for ((x, out), qt_val) in
-                                qt_slice.iter().zip(tmp.iter_mut()).zip(qt_table.iter())
-                            {
-                                *out = (i32::from(*x) * qt_val) as i16;
-                            }
-
                             // 环偏移：C# `((m&1)*RowsPerMcu + v*8)*W2 + bx*8`
                             let ring_off =
                                 (((i & 1) * component.vertical_sample) + k) * 8 * component.width_stride
                                     + j * 8;
-                            cs::idct8x8(&tmp, &mut component.cs_ring, ring_off, component.width_stride);
+                            if fastpath {
+                                // 反量化（natural-order short wrap，C# `(short)(coeff×q)`）
+                                // + AC 全零判定（终态系数 1..63 全零 → DC-only，对齐 C#
+                                // `nz==0/仅DC → last==0 → DcOnly(data[0])`，逐位恒等）。
+                                let ac_zero = dequant_block(qt_slice, &qt16[position], &mut tmp);
+                                if ac_zero {
+                                    cs::idct8x8_dc_only(
+                                        tmp[0],
+                                        &mut component.cs_ring,
+                                        ring_off,
+                                        component.width_stride,
+                                    );
+                                } else {
+                                    cs::idct8x8(
+                                        &tmp,
+                                        &mut component.cs_ring,
+                                        ring_off,
+                                        component.width_stride,
+                                    );
+                                }
+                            } else {
+                                // 对照路径：向量化反量化后恒全量 IDCT（旧行为）。
+                                dequant_block(qt_slice, &qt16[position], &mut tmp);
+                                cs::idct8x8(
+                                    &tmp,
+                                    &mut component.cs_ring,
+                                    ring_off,
+                                    component.width_stride,
+                                );
+                            }
                         }
                         self.stage.busy_stop(Stage::Idct, t_idct);
                     }
@@ -1333,6 +1373,79 @@ impl<'a> Decoder<'a> {
         }
 
         Ok(())
+    }
+}
+
+/// 渐进 finish 快路径（DC-only 路由）是否启用：`KIMG_JPEG_PROG_FASTPATH` 缺省开，
+/// `=0/false/off` 关（仅向量化反量化、恒全量 IDCT）——进程内一次读，供同二进制 A/B（K93）。
+#[inline]
+fn prog_fastpath_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("KIMG_JPEG_PROG_FASTPATH").unwrap_or_default();
+        let t = v.trim();
+        !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+    })
+}
+
+/// 反量化 64 系数块（natural-order `(short)(coeff × q)` 截断 wrap，恒等于旧 i32 标量
+/// 与 C# `(short)(coeff[k] * qz[k])`）。顺带返回「AC 全零」判定（终态系数 1..63 全零，
+/// 对齐 C# `NonZeroMask → last==0 → DcOnly`），供 DC-only 快路径路由。
+/// `coeff.len()` 与 `out` 均须为 64。
+#[inline]
+fn dequant_block(coeff: &[i16], qt16: &[i16; 64], out: &mut [i16; 64]) -> bool {
+    debug_assert_eq!(coeff.len(), 64);
+    #[cfg(target_arch = "x86_64")]
+    if crate::codecs::jpeg::avx2::avx2_enabled() {
+        // SAFETY: 调用方保证 coeff 长度 64；avx2_enabled() 保证 CPU 支持 AVX2。
+        return unsafe { dequant_block_avx2(coeff, qt16, out) };
+    }
+    // 标量：与 AVX2 `_mm256_mullo_epi16` 的低 16 位结果逐位恒等（模 2^16 截断）。
+    let mut ac_zero = true;
+    for i in 0..64 {
+        let v = (i32::from(coeff[i]) * i32::from(qt16[i])) as i16;
+        out[i] = v;
+        if i != 0 && v != 0 {
+            ac_zero = false;
+        }
+    }
+    ac_zero
+}
+
+#[cfg(target_arch = "x86_64")]
+/// AVX2：向量反量化（`mullo_epi16` = 每 16 位乘积的低 16 位，即 `(short)(coeff×q)` 截断
+/// wrap）+ AC 全零判定（索引 1..63 反量化结果全零 → DC-only）。
+/// SAFETY: 调用方保证 `coeff.len()==64`；调用方必须已用 `avx2_enabled()` 门控 CPU。
+unsafe fn dequant_block_avx2(coeff: &[i16], qt16: &[i16; 64], out: &mut [i16; 64]) -> bool {
+    // SAFETY: 长度已知 64；avx2_enabled() 已保证 CPU 支持 AVX2（movemask/mullo/srli 全 AVX2）。
+    unsafe {
+        use core::arch::x86_64::*;
+        let c0 = _mm256_loadu_si256(coeff.as_ptr().add(0) as *const __m256i);
+        let c1 = _mm256_loadu_si256(coeff.as_ptr().add(16) as *const __m256i);
+        let c2 = _mm256_loadu_si256(coeff.as_ptr().add(32) as *const __m256i);
+        let c3 = _mm256_loadu_si256(coeff.as_ptr().add(48) as *const __m256i);
+        let q0 = _mm256_loadu_si256(qt16.as_ptr().add(0) as *const __m256i);
+        let q1 = _mm256_loadu_si256(qt16.as_ptr().add(16) as *const __m256i);
+        let q2 = _mm256_loadu_si256(qt16.as_ptr().add(32) as *const __m256i);
+        let q3 = _mm256_loadu_si256(qt16.as_ptr().add(48) as *const __m256i);
+        let p0 = _mm256_mullo_epi16(c0, q0);
+        let p1 = _mm256_mullo_epi16(c1, q1);
+        let p2 = _mm256_mullo_epi16(c2, q2);
+        let p3 = _mm256_mullo_epi16(c3, q3);
+        _mm256_storeu_si256(out.as_mut_ptr().add(0) as *mut __m256i, p0);
+        _mm256_storeu_si256(out.as_mut_ptr().add(16) as *mut __m256i, p1);
+        _mm256_storeu_si256(out.as_mut_ptr().add(32) as *mut __m256i, p2);
+        _mm256_storeu_si256(out.as_mut_ptr().add(48) as *mut __m256i, p3);
+        // AC 全零判定（索引 1..63，p0 掩掉 DC=索引 0）。
+        // 注意：① 不得用 `srli_si256` 探测索引 1..15——按 128 位 lane 右移，
+        //   索引 8 落 lane 边界被移出而漏检；
+        // ② 不得用 `movemask_epi8(all_ac)==0`——它只测每字节最高位，
+        //   值如 0x0007 高位置 0 会被漏判；须逐字节 cmp-eq-zero 后全 1。
+        let dc_mask = _mm256_setr_epi16(0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+        let ac0 = _mm256_and_si256(p0, dc_mask);
+        let all_ac = _mm256_or_si256(_mm256_or_si256(ac0, p1), _mm256_or_si256(p2, p3));
+        let eq = _mm256_cmpeq_epi8(all_ac, _mm256_setzero_si256());
+        _mm256_movemask_epi8(eq) == -1
     }
 }
 
@@ -1391,4 +1504,129 @@ pub(crate) fn decode_progressive(
     let r = decoder.decode_mcu_ycbcr_progressive(pixels);
     decoder.stage.stop(Stage::Total, t_total);
     r
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    /// 标量反量化 + 参考 ac_zero（独立实现，避免与被测路径同构）。
+    fn ref_scalar(coeff: &[i16; 64], qt16: &[i16; 64]) -> ([i16; 64], bool) {
+        let mut out = [0i16; 64];
+        let mut ac_zero = true;
+        for i in 0..64 {
+            let v = (i32::from(coeff[i]) * i32::from(qt16[i])) as i16;
+            out[i] = v;
+            if i != 0 && v != 0 {
+                ac_zero = false;
+            }
+        }
+        (out, ac_zero)
+    }
+
+    fn lcg(s: &mut u64) -> u64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s
+    }
+
+    #[test]
+    fn dequant_avx2_eq_scalar() {
+        if !crate::codecs::jpeg::avx2::avx2_enabled() {
+            return;
+        }
+        let mut seed = 0xABCD_1234u64;
+        // 单 AC 非零覆盖每一位置（含 128-bit lane 边界 8）——曾因 `srli_si256`
+        // 按 lane 右移漏检索引 8 而误判 DC-only。
+        for ac_idx in 1..64i32 {
+            for dc_mode in [0i16, 12345].into_iter() {
+                let mut coeff = [0i16; 64];
+                coeff[0] = dc_mode;
+                coeff[ac_idx as usize] = (seed as i32 as i16).wrapping_add(12345);
+                let mut qt16 = [8i16; 64];
+                for q in qt16.iter_mut().skip(1) {
+                    *q = if (seed / 97) % 3 == 0 { 200 } else { 19 };
+                }
+                let mut out_v = [0i16; 64];
+                // SAFETY: 测试已门控 AVX2
+                let ac_v = unsafe { super::dequant_block_avx2(&coeff, &qt16, &mut out_v) };
+                let (ref_out, ref_ac) = ref_scalar(&coeff, &qt16);
+                assert!(!ref_ac, "单 AC 非零应 ac_zero=false idx={ac_idx}");
+                assert_eq!(out_v, ref_out, "dequant 单 AC 案例 idx={ac_idx} 不恒等");
+                assert_eq!(ac_v, ref_ac, "ac_zero 案例 idx={ac_idx} 不恒等");
+            }
+        }
+        for case in 0..4000 {
+            let mode = lcg(&mut seed) % 4;
+            let mut coeff = [0i16; 64];
+            if mode != 2 {
+                for i in 0..64 {
+                    coeff[i] = match mode {
+                        0 => 0i16,
+                        1 => {
+                            if i == 0 {
+                                lcg(&mut seed) as i16
+                            } else {
+                                0i16
+                            }
+                        }
+                        _ => lcg(&mut seed) as i16,
+                    };
+                }
+            }
+            let mut qt16 = [0i16; 64];
+            for q in qt16.iter_mut() {
+                // 覆盖 8 位表与 16 位表（含 >32767 折叠负）
+                *q = match lcg(&mut seed) % 3 {
+                    0 => (lcg(&mut seed) % 256) as i16,
+                    _ => (lcg(&mut seed) % 65536) as i16,
+                };
+            }
+            let mut out_v = [0i16; 64];
+            // SAFETY: 测试已门控 AVX2
+            let ac_v = unsafe { super::dequant_block_avx2(&coeff, &qt16, &mut out_v) };
+            let (ref_out, ref_ac) = ref_scalar(&coeff, &qt16);
+            assert_eq!(out_v, ref_out, "dequant 案例 {case} 不恒等");
+            assert_eq!(ac_v, ref_ac, "ac_zero 案例 {case} 不恒等 (mode={mode})");
+        }
+    }
+
+    /// AC 全零块：全量 cs::idct8x8（AVX2 内核）是否与 cs::idct8x8_dc_only 逐位恒等。
+    /// 这是渐进 DC-only 快路径路由的前提；若不等，路由会改输出。
+    #[test]
+    fn dconly_eq_avx2_full_for_ac_zero() {
+        use crate::codecs::jpeg::cs_avx2;
+        if !crate::codecs::jpeg::avx2::avx2_enabled() {
+            return;
+        }
+        let mut out_full = [0u8; 64];
+        let mut out_dc = [0u8; 64];
+        // 全零块
+        let data = [0i16; 64];
+        // SAFETY: AVX2 已门控
+        unsafe { cs_avx2::idct8x8_avx2(&data, &mut out_full, 0, 8) };
+        cs::idct8x8_dc_only(0, &mut out_dc, 0, 8);
+        assert_eq!(out_full, out_dc, "全零块不恒等");
+        // DC-only：密集扫 DC（含反量化后可能的大 DC 范围）
+        for dc in (-40000i32..=40000).step_by(1) {
+            let mut data = [0i16; 64];
+            data[0] = dc as i16;
+            let mut out_full = [0u8; 64];
+            let mut out_dc = [0u8; 64];
+            // SAFETY: AVX2 已门控
+            unsafe { cs_avx2::idct8x8_avx2(&data, &mut out_full, 0, 8) };
+            cs::idct8x8_dc_only(data[0], &mut out_dc, 0, 8);
+            assert_eq!(out_full, out_dc, "DC-only 块不恒等 dc={dc}");
+        }
+        // 极端 i16 值
+        for &dc in &[i16::MIN, i16::MAX, -32768, 32767, -128, 127, -129, 128] {
+            let mut data = [0i16; 64];
+            data[0] = dc;
+            let mut out_full = [0u8; 64];
+            let mut out_dc = [0u8; 64];
+            // SAFETY: AVX2 已门控
+            unsafe { cs_avx2::idct8x8_avx2(&data, &mut out_full, 0, 8) };
+            cs::idct8x8_dc_only(dc, &mut out_dc, 0, 8);
+            assert_eq!(out_full, out_dc, "DC-only 极端不恒等 dc={dc}");
+        }
+    }
 }

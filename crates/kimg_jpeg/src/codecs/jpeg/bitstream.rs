@@ -9,7 +9,7 @@ use crate::codecs::jpeg::huffman::{
     HuffmanTable, HUFF_LOOKAHEAD, CS_CODELEN_SHIFT, CS_LUT_BITS, CS_LUT_FULL, CS_VALUE_SHIFT,
 };
 use crate::codecs::jpeg::io::{ByteReader, Marker};
-use crate::codecs::jpeg::segment::{DCT_BLOCK, UN_ZIGZAG};
+use crate::codecs::jpeg::segment::{DCT_BLOCK, UN_ZIGZAG, ZIGZAG_QUANT_LEN};
 
 /// 查表解 Huffman（复刻 zune `decode_huff!`：9 位快速路径 + 慢路径 + 哨兵）。
 macro_rules! decode_huff {
@@ -663,6 +663,9 @@ pub(crate) struct HotStream {
     seen_eoi: bool,
 }
 
+/// discard 路径专用零融合表占位（不落系数、不被读取，仅满足统一签名）。
+static ZQ_ZERO: [u32; ZIGZAG_QUANT_LEN] = [0; ZIGZAG_QUANT_LEN];
+
 impl HotStream {
     /// 从 `BitStream` 快照当前位流状态。
     #[inline]
@@ -886,13 +889,15 @@ impl HotStream {
         dc_table: &HuffmanTable,
         ac_table: &HuffmanTable,
         qt_table: &[i32; DCT_BLOCK],
+        zq: &[u32; ZIGZAG_QUANT_LEN],
         block: &mut [i16; 64],
         dc_prediction: &mut i32,
     ) -> Result<u16, DecodeError> {
-        self.decode_block_inner(reader, dc_table, ac_table, qt_table, Some(block), dc_prediction)
+        self.decode_block_inner(reader, dc_table, ac_table, qt_table, zq, Some(block), dc_prediction)
     }
 
     /// 跳过（丢弃）一个 MCU 块；不落系数（位流消费与 `decode_mcu_block` 逐位一致）。
+    /// 注：discard 不写系数，故融合表传常量零表占位（不读取）。
     #[inline(always)]
     pub(crate) fn discard_mcu_block<'a>(
         &mut self,
@@ -901,7 +906,15 @@ impl HotStream {
         ac_table: &HuffmanTable,
     ) -> Result<u16, DecodeError> {
         let mut disc_pred = 0;
-        self.decode_block_inner(reader, dc_table, ac_table, &[0; DCT_BLOCK], None, &mut disc_pred)
+        self.decode_block_inner(
+            reader,
+            dc_table,
+            ac_table,
+            &[0; DCT_BLOCK],
+            &ZQ_ZERO,
+            None,
+            &mut disc_pred,
+        )
     }
 
     /// 熵解码共享内核（C# `JpegCore.DecodeBlockCore` 同构，JpegCore.cs:1021）：
@@ -911,7 +924,8 @@ impl HotStream {
     ///   幅值)，单次 `aligned_buffer <<= (e & 31)` 消费（位 5 恒 0，`e&31==e&63`）；幅值
     ///   出窗时退「丢码长 + 读 t 位扩展」；`e==0`（码长 > 11）退 `decode_huff!` 慢路径。
     ///   位消耗总量与旧实现逐符号一致，故 refill/marker 探测时机不变。
-    /// - 反量化契约不变：DC=(i64 乘积)as i16、AC=(v·q)as i16、`min(pos,63)` 挡越界。
+    /// - 反量化契约不变：DC=(i64 乘积)as i16、AC=(v·q)as i16、`min(pos,63)` 挡越界
+    ///   （由 `zq` 哨兵条目在单装载内等价实现，见 `build_zigzag_quant`）。
     /// - `block=None` 只消费位流不落系数（discard 路径）。
     #[inline(always)]
     fn decode_block_inner<'a>(
@@ -920,6 +934,7 @@ impl HotStream {
         dc_table: &HuffmanTable,
         ac_table: &HuffmanTable,
         qt_table: &[i32; DCT_BLOCK],
+        zq: &[u32; ZIGZAG_QUANT_LEN],
         mut block: Option<&mut [i16; 64]>,
         dc_prediction: &mut i32,
     ) -> Result<u16, DecodeError> {
@@ -1013,8 +1028,10 @@ impl HotStream {
             if (rs & 15) != 0 {
                 pos += ((rs >> 4) & 15) as usize;
                 if let Some(block) = block.as_deref_mut() {
-                    let t_pos = UN_ZIGZAG[min(pos, 63)] & 63;
-                    block[t_pos] = (v * qt_table[t_pos]) as i16;
+                    // C# `ZigQ` 单装载：高 16 位=natural-order 目标下标（含 pos≥64 哨兵=63），
+                    // 低 16 位=量化值；省一次 UN_ZIGZAG + 量化表装载，`min(pos,63)` 因哨兵常消。
+                    let z = zq[pos];
+                    block[(z >> 16) as usize] = (v * (z & 0xffff) as i32) as i16;
                 }
                 pos += 1;
             } else if rs != 0xF0 {
