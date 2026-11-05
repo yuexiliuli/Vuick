@@ -85,7 +85,11 @@ fn assert_parity(name: &str, bytes: &[u8]) -> Result<bool, String> {
     Ok(true)
 }
 
+/// 语义已换主（2026-11-05）：正确性参考改为逐字节恒等 C# Sdcb.SimdCodecs.Jpeg
+/// （`jpeg_csharp_parity` 为唯一硬闸）。本测试对 zune oracle 预期变红（浮点尾
+/// 与整数尾存在 ±1 系统差），降级 dormancy：保留可跑（--ignored），默认忽略。
 #[test]
+#[ignore]
 fn corpus_parity() {
     let dir = corpus_dir();
     assert!(dir.is_dir(), "语料目录缺失: {}", dir.display());

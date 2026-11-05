@@ -1,6 +1,10 @@
 //! Loeffler 整数 IDCT（1:1 复刻 zune-jpeg `idct/scalar.rs`）。
 //!
 //! AVX2 路径与标量在字节上恒等（zune 自身测试保证），故统一采用标量实现。
+//!
+//! dormancy（K24）：C# 语义换主后，本模块仅被 `avx2.rs` 及其单测引用，不再被管线调用。
+
+#![allow(dead_code)]
 
 pub(crate) const SCALE_BITS: i32 = 512 + 65536 + (128 << 17);
 

@@ -1,6 +1,10 @@
 //! 上采样（1:1 复刻 zune-jpeg `upsampler/scalar.rs` 与 `worker.rs` 的上采样部分）。
 //!
 //! AVX2 上采样与标量字节恒等（zune 自身测试保证），故统一采用标量实现。
+//!
+//! dormancy（K24）：C# 语义换主后，本模块仅被 `avx2.rs` 及其单测引用，不再被管线调用。
+
+#![allow(dead_code)]
 
 use crate::codecs::jpeg::error::DecodeError;
 use crate::codecs::jpeg::segment::{Component, SampleRatios};

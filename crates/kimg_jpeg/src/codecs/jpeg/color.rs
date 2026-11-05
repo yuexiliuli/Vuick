@@ -1,6 +1,10 @@
 //! 颜色空间换算（1:1 复刻 zune-jpeg `color_convert/scalar.rs` 与 `worker.rs` 的颜色部分）。
 //!
 //! AVX2 颜色换算与标量字节恒等（同一整数系数与取整链），故统一采用标量实现。
+//!
+//! dormancy（K24）：C# 语义换主后，本模块仅被 `avx2.rs` 及其单测引用，不再被管线调用。
+
+#![allow(dead_code)]
 
 use core::cmp::min;
 

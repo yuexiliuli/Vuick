@@ -5,7 +5,9 @@
 use core::cmp::min;
 
 use crate::codecs::jpeg::error::DecodeError;
-use crate::codecs::jpeg::huffman::{HuffmanTable, HUFF_LOOKAHEAD};
+use crate::codecs::jpeg::huffman::{
+    HuffmanTable, HUFF_LOOKAHEAD, CS_CODELEN_SHIFT, CS_LUT_BITS, CS_LUT_FULL, CS_VALUE_SHIFT,
+};
 use crate::codecs::jpeg::io::{ByteReader, Marker};
 use crate::codecs::jpeg::segment::{DCT_BLOCK, UN_ZIGZAG};
 
@@ -265,7 +267,7 @@ impl BitStream {
         dc_table: &HuffmanTable,
         ac_table: &HuffmanTable,
         qt_table: &[i32; DCT_BLOCK],
-        block: &mut [i32; 64],
+        block: &mut [i16; 64],
         dc_prediction: &mut i32,
     ) -> Result<u16, DecodeError> {
         let ac_lookup = ac_table.ac_lookup.as_ref().unwrap();
@@ -280,7 +282,7 @@ impl BitStream {
         // 解码 DC
         self.decode_dc(reader, dc_table, dc_prediction)?;
 
-        block[0] = *dc_prediction * qt_table[0];
+        block[0] = (i64::from(*dc_prediction) * i64::from(qt_table[0])) as i16;
 
         while pos < 64 {
             self.refill(reader)?;
@@ -293,7 +295,7 @@ impl BitStream {
                 pos += ((fast_ac >> 4) & 15) as usize;
                 let t_pos = UN_ZIGZAG[min(pos, 63)] & 63;
 
-                block[t_pos] = i32::from(fast_ac >> 8) * (qt_table[t_pos]);
+                block[t_pos] = (i32::from(fast_ac >> 8) * qt_table[t_pos]) as i16;
                 self.drop_bits((fast_ac & 15) as u8);
                 pos += 1;
             } else {
@@ -308,7 +310,7 @@ impl BitStream {
                     symbol = huff_extend(r, symbol);
                     let t_pos = UN_ZIGZAG[pos & 63] & 63;
 
-                    block[t_pos] = symbol * qt_table[t_pos];
+                    block[t_pos] = (symbol * qt_table[t_pos]) as i16;
 
                     pos += 1;
                 } else if r != 15 {
@@ -815,7 +817,10 @@ impl HotStream {
     }
 
     /// 解码 DC 系数到 `dc_prediction`（1:1 复刻 `BitStream::decode_dc`）。
+    /// 注：基线热路径已迁移至 `decode_block_inner`（cs_lut 单探测），本函数保留作
+    /// 语义参照（dormancy，K24），勿删。
     #[inline(always)]
+    #[allow(dead_code)]
     fn decode_dc<'a>(
         &mut self,
         reader: &mut ByteReader<'a>,
@@ -843,7 +848,10 @@ impl HotStream {
     }
 
     /// 丢弃 DC 系数（无需结果）。
+    /// 注：基线热路径已迁移至 `decode_block_inner`（cs_lut 单探测），本函数保留作
+    /// 语义参照（dormancy，K24），勿删。
     #[inline(always)]
+    #[allow(dead_code)]
     fn discard_dc<'a>(
         &mut self,
         reader: &mut ByteReader<'a>,
@@ -878,64 +886,13 @@ impl HotStream {
         dc_table: &HuffmanTable,
         ac_table: &HuffmanTable,
         qt_table: &[i32; DCT_BLOCK],
-        block: &mut [i32; 64],
+        block: &mut [i16; 64],
         dc_prediction: &mut i32,
     ) -> Result<u16, DecodeError> {
-        let ac_lookup = ac_table.ac_lookup.as_ref().unwrap();
-
-        let (mut symbol, mut r, mut fast_ac);
-        let mut pos: usize = 1;
-        if self.bits_left < 1 && self.marker.is_some() {
-            return Err(DecodeError::Format(
-                "No more bytes left in stream before marker".to_string(),
-            ));
-        }
-        // 解码 DC
-        self.decode_dc(reader, dc_table, dc_prediction)?;
-
-        block[0] = *dc_prediction * qt_table[0];
-
-        while pos < 64 {
-            self.refill(reader)?;
-            symbol = self.peek_bits::<HUFF_LOOKAHEAD>();
-            fast_ac = ac_lookup[symbol as usize];
-
-            if fast_ac != 0 {
-                // FAST AC 路径（多数符号）：只做一次查询就够
-                pos += ((fast_ac >> 4) & 15) as usize;
-                let t_pos = UN_ZIGZAG[min(pos, 63)] & 63;
-
-                block[t_pos] = i32::from(fast_ac >> 8) * (qt_table[t_pos]);
-                self.drop_bits((fast_ac & 15) as u8);
-                pos += 1;
-            } else {
-                symbol = ac_table.lookup[symbol as usize];
-                decode_huff!(self, symbol, ac_table);
-
-                r = symbol >> 4;
-                symbol &= 15;
-
-                if symbol != 0 {
-                    pos += r as usize;
-                    r = self.get_bits(symbol as u8);
-                    symbol = huff_extend(r, symbol);
-                    let t_pos = UN_ZIGZAG[pos & 63] & 63;
-
-                    block[t_pos] = symbol * qt_table[t_pos];
-
-                    pos += 1;
-                } else if r != 15 {
-                    return Ok(pos as u16);
-                } else {
-                    pos += 16;
-                }
-            }
-        }
-
-        Ok(64)
+        self.decode_block_inner(reader, dc_table, ac_table, qt_table, Some(block), dc_prediction)
     }
 
-    /// 跳过（丢弃）一个 MCU 块，但更新 DC 预测（1:1 复刻 `BitStream::discard_mcu_block`）。
+    /// 跳过（丢弃）一个 MCU 块；不落系数（位流消费与 `decode_mcu_block` 逐位一致）。
     #[inline(always)]
     pub(crate) fn discard_mcu_block<'a>(
         &mut self,
@@ -943,41 +900,131 @@ impl HotStream {
         dc_table: &HuffmanTable,
         ac_table: &HuffmanTable,
     ) -> Result<u16, DecodeError> {
-        let ac_lookup = ac_table.ac_lookup.as_ref().unwrap();
+        let mut disc_pred = 0;
+        self.decode_block_inner(reader, dc_table, ac_table, &[0; DCT_BLOCK], None, &mut disc_pred)
+    }
 
-        let (mut symbol, mut r, mut fast_ac);
-        let mut pos: usize = 1;
+    /// 熵解码共享内核（C# `JpegCore.DecodeBlockCore` 同构，JpegCore.cs:1021）：
+    ///
+    /// - DC/AC 都用 11 位值打包快速表 `cs_lut`（`JpegHuffman.BuildLut`）：一次探测解出
+    ///   (低 5 位消耗位数, 位 6-9 码长, 位 10 LutFull, 位 11-18 run/size, 位 21-31 已扩展
+    ///   幅值)，单次 `aligned_buffer <<= (e & 31)` 消费（位 5 恒 0，`e&31==e&63`）；幅值
+    ///   出窗时退「丢码长 + 读 t 位扩展」；`e==0`（码长 > 11）退 `decode_huff!` 慢路径。
+    ///   位消耗总量与旧实现逐符号一致，故 refill/marker 探测时机不变。
+    /// - 反量化契约不变：DC=(i64 乘积)as i16、AC=(v·q)as i16、`min(pos,63)` 挡越界。
+    /// - `block=None` 只消费位流不落系数（discard 路径）。
+    #[inline(always)]
+    fn decode_block_inner<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        dc_table: &HuffmanTable,
+        ac_table: &HuffmanTable,
+        qt_table: &[i32; DCT_BLOCK],
+        mut block: Option<&mut [i16; 64]>,
+        dc_prediction: &mut i32,
+    ) -> Result<u16, DecodeError> {
+        let dc_cs = &dc_table.cs_lut;
+        let ac_cs = &ac_table.cs_lut;
 
-        self.discard_dc(reader, dc_table)?;
+        // marker 且 0 位在块起始：仅解码路径保留此防御检查（与旧 `decode_mcu_block`
+        // 一致）；discard 路径旧实现无此检查，为保持其逐位语义不加。
+        if block.is_some() && self.bits_left < 1 && self.marker.is_some() {
+            return Err(DecodeError::Format(
+                "No more bytes left in stream before marker".to_string(),
+            ));
+        }
 
-        while pos < 64 {
+        // --- DC ---
+        if self.bits_left < 32 {
             self.refill(reader)?;
-            symbol = self.peek_bits::<HUFF_LOOKAHEAD>();
-            fast_ac = ac_lookup[symbol as usize];
-
-            if fast_ac != 0 {
-                // FAST AC 路径（只做一次查询）
-                pos += ((fast_ac >> 4) & 15) as usize;
-
-                self.drop_bits((fast_ac & 15) as u8);
-                pos += 1;
+        }
+        let mut e = dc_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+        let diff = if (e & CS_LUT_FULL) != 0 {
+            // 值在窗口内：单次移位消费码长+幅值（DC 表符号恒 ≤15，建表已校验）。
+            let n = (e & 31) as u8;
+            self.aligned_buffer <<= n;
+            self.bits_left = self.bits_left.saturating_sub(n);
+            e >> CS_VALUE_SHIFT
+        } else if e != 0 {
+            // 码在窗内但幅值出窗：先丢码长，再读 t 位幅值并按 JPEG EXTEND 扩展。
+            let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
+            let t = ((e >> 11) & 15) as u8;
+            self.aligned_buffer <<= len;
+            let mag = (self.aligned_buffer >> (64 - t)) as i32;
+            self.aligned_buffer <<= t;
+            self.bits_left = self.bits_left.saturating_sub(len + t);
+            huff_extend(mag, i32::from(t))
+        } else {
+            // 码长 > 11：慢路径（zune 风格）。
+            let mut symbol =
+                dc_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+            decode_huff!(self, symbol, dc_table);
+            if symbol != 0 {
+                let r = self.get_bits(symbol as u8);
+                huff_extend(r, symbol)
             } else {
-                symbol = ac_table.lookup[symbol as usize];
+                0
+            }
+        };
+        *dc_prediction = dc_prediction.wrapping_add(diff);
+        if let Some(block) = block.as_deref_mut() {
+            block[0] = (i64::from(*dc_prediction) * i64::from(qt_table[0])) as i16;
+        }
+
+        // --- AC ---
+        let mut pos: usize = 1;
+        loop {
+            if self.bits_left < 32 {
+                self.refill(reader)?;
+            }
+            e = ac_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+            let (rs, v) = if (e & CS_LUT_FULL) != 0 {
+                // 完整条目（含 EOB/ZRL 单探测）：一次消费（码长+幅值）。
+                let n = (e & 31) as u8;
+                self.aligned_buffer <<= n;
+                self.bits_left = self.bits_left.saturating_sub(n);
+                (((e >> 11) & 255) as u8, e >> CS_VALUE_SHIFT)
+            } else if e != 0 {
+                // 码在窗内、幅值出窗。
+                let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
+                self.aligned_buffer <<= len;
+                let rs = ((e >> 11) & 255) as u8;
+                let t = (rs & 15) as u8;
+                let mag = (self.aligned_buffer >> (64 - t)) as i32;
+                self.aligned_buffer <<= t;
+                self.bits_left = self.bits_left.saturating_sub(len + t);
+                (rs, if t != 0 { huff_extend(mag, i32::from(t)) } else { 0 })
+            } else {
+                // 码长 > 11：慢路径。
+                let mut symbol =
+                    ac_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
                 decode_huff!(self, symbol, ac_table);
-
-                r = symbol >> 4;
-                symbol &= 15;
-
-                if symbol != 0 {
-                    pos += r as usize;
-                    let _ = self.get_bits(symbol as u8);
-
-                    pos += 1;
-                } else if r != 15 {
-                    return Ok(pos as u16);
+                let rs = symbol as u8;
+                let size = (rs & 15) as u8;
+                let v = if size != 0 {
+                    let r = self.get_bits(size);
+                    huff_extend(r, i32::from(size))
                 } else {
-                    pos += 16;
+                    0
+                };
+                (rs, v)
+            };
+
+            if (rs & 15) != 0 {
+                pos += ((rs >> 4) & 15) as usize;
+                if let Some(block) = block.as_deref_mut() {
+                    let t_pos = UN_ZIGZAG[min(pos, 63)] & 63;
+                    block[t_pos] = (v * qt_table[t_pos]) as i16;
                 }
+                pos += 1;
+            } else if rs != 0xF0 {
+                return Ok(pos as u16); // EOB
+            } else {
+                pos += 16; // ZRL
+            }
+
+            if pos >= 64 {
+                break;
             }
         }
 

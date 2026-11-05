@@ -1,18 +1,17 @@
-//! MCU 解码主循环（1:1 复刻 zune-jpeg `mcu.rs`/`mcu_prog.rs` 的 baseline 部分）。
+//! MCU 解码主循环（baseline/progressive；数值核心 = C# 逐字节恒等的 `cs.rs`）。
 
 use core::cmp::{max, min};
 
-use crate::codecs::jpeg::avx2::{idct4x4, idct_int, zero_tmp_window};
 use crate::codecs::jpeg::bitstream::{BitStream, HotStream};
-use crate::codecs::jpeg::color::color_convert;
+use crate::codecs::jpeg::cs;
+use crate::codecs::jpeg::cs::{CsInput, R_ONE_TO_ONE};
 use crate::codecs::jpeg::error::DecodeError;
-use crate::codecs::jpeg::idct::idct_int_1x1;
 use crate::codecs::jpeg::io::{ByteReader, Marker};
 use crate::codecs::jpeg::segment::{
-    calculate_padded_width, ColorSpace, Decoder, SampleRatios, Stage, StageProfile, DCT_BLOCK,
+    ColorSpace, Decoder, SampleRatios, Stage, StageProfile, DCT_BLOCK,
     MAX_COMPONENTS,
 };
-use crate::codecs::jpeg::upsampler::{upsample, upsample_generic, upsample_no_op};
+use crate::codecs::jpeg::upsampler::{upsample_generic, upsample_no_op};
 
 /// MCU 行解码后的续接方式。
 enum McuContinuation {
@@ -207,10 +206,8 @@ impl<'a> Decoder<'a> {
         }
         let width = self.width;
 
-        let padded_width = calculate_padded_width(width, self.sample_ratio);
-
         let mut stream = BitStream::new();
-        let mut tmp = [0_i32; DCT_BLOCK];
+        let mut tmp = [0_i16; DCT_BLOCK];
 
         let comp_len = self.components.len();
 
@@ -232,10 +229,13 @@ impl<'a> Decoder<'a> {
             }
         }
 
+        // 初始化 C# 数值核心状态（环/垂直游标/上采样核）。
+        self.init_cs_tail();
+
         // 全部分量都在首个 scan 内 → 可直接逐 MCU 后处理；
-        // 否则需先缓冲全部分量到 `progressive_mcus`。
+        // 否则需先缓冲全部分量到 `progressive_mcus`（u8 采样字节平面）。
         let all_components_in_first_scan = usize::from(self.num_scans) == self.components.len();
-        let mut progressive_mcus: [Vec<i16>; 4] = core::array::from_fn(|_| vec![]);
+        let mut progressive_mcus: [Vec<u8>; 4] = core::array::from_fn(|_| vec![]);
 
         if !all_components_in_first_scan {
             for (component, mcu) in self.components.iter().zip(&mut progressive_mcus) {
@@ -248,25 +248,13 @@ impl<'a> Decoder<'a> {
             }
         }
 
-        let mut pixels_written = 0;
-
-        let is_hv = usize::from(self.is_interleaved);
-        let upsampler_scratch_size = is_hv
-            * self
-                .components
-                .iter()
-                .map(|x| x.width_stride)
-                .max()
-                .unwrap_or(0)
-            * 8;
-        let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
-
         self.stage.stop(Stage::Setup, t_setup);
 
         'sos: loop {
             for i in 0..mcu_height {
                 if stream.overread_by > 0 {
-                    pixels.get_mut(pixels_written..).map(|v| v.fill(128));
+                    pixels.get_mut(self.cs_out_row * width * self.out_bpp()..)
+                        .map(|v| v.fill(128));
                     break;
                 }
 
@@ -293,15 +281,7 @@ impl<'a> Decoder<'a> {
 
                 let t_post = self.stage.timer();
                 if all_components_in_first_scan {
-                    self.post_process(
-                        pixels,
-                        i,
-                        mcu_height,
-                        width,
-                        padded_width,
-                        &mut pixels_written,
-                        &mut upsampler_scratch_space,
-                    )?;
+                    self.post_process(pixels, i, width)?;
                 }
                 self.stage.stop(Stage::Post, t_post);
 
@@ -321,7 +301,9 @@ impl<'a> Decoder<'a> {
                         }
                     }
                     McuContinuation::Terminate => {
-                        pixels.get_mut(pixels_written..).map(|v| v.fill(128));
+                        pixels
+                            .get_mut(self.cs_out_row * width * self.out_bpp()..)
+                            .map(|v| v.fill(128));
                         return Ok(());
                     }
                 }
@@ -345,18 +327,12 @@ impl<'a> Decoder<'a> {
     /// 非交织多 scan 结束时按分量组装并后处理。
     pub(crate) fn finish_baseline_decoding(
         &mut self,
-        block: &[Vec<i16>; MAX_COMPONENTS],
+        block: &[Vec<u8>; MAX_COMPONENTS],
         _mcu_width: usize,
         pixels: &mut [u8],
     ) -> Result<(), DecodeError> {
         let mcu_height = self.mcu_y;
-
-        let is_hv = usize::from(self.is_interleaved);
-        let upsampler_scratch_size = is_hv * self.components.first().map(|c| c.width_stride).unwrap_or(0);
         let width = self.width;
-        let padded_width = calculate_padded_width(width, self.sample_ratio);
-
-        let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
 
         for (pos, comp) in self.components.iter_mut().enumerate() {
             if min(
@@ -372,7 +348,7 @@ impl<'a> Decoder<'a> {
             }
         }
 
-        let mut pixels_written = 0;
+        self.init_cs_tail();
 
         for i in 0..mcu_height {
             for (position, component) in self.components.iter_mut().enumerate() {
@@ -386,19 +362,17 @@ impl<'a> Decoder<'a> {
                     Some(s) => s,
                     None => return Err(DecodeError::Format("Invalid component data".to_string())),
                 };
-                let temp_channel = &mut component.raw_coeff;
-                temp_channel[..step].copy_from_slice(slice);
+                // 缓冲平面按绝对行存放；拷入 cs 环对应 MCU 行的一半
+                let ring_off = (i & 1) * component.cs_rows_mcu * component.cs_w2;
+                for (dst, &src) in component.cs_ring[ring_off..ring_off + step]
+                    .iter_mut()
+                    .zip(slice.iter())
+                {
+                    *dst = src as u8;
+                }
             }
 
-            self.post_process(
-                pixels,
-                i,
-                mcu_height,
-                width,
-                padded_width,
-                &mut pixels_written,
-                &mut upsampler_scratch_space,
-            )?;
+            self.post_process(pixels, i, width)?;
         }
 
         Ok(())
@@ -409,9 +383,9 @@ impl<'a> Decoder<'a> {
         &mut self,
         mcu_width: usize,
         mcu_height: usize,
-        tmp: &mut [i32; 64],
+        tmp: &mut [i16; 64],
         stream: &mut BitStream,
-        progressive: &mut [Vec<i16>; 4],
+        progressive: &mut [Vec<u8>; 4],
     ) -> Result<McuContinuation, DecodeError> {
         let is_one_by_one = !self.scan_subsampled;
 
@@ -439,15 +413,12 @@ impl<'a> Decoder<'a> {
         &mut self,
         mcu_width: usize,
         mcu_height: usize,
-        tmp: &mut [i32; 64],
+        tmp: &mut [i16; 64],
         stream: &mut BitStream,
-        progressive: &mut [Vec<i16>; 4],
+        progressive: &mut [Vec<u8>; 4],
     ) -> Result<McuContinuation, DecodeError> {
         let z_order = self.z_order;
         let z_scans = &z_order[..usize::from(self.num_scans)];
-
-        // 上次 MCU 解码写入了 tmp 的多少：只用于 `fill` 的优化。
-        let mut clobber_more_than_4x4 = true;
 
         // 消融开关（仅 profile 模式生效，进程内只读一次）：墙钟差值得 entropy/idct 占比。
         let skip_entropy = StageProfile::skip_entropy();
@@ -487,21 +458,6 @@ impl<'a> Decoder<'a> {
                     .ok_or_else(|| DecodeError::Format("AC table not found".to_string()))?;
 
                 let qt_table = &component.quantization_table;
-                let channel = if PROGRESSIVE {
-                    let offset =
-                        mcu_height * component.width_stride * 8 * component.vertical_sample;
-                    let tail = match progressive[k].get_mut(offset..) {
-                        Some(t) => t,
-                        None => {
-                            return Err(DecodeError::Format(
-                                "Would panic on slice iteration".to_string(),
-                            ))
-                        }
-                    };
-                    tail
-                } else {
-                    &mut component.raw_coeff
-                };
 
                 let component_samples_needed = component.needed;
 
@@ -524,13 +480,13 @@ impl<'a> Decoder<'a> {
                         let result = if skip_entropy {
                             // 消融：跳过熵解码，tmp 填零、len=64（不消费位流；restart 语义靠调用方不触发）
                             if component_samples_needed {
-                                zero_tmp_window(tmp, 64);
+                                tmp.fill(0);
                             }
                             Ok(64u16)
                         } else if component_samples_needed {
-                            let clobber_len = if !clobber_more_than_4x4 { 32 } else { 64 };
-
-                            zero_tmp_window(tmp, clobber_len);
+                            // C# `DecodeBlockCore` 每块清零全部 64 系数：不再用「只清首 32」
+                            // 的窗口优化——稀疏块会混入上一满块的高位残值，污染全量 f32 IDCT。
+                            tmp.fill(0);
 
                             hot.decode_mcu_block(
                                 &mut self.reader,
@@ -556,35 +512,36 @@ impl<'a> Decoder<'a> {
                         };
 
                         if component_samples_needed {
-                            clobber_more_than_4x4 = len > 10;
-
-                            let idct_position = if PROGRESSIVE {
-                                // 非交织：j 直接索引数据单元
-                                j * 8
-                            } else {
-                                let c2 = v_samp * 8;
-                                let c3 = ((j * component.horizontal_sample) + h_samp) * 8;
-
-                                component.width_stride * c2 + c3
-                            };
-
-                            let idct_pos = match channel.get_mut(idct_position..) {
-                                Some(p) => p,
-                                None => {
-                                    return Err(DecodeError::Format(
-                                        "IDCT position out of bounds".to_string(),
-                                    ))
-                                }
-                            };
-
                             let t_idct = self.stage.busy_timer();
                             if !skip_idct {
-                                if len <= 1 {
-                                    idct_int_1x1(tmp, idct_pos, component.width_stride);
-                                } else if len <= 10 {
-                                    idct4x4(tmp, idct_pos, component.width_stride);
+                                // 目标字节平面：PROGRESSIVE 缓冲到 `progressive[k]`（整帧样本平面），
+                                // 否则写 cs 环当前 MCU 行半区（C# `IdctToRing` 同款偏移）。
+                                let (out, off, stride) = if PROGRESSIVE {
+                                    let off0 = mcu_height * component.width_stride * 8
+                                        * component.vertical_sample
+                                        + j * 8;
+                                    (
+                                        &mut progressive[k][..],
+                                        off0,
+                                        component.width_stride,
+                                    )
                                 } else {
-                                    idct_int(tmp, idct_pos, component.width_stride);
+                                    let c2 = v_samp * 8;
+                                    let c3 = ((j * component.horizontal_sample) + h_samp) * 8;
+                                    let ring_off =
+                                        ((mcu_height & 1) * component.vertical_sample * 8 + c2)
+                                            * component.width_stride
+                                            + c3;
+                                    (
+                                        &mut component.cs_ring[..],
+                                        ring_off,
+                                        component.width_stride,
+                                    )
+                                };
+                                if len <= 1 {
+                                    cs::idct8x8_dc_only(tmp[0], out, off, stride);
+                                } else {
+                                    cs::idct8x8(tmp, out, off, stride);
                                 }
                             }
                             self.stage.busy_stop(Stage::Idct, t_idct);
@@ -748,149 +705,181 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
-    /// 逐行后处理：上采样 + 颜色换算写入输出。
-    #[allow(clippy::too_many_arguments)]
-    fn post_process(
-        &mut self,
-        pixels: &mut [u8],
-        i: usize,
-        mcu_height: usize,
-        width: usize,
-        padded_width: usize,
-        pixels_written: &mut usize,
-        upsampler_scratch_space: &mut [i16],
-    ) -> Result<(), DecodeError> {
-        let out_colorspace_components = self.out_colorspace.num_components();
+    /// 输出每像素字节数（对齐 C# `_outBpp`）。
+    fn out_bpp(&self) -> usize {
+        self.out_colorspace.num_components()
+    }
 
-        let mut px = *pixels_written;
-        // 是否垂直上采样
-        let is_vertically_sampled = self
+    /// 初始化 C# 数值核心状态：环 / 垂直游标 / 上采样核（每 decode 一次，幂等）。
+    fn init_cs_tail(&mut self) {
+        if self.cs_inited {
+            return;
+        }
+        self.cs_inited = true;
+        self.cs_out_row = 0;
+
+        let in_cs = self.input_colorspace;
+        let is_rgb = in_cs == ColorSpace::RGB;
+        self.cs_is_rgb_input = is_rgb;
+        self.cs_input_kind = match in_cs {
+            ColorSpace::Luma | ColorSpace::LumaA => CsInput::Luma,
+            ColorSpace::RGB => CsInput::Rgb,
+            ColorSpace::YCbCr => CsInput::Ycc,
+            ColorSpace::CMYK => CsInput::Cmyk,
+            ColorSpace::YCCK => CsInput::Ycck,
+            _ => CsInput::Other,
+        };
+
+        let comps = self.components.len();
+        let h_max = self.h_max;
+        let v_max = self.v_max;
+        let width = self.width;
+        let height = self.height;
+
+        // 各分量 Hs/Vs 先算好，避免逐分量的可变借用贴着 h_max 读取。
+        let ratios: Vec<(usize, usize)> = self
             .components
             .iter()
-            .any(|c| c.sample_ratio == SampleRatios::HV || c.sample_ratio == SampleRatios::V);
+            .map(|c| (h_max / c.horizontal_sample, v_max / c.vertical_sample))
+            .collect();
 
-        let mut comp_len = self.components.len();
+        for (comp, (hs, vs)) in self.components.iter_mut().zip(ratios) {
+            comp.cs_hs = hs;
+            comp.cs_vs = vs;
+            comp.cs_resample_kind = match (hs, vs) {
+                (1, 1) => R_ONE_TO_ONE,
+                (1, 2) => cs::R_V2,
+                (2, 1) => cs::R_H2,
+                (2, 2) => cs::R_HV2,
+                _ => cs::R_GENERIC,
+            };
+            comp.cs_w2 = comp.width_stride;
+            comp.cs_wlores = width.div_ceil(hs);
+            comp.cs_ys_scaled = (height * comp.vertical_sample + v_max - 1) / v_max;
+            comp.cs_rows_mcu = comp.vertical_sample * 8;
+            comp.cs_ring_rows = 2 * comp.cs_rows_mcu;
+            let n_out = cs::output_count(comp.cs_resample_kind, comp.cs_wlores, hs) + 3;
+            comp.cs_line_buf8 = vec![0u8; n_out];
+            comp.cs_line_buf16 = vec![0u16; n_out];
 
-        // YCbCr -> Luma 时只取第一个分量
-        if out_colorspace_components < comp_len && self.out_colorspace == ColorSpace::Luma {
-            comp_len = out_colorspace_components;
+            if comp.needed {
+                // C# `Ring.Clear()`：未覆盖的 padding 样本确定性为 0。
+                comp.cs_ring = vec![0u8; comp.cs_ring_rows * comp.cs_w2];
+            } else {
+                comp.cs_ring.clear();
+            }
+            comp.cs_line0 = 0;
+            comp.cs_line1 = 0;
+            // C# `PrepareOutput`：`YStep = Vs >> 1`（源码为准，勿改成 0——顶部两行的
+            // ¾/¼ 混合相位依赖它）。
+            comp.cs_ystep = vs >> 1;
+            comp.cs_ypos = 0;
+            comp.cs_rows_avail = 0;
+            comp.cs_chroma_ready = false;
+            comp.cs_row_is_ring = true;
+            comp.cs_row_near = 0;
         }
-        let input_colorspace = self.input_colorspace;
-        let out_colorspace = self.out_colorspace;
 
-        let mut color_conv_function =
-            |num_iters: usize, samples: [&[i16]; MAX_COMPONENTS]| -> Result<(), DecodeError> {
-                for (pos, output) in pixels[px..]
-                    .chunks_exact_mut(width * out_colorspace_components)
-                    .take(num_iters)
-                    .enumerate()
-                {
-                    let mut raw_samples: [&[i16]; MAX_COMPONENTS] = [&[], &[], &[], &[]];
+        // `_chroma16`：ycc 且分量 1/2 任一生效核非 OneToOne。
+        let ycc = (comps == 3 && !is_rgb) || in_cs == ColorSpace::YCCK;
+        self.cs_chroma16 = ycc
+            && (self.components.get(1).is_some_and(|c| c.cs_resample_kind != R_ONE_TO_ONE)
+                || self.components.get(2).is_some_and(|c| c.cs_resample_kind != R_ONE_TO_ONE));
+    }
 
-                    for (j, samp) in raw_samples.iter_mut().enumerate().take(comp_len) {
-                        let temp = samples[j].get(pos * padded_width..(pos + 1) * padded_width);
-                        if temp.is_none() {
-                            return Err(DecodeError::Format("Missing samples".to_string()));
-                        }
-                        *samp = temp.unwrap();
-                    }
-                    color_convert(
-                        &raw_samples,
-                        input_colorspace,
-                        out_colorspace,
-                        output,
-                        width,
-                        padded_width,
-                    )?;
-                    px += width * out_colorspace_components;
+    /// 逐行后处理：等价 C# `CommitMcuRow` + `EmitRows` + `EmitRow`。
+    /// `m` = 当前 MCU 行；每调一次先提交该行的 `RowsAvail`，再尽可能多地输出行。
+    fn post_process(&mut self, pixels: &mut [u8], m: usize, width: usize) -> Result<(), DecodeError> {
+        for comp in &mut self.components {
+            comp.cs_rows_avail = (m + 1) * comp.cs_rows_mcu;
+        }
+
+        let out_bpp = self.out_colorspace.num_components();
+        let chroma16 = self.cs_chroma16;
+        let input_kind = self.cs_input_kind;
+        let out_x = width;
+        let height = self.height;
+        let out_bytes = out_x * out_bpp;
+
+        while self.cs_out_row < height {
+            // C# `EmitRows` 门：任一分量 Line1 未就绪 → 等下一 MCU 行
+            let ready = self.components.iter().all(|c| c.cs_line1 < c.cs_rows_avail);
+            if !ready {
+                break;
+            }
+
+            // 逐分量：选近/远源行 → 上采样（16× 或 8 位）→ AdvanceLine
+            for k in 0..self.components.len() {
+                let comp = &mut self.components[k];
+                if !comp.needed {
+                    comp.cs_advance_line();
+                    comp.cs_row_is_ring = true;
+                    comp.cs_row_near = 0;
+                    continue;
                 }
-                Ok(())
+                let y_bot = comp.cs_ystep >= (comp.cs_vs >> 1);
+                let in_near = comp.cs_ring_offset(if y_bot { comp.cs_line1 } else { comp.cs_line0 });
+                let in_far = comp.cs_ring_offset(if y_bot { comp.cs_line0 } else { comp.cs_line1 });
+
+                if chroma16 && (k == 1 || k == 2) {
+                    cs::row16(
+                        comp.cs_resample_kind,
+                        &mut comp.cs_line_buf16,
+                        &comp.cs_ring,
+                        in_near,
+                        in_far,
+                        comp.cs_wlores,
+                        comp.cs_hs,
+                    );
+                    comp.cs_chroma_ready = true;
+                    comp.cs_row_is_ring = false;
+                } else if comp.cs_resample_kind == R_ONE_TO_ONE {
+                    comp.cs_row_is_ring = true;
+                    comp.cs_row_near = in_near;
+                } else {
+                    cs::row8(
+                        comp.cs_resample_kind,
+                        &mut comp.cs_line_buf8,
+                        &mut comp.cs_line_buf16,
+                        &comp.cs_ring,
+                        in_near,
+                        in_far,
+                        comp.cs_wlores,
+                        comp.cs_hs,
+                    );
+                    comp.cs_row_is_ring = false;
+                }
+                comp.cs_advance_line();
+            }
+
+            let j = self.cs_out_row;
+            let row_out = match pixels.get_mut(j * out_bytes..j * out_bytes + out_bytes) {
+                Some(s) => s,
+                None => return Err(DecodeError::Format("Output row out of bounds".to_string())),
             };
 
-        let comps = &mut self.components[..];
-
-        if self.is_interleaved && self.out_colorspace != ColorSpace::Luma {
-            let t_upsample = self.stage.timer();
-            for comp in comps.iter_mut() {
-                upsample(
-                    comp,
-                    mcu_height,
-                    i,
-                    upsampler_scratch_space,
-                    is_vertically_sampled,
-                )?;
-            }
-            self.stage.stop(Stage::Upsample, t_upsample);
-
-            if is_vertically_sampled {
-                if i > 0 {
-                    // 写出上一行未上采样的行（之前无 row_down）
-                    let mut samples: [&[i16]; MAX_COMPONENTS] = [&[], &[], &[], &[]];
-
-                    for (samp, component) in samples.iter_mut().zip(comps.iter()) {
-                        *samp = &component.first_row_upsample_dest;
-                    }
-
-                    let num_iters = self.coeff * self.v_max;
-
-                    let t_color = self.stage.timer();
-                    color_conv_function(num_iters, samples)?;
-                    self.stage.stop(Stage::Color, t_color);
-                }
-
-                // 上采样完最后一行后，保存可用于下次上采样的行
-                for component in comps.iter_mut() {
-                    if component.sample_ratio != SampleRatios::H {
-                        let size = component.vertical_sample
-                            * component.width_stride
-                            * component.sample_ratio.sample();
-
-                        let last_bytes =
-                            component.raw_coeff.rchunks_exact_mut(size).next().unwrap();
-
-                        component
-                            .first_row_upsample_dest
-                            .copy_from_slice(last_bytes);
-                    }
-                }
-            }
-
-            let mut samples: [&[i16]; MAX_COMPONENTS] = [&[], &[], &[], &[]];
-
-            for (samp, component) in samples.iter_mut().zip(comps.iter()) {
-                *samp = if component.sample_ratio == SampleRatios::None {
-                    &component.raw_coeff
+            // 组每分量 8 位行源（环直读或 line_buf8）
+            let mut rows: [&[u8]; 4] = [&[], &[], &[], &[]];
+            for k in 0..self.components.len().min(4) {
+                let comp = &self.components[k];
+                if comp.cs_row_is_ring {
+                    rows[k] = comp.cs_ring.get(comp.cs_row_near..).unwrap_or(&[]);
                 } else {
-                    &component.upsample_dest
-                };
+                    rows[k] = &comp.cs_line_buf8;
+                }
+            }
+            // 16× 色度行源（chroma16 时）
+            let mut rows16: [&[u16]; 4] = [&[], &[], &[], &[]];
+            if chroma16 {
+                for k in 1..self.components.len().min(3) {
+                    rows16[k] = &self.components[k].cs_line_buf16;
+                }
             }
 
-            // 垂直采样时除最后一行外少做一次迭代
-            let is_last_considered = is_vertically_sampled && (i != mcu_height.saturating_sub(1));
-
-            let num_iters = (8 - usize::from(is_last_considered)) * self.coeff * self.v_max;
-
-            let t_color = self.stage.timer();
-            color_conv_function(num_iters, samples)?;
-            self.stage.stop(Stage::Color, t_color);
-        } else {
-            let mut channels_ref: [&[i16]; MAX_COMPONENTS] = [&[]; MAX_COMPONENTS];
-
-            self.components
-                .iter()
-                .enumerate()
-                .for_each(|(pos, x)| channels_ref[pos] = &x.raw_coeff);
-
-            let t_color = self.stage.timer();
-            if let SampleRatios::Generic(_, v) = self.sample_ratio {
-                color_conv_function(8 * v * self.coeff, channels_ref)?;
-            } else {
-                color_conv_function(8 * self.coeff, channels_ref)?;
-            }
-            self.stage.stop(Stage::Color, t_color);
+            cs::pack_output_row(input_kind, out_bpp, chroma16, &rows, &rows16, row_out, out_x);
+            self.cs_out_row += 1;
         }
 
-        *pixels_written = px;
         Ok(())
     }
 
@@ -1255,7 +1244,7 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
-    /// 渐进收尾：整帧反量化 → IDCT → 后处理（1:1 复刻 zune `finish_progressive_decoding`）。
+    /// 渐进收尾：整帧反量化 → f32 IDCT → 后处理（C# `EmitCoefficients` 同款）。
     #[allow(clippy::too_many_lines)]
     fn finish_progressive_decoding(
         &mut self,
@@ -1269,14 +1258,8 @@ impl<'a> Decoder<'a> {
             (self.height + 7) / 8
         };
 
-        // 输出图像尺寸（宽 × 高）
-        let is_hv = usize::from(self.is_interleaved);
-        let upsampler_scratch_size = is_hv * self.components[0].width_stride;
         let width = self.width;
-        let padded_width = calculate_padded_width(width, self.sample_ratio);
-
-        let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
-        let mut tmp = [0_i32; DCT_BLOCK];
+        let mut tmp = [0_i16; DCT_BLOCK];
 
         for (pos, comp) in self.components.iter_mut().enumerate() {
             // 仅分配需要的分量平面
@@ -1294,9 +1277,9 @@ impl<'a> Decoder<'a> {
             }
         }
 
-        let mut pixels_written = 0;
+        self.init_cs_tail();
 
-        // 反量化、IDCT、颜色换算
+        // 反量化、IDCT、输出（逐 MCU 行）
         for i in 0..mcu_height {
             for (position, component) in self.components.iter_mut().enumerate() {
                 if !component.needed {
@@ -1310,58 +1293,43 @@ impl<'a> Decoder<'a> {
 
                 let slice = &block[position][start..start + step];
 
-                let temp_channel = &mut component.raw_coeff;
-
                 // 每行 MCU 宽对应的数据单元数
                 let mcu_x = component.width_stride / 8;
 
-                let mut idct_pos = 0;
-
                 for k in 0..component.vertical_sample {
                     for j in 0..mcu_x {
-                        // 写到第 k 个垂直采样行：跳过 8 行
-                        let width_stride = k * 8 * component.width_stride;
-                        let start = j * 64 + width_stride;
-
-                        let Some(qt_slice) = slice.get(start..start + 64) else {
-                            return Err(DecodeError::Format(
-                                "Invalid slice , would panic, invalid image".to_string(),
-                            ));
+                        // 反量化（natural-order short wrap，C# `(short)(coeff×q)`）
+                        let start = j * 64 + k * 8 * component.width_stride;
+                        let qt_slice = match slice.get(start..start + 64) {
+                            Some(s) => s,
+                            None => {
+                                return Err(DecodeError::Format(
+                                    "Invalid slice , would panic, invalid image".to_string(),
+                                ))
+                            }
                         };
 
                         let t_idct = self.stage.busy_timer();
 
                         if !StageProfile::skip_idct() {
-                            // 反量化
                             for ((x, out), qt_val) in
                                 qt_slice.iter().zip(tmp.iter_mut()).zip(qt_table.iter())
                             {
-                                *out = i32::from(*x) * qt_val;
+                                *out = (i32::from(*x) * qt_val) as i16;
                             }
 
-                            let sl = &mut temp_channel[idct_pos..];
-
-                            idct_pos += 8;
-                            // tmp 现为反量化后的块，做 IDCT（整块右移 & clamp 与 baseline 同源）
-                            idct_int(&mut tmp, sl, component.width_stride);
+                            // 环偏移：C# `((m&1)*RowsPerMcu + v*8)*W2 + bx*8`
+                            let ring_off =
+                                (((i & 1) * component.vertical_sample) + k) * 8 * component.width_stride
+                                    + j * 8;
+                            cs::idct8x8(&tmp, &mut component.cs_ring, ring_off, component.width_stride);
                         }
                         self.stage.busy_stop(Stage::Idct, t_idct);
                     }
-                    // 每写完 8 行后跳过 7 个 stride 至下一垂直块行
-                    idct_pos += 7 * component.width_stride;
                 }
             }
 
-            // 处理该宽度直至不可再处理
-            self.post_process(
-                pixels,
-                i,
-                mcu_height,
-                width,
-                padded_width,
-                &mut pixels_written,
-                &mut upsampler_scratch_space,
-            )?;
+            self.post_process(pixels, i, width)?;
         }
 
         Ok(())

@@ -30,7 +30,9 @@ pub(crate) const DCT_BLOCK: usize = 64;
 pub(crate) enum Stage {
     Entropy,
     Idct,
+    #[allow(dead_code)] // C# 语义换主后不再单独计时
     Upsample,
+    #[allow(dead_code)]
     Color,
     Total,
     Header,
@@ -300,6 +302,38 @@ pub(crate) struct Component {
     pub(crate) first_row_upsample_dest: Vec<i16>,
     pub(crate) sample_ratio: SampleRatios,
     pub(crate) fix_an_annoying_bug: usize,
+    // ---- C# 数值核心状态（`cs.rs`；zune 上采样/颜色两套并行，csharp 路径用此） ----
+    /// 双 MCU 行样本环（`RingRows × W2` 字节采样平面；RingOffset(row) = row%RingRows*W2）。
+    pub(crate) cs_ring: Vec<u8>,
+    /// 平面行宽（= `width_stride`）。
+    pub(crate) cs_w2: usize,
+    /// 水平 / 垂直采样倍率（`Hs = hMax/H`、`Vs = vMax/V`）。
+    pub(crate) cs_hs: usize,
+    pub(crate) cs_vs: usize,
+    /// 低分辨率样本数 `WLores = ceil(OutX / Hs)`。
+    pub(crate) cs_wlores: usize,
+    /// 平面高 `YsScaled = ceil(comp.Y / scale)`（scale=1）。
+    pub(crate) cs_ys_scaled: usize,
+    /// 每 MCU 行贡献的样本行数 `V*8` / 环总行数 `2*V*8`。
+    pub(crate) cs_rows_mcu: usize,
+    pub(crate) cs_ring_rows: usize,
+    /// 垂直上采样位置状态（C# `Line0/Line1/YStep/YPos`）。
+    pub(crate) cs_line0: usize,
+    pub(crate) cs_line1: usize,
+    pub(crate) cs_ystep: usize,
+    pub(crate) cs_ypos: usize,
+    /// 已解码平面行数（每 MCU 行提交后 = (m+1)*RowsPerMcu）。
+    pub(crate) cs_rows_avail: usize,
+    /// `JpegResample` 核类型（`cs::R_*`）。
+    pub(crate) cs_resample_kind: u8,
+    /// 8 位 / 16× 上采样行缓冲（`OutX+3` 容量）。
+    pub(crate) cs_line_buf8: Vec<u8>,
+    pub(crate) cs_line_buf16: Vec<u16>,
+    /// 本输出行的源：`cs_row_is_ring=true` → `cs_ring[cs_row_near..]`；否则 `cs_line_buf8`。
+    pub(crate) cs_row_is_ring: bool,
+    pub(crate) cs_row_near: usize,
+    /// 本输出行的 16× 色度是否已在 `cs_line_buf16`（供颜色核分辨色度 16/8 位/环）。
+    pub(crate) cs_chroma_ready: bool,
 }
 
 impl Component {
@@ -359,6 +393,25 @@ impl Component {
             first_row_upsample_dest: vec![],
             sample_ratio: SampleRatios::None,
             fix_an_annoying_bug: 1,
+            cs_ring: vec![],
+            cs_w2: 0,
+            cs_hs: 1,
+            cs_vs: 1,
+            cs_wlores: 0,
+            cs_ys_scaled: 0,
+            cs_rows_mcu: 0,
+            cs_ring_rows: 0,
+            cs_line0: 0,
+            cs_line1: 0,
+            cs_ystep: 0,
+            cs_ypos: 0,
+            cs_rows_avail: 0,
+            cs_resample_kind: crate::codecs::jpeg::cs::R_ONE_TO_ONE,
+            cs_line_buf8: vec![],
+            cs_line_buf16: vec![],
+            cs_row_is_ring: true,
+            cs_row_near: 0,
+            cs_chroma_ready: false,
         })
     }
 
@@ -370,6 +423,26 @@ impl Component {
             vec![128; self.vertical_sample * self.width_stride * self.sample_ratio.sample()];
         self.upsample_dest =
             vec![0; self.width_stride * self.sample_ratio.sample() * self.fix_an_annoying_bug * 8];
+    }
+
+    /// C# `RingOffset`: 平面行 → 环字节偏移（`row % RingRows * W2`）。
+    #[inline]
+    pub(crate) fn cs_ring_offset(&self, row: usize) -> usize {
+        (row % self.cs_ring_rows) * self.cs_w2
+    }
+
+    /// C# `AdvanceLine`: 每输出行步进垂直游标。
+    #[inline]
+    pub(crate) fn cs_advance_line(&mut self) {
+        self.cs_ystep += 1;
+        if self.cs_ystep >= self.cs_vs {
+            self.cs_ystep = 0;
+            self.cs_line0 = self.cs_line1;
+            self.cs_ypos += 1;
+            if self.cs_ypos < self.cs_ys_scaled {
+                self.cs_line1 += 1;
+            }
+        }
     }
 }
 
@@ -416,6 +489,17 @@ pub(crate) struct Decoder<'a> {
     pub(crate) exif_data: Option<Vec<u8>>,
     pub(crate) xmp_data: Option<Vec<u8>>,
     pub(crate) iptc_data: Option<Vec<u8>>,
+    // ---- C# 数值核心（`cs.rs`）解码级状态 ----
+    /// 已写出的输出行（从 0 单调递增到 `height`）。
+    pub(crate) cs_out_row: usize,
+    /// 色度是否走 16×（`_chroma16`）。
+    pub(crate) cs_chroma16: bool,
+    /// 3 分量输入是否 RGB 编码（`_isRgb`）。
+    pub(crate) cs_is_rgb_input: bool,
+    /// 输入颜色空间类别（选择输出行核）。
+    pub(crate) cs_input_kind: crate::codecs::jpeg::cs::CsInput,
+    /// 本次解码是否已初始化 cs 环（避免重复初始化）。
+    pub(crate) cs_inited: bool,
     /// 阶段计时探针（默认关闭，零开销）。
     pub(crate) stage: StageProfile,
 }
@@ -457,6 +541,11 @@ impl<'a> Decoder<'a> {
             exif_data: None,
             xmp_data: None,
             iptc_data: None,
+            cs_out_row: 0,
+            cs_chroma16: false,
+            cs_is_rgb_input: false,
+            cs_input_kind: crate::codecs::jpeg::cs::CsInput::Ycc,
+            cs_inited: false,
             stage: StageProfile {
                 enabled: StageProfile::enabled_by_env(),
                 ..Default::default()
@@ -1094,7 +1183,8 @@ fn unsupported_scheme_desc(int: u8) -> Option<String> {
     )
 }
 
-/// 计算按 16/8 对齐的填充宽度。
+/// 计算按 16/8 对齐的填充宽度（C# 语义换主后仅 dormant 引用）。
+#[allow(dead_code)]
 pub(crate) fn calculate_padded_width(actual_width: usize, sub_sample: SampleRatios) -> usize {
     match sub_sample {
         SampleRatios::None | SampleRatios::V => {

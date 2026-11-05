@@ -12,6 +12,8 @@
 // SIMD 内核文件统一豁免 `unsafe_op_in_unsafe_fn`（edition 2024；调用点本身仍是
 // `unsafe fn`，门控在分发层保证）。
 #![allow(unsafe_op_in_unsafe_fn)]
+// dormancy（K24）：C# 语义换主后，zune 整数内核保留编译不再被管线调用。
+#![allow(dead_code)]
 
 use crate::codecs::jpeg::color::{ycbcr_to_rgb_inner_16_scalar, ycbcr_to_rgba_inner_16_scalar};
 use crate::codecs::jpeg::idct::{idct4x4 as idct4x4_scalar, idct_int as idct_int_scalar};

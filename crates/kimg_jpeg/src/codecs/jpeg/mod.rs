@@ -11,6 +11,8 @@
 mod avx2;
 mod bitstream;
 mod color;
+mod cs;
+mod cs_avx2;
 mod error;
 mod huffman;
 mod idct;
