@@ -312,15 +312,11 @@ impl<'a> Decoder<'a> {
     pub(crate) fn parse_marker_inner(&mut self, m: Marker) -> Result<(), DecodeError> {
         match m {
             Marker::SOF(0..=2) => {
-                if m == Marker::SOF(0) || m == Marker::SOF(1) {
-                    // baseline（zune 把 SOF0/SOF1 都当 baseline 解）
-                    self.parse_start_of_frame()?;
-                } else {
-                    // SOF2 progressive：范围墙，不支持
-                    return Err(DecodeError::Unsupported(
-                        "progressive JPEG (SOF2) is not supported".to_string(),
-                    ));
+                if m == Marker::SOF(2) {
+                    // SOF2 progressive：标记渐进帧，随后按 zune 的解码流程处理
+                    self.is_progressive = true;
                 }
+                self.parse_start_of_frame()?;
             }
             Marker::SOF(v) => {
                 if let Some(feature) = unsupported_scheme_desc(v) {

@@ -25,6 +25,9 @@ enum McuContinuation {
     Terminate,
 }
 
+/// 渐进图像 scan 数上限（对齐 zune-core 默认 `max_scans = 100`）。
+const MAX_PROGRESSIVE_SCANS: u32 = 100;
+
 impl<'a> Decoder<'a> {
     /// 设置分量参数（行宽/量化表/交织信息/采样比例）。
     fn setup_component_params(&mut self) -> Result<(), DecodeError> {
@@ -843,6 +846,465 @@ impl<'a> Decoder<'a> {
         *pixels_written = px;
         Ok(())
     }
+
+    /// 重置渐进参数（每个 scan 开始前调用，与 zune `reset_prog_params` 对齐）。
+    fn reset_prog_params(&mut self, stream: &mut BitStream) {
+        stream.reset();
+        self.components.iter_mut().for_each(|x| x.dc_pred = 0);
+        self.todo = if self.restart_interval != 0 {
+            self.restart_interval
+        } else {
+            usize::MAX
+        };
+    }
+
+    /// 渐进模式主解码循环（1:1 复刻 zune `decode_mcu_ycbcr_progressive`）。
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn decode_mcu_ycbcr_progressive(&mut self, pixels: &mut [u8]) -> Result<(), DecodeError> {
+        self.setup_component_params()?;
+
+        // 各分量的整帧系数缓冲（未反量化、未 IDCT 的原始 DCT 系数）
+        let mut block: [Vec<i16>; MAX_COMPONENTS] = core::array::from_fn(|_| vec![]);
+        let mut mcu_width;
+        let mut mcu_height;
+        let mut seen_scans = 1;
+
+        if self.input_colorspace == ColorSpace::Luma && self.is_interleaved {
+            // 灰度下调采样图像：重置为无采样形态
+            self.reset_params();
+        }
+
+        if self.is_interleaved {
+            self.set_upsampling()?;
+        }
+
+        if self.is_interleaved {
+            mcu_width = self.mcu_x;
+            mcu_height = self.mcu_y;
+        } else {
+            mcu_width = (self.width + 7) / 8;
+            mcu_height = (self.height + 7) / 8;
+        }
+
+        // 特定图像（交织 YCbCr → 灰）需按采样比例修正 mcu_height
+        if self.is_interleaved
+            && self.input_colorspace.num_components() > 1
+            && self.out_colorspace.num_components() == 1
+            && (self.sample_ratio == SampleRatios::V || self.sample_ratio == SampleRatios::HV)
+        {
+            mcu_height *= self.v_max;
+            mcu_height /= self.h_max;
+            self.coeff = 2;
+        }
+
+        mcu_width *= 64;
+
+        for i in 0..self.input_colorspace.num_components() {
+            let comp = &self.components[i];
+            let len = mcu_width * comp.vertical_sample * comp.horizontal_sample * mcu_height;
+
+            block[i] = vec![0; len];
+        }
+
+        let mut stream = BitStream::new_progressive(self.succ_low, self.spec_start, self.spec_end);
+
+        // 首个 scan 已被 headers 阶段解析，直接解熵数据
+        let result = self.parse_entropy_coded_data(&mut stream, &mut block);
+
+        if result.is_err() {
+            // 非 strict：容忍错误，尽量收尾已解出的系数
+            return self.finish_progressive_decoding(&block, pixels);
+        }
+
+        // 取出终结首个 scan 的 marker
+        let mut marker = stream.marker.take().ok_or_else(|| {
+            DecodeError::Format("Marker missing where expected".to_string())
+        })?;
+
+        // 循环处理后续 scan；直到 EOI
+        'eoi: while marker != Marker::EOI {
+            match marker {
+                Marker::SOS => {
+                    self.parse_marker_inner(Marker::SOS)?;
+
+                    stream.update_progressive_params(
+                        self.succ_high,
+                        self.succ_low,
+                        self.spec_start,
+                        self.spec_end,
+                    );
+
+                    let result = self.parse_entropy_coded_data(&mut stream, &mut block);
+
+                    if result.is_err() {
+                        // 非 strict：跳出并收尾
+                        break 'eoi;
+                    }
+
+                    match get_marker(&mut self.reader, &mut stream) {
+                        Ok(marker_n) => {
+                            marker = marker_n;
+                            seen_scans += 1;
+                            if seen_scans > MAX_PROGRESSIVE_SCANS {
+                                return Err(DecodeError::Format(format!(
+                                    "Too many scans, exceeded limit of {}",
+                                    MAX_PROGRESSIVE_SCANS
+                                )));
+                            }
+
+                            stream.reset();
+                            continue 'eoi;
+                        }
+                        Err(_msg) => {
+                            // 非 strict：跳出
+                            break 'eoi;
+                        }
+                    }
+                }
+                Marker::RST(_n) => {
+                    self.handle_rst(&mut stream)?;
+                }
+                _ => {
+                    // DHT/DQT/DRI/COM/APP 等 scan 间 setup marker
+                    self.parse_marker_inner(marker)?;
+                }
+            }
+
+            match get_marker(&mut self.reader, &mut stream) {
+                Ok(marker_n) => {
+                    marker = marker_n;
+                }
+                Err(_e) => {
+                    // 非 strict：跳出，容忍部分损坏图像
+                    break 'eoi;
+                }
+            }
+        }
+
+        self.finish_progressive_decoding(&block, pixels)
+    }
+
+    /// 解单个 scan 的熵编码数据（1:1 复刻 zune `parse_entropy_coded_data`）。
+    #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
+    fn parse_entropy_coded_data(
+        &mut self,
+        stream: &mut BitStream,
+        buffer: &mut [Vec<i16>; MAX_COMPONENTS],
+    ) -> Result<(), DecodeError> {
+        self.reset_prog_params(stream);
+
+        if usize::from(self.num_scans) > self.input_colorspace.num_components() {
+            return Err(DecodeError::Format(format!(
+                "Number of scans {} cannot be greater than number of components, {}",
+                self.num_scans,
+                self.input_colorspace.num_components()
+            )));
+        }
+
+        if self.num_scans == 1 {
+            // 安全检查：单个非交织 scan 不能同时含 DC 与 AC 谱段
+            if self.spec_end != 0 && self.spec_start == 0 {
+                return Err(DecodeError::Format(
+                    "Can't merge DC and AC corrupt jpeg".to_string(),
+                ));
+            }
+
+            // 非交织：逐块按常规扫描顺序解码
+            let k = self.z_order[0];
+
+            if k >= self.components.len() {
+                return Err(DecodeError::Format(format!(
+                    "Cannot find component {k}, corrupt image"
+                )));
+            }
+
+            let component = &self.components[k];
+            let width_stride = component.width_stride;
+
+            // 非交织 scan 迭代该分量实际的数据单元网格
+            let mcu_width = (self.width * component.horizontal_sample).div_ceil(self.h_max * 8);
+            let mcu_height = (self.height * component.vertical_sample).div_ceil(self.v_max * 8);
+
+            for i in 0..mcu_height {
+                for j in 0..mcu_width {
+                    if self.spec_start != 0 && self.succ_high == 0 && stream.eob_run > 0 {
+                        // 在此处理 EOB RUN 的整块跳过
+                        stream.eob_run -= 1;
+                    } else {
+                        let start = 64 * (j + i * (width_stride / 8));
+
+                        let data: &mut [i16; 64] = buffer
+                            .get_mut(k)
+                            .ok_or_else(|| DecodeError::Format("Invalid image".to_string()))?
+                            .get_mut(start..start + 64)
+                            .ok_or_else(|| DecodeError::Format("Slice to Small".to_string()))?
+                            .try_into()
+                            .map_err(|_| DecodeError::Format("Slice to Small".to_string()))?;
+
+                        if self.spec_start == 0 {
+                            // DC 谱段（含 DC refine）
+                            let pos = self.components[k].dc_huff_table & (MAX_COMPONENTS - 1);
+
+                            let dc_table = self
+                                .dc_huffman_tables
+                                .get(pos)
+                                .ok_or_else(|| {
+                                    DecodeError::Format(
+                                        "No huffman table for DC component".to_string(),
+                                    )
+                                })?
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    DecodeError::Format(
+                                        "Huffman table at index  not initialized".to_string(),
+                                    )
+                                })?;
+
+                            let dc_pred = &mut self.components[k].dc_pred;
+
+                            if self.succ_high == 0 {
+                                stream.decode_prog_dc_first(
+                                    &mut self.reader,
+                                    dc_table,
+                                    &mut data[0],
+                                    dc_pred,
+                                )?;
+                            } else {
+                                stream.decode_prog_dc_refine(&mut self.reader, &mut data[0])?;
+                            }
+                        } else {
+                            // AC 谱段（含 AC refine）
+                            let pos = self.components[k].ac_huff_table;
+
+                            let ac_table = self
+                                .ac_huffman_tables
+                                .get(pos)
+                                .ok_or_else(|| {
+                                    DecodeError::Format(format!(
+                                        "No huffman table for component:{pos}"
+                                    ))
+                                })?
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    DecodeError::Format(format!(
+                                        "Huffman table at index  {pos} not initialized"
+                                    ))
+                                })?;
+
+                            if self.succ_high == 0 {
+                                stream.decode_mcu_ac_first(&mut self.reader, ac_table, data)?;
+                            } else {
+                                stream.decode_mcu_ac_refine(&mut self.reader, ac_table, data)?;
+                            }
+                        }
+                    }
+
+                    self.todo = self.todo.wrapping_sub(1);
+
+                    self.handle_rst_main(stream)?;
+                }
+            }
+        } else {
+            if self.spec_end != 0 {
+                return Err(DecodeError::HuffmanDecode(
+                    "Can't merge dc and AC corrupt jpeg".to_string(),
+                ));
+            }
+
+            // 预校验交织 scan 中各分量 DC 表存在
+            for k in 0..self.num_scans {
+                let n = self.z_order[usize::from(k)];
+
+                if n >= self.components.len() {
+                    return Err(DecodeError::Format(format!(
+                        "Cannot find component {n}, corrupt image"
+                    )));
+                }
+
+                let component = &mut self.components[n];
+                let _ = self
+                    .dc_huffman_tables
+                    .get(component.dc_huff_table)
+                    .ok_or_else(|| {
+                        DecodeError::Format(format!(
+                            "No huffman table for component:{}",
+                            component.dc_huff_table
+                        ))
+                    })?
+                    .as_ref()
+                    .ok_or_else(|| {
+                        DecodeError::Format(format!(
+                            "Huffman table at index  {} not initialized",
+                            component.dc_huff_table
+                        ))
+                    })?;
+            }
+
+            // 交织 DC scan：逐 MCU 逐分量解码（仅 DC 允许交织）
+            for i in 0..self.mcu_y {
+                for j in 0..self.mcu_x {
+                    for k in 0..self.num_scans {
+                        let n = self.z_order[usize::from(k)];
+
+                        let component = &mut self.components[n];
+
+                        let huff_table = self
+                            .dc_huffman_tables
+                            .get(component.dc_huff_table)
+                            .ok_or_else(|| {
+                                DecodeError::Format(
+                                    "No huffman table for component".to_string(),
+                                )
+                            })?
+                            .as_ref()
+                            .ok_or_else(|| {
+                                DecodeError::Format(
+                                    "Huffman table at index not initialized".to_string(),
+                                )
+                            })?;
+
+                        for v_samp in 0..component.vertical_sample {
+                            for h_samp in 0..component.horizontal_sample {
+                                let x2 = j * component.horizontal_sample + h_samp;
+                                let y2 = i * component.vertical_sample + v_samp;
+                                let position = 64 * (x2 + y2 * component.width_stride / 8);
+
+                                let buf_n = &mut buffer[n];
+
+                                let data = buf_n.get_mut(position).ok_or_else(|| {
+                                    DecodeError::Format("Invalid image".to_string())
+                                })?;
+
+                                if self.succ_high == 0 {
+                                    stream.decode_prog_dc_first(
+                                        &mut self.reader,
+                                        huff_table,
+                                        data,
+                                        &mut component.dc_pred,
+                                    )?;
+                                } else {
+                                    stream.decode_prog_dc_refine(&mut self.reader, data)?;
+                                }
+                            }
+                        }
+                    }
+
+                    self.todo = self.todo.wrapping_sub(1);
+
+                    self.handle_rst_main(stream)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 渐进收尾：整帧反量化 → IDCT → 后处理（1:1 复刻 zune `finish_progressive_decoding`）。
+    #[allow(clippy::too_many_lines)]
+    fn finish_progressive_decoding(
+        &mut self,
+        block: &[Vec<i16>; MAX_COMPONENTS],
+        pixels: &mut [u8],
+    ) -> Result<(), DecodeError> {
+        let mcu_height = if self.is_interleaved {
+            self.mcu_y
+        } else {
+            // 非交织（1x1 采样）：MCU 数以宽高除以 8 计
+            (self.height + 7) / 8
+        };
+
+        // 输出图像尺寸（宽 × 高）
+        let is_hv = usize::from(self.is_interleaved);
+        let upsampler_scratch_size = is_hv * self.components[0].width_stride;
+        let width = self.width;
+        let padded_width = calculate_padded_width(width, self.sample_ratio);
+
+        let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
+        let mut tmp = [0_i32; DCT_BLOCK];
+
+        for (pos, comp) in self.components.iter_mut().enumerate() {
+            // 仅分配需要的分量平面
+            if min(
+                self.out_colorspace.num_components().saturating_sub(1),
+                pos,
+            ) == pos
+                || self.input_colorspace == ColorSpace::YCCK
+                || self.input_colorspace == ColorSpace::CMYK
+            {
+                comp.needed = true;
+                comp.raw_coeff = vec![0; comp.width_stride * comp.vertical_sample * 8];
+            } else {
+                comp.needed = false;
+            }
+        }
+
+        let mut pixels_written = 0;
+
+        // 反量化、IDCT、颜色换算
+        for i in 0..mcu_height {
+            for (position, component) in self.components.iter_mut().enumerate() {
+                if !component.needed {
+                    continue;
+                }
+                let qt_table = &component.quantization_table;
+
+                // step = 该分量一整行 MCU 的系数个数
+                let step = block[position].len() / mcu_height;
+                let start = i * step;
+
+                let slice = &block[position][start..start + step];
+
+                let temp_channel = &mut component.raw_coeff;
+
+                // 每行 MCU 宽对应的数据单元数
+                let mcu_x = component.width_stride / 8;
+
+                let mut idct_pos = 0;
+
+                for k in 0..component.vertical_sample {
+                    for j in 0..mcu_x {
+                        // 写到第 k 个垂直采样行：跳过 8 行
+                        let width_stride = k * 8 * component.width_stride;
+                        let start = j * 64 + width_stride;
+
+                        let Some(qt_slice) = slice.get(start..start + 64) else {
+                            return Err(DecodeError::Format(
+                                "Invalid slice , would panic, invalid image".to_string(),
+                            ));
+                        };
+
+                        // 反量化
+                        for ((x, out), qt_val) in
+                            qt_slice.iter().zip(tmp.iter_mut()).zip(qt_table.iter())
+                        {
+                            *out = i32::from(*x) * qt_val;
+                        }
+
+                        let sl = &mut temp_channel[idct_pos..];
+
+                        idct_pos += 8;
+                        // tmp 现为反量化后的块，做 IDCT（整块右移 & clamp 与 baseline 同源）
+                        idct_int(&mut tmp, sl, component.width_stride);
+                    }
+                    // 每写完 8 行后跳过 7 个 stride 至下一垂直块行
+                    idct_pos += 7 * component.width_stride;
+                }
+            }
+
+            // 处理该宽度直至不可再处理
+            self.post_process(
+                pixels,
+                i,
+                mcu_height,
+                width,
+                padded_width,
+                &mut pixels_written,
+                &mut upsampler_scratch_space,
+            )?;
+        }
+
+        Ok(())
+    }
 }
 
 /// 从位流中读取下一个 marker（读取到 marker 或 EOF）。
@@ -883,4 +1345,15 @@ pub(crate) fn decode_baseline(
     decoder.out_colorspace = out_colorspace;
     decoder.decode_headers_internal()?;
     decoder.decode_mcu_ycbcr_baseline(pixels)
+}
+
+/// progressive 解码入口（先解析段，再按渐进流程解 MCU）。
+pub(crate) fn decode_progressive(
+    decoder: &mut Decoder<'_>,
+    out_colorspace: ColorSpace,
+    pixels: &mut [u8],
+) -> Result<(), DecodeError> {
+    decoder.out_colorspace = out_colorspace;
+    decoder.decode_headers_internal()?;
+    decoder.decode_mcu_ycbcr_progressive(pixels)
 }

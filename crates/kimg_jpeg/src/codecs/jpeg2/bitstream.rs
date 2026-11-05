@@ -58,18 +58,53 @@ pub(crate) struct BitStream {
     pub(crate) marker:       Option<Marker>,
     pub(crate) overread_by:  usize,
     pub(crate) seen_eoi:     bool,
+    /// 渐进模式：successive low 位掩码（1 << Al）。
+    successive_low_mask:     i16,
+    /// 渐进 scan 谱选择起止（Ss/Se）。
+    spec_start:              u8,
+    spec_end:                u8,
+    /// 渐进 EOB 运行计数值。
+    pub(crate) eob_run:      i32,
 }
 
 impl BitStream {
     pub(crate) fn new() -> BitStream {
         BitStream {
-            buffer:      0,
-            aligned_buffer: 0,
-            bits_left:   0,
-            marker:      None,
-            overread_by: 0,
-            seen_eoi:    false,
+            buffer:              0,
+            aligned_buffer:      0,
+            bits_left:           0,
+            marker:              None,
+            overread_by:         0,
+            seen_eoi:            false,
+            successive_low_mask: 1,
+            spec_start:          0,
+            spec_end:            0,
+            eob_run:             0,
         }
+    }
+
+    /// 构造用于渐进解码的位流（以首个 scan 的 Al/Ss/Se 初始化）。
+    #[allow(clippy::redundant_field_names)]
+    pub(crate) fn new_progressive(al: u8, spec_start: u8, spec_end: u8) -> BitStream {
+        BitStream {
+            buffer:              0,
+            aligned_buffer:      0,
+            bits_left:           0,
+            marker:              None,
+            overread_by:         0,
+            seen_eoi:            false,
+            successive_low_mask: 1i16 << al,
+            spec_start:          spec_start,
+            spec_end:            spec_end,
+            eob_run:             0,
+        }
+    }
+
+    /// 更新渐进 scan 参数（每个新 SOS 后调用）。
+    pub(crate) fn update_progressive_params(&mut self, _ah: u8, al: u8, spec_start: u8, spec_end: u8) {
+        self.successive_low_mask = 1i16 << al;
+        self.spec_start = spec_start;
+        self.spec_end = spec_end;
     }
 
     /// 补充位缓冲（最多 32 位），并处理 marker/字节填充。
@@ -365,6 +400,233 @@ impl BitStream {
         self.marker = None;
         self.buffer = 0;
         self.aligned_buffer = 0;
+        self.eob_run = 0;
+    }
+
+    /// 渐进 DC 首个 scan：解码 DC 差值并写入 `块[0]`（以 Al 位掩码缩放）。
+    #[inline]
+    pub(crate) fn decode_prog_dc_first<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        dc_table: &HuffmanTable,
+        block: &mut i16,
+        dc_prediction: &mut i32,
+    ) -> Result<(), DecodeError> {
+        self.decode_dc(reader, dc_table, dc_prediction)?;
+        *block = (*dc_prediction as i16).wrapping_mul(self.successive_low_mask);
+        Ok(())
+    }
+
+    /// 渐进 DC refine scan：读 1 位修正值并入已有 DC 系数。
+    #[inline]
+    pub(crate) fn decode_prog_dc_refine<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        block: &mut i16,
+    ) -> Result<(), DecodeError> {
+        if self.bits_left < 1 {
+            self.refill(reader)?;
+            // 若 refill 后仍不足位，说明撞到了 marker
+            if self.bits_left < 1 {
+                return Err(DecodeError::Format(
+                    "Marker found where not expected in refine bit".to_string(),
+                ));
+            }
+        }
+
+        if self.get_bit() == 1 {
+            *block = block.wrapping_add(self.successive_low_mask);
+        }
+
+        Ok(())
+    }
+
+    /// 读单个位。
+    fn get_bit(&mut self) -> u8 {
+        let k = (self.aligned_buffer >> 63) as u8;
+        self.drop_bits(1);
+        k
+    }
+
+    /// 渐进 AC 首个 scan：解谱段 [Ss..Se] 的首个非零系数（含 EOB RUN 计数）。
+    #[allow(clippy::cast_sign_loss)]
+    pub(crate) fn decode_mcu_ac_first<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        ac_table: &HuffmanTable,
+        block: &mut [i16; 64],
+    ) -> Result<(), DecodeError> {
+        let fast_ac = ac_table.ac_lookup.as_ref().unwrap();
+        let bit = self.successive_low_mask;
+
+        let mut k = usize::from(self.spec_start);
+        let (mut symbol, mut r, mut fac);
+
+        // EOB 运行交由 mcu.rs 的调用方处理（每块计数）
+        'block: loop {
+            self.refill(reader)?;
+
+            symbol = self.peek_bits::<HUFF_LOOKAHEAD>();
+            fac = fast_ac[symbol as usize];
+            symbol = ac_table.lookup[symbol as usize];
+
+            if fac != 0 {
+                // 快路径
+                k += ((fac >> 4) & 15) as usize; // run
+                block[UN_ZIGZAG[min(k, 63)] & 63] = (fac >> 8).wrapping_mul(bit); // 值
+                self.drop_bits((fac & 15) as u8);
+                k += 1;
+            } else {
+                decode_huff!(self, symbol, ac_table);
+
+                r = symbol >> 4;
+                symbol &= 15;
+
+                if symbol != 0 {
+                    k += r as usize;
+                    r = self.get_bits(symbol as u8);
+                    symbol = huff_extend(r, symbol);
+                    block[UN_ZIGZAG[k & 63] & 63] = (symbol as i16).wrapping_mul(bit);
+                    k += 1;
+                } else {
+                    if r != 15 {
+                        self.eob_run = 1 << r;
+                        self.eob_run += self.get_bits(r as u8);
+                        self.eob_run -= 1;
+                        break;
+                    }
+
+                    k += 16;
+                }
+            }
+
+            if k > usize::from(self.spec_end) {
+                break 'block;
+            }
+        }
+        Ok(())
+    }
+
+    /// 渐进 AC refine scan：修正既有非零系数并写入谱段内的新非零系数。
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn decode_mcu_ac_refine<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        table: &HuffmanTable,
+        block: &mut [i16; 64],
+    ) -> Result<(), DecodeError> {
+        let bit = self.successive_low_mask;
+
+        let mut k = self.spec_start;
+        let (mut symbol, mut r);
+
+        if self.eob_run == 0 {
+            'no_eob: loop {
+                self.refill(reader)?;
+
+                symbol = self.peek_bits::<HUFF_LOOKAHEAD>();
+                symbol = table.lookup[symbol as usize];
+
+                decode_huff!(self, symbol, table);
+
+                r = symbol >> 4;
+                symbol &= 15;
+
+                if symbol == 0 {
+                    if r != 15 {
+                        // EOB run = 2^r + 附加位
+                        self.eob_run = 1 << r;
+                        self.eob_run += self.get_bits(r as u8);
+                        break 'no_eob;
+                    }
+                } else {
+                    // 与被参照实现的 libjpeg-turbo 一致：对畸形码仅警告不报错
+                    // 取符号位
+                    if self.get_bit() == 1 {
+                        symbol = i32::from(bit);
+                    } else {
+                        symbol = i32::from(-bit);
+                    }
+                }
+
+                // 跳过既有非零系数，并为其追加修正位（1 表示绝对值须增大）
+                if k <= self.spec_end {
+                    'advance_nonzero: loop {
+                        let coefficient = &mut block[UN_ZIGZAG[usize::from(k) & 63] & 63];
+
+                        if *coefficient != 0 {
+                            if self.bits_left < 1 {
+                                self.refill(reader)?;
+                                if self.bits_left < 1 && self.marker.is_some() {
+                                    return Err(DecodeError::Format(
+                                        "Marker found where not expected in refine bit".to_string(),
+                                    ));
+                                }
+                            }
+                            if self.get_bit() == 1 && (*coefficient & bit) == 0 {
+                                if *coefficient > 0 {
+                                    *coefficient = coefficient.wrapping_add(bit);
+                                } else {
+                                    *coefficient = coefficient.wrapping_sub(bit);
+                                }
+                            }
+                        } else {
+                            r -= 1;
+
+                            if r < 0 {
+                                break 'advance_nonzero;
+                            }
+                        };
+
+                        if k == self.spec_end {
+                            break 'advance_nonzero;
+                        }
+
+                        k += 1;
+                    }
+                }
+
+                if symbol != 0 {
+                    let pos = UN_ZIGZAG[usize::from(k) & 63];
+                    block[pos & 63] = symbol as i16;
+                }
+
+                k += 1;
+
+                if k > self.spec_end {
+                    break 'no_eob;
+                }
+            }
+        }
+        if self.eob_run > 0 {
+            // 仅当块非纯零时处理（EOB 意味着后续块可能全零）
+            if &block[1..] != &[0_i16; 63] {
+                self.refill(reader)?;
+
+                while k <= self.spec_end {
+                    let coefficient = &mut block[UN_ZIGZAG[usize::from(k) & 63] & 63];
+
+                    if *coefficient != 0 && self.get_bit() == 1 {
+                        // 检查是否为已修正过的系数（避免重复加位）
+                        if (*coefficient & bit) == 0 {
+                            if *coefficient >= 0 {
+                                *coefficient = coefficient.wrapping_add(bit);
+                            } else {
+                                *coefficient = coefficient.wrapping_sub(bit);
+                            }
+                        }
+                    }
+                    if self.bits_left < 1 {
+                        // 到最后一刻才 refill
+                        self.refill(reader)?;
+                    }
+                    k += 1;
+                }
+            }
+            // 该块在 EOB 运行中计数完成
+            self.eob_run -= 1;
+        }
+        Ok(())
     }
 }
 
