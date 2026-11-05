@@ -41,6 +41,8 @@ pub enum ImageFormat {
     Qoi,
     /// PCX（仅扩展名识别）。
     Pcx,
+    /// HEIF / HEIC（ISOBMFF item 容器 + HEVC；kimg_heif 支持识别/读尺寸，解码逐步落地）。
+    Heic,
 }
 
 impl ImageFormat {
@@ -52,6 +54,7 @@ impl ImageFormat {
         let ext = ext.as_ref().to_str()?.to_ascii_lowercase();
         Some(match ext.as_str() {
             "avif" => ImageFormat::Avif,
+            "heic" | "heif" => ImageFormat::Heic,
             "jpg" | "jpeg" | "jfif" => ImageFormat::Jpeg,
             "png" | "apng" => ImageFormat::Png,
             "gif" => ImageFormat::Gif,
@@ -100,6 +103,7 @@ impl ImageFormat {
                 | ImageFormat::Bmp
                 | ImageFormat::Ico
                 | ImageFormat::Pnm
+                | ImageFormat::Heic
         )
     }
 
@@ -164,7 +168,44 @@ pub(crate) fn guess_format_impl(buffer: &[u8]) -> Option<ImageFormat> {
             return Some(format);
         }
     }
+    // HEIF/HEIC：IPv4/ISOBMFF `ftyp` box 列出 HEIF brand（且无 AVIF brand）。
+    if heif_brands(buffer) {
+        return Some(ImageFormat::Heic);
+    }
     None
+}
+
+/// 与 image/C# `HeifImageDecoder.CanDecode` 同步的 HEIF brand 检测：
+/// `ftyp` 里列出 HEIF brand（heic/heix/heim/heis/hevc/hevx/mif1/msf1）且不含 AVIF brand
+/// （avif/avis，它们常连同 mif1 列出，但不是 HEVC）。
+fn heif_brands(header: &[u8]) -> bool {
+    if header.len() < 16 || &header[4..8] != b"ftyp" {
+        return false;
+    }
+    let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]])
+        .min(header.len() as u32) as usize;
+    let mut heif = false;
+    let mut at = 8usize;
+    loop {
+        if at + 4 > size {
+            break;
+        }
+        let brand = &header[at..at + 4];
+        if brand == b"avif" || brand == b"avis" {
+            return false;
+        }
+        heif |= brand == b"heic"
+            || brand == b"heix"
+            || brand == b"heim"
+            || brand == b"heis"
+            || brand == b"hevc"
+            || brand == b"hevx"
+            || brand == b"mif1"
+            || brand == b"msf1";
+        // 跳过 major brand 后的 minor version（at==8 时 +8，之后 +4）。
+        at += if at == 8 { 8 } else { 4 };
+    }
+    heif
 }
 
 // 供 format_hint 的 From 转换使用（避免未用导入告警）。

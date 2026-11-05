@@ -1,0 +1,16 @@
+[package]
+name = "kimg_heif"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "kimg 拆分的 HEIF/HEIC 解码 crate（codecs/heif：ISOBMFF 容器 + hvcC 参数集 + 位读取 + 切片头；C# Sdcb.SimdCodecs.Heif 纯托管 HEVC 解码器重写，按阶段落地）。"
+
+[dependencies]
+kimg_core = { path = "../kimg_core" }
+
+[dev-dependencies]
+# oracle 测试读 target/heif/oracle/*.info.json（JSON 元数据：spsW/spsH/bitY/bitC/chroma/profile/ctbLog2/grid/cols/rows/conf）。
+# serde_json / serde 已是 workspace 依赖（根 Cargo.toml [workspace.dependencies]），此处仅 dev 引用。
+serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }

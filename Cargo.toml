@@ -50,7 +50,8 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["crates/media-ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/markdown", "crates/markdown-wysiwyg", "crates/toc", "crates/pdf", "crates/image_viewer", "crates/video", "crates/epub", "crates/shell", "crates/tray", "crates/music", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp", "crates/kimg_ico", "crates/kimg_pnm", "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
+members = ["crates/media-ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/markdown", "crates/markdown-wysiwyg", "crates/toc", "crates/pdf", "crates/image_viewer", "crates/video", "crates/epub", "crates/shell", "crates/tray", "crates/music", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp",     "crates/kimg_ico", "crates/kimg_pnm", "crates/kimg_heif",
+    "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`media_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。
@@ -113,6 +114,7 @@ kimg_tiff = { path = "crates/kimg_tiff" }
 kimg_bmp = { path = "crates/kimg_bmp" }
 kimg_ico = { path = "crates/kimg_ico" }
 kimg_pnm = { path = "crates/kimg_pnm" }
+kimg_heif = { path = "crates/kimg_heif" }
 # LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = "0.1"
 ratex-layout = "0.1"

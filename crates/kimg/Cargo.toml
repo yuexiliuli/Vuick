@@ -18,6 +18,7 @@ kimg_tiff = { path = "../kimg_tiff" }
 kimg_bmp = { path = "../kimg_bmp" }
 kimg_ico = { path = "../kimg_ico" }
 kimg_pnm = { path = "../kimg_pnm" }
+kimg_heif = { path = "../kimg_heif" }
 
 [features]
 default = []

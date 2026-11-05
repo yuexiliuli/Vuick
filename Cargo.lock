@@ -2504,6 +2504,7 @@ dependencies = [
  "kimg_bmp",
  "kimg_core",
  "kimg_gif",
+ "kimg_heif",
  "kimg_ico",
  "kimg_jpeg",
  "kimg_png",
@@ -2530,6 +2531,15 @@ version = "0.1.0"
 dependencies = [
  "gif",
  "kimg_core",
+]
+
+[[package]]
+name = "kimg_heif"
+version = "0.1.0"
+dependencies = [
+ "kimg_core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

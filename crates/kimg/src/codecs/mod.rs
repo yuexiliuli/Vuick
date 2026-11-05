@@ -36,6 +36,10 @@ pub mod webp {
         I4OpCosts, Vp8StageProfile, Vp8lStageProfile,
     };
 }
+pub mod heif {
+    pub use kimg_heif::{read_info, HeicDecoder, HeifInfo};
+    pub use kimg_heif::codecs::heif::probe::{heif_probe, ProbeInfo};
+}
 
 use std::io::{BufRead, Cursor, Seek};
 
@@ -59,6 +63,7 @@ pub enum GenericDecoder<'a, R: BufRead + Seek> {
     Bmp(bmp::BmpDecoder<R>),
     Ico(ico::IcoDecoder<R>),
     Pnm(pnm::PnmDecoder<R>),
+    Heic(heif::HeicDecoder<R>),
 }
 
 impl<'a, R: BufRead + Seek> GenericDecoder<'a, R> {
@@ -75,6 +80,7 @@ impl<'a, R: BufRead + Seek> GenericDecoder<'a, R> {
             Bmp => Ok(GenericDecoder::Bmp(bmp::BmpDecoder::new(reader)?)),
             Ico => Ok(GenericDecoder::Ico(ico::IcoDecoder::new(reader)?)),
             Pnm => Ok(GenericDecoder::Pnm(pnm::PnmDecoder::new(reader)?)),
+            Heic => Ok(GenericDecoder::Heic(heif::HeicDecoder::new(reader)?)),
             other => Err(ImageError::Unsupported(
                 UnsupportedError::from_format_and_kind(
                     ImageFormatHint::Exact(other),
@@ -115,6 +121,7 @@ impl<'a, R: BufRead + Seek> ImageDecoder for GenericDecoder<'a, R> {
             GenericDecoder::Bmp(d) => d.dimensions(),
             GenericDecoder::Ico(d) => d.dimensions(),
             GenericDecoder::Pnm(d) => d.dimensions(),
+            GenericDecoder::Heic(d) => d.dimensions(),
         }
     }
 
@@ -128,6 +135,7 @@ impl<'a, R: BufRead + Seek> ImageDecoder for GenericDecoder<'a, R> {
             GenericDecoder::Bmp(d) => d.color_type(),
             GenericDecoder::Ico(d) => d.color_type(),
             GenericDecoder::Pnm(d) => d.color_type(),
+            GenericDecoder::Heic(d) => d.color_type(),
         }
     }
 
@@ -141,6 +149,7 @@ impl<'a, R: BufRead + Seek> ImageDecoder for GenericDecoder<'a, R> {
             GenericDecoder::Bmp(d) => d.original_color_type(),
             GenericDecoder::Ico(d) => d.original_color_type(),
             GenericDecoder::Pnm(d) => d.original_color_type(),
+            GenericDecoder::Heic(d) => d.original_color_type(),
         }
     }
 
@@ -154,6 +163,7 @@ impl<'a, R: BufRead + Seek> ImageDecoder for GenericDecoder<'a, R> {
             GenericDecoder::Bmp(d) => d.exif_metadata(),
             GenericDecoder::Ico(d) => d.exif_metadata(),
             GenericDecoder::Pnm(d) => d.exif_metadata(),
+            GenericDecoder::Heic(d) => d.exif_metadata(),
         }
     }
 
@@ -167,6 +177,7 @@ impl<'a, R: BufRead + Seek> ImageDecoder for GenericDecoder<'a, R> {
             GenericDecoder::Bmp(d) => d.orientation(),
             GenericDecoder::Ico(d) => d.orientation(),
             GenericDecoder::Pnm(d) => d.orientation(),
+            GenericDecoder::Heic(d) => d.orientation(),
         }
     }
 
@@ -180,6 +191,7 @@ impl<'a, R: BufRead + Seek> ImageDecoder for GenericDecoder<'a, R> {
             GenericDecoder::Bmp(d) => d.read_image(buf),
             GenericDecoder::Ico(d) => d.read_image(buf),
             GenericDecoder::Pnm(d) => d.read_image(buf),
+            GenericDecoder::Heic(d) => d.read_image(buf),
         }
     }
 
@@ -193,6 +205,7 @@ impl<'a, R: BufRead + Seek> ImageDecoder for GenericDecoder<'a, R> {
             GenericDecoder::Bmp(d) => d.set_limits(limits),
             GenericDecoder::Ico(d) => d.set_limits(limits),
             GenericDecoder::Pnm(d) => d.set_limits(limits),
+            GenericDecoder::Heic(d) => d.set_limits(limits),
         }
     }
 
