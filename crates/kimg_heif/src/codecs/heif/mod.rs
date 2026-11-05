@@ -21,6 +21,7 @@ pub mod hevc;
 pub mod isobmff;
 pub mod metadata;
 pub mod probe;
+pub mod stage_clock;
 pub mod transform;
 
 pub use error::{HeifError, HeifResult};
@@ -84,7 +85,7 @@ fn decode_tiles(data: &[u8], container: &container::HeifContainer<'_>) -> HeifRe
             return Err(HeifError::invalid("图像 item 大于文件。"));
         }
         let mut payload = vec![0u8; length as usize];
-        container.items.resolve(item, &mut payload)?;
+        stage_clock::parse(|| container.items.resolve(item, &mut payload))?;
         let pic = hevc::decode_item_flags(config, &payload, false, false)?;
         tiles.push(canvas::TileYuv {
             y: pic.planes[0].clone(),
@@ -167,7 +168,7 @@ pub fn decode_yuv_bytes(data: &[u8]) -> HeifResult<YuvPlanes> {
 /// VUI；8/10 位都走，产出 RGBA8）→ 按关联顺序应用 transform（clap/irot/imir，对准 C# `HeifCanvas`
 /// 合成映射）写 `destination`。返回 `(宽, 高)` = 变换后显示尺寸（与 `ReadInfo().DisplaySize` 一致）。
 pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)> {
-    let container = container::HeifContainer::parse(data)?;
+    let container = stage_clock::parse(|| container::HeifContainer::parse(data))?;
     if container.tiles.is_empty() {
         return Err(HeifError::invalid("容器没有可解码的图像 item。"));
     }
@@ -183,7 +184,7 @@ pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)
     if cw <= 0 || ch <= 0 {
         return Err(HeifError::invalid("画布尺寸非法。"));
     }
-    let map = transform::compose(cw, ch, &container.transforms)?;
+    let map = stage_clock::transform(|| transform::compose(cw, ch, &container.transforms))?;
     let (ow, oh) = (map.width, map.height);
     if ow <= 0 || oh <= 0 {
         return Err(HeifError::invalid("显示尺寸非法。"));
@@ -200,21 +201,25 @@ pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)
         )));
     }
     let tiles = decode_tiles(data, &container)?;
-    let composed = canvas::compose_grid(&tiles, container.grid_columns, container.grid_rows, cw, ch)?;
-    let rgba = color::yuv_to_rgba(
-        &composed.y,
-        &composed.cb,
-        &composed.cr,
-        cw as usize,
-        ch as usize,
-        sps.bit_depth_y as u8,
-        matrix,
-        full_range,
-    )?;
+    let composed = stage_clock::grid(|| {
+        canvas::compose_grid(&tiles, container.grid_columns, container.grid_rows, cw, ch)
+    })?;
+    let rgba = stage_clock::color(|| {
+        color::yuv_to_rgba(
+            &composed.y,
+            &composed.cb,
+            &composed.cr,
+            cw as usize,
+            ch as usize,
+            sps.bit_depth_y as u8,
+            matrix,
+            full_range,
+        )
+    })?;
     if container.transforms.is_empty() {
         destination[..need].copy_from_slice(&rgba);
     } else {
-        transform::apply_rgba(&rgba, cw, ch, &map, &mut destination[..need])?;
+        stage_clock::transform(|| transform::apply_rgba(&rgba, cw, ch, &map, &mut destination[..need]))?;
     }
     Ok((ow, oh))
 }

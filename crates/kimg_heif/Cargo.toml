@@ -6,6 +6,11 @@ publish = false
 license = "Apache-2.0"
 description = "kimg 拆分的 HEIF/HEIC 解码 crate（codecs/heif：ISOBMFF 容器 + hvcC 参数集 + 位读取 + 切片头；C# Sdcb.SimdCodecs.Heif 纯托管 HEVC 解码器重写，按阶段落地）。"
 
+[features]
+# 分阶段粗钟探针（K96 参照优先分账第一阶段；仅诊断 bench release 用，默认关闭）。
+# 开启时只在调用点包瞬时计时（std::time::Instant + 原子累计），不改任何解码逻辑/字节输出。
+stage_profile = []
+
 [dependencies]
 kimg_core = { path = "../kimg_core" }
 

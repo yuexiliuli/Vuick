@@ -23,6 +23,7 @@ use crate::codecs::heif::hevc::parameter_sets::{HevcPps, HevcScan, HevcSps};
 use crate::codecs::heif::hevc::picture::HevcPicture;
 use crate::codecs::heif::hevc::slice_header::HevcSliceHeader;
 use crate::codecs::heif::hevc::transform::{HevcTransform, Scaler};
+use crate::codecs::heif::stage_clock;
 
 /// §6.5.3–6.5.5 的扫描序（log2Size 0..3 × scanIdx 0..2），懒构建一次，解码所有 TU 共用。
 static SCANS: LazyLock<Vec<Vec<Vec<u8>>>> = LazyLock::new(HevcScan::order);
@@ -295,7 +296,9 @@ impl HevcFrameDecoder {
         let width_in_ctbs = self.sps.pic_width_in_ctbs();
         let total = self.ctb_slice_addr.len();
         for (nal_type, rbsp) in slices {
-            let header = HevcSliceHeader::parse(&rbsp, nal_type, &self.sps, &self.pps, previous.as_ref())?;
+            let header = stage_clock::parse(|| {
+                HevcSliceHeader::parse(&rbsp, nal_type, &self.sps, &self.pps, previous.as_ref())
+            })?;
             if previous.is_none() && !header.first_slice_segment_in_pic {
                 return Err(HeifError::invalid("图画的第一切片段缺失。"));
             }
@@ -318,10 +321,10 @@ impl HevcFrameDecoder {
     /// `Deblock()`/`ApplySao()`（`skip_*` 供 oracle `_nofilter` 消融对照）。
     fn filter_picture(&mut self) -> HeifResult<()> {
         if !self.skip_deblock {
-            self.deblock()?;
+            stage_clock::deblock(|| self.deblock())?;
         }
         if !self.skip_sao {
-            self.apply_sao()?;
+            stage_clock::sao(|| self.apply_sao())?;
         }
         Ok(())
     }
@@ -478,7 +481,7 @@ impl HevcFrameDecoder {
     fn coding_tree_unit(&mut self, cabac: &mut HevcCabac, ctb_x: i32, ctb_y: i32) -> HeifResult<()> {
         let s = self.slice();
         if s.sao_luma || s.sao_chroma {
-            self.parse_sao(cabac, ctb_x, ctb_y)?;
+            stage_clock::parse(|| self.parse_sao(cabac, ctb_x, ctb_y))?;
         }
         self.coding_quadtree(
             cabac,
@@ -678,87 +681,91 @@ impl HevcFrameDecoder {
         depth: i32,
     ) -> HeifResult<()> {
         let size = 1 << log2_cb_size;
-        self.cu_transquant_bypass = self.pps.transquant_bypass_enabled
-            && cabac.decode_bin(HevcCabacTables::TransquantBypass)? == 1;
-        self.update_cu_qp();
-
-        // I 片的帧内 CU：part_mode 只在最小 CB 尺寸出现，1 → PART_2Nx2N，0 → PART_NxN。
-        let part_nxn = log2_cb_size == self.sps.min_cb_log2_size_y
-            && cabac.decode_bin(HevcCabacTables::PartMode)? == 0;
-
-        // 先填 CU 辅助信息：后续 PB 的亮度模式推导要读它。
-        let pb_offset = if part_nxn { size >> 1 } else { size };
         let x_end = (x0 + size).min(self.sps.width);
         let y_end = (y0 + size).min(self.sps.height);
-        let mut y = y0;
-        while y < y_end {
-            let mut x = x0;
-            while x < x_end {
-                let b = self.block(x, y);
-                self.ct_depth[b] = depth as u8;
-                self.no_filter[b] = if self.cu_transquant_bypass { 1 } else { 0 };
-                x += 4;
-            }
-            y += 4;
-        }
+        // 阶段计时：CU 级 CABAC 语法（transquant/part_mode/亮度模式/色度模式）计入 parse。
+        let (part_nxn, max_trafo_depth) = stage_clock::parse(|| -> HeifResult<(bool, i32)> {
+            self.cu_transquant_bypass = self.pps.transquant_bypass_enabled
+                && cabac.decode_bin(HevcCabacTables::TransquantBypass)? == 1;
+            self.update_cu_qp();
 
-        // 每个 PB 的 prev_intra_luma_pred_flag，随后 mpm_idx / rem_intra_luma_pred_mode（7.3.8.5）。
-        let pb_count = if part_nxn { 4 } else { 1 };
-        let mut prev_flags = [false; 4];
-        for i in 0..pb_count {
-            prev_flags[i] = cabac.decode_bin(HevcCabacTables::PrevIntraLuma)? == 1;
-        }
-        for i in 0..pb_count {
-            let x_pb = x0 + (i & 1) as i32 * pb_offset;
-            let y_pb = y0 + ((i >> 1) as i32) * pb_offset;
-            let mode: i32;
-            if prev_flags[i] {
-                let mpm_idx = if cabac.decode_bypass()? == 0 {
-                    0
-                } else if cabac.decode_bypass()? == 0 {
-                    1
-                } else {
-                    2
-                };
-                mode = self.derive_luma_mode(x_pb, y_pb, mpm_idx, -1);
-            } else {
-                mode = self.derive_luma_mode(x_pb, y_pb, -1, cabac.decode_bypass_bits(5)? as i32);
-            }
-            let pb_end_x = (x_pb + pb_offset).min(self.sps.width);
-            let pb_end_y = (y_pb + pb_offset).min(self.sps.height);
-            let mut y = y_pb;
-            while y < pb_end_y {
-                let mut x = x_pb;
-                while x < pb_end_x {
+            // I 片的帧内 CU：part_mode 只在最小 CB 尺寸出现，1 → PART_2Nx2N，0 → PART_NxN。
+            let part_nxn = log2_cb_size == self.sps.min_cb_log2_size_y
+                && cabac.decode_bin(HevcCabacTables::PartMode)? == 0;
+
+            // 先填 CU 辅助信息：后续 PB 的亮度模式推导要读它。
+            let pb_offset = if part_nxn { size >> 1 } else { size };
+            let mut y = y0;
+            while y < y_end {
+                let mut x = x0;
+                while x < x_end {
                     let b = self.block(x, y);
-                    self.intra_mode[b] = mode as u8;
+                    self.ct_depth[b] = depth as u8;
+                    self.no_filter[b] = if self.cu_transquant_bypass { 1 } else { 0 };
                     x += 4;
                 }
                 y += 4;
             }
-        }
 
-        // intra_chroma_pred_mode（4:2:0：每个 CU 一个）→ IntraPredModeC（表 8-2）。
-        let chroma_syntax = if cabac.decode_bin(HevcCabacTables::IntraChroma)? == 0 {
-            4
-        } else {
-            cabac.decode_bypass_bits(2)? as i32
-        };
-        let luma_mode = self.intra_mode[self.block(x0, y0)] as i32;
-        if chroma_syntax == 4 {
-            self.intra_chroma_mode = luma_mode;
-        } else {
-            let candidate = match chroma_syntax {
-                0 => 0,
-                1 => 26,
-                2 => 10,
-                _ => 1,
+            // 每个 PB 的 prev_intra_luma_pred_flag，随后 mpm_idx / rem_intra_luma_pred_mode（7.3.8.5）。
+            let pb_count = if part_nxn { 4 } else { 1 };
+            let mut prev_flags = [false; 4];
+            for i in 0..pb_count {
+                prev_flags[i] = cabac.decode_bin(HevcCabacTables::PrevIntraLuma)? == 1;
+            }
+            for i in 0..pb_count {
+                let x_pb = x0 + (i & 1) as i32 * pb_offset;
+                let y_pb = y0 + ((i >> 1) as i32) * pb_offset;
+                let mode: i32;
+                if prev_flags[i] {
+                    let mpm_idx = if cabac.decode_bypass()? == 0 {
+                        0
+                    } else if cabac.decode_bypass()? == 0 {
+                        1
+                    } else {
+                        2
+                    };
+                    mode = self.derive_luma_mode(x_pb, y_pb, mpm_idx, -1);
+                } else {
+                    mode = self.derive_luma_mode(x_pb, y_pb, -1, cabac.decode_bypass_bits(5)? as i32);
+                }
+                let pb_end_x = (x_pb + pb_offset).min(self.sps.width);
+                let pb_end_y = (y_pb + pb_offset).min(self.sps.height);
+                let mut y = y_pb;
+                while y < pb_end_y {
+                    let mut x = x_pb;
+                    while x < pb_end_x {
+                        let b = self.block(x, y);
+                        self.intra_mode[b] = mode as u8;
+                        x += 4;
+                    }
+                    y += 4;
+                }
+            }
+
+            // intra_chroma_pred_mode（4:2:0：每个 CU 一个）→ IntraPredModeC（表 8-2）。
+            let chroma_syntax = if cabac.decode_bin(HevcCabacTables::IntraChroma)? == 0 {
+                4
+            } else {
+                cabac.decode_bypass_bits(2)? as i32
             };
-            self.intra_chroma_mode = if candidate == luma_mode { 34 } else { candidate };
-        }
+            let luma_mode = self.intra_mode[self.block(x0, y0)] as i32;
+            if chroma_syntax == 4 {
+                self.intra_chroma_mode = luma_mode;
+            } else {
+                let candidate = match chroma_syntax {
+                    0 => 0,
+                    1 => 26,
+                    2 => 10,
+                    _ => 1,
+                };
+                self.intra_chroma_mode = if candidate == luma_mode { 34 } else { candidate };
+            }
 
-        let max_trafo_depth =
-            self.sps.max_transform_hierarchy_depth_intra + if part_nxn { 1 } else { 0 };
+            let max_trafo_depth =
+                self.sps.max_transform_hierarchy_depth_intra + if part_nxn { 1 } else { 0 };
+            Ok((part_nxn, max_trafo_depth))
+        })?;
         self.transform_tree(
             cabac,
             x0,
@@ -972,7 +979,7 @@ impl HevcFrameDecoder {
 
         // 亮度：先预测，再加残差。
         let luma_mode = self.intra_mode[self.block(x0, y0)] as i32;
-        self.predict_intra(0, x0, y0, log2_size, luma_mode)?;
+        stage_clock::intra(|| self.predict_intra(0, x0, y0, log2_size, luma_mode))?;
         if cbf_luma {
             self.residual_and_reconstruct(cabac, 0, x0, y0, log2_size, luma_mode)?;
         }
@@ -982,22 +989,22 @@ impl HevcFrameDecoder {
         if log2_size > 2 {
             let x_c = x0 >> 1;
             let y_c = y0 >> 1;
-            self.predict_intra(1, x_c, y_c, log2_size - 1, self.intra_chroma_mode)?;
+            stage_clock::intra(|| self.predict_intra(1, x_c, y_c, log2_size - 1, self.intra_chroma_mode))?;
             if cbf_cb {
                 self.residual_and_reconstruct(cabac, 1, x_c, y_c, log2_size - 1, self.intra_chroma_mode)?;
             }
-            self.predict_intra(2, x_c, y_c, log2_size - 1, self.intra_chroma_mode)?;
+            stage_clock::intra(|| self.predict_intra(2, x_c, y_c, log2_size - 1, self.intra_chroma_mode))?;
             if cbf_cr {
                 self.residual_and_reconstruct(cabac, 2, x_c, y_c, log2_size - 1, self.intra_chroma_mode)?;
             }
         } else if blk_idx == 3 {
             let x_c = x_base >> 1;
             let y_c = y_base >> 1;
-            self.predict_intra(1, x_c, y_c, 2, self.intra_chroma_mode)?;
+            stage_clock::intra(|| self.predict_intra(1, x_c, y_c, 2, self.intra_chroma_mode))?;
             if cbf_cb {
                 self.residual_and_reconstruct(cabac, 1, x_c, y_c, 2, self.intra_chroma_mode)?;
             }
-            self.predict_intra(2, x_c, y_c, 2, self.intra_chroma_mode)?;
+            stage_clock::intra(|| self.predict_intra(2, x_c, y_c, 2, self.intra_chroma_mode))?;
             if cbf_cr {
                 self.residual_and_reconstruct(cabac, 2, x_c, y_c, 2, self.intra_chroma_mode)?;
             }
@@ -1190,7 +1197,7 @@ impl HevcFrameDecoder {
     ) -> HeifResult<()> {
         let n = 1usize << log2_size;
         // _coeffs 在块之间全零：每块清掉它写下的矩形。
-        let packed = self.residual_coding(cabac, c_idx, log2_size, pred_mode_intra)?;
+        let packed = stage_clock::parse(|| self.residual_coding(cabac, c_idx, log2_size, pred_mode_intra))?;
         let transform_skip = (packed & 1) != 0;
         let max_x = (packed >> 8) & 0xFF;
         let max_y = packed >> 16;
@@ -1201,30 +1208,36 @@ impl HevcFrameDecoder {
             self.sps.bit_depth_c
         };
         let coeffs = &mut self.coeffs[..n * n];
+        let residual = &mut self.residual[..n * n];
         let stride = self.picture.plane_width(c_idx);
         let base = y_tb as usize * stride as usize + x_tb as usize;
         let plane = &mut self.picture.planes[c_idx];
         let dst = plane
             .get_mut(base..)
             .ok_or_else(|| HeifError::invalid("残差重建目标越界。"))?;
-        if self.cu_transquant_bypass {
-            HevcTransform::add_residual(coeffs, log2_size, bit_depth, dst, stride)?;
-        } else if transform_skip {
-            HevcTransform::transform_skip(coeffs, log2_size, bit_depth)?;
-            HevcTransform::add_residual(coeffs, log2_size, bit_depth, dst, stride)?;
-        } else {
-            HevcTransform::inverse_add(
-                coeffs,
-                &mut self.residual[..n * n],
-                log2_size,
-                c_idx == 0 && n == 4,
-                max_x,
-                max_y,
-                bit_depth,
-                dst,
-                stride,
-            )?;
-        }
+        let cu_tq_bypass = self.cu_transquant_bypass;
+        // 阶段计时：逆变换/残差加（系数语法在 `residual_coding` 已计 parse）。
+        stage_clock::residual(|| -> HeifResult<()> {
+            if cu_tq_bypass {
+                HevcTransform::add_residual(coeffs, log2_size, bit_depth, dst, stride)?;
+            } else if transform_skip {
+                HevcTransform::transform_skip(coeffs, log2_size, bit_depth)?;
+                HevcTransform::add_residual(coeffs, log2_size, bit_depth, dst, stride)?;
+            } else {
+                HevcTransform::inverse_add(
+                    coeffs,
+                    residual,
+                    log2_size,
+                    c_idx == 0 && n == 4,
+                    max_x,
+                    max_y,
+                    bit_depth,
+                    dst,
+                    stride,
+                )?;
+            }
+            Ok(())
+        })?;
 
         // 变换跳过把零映射到零，所以只有编码系数的矩形非零。
         let span = (max_x as usize + 1).min(n);
