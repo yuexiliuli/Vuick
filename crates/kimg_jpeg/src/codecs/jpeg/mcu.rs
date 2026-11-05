@@ -2,14 +2,14 @@
 
 use core::cmp::{max, min};
 
-use crate::codecs::jpeg::avx2::{idct4x4, idct_int};
+use crate::codecs::jpeg::avx2::{idct4x4, idct_int, zero_tmp_window};
 use crate::codecs::jpeg::bitstream::BitStream;
 use crate::codecs::jpeg::color::color_convert;
 use crate::codecs::jpeg::error::DecodeError;
 use crate::codecs::jpeg::idct::idct_int_1x1;
 use crate::codecs::jpeg::io::{ByteReader, Marker};
 use crate::codecs::jpeg::segment::{
-    calculate_padded_width, ColorSpace, Decoder, SampleRatios, DCT_BLOCK, MAX_COMPONENTS,
+    calculate_padded_width, ColorSpace, Decoder, SampleRatios, Stage, DCT_BLOCK, MAX_COMPONENTS,
 };
 use crate::codecs::jpeg::upsampler::{upsample, upsample_generic, upsample_no_op};
 
@@ -177,6 +177,8 @@ impl<'a> Decoder<'a> {
 
     /// baseline 主解码循环。
     pub(crate) fn decode_mcu_ycbcr_baseline(&mut self, pixels: &mut [u8]) -> Result<(), DecodeError> {
+        let t_setup = self.stage.timer();
+
         self.setup_component_params()?;
 
         self.check_tables()?;
@@ -258,6 +260,8 @@ impl<'a> Decoder<'a> {
             * 8;
         let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
 
+        self.stage.stop(Stage::Setup, t_setup);
+
         'sos: loop {
             for i in 0..mcu_height {
                 if stream.overread_by > 0 {
@@ -265,6 +269,7 @@ impl<'a> Decoder<'a> {
                     break;
                 }
 
+                let t_rows = self.stage.timer();
                 let terminate = if all_components_in_first_scan {
                     self.decode_mcu_width::<false>(
                         mcu_width,
@@ -282,7 +287,10 @@ impl<'a> Decoder<'a> {
                         &mut progressive_mcus,
                     )?
                 };
+                self.stage.stop(Stage::DecodeRows, t_rows);
+                self.stage.n_rows += 1;
 
+                let t_post = self.stage.timer();
                 if all_components_in_first_scan {
                     self.post_process(
                         pixels,
@@ -294,6 +302,7 @@ impl<'a> Decoder<'a> {
                         &mut upsampler_scratch_space,
                     )?;
                 }
+                self.stage.stop(Stage::Post, t_post);
 
                 match terminate {
                     McuContinuation::Ok => {}
@@ -501,10 +510,12 @@ impl<'a> Decoder<'a> {
                     };
 
                     for h_samp in h_step {
+                        let t_entropy = self.stage.timer();
+
                         let result = if component_samples_needed {
                             let clobber_len = if !clobber_more_than_4x4 { 32 } else { 64 };
 
-                            tmp[..clobber_len].fill(0);
+                            zero_tmp_window(tmp, clobber_len);
 
                             stream.decode_mcu_block(
                                 &mut self.reader,
@@ -517,6 +528,9 @@ impl<'a> Decoder<'a> {
                         } else {
                             stream.discard_mcu_block(&mut self.reader, dc_table, ac_table)
                         };
+
+                        self.stage.stop(Stage::Entropy, t_entropy);
+                        self.stage.n_entropy += 1;
 
                         let len = match result {
                             Ok(len) => len,
@@ -548,6 +562,7 @@ impl<'a> Decoder<'a> {
                                 }
                             };
 
+                            let t_idct = self.stage.timer();
                             if len <= 1 {
                                 idct_int_1x1(tmp, idct_pos, component.width_stride);
                             } else if len <= 10 {
@@ -555,11 +570,14 @@ impl<'a> Decoder<'a> {
                             } else {
                                 idct_int(tmp, idct_pos, component.width_stride);
                             }
+                            self.stage.stop(Stage::Idct, t_idct);
+                            self.stage.n_idct += 1;
                         }
                     }
                 }
             }
 
+            let t_mcu = self.stage.timer();
             self.todo = self.todo.wrapping_sub(1);
 
             if self.todo == 0 {
@@ -570,6 +588,7 @@ impl<'a> Decoder<'a> {
             if stream.marker.is_some() && stream.bits_left == 0 {
                 break;
             }
+            self.stage.stop(Stage::McuRest, t_mcu);
         }
 
         self.check_stream_marker_after_mcu_width(stream)
@@ -770,6 +789,7 @@ impl<'a> Decoder<'a> {
         let comps = &mut self.components[..];
 
         if self.is_interleaved && self.out_colorspace != ColorSpace::Luma {
+            let t_upsample = self.stage.timer();
             for comp in comps.iter_mut() {
                 upsample(
                     comp,
@@ -779,6 +799,7 @@ impl<'a> Decoder<'a> {
                     is_vertically_sampled,
                 )?;
             }
+            self.stage.stop(Stage::Upsample, t_upsample);
 
             if is_vertically_sampled {
                 if i > 0 {
@@ -791,7 +812,9 @@ impl<'a> Decoder<'a> {
 
                     let num_iters = self.coeff * self.v_max;
 
+                    let t_color = self.stage.timer();
                     color_conv_function(num_iters, samples)?;
+                    self.stage.stop(Stage::Color, t_color);
                 }
 
                 // 上采样完最后一行后，保存可用于下次上采样的行
@@ -826,7 +849,9 @@ impl<'a> Decoder<'a> {
 
             let num_iters = (8 - usize::from(is_last_considered)) * self.coeff * self.v_max;
 
+            let t_color = self.stage.timer();
             color_conv_function(num_iters, samples)?;
+            self.stage.stop(Stage::Color, t_color);
         } else {
             let mut channels_ref: [&[i16]; MAX_COMPONENTS] = [&[]; MAX_COMPONENTS];
 
@@ -835,11 +860,13 @@ impl<'a> Decoder<'a> {
                 .enumerate()
                 .for_each(|(pos, x)| channels_ref[pos] = &x.raw_coeff);
 
+            let t_color = self.stage.timer();
             if let SampleRatios::Generic(_, v) = self.sample_ratio {
                 color_conv_function(8 * v * self.coeff, channels_ref)?;
             } else {
                 color_conv_function(8 * self.coeff, channels_ref)?;
             }
+            self.stage.stop(Stage::Color, t_color);
         }
 
         *pixels_written = px;
@@ -1026,6 +1053,7 @@ impl<'a> Decoder<'a> {
 
             for i in 0..mcu_height {
                 for j in 0..mcu_width {
+                    let t_entropy = self.stage.timer();
                     if self.spec_start != 0 && self.succ_high == 0 && stream.eob_run > 0 {
                         // 在此处理 EOB RUN 的整块跳过
                         stream.eob_run -= 1;
@@ -1097,6 +1125,7 @@ impl<'a> Decoder<'a> {
                             }
                         }
                     }
+                    self.stage.stop(Stage::Entropy, t_entropy);
 
                     self.todo = self.todo.wrapping_sub(1);
 
@@ -1174,6 +1203,7 @@ impl<'a> Decoder<'a> {
                                     DecodeError::Format("Invalid image".to_string())
                                 })?;
 
+                                let t_entropy = self.stage.timer();
                                 if self.succ_high == 0 {
                                     stream.decode_prog_dc_first(
                                         &mut self.reader,
@@ -1184,6 +1214,8 @@ impl<'a> Decoder<'a> {
                                 } else {
                                     stream.decode_prog_dc_refine(&mut self.reader, data)?;
                                 }
+                        self.stage.stop(Stage::Entropy, t_entropy);
+                        self.stage.n_entropy += 1;
                             }
                         }
                     }
@@ -1272,6 +1304,8 @@ impl<'a> Decoder<'a> {
                             ));
                         };
 
+                        let t_idct = self.stage.timer();
+
                         // 反量化
                         for ((x, out), qt_val) in
                             qt_slice.iter().zip(tmp.iter_mut()).zip(qt_table.iter())
@@ -1284,6 +1318,7 @@ impl<'a> Decoder<'a> {
                         idct_pos += 8;
                         // tmp 现为反量化后的块，做 IDCT（整块右移 & clamp 与 baseline 同源）
                         idct_int(&mut tmp, sl, component.width_stride);
+                        self.stage.stop(Stage::Idct, t_idct);
                     }
                     // 每写完 8 行后跳过 7 个 stride 至下一垂直块行
                     idct_pos += 7 * component.width_stride;
@@ -1343,7 +1378,10 @@ pub(crate) fn decode_baseline(
 ) -> Result<(), DecodeError> {
     decoder.out_colorspace = out_colorspace;
     decoder.decode_headers_internal()?;
-    decoder.decode_mcu_ycbcr_baseline(pixels)
+    let t_total = decoder.stage.timer();
+    let r = decoder.decode_mcu_ycbcr_baseline(pixels);
+    decoder.stage.stop(Stage::Total, t_total);
+    r
 }
 
 /// progressive 解码入口（先解析段，再按渐进流程解 MCU）。
@@ -1354,5 +1392,8 @@ pub(crate) fn decode_progressive(
 ) -> Result<(), DecodeError> {
     decoder.out_colorspace = out_colorspace;
     decoder.decode_headers_internal()?;
-    decoder.decode_mcu_ycbcr_progressive(pixels)
+    let t_total = decoder.stage.timer();
+    let r = decoder.decode_mcu_ycbcr_progressive(pixels);
+    decoder.stage.stop(Stage::Total, t_total);
+    r
 }

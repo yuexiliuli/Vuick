@@ -11,6 +11,158 @@ use crate::codecs::jpeg::upsampler::{upsample_no_op, UpSampler};
 pub(crate) const MAX_COMPONENTS: usize = 4;
 pub(crate) const DCT_BLOCK: usize = 64;
 
+/// 阶段计时探针：`KIMG_JPEG_STAGE_PROFILE=1` 时在热路径累加各阶段耗时。
+/// 默认关闭：`timer()`/`stop()` 只做一次可预测分支，`Instant::now()` 仅启用时构造，
+/// 探针关闭为零开销（不读 env、不构造 Instant）。env 判定进程级缓存，热环不重复读。
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Stage {
+    Entropy,
+    Idct,
+    Upsample,
+    Color,
+    Total,
+    Header,
+    Setup,
+    DecodeRows,
+    Post,
+    McuRest,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StageProfile {
+    pub(crate) enabled: bool,
+    entropy_us: u128,
+    idct_us: u128,
+    upsample_us: u128,
+    color_us: u128,
+    total_us: u128,
+    header_us: u128,
+    setup_us: u128,
+    rows_us: u128,
+    post_us: u128,
+    /// 调用计数（辅助解释 per-call 耗时时使用）。
+    pub(crate) n_entropy: u64,
+    pub(crate) n_idct: u64,
+    pub(crate) n_rows: u64,
+    pub(crate) mcu_rest_us: u128,
+}
+
+#[inline]
+fn rdtsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // 非 x86：以 ns 计时（ns_per_tick=1.0 使换算成立）。
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as u64,
+            Err(_) => 0,
+        }
+    }
+}
+
+/// x86 TSC 计数 → ns 换算系数（进程内校准一次；非 x86 恒为 1ns/tick）。
+fn ns_per_tick() -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(|| {
+            let t0 = rdtsc();
+            let s0 = std::time::Instant::now();
+            let mut x: u64 = 0;
+            for _ in 0..2_000_000 {
+                x = x.wrapping_add(1);
+            }
+            let s1 = std::time::Instant::now();
+            let t1 = rdtsc();
+            let ns = s1.duration_since(s0).as_nanos().max(1) as f64;
+            let ticks = t1.wrapping_sub(t0).max(1) as f64;
+            let _ = x;
+            ns / ticks
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        1.0
+    }
+}
+
+impl StageProfile {
+    /// env 门控一次性判定（OnceLock 缓存，进程内只读一次）。
+    pub(crate) fn enabled_by_env() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("KIMG_JPEG_STAGE_PROFILE")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false)
+        })
+    }
+
+    #[inline]
+    pub(crate) fn timer(&self) -> Option<u64> {
+        if self.enabled {
+            Some(rdtsc())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn stop(&mut self, stage: Stage, t: Option<u64>) {
+        if let Some(t) = t {
+            let us = ((rdtsc().wrapping_sub(t)) as f64 * ns_per_tick() / 1000.0) as u128;
+            match stage {
+                Stage::Entropy => self.entropy_us += us,
+                Stage::Idct => self.idct_us += us,
+                Stage::Upsample => self.upsample_us += us,
+                Stage::Color => self.color_us += us,
+                Stage::Total => self.total_us += us,
+                Stage::Header => self.header_us += us,
+                Stage::Setup => self.setup_us += us,
+                Stage::DecodeRows => self.rows_us += us,
+                Stage::Post => self.post_us += us,
+                Stage::McuRest => self.mcu_rest_us += us,
+            }
+        }
+    }
+
+    /// 打印本 decode 的阶段分布（只读 side-effect，env 门控）。
+    pub(crate) fn print(&self) {
+        if !self.enabled {
+            return;
+        }
+        // 占比分母 = header + mcu 解码全时段
+        let full = (self.header_us + self.total_us).max(1);
+        let pct = |us: u128| (us as f64) / (full as f64) * 100.0;
+        let other = self
+            .total_us
+            .saturating_sub(self.setup_us + self.rows_us + self.post_us);
+        let rest = self
+            .rows_us
+            .saturating_sub(self.entropy_us + self.idct_us + self.mcu_rest_us);
+        println!(
+            "STAGE-DECODE header={:.3}ms mcu_total={:.3}ms rows={:.3}ms x{}[nidct={}] loop=(ent{:.3}+idct{:.3})+mcuRest{:.3}+inner{:.3} post={:.3}ms[up={:.3}+color={:.3}] other={:.3}ms({:.1}%)",
+            self.header_us as f64 / 1000.0,
+            self.total_us as f64 / 1000.0,
+            self.rows_us as f64 / 1000.0,
+            self.n_rows,
+            self.n_idct,
+            self.entropy_us as f64 / 1000.0,
+            self.idct_us as f64 / 1000.0,
+            self.mcu_rest_us as f64 / 1000.0,
+            rest as f64 / 1000.0,
+            self.post_us as f64 / 1000.0,
+            self.upsample_us as f64 / 1000.0,
+            self.color_us as f64 / 1000.0,
+            other as f64 / 1000.0,
+            pct(other),
+        );
+    }
+}
+
 /// 输入/输出颜色空间（zune-core `ColorSpace` 的子集；部分变体仅用于镜像映射）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -198,6 +350,8 @@ pub(crate) struct Decoder<'a> {
     pub(crate) exif_data: Option<Vec<u8>>,
     pub(crate) xmp_data: Option<Vec<u8>>,
     pub(crate) iptc_data: Option<Vec<u8>>,
+    /// 阶段计时探针（默认关闭，零开销）。
+    pub(crate) stage: StageProfile,
 }
 
 impl<'a> Decoder<'a> {
@@ -237,6 +391,10 @@ impl<'a> Decoder<'a> {
             exif_data: None,
             xmp_data: None,
             iptc_data: None,
+            stage: StageProfile {
+                enabled: StageProfile::enabled_by_env(),
+                ..Default::default()
+            },
         }
     }
 

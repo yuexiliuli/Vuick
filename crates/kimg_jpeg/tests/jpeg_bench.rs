@@ -141,6 +141,50 @@ fn bench_main() {
         return;
     }
 
+    // 阶段探针模式：`KIMG_JPEG_STAGE_PROFILE=1` 时跑分布表（warmup + 3 轮），
+    // 不做 A/B；decode 内部每轮打印一行 `STAGE-DECODE ...`（env 门控，见 jpeg/mcu.rs）。
+    // `KIMG_JPEG_STAGE_FILTER=<子串>` 可只跑名字含该子串的文件。
+    if std::env::var("KIMG_JPEG_STAGE_PROFILE").as_deref() == Ok("1") {
+        let filter = std::env::var("KIMG_JPEG_STAGE_FILTER").unwrap_or_default();
+        for (name, bytes, n) in bench.iter().filter(|(n, _, _)| {
+            filter.is_empty() || n.contains(&filter)
+        }) {
+            let dims = NewJpeg::new(Cursor::new(bytes.as_slice()))
+                .map(|d| {
+                    let (w, h) = d.dimensions();
+                    format!("{w}x{h}")
+                })
+                .unwrap_or_else(|_| "(dims?)".into());
+            println!("STAGE FILE {name} dims={dims}");
+            let mut buf = vec![0u8; *n];
+            let t0 = Instant::now();
+            let dec = NewJpeg::new(Cursor::new(bytes.as_slice())).expect("冒烟已保证可解");
+            let t1 = Instant::now();
+            let _ = dec.read_image(&mut buf).expect("冒烟已保证可解");
+            let t2 = Instant::now();
+            println!(
+                "STAGE WARMUP wall new={:.3}ms read={:.3}ms",
+                (t1 - t0).as_secs_f64() * 1000.0,
+                (t2 - t1).as_secs_f64() * 1000.0
+            );
+            for _ in 0..3 {
+                let mut buf = vec![0u8; *n];
+                let t0 = Instant::now();
+                let dec = NewJpeg::new(Cursor::new(bytes.as_slice())).expect("冒烟已保证可解");
+                let t1 = Instant::now();
+                let _ = dec.read_image(&mut buf).expect("冒烟已保证可解");
+                let t2 = Instant::now();
+                println!(
+                    "STAGE ROUND wall new={:.3}ms read={:.3}ms",
+                    (t1 - t0).as_secs_f64() * 1000.0,
+                    (t2 - t1).as_secs_f64() * 1000.0
+                );
+            }
+        }
+        println!("STAGE done.");
+        return;
+    }
+
     // A/B 计时：old 与 new 各预分配一次缓冲复用（暖态零分配 direct 姿态）。
     let mut ratios: Vec<f64> = Vec::new();
     let mut agg_old: Vec<f64> = Vec::new();

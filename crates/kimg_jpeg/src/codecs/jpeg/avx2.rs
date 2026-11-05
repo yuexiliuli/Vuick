@@ -308,8 +308,7 @@ mod kernels {
         permute_store!(row6, row7, pos, out_vector, stride);
     }
 
-    /// 仅左上 4×4 子块非零的 IDCT（复刻 `idct/avx2.rs::idct_avx2_4x4`）。
-    #[target_feature(enable = "avx2")]
+    /// 仅左上 4×4 子块非零的 IDCT（复刻 `idct/avx2.rs::idct_avx2_4x4`）。    #[target_feature(enable = "avx2")]
     #[allow(clippy::similar_names, unused_assignments)]
     pub(crate) unsafe fn idct_avx2_4x4(
         in_vector: &mut [i32; 64],
@@ -426,6 +425,20 @@ mod kernels {
         permute_store!(row2, row3, pos, out_vector, stride);
         permute_store!(row4, row5, pos, out_vector, stride);
         permute_store!(row6, row7, pos, out_vector, stride);
+    }
+
+    /// 256-bit 零向量清零 `i32` 窗口（`tmp` 块装配用；字节恒等的写零）。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn zero_i32_window(tmp: &mut [i32; 64], clobber_len: usize) {
+        let zero = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 8 <= clobber_len {
+            _mm256_storeu_si256(tmp[i..].as_mut_ptr().cast(), zero);
+            i += 8;
+        }
+        for v in &mut tmp[i..clobber_len] {
+            *v = 0;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -948,6 +961,21 @@ pub(crate) fn upsample_hv(
         return;
     }
     uhv_scalar(input, in_near, in_far, scratch, output)
+}
+
+/// 清零 `tmp[..clobber_len]`（i32 窗口）。AVX2 开启时用 256-bit 零向量 store，
+/// 否则回退 `fill(0)`（memset）。字节恒等（写零），仅装配路径微调。
+#[inline]
+pub(crate) fn zero_tmp_window(tmp: &mut [i32; 64], clobber_len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if clobber_len >= 8 && avx2_enabled() {
+        // SAFETY: avx2_enabled() 已保证 AVX2；clobber_len>=8 保证至少一个完整 256-bit。
+        unsafe {
+            kernels::zero_i32_window(tmp, clobber_len);
+        }
+        return;
+    }
+    tmp[..clobber_len].fill(0);
 }
 
 // ---------------------------------------------------------------------------

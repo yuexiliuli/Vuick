@@ -5,7 +5,6 @@
 //! 本模块的 `zune_decode` 复刻旧 `codecs/jpeg.rs` wrapper 的选项语义：
 //! 输入 YCbCr→RGB / RGB→RGB / RGBA→RGBA / Luma→L8 / LumaA→La8，其余（CMYK/YCCK）→RGB。
 
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use zune_core::bytestream::ZCursor;

@@ -34,7 +34,7 @@ use kimg_core::ImageFormatHint;
 
 use crate::codecs::jpeg::error::DecodeError;
 use crate::codecs::jpeg::mcu::{decode_baseline, decode_progressive};
-use crate::codecs::jpeg::segment::{ColorSpace, Decoder};
+use crate::codecs::jpeg::segment::{ColorSpace, Decoder, Stage};
 
 /// 自研 JPEG 解码器（泛型参数 `R` 与旧 wrapper 同款占位）。
 pub struct JpegDecoder<R> {
@@ -149,12 +149,15 @@ impl<R> ImageDecoder for JpegDecoder<R> {
 
         let target_out = output_for_input(self.input_colorspace);
         let mut dec = Decoder::new(&self.input);
+        let t_header = dec.stage.timer();
         dec.decode_headers_internal().map_err(from_kimg_jpeg)?;
+        dec.stage.stop(Stage::Header, t_header);
         if dec.is_progressive {
             decode_progressive(&mut dec, target_out, buf).map_err(from_kimg_jpeg)?;
         } else {
             decode_baseline(&mut dec, target_out, buf).map_err(from_kimg_jpeg)?;
         }
+        dec.stage.print();
         Ok(())
     }
 

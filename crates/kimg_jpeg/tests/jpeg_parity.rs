@@ -15,7 +15,6 @@ mod fixtures;
 
 use std::io::Cursor;
 
-use kimg_core::ImageDecoder as _;
 use kimg_jpeg::codecs::jpeg::JpegDecoder as NewJpeg;
 
 use fixtures::*;
