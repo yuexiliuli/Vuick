@@ -196,7 +196,7 @@ mod kernels {
 
         if _mm256_testz_si256(bitmap, bitmap) == 1 {
             // 63 个 AC 全零：整块为 `(coeff[0] + 4 + 1024) >> 3` clamp 后铺满（同 idct_int_1x1）
-            let coeff = ((in_vector[0] + 4 + 1024) >> 3).clamp(0, 255) as i16;
+            let coeff = ((in_vector[0].wrapping_add(4 + 1024)) >> 3).clamp(0, 255) as i16;
             let idct_value = _mm_set1_epi16(coeff);
 
             macro_rules! store {
@@ -308,7 +308,8 @@ mod kernels {
         permute_store!(row6, row7, pos, out_vector, stride);
     }
 
-    /// 仅左上 4×4 子块非零的 IDCT（复刻 `idct/avx2.rs::idct_avx2_4x4`）。    #[target_feature(enable = "avx2")]
+    /// 仅左上 4×4 子块非零的 IDCT（复刻 `idct/avx2.rs::idct_avx2_4x4`）。
+    #[target_feature(enable = "avx2")]
     #[allow(clippy::similar_names, unused_assignments)]
     pub(crate) unsafe fn idct_avx2_4x4(
         in_vector: &mut [i32; 64],
