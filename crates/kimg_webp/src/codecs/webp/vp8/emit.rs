@@ -73,6 +73,22 @@ impl EmitScratch {
             t_ws: vec![0u16; 4 * (cw + 8)],
         }
     }
+
+    /// 池化复用（`subbuffers` 池 take 路径）：把先前宽度的缓冲 resize 到当前 `width`（容量
+    /// 保留、grow 不 shrink）。各字段每次 emit 调用前均由 `upsample_fancy_into_uv(_pair)` 全写
+    /// 先于读（输出行 u_up/v_up 及 t_ws 逐元素覆写，读只取本次已写段；见 simd::upsample），
+    /// 且消费方按当前 `width` 切片（`yuv_row_to_rgba_alpha` debug_assert 长度相等）——故仅需
+    /// 保证 `len` 与当前 width/cw 一致，无需重新清零（残值不可读）。
+    pub(crate) fn resize_to(mut self, width: usize) -> Self {
+        let cw = (width + 1) >> 1;
+        // `resize` 收缩时容量保留；扩容时仅新段置零（少见，grow 语义）——旧段内容不参与任何读。
+        self.u_up.resize(width, 0);
+        self.v_up.resize(width, 0);
+        self.u_up2.resize(width, 0);
+        self.v_up2.resize(width, 0);
+        self.t_ws.resize(4 * (cw + 8), 0);
+        self
+    }
 }
 
 /// 从**滤波后** padded 平面把已定稿行 `[first, end)` fancy 上采样 + YUV→RGBA 直出到 `rgba`。

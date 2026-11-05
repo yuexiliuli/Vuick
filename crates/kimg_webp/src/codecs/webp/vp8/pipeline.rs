@@ -547,8 +547,19 @@ pub(crate) fn decode_from_header(
     // 左缘读）被预测读取，故只对该列确定性初始化，省全量 memset。无未初始化读（见下）。
     let y_vec_len = ch * y_pitch;
     let uv_vec_len = uh * uv_pitch;
+    // 固定缓冲池（结构线唯一实靶）：planes / above_b / above_nz / row_filters / EmitScratch
+    // 每调用一次分配收敛为每线程复用池——第二次起的 decode 不再分配、不首触缺页（见
+    // `subbuffers.rs`）。线程归属：所有取/还都在调用线程完成（MT 路径 planes_A 虽被 t2 重建
+    // 线程写入，其生命周期由本 guard 全程持有、`std::thread::scope` join 后才归还）→ 无跨线程
+    // 归还（K28 每线程独立）。各缓冲「take 时重初始化 or 全写先于读」判定见 `subbuffers.rs`。
+    let mut sub = Vp8SubBuffersGuard::take(y_vec_len, uv_vec_len, mbw, mbh);
     let (mut planes, mut rgba, mut out_y, mut out_u, mut out_v) = stage_clock::setup(|| {
-        let mut planes = unsafe { uninit_vec_u8(y_vec_len + 2 * uv_vec_len) };
+        // planes 池化：take 时已按本帧 `len` 就绪（grow 用 reserve 不触碰新页，与
+        // `uninit_vec_u8` 同未初始化语义——首页缺页仍发生在重建写，而非 here）。
+        // 129 左列确定性初始化每帧照旧；内部像素由预测/IDCT 逐宏块整块写满先于读（既有
+        // 微批不变式，复用上一帧残值不影响任何读）。`rgba`/`out_*` 例外：随 `Vp8Yuv` 逃逸给
+        // 调用方，不能池化（会被下一帧 take 复用覆盖仍在使用的输出）→ 每帧新建。
+        let mut planes = sub.take_planes();
         {
             let (y, uv_rest) = planes.split_at_mut(y_vec_len);
             let (u, v) = uv_rest.split_at_mut(uv_vec_len);
@@ -635,13 +646,16 @@ pub(crate) fn decode_from_header(
         } else {
             None
         };
-        let mut above_b = vec![0u8; mbw * 4];
-        let mut above_nz = vec![0u32; mbw];
+        // above_b / above_nz：take 时已确定性重初始化（fill 0，`vec![0; _]` 原语义——首宏块
+        // 行写前读取依赖 0 初值）。row_filters：逐元素写满先于读（串行每宏块写、经受滤波行才
+        // 读；MT 不消费本表）→ take 时未重零。
+        let above_b = sub.take_above_b();
+        let above_nz = sub.take_above_nz();
         let above_y = [127u8; 21];
         let above_u = [127u8; 9];
         let above_v = [127u8; 9];
         // 每行宏块的 (滤波等级, 是否滤内部边)，仅串行路径消费（MT 行包自带滤波参数）。
-        let row_filters = vec![(0u8, 0u8); mbw * mbh];
+        let row_filters = sub.take_row_filters();
         let pipelined = filter_mt_enabled(mbw, mbh);
         (
             partition_count,
@@ -755,7 +769,9 @@ pub(crate) fn decode_from_header(
         // 串行分支整段墙钟（B 线拆账：margin = serial_loop − Σ5 阶段；feature 外零开销）。
         stage_clock::serial_loop(|| {
         let mut pkt = MbPacket::default();
-        let mut scratch = EmitScratch::new(width);
+        // EmitScratch 池化：池中复用则 resize 到当前 width（各字段 emit 前全写先于读，见
+        // `EmitScratch::resize_to`），池空才新建；serial 分支专属，用完归还。
+        let mut scratch = sub.take_scratch(width);
         let mut emitted = 0usize;
         for mby in 0..mbh {
             // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
@@ -822,8 +838,18 @@ pub(crate) fn decode_from_header(
                 );
             });
         }
+        // 归还上采样工作区给池（serial 分支专属；MT 分支未 take，随 guard Drop 归还）。
+        sub.return_scratch(scratch);
         });
     }
+
+    // 归还各固定缓冲给池（下帧 take 即再就绪；`rgba`/`out_*` 例外：随 `Vp8Yuv` 逃逸给调用方，
+    // 不能池化——见 setup 注释）。本函数仅有的提前 `return Err`（直写缓冲长度不符）发生在
+    // mid() 之前，planes 此时已 take 出、随 drop 释放（池退回空 → 下帧重建），语义不变。
+    sub.return_planes(planes);
+    sub.return_above_b(above_b);
+    sub.return_above_nz(above_nz);
+    sub.return_row_filters(row_filters);
 
     // scope join 后、返回前尾段（Vp8Yuv 构建）：主线程墙钟全部归账，无隐藏盲区（K53）。
     // `rgba` 缓冲按 `channels` 已写满（3=RGB3 / 4=RGBA4）；路由到对应字段，另一个恒空。

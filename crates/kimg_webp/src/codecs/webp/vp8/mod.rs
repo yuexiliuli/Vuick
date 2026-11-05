@@ -56,6 +56,8 @@ pub(crate) mod mbdec;
 pub(crate) mod pipeline;
 pub(crate) mod filter;
 pub(crate) mod emit;
+pub(crate) mod subbuffers;
+pub(crate) use self::subbuffers::Vp8SubBuffersGuard;
 pub(crate) mod decode;
 pub(crate) mod stage;
 #[cfg(test)]
@@ -68,6 +70,8 @@ mod v3_yuv_golden_tests;
 mod v4_rgba_parity_tests;
 #[cfg(test)]
 mod mt_tests;
+#[cfg(test)]
+mod subbuffers_tests;
 #[cfg(test)]
 mod perf_stage_tests;
 #[cfg(test)]
