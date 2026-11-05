@@ -1,8 +1,9 @@
 //! HEIF/HEIC 解码门面（对应 C# `HeifDecoder`/`HeifImageDecoder` 的 Rust 等价物）。
 //!
-//! Phase-1：容器/参数集/位读取/切片头可用；`read_info`（header-only）与 `heif_probe` 真实现，
-//! `decode_yuv`/`decode_rgba` 是返回 `NotImplemented` 的桩；`HeicDecoder` 接入 kimg
-//! `ImageDecoder` trait，尺寸/色彩类型可读、`read_image` 返回未实现错误（格式识别可测）。
+//! Phase-3：容器/参数集/位读取/切片头/帧解码（含 in-loop 滤波）全部可用；`read_info`/`heif_probe`
+//! （header-only）真实现；`decode_yuv`（canvas 级 YUV，transform 前）与 `decode_rgba`（无 transform
+//! 全链 RGBA）真实现；`HeicDecoder` 接入 kimg `ImageDecoder` trait，`read_image` 返回真 RGBA8。
+//! transform 属性（clap/irot/imir）本阶段不接受，`decode_rgba` 显式拒绝（C# 侧要变换像素）。
 
 use std::io::{BufRead, Seek};
 use std::marker::PhantomData;
@@ -66,12 +67,70 @@ pub fn read_info(data: &[u8]) -> HeifResult<HeifInfo> {
     })
 }
 
-/// 解码 canvas 级 YUV 平面。**Phase-1 桩**：返回 `NotImplemented`。
+/// 把容器里每个画面 item（grid 行主序）解码为 [`canvas::TileYuv`]（含 in-loop 滤波，
+/// 对应 C# `DecodeCodedImages`；`decode_item_flags` 全滤波口径 = `_t0.yuv` oracle）。
+fn decode_tiles(data: &[u8], container: &container::HeifContainer<'_>) -> HeifResult<Vec<canvas::TileYuv>> {
+    if container.tiles.is_empty() {
+        return Err(HeifError::invalid("容器没有可解码的图像 item。"));
+    }
+    let mut tiles = Vec::with_capacity(container.tiles.len());
+    for i in 0..container.tiles.len() {
+        let config = &container.tile_configs[i];
+        let item = &container.items.items[container.tiles[i]];
+        let length = isobmff::item_container::ItemContainer::get_item_length(item);
+        // 先校验 payload 不超出文件再分配（镜像 C# `ResolvePayloads` 的 `length > data.Length` 拒绝）。
+        if length < 0 || length > data.len() as i64 {
+            return Err(HeifError::invalid("图像 item 大于文件。"));
+        }
+        let mut payload = vec![0u8; length as usize];
+        container.items.resolve(item, &mut payload)?;
+        let pic = hevc::decode_item_flags(config, &payload, false, false)?;
+        tiles.push(canvas::TileYuv {
+            y: pic.planes[0].clone(),
+            cb: pic.planes[1].clone(),
+            cr: pic.planes[2].clone(),
+            y_w: pic.width,
+            y_h: pic.height,
+            c_w: pic.chroma_width,
+            c_h: pic.chroma_height,
+            crop_left: pic.crop_left,
+            crop_right: pic.crop_right,
+            crop_top: pic.crop_top,
+            crop_bottom: pic.crop_bottom,
+        });
+    }
+    Ok(tiles)
+}
+
+/// 解码 canvas 级 YUV 平面（transform 前；grid 合成后）。对应 C# `DecodeYuv`：每个 tile 的
+/// conformance window 输出按 grid 位置贴到画布并裁剪到 grid 输出尺寸。transform 属相（clap/irot/
+/// imir）不影响此步——它退回**变换前画布**（IMG_* 竖图返回横向画布，与 C# oracle `<md5>.yuv`
+/// 逐字节一致，供 oracle 对照）。
 pub fn decode_yuv(data: &[u8]) -> HeifResult<YuvPlanes> {
-    let _ = data;
-    Err(HeifError::not_implemented(
-        "HEIF 画面解码（YUV 平面）尚未实现（Phase-1 仅容器/参数集/位读取/切片头）。",
-    ))
+    let container = container::HeifContainer::parse(data)?;
+    if container.tiles.is_empty() {
+        return Err(HeifError::invalid("容器没有可解码的图像 item。"));
+    }
+    let sps = container.tile_configs[0].parse_sps()?;
+    if sps.bit_depth_y != sps.bit_depth_c {
+        return Err(HeifError::invalid("亮度与色度位深不同不受支持。"));
+    }
+    let tiles = decode_tiles(data, &container)?;
+    let composed = canvas::compose_grid(
+        &tiles,
+        container.grid_columns,
+        container.grid_rows,
+        container.canvas_width,
+        container.canvas_height,
+    )?;
+    Ok(YuvPlanes {
+        y: composed.y,
+        cb: composed.cb,
+        cr: composed.cr,
+        width: composed.width,
+        height: composed.height,
+        bit_depth: sps.bit_depth_y,
+    })
 }
 
 /// 解码一张**单 tile** HEIC 图画为 4:2:0 YUV 平面（含 in-loop 滤波后的重建平面）。
@@ -102,22 +161,67 @@ pub fn decode_yuv_bytes(data: &[u8]) -> HeifResult<YuvPlanes> {
     })
 }
 
-/// 解码显示朝向的 RGBA。**Phase-1 桩**：返回 `NotImplemented`。
+/// 解码显示朝向的 RGBA。**真实现**：容器解析 → 若存在 transform 属性（clap/irot/imir）显式拒绝
+/// （本阶段不做变换，避免输出与显示朝向不符的像素）→ 逐 tile 解码（`decode_item_flags` 全滤波）
+/// → `compose_grid` 合成整图 YUV → `color::yuv_to_rgba`（矩阵/full_range 取自容器 `nclx`，否则
+/// SPS VUI；8/10 位都走，产出 RGBA8）写 `destination`。返回 `(宽, 高)`。
 pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)> {
-    let _ = (data, destination);
-    Err(HeifError::not_implemented(
-        "HEIF 画面解码（RGBA）尚未实现（Phase-1 仅容器/参数集/位读取/切片头）。",
-    ))
+    let container = container::HeifContainer::parse(data)?;
+    if !container.transforms.is_empty() {
+        return Err(HeifError::unsupported(
+            "transform 属性（'clap'/'irot'/'imir'）尚未支持；仅支持无 transform 的 HEIC 输出 RGBA。",
+        ));
+    }
+    if container.tiles.is_empty() {
+        return Err(HeifError::invalid("容器没有可解码的图像 item。"));
+    }
+    let sps = container.tile_configs[0].parse_sps()?;
+    if sps.bit_depth_y != sps.bit_depth_c {
+        return Err(HeifError::invalid("亮度与色度位深不同不受支持。"));
+    }
+    let (matrix, full_range) = match container.nclx_colour {
+        Some(n) => (n.matrix_coefficients, n.full_range),
+        None => (sps.matrix_coefficients, sps.video_full_range),
+    };
+    let (w, h) = (container.canvas_width, container.canvas_height);
+    if w <= 0 || h <= 0 {
+        return Err(HeifError::invalid("画布尺寸非法。"));
+    }
+    // 尺寸上限护栏：画布像素 × 4 字节不溢出（容器已限 ≤ 1<<28 像素；再显式守卫防 OOM）。
+    let need = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|p| p.checked_mul(4))
+        .ok_or_else(|| HeifError::invalid("画布尺寸溢出。"))?;
+    if destination.len() < need {
+        return Err(HeifError::invalid(format!(
+            "目标缓冲不足：需要 {need} 字节，实际 {} 字节。",
+            destination.len()
+        )));
+    }
+    let tiles = decode_tiles(data, &container)?;
+    let composed = canvas::compose_grid(&tiles, container.grid_columns, container.grid_rows, w, h)?;
+    let rgba = color::yuv_to_rgba(
+        &composed.y,
+        &composed.cb,
+        &composed.cr,
+        w as usize,
+        h as usize,
+        sps.bit_depth_y as u8,
+        matrix,
+        full_range,
+    )?;
+    destination[..need].copy_from_slice(&rgba);
+    Ok((w, h))
 }
 
 /// HEIF 解码器（接入 kimg `ImageDecoder` trait）：new 时读全量字节 → 容器解析拿尺寸/位深；
-/// `read_image`（画面重建）返回未实现错误，保证格式识别与尺寸读取可测。
+/// `read_image` 真解码 RGBA8（对齐 C# `HeifDecoder.Decode` 输出 = `PixelFormat.Rgba32`）。
 pub struct HeicDecoder<R> {
     width: u32,
     height: u32,
     color_type: ColorType,
     icc_profile: Option<Vec<u8>>,
-    // 保存输入字节（供后续 read_image 落实现使用；现触达路径未用）。
+    // 保存输入字节（供 read_image 解码）。
     _data: Option<Vec<u8>>,
     _r: PhantomData<R>,
 }
@@ -132,15 +236,12 @@ impl<R: BufRead + Seek> HeicDecoder<R> {
         let info = read_info(&data).map_err(|e| {
             ImageError::Decoding(DecodingError::new(ImageFormat::Heic.into(), e))
         })?;
-        let color_type = if info.bit_depth > 8 {
-            ColorType::Rgb16
-        } else {
-            ColorType::Rgb8
-        };
         Ok(HeicDecoder {
             width: info.width as u32,
             height: info.height as u32,
-            color_type,
+            // 8/10 位都出 RGBA8（`decode_rgba` 经 `yuv_to_rgba` 把 10 位采样直接映射到 8 位输出，
+            // 与 C# `HeifDecoder.Decode` 的 `Rgba32` 口径一致）。
+            color_type: ColorType::Rgba8,
             icc_profile: info.icc_profile,
             _data: Some(data),
             _r: PhantomData,
@@ -161,11 +262,17 @@ impl<R: BufRead + Seek> ImageDecoder for HeicDecoder<R> {
         Ok(self.icc_profile.clone())
     }
 
-    fn read_image(self, _buf: &mut [u8]) -> ImageResult<()> {
-        Err(ImageError::Decoding(DecodingError::new(
-            ImageFormat::Heic.into(),
-            "HEIF 画面重建尚未实现（Phase-1 仅容器/参数集/位读取/切片头）。",
-        )))
+    fn read_image(self, buf: &mut [u8]) -> ImageResult<()> {
+        let data = self._data.as_deref().ok_or_else(|| {
+            ImageError::Decoding(DecodingError::new(
+                ImageFormat::Heic.into(),
+                "HEIF 输入数据缺失。",
+            ))
+        })?;
+        decode_rgba(data, buf).map_err(|e| {
+            ImageError::Decoding(DecodingError::new(ImageFormat::Heic.into(), e))
+        })?;
+        Ok(())
     }
 
     fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
