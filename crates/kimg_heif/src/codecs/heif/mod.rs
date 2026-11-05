@@ -1,9 +1,9 @@
 //! HEIF/HEIC 解码门面（对应 C# `HeifDecoder`/`HeifImageDecoder` 的 Rust 等价物）。
 //!
 //! Phase-3：容器/参数集/位读取/切片头/帧解码（含 in-loop 滤波）全部可用；`read_info`/`heif_probe`
-//! （header-only）真实现；`decode_yuv`（canvas 级 YUV，transform 前）与 `decode_rgba`（无 transform
-//! 全链 RGBA）真实现；`HeicDecoder` 接入 kimg `ImageDecoder` trait，`read_image` 返回真 RGBA8。
-//! transform 属性（clap/irot/imir）本阶段不接受，`decode_rgba` 显式拒绝（C# 侧要变换像素）。
+//! （header-only）真实现；`decode_yuv`（canvas 级 YUV，transform 前）与 `decode_rgba`（含 transform
+//! 显示朝向全链 RGBA）真实现；`HeicDecoder` 接入 kimg `ImageDecoder` trait，`read_image` 返回真 RGBA8。
+//! transform 属性（clap/irot/imir）按文件关联顺序应用到 RGBA 画布（对齐 C# `HeifCanvas` 合成映射）。
 
 use std::io::{BufRead, Seek};
 use std::marker::PhantomData;
@@ -21,6 +21,7 @@ pub mod hevc;
 pub mod isobmff;
 pub mod metadata;
 pub mod probe;
+pub mod transform;
 
 pub use error::{HeifError, HeifResult};
 
@@ -161,17 +162,12 @@ pub fn decode_yuv_bytes(data: &[u8]) -> HeifResult<YuvPlanes> {
     })
 }
 
-/// 解码显示朝向的 RGBA。**真实现**：容器解析 → 若存在 transform 属性（clap/irot/imir）显式拒绝
-/// （本阶段不做变换，避免输出与显示朝向不符的像素）→ 逐 tile 解码（`decode_item_flags` 全滤波）
-/// → `compose_grid` 合成整图 YUV → `color::yuv_to_rgba`（矩阵/full_range 取自容器 `nclx`，否则
-/// SPS VUI；8/10 位都走，产出 RGBA8）写 `destination`。返回 `(宽, 高)`。
+/// 解码显示朝向的 RGBA。**真实现**：容器解析 → 逐 tile 解码（`decode_item_flags` 全滤波）→
+/// `compose_grid` 合成整图 YUV → `color::yuv_to_rgba`（矩阵/full_range 取自容器 `nclx`，否则 SPS
+/// VUI；8/10 位都走，产出 RGBA8）→ 按关联顺序应用 transform（clap/irot/imir，对准 C# `HeifCanvas`
+/// 合成映射）写 `destination`。返回 `(宽, 高)` = 变换后显示尺寸（与 `ReadInfo().DisplaySize` 一致）。
 pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)> {
     let container = container::HeifContainer::parse(data)?;
-    if !container.transforms.is_empty() {
-        return Err(HeifError::unsupported(
-            "transform 属性（'clap'/'irot'/'imir'）尚未支持；仅支持无 transform 的 HEIC 输出 RGBA。",
-        ));
-    }
     if container.tiles.is_empty() {
         return Err(HeifError::invalid("容器没有可解码的图像 item。"));
     }
@@ -183,15 +179,20 @@ pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)
         Some(n) => (n.matrix_coefficients, n.full_range),
         None => (sps.matrix_coefficients, sps.video_full_range),
     };
-    let (w, h) = (container.canvas_width, container.canvas_height);
-    if w <= 0 || h <= 0 {
+    let (cw, ch) = (container.canvas_width, container.canvas_height);
+    if cw <= 0 || ch <= 0 {
         return Err(HeifError::invalid("画布尺寸非法。"));
     }
-    // 尺寸上限护栏：画布像素 × 4 字节不溢出（容器已限 ≤ 1<<28 像素；再显式守卫防 OOM）。
-    let need = (w as usize)
-        .checked_mul(h as usize)
+    let map = transform::compose(cw, ch, &container.transforms)?;
+    let (ow, oh) = (map.width, map.height);
+    if ow <= 0 || oh <= 0 {
+        return Err(HeifError::invalid("显示尺寸非法。"));
+    }
+    // 尺寸上限护栏：输出像素 × 4 字节不溢出（容器已限画布 ≤ 1<<28 像素；clap 只减 irot/imir 不增）。
+    let need = (ow as usize)
+        .checked_mul(oh as usize)
         .and_then(|p| p.checked_mul(4))
-        .ok_or_else(|| HeifError::invalid("画布尺寸溢出。"))?;
+        .ok_or_else(|| HeifError::invalid("显示尺寸溢出。"))?;
     if destination.len() < need {
         return Err(HeifError::invalid(format!(
             "目标缓冲不足：需要 {need} 字节，实际 {} 字节。",
@@ -199,19 +200,23 @@ pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)
         )));
     }
     let tiles = decode_tiles(data, &container)?;
-    let composed = canvas::compose_grid(&tiles, container.grid_columns, container.grid_rows, w, h)?;
+    let composed = canvas::compose_grid(&tiles, container.grid_columns, container.grid_rows, cw, ch)?;
     let rgba = color::yuv_to_rgba(
         &composed.y,
         &composed.cb,
         &composed.cr,
-        w as usize,
-        h as usize,
+        cw as usize,
+        ch as usize,
         sps.bit_depth_y as u8,
         matrix,
         full_range,
     )?;
-    destination[..need].copy_from_slice(&rgba);
-    Ok((w, h))
+    if container.transforms.is_empty() {
+        destination[..need].copy_from_slice(&rgba);
+    } else {
+        transform::apply_rgba(&rgba, cw, ch, &map, &mut destination[..need])?;
+    }
+    Ok((ow, oh))
 }
 
 /// HEIF 解码器（接入 kimg `ImageDecoder` trait）：new 时读全量字节 → 容器解析拿尺寸/位深；

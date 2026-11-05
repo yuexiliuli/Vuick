@@ -1,6 +1,7 @@
-//! HEIF 全链（解码 → grid 合成 → 色彩转换）oracle 测试：
-//! - `decode_rgba` 全链 RGBA8：对 8 个无 transform 语料逐字节对比 `target/heif/oracle/<md5>.rgba`
-//!   （w,h i32LE + RGBA8 行主序无跨步）。目标 8/8 mismatches=0。
+//! HEIF 全链（解码 → grid 合成 → 色彩转换 → transform）oracle 测试：
+//! - `decode_rgba` 全链 RGBA8：对 manifest 全部可解文件（含 clap/irot/imir transform）逐字节对比
+//!   `target/heif/oracle/<md5>.rgba`（w,h i32LE + RGBA8 行主序无跨步，**显示朝向**含变换后尺寸）。
+//!   目标全部 mismatches=0（14 张手机 IMG_* + mangrove 的 transform=1 亦应解锁）。
 //! - `decode_yuv` 整图 YUV：对 manifest 全部可解文件（transforms=0/1 皆可）逐字节对比
 //!   `target/heif/oracle/<md5>.yuv`（**无头**：Y+Cb+Cr，各 u16LE，画布尺度 4:2:0；IMG_* 竖图
 //!   的整图 YUV 是 transform 前横向画布——`decode_yuv` 正好返回该画布）。
@@ -13,18 +14,6 @@ use kimg_heif::{decode_rgba, decode_yuv};
 
 const ORACLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/oracle");
 const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus");
-
-/// 8 个无 transform 全链 RGBA 目标（md5, 语料文件名）。
-const RGBA_TARGETS: &[(&str, &str)] = &[
-    ("86d06d35c1f171952b534b498aca55cf", "synth-photo-fuji-1600x900-main8.heic"),
-    ("25e8249964d4f8b08e022919ff07d852", "synth-screen-testsrc2-1280x720-main8.heic"),
-    ("84e4d9493f325b938c3e2f849f9b69fc", "synth-screen-testsrc2-640x360-hlg-nclx.heic"),
-    ("bb0c8511e1e2db5995f3e58480ad6af6", "synth-screen-testsrc2-640x360-pq-vui.heic"),
-    ("0446df12bc6fb4bc4d6e13f7c7b14439", "synth-photo-fuji-1600x900-alpha.heic"),
-    ("8bee6473769781b7e3061a886550c551", "hevc-main-3072x4096-grid.heic"),
-    ("9e1a7291eb43659d3ef42e815e1a4856", "hevc-main-8192x6144-grid.heic"),
-    ("9b79d0cd349203f9b485f013ee0ef088", "hevc-main10-3072x4096-grid.heic"),
-];
 
 fn i32_at(data: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
@@ -46,7 +35,60 @@ fn count_mismatches(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
     (count, first)
 }
 
-/// `decode_rgba` 全链 RGBA：8 个无 transform 目标逐字节对比 C# `<md5>.rgba`。
+/// 读 manifest（md5,file,…）里非 ERR 的可解文件（有 `.rgba` oracle 者），按 oracle 尺寸升序返回
+/// （小文件先跑，mango/fuji → IMG_* → 大 grid）。
+fn rgba_manifest_rows() -> Vec<(String, String)> {
+    let manifest_path = PathBuf::from(ORACLE_DIR).join("manifest.csv");
+    let manifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(m) => m,
+        Err(e) => {
+            println!("SKIP: missing {manifest_path:?} ({e})");
+            return Vec::new();
+        }
+    };
+    let mut rows: Vec<(String, String, u64)> = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("md5,") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() < 2 || cols[2] == "ERR" {
+            continue;
+        }
+        let md5 = cols[0].to_string();
+        let file = cols[1].to_string();
+        let rgba_path = PathBuf::from(ORACLE_DIR).join(format!("{md5}.rgba"));
+        let size = std::fs::metadata(&rgba_path).map(|m| m.len()).unwrap_or(u64::MAX);
+        rows.push((md5, file, size));
+    }
+    rows.sort_by_key(|r| r.2);
+    rows.into_iter().map(|(m, f, _)| (m, f)).collect()
+}
+
+/// 打印容器 transform 摘要（用于报告该文件哪类变换；parse 不解码 HEVC payload，开销小）。
+fn print_transforms(file: &str, data: &[u8]) {
+    let Ok(c) = kimg_heif::codecs::heif::container::HeifContainer::parse(data) else {
+        println!("  {file}: 容器解析失败（不解码）");
+        return;
+    };
+    if c.transforms.is_empty() {
+        println!("  {file}: transforms=0（无变换）");
+        return;
+    }
+    let names: Vec<String> = c
+        .transforms
+        .iter()
+        .map(|t| match t.ty {
+            kimg_heif::codecs::heif::container::PropClap => format!("clap(pr={:?})", t.clap),
+            kimg_heif::codecs::heif::container::PropIrot => format!("irot(a={})", t.a),
+            _ => format!("imir(a={})", t.a),
+        })
+        .collect();
+    println!("  {file}: transforms={} {}", c.transforms.len(), names.join(" → "));
+}
+
+/// `decode_rgba` 全链 RGBA：manifest 全部可解文件逐字节对比 C# `<md5>.rgba`。
 #[test]
 fn rgba_full_chain_matches_csharp() {
     let dir = PathBuf::from(ORACLE_DIR);
@@ -54,12 +96,17 @@ fn rgba_full_chain_matches_csharp() {
         println!("SKIP: missing {dir:?}");
         return;
     }
+    let rows = rgba_manifest_rows();
+    if rows.is_empty() {
+        println!("SKIP: missing {}/manifest.csv 或全部无可解文件", dir.display());
+        return;
+    }
     let mut checked = 0usize;
     let mut skipped = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
-    for &(md5, file) in RGBA_TARGETS {
-        let corpus = PathBuf::from(CORPUS_DIR).join(file);
+    for (md5, file) in rows {
+        let corpus = PathBuf::from(CORPUS_DIR).join(&file);
         let rgba_path = dir.join(format!("{md5}.rgba"));
         if !corpus.exists() {
             println!("SKIP: missing corpus {corpus:?}");
@@ -72,6 +119,7 @@ fn rgba_full_chain_matches_csharp() {
             continue;
         }
         let data = std::fs::read(&corpus).expect("read corpus");
+        print_transforms(&file, &data);
         let want = std::fs::read(&rgba_path).expect("read rgba oracle");
         if want.len() < 8 {
             println!("SKIP: {file}: rgba 过短");
@@ -111,13 +159,14 @@ fn rgba_full_chain_matches_csharp() {
             println!("PASS {file}: {w}x{h} RGBA mismatches=0");
         } else {
             let fi = first.unwrap_or(0);
+            let (fx, fy) = (fi % (w as usize * 4) / 4, fi / (w as usize * 4));
             failures.push(format!(
-                "{file}: {mismatches}/{expect} 字节失配；首差 @ {fi} (ours={} c#={})",
+                "{file}: {mismatches}/{expect} 字节失配；首差 @ {fi} (x={fx}, y={fy}) ours={} c#={}",
                 out[fi],
                 want[8 + fi]
             ));
             println!(
-                "FAIL {file}: {mismatches}/{expect} 字节失配；首差 @ {fi} (ours={} c#={})",
+                "FAIL {file}: {mismatches}/{expect} 字节失配；首差 @ {fi} (x={fx}, y={fy}) ours={} c#={}",
                 out[fi],
                 want[8 + fi]
             );
