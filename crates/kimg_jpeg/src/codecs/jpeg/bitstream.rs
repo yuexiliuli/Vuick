@@ -4,10 +4,10 @@
 
 use core::cmp::min;
 
-use crate::codecs::jpeg2::error::DecodeError;
-use crate::codecs::jpeg2::huffman::{HuffmanTable, HUFF_LOOKAHEAD};
-use crate::codecs::jpeg2::io::{ByteReader, Marker};
-use crate::codecs::jpeg2::segment::{DCT_BLOCK, UN_ZIGZAG};
+use crate::codecs::jpeg::error::DecodeError;
+use crate::codecs::jpeg::huffman::{HuffmanTable, HUFF_LOOKAHEAD};
+use crate::codecs::jpeg::io::{ByteReader, Marker};
+use crate::codecs::jpeg::segment::{DCT_BLOCK, UN_ZIGZAG};
 
 /// 查表解 Huffman（复刻 zune `decode_huff!`：9 位快速路径 + 慢路径 + 哨兵）。
 macro_rules! decode_huff {

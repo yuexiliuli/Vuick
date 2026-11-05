@@ -5,7 +5,7 @@
 //! 失败时指针回退到本次读取起点（供位流 `refill` 4 字节预读失败时回退）、
 //! `skip` 允许越过末尾。位流与段扫描共用同一读取器。
 
-use crate::codecs::jpeg2::error::DecodeError;
+use crate::codecs::jpeg::error::DecodeError;
 
 /// 基于内存切片的字节读取器（等价 zune `ZCursor<&[u8]>`）。
 pub(crate) struct ByteReader<'a> {

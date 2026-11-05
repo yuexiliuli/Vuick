@@ -1,8 +1,8 @@
-//! JPEG 自研引擎 vs 旧 zune-jpeg 后端字节恒等对照（回归硬闸）。
+//! JPEG 自研引擎 vs zune-jpeg oracle 字节恒等对照（回归硬闸）。
 //!
 //! 语料：`<workspace>/target/测试图片/jpeg`（env `KIMG_JPEG_CORPUS` 可覆盖）。
-//! 每个文件：旧路径（zune-jpeg，现 `codecs::jpeg::JpegDecoder`）与新自研
-//! （`codecs::jpeg2::JpegDecoder`）各自 `image_decoder` 同口径解码到其声明的
+//! 每个文件：oracle（zune-jpeg 0.5.15，== image 0.25 自用后端，即被替换前的旧行为）与
+//! 自研 `codecs::jpeg::JpegDecoder` 各自 `ImageDecoder` 同口径解码到其声明的
 //! color_type → 逐字节比较，必须完全一致（IDCT/上采样/颜色换算三处取整全等比）。
 //!
 //! 运行：
@@ -11,43 +11,16 @@
 //! ```
 //! 失败时打印首个差异像素的 (x, y, 通道, old, new)。
 
+mod fixtures;
+
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
 
 use kimg_core::ImageDecoder as _;
-use kimg_jpeg::codecs::jpeg::JpegDecoder as OldJpeg;
-use kimg_jpeg::codecs::jpeg2::JpegDecoder as NewJpeg;
+use kimg_jpeg::codecs::jpeg::JpegDecoder as NewJpeg;
 
-fn corpus_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("KIMG_JPEG_CORPUS") {
-        return PathBuf::from(p);
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("target")
-        .join("测试图片")
-        .join("jpeg")
-}
+use fixtures::*;
 
-fn collect_jpegs(dir: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension()
-                .map(|x| x.eq_ignore_ascii_case("jpg"))
-                .unwrap_or(false)
-            {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// 用旧/新解码器同口径解出 (width, height, color_type, bytes)。
+/// 用 oracle/新解码器同口径解出 (width, height, color_type, bytes)。
 fn decode<D: kimg_core::ImageDecoder + Sized>(
     new_dec: impl FnOnce(Cursor<Vec<u8>>) -> Result<D, String>,
     bytes: &[u8],
@@ -60,13 +33,6 @@ fn decode<D: kimg_core::ImageDecoder + Sized>(
     Ok((w, h, ct, buf))
 }
 
-fn old_decode(bytes: &[u8]) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>), String> {
-    decode(
-        |c| OldJpeg::new(c).map_err(|e| e.to_string()),
-        bytes,
-    )
-}
-
 fn new_decode(bytes: &[u8]) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>), String> {
     decode(
         |c| NewJpeg::new(c).map_err(|e| e.to_string()),
@@ -74,18 +40,18 @@ fn new_decode(bytes: &[u8]) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>),
     )
 }
 
-/// 单文件：断言 尺寸/颜色类型/字节 三者与旧路径完全一致。
+/// 单文件：断言 尺寸/颜色类型/字节 三者与 oracle 完全一致。
 /// 返回 Ok(true) 恒等；Ok(false) 新路径明确不支持（计入 SKIP，不判失败）；
 /// Err(..) 为失败。
 fn assert_parity(name: &str, bytes: &[u8]) -> Result<bool, String> {
-    let o = old_decode(bytes).map_err(|e| format!("{name}: 旧路径(参照)解码失败：{e}"))?;
+    let o = zune_decode(bytes).map_err(|e| format!("{name}: oracle(zune) 解码失败：{e}"))?;
     let n = match new_decode(bytes) {
         Ok(v) => v,
         Err(e) if e.contains("not support") || e.contains("Unsupported") => {
             println!("{name}: SKIP（新路径不支持：{e}）");
             return Ok(false);
         }
-        Err(e) => return Err(format!("{name}: 新路径解码失败：{e}（旧路径可解）")),
+        Err(e) => return Err(format!("{name}: 新路径解码失败：{e}（oracle 可解）")),
     };
     assert_eq!(o.0, n.0, "{name}: 宽不一致 old={} new={}", o.0, n.0);
     assert_eq!(o.1, n.1, "{name}: 高不一致 old={} new={}", o.1, n.1);

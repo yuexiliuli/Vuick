@@ -3,10 +3,10 @@
 
 use core::cmp::max;
 
-use crate::codecs::jpeg2::error::DecodeError;
-use crate::codecs::jpeg2::huffman::HuffmanTable;
-use crate::codecs::jpeg2::io::{ByteReader, Marker};
-use crate::codecs::jpeg2::upsampler::{upsample_no_op, UpSampler};
+use crate::codecs::jpeg::error::DecodeError;
+use crate::codecs::jpeg::huffman::HuffmanTable;
+use crate::codecs::jpeg::io::{ByteReader, Marker};
+use crate::codecs::jpeg::upsampler::{upsample_no_op, UpSampler};
 
 pub(crate) const MAX_COMPONENTS: usize = 4;
 pub(crate) const DCT_BLOCK: usize = 64;

@@ -1,4 +1,4 @@
-//! 自研 JPEG baseline 顺序解码器（`jpeg2`）。
+//! 自研 JPEG 解码器（`jpeg`，baseline 顺序帧原为 jpeg2，后并入本模块）。
 //!
 //! 与旧 `zune-jpeg` 后端输出**逐字节恒等**（IDCT/上采样/颜色换算三处取整全等价），
 //! 完全不依赖任何外部 JPEG 解码库。模块内：段解析（`segment`）、Huffman（`huffman`）、
@@ -32,9 +32,9 @@ use kimg_core::metadata::Orientation;
 use kimg_core::ImageDecoder;
 use kimg_core::ImageFormatHint;
 
-use crate::codecs::jpeg2::error::DecodeError;
-use crate::codecs::jpeg2::mcu::{decode_baseline, decode_progressive};
-use crate::codecs::jpeg2::segment::{ColorSpace, Decoder};
+use crate::codecs::jpeg::error::DecodeError;
+use crate::codecs::jpeg::mcu::{decode_baseline, decode_progressive};
+use crate::codecs::jpeg::segment::{ColorSpace, Decoder};
 
 /// 自研 JPEG 解码器（泛型参数 `R` 与旧 wrapper 同款占位）。
 pub struct JpegDecoder<R> {

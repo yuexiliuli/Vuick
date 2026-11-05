@@ -9,70 +9,47 @@
 //! （ratio = new ÷ old，new 更快则 <1）。
 //!
 //! 口径说明（对标 C# Sdcb.SimdCodecs `JpegDecoder.DecodeTo(data, rgba)`）：
-//! - old = zune-jpeg（当前 kimg_jpeg 后端，== image 0.25 所用，字节恒 etc.oracle）。
-//! - new = kimg_jpeg 自研引擎（就位后同口径测；未就位时 new 列 = old 占位）。
-//! - 姿态 = 复用调用方已分配缓冲（暖态零分配 direct 姿态），输出到 RGBA8/RGB8 按解码器
-//!   声明的 color_type。
+//! - old = zune-jpeg oracle（== image 0.25 用后端，即被替换前的旧行为；标量默认路径）。
+//! - new = kimg_jpeg 自研引擎 `codecs::jpeg::JpegDecoder`（AVX2/标量双路径）。
+//! - 姿态 = 复用调用方已分配缓冲（暖态零分配 direct 姿态），输出到解码器声明的 color_type。
+
+mod fixtures;
 
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use kimg_jpeg::JpegDecoder as OldJpeg;
-use kimg_jpeg::codecs::jpeg2::JpegDecoder as NewJpeg;
+use kimg_jpeg::codecs::jpeg::JpegDecoder as NewJpeg;
 use kimg_core::ImageDecoder as _;
 
-// ---------------------------------------------------------------------------
-// 语料发现
-// ---------------------------------------------------------------------------
+use fixtures::*;
 
-fn corpus_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("KIMG_JPEG_CORPUS") {
-        return PathBuf::from(p);
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("target")
-        .join("测试图片")
-        .join("jpeg")
-}
-
-fn collect_jpegs(dir: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().map(|x| x.eq_ignore_ascii_case("jpg")).unwrap_or(false) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// 读文件并取得输出缓冲尺寸。返回 (name, bytes, old 路径输出字节数)。
-fn load(path: &Path) -> Option<(String, Vec<u8>, usize)> {
+/// 读文件并取得新路径输出缓冲尺寸（仅解码头，快）。
+fn load(path: &std::path::Path) -> Option<(String, Vec<u8>, usize)> {
     let bytes = std::fs::read(path).ok()?;
-    let dec = OldJpeg::new(Cursor::new(&bytes)).ok()?;
+    let dec = NewJpeg::new(Cursor::new(bytes.as_slice())).ok()?;
     let n = dec.total_bytes() as usize;
-    Some((path.file_name()?.to_string_lossy().into_owned(), bytes, n))
+    Some((
+        path.file_name()?.to_string_lossy().into_owned(),
+        bytes,
+        n,
+    ))
 }
 
 // ---------------------------------------------------------------------------
-// 旧路径（zune-jpeg 现后端）
+// 旧路径（zune-jpeg oracle）
 // ---------------------------------------------------------------------------
 
 fn old_decode(bytes: &[u8], out: &mut [u8]) -> Result<(), String> {
-    OldJpeg::new(Cursor::new(bytes))
-        .map_err(|e| e.to_string())?
-        .read_image(out)
-        .map_err(|e| e.to_string())
+    let (_, _, _, pix) = zune_decode(bytes)?;
+    if pix.len() != out.len() {
+        return Err(format!("长度不一致 oracle={} out={}", pix.len(), out.len()));
+    }
+    out.copy_from_slice(&pix);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 新路径（jpeg2 自研引擎）
+// 新路径（自研引擎）
 // ---------------------------------------------------------------------------
 
 fn new_decode(bytes: &[u8], out: &mut [u8]) -> Result<(), String> {
@@ -131,13 +108,16 @@ fn bench_main() {
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     println!("JPEG_BENCH profile={profile} rounds={rounds} files={}", files.len());
 
-    // 冒烟：每个文件两路径先解一次；失败/尺寸异常 → 记行并跳过（不回比不可信数）。
+    // 冒烟：每个文件两路径先解一次；失败/输出不一致 → 跳过（不回比不可信数）。
     let mut bench: Vec<(String, Vec<u8>, usize)> = Vec::new();
     let mut old_out: Vec<Vec<u8>> = Vec::new();
     for p in &files {
         let Some(loaded) = load(p) else {
-            let nm = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            println!("JPEG_BENCH SMOKE {nm}: 旧路径解码头失败，跳过");
+            let nm = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            println!("JPEG_BENCH SMOKE {nm}: 解码头失败，跳过");
             continue;
         };
         let (name, bytes, n) = loaded;
@@ -149,9 +129,8 @@ fn bench_main() {
             println!("JPEG_BENCH SMOKE {name}: old={ok_old} new={ok_new} 未全过，跳过");
             continue;
         }
-        if out != out2 {
-            println!("JPEG_BENCH SMOKE {name}: old/new 输出不一致（字节数 {}/{}/{}），跳过",
-                n, out.len(), out2.len());
+        if out_to_length_mismatch(&out, &out2) {
+            println!("JPEG_BENCH SMOKE {name}: old/new 输出字节数不一致，跳过");
             continue;
         }
         bench.push((name, bytes, n));
@@ -196,4 +175,8 @@ fn bench_main() {
         g_new / g_old
     );
     println!("JPEG_BENCH done.");
+}
+
+fn out_to_length_mismatch(a: &[u8], b: &[u8]) -> bool {
+    a.len() != b.len()
 }

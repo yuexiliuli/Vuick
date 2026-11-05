@@ -13,9 +13,9 @@
 // `unsafe fn`，门控在分发层保证）。
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::codecs::jpeg2::color::{ycbcr_to_rgb_inner_16_scalar, ycbcr_to_rgba_inner_16_scalar};
-use crate::codecs::jpeg2::idct::{idct4x4 as idct4x4_scalar, idct_int as idct_int_scalar};
-use crate::codecs::jpeg2::upsampler::{
+use crate::codecs::jpeg::color::{ycbcr_to_rgb_inner_16_scalar, ycbcr_to_rgba_inner_16_scalar};
+use crate::codecs::jpeg::idct::{idct4x4 as idct4x4_scalar, idct_int as idct_int_scalar};
+use crate::codecs::jpeg::upsampler::{
     upsample_horizontal as uh_scalar, upsample_hv as uhv_scalar, upsample_vertical as uv_scalar,
 };
 
@@ -431,8 +431,8 @@ mod kernels {
     // -----------------------------------------------------------------------
     // 颜色换算（复刻 `color_convert/avx.rs`）
     // -----------------------------------------------------------------------
-    use crate::codecs::jpeg2::color as color;
-    use crate::codecs::jpeg2::upsampler as upsampler;
+    use crate::codecs::jpeg::color as color;
+    use crate::codecs::jpeg::upsampler as upsampler;
     use color::CB_CF;
     use color::C_G_CB_COEF_2;
     use color::C_G_CR_COEF_1;
@@ -956,9 +956,9 @@ pub(crate) fn upsample_hv(
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::kernels;
-    use crate::codecs::jpeg2::color::{ycbcr_to_rgb_inner_16_scalar, ycbcr_to_rgba_inner_16_scalar};
-    use crate::codecs::jpeg2::idct::{idct4x4, idct_int};
-    use crate::codecs::jpeg2::upsampler::{upsample_horizontal, upsample_hv, upsample_vertical};
+    use crate::codecs::jpeg::color::{ycbcr_to_rgb_inner_16_scalar, ycbcr_to_rgba_inner_16_scalar};
+    use crate::codecs::jpeg::idct::{idct4x4, idct_int};
+    use crate::codecs::jpeg::upsampler::{upsample_horizontal, upsample_hv, upsample_vertical};
 
     fn avx2() -> bool {
         std::arch::is_x86_feature_detected!("avx2")

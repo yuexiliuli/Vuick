@@ -2,8 +2,8 @@
 //!
 //! AVX2 上采样与标量字节恒等（zune 自身测试保证），故统一采用标量实现。
 
-use crate::codecs::jpeg2::error::DecodeError;
-use crate::codecs::jpeg2::segment::{Component, SampleRatios};
+use crate::codecs::jpeg::error::DecodeError;
+use crate::codecs::jpeg::segment::{Component, SampleRatios};
 
 /// 上采样函数签名。
 pub(crate) type UpSampler = fn(

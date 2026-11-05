@@ -1,6 +1,6 @@
 //! Huffman 表构造（1:1 复刻 zune-jpeg `huffman.rs` 的表构造与哨兵语义）。
 
-use crate::codecs::jpeg2::error::DecodeError;
+use crate::codecs::jpeg::error::DecodeError;
 
 /// 位流解码的预读位数。
 pub(crate) const HUFF_LOOKAHEAD: u8 = 9;

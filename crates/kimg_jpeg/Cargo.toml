@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
-description = "kimg 拆分的 JPEG 解码 crate（codecs/jpeg，基于 zune-jpeg，== image 0.25 自身后端）。"
+description = "kimg 拆分的 JPEG 解码 crate（codecs/jpeg：自研 baseline+progressive 解码器，AVX2/标量双路径，零外部 JPEG 运行依赖）。"
 
 [dependencies]
 kimg_core = { path = "../kimg_core" }
-# JPEG 用 zune-jpeg（== image 0.25.10 自身所用后端，保证字节级一致）。
+
+[dev-dependencies]
+# zune-jpeg 仅作测试/基准 oracle（== image 0.25 自用后端，字节恒等对照），运行零依赖。
 zune-jpeg = "0.5.15"
 zune-core = "0.5.3"

@@ -2,16 +2,16 @@
 
 use core::cmp::{max, min};
 
-use crate::codecs::jpeg2::avx2::{idct4x4, idct_int};
-use crate::codecs::jpeg2::bitstream::BitStream;
-use crate::codecs::jpeg2::color::color_convert;
-use crate::codecs::jpeg2::error::DecodeError;
-use crate::codecs::jpeg2::idct::idct_int_1x1;
-use crate::codecs::jpeg2::io::{ByteReader, Marker};
-use crate::codecs::jpeg2::segment::{
+use crate::codecs::jpeg::avx2::{idct4x4, idct_int};
+use crate::codecs::jpeg::bitstream::BitStream;
+use crate::codecs::jpeg::color::color_convert;
+use crate::codecs::jpeg::error::DecodeError;
+use crate::codecs::jpeg::idct::idct_int_1x1;
+use crate::codecs::jpeg::io::{ByteReader, Marker};
+use crate::codecs::jpeg::segment::{
     calculate_padded_width, ColorSpace, Decoder, SampleRatios, DCT_BLOCK, MAX_COMPONENTS,
 };
-use crate::codecs::jpeg2::upsampler::{upsample, upsample_generic, upsample_no_op};
+use crate::codecs::jpeg::upsampler::{upsample, upsample_generic, upsample_no_op};
 
 /// MCU 行解码后的续接方式。
 enum McuContinuation {
@@ -151,9 +151,9 @@ impl<'a> Decoder<'a> {
 
             let (ratio, sampler) = match (hs, vs) {
                 (1, 1) => (SampleRatios::None, upsample_no_op as _),
-                (2, 1) => (SampleRatios::H, crate::codecs::jpeg2::avx2::upsample_horizontal as _),
-                (1, 2) => (SampleRatios::V, crate::codecs::jpeg2::avx2::upsample_vertical as _),
-                (2, 2) => (SampleRatios::HV, crate::codecs::jpeg2::avx2::upsample_hv as _),
+                (2, 1) => (SampleRatios::H, crate::codecs::jpeg::avx2::upsample_horizontal as _),
+                (1, 2) => (SampleRatios::V, crate::codecs::jpeg::avx2::upsample_vertical as _),
+                (2, 2) => (SampleRatios::HV, crate::codecs::jpeg::avx2::upsample_hv as _),
                 (hs, vs) => (SampleRatios::Generic(hs, vs), upsample_generic as _),
             };
             comp.sample_ratio = ratio;

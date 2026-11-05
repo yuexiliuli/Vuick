@@ -4,9 +4,9 @@
 
 use core::cmp::min;
 
-use crate::codecs::jpeg2::error::DecodeError;
-use crate::codecs::jpeg2::segment::ColorSpace;
-use crate::codecs::jpeg2::segment::MAX_COMPONENTS;
+use crate::codecs::jpeg::error::DecodeError;
+use crate::codecs::jpeg::segment::ColorSpace;
+use crate::codecs::jpeg::segment::MAX_COMPONENTS;
 
 // Bt.601 全范围逆矩阵系数（14 位精度，保持 i16 内）。
 pub(crate) const Y_CF: i16 = 16384;
@@ -398,10 +398,10 @@ fn convert_16(
 ) {
     match output_colorspace {
         ColorSpace::RGB => {
-            crate::codecs::jpeg2::avx2::ycbcr_to_rgb_16(y, cb, cr, out, &mut 0);
+            crate::codecs::jpeg::avx2::ycbcr_to_rgb_16(y, cb, cr, out, &mut 0);
         }
         ColorSpace::RGBA => {
-            crate::codecs::jpeg2::avx2::ycbcr_to_rgba_16(y, cb, cr, out, &mut 0);
+            crate::codecs::jpeg::avx2::ycbcr_to_rgba_16(y, cb, cr, out, &mut 0);
         }
         _ => unreachable!("只支持 RGB/RGBA 输出的 YCbCr 换算"),
     }

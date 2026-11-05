@@ -1,4 +1,4 @@
-//! JPEG codec：JpegDecoder（旧为基于 zune-jpeg，另含自研 jpeg2）。
+//! JPEG codec：自研解码器 `JpegDecoder`（baseline+progressive，AVX2/标量双路径，
+//! 与 zune-jpeg 0.5.15 逐字节恒等 oracle；zune 仅作 dev-dependency 测试对照）。
 
 pub mod jpeg;
-pub mod jpeg2;
