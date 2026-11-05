@@ -1070,6 +1070,59 @@ mod tests {
         }
     }
 
+    /// 稠密 full-idct 吞吐微基准（release `#[ignore]`）：逐块 `idct_avx2`（每次函数调用）vs 标量。
+    /// 2026-11-05 批量 IDCT 调研沉淀：直接回答「单块内核逐块调用（Win64 callee-saved xmm 盘存 /
+    /// 常数重载）是否构成可摊薄的大头」。实测（本机）single_avx2=74ns/block、scalar=569ns/block，
+    /// batch(k=4)=77ns/block → 逐块调用开销≈中性，批量集成反而加拷贝/收口净负 → 判定不投。可复用。
+    #[test]
+    #[ignore]
+    fn idct_throughput_microbench() {
+        if !avx2() {
+            println!("IDCT_MICRO skip: no avx2");
+            return;
+        }
+        use std::time::Instant;
+
+        // 语料：稠密随机块（模拟全 full-idct 图像如 Chipboard）
+        let mut rng = Lcg::new(0x7777);
+        let blocks_n = 128usize;
+        let mut blocks: Vec<[i32; 64]> =
+            (0..blocks_n).map(|_| rand_block(&mut rng, 30000)).collect();
+        let mut out = vec![0i16; blocks_n * 8 * 8];
+
+        let iters = 20_000usize;
+        let mut sink: u64 = 0;
+
+        // 逐块 AVX2（K=1 函数调用形态）
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for (i, blk) in blocks.iter_mut().enumerate() {
+                // SAFETY: 已门控 AVX2
+                unsafe {
+                    kernels::idct_avx2(blk, &mut out[i * 8..], 8);
+                }
+            }
+            sink = sink.wrapping_add(out[0] as u64);
+        }
+        let t_single = t0.elapsed().as_secs_f64() * 1e9 / (iters as f64 * blocks_n as f64);
+
+        // 标量
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for (i, blk) in blocks.iter_mut().enumerate() {
+                crate::codecs::jpeg::idct::idct_int(blk, &mut out[i * 8..], 8);
+            }
+            sink = sink.wrapping_add(out[0] as u64);
+        }
+        let t_scalar = t0.elapsed().as_secs_f64() * 1e9 / (iters as f64 * blocks_n as f64);
+
+        println!(
+            "IDCT_MICRO ns/block single_avx2={t_single:.2} scalar={t_scalar:.2} (scalar/single={:.3})",
+            t_scalar / t_single
+        );
+        assert_ne!(sink, u64::MAX); // 防优化
+    }
+
     #[test]
     fn idct4x4_scalar_eq_avx2() {
         if !avx2() {
