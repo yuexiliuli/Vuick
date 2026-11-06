@@ -1,5 +1,75 @@
 use super::*;
 
+/// 空块路径计数探针（2026-11-06 It-4，K103 探针先行）：`KIMG_WEBP_EMPTY_PROBE` env 门控
+/// （仅测试构建；`parse_residuals_impl` 内 `cfg(test)` 钩子），逐块记录「块位置 × 空/仅 DC/含 AC」。
+/// 默认关：关时主环仅一处 Relaxed 原子读 + 分支（~1ns/块，测试构建可接受，release 不含 cfg 全删）。
+/// 开时只加原子计数（Relaxed），不改任何字节输出——供 flat/低比特率图「每 MB 空块数 + 空块机械
+/// 分段成本」实测（It-4 报告；探针可留仓作证据，对应 W2「flat 每 MB ~0.05 tok、绝大多数空块」）。
+#[cfg(test)]
+pub(crate) mod empty_probe {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static MB: AtomicU64 = AtomicU64::new(0);
+    static EMPTY: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+    static DC_ONLY: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+    static AC: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+
+    /// 一次（测试进程）从 env 读门控。默认关；`set` 优先。
+    pub(crate) fn init() {
+        let v = std::env::var("KIMG_WEBP_EMPTY_PROBE").unwrap_or_default();
+        ON.store(
+            matches!(v.trim(), "1" | "true" | "on" | "y" | "yes"),
+            Relaxed,
+        );
+    }
+
+    pub(crate) fn set(v: bool) {
+        ON.store(v, Relaxed);
+    }
+
+    pub(crate) fn on() -> bool {
+        ON.load(Relaxed)
+    }
+
+    /// 每宏块一次（= 每次 `parse_residuals*` 调用）。
+    pub(crate) fn mb() {
+        MB.fetch_add(1, Relaxed);
+    }
+
+    /// `kind`: 0=空(last==0) / 1=仅 DC(last==1) / 2=含 AC(last>1)。`block` 0..24。
+    pub(crate) fn bump(block: usize, kind: u8) {
+        let d = match kind {
+            0 => &EMPTY[block],
+            1 => &DC_ONLY[block],
+            _ => &AC[block],
+        };
+        d.fetch_add(1, Relaxed);
+    }
+
+    /// 返回 `(宏块数, 逐块位置空/仅DC/AC 三元计数)`。len=25，`[i]` 为块 i（Y2=24）。
+    pub(crate) fn report() -> (u64, [u64; 25], [u64; 25], [u64; 25]) {
+        let mut e = [0u64; 25];
+        let mut d = [0u64; 25];
+        let mut a = [0u64; 25];
+        for i in 0..25usize {
+            e[i] = EMPTY[i].load(Relaxed);
+            d[i] = DC_ONLY[i].load(Relaxed);
+            a[i] = AC[i].load(Relaxed);
+        }
+        (MB.load(Relaxed), e, d, a)
+    }
+
+    pub(crate) fn reset() {
+        MB.store(0, Relaxed);
+        for i in 0..25usize {
+            EMPTY[i].store(0, Relaxed);
+            DC_ONLY[i].store(0, Relaxed);
+            AC[i].store(0, Relaxed);
+        }
+    }
+}
+
 /// 基线变体：与 RC1 前完全相同的指令选择（bsr+xorl $31 / mov→cl），旧 CPU 与
 /// `KIMG_WEBP_ENT_NO_BMI=1` 强制侧走本条。字节恒等由「bmi≡baseline」硬闸对拍。
 #[inline(never)]

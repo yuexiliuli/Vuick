@@ -42,10 +42,42 @@ pub(crate) struct RowPacket {
     pub(crate) mbs: Vec<MbPacket>,
 }
 
+/// 单宏块解码所需 SIMD/熵门控（整帧恒定：CPU 特性探测 + env/override 只在首次访问触发一次，
+/// 之后全 Relaxed 原子读）。在 `decode_from_header` / `recon_loop` 每帧取一次，经 per-MB 函数
+/// 透传——消除逐宏块/逐块的 `part_simd_on`/`idct_i16_enabled`/`i4_simd_enabled` 多次读取
+/// （asm 每块 `movl ON(%rip);testl;jne` 分支，4–6ns/MB；`_forced` 核已在循环外判定过）。
+#[derive(Clone, Copy)]
+pub(crate) struct MbGates {
+    /// `part_simd_on("dct","sse2")` 原始判定。i16/UV 段直用；i4 段须再与 `i4_simd` 合取
+    /// （`i4_simd && dct_simd`，保持既有 i4 分支语义）。
+    pub(crate) dct_simd: bool,
+    /// `idct_i16_enabled()`（K93 第二遍 i16 域开关）。
+    pub(crate) i16_en: bool,
+    /// `i4_simd_enabled()`（i4 段专用开关）。
+    pub(crate) i4_simd: bool,
+    /// `i4_simd && part_simd_on("pred","ssse3")`（i4 段 B_PRED 子块预测 SIMD；已含 i4 开关）。
+    pub(crate) pred_simd: bool,
+}
+
+impl MbGates {
+    /// 每帧取一次。与 `reconstruct_macroblock` 旧「逐宏块读取」取值逐位一致（门控函数在整帧
+    /// 解码内恒定，测试 override 亦在整帧内不变）→ 透传不改变任何分发语义。
+    pub(crate) fn detect() -> MbGates {
+        let dct_simd = super::simd::part_simd_on("dct", "sse2");
+        let i16_en = super::simd::idct_i16_enabled();
+        let i4_simd = super::simd::i4_simd_enabled();
+        let pred_simd = i4_simd && super::simd::part_simd_on("pred", "ssse3");
+        MbGates { dct_simd, i16_en, i4_simd, pred_simd }
+    }
+}
+
 /// 单宏块熵解码（模式 + 残差 token + 去量化），产出 [`MbPacket`] 与行滤波参数 `(level, inner)`。
 /// 逐条对应原 `decode_from_header::reconstruct_row` 的「阶段一」，只是把 `mb`/`b_modes` 收进
 /// 包（每宏块零初始化，与串行 mb 复用数组在「写入前全零」语义上等价——未写位恒 0）。
 /// 熵态（`header`/`td` bool 解码器与 `above_nz`/`left_nz`/`above_b`/`left_b`）全程留在 t1。
+/// `#[inline(always)]`：串行路径经 `decode_macroblock` 合并时与 `reconstruct_macroblock` 同体
+/// 内联（消灭逐宏块两次 out-of-line 调用+分发）；MT t1 单调用点同样受益，字节恒等由同源函数体保证。
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn entropy_macroblock(
     header: &mut Vp8BoolDecoder<'_>,
@@ -109,6 +141,10 @@ fn entropy_macroblock(
 /// t2 依序重建时 `prepare_above` 读到的上一行是**已重建未滤波**像素，与串行（整帧重建毕再滤波）
 /// 语义一致 → 字节恒等不依赖行顺序，只依赖「预测读未滤、滤波读已建」。`pkt.mb` 可变：
 /// WHT 把 DC 写入 luma 块、用后清零，与串行共享 `mb` 数组的写序完全同构。
+/// `gates`：整帧恒定门控（[`MbGates::detect`] 每帧取一次），替换逐宏块/逐块门读。
+/// `#[inline(always)]`：串行经 `decode_macroblock` 与熵段同体内联，消灭逐宏块第二次
+/// out-of-line 调用+分发；MT t2 `recon_loop` 单调用点同样受益。
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reconstruct_macroblock(
     y: &mut [u8],
@@ -123,6 +159,7 @@ pub(crate) fn reconstruct_macroblock(
     mby: usize,
     mbw: usize,
     pkt: &mut MbPacket,
+    gates: MbGates,
 ) {
     let nonzero_mask = pkt.nonzero_mask;
     let ac_mask = pkt.ac_mask;
@@ -165,11 +202,11 @@ pub(crate) fn reconstruct_macroblock(
             // （热路径每宏块 8 对各付一次 ≈15-25ns/调）；判定在整帧解码内恒定（env/特性探测
             // 只跑一次），本宏块开头取一次，循环内改调 `_forced` 变体。`KIMG_WEBP_NO_SIMD_DCT=1`
             // / `KIMG_WEBP_NO_SIMD=1` / 非 x86_64 被判为假时走标量回退，关闭途径保留。
-            let dct_simd = super::simd::part_simd_on("dct", "sse2");
+            let dct_simd = gates.dct_simd;
             // IDCT 第二遍 i16 域开关同样提升出对循环（同 `dct_simd` 姿势，K93 双路径）：
             // `idct_i16_enabled()` 内部是 OnceLock 读取 + 分支（asm 每块 `movl ON(%rip);testl;jne`），
             // 判定在整帧解码内恒定，本宏块取一次、循环内经 `_forced` 核透传局部 bool。
-            let i16_en = super::simd::idct_i16_enabled();
+            let i16_en = gates.i16_en;
             stage_clock::idct_i16(|| {
                 for by in 0..4 {
                     let row0 = dy + by * 4;
@@ -236,13 +273,14 @@ pub(crate) fn reconstruct_macroblock(
             //   慢），且 `idct_add_one_sse2` 对仅 DC 块与标量捷径逐字节一致
             //   （`inverse_dct_has_ac_shortcut_equivalence`）；② 去 `let coeff = mb[block]` 全量
             //   16 系数拷贝（原实现 32B 栈拷 + 回读每块都付，零块也付），核直接借用 `&mb[block]`。
-            let i4_simd = super::simd::i4_simd_enabled();
-            let pred_simd = i4_simd && super::simd::part_simd_on("pred", "ssse3");
-            let dct_simd = i4_simd && super::simd::part_simd_on("dct", "sse2");
+            // i4 段门控：`pred_simd`/`dct_simd` 取自整帧恒定的 `gates`（`dct_simd` 与 i16/UV 段
+            // 不同：i4 段须与 `i4_simd` 合取，保持既有分支语义）。
+            let pred_simd = gates.pred_simd;
+            let dct_simd = gates.i4_simd && gates.dct_simd;
             // `idct_i16_enabled()`（K93 第二遍 i16 域开关）同提升：逐块调用是同一 OnceLock 读取
             // + 分支（asm 每块 `movl ON(%rip);testl;jne`），判定在整帧解码内恒定，本宏块取一次
             // 透传 `idct_add_one_forced`，循环内用局部 bool。
-            let i16_en = super::simd::idct_i16_enabled();
+            let i16_en = gates.i16_en;
             stage_clock::idct_i4(|| {
                 if pred_simd {
                     // Coder Iteration 4：i4 子块壳批量化——把整段 16 块 predict→add 提升进单个
@@ -363,11 +401,11 @@ pub(crate) fn reconstruct_macroblock(
                 // DCT SIMD 判定提升出 UV 对循环（同 i16 段 `dct_simd` 姿势）：每宏块 4 对，
                 // 循环外判定一次，循环内改调 `_forced` 变体；关闭途径（`KIMG_WEBP_NO_SIMD_DCT=1`
                 // / `KIMG_WEBP_NO_SIMD=1` / 非 x86_64）走标量回退保留。
-                let dct_simd = super::simd::part_simd_on("dct", "sse2");
+                let dct_simd = gates.dct_simd;
                 // `idct_i16_enabled()`（K93 第二遍 i16 域开关）同提升出 UV 对循环：判定在整帧
                 // 解码内恒定，本宏块取一次、经 `inverse_dct_add_two_forced` 透传，省去逐对
                 // OnceLock 读取 + 分支（asm 每对 `movl ON(%rip);testl;jne`）。
-                let i16_en = super::simd::idct_i16_enabled();
+                let i16_en = gates.i16_en;
                 for a in [16usize, 18, 20, 22] {
                     let b = a + 1;
                     let row0 = dyu + ((a >> 1) & 1) * 4;
@@ -517,6 +555,60 @@ unsafe fn reconstruct_i4_mb_ssse3(
             block += 1;
         }
     }
+}
+
+/// 串行路径单 per-MB 解码：熵（`entropy_macroblock`）→ 重建（`reconstruct_macroblock`）合并为
+/// 一次调用——消灭逐宏块两次 out-of-line 调用+分发（c1 ~14–25ns/MB 的可解部分 ≈5–10ns/MB）。
+/// 两段子函数 `#[inline(always)]` 在本函数内全内联（同 `reconstruct_i4_mb_ssse3` 先例的
+/// 「整段提升进单函数」姿势）：熵态（header/td/above_nz/left_nz）与重建态（y/u/v/above_*）
+/// 在同一函数体内流转，寄存器驻留、无 ABI 往返。字节恒等：与 MT 两路径共用完全相同的
+/// `entropy_macroblock`/`reconstruct_macroblock` 函数体（`threads2_matches_serial_byte_exact`
+/// 结构性成立），`gates` 整帧恒定一次判定，语义不变。
+#[allow(clippy::too_many_arguments)]
+fn decode_macroblock(
+    header: &mut Vp8BoolDecoder<'_>,
+    td: &mut Vp8BoolDecoder<'_>,
+    segment_probs: Option<&[u8; 3]>,
+    skip_probability: i32,
+    probs: &[u8],
+    seg_params: &[SegmentParameters; 4],
+    above_b: &mut [u8; 4],
+    left_b: &mut [u8; 4],
+    above_nz: &mut u32,
+    left_nz: &mut u32,
+    pkt: &mut MbPacket,
+    y: &mut [u8],
+    y_pitch: usize,
+    u: &mut [u8],
+    v: &mut [u8],
+    uv_pitch: usize,
+    above_y: &mut [u8; 21],
+    above_u: &mut [u8; 9],
+    above_v: &mut [u8; 9],
+    mbx: usize,
+    mby: usize,
+    mbw: usize,
+    gates: MbGates,
+) -> (u8, u8) {
+    let (level, inner) = entropy_macroblock(
+        header,
+        td,
+        segment_probs,
+        skip_probability,
+        probs,
+        seg_params,
+        above_b,
+        left_b,
+        above_nz,
+        left_nz,
+        pkt,
+    );
+    reconstruct_macroblock(
+        y, y_pitch, u, v, uv_pitch,
+        above_y, above_u, above_v,
+        mbx, mby, mbw, pkt, gates,
+    );
+    (level, inner)
 }
 
 pub(crate) fn decode_from_header(
@@ -773,6 +865,9 @@ pub(crate) fn decode_from_header(
         // `EmitScratch::resize_to`），池空才新建；serial 分支专属，用完归还。
         let mut scratch = sub.take_scratch(width);
         let mut emitted = 0usize;
+        // 帧级 SIMD/熵门控一次判定（`part_simd_on`/`idct_i16_enabled`/`i4_simd_enabled` 在整帧
+        // 解码内恒定）：透传进 `decode_macroblock`，消灭逐宏块/逐块门读（c2 ~4–6ns/MB）。
+        let gates = MbGates::detect();
         for mby in 0..mbh {
             // 每宏块行重置 4 个左邻 b 模式（C# `leftB.Clear()` 同款）。
             let mut left_b = [0u8; 4];
@@ -782,7 +877,8 @@ pub(crate) fn decode_from_header(
             for mbx in 0..mbw {
                 let above_b_slot: &mut [u8; 4] =
                     (&mut above_b[mbx * 4..mbx * 4 + 4]).try_into().unwrap();
-                let (level, inner) = entropy_macroblock(
+                // 单 per-MB 调用（熵+重建合并）：过去两处 out-of-line 调用+分发收敛为一次。
+                let (level, inner) = decode_macroblock(
                     &mut header,
                     td,
                     segment_probs,
@@ -794,13 +890,12 @@ pub(crate) fn decode_from_header(
                     &mut above_nz[mbx],
                     &mut left_nz,
                     &mut pkt,
-                );
-                row_filters[mby * mbw + mbx] = (level, inner);
-                reconstruct_macroblock(
                     &mut y, y_pitch, &mut u, &mut v, uv_pitch,
                     &mut above_y, &mut above_u, &mut above_v,
-                    mbx, mby, mbw, &mut pkt,
+                    mbx, mby, mbw,
+                    gates,
                 );
+                row_filters[mby * mbw + mbx] = (level, inner);
             }
             // 行窗：重建行 mby 后，上一行 mby-1 的滤波输入已全部就绪（bottom 邻行 mby 已做），
             // 立即滤波上一行并发射其已定稿行 —— 滤波/YUV 读的都是刚写出的热行（消整帧重建毕

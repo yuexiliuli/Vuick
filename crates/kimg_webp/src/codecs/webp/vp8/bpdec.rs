@@ -239,6 +239,12 @@ pub(crate) fn ent_split_pre(
     let b = *bits as u32;
     unsafe { core::hint::assert_unchecked(b < 64) };
     let rm1 = *range_minus1;
+    // p255 命中占比探针（仅测试）：诊断 flat 低比特率图在熵决策点的 p==255 占比（曾证
+    // syn-bars 79.6% / grad 49.3% / testsrc2·mandel·slintpad ≈20%）。据此评估过的「p==255
+    // 免乘特化」（(rm1*255)>>8 ≡ rm1-1，rm1∈[127,255] 精确恒等）同窗 A/B 实测 ≈0（见
+    // 2026-11-06 批注），未达 ≥3% 派单门槛 → 不投（K107），此处仅保留计数探针供复用。
+    #[cfg(test)]
+    p255_probe::bump(probability == 255);
     let split_minus1 = (rm1 * prob) >> 8;
     (*value >> b, split_minus1, rm1)
 }
@@ -336,6 +342,71 @@ pub(crate) fn ent_read_signed(
 // 是否值得投，K60 ≥8% 才投）。feature 关闭时 `probe_skew!` 展开为空、本模块不存在，
 // 产品路径零代码影响（行为/字节不变）。
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// p255 命中占比探针（仅 `#[cfg(test)]`，生产零代码影响）：诊断 flat 低比特率图在熵决策点
+// 的真实 p==255 占比——供「p255 免乘特化」的收益判定与派单门槛（K107 三件套）。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+pub(crate) mod p255_probe {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static HIT: AtomicU64 = AtomicU64::new(0);
+    #[inline(always)]
+    pub fn bump(hit: bool) {
+        TOTAL.fetch_add(1, Relaxed);
+        if hit {
+            HIT.fetch_add(1, Relaxed);
+        }
+    }
+    pub fn reset() {
+        TOTAL.store(0, Relaxed);
+        HIT.store(0, Relaxed);
+    }
+    pub fn report() -> (u64, u64) {
+        (TOTAL.load(Relaxed), HIT.load(Relaxed))
+    }
+}
+
+#[cfg(test)]
+mod p255_share_tests {
+    use super::*;
+
+    /// 解码指定静态有损 fixture，返回 `(总 ent_split_pre 调用数, 其中 p==255 数)`。
+    fn p255_share(name: &str) -> Option<(u64, u64)> {
+        let p = super::super::webp_fixtures_support::webp_fixture_path(name)?;
+        let data = std::fs::read(&p).ok()?;
+        let c = super::super::super::container::parse(&data).ok()?;
+        if c.family != super::super::super::container::Family::StaticLossy {
+            return None;
+        }
+        let (w, h) = (c.width, c.height);
+        p255_probe::reset();
+        let _ = super::super::decode::decode_vp8_tight(c.bitstream.unwrap(), w, h);
+        Some(p255_probe::report())
+    }
+
+    #[test]
+    fn p255_share_in_flat_lossy() {
+        for name in [
+            "syn-bars-3840x2160.webp",
+            "syn-testsrc2-3840x2160.webp",
+            "syn-mandel-3840x2160.webp",
+            "try-it-in-slintpad.webp",
+            "syn-grad-1280x720.webp",
+        ] {
+            let Some((total, hit)) = p255_share(name) else {
+                eprintln!("VP8_P255_SHARE SKIP {name} 外部语料缺失");
+                continue;
+            };
+            let pct = if total > 0 { hit as f64 * 100.0 / total as f64 } else { 0.0 };
+            eprintln!(
+                "VP8_P255_SHARE {name}\ttotal={total}\thit_p255={hit}\t{:.1}%",
+                pct
+            );
+        }
+    }
+}
+
 #[cfg(feature = "stage_profile")]
 pub(crate) mod skew_clock {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};

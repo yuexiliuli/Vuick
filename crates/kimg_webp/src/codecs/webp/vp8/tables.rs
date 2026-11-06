@@ -369,6 +369,10 @@ macro_rules! parse_residuals_impl {
         } else {
             (3usize, 0usize, $sp.y_dc)
         };
+        #[cfg(test)]
+        if empty_probe::on() {
+            empty_probe::mb();
+        }
         loop {
             let (ty, start, dc, ac) = if block < 16 {
                 (luma_type, luma_start, luma_dc, $sp.y_ac)
@@ -404,6 +408,17 @@ macro_rules! parse_residuals_impl {
                 masks |= 1u64 << (block + 32);
             }
             stage_clock::acct();
+            #[cfg(test)]
+            if empty_probe::on() {
+                let kind: u8 = if last == 0 {
+                    0
+                } else if last == 1 {
+                    1
+                } else {
+                    2
+                };
+                empty_probe::bump(block, kind);
+            }
             if block == 24 {
                 block = 0;
             } else {

@@ -578,3 +578,178 @@
         super::super::simd::set_simd_part_override("pred", None);
         super::super::simd::set_simd_part_override("flt", None);
     }
+
+    /// It-4 探针 A：flat/低比特率图「每 MB 空块数」统计（`empty_probe` env 门控原子计数，K103
+    /// 打靶前量化）。输出各图：宏块数、逐块位置 空/仅DC/含AC 合计、每 MB 平均空块数 ＋ 串行
+    /// 全链墙钟与「墙钟/空块」摊还上限。fallback：`cargo test -p kimg_webp perf_stage_tests::empty_block_counts
+    /// -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "手动运行"]
+    fn empty_block_counts() {
+        use std::time::Instant;
+        // 强制串行（MT 分账跨线程不可归）；墙钟口径 = serial 分支整帧（含滤波/直出）。
+        unsafe { std::env::set_var("KIMG_WEBP_THREADS", "0") };
+        empty_probe::init();
+        for name in [
+            "syn-bars-3840x2160.webp",
+            "syn-testsrc2-3840x2160.webp",
+            "syn-mandel-3840x2160.webp",
+            "try-it-in-slintpad.webp",
+            "syn-grad-1280x720.webp",
+            "syn-noise-3840x2160.webp",
+        ] {
+            let Some(data) = std::fs::read(corpus_path(name)).ok() else {
+                eprintln!("VP8_EMPTY_COUNT SKIP {name} 外部语料缺失");
+                continue;
+            };
+            let Some(c) = super::super::container::parse(&data).ok() else {
+                eprintln!("VP8_EMPTY_COUNT SKIP {name} 非静态有损");
+                continue;
+            };
+            if c.family != super::super::container::Family::StaticLossy {
+                eprintln!("VP8_EMPTY_COUNT SKIP {name} 非静态有损");
+                continue;
+            }
+            let (w, h) = (c.width, c.height);
+            let bitstream = c.bitstream.unwrap();
+            // 预热 + 字节恒等自检（不取墙钟）。
+            let _ = decode_vp8(&bitstream, w, h).unwrap();
+            empty_probe::set(true);
+            empty_probe::reset();
+            let t0 = Instant::now();
+            let _ = decode_vp8(&bitstream, w, h).unwrap();
+            let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+            empty_probe::set(false);
+            let (mbs, e, d, a) = empty_probe::report();
+            let (te, td, ta): (f64, f64, f64) = (
+                e.iter().sum::<u64>() as f64,
+                d.iter().sum::<u64>() as f64,
+                a.iter().sum::<u64>() as f64,
+            );
+            if mbs == 0 {
+                eprintln!("VP8_EMPTY_COUNT {name} 0 宏块（无熵解析）");
+                continue;
+            }
+            let per = |n: f64| n / mbs as f64;
+            // 摊还上限：全链墙钟 ÷ 空块数（含 recon/filter/yuv，故为「空块路径」上界）。
+            let per_empty_ns = wall_ms * 1e6 / te.max(1.0);
+            eprintln!(
+                "VP8_EMPTY_COUNT {name}\t{}x{}\tmbs={mbs}\tper_mb empty={:.3} dc={:.3} ac={:.3} \
+                 \tlumaE/D/A={:.1}/{:.1}/{:.1} uvE/D/A={:.1}/{:.1}/{:.1} y2E/D/A={}/{}/{}\t\
+                 wall={wall_ms:.2}ms\tns_fr=…",
+                w,
+                h,
+                per(te),
+                per(td),
+                per(ta),
+                e[0..16].iter().sum::<u64>() as f64,
+                d[0..16].iter().sum::<u64>() as f64,
+                a[0..16].iter().sum::<u64>() as f64,
+                e[16..24].iter().sum::<u64>() as f64,
+                d[16..24].iter().sum::<u64>() as f64,
+                a[16..24].iter().sum::<u64>() as f64,
+                e[24],
+                d[24],
+                a[24],
+            );
+            eprintln!("VP8_EMPTY_COUNT {name} wall_per_mb={:.1}ns empty_amortized_upper={:.1}ns/blk", wall_ms * 1e6 / mbs as f64, per_empty_ns);
+        }
+        unsafe { std::env::remove_var("KIMG_WEBP_THREADS") };
+    }
+
+    /// It-4 探针 B：逐空块分段成本 микроbench（clean 构建、真 flat 分区 + 真概率、熵态跨 MB
+    /// 携带，镜像 `parse_residuals` 的逐空块机器）。输出每空块：
+    /// full=真 `parse_residuals` 每 -MB 机器（含 上下文+索引+块序/清零写回）；
+    /// eob=不可约 EOB 位读下限（去除上下文/索引/掩码）；差值 ≈ 上下文+索引+块序+写回可省面；
+    /// memset=per-MB 800B 系数数组清零。fallback 同上。
+    #[test]
+    #[ignore = "手动运行"]
+    fn empty_block_machine_micro() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let reps = |f: &mut dyn FnMut()| -> f64 {
+            const R: usize = 5;
+            let t0 = Instant::now();
+            for _ in 0..R {
+                f();
+            }
+            t0.elapsed().as_secs_f64() / R as f64
+        };
+        for name in ["syn-bars-3840x2160.webp", "syn-noise-3840x2160.webp"] {
+            let Some(data) = std::fs::read(corpus_path(name)).ok() else {
+                eprintln!("VP8_EMPTY_MICRO SKIP {name}");
+                continue;
+            };
+            let Some(c) = super::super::container::parse(&data).ok() else { continue };
+            if c.family != super::super::container::Family::StaticLossy {
+                continue;
+            }
+            let (w, h) = (c.width, c.height);
+            let fh = parse_frame_header(&c.bitstream.unwrap()).unwrap();
+            let mbw = fh.mb_width;
+            let mbh = fh.mb_height;
+            let n_mb = (mbw * mbh).max(1);
+            let sp = compute_segment_parameters(&fh.segments, &fh.quantizers, &fh.filter);
+            let probs = fh.coefficient_probabilities;
+            let part = fh.partitions[0];
+
+            // 1) full：真 `parse_residuals` 逐空块机器（i16=true 主路径；全帧 MB 数一次）。
+            let full = reps(&mut || {
+                let mut td = Vp8BoolDecoder::new(part);
+                let mut mb = [[0i16; 16]; 25];
+                let mut above_nz = 0u32;
+                let mut left_nz = 0u32;
+                let mut acc = 0u64;
+                for _ in 0..n_mb {
+                    acc ^= parse_residuals(&mut td, &probs, &mut mb, &sp[0], true, &mut above_nz, &mut left_nz);
+                }
+                black_box(acc);
+            });
+            // eob 下限：每块只付一次 EOB 位读（context/band/掩码全去掉；真实 EOB 概率随位流）。
+            let eob_prob = probs[0]; // type0/band0/context0 的 EOB 概率（flat 主决策点）。
+            let n_blk = n_mb * 25usize;
+            let eob = reps(&mut || {
+                let mut td = Vp8BoolDecoder::new(part);
+                let mut acc = 0u64;
+                for _ in 0..n_blk {
+                    // 走 `tokens` EOB 首决策同一 bool-decoder 标量路径（ent_branch 分支形）。
+                    let (vs, sp2, rm1) =
+                        ent_split_pre(part, &mut td.pos, &mut td.value, &mut td.bits, &mut td.range_minus1, eob_prob);
+                    if vs > u64::from(sp2) {
+                        td.value -= (u64::from(sp2 + 1)) << td.bits as u32;
+                        ent_renorm_apply(&mut td.bits, &mut td.range_minus1, rm1 - sp2, ent_renorm_skip());
+                        acc |= 1;
+                    } else {
+                        ent_renorm_apply(&mut td.bits, &mut td.range_minus1, sp2 + 1, ent_renorm_skip());
+                    }
+                }
+                black_box(acc);
+            });
+            // memset：per-MB 800B 系数数组清零（`pkt.mb = [[0i16;16];25]` 同形，`black_box(&mb)`
+            // 防 DCE——编译器会把「整数组重写后仅读常量」折叠成无操作）。
+            let memset = reps(&mut || {
+                let mut mb = [[0i16; 16]; 25];
+                let mut s = 0u64;
+                for _ in 0..n_mb {
+                    mb = [[0i16; 16]; 25];
+                    s ^= black_box(&mb)[24][15] as u64;
+                }
+                black_box(s);
+            });
+            // 空块数（推算：i16 主路径 25 块/MB；flat 全空见探针 A）。
+            eprintln!(
+                "VP8_EMPTY_MICRO {name}\t{}x{}\tmbw={mbw} mbh={mbh} n_mb={n_mb}\t\
+                 full={:.3}ms({:.1}ns/blk) eob_only={:.3}ms({:.1}ns/blk) \
+                 ctx_idx_delta={:.1}ns/blk memset={:.3}ms({:.1}ns/MB)",
+                w,
+                h,
+                full * 1e3,
+                full * 1e9 / n_blk as f64,
+                eob * 1e3,
+                eob * 1e9 / n_blk as f64,
+                (full - eob) * 1e9 / n_blk as f64,
+                memset * 1e3,
+                memset * 1e9 / n_mb as f64,
+            );
+        }
+    }

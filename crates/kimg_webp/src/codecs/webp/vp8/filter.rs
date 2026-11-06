@@ -336,12 +336,14 @@ pub(crate) fn recon_loop(
     let mut above_y = [127u8; 21];
     let mut above_u = [127u8; 9];
     let mut above_v = [127u8; 9];
+    // 帧级 SIMD/熵门控一次判定（整帧恒定）：透传进 `reconstruct_macroblock`，消灭逐宏块门读。
+    let gates = super::MbGates::detect();
     for (r, mut rowpkt) in rx.iter().enumerate() {
         for (mbx, pkt) in rowpkt.mbs.iter_mut().enumerate() {
             reconstruct_macroblock(
                 y, y_pitch, u, v, uv_pitch,
                 &mut above_y, &mut above_u, &mut above_v,
-                mbx, r, mbw, pkt,
+                mbx, r, mbw, pkt, gates,
             );
         }
         // 打包本 MB 行（行 r 已在 planes_A 定稿重建）→ t3。B：strip Vec 帧内池——优先复用
