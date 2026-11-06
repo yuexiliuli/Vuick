@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -21,9 +22,10 @@ pub(crate) const BLOCK_LEFT_CONTEXT_BIT: [u32; 25] = [
 pub(crate) const NZ_Y2: u32 = 1 << 24;
 
 /// RFC 6386 §13.2 DCT_CAT3..6 子树（p8 之后）附额外位。熵态以调用方局部标量携带（寄存器驻留，
-/// 同 `tokens` 标量化 Load/Store 姿势；`data`/`pos` 仅在 refill 触碰）。概率读用裸指针游标 `p`
-/// （`tokens` 传入，指向当前 p_idx 处）：读 `p[k]`（k=8..10）。不变量与 `tokens` 同证：
-/// p_idx ≤ 253、p_idx+10 ≤ 263 < 264（每型概率表长）→ 恒不越界。
+/// 同 `tokens` 标量化 Load/Store 姿势；`data`/`pos` 仅在 refill 触碰）。概率读用熵概率游标
+/// `p`（`tokens` 传入，指向当前 p_idx 处）：读 `p[k]`（k=8..10）。不变量与 `tokens` 同证：
+/// p_idx ≤ 253、p_idx+10 ≤ 263 < 264（每型概率表长）→ 恒不越界。游标下沉
+/// `simd::raw::Vp8ProbCursor`（`read_offset` 内联后 `movzx …[reg+k]` 与指针游标同指令）。
 ///
 /// **RC3**：CAT8/9/10（p[8..10]，偏斜极高但低频）随 ZERO/G5 同机制做预测分支形——位判定与
 /// 调用点 `if b==0` 体合并为同一分支（`ent_branch=true`，默认）；false 走旧 cmov 形。两形输出
@@ -37,18 +39,18 @@ fn read_category_3_to_6(
     range_minus1: &mut u32,
     renorm_skip: bool,
     ent_branch: bool,
-    p: *const u8,
+    p: super::simd::raw::Vp8ProbCursor,
 ) -> i32 {
     let (extra, base): (&[u8], i32) = {
         if ent_branch {
             // 预测分支形：CAT8 位判定直接路由（多数方 bit=0 只算本路熵态，单误判点）。
-            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(8) });
+            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, p.read_offset(8));
             if vs > u64::from(sp) {
                 // bit=1（少数方 0.2%）：CAT10 分支（偏斜 0.94，多数方 bit=0）。
                 *value -= (u64::from(sp + 1)) << (*bits as u32);
                 ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
                 probe_skew!(skew_clock::CAT8, 1);
-                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(10) });
+                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, p.read_offset(10));
                 if vs > u64::from(sp) {
                     *value -= (u64::from(sp + 1)) << (*bits as u32);
                     ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
@@ -63,7 +65,7 @@ fn read_category_3_to_6(
                 // bit=0（多数方 99.8%，预测命中）：CAT9 分支（偏斜 0.893，多数方 bit=0）。
                 ent_renorm_apply(bits, range_minus1, sp + 1, renorm_skip);
                 probe_skew!(skew_clock::CAT8, 0);
-                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(9) });
+                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, p.read_offset(9));
                 if vs > u64::from(sp) {
                     *value -= (u64::from(sp + 1)) << (*bits as u32);
                     ent_renorm_apply(bits, range_minus1, rm1 - sp, renorm_skip);
@@ -77,10 +79,10 @@ fn read_category_3_to_6(
             }
         } else {
             // cmov 全算（A/B 对照侧）：与分支形逐字节一致，唯指令选择不同。
-            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(8) });
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(8));
             probe_skew!(skew_clock::CAT8, b);
             if b == 0 {
-                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(9) });
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(9));
                 probe_skew!(skew_clock::CAT9, b);
                 if b == 0 {
                     (&PCAT3, 11)
@@ -88,7 +90,7 @@ fn read_category_3_to_6(
                     (&PCAT4, 19)
                 }
             } else {
-                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(10) });
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(10));
                 probe_skew!(skew_clock::CAT10, b);
                 if b == 0 {
                     (&PCAT5, 35)
@@ -132,18 +134,19 @@ pub(crate) fn tokens(
     // 熵概率读不变量（证明）：`BAND_ROW_OFFSETS` 最大 231（position≤15），context≤2、
     // next_context∈{11,22} ⇒ p_idx ≤ 253；概率表按型分块 8*33=264 字节、`probabilities` 切片长
     // 恒 ≥ 264（`parse_residuals` 传 `probs[ty*264..]`，表总长 1056）⇒ p_idx+10 ≤ 263 < 264。
-    // 故裸指针游标 `p = base.add(p_idx)` 读 `p[k]`（k≤10）恒不越界——用指针游标省去每次
-    // `probabilities[p_idx+k]` 的边界检查，读到的概率字节与下标版逐字节相同（libwebp vp8_dec.c
-    // 的 `const uint8_t* p` 滑动游标同款姿势，参考不抄）。
+    // 故熵概率游标 `p = Vp8ProbCursor::from_slice_unchecked(probabilities, p_idx)` 读 `p[k]`
+    // （k≤10）恒不越界——读操作下沉 `simd::raw::Vp8ProbCursor`（`read_offset` 内联后
+    // `movzx …[reg+k]`），省去每次 `probabilities[p_idx+k]` 的边界检查，读到的概率字节与下标版
+    // 逐字节相同（libwebp vp8_dec.c 的 `const uint8_t* p` 滑动游标同款姿势，参考不抄）。
     //
     // 环内 `get_unchecked` 不变量（A 记账压紧·减少每系数索引算术）：`position` 两侧自增后必先
     // 判 `position == 16` break 才续用（1208-1272），故三处 `BAND_ROW_OFFSETS[position]` /
-    // `ZIGZAG[position]`（1217/1258/1267）恒有 position ≤ 15 < 16——去掉必然不触发的边界检查
-    // 每次索引省 1-2 uop（cmp+溢出分支），读值与下标版逐字节相同。
+    // `ZIGZAG[position]`（1217/1258/1267）恒有 position ≤ 15 < 16——无检查下标读下沉
+    // `simd::raw::unchecked_index`（去掉必然不触发的边界检查，每次索引省 1-2 uop（cmp+溢出分支），
+    // 读值与下标版逐字节相同）。
     let p_idx = BAND_ROW_OFFSETS[position] + context * 11;
     debug_assert!(p_idx + 10 < probabilities.len());
-    let base = probabilities.as_ptr();
-    let mut p = unsafe { base.add(p_idx) };
+    let mut p = super::simd::raw::Vp8ProbCursor::from_slice_unchecked(probabilities, p_idx);
     stage_clock::acct();
     let mut last = 0usize;
 
@@ -155,7 +158,7 @@ pub(crate) fn tokens(
     /// F67/F159/F165/F145 偏斜 54-64% 净负，保留 cmov 形不动（抛硬币/近硬币点禁止改）。
     macro_rules! g5_zero_body {
         () => {{
-            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(7) });
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(7));
             probe_skew!(skew_clock::F67, b);
             if b == 0 {
                 let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, 159);
@@ -176,27 +179,27 @@ pub(crate) fn tokens(
     macro_rules! nonzero_token_body {
         () => {{
             let (mag, next_context): (i32, usize) = {
-                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(2) });
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(2));
                 probe_skew!(skew_clock::ONE, b);
                 if b == 0 {
                     (1, 11)
                 } else {
-                    let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(3) });
+                    let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(3));
                     probe_skew!(skew_clock::LT5, b);
                     if b == 0 {
-                        let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(4) });
+                        let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(4));
                         probe_skew!(skew_clock::TWO, b);
                         if b == 0 {
                             (2, 22)
                         } else {
-                            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(5) });
+                            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(5));
                             probe_skew!(skew_clock::F34, b);
                             (3 + b as i32, 22)
                         }
                     } else {
                         // G5 决策（p[6]，多数方 bit=0 偏斜 89.6%）：分支形与 cmov 形运行时切换。
                         if ent_branch {
-                            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(6) });
+                            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, p.read_offset(6));
                             if vs > u64::from(sp) {
                                 // bit=1（少数方 10.4%）：DCT_CAT3..6。
                                 *value -= (u64::from(sp + 1)) << (*bits as u32);
@@ -211,7 +214,7 @@ pub(crate) fn tokens(
                                 g5_zero_body!()
                             }
                         } else {
-                            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(6) });
+                            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(6));
                             probe_skew!(skew_clock::G5, b);
                             if b == 0 {
                                 g5_zero_body!()
@@ -227,7 +230,7 @@ pub(crate) fn tokens(
             // 无分支符号（C# ReadSigned：符号是抛硬币，分支一半预测失败）。
             let signed = ent_read_signed(data, pos, value, bits, range_minus1, mag);
             stage_clock::dq();
-            output[unsafe { *ZIGZAG.get_unchecked(position) } as usize] = (signed * factor) as i16;
+            output[super::simd::raw::unchecked_index(&ZIGZAG, position) as usize] = (signed * factor) as i16;
             stage_clock::acct();
             last = position + 1;
             stage_clock::acct();
@@ -236,12 +239,15 @@ pub(crate) fn tokens(
                 break;
             }
             stage_clock::acct();
-            p = unsafe { base.add(*BAND_ROW_OFFSETS.get_unchecked(position) + next_context) };
+            p = super::simd::raw::Vp8ProbCursor::from_slice_unchecked(
+                probabilities,
+                super::simd::raw::unchecked_index(&BAND_ROW_OFFSETS, position) + next_context,
+            );
             // ── C2：下一位置 EOB 决策点（p[0]）分支形/cmov 切换（同 RC3 ZERO 样式）：分支形把位
             // 判定与「break/续读」体合并为同一分支（单误判点；预测命中方只算本路熵态）。稀疏多数方
             // bit=0 → EOB 命中 break；噪声多数方 bit=1 → 续读环顶。
             if ent_branch {
-                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p });
+                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, p.read());
                 if vs > u64::from(sp) {
                     // bit=1（续读）：更新熵态，回环顶续读下一系数。
                     *value -= (u64::from(sp + 1)) << (*bits as u32);
@@ -254,7 +260,7 @@ pub(crate) fn tokens(
                     break;
                 }
             } else {
-                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read());
                 probe_skew!(skew_clock::EOB, b);
                 if b == 0 {
                     break; // 下一位置 EOB。
@@ -271,7 +277,10 @@ pub(crate) fn tokens(
                 break;
             }
             stage_clock::acct();
-            p = unsafe { base.add(*BAND_ROW_OFFSETS.get_unchecked(position)) };
+            p = super::simd::raw::Vp8ProbCursor::from_slice_unchecked(
+                probabilities,
+                super::simd::raw::unchecked_index(&BAND_ROW_OFFSETS, position),
+            );
             continue;
         }};
     }
@@ -282,7 +291,7 @@ pub(crate) fn tokens(
     // bit=1，均 ≥85%）→ 默认开、无需内容门控。bit=0 = 空块（不读系数）。
     'eob: {
         if ent_branch {
-            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p });
+            let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, p.read());
             if vs > u64::from(sp) {
                 // bit=1（块有内容）：更新熵态后进系数环。
                 *value -= (u64::from(sp + 1)) << (*bits as u32);
@@ -295,7 +304,7 @@ pub(crate) fn tokens(
                 break 'eob;
             }
         } else {
-            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p });
+            let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read());
             probe_skew!(skew_clock::EOB, b);
             if b == 0 {
                 break 'eob;
@@ -306,7 +315,7 @@ pub(crate) fn tokens(
             // 位判定与 `if b==0` 体合并为同一分支（单误判点；多数方命中只算本路熵态），两形共享
             // 单源算术（`ent_split_pre`/`ent_renorm_apply`）→ 输出逐字节一致。
             if ent_branch {
-                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, unsafe { *p.add(1) });
+                let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, p.read_offset(1));
                 if vs > u64::from(sp) {
                     // bit=1（少数方 14.8%）：零未命中，更新熵态后落入非零 token 体。
                     *value -= (u64::from(sp + 1)) << (*bits as u32);
@@ -320,7 +329,7 @@ pub(crate) fn tokens(
                     zero_token_body!();
                 }
             } else {
-                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, unsafe { *p.add(1) });
+                let b = ent_read_bit(data, pos, value, bits, range_minus1, renorm_skip, p.read_offset(1));
                 probe_skew!(skew_clock::ZERO, b);
                 if b == 0 {
                     zero_token_body!();
@@ -354,7 +363,10 @@ macro_rules! parse_residuals_impl {
         // （TOP4：OnceLock 每宏块一读，主环零 OnceLock load）。
         let renorm_skip = ent_renorm_skip();
         // RC3：分支形开关每宏块判定一次（OnceLock 一读 + 恒定可预测分支），主环零开关开销。
-        let ent_branch = super::simd::ent_branch_enabled();
+        // 全路径（绝对路径）引用：本宏体经 `simd::raw::mbdec` 的 `parse_residuals_base/bmi`
+        // 展开（定义点在 vp8 子树内 `super::simd`、展开点在 simd 子树内不一致），绝对路径
+        // 在任一无 unsafe 落点都解析到同一 `ent_branch_enabled`（语义/字节不变）。
+        let ent_branch = crate::codecs::webp::simd::ent_branch_enabled();
         let data = $d.data;
         let mut pos = $d.pos;
         let mut value = $d.value;
@@ -439,4 +451,7 @@ macro_rules! parse_residuals_impl {
         masks
     })
 }
+// pub(crate) 再导出：`simd::raw::mbdec` 迁入的 `parse_residuals_base/bmi` 展开本宏体须在
+// 展开点（raw 子树）可解析——经 `vp8::parse_residuals_impl` 按名导入。
+pub(crate) use parse_residuals_impl;
 

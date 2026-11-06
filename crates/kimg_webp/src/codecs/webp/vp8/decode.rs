@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use super::*;
 
 /// 完整解码：解析帧头 + 重建全部宏块 → 紧密 YUV 4:2:0（V2 暂不含环路滤波，V3 接入）。
@@ -100,9 +101,8 @@ pub(crate) fn decode_vp8_tight(frame: &[u8], width: u32, height: u32) -> Result<
 /// 未初始化 `Vec<u8>`：调用方必须保证返回后 `len` 字节在被读取前全部写入（见各调用点
 /// Safety 注释）。省去 `vec![0u8; len]` 的全量 memset——大缓冲（RGBA 输出/紧密平面）零化
 /// 在主线程关键路径上（P-B 直出已覆盖全部字节），逐字节恒等。
+/// 未初始化 set_len 下沉 `simd::raw::uninit_vec_u8`（叶子安全门面，同不变量）。
 #[inline]
-pub(crate) unsafe fn uninit_vec_u8(len: usize) -> Vec<u8> { unsafe {
-    let mut v = Vec::with_capacity(len);
-    v.set_len(len);
-    v
-}}
+pub(crate) fn uninit_vec_u8(len: usize) -> Vec<u8> {
+    super::simd::raw::uninit_vec_u8(len)
+}

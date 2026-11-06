@@ -1,3 +1,7 @@
+#![forbid(unsafe_code)]
+// 本文件零裸操作：`subblock_above` 的预测行裸读下沉 `simd::raw::unchecked_index`
+// （`#[inline(always)]` 安全门面，内联后与原裸指针对代码生成逐指令一致）。
+
 // ---------------------------------------------------------------------------
 // V2：宏块重建（帧内预测 / IDCT / WHT / 解量化 / 写回 YUV）
 // ---------------------------------------------------------------------------
@@ -211,7 +215,8 @@ pub(crate) fn predict_large(
 /// 构造 4x4 块的 above 行（`above[0]`=左上，`above[1..9]`=上 8 像素）：
 /// 顶行块取宏块 above 缓冲；下方块取已重建上一行；右列块的 above-right 取自宏块 above 缓冲
 /// 第 16..19（RFC 6386 §12.3 的 16×8 边界不可重排语义）。
-/// I4 热路径逐块调用（16×/宏块 × ~80% 宏块）：读用裸指针免边界检查。
+/// I4 热路径逐块调用（16×/宏块 × ~80% 宏块）：读下沉 `simd::raw::unchecked_index`
+/// 免边界检查（内联后与原裸指针同指令）。
 /// 越界不变量：`block_y>0` 时读行 `row_above=row0-1`，列范围
 /// `col0-1 ..= col0+7`——`col0=dx+bx*4`，bx≤3 → 最大列 `dx+15 < cw`，最小 `dx-1` 为左边界
 /// 129 列（`pitch` 行首格）；故最大平面下标 `(ch-1)*pitch+1+cw-1 < ch*pitch`（=y 平面长度）
@@ -233,19 +238,19 @@ pub(crate) fn subblock_above(
         return a;
     }
     let row_above = row0 - 1;
-    let base = unsafe { plane.as_ptr().add(row_above * pitch) };
+    let base = row_above * pitch;
     let mut a = [0u8; 9];
-    debug_assert!(row_above * pitch + col0 + 8 < plane.len());
+    debug_assert!(base + col0 + 8 < plane.len());
     if block_x < 3 {
-        a[0] = unsafe { *base.add(col0) };
+        a[0] = super::simd::raw::unchecked_index(plane, base + col0);
         for k in 0..8 {
-            a[1 + k] = unsafe { *base.add(col0 + 1 + k) };
+            a[1 + k] = super::simd::raw::unchecked_index(plane, base + col0 + 1 + k);
         }
     } else {
         // block_x == 3：右侧 4 像素取宏块 aboveY[16..19]。
-        a[0] = unsafe { *base.add(col0) };
+        a[0] = super::simd::raw::unchecked_index(plane, base + col0);
         for k in 0..4 {
-            a[1 + k] = unsafe { *base.add(col0 + 1 + k) };
+            a[1 + k] = super::simd::raw::unchecked_index(plane, base + col0 + 1 + k);
         }
         for k in 0..4 {
             a[5 + k] = above_y[17 + k];

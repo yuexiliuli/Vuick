@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -190,8 +191,8 @@ impl Copy for Vp8BoolDecoder<'_> {}
 #[inline(always)]
 fn ent_refill(data: &[u8], pos: &mut usize, value: &mut u64, bits: &mut i32) {
     if data.len() - *pos >= 8 {
-        // 安全性：分支保证 *pos + 8 <= len；`read_unaligned` 自行处理非对齐载荷（同 refill）。
-        let raw = unsafe { (data.as_ptr().add(*pos) as *const u64).read_unaligned() };
+        // 安全性：分支保证 *pos + 8 <= len；非对齐直读下沉 `simd::raw::read_u64_unaligned`。
+        let raw = super::simd::raw::read_u64_unaligned(data, *pos);
         let raw = u64::from_be(raw);
         *value = (*value << 56) | (raw >> 8);
         *pos += 7;
@@ -237,9 +238,9 @@ pub(crate) fn ent_split_pre(
     // 故本点（refill 后）恒有 bits ∈ [0,55] < 64。单点载入 `b` 并对其下界假设，移位直接用该 `b`
     // （保证假设与移位共用同一 SSA 值，KnownBits 传导后 x86 变量移位前 `andl $63` 判恒等折叠删除；
     // 掩码值本仅喂移位计数，字节恒等不变）。debug 构建假设转真实断言（验证期兜底）。
-    // Safety：上方不变量证明 b<64 恒成立。
-    let b = *bits as u32;
-    unsafe { core::hint::assert_unchecked(b < 64) };
+    // Safety：上方不变量证明 b<64 恒成立；下界假设下沉 `simd::raw::ent_shift_amt_lt_64`
+    // （内联后 `llvm.assume` 与原 b 同一 SSA，`andl $63` 折叠删除，codegen 与隔离前一致）。
+    let b = super::simd::raw::ent_shift_amt_lt_64(*bits as u32);
     let rm1 = *range_minus1;
     // p255 命中占比探针（仅测试）：诊断 flat 低比特率图在熵决策点的 p==255 占比（曾证
     // syn-bars 79.6% / grad 49.3% / testsrc2·mandel·slintpad ≈20%）。据此评估过的「p==255
@@ -283,10 +284,10 @@ pub(crate) fn ent_read_bit(
 ) -> u32 {
     let (vs, sp, rm1) = ent_split_pre(data, pos, value, bits, range_minus1, probability);
     // 减法位移位数与 ent_split_pre 同源（其间 bits 不被改写）：单点载入并对同一 SSA 下界假设
-    // （见 `ent_split_pre`，bits ∈ [0,55] < 64 可证；debug 转真实断言）。
+    // （见 `ent_split_pre`，bits ∈ [0,55] < 64 可证；debug 转真实断言）。下界假设下沉
+    // `simd::raw::ent_shift_amt_lt_64`（内联后 assume 与原 b 同一 SSA）。
     // Safety：b<64 恒成立。
-    let b = *bits as u32;
-    unsafe { core::hint::assert_unchecked(b < 64) };
+    let b = super::simd::raw::ent_shift_amt_lt_64(*bits as u32);
     let (range, bit) = if vs > u64::from(sp) {
         *value -= (u64::from(sp + 1)) << b;
         (rm1 - sp, 1)
@@ -308,6 +309,9 @@ macro_rules! probe_skew {
 macro_rules! probe_skew {
     ($site:expr, $b:expr) => {};
 }
+// pub(crate) 再导出：`simd::raw::mbdec` 迁入的 `read_macroblock_modes_impl!` 内
+// `probe_skew!` 须在展开点（raw 子树）可解析——经 `vp8::probe_skew` 按名导入。
+pub(crate) use probe_skew;
 #[inline(always)]
 pub(crate) fn ent_read_signed(
     data: &[u8],
@@ -322,10 +326,10 @@ pub(crate) fn ent_read_signed(
         ent_refill(data, pos, value, bits);
     }
     // 同 `ent_split_pre` 的 bits 上界不变量（refill 后 bits ∈ [0,55] < 64，可证）；单点载入 `b`
-    // 并对其下界假设、两处移位共用该 `b`（删 `andl $63`）；debug 转真实断言。
+    // 并对其下界假设、两处移位共用该 `b`（删 `andl $63`）；debug 转真实断言。下界假设下沉
+    // `simd::raw::ent_shift_amt_lt_64`（内联后 assume 与原 b 同一 SSA）。
     // Safety：b<64 恒成立。
-    let b = *bits as u32;
-    unsafe { core::hint::assert_unchecked(b < 64) };
+    let b = super::simd::raw::ent_shift_amt_lt_64(*bits as u32);
     let rm1 = *range_minus1 as i32;
     let split_minus1 = rm1 >> 1;
     let mask = (split_minus1 - (*value >> b) as i32) >> 31;

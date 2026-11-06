@@ -1,3 +1,7 @@
+#![forbid(unsafe_code)]
+// 本文件零裸操作：SIMD 熔合路径的指针派点 + 内核调用下沉 `simd::raw::lf_filter_macroblock_safe`
+// （`#[inline(always)]` 安全门面）；标量路径全部安全切片读写。
+
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -213,31 +217,31 @@ pub(crate) fn filter_macroblock_row(
         let uvx = mbx * 8;
 
         // SIMD 熔合路径（D2v3）：一次宏块全 12 核（C# FilterMacroblock 同款），边次序与下方
-        // 标量完全一致 → 逐字节相同；`KIMG_WEBP_NO_SIMD=1` / `KIMG_WEBP_NO_SIMD_FLT=1` /
+        // 标量完全一致 → 逐字节相同；指针派点与内核调用下沉 `simd::raw::lf_filter_macroblock_safe`
+        // （`#[inline(always)]` 安全门面）。`KIMG_WEBP_NO_SIMD=1` / `KIMG_WEBP_NO_SIMD_FLT=1` /
         // `KIMG_WEBP_SIMD_FLT=0` 回退标量（门控见 simd::part_simd_on）。
         #[cfg(target_arch = "x86_64")]
         {
             if super::simd::part_simd_on("flt", "sse2") {
-                unsafe {
-                    let yc = y.as_mut_ptr().add(y_row * y_pitch + 1 + x);
-                    let uc = u.as_mut_ptr().add(uv_row * uv_pitch + 1 + uvx);
-                    let vc = v.as_mut_ptr().add(uv_row * uv_pitch + 1 + uvx);
-                    super::simd::lf_filter_macroblock(
-                        yc,
-                        y_pitch as isize,
-                        uc,
-                        vc,
-                        uv_pitch as isize,
-                        mbx > 0,
-                        mby > 0,
-                        !skip_inner,
-                        simple,
-                        interior,
-                        edge_limit,
-                        sub_limit,
-                        hev,
-                    );
-                }
+                super::simd::raw::lf_filter_macroblock_safe(
+                    y,
+                    y_pitch,
+                    u,
+                    v,
+                    uv_pitch,
+                    y_row,
+                    x,
+                    uv_row,
+                    uvx,
+                    mbx > 0,
+                    mby > 0,
+                    !skip_inner,
+                    simple,
+                    interior,
+                    edge_limit,
+                    sub_limit,
+                    hev,
+                );
                 continue;
             }
         }
@@ -423,7 +427,7 @@ pub(crate) fn extract_tight_rows(
 /// - 滤波/直出/紧密抽取完全复用 `filter_macroblock_row` / `emit_rows_into_rgba` /
 ///   `extract_tight_rows`，行序 m 升序、段序 `[emitted, m*16+8)` 与串行一致 → 逐字节同。
 /// - planes_A 恒未滤波（t2 独占），故 t3 滤波不需要等 t2 的下一步预测 —— 无 1 行滞后约束。
-/// 所有权：本线程独占 planes_B / rgba / out_*，零 unsafe，无共享可变内存。
+/// 所有权：本线程独占 planes_B / rgba / out_*，零裸操作，无共享可变内存。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn filter_t3_loop(
     rx: std::sync::mpsc::Receiver<RowPixels>,
@@ -449,7 +453,7 @@ pub(crate) fn filter_t3_loop(
     // → 全量 memset 为死写，未初始化分配 + 整行覆写与 memset 版逐字节同，无未初始化读。
     let y_vec_len = mbh * 16 * y_pitch;
     let uv_vec_len = mbh * 8 * uv_pitch;
-    let mut planes_b = unsafe { super::uninit_vec_u8(y_vec_len + 2 * uv_vec_len) };
+    let mut planes_b = super::uninit_vec_u8(y_vec_len + 2 * uv_vec_len);
     let (yb, rest) = planes_b.split_at_mut(y_vec_len);
     let (ub, vb) = rest.split_at_mut(uv_vec_len);
     let cw = (width + 1) >> 1;

@@ -640,9 +640,7 @@ pub fn lossless_static_size(data: &[u8]) -> Option<(u32, u32, usize)> {
 /// `out`（对齐快道 `decode_image_into` 顺序全写 + 原地字节交换；未对齐兜底整段拷贝）；
 /// 中途 Err 时缓冲由调用方丢弃（回退常规解码路径），无未初始化字节泄漏到图像之外。
 pub fn uninit_rgba8_vec(len: usize) -> Vec<u8> {
-    let mut v = Vec::with_capacity(len);
-    unsafe { v.set_len(len) };
-    v
+    simd::raw::uninit_vec_u8(len)
 }
 
 /// RGB8 → RGBA8 扩写快道（SSSE3，alpha 恒 255），供 kimg 门面 `DynamicImage::to_rgba8` 的

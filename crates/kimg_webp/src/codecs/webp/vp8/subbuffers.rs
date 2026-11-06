@@ -1,4 +1,6 @@
+#![forbid(unsafe_code)]
 use super::emit::EmitScratch;
+use super::simd::raw;
 
 // ---------------------------------------------------------------------------
 // 每线程解码固定缓冲池（结构线唯一实靶：S0 production 复核定案 setup 1.55% + glue 3.19% ≈
@@ -72,28 +74,29 @@ impl Vp8SubBuffersGuard {
             b.planes.reserve(need - b.planes.len());
         }
         // SAFETY：u8 无 Drop glue，set_len 后未初始化尾部保证读前写满（上方纪律 + 调用点
-        // Safety 注释）；收缩仅截断已写字节、容量保留（永不 shrink）。
-        unsafe { b.planes.set_len(need) };
+        // Safety 注释）；收缩仅截断已写字节、容量保留（永不 shrink）。set_len 下沉
+        // `raw::vec_set_len`（未初始化不变量随门面传递）。
+        raw::vec_set_len(&mut b.planes, need);
         // above_b：length 就位 + 全量清零（vec![0; mbw*4] 原语义每帧重立）。
         if b.above_b.capacity() < mbw * 4 {
             b.above_b.reserve(mbw * 4 - b.above_b.len());
         }
         // SAFETY：同上（u8 无 Drop；下方 fill 全覆盖后再移交读方）。
-        unsafe { b.above_b.set_len(mbw * 4) };
+        raw::vec_set_len(&mut b.above_b, mbw * 4);
         b.above_b.fill(0);
         // above_nz：同 above_b（vec![0u32; mbw] 原语义）。
         if b.above_nz.capacity() < mbw {
             b.above_nz.reserve(mbw - b.above_nz.len());
         }
         // SAFETY：u32 无 Drop glue；fill 全覆盖。
-        unsafe { b.above_nz.set_len(mbw) };
+        raw::vec_set_len(&mut b.above_nz, mbw);
         b.above_nz.fill(0);
         // row_filters：长度就位即够（全写先于读证明，见 `decode_from_header`）。(u8,u8) 无
         // Drop glue，set_len 安全。
         if b.row_filters.capacity() < mbw * mbh {
             b.row_filters.reserve(mbw * mbh - b.row_filters.len());
         }
-        unsafe { b.row_filters.set_len(mbw * mbh) };
+        raw::vec_set_len(&mut b.row_filters, mbw * mbh);
         Vp8SubBuffersGuard { bufs: Some(b) }
     }
 

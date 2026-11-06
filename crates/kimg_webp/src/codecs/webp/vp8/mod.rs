@@ -103,6 +103,12 @@ mod vp8_tables {
 }
 
 use vp8_tables::*;
+// 树路由静态表 pub(crate) 再导出（供 `simd::raw::mbdec` 迁入的内核/宏经
+// `crate::codecs::webp::vp8::NAME` 按名引用；其余 vp8_tables 项仍由上方私有 glob 供给本子树）。
+pub(crate) use vp8_tables::{
+    BLOCK_MODE_TREE, KEYFRAME_BLOCK_MODE_PROBS, KEYFRAME_UV_MODE_PROBS, KEYFRAME_Y_MODE_PROBS,
+    KEYFRAME_Y_MODE_TREE, SEGMENT_ID_TREE, UV_MODE_TREE,
+};
 
 #[cfg(test)]
 #[path = "../../../../tests/fixtures/webp/mod.rs"]

@@ -30,6 +30,7 @@ pub(crate) mod lf_edge;
 pub(crate) mod loop_filter;
 pub(crate) mod predict;
 pub(crate) mod predictor;
+pub(crate) mod raw;
 pub(crate) mod upsample;
 pub(crate) mod yuv;
 #[cfg(test)]
@@ -40,7 +41,13 @@ mod tests_idct;
 pub(crate) use self::argb::*;
 pub(crate) use self::gating::*;
 pub(crate) use self::idct::*;
+// `lf_edge` 的 `lf_filter_macroblock` re-export 仅供对照/测试按名引用（生产已改经
+// `raw::lf_filter_macroblock_safe` 直连）→ 抑制 glob unused_imports（同下方 loop_filter 姿态）。
+#[allow(unused_imports)]
 pub(crate) use self::lf_edge::*;
+// 零符号丢失面：`loop_filter` 内核 re-export 仅供测试/对照按名引用（生产在 raw 内部直连），
+// 非 test 构建整体未按名引用 → 抑制 glob unused_imports。
+#[allow(unused_imports)]
 pub(crate) use self::loop_filter::*;
 pub(crate) use self::predict::*;
 pub use self::predictor::rgb8_to_rgba8;

@@ -92,7 +92,7 @@ pub fn probe_entropy_op_costs(reps: u32) -> (f64, f64, f64) {
     // 3) 去量化+zigzag 写回：乘 factor + ZIGZAG 索引 + s16 存储。
     let mut out = [0i16; 16];
     let mut pos = 0usize;
-    let mut signed = if (acc & 1) == 0 { 17i32 } else { -17i32 };
+    let signed = if (acc & 1) == 0 { 17i32 } else { -17i32 };
     let t = Instant::now();
     for _ in 0..reps {
         pos = (pos + 1) & 15;

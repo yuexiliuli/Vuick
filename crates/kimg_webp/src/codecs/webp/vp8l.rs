@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! VP8L 静态无损解码器（RFC 9649 §3.5-3.8；移植自 SimdCodecs `Vp8LDecoder.cs`，MIT；**标量正确版**）。
 //!
 //! 覆盖：VP8L 头（字节 0=0x2f + 位缓存维度）、熵编码（简单/普通前缀码 + Huffman 表构建：
@@ -13,6 +14,9 @@
 use std::fmt;
 
 use super::container::MAX_PIXELS;
+// 探针计数跨模块共用（stage_decode 重置/回读），仅 `stage_profile` feature 编译。
+#[cfg(feature = "stage_profile")]
+use super::simd::raw::vp8l::{SUBTABLE_HITS, SYMBOL_READS};
 
 // 外部语料定位助手（与集成测试共享，见 tests/fixtures/webp/mod.rs）。
 #[cfg(test)]
@@ -92,10 +96,9 @@ impl RgbaBytes {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         match &self.inner {
             RgbaBytesKind::U32(v) => {
-                // 只读按字节重借：u32 缓冲内均为合法位型，无写入别名，sound。
-                let ptr = v.as_ptr().cast::<u8>();
-                let len = v.len() * 4;
-                unsafe { std::slice::from_raw_parts(ptr, len) }
+                // 只读按字节重借（下沉 `simd::raw::u32_slice_as_bytes`）：u32 缓冲内均为合法位型，
+                // 无写入别名，sound。
+                super::simd::raw::u32_slice_as_bytes(v)
             }
             RgbaBytesKind::U8(v) => v.as_slice(),
         }
@@ -228,7 +231,7 @@ impl<'a> BitReader<'a> {
         if bits < 15 {
             self.refill(&mut buffer, &mut bits)?;
         }
-        let sym = read_symbol(table.as_ptr(), root_mask, &mut buffer, &mut bits);
+        let sym = read_symbol(table.as_ptr(), 0, root_mask, &mut buffer, &mut bits);
         self.buffer = buffer;
         self.bits = bits;
         Ok(sym)
@@ -239,9 +242,9 @@ impl<'a> BitReader<'a> {
     #[inline(always)]
     fn refill(&mut self, buffer: &mut u64, bits: &mut u32) -> Result<()> {
         if self.pos + 8 <= self.data.len() {
-            // 整 8 字节非对齐直读（区长度已保证读前 pos+8<=len，x86 LE 单条加载）。
-            let loaded =
-                unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
+            // 整 8 字节非对齐直读（区长度已保证读前 pos+8<=len，x86 LE 单条加载）；
+            // 裸读下沉 `simd::raw::read_u64_unaligned`（叶子安全门面，同不变量）。
+            let loaded = super::simd::raw::read_u64_unaligned(self.data, self.pos);
             *buffer |= loaded << *bits;
             let take = (63 - *bits) >> 3;
             self.pos += take as usize;
@@ -281,41 +284,24 @@ impl<'a> BitReader<'a> {
 // Huffman 符号解码（对齐 SimdCodecs，标量）
 // ---------------------------------------------------------------------------
 
-const ROOT_BITS: u32 = 8;
-const SUBTABLE_FLAG: u32 = 0x100;
+// 常数供建表层与 `simd::raw::vp8l::read_symbol` 共用（pub(crate)）。
+pub(crate) const ROOT_BITS: u32 = 8;
+pub(crate) const SUBTABLE_FLAG: u32 = 0x100;
 
-// 探针计数（仅 `stage_profile` feature；read_symbol 命中子表频率 → 量化「更大 root 主表」收益上限）。
-#[cfg(feature = "stage_profile")]
-thread_local! {
-    static SYMBOL_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static SUBTABLE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
+// 探针计数已随 read_symbol 下沉 `simd::raw::vp8l`（stage_decode 经 `use` 回读）。
 
-/// 解码一个符号（入口 ≥15 位缓冲）。根条目 = `(symbol<<16)|length` 或
-/// 二级表指针 `(start<<16)|SUBTABLE_FLAG|subBits`。
-/// 热路径用裸指针：`table` 指向 `tables.data + 通道偏移`，该区域长度在建表期已
-/// `ensure`（≥ 1<<ROOT_BITS + 二级表），索引恒在区域内（K42 上限在建表校验），
-/// parity 全量覆盖标量/向量一致性。
+/// 解码一个符号（入口 ≥15 位缓冲）。裸指针表区读取下沉 `simd::raw::vp8l::read_symbol`
+/// （本文件 forbid；热路径 + 探针计数见该叶子模块，`table` 为表池基址、`offset` 为通道偏移）——
+/// `BitReader::read_symbol` 与其共享。
 #[inline(always)]
-fn read_symbol(table: *const u32, root_mask: u32, buffer: &mut u64, bits: &mut u32) -> u32 {
-    unsafe {
-        #[cfg(feature = "stage_profile")]
-        SYMBOL_READS.with(|c| c.set(c.get() + 1));
-        let entry = *table.add((*buffer as u32 & root_mask) as usize);
-        let entry = if entry & SUBTABLE_FLAG != 0 {
-            #[cfg(feature = "stage_profile")]
-            SUBTABLE_HITS.with(|c| c.set(c.get() + 1));
-            let index =
-                (entry >> 16) + ((*buffer as u32 >> ROOT_BITS) & ((1 << (entry & 0xff)) - 1));
-            *table.add(index as usize)
-        } else {
-            entry
-        };
-        let length = entry & 0xff;
-        *buffer >>= length;
-        *bits -= length;
-        entry >> 16
-    }
+fn read_symbol(
+    table: *const u32,
+    offset: usize,
+    root_mask: u32,
+    buffer: &mut u64,
+    bits: &mut u32,
+) -> u32 {
+    super::simd::raw::vp8l::read_symbol(table, offset, root_mask, buffer, bits)
 }
 
 /// LZ77 长度/距离的前缀值（≤18 额外位）。
@@ -370,14 +356,9 @@ fn copy_backward(pixels: &mut [u32], position: usize, distance: usize, length: u
     debug_assert!(position + length <= pixels.len());
     let source = position - distance;
     if length <= 16 {
-        // 短距离去界查（前置不变式已穷尽入界）。前向逐写保持重叠语义。
-        let p = pixels.as_mut_ptr();
-        for i in 0..length {
-            unsafe {
-                let v = p.add(source + i).read();
-                p.add(position + i).write(v);
-            }
-        }
+        // 短距离去界查（前置不变式已穷尽入界）。前向逐写保持重叠语义；
+        // 裸指针读写下沉 `simd::raw::ptr_copy_forward`（同序逐元素，内联后同指令）。
+        super::simd::raw::ptr_copy_forward(pixels.as_mut_ptr(), source, position, length);
         return;
     }
     if distance >= length {
@@ -978,9 +959,11 @@ fn select_group(
     Ok(idx)
 }
 
-unsafe fn group_ref(groups: &[Option<HuffmanGroup>], idx: usize) -> &HuffmanGroup {
+fn group_ref(groups: &[Option<HuffmanGroup>], idx: usize) -> &HuffmanGroup {
     // 前置：select_group 只返回 `idx < len && groups[idx].is_some()` 的组。
-    unsafe { groups.get_unchecked(idx).as_ref().unwrap_unchecked() }
+    // 无检查引用取下沉 `simd::raw::option_slice_ref`（内联后同 get_unchecked+unwrap_unchecked
+    // 逐指令；组引用仅在块边界/拷贝后解析，非每像素热点）。
+    super::simd::raw::option_slice_ref(groups, idx)
 }
 
 /// 解码一个熵编码子图（宽高为编码尺寸）。
@@ -1148,7 +1131,7 @@ fn decode_pixels(
     let mut y = 0u32;
     let mut group_idx = select_group(groups, entropy, entropy_width, prefix_bits, 0, 0)?;
     // 块边界处解析一次组引用（select_group 已保证非 None）；组切换点同步刷新。
-    let mut g = unsafe { group_ref(groups, group_idx) };
+    let mut g = group_ref(groups, group_idx);
     // 表池基址提升（对齐 C# `ref uint tableBase`）：解码期不再增长，偏移恒有效。
     let tbl = tables.data.as_ptr();
 
@@ -1156,22 +1139,22 @@ fn decode_pixels(
         if bits < 32 {
             reader.refill(&mut buffer, &mut bits)?;
         }
-        let symbol = unsafe { read_symbol(tbl.add(g.green), g.green_mask, &mut buffer, &mut bits) };
+        let symbol = read_symbol(tbl, g.green, g.green_mask, &mut buffer, &mut bits);
         if symbol < 256 {
             let color;
             if g.trivial_literal {
                 color = g.literal | (symbol << 8);
             } else {
-                let red = unsafe { read_symbol(tbl.add(g.red), g.red_mask, &mut buffer, &mut bits) };
+                let red = read_symbol(tbl, g.red, g.red_mask, &mut buffer, &mut bits);
                 if bits < 32 {
                     reader.refill(&mut buffer, &mut bits)?;
                 }
-                let blue = unsafe { read_symbol(tbl.add(g.blue), g.blue_mask, &mut buffer, &mut bits) };
-                let alpha = unsafe { read_symbol(tbl.add(g.alpha), g.alpha_mask, &mut buffer, &mut bits) };
+                let blue = read_symbol(tbl, g.blue, g.blue_mask, &mut buffer, &mut bits);
+                let alpha = read_symbol(tbl, g.alpha, g.alpha_mask, &mut buffer, &mut bits);
                 color = (alpha << 24) | (red << 16) | (symbol << 8) | blue;
             }
-            // 写入在 `position < pixel_count` 循环前置下恒界内。
-            unsafe { *result.get_unchecked_mut(position) = color; }
+            // 写入在 `position < pixel_count` 循环前置下恒界内（无检查写下沉 leaf 门面）。
+            super::simd::raw::unchecked_write(result, position, color);
             position += 1;
             x += 1;
             if x == width {
@@ -1181,10 +1164,10 @@ fn decode_pixels(
                     break;
                 }
                 group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
-                g = unsafe { group_ref(groups, group_idx) };
+                g = group_ref(groups, group_idx);
             } else if (x & block_mask) == 0 {
                 group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
-                g = unsafe { group_ref(groups, group_idx) };
+                g = group_ref(groups, group_idx);
             }
             continue;
         }
@@ -1195,9 +1178,7 @@ fn decode_pixels(
             if bits < 32 {
                 reader.refill(&mut buffer, &mut bits)?;
             }
-            let distance_code = unsafe {
-                read_symbol(tbl.add(g.distance), g.distance_mask, &mut buffer, &mut bits)
-            };
+            let distance_code = read_symbol(tbl, g.distance, g.distance_mask, &mut buffer, &mut bits);
             if bits < 32 {
                 reader.refill(&mut buffer, &mut bits)?;
             }
@@ -1214,7 +1195,7 @@ fn decode_pixels(
                 y = (position / width as usize) as u32;
                 x = (position % width as usize) as u32;
                 group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
-                g = unsafe { group_ref(groups, group_idx) };
+                g = group_ref(groups, group_idx);
             }
             continue;
         }
@@ -1232,7 +1213,7 @@ fn decode_pixels(
             cache[hash as usize] = value;
         }
         cached = position;
-        unsafe { *result.get_unchecked_mut(position) = cache[(symbol - 280) as usize]; }
+        super::simd::raw::unchecked_write(result, position, cache[(symbol - 280) as usize]);
         #[cfg(feature = "stage_profile")]
         {
             if let Some(p) = profile.as_mut() {
@@ -1250,10 +1231,10 @@ fn decode_pixels(
                 break;
             }
             group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
-            g = unsafe { group_ref(groups, group_idx) };
+            g = group_ref(groups, group_idx);
         } else if (x & block_mask) == 0 {
             group_idx = select_group(groups, entropy, entropy_width, prefix_bits, x, y)?;
-            g = unsafe { group_ref(groups, group_idx) };
+            g = group_ref(groups, group_idx);
         }
     }
 
@@ -1331,7 +1312,8 @@ fn read_transform(reader: &mut BitReader<'_>, ty: u8, width: u32, height: u32) -
 /// 的唯一风险由 [`decode_image_into`] 的全覆写不变式排除。
 fn uninit_u32_vec(len: usize) -> Vec<u32> {
     let mut v = Vec::with_capacity(len);
-    unsafe { v.set_len(len) };
+    // set_len 下沉 `simd::raw::vec_set_len`（叶子安全门面；u32 无 Drop glue，不变量见上）。
+    super::simd::raw::vec_set_len(&mut v, len);
     v
 }
 
@@ -1452,11 +1434,10 @@ pub(crate) fn decode_into_rgba8(bitstream: &[u8], out: &mut [u8]) -> Result<()> 
     }
     if out.as_ptr() as usize % std::mem::align_of::<u32>() == 0 {
         // 把调用方缓冲重借为 `&mut [u32]`：熵解码/逆变换以 ARGB 直写其中（全覆写不变式见
-        // decode_image_into），再原地字节交换为 RGBA8。raw 派生重借（语义等同 bytemuck
-        // cast_slice_mut），重借存活期不触碰 `out`；缓冲由调用方持有，无 Drop 冲突。
-        let px = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u32>(), pixel_count)
-        };
+        // decode_image_into），再原地字节交换为 RGBA8。重借下沉 `simd::raw::bytes_as_mut_u32`
+        // （语义等同 bytemuck cast_slice_mut），重借存活期不触碰 `out`；缓冲由调用方持有、
+        // 无 Drop 冲突。调用点已保证 4 字节对齐与容量（out.len() == pixel_count*4）。
+        let px = super::simd::raw::bytes_as_mut_u32(out, pixel_count);
         let mut reader = BitReader::new(&bitstream[5..]);
         decode_image_into(&mut reader, width, height, px)?;
         super::simd::argb_to_rgba_inplace(px);
