@@ -7,6 +7,8 @@
 
 use std::io::{BufRead, Seek};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 use kimg_core::decoder::ImageDecoder;
 use kimg_core::error::{DecodingError, ImageError, ImageResult};
@@ -104,7 +106,100 @@ fn decode_tiles(data: &[u8], container: &container::HeifContainer<'_>) -> HeifRe
     Ok(tiles)
 }
 
-/// 解码 canvas 级 YUV 平面（transform 前；grid 合成后）。对应 C# `DecodeYuv`：每个 tile 的
+/// 并行解码 grid 的全部 tile，与 [`decode_tiles`] 逐字节恒等：
+/// - tiles<=1 直接落既有 [`decode_tiles`]（避免线程开销）；tiles>=2 用 `std::thread::scope`
+///   派有限 worker（`available_parallelism`，且不超过 tile 数），`AtomicUsize` 索引轮转 +
+///   `mpsc` 回传 `(idx, HeifResult<TileYuv>)`，主线程按 index 归位。
+/// - 线程安全：`HevcFrameDecoder` 每 tile 独立 new、字段全 owned（无 Rc/RefCell/static）；
+///   `Rc<Config>` 本身非 Send，不送进线程——串行预 resolve 全部 payload、预把 `tile_configs`
+///   逐 `&**rc` deref 成 `Vec<&HevcDecoderConfiguration>`，workers 只捕获借用。
+/// - 错误语义与串行一致：先串行预检 payload 长度（防分配前越界），解码后按 index 顺序
+///   返回第一个 Err；worker 解码失败不 panic、经 Result 回传。
+/// - 内存增量：串行预 resolve 全量 payload 驻留（累计 ≈ 输入文件大小）+ `results`
+///   全量 tile 平面驻留（各 tile 解码完即归位，过程占用与串行等价，平面总和 ==
+///   画布平面 + grid 边缘 padding）——超大 grid（如 192-tile）相对输出画布量级增量有界。
+/// - 错误优先级微差（已接受，有效 grid 不可观测）：病态输入下 payload 长度预检发生在
+///   任何解码之前，并行路径可能先报**后 tile** 的长度/解析错，而串行先报**前 tile** 的
+///   解码错；两者都只回传一个 Err，正常输入两者一致。
+fn decode_tiles_par(
+    data: &[u8],
+    container: &container::HeifContainer<'_>,
+) -> HeifResult<Vec<canvas::TileYuv>> {
+    if container.tiles.is_empty() {
+        return Err(HeifError::invalid("容器没有可解码的图像 item。"));
+    }
+    let n = container.tiles.len();
+    if n <= 1 {
+        return decode_tiles(data, container);
+    }
+    // 串行预 resolve 全部 payload（含与串行 :83-86 同款长度预检，防分配前越界）。
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let item = &container.items.items[container.tiles[i]];
+        let length = isobmff::item_container::ItemContainer::get_item_length(item);
+        if length < 0 || length > data.len() as i64 {
+            return Err(HeifError::invalid("图像 item 大于文件。"));
+        }
+        let mut payload = vec![0u8; length as usize];
+        stage_clock::parse(|| container.items.resolve(item, &mut payload))?;
+        payloads.push(payload);
+    }
+    // `Rc<Config>` 非 Send，deref 成 `&Config`（Send+Sync）交给 worker 共享。
+    let configs: Vec<&hevc::HevcDecoderConfiguration> =
+        container.tile_configs.iter().map(|rc| &**rc).collect();
+
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel::<(usize, HeifResult<canvas::TileYuv>)>();
+    let worker_count = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n);
+    let mut results: Vec<Option<HeifResult<canvas::TileYuv>>> = Vec::with_capacity(n);
+    results.resize_with(n, || None);
+
+    // 共享借用进 scope（& 是 Copy，每个 worker 复制一份；scope 保证全部 join 后才返回）。
+    let next_ref = &next;
+    let configs_ref = &configs;
+    let payloads_ref = &payloads;
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            scope.spawn(move || loop {
+                let i = next_ref.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let tile = hevc::decode_item_flags(configs_ref[i], &payloads_ref[i], false, false)
+                    .map(|pic| canvas::TileYuv {
+                        y: pic.planes[0].clone(),
+                        cb: pic.planes[1].clone(),
+                        cr: pic.planes[2].clone(),
+                        y_w: pic.width,
+                        y_h: pic.height,
+                        c_w: pic.chroma_width,
+                        c_h: pic.chroma_height,
+                        crop_left: pic.crop_left,
+                        crop_right: pic.crop_right,
+                        crop_top: pic.crop_top,
+                        crop_bottom: pic.crop_bottom,
+                    });
+                let _ = tx.send((i, tile));
+            });
+        }
+        drop(tx);
+        // 收到全部回传：所有 sender 在 worker 收工后 drop，rx 迭代自然结束。
+        for (i, tile) in rx.iter() {
+            results[i] = Some(tile);
+        }
+    });
+
+    // 按 index 顺序返回第一个 Err（与串行一致）。
+    let mut tiles = Vec::with_capacity(n);
+    for r in results {
+        tiles.push(r.unwrap()?);
+    }
+    Ok(tiles)
+}
 /// conformance window 输出按 grid 位置贴到画布并裁剪到 grid 输出尺寸。transform 属相（clap/irot/
 /// imir）不影响此步——它退回**变换前画布**（IMG_* 竖图返回横向画布，与 C# oracle `<md5>.yuv`
 /// 逐字节一致，供 oracle 对照）。
@@ -135,7 +230,35 @@ pub fn decode_yuv(data: &[u8]) -> HeifResult<YuvPlanes> {
     })
 }
 
-/// 解码一张**单 tile** HEIC 图画为 4:2:0 YUV 平面（含 in-loop 滤波后的重建平面）。
+/// 与 [`decode_yuv`] 语义相同的并行 tile 解码版本（逐行对照 :111-136）：唯一差别是 tile 解码
+/// 走 [`decode_tiles_par`]（tiles>=2 并行、tiles<=1 自然落串行），grid 合成/返回口径完全相同。
+/// 供产品主通道 [`decode_rgba`] 与「串≡并」parity 测试使用。
+pub fn decode_yuv_par(data: &[u8]) -> HeifResult<YuvPlanes> {
+    let container = container::HeifContainer::parse(data)?;
+    if container.tiles.is_empty() {
+        return Err(HeifError::invalid("容器没有可解码的图像 item。"));
+    }
+    let sps = container.tile_configs[0].parse_sps()?;
+    if sps.bit_depth_y != sps.bit_depth_c {
+        return Err(HeifError::invalid("亮度与色度位深不同不受支持。"));
+    }
+    let tiles = decode_tiles_par(data, &container)?;
+    let composed = canvas::compose_grid(
+        &tiles,
+        container.grid_columns,
+        container.grid_rows,
+        container.canvas_width,
+        container.canvas_height,
+    )?;
+    Ok(YuvPlanes {
+        y: composed.y,
+        cb: composed.cb,
+        cr: composed.cr,
+        width: composed.width,
+        height: composed.height,
+        bit_depth: sps.bit_depth_y,
+    })
+}
 /// grid 图像（多 tile）不支持，返回错误。供单 tile oracle 对照与新解码调试使用。
 pub fn decode_yuv_bytes(data: &[u8]) -> HeifResult<YuvPlanes> {
     let container = container::HeifContainer::parse(data)?;
@@ -200,7 +323,7 @@ pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)
             destination.len()
         )));
     }
-    let tiles = decode_tiles(data, &container)?;
+    let tiles = decode_tiles_par(data, &container)?;
     let composed = stage_clock::grid(|| {
         canvas::compose_grid(&tiles, container.grid_columns, container.grid_rows, cw, ch)
     })?;
