@@ -3,6 +3,8 @@
 //! 像素计算逐行对齐 C# 标量内核：整数运算、16.16 固定系数（`round(value·2^16)`）、`+2^15 >> 16`
 //! 舍入、`[0,255]` / `[0,65535]` 裁剪。ICC 不处理（直通/忽略）。
 
+#![forbid(unsafe_code)]
+
 use crate::codecs::heif::error::{HeifError, HeifResult};
 
 /// 固定点系数（对应 C# `HeifColor.Coefficients`）。
@@ -127,6 +129,9 @@ fn fixed(value: f64) -> i32 {
 
 /// 8 位转换的一行（C# `HeifColor.ToRgba420RowScalar`）：Y[x] 取色度 cb/cr[x/2]（4:2:0 最近邻复制），
 /// 每像素写 R G B A 4 字节。`out` 至少 `width*4`。
+///
+/// 标量定义（向量核的兜底/对照，且承担 identity 与 `width<8`、AVX2 缺失时的全部行处理）：
+/// 从像素 0 开始处理整行；行内分派（向量车身+标量补尾）见 [`to_rgba_420_row`]。
 pub(crate) fn to_rgba_420_row_scalar(
     y: &[u16],
     cb: &[u16],
@@ -135,12 +140,59 @@ pub(crate) fn to_rgba_420_row_scalar(
     width: usize,
     k: &Coefficients,
 ) {
+    to_rgba_420_row_scalar_from(y, cb, cr, out, 0, width, k);
+}
+
+/// 整行分派：AVX2 且 `width>=8` 且非 identity → 8-lane 向量核（`color_simd::to_rgba_420_row_avx2`）
+/// 处理前 `floor(width/8)*8` 像素，尾段（`width%8`）回标量；其余情形（identity / `width<8` /
+/// 无 AVX2）整行走标量。输出与 [`to_rgba_420_row_scalar`] 逐位一致。
+pub(crate) fn to_rgba_420_row(
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
+    out: &mut [u8],
+    width: usize,
+    k: &Coefficients,
+) {
+    #[cfg(target_arch = "x86_64")]
+    let done = {
+        if width >= 8 && !k.identity && std::is_x86_feature_detected!("avx2") {
+            // color_simd::to_rgba_420_row_avx2 是安全包装（仿 hevc/transform_simd::inverse_add_avx2
+            // 先例：内部自证缓冲前置再把 unsafe 内核封在 unsafe{} 内），调用方无需 unsafe；AVX2
+            // 已在此运行时检出（叶子隔离，见 color_simd 模块文档）。
+            super::color_simd::to_rgba_420_row_avx2(y, cb, cr, out, width, k)
+        } else {
+            0
+        }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let done = 0;
+    if done == 0 {
+        // 全程标量（identity / width<8 / 无 AVX2）：整行走规范标量行内核，保持单一标量定义。
+        to_rgba_420_row_scalar(y, cb, cr, out, width, k);
+    } else {
+        // 向量核处理前 done 像素后，尾段（width-done）回标量补全。
+        to_rgba_420_row_scalar_from(y, cb, cr, out, done, width, k);
+    }
+}
+
+/// 标量行内核从像素 `start` 写到 `width`（向量核车身之后的分派点），像素 `x` 的色度取
+/// `cb/cr[x>>1]`、亮度取 `y[x]`，与 [`to_rgba_420_row_scalar`] 在 `start==0` 时逐位一致。
+fn to_rgba_420_row_scalar_from(
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
+    out: &mut [u8],
+    start: usize,
+    width: usize,
+    k: &Coefficients,
+) {
     let chroma = (width + 1) >> 1;
     debug_assert!(
         y.len() >= width && cb.len() >= chroma && cr.len() >= chroma && out.len() >= width * 4,
         "colour row 不匹配其缓冲。"
     );
-    for x in 0..width {
+    for x in start..width {
         let luma = i32::from(y[x]).wrapping_sub(k.y_offset);
         let u = i32::from(cb[x >> 1]).wrapping_sub(k.c_offset);
         let v = i32::from(cr[x >> 1]).wrapping_sub(k.c_offset);
@@ -225,7 +277,8 @@ pub(crate) fn to_gray_row(y: &[u16], out: &mut [u8], width: usize, k: &Coefficie
 }
 
 /// 整图 Y′CbCr → RGBA8（`yuv_to_rgba`）：`width×height` 亮度平面 + 4:2:0 色度平面
-/// （行主序、无跨步），逐行走 [`to_rgba_420_row_scalar`]，输出 `width*height*4` 字节（R G B A）。
+/// （行主序、无跨步），逐行走 [`to_rgba_420_row`]（内部 AVX2/标量分派），输出
+/// `width*height*4` 字节（R G B A）。
 /// 参数照 C# `HeifColor.For(matrix_coefficients, full_range, bit_depth)`；位深 8/10 直接映射到 8 位输出。
 pub fn yuv_to_rgba(
     y: &[u16],
@@ -251,7 +304,7 @@ pub fn yuv_to_rgba(
     let mut out = vec![0u8; width * height * 4];
     for row in 0..height {
         let c_off = (row >> 1) * cw;
-        to_rgba_420_row_scalar(
+        to_rgba_420_row(
             &y[row * width..(row + 1) * width],
             &cb[c_off..c_off + cw],
             &cr[c_off..c_off + cw],
@@ -372,5 +425,138 @@ mod tests {
     fn yuv_to_rgba_dim_check() {
         assert!(yuv_to_rgba(&[0u16; 4], &[0; 1], &[0; 1], 2, 2, 8, 2, false).is_ok());
         assert!(yuv_to_rgba(&[0u16; 3], &[0; 1], &[0; 1], 2, 2, 8, 2, false).is_err());
+    }
+
+    /// xorshift64* 确定性 PRNG（跨平台稳定，无 rand 依赖）。
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    fn rand_vec(rng: &mut Rng, len: usize, max: u16) -> Vec<u16> {
+        (0..len)
+            .map(|_| (rng.next() % (max as u64 + 1)) as u16)
+            .collect()
+    }
+
+    /// 找出两行输出第一个不同像素的 (x, ch)（RGBA 首差定位）。
+    fn first_diff(a: &[u8], b: &[u8], width: usize) -> Option<(usize, usize)> {
+        assert_eq!(a.len(), b.len(), "输出段长度不一致");
+        for x in 0..width {
+            for ch in 0..4 {
+                if a[x * 4 + ch] != b[x * 4 + ch] {
+                    return Some((x, ch));
+                }
+            }
+        }
+        None
+    }
+
+    /// 整行分派（向量车身 + 标量补尾）≡ 整行标量：随机 Y/Cb/Cr × 矩阵 {601,709,2020} ×
+    /// full_range {true,false} × 位深 {8,10} × 宽 {8,9,17,31,32,64}（覆盖尾段与 8 对齐）。
+    #[test]
+    fn to_rgba_420_row_dispatch_matches_scalar_randomised() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP: 无 AVX2，分派退化为标量，无向量路径可对拍");
+            return;
+        }
+        let mut rng = Rng(0xA5A5_5A5A_F00F_FACE);
+        let mut tried = 0usize;
+        for &bd in &[8u8, 10u8] {
+            for &matrix in &[2, 1, 9] {
+                // matrix 2 = BT.601（unspecified），1 = BT.709，9 = BT.2020。
+                for &full in &[false, true] {
+                    for &width in &[8usize, 9, 17, 31, 32, 64] {
+                        let k = Coefficients::for_matrix(matrix, full, bd as i32);
+                        let chroma = (width + 1) >> 1;
+                        let max_sample = if bd == 10 { 1023u16 } else { 255u16 };
+                        let y = rand_vec(&mut rng, width, max_sample);
+                        let cb = rand_vec(&mut rng, chroma, max_sample);
+                        let cr = rand_vec(&mut rng, chroma, max_sample);
+                        let mut ref_out = vec![0u8; width * 4];
+                        to_rgba_420_row_scalar(&y, &cb, &cr, &mut ref_out, width, &k);
+                        let mut dispatch_out = vec![0u8; width * 4];
+                        to_rgba_420_row(&y, &cb, &cr, &mut dispatch_out, width, &k);
+                        if let Some((x, ch)) = first_diff(&ref_out, &dispatch_out, width) {
+                            panic!(
+                                "分派≠标量 @ (x={x}, ch={ch}) matrix={matrix} full={full} bd={bd} \
+                                 width={width}: 标量={} 分派={}",
+                                ref_out[x * 4 + ch],
+                                dispatch_out[x * 4 + ch]
+                            );
+                        }
+                        tried += 1;
+                    }
+                }
+            }
+        }
+        assert!(tried > 0, "分派随机对拍未执行任何一轮");
+    }
+
+    /// identity 矩阵：分派必须仍走标量（不走向量核），与整行标量逐字节相等。
+    #[test]
+    fn to_rgba_420_row_identity_stays_scalar() {
+        let mut rng = Rng(0xDEAD_BEEF_3133_7F00);
+        for &bd in &[8u8, 10u8] {
+            for &full in &[false, true] {
+                for &width in &[8usize, 32, 33] {
+                    let k = Coefficients::for_matrix(0, full, bd as i32);
+                    assert!(k.identity);
+                    let chroma = (width + 1) >> 1;
+                    let max_sample = if bd == 10 { 1023u16 } else { 255u16 };
+                    let y = rand_vec(&mut rng, width, max_sample);
+                    let cb = rand_vec(&mut rng, chroma, max_sample);
+                    let cr = rand_vec(&mut rng, chroma, max_sample);
+                    let mut ref_out = vec![0u8; width * 4];
+                    to_rgba_420_row_scalar(&y, &cb, &cr, &mut ref_out, width, &k);
+                    let mut out = vec![0u8; width * 4];
+                    to_rgba_420_row(&y, &cb, &cr, &mut out, width, &k);
+                    assert_eq!(
+                        out, ref_out,
+                        "identity 分派应恒走标量（bd={bd} full={full} width={width}）"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 整图层级：随机多行（奇数行带宽/高）yuv_to_rgba 经分派后与单行标量拼接逐字节相等。
+    #[test]
+    fn yuv_to_rgba_dispatch_matches_scalar_full() {
+        let mut rng = Rng(0x0DDB_A11_CAFE_F00D);
+        for &(w, h) in &[(8usize, 2usize), (9, 1), (17, 3), (31, 2), (32, 3), (64, 2)] {
+            for &(bd, matrix, full) in &[(8u8, 2, false), (10, 1, true), (8, 9, true)] {
+                let cw = (w + 1) >> 1;
+                let ch = (h + 1) >> 1;
+                let max_sample = if bd == 10 { 1023u16 } else { 255u16 };
+                let y: Vec<u16> = rand_vec(&mut rng, w * h, max_sample);
+                let cb: Vec<u16> = rand_vec(&mut rng, cw * ch, max_sample);
+                let cr: Vec<u16> = rand_vec(&mut rng, cw * ch, max_sample);
+                let k = Coefficients::for_matrix(matrix, full, bd as i32);
+                // 期望：逐行标量拼接。
+                let mut expected = vec![0u8; w * h * 4];
+                for row in 0..h {
+                    let c_off = (row >> 1) * cw;
+                    to_rgba_420_row_scalar(
+                        &y[row * w..(row + 1) * w],
+                        &cb[c_off..c_off + cw],
+                        &cr[c_off..c_off + cw],
+                        &mut expected[row * w * 4..(row + 1) * w * 4],
+                        w,
+                        &k,
+                    );
+                }
+                let got =
+                    yuv_to_rgba(&y, &cb, &cr, w, h, bd, matrix, full).expect("yuv_to_rgba");
+                assert_eq!(got, expected, "整图分派≠逐行标量 (w={w} h={h} bd={bd} m={matrix} full={full})");
+            }
+        }
     }
 }

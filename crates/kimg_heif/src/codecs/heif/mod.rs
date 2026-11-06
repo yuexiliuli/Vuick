@@ -17,6 +17,8 @@ use kimg_core::ColorType;
 
 pub mod canvas;
 pub mod color;
+// 色彩转换 AVX2 内核叶子（`#![allow(unsafe_code)]`；color.rs 运行时检出后分派到本模块）。
+pub(super) mod color_simd;
 pub mod container;
 pub mod error;
 pub mod hevc;
