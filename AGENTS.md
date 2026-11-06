@@ -331,6 +331,8 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 - 事件互斥：gpui 鼠标事件沿命中栈冒泡 → 需互斥（双击全屏 vs 控制条）时在专属层 `stop_propagation`（`click_count>=2` 拦、单击放行）（K15）。
 - 窗口上下文资源释放：`App::drop_image(_, None)` 在窗口回调内漏当前窗口 → `cx.defer` 延到本拍更新末尾（K14）。
 - 中文源码改动：只用 read/edit/write 写文件；bash 回显中文乱码改 read UTF-8 读（K16）。
+- unsafe 叶子隔离架构（kimg_webp）：`target_feature` SIMD 内核/裸指针位读一律进 `codecs/webp/simd/raw/`（唯一 `#![allow(unsafe_code)]` 叶子）；其余生产模块 `#![forbid(unsafe_code)]`——新增 unsafe 代码在 forbid 模块**直接编译失败**，勿绕过、勿删 forbid、勿在 raw 外写裸 unsafe。
+- WebP 性能复现套餐：`Benchmarks/`（独立 workspace `webp_compare/`，path 依赖 crates/kimg + 自带语料 + `corpus/csharp` 2 列 current 表 + libwebp DLL + `compare_refs.py` + 脚本；bootstrap 源参数/env 驱动，禁写死路径）。单线程：`pwsh -File Benchmarks\scripts\run_single_thread.ps1` → `== static-lossy: matched=53` + `geomean kimg/C#`；MT 用 `run_mt.ps1`。对账契约：探针输出行前缀 `KIMG_WEBP_VS_DLL`、C# 表为 `| \`名\` | current_ms |`、日志必须 UTF-8（脚本已处理，勿改用非 UTF-8 捕获方式）。
 
 **本仓封存决议（性能负收益，勿重试）**：
 - 环路滤波 SIMD（WebP VP8：三轮 16-lane/旧式/Load16x4 全负收益）→ 别做，带宽/分支开销反超标量 `if>edge` 早退，胜者是标量。
@@ -350,6 +352,8 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | 功能交付 / 交互语义 / 运行时冒烟 | `feature-delivery` | 语义确认表、brief 模板、双评审、探针用法；`.kilo/skill/` |
 | 真机打开资产 + 滚动 / 截图取证 | `gpui-open-scroll` | 打开文档滚动前后截图 + stderr 取证 + Windows 三坑规避 |
 | 性能调研 / 参照优先分账 | 复用「单文件探针 + 同窗交错 A/B + 参照侧 ablation」三件套（K96/K101） | 首建即复用；新线先判断跑分工具已存在，勿重建 |
+| PowerShell 脚本 / 原生命令报错 | `powershell-traps` | `.kilo/skill/`：一律 pwsh（`powershell`=5.1 写 UTF-16/噪音多）；`2>&1` 噪音先 `"$_"` 摊平；Tee 日志重写 UTF-8；双引号反引号 ` `` ` 才是字面量；无 heredoc；退出码只看 `$LASTEXITCODE` |
+| WebP 单线程/MT 性能对账 | 复用 `Benchmarks/` 套件（勿重建探针） | `pwsh -File Benchmarks\scripts\{bootstrap,run_single_thread,run_mt}.ps1`；语料/参照表/DLL 各机用参数/env 注入；对账契约见 §7 |
 
 ### 8.2 CRG 工具链（调用姿势 `[待迁移至 skill: code-review-graph]`）
 
