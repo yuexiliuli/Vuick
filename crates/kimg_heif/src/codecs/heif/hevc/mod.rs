@@ -15,6 +15,8 @@ pub mod picture;
 pub mod sao;
 pub mod slice_header;
 pub mod transform;
+// 逆变换 SIMD 内核叶子（`#![allow(unsafe_code)]`；transform.rs 分派到本模块）。hevc 内部可见。
+pub(super) mod transform_simd;
 
 pub use bit_reader::HevcBitReader;
 pub use nal::Nal;

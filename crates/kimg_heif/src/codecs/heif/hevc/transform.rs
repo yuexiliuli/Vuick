@@ -9,6 +9,9 @@
 //! 垂直遍利用 DCT 基的对称性 `transMatrix[j][N−1−y] = (−1)^j·transMatrix[j][y]`：
 //! 偶/奇 j 的部分和 E/O 给出输出 y 为 E + O、输出 N−1−y 为 E − O。
 
+// 叶子隔离：unsafe SIMD 内核只许在 `transform_simd`（`#![allow(unsafe_code)]`）内，本模块禁止。
+#![forbid(unsafe_code)]
+
 use std::sync::LazyLock;
 
 use crate::codecs::heif::error::{HeifError, HeifResult};
@@ -136,7 +139,8 @@ impl HevcTransform {
         Ok(&DCT_N[log2_size - 2])
     }
 
-    /// 反变换被 `HevcTransform::inverse_add` 调度的统一入口；本实现固定走标量路径（与 C# 分层逐字节一致）。
+    /// 反变换分派入口：AVX2（n≥8）8-lane → SSE4.1 4-lane（含 DST 4 点）→ 标量兜底。
+    /// 三层与 C# 逐字节一致；SIMD 内核在 `transform_simd`（叶子隔离），标量路径原样保留。
     #[allow(clippy::too_many_arguments)]
     pub fn inverse_add(
         coeffs: &[i32],
@@ -149,9 +153,45 @@ impl HevcTransform {
         dst: &mut [u16],
         stride: i32,
     ) -> HeifResult<()> {
-        Self::inverse_add_scalar(
-            coeffs, scratch, log2_size, dst4, max_x, max_y, bit_depth, dst, stride,
-        )
+        if !(2..=5).contains(&log2_size) || !(8..=16).contains(&bit_depth) {
+            return Err(HeifError::invalid("变换尺寸或位深越界。"));
+        }
+        let n = 1usize << log2_size;
+        // DST 仅 4 点（4×4）。防未来调用方误传 dst4=true & n≥8 让 SIMD DST 内核拿 DST_N（4 点基阵）
+        // 按大步长/大块遍历越界（OOB/UB）。
+        if dst4 && n != 4 {
+            return Err(HeifError::invalid("DST 变换仅支持 4 点（dst4 要求 n==4）。"));
+        }
+        let max_x_u = usize::try_from(max_x).map_err(|_| HeifError::invalid("maxX 越界。"))?;
+        let max_y_u = usize::try_from(max_y).map_err(|_| HeifError::invalid("maxY 越界。"))?;
+        #[cfg(target_arch = "x86_64")]
+        // avx2 内核还用 `_mm_cvtepu16_epi32`/`_mm_packus_epi32`/`_mm_mullo_epi32` 等 SSE4.1 指令；
+        // 真实 AVX2 CPU 均含 SSE4.1，此处显式并查只为意图清晰（无 SSE4.1 则回落 sse41/标量路径）。
+        if n >= 8
+            && std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("sse4.1")
+        {
+            let m: &[i32] = if dst4 {
+                &DST_N
+            } else {
+                HevcTransform::dct_n(log2_size as usize)?
+            };
+            return super::transform_simd::inverse_add_avx2(
+                n, m, coeffs, scratch, max_x_u, max_y_u, bit_depth, dst, stride as usize,
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("sse4.1") {
+            let m: &[i32] = if dst4 {
+                &DST_N
+            } else {
+                HevcTransform::dct_n(log2_size as usize)?
+            };
+            return super::transform_simd::inverse_add_sse41(
+                n, m, dst4, coeffs, scratch, max_x_u, max_y_u, bit_depth, dst, stride as usize,
+            );
+        }
+        Self::inverse_add_impl(coeffs, scratch, log2_size, dst4, max_x, max_y, bit_depth, dst, stride)
     }
 
     /// 反变换的标量定义：与向量分层一样的遍与捷径，一次一个采样。
@@ -159,6 +199,22 @@ impl HevcTransform {
     /// 并把残差加进 `dst`（行距 `stride`）里的预测，截到采样范围。`scratch` 存中间 N×N 块。
     #[allow(clippy::too_many_arguments)]
     pub fn inverse_add_scalar(
+        coeffs: &[i32],
+        scratch: &mut [i32],
+        log2_size: i32,
+        dst4: bool,
+        max_x: i32,
+        max_y: i32,
+        bit_depth: i32,
+        dst: &mut [u16],
+        stride: i32,
+    ) -> HeifResult<()> {
+        Self::inverse_add_impl(coeffs, scratch, log2_size, dst4, max_x, max_y, bit_depth, dst, stride)
+    }
+
+    /// 标量反变换的实现体（校验 + 垂直/水平两遍）。`inverse_add_scalar` 与 `inverse_add` 兜底共用。
+    #[allow(clippy::too_many_arguments)]
+    fn inverse_add_impl(
         coeffs: &[i32],
         scratch: &mut [i32],
         log2_size: i32,
