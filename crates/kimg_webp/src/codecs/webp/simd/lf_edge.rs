@@ -14,19 +14,19 @@ use std::arch::x86_64::*;
 /// 读一条 16-lane 色度行（低 8 = U、高 8 = V，同偏移行各 8 字节）—— C# `LoadPair` 同款。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn lf_uv_pair_row(u: *const u8, v: *const u8, off: isize) -> __m128i {
+unsafe fn lf_uv_pair_row(u: *const u8, v: *const u8, off: isize) -> __m128i { unsafe {
     let ul = _mm_loadl_epi64(u.offset(off) as *const __m128i);
     let vl = _mm_loadl_epi64(v.offset(off) as *const __m128i);
     _mm_unpacklo_epi64(ul, vl)
-}
+}}
 
 /// 写回一条 16-lane 色度行（低 8 → U、高 8 → V）—— C# `StorePair` 同款。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn lf_uv_pair_store(u: *mut u8, v: *mut u8, off: isize, val: __m128i) {
+unsafe fn lf_uv_pair_store(u: *mut u8, v: *mut u8, off: isize, val: __m128i) { unsafe {
     _mm_storel_epi64(u.offset(off) as *mut __m128i, val);
     _mm_storel_epi64(v.offset(off) as *mut __m128i, _mm_srli_si128(val, 8));
-}
+}}
 
 /// 竖直色度边（U/V 打包，8+8=16 lane）：`u`/`v` 指向 q0 列（行 uv_row、列 uvx），每侧 8 行 8 列
 /// 经 Load16x8/Store16x8 转置成 8 列、每列 16 lane（低 8 = U 行、高 8 = V 行）一次滤完 ——
@@ -43,46 +43,44 @@ unsafe fn lf_edge_v8_pair(
     hev: i32,
     macroblock_edge: bool,
     simple: bool,
-) {
+) { unsafe {
     let ul = u.offset(-4);
     let vl = v.offset(-4);
     let mut c = load16x8(ul, stride, vl, stride);
-    unsafe {
-        if simple {
-            let (p0n, q0n) = lf_do_filter2(c[2], c[3], c[4], c[5], edge);
+    if simple {
+        let (p0n, q0n) = lf_do_filter2(c[2], c[3], c[4], c[5], edge);
+        c[3] = p0n;
+        c[4] = q0n;
+    } else {
+        let mx = lf_max_diff(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+        let mask = lf_mask_composite(
+            lf_needs_filter(_mm_set1_epi8(-1), c[2], c[3], c[4], c[5], edge),
+            mx,
+            interior,
+        );
+        // 全零 mask：任何 lane 都无需改（输出==输入），跳过 store（c 原值不变则存回既存既等）。
+        if _mm_movemask_epi8(mask) == 0 {
+            return;
+        }
+        if macroblock_edge {
+            let (p2n, p1n, p0n, q0n, q1n, q2n) =
+                lf_do_filter6(c[1], c[2], c[3], c[4], c[5], c[6], mask, hev);
+            c[1] = p2n;
+            c[2] = p1n;
             c[3] = p0n;
             c[4] = q0n;
+            c[5] = q1n;
+            c[6] = q2n;
         } else {
-            let mx = lf_max_diff(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
-            let mask = lf_mask_composite(
-                lf_needs_filter(_mm_set1_epi8(-1), c[2], c[3], c[4], c[5], edge),
-                mx,
-                interior,
-            );
-            // 全零 mask：任何 lane 都无需改（输出==输入），跳过 store（c 原值不变则存回既存既等）。
-            if _mm_movemask_epi8(mask) == 0 {
-                return;
-            }
-            if macroblock_edge {
-                let (p2n, p1n, p0n, q0n, q1n, q2n) =
-                    lf_do_filter6(c[1], c[2], c[3], c[4], c[5], c[6], mask, hev);
-                c[1] = p2n;
-                c[2] = p1n;
-                c[3] = p0n;
-                c[4] = q0n;
-                c[5] = q1n;
-                c[6] = q2n;
-            } else {
-                let (p1n, p0n, q0n, q1n) = lf_do_filter4(c[2], c[3], c[4], c[5], mask, hev);
-                c[2] = p1n;
-                c[3] = p0n;
-                c[4] = q0n;
-                c[5] = q1n;
-            }
+            let (p1n, p0n, q0n, q1n) = lf_do_filter4(c[2], c[3], c[4], c[5], mask, hev);
+            c[2] = p1n;
+            c[3] = p0n;
+            c[4] = q0n;
+            c[5] = q1n;
         }
     }
     store16x8(ul, stride, vl, stride, c);
-}
+}}
 
 /// 水平色度边（U/V 打包）：`u`/`v` 指向 q0 行（行 uv_row±k、列 uvx），同偏移行各 8 字节拼一个
 /// 16-lane 向量一次滤完 —— C# `ChromaHorizontal` 同款 LoadPair/StorePair。
@@ -170,7 +168,7 @@ pub(crate) unsafe fn lf_filter_macroblock(
     edge_limit: i32,
     sub_limit: i32,
     hev: i32,
-) {
+) { unsafe {
     // 竖直段：左 MB 边 → 内竖×3（与标量同序：后边读前边已滤像素）。
     if left {
         lf_edge_v16(yc.offset(-4), y_pitch, interior, edge_limit, hev, true, simple);
@@ -210,7 +208,7 @@ pub(crate) unsafe fn lf_filter_macroblock(
             );
         }
     }
-}
+}}
 
 
 

@@ -9,6 +9,8 @@ use std::arch::x86_64::*;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+// 休眠：D2v1 弃旧 16×8 全转置慢实现集群（filter_lanes/filter_edge_sse2 同宗），仅测试/探针用。
+#[cfg_attr(not(test), allow(dead_code))]
 enum FilterKind {
     Simple,
     Inner,
@@ -60,7 +62,9 @@ macro_rules! shr8u {
 }
 
 /// `|a-b|`（u8 饱和差 + OR）。
+/// 休眠：D2v1 弃旧 16×8 全转置慢实现集群，仅测试/探针用。
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn abs_diff_u8(a: __m128i, b: __m128i) -> __m128i {
     _mm_or_si128(_mm_subs_epu8(a, b), _mm_subs_epu8(b, a))
@@ -81,7 +85,9 @@ unsafe fn shift_right1(v: __m128i, e80: __m128i) -> __m128i {
 }
 
 /// 边缘掩码：`2|p0-q0|+|p1-q1|/2 <= edge`（饱和和即便越 255 也恒大于 edge 阈值，见 C# 注释）。
+/// 休眠：D2v1 弃旧 16×8 全转置慢实现集群，仅测试/探针用。
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn edge_mask(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, edge: i32) -> __m128i {
     let zero = _mm_setzero_si128();
@@ -93,7 +99,9 @@ unsafe fn edge_mask(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, edge: i3
 
 /// common_adjust：`a=clamp(outer+3*delta)`（饱和三次），`qa=(a+4)>>3`、`pa=(a+3)>>3`
 /// （先钳后移），只更新 `amask` 覆盖的 lane，返回 (p0, q0, qAdjust)。
+/// 休眠：D2v1 弃旧 16×8 全转置慢实现集群，仅测试/探针用。
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn common_adjust(
     outer: __m128i,
@@ -115,7 +123,9 @@ unsafe fn common_adjust(
 }
 
 /// 宏块权重 `(w*27/18/9 + 63) >> 7`（w 有符号字节 → i16 符号扩展计算 → 饱和折回）。
+/// 休眠：D2v1 弃旧 16×8 全转置慢实现集群，仅测试/探针用。
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn tap_weights(w: __m128i) -> (__m128i, __m128i, __m128i) {
     let wlo = _mm_srai_epi16(_mm_unpacklo_epi8(w, w), 8);
@@ -140,7 +150,9 @@ unsafe fn tap_weights(w: __m128i) -> (__m128i, __m128i, __m128i) {
 }
 
 /// 16 lane 滤波核心：p3..q3（每 lane 一“样本列”），返回可变的 (p2,p1,p0,q0,q1,q2)，其余原样。
+/// 休眠：D2v1 弃旧 16×8 全转置慢实现集群，仅测试/探针用。
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn filter_lanes(
     p3: __m128i,
@@ -381,7 +393,9 @@ pub(crate) unsafe fn transpose8x8(rows: [__m128i; 8]) -> [__m128i; 8] {
 }
 
 /// SSE2 单边滤波：按 vertical + length 分四条（luma 16 × 横/纵、chroma 8 × 横/纵）。
+/// 休眠：D2v1 弃旧 16×8 全转置慢实现集群，仅测试/探针用。
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn filter_edge_sse2(
     plane: &mut [u8],
@@ -468,6 +482,7 @@ unsafe fn filter_edge_sse2(
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn macroblock_store16(
     q0p: *mut u8,
@@ -506,6 +521,7 @@ unsafe fn macroblock_store16(
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn macroblock_store8(
     q0p: *mut u8,
@@ -558,7 +574,7 @@ unsafe fn lf_abs(a: __m128i, b: __m128i) -> __m128i {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn lf_needs_filter(mask: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, thresh: i32) -> __m128i {
+pub(crate) unsafe fn lf_needs_filter(mask: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, thresh: i32) -> __m128i { unsafe {
     let zero = _mm_setzero_si128();
     let t1 = lf_abs(p1, q1);
     let t2 = _mm_and_si128(t1, _mm_set1_epi8(0xFEu8 as i8));
@@ -567,10 +583,12 @@ pub(crate) unsafe fn lf_needs_filter(mask: __m128i, p1: __m128i, p0: __m128i, q0
     let t5 = _mm_adds_epu8(_mm_adds_epu8(t4, t4), t3);
     let t6 = _mm_subs_epu8(t5, _mm_set1_epi8(thresh as i8));
     _mm_and_si128(_mm_cmpeq_epi8(t6, zero), mask)
-}
+}}
 
 /// 平坦度：`mask` 与 `max(|p3-p2|,|p2-p1|,|p1-p0|)` 再与 `max(...,|q1-q0|,|q2-q1|,|q3-q2|)` <= ithresh。
+/// 休眠：D2v2 平坦度计算未接入生产（libwebp 内联进 6-tap，本入口仅测试/探针用）。
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "sse2")]
 unsafe fn lf_flat(mask: __m128i, max_diff: __m128i, ithresh: i32) -> __m128i {
     let zero = _mm_setzero_si128();
@@ -580,12 +598,12 @@ unsafe fn lf_flat(mask: __m128i, max_diff: __m128i, ithresh: i32) -> __m128i {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn lf_not_hev(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, hev: i32) -> __m128i {
+unsafe fn lf_not_hev(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, hev: i32) -> __m128i { unsafe {
     let zero = _mm_setzero_si128();
     let mx = _mm_max_epu8(lf_abs(p1, p0), lf_abs(q1, q0));
     let t = _mm_subs_epu8(mx, _mm_set1_epi8(hev as i8));
     _mm_cmpeq_epi8(t, zero)
-}
+}}
 
 /// base delta（输入为翻转符号域）：p1-q1 + 3(q0-p0) 饱和 = 标量 clamp(clamp(p1-q1)+3(q0-p0))。
 #[cfg(target_arch = "x86_64")]
@@ -614,35 +632,35 @@ unsafe fn lf_sub_byte(v: __m128i, d: __m128i, sb: __m128i) -> __m128i {
 /// 翻转符号域饱和加/减（等价标量 [0,255] clamp 后的 p/q 写回）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn lf_flip_add(v: __m128i, d: __m128i, sb: __m128i) -> __m128i {
+unsafe fn lf_flip_add(v: __m128i, d: __m128i, sb: __m128i) -> __m128i { unsafe {
     lf_add_byte(v, d, sb)
-}
+}}
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn lf_flip_sub(v: __m128i, d: __m128i, sb: __m128i) -> __m128i {
+unsafe fn lf_flip_sub(v: __m128i, d: __m128i, sb: __m128i) -> __m128i { unsafe {
     lf_sub_byte(v, d, sb)
-}
+}}
 
 /// 水平边行向量：读指针 `p` 处 `n` 连续字节（n=16 或 8）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn lf_row(b: *const u8, n: usize) -> __m128i {
+unsafe fn lf_row(b: *const u8, n: usize) -> __m128i { unsafe {
     if n == 16 {
         _mm_loadu_si128(b as *const __m128i)
     } else {
         _mm_loadl_epi64(b as *const __m128i)
     }
-}
+}}
 
 /// 简单 2-tap（mask lane）：p0 += (a+3)>>3、q0 -= (a+4)>>3。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn lf_simple2(a: __m128i, p0: __m128i, q0: __m128i) -> (__m128i, __m128i) {
+unsafe fn lf_simple2(a: __m128i, p0: __m128i, q0: __m128i) -> (__m128i, __m128i) { unsafe {
     let sb = _mm_set1_epi8(0x80u8 as i8);
     let pa = shift_right3(_mm_adds_epi8(a, _mm_set1_epi8(3)), sb);
     let qa = shift_right3(_mm_adds_epi8(a, _mm_set1_epi8(4)), sb);
     (lf_add_byte(p0, pa, sb), lf_sub_byte(q0, qa, sb))
-}
+}}
 
 /// Load8x4：读 8 行 × 4 列（围绕竖直边），返回 (col0 的 8 行 + col1 的 8 行) 与 (col2+col3)。
 /// 端口 libwebp `Load8x4_SSE2`（WebPMemToInt32 等价 read_unaligned<i32>）。
@@ -650,7 +668,7 @@ unsafe fn lf_simple2(a: __m128i, p0: __m128i, q0: __m128i) -> (__m128i, __m128i)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 #[cfg_attr(not(test), allow(dead_code))]
-unsafe fn lf_load8x4(b: *const u8, stride: isize) -> (__m128i, __m128i) {
+unsafe fn lf_load8x4(b: *const u8, stride: isize) -> (__m128i, __m128i) { unsafe {
     use std::arch::x86_64::*;
     let r = |i: isize| -> i32 {
         let p = b.offset(i * stride);
@@ -668,7 +686,7 @@ unsafe fn lf_load8x4(b: *const u8, stride: isize) -> (__m128i, __m128i) {
         _mm_unpacklo_epi32(c0, c1),
         _mm_unpackhi_epi32(c0, c1),
     )
-}
+}}
 
 /// Load16x4：读 16 行 × 4 列（竖直边 p1/p0/q0/q1 四列），返回四列各 16 字节 lane。
 /// 端口 libwebp `Load16x4_SSE2`。
@@ -676,7 +694,7 @@ unsafe fn lf_load8x4(b: *const u8, stride: isize) -> (__m128i, __m128i) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 #[cfg_attr(not(test), allow(dead_code))]
-unsafe fn lf_load16x4(b: *const u8, stride: isize) -> (__m128i, __m128i, __m128i, __m128i) {
+unsafe fn lf_load16x4(b: *const u8, stride: isize) -> (__m128i, __m128i, __m128i, __m128i) { unsafe {
     use std::arch::x86_64::*;
     // r0=行0..7 的四列，r8=行8..15。
     let (p1lo, q0lo) = lf_load8x4(b, stride);
@@ -689,21 +707,21 @@ unsafe fn lf_load16x4(b: *const u8, stride: isize) -> (__m128i, __m128i, __m128i
         _mm_unpacklo_epi64(t2, q1hi),
         _mm_unpackhi_epi64(t2, q1hi),
     )
-}
+}}
 
 /// Store4x4：把 4 个 lane 写回 4 行 × 4 列（每行一个 i32）。
 /// dormancy：已被 `lf_edge_v16` 的全向量 `store16x8` 取代（K24），保留供对照/回退。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 #[cfg_attr(not(test), allow(dead_code))]
-unsafe fn lf_store4x4(x: &mut __m128i, dst: *mut u8, stride: isize) {
+unsafe fn lf_store4x4(x: &mut __m128i, dst: *mut u8, stride: isize) { unsafe {
     use std::arch::x86_64::*;
     for i in 0..4isize {
         let v = _mm_cvtsi128_si32(*x);
         std::ptr::write_unaligned(dst.offset(i * stride) as *mut i32, v);
         *x = _mm_srli_si128(*x, 4);
     }
-}
+}}
 
 /// Store16x4：4 个列向量（c0..c3 = col0..col3，各 16 行字节）写回 16 行。端口 libwebp `Store16x4_SSE2`。
 /// 注意 unpack 顺序与 C 一致：先 (col0,col1) 与 (col2,col3) 按字节交错，再按 i16 交错还原 4×4。
@@ -714,7 +732,7 @@ unsafe fn lf_store4x4(x: &mut __m128i, dst: *mut u8, stride: isize) {
 unsafe fn lf_store16x4(
     c0: &mut __m128i, c1: &mut __m128i, c2: &mut __m128i, c3: &mut __m128i,
     r0: *mut u8, r8: *mut u8, stride: isize,
-) {
+) { unsafe {
     let t1 = *c1;
     let a = _mm_unpacklo_epi8(*c0, t1);
     let b = _mm_unpackhi_epi8(*c0, t1);
@@ -731,12 +749,12 @@ unsafe fn lf_store16x4(
     lf_store4x4(&mut f, r0.offset(4 * stride), stride);
     lf_store4x4(&mut g, r8, stride);
     lf_store4x4(&mut h, r8.offset(4 * stride), stride);
-}
+}}
 
 /// DoFilter2（简单边）：NeedsFilter 掩码 lane 只更新 p0/q0（thresh=`edge`）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn lf_do_filter2(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, edge: i32) -> (__m128i, __m128i) {
+pub(crate) unsafe fn lf_do_filter2(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, edge: i32) -> (__m128i, __m128i) { unsafe {
     let sb = _mm_set1_epi8(0x80u8 as i8);
     let mask = lf_needs_filter(_mm_set1_epi8(-1), p1, p0, q0, q1, edge);
     let a = _mm_and_si128(
@@ -744,14 +762,14 @@ pub(crate) unsafe fn lf_do_filter2(p1: __m128i, p0: __m128i, q0: __m128i, q1: __
         mask,
     );
     lf_simple2(a, p0, q0)
-}
+}}
 
 /// DoFilter4（内部边）：delta=hev(p1-q1)+3(q0-p0)；p0/q0 2-tap；!hev 时 p1/q1 (qa+1)>>1。mask 已复合。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 pub(crate) unsafe fn lf_do_filter4(
     p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, mask: __m128i, hev: i32,
-) -> (__m128i, __m128i, __m128i, __m128i) {
+) -> (__m128i, __m128i, __m128i, __m128i) { unsafe {
     let sb = _mm_set1_epi8(0x80u8 as i8);
     let not_hev = lf_not_hev(p1, p0, q0, q1, hev);
     let p1s = _mm_xor_si128(p1, sb);
@@ -770,7 +788,7 @@ pub(crate) unsafe fn lf_do_filter4(
     let p1n = lf_flip_add(p1, inn, sb);
     let q1n = lf_flip_sub(q1, inn, sb);
     (p1n, p0n, q0n, q1n)
-}
+}}
 
 /// DoFilter6（宏块边）：hev lane 2-tap；!hev lane 27/18/9 权重（f×9/18/27+63）>>7 铺 p2..q2。
 #[cfg(target_arch = "x86_64")]
@@ -778,7 +796,7 @@ pub(crate) unsafe fn lf_do_filter4(
 pub(crate) unsafe fn lf_do_filter6(
     p2: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, q2: __m128i,
     mask: __m128i, hev: i32,
-) -> (__m128i, __m128i, __m128i, __m128i, __m128i, __m128i) {
+) -> (__m128i, __m128i, __m128i, __m128i, __m128i, __m128i) { unsafe {
     let sb = _mm_set1_epi8(0x80u8 as i8);
     let zero = _mm_setzero_si128();
     let not_hev = lf_not_hev(p1, p0, q0, q1, hev);
@@ -817,7 +835,7 @@ pub(crate) unsafe fn lf_do_filter6(
     let p0n = lf_flip_add(p0, _mm_add_epi8(pa_hv, s27), sb);
     let q0n = lf_flip_sub(q0, _mm_add_epi8(qa_hv, s27), sb);
     (p2n, p1n, p0n, q0n, q1n, q2n)
-}
+}}
 
 /// 复合掩码：`filter`（thresh 判定）∧ 平坦度（max_diff <= ithresh）。
 #[cfg(target_arch = "x86_64")]
@@ -831,13 +849,13 @@ pub(crate) unsafe fn lf_mask_composite(filter: __m128i, max_diff: __m128i, ithre
 /// 平面内平坦度（MB/inner 共用六邻绝对差的最大值）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn lf_max_diff(p3: __m128i, p2: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, q2: __m128i, q3: __m128i) -> __m128i {
+pub(crate) unsafe fn lf_max_diff(p3: __m128i, p2: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, q2: __m128i, q3: __m128i) -> __m128i { unsafe {
     let m = _mm_max_epu8(
         _mm_max_epu8(_mm_max_epu8(lf_abs(p3, p2), lf_abs(p2, p1)), lf_abs(p1, p0)),
         _mm_max_epu8(_mm_max_epu8(lf_abs(q0, q1), lf_abs(q1, q2)), lf_abs(q2, q3)),
     );
     m
-}
+}}
 
 /// 竖直边（our vertical=true）16-wide。`pt` 指向 (行 y, 帧列 x-4)（p3 列；simple 只更新 p0/q0）。
 /// 全向量 16×8 转置梯（`load16x8`/`store16x8`，同 chroma `lf_edge_v8_pair` 姿势）：一次装载
@@ -851,7 +869,7 @@ pub(crate) unsafe fn lf_max_diff(p3: __m128i, p2: __m128i, p1: __m128i, p0: __m1
 pub(crate) unsafe fn lf_edge_v16(
     pt: *mut u8, stride: isize,
     interior: i32, edge: i32, hev: i32, macroblock_edge: bool, simple: bool,
-) {
+) { unsafe {
     let mut c = load16x8(pt, stride, pt.offset(8 * stride), stride);
     if simple {
         let (p0n, q0n) = lf_do_filter2(c[2], c[3], c[4], c[5], edge);
@@ -883,7 +901,65 @@ pub(crate) unsafe fn lf_edge_v16(
         c[5] = q1n;
     }
     store16x8(pt, stride, pt.offset(8 * stride), stride, c);
-}
+}}
+
+/// 竖直边（our vertical=true）8-wide（chroma per-edge / 测试入口，C# Load8x8/Store8x8 同款）。
+/// `pt` 指向 (行 y, 帧列 x-4)（p3 列；simple 只更新 p0/q0）。全向量 8×8 转置梯（`transpose8x8`，
+/// 矩阵转置自身逆，单测 round-trip 断言）：一次装载 pt..pt+7 全部 8 列（p3..q3）8 行、滤波后一次
+/// 写回——替换 `lf_filter_edge_sse2` 里 8-wide 的标量回退 `vp8::filter_edge`（逐行逐列标量字节
+/// 读写）。列向量布局与 `lf_edge_v16` 低 8 字节半区同轴（c[j] 低 8 字节 = 行 0..7 列 j）；
+/// `transpose8x8` 用 `_mm_unpacklo_epi64(c, zero)` 把高 8 lane 恒置 0 → 高 lane 恒过 mask 但
+/// delta 恒 0（lf_do_filter4/6 非 mask lane 增量 0 → 原值），写回只取低 8 字节 → 输出逐位不变。
+/// movemask 早退只采低 8 位（`& 0xFF`），高 lane 的「恒需滤」不参与「整列全无需改」判定。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn lf_edge_v8(
+    pt: *mut u8, stride: isize,
+    interior: i32, edge: i32, hev: i32, macroblock_edge: bool, simple: bool,
+) { unsafe {
+    let mut rows = [_mm_setzero_si128(); 8];
+    for i in 0..8isize {
+        rows[i as usize] = _mm_loadl_epi64(pt.offset(i * stride) as *const __m128i);
+    }
+    let mut c = transpose8x8(rows);
+    if simple {
+        let (p0n, q0n) = lf_do_filter2(c[2], c[3], c[4], c[5], edge);
+        c[3] = p0n;
+        c[4] = q0n;
+    } else {
+        let mx = lf_max_diff(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+        let mask = lf_mask_composite(
+            lf_needs_filter(_mm_set1_epi8(-1), c[2], c[3], c[4], c[5], edge),
+            mx,
+            interior,
+        );
+        // 只采低 8 位：低 8（真实 8 列）全无需改 → 跳过 store（高 lane 恒 0 恒过 mask，不参与判定）。
+        if _mm_movemask_epi8(mask) & 0xFF == 0 {
+            return;
+        }
+        if macroblock_edge {
+            let (p2n, p1n, p0n, q0n, q1n, q2n) =
+                lf_do_filter6(c[1], c[2], c[3], c[4], c[5], c[6], mask, hev);
+            c[1] = p2n;
+            c[2] = p1n;
+            c[3] = p0n;
+            c[4] = q0n;
+            c[5] = q1n;
+            c[6] = q2n;
+        } else {
+            let (p1n, p0n, q0n, q1n) = lf_do_filter4(c[2], c[3], c[4], c[5], mask, hev);
+            c[2] = p1n;
+            c[3] = p0n;
+            c[4] = q0n;
+            c[5] = q1n;
+        }
+    }
+    let out = transpose8x8(c);
+    for i in 0..8isize {
+        _mm_storel_epi64(pt.offset(i * stride) as *mut __m128i, out[i as usize]);
+    }
+}}
 
 /// 水平边（our vertical=false）16/8-wide。`pt` 指向 (行 y, 帧列 x)（q0 行首）；n=16/8。
 #[cfg(target_arch = "x86_64")]
@@ -892,7 +968,7 @@ pub(crate) unsafe fn lf_edge_v16(
 pub(crate) unsafe fn lf_edge_h(
     pt: *mut u8, stride: isize, n: usize,
     interior: i32, edge: i32, hev: i32, macroblock_edge: bool, simple: bool,
-) {
+) { unsafe {
     let p3 = lf_row(pt.offset(-4 * stride), n);
     let p2 = lf_row(pt.offset(-3 * stride), n);
     let p1 = lf_row(pt.offset(-2 * stride), n);
@@ -926,7 +1002,7 @@ pub(crate) unsafe fn lf_edge_h(
             std::ptr::copy_nonoverlapping(&v as *const __m128i as *const u8, pt.offset(off * stride), n);
         }
     }
-}
+}}
 
 /// 新环路滤波入口（libwebp 风格 SSE2）：语义与 vp8::filter_edge 相同。8-wide 竖直边暂保留标量。
 #[cfg(target_arch = "x86_64")]
@@ -944,7 +1020,7 @@ unsafe fn lf_filter_edge_sse2(
     interior: i32,
     edge: i32,
     hev: i32,
-) {
+) { unsafe {
     let base = plane.as_mut_ptr();
     let center = (y * stride + 1 + x) as isize;
     let s = stride as isize;
@@ -952,9 +1028,9 @@ unsafe fn lf_filter_edge_sse2(
         if length == 16 {
             lf_edge_v16(base.offset(center - 4), s, interior, edge, hev, macroblock_edge, simple);
         } else {
-            super::vp8::filter_edge(plane, stride, x, y, 8, true, macroblock_edge, simple, interior, edge, hev);
+            lf_edge_v8(base.offset(center - 4), s, interior, edge, hev, macroblock_edge, simple);
         }
     } else {
         lf_edge_h(base.offset(center), s, length, interior, edge, hev, macroblock_edge, simple);
     }
-}
+}}

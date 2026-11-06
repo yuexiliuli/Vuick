@@ -8,6 +8,8 @@ use super::*;
 
 
 /// 4×4 预测分派：SSSE3 向量核；无 SIMD → vp8.rs 标量（单一语义源）。
+/// 休眠：产线走 `predict_subblock_forced`（pipeline.rs「不可再走 simd::predict_subblock」），仅测试/探针用。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn predict_subblock(
     plane: &mut [u8],
     pitch: usize,

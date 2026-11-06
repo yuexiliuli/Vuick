@@ -110,6 +110,8 @@ impl<'a> Vp8BoolDecoder<'a> {
     /// 分支约半数预测失败；用 `mask = (split - (window))>>31` 全表达式消除分支，
     /// 与 `read_bit(128)+符号分支` 逐位同语义。`magnitude` 为系数幅值，返回取符号结果。
     /// cold 入口委托标量热路径 `ent_read_signed`（算术单源）。
+    /// 休眠：生产改直调 `ent_read_signed`，无生产调用者，仅测试/探针用。
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     pub(crate) fn read_signed_val(mut self, magnitude: i32) -> (Self, i32) {
         let v = ent_read_signed(

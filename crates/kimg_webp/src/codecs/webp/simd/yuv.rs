@@ -411,15 +411,13 @@ unsafe fn yuv32_to_rgba_avx2(
 #[target_feature(enable = "avx2")]
 unsafe fn pack8_bytes_avx2(a: __m256i, b: __m256i) -> __m256i {
     use std::arch::x86_64::*;
-    unsafe {
-        let al = _mm256_castsi256_si128(a);
-        let ah = _mm256_extracti128_si256(a, 1);
-        let bl = _mm256_castsi256_si128(b);
-        let bh = _mm256_extracti128_si256(b, 1);
-        let lo = _mm_packus_epi16(_mm_packs_epi32(al, ah), _mm_setzero_si128());
-        let hi = _mm_packus_epi16(_mm_packs_epi32(bl, bh), _mm_setzero_si128());
-        _mm256_set_m128i(hi, lo)
-    }
+    let al = _mm256_castsi256_si128(a);
+    let ah = _mm256_extracti128_si256(a, 1);
+    let bl = _mm256_castsi256_si128(b);
+    let bh = _mm256_extracti128_si256(b, 1);
+    let lo = _mm_packus_epi16(_mm_packs_epi32(al, ah), _mm_setzero_si128());
+    let hi = _mm_packus_epi16(_mm_packs_epi32(bl, bh), _mm_setzero_si128());
+    _mm256_set_m128i(hi, lo)
 }
 
 /// AVX2 u16 16px 通道（已左移 8 的 16-u16 y/u/v + **已组装的 A 平面**）：mulhi → max-sub → srli6 →
@@ -431,51 +429,49 @@ unsafe fn pack8_bytes_avx2(a: __m256i, b: __m256i) -> __m256i {
 #[target_feature(enable = "avx2")]
 unsafe fn yuv16_pack_avx2_u16(yv: __m256i, uv: __m256i, vv: __m256i, a8: __m256i) -> (__m256i, __m256i) {
     use std::arch::x86_64::*;
-    unsafe {
-        let k_y = _mm256_set1_epi16(19077);
-        let k_vr = _mm256_set1_epi16(26149);
-        let k_ug = _mm256_set1_epi16(6419);
-        let k_vg = _mm256_set1_epi16(13320);
-        // 33050 > i16::MAX → 补码表示（-32486 = 0x811A）；mulhi_epu16 按 u16 位模式读，恒为 33050。
-        let k_ub = _mm256_set1_epi16(-32486);
-        let b_r = _mm256_set1_epi16(14234);
-        let b_g = _mm256_set1_epi16(8708);
-        let b_b = _mm256_set1_epi16(17685);
+    let k_y = _mm256_set1_epi16(19077);
+    let k_vr = _mm256_set1_epi16(26149);
+    let k_ug = _mm256_set1_epi16(6419);
+    let k_vg = _mm256_set1_epi16(13320);
+    // 33050 > i16::MAX → 补码表示（-32486 = 0x811A）；mulhi_epu16 按 u16 位模式读，恒为 33050。
+    let k_ub = _mm256_set1_epi16(-32486);
+    let b_r = _mm256_set1_epi16(14234);
+    let b_g = _mm256_set1_epi16(8708);
+    let b_b = _mm256_set1_epi16(17685);
 
-        let yt = _mm256_mulhi_epu16(yv, k_y);
-        let vr = _mm256_mulhi_epu16(vv, k_vr);
-        let ug = _mm256_mulhi_epu16(uv, k_ug);
-        let vg = _mm256_mulhi_epu16(vv, k_vg);
-        let ub = _mm256_mulhi_epu16(uv, k_ub);
+    let yt = _mm256_mulhi_epu16(yv, k_y);
+    let vr = _mm256_mulhi_epu16(vv, k_vr);
+    let ug = _mm256_mulhi_epu16(uv, k_ug);
+    let vg = _mm256_mulhi_epu16(vv, k_vg);
+    let ub = _mm256_mulhi_epu16(uv, k_ub);
 
-        // 负数偏置：max(和, bias)-bias 在 u16 域钳 0，等价标量负值走 srai 后 clamp 0。
-        let rd = _mm256_srli_epi16(
-            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, vr), b_r), b_r),
-            6,
-        );
-        let gn = _mm256_add_epi16(ug, vg);
-        let gr = _mm256_srli_epi16(
-            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, b_g), gn), gn),
-            6,
-        );
-        let bl = _mm256_srli_epi16(
-            _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, ub), b_b), b_b),
-            6,
-        );
+    // 负数偏置：max(和, bias)-bias 在 u16 域钳 0，等价标量负值走 srai 后 clamp 0。
+    let rd = _mm256_srli_epi16(
+        _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, vr), b_r), b_r),
+        6,
+    );
+    let gn = _mm256_add_epi16(ug, vg);
+    let gr = _mm256_srli_epi16(
+        _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, b_g), gn), gn),
+        6,
+    );
+    let bl = _mm256_srli_epi16(
+        _mm256_sub_epi16(_mm256_max_epu16(_mm256_add_epi16(yt, ub), b_b), b_b),
+        6,
+    );
 
-        // 每 16 i16 → 16 u8 平面：packus(r, 0) 得低 128 位 [px0-7,0×8]、高 128 位 [px8-15,0×8]，
-        // 与 i32 路径的 16 字节平面同构（unpack 逐 lane 取低 8 字节即像素段）。
-        let r8 = _mm256_packus_epi16(rd, _mm256_setzero_si256());
-        let g8 = _mm256_packus_epi16(gr, _mm256_setzero_si256());
-        let b8 = _mm256_packus_epi16(bl, _mm256_setzero_si256());
-        let rg = _mm256_unpacklo_epi8(r8, g8);
-        let ba = _mm256_unpacklo_epi8(b8, a8);
-        let out_lo = _mm256_unpacklo_epi16(rg, ba);
-        let out_hi = _mm256_unpackhi_epi16(rg, ba);
-        let p01 = _mm256_permute2x128_si256(out_lo, out_hi, 0x20);
-        let p23 = _mm256_permute2x128_si256(out_lo, out_hi, 0x31);
-        (p01, p23)
-    }
+    // 每 16 i16 → 16 u8 平面：packus(r, 0) 得低 128 位 [px0-7,0×8]、高 128 位 [px8-15,0×8]，
+    // 与 i32 路径的 16 字节平面同构（unpack 逐 lane 取低 8 字节即像素段）。
+    let r8 = _mm256_packus_epi16(rd, _mm256_setzero_si256());
+    let g8 = _mm256_packus_epi16(gr, _mm256_setzero_si256());
+    let b8 = _mm256_packus_epi16(bl, _mm256_setzero_si256());
+    let rg = _mm256_unpacklo_epi8(r8, g8);
+    let ba = _mm256_unpacklo_epi8(b8, a8);
+    let out_lo = _mm256_unpacklo_epi16(rg, ba);
+    let out_hi = _mm256_unpackhi_epi16(rg, ba);
+    let p01 = _mm256_permute2x128_si256(out_lo, out_hi, 0x20);
+    let p23 = _mm256_permute2x128_si256(out_lo, out_hi, 0x31);
+    (p01, p23)
 }
 
 /// AVX2 u16 16px 核心（已左移 8 的 16-u16 y/u/v）：[`yuv16_pack_avx2_u16`] + 两次 256-bit 存储。

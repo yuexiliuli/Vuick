@@ -196,6 +196,8 @@ unsafe fn idct_add_one_sse2(coeff: *const i16, dst: *mut u8, stride: isize, i16_
 /// `coeff_a`/`coeff_b` 为 [i16;16]，`col0` 为块 `a` 的左上列（帧坐标），块 `b` 在 `col0+4`。
 /// 标量回退：逐块走 `vp8::inverse_dct_add`（恒以 has_ac=true —— 对全零块/仅 DC 块结果与
 /// 既有短路逐字节一致，见 K 注释：零块残差为 0、DC-only 全 16 像素 (dc+4)>>3 同恒等式）。
+/// 休眠：已被 `inverse_dct_add_two_forced` 取代（预判定直调），仅测试/探针用。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn inverse_dct_add_two(
     coeff_a: &[i16; 16],
     coeff_b: &[i16; 16],
@@ -256,6 +258,8 @@ pub(crate) unsafe fn inverse_dct_add_two_forced(
 /// `coeff` 为 [i16;16]。SIMD 走单块核 `idct_add_one_sse2`（与 i16 的 DCT 部件同门控
 /// `part_simd_on("dct","sse2")`）；标量回退恒 has_ac=true（对仅 DC 块与既有捷径逐字节一致，
 /// 见 `inverse_dct_has_ac_shortcut_equivalence`）。调用方在 AC 位为准时进入本入口，DC 捷径仍走标量。
+/// 休眠：已被 `idct_add_one_forced` 取代，仅测试用（test 引用）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn inverse_dct_add_one(
     coeff: &[i16; 16],
     plane: &mut [u8],
@@ -311,6 +315,8 @@ pub(crate) unsafe fn idct_add_one_forced(
 /// 仅 DC 块逐字节一致，既有 `inverse_dct_has_ac_shortcut_equivalence` 已证）。SSE2 下省去
 /// 两遍 butterfly，直接 16 像素加 DC；无 SIMD 回退逐块 `vp8::inverse_dct_add(has_ac=true)`
 /// （对 [dc,0..0] 块与捷径同输出）。调用方以 `ac_mask` 双块位全 0 判定后进入本路径。
+/// 休眠：已被 `dc_add_two_forced` 取代，仅测试用（test 引用）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn dc_add_two(
     dc_a: i16,
     dc_b: i16,
@@ -460,18 +466,16 @@ unsafe fn idct_pass2_shift32_sse2(
     m32: __m128i,
 ) -> (__m128i, __m128i, __m128i, __m128i) {
     use std::arch::x86_64::*;
-    unsafe {
-        let four = _mm_set1_epi32(4);
-        let a = _mm_add_epi32(_mm_add_epi32(t0, t2), four);
-        let b = _mm_sub_epi32(_mm_add_epi32(t0, four), t2);
-        let c = _mm_sub_epi32(_mm_add_epi32(m1k2, t1), _mm_add_epi32(t3, m3k1));
-        let d = _mm_add_epi32(_mm_add_epi32(_mm_add_epi32(t1, m12), m32), t3);
-        let s0 = _mm_srai_epi32(_mm_add_epi32(a, d), 3);
-        let s1 = _mm_srai_epi32(_mm_add_epi32(b, c), 3);
-        let s2 = _mm_srai_epi32(_mm_sub_epi32(b, c), 3);
-        let s3 = _mm_srai_epi32(_mm_sub_epi32(a, d), 3);
-        (s0, s1, s2, s3)
-    }
+    let four = _mm_set1_epi32(4);
+    let a = _mm_add_epi32(_mm_add_epi32(t0, t2), four);
+    let b = _mm_sub_epi32(_mm_add_epi32(t0, four), t2);
+    let c = _mm_sub_epi32(_mm_add_epi32(m1k2, t1), _mm_add_epi32(t3, m3k1));
+    let d = _mm_add_epi32(_mm_add_epi32(_mm_add_epi32(t1, m12), m32), t3);
+    let s0 = _mm_srai_epi32(_mm_add_epi32(a, d), 3);
+    let s1 = _mm_srai_epi32(_mm_add_epi32(b, c), 3);
+    let s2 = _mm_srai_epi32(_mm_sub_epi32(b, c), 3);
+    let s3 = _mm_srai_epi32(_mm_sub_epi32(a, d), 3);
+    (s0, s1, s2, s3)
 }
 
 /// 第二遍一维逆变换的 i16 域版本（8-lane A/B 组合布局，与 libwebp `Transform_SSE2` 水平遍
@@ -492,32 +496,30 @@ unsafe fn idct_pass2_shift16_sse2(
     t3: __m128i,
 ) -> (__m128i, __m128i, __m128i, __m128i) {
     use std::arch::x86_64::*;
-    unsafe {
-        let k1 = _mm_set1_epi16(20091);
-        let k2 = _mm_set1_epi16(-30068);
-        let four = _mm_set1_epi16(4);
-        // 与 libwebp dec_sse2.c 水平遍同序：dc=T0+4 → a=dc+T2、b=dc-T2。
-        let dc = _mm_add_epi16(t0, four);
-        let a = _mm_add_epi16(dc, t2);
-        let b = _mm_sub_epi16(dc, t2);
-        // c = MUL(t1,K2) − MUL(t3,K1) = mulhi(t1,k2) − mulhi(t3,k1) + t1 − t3（先差后合）。
-        let c1 = _mm_mulhi_epi16(t1, k2);
-        let c2 = _mm_mulhi_epi16(t3, k1);
-        let c3 = _mm_sub_epi16(t1, t3);
-        let c4 = _mm_sub_epi16(c1, c2);
-        let c = _mm_add_epi16(c3, c4);
-        // d = MUL(t1,K1) + MUL(t3,K2) = mulhi(t1,k1) + mulhi(t3,k2) + t1 + t3（先和后合）。
-        let d1 = _mm_mulhi_epi16(t1, k1);
-        let d2 = _mm_mulhi_epi16(t3, k2);
-        let d3 = _mm_add_epi16(t1, t3);
-        let d4 = _mm_add_epi16(d1, d2);
-        let d = _mm_add_epi16(d3, d4);
-        let s0 = _mm_srai_epi16(_mm_add_epi16(a, d), 3);
-        let s1 = _mm_srai_epi16(_mm_add_epi16(b, c), 3);
-        let s2 = _mm_srai_epi16(_mm_sub_epi16(b, c), 3);
-        let s3 = _mm_srai_epi16(_mm_sub_epi16(a, d), 3);
-        (s0, s1, s2, s3)
-    }
+    let k1 = _mm_set1_epi16(20091);
+    let k2 = _mm_set1_epi16(-30068);
+    let four = _mm_set1_epi16(4);
+    // 与 libwebp dec_sse2.c 水平遍同序：dc=T0+4 → a=dc+T2、b=dc-T2。
+    let dc = _mm_add_epi16(t0, four);
+    let a = _mm_add_epi16(dc, t2);
+    let b = _mm_sub_epi16(dc, t2);
+    // c = MUL(t1,K2) − MUL(t3,K1) = mulhi(t1,k2) − mulhi(t3,k1) + t1 − t3（先差后合）。
+    let c1 = _mm_mulhi_epi16(t1, k2);
+    let c2 = _mm_mulhi_epi16(t3, k1);
+    let c3 = _mm_sub_epi16(t1, t3);
+    let c4 = _mm_sub_epi16(c1, c2);
+    let c = _mm_add_epi16(c3, c4);
+    // d = MUL(t1,K1) + MUL(t3,K2) = mulhi(t1,k1) + mulhi(t3,k2) + t1 + t3（先和后合）。
+    let d1 = _mm_mulhi_epi16(t1, k1);
+    let d2 = _mm_mulhi_epi16(t3, k2);
+    let d3 = _mm_add_epi16(t1, t3);
+    let d4 = _mm_add_epi16(d1, d2);
+    let d = _mm_add_epi16(d3, d4);
+    let s0 = _mm_srai_epi16(_mm_add_epi16(a, d), 3);
+    let s1 = _mm_srai_epi16(_mm_add_epi16(b, c), 3);
+    let s2 = _mm_srai_epi16(_mm_sub_epi16(b, c), 3);
+    let s3 = _mm_srai_epi16(_mm_sub_epi16(a, d), 3);
+    (s0, s1, s2, s3)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -529,20 +531,18 @@ unsafe fn transpose_2_4x4_16b_sse2(
     in3: __m128i,
 ) -> (__m128i, __m128i, __m128i, __m128i) {
     use std::arch::x86_64::*;
-    unsafe {
-        let t00 = _mm_unpacklo_epi16(in0, in1);
-        let t01 = _mm_unpacklo_epi16(in2, in3);
-        let t10 = _mm_unpackhi_epi16(in0, in1);
-        let t11 = _mm_unpackhi_epi16(in2, in3);
-        let t20 = _mm_unpacklo_epi32(t00, t01);
-        let t21 = _mm_unpacklo_epi32(t10, t11);
-        let t22 = _mm_unpackhi_epi32(t00, t01);
-        let t23 = _mm_unpackhi_epi32(t10, t11);
-        (
-            _mm_unpacklo_epi64(t20, t21),
-            _mm_unpackhi_epi64(t20, t21),
-            _mm_unpacklo_epi64(t22, t23),
-            _mm_unpackhi_epi64(t22, t23),
-        )
-    }
+    let t00 = _mm_unpacklo_epi16(in0, in1);
+    let t01 = _mm_unpacklo_epi16(in2, in3);
+    let t10 = _mm_unpackhi_epi16(in0, in1);
+    let t11 = _mm_unpackhi_epi16(in2, in3);
+    let t20 = _mm_unpacklo_epi32(t00, t01);
+    let t21 = _mm_unpacklo_epi32(t10, t11);
+    let t22 = _mm_unpackhi_epi32(t00, t01);
+    let t23 = _mm_unpackhi_epi32(t10, t11);
+    (
+        _mm_unpacklo_epi64(t20, t21),
+        _mm_unpackhi_epi64(t20, t21),
+        _mm_unpacklo_epi64(t22, t23),
+        _mm_unpackhi_epi64(t22, t23),
+    )
 }

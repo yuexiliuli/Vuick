@@ -915,7 +915,7 @@ pub(crate) fn decode_from_header(
         // 同样跳过（`mbh-1` 会下溢）。
         if mbh > 0 {
             #[allow(unused_assignments)]
-            let emitted = filter_emit_serial_row(
+            let _emitted = filter_emit_serial_row(
                 &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw,
                 mbh - 1, mbh, &fh.filter, &row_filters[(mbh - 1) * mbw..mbh * mbw],
                 width, height, dst, &mut scratch, channels, alpha, emitted,

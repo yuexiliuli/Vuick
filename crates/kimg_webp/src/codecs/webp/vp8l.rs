@@ -102,6 +102,8 @@ impl RgbaBytes {
     }
 
     /// RGBA8 字节数（= w*h*4）。
+    /// 休眠：仅 `stage_profile` 探针测试用（产线经 `as_bytes()` 取视图），无生产调用者。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         match &self.inner {
             RgbaBytesKind::U32(v) => v.len() * 4,
@@ -109,6 +111,8 @@ impl RgbaBytes {
         }
     }
 
+    /// 休眠：无生产调用者，仅探针/备用用。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         match &self.inner {
             RgbaBytesKind::U32(v) => v.is_empty(),

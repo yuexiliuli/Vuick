@@ -808,7 +808,7 @@ pub(crate) mod stage_clock {
     }
     /// 宏块模式计数：每宏块恰好一次（i16⇔y_mode!=4 之外即 i4）。feature 外空操作。
     #[inline(always)]
-    pub fn mb_mode(is_i16: bool) {
+    pub fn mb_mode(_is_i16: bool) {
         #[cfg(feature = "stage_profile")]
         {
             if is_i16 {

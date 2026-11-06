@@ -159,7 +159,7 @@ unsafe fn avg2_epu8(a: __m128i, b: __m128i) -> __m128i {
 /// `dl<dt 取 left 否则 top` 逐位一致（相等时同取 top）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn select_u32(a: u32, b: u32, c: u32) -> u32 {
+unsafe fn select_u32(a: u32, b: u32, c: u32) -> u32 { unsafe {
     let zero = _mm_setzero_si128();
     let va = _mm_cvtsi32_si128(a as i32);
     let vb = _mm_cvtsi32_si128(b as i32);
@@ -177,7 +177,7 @@ unsafe fn select_u32(a: u32, b: u32, c: u32) -> u32 {
     } else {
         b
     }
-}
+}}
 
 /// 预测器段分派（mode 恒定，n 像素；`dst` 段首、`upper` 顶行、`left` 段首左侧已变换值）。
 /// 运行时按 CPU 选核（AVX2 8 宽并行 → SSE2 4 宽 → 标量）；调用方已确保 sse2 在位。
@@ -231,7 +231,7 @@ fn predictor_segment(mode: u32, dst: *mut u32, upper: *const u32, n: usize, left
 /// AVX2 8 宽并行预测-加（模式 0/2/3/4/8/9；长剩余交回 SSE2 4 宽）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,sse2")]
-unsafe fn pred_add_parallel_avx2(mode: u32, dst: *mut u32, upper: *const u32, n: usize) {
+unsafe fn pred_add_parallel_avx2(mode: u32, dst: *mut u32, upper: *const u32, n: usize) { unsafe {
     let black = _mm256_set1_epi32(0xff00_0000u32 as i32);
     let mut i = 0usize;
     while i + 8 <= n {
@@ -260,7 +260,7 @@ unsafe fn pred_add_parallel_avx2(mode: u32, dst: *mut u32, upper: *const u32, n:
     if i < n {
         pred_add_parallel(mode, dst.add(i), upper.add(i), n - i);
     }
-}
+}}
 
 /// 256 位逐字节 floor 均值（AVX2）。
 #[cfg(target_arch = "x86_64")]
@@ -274,7 +274,7 @@ unsafe fn avg2_epu8_256(a: __m256i, b: __m256i) -> __m256i {
 /// 4 宽并行预测-加（模式 0/2/3/4/8/9；n≥1，段首左侧已变换值 `left` 不参与预测）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn pred_add_parallel(mode: u32, dst: *mut u32, upper: *const u32, n: usize) {
+unsafe fn pred_add_parallel(mode: u32, dst: *mut u32, upper: *const u32, n: usize) { unsafe {
     let black = _mm_set1_epi32(0xff00_0000u32 as i32);
     let mut i = 0usize;
     while i + 4 <= n {
@@ -301,12 +301,12 @@ unsafe fn pred_add_parallel(mode: u32, dst: *mut u32, upper: *const u32, n: usiz
         // 标量尾（段首左侧自取 *dst.sub(1)；不越界：段在行内且 x≥1）。
         pred_add_scalar(mode, dst.add(i), upper.add(i), n - i);
     }
-}
+}}
 
 /// mode 1 前缀和（log-step 扫描，4 宽；`left` = 段首左侧已变换值）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn pred_add_prefix(dst: *mut u32, n: usize, left_init: u32) {
+unsafe fn pred_add_prefix(dst: *mut u32, n: usize, left_init: u32) { unsafe {
     let mut i = 0usize;
     let mut prev = _mm_set1_epi32(left_init as i32);
     while i + 4 <= n {
@@ -328,12 +328,12 @@ unsafe fn pred_add_prefix(dst: *mut u32, n: usize, left_init: u32) {
             i += 1;
         }
     }
-}
+}}
 
 /// left 串行链模式 6/7（avg2）：`left` 全程驻留向量寄存器，`add_argb` = `_mm_add_epi8`（1 条）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn pred_add_avg2_serial(mode: u32, dst: *mut u32, upper: *const u32, n: usize, left_init: u32) {
+unsafe fn pred_add_avg2_serial(mode: u32, dst: *mut u32, upper: *const u32, n: usize, left_init: u32) { unsafe {
     let mut lv = _mm_cvtsi32_si128(left_init as i32);
     for i in 0..n {
         let s = *dst.add(i);
@@ -344,12 +344,12 @@ unsafe fn pred_add_avg2_serial(mode: u32, dst: *mut u32, upper: *const u32, n: u
         *dst.add(i) = _mm_cvtsi128_si32(res) as u32;
         lv = res;
     }
-}
+}}
 
 /// left 串行链模式 5（avg3：avg(avg(L,TR),T)）：向量驻留。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn pred_add_avg3_serial(dst: *mut u32, upper: *const u32, n: usize, left_init: u32) {
+unsafe fn pred_add_avg3_serial(dst: *mut u32, upper: *const u32, n: usize, left_init: u32) { unsafe {
     let mut lv = _mm_cvtsi32_si128(left_init as i32);
     for i in 0..n {
         let s = *dst.add(i);
@@ -361,12 +361,12 @@ unsafe fn pred_add_avg3_serial(dst: *mut u32, upper: *const u32, n: usize, left_
         *dst.add(i) = _mm_cvtsi128_si32(res) as u32;
         lv = res;
     }
-}
+}}
 
 /// left 串行链模式 11（select）：SAD 判定需横向求和 → 每像素提取标量做比较。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn pred_add_select_serial(dst: *mut u32, upper: *const u32, n: usize, left_init: u32) {
+unsafe fn pred_add_select_serial(dst: *mut u32, upper: *const u32, n: usize, left_init: u32) { unsafe {
     let mut left = left_init;
     for i in 0..n {
         let s = *dst.add(i);
@@ -381,12 +381,12 @@ unsafe fn pred_add_select_serial(dst: *mut u32, upper: *const u32, n: usize, lef
         *dst.add(i) = r;
         left = r;
     }
-}
+}}
 
 /// left 串行链模式 12（clamp-add）：i16 lane `clamp(L+T-TL)`，`add`=1 条。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn pred_add_clamp_add_serial(dst: *mut u32, upper: *const u32, n: usize, left_init: u32) {
+unsafe fn pred_add_clamp_add_serial(dst: *mut u32, upper: *const u32, n: usize, left_init: u32) { unsafe {
     let zero = _mm_setzero_si128();
     let mut lv = _mm_cvtsi32_si128(left_init as i32);
     for i in 0..n {
@@ -400,12 +400,12 @@ unsafe fn pred_add_clamp_add_serial(dst: *mut u32, upper: *const u32, n: usize, 
         *dst.add(i) = _mm_cvtsi128_si32(res) as u32;
         lv = res;
     }
-}
+}}
 
 /// left 串行链模式 13（clamp-half：clamp(avg(L,T) + (avg-TL)/2)）：向量驻留。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn pred_add_clamp_half_serial(dst: *mut u32, upper: *const u32, n: usize, left_init: u32) {
+unsafe fn pred_add_clamp_half_serial(dst: *mut u32, upper: *const u32, n: usize, left_init: u32) { unsafe {
     let zero = _mm_setzero_si128();
     let mut lv = _mm_cvtsi32_si128(left_init as i32);
     for i in 0..n {
@@ -425,7 +425,7 @@ unsafe fn pred_add_clamp_half_serial(dst: *mut u32, upper: *const u32, n: usize,
         *dst.add(i) = _mm_cvtsi128_si32(res) as u32;
         lv = res;
     }
-}
+}}
 
 /// VP8L 预测器逆变换（整个图像；段分派见 `predictor_segment`）。`None` = 模式非法
 /// 或 SIMD 未就绪 → 调用方回退 vp8l.rs 标量整段（非法模式产出结构化 Err，绝不半途改动像素）。
@@ -460,7 +460,7 @@ unsafe fn predictor_inverse_sse2(
     height: usize,
     bits: u32,
     data: &[u32],
-) {
+) { unsafe {
     if width == 0 || height == 0 {
         return;
     }
@@ -513,7 +513,7 @@ unsafe fn predictor_inverse_sse2(
             *p.add(i) = super::vp8l::add_argb(*p.add(i), pred);
         }
     }
-}
+}}
 
 // ---------------------------------------------------------------------------
 // VP8L 色变换逆变换（`Vector<int>` lane 算术：绿→红→蓝→α 顺序与 `color_delta` 标量
@@ -522,7 +522,7 @@ unsafe fn predictor_inverse_sse2(
 
 /// 块内恒定 cte 的整段标量色变换（与 vp8l.rs 标量逐字节一致）。
 #[inline]
-unsafe fn color_run_scalar(dst: *mut u32, n: usize, cte: u32) {
+unsafe fn color_run_scalar(dst: *mut u32, n: usize, cte: u32) { unsafe {
     for i in 0..n {
         let p = *dst.add(i);
         let green = (p >> 8) & 0xff;
@@ -536,12 +536,12 @@ unsafe fn color_run_scalar(dst: *mut u32, n: usize, cte: u32) {
             & 0xff;
         *dst.add(i) = (p & 0xff00_ff00) | ((red_for_blue as u32) << 16) | (new_blue as u32);
     }
-}
+}}
 
 /// SSE4.1 4 宽色变换核。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
-unsafe fn color_run_sse2(dst: *mut u32, n: usize, cte: u32) {
+unsafe fn color_run_sse2(dst: *mut u32, n: usize, cte: u32) { unsafe {
     let cr = _mm_set1_epi32((cte as u8 as i8) as i32);
     let cb = _mm_set1_epi32(((cte >> 8) as u8 as i8) as i32);
     let cb2 = _mm_set1_epi32(((cte >> 16) as u8 as i8) as i32);
@@ -570,12 +570,12 @@ unsafe fn color_run_sse2(dst: *mut u32, n: usize, cte: u32) {
     if i < n {
         color_run_scalar(dst.add(i), n - i, cte);
     }
-}
+}}
 
 /// AVX2 8 宽色变换核（长剩余交回 4 宽 SSE4.1）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,sse4.1")]
-unsafe fn color_run_avx2(dst: *mut u32, n: usize, cte: u32) {
+unsafe fn color_run_avx2(dst: *mut u32, n: usize, cte: u32) { unsafe {
     let cr = _mm256_set1_epi32((cte as u8 as i8) as i32);
     let cb = _mm256_set1_epi32(((cte >> 8) as u8 as i8) as i32);
     let cb2 = _mm256_set1_epi32(((cte >> 16) as u8 as i8) as i32);
@@ -604,7 +604,7 @@ unsafe fn color_run_avx2(dst: *mut u32, n: usize, cte: u32) {
     if i < n {
         color_run_sse2(dst.add(i), n - i, cte);
     }
-}
+}}
 
 /// VP8L 色变换逆变换（整个图像；`bits` 块位宽、`data` 块乘数网格）。返回 false = SIMD
 /// 未就绪（调用方回退 vp8l.rs 标量整段）。

@@ -101,8 +101,8 @@ pub(crate) fn decode_vp8_tight(frame: &[u8], width: u32, height: u32) -> Result<
 /// Safety 注释）。省去 `vec![0u8; len]` 的全量 memset——大缓冲（RGBA 输出/紧密平面）零化
 /// 在主线程关键路径上（P-B 直出已覆盖全部字节），逐字节恒等。
 #[inline]
-pub(crate) unsafe fn uninit_vec_u8(len: usize) -> Vec<u8> {
+pub(crate) unsafe fn uninit_vec_u8(len: usize) -> Vec<u8> { unsafe {
     let mut v = Vec::with_capacity(len);
     v.set_len(len);
     v
-}
+}}

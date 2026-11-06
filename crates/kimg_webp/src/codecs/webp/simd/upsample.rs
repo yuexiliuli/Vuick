@@ -153,7 +153,7 @@ unsafe fn upsample_fancy_trow_avx2(cur: *const u8, adj: *const u8, t: *mut u16) 
         let c = _mm256_loadu_si256(cur as *const __m256i);
         let a = _mm256_loadu_si256(adj as *const __m256i);
         let three = _mm256_set1_epi16(3);
-        let zero = _mm256_setzero_si256();
+        let _zero = _mm256_setzero_si256();
         // 低 16 列 → t[col..col+16]，高 16 列 → t[col+16..col+32]。
         let clo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(c));
         let chi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(c, 1));
