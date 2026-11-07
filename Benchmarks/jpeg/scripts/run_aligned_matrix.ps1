@@ -1,14 +1,16 @@
-# turbo 端对齐测量矩阵（2026-11-07）：probe(tj3-rgba / tj2-rgb) × C#(rgba / rgb) × 语料(A=19 baseline, B=B2 广谱 114)。
+# turbo 端对齐测量矩阵（2026-11-07；2026-11-08 语料切 446 主线）：probe(tj3-rgba / tj2-rgb) × C#(rgba / rgb) × 语料(446 = Sdcb 官方矩阵)。
 # 目标：对齐到 Sdcb 官方基准口径（tj3 + RGBA32 输出 + 广谱）后，C#/turbo 从历史 1.076 往哪走、离 Sdcb 0.82 差多少。
+# 注：旧双语料（A=19 baseline / B=B2 广谱 114，jpeg_broad 已废）角色由 446 全量替代，矩阵改为
+# 单语料（-CorpusA 指向新集合即可复用）两 turbo 口径直接跑；对齐口径（tj3-rgba vs C#-rgba、
+# tj2-rgb vs C#-rgb）不变。
 #
-# 用法：pwsh -File Benchmarks\jpeg\scripts\run_aligned_matrix.ps1 [-NoSettle] [-CorpusB <dir>]
+# 用法：pwsh -File Benchmarks\jpeg\scripts\run_aligned_matrix.ps1 [-NoSettle] [-CorpusA <dir>]
 # - 长命令一律前台阻塞到结束（K86，禁后台化）。
 # - 产物：logs/aligned_matrix_<ts>.log（UTF-8 无 BOM）＋每 cell 独立日志（logs/aligned_*_<ts>_*.log）。
 # - 探针 env：KIMG_JPEG_TURBO_ROUNDS=9；C# env: JPEG_REF_ROUNDS=9。
 param(
     [switch]$NoSettle,        # 跳过静置（CI/已有热机态）
-    [string]$CorpusA,         # 缺省 Benchmarks\corpus\JPEG（19 baseline）
-    [string]$CorpusB          # 缺省 %TEMP%\kilo\jpeg_broad（B2 广谱 114）
+    [string]$CorpusA          # 缺省 Benchmarks\corpus\JPEG（446 = Sdcb 官方矩阵；env KIMG_JPEG_CORPUS 可覆盖）
 )
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -17,7 +19,6 @@ $suite = Resolve-Path (Join-Path $here '..')
 $logDir = Join-Path $suite 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 if (-not $CorpusA) { $CorpusA = Join-Path $root 'Benchmarks\corpus\JPEG' }
-if (-not $CorpusB) { $CorpusB = Join-Path $env:TEMP 'kilo\jpeg_broad' }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $log = Join-Path $logDir "aligned_matrix_$stamp.log"
@@ -30,21 +31,20 @@ $py = Get-Command python -ErrorAction SilentlyContinue
 function Write-Log { param([string]$m) $m | Tee-Object -FilePath $log -Append }
 
 Write-Log "== turbo 端对齐测量 $stamp =="
-Write-Log "root=$root corpusA=$CorpusA corpusB=$CorpusB settle=$(-not $NoSettle)"
+Write-Log "root=$root corpusA=$CorpusA settle=$(-not $NoSettle)"
 
 if (-not (Test-Path $CorpusA)) { Write-Error "CorpusA 不存在: $CorpusA" }
-if (-not (Test-Path $CorpusB)) { Write-Error "CorpusB 不存在: $CorpusB" }
 
-# 0) release 探针构建（一次，四 cell 复用）
+# 0) release 探针构建（一次，两 cell 复用）
 Write-Log '== release probe build =='
 cargo build --release --manifest-path $probeManifest 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log -Append
 if ($LASTEXITCODE -ne 0) { Write-Error '探针 release 构建失败'; exit 1 }
 
 $env:KIMG_JPEG_TURBO_ROUNDS = '9'
 $env:JPEG_REF_ROUNDS = '9'
-$corpora = @(@{Label='A'; Dir=$CorpusA}, @{Label='B'; Dir=$CorpusB})
+$corpora = @(@{Label='A'; Dir=$CorpusA})
 
-# 1) C# 参照（每语料 rgb + rgba 两轮；rgba 只计时不 dump；过滤 # 注释行与 | name | ms | 表）
+# 1) C# 参照（语料 rgb + rgba 两轮；rgba 只计时不 dump；过滤 # 注释行与 | name | ms | 表）
 $csvcLogs = @{}
 foreach ($c in $corpora) {
     foreach ($m in @('rgb','rgba')) {
@@ -83,7 +83,7 @@ foreach ($c in $corpora) {
     }
 }
 
-# 3) 合成四 cell 表：probe(<turbo 口径>) × C#(<对应输出格式>)
+# 3) 合成 cell 表：probe(<turbo 口径>) × C#(<对应输出格式>)
 Write-Log ''
 Write-Log '== 矩阵合成 =='
 $env:PYTHONUTF8 = '1'
@@ -92,10 +92,8 @@ $matrix = @(
     '|---|---|---|---|---|'
 )
 $cells = @(
-    @{Label='A';  Name='A baseline19'; Tm='tj2-rgb';   Cm='rgb'},
-    @{Label='A';  Name='A baseline19'; Tm='tj3-rgba';  Cm='rgba'},
-    @{Label='B';  Name='B 广谱114';    Tm='tj2-rgb';   Cm='rgb'},
-    @{Label='B';  Name='B 广谱114';    Tm='tj3-rgba';  Cm='rgba'}
+    @{Label='A';  Name='A 446矩阵';    Tm='tj2-rgb';   Cm='rgb'},
+    @{Label='A';  Name='A 446矩阵';    Tm='tj3-rgba';  Cm='rgba'}
 )
 foreach ($cell in $cells) {
     $plog = $probeLogs["$($cell.Label):$($cell.Tm)"]

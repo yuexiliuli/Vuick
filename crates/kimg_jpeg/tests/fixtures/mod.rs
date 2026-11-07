@@ -13,7 +13,9 @@ use zune_core::options::DecoderOptions;
 
 use kimg_core::color::ColorType;
 
-/// 语料目录：`<workspace>/target/测试图片/jpeg`（env `KIMG_JPEG_CORPUS` 覆盖）。
+/// 语料目录：默认主语料 `<workspace>/Benchmarks/corpus/JPEG`（446 = Sdcb 官方矩阵，平铺
+/// `组名__场景.jpg`：420/444×q50-100 + rst/opt/prog + 422/gray + camera；目录 gitignore，缺失
+/// 时测试 SKIP）；env `KIMG_JPEG_CORPUS` 优先覆盖（显式指定姿势不变）。
 pub fn corpus_dir() -> PathBuf {
     if let Ok(p) = std::env::var("KIMG_JPEG_CORPUS") {
         return PathBuf::from(p);
@@ -21,9 +23,9 @@ pub fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .join("target")
-        .join("测试图片")
-        .join("jpeg")
+        .join("Benchmarks")
+        .join("corpus")
+        .join("JPEG")
 }
 
 pub fn collect_jpegs(dir: &Path) -> Vec<PathBuf> {

@@ -1,6 +1,6 @@
 //! JPEG 自研引擎 vs C# Sdcb.SimdCodecs.Jpeg `DecodeTo` 参照字节恒等对照（正确性硬闸）。
 //!
-//! 语料：`<workspace>/target/测试图片/jpeg`（env `KIMG_JPEG_CORPUS` 可覆盖）。
+//! 语料：`<workspace>/Benchmarks/corpus/JPEG`（446 = Sdcb 官方矩阵；env `KIMG_JPEG_CORPUS` 可覆盖）。
 //! 参照：`<workspace>/target/csharp-ref`（外部 C# runner 产出，每语料一张）：
 //! `<stem>.<w>x<h>.{gray|rgb}`。gray = 灰度 1B/像素（= 我们 `ColorType::L8`），
 //! rgb = 交错 RGB 3B/像素（= 我们 `ColorType::Rgb8`）。

@@ -18,12 +18,25 @@ Benchmarks/jpeg/
 ## 用法
 
 ```powershell
-# 1) C# 参照（首次或换语料必跑）：-> Benchmarks/corpus/csharp/jpeg_csharp.log + target/csharp-ref 19 张
+# 1) C# 参照（首次或换语料必跑）：-> Benchmarks/corpus/csharp/jpeg_csharp.log + target/csharp-ref 446 张（= Sdcb 官方矩阵）
 pwsh -File Benchmarks\jpeg\scripts\run_csharp_ref.ps1
 
 # 2) 一键对账：oracle 闸（debug，byte 恒等）+ release 探针 + 三路表
 pwsh -File Benchmarks\jpeg\scripts\run_acceptance.ps1
 # 结尾一行 `ours÷turbo geomean=… / ours÷C# geomean=…` 即主口径，完整表在 logs/acceptance_<ts>.log
+```
+
+## progressive 探针（prog_scanp / prog_maskp）
+
+`-prog` 组（`420-q75-3mp-prog__*` / `420-q95-3mp-prog__*`，共 20 张）是 446 矩阵里的
+progressive 文件；两条探针按 `-prog` 组名过滤，`prog_files` 应 = 20。
+
+```powershell
+$env:KIMG_JPEG_CORPUS='E:\Rust\gpui-editor\Benchmarks\corpus\JPEG'
+$env:KIMG_JPEG_SCAN_PROFILE='1'
+cargo test -p kimg_jpeg --release --test prog_scanp -- --ignored --nocapture   # SCANP 逐 scan 墙钟占比
+$env:KIMG_JPEG_PROG_MASK_PROFILE='1'
+cargo test -p kimg_jpeg --release --test prog_maskp -- --ignored --nocapture   # POPMASK prog_mask 分布
 ```
 
 ## 铁律（与 webp/heif 套件一致）
@@ -41,6 +54,8 @@ pwsh -File Benchmarks\jpeg\scripts\run_acceptance.ps1
 - 灰度判定：自研 `color_type()==L8` → 灰度（turbo `TJPF_GRAY` 1B/px、C# `Gray8`；其余彩色
   turbo `TJPF_RGB` 3B/px、C# `Rgb24`）——三路同输出布局，逐字节可对。
 - 计时姿态：双方均复用调用方已分配缓冲（暖态零分配 direct 姿态）。
-- 语料：`Benchmarks/corpus/JPEG` 19 张（env `KIMG_JPEG_CORPUS` 覆盖）。
+- 语料：`Benchmarks/corpus/JPEG`，446 张 = Sdcb 官方矩阵（420/444×q50-100 + rst/opt/prog +
+  422/gray + camera×6 平铺，命名 `组名__场景.jpg`，如 `420-q75-3mp-prog__architecture-teatro.jpg`；
+  目录 gitignore，缺失时测试 SKIP；env `KIMG_JPEG_CORPUS` 覆盖）。
 - C# 参照：`Sdcb.SimdCodecs.Jpeg`（纯托管解码器）`DecodeTo` 计时；其输出同时 dump 到
   `target/csharp-ref/<stem>.<w>x<h>.{rgb|gray}` 作字节恒等参照（oracle 闸消费）。

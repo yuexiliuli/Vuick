@@ -38,8 +38,9 @@ fn median_ms<F: FnMut()>(mut f: F, rounds: usize) -> f64 {
     acc[acc.len() / 2]
 }
 
-/// 候选文件：语料 `KIMG_JPEG_CORPUS` 覆盖，缺省 `<workspace>/target/测试图片/jpeg`
-///（fixtures::corpus_dir，与其余测试同口径，不硬编码不存在的目录）。
+/// 候选文件：语料 `KIMG_JPEG_CORPUS` 覆盖，缺省 `<workspace>/Benchmarks/corpus/JPEG`
+///（fixtures::corpus_dir，与其余测试同口径，不硬编码不存在的目录）。选样按尺寸
+///（2048 宽 / 1024 方 / 1152 竖）优先、不足按语料序补可解文件，不依赖固定文件名——446 下依旧成立。
 type Candidate = (String, PathBuf, (u32, u32)); // (文件名, 路径, 尺寸)
 
 /// 选取代表文件：优先 2048 宽 / 1024 方 / 1152 竖 各一（按语料排序首次命中），

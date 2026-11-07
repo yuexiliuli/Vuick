@@ -11,7 +11,7 @@
 //!
 //! 用法（长命令前台阻塞到结束，K86）：
 //! ```text
-//! $env:KIMG_JPEG_CORPUS='C:\Users\yuexi\AppData\Local\Temp\kilo\jpeg_broad'
+//! $env:KIMG_JPEG_CORPUS='E:\Rust\gpui-editor\Benchmarks\corpus\JPEG'
 //! $env:KIMG_JPEG_SCAN_PROFILE='1'
 //! cargo test -p kimg_jpeg --release --test prog_scanp -- --ignored --nocapture | Tee-Object -FilePath Benchmarks\jpeg\logs\prog_scanp_<ts>.log
 //! ```
@@ -43,12 +43,13 @@ fn scanp() {
         return;
     }
     let files = collect_jpegs(&dir);
-    // 只统计名含 `progressive-` 的（任务口径）。
+    // 只统计名含 `-prog` 的（446 矩阵组名：420-q75-3mp-prog / 420-q95-3mp-prog，共 10+10=20；
+    // `-prog` 不误伤 `-opt`/`-rst`/`-q75` 等邻近组名）。
     let prog: Vec<PathBuf> = files
         .into_iter()
         .filter(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().contains("progressive-"))
+                .map(|n| n.to_string_lossy().contains("-prog"))
                 .unwrap_or(false)
         })
         .collect();

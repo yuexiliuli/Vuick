@@ -44,7 +44,7 @@ use super::JpegDecoder;
 use kimg_core::ImageDecoder as _;
 
 /// 语料目录：`KIMG_JPEG_CORPUS` 覆盖（任务：Benchmarks/corpus/JPEG），
-/// 缺省回落到 `<workspace>/target/测试图片/jpeg`（fixtures 同口径）。
+/// 缺省主语料 `<workspace>/Benchmarks/corpus/JPEG`（446 矩阵，fixtures 同口径）。
 fn corpus_dir() -> PathBuf {
     if let Ok(p) = std::env::var("KIMG_JPEG_CORPUS") {
         return PathBuf::from(p);
@@ -52,9 +52,9 @@ fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .join("target")
-        .join("测试图片")
-        .join("jpeg")
+        .join("Benchmarks")
+        .join("corpus")
+        .join("JPEG")
 }
 
 fn collect_jpegs(dir: &Path) -> Vec<PathBuf> {

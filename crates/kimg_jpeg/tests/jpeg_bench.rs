@@ -4,7 +4,7 @@
 //! ```text
 //! cargo test -p kimg_jpeg --release --test jpeg_bench -- --ignored --nocapture
 //! ```
-//! 语料：`<workspace>/target/测试图片/jpeg`（env `KIMG_JPEG_CORPUS` 可覆盖）。
+//! 语料：`<workspace>/Benchmarks/corpus/JPEG`（446 = Sdcb 官方矩阵；env `KIMG_JPEG_CORPUS` 可覆盖）。
 //! 输出 `JPEG_BENCH FILE <name> old=..ms new=..ms ratio=..` 与 `JPEG_BENCH AGG ...`
 //! （ratio = new ÷ old，new 更快则 <1）。
 //!

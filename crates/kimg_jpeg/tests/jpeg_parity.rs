@@ -1,6 +1,6 @@
 //! JPEG 自研引擎 vs zune-jpeg oracle 字节恒等对照（回归硬闸）。
 //!
-//! 语料：`<workspace>/target/测试图片/jpeg`（env `KIMG_JPEG_CORPUS` 可覆盖）。
+//! 语料：`<workspace>/Benchmarks/corpus/JPEG`（446 = Sdcb 官方矩阵；env `KIMG_JPEG_CORPUS` 可覆盖）。
 //! 每个文件：oracle（zune-jpeg 0.5.15，== image 0.25 自用后端，即被替换前的旧行为）与
 //! 自研 `codecs::jpeg::JpegDecoder` 各自 `ImageDecoder` 同口径解码到其声明的
 //! color_type → 逐字节比较，必须完全一致（IDCT/上采样/颜色换算三处取整全等比）。
