@@ -32,6 +32,8 @@ if (-not (Test-Path $dotnet)) { Write-Error '未找到 dotnet（%LOCALAPPDATA%\M
 $log = Join-Path $root 'Benchmarks\corpus\csharp\jpeg_csharp.log'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
 New-Item -ItemType Directory -Force -Path $RefOut | Out-Null
+# 先清空 RefOut（防止旧语料残留累积——上轮曾 133 个文件混入 446 集）
+Get-ChildItem $RefOut -File -ErrorAction SilentlyContinue | Remove-Item -Force
 
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
