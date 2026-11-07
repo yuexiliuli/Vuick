@@ -1174,7 +1174,7 @@ impl<'a> Decoder<'a> {
             );
         }
 
-        self.finish_progressive_decoding(&block, pixels)
+        self.finish_progressive_decoding(&block, &prog_mask, pixels)
     }
 
     /// 解单个 scan 的熵编码数据（1:1 复刻 zune `parse_entropy_coded_data`；P1 A′ 改造；
@@ -1494,10 +1494,16 @@ impl<'a> Decoder<'a> {
     }
 
     /// 渐进收尾：整帧反量化 → f32 IDCT → 后处理（C# `EmitCoefficients` 同款）。
+    ///
+    /// `prog_mask`（P2 逐块非零掩码）与本函数平铺块序逐位对齐：对分量 `position`、MCU 行
+    /// `i`、竖直子块 `k`、水平子块 `j`，`flat = (i*vertical_sample + k)*mcu_x + j` 即
+    /// `prog_mask[position]` 下标（熵段非交织 AC scan 以同序 `start>>6` 写掩码，DC scan 不
+    /// 涉 bit0；`block`/`prog_mask` 由同一 `len` 分配，灰度下采样修正对两者一致）。
     #[allow(clippy::too_many_lines)]
     fn finish_progressive_decoding(
         &mut self,
         block: &[Vec<i16>; MAX_COMPONENTS],
+        prog_mask: &[Vec<u64>; MAX_COMPONENTS],
         pixels: &mut [u8],
     ) -> Result<(), DecodeError> {
         let mcu_height = if self.is_interleaved {
@@ -1541,9 +1547,21 @@ impl<'a> Decoder<'a> {
         }
 
         // 反量化、IDCT、输出（逐 MCU 行）
-        // A/B 门控（进程内一次）：`KIMG_JPEG_PROG_FASTPATH=0` → 仅向量化反量化、恒全量
-        // IDCT（旧路径），缺省 → DC-only 快路径路由。同二进制 A/B（K93 姿势）。
+        // A/B 门控（进程内一次，K93 姿势）：
+        //   `KIMG_JPEG_PROG_FASTPATH=0` → 仅向量化反量化、恒全量 IDCT（最早旧路径）；
+        //   `KIMG_JPEG_FINISH_FUSED=0` → 回退 HEAD 6de52fe 的旧 finish（dequant_block 全量
+        //     算 + ac_zero 判定路由），缺省 → 候选 A+B（prog_mask 预判 DC-only 免全量 dequant
+        //     + fused「反量化∘IDCT」内核）。两开关都开 = 本次默认。
+        // popcount 探针（`KIMG_JPEG_PROG_MASK_PROFILE=1`，缺省关=零注入）只读计数不改路径。
+        let fused = finish_fused_enabled();
         let fastpath = prog_fastpath_enabled();
+        let maskp = popmask_profile_enabled();
+        let mut pop = MaskProfile::default();
+        let t_maskp = if maskp {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         for i in 0..mcu_height {
             for (position, component) in self.components.iter_mut().enumerate() {
                 if !component.needed {
@@ -1558,8 +1576,11 @@ impl<'a> Decoder<'a> {
 
                 // 每行 MCU 宽对应的数据单元数
                 let mcu_x = component.width_stride / 8;
+                let v_samp = component.vertical_sample;
+                // 与 `prog_mask[position]` 对齐的块掩码切片（flat 下标见本函数 doc）。
+                let pmask = prog_mask.get(position);
 
-                for k in 0..component.vertical_sample {
+                for k in 0..v_samp {
                     for j in 0..mcu_x {
                         // 反量化（natural-order short wrap，C# `(short)(coeff×q)`）
                         let start = j * 64 + k * 8 * component.width_stride;
@@ -1576,14 +1597,55 @@ impl<'a> Decoder<'a> {
 
                         if !StageProfile::skip_idct() {
                             // 环偏移：C# `((m&1)*RowsPerMcu + v*8)*W2 + bx*8`
-                            let ring_off =
-                                (((i & 1) * component.vertical_sample) + k) * 8 * component.width_stride
-                                    + j * 8;
-                            if fastpath {
+                            let ring_off = (((i & 1) * v_samp) + k) * 8 * component.width_stride
+                                + j * 8;
+                            if fused {
+                                let flat_blk = (i * v_samp + k) * mcu_x + j;
+                                let mask = pmask.and_then(|p| p.get(flat_blk)).copied();
+                                if maskp {
+                                    pop.accum(mask.unwrap_or(0));
+                                }
+                                match mask {
+                                    // 候选 A：终态 AC 全零 → 免全量 dequant，只算 DC
+                                    // （`(coeff[0]*qt16[0]) as i16`，与 dequant_block 截断同义）
+                                    // 后走 DC-only（全量 idct 于 AC 全零块逐位恒等，
+                                    // dconly_eq_avx2_full_for_ac_zero 已证 → 逐块恒等保持）。
+                                    Some(0) => {
+                                        // 路由前提：mask==0 ⇒ 终态 AC 系数全零（mask 位 p=zigzag
+                                        // 系数序 p，UN_ZIGZAG 双射 → natural 序 1..63 逐位全零）。
+                                        // debug_assert 防未来熵段回归静默漏置 mask 位（mask==0 但 AC
+                                        // 非零 → 本旁路会错判 DC-only 改输出；release 恒等于零开销）。
+                                        debug_assert!(qt_slice[1..].iter().all(|&c| c == 0));
+                                        let dc = (i32::from(qt_slice[0])
+                                            * i32::from(qt16[position][0]))
+                                            as i16;
+                                        cs::idct8x8_dc_only(
+                                            dc,
+                                            &mut component.cs_ring,
+                                            ring_off,
+                                            component.width_stride,
+                                        );
+                                    }
+                                    // 候选 B：非 DC-only 块走 fused「反量化∘IDCT」（mullo 直喂
+                                    // f32 装载，删 128B store+load+栈框；非零块不再算 ac_zero
+                                    // movemask 冗余比较）。mask 缺失（边际越界）→ 保守全量，
+                                    // 全量 idct 对 DC-only 块亦恒等 → 任意情况字节恒等。
+                                    _ => {
+                                        dequant_idct8x8(
+                                            qt_slice,
+                                            &qt16[position],
+                                            &mut component.cs_ring,
+                                            ring_off,
+                                            component.width_stride,
+                                        );
+                                    }
+                                }
+                            } else if fastpath {
                                 // 反量化（natural-order short wrap，C# `(short)(coeff×q)`）
                                 // + AC 全零判定（终态系数 1..63 全零 → DC-only，对齐 C#
                                 // `nz==0/仅DC → last==0 → DcOnly(data[0])`，逐位恒等）。
-                                let ac_zero = dequant_block(qt_slice, &qt16[position], &mut tmp);
+                                let ac_zero =
+                                    dequant_block(qt_slice, &qt16[position], &mut tmp);
                                 if ac_zero {
                                     cs::idct8x8_dc_only(
                                         tmp[0],
@@ -1618,6 +1680,13 @@ impl<'a> Decoder<'a> {
             self.post_process(pixels, i, width)?;
         }
 
+        // 探针：打印本帧 popcount 分布（env 门控；关联文件名由测量侧解码前打印的
+        // `POPMASK FILE <name>` 标记行给出，与 STAGE/SCANP 同款关联口径）。
+        if maskp {
+            let total_ms = t_maskp.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+            pop.print(total_ms);
+        }
+
         Ok(())
     }
 }
@@ -1632,6 +1701,81 @@ fn prog_fastpath_enabled() -> bool {
         let t = v.trim();
         !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
     })
+}
+
+/// 渐进 finish 候选 A+B（本次改动）是否启用：`KIMG_JPEG_FINISH_FUSED` 缺省开，
+/// `=0/false/off` 关 → 回退到 HEAD 6de52fe 的旧 finish（`dequant_block` 全量 + ac_zero
+/// 路由，即 `KIMG_JPEG_PROG_FASTPATH` 原逻辑）——进程内一次读，供同二进制 A/B（K93）。
+#[inline]
+fn finish_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("KIMG_JPEG_FINISH_FUSED").unwrap_or_default();
+        let t = v.trim();
+        !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+    })
+}
+
+/// `KIMG_JPEG_PROG_MASK_PROFILE=1`：渐进 finish 逐块 `prog_mask` popcount 分布探针
+/// （缺省关=零注入；只在启用时读 env + 计数，不改算法路径/位序）。供候选 C（prog_mask
+/// 稀疏 IDCT 分层）取证：DC-only 占比 / 非零 AC ≤4 / 5-16 / >16。
+#[inline]
+fn popmask_profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("KIMG_JPEG_PROG_MASK_PROFILE")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// 逐块 popcount 分布累加器（探针读数；只在 `popmask_profile_enabled()` 时构造/打印）。
+#[derive(Default)]
+struct MaskProfile {
+    n: u64,
+    dc_only: u64,
+    ac_le4: u64,
+    ac_516: u64,
+    ac_gt16: u64,
+}
+
+impl MaskProfile {
+    /// 累加一块的 popcount（位 p = zigzag 系数序 p，bit0=DC 恒不置 → popcount=非零 AC 数）。
+    #[inline]
+    fn accum(&mut self, mask: u64) {
+        self.n += 1;
+        if mask == 0 {
+            self.dc_only += 1;
+        } else {
+            let pc = u64::from(mask.count_ones());
+            if pc <= 4 {
+                self.ac_le4 += 1;
+            } else if pc <= 16 {
+                self.ac_516 += 1;
+            } else {
+                self.ac_gt16 += 1;
+            }
+        }
+    }
+
+    /// 打印一行 `POPMASK ...`（stdout，与 `SCANP`/`STAGE` 同口径，离线聚合按文件归并）。
+    fn print(&self, total_ms: f64) {
+        let pct = |v: u64| {
+            if self.n > 0 {
+                v as f64 / self.n as f64 * 100.0
+            } else {
+                0.0
+            }
+        };
+        println!(
+            "POPMASK n={} dc_only={:.2}% ac_le4={:.2}% ac_516={:.2}% ac_gt16={:.2}% finish_probe_ms={total_ms:.3}",
+            self.n,
+            pct(self.dc_only),
+            pct(self.ac_le4),
+            pct(self.ac_516),
+            pct(self.ac_gt16),
+        );
+    }
 }
 
 /// 反量化 64 系数块（natural-order `(short)(coeff × q)` 截断 wrap，恒等于旧 i32 标量
@@ -1693,6 +1837,38 @@ unsafe fn dequant_block_avx2(coeff: &[i16], qt16: &[i16; 64], out: &mut [i16; 64
         let eq = _mm256_cmpeq_epi8(all_ac, _mm256_setzero_si256());
         _mm256_movemask_epi8(eq) == -1
     }
+}
+
+/// 反量化 ∘ IDCT（候选 B fused 分派）：AVX2 → `cs_avx2::dequant_idct8x8_avx2`
+/// （mullo 直喂 f32 IDCT，删 128B store+load+栈框）；标量 → `dequant_block` + `cs::idct8x8`
+/// （逐位恒等，dequant_avx2_eq_scalar / cs 侧 idct8x8_avx2_eq_scalar 测试骨架已证）。
+/// 仅用于「非 DC-only」块（DC-only 由调用方经 prog_mask 预判走 `idct8x8_dc_only`）。
+/// `coeff.len()` 须为 64；`out` 以 `(offset, stride)` 写 8×8 字节块。
+#[inline]
+fn dequant_idct8x8(
+    coeff: &[i16],
+    qt16: &[i16; 64],
+    out: &mut [u8],
+    offset: usize,
+    stride: usize,
+) {
+    debug_assert_eq!(coeff.len(), 64);
+    #[cfg(target_arch = "x86_64")]
+    if crate::codecs::jpeg::avx2::avx2_enabled() {
+        // SAFETY: 调用方保证 coeff 长度 64；avx2_enabled() 保证 CPU 支持 AVX2。
+        return unsafe {
+            crate::codecs::jpeg::cs_avx2::dequant_idct8x8_avx2(
+                coeff.as_ptr(),
+                qt16.as_ptr(),
+                out,
+                offset,
+                stride,
+            )
+        };
+    }
+    let mut tmp = [0_i16; DCT_BLOCK];
+    let _ = dequant_block(coeff, qt16, &mut tmp);
+    cs::idct8x8(&tmp, out, offset, stride);
 }
 
 /// 从位流中读取下一个 marker（读取到 marker 或 EOF）。
@@ -1873,6 +2049,122 @@ mod tests {
             unsafe { cs_avx2::idct8x8_avx2(&data, &mut out_full, 0, 8) };
             cs::idct8x8_dc_only(dc, &mut out_dc, 0, 8);
             assert_eq!(out_full, out_dc, "DC-only 极端不恒等 dc={dc}");
+        }
+    }
+
+    /// Fused「反量化∘IDCT」内核是否与「分阶段 dequant_block → idct8x8」逐位恒等。
+    /// 随机 500 例 + 边角矩阵（全零/仅 DC/单 AC 逐位/极端值/8 位与 16 位量化表折叠负）。
+    /// 结合既有 `dequant_avx2_eq_scalar`（dequant AVX2≡标量）与 cs 侧 `idct8x8_avx2_eq_scalar`
+    /// （IDCT AVX2≡标量），链式证「fused ≡ 标量 路径」；标量路径（dequant_block 标量分支 +
+    /// cs::idct8x8 标量分支）保持原样不动。
+    #[test]
+    fn dequant_idct_fused_eq_staged() {
+        use crate::codecs::jpeg::cs_avx2;
+        if !crate::codecs::jpeg::avx2::avx2_enabled() {
+            return;
+        }
+        let mut seed = 0xDEAD_BEEF_1337u64;
+        let check = |coeff: &[i16; 64], qt16: &[i16; 64]| {
+            // 分阶段参照：dequant_block_avx2 → idct8x8_avx2（均已被既有测试证 ≡ 标量）。
+            let mut tmp = [0i16; 64];
+            // SAFETY: 已门控 AVX2
+            unsafe { super::dequant_block_avx2(coeff, qt16, &mut tmp) };
+            let mut ref_out = [0u8; 64];
+            // SAFETY: 已门控 AVX2
+            unsafe { cs_avx2::idct8x8_avx2(&tmp, &mut ref_out, 0, 8) };
+            // fused：经 mcu 侧分派（avx2 已门控 → cs_avx2::dequant_idct8x8_avx2）。
+            let mut fused_out = [0u8; 64];
+            super::dequant_idct8x8(coeff, qt16, &mut fused_out, 0, 8);
+            assert_eq!(fused_out, ref_out, "fused ≠ staged (dequant∘idct)");
+        };
+        // 边角矩阵：全零/仅 DC（含极值）、单 AC 逐位（含 128 位 lane 边界 8）。
+        for &dc in &[0i16, 1, 12345, i16::MIN, i16::MAX, -32768, 32767] {
+            let mut coeff = [0i16; 64];
+            coeff[0] = dc;
+            let mut qt = [8i16; 64];
+            qt[3] = 0;
+            check(&coeff, &qt);
+        }
+        for ac_idx in 1..64i32 {
+            let mut coeff = [0i16; 64];
+            coeff[0] = 100;
+            coeff[ac_idx as usize] = 300;
+            check(&coeff, &[8i16; 64]);
+        }
+        // 随机 500 例（含 16 位量化表折叠负与全零量化表）。
+        for _ in 0..500 {
+            let mut coeff = [0i16; 64];
+            let dense = (lcg(&mut seed) >> 32) % 2 == 0;
+            for i in 0..64 {
+                coeff[i] = if dense {
+                    lcg(&mut seed) as i16
+                } else if i == 0 {
+                    lcg(&mut seed) as i16
+                } else if (lcg(&mut seed) >> 40) % 100 == 0 {
+                    lcg(&mut seed) as i16
+                } else {
+                    0
+                };
+            }
+            let mut qt16 = [0i16; 64];
+            for q in qt16.iter_mut() {
+                *q = match lcg(&mut seed) % 3 {
+                    0 => (lcg(&mut seed) % 256) as i16,
+                    _ => (lcg(&mut seed) % 65536) as i16,
+                };
+            }
+            check(&coeff, &qt16);
+        }
+    }
+
+    /// prog_mask 的 flat 块序与 finish 平铺块序对齐（探针/DC-only 路由的下标前提）。
+    /// 用真实 4:2:0 几何（16×2 MCU 网格）逐字复刻两条代码路径各自的循环，验证：
+    /// ① finish 逐块下标 `(i_mcu*v_samp+k)*mcu_x + j` 落在 `prog_mask` 长度内（不越界）；
+    /// ② finish 与熵段 AC scan（非交织逐数据单元 `j + row*width_stride/8`）产生的块序序列
+    ///    逐位一致且双射（无遗漏/重叠）——即「熵段写哪、finish 读哪」同一块序。
+    /// 4:2:0 几何（h_max=2, v_max=2；mcu_x=mcu_y=2）：
+    ///   Y： h_samp=2, v_samp=2 → width_stride=2*2*8=32、mcu_x_local=4、块数=2*2*2*2=16；
+    ///   Cb/Cr：h_samp=1, v_samp=1 → width_stride=2*1*8=16、mcu_x_local=2、块数=2*1*1*2=4。
+    #[test]
+    fn prog_mask_flat_order_aligned() {
+        let mcu_x_mcu = 2usize; // 2×2 MCU 网格
+        let mcu_y = 2usize;
+        // (h_samp, v_samp) 真实 4:2:0 三分量
+        let comps: [(usize, usize); 3] = [(2, 2), (1, 1), (1, 1)];
+        for &(h_samp, v_samp) in &comps {
+            let width_stride = mcu_x_mcu * h_samp * 8; // i16 系数字面宽（= 熵段 comp.width_stride）
+            let mcu_x = width_stride / 8; // finish 的 mcu_x（= width_stride/8）
+            let n_blocks = mcu_x_mcu * h_samp * v_samp * mcu_y;
+            // ① finish 逐 MCU 行循环（mcu.rs finish_progressive_decoding 同式）：
+            let mut finish_flat: Vec<usize> = Vec::new();
+            for i in 0..mcu_y {
+                for k in 0..v_samp {
+                    for j in 0..mcu_x {
+                        let flat = (i * v_samp + k) * mcu_x + j;
+                        assert!(flat < n_blocks, "finish flat 越界: flat={flat} n={n_blocks}");
+                        finish_flat.push(flat);
+                    }
+                }
+            }
+            // ② 熵段非交织 AC scan 逐数据单元循环（bitstream/mcu.rs 同式：
+            //    `start = 64*(j + i*(width_stride/8))`，i=数据单元行、j=列）：
+            let rows = mcu_y * v_samp; // 数据单元行数
+            let cols = width_stride / 8; // 数据单元列数（= mcu_x_local）
+            let mut entropy_flat: Vec<usize> = Vec::new();
+            for i in 0..rows {
+                for j in 0..cols {
+                    let start = 64 * (j + i * (width_stride / 8));
+                    assert!(start / 64 < n_blocks, "熵段 flat 越界: block={} n={n_blocks}", start / 64);
+                    entropy_flat.push(start / 64);
+                }
+            }
+            // finish 与熵段各访问 n_blocks 个不重复块、且序列逐位一致（同一块序）。
+            let mut f_sorted = finish_flat.clone();
+            f_sorted.sort_unstable();
+            f_sorted.dedup();
+            assert_eq!(f_sorted.len(), n_blocks, "finish 块序有重叠/遗漏 (v_samp={v_samp})");
+            assert_eq!(finish_flat, entropy_flat, "finish 与熵段块序不一致 (v_samp={v_samp})");
+            assert_eq!(f_sorted.len(), entropy_flat.len(), "熵段块数不符 (v_samp={v_samp})");
         }
     }
 }

@@ -138,6 +138,23 @@ mod kernels {
         _mm256_cvtepi32_ps(v)
     }
 
+    /// 从 16 个已反量化 i16（自然序两行：lane 内 low=行 r、high=行 r+1）取一行 → 8 个 f32。
+    /// 转换与 `load_row_f32` 逐位同构（cvtepi16_epi32 → cvtepi32_ps，无取整/饱和），供
+    /// fused「反量化 ∘ IDCT」内核直接装载而无需经 128B 内存往返。
+    /// `#[inline]`：被 fused 内核内联，避免 8 个 f32 行经函数边界落入栈（Win64 只
+    /// 传 4 个向量寄存器参数——非内联调用会把这 128B 往返原样带回）。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dequant_row_f32(v: __m256i, hi: bool) -> __m256 {
+        let lo = if hi {
+            _mm256_extracti128_si256::<1>(v)
+        } else {
+            _mm256_extracti128_si256::<0>(v)
+        };
+        let i32v = _mm256_cvtepi16_epi32(lo);
+        _mm256_cvtepi32_ps(i32v)
+    }
+
     /// 完整 8×8 IDCT（`JpegIdct.Idct8x8V256`；无 half/sparse 化简，与 `cs::idct8x8` 全量一致）。
     ///
     /// P-B1：pass2 输出是 8 个「列向量」（c_k = M2 第 k 列），旧实现先一次 8×8 f32 全转置
@@ -155,13 +172,35 @@ mod kernels {
         let f5 = load_row_f32(d, 5);
         let f6 = load_row_f32(d, 6);
         let f7 = load_row_f32(d, 7);
+        idct_from_rows_avx2(f0, f1, f2, f3, f4, f5, f6, f7, out, offset, stride);
+    }
 
+    /// IDCT 公共尾部：8 行 f32 → 输出字节平面（列 pass → 行 pass → 折叠转置装配）。
+    /// 与旧 `idct8x8_avx2` 从「列 pass」起的逐条指令一致；f0..f7 的来源（`load_row_f32`
+    /// 或 fused 反量化后的 `dequant_row_f32`）不影响逐字节结果。
+    /// `#[inline]`：8 个 `__m256` 行参数若非内联会按 Win64 约定只传 4 个向量寄存器、
+    /// 其余落栈（重新引入旧「128B store+load」往返 + 一次调用/栈框），故尽量内联进调用方。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn idct_from_rows_avx2(
+        f0: __m256,
+        f1: __m256,
+        f2: __m256,
+        f3: __m256,
+        f4: __m256,
+        f5: __m256,
+        f6: __m256,
+        f7: __m256,
+        out: &mut [u8],
+        offset: usize,
+        stride: usize,
+    ) {
         // 列 pass（lane j = 列 j）
         let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5, mut r6, mut r7) =
             idct_1d256(f0, f1, f2, f3, f4, f5, f6, f7);
         transpose_ps(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7);
         // 行 pass（lane j = 行 j）→ 输出即 M2 各列（c_k = 第 k 列），无第二次全转置。
-        let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6, mut c7) =
+        let (c0, c1, c2, c3, c4, c5, c6, c7) =
             idct_1d256(r0, r1, r2, r3, r4, r5, r6, r7);
 
         // 输出装配（转置折叠进 pack）：trunc(s + 128.5) + 饱和 pack = `ToSample` 的
@@ -195,6 +234,46 @@ mod kernels {
         for (r, &v) in rows.iter().enumerate() {
             core::ptr::write_unaligned(dst.add(r * stride) as *mut u64, v);
         }
+    }
+
+    /// 反量化 ∘ IDCT 融合内核（候选 B）：mullo 得 4×`__m256i` i16 lane 后直喂
+    /// `dequant_row_f32`，删掉旧「128B store → tmp → 128B load」往返 + 每块函数调用/栈框。
+    /// 逐字节恒等 = `dequant_block`（mullo 低 16 位截断 wrap）∘ `cs::idct8x8`。
+    /// 调用方必须先经 `avx2::avx2_enabled()` 门控 CPU；`coeff`/`qt16` 均 64 i16 natural-order。
+    ///
+    /// SAFETY: `coeff`/`qt16` 指向 64 i16 有效内存；`out.add(offset)` 起按 `(offset, stride)`
+    /// 可写 8×8 字节；CPU 已由 `avx2_enabled()` 门控 AVX2。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn dequant_idct8x8_avx2(
+        coeff: *const i16,
+        qt16: *const i16,
+        out: &mut [u8],
+        offset: usize,
+        stride: usize,
+    ) {
+        let c0 = _mm256_loadu_si256(coeff.add(0) as *const __m256i);
+        let c1 = _mm256_loadu_si256(coeff.add(16) as *const __m256i);
+        let c2 = _mm256_loadu_si256(coeff.add(32) as *const __m256i);
+        let c3 = _mm256_loadu_si256(coeff.add(48) as *const __m256i);
+        let q0 = _mm256_loadu_si256(qt16.add(0) as *const __m256i);
+        let q1 = _mm256_loadu_si256(qt16.add(16) as *const __m256i);
+        let q2 = _mm256_loadu_si256(qt16.add(32) as *const __m256i);
+        let q3 = _mm256_loadu_si256(qt16.add(48) as *const __m256i);
+        // 反量化：mullo_epi16 = 每 16 位乘积的低 16 位（`(short)(coeff×q)` 截断 wrap）。
+        let p0 = _mm256_mullo_epi16(c0, q0);
+        let p1 = _mm256_mullo_epi16(c1, q1);
+        let p2 = _mm256_mullo_epi16(c2, q2);
+        let p3 = _mm256_mullo_epi16(c3, q3);
+        // 直喂 f32 IDCT：每 lane 16 i16 = 自然序两行（low=行 2t、high=行 2t+1）。
+        let f0 = dequant_row_f32(p0, false);
+        let f1 = dequant_row_f32(p0, true);
+        let f2 = dequant_row_f32(p1, false);
+        let f3 = dequant_row_f32(p1, true);
+        let f4 = dequant_row_f32(p2, false);
+        let f5 = dequant_row_f32(p2, true);
+        let f6 = dequant_row_f32(p3, false);
+        let f7 = dequant_row_f32(p3, true);
+        idct_from_rows_avx2(f0, f1, f2, f3, f4, f5, f6, f7, out, offset, stride);
     }
 
     /// P-B1 输出装配：8 个「列向量」i32（I_k = M2 第 k 列的取整样本）→ 两段行主序
@@ -710,4 +789,6 @@ mod kernels {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub(crate) use kernels::{idct8x8_avx2, row16_avx2, row8_avx2, ycc_row16_avx2, ycc_row8_avx2};
+pub(crate) use kernels::{
+    dequant_idct8x8_avx2, idct8x8_avx2, row16_avx2, row8_avx2, ycc_row16_avx2, ycc_row8_avx2,
+};
