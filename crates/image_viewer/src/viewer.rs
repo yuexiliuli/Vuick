@@ -1544,6 +1544,35 @@ mod tests {
         assert!(decode_image_at(&p).is_err());
     }
 
+    /// 真实 HEIF/HEIC（手机 48-tile grid）应能经查看器解码路径 (`decode_generic` →
+    /// `decode_static_first_frame` → `kimg::load_from_memory`) 解出 BGRA 帧；缺失语料 → SKIP。
+    /// 回归：扩展名清单曾缺 heic/heif 导致 .HEIC 被当文本打开失败。
+    #[test]
+    fn heic_decodes_via_viewer_path_to_bgra() {
+        let corpus =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus/IMG_0083.HEIC");
+        let bytes = match std::fs::read(corpus) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("SKIP: missing {corpus} ({e})");
+                return;
+            }
+        };
+        let (frames, w, h) = decode_generic(&bytes).expect("真实 HEIC 应能解码");
+        assert_eq!((w, h), (3024, 4032), "IMG_0083 显示尺寸（irot 后竖图）");
+        assert_eq!(frames.len(), 1, "静态 HEIC 单帧");
+        let buf = frames[0].buffer();
+        let len = w as usize * h as usize;
+        assert_eq!(buf.len(), len * 4, "BGRA 字节数");
+        assert_eq!(buf[3], 255, "alpha 通道应为 255（BGRA 第 4 字节）");
+        // 解码背景档：HEIC 无降档路径 → 回退全解 den=1
+        let (frames2, w2, h2, den) = decode_background(&bytes, (1024.0, 1024.0))
+            .expect("decode_background 应能解 HEIC");
+        assert_eq!((w2, h2), (3024, 4032));
+        assert_eq!(den, 1, "HEIC 走全解（无显示档降量）");
+        assert_eq!(frames2[0].buffer().len(), len * 4);
+    }
+
     /// 编码一张 N 帧测试 GIF（每帧统一 4×3 逻辑屏全画布；(0,0) 像素为 `color`、帧 delay 为
     /// `ms`）。用 `GifEncoder`（image 0.25 默认特性含 gif 编码）。GIF 编码 delay 精度
     /// 10ms（写盘时除 10 取整），测试参数须用 10 的倍数才能精确往返。

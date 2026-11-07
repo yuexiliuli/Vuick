@@ -455,10 +455,11 @@ pub(super) const QUICK_OPEN_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 pub(super) const QUICK_OPEN_MAX_FILES: usize = 500;
 /// 二进制 / 非文本扩展名黑名单（按 bool 跳过，不列入候选）。
 pub(super) const QUICK_OPEN_BINARY_EXT: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svgz", "mp4", "mkv", "avi", "mov",
-    "wmv", "flv", "webm", "mp3", "wav", "flac", "m4a", "ogg", "wma", "aac", "pdf", "exe",
-    "dll", "bin", "obj", "lib", "so", "dylib", "zip", "7z", "rar", "gz", "xz", "tar",
-    "iso", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "ttf", "otf", "woff", "woff2", "eot",
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "heic", "heif", "svgz", "mp4", "mkv",
+    "avi", "mov", "wmv", "flv", "webm", "mp3", "wav", "flac", "m4a", "ogg", "wma", "aac",
+    "pdf", "exe", "dll", "bin", "obj", "lib", "so", "dylib", "zip", "7z", "rar", "gz", "xz",
+    "tar", "iso", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "ttf", "otf", "woff", "woff2",
+    "eot",
 ];
 
 /// 后台递归收集候选文件路径（**不在主线程执行**）：跳过黑名单目录 / 会话目录、跳过

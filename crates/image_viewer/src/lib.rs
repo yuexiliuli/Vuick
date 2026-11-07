@@ -16,10 +16,11 @@ mod viewer;
 
 pub use viewer::ImageViewer;
 
-/// 可识别的图片扩展名（小写；`image` crate 默认特性可解码的子集）。
+/// 可识别的图片扩展名（小写；`image` crate 默认特性可解码的子集 + kimg 家族自有扩展）。
 /// 供 `EditorApp::is_image_path`（打开路由）与查看器自身「同文件夹扫描」共用。
+/// HEIF/HEIC 由 kimg（kimg_heif）解码，其他由 `image`/kimg 解码。
 pub const IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff",
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff", "heic", "heif",
 ];
 
 /// 某路径是否可识别的图片文件（按扩展名判断）。
@@ -28,4 +29,20 @@ pub fn is_image_extension(p: &std::path::Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// HEIF/HEIC 必须进图片路由（否则被当文本打开 → 二进制 → 打开失败）。
+    #[test]
+    fn heic_and_heif_are_image_extensions() {
+        for name in ["photo.HEIC", "photo.heic", "photo.heif", "PHOTO.HeIf"] {
+            assert!(
+                is_image_extension(std::path::Path::new(name)),
+                "{name} 应被识别为图片扩展名"
+            );
+        }
+    }
 }
