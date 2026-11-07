@@ -711,6 +711,10 @@ impl HotStream {
     }
 
     /// 补充位缓冲（最多 32 位），并处理 marker/字节填充（1:1 复刻 `BitStream::refill`）。
+    ///
+    /// P-A1 测量否决：曾试 `#[cold]` + `#[inline(never)]`（v3），同窗两窗 ours
+    /// 6.94-6.99 vs v1 6.77-6.84（~2% 净退化）——refill 每 ~3-4 符号触发一次，出线调用 +
+    /// 状态内存往返的开销大于 I-cache/寄存器帧收益；维持内联（v1 选型）。
     #[inline(always)]
     fn refill<'a>(&mut self, reader: &mut ByteReader<'a>) -> Result<bool, DecodeError> {
         // 单字节 refill：读到 0xFF 时探测后续 marker
@@ -940,7 +944,13 @@ impl HotStream {
     /// - 反量化契约不变：DC=(i64 乘积)as i16、AC=(v·q)as i16、`min(pos,63)` 挡越界
     ///   （由 `zq` 哨兵条目在单装载内等价实现，见 `build_zigzag_quant`）。
     /// - `block=None` 只消费位流不落系数（discard 路径）。
-    #[inline(always)]
+    ///
+    /// P-A1：`#[inline(never)]` 独立函数态——把熵块解算从巨型 const-generic
+    /// `inner_decode_mcu_width`（单函数 ~3000 行 asm，寄存器榨干 → aligned_buffer/
+    /// bits_left/zq/block 每符号栈帧访问）中提出，编译器给它完整寄存器帧（独立函数态
+    /// ≈18-22 条/符号、0 栈访问）；外层只保留 MCU 循环与 post。非泛型 → 全部 4 个
+    /// PROGRESSIVE/SAMPLED 实例共享同一份独立函数代码。
+    #[inline(never)]
     fn decode_block_inner<'a>(
         &mut self,
         reader: &mut ByteReader<'a>,
