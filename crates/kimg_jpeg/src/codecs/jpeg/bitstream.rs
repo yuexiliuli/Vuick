@@ -669,6 +669,14 @@ static ZQ_ZERO: [u32; ZIGZAG_QUANT_LEN] = [0; ZIGZAG_QUANT_LEN];
 /// P-A2 双符号 AC 打包解码开关：`KIMG_JPEG_DUAL_SYM=1|true|on` 开、缺省关。
 /// 进程内一次读（OnceLock）；调用方（mcu.rs 每行）在块环外取一次为循环不变布尔，
 /// 块环内按寄存器分支分发，热环内无每符号开销（K93 运行时双路径姿势）。
+///
+/// 2026-11-07 B2 翻正尝试结论：广谱 parity（C# 编码器 19×6：baseline 420/444/灰度/
+/// progressive 420/444/RST16）DUAL=1 与 DUAL=0 均逐字节=C#（ok=114×2）、19 基线双模式
+/// parity 全绿（ok=19）——正确性达标；但翻正后同窗交错 A/B（release 探针 19 基线、
+/// rounds=9、8 窗 on/off 交替）全部 7 个相邻对都指向 DUAL 慢（on 均值 7.51ms vs off
+/// 7.07ms，≈ −6.2%），与 P-A2 时代的 −2.8~3.1% 相反（A' 已把单符号快路径 ab/bl 寄存器
+/// 贯穿、双符号路径未同步享受该收益）→ 按验收口径「A/B 退化即恢复默认关」**保持缺省关**，
+/// DUAL 仅 opt-in。待双符号路径对齐 A' 收益后另行翻正。
 #[inline(always)]
 pub(crate) fn dual_sym_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
