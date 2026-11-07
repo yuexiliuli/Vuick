@@ -2,7 +2,7 @@
 
 use core::cmp::{max, min};
 
-use crate::codecs::jpeg::bitstream::{BitStream, HotStream};
+use crate::codecs::jpeg::bitstream::{dual_sym_enabled, BitStream, HotStream};
 use crate::codecs::jpeg::cs;
 use crate::codecs::jpeg::cs::{CsInput, R_ONE_TO_ONE};
 use crate::codecs::jpeg::error::DecodeError;
@@ -481,6 +481,11 @@ impl<'a> Decoder<'a> {
         // restart!=0 保留原每 MCU 回写 + `handle_rst_main` 路径（RST 语义兜底）。
         let restart = self.restart_interval != 0;
 
+        // P-A2：双符号 AC 打包解码开关——行首一次判定（OnceLock 进程内只读一次），
+        // 块环内按寄存器布尔分支分发（预测恒走、无每符号/每块原子开销；缺省关 = HEAD
+        // 单符号路径逐字节一致）。两条路径各自独立函数，互不影响彼此的代码生成。
+        let dual = dual_sym_enabled();
+
         for j in 0..scan_du_width {
             for &k in z_scans {
                 let component = &mut self.components[k];
@@ -521,15 +526,29 @@ impl<'a> Decoder<'a> {
                             // 的窗口优化——稀疏块会混入上一满块的高位残值，污染全量 f32 IDCT。
                             tmp.fill(0);
 
-                            hot.decode_mcu_block(
-                                &mut self.reader,
-                                dc_table,
-                                ac_table,
-                                qt_table,
-                                &component.quantization_zq,
-                                tmp,
-                                &mut component.dc_pred,
-                            )
+                            if dual {
+                                hot.decode_mcu_block_dual(
+                                    &mut self.reader,
+                                    dc_table,
+                                    ac_table,
+                                    qt_table,
+                                    &component.quantization_zq,
+                                    tmp,
+                                    &mut component.dc_pred,
+                                )
+                            } else {
+                                hot.decode_mcu_block(
+                                    &mut self.reader,
+                                    dc_table,
+                                    ac_table,
+                                    qt_table,
+                                    &component.quantization_zq,
+                                    tmp,
+                                    &mut component.dc_pred,
+                                )
+                            }
+                        } else if dual {
+                            hot.discard_mcu_block_dual(&mut self.reader, dc_table, ac_table)
                         } else {
                             hot.discard_mcu_block(&mut self.reader, dc_table, ac_table)
                         };

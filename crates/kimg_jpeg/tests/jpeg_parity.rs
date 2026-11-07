@@ -10,6 +10,9 @@
 //! cargo test -p kimg_jpeg --test jpeg_parity -- --nocapture
 //! ```
 //! 失败时打印首个差异像素的 (x, y, 通道, old, new)。
+//!
+//! P-A2 双模式验证：`KIMG_JPEG_DUAL_SYM=1` 与缺省（0）各跑一遍本套件，两份输出
+//! 逐行对照一致才算过（K27 可复跑姿势；同进程内 OnceLock 一次判定，须分进程跑）。
 
 mod fixtures;
 

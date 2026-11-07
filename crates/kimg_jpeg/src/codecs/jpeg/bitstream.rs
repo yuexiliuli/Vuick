@@ -666,6 +666,41 @@ pub(crate) struct HotStream {
 /// discard 路径专用零融合表占位（不落系数、不被读取，仅满足统一签名）。
 static ZQ_ZERO: [u32; ZIGZAG_QUANT_LEN] = [0; ZIGZAG_QUANT_LEN];
 
+/// P-A2 双符号 AC 打包解码开关：`KIMG_JPEG_DUAL_SYM=1|true|on` 开、缺省关。
+/// 进程内一次读（OnceLock）；调用方（mcu.rs 每行）在块环外取一次为循环不变布尔，
+/// 块环内按寄存器分支分发，热环内无每符号开销（K93 运行时双路径姿势）。
+#[inline(always)]
+pub(crate) fn dual_sym_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let t = std::env::var("KIMG_JPEG_DUAL_SYM").unwrap_or_default();
+        let t = t.trim();
+        t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+    })
+}
+
+/// 应用一个已解出的 AC 符号（run/size 展开 + 反量化落系数 + EOB/ZRL 处理）。
+/// 与单符号路径的 apply 段逐位一致；`return Ok(..)` 从 `decode_block_inner_dual` 早退
+/// （EOB）。仅 P-A2 双符号路径使用（单符号路径保持原样，不引此宏）。
+macro_rules! apply_ac {
+    ($rs:expr, $v:expr, $pos:expr, $block:ident, $zq:ident) => {{
+        if ($rs & 15) != 0 {
+            $pos += (($rs >> 4) & 15) as usize;
+            if let Some(block) = $block.as_deref_mut() {
+                // C# `ZigQ` 单装载：高 16 位=natural-order 目标下标（含 pos≥64 哨兵=63），
+                // 低 16 位=量化值；省一次 UN_ZIGZAG + 量化表装载，`min(pos,63)` 因哨兵常消。
+                let z = $zq[$pos];
+                block[(z >> 16) as usize] = ($v * (z & 0xffff) as i32) as i16;
+            }
+            $pos += 1;
+        } else if $rs != 0xF0 {
+            return Ok($pos as u16); // EOB
+        } else {
+            $pos += 16; // ZRL
+        }
+    }};
+}
+
 impl HotStream {
     /// 从 `BitStream` 快照当前位流状态。
     #[inline]
@@ -934,6 +969,84 @@ impl HotStream {
         )
     }
 
+    /// P-A2：`decode_mcu_block` 的双符号变体（仅 `KIMG_JPEG_DUAL_SYM` 开启时由 mcu.rs
+    /// 路由到此处；与单符号路径对同一有效流逐位一致，字节恒等由 parity 硬闸守护）。
+    #[inline(always)]
+    pub(crate) fn decode_mcu_block_dual<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        dc_table: &HuffmanTable,
+        ac_table: &HuffmanTable,
+        qt_table: &[i32; DCT_BLOCK],
+        zq: &[u32; ZIGZAG_QUANT_LEN],
+        block: &mut [i16; 64],
+        dc_prediction: &mut i32,
+    ) -> Result<u16, DecodeError> {
+        self.decode_block_inner_dual(reader, dc_table, ac_table, qt_table, zq, Some(block), dc_prediction)
+    }
+
+    /// P-A2：`discard_mcu_block` 的双符号变体（语义同上）。
+    #[inline(always)]
+    pub(crate) fn discard_mcu_block_dual<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        dc_table: &HuffmanTable,
+        ac_table: &HuffmanTable,
+    ) -> Result<u16, DecodeError> {
+        let mut disc_pred = 0;
+        self.decode_block_inner_dual(
+            reader,
+            dc_table,
+            ac_table,
+            &[0; DCT_BLOCK],
+            &ZQ_ZERO,
+            None,
+            &mut disc_pred,
+        )
+    }
+
+    /// P-A2：由已探测的 `cs_lut` 条目 `e` 解一个 AC 符号（FULL / 码在窗内幅值出窗 / 慢路径
+    /// 三路），与单符号路径对应分支逐位一致（位消费顺序、refill 边界由调用方保证）。
+    /// 调用方必须保证窗口位数足够本次消费（FULL≤11、非 FULL≤len+t、慢≤31），否则结果
+    /// 偏离单符号路径；P-A2 双符号路径以「逐步安全判据」保证后才直解，坏流则回退单符号。
+    #[inline(always)]
+    fn ac_symbol_from_e(
+        &mut self,
+        ac_table: &HuffmanTable,
+        e: i32,
+    ) -> Result<(u8, i32), DecodeError> {
+        if (e & CS_LUT_FULL) != 0 {
+            // 完整条目（含 EOB/ZRL 单探测）：一次消费（码长+幅值）。
+            let n = (e & 31) as u8;
+            self.aligned_buffer <<= n;
+            self.bits_left = self.bits_left.saturating_sub(n);
+            Ok((((e >> 11) & 255) as u8, e >> CS_VALUE_SHIFT))
+        } else if e != 0 {
+            // 码在窗内、幅值出窗。
+            let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
+            self.aligned_buffer <<= len;
+            let rs = ((e >> 11) & 255) as u8;
+            let t = (rs & 15) as u8;
+            let mag = (self.aligned_buffer >> (64 - t)) as i32;
+            self.aligned_buffer <<= t;
+            self.bits_left = self.bits_left.saturating_sub(len + t);
+            Ok((rs, if t != 0 { huff_extend(mag, i32::from(t)) } else { 0 }))
+        } else {
+            // 码长 > 11：慢路径（探测时不移动缓冲，与单符号路径一致）。
+            let mut symbol = ac_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+            decode_huff!(self, symbol, ac_table);
+            let rs = symbol as u8;
+            let size = (rs & 15) as u8;
+            let v = if size != 0 {
+                let r = self.get_bits(size);
+                huff_extend(r, i32::from(size))
+            } else {
+                0
+            };
+            Ok((rs, v))
+        }
+    }
+
     /// 熵解码共享内核（C# `JpegCore.DecodeBlockCore` 同构，JpegCore.cs:1021）：
     ///
     /// - DC/AC 都用 11 位值打包快速表 `cs_lut`（`JpegHuffman.BuildLut`）：一次探测解出
@@ -1065,6 +1178,114 @@ impl HotStream {
 
             if pos >= 64 {
                 break;
+            }
+        }
+
+        Ok(64)
+    }
+
+    /// P-A2 双符号 AC 打包解码内核（`KIMG_JPEG_DUAL_SYM=1|true|on` 时由
+    /// `decode_mcu_block_dual`/`discard_mcu_block_dual` 路由到此处；缺省关走
+    /// `decode_block_inner` 单符号路径，本函数不执行）。
+    ///
+    /// DC 段与单符号路径逐位一致；AC 段每对符号共享「一次 refill 检查 + 一次循环背沿」，
+    /// s2 仅当「逐步安全判据」成立时免 refill 直解——判据保证 s2 与单符号路径逐位一致：
+    ///   - 探测需 ≥11 位（守卫 bits_left ≥ 16）；
+    ///   - FULL 条目（值内嵌表项，消费 ≤11 位）⟹ 恒安全；
+    ///   - 码在窗内、幅值出窗 → 精确需 bits_left ≥ len+t；
+    ///   - 慢路径（码长 >11）→ 需 bits_left ≥ 31（最多 16+15 位）。
+    /// 判据不满足 → 回退循环顶 = 单符号路径的「refill 检查 + 解符号」（逐位一致；仅
+    /// marker 探测点可延后一个 refill：对有效流收敛、坏流走抛错路径，parity 兜底）。
+    #[inline(never)]
+    fn decode_block_inner_dual<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        dc_table: &HuffmanTable,
+        ac_table: &HuffmanTable,
+        qt_table: &[i32; DCT_BLOCK],
+        zq: &[u32; ZIGZAG_QUANT_LEN],
+        mut block: Option<&mut [i16; 64]>,
+        dc_prediction: &mut i32,
+    ) -> Result<u16, DecodeError> {
+        let dc_cs = &dc_table.cs_lut;
+        let ac_cs = &ac_table.cs_lut;
+
+        // marker 且 0 位在块起始：仅解码路径保留此防御检查（与单符号路径一致）。
+        if block.is_some() && self.bits_left < 1 && self.marker.is_some() {
+            return Err(DecodeError::Format(
+                "No more bytes left in stream before marker".to_string(),
+            ));
+        }
+
+        // --- DC（与单符号路径逐位一致）---
+        if self.bits_left < 32 {
+            self.refill(reader)?;
+        }
+        let e = dc_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+        let diff = if (e & CS_LUT_FULL) != 0 {
+            // 值在窗口内：单次移位消费码长+幅值（DC 表符号恒 ≤15，建表已校验）。
+            let n = (e & 31) as u8;
+            self.aligned_buffer <<= n;
+            self.bits_left = self.bits_left.saturating_sub(n);
+            e >> CS_VALUE_SHIFT
+        } else if e != 0 {
+            // 码在窗内但幅值出窗：先丢码长，再读 t 位幅值并按 JPEG EXTEND 扩展。
+            let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
+            let t = ((e >> 11) & 15) as u8;
+            self.aligned_buffer <<= len;
+            let mag = (self.aligned_buffer >> (64 - t)) as i32;
+            self.aligned_buffer <<= t;
+            self.bits_left = self.bits_left.saturating_sub(len + t);
+            huff_extend(mag, i32::from(t))
+        } else {
+            // 码长 > 11：慢路径（zune 风格）。
+            let mut symbol =
+                dc_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+            decode_huff!(self, symbol, dc_table);
+            if symbol != 0 {
+                let r = self.get_bits(symbol as u8);
+                huff_extend(r, symbol)
+            } else {
+                0
+            }
+        };
+        *dc_prediction = dc_prediction.wrapping_add(diff);
+        if let Some(block) = block.as_deref_mut() {
+            block[0] = (i64::from(*dc_prediction) * i64::from(qt_table[0])) as i16;
+        }
+
+        // --- AC（双符号打包）---
+        let mut pos: usize = 1;
+        loop {
+            if self.bits_left < 32 {
+                self.refill(reader)?;
+            }
+            // --- 符号 1（与单符号路径逐位一致）---
+            let e = ac_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+            let (rs, v) = self.ac_symbol_from_e(ac_table, e)?;
+            apply_ac!(rs, v, pos, block, zq);
+            if pos >= 64 {
+                break;
+            }
+            // --- 符号 2（免 refill 检查；逐步安全判据）---
+            if self.bits_left >= 16 {
+                let e2 = ac_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+                let safe = if (e2 & CS_LUT_FULL) != 0 {
+                    true
+                } else if e2 != 0 {
+                    let len = ((e2 >> CS_CODELEN_SHIFT) & 15) as u8;
+                    let t = ((e2 >> 11) & 15) as u8;
+                    self.bits_left >= len + t
+                } else {
+                    self.bits_left >= 31
+                };
+                if safe {
+                    let (rs, v) = self.ac_symbol_from_e(ac_table, e2)?;
+                    apply_ac!(rs, v, pos, block, zq);
+                    if pos >= 64 {
+                        break;
+                    }
+                }
             }
         }
 
