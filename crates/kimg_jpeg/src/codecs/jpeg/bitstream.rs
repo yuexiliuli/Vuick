@@ -844,7 +844,10 @@ impl BitStream {
     /// size≠0 → 落 `UN_ZIGZAG[min(k,63)]` 系数并 k+=1；rs==0xF0 → ZRL k+=16；否则 EOB（category=run
     /// 半字节）→ 读 category 位扩展 EOB 运行并 break。快路径位消费与 fast_ac/lookup 路径等价
     /// （基线 A′ 已证）；写位 `min(k,63)` 与旧快路径/zune 逐位对齐（有效流 k≤Se≤63 恒等于
-    /// `k&63`；k>63 恶劣流按 min 对齐）。
+    /// `k&63`；k>63 恶劣流按 min 对齐）。P2 起带 `mask`：mask 仅含 AC 显著位，位 p = zigzag
+    /// 系数序 p（块内非零系数）；每块写入新非零系数处置位，供后续 AC-refine 稀疏游走复用
+    /// （位集语义 = 系数显著 iff 该位置位）。DC 扫走独立路径不涉 bit 0（decode_prog_dc_first_v/
+    /// refine_v 不接收 mask）。
     #[allow(clippy::cast_sign_loss)]
     #[inline]
     pub(crate) fn decode_mcu_ac_first_v<'a>(
@@ -852,6 +855,7 @@ impl BitStream {
         reader: &mut ByteReader<'a>,
         ac_table: &HuffmanTable,
         block: &mut [i16; 64],
+        mask: &mut u64,
         ab: u64,
         bl: u8,
     ) -> Result<(u64, u8), DecodeError> {
@@ -912,7 +916,9 @@ impl BitStream {
             if (rs & 15) != 0 {
                 // 非零系数：run=r、幅值 v（快路径已扩展；慢路径 huff_extend 后乘 bit）
                 k += r;
-                block[UN_ZIGZAG[min(k, 63)] & 63] = (v as i16).wrapping_mul(bit);
+                let pos = min(k, 63);
+                block[UN_ZIGZAG[pos] & 63] = (v as i16).wrapping_mul(bit);
+                *mask |= 1_u64 << pos;
                 k += 1;
             } else if rs != 0xF0 {
                 // EOB：EOB run = 2^r + r 个附加位，编码高半字节为 category。
@@ -934,10 +940,22 @@ impl BitStream {
         Ok((ab, bl))
     }
 
-    /// P1：渐进 AC refine scan（A′ value-return 版）。逐位语义与 `decode_mcu_ac_refine`
-    /// 完全一致：位消费严格依赖块内既有非零系数（refine 位只对非零系数读、新非零系数只读
-    /// 1 位符号位），故块系数状态必须全文保留——仅把 ab/bl 提为局部寄存器 + refill 值返回，
-    /// 控制流与位消费顺序与原文按行对照不变。
+    /// P1+P2：渐进 AC refine scan（A′ value-return 稀疏掩码版，P2 起）。
+    ///
+    /// 位消费语义与 `decode_mcu_ac_refine`（dormancy 参照）完全一致：refine 位只对块内既有
+    /// 非零系数读、新非零系数只读 1 位符号位（T.81 G.1.2.3 位序）。P1 已把 ab/bl 提为局部
+    /// 寄存器 + refill 值返回；P2 引入 `mask`（仅含 AC 显著位，位 p = zigzag 系数序 p；DC 扫
+    /// 走独立路径不涉 bit 0）把「逐位线性游走 + `block[p] != 0` 分支」改为「仅历显著位 + 掩码
+    /// 求目标零位」——零位置不耗位、不参与 EOB/run 之外的状态。字节恒等论证（≤10 行）：
+    ///  1) 位消费集合逐位一致——advance 路径只对 [k, T) 内显著位置读修正位（T = 第 r+1 个零位
+    ///     或谱带上界后），非显著位置零耗位，与线性游走「显著位读、零位仅 r--」逐位同集同序；
+    ///  2) EOBRUN 符号只与「尚未显著的零位置尾部」相关：EOBRUN 后对 [k, Se] 内剩余显著位读
+    ///     修正位（游走同集合），不做新系数；EOB run 计数/递减照旧；
+    ///  3) 符号位 / Huffman 位消费点不动；新显著写位用 mask 补位且不参与后续目标（目标恒在本位
+    ///     之后——C# 同款「behind k from now on」），跨块 mask 写回供下一 scan 复用；
+    ///  4) r 越谱带（run 超出剩余零数）夹到 Se：修正 [k, Se] 全部显著位并在 Se 落新系数——
+    ///     与线性游走 `k==spec_end` break 后落位逐位一致（损坏流夹逼语义）。
+    /// 硬闸：csharp parity 广谱 114（含 38 progressive 变体）逐字节恒等。
     #[allow(clippy::too_many_lines)]
     #[inline]
     pub(crate) fn decode_mcu_ac_refine_v<'a>(
@@ -945,15 +963,24 @@ impl BitStream {
         reader: &mut ByteReader<'a>,
         table: &HuffmanTable,
         block: &mut [i16; 64],
+        mask: &mut u64,
         ab: u64,
         bl: u8,
     ) -> Result<(u64, u8), DecodeError> {
         let mut ab = ab;
         let mut bl = bl;
         let bit = self.successive_low_mask;
+        let s = usize::from(self.spec_start);
+        let e = usize::from(self.spec_end);
 
-        let mut k = self.spec_start;
-        let (mut symbol, mut r);
+        // 频带内显著位（natural 序）：mask 位 p = 系数 p 显著（!=0）。
+        let band = if e == 63 {
+            u64::MAX << s
+        } else {
+            ((1_u64 << (e - s + 1)) - 1) << s
+        };
+        let mut nz = *mask & band;
+        let mut k = s;
 
         if self.eob_run == 0 {
             'no_eob: loop {
@@ -967,7 +994,7 @@ impl BitStream {
                     }
                 }
                 // 探测 + 快速消费（与 decode_huff! 等价：码长 >11 才落盘走慢路径）。
-                symbol = table.lookup[(ab >> (64 - HUFF_LOOKAHEAD)) as usize];
+                let mut symbol = table.lookup[(ab >> (64 - HUFF_LOOKAHEAD)) as usize];
                 if symbol >> HUFF_LOOKAHEAD > i32::from(HUFF_LOOKAHEAD) {
                     // 码长 >11：落盘 ab/bl，把 RAW lookup 值（高位码长未掩）交给 decode_huff!
                     // 走 16 位码慢探测（内部重提取 code_length），再读回 ab/bl。
@@ -988,16 +1015,16 @@ impl BitStream {
                     ab <<= code_length as u8;
                     bl = bl.saturating_sub(code_length as u8);
                 }
-                r = symbol >> 4;
-                symbol &= 15;
+                let r = symbol >> 4;
+                let mut symbol = symbol & 15;
 
                 if symbol == 0 {
                     if r != 15 {
                         // EOB run = 2^r + 附加位（r = category 高半字节）
                         self.eob_run = 1 << r;
-                        let mask = (1_u64 << r) - 1;
+                        let emask = (1_u64 << r) - 1;
                         ab = ab.rotate_left(r as u32);
-                        self.eob_run += (ab & mask) as i32;
+                        self.eob_run += (ab & emask) as i32;
                         bl = bl.wrapping_sub(r as u8);
                         break 'no_eob;
                     }
@@ -1014,108 +1041,113 @@ impl BitStream {
                     }
                 }
 
-                // 跳过既有非零系数，并为其追加修正位（1 表示绝对值须增大）
-                if k <= self.spec_end {
-                    'advance_nonzero: loop {
-                        let coefficient = &mut block[UN_ZIGZAG[usize::from(k) & 63] & 63];
+                // 稀疏 advance：目标零位 T = [k, Se] 内第 r+1 个零位（游走语义：每零位 r-=1、
+                // 首 r<0 处落新系数）；无则越过谱带（损坏流夹 Se）。仅对 [k, T) 内显著位读修正位。
+                let rest = band & (u64::MAX << k);
+                let target = nth_set_bit_pos(rest & !nz, r as usize);
+                let t = target.map_or(e + 1, |p| p);
+                let passed = if t > e {
+                    rest
+                } else {
+                    rest & ((1_u64 << t) - 1)
+                };
+                self.correct_refine(reader, block, nz & passed, bit, &mut ab, &mut bl)?;
 
-                        if *coefficient != 0 {
-                            if bl < 1 {
-                                match self.refill_ab(reader, ab, bl) {
-                                    Ok((a, b)) => {
-                                        ab = a;
-                                        bl = b;
-                                    }
-                                    Err(e) => return Err(e),
-                                }
-                                if bl < 1 && self.marker.is_some() {
-                                    return Err(DecodeError::Format(
-                                        "Marker found where not expected in refine bit".to_string(),
-                                    ));
-                                }
-                            }
-                            let refine = (ab >> 63) == 1;
-                            ab <<= 1;
-                            bl = bl.saturating_sub(1);
-                            if refine && (*coefficient & bit) == 0 {
-                                if *coefficient > 0 {
-                                    *coefficient = coefficient.wrapping_add(bit);
-                                } else {
-                                    *coefficient = coefficient.wrapping_sub(bit);
-                                }
-                            }
-                        } else {
-                            r -= 1;
-
-                            if r < 0 {
-                                break 'advance_nonzero;
-                            }
-                        }
-
-                        if k == self.spec_end {
-                            break 'advance_nonzero;
-                        }
-
-                        k += 1;
+                if t > e {
+                    if symbol != 0 {
+                        block[UN_ZIGZAG[e] & 63] = symbol as i16;
+                        nz |= 1_u64 << e;
                     }
+                    break 'no_eob;
                 }
-
                 if symbol != 0 {
-                    let pos = UN_ZIGZAG[usize::from(k) & 63];
-                    block[pos & 63] = symbol as i16;
+                    block[UN_ZIGZAG[t] & 63] = symbol as i16;
+                    nz |= 1_u64 << t;
                 }
-
-                k += 1;
-
-                if k > self.spec_end {
+                k = t + 1;
+                if k > e {
                     break 'no_eob;
                 }
             }
         }
         if self.eob_run > 0 {
-            // 仅当块非纯零时处理（EOB 意味着后续块可能全零）
-            if &block[1..] != &[0_i16; 63] {
-                match self.refill_ab(reader, ab, bl) {
-                    Ok((a, b)) => {
-                        ab = a;
-                        bl = b;
-                    }
-                    Err(e) => return Err(e),
-                }
-
-                while k <= self.spec_end {
-                    let coefficient = &mut block[UN_ZIGZAG[usize::from(k) & 63] & 63];
-
-                    if *coefficient != 0 {
-                        let refine = (ab >> 63) == 1;
-                        ab <<= 1;
-                        bl = bl.saturating_sub(1);
-                        // 检查是否为已修正过的系数（避免重复加位）
-                        if refine && (*coefficient & bit) == 0 {
-                            if *coefficient >= 0 {
-                                *coefficient = coefficient.wrapping_add(bit);
-                            } else {
-                                *coefficient = coefficient.wrapping_sub(bit);
-                            }
-                        }
-                    }
-                    if bl < 1 {
-                        // 到最后一刻才 refill
-                        match self.refill_ab(reader, ab, bl) {
-                            Ok((a, b)) => {
-                                ab = a;
-                                bl = b;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    k += 1;
-                }
+            // 仅当块有非零 AC 系数时处理（EOB 意味着后续块可能全零）；只对频带 [k, Se] 内
+            // 剩余显著位读修正位（k 保持 EOBRUN 符号/整块 EOBRUN 进入时的游走位置）。
+            // `*mask != 0` 等价旧实现 `&block[1..] != &[0;63]`：mask 只含 AC 显著位（位 0 恒
+            // 未置——DC 扫走 decode_prog_dc_first_v/refine_v 独立路径不接收 mask），且系数
+            // 从不归零（refine 只增不减）→ 任一 AC 系数非零 ⟺ mask 非零。
+            if *mask != 0 {
+                let rest = band & (u64::MAX << k);
+                self.correct_refine(reader, block, nz & rest, bit, &mut ab, &mut bl)?;
             }
             // 该块在 EOB 运行中计数完成
             self.eob_run -= 1;
         }
+        *mask |= nz;
         Ok((ab, bl))
+    }
+
+    /// P2：稀疏修正——对 `mask` 各置位（natural 序显著系数，升序）逐位读修正位并入块。
+    /// 位消费顺序 = mask 置位升序（与逐位游走一致）；bl<1 时 refill（含 marker 截止检查，
+    /// 与 `decode_mcu_ac_refine` advance 路径同款语义）。
+    #[inline(always)]
+    fn correct_refine<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        block: &mut [i16; 64],
+        cmask: u64,
+        bit: i16,
+        ab: &mut u64,
+        bl: &mut u8,
+    ) -> Result<(), DecodeError> {
+        let mut m = cmask;
+        while m != 0 {
+            let p = m.trailing_zeros() as usize;
+            m &= m - 1;
+            if *bl < 1 {
+                match self.refill_ab(reader, *ab, *bl) {
+                    Ok((a, b)) => {
+                        *ab = a;
+                        *bl = b;
+                    }
+                    Err(e) => return Err(e),
+                }
+                if *bl < 1 && self.marker.is_some() {
+                    return Err(DecodeError::Format(
+                        "Marker found where not expected in refine bit".to_string(),
+                    ));
+                }
+            }
+            let coefficient = &mut block[UN_ZIGZAG[p] & 63];
+            let refine = (*ab >> 63) == 1;
+            *ab <<= 1;
+            *bl = bl.saturating_sub(1);
+            if refine && (*coefficient & bit) == 0 {
+                if *coefficient > 0 {
+                    *coefficient = coefficient.wrapping_add(bit);
+                } else {
+                    *coefficient = coefficient.wrapping_sub(bit);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// P2：返回 `m` 中第 (n+1) 个置位的位置（0 起始），无则 None（n ≤ 15：run 半字节）。
+#[inline(always)]
+fn nth_set_bit_pos(mut m: u64, n: usize) -> Option<usize> {
+    let mut i = 0;
+    loop {
+        if m == 0 {
+            return None;
+        }
+        let p = m.trailing_zeros() as usize;
+        if i == n {
+            return Some(p);
+        }
+        m &= m - 1;
+        i += 1;
     }
 }
 

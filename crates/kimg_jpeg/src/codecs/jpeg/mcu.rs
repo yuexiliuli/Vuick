@@ -28,6 +28,39 @@ enum McuContinuation {
 /// 渐进图像 scan 数上限（对齐 zune-core 默认 `max_scans = 100`）。
 const MAX_PROGRESSIVE_SCANS: u32 = 100;
 
+/// `KIMG_JPEG_SCAN_PROFILE=1`：渐进解码逐 scan 类别墙钟占比探针（缺省关=零注入）。
+/// 只在启用时读取 env（OnceLock 进程内一次）并调用 `Instant::now()`；不 skip 任何 scan、
+/// 不改解码语义/位序（纯只读测量）。本机 RDTSC 不可信（K104）→ 只下墙钟。
+#[inline]
+fn scan_profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("KIMG_JPEG_SCAN_PROFILE")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// 渐进 scan 类别（探针累加器下标）：DC 类（`spec_start==0`）分 first（`succ_high==0`）/
+/// refine（`succ_high>0`）；AC 类（`spec_start>0`）同分。下标 = [dc_first, ac_first,
+/// dc_refine, ac_refine]，对应 `scan_ms[4]` 累加顺序。
+#[inline]
+fn scan_kind(spec_start: u8, succ_high: u8) -> usize {
+    let refine = usize::from(succ_high > 0);
+    if spec_start == 0 {
+        refine * 2
+    } else {
+        1 + refine * 2
+    }
+}
+
+/// 逐 scan 探针累加器读数（供 print 用；只在 `scan_profile_enabled()` 时构造）。
+#[derive(Default)]
+struct ScanProfile {
+    ms: [f64; 4],
+    n_scans: u32,
+}
+
 impl<'a> Decoder<'a> {
     /// 设置分量参数（行宽/量化表/交织信息/采样比例）。
     fn setup_component_params(&mut self) -> Result<(), DecodeError> {
@@ -960,6 +993,10 @@ impl<'a> Decoder<'a> {
 
         // 各分量的整帧系数缓冲（未反量化、未 IDCT 的原始 DCT 系数）
         let mut block: [Vec<i16>; MAX_COMPONENTS] = core::array::from_fn(|_| vec![]);
+        // P2：逐块非零掩码——仅含 AC 显著位，位 p = zigzag 系数序 p（块内非零系数），AC-first
+        // 写系数时置位、AC-refine 稀疏游走复用并补写新显著位；DC 扫走独立路径不涉 bit 0
+        // （decode_prog_dc_first_v/refine_v 不接收 mask）。内存 = 每块 8B，并行于系数缓冲。
+        let mut prog_mask: [Vec<u64>; MAX_COMPONENTS] = core::array::from_fn(|_| vec![]);
         let mut mcu_width;
         let mut mcu_height;
         let mut seen_scans = 1;
@@ -999,92 +1036,155 @@ impl<'a> Decoder<'a> {
             let len = mcu_width * comp.vertical_sample * comp.horizontal_sample * mcu_height;
 
             block[i] = vec![0; len];
+            prog_mask[i] = vec![0; len / 64];
         }
 
         let mut stream = BitStream::new_progressive(self.succ_low, self.spec_start, self.spec_end);
 
+        // 逐 scan 墙钟占比探针（env 门控 `KIMG_JPEG_SCAN_PROFILE=1`；缺省关=零注入，不改语义）
+        let scan_prof = scan_profile_enabled();
+        let mut prof = ScanProfile::default();
+        let t_scan0 = if scan_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         // 首个 scan 已被 headers 阶段解析，直接解熵数据
-        let result = self.parse_entropy_coded_data(&mut stream, &mut block);
-
-        if result.is_err() {
-            // 非 strict：容忍错误，尽量收尾已解出的系数
-            return self.finish_progressive_decoding(&block, pixels);
+        let t_e0 = if scan_prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let result = self.parse_entropy_coded_data(&mut stream, &mut block, &mut prog_mask);
+        if scan_prof {
+            if let Some(t) = t_e0 {
+                let k = scan_kind(self.spec_start, self.succ_high);
+                prof.ms[k] += t.elapsed().as_secs_f64() * 1000.0;
+                prof.n_scans += 1;
+            }
         }
+        let first_err = result.is_err();
 
-        // 取出终结首个 scan 的 marker
-        let mut marker = stream.marker.take().ok_or_else(|| {
-            DecodeError::Format("Marker missing where expected".to_string())
-        })?;
+        if !first_err {
+            // 取出终结首个 scan 的 marker
+            let mut marker = stream.marker.take().ok_or_else(|| {
+                DecodeError::Format("Marker missing where expected".to_string())
+            })?;
 
-        // 循环处理后续 scan；直到 EOI
-        'eoi: while marker != Marker::EOI {
-            match marker {
-                Marker::SOS => {
-                    self.parse_marker_inner(Marker::SOS)?;
+            // 循环处理后续 scan；直到 EOI
+            'eoi: while marker != Marker::EOI {
+                match marker {
+                    Marker::SOS => {
+                        self.parse_marker_inner(Marker::SOS)?;
 
-                    stream.update_progressive_params(
-                        self.succ_high,
-                        self.succ_low,
-                        self.spec_start,
-                        self.spec_end,
-                    );
+                        stream.update_progressive_params(
+                            self.succ_high,
+                            self.succ_low,
+                            self.spec_start,
+                            self.spec_end,
+                        );
 
-                    let result = self.parse_entropy_coded_data(&mut stream, &mut block);
-
-                    if result.is_err() {
-                        // 非 strict：跳出并收尾
-                        break 'eoi;
-                    }
-
-                    match get_marker(&mut self.reader, &mut stream) {
-                        Ok(marker_n) => {
-                            marker = marker_n;
-                            seen_scans += 1;
-                            if seen_scans > MAX_PROGRESSIVE_SCANS {
-                                return Err(DecodeError::Format(format!(
-                                    "Too many scans, exceeded limit of {}",
-                                    MAX_PROGRESSIVE_SCANS
-                                )));
+                        let t_es = if scan_prof {
+                            Some(std::time::Instant::now())
+                        } else {
+                            None
+                        };
+                        let result =
+                            self.parse_entropy_coded_data(&mut stream, &mut block, &mut prog_mask);
+                        if scan_prof {
+                            if let Some(t) = t_es {
+                                let k = scan_kind(self.spec_start, self.succ_high);
+                                prof.ms[k] += t.elapsed().as_secs_f64() * 1000.0;
+                                prof.n_scans += 1;
                             }
-
-                            stream.reset();
-                            continue 'eoi;
                         }
-                        Err(_msg) => {
-                            // 非 strict：跳出
+
+                        if result.is_err() {
+                            // 非 strict：跳出并收尾
                             break 'eoi;
                         }
+
+                        match get_marker(&mut self.reader, &mut stream) {
+                            Ok(marker_n) => {
+                                marker = marker_n;
+                                seen_scans += 1;
+                                if seen_scans > MAX_PROGRESSIVE_SCANS {
+                                    return Err(DecodeError::Format(format!(
+                                        "Too many scans, exceeded limit of {}",
+                                        MAX_PROGRESSIVE_SCANS
+                                    )));
+                                }
+
+                                stream.reset();
+                                continue 'eoi;
+                            }
+                            Err(_msg) => {
+                                // 非 strict：跳出
+                                break 'eoi;
+                            }
+                        }
+                    }
+                    Marker::RST(_n) => {
+                        self.handle_rst(&mut stream)?;
+                    }
+                    _ => {
+                        // DHT/DQT/DRI/COM/APP 等 scan 间 setup marker
+                        self.parse_marker_inner(marker)?;
                     }
                 }
-                Marker::RST(_n) => {
-                    self.handle_rst(&mut stream)?;
-                }
-                _ => {
-                    // DHT/DQT/DRI/COM/APP 等 scan 间 setup marker
-                    self.parse_marker_inner(marker)?;
-                }
-            }
 
-            match get_marker(&mut self.reader, &mut stream) {
-                Ok(marker_n) => {
-                    marker = marker_n;
-                }
-                Err(_e) => {
-                    // 非 strict：跳出，容忍部分损坏图像
-                    break 'eoi;
+                match get_marker(&mut self.reader, &mut stream) {
+                    Ok(marker_n) => {
+                        marker = marker_n;
+                    }
+                    Err(_e) => {
+                        // 非 strict：跳出，容忍部分损坏图像
+                        break 'eoi;
+                    }
                 }
             }
+        }
+
+        // 探针：打印 scan 类别墙钟占比（env 门控；关联文件名由测量侧在解码前打印的
+        // `SCANP FILE <name>` 标记行给出，与 STAGE FILE/STAGE-DECODE 同款关联口径）
+        if scan_prof {
+            let total_ms = t_scan0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+            let sum: f64 = prof.ms.iter().sum();
+            let other = (total_ms - sum).max(0.0);
+            let pct = |v: f64| {
+                if total_ms > 1e-6 {
+                    v / total_ms * 100.0
+                } else {
+                    0.0
+                }
+            };
+            println!(
+                "SCANP total={total_ms:.2}ms dc_first={:.2}({:.1}%) ac_first={:.2}({:.1}%) ac_refine={:.2}({:.1}%) dc_refine={:.2}({:.1}%) n_scans={} other_scan={other:.2}({:.1}%)",
+                prof.ms[0],
+                pct(prof.ms[0]),
+                prof.ms[1],
+                pct(prof.ms[1]),
+                prof.ms[3],
+                pct(prof.ms[3]),
+                prof.ms[2],
+                pct(prof.ms[2]),
+                prof.n_scans,
+                pct(other),
+            );
         }
 
         self.finish_progressive_decoding(&block, pixels)
     }
 
-    /// 解单个 scan 的熵编码数据（1:1 复刻 zune `parse_entropy_coded_data`；P1 A′ 改造）。
+    /// 解单个 scan 的熵编码数据（1:1 复刻 zune `parse_entropy_coded_data`；P1 A′ 改造；
+    /// P2 带逐块非零掩码 `prog_mask` 供 AC-first 置位 / AC-refine 稀疏游走）。
     #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
     fn parse_entropy_coded_data(
         &mut self,
         stream: &mut BitStream,
         buffer: &mut [Vec<i16>; MAX_COMPONENTS],
+        prog_mask: &mut [Vec<u64>; MAX_COMPONENTS],
     ) -> Result<(), DecodeError> {
         self.reset_prog_params(stream);
 
@@ -1183,6 +1283,9 @@ impl<'a> Decoder<'a> {
                         stream.eob_run -= 1;
                     } else {
                         let start = 64 * (j + i * (width_stride / 8));
+                        // P2：本块非零掩码槽（位 p = zigzag 系数序 p，仅 AC 显著位）；与 data
+                        // 同块索引（start 恒为 64 倍数）。
+                        let blk_mask = &mut prog_mask[comp_k][start >> 6];
 
                         let data: &mut [i16; 64] = buffer
                             .get_mut(comp_k)
@@ -1227,6 +1330,7 @@ impl<'a> Decoder<'a> {
                                     &mut self.reader,
                                     unsafe { &*ac_ptr },
                                     data,
+                                    blk_mask,
                                     ab,
                                     bl,
                                 )?
@@ -1235,6 +1339,7 @@ impl<'a> Decoder<'a> {
                                     &mut self.reader,
                                     unsafe { &*ac_ptr },
                                     data,
+                                    blk_mask,
                                     ab,
                                     bl,
                                 )?
