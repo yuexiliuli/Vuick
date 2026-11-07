@@ -17,6 +17,8 @@ pub mod slice_header;
 pub mod transform;
 // 逆变换 SIMD 内核叶子（`#![allow(unsafe_code)]`；transform.rs 分派到本模块）。hevc 内部可见。
 pub(super) mod transform_simd;
+// SAO 行内核 SIMD 叶子（`#![allow(unsafe_code)]`；sao.rs 分派到本模块）。
+pub(super) mod sao_simd;
 
 pub use bit_reader::HevcBitReader;
 pub use nal::Nal;
