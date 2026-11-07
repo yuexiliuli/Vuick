@@ -91,6 +91,11 @@ pub(crate) fn idct8x8(data: &[i16; 64], out: &mut [u8], offset: usize, stride: u
         unsafe { super::cs_avx2::idct8x8_avx2(data, out, offset, stride) };
         return;
     }
+    idct8x8_scalar(data, out, offset, stride);
+}
+
+/// 标量实现（CSS 逐句镜像：先列 pass 存入转置 `t`，再行 pass）。AVX2 内核的字节恒等参照。
+fn idct8x8_scalar(data: &[i16; 64], out: &mut [u8], offset: usize, stride: usize) {
     let mut t = [0.0f32; 64];
     for x in 0..8 {
         let (s0, s1, s2, s3, s4, s5, s6, s7) = idct_1d(
@@ -472,5 +477,116 @@ pub(crate) fn pack_output_row(
             }
         }
         CsInput::Other => gray_row(rows[0], out, n, out_bpp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 迷你 LCG（与 avx2.rs 测试同款，确定性）。
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn i16(&mut self, bound: i32) -> i16 {
+            (self.next() % bound as u32) as i16
+        }
+    }
+
+    /// AVX2 内核 ≡ 标量（逐字节恒等）。覆盖全零 / 纯 DC / 稀疏 / 稠密多种形态。
+    /// 几何双口径：对齐（offset=0/stride=8）+ 非对齐（offset=3/stride=11），防装配错位漏网。
+    #[test]
+    fn avx2_eq_scalar_float_idct() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !super::super::avx2::avx2_enabled() {
+                return;
+            }
+            let mut rng = Lcg(0xABCD_1234);
+            for (offset, stride) in [(3usize, 11usize), (0usize, 8usize)] {
+                for case in 0..500 {
+                    let mut data = [0i16; 64];
+                    match case % 4 {
+                        0 => {}
+                        1 => {
+                            data[0] = rng.i16(40000);
+                        }
+                        2 => {
+                            for i in 0..16 {
+                                data[i] = rng.i16(30000);
+                            }
+                        }
+                        _ => {
+                            for v in data.iter_mut() {
+                                *v = rng.i16(32000);
+                            }
+                        }
+                    }
+                    let mut out_s = [0u8; 128];
+                    let mut out_v = [0u8; 128];
+                    idct8x8_scalar(&data, &mut out_s, offset, stride);
+                    // SAFETY: 测试已门控 AVX2
+                    unsafe { crate::codecs::jpeg::cs_avx2::idct8x8_avx2(&data, &mut out_v, offset, stride) };
+                    assert_eq!(
+                        out_s[..],
+                        out_v[..],
+                        "cs::idct8x8 AVX2 vs scalar 案例 {case} geom({offset},{stride})"
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {}
+    }
+
+    /// 稠密块 AVX2 8×8 f32 IDCT 吞吐微基准（release `#[ignore]`）：逐块调用形态，同窗 A/B 用。
+    #[test]
+    #[ignore]
+    fn idct8x8_avx2_throughput() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::time::Instant;
+            if !super::super::avx2::avx2_enabled() {
+                println!("IDCT8 SKIP no avx2");
+                return;
+            }
+            let mut rng = Lcg(0x9999);
+            let blocks_n = 512usize;
+            let mut blocks: Vec<[i16; 64]> = (0..blocks_n)
+                .map(|_| {
+                    let mut b = [0i16; 64];
+                    for v in b.iter_mut() {
+                        *v = rng.i16(32000);
+                    }
+                    b
+                })
+                .collect();
+            let mut out = vec![0u8; blocks_n * 8 * 8];
+            let iters = 30_000usize;
+            let mut sink: u64 = 0;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                for (i, blk) in blocks.iter_mut().enumerate() {
+                    // SAFETY: 已门控 AVX2（同 idct8x8 分发条件）
+                    unsafe {
+                        crate::codecs::jpeg::cs_avx2::idct8x8_avx2(
+                            blk,
+                            &mut out[i * 64..],
+                            0,
+                            8,
+                        )
+                    };
+                }
+                sink = sink.wrapping_add(out[0] as u64);
+            }
+            let ns = t0.elapsed().as_secs_f64() * 1e9 / (iters as f64 * blocks_n as f64);
+            println!("IDCT8_AVX2 ns/block dense={ns:.2}");
+            assert_ne!(sink, 0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {}
     }
 }

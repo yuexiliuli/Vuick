@@ -139,6 +139,11 @@ mod kernels {
     }
 
     /// 完整 8×8 IDCT（`JpegIdct.Idct8x8V256`；无 half/sparse 化简，与 `cs::idct8x8` 全量一致）。
+    ///
+    /// P-B1：pass2 输出是 8 个「列向量」（c_k = M2 第 k 列），旧实现先一次 8×8 f32 全转置
+    /// 再逐行 pack；本实现把这次转置**折叠进 pack 的字节装配**（vshufb + vperm2i128 +
+    /// vpor），逐字节恒等但省掉一整段 ~32-48 条纯 shuffle。算术/取整与
+    /// `cs::idct_1d` / `to_sample` 一字不差，只是「数据在哪/怎么搬」换了。
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn idct8x8_avx2(data: &[i16; 64], out: &mut [u8], offset: usize, stride: usize) {
         let d = data.as_ptr();
@@ -155,33 +160,23 @@ mod kernels {
         let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5, mut r6, mut r7) =
             idct_1d256(f0, f1, f2, f3, f4, f5, f6, f7);
         transpose_ps(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7);
-        // 行 pass（lane j = 行 j）
+        // 行 pass（lane j = 行 j）→ 输出即 M2 各列（c_k = 第 k 列），无第二次全转置。
         let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6, mut c7) =
             idct_1d256(r0, r1, r2, r3, r4, r5, r6, r7);
-        transpose_ps(&mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7);
 
-        // 输出：trunc(s + 128.5) + 饱和 pack（= `ToSample` 的 trunc + clamp[0,255]）。
-        // packssdw→packuswb≡`trunc(min(max(s+128.5,0),255))`（C# 注释同款论证）。
+        // 输出装配（转置折叠进 pack）：trunc(s + 128.5) + 饱和 pack = `ToSample` 的
+        // trunc + clamp[0,255]（packssdw→packuswb 同款论证）。逐元素算术/取整不变。
         let bias = _mm256_set1_ps(BIAS);
-        let p01 = _mm256_packs_epi32(
-            _mm256_cvttps_epi32(_mm256_add_ps(c0, bias)),
-            _mm256_cvttps_epi32(_mm256_add_ps(c1, bias)),
-        );
-        let p23 = _mm256_packs_epi32(
-            _mm256_cvttps_epi32(_mm256_add_ps(c2, bias)),
-            _mm256_cvttps_epi32(_mm256_add_ps(c3, bias)),
-        );
-        let p45 = _mm256_packs_epi32(
-            _mm256_cvttps_epi32(_mm256_add_ps(c4, bias)),
-            _mm256_cvttps_epi32(_mm256_add_ps(c5, bias)),
-        );
-        let p67 = _mm256_packs_epi32(
-            _mm256_cvttps_epi32(_mm256_add_ps(c6, bias)),
-            _mm256_cvttps_epi32(_mm256_add_ps(c7, bias)),
-        );
-        let row_order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-        let b0123 = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(p01, p23), row_order);
-        let b4567 = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(p45, p67), row_order);
+        let i0 = _mm256_cvttps_epi32(_mm256_add_ps(c0, bias));
+        let i1 = _mm256_cvttps_epi32(_mm256_add_ps(c1, bias));
+        let i2 = _mm256_cvttps_epi32(_mm256_add_ps(c2, bias));
+        let i3 = _mm256_cvttps_epi32(_mm256_add_ps(c3, bias));
+        let i4 = _mm256_cvttps_epi32(_mm256_add_ps(c4, bias));
+        let i5 = _mm256_cvttps_epi32(_mm256_add_ps(c5, bias));
+        let i6 = _mm256_cvttps_epi32(_mm256_add_ps(c6, bias));
+        let i7 = _mm256_cvttps_epi32(_mm256_add_ps(c7, bias));
+        let (b0123, b4567) = pack_column_rows_to_bytes(i0, i1, i2, i3, i4, i5, i6, i7);
+
         let dst = out.as_mut_ptr().add(offset);
         let l0 = _mm256_extracti128_si256::<0>(b0123);
         let l1 = _mm256_extracti128_si256::<1>(b0123);
@@ -200,6 +195,61 @@ mod kernels {
         for (r, &v) in rows.iter().enumerate() {
             core::ptr::write_unaligned(dst.add(r * stride) as *mut u64, v);
         }
+    }
+
+    /// P-B1 输出装配：8 个「列向量」i32（I_k = M2 第 k 列的取整样本）→ 两段行主序
+    /// 字节（b0123 = 行 0-3，b4567 = 行 4-7）。转置折叠进 pack（vshufb + vperm2i128 +
+    /// vpor），逐字节恒等、无算术。
+    ///
+    /// 布局（packus_epi16 = [a.low, b.low, a.high, b.high]）：
+    /// q0 = [行0-3 的 c0..c3 | 行4-7 的 c0..c3]，q1 = 同换 c4..c7。
+    /// 先 per-lane vshufb 把每 lane 的 4 列重排成「每行 4 字节连续」（m_rows），
+    /// 再 vperm2i128 各自复制（l0→l0/l1、l1→l0/l1），最后 mG/mH 抹选 + or 拼出各行 8 字节。
+    #[target_feature(enable = "avx2")]
+    unsafe fn pack_column_rows_to_bytes(
+        i0: __m256i,
+        i1: __m256i,
+        i2: __m256i,
+        i3: __m256i,
+        i4: __m256i,
+        i5: __m256i,
+        i6: __m256i,
+        i7: __m256i,
+    ) -> (__m256i, __m256i) {
+        let p01 = _mm256_packs_epi32(i0, i1);
+        let p23 = _mm256_packs_epi32(i2, i3);
+        let p45 = _mm256_packs_epi32(i4, i5);
+        let p67 = _mm256_packs_epi32(i6, i7);
+        let q0 = _mm256_packus_epi16(p01, p23); // lane0: 行0-3×c0..c3；lane1: 行4-7×c0..c3
+        let q1 = _mm256_packus_epi16(p45, p67); // lane0: 行0-3×c4..c7；lane1: 行4-7×c4..c7
+        // per-lane 内把「4 列 × 行」重排成「每行 4B 连续」：m_rows = [c0r, c1r, c2r, c3r] 逐行。
+        let m_rows = _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+        let a0 = _mm256_shuffle_epi8(q0, m_rows); // lane0: 行0-3 c0-3；lane1: 行4-7 c0-3
+        let a1 = _mm256_shuffle_epi8(q1, m_rows); // lane0: 行0-3 c4-7；lane1: 行4-7 c4-7
+        // 行半段复制：a0_lo = [行0-3 c0-3 | 行0-3 c0-3]，a0_hi = [行4-7 c0-3 | 行4-7 c0-3]（a1 同）。
+        let a0_lo = _mm256_permute2f128_si256(a0, a0, 0x00);
+        let a1_lo = _mm256_permute2f128_si256(a1, a1, 0x00);
+        let a0_hi = _mm256_permute2f128_si256(a0, a0, 0x11);
+        let a1_hi = _mm256_permute2f128_si256(a1, a1, 0x11);
+        // mG：取 c0-3 逐行 4B（lane0 用 0/4 索引行0-1、lane1 用 8/12 索引行2-3）；
+        // mH：取 c4-7（同构，插到 4B 间隙）。
+        let mg = _mm256_setr_epi8(
+            0, 1, 2, 3, -1, -1, -1, -1, 4, 5, 6, 7, -1, -1, -1, -1, 8, 9, 10, 11, -1, -1,
+            -1, -1, 12, 13, 14, 15, -1, -1, -1, -1,
+        );
+        let mh = _mm256_setr_epi8(
+            -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, 4, 5, 6, 7, -1, -1, -1, -1, 8, 9, 10,
+            11, -1, -1, -1, -1, 12, 13, 14, 15,
+        );
+        let b0123 = _mm256_or_si256(
+            _mm256_shuffle_epi8(a0_lo, mg),
+            _mm256_shuffle_epi8(a1_lo, mh),
+        );
+        let b4567 = _mm256_or_si256(
+            _mm256_shuffle_epi8(a0_hi, mg),
+            _mm256_shuffle_epi8(a1_hi, mh),
+        );
+        (b0123, b4567)
     }
 
     // ------------------------------------------------------------------
@@ -492,6 +542,169 @@ mod kernels {
             for _ in 3..out_bpp {
                 out[o + 3] = 255;
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // P-B1 测量探针（release `#[ignore]`，仅测「去掉某个转置」的上限，不做字节恒等）
+    // ------------------------------------------------------------------
+
+    /// 8×8 转置stub：正常（false）或直通（true 时跳过转置——仅测量用，输出不对）。
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn trans_or_pass_ps(skip: bool, r0: &mut __m256, r1: &mut __m256, r2: &mut __m256, r3: &mut __m256, r4: &mut __m256, r5: &mut __m256, r6: &mut __m256, r7: &mut __m256) {
+        if !skip {
+            transpose_ps(r0, r1, r2, r3, r4, r5, r6, r7);
+        }
+    }
+
+    /// P-B1 变体内核（skip_t1 / skip_t2）：其余与当前 idct8x8_avx2 逐句一致。
+    #[cfg(test)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn idct8x8_avx2_variant(
+        data: &[i16; 64],
+        out: &mut [u8],
+        offset: usize,
+        stride: usize,
+        skip_t1: bool,
+        skip_t2: bool,
+    ) {
+        let d = data.as_ptr();
+        let f0 = load_row_f32(d, 0);
+        let f1 = load_row_f32(d, 1);
+        let f2 = load_row_f32(d, 2);
+        let f3 = load_row_f32(d, 3);
+        let f4 = load_row_f32(d, 4);
+        let f5 = load_row_f32(d, 5);
+        let f6 = load_row_f32(d, 6);
+        let f7 = load_row_f32(d, 7);
+        let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5, mut r6, mut r7) =
+            idct_1d256(f0, f1, f2, f3, f4, f5, f6, f7);
+        trans_or_pass_ps(skip_t1, &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7);
+        let (mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6, mut c7) =
+            idct_1d256(r0, r1, r2, r3, r4, r5, r6, r7);
+        trans_or_pass_ps(skip_t2, &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7);
+        let bias = _mm256_set1_ps(BIAS);
+        let p01 = _mm256_packs_epi32(
+            _mm256_cvttps_epi32(_mm256_add_ps(c0, bias)),
+            _mm256_cvttps_epi32(_mm256_add_ps(c1, bias)),
+        );
+        let p23 = _mm256_packs_epi32(
+            _mm256_cvttps_epi32(_mm256_add_ps(c2, bias)),
+            _mm256_cvttps_epi32(_mm256_add_ps(c3, bias)),
+        );
+        let p45 = _mm256_packs_epi32(
+            _mm256_cvttps_epi32(_mm256_add_ps(c4, bias)),
+            _mm256_cvttps_epi32(_mm256_add_ps(c5, bias)),
+        );
+        let p67 = _mm256_packs_epi32(
+            _mm256_cvttps_epi32(_mm256_add_ps(c6, bias)),
+            _mm256_cvttps_epi32(_mm256_add_ps(c7, bias)),
+        );
+        let row_order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        let b0123 = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(p01, p23), row_order);
+        let b4567 = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(p45, p67), row_order);
+        let dst = out.as_mut_ptr().add(offset);
+        let l0 = _mm256_extracti128_si256::<0>(b0123);
+        let l1 = _mm256_extracti128_si256::<1>(b0123);
+        let l2 = _mm256_extracti128_si256::<0>(b4567);
+        let l3 = _mm256_extracti128_si256::<1>(b4567);
+        let rows = [
+            _mm_cvtsi128_si64(l0) as u64,
+            _mm_extract_epi64::<1>(l0) as u64,
+            _mm_cvtsi128_si64(l1) as u64,
+            _mm_extract_epi64::<1>(l1) as u64,
+            _mm_cvtsi128_si64(l2) as u64,
+            _mm_extract_epi64::<1>(l2) as u64,
+            _mm_cvtsi128_si64(l3) as u64,
+            _mm_extract_epi64::<1>(l3) as u64,
+        ];
+        for (r, &v) in rows.iter().enumerate() {
+            core::ptr::write_unaligned(dst.add(r * stride) as *mut u64, v);
+        }
+    }
+
+    /// 逐转置消融的吞吐（P-B1 上限测量）。
+    #[cfg(test)]
+    mod p_b1_probe {
+        use super::*;
+        use std::time::Instant;
+
+        /// 恒等输入验证 pack_column_rows_to_bytes：I_k[j] = j*8+k（0..63 各不相同），
+        /// 期望输出行 r = [r*8+0 .. r*8+7]。
+        #[test]
+        #[ignore]
+        fn pack_assembly_identity() {
+            if !crate::codecs::jpeg::avx2::avx2_enabled() {
+                eprintln!("SKIP non-avx2");
+                return;
+            }
+            let mk = |k: i32| -> __m256i {
+                // SAFETY: 本测试进程已支持 AVX2（调用方条件为真才运行）
+                unsafe {
+                    _mm256_setr_epi32(0 * 8 + k, 1 * 8 + k, 2 * 8 + k, 3 * 8 + k, 4 * 8 + k, 5 * 8 + k, 6 * 8 + k, 7 * 8 + k)
+                }
+            };
+            // SAFETY: 测试目标函数自身 target_feature；本机已支持 AVX2（调用方在 p_b1_probe 内）
+            let (b0123, b4567) = unsafe {
+                pack_column_rows_to_bytes(mk(0), mk(1), mk(2), mk(3), mk(4), mk(5), mk(6), mk(7))
+            };
+            let mut got = [0u8; 64];
+            unsafe {
+                _mm_storeu_si128(got.as_mut_ptr() as *mut _, _mm256_castsi256_si128(b0123));
+                let h0 = _mm256_extracti128_si256::<1>(b0123);
+                _mm_storeu_si128(got.as_mut_ptr().add(16) as *mut _, h0);
+                _mm_storeu_si128(got.as_mut_ptr().add(32) as *mut _, _mm256_castsi256_si128(b4567));
+                let h1 = _mm256_extracti128_si256::<1>(b4567);
+                _mm_storeu_si128(got.as_mut_ptr().add(48) as *mut _, h1);
+            }
+            for r in 0..8 {
+                for c in 0..8 {
+                    let exp = (r * 8 + c) as u8;
+                    assert_eq!(got[r * 8 + c], exp, "row{r},col{c}: got {} want {exp}", got[r * 8 + c]);
+                }
+            }
+        }
+
+        #[test]
+        #[ignore]
+        fn transpose_ablation_throughput() {
+            let mut rng = 0x9E37_79B9u64;
+            let mut next = move || {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (rng >> 33) as u32
+            };
+            let blocks_n = 512usize;
+            let mut blocks: Vec<[i16; 64]> = (0..blocks_n)
+                .map(|_| {
+                    let mut b = [0i16; 64];
+                    for v in b.iter_mut() {
+                        *v = (next() % 32000) as i16;
+                    }
+                    b
+                })
+                .collect();
+            let mut out = vec![0u8; blocks_n * 64];
+            let iters = 30_000usize;
+            let mut time = |skip_t1: bool, skip_t2: bool, tag: &str| {
+                let t0 = Instant::now();
+                let mut sink: u64 = 0;
+                for _ in 0..iters {
+                    for (i, blk) in blocks.iter_mut().enumerate() {
+                        unsafe {
+                            idct8x8_avx2_variant(blk, &mut out[i * 64..], 0, 8, skip_t1, skip_t2)
+                        };
+                    }
+                    sink = sink.wrapping_add(out[0] as u64);
+                }
+                let ns = t0.elapsed().as_secs_f64() * 1e9 / (iters as f64 * blocks_n as f64);
+                println!("PB1_ABLATION {tag}: ns/block={ns:.2} (sink={sink})");
+            };
+            time(false, false, "base(T1=T2)");
+            time(true, false, "skip_T1      ");
+            time(false, true, "skip_T2      ");
+            time(true, true, "skip_T1+T2   ");
         }
     }
 }
