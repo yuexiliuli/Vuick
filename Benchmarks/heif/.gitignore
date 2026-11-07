@@ -1,0 +1,3 @@
+# HEIF 复现套件产物
+logs/
+# 语料不入仓（K64）：快照在 Benchmarks/corpus/heif（gitignored）；C# 表为轻量文本可入仓

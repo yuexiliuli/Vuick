@@ -4,7 +4,7 @@
 //! - `perf_stage_no_color`：`decode_yuv`（变换前画布、grid 合成、不含 color）耗时，与 C# stage_ms（per-tile
 //!   HEVC，无容器/无合成）对照——Rust 含 tgile 逐 tile + grid 合成，故略高于 C# stage 属预期。
 //!
-//! 语料：`target/heif/corpus/<file>`；缺失 → 打印 `SKIP: missing …` 后 return（SKIP 是常态不是失败）。
+//! 语料：`Benchmarks/corpus/heif/<file>`；缺失 → 打印 `SKIP: missing …` 后 return（SKIP 是常态不是失败）。
 //! 均 `#[ignore]`，仅 release 测量用；debug 跑无意义。
 //! 运行：`cargo test -p kimg_heif --release --test oracle_perf perf_ -- --ignored --nocapture --test-threads=1`
 
@@ -14,7 +14,7 @@ use std::time::Instant;
 use kimg_heif::codecs::heif::decode_yuv_par;
 use kimg_heif::{decode_rgba, decode_yuv, read_info};
 
-const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus");
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif");
 
 /// 代表夹具（从易到难）：语料文件名 + 单轮 >30s 是否可降轮。
 /// C# 基线仅含前三（IMG_0083 / fuji / testsrc2 见 ref_000_heif_quick.log）；三个 *_grid 无 C# 基线。

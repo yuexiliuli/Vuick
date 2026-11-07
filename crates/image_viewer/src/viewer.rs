@@ -1550,7 +1550,7 @@ mod tests {
     #[test]
     fn heic_decodes_via_viewer_path_to_bgra() {
         let corpus =
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus/IMG_0083.HEIC");
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif/IMG_0083.HEIC");
         let bytes = match std::fs::read(corpus) {
             Ok(b) => b,
             Err(e) => {

@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn grid_parallel_branch_is_taken_for_photo_grid() {
         let corpus =
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus/IMG_0083.HEIC");
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif/IMG_0083.HEIC");
         let data = match std::fs::read(corpus) {
             Ok(d) => d,
             Err(e) => {

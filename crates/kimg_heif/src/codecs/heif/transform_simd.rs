@@ -1179,7 +1179,7 @@ mod tests {
     #[test]
     fn img_0083_map_classifies_rot90_aligned() {
         let corpus =
-            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus/IMG_0083.HEIC"));
+            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif/IMG_0083.HEIC"));
         if !corpus.exists() {
             eprintln!("SKIP: missing {corpus:?}");
             return;
@@ -1316,7 +1316,7 @@ mod tests {
     #[ignore]
     fn perf_decode_irot_before_after() {
         let corpus_root =
-            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus"));
+            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif"));
         let files = [
             "IMG_0083.HEIC",
             "hevc-main-3072x4096-grid.heic",

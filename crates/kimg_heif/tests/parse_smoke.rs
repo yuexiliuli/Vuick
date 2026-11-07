@@ -8,7 +8,7 @@ use kimg_heif::codecs::heif::hevc::parameter_sets::{HevcPps, HevcSps};
 use kimg_heif::codecs::heif::probe::heif_probe;
 
 const CORPUS_FILE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus/synth-screen-testsrc2-1280x720-main8.heic");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif/synth-screen-testsrc2-1280x720-main8.heic");
 
 #[test]
 fn probe_and_parameter_sets_synth_main8() {

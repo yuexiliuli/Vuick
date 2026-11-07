@@ -3,7 +3,7 @@
 //! - 默认带 in-loop 滤波（Deblock + SAO）= `_t0.yuv`（main8 全图 Oracle 全绿 = 目标）；
 //! - `decode_item_flags(.., true, true)` 消融 = `_t0_nofilter.yuv`（保留，防拆东墙）。
 //!
-//! 语料：`target/heif/corpus/<file>.HEIC/.heic`；参考 dump：`target/heif/oracle/<md5>_t0?[_nofilter].yuv`。
+//! 语料：`Benchmarks/corpus/heif/<file>.HEIC/.heic`；参考 dump：`target/heif/oracle/<md5>_t0?[_nofilter].yuv`。
 //! dump 格式 = 32 字节头（yW,yH,cW,cH,cropL,cropR,cropT,cropB 各 i32LE）+ Y(u16LE×yW*yH) +
 //! Cb(cW*cH) + Cr(cW*cH)，行主序无跨步；yW/yH 是 SPS 编码尺寸（含一致性 padding：SPS 尺寸本身
 //! 就是 MinCb 对齐的编码尺寸，平面的 stride = 平面宽）。Rust 输出（`HevcPicture`）必须同尺寸。
@@ -19,7 +19,7 @@ use kimg_heif::codecs::heif::hevc::decode_item_flags;
 use kimg_heif::codecs::heif::isobmff::item_container::ItemContainer;
 
 const ORACLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/oracle");
-const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus");
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif");
 
 /// 单一 main8 单 tile 图片：「md5（dump 前缀）, 语料文件名」。SPS 编码尺寸即 dump 尺寸
 /// （含一致性 padding：SPS 尺寸本身是编码尺寸；输出画布对被 `crop` 裁剪，但 dump 是整图）。

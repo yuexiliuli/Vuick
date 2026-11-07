@@ -2,7 +2,7 @@
 //! 读 `target/heif/oracle/<md5>.yuv`（整图 YUV：**无头**、画布尺度 4:2:0、u16 LE、行主序无跨步）
 //! 与 `<md5>.rgba`（w,h i32 LE + RGBA8），用本 crate 的 `color::yuv_to_rgba` 与 `canvas::compose_grid`
 //! 复算并逐字节断言。
-//! 画布尺寸与颜色参数（`matrix_coefficients` / `full_range` / 位深）从 `target/heif/corpus/<file>` 的
+//! 画布尺寸与颜色参数（`matrix_coefficients` / `full_range` / 位深）从 `Benchmarks/corpus/heif/<file>` 的
 //! 容器（`canvas_width/height`）与 nclx/SPS 推导，口径与 C# 相同（nclx 优先，否则 SPS VUI）。
 //! 注意：IMG_*（transforms=1）的整图 YUV 是 **transform 前画布**（常见为横向 4032×3024），显示尺寸
 //! 因 irot 是竖的，故按容器画布尺寸切分/合成，不以 `.rgba` 显示尺寸为准。
@@ -20,7 +20,7 @@ use kimg_heif::codecs::heif::color::yuv_to_rgba;
 use kimg_heif::codecs::heif::container::HeifContainer;
 
 const ORACLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/oracle");
-const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus");
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif");
 
 #[allow(non_snake_case)]
 #[derive(Debug, serde::Deserialize)]

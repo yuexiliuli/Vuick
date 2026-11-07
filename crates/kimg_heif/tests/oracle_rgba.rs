@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use kimg_heif::{decode_rgba, decode_yuv};
 
 const ORACLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/oracle");
-const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus");
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif");
 
 fn i32_at(data: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])

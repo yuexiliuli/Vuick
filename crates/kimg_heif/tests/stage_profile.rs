@@ -5,7 +5,7 @@
 //! 逐代表夹具多轮中位，输出各阶段 ms 与占全链 %。阶段对齐 C# `quick --ablate` 内插口径：
 //! parse=容器+切片+CABAC+残差语法（等效 parse-only）、intra、residual、deblock、sao、grid、color、transform。
 //!
-//! 语料：`target/heif/corpus/<file>`；缺失 → 打印 `SKIP: missing …` 后 return（SKIP 是常态不是失败）。
+//! 语料：`Benchmarks/corpus/heif/<file>`；缺失 → 打印 `SKIP: missing …` 后 return（SKIP 是常态不是失败）。
 //! 均 `#[ignore]`，仅 release 测量用；debug 跑无意义，也不加 feature 跑无意义（stage_clock 全 0）。
 //! 运行：`cargo test -p kimg_heif --release --features stage_profile --test stage_profile perf_ -- --ignored --nocapture --test-threads=1`
 //!（长命令前台阻塞到结束，禁止后台化。）
@@ -16,7 +16,7 @@ use std::time::Instant;
 use kimg_heif::codecs::heif::stage_clock;
 use kimg_heif::{decode_rgba, read_info};
 
-const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus");
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif");
 
 /// 代表夹具（K96 对齐 C# ablate 主行）：main8 单 tile ×2、48-tile 照片、main8/main10 grid。
 const FIXTURES: &[&str] = &[

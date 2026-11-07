@@ -3,7 +3,7 @@
 //! 逐字节比对。语料缺失 → 打印 `SKIP: missing …` 后 return。
 
 const SYNTH_FILE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus/synth-screen-testsrc2-1280x720-main8.heic");
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif/synth-screen-testsrc2-1280x720-main8.heic");
 const TEST_SRC2_RGBA: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/oracle/25e8249964d4f8b08e022919ff07d852.rgba");
 

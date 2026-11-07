@@ -1,5 +1,5 @@
 //! oracle 测试骨架：读 `target/heif/oracle/manifest.csv`（`md5,file,w,h,bitdepth,tiles`），
-//! 每文件读 `<md5>.info.json`，用 `heif_probe` 解析 `target/heif/corpus/<file>` 并逐字段断言
+//! 每文件读 `<md5>.info.json`，用 `heif_probe` 解析 `Benchmarks/corpus/heif/<file>` 并逐字段断言
 //! （w,h,bd,spsW,spsH,bitY,bitC,chroma,profile,ctbLog2,grid,cols,rows,tiles,conf）。
 //! 目录/文件缺失 → 打印 `SKIP: missing …` 后 return（SKIP 是常态不是失败）。
 //! 运行：`cargo test -p kimg_heif --test oracle -- --nocapture --test-threads=1`
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use kimg_heif::codecs::heif::probe::heif_probe;
 
 const ORACLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/oracle");
-const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus");
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif");
 
 #[allow(non_snake_case)]
 #[derive(Debug, serde::Deserialize)]

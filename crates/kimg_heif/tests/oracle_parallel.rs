@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use kimg_heif::codecs::heif::{decode_yuv, decode_yuv_par, YuvPlanes};
 
 const ORACLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/oracle");
-const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/heif/corpus");
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif");
 
 /// 两个 YUV 结果是否逐平面一致；返回失配说明（空 = 完全一致）。
 fn yuvs_identical(a: &YuvPlanes, b: &YuvPlanes) -> Result<(), String> {
