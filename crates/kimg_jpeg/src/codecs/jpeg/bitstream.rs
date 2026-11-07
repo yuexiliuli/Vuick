@@ -845,6 +845,114 @@ impl HotStream {
         Ok(true)
     }
 
+    /// A′（K109 探查）：value-return 版 refill——`aligned_buffer/bits_left` 作为正则
+    /// 局部变量传入、新值 `(ab, bl)` 传出，热 AC 环内二者全程寄存器驻留、不落盘 self；
+    /// `buffer/marker/overread_by/seen_eoi` 仍留在 self（冷字段，仅 refill 时访问）。
+    /// 逐位语义与 `refill` 完全一致（同 refill_hot 单字节逻辑：marker 探测时机、字节填充、
+    /// EOI 补零、`overread_by`/`seen_eoi` 路径全照抄；返回值 bool「skip」调用侧本就忽略，
+    /// 故只回 `(ab, bl)`）。仅 A′ 单符号 `decode_block_inner` 使用，`refill` 保留作
+    /// DUAL/其它调用方。
+    #[inline(always)]
+    fn refill_value<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        mut ab: u64,
+        mut bl: u8,
+    ) -> Result<(u64, u8), DecodeError> {
+        // 单字节 refill：读到 0xFF 时探测后续 marker（`refill` 内 refill_hot 1:1，仅
+        // aligned_buffer→ab / bits_left→bl）。
+        macro_rules! refill_hot_v {
+            ($buffer:expr,$byte:expr,$bits_left:expr) => {
+                // 读一个字节
+                $byte = u64::from(reader.read_u8());
+                self.overread_by += usize::from(reader.eof()?);
+                // 追加到缓冲
+                $buffer = ($buffer << 8) | $byte;
+                // 增加位数
+                $bits_left += 8;
+                // 特判 0xFF
+                if $byte == 0xff {
+                    // 读取下一字节
+                    let mut next_byte = u64::from(reader.read_u8());
+                    // 字节填充：遇到 0xFF 则跳过
+                    if next_byte != 0x00 {
+                        while next_byte == 0xFF {
+                            next_byte = u64::from(reader.read_u8());
+                        }
+
+                        if next_byte != 0x00 {
+                            // 撤销刚才的 0xFF 追加并返回
+                            $buffer >>= 8;
+                            $bits_left -= 8;
+
+                            if $bits_left != 0 {
+                                ab = $buffer << (64 - $bits_left);
+                            }
+
+                            let marker = Marker::from_u8(next_byte as u8);
+                            self.marker = marker;
+
+                            if let Some(Marker::UNKNOWN(_)) = marker {
+                                return Err(DecodeError::Format(
+                                    "Unknown marker in bit stream".to_string(),
+                                ));
+                            }
+                            if next_byte == 0xD9 {
+                                // EOI 特殊处理：补一个零字节，避免 panic
+                                self.buffer <<= 8;
+                                $bits_left += 8;
+                                ab = self.buffer << (64 - $bits_left);
+                            }
+
+                            return Ok((ab, bl));
+                        }
+                    }
+                }
+            };
+        }
+
+        // 32 位足够一次解码(16 位)与 receive_extend(最多 16 位)
+        if bl < 32 {
+            if self.marker.is_some() || self.seen_eoi {
+                // 已发现 marker 或处于 EOI：填零
+                self.buffer <<= 32;
+                bl += 32;
+                ab = self.buffer << (64 - bl);
+                return Ok((ab, bl));
+            }
+
+            if self.overread_by > 0 {
+                if bl == 0 {
+                    return Err(DecodeError::ExhaustedData);
+                }
+                // 已过 EOF：继续消费缓冲位，不再合成零填充
+                return Ok((ab, bl));
+            }
+
+            // 常见路径：一次预读 4 字节，若无 0xFF 则直接消费
+            if let Ok(bytes) = reader.read_fixed_bytes_or_error::<4>() {
+                let msb_buf = u32::from_be_bytes(bytes);
+                if !has_byte(msb_buf, 255) {
+                    bl += 32;
+                    self.buffer <<= 32;
+                    self.buffer |= u64::from(msb_buf);
+                    ab = self.buffer << (64 - bl);
+                    return Ok((ab, bl));
+                }
+
+                reader.rewind(4)?;
+            }
+            let mut byte;
+            // 4 次单字节 refill
+            refill_hot_v!(self.buffer, byte, bl);
+            refill_hot_v!(self.buffer, byte, bl);
+            refill_hot_v!(self.buffer, byte, bl);
+            refill_hot_v!(self.buffer, byte, bl);
+            ab = self.buffer << (64 - bl);
+        }
+        Ok((ab, bl))
+    }
+
     /// 预读 `LOOKAHEAD` 位。
     #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
@@ -1063,6 +1171,13 @@ impl HotStream {
     /// bits_left/zq/block 每符号栈帧访问）中提出，编译器给它完整寄存器帧（独立函数态
     /// ≈18-22 条/符号、0 栈访问）；外层只保留 MCU 循环与 post。非泛型 → 全部 4 个
     /// PROGRESSIVE/SAMPLED 实例共享同一份独立函数代码。
+    ///
+    /// A′（K109 探查，2026-11-07）：P-A1 后 asm 仍每符号 3 处 HotStream 内存往返——
+    /// aligned_buffer 载+存各 1（8(%self) store-forward 关键链）、bits_left 无条件 spill。
+    /// 本版把 aligned_buffer/bits_left 提为热环局部 `ab`/`bl`，全程寄存器驻留、环内
+    /// 「只算不落盘」；refill 改走 `refill_value`（value-return 新值）；仅环结束 / EOB /
+    /// 慢路径 / 出错才写回 self。位消费顺序逐位不变（与 `decode_block_inner_dual` 无关，
+    /// DUAL 路径保持原样）。
     #[inline(never)]
     fn decode_block_inner<'a>(
         &mut self,
@@ -1077,45 +1192,72 @@ impl HotStream {
         let dc_cs = &dc_table.cs_lut;
         let ac_cs = &ac_table.cs_lut;
 
+        // A′：aligned_buffer/bits_left 提出为热环局部寄存器驻留变量。
+        let mut ab = self.aligned_buffer;
+        let mut bl = self.bits_left;
+
         // marker 且 0 位在块起始：仅解码路径保留此防御检查（与旧 `decode_mcu_block`
-        // 一致）；discard 路径旧实现无此检查，为保持其逐位语义不加。
-        if block.is_some() && self.bits_left < 1 && self.marker.is_some() {
+        // 一致）；discard 路径旧实现无此检查，为保持其逐位语义不加。此时仅读局部 bl，
+        // self 未被修改。
+        if block.is_some() && bl < 1 && self.marker.is_some() {
             return Err(DecodeError::Format(
                 "No more bytes left in stream before marker".to_string(),
             ));
         }
 
-        // --- DC ---
-        if self.bits_left < 32 {
-            self.refill(reader)?;
+        // A′ refill 内联（value-return）：更新 ab/bl。
+        // 出错即解码终结路径：DecodeError 沿 mcu.rs（decode_mcu_ycbcr_baseline 等
+        // :182/:392/:422）传播后无人再读 HotStream 态（无 resync），txt 不写回 ab/bl——
+        // 此处「预 refill 的 ab/bl 局部 × 已 post-refill 的 buffer/marker」混合瞬态不可观测，
+        // 故 error 臂只上抛（删写回，NIT1）。
+        macro_rules! refill_ab {
+            () => {{
+                match self.refill_value(reader, ab, bl) {
+                    Ok((a, b)) => {
+                        ab = a;
+                        bl = b;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }};
         }
-        let mut e = dc_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+
+        // --- DC ---
+        if bl < 32 {
+            refill_ab!();
+        }
+        let mut e = dc_cs[(ab >> (64 - CS_LUT_BITS)) as usize];
         let diff = if (e & CS_LUT_FULL) != 0 {
             // 值在窗口内：单次移位消费码长+幅值（DC 表符号恒 ≤15，建表已校验）。
             let n = (e & 31) as u8;
-            self.aligned_buffer <<= n;
-            self.bits_left = self.bits_left.saturating_sub(n);
+            ab <<= n;
+            bl = bl.saturating_sub(n);
             e >> CS_VALUE_SHIFT
         } else if e != 0 {
             // 码在窗内但幅值出窗：先丢码长，再读 t 位幅值并按 JPEG EXTEND 扩展。
             let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
             let t = ((e >> 11) & 15) as u8;
-            self.aligned_buffer <<= len;
-            let mag = (self.aligned_buffer >> (64 - t)) as i32;
-            self.aligned_buffer <<= t;
-            self.bits_left = self.bits_left.saturating_sub(len + t);
+            ab <<= len;
+            let mag = (ab >> (64 - t)) as i32;
+            ab <<= t;
+            bl = bl.saturating_sub(len + t);
             huff_extend(mag, i32::from(t))
         } else {
-            // 码长 > 11：慢路径（zune 风格）。
+            // 码长 > 11：慢路径（zune 风格）——先落盘局部态，走 &mut self 慢路径后回读。
+            self.aligned_buffer = ab;
+            self.bits_left = bl;
             let mut symbol =
                 dc_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
             decode_huff!(self, symbol, dc_table);
-            if symbol != 0 {
+            let d = if symbol != 0 {
                 let r = self.get_bits(symbol as u8);
                 huff_extend(r, symbol)
             } else {
                 0
-            }
+            };
+            ab = self.aligned_buffer;
+            bl = self.bits_left;
+            d
         };
         *dc_prediction = dc_prediction.wrapping_add(diff);
         if let Some(block) = block.as_deref_mut() {
@@ -1125,28 +1267,30 @@ impl HotStream {
         // --- AC ---
         let mut pos: usize = 1;
         loop {
-            if self.bits_left < 32 {
-                self.refill(reader)?;
+            if bl < 32 {
+                refill_ab!();
             }
-            e = ac_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+            e = ac_cs[(ab >> (64 - CS_LUT_BITS)) as usize];
             let (rs, v) = if (e & CS_LUT_FULL) != 0 {
                 // 完整条目（含 EOB/ZRL 单探测）：一次消费（码长+幅值）。
                 let n = (e & 31) as u8;
-                self.aligned_buffer <<= n;
-                self.bits_left = self.bits_left.saturating_sub(n);
+                ab <<= n;
+                bl = bl.saturating_sub(n);
                 (((e >> 11) & 255) as u8, e >> CS_VALUE_SHIFT)
             } else if e != 0 {
                 // 码在窗内、幅值出窗。
                 let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
-                self.aligned_buffer <<= len;
+                ab <<= len;
                 let rs = ((e >> 11) & 255) as u8;
                 let t = (rs & 15) as u8;
-                let mag = (self.aligned_buffer >> (64 - t)) as i32;
-                self.aligned_buffer <<= t;
-                self.bits_left = self.bits_left.saturating_sub(len + t);
+                let mag = (ab >> (64 - t)) as i32;
+                ab <<= t;
+                bl = bl.saturating_sub(len + t);
                 (rs, if t != 0 { huff_extend(mag, i32::from(t)) } else { 0 })
             } else {
-                // 码长 > 11：慢路径。
+                // 码长 > 11：慢路径——先落盘局部态，走 &mut self 慢路径后回读。
+                self.aligned_buffer = ab;
+                self.bits_left = bl;
                 let mut symbol =
                     ac_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
                 decode_huff!(self, symbol, ac_table);
@@ -1158,6 +1302,8 @@ impl HotStream {
                 } else {
                     0
                 };
+                ab = self.aligned_buffer;
+                bl = self.bits_left;
                 (rs, v)
             };
 
@@ -1171,7 +1317,10 @@ impl HotStream {
                 }
                 pos += 1;
             } else if rs != 0xF0 {
-                return Ok(pos as u16); // EOB
+                // EOB：写回局部态后返回（self.bits_left/marker 供 mcu.rs 断点检查）。
+                self.aligned_buffer = ab;
+                self.bits_left = bl;
+                return Ok(pos as u16);
             } else {
                 pos += 16; // ZRL
             }
@@ -1181,6 +1330,9 @@ impl HotStream {
             }
         }
 
+        // 环结束：写回局部态（非 EOB 满块）。
+        self.aligned_buffer = ab;
+        self.bits_left = bl;
         Ok(64)
     }
 
