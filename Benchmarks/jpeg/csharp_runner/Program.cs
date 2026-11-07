@@ -1,8 +1,12 @@
 // JPEG C# runner：两个子命令。
 //
-// `ref <corpusDir> <refOutDir>` —— 单核参照生成器：对语料每张 jpg 用
-// Sdcb.SimdCodecs.Jpeg.DecodeTo 计时（暖机 1 + N 轮中位），并 dump 一次解码字节到
-// <refOut>/<stem>.<w>x<h>.{gray|rgb}（jpeg_csharp_parity 的字节恒等参照）。
+// `ref <corpusDir> <refOutDir> [--rgba]` —— 单核参照测量 / 生成器：对语料每张 jpg 用
+// Sdcb.SimdCodecs.Jpeg.DecodeTo 计时（暖机 1 + N 轮中位）。
+//   - 默认（无 --rgba）：彩色 → Rgb24(3B/px)、灰度 → Gray8(1B/px)，dump 一次解码字节到
+//     <refOut>/<stem>.<w>x<h>.{gray|rgb}（jpeg_csharp_parity 的字节恒等参照）。
+//   - `--rgba`：对齐口径 Sdcb 官方基准 —— 一律 Rgba32(4B/px，灰度亦 4B)，
+//     DecodeTo(data, dest, stride, Rgba32, Full)，仅计时输出 `| name | ms |` 表，不 dump。
+//     （rgba 表供「turbo 端对齐测量」matrix 与 tj3-rgba 探针对照。）
 //
 // `encode <srcDir> <outDir>` —— 广谱语料生成器（B2 翻正前置验证）：对 srcDir 每个
 // .jpg 用 JpegDecoder.Decode 解成 RGBA 栅格，再经 JpegEncoder.Encode 产出 6 个变体：
@@ -30,20 +34,32 @@ return args[0] switch
 
 static int RunRef(string[] args)
 {
-    if (args.Length < 3)
+    // 解析：ref <corpusDir> <refOutDir> [--rgba]（--rgba 位置任意）
+    bool rgba = false;
+    var positional = new List<string>();
+    foreach (string a in args.Skip(1))
     {
-        Console.Error.WriteLine("用法: JpegRef ref <corpusDir> <refOutDir>");
+        if (a == "--rgba") { rgba = true; }
+        else { positional.Add(a); }
+    }
+    if (positional.Count < 2)
+    {
+        Console.Error.WriteLine(rgba ? "用法: JpegRef ref <corpusDir> <refOutDir> --rgba" : "用法: JpegRef ref <corpusDir> <refOutDir>");
         return 2;
     }
 
-    string corpusDir = args[1];
-    string refOutDir = args[2];
+    string corpusDir = positional[0];
+    string refOutDir = positional[1];
     if (!Directory.Exists(corpusDir))
     {
         Console.Error.WriteLine($"# ERR corpus 不存在: {corpusDir}");
         return 2;
     }
-    Directory.CreateDirectory(refOutDir);
+    if (!rgba)
+    {
+        Directory.CreateDirectory(refOutDir);
+    }
+
 
     int rounds = 9;
     if (Environment.GetEnvironmentVariable("JPEG_REF_ROUNDS") is { Length: > 0 } rs
@@ -77,7 +93,8 @@ static int RunRef(string[] args)
             w = info.Width;
             h = info.Height;
             gray = info.Components == 1;
-            bpp = gray ? 1 : 3;
+            // rgba 口径：一律 4B/px（等同 Sdcb 官方 Rgba32 计时）；否则彩色3/灰度1
+            bpp = rgba ? 4 : (gray ? 1 : 3);
         }
         catch (Exception ex)
         {
@@ -88,7 +105,7 @@ static int RunRef(string[] args)
         int stride = checked(w * bpp);
         int len = checked(stride * h);
         var dest = new byte[len];
-        var format = gray ? JpegPixelFormat.Gray8 : JpegPixelFormat.Rgb24;
+        var format = rgba ? JpegPixelFormat.Rgba32 : (gray ? JpegPixelFormat.Gray8 : JpegPixelFormat.Rgb24);
 
         bool decoded = false;
         try
@@ -107,24 +124,27 @@ static int RunRef(string[] args)
             _ = JpegDecoder.DecodeTo(data, dest, stride, format, JpegScale.Full);
         }, rounds);
 
-        try
+        if (!rgba)
         {
-            string ext = gray ? "gray" : "rgb";
-            string refFile = Path.Combine(refOutDir, $"{stem}.{w}x{h}.{ext}");
-            if (!decoded) { throw new InvalidOperationException("未解码成功"); }
-            File.WriteAllBytes(refFile, dest);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"# ERR {name} dump ref 失败: {ex.Message}");
-            continue;
+            try
+            {
+                string ext = gray ? "gray" : "rgb";
+                string refFile = Path.Combine(refOutDir, $"{stem}.{w}x{h}.{ext}");
+                if (!decoded) { throw new InvalidOperationException("未解码成功"); }
+                File.WriteAllBytes(refFile, dest);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"# ERR {name} dump ref 失败: {ex.Message}");
+                continue;
+            }
         }
 
         Console.WriteLine($"| `{name}` | {ms.ToString("F3", CultureInfo.InvariantCulture)} |");
         done++;
     }
 
-    Console.WriteLine($"# DONE ref files={done} total={files.Count}");
+    Console.WriteLine($"# DONE ref{(@rgba ? "-rgba" : "")} files={done} total={files.Count}");
     return 0;
 }
 

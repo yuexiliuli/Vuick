@@ -12,9 +12,10 @@ import re
 import sys
 from pathlib import Path
 
+# turbo 字段名随探针 mode：`turbo_tj2_rgb=`（旧口径） / `turbo_tj3_rgba=`（Sdcb 对齐口径），通用捕获。
 PERFILE = re.compile(
     r'KIMG_JPEG_VS_TURBO perfile\s+(\S+)\s+(\d+)x(\d+)\s+gray=([01])\s+'
-    r'ours=([\d.]+)\s+turbo=([\d.]+)\s+ratio_ours_turbo=([\d.]+)'
+    r'ours=([\d.]+)\s+turbo_([a-z0-9_]+)=([\d.]+)\s+ratio_ours_turbo=([\d.]+)'
 )
 CS_ROW = re.compile(r'^\s*\|\s*`([^`]+)`\s*\|\s*([\d.]+)\s*\|')
 
@@ -51,6 +52,7 @@ def main():
                     pass
 
     rows = {}
+    turbo_modes = set()
     for line in acc.splitlines():
         m = PERFILE.match(line)
         if m:
@@ -59,10 +61,15 @@ def main():
                 'h': int(m.group(3)),
                 'gray': m.group(4) == '1',
                 'ours': float(m.group(5)),
-                'turbo': float(m.group(6)),
+                'turbo': float(m.group(7)),
             }
+            turbo_modes.add(m.group(6))
     if not rows:
         print('未解析到 KIMG_JPEG_VS_TURBO perfile 行', file=sys.stderr)
+        return 2
+    turbo_mode = sorted(turbo_modes)
+    if len(turbo_mode) != 1:
+        print(f'探针日志含多种 turbo 字段（{turbo_mode}），应单一 mode 单日志', file=sys.stderr)
         return 2
 
     # 三路合并：只计探针与 C# 都有的文件（matched 口径）
@@ -80,7 +87,7 @@ def main():
     oc = [o / c for (_, o, _, c) in tri]
     ct = [c / t for (_, _, t, c) in tri]
 
-    print(f'== jpeg: matched={matched}（探针 {len(rows)} 文件，C# {len(cs)} 文件）')
+    print(f'== jpeg[{turbo_mode[0]}] matched={matched}（探针 {len(rows)} 文件，C# {len(cs)} 文件）')
     if dropped:
         print(f'   dropped（探针有而 C# 无，不计入）: {", ".join(dropped)}')
     print(f'   geomean ours/turbo = {geomean(ot):.3f}    geomean ours/C# = {geomean(oc):.3f}    geomean C#/turbo = {geomean(ct):.3f}')
