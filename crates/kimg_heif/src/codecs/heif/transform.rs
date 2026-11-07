@@ -7,9 +7,24 @@
 //! 越界守卫即与 C#「逐瓦片写输出」逐字节一致（零 panic）。
 //!
 //! 本模块只做纯整数仿射；解码 → grid 合成 → 色转属于 canvas/color，各自处理。
+//! 无 unsafe：SIMD 内核在 `transform_simd`（`#![allow(unsafe_code)]` 叶子）里，此处经安全分派调用。
+#![forbid(unsafe_code)]
 
 use crate::codecs::heif::container::{HeifContainer, Transform, PropClap, PropIrot};
 use crate::codecs::heif::error::{HeifError, HeifResult};
+
+/// dev 测量开关（仿 `KIMG_HEIF_PARALLEL` / `KIMG_HEIF_TRANSFORM_SIMD` 姿势）：
+/// `KIMG_HEIF_TRANSFORM_PARALLEL=0` → transform 恒走串行（不开线程），供 release
+/// **同窗同二进制** A/B 定 transform 并行收益；默认空/AUTO → 启用。一次读取缓存，
+/// 不进热路径。叠加门控：`KIMG_HEIF_PARALLEL=0`（force_serial）恒优先串行。
+static FORCE_TRANSFORM_PAR_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn transform_par_enabled() -> bool {
+    !*FORCE_TRANSFORM_PAR_SERIAL.get_or_init(|| {
+        std::env::var("KIMG_HEIF_TRANSFORM_PARALLEL")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+    })
+}
 
 /// 合成的画布 → 输出仿射图与输出尺寸（C# `HeifCanvas` 的 `_a.._f` 与 `Width/Height`）。
 #[derive(Debug, Clone, Copy)]
@@ -97,7 +112,70 @@ pub fn compose(canvas_w: i32, canvas_h: i32, transforms: &[Transform]) -> HeifRe
 /// 把画布 RGBA8（`canvas_w × canvas_h` 行主序无跨步）经 `map` 写到 `out`（显示朝向 `width × height`
 /// 行主序、`out` 至少 `width*height*4` 字节）。画布像素映射出输出的被跳过（preimage 即输出恰覆盖
 /// 的矩形，见模块头注）。C# 逐 tile 写输出与逐画布扫描等价，逐字节同。
+///
+/// 分派：x86_64 且 `classify` 命中纯置换 irot（rot90/rot270/rot180）且源矩形对齐在界时走
+/// `transform_simd::apply_simd`（字节恒等双射，零算术）；否则原通用循环原样执行。
 pub fn apply_rgba(canvas: &[u8], canvas_w: i32, canvas_h: i32, map: &TransformMap, out: &mut [u8]) -> HeifResult<()> {
+    validate_rgba(canvas, canvas_w, canvas_h, map, out)?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if super::transform_simd::apply_simd(canvas, canvas_w, canvas_h, map, out)? {
+            return Ok(());
+        }
+    }
+    apply_rgba_loop(canvas, canvas_w, canvas_h, map, out);
+    Ok(())
+}
+
+/// [`apply_rgba`] 的并行版：`!force_serial() && tiles>=2` 时先试 SIMD 输出块行带并行
+/// （`transform_simd::apply_simd_par`），miss / 单核 / 单 tile → 落 [`apply_rgba`] 既有
+/// 路径（串行 SIMD → 通用循环），与串行**逐字节恒等**（并行只改执行顺序，块间写不相交）。
+///
+/// 门控硬约束：`KIMG_HEIF_PARALLEL=0`（[`super::force_serial`]）必须连 transform 并行一起关，
+/// 保「单核」测量口径不被污染——故 transform 并行与 color 并行共用同一
+/// `!force_serial() && tiles >= 2` 判据。
+pub fn apply_rgba_par(
+    canvas: &[u8],
+    canvas_w: i32,
+    canvas_h: i32,
+    map: &TransformMap,
+    out: &mut [u8],
+    tiles: usize,
+) -> HeifResult<()> {
+    validate_rgba(canvas, canvas_w, canvas_h, map, out)?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        // 并行门：与 color 并行同判据（`force_serial` / 单 tile → 恒串行）；另受
+        // `KIMG_HEIF_TRANSFORM_PARALLEL=0`（dev 测开关）兜底。
+        if !super::force_serial() && tiles >= 2 && transform_par_enabled() {
+            if super::transform_simd::apply_simd_par(canvas, canvas_w, canvas_h, map, out)? {
+                return Ok(());
+            }
+            // SIMD 并行 miss → 落下方串行 SIMD / 通用循环（与 apply_rgba 相同的既有路径）。
+        }
+        if super::transform_simd::apply_simd(canvas, canvas_w, canvas_h, map, out)? {
+            return Ok(());
+        }
+    }
+    apply_rgba_loop(canvas, canvas_w, canvas_h, map, out);
+    Ok(())
+}
+
+/// 强制通用路径入口（与 [`apply_rgba`] 同校验；供 SIMD≡通用对拍测试与性能探针使用）。
+pub(crate) fn apply_rgba_generic(
+    canvas: &[u8],
+    canvas_w: i32,
+    canvas_h: i32,
+    map: &TransformMap,
+    out: &mut [u8],
+) -> HeifResult<()> {
+    validate_rgba(canvas, canvas_w, canvas_h, map, out)?;
+    apply_rgba_loop(canvas, canvas_w, canvas_h, map, out);
+    Ok(())
+}
+
+/// 缓冲/尺寸一致性与溢出的公共校验（`apply_rgba`/`apply_rgba_generic` 共用）。
+fn validate_rgba(canvas: &[u8], canvas_w: i32, canvas_h: i32, map: &TransformMap, out: &mut [u8]) -> HeifResult<()> {
     let ow = map.width;
     let oh = map.height;
     if canvas_w <= 0 || canvas_h <= 0 || ow <= 0 || oh <= 0 {
@@ -115,6 +193,13 @@ pub fn apply_rgba(canvas: &[u8], canvas_w: i32, canvas_h: i32, map: &TransformMa
     if out.len() < out_px * 4 {
         return Err(HeifError::invalid("输出 RGBA 缓冲不足。"));
     }
+    Ok(())
+}
+
+/// 原始逐像素通用循环（C# 语义，含越界守卫；SIMD 回退/对拍基准）。
+fn apply_rgba_loop(canvas: &[u8], canvas_w: i32, canvas_h: i32, map: &TransformMap, out: &mut [u8]) {
+    let ow = map.width;
+    let oh = map.height;
     let a = map.a;
     let b = map.b;
     let c = map.c;
@@ -134,7 +219,6 @@ pub fn apply_rgba(canvas: &[u8], canvas_w: i32, canvas_h: i32, map: &TransformMa
             out[di..di + 4].copy_from_slice(&canvas[si..si + 4]);
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

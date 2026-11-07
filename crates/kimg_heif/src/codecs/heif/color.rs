@@ -296,11 +296,101 @@ pub fn yuv_to_rgba(
     Ok(out)
 }
 
+/// 并行色彩的最小行数门槛（行数过少线程开销 > 收益；`KIMG_HEIF_PARALLEL=0` 恒串行）。
+const COLOR_PAR_MIN_ROWS: usize = 4;
+/// 行带并行每带最小学（防 tiny dest 过分割：可用核再多也不切出更细的行带）。
+const COLOR_PAR_BAND_MIN_ROWS: usize = 8;
+
 /// 整图 Y′CbCr → RGBA8 直写：与 [`yuv_to_rgba`] 逐字节恒等（同一系数/逐行分派/alpha=255），
 /// 但不分配中间缓冲，直接把 `width*height*4` 字节（R G B A）写进 `dest`
 /// （`dest.len() < width*height*4` 时返回 `Err`，不写任何字节）。
 /// 供 `decode_rgba` 无 transform 时直写 `destination` 使用。
 pub fn yuv_to_rgba_into(
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    matrix_coefficients: i32,
+    full_range: bool,
+    dest: &mut [u8],
+) -> HeifResult<()> {
+    color_band(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        bit_depth,
+        matrix_coefficients,
+        full_range,
+        dest,
+        0,
+        height,
+        height,
+    )
+}
+
+/// 行带 [r0, r1) 的色彩转换（[`yuv_to_rgba_into`] 的行带切片版本）：与整图逐行同算术
+/// （同一 [`to_rgba_420_row`] 分派）、逐字节恒等，只处理输出行 `[r0, r1)`。
+///
+/// `dest` 是「从输出行 `r0` 起」的切片：整图调用传 `r0=0, r1=out_h` 且 `dest` 为整图
+/// （`out_h == height`）；行带调用传 `split_at_mut` 得到的**子切片**（长度恰好
+/// `(r1-r0)*width*4`）。容量按带校验（`dest.len() < (r1-r0)*width*4` 返回 `Err`，不写
+/// 任何字节），平面尺寸/位深校验与 [`yuv_to_rgba_into`] 完全一致。`out_h` 为输出总高
+/// （须 `r1 <= out_h`；现调用恒等于 `height`）。chroma 邻近行只读共享，无写冲突。
+pub(crate) fn color_band(
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    matrix_coefficients: i32,
+    full_range: bool,
+    dest: &mut [u8],
+    r0: usize,
+    r1: usize,
+    out_h: usize,
+) -> HeifResult<()> {
+    let cw = (width + 1) >> 1;
+    let ch = (height + 1) >> 1;
+    if y.len() < width * height || cb.len() < cw * ch || cr.len() < cw * ch {
+        return Err(HeifError::invalid("YUV 平面尺寸不足。"));
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(HeifError::invalid(format!(
+            "不支持的位深 {bit_depth}；只支持 8–16。"
+        )));
+    }
+    if r1 > out_h || dest.len() < (r1 - r0) * width * 4 {
+        return Err(HeifError::invalid("目标缓冲不足。"));
+    }
+    let k = Coefficients::for_matrix(matrix_coefficients, full_range, i32::from(bit_depth));
+    for row in r0..r1 {
+        let c_off = (row >> 1) * cw;
+        let start = (row - r0) * width * 4;
+        to_rgba_420_row(
+            &y[row * width..(row + 1) * width],
+            &cb[c_off..c_off + cw],
+            &cr[c_off..c_off + cw],
+            &mut dest[start..start + width * 4],
+            width,
+            &k,
+        );
+    }
+    Ok(())
+}
+
+/// 并行行带色彩转换（[`yuv_to_rgba_into`] 的并行版）：逐输出行独立（行间无写依赖，
+/// chroma 邻近行只读共享），按连续行带 `split_at_mut` 分块交 `std::thread::scope` worker
+/// 并行处理，逐字节恒等——仅执行顺序按带切分，per-row 算术与 [`color_band`] 完全一致。
+///
+/// 门控（`decode_rgba` 的 `tiles>=2 && !force_serial()` 路由之外的兜底）：`KIMG_HEIF_PARALLEL=0`
+/// （[`super::force_serial`]）或行数 < [`COLOR_PAR_MIN_ROWS`] 或可用核 <2 → 落单线程整图
+/// （与 [`yuv_to_rgba_into`] 逐字节恒等）。供 `decode_rgba`（tiles>=2 的并行路径）使用。
+pub(crate) fn yuv_to_rgba_into_par(
     y: &[u16],
     cb: &[u16],
     cr: &[u16],
@@ -324,19 +414,80 @@ pub fn yuv_to_rgba_into(
     if dest.len() < width * height * 4 {
         return Err(HeifError::invalid("目标缓冲不足。"));
     }
-    let k = Coefficients::for_matrix(matrix_coefficients, full_range, i32::from(bit_depth));
-    for row in 0..height {
-        let c_off = (row >> 1) * cw;
-        to_rgba_420_row(
-            &y[row * width..(row + 1) * width],
-            &cb[c_off..c_off + cw],
-            &cr[c_off..c_off + cw],
-            &mut dest[row * width * 4..(row + 1) * width * 4],
-            width,
-            &k,
+    let avail = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    // 线程数上限 = 可用核 ∩ 保证每带至少 COLOR_PAR_BAND_MIN_ROWS 行（防 tiny dest 过分割）。
+    let threads = avail
+        .min(height.div_ceil(COLOR_PAR_BAND_MIN_ROWS))
+        .max(1);
+    if super::force_serial() || height < COLOR_PAR_MIN_ROWS || threads < 2 {
+        return color_band(
+            y, cb, cr, width, height, bit_depth, matrix_coefficients, full_range, dest, 0,
+            height, height,
         );
     }
+    // 行带划分：chunk = ceil(height/threads)，带 i = [i*chunk, min((i+1)*chunk, height))。
+    let chunk = height.div_ceil(threads);
+    let first_err: std::sync::Mutex<Option<HeifError>> = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        let mut rest = dest;
+        let mut r0 = 0usize;
+        while r0 < height {
+            let r1 = (r0 + chunk).min(height);
+            let band_bytes = (r1 - r0) * width * 4;
+            let (seg, tail) = rest.split_at_mut(band_bytes);
+            rest = tail;
+            let first = r0;
+            let err_slot = &first_err;
+            scope.spawn(move || {
+                // 已整体校验；带内 color_band 必 Ok（平面/dest 尺寸均就绪）。仍收集首个
+                // Err 防静默半写（评审 NIT：勿吞错误）。
+                if let Err(e) = color_band(
+                    y, cb, cr, width, height, bit_depth, matrix_coefficients, full_range,
+                    seg, first, r1, height,
+                ) {
+                    let mut slot = err_slot.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                }
+            });
+            r0 = r1;
+        }
+    });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
     Ok(())
+}
+
+/// 并行版 [`yuv_to_rgba`]：分配整图 RGBA 后走 [`yuv_to_rgba_into_par`]（tiles>=2 的
+/// transform 路径 color 段）。单线程口径（`KIMG_HEIF_PARALLEL=0` / 小图）与 [`yuv_to_rgba`]
+/// 逐字节恒等。
+pub(crate) fn yuv_to_rgba_par(
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    matrix_coefficients: i32,
+    full_range: bool,
+) -> HeifResult<Vec<u8>> {
+    let mut out = vec![0u8; width * height * 4];
+    yuv_to_rgba_into_par(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        bit_depth,
+        matrix_coefficients,
+        full_range,
+        &mut out,
+    )?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -619,4 +770,106 @@ mod tests {
             "dest 过小应返回 Err"
         );
     }
+
+    /// 行带并行 ≡ 单线程整图：随机平面 × 矩阵 {0,2,9} × full_range {false,true} × 位深
+    /// {8,10} × 高 {8,16,33,64}（覆盖奇数、带数 < / > 线程数、8 倍数），
+    /// `yuv_to_rgba_into_par`（正常环境真走行带并行）与 `yuv_to_rgba_into` 逐字节相等；
+    /// 高位深/identity 一并覆盖。行数过小的尺寸另点验（落单线程也不失配）。
+    #[test]
+    fn parallel_rows_match_serial_whole() {
+        let mut rng = Rng(0xBA11_5E1F_A1C0_0BC0);
+        let mut tried = 0usize;
+        for &(w, h) in &[
+            (17usize, 8usize),
+            (32, 16),
+            (9, 33),
+            (64, 64),
+            (7, 9),
+            (48, 21),
+            (31, 2),
+        ] {
+            for &bd in &[8u8, 10u8] {
+                for &matrix in &[0, 2, 9] {
+                    for &full in &[false, true] {
+                        let cw = (w + 1) >> 1;
+                        let ch = (h + 1) >> 1;
+                        let max_sample = if bd == 10 { 1023u16 } else { 255u16 };
+                        let y: Vec<u16> = rand_vec(&mut rng, w * h, max_sample);
+                        let cb: Vec<u16> = rand_vec(&mut rng, cw * ch, max_sample);
+                        let cr: Vec<u16> = rand_vec(&mut rng, cw * ch, max_sample);
+                        let mut serial = vec![0xFFu8; w * h * 4];
+                        yuv_to_rgba_into(&y, &cb, &cr, w, h, bd, matrix, full, &mut serial)
+                            .expect("yuv_to_rgba_into");
+                        let mut par = vec![0xFFu8; w * h * 4];
+                        yuv_to_rgba_into_par(&y, &cb, &cr, w, h, bd, matrix, full, &mut par)
+                            .expect("yuv_to_rgba_into_par");
+                        assert_eq!(
+                            serial, par,
+                            "并行≠串行整图 (w={w} h={h} bd={bd} m={matrix} full={full})"
+                        );
+                        let par_alloc = yuv_to_rgba_par(&y, &cb, &cr, w, h, bd, matrix, full)
+                            .expect("yuv_to_rgba_par");
+                        assert_eq!(
+                            serial, par_alloc,
+                            "并行分配版≠串行整图 (w={w} h={h} bd={bd} m={matrix} full={full})"
+                        );
+                        tried += 1;
+                    }
+                }
+            }
+        }
+        assert!(tried > 0, "并行对拍未执行任何一轮");
+    }
+
+    /// `color_band` 行带切分与整图逐字节一致（环境无关，直接验带 API）：把整图按
+    /// {1,2,3,5} 带切分（含奇数尾带/带数 <、> 线程数），每带写独立 `split_at_mut` 子切片，
+    /// 拼接后与 `yuv_to_rgba_into` 相等；高位深/奇数带宽一并覆盖。
+    #[test]
+    fn color_band_partitions_match_whole() {
+        let mut rng = Rng(0x9E11_5E1F_51A1_0D5A);
+        let mut tried = 0usize;
+        for &(w, h) in &[(8usize, 8usize), (17, 16), (9, 33), (32, 64), (6, 5)] {
+            for &bd in &[8u8, 10u8] {
+                for &matrix in &[0, 2, 9] {
+                    for &full in &[false, true] {
+                        let cw = (w + 1) >> 1;
+                        let ch = (h + 1) >> 1;
+                        let max_sample = if bd == 10 { 1023u16 } else { 255u16 };
+                        let y: Vec<u16> = rand_vec(&mut rng, w * h, max_sample);
+                        let cb: Vec<u16> = rand_vec(&mut rng, cw * ch, max_sample);
+                        let cr: Vec<u16> = rand_vec(&mut rng, cw * ch, max_sample);
+                        let mut whole = vec![0u8; w * h * 4];
+                        yuv_to_rgba_into(&y, &cb, &cr, w, h, bd, matrix, full, &mut whole)
+                            .expect("yuv_to_rgba_into");
+                        for parts in [1usize, 2, 3, 5] {
+                            if parts > h {
+                                continue;
+                            }
+                            let chunk = h.div_ceil(parts);
+                            let mut got = vec![0xFFu8; w * h * 4];
+                            let mut base = 0usize;
+                            let mut r0 = 0usize;
+                            while r0 < h {
+                                let r1 = (r0 + chunk).min(h);
+                                let band_bytes = (r1 - r0) * w * 4;
+                                let seg = &mut got[base..base + band_bytes];
+                                color_band(&y, &cb, &cr, w, h, bd, matrix, full, seg, r0, r1, h)
+                                    .expect("color_band");
+                                base += band_bytes;
+                                r0 = r1;
+                            }
+                            assert_eq!(
+                                got, whole,
+                                "color_band {parts} 带切分≠整图 (w={w} h={h} bd={bd} m={matrix} full={full})"
+                            );
+                            tried += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(tried > 0, "color_band 对拍未执行任何一轮");
+    }
 }
+
+

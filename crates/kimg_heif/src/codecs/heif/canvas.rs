@@ -59,6 +59,85 @@ impl ComposedYuv {
     }
 }
 
+/// 单个 tile 平面的散贴描述。`compose_grid`（串行）与 `canvas_paste`（并行 worker 直贴）共用
+/// 同一份行事时序，保证两种合成路径逐字节恒等。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlaneCopy {
+    /// 0=Y、1=Cb、2=Cr。
+    pub plane: u8,
+    /// 源平面行距（Y=`y_w`，色度=`c_w`）。
+    pub src_stride: i32,
+    /// 源平面高（Y=`y_h`，色度=`c_h`；与 `paste_plane` 的 `src_h` 同口径）。
+    pub src_h: i32,
+    /// 源读取起点（conformance 窗口除以子抽样）。
+    pub src_x: i32,
+    pub src_y: i32,
+    pub copy_w: i32,
+    pub copy_h: i32,
+    /// 目标写入起点（画布平面坐标，已含子抽样位移）。
+    pub dst_x: i32,
+    pub dst_y: i32,
+    /// 目标平面行距（Y=`canvas_w`，色度=`(canvas_w+1)/2`）。
+    pub dst_stride: i32,
+}
+
+/// 计算单个 tile 的逐平面拷贝参数（对齐 C# `HeifDecoder.DecodeYuv` 的逐平面 Math.Min 裁剪；
+/// 与既有 `compose_grid` 内联逻辑逐行同构）。返回 `[Option<PlaneCopy>; 3]`：
+/// `None` = 该平面无有效拷贝（copy_w/copy_h 非正 → 跳过，负拷贝在 C# 抛异常但本仓采取
+/// 可辩护处理=跳过）；几何/边界非法返回 `Err`（不 panic）。
+pub(crate) fn tile_plane_copies(
+    t: &TileYuv,
+    col: i32,
+    row: i32,
+    canvas_w: i32,
+    canvas_h: i32,
+) -> HeifResult<[Option<PlaneCopy>; 3]> {
+    let cw = (canvas_w + 1) >> 1;
+    let ch = (canvas_h + 1) >> 1;
+    let tw = t.output_width();
+    let th = t.output_height();
+    if tw <= 0 || th <= 0 {
+        return Err(HeifError::invalid("tile 的 conformance 窗口为空。"));
+    }
+    let mut out: [Option<PlaneCopy>; 3] = [None, None, None];
+    // 逐平面：0=Y、1=Cb、2=Cr；色度采样坐标 ÷2（4:2:0）。
+    for c in 0..3usize {
+        let shift = if c == 0 { 0 } else { 1 };
+        let dst_w = if c == 0 { canvas_w } else { cw };
+        let dst_h = if c == 0 { canvas_h } else { ch };
+        let dst_x = (col * tw) >> shift;
+        let dst_y = (row * th) >> shift;
+        let src_stride = if c == 0 { t.y_w } else { t.c_w };
+        let src_h = if c == 0 { t.y_h } else { t.c_h };
+        let src_x = t.crop_left >> shift;
+        let src_y = t.crop_top >> shift;
+        let copy_w = i32::min(tw >> shift, dst_w - dst_x);
+        let copy_h = i32::min(th >> shift, dst_h - dst_y);
+        // tile 落在画布外或与画布无重合：C# `DecodeYuv` 的 `Math.Min` 对此会给非正拷贝
+        // （for 循环零次），dump 结果等同跳过；负拷贝在 C# 抛异常但可辩护处理=跳过，
+        // 与整图 YUV oracle（transform 前画布）逐字节一致。
+        if copy_w <= 0 || copy_h <= 0 {
+            continue;
+        }
+        if dst_x < 0 || dst_y < 0 || dst_x >= dst_w || dst_y >= dst_h || src_x < 0 || src_y < 0 {
+            return Err(HeifError::invalid("tile 位置/尺寸越界。"));
+        }
+        out[c] = Some(PlaneCopy {
+            plane: c as u8,
+            src_stride,
+            src_h,
+            src_x,
+            src_y,
+            copy_w,
+            copy_h,
+            dst_x,
+            dst_y,
+            dst_stride: dst_w,
+        });
+    }
+    Ok(out)
+}
+
 /// 把 grid tiles（行主序，第 i 个在 (i % cols, i / cols)）合成到 `canvas_w × canvas_h` 画布的
 /// Y/Cb/Cr 平面；色度平面 `(cw, ch) = ((w+1)/2, (h+1)/2)`，tile 裁剪到画布边界（对应 C#
 /// `HeifDecoder.DecodeYuv` 的逐平面拷贝）。几何/边界非法返回 `Err`（不 panic）。
@@ -92,50 +171,27 @@ pub fn compose_grid(
     for (i, t) in tiles.iter().enumerate() {
         let col = (i as i32) % cols;
         let row = (i as i32) / cols;
-        let tw = t.output_width();
-        let th = t.output_height();
-        if tw <= 0 || th <= 0 {
-            return Err(HeifError::invalid("tile 的 conformance 窗口为空。"));
-        }
-        // 逐平面：0=Y、1=Cb、2=Cr；色度采样坐标 ÷2（4:2:0）。
-        for c in 0..3usize {
-            let shift = if c == 0 { 0 } else { 1 };
-            let dst_w = if c == 0 { canvas_w } else { cw };
-            let dst_h = if c == 0 { canvas_h } else { ch };
-            let dst_x = (col * tw) >> shift;
-            let dst_y = (row * th) >> shift;
-            let src_stride = if c == 0 { t.y_w } else { t.c_w };
-            let src_h = if c == 0 { t.y_h } else { t.c_h };
-            let src_x = t.crop_left >> shift;
-            let src_y = t.crop_top >> shift;
-            let copy_w = i32::min(tw >> shift, dst_w - dst_x);
-            let copy_h = i32::min(th >> shift, dst_h - dst_y);
-            // tile 落在画布外或与画布无重合：C# `DecodeYuv` 的 `Math.Min` 对此会给非正拷贝
-            // （for 循环零次），dump 结果等同跳过；负拷贝在 C# 抛异常但可辩护处理=跳过，
-            // 与整图 YUV oracle（transform 前画布）逐字节一致。
-            if copy_w <= 0 || copy_h <= 0 {
-                continue;
-            }
-            if dst_x < 0 || dst_y < 0 || dst_x >= dst_w || dst_y >= dst_h || src_x < 0 || src_y < 0 {
-                return Err(HeifError::invalid("tile 位置/尺寸越界。"));
-            }
-            let (src_plane, dst_plane): (&[u16], &mut [u16]) = match c {
+        for spec in tile_plane_copies(t, col, row, canvas_w, canvas_h)?
+            .into_iter()
+            .flatten()
+        {
+            let (src_plane, dst_plane): (&[u16], &mut [u16]) = match spec.plane {
                 0 => (&t.y, &mut y),
                 1 => (&t.cb, &mut cb),
                 _ => (&t.cr, &mut cr),
             };
             paste_plane(
                 src_plane,
-                src_stride,
-                src_h,
-                src_x,
-                src_y,
-                copy_w,
-                copy_h,
+                spec.src_stride,
+                spec.src_h,
+                spec.src_x,
+                spec.src_y,
+                spec.copy_w,
+                spec.copy_h,
                 dst_plane,
-                dst_w,
-                dst_x,
-                dst_y,
+                spec.dst_stride,
+                spec.dst_x,
+                spec.dst_y,
             )?;
         }
     }
