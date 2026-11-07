@@ -91,10 +91,12 @@ fn decode_tiles(data: &[u8], container: &container::HeifContainer<'_>) -> HeifRe
         let mut payload = vec![0u8; length as usize];
         stage_clock::parse(|| container.items.resolve(item, &mut payload))?;
         let pic = hevc::decode_item_flags(config, &payload, false, false)?;
+        // D2a：移动 HevcPicture 的三平面进 TileYuv（picture 至此不再被消费），免整图量 clone。
+        let [y, cb, cr] = pic.planes;
         tiles.push(canvas::TileYuv {
-            y: pic.planes[0].clone(),
-            cb: pic.planes[1].clone(),
-            cr: pic.planes[2].clone(),
+            y,
+            cb,
+            cr,
             y_w: pic.width,
             y_h: pic.height,
             c_w: pic.chroma_width,
@@ -123,12 +125,30 @@ fn decode_tiles(data: &[u8], container: &container::HeifContainer<'_>) -> HeifRe
 /// - 错误优先级微差（已接受，有效 grid 不可观测）：病态输入下 payload 长度预检发生在
 ///   任何解码之前，并行路径可能先报**后 tile** 的长度/解析错，而串行先报**前 tile** 的
 ///   解码错；两者都只回传一个 Err，正常输入两者一致。
+/// 串行全链强制开关（dev 测量工具，仿 intra_pred.rs K93 姿势）：`KIMG_HEIF_PARALLEL=0` →
+/// [`decode_tiles_par`] 直接落串行 [`decode_tiles`]，用于「专攻单核」战役的单核基线测量；
+/// 默认空/AUTO → 并行（行为不变）。一次读取缓存到 `OnceLock`，不进每 tile 开销。
+/// 字节恒等：串行路径即原 [`decode_tiles`]，0 失配必然。
+static FORCE_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn force_serial() -> bool {
+    *FORCE_SERIAL.get_or_init(|| {
+        std::env::var("KIMG_HEIF_PARALLEL")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+    })
+}
+
 fn decode_tiles_par(
     data: &[u8],
     container: &container::HeifContainer<'_>,
 ) -> HeifResult<Vec<canvas::TileYuv>> {
     if container.tiles.is_empty() {
         return Err(HeifError::invalid("容器没有可解码的图像 item。"));
+    }
+    // dev 测量开关：KIMG_HEIF_PARALLEL=0 → 强制单核（含 tiles>=2 也走串行）。
+    if force_serial() {
+        return decode_tiles(data, container);
     }
     let n = container.tiles.len();
     if n <= 1 {
@@ -172,18 +192,22 @@ fn decode_tiles_par(
                     break;
                 }
                 let tile = hevc::decode_item_flags(configs_ref[i], &payloads_ref[i], false, false)
-                    .map(|pic| canvas::TileYuv {
-                        y: pic.planes[0].clone(),
-                        cb: pic.planes[1].clone(),
-                        cr: pic.planes[2].clone(),
-                        y_w: pic.width,
-                        y_h: pic.height,
-                        c_w: pic.chroma_width,
-                        c_h: pic.chroma_height,
-                        crop_left: pic.crop_left,
-                        crop_right: pic.crop_right,
-                        crop_top: pic.crop_top,
-                        crop_bottom: pic.crop_bottom,
+                    .map(|pic| {
+                        // D2a：移动 planes（worker 独占 pic，至此不再消费），免整图量 clone。
+                        let [y, cb, cr] = pic.planes;
+                        canvas::TileYuv {
+                            y,
+                            cb,
+                            cr,
+                            y_w: pic.width,
+                            y_h: pic.height,
+                            c_w: pic.chroma_width,
+                            c_h: pic.chroma_height,
+                            crop_left: pic.crop_left,
+                            crop_right: pic.crop_right,
+                            crop_top: pic.crop_top,
+                            crop_bottom: pic.crop_bottom,
+                        }
                     });
                 let _ = tx.send((i, tile));
             });
@@ -215,8 +239,8 @@ pub fn decode_yuv(data: &[u8]) -> HeifResult<YuvPlanes> {
         return Err(HeifError::invalid("亮度与色度位深不同不受支持。"));
     }
     let tiles = decode_tiles(data, &container)?;
-    let composed = canvas::compose_grid(
-        &tiles,
+    let composed = canvas::compose_grid_owned(
+        tiles,
         container.grid_columns,
         container.grid_rows,
         container.canvas_width,
@@ -245,8 +269,8 @@ pub fn decode_yuv_par(data: &[u8]) -> HeifResult<YuvPlanes> {
         return Err(HeifError::invalid("亮度与色度位深不同不受支持。"));
     }
     let tiles = decode_tiles_par(data, &container)?;
-    let composed = canvas::compose_grid(
-        &tiles,
+    let composed = canvas::compose_grid_owned(
+        tiles,
         container.grid_columns,
         container.grid_rows,
         container.canvas_width,
@@ -289,9 +313,11 @@ pub fn decode_yuv_bytes(data: &[u8]) -> HeifResult<YuvPlanes> {
 }
 
 /// 解码显示朝向的 RGBA。**真实现**：容器解析 → 逐 tile 解码（`decode_item_flags` 全滤波）→
-/// `compose_grid` 合成整图 YUV → `color::yuv_to_rgba`（矩阵/full_range 取自容器 `nclx`，否则 SPS
-/// VUI；8/10 位都走，产出 RGBA8）→ 按关联顺序应用 transform（clap/irot/imir，对准 C# `HeifCanvas`
-/// 合成映射）写 `destination`。返回 `(宽, 高)` = 变换后显示尺寸（与 `ReadInfo().DisplaySize` 一致）。
+/// `compose_grid` 合成整图 YUV → 色转（矩阵/full_range 取自容器 `nclx`，否则 SPS VUI；8/10 位都走，
+/// 产出 RGBA8）。无 transform 时 `color::yuv_to_rgba_into` 直写 `destination`（免中间缓冲）；
+/// 有 transform 时经 `color::yuv_to_rgba` 出整图 rgba 再按关联顺序 `transform::apply_rgba`
+/// （clap/irot/imir，对准 C# `HeifCanvas` 合成映射）写 `destination`。返回 `(宽, 高)` =
+/// 变换后显示尺寸（与 `ReadInfo().DisplaySize` 一致）。
 pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)> {
     let container = stage_clock::parse(|| container::HeifContainer::parse(data))?;
     if container.tiles.is_empty() {
@@ -327,23 +353,45 @@ pub fn decode_rgba(data: &[u8], destination: &mut [u8]) -> HeifResult<(i32, i32)
     }
     let tiles = decode_tiles_par(data, &container)?;
     let composed = stage_clock::grid(|| {
-        canvas::compose_grid(&tiles, container.grid_columns, container.grid_rows, cw, ch)
-    })?;
-    let rgba = stage_clock::color(|| {
-        color::yuv_to_rgba(
-            &composed.y,
-            &composed.cb,
-            &composed.cr,
-            cw as usize,
-            ch as usize,
-            sps.bit_depth_y as u8,
-            matrix,
-            full_range,
+        canvas::compose_grid_owned(
+            tiles,
+            container.grid_columns,
+            container.grid_rows,
+            cw,
+            ch,
         )
     })?;
     if container.transforms.is_empty() {
-        destination[..need].copy_from_slice(&rgba);
+        // 无 transform：直写 destination（消除中间 out 分配与一次整图 copy_from_slice，
+        // 与 yuv_to_rgba 路径逐字节恒等；identity 映射下 need == cw*ch*4，dest[..need]
+        // 长度恰为整图 RGBA8，直写逐字节覆盖，无旧值残留）。
+        stage_clock::color(|| {
+            color::yuv_to_rgba_into(
+                &composed.y,
+                &composed.cb,
+                &composed.cr,
+                cw as usize,
+                ch as usize,
+                sps.bit_depth_y as u8,
+                matrix,
+                full_range,
+                &mut destination[..need],
+            )
+        })?;
     } else {
+        // 有 transform：transform::apply_rgba 需要整图 rgba 作源（画布 → 显示朝向映射），保持原路径。
+        let rgba = stage_clock::color(|| {
+            color::yuv_to_rgba(
+                &composed.y,
+                &composed.cb,
+                &composed.cr,
+                cw as usize,
+                ch as usize,
+                sps.bit_depth_y as u8,
+                matrix,
+                full_range,
+            )
+        })?;
         stage_clock::transform(|| transform::apply_rgba(&rgba, cw, ch, &map, &mut destination[..need]))?;
     }
     Ok((ow, oh))

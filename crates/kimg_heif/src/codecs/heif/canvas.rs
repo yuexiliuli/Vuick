@@ -62,6 +62,9 @@ impl ComposedYuv {
 /// 把 grid tiles（行主序，第 i 个在 (i % cols, i / cols)）合成到 `canvas_w × canvas_h` 画布的
 /// Y/Cb/Cr 平面；色度平面 `(cw, ch) = ((w+1)/2, (h+1)/2)`，tile 裁剪到画布边界（对应 C#
 /// `HeifDecoder.DecodeYuv` 的逐平面拷贝）。几何/边界非法返回 `Err`（不 panic）。
+///
+/// 只借用 tiles（供 oracle 测试/单元测试用）；产品主通道请用 [`compose_grid_owned`]
+/// 走单 tile 无 crop 的零拷贝短路。
 pub fn compose_grid(
     tiles: &[TileYuv],
     cols: i32,
@@ -145,6 +148,67 @@ pub fn compose_grid(
     })
 }
 
+/// 拥有 tiles 的合成入口：**单 tile 且无 conformance crop 且画布尺寸 == tile 尺寸且 4:2:0 偶数维**
+/// 时零拷贝短路（直接移动该 tile 的三平面，不再分配画布 + paste），否则原样委托 [`compose_grid`]。
+///
+/// 短路安全条件（与 [`compose_grid`] 输出逐字节恒等，池 error 语义不变）：
+/// - 单 tile、crop 四边全 0、`y_w == canvas_w && y_h == canvas_h`；
+/// - 画布宽高都为偶数且 `c_w == canvas_w/2 && c_h == canvas_h/2`（4:2:0 偶数维下
+///   `compose_grid` 的画布色度 `(w+1)>>1 == w/2`，paste 刚好整幅覆盖；奇数维画布会给
+///   色度补最后一列 0，tile 平面是 tight 的，不能短路）；
+/// - 平面长度复核（防异常 tile 触发越界差异）。任一不成立 → 走原合成（grid/多 tile/
+///   crop/奇数维全部保持原样）。
+pub fn compose_grid_owned(
+    tiles: Vec<TileYuv>,
+    cols: i32,
+    rows: i32,
+    canvas_w: i32,
+    canvas_h: i32,
+) -> HeifResult<ComposedYuv> {
+    // 与 compose_grid 同款的几何预检（短路仅对合法几何开放；非法几何一律委托原路径报同样错误）。
+    if cols <= 0 || rows <= 0 || canvas_w <= 0 || canvas_h <= 0 {
+        return Err(HeifError::invalid("grid/画布尺寸非法。"));
+    }
+    if tiles.is_empty() {
+        return Err(HeifError::invalid("grid 没有 tile。"));
+    }
+    if (tiles.len() as i64) > i64::from(cols) * i64::from(rows) {
+        return Err(HeifError::invalid("grid tile 数超过 列×行。"));
+    }
+    if tiles.len() == 1 {
+        let t = &tiles[0];
+        let even = (canvas_w & 1) == 0 && (canvas_h & 1) == 0;
+        let plane_ok = {
+            let c_n = (canvas_w / 2) as usize * (canvas_h / 2) as usize;
+            t.y.len() == (canvas_w as usize) * (canvas_h as usize)
+                && t.cb.len() == c_n
+                && t.cr.len() == c_n
+        };
+        if even
+            && plane_ok
+            && t.crop_left == 0
+            && t.crop_right == 0
+            && t.crop_top == 0
+            && t.crop_bottom == 0
+            && t.y_w == canvas_w
+            && t.y_h == canvas_h
+            && t.c_w == canvas_w / 2
+            && t.c_h == canvas_h / 2
+        {
+            // 零拷贝短路：移动三平面，不分配画布、不 paste。
+            let tile = tiles.into_iter().next().unwrap();
+            return Ok(ComposedYuv {
+                y: tile.y,
+                cb: tile.cb,
+                cr: tile.cr,
+                width: canvas_w,
+                height: canvas_h,
+            });
+        }
+    }
+    compose_grid(&tiles, cols, rows, canvas_w, canvas_h)
+}
+
 /// 把源平面 `[src_y..src_y+copy_h) × [src_x..src_x+copy_w)` 拷贝进目标平面
 /// `[dst_y..dst_y+copy_h) × [dst_x..dst_x+copy_w)`（两平面都行主序、无跨步、stride = 平面宽）。
 fn paste_plane(
@@ -179,10 +243,12 @@ mod tests {
     use super::*;
 
     fn tile(w: i32, h: i32, fill: u16) -> TileYuv {
+        // 4:2:0 tight 平面：色度尺寸 = (w/2)×(h/2)（与 picture.rs 的 chroma_width/height 一致）。
+        let c_n = ((w / 2) * (h / 2)) as usize;
         TileYuv {
             y: vec![fill; (w * h) as usize],
-            cb: vec![fill; (w * w) as usize / 4],
-            cr: vec![fill; (w * w) as usize / 4],
+            cb: vec![fill; c_n],
+            cr: vec![fill; c_n],
             y_w: w,
             y_h: h,
             c_w: w / 2,
@@ -248,5 +314,74 @@ mod tests {
         assert!(compose_grid(&[], 1, 1, 2, 2).is_err());
         // tile 数超过 cols×rows。
         assert!(compose_grid(&[tile(2, 2, 0), tile(2, 2, 0)], 1, 1, 4, 2).is_err());
+    }
+
+    /// 「compose 短路 ≡ 非短路」逐元素对拍：`compose_grid_owned`（可能短路）与 `compose_grid`
+    /// （借用原路径）对同一组夹具必须三平面逐元素一致（含长度）。
+    #[test]
+    fn compose_owned_shortcircuit_equals_borrowed() {
+        // 夹具：短路径触发/触发各一组，覆盖 crop、奇数维、多 tile、尺寸不匹配。
+        let cases: Vec<(Vec<TileYuv>, i32, i32, i32, i32)> = vec![
+            // 单 tile 无 crop 偶数维：短路应触发。
+            (vec![tile(6, 4, 3)], 1, 1, 6, 4),
+            // 单 tile 无 crop 偶数维但 cols/rows 非 1（tile 落在 (0,0) 同上）。
+            (vec![tile(6, 4, 3)], 2, 1, 6, 4),
+            // 多 tile 2x2：不短路。
+            (vec![tile(2, 2, 1), tile(2, 2, 2), tile(2, 2, 3), tile(2, 2, 4)], 2, 2, 4, 4),
+            // 奇数维画布：compose 补色度列，不得短路。
+            (vec![tile(5, 3, 7)], 1, 1, 5, 3),
+            // 画布大于 tile：余下 0 填充，不短路。
+            (vec![tile(4, 2, 9)], 1, 1, 6, 4),
+            // 带 conformance crop：不短路。
+            ({
+                let mut t = tile(6, 4, 5);
+                t.crop_top = 1;
+                vec![t]
+            }, 1, 1, 6, 3),
+            // 色度尺寸不匹配（模拟非 4:2:0）：不短路，compose 会补 0/padding。
+            ({
+                let mut t = tile(6, 4, 8);
+                t.c_h = 4; // 画布 ch=2，tile c_h=4 不匹配
+                vec![t]
+            }, 1, 1, 6, 4),
+        ];
+        for (idx, (tiles, cols, rows, cw, ch)) in cases.into_iter().enumerate() {
+            let borrowed = compose_grid(&tiles, cols, rows, cw, ch).expect("borrowed 应成功");
+            let owned = compose_grid_owned(tiles, cols, rows, cw, ch).expect("owned 应成功");
+            assert_eq!(owned.width, borrowed.width, "case{idx} width");
+            assert_eq!(owned.height, borrowed.height, "case{idx} height");
+            assert_eq!(owned.y.len(), borrowed.y.len(), "case{idx} y 长度");
+            assert_eq!(owned.cb.len(), borrowed.cb.len(), "case{idx} cb 长度");
+            assert_eq!(owned.cr.len(), borrowed.cr.len(), "case{idx} cr 长度");
+            assert_eq!(owned.y, borrowed.y, "case{idx} Y 平面逐元素不一致");
+            assert_eq!(owned.cb, borrowed.cb, "case{idx} Cb 平面逐元素不一致");
+            assert_eq!(owned.cr, borrowed.cr, "case{idx} Cr 平面逐元素不一致");
+        }
+    }
+
+    /// 零拷贝断言：短路路径返回的画布平面与 tile 平面是**同一块堆缓冲**（移动而非拷贝）。
+    #[test]
+    fn compose_owned_shortcircuit_moves_tile_buffers() {
+        let t = tile(6, 4, 0);
+        let y_ptr = t.y.as_ptr();
+        let cb_ptr = t.cb.as_ptr();
+        let cr_ptr = t.cr.as_ptr();
+        let out = compose_grid_owned(vec![t], 1, 1, 6, 4).unwrap();
+        assert_eq!(out.y.as_ptr(), y_ptr, "Y 平面应被移动而非拷贝");
+        assert_eq!(out.cb.as_ptr(), cb_ptr, "Cb 平面应被移动而非拷贝");
+        assert_eq!(out.cr.as_ptr(), cr_ptr, "Cr 平面应被移动而非拷贝");
+    }
+
+    /// 短路只应在「单 tile 无 crop 偶数维」触发；奇数维等共享同一断言覆盖。
+    #[test]
+    fn compose_owned_shortcircuit_odd_dims_still_equal() {
+        // 奇数维（1599x1199 类）不得短路：compose 给色度补最后一列 0，短路会给真实 tight 列 → 必须保
+        // 持 compose 语义（等价于上面 cases 里奇数维一项，这里再显式固定尺寸）。
+        let t = tile(5, 3, 7);
+        let owned = compose_grid_owned(vec![t.clone()], 1, 1, 5, 3).unwrap();
+        let borrowed = compose_grid(&[t], 1, 1, 5, 3).unwrap();
+        assert_eq!(owned.y, borrowed.y);
+        assert_eq!(owned.cb, borrowed.cb);
+        assert_eq!(owned.cr, borrowed.cr);
     }
 }

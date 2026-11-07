@@ -192,6 +192,155 @@ fn perf_tile_parallel_speedup() {
     println!("oracle_perf TILE-PAR: checked={checked} skipped={skipped}");
 }
 
+/// 终测表（K96 参照优先分账收口）：遍历 corpus 全部 .heic（名字序），每文件 warmup 1 +
+/// `decode_rgba` reps=9 取中位，打印 tiles 与（对 17+3 参照表文件的）Rust/C# 比值；profile-4
+/// 解码 Err → 打印 `ERR <file>` 后跳过（不 fail）。最后输出四组 geomean：17 文件(14 手机+3 单
+/// tile)、20 文件(17+3 grid 参考)、14 手机、3 单 tile（单 tile=串行等效）。
+/// 运行：`cargo build --release -p kimg_heif --tests` 后
+/// `target\release\deps\oracle_perf-*.exe --exact perf_acceptance_geo --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn perf_acceptance_geo() {
+    const REPS: usize = 9;
+    /// 参照：stem（大小写不敏感匹配）+ C# 单核 RGBA_ms（RGBA_ms 全链，quick 同窗 reps9 中位）。
+    /// 前 14 = 手机 48-tile grid；中 3 = 单 tile main8；后 3 grid = 非过滤 quick 同窗参考。
+    const REF_CS: &[(&str, f64, &str)] = &[
+        ("IMG_0083", 256.6, "phone"),
+        ("IMG_0084", 320.7, "phone"),
+        ("IMG_0085", 377.1, "phone"),
+        ("IMG_0086", 464.6, "phone"),
+        ("IMG_0087", 393.7, "phone"),
+        ("IMG_2645", 323.1, "phone"),
+        ("IMG_4512", 633.1, "phone"),
+        ("IMG_4513", 198.1, "phone"),
+        ("IMG_4608", 374.8, "phone"),
+        ("IMG_4609", 364.2, "phone"),
+        ("IMG_4610", 372.4, "phone"),
+        ("IMG_4611", 355.1, "phone"),
+        ("IMG_4612", 301.0, "phone"),
+        ("IMG_4613", 301.1, "phone"),
+        ("synth-photo-fuji-1600x900-main8", 32.1, "single"),
+        ("synth-photo-mangrove-1599x1199-main8", 53.3, "single"),
+        ("synth-screen-testsrc2-1280x720-main8", 9.4, "single"),
+        ("hevc-main-3072x4096-grid", 386.3, "grid"),
+        ("hevc-main-8192x6144-grid", 1613.4, "grid"),
+        ("hevc-main10-3072x4096-grid", 538.9, "grid"),
+    ];
+
+    let mut ratios: Vec<(&str, f64, f64, f64, &str)> = Vec::new(); // (name, rust, cs, ratio, cat)
+    let mut checked = 0usize;
+    let skipped = 0usize;
+    let mut errs = 0usize;
+
+    let mut paths = std::fs::read_dir(CORPUS_DIR)
+        .expect("read corpus dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("heic"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let stem = path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("ERR {name} (read: {e})");
+                errs += 1;
+                continue;
+            }
+        };
+        let info = match read_info(&data) {
+            Ok(i) => i,
+            Err(e) => {
+                println!("ERR {name} (read_info: {e})");
+                errs += 1;
+                continue;
+            }
+        };
+        let (w, h) = (info.width as usize, info.height as usize);
+        let mut out = vec![0u8; w * h * 4];
+        let tiles = kimg_heif::codecs::heif::container::HeifContainer::parse(&data)
+            .map(|c| c.tiles.len())
+            .unwrap_or(0);
+
+        if let Err(e) = decode_rgba(&data, &mut out) {
+            println!("ERR {name} (decode: {e})");
+            errs += 1;
+            continue;
+        }
+        let mut rounds = Vec::with_capacity(REPS);
+        let mut failed = false;
+        for _ in 0..REPS {
+            let t = Instant::now();
+            if let Err(e) = decode_rgba(&data, &mut out) {
+                println!("ERR {name} (decode round: {e})");
+                errs += 1;
+                failed = true;
+                break;
+            }
+            rounds.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        if failed {
+            continue;
+        }
+        let med = median_ms(&rounds);
+
+        let cs = REF_CS.iter().find(|(k, _, _)| k.eq_ignore_ascii_case(&stem));
+        match cs {
+            Some((key, cs_ms, cat)) => {
+                let ratio = med / cs_ms;
+                ratios.push((key, med, *cs_ms, ratio, cat));
+                println!(
+                    "GEO {name}: tiles={tiles} rust={med:.1} ms cs={cs_ms:.1} ms ratio={ratio:.3} [{cat}]"
+                );
+            }
+            None => {
+                println!("GEO {name}: tiles={tiles} rust={med:.1} ms (无 C# 参照)");
+            }
+        }
+        checked += 1;
+    }
+
+    let geomean = |xs: &[f64]| -> f64 {
+        let n = xs.len();
+        if n == 0 {
+            return f64::NAN;
+        }
+        (xs.iter().map(|x| x.ln()).sum::<f64>() / n as f64).exp()
+    };
+    let emit = |label: &str, group: &[&(&str, f64, f64, f64, &str)]| {
+        let xs: Vec<f64> = group.iter().map(|(_, _, _, r, _)| *r).collect();
+        println!(
+            "GEO-SUM {label}: n={} geomean(ratio)={:.3}",
+            group.len(),
+            geomean(&xs)
+        );
+    };
+
+    let phone: Vec<_> = ratios.iter().filter(|r| r.4 == "phone").collect();
+    let single: Vec<_> = ratios.iter().filter(|r| r.4 == "single").collect();
+    let grid: Vec<_> = ratios.iter().filter(|r| r.4 == "grid").collect();
+    emit("17files(phone+single)", &phone.iter().chain(single.iter()).copied().collect::<Vec<_>>());
+    let all20: Vec<_> = ratios.iter().collect();
+    emit("20files(+grid ref)", &all20);
+    emit("14 phone", &phone);
+    emit("3 single", &single);
+    let _ = grid;
+    println!(
+        "oracle_perf perf_acceptance_geo: checked={checked} skipped={skipped} errs={errs}"
+    );
+}
+
 /// 防呆：release 仅用于测量，勿在 CI debug 下误跑（`#[ignore]` 本就不跑，此处声明意图占位）。
 #[test]
 fn note_release_only_measurement() {

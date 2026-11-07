@@ -3,8 +3,6 @@
 //! 像素计算逐行对齐 C# 标量内核：整数运算、16.16 固定系数（`round(value·2^16)`）、`+2^15 >> 16`
 //! 舍入、`[0,255]` / `[0,65535]` 裁剪。ICC 不处理（直通/忽略）。
 
-#![forbid(unsafe_code)]
-
 use crate::codecs::heif::error::{HeifError, HeifResult};
 
 /// 固定点系数（对应 C# `HeifColor.Coefficients`）。
@@ -157,10 +155,10 @@ pub(crate) fn to_rgba_420_row(
     #[cfg(target_arch = "x86_64")]
     let done = {
         if width >= 8 && !k.identity && std::is_x86_feature_detected!("avx2") {
-            // color_simd::to_rgba_420_row_avx2 是安全包装（仿 hevc/transform_simd::inverse_add_avx2
-            // 先例：内部自证缓冲前置再把 unsafe 内核封在 unsafe{} 内），调用方无需 unsafe；AVX2
-            // 已在此运行时检出（叶子隔离，见 color_simd 模块文档）。
-            super::color_simd::to_rgba_420_row_avx2(y, cb, cr, out, width, k)
+            // SAFETY: 调用前置与标量相同（y.len()>=width、cb/cr.len()>=(width+1)>>1、
+            // out.len()>=width*4，见 color_simd 模块文档）；AVX2 已运行时检出，target_feature
+            // 内核只经此处 unsafe 调用（叶子隔离，与 hevc/transform_simd 同一姿势）。
+            unsafe { super::color_simd::to_rgba_420_row_avx2(y, cb, cr, out, width, k) }
         } else {
             0
         }
@@ -280,6 +278,7 @@ pub(crate) fn to_gray_row(y: &[u16], out: &mut [u8], width: usize, k: &Coefficie
 /// （行主序、无跨步），逐行走 [`to_rgba_420_row`]（内部 AVX2/标量分派），输出
 /// `width*height*4` 字节（R G B A）。
 /// 参数照 C# `HeifColor.For(matrix_coefficients, full_range, bit_depth)`；位深 8/10 直接映射到 8 位输出。
+/// 分配中间缓冲并返回；需要直接写进既有目标时用 [`yuv_to_rgba_into`]（消除一次整图拷贝）。
 pub fn yuv_to_rgba(
     y: &[u16],
     cb: &[u16],
@@ -290,6 +289,28 @@ pub fn yuv_to_rgba(
     matrix_coefficients: i32,
     full_range: bool,
 ) -> HeifResult<Vec<u8>> {
+    let mut out = vec![0u8; width * height * 4];
+    yuv_to_rgba_into(
+        y, cb, cr, width, height, bit_depth, matrix_coefficients, full_range, &mut out,
+    )?;
+    Ok(out)
+}
+
+/// 整图 Y′CbCr → RGBA8 直写：与 [`yuv_to_rgba`] 逐字节恒等（同一系数/逐行分派/alpha=255），
+/// 但不分配中间缓冲，直接把 `width*height*4` 字节（R G B A）写进 `dest`
+/// （`dest.len() < width*height*4` 时返回 `Err`，不写任何字节）。
+/// 供 `decode_rgba` 无 transform 时直写 `destination` 使用。
+pub fn yuv_to_rgba_into(
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    matrix_coefficients: i32,
+    full_range: bool,
+    dest: &mut [u8],
+) -> HeifResult<()> {
     let cw = (width + 1) >> 1;
     let ch = (height + 1) >> 1;
     if y.len() < width * height || cb.len() < cw * ch || cr.len() < cw * ch {
@@ -300,20 +321,22 @@ pub fn yuv_to_rgba(
             "不支持的位深 {bit_depth}；只支持 8–16。"
         )));
     }
+    if dest.len() < width * height * 4 {
+        return Err(HeifError::invalid("目标缓冲不足。"));
+    }
     let k = Coefficients::for_matrix(matrix_coefficients, full_range, i32::from(bit_depth));
-    let mut out = vec![0u8; width * height * 4];
     for row in 0..height {
         let c_off = (row >> 1) * cw;
         to_rgba_420_row(
             &y[row * width..(row + 1) * width],
             &cb[c_off..c_off + cw],
             &cr[c_off..c_off + cw],
-            &mut out[row * width * 4..(row + 1) * width * 4],
+            &mut dest[row * width * 4..(row + 1) * width * 4],
             width,
             &k,
         );
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -463,10 +486,6 @@ mod tests {
     /// full_range {true,false} × 位深 {8,10} × 宽 {8,9,17,31,32,64}（覆盖尾段与 8 对齐）。
     #[test]
     fn to_rgba_420_row_dispatch_matches_scalar_randomised() {
-        if !std::is_x86_feature_detected!("avx2") {
-            eprintln!("SKIP: 无 AVX2，分派退化为标量，无向量路径可对拍");
-            return;
-        }
         let mut rng = Rng(0xA5A5_5A5A_F00F_FACE);
         let mut tried = 0usize;
         for &bd in &[8u8, 10u8] {
@@ -558,5 +577,46 @@ mod tests {
                 assert_eq!(got, expected, "整图分派≠逐行标量 (w={w} h={h} bd={bd} m={matrix} full={full})");
             }
         }
+    }
+
+    /// 直写路径（`yuv_to_rgba_into`）≡ 返回路径（`yuv_to_rgba`）：随机 YUV 平面 ×
+    /// 矩阵 {0(identity),2,1,9} × full_range {false,true} × 位深 {8,10} × 尺寸
+    /// （含 1×1、奇偶宽高、8 对齐行），逐字节相等；dest 先填 0xFF 哨兵，确认直写
+    /// 覆盖每个字节（不留旧值）。另验证 dest 过小时返回 Err。
+    #[test]
+    fn yuv_to_rgba_into_matches_return_path() {
+        let mut rng = Rng(0xBAD1_C0FF_EE11_2BAD);
+        let mut tried = 0usize;
+        for &(w, h) in &[(1usize, 1usize), (2, 3), (8, 2), (9, 17), (17, 9), (32, 33)] {
+            for &bd in &[8u8, 10u8] {
+                for &matrix in &[0, 2, 1, 9] {
+                    for &full in &[false, true] {
+                        let cw = (w + 1) >> 1;
+                        let ch = (h + 1) >> 1;
+                        let max_sample = if bd == 10 { 1023u16 } else { 255u16 };
+                        let y: Vec<u16> = rand_vec(&mut rng, w * h, max_sample);
+                        let cb: Vec<u16> = rand_vec(&mut rng, cw * ch, max_sample);
+                        let cr: Vec<u16> = rand_vec(&mut rng, cw * ch, max_sample);
+                        let reference = yuv_to_rgba(&y, &cb, &cr, w, h, bd, matrix, full)
+                            .expect("yuv_to_rgba");
+                        let mut dest = vec![0xFFu8; reference.len()];
+                        yuv_to_rgba_into(&y, &cb, &cr, w, h, bd, matrix, full, &mut dest)
+                            .expect("yuv_to_rgba_into");
+                        assert_eq!(
+                            dest, reference,
+                            "直写≠返回路径 (w={w} h={h} bd={bd} m={matrix} full={full})"
+                        );
+                        tried += 1;
+                    }
+                }
+            }
+        }
+        assert!(tried > 0, "直写对拍未执行任何一轮");
+        // dest 过小 → Err（不写）。
+        let mut tiny = [0u8; 8];
+        assert!(
+            yuv_to_rgba_into(&[0u16; 4], &[0; 1], &[0; 1], 2, 2, 8, 2, false, &mut tiny).is_err(),
+            "dest 过小应返回 Err"
+        );
     }
 }
