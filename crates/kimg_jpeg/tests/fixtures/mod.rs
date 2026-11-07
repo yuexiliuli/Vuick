@@ -45,6 +45,7 @@ pub fn collect_jpegs(dir: &Path) -> Vec<PathBuf> {
 
 /// zune 参照解码：同口径（目标输出颜色空间 = 旧 wrapper 映射）解出
 /// (width, height, color_type, bytes)。
+#[allow(dead_code)] // 仅部分测试（bench/parity）使用，probe_ablate 等不含
 pub fn zune_decode(bytes: &[u8]) -> Result<(u32, u32, ColorType, Vec<u8>), String> {
     let options = DecoderOptions::default()
         .set_strict_mode(false)

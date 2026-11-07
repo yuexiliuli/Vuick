@@ -165,10 +165,31 @@ impl StageProfile {
         }
     }
 
+    /// `KIMG_JPEG_NO_BUSY=1`：测量卫生开关（仅 profile 模式有意义）。置位时
+    /// 忙钟（rdtsc）与 `n_entropy/n_idct` 逐块计数完全不注入被测窗口——窗口不变
+    /// 但不再被插桩，得到无忙钟插桩的净值（消融 A/B / stage 分账用）。进程内一次读。
+    pub(crate) fn no_busy() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            Self::enabled_by_env()
+                && std::env::var("KIMG_JPEG_NO_BUSY")
+                    .map(|v| v.trim() == "1")
+                    .unwrap_or(false)
+        })
+    }
+
+    /// 逐块计数（`n_entropy/n_idct`）是否注入：与忙钟同门控（profile 开启且未设
+    /// NO_BUSY）。production 关闭时恒 false——顺带去掉生产路径的无条件自增。
+    #[inline]
+    pub(crate) fn counting(&self) -> bool {
+        self.enabled && !Self::no_busy()
+    }
+
     /// 忙钟（rdtsc）计时——仅逐块熵/IDCT 交叉参考用，开销 ~10.8ns/次。
+    /// NO_BUSY 置位时不注入（返回 None，busy_stop 随之短路），被测窗口不再被插桩。
     #[inline]
     pub(crate) fn busy_timer(&self) -> Option<u64> {
-        if self.enabled {
+        if self.enabled && !Self::no_busy() {
             #[cfg(target_arch = "x86_64")]
             {
                 Some(unsafe { core::arch::x86_64::_rdtsc() })

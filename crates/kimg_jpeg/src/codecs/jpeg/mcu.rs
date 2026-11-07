@@ -6,6 +6,7 @@ use crate::codecs::jpeg::bitstream::{BitStream, HotStream};
 use crate::codecs::jpeg::cs;
 use crate::codecs::jpeg::cs::{CsInput, R_ONE_TO_ONE};
 use crate::codecs::jpeg::error::DecodeError;
+use crate::codecs::jpeg::huffman::HuffmanTable;
 use crate::codecs::jpeg::io::{ByteReader, Marker};
 use crate::codecs::jpeg::segment::{
     build_zigzag_quant, ColorSpace, Decoder, SampleRatios, Stage, StageProfile, DCT_BLOCK,
@@ -447,31 +448,61 @@ impl<'a> Decoder<'a> {
             scan_du_width = scan_du_width.min(min_du);
         }
 
+        // ① 每分量一次的表解析 + 采样快照（(j,k) 内环外提，P2）：把 `%MAX_COMPONENTS` +
+        // `as_ref` + `ok_or_else?` 分支从每 MCU 列热点挪到行首一次。`dc/ac_huffman_tables`
+        // 解码期间不再变动（header 已解析、`check_tables` 已先行校验非空），故用原始指针
+        // 快照规避与 `handle_rst_main(&mut self)` 的借用冲突（指针不参与借用检查），解引用安全。
+        // 有效表缺失 → 行首即返回（与原 `?` 同一 Err；有效图像表必在）。
+        let nc = self.components.len().min(MAX_COMPONENTS);
+        let mut dc_ptr: [*const HuffmanTable; MAX_COMPONENTS] = [core::ptr::null(); MAX_COMPONENTS];
+        let mut ac_ptr: [*const HuffmanTable; MAX_COMPONENTS] = [core::ptr::null(); MAX_COMPONENTS];
+        let mut snap_needed = [false; MAX_COMPONENTS];
+        let mut snap_vs = [1usize; MAX_COMPONENTS];
+        let mut snap_hs = [1usize; MAX_COMPONENTS];
+        let mut snap_stride = [0usize; MAX_COMPONENTS];
+        for k in 0..nc {
+            let c = &self.components[k];
+            match self.dc_huffman_tables[c.dc_huff_table % MAX_COMPONENTS].as_ref() {
+                Some(t) => dc_ptr[k] = t as *const HuffmanTable,
+                None => return Err(DecodeError::Format("DC table not found".to_string())),
+            }
+            match self.ac_huffman_tables[c.ac_huff_table % MAX_COMPONENTS].as_ref() {
+                Some(t) => ac_ptr[k] = t as *const HuffmanTable,
+                None => return Err(DecodeError::Format("AC table not found".to_string())),
+            }
+            snap_needed[k] = c.needed;
+            snap_vs[k] = c.vertical_sample;
+            snap_hs[k] = c.horizontal_sample;
+            snap_stride[k] = c.width_stride;
+        }
+
+        // ② restart==0（语料主流）：免 per-MCU `hot.write_back(stream)`——本行末尾一次回写 +
+        // marker 处理；per-MCU marker 断点改查 hot（write_back 前后逐字段等价，断点时机不变）。
+        // restart!=0 保留原每 MCU 回写 + `handle_rst_main` 路径（RST 语义兜底）。
+        let restart = self.restart_interval != 0;
+
         for j in 0..scan_du_width {
             for &k in z_scans {
                 let component = &mut self.components[k];
 
-                let dc_table = self.dc_huffman_tables[component.dc_huff_table % MAX_COMPONENTS]
-                    .as_ref()
-                    .ok_or_else(|| DecodeError::Format("DC table not found".to_string()))?;
-
-                let ac_table = self.ac_huffman_tables[component.ac_huff_table % MAX_COMPONENTS]
-                    .as_ref()
-                    .ok_or_else(|| DecodeError::Format("AC table not found".to_string()))?;
+                // SAFETY: dc_ptr/ac_ptr[k] 已在上面由非空 `as_ref` 填充（k<nc），且表在解码
+                // 期间不变；仅在本迭代内作只读引用使用。
+                let dc_table = unsafe { &*dc_ptr[k] };
+                let ac_table = unsafe { &*ac_ptr[k] };
 
                 let qt_table = &component.quantization_table;
 
-                let component_samples_needed = component.needed;
+                let component_samples_needed = snap_needed[k];
 
                 let v_step = if SAMPLED && !PROGRESSIVE {
-                    0..component.vertical_sample
+                    0..snap_vs[k]
                 } else {
                     0..1
                 };
 
                 for v_samp in v_step {
                     let h_step = if SAMPLED && !PROGRESSIVE {
-                        0..component.horizontal_sample
+                        0..snap_hs[k]
                     } else {
                         0..1
                     };
@@ -504,7 +535,9 @@ impl<'a> Decoder<'a> {
                         };
 
                         self.stage.busy_stop(Stage::Entropy, t_entropy);
-                        self.stage.n_entropy += 1;
+                        if self.stage.counting() {
+                            self.stage.n_entropy += 1;
+                        }
 
                         let len = match result {
                             Ok(len) => len,
@@ -520,25 +553,24 @@ impl<'a> Decoder<'a> {
                                 // 目标字节平面：PROGRESSIVE 缓冲到 `progressive[k]`（整帧样本平面），
                                 // 否则写 cs 环当前 MCU 行半区（C# `IdctToRing` 同款偏移）。
                                 let (out, off, stride) = if PROGRESSIVE {
-                                    let off0 = mcu_height * component.width_stride * 8
-                                        * component.vertical_sample
+                                    let off0 = mcu_height * snap_stride[k] * 8
+                                        * snap_vs[k]
                                         + j * 8;
                                     (
                                         &mut progressive[k][..],
                                         off0,
-                                        component.width_stride,
+                                        snap_stride[k],
                                     )
                                 } else {
                                     let c2 = v_samp * 8;
-                                    let c3 = ((j * component.horizontal_sample) + h_samp) * 8;
-                                    let ring_off =
-                                        ((mcu_height & 1) * component.vertical_sample * 8 + c2)
-                                            * component.width_stride
-                                            + c3;
+                                    let c3 = ((j * snap_hs[k]) + h_samp) * 8;
+                                    let ring_off = ((mcu_height & 1) * snap_vs[k] * 8 + c2)
+                                        * snap_stride[k]
+                                        + c3;
                                     (
                                         &mut component.cs_ring[..],
                                         ring_off,
-                                        component.width_stride,
+                                        snap_stride[k],
                                     )
                                 };
                                 if len <= 1 {
@@ -548,7 +580,9 @@ impl<'a> Decoder<'a> {
                                 }
                             }
                             self.stage.busy_stop(Stage::Idct, t_idct);
-                            self.stage.n_idct += 1;
+                            if self.stage.counting() {
+                                self.stage.n_idct += 1;
+                            }
                         }
                     }
                 }
@@ -557,15 +591,18 @@ impl<'a> Decoder<'a> {
             let t_mcu = self.stage.timer();
             self.todo = self.todo.wrapping_sub(1);
 
-            // 把 hot 状态同步回 stream，供 handle_rst_main / marker 检查消费。
-            hot.write_back(stream);
-            if self.todo == 0 {
-                self.handle_rst_main(stream)?;
-                hot.reload(stream);
-                continue;
+            if restart {
+                // 原每 MCU 回写 + RST 处理路径（restart≠0 图像，语义逐字节不变）
+                hot.write_back(stream);
+                if self.todo == 0 {
+                    self.handle_rst_main(stream)?;
+                    hot.reload(stream);
+                    continue;
+                }
             }
 
-            if stream.marker.is_some() && stream.bits_left == 0 {
+            // 免回写：直接查 hot（= 原 write_back 后查 stream，逐字段等价）
+            if hot.marker().is_some() && hot.bits_left() == 0 {
                 break;
             }
             self.stage.stop(Stage::McuRest, t_mcu);
@@ -1232,7 +1269,9 @@ impl<'a> Decoder<'a> {
                                     }
                                 }
                                 self.stage.busy_stop(Stage::Entropy, t_entropy);
-                                self.stage.n_entropy += 1;
+                                if self.stage.counting() {
+                                    self.stage.n_entropy += 1;
+                                }
                             }
                         }
                     }

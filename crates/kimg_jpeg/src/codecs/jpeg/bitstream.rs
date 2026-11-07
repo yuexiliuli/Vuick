@@ -691,6 +691,19 @@ impl HotStream {
         s.seen_eoi = self.seen_eoi;
     }
 
+    /// 当前 marker（P2：mcu.rs 免 per-MCU 回写的断点检查用；与 `write_back` 后查
+    /// `stream.marker` 逐字段等价，断点时机不变）。
+    #[inline]
+    pub(crate) fn marker(&self) -> Option<Marker> {
+        self.marker
+    }
+
+    /// 当前剩余位数（同上，等价 `stream.bits_left`）。
+    #[inline]
+    pub(crate) fn bits_left(&self) -> u8 {
+        self.bits_left
+    }
+
     /// `handle_rst_main`（RST reset 等）改动了 `BitStream` 后重新装载。
     #[inline]
     pub(crate) fn reload(&mut self, s: &BitStream) {
