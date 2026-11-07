@@ -411,6 +411,9 @@ impl BitStream {
     }
 
     /// 渐进 DC 首个 scan：解码 DC 差值并写入 `块[0]`（以 Al 位掩码缩放）。
+    /// C1 起渐进热路径改用 `decode_prog_dc_first_v`（ab/bl 值返回 A′ 版），本函数保留作
+    /// 位消费语义参照（dormancy，K24）；字节恒等由 parity 对两版同源守护。
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn decode_prog_dc_first<'a>(
         &mut self,
@@ -425,6 +428,9 @@ impl BitStream {
     }
 
     /// 渐进 DC refine scan：读 1 位修正值并入已有 DC 系数。
+    /// C1 起渐进热路径改用 `decode_prog_dc_refine_v`（ab/bl 值返回 A′ 版），本函数保留作
+    /// 位消费语义参照（dormancy，K24）；字节恒等由 parity 对两版同源守护。
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn decode_prog_dc_refine<'a>(
         &mut self,
@@ -993,30 +999,36 @@ impl BitStream {
                         Err(e) => return Err(e),
                     }
                 }
-                // 探测 + 快速消费（与 decode_huff! 等价：码长 >11 才落盘走慢路径）。
-                let mut symbol = table.lookup[(ab >> (64 - HUFF_LOOKAHEAD)) as usize];
-                if symbol >> HUFF_LOOKAHEAD > i32::from(HUFF_LOOKAHEAD) {
-                    // 码长 >11：落盘 ab/bl，把 RAW lookup 值（高位码长未掩）交给 decode_huff!
-                    // 走 16 位码慢探测（内部重提取 code_length），再读回 ab/bl。
-                    self.aligned_buffer = ab;
-                    self.bits_left = bl;
-                    decode_huff!(self, symbol, table);
-                    ab = self.aligned_buffer;
-                    bl = self.bits_left;
-                } else {
-                    let code_length = symbol >> HUFF_LOOKAHEAD;
-                    symbol &= (1 << HUFF_LOOKAHEAD) - 1;
-                    if code_length > i32::from(bl) {
+                // C2：cs_lut 单探测（与 decode_huff! 等价：码长 >11 即 e==0 落盘走慢路径）。
+                // 复用 ac_first_v 同款 cs_lut 布局（位 6-9 = 码长 s、位 11-18 = rs），FULL 与
+                // 非 FULL 条目均一次解出 rs、消费 s 位；refine 幅值恒由后续 1 位符号位给出，
+                // 不消费/不查 cs_lut FULL 幅值字段，位序与 `decode_mcu_ac_refine` 逐位一致。
+                let probe = table.cs_lut[(ab >> (64 - CS_LUT_BITS)) as usize];
+                let rs = if probe != 0 {
+                    let code_length = ((probe >> CS_CODELEN_SHIFT) & 15) as u8;
+                    if code_length > bl {
                         return Err(DecodeError::Format(format!(
                             "Code length {code_length}  more than bits left {}",
                             bl
                         )));
                     }
-                    ab <<= code_length as u8;
-                    bl = bl.saturating_sub(code_length as u8);
-                }
-                let r = symbol >> 4;
-                let mut symbol = symbol & 15;
+                    ab <<= code_length;
+                    bl = bl.saturating_sub(code_length);
+                    ((probe >> 11) & 255) as u8
+                } else {
+                    // 码长 >11：落盘 ab/bl，把 RAW lookup 值（高位码长未掩）交给 decode_huff!
+                    // 走 16 位码慢探测（内部重提取 code_length），再读回 ab/bl。
+                    self.aligned_buffer = ab;
+                    self.bits_left = bl;
+                    let mut symbol =
+                        table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+                    decode_huff!(self, symbol, table);
+                    ab = self.aligned_buffer;
+                    bl = self.bits_left;
+                    symbol as u8
+                };
+                let r = i32::from(rs >> 4);
+                let mut symbol = i32::from(rs & 15);
 
                 if symbol == 0 {
                     if r != 15 {

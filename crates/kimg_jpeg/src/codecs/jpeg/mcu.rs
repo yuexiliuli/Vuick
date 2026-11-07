@@ -1422,7 +1422,14 @@ impl<'a> Decoder<'a> {
                 }
             }
 
-            // 交织 DC scan：逐 MCU 逐分量解码（仅 DC 允许交织）
+            // C1：交织 DC scan：逐 MCU 逐分量解码（仅 DC 允许交织）。ab/bl 提升为扫描级局部
+            // 寄存器（`_v` value-return A′ 变体，与单分量路径 mcu.rs:1305/1316 同构），消除
+            // 每块经 `&mut BitStream` 的 6 字段快照/回写与 store-forward 链。
+            // restart==0：免每 MCU `#[cold] handle_rst_main`（todo=usize::MAX 恒不触 RST，
+            // 与单分量路径 mcu.rs:1355 同款门控）；restart≠0：保留每 MCU 逐块回写 +
+            // handle_rst_main + reload（RST 语义兜底）。
+            let restart = self.restart_interval != 0;
+            let (mut ab, mut bl) = stream.ab_bl();
             for i in 0..self.mcu_y {
                 for j in 0..self.mcu_x {
                     for k in 0..self.num_scans {
@@ -1447,16 +1454,20 @@ impl<'a> Decoder<'a> {
                                 })?;
 
                                 let t_entropy = self.stage.busy_timer();
-                                if self.succ_high == 0 {
-                                    stream.decode_prog_dc_first(
+                                let (a, b) = if self.succ_high == 0 {
+                                    stream.decode_prog_dc_first_v(
                                         &mut self.reader,
                                         huff_table,
                                         data,
                                         &mut component.dc_pred,
-                                    )?;
+                                        ab,
+                                        bl,
+                                    )?
                                 } else {
-                                    stream.decode_prog_dc_refine(&mut self.reader, data)?;
-                                }
+                                    stream.decode_prog_dc_refine_v(&mut self.reader, data, ab, bl)?
+                                };
+                                ab = a;
+                                bl = b;
                                 self.stage.busy_stop(Stage::Entropy, t_entropy);
                                 if self.stage.counting() {
                                     self.stage.n_entropy += 1;
@@ -1467,9 +1478,16 @@ impl<'a> Decoder<'a> {
 
                     self.todo = self.todo.wrapping_sub(1);
 
-                    self.handle_rst_main(stream)?;
+                    if restart {
+                        // RST 语义兜底：逐 MCU 回写 + handle_rst_main + reload（stream 被改
+                        // 则同步回 ab/bl；与单分量路径 mcu.rs:1355 同款）。
+                        stream.set_ab_bl(ab, bl);
+                        self.handle_rst_main(stream)?;
+                        (ab, bl) = stream.ab_bl();
+                    }
                 }
             }
+            stream.set_ab_bl(ab, bl);
         }
 
         Ok(())
