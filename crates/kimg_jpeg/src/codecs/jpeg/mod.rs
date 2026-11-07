@@ -18,6 +18,8 @@ mod huffman;
 mod idct;
 mod io;
 mod mcu;
+#[cfg(test)]
+mod prescan_probe;
 mod segment;
 mod upsampler;
 
