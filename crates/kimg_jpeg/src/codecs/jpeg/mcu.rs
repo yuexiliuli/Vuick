@@ -1079,7 +1079,7 @@ impl<'a> Decoder<'a> {
         self.finish_progressive_decoding(&block, pixels)
     }
 
-    /// 解单个 scan 的熵编码数据（1:1 复刻 zune `parse_entropy_coded_data`）。
+    /// 解单个 scan 的熵编码数据（1:1 复刻 zune `parse_entropy_coded_data`；P1 A′ 改造）。
     #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
     fn parse_entropy_coded_data(
         &mut self,
@@ -1096,6 +1096,25 @@ impl<'a> Decoder<'a> {
             )));
         }
 
+        // P1 前置探针修复：skip_entropy 消融在渐进上不再 panic。skip_e 跳过实际熵解码，
+        // 但仍以字节扫描推进位流到下一真实 marker（restart 图的中途 RST marker 由外层
+        // scan 循环逐段消费），使 scan 层 marker 语义正常收尾——此前 skip_e 完全不消费位流，
+        // `stream.marker` 恒 None，`decode_mcu_ycbcr_progressive` 在 `marker.take()`
+        // （mcu.rs:1015）处 panic「Marker missing where expected」。AC-refine 的位消费依赖
+        // 块内既有非零系数（refine 位只对非零系数读），无法「只跳过系数写入」仍保持位序，
+        // 故用 get_marker 盲扫推进（仅测量模式，entropy 墙钟趋零出真值）。
+        if StageProfile::skip_entropy() {
+            match get_marker(&mut self.reader, stream) {
+                Ok(m) => stream.marker = Some(m),
+                Err(_) => {
+                    // 截断/损坏：置 EOI 让外层 scan 循环正常收尾（仅测量模式）
+                    stream.seen_eoi = true;
+                    stream.marker = Some(Marker::EOI);
+                }
+            }
+            return Ok(());
+        }
+
         if self.num_scans == 1 {
             // 安全检查：单个非交织 scan 不能同时含 DC 与 AC 谱段
             if self.spec_end != 0 && self.spec_start == 0 {
@@ -1105,104 +1124,141 @@ impl<'a> Decoder<'a> {
             }
 
             // 非交织：逐块按常规扫描顺序解码
-            let k = self.z_order[0];
+            let comp_k = self.z_order[0];
 
-            if k >= self.components.len() {
+            if comp_k >= self.components.len() {
                 return Err(DecodeError::Format(format!(
-                    "Cannot find component {k}, corrupt image"
+                    "Cannot find component {comp_k}, corrupt image"
                 )));
             }
 
-            let component = &self.components[k];
-            let width_stride = component.width_stride;
+            let comp = &self.components[comp_k];
+            let width_stride = comp.width_stride;
 
             // 非交织 scan 迭代该分量实际的数据单元网格
-            let mcu_width = (self.width * component.horizontal_sample).div_ceil(self.h_max * 8);
-            let mcu_height = (self.height * component.vertical_sample).div_ceil(self.v_max * 8);
+            let mcu_width = (self.width * comp.horizontal_sample).div_ceil(self.h_max * 8);
+            let mcu_height = (self.height * comp.vertical_sample).div_ceil(self.v_max * 8);
+
+            // P1：每 scan 一次的表解析 + 指针快照（把 `%MAX_COMPONENTS` + `as_ref` +
+            // `ok_or_else?` 分支从每块热点挪到 scan 首一次）。`dc/ac_huffman_tables` 解码期间
+            // 不再变动 → 原始指针快照解引用安全（与 baseline 行首 dc_ptr/ac_ptr 同款）；
+            // 有效表缺失 → scan 首即返回（与原每块 `?` 同一 Err 文本）。
+            let dc_idx = comp.dc_huff_table & (MAX_COMPONENTS - 1);
+            let dc_ptr: *const HuffmanTable = match self.dc_huffman_tables[dc_idx].as_ref() {
+                Some(t) => t as *const HuffmanTable,
+                None => {
+                    return Err(DecodeError::Format("DC table not found".to_string()));
+                }
+            };
+            let ac_idx = comp.ac_huff_table;
+            let ac_ptr: *const HuffmanTable = match self
+                .ac_huffman_tables
+                .get(ac_idx)
+                .ok_or_else(|| {
+                    DecodeError::Format(format!("No huffman table for component:{ac_idx}"))
+                })?
+                .as_ref()
+            {
+                Some(t) => t as *const HuffmanTable,
+                None => {
+                    return Err(DecodeError::Format(format!(
+                        "Huffman table at index  {ac_idx} not initialized"
+                    )))
+                }
+            };
+
+            // P1：ab/bl 扫描级局部寄存器驻留（value-return refill/decode 同款），块环以
+            // 值返回方式在块间传递，不逐块回写 `stream`。restart 图需逐块回写 +
+            // handle_rst_main + reload（RST 语义兜底，与 baseline inner_decode_mcu_width
+            // restart!=0 姿势同款）；restart==0（语料主流）免回写，marker 由 refill/decode
+            // 设进 stream，块间不回写。
+            let restart = self.restart_interval != 0;
+            let (mut ab, mut bl) = stream.ab_bl();
 
             for i in 0..mcu_height {
                 for j in 0..mcu_width {
                     let t_entropy = self.stage.busy_timer();
-                    if !StageProfile::skip_entropy() {
-                        if self.spec_start != 0 && self.succ_high == 0 && stream.eob_run > 0 {
-                            // 在此处理 EOB RUN 的整块跳过
-                            stream.eob_run -= 1;
-                        } else {
-                            let start = 64 * (j + i * (width_stride / 8));
+                    if self.spec_start != 0 && self.succ_high == 0 && stream.eob_run > 0 {
+                        // 在此处理 EOB RUN 的整块跳过
+                        stream.eob_run -= 1;
+                    } else {
+                        let start = 64 * (j + i * (width_stride / 8));
 
-                            let data: &mut [i16; 64] = buffer
-                                .get_mut(k)
-                                .ok_or_else(|| DecodeError::Format("Invalid image".to_string()))?
-                                .get_mut(start..start + 64)
-                                .ok_or_else(|| DecodeError::Format("Slice to Small".to_string()))?
-                                .try_into()
-                                .map_err(|_| DecodeError::Format("Slice to Small".to_string()))?;
+                        let data: &mut [i16; 64] = buffer
+                            .get_mut(comp_k)
+                            .ok_or_else(|| DecodeError::Format("Invalid image".to_string()))?
+                            .get_mut(start..start + 64)
+                            .ok_or_else(|| DecodeError::Format("Slice to Small".to_string()))?
+                            .try_into()
+                            .map_err(|_| DecodeError::Format("Slice to Small".to_string()))?;
 
-                            if self.spec_start == 0 {
-                                // DC 谱段（含 DC refine）
-                                let pos = self.components[k].dc_huff_table & (MAX_COMPONENTS - 1);
+                        if self.spec_start == 0 {
+                            // DC 谱段（含 DC refine）
+                            let dc_pred = &mut self.components[comp_k].dc_pred;
 
-                                let dc_table = self
-                                    .dc_huffman_tables
-                                    .get(pos)
-                                    .ok_or_else(|| {
-                                        DecodeError::Format(
-                                            "No huffman table for DC component".to_string(),
-                                        )
-                                    })?
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        DecodeError::Format(
-                                            "Huffman table at index  not initialized".to_string(),
-                                        )
-                                    })?;
-
-                                let dc_pred = &mut self.components[k].dc_pred;
-
-                                if self.succ_high == 0 {
-                                    stream.decode_prog_dc_first(
-                                        &mut self.reader,
-                                        dc_table,
-                                        &mut data[0],
-                                        dc_pred,
-                                    )?;
-                                } else {
-                                    stream.decode_prog_dc_refine(&mut self.reader, &mut data[0])?;
-                                }
+                            if self.succ_high == 0 {
+                                // SAFETY: dc_ptr/已由上非空 `as_ref` 快照（comp_k < nc 且在此
+                                // scan 固定），表解码期间不变；仅本迭代内作只读引用使用。
+                                let (a, b) = stream.decode_prog_dc_first_v(
+                                    &mut self.reader,
+                                    unsafe { &*dc_ptr },
+                                    &mut data[0],
+                                    dc_pred,
+                                    ab,
+                                    bl,
+                                )?;
+                                ab = a;
+                                bl = b;
                             } else {
-                                // AC 谱段（含 AC refine）
-                                let pos = self.components[k].ac_huff_table;
-
-                                let ac_table = self
-                                    .ac_huffman_tables
-                                    .get(pos)
-                                    .ok_or_else(|| {
-                                        DecodeError::Format(format!(
-                                            "No huffman table for component:{pos}"
-                                        ))
-                                    })?
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        DecodeError::Format(format!(
-                                            "Huffman table at index  {pos} not initialized"
-                                        ))
-                                    })?;
-
-                                if self.succ_high == 0 {
-                                    stream.decode_mcu_ac_first(&mut self.reader, ac_table, data)?;
-                                } else {
-                                    stream.decode_mcu_ac_refine(&mut self.reader, ac_table, data)?;
-                                }
+                                let (a, b) = stream.decode_prog_dc_refine_v(
+                                    &mut self.reader,
+                                    &mut data[0],
+                                    ab,
+                                    bl,
+                                )?;
+                                ab = a;
+                                bl = b;
                             }
+                        } else {
+                            // AC 谱段（含 AC refine）
+                            let (a, b) = if self.succ_high == 0 {
+                                // SAFETY: ac_ptr 同上（ac_huff_table 冲突仅照原 Err 文本）。
+                                stream.decode_mcu_ac_first_v(
+                                    &mut self.reader,
+                                    unsafe { &*ac_ptr },
+                                    data,
+                                    ab,
+                                    bl,
+                                )?
+                            } else {
+                                stream.decode_mcu_ac_refine_v(
+                                    &mut self.reader,
+                                    unsafe { &*ac_ptr },
+                                    data,
+                                    ab,
+                                    bl,
+                                )?
+                            };
+                            ab = a;
+                            bl = b;
                         }
                     }
                     self.stage.busy_stop(Stage::Entropy, t_entropy);
 
                     self.todo = self.todo.wrapping_sub(1);
 
-                    self.handle_rst_main(stream)?;
+                    if restart {
+                        // RST 语义兜底：逐块回写 + handle_rst_main + reload（stream 被改则同步回 ab/bl）
+                        stream.set_ab_bl(ab, bl);
+                        self.handle_rst_main(stream)?;
+                        (ab, bl) = stream.ab_bl();
+                    } else {
+                        // restart==0：handle_rst_main 恒 no-op（todo 首值为 usize::MAX，不会
+                        // 递减到 0），免每块调用；marker 在 decode 的 refill 内设进 stream。
+                    }
                 }
             }
+            stream.set_ab_bl(ab, bl);
         } else {
             if self.spec_end != 0 {
                 return Err(DecodeError::HuffmanDecode(
@@ -1239,6 +1295,28 @@ impl<'a> Decoder<'a> {
                     })?;
             }
 
+            // P1：交织 DC scan 的表指针快照（每 scan 一次；dc_ptr 按分量下标，表在位期间不变）。
+            let mut dc_ptr: [*const HuffmanTable; MAX_COMPONENTS] = [core::ptr::null(); MAX_COMPONENTS];
+            for k in 0..self.num_scans {
+                let n = self.z_order[usize::from(k)];
+                let dci = self.components[n].dc_huff_table;
+                match self
+                    .dc_huffman_tables
+                    .get(dci)
+                    .ok_or_else(|| {
+                        DecodeError::Format(format!("No huffman table for component:{dci}"))
+                    })?
+                    .as_ref()
+                {
+                    Some(t) => dc_ptr[n] = t as *const HuffmanTable,
+                    None => {
+                        return Err(DecodeError::Format(format!(
+                            "Huffman table at index  {dci} not initialized"
+                        )))
+                    }
+                }
+            }
+
             // 交织 DC scan：逐 MCU 逐分量解码（仅 DC 允许交织）
             for i in 0..self.mcu_y {
                 for j in 0..self.mcu_x {
@@ -1247,20 +1325,9 @@ impl<'a> Decoder<'a> {
 
                         let component = &mut self.components[n];
 
-                        let huff_table = self
-                            .dc_huffman_tables
-                            .get(component.dc_huff_table)
-                            .ok_or_else(|| {
-                                DecodeError::Format(
-                                    "No huffman table for component".to_string(),
-                                )
-                            })?
-                            .as_ref()
-                            .ok_or_else(|| {
-                                DecodeError::Format(
-                                    "Huffman table at index not initialized".to_string(),
-                                )
-                            })?;
+                        // SAFETY: dc_ptr[n] 上方已按 `dc_huffman_tables.get` 语义非空填充
+                        // （n 在本 scan 分量集内），表解码期间不变。
+                        let huff_table = unsafe { &*dc_ptr[n] };
 
                         for v_samp in 0..component.vertical_sample {
                             for h_samp in 0..component.horizontal_sample {
@@ -1275,17 +1342,15 @@ impl<'a> Decoder<'a> {
                                 })?;
 
                                 let t_entropy = self.stage.busy_timer();
-                                if !StageProfile::skip_entropy() {
-                                    if self.succ_high == 0 {
-                                        stream.decode_prog_dc_first(
-                                            &mut self.reader,
-                                            huff_table,
-                                            data,
-                                            &mut component.dc_pred,
-                                        )?;
-                                    } else {
-                                        stream.decode_prog_dc_refine(&mut self.reader, data)?;
-                                    }
+                                if self.succ_high == 0 {
+                                    stream.decode_prog_dc_first(
+                                        &mut self.reader,
+                                        huff_table,
+                                        data,
+                                        &mut component.dc_pred,
+                                    )?;
+                                } else {
+                                    stream.decode_prog_dc_refine(&mut self.reader, data)?;
                                 }
                                 self.stage.busy_stop(Stage::Entropy, t_entropy);
                                 if self.stage.counting() {

@@ -456,7 +456,9 @@ impl BitStream {
     }
 
     /// 渐进 AC 首个 scan：解谱段 [Ss..Se] 的首个非零系数（含 EOB RUN 计数）。
-    #[allow(clippy::cast_sign_loss)]
+    /// P1 起渐进热路径改用 `decode_mcu_ac_first_v`（ab/bl 值返回 A′ 版），本函数保留作
+    /// 位消费语义参照（dormancy，K24）；字节恒等由 parity 对两版同源守护。
+    #[allow(dead_code, clippy::cast_sign_loss)]
     pub(crate) fn decode_mcu_ac_first<'a>(
         &mut self,
         reader: &mut ByteReader<'a>,
@@ -515,7 +517,9 @@ impl BitStream {
     }
 
     /// 渐进 AC refine scan：修正既有非零系数并写入谱段内的新非零系数。
-    #[allow(clippy::too_many_lines)]
+    /// P1 起渐进热路径改用 `decode_mcu_ac_refine_v`（ab/bl 值返回 A′ 版），本函数保留作
+    /// 位消费语义参照（dormancy，K24）；字节恒等由 parity 对两版同源守护。
+    #[allow(dead_code, clippy::too_many_lines)]
     pub(crate) fn decode_mcu_ac_refine<'a>(
         &mut self,
         reader: &mut ByteReader<'a>,
@@ -634,6 +638,484 @@ impl BitStream {
             self.eob_run -= 1;
         }
         Ok(())
+    }
+
+    // ─────────── P1：渐进熵路径 A′ 移植（ab/bl 值返回寄存器驻留）───────────
+    // 基线 A′（HotStream::decode_block_inner）把 aligned_buffer/bits_left 提为热环局部、
+    // 经 `refill_value` 值返回，同窗实测 −1.5% 且字节恒等。这里对渐进 4 个熵解码函数做
+    // 同款移植：调用方（mcu.rs 每 scan）把 (ab, bl) 作为扫描级局部寄存器态贯穿块环、
+    // 以 value-return 在块间传递，免每块 6 字段快照/回写与每符号内存往返（与
+    // `refill_value` 值返回姿势同款）。位消费/DC 预测/scan 边界/refill/marker 时序
+    // 逐位不变（与原 `decode_prog_*`/`decode_mcu_ac_*` 按位对照）；slow 路径沿用
+    // 「落盘 ab/bl → 走 &mut self 既有逻辑 → 读回」姿势（同 decode_block_inner）。
+    // 字节恒等由 progressive parity + zune 红线守护。AC-refine 的位消费依赖块内既有
+    // 非零系数（refine 位只对非零系数读），故块系数状态必须全文保留，仅 ab/bl 提升。
+
+    /// P1：渐进调用方取 scan 起始 (aligned_buffer, bits_left) 到扫描级局部态。
+    #[inline]
+    pub(crate) fn ab_bl(&self) -> (u64, u8) {
+        (self.aligned_buffer, self.bits_left)
+    }
+
+    /// P1：渐进调用方把扫描级局部态写回 `stream`（scan 结束 / restart 逐块回写时）。
+    #[inline]
+    pub(crate) fn set_ab_bl(&mut self, ab: u64, bl: u8) {
+        self.aligned_buffer = ab;
+        self.bits_left = bl;
+    }
+
+    /// P1：A′ 值返回 refill——与 `HotStream::refill_value`（bitstream.rs:863）逐位同义，
+    /// 仅宿主改为 `BitStream` 供渐进 A′ 函数使用；`refill` 保留供既有（stream 态）调用方。
+    #[inline(always)]
+    fn refill_ab<'a>(        &mut self,
+        reader: &mut ByteReader<'a>,
+        mut ab: u64,
+        mut bl: u8,
+    ) -> Result<(u64, u8), DecodeError> {
+        // 单字节 refill：读到 0xFF 时探测后续 marker（见 `refill` 宏注释，1:1 移植）。
+        macro_rules! refill_hot_v {
+            ($buffer:expr,$byte:expr,$bits_left:expr) => {
+                $byte = u64::from(reader.read_u8());
+                self.overread_by += usize::from(reader.eof()?);
+                $buffer = ($buffer << 8) | $byte;
+                $bits_left += 8;
+                if $byte == 0xff {
+                    let mut next_byte = u64::from(reader.read_u8());
+                    if next_byte != 0x00 {
+                        while next_byte == 0xFF {
+                            next_byte = u64::from(reader.read_u8());
+                        }
+                        if next_byte != 0x00 {
+                            $buffer >>= 8;
+                            $bits_left -= 8;
+                            if $bits_left != 0 {
+                                ab = $buffer << (64 - $bits_left);
+                            }
+                            let marker = Marker::from_u8(next_byte as u8);
+                            self.marker = marker;
+                            if let Some(Marker::UNKNOWN(_)) = marker {
+                                return Err(DecodeError::Format(
+                                    "Unknown marker in bit stream".to_string(),
+                                ));
+                            }
+                            if next_byte == 0xD9 {
+                                self.buffer <<= 8;
+                                $bits_left += 8;
+                                ab = self.buffer << (64 - $bits_left);
+                            }
+                            return Ok((ab, bl));
+                        }
+                    }
+                }
+            };
+        }
+
+        if bl < 32 {
+            if self.marker.is_some() || self.seen_eoi {
+                self.buffer <<= 32;
+                bl += 32;
+                ab = self.buffer << (64 - bl);
+                return Ok((ab, bl));
+            }
+            if self.overread_by > 0 {
+                if bl == 0 {
+                    return Err(DecodeError::ExhaustedData);
+                }
+                return Ok((ab, bl));
+            }
+            if let Ok(bytes) = reader.read_fixed_bytes_or_error::<4>() {
+                let msb_buf = u32::from_be_bytes(bytes);
+                if !has_byte(msb_buf, 255) {
+                    bl += 32;
+                    self.buffer <<= 32;
+                    self.buffer |= u64::from(msb_buf);
+                    ab = self.buffer << (64 - bl);
+                    return Ok((ab, bl));
+                }
+                reader.rewind(4)?;
+            }
+            let mut byte;
+            refill_hot_v!(self.buffer, byte, bl);
+            refill_hot_v!(self.buffer, byte, bl);
+            refill_hot_v!(self.buffer, byte, bl);
+            refill_hot_v!(self.buffer, byte, bl);
+            ab = self.buffer << (64 - bl);
+        }
+        Ok((ab, bl))
+    }
+
+    /// P1：渐进 DC 首个 scan（A′ value-return 版）。语义与 `decode_prog_dc_first` 逐位一致：
+    /// DC 符号用 `cs_lut` 单探测（基线 A′ 同款，与 `lookup`+`decode_huff!` 等价）、幅值出窗退
+    /// 「丢码长 + 读 t 位扩展」、码长 >11 退慢路径（落盘 ab/bl 走 `decode_huff!` 再读回）；
+    /// `*block = dc_pred * successive_low_mask` 不变。
+    #[inline(always)]
+    pub(crate) fn decode_prog_dc_first_v<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        dc_table: &HuffmanTable,
+        block: &mut i16,
+        dc_prediction: &mut i32,
+        ab: u64,
+        bl: u8,
+    ) -> Result<(u64, u8), DecodeError> {
+        let mut ab = ab;
+        let mut bl = bl;
+        let dc_cs = &dc_table.cs_lut;
+
+        if bl < 32 {
+            match self.refill_ab(reader, ab, bl) {
+                Ok((a, b)) => {
+                    ab = a;
+                    bl = b;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let e = dc_cs[(ab >> (64 - CS_LUT_BITS)) as usize];
+        let diff = if (e & CS_LUT_FULL) != 0 {
+            let n = (e & 31) as u8;
+            ab <<= n;
+            bl = bl.saturating_sub(n);
+            e >> CS_VALUE_SHIFT
+        } else if e != 0 {
+            let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
+            let t = ((e >> 11) & 15) as u8;
+            ab <<= len;
+            let mag = (ab >> (64 - t)) as i32;
+            ab <<= t;
+            bl = bl.saturating_sub(len + t);
+            huff_extend(mag, i32::from(t))
+        } else {
+            self.aligned_buffer = ab;
+            self.bits_left = bl;
+            let mut symbol = dc_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+            decode_huff!(self, symbol, dc_table);
+            let d = if symbol != 0 {
+                let r = self.get_bits(symbol as u8);
+                huff_extend(r, symbol)
+            } else {
+                0
+            };
+            ab = self.aligned_buffer;
+            bl = self.bits_left;
+            d
+        };
+        *dc_prediction = dc_prediction.wrapping_add(diff);
+        *block = (*dc_prediction as i16).wrapping_mul(self.successive_low_mask);
+        Ok((ab, bl))
+    }
+
+    /// P1：渐进 DC refine scan（A′ value-return 版）。与 `decode_prog_dc_refine` 逐位一致：
+    /// bl<1 时 refill（refill 后仍 <1 → 原 Err 文本）；读 1 位修正并入块的 successive_low_mask。
+    #[inline(always)]
+    pub(crate) fn decode_prog_dc_refine_v<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        block: &mut i16,
+        ab: u64,
+        bl: u8,
+    ) -> Result<(u64, u8), DecodeError> {
+        let mut ab = ab;
+        let mut bl = bl;
+        if bl < 1 {
+            match self.refill_ab(reader, ab, bl) {
+                Ok((a, b)) => {
+                    ab = a;
+                    bl = b;
+                }
+                Err(e) => return Err(e),
+            }
+            if bl < 1 {
+                return Err(DecodeError::Format(
+                    "Marker found where not expected in refine bit".to_string(),
+                ));
+            }
+        }
+        if (ab >> 63) == 1 {
+            *block = block.wrapping_add(self.successive_low_mask);
+        }
+        ab <<= 1;
+        bl = bl.saturating_sub(1);
+        Ok((ab, bl))
+    }
+
+    /// P1：渐进 AC 首个 scan（A′ value-return 版）。语义与 `decode_mcu_ac_first` 逐位一致：
+    /// 环顶 refill 检查后 `cs_lut` 单探测得 (rs, v)（EOB/ZRL 亦单探测），run=rs>>4、size=rs&15；
+    /// size≠0 → 落 `UN_ZIGZAG[min(k,63)]` 系数并 k+=1；rs==0xF0 → ZRL k+=16；否则 EOB（category=run
+    /// 半字节）→ 读 category 位扩展 EOB 运行并 break。快路径位消费与 fast_ac/lookup 路径等价
+    /// （基线 A′ 已证）；写位 `min(k,63)` 与旧快路径/zune 逐位对齐（有效流 k≤Se≤63 恒等于
+    /// `k&63`；k>63 恶劣流按 min 对齐）。
+    #[allow(clippy::cast_sign_loss)]
+    #[inline]
+    pub(crate) fn decode_mcu_ac_first_v<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        ac_table: &HuffmanTable,
+        block: &mut [i16; 64],
+        ab: u64,
+        bl: u8,
+    ) -> Result<(u64, u8), DecodeError> {
+        let mut ab = ab;
+        let mut bl = bl;
+        let ac_cs = &ac_table.cs_lut;
+        let bit = self.successive_low_mask;
+
+        let mut k = usize::from(self.spec_start);
+
+        // EOB 运行交由 mcu.rs 的调用方处理（每块计数）
+        'block: loop {
+            if bl < 32 {
+                match self.refill_ab(reader, ab, bl) {
+                    Ok((a, b)) => {
+                        ab = a;
+                        bl = b;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let e = ac_cs[(ab >> (64 - CS_LUT_BITS)) as usize];
+            let (rs, v) = if (e & CS_LUT_FULL) != 0 {
+                let n = (e & 31) as u8;
+                ab <<= n;
+                bl = bl.saturating_sub(n);
+                (((e >> 11) & 255) as u8, e >> CS_VALUE_SHIFT)
+            } else if e != 0 {
+                let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
+                ab <<= len;
+                let rs = ((e >> 11) & 255) as u8;
+                let t = (rs & 15) as u8;
+                let mag = (ab >> (64 - t)) as i32;
+                ab <<= t;
+                bl = bl.saturating_sub(len + t);
+                (rs, if t != 0 { huff_extend(mag, i32::from(t)) } else { 0 })
+            } else {
+                // 码长 > 11：慢路径——落盘 ab/bl，走 `decode_huff!` + get_bits 后读回。
+                self.aligned_buffer = ab;
+                self.bits_left = bl;
+                let mut symbol =
+                    ac_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+                decode_huff!(self, symbol, ac_table);
+                let rs = symbol as u8;
+                let size = (rs & 15) as u8;
+                let v = if size != 0 {
+                    let r = self.get_bits(size);
+                    huff_extend(r, i32::from(size))
+                } else {
+                    0
+                };
+                ab = self.aligned_buffer;
+                bl = self.bits_left;
+                (rs, v)
+            };
+
+            let r = (rs >> 4) as usize;
+            if (rs & 15) != 0 {
+                // 非零系数：run=r、幅值 v（快路径已扩展；慢路径 huff_extend 后乘 bit）
+                k += r;
+                block[UN_ZIGZAG[min(k, 63)] & 63] = (v as i16).wrapping_mul(bit);
+                k += 1;
+            } else if rs != 0xF0 {
+                // EOB：EOB run = 2^r + r 个附加位，编码高半字节为 category。
+                self.eob_run = 1 << r;
+                let mask = (1_u64 << r) - 1;
+                ab = ab.rotate_left(r as u32);
+                self.eob_run += (ab & mask) as i32;
+                bl = bl.wrapping_sub(r as u8);
+                self.eob_run -= 1;
+                break;
+            } else {
+                k += 16; // ZRL
+            }
+
+            if k > usize::from(self.spec_end) {
+                break 'block;
+            }
+        }
+        Ok((ab, bl))
+    }
+
+    /// P1：渐进 AC refine scan（A′ value-return 版）。逐位语义与 `decode_mcu_ac_refine`
+    /// 完全一致：位消费严格依赖块内既有非零系数（refine 位只对非零系数读、新非零系数只读
+    /// 1 位符号位），故块系数状态必须全文保留——仅把 ab/bl 提为局部寄存器 + refill 值返回，
+    /// 控制流与位消费顺序与原文按行对照不变。
+    #[allow(clippy::too_many_lines)]
+    #[inline]
+    pub(crate) fn decode_mcu_ac_refine_v<'a>(
+        &mut self,
+        reader: &mut ByteReader<'a>,
+        table: &HuffmanTable,
+        block: &mut [i16; 64],
+        ab: u64,
+        bl: u8,
+    ) -> Result<(u64, u8), DecodeError> {
+        let mut ab = ab;
+        let mut bl = bl;
+        let bit = self.successive_low_mask;
+
+        let mut k = self.spec_start;
+        let (mut symbol, mut r);
+
+        if self.eob_run == 0 {
+            'no_eob: loop {
+                if bl < 32 {
+                    match self.refill_ab(reader, ab, bl) {
+                        Ok((a, b)) => {
+                            ab = a;
+                            bl = b;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                // 探测 + 快速消费（与 decode_huff! 等价：码长 >11 才落盘走慢路径）。
+                symbol = table.lookup[(ab >> (64 - HUFF_LOOKAHEAD)) as usize];
+                if symbol >> HUFF_LOOKAHEAD > i32::from(HUFF_LOOKAHEAD) {
+                    // 码长 >11：落盘 ab/bl，把 RAW lookup 值（高位码长未掩）交给 decode_huff!
+                    // 走 16 位码慢探测（内部重提取 code_length），再读回 ab/bl。
+                    self.aligned_buffer = ab;
+                    self.bits_left = bl;
+                    decode_huff!(self, symbol, table);
+                    ab = self.aligned_buffer;
+                    bl = self.bits_left;
+                } else {
+                    let code_length = symbol >> HUFF_LOOKAHEAD;
+                    symbol &= (1 << HUFF_LOOKAHEAD) - 1;
+                    if code_length > i32::from(bl) {
+                        return Err(DecodeError::Format(format!(
+                            "Code length {code_length}  more than bits left {}",
+                            bl
+                        )));
+                    }
+                    ab <<= code_length as u8;
+                    bl = bl.saturating_sub(code_length as u8);
+                }
+                r = symbol >> 4;
+                symbol &= 15;
+
+                if symbol == 0 {
+                    if r != 15 {
+                        // EOB run = 2^r + 附加位（r = category 高半字节）
+                        self.eob_run = 1 << r;
+                        let mask = (1_u64 << r) - 1;
+                        ab = ab.rotate_left(r as u32);
+                        self.eob_run += (ab & mask) as i32;
+                        bl = bl.wrapping_sub(r as u8);
+                        break 'no_eob;
+                    }
+                } else {
+                    // 与被参照实现的 libjpeg-turbo 一致：对畸形码仅警告不报错
+                    // 取符号位（1 位恒消费）
+                    let sign = (ab >> 63) == 1;
+                    ab <<= 1;
+                    bl = bl.saturating_sub(1);
+                    if sign {
+                        symbol = i32::from(bit);
+                    } else {
+                        symbol = i32::from(-bit);
+                    }
+                }
+
+                // 跳过既有非零系数，并为其追加修正位（1 表示绝对值须增大）
+                if k <= self.spec_end {
+                    'advance_nonzero: loop {
+                        let coefficient = &mut block[UN_ZIGZAG[usize::from(k) & 63] & 63];
+
+                        if *coefficient != 0 {
+                            if bl < 1 {
+                                match self.refill_ab(reader, ab, bl) {
+                                    Ok((a, b)) => {
+                                        ab = a;
+                                        bl = b;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                                if bl < 1 && self.marker.is_some() {
+                                    return Err(DecodeError::Format(
+                                        "Marker found where not expected in refine bit".to_string(),
+                                    ));
+                                }
+                            }
+                            let refine = (ab >> 63) == 1;
+                            ab <<= 1;
+                            bl = bl.saturating_sub(1);
+                            if refine && (*coefficient & bit) == 0 {
+                                if *coefficient > 0 {
+                                    *coefficient = coefficient.wrapping_add(bit);
+                                } else {
+                                    *coefficient = coefficient.wrapping_sub(bit);
+                                }
+                            }
+                        } else {
+                            r -= 1;
+
+                            if r < 0 {
+                                break 'advance_nonzero;
+                            }
+                        }
+
+                        if k == self.spec_end {
+                            break 'advance_nonzero;
+                        }
+
+                        k += 1;
+                    }
+                }
+
+                if symbol != 0 {
+                    let pos = UN_ZIGZAG[usize::from(k) & 63];
+                    block[pos & 63] = symbol as i16;
+                }
+
+                k += 1;
+
+                if k > self.spec_end {
+                    break 'no_eob;
+                }
+            }
+        }
+        if self.eob_run > 0 {
+            // 仅当块非纯零时处理（EOB 意味着后续块可能全零）
+            if &block[1..] != &[0_i16; 63] {
+                match self.refill_ab(reader, ab, bl) {
+                    Ok((a, b)) => {
+                        ab = a;
+                        bl = b;
+                    }
+                    Err(e) => return Err(e),
+                }
+
+                while k <= self.spec_end {
+                    let coefficient = &mut block[UN_ZIGZAG[usize::from(k) & 63] & 63];
+
+                    if *coefficient != 0 {
+                        let refine = (ab >> 63) == 1;
+                        ab <<= 1;
+                        bl = bl.saturating_sub(1);
+                        // 检查是否为已修正过的系数（避免重复加位）
+                        if refine && (*coefficient & bit) == 0 {
+                            if *coefficient >= 0 {
+                                *coefficient = coefficient.wrapping_add(bit);
+                            } else {
+                                *coefficient = coefficient.wrapping_sub(bit);
+                            }
+                        }
+                    }
+                    if bl < 1 {
+                        // 到最后一刻才 refill
+                        match self.refill_ab(reader, ab, bl) {
+                            Ok((a, b)) => {
+                                ab = a;
+                                bl = b;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    k += 1;
+                }
+            }
+            // 该块在 EOB 运行中计数完成
+            self.eob_run -= 1;
+        }
+        Ok((ab, bl))
     }
 }
 
