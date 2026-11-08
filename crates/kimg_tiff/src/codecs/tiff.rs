@@ -890,14 +890,122 @@ fn decode_deflate(src: &[u8], out: &mut [u8]) -> ImageResult<()> {
     Ok(())
 }
 
+/// 快道/慢道 env 门控：`KIMG_TIFF_PRED_FAST=0` 强制标量（同二进制 A/B 用），默认快道。
+/// `OnceLock` 一次读取（勿每行读 env）。仿 `KIMG_TIFF_LZW_FAST`。
+fn pred_fast_enabled() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        std::env::var("KIMG_TIFF_PRED_FAST")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// Horizontal predictor 还原：对每个解码后的行（`row_bytes` 字节）逐采样通道做
 /// `row[i] += row[i - samples]`（wrapping mod 256），行首采样保持为 0 差分起点。
 /// 与 tiff crate `rev_hpredict_nsamp`（8bit、N=samples）逐字节一致。
+///
+/// 快道/慢道双路径：samples∈{1,2,3,4} 且宿主支持 SSSE3 且 `KIMG_TIFF_PRED_FAST` 未禁 →
+/// 16B 块前缀和 SIMD 快道（见 [`pred_simd`]，K109 探针已证 N=1 逐字节 0 失配、~2.5×）；
+/// 否则走下方标量参照路径（dormancy 保留，`KIMG_TIFF_PRED_FAST=0` 同二进制 A/B 用）。
 fn apply_horizontal_predictor(buf: &mut [u8], row_bytes: usize, samples: usize) {
     debug_assert!(samples >= 1 && samples <= row_bytes);
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::is_x86_feature_detected;
+        if pred_fast_enabled()
+            && (1..=4).contains(&samples)
+            && is_x86_feature_detected!("ssse3")
+        {
+            return unsafe { pred_simd::predict_all(buf, row_bytes, samples) };
+        }
+    }
+    // 标量参照路径（dormancy；语义 = 逐通道差分链 out[i]=enc[i]+out[i-N]，模 256 回绕）。
     for row in buf.chunks_mut(row_bytes) {
         for i in samples..row.len() {
             row[i] = row[i].wrapping_add(row[i - samples]);
+        }
+    }
+}
+
+/// 16B 块前缀和 SIMD 快道（x86_64）：
+/// 每 16B 块先读本块**原始字节** v（in-place 写入前读）→ 按 samples 的 shift 计划做
+/// 块内各通道链前缀和 t → `t + pshufb(上块解码输出, MASK_N)`（块间 carry 来自上块**解码**输出
+/// 末 N 字节按通道广播）→ 写回，prev = 本块解码输出供下块 carry。每行独立、行首 carry=0。
+///
+/// 链语义：samples=N 时有 N 条交错链（位置 s, s+N, s+2N, …，0≤s<N），out[i]=enc[i]+out[i-N]；
+/// 块内 `_mm_slli_si128` 逐 d 移位累加即块内链前缀和（模 256 回绕天然成立）。块间 carry 必须取
+/// 上块**解码输出**末 N 字节（= 链在块前的累计值），不能取原始字节（原始末字节 ≠ 块前缀和）。
+/// - shift 计划（`slli_si128` 第二参须编译期立即数，故按 N 特化）：N=1→[1,2,4,8]；
+///   N=2→[2,4,8]；N=3→[3,6,12]；N=4→[4,8]。
+/// - MASK_N[j] = 16-N+(j mod N)（N=3 为 13,14,15 循环——note：非 12,13,14，前导 carry 偏移
+///   由链长 N 定，16-3=13；首块 prev=0 → carry=0）。
+/// 整除块循环后尾部（非 16 倍数）标量收尾，自然取本块已压解码值作 carry。
+#[cfg(target_arch = "x86_64")]
+mod pred_simd {
+    use std::arch::x86_64::*;
+
+    const MASK1: [i8; 16] = [15; 16];
+    const MASK2: [i8; 16] = [14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15];
+    const MASK3: [i8; 16] = [13, 14, 15, 13, 14, 15, 13, 14, 15, 13, 14, 15, 13, 14, 15, 13];
+    const MASK4: [i8; 16] = [12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15];
+
+    /// 块内链前缀和：依次 `t += slli(t, d)`（模 256 回绕天然成立，无跨子块问题）。
+    macro_rules! block_prefix {
+        ($v:ident $(, $d:literal)*) => {{
+            let mut p = $v;
+            $(p = _mm_add_epi8(p, _mm_slli_si128::<$d>(p));)*
+            p
+        }};
+    }
+
+    /// 整体快道：逐行处理（每行独立、行首 carry=0）。
+    pub(crate) unsafe fn predict_all(buf: &mut [u8], row_bytes: usize, samples: usize) {
+        for row in buf.chunks_mut(row_bytes) {
+            unsafe { predict_row(row, samples) };
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    pub(crate) unsafe fn predict_row(row: &mut [u8], samples: usize) {
+        unsafe {
+            let n = row.len();
+            // 整行不足一块（或未知 samples>4）→ 整行走标量。
+            if n < 16 || samples > 4 {
+                for i in samples..n {
+                    row[i] = row[i].wrapping_add(row[i - samples]);
+                }
+                return;
+            }
+            let r = row.as_mut_ptr();
+            let mut i = 0usize;
+            let mut prev = _mm_setzero_si128(); // 行首 carry=0；逐块更新为上块解码输出
+            while i + 16 <= n {
+                // 写入前先读本块原始字节（in-place 语义）。
+                let v = _mm_loadu_si128(r.add(i) as *const __m128i);
+                let maskv =
+                    _mm_loadu_si128(match samples {
+                        1 => MASK1.as_ptr() as *const __m128i,
+                        2 => MASK2.as_ptr() as *const __m128i,
+                        3 => MASK3.as_ptr() as *const __m128i,
+                        _ => MASK4.as_ptr() as *const __m128i,
+                    });
+                let carry = _mm_shuffle_epi8(prev, maskv);
+                let out = match samples {
+                    1 => _mm_add_epi8(block_prefix!(v, 1, 2, 4, 8), carry),
+                    2 => _mm_add_epi8(block_prefix!(v, 2, 4, 8), carry),
+                    3 => _mm_add_epi8(block_prefix!(v, 3, 6, 12), carry),
+                    _ => _mm_add_epi8(block_prefix!(v, 4, 8), carry),
+                };
+                _mm_storeu_si128(r.add(i) as *mut __m128i, out);
+                prev = out;
+                i += 16;
+            }
+            // 标量尾段：i≥16 恒 > samples，row[i-samples] 取已压解码值作 carry。
+            while i < n {
+                *r.add(i) = row[i].wrapping_add(row[i - samples]);
+                i += 1;
+            }
         }
     }
 }
@@ -994,5 +1102,153 @@ where
 
     fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
         (*self).read_image(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 独立标量参考（不经 `apply_horizontal_predictor` 的 SIMD 派发）。
+    fn scalar_predict(buf: &mut [u8], row_bytes: usize, samples: usize) {
+        for row in buf.chunks_mut(row_bytes) {
+            for i in samples..row.len() {
+                row[i] = row[i].wrapping_add(row[i - samples]);
+            }
+        }
+    }
+
+    /// 正向水平差分编码（预测器逆运算）：enc[i] = raw[i] - raw[i-N]，行首 N 字节原样。
+    /// 恒有 `predict(forward(x)) == x`。
+    fn forward_predict(buf: &mut [u8], row_bytes: usize, samples: usize) {
+        for row in buf.chunks_mut(row_bytes) {
+            for i in (samples..row.len()).rev() {
+                row[i] = row[i].wrapping_sub(row[i - samples]);
+            }
+        }
+    }
+
+    /// 确定性伪随机行（LCG，同 pngsimd 测试姿势）。
+    fn random_row(len: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 56) as u8
+            })
+            .collect()
+    }
+
+    /// fast ≡ 标量：随机缓冲覆盖 N=1/2/3/4、行长 1..及非 16 倍数、行高 1/多行。
+    /// 直接调 `pred_simd::predict_all` 强制走 SIMD 核（绕开 env/派发），
+    /// 故 `KIMG_TIFF_PRED_FAST=0` 重跑本套件时 SIMD 核仍被直接验证。
+    #[test]
+    fn pred_fast_matches_scalar_random() {
+        for samples in 1..=4usize {
+            for row_bytes in [
+                1usize, 2, 3, 4, 5, 7, 15, 16, 17, 19, 31, 32, 33, 47, 64, 65, 95, 100,
+            ] {
+                if samples > row_bytes {
+                    continue; // debug_assert 要求 samples <= row_bytes（真实行恒满足）
+                }
+                for rows in [1usize, 3] {
+                    let len = row_bytes * rows;
+                    let data = random_row(len, 0x9E3779B97F4A7C15 ^ (samples as u64 * 131 + row_bytes as u64 * 7 + rows as u64));
+                    // 标量参考
+                    let mut scalar = data.clone();
+                    scalar_predict(&mut scalar, row_bytes, samples);
+                    // 走完整派发（fast 或标量回退，见机行事）
+                    let mut dispatched = data.clone();
+                    apply_horizontal_predictor(&mut dispatched, row_bytes, samples);
+                    assert_eq!(dispatched, scalar, "派发路径不符 (samples={samples} row_bytes={row_bytes} rows={rows})");
+                    // 强制 SIMD 核直测
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use std::arch::is_x86_feature_detected;
+                        if is_x86_feature_detected!("ssse3") {
+                            let mut leaf = data.clone();
+                            unsafe { pred_simd::predict_all(&mut leaf, row_bytes, samples) };
+                            assert_eq!(leaf, scalar, "SIMD 核不符 (samples={samples} row_bytes={row_bytes} rows={rows})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// fast ≡ 标量：真实语料 `Benchmarks/corpus/TIFF/*_pred.tif`（解码后的行缓冲再正向差分
+    /// 还原预测输入）→ 覆盖真实灰度/RGB/RGBA 行布局与内容。缺语料 → SKIP（不入库惯例）。
+    #[test]
+    fn pred_fast_matches_scalar_corpus() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let corpus = root.join("Benchmarks").join("corpus").join("TIFF");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&corpus) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.file_name()
+                    .map(|n| n.to_string_lossy().ends_with("_pred.tif"))
+                    .unwrap_or(false)
+                {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        if files.is_empty() {
+            eprintln!("[pred-fast-corpus] SKIP: corpus/TIFF 缺 *_pred.tif（先跑 Benchmarks/tiff/scripts/run_gen.ps1）");
+            return;
+        }
+        let mut checked = 0usize;
+        for path in &files {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let data = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[pred-fast-corpus] SKIP {name}: 读文件失败 {e}");
+                    continue;
+                }
+            };
+            let dec = match TiffDecoder::new(std::io::Cursor::new(data.as_slice())) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[pred-fast-corpus] SKIP {name}: 自研解码构造失败 {e}");
+                    continue;
+                }
+            };
+            let (w, h) = dec.dimensions();
+            let total = dec.total_bytes() as usize;
+            let mut raw = vec![0u8; total];
+            if let Err(e) = dec.read_image(&mut raw) {
+                eprintln!("[pred-fast-corpus] SKIP {name}: 自研解码失败 {e}");
+                continue;
+            }
+            let row_bytes = raw.len() / h as usize;
+            if row_bytes % w as usize != 0 {
+                eprintln!("[pred-fast-corpus] SKIP {name}: 行长不为宽整数倍 row_bytes={row_bytes} w={w}");
+                continue;
+            }
+            let samples = row_bytes / w as usize;
+            if !(1..=4).contains(&samples) {
+                eprintln!("[pred-fast-corpus] SKIP {name}: 布局推断异常 row_bytes={row_bytes} samples={samples}");
+                continue;
+            }
+            // 正向差分还原预测输入，再跑 fast/标量，均须恢复原始解码字节。
+            let mut enc = raw.clone();
+            forward_predict(&mut enc, row_bytes, samples);
+            let mut fast = enc.clone();
+            apply_horizontal_predictor(&mut fast, row_bytes, samples);
+            assert_eq!(fast, raw, "[pred-fast-corpus] {name} fast ≠ 原始解码（end-to-end 失配）");
+            let mut scalar_buf = enc.clone();
+            scalar_predict(&mut scalar_buf, row_bytes, samples);
+            assert_eq!(scalar_buf, raw, "[pred-fast-corpus] {name} 标量参考 ≠ 原始解码");
+            checked += 1;
+        }
+        eprintln!("[pred-fast-corpus] parity ok={checked}");
+        assert!(checked > 0, "[pred-fast-corpus] 一个 pred 文件都没验上");
     }
 }
