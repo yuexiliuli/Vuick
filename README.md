@@ -248,6 +248,15 @@ pwsh scripts/package.ps1
 - **范围与限制**：只持久化 / 恢复**主窗口**（拆分 / 拖出的独立窗口不纳入）；已打开文件的**未保存修改不保留**（只记路径，下次重新打开文件本体）；文件缺失时恢复自动跳过该选项卡。
 - **恢复优先级**：命令行首个参数是文件时保持既有行为（打开该文件）、跳过会话恢复（显式意图优先）。
 
+## 许可证与第三方合规
+
+- **本体代码**：Apache-2.0（`LICENSE-APACHE`）；全部 crates 均为本仓库自研。
+- **第三方组件**（分发包由 `scripts/package.ps1` 随包提供 `THIRD_PARTY_NOTICES.md` 与 `third_party/` 许可原文）：
+  - **FFmpeg**（视频/音频解码）：**LGPL v2.1+**；以未修改的 FFmpeg 上游主线 **n9.0.2** 做**瘦化 decode-only** 构建（configure 白名单仅启用原生解码器 + 硬解，无 `--enable-gpl` / `--enable-nonfree`、无外部 GPL 库）；主 exe 经 `libloading` **运行时动态加载** `media_ffmpeg.dll`（B1 独立 av\*.dll / B2 静态归档可重链），本体代码不受 LGPL 传染。构建脚本 `scripts/build-slim-ffmpeg*.sh`，文本见 `third_party/LGPL-2.1.txt`、`third_party/FFmpeg-LICENSE.md`。
+  - **zstd**（PDF 载荷压缩）：BSD-3-Clause / MIT。
+  - **pdfium**（`pdfium-render`，PDF 栅格化）：BSD-3-Clause（Chromium）。
+- **专利口径（非法律意见）**：HEVC/H.265、AAC 等标准必要专利与代码许可无关；本应用为桌面软件、纯 CPU 解码，属 HEVC Advance「royalty-free 应用层软件」政策覆盖面；商业分发 / 收费 / 云服务 / 硬件形态，发货前请另行评估专利池并与法务确认。
+
 ## 已知限制与后续方向
 
 - 内容区拖选是整条文本维度的选择；图表 / 图片等富媒体尚未支持选择。

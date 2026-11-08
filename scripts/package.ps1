@@ -13,6 +13,7 @@
   - media_ffmpeg.dll **实际导入**的 FFmpeg dll（导入表驱动自动随必需集；media-ffmpeg
     Cargo.toml 已剪 device/filter feature → 只带 avcodec/avformat/avutil/swresample/swscale，
     不再拷 avdevice/avfilter。与编译期同一 FFmpeg 构建、版本一致不会 ABI 错位）
+  - THIRD_PARTY_NOTICES.md + third_party/（第三方合规声明与 FFmpeg LGPL 许可原文，LGPL 随分发义务）
 
 其余依赖（VCRUNTIME140.dll / api-ms-win-crt-* / d3dcompiler_47.dll / icuuc.dll 等）都是
 Windows 10/11 系统自带，无需打包；若目标机是精简版 / 旧版 Win10，建议先在本机安装
@@ -172,6 +173,24 @@ if ($decision.State -eq 'static') {
         Write-Host "[警告] FFMPEG_DIR\bin 缺以下 dll（ABI 版本与编译期不一致？）：$($missingSrc -join ', ')"
     }
     Write-Host "     已复制 media_ffmpeg.dll + $($ffNeeded.Count) 个 FFmpeg dll（$($ffNeeded -join ', ')）"
+}
+
+# 2c) 许可证合规文件：随包复制第三方声明 + FFmpeg LGPL 原文。
+#     ffmpeg-slim 的 make install 不装 license 文件（构建树全树无 LICENSE/COPYING）→ 文本由
+#     仓库 third_party/ vendor 兜底（scripts/build-slim-ffmpeg*.sh 自建 LGPL 构建，见 THIRD_PARTY_NOTICES.md）。
+$repoRoot = Split-Path $PSScriptRoot -Parent
+$notices = Join-Path $repoRoot 'THIRD_PARTY_NOTICES.md'
+if (Test-Path $notices) {
+    Copy-Item $notices (Join-Path $outDir 'THIRD_PARTY_NOTICES.md') -Force
+} else {
+    Write-Host '[警告] 缺 THIRD_PARTY_NOTICES.md，未复制第三方声明'
+}
+$tpDir = Join-Path $repoRoot 'third_party'
+if (Test-Path $tpDir) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'third_party') | Out-Null
+    Copy-Item (Join-Path $tpDir '*') (Join-Path $outDir 'third_party') -Recurse -Force
+} else {
+    Write-Host '[警告] 缺 third_party/，未复制 FFmpeg LGPL 许可原文'
 }
 
 # ---------- 3) 校验 + 收尾 ----------

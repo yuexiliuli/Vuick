@@ -7,6 +7,10 @@
 //! - 载入失败（缺 `media_ffmpeg.dll` 或 FFmpeg 运行库）→ [`Self::available`] 为 false，
 //!   查看器在窗口内报「缺少视频运行库」，**exe 照常启动**。
 //!
+//! 许可证：主 exe 与 FFmpeg 之间是「libloading 动态桥 + 独立共享库」关系——FFmpeg 为外部
+//! **LGPL v2.1+** 共享库（自建瘦化 decode-only 构建 `scripts/build-slim-ffmpeg*.sh`，无 GPL /
+//! 外部库），本 crate 及主程序 Apache-2.0 不受 LGPL 传染；分发义务见根 `THIRD_PARTY_NOTICES.md`。
+//!
 //! 解码逻辑与逐帧回归测试均保留在 `media-ffmpeg` crate（`cargo test -p media-ffmpeg`）。
 //! FFI 约定见 `media-ffmpeg/src/lib.rs`：句柄透明、输出缓冲由调用方预分配、路径按 UTF-8 传。
 //!
