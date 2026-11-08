@@ -1,0 +1,18 @@
+[package]
+name = "kimg_gif_vs_csharp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 独立 workspace 根：探针位于仓库工作区目录树内（Benchmarks/gif/probe），声明自身为 workspace 根，
+# 避免 cargo 把根仓库 workspace 误认为本包所属；默认 target 即本目录下 target/（独立于根仓库）。
+
+[workspace]
+
+[dependencies]
+kimg_gif = { path = "../../../crates/kimg_gif" }
+kimg_core = { path = "../../../crates/kimg_core" }
+
+# 速度向可比口径（对照 C# Release + Optimize；独立探针按 release opt-level=3）。
+[profile.release]
+opt-level = 3
