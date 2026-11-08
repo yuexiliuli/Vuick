@@ -60,6 +60,18 @@ pub(crate) fn simd_forced_off() -> bool {
     OFF.load(Relaxed)
 }
 
+/// Adam7 scatter 快道开关：`KIMG_PNG_ADAM7_FAST=0|false|off` 强制走逐像素慢道（同二进制 A/B 裁决用）。
+/// 默认开启；首次访问缓存一次环境变量，与 `simd_forced_off` 同款 OnceLock 姿势。
+pub(crate) fn adam7_fast_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FAST: OnceLock<bool> = OnceLock::new();
+    *FAST.get_or_init(|| {
+        std::env::var("KIMG_PNG_ADAM7_FAST")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+            .unwrap_or(true)
+    })
+}
+
 /// 分阶段计时探针（`stage_profile` feature）：decode 按 inflate / unfilter / expand / copy 累计耗时。
 /// 正常构建（未开 feature）下结构体照常幸存但无计时指令，仅多一次 `&mut Stages` 透传——零开销。
 #[derive(Default, Clone, Copy)]
@@ -719,6 +731,10 @@ fn decode_adam7(
     let mut expanded = vec![0u8; width * out_bpp];
     let mut pos = 0usize;
 
+    // Adam7 散射快道门控（out_bpp==4 时以无边界检查 u32 直写替代逐像素拷贝），按 env 一次判定，
+    // 不逐行重复读门控；仅 Adam7 路径，非隔行 decode_scanlines 不受影响。
+    let fast_scatter = adam7_fast_enabled() && out_bpp == 4;
+
     for (x0, y0, dx, dy) in ADAM7_PASSES {
         let pw = pass_extent(width, x0, dx);
         let ph = pass_extent(height, y0, dy);
@@ -746,13 +762,13 @@ fn decode_adam7(
             let c3 = std::time::Instant::now();
             let y = y0 + r * dy;
             let dst_start = y * out_row + x0 * out_bpp;
-            scatter(
-                &expanded[..pw * out_bpp],
-                &mut buf[dst_start..],
-                pw,
-                out_bpp,
-                dx,
-            );
+            let erow = &expanded[..pw * out_bpp];
+            if fast_scatter {
+                // RGBA8（及 4B 输出）用无边界检查 u32 直写快道（scatter 阶段在落后文件占 59-70%）。
+                scatter_fast(erow, &mut buf[dst_start..], pw, dx);
+            } else {
+                scatter(erow, &mut buf[dst_start..], pw, out_bpp, dx);
+            }
             #[cfg(feature = "stage_profile")]
             let c4 = std::time::Instant::now();
             std::mem::swap(&mut cur, &mut above);
@@ -775,6 +791,27 @@ fn scatter(src: &[u8], dst: &mut [u8], count: usize, pixel_bytes: usize, step: u
         let s = &src[i * pixel_bytes..i * pixel_bytes + pixel_bytes];
         let d = &mut dst[i * stride..i * stride + pixel_bytes];
         d.copy_from_slice(s);
+    }
+}
+
+/// Adam7 散射快道：`pixel_bytes==4`（RGBA8 等 4B 输出）时用 native 序 u32 无边界检查直写。
+/// 语义与慢道逐字节拷贝恒等——u32 读/写不重排四字节，双端字节序等价（测试 `scatter_fast_parity` 实锤）。
+/// 安全性：`src` 长度 = `count*4`；pass 几何保证末像素写入止于 `(count-1)*stride+4`，其
+/// `<= dst.len()`（末列 `x0+(count-1)*dx < width` 恒成立，见 `decode_adam7` 的 `pass_extent`）。
+/// 注意：本快道**非 SIMD**（raw u32 直写，纯内存拷贝优化）；`KIMG_PNG_NO_SIMD=1` 测量旋钮语义
+/// 只关 SIMD 路径（反滤波/展开），故不经其门控——字节恒等，无歧义风险。
+#[inline]
+fn scatter_fast(src: &[u8], dst: &mut [u8], count: usize, step: usize) {
+    let stride = step * 4;
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr();
+    debug_assert!(src.len() >= count * 4);
+    debug_assert!(count == 0 || (count - 1) * stride + 4 <= dst.len());
+    for i in 0..count {
+        unsafe {
+            let v = std::ptr::read_unaligned(sp.add(i * 4) as *const u32);
+            std::ptr::write_unaligned(dp.add(i * stride) as *mut u32, v);
+        }
     }
 }
 
@@ -1383,5 +1420,228 @@ mod diag_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod adam7_fast_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// 语料目录：默认 `<workspace>/Benchmarks/corpus/PNG`；env `KIMG_PNG_CORPUS` 优先覆盖。
+    fn corpus_dir() -> PathBuf {
+        if let Ok(p) = std::env::var("KIMG_PNG_CORPUS") {
+            return PathBuf::from(p);
+        }
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("Benchmarks")
+            .join("corpus")
+            .join("PNG")
+    }
+
+    /// 3 个 adam7 落后文件 + 25__adam7（proto 分账证明 scatter 为其临界项）。
+    const ADAM7_FILES: [&str; 4] = [
+        "sdcb_screen_p8a_adam7.png",
+        "sdcb_screen_rgba8_adam7.png",
+        "sdcb_photo_p8a_adam7.png",
+        "25__adam7.png",
+    ];
+
+    /// 确定性字节模式（防跨进程校验依赖污染）。
+    fn pattern(len: usize, seed: u64) -> Vec<u8> {
+        if seed == 0 {
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len {
+                v.push((i % 251) as u8);
+            }
+            return v;
+        }
+        let mut lcg = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        (0..len)
+            .map(|_| {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (lcg >> 41) as u8
+            })
+            .collect()
+    }
+
+    /// 对 (count,step) 组合跑「慢道 scatter ≡ 快道 scatter_fast」逐字节断言。
+    fn assert_parity_pair(count: usize, step: usize, seed: u64) {
+        // 目标缓冲留 slack：证明快道不越界多写（slack 两侧均保持零）。
+        let dst_len = count * step * 4 + 16;
+        let src = pattern(count * 4, seed);
+        let mut slow = vec![0u8; dst_len];
+        let mut fast = vec![0u8; dst_len];
+        // slow 侧固定 4B/px（scatter 签名带 pixel_bytes 参数，fast 为 4B 专用签名）；
+        // 两侧语义一致：每像素 4 字节、以 `step*4` 步进散射。
+        scatter(&src, &mut slow, count, 4, step);
+        scatter_fast(&src, &mut fast, count, step);
+        assert_eq!(
+            slow, fast,
+            "scatter(慢) ≡ scatter_fast(快) 失配 count={count} step={step} seed={seed:#x}"
+        );
+    }
+
+    /// 直拍 1：自构造边角——Adam7 全 7 pass 几何 × 各种宽（1、7、非 8 倍数……）+ 混合字节模式，
+    /// 覆盖 pass 步幅 {8,4,2,1}、count 边角（1、7、8、9、非 8 倍数、大数），逐字节 0 失配。
+    #[test]
+    fn scatter_fast_parity() {
+        let widths = [1usize, 2, 7, 8, 9, 13, 16, 17, 167, 1920];
+        // Adam7 七遍 (x0, step, dx 列步幅)：(x0=0,8)、(4,8)、(0,4)、(2,4)、(0,2)、(1,2)、(0,1)。
+        let passes = [
+            (0usize, 8usize),
+            (4, 8),
+            (0, 4),
+            (2, 4),
+            (0, 2),
+            (1, 2),
+            (0, 1),
+        ];
+        let mut combos: Vec<(usize, usize)> = Vec::new();
+        for &w in &widths {
+            for &(x0, step) in &passes {
+                let count = pass_extent(w, x0, step);
+                if count > 0 {
+                    combos.push((count, step));
+                }
+            }
+        }
+        // 补充稀疏大 count（覆盖较长重复步进写）。
+        combos.push((1344, 1));
+        combos.push((168, 8));
+        combos.push((169, 4));
+        combos.push((673, 2));
+        combos.push((1, 1));
+        combos.push((7, 2));
+        combos.push((0, 1));
+
+        let seeds = [
+            0u64, // 循环 ramp（含重复字节区间，抓字节重排）
+            1,    // LCG 伪随机
+            0xDEAD_BEEF, 0xFFFFFFFF_FFFFFFFF, 0x0102_0304, 0x7F7F_7F7F,
+        ];
+        let mut checked = 0usize;
+        for &(count, step) in &combos {
+            for &seed in &seeds {
+                assert_parity_pair(count, step, seed);
+                checked += 1;
+            }
+        }
+        eprintln!("[adam7-fast] spread scatter_fast parity: {checked} 组 (count,step,seed) 全绿");
+    }
+
+    /// 对单个文件解码并返回 FNV-1a 64 摘要（无依赖、跨进程确定）。
+    fn decode_hash(path: &Path) -> Option<(usize, u64)> {
+        let bytes = std::fs::read(path).ok()?;
+        let eng = PngEngine::from_vec(bytes).ok()?;
+        let n = eng.total_bytes() as usize;
+        let mut buf = vec![0u8; n];
+        eng.decode(&mut buf, None).ok()?;
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in &buf {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        Some((n, h))
+    }
+
+    /// 子进程慢道 dump 助手：父测试以 `KIMG_PNG_ADAM7_FAST=0` 派生本测试，打印每文件慢道摘要。
+    /// 正常随套件跑（fast 态）时仅解码打印，无副作用。
+    #[test]
+    fn scatter_fast_slow_dump_helper() {
+        let dir = corpus_dir();
+        for name in ADAM7_FILES {
+            let p = dir.join(name);
+            match decode_hash(&p) {
+                Some((n, h)) => println!("ADAM7_SLOW_HASH {name} {n} {h:016x}"),
+                None => eprintln!("SKIP: missing {}", p.display()),
+            }
+        }
+    }
+
+    /// 直拍 2：真·快道≡慢道对 3 个落后 adam7 文件 + 25__adam7 逐字节 0 失配。
+    /// 本进程按当前 env 解码（默认快道）；子进程强制 `KIMG_PNG_ADAM7_FAST=0` 走慢道，
+    /// 两侧摘要必须一致（env 门控进程级缓存，故跨进程对拍）。
+    /// 注意：若整套餐件本身以 `KIMG_PNG_ADAM7_FAST=0` 运行，本进程与子进程同走慢道，
+    /// 断言退化为 slow-vs-slow 恒等（防误读：真对拍只在默认快态下成立）。
+    #[test]
+    fn scatter_fast_real_files_matches_slow() {
+        let dir = corpus_dir();
+        if !dir.is_dir() {
+            eprintln!("SKIP: missing corpus {}", dir.display());
+            return;
+        }
+        // 本进程快道摘要（若整套餐件在 env=0 下运行则为慢道，跨进程对拍仍成立）。
+        let mut fast_hashes: Vec<(String, usize, u64)> = Vec::new();
+        for name in ADAM7_FILES {
+            let p = dir.join(name);
+            match decode_hash(&p) {
+                Some((n, h)) => fast_hashes.push((name.to_string(), n, h)),
+                None => {
+                    eprintln!("SKIP: 解码失败 {}", p.display());
+                    return;
+                }
+            }
+        }
+
+        let exe = std::env::current_exe().expect("当前测试可执行路径");
+        // module_path!() 带 crate 名前缀（`.e.g.kimg_png::...`），libtest 全名不带——剥前缀对齐。
+        let crate_pref = format!("{}::", env!("CARGO_PKG_NAME"));
+        let helper = format!(
+            "{}::scatter_fast_slow_dump_helper",
+            module_path!()
+        );
+        let helper = helper.strip_prefix(&crate_pref).unwrap_or(&helper);
+        let out = std::process::Command::new(&exe)
+            .args(["--exact", &helper, "--nocapture", "--test-threads=1"])
+            .env("KIMG_PNG_ADAM7_FAST", "0")
+            .env("KIMG_PNG_CORPUS", &dir)
+            .output()
+            .expect("子进程（慢道）运行失败");
+        assert!(
+            out.status.success(),
+            "子进程（慢道）失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut slow: std::collections::HashMap<String, (usize, u64)> =
+            std::collections::HashMap::new();
+        for line in stdout.lines() {
+            // 首行会被 libtest「test <名> ...」前缀占用——按标记 token 出现位置解析，勿断言行首。
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let i = match toks.iter().position(|&t| t == "ADAM7_SLOW_HASH") {
+                Some(i) => i,
+                None => continue,
+            };
+            if toks.len() < i + 4 {
+                continue;
+            }
+            let name = toks[i + 1].to_string();
+            let n: usize = toks[i + 2].parse().unwrap_or(0);
+            let h = u64::from_str_radix(toks[i + 3], 16).unwrap_or(0);
+            slow.insert(name, (n, h));
+        }
+        assert_eq!(
+            slow.len(),
+            ADAM7_FILES.len(),
+            "子进程未产出全部慢道摘要：\n{}",
+            stdout
+        );
+        for (name, n, h) in &fast_hashes {
+            let (sn, sh) = slow.get(name).unwrap_or_else(|| panic!("缺慢道摘要 {name}"));
+            assert_eq!(
+                (n, h),
+                (&(*sn), sh),
+                "快道≠慢道：{name} 字节不一致（{n} bytes vs {sn}）"
+            );
+        }
+        eprintln!(
+            "[adam7-fast] 真机语料快道≡慢道：{} 文件全绿",
+            fast_hashes.len()
+        );
     }
 }
