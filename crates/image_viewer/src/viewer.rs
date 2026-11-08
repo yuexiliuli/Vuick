@@ -254,6 +254,9 @@ pub struct ImageViewer {
     byte_cache: LruMap<PathBuf, ByteEntry>,
     /// 已在后台解码中的路径去重（当前目标 + 预取共用，防同一路径重复解码）。
     in_flight: HashSet<PathBuf>,
+    /// **重型格式**（HEIF/HEIC）在途解码数：受 [`config::image::HEAVY_DECODE_MAX`] 单独封顶
+    /// ——HEIF 全解秒级 + 数十 MB RGBA，8 路并发会把核打满致 GUI 卡死；JPEG/PNG/GIF 不计数。
+    heavy_inflight: usize,
     /// 字节预读在途去重（与解码池分离：IO 便宜，不占 [`MAX_DECODE`] 解码槽）。
     byte_flight: HashSet<PathBuf>,
     /// 解码池并发满时记忆的「最新显示目标」：空位一放立即派发（追最新，跳过中间）。
@@ -326,6 +329,7 @@ impl ImageViewer {
             byte_cache: LruMap::new(None, BYTE_CACHE_BYTES, |e: &ByteEntry| e.bytes.len()),
             in_flight: HashSet::new(),
             byte_flight: HashSet::new(),
+            heavy_inflight: 0,
             pending_target: None,
             thumb_pending: None,
             scroll_accum: 0.0,
@@ -455,6 +459,7 @@ impl ImageViewer {
         self.byte_cache.clear();
         self.in_flight.clear();
         self.byte_flight.clear();
+        self.heavy_inflight = 0;
         self.pending_target = None;
         self.thumb_pending = None;
         self.prefetch_inflight = 0;
@@ -531,6 +536,21 @@ fn is_gif_magic(b: &[u8]) -> bool {
 /// 被误当 PNG 硬解）。
 fn is_png_magic(b: &[u8]) -> bool {
     b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+}
+
+/// HEIC/HEIF 魔数（ISOBMFF `ftyp` box 判定）检测：区分「HEIF 走展示档降档解码」与
+/// 「其余格式走 image 全解」。委托 kimg 的 `guess_format`（内部 `heif_brands` 校验
+/// `ftyp` 所列 brand：heic/heix/heim/heis/hevc/hevx/mif1/msf1 且不含 avif/avis），
+/// 勿手写易错 brand 解析。以字节为准，比扩展名可信（伪装成其它扩展名的 HEIF 也会
+/// 被识别；伪装 .heic 的 AVIF 不会误判成 HEIF）。
+fn is_heic_magic(b: &[u8]) -> bool {
+    matches!(kimg::guess_format(b), Ok(kimg::ImageFormat::Heic))
+}
+
+/// **重型格式**判定（并发上限用）：HEIF/HEIC 即重型——单张 debug 全解秒级、全解 RGBA
+/// 数十 MB，并发必须受 [`config::image::HEAVY_DECODE_MAX`] 单独封顶以免长期满核。
+fn is_heavy_format(bytes: &[u8]) -> bool {
+    is_heic_magic(bytes)
 }
 
 /// 路径扩展名是否 jpg/jpeg（升档路由的廉价判据；最终仍以魔数 + `probe` 为准）。
@@ -897,6 +917,32 @@ fn decode_png_display(
     Ok((bgra, w, h, den))
 }
 
+/// HEIF/HEIC 按展示需要**降档解码**（kimg_heif 全解出 RGBA 帧 → 与 PNG/JPEG 同款盒式
+/// 降采样到展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。选档复用
+/// [`pick_jpeg_denom`]（与格式无关的「解码 ≥ 显示」语义）。全解路径沿用
+/// [`decode_static_first_frame`] 同源（`kimg::load_from_memory`），输出**已含显示朝向
+/// 变换**。
+/// - den=1 → 与改动前 `decode_generic` 全解**逐像素一致**（RGBA swap 成 BGRA，尺寸=原始）；
+/// - den>1 → 只对**缩小后**缓冲区 swap 红蓝（不在大图上做交换）。
+/// 任何失败均返回 `Err`（由上层回退 `decode_generic` 全解 den=1，绝不 panic/硬失败）。
+fn decode_heif_display(
+    bytes: &[u8],
+    need: (f32, f32),
+) -> Result<(Vec<u8>, u32, u32, u8), String> {
+    let img = kimg::load_from_memory(bytes).map_err(|e| format!("HEIF 解码失败：{e}"))?;
+    let (iw, ih) = img.dimensions();
+    let den = pick_jpeg_denom(iw, ih, need);
+    let mut rgba = img.to_rgba8();
+    if den == 1 {
+        // den=1：全解直出（RGBA→BGRA 交换，尺寸=原始；与 decode_generic 逐像素一致）
+        swap_rb_in_place(rgba.as_mut());
+        return Ok((rgba.into_raw(), iw, ih, 1));
+    }
+    let (mut bgra, w, h) = box_downsample_bgra_or_rgba_rayon(rgba.as_raw(), iw, ih, den);
+    swap_rb_in_place(bgra.as_mut());
+    Ok((bgra, w, h, den))
+}
+
 /// RGBA → BGRA（原地交换每像素 R/B；缓冲区按 w×h×4 的 RGBA 直排）。GPUI 的
 /// `RenderImage` 字节序为 BGRA（PDF 模块亦如此）；不交换会红蓝互换、颜色明显失真。
 fn swap_rb_in_place(rgba: &mut [u8]) {
@@ -992,8 +1038,10 @@ fn decode_generic(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
 
 /// 后台解码总入口：JPEG → 自研 `kimg` 全解后按展示需要盒式降档出 BGRA（特殊 JPEG 如
 /// CMYK / 12bit / lossless 解不动时回退 `image` 全解，绝不硬失败）包成单帧；PNG → 展示档
-/// 降采样解码（[`decode_png_display`]，失败回退 `image` 全解）；其它 → `image` 全解
-/// （GIF 解全帧动图）。返回 (BGRA 帧序列, 宽, 高, 降档分母)。den=1 时与改动前逐像素一致。
+/// 降采样解码（[`decode_png_display`]，失败回退 `image` 全解）；HEIF/HEIC → 展示档降档
+/// 解码（[`decode_heif_display`]：kimg_heif 全解出 RGBA → 盒式降采样，失败回退全解）；
+/// 其它 → `image` 全解（GIF 解全帧动图）。返回 (BGRA 帧序列, 宽, 高, 降档分母)。
+/// den=1 时与改动前逐像素一致。
 fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<Frame>, u32, u32, u8), String> {
     if is_jpeg_magic(bytes) {
         match decode_jpeg_display(bytes, need) {
@@ -1014,6 +1062,18 @@ fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<Frame>, u32,
             }
             Err(_) => {
                 // 降采样链路任何失败 → 回退既有 `image` 全解（den=1），绝不硬失败/panic
+                let (frames, w, h) = decode_generic(bytes)?;
+                Ok((frames, w, h, 1))
+            }
+        }
+    } else if is_heic_magic(bytes) {
+        match decode_heif_display(bytes, need) {
+            Ok((bgra, w, h, den)) => {
+                let frame = bgra_single_frame(bgra, w, h).ok_or("解码结果尺寸异常")?;
+                Ok((vec![frame], w, h, den))
+            }
+            Err(_) => {
+                // 降档链路任何失败 → 回退既有 `image` 全解（den=1），绝不硬失败/panic
                 let (frames, w, h) = decode_generic(bytes)?;
                 Ok((frames, w, h, 1))
             }
@@ -1567,12 +1627,214 @@ mod tests {
         let len = w as usize * h as usize;
         assert_eq!(buf.len(), len * 4, "BGRA 字节数");
         assert_eq!(buf[3], 255, "alpha 通道应为 255（BGRA 第 4 字节）");
-        // 解码背景档：HEIC 无降档路径 → 回退全解 den=1
+        // 解码背景档：HEIC 走展示档降档（IMG_0083 3024×4032，需要 1024 → 1/2 = 1512×2016 ≥ 需要）
         let (frames2, w2, h2, den) = decode_background(&bytes, (1024.0, 1024.0))
             .expect("decode_background 应能解 HEIC");
-        assert_eq!((w2, h2), (3024, 4032));
-        assert_eq!(den, 1, "HEIC 走全解（无显示档降量）");
-        assert_eq!(frames2[0].buffer().len(), len * 4);
+        assert!((w2, h2) == (1512, 2016), "HEIC 展示档应降到 1/2，输出 {w2}×{h2}");
+        assert_eq!(den, 2, "HEIC 展示档应降档（非全解）");
+        assert_eq!(frames2[0].buffer().len(), w2 as usize * h2 as usize * 4);
+    }
+
+    /// HEIF 展示档**降档**回归：need 远小于原图 → den≥2，输出宽高 = ceil(全量/den) 且
+    /// ≥ display need（对齐 [`pick_jpeg_denom`] 的「输出 ≥ 显示需要」语义，同
+    /// `pick_jpeg_denom_never_below_display_pixels`）。用最轻合成语料（1600×900，debug 快）。
+    #[test]
+    fn heif_display_denoms_when_need_small() {
+        let corpus = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../Benchmarks/corpus/heif/synth-photo-fuji-1600x900-main8.heic"
+        );
+        let bytes = match std::fs::read(corpus) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("SKIP: missing {corpus} ({e})");
+                return;
+            }
+        };
+        let (frames, w, h, den) = decode_background(&bytes, (200.0, 150.0)).expect("HEIF 降档应成功");
+        assert!(den >= 2, "need 远小于原图应降档，den={den}");
+        let (full, wf, hf) = decode_generic(&bytes).expect("真实 HEIF 应能全解");
+        assert_eq!(full.len(), 1, "静态 HEIF 单帧");
+        assert_eq!(w, wf.div_ceil(u32::from(den)), "输出宽 = ceil(全量/den)");
+        assert_eq!(h, hf.div_ceil(u32::from(den)), "输出高 = ceil(全量/den)");
+        assert!(w >= 200 && h >= 150, "解码像素不得低于显示需要（不糊）：{w}×{h}");
+        assert_eq!(frames[0].buffer().len(), (w as usize * h as usize * 4) as usize);
+    }
+
+    /// HEIF 展示档 **den=1 字节恒等**：need 超原图 → 与改动前 `decode_generic`（
+    /// `decode_static_first_frame` → `kimg::load_from_memory`）全解**逐像素一致**（RGBA→
+    /// BGRA 交换后）。守护降档/交换顺序不破坏既有全解路径。
+    #[test]
+    fn heif_display_den1_matches_full_decode_bytes() {
+        let corpus = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../Benchmarks/corpus/heif/synth-photo-fuji-1600x900-main8.heic"
+        );
+        let bytes = match std::fs::read(corpus) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("SKIP: missing {corpus} ({e})");
+                return;
+            }
+        };
+        let (full, wf, hf) = decode_generic(&bytes).expect("全解应成功");
+        let (disp, wd, hd, den) = decode_background(&bytes, (99999.0, 99999.0)).expect("全解降档应成功");
+        assert_eq!(den, 1, "need 超原图应落全解");
+        assert_eq!((wd, hd), (wf, hf));
+        assert_eq!(
+            disp[0].buffer().as_raw(),
+            full[0].buffer().as_raw(),
+            "den=1 输出必须与改动前全解逐像素一致"
+        );
+    }
+
+    /// 损坏 HEIF 字节（ftyp head 合法但无实际 HEVC 数据）→ `decode_background` 返回
+    /// `Err` 而非 panic（HEIF 展示档失败 → 回退全解仍失败 → 顶层以加载错误呈现，同 PNG/JPEG
+    /// 兜底姿势）。
+    #[test]
+    fn corrupt_heif_bytes_return_err_not_panic() {
+        let bad: &[u8] = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic";
+        let r = decode_background(bad, (100.0, 100.0));
+        assert!(r.is_err(), "损坏 HEIF 应返回 Err 而非 panic");
+    }
+
+    /// HEIF 识别（`is_heic_magic`/`is_heavy_format`）：`ftyp` 所列 brand 含 HEIF 系 → 是；
+    /// AVIF brand（常连同 mif1 列出但不是 HEVC）→ 否（kimg `heif_brands` 语义）；其它格式
+    /// 不误判。
+    #[test]
+    fn heic_magic_and_heavy_format_detect_ftyp_brands_only() {
+        let heic: &[u8] = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic";
+        assert!(is_heic_magic(heic), "major brand heic 应识别");
+        assert!(is_heavy_format(heic), "HEIF 即重型格式");
+        // AVIF：avif/avis brand 不算 HEIF（kimg 与 image/C# CanDecode 同步）
+        let avif: &[u8] = b"\x00\x00\x00\x1Cftypavif\x00\x00\x00\x00mif1avif";
+        assert!(!is_heic_magic(avif), "AVIF 不是 HEIF brand，不应进入 HEIF 展示档分支");
+        // 其它格式不误判
+        assert!(!is_heic_magic(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]), "PNG 非 HEIF");
+        assert!(!is_heic_magic(&[0xFF, 0xD8, 0xFF, 0xE0]), "JPEG 非 HEIF");
+        assert!(!is_heic_magic(b"GIF89a"), "GIF 非 HEIF");
+    }
+
+    /// 端到端：打开真实 HEIF → 首解即「展示尺寸档」（need 压小 → den≥2，不糊），且缓存
+    /// 只存这份降档；放大使需要超全量 → 走 [`Self::escalate_display_denom`]（已去 jpeg 限定）
+    /// 升档全解替换（镜像 JPEG/PNG 版 `*_cold_open_installs_sharp_display`）。合成语料最轻，
+    /// debug 快；缺语料 → SKIP。
+    #[gpui::test]
+    async fn heif_cold_open_installs_sharp_display_and_escalates(cx: &mut TestAppContext) {
+        let corpus = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../Benchmarks/corpus/heif/synth-photo-fuji-1600x900-main8.heic"
+        );
+        let p = std::path::PathBuf::from(corpus);
+        if !p.exists() {
+            println!("SKIP: missing {corpus}");
+            return;
+        }
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        // 后台扫描未完成（首解未派发）前把展示需要压小 → 首解即降档（用最轻语料验证 den 链）
+        cx.update(|app| {
+            viewer.update(app, |v, _| v.display_need = (200.0, 150.0));
+        });
+        wait_until_ready(cx, &viewer);
+        let (den, w, h) = cx.update(|app| {
+            let v = viewer.read(app);
+            (
+                v.display_denom,
+                v.intrinsic.map(|i| i.0 as u32).unwrap_or(0),
+                v.intrinsic.map(|i| i.1 as u32).unwrap_or(0),
+            )
+        });
+        assert!(den >= 2, "HEIF 首解应为展示尺寸档而非全解：den={den}");
+        assert!(w >= 200 && h >= 150, "输出不得低于展示需要（不糊）：{w}×{h}");
+        // 放大：需要超全量 → 升档 1/1 全解
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.display_need = (2000.0, 1500.0);
+                v.escalate_display_denom(cx);
+            })
+        });
+        flush(cx);
+        let (d1, w1, h1) = cx.update(|app| {
+            let v = viewer.read(app);
+            (
+                v.display_denom,
+                v.intrinsic.map(|i| i.0 as u32).unwrap_or(0),
+                v.intrinsic.map(|i| i.1 as u32).unwrap_or(0),
+            )
+        });
+        assert_eq!(d1, 1, "放大超全量应升档 1/1 全解，而非停在降档");
+        let full_bytes = std::fs::read(&p).unwrap();
+        let (_, fw, fh) = decode_generic(&full_bytes).expect("全解基准应成功");
+        assert_eq!((w1, h1), (fw, fh), "升档后应为全解尺寸");
+    }
+
+    /// 重型并发闸状态机：模拟 HEAVY_DECODE_MAX 路 HEIF 在途 → ①重型目标进
+    /// `pending_target` 等空位（不派发、不计数）②重型预取直接放弃（不改 pending_target）
+    /// ③非重型 PNG 不受重型闸 → 立即派发 ④空位放出（重型计数自减）→ `drain_pending`
+    /// 重入队即放行。用最轻合成语料副本；缺语料 → SKIP。
+    #[gpui::test]
+    async fn heif_heavy_cap_gates_target_abandons_prefetch_and_lets_light_through(
+        cx: &mut TestAppContext,
+    ) {
+        const HEAVY: usize = config::image::HEAVY_DECODE_MAX;
+        let dir = tmp_dir("heif_cap");
+        let synth = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../Benchmarks/corpus/heif/synth-photo-fuji-1600x900-main8.heic"
+        );
+        if !std::path::Path::new(synth).exists() {
+            println!("SKIP: missing {synth}");
+            return;
+        }
+        let (a, b, c) = (dir.join("a.heic"), dir.join("b.heic"), dir.join("c.heic"));
+        std::fs::copy(synth, &a).unwrap();
+        std::fs::copy(synth, &b).unwrap();
+        std::fs::copy(synth, &c).unwrap();
+        let png = dir.join("light.png");
+        write_png(&png, 64, 64);
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(a.clone(), cx)));
+        // 模拟 HEAVY_DECODE_MAX 路 HEIF 已在途：重型并发满
+        cx.update(|app| viewer.update(app, |v, _| v.heavy_inflight = HEAVY));
+        // ① 重型**目标** → 进 pending_target 等空位，不派发、重型计数不增
+        cx.update(|app| viewer.update(app, |v, cx| v.queue_decode(b.clone(), true, cx)));
+        let (pending, b_on, heavy) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.pending_target.clone(), v.in_flight.contains(&b), v.heavy_inflight)
+        });
+        assert_eq!(pending.as_deref(), Some(b.as_path()), "重型目标应记 pending_target");
+        assert!(!b_on, "重型目标在并发满时不得立即派发");
+        assert_eq!(heavy, HEAVY, "被闸拒绝的请求不得计入重型在途");
+        // ② 重型**预取** → 直接放弃：pending_target 不变、不派发
+        cx.update(|app| viewer.update(app, |v, cx| v.queue_decode(c.clone(), false, cx)));
+        let (pending2, c_on) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.pending_target.clone(), v.in_flight.contains(&c))
+        });
+        assert_eq!(pending2.as_deref(), Some(b.as_path()), "重型预取放弃不得改 pending_target");
+        assert!(!c_on, "重型预取应直接放弃");
+        // ③ 非重型（PNG 预取）不受重型闸 → 立即派发，也不参与重型计数
+        cx.update(|app| viewer.update(app, |v, cx| v.queue_decode(png.clone(), false, cx)));
+        let (png_on, heavy2) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.in_flight.contains(&png), v.heavy_inflight)
+        });
+        assert!(png_on, "PNG 不受重型并发闸限制（MAX_DECODE=8 语义保持）");
+        assert_eq!(heavy2, HEAVY, "PNG 不参与重型计数");
+        // ④ 空位放出（重型计数 2→1）→ drain_pending 重入队：重型目标应放行派发
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.heavy_inflight = HEAVY - 1;
+                v.drain_pending(cx);
+            })
+        });
+        let (b_on2,) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.in_flight.contains(&b),)
+        });
+        assert!(b_on2, "空位放出后重型目标应放行派发");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 编码一张 N 帧测试 GIF（每帧统一 4×3 逻辑屏全画布；(0,0) 像素为 `color`、帧 delay 为

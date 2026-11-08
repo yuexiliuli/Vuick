@@ -12,13 +12,14 @@ use gpui::{Context, RenderImage};
 use kimg::Frame;
 
 use config::image::{
-    CACHE_MAX_BYTES, CACHE_MAX_ITEMS, MAX_DECODE, PREFETCH_BACKWARD, PREFETCH_FORWARD,
-    PREFETCH_FORWARD_FAST,
+    CACHE_MAX_BYTES, CACHE_MAX_ITEMS, HEAVY_DECODE_MAX, MAX_DECODE, PREFETCH_BACKWARD,
+    PREFETCH_FORWARD, PREFETCH_FORWARD_FAST,
 };
 
 use super::{
     bgra_single_frame, decode_background, decode_jpeg_display, extract_exif_jpeg_thumbnail,
-    path_is_jpeg, pick_jpeg_denom, read_head, ByteEntry, CacheEntry, DISPLAY_NEED_INIT,
+    is_heavy_format, path_is_jpeg, pick_jpeg_denom, read_head, ByteEntry, CacheEntry,
+    DISPLAY_NEED_INIT,
 };
 
 /// EXIF APP1 探读上限（字节）：EXIF 段及其内嵌缩略图都位于文件头（APP1 长度 16 位、
@@ -84,7 +85,9 @@ impl super::ImageViewer {
 
     /// 解码池入队：已在解 → 等其落盘追最新；已缓存 → 直接落盘；并发满（[`MAX_DECODE`]）
     /// → 仅**显示目标**（`is_target`）记入 [`pending_target`] 等空位（预取在满时直接放弃）；
-    /// 否则派发并行解码。`in_flight` 去重。
+    /// 否则派发并行解码。`in_flight` 去重。**重型格式**（HEIF）在途数 ≥
+    /// [`HEAVY_DECODE_MAX`] 时同款：目标记 [pending_target]、预取放弃（见
+    /// [`Self::spawn_decode`] 内的重型闸）。
     pub(super) fn queue_decode(&mut self, path: PathBuf, is_target: bool, cx: &mut Context<Self>) {
         if self.in_flight.contains(&path) {
             return;
@@ -104,16 +107,57 @@ impl super::ImageViewer {
         self.spawn_decode(path, !is_target, cx);
     }
 
+    /// 判定路径是否为**重型格式**（HEIF/HEIC，受 [`HEAVY_DECODE_MAX`] 并发上限约束）：
+    /// 优先用调用方已取的缓存字节（零 IO）做字节判定；没有时用字节缓存，再没有才读
+    /// **文件头部**（`ftyp` box 在文件首 64 字节内）——以字节为准、零全量读盘。扩展名
+    /// 非 heif 系直接放行（零 IO 快速路径；伪装成其它扩展名的 HEIF 在解码层仍按
+    /// [`decode_background`] 的字节分支降档，只是不享受并发上限——可接受的口径差）。
+    fn path_is_heavy(&mut self, path: &Path, have: Option<&[u8]>) -> bool {
+        let ext_heif = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "heic" | "heif" | "hif"));
+        if !ext_heif {
+            return false;
+        }
+        match have {
+            Some(bytes) => is_heavy_format(bytes),
+            None => {
+                if let Some(arc) = self.byte_cache_get(path) {
+                    is_heavy_format(&arc)
+                } else {
+                    read_head(path, 64).is_some_and(|h| is_heavy_format(&h))
+                }
+            }
+        }
+    }
+
     /// 派发一次并行解码（解码池槽位之一）：优先用字节缓存里的内存字节，否则后台读盘并把
-    /// 字节回填缓存（重解码不重读盘）。按当前「展示像素需要」解码（JPEG/PNG 走自研 kimg
-    /// 全解 + 盒式降档直出 BGRA；其它格式走 `image` 全解）。结果只进缓存；仅当「仍是当前
-    /// 显示目标」才上屏。
+    /// 字节回填缓存（重解码不重读盘）。按当前「展示像素需要」解码（JPEG/PNG/HEIF 走自研
+    /// kimg 全解 + 盒式降档直出 BGRA；其它格式走 `image` 全解）。结果只进缓存；仅当「仍是
+    /// 当前显示目标」才上屏。
+    ///
+    /// **重型格式并发闸**（[`HEAVY_DECODE_MAX`]）：HEIF 全解秒级 + 数十 MB RGBA，8 路并发
+    /// 会把核长期打满→ 在途重型数 ≥ 上限时，目标记 [`pending_target`] 等空位、预取直接
+    /// 放弃（不占解码槽）；JPEG/PNG/GIF 不受此限。重型计数在**派发前**自增、完成后自减
+    /// （配对 1:1，被闸拒绝的请求不计数）。
     fn spawn_decode(&mut self, path: PathBuf, is_prefetch: bool, cx: &mut Context<Self>) {
+        let bytes = self.byte_cache_get(&path);
+        let heavy = self.path_is_heavy(&path, bytes.as_ref().map(|b| &b[..]));
+        // 先于 in_flight.insert：重型并发闸拒绝时不产生在途、不占槽位
+        if heavy && self.heavy_inflight >= HEAVY_DECODE_MAX {
+            if !is_prefetch {
+                self.pending_target = Some(path);
+            }
+            return;
+        }
         self.in_flight.insert(path.clone());
+        if heavy {
+            self.heavy_inflight += 1;
+        }
         if is_prefetch {
             self.prefetch_inflight += 1;
         }
-        let bytes = self.byte_cache_get(&path);
         let decode_path = path;
         let read_path = decode_path.clone();
         let need = self.display_need;
@@ -134,6 +178,9 @@ impl super::ImageViewer {
                 this.in_flight.remove(&decode_path);
                 if is_prefetch {
                     this.prefetch_inflight -= 1;
+                }
+                if heavy {
+                    this.heavy_inflight = this.heavy_inflight.saturating_sub(1);
                 }
                 match outcome {
                     Ok((raw, decoded)) => {
@@ -186,8 +233,9 @@ impl super::ImageViewer {
     }
 
     /// 并发槽空出后的兜底：把「最新显示目标」重新入队（已在解 / 已缓存的情况下
-    /// [`Self::queue_decode`] 自行处理）。
-    fn drain_pending(&mut self, cx: &mut Context<Self>) {
+    /// [`Self::queue_decode`] 自行处理；重型闸挂起的目标同样在此放出：重型计数已自减、
+    /// 重入队列即通过闸）。
+    pub(super) fn drain_pending(&mut self, cx: &mut Context<Self>) {
         if let Some(p) = self.pending_target.take() {
             self.queue_decode(p, true, cx);
         }

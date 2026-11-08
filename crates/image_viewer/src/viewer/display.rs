@@ -61,15 +61,19 @@ impl ImageViewer {
         out
     }
 
-    /// 居中占位文本（加载中 / 加载失败共用）。
-    fn placeholder(text: &str, color: Hsla) -> gpui::AnyElement {
+    /// 居中占位文本（加载中 / 加载失败共用）。`max_w` 给定则文本限定到该宽度内**自动换行**
+    /// （错误长文案不被窗口横向截断；`None` 不限宽，供「正在加载」短文案）。
+    fn placeholder(text: &str, color: Hsla, max_w: Option<f32>) -> gpui::AnyElement {
+        let mut txt = div().text_size(px(14.)).text_color(color);
+        if let Some(w) = max_w {
+            txt = txt.max_w(px(w));
+        }
         div()
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(14.))
-            .text_color(color)
-            .child(text.to_string())
+            .size_full()
+            .child(txt.child(text.to_string()))
             .into_any_element()
     }
 }
@@ -86,7 +90,12 @@ impl Render for ImageViewer {
         let (vw, vh) = self.last_viewport;
 
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
-            Self::placeholder(&format!("无法打开图片：{err}"), muted)
+            // 错误长文案限定到窗口宽-边距自动换行（避免单行被横向截断首尾缺失）
+            Self::placeholder(
+                &format!("无法打开图片：{err}"),
+                muted,
+                Some((vw - 48.0).max(160.0)),
+            )
         } else if let (Some(render), Some((iw, ih))) = (self.image.clone(), self.intrinsic) {
             let (dw, dh) = self.display_size(iw, ih, vw, vh);
             // 放大后平移：clamp 到图始终覆盖视口（未放大时 pan 恒 0 = 居中；中心锚定缩放不变）
@@ -104,7 +113,7 @@ impl Render for ImageViewer {
                 .h(px(dh))
                 .into_any_element()
         } else {
-            Self::placeholder("正在加载图片…", muted)
+            Self::placeholder("正在加载图片…", muted, None)
         };
 
         // 底部信息条：第几张/共几张 · 缩放百分比（含锁定模式；名称不显示）。

@@ -45,6 +45,12 @@ pub const BYTE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// 同时进行的后台解码上限（含当前目标 + 预取；= 后台线程池逻辑核数上限，8 路并发把
 /// 预热窗口一次铺完；持续 CPU 由「缓存满即停预取」封顶，非无界）。
 pub const MAX_DECODE: usize = 8;
+/// **重型格式**（HEIF/HEIC）并发解码上限：HEIF 单张 debug 全解 2-17s（语料 12.6~50MP）、
+/// 全解 RGBA 48-200MB，8 路并发会把所有核长期打满致 GUI 卡死——重型格式在途数 ≥ 本值时
+/// HEIF 目标进 `pending_target` 等空位、预取直接放弃；JPEG/PNG/GIF 不受此限（仍走
+/// [`MAX_DECODE`]=8）。降档解码本身只省内存/重复解码，单次仍是全解→降采样，故并发行
+/// 必须单独封顶。
+pub const HEAVY_DECODE_MAX: usize = 1;
 /// 触控板「像素滚轮」的一格门限（px）：累计像素滚动超过该值才切一张——把高分辨率
 /// 手势的洪水事件合并成离散步进；普通鼠标的「行滚轮」仍是 1 事件 = 1 张，不受影响。
 pub const WHEEL_PIXEL_STEP: f32 = 24.0;
