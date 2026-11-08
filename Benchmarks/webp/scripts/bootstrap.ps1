@@ -12,15 +12,16 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$SuiteRoot = Split-Path -Parent $PSScriptRoot                    # ...\Benchmarks
-$RepoRoot  = Split-Path -Parent $SuiteRoot                       # ...\gpui-editor（本仓库，相对推导）
+$SuiteRoot  = Split-Path -Parent $PSScriptRoot                   # ...\Benchmarks\webp
+$Benchmarks = Split-Path -Parent $SuiteRoot                      # ...\Benchmarks（共享语料/ C# 表所在）
+$RepoRoot   = Split-Path -Parent $Benchmarks                     # ...\gpui-editor（本仓库，相对推导）
 
 # 仓内语料（相对本仓库推导；可在别机用 KIMG_CORPUS_INTERNAL 覆盖）
 $InclCorpus = if ($env:KIMG_CORPUS_INTERNAL) { $env:KIMG_CORPUS_INTERNAL } else { Join-Path $RepoRoot 'target\imgbench-corpus\WEBP' }
 
-$webpDst   = Join-Path $SuiteRoot 'corpus\webp'
-$csharpDst = Join-Path $SuiteRoot 'corpus\csharp'
-$dllDst    = Join-Path $SuiteRoot 'libwebp'
+$webpDst   = Join-Path $Benchmarks 'corpus\webp'
+$csharpDst = Join-Path $Benchmarks 'corpus\csharp'
+$dllDst    = Join-Path $SuiteRoot 'bin'
 $logsDst   = Join-Path $SuiteRoot 'logs'
 
 foreach ($d in @($webpDst, $csharpDst, $dllDst, $logsDst)) {

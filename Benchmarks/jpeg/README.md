@@ -26,13 +26,36 @@ pwsh -File Benchmarks\jpeg\scripts\run_acceptance.ps1
 # 结尾一行 `ours÷turbo geomean=… / ours÷C# geomean=…` 即主口径，完整表在 logs/acceptance_<ts>.log
 ```
 
+## 全新机器装配（git clone 后）
+
+参照 DLL（gitignore，不入库）：`bin/turbojpeg.dll` 缺失时自动从 MSYS2 固定版本装配。
+
+```powershell
+pwsh -File Benchmarks\jpeg\scripts\ensure_refs.ps1     # 缺失 → 下载+解压+SHA 校验+就位；已就位 → no-op
+pwsh -File Benchmarks\jpeg\scripts\run_acceptance.ps1  # 前置检查会自动 ensure；仍缺才报错并给出手动命令
+```
+
+- **DLL 来源 = MSYS2 mingw-w64-x86_64-libjpeg-turbo 3.2.1-1（SHA-256 钉版）**，URL/SHA 见
+  `scripts/ensure_refs.ps1` 顶部固定版本表：`mingw64/bin/libturbojpeg.dll` → `bin/turbojpeg.dll`
+  （soname = `libturbojpeg.dll`；TurboJPEG 3.x C ABI 跨编译兼容，探针只经 kernel32 黑盒调用，tj2/tj3 均可）。
+  *数值注意*：mingw 构建与本机「官方 vc64 3.2.0」构建解码速度可能略有差异（编译器/指令集选择不同），
+  跨机 `ours/turbo` 比值参照一致；与本机既有呈现做绝对值对比时差异属预期。
+- **C# 参照**需 .NET（10.x）+ Sdcb.SimdCodecs 源（`SDCB_ROOT`，缺省 `<repo>\..\SimdCodecs`（当前项目父目录）或 clone
+  `https://github.com/sdcb/Sdcb.SimdCodecs`）+ 语料矩阵：
+  ```powershell
+  pwsh -File Benchmarks\jpeg\scripts\setup_jpeg_corpus.ps1   # 一键：下载 16 源图（Wikimedia）→ dotnet prepare 446 → 平铺复制
+  pwsh -File Benchmarks\jpeg\scripts\run_csharp_ref.ps1      # 生成 jpeg_csharp.log + target/csharp-ref
+  ```
+- **语料**（gitignore，跨机重建或从原机拷贝）：446 全集在 `Benchmarks/corpus/JPEG_FULL`，
+  20 张快速集在 `Benchmarks/corpus/JPEG`（acceptance 默认用）；均由 `setup_jpeg_corpus.ps1`
+  的 446 矩阵产物整理而来，缺失时探针 SKIP 而非回归。
 ## progressive 探针（prog_scanp / prog_maskp）
 
 `-prog` 组（`420-q75-3mp-prog__*` / `420-q95-3mp-prog__*`，共 20 张）是 446 矩阵里的
 progressive 文件；两条探针按 `-prog` 组名过滤，`prog_files` 应 = 20。
 
 ```powershell
-$env:KIMG_JPEG_CORPUS='E:\Rust\gpui-editor\Benchmarks\corpus\JPEG'
+$env:KIMG_JPEG_CORPUS=(Resolve-Path 'Benchmarks\corpus\JPEG')
 $env:KIMG_JPEG_SCAN_PROFILE='1'
 cargo test -p kimg_jpeg --release --test prog_scanp -- --ignored --nocapture   # SCANP 逐 scan 墙钟占比
 $env:KIMG_JPEG_PROG_MASK_PROFILE='1'

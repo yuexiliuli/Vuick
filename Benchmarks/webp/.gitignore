@@ -1,0 +1,11 @@
+# WebP 复现套件：数据与构建产物一律不入库（scripts/bootstrap.ps1 可再生成）。
+# 语料快照与 C# 表在共享 Benchmarks/corpus/（根 .gitignore 管辖），此文件只管 webp/ 套件内产物。
+/bin/
+/logs/
+/target/
+*.log
+
+# 探针 crate 是独立 workspace 根，构建产物在其自身目录下（默认 target，未设 target-dir）。
+# Cargo.lock 不入库：依赖 kimg 走 path。
+compare/target/
+compare/Cargo.lock

@@ -3,7 +3,7 @@
 # 用法：pwsh -File Benchmarks\jpeg\scripts\setup_jpeg_corpus.ps1 [-SimdCodecsRoot <dir>] [-ForceReDownload] [-ForcePrepare] [-ForceFlatten]
 # 依赖：dotnet（10.x，%LOCALAPPDATA%\Microsoft\dotnet\dotnet.exe）、System32 curl、python、网络（Wikimedia ~440MB，慢/不稳时用代理或 VPN 重试）。
 param(
-    [string]$SimdCodecsRoot = $(if ($env:SDCB_ROOT) { $env:SDCB_ROOT } else { 'E:\Rust\SimdCodecs' }),
+    [string]$SimdCodecsRoot = $(if ($env:SDCB_ROOT) { $env:SDCB_ROOT } else { Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) '..\..\..') 'SimdCodecs' }),
     [switch]$ForceReDownload,
     [switch]$ForcePrepare,
     [switch]$ForceFlatten
@@ -13,6 +13,10 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Resolve-Path (Join-Path $here '..\..\..')
 $suite = Resolve-Path (Join-Path $here '..')
 
+if (-not (Test-Path $SimdCodecsRoot)) {
+    Write-Error "❓ 未找到 Sdcb.SimdCodecs 源（缺省 <repo>\..\SimdCodecs）。请将其克隆/移动到该位置，或设 env SDCB_ROOT 指向真实路径"
+    exit 1
+}
 $benchDir = Join-Path $SimdCodecsRoot 'benchmarks\Sdcb.SimdCodecs.Jpeg.Benchmarks'
 $manifest = Join-Path $benchDir 'corpus\manifest.tsv'
 $originals = Join-Path $benchDir '.cache\corpus\originals'

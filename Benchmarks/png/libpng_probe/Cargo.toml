@@ -1,0 +1,19 @@
+[package]
+name = "kimg_png_vs_libpng"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 独立 workspace 根：kimg_png（OURS） vs 真机 libpng（DLL）单核对拍探针。
+# 位于仓库工作区目录树内（Benchmarks/png/libpng_probe），自身声明为 workspace 根避免 cargo
+# 把根仓库 workspace 误认为本包所属；依赖用相对路径（../../../crates/...），默认 target
+# 即本目录下 target/（独立于根仓库）。
+
+[workspace]
+
+[dependencies]
+kimg_png = { path = "../../../crates/kimg_png" }
+kimg_core = { path = "../../../crates/kimg_core" }
+
+[profile.release]
+opt-level = 3

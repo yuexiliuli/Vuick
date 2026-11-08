@@ -1,0 +1,24 @@
+[package]
+name = "kimg_png_vs_csharp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 独立 workspace 根：探针位于仓库工作区目录树内（Benchmarks/png/probe），声明自身为 workspace 根，
+# 避免 cargo 把根仓库 workspace 误认为本包所属；默认 target 即本目录下 target/（独立于根仓库）。
+
+[workspace]
+
+[dependencies]
+kimg_png = { path = "../../../crates/kimg_png" }
+kimg_core = { path = "../../../crates/kimg_core" }
+
+# 分阶段墙钟探针（诊断用）：开启 kimg_png 的 `stage_profile` feature（decode 内 inflate/unfilter/
+# expand/copy 逐阶段计时）。acceptance 默认不带本 feature → 精确测量（零插桩，K83 通胀规避）；
+# 分账单独 `--features stage-profile` 构建 + KIMG_PNG_STAGE_PROFILE=1 跑。
+[features]
+stage-profile = ["kimg_png/stage_profile"]
+
+# 速度向可比口径（对照 C# Release + Optimize；独立探针按 release opt-level=3）。
+[profile.release]
+opt-level = 3

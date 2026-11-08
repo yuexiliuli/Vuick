@@ -5,8 +5,8 @@
 //!
 //! 运行：
 //!   $env:KIMG_WEBP_THREADS=0            # 0=强制单线程；不设 = 默认 MT（auto）
-//!   $env:LIBWEBP_DLL=...                # 可覆盖；默认 = 探针 crate 相对 ../libwebp/libwebp.dll
-//!   cargo run --release --manifest-path ...\Benchmarks\webp_compare\Cargo.toml
+//!   $env:LIBWEBP_DLL=...                # 可覆盖；默认 = 探针 crate 相对 ../bin/libwebp.dll
+//!   cargo run --release --manifest-path ...\Benchmarks\webp\compare\Cargo.toml
 
 use std::ffi::c_void;
 use std::io::Cursor;
@@ -271,7 +271,7 @@ fn main() {
     // OURS 后端（M6 后默认即 ours，仍显式设以明确口径）。
     unsafe { std::env::set_var("KIMG_WEBP_BACKEND", "ours") };
     let dll_path = std::env::var("LIBWEBP_DLL").unwrap_or_else(|_| {
-        format!("{}/../libwebp/libwebp.dll", env!("CARGO_MANIFEST_DIR"))
+        format!("{}/../bin/libwebp.dll", env!("CARGO_MANIFEST_DIR"))
     });
     let dll = load_dll(&dll_path).expect("装载 libwebp DLL 失败");
 
@@ -279,14 +279,14 @@ fn main() {
         "KIMG_WEBP_VS_DLL profile=release(json imgbench) rounds={ROUNDS} libwebp_dll={dll_path}"
     );
 
-    // 语料：bootstrap 已把 `target/imgbench-corpus/WEBP`(20) + `E:\Rust\SimdCodecs\测试图片\WEBP`(52)
+    // 语料：bootstrap 已把 `target/imgbench-corpus/WEBP`(20) + `SDCB_ROOT\测试图片\WEBP`(52)
     // 快照进套件 `corpus/webp`（文件名去重 72）。默认探针所在 crate 的相对路径；
     // `KIMG_WEBP_VS_DLL_CORPUS`（`;` 分隔多目录）可覆盖，保留多源语料口。
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let corpus_dirs: Vec<String> = std::env::var("KIMG_WEBP_VS_DLL_CORPUS")
         .map(|v| v.split(';').map(|s| s.to_string()).collect())
         .unwrap_or_else(|_| {
-            vec![format!("{}/../corpus/webp", env!("CARGO_MANIFEST_DIR"))]
+            vec![format!("{}/../../corpus/webp", env!("CARGO_MANIFEST_DIR"))]
         });
     for d in corpus_dirs {
         collect_dir(std::path::Path::new(&d), &mut files);

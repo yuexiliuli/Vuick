@@ -13,7 +13,7 @@
 //   baseline-420-q90 / baseline-444-q90 / baseline-gray-q85 /
 //   progressive-420-q80 / progressive-444-q80 / baseline-420-q80-rst16（RST 覆盖）
 // 命名 <stem>__<variant>.jpg。质量/subsampling/progressive/RestartInterval 均走公开 API
-// （JpegEncodeOptions，见 E:\Rust\SimdCodecs\src\Sdcb.SimdCodecs.Jpeg\JpegEncodeOptions.cs）。
+// （JpegEncodeOptions，见 SDCB_ROOT\src\Sdcb.SimdCodecs.Jpeg\JpegEncodeOptions.cs）。
 
 using System.Diagnostics;
 using System.Globalization;
@@ -69,6 +69,29 @@ static int RunRef(string[] args)
     }
 
     var files = CollectFiles(corpusDir);
+
+    // 全局暖机（2026-11-08 重基线）：整集解码一遍不计时，令 JIT/Tiered 编译与逐方法 tier0→tier1
+    // 提升在计时前全部收敛——否则字典序遍历（CollectFiles/Ordinal）把首调伪影落在语料前几个文件
+    // （曾在 420-q100-0.5mp 前 3 张测出 11.98/10.34/12.03ms，≈ 同桶其余 7 张 2.4-4.6ms 的 3 倍）。
+    // 单线程、不计时、不改变解码输出语义、不引入伪减速；坏文件静默跳过（主循环自会 # ERR）。
+    foreach (var path in files)
+    {
+        try
+        {
+            byte[] wdata = File.ReadAllBytes(path);
+            JpegInfo wi = JpegDecoder.ReadInfo(wdata, null);
+            bool wGray = wi.Components == 1;
+            int wBpp = rgba ? 4 : (wGray ? 1 : 3);
+            int wStride = checked(wi.Width * wBpp);
+            byte[] wDest = new byte[checked(wStride * wi.Height)];
+            var wFmt = rgba ? JpegPixelFormat.Rgba32 : (wGray ? JpegPixelFormat.Gray8 : JpegPixelFormat.Rgb24);
+            JpegDecoder.DecodeTo(wdata, wDest, wStride, wFmt, JpegScale.Full);
+        }
+        catch
+        {
+            // 暖机失败忽略
+        }
+    }
 
     int done = 0;
     foreach (var path in files)
@@ -277,9 +300,9 @@ static void Usage()
     Console.Error.WriteLine("用法: JpegRef <ref|encode> <srcDir> <outDir>");
 }
 
-static double MedianMs(Action action, int rounds)
+static double MedianMs(Action action, int rounds, int warm = 2)
 {
-    action(); // 暖机 1 轮
+    for (int i = 0; i < warm; i++) { action(); } // 预热 warm 轮（不计时，丢弃）
     var acc = new double[rounds];
     for (int i = 0; i < rounds; i++)
     {

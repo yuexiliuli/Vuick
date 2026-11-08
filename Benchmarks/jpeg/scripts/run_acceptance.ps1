@@ -19,16 +19,22 @@ $corpus = Join-Path $root 'Benchmarks\corpus\JPEG'
 $turboDll = Join-Path $suite 'bin\turbojpeg.dll'
 $probeManifest = Join-Path $suite 'probe\Cargo.toml'
 $csharpLog = Join-Path $root 'Benchmarks\corpus\csharp\jpeg_csharp.log'
-$refOut = Join-Path $root 'target\csharp-ref'
+$refOut = Join-Path $root 'target\csharp-ref\jpeg'
 
 Write-Host "root=$root"; Write-Host "log=$log"
 '=' * 20 | Tee-Object -FilePath $log
 
 # 0) 前置检查
 if (-not (Test-Path $corpus))   { Write-Error "corpus 不存在: $corpus" }
-if (-not (Test-Path $turboDll)) { Write-Error "turbojpeg.dll 不存在: $turboDll（先安置 bin/turbojpeg.dll）" }
+# 0a) 参照 DLL 自动装配（turbojpeg.dll：跨机缺失时从 MSYS2 自动下载；已就位 → no-op）
+if (-not (Test-Path $turboDll)) {
+    & (Join-Path $here 'ensure_refs.ps1')
+    if (-not (Test-Path $turboDll)) {
+        Write-Error "turbojpeg.dll 缺失且自动装配失败：$turboDll — 手动跑 pwsh -File $here\ensure_refs.ps1（下载源见其固定版本表）"
+    }
+}
 if (-not (Test-Path $refOut) -or @(Get-ChildItem $refOut -File -ErrorAction SilentlyContinue).Count -eq 0) {
-    Write-Error "target\csharp-ref 为空 — 先跑 pwsh -File Benchmarks\jpeg\scripts\run_csharp_ref.ps1"
+    Write-Error "target\csharp-ref\jpeg 为空 — 先跑 pwsh -File Benchmarks\jpeg\scripts\run_csharp_ref.ps1"
 }
 
 # 1) oracle 闸（debug，字节恒等全量；FAILED 即停）
