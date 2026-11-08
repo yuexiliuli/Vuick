@@ -9,7 +9,6 @@ description = "gpui-editor 图片查看器 crate（后台解码 + 文件夹轮�
 gpui = { workspace = true }
 kimg = { workspace = true }
 rayon = { workspace = true }
-libjpeg-turbo-rs = { workspace = true }
 config = { path = "../config" }
 ui = { path = "../ui" }
 viewer = { path = "../viewer" }

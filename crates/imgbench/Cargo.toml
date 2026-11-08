@@ -24,13 +24,6 @@ libwebp-sys = { version = "0.14.4", optional = true }
 # member、主链无人消费，故 C 构建不影响主链。绝不进 kimg 主线（见 benches/inflate_probe.rs）。
 # 注意：同一包不允许 dev+optional 双名并存（Cargo 报 multiple times），故只作普通依赖。
 flate2 = "1.1"
-# 可选对照通道：libjpeg-turbo-rs 0.8 pure-Rust SIMD（workspace 版本，与 image_viewer 同源）。
-# 仅 `libjpeg-turbo-ref` feature 下启用；未启用时 benches/gif_jpeg_bmp_release_bench.rs
-# 的 turbo 列输出 N/A。kimg/editor 主链不消费本 crate，不启用则不进依赖图。
-libjpeg-turbo-rs = { workspace = true, optional = true }
-# 临时 BMP 对照通道（测完即删）：kimg 替换前的 `image` crate 0.25.10 解码性能对比
-# （`image-ref` feature 门控）。会临时把 crates.io image 树拉回 lock，测完还原，勿长期保留。
-image = { version = "0.25.10", optional = true }
 
 [features]
 default = []
@@ -47,11 +40,6 @@ libwebp-ref = ["dep:libwebp-sys"]
 # IDAT 解压后端对比探针（fdeflate 纯 Rust vs C zlib-ng），量化「纯解压天花板」。imgbench
 # 专属 dev 探针；feature 未开时 benches/inflate_probe.rs 打印 N/A。
 inflate-probe = ["flate2/zlib-ng"]
-# 临时 BMP 对照通道：image crate 0.25.10（kimg 替换前的后端）。测完即删，勿长期保留。
-image-ref = ["dep:image"]
-# 启用 libjpeg-turbo-rs 0.8 SIMD 参考对照通道（bench 专用，仅 JPEG）。未启用时
-# benches/gif_jpeg_bmp_release_bench.rs 的 turbo 列输出 N/A。属纯 Rust，无 C 构建。
-libjpeg-turbo-ref = ["dep:libjpeg-turbo-rs"]
 
 [dev-dependencies]
 # 仅 bench 夹具构建用：手工 Adam7 PNG 需要 zlib 压缩（ZlibEncoder）、chunk CRC 用 crc32fast。

@@ -22,10 +22,11 @@
 //! - **解码结果 LRU 缓存**（张数 + 字节双上限）：命中即 O(1) 瞬时上屏。
 //!
 //! # 大图打开/滚动（school 20MP 照片，CPU/内存双降 + 清晰）
-//! - **按展示像素解码（decode to display size）**：JPEG 走 `libjpeg-turbo`（纯 Rust SIMD：
-//!   AVX2/SSE2 IDCT 降档 + 直出 BGRA，无 `DynamicImage` 中间拷贝）按 [`Self::display_need`]
-//!   档位解码。选档规则 = **解码分辨率 ≥ 显示需要的像素**（上限 1/8，需要涨则分母落，
-//!   需要超过原图才全解）——GPU 只缩小不放大 → **显示不糊**；单帧内存 75MB→~20MB。
+//! - **按展示像素解码（decode to display size）**：JPEG 走自研 `kimg` 全量解出 RGBA8 后，
+//!   与 PNG 同款**盒式降采样**到展示档（无 `DynamicImage` 中间拷贝之外的额外开销），
+//!   按 [`Self::display_need`] 档位解码。选档规则 = **解码分辨率 ≥ 显示需要的像素**
+//!   （上限 1/8，需要涨则分母落，需要超过原图才全解）——GPU 只缩小不放大 → **显示不糊**；
+//!   单帧内存 75MB→~20MB。
 //! - **PNG 同款降档**：PNG 走 `kimg::codecs::png::PngDecoder` 全量解出 RGBA8（palette/
 //!   灰度/16bit 展开归一）后按同一选档规则**盒式降采样**到展示档（rayon 行组并行，小图
 //!   退串行）——缓存/GPU 上传像素数按 den² 缩小，放大升档链路与 JPEG 对齐。
@@ -60,7 +61,6 @@ use std::sync::Arc;
 
 use gpui::{App, Context, Hsla, RenderImage, ScrollHandle, Window};
 use kimg::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
-use libjpeg_turbo_rs::{Decoder as LtjDecoder, PixelFormat as LtjPixelFormat, ScalingFactor};
 
 use config::image::{BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS};
 // 以下常量仅 `mod tests`（`use super::*`）以裸名直取；非测试构建不导入，避免未用告警。
@@ -91,8 +91,8 @@ struct CacheEntry {
     render: Arc<RenderImage>,
     intrinsic: (f32, f32),
     bytes: usize,
-    /// 实际解码降档分母（1/8/4/2/1）：JPEG 走 libjpeg-turbo IDCT 降档、PNG 走盒式降采样，
-    /// 二者共用 [`pick_jpeg_denom`] 选档；其它格式恒 1。用于「升档判定」：展示分母 >
+    /// 实际解码降档分母（1/8/4/2/1）：JPEG/PNG 共用 [`pick_jpeg_denom`] 选档（JPEG 全解后
+    /// 盒式降采样、PNG 盒式降采样），其它格式恒 1。用于「升档判定」：展示分母 >
     /// 当前需要分母（= 解码比显示更粗）时按需重解更细档（放大时）。
     denom: u8,
     /// 动图（GIF）逐帧切片：每帧一个**独立单帧** `RenderImage` + 各自时长；`None` = 静态图。
@@ -514,7 +514,7 @@ impl ImageViewer {
     }
 }
 
-/// JPEG 魔数（FF D8 FF）检测：区分「JPEG 走 libjpeg-turbo 降档」与「其它格式走 image 全解」。
+/// JPEG 魔数（FF D8 FF）检测：区分「JPEG 走展示档降档解码」与「其它格式走 image 全解」。
 /// 以字节为准，比扩展名可信（伪装成 .jpg 的其它格式不会被误当 JPEG 硬解）。
 fn is_jpeg_magic(b: &[u8]) -> bool {
     b.starts_with(&[0xFF, 0xD8, 0xFF])
@@ -552,8 +552,8 @@ fn read_head(path: &Path, n: usize) -> Option<Vec<u8>> {
 /// 从 JPEG 的 EXIF APP1（TIFF IFD1 的 0x0201/0x0202）提取嵌入缩略图 JPEG 字节。
 ///
 /// 手机照片（school 已实测）在 APP1-Exif 的 TIFF IFD1 常嵌一张 ~160px 缩略 JPEG——冷打开
-/// 先显它（几 ms）再让展示档真图替换，消除「首帧空等熵解码」。仓库依赖 `libjpeg-turbo-rs`
-/// 的 `extract_embedded_jpeg` 只解 **TIFF-RAW** 容器、`extract_jfif_thumbnail` 只解 **APP0-JFIF**，
+/// 先显它（几 ms）再让展示档真图替换，消除「首帧空等熵解码」。既有库的
+/// `extract_embedded_jpeg` 只解 **TIFF-RAW** 容器、`extract_jfif_thumbnail` 只解 **APP0-JFIF**，
 /// 都不读 JPEG 的 EXIF APP1，故自实现最小「APP 段扫描 + TIFF-IFD 遍历」（纯字节、零依赖）。
 fn extract_exif_jpeg_thumbnail(data: &[u8]) -> Option<Vec<u8>> {
     let mut i = 2usize; // 跳过 SOI（FFD8）
@@ -667,23 +667,25 @@ fn pick_jpeg_denom(iw: u32, ih: u32, need: (f32, f32)) -> u8 {
     1
 }
 
-/// JPEG 按展示需要**降档解码**（libjpeg-turbo SIMD，IDCT 缩放 + 直出 BGRA，无中间拷贝）：
-/// 返回 BGRA 字节 + 输出尺寸 + 实际降档分母。`probe` 先读头拿完整尺寸再选档。
+/// JPEG 按展示需要**降档解码**（自研 `kimg` 全量解出 RGBA8 → 与 PNG 同款盒式降采样到
+/// 展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。先用 kimg 解码拿完整尺寸再选档，
+/// 失败返回 `Err`（由上层回退 `image` 全解），绝不 panic/硬失败。
 fn decode_jpeg_display(
     bytes: &[u8],
     need: (f32, f32),
 ) -> Result<(Vec<u8>, u32, u32, u8), String> {
-    let info = libjpeg_turbo_rs::probe(bytes)
-        .map_err(|e| format!("JPEG 读取头部失败：{e}"))?;
-    let (iw, ih) = (info.width as u32, info.height as u32);
+    let img = kimg::load_from_memory(bytes).map_err(|e| format!("JPEG 解码失败：{e}"))?;
+    let (iw, ih) = img.dimensions();
     let den = pick_jpeg_denom(iw, ih, need);
-    let mut dec = LtjDecoder::new(bytes).map_err(|e| format!("JPEG 解码器初始化失败：{e}"))?;
-    dec.set_scale(ScalingFactor::new(1, u32::from(den)));
-    dec.set_output_format(LtjPixelFormat::Bgra);
-    let img = dec
-        .decode_image()
-        .map_err(|e| format!("JPEG 解码失败：{e}"))?;
-    Ok((img.data, img.width as u32, img.height as u32, den))
+    let mut rgba = img.to_rgba8();
+    if den == 1 {
+        // den=1：全解直出（RGBA→BGRA 交换，尺寸=原始）
+        swap_rb_in_place(rgba.as_mut());
+        return Ok((rgba.into_raw(), iw, ih, 1));
+    }
+    let (mut bgra, w, h) = box_downsample_bgra_or_rgba_rayon(rgba.as_raw(), iw, ih, den);
+    swap_rb_in_place(bgra.as_mut());
+    Ok((bgra, w, h, den))
 }
 
 /// 盒式降采样并行阈值（输入像素数）：低于则用单线程，避免 rayon 线程池分摊/派发开销
@@ -988,10 +990,10 @@ fn decode_generic(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
     }
 }
 
-/// 后台解码总入口：JPEG → libjpeg-turbo 按展示需要降档直出 BGRA（特殊 JPEG 如 CMYK / 12bit /
-/// lossless 解不动时回退 `image` 全解，绝不硬失败）包成单帧；PNG → 展示档降采样解码
-/// （[`decode_png_display`]，失败回退 `image` 全解）；其它 → `image` 全解（GIF 解全帧动图）。
-/// 返回 (BGRA 帧序列, 宽, 高, 降档分母)。den=1 时与改动前逐像素一致。
+/// 后台解码总入口：JPEG → 自研 `kimg` 全解后按展示需要盒式降档出 BGRA（特殊 JPEG 如
+/// CMYK / 12bit / lossless 解不动时回退 `image` 全解，绝不硬失败）包成单帧；PNG → 展示档
+/// 降采样解码（[`decode_png_display`]，失败回退 `image` 全解）；其它 → `image` 全解
+/// （GIF 解全帧动图）。返回 (BGRA 帧序列, 宽, 高, 降档分母)。den=1 时与改动前逐像素一致。
 fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<Frame>, u32, u32, u8), String> {
     if is_jpeg_magic(bytes) {
         match decode_jpeg_display(bytes, need) {
@@ -1757,26 +1759,266 @@ mod tests {
         eprintln!("[GIF-REAL] 渲染冒烟 ✓（解码就绪 + 绘制一帧完成）");
     }
 
-    /// 写一张有内容（渐变）的 JPEG：编码走 `libjpeg-turbo`（`image`(=kimg) 无 JPEG 编码器，
-    /// 其 save 只支持 PNG/GIF）。
+    /// 写一张有内容（渐变）的 JPEG：编码走测试模块内自包含的**最小 baseline JPEG 编码器**
+    /// （[`encode_baseline_jpeg`]：DC-only + 标准 Huffman/量化表，YCbCr 4:4:4 不下采样，
+    /// 零依赖）——`image`(=kimg) 无 JPEG 编码器、其 save 只支持 PNG/GIF（原 turbo 参照
+    /// 通道已移除）。渐变前 8 像素起纯黑（首 8×8 块全 0）→ 解码角点精确
+    /// (0,0,0)，供降档「角点黑 / 右下渐变」断言稳定。
     fn write_jpeg(path: &Path, w: u32, h: u32) {
         let mut img = kimg::RgbImage::new(w, h);
         for (x, y, px) in img.enumerate_pixels_mut() {
-            let r = ((x * 255) / w) as u8;
-            let g = ((y * 255) / h) as u8;
-            let b = ((x + y) * 60 / (w + h)) as u8;
+            // 前 8 像素裁为纯黑（首 8×8 块全 0），其余照旧渐变
+            let (rx, ry) = (x.saturating_sub(8), y.saturating_sub(8));
+            let r = ((rx * 255) / w) as u8;
+            let g = ((ry * 255) / h) as u8;
+            let b = ((rx + ry) * 60 / (w + h)) as u8;
             *px = kimg::Rgb([r, g, b]);
         }
-        let jpeg = libjpeg_turbo_rs::compress(
-            img.as_raw(),
-            w as usize,
-            h as usize,
-            LtjPixelFormat::Rgb,
-            90,
-            libjpeg_turbo_rs::Subsampling::S420,
-        )
-        .expect("libjpeg-turbo 编码渐变 JPEG 应成功");
+        let jpeg = encode_baseline_jpeg(img.as_raw(), w, h);
         std::fs::write(path, jpeg).expect("写出渐变 JPEG 应成功");
+    }
+
+    /// 标准 Annex K 量化表（zigzag 存储序）。本编码器只用 DC 项（索引 0），AC 项仅供
+    /// 解码例行读取；luma DC=16 能整除 1024（纯黑块 DC 精确 -64，解码角点恰为 0）。
+    static LUM_Q: [u8; 64] = [
+        16, 11, 12, 14, 12, 10, 16, 14, 13, 14, 18, 17, 16, 19, 24, 40, 26, 24, 22, 22, 24, 49,
+        35, 37, 29, 40, 58, 51, 61, 60, 57, 51, 56, 55, 64, 72, 92, 78, 64, 68, 87, 69, 55, 56,
+        80, 109, 81, 87, 95, 98, 103, 104, 103, 62, 77, 113, 121, 112, 100, 120, 92, 101, 103,
+        99,
+    ];
+    static CHR_Q: [u8; 64] = [
+        17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99,
+        99, 99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+    ];
+
+    /// 标准 Annex K Huffman 表：bits[i] = 码长 (i+1) 的码字个数，随后 values 为对应符号。
+    static DC_LUM_BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+    static DC_LUM_VAL: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    static DC_CHR_BITS: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+    static DC_CHR_VAL: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    static AC_LUM_BITS: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
+    static AC_LUM_VAL: [u8; 162] = [
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61,
+        0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52,
+        0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25,
+        0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45,
+        0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64,
+        0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83,
+        0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+        0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+        0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3,
+        0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8,
+        0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+    ];
+    static AC_CHR_BITS: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
+    static AC_CHR_VAL: [u8; 162] = [
+        0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61,
+        0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33,
+        0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18,
+        0x19, 0x1a, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44,
+        0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63,
+        0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
+        0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+        0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4,
+        0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca,
+        0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,
+        0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+    ];
+
+    /// 最小 baseline JPEG 编码器（零依赖，测试夹具专用）：把行优先 R/G/B 交错的 `w×h`
+    /// 栅格编码成标准 baseline JPEG 字节流。**只写 DC 系数**（每 8×8 块一 DC + AC 表 EOB，
+    /// AC 恒 0）——这是合法 baseline JPEG 的平凡子集（场景为平坦块渐变图），量化/重构后
+    /// 即「块内均值」，标准 K 表 + 4:4:4 不下采样下任何 baseline 解码器（含自研 kimg_jpeg）
+    /// 都能解。**O(像素)** 纯遍历：5120×3840 20MP 亦即时完成，无堆栈大缓冲。
+    fn encode_baseline_jpeg(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let dc_lum_q = i64::from(LUM_Q[0]);
+        let dc_chr_q = i64::from(CHR_Q[0]);
+
+        /// Huffman 表：按符号值索引，`code`/`len` 为码字与码长。
+        #[derive(Clone, Copy)]
+        struct Hf {
+            code: u16,
+            len: u8,
+        }
+        fn build_ht(bits: &[u8; 16], vals: &[u8]) -> [Hf; 256] {
+            let mut t = [Hf { code: 0, len: 0 }; 256];
+            let mut code: u32 = 0;
+            let mut k = 0usize;
+            for len in 1..=16u32 {
+                for _ in 0..bits[(len - 1) as usize] {
+                    let v = vals[k] as usize;
+                    t[v] = Hf {
+                        code: code as u16,
+                        len: len as u8,
+                    };
+                    code += 1;
+                    k += 1;
+                }
+                code <<= 1;
+            }
+            t
+        }
+
+        /// MSB 优先位写器：字节填充（0xFF 后补 0x00），末尾不足字节补 1。
+        struct BitWriter {
+            buf: Vec<u8>,
+            acc: u32,
+            nbits: u32,
+        }
+        impl BitWriter {
+            fn new() -> Self {
+                Self { buf: Vec::with_capacity(4096), acc: 0, nbits: 0 }
+            }
+            fn put(&mut self, val: u32, n: u32) {
+                self.acc = (self.acc << n) | val;
+                self.nbits += n;
+                while self.nbits >= 8 {
+                    self.nbits -= 8;
+                    let b = ((self.acc >> self.nbits) & 0xFF) as u8;
+                    self.buf.push(b);
+                    if b == 0xFF {
+                        self.buf.push(0); // 字节填充
+                    }
+                }
+            }
+            fn finish(mut self) -> Vec<u8> {
+                if self.nbits > 0 {
+                    let pad = 8 - self.nbits;
+                    let b = ((self.acc << pad) | ((1u32 << pad) - 1)) & 0xFF;
+                    self.buf.push(b as u8);
+                }
+                self.buf
+            }
+        }
+
+        /// 写单个 DC 差分系数：符号 = 幅值位数，负数用一补形态。
+        fn put_dc(bw: &mut BitWriter, tbl: &[Hf; 256], diff: i32) {
+            let size = if diff == 0 {
+                0
+            } else {
+                32 - diff.unsigned_abs().leading_zeros()
+            };
+            let h = tbl[size as usize];
+            bw.put(u32::from(h.code), u32::from(h.len));
+            if size > 0 {
+                // 幅值：正数 = 原值；负数 = 2^size - 1 - |值|（JPEG 一补形态，MSB=0）
+                let mag = if diff >= 0 {
+                    diff as u32
+                } else {
+                    (1u32 << size) - 1 - diff.unsigned_abs()
+                };
+                bw.put(mag, size);
+            }
+        }
+
+        /// 组装「标记 + 长度 + 载荷」段。
+        fn push_seg(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+            out.push(0xFF);
+            out.push(marker);
+            out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+            out.extend_from_slice(payload);
+        }
+
+        let dc_lum = build_ht(&DC_LUM_BITS, &DC_LUM_VAL);
+        let ac_lum = build_ht(&AC_LUM_BITS, &AC_LUM_VAL);
+        let dc_chr = build_ht(&DC_CHR_BITS, &DC_CHR_VAL);
+        let ac_chr = build_ht(&AC_CHR_BITS, &AC_CHR_VAL);
+
+        let mcu_x = (w + 7) / 8;
+        let mcu_y = (h + 7) / 8;
+        // 四舍五入除法（半值远离零）：DC = round(Σ/8 / Q)；对纯黑块（Σ=-8192, luma Q=16）
+        // 恰整除 -64，解码角点精确为 0。
+        let rdiv = |sum: i64, q: i64| -> i32 {
+            let half = q / 2;
+            ((sum + if sum >= 0 { half } else { -half }) / q) as i32
+        };
+        // YCbCr→DCT 域 DC（含右/下边缘复制到 64 采样）：BT.601 full-range
+        let (mut py, mut pc, mut pr) = (0i32, 0i32, 0i32);
+        let mut bw = BitWriter::new();
+        for my in 0..mcu_y {
+            for mx in 0..mcu_x {
+                let (mut sy, mut sc, mut sr) = (0i64, 0i64, 0i64);
+                for yy in 0..8u32 {
+                    let y = (my * 8 + yy).min(h - 1);
+                    let row = &rgb[((y as usize) * (w as usize)) * 3..];
+                    for xx in 0..8u32 {
+                        let x = (mx * 8 + xx).min(w - 1);
+                        let o = x as usize * 3;
+                        let (r, g, b) = (row[o], row[o + 1], row[o + 2]);
+                        let yv = (299 * i32::from(r) + 587 * i32::from(g) + 114 * i32::from(b)) / 1000;
+                        let cb = 128
+                            + (-168736 * i32::from(r) - 331264 * i32::from(g) + 500000 * i32::from(b))
+                                / 1000000;
+                        let cr = 128
+                            + (500000 * i32::from(r) - 418688 * i32::from(g) - 81312 * i32::from(b))
+                                / 1000000;
+                        sy += i64::from(yv - 128);
+                        sc += i64::from(cb - 128);
+                        sr += i64::from(cr - 128);
+                    }
+                }
+                let y_dc = rdiv(sy, 8 * dc_lum_q);
+                let cb_dc = rdiv(sc, 8 * dc_chr_q);
+                let cr_dc = rdiv(sr, 8 * dc_chr_q);
+                put_dc(&mut bw, &dc_lum, y_dc - py);
+                py = y_dc;
+                bw.put(u32::from(ac_lum[0].code), u32::from(ac_lum[0].len)); // EOB
+                put_dc(&mut bw, &dc_chr, cb_dc - pc);
+                pc = cb_dc;
+                bw.put(u32::from(ac_chr[0].code), u32::from(ac_chr[0].len)); // EOB
+                put_dc(&mut bw, &dc_chr, cr_dc - pr);
+                pr = cr_dc;
+                bw.put(u32::from(ac_chr[0].code), u32::from(ac_chr[0].len)); // EOB
+            }
+        }
+
+        let mut out = Vec::with_capacity(bw.buf.capacity());
+        out.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        // APP0 JFIF 1.01（无缩略）
+        push_seg(
+            &mut out,
+            0xE0,
+            &[b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00],
+        );
+        // DQT：亮度 0 + 色度 1
+        let mut dqt = Vec::with_capacity(130);
+        dqt.push(0x00);
+        dqt.extend_from_slice(&LUM_Q);
+        dqt.push(0x01);
+        dqt.extend_from_slice(&CHR_Q);
+        push_seg(&mut out, 0xDB, &dqt);
+        // SOF0：baseline、精度 8、3 分量 4:4:4（采样 0x11）
+        let mut sof = Vec::with_capacity(17);
+        sof.push(8);
+        sof.extend_from_slice(&(h as u16).to_be_bytes());
+        sof.extend_from_slice(&(w as u16).to_be_bytes());
+        sof.push(3);
+        sof.extend_from_slice(&[1, 0x11, 0]); // Y
+        sof.extend_from_slice(&[2, 0x11, 1]); // Cb
+        sof.extend_from_slice(&[3, 0x11, 1]); // Cr
+        push_seg(&mut out, 0xC0, &sof);
+        // DHT：DC/AC × 亮度/色度 四表
+        let mut dht = Vec::new();
+        dht.push(0x00);
+        dht.extend_from_slice(&DC_LUM_BITS);
+        dht.extend_from_slice(&DC_LUM_VAL);
+        dht.push(0x10);
+        dht.extend_from_slice(&AC_LUM_BITS);
+        dht.extend_from_slice(&AC_LUM_VAL);
+        dht.push(0x01);
+        dht.extend_from_slice(&DC_CHR_BITS);
+        dht.extend_from_slice(&DC_CHR_VAL);
+        dht.push(0x11);
+        dht.extend_from_slice(&AC_CHR_BITS);
+        dht.extend_from_slice(&AC_CHR_VAL);
+        push_seg(&mut out, 0xC4, &dht);
+        // SOS：3 分量的 DC/AC 表选择 + 谱选择（baseline 固定 0,63,0）
+        let sos = [3u8, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0];
+        push_seg(&mut out, 0xDA, &sos);
+        out.extend_from_slice(&bw.finish());
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
     }
 
     /// 组合「带 EXIF 嵌入缩略图」的合法 JPEG 字节（SOI + APP1-Exif（TIFF 内嵌缩略 JPEG），
@@ -2061,7 +2303,7 @@ mod tests {
         let bgra = frames[0].buffer().as_raw();
         assert_eq!(bgra.len(), (200 * 150 * 4) as usize);
         // 左上角 (0,0) 黑色 → BGRA [0,0,0,255]；右下角 (399,299) 渐变近
-        // B≈60,G≈254,R≈254 → BGRA [B,G,R,255]（libjpeg-turbo Bgra 直出 = GPUI 字节序）。
+        // B≈60,G≈254,R≈254 → BGRA [B,G,R,255]（自研 kimg 盒式降档 BGRA 直出 = GPUI 字节序）。
         assert_eq!([bgra[0], bgra[1], bgra[2], bgra[3]], [0, 0, 0, 255]);
         let tail = &bgra[(bgra.len() - 4)..];
         assert!(tail[0] < 150 && tail[1] > 200 && tail[2] > 200, "右下应低蓝高红：{tail:?}");
@@ -2232,7 +2474,7 @@ mod tests {
     }
 
     /// 实测大图冷解码耗时：**全分辨率（旧链路 `image` 全解）vs 展示尺寸档（新链路
-    /// libjpeg-turbo SIMD 降档直出 BGRA）**。展示需要固定为 1080p 视口 contain 的真实量
+    /// 自研 kimg 全解 + 盒式降档直出 BGRA）**。展示需要固定为 1080p 视口 contain 的真实量
     /// （1376×1032）——验证 20MP 照片打开/切换由 debug ~7s 降到几十 ms、且解码分辨率 ≥ 显示
     /// （不糊）。目录 `IMG_BENCH_DIR`（school 用 school），`IMG_BENCH_LIMIT` 前 N 张。
     /// `--ignored --nocapture` 运行。
@@ -2259,7 +2501,7 @@ mod tests {
         // 1080p 视口 contain 需要的展示像素（≈ 结果「显示尺寸档」的选档基准）
         let need = (1376.0, 1032.0);
         eprintln!(
-            "\n[IMG-BENCH] {} 张 | 全解(旧 image) vs 展示尺寸(JPEG libjpeg-turbo SIMD / PNG 盒式降采样, 需要 {:.0}×{:.0})：",
+            "\n[IMG-BENCH] {} 张 | 全解(旧 image) vs 展示尺寸(JPEG/PNG kimg 全解+盒式降采样, 需要 {:.0}×{:.0})：",
             files.len(),
             need.0,
             need.1

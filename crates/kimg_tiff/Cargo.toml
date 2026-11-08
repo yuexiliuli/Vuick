@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
-description = "kimg 拆分的 TIFF 解码 crate（codecs/tiff，基于 tiff crate）。"
+description = "kimg 拆分的 TIFF 解码 crate（codecs/tiff，A1 自研核心：运行时零 tiff 依赖）。"
 
 [dependencies]
 kimg_core = { path = "../kimg_core" }
+# A2：Deflate(8)/ZlibPkzip(32946) 走 fdeflate 解 zlib 封装（与 kimg_png 同版本 0.3.x，生产已用）。
+fdeflate = "0.3"
+
+[dev-dependencies]
+# 仅测试用 oracle：自研解码器输出与 tiff crate 逐字节对拍（A1 字节恒等验收），
+# 另用于生成 A1 矩阵 fixture。运行时零 tiff 依赖。
 tiff = "0.11.3"

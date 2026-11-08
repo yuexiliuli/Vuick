@@ -105,9 +105,9 @@ impl super::ImageViewer {
     }
 
     /// 派发一次并行解码（解码池槽位之一）：优先用字节缓存里的内存字节，否则后台读盘并把
-    /// 字节回填缓存（重解码不重读盘）。按当前「展示像素需要」解码（JPEG 走 libjpeg-turbo
-    /// SIMD 降档直出 BGRA；其它格式走 `image` 全解）。结果只进缓存；仅当「仍是当前显示
-    /// 目标」才上屏。
+    /// 字节回填缓存（重解码不重读盘）。按当前「展示像素需要」解码（JPEG/PNG 走自研 kimg
+    /// 全解 + 盒式降档直出 BGRA；其它格式走 `image` 全解）。结果只进缓存；仅当「仍是当前
+    /// 显示目标」才上屏。
     fn spawn_decode(&mut self, path: PathBuf, is_prefetch: bool, cx: &mut Context<Self>) {
         self.in_flight.insert(path.clone());
         if is_prefetch {

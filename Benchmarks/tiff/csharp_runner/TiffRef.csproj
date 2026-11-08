@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- SDCB_ROOT 注入：env 优先，缺省 <repo>\..\SimdCodecs（相对本目录上溯 4 级 = 当前项目父目录，不泄绝对路径） -->
+    <SDCB_ROOT Condition="'$(SDCB_ROOT)'==''">$(MSBuildProjectDirectory)\..\..\..\..\SimdCodecs</SDCB_ROOT>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(SDCB_ROOT)/src/Sdcb.SimdCodecs.Tiff/Sdcb.SimdCodecs.Tiff.csproj" />
+  </ItemGroup>
+
+</Project>

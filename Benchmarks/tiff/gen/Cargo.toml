@@ -1,0 +1,21 @@
+[package]
+name = "kimg_tiff_gen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 独立 workspace 根：语料生成器位于仓库工作区目录树内（Benchmarks/tiff/gen），声明自身为根，
+# 避免 cargo 把根仓库 workspace 误认为本包所属；默认 target 即本目录下 target/（独立于根仓库）。
+
+[workspace]
+
+[dependencies]
+# 源图解 RGBA（BMP 001/002 走 kimg 门面 load_from_memory → to_rgba8）。
+kimg = { path = "../../../crates/kimg" }
+kimg_core = { path = "../../../crates/kimg_core" }
+# 语料编码器（dev oracle，仅生成用）：写 Uncompressed/PackBits/LZW/Deflate + Horizontal predictor(2)。
+# 关掉用不到的 fax/jpeg 默认特性，只留 lzw(weezl)+deflate(flate2)。
+tiff = { version = "0.11", default-features = false, features = ["lzw", "deflate"] }
+
+[profile.release]
+opt-level = 3

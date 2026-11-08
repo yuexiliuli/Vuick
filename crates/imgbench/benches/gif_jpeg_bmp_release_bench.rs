@@ -1,14 +1,11 @@
 //! GIF/JPEG/BMP 解码 release 基准（cargo bench 手动运行）：kimg 三通道生产姿态基线，
-//! 供后续自研解码优化前后对比。JPEG 附 libjpeg-turbo-rs 0.8 pure-Rust SIMD 参考通道
-//! （可选 feature `libjpeg-turbo-ref` 门控，缺省关闭避免影响首次基线构建）。
+//! 供后续自研解码优化前后对比。JPEG 的 turbo 参照通道（libjpeg-turbo-rs）已移除，
+//! 该列固定输出 N/A。
 //!
 //! 运行（release 默认，harness=false 直接执行）：
 //! ```text
-//! # 仅 kimg 三通道基线（JPEG turbo 列输出 N/A；不构建 libjpeg-turbo）
+//! # 仅 kimg 三通道基线（JPEG turbo 列输出 N/A）
 //! cargo bench -p imgbench --bench gif_jpeg_bmp_release_bench
-//!
-//! # 含 libjpeg-turbo-rs SIMD 参考列（JPEG）
-//! cargo bench -p imgbench --bench gif_jpeg_bmp_release_bench --features libjpeg-turbo-ref
 //! ```
 //!
 //! 输出 `GIF_JPEG_BMP_RELEASE_BENCH <fmt> files=N ...`（各场景 N≥9 轮取中位，release；
@@ -25,7 +22,6 @@
 //!   正确性哨兵校验输出字节数 == 宽*高*4，不符视为探测失败。
 //! - GIF 双列：GIF_STATIC = `ImageReader…Gif…to_rgba8` 首帧（生产 static 姿态）；
 //!   GIF_ANIM = `kimg::codecs::gif::GifDecoder…into_frames().collect_frames()` 帧缓冲字节总和。
-//! - JPEG 参考：libjpeg-turbo-rs `decompress_to(Rgba)` 全解直出 RGBA（SIMD）。
 //!   装载时逐文件对启用通道各解一次，解不了则 drop + note（防基准中途 panic）。
 
 use std::io::Cursor;
@@ -121,13 +117,6 @@ fn collect_corpus() -> Vec<(Scenario, String, Vec<u8>)> {
         }
         for (name, bytes) in files {
             let kimg_ok = kimg_decode(scen, &bytes).is_some();
-            #[cfg(feature = "libjpeg-turbo-ref")]
-            let turbo_ok = if scen == Scenario::Jpeg {
-                turbo_decode(&bytes).is_some()
-            } else {
-                true
-            };
-            #[cfg(not(feature = "libjpeg-turbo-ref"))]
             let turbo_ok = true;
             if !(kimg_ok && turbo_ok) {
                 println!(
@@ -174,52 +163,9 @@ fn kimg_decode(scen: Scenario, bytes: &[u8]) -> Option<(usize, Option<usize>)> {
     Some((static_len, anim_bytes))
 }
 
-/// libjpeg-turbo-rs 0.8 参考通道：全解 RGBA（SIMD），返回 RGBA8 字节数。
-#[cfg(feature = "libjpeg-turbo-ref")]
-fn turbo_decode(bytes: &[u8]) -> Option<usize> {
-    let img = libjpeg_turbo_rs::decompress_to(bytes, libjpeg_turbo_rs::PixelFormat::Rgba).ok()?;
-    if img.data.len() != img.width * img.height * 4 {
-        return None;
-    }
-    Some(img.data.len())
-}
-
-#[cfg(feature = "libjpeg-turbo-ref")]
+/// turbo 参照通道已移除：此处保留签名与输出列，恒返回 N/A 占位。
 fn turbo_version() -> &'static str {
-    "libjpeg-turbo-rs 0.8 (pure-Rust, SSE2/AVX2 SIMD)"
-}
-
-/// 临时对照通道：kimg 替换前的 `image` crate 0.25.10 BMP 解码（生产姿态 to_rgba8），
-/// 返回 RGBA8 字节数。仅 `image-ref` feature 启用（测完即删）。
-#[cfg(feature = "image-ref")]
-fn image_crate_decode_bmp(bytes: &[u8]) -> Option<usize> {
-    let img = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Bmp)
-        .decode()
-        .ok()?;
-    let rgba = img.to_rgba8();
-    let expected = (rgba.width() as usize)
-        .saturating_mul(rgba.height() as usize)
-        .saturating_mul(4);
-    let len = rgba.into_raw().len();
-    if len != expected {
-        return None;
-    }
-    Some(len)
-}
-
-#[cfg(feature = "image-ref")]
-fn image_ref_version() -> &'static str {
-    "image crate 0.25.10 (替换前后端)"
-}
-
-#[cfg(not(feature = "image-ref"))]
-fn image_ref_version() -> &'static str {
-    "n/a (feature image-ref 未启用)"
-}
-
-#[cfg(not(feature = "libjpeg-turbo-ref"))]
-fn turbo_version() -> &'static str {
-    "n/a (feature libjpeg-turbo-ref 未启用)"
+    "n/a (libjpeg-turbo-rs 参照通道已移除)"
 }
 
 // ---------------------------------------------------------------------------
@@ -294,27 +240,8 @@ fn bench_scenario(
                 },
                 rounds,
             );
-            #[cfg(feature = "image-ref")]
-            {
-                let img_ms = median_ms(
-                    || {
-                        for (_, _, b) in files {
-                            let _ = image_crate_decode_bmp(b).expect("探测已保证可解");
-                        }
-                    },
-                    rounds,
-                );
-                println!(
-                    "GIF_JPEG_BMP_RELEASE_BENCH Bmp files={} kimg={:.3}ms image_crate={img_ms:.3}ms ratio_kimg_vs_image={:.3}",
-                    files.len(),
-                    kimg_ms,
-                    kimg_ms / img_ms
-                );
-                return;
-            }
-            #[cfg(not(feature = "image-ref"))]
             println!(
-                "GIF_JPEG_BMP_RELEASE_BENCH Bmp files={} kimg={:.3}ms turbo=N/A (BMP 无 turbo 对照; 启用 --features image-ref 可与 image crate 对比)",
+                "GIF_JPEG_BMP_RELEASE_BENCH Bmp files={} kimg={:.3}ms turbo=N/A (BMP 无 turbo 对照)",
                 files.len(),
                 kimg_ms
             );
@@ -328,31 +255,9 @@ fn bench_scenario(
                 },
                 rounds,
             );
-            #[cfg(feature = "libjpeg-turbo-ref")]
-            if turbo_on {
-                let turbo_ms = median_ms(
-                    || {
-                        for (_, _, b) in files {
-                            let _ = turbo_decode(b).expect("探测已保证可解");
-                        }
-                    },
-                    rounds,
-                );
-                println!(
-                    "GIF_JPEG_BMP_RELEASE_BENCH Jpeg files={} kimg={:.3}ms turbo={:.3}ms ratio_kimg_vs_turbo={:.3}",
-                    files.len(),
-                    kimg_ms,
-                    turbo_ms,
-                    kimg_ms / turbo_ms
-                );
-                return;
-            }
-            #[cfg(not(feature = "libjpeg-turbo-ref"))]
             let _ = turbo_on;
-            #[cfg(not(feature = "libjpeg-turbo-ref"))]
             println!(
-                "GIF_JPEG_BMP_RELEASE_BENCH Jpeg files={} kimg={:.3}ms turbo=N/A (feature libjpeg-turbo-ref 未启用；\
-                 cargo bench -p imgbench --bench gif_jpeg_bmp_release_bench --features libjpeg-turbo-ref 可开)",
+                "GIF_JPEG_BMP_RELEASE_BENCH Jpeg files={} kimg={:.3}ms turbo=N/A (libjpeg-turbo-rs 参照通道已移除)",
                 files.len(),
                 kimg_ms
             );
@@ -377,7 +282,7 @@ fn main() {
         if files.is_empty() {
             continue;
         }
-        bench_scenario(scen, &files, rounds, cfg!(feature = "libjpeg-turbo-ref"));
+        bench_scenario(scen, &files, rounds, false);
     }
     println!(
         "GIF_JPEG_BMP_RELEASE_BENCH note corpus_size={} bench_files={}",

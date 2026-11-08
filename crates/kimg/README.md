@@ -18,7 +18,7 @@
 | decode | TIFF | tiff crate | — |
 | encode | PNG | 自研 png_encoder | fdeflate + adler32 自产，零 png crate 运行时依赖 |
 | encode | GIF | 自研 LZW | 精确调色板 / Wu 量化 + NETSCAPE loop |
-| encode | WebP / JPEG | 无 | JPEG 测试夹具走 libjpeg-turbo-rs |
+| encode | WebP / JPEG | 无 | JPEG 测试夹具走 image_viewer 自包含最小 baseline 编码器（原 libjpeg-turbo-rs 参照已移除） |
 
 ## 性能对比（关键交付）
 
@@ -56,7 +56,7 @@ SIMD：YUV→RGB SSE4.1（2.5×）、帧内预测 SSSE3（端到端 −9%）、I
 | 前 | 220ms | 逐像素 3 字节 read + reverse |
 | 后（本会话交付） | **189ms（-14%）** | 24/32bit 通道重排 SSSE3/AVX2、16bit/bitfields 整行读 + 256 LUT、`KIMG_BMP_NO_SIMD` 标量回退；SIMD≡标量≡旧语义（31 金指） |
 
-**JPEG**：维持 `zune-jpeg`（300KB~570KB 语料 315–328ms；libjpeg-turbo-rs SIMD 参照 235ms）。自研 8-bit baseline 曾达与 zune 逐字节一致（19/19，含 SIMD 色转），但 release 仍慢 2.13×（360.8 vs 169.4ms，熵+IDCT 标量吞吐不足），已按「无效即回滚」撤销，作为后续工作记录在 docs 交接。
+**JPEG**：维持 `zune-jpeg`（300KB~570KB 语料 315–328ms；turbo SIMD 参照 235ms，参照通道已移除）。自研 8-bit baseline 曾达与 zune 逐字节一致（19/19，含 SIMD 色转），但 release 仍慢 2.13×（360.8 vs 169.4ms，熵+IDCT 标量吞吐不足），已按「无效即回滚」撤销，作为后续工作记录在 docs 交接。
 
 结论如实：lossy 静态 WebP、PNG 主路径、GIF 动画、BMP 均反超/持平既有参照；lossless WebP 与 JPEG 保持既有后端不强改。
 
@@ -77,7 +77,7 @@ SIMD：YUV→RGB SSE4.1（2.5×）、帧内预测 SSSE3（端到端 −9%）、I
 ```powershell
 cargo bench -p imgbench --bench png_release_bench [--features libpng-ref]
 cargo bench -p imgbench --bench webp_release_bench --features libwebp-ref  # libwebp-sys vendored 1.6.0 SIMD
-cargo bench -p imgbench --bench gif_jpeg_bmp_release_bench [--features libjpeg-turbo-ref]  # GIF/BMP/JPEG 三场景
+cargo bench -p imgbench --bench gif_jpeg_bmp_release_bench  # GIF/BMP/JPEG 三场景（JPEG turbo 参照列已移除，恒 N/A）
 ```
 
 - 语料：`target/imgbench-corpus`（gitignore，不入仓库）+ 外部 `E:\Rust\SimdCodecs\测试图片`；kimg 测试经 `tests/fixtures/webp/mod.rs` 解析外部语料，缺则 SKIP。
@@ -88,7 +88,7 @@ cargo bench -p imgbench --bench gif_jpeg_bmp_release_bench [--features libjpeg-t
 - WebP 动画未自研（image-webp 兜底）。
 - 已知 10 个 webp 小/大文件 vs image-webp/libwebp 有记录未判失败的 diff（详见 docs 交接 §3.2/§4 与 `VP8_EXTRA_DIFF`/`VP8L_EXTRA_DIFF` 打印），不作决断、只如实记录。
 - 16bit PNG / BMP RLE / TIFF 真机样例缺（parity 靠合成/语料）。
-- WebP / JPEG 编码无（JPEG 测试夹具走 libjpeg-turbo-rs）。
+- WebP / JPEG 编码无（JPEG 测试夹具走 image_viewer 自包含最小 baseline 编码器）。
 - APNG 不支持（与 `image 0.25` 默认一致）。
 
 ## 许可 / 归属
