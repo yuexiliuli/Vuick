@@ -4,8 +4,10 @@
 //! 性能手段：
 //! - 调色板预先打成 `[u32;256]`（native 序 RGBA，表外=不透明黑），一次；展开每像素一次 u32 写。
 //! - 画布为 `Vec<u32>`，整行地址算术 + 直接索引，不走 `get_pixel_mut`/`enumerate_pixels_mut`。
-//! - 任意几何 Keep 帧走纯 LUT 直写热路径（只推进画布 u32 1 写/px，帧末整拷贝）；非 Keep/
-//!   快道关的局部帧先整体 `memcpy` 画布到输出再覆盖 bbox（dormancy 原路径）。
+//! - 三路 disposal 快道（`KIMG_GIF_BLIT_FAST=0` 关，dormancy 保留原 copy+blit 双写）：
+//!   Keep → 只写画布 u32 1 写/px + 帧末整拷贝（blit_keep）；Previous → 只写 out（trans 读旧画布
+//!   现像、非 trans LUT 直写）+ 画布完全不写；Background → 同只写 out + bbox 画布行级整零（memset）。
+//!   局部帧 bbox 外靠先整体 memcpy 画布到输出（全覆帧 bbox=全画布可省）；几何与原 blit 逐字节同构。
 //! - LZW 表/码流/索引缓冲跨帧复用（`Scratch`），不逐帧重建。
 
 use std::io;
@@ -271,6 +273,67 @@ fn blit_keep(
     }
 }
 
+/// Previous/Background 快道内核（R3，与 blit_keep 几何同构）：只写 out，画布按 disposal 语义推进。
+///
+/// 几何与 `blit` 完全同构（同 clip_rect / src_col_start / src_end 截断 / interlaced_row /
+/// y≥h 跳过），故循环覆盖「原 blit 会处理的像素集」，out 逐字节 == 原 copy+blit 双写路径：
+/// - 透明索引（idx==trans）：out = 画布现像（= 原 outp=prev；本行该地址本帧前未写，读到的
+///   必是块前值；Previous 画布不写、Background 于同轮最后才写 0，顺序保旧值）；
+/// - 非透明：out = LUT 直写（原 cur，alpha 恒 255）。
+/// 画布推进：`clear=true`（Background）→ 同轮 bbox 整 0（原 `Disposal::Background => 0`）；
+/// `clear=false`（Previous）→ 完全不写（原 `Disposal::Previous => prev`，值上=保持块前状态）。
+fn blit_disp(
+    out: &mut [u8],
+    canvas: &mut [u32],
+    indices: &[u8],
+    frame: &GifFrame,
+    lut: &[u32; 256],
+    w: usize,
+    h: usize,
+    clear: bool,
+) {
+    let (cx, _cy, cw, ch) = clip_rect(frame, w as u32, h as u32);
+    if cw == 0 || ch == 0 {
+        return; // 帧完全在逻辑屏外（含 x>=w / y>=h 全越界）
+    }
+    let fw = frame.w as usize;
+    let trans = frame.transparent; // i32（-1 = 无透明索引；GCE 透明恒 0..=255）
+    let rows = indices.len().div_ceil(fw).min(frame.h as usize);
+    let x0 = cx as usize;
+    let x1 = (cx + cw) as usize;
+    let width = x1 - x0;
+    let src_col_start = x0.saturating_sub(frame.x as usize);
+    for r in 0..rows {
+        let yf = if frame.interlaced { interlaced_row(r, frame.h as usize) } else { r };
+        let y = frame.y as usize + yf;
+        if y >= h {
+            continue;
+        }
+        let src = r * fw + src_col_start;
+        let src_end = (r * fw + fw).min(indices.len());
+        let dst = y * w + x0;
+        let mut n = 0; // 本行已处理像素数；Background 画布也**只清这些**（与 blit 截断语义一致）
+        for dx in 0..width {
+            if src + dx >= src_end {
+                break;
+            }
+            let idx = indices[src + dx];
+            if i32::from(idx) == trans {
+                // 透明：out = 画布现像（先读旧值；Background 的行级整清在本行写完后才发生）。
+                write_px(out, dst + dx, canvas[dst + dx]);
+            } else {
+                write_px(out, dst + dx, lut[idx as usize]);
+            }
+            n += 1;
+        }
+        if clear && n > 0 {
+            // Background：bbox 清透明黑——行级整零（memset 级 vectorized），非逐像素散写；
+            // 只清已处理列，防止把「截断未处理像素」保留旧值的语义清掉。
+            canvas[dst..dst + n].fill(0);
+        }
+    }
+}
+
 /// 迭代器用：合成第 `frame` 帧（画布推进 + 输出全量画布）。`out` 长 == canvas_w*canvas_h*4。
 pub(crate) fn composite_into(
     canvas: &mut Canvas,
@@ -285,17 +348,39 @@ pub(crate) fn composite_into(
         frame.x == 0 && frame.y == 0 && frame.w as usize >= w && frame.h as usize >= h;
 
     let lut = build_palette(data, frame);
-    if blit_fast_enabled() && frame.disposal == Disposal::Keep {
-        // 任意几何 Keep 快道（env 门控，默认开）：只写画布 + 帧末一次整画布拷贝，字节恒等
-        // （见 blit_keep 不变式：Keep 下处理后画布==输出，含非全覆局部帧）。非 Keep 或快道关
-        // 走下方原路径（原 copy_canvas_into + blit 双写，dormancy 保留）。
-        blit_keep(canvas, indices, frame, &lut, w, h);
-        copy_canvas_into(out, &canvas.canvas);
-        return Ok(());
+    if blit_fast_enabled() {
+        match frame.disposal {
+            // 任意几何 Keep 快道（R2）：只写画布 + 帧末一次整画布拷贝，字节恒等
+            // （见 blit_keep 不变式：Keep 下处理后画布==输出，含非全覆局部帧）。
+            Disposal::Keep => {
+                blit_keep(canvas, indices, frame, &lut, w, h);
+                copy_canvas_into(out, &canvas.canvas);
+                return Ok(());
+            }
+            // R3：Previous/Background 快道——只写 out（bbox 内 trans 读旧画布、非 trans LUT
+            // 直写；bbox 外靠 copy_canvas_into，全覆帧 bbox=全画布可省拷贝），画布按语义推进
+            // （Previous 不写 / Background bbox 清 0）。逐字节同构原 copy+blit 双写（blit_disp）。
+            Disposal::Previous | Disposal::Background => {
+                if !covers_full {
+                    copy_canvas_into(out, &canvas.canvas);
+                }
+                blit_disp(
+                    out,
+                    &mut canvas.canvas,
+                    indices,
+                    frame,
+                    &lut,
+                    w,
+                    h,
+                    frame.disposal == Disposal::Background,
+                );
+                return Ok(());
+            }
+        }
     }
 
     if !covers_full {
-        // 局部帧：输出先取画布现状，再叠绘 bbox。
+        // 局部帧（非 Keep/Previous/Background 或快道关）：输出先取画布现状，再叠绘 bbox。
         copy_canvas_into(out, &canvas.canvas);
     }
     blit(
@@ -654,6 +739,197 @@ mod tests {
                 let mut probe = vec![0u8; (cw * ch * 4) as usize];
                 copy_canvas_into(&mut probe, &d_cv);
                 assert_eq!(probe, d_out, "[Keep] 派发后 out != 画布（不变式破）");
+            }
+        }
+    }
+
+    /// Previous/Background 双路对拍：原路径（copy-if-partial + blit 双写）vs 快道（blit_disp）。
+    /// 断言两路 `out` 逐字节一致且画布终态一致（Background：bbox 清透明黑；Previous：保持不变
+    /// ——值上=块前状态，快道完全不写）。覆盖：全覆/局部、透明打孔、preseed 非零、interlaced、
+    /// 裁边（越界底右角/完全越界空 clip）、索引截断、320x240 近真实；两 disposal 各跑一遍。
+    fn assert_disp_parity(c: &Case, d: Disposal, label: &str) {
+        let clear = d == Disposal::Background;
+        let full =
+            c.frame.x == 0 && c.frame.y == 0 && c.frame.w as usize >= c.w && c.frame.h as usize >= c.h;
+        let mut f = c.frame.clone();
+        f.disposal = d;
+
+        // 参照路：原 composite_into（局部帧先 copy 画布到 out 再 blit 双写）。
+        let mut ref_canvas = Canvas::new(c.w, c.h);
+        let mut ref_out = vec![0u8; c.w * c.h * 4];
+        if c.preseed {
+            let mut p = 0xABCD_EF01u64;
+            for v in ref_canvas.canvas.iter_mut() {
+                *v = lcg(&mut p) as u32;
+            }
+        }
+        if !full {
+            copy_canvas_into(&mut ref_out, &ref_canvas.canvas);
+        }
+        blit(
+            &mut ref_out,
+            Some(&mut ref_canvas.canvas),
+            &c.indices,
+            &f,
+            &c.lut,
+            c.w,
+            c.h,
+        );
+
+        // 快道路（blit_disp）。
+        let mut fast_canvas = Canvas::new(c.w, c.h);
+        let mut fast_out = vec![0u8; c.w * c.h * 4];
+        if c.preseed {
+            let mut p = 0xABCD_EF01u64;
+            for v in fast_canvas.canvas.iter_mut() {
+                *v = lcg(&mut p) as u32;
+            }
+        }
+        if !full {
+            copy_canvas_into(&mut fast_out, &fast_canvas.canvas);
+        }
+        blit_disp(
+            &mut fast_out,
+            &mut fast_canvas.canvas,
+            &c.indices,
+            &f,
+            &c.lut,
+            c.w,
+            c.h,
+            clear,
+        );
+
+        assert_eq!(ref_out, fast_out, "[{label}] 输出字节不一致");
+        assert_eq!(ref_canvas.canvas, fast_canvas.canvas, "[{label}] 画布终态不一致");
+        if d == Disposal::Previous {
+            // Previous 画布=块前状态：与输入画布逐字节一致（快道未写画布）。
+            let mut probe = Canvas::new(c.w, c.h);
+            if c.preseed {
+                let mut p = 0xABCD_EF01u64;
+                for v in probe.canvas.iter_mut() {
+                    *v = lcg(&mut p) as u32;
+                }
+            }
+            assert_eq!(probe.canvas, fast_canvas.canvas, "[{label}] Previous 画布被改动");
+        } else {
+            // Background：bbox 内处理过的像素已清透明黑（0x00000000），bbox 外/未处理像素保留。
+            for (i, (&refv, &fastv)) in ref_canvas.canvas.iter().zip(fast_canvas.canvas.iter()).enumerate() {
+                assert_eq!(refv, fastv, "[{label}] Background 画布 @px {i}");
+            }
+        }
+    }
+
+    /// Previous/Background 快道直拍：`blit_disp` vs 原 `blit` 双写，逐字节对拍 + 画布终态断言，
+    /// 两 disposal、多样例（部分共享 Keep 的几何模板但换 disposal，扩大覆盖）。
+    #[test]
+    fn blit_disp_matches_original() {
+        let mut seed = 0xFEDC_BA98u64;
+        let cases: Vec<Case> = vec![
+            // 全覆 Previous/Background 不透明 + preseed（画布旧值须保留到 out 之外无扰）。
+            Case {
+                w: 16,
+                h: 12,
+                indices: index_grid(&mut seed, 16 * 12, 256),
+                frame: frame(0, 0, 16, 12, Disposal::Previous, -1, false),
+                lut: opaque_lut(&mut seed),
+                label: "full_disp_preseed_opaque",
+                preseed: true,
+            },
+            // 全覆 + 透明打孔 + preseed（非零底上透明保留旧画布/背景清 0）。
+            Case {
+                w: 24,
+                h: 18,
+                indices: index_grid(&mut seed, 24 * 18, 20),
+                frame: frame(0, 0, 24, 18, Disposal::Previous, 2, false),
+                lut: opaque_lut(&mut seed),
+                label: "full_disp_preseed_trans",
+                preseed: true,
+            },
+            // 全覆 + 透明 + 隔行。
+            Case {
+                w: 21,
+                h: 17,
+                indices: index_grid(&mut seed, 21 * 17, 8),
+                frame: frame(0, 0, 21, 17, Disposal::Previous, 0, true),
+                lut: opaque_lut(&mut seed),
+                label: "full_disp_trans_interlaced",
+                preseed: false,
+            },
+            // 局部 + 透明打孔 + preseed（bbox 外保留画布拷贝，bbox 内 trans 读旧画布）。
+            Case {
+                w: 20,
+                h: 16,
+                indices: index_grid(&mut seed, 9 * 8, 16),
+                frame: frame(4, 2, 9, 8, Disposal::Previous, 2, false),
+                lut: opaque_lut(&mut seed),
+                label: "partial_disp_trans_preseed",
+                preseed: true,
+            },
+            // 局部 + 透明 + 隔行（偏移下 interlaced_row 命中裁剪行）。
+            Case {
+                w: 24,
+                h: 20,
+                indices: index_grid(&mut seed, 10 * 9, 8),
+                frame: frame(3, 5, 10, 9, Disposal::Previous, 0, true),
+                lut: opaque_lut(&mut seed),
+                label: "partial_disp_trans_interlaced",
+                preseed: true,
+            },
+            // 局部越界底右角（clip_rect 收窄 bbox）。
+            Case {
+                w: 10,
+                h: 10,
+                indices: index_grid(&mut seed, 10 * 10, 64),
+                frame: frame(8, 8, 10, 10, Disposal::Previous, -1, false),
+                lut: opaque_lut(&mut seed),
+                label: "partial_disp_clip_tr",
+                preseed: true,
+            },
+            // 局部完全越界（空 clip → 两路 no-op，out 全画布、画布不变）。
+            Case {
+                w: 8,
+                h: 8,
+                indices: index_grid(&mut seed, 4 * 4, 16),
+                frame: frame(9, 9, 4, 4, Disposal::Previous, -1, false),
+                lut: opaque_lut(&mut seed),
+                label: "partial_disp_offscreen",
+                preseed: true,
+            },
+            // 局部 + 索引截断（src_end 截断：未处理像素画布/out 均不动）。
+            Case {
+                w: 8,
+                h: 8,
+                indices: index_grid(&mut seed, 30, 64),
+                frame: frame(1, 1, 6, 6, Disposal::Previous, 5, false),
+                lut: opaque_lut(&mut seed),
+                label: "partial_disp_truncated",
+                preseed: true,
+            },
+            // 大尺寸透明打孔稀疏（近真实 screen anim 形）。
+            Case {
+                w: 320,
+                h: 240,
+                indices: {
+                    let mut sparse = vec![1u8; 320 * 240];
+                    for i in (0..320 * 240).step_by(100) {
+                        sparse[i] = 0;
+                    }
+                    sparse
+                },
+                frame: frame(0, 0, 320, 240, Disposal::Previous, 0, false),
+                lut: opaque_lut(&mut seed),
+                label: "full_disp_320x240_sparse_trans",
+                preseed: false,
+            },
+        ];
+
+        for d in [Disposal::Previous, Disposal::Background] {
+            for c in &cases {
+                assert_disp_parity(c, d, &format!("{}:{}", match d {
+                    Disposal::Previous => "Previous",
+                    Disposal::Background => "Background",
+                    Disposal::Keep => "Keep",
+                }, c.label));
             }
         }
     }
