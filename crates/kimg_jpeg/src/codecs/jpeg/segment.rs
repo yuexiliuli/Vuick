@@ -134,6 +134,19 @@ impl StageProfile {
         })
     }
 
+    /// 消融开关：profile 模式 + `KIMG_JPEG_SKIP_FILL=1` 跳过每块 `tmp.fill(0)`（骨架归因）。
+    /// 注意：跳过清零后熵未写的间隙残留上一块残值，稀疏/全量 IDCT 读入垃圾 → 输出**错误**，
+    /// 仅作墙钟归因测量用；字节恒等抽查必须回实路径（不设此 env）。
+    pub(crate) fn skip_fill() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            Self::enabled_by_env()
+                && std::env::var("KIMG_JPEG_SKIP_FILL")
+                    .map(|v| v.trim() == "1")
+                    .unwrap_or(false)
+        })
+    }
+
     /// 墙钟计时（粗粒度调用点）。
     #[inline]
     pub(crate) fn timer(&self) -> Option<Instant> {
@@ -439,15 +452,9 @@ impl Component {
         })
     }
 
-    /// 分配上采样所需的工作缓冲区。
-    pub(crate) fn setup_upsample_scanline(&mut self) {
-        self.row = vec![0; self.width_stride * self.vertical_sample];
-        self.row_up = vec![0; self.width_stride * self.vertical_sample];
-        self.first_row_upsample_dest =
-            vec![128; self.vertical_sample * self.width_stride * self.sample_ratio.sample()];
-        self.upsample_dest =
-            vec![0; self.width_stride * self.sample_ratio.sample() * self.fix_an_annoying_bug * 8];
-    }
+    /// 上采样工作缓冲分配已移除（dormancy）：C# 语义换主后 `upsampler::upsample` 不再被
+    /// 管线调用，`row/row_up/first_row_upsample_dest/upsample_dest` 四处分配纯死
+    /// （2026-11-08 删），字段保留为空 Vec 以维持 `upsampler.rs`（休眠模块）编译。
 
     /// C# `RingOffset`: 平面行 → 环字节偏移（`row % RingRows * W2`）。
     #[inline]
@@ -528,7 +535,44 @@ pub(crate) struct Decoder<'a> {
     pub(crate) stage: StageProfile,
 }
 
-impl<'a> Decoder<'a> {
+    /// 头部解析后可复用的解码状态（C2：省 `read_image` 第二遍 header 解析）。
+    ///
+    /// `decode_headers_internal` 返回后一次性从 `Decoder` 提取（move 拥有态字段），
+    /// 之后 `restore_header_state` 可把它等价装回一个借用同一输入的新 `Decoder`
+    /// （reader 对准 `scan_start` = 熵编码数据起点，`headers_decoded=true`，
+    /// `decode_baseline/progressive` 内部二次 `decode_headers_internal` 随之短路）。
+    /// 字段集与 `Decoder` 中「段解析建立、解码路径消费」的部分一一对应；两边同时
+    /// 维护的不变量由 `jpeg_csharp_parity` 全量字节对照兜底。
+    /// Huffman 表装箱（`Box<HuffmanTable>`）：每表 ~20KB，沿 `HeaderState` 逐值搬运
+    /// 会在 debug 1MB 栈上多帧累计爆栈（K82），装箱后结构体 ~1.2KB。
+    pub(crate) struct HeaderState {
+        pub(crate) width: usize,
+        pub(crate) height: usize,
+        pub(crate) components: Vec<Component>,
+        pub(crate) qt_tables: [Option<[i32; DCT_BLOCK]>; MAX_COMPONENTS],
+        pub(crate) dc_huffman_tables: [Option<Box<HuffmanTable>>; MAX_COMPONENTS],
+        pub(crate) ac_huffman_tables: [Option<Box<HuffmanTable>>; MAX_COMPONENTS],
+        pub(crate) h_max: usize,
+        pub(crate) v_max: usize,
+        pub(crate) is_interleaved: bool,
+        pub(crate) input_colorspace: ColorSpace,
+        pub(crate) is_progressive: bool,
+        pub(crate) spec_start: u8,
+        pub(crate) spec_end: u8,
+        pub(crate) succ_high: u8,
+        pub(crate) succ_low: u8,
+        pub(crate) num_scans: u8,
+        pub(crate) scan_subsampled: bool,
+        pub(crate) z_order: [usize; MAX_COMPONENTS],
+        pub(crate) restart_interval: usize,
+        pub(crate) todo: usize,
+        pub(crate) coeff: usize,
+        pub(crate) sample_ratio: SampleRatios,
+        /// 头部解析结束（= 首个 SOS 段末）的 reader 绝对位置 = 熵编码数据起点。
+        pub(crate) scan_start: usize,
+    }
+
+    impl<'a> Decoder<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Decoder<'a> {
         Decoder {
             reader: ByteReader::new(data),
@@ -643,6 +687,83 @@ impl<'a> Decoder<'a> {
             last_byte = m;
             bytes_before_marker += 1;
         }
+    }
+
+    /// 提取头部解析后的解码状态（C2）。move 拥有态字段（components/huffman/量化表），
+    /// 并记录 reader 在熵编码数据起点的绝对位置。调用方须在提取后再取 metadata。
+    pub(crate) fn extract_header_state(&mut self) -> HeaderState {
+        HeaderState {
+            width: self.width,
+            height: self.height,
+            components: core::mem::take(&mut self.components),
+            qt_tables: core::mem::take(&mut self.qt_tables),
+            dc_huffman_tables: core::mem::take(&mut self.dc_huffman_tables)
+                .map(|o| o.map(Box::new)),
+            ac_huffman_tables: core::mem::take(&mut self.ac_huffman_tables)
+                .map(|o| o.map(Box::new)),
+            h_max: self.h_max,
+            v_max: self.v_max,
+            is_interleaved: self.is_interleaved,
+            input_colorspace: self.input_colorspace,
+            is_progressive: self.is_progressive,
+            spec_start: self.spec_start,
+            spec_end: self.spec_end,
+            succ_high: self.succ_high,
+            succ_low: self.succ_low,
+            num_scans: self.num_scans,
+            scan_subsampled: self.scan_subsampled,
+            z_order: self.z_order,
+            restart_interval: self.restart_interval,
+            todo: self.todo,
+            coeff: self.coeff,
+            sample_ratio: self.sample_ratio,
+            scan_start: self.reader.position(),
+        }
+    }
+
+    /// 把 `extract_header_state` 的结果装回一个借用同一输入的新 `Decoder`
+    /// （reader 对准熵编码数据起点、`headers_decoded=true`），省去第二遍 header 解析。
+    pub(crate) fn restore_header_state(&mut self, s: HeaderState) {
+        self.width = s.width;
+        self.height = s.height;
+        self.components = s.components;
+        self.qt_tables = s.qt_tables;
+        // 解箱回 Decoder 的内联表数组（一次只解一张，~20KB 栈瞬时，避免多帧累计）。
+        self.dc_huffman_tables = core::array::from_fn(|_| None);
+        for (dst, src) in self
+            .dc_huffman_tables
+            .iter_mut()
+            .zip(s.dc_huffman_tables.into_iter())
+        {
+            *dst = src.map(|b| *b);
+        }
+        self.ac_huffman_tables = core::array::from_fn(|_| None);
+        for (dst, src) in self
+            .ac_huffman_tables
+            .iter_mut()
+            .zip(s.ac_huffman_tables.into_iter())
+        {
+            *dst = src.map(|b| *b);
+        }
+        self.h_max = s.h_max;
+        self.v_max = s.v_max;
+        self.is_interleaved = s.is_interleaved;
+        self.input_colorspace = s.input_colorspace;
+        self.is_progressive = s.is_progressive;
+        self.spec_start = s.spec_start;
+        self.spec_end = s.spec_end;
+        self.succ_high = s.succ_high;
+        self.succ_low = s.succ_low;
+        self.num_scans = s.num_scans;
+        self.scan_subsampled = s.scan_subsampled;
+        self.z_order = s.z_order;
+        self.restart_interval = s.restart_interval;
+        self.todo = s.todo;
+        self.coeff = s.coeff;
+        self.sample_ratio = s.sample_ratio;
+        self.headers_decoded = true;
+        self.seen_sof = true;
+        self.reader.set_position(s.scan_start);
     }
 
     /// 统一 marker 分发（等价 zune `parse_marker_inner`）。

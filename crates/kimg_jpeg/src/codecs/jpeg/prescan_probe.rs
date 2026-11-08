@@ -136,6 +136,7 @@ fn prescan_walk<const DISCARD: bool>(dec: &mut Decoder<'_>) -> Result<(u64, f64)
 
     let mut stream = BitStream::new();
     let mut hot = HotStream::from_stream(&stream);
+    let (mut ab, mut bl) = hot.ab_bl();
     let mut dc_pred_state = [0i32; MAX_COMPONENTS];
     let mut tmp = [0i16; DCT_BLOCK];
     let mut blocks: u64 = 0;
@@ -196,14 +197,21 @@ fn prescan_walk<const DISCARD: bool>(dec: &mut Decoder<'_>) -> Result<(u64, f64)
                 let qt: &[i32; DCT_BLOCK] = unsafe { &*qt_ptr[k] };
                 let zq: &[u32; ZIGZAG_QUANT_LEN] = &zq_store[k];
                 // 每分量每 MCU 的块数 = vs×hs（scan_subsampled=false 时全为 1×1，等价）
-                for _v in 0..vs[k] {
+                    for _v in 0..vs[k] {
                     for _h in 0..hs[k] {
                         blocks += 1;
                         let r = if DISCARD {
-                            hot.discard_mcu_block(&mut dec.reader, dc, ac)
+                            match hot.discard_mcu_block(&mut dec.reader, dc, ac, ab, bl) {
+                                Ok((_, a, b)) => {
+                                    ab = a;
+                                    bl = b;
+                                    Ok(0u16)
+                                }
+                                Err(e) => Err(e),
+                            }
                         } else {
                             tmp.fill(0);
-                            hot.decode_mcu_block(
+                            match hot.decode_mcu_block(
                                 &mut dec.reader,
                                 dc,
                                 ac,
@@ -211,7 +219,16 @@ fn prescan_walk<const DISCARD: bool>(dec: &mut Decoder<'_>) -> Result<(u64, f64)
                                 zq,
                                 &mut tmp,
                                 &mut dc_pred_state[k],
-                            )
+                                ab,
+                                bl,
+                            ) {
+                                Ok((len, a, b)) => {
+                                    ab = a;
+                                    bl = b;
+                                    Ok(len)
+                                }
+                                Err(e) => Err(e),
+                            }
                         };
                         if r.is_err() {
                             break 'outer; // 与生产的 Terminate 一致：停止走位
@@ -221,6 +238,7 @@ fn prescan_walk<const DISCARD: bool>(dec: &mut Decoder<'_>) -> Result<(u64, f64)
             }
             dec.todo = dec.todo.wrapping_sub(1);
             if restart {
+                hot.set_ab_bl(ab, bl);
                 hot.write_back(&mut stream);
                 if dec.todo == 0 {
                     if dec.handle_rst_main(&mut stream).is_err() {
@@ -228,12 +246,17 @@ fn prescan_walk<const DISCARD: bool>(dec: &mut Decoder<'_>) -> Result<(u64, f64)
                     }
                     dc_pred_state.iter_mut().for_each(|x| *x = 0);
                     hot.reload(&stream);
+                    let (a, b) = hot.ab_bl();
+                    ab = a;
+                    bl = b;
                 }
             }
-            if hot.marker().is_some() && hot.bits_left() == 0 {
+            let bl_zero = bl == 0;
+            if hot.marker().is_some() && bl_zero {
                 break 'outer; // 生产 mcu.rs:624 同款断点
             }
         }
+        hot.set_ab_bl(ab, bl);
         hot.write_back(&mut stream);
         if let Some(m) = stream.marker {
             match m {

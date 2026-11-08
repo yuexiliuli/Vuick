@@ -24,6 +24,11 @@ impl<'a> ByteReader<'a> {
         self.pos
     }
 
+    /// 直接设定绝对位置（复用已解析头部状态时把读取器对准熵编码数据起点）。
+    pub(crate) fn set_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     /// 读单字节；EOF 返回 0 且不推进（复刻 zune `read_u8`/`read_byte_no_error`）。
     #[inline]
     pub(crate) fn read_u8(&mut self) -> u8 {

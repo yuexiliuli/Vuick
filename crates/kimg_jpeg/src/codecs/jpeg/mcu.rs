@@ -193,7 +193,6 @@ impl<'a> Decoder<'a> {
                 (hs, vs) => (SampleRatios::Generic(hs, vs), upsample_generic as _),
             };
             comp.sample_ratio = ratio;
-            comp.setup_upsample_scanline();
             comp.up_sampler = sampler;
         }
 
@@ -248,21 +247,13 @@ impl<'a> Decoder<'a> {
         let comp_len = self.components.len();
 
         for (pos, comp) in self.components.iter_mut().enumerate() {
-            // 仅分配需要的分量平面
-            if min(
+            // 仅标记需要的分量平面（`raw_coeff` 缓冲已随 zune 上采样休眠移除——
+            // 解码走 cs 环采样，raw_coeff 分配纯死，2026-11-08）。
+            comp.needed = min(
                 self.out_colorspace.num_components().saturating_sub(1),
                 pos,
             ) == pos
-                || comp_len == 4
-            {
-                // 容量为一整行 MCU 宽
-                let len = comp.width_stride * comp.vertical_sample * 8;
-
-                comp.needed = true;
-                comp.raw_coeff = vec![0; len];
-            } else {
-                comp.needed = false;
-            }
+                || comp_len == 4;
         }
 
         // 初始化 C# 数值核心状态（环/垂直游标/上采样核）。
@@ -459,10 +450,19 @@ impl<'a> Decoder<'a> {
         // 消融开关（仅 profile 模式生效，进程内只读一次）：墙钟差值得 entropy/idct 占比。
         let skip_entropy = StageProfile::skip_entropy();
         let skip_idct = StageProfile::skip_idct();
+        // 骨架归因消融：跳过每块 `tmp.fill(0)`（结果错误仅测墙钟，字节恒等必须回实路径）。
+        let skip_fill = StageProfile::skip_fill();
 
         // 寄存器化位流局部状态：整行 MCU 逐块解码共用一份，免逐块经 `stream` 内存往返
         // （省每块 6 字段快照/回写 + 独立函数调用/寄存器盘存）。
         let mut hot = HotStream::from_stream(stream);
+
+        // S3-A：基线跨块 (ab, bl) 寄存器驻留——行首取一次到局部、块环内以 value-return
+        // 传递，免每块 entry 载 / EOB·块尾两处写回经 hot 的内存往返（同 P1 decode_prog_*_v
+        // 姿势）。hot 自身的 aligned_buffer/bits_left 环内仅作惰性载体：restart / 行尾
+        // write_back 前经 `set_ab_bl` 同步，reload 后经 `ab_bl` 取回；buffer/marker/
+        // overread_by/seen_eoi 仍由 refill 实时维护（marker 断点逐块时机不变）。
+        let (mut ab, mut bl) = hot.ab_bl();
 
         // 非交织（PROGRESSIVE=true）时按该分量的实际数据单元数迭代
         let mut scan_du_width = if PROGRESSIVE {
@@ -515,9 +515,13 @@ impl<'a> Decoder<'a> {
         let restart = self.restart_interval != 0;
 
         // P-A2：双符号 AC 打包解码开关——行首一次判定（OnceLock 进程内只读一次），
-        // 块环内按寄存器布尔分支分发（预测恒走、无每符号/每块原子开销；缺省关 = HEAD
+        // 块环内按寄存器布尔分支分发（预测恒走、无每符号/块原子开销；缺省关 = HEAD
         // 单符号路径逐字节一致）。两条路径各自独立函数，互不影响彼此的代码生成。
         let dual = dual_sym_enabled();
+
+        // S1 稀疏 IDCT 开关——行首一次判定（OnceLock 进程内只读一次，K93 双路径）：
+        // `KIMG_JPEG_SPARSE_IDCT=0|false|off` 关 → 回 HEAD 旧全量核（字节恒等）。
+        let sparse = sparse_idct_enabled();
 
         for j in 0..scan_du_width {
             for &k in z_scans {
@@ -550,16 +554,18 @@ impl<'a> Decoder<'a> {
 
                         let result = if skip_entropy {
                             // 消融：跳过熵解码，tmp 填零、len=64（不消费位流；restart 语义靠调用方不触发）
-                            if component_samples_needed {
+                            if component_samples_needed && !skip_fill {
                                 tmp.fill(0);
                             }
                             Ok(64u16)
                         } else if component_samples_needed {
                             // C# `DecodeBlockCore` 每块清零全部 64 系数：不再用「只清首 32」
                             // 的窗口优化——稀疏块会混入上一满块的高位残值，污染全量 f32 IDCT。
-                            tmp.fill(0);
+                            if !skip_fill {
+                                tmp.fill(0);
+                            }
 
-                            if dual {
+                            let r = if dual {
                                 hot.decode_mcu_block_dual(
                                     &mut self.reader,
                                     dc_table,
@@ -568,6 +574,8 @@ impl<'a> Decoder<'a> {
                                     &component.quantization_zq,
                                     tmp,
                                     &mut component.dc_pred,
+                                    ab,
+                                    bl,
                                 )
                             } else {
                                 hot.decode_mcu_block(
@@ -578,12 +586,36 @@ impl<'a> Decoder<'a> {
                                     &component.quantization_zq,
                                     tmp,
                                     &mut component.dc_pred,
+                                    ab,
+                                    bl,
                                 )
+                            };
+                            match r {
+                                Ok((len, a, b)) => {
+                                    ab = a;
+                                    bl = b;
+                                    Ok(len)
+                                }
+                                Err(e) => Err(e),
                             }
                         } else if dual {
-                            hot.discard_mcu_block_dual(&mut self.reader, dc_table, ac_table)
+                            match hot.discard_mcu_block_dual(&mut self.reader, dc_table, ac_table, ab, bl) {
+                                Ok((len, a, b)) => {
+                                    ab = a;
+                                    bl = b;
+                                    Ok(len)
+                                }
+                                Err(e) => Err(e),
+                            }
                         } else {
-                            hot.discard_mcu_block(&mut self.reader, dc_table, ac_table)
+                            match hot.discard_mcu_block(&mut self.reader, dc_table, ac_table, ab, bl) {
+                                Ok((len, a, b)) => {
+                                    ab = a;
+                                    bl = b;
+                                    Ok(len)
+                                }
+                                Err(e) => Err(e),
+                            }
                         };
 
                         self.stage.busy_stop(Stage::Entropy, t_entropy);
@@ -627,7 +659,13 @@ impl<'a> Decoder<'a> {
                                 };
                                 if len <= 1 {
                                     cs::idct8x8_dc_only(tmp[0], out, off, stride);
+                                } else if sparse {
+                                    // S1：熵每块返回 len = zigzag 末位+1 → last=len-1，
+                                    // 按 MAX_ROW[MAX_COL][last] 4 态稀疏 IDCT（C# parity）。
+                                    cs::idct8x8_sparse(tmp, (len - 1) as usize, out, off, stride);
                                 } else {
+                                    // 门关（KIMG_JPEG_SPARSE_IDCT=0）：S1 之前的旧全量核，
+                                    // 与 HEAD `idct8x8` 路径逐字节一致（同二进制 A/B）。
                                     cs::idct8x8(tmp, out, off, stride);
                                 }
                             }
@@ -644,22 +682,31 @@ impl<'a> Decoder<'a> {
             self.todo = self.todo.wrapping_sub(1);
 
             if restart {
-                // 原每 MCU 回写 + RST 处理路径（restart≠0 图像，语义逐字节不变）
+                // 原每 MCU 回写 + RST 处理路径（restart≠0 图像，语义逐字节不变）：先把扫描级
+                // (ab,bl) 同步进 hot（write_back 依赖 hot.aligned_buffer/bits_left），reload 后取回。
+                hot.set_ab_bl(ab, bl);
                 hot.write_back(stream);
                 if self.todo == 0 {
                     self.handle_rst_main(stream)?;
                     hot.reload(stream);
+                    let (a, b) = hot.ab_bl();
+                    ab = a;
+                    bl = b;
                     continue;
                 }
             }
 
-            // 免回写：直接查 hot（= 原 write_back 后查 stream，逐字段等价）
-            if hot.marker().is_some() && hot.bits_left() == 0 {
+            // 免回写：直接查 hot（= 原 write_back 后查 stream，逐字段等价）；bits_left 读
+            // 行级局部 bl（hot 自身 bits_left 环内惰性，环尾才经 set_ab_bl 同步）。
+            let bl_zero = bl == 0;
+            if hot.marker().is_some() && bl_zero {
                 break;
             }
             self.stage.stop(Stage::McuRest, t_mcu);
         }
 
+        // 行尾：先同步扫描级 (ab,bl) 进 hot 再统一 write_back。
+        hot.set_ab_bl(ab, bl);
         hot.write_back(stream);
         self.check_stream_marker_after_mcu_width(stream)
     }
@@ -1517,19 +1564,13 @@ impl<'a> Decoder<'a> {
         let mut tmp = [0_i16; DCT_BLOCK];
 
         for (pos, comp) in self.components.iter_mut().enumerate() {
-            // 仅分配需要的分量平面
-            if min(
+            // 仅标记需要的分量平面（`raw_coeff` 缓冲已随 zune 上采样休眠移除，2026-11-08）。
+            comp.needed = min(
                 self.out_colorspace.num_components().saturating_sub(1),
                 pos,
             ) == pos
                 || self.input_colorspace == ColorSpace::YCCK
-                || self.input_colorspace == ColorSpace::CMYK
-            {
-                comp.needed = true;
-                comp.raw_coeff = vec![0; comp.width_stride * comp.vertical_sample * 8];
-            } else {
-                comp.needed = false;
-            }
+                || self.input_colorspace == ColorSpace::CMYK;
         }
 
         self.init_cs_tail();
@@ -1556,6 +1597,9 @@ impl<'a> Decoder<'a> {
         let fused = finish_fused_enabled();
         let fastpath = prog_fastpath_enabled();
         let maskp = popmask_profile_enabled();
+        // S4 稀疏 IDCT 开关（K93 双路径，同二进制 A/B）：同 baseline 的
+        // `KIMG_JPEG_SPARSE_IDCT`，门关 → fused 稀疏核回退 fused 全量核（逐字节一致）。
+        let sparse = sparse_idct_enabled();
         let mut pop = MaskProfile::default();
         let t_maskp = if maskp {
             Some(std::time::Instant::now())
@@ -1628,9 +1672,34 @@ impl<'a> Decoder<'a> {
                                     }
                                     // 候选 B：非 DC-only 块走 fused「反量化∘IDCT」（mullo 直喂
                                     // f32 装载，删 128B store+load+栈框；非零块不再算 ac_zero
-                                    // movemask 冗余比较）。mask 缺失（边际越界）→ 保守全量，
+                                    // movemask 冗余比较）。S4：mask 非零 → last =
+                                    // 63−lzcnt(mask)（C# JpegCore.cs:1826 直通），4 态
+                                    // 分发到 fused 稀疏核；mask 缺失（边际越界）→ 保守全量，
                                     // 全量 idct 对 DC-only 块亦恒等 → 任意情况字节恒等。
-                                    _ => {
+                                    Some(m) => {
+                                        if sparse {
+                                            let last = 63 - m.leading_zeros() as usize;
+                                            dequant_idct8x8_sparse(
+                                                qt_slice,
+                                                &qt16[position],
+                                                last,
+                                                &mut component.cs_ring,
+                                                ring_off,
+                                                component.width_stride,
+                                            );
+                                        } else {
+                                            // 门关（KIMG_JPEG_SPARSE_IDCT=0）：S4 之前的
+                                            // 旧 fused 全量核，逐字节一致（同二进制 A/B）。
+                                            dequant_idct8x8(
+                                                qt_slice,
+                                                &qt16[position],
+                                                &mut component.cs_ring,
+                                                ring_off,
+                                                component.width_stride,
+                                            );
+                                        }
+                                    }
+                                    None => {
                                         dequant_idct8x8(
                                             qt_slice,
                                             &qt16[position],
@@ -1711,6 +1780,22 @@ fn finish_fused_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let v = std::env::var("KIMG_JPEG_FINISH_FUSED").unwrap_or_default();
+        let t = v.trim();
+        !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+    })
+}
+
+/// S1+S4 稀疏 IDCT 开关（K93 双路径 A/B）：`KIMG_JPEG_SPARSE_IDCT` **默认开**，
+/// `=0/false/off` 关 → baseline 稀疏分发（`idct8x8_sparse`）与渐进 finish 的
+/// `dequant_idct8x8_sparse` 都走休眠的旧全量核（`idct8x8` / `dequant_idct8x8`），
+/// 门关行为与 S1/S4 之前逐字节一致（稀疏 ≡ 全量）——同二进制零代码回退开关。
+/// 进程内一次读（OnceLock），调用方在块环外取循环不变布尔，热环内无每块原子开销
+/// （同 `dual_sym_enabled` / `finish_fused_enabled` 姿势）。
+#[inline]
+fn sparse_idct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("KIMG_JPEG_SPARSE_IDCT").unwrap_or_default();
         let t = v.trim();
         !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
     })
@@ -1869,6 +1954,50 @@ fn dequant_idct8x8(
     let mut tmp = [0_i16; DCT_BLOCK];
     let _ = dequant_block(coeff, qt16, &mut tmp);
     cs::idct8x8(&tmp, out, offset, stride);
+}
+
+/// 反量化 ∘ 稀疏 IDCT 分派（S4）：AVX2 → `cs_avx2::dequant_idct8x8_sparse_avx2`
+/// （mullo 直喂 f32 稀疏 IDCT）；标量 → `dequant_block` + `cs::idct8x8_sparse_scalar`
+/// （逐位恒等）。`last` = 最高非零 zigzag 下标（≥1；==0 的 DC-only 由调用方 prog_mask
+/// 预判走 `idct8x8_dc_only`），half_row/half_col 由 `cs::MAX_ROW/MAX_COL` 派生。
+/// `coeff.len()` 须为 64；`out` 以 `(offset, stride)` 写 8×8 字节块。
+#[inline]
+fn dequant_idct8x8_sparse(
+    coeff: &[i16],
+    qt16: &[i16; 64],
+    last: usize,
+    out: &mut [u8],
+    offset: usize,
+    stride: usize,
+) {
+    debug_assert_eq!(coeff.len(), 64);
+    debug_assert!(last < 64);
+    let half_rows = cs::MAX_ROW[last.min(79)] < 4;
+    let half_cols = cs::MAX_COL[last.min(79)] < 4;
+    // 稠密全量态（MAX_ROW/MAX_COL 均 ≥4）：稀疏（全量）≡ 全量 → 直接走 fused 全量核，
+    // 免稀疏分发簿记（与 cs::idct8x8_sparse 同款汇聚，K108）。
+    if !half_rows && !half_cols {
+        dequant_idct8x8(coeff, qt16, out, offset, stride);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::codecs::jpeg::avx2::avx2_enabled() {
+        // SAFETY: 调用方保证 coeff 长度 64；avx2_enabled() 保证 CPU 支持 AVX2。
+        return unsafe {
+            crate::codecs::jpeg::cs_avx2::dequant_idct8x8_sparse_avx2(
+                coeff.as_ptr(),
+                qt16.as_ptr(),
+                half_rows,
+                half_cols,
+                out,
+                offset,
+                stride,
+            )
+        };
+    }
+    let mut tmp = [0_i16; DCT_BLOCK];
+    let _ = dequant_block(coeff, qt16, &mut tmp);
+    cs::idct8x8_sparse_scalar(&tmp, half_rows, half_cols, out, offset, stride);
 }
 
 /// 从位流中读取下一个 marker（读取到 marker 或 EOF）。
@@ -2093,6 +2222,81 @@ mod tests {
         }
         // 随机 500 例（含 16 位量化表折叠负与全零量化表）。
         for _ in 0..500 {
+            let mut coeff = [0i16; 64];
+            let dense = (lcg(&mut seed) >> 32) % 2 == 0;
+            for i in 0..64 {
+                coeff[i] = if dense {
+                    lcg(&mut seed) as i16
+                } else if i == 0 {
+                    lcg(&mut seed) as i16
+                } else if (lcg(&mut seed) >> 40) % 100 == 0 {
+                    lcg(&mut seed) as i16
+                } else {
+                    0
+                };
+            }
+            let mut qt16 = [0i16; 64];
+            for q in qt16.iter_mut() {
+                *q = match lcg(&mut seed) % 3 {
+                    0 => (lcg(&mut seed) % 256) as i16,
+                    _ => (lcg(&mut seed) % 65536) as i16,
+                };
+            }
+            check(&coeff, &qt16);
+        }
+    }
+
+    /// 稀疏 fused「反量化∘IDCT」内核（S4）≡ 分阶段「dequant_block → 稀疏 IDCT」。
+    /// 对随机/单一 AC 逐位/全零/仅 DC 等形态：用 raw 系数最高的非零 zigzag 下标
+    /// （与生产 prog_mask 的 last 同口径）派生 half 旗标，断言 mcu 侧 fused 稀疏分派
+    /// 与 dequant_block_avx2 + cs 稀疏标量逐位恒等；dequant/稀疏各自已被既有测试
+    /// 证 ≡ 标量全量，链式闭合「fused 稀疏 ≡ 标量全量」。
+    #[test]
+    fn dequant_idct_sparse_fused_eq_staged() {
+        use crate::codecs::jpeg::segment::UN_ZIGZAG;
+        if !crate::codecs::jpeg::avx2::avx2_enabled() {
+            return;
+        }
+        let zigzag_last = |data: &[i16; 64]| {
+            let mut last = 0usize;
+            for (n, &v) in data.iter().enumerate() {
+                if v != 0 {
+                    last = last.max(UN_ZIGZAG.iter().position(|&x| x == n).unwrap_or(0));
+                }
+            }
+            last
+        };
+        let check = |coeff: &[i16; 64], qt16: &[i16; 64]| {
+            let last = zigzag_last(coeff);
+            let hr = cs::MAX_ROW[last.min(79)] < 4;
+            let hc = cs::MAX_COL[last.min(79)] < 4;
+            // 分阶段参照：dequant_block_avx2 → cs::idct8x8_sparse_scalar
+            let mut tmp = [0i16; 64];
+            // SAFETY: 已门控 AVX2
+            unsafe { super::dequant_block_avx2(coeff, qt16, &mut tmp) };
+            let mut ref_out = [0u8; 64];
+            cs::idct8x8_sparse_scalar(&tmp, hr, hc, &mut ref_out, 0, 8);
+            // fused 稀疏：经 mcu 侧分派（avx2 已门控 → cs_avx2::dequant_idct8x8_sparse_avx2）
+            let mut fused_out = [0u8; 64];
+            super::dequant_idct8x8_sparse(coeff, qt16, last, &mut fused_out, 0, 8);
+            assert_eq!(fused_out, ref_out, "fused 稀疏 ≠ staged 稀疏 (last={last}, hr={hr}, hc={hc})");
+        };
+        // 仅 DC（含极值）→ last=0
+        for &dc in &[0i16, 1, 12345, i16::MIN, i16::MAX, -32768, 32767] {
+            let mut coeff = [0i16; 64];
+            coeff[0] = dc;
+            check(&coeff, &[8i16; 64]);
+        }
+        // 单一 AC 逐位：覆盖双 half（zigzag 0..9）、半列（10..13）、全量（14+）三态
+        for ac_idx in 1..64i32 {
+            let mut coeff = [0i16; 64];
+            coeff[0] = 100;
+            coeff[ac_idx as usize] = 300;
+            check(&coeff, &[8i16; 64]);
+        }
+        // 随机（含 16 位量化表折叠负、全零量化表 → mask 位保守但 dequant 归零边角）
+        let mut seed = 0xC0FFEE_2026u64;
+        for _ in 0..800 {
             let mut coeff = [0i16; 64];
             let dense = (lcg(&mut seed) >> 32) % 2 == 0;
             for i in 0..64 {

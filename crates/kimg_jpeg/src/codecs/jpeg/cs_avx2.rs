@@ -31,6 +31,10 @@ mod kernels {
     // ------------------------------------------------------------------
 
     /// `Idct1D(Vector256<float>)` 逐句镜像：每 lane 的 op 序 = `cs::idct_1d` 标量。
+    /// `#[inline]`：返回 8×`__m256` 元组；非内联时 Win64 聚合返回经 sret 落栈
+    /// （256B store+load 往返/次），必须内联进 `idct_from_rows_*` 调用方
+    /// （stable 工具链禁 `#[inline(always)]` 配 `#[target_feature]`，用 `#[inline]` 提示）。
+    #[inline]
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn idct_1d256(
@@ -92,6 +96,8 @@ mod kernels {
     }
 
     /// 8×8 f32 转置（`JpegIdct.Transpose` Vector256 分支逐句镜像）。
+    /// `#[inline]`：随 `idct_from_rows_*` 内联为纯寄存器 shuffle，无调用/栈框。
+    #[inline]
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn transpose_ps(
@@ -179,7 +185,7 @@ mod kernels {
     /// 与旧 `idct8x8_avx2` 从「列 pass」起的逐条指令一致；f0..f7 的来源（`load_row_f32`
     /// 或 fused 反量化后的 `dequant_row_f32`）不影响逐字节结果。
     /// `#[inline]`：8 个 `__m256` 行参数若非内联会按 Win64 约定只传 4 个向量寄存器、
-    /// 其余落栈（重新引入旧「128B store+load」往返 + 一次调用/栈框），故尽量内联进调用方。
+    /// 其余落栈（重新引入旧「128B store+load」往返 + 一次调用/栈框），故加提示内联进调用方。
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn idct_from_rows_avx2(
@@ -203,8 +209,32 @@ mod kernels {
         let (c0, c1, c2, c3, c4, c5, c6, c7) =
             idct_1d256(r0, r1, r2, r3, r4, r5, r6, r7);
 
-        // 输出装配（转置折叠进 pack）：trunc(s + 128.5) + 饱和 pack = `ToSample` 的
-        // trunc + clamp[0,255]（packssdw→packuswb 同款论证）。逐元素算术/取整不变。
+        write_rows_from_columns_avx2(c0, c1, c2, c3, c4, c5, c6, c7, out, offset, stride);
+    }
+
+    /// 8 个「列向量」c_k（= 最终输出第 k 列，8 lane = 8 行）→ 逐行写 8×8 字节块：
+    /// trunc(s + 128.5) + 饱和 pack = `ToSample` 的 trunc + clamp[0,255]
+    /// （packssdw→packuswb 同款论证）；转置折叠进字节装配（P-B1）。全量/稀疏
+    /// IDCT 共用尾部。
+    /// `#[inline]`（评审 NIT2）：8 个 `__m256` 值参数超过 Win64 向量参数寄存器
+    /// 上限（仅 4 个），非内联时 c4..c7 落栈 = 每块 128B store+load 往返，影响含 dense
+    /// 的所有 IDCT 路径；必须内联进 `idct_from_rows_*`。
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn write_rows_from_columns_avx2(
+        c0: __m256,
+        c1: __m256,
+        c2: __m256,
+        c3: __m256,
+        c4: __m256,
+        c5: __m256,
+        c6: __m256,
+        c7: __m256,
+        out: &mut [u8],
+        offset: usize,
+        stride: usize,
+    ) {
         let bias = _mm256_set1_ps(BIAS);
         let i0 = _mm256_cvttps_epi32(_mm256_add_ps(c0, bias));
         let i1 = _mm256_cvttps_epi32(_mm256_add_ps(c1, bias));
@@ -234,6 +264,179 @@ mod kernels {
         for (r, &v) in rows.iter().enumerate() {
             core::ptr::write_unaligned(dst.add(r * stride) as *mut u64, v);
         }
+    }
+
+    /// `JpegIdct.Idct1DHalf(Vector256<float>)` 逐句镜像：f4..f7 恒 +0 时与
+    /// `idct_1d256` 逐位恒等（C# 426-431 论证），删 f4..f7 各项的半 pass。
+    /// `#[inline]`：返回 8×`__m256` 元组，非内联沿 sret 落栈（同 `idct_1d256`）。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn idct_1d_half256(
+        f0: __m256,
+        f1: __m256,
+        f2: __m256,
+        f3: __m256,
+    ) -> (__m256, __m256, __m256, __m256, __m256, __m256, __m256, __m256) {
+        let k4 = _mm256_set1_ps(K4);
+        let k2 = _mm256_set1_ps(C2);
+        let k6 = _mm256_set1_ps(C6);
+        let k1 = _mm256_set1_ps(C1);
+        let k3 = _mm256_set1_ps(C3);
+        let k5 = _mm256_set1_ps(C5);
+        let k7 = _mm256_set1_ps(C7);
+        let a0 = _mm256_mul_ps(f0, k4);
+        let b0 = _mm256_mul_ps(f2, k2);
+        let b1 = _mm256_mul_ps(f2, k6);
+        let e0 = _mm256_add_ps(a0, b0);
+        let e1 = _mm256_add_ps(a0, b1);
+        let e2 = _mm256_sub_ps(a0, b1);
+        let e3 = _mm256_sub_ps(a0, b0);
+        let o0 = _mm256_add_ps(_mm256_mul_ps(f1, k1), _mm256_mul_ps(f3, k3));
+        let o1 = _mm256_sub_ps(_mm256_mul_ps(f1, k3), _mm256_mul_ps(f3, k7));
+        let o2 = _mm256_sub_ps(_mm256_mul_ps(f1, k5), _mm256_mul_ps(f3, k1));
+        let o3 = _mm256_sub_ps(_mm256_mul_ps(f1, k7), _mm256_mul_ps(f3, k5));
+        let s0 = _mm256_add_ps(e0, o0);
+        let s1 = _mm256_add_ps(e1, o1);
+        let s2 = _mm256_add_ps(e2, o2);
+        let s3 = _mm256_add_ps(e3, o3);
+        let s4 = _mm256_sub_ps(e3, o3);
+        let s5 = _mm256_sub_ps(e2, o2);
+        let s6 = _mm256_sub_ps(e1, o1);
+        let s7 = _mm256_sub_ps(e0, o0);
+        (s0, s1, s2, s3, s4, s5, s6, s7)
+    }
+
+    /// 稀疏 IDCT 公共体（`JpegIdct.TransformV256Rows` 镜像）：`half_rows` → 列 pass 半
+    /// （f4..f7 视为 +0），`half_cols` → 行 pass 半；转置 + 输出尾部与全量共用。
+    /// `#[inline]`：8 行参数 + 8 列输出，非内联按 Win64 双双落栈（sret/栈参），
+    /// 尽量内联进 4 个稀疏/融合入口核。
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn idct_from_rows_sparse_avx2(
+        f0: __m256,
+        f1: __m256,
+        f2: __m256,
+        f3: __m256,
+        f4: __m256,
+        f5: __m256,
+        f6: __m256,
+        f7: __m256,
+        half_rows: bool,
+        half_cols: bool,
+        out: &mut [u8],
+        offset: usize,
+        stride: usize,
+    ) {
+        let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5, mut r6, mut r7) = if half_rows {
+            idct_1d_half256(f0, f1, f2, f3)
+        } else {
+            idct_1d256(f0, f1, f2, f3, f4, f5, f6, f7)
+        };
+        transpose_ps(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7);
+        let (c0, c1, c2, c3, c4, c5, c6, c7) = if half_cols {
+            idct_1d_half256(r0, r1, r2, r3)
+        } else {
+            idct_1d256(r0, r1, r2, r3, r4, r5, r6, r7)
+        };
+        write_rows_from_columns_avx2(c0, c1, c2, c3, c4, c5, c6, c7, out, offset, stride);
+    }
+
+    /// 非融合稀疏 IDCT：`half_rows` → 只装载行 0-3（f4..f7 置 +0）；`half_cols` →
+    /// 行 pass 半。对满足 sparsity 约束的输入与 `idct8x8_avx2` 逐位恒等（C# 93 论证）。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn idct8x8_sparse_avx2(
+        data: &[i16; 64],
+        half_rows: bool,
+        half_cols: bool,
+        out: &mut [u8],
+        offset: usize,
+        stride: usize,
+    ) {
+        let d = data.as_ptr();
+        let z = _mm256_setzero_ps();
+        let (f0, f1, f2, f3, f4, f5, f6, f7) = if half_rows {
+            (
+                load_row_f32(d, 0),
+                load_row_f32(d, 1),
+                load_row_f32(d, 2),
+                load_row_f32(d, 3),
+                z,
+                z,
+                z,
+                z,
+            )
+        } else {
+            (
+                load_row_f32(d, 0),
+                load_row_f32(d, 1),
+                load_row_f32(d, 2),
+                load_row_f32(d, 3),
+                load_row_f32(d, 4),
+                load_row_f32(d, 5),
+                load_row_f32(d, 6),
+                load_row_f32(d, 7),
+            )
+        };
+        idct_from_rows_sparse_avx2(f0, f1, f2, f3, f4, f5, f6, f7, half_rows, half_cols, out, offset, stride);
+    }
+
+    /// 反量化 ∘ 稀疏 IDCT 融合内核（S4）：mullo 得 4×`__m256i` i16 lane 后直喂
+    /// `dequant_row_f32`；`half_rows` → 仅取行 0-3（行 4-7 mullo(0,q)≡0 与变换全跳过），
+    /// `half_cols` → 行 pass 半。字节恒等 = `dequant_block` ∘ `cs::idct8x8_sparse_scalar`
+    /// （dequant 每元素恒等 + 稀疏 IDCT ≡ 全量，见 cs 论证）。
+    /// SAFETY: `coeff`/`qt16` 指向 64 i16 有效内存；`out.add(offset)` 起按 `(offset, stride)`
+    /// 可写 8×8 字节；CPU 已由 `avx2_enabled()` 门控 AVX2。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn dequant_idct8x8_sparse_avx2(
+        coeff: *const i16,
+        qt16: *const i16,
+        half_rows: bool,
+        half_cols: bool,
+        out: &mut [u8],
+        offset: usize,
+        stride: usize,
+    ) {
+        let c0 = _mm256_loadu_si256(coeff.add(0) as *const __m256i);
+        let c1 = _mm256_loadu_si256(coeff.add(16) as *const __m256i);
+        let c2 = _mm256_loadu_si256(coeff.add(32) as *const __m256i);
+        let c3 = _mm256_loadu_si256(coeff.add(48) as *const __m256i);
+        let q0 = _mm256_loadu_si256(qt16.add(0) as *const __m256i);
+        let q1 = _mm256_loadu_si256(qt16.add(16) as *const __m256i);
+        let q2 = _mm256_loadu_si256(qt16.add(32) as *const __m256i);
+        let q3 = _mm256_loadu_si256(qt16.add(48) as *const __m256i);
+        // 反量化：mullo_epi16 = 每 16 位乘积的低 16 位（`(short)(coeff×q)` 截断 wrap）。
+        let p0 = _mm256_mullo_epi16(c0, q0);
+        let p1 = _mm256_mullo_epi16(c1, q1);
+        let p2 = _mm256_mullo_epi16(c2, q2);
+        let p3 = _mm256_mullo_epi16(c3, q3);
+        let z = _mm256_setzero_ps();
+        // 每 lane 16 i16 = 自然序两行（low=行 2t、high=行 2t+1）。half_rows → 只需行 0-3。
+        let (f0, f1, f2, f3, f4, f5, f6, f7) = if half_rows {
+            (
+                dequant_row_f32(p0, false),
+                dequant_row_f32(p0, true),
+                dequant_row_f32(p1, false),
+                dequant_row_f32(p1, true),
+                z,
+                z,
+                z,
+                z,
+            )
+        } else {
+            (
+                dequant_row_f32(p0, false),
+                dequant_row_f32(p0, true),
+                dequant_row_f32(p1, false),
+                dequant_row_f32(p1, true),
+                dequant_row_f32(p2, false),
+                dequant_row_f32(p2, true),
+                dequant_row_f32(p3, false),
+                dequant_row_f32(p3, true),
+            )
+        };
+        idct_from_rows_sparse_avx2(f0, f1, f2, f3, f4, f5, f6, f7, half_rows, half_cols, out, offset, stride);
     }
 
     /// 反量化 ∘ IDCT 融合内核（候选 B）：mullo 得 4×`__m256i` i16 lane 后直喂
@@ -279,11 +482,14 @@ mod kernels {
     /// P-B1 输出装配：8 个「列向量」i32（I_k = M2 第 k 列的取整样本）→ 两段行主序
     /// 字节（b0123 = 行 0-3，b4567 = 行 4-7）。转置折叠进 pack（vshufb + vperm2i128 +
     /// vpor），逐字节恒等、无算术。
+    /// `#[inline]`：8 个 `__m256i` 值参数超出 Win64 向量参数寄存器上限，非内联
+    /// 即 c4..c7 落栈（128B store+load/块）；由 `write_rows_from_columns_avx2` 内联调用。
     ///
     /// 布局（packus_epi16 = [a.low, b.low, a.high, b.high]）：
     /// q0 = [行0-3 的 c0..c3 | 行4-7 的 c0..c3]，q1 = 同换 c4..c7。
     /// 先 per-lane vshufb 把每 lane 的 4 列重排成「每行 4 字节连续」（m_rows），
     /// 再 vperm2i128 各自复制（l0→l0/l1、l1→l0/l1），最后 mG/mH 抹选 + or 拼出各行 8 字节。
+    #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn pack_column_rows_to_bytes(
         i0: __m256i,
@@ -790,5 +996,6 @@ mod kernels {
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) use kernels::{
-    dequant_idct8x8_avx2, idct8x8_avx2, row16_avx2, row8_avx2, ycc_row16_avx2, ycc_row8_avx2,
+    dequant_idct8x8_avx2, dequant_idct8x8_sparse_avx2, idct8x8_avx2, idct8x8_sparse_avx2,
+    row16_avx2, row8_avx2, ycc_row16_avx2, ycc_row8_avx2,
 };

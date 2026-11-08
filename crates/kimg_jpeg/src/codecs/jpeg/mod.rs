@@ -23,8 +23,8 @@ mod prescan_probe;
 mod segment;
 mod upsampler;
 
+use std::borrow::Cow;
 use std::io::{BufRead, Seek};
-use std::marker::PhantomData;
 
 use kimg_core::color::{ColorType, ExtendedColorType};
 use kimg_core::error::{
@@ -38,11 +38,20 @@ use kimg_core::ImageFormatHint;
 
 use crate::codecs::jpeg::error::DecodeError;
 use crate::codecs::jpeg::mcu::{decode_baseline, decode_progressive};
-use crate::codecs::jpeg::segment::{ColorSpace, Decoder, Stage};
+use crate::codecs::jpeg::segment::{ColorSpace, Decoder, HeaderState, Stage};
 
-/// 自研 JPEG 解码器（泛型参数 `R` 与旧 wrapper 同款占位）。
-pub struct JpegDecoder<R> {
-    input: Vec<u8>,
+/// 自研 JPEG 解码器。
+///
+/// 输入字节两种持有方式（C1 零拷贝）：
+/// - `from_bytes(&'a [u8])`：直接借用调用方切片（`load_from_memory` 内存路径，零拷贝）；
+/// - `new(reader: R)`：自通用读取器读入自有输入（向后兼容旧 API；对内存切片读者是一次复制）。
+///
+/// 构造（`new`/`from_bytes`）只做一遍 header 解析，结果缓存于 `seed: HeaderState`，
+/// `read_image` 复用它构造解码用 `Decoder`（C2 免第二遍解析）。
+pub struct JpegDecoder<'a> {
+    input: Cow<'a, [u8]>,
+    /// 头部解析结果（`extract_header_state`），解码时 `restore_header_state` 复用。
+    seed: HeaderState,
     width: u32,
     height: u32,
     color_type: ColorType,
@@ -55,16 +64,28 @@ pub struct JpegDecoder<R> {
     iptc: Option<Vec<u8>>,
     /// 输入颜色空间（决定输出颜色类型的映射）。
     input_colorspace: ColorSpace,
-    phantom: PhantomData<R>,
 }
 
-impl<R: BufRead + Seek> JpegDecoder<R> {
-    /// 构造并读取头信息（一次性完成段解析与元数据抓取）。
-    pub fn new(mut r: R) -> ImageResult<JpegDecoder<R>> {
+impl<'a> JpegDecoder<'a> {
+    /// 零拷贝构造：借用调用方字节（内存路径，与 C# 参照同口径无输入复制）。
+    pub fn from_bytes(data: &'a [u8]) -> ImageResult<JpegDecoder<'a>> {
+        JpegDecoder::build(Cow::Borrowed(data))
+    }
+}
+
+impl JpegDecoder<'static> {
+    /// 通用读取器构造（向后兼容旧 `new(reader)`）：`R: BufRead + Seek`，读入自有输入。
+    pub fn new<R: BufRead + Seek>(mut r: R) -> ImageResult<JpegDecoder<'static>> {
         let mut input = Vec::new();
         r.read_to_end(&mut input).map_err(ImageError::from)?;
+        JpegDecoder::build(Cow::Owned(input))
+    }
+}
 
-        let mut dec = Decoder::new(&input);
+impl<'a> JpegDecoder<'a> {
+    /// 共享构造：一遍 header 解析并缓存解码种子（C1 输入不复制、C2 解析只一遍）。
+    fn build(input: Cow<'a, [u8]>) -> ImageResult<JpegDecoder<'a>> {
+        let mut dec = Decoder::new(input.as_ref());
         dec.decode_headers_internal().map_err(from_kimg_jpeg)?;
 
         let input_colorspace = dec.input_colorspace;
@@ -77,6 +98,13 @@ impl<R: BufRead + Seek> JpegDecoder<R> {
             .and_then(|exif| Orientation::from_exif_chunk(exif))
             .unwrap_or(Orientation::NoTransforms);
 
+        // 解码种子先提取（move 出 components/huffman/量化表），再取 metadata（互不干扰）。
+        let seed = dec.extract_header_state();
+        let icc = dec.icc_profile();
+        let exif = dec.exif_data.take();
+        let xmp = dec.xmp_data.take();
+        let iptc = dec.iptc_data.take();
+
         Ok(JpegDecoder {
             color_type: color_type_for(&input_colorspace),
             orig_color_type: orig_color_type_for(&input_colorspace),
@@ -85,17 +113,17 @@ impl<R: BufRead + Seek> JpegDecoder<R> {
             height,
             limits: Limits::no_limits(),
             orientation: Some(orientation),
-            icc: dec.icc_profile(),
-            exif: dec.exif_data.take(),
-            xmp: dec.xmp_data.take(),
-            iptc: dec.iptc_data.take(),
+            icc,
+            exif,
+            xmp,
+            iptc,
             input,
-            phantom: PhantomData,
+            seed,
         })
     }
 }
 
-impl<R> ImageDecoder for JpegDecoder<R> {
+impl<'a> ImageDecoder for JpegDecoder<'a> {
     fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -152,9 +180,11 @@ impl<R> ImageDecoder for JpegDecoder<R> {
         self.limits.check_dimensions(self.width, self.height)?;
 
         let target_out = output_for_input(self.input_colorspace);
+        // C2：复用构造期缓存好的头部状态（免第二遍 header 解析）；
+        // `decode_baseline/progressive` 内部二次 `decode_headers_internal` 亦短路。
         let mut dec = Decoder::new(&self.input);
         let t_header = dec.stage.timer();
-        dec.decode_headers_internal().map_err(from_kimg_jpeg)?;
+        dec.restore_header_state(self.seed);
         dec.stage.stop(Stage::Header, t_header);
         if dec.is_progressive {
             decode_progressive(&mut dec, target_out, buf).map_err(from_kimg_jpeg)?;

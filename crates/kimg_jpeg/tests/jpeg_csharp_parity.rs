@@ -1,7 +1,7 @@
 //! JPEG 自研引擎 vs C# Sdcb.SimdCodecs.Jpeg `DecodeTo` 参照字节恒等对照（正确性硬闸）。
 //!
 //! 语料：`<workspace>/Benchmarks/corpus/JPEG`（446 = Sdcb 官方矩阵；env `KIMG_JPEG_CORPUS` 可覆盖）。
-//! 参照：`<workspace>/target/csharp-ref`（外部 C# runner 产出，每语料一张）：
+//! 参照：`<workspace>/target/csharp-ref/jpeg`（外部 C# runner 产出，每语料一张）：
 //! `<stem>.<w>x<h>.{gray|rgb}`。gray = 灰度 1B/像素（= 我们 `ColorType::L8`），
 //! rgb = 交错 RGB 3B/像素（= 我们 `ColorType::Rgb8`）。
 //! 自研 `codecs::jpeg::JpegDecoder` 以 `ImageDecoder` 同口径解码到其声明的 color_type，
@@ -18,41 +18,33 @@
 
 mod fixtures;
 
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use kimg_core::ColorType;
+use kimg_core::ImageDecoder as _;
 use kimg_jpeg::codecs::jpeg::JpegDecoder as NewJpeg;
 
 use fixtures::*;
 
-/// 参照目录：`<workspace>/target/csharp-ref`。
+/// 参照目录：`<workspace>/target/csharp-ref/jpeg`（jpeg 专用子目录，防与 png 等格式参照互清）。
 fn csharp_ref_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("target")
         .join("csharp-ref")
+        .join("jpeg")
 }
 
 /// 用新解码器同口径解出 (width, height, color_type, bytes)。
-fn decode<D: kimg_core::ImageDecoder + Sized>(
-    new_dec: impl FnOnce(Cursor<Vec<u8>>) -> Result<D, String>,
-    bytes: &[u8],
-) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>), String> {
-    let dec = new_dec(Cursor::new(bytes.to_vec()))?;
+/// 走零拷贝内存路径（C1）：直接借用输入切片；解码复用构造期缓存头部状态（C2）。
+fn new_decode(bytes: &[u8]) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>), String> {
+    let dec = NewJpeg::from_bytes(bytes).map_err(|e| e.to_string())?;
     let (w, h) = dec.dimensions();
     let ct = dec.color_type();
     let mut buf = vec![0u8; dec.total_bytes() as usize];
     dec.read_image(&mut buf).map_err(|e| e.to_string())?;
     Ok((w, h, ct, buf))
-}
-
-fn new_decode(bytes: &[u8]) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>), String> {
-    decode(
-        |c| NewJpeg::new(c).map_err(|e| e.to_string()),
-        bytes,
-    )
 }
 
 /// 单文件：尺寸/颜色类型/字节 三者与 C# 参照完全一致。
@@ -81,7 +73,7 @@ fn assert_csharp_parity(
         (gray_cand, "gray")
     } else {
         return Err(format!(
-            "no C# ref for {name}: expected target/csharp-ref/{stem}.{w}x{h}.[rgb|gray]"
+            "no C# ref for {name}: expected target/csharp-ref/jpeg/{stem}.{w}x{h}.[rgb|gray]"
         ));
     };
 
@@ -163,7 +155,7 @@ fn corpus_csharp_parity() {
     let ref_dir = csharp_ref_dir();
     assert!(
         ref_dir.is_dir(),
-        "missing target/csharp-ref — run the C# reference emitter first: {}",
+        "missing target/csharp-ref/jpeg — run the C# reference emitter first: {}",
         ref_dir.display()
     );
     let mut oks = 0usize;

@@ -135,10 +135,189 @@ fn idct8x8_scalar(data: &[i16; 64], out: &mut [u8], offset: usize, stride: usize
 /// DC-only 块：每个样本 = `((float)dc * K4) * K4`（与全量变换逐位恒等，快路径）。
 pub(crate) fn idct8x8_dc_only(dc: i16, out: &mut [u8], offset: usize, stride: usize) {
     let v = to_sample((f32::from(dc) * K4) * K4);
-    for y in 0..8 {
-        let o = offset + y * stride;
-        out[o..o + 8].fill(v);
+    // stride 为 8 的倍数时（本仓调用点各平面行宽均为 8 倍数）每行 8 字节按单个
+    // `[u8; 8]` 拷贝（x86 上展开为一次 8 字节写而非逐字节 fill），字节恒等。
+    if stride % 8 == 0 {
+        let word = [v; 8];
+        for y in 0..8 {
+            let o = offset + y * stride;
+            let dst: &mut [u8; 8] = (&mut out[o..o + 8]).try_into().unwrap();
+            *dst = word;
+        }
+    } else {
+        for y in 0..8 {
+            let o = offset + y * stride;
+            out[o..o + 8].fill(v);
+        }
     }
+}
+
+// ==========================================================================
+// 稀疏 IDCT（C# `JpegIdct.Idct8x8(..., last)` 4 态分发；C# 96-146 直译）
+// ==========================================================================
+
+/// 生成 C# `JpegIdct.MaxRow/MaxCol` 表（80 项、钳 79）——编译期求值，与 C#
+/// JpegIdct.cs 静态构造器（98-122）逐入口同构：`MAX_ROW[k]`/`MAX_COL[k]` =
+/// zigzag 位置 0..=k 内最大行/列号；`< 4` ⟺ 该前缀内系数行/列全在 0..3。
+/// 本表与 `segment::UN_ZIGZAG`（同一标准 JPEG 反锯齿序）自洽；两表都含 64..79
+/// 的 7 填充（C# 显式补 7，本实现以初值 [7;80] 等效）。
+pub(crate) const MAX_ROW: [u8; 80] = build_sparse_tables().0;
+pub(crate) const MAX_COL: [u8; 80] = build_sparse_tables().1;
+
+const fn build_sparse_tables() -> ([u8; 80], [u8; 80]) {
+    let mut max_row = [7u8; 80];
+    let mut max_col = [7u8; 80];
+    let mut cur_row = 0u8;
+    let mut cur_col = 0u8;
+    let mut k = 0usize;
+    let mut s = 0i32;
+    while s < 15 {
+        let mut t = 0i32;
+        while t <= s {
+            let row = if s % 2 == 0 { s - t } else { t };
+            let col = s - row;
+            if row <= 7 && col <= 7 {
+                if row > cur_row as i32 {
+                    cur_row = row as u8;
+                }
+                if col > cur_col as i32 {
+                    cur_col = col as u8;
+                }
+                max_row[k] = cur_row;
+                max_col[k] = cur_col;
+                k += 1;
+            }
+            t += 1;
+        }
+        s += 1;
+    }
+    (max_row, max_col)
+}
+
+/// 1-D 半 pass（`JpegIdct.Idct1DHalf` 标量）：f4..f7 恒 +0 时与 `idct_1d` 逐位恒等
+/// （0·C=+0、n±0=n、整数输入不产生 −0，C# 86-93 论证），删 f4..f7 项后左→右求值逐项一致。
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn idct_1d_half(f0: f32, f1: f32, f2: f32, f3: f32) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+    let a0 = f0 * K4;
+    let b0 = f2 * C2;
+    let b1 = f2 * C6;
+    let e0 = a0 + b0;
+    let e1 = a0 + b1;
+    let e2 = a0 - b1;
+    let e3 = a0 - b0;
+    let o0 = f1 * C1 + f3 * C3;
+    let o1 = f1 * C3 - f3 * C7;
+    let o2 = f1 * C5 - f3 * C1;
+    let o3 = f1 * C7 - f3 * C5;
+    let s0 = e0 + o0;
+    let s1 = e1 + o1;
+    let s2 = e2 + o2;
+    let s3 = e3 + o3;
+    let s4 = e3 - o3;
+    let s5 = e2 - o2;
+    let s6 = e1 - o1;
+    let s7 = e0 - o0;
+    (s0, s1, s2, s3, s4, s5, s6, s7)
+}
+
+/// 标量稀疏 IDCT：`half_rows`（系数行 4-7 恒零 → 列 pass 半）+ `half_cols`
+/// （系数列 4-7 恒零 → 行 pass 半），`TransformScalar` 同款先列后行。对满足
+/// sparsity 约束的输入与 `idct8x8_scalar` 逐位恒等（C# 93 论证；`dconly` 由
+/// `last==0` 分支外置，本函数只处理 last≥1）。
+pub(crate) fn idct8x8_sparse_scalar(
+    data: &[i16; 64],
+    half_rows: bool,
+    half_cols: bool,
+    out: &mut [u8],
+    offset: usize,
+    stride: usize,
+) {
+    let mut t = [0.0f32; 64];
+    for x in 0..8 {
+        let (s0, s1, s2, s3, s4, s5, s6, s7) = if half_rows {
+            idct_1d_half(
+                f32::from(data[x]),
+                f32::from(data[8 + x]),
+                f32::from(data[16 + x]),
+                f32::from(data[24 + x]),
+            )
+        } else {
+            idct_1d(
+                f32::from(data[x]),
+                f32::from(data[8 + x]),
+                f32::from(data[16 + x]),
+                f32::from(data[24 + x]),
+                f32::from(data[32 + x]),
+                f32::from(data[40 + x]),
+                f32::from(data[48 + x]),
+                f32::from(data[56 + x]),
+            )
+        };
+        t[x] = s0;
+        t[8 + x] = s1;
+        t[16 + x] = s2;
+        t[24 + x] = s3;
+        t[32 + x] = s4;
+        t[40 + x] = s5;
+        t[48 + x] = s6;
+        t[56 + x] = s7;
+    }
+    for y in 0..8 {
+        let r = &t[y * 8..y * 8 + 8];
+        let (s0, s1, s2, s3, s4, s5, s6, s7) = if half_cols {
+            idct_1d_half(r[0], r[1], r[2], r[3])
+        } else {
+            idct_1d(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7])
+        };
+        let o = offset + y * stride;
+        out[o] = to_sample(s0);
+        out[o + 1] = to_sample(s1);
+        out[o + 2] = to_sample(s2);
+        out[o + 3] = to_sample(s3);
+        out[o + 4] = to_sample(s4);
+        out[o + 5] = to_sample(s5);
+        out[o + 6] = to_sample(s6);
+        out[o + 7] = to_sample(s7);
+    }
+}
+
+/// C# `JpegIdct.Idct8x8(..., last)` 稀疏分发镜像：`last` = 最高非零 zigzag 下标
+/// （0 = 仅 DC）。`last==0 → DC-only`；否则按 `MAX_ROW/MAX_COL[last]` 四态
+/// （max<4/min 单半/全量），其中「行、列均 <4」（last∈1..9 的双 half）是独立态、
+/// 非 DC-only（含低 AC 项的 4×4 块 ≠ 纯 DC，C# 默认 kernel 同款处理）。
+pub(crate) fn idct8x8_sparse(
+    data: &[i16; 64],
+    last: usize,
+    out: &mut [u8],
+    offset: usize,
+    stride: usize,
+) {
+    debug_assert!(last < 64, "sparse idct last={last} 越界");
+    if last == 0 {
+        idct8x8_dc_only(data[0], out, offset, stride);
+        return;
+    }
+    // 防御性钳 79（C# `if last>=80 → 79`；实际 last≤63，恒不触发）
+    let idx = last.min(79);
+    let half_rows = MAX_ROW[idx] < 4;
+    let half_cols = MAX_COL[idx] < 4;
+    // 稠密全量态（MAX_ROW/MAX_COL 均 ≥4，zigzag 下标 ≥14）：稀疏（全量态）内核与
+    // 全量内核逐位恒等（sparse_dispatch_eq_full 已证）→ 直接走 `idct8x8`，免稀疏分发
+    // 簿记 + 稀疏入口核的重复体（防止 dense 块被稀疏分发路径拖回，K108 汇聚度）。
+    if !half_rows && !half_cols {
+        idct8x8(data, out, offset, stride);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if super::avx2::avx2_enabled() {
+        // SAFETY: avx2_enabled() 已保证 CPU 支持 AVX2 且未被 env 关闭。
+        unsafe {
+            super::cs_avx2::idct8x8_sparse_avx2(data, half_rows, half_cols, out, offset, stride)
+        };
+        return;
+    }
+    idct8x8_sparse_scalar(data, half_rows, half_cols, out, offset, stride);
 }
 
 // ==========================================================================
@@ -540,6 +719,163 @@ mod tests {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {}
+    }
+
+    /// 稀疏 IDCT 链验证辅助（下方两个测试用）。
+    /// 生成满足 `(half_rows, half_cols)` sparsity 约束的随机 natural-order 块：
+    /// half_rows → 行 4-7 全零；half_cols → 列 4-7 全零；其余位置以 ~35% 密度置值。
+    fn make_sparse_block(rng: &mut Lcg, half_rows: bool, half_cols: bool) -> [i16; 64] {
+        let mut data = [0i16; 64];
+        for i in 0..64 {
+            let r = i / 8;
+            let c = i % 8;
+            if (half_rows && r >= 4) || (half_cols && c >= 4) {
+                data[i] = 0;
+            } else if rng.next() % 100 < 35 {
+                data[i] = rng.i16(32000);
+            }
+        }
+        data
+    }
+
+    /// natural-order 块的最高非零 zigzag 下标（0 = 仅 DC）。用 `segment::UN_ZIGZAG`
+    /// （zigzag → natural 标准表）反求 `last`，与生产熵解码的 len/mask 同口径。
+    fn zigzag_last(data: &[i16; 64]) -> usize {
+        use crate::codecs::jpeg::segment::UN_ZIGZAG;
+        let mut last = 0usize;
+        for (n, &v) in data.iter().enumerate() {
+            if v != 0 {
+                let z = UN_ZIGZAG.iter().position(|&x| x == n).unwrap_or(0);
+                if z > last {
+                    last = z;
+                }
+            }
+        }
+        last
+    }
+
+    /// 稀疏 AVX2 内核 ≡ 稀疏标量内核：4 态（全量/仅半行/仅半列/双半）+ 随机
+    /// 满足约束的块 + 对齐/非对齐两几何，逐字节恒等。
+    #[test]
+    fn avx2_sparse_eq_scalar_sparse() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !super::super::avx2::avx2_enabled() {
+                return;
+            }
+            let mut rng = Lcg(0xABCD_5678);
+            for &(hr, hc) in &[(false, false), (true, false), (false, true), (true, true)] {
+                for (offset, stride) in [(3usize, 11usize), (0usize, 8usize)] {
+                    for case in 0..250 {
+                        let data = make_sparse_block(&mut rng, hr, hc);
+                        let mut out_s = [0u8; 128];
+                        let mut out_v = [0u8; 128];
+                        idct8x8_sparse_scalar(&data, hr, hc, &mut out_s, offset, stride);
+                        // SAFETY: 测试已门控 AVX2
+                        unsafe {
+                            crate::codecs::jpeg::cs_avx2::idct8x8_sparse_avx2(
+                                &data,
+                                hr,
+                                hc,
+                                &mut out_v,
+                                offset,
+                                stride,
+                            )
+                        };
+                        assert_eq!(
+                            out_s[..],
+                            out_v[..],
+                            "sparse AVX2 vs scalar (hr={hr},hc={hc}) case {case} geom({offset},{stride})"
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {}
+    }
+
+    /// 稀疏 ≡ 全量（表驱动链路）：对随机块算 `last`，断言 ① 标量稀疏（按
+    /// MAX_ROW/MAX_COL[last] 分发的 4 态）== 标量全量；② dispatch（AVX2 稀疏）
+    /// == 全量 dispatch。用例刻意覆盖 last∈0..9 的双半态、仅半行/半列、稠密与全零。
+    #[test]
+    fn sparse_dispatch_eq_full() {
+        let mut rng = Lcg(0x1234_ABCD);
+        // 状态可达性（C# 表直译）：MAX_ROW[10]=4（zigzag 10=(4,0)）先于 MAX_COL[14]=4
+        // （zigzag 14=(0,4)）——故 last≤9 双半、last∈10..13 仅半列、last≥14 全量；
+        // 「仅半行」态（row<4 而 col≥4）在表中不可达，由 case 3 的保守全量覆盖。
+        for (offset, stride) in [(3usize, 11usize), (0usize, 8usize)] {
+            for case in 0..900 {
+                let mut data = [0i16; 64];
+                match case % 6 {
+                    0 => { /* 全零块 */ }
+                    1 => {
+                        // 双 half：非零全部落在 zigzag 位置 0..9（行、列均 <4）。
+                        data[0] = rng.i16(40000);
+                        for _ in 0..3 {
+                            let n = [0usize, 1, 8, 16, 9, 2, 3, 10, 17, 24][(rng.next() % 10) as usize];
+                            data[n] = rng.i16(30000);
+                        }
+                    }
+                    2 => {
+                        // 仅半列态（确定性）：唯一 AC 非零 = natural 32=(4,0)→zigzag 10
+                        // → MAX_ROW[10]=4（行 pass 全量）、MAX_COL[10]=3（列 pass 半）。
+                        data[0] = rng.i16(40000);
+                        data[32] = rng.i16(30000);
+                    }
+                    3 => {
+                        // 半列边界：AC 非零=natural 11=(1,3)→zigzag 13（仍在 10..13，
+                        // MAX_COL[13]=3 → 半列；MAX_ROW[13]=4 → 全行）。
+                        data[0] = rng.i16(40000);
+                        data[11] = rng.i16(30000);
+                    }
+                    4 => {
+                        // 保守全量（「仅半行」实际不可达）：非零行 0..3、列 4..7 → last≥14
+                        // → 表判全量，但实际行 4-7 全零。稀疏（全量态）仍须 ≡ full。
+                        data[0] = rng.i16(40000);
+                        for _ in 0..4 {
+                            let r = (rng.next() % 4) as usize;
+                            let c = 4 + (rng.next() % 4) as usize;
+                            data[r * 8 + c] = rng.i16(30000);
+                        }
+                    }
+                    _ => {
+                        // 稠密（含非零高行/高列 → 全量态）
+                        for v in data.iter_mut() {
+                            *v = rng.i16(32000);
+                        }
+                    }
+                }
+                let last = zigzag_last(&data);
+                // ① 标量稀疏 == 标量全量
+                let mut out_s = [0u8; 128];
+                let mut out_f = [0u8; 128];
+                idct8x8_sparse_scalar(
+                    &data,
+                    MAX_ROW[last] < 4,
+                    MAX_COL[last] < 4,
+                    &mut out_s,
+                    offset,
+                    stride,
+                );
+                idct8x8_scalar(&data, &mut out_f, offset, stride);
+                assert_eq!(
+                    out_s[..],
+                    out_f[..],
+                    "scalar sparse≠full case {case} last={last} geom({offset},{stride})"
+                );
+                // ② dispatch 层（AVX2 稀疏）== 全量 dispatch（同门控）
+                let mut out_d = [0u8; 128];
+                let mut out_ff = [0u8; 128];
+                idct8x8_sparse(&data, last, &mut out_d, offset, stride);
+                idct8x8(&data, &mut out_ff, offset, stride);
+                assert_eq!(
+                    out_d[..],
+                    out_ff[..],
+                    "dispatch sparse≠full case {case} last={last} geom({offset},{stride})"
+                );
+            }
+        }
     }
 
     /// 稠密块 AVX2 8×8 f32 IDCT 吞吐微基准（release `#[ignore]`）：逐块调用形态，同窗 A/B 用。

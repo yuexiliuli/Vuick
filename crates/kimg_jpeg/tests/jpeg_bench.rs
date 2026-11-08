@@ -53,7 +53,8 @@ fn old_decode(bytes: &[u8], out: &mut [u8]) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn new_decode(bytes: &[u8], out: &mut [u8]) -> Result<(), String> {
-    NewJpeg::new(Cursor::new(bytes))
+    // 零拷贝内存路径（C1）：直接借用 bytes，免入口 read_to_end 复制。
+    NewJpeg::from_bytes(bytes)
         .map_err(|e| e.to_string())?
         .read_image(out)
         .map_err(|e| e.to_string())

@@ -975,6 +975,8 @@ impl BitStream {
     ) -> Result<(u64, u8), DecodeError> {
         let mut ab = ab;
         let mut bl = bl;
+        // C2 门控：KIMG_JPEG_REFINE_CLUT 默认开、0 回旧核（K93 双路径，进程内 OnceLock）。
+        let use_refine_clut = refine_clut_enabled();
         let bit = self.successive_low_mask;
         let s = usize::from(self.spec_start);
         let e = usize::from(self.spec_end);
@@ -1003,8 +1005,10 @@ impl BitStream {
                 // 复用 ac_first_v 同款 cs_lut 布局（位 6-9 = 码长 s、位 11-18 = rs），FULL 与
                 // 非 FULL 条目均一次解出 rs、消费 s 位；refine 幅值恒由后续 1 位符号位给出，
                 // 不消费/不查 cs_lut FULL 幅值字段，位序与 `decode_mcu_ac_refine` 逐位一致。
+                // K93 双路径：`KIMG_JPEG_REFINE_CLUT=0` → 回 C2 前 `table.lookup`+
+                // HUFF_LOOKAHEAD 旧核（同表消费、位序逐位一致），供 A/B 与灰度回退。
                 let probe = table.cs_lut[(ab >> (64 - CS_LUT_BITS)) as usize];
-                let rs = if probe != 0 {
+                let rs = if use_refine_clut && probe != 0 {
                     let code_length = ((probe >> CS_CODELEN_SHIFT) & 15) as u8;
                     if code_length > bl {
                         return Err(DecodeError::Format(format!(
@@ -1016,15 +1020,28 @@ impl BitStream {
                     bl = bl.saturating_sub(code_length);
                     ((probe >> 11) & 255) as u8
                 } else {
-                    // 码长 >11：落盘 ab/bl，把 RAW lookup 值（高位码长未掩）交给 decode_huff!
-                    // 走 16 位码慢探测（内部重提取 code_length），再读回 ab/bl。
-                    self.aligned_buffer = ab;
-                    self.bits_left = bl;
-                    let mut symbol =
-                        table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
-                    decode_huff!(self, symbol, table);
-                    ab = self.aligned_buffer;
-                    bl = self.bits_left;
+                    // 门控关（C2 前旧核）或码长 >11：RAW lookup 值（高位码长未掩）→
+                    // 码长 ≤11 快速消费、>11 落盘 ab/bl 交 decode_huff!（内部重提取
+                    // code_length 走 16 位码慢探测），再读回 ab/bl。
+                    let mut symbol = table.lookup[(ab >> (64 - CS_LUT_BITS)) as usize];
+                    if symbol >> HUFF_LOOKAHEAD > i32::from(HUFF_LOOKAHEAD) {
+                        self.aligned_buffer = ab;
+                        self.bits_left = bl;
+                        decode_huff!(self, symbol, table);
+                        ab = self.aligned_buffer;
+                        bl = self.bits_left;
+                    } else {
+                        let code_length = symbol >> HUFF_LOOKAHEAD;
+                        symbol &= (1 << HUFF_LOOKAHEAD) - 1;
+                        if code_length > i32::from(bl) {
+                            return Err(DecodeError::Format(format!(
+                                "Code length {code_length}  more than bits left {}",
+                                bl
+                            )));
+                        }
+                        ab <<= code_length as u8;
+                        bl = bl.saturating_sub(code_length as u8);
+                    }
                     symbol as u8
                 };
                 let r = i32::from(rs >> 4);
@@ -1192,32 +1209,59 @@ pub(crate) struct HotStream {
 /// discard 路径专用零融合表占位（不落系数、不被读取，仅满足统一签名）。
 static ZQ_ZERO: [u32; ZIGZAG_QUANT_LEN] = [0; ZIGZAG_QUANT_LEN];
 
-/// P-A2 双符号 AC 打包解码开关：`KIMG_JPEG_DUAL_SYM=1|true|on` 开、缺省关。
+/// P-A2 双符号 AC 打包解码开关：**默认开**，`KIMG_JPEG_DUAL_SYM=0|false|off` 强制关
+/// （K93 双路径回退：env 置 0 即回 HEAD 默认关路径），`1|true|on` 显式强制开。
 /// 进程内一次读（OnceLock）；调用方（mcu.rs 每行）在块环外取一次为循环不变布尔，
 /// 块环内按寄存器分支分发，热环内无每符号开销（K93 运行时双路径姿势）。
 ///
-/// 2026-11-07 B2 翻正尝试结论：广谱 parity（C# 编码器 19×6：baseline 420/444/灰度/
-/// progressive 420/444/RST16）DUAL=1 与 DUAL=0 均逐字节=C#（ok=114×2）、19 基线双模式
-/// parity 全绿（ok=19）——正确性达标；但翻正后同窗交错 A/B（release 探针 19 基线、
-/// rounds=9、8 窗 on/off 交替）全部 7 个相邻对都指向 DUAL 慢（on 均值 7.51ms vs off
-/// 7.07ms，≈ −6.2%），与 P-A2 时代的 −2.8~3.1% 相反（A' 已把单符号快路径 ab/bl 寄存器
-/// 贯穿、双符号路径未同步享受该收益）→ 按验收口径「A/B 退化即恢复默认关」**保持缺省关**，
-/// DUAL 仅 opt-in。待双符号路径对齐 A' 收益后另行翻正。
+/// 2026-11-07 C1 翻默认：B2 时代「A/B 退化即恢复默认关」结论后，A′ 对齐使单/双符号
+/// 双路径寄存器贯穿，DUAL-A′ 双符号寄存器驻留经独立评审 APPROVE、字节恒等 446×2
+/// 全绿 → 默认 ON。正确性由广谱 parity（C# 编码器 19×6：baseline 420/444/灰度/
+/// progressive 420/444/RST16）DUAL=1 == DUAL=0 == C#（ok=114×2）托底；env 门控保留
+/// 可回退，灰度/回退零代码。
 #[inline(always)]
 pub(crate) fn dual_sym_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let t = std::env::var("KIMG_JPEG_DUAL_SYM").unwrap_or_default();
         let t = t.trim();
-        t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+        if t.is_empty() {
+            true
+        } else if t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off") {
+            false
+        } else {
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+        }
+    })
+}
+
+/// C2 渐进 AC-refine `cs_lut` 单探测开关：**默认开**，`KIMG_JPEG_REFINE_CLUT=0|false|off`
+/// 强制关（K93 双路径回退：env 置 0 即回 C2 前 `table.lookup`+HUFF_LOOKAHEAD 旧核，
+/// 同表消费、位序逐位一致），`1|true|on` 显式强制开。进程内一次读（OnceLock）。
+#[inline(always)]
+pub(crate) fn refine_clut_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let t = std::env::var("KIMG_JPEG_REFINE_CLUT").unwrap_or_default();
+        let t = t.trim();
+        if t.is_empty() {
+            true
+        } else if t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off") {
+            false
+        } else {
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+        }
     })
 }
 
 /// 应用一个已解出的 AC 符号（run/size 展开 + 反量化落系数 + EOB/ZRL 处理）。
 /// 与单符号路径的 apply 段逐位一致；`return Ok(..)` 从 `decode_block_inner_dual` 早退
 /// （EOB）。仅 P-A2 双符号路径使用（单符号路径保持原样，不引此宏）。
+///
+/// S3-A（2026-11-07）：EOB 早退不再写回 self——(ab, bl) 随返回值带回调用方（mcu.rs 行级
+/// 局部）跨块驻留；mcu.rs 断点检查改读行级局部，位序/marker 时序逐块等价不变。
 macro_rules! apply_ac {
-    ($rs:expr, $v:expr, $pos:expr, $block:ident, $zq:ident) => {{
+    ($rs:expr, $v:expr, $pos:expr, $block:ident, $zq:ident, $stream:ident, $ab:ident, $bl:ident) => {{
         if ($rs & 15) != 0 {
             $pos += (($rs >> 4) & 15) as usize;
             if let Some(block) = $block.as_deref_mut() {
@@ -1228,7 +1272,8 @@ macro_rules! apply_ac {
             }
             $pos += 1;
         } else if $rs != 0xF0 {
-            return Ok($pos as u16); // EOB
+            // EOB：返回局部态（ab/bl 随返回值带回调用方跨块驻留）。
+            return Ok(($pos as u16, $ab, $bl)); // EOB
         } else {
             $pos += 16; // ZRL
         }
@@ -1267,10 +1312,20 @@ impl HotStream {
         self.marker
     }
 
-    /// 当前剩余位数（同上，等价 `stream.bits_left`）。
+    /// S3-A：取当前 (aligned_buffer, bits_left) 到调用方局部（镜像 `BitStream::ab_bl`，
+    /// 供基线跨块寄存器驻留；环内 hot 自身的 aligned_buffer/bits_left 保持惰性，仅
+    /// restart / 行尾 write_back 前经 `set_ab_bl` 同步）。
     #[inline]
-    pub(crate) fn bits_left(&self) -> u8 {
-        self.bits_left
+    pub(crate) fn ab_bl(&self) -> (u64, u8) {
+        (self.aligned_buffer, self.bits_left)
+    }
+
+    /// S3-A：把调用方扫描级局部态 (ab, bl) 写回 hot（restart 路径与行尾 `write_back`
+    /// 前调用，镜像 `BitStream::set_ab_bl`）。
+    #[inline]
+    pub(crate) fn set_ab_bl(&mut self, ab: u64, bl: u8) {
+        self.aligned_buffer = ab;
+        self.bits_left = bl;
     }
 
     /// `handle_rst_main`（RST reset 等）改动了 `BitStream` 后重新装载。
@@ -1576,6 +1631,9 @@ impl HotStream {
     ///
     /// 快路径微优化：`ac_table.lookup` 只在慢路径需要 `symbol` 时才查询——快路径
     /// 占绝大多数符号，省一次表加载（慢路径复算一次，位消耗语义不变）。
+    ///
+    /// S3-A：`ab`/`bl` 由调用方（mcu.rs 行级局部）传入并随结果返回——跨块寄存器驻留，
+    /// 免每块 entry 载 / EOB·块尾两处写回（镜像 P1 `decode_prog_*_v` 值返回姿势）。
     #[inline(always)]
     pub(crate) fn decode_mcu_block<'a>(
         &mut self,
@@ -1586,19 +1644,34 @@ impl HotStream {
         zq: &[u32; ZIGZAG_QUANT_LEN],
         block: &mut [i16; 64],
         dc_prediction: &mut i32,
-    ) -> Result<u16, DecodeError> {
-        self.decode_block_inner(reader, dc_table, ac_table, qt_table, zq, Some(block), dc_prediction)
+        ab: u64,
+        bl: u8,
+    ) -> Result<(u16, u64, u8), DecodeError> {
+        self.decode_block_inner(
+            reader,
+            dc_table,
+            ac_table,
+            qt_table,
+            zq,
+            Some(block),
+            dc_prediction,
+            ab,
+            bl,
+        )
     }
 
     /// 跳过（丢弃）一个 MCU 块；不落系数（位流消费与 `decode_mcu_block` 逐位一致）。
-    /// 注：discard 不写系数，故融合表传常量零表占位（不读取）。
+    /// 注：discard 不写系数，故融合表传常量零表占位（不读取）。S3-A：同 `decode_mcu_block`
+    /// 以 (ab, bl) 值参/值返回跨块驻留。
     #[inline(always)]
     pub(crate) fn discard_mcu_block<'a>(
         &mut self,
         reader: &mut ByteReader<'a>,
         dc_table: &HuffmanTable,
         ac_table: &HuffmanTable,
-    ) -> Result<u16, DecodeError> {
+        ab: u64,
+        bl: u8,
+    ) -> Result<(u16, u64, u8), DecodeError> {
         let mut disc_pred = 0;
         self.decode_block_inner(
             reader,
@@ -1608,11 +1681,14 @@ impl HotStream {
             &ZQ_ZERO,
             None,
             &mut disc_pred,
+            ab,
+            bl,
         )
     }
 
     /// P-A2：`decode_mcu_block` 的双符号变体（仅 `KIMG_JPEG_DUAL_SYM` 开启时由 mcu.rs
     /// 路由到此处；与单符号路径对同一有效流逐位一致，字节恒等由 parity 硬闸守护）。
+    /// S3-A：同单符号路径以 (ab, bl) 值参/值返回跨块驻留。
     #[inline(always)]
     pub(crate) fn decode_mcu_block_dual<'a>(
         &mut self,
@@ -1623,18 +1699,32 @@ impl HotStream {
         zq: &[u32; ZIGZAG_QUANT_LEN],
         block: &mut [i16; 64],
         dc_prediction: &mut i32,
-    ) -> Result<u16, DecodeError> {
-        self.decode_block_inner_dual(reader, dc_table, ac_table, qt_table, zq, Some(block), dc_prediction)
+        ab: u64,
+        bl: u8,
+    ) -> Result<(u16, u64, u8), DecodeError> {
+        self.decode_block_inner_dual(
+            reader,
+            dc_table,
+            ac_table,
+            qt_table,
+            zq,
+            Some(block),
+            dc_prediction,
+            ab,
+            bl,
+        )
     }
 
-    /// P-A2：`discard_mcu_block` 的双符号变体（语义同上）。
+    /// P-A2：`discard_mcu_block` 的双符号变体（语义同上）。S3-A：同单符号路径。
     #[inline(always)]
     pub(crate) fn discard_mcu_block_dual<'a>(
         &mut self,
         reader: &mut ByteReader<'a>,
         dc_table: &HuffmanTable,
         ac_table: &HuffmanTable,
-    ) -> Result<u16, DecodeError> {
+        ab: u64,
+        bl: u8,
+    ) -> Result<(u16, u64, u8), DecodeError> {
         let mut disc_pred = 0;
         self.decode_block_inner_dual(
             reader,
@@ -1644,37 +1734,47 @@ impl HotStream {
             &ZQ_ZERO,
             None,
             &mut disc_pred,
+            ab,
+            bl,
         )
     }
 
-    /// P-A2：由已探测的 `cs_lut` 条目 `e` 解一个 AC 符号（FULL / 码在窗内幅值出窗 / 慢路径
-    /// 三路），与单符号路径对应分支逐位一致（位消费顺序、refill 边界由调用方保证）。
-    /// 调用方必须保证窗口位数足够本次消费（FULL≤11、非 FULL≤len+t、慢≤31），否则结果
-    /// 偏离单符号路径；P-A2 双符号路径以「逐步安全判据」保证后才直解，坏流则回退单符号。
+    /// P-A3（A′ 对齐）：由已探测的 `cs_lut` 条目 `e` 解一个 AC 符号，`ab`/`bl` 作为正则
+    /// 局部变量传入、新值 `(ab,bl)` 连同 `(rs,v)` 一并传出——热环内二者全程寄存器驻留、
+    /// 不落盘 self（镜像单符号 `decode_block_inner` 的 refill_value 姿势）。
+    ///
+    /// 逐位语义三路（FULL / 非 FULL / 慢路径）与单符号路径逐位一致；慢路径先落盘
+    /// 局部态、走 &mut self 慢路径后回读。调用方必须保证
+    /// 窗口位数足够本次消费（FULL≤11、非 FULL≤len+t、慢≤31）；P-A3 双符号路径以
+    /// 「逐步安全判据」保证后才直解，坏流则回退单符号。
     #[inline(always)]
-    fn ac_symbol_from_e(
+    fn ac_symbol_from_ab(
         &mut self,
         ac_table: &HuffmanTable,
         e: i32,
-    ) -> Result<(u8, i32), DecodeError> {
+        mut ab: u64,
+        mut bl: u8,
+    ) -> Result<((u8, i32), u64, u8), DecodeError> {
         if (e & CS_LUT_FULL) != 0 {
             // 完整条目（含 EOB/ZRL 单探测）：一次消费（码长+幅值）。
             let n = (e & 31) as u8;
-            self.aligned_buffer <<= n;
-            self.bits_left = self.bits_left.saturating_sub(n);
-            Ok((((e >> 11) & 255) as u8, e >> CS_VALUE_SHIFT))
+            ab <<= n;
+            bl = bl.saturating_sub(n);
+            Ok(((((e >> 11) & 255) as u8, e >> CS_VALUE_SHIFT), ab, bl))
         } else if e != 0 {
             // 码在窗内、幅值出窗。
             let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
-            self.aligned_buffer <<= len;
+            ab <<= len;
             let rs = ((e >> 11) & 255) as u8;
             let t = (rs & 15) as u8;
-            let mag = (self.aligned_buffer >> (64 - t)) as i32;
-            self.aligned_buffer <<= t;
-            self.bits_left = self.bits_left.saturating_sub(len + t);
-            Ok((rs, if t != 0 { huff_extend(mag, i32::from(t)) } else { 0 }))
+            let mag = (ab >> (64 - t)) as i32;
+            ab <<= t;
+            bl = bl.saturating_sub(len + t);
+            Ok(((rs, if t != 0 { huff_extend(mag, i32::from(t)) } else { 0 }), ab, bl))
         } else {
-            // 码长 > 11：慢路径（探测时不移动缓冲，与单符号路径一致）。
+            // 码长 > 11：慢路径——先落盘局部态，走 &mut self 慢路径后回读。
+            self.aligned_buffer = ab;
+            self.bits_left = bl;
             let mut symbol = ac_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
             decode_huff!(self, symbol, ac_table);
             let rs = symbol as u8;
@@ -1685,7 +1785,9 @@ impl HotStream {
             } else {
                 0
             };
-            Ok((rs, v))
+            ab = self.aligned_buffer;
+            bl = self.bits_left;
+            Ok(((rs, v), ab, bl))
         }
     }
 
@@ -1712,6 +1814,12 @@ impl HotStream {
     /// 「只算不落盘」；refill 改走 `refill_value`（value-return 新值）；仅环结束 / EOB /
     /// 慢路径 / 出错才写回 self。位消费顺序逐位不变（与 `decode_block_inner_dual` 无关，
     /// DUAL 路径保持原样）。
+    ///
+    /// S3-A（2026-11-07）：ab/bl 再上提一级——由调用方（mcu.rs `inner_decode_mcu_width`
+    /// 行级局部）作为值参传入、随返回值带回，跨块寄存器驻留：删 entry 载与 EOB/块尾
+    /// 两处写回，整行 MCU 一块也经 self 往返（镜像 P1 `decode_prog_*_v` 姿势）。
+    /// refill 仍经 `refill_value`（self 仅维护 buffer/marker/overread_by/seen_eoi）。
+    /// 错误路径不写回 = 解码终结（沿 mcu.rs 传播无人再读热态）。
     #[inline(never)]
     fn decode_block_inner<'a>(
         &mut self,
@@ -1722,13 +1830,14 @@ impl HotStream {
         zq: &[u32; ZIGZAG_QUANT_LEN],
         mut block: Option<&mut [i16; 64]>,
         dc_prediction: &mut i32,
-    ) -> Result<u16, DecodeError> {
+        mut ab: u64,
+        mut bl: u8,
+    ) -> Result<(u16, u64, u8), DecodeError> {
         let dc_cs = &dc_table.cs_lut;
         let ac_cs = &ac_table.cs_lut;
 
-        // A′：aligned_buffer/bits_left 提出为热环局部寄存器驻留变量。
-        let mut ab = self.aligned_buffer;
-        let mut bl = self.bits_left;
+        // S3-A：ab/bl 由调用方（mcu.rs 行级局部）作为值参传入——跨块寄存器驻留，函数内
+        // 不再从 self 载入/写回（删 A′ 的 entry 载与 EOB/块尾两处写回）。
 
         // marker 且 0 位在块起始：仅解码路径保留此防御检查（与旧 `decode_mcu_block`
         // 一致）；discard 路径旧实现无此检查，为保持其逐位语义不加。此时仅读局部 bl，
@@ -1851,10 +1960,8 @@ impl HotStream {
                 }
                 pos += 1;
             } else if rs != 0xF0 {
-                // EOB：写回局部态后返回（self.bits_left/marker 供 mcu.rs 断点检查）。
-                self.aligned_buffer = ab;
-                self.bits_left = bl;
-                return Ok(pos as u16);
+                // EOB：返回局部态（ab/bl 随返回值带回调用方跨块驻留）。
+                return Ok((pos as u16, ab, bl));
             } else {
                 pos += 16; // ZRL
             }
@@ -1864,10 +1971,8 @@ impl HotStream {
             }
         }
 
-        // 环结束：写回局部态（非 EOB 满块）。
-        self.aligned_buffer = ab;
-        self.bits_left = bl;
-        Ok(64)
+        // 环结束：返回局部态（非 EOB 满块）。
+        Ok((64, ab, bl))
     }
 
     /// P-A2 双符号 AC 打包解码内核（`KIMG_JPEG_DUAL_SYM=1|true|on` 时由
@@ -1882,6 +1987,15 @@ impl HotStream {
     ///   - 慢路径（码长 >11）→ 需 bits_left ≥ 31（最多 16+15 位）。
     /// 判据不满足 → 回退循环顶 = 单符号路径的「refill 检查 + 解符号」（逐位一致；仅
     /// marker 探测点可延后一个 refill：对有效流收敛、坏流走抛错路径，parity 兜底）。
+    ///
+    /// A′ 对齐（2026-11-07，C1）：把 aligned_buffer/bits_left 提为热环局部 `ab`/`bl`，
+    /// 全程寄存器驻留、环内「只算不落盘」；refill 改走 `refill_value`（value-return），
+    /// 符号解算走 value-return 的 `ac_symbol_from_ab`；仅环结束 / EOB / 慢路径 / 出错
+    /// 才写回 self。位消费顺序逐位不变，双符号每次解 2 符号的语义不变。
+    ///
+    /// S3-A（2026-11-07）：ab/bl 再上提一级——由调用方（mcu.rs 行级局部）值参传入、随
+    /// 返回值带回，跨块寄存器驻留；删 entry 载与 EOB/loop-end 写回（EOB 经 `apply_ac!`
+    /// 返回局部态）。位序/断点时机与 A′ 逐块等价不变。
     #[inline(never)]
     fn decode_block_inner_dual<'a>(
         &mut self,
@@ -1892,48 +2006,74 @@ impl HotStream {
         zq: &[u32; ZIGZAG_QUANT_LEN],
         mut block: Option<&mut [i16; 64]>,
         dc_prediction: &mut i32,
-    ) -> Result<u16, DecodeError> {
+        mut ab: u64,
+        mut bl: u8,
+    ) -> Result<(u16, u64, u8), DecodeError> {
         let dc_cs = &dc_table.cs_lut;
         let ac_cs = &ac_table.cs_lut;
 
+        // S3-A：ab/bl 由调用方（mcu.rs 行级局部）作为值参传入——跨块寄存器驻留，函数内
+        // 不再从 self 载入/写回（删 A′ 的 entry 载与 loop-end 写回；EOB 经 apply_ac! 返回）。
+
         // marker 且 0 位在块起始：仅解码路径保留此防御检查（与单符号路径一致）。
-        if block.is_some() && self.bits_left < 1 && self.marker.is_some() {
+        // 此时仅读局部 bl，self 未被修改。
+        if block.is_some() && bl < 1 && self.marker.is_some() {
             return Err(DecodeError::Format(
                 "No more bytes left in stream before marker".to_string(),
             ));
         }
 
-        // --- DC（与单符号路径逐位一致）---
-        if self.bits_left < 32 {
-            self.refill(reader)?;
+        // A′ refill 内联（value-return）：更新 ab/bl（镜像单符号路径 refill_ab）。
+        // 出错即解码终结路径：DecodeError 沿 mcu.rs 传播后无人再读 HotStream 态（无
+        // resync），error 臂只上抛（删写回，同单符号 A′ 姿势）。
+        macro_rules! refill_ab {
+            () => {{
+                match self.refill_value(reader, ab, bl) {
+                    Ok((a, b)) => {
+                        ab = a;
+                        bl = b;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }};
         }
-        let e = dc_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+
+        // --- DC（与单符号路径逐位一致）---
+        if bl < 32 {
+            refill_ab!();
+        }
+        let e = dc_cs[(ab >> (64 - CS_LUT_BITS)) as usize];
         let diff = if (e & CS_LUT_FULL) != 0 {
             // 值在窗口内：单次移位消费码长+幅值（DC 表符号恒 ≤15，建表已校验）。
             let n = (e & 31) as u8;
-            self.aligned_buffer <<= n;
-            self.bits_left = self.bits_left.saturating_sub(n);
+            ab <<= n;
+            bl = bl.saturating_sub(n);
             e >> CS_VALUE_SHIFT
         } else if e != 0 {
             // 码在窗内但幅值出窗：先丢码长，再读 t 位幅值并按 JPEG EXTEND 扩展。
             let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
             let t = ((e >> 11) & 15) as u8;
-            self.aligned_buffer <<= len;
-            let mag = (self.aligned_buffer >> (64 - t)) as i32;
-            self.aligned_buffer <<= t;
-            self.bits_left = self.bits_left.saturating_sub(len + t);
+            ab <<= len;
+            let mag = (ab >> (64 - t)) as i32;
+            ab <<= t;
+            bl = bl.saturating_sub(len + t);
             huff_extend(mag, i32::from(t))
         } else {
-            // 码长 > 11：慢路径（zune 风格）。
+            // 码长 > 11：慢路径（zune 风格）——先落盘局部态，走 &mut self 慢路径后回读。
+            self.aligned_buffer = ab;
+            self.bits_left = bl;
             let mut symbol =
                 dc_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
             decode_huff!(self, symbol, dc_table);
-            if symbol != 0 {
+            let d = if symbol != 0 {
                 let r = self.get_bits(symbol as u8);
                 huff_extend(r, symbol)
             } else {
                 0
-            }
+            };
+            ab = self.aligned_buffer;
+            bl = self.bits_left;
+            d
         };
         *dc_prediction = dc_prediction.wrapping_add(diff);
         if let Some(block) = block.as_deref_mut() {
@@ -1943,31 +2083,35 @@ impl HotStream {
         // --- AC（双符号打包）---
         let mut pos: usize = 1;
         loop {
-            if self.bits_left < 32 {
-                self.refill(reader)?;
+            if bl < 32 {
+                refill_ab!();
             }
             // --- 符号 1（与单符号路径逐位一致）---
-            let e = ac_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
-            let (rs, v) = self.ac_symbol_from_e(ac_table, e)?;
-            apply_ac!(rs, v, pos, block, zq);
+            let e = ac_cs[(ab >> (64 - CS_LUT_BITS)) as usize];
+            let ((rs, v), na, nb) = self.ac_symbol_from_ab(ac_table, e, ab, bl)?;
+            ab = na;
+            bl = nb;
+            apply_ac!(rs, v, pos, block, zq, self, ab, bl);
             if pos >= 64 {
                 break;
             }
             // --- 符号 2（免 refill 检查；逐步安全判据）---
-            if self.bits_left >= 16 {
-                let e2 = ac_cs[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
+            if bl >= 16 {
+                let e2 = ac_cs[(ab >> (64 - CS_LUT_BITS)) as usize];
                 let safe = if (e2 & CS_LUT_FULL) != 0 {
                     true
                 } else if e2 != 0 {
                     let len = ((e2 >> CS_CODELEN_SHIFT) & 15) as u8;
                     let t = ((e2 >> 11) & 15) as u8;
-                    self.bits_left >= len + t
+                    bl >= len + t
                 } else {
-                    self.bits_left >= 31
+                    bl >= 31
                 };
                 if safe {
-                    let (rs, v) = self.ac_symbol_from_e(ac_table, e2)?;
-                    apply_ac!(rs, v, pos, block, zq);
+                    let ((rs, v), na, nb) = self.ac_symbol_from_ab(ac_table, e2, ab, bl)?;
+                    ab = na;
+                    bl = nb;
+                    apply_ac!(rs, v, pos, block, zq, self, ab, bl);
                     if pos >= 64 {
                         break;
                     }
@@ -1975,7 +2119,8 @@ impl HotStream {
             }
         }
 
-        Ok(64)
+        // 环结束：返回局部态（非 EOB 满块）。
+        Ok((64, ab, bl))
     }
 }
 
