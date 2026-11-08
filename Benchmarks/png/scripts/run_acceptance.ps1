@@ -1,7 +1,7 @@
 # PNG acceptance 一键对账：oracle 闸（debug 字节恒等→含 png_csharp_parity）→ 静置 60s →
 # release 探针（单核 KIMG_PNG_PIPELINE=0）→ compare_refs 双路 geomean（比较集 = RGBA8 布局）。
 # 用法：pwsh -File Benchmarks\png\scripts\run_acceptance.ps1   （-NoWait 跳过静置 60s）
-# 前置：target\csharp-ref 非空（先跑 run_csharp_ref.ps1）。
+# 前置：target\csharp-ref\png 非空（先跑 run_csharp_ref.ps1；2026-11-08 格式隔离后落子目录）。
 # 输出：logs\acceptance_<时间戳>.log（stdout 双落，UTF-8 无 BOM）；结尾主口径。
 param(
     [switch]$NoWait # 跳过静置 60s（CI/已有热机态）
@@ -19,7 +19,7 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 $corpus = Join-Path $root 'Benchmarks\corpus\PNG'
 $probeManifest = Join-Path $suite 'probe\Cargo.toml'
 $csharpLog = Join-Path $root 'Benchmarks\corpus\csharp\png_csharp.log'
-$refOut = Join-Path $root 'target\csharp-ref'
+$refOut = Join-Path $root 'target\csharp-ref\png'
 
 Write-Host "root=$root"; Write-Host "log=$log"
 '=' * 20 | Tee-Object -FilePath $log
@@ -34,7 +34,7 @@ foreach ($dll in @('libpng16.dll', 'zlib1.dll')) {
 }
 if (-not (Test-Path $corpus))   { Write-Error "corpus 不存在: $corpus" }
 if (-not (Test-Path $refOut) -or @(Get-ChildItem $refOut -File -ErrorAction SilentlyContinue).Count -eq 0) {
-    Write-Error "target\csharp-ref 为空 — 先跑 pwsh -File Benchmarks\png\scripts\run_csharp_ref.ps1"
+    Write-Error "target\csharp-ref\png 为空 — 先跑 pwsh -File Benchmarks\png\scripts\run_csharp_ref.ps1"
 }
 
 # 1) oracle 闸（debug，字节恒等全量；FAILED 即停）
