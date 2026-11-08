@@ -254,7 +254,7 @@ pwsh scripts/package.ps1
 - **第三方组件**（分发包由 `scripts/package.ps1` 随包提供 `THIRD_PARTY_NOTICES.md` 与 `third_party/` 许可原文）：
   - **FFmpeg**（视频/音频解码）：**LGPL v2.1+**；以未修改的 FFmpeg 上游主线 **n9.0.2** 做**瘦化 decode-only** 构建（configure 白名单仅启用原生解码器 + 硬解，无 `--enable-gpl` / `--enable-nonfree`、无外部 GPL 库）；主 exe 经 `libloading` **运行时动态加载** `media_ffmpeg.dll`（B1 独立 av\*.dll / B2 静态归档可重链），本体代码不受 LGPL 传染。构建脚本 `scripts/build-slim-ffmpeg*.sh`，文本见 `third_party/LGPL-2.1.txt`、`third_party/FFmpeg-LICENSE.md`。
   - **zstd**（PDF 载荷压缩）：BSD-3-Clause / MIT。
-  - **pdfium**（`pdfium-render`，PDF 栅格化）：BSD-3-Clause（Chromium）。
+  - **pdfium**（`pdfium-render` —— MIT OR Apache-2.0；内嵌 PDFium 预编译库 —— **BSD-3-Clause + Apache-2.0**，含 FreeType/ICU 等内嵌第三方各自许可）：PDF 栅格化。许可原文见 `third_party/pdfium/`。
 - **专利口径（非法律意见）**：HEVC/H.265、AAC 等标准必要专利与代码许可无关；本应用为桌面软件、纯 CPU 解码，属 HEVC Advance「royalty-free 应用层软件」政策覆盖面；商业分发 / 收费 / 云服务 / 硬件形态，发货前请另行评估专利池并与法务确认。
 
 ## 已知限制与后续方向

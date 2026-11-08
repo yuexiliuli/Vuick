@@ -26,9 +26,16 @@
 
 - BSD-3-Clause / MIT（Ze 字节级数据压缩；build 编译自带 C 源，见根 `Cargo.toml`）。
 
-## pdfium（`pdfium-render`，PDF 栅格化）
+## pdfium（PDF 栅格化）
 
-- BSD-3-Clause（Chromium PDFium；随包以 zstd 压缩内嵌 pdfium dll，见根 `Cargo.toml`）。
+- **pdfium-render**（Rust 包装 crate）：**MIT OR Apache-2.0**。
+- **PDFium 预编译库**（`resources/pdfium/pdfium-154.0.8035.0.dll`，`crates/pdf/build.rs` 以 zstd 压缩
+  内嵌；Chromium PDFium，经 `bblanchon/pdfium-binaries` 发布包获取 `pdfium-win-x64.tgz`）：
+  **BSD-3-Clause + Apache-2.0**（Copyright 2014 The PDFium Authors）；其内嵌第三方组件各按其
+  自有许可授权（FreeType / ICU / libjpeg-turbo / OpenJPEG / libpng / zlib / Little CMS / Abseil /
+  AGG / simdutf / fast_float / LLVM libc 等）。**全部许可原文已 vendor 于 `third_party/pdfium/`**
+  （`LICENSE`= 打包方 bblanchon 的 MIT；`licenses/pdfium.txt` = PDFium BSD-3 + Apache-2.0；
+  `licenses/*` = 各内嵌第三方）。
 
 ## 其余
 
