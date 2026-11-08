@@ -5,9 +5,10 @@
 //! 每条 decode 只需重写 0..clear 的字面区间，其余槽位随字典定义覆盖写——零重启成本。
 //! 位累加器 u64 + 最少 refill（每码仅一次 `while bitCount < codeSize` 补字节）。
 
-/// 收集一帧的数据子块链为连续码流。返回 (码流, 是否带终止 0 字节)；中途截断则取残缺段。
-pub(crate) fn gather_sub_blocks(data: &[u8], offset: usize) -> (Vec<u8>, bool) {
-    let mut codes = Vec::new();
+/// 收集一帧的数据子块链到 `out`（clear 后追加）；返回是否带终止 0 字节。
+/// 中途截断则取残缺段。`out` 复用调用方缓冲（如 `Scratch.codes`），避免每帧新建 Vec。
+pub(crate) fn gather_sub_blocks_into(data: &[u8], offset: usize, out: &mut Vec<u8>) -> bool {
+    out.clear();
     let mut pos = offset;
     let mut terminated = false;
     while pos < data.len() {
@@ -17,9 +18,17 @@ pub(crate) fn gather_sub_blocks(data: &[u8], offset: usize) -> (Vec<u8>, bool) {
             break;
         }
         let take = (size as usize).min(data.len() - pos - 1);
-        codes.extend_from_slice(&data[pos + 1..pos + 1 + take]);
+        out.extend_from_slice(&data[pos + 1..pos + 1 + take]);
         pos += 1 + size as usize;
     }
+    terminated
+}
+
+/// 收集一帧的数据子块链为连续码流。返回 (码流, 是否带终止 0 字节)；中途截断则取残缺段。
+#[inline]
+pub(crate) fn gather_sub_blocks(data: &[u8], offset: usize) -> (Vec<u8>, bool) {
+    let mut codes = Vec::new();
+    let terminated = gather_sub_blocks_into(data, offset, &mut codes);
     (codes, terminated)
 }
 

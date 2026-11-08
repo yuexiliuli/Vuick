@@ -10,7 +10,7 @@
 use std::io;
 
 use super::container::{clip_rect, Disposal, GifFrame};
-use super::lzw::{LzwDecoder, gather_sub_blocks};
+use super::lzw::{LzwDecoder, gather_sub_blocks_into};
 
 /// 跨帧复用缓冲：LZW 表 + 码流 + 索引。分配只升不降。
 ///
@@ -37,15 +37,12 @@ impl Scratch {
     /// 数据截断（子块链缺终止字节，或码流提前耗尽）→ `Err(UnexpectedEof)`（对齐 kimg
     /// 「遇 UnexpectedEof 报错、不画 partial」语义）。
     fn decode(&mut self, data: &[u8], frame: &GifFrame) -> io::Result<&[u8]> {
-        let (codes, terminated) = gather_sub_blocks(data, frame.data_offset);
-        if !terminated {
+        if !gather_sub_blocks_into(data, frame.data_offset, &mut self.codes) {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "GIF 帧数据子块链被截断",
             ));
         }
-        self.codes.clear();
-        self.codes.extend_from_slice(&codes);
         let total = (frame.w as usize)
             .checked_mul(frame.h as usize)
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "GIF 帧尺寸溢出"))?;
@@ -211,6 +208,53 @@ fn blit(
     }
 }
 
+/// 全覆 Keep 快道 env 门控：`KIMG_GIF_BLIT_FAST=0` 强制走原标量双写路径（dormancy 保留，A/B 用）。
+/// 默认 1。只在 composite 派发层每帧读一次，不进入热循环。
+fn blit_fast_enabled() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        std::env::var("KIMG_GIF_BLIT_FAST")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
+/// 全覆 Keep 帧快道：帧矩形覆盖整个逻辑屏（covers_full）且 disposal==Keep 时，
+/// **不变式 out 逐像素 == canvas** 成立：
+/// - 原 blit 对每像素 `outp = if cur alpha==0 { prev } else { cur }`，Keep 下 canvas 与 out
+///   同写 `outp`（canvas[dst] = outp，write_px(out, outp)）；
+/// - 透明像素（cur==0 即 idx==trans）取 prev=画布现像，Keep 下画布保持该现像 → 二者仍相等；
+/// - 非透明像素 lut 直写（alpha 恒 0xFF），canvas 与 out 同取 cur。
+/// 故快道只需 u32 1 写/px 推进画布（透明像素跳过=保持画布现像），帧末整画布一次拷贝出输出；
+/// 省掉原 blit 每像素的「prev 画布读 + write_px 4 字节写 + disposal 分支」。输出逐字节与原一致。
+fn blit_full_cover_keep(
+    canvas: &mut Canvas,
+    indices: &[u8],
+    frame: &GifFrame,
+    lut: &[u32; 256],
+    w: usize,
+    h: usize,
+) {
+    let cv = &mut canvas.canvas;
+    let fw = frame.w as usize;
+    let trans = frame.transparent; // i32（-1 = 无透明索引；GCE 透明恒 0..=255）
+    for r in 0..indices.len().div_ceil(fw).min(frame.h as usize) {
+        let y = if frame.interlaced { interlaced_row(r, frame.h as usize) } else { r };
+        if y >= h {
+            continue;
+        }
+        let src = r * fw;
+        let dst = y * w;
+        for x in 0..w {
+            let idx = indices[src + x];
+            // 透明：画布保持现像（= 原 outp=prev）；非透明：LUT 直写。
+            if i32::from(idx) != trans {
+                cv[dst + x] = lut[idx as usize];
+            }
+        }
+    }
+}
+
 /// 迭代器用：合成第 `frame` 帧（画布推进 + 输出全量画布）。`out` 长 == canvas_w*canvas_h*4。
 pub(crate) fn composite_into(
     canvas: &mut Canvas,
@@ -229,6 +273,13 @@ pub(crate) fn composite_into(
         copy_canvas_into(out, &canvas.canvas);
     }
     let lut = build_palette(data, frame);
+    if blit_fast_enabled() && covers_full && frame.disposal == Disposal::Keep {
+        // 全覆 Keep 快道（env 门控，默认开）：只写画布 + 帧末一次整画布拷贝，字节恒等（见
+        // blit_full_cover_keep 不变式）。非全覆 / 非 Keep 走下方原路径（含原 copy_canvas_into + blit 双写）。
+        blit_full_cover_keep(canvas, indices, frame, &lut, w, h);
+        copy_canvas_into(out, &canvas.canvas);
+        return Ok(());
+    }
     blit(
         out,
         Some(&mut canvas.canvas),
@@ -258,4 +309,263 @@ pub(crate) fn composite_first_into(
     let lut = build_palette(data, frame);
     blit(out, None, indices, frame, &lut, w, h);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LCG 确定性伪随机（同 kimg 惯例），避免真随机不稳定的种子依赖。
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    struct Case<'a> {
+        w: usize,
+        h: usize,
+        indices: Vec<u8>,
+        frame: GifFrame,
+        lut: [u32; 256],
+        label: &'a str,
+    }
+
+    /// 双路对拍：原路径（copy+blit 双写）vs 快道（blit_full_cover_keep + 帧末整拷贝）。
+    /// 断言两路输出字节一致且画布终态一致（对「快道适用」帧，原本就是唯一正确结果）。
+    fn assert_fast_parity(c: &Case) {
+        // 参照路：原 composite_into 行为（decode 外置，直接喂 indices）。
+        let mut ref_canvas = Canvas::new(c.w, c.h);
+        let mut ref_out = vec![0u8; c.w * c.h * 4];
+        if !(c.frame.x == 0 && c.frame.y == 0 && c.frame.w as usize >= c.w && c.frame.h as usize >= c.h)
+        {
+            copy_canvas_into(&mut ref_out, &ref_canvas.canvas);
+        }
+        blit(
+            &mut ref_out,
+            Some(&mut ref_canvas.canvas),
+            &c.indices,
+            &c.frame,
+            &c.lut,
+            c.w,
+            c.h,
+        );
+
+        // 快道路。
+        let mut fast_canvas = Canvas::new(c.w, c.h);
+        let mut fast_out = vec![0u8; c.w * c.h * 4];
+        blit_full_cover_keep(&mut fast_canvas, &c.indices, &c.frame, &c.lut, c.w, c.h);
+        copy_canvas_into(&mut fast_out, &fast_canvas.canvas);
+
+        assert_eq!(
+            ref_out, fast_out,
+            "[{}] 输出字节不一致",
+            c.label
+        );
+        assert_eq!(
+            ref_canvas.canvas, fast_canvas.canvas,
+            "[{}] 画布终态不一致",
+            c.label
+        );
+    }
+
+    fn opaque_lut(seed: &mut u64) -> [u32; 256] {
+        let mut lut = [0u32; 256];
+        for i in 0..256 {
+            // alpha 恒 0xFF（native u32 RGBA），与 build_palette 一致。
+            lut[i] = (lcg(seed) as u32 & 0xFFFFFF) | 0xFF << 24;
+        }
+        lut
+    }
+
+    fn frame(x: u32, y: u32, w: u32, h: u32, disposal: Disposal, transparent: i32, interlaced: bool) -> GifFrame {
+        GifFrame {
+            x,
+            y,
+            w,
+            h,
+            interlaced,
+            palette_offset: -1,
+            palette_count: 0,
+            min_code_size: 8,
+            data_offset: 0,
+            disposal,
+            transparent,
+            delay_centiseconds: 0,
+        }
+    }
+
+    fn index_grid(seed: &mut u64, len: usize, span: u32) -> Vec<u8> {
+        (0..len).map(|_| (lcg(seed) % u64::from(span)) as u8).collect()
+    }
+
+    #[test]
+    fn blit_full_cover_keep_matches_original() {
+        let mut seed = 0x1234_5678;
+        let mut cases: Vec<Case> = Vec::new();
+
+        // 1) 全覆 Keep 不透明（无 GCE）。
+        cases.push(Case {
+            w: 8,
+            h: 8,
+            indices: index_grid(&mut seed, 8 * 8, 256),
+            frame: frame(0, 0, 8, 8, Disposal::Keep, -1, false),
+            lut: opaque_lut(&mut seed),
+            label: "full_keep_opaque",
+        });
+        // 2) 全覆 Keep + 透明索引打孔（透明像素须保留画布现像）。
+        cases.push(Case {
+            w: 16,
+            h: 12,
+            indices: index_grid(&mut seed, 16 * 12, 16),
+            frame: frame(0, 0, 16, 12, Disposal::Keep, 3, false),
+            lut: opaque_lut(&mut seed),
+            label: "full_keep_trans_holes",
+        });
+        // 3) 全覆 Keep + 透明 + 隔行（interlaced_row 走查）。
+        cases.push(Case {
+            w: 21,
+            h: 17,
+            indices: index_grid(&mut seed, 21 * 17, 8),
+            frame: frame(0, 0, 21, 17, Disposal::Keep, 0, true),
+            lut: opaque_lut(&mut seed),
+            label: "full_keep_trans_interlaced",
+        });
+        // 4) 帧矩形大于逻辑屏（全覆但超尺寸：indices=fw*fh，只消费 w×h）。
+        cases.push(Case {
+            w: 10,
+            h: 10,
+            indices: index_grid(&mut seed, 20 * 15, 32),
+            frame: frame(0, 0, 20, 15, Disposal::Keep, 7, false),
+            lut: opaque_lut(&mut seed),
+            label: "full_keep_oversized_frame",
+        });
+        // 5) 大尺寸纯不透明（接近真实 001__anim_opaque）。
+        cases.push(Case {
+            w: 320,
+            h: 240,
+            indices: index_grid(&mut seed, 320 * 240, 256),
+            frame: frame(0, 0, 320, 240, Disposal::Keep, -1, false),
+            lut: opaque_lut(&mut seed),
+            label: "full_keep_320x240",
+        });
+        // 6) 透明打孔低频（1% 透明索引，覆盖「透明像素在循环中稀疏出现」）。
+        let mut idx = vec![1u8; 320 * 240];
+        for i in (0..320 * 240).step_by(100) {
+            idx[i] = 0;
+        }
+        cases.push(Case {
+            w: 320,
+            h: 240,
+            indices: idx,
+            frame: frame(0, 0, 320, 240, Disposal::Keep, 0, false),
+            lut: opaque_lut(&mut seed),
+            label: "full_keep_sparse_trans",
+        });
+
+        for c in &cases {
+            assert_fast_parity(c);
+        }
+    }
+
+    /// SIMD 调色板展开可行性 microbench（release 跑，非默认测试）：
+    /// `cargo test -p kimg_gif --release --lib -- --ignored blit_simd_headroom --nocapture --test-threads=1`
+    /// 快道内层循环（全覆 Keep：`if idx != trans { dst[i] = lut[idx] }`）标量 vs AVX2 vpgatherdd 中位。
+    /// 结论用于决定是否接入 SIMD（K107 门槛：需 ≥1.5× 且逐字节恒等，否则不硬投）。
+    #[test]
+    #[ignore = "仅 SIMD 决策用，release + --ignored 显式跑"]
+    fn blit_simd_headroom() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("SIMD headroom: 无 AVX2，跳过");
+            return;
+        }
+        const N: usize = 4 * 1024 * 1024;
+        let mut seed = 0xDEAD_BEEFu64;
+        let idx: Vec<u8> = (0..N)
+            .map(|_| {
+                seed = seed.wrapping_mul(0x9E3779B97F4A7C15) ^ (seed >> 29);
+                (seed % 256) as u8
+            })
+            .collect();
+        let lut: [u32; 256] = {
+            let mut l = [0u32; 256];
+            for i in 0..256 {
+                l[i] = ((i as u32) * 2654435761) | 0xFF << 24;
+            }
+            l
+        };
+        let trans = 0u8;
+
+        let mut dst_s = vec![0u32; N];
+        let mut dst_v = vec![0u32; N];
+
+        fn scalar_expand(idx: &[u8], lut: &[u32; 256], trans: u8, dst: &mut [u32]) {
+            for i in 0..idx.len() {
+                let v = idx[i];
+                if v != trans {
+                    dst[i] = lut[v as usize];
+                }
+            }
+        }
+
+        scalar_expand(&idx, &lut, trans, &mut dst_s);
+        unsafe {
+            lut_expand_avx2(&idx, &lut, trans, &mut dst_v);
+        }
+        assert_eq!(dst_s, dst_v, "SIMD 与标量逐字节不一致");
+
+        let median = |f: &mut dyn FnMut()| {
+            f();
+            let mut acc = Vec::new();
+            for _ in 0..9 {
+                let t = std::time::Instant::now();
+                f();
+                acc.push(t.elapsed().as_secs_f64());
+            }
+            acc.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            acc[acc.len() / 2]
+        };
+        let s = median(&mut || {
+            scalar_expand(&idx, &lut, trans, &mut dst_s);
+            std::hint::black_box(&dst_s[0]);
+        });
+        let v = median(&mut || {
+            unsafe {
+                lut_expand_avx2(&idx, &lut, trans, &mut dst_v);
+            }
+            std::hint::black_box(&dst_v[0]);
+        });
+        eprintln!(
+            "SIMD headroom: N={N} scalar={s:.5}s avx2={v:.5}s ratio={:.2}x",
+            s / v
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn lut_expand_avx2(idx: &[u8], lut: &[u32; 256], trans: u8, dst: &mut [u32]) {
+        use std::arch::x86_64::*;
+        let mut i = 0usize;
+        let vtrans = _mm256_set1_epi32(i32::from(trans));
+        let ptr = lut.as_ptr();
+        while i + 8 <= dst.len() {
+            // 2024 edition：unsafe fn 内对每个 unsafe 运算仍需显式 unsafe 块。
+            unsafe {
+                let bytes = _mm_loadl_epi64(idx.as_ptr().add(i) as *const __m128i);
+                let dwords = _mm256_cvtepu8_epi32(bytes);
+                let mask = _mm256_cmpeq_epi32(dwords, vtrans);
+                let gathered = _mm256_i32gather_epi32(ptr.cast(), dwords, 4);
+                let old = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+                let blended = _mm256_blendv_epi8(gathered, old, mask);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, blended);
+            }
+            i += 8;
+        }
+        while i < dst.len() {
+            let v = idx[i];
+            if v != trans {
+                dst[i] = lut[v as usize];
+            }
+            i += 1;
+        }
+    }
 }
