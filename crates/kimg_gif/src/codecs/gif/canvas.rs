@@ -4,7 +4,8 @@
 //! 性能手段：
 //! - 调色板预先打成 `[u32;256]`（native 序 RGBA，表外=不透明黑），一次；展开每像素一次 u32 写。
 //! - 画布为 `Vec<u32>`，整行地址算术 + 直接索引，不走 `get_pixel_mut`/`enumerate_pixels_mut`。
-//! - 全覆盖无透明 + Keep 帧走纯 LUT 直写热路径；偏置局部帧先整体 `memcpy` 画布到输出再覆盖 bbox。
+//! - 任意几何 Keep 帧走纯 LUT 直写热路径（只推进画布 u32 1 写/px，帧末整拷贝）；非 Keep/
+//!   快道关的局部帧先整体 `memcpy` 画布到输出再覆盖 bbox（dormancy 原路径）。
 //! - LZW 表/码流/索引缓冲跨帧复用（`Scratch`），不逐帧重建。
 
 use std::io;
@@ -219,15 +220,17 @@ fn blit_fast_enabled() -> bool {
     })
 }
 
-/// 全覆 Keep 帧快道：帧矩形覆盖整个逻辑屏（covers_full）且 disposal==Keep 时，
+/// 任意几何 Keep 帧快道（R1 全覆快道推广到非全覆局部帧）：disposal==Keep 时，
 /// **不变式 out 逐像素 == canvas** 成立：
-/// - 原 blit 对每像素 `outp = if cur alpha==0 { prev } else { cur }`，Keep 下 canvas 与 out
-///   同写 `outp`（canvas[dst] = outp，write_px(out, outp)）；
-/// - 透明像素（cur==0 即 idx==trans）取 prev=画布现像，Keep 下画布保持该现像 → 二者仍相等；
-/// - 非透明像素 lut 直写（alpha 恒 0xFF），canvas 与 out 同取 cur。
+/// - 原路径 bbox 内两处同写 `outp`（canvas[dst]=outp 且 write_px(out,outp)=outp），bbox 外
+///   out 维持早先 copy_canvas_into 的画布拷贝 → 处理后整画布 out==canvas（透明像素
+///   idx==trans 取 prev=画布现像，Keep 下画布保持该现像 → 跳过即等价；非透明 lut 直写双路同 cur）；
+/// - R1 全覆是该不变式的特例（x0=0、cw=w、src_col_start=0）。
 /// 故快道只需 u32 1 写/px 推进画布（透明像素跳过=保持画布现像），帧末整画布一次拷贝出输出；
 /// 省掉原 blit 每像素的「prev 画布读 + write_px 4 字节写 + disposal 分支」。输出逐字节与原一致。
-fn blit_full_cover_keep(
+/// 几何与 `blit` 完全同构（同 clip_rect / src_col_start / src_end 截断 / interlaced_row），
+/// 仅省略 out 侧写与 prev 读。Background/Previous 帧不适用（out≠画布，dispatch 层已排除）。
+fn blit_keep(
     canvas: &mut Canvas,
     indices: &[u8],
     frame: &GifFrame,
@@ -235,21 +238,34 @@ fn blit_full_cover_keep(
     w: usize,
     h: usize,
 ) {
+    let (cx, _cy, cw, ch) = clip_rect(frame, w as u32, h as u32);
+    if cw == 0 || ch == 0 {
+        return; // 帧完全在逻辑屏外（含 x>=w / y>=h 全越界）
+    }
     let cv = &mut canvas.canvas;
     let fw = frame.w as usize;
     let trans = frame.transparent; // i32（-1 = 无透明索引；GCE 透明恒 0..=255）
-    for r in 0..indices.len().div_ceil(fw).min(frame.h as usize) {
-        let y = if frame.interlaced { interlaced_row(r, frame.h as usize) } else { r };
+    let rows = indices.len().div_ceil(fw).min(frame.h as usize);
+    let x0 = cx as usize;
+    let x1 = (cx + cw) as usize;
+    let src_col_start = x0.saturating_sub(frame.x as usize);
+    for r in 0..rows {
+        let yf = if frame.interlaced { interlaced_row(r, frame.h as usize) } else { r };
+        let y = frame.y as usize + yf;
         if y >= h {
             continue;
         }
-        let src = r * fw;
-        let dst = y * w;
-        for x in 0..w {
-            let idx = indices[src + x];
+        let src = r * fw + src_col_start;
+        let src_end = (r * fw + fw).min(indices.len());
+        let dst = y * w + x0;
+        for dx in 0..(x1 - x0) {
+            if src + dx >= src_end {
+                break;
+            }
+            let idx = indices[src + dx];
             // 透明：画布保持现像（= 原 outp=prev）；非透明：LUT 直写。
             if i32::from(idx) != trans {
-                cv[dst + x] = lut[idx as usize];
+                cv[dst + dx] = lut[idx as usize];
             }
         }
     }
@@ -268,17 +284,19 @@ pub(crate) fn composite_into(
     let covers_full =
         frame.x == 0 && frame.y == 0 && frame.w as usize >= w && frame.h as usize >= h;
 
+    let lut = build_palette(data, frame);
+    if blit_fast_enabled() && frame.disposal == Disposal::Keep {
+        // 任意几何 Keep 快道（env 门控，默认开）：只写画布 + 帧末一次整画布拷贝，字节恒等
+        // （见 blit_keep 不变式：Keep 下处理后画布==输出，含非全覆局部帧）。非 Keep 或快道关
+        // 走下方原路径（原 copy_canvas_into + blit 双写，dormancy 保留）。
+        blit_keep(canvas, indices, frame, &lut, w, h);
+        copy_canvas_into(out, &canvas.canvas);
+        return Ok(());
+    }
+
     if !covers_full {
         // 局部帧：输出先取画布现状，再叠绘 bbox。
         copy_canvas_into(out, &canvas.canvas);
-    }
-    let lut = build_palette(data, frame);
-    if blit_fast_enabled() && covers_full && frame.disposal == Disposal::Keep {
-        // 全覆 Keep 快道（env 门控，默认开）：只写画布 + 帧末一次整画布拷贝，字节恒等（见
-        // blit_full_cover_keep 不变式）。非全覆 / 非 Keep 走下方原路径（含原 copy_canvas_into + blit 双写）。
-        blit_full_cover_keep(canvas, indices, frame, &lut, w, h);
-        copy_canvas_into(out, &canvas.canvas);
-        return Ok(());
     }
     blit(
         out,
@@ -303,6 +321,8 @@ pub(crate) fn composite_first_into(
 ) -> io::Result<()> {
     let indices = scratch.decode(data, frame)?;
     let covers_full = frame.x == 0 && frame.y == 0 && frame.w as usize >= w && frame.h as usize >= h;
+    // covers_full 时 blit(None) 全量覆盖每像素：非透明写 cur、透明写 0，与透明黑底 fill(0)
+    // 逐字节等价 → 跳过 fill。仅局部帧才需先清透明黑底。
     if !covers_full {
         out.fill(0); // 透明黑底
     }
@@ -313,6 +333,7 @@ pub(crate) fn composite_first_into(
 
 #[cfg(test)]
 mod tests {
+    use super::super::lzw::lzw_write_indices;
     use super::*;
 
     /// LCG 确定性伪随机（同 kimg 惯例），避免真随机不稳定的种子依赖。
@@ -328,14 +349,22 @@ mod tests {
         frame: GifFrame,
         lut: [u32; 256],
         label: &'a str,
+        /// 预置非零画布（模拟前帧留下的持久画布内容；两路同种子同填，强化「透明保留 prev」语义）。
+        preseed: bool,
     }
 
-    /// 双路对拍：原路径（copy+blit 双写）vs 快道（blit_full_cover_keep + 帧末整拷贝）。
+    /// 双路对拍：原路径（copy+blit 双写）vs 快道（blit_keep + 帧末整拷贝）。
     /// 断言两路输出字节一致且画布终态一致（对「快道适用」帧，原本就是唯一正确结果）。
     fn assert_fast_parity(c: &Case) {
         // 参照路：原 composite_into 行为（decode 外置，直接喂 indices）。
         let mut ref_canvas = Canvas::new(c.w, c.h);
         let mut ref_out = vec![0u8; c.w * c.h * 4];
+        if c.preseed {
+            let mut p = 0xABCD_EF01u64;
+            for v in ref_canvas.canvas.iter_mut() {
+                *v = lcg(&mut p) as u32;
+            }
+        }
         if !(c.frame.x == 0 && c.frame.y == 0 && c.frame.w as usize >= c.w && c.frame.h as usize >= c.h)
         {
             copy_canvas_into(&mut ref_out, &ref_canvas.canvas);
@@ -353,7 +382,13 @@ mod tests {
         // 快道路。
         let mut fast_canvas = Canvas::new(c.w, c.h);
         let mut fast_out = vec![0u8; c.w * c.h * 4];
-        blit_full_cover_keep(&mut fast_canvas, &c.indices, &c.frame, &c.lut, c.w, c.h);
+        if c.preseed {
+            let mut p = 0xABCD_EF01u64;
+            for v in fast_canvas.canvas.iter_mut() {
+                *v = lcg(&mut p) as u32;
+            }
+        }
+        blit_keep(&mut fast_canvas, &c.indices, &c.frame, &c.lut, c.w, c.h);
         copy_canvas_into(&mut fast_out, &fast_canvas.canvas);
 
         assert_eq!(
@@ -399,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn blit_full_cover_keep_matches_original() {
+    fn blit_keep_matches_original() {
         let mut seed = 0x1234_5678;
         let mut cases: Vec<Case> = Vec::new();
 
@@ -411,6 +446,7 @@ mod tests {
             frame: frame(0, 0, 8, 8, Disposal::Keep, -1, false),
             lut: opaque_lut(&mut seed),
             label: "full_keep_opaque",
+            preseed: false,
         });
         // 2) 全覆 Keep + 透明索引打孔（透明像素须保留画布现像）。
         cases.push(Case {
@@ -420,6 +456,7 @@ mod tests {
             frame: frame(0, 0, 16, 12, Disposal::Keep, 3, false),
             lut: opaque_lut(&mut seed),
             label: "full_keep_trans_holes",
+            preseed: false,
         });
         // 3) 全覆 Keep + 透明 + 隔行（interlaced_row 走查）。
         cases.push(Case {
@@ -429,6 +466,7 @@ mod tests {
             frame: frame(0, 0, 21, 17, Disposal::Keep, 0, true),
             lut: opaque_lut(&mut seed),
             label: "full_keep_trans_interlaced",
+            preseed: false,
         });
         // 4) 帧矩形大于逻辑屏（全覆但超尺寸：indices=fw*fh，只消费 w×h）。
         cases.push(Case {
@@ -438,6 +476,7 @@ mod tests {
             frame: frame(0, 0, 20, 15, Disposal::Keep, 7, false),
             lut: opaque_lut(&mut seed),
             label: "full_keep_oversized_frame",
+            preseed: false,
         });
         // 5) 大尺寸纯不透明（接近真实 001__anim_opaque）。
         cases.push(Case {
@@ -447,6 +486,7 @@ mod tests {
             frame: frame(0, 0, 320, 240, Disposal::Keep, -1, false),
             lut: opaque_lut(&mut seed),
             label: "full_keep_320x240",
+            preseed: false,
         });
         // 6) 透明打孔低频（1% 透明索引，覆盖「透明像素在循环中稀疏出现」）。
         let mut idx = vec![1u8; 320 * 240];
@@ -460,10 +500,161 @@ mod tests {
             frame: frame(0, 0, 320, 240, Disposal::Keep, 0, false),
             lut: opaque_lut(&mut seed),
             label: "full_keep_sparse_trans",
+            preseed: false,
+        });
+
+        // 7) 局部 Keep 不透明（x>0/y>0 偏移，bbox 内叠绘、bbox 外保留画布）。
+        cases.push(Case {
+            w: 16,
+            h: 16,
+            indices: index_grid(&mut seed, 6 * 5, 256),
+            frame: frame(2, 3, 6, 5, Disposal::Keep, -1, false),
+            lut: opaque_lut(&mut seed),
+            label: "partial_keep_opaque",
+            preseed: true,
+        });
+        // 8) 局部 Keep + 透明打孔（透明像素保留非零画布现像并入 out 拷贝）。
+        cases.push(Case {
+            w: 20,
+            h: 16,
+            indices: index_grid(&mut seed, 9 * 8, 16),
+            frame: frame(4, 2, 9, 8, Disposal::Keep, 2, false),
+            lut: opaque_lut(&mut seed),
+            label: "partial_keep_trans_holes",
+            preseed: true,
+        });
+        // 9) 局部 Keep + 透明 + 隔行（偏移下 interlaced_row 命中裁剪行）。
+        cases.push(Case {
+            w: 24,
+            h: 20,
+            indices: index_grid(&mut seed, 10 * 9, 8),
+            frame: frame(3, 5, 10, 9, Disposal::Keep, 0, true),
+            lut: opaque_lut(&mut seed),
+            label: "partial_keep_trans_interlaced",
+            preseed: true,
+        });
+        // 10) 局部 Keep 越界底右角（帧矩形伸到屏外，clip_rect 收窄 bbox）。
+        cases.push(Case {
+            w: 10,
+            h: 10,
+            indices: index_grid(&mut seed, 10 * 10, 64),
+            frame: frame(8, 8, 10, 10, Disposal::Keep, -1, false),
+            lut: opaque_lut(&mut seed),
+            label: "partial_keep_clip_tr",
+            preseed: true,
+        });
+        // 11) 局部 Keep 紧贴顶左缘 + 透明（x0=src_col_start 零偏走查）。
+        cases.push(Case {
+            w: 12,
+            h: 12,
+            indices: index_grid(&mut seed, 4 * 4, 8),
+            frame: frame(1, 1, 4, 4, Disposal::Keep, 1, false),
+            lut: opaque_lut(&mut seed),
+            label: "partial_keep_edge_tl",
+            preseed: true,
+        });
+        // 12) 局部 Keep 完全越界（clip 空矩形 → 两路均 no-op，画布原样拷出）。
+        cases.push(Case {
+            w: 8,
+            h: 8,
+            indices: index_grid(&mut seed, 4 * 4, 16),
+            frame: frame(9, 9, 4, 4, Disposal::Keep, -1, false),
+            lut: opaque_lut(&mut seed),
+            label: "partial_keep_offscreen",
+            preseed: true,
+        });
+        // 13) 局部 Keep 帧矩形大于逻辑屏但带偏移（非全覆：clip 到屏内，src 只采首列）。
+        cases.push(Case {
+            w: 8,
+            h: 8,
+            indices: index_grid(&mut seed, 20 * 20, 32),
+            frame: frame(2, 2, 20, 20, Disposal::Keep, -1, false),
+            lut: opaque_lut(&mut seed),
+            label: "partial_keep_oversized_offset",
+            preseed: true,
+        });
+        // 14) 局部 Keep + 索引截断（indices < fw*fh：两路 src_end 截断须逐字节一致）。
+        cases.push(Case {
+            w: 8,
+            h: 8,
+            indices: index_grid(&mut seed, 30, 64), // 6*6=36 缺 6 个
+            frame: frame(1, 1, 6, 6, Disposal::Keep, 5, false),
+            lut: opaque_lut(&mut seed),
+            label: "partial_keep_truncated",
+            preseed: true,
+        });
+        // 15) 全覆 Keep + 透明打孔 + 预置非零画布（透明保留 prev 在非零底上直断言——
+        //     与第 2/3 例的区别：全覆透明此前只在零画布对拍过，preseed 暴露「透明误清零/误覆写」类错）。
+        cases.push(Case {
+            w: 24,
+            h: 18,
+            indices: index_grid(&mut seed, 24 * 18, 20),
+            frame: frame(0, 0, 24, 18, Disposal::Keep, 2, false),
+            lut: opaque_lut(&mut seed),
+            label: "full_keep_preseed_trans",
+            preseed: true,
         });
 
         for c in &cases {
             assert_fast_parity(c);
+        }
+    }
+
+    /// `composite_into` 派发分支直测：用 `lzw_write_indices` 合成真实可解码帧数据（子块链 +
+    /// 终止 0，data_offset=0 / min_code_size=8），Keep 帧经派发走快道、Background/Previous 走
+    /// 原路，各与「手动原路径（copy-if-partial + blit）」对拍输出与画布逐字节一致——直接执行
+    /// `composite_into` 的派发分支体（非复用下层函数），两态 env 下均成立（Keep 在快道关时
+    /// 落入原路、参照相同，断言依然成立）。
+    #[test]
+    fn composite_into_dispatch_parity() {
+        let mut seed = 0x1357_9BDFu64;
+        let (cw, ch) = (16u32, 12u32);
+        let (fw, fh) = (8u32, 6u32); // 局部帧（非全覆，x=2,y=1）
+        let indices = index_grid(&mut seed, (fw * fh) as usize, 32);
+        let mut data = Vec::new();
+        lzw_write_indices(&mut data, &indices, 8).unwrap();
+
+        // 经派发跑 `composite_into`。
+        let dispatch = |d: Disposal| {
+            let f = frame(2, 1, fw, fh, d, 3, false); // palette=-1 → LUT=[0xFF000000;256]
+            let mut canvas = Canvas::new(cw as usize, ch as usize);
+            let mut out = vec![0u8; (cw * ch * 4) as usize];
+            composite_into(&mut canvas, &mut Scratch::new(), &data, &f, &mut out).unwrap();
+            (out, canvas.canvas)
+        };
+        // 手动原路径参照（局部帧先 copy 画布到 out 再 blit 双写）。
+        let manual = |d: Disposal| {
+            let f = frame(2, 1, fw, fh, d, 3, false);
+            let mut canvas = Canvas::new(cw as usize, ch as usize);
+            let mut out = vec![0u8; (cw * ch * 4) as usize];
+            copy_canvas_into(&mut out, &canvas.canvas);
+            blit(
+                &mut out,
+                Some(&mut canvas.canvas),
+                &indices,
+                &f,
+                &[0xFF000000u32; 256],
+                cw as usize,
+                ch as usize,
+            );
+            (out, canvas.canvas)
+        };
+
+        for (d, name) in [
+            (Disposal::Keep, "Keep"),
+            (Disposal::Background, "Background"),
+            (Disposal::Previous, "Previous"),
+        ] {
+            let (d_out, d_cv) = dispatch(d);
+            let (m_out, m_cv) = manual(d);
+            assert_eq!(d_out, m_out, "[{name}] composite_into 派发输出 != 原路径参照");
+            assert_eq!(d_cv, m_cv, "[{name}] composite_into 派发画布 != 原路径参照");
+            if d == Disposal::Keep {
+                // Keep 不变式经真实派发成立：out 逐字节 == 画布（快道/原路同满足）。
+                let mut probe = vec![0u8; (cw * ch * 4) as usize];
+                copy_canvas_into(&mut probe, &d_cv);
+                assert_eq!(probe, d_out, "[Keep] 派发后 out != 画布（不变式破）");
+            }
         }
     }
 
