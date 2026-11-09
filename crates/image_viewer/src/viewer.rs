@@ -85,6 +85,7 @@ use ::viewer::pan_zoom;
 mod input;   // input/hit：滚轮缩放/切图、放大态平移、拖拽平移、切图复位
 mod decode;  // decode：并行解码池 / LRU 缓存 / 级联预取 / 动图时钟 / EXIF 即时首帧
 mod display; // display/placeholder：Render 上屏、C6 预上传垫底、占位文本
+mod diag;    // diag：env 门控诊断探针（GPUI_EDITOR_IMG_DIAG=1，帧间隔/切换时延）
 
 /// 一张已解码可立即上屏的图片（LRU 缓存条目）。
 #[derive(Clone)]
@@ -93,7 +94,8 @@ struct CacheEntry {
     render: Arc<RenderImage>,
     intrinsic: (f32, f32),
     bytes: usize,
-    /// 实际解码降档分母（1/8/4/2/1）：JPEG/PNG 共用 [`pick_jpeg_denom`] 选档（JPEG 全解后
+    /// 实际解码降档分母（1/8/4/2/1）：JPEG/PNG/HEIF/通用静态共用 [`pick_den`] 选档
+    /// （JPEG 全解后
     /// 盒式降采样、PNG 盒式降采样），其它格式恒 1。用于「升档判定」：展示分母 >
     /// 当前需要分母（= 解码比显示更粗）时按需重解更细档（放大时）。
     denom: u8,
@@ -534,6 +536,12 @@ fn is_gif_magic(b: &[u8]) -> bool {
     b.starts_with(b"GIF")
 }
 
+/// ICO 魔数（ICONDIR：reserved(2)=0 + type(2)=1）检测：ICO 亚 ms 尺寸、降档无关紧要，
+/// 保持全尺寸 den=1（避免对多帧/带内嵌 PNG 的 ICO 在解码层意外降档）。
+fn is_ico_magic(b: &[u8]) -> bool {
+    b.len() >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 1 && b[3] == 0
+}
+
 /// PNG 魔数（8 字节签名 `\x89PNG\r\n\x1a\n`）检测：区分「PNG 走展示档降采样解码」与
 /// 「其它格式走 image 全解」。以字节为准，比扩展名可信（伪装成 .png 的其它格式不会
 /// 被误当 PNG 硬解）。
@@ -674,16 +682,27 @@ fn exif_ifd_thumbnail(tiff: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// 按「展示像素需要」选 JPEG 降档分母 {1,2,4,8}：取**最大**的、让解码尺寸 ≥ 需要尺寸的
-/// 分母（缺省 1 = 全解）。保证一张图只在「解码 ≥ 显示」的前提下尽量省内存——GPU 只会把
-/// 图缩小、绝不放大 → 显示**不糊**（这是行业「decode to display size」的地基：放大时
-/// 需要涨、分母自然下降，需要 > 原图时才落到全解）。
-fn pick_jpeg_denom(iw: u32, ih: u32, need: (f32, f32)) -> u8 {
-    let (nw, nh) = (need.0.max(1.0), need.1.max(1.0));
+/// 通用「按展示像素需要选降档分母 {1,2,4,8}」：取**最大**的、让解码尺寸 ≥ 需要尺寸的
+/// 分母（缺省 1 = 全解）。JPEG/PNG/HEIF/通用静态（BMP/TIFF/WEBP…）共用一处判档（R5A
+/// 收口）。保证一张图只在「解码 ≥ 显示」的前提下尽量省内存——GPU 只会把图缩小、绝不
+/// 放大 → 显示**不糊**（行业「decode to display size」地基：放大时需要涨、分母自然
+/// 下降，需要 > 原图时才落到全解）。
+///
+/// 判档前先把「视口需要」**按图像纵横比折算成 contain 实际显示尺寸**：contain 只贴一边，
+/// 竖图显示宽度永远到不了视口宽（高度先贴边）、横图/全景图高度到不了视口高。直接拿
+/// 「宽高双 ≥ 视口 need」卡档会让竖图被短轴卡死 den=1——全尺寸缓存 + 34MB 纹理白占。
+/// 折算后（`eff_w = min(nw, nh·iw/ih)`，`eff_h = min(nh, nw·ih/iw)`）短/长轴都投影到
+/// 以图比例对应的目标值，降档后仍 ≥ 实际显示尺寸（不放大、不糊），且当 need 比例已与
+/// 图像一致时折算为恒等（既有横图回归不变）。
+fn pick_den(iw: u32, ih: u32, need_w: f32, need_h: f32) -> u8 {
+    let (nw, nh) = (need_w.max(1.0), need_h.max(1.0));
+    let (iw, ih) = (iw.max(1) as f32, ih.max(1) as f32);
+    let eff_w = nw.min(nh * iw / ih);
+    let eff_h = nh.min(nw * ih / iw);
     for den in [8u8, 4, 2, 1] {
-        let w = (iw as f32 / den as f32).ceil();
-        let h = (ih as f32 / den as f32).ceil();
-        if w >= nw && h >= nh {
+        let w = (iw / den as f32).ceil();
+        let h = (ih / den as f32).ceil();
+        if w >= eff_w && h >= eff_h {
             return den;
         }
     }
@@ -704,7 +723,7 @@ fn decode_jpeg_display(
     }
     let img = kimg::load_from_memory(bytes).map_err(|e| format!("JPEG 解码失败：{e}"))?;
     let (iw, ih) = img.dimensions();
-    let den = pick_jpeg_denom(iw, ih, need);
+    let den = pick_den(iw, ih, need.0, need.1);
     let mut rgba = img.to_rgba8();
     if den == 1 {
         // den=1：全解直出（RGBA→BGRA 交换，尺寸=原始）
@@ -733,8 +752,8 @@ fn try_decode_jpeg_scaled(bytes: &[u8], need: (f32, f32)) -> Option<(Vec<u8>, u3
     let mut dec = kimg::codecs::jpeg::JpegDecoder::from_bytes(bytes).ok()?;
     dec.set_limits(kimg::Limits::default()).ok()?;
     let (iw, ih) = dec.dimensions();
-    // v1 只做 den=2：den=1/4/8 → 走旧路径（不降级）。选档与 [`pick_jpeg_denom`] 同口径。
-    if pick_jpeg_denom(iw, ih, need) != 2 {
+    // v1 只做 den=2：den=1/4/8 → 走旧路径（不降级）。选档与 [`pick_den`] 同口径。
+    if pick_den(iw, ih, need.0, need.1) != 2 {
         return None;
     }
     let color = dec.color_type();
@@ -830,6 +849,77 @@ fn box_downsample_bgra_or_rgba_rayon(buf: &[u8], iw: u32, ih: u32, den: u8) -> (
     out.par_chunks_mut(row_bytes)
         .enumerate()
         .for_each(|(oy, dst)| downsample_row_4ch(buf, iw, ih, den, ow, oy as u32, dst));
+    (out, ow, oh)
+}
+
+/// 3 通道（RGB8）盒式降采样 → 直接产出 **BGRA**（RGBA 展开 + R/B 交换一步完成，无中间
+/// 4 通道缓冲）：`den×den` 源像素块 → 1 输出像素，每通道取均值，输出像素 [B,G,R,255]；
+/// 右/下边缘不满块按实际像素数归一。与 [`box_downsample_bgra_or_rgba`] 语义逐字节一致
+/// （每通道整数平均 + 通道序置换可交换），仅输入为 3 通道——供 BMP/TIFF/WEBP 等静态
+/// 「3 通道原始缓冲先降采样再上屏」省掉全尺寸 RGBA 展开（8.9MP BMP 免 35MB 中间态）。
+fn box_downsample_rgb8_to_bgra(buf: &[u8], iw: u32, ih: u32, den: u8) -> (Vec<u8>, u32, u32) {
+    let den = u32::from(den).max(1);
+    let ow = iw.div_ceil(den);
+    let oh = ih.div_ceil(den);
+    let mut out = vec![0u8; (ow as usize) * (oh as usize) * 4];
+    for oy in 0..oh {
+        downsample_row_3ch(
+            buf, iw, ih, den, ow, oy,
+            &mut out[(oy as usize * ow as usize) * 4..],
+        );
+    }
+    (out, ow, oh)
+}
+
+/// 单条输出行：对其 `den×den` 源块的 `ow` 个像素块各自求 3 通道平均，直接写 BGRA
+/// （B←R / G←G / R←B / A=255）。行与行互不依赖 → 供 rayon 按行并行复用。
+#[inline]
+fn downsample_row_3ch(buf: &[u8], iw: u32, ih: u32, den: u32, ow: u32, oy: u32, dst: &mut [u8]) {
+    let y0 = oy * den;
+    let y1 = (y0 + den).min(ih);
+    for ox in 0..ow {
+        let x0 = ox * den;
+        let x1 = (x0 + den).min(iw);
+        let col_bytes = (x1 - x0) as usize * 3;
+        let mut acc = [0u32; 3];
+        let mut n = 0u32;
+        for y in y0..y1 {
+            let row = &buf[((y * iw + x0) as usize) * 3..][..col_bytes];
+            let mut off = 0usize;
+            while off < col_bytes {
+                acc[0] += row[off] as u32;
+                acc[1] += row[off + 1] as u32;
+                acc[2] += row[off + 2] as u32;
+                n += 1;
+                off += 3;
+            }
+        }
+        let di = ox as usize * 4;
+        if n > 0 {
+            dst[di] = (acc[2] / n) as u8; // B ← 源通道 2（蓝；RGB→BGRA 重排 R/B）
+            dst[di + 1] = (acc[1] / n) as u8; // G
+            dst[di + 2] = (acc[0] / n) as u8; // R ← 源通道 0（红）
+            dst[di + 3] = 255;
+        }
+    }
+}
+
+/// 同 [`box_downsample_rgb8_to_bgra`] 语义的 **rayon 行组并行** 版：输出行互不依赖、按行
+/// 派给并行迭代器；输入像素 < [`PARALLEL_DOWNSAMPLE_MIN_PX`] 时退回单线程（与 4 通道
+/// 版同为「先判小图单线程」的热路径惯例）。产出与单线程参考实现逐字节一致。
+fn box_downsample_rgb8_to_bgra_rayon(buf: &[u8], iw: u32, ih: u32, den: u8) -> (Vec<u8>, u32, u32) {
+    if (iw as u64) * (ih as u64) < PARALLEL_DOWNSAMPLE_MIN_PX {
+        return box_downsample_rgb8_to_bgra(buf, iw, ih, den);
+    }
+    use rayon::prelude::*;
+    let den = u32::from(den).max(1);
+    let ow = iw.div_ceil(den);
+    let oh = ih.div_ceil(den);
+    let row_bytes = (ow as usize) * 4;
+    let mut out = vec![0u8; row_bytes * (oh as usize)];
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(oy, dst)| downsample_row_3ch(buf, iw, ih, den, ow, oy as u32, dst));
     (out, ow, oh)
 }
 
@@ -932,7 +1022,7 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: kimg::ColorType) -> Op
 
 /// PNG 按展示需要**降档解码**（`kimg::codecs::png::PngDecoder` 解全量位图，非 RGBA8 先
 /// 展开，再对全量做盒式降采样到展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。
-/// 选档复用 [`pick_jpeg_denom`]（与格式无关的「解码 ≥ 显示」语义）。
+/// 选档复用 [`pick_den`]（与格式无关的「解码 ≥ 显示」语义）。
 /// - den=1 → 与改动前 `image` 全解**逐像素一致**（RGBA swap 成 BGRA，尺寸=原始）；
 /// - den>1 → 只对**缩小后**缓冲区 swap 红蓝（不在 9M 全量上做交换）。
 /// 任何失败均返回 `Err`（由上层回退 `image` 全解），绝不 panic/硬失败。
@@ -946,7 +1036,7 @@ fn decode_png_display(
     dec.set_limits(kimg::Limits::default())
         .map_err(|e| format!("PNG 尺寸超限：{e}"))?;
     let (iw, ih) = dec.dimensions();
-    let den = pick_jpeg_denom(iw, ih, need);
+    let den = pick_den(iw, ih, need.0, need.1);
     let color = dec.color_type();
     let nbytes = usize::try_from(dec.total_bytes()).map_err(|_| "PNG 解码尺寸过大".to_string())?;
     let mut raw = vec![0u8; nbytes];
@@ -970,7 +1060,7 @@ fn decode_png_display(
 
 /// HEIF/HEIC 按展示需要**降档解码**（kimg_heif 全解出 RGBA 帧 → 与 PNG/JPEG 同款盒式
 /// 降采样到展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。选档复用
-/// [`pick_jpeg_denom`]（与格式无关的「解码 ≥ 显示」语义）。全解路径沿用
+/// [`pick_den`]（与格式无关的「解码 ≥ 显示」语义）。全解路径沿用
 /// [`decode_static_first_frame`] 同源（`kimg::load_from_memory`），输出**已含显示朝向
 /// 变换**。
 /// - den=1 → 与改动前 `decode_generic` 全解**逐像素一致**（RGBA swap 成 BGRA，尺寸=原始）；
@@ -982,7 +1072,7 @@ fn decode_heif_display(
 ) -> Result<(Vec<u8>, u32, u32, u8), String> {
     let img = kimg::load_from_memory(bytes).map_err(|e| format!("HEIF 解码失败：{e}"))?;
     let (iw, ih) = img.dimensions();
-    let den = pick_jpeg_denom(iw, ih, need);
+    let den = pick_den(iw, ih, need.0, need.1);
     let mut rgba = img.to_rgba8();
     if den == 1 {
         // den=1：全解直出（RGBA→BGRA 交换，尺寸=原始；与 decode_generic 逐像素一致）
@@ -992,6 +1082,59 @@ fn decode_heif_display(
     let (mut bgra, w, h) = box_downsample_bgra_or_rgba_rayon(rgba.as_raw(), iw, ih, den);
     swap_rb_in_place(bgra.as_mut());
     Ok((bgra, w, h, den))
+}
+
+/// 其余静态格式（BMP/TIFF/WEBP/PNM…）按展示需要**降档解码**（R5）：kimg 全解出**原始
+/// 缓冲**（按其通道：BMP 3ch RGB8 / TIFF / WEBP 等）→ [`pick_den`] 通用判档 → **先对
+/// 原始缓冲盒式降采样**到展示档再上屏。返回 (BGRA, 输出宽, 输出高, 降档分母)。
+/// - **GIF 动画保持 den=1**（动画帧必须全量驻留才能播；R5 范围墙：动画帧降宽容错面大，
+///   本任务不做）；**ICO 亚 ms 尺寸保持 den=1**（尺寸小无关紧要）；
+/// - 通道分支：3ch RGB8 → [`box_downsample_rgb8_to_bgra_rayon`] 直出 BGRA（免全尺寸
+///   RGBA 展开）；4ch RGBA8 → 复用 4 通道盒式后 swap；其余（L8/La8/16bit 灰度 TIFF…）
+///   先 [`expand_png_to_rgba8`] 展开再走 4 通道盒式；
+/// - den=1 → 与改动前 [`decode_static_first_frame`] 全解**逐像素一致**（RGBA→BGRA swap，
+///   尺寸=原始）；
+/// - den>1 → 只在**降档后**缓冲上做通道重排（不在大图上做交换）。
+/// 任何失败均返回 `Err`（由上层回退 [`decode_generic`] 全解 den=1，绝不 panic/硬失败）。
+fn decode_generic_display(
+    bytes: &[u8],
+    need: (f32, f32),
+) -> Result<(Vec<u8>, u32, u32, u8), String> {
+    let img = kimg::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
+    let (iw, ih) = img.dimensions();
+    if is_ico_magic(bytes) {
+        // ICO 亚 ms 尺寸无关紧要 → 全尺寸 den=1（与 [decode_static_first_frame] 逐像素一致）
+        let mut rgba = img.to_rgba8();
+        swap_rb_in_place(rgba.as_mut());
+        return Ok((rgba.into_raw(), iw, ih, 1));
+    }
+    let den = pick_den(iw, ih, need.0, need.1);
+    if den == 1 {
+        // den=1：全解直出（RGBA→BGRA 交换，尺寸=原始；与 decode_static_first_frame 逐像素一致）
+        let mut rgba = img.to_rgba8();
+        swap_rb_in_place(rgba.as_mut());
+        return Ok((rgba.into_raw(), iw, ih, 1));
+    }
+    // den>1：按解码原通道「先降采样再上屏」
+    match img.color() {
+        kimg::ColorType::Rgb8 => {
+            let (bgra, w, h) = box_downsample_rgb8_to_bgra_rayon(img.as_bytes(), iw, ih, den);
+            Ok((bgra, w, h, den))
+        }
+        kimg::ColorType::Rgba8 => {
+            let (mut bgra, w, h) = box_downsample_bgra_or_rgba_rayon(img.as_bytes(), iw, ih, den);
+            swap_rb_in_place(bgra.as_mut());
+            Ok((bgra, w, h, den))
+        }
+        // 其它通道（L8/La8/16bit 等，如灰度 TIFF）：先展开 RGBA8 再走 4 通道盒式
+        _ => {
+            let rgba = expand_png_to_rgba8(img.as_bytes(), iw, ih, img.color())
+                .ok_or("非 8bit 色彩展开失败")?;
+            let (mut bgra, w, h) = box_downsample_bgra_or_rgba_rayon(&rgba, iw, ih, den);
+            swap_rb_in_place(bgra.as_mut());
+            Ok((bgra, w, h, den))
+        }
+    }
 }
 
 /// RGBA → BGRA（原地交换每像素 R/B；缓冲区按 w×h×4 的 RGBA 直排）。GPUI 的
@@ -1091,8 +1234,9 @@ fn decode_generic(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
 /// CMYK / 12bit / lossless 解不动时回退 `image` 全解，绝不硬失败）包成单帧；PNG → 展示档
 /// 降采样解码（[`decode_png_display`]，失败回退 `image` 全解）；HEIF/HEIC → 展示档降档
 /// 解码（[`decode_heif_display`]：kimg_heif 全解出 RGBA → 盒式降采样，失败回退全解）；
-/// 其它 → `image` 全解（GIF 解全帧动图）。返回 (BGRA 帧序列, 宽, 高, 降档分母)。
-/// den=1 时与改动前逐像素一致。
+/// 其余静态格式（BMP/TIFF/WEBP/ICO…）→ 展示档降档（[`decode_generic_display`]，先盒式
+/// 降采样原始缓冲再上屏，失败回退全解）；GIF → 全帧动图（den=1）。返回
+/// (BGRA 帧序列, 宽, 高, 降档分母)。den=1 时与改动前逐像素一致。
 fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<Frame>, u32, u32, u8), String> {
     if is_jpeg_magic(bytes) {
         match decode_jpeg_display(bytes, need) {
@@ -1129,9 +1273,24 @@ fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<Frame>, u32,
                 Ok((frames, w, h, 1))
             }
         }
-    } else {
+    } else if is_gif_magic(bytes) {
+        // GIF 动画保持全尺寸 den=1（动画帧必须全量驻留才能播；R5 范围墙：动画帧降宽
+        // 容错面大、本任务不做）
         let (frames, w, h) = decode_generic(bytes)?;
         Ok((frames, w, h, 1))
+    } else {
+        // 其余静态格式（BMP/TIFF/WEBP/ICO/PNM…）：展示档降档解码（R5）。降档链路任何
+        // 失败 → 回退既有 `decode_generic` 全解（den=1），绝不硬失败/panic。
+        match decode_generic_display(bytes, need) {
+            Ok((bgra, w, h, den)) => {
+                let frame = bgra_single_frame(bgra, w, h).ok_or("解码结果尺寸异常")?;
+                Ok((vec![frame], w, h, den))
+            }
+            Err(_) => {
+                let (frames, w, h) = decode_generic(bytes)?;
+                Ok((frames, w, h, 1))
+            }
+        }
     }
 }
 
@@ -1173,6 +1332,79 @@ mod tests {
     fn write_png(path: &Path, w: u32, h: u32) {
         let img = kimg::RgbaImage::from_pixel(w, h, kimg::Rgba([200_u8, 30, 10, 255]));
         img.save(path).expect("本测试自产 PNG 应能写出");
+    }
+
+    /// 手写 **24bit 无压缩 BMP**（BI_RGB，自底向上）+ 4 字节行填充：kimg 仅 PNG/GIF
+    /// 可编码，BMP/TIFF/WEBP 夹具须手写。kimg_bmp 解码 BMP 为 3ch RGB8 —— R5 通用静态
+    /// display 降档（3 通道先降采样再上屏）的确定性夹具。`color(x,y)` 供渐变/角点断言。
+    fn write_bmp(path: &Path, w: u32, h: u32, color: impl Fn(u32, u32) -> [u8; 3]) {
+        let stride = ((w * 3 + 3) / 4) * 4;
+        let px_off = 54u32;
+        let file_size = px_off + stride * h;
+        let mut out = Vec::with_capacity(file_size as usize);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&file_size.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]); // 保留
+        out.extend_from_slice(&px_off.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER 尺寸
+        out.extend_from_slice(&w.to_le_bytes());
+        out.extend_from_slice(&h.to_le_bytes()); // 正 = 自底向上
+        out.extend_from_slice(&1u16.to_le_bytes()); // planes
+        out.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        out.extend_from_slice(&[0u8; 20]); // 图像大小(4)+Xppm(4)+Yppm(4)+颜色数(4)+重要颜色(4)
+        for y in (0..h).rev() {
+            let mut row = Vec::with_capacity(stride as usize);
+            for x in 0..w {
+                let [r, g, b] = color(x, y);
+                row.extend_from_slice(&[b, g, r]); // BMP 像素序 BGR
+            }
+            row.resize(stride as usize, 0);
+            out.extend_from_slice(&row);
+        }
+        std::fs::write(path, out).expect("写出 BMP 应成功");
+    }
+
+    /// 手写**最小无压缩 RGB8 TIFF**（单 strip、top-down、Photometric=2=RGB）：IFD 9 项 +
+    /// BitsPerSample 数组 + 原始 RGB8 像素。kimg_tiff 解码为 3ch RGB8 —— 与 BMP 同走
+    /// R5 通用静态降档路径。`color(x,y)` 供渐变断言。
+    fn write_rgb8_tiff(path: &Path, w: u32, h: u32, color: impl Fn(u32, u32) -> [u8; 3]) {
+        let entries: u16 = 9;
+        let bits_off: u32 = 8 + 2 + (entries as u32) * 12 + 4;
+        let data_off: u32 = (bits_off + 6).div_ceil(4) * 4;
+        let n = w as usize * h as usize * 3;
+        let mut out = Vec::with_capacity(data_off as usize + n);
+        out.extend_from_slice(b"II");
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&8u32.to_le_bytes()); // IFD 偏移
+        out.extend_from_slice(&entries.to_le_bytes());
+        let mut push = |tag: u16, ty: u16, count: u32, val: u32| {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        };
+        push(256, 4, 1, w); // ImageWidth
+        push(257, 4, 1, h); // ImageLength
+        push(258, 3, 3, bits_off); // BitsPerSample(8,8,8)
+        push(259, 3, 1, 1); // Compression = none
+        push(262, 3, 1, 2); // Photometric = RGB
+        push(273, 4, 1, data_off); // StripOffsets
+        push(277, 3, 1, 3); // SamplesPerPixel
+        push(278, 4, 1, h); // RowsPerStrip
+        push(279, 4, 1, n as u32); // StripByteCounts
+        out.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 无
+        for _ in 0..3 {
+            out.extend_from_slice(&8u16.to_le_bytes());
+        }
+        out.resize(data_off as usize, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b] = color(x, y);
+                out.extend_from_slice(&[r, g, b]);
+            }
+        }
+        std::fs::write(path, out).expect("写出 TIFF 应成功");
     }
 
     #[test]
@@ -1336,7 +1568,7 @@ mod tests {
     }
 
     /// 尺寸断言：3000×2400 需要 (1032,1032) → den=2，输出 1500×1200 ≥ need（不糊，对齐
-    /// pick_jpeg_denom_never_below_display_pixels 的「输出 ≥ 显示需要」同款断言）。
+    /// pick_den_never_below_display_pixels 的「输出 ≥ 显示需要」同款断言）。
     #[test]
     fn decode_png_display_downscales_and_never_below_display_pixels() {
         let dir = tmp_dir("png_den2");
@@ -1358,11 +1590,12 @@ mod tests {
         let p = dir.join("a.png");
         write_png(&p, 2999, 2400);
         let bytes = std::fs::read(&p).unwrap();
-        // den8(375×300) < need(400,300) → 落 den4：750×600（ceil(2999/4)=750）
-        let (_, w4, h4, den4) = decode_png_display(&bytes, (400.0, 300.0)).unwrap();
+        // 需要 (400,320)（≈ 图 4:5 纵横比 → R5A 按纵横比折算近恒等）：den8(375×300) < 需要
+        // → 落 den4：750×600（ceil(2999/4)=750）
+        let (_, w4, h4, den4) = decode_png_display(&bytes, (400.0, 320.0)).unwrap();
         assert_eq!(den4, 4);
         assert_eq!((w4, h4), (750, 600));
-        assert!(w4 >= 400 && h4 >= 300);
+        assert!(w4 >= 400 && h4 >= 320);
         let (_, w8, h8, den8) = decode_png_display(&bytes, (100.0, 60.0)).unwrap();
         assert_eq!(den8, 8);
         assert_eq!((w8, h8), (375, 300)); // ceil(2999/8)=375, ceil(2400/8)=300
@@ -1687,8 +1920,8 @@ mod tests {
     }
 
     /// HEIF 展示档**降档**回归：need 远小于原图 → den≥2，输出宽高 = ceil(全量/den) 且
-    /// ≥ display need（对齐 [`pick_jpeg_denom`] 的「输出 ≥ 显示需要」语义，同
-    /// `pick_jpeg_denom_never_below_display_pixels`）。用最轻合成语料（1600×900，debug 快）。
+    /// ≥ display need（对齐 [`pick_den`] 的「输出 ≥ 显示需要」语义，同
+    /// `pick_den_never_below_display_pixels`）。用最轻合成语料（1600×900，debug 快）。
     #[test]
     fn heif_display_denoms_when_need_small() {
         let corpus = concat!(
@@ -1708,7 +1941,17 @@ mod tests {
         assert_eq!(full.len(), 1, "静态 HEIF 单帧");
         assert_eq!(w, wf.div_ceil(u32::from(den)), "输出宽 = ceil(全量/den)");
         assert_eq!(h, hf.div_ceil(u32::from(den)), "输出高 = ceil(全量/den)");
-        assert!(w >= 200 && h >= 150, "解码像素不得低于显示需要（不糊）：{w}×{h}");
+        // R5A：contain 实际显示尺寸（按图纵横比把 need 折算）——解码 ≥ 显示才不糊
+        let eff = (
+            200.0f32.min(150.0 * wf as f32 / hf as f32),
+            150.0f32.min(200.0 * hf as f32 / wf as f32),
+        );
+        assert!(
+            (w as f32) >= eff.0 && (h as f32) >= eff.1,
+            "解码不得低于 contain 显示尺寸（不糊）：{w}×{h} vs 显示 {:.1}×{:.1}",
+            eff.0,
+            eff.1
+        );
         assert_eq!(frames[0].buffer().len(), (w as usize * h as usize * 4) as usize);
     }
 
@@ -1797,7 +2040,18 @@ mod tests {
             )
         });
         assert!(den >= 2, "HEIF 首解应为展示尺寸档而非全解：den={den}");
-        assert!(w >= 200 && h >= 150, "输出不得低于展示需要（不糊）：{w}×{h}");
+        // R5A：contain 实际显示尺寸（1600×900 对角 (200,150) need → 约 200×112.5）——
+        // 解码 ≥ 显示才不糊；短轴不再要求 ≥ 视口原始 need。
+        let eff = (
+            200.0f32.min(150.0 * w as f32 / h as f32),
+            150.0f32.min(200.0 * h as f32 / w as f32),
+        );
+        assert!(
+            (w as f32) >= eff.0 && (h as f32) >= eff.1,
+            "输出不得低于 contain 显示尺寸（不糊）：{w}×{h} vs 显示 {:.1}×{:.1}",
+            eff.0,
+            eff.1
+        );
         // 放大：需要超全量 → 升档 1/1 全解
         cx.update(|app| {
             viewer.update(app, |v, cx| {
@@ -2414,7 +2668,7 @@ mod tests {
         // 本模块最小 baseline JPEG 编码器产 64×64，再把 SOF0 宽高 patch 成 65535×65535
         let mut jpeg = encode_baseline_jpeg(&[0u8; 64 * 64 * 3], 64, 64);
         patch_jpeg_sof_dims(&mut jpeg, 65535, 65535).expect("自产 JPEG 应含 SOF0 可 patch");
-        // 视口 (30000,30000) → pick_jpeg_denom 落 den=2（65535 宽 → scaled 32768 ≥ need）
+        // 视口 (30000,30000) → pick_den 落 den=2（65535 宽 → scaled 32768 ≥ need）
         let mut dec = kimg::codecs::jpeg::JpegDecoder::from_bytes(&jpeg).expect("头解析应成功");
         assert_eq!(dec.dimensions(), (65535, 65535), "patch 后声明 65535×65535");
         assert_eq!(
@@ -2662,18 +2916,221 @@ mod tests {
     }
 
     #[test]
-    fn pick_jpeg_denom_never_below_display_pixels() {
+    fn pick_den_never_below_display_pixels() {
         // 20MP + 1080p 视口需要 (1376,1032)：1/2（2560×1920）恰好全cover、1/4（1280×960）
         // 会低于 1376 → 必须选 1/2 —— 这就是「不糊」的边界。
-        assert_eq!(pick_jpeg_denom(5120, 3840, (1376.0, 1032.0)), 2);
-        assert_eq!(pick_jpeg_denom(5120, 3840, (1280.0, 960.0)), 4);
-        assert_eq!(pick_jpeg_denom(5120, 3840, (1281.0, 960.0)), 2, "超一像素也必须升 1/2");
+        assert_eq!(pick_den(5120, 3840, 1376.0, 1032.0), 2);
+        assert_eq!(pick_den(5120, 3840, 1280.0, 960.0), 4);
+        // 4:3 图在 (1281,960) 盒内 contain 实际显示为 1280×960（高度贴边、宽度按比例投影）：
+        // 1/4 档 1280×960 ≥ 显示尺寸 → 仍不糊（R5A 按纵横比折算后不再「宽度超一像素就升 1/2」）。
+        assert_eq!(pick_den(5120, 3840, 1281.0, 960.0), 4, "contain 折算后 1/4 档恰好盖住显示");
         // 缩小看（zoom<1）→ 需要变小 → 可压到 1/8（640×480 ≥ 275×206）
-        assert_eq!(pick_jpeg_denom(5120, 3840, (275.0, 206.0)), 8);
+        assert_eq!(pick_den(5120, 3840, 275.0, 206.0), 8);
         // 放大 2× → 需要 (2752,2064) > 1/2（2560×1920）→ 全解
-        assert_eq!(pick_jpeg_denom(5120, 3840, (2752.0, 2064.0)), 1);
+        assert_eq!(pick_den(5120, 3840, 2752.0, 2064.0), 1);
         // 小图不需要降档
-        assert_eq!(pick_jpeg_denom(800, 600, (1920.0, 1080.0)), 1);
+        assert_eq!(pick_den(800, 600, 1920.0, 1080.0), 1);
+        // R5A：竖图（2552×3496）在 1080p/横视口下 —— 显示宽度永远到不了视口宽（高度先
+        // 贴边），按纵横比折算后短轴目标 ≈788、不再卡死 den=1 → 1/2（1276×1748 ≥ 显示）；
+        // 视口更小（600×800）可压到 1/4（638×874 ≥ 显示）。横图（4000×3000 @1376×1032）
+        // 回归不变（仍 1/2）。
+        assert_eq!(pick_den(2552, 3496, 1920.0, 1080.0), 2, "竖图 1080p 视口应 1/2 不再 1");
+        assert_eq!(pick_den(2552, 3496, 1376.0, 1032.0), 2);
+        assert_eq!(pick_den(2552, 3496, 600.0, 800.0), 4);
+        // 放大 2× → 需要折算 (1506,2064) > 1/2（1276×1748）→ 全解（竖图 get 全分辨率）
+        assert_eq!(pick_den(2552, 3496, 2752.0, 2064.0), 1);
+        assert_eq!(pick_den(4000, 3000, 1376.0, 1032.0), 2, "横图回归不变");
+    }
+
+    /// R5B：通用静态（BMP 3ch）**展示档降档**——竖图不再卡 den=1、横图回归不变、den=1 与
+    /// 旧静态全解**逐字节一致**（字节 = 显示尺寸、RGBA→BGRA 命中角点色）。
+    #[test]
+    fn bmp_display_downscales_vertical_keeps_landscape_and_den1_parity() {
+        let dir = tmp_dir("bmp_disp");
+        let grad = |w: u32, h: u32| {
+            move |x: u32, y: u32| [((x * 255) / w) as u8, ((y * 255) / h) as u8, 0u8]
+        };
+        // 竖图 2552×3496 + 1080p 需 need → 1/2 档 1276×1748（不再 1）；像素数 < 全尺寸
+        let vpath = dir.join("vert.bmp");
+        write_bmp(&vpath, 2552, 3496, grad(2552, 3496));
+        let vb = std::fs::read(&vpath).unwrap();
+        let (vf, vw, vh, vden) = decode_background(&vb, (1920.0, 1080.0)).expect("竖图 BMP 降档应成功");
+        assert_eq!((vw, vh, vden), (1276, 1748, 2), "竖图 BMP 应 1/2 档");
+        assert_eq!(vf[0].buffer().as_raw().len(), (1276 * 1748 * 4) as usize);
+        assert!((vw as u64) * (vh as u64) < (2552u64 * 3496), "展示档像素必须 < 全尺寸");
+        // 左上角 (0,0) 源 RGB(0,0,0) → BGRA [0,0,0,255]
+        assert_eq!(&vf[0].buffer().as_raw()[..4], &[0, 0, 0, 255]);
+        // 横图 4000×3000 + 1376×1032 需 need → 仍 1/2 档（回归不变）
+        let hpath = dir.join("land.bmp");
+        write_bmp(&hpath, 4000, 3000, grad(4000, 3000));
+        let hb = std::fs::read(&hpath).unwrap();
+        let (_, hw, hh, hden) = decode_background(&hb, (1376.0, 1032.0)).expect("横图 BMP 降档应成功");
+        assert_eq!((hw, hh, hden), (2000, 1500, 2), "横图 BMP 回归不变");
+        // den=1 全解 parity：小 BMP + 超大 need → 与旧静态全解逐字节一致
+        let spath = dir.join("small.bmp");
+        write_bmp(&spath, 64, 48, grad(64, 48));
+        let sb = std::fs::read(&spath).unwrap();
+        let (sf, sw, sh, sden) = decode_background(&sb, (1e6, 1e6)).expect("小 BMP 应全解");
+        assert_eq!((sw, sh, sden), (64, 48, 1));
+        let (oldf, _, _) = decode_generic(&sb).expect("旧静态全解应成功");
+        assert_eq!(
+            sf[0].buffer().as_raw(),
+            oldf[0].buffer().as_raw(),
+            "den=1 display 与旧静态全解必须逐字节一致"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5B：TIFF 静态（手写 RGB8，kimg_tiff 3ch）展示档降档 → 1/2、字节=显示尺寸。
+    #[test]
+    fn tiff_display_downscales_large_static() {
+        let dir = tmp_dir("tiff_disp");
+        let p = dir.join("big.tiff");
+        write_rgb8_tiff(&p, 2048, 1536, |x, y| [((x * 255) / 2048) as u8, ((y * 255) / 1536) as u8, 30u8]);
+        let b = std::fs::read(&p).unwrap();
+        let (frames, w, h, den) = decode_background(&b, (1000.0, 750.0)).expect("TIFF 降档应成功");
+        assert_eq!((w, h, den), (1024, 768, 2), "TIFF 应 1/2 档");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].buffer().as_raw().len(), (1024 * 768 * 4) as usize);
+        // 左上角 (0,0) 源 RGB(0,0,30) → BGRA [30,0,0,255]
+        assert_eq!(&frames[0].buffer().as_raw()[..4], &[30, 0, 0, 255]);
+        // den=1（need ≥ 原图）→ 全尺寸、字节=显示
+        let (_, w1, h1, den1) = decode_background(&b, (4096.0, 4096.0)).unwrap();
+        assert_eq!((w1, h1, den1), (2048, 1536, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5B：GIF 动画保持全尺寸 den=1（动画帧必须全量驻留才能播；范围墙不做动画降档）——
+    /// decode_background 对 GIF 走回全帧动图路径、帧数/逻辑屏尺寸不变。
+    #[test]
+    fn gif_anim_keeps_den1_and_full_frames() {
+        let bytes = encode_test_gif(&[
+            (kimg::Rgba([255, 0, 0, 255]), 100),
+            (kimg::Rgba([0, 0, 255, 255]), 200),
+        ]);
+        let (frames, w, h, den) = decode_background(&bytes, (1920.0, 1080.0)).expect("GIF 应解全帧动图");
+        assert_eq!((w, h, den), (4, 3, 1), "GIF 动画必须 den=1 全尺寸");
+        assert_eq!(frames.len(), 2, "动画原帧数不变");
+    }
+
+    /// R5B 端到端：冷开一张 8.9MP 竖图 BMP → 首解即「显示尺寸档」（1/2，1276×1748），缓存
+    /// 条目尺寸 = display < 全尺寸、字节 ≈ 8.9MB（不再 35.7MB 全解）。测试执行器无视口 →
+    /// 用 [`DISPLAY_NEED_INIT`]（≈1080p）作展示需要。
+    #[gpui::test]
+    async fn bmp_cold_open_installs_display_entry_sub_full(cx: &mut TestAppContext) {
+        let dir = tmp_dir("bmp_open");
+        let p = dir.join("big.bmp");
+        write_bmp(&p, 2552, 3496, |x, y| [((x * 255) / 2552) as u8, ((y * 255) / 3496) as u8, 0]);
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        let (den, iw, ih, bytes, cache_len) = cx.update(|app| {
+            viewer.update(app, |v, _| {
+                let e = v.cache_get(&p).expect("已安装条目应在缓存");
+                (e.denom, e.intrinsic.0 as u32, e.intrinsic.1 as u32, e.bytes, v.cache.len())
+            })
+        });
+        assert_eq!((den, iw, ih), (2, 1276, 1748), "缓存条目=显示档 1/2");
+        assert_eq!(bytes, (1276 * 1748 * 4) as usize, "条目字节=显示尺寸");
+        assert!(bytes < (2552 * 3496 * 4) as usize, "条目必须 < 全尺寸");
+        assert!(cache_len >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5B 端到端：目录内多张 8.9MP BMP 全解码后，缓存总字节 ≤ 显示档总和（≈4×8.9MB），
+    /// 远低于 4×全解 35.7MB——不再「每张 34MB 纹理 + 26×34MB」级。
+    #[gpui::test]
+    async fn bmp_dir_all_display_entries_bound_memory(cx: &mut TestAppContext) {
+        let dir = tmp_dir("bmp_mem");
+        let (w, h) = (2552u32, 3496u32);
+        let mut paths = Vec::new();
+        for i in 0..4 {
+            let p = dir.join(format!("{i}.bmp"));
+            write_bmp(&p, w, h, |x, y| [((x * 255) / w) as u8, ((y * 255) / h) as u8, 0]);
+            paths.push(p);
+        }
+        let img_w = (w / 2) as usize * (h / 2) as usize * 4; // 每张 display 档字节（den=2）
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(paths[0].clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        // 把其余 3 张逐一入队解码（预取也会落缓存）→ 落定后核对缓存总字节
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                for p in &paths[1..] {
+                    v.queue_decode(p.clone(), false, cx);
+                }
+            })
+        });
+        wait_until_ready(cx, &viewer);
+        let (cache_bytes, full_sum) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.cache.bytes(), paths.len() * (w as usize * h as usize * 4))
+        });
+        assert!(
+            cache_bytes <= paths.len() * img_w,
+            "缓存总字节应 ≤ 显示档总和：{cache_bytes} ≤ {}",
+            paths.len() * img_w
+        );
+        assert!(cache_bytes < full_sum, "缓存总字节应远低于全解总和 {full_sum}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5B WEBP 展示档降档（真实语料，release/本地验证用）：本地 `Benchmarks/corpus/WEBP`
+    /// 缺夹具置 SKIP，绝不视为回归。`--ignored --nocapture` 运行。
+    #[test]
+    #[ignore]
+    fn webp_display_downscales_from_corpus() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/WEBP");
+        let cands = ["gen32-photo-large-lossless.webp", "gen27-photo-rgba-lossless.webp"];
+        let Some(p) = cands
+            .iter()
+            .map(|n| std::path::Path::new(dir).join(n))
+            .find(|p| p.exists())
+        else {
+            eprintln!("SKIP: missing {dir}");
+            return;
+        };
+        let b = std::fs::read(&p).unwrap();
+        let need = (1376.0, 1032.0);
+        let (frames, w, h, den) = decode_background(&b, need).expect("WEBP 降档应成功");
+        eprintln!("WEBP {}: full→display {}×{} den=1/{den}", p.display(), w, h);
+        assert!(den > 1, "大 WEBP 应走降档，den={den}");
+        assert!((w as u64) * (h as u64) < (2000u64 * 2000), "展示档应明显小于全尺寸");
+        assert_eq!(frames.len(), 1);
+    }
+
+    /// R5B 目录内存基准（真实语料，26 张 BMP）：全解 RGBA 总和 vs 展示档总和。
+    /// 本地 `Benchmarks/corpus/BMP` 缺夹具置 SKIP。`--ignored --nocapture` 运行。
+    #[test]
+    #[ignore]
+    fn bmp_26_corpus_display_memory() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/BMP");
+        if !std::path::Path::new(dir).exists() {
+            eprintln!("SKIP: missing {dir}");
+            return;
+        }
+        let need = (1920.0, 1080.0);
+        let mut full_px: u64 = 0;
+        let mut disp_px: u64 = 0;
+        let mut n = 0u32;
+        let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+        files.sort();
+        for p in files {
+            let b = std::fs::read(&p).unwrap();
+            let (_, wf, hf) = decode_generic(&b).expect("BMP 全解应成功");
+            let (_, wd, hd, den) = decode_background(&b, need).expect("BMP 展示档应成功");
+            full_px += wf as u64 * hf as u64;
+            disp_px += wd as u64 * hd as u64;
+            n += 1;
+            eprintln!("  {} {}×{} → display {}×{} (1/{})", p.file_name().unwrap().to_string_lossy(), wf, hf, wd, hd, den);
+        }
+        eprintln!(
+            "[BMP-MEM] {n} 张 | 全解 RGBA {:.1}MB → 展示档 {:.1}MB（{:.0}× 降）",
+            full_px as f64 * 4.0 / 1e6,
+            disp_px as f64 * 4.0 / 1e6,
+            (full_px as f64) / (disp_px as f64)
+        );
+        assert!(disp_px < full_px, "展示档总像素必须 < 全解总像素");
     }
 
     /// 端到端：打开 20MP JPEG → 首解即「显示尺寸档」（1/2，不糊），而非低清 1/8；缓存也只
@@ -3417,6 +3874,204 @@ mod tests {
             "快滚满并发时新目标应记入 pending_target（chase-latest）"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4A 重绘收口：快速连滚切到**未就绪**目标时——不发同步 notify（不整窗重绘）、
+    /// 显示保持上一张已安装图（不置空/不抢换），换图只由目标落盘（`install_current`）
+    /// 通知；30 格未就绪切换的总 notify 次数必须 << 30。用 `App::observe` 精确计数实体
+    /// 的 notify（外层 `cx.update` 收尾即 flush effects，批量中同步 notify 可逐格读到）。
+    #[gpui::test]
+    async fn fast_scroll_unready_switch_defers_repaint_keeps_display(cx: &mut TestAppContext) {
+        let dir = tmp_dir("r4a_defer");
+        const N: u32 = 40;
+        for i in 0..N {
+            write_pattern_png(&dir.join(format!("{:02}.png", i)), 600, 400);
+        }
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(dir.join("00.png"), cx)));
+        wait_until_ready(cx, &viewer);
+        wait_idle(cx, &viewer); // 预取窗口铺满、在途清零 → 确定性起点
+
+        let prev = cx.update(|app| viewer.read(app).image.clone());
+        assert!(prev.is_some(), "首图应已安装");
+
+        // 清空解码缓存 → 后续 30 次切图全部未就绪（无缓存命中、无同步 install）
+        cx.update(|app| {
+            viewer.update(app, |v, _| v.cache.clear());
+        });
+
+        // observe 计数器（实体每 notify 一次 +1）
+        let notifies = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let _sub = {
+            let n = notifies.clone();
+            cx.update(|app| app.observe(&viewer, move |_, _| n.set(n.get() + 1)))
+        };
+
+        // 事件洪峰：批量 30 次 switch(1)，中间不 pump（与 bench_switch_rapid_corpus 同款）
+        for _ in 0..30 {
+            cx.update(|app| viewer.update(app, |v, cx| v.switch(1, cx)));
+        }
+        // ① 未就绪切图不得同步 notify（否则每滚一格就触发一次整窗重绘）
+        let during = notifies.get();
+        assert_eq!(
+            during,
+            0,
+            "30 个未就绪切图不得产生任何同步 notify（不整窗重绘）：during={during}"
+        );
+        // ② 显示保持上一张已安装图（image Arc 指针不变 = 未置空/未抢换）
+        let mid = cx.update(|app| viewer.read(app).image.clone());
+        assert!(
+            Arc::ptr_eq(prev.as_ref().unwrap(), mid.as_ref().unwrap()),
+            "未就绪期间必须保持上一张已安装图像（不得置空/抢换）"
+        );
+        // ③ 落定后：最终目标换图（落盘 notify），总次数 << 30、且最终显示最新目标
+        wait_until_ready(cx, &viewer);
+        let total = notifies.get();
+        assert!(
+            total > 0,
+            "目标落盘后应至少 notify 一次触发最终换图：total={total}"
+        );
+        assert!(
+            total < 30,
+            "30 格未就绪切图的总 notify 次数应 << 30（只由落盘/缓存命中触发）：{total}"
+        );
+        let (loaded, file) = cx.update(|app| {
+            let v = viewer.read(app);
+            (
+                v.is_loaded(),
+                v.nav.item(v.nav.current()).map(|p| p.to_path_buf()),
+            )
+        });
+        assert!(loaded, "最终目标应就绪");
+        assert_eq!(file, Some(dir.join("30.png")), "最终应显示最新目标 30.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4A 消除闪烁（JPEG 带 EXIF 嵌入缩略图）：切到**未就绪 JPEG** 时不得再派 EXIF
+    /// 缩略图占位抢换显示——`thumb_pending` 不被置位（同步可断言）＝ 不会闪出模糊小图、
+    /// 也不会因占位落盘多触发一次重绘。冷打开（无上一张）仍走占位，由既有
+    /// `jpeg_cold_open_exif_thumb_then_sharp` 守护。
+    #[gpui::test]
+    async fn switch_to_unready_jpeg_skips_exif_thumb_provisional(cx: &mut TestAppContext) {
+        let dir = tmp_dir("r4a_jpeg");
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        write_jpeg(&assets.join("thumb.jpg"), 160, 120);
+        for name in ["00.jpg", "01.jpg"] {
+            write_jpeg(&dir.join(name), 800, 600);
+            let main = std::fs::read(dir.join(name)).unwrap();
+            let thumb = std::fs::read(assets.join("thumb.jpg")).unwrap();
+            std::fs::write(
+                dir.join(name),
+                wrap_exif_thumb(main.as_slice(), thumb.as_slice()),
+            )
+            .unwrap();
+        }
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(dir.join("00.jpg"), cx)));
+        wait_until_ready(cx, &viewer);
+        wait_idle(cx, &viewer); // 01 可能已被预取入缓存 → 落定后清空，转为未就绪
+
+        cx.update(|app| {
+            viewer.update(app, |v, _| v.cache.clear());
+        });
+        let prev = cx.update(|app| viewer.read(app).image.clone());
+        assert!(prev.is_some());
+
+        // 切到 01（未就绪 JPEG）→ 同步断言：不派 EXIF 缩略图占位
+        cx.update(|app| viewer.update(app, |v, cx| v.switch(1, cx)));
+        let (pending, kept, path_ok) = cx.update(|app| {
+            let v = viewer.read(app);
+            (
+                v.thumb_pending.is_none(),
+                Arc::ptr_eq(prev.as_ref().unwrap(), v.image.as_ref().unwrap()),
+                v.path == dir.join("01.jpg"),
+            )
+        });
+        assert!(path_ok, "切图后 path 应指向 01.jpg");
+        assert!(
+            pending,
+            "未就绪 JPEG 切换不得派 EXIF 缩略图占位（会闪缩略图 + 多一次重绘）"
+        );
+        assert!(kept, "切换未就绪 JPEG 期间应保持上一张已安装图（不得被缩略图抢换）");
+
+        // 落定：换到 01 真图（headless 无视口 → display_need 回落 (1,1) → 走展示降档
+        // den>1；EXIF 缩略图占位恒 den=1、160×120——den != 1 即证明最终是「真图降档解码」
+        // 而非缩略图兜底），thumb_pending 保持清空。
+        wait_until_ready(cx, &viewer);
+        let (den, thumb_gone, loaded) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.display_denom, v.thumb_pending.is_none(), v.is_loaded())
+        });
+        assert!(loaded, "01 落定后应就绪");
+        assert!(
+            den != 1,
+            "最终应显示 01 真图降档解码（缩略图占位恒 den=1），实为 den={den}"
+        );
+        assert!(thumb_gone, "真图落盘后 thumb_pending 应清空");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4C 资源占用：LRU 逐出时释放被淘汰的非当前图，但**绝不释放当前正在显示的图**。
+    /// headless 无真实图集（drop_image 对零窗口为空操作、不可观测释放本身）——这里直接
+    /// 驱动 `cache_put` 锁两条可观测不变量：① 非当前条目被逐出（走 drop 分支）不 panic、
+    /// LRU 账一致；② 当前显示条目被逐出时 guard 跳过 drop，显示 Arc 原样保留。重负载
+    /// 连环逐出由 `fast_scroll_unready_switch_defers_repaint_keeps_display` 经真实流水线触发。
+    #[gpui::test]
+    async fn cache_eviction_keeps_current_display_and_releases_old_entries(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tmp_dir("r4c_evict");
+        for n in ["a.png", "b.png", "c.png", "d.png"] {
+            write_png(&dir.join(n), 8, 8);
+        }
+        let entry_for = |name: &str| {
+            let p = dir.join(name);
+            let bytes = std::fs::read(&p).unwrap();
+            let (frames, w, h, den) = decode_background(&bytes, (10.0, 10.0)).unwrap();
+            ImageViewer::build_entry(p, frames, w, h, den).unwrap()
+        };
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(dir.join("a.png"), cx)));
+        wait_until_ready(cx, &viewer);
+        wait_idle(cx, &viewer);
+        let shown = cx
+            .update(|app| viewer.read(app).image.clone())
+            .expect("a 已显示");
+
+        // 场景 1：非当前条目（b）被 LRU 逐出 → drop_image(render) 分支；账一致、不 panic、
+        // 显示 Arc 不动。
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.cache = LruMap::new(Some(2), usize::MAX, |e: &CacheEntry| e.bytes);
+                v.cache_put(dir.join("b.png"), entry_for("b.png"), cx);
+                v.cache_put(dir.join("c.png"), entry_for("c.png"), cx);
+                v.cache_put(dir.join("a.png"), entry_for("a.png"), cx); // 顶掉 b（非当前）
+                assert_eq!(v.cache.len(), 2, "LRU=2 只存最新两条");
+                assert!(!v.cache_contains(&dir.join("b.png")), "b 应被逐出");
+                assert!(v.cache_contains(&dir.join("c.png")));
+                assert!(
+                    Arc::ptr_eq(&shown, v.image.as_ref().unwrap()),
+                    "逐出非当前条目不得触碰当前显示 Arc"
+                );
+            })
+        });
+
+        // 场景 2：当前显示条目（a==self.path）被 LRU 逐出 → guard 跳过 drop，显示 Arc 原样。
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.cache = LruMap::new(Some(1), usize::MAX, |e: &CacheEntry| e.bytes);
+                v.cache_put(dir.join("a.png"), entry_for("a.png"), cx);
+                v.cache_put(dir.join("b.png"), entry_for("b.png"), cx); // 顶掉 a（当前显示）
+                assert_eq!(v.cache.len(), 1);
+                assert!(!v.cache_contains(&dir.join("a.png")), "LRU 逐出语义不变");
+                assert!(
+                    Arc::ptr_eq(&shown, v.image.as_ref().unwrap()),
+                    "当前正在显示的图被逐出时不得 drop_image（显示 Arc 必须原样保留）"
+                );
+            })
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

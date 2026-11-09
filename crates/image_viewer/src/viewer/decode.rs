@@ -18,8 +18,7 @@ use config::image::{
 
 use super::{
     bgra_single_frame, decode_background, decode_jpeg_display, extract_exif_jpeg_thumbnail,
-    is_heavy_format, path_is_jpeg, pick_jpeg_denom, read_head, ByteEntry, CacheEntry,
-    DISPLAY_NEED_INIT,
+    is_heavy_format, path_is_jpeg, pick_den, read_head, ByteEntry, CacheEntry, DISPLAY_NEED_INIT,
 };
 
 /// EXIF APP1 探读上限（字节）：EXIF 段及其内嵌缩略图都位于文件头（APP1 长度 16 位、
@@ -208,7 +207,7 @@ impl super::ImageViewer {
                                 if let Some(entry) =
                                     Self::build_entry(decode_path.clone(), frames, w, h, den)
                                 {
-                                    this.cache_put(decode_path.clone(), entry.clone());
+                                    this.cache_put(decode_path.clone(), entry.clone(), cx);
                                     if this.path == decode_path {
                                         this.install_current(entry, &decode_path, cx);
                                     }
@@ -256,7 +255,7 @@ impl super::ImageViewer {
     }
 
     /// 「升档」：当前展示档分母比当前展示需要更粗（解码像素比显示小）时，重解更细档替换
-    /// （JPEG/PNG 皆可——选档 [`pick_jpeg_denom`] 与格式无关）。直接派发（跳过
+    /// （JPEG/PNG/通用静态皆可——选档 [`pick_den`] 与格式无关）。直接派发（跳过
     /// [`Self::queue_decode`] 的缓存短路——缓存里存的旧档位命中只会装回旧图）；
     /// `in_flight`/并发满则记 [`Self::pending_target`]。完成后新档经 `cache_put` 替换
     /// 粗档并上屏，`display_denom` 收敛到 ≤ 需要 → 不再触发（只升不降）。
@@ -276,7 +275,7 @@ impl super::ImageViewer {
             (iw as u32).saturating_mul(u32::from(self.display_denom)),
             (ih as u32).saturating_mul(u32::from(self.display_denom)),
         );
-        let desired = pick_jpeg_denom(full.0, full.1, self.display_need);
+        let desired = pick_den(full.0, full.1, self.display_need.0, self.display_need.1);
         if self.display_denom <= desired {
             return;
         }
@@ -295,7 +294,7 @@ impl super::ImageViewer {
     /// 必须横向统一尺寸（`w×h`）——GIF 解码已按逻辑屏画布统一；`bytes` 按
     /// 「单帧字节 × 帧数」诚实记账：大 GIF 会如实算成块头、超 [`config::image::CACHE_MAX_BYTES`]
     /// 预算时被 LRU 立刻淘汰——可接受（动画帧必须全量驻留才能播，口径如实反映）。
-    fn build_entry(
+    pub(super) fn build_entry(
         path: PathBuf,
         frames: Vec<Frame>,
         w: u32,
@@ -443,6 +442,16 @@ impl super::ImageViewer {
 
     /// 把缓存条目落盘为当前显示 + 通知宿主 + 重锚级联预取（窗口沿方向滑动更新）。
     pub(super) fn install_current(&mut self, entry: CacheEntry, path: &Path, cx: &mut Context<Self>) {
+        // 诊断探针（env 门控，默认关）：记录落盘时刻 t1，结算 decode_ms=t1-t0
+        super::diag::note_install(path);
+        // R4A 边界「当前显示与目标相同不闪」：同路径且同渲染 Arc 的重复落盘 = 重画同一张
+        // 图，整段状态（path/image/intrinsic/denom/loading/动画/预取锚）已就位——直接早退，
+        // 不再 notify + refresh，省下一次「全树重述 + present」周期。
+        if self.path == *path
+            && self.image.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &entry.render))
+        {
+            return;
+        }
         self.path = path.to_path_buf();
         self.image = Some(entry.render.clone());
         self.intrinsic = Some(entry.intrinsic);
@@ -518,13 +527,40 @@ impl super::ImageViewer {
     }
 
     /// 缓存是否已含某路径（只读，不改变 LRU 顺序）。
-    fn cache_contains(&self, path: &Path) -> bool {
+    pub(super) fn cache_contains(&self, path: &Path) -> bool {
         self.cache.contains(path)
     }
 
     /// 写入缓存（已存在则移到队尾），超出张数/字节预算按 LRU 从队首淘汰。
-    fn cache_put(&mut self, path: PathBuf, entry: CacheEntry) {
-        let _ = self.cache.put(path, entry);
+    ///
+    /// R4C（资源占用）：被逐出且**非当前显示**的条目，立即 `drop_image` 释放其 GPU 纹理
+    /// （首帧 render + 动图各帧），不让 LRU 被顶落后的旧纹理继续占 VRAM/图集；当前正在
+    /// 显示的图（`path == self.path`）一律保留，绝不释放。本方法只在后台解码完成回调
+    /// （普通实体更新）里调用，非窗口回调内，"当前窗口移出 App.windows"的 K14 场景不成立，
+    /// `drop_image(_, None)` 遍历全部窗口即兜住。
+    pub(super) fn cache_put(&mut self, path: PathBuf, entry: CacheEntry, cx: &mut Context<Self>) {
+        let removed = self.cache.put(path, entry);
+        self.drop_evicted_images(cx, removed);
+    }
+
+    /// 释放被 LRU 逐出的 GPU 纹理（R4C）：`evicted` 为 `put` 返回的被淘汰/被替换条目。
+    /// 跳过当前显示的路径（`self.path`）——当前正在看的图绝不 drop_image；其余条目：
+    /// 静态图释放首帧 `render`，动图释放全部帧切片（`render` 即 `gif` 首帧的同一 Arc，
+    /// 走帧切片分支即可全覆盖，不重复 drop）。
+    fn drop_evicted_images(&mut self, cx: &mut Context<Self>, evicted: Vec<(PathBuf, CacheEntry)>) {
+        for (path, entry) in evicted {
+            if path == self.path {
+                continue;
+            }
+            match entry.gif {
+                Some((frames, _)) => {
+                    for f in frames {
+                        cx.drop_image(f, None);
+                    }
+                }
+                None => cx.drop_image(entry.render, None),
+            }
+        }
     }
 
     /// 字节缓存查询并移到队尾（MRU），返回 Arc 克隆（保留在缓存里供解码/重解码复用）。

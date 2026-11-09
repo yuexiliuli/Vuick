@@ -1597,3 +1597,71 @@ fn ffi_open_failure_classification_distinct() {
         std::process::id()
     )));
 }
+
+/// HEIF A/B 探针（测量任务 2026-11-09，只测量不优化）：用 media_ffmpeg 软解（`open_scaled`
+/// 全尺寸）打开 HEIF 语料样本，记录 open + 逐帧解码总耗时与输出尺寸，验证 avformat heif
+/// demuxer 对 grid 文件是否合成单帧/报错/多 tile 逐帧。`#[ignore]`，release 跑：
+/// `cargo test -p media_ffmpeg --release probe_heif_decode_ab -- --ignored --nocapture --test-threads=1`
+/// 语料缺失 → SKIP（不入库，同仓库约定）。
+#[test]
+#[ignore]
+fn probe_heif_decode_ab() {
+    use std::time::Instant;
+    let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Benchmarks/corpus/heif");
+    // 与 kimg_heif oracle_perf/perf_single_thread_decode 同批样本（4 个：12.7MP 手机照、
+    // 50MP grid、12.6MP grid、synth main8）。
+    let samples = [
+        "IMG_0083.HEIC",
+        "hevc-main-8192x6144-grid.heic",
+        "hevc-main-3072x4096-grid.heic",
+        "synth-photo-fuji-1600x900-main8.heic",
+    ];
+    let mut ran = 0usize;
+    for name in samples {
+        let p = corpus.join(name);
+        if !p.exists() {
+            eprintln!("SKIP: missing {p:?}");
+            continue;
+        }
+        ran += 1;
+        let t_open = std::time::Instant::now();
+        let mut r = match VideoReader::open_scaled(&p, u32::MAX) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[HEIF-FFMPEG] {name}: OPEN FAIL {e:#}");
+                continue;
+            }
+        };
+        let open_ms = t_open.elapsed().as_secs_f64() * 1e3;
+        let pp = r.params();
+        let mut frames = 0usize;
+        let mut out = (0u32, 0u32);
+        let t_f = Instant::now();
+        loop {
+            match r.next_frame_bgra() {
+                Ok(Some((_pts, w, h, _bgra))) => {
+                    frames += 1;
+                    out = (w, h);
+                    if frames > 64 {
+                        eprintln!("[HEIF-FFMPEG] {name}: 帧数爆炸（>64）中止");
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[HEIF-FFMPEG] {name}: FRAME FAIL {e:#}");
+                    break;
+                }
+            }
+        }
+        let decode_ms = t_f.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "[HEIF-FFMPEG] {name}: open {open_ms:.1}ms · 全帧解码 {decode_ms:.1}ms · 帧数 {frames} · params {}x{} (dur {:.2}s) → 输出 {}x{}",
+            pp.width, pp.height, pp.duration, out.0, out.1
+        );
+        drop(r);
+    }
+    if ran == 0 {
+        eprintln!("SKIP: 无 HEIF 语料（Benchmarks/corpus/heif 缺失）");
+    }
+}

@@ -19,7 +19,8 @@ param(
     [double]$Rate = 30,
     [double]$Duration = 12,
     [double]$Cooldown = 6,
-    [int]$Cores = 0
+    [int]$Cores = 0,
+    [string]$Exe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,8 +46,10 @@ public static class Win32 {
 }
 "@
 
-$exe = "E:\Rust\gpui-editor\target\debug\gpui-editor.exe"
-if (-not (Test-Path -LiteralPath $exe)) { throw "exe 不存在（先 cargo build --bin gpui-editor）: $exe" }
+if (-not $Exe) {
+    $Exe = "E:\Rust\gpui-editor\target\debug\gpui-editor.exe"
+}
+if (-not (Test-Path -LiteralPath $Exe)) { throw "exe 不存在（先 cargo build --bin gpui-editor）: $Exe" }
 
 $p = Start-Process -FilePath $exe -ArgumentList @("`"$Image`"") -PassThru
 try {

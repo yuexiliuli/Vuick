@@ -150,6 +150,8 @@ impl super::ImageViewer {
             self.fast_count >= FAST_SCROLL_THRESHOLD || (self.scroll_fast && self.fast_count > 0);
         let _ = self.nav.set_current(next);
         self.path = self.nav.item(next).expect("switch 目标恒在清单内");
+        // 诊断探针（env 门控，默认关）：记录切图时刻 t0（decode 分账 + 滚动期判定起点）
+        super::diag::note_switch(&self.path);
         // 切图：缩放复位为适应视口 + 平移/拖拽归零（每张都从初始大小开始）
         self.zoom = 1.0;
         self.pan = (0.0, 0.0);
@@ -162,6 +164,10 @@ impl super::ImageViewer {
     /// 显示入口（首图 / 切换共用）：`path` 已指向目标。缓存命中 → 瞬时落盘并启动级联
     /// 预取；未中 → 置 loading 并进入「并行解码池」（去重 / 追最新）。命中后按当前
     /// 展示需要判断是否需升档（缓存的可能是旧档位）。
+    ///
+    /// R4A 重绘收口：**未就绪目标不置空显示、不整窗重绘**——保持上一张已安装图像，
+    /// 仅后台 `queue_decode`；换图只由该目标 `install_current` 落盘后 notify 触发
+    /// （缓存命中路径维持现状：同步 install + notify，立即切换）。
     pub(super) fn request_display(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         if let Some(entry) = self.cache_get(&path) {
@@ -169,11 +175,16 @@ impl super::ImageViewer {
             self.escalate_display_denom(cx);
             return;
         }
+        // 未就绪：不改 `self.image`（显示保持上一张已安装图），也不在此 notify /
+        // refresh——重绘只由落盘（install_current）或缓存命中（上文）触发。
         self.loading = true;
         self.load_error = None;
-        // P1b「即时首帧」：冷目标若是 JPEG，先解出 EXIF 内嵌缩略图立即上屏（<5ms），
-        // 展示档真图解码完成后再覆盖——冷打开首帧不再空等熵解码。
-        self.maybe_show_exif_thumb(&path, cx);
+        // P1b「即时首帧」只在**首开/无上一张**时派 EXIF 缩略图占位（冷打开首帧不空等
+        // 熵解码）；已有显示图像的切换不再临时替换——否则快滚到未就绪 JPEG 会闪出模糊
+        // 缩略图、且占位落盘还会多点一次整窗重绘（R4A 消除闪烁）。
+        if self.image.is_none() {
+            self.maybe_show_exif_thumb(&path, cx);
+        }
         self.queue_decode(path, true, cx);
     }
 

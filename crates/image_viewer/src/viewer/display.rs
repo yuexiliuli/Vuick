@@ -14,13 +14,35 @@ use gpui::{
 
 use super::ImageViewer;
 
+/// C6 预上传默认张数（R4B）：默认 1；env `GPUI_EDITOR_IMG_PREHEAT=N` 可覆盖（A/B 对表
+/// 用 `=3` 强制旧 3 张）。进程内只读一次后缓存，每帧零开销。
+const PREHEAT_UPGRADE_N_DEFAULT: i64 = 1;
+/// `GPUI_EDITOR_IMG_PREHEAT` env 名（R4B A/B 门控）。
+const PREHEAT_ENV_VAR: &str = "GPUI_EDITOR_IMG_PREHEAT";
+
+/// C6 预上传张数：首调读一次 env（默认 1），此后缓存结果不再查 env（门控需重启生效）。
+fn preheat_upgrade_n() -> i64 {
+    use std::sync::OnceLock;
+    static N: OnceLock<i64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var(PREHEAT_ENV_VAR)
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(PREHEAT_UPGRADE_N_DEFAULT)
+    })
+}
+
 impl ImageViewer {
 
-    /// C6：取滚动方向最近「已解码在缓存、但非当前显示」的最多 3 张图，各自包成**垫底透明
-    /// img**（同尺寸、opacity 0、不拦截输入）叠进返回值。让 gpui 在上屏前就完成这些纹理的
-    /// GPU 上传，切到的那一帧不再肩负首次上传（真实 GPU 生效；headless 测试无真实纹理，
-    /// 仅保证构造正确）。前向加深到 3 张：快翻时后 2 张大概率已缓存，一次预上传 3 张省
-    /// 掉连续切换里「首次上传」的卡顿；缓存没填满 3 张就只叠加存在者，重复路径去重。
+    /// C6：取滚动方向最近「已解码在缓存、但非当前显示」的最多 [`PREHEAT_UPGRADE_N_DEFAULT`] 张图，
+    /// 各自包成**垫底透明 img**（同尺寸、opacity 0、不拦截输入）叠进返回值。让 gpui 在上屏
+    /// 前就完成这些纹理的 GPU 上传，切到的那一帧不再肩负首次上传（真实 GPU 生效；headless
+    /// 测试无真实纹理，仅保证构造正确）。
+    ///
+    /// R4B（重绘收口）：预上传张数默认 1（`PREHEAT_UPGRADE_N_DEFAULT`）——每帧只多画 1 张
+    /// 全屏纹理；快滚每格都整窗重绘时，旧 3 张 = 每帧 4 张全屏纹理（预上传 3 + 当前 1）是
+    /// 渲染服务时间的头号成本。可用 env `GPUI_EDITOR_IMG_PREHEAT=3` 强制旧 3 张做 A/B 对表
+    /// （进程内只读一次，改门控需重启应用）。
     fn peek_upgrade_elements(&self) -> Vec<gpui::AnyElement> {
         let n = self.nav.len() as i64;
         if n <= 1 {
@@ -28,7 +50,7 @@ impl ImageViewer {
         }
         let mut seen: Vec<&Path> = Vec::new();
         let mut out = Vec::new();
-        for k in 1i64..=3 {
+        for k in 1i64..=preheat_upgrade_n() {
             let ni = (self.nav.current() as i64 + self.prefetch_dir as i64 * k).rem_euclid(n) as usize;
             let Some(target) = self.nav.get(ni) else {
                 continue;
@@ -80,6 +102,8 @@ impl ImageViewer {
 
 impl Render for ImageViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 诊断探针（env 门控，默认关）：帧间隔 + 首帧上屏时延
+        super::diag::note_render(&self.path, self.image.is_some());
         let theme = ui::theme::Theme::global(cx);
         let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
         let muted: Hsla = theme.colors.fg_muted.into();
