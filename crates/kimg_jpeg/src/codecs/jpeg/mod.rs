@@ -209,28 +209,31 @@ impl<'a> ImageDecoder for JpegDecoder<'a> {
 }
 
 impl<'a> JpegDecoder<'a> {
-    /// 按展示降档分母 **DCT 缩放** 解码（v1 仅 `den=2`：半带抗混叠截断，libjpeg
-    /// `jpeg_idct_4x4` 模型，见 `cs::idct4x4`）。输出 = 与 box 网格同构的
-    /// `ceil(w/2)×ceil(h/2)` 自然 color_type 字节（走与全解同款 `pack_output_row`
-    /// 契约；缩后后处理单线程）。输出尺寸/B1 契约由 [`Self::scaled_dimensions`] 与
-    /// [`Self::read_image_scaled`] 一致口径给出。
+    /// 按展示降档分母 **DCT 缩放** 解码（`den∈{2,4,8}`：half-band 抗混叠截断，libjpeg
+    /// `jpeg_idct_4x4/2x2/1x1` 模型，见 `cs::idct4x4/idct2x2/idct1x1_dc`）。输出 = 与 box
+    /// 网格同构的 `ceil(w/den)×ceil(h/den)` 自然 color_type 字节（走与全解同款
+    /// `pack_output_row` 契约；缩后后处理单线程）。输出尺寸/B1 契约由 [`Self::scaled_dimensions`]
+    /// 与 [`Self::read_image_scaled`] 一致口径给出。
     ///
     /// 失败语义（上层照既有「Err→全解兜底」零耦合回退）：
-    /// - `den ∉ {2}` → `Unsupported`（v1 只做 den=2；den=4/8 返回 Unsupported → 上层全解兜底，不降级）；
+    /// - `den ∉ {2,4,8}` → `Unsupported`（其余 den 返回 Unsupported → 上层全解兜底，不降级）；
     /// - `KIMG_JPEG_SCALED=0|false|off` → `Unsupported`（env 门控整收在本入口内，K93 快道+基线）；
-    /// - progressive / 多 SOS baseline（非首 scan 全分量）→ `Unsupported`；
-    ///   - 其余解码错误按常规 `ImageResult` 上报。
+    /// - 其余解码错误按常规 `ImageResult` 上报（baseline SOF2 渐进已支持 scaled；
+    ///   非交织多 SOS baseline（首 scan 非全分量）仍 `Unsupported` → 全解兜底）。
+    ///
+    /// 内存如实声明：progressive scaled 内部系数平面（`block`/`prog_mask` 整帧 i16/u64 缓冲）
+    /// 按全图尺寸分配——分配与全解同量级、未按 den 独立设界（与全解暴露持平）。
     pub fn read_image_scaled(mut self, den: u8, buf: &mut [u8]) -> ImageResult<()> {
         if !jpeg_scaled_enabled() {
             return Err(unsupported_jpeg_scaled("KIMG_JPEG_SCALED 关闭（回退全解+盒式）"));
         }
-        // 入口第一行校验 den∈{2}（v1 仅 2；4/8 → Unsupported，不降级）
-        if den != 2 {
+        // 入口先校验 den∈{2,4,8}（0/非 2 幂/超限 → Unsupported，不降级）
+        if !matches!(den, 2 | 4 | 8) {
             return Err(unsupported_jpeg_scaled(&format!(
-                "JPEG DCT 缩放 v1 仅支持 den=2（收到 den={den}）"
+                "JPEG DCT 缩放仅支持 den=2/4/8（收到 den={den}）"
             )));
         }
-        let (sw, sh) = scaled_dims(self.width, self.height);
+        let (sw, sh) = scaled_dims(self.width, self.height, den);
         let out_bpp = usize::from(self.color_type.bytes_per_pixel());
         let advertised = (sw as usize)
             .saturating_mul(sh as usize)
@@ -240,7 +243,7 @@ impl<'a> JpegDecoder<'a> {
                 ImageFormat::Jpeg.into(),
                 format!(
                     "Scaled length {} doesn't match predicted length {advertised} \
-                    (den=2: {sw}×{sh} × {out_bpp}B/px)",
+                    (den={den}: {sw}×{sh} × {out_bpp}B/px)",
                     buf.len(),
                 ),
             )));
@@ -257,25 +260,26 @@ impl<'a> JpegDecoder<'a> {
         let t_header = dec.stage.timer();
         dec.restore_header_state(self.seed);
         dec.stage.stop(Stage::Header, t_header);
+        dec.scaled_den = Some(den);
         if dec.is_progressive {
-            return Err(unsupported_jpeg_scaled("progressive JPEG den=2 缩放 v1 未实现"));
+            decode_progressive(&mut dec, target_out, buf).map_err(from_kimg_jpeg)?;
+        } else {
+            decode_baseline(&mut dec, target_out, buf).map_err(from_kimg_jpeg)?;
         }
-        dec.scaled_den = Some(2);
-        decode_baseline(&mut dec, target_out, buf).map_err(from_kimg_jpeg)?;
         dec.stage.print();
         Ok(())
     }
 
-    /// 缩放输出尺寸（与 box 网格精确同构：顶左对齐、`ceil(iw/2)×ceil(ih/2)`，B1）。
-    /// `den=2` 返回 `Some`；其它（v1 不支持）返回 `None`。
+    /// 缩放输出尺寸（与 box 网格精确同构：顶左对齐、`ceil(iw/den)×ceil(ih/den)`，B1）。
+    /// `den∈{2,4,8}` 返回 `Some`；其它返回 `None`。
     pub fn scaled_dimensions(&self, den: u8) -> Option<(u32, u32)> {
-        (den == 2).then(|| scaled_dims(self.width, self.height))
+        matches!(den, 2 | 4 | 8).then(|| scaled_dims(self.width, self.height, den))
     }
 }
 
-/// `ceil(w/2)×ceil(h/2)`（den=2 缩放 / box 网格同构尺寸，顶左对齐）。
-fn scaled_dims(w: u32, h: u32) -> (u32, u32) {
-    (w.div_ceil(2), h.div_ceil(2))
+/// `ceil(w/den)×ceil(h/den)`（den 缩放 / box 网格同构尺寸，顶左对齐；den∈{2,4,8}）。
+fn scaled_dims(w: u32, h: u32, den: u8) -> (u32, u32) {
+    (w.div_ceil(u32::from(den)), h.div_ceil(u32::from(den)))
 }
 
 /// `KIMG_JPEG_SCALED=0|false|off` → 关闭 DCT 缩放（回退全解+盒式），缺省开。

@@ -239,9 +239,9 @@ impl<'a> Decoder<'a> {
             mcu_width = (self.width + 7) / 8;
             mcu_height = (self.height + 7) / 8;
         }
-        // scaled：输出宽按 `ceil(w/2)`（overread 128 清行 / post_process 都用它）。
-        let width = if self.scaled_den == Some(2) {
-            self.width.div_ceil(2)
+        // scaled：输出宽按 `ceil(w/den)`（overread 128 清行 / post_process 都用它）。
+        let width = if let Some(den) = self.scaled_den {
+            self.width.div_ceil(usize::from(den))
         } else {
             self.width
         };
@@ -267,12 +267,13 @@ impl<'a> Decoder<'a> {
         // 全部分量都在首个 scan 内 → 可直接逐 MCU 后处理；
         // 否则需先缓冲全部分量到 `progressive_mcus`（u8 采样字节平面）。
         let all_components_in_first_scan = usize::from(self.num_scans) == self.components.len();
-        // v1 scaled（den=2）仅支持「首 scan 全分量」baseline：多 SOS（非交织多 scan）的
-        // `finish_baseline_decoding` 按全解几何拷环，scaled 环几何不同 → 返回 Unsupported，
-        // 由上层回退「全解+盒式」（零耦合，不降级）。
+        // baseline 缩放（den∈{2,4,8}）非首 scan 全分量（非交织多 SOS）：`finish_baseline_decoding`
+        // 按全解几何拷环、scaled 环几何不同 → 返回 Unsupported、由上层回退「全解+盒式」（零耦合，
+        // 不降级）。progressive（SOF2）经 `decode_progressive` 的 scaled 路径（`finish_progressive_decoding`
+        // 内同款缩放写环），不受此门限。
         if self.scaled_den.is_some() && !all_components_in_first_scan {
             return Err(DecodeError::Unsupported(
-                "JPEG den=2 缩放 v1 仅支持单 SOS baseline（多 scan 回退全解）".to_string(),
+                "JPEG 缩放（den∈{2,4,8}）不支持非交织多 SOS baseline（多 scan 回退全解）".to_string(),
             ));
         }
         let mut progressive_mcus: [Vec<u8>; 4] = core::array::from_fn(|_| vec![]);
@@ -647,30 +648,56 @@ impl<'a> Decoder<'a> {
                         if component_samples_needed {
                             let t_idct = self.stage.busy_timer();
                             if !skip_idct {
-                                // den=2 缩放写环（独立新核 `cs::idct4x4`；不 PROGRESSIVE，v1 入口已拒）
-                                if self.scaled_den == Some(2) {
-                                    let stride = snap_stride[k] / 2;
-                                    let c2 = v_samp * 4;
-                                    let c3 = ((j * snap_hs[k]) + h_samp) * 4;
+                                // DCT 缩放写环（独立新核 `cs::idct4x4/2x2/1x1`；progressive 走
+                                // `finish_progressive_decoding` 内同款缩放写环）
+                                if let Some(den) = self.scaled_den {
+                                    let den = usize::from(den);
+                                    let bs = 8 / den;
+                                    let stride = snap_stride[k] / den;
+                                    let c2 = v_samp * bs;
+                                    let c3 = ((j * snap_hs[k]) + h_samp) * bs;
                                     let ring_off =
-                                        ((mcu_height & 1) * snap_vs[k] * 4 + c2) * stride + c3;
-                                    // B 契约插桩：写环前界断言（scaled 环行宽 = snap_stride/2；块占
-                                    // 4 行 × 4 字节，末字节 = off+3*stride+4；+4*stride 会误报边块）
+                                        ((mcu_height & 1) * snap_vs[k] * bs + c2) * stride + c3;
+                                    // B 契约插桩：写环前界断言（scaled 环行宽 = snap_stride/den；
+                                    // 块占 bs 行 × bs 字节，末字节 = off+(bs-1)*stride+bs）。
                                     debug_assert!(
-                                        ring_off + 3 * stride + 4 <= component.cs_ring.len(),
-                                        "scaled ring 越界: block ({j},{v_samp},{h_samp}) off={ring_off} stride={stride} ring={}",
+                                        ring_off + (bs - 1) * stride + bs <= component.cs_ring.len(),
+                                        "scaled ring 越界: den={den} block ({j},{v_samp},{h_samp}) off={ring_off} stride={stride} ring={}",
                                         component.cs_ring.len()
                                     );
-                                    if len <= 1 {
-                                        cs::idct4x4_dc_only(
+                                    match den {
+                                        2 => {
+                                            if len <= 1 {
+                                                cs::idct4x4_dc_only(
+                                                    tmp[0],
+                                                    &mut component.cs_ring,
+                                                    ring_off,
+                                                    stride,
+                                                );
+                                            } else {
+                                                // 半带核：只吃左上 4×4 系数（熵仍消费全块位流，随熵路径不动）
+                                                cs::idct4x4(tmp, &mut component.cs_ring, ring_off, stride);
+                                            }
+                                        }
+                                        4 => {
+                                            if len <= 1 {
+                                                cs::idct2x2_dc_only(
+                                                    tmp[0],
+                                                    &mut component.cs_ring,
+                                                    ring_off,
+                                                    stride,
+                                                );
+                                            } else {
+                                                // den=4 核：只吃左上 4×4 系数 → 2×2 盒平均
+                                                cs::idct2x2(tmp, &mut component.cs_ring, ring_off, stride);
+                                            }
+                                        }
+                                        // den=8：仅 DC 块均值（1×1），AC 全部丢弃（抗混叠即平均义）
+                                        _ => cs::idct1x1_dc(
                                             tmp[0],
                                             &mut component.cs_ring,
                                             ring_off,
-                                            stride,
-                                        );
-                                    } else {
-                                        // 半带核：只吃左上 4×4 系数（熵仍消费全块位流，随熵路径不动）
-                                        cs::idct4x4(tmp, &mut component.cs_ring, ring_off, stride);
+                                        ),
                                     }
                                 } else {
                                     // 目标字节平面：PROGRESSIVE 缓冲到 `progressive[k]`（整帧样本平面），
@@ -914,15 +941,17 @@ impl<'a> Decoder<'a> {
         let v_max = self.v_max;
         let width = self.width;
         let height = self.height;
-        // den=2 DCT 缩放（`read_image_scaled`）：输出/环几何整体按 `ceil(w/2)×ceil(h/2)`
-        // 落到「每 8×8 块 → 4×4 样本」的紧凑环（seed = 块/列 采样宽度减半、每块带 4 行）。
+        // DCT 缩放（`read_image_scaled`，den∈{2,4,8}）：输出/环几何整体按 `ceil(w/den)×
+        // ceil(h/den)` 落到「每 8×8 块 → (8/den)×(8/den) 样本」的紧凑环（seed = 块/列采样
+        // 宽度按 den 缩、每块带 8/den 行；环总行 = 2×v_samp×(8/den)）。
         // 采样比（`cs_hs/cs_vs`）、`R_HV2` 核形状与 `cs_ystep` ¾/¼ 相位逻辑原样保留——
-        // 只显式把列数/行数减半，示意"复用现有上采样核、仅列数减半"。色度 4:2:0 采样比
+        // 只显式把列数/行数按 den 缩，示意"复用现有上采样核、仅列数缩放"。色度 4:2:0 采样比
         // 在 scaled 下不变（Y/色度块同比例缩，比例关系不随 den 变）。
-        let scaled = self.scaled_den == Some(2);
-        let out_w = if scaled { width.div_ceil(2) } else { width };
-        let out_h = if scaled { height.div_ceil(2) } else { height };
-        let rows_per_block = if scaled { 4 } else { 8 };
+        let den = usize::from(self.scaled_den.unwrap_or(1));
+        let scaled = den > 1;
+        let out_w = if scaled { width.div_ceil(den) } else { width };
+        let out_h = if scaled { height.div_ceil(den) } else { height };
+        let rows_per_block = if scaled { 8 / den } else { 8 };
 
         // 各分量 Hs/Vs 先算好，避免逐分量的可变借用贴着 h_max 读取。
         let ratios: Vec<(usize, usize)> = self
@@ -941,9 +970,9 @@ impl<'a> Decoder<'a> {
                 (2, 2) => cs::R_HV2,
                 _ => cs::R_GENERIC,
             };
-            // scaled：环行宽减半（每 8×8 块只写 4 个连续样本列）；width_stride 恒为
-            // `horizontal_sample * mcu_x * 8`（8 的倍数）→ 减半为 4 的倍数，无舍入。
-            comp.cs_w2 = if scaled { comp.width_stride / 2 } else { comp.width_stride };
+            // scaled：环行宽按 den 缩（每 8×8 块只写 8/den 个连续样本列）；width_stride 恒为
+            // `horizontal_sample * mcu_x * 8`（8 的倍数）→ 按 den∈{2,4,8} 缩后为整数，无舍入。
+            comp.cs_w2 = if scaled { comp.width_stride / den } else { comp.width_stride };
             comp.cs_wlores = out_w.div_ceil(hs);
             comp.cs_ys_scaled = (out_h * comp.vertical_sample).div_ceil(v_max);
             comp.cs_rows_mcu = comp.vertical_sample * rows_per_block;
@@ -987,10 +1016,10 @@ impl<'a> Decoder<'a> {
         let out_bpp = self.out_colorspace.num_components();
         let chroma16 = self.cs_chroma16;
         let input_kind = self.cs_input_kind;
-        // scaled：`width` 参数已是 `ceil(w/2)`（baseline 驱动处折算），只再限输出行数
+        // scaled：`width` 参数已是 `ceil(w/den)`（baseline 驱动处折算），只再限输出行数
         let out_x = width;
-        let height = if self.scaled_den == Some(2) {
-            self.height.div_ceil(2)
+        let height = if let Some(den) = self.scaled_den {
+            self.height.div_ceil(usize::from(den))
         } else {
             self.height
         };
@@ -1134,6 +1163,8 @@ impl<'a> Decoder<'a> {
 
         mcu_width *= 64;
 
+        // 整帧系数缓冲按全图 MCU 数分配——scaled 亦同：分配与全解同量级、未按 den 独立设界
+        // （与全解暴露持平；如实声明，未按 den 单独省内存）。
         for i in 0..self.input_colorspace.num_components() {
             let comp = &self.components[i];
             let len = mcu_width * comp.vertical_sample * comp.horizontal_sample * mcu_height;
@@ -1602,6 +1633,9 @@ impl<'a> Decoder<'a> {
     /// `i`、竖直子块 `k`、水平子块 `j`，`flat = (i*vertical_sample + k)*mcu_x + j` 即
     /// `prog_mask[position]` 下标（熵段非交织 AC scan 以同序 `start>>6` 写掩码，DC scan 不
     /// 涉 bit0；`block`/`prog_mask` 由同一 `len` 分配，灰度下采样修正对两者一致）。
+    ///
+    /// 内存如实声明：scaled 下 `block`/`prog_mask` 仍按全图尺寸分配（分配与全解同量级、
+    /// 未按 den 独立设界，与全解暴露持平）。
     #[allow(clippy::too_many_lines)]
     fn finish_progressive_decoding(
         &mut self,
@@ -1616,7 +1650,12 @@ impl<'a> Decoder<'a> {
             (self.height + 7) / 8
         };
 
-        let width = self.width;
+        // 输出宽（scaled 时按 den 折算；post_process 用同一口径）。
+        let width = if let Some(den) = self.scaled_den {
+            self.width.div_ceil(usize::from(den))
+        } else {
+            self.width
+        };
         let mut tmp = [0_i16; DCT_BLOCK];
 
         for (pos, comp) in self.components.iter_mut().enumerate() {
@@ -1696,56 +1735,110 @@ impl<'a> Decoder<'a> {
                         let t_idct = self.stage.busy_timer();
 
                         if !StageProfile::skip_idct() {
-                            // 环偏移：C# `((m&1)*RowsPerMcu + v*8)*W2 + bx*8`
-                            let ring_off = (((i & 1) * v_samp) + k) * 8 * component.width_stride
-                                + j * 8;
-                            if fused {
-                                let flat_blk = (i * v_samp + k) * mcu_x + j;
-                                let mask = pmask.and_then(|p| p.get(flat_blk)).copied();
-                                if maskp {
-                                    pop.accum(mask.unwrap_or(0));
-                                }
-                                match mask {
-                                    // 候选 A：终态 AC 全零 → 免全量 dequant，只算 DC
-                                    // （`(coeff[0]*qt16[0]) as i16`，与 dequant_block 截断同义）
-                                    // 后走 DC-only（全量 idct 于 AC 全零块逐位恒等，
-                                    // dconly_eq_avx2_full_for_ac_zero 已证 → 逐块恒等保持）。
-                                    Some(0) => {
-                                        // 路由前提：mask==0 ⇒ 终态 AC 系数全零（mask 位 p=zigzag
-                                        // 系数序 p，UN_ZIGZAG 双射 → natural 序 1..63 逐位全零）。
-                                        // debug_assert 防未来熵段回归静默漏置 mask 位（mask==0 但 AC
-                                        // 非零 → 本旁路会错判 DC-only 改输出；release 恒等于零开销）。
-                                        debug_assert!(qt_slice[1..].iter().all(|&c| c == 0));
-                                        let dc = (i32::from(qt_slice[0])
-                                            * i32::from(qt16[position][0]))
-                                            as i16;
-                                        cs::idct8x8_dc_only(
-                                            dc,
-                                            &mut component.cs_ring,
-                                            ring_off,
-                                            component.width_stride,
-                                        );
+                            if let Some(den) = self.scaled_den {
+                                // DCT 缩放写环（den∈{2,4,8}）：反量化到 tmp 后走缩放核；
+                                // 与 fused 稀疏无关——缩放核只读左上 4×4/DC（熵结构、反量化
+                                // 全量照旧，仅 IDCT 写回降档）。
+                                let den = usize::from(den);
+                                let bs = 8 / den;
+                                let stride = component.width_stride / den;
+                                let ring_off = (((i & 1) * v_samp) + k) * bs * stride + j * bs;
+                                // B 契约插桩：scaled 环写界（bs 行 × bs 字节，末字节 = off+(bs-1)*stride+bs）。
+                                debug_assert!(
+                                    ring_off + (bs - 1) * stride + bs <= component.cs_ring.len(),
+                                    "prog scaled ring 越界: den={den} ({i},{k},{j}) off={ring_off} stride={stride} ring={}",
+                                    component.cs_ring.len()
+                                );
+                                let ac_zero = dequant_block(qt_slice, &qt16[position], &mut tmp);
+                                match den {
+                                    2 => {
+                                        if ac_zero {
+                                            cs::idct4x4_dc_only(
+                                                tmp[0],
+                                                &mut component.cs_ring,
+                                                ring_off,
+                                                stride,
+                                            );
+                                        } else {
+                                            cs::idct4x4(&tmp, &mut component.cs_ring, ring_off, stride);
+                                        }
                                     }
-                                    // 候选 B：非 DC-only 块走 fused「反量化∘IDCT」（mullo 直喂
-                                    // f32 装载，删 128B store+load+栈框；非零块不再算 ac_zero
-                                    // movemask 冗余比较）。S4：mask 非零 → last =
-                                    // 63−lzcnt(mask)（C# JpegCore.cs:1826 直通），4 态
-                                    // 分发到 fused 稀疏核；mask 缺失（边际越界）→ 保守全量，
-                                    // 全量 idct 对 DC-only 块亦恒等 → 任意情况字节恒等。
-                                    Some(m) => {
-                                        if sparse {
-                                            let last = 63 - m.leading_zeros() as usize;
-                                            dequant_idct8x8_sparse(
-                                                qt_slice,
-                                                &qt16[position],
-                                                last,
+                                    4 => {
+                                        if ac_zero {
+                                            cs::idct2x2_dc_only(
+                                                tmp[0],
+                                                &mut component.cs_ring,
+                                                ring_off,
+                                                stride,
+                                            );
+                                        } else {
+                                            cs::idct2x2(&tmp, &mut component.cs_ring, ring_off, stride);
+                                        }
+                                    }
+                                    // den=8：仅 DC 块均值（1×1），AC 全部丢弃（抗混叠即平均义）
+                                    _ => cs::idct1x1_dc(tmp[0], &mut component.cs_ring, ring_off),
+                                }
+                            } else {
+                                // 环偏移：C# `((m&1)*RowsPerMcu + v*8)*W2 + bx*8`
+                                let ring_off = (((i & 1) * v_samp) + k) * 8 * component.width_stride
+                                    + j * 8;
+                                if fused {
+                                    let flat_blk = (i * v_samp + k) * mcu_x + j;
+                                    let mask = pmask.and_then(|p| p.get(flat_blk)).copied();
+                                    if maskp {
+                                        pop.accum(mask.unwrap_or(0));
+                                    }
+                                    match mask {
+                                        // 候选 A：终态 AC 全零 → 免全量 dequant，只算 DC
+                                        // （`(coeff[0]*qt16[0]) as i16`，与 dequant_block 截断同义）
+                                        // 后走 DC-only（全量 idct 于 AC 全零块逐位恒等，
+                                        // dconly_eq_avx2_full_for_ac_zero 已证 → 逐块恒等保持）。
+                                        Some(0) => {
+                                            // 路由前提：mask==0 ⇒ 终态 AC 系数全零（mask 位 p=zigzag
+                                            // 系数序 p，UN_ZIGZAG 双射 → natural 序 1..63 逐位全零）。
+                                            // debug_assert 防未来熵段回归静默漏置 mask 位（mask==0 但 AC
+                                            // 非零 → 本旁路会错判 DC-only 改输出；release 恒等于零开销）。
+                                            debug_assert!(qt_slice[1..].iter().all(|&c| c == 0));
+                                            let dc = (i32::from(qt_slice[0])
+                                                * i32::from(qt16[position][0]))
+                                                as i16;
+                                            cs::idct8x8_dc_only(
+                                                dc,
                                                 &mut component.cs_ring,
                                                 ring_off,
                                                 component.width_stride,
                                             );
-                                        } else {
-                                            // 门关（KIMG_JPEG_SPARSE_IDCT=0）：S4 之前的
-                                            // 旧 fused 全量核，逐字节一致（同二进制 A/B）。
+                                        }
+                                        // 候选 B：非 DC-only 块走 fused「反量化∘IDCT」（mullo 直喂
+                                        // f32 装载，删 128B store+load+栈框；非零块不再算 ac_zero
+                                        // movemask 冗余比较）。S4：mask 非零 → last =
+                                        // 63−lzcnt(mask)（C# JpegCore.cs:1826 直通），4 态
+                                        // 分发到 fused 稀疏核；mask 缺失（边际越界）→ 保守全量，
+                                        // 全量 idct 对 DC-only 块亦恒等 → 任意情况字节恒等。
+                                        Some(m) => {
+                                            if sparse {
+                                                let last = 63 - m.leading_zeros() as usize;
+                                                dequant_idct8x8_sparse(
+                                                    qt_slice,
+                                                    &qt16[position],
+                                                    last,
+                                                    &mut component.cs_ring,
+                                                    ring_off,
+                                                    component.width_stride,
+                                                );
+                                            } else {
+                                                // 门关（KIMG_JPEG_SPARSE_IDCT=0）：S4 之前的
+                                                // 旧 fused 全量核，逐字节一致（同二进制 A/B）。
+                                                dequant_idct8x8(
+                                                    qt_slice,
+                                                    &qt16[position],
+                                                    &mut component.cs_ring,
+                                                    ring_off,
+                                                    component.width_stride,
+                                                );
+                                            }
+                                        }
+                                        None => {
                                             dequant_idct8x8(
                                                 qt_slice,
                                                 &qt16[position],
@@ -1755,30 +1848,30 @@ impl<'a> Decoder<'a> {
                                             );
                                         }
                                     }
-                                    None => {
-                                        dequant_idct8x8(
-                                            qt_slice,
-                                            &qt16[position],
+                                } else if fastpath {
+                                    // 反量化（natural-order short wrap，C# `(short)(coeff×q)`）
+                                    // + AC 全零判定（终态系数 1..63 全零 → DC-only，对齐 C#
+                                    // `nz==0/仅DC → last==0 → DcOnly(data[0])`，逐位恒等）。
+                                    let ac_zero =
+                                        dequant_block(qt_slice, &qt16[position], &mut tmp);
+                                    if ac_zero {
+                                        cs::idct8x8_dc_only(
+                                            tmp[0],
+                                            &mut component.cs_ring,
+                                            ring_off,
+                                            component.width_stride,
+                                        );
+                                    } else {
+                                        cs::idct8x8(
+                                            &tmp,
                                             &mut component.cs_ring,
                                             ring_off,
                                             component.width_stride,
                                         );
                                     }
-                                }
-                            } else if fastpath {
-                                // 反量化（natural-order short wrap，C# `(short)(coeff×q)`）
-                                // + AC 全零判定（终态系数 1..63 全零 → DC-only，对齐 C#
-                                // `nz==0/仅DC → last==0 → DcOnly(data[0])`，逐位恒等）。
-                                let ac_zero =
-                                    dequant_block(qt_slice, &qt16[position], &mut tmp);
-                                if ac_zero {
-                                    cs::idct8x8_dc_only(
-                                        tmp[0],
-                                        &mut component.cs_ring,
-                                        ring_off,
-                                        component.width_stride,
-                                    );
                                 } else {
+                                    // 对照路径：向量化反量化后恒全量 IDCT（旧行为）。
+                                    dequant_block(qt_slice, &qt16[position], &mut tmp);
                                     cs::idct8x8(
                                         &tmp,
                                         &mut component.cs_ring,
@@ -1786,15 +1879,6 @@ impl<'a> Decoder<'a> {
                                         component.width_stride,
                                     );
                                 }
-                            } else {
-                                // 对照路径：向量化反量化后恒全量 IDCT（旧行为）。
-                                dequant_block(qt_slice, &qt16[position], &mut tmp);
-                                cs::idct8x8(
-                                    &tmp,
-                                    &mut component.cs_ring,
-                                    ring_off,
-                                    component.width_stride,
-                                );
                             }
                         }
                         self.stage.busy_stop(Stage::Idct, t_idct);

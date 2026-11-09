@@ -226,6 +226,78 @@ pub(crate) fn idct4x4_dc_only(dc: i16, out: &mut [u8], offset: usize, stride: us
 }
 
 // ==========================================================================
+// 2×2 半带 DCT 缩放 IDCT（den=4 展示档；libjpeg `jpeg_idct_2x2` DCT-scaled 模型）
+// ==========================================================================
+
+/// 2×2 缩放的 **独立** 新核（不进 `idct8x8` 现有路径，K29 防污染）。
+///
+/// 语义 = 对「只保留频带 < 8/2=4（左上 4×4 低位系数）的抗混叠重建」做 **4×4 盒平均**
+/// （libjpeg `jpeg_idct_2x2` 的「相邻四输出平均」模型，`jidctred.c` 明确）。与 den=2 的
+/// `idct4x4` 同频带（u,v<4）；「(2×2 盒)∘(2×2 盒) = 4×4 盒」可复合 → 先列 pass + 行 pass
+/// 得到 4×4 带限重建样本（f32、同 `idct4x4` 但**不**取整），再对每 2×2 组求均值后单次
+/// `to_sample`。分离式两遍每遍仍是同一个 1-D 8→4 盒式核 `T`（`idct4_1d`）；f32 严格求值无 FMA。
+#[inline]
+pub(crate) fn idct2x2(data: &[i16; 64], out: &mut [u8], offset: usize, stride: usize) {
+    // 列 pass → t[16]（行主 `t[r*4+c]`，4 列 × 左上 4 系数）。
+    let mut t = [0.0f32; 16];
+    for u in 0..4 {
+        let (s0, s1, s2, s3) = idct4_1d(
+            f32::from(data[u]),
+            f32::from(data[8 + u]),
+            f32::from(data[16 + u]),
+            f32::from(data[24 + u]),
+        );
+        t[u] = s0;
+        t[4 + u] = s1;
+        t[8 + u] = s2;
+        t[12 + u] = s3;
+    }
+    // 行 pass → s4[16]（4×4 带限重建样本，行主 `s4[r*4+c]`；仅此新核用，非 idct4x4 输出）。
+    let mut s4 = [0.0f32; 16];
+    for m in 0..4 {
+        let r = &t[m * 4..m * 4 + 4];
+        let (s0, s1, s2, s3) = idct4_1d(r[0], r[1], r[2], r[3]);
+        s4[m * 4] = s0;
+        s4[m * 4 + 1] = s1;
+        s4[m * 4 + 2] = s2;
+        s4[m * 4 + 3] = s3;
+    }
+    // 2×2 输出：每输出 = 4×4 带限样本组平均（f32 域求均值，一次取整）。
+    for m in 0..2 {
+        let o = offset + m * stride;
+        for n in 0..2 {
+            let avg = (s4[(2 * m) * 4 + 2 * n]
+                + s4[(2 * m) * 4 + 2 * n + 1]
+                + s4[(2 * m + 1) * 4 + 2 * n]
+                + s4[(2 * m + 1) * 4 + 2 * n + 1])
+                * 0.25f32;
+            out[o + n] = to_sample(avg);
+        }
+    }
+}
+
+/// DC-only 2×2 半带块：每样本 = `((float)dc * K4) * K4`（DC 均匀，与全量 2×2 逐位恒等快路径）。
+#[inline]
+pub(crate) fn idct2x2_dc_only(dc: i16, out: &mut [u8], offset: usize, stride: usize) {
+    let v = to_sample((f32::from(dc) * K4) * K4);
+    out[offset] = v;
+    out[offset + 1] = v;
+    out[offset + stride] = v;
+    out[offset + stride + 1] = v;
+}
+
+// ==========================================================================
+// 1×1 DC 缩放（den=8 展示档；libjpeg `jpeg_idct_1x1`：`DC/8` = 块均值）
+// ==========================================================================
+
+/// 8×8 块 → 1×1 样本：DC 值即整块均值（`((float)dc * K4) * K4` = `dc/8`，libjpeg
+/// `_jpeg_idct_1x1` 的 `DEQUANTIZE(dc) >> 3` 与全量 8×8 重建逐位恒等，`dconly_eq_*` 已证）。
+#[inline]
+pub(crate) fn idct1x1_dc(dc: i16, out: &mut [u8], offset: usize) {
+    out[offset] = to_sample((f32::from(dc) * K4) * K4);
+}
+
+// ==========================================================================
 // 稀疏 IDCT（C# `JpegIdct.Idct8x8(..., last)` 4 态分发；C# 96-146 直译）
 // ==========================================================================
 
@@ -1031,6 +1103,105 @@ mod tests {
         // 容差外的系统偏差会被上式拦下；此处仅把最大差打进报告供核查
         // （≤3 = 折叠常数族 vs 直算 cos 两套 f32 代数路径的浮点累计差，非语义偏差）。
         println!("idct4x4 vs box-of-bandlimited max diff = {max_diff}");
+    }
+
+    /// 2×2 半带核 ≡ 「带限重建（只留左上 4×4 系数）的 4×4 盒平均」参考（B2 契约，den=4）。
+    /// 参考实现走与本核**不同**的直算路径：对 `data` 左上 4×4 还原 8×8 空间块、逐 4×4 组
+    /// 平均再 `to_sample`（两套 f32 代数路径存在 ≤几 ulp 级差，容差 ±5，实测 0）。
+    #[test]
+    fn idct2x2_eq_box_of_bandlimited() {
+        let mut seed = 0x9E37_79B9u64;
+        let wr = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((*seed >> 33) as u32) as i16
+        };
+        let mut max_diff = 0i32;
+        for case in 0..1200 {
+            let mut data = [0i16; 64];
+            let dense = case % 4;
+            for i in 0..16 {
+                data[i] = match dense {
+                    0 => 0,
+                    1 => {
+                        if i == 0 {
+                            wr(&mut seed)
+                        } else {
+                            0
+                        }
+                    }
+                    _ => wr(&mut seed),
+                };
+            }
+            // 参考：左上 4×4 重建 8×8 块 → 逐 4×4 盒平均
+            let mut s = [0.0f32; 64];
+            for y in 0..8 {
+                for x in 0..8 {
+                    let mut acc = 0.0f32;
+                    for vf in 0..4 {
+                        let gv = if vf == 0 { K4 } else { 0.5f32 };
+                        for uf in 0..4 {
+                            let gu = if uf == 0 { K4 } else { 0.5f32 };
+                            let ang = |n: usize, k: usize| {
+                                let t = 2 * n + 1;
+                                (t as f32) * (k as f32) * std::f32::consts::PI / 16.0
+                            };
+                            acc += gu
+                                * gv
+                                * f32::from(data[vf * 8 + uf])
+                                * ang(x, uf).cos()
+                                * ang(y, vf).cos();
+                        }
+                    }
+                    s[y * 8 + x] = acc;
+                }
+            }
+            let mut ref_out = [0u8; 4];
+            for m in 0..2 {
+                for n in 0..2 {
+                    let mut avg = 0.0f32;
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            avg += s[(4 * m + dy) * 8 + (4 * n + dx)];
+                        }
+                    }
+                    ref_out[m * 2 + n] = to_sample(avg * 0.0625);
+                }
+            }
+            let mut out = [0u8; 128];
+            idct2x2(&data, &mut out, 3, 11);
+            for m in 0..2 {
+                for n in 0..2 {
+                    let got = i32::from(out[3 + m * 11 + n]);
+                    let want = i32::from(ref_out[m * 2 + n]);
+                    let d = (got - want).abs();
+                    max_diff = max_diff.max(d);
+                    assert!(
+                        d <= 5,
+                        "idct2x2 ≠ 带限盒参考 case {case} dense={dense} ({m},{n}) got={got} want={want}"
+                    );
+                }
+            }
+        }
+        println!("idct2x2 vs box-of-bandlimited(4×4) max diff = {max_diff}");
+    }
+
+    /// DC-only 缩放核自证：`idct1x1_dc` ≡ 全量 8×8 DC-only 核单样本（den=8 → DC 即块均值）；
+    /// `idct2x2_dc_only` ≡ `idct1x1_dc` 的 2×2 平铺。两核均对稠密/极值 DC 逐位恒等。
+    #[test]
+    fn dc_scaled_kernels_eq_dc_only_value() {
+        for &dc in &[0i16, 1, -1, 127, -128, 12345, -12345, i16::MIN, i16::MAX] {
+            let mut ring = [0u8; 64];
+            let mut ref8 = [0u8; 64];
+            idct8x8_dc_only(dc, &mut ref8, 0, 8);
+            let want = ref8[0];
+            idct1x1_dc(dc, &mut ring, 5);
+            assert_eq!(ring[5], want, "idct1x1_dc dc={dc} ≠ DC-only 值");
+            let mut ring2 = [0u8; 64];
+            idct2x2_dc_only(dc, &mut ring2, 3, 11);
+            for (m, n) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                assert_eq!(ring2[3 + m * 11 + n], want, "idct2x2_dc_only dc={dc} ≠ DC-only 值");
+            }
+        }
     }
 
     /// 稠密块 AVX2 8×8 f32 IDCT 吞吐微基准（release `#[ignore]`）：逐块调用形态，同窗 A/B 用。

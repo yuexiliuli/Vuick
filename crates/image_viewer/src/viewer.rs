@@ -35,7 +35,7 @@
 //!   [`FAST_SCROLL_MAX_DECODE`]），且 [`Self::pump_prefetch`]
 //!   在解码缓存达到字节预算后**停止派发**（[`CACHE_MAX_BYTES`]）——不再把整个文件夹扫一遍
 //!   白算 CPU（此前 106 张全解 ≈ 8GB 像素量磨 8 核）。缓存能装 ~9 张显示档 → 滚动基本全命中。
-//! - **放大升档**：Ctrl+滚轮使 `display_need` 变大 → [`Self::escalate_display_denom`] 按需
+//! - **放大升档**：Ctrl+滚轮使 `display_need` 变大 → `escalate_display_denom` 按需
 //!   重解更细档（只升不降，`in_flight` 去重防抖）——1:1 看细节时自动回到全解清晰图。
 //! - **P1b 即时首帧（EXIF 嵌入缩略图，零依赖）**：冷打开 JPEG 先解出 APP1-Exif IFD1 内嵌
 //!   ~160px 缩略图立即上屏（几 ms），展示档真图解码完成后覆盖——首帧不再空等熵解码（school
@@ -296,7 +296,7 @@ pub struct ImageViewer {
     /// [`DISPLAY_NEED_INIT`] 兜底。
     display_need: (f32, f32),
     /// 当前安装展示的降档分母（1/8/4/2/1；JPEG/PNG；其它格式恒 1）。缩放放大且需要更细档时
-    /// 据此触发「升档」重解（[`Self::escalate_display_denom`]）。
+    /// 据此触发「升档」重解（`escalate_display_denom`）。
     display_denom: u8,
     /// 平移（px）：放大后拖拽浏览其他区域，以视口中心为基准、每帧 clamp 到图始终覆盖视口。
     pan: (f32, f32),
@@ -709,11 +709,11 @@ fn pick_den(iw: u32, ih: u32, need_w: f32, need_h: f32) -> u8 {
     1
 }
 
-/// JPEG 按展示需要**降档解码**：den=2 优先走自研 `kimg` 的 **DCT 半带缩放**新路径
-/// （[`try_decode_jpeg_scaled`]：熵→4×4 半带 IDCT 直出 `ceil/2` 尺寸，消掉「全解 12MP 再
-/// 盒式降采样」的 48MB 中间态）；任何失败/不支持 → 无缝回退「全解 RGBA8 + 盒式降采样」
-/// 旧路径（与改动前逐像素一致，零状态泄漏）。返回 BGRA 字节 + 输出尺寸 + 实际降档分母。
-/// 失败返回 `Err`（由上层回退 `image` 全解），绝不 panic/硬失败。
+/// JPEG 按展示需要**降档解码**：den∈{2,4,8} 优先走自研 `kimg` 的 **DCT 缩放**新路径
+/// （[`try_decode_jpeg_scaled`]：熵→half-band IDCT 直出 `ceil/den` 尺寸，消掉「全解
+/// 大图再盒式降采样」的 48MB~100MB+ 中间态）；任何失败/不支持 → 无缝回退「全解 RGBA8 +
+/// 盒式降采样」旧路径（与改动前逐像素一致，零状态泄漏）。返回 BGRA 字节 + 输出尺寸 +
+/// 实际降档分母。失败返回 `Err`（由上层回退 `image` 全解），绝不 panic/硬失败。
 fn decode_jpeg_display(
     bytes: &[u8],
     need: (f32, f32),
@@ -735,15 +735,15 @@ fn decode_jpeg_display(
     Ok((bgra, w, h, den))
 }
 
-/// JPEG den=2 缩放输出分配硬上界（≤ `kimg::Limits::default()` 的 `max_alloc` = 512MiB）
+/// JPEG 缩放输出分配硬上界（≤ `kimg::Limits::default()` 的 `max_alloc` = 512MiB）
 /// ——不可信头尺寸不得触发超出预算的单次分配（K124；见 [`try_decode_jpeg_scaled`]）。
 const JPEG_SCALED_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
-/// JPEG den=2 **DCT 半带缩放**直解尝试：成功返回 `(BGRA, w, h, 2)`（与 box 网格同构
-/// `ceil(iw/2)×ceil(ih/2)`，顶左对齐）；任何失败/不支持/非 den=2/超分配预算 → `None`，
-/// 由 [`decode_jpeg_display`] 无缝回退「全解+盒式」。门控（`KIMG_JPEG_SCALED`）整收在
-/// `kimg_jpeg::JpegDecoder::read_image_scaled` 内（progressive/den≠2 → Unsupported），
-/// 本入口零耦合：Err → None → 旧路径。
+/// JPEG **DCT 缩放**直解尝试：成功返回 `(BGRA, w, h, den)`（与 box 网格同构
+/// `ceil(iw/den)×ceil(ih/den)`，顶左对齐，den∈{2,4,8}）；任何失败/不支持/非
+/// {2,4,8}/超分配预算 → `None`，由 [`decode_jpeg_display`] 无缝回退「全解+盒式」。
+/// 门控（`KIMG_JPEG_SCALED`）整收在 `kimg_jpeg::JpegDecoder::read_image_scaled` 内
+/// （不支持 → Unsupported），本入口零耦合：Err → None → 旧路径。
 fn try_decode_jpeg_scaled(bytes: &[u8], need: (f32, f32)) -> Option<(Vec<u8>, u32, u32, u8)> {
     // K124：先应用默认 Limits（max_alloc=512MiB，宽高无默认上限）再取尺寸——对齐 PNG
     // display 路径惯例（viewer.rs 内 decode_png_display 同款 `set_limits(Limits::default())`）。
@@ -752,14 +752,15 @@ fn try_decode_jpeg_scaled(bytes: &[u8], need: (f32, f32)) -> Option<(Vec<u8>, u3
     let mut dec = kimg::codecs::jpeg::JpegDecoder::from_bytes(bytes).ok()?;
     dec.set_limits(kimg::Limits::default()).ok()?;
     let (iw, ih) = dec.dimensions();
-    // v1 只做 den=2：den=1/4/8 → 走旧路径（不降级）。选档与 [`pick_den`] 同口径。
-    if pick_den(iw, ih, need.0, need.1) != 2 {
+    // 只放行 {2,4,8}：den=1 → 走旧路径（全解；不降级）。选档与 [`pick_den`] 同口径。
+    let den = pick_den(iw, ih, need.0, need.1);
+    if !matches!(den, 2 | 4 | 8) {
         return None;
     }
     let color = dec.color_type();
-    let (sw, sh) = dec.scaled_dimensions(2)?;
+    let (sw, sh) = dec.scaled_dimensions(den)?;
     let ch = u64::from(color.bytes_per_pixel());
-    // 分配前硬上界（K124）：`ceil(iw/2)×ceil(ih/2)×bpp` 须 ≤ 512MiB；超限不分配、回退
+    // 分配前硬上界（K124）：`ceil(iw/den)×ceil(ih/den)×bpp` 须 ≤ 512MiB；超限不分配、回退
     // 全解兜底（全解路径在 limits 内正确拒绝炸弹头）。`checked` 乘法防中间溢出（16-bit
     // SOF 极端 65535×65535 亦被本界拦下：scaled 32768×32768×3 ≈ 3.0GB > 512MiB）。
     let n = u64::from(sw).checked_mul(u64::from(sh))?.checked_mul(ch)?;
@@ -767,7 +768,7 @@ fn try_decode_jpeg_scaled(bytes: &[u8], need: (f32, f32)) -> Option<(Vec<u8>, u3
         return None;
     }
     let mut buf = vec![0u8; n as usize];
-    dec.read_image_scaled(2, &mut buf).ok()?;
+    dec.read_image_scaled(den, &mut buf).ok()?;
     // 展开到 RGBA 4 通道（与 box 旧路径 `to_rgba8` 同形），再 swap → BGRA。
     let mut rgba = if color == kimg::ColorType::Rgba8 {
         buf
@@ -775,7 +776,7 @@ fn try_decode_jpeg_scaled(bytes: &[u8], need: (f32, f32)) -> Option<(Vec<u8>, u3
         expand_png_to_rgba8(&buf, sw, sh, color)?
     };
     swap_rb_in_place(rgba.as_mut());
-    Some((rgba, sw, sh, 2))
+    Some((rgba, sw, sh, den))
 }
 
 /// 盒式降采样并行阈值（输入像素数）：低于则用单线程，避免 rayon 线程池分摊/派发开销

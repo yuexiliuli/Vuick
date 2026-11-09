@@ -1,11 +1,11 @@
-//! JPEG 展示档 den=2 DCT 缩放的验收测试（B 契约 / 验收口径）。
+//! JPEG 展示档 DCT 缩放的验收测试（B 契约 / 验收口径；den∈{2,4,8}）。
 //!
-//! - **B1 网格同构**：`scaled_dimensions == box_dims`（顶左对齐、`ceil(w/2)×ceil(h/2)`）
+//! - **B1 网格同构**：`scaled_dimensions == box_dims`（顶左对齐、`ceil(w/den)×ceil(h/den)`）
 //!   对全 `w,h∈[1..20]` + 语料各档尺寸成立；`read_image_scaled` 输出尺寸与声明一致。
-//! - **B2 抗混叠半核**：内核级 `cs::tests::idct4x4_eq_box_of_bandlimited`（lib 单元）；
-//!   本文件核对端到端 PSNR（scaled 3MP vs box 3MP ≥ 30dB）+ 高频能量不降。
-//! - **验收口径**：420-q100-3mp / 444-q100-3mp（各一）PSNR≥30；420-q100-12mp（细纹理
-//!   混叠应力）、444-q100-12mp（直线振铃）在真实 1376×1032 视口（den=2）同样 ≥30。
+//! - **B2 抗混叠半核**：内核级 `cs::tests::idct4x4/idct2x2_eq_box_of_bandlimited` +
+//!   `dc_scaled_kernels_eq_dc_only_value`（lib 单元）；本文件核对端到端 PSNR + 高频能量不降。
+//! - **验收口径**：den=2/4（420+444 q100 3mp/12mp + moe 50MP）+ den=8 + 渐进（SOF2）各档；
+//!   全部 PSNR≥30（宽松档 ≥28）。
 //! - **env 回退**：`KIMG_JPEG_SCALED=0` → `read_image_scaled` 返回 Unsupported。
 //!   注意 OnceLock 进程内一次判定 → 该用例独立成文件在独立进程跑（`jpeg_scaled_gate.rs`）。
 //! - 语料缺失 → SKIP（常态）；长命令前台阻塞到结束，禁全量。
@@ -19,19 +19,19 @@ use kimg_jpeg::codecs::jpeg::JpegDecoder;
 
 use fixtures::*;
 
-/// 2×2 盒式降采样（单线程参考）：`den×den` 源块 → 1 输出像素，每通道平均；
-/// 右/下不满块按实际像素数归一。输出 `ceil(w/den)×ceil(h/den)`。仅 den=2 用。
-fn box_downsample_2(px: &[u8], iw: u32, ih: u32, ch: usize) -> (Vec<u8>, u32, u32) {
-    let ow = iw.div_ceil(2);
-    let oh = ih.div_ceil(2);
+/// `den×den` 盒式降采样（单线程参考）：`den×den` 源块 → 1 输出像素，每通道平均；
+/// 右/下不满块按实际像素数归一。输出 `ceil(w/den)×ceil(h/den)`。
+fn box_downsample_n(px: &[u8], iw: u32, ih: u32, ch: usize, den: u32) -> Vec<u8> {
+    let ow = iw.div_ceil(den);
+    let oh = ih.div_ceil(den);
     let mut out = vec![0u8; ow as usize * oh as usize * ch];
     for oy in 0..oh {
         for ox in 0..ow {
             let mut sum = vec![0u32; ch];
             let mut n = 0u32;
-            for dy in 0..2u32 {
-                for dx in 0..2u32 {
-                    let (sx, sy) = (ox * 2 + dx, oy * 2 + dy);
+            for dy in 0..den {
+                for dx in 0..den {
+                    let (sx, sy) = (ox * den + dx, oy * den + dy);
                     if sx < iw && sy < ih {
                         for c in 0..ch {
                             sum[c] += u32::from(px[(sy * iw + sx) as usize * ch + c]);
@@ -45,7 +45,7 @@ fn box_downsample_2(px: &[u8], iw: u32, ih: u32, ch: usize) -> (Vec<u8>, u32, u3
             }
         }
     }
-    (out, ow, oh)
+    out
 }
 
 /// PSNR（所有通道合并 MSE；dB）。
@@ -98,52 +98,55 @@ fn full_decode(bytes: &[u8]) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>)
     Ok((w, h, ct, buf))
 }
 
-/// den=2 缩放解码：自然 color_type 字节（与全解同 color_type）。
+/// den 缩放解码：自然 color_type 字节（与全解同 color_type）。
 fn scaled_decode(
     bytes: &[u8],
+    den: u8,
 ) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>), String> {
     let dec = JpegDecoder::from_bytes(bytes).map_err(|e| format!("构造失败 {e}"))?;
     let ct = dec.color_type();
     let (sw, sh) = dec
-        .scaled_dimensions(2)
-        .ok_or("scaled_dimensions(2) 意外为 None".to_string())?;
+        .scaled_dimensions(den)
+        .ok_or(format!("scaled_dimensions({den}) 意外为 None"))?;
     let ch = usize::from(ct.bytes_per_pixel());
     let mut buf = vec![0u8; sw as usize * sh as usize * ch];
-    dec.read_image_scaled(2, &mut buf)
+    dec.read_image_scaled(den, &mut buf)
         .map_err(|e| format!("缩放失败 {e}"))?;
     Ok((sw, sh, ct, buf))
 }
 
-/// 全解 + 盒式 den=2（现展示产物参照）：与 `scaled_decode` 同 color_type。
-fn box_ref(bytes: &[u8]) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>), String> {
+/// 全解 + 盒式 den（现展示产物参照）：与 `scaled_decode` 同 color_type。
+fn box_ref(bytes: &[u8], den: u8) -> Result<(u32, u32, kimg_core::ColorType, Vec<u8>), String> {
     let (w, h, ct, px) = full_decode(bytes)?;
     let ch = usize::from(ct.bytes_per_pixel());
-    let (b, bw, bh) = box_downsample_2(&px, w, h, ch);
+    let b = box_downsample_n(&px, w, h, ch, u32::from(den));
+    let (bw, bh) = (w.div_ceil(u32::from(den)), h.div_ceil(u32::from(den)));
     Ok((bw, bh, ct, b))
 }
 
 /// 单文件验收：scaled vs box（同 color_type）PSNR + 高频能量比。
 /// 返回 Ok(Some((psnr_db, energy_ratio))) 已测；Ok(None) = SKIP（语料缺失/格式不支持）。
-fn check_one(
+fn check_one_den(
     name: &str,
     bytes: &[u8],
+    den: u8,
     min_psnr: f64,
 ) -> Result<Option<(f64, f64)>, String> {
-    let (sw, sh, ct, s) = match scaled_decode(bytes) {
+    let (sw, sh, ct, s) = match scaled_decode(bytes, den) {
         Ok(v) => v,
         Err(e) if e.contains("does not support") || e.contains("Unsupported") => {
-            println!("{name}: SKIP（缩放不支持：{e}）");
+            println!("{name}: den={den} SKIP（缩放不支持：{e}）");
             return Ok(None);
         }
-        Err(e) => return Err(format!("{name}: {e}")),
+        Err(e) => return Err(format!("{name}: den={den} {e}")),
     };
-    let (bw, bh, bct, b) = box_ref(bytes)?;
+    let (bw, bh, bct, b) = box_ref(bytes, den)?;
     if bct != ct {
-        return Err(format!("{name}: color_type 不一致 scaled={ct:?} box={bct:?}"));
+        return Err(format!("{name}: den={den} color_type 不一致 scaled={ct:?} box={bct:?}"));
     }
     if (sw, sh) != (bw, bh) {
         return Err(format!(
-            "{name}: 网格不同构 scaled={sw}×{sh} box={bw}×{bh}（B1 契约）"
+            "{name}: den={den} 网格不同构 scaled={sw}×{sh} box={bw}×{bh}（B1 契约）"
         ));
     }
     let p = psnr(&s, &b);
@@ -152,20 +155,38 @@ fn check_one(
     let eb = highfreq_energy(&b, sw, sh, ch);
     let ratio = if eb > 1e-9 { es / eb } else { 1.0 };
     println!(
-        "{name}: {sw}×{sh} {:?} PSNR={p:.2}dB 高频能量比={ratio:.2} (scaled {es:.2} / box {eb:.2})",
+        "{name}: den={den} {sw}×{sh} {:?} PSNR={p:.2}dB 高频能量比={ratio:.2} (scaled {es:.2} / box {eb:.2})",
         ct
     );
     if p < min_psnr {
-        return Err(format!("{name}: PSNR {p:.2}dB < {min_psnr}dB"));
+        return Err(format!("{name}: den={den} PSNR {p:.2}dB < {min_psnr}dB"));
     }
     // 高频能量不降（相对 box 展示产物；抗混叠允许适量衰减，但不得过度模糊 < 0.5×）
     if ratio < 0.5 {
-        return Err(format!("{name}: 缩放过度模糊 高频能量比 {ratio:.2} < 0.5"));
+        return Err(format!("{name}: den={den} 缩放过度模糊 高频能量比 {ratio:.2} < 0.5"));
     }
     Ok(Some((p, ratio)))
 }
 
-/// B1/验收聚合：对口语料（420/444×q100×3mp/12mp，真实 1376×1032 视口 den=2）逐一验收。
+/// 对单个文件逐一跑一组 (den, min_psnr) 验收；任一失败记一失败项。
+fn check_dens(
+    name: &str,
+    bytes: &[u8],
+    dens: &[(u8, f64)],
+    failures: &mut Vec<String>,
+    checked: &mut usize,
+) {
+    for &(den, min_psnr) in dens {
+        match check_one_den(name, bytes, den, min_psnr) {
+            Ok(Some(_)) => *checked += 1,
+            Ok(None) => {}
+            Err(e) => failures.push(e),
+        }
+    }
+}
+
+/// B1/验收聚合：对口语料（420/444×q100×3mp/12mp、moe 50MP、渐进 3MP）逐一多档验收。
+/// den=2/4（420+444，q100 细纹理/振铃应力）+ den=8（420 12mp）+ 渐进（420 prog 系）。
 #[test]
 fn scaled_psnr_vs_box_acceptance() {
     let dir = corpus_dir();
@@ -174,36 +195,55 @@ fn scaled_psnr_vs_box_acceptance() {
         return;
     }
     let files = collect_jpegs(&dir);
-    // 验收焦点：420/444 q100（细纹理/振铃应力）+ 3mp 常规；按名选取，缺失即跳过
-    let focus: Vec<&str> = vec![
-        "420-q100-3mp__landscape-almsee.jpg",
-        "444-q100-3mp__landscape-almsee.jpg",
-        "420-q100-12mp__texture-ground.jpg",
-        "444-q100-12mp__architecture-teatro.jpg",
+    // 焦点清单：名称 → 各档验收 (den, min_psnr)。缺失即跳过；den=2/4/8 全覆盖。
+    let focus: Vec<(&str, Vec<(u8, f64)>)> = vec![
+        (
+            "420-q100-3mp__landscape-almsee.jpg",
+            vec![(2, 30.0), (4, 30.0)],
+        ),
+        (
+            "444-q100-3mp__landscape-almsee.jpg",
+            vec![(2, 30.0), (4, 30.0)],
+        ),
+        (
+            "420-q100-12mp__texture-ground.jpg",
+            vec![(2, 30.0), (4, 30.0), (8, 30.0)],
+        ),
+        (
+            "444-q100-12mp__architecture-teatro.jpg",
+            vec![(2, 30.0), (4, 30.0), (8, 30.0)],
+        ),
+        // moe 50MP baseline（4:2:0 + RST）：den=4 减轻 50MP 全解+box 参照成本，仍覆盖真实大图
+        ("moe 46577 duel_dolls tinkle.jpg", vec![(4, 30.0)]),
+        // 渐进（SOF2）scaled：3mp 语料快速验收 den=2/4
+        (
+            "420-q95-3mp-prog__panorama-lakeview.jpg",
+            vec![(2, 30.0), (4, 30.0)],
+        ),
+        (
+            "420-q75-3mp-prog__night-alexanderplatz.jpg",
+            vec![(2, 30.0), (4, 30.0)],
+        ),
     ];
     let mut checked = 0usize;
     let mut failures: Vec<String> = Vec::new();
-    for want in &focus {
+    for (want, dens) in &focus {
         let p = dir.join(want);
         if !p.is_file() {
             println!("SKIP: missing {}（语料子集未含）", p.display());
             continue;
         }
         let bytes = std::fs::read(&p).unwrap();
-        match check_one(want, &bytes, 30.0) {
-            Ok(Some(_)) => checked += 1,
-            Ok(None) => {}
-            Err(e) => failures.push(e),
-        }
+        check_dens(want, &bytes, dens, &mut failures, &mut checked);
     }
-    // 通用样本（q75/90 等）宽松 ≥28dB 加粗样本：任一失败即报
+    // 通用样本（q75/90 等，den=2 宽松 ≥28dB）加粗样本：任一失败即报
     for p in &files {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        if focus.contains(&name.as_str()) {
+        if focus.iter().any(|(w, _)| *w == name.as_str()) {
             continue;
         }
         let bytes = std::fs::read(p).unwrap();
-        match check_one(&name, &bytes, 28.0) {
+        match check_one_den(&name, &bytes, 2, 28.0) {
             Ok(Some(_)) => checked += 1,
             Ok(None) => {}
             Err(e) => failures.push(e),
@@ -221,12 +261,13 @@ fn scaled_psnr_vs_box_acceptance() {
     );
 }
 
-/// B1 网格同构（property）：`scaled_dimensions(2) == (w.div_ceil(2), h.div_ceil(2))`
-/// 对**全 `w,h∈[1..20]`** 逐项断言（零解码：仅头解析后取 `scaled_dimensions`，不跑像素
-/// 解码）；再加 12MP 语料的「声明 == 实际解码 == box」端到端对拍（含非 8 整倍宽高）。
+/// B1 网格同构（property）：`scaled_dimensions(den) == (w.div_ceil(den), h.div_ceil(den))`
+/// 对 **den∈{2,4,8}** × **全 `w,h∈[1..20]`** 逐项断言（零解码：仅头解析后取
+/// `scaled_dimensions`，不跑像素解码）；den∉{2,4,8} → None。再加 12MP 语料的
+/// 「声明 == 实际解码 == box」端到端对拍（含非 8 整倍宽高）。
 ///
 /// 做法：读一张最小语料 JPEG，把它的 SOF 宽高逐项 patch 成 (w,h)，`from_bytes` 只做头
-/// 解析（µs 级），对每个尺寸核对 `scaled_dimensions(2)` 与 box 网格公式同构。
+/// 解析（µs 级），对每个尺寸核对 `scaled_dimensions(den)` 与 box 网格公式同构。
 #[test]
 fn scaled_dims_eq_box_dims() {
     let dir = corpus_dir();
@@ -259,17 +300,20 @@ fn scaled_dims_eq_box_dims() {
                 (w, h),
                 "patch SOF 后 dimensions 应为 {w}×{h}"
             );
-            // B1：scaled == box 网格公式（顶左对齐 ceil/2）；den≠2 → None（v1）
-            assert_eq!(
-                dec.scaled_dimensions(2),
-                Some((w.div_ceil(2), h.div_ceil(2))),
-                "B1 网格同构 ({w}×{h})"
-            );
-            assert_eq!(dec.scaled_dimensions(1), None, "v1 仅 den=2 ({w}×{h})");
-            assert_eq!(dec.scaled_dimensions(4), None, "v1 仅 den=2 ({w}×{h})");
+            // B1：scaled == box 网格公式（顶左对齐 ceil/den）；den∉{2,4,8} → None
+            for den in [2u8, 4, 8] {
+                assert_eq!(
+                    dec.scaled_dimensions(den),
+                    Some((w.div_ceil(u32::from(den)), h.div_ceil(u32::from(den)))),
+                    "B1 网格同构 ({w}×{h}) den={den}"
+                );
+            }
+            for den in [1u8, 3, 5] {
+                assert_eq!(dec.scaled_dimensions(den), None, "den={den} 应不支持 ({w}×{h})");
+            }
         }
     }
-    println!("B1 grid property: 全 w,h∈[1..20] scaled==box 网格同构 ✓");
+    println!("B1 grid property: 全 w,h∈[1..20] × den∈{{2,4,8}} scaled==box 网格同构 ✓");
 
     // 端到端：以 12MP 420 语料（若存在）核对「声明（api）== 实际解码 == box 尺寸」。
     let target = dir.join("420-q100-12mp__texture-ground.jpg");
@@ -278,11 +322,13 @@ fn scaled_dims_eq_box_dims() {
         return;
     }
     let bytes = std::fs::read(&target).unwrap();
-    let (sw, sh, _ct, _s) = scaled_decode(&bytes).unwrap();
-    let (bw, bh, _bct, _b) = box_ref(&bytes).unwrap();
-    assert_eq!(sw, bw, "B1 网格同构：宽");
-    assert_eq!(sh, bh, "B1 网格同构：高");
-    println!("B1 grid 420-q100-12mp scaled={sw}×{sh} == box（顶左对齐）");
+    for den in [2u8, 4] {
+        let (sw, sh, _ct, _s) = scaled_decode(&bytes, den).unwrap();
+        let (bw, bh, _bct, _b) = box_ref(&bytes, den).unwrap();
+        assert_eq!(sw, bw, "B1 网格同构：宽 den={den}");
+        assert_eq!(sh, bh, "B1 网格同构：高 den={den}");
+        println!("B1 grid 420-q100-12mp den={den} scaled={sw}×{sh} == box（顶左对齐）");
+    }
 }
 
 /// 把 JPEG 的 SOF（SOF0 优先，落 `FF Cx` 段）宽高 patch 成 (w, h)：返回新字节。
@@ -343,21 +389,27 @@ fn den1_path_unpolluted_by_scaled() {
     let bytes = std::fs::read(&target).unwrap();
     // 先走一次 scaled（触发 scaled_den 分支），再全解 → 断言尺寸/输出健在（共享
     // init_cs_tail/参数未被污染；B3 全量由 jpeg_csharp_parity 兜底）。
-    if let Ok((sw, sh, ct, px)) = scaled_decode(&bytes) {
-        let (w, h, ct2, _px2) = full_decode(&bytes).unwrap();
-        assert_eq!(ct, ct2, "scaled/全解 color_type 应一致");
-        assert_eq!((sw, sh), (w.div_ceil(2), h.div_ceil(2)), "B1 缩放尺寸");
-        assert_eq!(px.len(), sw as usize * sh as usize * usize::from(ct.bytes_per_pixel()));
+    for den in [2u8, 4, 8] {
+        if let Ok((sw, sh, ct, px)) = scaled_decode(&bytes, den) {
+            let (w, h, ct2, _px2) = full_decode(&bytes).unwrap();
+            assert_eq!(ct, ct2, "scaled/全解 color_type 应一致");
+            assert_eq!(
+                (sw, sh),
+                (w.div_ceil(u32::from(den)), h.div_ceil(u32::from(den))),
+                "B1 缩放尺寸 den={den}"
+            );
+            assert_eq!(px.len(), sw as usize * sh as usize * usize::from(ct.bytes_per_pixel()));
+        }
     }
     println!("B3 den=1 与 scaled 共享路径未污染（全解尺寸/色型健在）");
 }
 
 /// 探针：语料时钟（release `#[ignore]`，同窗 A/B 用）：scaled 解码 vs box 参照全链毫秒。
 ///
-/// **口径**：`box_ref` = 全解 + **单线程** `box_downsample_2`（本测量器自有实现），
+/// **口径**：`box_ref` = 全解 + **单线程** `box_downsample_n`（本测量器自有实现），
 /// 不含生产的 `box_downsample_bgra_or_rgba_rayon` 并行降采样与 `to_rgba8` 展开——
-/// 故此处「scaled > box >4×」是**解码侧理想化上限**；生产端到端含 rayon 并行 box（全解
-/// RGBA→BGRA 中间态 + 并行降档），box 侧会更快、比值会**缩水到约 2-3×**。上报口径按
+/// 故此处「scaled vs 单线程 box」是**解码侧理想化上限**；生产端到端含 rayon 并行 box（全解
+/// RGBA→BGRA 中间态 + 并行降档），box 侧会更快、比值会**缩水**。上报口径按
 /// 「解码侧 scaled vs 单线程 box」标注，勿与其他端到端数字混用。
 #[test]
 #[ignore]
@@ -374,16 +426,15 @@ fn scaled_vs_box_wallclock() {
         return;
     }
     let bytes = std::fs::read(&target).unwrap();
-    let mut iter = 0u32;
     let mut best_scaled = f64::MAX;
     let mut best_box = f64::MAX;
     let iters = 3;
     for i in 0..iters {
         let t = Instant::now();
-        let _ = scaled_decode(&bytes).unwrap();
+        let _ = scaled_decode(&bytes, 2).unwrap();
         let ts = t.elapsed().as_secs_f64() * 1000.0;
         let t = Instant::now();
-        let _ = box_ref(&bytes).unwrap();
+        let _ = box_ref(&bytes, 2).unwrap();
         let tb = t.elapsed().as_secs_f64() * 1000.0;
         if i > 0 {
             best_scaled = best_scaled.min(ts);
@@ -392,12 +443,68 @@ fn scaled_vs_box_wallclock() {
             best_scaled = ts;
             best_box = tb;
         }
-        iter = i + 1;
         println!("SCALED_WALL iter{i}: scaled={ts:.1}ms box={tb:.1}ms");
     }
-    let _ = iter;
     println!(
         "SCALED_WALL best (warm, {iters} iters): scaled={best_scaled:.1}ms box={best_box:.1}ms"
     );
     assert!(best_scaled > 0.0, "不可达");
+}
+
+/// 探针（release `#[ignore]`）：大图（moe 50MP baseline / yande.re 48MP progressive）
+/// den=4/8 scaled 解码时钟 + 与 box 参照的 PSNR。本任务验收焦点：release den=4
+/// 50MP 应 <250ms（对照现全解 ~421ms）、debug <6.5s（对照现 ~10.4s）。
+///
+/// **口径**：box 参照 = 全解 + 单线程盒式（同 `scaled_vs_box_wallclock` 注释）。
+/// 仅在点名运行（`--ignored --nocapture`），跑的是各自语料普通档（非 kimg 专项）。
+#[test]
+#[ignore]
+fn big_image_scaled_wallclock_psnr() {
+    use std::time::Instant;
+    let dir = corpus_dir();
+    if !dir.is_dir() {
+        println!("SKIP: missing {}", dir.display());
+        return;
+    }
+    // (文件名, den)：moe 50MP baseline 420 的 den=4；yande.re 48MP progressive 的 den=4。
+    let targets: Vec<(&str, u8)> = vec![
+        ("moe 46577 duel_dolls tinkle.jpg", 4),
+        ("yande.re 226355 crease fixme loli lolita_fashion raw_scan tinkerbell tinkle.jpg", 4),
+        ("moe 46577 duel_dolls tinkle.jpg", 8),
+    ];
+    for (name, den) in &targets {
+        let p = dir.join(name);
+        if !p.is_file() {
+            println!("SKIP: missing {}", p.display());
+            continue;
+        }
+        let bytes = std::fs::read(&p).unwrap();
+        let t = Instant::now();
+        let (sw, sh, ct, s) = match scaled_decode(&bytes, *den) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("{name} den={den}: scaled 失败 {e}");
+                continue;
+            }
+        };
+        let ts = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        let (bw, bh, _bct, b) = match box_ref(&bytes, *den) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("{name} den={den}: box 参照失败 {e}");
+                continue;
+            }
+        };
+        let tb = t.elapsed().as_secs_f64() * 1000.0;
+        let p = psnr(&s, &b);
+        let ch = usize::from(ct.bytes_per_pixel());
+        let es = highfreq_energy(&s, sw, sh, ch);
+        let eb = highfreq_energy(&b, bw, bh, ch);
+        let ratio = if eb > 1e-9 { es / eb } else { 1.0 };
+        println!(
+            "BIG_SCALED {name}: den={den} {sw}×{sh} scaled={ts:.1}ms box={tb:.1}ms \
+             PSNR={p:.2}dB 高频能量比={ratio:.2}"
+        );
+    }
 }
