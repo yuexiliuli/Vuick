@@ -2653,9 +2653,7 @@ dependencies = [
  "anyhow",
  "base",
  "config",
- "editor",
  "gpui",
- "ime",
  "ratex-layout",
  "ratex-parser",
  "ratex-render",
@@ -2663,7 +2661,6 @@ dependencies = [
  "ropey",
  "rustc-hash",
  "serde_json",
- "syntax",
  "ui",
 ]
 
