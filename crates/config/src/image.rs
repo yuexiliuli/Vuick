@@ -45,6 +45,13 @@ pub const BYTE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// 同时进行的后台解码上限（含当前目标 + 预取；= 后台线程池逻辑核数上限，8 路并发把
 /// 预热窗口一次铺完；持续 CPU 由「缓存满即停预取」封顶，非无界）。
 pub const MAX_DECODE: usize = 8;
+/// **快速连续滚动**（[`FAST_SCROLL_THRESHOLD`] 已触发）时的解码并发闸：快滚用户逐张猛甩，
+/// 8 路并发把核长期打满（真机 avg 46%/max 83%）且大量预取图根本没被看——快滚态把并发
+/// 收敛到本值（默认 2 ≈ 2 核），并把前向预取窗口整体收进 2 并发闸内。
+/// 权衡：并发越低 CPU 越低、向前预热越慢；「停住后的追尾」反而更短——并发小则排队短，
+/// chase-latest 保证停住即解最新目标。[`HEAVY_DECODE_MAX`]=1 仍独立封顶重型格式
+/// （取 min，不被本值顶破）；放大升档重解（`escalate_display_denom`）同样受本闸约束。
+pub const FAST_SCROLL_MAX_DECODE: usize = 2;
 /// **重型格式**（HEIF/HEIC）并发解码上限：HEIF 单张 debug 全解 2-17s（语料 12.6~50MP）、
 /// 全解 RGBA 48-200MB，8 路并发会把所有核长期打满致 GUI 卡死——重型格式在途数 ≥ 本值时
 /// HEIF 目标进 `pending_target` 等空位、预取直接放弃；JPEG/PNG/GIF 不受此限（仍走

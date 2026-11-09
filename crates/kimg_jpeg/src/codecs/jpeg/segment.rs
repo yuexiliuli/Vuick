@@ -512,6 +512,9 @@ pub(crate) struct Decoder<'a> {
     pub(crate) z_order: [usize; MAX_COMPONENTS],
     pub(crate) restart_interval: usize,
     pub(crate) todo: usize,
+    /// 展示降档分母（=Some(2) 时按 den=2 DCT 缩放解码，2026-11 新增；None = 全解）。
+    /// 仅解码级状态（不入 HeaderState）：`read_image_scaled` 在恢复头部后设置。
+    pub(crate) scaled_den: Option<u8>,
     pub(crate) headers_decoded: bool,
     pub(crate) seen_sof: bool,
     pub(crate) icc_data: Vec<ICCChunk>,
@@ -601,6 +604,7 @@ pub(crate) struct Decoder<'a> {
             z_order: [0; MAX_COMPONENTS],
             restart_interval: 0,
             todo: 0x7fff_ffff,
+            scaled_den: None,
             headers_decoded: false,
             seen_sof: false,
             icc_data: vec![],

@@ -239,7 +239,12 @@ impl<'a> Decoder<'a> {
             mcu_width = (self.width + 7) / 8;
             mcu_height = (self.height + 7) / 8;
         }
-        let width = self.width;
+        // scaled：输出宽按 `ceil(w/2)`（overread 128 清行 / post_process 都用它）。
+        let width = if self.scaled_den == Some(2) {
+            self.width.div_ceil(2)
+        } else {
+            self.width
+        };
 
         let mut stream = BitStream::new();
         let mut tmp = [0_i16; DCT_BLOCK];
@@ -262,6 +267,14 @@ impl<'a> Decoder<'a> {
         // 全部分量都在首个 scan 内 → 可直接逐 MCU 后处理；
         // 否则需先缓冲全部分量到 `progressive_mcus`（u8 采样字节平面）。
         let all_components_in_first_scan = usize::from(self.num_scans) == self.components.len();
+        // v1 scaled（den=2）仅支持「首 scan 全分量」baseline：多 SOS（非交织多 scan）的
+        // `finish_baseline_decoding` 按全解几何拷环，scaled 环几何不同 → 返回 Unsupported，
+        // 由上层回退「全解+盒式」（零耦合，不降级）。
+        if self.scaled_den.is_some() && !all_components_in_first_scan {
+            return Err(DecodeError::Unsupported(
+                "JPEG den=2 缩放 v1 仅支持单 SOS baseline（多 scan 回退全解）".to_string(),
+            ));
+        }
         let mut progressive_mcus: [Vec<u8>; 4] = core::array::from_fn(|_| vec![]);
 
         if !all_components_in_first_scan {
@@ -634,39 +647,66 @@ impl<'a> Decoder<'a> {
                         if component_samples_needed {
                             let t_idct = self.stage.busy_timer();
                             if !skip_idct {
-                                // 目标字节平面：PROGRESSIVE 缓冲到 `progressive[k]`（整帧样本平面），
-                                // 否则写 cs 环当前 MCU 行半区（C# `IdctToRing` 同款偏移）。
-                                let (out, off, stride) = if PROGRESSIVE {
-                                    let off0 = mcu_height * snap_stride[k] * 8
-                                        * snap_vs[k]
-                                        + j * 8;
-                                    (
-                                        &mut progressive[k][..],
-                                        off0,
-                                        snap_stride[k],
-                                    )
+                                // den=2 缩放写环（独立新核 `cs::idct4x4`；不 PROGRESSIVE，v1 入口已拒）
+                                if self.scaled_den == Some(2) {
+                                    let stride = snap_stride[k] / 2;
+                                    let c2 = v_samp * 4;
+                                    let c3 = ((j * snap_hs[k]) + h_samp) * 4;
+                                    let ring_off =
+                                        ((mcu_height & 1) * snap_vs[k] * 4 + c2) * stride + c3;
+                                    // B 契约插桩：写环前界断言（scaled 环行宽 = snap_stride/2；块占
+                                    // 4 行 × 4 字节，末字节 = off+3*stride+4；+4*stride 会误报边块）
+                                    debug_assert!(
+                                        ring_off + 3 * stride + 4 <= component.cs_ring.len(),
+                                        "scaled ring 越界: block ({j},{v_samp},{h_samp}) off={ring_off} stride={stride} ring={}",
+                                        component.cs_ring.len()
+                                    );
+                                    if len <= 1 {
+                                        cs::idct4x4_dc_only(
+                                            tmp[0],
+                                            &mut component.cs_ring,
+                                            ring_off,
+                                            stride,
+                                        );
+                                    } else {
+                                        // 半带核：只吃左上 4×4 系数（熵仍消费全块位流，随熵路径不动）
+                                        cs::idct4x4(tmp, &mut component.cs_ring, ring_off, stride);
+                                    }
                                 } else {
-                                    let c2 = v_samp * 8;
-                                    let c3 = ((j * snap_hs[k]) + h_samp) * 8;
-                                    let ring_off = ((mcu_height & 1) * snap_vs[k] * 8 + c2)
-                                        * snap_stride[k]
-                                        + c3;
-                                    (
-                                        &mut component.cs_ring[..],
-                                        ring_off,
-                                        snap_stride[k],
-                                    )
-                                };
-                                if len <= 1 {
-                                    cs::idct8x8_dc_only(tmp[0], out, off, stride);
-                                } else if sparse {
-                                    // S1：熵每块返回 len = zigzag 末位+1 → last=len-1，
-                                    // 按 MAX_ROW[MAX_COL][last] 4 态稀疏 IDCT（C# parity）。
-                                    cs::idct8x8_sparse(tmp, (len - 1) as usize, out, off, stride);
-                                } else {
-                                    // 门关（KIMG_JPEG_SPARSE_IDCT=0）：S1 之前的旧全量核，
-                                    // 与 HEAD `idct8x8` 路径逐字节一致（同二进制 A/B）。
-                                    cs::idct8x8(tmp, out, off, stride);
+                                    // 目标字节平面：PROGRESSIVE 缓冲到 `progressive[k]`（整帧样本平面），
+                                    // 否则写 cs 环当前 MCU 行半区（C# `IdctToRing` 同款偏移）。
+                                    let (out, off, stride) = if PROGRESSIVE {
+                                        let off0 = mcu_height * snap_stride[k] * 8
+                                            * snap_vs[k]
+                                            + j * 8;
+                                        (
+                                            &mut progressive[k][..],
+                                            off0,
+                                            snap_stride[k],
+                                        )
+                                    } else {
+                                        let c2 = v_samp * 8;
+                                        let c3 = ((j * snap_hs[k]) + h_samp) * 8;
+                                        let ring_off = ((mcu_height & 1) * snap_vs[k] * 8 + c2)
+                                            * snap_stride[k]
+                                            + c3;
+                                        (
+                                            &mut component.cs_ring[..],
+                                            ring_off,
+                                            snap_stride[k],
+                                        )
+                                    };
+                                    if len <= 1 {
+                                        cs::idct8x8_dc_only(tmp[0], out, off, stride);
+                                    } else if sparse {
+                                        // S1：熵每块返回 len = zigzag 末位+1 → last=len-1，
+                                        // 按 MAX_ROW[MAX_COL][last] 4 态稀疏 IDCT（C# parity）。
+                                        cs::idct8x8_sparse(tmp, (len - 1) as usize, out, off, stride);
+                                    } else {
+                                        // 门关（KIMG_JPEG_SPARSE_IDCT=0）：S1 之前的旧全量核，
+                                        // 与 HEAD `idct8x8` 路径逐字节一致（同二进制 A/B）。
+                                        cs::idct8x8(tmp, out, off, stride);
+                                    }
                                 }
                             }
                             self.stage.busy_stop(Stage::Idct, t_idct);
@@ -874,6 +914,15 @@ impl<'a> Decoder<'a> {
         let v_max = self.v_max;
         let width = self.width;
         let height = self.height;
+        // den=2 DCT 缩放（`read_image_scaled`）：输出/环几何整体按 `ceil(w/2)×ceil(h/2)`
+        // 落到「每 8×8 块 → 4×4 样本」的紧凑环（seed = 块/列 采样宽度减半、每块带 4 行）。
+        // 采样比（`cs_hs/cs_vs`）、`R_HV2` 核形状与 `cs_ystep` ¾/¼ 相位逻辑原样保留——
+        // 只显式把列数/行数减半，示意"复用现有上采样核、仅列数减半"。色度 4:2:0 采样比
+        // 在 scaled 下不变（Y/色度块同比例缩，比例关系不随 den 变）。
+        let scaled = self.scaled_den == Some(2);
+        let out_w = if scaled { width.div_ceil(2) } else { width };
+        let out_h = if scaled { height.div_ceil(2) } else { height };
+        let rows_per_block = if scaled { 4 } else { 8 };
 
         // 各分量 Hs/Vs 先算好，避免逐分量的可变借用贴着 h_max 读取。
         let ratios: Vec<(usize, usize)> = self
@@ -892,10 +941,12 @@ impl<'a> Decoder<'a> {
                 (2, 2) => cs::R_HV2,
                 _ => cs::R_GENERIC,
             };
-            comp.cs_w2 = comp.width_stride;
-            comp.cs_wlores = width.div_ceil(hs);
-            comp.cs_ys_scaled = (height * comp.vertical_sample + v_max - 1) / v_max;
-            comp.cs_rows_mcu = comp.vertical_sample * 8;
+            // scaled：环行宽减半（每 8×8 块只写 4 个连续样本列）；width_stride 恒为
+            // `horizontal_sample * mcu_x * 8`（8 的倍数）→ 减半为 4 的倍数，无舍入。
+            comp.cs_w2 = if scaled { comp.width_stride / 2 } else { comp.width_stride };
+            comp.cs_wlores = out_w.div_ceil(hs);
+            comp.cs_ys_scaled = (out_h * comp.vertical_sample).div_ceil(v_max);
+            comp.cs_rows_mcu = comp.vertical_sample * rows_per_block;
             comp.cs_ring_rows = 2 * comp.cs_rows_mcu;
             let n_out = cs::output_count(comp.cs_resample_kind, comp.cs_wlores, hs) + 3;
             comp.cs_line_buf8 = vec![0u8; n_out];
@@ -936,8 +987,13 @@ impl<'a> Decoder<'a> {
         let out_bpp = self.out_colorspace.num_components();
         let chroma16 = self.cs_chroma16;
         let input_kind = self.cs_input_kind;
+        // scaled：`width` 参数已是 `ceil(w/2)`（baseline 驱动处折算），只再限输出行数
         let out_x = width;
-        let height = self.height;
+        let height = if self.scaled_den == Some(2) {
+            self.height.div_ceil(2)
+        } else {
+            self.height
+        };
         let out_bytes = out_x * out_bpp;
 
         while self.cs_out_row < height {

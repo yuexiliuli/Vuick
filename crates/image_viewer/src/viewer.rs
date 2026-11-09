@@ -16,7 +16,8 @@
 //! - **多核并行解码池**：同时最多 [`MAX_DECODE`] 张在解（当前目标 + 预取并发，预取封顶
 //!   `MAX_DECODE-1` 预留 1 槽给冷目标秒占）；并发满时只记忆「最新显示目标」
 //!   （[`Self::pending_target`]），空位一放立刻追最新——快速连滚既不吃满 4 核内部竞争，
-//!   又不会每一滚都从头解码；
+//!   又不会每一滚都从头解码；**快滚节流**：连续快速滚动（`scroll_fast`）时有效并发收敛到
+//!   [`FAST_SCROLL_MAX_DECODE`]=2，避免 8 路并发把核打满（CPU 降、追尾更短）；
 //! - **磁盘→RAM 字节预读**：文件**压缩字节** `fs::read` 进 LRU 字节缓存，与解码分离——
 //!   解码从内存字节开始，不再等磁盘 IO；重解码/回看不重读盘；
 //! - **解码结果 LRU 缓存**（张数 + 字节双上限）：命中即 O(1) 瞬时上屏。
@@ -30,7 +31,8 @@
 //! - **PNG 同款降档**：PNG 走 `kimg::codecs::png::PngDecoder` 全量解出 RGBA8（palette/
 //!   灰度/16bit 展开归一）后按同一选档规则**盒式降采样**到展示档（rayon 行组并行，小图
 //!   退串行）——缓存/GPU 上传像素数按 den² 缩小，放大升档链路与 JPEG 对齐。
-//! - **内存/CPU 有界**：解码并发照旧 [`MAX_DECODE`]-1 预取封顶，且 [`Self::pump_prefetch`]
+//! - **内存/CPU 有界**：解码并发 `[Self::max_decode]`-1 预取封顶（快速滚动再收窄到
+//!   [`FAST_SCROLL_MAX_DECODE`]），且 [`Self::pump_prefetch`]
 //!   在解码缓存达到字节预算后**停止派发**（[`CACHE_MAX_BYTES`]）——不再把整个文件夹扫一遍
 //!   白算 CPU（此前 106 张全解 ≈ 8GB 像素量磨 8 核）。缓存能装 ~9 张显示档 → 滚动基本全命中。
 //! - **放大升档**：Ctrl+滚轮使 `display_need` 变大 → [`Self::escalate_display_denom`] 按需
@@ -274,7 +276,8 @@ pub struct ImageViewer {
     /// 停下歇着，避免空闲时把整个文件夹循环解个没完（LRU 也会淘汰，白费 CPU）。
     prefetch_origin: i64,
     /// 当前「预取」解码在途数（区别于显示目标解码）：用于预留解码槽——预取封顶
-    /// [`MAX_DECODE`]-1，保证冷目标能立刻占到一个槽、不用排在预取队尾等。
+    /// `[Self::max_decode]`-1（快速滚动节流到 [`config::image::FAST_SCROLL_MAX_DECODE`]-1），
+    /// 保证冷目标能立刻占到一个槽、不用排在预取队尾等。
     prefetch_inflight: usize,
     /// 快速连续滚动标志（B4）：连续滚准确认后临时放宽前向窗口、舍弃反向窗口。
     scroll_fast: bool,
@@ -687,13 +690,18 @@ fn pick_jpeg_denom(iw: u32, ih: u32, need: (f32, f32)) -> u8 {
     1
 }
 
-/// JPEG 按展示需要**降档解码**（自研 `kimg` 全量解出 RGBA8 → 与 PNG 同款盒式降采样到
-/// 展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。先用 kimg 解码拿完整尺寸再选档，
+/// JPEG 按展示需要**降档解码**：den=2 优先走自研 `kimg` 的 **DCT 半带缩放**新路径
+/// （[`try_decode_jpeg_scaled`]：熵→4×4 半带 IDCT 直出 `ceil/2` 尺寸，消掉「全解 12MP 再
+/// 盒式降采样」的 48MB 中间态）；任何失败/不支持 → 无缝回退「全解 RGBA8 + 盒式降采样」
+/// 旧路径（与改动前逐像素一致，零状态泄漏）。返回 BGRA 字节 + 输出尺寸 + 实际降档分母。
 /// 失败返回 `Err`（由上层回退 `image` 全解），绝不 panic/硬失败。
 fn decode_jpeg_display(
     bytes: &[u8],
     need: (f32, f32),
 ) -> Result<(Vec<u8>, u32, u32, u8), String> {
+    if let Some(out) = try_decode_jpeg_scaled(bytes, need) {
+        return Ok(out);
+    }
     let img = kimg::load_from_memory(bytes).map_err(|e| format!("JPEG 解码失败：{e}"))?;
     let (iw, ih) = img.dimensions();
     let den = pick_jpeg_denom(iw, ih, need);
@@ -706,6 +714,49 @@ fn decode_jpeg_display(
     let (mut bgra, w, h) = box_downsample_bgra_or_rgba_rayon(rgba.as_raw(), iw, ih, den);
     swap_rb_in_place(bgra.as_mut());
     Ok((bgra, w, h, den))
+}
+
+/// JPEG den=2 缩放输出分配硬上界（≤ `kimg::Limits::default()` 的 `max_alloc` = 512MiB）
+/// ——不可信头尺寸不得触发超出预算的单次分配（K124；见 [`try_decode_jpeg_scaled`]）。
+const JPEG_SCALED_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// JPEG den=2 **DCT 半带缩放**直解尝试：成功返回 `(BGRA, w, h, 2)`（与 box 网格同构
+/// `ceil(iw/2)×ceil(ih/2)`，顶左对齐）；任何失败/不支持/非 den=2/超分配预算 → `None`，
+/// 由 [`decode_jpeg_display`] 无缝回退「全解+盒式」。门控（`KIMG_JPEG_SCALED`）整收在
+/// `kimg_jpeg::JpegDecoder::read_image_scaled` 内（progressive/den≠2 → Unsupported），
+/// 本入口零耦合：Err → None → 旧路径。
+fn try_decode_jpeg_scaled(bytes: &[u8], need: (f32, f32)) -> Option<(Vec<u8>, u32, u32, u8)> {
+    // K124：先应用默认 Limits（max_alloc=512MiB，宽高无默认上限）再取尺寸——对齐 PNG
+    // display 路径惯例（viewer.rs 内 decode_png_display 同款 `set_limits(Limits::default())`）。
+    // `JpegDecoder::from_bytes` 默认 `no_limits()`，若不先套 limits，不可信 SOF 尺寸可驱动
+    // 下方 `vec![0; n]` 做出 GB 级分配。
+    let mut dec = kimg::codecs::jpeg::JpegDecoder::from_bytes(bytes).ok()?;
+    dec.set_limits(kimg::Limits::default()).ok()?;
+    let (iw, ih) = dec.dimensions();
+    // v1 只做 den=2：den=1/4/8 → 走旧路径（不降级）。选档与 [`pick_jpeg_denom`] 同口径。
+    if pick_jpeg_denom(iw, ih, need) != 2 {
+        return None;
+    }
+    let color = dec.color_type();
+    let (sw, sh) = dec.scaled_dimensions(2)?;
+    let ch = u64::from(color.bytes_per_pixel());
+    // 分配前硬上界（K124）：`ceil(iw/2)×ceil(ih/2)×bpp` 须 ≤ 512MiB；超限不分配、回退
+    // 全解兜底（全解路径在 limits 内正确拒绝炸弹头）。`checked` 乘法防中间溢出（16-bit
+    // SOF 极端 65535×65535 亦被本界拦下：scaled 32768×32768×3 ≈ 3.0GB > 512MiB）。
+    let n = u64::from(sw).checked_mul(u64::from(sh))?.checked_mul(ch)?;
+    if n > JPEG_SCALED_MAX_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; n as usize];
+    dec.read_image_scaled(2, &mut buf).ok()?;
+    // 展开到 RGBA 4 通道（与 box 旧路径 `to_rgba8` 同形），再 swap → BGRA。
+    let mut rgba = if color == kimg::ColorType::Rgba8 {
+        buf
+    } else {
+        expand_png_to_rgba8(&buf, sw, sh, color)?
+    };
+    swap_rb_in_place(rgba.as_mut());
+    Some((rgba, sw, sh, 2))
 }
 
 /// 盒式降采样并行阈值（输入像素数）：低于则用单线程，避免 rayon 线程池分摊/派发开销
@@ -2354,6 +2405,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// K124 安全反例：SOF 声明 16-bit 上限 65535×65535 的小文件——`try_decode_jpeg_scaled`
+    /// 必须在**分配前**因「scaled 输出 > 512MiB 硬上界」返回 `None`，不得做 GB 级分配
+    /// （受 `JPEG_SCALED_MAX_BYTES` 拦下；`set_limits(default)` 使 codec 侧
+    /// `read_image_scaled` 的 `max_alloc` reserve 同口径生效）。
+    #[test]
+    fn try_decode_jpeg_scaled_rejects_huge_header_without_alloc() {
+        // 本模块最小 baseline JPEG 编码器产 64×64，再把 SOF0 宽高 patch 成 65535×65535
+        let mut jpeg = encode_baseline_jpeg(&[0u8; 64 * 64 * 3], 64, 64);
+        patch_jpeg_sof_dims(&mut jpeg, 65535, 65535).expect("自产 JPEG 应含 SOF0 可 patch");
+        // 视口 (30000,30000) → pick_jpeg_denom 落 den=2（65535 宽 → scaled 32768 ≥ need）
+        let mut dec = kimg::codecs::jpeg::JpegDecoder::from_bytes(&jpeg).expect("头解析应成功");
+        assert_eq!(dec.dimensions(), (65535, 65535), "patch 后声明 65535×65535");
+        assert_eq!(
+            dec.scaled_dimensions(2),
+            Some((65535u32.div_ceil(2), 65535u32.div_ceil(2)))
+        );
+        // 3.0GB > 512MiB → 分配前拒绝（None → 上层走全解兜底）
+        assert!(
+            try_decode_jpeg_scaled(&jpeg, (30000.0, 30000.0)).is_none(),
+            "超大 SOF 必须在分配前拒绝"
+        );
+    }
+
+    /// 定位 JPEG SOF0（`FF C0`）并原地 patch 高/宽（段布局 `FF C0 <len:2> <prec:1> <h:2> <w:2>`）。
+    fn patch_jpeg_sof_dims(bytes: &mut Vec<u8>, w: u16, h: u16) -> Option<()> {
+        for i in 0..bytes.len().saturating_sub(8) {
+            if bytes[i] == 0xFF && bytes[i + 1] == 0xC0 {
+                bytes[i + 5..i + 7].copy_from_slice(&h.to_be_bytes());
+                bytes[i + 7..i + 9].copy_from_slice(&w.to_be_bytes());
+                return Some(());
+            }
+        }
+        None
+    }
+
     #[test]
     fn clamp_pan_covers_viewport_and_stays_centered_when_unzoomed() {
         let cp = ImageViewer::clamp_pan;
@@ -2843,6 +2929,25 @@ mod tests {
         }
     }
 
+    /// 反复泵到后台解码/字节预读**全部落定**（在途集合清空）：后台解码在真实线程池上跑，
+    /// `run_until_parked` 只处理已排队的完成回调、不等待其真实完成——本循环持续泵到
+    /// `in_flight`/`byte_flight` 清空，把异步余量收敛为确定性状态（R2 快滚闸确定性断言用）。
+    fn wait_idle(cx: &mut TestAppContext, viewer: &gpui::Entity<ImageViewer>) {
+        let mut guard = 0;
+        loop {
+            cx.run_until_parked();
+            let idle = cx.update(|app| {
+                let v = viewer.read(app);
+                v.in_flight.is_empty() && v.byte_flight.is_empty()
+            });
+            if idle {
+                return;
+            }
+            guard += 1;
+            assert!(guard < 20000, "等待后台解码/字节预读落定超时");
+        }
+    }
+
     /// 等到「当前显示目标已就绪」（loading==false 且已非首帧）：缓存命中时首次刻就绪
     /// （≈0）；缓存未中时轮询执行器直到后台解码落盘。带安全上限防死循环。
     fn wait_until_ready(cx: &mut TestAppContext, viewer: &gpui::Entity<ImageViewer>) {
@@ -3024,6 +3129,294 @@ mod tests {
             avg_paint < 50.0,
             "暖切换→首帧应远小于 50ms：{avg_paint}ms"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B 战役锚表母线：corpus 真实目录「快速连续切换 30 格」压力——模拟用户快速甩滚轮
+    /// 逐张切图。语义：等首图就绪 + 排空预取后，**先进入快速模式**（连续快滚到
+    /// [`config::image::FAST_SCROLL_THRESHOLD`] 并排空「进模式」首 1-2 格尚未触发节流时的
+    /// 预取洪泛），再**批量提交** 30 次 `switch(1)`（事件洪峰，与 `bench_switch_pipeline`
+    /// B4 段落同款姿势；注意 headless 测试里 `run_until_parked` 会连后台解码一起排空，若
+    /// 逐格泵会退化成「每格等一张解完」——故用批量提交建模洪峰）：
+    /// ① 30 次提交总墙钟（事件到达成本；测试执行器内同步微秒级，主要看追尾）；
+    /// ② 提交完 → 最终目标就绪的**追尾延迟**（用户感知「滚到头才出图」）；
+    /// ③ 「解码派发 N」——进入段 flush 已把前向窗口预取进缓存，批量 30 格目标基本暖命中，
+    ///    该计数实为「缓存未中（窗口外）尾数」而非解码池利用率；对 `in_flight` 集合逐采样
+    ///    取并集（既有字段、零生产改动；快解码可能在采样间隙完成而低估）；
+    /// ④ 在途/预取/缓存字节峰值（解码队列堆积的定性观察）；
+    /// ⑤ 反向回退 5 格（落出快速前向窗口回看，LRU 淘汰后回看成本）每格 ready 延迟。
+    /// 目录用 `IMG_SWITCH_DIR` env（真实 corpus）；未设则生成 40 张渐变 PNG 兜底。
+    /// `--ignored --nocapture` 运行。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_switch_rapid_corpus(cx: &mut TestAppContext) {
+        use std::collections::HashSet;
+        use std::time::Instant;
+        const RAPID: usize = 30;
+        // 快滚节流闸上限（bench 内复引用，便于断言与打印）
+        const MAX_FAST: usize = config::image::FAST_SCROLL_MAX_DECODE;
+
+        // 目录：env `IMG_SWITCH_DIR`（corpus 真目录）→ 未设时生成渐变 PNG 兜底
+        let (dir, generated) = match std::env::var("IMG_SWITCH_DIR").ok() {
+            Some(d) => (PathBuf::from(d), false),
+            None => {
+                let d = tmp_dir("rapid");
+                for i in 0..40u32 {
+                    write_pattern_png(&d.join(format!("{:02}.png", i)), 1200, 900);
+                }
+                (d, true)
+            }
+        };
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取目录失败 {}: {e}", dir.display()))
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| crate::is_image_extension(p))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "目录内无图片可测：{}", dir.display());
+        assert!(
+            files.len() >= RAPID + 6,
+            "样本不足（需 ≥{}+6 张才能跑 30 格+回退 5）：{}",
+            RAPID,
+            files.len()
+        );
+        let first = files[0].clone();
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(first, cx)));
+        // 首图就绪（含后台文件夹扫描 + 首图解码）→ 排空预取链（窗口铺满，模拟停留后甩滚轮）
+        wait_until_ready(cx, &viewer);
+        flush(cx);
+        let (cache0, bytes0, nav0, byte_b0) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.cache.len(), v.cache.bytes(), v.nav.len(), v.byte_cache.bytes())
+        });
+        assert!(nav0 > 1, "文件夹扫描应建立兄弟清单：nav.len()={nav0}");
+
+        // 事件洪峰：批量提交 30 次 switch(1)，中间不泵（后台解码在真实线程池并行跑，完成回调
+        // 排队到前台；快滚节流下并发满 2 即进 pending_target 追最新）
+        let mut dispatched: HashSet<PathBuf> = HashSet::new();
+        let mut peak_inflight = 0usize;
+        let mut peak_prefetch = 0usize;
+        let mut peak_cache = cache0;
+        let mut peak_cache_bytes = bytes0;
+        let mut peak_byte_cache_bytes = byte_b0;
+
+        // 先进入快速模式并排空「进模式」的首 1-2 格（scroll_fast 尚未触发时的 8 路预取洪泛）
+        // ——真实用户「停留→甩滚轮」同样先沉淀再快滚，本段只建模进入稳态、不计入洪峰测量
+        for _ in 0..config::image::FAST_SCROLL_THRESHOLD + 1 {
+            cx.update(|app| viewer.update(app, |v, cx| v.switch(1, cx)));
+        }
+        flush(cx);
+        let fast_armed = cx.update(|app| viewer.read(app).scroll_fast);
+        assert!(fast_armed, "连续快滚应已进入快速模式（scroll_fast）");
+
+        let t0 = Instant::now();
+        for _ in 0..RAPID {
+            cx.update(|app| viewer.update(app, |v, cx| v.switch(1, cx)));
+        }
+        let submit_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // 洪峰刚落：首批并发派发同步可见（追最新目标在 pending_target 等空位）
+        cx.update(|app| {
+            let v = viewer.read(app);
+            for p in &v.in_flight {
+                dispatched.insert(p.clone());
+            }
+            peak_inflight = peak_inflight.max(v.in_flight.len());
+            peak_prefetch = peak_prefetch.max(v.prefetch_inflight);
+        });
+
+        // 追尾：提交流回 → 泵到最终目标就绪，采样续派发解码与队列峰值
+        let t1 = Instant::now();
+        let mut guard = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                for p in &v.in_flight {
+                    dispatched.insert(p.clone());
+                }
+                peak_inflight = peak_inflight.max(v.in_flight.len());
+                peak_prefetch = peak_prefetch.max(v.prefetch_inflight);
+                peak_cache = peak_cache.max(v.cache.len());
+                peak_cache_bytes = peak_cache_bytes.max(v.cache.bytes());
+                peak_byte_cache_bytes = peak_byte_cache_bytes.max(v.byte_cache.bytes());
+                v.is_loaded()
+            });
+            if ready {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 2000, "等待快速切换目标就绪超时");
+        }
+        let tail_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        flush(cx); // 排空残余预取再读终态
+        // 快滚节流：本段 30 格洪峰全程处于快速模式（scroll_fast 已在进入段置位），在途并发
+        // 峰值必须收敛到 FAST_SCROLL_MAX_DECODE（动态上限按构造成立，断言防回归）
+        assert!(
+            peak_inflight <= MAX_FAST,
+            "快滚节流下在途并发峰值应 ≤ FAST_SCROLL_MAX_DECODE={MAX_FAST}，实为 {peak_inflight}"
+        );
+        let (cache1, bytes1, scroll_fast, idx_now) = cx.update(|app| {
+            let v = viewer.read(app);
+            (
+                v.cache.len(),
+                v.cache.bytes(),
+                v.scroll_fast,
+                v.nav.current(),
+            )
+        });
+
+        // 反向回退 5 格：每格等 ready（第 5 格通常落出快速前向窗口 → 真实重解码成本）
+        let mut backs: Vec<f64> = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            cx.update(|app| viewer.update(app, |v, cx| v.switch(-1, cx)));
+            wait_until_ready(cx, &viewer);
+            backs.push(t.elapsed().as_secs_f64() * 1000.0);
+            flush(cx);
+        }
+
+        eprintln!(
+            "\n[IMG-BENCH] rapid-switch: dir={} ({:>3} 张) 批量 {RAPID} 格提交 {:7.2}ms · 追尾(最后目标就绪) {:7.1}ms · 解码派发 {} 个 · 在途峰值 {} (快滚闸≤{MAX_FAST}) / 预取峰值 {} · 缓存 {}→{} 条目 {:>6.0}MB→{:>6.0}MB · 字节缓存峰值 {:>6.0}MB · 滚动后下标 {idx_now} scroll_fast={scroll_fast} · 回退5格 ready {:?}ms",
+            dir.display(),
+            files.len(),
+            submit_ms,
+            tail_ms,
+            dispatched.len(),
+            peak_inflight,
+            peak_prefetch,
+            cache0,
+            cache1,
+            bytes0 as f64 / 1048576.0,
+            bytes1 as f64 / 1048576.0,
+            peak_byte_cache_bytes as f64 / 1048576.0,
+            backs
+        );
+        eprintln!(
+            "[IMG-BENCH] rapid-switch detail: 快滚节流（scroll_fast）在途并发峰值 ≤FAST_SCROLL_MAX_DECODE={MAX_FAST}; 解码派发 {} 个（去重路径，含追最新重解）; 追尾段=目标未命中→pending/重解→落盘; 回退 5 格延迟 min {:6.2}ms / max {:6.2}ms（第 5 格 {:6.2}ms 通常已落出快速前向窗口）",
+            dispatched.len(),
+            backs.iter().cloned().fold(f64::MAX, f64::min),
+            backs.iter().cloned().fold(f64::MIN, f64::max),
+            backs.last().copied().unwrap_or(0.0)
+        );
+        if generated {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// R2 快滚节流闸 · 确定性单测：快速模式下解码并发必须收敛到
+    /// [`config::image::FAST_SCROLL_MAX_DECODE`]，且并发满后最新目标不被丢（chase-latest
+    /// 生效）。三个点检，均不依赖后台完成时序：
+    /// ①（端到端）进入快速模式后连续快速切图：在途并发 ≤ 上限，且末位目标不丢（已记
+    ///    pending / 已追入在途 / 已装屏）；pump 后最新目标被追上并上屏（红于 chase-latest
+    ///    失效：满时不再记 pending / drain 不再放出 / 追不上目标）。
+    /// ②（确定性满池门控，红于 `max_decode` 被改坏）人为把在途填到上限，直接 `queue_decode`
+    ///    冷目标 → 不得再派生（记 pending），在途保持 = 上限；`max_decode()` 不再收敛回
+    ///    [`config::image::FAST_SCROLL_MAX_DECODE`] 时满池判定用错上限 → 继续派生 → 红。
+    #[gpui::test]
+    async fn fast_scroll_throttles_inflight_and_chases_latest(cx: &mut TestAppContext) {
+        let dir = tmp_dir("fast_throttle");
+        let n = 40u32;
+        for i in 0..n {
+            write_pattern_png(&dir.join(format!("{:02}.png", i)), 1200, 900);
+        }
+        let first = dir.join("00.png");
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(first, cx)));
+        wait_until_ready(cx, &viewer);
+        wait_idle(cx, &viewer); // 开窗预取全落定：确定性起点（in_flight=0、窗口暖缓存）
+        // 进入快速模式（连续快滚到阈值）并落定（进模式只派发少量预取，全部收敛为 0 在途）
+        for _ in 0..config::image::FAST_SCROLL_THRESHOLD + 1 {
+            cx.update(|app| viewer.update(app, |v, cx| v.switch(1, cx)));
+        }
+        wait_idle(cx, &viewer);
+        let fast = cx.update(|app| viewer.read(app).scroll_fast);
+        assert!(fast, "连续快滚应已触发快速模式（scroll_fast）");
+
+        // 无 pump 批量快速切图（连续同向 → scroll_fast 全程保持、不触发迟滞衰减）：目标逐格
+        // 前进，末位目标（3+STEPS=29，n=40）稳落出缓存窗口（冷）→ 在途只受快滚闸约束
+        // （满则记 pending 追最新）。同步 switch 之间不显式泵，但本执行器也会处理已排队的
+        // 后台完成回调，故不依赖「零在途完成」时序假设。
+        const STEPS: usize = 26;
+        for _ in 0..STEPS {
+            cx.update(|app| viewer.update(app, |v, cx| v.switch(1, cx)));
+        }
+        // 点检 1：在途并发 ≤ 快滚闸（派生受 `max_decode()` 门控 → 按构造成立；改坏上限即红）。
+        // 注：chase-latest 的「满时记 pending」可能已被 drain 提前把最新追入在途/装屏（本测试
+        // 执行器在同步 switch 之间也会处理后台完成回调），故点检 2 判据为「最新目标不丢」：
+        // 已在 pending / 已追入在途 / 已装屏（install）三者之一即算覆盖。
+        let (inflight, latest_covered, latest_path) = cx.update(|app| {
+            let v = viewer.read(app);
+            let latest = v
+                .nav
+                .item(v.nav.current())
+                .expect("switch 目标恒在清单内");
+            (
+                v.in_flight.len(),
+                v.pending_target.as_deref() == Some(latest.as_path())
+                    || v.in_flight.contains(&latest)
+                    || v.path == latest,
+                latest,
+            )
+        });
+        assert!(
+            inflight <= config::image::FAST_SCROLL_MAX_DECODE,
+            "快滚节流闸：快速切图在途并发应 ≤ FAST_SCROLL_MAX_DECODE={}，实为 {inflight}",
+            config::image::FAST_SCROLL_MAX_DECODE
+        );
+        assert!(
+            latest_covered,
+            "快滚并发满时最新目标不得丢失：应已记 pending_target / 已追入在途 / 已装屏（chase-latest）"
+        );
+
+        // 点检 2：pump → chase-latest 追上最新目标并上屏（追尾兜底：丢目标则 wait 超时红）
+        wait_until_ready(cx, &viewer);
+        let (loaded, installed) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.is_loaded(), v.path.clone())
+        });
+        assert!(loaded, "pump 后最新目标应就绪（chase-latest 生效）");
+        assert_eq!(
+            installed.file_name(),
+            latest_path.file_name(),
+            "应安装最新目标 {latest_path:?}，实为 {installed:?}"
+        );
+
+        // 点检 3（确定性「满并发」门控，红于 max_decode 被改坏）：人为把解码池填到
+        // FAST_SCROLL_MAX_DECODE 个在途（远端未解码路径），直接 queue_decode 冷目标 →
+        // 不再派生（满则记 pending_target 追最新），in_flight 保持 = FAST_SCROLL_MAX_DECODE
+        // 不增长。「fast 态不再收敛」（max_decode 恒回 MAX_DECODE）时满池判定用错上限 →
+        // 新目标被继续派生 → 断言红。不用 switch（无导航/迟滞副作用），target 为不存在的
+        // 远端路径（若错了被派生也只走失败分支，不会入缓存/上屏）。
+        let gate_target = dir.join("__gate__0.png");
+        let gate_d1 = dir.join("__gate__1.png");
+        let gate_d2 = dir.join("__gate__2.png");
+        cx.update(|app| {
+            viewer.update(app, |v, _| {
+                v.in_flight.insert(gate_d1);
+                v.in_flight.insert(gate_d2);
+            })
+        });
+        cx.update(|app| viewer.update(app, |v, cx| v.queue_decode(gate_target.clone(), true, cx)));
+        let (gate_inflight, gate_pending) = cx.update(|app| {
+            let v = viewer.read(app);
+            (
+                v.in_flight.len(),
+                v.pending_target == Some(gate_target.clone()),
+            )
+        });
+        assert_eq!(
+            gate_inflight,
+            config::image::FAST_SCROLL_MAX_DECODE,
+            "快滚满并发时不得再派生新解码：in_flight 应为 {}，实为 {gate_inflight}（max_decode 被改坏？）",
+            config::image::FAST_SCROLL_MAX_DECODE
+        );
+        assert!(
+            gate_pending,
+            "快滚满并发时新目标应记入 pending_target（chase-latest）"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

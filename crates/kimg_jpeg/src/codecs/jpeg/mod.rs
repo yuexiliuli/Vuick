@@ -208,6 +208,96 @@ impl<'a> ImageDecoder for JpegDecoder<'a> {
     }
 }
 
+impl<'a> JpegDecoder<'a> {
+    /// 按展示降档分母 **DCT 缩放** 解码（v1 仅 `den=2`：半带抗混叠截断，libjpeg
+    /// `jpeg_idct_4x4` 模型，见 `cs::idct4x4`）。输出 = 与 box 网格同构的
+    /// `ceil(w/2)×ceil(h/2)` 自然 color_type 字节（走与全解同款 `pack_output_row`
+    /// 契约；缩后后处理单线程）。输出尺寸/B1 契约由 [`Self::scaled_dimensions`] 与
+    /// [`Self::read_image_scaled`] 一致口径给出。
+    ///
+    /// 失败语义（上层照既有「Err→全解兜底」零耦合回退）：
+    /// - `den ∉ {2}` → `Unsupported`（v1 只做 den=2；den=4/8 返回 Unsupported → 上层全解兜底，不降级）；
+    /// - `KIMG_JPEG_SCALED=0|false|off` → `Unsupported`（env 门控整收在本入口内，K93 快道+基线）；
+    /// - progressive / 多 SOS baseline（非首 scan 全分量）→ `Unsupported`；
+    ///   - 其余解码错误按常规 `ImageResult` 上报。
+    pub fn read_image_scaled(mut self, den: u8, buf: &mut [u8]) -> ImageResult<()> {
+        if !jpeg_scaled_enabled() {
+            return Err(unsupported_jpeg_scaled("KIMG_JPEG_SCALED 关闭（回退全解+盒式）"));
+        }
+        // 入口第一行校验 den∈{2}（v1 仅 2；4/8 → Unsupported，不降级）
+        if den != 2 {
+            return Err(unsupported_jpeg_scaled(&format!(
+                "JPEG DCT 缩放 v1 仅支持 den=2（收到 den={den}）"
+            )));
+        }
+        let (sw, sh) = scaled_dims(self.width, self.height);
+        let out_bpp = usize::from(self.color_type.bytes_per_pixel());
+        let advertised = (sw as usize)
+            .saturating_mul(sh as usize)
+            .saturating_mul(out_bpp);
+        if u64::try_from(buf.len()).ok() != Some(advertised as u64) {
+            return Err(ImageError::Decoding(DecodingError::new(
+                ImageFormat::Jpeg.into(),
+                format!(
+                    "Scaled length {} doesn't match predicted length {advertised} \
+                    (den=2: {sw}×{sh} × {out_bpp}B/px)",
+                    buf.len(),
+                ),
+            )));
+        }
+        // K124 真实护栏：缩放输出字节数须 ≤ `limits.max_alloc`。注意 `check_dimensions`
+        // 对 `Limits::default()` 的宽高域是 `None`（恒过）——仅作尺寸上限约束，**不足**为
+        // 分配护栏；故这里直接对 `max_alloc` 扣预算（缺省 `no_limits=None` 无约束，由调用方
+        // 如 image_viewer 先 `set_limits(Limits::default())` 使默认 512MiB 生效）。超限报
+        // `Limits` 错误，绝不先按不可信头尺寸分配（本入口不分配输出，由调用方按本长度预配）。
+        self.limits.reserve(advertised as u64)?;
+
+        let target_out = output_for_input(self.input_colorspace);
+        let mut dec = Decoder::new(&self.input);
+        let t_header = dec.stage.timer();
+        dec.restore_header_state(self.seed);
+        dec.stage.stop(Stage::Header, t_header);
+        if dec.is_progressive {
+            return Err(unsupported_jpeg_scaled("progressive JPEG den=2 缩放 v1 未实现"));
+        }
+        dec.scaled_den = Some(2);
+        decode_baseline(&mut dec, target_out, buf).map_err(from_kimg_jpeg)?;
+        dec.stage.print();
+        Ok(())
+    }
+
+    /// 缩放输出尺寸（与 box 网格精确同构：顶左对齐、`ceil(iw/2)×ceil(ih/2)`，B1）。
+    /// `den=2` 返回 `Some`；其它（v1 不支持）返回 `None`。
+    pub fn scaled_dimensions(&self, den: u8) -> Option<(u32, u32)> {
+        (den == 2).then(|| scaled_dims(self.width, self.height))
+    }
+}
+
+/// `ceil(w/2)×ceil(h/2)`（den=2 缩放 / box 网格同构尺寸，顶左对齐）。
+fn scaled_dims(w: u32, h: u32) -> (u32, u32) {
+    (w.div_ceil(2), h.div_ceil(2))
+}
+
+/// `KIMG_JPEG_SCALED=0|false|off` → 关闭 DCT 缩放（回退全解+盒式），缺省开。
+#[inline]
+fn jpeg_scaled_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("KIMG_JPEG_SCALED")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(true)
+    })
+}
+
+/// JPEG DCT 缩放不支持错误（`UnsupportedErrorKind::GenericFeature`；Display 含
+/// "does not support" → 上层/测试按 Unsupported 识别回退）。
+fn unsupported_jpeg_scaled(desc: &str) -> ImageError {
+    ImageError::Unsupported(UnsupportedError::from_format_and_kind(
+        ImageFormatHint::Exact(ImageFormat::Jpeg),
+        UnsupportedErrorKind::GenericFeature(desc.to_string()),
+    ))
+}
+
 /// 输入颜色空间 -> 解码输出 `ColorType`（与旧 wrapper 完全一致）。
 fn color_type_for(orig: &ColorSpace) -> ColorType {
     match orig {

@@ -12,8 +12,8 @@ use gpui::{Context, RenderImage};
 use kimg::Frame;
 
 use config::image::{
-    CACHE_MAX_BYTES, CACHE_MAX_ITEMS, HEAVY_DECODE_MAX, MAX_DECODE, PREFETCH_BACKWARD,
-    PREFETCH_FORWARD, PREFETCH_FORWARD_FAST,
+    CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_MAX_DECODE, HEAVY_DECODE_MAX, MAX_DECODE,
+    PREFETCH_BACKWARD, PREFETCH_FORWARD, PREFETCH_FORWARD_FAST,
 };
 
 use super::{
@@ -83,7 +83,21 @@ impl super::ImageViewer {
         cx.refresh_windows();
     }
 
-    /// 解码池入队：已在解 → 等其落盘追最新；已缓存 → 直接落盘；并发满（[`MAX_DECODE`]）
+    /// **快滚节流闸**：当前「有效解码并发上限」——快速连续滚动（`scroll_fast`）时收敛到
+    /// [`FAST_SCROLL_MAX_DECODE`]（快滚多张猛甩，8 路并发把核打满是 CPU 放大器，且大量
+    /// 预取未被看），否则回 [`MAX_DECODE`]。动态上限**统一收口**到本方法：目标解码
+    /// （[`Self::queue_decode`] / 升档 / [`Self::drain_pending`] 追最新）与预取
+    /// （[`Self::pump_prefetch`] 的在途判定）全部经它取值，避免散点常量。重型格式仍由
+    /// [`HEAVY_DECODE_MAX`] 独立封顶（=1 ≤ 快滚闸），取 min 不顶破。
+    fn max_decode(&self) -> usize {
+        if self.scroll_fast {
+            FAST_SCROLL_MAX_DECODE
+        } else {
+            MAX_DECODE
+        }
+    }
+
+    /// 解码池入队：已在解 → 等其落盘追最新；已缓存 → 直接落盘；并发满（[`Self::max_decode`]）
     /// → 仅**显示目标**（`is_target`）记入 [`pending_target`] 等空位（预取在满时直接放弃）；
     /// 否则派发并行解码。`in_flight` 去重。**重型格式**（HEIF）在途数 ≥
     /// [`HEAVY_DECODE_MAX`] 时同款：目标记 [pending_target]、预取放弃（见
@@ -98,7 +112,7 @@ impl super::ImageViewer {
             }
             return;
         }
-        if self.in_flight.len() >= MAX_DECODE {
+        if self.in_flight.len() >= self.max_decode() {
             if is_target {
                 self.pending_target = Some(path);
             }
@@ -270,7 +284,7 @@ impl super::ImageViewer {
         if self.in_flight.contains(&path) {
             return;
         }
-        if self.in_flight.len() >= MAX_DECODE {
+        if self.in_flight.len() >= self.max_decode() {
             self.pending_target = Some(path);
             return;
         }
@@ -319,8 +333,9 @@ impl super::ImageViewer {
     /// 2. **反向**（刚看过的往回侧）：非快速滚动时保留 [`PREFETCH_BACKWARD`] 张，回看上一张/
     ///    回头翻不因 LRU 淘汰变冷；快速滚动时让位给前方深预取；
     /// 3. 解码槽全满时给窗口外最近几张预读字节（IO 不占解码槽）。
-    /// 4. 预取统一封顶 `MAX_DECODE - 1` 个在途解码（预留 1 槽给「冷目标」秒占）；显示目标在等槽位优先、
-    ///    窗口铺满、或游标越过锚点一整圈（全清单已覆盖）时自停。
+    /// 4. 预取统一封顶 `[Self::max_decode] - 1` 个在途解码（预留 1 槽给「冷目标」秒占；快速
+    ///    滚动时受快滚节流闸 [`FAST_SCROLL_MAX_DECODE`] 约束，不再 8 并发深挖 12 张）；
+    ///    显示目标在等槽位优先、窗口铺满、或游标越过锚点一整圈（全清单已覆盖）时自停。
     fn pump_prefetch(&mut self, cx: &mut Context<Self>) {
         if self.pending_target.is_some() {
             return;
@@ -335,9 +350,9 @@ impl super::ImageViewer {
         } else {
             PREFETCH_FORWARD
         } as i64;
-        // 1) 主方向窗口：dist 1..=forward_win（预取封顶 MAX_DECODE-1，预留冷目标槽）
+        // 1) 主方向窗口：dist 1..=forward_win（预取封顶 max_decode-1，预留冷目标槽）
         while (self.prefetch_pos - self.prefetch_origin).abs() < n
-            && self.prefetch_inflight < MAX_DECODE - 1
+            && self.prefetch_inflight < self.max_decode().saturating_sub(1)
             && (self.prefetch_pos - self.prefetch_origin).abs() <= forward_win
         {
             // 解码缓存已满（字节预算）→ 预取一解即被 LRU 挤掉，纯白算 CPU：停止新派发
@@ -361,7 +376,7 @@ impl super::ImageViewer {
         if !self.scroll_fast {
             let base = self.nav.current() as i64;
             for k in 1..=PREFETCH_BACKWARD as i64 {
-                if self.prefetch_inflight + 1 >= MAX_DECODE
+                if self.prefetch_inflight + 1 >= self.max_decode()
                     || self.cache.len() >= CACHE_MAX_ITEMS
                     || self.cache.bytes() >= CACHE_MAX_BYTES
                 {
@@ -380,9 +395,10 @@ impl super::ImageViewer {
                 }
             }
         }
-        // 3) 解码槽全满：给窗口后最近几张预读字节（IO 不占解码槽；等空位时不再等磁盘）
-        if self.prefetch_inflight + 1 >= MAX_DECODE {
-            for _ in 0..MAX_DECODE {
+        // 3) 解码槽全满：给窗口后最近几张预读字节（IO 不占解码槽；等空位时不再等磁盘；
+        //    门槛随 max_decode 走：快滚态解码并发小，槽一满即预读，IO 与解码分离不互占）
+        if self.prefetch_inflight + 1 >= self.max_decode() {
+            for _ in 0..self.max_decode() {
                 if (self.prefetch_pos - self.prefetch_origin).abs() >= n {
                     break;
                 }
