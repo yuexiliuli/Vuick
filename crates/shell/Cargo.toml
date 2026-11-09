@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 # 迁入本 crate 后 app/scrollbar 内部经 crate-root 短别名消费的全部项目内 crate。
 config = { path = "../config" }
 base = { path = "../base" }
+# 文本打开 / 编码 / 差异 叶子 crate（自 app/encoding + app/open_progress + app/diff 拆出）。
+text_open = { path = "../text_open" }
 # 系统托盘（Windows）：关闭到托盘 / 托盘恢复 / 托盘退出。非 windows 目标为 no-op。
 tray = { path = "../tray" }
 # 提取主窗口原生 HWND 交给 tray crate（复用 workspace 已有 raw-window-handle=0.6）。
@@ -29,13 +31,16 @@ ui = { path = "../ui" }
 editor = { path = "../editor" }
 markdown = { path = "../markdown" }
 # WYSIWYG 编辑器：自 markdown 拆分独立的新 crate（shell 直接消费 markdown_wysiwyg::*）。
-markdown-wysiwyg = { path = "../markdown-wysiwyg" }
+markdown_wysiwyg = { path = "../markdown_wysiwyg" }
 toc = { path = "../toc" }
 pdf = { path = "../pdf" }
 image_viewer = { path = "../image_viewer" }
 # 视频查看器随本 crate 的 `video` feature 开关（`cfg(feature = "video")`）。
 video = { path = "../video", optional = true }
 epub = { path = "../epub" }
+# 会话持久化 / 设置导出 / 最近面板实体 叶子 crate（自 app/session + app/settings_xfer +
+# app/recent_panel 拆出；shell 保留编排、经 RecentPanelHost trait 接入面板）。
+session_store = { path = "../session_store" }
 # 音乐播放器（Phase A 引擎 + Phase B UI 已提交）：shell 集成（整窗音乐模式 /
 # 打开音频文件路由 / 状态栏指示）。不静态链 FFmpeg（运行时经 libloading 加载）。
 music = { path = "../music" }

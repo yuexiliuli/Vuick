@@ -3,10 +3,11 @@ name = "pdf"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor PDF 阅读器 crate（pdfium 栅格化 + 瓦片虚拟化）"
-build = "build.rs"
+description = "gpui-editor PDF 阅读器视图 crate（瓦片虚拟化 + 交互/渲染；栅格化核心在 pdf_core）"
 
 [dependencies]
+# pdf 拆成 pdf_core（栅格化核心）+ pdf（视图层门面）：本 crate 保留包名并全量重导出 pdf_core。
+pdf_core = { path = "../pdf_core" }
 gpui = { workspace = true }
 pdfium-render = { workspace = true }
 kimg = { workspace = true }

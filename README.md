@@ -64,7 +64,7 @@ GPUI 应用内**全部 UI 组件均为自研**，替代已移除的 `gpui-compon
 
 ## 目录结构（主要代码作用）
 
-> 注意：仓库现已拆分为**多 workspace crate**（`crates/`：`shell` 应用外壳 / `editor` 代码编辑器 / `media-ffmpeg` 视频解码内核（独立 cdylib）/ `video` 播放器 / `image_viewer` 图片查看 / `pdf` / `epub` / `music` 音乐播放器 / `markdown` 解析 / `markdown-wysiwyg` 实时预览 / `syntax` 高亮 / `toc` / `viewer` 共享查看器几何 / `ui` 组件库）。下方旧 `src/` 目录树为早期单二进制布局，**除路径前缀外职责描述仍成立**：`src/app` ≈ `crates/shell/src/app`、`src/editor` ≈ `crates/editor`、`src/pdf` ≈ `crates/pdf`，依此类推。
+> 注意：仓库现已拆分为**多 workspace crate**（`crates/`：`shell` 应用外壳 / `editor` 代码编辑器 / `media_ffmpeg` 视频解码内核（独立 cdylib）/ `video` 播放器 / `image_viewer` 图片查看 / `pdf` / `epub` / `music` 音乐播放器 / `markdown` 解析 / `markdown_wysiwyg` 实时预览 / `syntax` 高亮 / `toc` / `viewer` 共享查看器几何 / `ui` 组件库）。下方旧 `src/` 目录树为早期单二进制布局，**除路径前缀外职责描述仍成立**：`src/app` ≈ `crates/shell/src/app`、`src/editor` ≈ `crates/editor`、`src/pdf` ≈ `crates/pdf`，依此类推。
 
 ```
 src/
@@ -137,8 +137,8 @@ src/
 - `LIBCLANG_PATH` → 指向含 `libclang.dll` 的目录（bindgen 必需，装 LLVM 即得）。
 
 一键装环境：`pwsh scripts/setup-ffmpeg.ps1`（下载 / 配置提示、写用户环境变量，新终端生效）。
-跳过视频功能可 `cargo build --workspace --no-default-features --exclude media-ffmpeg`（不编译
-`src/video/`，也不构建 `media-ffmpeg` cdylib——否则默认 workspace 构建仍需要 FFmpeg 环境）。
+跳过视频功能可 `cargo build --workspace --no-default-features --exclude media_ffmpeg`（不编译
+`src/video/`，也不构建 `media_ffmpeg` cdylib——否则默认 workspace 构建仍需要 FFmpeg 环境）。
 
 PDF 预览依赖 pdfium 动态库：前往 https://github.com/bblanchon/pdfium-binaries/releases 下载，解压得到 `pdfium.dll`，重命名并放于 `resources/pdfium/pdfium-154.0.8035.0.dll`（构建时若探测到会**内嵌进 exe**，分发免带）。
 
@@ -174,7 +174,7 @@ PDF / EPUB / 图片 / 大文档测试的 fixture **已提交至仓库**（`fixtu
 
 ## 发布 / 打包分发
 
-视频解码内核已拆成独立 cdylib（`media-ffmpeg` 工作区成员，产物 `media_ffmpeg.dll`）：
+视频解码内核已拆成独立 cdylib（`media_ffmpeg` 工作区成员，产物 `media_ffmpeg.dll`）：
 主 exe **不静态导入**任何 FFmpeg dll，只在打开视频时经 libloading **运行时**加载它。
 所以：
 - **exe 缺 `media_ffmpeg.dll` / FFmpeg 运行库也能正常启动**——不开视频照常使用全部其它功能，开视频时在窗口内提示「缺少视频运行库」；

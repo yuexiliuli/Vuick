@@ -2771,12 +2771,12 @@
                 crate::app::session::save_session_to(app, &sess, cx);
             });
         });
-        let manifest = crate::app::session::read_manifest(&sess).expect("清单应写入");
+        let manifest = session_store::read_manifest(&sess).expect("清单应写入");
         assert!(
             manifest.tabs.iter().any(|t| {
                 matches!(
                     t,
-                    crate::app::session::SessionTab::File { path }
+                    session_store::SessionTab::File { path }
                         if path == &new_path
                 )
             }),

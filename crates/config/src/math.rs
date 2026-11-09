@@ -1,7 +1,8 @@
 //! 数学排版（RaTeX）配置常量：字号 / 设备像素比 / 排版边距 / 行内撑高上限 / 公式色。
 //!
-//! 单一来源：`wysiwyg::math_typeset`（光栅）与 `wysiwyg::element`（行内撑高/缩放）、
-//! `wysiwyg::mod`（离屏排版/公式色）全部从这里取值，调一个参数无需满项目找。
+//! 单一来源：`wy_math_render`（光栅，自 `wysiwyg::math_typeset` 拆出）与
+//! `wysiwyg::element`（行内撑高/缩放）、`wysiwyg::mod`（离屏排版/公式色）
+//! 全部从这里取值，调一个参数无需满项目找。
 
 /// 数学排版字号（px/em）——比正文略大，块级公式可读。
 pub const MATH_FONT_SIZE: f32 = 22.0;

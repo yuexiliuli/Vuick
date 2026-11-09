@@ -1206,8 +1206,20 @@ version = "0.1.0"
 dependencies = [
  "base",
  "config",
+ "editor_core",
  "gpui",
  "ime",
+ "ropey",
+ "syntect",
+ "ui",
+]
+
+[[package]]
+name = "editor_core"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "gpui",
  "regex",
  "ropey",
  "syntax",
@@ -2665,7 +2677,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "markdown-wysiwyg"
+name = "markdown_wysiwyg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2676,14 +2688,49 @@ dependencies = [
  "ime",
  "kimg",
  "markdown",
- "ratex-layout",
- "ratex-parser",
- "ratex-render",
+ "markdown_wysiwyg_engine",
+ "markdown_wysiwyg_math",
+ "markdown_wysiwyg_mermaid",
  "ropey",
  "rustc-hash",
  "serde_json",
  "syntax",
  "ui",
+]
+
+[[package]]
+name = "markdown_wysiwyg_engine"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "config",
+ "gpui",
+ "markdown",
+ "markdown_wysiwyg_math",
+ "markdown_wysiwyg_mermaid",
+ "rustc-hash",
+ "syntax",
+ "ui",
+]
+
+[[package]]
+name = "markdown_wysiwyg_math"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "gpui",
+ "kimg",
+ "markdown",
+ "ratex-layout",
+ "ratex-parser",
+ "ratex-render",
+]
+
+[[package]]
+name = "markdown_wysiwyg_mermaid"
+version = "0.1.0"
+dependencies = [
+ "gpui",
 ]
 
 [[package]]
@@ -2693,7 +2740,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
-name = "media-ffmpeg"
+name = "media_ffmpeg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3135,10 +3182,23 @@ dependencies = [
  "config",
  "gpui",
  "kimg",
+ "pdf_core",
  "pdfium-render",
  "ui",
  "viewer",
  "windows-sys 0.61.2",
+ "zstd",
+]
+
+[[package]]
+name = "pdf_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "gpui",
+ "kimg",
+ "pdfium-render",
  "zstd",
 ]
 
@@ -4158,6 +4218,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "session_store"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "gpui",
+ "serde_json",
+ "ui",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4209,7 +4279,7 @@ dependencies = [
  "gpui",
  "image_viewer",
  "markdown",
- "markdown-wysiwyg",
+ "markdown_wysiwyg",
  "memchr",
  "music",
  "pdf",
@@ -4217,7 +4287,9 @@ dependencies = [
  "rfd",
  "ropey",
  "serde_json",
+ "session_store",
  "syntax",
+ "text_open",
  "toc",
  "tray",
  "ui",
@@ -4562,6 +4634,17 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "text_open"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "editor_core",
+ "encoding_rs",
+ "memchr",
+ "ropey",
 ]
 
 [[package]]

@@ -156,7 +156,7 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | 时序/并发/跨线程通知（泵/等待语义/事件唤醒/渲染时序） | **测试代理（fake 调度器无跨线程唤醒等）结果一律视为「疑似真值」**；验收闭环 = 测试绿 + 用户真机复验通过（提交须真机复验后才准）；评审发现「生产热路径 ≠ 测试路径」分叉必须标 BLOCK 挂起提交，不得降级软放行（K26） |
 | GPU/渲染语义 | ① 能用 `#[gpui::test]` 验证 → 以测试为验收；② 无法 headless（真机光栅像素/线程安全/驱动共享纹理）→ 该路径**默认休眠**（cfg 关/回退护栏）+ **必须真机人工实操验证通过后才默认启用**；③ 禁止程序自动操作 GUI 代验。符合②③ → 报告写「已实现+单测过、未冒烟（待人工实操后翻转默认）」 |
 | 构建 | 应用/交付构建一律 debug；**bench/性能探针（stage_profile、oracle_perf、Benchmarks 脚本等）release 例外**——release 只跑探针、不交付（与「构建调试 + release 只跑探针」全篇口径一致） |
-| 测试命令 | 一律 `cargo test -p <crate>`（根目录裸 `cargo test` 只盖根包+media-ffmpeg）；串行须 `-- --test-threads=1`——**`--` 不可省**（缺了报 `unexpected argument '--test-threads'`） |
+| 测试命令 | 一律 `cargo test -p <crate>`（根目录裸 `cargo test` 只盖根包+media_ffmpeg）；串行须 `-- --test-threads=1`——**`--` 不可省**（缺了报 `unexpected argument '--test-threads'`） |
 | 验证聚合 | 同批断言**一次 `cargo test` 聚合跑**（`&&` 串联 / 单条 monitor），不逐条启动编译；热编译期复用 `target\debug\deps\<crate>-*.exe <filter>` 直接跑测试二进制（跳过 cargo 元数据/重启）；PDF 快速回归可固化一条脚本（b1+b2+b3+writeback+pan） |
 | 编译节奏 | 每组改动改完一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量 |
 | 测量一次化 | 同批 geomean/A-B 收进 `Benchmarks/<fmt>/scripts/run_*.ps1` runner（如 `Benchmarks\heif\scripts\run_acceptance.ps1`），主 agent **禁反复手跑同一探针**；每阶段派一个测量 agent 一次交齐（多遍手跑 GEO-SUM=浪费，K110） |

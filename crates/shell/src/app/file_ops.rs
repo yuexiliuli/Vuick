@@ -3,7 +3,7 @@
 use super::*;
 use ui::notification::{Notification, NotificationKind};
 
-use crate::app::open_progress::TextChunk;
+use text_open::TextChunk;
 use config::limits::{EDITOR_WRAP_MAX_LINES, OPEN_ASYNC_MIN_BYTES, RECENT_MAX};
 use config::timing::OPEN_FAILURE_AUTOHIDE_SECS;
 
@@ -66,7 +66,7 @@ enum OpenMsg {
         hist: editor::buffer::LineWidthHistogram,
         max_line_chars: usize,
         /// 本文件探测出的源文本编码（None = 纯 UTF-8），消费端写回选项卡，保存按
-        /// 此编码回写（见 [`crate::app::encoding`]）。
+        /// 此编码回写（见 [`text_open::encoding`]）。
         src_encoding: Option<&'static encoding_rs::Encoding>,
     },
     Err(std::io::Error),
@@ -85,7 +85,7 @@ async fn read_chunks_async(
 ) {
     use futures::SinkExt as _;
     let t = std::time::Instant::now();
-    let mut reader = match crate::app::open_progress::ChunkReader::open(&prod_p) {
+    let mut reader = match text_open::ChunkReader::open(&prod_p) {
         Ok(r) => r,
         Err(e) => {
             let _ = prod_tx.send(OpenMsg::Err(e)).await;
@@ -557,7 +557,7 @@ impl EditorApp {
     }
 
     /// 大文档「分块读盘 · 渐进装配」打开流水线：
-    /// 1. **生产者**（后台线程）：[`open_progress::produce_open_chunks`] 逐块
+    /// 1. **生产者**（后台线程）：[`text_open::open_progress::produce_open_chunks`] 逐块
     ///    `File::read`→UTF-8 校验→CRLF 归一化→按块精确算行宽统计（读多少、发多少，
     ///    不再整篇 `read_to_string` 物化 ~1× 文件字节的 String 临时代理），经 channel
     ///    把每一块推给消费者，首块下限 256KB（几十 KB 即出首屏）、之后 1MB；
@@ -842,7 +842,7 @@ impl EditorApp {
         &mut self,
         idx: usize,
         p: &std::path::Path,
-        chunk: crate::app::open_progress::TextChunk,
+        chunk: text_open::TextChunk,
         first: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1144,11 +1144,11 @@ impl EditorApp {
             return;
         }
         // 小文档：同步打开（读成功再建 tab；小而快，保持既有行为）。
-        // 编码感知：BOM 优先 → 合法 UTF-8 → GB18030（见 `app::encoding`）；解码/检测
+        // 编码感知：BOM 优先 → 合法 UTF-8 → GB18030（见 `text_open::encoding`）；解码/检测
         // 失败走既有 `report_open_failure`（不建坏 tab）。
         let t_read = std::time::Instant::now();
         let (decoded, src_enc) = match std::fs::read(&p) {
-            Ok(bytes) => match crate::app::encoding::decode_bytes(&bytes) {
+            Ok(bytes) => match text_open::decode_bytes(&bytes) {
                 Ok(v) => v,
                 Err(e) => {
                     self.report_open_failure(&p, &e, window, cx);
@@ -1313,7 +1313,7 @@ impl EditorApp {
         // 按源编码把缓冲 UTF-8 转回字节写盘（None=纯 UTF-8 现状；GBK/UTF-16 等原编码
         // 回写，含 BOM 还原——文档编码随文档走，「另存为」沿用同一 source_encoding）。
         let enc = self.tabs.get(idx).and_then(|t| t.source_encoding);
-        let bytes = crate::app::encoding::encode_for_save(&text, enc);
+        let bytes = text_open::encode_for_save(&text, enc);
         match fs::write(path, bytes) {
             Ok(()) => {
                 if let Some(tab) = self.tabs.get_mut(idx) {

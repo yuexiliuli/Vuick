@@ -7,6 +7,7 @@ use crate::commands::{
     PASTE, PREVIEW, QUIT, REDO, RESET_FONT, SAVE, SAVE_AS, SELECT_ALL, THEME,
     TOGGLE_MUSIC_PLAYER, TOGGLE_WRAP, UNDO,
 };
+use session_store::RecentPanelHost;
 use ui::button::{Button, ButtonVariants as _};
 use ui::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 
@@ -691,7 +692,7 @@ impl EditorApp {
 
     /// 「打开最近」居中大面板入口（**Dormancy：已被 [`Self::file_items`] 的 flyout 悬浮
     /// 次级菜单取代**——文件菜单「打开最近…」现为悬停展开的右侧子菜单，子项点击即整链
-    /// 关闭，不再打开此居中面板）。保留源码 + 测试（recent.rs 经 [`recent_panel`] /
+    /// 关闭，不再打开此居中面板）。保留源码 + 测试（recent.rs 经 [`session_store::RecentPanel`] /
     /// `open_recent_panel` 直连面板实体做 dormancy 回归）；仅测试引用故标 dead_code。
     /// 历史行为：`RecentPanel` 是 Ctrl+P 命令面板同款 Acrylic 居中卡片，打开即聚焦、
     /// 订阅 `DismissEvent`（择项/Esc/点击外 → 清引用释放实体）。
@@ -705,7 +706,7 @@ impl EditorApp {
         let previous_focus = window.focused(cx);
         let host = cx.weak_entity();
         let panel = cx.new(|cx| {
-            recent_panel::RecentPanel::new(host, folders, files, previous_focus, cx)
+            session_store::RecentPanel::new(host, folders, files, previous_focus, cx)
         });
         let sub = cx.subscribe(&panel, |this, _e, _: &DismissEvent, cx| {
             this.recent_panel = None;
@@ -717,6 +718,41 @@ impl EditorApp {
         window.focus(&handle, cx);
         self.recent_panel = Some(panel);
         self._recent_panel_sub = Some(sub);
+        cx.notify();
+    }
+}
+
+/// [`RecentPanelHost`]（session_store 定义的最小宿主接口）的 shell 实现：
+/// 转发到 EditorApp 既有 `pub(super)` 同名方法，**行为完全不变**（方法不在此新增任何
+/// 逻辑，只做宿主接入点）。实现体内 `self.x(...)` 方法调用在对 `EditorApp`（具体类型）
+/// 做候选解析时固有方法优先于 trait 方法 → 命中既有方法，不会递归。
+/// `clear_recents` 原为面板内联的「清两类 + 落盘 + notify」，现收敛到宿主一处（语义等价）。
+impl RecentPanelHost for EditorApp {
+    fn open_folder_path(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_folder_path(path, window, cx);
+    }
+
+    fn remove_recent_folder(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.remove_recent_folder(path, window, cx);
+    }
+
+    fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file(path, window, cx);
+    }
+
+    fn remove_recent_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.remove_recent_file(path, window, cx);
+    }
+
+    fn clear_recents(&mut self, cx: &mut Context<Self>) {
+        self.recent_folders.clear();
+        self.recent_files.clear();
+        self.persist_prefs();
         cx.notify();
     }
 }

@@ -1,0 +1,53 @@
+[package]
+name = "media_ffmpeg"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "FFmpeg 视频/音频解码内核（cdylib），供 gpui-editor 主程序运行时经 libloading 动态加载"
+
+# 许可：本 crate 自身 Apache-2.0；FFmpeg 为外部 **LGPL v2.1+** 共享库（自建瘦化 decode-only
+# 构建 scripts/build-slim-ffmpeg*.sh，pin n9.0.2、无 GPL/外部库），主 exe 经本 dll 运行
+# 时动态桥接（B1 独立 av*.dll / B2 静态归档可重链）；合规详见根 THIRD_PARTY_NOTICES.md。
+
+[lib]
+crate-type = ["cdylib"]
+
+# B2 静态单 dll（opt-in）：static-link 时 ffmpeg-next/static → ffmpeg-sys-next
+# 以 static= 链 FFMPEG_DIR/lib 下的静态 COFF 归档（scripts/build-slim-ffmpeg-static-msvc.sh
+# 产物），media_ffmpeg.dll 不再导入 av*.dll，分发只需 exe + 1 件 dll。
+# 默认无 feature = B1 shared 链路（5 件 av*.dll），FFMPEG_DIR 仍指 ffmpeg-slim。
+# 开启时须把 FFMPEG_DIR 指到静态包（E:\Rust\temp\ffmpeg-slim-static），系统库
+# 由 build.rs 补 bcrypt/user32/ole32。
+[features]
+default = []
+static-link = ["ffmpeg-next/static"]
+
+[dependencies]
+anyhow = "1.0"
+# 构建期需 FFMPEG_DIR（头文件/导入库）+ LIBCLANG_PATH（bindgen），见仓库 scripts/setup-ffmpeg.ps1。
+# feature 剪枝（2026-10-27）：default 含 device/filter 但代码不用（无 filter graph / 无设备输入），
+# 关掉后 avdevice-*.dll / avfilter-*.dll 不再被链接器导入 → 分发从 FFMPEG_DIR\bin\*.dll 全量
+# （约 230MB）降到仅 5 件（avcodec/avformat/avutil/swresample/swscale，约 121MB）。
+# 硬解（d3d11va/dxva2）走 avutil `av_hwdevice_*` 与 avcodec hwaccel，不依赖这两个 feature。
+ffmpeg-next = { version = "9.0", default-features = false, features = [
+    "codec",
+    "format",
+    "software-resampling",
+    "software-scaling",
+] }
+# 外部 D3D11 设备注入（零回读 GPU 直通）：open_external_hw 用 windows::core::IUnknown 的
+# AddRef/Release 持有调用方设备引用；测试用 D3D11CreateDevice 建设备。features 仅取所需
+# 最小集（版本随 workspace 0.62）：Direct3D11 生成的类型内部引用 Direct3D（D3D_DRIVER_TYPE/
+# D3D_FEATURE_LEVEL）与 Dxgi（DXGI_FORMAT/IDXGIAdapter），三者必须同开才能编译。
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+# MSVC 链接 cdylib 时会打印「正在创建库 ... .lib 和对象 ... .exp」（信息性，非错误），压掉以守零告警纪律。
+[lints.rust]
+linker_messages = "allow"

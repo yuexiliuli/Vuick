@@ -3,25 +3,24 @@ name = "editor"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 自研文本/代码编辑器 crate（CodeEditor：buffer/fold/highlight/movement/selection/undo/rope_ext/markdown 装饰）"
+description = "gpui-editor 自研文本/代码编辑器 crate（视图层：CodeEditor 渲染/输入/渲染接线；模型层已拆至 editor_core，本 crate 全量重导出）"
 
 [dependencies]
 gpui = { workspace = true }
-# 文本存储：自研 CodeEditor 直接持有的 ropey 缓冲（同一版本依赖，仅从根包重分配）。
+# 文本存储：ropey 缓冲（编辑器视图直接读 buffer 的 Rope 快照）。
 ropey = { workspace = true }
-# 编辑器代码高亮：syntect 解析默认语法集（features 对齐：parsing + default-syntaxes + regex-fancy）。
-syntect = { workspace = true }
-# 编辑区内查找（Ctrl+F）：匹配用字面文本正则（regex::escape 转义），既有 workspace 依赖。
-regex = { workspace = true }
+# 核心模型层（buffer/selection/undo/movement/rope_ext/highlight/fold/markdown/find/goto）：
+# 本 crate 全量重导出，旧 `editor::X` 路径不变。
+editor_core = { path = "../editor_core" }
 config = { path = "../config" }
 base = { path = "../base" }
 ime = { path = "../ime" }
-# 高亮单真值：编辑器语法高亮消费 syntax crate 的 SyntaxSet/find_syntax/semantic_name/GitHubTheme
-# （编辑器不再内嵌重复语法集、scope 映射与色板）。
-syntax = { path = "../syntax" }
-# 编辑器视图渲染用 ui 的 theme/scrollbar/shell（第二 UI 组件 crate，依赖 {config,base,ime} 不依赖 editor）。
+# 编辑器视图渲染用 ui 的 theme/scrollbar/input/shell（依赖 {config,base,ime} 不依赖 editor/editor_core）。
 ui = { path = "../ui" }
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
 gpui = { workspace = true, features = ["test-support"] }
+# 视图层测试（tests/logic.rs）直接实例化 syntect ParseState 做基准校准；生产代码已不直用，
+# 只需 dev 依赖。features 对齐 workspace 定义（parsing + default-syntaxes + regex-fancy）。
+syntect = { workspace = true }

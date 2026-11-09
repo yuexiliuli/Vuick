@@ -1,0 +1,10 @@
+[package]
+name = "markdown_wysiwyg_mermaid"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor WYSIWYG 的 Mermaid 图渲染子系统：flowchart/sequence 解析、布局、绘制（自 markdown_wysiwyg 的 wysiwyg/mermaid 拆出的独立 crate）"
+
+[dependencies]
+# 渲染/宿主：gpui 钉 zed 提交（workspace 统一版本）。
+gpui = { workspace = true }

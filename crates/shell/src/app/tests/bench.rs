@@ -1181,7 +1181,7 @@
     #[gpui::test]
     #[ignore]
     async fn bench_startup_to_first_frame(cx: &mut TestAppContext) {
-        use session::SessionTab;
+        use session_store::SessionTab;
         use std::time::Instant;
         init_test(cx);
         // ① 构造 + 首帧（真实启动路径：EditorApp::new = startup=true，restore/tray 在
@@ -1221,7 +1221,7 @@
             std::fs::write(&p, &body).unwrap();
             files.push(p);
         }
-        let m = session::SessionManifest {
+        let m = session_store::SessionManifest {
             version: 1,
             active_tab: 0,
             tabs: vec![
@@ -1232,9 +1232,9 @@
                 SessionTab::New { slot: "t1".into(), name: "未命名".into() },
             ],
         };
-        assert!(session::write_manifest(&dir, &m), "清单应写入");
-        assert!(session::write_slot(&dir, "t0", "未命名内容甲"));
-        assert!(session::write_slot(&dir, "t1", "未命名内容乙"));
+        assert!(session_store::write_manifest(&dir, &m), "清单应写入");
+        assert!(session_store::write_slot(&dir, "t0", "未命名内容甲"));
+        assert!(session_store::write_slot(&dir, "t1", "未命名内容乙"));
         let (app2, cx) = add_app_zero_tabs(cx);
         let t_restore = Instant::now();
         cx.update(|window, cx| {

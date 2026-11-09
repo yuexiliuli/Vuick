@@ -3,6 +3,16 @@
 //! 这是**独立于 gpui-component `Editor`** 的自有实现：从缓冲、选区、光标移动、
 //! 撤销/重做、语法高亮到视图渲染全部自持，可作为预览/编辑区的可替换组件。
 //!
+//! # 结构（2026-11 拆分为两 crate）
+//!
+//! - **`editor_core`（核心模型层）**：buffer/selection/undo/movement/rope_ext/
+//!   highlight/fold/markdown/find/goto——纯状态与纯函数，零视图依赖；
+//! - **本 crate（视图层）**：`view/`（render/document/layout/rows/interaction/
+//!   editing/input/find_goto）+ `CodeEditor`/`EditorEvent`/`merge_highlights` 等。
+//!   本 crate **全量重导出 `editor_core`**，既有 `editor::buffer::X` /
+//!   `editor::movement::X` 等路径继续成立，消费者（shell / markdown-wysiwyg / ui）
+//!   零代码改动。
+//!
 //! # 设计来源（调研吸收）
 //!
 //! - **zed `editor`/`text` crates**（本地 `.../zed-*/399258f/crates`）：
@@ -34,27 +44,24 @@
 
 #![allow(dead_code)] // 组件库公共 API：作为 lib crate 前 bin crate 会对未使用项误报 dead_code
 
-pub mod buffer;
-pub mod find;
-pub mod fold;
-pub mod goto;
-pub mod highlight;
-mod markdown;
-pub mod movement;
-pub mod rope_ext;
-pub mod selection;
-pub mod undo;
+// ---------------------------------------------------------------------------
+// 核心模型层全量重导出（`editor_core` 为拆出 crate；glob 带出全部 pub 模块与根级类型，
+// 显式 `pub use` 保目录路径语义，既有 `editor::buffer::*` / `editor::movement::*` 等
+// 消费者路径零改动即可继续解析）。
+// ---------------------------------------------------------------------------
+pub use editor_core::*;
+#[allow(unused_imports)]
+pub use editor_core::{
+    buffer, find, fold, goto, highlight, markdown, movement, rope_ext, selection, undo,
+};
+
 mod view;
 
 #[cfg(test)]
 mod tests;
 
 #[allow(unused_imports)]
-pub use buffer::{Buffer, Edit};
-#[allow(unused_imports)]
-pub use selection::Selection;
-#[allow(unused_imports)]
-pub use undo::{EditIntent, Transaction, UndoManager};
+pub use editor_core::{Buffer, Edit, Selection, EditIntent, Transaction, UndoManager};
 #[allow(unused_imports)]
 pub use view::{CodeEditor, EditorEvent};
 

@@ -44,16 +44,16 @@ fn export_bundle_structure_and_roundtrip() {
         "music_last_track": r"D:\music\林俊杰 - 江南.mp3",
         "music_progress_secs": 123.25,
     });
-    let manifest = session::SessionManifest {
+    let manifest = session_store::SessionManifest {
         version: 1,
         active_tab: 1,
         tabs: vec![
-            session::SessionTab::File { path: std::path::PathBuf::from(r"C:\doc.md") },
-            session::SessionTab::New { slot: "t0".into(), name: "未命名".into() },
+            session_store::SessionTab::File { path: std::path::PathBuf::from(r"C:\doc.md") },
+            session_store::SessionTab::New { slot: "t0".into(), name: "未命名".into() },
         ],
     };
     let slots = sample_slots();
-    let body = settings_xfer::build_export_bundle(&prefs, &manifest, &slots);
+    let body = session_store::build_export_bundle(&prefs, &manifest, &slots);
     // 结构断言：魔力头 + 版本自含 + prefs/session 就位。
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["app"], serde_json::json!("gpui-editor"));
@@ -63,7 +63,7 @@ fn export_bundle_structure_and_roundtrip() {
     assert_eq!(v["session"]["manifest"]["tabs"].as_array().unwrap().len(), 2);
     assert_eq!(v["session"]["slots"]["t0"], serde_json::json!("第一行\n第二行 \"引号\" 反斜杠 \\ 结尾"));
     // roundtrip：解析回的数据与导出数据逐项全等。
-    let parsed = settings_xfer::parse_export_bundle(&body).expect("自产自入应可解析");
+    let parsed = session_store::parse_export_bundle(&body).expect("自产自入应可解析");
     assert_eq!(parsed.prefs.as_ref().expect("prefs 应在"), &prefs, "配置字段全等");
     let (p_manifest, p_slots) = parsed.session.expect("会话应在");
     assert_eq!(p_manifest, manifest, "清单全等");
@@ -75,12 +75,12 @@ fn export_bundle_structure_and_roundtrip() {
 #[test]
 fn parse_rejects_invalid_and_partial_optional() {
     for bad in ["", "不是json", "[1,2,3]", "{}", r#"{"app":"gpui-editor"}"#] {
-        assert!(settings_xfer::parse_export_bundle(bad).is_err(), "应拒绝：{bad}");
+        assert!(session_store::parse_export_bundle(bad).is_err(), "应拒绝：{bad}");
     }
     let wrong_magic = serde_json::json!({"app": "别的应用", "export_version": 1}).to_string();
-    assert!(settings_xfer::parse_export_bundle(&wrong_magic).is_err(), "魔力头不符应拒绝");
+    assert!(session_store::parse_export_bundle(&wrong_magic).is_err(), "魔力头不符应拒绝");
     let wrong_ver = serde_json::json!({"app": "gpui-editor", "export_version": 99}).to_string();
-    assert!(settings_xfer::parse_export_bundle(&wrong_ver).is_err(), "版本不符应拒绝");
+    assert!(session_store::parse_export_bundle(&wrong_ver).is_err(), "版本不符应拒绝");
 
     // prefs 非对象 → None；session 正常 → 保留（配置侧缺失可跳过）。
     let no_prefs = serde_json::json!({
@@ -88,7 +88,7 @@ fn parse_rejects_invalid_and_partial_optional() {
         "session": {"manifest": {"version": 1, "active_tab": 0, "tabs": []}}
     })
     .to_string();
-    let p = settings_xfer::parse_export_bundle(&no_prefs).expect("合法包应解析");
+    let p = session_store::parse_export_bundle(&no_prefs).expect("合法包应解析");
     assert!(p.prefs.is_none(), "prefs 非对象 → None");
     assert!(p.session.is_some(), "session 应保留");
 
@@ -98,7 +98,7 @@ fn parse_rejects_invalid_and_partial_optional() {
         "prefs": {"theme": "light"}, "session": "坏了"
     })
     .to_string();
-    let p = settings_xfer::parse_export_bundle(&no_session).expect("合法包应解析");
+    let p = session_store::parse_export_bundle(&no_session).expect("合法包应解析");
     assert!(p.prefs.is_some(), "prefs 应保留");
     assert!(p.session.is_none(), "session 非对象 → None");
 
@@ -108,7 +108,7 @@ fn parse_rejects_invalid_and_partial_optional() {
         "session": {"manifest": 42}
     })
     .to_string();
-    let p = settings_xfer::parse_export_bundle(&bad_session).expect("合法包应解析");
+    let p = session_store::parse_export_bundle(&bad_session).expect("合法包应解析");
     assert!(p.prefs.is_some());
     assert!(p.session.is_none(), "损坏 manifest → None");
 }
@@ -119,7 +119,7 @@ fn parse_rejects_invalid_and_partial_optional() {
 async fn import_applies_prefs_immediately(cx: &mut TestAppContext) {
     init_test(cx);
     let (app, cx) = add_app(cx);
-    let body = settings_xfer::build_export_bundle(
+    let body = session_store::build_export_bundle(
         &serde_json::json!({
             "theme": "dark",
             "font_size": 17.0,
@@ -127,14 +127,14 @@ async fn import_applies_prefs_immediately(cx: &mut TestAppContext) {
             "close_to_tray": true,
             "recent_files": ["a.md"],
         }),
-        &session::SessionManifest {
+        &session_store::SessionManifest {
             version: 1,
             active_tab: 0,
-            tabs: vec![session::SessionTab::New { slot: "t0".into(), name: "未命名".into() }],
+            tabs: vec![session_store::SessionTab::New { slot: "t0".into(), name: "未命名".into() }],
         },
         &[("t0".into(), "会话正文".into())],
     );
-    let parsed = settings_xfer::parse_export_bundle(&body).unwrap();
+    let parsed = session_store::parse_export_bundle(&body).unwrap();
     let dir = xfer_temp_dir("apply_prefs");
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
@@ -155,7 +155,7 @@ async fn import_applies_prefs_immediately(cx: &mut TestAppContext) {
     });
     // 会话已写盘供下一启动恢复。
     assert!(dir.join("session.json").is_file(), "会话已写盘");
-    assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("会话正文"));
+    assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("会话正文"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -165,25 +165,25 @@ async fn import_applies_prefs_immediately(cx: &mut TestAppContext) {
 async fn import_explicit_false_restore_honored(cx: &mut TestAppContext) {
     init_test(cx);
     let (app, cx) = add_app(cx);
-    let body = settings_xfer::build_export_bundle(
+    let body = session_store::build_export_bundle(
         &serde_json::json!({ "session_restore": false }),
-        &session::SessionManifest {
+        &session_store::SessionManifest {
             version: 1,
             active_tab: 0,
-            tabs: vec![session::SessionTab::New { slot: "t0".into(), name: "未命名".into() }],
+            tabs: vec![session_store::SessionTab::New { slot: "t0".into(), name: "未命名".into() }],
         },
         &[("t0".into(), "不该落盘的正文".into())],
     );
-    let parsed = settings_xfer::parse_export_bundle(&body).unwrap();
+    let parsed = session_store::parse_export_bundle(&body).unwrap();
     let dir = xfer_temp_dir("restore_off");
     // 预置一份遗留会话（模拟此前开启时留下的陈旧清单/槽位）：显式关后应被清理。
-    assert!(session::write_slot(&dir, "t0", "陈旧"));
-    assert!(session::write_manifest(
+    assert!(session_store::write_slot(&dir, "t0", "陈旧"));
+    assert!(session_store::write_manifest(
         &dir,
-        &session::SessionManifest {
+        &session_store::SessionManifest {
             version: 1,
             active_tab: 0,
-            tabs: vec![session::SessionTab::New { slot: "t0".into(), name: "未命名".into() }],
+            tabs: vec![session_store::SessionTab::New { slot: "t0".into(), name: "未命名".into() }],
         }
     ));
     cx.update(|_w, cx| {
@@ -216,16 +216,16 @@ async fn import_session_does_not_rearrange_current_window(cx: &mut TestAppContex
             app.activate_tab(i1, window, cx);
         });
     });
-    let body = settings_xfer::build_export_bundle(
+    let body = session_store::build_export_bundle(
         &serde_json::json!({}),
-        &session::SessionManifest {
+        &session_store::SessionManifest {
             version: 1,
             active_tab: 0,
-            tabs: vec![session::SessionTab::New { slot: "tt".into(), name: "未命名".into() }],
+            tabs: vec![session_store::SessionTab::New { slot: "tt".into(), name: "未命名".into() }],
         },
         &[("tt".into(), "导入会话内容".into())],
     );
-    let parsed = settings_xfer::parse_export_bundle(&body).unwrap();
+    let parsed = session_store::parse_export_bundle(&body).unwrap();
     let dir = xfer_temp_dir("no_rearrange");
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
@@ -243,7 +243,7 @@ async fn import_session_does_not_rearrange_current_window(cx: &mut TestAppContex
     });
     assert_eq!(contents, vec!["现有甲", "现有乙"], "当前窗口内容不被替换");
     assert!(dir.join("session.json").is_file(), "会话已写盘供下一启动");
-    assert_eq!(session::read_slot(&dir, "tt").as_deref(), Some("导入会话内容"));
+    assert_eq!(session_store::read_slot(&dir, "tt").as_deref(), Some("导入会话内容"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -254,17 +254,17 @@ async fn import_session_restores_on_next_startup(cx: &mut TestAppContext) {
     init_test(cx);
     let f1 = std::env::temp_dir().join(format!("gpui-xfer-file-{}.txt", std::process::id()));
     std::fs::write(&f1, "文件正文").unwrap();
-    let manifest = session::SessionManifest {
+    let manifest = session_store::SessionManifest {
         version: 1,
         active_tab: 1,
         tabs: vec![
-            session::SessionTab::File { path: f1.clone() },
-            session::SessionTab::New { slot: "t0".into(), name: "未命名".into() },
+            session_store::SessionTab::File { path: f1.clone() },
+            session_store::SessionTab::New { slot: "t0".into(), name: "未命名".into() },
         ],
     };
     let slots = vec![("t0".into(), "导入槽内容".to_string())];
-    let body = settings_xfer::build_export_bundle(&serde_json::json!({}), &manifest, &slots);
-    let parsed = settings_xfer::parse_export_bundle(&body).unwrap();
+    let body = session_store::build_export_bundle(&serde_json::json!({}), &manifest, &slots);
+    let parsed = session_store::parse_export_bundle(&body).unwrap();
     let dir = xfer_temp_dir("next_startup");
     let (app, cx) = add_app_zero_tabs(cx);
     cx.update(|_w, cx| {
@@ -273,9 +273,9 @@ async fn import_session_restores_on_next_startup(cx: &mut TestAppContext) {
         });
     });
     // 盘面核对：清单 + 槽位（下一启动恢复的输入）。
-    let back = session::read_manifest(&dir).expect("导入后清单应在");
+    let back = session_store::read_manifest(&dir).expect("导入后清单应在");
     assert_eq!(back, manifest, "导入清单与导出全等");
-    assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("导入槽内容"));
+    assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("导入槽内容"));
 
     // 模拟下一启动：全新窗口实例 restore → 选项卡重建（数量/内容/活动一致）。
     let (app2, cx) = add_app_zero_tabs(cx);
@@ -339,7 +339,7 @@ async fn import_bundle_without_session_applies_prefs(cx: &mut TestAppContext) {
         "prefs": { "theme": "light", "font_size": 15.0 }
     })
     .to_string();
-    let parsed = settings_xfer::parse_export_bundle(&body).expect("合法包应解析");
+    let parsed = session_store::parse_export_bundle(&body).expect("合法包应解析");
     assert!(parsed.session.is_none());
     assert!(!parsed.session_present, "缺 session 段");
     let dir = xfer_temp_dir("no_session");
@@ -405,7 +405,7 @@ async fn partial_prefs_valid_session_broken(cx: &mut TestAppContext) {
         "session": { "manifest": 42 }
     })
     .to_string();
-    let parsed = settings_xfer::parse_export_bundle(&body).expect("合法包应解析");
+    let parsed = session_store::parse_export_bundle(&body).expect("合法包应解析");
     assert!(parsed.prefs.is_some());
     assert!(parsed.session.is_none());
     let dir = xfer_temp_dir("partial_prefs");
@@ -439,7 +439,7 @@ async fn partial_session_valid_prefs_broken(cx: &mut TestAppContext) {
         }
     })
     .to_string();
-    let parsed = settings_xfer::parse_export_bundle(&body).expect("合法包应解析");
+    let parsed = session_store::parse_export_bundle(&body).expect("合法包应解析");
     assert!(parsed.prefs.is_none());
     assert!(parsed.session.is_some());
     let dir = xfer_temp_dir("partial_session");
@@ -453,7 +453,7 @@ async fn partial_session_valid_prefs_broken(cx: &mut TestAppContext) {
         });
     });
     assert!(dir.join("session.json").is_file(), "会话照常导入");
-    assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("会话内容"));
+    assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("会话内容"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -486,7 +486,7 @@ async fn export_writes_file_and_reimports(cx: &mut TestAppContext) {
     });
     assert!(file.is_file(), "导出落盘文件存在");
     let text = std::fs::read_to_string(&file).unwrap();
-    let parsed = settings_xfer::parse_export_bundle(&text).expect("落盘文件可被自己解析");
+    let parsed = session_store::parse_export_bundle(&text).expect("落盘文件可被自己解析");
     let p = parsed.prefs.expect("prefs");
     assert_eq!(p["theme"], serde_json::json!("dark"));
     assert_eq!(p["font_size"], serde_json::json!(16.0));
@@ -510,12 +510,12 @@ fn write_imported_session_rejects_path_traversal_slots() {
     let _ = std::fs::remove_file(&escape); // 清残留（若上次失败留下）
     // 三类非法槽位名分别建包：路径穿越、Windows 绝对路径、盘符相对。
     for bad in ["../gpui-xfer-escape-root.txt", r"C:\Windows\system32\evil.txt", r"c:evil.txt"] {
-        let ok = session::write_imported_session(
+        let ok = session_store::write_imported_session(
             &dir,
-            &session::SessionManifest {
+            &session_store::SessionManifest {
                 version: 1,
                 active_tab: 0,
-                tabs: vec![session::SessionTab::New {
+                tabs: vec![session_store::SessionTab::New {
                     slot: bad.into(),
                     name: "未命名".into(),
                 }],
@@ -530,12 +530,12 @@ fn write_imported_session_rejects_path_traversal_slots() {
         }
     }
     // 合法槽位名照常可写（不被误伤）。
-    let ok = session::write_imported_session(
+    let ok = session_store::write_imported_session(
         &dir,
-        &session::SessionManifest {
+        &session_store::SessionManifest {
             version: 1,
             active_tab: 0,
-            tabs: vec![session::SessionTab::New {
+            tabs: vec![session_store::SessionTab::New {
                 slot: "t0".into(),
                 name: "未命名".into(),
             }],
@@ -543,7 +543,7 @@ fn write_imported_session_rejects_path_traversal_slots() {
         &[("t0".into(), "正常正文".into())],
     );
     assert!(ok);
-    assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("正常正文"));
+    assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("正常正文"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -553,12 +553,12 @@ fn write_imported_session_rejects_path_traversal_slots() {
 #[test]
 fn write_imported_session_rejects_traversal_via_manifest() {
     let dir = xfer_temp_dir("traversal_manifest");
-    let ok = session::write_imported_session(
+    let ok = session_store::write_imported_session(
         &dir,
-        &session::SessionManifest {
+        &session_store::SessionManifest {
             version: 1,
             active_tab: 0,
-            tabs: vec![session::SessionTab::New {
+            tabs: vec![session_store::SessionTab::New {
                 slot: "../via_manifest".into(),
                 name: "未命名".into(),
             }],
@@ -570,18 +570,18 @@ fn write_imported_session_rejects_traversal_via_manifest() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 安全③「槽位正文大小上限」：超 [`session::MAX_IMPORT_SLOT_BYTES`] 的槽位内容 →
+/// 安全③「槽位正文大小上限」：超 [`session_store::MAX_IMPORT_SLOT_BYTES`] 的槽位内容 →
 /// 整个会话拒绝（零写入）；边界内照常收。防恶意/退化导出包用超大槽位撑爆磁盘。
 #[test]
 fn write_imported_session_rejects_oversize_slot() {
     let dir = xfer_temp_dir("oversize");
-    let huge = "x".repeat(session::MAX_IMPORT_SLOT_BYTES + 1);
-    let ok = session::write_imported_session(
+    let huge = "x".repeat(session_store::MAX_IMPORT_SLOT_BYTES + 1);
+    let ok = session_store::write_imported_session(
         &dir,
-        &session::SessionManifest {
+        &session_store::SessionManifest {
             version: 1,
             active_tab: 0,
-            tabs: vec![session::SessionTab::New {
+            tabs: vec![session_store::SessionTab::New {
                 slot: "t0".into(),
                 name: "未命名".into(),
             }],
@@ -603,19 +603,19 @@ async fn apply_malicious_slot_is_zero_write(cx: &mut TestAppContext) {
     let dir = xfer_temp_dir("apply_malicious");
     let escape = dir.join("..").join("gpui-xfer-apply-escape.txt");
     let _ = std::fs::remove_file(&escape);
-    let body = settings_xfer::build_export_bundle(
+    let body = session_store::build_export_bundle(
         &serde_json::json!({}),
-        &session::SessionManifest {
+        &session_store::SessionManifest {
             version: 1,
             active_tab: 0,
-            tabs: vec![session::SessionTab::New {
+            tabs: vec![session_store::SessionTab::New {
                 slot: "../gpui-xfer-apply-escape.txt".into(),
                 name: "未命名".into(),
             }],
         },
         &[("../gpui-xfer-apply-escape.txt".into(), "恶意正文".into())],
     );
-    let parsed = settings_xfer::parse_export_bundle(&body).unwrap();
+    let parsed = session_store::parse_export_bundle(&body).unwrap();
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
             app.apply_import_bundle(Some(parsed), &dir, _w, cx);
@@ -640,14 +640,14 @@ async fn import_opened_folder_pops_children(cx: &mut TestAppContext) {
     let (app, cx) = add_app(cx);
     let root = xfer_temp_dir("opened_folder");
     std::fs::write(root.join("子文件.txt"), "正文").unwrap();
-    let body = settings_xfer::build_export_bundle(
+    let body = session_store::build_export_bundle(
         &serde_json::json!({
             "opened_folder": root.to_string_lossy(),
         }),
-        &session::SessionManifest { version: 1, active_tab: 0, tabs: vec![] },
+        &session_store::SessionManifest { version: 1, active_tab: 0, tabs: vec![] },
         &[],
     );
-    let parsed = settings_xfer::parse_export_bundle(&body).unwrap();
+    let parsed = session_store::parse_export_bundle(&body).unwrap();
     let dir = xfer_temp_dir("opened_folder_session");
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {

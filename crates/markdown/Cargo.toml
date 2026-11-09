@@ -3,7 +3,7 @@ name = "markdown"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 自研 Markdown 渲染 + 文档管线 crate（Doc+shard 管线；WYSIWYG 编辑已迁至 markdown-wysiwyg）"
+description = "gpui-editor 自研 Markdown 渲染 + 文档管线 crate（Doc+shard 管线；WYSIWYG 编辑已迁至 markdown_wysiwyg）"
 
 [dependencies]
 # 渲染/宿主：gpui 钉 zed 提交（workspace 统一版本）。
@@ -22,7 +22,7 @@ rustc-hash = { workspace = true }
 serde_json = { workspace = true }
 # 拆 workspace 后迁出的叶/核心 crate：{config, base, ui}。ime/editor/syntax 在本 crate
 # src 全树无任何符号引用（仅注释提及），已作死依赖清理；WYSIWYG 与 CodeEditor 编辑由
-# markdown-wysiwyg crate 自持其 editor/ime/syntax 依赖（2026-11）。
+# markdown_wysiwyg crate 自持其编辑/IME/语法依赖（2026-11）。
 config = { path = "../config" }
 base = { path = "../base" }
 ui = { path = "../ui" }

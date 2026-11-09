@@ -556,7 +556,7 @@
         pump_panel(cx);
         // 同实体 mode 切换：实体不变、mode=All。
         let mode = cx.update(|_w, cx| app.read(cx).recent_panel.clone().unwrap().read(cx).mode());
-        assert_eq!(mode, recent_panel::RecentMode::All, "More 应切到完整列表模式");
+        assert_eq!(mode, session_store::RecentMode::All, "More 应切到完整列表模式");
         assert!(
             cx.update(|_w, cx| app.read(cx).recent_panel.as_ref() == panel_entity.as_ref()),
             "More 不应重开/重建面板实体（同实体切换）"
@@ -574,7 +574,7 @@
         cx.simulate_click(back, Default::default());
         pump_panel(cx);
         let mode = cx.update(|_w, cx| app.read(cx).recent_panel.clone().unwrap().read(cx).mode());
-        assert_eq!(mode, recent_panel::RecentMode::Regions, "返回应切回四区域");
+        assert_eq!(mode, session_store::RecentMode::Regions, "返回应切回四区域");
         assert!(cx.debug_bounds("recent-more").is_some(), "返回后回到四区域（More 行出现）");
         assert!(cx.debug_bounds("recent-back").is_none(), "四区域无返回行");
         assert!(cx.debug_bounds("recent-folder-row-11").is_none(), "四区域只展示前 10 条");

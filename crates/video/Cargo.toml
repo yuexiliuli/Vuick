@@ -16,7 +16,7 @@ config = { path = "../config" }
 ui = { path = "../ui", features = ["video"] }
 viewer = { path = "../viewer" }
 # 双设备 GPU 直通（零回读）：worker 自有 D3D11 设备 + 共享 NV12 纹理（shared handle +
-# keyed mutex）跨设备移动。features 取与 media-ffmpeg 同款最小集（Direct3D11 生成的类型内部
+# keyed mutex）跨设备移动。features 取与 media_ffmpeg 同款最小集（Direct3D11 生成的类型内部
 # 引用 Direct3D/Dxgi，三者必须同开才能编译）。
 windows = { workspace = true, features = [
     "Win32_Foundation",

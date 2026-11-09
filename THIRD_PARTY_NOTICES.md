@@ -7,7 +7,7 @@
 
 ## FFmpeg（视频/音频解码）—— LGPL v2.1+
 
-- **形态**：`crates/media-ffmpeg`（Apache-2.0 Rust cdylib）经 `libloading` 运行时动态加载；
+- **形态**：`crates/media_ffmpeg`（Apache-2.0 Rust cdylib）经 `libloading` 运行时动态加载；
   B1（默认）导入 FFmpeg 共享库 `avcodec/avformat/avutil/swresample/swscale` 五件独立 dll，
   主 exe 不静态导入 FFmpeg；B2（opt-in `static-link`）将 FFmpeg 静态归档链入 `media_ffmpeg.dll`
   （提供 `third_party` 之外构建脚本与静态归档以满足 LGPL 可重链）。

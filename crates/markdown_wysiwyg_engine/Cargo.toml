@@ -1,0 +1,42 @@
+[package]
+name = "markdown_wysiwyg_engine"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor WYSIWYG 的「元素引擎纯类型核心」：WyTheme 与元素纯类型/几何（Frame/BlockLayout/ShapedRow/FoldPlan/geom 等，自 markdown_wysiwyg 的 wysiwyg/element 纯类型 + theme 拆出的独立 crate，纯结构移动，只重分配既有依赖；不含 WyEditorElement 与 paint/hit/frame/shape）"
+
+[dependencies]
+# 渲染/宿主：gpui 钉 zed 提交（workspace 统一版本）。
+gpui = { workspace = true }
+# 本项目内叶子/核心 crate（沿原 layout 依赖抄）。
+config = { path = "../config" }
+# 字符边界吸收（char_align_byte）等字节工具（layout::text_runs 的逐 run 守卫）。
+base = { path = "../base" }
+# 向上依赖：共享 parse/doc/ir/view 解析与文档层（IrKind / AlertKind / LinkHit / MathAlign / StyleParams）。
+markdown = { path = "../markdown" }
+# Mermaid 布局结果类型（ShapedRow.mm）与 mermaid 调色板快照（WyTheme → MmTheme）。
+markdown_wysiwyg_mermaid = { path = "../markdown_wysiwyg_mermaid" }
+# 行内公式排版结果类型（RowExtra.inline_maths）。
+markdown_wysiwyg_math = { path = "../markdown_wysiwyg_math" }
+# 快速非加密哈希：FoldPlanSets 的 marker 集合容器。
+rustc-hash = { workspace = true }
+# 代码块语法高亮（shape_code_row：CodeLineRuns / parse_code_lines / github_theme_cached）。
+syntax = { path = "../syntax" }
+# 全局主题查询（paint 注记/搜索高亮色的明暗判定）。
+ui = { path = "../ui" }
+
+[features]
+# 测试计数/动画帧门控（对齐 config 的 test-mode 惯例）：宿主 `markdown_wysiwyg` 在
+# [dev-dependencies] 叠加本 feature——宿主跑 `cargo test` 时引擎按 test-mode 编译：
+# ① Pass2/预热的 `bump_reshapes`/`bump_coolings`/`bump_prewarm_shapes` 计数生效
+#   （宿主 `take_*` 读同一 `rd` 计数器断言缓存/重排行为）；
+# ② `settle_giant_blocks`/`prewarm_band` 的 `request_animation_frame` 在测试平台
+#   会 panic（gpui test platform 无动画帧），test-mode 关闭之。
+# 生产（release/shell）不启用 → 动画帧行为逐字保持、计数零开销。
+# 说明：引擎自身的 `cargo test`（cfg(test)）不受本 feature 影响（帧门控 cft(test) 关、
+# 计数 `cft(test-mode)` 关——引擎自测不读宿主计数器，两态都对）。
+test-mode = []
+
+[dev-dependencies]
+# zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
+gpui = { workspace = true, features = ["test-support"] }

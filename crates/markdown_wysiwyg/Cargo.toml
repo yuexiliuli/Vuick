@@ -1,0 +1,45 @@
+[package]
+name = "markdown_wysiwyg"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 自研 WYSIWYG 所见即所得编辑 crate（自 crates/markdown 的 wysiwyg 拆分独立，依赖 markdown 的 parse/doc/ir/view 共享层）"
+
+[dependencies]
+# 渲染/宿主：gpui 钉 zed 提交（workspace 统一版本）。
+gpui = { workspace = true }
+# 大文档「分块读盘·渐进装配」/ 解析报错上下文。
+anyhow = { workspace = true }
+# 位图（WebP/PNG 图片行、EPUB 内存图）栅格化。
+kimg = { workspace = true }
+# 文本存储 / WYSIWYG 缓冲区（与 editor 同版本 ropey，本 crate 自持一份）。
+ropey = { workspace = true }
+# 快速非加密哈希：fold_plan/shape 缓存容器重建。
+rustc-hash = { workspace = true }
+serde_json = { workspace = true }
+# 项目内叶子/核心 crate（沿 markdown 原依赖抄，仅含 wy 面实际消费的）。
+config = { path = "../config" }
+base = { path = "../base" }
+ime = { path = "../ime" }
+ui = { path = "../ui" }
+editor = { path = "../editor" }
+syntax = { path = "../syntax" }
+# 向上依赖：共享 parse/doc/ir/view 解析与文档层。
+markdown = { path = "../markdown" }
+# Mermaid 渲染子系统（自 wysiwyg/mermaid 拆出，纯结构移动）：经 MmTheme 调色板解耦。
+markdown_wysiwyg_mermaid = { path = "../markdown_wysiwyg_mermaid" }
+# 数学渲染子系统（自 wysiwyg/math + math_typeset 拆出，纯结构移动）：LaTeX 排版 +
+# 行内/块公式整形；本 crate 经闭包注入解耦（splice_math_text 不反向依赖本 crate）。
+markdown_wysiwyg_math = { path = "../markdown_wysiwyg_math" }
+# 元素引擎纯类型核心（自 wysiwyg/element 纯类型/geom + theme 拆出，纯结构移动）：WyTheme /
+# Frame / BlockLayout / ShapedRow / FoldPlan / geom 等纯类型与几何；宿主经
+# `element` shim + `theme` shim 别名 re-export 保持全部既有路径不变。
+markdown_wysiwyg_engine = { path = "../markdown_wysiwyg_engine" }
+
+[dev-dependencies]
+# zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
+gpui = { workspace = true, features = ["test-support"] }
+# 引擎测试计数/动画帧门控（对齐 config test-mode 惯例）：宿主测试构建时叠加
+# `test-mode` → 引擎 Pass2/预热计数生效（`take_*` 断言用）、巨型块静止整形的
+# `request_animation_frame` 在测试平台关闭（否则 gpui test platform panic）。
+markdown_wysiwyg_engine = { path = "../markdown_wysiwyg_engine", features = ["test-mode"] }

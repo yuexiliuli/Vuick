@@ -50,13 +50,13 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["crates/media-ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/markdown", "crates/markdown-wysiwyg", "crates/toc", "crates/pdf", "crates/image_viewer", "crates/video", "crates/epub", "crates/shell", "crates/tray", "crates/music", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp",     "crates/kimg_ico", "crates/kimg_pnm", "crates/kimg_heif",
+members = ["crates/media_ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/editor_core", "crates/text_open", "crates/markdown", "crates/markdown_wysiwyg", "crates/markdown_wysiwyg_engine", "crates/markdown_wysiwyg_mermaid", "crates/markdown_wysiwyg_math", "crates/toc", "crates/pdf", "crates/pdf_core", "crates/image_viewer", "crates/video", "crates/epub", "crates/shell", "crates/tray", "crates/music", "crates/session_store", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp",     "crates/kimg_ico", "crates/kimg_pnm", "crates/kimg_heif",
     "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`media_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。
-# 无 FFmpeg 环境的源码构建仍可用 `cargo build --workspace --no-default-features --exclude media-ffmpeg` 绕过。
-default-members = [".", "crates/media-ffmpeg"]
+# 无 FFmpeg 环境的源码构建仍可用 `cargo build --workspace --no-default-features --exclude media_ffmpeg` 绕过。
+default-members = [".", "crates/media_ffmpeg"]
 
 # ---------------------------------------------------------------------------
 # workspace 统一依赖：版本与拆 crate 前根 Cargo.toml 逐项完全一致，只重分配不升级。
@@ -115,6 +115,28 @@ kimg_bmp = { path = "crates/kimg_bmp" }
 kimg_ico = { path = "crates/kimg_ico" }
 kimg_pnm = { path = "crates/kimg_pnm" }
 kimg_heif = { path = "crates/kimg_heif" }
+# editor 拆分（2026-11）：核心模型层独立 crate（editor = 视图层门面，全量重导出 editor_core）。
+editor_core = { path = "crates/editor_core" }
+# text_open 拆分（2026-11）：文本打开/编码/差异核心独立 crate（自 shell 的
+# app/encoding + app/open_progress + app/diff 拆出；纯结构移动，只重分配既有依赖，不新增外部包）。
+text_open = { path = "crates/text_open" }
+# pdf 拆分（2026-11）：栅格化核心独立 crate（pdf = 视图层门面，全量重导出 pdf_core）。
+pdf_core = { path = "crates/pdf_core" }
+# markdown_wysiwyg_mermaid 拆分（2026-11）：mermaid 渲染子系统独立 crate（自 markdown_wysiwyg 的
+# wysiwyg/mermaid 拆分；纯结构移动，只重分配既有依赖，不新增外部包）。
+markdown_wysiwyg_mermaid = { path = "crates/markdown_wysiwyg_mermaid" }
+# markdown_wysiwyg_engine 拆分（2026-11）：元素引擎纯类型核心独立 crate（自 markdown_wysiwyg
+# 的 wysiwyg/theme + wysiwyg/element 纯类型/geom 拆分；纯结构移动，只重分配既有依赖，
+# 不新增外部包）。
+markdown_wysiwyg_engine = { path = "crates/markdown_wysiwyg_engine" }
+# markdown_wysiwyg_math 拆分（2026-11）：数学渲染子系统独立 crate（自 markdown_wysiwyg 的
+# wysiwyg/math + math_typeset + types/geom 随迁项拆分；纯结构移动，只重分配既有依赖，
+# 不新增外部包）。
+markdown_wysiwyg_math = { path = "crates/markdown_wysiwyg_math" }
+# session_store 拆分（2026-11）：会话持久化存储 / 设置导出序列化 / 最近面板实体
+# 独立 crate（自 shell 的 app/session + app/settings_xfer + app/recent_panel 拆出；
+# 纯结构移动，只重分配既有依赖，不新增外部包）。
+session_store = { path = "crates/session_store" }
 # LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = "0.1"
 ratex-layout = "0.1"

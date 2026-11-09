@@ -13,6 +13,11 @@
 //! - session 复用 [`collect_session_data`]（与 [`crate::app::session::save_session_to`]
 //!   同一序列化路径，不复制整套会话逻辑），各槽位正文经 serde_json 字符串转义嵌入。
 //!
+//! **结构**（2026-11 拆 crate）：打包包的**纯序列化**（构建 / 校验 / 解析）已迁入独立
+//! 叶子 crate `session_store`（`session_store::build_export_bundle` /
+//! `parse_export_bundle`）；本模块只保留 host-bound 应用层（对话框 / 配置即时生效 /
+//! 会话写回目录 / toast）。
+//!
 //! 导入语义：配置**即时生效**（主题/字号/侧栏宽度立即刷新并持久化本地 config，下一次
 //! 启动仍保持）；会话写回当前 session 目录、**下一启动** [`restore_session_from`] 恢复
 //! （不立即重排当前窗口，避免打断未保存编辑）。部分可解析：prefs 有效但 session 损坏 →
@@ -20,89 +25,20 @@
 //! toast「不是有效的 gpui-editor 设置文件」，零副作用零误应用。
 
 use super::*;
-use super::session::{
-    clear_session, collect_session_data, write_imported_session, SessionManifest,
+use super::session::{collect_session_data};
+use session_store::{
+    ParsedExportBundle, build_export_bundle, clear_session,
+    write_imported_session,
 };
-use serde_json::{json, Map, Value};
+// `parse_export_bundle` 仅 `import_settings`（`#[cfg(not(test))]` 对话框入口）消费；
+// 测试构建无该调用 → 此处按构建门控 import，避免测试构建未用告警。
+#[cfg(not(test))]
+use session_store::parse_export_bundle;
 use ui::notification::{Notification, NotificationKind};
-
-/// 导出包魔力头（非本应用文件 → 拒绝导入）。
-const EXPORT_MAGIC: &str = "gpui-editor";
-/// 导出包格式版本（自含版本可校验；未来格式演进用版本号迁移）。
-const EXPORT_VERSION: u64 = 1;
 
 /// 「导出/导入设置」结果通知的（伪）类型标签：配合唯一 key 精确移除（同
 /// `goto_line_toast` 姿势，替换上一条同款提示不堆积）。
 struct SettingsTransferToast;
-
-/// 解析后的导出包：prefs 与 session 各自独立可选——「部分可解析」据此实现
-/// （prefs 有效但 session 损坏 → 配置照常应用 + toast 说明跳过，不整体回滚）。
-pub(crate) struct ParsedExportBundle {
-    pub(crate) prefs: Option<Value>,
-    /// 导出包是否**含** `session` 段（区别于「有段但损坏」：缺段 = 无会话可导，
-    /// 有段损坏 = 跳过，两者 toast 文案不同）。
-    pub(crate) session_present: bool,
-    pub(crate) session: Option<(SessionManifest, Vec<(String, String)>)>,
-}
-
-/// 构建导出包 JSON 字符串（纯函数，可测）：magic + 版本 + prefs 全字段 + 会话清单 +
-/// 各槽位正文（槽位内容经 serde_json 字符串转义嵌入，无双引号/换行串通冲突）。
-pub(crate) fn build_export_bundle(
-    prefs: &Value,
-    manifest: &SessionManifest,
-    slots: &[(String, String)],
-) -> String {
-    let mut slots_obj = Map::new();
-    for (slot, content) in slots {
-        slots_obj.insert(slot.clone(), Value::String(content.clone()));
-    }
-    json!({
-        "app": EXPORT_MAGIC,
-        "export_version": EXPORT_VERSION,
-        "prefs": prefs,
-        "session": {
-            "manifest": manifest.to_value(),
-            "slots": slots_obj,
-        },
-    })
-    .to_string()
-}
-
-/// 校验并解析导出包：JSON 损坏 / 非对象 / 魔力头不符 / 版本不符 → `Err`（调用方必须
-/// 零副作用 toast「不是有效…」）；合法 → prefs（`"prefs"` 须为对象，否则 `None`）、
-/// session（`"session"` 须为含 `"manifest"` 对象的对象，否则 `None`）。
-pub(crate) fn parse_export_bundle(text: &str) -> Result<ParsedExportBundle, ()> {
-    let v: Value = serde_json::from_str(text).map_err(|_| ())?;
-    let Some(obj) = v.as_object() else {
-        return Err(());
-    };
-    if obj.get("app").and_then(|x| x.as_str()) != Some(EXPORT_MAGIC) {
-        return Err(());
-    }
-    if obj.get("export_version").and_then(|x| x.as_u64()) != Some(EXPORT_VERSION) {
-        return Err(());
-    }
-    let prefs = obj.get("prefs").filter(|p| p.is_object()).cloned();
-    let session_present = obj.contains_key("session");
-    let session = obj
-        .get("session")
-        .and_then(|s| s.as_object())
-        .and_then(|sobj| {
-            let m = sobj.get("manifest").filter(|m| m.is_object())?;
-            let manifest = SessionManifest::from_value(m);
-            let slots = sobj
-                .get("slots")
-                .and_then(|s| s.as_object())
-                .map(|map| {
-                    map.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            Some((manifest, slots))
-        });
-    Ok(ParsedExportBundle { prefs, session_present, session })
-}
 
 /// 本次导入中会话段的处置结果（决定 toast 文案，区分「无会话 / 损坏 / 已写入 /
 /// 按导入值显式关闭 / 写失败」）。

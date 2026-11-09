@@ -1,0 +1,20 @@
+[package]
+name = "text_open"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 文本打开/编码/差异核心 crate（大文档分块读盘归一 + 文本编码探测与按原编码保存 + WYSIWYG 写回增量行级 diff，纯库零视图依赖）"
+
+[dependencies]
+# 大文档分块打开的分块阈值 / 读缓冲常量（config::limits）。
+config = { path = "../config" }
+# 行宽直方图与全量行宽统计：editor 视图层门面的核心层在 editor_core（buffer::LineWidthHistogram / compute_line_stats）。
+editor_core = { path = "../editor_core" }
+# 分块归一化：memchr2 找 \r/\n 分隔符的字节级快路径。
+memchr = { workspace = true }
+# 非 UTF-8 文本（GBK/GB18030/UTF-16 BOM）探测 / 解码 / 按原编码编码回写。
+encoding_rs = { workspace = true }
+
+[dev-dependencies]
+# open_progress 测试对照全量 compute_line_stats 需要 Rope 建型（既有 workspace 依赖重分配）。
+ropey = { workspace = true }

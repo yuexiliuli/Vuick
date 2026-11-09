@@ -808,7 +808,7 @@ impl EditorApp {
             let n_chars = content.as_ref().chars().count();
             tab.line_count = n_lines;
             tab.char_count = n_chars;
-            replaces = super::diff::line_diff(base.as_str(), content.as_ref());
+            replaces = text_open::line_diff(base.as_str(), content.as_ref());
             if !replaces.is_empty() {
                 tab.editor.update(cx, |ed, _| ed.apply_replaces(&replaces));
             }
@@ -946,7 +946,7 @@ impl EditorApp {
     }
 
     /// Step2/3：大文档 md「打开即提前整篇解析」——首块挂载（`apply_open_chunk`）后立刻以
-    /// 独立后台任务**从文件路径读全文**（复用 `open_progress::ChunkReader` 归一化：
+    /// 独立后台任务**从文件路径读全文**（复用 `text_open::ChunkReader` 归一化：
     /// CRLF/孤立 CR → LF、UTF-8 校验，结果与分块读盘后的编辑区逐字节一致）+ 整篇
     /// `open_from_str` 解析，与编辑区分块追加**并行**（不再等 EOF 才开跑 Doc::open）。
     /// Step3：与 [`Self::md_wy_spawn_prefix_install`] **两阶段**协作——prefix 首装先行
@@ -983,7 +983,7 @@ impl EditorApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    use crate::app::open_progress::ChunkReader;
+                    use text_open::ChunkReader;
                     let mut text = String::new();
                     let mut reader = ChunkReader::open(&p)?;
                     while let Some(chunk) = reader.next_chunk()? {

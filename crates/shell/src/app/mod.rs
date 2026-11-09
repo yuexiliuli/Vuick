@@ -28,17 +28,16 @@
 //! - [`chrome`]：主题 / 外壳配色、标题栏与通知层
 //! - [`layout`]：主体布局与根视图渲染（`Render` 实现、欢迎页、快捷键接线）
 //!
-//! 其余职责已在更早拆分：`file_ops`（打开/保存/粘贴）、`open_progress`（大文档分块
-//! 异步就绪）、`menu`（菜单栏）、`palette`（命令面板）、`panes`（编辑/预览宿主与
-//! 分割线）、`sidebar`（侧边栏）、`status_bar`（状态栏）、`tabs`（选项卡栏）。
+//! 其余职责已在更早拆分：`file_ops`（打开/保存/粘贴）、`text_open`（大文档分块
+//! 异步就绪 / 编码 / 差异，独立叶子 crate）、`menu`（菜单栏）、`palette`（命令面板）、
+//! `panes`（编辑/预览宿主与分割线）、`sidebar`（侧边栏）、`status_bar`（状态栏）、
+//! `tabs`（选项卡栏）。
 
 mod file_ops;
-mod open_progress;
 mod menu;
 mod music_player;
 mod palette;
 mod panes;
-mod recent_panel;
 mod sidebar;
 mod status_bar;
 mod tabs;
@@ -48,8 +47,6 @@ mod tabs;
 // （可见于 `app`）；原 `pub` / `pub(super)`（= crate 可见）搬入私有子模块后升为 `pub(crate)`）。
 mod chrome;
 mod close_tray;
-mod diff;
-mod encoding;
 mod file_tree_prompt;
 mod init;
 mod layout;
@@ -106,7 +103,7 @@ struct EditorTab {
     editor: gpui::Entity<editor::CodeEditor>,
     /// 当前文件路径（None = 未命名）
     file_path: Option<PathBuf>,
-    /// 本选项卡的**源文本编码**（[`crate::app::encoding`]）：`None` = 纯 UTF-8（新建/
+    /// 本选项卡的**源文本编码**（[`text_open::encoding`]）：`None` = 纯 UTF-8（新建/
     /// 打开/媒体）；`Some(&'static Encoding)` = 打开时探测出的非 UTF-8 编码（含带 BOM
     /// 的 UTF-8/UTF-16）。保存（`write_to_path`）按此编码把缓冲 UTF-8 转回字节写盘。
     /// 随选项卡搬迁（EditorTab ⇄ DetachedTab 整包搬移）、文档编码随文档走。
@@ -665,9 +662,10 @@ pub struct EditorApp {
     /// 跨重启持久化（`UserPrefs::recent_files`）；面板四区域模式只展示前 10。
     pub(crate) recent_files: Vec<String>,
     /// 「打开最近」居中大面板（反馈 2）：打开时为 `Some`，择项 / Esc / 点击外
-    /// （`DismissEvent`）关闭后清空。面板是独立 [`recent_panel::RecentPanel`] 实体
-    /// （mode/选中/最近列表快照自持；More/返回 单实体切模式）。
-    recent_panel: Option<gpui::Entity<recent_panel::RecentPanel>>,
+    /// （`DismissEvent`）关闭后清空。面板是独立 [`session_store::RecentPanel`] 实体
+    /// （mode/选中/最近列表快照自持；More/返回 单实体切模式），实体已迁独立 crate
+    /// `session_store`（`<EditorApp>` 为 [`session_store::RecentPanelHost`] 宿主）。
+    recent_panel: Option<gpui::Entity<session_store::RecentPanel<EditorApp>>>,
     /// 最近面板的关闭订阅（择项/Esc/点击外 → 清空引用并释放实体）。
     _recent_panel_sub: Option<Subscription>,
     focus_handle: FocusHandle,
@@ -807,3 +805,4 @@ impl Focusable for EditorApp {
         self.focus_handle.clone()
     }
 }
+

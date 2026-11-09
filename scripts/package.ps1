@@ -1,7 +1,7 @@
 <#
 一键打包可分发的 gpui-editor（release 二进制 + media_ffmpeg.dll + FFmpeg 运行库）。
 
-背景：视频解码内核已拆成独立 cdylib（工作区成员 media-ffmpeg，产物 media_ffmpeg.dll），
+背景：视频解码内核已拆成独立 cdylib（工作区成员 media_ffmpeg，产物 media_ffmpeg.dll），
 主 exe 只经 libloading 在打开视频时才「运行时」加载它（PE 导入表里没有 FFmpeg dll）。
 因此：
   - exe 缺 FFmpeg 也能正常启动，只在用视频时于窗口内报「缺少视频运行库」；
@@ -10,7 +10,7 @@
 本脚本产出 dist\gpui-editor-win64\：
   - gpui-editor.exe（release，非 debug：debug 还依赖 vcruntime140d/ucrtbased 调试 CRT）
   - media_ffmpeg.dll（视频解码内核，本仓库 cdylib 构建产物）
-  - media_ffmpeg.dll **实际导入**的 FFmpeg dll（导入表驱动自动随必需集；media-ffmpeg
+  - media_ffmpeg.dll **实际导入**的 FFmpeg dll（导入表驱动自动随必需集；media_ffmpeg
     Cargo.toml 已剪 device/filter feature → 只带 avcodec/avformat/avutil/swresample/swscale，
     不再拷 avdevice/avfilter。与编译期同一 FFmpeg 构建、版本一致不会 ABI 错位）
   - THIRD_PARTY_NOTICES.md + third_party/（第三方合规声明与 FFmpeg LGPL 许可原文，LGPL 随分发义务）
@@ -109,16 +109,16 @@ if ($Simulate) {
     exit 0
 }
 
-# ---------- 1) release 构建（exe 与 media-ffmpeg 分开构建，确保 cdylib 一定产出） ----------
-Write-Host "[1/3] cargo build --release（exe + media-ffmpeg cdylib）..."
+# ---------- 1) release 构建（exe 与 media_ffmpeg 分开构建，确保 cdylib 一定产出） ----------
+Write-Host "[1/3] cargo build --release（exe + media_ffmpeg cdylib）..."
 cargo build --release -p gpui-editor
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[错误] release exe 构建失败。"
     exit 1
 }
-cargo build --release -p media-ffmpeg
+cargo build --release -p media_ffmpeg
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[错误] media-ffmpeg（cdylib）构建失败。"
+    Write-Host "[错误] media_ffmpeg（cdylib）构建失败。"
     exit 1
 }
 $exe = Join-Path (Get-Location) 'target\release\gpui-editor.exe'
@@ -141,7 +141,7 @@ Copy-Item $exe (Join-Path $outDir 'gpui-editor.exe') -Force
 Copy-Item $kernel (Join-Path $outDir 'media_ffmpeg.dll') -Force
 
 # 2b) FFmpeg 运行库：三态判定（Get-FfmpegDecision）按 media_ffmpeg.dll 的实际导入表驱动，只带必需件。
-# media-ffmpeg/Cargo.toml 已剪掉 device/filter feature → avdevice/avfilter 不在导入表，
+# media_ffmpeg/Cargo.toml 已剪掉 device/filter feature → avdevice/avfilter 不在导入表，
 # 自动不再复制（本机 FFMPEG_DIR\bin 全量约 230MB → B1 仅 5 件约 121MB）；今后再改 feature
 # 导入表变，重新打包即自适应，无需改本清单。B2 静态态导入表无 av/sw → 什么都不拷。
 $decision = Get-FfmpegDecision -KernelDll $kernel

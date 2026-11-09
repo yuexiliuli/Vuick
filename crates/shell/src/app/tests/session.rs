@@ -13,7 +13,7 @@
     /// 清单 roundtrip：file + new 混合、顺序与 active_tab 保存一致（含空格/中文路径）。
     #[test]
     fn manifest_roundtrip() {
-        use session::{SessionManifest, SessionTab};
+        use session_store::{SessionManifest, SessionTab};
         let dir = session_temp_dir("manifest_roundtrip");
         let m = SessionManifest {
             version: 1,
@@ -26,8 +26,8 @@
                 },
             ],
         };
-        assert!(session::write_manifest(&dir, &m), "清单应原子写成功");
-        let back = session::read_manifest(&dir).expect("清单应可读回");
+        assert!(session_store::write_manifest(&dir, &m), "清单应原子写成功");
+        let back = session_store::read_manifest(&dir).expect("清单应可读回");
         assert_eq!(back, m, "roundtrip 后清单应完全一致");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -37,14 +37,14 @@
     #[test]
     fn manifest_corrupt_or_missing_safe_fallback() {
         let dir = session_temp_dir("manifest_corrupt");
-        assert!(session::read_manifest(&dir).is_none(), "缺失清单 → None");
+        assert!(session_store::read_manifest(&dir).is_none(), "缺失清单 → None");
         std::fs::write(dir.join("session.json"), "{ 不是 JSON !!!").unwrap();
-        assert!(session::read_manifest(&dir).is_none(), "损坏 JSON → None");
+        assert!(session_store::read_manifest(&dir).is_none(), "损坏 JSON → None");
         std::fs::write(dir.join("session.json"), "[1,2,3]").unwrap();
-        assert!(session::read_manifest(&dir).is_none(), "非对象 JSON → None");
+        assert!(session_store::read_manifest(&dir).is_none(), "非对象 JSON → None");
         // 空对象（合法但缺全部字段）→ 回退最小清单，不 panic。
         std::fs::write(dir.join("session.json"), "{}").unwrap();
-        let m = session::read_manifest(&dir).expect("合法空对象应回退最小清单");
+        let m = session_store::read_manifest(&dir).expect("合法空对象应回退最小清单");
         assert_eq!(m.active_tab, 0);
         assert!(m.tabs.is_empty());
         assert_eq!(m.version, 1);
@@ -55,15 +55,15 @@
     #[test]
     fn slot_roundtrip_including_empty() {
         let dir = session_temp_dir("slot_roundtrip");
-        assert!(session::write_slot(&dir, "t0", ""));
-        assert!(session::write_slot(&dir, "t1", "第一行\n第二行\ncrlf\r\n可归一"));
+        assert!(session_store::write_slot(&dir, "t0", ""));
+        assert!(session_store::write_slot(&dir, "t1", "第一行\n第二行\ncrlf\r\n可归一"));
         // CRLF 写入后应被 LF 规范化（返回是读盘原样，断言写前已归一：直接读文件）。
         let raw = std::fs::read_to_string(dir.join("t1")).unwrap();
         assert!(!raw.contains("\r"), "槽位文件应 LF 规范化（未含 CR）");
-        assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some(""), "空内容也应写文件并可读回");
-        assert_eq!(session::read_slot(&dir, "t1").as_deref(), Some("第一行\n第二行\ncrlf\n可归一"));
+        assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some(""), "空内容也应写文件并可读回");
+        assert_eq!(session_store::read_slot(&dir, "t1").as_deref(), Some("第一行\n第二行\ncrlf\n可归一"));
         assert!(dir.join("t0").is_file(), "空内容也写槽位文件");
-        assert_eq!(session::read_slot(&dir, "t999"), None, "缺失槽位 → None");
+        assert_eq!(session_store::read_slot(&dir, "t999"), None, "缺失槽位 → None");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -92,13 +92,13 @@
             });
         });
         // 落盘内容核对：3 个 new 槽位 t0..t2，空内容也在。
-        let m = session::read_manifest(&dir).expect("保存后清单应存在");
+        let m = session_store::read_manifest(&dir).expect("保存后清单应存在");
         assert_eq!(m.tabs.len(), 3);
         assert_eq!(m.active_tab, 2);
-        assert!(matches!(m.tabs[0], session::SessionTab::New { ref slot, .. } if slot == "t0"));
-        assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some(""));
-        assert_eq!(session::read_slot(&dir, "t1").as_deref(), Some("内容甲"));
-        assert_eq!(session::read_slot(&dir, "t2").as_deref(), Some("内容乙"));
+        assert!(matches!(m.tabs[0], session_store::SessionTab::New { ref slot, .. } if slot == "t0"));
+        assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some(""));
+        assert_eq!(session_store::read_slot(&dir, "t1").as_deref(), Some("内容甲"));
+        assert_eq!(session_store::read_slot(&dir, "t2").as_deref(), Some("内容乙"));
 
         // 全新窗口实例恢复。
         let (app_b, cx) = add_app_zero_tabs(cx);
@@ -153,10 +153,10 @@
                 assert!(session::save_session_to(app, &dir, cx));
             });
         });
-        let m = session::read_manifest(&dir).expect("清单应存在");
-        assert!(matches!(m.tabs[0], session::SessionTab::File { .. }));
-        assert!(matches!(m.tabs[1], session::SessionTab::New { .. }));
-        assert!(matches!(m.tabs[2], session::SessionTab::File { .. }));
+        let m = session_store::read_manifest(&dir).expect("清单应存在");
+        assert!(matches!(m.tabs[0], session_store::SessionTab::File { .. }));
+        assert!(matches!(m.tabs[1], session_store::SessionTab::New { .. }));
+        assert!(matches!(m.tabs[2], session_store::SessionTab::File { .. }));
         assert_eq!(m.active_tab, 2);
 
         let (app_b, cx) = add_app_zero_tabs(cx);
@@ -194,14 +194,14 @@
     async fn restore_clamps_out_of_range_active_tab(cx: &mut TestAppContext) {
         init_test(cx);
         let dir = session_temp_dir("active_clamp");
-        use session::{SessionManifest, SessionTab};
+        use session_store::{SessionManifest, SessionTab};
         let m = SessionManifest {
             version: 1,
             active_tab: 5,
             tabs: vec![SessionTab::New { slot: "t0".into(), name: "未命名".into() }],
         };
-        assert!(session::write_manifest(&dir, &m));
-        assert!(session::write_slot(&dir, "t0", "x"));
+        assert!(session_store::write_manifest(&dir, &m));
+        assert!(session_store::write_slot(&dir, "t0", "x"));
         let (app, cx) = add_app_zero_tabs(cx);
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -223,14 +223,14 @@
         init_test(cx);
         let dir = session_temp_dir("switch_off");
         // 先有一个遗留清单/槽位（模拟上次开启时留下的陈旧会话）。
-        use session::{SessionManifest, SessionTab};
+        use session_store::{SessionManifest, SessionTab};
         let m = SessionManifest {
             version: 1,
             active_tab: 0,
             tabs: vec![SessionTab::New { slot: "t0".into(), name: "未命名".into() }],
         };
-        assert!(session::write_manifest(&dir, &m));
-        assert!(session::write_slot(&dir, "t0", "陈旧"));
+        assert!(session_store::write_manifest(&dir, &m));
+        assert!(session_store::write_slot(&dir, "t0", "陈旧"));
 
         let (app, cx) = add_app(cx);
         // 开关关 + 保存 → 只清不写（遗留清单/槽位被清理）。
@@ -276,7 +276,7 @@
             std::process::id()
         ));
         std::fs::write(&present, "在").unwrap();
-        use session::{SessionManifest, SessionTab};
+        use session_store::{SessionManifest, SessionTab};
         let m = SessionManifest {
             version: 1,
             active_tab: 1,
@@ -285,7 +285,7 @@
                 SessionTab::File { path: present.clone() },
             ],
         };
-        assert!(session::write_manifest(&dir, &m));
+        assert!(session_store::write_manifest(&dir, &m));
         let (app, cx) = add_app_zero_tabs(cx);
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -310,7 +310,7 @@
     /// 删除；目录缺失 → 安全 true（不 panic、无操作）。
     #[test]
     fn prune_unreferenced_slots_deletes_orphans_keeps_refs_and_tmp() {
-        use session::{SessionManifest, SessionTab};
+        use session_store::{SessionManifest, SessionTab};
         let dir = session_temp_dir("prune_cleanup");
         let m = SessionManifest {
             version: 1,
@@ -325,14 +325,14 @@
         std::fs::write(dir.join("t2"), "孤儿").unwrap();
         std::fs::write(dir.join("t0.tmp"), "写入中").unwrap();
         std::fs::write(dir.join("session.json"), "{}").unwrap();
-        assert!(session::prune_unreferenced_slots(&dir, &m), "清理应成功");
+        assert!(session_store::prune_unreferenced_slots(&dir, &m), "清理应成功");
         assert!(dir.join("t0").exists(), "被引用槽位保留");
         assert!(dir.join("t0.tmp").exists(), ".tmp 中间文件保留");
         assert!(dir.join("session.json").exists(), "清单保留");
         assert!(!dir.join("t1").exists(), "孤儿 t1 删除");
         assert!(!dir.join("t2").exists(), "孤儿 t2 删除");
         assert!(
-            session::prune_unreferenced_slots(&dir.join("不存在的目录"), &m),
+            session_store::prune_unreferenced_slots(&dir.join("不存在的目录"), &m),
             "目录缺失应安全返回"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -352,8 +352,8 @@
                 let i1 = app.make_tab(window, cx);
                 app.tabs[i1].editor.update(cx, |ed, _| ed.set_text("乙"));
                 assert!(session::save_session_to(app, &dir, cx), "首次保存应成功");
-                assert!(session::read_slot(&dir, "t0").is_some(), "首轮 t0 在盘");
-                assert!(session::read_slot(&dir, "t1").is_some(), "首轮 t1 在盘");
+                assert!(session_store::read_slot(&dir, "t0").is_some(), "首轮 t0 在盘");
+                assert!(session_store::read_slot(&dir, "t1").is_some(), "首轮 t1 在盘");
                 // 关掉 idx=1（乙）：保留 idx=0（甲）；remove_tab 自带即时持久化（测试构建
                 // 短路），此处显式再存，验证裁剪。
                 app.remove_tab(i1, window, cx);
@@ -361,7 +361,7 @@
             });
         });
         assert!(dir.join("session.json").exists(), "清单应在");
-        assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("甲"), "保留槽位内容正确");
+        assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("甲"), "保留槽位内容正确");
         assert!(!dir.join("t1").exists(), "被关选项卡的旧槽位 t1 应清理");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -381,16 +381,16 @@
                 let i2 = app.make_tab(window, cx);
                 app.tabs[i2].editor.update(cx, |ed, _| ed.set_text("丙"));
                 assert!(session::save_session_to(app, &dir, cx));
-                assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some(""), "空内容也在盘");
-                assert_eq!(session::read_slot(&dir, "t2").as_deref(), Some("丙"), "t2 首轮在盘");
+                assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some(""), "空内容也在盘");
+                assert_eq!(session_store::read_slot(&dir, "t2").as_deref(), Some("丙"), "t2 首轮在盘");
                 app.remove_tab(i1, window, cx); // 关「乙」
                 assert!(session::save_session_to(app, &dir, cx));
             });
         });
-        let m = session::read_manifest(&dir).expect("清单应在");
+        let m = session_store::read_manifest(&dir).expect("清单应在");
         assert_eq!(m.tabs.len(), 2, "重存后 2 个未命名槽位");
-        assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some(""), "t0=空内容正确");
-        assert_eq!(session::read_slot(&dir, "t1").as_deref(), Some("丙"), "t1=剩余内容正确");
+        assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some(""), "t0=空内容正确");
+        assert_eq!(session_store::read_slot(&dir, "t1").as_deref(), Some("丙"), "t1=剩余内容正确");
         assert!(!dir.join("t2").exists(), "孤儿 t2 应清理");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -464,8 +464,8 @@
                 // 只改 t0 内容：重存后盘上 t0 更新、t1 不变（盘点正确性不受跳过影响）。
                 app.tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲改"));
                 assert!(session::save_session_to(app, &dir, cx));
-                assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("甲改"), "变化槽位重写");
-                assert_eq!(session::read_slot(&dir, "t1").as_deref(), Some("乙"), "未变槽位盘面原样");
+                assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("甲改"), "变化槽位重写");
+                assert_eq!(session_store::read_slot(&dir, "t1").as_deref(), Some("乙"), "未变槽位盘面原样");
 
                 // 关掉 idx=1 → 重存：指纹淘汰 t1、只留 live 槽 t0（重编号后仍对应正确内容）。
                 app.remove_tab(i1, window, cx);
@@ -474,7 +474,7 @@
                     app.session_slot_hashes.len() == 1 && app.session_slot_hashes.contains_key("t0"),
                     "指纹只留 live 槽（内存不膨胀）"
                 );
-                assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("甲改"));
+                assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("甲改"));
             });
         });
         let _ = std::fs::remove_dir_all(&dir);
@@ -495,7 +495,7 @@
                 // 开启态保存：槽位落盘 + 指纹记录。
                 app.session_restore = true;
                 assert!(session::save_session_to(app, &dir, cx));
-                assert!(session::read_slot(&dir, "t0").is_some(), "开启态槽位在盘");
+                assert!(session_store::read_slot(&dir, "t0").is_some(), "开启态槽位在盘");
 
                 // 关（只清不写）：盘面与指纹一并清空。
                 app.session_restore = false;
@@ -507,7 +507,7 @@
                 app.session_restore = true;
                 assert!(session::save_session_to(app, &dir, cx));
                 assert_eq!(
-                    session::read_slot(&dir, "t0").as_deref(),
+                    session_store::read_slot(&dir, "t0").as_deref(),
                     Some("内容"),
                     "重开后槽位重新落盘"
                 );
@@ -559,7 +559,7 @@
         );
         let t = Instant::now();
         for _ in 0..n {
-            assert!(session::write_slot(&dir, "t0", ""));
+            assert!(session_store::write_slot(&dir, "t0", ""));
         }
         eprintln!(
             "[bench-parts] write_slot(空槽位原子写): {:.1}us/次",
@@ -597,7 +597,7 @@
                 // 内容变化只重写槽位；清单不含正文 → 清单不重写（指纹不变）。
                 app.tabs[i].editor.update(cx, |ed, _| ed.set_text("内容2"));
                 assert!(session::save_session_to(app, &dir, cx));
-                assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("内容2"), "内容变化重写槽位");
+                assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("内容2"), "内容变化重写槽位");
                 assert_eq!(app.session_last_manifest_digest, digest1, "内容不入清单 → 清单指纹不变");
 
                 // 结构变化（新建 + 激活新 tab → active_tab 变）→ 清单指纹变并重写。
@@ -722,17 +722,17 @@
         let f2 = std::env::temp_dir().join(format!("gpui-prog-sync-{}-b.txt", std::process::id()));
         std::fs::write(&f1, "fn main() {\n    let x = 1;\n}\n").unwrap();
         std::fs::write(&f2, "line1\nline2\nline3\n").unwrap();
-        let m = session::SessionManifest {
+        let m = session_store::SessionManifest {
             version: 1,
             active_tab: 1,
             tabs: vec![
-                session::SessionTab::File { path: f1.clone() },
-                session::SessionTab::New { slot: "t0".into(), name: "未命名".into() },
-                session::SessionTab::File { path: f2.clone() },
+                session_store::SessionTab::File { path: f1.clone() },
+                session_store::SessionTab::New { slot: "t0".into(), name: "未命名".into() },
+                session_store::SessionTab::File { path: f2.clone() },
             ],
         };
-        assert!(session::write_manifest(&dir, &m), "清单应写入");
-        session::write_slot(&dir, "t0", "未命名内容甲");
+        assert!(session_store::write_manifest(&dir, &m), "清单应写入");
+        session_store::write_slot(&dir, "t0", "未命名内容甲");
 
         // 同步版基准（改前行为）：同清单恢复后的最终态。
         let (app_sync, cx_sync) = add_app_zero_tabs(cx);
@@ -758,12 +758,12 @@
         // 渐进版：新实例 schedule_restore → 首帧前零 tab（A1 核心）→ 逐帧泵到完成。
         // 注意：同步版恢复已完成并清盘（清单/槽位被删，属既有语义）→ 此处**重新播种**
         // 同清单 + 槽位，供渐进版原样恢复（最终态对拍才有意义）。
-        assert!(session::write_manifest(&dir, &m), "渐进版清单应重新写入");
-        session::write_slot(&dir, "t0", "未命名内容甲");
+        assert!(session_store::write_manifest(&dir, &m), "渐进版清单应重新写入");
+        session_store::write_slot(&dir, "t0", "未命名内容甲");
         let (app_prog, cx_prog) = add_app_zero_tabs(cx);
         cx_prog.update(|window, cx| {
             app_prog.update(cx, |app, cx| {
-                let man = session::read_manifest(&dir).expect("清单应可读回");
+                let man = session_store::read_manifest(&dir).expect("清单应可读回");
                 app.schedule_restore(window, cx, dir.clone(), man);
                 assert!(app.tabs.is_empty(), "首帧前（on_next_frame 前）不得同步恢复任何 tab");
                 assert!(app.session_restoring, "恢复期间应抑制持久化");

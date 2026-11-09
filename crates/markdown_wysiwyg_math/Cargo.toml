@@ -1,0 +1,20 @@
+[package]
+name = "markdown_wysiwyg_math"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor WYSIWYG 的数学渲染子系统：LaTeX 排版（parse→layout→render 光栅位图）与行内/块公式整形（自 markdown_wysiwyg 的 wysiwyg/math + math_typeset 拆出的独立 crate，纯结构移动，只重分配既有依赖）"
+
+[dependencies]
+# 渲染/宿主：gpui 钉 zed 提交（workspace 统一版本）。
+gpui = { workspace = true }
+# 位图（RaTeX PNG 解码回像素后重着色）栅格化。
+kimg = { workspace = true }
+# LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
+ratex-parser = { workspace = true }
+ratex-layout = { workspace = true }
+ratex-render = { workspace = true }
+# 排版常量（MATH_FONT_SIZE / INLINE_MATH_BAND / MATH_PAD / INLINE_MATH_PAD）。
+config = { path = "../config" }
+# 向上依赖：共享 parse 解析层（inline_style 的行内 `$…$` 识别 / splice / Unicode 展平命名）。
+markdown = { path = "../markdown" }

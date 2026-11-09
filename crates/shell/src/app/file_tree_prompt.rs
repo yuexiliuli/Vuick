@@ -1,7 +1,7 @@
 //! 文件树「新建/重命名」输入弹层：居中 Acrylic 卡片 + 单行输入框（复用 `ui::input`），
 //! 回车/确定提交 → 回调宿主执行文件系统操作；失败在卡片内联提示（不静默丢反馈）；
 //! Esc/取消/点外 → 关闭（发 `DismissEvent`，宿主清引用释放实体）。焦点管理同
-//! [`recent_panel::RecentPanel`]（开前记焦点、动作未带走才归还）。
+//! [`session_store::RecentPanel`]（开前记焦点、动作未带走才归还）。
 
 use super::*;
 use gpui::{EventEmitter, KeyDownEvent, WeakEntity};
