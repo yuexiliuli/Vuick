@@ -27,6 +27,9 @@ pub use crate::dynamic_image::DynamicImage;
 
 mod image_buf_ext;
 pub use crate::image_buf_ext::ImageBufferExt;
+
+#[cfg(test)]
+mod bench_rgb8_rgba8;
 pub use crate::free_functions::{
     load_from_memory, load_from_memory_with_format, open, save_buffer, save_buffer_with_format,
 };

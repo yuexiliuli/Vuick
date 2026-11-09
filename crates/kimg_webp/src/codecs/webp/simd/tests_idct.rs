@@ -447,7 +447,7 @@
     #[test]
     fn rgba8_rgb8_repack_matches_scalar() {
         let mut rng = Lcg(0x55aa_55aa_55aa_55aa);
-        for n in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 17, 33, 257, 4096] {
+        for n in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 33, 257, 4096, 10_000] {
             // 4→3 抽条。
             let rgba: Vec<u8> = (0..n * 4).map(|_| rng.byte()).collect();
             let mut rgb_simd = vec![0u8; n * 3];

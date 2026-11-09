@@ -318,9 +318,40 @@ pub(in super::super) fn rgba8_to_rgb8(src: &[u8], dst: &mut [u8]) {
     }
 }
 
-/// RGB8 → RGBA8 扩写（3→4，alpha 恒 255）：SSSE3 每 4 像素（12B 读 → 16B 写；12B 读
-/// 不越界：offset=(n-4)*3 恰 12B ≤ n*3），尾像素标量。无 SSSE3 → 全标量。
-/// 与 `Pixel::to_rgba` 的 `[r,g,b,255]` 逐字节一致。
+/// RGB8 → RGBA8 AVX2 8px 核：每批 8 像素（两次 16B 重叠载入 offset 0/12 各出 4 RGBA → 拼
+/// 256 位一次写），与 kimg_bmp `bgr24_to_rgba_avx2` 同款结构（仅无 BGR 换序，掩码直取）。
+/// 前进条件 `3i+28<=3n` 保证两次载入（i*3..i*3+27）整段在输入内。返回已处理像素数；
+/// 余像素由调用方经 SSSE3/标量兜底。**Safety**：调用方须先经 `simd_on("avx2")` 判定，
+/// 本函数 `#[target_feature]` 未做 `is_*` 运行时检查，无 AVX2 的 CPU 上执行即 SIGILL。
+/// （AVX2 CPU 必带 SSSE3，故同时启用 avx2+ssse3 满足 `_mm_shuffle_epi8` 依赖。）
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "ssse3")]
+unsafe fn rgb8_to_rgba8_avx2_8px(src: &[u8], dst: &mut [u8], start: usize) -> usize {
+    let n = src.len() / 3;
+    let mut i = start;
+    let s = src.as_ptr();
+    let d = dst.as_mut_ptr();
+    let shuf = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
+    let alpha = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
+    while 3 * i + 28 <= 3 * n {
+        let v0 = _mm_loadu_si128(s.add(i * 3) as *const __m128i);
+        let v1 = _mm_loadu_si128(s.add(i * 3 + 12) as *const __m128i);
+        let o0 = _mm_or_si128(_mm_shuffle_epi8(v0, shuf), alpha);
+        let o1 = _mm_or_si128(_mm_shuffle_epi8(v1, shuf), alpha);
+        _mm256_storeu_si256(d.add(i * 4) as *mut __m256i, _mm256_set_m128i(o1, o0));
+        i += 8;
+    }
+    i
+}
+
+/// RGB8 → RGBA8 扩写（3→4，alpha 恒 255）：
+/// - AVX2：每批 8 像素（两次 16B 重叠载入各出 4 RGBA → 拼 256 位一次写），与 kimg_bmp
+///   `bgr24_to_rgba_avx2` 同款结构（仅无 BGR 换序，掩码直取）。前进条件 `3i+28<=3n`
+///   保证两次载入（i*3..i*3+27）整段在输入内，尾像素标量兜底。
+/// - SSSE3：每批 4 像素（12B 读 → 16B 写；12B 读不越界：offset=(n-4)*3 恰 12B ≤ n*3），
+///   掩码常数提出循环外（修 debug 慢：常数每轮重建是 to_rgba8 热点，K53 测量）。
+/// - 无 AVX2/SSSE3 → 全标量尾兜底。
+/// 与 `Pixel::to_rgba` 的 `[r,g,b,255]` 逐字节一致（纯重排 + OR 常量，不涉算术）。
 pub(in super::super) fn rgb8_to_rgba8(src: &[u8], dst: &mut [u8]) {
     debug_assert!(src.len() % 3 == 0);
     debug_assert_eq!(dst.len(), src.len() / 3 * 4);
@@ -328,18 +359,26 @@ pub(in super::super) fn rgb8_to_rgba8(src: &[u8], dst: &mut [u8]) {
     let mut i = 0usize;
     #[cfg(target_arch = "x86_64")]
     {
-        if simd_on("ssse3") {
+        if simd_on("avx2") {
+            // Safety：`simd_on("avx2")` 已保证目标 CPU 支持 AVX2（含 SSSE3，AVX2 的
+            // pshufb 依赖）；`rgb8_to_rgba8_avx2_8px` 内整段载入/写出被 `3i+28<=3n`
+            // 前条件约束在界内，余像素由下方 SSSE3/标量兜底。
+            unsafe { i = rgb8_to_rgba8_avx2_8px(src, dst, i) };
+        }
+        if i + 4 <= n && simd_on("ssse3") {
             let s = src.as_ptr();
             let d = dst.as_mut_ptr();
             unsafe {
+                let shuf = _mm_setr_epi8(
+                    0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1,
+                );
+                let alpha = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
                 while i + 4 <= n {
                     let lo = _mm_loadl_epi64(s.add(i * 3) as *const __m128i);
                     let hi32 = std::ptr::read_unaligned(s.add(i * 3 + 8) as *const u32) as i32;
                     let hi = _mm_cvtsi32_si128(hi32);
                     let data = _mm_unpacklo_epi64(lo, hi);
                     // pshufb 索引 0xFF（位 7 置位）→ 输出字节 0；OR 常量 0xFF 得 alpha=255。
-                    let shuf = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
-                    let alpha = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
                     let out = _mm_shuffle_epi8(data, shuf);
                     _mm_storeu_si128(
                         d.add(i * 4) as *mut __m128i,
