@@ -2710,9 +2710,19 @@ fn extract_image_pixels(
     // 目标尺寸夹到 i32 正整数域（Pixels=i32；真正图片嵌入尺寸都在合理范围内，仅防病态）。
     let w = req_w.clamp(1, i32::MAX as u32) as i32;
     let h = req_h.clamp(1, i32::MAX as u32) as i32;
-    let bmp = img
+    // —— 尺寸稳定性（2026-11-10，修复「复制图片」剪贴板 DIB 尺寸漂移）——
+    // pdfium-render `get_processed_bitmap_with_size` 的缩放收敛 loop 对**首次**渲染会给出
+    // 与请求差 ±1 行/列的位图（实证：请求 953×213 → 首次 953×212、第二次及以后 953×213，
+    // 且短者为长者的行前缀、字节恒等）。「复制图片」按自然分辨率语义：首渲尺寸 ≠ 请求时
+    // **重渲一次取稳定尺寸**，保证同参数多次 request_image_pixels 结果完全一致（尺寸与内容）。
+    let mut bmp = img
         .get_processed_bitmap_with_size(doc, w, h)
         .ok()?;
+    if bmp.width() != w || bmp.height() != h {
+        if let Ok(b2) = img.get_processed_bitmap_with_size(doc, w, h) {
+            bmp = b2;
+        }
+    }
     let bw = bmp.width();
     let bh = bmp.height();
     if bw <= 0 || bh <= 0 {
@@ -2735,10 +2745,31 @@ fn extract_image_pixels(
     } else {
         return None;
     }
+    // 定稿尺寸：重渲后应 = 请求；防御性兜底——仍差 ≤1 则裁/补到请求尺寸（短 = 复制末行、
+    // 长 = 截尾），绝不把 pdfium 漂移尺寸外泄；差 ≥2 视为真实内容差，用实际尺寸并保持自洽。
+    let (rw, rh) = (w as u32, h as u32);
+    let within = (bw as i64 - rw as i64).abs() <= 1 && (bh as i64 - rh as i64).abs() <= 1;
+    let (out_w, out_h) = if within { (rw, rh) } else { (bw, bh) };
+    let want = (out_w as usize) * (out_h as usize) * 4;
+    if bgra.len() > want {
+        bgra.truncate(want);
+    } else if bgra.len() < want {
+        // 短 ≤1 行：复制最后一条真实行补到尾（确定性填充，保持 bgra 与 out 尺寸自洽）。
+        let row = (out_w as usize) * 4;
+        let last_row = bgra
+            .get(bgra.len().saturating_sub(row)..)
+            .unwrap_or_default()
+            .to_vec();
+        let fill = if last_row.is_empty() { vec![0xff; row] } else { last_row };
+        while bgra.len() + fill.len() <= want {
+            bgra.extend_from_slice(&fill);
+        }
+        bgra.resize(want, 0xff);
+    }
     Some(PdfImagePixels {
         bgra,
-        width: bw,
-        height: bh,
+        width: out_w,
+        height: out_h,
     })
 }
 

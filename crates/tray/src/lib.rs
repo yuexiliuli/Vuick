@@ -174,6 +174,17 @@ pub fn read_clipboard_image_bgra() -> Option<(Vec<u8>, u32, u32)> {
     }
 }
 
+/// 清空系统剪贴板当前内容（`EmptyClipboard`）。**测试夹具用**：清掉可能残留的旧 DIB /
+/// 文本（Windows 剪贴板跨进程持久，上一进程/上一轮写入会留在系统里），让「写剪贴板 →
+/// 读回」对拍只读到本次写入，杜绝读到陈旧数据。清空失败（被占用/无桌面）→ 静默 no-op，
+/// 不 panic（调用方语义 = 「尽力清空」）。非 `windows` 目标为 no-op。
+pub fn clear_clipboard() {
+    #[cfg(windows)]
+    imp::clear_clipboard_impl();
+    #[cfg(not(windows))]
+    {}
+}
+
 /// 构造 `explorer /select,<绝对路径>` 定位命令（**只构造不 spawn**；spawn 由 UI 动作
 /// 路径负责并在失败时提示/静默）。`explorer.exe` 单参数 `"/select,<path>"` 是 Windows
 /// 标准姿势（选中该文件/目录的资源管理器窗口）。
@@ -857,6 +868,22 @@ mod imp {
             })();
             CloseClipboard().ok();
             result
+        }
+    }
+
+    /// 清空系统剪贴板当前内容（测试夹具用，见 [`crate::clear_clipboard`]）。
+    /// Open → Empty → Close；被占用/无桌面 → 静默 no-op（尽力清空，不 panic）。
+    pub(super) fn clear_clipboard_impl() {
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard,
+        };
+        // SAFETY：Open 期间 Empty + Close 为标准清空协议；失败（被占用）静默返回，
+        // 不改动其它状态。单 UI 线程调用（与写剪贴板同契约）。
+        unsafe {
+            if OpenClipboard(None).is_ok() {
+                EmptyClipboard().ok();
+                CloseClipboard().ok();
+            }
         }
     }
 
