@@ -868,19 +868,24 @@ impl super::VideoViewer {
                 //（建设备/open_hw）→ 回落 SAFE BGRA 硬解（与旧 auto 行为一致）。
                 if dual_path_allowed() {
                     if let Some(worker) = create_worker_d3d11_device() {
-                        let raw_dev = worker.device.as_raw() as usize;
-                        let raw_ctx = worker.context.as_raw() as usize;
-                        if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
-                            #[cfg(test)]
-                            {
-                                DUAL_ENGAGED.store(true, Ordering::Relaxed);
-                                HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
+                        // 预检：仅当 worker 设备真正具备 D3D11VA 解码能力才注入 FFmpeg open_hw——
+                        // 无能力适配器上直接注入会在 d3d11.dll 内 AV（见
+                        // `crate::hw::worker_d3d11va_supported` 注释；本机 Basic Display 实证）。
+                        if crate::hw::worker_d3d11va_supported(&worker.device) {
+                            let raw_dev = worker.device.as_raw() as usize;
+                            let raw_ctx = worker.context.as_raw() as usize;
+                            if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
+                                #[cfg(test)]
+                                {
+                                    DUAL_ENGAGED.store(true, Ordering::Relaxed);
+                                    HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
+                                }
+                                return Ok((
+                                    ReaderMode::Auto(*cap),
+                                    r,
+                                    Some(SharedCopier::new(worker)),
+                                ));
                             }
-                            return Ok((
-                                ReaderMode::Auto(*cap),
-                                r,
-                                Some(SharedCopier::new(worker)),
-                            ));
                         }
                     }
                 }

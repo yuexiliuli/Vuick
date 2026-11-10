@@ -36,7 +36,7 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D,
+    ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource};
@@ -92,6 +92,43 @@ pub fn create_worker_d3d11_device() -> Option<WorkerD3D> {
         return Some(WorkerD3D { device: d.0, context: d.1, kind: "warp" });
     }
     None
+}
+
+/// 预检 worker D3D11 设备是否**真正具备 D3D11VA 视频解码能力**（能否解 NV12）：双设备 GPU
+/// 直通把该设备注入 FFmpeg `open_hw` 之前调用。
+///
+/// 动机（真实崩溃根因，2026-11-10）：在「标称硬件、但无真实 D3D11VA 解码」的适配器
+///（本机 = Microsoft Basic Display / VM 虚拟 GPU；`D3D11CreateDevice(HARDWARE)` 能成功建出
+/// `kind="hardware"` 的设备，却不具备可用的视频解码能力）上，直接把该设备注入 FFmpeg 的
+/// 外部 D3D11VA 解码器初始化会在 `d3d11.dll` 内崩溃（`STATUS_ACCESS_VIOLATION`，
+/// 本仓 `video::decode::open_hw` FFI 处复现，d3d11.dll+0x5D3EE 与故障 IP 交替出现内存越界）。
+/// FFmpeg 自建设备的路径会在其内部探测到不支持并优雅回软解，唯独**注入外部设备**没有这层
+/// 探测、直接建解码器帧池 → AV。
+///
+/// 预检只走 D3D11 标准 COM 调用（`ID3D11VideoDevice` 的 profile/format 查询，不碰 FFmpeg、
+/// 不碰解码器、不建帧池），失败即视为无能力；真实 GPU 上该预检通过、双设备直通行为不变，
+/// 不通过 → 上层回落到 SAFE BGRA 硬解/软解（本机实证存活）。
+pub(crate) fn worker_d3d11va_supported(device: &ID3D11Device) -> bool {
+    use windows::core::Interface as _;
+    let Ok(video) = device.cast::<ID3D11VideoDevice>() else {
+        // 设备不暴露 D3D11VideoDevice = 该项能力缺失，直接判不支持
+        return false;
+    };
+    // 遍历全部解码 profile，任一个能解 NV12（软解帧/FFmpeg D3D11VA 输出的标准格式）即支持
+    let count = unsafe { video.GetVideoDecoderProfileCount() };
+    for index in 0..count {
+        let Ok(profile) = (unsafe { video.GetVideoDecoderProfile(index) }) else {
+            continue;
+        };
+        if let Ok(supported) =
+            unsafe { video.CheckVideoDecoderFormat(&profile, DXGI_FORMAT_NV12) }
+        {
+            if supported.as_bool() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 一帧解码帧拷进共享 NV12 槽后的产物（跨线程只传 `shared_handle` 数值）。

@@ -26,6 +26,7 @@ pub(crate) fn gather_sub_blocks_into(data: &[u8], offset: usize, out: &mut Vec<u
 
 /// 收集一帧的数据子块链为连续码流。返回 (码流, 是否带终止 0 字节)；中途截断则取残缺段。
 #[inline]
+#[allow(dead_code)] // 仅测试引用（非测试构建 dead，dormancy 保留）
 pub(crate) fn gather_sub_blocks(data: &[u8], offset: usize) -> (Vec<u8>, bool) {
     let mut codes = Vec::new();
     let terminated = gather_sub_blocks_into(data, offset, &mut codes);

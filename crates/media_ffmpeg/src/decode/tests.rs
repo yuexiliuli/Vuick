@@ -1294,12 +1294,26 @@ fn subtitle_scan_concurrent_with_video_seek_stress() {
     }
 }
 
-/// 日志过滤器（env_facs_q 收敛）：只匹配 HE-AAC SBR 断链坏帧的良性报错，其余
-/// 解码错误（如真实 decode error）必须照常透传。
+/// 日志过滤器（env_facs_q 收敛 + 硬解回退噪音收敛）：只匹配 HE-AAC SBR 断链坏帧与
+/// 硬件初始化失败回退软解的良性报错，其余解码错误（如真实 decode error）必须照常透传。
 #[test]
 fn log_filter_predicate_only_matches_env_facsq() {
     assert!(ffmpeg_log_line_is_benign("[aac @ 0000] env_facs_q 253 is invalid"));
     assert!(ffmpeg_log_line_is_benign("Reinit context to ... env_facs_q 254 is invalid"));
+    // 硬解初始化失败回退软解三连（无 D3D11VA/DXVA2 能力适配器上的期望噪音）
+    assert!(ffmpeg_log_line_is_benign(
+        "[AVHWFramesContext @ 00000256ea0f6d40] Could not create the surfaces"
+    ));
+    assert!(ffmpeg_log_line_is_benign(
+        "[AVHWFramesContext @ 00000256ea0f6d40] Error creating an internal frame pool"
+    ));
+    assert!(ffmpeg_log_line_is_benign(
+        "[h264 @ 00000256ea2b4a40] Failed setup for format dxva2_vld: hwaccel initialisation returned error."
+    ));
+    assert!(ffmpeg_log_line_is_benign(
+        "Could not create the surfaces"
+    ));
+    // 真实解码错误 / 其它噪音必须照常透传
     assert!(!ffmpeg_log_line_is_benign("[h264 @ 0000] decode error"));
     assert!(!ffmpeg_log_line_is_benign("udta parsing failed retrying raw"));
     assert!(!ffmpeg_log_line_is_benign(""));

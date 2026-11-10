@@ -136,17 +136,26 @@ static FFMPEG_LOG_QUIET: Once = Once::new();
 /// 被 [`ffmpeg_log_filter_cb`] 滤掉的良性报错条数（诊断/测试用，非热路径）。
 static FFMPEG_LOG_FILTERED: AtomicUsize = AtomicUsize::new(0);
 
-/// HE-AAC SBR 断链坏帧的良性报错特征：seek 落点非 AAC 帧对齐（MKV lacing 1ms vs AAC
-/// 21.33ms 帧长）时，解码器内部 `av_log` **ERROR** 级打印 `env_facs_q ... is invalid`——
-/// `skip_until` 已把这些坏帧丢弃（不改解码正确性），这行日志纯噪音。quiet 的
-/// `Level::Error` 挡不住（它就是 Error 级），SKIP_REPEATED 只收敛高频重复，故在此
-/// **按消息文本过滤**，其余日志照常透传。
+/// 良性报错特征（命中即从 stderr 丢弃，其余照常透传）：
+/// 1. **HE-AAC SBR 断链坏帧**：seek 落点非 AAC 帧对齐（MKV lacing 1ms vs AAC 21.33ms
+///    帧长）时，解码器内部 `av_log` **ERROR** 级打印 `env_facs_q ... is invalid`——
+///    `skip_until` 已把这些坏帧丢弃（不改解码正确性）。quiet 的 `Level::Error` 挡不住
+///    （它就是 Error 级），SKIP_REPEATED 只收敛高频重复，故按消息文本过滤。
+/// 2. **硬件解码初始化失败回退软解**：无真实 D3D11VA/DXVA2 解码能力的适配器（本机
+///    Microsoft Basic Display/WARP）上，`open_scaled_hw` 每开一次解码器都会先试硬解、
+///    失败后优雅回软解——FFmpeg 顺带 ERROR 级打印「Could not create the surfaces /
+///    Error creating an internal frame pool / Failed setup for format ...: hwaccel
+///    initialisation returned error」三连。回软解是设计行为、播放不受影响，属纯噪音；
+///    真解码错误（如 `decode error`）仍透传。
 fn ffmpeg_log_line_is_benign(line: &str) -> bool {
     line.contains("env_facs_q")
+        || line.contains("Could not create the surfaces")
+        || line.contains("Error creating an internal frame pool")
+        || line.contains("hwaccel initialisation returned error")
 }
 
 /// FFmpeg 日志回调（挂进 `av_log_set_callback`）：把每条消息格式化后按
-/// [`ffmpeg_log_line_is_benign`] 过滤，命中即丢弃（`env_facs_q ... is invalid`）；
+/// [`ffmpeg_log_line_is_benign`] 过滤，命中即丢弃（HE-AAC 坏帧 / 硬解回退噪音）；
 /// 未命中则透传给默认回调（格式化/前缀/重复收敛/落盘行为与默认一致）。
 /// 回调内禁止 panic（extern "C" unwind 会 abort）：一律 `unwrap_or` 兜底。
 unsafe extern "C" fn ffmpeg_log_filter_cb(
@@ -453,6 +462,13 @@ impl VideoReader {
         let _ = max_dim; // HW 路径不缩放（无 sws），输出即源尺寸
         if device.is_null() {
             return Err(anyhow!("外部 D3D11 设备指针为空"));
+        }
+        // 预检设备是否真正具备 D3D11VA 解码能力（能解 NV12）：无能力适配器（本机
+        // Microsoft Basic Display，D3D11CreateDevice(HARDWARE) 能建出设备、却无可用视频解码）
+        // 上直接注入会在 d3d11.dll 内 AV（0xC0000005，见 `hw::device_supports_d3d11va` 注释）；
+        // 预检失败返回干净 Err → 调用方回落 SAFE BGRA 硬解/软解（本机实证存活）。
+        if !hw::device_supports_d3d11va(device) {
+            return Err(anyhow!("外部 D3D11 设备不支持 D3D11VA 视频解码（跳过双设备直通）"));
         }
         ffmpeg::init().context("ffmpeg init 失败")?;
         quiet_ffmpeg_log_once();

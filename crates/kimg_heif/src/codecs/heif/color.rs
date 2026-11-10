@@ -155,10 +155,10 @@ pub(crate) fn to_rgba_420_row(
     #[cfg(target_arch = "x86_64")]
     let done = {
         if width >= 8 && !k.identity && std::is_x86_feature_detected!("avx2") {
-            // SAFETY: 调用前置与标量相同（y.len()>=width、cb/cr.len()>=(width+1)>>1、
-            // out.len()>=width*4，见 color_simd 模块文档）；AVX2 已运行时检出，target_feature
-            // 内核只经此处 unsafe 调用（叶子隔离，与 hevc/transform_simd 同一姿势）。
-            unsafe { super::color_simd::to_rgba_420_row_avx2(y, cb, cr, out, width, k) }
+            // target_feature 内核（SAFE 签名：调用前置与标量相同 y.len()>=width、cb/cr.len()>=
+            // (width+1)>>1、out.len()>=width*4，见 color_simd 模块文档）；AVX2 已运行时检出，
+            // 叶子隔离（与 hevc/transform_simd 同一姿势）。
+            super::color_simd::to_rgba_420_row_avx2(y, cb, cr, out, width, k)
         } else {
             0
         }

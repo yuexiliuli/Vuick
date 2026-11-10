@@ -319,6 +319,52 @@ pub(crate) fn build_external_d3d11_device_ctx(
     Ok(AvBuf(device_buf))
 }
 
+/// 预检外部注入的 D3D11 设备是否**真正具备 D3D11VA 视频解码能力**（能否解 NV12）。
+///
+/// 动机（真实崩溃根因，2026-11-10）：在「标称硬件、但无真实 D3D11VA 解码」的适配器
+///（本机 = Microsoft Basic Display / VM 虚拟 GPU；`D3D11CreateDevice(HARDWARE)` 能成功建出
+/// 设备、却不具备可用的视频解码能力）上，把该设备直接交给 FFmpeg 建外部 D3D11VA 解码器/
+/// 帧池会在 `d3d11.dll` 内 `STATUS_ACCESS_VIOLATION`（本仓 `open_external_hw` 复现，
+/// d3d11.dll+0x5D3EE 与 WARP 工作线程故障 IP 交替出现内存越界；`media_ffmpeg` 的
+/// `hw_external_*` 测试也同源崩溃）。FFmpeg 自建设备的路径会在其内部探测到不支持并优雅回
+/// 软解，唯独**注入外部设备**没有这层探测、直接建解码器帧池 → AV。
+///
+/// 预检只走 D3D11 标准 COM 调用（`ID3D11VideoDevice` 的 profile/format 查询，不碰 FFmpeg、
+/// 不碰解码器、不建帧池），失败即视为无能力；真实 GPU 上预检通过、注入解码行为不变，
+/// 不通过 → 调用方回落到 SAFE BGRA 硬解/软解（本机实证存活）。
+pub(crate) fn device_supports_d3d11va(device_raw: *mut std::ffi::c_void) -> bool {
+    use windows::core::Interface as _;
+    use windows::Win32::Graphics::Direct3D11::ID3D11VideoDevice;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
+    if device_raw.is_null() {
+        return false;
+    }
+    // edition 2024 下 `let Ok(..) = unsafe { .. } else` 非法：先求值再 let-else
+    let unk = unsafe { windows::core::IUnknown::from_raw_borrowed(&device_raw) };
+    let Some(unk) = unk else {
+        return false;
+    };
+    let cast = unk.cast::<ID3D11VideoDevice>();
+    let Ok(video) = cast else {
+        return false;
+    };
+    // 遍历全部解码 profile，任一个能解 NV12（软解帧/FFmpeg D3D11VA 输出的标准格式）即支持
+    let count = unsafe { video.GetVideoDecoderProfileCount() };
+    for index in 0..count {
+        let prof = unsafe { video.GetVideoDecoderProfile(index) };
+        let Ok(profile) = prof else {
+            continue;
+        };
+        let ok = unsafe { video.CheckVideoDecoderFormat(&profile, DXGI_FORMAT_NV12) };
+        if let Ok(supported) = ok {
+            if supported.as_bool() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// 诊断/测试用探测：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」——用**带 SHR**
 /// 的设备上下文建一个最小帧池（NV12 数组 ×4，BindFlags = `DECODER | SHADER_RESOURCE`，与
 /// libavcodec D3D11VA frame_params 一致）跑 `av_hwframe_ctx_init`：成功 = 支持；失败
@@ -334,6 +380,11 @@ pub(crate) fn d3d11_supports_shader_bound_textures(
     device: *mut std::ffi::c_void,
     device_context: *mut std::ffi::c_void,
 ) -> bool {
+    // 先预检设备是否具备基础 D3D11VA 解码能力：无能力适配器（本机 Basic Display）上直接
+    // 建 SHR 帧池同样会在 d3d11.dll 内 AV（与 open_external_hw 同源崩溃）——提前判不支持。
+    if !device_supports_d3d11va(device) {
+        return false;
+    }
     use ffmpeg::ffi::{AVBufferRef, AVD3D11VAFramesContext, AVHWFramesContext};
     let Ok(dev) = build_external_d3d11_device_ctx(device, device_context, true) else {
         return false;

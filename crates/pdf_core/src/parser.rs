@@ -107,14 +107,16 @@ fn locate_dll() -> Result<PathBuf> {
     if let Some(dir) = exe_dir {
         candidates.push(dir.join(PDFIUM_VERSIONED_NAME));
     }
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        // P4：crate 位于 crates/pdf，开发树自带的 pdfium 在工作区根 resources/pdfium/（上溯两级）。
-        candidates.push(
-            PathBuf::from(manifest)
-                .join("../../resources/pdfium")
-                .join(PDFIUM_VERSIONED_NAME),
-        );
-    }
+    // 用**编译期** manifest（pdf_core 自身目录）而非运行期 `CARGO_MANIFEST_DIR`：
+    // 运行期该变量属于「运行中的包」——`cargo run` 时是根包（仓库根），../../ 会再多上一级
+    // 到 workspace 层，找不到 resources/pdfium；编译期恒等于 crates/pdf_core，../../ = 仓库根。
+    // （与 build.rs 的 `../../resources` 上溯逻辑同源。）
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    candidates.push(
+        PathBuf::from(manifest)
+            .join("../../resources/pdfium")
+            .join(PDFIUM_VERSIONED_NAME),
+    );
     #[cfg(embed_pdfium)]
     candidates.push(extract_embedded_pdfium());
     #[cfg(not(embed_pdfium))]

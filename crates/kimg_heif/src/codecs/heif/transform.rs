@@ -162,6 +162,8 @@ pub fn apply_rgba_par(
 }
 
 /// 强制通用路径入口（与 [`apply_rgba`] 同校验；供 SIMD≡通用对拍测试与性能探针使用）。
+/// 仅测试/bench 探针引用（bin 构建图内无调用 → 非测试构建 dead；dormancy 保留）。
+#[allow(dead_code)]
 pub(crate) fn apply_rgba_generic(
     canvas: &[u8],
     canvas_w: i32,

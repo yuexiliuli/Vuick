@@ -334,11 +334,13 @@ unsafe fn rgb8_to_rgba8_avx2_8px(src: &[u8], dst: &mut [u8], start: usize) -> us
     let shuf = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
     let alpha = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
     while 3 * i + 28 <= 3 * n {
-        let v0 = _mm_loadu_si128(s.add(i * 3) as *const __m128i);
-        let v1 = _mm_loadu_si128(s.add(i * 3 + 12) as *const __m128i);
+        let v0 = unsafe { _mm_loadu_si128(s.add(i * 3) as *const __m128i) };
+        let v1 = unsafe { _mm_loadu_si128(s.add(i * 3 + 12) as *const __m128i) };
         let o0 = _mm_or_si128(_mm_shuffle_epi8(v0, shuf), alpha);
         let o1 = _mm_or_si128(_mm_shuffle_epi8(v1, shuf), alpha);
-        _mm256_storeu_si256(d.add(i * 4) as *mut __m256i, _mm256_set_m128i(o1, o0));
+        unsafe {
+            _mm256_storeu_si256(d.add(i * 4) as *mut __m256i, _mm256_set_m128i(o1, o0));
+        }
         i += 8;
     }
     i
