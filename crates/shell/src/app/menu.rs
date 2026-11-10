@@ -601,7 +601,8 @@ impl EditorApp {
 
     /// 「关闭到系统托盘」菜单标签（动态 ☑/☐ 复选标记，同 `session_restore_menu_item`
     /// 模式；纯函数供菜单渲染与 R4 回归断言共用）。
-    pub(super) fn close_to_tray_label(on: bool) -> &'static str {
+    #[doc(hidden)]
+    pub fn close_to_tray_label(on: bool) -> &'static str {
         if on {
             "☑ 关闭时最小化到系统托盘"
         } else {
@@ -698,7 +699,8 @@ impl EditorApp {
     /// 历史行为：`RecentPanel` 是 Ctrl+P 命令面板同款 Acrylic 居中卡片，打开即聚焦、
     /// 订阅 `DismissEvent`（择项/Esc/点击外 → 清引用释放实体）。
     #[allow(dead_code)]
-    pub(super) fn open_recent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    #[doc(hidden)]
+    pub fn open_recent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 最近列表快照：面板打开期间被别处更新 → 下次打开才反映最新（面板实体不
         // 在渲染路径反读宿主演变状态，避免 re-entrant borrow；记录逻辑仍走 file_ops）。
         let folders = self.model.borrow().recent_folders.clone();

@@ -76,7 +76,14 @@ impl AppHost for EditorApp {
         }
     }
 
+    /// 「测试构建」运行时注入（R3，2026-11-10）：integration 测试目标下 shell lib 以
+    /// **非 test** 编译 → `cfg!(test)` 恒 false，`persist_session`/`persist_prefs` 会
+    /// 真写 `%APPDATA%`（K8 复发）。正解 = 由各 integration 目标 `tests/common/mod.rs`
+    /// 的 `init_test()` 在 gpui App 启动前设 `GPUI_EDITOR_TEST=1`，此处运行时判定：
+    /// lib 单测仍走 `cfg!(test)`；integration 走 env；生产不设该 env → 恒 false。
     fn is_test_build(&self) -> bool {
-        cfg!(test)
+        // 只认字面 "1"（fail-closed 到生产行为）：CI/容器/共享 shell 残留 export 或意外值
+        // （"false"/"0"/"off"…）一律按非测试态处理，防 persist_session/prefs 被静默关停（丢设置）。
+        cfg!(test) || matches!(std::env::var("GPUI_EDITOR_TEST").as_deref(), Ok("1"))
     }
 }

@@ -24,7 +24,9 @@ impl EditorApp {
     /// 「媒体在新窗口打开」创建的独立媒体窗口：普通拖拽语义（`is_detached=false`），
     /// 但**不承担**启动/退出职责（不读 CLI 首参、不恢复会话、不挂退出/托盘钩子）——这些
     /// 职责只属于首个主窗口。媒体由调用方在窗口创建后经 `open_file_here` 补开（media_window.rs）。
-    pub(super) fn new_media_window(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
+    /// `#[doc(hidden)] pub`：`tests/media.rs` 新媒体窗口尺寸记录断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn new_media_window(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
         Self::new_impl(window, cx, None, false, false)
     }
 

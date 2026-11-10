@@ -68,8 +68,11 @@ fn normalize_search_query(q: &str) -> String {
 }
 
 /// 侧边栏视图。
+/// `#[doc(hidden)] pub`：`tests/bench.rs` 经 `shell::app::SidebarView` 构造
+/// `toggle_sidebar_view(SidebarView::Toc, …)`（§8.6 外提清单）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SidebarView {
+#[doc(hidden)]
+pub enum SidebarView {
     /// 当前文档目录（Markdown 标题 / PDF 书签）。
     Toc,
     /// 跨打开文件的搜索。
@@ -79,14 +82,18 @@ pub(crate) enum SidebarView {
 }
 
 /// 文件树单条子项：显示名 + 是否目录 + 完整路径。目录在前的排序结果。
+/// `#[doc(hidden)] pub`：`SidebarChromeState.files.children` 字段随 §8.6 外提链
+/// （`tests/settings_xfer.rs` 读 `e.path`）要求其元素类型可见。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TreeEntry {
+#[doc(hidden)]
+pub struct TreeEntry {
     /// 显示名（`file_name` 的 UTF-8 字符串，排序键）。
     pub(crate) name: String,
     /// 是否目录（目录优先于文件）。
     pub(crate) is_dir: bool,
     /// 完整路径（行点击 / 展开 / 打开文件的依据）。
-    pub(crate) path: PathBuf,
+    #[doc(hidden)]
+    pub path: PathBuf,
 }
 
 /// 文件树状态：根 + 已展开目录集 + 每个已展开目录的直接子项缓存。
@@ -94,14 +101,18 @@ pub(crate) struct TreeEntry {
 /// 懒加载纪律：**禁止整棵递归预扫描**——只在目录首次展开时后台读一次直接子项
 /// （[`EditorApp::spawn_file_tree_scan`]），建材缓存后折叠再展开复用；渲染逐帧
 /// O(可见行)，绝不每帧重扫 `read_dir` 或重建 HashMap。换根 → 全清。
+/// `#[doc(hidden)] pub`：`EditorApp.sidebar.files`（§8.6 外提链）元素类型。
 #[derive(Default)]
-pub(crate) struct FileTreeState {
+#[doc(hidden)]
+pub struct FileTreeState {
     /// 文件树根目录（未打开 / 路径失效 = `None`）。
-    pub(crate) root: Option<PathBuf>,
+    #[doc(hidden)]
+    pub root: Option<PathBuf>,
     /// 已展开的目录完整路径集合（折叠即移除，children 缓存保留复用）。
     pub(crate) expanded: std::collections::HashSet<PathBuf>,
     /// 每个**已扫描过**目录的直接子项缓存（漏项 = 尚未扫描，展示层按「加载中」处理）。
-    pub(crate) children: std::collections::HashMap<PathBuf, Vec<TreeEntry>>,
+    #[doc(hidden)]
+    pub children: std::collections::HashMap<PathBuf, Vec<TreeEntry>>,
     /// 正在后台扫描的目录（防重复读盘）。
     pub(crate) pending: std::collections::HashSet<PathBuf>,
     /// 树结构版本：换根 / 展开折叠 / 扫描子项落地时 +1，可见行缓存
@@ -111,7 +122,10 @@ pub(crate) struct FileTreeState {
 
 impl FileTreeState {
     /// 换根：清空已展开/子项缓存/在途扫描（残留的旧根后台读盘完成后查 `root` 丢弃）。
-    pub(crate) fn set_root(&mut self, root: Option<PathBuf>) {
+    /// `#[doc(hidden)] pub`：`tests/palette.rs` 快速打开「无打开文件夹」前置断言
+    /// （§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn set_root(&mut self, root: Option<PathBuf>) {
         self.root = root;
         self.expanded.clear();
         self.children.clear();
@@ -139,8 +153,10 @@ pub(crate) struct FileRow {
 
 /// 侧边栏「外壳」状态：可见性、当前视图与目录（TOC）面板的宽度/折叠/右缘拖拽。
 /// 与「检索输入 + 缓存 + 订阅」分属（后者仍在 `EditorApp`，后续洋葱继续剥）。
-/// 全部 `pub(crate)`：跨 `app` 子模块读写 + `app::tests` 直读。
-pub(crate) struct SidebarChromeState {
+/// `#[doc(hidden)] pub`：`EditorApp.sidebar` 字段 + `width/width_auto/files` 供
+/// `tests/settings_xfer.rs` 直读/直写（§8.6 外提清单）。
+#[doc(hidden)]
+pub struct SidebarChromeState {
     /// 侧边栏是否展开。
     pub(crate) open: bool,
     /// 侧边栏当前视图（目录 / 搜索）。
@@ -157,7 +173,8 @@ pub(crate) struct SidebarChromeState {
     /// 右侧自绘纵向滚动条跟随（与目录/编辑器一致）。
     pub(crate) search_vscroll: gpui::ScrollHandle,
     /// 文件树根 / 展开集 / 子项缓存（懒加载，见 [`FileTreeState`]）。
-    pub(crate) files: FileTreeState,
+    #[doc(hidden)]
+    pub files: FileTreeState,
     /// 文件树**可见行描述缓存** `(files.layout_gen, 行表)`：树结构没变逐帧复用，
     /// 渲染只物化可视带（同目录视图 TOC 虚拟化口径）。
     pub(crate) files_layout: Option<(u64, Vec<FileRow>)>,
@@ -174,13 +191,19 @@ pub(crate) struct SidebarChromeState {
     pub(crate) toc_cache:
         Option<(usize, u64, u64, markdown_wysiwyg::TocEntries, Vec<usize>, MdTocScroll)>,
     /// 侧边栏当前宽度（px）：目录视图随内容自适应，也可右缘拖拽手动调整。
-    pub(crate) width: f32,
+    #[doc(hidden)]
+    pub width: f32,
     /// 是否仍随目录内容自适应宽度（手动拖拽后关闭，切换文档重开）。
-    pub(crate) width_auto: bool,
+    #[doc(hidden)]
+    pub width_auto: bool,
     /// 侧边栏右缘拖拽：`Some((起始 x, 起始宽))`。
-    pub(crate) resize: Option<(f32, f32)>,
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 调宽拖拽开始/结束断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub resize: Option<(f32, f32)>,
     /// 侧边栏右缘是否被鼠标悬停（悬停时高亮提示可拖拽）。
-    pub(crate) resize_hovered: bool,
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 调宽 hover 断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub resize_hovered: bool,
 }
 
 /// 目录条目总数超过此值才启用列表虚拟化（普通小文档仍全量渲染，行为不变）。
@@ -191,7 +214,9 @@ const TOC_BAND_BUFFER: usize = 8;
 impl SidebarChromeState {
     /// 切换视图：未在该面板 → 展开并切到；已在该面板再点 → 只收起面板。
     /// （折叠/展开逻辑此前栖身在 `toggle_sidebar_view`，随状态一起收编。）
-    pub(super) fn toggle_view(&mut self, view: SidebarView) {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` TOC 面板展开断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_view(&mut self, view: SidebarView) {
         if self.panel_open && self.view == view {
             self.panel_open = false;
         } else {

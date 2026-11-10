@@ -1,3 +1,10 @@
+//! 配置/会话路径测试隔离（K8 根因探针，首拆样板）：纯断言、零 helper 依赖，验证
+//! 不设 `GPUI_EDITOR_CONFIG` 时 config/session 路径落隔离临时目录、`load()` 回退全默认。
+//! **R3**：本目标不建应用、无持久化，`GPUI_EDITOR_TEST` 由 `common::init_test` 注入
+//! （此处虽未调用，隔离语义仍由 config dev-dep `test-mode` 保证）。
+//! 断言内部与 lib 单测 `src/app/tests/config_isolation.rs` 逐字一致（P1 测试域化迁移）。
+
+mod common;
 
     // ---- K8 根因探针：配置/会话路径测试隔离 ----
     // 历史坑（K8）：config crate 作依赖被 shell 测试编译时，其自身 `cfg!(test)` 不生效

@@ -1,3 +1,12 @@
+//! 命令面板域（palette 单源 target，§8.3）：命令/文件模式、quick open 模糊检索、几何。
+//! 断言内部与 lib 单测 `src/app/tests/palette.rs` 逐字一致（P1 测试域化）；
+//! `quick_open_collect`/`QUICK_OPEN_MAX_*` 经 §8.6 外提 pub 化、`SidebarView::Toc` 经
+//! `shell::app` 访问；`common::init_test` 注入 `GPUI_EDITOR_TEST`。
+
+mod common;
+
+use common::*;
+
     // ---------------------------------------------------------------------
     // P2-8 命令面板：命令模式（Ctrl+Shift+P）+ 文件模式（Ctrl+P）
     // ---------------------------------------------------------------------
@@ -434,7 +443,7 @@
         cx.update(|_w, cx| {
             app.update(
                 cx,
-                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+                |app, cx| app.toggle_sidebar_view(shell::app::SidebarView::Toc, cx),
             );
         });
         for _ in 0..3 {
@@ -492,7 +501,7 @@
     // 命令面板闭环：quick open 模糊文件检索（Ctrl+P）
     // ---------------------------------------------------------------------
 
-    use crate::app::palette::{
+    use shell::app::{
         quick_open_collect, QUICK_OPEN_MAX_FILE_BYTES, QUICK_OPEN_MAX_FILES,
     };
 

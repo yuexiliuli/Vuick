@@ -1,3 +1,20 @@
+//! 性能基准域（全部 `#[ignore]`）：大文档打开/编辑/删除、预览桥、侧栏扫描、启动→首帧、
+//! 新开媒体窗口、拖拽拆窗断点等真夹具墙钟基准。断言内部与 lib 单测 `src/app/tests/bench.rs`
+//! 逐字一致（P1 测试域化），仅调整测试不可见的 crate 内路径：
+//! - `base::prof` → `base::prof`（lib 内私有别名 `use base::prof`，integration 直连 base）
+//! - `crate::app::sidebar::scan_line_hits` → `shell_scan::scan_line_hits`（leaf 直挂）
+//! - `crate::app::sidebar::SidebarView` → `shell::app::SidebarView`（§8.6 外提重导出）
+//! 另将 `tests/media_window.rs` 的 4 个媒体夹具 helper（`registry_window_count` /
+//! `media_win_snap` / `other_app_entity` / `placeholder_audio`）随迁本目标
+//! （`bench_new_media_window_first_frame` 依赖；该测试文件未在本批拆出）。
+//! 所有基准均 `#[ignore]`：常规 `cargo test -p shell` 不计入通过数；跑 `--ignored` 时才执行。
+
+mod common;
+
+use common::*;
+
+use shell::app::EditorAppRegistry;
+
     /// 基准：打开 16 万行大文档的逐阶段耗时（读文件 / 编辑器装配 / 预览扫描 / 首帧渲染）。
     /// 用与拖入完全相同的 `open_file` 同步路径，定位"拖入大文档卡顿几秒"到底卡在哪。
     /// 运行：`cargo test --release --bench --ignored bench_open_large_md --nocapture`（见下）
@@ -225,7 +242,7 @@
         cx.update(|_w, cx| {
             app.update(
                 cx,
-                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+                |app, cx| app.toggle_sidebar_view(shell::app::SidebarView::Toc, cx),
             );
         });
         cx.run_until_parked();
@@ -826,13 +843,13 @@
 
     /// 基准（debug，KILO_PROF=1 时为默认关闭内部拆解）：模拟真实编辑大文件的
     /// 「连续输入 → 停顿（触发预览增量同步）」节奏，逐键测插入与渲染停驻耗时，
-    /// 并用 [`crate::prof`] 输出各热点（tab_change / hl_update / hl_styles / md_render /
+    /// 并用 [`base::prof`] 输出各热点（tab_change / hl_update / hl_styles / md_render /
     /// md_ensure_window）的累计拆解。
     #[gpui::test]
     #[ignore]
     async fn bench_realistic_large_file_editing(cx: &mut TestAppContext) {
         use std::time::{Duration, Instant};
-        crate::prof::enable();
+        base::prof::enable();
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(1400.), px(900.)));
@@ -862,7 +879,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        crate::prof::dump("开篇预热后");
+        base::prof::dump("开篇预热后");
         let sample = "性能耗时代码行 performance line 1234567890 更多中文输入继续。\n";
         // —— A. 光标在文档开头连续输入 ~8 键（每键都渲染一帧）——
         let mut ins: Vec<f64> = Vec::new();
@@ -877,7 +894,7 @@
             ins.push(t1.duration_since(t).as_secs_f64() * 1000.0);
             park.push(t2.duration_since(t1).as_secs_f64() * 1000.0);
         }
-        crate::prof::dump("A. 开头连续输入8键");
+        base::prof::dump("A. 开头连续输入8键");
         println!(
             "A. 开头连续输入：insert 均值 {:.2} ms，渲染停驻均值 {:.2} ms",
             ins.iter().sum::<f64>() / ins.len() as f64,
@@ -890,7 +907,7 @@
             cx.run_until_parked();
         }
         println!("A. 停顿+预览同步 停驻 {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
-        crate::prof::dump("A. 停顿同步后");
+        base::prof::dump("A. 停顿同步后");
 
         // —— B. 光标移到文档中部继续输入 ——
         let total = cx.update(|_, cx| editor.read(cx).value().len());
@@ -908,7 +925,7 @@
             ins.push(t1.duration_since(t).as_secs_f64() * 1000.0);
             park.push(t2.duration_since(t1).as_secs_f64() * 1000.0);
         }
-        crate::prof::dump("B. 中部连续输入8键");
+        base::prof::dump("B. 中部连续输入8键");
         println!(
             "B. 中部连续输入：insert 均值 {:.2} ms，渲染停驻均值 {:.2} ms",
             ins.iter().rev().take(8).sum::<f64>() / 8.0,
@@ -920,7 +937,7 @@
             cx.run_until_parked();
         }
         println!("B. 停顿+预览同步 停驻 {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
-        crate::prof::dump("B. 停顿同步后（完成）");
+        base::prof::dump("B. 停顿同步后（完成）");
 
         // —— C. 探针：裸 ropey Rope.insert vs 编辑器 insert，分离引擎/回调 ——
         {
@@ -941,7 +958,7 @@
             println!(
                 "C. 探针：裸 ropey Rope(6MB).insert 中段 = {rope_ms:.2} ms/次；编辑器 insert（含事件/订阅） = {ins_ms:.2} ms/次"
             );
-            crate::prof::dump("C. 探针后");
+            base::prof::dump("C. 探针后");
         }
     }
 
@@ -952,7 +969,7 @@
     /// 漏斗复现同一 delete 成本——`set_selection_range(at..at+1)` + `insert_text("")`
     /// （insert_text 内部即 `insert_edit(self.selection.range(), text, …)`：逐键单字符
     /// 删除、撤销合并走同一主链）。打开真实文件后从正文中部向前逐字符删 N 次，输出
-    /// 总耗时 + ms/次（单位：ms/次），`KILO_PROF=1` 时 `crate::prof::dump` 拆账。
+    /// 总耗时 + ms/次（单位：ms/次），`KILO_PROF=1` 时 `base::prof::dump` 拆账。
     /// 运行：`cargo test --release -- --ignored --nocapture bench_editor_delete_1000_times`
     #[gpui::test]
     #[ignore]
@@ -1022,8 +1039,8 @@
             }
             let n = N.min(before - 1).max(1);
             let before_chars = cx.update(|_, cx| editor.read(cx).char_count());
-            crate::prof::enable();
-            crate::prof::dump("editor-delete.warmup");
+            base::prof::enable();
+            base::prof::dump("editor-delete.warmup");
             // 逐字符前删 = 编辑器 `delete_forward` 同款语义：光标 `at` 固定（边界，先经
             // char_left 钳正，避免 before/2 劈开多字节字符），每键删 `[at, char_right(at))`
             // 一个字符并重新取边界；删除后文档左移，固定 `at` 即连续删后继字符——
@@ -1053,7 +1070,7 @@
                 deleted += 1;
             }
             let dt = t_del.elapsed();
-            crate::prof::dump("editor-delete.measured");
+            base::prof::dump("editor-delete.measured");
             let after = cx.update(|_, cx| editor.read(cx).value().len());
             let after_chars = cx.update(|_, cx| editor.read(cx).char_count());
             let shrank = before.saturating_sub(after);
@@ -1078,11 +1095,11 @@
 
     /// 当前扫描语义的匹配阶段（直接调生产 `scan_line_hits`——`sidebar_search_scan` 的
     /// 可编辑分支正是 `value()` 物化后逐行复用它）。
-    fn new_style_scan(content: &str, q: &str) -> usize {
-        let mut out = Vec::new();
-        crate::app::sidebar::scan_line_hits(content, q, usize::MAX, &mut out);
-        out.len()
-    }
+fn new_style_scan(content: &str, q: &str) -> usize {
+    let mut out = Vec::new();
+    shell_scan::scan_line_hits(content, q, usize::MAX, &mut out);
+    out.len()
+}
 
     /// 旧式基准：每行 `to_lowercase()` 新分配小写串 + 朴素查找（物化/防抖优化前的每行分配路径）。
     fn old_style_scan(content: &str, q: &str) -> usize {
@@ -1463,5 +1480,58 @@
             t_settle.elapsed().as_millis()
         );
     }
+
+// ===== 媒体窗口夹具 helper（随迁自 tests/media_window.rs，`bench_new_media_window_first_frame` 依赖）=====
+
+/// 只读全局注册表的窗口总数（EditorAppRegistry 在每次构造时登记）。
+fn registry_window_count(cx: &mut TestAppContext) -> usize {
+    cx.update(|cx| cx.global::<EditorAppRegistry>().windows.len())
+}
+
+/// 快速读取某窗口的可观测状态：(music 模式, 活动选项卡文件路径, tab 数)。
+fn media_win_snap(
+    cx: &mut TestAppContext,
+    e: &gpui::Entity<EditorApp>,
+) -> (bool, Option<std::path::PathBuf>, usize) {
+    cx.update(|cx| {
+        let a = e.read(cx);
+        let model = a.model.borrow();
+        let tab = model.tabs.get(model.active_tab);
+        (
+            a.model.borrow().music_mode,
+            tab.and_then(|t| t.file_path.clone()),
+            a.model.borrow().tabs.len(),
+        )
+    })
+}
+
+/// 按实体 id 过滤出「非给定窗口」的注册表强实体（找另一窗口用）。
+fn other_app_entity(
+    cx: &mut TestAppContext,
+    exclude: &gpui::Entity<EditorApp>,
+) -> Vec<gpui::Entity<EditorApp>> {
+    cx.update(|cx| {
+        let reg = cx.global::<EditorAppRegistry>();
+        reg.windows
+            .iter()
+            .filter_map(|(weak, _)| {
+                let e = weak.upgrade()?;
+                (e.entity_id() != exclude.entity_id()).then_some(e)
+            })
+            .collect()
+    })
+}
+
+/// 占位音频文件（.ogg，路由只看扩展名）。
+fn placeholder_audio(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "gpui-mediawnd-a-{}-{tag}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&d);
+    let p = d.join(format!("{tag}.ogg"));
+    std::fs::write(&p, b"OggS placeholder").unwrap();
+    p
+}
 
 

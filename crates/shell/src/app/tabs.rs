@@ -102,7 +102,8 @@ pub(super) enum ReorderSide {
 
 impl EditorApp {
     /// SC-4：动作体已迁 `AppModel::make_tab`（shell_core::actions）。此处 glue 转发。
-    pub(super) fn make_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> usize {
+    #[doc(hidden)]
+    pub fn make_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> usize {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().make_tab(host, &mut **cx)
     }
@@ -171,12 +172,14 @@ impl EditorApp {
     }
 
     /// SC-4：动作体已迁 `AppModel::activate_tab`。glue 转发。
-    pub(super) fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+    #[doc(hidden)]
+    pub fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().activate_tab(host, idx, window, &mut **cx);
     }
 
-    pub(super) fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+    #[doc(hidden)]
+    pub fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if idx >= self.model.borrow().tabs.len() {
             return;
         }
@@ -337,7 +340,8 @@ impl EditorApp {
     }
 
     /// SC-4：动作体已迁 `AppModel::remove_tab`。glue 转发。
-    pub(super) fn remove_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+    #[doc(hidden)]
+    pub fn remove_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().remove_tab(host, idx, window, &mut **cx);
     }

@@ -16,8 +16,9 @@
 use super::*;
 
 /// 媒体打开去向（[`EditorApp::open_file`] 对音频/视频的重定向纯决策结果）。
+/// `pub`：经 `app` 重导出供 `tests/media.rs` 行为表断言（§8.6 外提清单）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum MediaOpenTarget {
+pub enum MediaOpenTarget {
     /// 当前窗口打开（现行行为）。
     Here,
     /// 复用 registry 中最近的已有媒体窗口打开。
@@ -28,8 +29,9 @@ pub(super) enum MediaOpenTarget {
 
 /// 媒体窗口的「当前角色」（尺寸记录按角色分开写 music / video 两组）：
 /// 与「媒体窗口」判定同源（music_mode → Music；否则活动选项卡为视频 → Video）。
+/// `pub`：经 `app` 重导出供 `tests/media.rs` 尺寸取值断言（§8.6 外提清单）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum MediaWindowKind {
+pub enum MediaWindowKind {
     /// 音乐模式（整窗 MusicView）。
     Music,
     /// 视频查看器（活动选项卡 `MediaReader::Video`）。
@@ -56,7 +58,8 @@ const MIN_MEDIA_WIN_H: f32 = 160.0;
 ///   | 开               | 关                 | any            | any            | NewWindow   |
 ///
 /// 纯函数、无副作用，单测直接覆盖全真值组合（见 tests/media_window.rs）。
-pub(super) fn resolve_media_open_target(
+/// `pub`：经 `app` 重导出供 `tests/media.rs` 行为表断言（§8.6 外提清单）。
+pub fn resolve_media_open_target(
     media_new_window: bool,
     reuse: bool,
     self_is_media: bool,
@@ -80,7 +83,8 @@ pub(super) fn resolve_media_open_target(
 /// 等非媒体窗）**内存可能陈旧**——媒体窗口 resize 自动写盘后不广播回发起窗内存，若只看
 /// 内存会退化成「调好音乐窗尺寸→关→再开仍是旧尺寸」，故以 config 盘上最新记录优先、
 /// 内存兜底（内存 = 构造期从 prefs 读入的现值）。
-pub(super) fn resolve_recorded_size(
+/// `pub`：经 `app` 重导出供 `tests/media.rs` 尺寸取值断言（§8.6 外提清单）。
+pub fn resolve_recorded_size(
     kind: MediaWindowKind,
     self_is_media: bool,
     mem_music: Option<Size<Pixels>>,
@@ -106,7 +110,9 @@ impl EditorApp {
     /// 本窗口是否「媒体窗口」（媒体打开复用目标判定）：音乐模式开启 或 活动选项卡为视频。
     /// 与 [`Self::media_window_kind`] 同源（`kind.is_some()`），保持单一事实源（行为表回归
     /// 由 tests/media_window.rs 既有 10 测试覆盖）。
-    pub(super) fn is_media_window(&self) -> bool {
+    /// `#[doc(hidden)] pub`：`tests/media.rs` 复用路由判定断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn is_media_window(&self) -> bool {
         self.media_window_kind().is_some()
     }
 
@@ -133,7 +139,9 @@ impl EditorApp {
     /// （连续 resize 不逐事件写盘，K10/K11）。去重：尺寸与上次记录一致不写；最小尺寸护栏
     /// 在写入前 clamp。角色为 `None`（非媒体窗口）时不记录（不覆盖）。
     /// 测试直接驱动（persist_prefs 在测试构建为 no-op，断言内存字段即可）。
-    pub(super) fn record_media_window_size(
+    /// `#[doc(hidden)] pub`：`tests/media.rs` 尺寸记录/取值断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn record_media_window_size(
         &mut self,
         size: Size<Pixels>,
         cx: &mut Context<Self>,
@@ -394,7 +402,9 @@ impl EditorApp {
     }
 
     /// 「媒体在新窗口打开」开关：翻转 + 立即持久化（与其它偏好同款落盘）。
-    pub(super) fn toggle_media_new_window(
+    /// `#[doc(hidden)] pub`：`tests/media.rs` 开关翻转断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_media_new_window(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -410,7 +420,9 @@ impl EditorApp {
 
     /// 「复用已有媒体窗口」开关：仅 `media_new_window` 开启时翻转（关闭时该开关无意义，
     /// 菜单项置灰；此处兜底拒绝，双保险防半开态）。
-    pub(super) fn toggle_reuse_media_window(
+    /// `#[doc(hidden)] pub`：`tests/media.rs` 开关翻转断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_reuse_media_window(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,

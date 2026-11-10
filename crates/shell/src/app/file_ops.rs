@@ -21,9 +21,10 @@ enum ChunkApply {
 }
 
 /// 自包含媒体阅读器类型（PDF / 图片 / 视频）——[`EditorApp::load_media`] 的装配参数；
-/// 解析/解码各由对应查看器在后台完成，窗口不阻塞。`pub(super)`（app 内，含测试）可见。
+/// 解析/解码各由对应查看器在后台完成，窗口不阻塞。`pub`（经 `app` 重导出，
+/// `tests/pdf.rs` 直接驱动 `load_media` 装配全 media 三态）。
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum MediaKind {
+pub enum MediaKind {
     /// PDF 阅读器（`PdfViewer`）：整页原样 + 侧边栏全文检索 + 页码。
     Pdf,
     /// 图片查看器（`ImageViewer`）：整图展示 + 同文件夹切换 + Ctrl+滚轮缩放。
@@ -250,7 +251,8 @@ impl EditorApp {
     /// 「打开最近」副作用集中入口（K10/K11：一次调用内完成「列表更新 + 落盘」，
     /// 消费点只调它，不散点直调 persist）。
     /// SC-4：逻辑已迁 [`AppModel::record_recent_file`]；此处 glue。
-    pub(super) fn record_recent_file(&mut self, path: &std::path::Path) {
+    #[doc(hidden)]
+    pub fn record_recent_file(&mut self, path: &std::path::Path) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().record_recent_file(host, path);
     }
@@ -258,7 +260,8 @@ impl EditorApp {
     /// 记录最近打开的文件夹：去重置顶 + 截 [`RECENT_MAX`] + 立即持久化
     /// （同 [`Self::record_recent_file`] 的副作用集中入口）。
     /// SC-4：逻辑已迁 [`AppModel::record_recent_folder`]；此处 glue。
-    pub(super) fn record_recent_folder(&mut self, path: &std::path::Path) {
+    #[doc(hidden)]
+    pub fn record_recent_folder(&mut self, path: &std::path::Path) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().record_recent_folder(host, path);
     }
@@ -889,8 +892,9 @@ impl EditorApp {
     }
 
     /// 把 EPUB 解析结果载入指定选项卡：纯展示（只读预览），编辑区置空。
-    /// `pub(super)`：装配回归测试（`app::tests`）直接驱动。
-    pub(super) fn load_epub(
+    /// `#[doc(hidden)] pub`：装配回归测试（`tests/pdf.rs`）直接驱动（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn load_epub(
         &mut self,
         idx: usize,
         p: &std::path::Path,
@@ -933,8 +937,10 @@ impl EditorApp {
     /// 只读预览。三项的**公共装配**（搜索缓存失效 / 画布底色 / 编辑区清空 + markdown
     /// 语言 / 文件路径与计数 / 预览全屏只读 / 状态与通知）统一在此，差异（查看器实体
     /// 创建 + PDF 订阅重绘 / 视频焦点 / 状态文案）按 `kind` 分支。解析/解码各由查看器
-    /// 自己在后台完成，窗口不阻塞。
-    pub(super) fn load_media(
+    /// 自己在后台完成，窗口不阻塞。`#[doc(hidden)] pub`：装配回归测试（`tests/pdf.rs`）
+    /// 直接驱动（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn load_media(
         &mut self,
         idx: usize,
         p: &std::path::Path,
@@ -1061,7 +1067,8 @@ impl EditorApp {
     /// 对音频/视频且 `media_new_window` 开启时，按纯决策分流（新窗口 / 复用媒体窗口 /
     /// 当前窗口，见 [`crate::app::media_window`]）；否则原样在当前窗口打开。
     /// 主体逻辑下沉到 [`Self::open_file_here`]（永不重定向，供新窗口 / 复用目标直调）。
-    pub(super) fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+    #[doc(hidden)]
+    pub fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.maybe_redirect_media_open(path, window, cx) {
             return;
         }
@@ -1271,7 +1278,8 @@ impl EditorApp {
     /// 把一个文件夹设为文件树根：路径无效 → 清空树（后续写 prefs 同步清掉）；
     /// 有效 → 换根（清整棵树）→ 展开根 → 后台读根直接子项 → 切到「文件」视图 →
     /// 持久化根路径跨重启恢复。
-    pub(super) fn open_folder_path(
+    #[doc(hidden)]
+    pub fn open_folder_path(
         &mut self,
         path: std::path::PathBuf,
         window: &mut Window,

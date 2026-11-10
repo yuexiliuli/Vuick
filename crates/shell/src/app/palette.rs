@@ -468,9 +468,11 @@ pub(super) enum QuickOpenScanUpdate {
 /// quick open 跳过的目录名（黑名单，对齐 sidebar WP-A 文件夹搜索）。
 pub(super) const QUICK_OPEN_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
 /// quick open 跳过的**超大文件**阈值：> 5MB 不列入候选（元数据判断，不读盘）。
-pub(super) const QUICK_OPEN_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+/// `pub`：经 `app` 重导出供 `tests/palette.rs` quick open 断言（§8.6 外提清单）。
+pub const QUICK_OPEN_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 /// quick open 候选上限：超过即截断（文件夹内文件增删只按「打开面板/切文件夹」刷新）。
-pub(super) const QUICK_OPEN_MAX_FILES: usize = 500;
+/// `pub`：经 `app` 重导出供 `tests/palette.rs` quick open 断言（§8.6 外提清单）。
+pub const QUICK_OPEN_MAX_FILES: usize = 500;
 /// 二进制 / 非文本扩展名黑名单（按 bool 跳过，不列入候选）。
 pub(super) const QUICK_OPEN_BINARY_EXT: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "heic", "heif", "svgz", "mp4", "mkv",
@@ -484,7 +486,8 @@ pub(super) const QUICK_OPEN_BINARY_EXT: &[&str] = &[
 /// 超大文件与二进制扩展名（扩张名黑名单即可，不读盘测内容）。显式栈 DFS（避免深目录
 /// 递归爆栈）；单目录读失败 / 单条目元数据失败 → 跳过该条目继续，不中断、不抛错。
 /// 条目按文件名排序保证确定性；达到 [`QUICK_OPEN_MAX_FILES`] 即截断。
-pub(super) fn quick_open_collect(
+/// `pub`：经 `app` 重导出供 `tests/palette.rs` quick open 检索断言（§8.6 外提清单）。
+pub fn quick_open_collect(
     root: &std::path::Path,
     session_dir: &std::path::Path,
     out: &mut Vec<(PathBuf, String)>,

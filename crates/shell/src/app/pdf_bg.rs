@@ -115,7 +115,9 @@ impl EditorApp {
 
     /// 设 PDF 画布背景偏好并立即应用 + 持久化（右键「背景色」预设/自定义点击共用）。
     /// `custom` 仅在 `Some` 时更新（重选「自定义」保留上次颜色；预设不覆盖存储值）。
-    pub(super) fn set_pdf_bg(
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 背景预设/主题切换断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn set_pdf_bg(
         &mut self,
         pref: PdfBgPref,
         custom: Option<String>,

@@ -5,7 +5,9 @@ use super::*;
 
 impl EditorApp {
     /// 切换侧边栏「展开/收起」。
-    pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    /// `#[doc(hidden)] pub`：`tests/palette.rs` 侧栏几何断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar.open = !self.sidebar.open;
         cx.notify();
     }
@@ -21,7 +23,9 @@ impl EditorApp {
     }
 
     /// 窗口整体背景（编辑区以外的画布）。
-    pub(super) fn window_bg(&self) -> gpui::Hsla {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 主题切换背景断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn window_bg(&self) -> gpui::Hsla {
         self.chrome().window_bg.into()
     }
 
@@ -125,7 +129,9 @@ impl EditorApp {
     /// 切换黑白（深色/浅色）主题：作为 light↔dark 两态切换（退出「跟随」），
     /// 偏好记为当前生效的强制档。驱动自研主题（`ui::theme`）双轨同色；
     /// 编辑器语法配色随明暗切换为 GitHub Light / Dark（见 [`syntax`]）。
-    pub(super) fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 主题切换不覆盖显式 PDF 背景断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let dark_mode = !self.model.borrow().dark_mode;
         self.model.borrow_mut().dark_mode = dark_mode;
         // 手动切换 = 退出跟随：记为强制档并写盘。
@@ -148,7 +154,9 @@ impl EditorApp {
 
     /// 把当前 `dark_mode` 落地到全局主题 + 刷新所有预览背景
     /// （toggle / 跟随系统 / 启动恢复共用同一入口）。
-    pub(super) fn refresh_theme_ui(&mut self, cx: &mut Context<Self>) {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 主题刷新后落位断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn refresh_theme_ui(&mut self, cx: &mut Context<Self>) {
         ui::theme::Theme::set(
             if self.model.borrow().dark_mode {
                 ui::theme::ThemeMode::Dark

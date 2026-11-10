@@ -1,3 +1,11 @@
+//! 「打开最近」域（recent）：记录去重置顶/截断、打开面板四区域/空态/焦点、真实菜单
+//! flyout 链路。断言内部与 lib 单测 `src/app/tests/recent.rs` 逐字一致（P1 测试域化）。
+//! ⚠ 集成目标下 shell lib 非 test 编译：`record_recent_*`/`open_recent_panel` 等动作经
+//! §8.6 外提清单 pub 化访问；`common::init_test` 注入 `GPUI_EDITOR_TEST` 短路持久化写盘。
+
+mod common;
+
+use common::*;
 
     /// 「打开最近」记录：`record_recent_file/folder` 去重置顶 + 每类 ≤50（纯逻辑断言）。
     #[gpui::test]

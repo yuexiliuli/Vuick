@@ -14,7 +14,9 @@ use super::*;
 impl EditorApp {
     /// 切换音乐模式：关 → 开（首次惰性创建 MusicView；尚未加载目录则载默认音乐目录）；
     /// 开 → 关（回编辑器界面，焦点还给活跃编辑区）。
-    pub(super) fn toggle_music_player(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `#[doc(hidden)] pub`：`tests/music.rs`/`tests/media.rs` 音乐模式切换断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_music_player(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.borrow().music_mode {
             self.model.borrow_mut().music_mode = false;
             window.focus(&self.editor_focus_handle(cx), cx);

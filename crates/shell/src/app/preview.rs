@@ -102,7 +102,9 @@ impl EditorApp {
     /// PDF / 图片 / 视频（自带阅读器）→ `None`。`render_preview_pane` /
     /// `render_fullscreen_preview` 据此决定走统一组件宿主。
     ///（M5-B5 P4-2：`MarkdownPreview` 已删，预览统一 WyEditor。）
-    pub(super) fn md_wy_preview(&self) -> Option<gpui::Entity<WyEditor>> {
+    /// `#[doc(hidden)] pub`：`tests/epub.rs` 预览宿主路由断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn md_wy_preview(&self) -> Option<gpui::Entity<WyEditor>> {
         let model = self.model.borrow();
         let active = model.active_tab;
         let tab = model.tabs.get(active)?;
@@ -116,7 +118,9 @@ impl EditorApp {
     /// EPUB 轻量视口分页读数 `(当前页, 总页数)`（1 基；状态栏页码，P4-1/P4-2）：
     /// 读 WyEditor 只读宿主 WYSIWYG 确定性量程（`MarkdownPreview` 回退后端已删）。
     /// 非 EPUB / 就绪前 → `None`（状态栏不显示页码）。
-    pub(super) fn epub_page_bounds(&self, window: &mut Window, cx: &gpui::App) -> Option<(usize, usize)> {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` EPUB 状态栏页码断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn epub_page_bounds(&self, window: &mut Window, cx: &gpui::App) -> Option<(usize, usize)> {
         let idx = self.model.borrow().active_tab;
         if !self.is_epub_tab(idx) {
             return None;
@@ -446,7 +450,9 @@ impl EditorApp {
     /// 统一 WyEditor 宿主：当前章 = 顶行所在标题，滚动到相邻章标题（`set_scroll_target`，
     /// prepaint 重钉，无需 window；`MarkdownPreview` 回退后端已删）。
     /// 无 EPUB / 少于 2 章 / 已处边界章 → 不动，返回 `false`。
-    pub(super) fn epub_flip_chapter(&mut self, dir: i32, cx: &mut Context<Self>) -> bool {
+    /// `#[doc(hidden)] pub`：`tests/epub.rs` 章节翻转断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn epub_flip_chapter(&mut self, dir: i32, cx: &mut Context<Self>) -> bool {
         let idx = self.model.borrow().active_tab;
         if !self.is_epub_tab(idx) {
             return false;
@@ -476,7 +482,8 @@ impl EditorApp {
     /// 会先激活该选项卡，再翻转其 `preview_on`。
     /// EPUB（`readonly_preview`）：正文只在预览区、编辑区为空，翻转预览无意义，
     /// 点击仅重新同步内容（持久保持全屏预览，不会落入空白编辑区）。
-    pub(super) fn toggle_preview_for_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+    #[doc(hidden)]
+    pub fn toggle_preview_for_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(idx, window, cx);
         // 零选项卡（欢迎页）下「预览」无对象：菜单/命令面板都可达这里，先兜底返回。
         if self.model.borrow().tabs.get(idx).is_none() {
@@ -530,7 +537,9 @@ impl EditorApp {
 
     /// 切换当前选项卡预览是否全屏占满（EPUB 阅读模式）。
     /// P4-2：预览统一 WyEditor（恒换行），全屏只影响编辑区/布局，无需再设预览换行。
-    pub(super) fn toggle_preview_fullscreen(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 全屏/换行切换断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_preview_fullscreen(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.model.borrow().active_tab;
         let (fullscreen, editor) = {
             let mut model = self.model.borrow_mut();
@@ -556,7 +565,9 @@ impl EditorApp {
 
     /// 切换当前选项卡编辑区的自动换行/不换行，并更新全局编辑器偏好。
     /// 只作用于编辑区；Markdown/EPUB 预览始终自动换行，不随此开关变化。
-    pub(super) fn toggle_wrap(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 换行切换断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_wrap(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.model.borrow().active_tab;
         let wrap_enabled = !self.model.borrow().wrap_enabled;
         self.model.borrow_mut().wrap_enabled = wrap_enabled;

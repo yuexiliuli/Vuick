@@ -1,3 +1,12 @@
+//! 托盘菜单域（close_tray）：开关翻转 + tray 全局状态联动 + 菜单标签复选标记。
+//! 断言内部与 lib 单测 `src/app/tests/close_tray.rs` 逐字一致（P1 测试域化）。
+//! ⚠ 集成目标下 shell lib 非 test 编译：`toggle_close_to_tray` / `close_to_tray_label`
+//! 经 §8.6 外提清单 pub 化访问；`common::init_test` 注入 `GPUI_EDITOR_TEST`。
+
+mod common;
+
+use common::*;
+
     /// R3：`toggle_close_to_tray` 翻转 `close_to_tray` 字段并触发持久化——
     /// 测试构建下 `persist_prefs` 短路不写盘（chrome.rs）、`tray::set_close_to_tray`
     /// 只翻 flag 不真建托盘图标（tray crate 文档），故此处断言字段翻转 + tray 状态联动。

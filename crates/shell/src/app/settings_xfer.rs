@@ -88,7 +88,9 @@ impl EditorApp {
 
     /// 把当前应用状态导出到指定路径（纯逻辑、可测）：收集 prefs（当前交互态）+ 会话
     /// 清单/槽位 → 构建导出包 → 原子写盘 → toast（成功带路径 / 失败带原因，K11 不崩）。
-    pub(crate) fn export_to_path(&mut self, save_path: &std::path::Path, cx: &mut Context<Self>) {
+    /// `#[doc(hidden)] pub`：`tests/session.rs`（settings_xfer 合并域）直驱（§8.6）。
+    #[doc(hidden)]
+    pub fn export_to_path(&mut self, save_path: &std::path::Path, cx: &mut Context<Self>) {
         let prefs = self.collect_prefs().to_json_value();
         let (manifest, slots) = collect_session_data(self, cx);
         let body = build_export_bundle(&prefs, &manifest, &slots);
@@ -134,7 +136,9 @@ impl EditorApp {
     ///   （下一次启动仍保持）；`session_restore` 显式 false → 诚实跟随（清 session 目录）。
     /// - session → 写回 `session_dir`（下一启动恢复）；**不**立即重排当前窗口。
     /// 部分可解析：单侧损坏只跳过该侧 + toast 说明，不整体回滚；整体非法 → 零副作用。
-    pub(crate) fn apply_import_bundle(
+    /// `#[doc(hidden)] pub`：`tests/session.rs`（settings_xfer 合并域）直驱（§8.6）。
+    #[doc(hidden)]
+    pub fn apply_import_bundle(
         &mut self,
         parsed: Option<ParsedExportBundle>,
         session_dir: &std::path::Path,

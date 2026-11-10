@@ -31,7 +31,8 @@ pub(crate) fn bookmarks_path() -> std::path::PathBuf {
 
 /// 规范化路径键：先 `canonicalize`（消 `.`/`..`、接真实盘符大小写形态），失败回退
 /// 原样字符串。同一文件的后续打开 / 绝对化写法都落到同一键。
-pub(crate) fn normalize_key(path: &Path) -> String {
+/// `pub`：经 `app` 重导出供 `tests/pdf.rs` 书签盘上读出断言（§8.6 外提清单）。
+pub fn normalize_key(path: &Path) -> String {
     std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
@@ -94,7 +95,8 @@ pub(crate) fn from_json(v: &Value) -> HashMap<String, Vec<PdfBookmark>> {
 }
 
 /// 从磁盘加载书签存储（缺失 / 损坏 → 空 map）。
-pub(crate) fn load() -> HashMap<String, Vec<PdfBookmark>> {
+/// `pub`：经 `app` 重导出供 `tests/pdf.rs` 书签盘上读出断言（§8.6 外提清单）。
+pub fn load() -> HashMap<String, Vec<PdfBookmark>> {
     let Ok(text) = std::fs::read_to_string(bookmarks_path()) else {
         return HashMap::new();
     };
@@ -139,13 +141,17 @@ impl EditorApp {
     /// 某路径当前内存态的书签列表（无 → `None`）。侧边栏 TOC「书签」区段与测试读。
     /// SC-3：`pdf_bookmarks` 迁入 `AppModel`（`Rc<RefCell>`）后无法再经「方法内临时
     /// guard」返回 `&[PdfBookmark]` 引用——改为返回 owned 克隆，语义/内容不变。
-    pub(crate) fn pdf_bookmarks_for(&self, path: &std::path::Path) -> Option<Vec<PdfBookmark>> {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 书签持久化断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn pdf_bookmarks_for(&self, path: &std::path::Path) -> Option<Vec<PdfBookmark>> {
         let key = normalize_key(path);
         self.model.borrow().pdf_bookmarks.get(&key).cloned()
     }
 
     /// 添加/覆盖一条书签（同页去重）：更新内存 + 原子落盘 + notify。
-    pub(crate) fn add_pdf_bookmark(
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 书签持久化断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn add_pdf_bookmark(
         &mut self,
         path: &std::path::Path,
         page_index: usize,

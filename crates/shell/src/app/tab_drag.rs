@@ -57,7 +57,9 @@ impl EditorApp {
     /// 整结构 move：一次解构 `EditorTab` 搬到 `DetachedTab`（`..` 丢弃源窗口专属的
     /// live 态 / 订阅），不再逐字段手抄。
     /// SC-4：payload 动作体已迁 `AppModel::take_tab_payload`。glue 转发。
-    pub(super) fn take_tab_payload(&mut self, idx: usize) -> Option<DetachedTab> {
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 多窗口换位回归（真实拔出/收纳路径，§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn take_tab_payload(&mut self, idx: usize) -> Option<DetachedTab> {
         self.model.borrow_mut().take_tab_payload(idx)
     }
 
@@ -83,7 +85,9 @@ impl EditorApp {
     /// `Some(window)` 用于拆出新窗口（直接聚焦新窗口的编辑区）。
     /// 整结构 move：一次解构 `DetachedTab` 搬回 `EditorTab`（live 态/订阅置目标窗口
     /// 缺省值），不再逐字段手抄。
-    pub(crate) fn adopt_tab(
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 多窗口换位回归（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn adopt_tab(
         &mut self,
         payload: DetachedTab,
         mut window: Option<&mut Window>,

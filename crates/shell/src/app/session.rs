@@ -113,8 +113,10 @@ impl EditorApp {
     /// 此处只做：置恢复期间抑制持久化 → 把待恢复选项卡排队 → 登记下一帧回调。
     /// **本函数内不打开任何选项卡**——首个真实 `open_file` 发生在首帧 render 之后
     /// （`on_next_frame` 保证），因此首帧不含恢复段。
-    /// `pub(super)`：供启动（`restore_session`）与测试（显式目录 + `simulate_next_frame`）共用。
-    pub(super) fn schedule_restore(
+    /// `#[doc(hidden)] pub`：启动（`restore_session`）与测试（显式目录 +
+    /// `simulate_next_frame`）共用；integration 目标经 pub 面访问（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn schedule_restore(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -268,7 +270,9 @@ pub(crate) fn collect_session_data(
 /// 保存会话（纯逻辑，显式目录，可测试）：SC-4 逻辑已迁
 /// [`AppModel::save_session_to`]（shell_core::actions）；此处保留 free fn 挂测试与
 /// 退出钩子（`save_session`），逐字保持既有语义（开关关闭只清、未变槽位跳过等）。
-pub(crate) fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool {
+/// `#[doc(hidden)] pub`：integration 测试经 `shell::app::save_session_to` 访问（§8.6）。
+#[doc(hidden)]
+pub fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool {
     app.model.borrow_mut().save_session_to(dir, cx)
 }
 
@@ -278,9 +282,11 @@ pub(crate) fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool
 /// （与 CLI 首参打开同口径：`is_file` 才开）。
 /// **A1 之后生产启动不再走本函数**（改走渐进的 [`EditorApp::schedule_restore`]）；此处
 /// 保留为测试与基准（`tests/session.rs`、`tests/bench.rs`、`tests/settings_xfer.rs`）
-/// 的「改前行为基准」驱动，`#[cfg(test)]` 归位避免生产 dead_code。
-#[cfg(test)]
-pub(crate) fn restore_session_from(
+/// 的「改前行为基准」驱动。原 `#[cfg(test)]` 归位为恒编：integration 目标下 shell lib
+/// 以非 test 编译，`#[cfg(test)]` 项不可见，必须恒编 + `pub`（生产不调用，pub 故无
+/// dead_code 告警）。
+#[doc(hidden)]
+pub fn restore_session_from(
     app: &mut EditorApp,
     dir: &Path,
     window: &mut Window,

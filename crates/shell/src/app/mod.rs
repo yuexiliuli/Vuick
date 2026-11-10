@@ -108,6 +108,32 @@ pub use shell_core::{
     SearchScopeTab, TabDragData, TabDragGhost, TitleCtrlIconFg, WinCtrlKind,
 };
 
+/// 测试可见重导出（2026-11-10 P1 测试域化，§8.6 外提清单）：
+/// - `app::session` 私有模块的纯逻辑入口（`save_session_to` / `restore_session_from`）：
+///   integration 目标（`tests/*.rs` 独立二进制）只能见 lib pub 面，私有 `mod session` 的
+///   路径不可达，经此 `pub use` 暴露。`restore_session_from` 原 `#[cfg(test)]` 归位为恒编
+///   （测试/基准唯一驱动，生产进程不调用，pub 故无 dead_code 告警）。
+/// - `app::sidebar` 私有模块的宿主状态类型与视图枚举：它们的 `width`/`files` 等字段随
+///   `EditorApp::sidebar` 字段一并 pub，供 `tests/settings_xfer.rs` 直读/直写
+///   （`import_opened_folder_pops_children` / 宽度即时生效断言）。
+#[doc(hidden)]
+pub use session::{restore_session_from, save_session_to};
+#[doc(hidden)]
+pub use sidebar::{FileTreeState, SidebarChromeState, SidebarView, TreeEntry};
+// P1 测试域化（2026-11-10 §8.3 中批）：`palette`/`media_window`/`pdf_bookmarks`
+// 私有模块的纯逻辑面供 `tests/palette.rs`（quick open 检索）、`tests/media.rs`
+// （媒体窗口打开决策/尺寸取值）、`tests/pdf.rs`（书签盘上读写）访问。
+#[doc(hidden)]
+pub use media_window::{
+    resolve_media_open_target, resolve_recorded_size, MediaOpenTarget, MediaWindowKind,
+};
+#[doc(hidden)]
+pub use palette::{quick_open_collect, QUICK_OPEN_MAX_FILE_BYTES, QUICK_OPEN_MAX_FILES};
+#[doc(hidden)]
+pub use pdf_bookmarks::{load, normalize_key};
+#[doc(hidden)]
+pub use file_ops::MediaKind;
+
 /// 编辑器被预览驱动后的落位收敛宽限（帧）：边界块（表格等）顶行读取可能滞后/抖动
 /// 一两帧，此期内「编辑器落位」不回显为「编辑器主动滚动」；超过才放手由正常双向同步接管。
 const DRIVEN_EDITOR_MAX_AWAIT: u32 = 8;
@@ -122,9 +148,14 @@ pub(crate) enum MdTocScroll {
 /// 所有 `EditorApp` 窗口的注册表（全局）：记录每个窗口的弱实体句柄与窗口句柄。
 /// 「拖出拆分」创建的子窗口带 `is_detached=true`，把选项卡拖回主窗口时据此找到
 /// 主窗口（第一个非 detached 的 EditorApp 窗口）。
+/// `#[doc(hidden)] pub`：`tests/bench.rs`（`bench_new_media_window_first_frame` 断
+/// 言「窗口数 +1」）与 `tests/` 媒体夹具经 `cx.global::<EditorAppRegistry>()` 读
+/// `windows` 长度/枚举（§8.6 外提清单；生产仍仅供 shell 内部使用）。
 #[derive(Default)]
-struct EditorAppRegistry {
-    windows: Vec<(gpui::WeakEntity<EditorApp>, AnyWindowHandle)>,
+#[doc(hidden)]
+pub struct EditorAppRegistry {
+    #[doc(hidden)]
+    pub windows: Vec<(gpui::WeakEntity<EditorApp>, AnyWindowHandle)>,
 }
 
 
@@ -207,29 +238,45 @@ pub struct EditorApp {
     /// 到点不误清新滚动。[`TAB_HSCROLL_HIDE_MS`] 后无新滚动再隐藏滚动条。
     tab_hscroll_delay: SeqAfter,
     /// 通知 toasts（自研 `ui::notification`，App 自持容器与生命周期）。
-    notifications: Vec<ui::notification::Notification>,
-    /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）
-    split_ratio: f32,
-    /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`
-    split_drag: Option<(f32, f32)>,
+    /// `#[doc(hidden)] pub`：`tests/settings_xfer.rs` 断言导入/导出结果 toast
+    /// （`app.notifications.last().message_str()`，§8.6 外提清单）。
+    #[doc(hidden)]
+    pub notifications: Vec<ui::notification::Notification>,
+    /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）。
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 拖拽断言读（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub split_ratio: f32,
+    /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`。
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 拖拽开始/结束断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub split_drag: Option<(f32, f32)>,
     /// 拖分割条帧级合并（B4）：`on_mouse_move` 只记**最新目标比例**，本帧 `render`
     /// 开头统一落地到 `split_ratio`（对齐 scrollbar `pending_target`→prepaint 先例）。
     /// 语义不变：分割条拖动仍实时跟手（每帧一落），只合并 notify 频率。
     pending_split_ratio: Option<f32>,
-    /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）
-    splitter_hovered: bool,
+    /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）。
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 悬停高亮断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub splitter_hovered: bool,
     /// 侧边栏「外壳」状态：可见性 / 视图 / 目录折叠 / 宽度与右缘拖拽
     /// （检索输入 + 扫描缓存等仍在此处，见 [`sidebar::SidebarChromeState`]）。
-    sidebar: sidebar::SidebarChromeState,
+    /// `#[doc(hidden)] pub`：`tests/settings_xfer.rs` 直读/直写 `width`/`width_auto`/
+    /// `files.root`/`files.children`（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub sidebar: sidebar::SidebarChromeState,
     /// 侧边栏「搜索」关键字输入控件。
-    search_state: gpui::Entity<InputState>,
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 检索在途断言 `set_value` 推查询（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub search_state: gpui::Entity<InputState>,
     /// 监听搜索框输入变化 → 刷新搜索结果。
     _search_sub: Subscription,
     /// 大文档「两段式打开」快段（`load_file_text` 延迟挂载编辑器）执行次数。
     /// 测试用：验证大文件先瞬时挂编辑器、再后台补齐统计/预览的完整流程两段都跑了。
     pub(crate) open_fast_count: usize,
     /// 大文档「两段式打开」慢段（`finish_file_text` 应用统计 + 预览索引）执行次数。
-    pub(crate) open_finish_count: usize,
+    /// `#[doc(hidden)] pub`：`tests/bench.rs` 流水线就绪判据（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub open_finish_count: usize,
     /// 「打开文件对话框」的调用次数（空态「打开文件…」按钮点击 / 文件菜单 / Ctrl+O
     /// 共用 `open_dialog` 入口）。测试用：断言空态按钮触发 open（测试为 stub 不真弹窗）。
     pub(crate) open_dialog_calls: usize,
@@ -267,7 +314,9 @@ pub struct EditorApp {
     /// PDF 右键「添加书签/插入页面/删除页面/提取页面」上下文菜单：弹出位置（窗口坐标）。
     pdf_menu_pos: Option<Point<Pixels>>,
     /// 已打开的 PDF 右键菜单实体（随位置同生同灭）。
-    pdf_menu_entity: Option<gpui::Entity<PopupMenu>>,
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 菜单项禁用判定（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub pdf_menu_entity: Option<gpui::Entity<PopupMenu>>,
     /// PDF 右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     pdf_menu_sub: Option<Subscription>,
     /// 选项卡栏右键「新建/打开」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
@@ -295,7 +344,9 @@ pub struct EditorApp {
     /// （`DismissEvent`）关闭后清空。面板是独立 [`session_store::RecentPanel`] 实体
     /// （mode/选中/最近列表快照自持；More/返回 单实体切模式），实体已迁独立 crate
     /// `session_store`（`<EditorApp>` 为 [`session_store::RecentPanelHost`] 宿主）。
-    recent_panel: Option<gpui::Entity<session_store::RecentPanel<EditorApp>>>,
+    /// `#[doc(hidden)] pub`：`tests/recent.rs` 大量面板断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub recent_panel: Option<gpui::Entity<session_store::RecentPanel<EditorApp>>>,
     /// 最近面板的关闭订阅（择项/Esc/点击外 → 清空引用并释放实体）。
     _recent_panel_sub: Option<Subscription>,
     focus_handle: FocusHandle,
@@ -312,11 +363,16 @@ pub struct EditorApp {
     _bounds_sub: Option<Subscription>,
     /// 命令面板（P2-8）：打开时为 `Some`，选择/Esc/点击外（`DismissEvent`）关闭后清空。
     /// 面板是独立 `CommandPalette` 实体（query/选中/模式/条目自持），新建即情境。
-    palette: Option<gpui::Entity<ui::palette::CommandPalette>>,
+    /// `#[doc(hidden)] pub`：`tests/palette.rs` quick open 扫描就绪轮询（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub palette: Option<gpui::Entity<ui::palette::CommandPalette>>,
     /// 面板关闭订阅（选择/Esc/点击外 → 清空 `palette` 并释放实体）。
     _palette_sub: Option<Subscription>,
     /// 音乐播放器视图（惰性创建；不随退出音乐模式销毁——播放继续）。
-    music: Option<gpui::Entity<music::MusicView>>,
+    /// `#[doc(hidden)] pub`：`tests/music.rs`/`tests/media.rs` 断言音乐模式已建视图
+    /// （`app.music.is_some()`）与 `ExitRequested` 事件驱动（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub music: Option<gpui::Entity<music::MusicView>>,
     /// 音乐视图事件订阅（`MusicEvent::ExitRequested` → 退出音乐模式并把焦点还给编辑区）。
     _music_sub: Option<Subscription>,
     /// SC-4：宿主实体自身弱句柄/实体 id——`AppHost` 的 `&self` 服务方法经它再入宿主实体
