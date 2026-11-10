@@ -106,3 +106,123 @@
         );
     }
 
+    /// 文件名展示迁移（2026-11-10）：**有名文件**选项卡悬停 → 200ms 防抖后在 tab 下方浮出
+    /// 完整路径 tooltip；移出立即消失。防抖期内（<200ms）恒不显示。
+    /// 注：`add_app` 预建 1 个未命名空 tab（tab-0），`open_file` 新建文件选项卡 → tab-1。
+    #[gpui::test]
+    async fn tab_tooltip_path_delayed_appear_geom_and_hide(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 打开临时文件 → 有名文件选项卡 tab-1。
+        let f = std::env::temp_dir().join(format!("gpui-tab-tip-{}.txt", std::process::id()));
+        std::fs::write(&f, "hello\nworld\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let tab = cx
+            .debug_bounds("tab-1")
+            .expect("打开文件后应渲染有名文件选项卡 tab-1");
+        // 初始无浮层。
+        assert!(
+            cx.debug_bounds("tooltip-tab-tip-1").is_none(),
+            "未悬停时不应渲染 tab tooltip"
+        );
+        // 悬停进入：防抖期内（< TOOLTIP_DELAY_MS=200ms）不显示。
+        cx.simulate_mouse_move(tab.center(), None, Default::default());
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("tooltip-tab-tip-1").is_none(),
+            "防抖期内（100ms<200ms）tooltip 不应出现"
+        );
+        // 时钟再推进超过防抖 → 浮层出现，且锚在 tab 下方（不盖选项卡本体/相邻选项卡）。
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let tip = cx
+            .debug_bounds("tooltip-tab-tip-1")
+            .expect("延迟后 tooltip 应在 tab 下方出现");
+        assert!(
+            tip.origin.y.as_f32() >= tab.origin.y.as_f32() + tab.size.height.as_f32(),
+            "tooltip 应在 tab 下方（不盖本体），tip={tip:?} tab={tab:?}"
+        );
+        // 左缘对齐：此刻鼠标悬停在 tab.center() → tooltip 左缘 x 应≈鼠标 x（偏移 ≤1px，
+        // 浮在指针右下方）。
+        assert!(
+            (tip.origin.x.as_f32() - tab.center().x.as_f32()).abs() <= 1.0,
+            "tooltip 左缘 x 应对齐鼠标当时 x（悬浮 tab.center），tip={tip:?} tab={tab:?}"
+        );
+        // 冻结断言：tooltip 已显示后鼠标再动（x+30，仍在 tab 内）→ 位置不跟随、左缘 x 不变。
+        cx.simulate_mouse_move(
+            gpui::point(px(tab.center().x.as_f32() + 30.), tab.center().y),
+            None,
+            Default::default(),
+        );
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let tip_after = cx
+            .debug_bounds("tooltip-tab-tip-1")
+            .expect("tooltip 应仍显示");
+        assert!(
+            (tip_after.origin.x.as_f32() - tip.origin.x.as_f32()).abs() <= 0.5,
+            "tooltip 显示后鼠标移动不应再跟随（冻结），before={tip:?} after={tip_after:?}"
+        );
+        // 移出 → 立即消失。
+        cx.simulate_mouse_move(gpui::point(px(8.), px(8.)), None, Default::default());
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("tooltip-tab-tip-1").is_none(),
+            "移出后 tooltip 应立即消失"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 文件名展示迁移（2026-11-10）：**未命名**选项卡（无 file_path）悬停恒不显示浮层——
+    /// 即使防抖时钟已充分推进（400ms>200ms）也不挂 tooltip 层（`has_path` 为假）。
+    #[gpui::test]
+    async fn tab_tooltip_not_shown_for_unnamed_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let _ = app;
+        // 默认即有未命名空选项卡 tab-0（tabs_actions 实证）。
+        let tab = cx
+            .debug_bounds("tab-0")
+            .expect("初始未命名选项卡应渲染");
+        cx.simulate_mouse_move(tab.center(), None, Default::default());
+        cx.executor().advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("tooltip-tab-tip-0").is_none(),
+            "未命名选项卡悬停恒不显示路径 tooltip"
+        );
+    }
+

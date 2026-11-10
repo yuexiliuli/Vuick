@@ -1,4 +1,8 @@
-//! tabs.
+//! tabs：选项卡栏渲染与交互。
+//!
+//! 文件名展示（2026-11-10 由状态栏迁移而来）：每个**有名文件**选项卡悬停 200ms 后在 tab
+//! 下方浮出该 tab 自身完整路径 tooltip（P2-9 tooltip 复用）；未命名选项卡（无 file_path）
+//! 悬停恒不显示浮层。
 
 use super::*;
 use config::timing::TAB_HSCROLL_HIDE_MS;
@@ -375,6 +379,7 @@ impl EditorApp {
     fn tab_bar_item(
         name: &str,
         dirty: bool,
+        path_hint: Option<String>,
         idx: usize,
         is_active: bool,
         reorder_line: Option<ReorderSide>,
@@ -390,6 +395,57 @@ impl EditorApp {
         let view_id = window.current_view();
         let tab_hover = window.use_keyed_state(("tab", idx), cx, |_, _| false);
         let hovered = *tab_hover.read(cx);
+
+        // P2-9 鼠标跟随（2026-11-10）：记录下方路径 tooltip 的**窗口坐标锚点**（水平 = 鼠标
+        // 窗口 x，垂直 = tab 底缘 y）。锚点在 `on_mouse_move`（事件期）算——此刻 `bounds_cell`
+        // 才持有上一帧 laid-out 边界；render 期 `render_tab_bar` 每帧重建 cell（宽恒 0）不可用。
+        // key 与既有 ("tab", idx) hover 态区分，互不冲突。
+        let tab_mx = window.use_keyed_state(("tab-mx", idx), cx, |_, _| None::<gpui::Point<Pixels>>);
+        let anchor = *tab_mx.read(cx);
+
+        // P2-9 tooltip（2026-11-10 由状态栏文件名迁移）：每个 tab 独立 id 键控；悬停
+        // 显示该 tab 自身完整路径；未命名（无路径）悬殊停恒不显示浮层。
+        let path_hint = path_hint.unwrap_or_default();
+        let has_path = !path_hint.is_empty();
+        let tip_id = format!("tab-tip-{idx}");
+        let tip = ui::tooltip::tooltip_state(&tip_id, window, cx);
+        let tip_on = ui::tooltip::tooltip_visible(&tip, cx);
+
+        // 浮层锚在 tab 下方、水平中心随鼠标 x 移动（`tooltip_layer_placed` Window 定位，锚=
+        // 事件期算出的窗口坐标点；不盖相邻选项卡）：host_w = 内容宽近似 = px_2 双向 16 +
+        // 脏点宽 + 名宽 + 两个 gap_1 8 + 关闭钮 18（仅 None 回退居中使用）。measure 闭包
+        // 姿势同 `status_bar`（`window.text_style().font()` + `shape_line(..., px(12.), ...)`）。
+        let base_font = window.text_style().font();
+        let measure = |text: SharedString, weight: gpui::FontWeight| -> f32 {
+            let len = text.len();
+            let mut font = base_font.clone();
+            font.weight = weight;
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(
+                        text,
+                        px(12.),
+                        &[gpui::TextRun {
+                            len,
+                            font,
+                            color: gpui::Hsla::default(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    )
+                    .width(),
+            )
+        };
+        let dirty_dot_w = if dirty {
+            measure("●".into(), gpui::FontWeight::NORMAL) + 4.0
+        } else {
+            0.0
+        };
+        let name_w = measure(name.clone().into(), gpui::FontWeight::NORMAL);
+        let host_w = 16.0 + dirty_dot_w + name_w + 8.0 + 18.0;
 
         let close = div()
             .id(SharedString::from(format!("tab-close-{idx}")))
@@ -426,30 +482,79 @@ impl EditorApp {
             .px_2()
             .flex()
             .items_center()
-            .gap_1()
             .flex_shrink(1.)
             .relative()
             .cursor(CursorStyle::PointingHand)
             .text_size(px(12.))
             .text_color(colors.text_primary)
-            .child(if dirty { "● " } else { "" })
-            .child(SharedString::from(name.clone()))
-            .child(close);
+            // 几何硬约束（2026-11-10）：[脏点, 名, 关闭钮] 包进内层 flex_row + gap_1，
+            // 外层去掉 gap_1——tooltip_layer 空 div 作外层直子零宽度，tab 的 border-box
+            // 与改动前逐像素一致；浮层锚在 tab 下方水平居中（host_w=内容宽近似）。
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(if dirty { "● " } else { "" })
+                    .child(SharedString::from(name.clone()))
+                    .child(close),
+            )
+            // 路径提示浮层（锚在 tab 下方、水平中心随鼠标 x 移动、不盖相邻选项卡；无路径
+            // （未命名）恒不显示）：host_w = 内容宽近似 = px_2 双向 16 + 脏点宽 + 名宽 + 两个
+            // gap_1 8 + 关闭钮 18。compact 密度（更小内边距/字号）仅本 tooltip 使用。
+            .child(ui::tooltip::tooltip_layer_placed(
+                &tip_id,
+                &path_hint,
+                has_path && tip_on,
+                host_w,
+                26.0,
+                ui::tooltip::TooltipPlacement::Below,
+                ui::tooltip::TooltipTone::Compact,
+                anchor,
+                cx,
+            ));
         // 激活项 = VS Code 卡片式：26px 圆角白卡浮在灰带上（浅色下）；
-        // 非激活项透明底 + hover 填充（背景由底部弹簧统一淡入，P2-10）。
+        // 非激活项透明底 + hover 填充（背景由底部弹簧统一淡入，P2-10）——非激活项同样加
+        // `rounded_md()`（**不加** `border_1/border_color`，边框仅激活卡片有，非激活透明底
+        // 有边框会变方形框），保证 hover 高亮为**圆角矩形**而非尖角方矩形；border-radius
+        // 不改 border-box 尺寸，既有几何测试不受影响。
         el = if is_active {
             el.rounded_md()
                 .border_1()
                 .border_color(colors.tab_active_border)
         } else {
-            el
+            el.rounded_md()
         };
-        // hover 状态跨帧记录，驱动关闭 × 悬停显现与行背景淡入。
+        // hover 状态跨帧记录，驱动关闭 × 悬停显现与行背景淡入；同时驱动路径 tooltip 出没。
         el = el.on_hover({
             let st = tab_hover.clone();
+            let tip = tip.clone();
             move |hovered, _window, cx| {
                 st.update(cx, |h, _| *h = *hovered);
+                ui::tooltip::tooltip_hover(&tip, *hovered, cx);
                 cx.notify(view_id);
+            }
+        });
+        // 鼠标 x 跨帧记录（事件期）：此刻 `bounds_cell` 持上一帧 laid-out 边界（render 期被
+        // 每帧重建、不可用）。只在 tooltip **尚未显示**时记录锚点（出现时对齐鼠标当时所在
+        // x、垂直 tab 底缘）；一旦显示即冻结——`tip_on` 为真不再记录、也不再 notify 重渲染，
+        // 后续任何重渲染都读到同一锚点（真冻结）。移出隐藏后重新进入会重新记录（恢复）。
+        el = el.on_mouse_move({
+            let st = tab_mx.clone();
+            let bcell = bounds_cell.clone();
+            move |ev: &gpui::MouseMoveEvent, _window, cx| {
+                if !tip_on {
+                    let b = bcell.get();
+                    if b.size.width > px(0.) {
+                        st.update(cx, |m, _| {
+                            *m = Some(gpui::point(
+                                px(ev.position.x.as_f32()),
+                                b.bottom_right().y,
+                            ))
+                        });
+                    }
+                }
             }
         });
         // 多窗口拖拽：按住选项卡拖动 → 跟出“胶囊”幽灵；
@@ -687,9 +792,9 @@ impl EditorApp {
             None
         };
         // 借用纪律（SC-5）：先一次 borrow 快照每个选项卡渲染所需的廉价字段（显示名 +
-        // 脏标记），guard 随即释放——构造期不再持 `tabs` 长借用。`tab_bar_item` 只消费
-        // 这两项派生数据，改动零渲染差异。
-        let tab_meta: Vec<(String, bool)> = {
+        // 脏标记 + 完整路径），guard 随即释放——构造期不再持 `tabs` 长借用。
+        // `tab_bar_item` 只消费这三项派生数据，改动零渲染差异（未命名路径为 None）。
+        let tab_meta: Vec<(String, bool, Option<String>)> = {
             let model = self.model.borrow();
             model
                 .tabs
@@ -701,13 +806,17 @@ impl EditorApp {
                         .and_then(|p| p.file_name())
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "未命名".to_string());
-                    (name, t.dirty)
+                    let path_hint = t
+                        .file_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned());
+                    (name, t.dirty, path_hint)
                 })
                 .collect()
         };
         let tabs_len = tab_meta.len();
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
-        for (i, (name, dirty)) in tab_meta.into_iter().enumerate() {
+        for (i, (name, dirty, path_hint)) in tab_meta.into_iter().enumerate() {
             let line = match reorder_target {
                 Some(t) if i == t => Some(ReorderSide::Left),
                 Some(t) if t == tabs_len && i + 1 == tabs_len => Some(ReorderSide::Right),
@@ -716,6 +825,7 @@ impl EditorApp {
             tabs.push(Self::tab_bar_item(
                 &name,
                 dirty,
+                path_hint,
                 i,
                 i == active,
                 line,

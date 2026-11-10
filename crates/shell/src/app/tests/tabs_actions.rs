@@ -681,6 +681,16 @@
             cx.debug_bounds("status-bar-divider").is_some(),
             "打开 .md 后分隔线仍应存在"
         );
+        // 文件名展示迁移（2026-11-10）：状态栏不再显示文件名块（含脏点/路径 tooltip），
+        // 语言徽标保留。
+        assert!(
+            cx.debug_bounds("status-file-name").is_none(),
+            "状态栏文件名块（status-file-name）已迁移移除"
+        );
+        assert!(
+            cx.debug_bounds("status-language-badge").is_some(),
+            "语言徽标仍应在状态栏左侧显示"
+        );
         let _ = std::fs::remove_file(&md);
     }
 

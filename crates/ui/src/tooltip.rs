@@ -27,7 +27,7 @@ use std::time::Duration;
 use base::util::SeqAfter;
 use gpui::{
     Anchor, AnimationExt, AnyElement, App, Edges, Entity, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Styled, anchored, deferred, div, px,
+    ParentElement, Pixels, Styled, anchored, deferred, div, px,
 };
 
 use crate::ui::motion::hover_spring;
@@ -114,29 +114,77 @@ pub fn tooltip_visible(state: &Entity<TooltipState>, cx: &App) -> bool {
     state.read(cx).visible
 }
 
-/// 把 tooltip 浮层作为宿主的相对定位直子挂上（合成层纪律：`deferred(anchored(Local))`，
-/// 同 `ui::menu::Dropdown`）。锚在宿主右缘、垂直居中，`snap_to_window_with_margin`
-/// 兜底防越窗。`show` 为假返回空元素（不移挂）；淡入由 `with_spring` 承担。
+/// tooltip 浮层相对宿主的放置方向。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum TooltipPlacement {
+    /// 右缘垂直居中（默认，既有调用点行为逐字节不变）。
+    #[default]
+    Right,
+    /// 宿主下方：默认水平居中（宿主相对）；传窗口坐标锚点时浮层**左上角**对准该锚点
+    /// （左缘 x = 鼠标落在 tab 上的窗口 x → 浮在指针右下方，垂直 = tab 底缘）。
+    Below,
+}
+
+/// tooltip 卡片的密度档位：控制内边距与字号。紧凑档仅供选项卡路径 tooltip
+/// （2026-11-10）——活动栏/搜索等既有 tooltip 一律走 `Normal`，观感逐字节不变。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum TooltipTone {
+    /// 常规密度（默认）：8px/4px 内边距 + 12px 字号（既有调用点行为逐字节不变）。
+    #[default]
+    Normal,
+    /// 紧凑密度：4px/2px 内边距 + 11px 字号（仅选项卡路径 tooltip 使用）。
+    Compact,
+}
+
+/// 把 tooltip 浮层作为宿主的相对定位直子挂上（合成层纪律：`deferred(anchored(...))`，
+/// 同 `ui::menu::Dropdown`）。锚点与偏移由 `placement` / `anchor` 决定
+/// （`snap_to_window_with_margin` 兜底防越窗；`show` 为假返回空元素（不移挂）；
+/// 淡入由 `with_spring` 承担）：
+/// - [`TooltipPlacement::Right`]：Local 模式、锚在宿主右缘垂直居中
+///   （`offset(host_w+TIP_GAP, host_h*0.5)`——逐字节不变）；
+/// - [`TooltipPlacement::Below`]：`anchor` 为 `Some(窗口坐标锚点)` → **Window 模式**，
+///   浮层**左上角**对准 `(anchor.x, anchor.y+TIP_GAP)`：左缘 x = 鼠标落在 tab 上的窗口 x
+///   （浮在指针右下方；出现时对齐、显示后冻结仍有定锚），顶缘 = tab 底缘下方 4px；`None` →
+///   Local 模式、宿主下方水平居中（`offset(host_w*0.5, host_h+TIP_GAP)`，旧行为）。
 ///
-/// `host_w / host_h`：宿主（按钮）尺寸，用于「贴右缘水平居中」的偏移换算
-/// （活动栏按钮 40×38、PDF 导航按钮 28×24 等）。
-pub fn tooltip_layer(
+/// `host_w / host_h`：宿主（按钮/选项卡）尺寸，用于「贴右缘/贴底缘水平居中」的偏移换算
+/// （活动栏按钮 40×38、PDF 导航按钮 28×24、选项卡 26 高 × 内容宽等）。
+pub fn tooltip_layer_placed(
     id: &str,
     text: &str,
     show: bool,
     host_w: f32,
     host_h: f32,
+    placement: TooltipPlacement,
+    tone: TooltipTone,
+    anchor: Option<gpui::Point<Pixels>>,
     cx: &App,
 ) -> AnyElement {
     if !show {
         return div().into_any_element();
     }
-    let card = tooltip_card(id, text, cx);
-    deferred(
-        anchored()
+    let floating = match placement {
+        TooltipPlacement::Right => anchored()
             .position_mode(gpui::AnchoredPositionMode::Local)
             .anchor(Anchor::LeftCenter)
-            .offset(gpui::point(px(host_w + TIP_GAP), px(host_h * 0.5)))
+            .offset(gpui::point(px(host_w + TIP_GAP), px(host_h * 0.5))),
+        TooltipPlacement::Below => match anchor {
+            // 窗口坐标锚点：浮层**左上角**对准 (anchor.x, anchor.y)、下方 +TIP_GAP 间隙
+            // （左缘 x = 鼠标 x，浮在指针右下方）。
+            Some(pos) => anchored()
+                .position_mode(gpui::AnchoredPositionMode::Window)
+                .anchor(Anchor::TopLeft)
+                .position(pos)
+                .offset(gpui::point(px(0.), px(TIP_GAP))),
+            None => anchored()
+                .position_mode(gpui::AnchoredPositionMode::Local)
+                .anchor(Anchor::TopCenter)
+                .offset(gpui::point(px(host_w * 0.5), px(host_h + TIP_GAP))),
+        },
+    };
+    let card = tooltip_card(id, text, tone, cx);
+    deferred(
+        floating
             .snap_to_window_with_margin(Edges::all(px(8.)))
             .child(
                 card.with_spring(
@@ -150,16 +198,42 @@ pub fn tooltip_layer(
     .into_any_element()
 }
 
-/// 灰色说明卡片本体：VSCode 式灰底、细边框 + 弱阴影、8px 圆角、12px muted 文字。
+/// 把 tooltip 浮层作为宿主的相对定位直子挂上（保持既有签名/行为不变：右缘垂直居中、
+/// 常规密度；需要下方放置 / 其他密度时用 [`tooltip_layer_placed`]）。
+pub fn tooltip_layer(
+    id: &str,
+    text: &str,
+    show: bool,
+    host_w: f32,
+    host_h: f32,
+    cx: &App,
+) -> AnyElement {
+    tooltip_layer_placed(
+        id,
+        text,
+        show,
+        host_w,
+        host_h,
+        TooltipPlacement::Right,
+        TooltipTone::Normal,
+        None,
+        cx,
+    )
+}
+
+
+/// 灰色说明卡片本体：VSCode 式灰底、细边框 + 弱阴影、8px 圆角、muted 文字。
+/// 密度按 `tone` 分档（`Normal`：12px 字号、8/4px 内边距——既有调用点逐字节不变；
+/// `Compact`：11px 字号、4/2px 内边距——仅选项卡路径 tooltip，2026-11-10）。
 /// 无 id / 无事件处理 → 无 hitbox → 不拦截点击、不抢焦点（命中穿透）。
-fn tooltip_card(id: &str, text: &str, cx: &App) -> gpui::Div {
+fn tooltip_card(id: &str, text: &str, tone: TooltipTone, cx: &App) -> gpui::Div {
     let theme = Theme::global(cx);
     let colors = theme.colors;
     let bg: Hsla = colors.popover_bg.into();
     let border: Hsla = colors.border.into();
     let fg: Hsla = colors.fg_muted.into();
     let card_sel = format!("tooltip-{id}");
-    div()
+    let card = div()
         .debug_selector(move || card_sel.clone())
         .bg(bg)
         .border_1()
@@ -169,11 +243,12 @@ fn tooltip_card(id: &str, text: &str, cx: &App) -> gpui::Div {
         .shadow(vec![
             gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
                 .blur_radius(px(6.)),
-        ])
-        .px_2()
-        .py_1()
-        .whitespace_nowrap()
-        .text_size(px(12.))
+        ]);
+    let card = match tone {
+        TooltipTone::Compact => card.px(px(4.)).py(px(2.)).text_size(px(11.)),
+        TooltipTone::Normal => card.px_2().py_1().text_size(px(12.)),
+    };
+    card.whitespace_nowrap()
         .text_color(fg)
         .child(text.to_string())
 }

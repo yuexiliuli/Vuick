@@ -623,16 +623,6 @@ impl EditorApp {
         classify(p).language_id()
     }
 
-    /// 当前文件显示名（无文件时为"未命名"）。
-    pub(super) fn file_display_name(&self) -> String {
-        self.model.borrow().tabs
-            .get(self.model.borrow().active_tab)
-            .and_then(|t| t.file_path.as_ref())
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "未命名".to_string())
-    }
-
     /// 按扩展名推断语言标签（仅用于状态栏展示；单一真值见 [`Self::classify`]）。
     pub(super) fn language_label(&self) -> &'static str {
         let model = self.model.borrow();

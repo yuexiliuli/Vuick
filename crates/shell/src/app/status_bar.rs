@@ -1,8 +1,10 @@
 //! status_bar：VSCode 式三区分区状态栏（P2-11）。
 //!
 //! 布局（自左向右，区之间用细分隔线，见 [`status_section_divider`]）：
-//! - **左侧区**：语言徽标（圆角小底 + 语言类别「徽记色点」，色源 [`ui::theme::language_badge_color`]）
-//!   + 文件名（悬停浮层提示完整路径，P2-9 tooltip 复用）；未打开文件时显示「未命名」占位。
+//! - **左侧区**：语言徽标（圆角小底 + 语言类别「徽记色点」，色源 [`ui::theme::language_badge_color`]）。
+//!   文件名与「悬停显示完整路径」提示已迁移到选项卡栏（2026-11-10）：每个有名文件选项卡
+//!   悬停 200ms 后在其下方浮出自身完整路径 tooltip（见 [`crate::app::tabs`]）；未打开文件时
+//!   徽标显示「纯文本」占位。
 //! - **中间区**：光标位置（编辑区 `Ln x, Col y`）或滚动位置（预览/PDF 页码）；无编辑内容时整段省略。
 //! - **右侧区**：模式/状态（预览 / 只读 / 跟随系统主题 / UTF-8）→ 统计（行/字）→ 阅读控制按钮。
 //!
@@ -37,12 +39,11 @@ impl EditorApp {
         // 借用纪律（SC-5）：一次 borrow 取出激活选项卡的全部廉价字段（Scalar/String/实体引用
         // 读数）即释放 guard——杜绝「长借用 model.borrow() 构造子元素」后子元素继续借用的
         // 隐患；后续 `status_bar_left/right` 等自身再 borrow，互不嵌套。
-        let (line_count, char_count, dirty, language, preview_on, readonly_preview, fullscreen, wrap_on, is_markdown, epub_page, pdf_page, cursor_pos) = {
+        let (line_count, char_count, language, preview_on, readonly_preview, fullscreen, wrap_on, is_markdown, epub_page, pdf_page, cursor_pos) = {
             let model = self.model.borrow();
             let tab = model.tabs.get(model.active_tab);
             let (line_count, char_count) =
                 tab.map(|t| (t.line_count, t.char_count)).unwrap_or((0, 0));
-            let dirty = tab.map(|t| t.dirty).unwrap_or(false);
             let language = self.language_label().to_string();
             // 右侧条件沿用既有判定：
             // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。
@@ -81,7 +82,6 @@ impl EditorApp {
             (
                 line_count,
                 char_count,
-                dirty,
                 language,
                 preview_on,
                 readonly_preview,
@@ -95,8 +95,8 @@ impl EditorApp {
         };
         let bar_border = self.bar_border();
 
-        // 左侧区：语言徽标 + 文件名
-        let left = self.status_bar_left(dirty, language, window, cx);
+        // 左侧区：语言徽标
+        let left = self.status_bar_left(language);
         let middle = self.status_bar_middle(epub_page, pdf_page, cursor_pos);
 
         let mut root = div()
@@ -141,118 +141,15 @@ impl EditorApp {
         root
     }
 
-    /// 左侧区：文件名（悬停浮层显示完整路径）＋ 语言徽标 pill。
-    fn status_bar_left(
-        &self,
-        dirty: bool,
-        language: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let text_primary = self.text_primary();
-        let file_name = self.file_display_name();
-        // P2-9 tooltip：文件名悬停后展示完整路径（路径提示）。
-        let path_hint = self
-            .model.borrow().tabs
-            .get(self.model.borrow().active_tab)
-            .and_then(|t| t.file_path.as_ref())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let has_path = !path_hint.is_empty();
-        const TIP_ID: &str = "status-file-name";
-        let tip = ui::tooltip::tooltip_state(TIP_ID, window, cx);
-        let tip_on = ui::tooltip::tooltip_visible(&tip, cx);
-        let view_id = window.current_view();
-
-        // 路径浮层锚在文件名块**右缘**（`tooltip_layer` 偏移 = host_w + 间隙）：实测
-        // 「脏标记 ● + 间距 + 文件名文本」的可见宽度，否则 host_w=0 会让浮层盖住
-        // 触发它的文件名。文件名有 `max_w(320px)` 截断，测量值同样封顶（一致）。
-        let base_font = window.text_style().font();
-        let measure = |text: SharedString, weight: gpui::FontWeight| -> f32 {
-            let len = text.len();
-            let mut font = base_font.clone();
-            font.weight = weight;
-            f32::from(
-                window
-                    .text_system()
-                    .shape_line(
-                        text,
-                        px(12.),
-                        &[gpui::TextRun {
-                            len,
-                            font,
-                            color: gpui::Hsla::default(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        }],
-                        None,
-                    )
-                    .width(),
-            )
-        };
-        let dirty_dot_w = if dirty {
-            measure("●".into(), gpui::FontWeight::NORMAL) + 4.0
-        } else {
-            0.0
-        };
-        let name_w = measure(file_name.clone().into(), gpui::FontWeight::MEDIUM).min(320.0);
-        let name_block_w = dirty_dot_w + name_w;
-
-        // 文件名块：脏标记 + 文件名（过长截断）+ 路径 tooltip 浮层。
-        let name_block = div()
-            .id(TIP_ID)
-            .debug_selector(|| TIP_ID.into())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .min_w(px(0.))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(if dirty {
-                        self.chrome().dirty
-                    } else {
-                        self.chrome().text_minor
-                    })
-                    .child(if dirty { "●" } else { "" }),
-            )
-            .child(
-                div()
-                    .min_w(px(0.))
-                    .max_w(px(320.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_size(px(12.))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(text_primary)
-                    .child(file_name),
-            )
-            // 路径提示浮层（锚在文件名块右缘垂直居中；无路径（未命名）恒不显示）。
-            .child(ui::tooltip::tooltip_layer(
-                TIP_ID,
-                &path_hint,
-                has_path && tip_on,
-                name_block_w,
-                config::layout::STATUS_BAR_H,
-                cx,
-            ))
-            .on_hover({
-                let state = tip.clone();
-                move |hovered, _w, cx| {
-                    ui::tooltip::tooltip_hover(&state, *hovered, cx);
-                    cx.notify(view_id);
-                }
-            });
-
+    /// 左侧区：语言徽标 pill（文件名与「悬停显示完整路径」提示已迁移到选项卡栏，
+    /// 见 [`crate::app::tabs::tab_bar_item`]，2026-11-10）。
+    fn status_bar_left(&self, language: String) -> gpui::Div {
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
             .min_w(px(0.))
-            .child(name_block)
             .child(self.status_language_badge(&language))
     }
 
