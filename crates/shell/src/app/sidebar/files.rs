@@ -12,11 +12,11 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(idx) = self
-            .tabs
+        let idx = self
+            .model.borrow().tabs
             .iter()
-            .position(|t| t.file_path.as_deref() == Some(path))
-        {
+            .position(|t| t.file_path.as_deref() == Some(path));
+        if let Some(idx) = idx {
             self.activate_tab(idx, window, cx);
         } else {
             self.open_file(&path.to_string_lossy(), window, cx);
@@ -292,7 +292,10 @@ impl EditorApp {
         let Some(root) = self.sidebar.files.root.clone() else {
             return out;
         };
-        let filter = self.files_filter.as_str();
+        // SC-3：hold Ref guard 供 `filter` 引用（`borrow()` 临时在某语句末即释放，
+        // 不能直接 `self.model.borrow().files_filter.as_str()` 返回 &str）。
+        let m = self.model.borrow();
+        let filter = m.files_filter.as_str();
         // 根行恒可见（树根不因过滤消失；其下子项按过滤词裁剪）。
         let root_name = root
             .file_name()
@@ -500,8 +503,8 @@ impl EditorApp {
 
     /// 某路径是否为当前激活选项卡的文件（文件树行高亮依据）。
     fn active_file_path_matches(&self, path: &std::path::Path) -> bool {
-        self.tabs
-            .get(self.active_tab)
+        self.model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .and_then(|t| t.file_path.as_ref())
             .is_some_and(|p| p == path)
     }
@@ -545,17 +548,20 @@ impl EditorApp {
     /// 输入变化 → 登记防抖待提交过滤词并重启防抖计时器（`SeqAfter` 代序作废旧定时器）。
     /// 防抖期满提交 `files_filter` + 作废文件树布局缓存（下次渲染按新过滤词重收集可见行）。
     pub(crate) fn schedule_files_filter_debounce(&mut self, value: String, cx: &mut Context<Self>) {
-        self.files_filter_pending = value.trim().to_lowercase();
+        self.model.borrow_mut().files_filter_pending = value.trim().to_lowercase();
         cx.notify();
         let weak = cx.weak_entity();
-        self.files_filter_debounce.after(
+        self.model.borrow().files_filter_debounce.after(
             cx,
             std::time::Duration::from_millis(FILES_FILTER_DEBOUNCE_MS),
             move |app| {
                 let _ = weak.update(app, |this, cx| {
-                    let pending = std::mem::take(&mut this.files_filter_pending);
-                    if this.files_filter != pending {
-                        this.files_filter = pending;
+                    // SC-3：先提纯 owned 再比较（`if` 条件里的 borrow 临时 Ref 会存活
+                    // 整个分支块 → 块内 borrow_mut 运行期双借 panic）。
+                    let pending = std::mem::take(&mut this.model.borrow_mut().files_filter_pending);
+                    let files_filter = this.model.borrow().files_filter.clone();
+                    if files_filter != pending {
+                        this.model.borrow_mut().files_filter = pending;
                         this.sidebar.files.layout_gen = this.sidebar.files.layout_gen.wrapping_add(1);
                         cx.notify();
                     }

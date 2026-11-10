@@ -81,7 +81,7 @@ pub(crate) static LIVE_COMMIT_OPS_COUNT: std::sync::atomic::AtomicUsize =
 impl EditorApp {
     /// 选项卡默认文件名（用于保存对话框）。
     pub(super) fn tab_file_name(&self, idx: usize) -> String {
-        self.tabs
+        self.model.borrow().tabs
             .get(idx)
             .and_then(|t| t.file_path.as_ref())
             .and_then(|p| p.file_name())
@@ -91,8 +91,8 @@ impl EditorApp {
 
     /// 当前激活选项卡是否开启预览。
     pub(super) fn show_preview(&self) -> bool {
-        self.tabs
-            .get(self.active_tab)
+        self.model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .map(|t| t.preview_on)
             .unwrap_or(false)
     }
@@ -103,7 +103,9 @@ impl EditorApp {
     /// `render_fullscreen_preview` 据此决定走统一组件宿主。
     ///（M5-B5 P4-2：`MarkdownPreview` 已删，预览统一 WyEditor。）
     pub(super) fn md_wy_preview(&self) -> Option<gpui::Entity<WyEditor>> {
-        let tab = self.tabs.get(self.active_tab)?;
+        let model = self.model.borrow();
+        let active = model.active_tab;
+        let tab = model.tabs.get(active)?;
         // PDF/图片/视频用自带阅读器，绝不以 WyEditor 渲染。
         if tab.reader.is_reader() {
             return None;
@@ -115,11 +117,12 @@ impl EditorApp {
     /// 读 WyEditor 只读宿主 WYSIWYG 确定性量程（`MarkdownPreview` 回退后端已删）。
     /// 非 EPUB / 就绪前 → `None`（状态栏不显示页码）。
     pub(super) fn epub_page_bounds(&self, window: &mut Window, cx: &gpui::App) -> Option<(usize, usize)> {
-        let idx = self.active_tab;
+        let idx = self.model.borrow().active_tab;
         if !self.is_epub_tab(idx) {
             return None;
         }
-        let tab = self.tabs.get(idx)?;
+        let model = self.model.borrow();
+        let tab = model.tabs.get(idx)?;
         // 视口高：以窗口内容高估算（容器 ≈ 窗口正文区；误差 ≤ 顶部/底部工具条高，
         // 对「第 x/N 页」展示无碍）。
         let view_h = f32::from(window.viewport_size().height).max(1.);
@@ -140,11 +143,12 @@ impl EditorApp {
     /// 上一帧渲染期推入的 `viewport_top_px`）——本帧推入发生在 sync 之后，故同步天然
     /// 滞后一帧；对逐帧收敛无影响，反而更稳。
     pub(super) fn sync_editor_preview_scroll(&mut self, cx: &mut Context<Self>) {
-        let idx = self.active_tab;
+        let idx = self.model.borrow().active_tab;
         if self.md_wy_preview().is_none() {
             return;
         }
-        let tab = &self.tabs[idx];
+        let model = self.model.borrow();
+        let tab = &model.tabs[idx];
         if tab.readonly_preview || tab.preview_fullscreen || !self.show_preview() || tab.live_edit {
             return;
         }
@@ -321,7 +325,9 @@ impl EditorApp {
         &self,
         cx: &gpui::App,
     ) -> Option<(markdown_wysiwyg::TocEntries, MdTocScroll)> {
-        let tab = self.tabs.get(self.active_tab)?;
+        let model = self.model.borrow();
+        let active = model.active_tab;
+        let tab = model.tabs.get(active)?;
         let wy = tab.md_wy.as_ref()?;
         Some((wy.read(cx).toc_entries(), MdTocScroll::Unified(wy.clone())))
     }
@@ -338,13 +344,13 @@ impl EditorApp {
         cx: &mut Context<Self>,
         configure: impl FnOnce(&mut WyEditor, &mut gpui::App),
     ) {
-        let fs = self.font_size;
-        let base_dir = self.tabs[idx]
+        let fs = self.model.borrow().font_size;
+        let base_dir = self.model.borrow().tabs[idx]
             .file_path
             .as_ref()
             .and_then(|p| p.parent())
             .map(|d| d.to_path_buf());
-        if self.tabs[idx].md_wy.is_none() {
+        if self.model.borrow().tabs[idx].md_wy.is_none() {
             let ed = cx.new(|cx| WyEditor::new(window, cx));
             ed.update(cx, |ed, cx| {
                 ed.set_editable(false); // A1 只读门控：右栏预览不可编辑
@@ -352,7 +358,7 @@ impl EditorApp {
                 ed.set_base_dir(base_dir);
                 configure(ed, cx);
             });
-            self.tabs[idx].md_wy = Some(ed.clone());
+            self.model.borrow_mut().tabs[idx].md_wy = Some(ed.clone());
         }
     }
 
@@ -367,7 +373,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
         feed: bool,
     ) {
-        if idx >= self.tabs.len() {
+        if idx >= self.model.borrow().tabs.len() {
             return;
         }
         // B3：喂源/就地换源前作废在途后台装配（防旧切回的装配把新喂内容覆盖回去）。
@@ -376,17 +382,18 @@ impl EditorApp {
         self.ensure_wy(idx, window, cx, |_ed, _cx| {});
         if feed {
             // 同步喂源：源 = 编辑区规范文本（与预览宿主同口径）。
-            let fs = self.font_size;
-            let base_dir = self.tabs[idx]
+            let fs = self.model.borrow().font_size;
+            let base_dir = self.model.borrow().tabs[idx]
                 .file_path
                 .as_ref()
                 .and_then(|p| p.parent())
                 .map(|d| d.to_path_buf());
             let text = {
-                let tab = &mut self.tabs[idx];
+                let mut model = self.model.borrow_mut();
+        let tab = &mut model.tabs[idx];
                 tab.editor.read(cx).value().to_string()
             };
-            if let Some(ed) = self.tabs[idx].md_wy.clone() {
+            if let Some(ed) = self.model.borrow().tabs[idx].md_wy.clone() {
                 ed.update(cx, |ed, _| {
                     ed.set_font_size(gpui::px(fs));
                     ed.set_base_dir(base_dir);
@@ -409,20 +416,20 @@ impl EditorApp {
         images: &std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
         notes: &std::collections::BTreeMap<usize, String>,
     ) {
-        if idx >= self.tabs.len() {
+        if idx >= self.model.borrow().tabs.len() {
             return;
         }
         // B3：喂源/就地换源前作废在途后台装配（防旧切回装配覆盖新喂内容）。
         self.md_wy_invalidate_async(idx);
         // 懒创建引导块共用；EPUB 创建期无专属设置 → 空配置闭包。
         self.ensure_wy(idx, window, cx, |_ed, _cx| {});
-        let fs = self.font_size;
-        let base_dir = self.tabs[idx]
+        let fs = self.model.borrow().font_size;
+        let base_dir = self.model.borrow().tabs[idx]
             .file_path
             .as_ref()
             .and_then(|p| p.parent())
             .map(|d| d.to_path_buf());
-        if let Some(ed) = self.tabs[idx].md_wy.clone() {
+        if let Some(ed) = self.model.borrow().tabs[idx].md_wy.clone() {
             ed.update(cx, |ed, _| {
                 ed.set_font_size(gpui::px(fs));
                 ed.set_base_dir(base_dir);
@@ -440,7 +447,7 @@ impl EditorApp {
     /// prepaint 重钉，无需 window；`MarkdownPreview` 回退后端已删）。
     /// 无 EPUB / 少于 2 章 / 已处边界章 → 不动，返回 `false`。
     pub(super) fn epub_flip_chapter(&mut self, dir: i32, cx: &mut Context<Self>) -> bool {
-        let idx = self.active_tab;
+        let idx = self.model.borrow().active_tab;
         if !self.is_epub_tab(idx) {
             return false;
         }
@@ -472,12 +479,13 @@ impl EditorApp {
     pub(super) fn toggle_preview_for_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(idx, window, cx);
         // 零选项卡（欢迎页）下「预览」无对象：菜单/命令面板都可达这里，先兜底返回。
-        if self.tabs.get(idx).is_none() {
+        if self.model.borrow().tabs.get(idx).is_none() {
             return;
         }
-        let readonly = self.tabs.get(idx).map(|t| t.readonly_preview).unwrap_or(false);
+        let readonly = self.model.borrow().tabs.get(idx).map(|t| t.readonly_preview).unwrap_or(false);
         let preview_on = {
-            let tab = &mut self.tabs[idx];
+            let mut model = self.model.borrow_mut();
+        let tab = &mut model.tabs[idx];
             if readonly {
                 tab.preview_on = true;
                 tab.preview_fullscreen = true;
@@ -493,8 +501,8 @@ impl EditorApp {
         // 开启预览 → 编辑区强制换行，方便在分屏里编辑 Markdown；
         // 关闭预览 → 恢复默认：Markdown 文件编辑区仍换行（md 默认），其余按全局偏好。
         let is_md = self.is_markdown_tab(idx);
-        let wrap = preview_on || is_md || self.wrap_enabled;
-        self.tabs[idx].editor.update(cx, |ed, _cx| {
+        let wrap = preview_on || is_md || self.model.borrow().wrap_enabled;
+        self.model.borrow().tabs[idx].editor.update(cx, |ed, _cx| {
             ed.set_soft_wrap(wrap);
         });
         if preview_on {
@@ -504,9 +512,9 @@ impl EditorApp {
             if !readonly {
                 self.ensure_md_wy(idx, window, cx, true);
             } else if self.is_epub_tab(idx) {
-                let images = self.tabs[idx].epub_images.clone();
-                let notes = self.tabs[idx].epub_notes.clone();
-                let content = self.tabs[idx].content.clone();
+                let images = self.model.borrow().tabs[idx].epub_images.clone();
+                let notes = self.model.borrow().tabs[idx].epub_notes.clone();
+                let content = self.model.borrow().tabs[idx].content.clone();
                 self.ensure_epub_wy(idx, window, cx, content.as_ref(), &images, &notes);
             }
         } else {
@@ -514,8 +522,8 @@ impl EditorApp {
             // 内存回到基线）。B3：在途后台整篇装配一并作废（实体被丢弃，完成回调按
             // tab 归属/代号不再安装）。
             self.md_wy_invalidate_async(idx);
-            self.tabs[idx].md_wy = None;
-            self.tabs[idx].md_wy_vscroll = gpui::ScrollHandle::new();
+            self.model.borrow_mut().tabs[idx].md_wy = None;
+            self.model.borrow_mut().tabs[idx].md_wy_vscroll = gpui::ScrollHandle::new();
         }
         cx.notify();
     }
@@ -523,9 +531,10 @@ impl EditorApp {
     /// 切换当前选项卡预览是否全屏占满（EPUB 阅读模式）。
     /// P4-2：预览统一 WyEditor（恒换行），全屏只影响编辑区/布局，无需再设预览换行。
     pub(super) fn toggle_preview_fullscreen(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let idx = self.active_tab;
+        let idx = self.model.borrow().active_tab;
         let (fullscreen, editor) = {
-            let Some(tab) = self.tabs.get_mut(idx) else {
+            let mut model = self.model.borrow_mut();
+            let Some(tab) = model.tabs.get_mut(idx) else {
                 return;
             };
             tab.preview_fullscreen = !tab.preview_fullscreen;
@@ -537,7 +546,7 @@ impl EditorApp {
         let editor_wrap = if fullscreen {
             true
         } else {
-            is_md || self.wrap_enabled
+            is_md || self.model.borrow().wrap_enabled
         };
         editor.update(cx, |ed, _cx| {
             ed.set_soft_wrap(editor_wrap);
@@ -548,16 +557,16 @@ impl EditorApp {
     /// 切换当前选项卡编辑区的自动换行/不换行，并更新全局编辑器偏好。
     /// 只作用于编辑区；Markdown/EPUB 预览始终自动换行，不随此开关变化。
     pub(super) fn toggle_wrap(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let idx = self.active_tab;
-        let wrap_enabled = !self.wrap_enabled;
-        self.wrap_enabled = wrap_enabled;
+        let idx = self.model.borrow().active_tab;
+        let wrap_enabled = !self.model.borrow().wrap_enabled;
+        self.model.borrow_mut().wrap_enabled = wrap_enabled;
         // 全屏阅读模式强制换行，跳过（由全屏切换控制）；否则按编辑器偏好
         if self
-            .tabs
+            .model.borrow().tabs
             .get(idx)
             .map(|t| !t.preview_fullscreen)
             .unwrap_or(true)
-            && let Some(tab) = self.tabs.get(idx) {
+            && let Some(tab) = self.model.borrow().tabs.get(idx) {
                 tab.editor.update(cx, |ed, _cx| {
                     ed.set_soft_wrap(wrap_enabled);
                 });
@@ -572,7 +581,7 @@ impl EditorApp {
 
     /// 选项卡是否 Markdown 文件（编辑区/预览默认换行的依据）。
     pub(super) fn is_markdown_tab(&self, idx: usize) -> bool {
-        self.tabs
+        self.model.borrow().tabs
             .get(idx)
             .and_then(|t| t.file_path.as_ref())
             .map(|p| Self::is_markdown_path(p))
@@ -581,7 +590,7 @@ impl EditorApp {
 
     /// 选项卡是否 EPUB 文件（按扩展名识别；EPUB 预览走 WyEditor 只读宿主的依据）。
     pub(super) fn is_epub_tab(&self, idx: usize) -> bool {
-        self.tabs
+        self.model.borrow().tabs
             .get(idx)
             .and_then(|t| t.file_path.as_ref())
             .map(|p| Self::is_epub_path(p))
@@ -616,8 +625,8 @@ impl EditorApp {
 
     /// 当前文件显示名（无文件时为"未命名"）。
     pub(super) fn file_display_name(&self) -> String {
-        self.tabs
-            .get(self.active_tab)
+        self.model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .and_then(|t| t.file_path.as_ref())
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
@@ -626,9 +635,9 @@ impl EditorApp {
 
     /// 按扩展名推断语言标签（仅用于状态栏展示；单一真值见 [`Self::classify`]）。
     pub(super) fn language_label(&self) -> &'static str {
-        let Some(p) = self
-            .tabs
-            .get(self.active_tab)
+        let model = self.model.borrow();
+        let Some(p) = model.tabs
+            .get(model.active_tab)
             .and_then(|t| t.file_path.as_ref())
         else {
             return "纯文本";
@@ -638,58 +647,45 @@ impl EditorApp {
 
     /// 调节编辑器字号并刷新预览（范围约束见 FONT_MIN/FONT_MAX）。
     pub(super) fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
-        self.font_size = (self.font_size + delta).clamp(FONT_MIN, FONT_MAX);
+        let font_size = (self.model.borrow().font_size + delta).clamp(FONT_MIN, FONT_MAX);
+        self.model.borrow_mut().font_size = font_size;
         // 字号用户自调后持久化（文件极小 + 原子写，每步一次可接受）。
         self.persist_prefs();
         // 实时预览编辑（WYSIWYG）字号：EditorState 继承外层 text_size（宿主容器渲染时
-        // 读取 self.font_size），无需像旧的 MarkdownLivePreview 那样内部 set_font_override。
+        // 读取 model.font_size），无需像旧的 MarkdownLivePreview 那样内部 set_font_override。
         cx.notify();
     }
 
     /// 重置正文字号到默认值并持久化。
     pub(super) fn reset_font_size(&mut self, cx: &mut Context<Self>) {
-        self.font_size = DEFAULT_FONT_SIZE;
+        self.model.borrow_mut().font_size = DEFAULT_FONT_SIZE;
         self.persist_prefs();
         cx.notify();
-    }
-
-    /// 选项卡的「有效内容」：`live2`（WyEditor，实时）开启时读它，否则读源码编辑区。
-    /// 保存/关闭/写回统一走此口径——**live 期间源码编辑区不镜像**（去 O(n)），直接读
-    /// WyEditor 的 rope 才不丢内容（大文档 close→保存 若读旧编辑区会整段丢失）。
-    /// 大文档后台解析**未完成**（`is_loaded() == false`）时 live2 是空壳，回退源码编辑区。
-    pub(crate) fn tab_effective_text(&self, idx: usize, cx: &App) -> String {
-        match self.tabs.get(idx) {
-            Some(t) => match &t.live2 {
-                Some(l2) => {
-                    if l2.read(cx).is_loaded() {
-                        l2.read(cx).text().to_string()
-                    } else {
-                        t.editor.read(cx).value().to_string()
-                    }
-                }
-                None => t.editor.read(cx).value().to_string(),
-            },
-            None => String::new(),
-        }
     }
 
     /// （仅测试）当前 `retired_live2` 延迟回收队列长度——A2 探针：切回瞬间应暂存 1 个
     /// 旧 live2 实体，下一帧 `on_next_frame` 清空后回 0（无泄漏到下一次 open）。
     #[cfg(test)]
     pub(crate) fn retired_live2_len(&self) -> usize {
-        self.retired_live2.len()
+        self.model.borrow().retired_live2.len()
     }
 
     /// 退出预览编辑：把 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览；live2 实体**延迟**
     /// 到下一帧渲染后销毁（A：实体级联 Drop ~36ms 移出点击同步路径）。
     pub(super) fn commit_live(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(idx) else { return };
-        // 本 live 会话是否有内容编辑（读后再清，供下方「未改动跳过写回」判定）。
-        let l2_dirty = tab.live2_dirty;
-        tab.live2_dirty = false;
-        tab.live_edit = false;
-        tab._live2_sub = None;
-        let Some(l2) = tab.live2.take() else { return };
+        // SC-3：把「读取 + 拆 live2」收进一个礼盒作用域（tab 可变借与同 guard 的
+        // `retired_live2` 写入互斥，E0499）→ 出作用域后模型可再借。
+        let (l2, l2_dirty) = {
+            let mut model = self.model.borrow_mut();
+            let Some(tab) = model.tabs.get_mut(idx) else { return };
+            // 本 live 会话是否有内容编辑（读后再清，供下方「未改动跳过写回」判定）。
+            let l2_dirty = tab.live2_dirty;
+            tab.live2_dirty = false;
+            tab.live_edit = false;
+            tab._live2_sub = None;
+            let Some(l2) = tab.live2.take() else { return };
+            (l2, l2_dirty)
+        };
         // A2：**延迟回收**。live2 实体（WyEditor 大对象：Doc 的 rope/行索引/派生缓存 +
         // 整`Rc` 级联）的销毁占切回 ~36ms，不能丢在点击事件路径里同步 Drop。先把实体
         // 暂存到 app 侧 `retired_live2`（clone 是 O(1) 句柄；本函数内 `l2` 继续照常读写），
@@ -698,9 +694,9 @@ impl EditorApp {
         // render 都不再引用旧实体；`on_next_frame` 又晚于「下一帧已渲染/呈现」，故延迟
         // Drop 时既无渲染在读它、也不占用展示切回结果的那一帧的 CPU。本函数所有提前
         // return 路径共用此延迟（未改动 O(1) 跳过 / 加载中退出同样受益）。
-        self.retired_live2.push(l2.clone());
+        self.model.borrow_mut().retired_live2.push(l2.clone());
         cx.on_next_frame(window, |this, _window, _cx| {
-            this.retired_live2.clear();
+            this.model.borrow_mut().retired_live2.clear();
         });
         // 视图从 WYSIWYG 换回源码编辑区：先清空两端编辑器可能残留的鼠标拖选状态
         // （须在任何提前 return 之前）。点击「预览编辑测试」菜单项时 GPUI 把 MouseDown
@@ -712,12 +708,14 @@ impl EditorApp {
         // 并覆盖提前 return 路径（大文档未加载完不走 `set_text`）：WYSIWYG 实体
         // （随后即销毁）与源码编辑区（转前台显示）都不留拖选态。
         l2.update(cx, |ed, _| ed.end_selection());
-        tab.editor.update(cx, |ed, _| ed.cancel_mouse_drag());
+        self.model.borrow().tabs[idx]
+            .editor
+            .update(cx, |ed, _| ed.cancel_mouse_drag());
         // 大文档后台解析在途就退出：live2 尚无内容，不能写回（否则源码编辑区被清空）。
         // 源码编辑区仍是权威源，直接丢弃空壳实体即可。
         if !l2.read(cx).is_loaded() {
-            self.status = SharedString::from("预览编辑测试：关（加载中退出，未写回编辑区）");
-            self.status_ok = false;
+            self.model.borrow_mut().status = SharedString::from("预览编辑测试：关（加载中退出，未写回编辑区）");
+            self.model.borrow_mut().status_ok = false;
             return;
         }
         // 未改动（live 期间无任何内容编辑，`live2_dirty == false`）：live2 文本恒等于
@@ -727,8 +725,8 @@ impl EditorApp {
         if !l2_dirty {
             #[cfg(test)]
             LIVE_COMMIT_SKIP_UNCHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.status = SharedString::from("预览编辑测试：关（未改动，无需写回）");
-            self.status_ok = true;
+            self.model.borrow_mut().status = SharedString::from("预览编辑测试：关（未改动，无需写回）");
+            self.model.borrow_mut().status_ok = true;
             return;
         }
         #[cfg(test)]
@@ -750,7 +748,8 @@ impl EditorApp {
             let content = l2.read(cx).text();
             let src_len;
             let ok = {
-                let tab = &mut self.tabs[idx];
+                let mut model = self.model.borrow_mut();
+                let tab = &mut model.tabs[idx];
                 tab.content = content.clone();
                 // 行/字符计数直接取 WyEditor 增量维护的 O(1) 值（订阅已随每次编辑更新；
                 // 不再对 6.4MB 全文做 lines()/chars() 线性扫——那是旧路径 ~90ms 的主来源）。
@@ -774,8 +773,8 @@ impl EditorApp {
                 // `preview_apply_edit`（1-3ms，不回归）；大跨度/失步改整篇喂源——大内容
                 // **后台异步装配**（`md_wy_feed_full`），同步路径不再 O(n) `Doc::open`。
                 self.md_wy_align_after_ops(idx, &ops, src_len, content, cx);
-                self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
-                self.status_ok = true;
+                self.model.borrow_mut().status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
+                self.model.borrow_mut().status_ok = true;
                 return;
             }
             // 护栏失败 → 落到既有行级 diff 兜底（源码编辑区未被重放污染，`base` 仍有效）。
@@ -795,7 +794,8 @@ impl EditorApp {
         let content;
         let replaces;
         {
-            let tab = &mut self.tabs[idx];
+            let mut model = self.model.borrow_mut();
+            let tab = &mut model.tabs[idx];
             base = tab.editor.read(cx).text().to_string();
             // A1：`l2.text()` 直接返回 `SharedString`（`Doc::text_shared` 的 O(1) 句柄），
             // 零拷贝赋给 `tab.content` —— 不再 `.to_string()` 又 `SharedString::from` 绕一圈
@@ -826,8 +826,8 @@ impl EditorApp {
         // 帧，实测 6.4MB 大段替换更慢；B3 起大内容整篇喂源改后台异步装配（`md_wy_feed_full`）
         // ——同步路径不再 O(n)。md_wy 内容 ≠ 源快照（含空壳未就绪）也整篇兜底。
         self.md_wy_align_after_diff(idx, &replaces, base.as_str(), content, cx);
-        self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
-        self.status_ok = true;
+        self.model.borrow_mut().status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
+        self.model.borrow_mut().status_ok = true;
     }
 
     // —— B3：右栏 `md_wy` 整篇喂源 / 后台异步装配 ——
@@ -837,7 +837,7 @@ impl EditorApp {
     /// 都必须在改动前调用——否则旧装配完成后会按旧代号命中、把刚改好的内容覆盖回去
     /// （装错）。`file_ops`（打开换源）也调用，故 `pub(super)`。
     pub(super) fn md_wy_invalidate_async(&mut self, idx: usize) {
-        if let Some(t) = self.tabs.get_mut(idx) {
+        if let Some(t) = self.model.borrow_mut().tabs.get_mut(idx) {
             t.md_wy_install.seq += 1;
             t.md_wy_install.pending = None;
             t.md_wy_install.pending_full = None; // Step3：任何同步改写 md_wy 内容 → 整篇在途标记一并作废
@@ -852,11 +852,12 @@ impl EditorApp {
     /// （切走/关闭/更新换代）则完成回调直接丢弃结果，md_wy 保持当前（旧）内容，由后续
     /// 喂源/装配追平，不装错、不泄漏。
     fn md_wy_feed_full(&mut self, idx: usize, content: SharedString, cx: &mut Context<Self>) {
-        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+        let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
             return;
         };
         let seq = {
-            let t = &mut self.tabs[idx];
+            let mut model = self.model.borrow_mut();
+            let t = &mut model.tabs[idx];
             t.md_wy_install.seq += 1;
             t.md_wy_install.seq
         };
@@ -866,16 +867,16 @@ impl EditorApp {
             wy.update(cx, |w, _| {
                 w.install_open(markdown_wysiwyg::WyEditor::open_from_str(content))
             });
-            if let Some(t) = self.tabs.get_mut(idx) {
+            if let Some(t) = self.model.borrow_mut().tabs.get_mut(idx) {
                 t.md_wy_install.pending = None;
                 t.md_wy_install.pending_full = None; // Step3：同步装好即 == 编辑区 → 解除在途标记
             }
             return;
         }
-        self.tabs[idx].md_wy_install.pending = Some((seq, content.clone()));
+        self.model.borrow_mut().tabs[idx].md_wy_install.pending = Some((seq, content.clone()));
         // Step3：异步整篇在途、预览仍为旧内容（<新整篇）→ 置在途标记，增量桥打旧内容会
         // 错位，转为「作废 + 重喂」（见 `sync::on_editor_edited`）。
-        self.tabs[idx].md_wy_install.pending_full = Some((seq, 0));
+        self.model.borrow_mut().tabs[idx].md_wy_install.pending_full = Some((seq, 0));
         #[cfg(test)]
         LIVE_COMMIT_MD_WY_ASYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self::md_wy_spawn_async_install(idx, wy, content, seq, cx);
@@ -894,7 +895,7 @@ impl EditorApp {
         content: SharedString,
         cx: &mut Context<Self>,
     ) {
-        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+        let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
             return;
         };
         let span: usize = ops
@@ -928,7 +929,7 @@ impl EditorApp {
         content: SharedString,
         cx: &mut Context<Self>,
     ) {
-        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+        let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
             return;
         };
         let span: usize = replaces.iter().map(|(r, _)| r.end - r.start).sum();
@@ -969,15 +970,16 @@ impl EditorApp {
         p: std::path::PathBuf,
         cx: &mut Context<Self>,
     ) -> usize {
-        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+        let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
             return 0;
         };
         let (seq, ver) = {
-            let t = &mut self.tabs[idx];
+            let mut model = self.model.borrow_mut();
+            let t = &mut model.tabs[idx];
             t.md_wy_install.seq += 1;
             (t.md_wy_install.seq, t.edit_version)
         };
-        self.tabs[idx].md_wy_install.early = Some(MdWyEarly::Pending { seq, edit_version: ver });
+        self.model.borrow_mut().tabs[idx].md_wy_install.early = Some(MdWyEarly::Pending { seq, edit_version: ver });
         cx.spawn(async move |this, cx| {
             // 独立后台任务：读全文（归一化）→ 整篇解析（UI 线程不背 O(n)）。
             let result = cx
@@ -996,13 +998,13 @@ impl EditorApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // 守卫 1/2（短借用）：tab 归属 + 装配代号。
-                let ok = this.tabs.get(idx).is_some_and(|t| {
+                let ok = this.model.borrow().tabs.get(idx).is_some_and(|t| {
                     t.md_wy.as_ref() == Some(&wy) && t.md_wy_install.seq == seq
                 });
                 if !ok {
                     // 代号已换代 / 实体已易主（换源、重喂、切走重建）→ 本结果作废；清掉
                     // 本代号的在途标记（不误标 Failed——新装配会接管）。
-                    if let Some(t) = this.tabs.get_mut(idx)
+                    if let Some(t) = this.model.borrow_mut().tabs.get_mut(idx)
                         && t.md_wy_install.early.as_ref()
                             == Some(&MdWyEarly::Pending { seq, edit_version: ver })
                     {
@@ -1013,13 +1015,14 @@ impl EditorApp {
                 }
                 match result {
                     // 守卫 3：未编辑 → 带滚动锚换入全文。
-                    Ok(result) if this.tabs[idx].edit_version == ver => {
+                    Ok(result) if this.model.borrow().tabs[idx].edit_version == ver => {
                         this.md_wy_install_full_swap(idx, &wy, result, cx);
                     }
                     Ok(_) => {
                         // 已编辑：丢弃整篇结果（sync 自愈/重喂链路接管），复位在途标记
                         //（EOF 收尾不再指望它，走既有收尾兜底）。
-                        let t = &mut this.tabs[idx];
+                        let mut model = this.model.borrow_mut();
+            let t = &mut model.tabs[idx];
                         t.md_wy_install.early = None;
                         t.md_wy_install.pending_full = None;
                     }
@@ -1032,12 +1035,13 @@ impl EditorApp {
                         //   - EOF 未过 → EOF 的 `md_wy_invalidate_async` 会作废本在途重喂，
                         //     EOF 兜底整篇装配接管（无双 install、不装陈旧）。
                         {
-                            let t = &mut this.tabs[idx];
+                            let mut model = this.model.borrow_mut();
+            let t = &mut model.tabs[idx];
                             // 仅当依旧命中本代号（期间无换代）才接管，否则交新装配。
                             t.md_wy_install.early = Some(MdWyEarly::Failed);
                             t.md_wy_install.pending_full = None;
                         }
-                        let rope = this.tabs[idx].editor.read(cx).rope().clone();
+                        let rope = this.model.borrow().tabs[idx].editor.read(cx).rope().clone();
                         this.md_wy_feed_full_rope(idx, rope, cx);
                     }
                 }
@@ -1064,7 +1068,8 @@ impl EditorApp {
         if let Some(sl) = anchor {
             wy.update(cx, |ed, _| ed.set_scroll_target(sl));
         }
-        if let Some(tab) = self.tabs.get_mut(idx) {
+        let mut model = self.model.borrow_mut();
+        if let Some(tab) = model.tabs.get_mut(idx) {
             tab.md_wy_install.early = Some(MdWyEarly::Done);
             tab.md_wy_install.pending_full = None;
         }
@@ -1094,10 +1099,10 @@ impl EditorApp {
         full_seq: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+        let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
             return;
         };
-        let ver = self.tabs[idx].edit_version;
+        let ver = self.model.borrow().tabs[idx].edit_version;
         let prefix_len = prefix.len();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1105,7 +1110,8 @@ impl EditorApp {
                 .spawn(async move { markdown_wysiwyg::WyEditor::open_from_rope(prefix) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                let Some(tab) = this.tabs.get_mut(idx) else {
+                let mut model = this.model.borrow_mut();
+                let Some(tab) = model.tabs.get_mut(idx) else {
                     return;
                 };
                 if tab.md_wy.as_ref() != Some(&wy) || tab.md_wy_install.seq != full_seq {
@@ -1131,11 +1137,12 @@ impl EditorApp {
     /// 区」，随后退化逐键增量。小 rope 同步装、大 rope 后台 parse，均带装配代号守卫；
     /// 异步在途期间置 `md_wy_pending_full`（禁止对旧内容增量）。
     pub(super) fn md_wy_feed_full_rope(&mut self, idx: usize, rope: Rope, cx: &mut Context<Self>) {
-        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+        let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
             return;
         };
         let seq = {
-            let t = &mut self.tabs[idx];
+            let mut model = self.model.borrow_mut();
+            let t = &mut model.tabs[idx];
             t.md_wy_install.seq += 1;
             t.md_wy_install.seq
         };
@@ -1144,14 +1151,14 @@ impl EditorApp {
             wy.update(cx, |w, _| {
                 w.install_open(markdown_wysiwyg::WyEditor::open_from_rope(rope))
             });
-            if let Some(t) = self.tabs.get_mut(idx) {
+            if let Some(t) = self.model.borrow_mut().tabs.get_mut(idx) {
                 t.md_wy_install.pending = None;
                 t.md_wy_install.pending_full = None;
             }
             return;
         }
-        self.tabs[idx].md_wy_install.pending = None;
-        self.tabs[idx].md_wy_install.pending_full = Some((seq, 0));
+        self.model.borrow_mut().tabs[idx].md_wy_install.pending = None;
+        self.model.borrow_mut().tabs[idx].md_wy_install.pending_full = Some((seq, 0));
         Self::md_wy_spawn_async_install_rope(idx, wy, rope, seq, cx);
     }
 
@@ -1173,16 +1180,17 @@ impl EditorApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.tabs.get(tab_idx).is_some_and(|t| {
+                if this.model.borrow().tabs.get(tab_idx).is_some_and(|t| {
                     t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install.seq == seq
                 }) {
                     wy_install.update(cx, |ed, _| ed.install_open(result));
-                    if let Some(tab) = this.tabs.get_mut(tab_idx) {
+                    let mut model = this.model.borrow_mut();
+                    if let Some(tab) = model.tabs.get_mut(tab_idx) {
                         tab.md_wy_install.pending = None;
                         tab.md_wy_install.pending_full = None;
                     }
                     cx.notify();
-                } else if let Some(tab) = this.tabs.get_mut(tab_idx)
+                } else if let Some(tab) = this.model.borrow_mut().tabs.get_mut(tab_idx)
                     && tab.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq)
                 {
                     // 守卫不通过（切走/关闭/换代）→ 若仍挂本代号则清悬空标记；已换新代号保留。
@@ -1220,17 +1228,18 @@ impl EditorApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.tabs.get(tab_idx).is_some_and(|t| {
+                if this.model.borrow().tabs.get(tab_idx).is_some_and(|t| {
                     t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install.seq == seq
                 }) {
                     wy_install.update(cx, |ed, _| ed.install_open(result));
-                    if let Some(tab) = this.tabs.get_mut(tab_idx) {
+                    let mut model = this.model.borrow_mut();
+                    if let Some(tab) = model.tabs.get_mut(tab_idx) {
                         tab.md_wy_install.pending = None;
                         // Step3：异步整篇落地 → 预览已 == 目标，解除在途标记（增量桥恢复）。
                         tab.md_wy_install.pending_full = None;
                     }
                     cx.notify();
-                } else if let Some(tab) = this.tabs.get_mut(tab_idx)
+                } else if let Some(tab) = this.model.borrow_mut().tabs.get_mut(tab_idx)
                     && (tab.md_wy_install.pending.as_ref().is_some_and(|(s, _)| *s == seq)
                         || tab.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq))
                 {
@@ -1246,14 +1255,14 @@ impl EditorApp {
 
     /// 「预览编辑测试」开关：用本项目 `markdown_wysiwyg::WyEditor` 渲染左面板。
     pub(super) fn toggle_live_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let idx = self.active_tab;
+        let idx = self.model.borrow().active_tab;
         if !self.is_markdown_tab(idx) {
-            self.status = SharedString::from("预览编辑测试仅支持 Markdown 文件");
-            self.status_ok = false;
+            self.model.borrow_mut().status = SharedString::from("预览编辑测试仅支持 Markdown 文件");
+            self.model.borrow_mut().status_ok = false;
             cx.notify();
             return;
         }
-        if self.tabs[idx].live2.is_some() {
+        if self.model.borrow().tabs[idx].live2.is_some() {
             self.commit_live(idx, window, cx);
         } else {
             // 源快照：O(1) COW Rope。大文档走**后台解析**（与预览的后台 scan_blocks 同构）：
@@ -1262,7 +1271,7 @@ impl EditorApp {
             // （无「空白→内容」闪烁）。加载完成前 `is_loaded()==false`，宿主读写文本
             // （保存/退出）回退源码编辑区（`tab_effective_text` / `commit_live` 已守卫）。
             const ASYNC_LOAD_MIN_BYTES: usize = 512 * 1024;
-            let rope = self.tabs[idx].editor.read(cx).text().clone();
+            let rope = self.model.borrow().tabs[idx].editor.read(cx).text().clone();
             let async_load = rope.len() >= ASYNC_LOAD_MIN_BYTES;
             // —— 共享复用右栏已解析 Doc（消双解析、O(1) 即见）——
             // 守卫沿增量桥不变式：`md_wy` 已 loaded（且与编辑区字节等长 → 内容一致）、无
@@ -1273,16 +1282,16 @@ impl EditorApp {
             // 异步 `open_from_rope` 兜底。小文档（`!async_load`）不蹭复用：同步 `with_text`
             // 本就无空白帧、零风险不变行为。
             let reuse = self
-                .tabs[idx]
+                .model.borrow().tabs[idx]
                 .md_wy
                 .as_ref()
                 .filter(|w| {
                     async_load
                         && w.read(cx).is_loaded()
-                        && self.tabs[idx].md_wy_install.pending.is_none()
-                        && self.tabs[idx].md_wy_install.pending_full.is_none()
+                        && self.model.borrow().tabs[idx].md_wy_install.pending.is_none()
+                        && self.model.borrow().tabs[idx].md_wy_install.pending_full.is_none()
                         && !matches!(
-                            self.tabs[idx].md_wy_install.early,
+                            self.model.borrow().tabs[idx].md_wy_install.early,
                             Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Failed)
                         )
                         && w.read(cx).len() == rope.len()
@@ -1307,10 +1316,10 @@ impl EditorApp {
                 cx.new(|cx| WyEditor::new(window, cx).with_text(text.as_ref()))
             };
             // 同步全局字号（新建即套用；WY 字号由编辑器自持，measure/prepaint 一致）
-            let fs = self.font_size;
+            let fs = self.model.borrow().font_size;
             ed.update(cx, |ed, _| ed.set_font_size(gpui::px(fs)));
             // 图片相对路径基于文件所在目录解析（与预览一致）
-            let base_dir = self.tabs[idx]
+            let base_dir = self.model.borrow().tabs[idx]
                 .file_path
                 .as_ref()
                 .and_then(|p| p.parent())
@@ -1323,8 +1332,11 @@ impl EditorApp {
                 let _t = crate::prof::begin();
                 match ev {
                     WyEvent::Changed => {
+                        // SC-2：命名 RefMut guard + 用完即 drop（借用纪律收窄），
+                        // 否则 	his.schedule_session_flush 在 guard 存活期 → E0502。
+                        let mut model_sub = this.model.borrow_mut();
                         if let Some(tab) =
-                            this.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&emitter))
+                            model_sub.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&emitter))
                         {
                             // **O(1) 增量计数**（`WyEditor::line_count/char_count` 直读
                             // `Doc` 行起始表/增量字符计数，不物化全文），源码编辑区与右侧
@@ -1341,18 +1353,20 @@ impl EditorApp {
                                 tab.dirty = true;
                             }
                             cx.notify();
+                            drop(model_sub);
                             // WYSIWYG 内容变更 → 防抖持久化（结构变化则即时，见 session 模块）。
                             this.schedule_session_flush(cx, false);
                         }
                     }
                     WyEvent::OpenPage(p) => {
-                        this.status = SharedString::from(format!("WYSIWYG 点击链接：{p}"));
-                        this.status_ok = true;
+                        this.model.borrow_mut().status = SharedString::from(format!("WYSIWYG 点击链接：{p}"));
+                        this.model.borrow_mut().status_ok = true;
                     }
                 }
                 crate::prof::end("wy.app.changed", _t);
             });
-            let tab = &mut self.tabs[idx];
+            let mut model = self.model.borrow_mut();
+        let tab = &mut model.tabs[idx];
             tab.live2 = Some(ed.clone());
             tab._live2_sub = Some(ed_sub);
             tab.live_edit = true;
@@ -1388,12 +1402,13 @@ impl EditorApp {
                     let _ = this.update(cx, |this, cx| {
                         // 只装配仍挂在原 tab 的 live2（用户在装配期间切换/退出则丢弃）。
                         if this
-                            .tabs
+                            .model.borrow().tabs
                             .get(tab_idx)
                             .is_some_and(|t| t.live2.as_ref() == Some(&ed_install))
                         {
                             ed_install.update(cx, |ed, _| ed.install_open(result));
-                            let tab = &mut this.tabs[tab_idx];
+                            let mut model = this.model.borrow_mut();
+            let tab = &mut model.tabs[tab_idx];
                             tab.line_count = ed_install.read(cx).line_count();
                             tab.char_count = ed_install.read(cx).char_count();
                             cx.notify();
@@ -1419,12 +1434,13 @@ impl EditorApp {
                     let _ = this.update(cx, |this, cx| {
                         // 只装配仍挂在原 tab 的 live2（用户在解析期间切换/退出则丢弃）。
                         if this
-                            .tabs
+                            .model.borrow().tabs
                             .get(tab_idx)
                             .is_some_and(|t| t.live2.as_ref() == Some(&ed_install))
                         {
                             ed_install.update(cx, |ed, _| ed.install_open(result));
-                            let tab = &mut this.tabs[tab_idx];
+                            let mut model = this.model.borrow_mut();
+            let tab = &mut model.tabs[tab_idx];
                             tab.line_count = ed_install.read(cx).line_count();
                             tab.char_count = ed_install.read(cx).char_count();
                             cx.notify();
@@ -1433,8 +1449,8 @@ impl EditorApp {
                 })
                 .detach();
             }
-            self.status = SharedString::from("预览编辑测试：开（本项目 Doc 管线 WYSIWYG，初步实现）");
-            self.status_ok = true;
+            model.status = SharedString::from("预览编辑测试：开（本项目 Doc 管线 WYSIWYG，初步实现）");
+            model.status_ok = true;
             let focus = gpui::Focusable::focus_handle(ed.read(cx), cx);
             window.focus(&focus, cx);
         }

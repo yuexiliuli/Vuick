@@ -4,8 +4,11 @@ use super::*;
 use ui::notification::{Notification, NotificationKind};
 
 use text_open::TextChunk;
-use config::limits::{EDITOR_WRAP_MAX_LINES, OPEN_ASYNC_MIN_BYTES, RECENT_MAX};
+use config::limits::EDITOR_WRAP_MAX_LINES;
 use config::timing::OPEN_FAILURE_AUTOHIDE_SECS;
+// SC-4：file_ops 纯逻辑（prepare_text / is_large_path / PreparedText / set_tab_text）
+// 已迁 shell_core::file_ops，此处收敛为 `use` 引用（见下方 glue 转发）。
+use shell_core::file_ops::{prepare_text, PreparedText, is_large_path};
 
 /// [`EditorApp::apply_open_chunk`] 的结果：一块被如何处理（消费者据此决定继续/中止）。
 enum ChunkApply {
@@ -193,13 +196,13 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        for tab in self.tabs.iter_mut() {
+        for tab in self.model.borrow_mut().tabs.iter_mut() {
             if tab.file_path.as_deref() == Some(p) {
                 tab.loading_lock = false;
             }
         }
-        self.status = SharedString::from(format!("打开失败：{e}"));
-        self.status_ok = false;
+        self.model.borrow_mut().status = SharedString::from(format!("打开失败：{e}"));
+        self.model.borrow_mut().status_ok = false;
         // 自托管计时移除（而非依赖通知层按窗口激活状态倒计时），保证必然消失。
         let key = gpui::ElementId::from(SharedString::from(format!(
             "open-fail-{}",
@@ -246,54 +249,45 @@ impl EditorApp {
     /// 记录最近打开的文件：去重置顶 + 截 [`RECENT_MAX`] + 立即持久化。
     /// 「打开最近」副作用集中入口（K10/K11：一次调用内完成「列表更新 + 落盘」，
     /// 消费点只调它，不散点直调 persist）。
+    /// SC-4：逻辑已迁 [`AppModel::record_recent_file`]；此处 glue。
     pub(super) fn record_recent_file(&mut self, path: &std::path::Path) {
-        Self::push_recent(&mut self.recent_files, &path.to_string_lossy());
-        self.persist_prefs();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().record_recent_file(host, path);
     }
 
     /// 记录最近打开的文件夹：去重置顶 + 截 [`RECENT_MAX`] + 立即持久化
     /// （同 [`Self::record_recent_file`] 的副作用集中入口）。
+    /// SC-4：逻辑已迁 [`AppModel::record_recent_folder`]；此处 glue。
     pub(super) fn record_recent_folder(&mut self, path: &std::path::Path) {
-        Self::push_recent(&mut self.recent_folders, &path.to_string_lossy());
-        self.persist_prefs();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().record_recent_folder(host, path);
     }
 
     /// 从最近文件列表移除失效路径（点击失效项 → 命中同步路径外移除 + 落盘）：
     /// 状态栏提示，不尝试打开。
+    /// SC-4：逻辑已迁 [`AppModel::remove_recent_file`]；此处 glue。
     pub(super) fn remove_recent_file(
         &mut self,
         path: &str,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.recent_files.retain(|p| p != path);
-        self.persist_prefs();
-        self.status = SharedString::from(format!("{path} 不存在，已从最近列表移除"));
-        self.status_ok = false;
-        cx.notify();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut()
+            .remove_recent_file(host, path, _window, &mut **cx);
     }
 
     /// 从最近文件夹列表移除失效路径（同 [`Self::remove_recent_file`]）。
+    /// SC-4：逻辑已迁 [`AppModel::remove_recent_folder`]；此处 glue。
     pub(super) fn remove_recent_folder(
         &mut self,
         path: &str,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.recent_folders.retain(|p| p != path);
-        self.persist_prefs();
-        self.status = SharedString::from(format!("{path} 不存在，已从最近列表移除"));
-        self.status_ok = false;
-        cx.notify();
-    }
-
-    /// 去重置顶 + 截断（每类 ≤[`RECENT_MAX`]）：相同路径先移除旧位再插到最前。
-    fn push_recent(list: &mut Vec<String>, path: &str) {
-        if let Some(i) = list.iter().position(|p| p == path) {
-            list.remove(i);
-        }
-        list.insert(0, path.to_string());
-        list.truncate(RECENT_MAX);
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut()
+            .remove_recent_folder(host, path, _window, &mut **cx);
     }
 
     /// 把已读取并预处理好的 UTF-8 文本载入指定选项卡，并刷新文件信息与状态。
@@ -312,8 +306,9 @@ impl EditorApp {
         cx: &mut Context<Self>,
         defer_preview: bool,
     ) {
-        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
-        let Some(tab) = self.tabs.get_mut(idx) else {
+        self.model.borrow_mut().search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
+        let mut model = self.model.borrow_mut();
+        let Some(tab) = model.tabs.get_mut(idx) else {
             return;
         };
         let lang = Self::language_id(p);
@@ -384,12 +379,13 @@ impl EditorApp {
         if is_md {
             tab.preview_on = true;
         }
-        self.status = SharedString::from(if is_md && lines > EDITOR_WRAP_MAX_LINES {
+        drop(model);
+        self.model.borrow_mut().status = SharedString::from(if is_md && lines > EDITOR_WRAP_MAX_LINES {
             format!("已打开：{} · 大文档编辑区已关闭软换行（Ctrl+W 可开，预览保持换行）", p.display())
         } else {
             format!("已打开：{}", p.display())
         });
-        self.status_ok = true;
+        self.model.borrow_mut().status_ok = true;
         // A2：MD 选项卡右栏预览统一组件（WyEditor 只读）——创建并喂源。
         //  - 同步小文档：就地 `set_source_text`（小，UI 可承受，与 md_preview.set_source 同）；
         //  - 大文档快速挂载（defer=true）：只建空壳，整篇 `Doc::open` 由后台
@@ -406,6 +402,7 @@ impl EditorApp {
     /// [`Self::load_file_text`] 走同一条 O(n) 装配管线（`prepare_text` → Rope +
     /// 行宽统计 + 行/字计数），但不设 `file_path`（保持「未命名」语义）、不建
     /// Markdown 预览（未命名选项卡 = 纯文本）。`make_tab` 已建空编辑器。
+    /// SC-4：动作体已迁 [`AppModel::set_tab_text`]（shell_core::file_ops）；此处 glue。
     pub(super) fn set_tab_text(
         &mut self,
         idx: usize,
@@ -413,34 +410,8 @@ impl EditorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if idx >= self.tabs.len() {
-            return;
-        }
-        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
-        let PreparedText {
-            rope,
-            lines,
-            chars,
-            max_line_chars,
-            line_width_histogram,
-            src_len: _,
-        } = prepare_text(text);
-        let Some(tab) = self.tabs.get_mut(idx) else { return };
-        tab.editor.update(cx, |ed, _cx| {
-            // O(1) 装配：与 load_file_text 同款（Rope 共享、统计就地算好）。
-            ed.set_rope_with_stats(rope, max_line_chars, line_width_histogram);
-            // 未命名选项卡无文件 → 不设语言（保持纯文本高亮缺省）。
-            ed.set_language(None);
-        });
-        tab.editor_pending = false;
-        // 未命名选项卡正文以编辑器 Rope 为准，不整份镜像到 content（同 load_file_text）。
-        tab.content = SharedString::default();
-        tab.line_count = lines;
-        tab.char_count = chars;
-        tab.cursor_row = 0;
-        tab.cursor_col = 0;
-        tab.dirty = false;
-        cx.notify();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().set_tab_text(host, idx, text, &mut **cx);
     }
 
     /// 大文档「先瞬时显示、后台补齐」的收尾段：**P1 起整篇 rope 由生产端在后台建好，
@@ -468,7 +439,7 @@ impl EditorApp {
         // 在途的早期解析丢弃，白做一次整篇 Doc::open），本次 EOF 也不重复 install（见下）。
         let early_live = Self::is_markdown_path(p)
             && self
-                .tabs
+                .model.borrow().tabs
                 .get(idx)
                 .is_some_and(|t| {
                     matches!(
@@ -479,7 +450,8 @@ impl EditorApp {
         if Self::is_markdown_path(p) && !early_live {
             self.md_wy_invalidate_async(idx);
         }
-        let Some(tab) = self.tabs.get_mut(idx) else {
+        let mut model = self.model.borrow_mut();
+        let Some(tab) = model.tabs.get_mut(idx) else {
             return;
         };
         if tab.file_path.as_deref() != Some(p) {
@@ -575,8 +547,8 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.status = SharedString::from(format!("正在打开大文档：{}…", p.display()));
-        self.status_ok = true;
+        self.model.borrow_mut().status = SharedString::from(format!("正在打开大文档：{}…", p.display()));
+        self.model.borrow_mut().status_ok = true;
         let is_md = Self::is_markdown_path(&p);
         let entity = cx.entity();
 
@@ -631,7 +603,7 @@ impl EditorApp {
                             let do_notify = progress_gate % 4 == 0;
                             progress_gate += 1;
                             let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
-                                if let Some(tab) = this.tabs.get_mut(idx).filter(|t| {
+                                if let Some(tab) = this.model.borrow_mut().tabs.get_mut(idx).filter(|t| {
                                     t.file_path.as_deref() == Some(p_prg.as_path())
                                 }) {
                                     tab.line_count = lines;
@@ -733,7 +705,7 @@ impl EditorApp {
                 let early_live = is_md
                     && cx
                         .update_window_entity(&entity, |this, _w, _cx| {
-                            this.tabs.get(idx).is_some_and(|t| {
+                            this.model.borrow().tabs.get(idx).is_some_and(|t| {
                                 matches!(
                                     t.md_wy_install.early,
                                     Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Done)
@@ -771,7 +743,7 @@ impl EditorApp {
                 let p_fin = p.clone();
                 let _ = cx.update_window_entity(&entity, move |this, window, cx| {
                     // 源编码写回选项卡（保存 `write_to_path` 按此编码回写）。
-                    if let Some(tab) = this.tabs.get_mut(idx).filter(|t| {
+                    if let Some(tab) = this.model.borrow_mut().tabs.get_mut(idx).filter(|t| {
                         t.file_path.as_deref() == Some(p_fin.as_path())
                     }) {
                         tab.source_encoding = src_enc;
@@ -790,14 +762,24 @@ impl EditorApp {
                     // （`new_impl` 的同步检查跑在 `tab.file_path` 就位之前，这里补齐；
                     // 小文档走 `load_file_text` 同步挂载，由 `new_impl` 直接开启）。
                     if std::env::var_os("WY_AUTOTEST").is_some()
-                        && idx == this.active_tab
-                        && this.tabs.get(idx).is_some_and(|t| t.live2.is_none())
+                        && idx == this.model.borrow().active_tab
+                        && this.model.borrow().tabs.get(idx).is_some_and(|t| t.live2.is_none())
                     {
                         this.toggle_live_test(window, cx);
                     }
                     // 最终状态：内容就绪，恢复「已打开」（含大文档关闭软换行的提示）。
-                    if let Some(tab) = this.tabs.get(idx).filter(|t| t.file_path.as_deref() == Some(p_fin.as_path())) {
-                        this.status = SharedString::from(if is_md && tab.line_count > EDITOR_WRAP_MAX_LINES {
+                    // SC-3：先提纯 owned line_count 再写——避免 `if let` 掮获的共享 Ref
+                    // 存活整个块、块内 `borrow_mut()` 运行期双借 panic。
+                    let opened_line_count = {
+                        let m = this.model.borrow();
+                        m.tabs
+                            .get(idx)
+                            .filter(|t| t.file_path.as_deref() == Some(p_fin.as_path()))
+                            .map(|t| t.line_count)
+                    };
+                    if let Some(line_count) = opened_line_count {
+                        let mut m = this.model.borrow_mut();
+                        m.status = SharedString::from(if is_md && line_count > EDITOR_WRAP_MAX_LINES {
                             format!(
                                 "已打开：{} · 大文档编辑区已关闭软换行（Ctrl+W 可开，预览保持换行）",
                                 p_fin.display()
@@ -805,11 +787,12 @@ impl EditorApp {
                         } else {
                             format!("已打开：{}", p_fin.display())
                         });
-                        this.status_ok = true;
+                        m.status_ok = true;
                     }
                     // 折叠候选 / 括号标尺：整篇换装后**后台**重扫一次（打开全程不再每块
                     // 整篇重扫 → 打开 160k 行文档从 ~2s UI 卡顿降到毫秒级装配）。
-                    if let Some(tab) = this.tabs.get_mut(idx).filter(|t| t.file_path.as_deref() == Some(p_fin.as_path())) {
+                    let mut model = this.model.borrow_mut();
+                    if let Some(tab) = model.tabs.get_mut(idx).filter(|t| t.file_path.as_deref() == Some(p_fin.as_path())) {
                         tab.editor.update(cx, |ed, cx| {
                             ed.refresh_fold_brackets(cx);
                         });
@@ -868,20 +851,34 @@ impl EditorApp {
             // 后台 `open_from_rope` + install，首屏立刻真内容），再整篇续读/续解析；整篇
             // 就绪后带守卫换入全文。EOF 收尾（`finish_file_text`）据此跳过重复 install。
             if Self::is_markdown_path(p) {
-                let prefix = self.tabs[idx].editor.read(cx).rope().clone();
+                let prefix = self.model.borrow().tabs[idx].editor.read(cx).rope().clone();
                 let full_seq = self.md_wy_spawn_early_install(idx, p.to_path_buf(), cx);
                 self.md_wy_spawn_prefix_install(idx, prefix, full_seq, cx);
             }
             // 首块后内容已可见，但整篇仍在读盘 → 保持「正在打开」；锁输入防编辑竞态。
-            if let Some(tab) = self.tabs.get_mut(idx) {
-                tab.loading_lock = true;
-                self.status = SharedString::from(format!("正在打开大文档：{}…", p.display()));
-                self.status_ok = true;
-                return ChunkApply::Mounted(tab.edit_version);
-            }
-            return ChunkApply::Stale;
+            // SC-3：先收窄取 mounted（loading_lock + 版本）再写状态——`tab` 是对 model 的
+            // 可变派生引用，与 `model.status` 同 guard 内互排斥（E0499），故两段分开。
+            let mounted = {
+                let mut model = self.model.borrow_mut();
+                model.tabs.get_mut(idx).map(|tab| {
+                    tab.loading_lock = true;
+                    ChunkApply::Mounted(tab.edit_version)
+                })
+            };
+            return match mounted {
+                Some(applied) => {
+                    self.model.borrow_mut().status = SharedString::from(format!(
+                        "正在打开大文档：{}…",
+                        p.display()
+                    ));
+                    self.model.borrow_mut().status_ok = true;
+                    applied
+                }
+                None => ChunkApply::Stale,
+            };
         }
-        let Some(tab) = self.tabs.get_mut(idx) else {
+        let mut model = self.model.borrow_mut();
+        let Some(tab) = model.tabs.get_mut(idx) else {
             return ChunkApply::Stale;
         };
         if tab.file_path.as_deref() != Some(p) {
@@ -901,7 +898,7 @@ impl EditorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
+        self.model.borrow_mut().search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
         let text = doc.markdown;
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
@@ -913,7 +910,8 @@ impl EditorApp {
         if !self.reset_common_tab_fields(idx, p, SharedString::from(text), lines, chars, cx) {
             return;
         }
-        let Some(tab) = self.tabs.get_mut(idx) else {
+        let mut model = self.model.borrow_mut();
+        let Some(tab) = model.tabs.get_mut(idx) else {
             return;
         };
         // P4-1：EPUB 内存图随选项卡持有（供 WyEditor 只读宿主注入；随选项卡搬迁）。
@@ -925,15 +923,13 @@ impl EditorApp {
         } else {
             format!("（{}）", doc.author)
         };
-        self.status = SharedString::from(format!(
+        model.status = SharedString::from(format!(
             "已打开 EPUB：{}{} · {} 章",
             doc.title, author, doc.chapter_count
         ));
-        self.status_ok = true;
+        model.status_ok = true;
         cx.notify();
-    }
-
-    /// 把一个新建媒体阅读器（PDF / 图片 / 视频）载入指定选项卡：编辑区置空、全屏
+    }    /// 把一个新建媒体阅读器（PDF / 图片 / 视频）载入指定选项卡：编辑区置空、全屏
     /// 只读预览。三项的**公共装配**（搜索缓存失效 / 画布底色 / 编辑区清空 + markdown
     /// 语言 / 文件路径与计数 / 预览全屏只读 / 状态与通知）统一在此，差异（查看器实体
     /// 创建 + PDF 订阅重绘 / 视频焦点 / 状态文案）按 `kind` 分支。解析/解码各由查看器
@@ -946,9 +942,9 @@ impl EditorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
+        self.model.borrow_mut().search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
         if matches!(kind, MediaKind::Pdf) {
-            self.pdf_search = None; // 新 PDF 阅读器 → 需重新推送查询
+            self.model.borrow_mut().pdf_search = None; // 新 PDF 阅读器 → 需重新推送查询
         }
         // 阅读画布用灰色系（非白面板），让阅读器与画布形成分隔（PDF / 图片 / 视频同源）
         let canvas_bg = self.window_bg();
@@ -967,10 +963,12 @@ impl EditorApp {
             // 独立、不被后打开者覆盖（旧 `_pdf_observe` 单槽即此缺陷）。单一写点
             // `subscribe_pdf`（新建/跨窗口移交共用，K10 收敛）。
             self.subscribe_pdf(idx, &viewer, cx);
-            let tab = self.tabs.get_mut(idx).expect("PDF 选项卡应已在场");
+            let mut model = self.model.borrow_mut();
+            let tab = model.tabs.get_mut(idx).expect("PDF 选项卡应已在场");
             tab.reader = MediaReader::Pdf(viewer);
         } else {
-            let Some(tab) = self.tabs.get_mut(idx) else {
+            let mut model = self.model.borrow_mut();
+            let Some(tab) = model.tabs.get_mut(idx) else {
                 return;
             };
             match kind {
@@ -993,7 +991,7 @@ impl EditorApp {
                 _ => unreachable!(),
             }
         }
-        self.status = match kind {
+        self.model.borrow_mut().status = match kind {
             MediaKind::Pdf => {
                 SharedString::from(format!("已打开 PDF：{}（解析中…）", p.display()))
             }
@@ -1001,7 +999,7 @@ impl EditorApp {
             #[cfg(feature = "video")]
             MediaKind::Video => SharedString::from(format!("已打开视频：{}", p.display())),
         };
-        self.status_ok = true;
+        self.model.borrow_mut().status_ok = true;
         cx.notify();
     }
 
@@ -1018,7 +1016,8 @@ impl EditorApp {
         char_count: usize,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(tab) = self.tabs.get_mut(idx) else {
+        let mut model = self.model.borrow_mut();
+        let Some(tab) = model.tabs.get_mut(idx) else {
             return false;
         };
         // 编辑区置为提示文本（只读阅读，不参与文本编辑）
@@ -1037,6 +1036,7 @@ impl EditorApp {
         tab.preview_fullscreen = true;
         // 正文只存在于查看器/预览，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
         tab.readonly_preview = true;
+        drop(model);
         // 媒体/EPUB 文件路径就位（make_tab 时机为未命名）→ 立即持久化记成 File 型。
         self.schedule_session_flush(cx, true);
         true
@@ -1051,8 +1051,8 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.status = SharedString::from(format!("正在打开 PDF：{}…", p.display()));
-        self.status_ok = true;
+        self.model.borrow_mut().status = SharedString::from(format!("正在打开 PDF：{}…", p.display()));
+        self.model.borrow_mut().status_ok = true;
         self.load_media(idx, &p, MediaKind::Pdf, window, cx);
     }
 
@@ -1096,8 +1096,8 @@ impl EditorApp {
                     self.record_recent_file(&p);
                 }
                 Err(e) => {
-                    self.status = SharedString::from(format!("打开失败：{e}"));
-                    self.status_ok = false;
+                    self.model.borrow_mut().status = SharedString::from(format!("打开失败：{e}"));
+                    self.model.borrow_mut().status_ok = false;
                     cx.notify();
                 }
             }
@@ -1160,7 +1160,7 @@ impl EditorApp {
                 return;
             }
         };
-        let text = Self::normalize_newlines(&decoded);
+        let text = shell_scan::normalize_newlines(&decoded);
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
                 "[MD_OPEN_DEBUG] 读文件+归一化: {} ms ({} B)",
@@ -1171,9 +1171,11 @@ impl EditorApp {
         let t_mk = std::time::Instant::now();
         let idx = self.make_tab(window, cx);
         // 源编码写回选项卡（保存 `write_to_path` 按此编码回写；None=纯 UTF-8）。
-        if let Some(tab) = self.tabs.get_mut(idx) {
+        let mut model = self.model.borrow_mut();
+        if let Some(tab) = model.tabs.get_mut(idx) {
             tab.source_encoding = src_enc;
         }
+        drop(model);
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!("[MD_OPEN_DEBUG] make_tab: {} ms", t_mk.elapsed().as_millis());
         }
@@ -1188,7 +1190,7 @@ impl EditorApp {
         }
         // 小文档同步打开成功 → 记录最近（读盘失败已早退，不记录）。
         self.record_recent_file(&p);
-        if let Some(_tab) = self.tabs.get(idx) {
+        if let Some(_tab) = self.model.borrow().tabs.get(idx) {
             let t_focus = std::time::Instant::now();
             let focus = self.tab_focus_handle(idx, cx);
             window.focus(&focus, cx);
@@ -1277,13 +1279,13 @@ impl EditorApp {
     ) {
         // 换根 / 关文件夹 → 旧文件夹级搜索结果失效（下次渲染按新根重扫；根为 None 时
         // 「整个文件夹」范围不可用，走未打开文件夹提示）。
-        self.folder_search = None;
+        self.model.borrow_mut().folder_search = None;
         // 换工作区 → 在途 quick open 扫描结果作废（代际丢弃，防止旧扫描晚到串库）。
-        self.quick_open_gen = self.quick_open_gen.wrapping_add(1);
-        if !path.is_dir() {
-            self.sidebar.files.set_root(None);
-            self.status = SharedString::from(format!("文件夹无效：{}", path.display()));
-            self.status_ok = false;
+        let quick_open_gen = self.model.borrow_mut().quick_open_gen.wrapping_add(1);
+        self.model.borrow_mut().quick_open_gen = quick_open_gen;
+        if !path.is_dir() {            self.sidebar.files.set_root(None);
+            self.model.borrow_mut().status = SharedString::from(format!("文件夹无效：{}", path.display()));
+            self.model.borrow_mut().status_ok = false;
             self.persist_prefs();
             cx.notify();
             return;
@@ -1295,8 +1297,8 @@ impl EditorApp {
         self.sidebar.view = sidebar::SidebarView::Files;
         self.sidebar.open = true;
         self.sidebar.panel_open = true;
-        self.status = SharedString::from(format!("已打开文件夹：{}", path.display()));
-        self.status_ok = true;
+        self.model.borrow_mut().status = SharedString::from(format!("已打开文件夹：{}", path.display()));
+        self.model.borrow_mut().status_ok = true;
         // 成功设根：记录最近文件夹（内部已含 persist_prefs —— 同时把 opened_folder
         // 根路径落盘，覆盖原末尾的 `persist_prefs()`；失败/无效路径分支不记录）。
         self.record_recent_folder(&path);
@@ -1312,24 +1314,26 @@ impl EditorApp {
     ) -> bool {
         // 按源编码把缓冲 UTF-8 转回字节写盘（None=纯 UTF-8 现状；GBK/UTF-16 等原编码
         // 回写，含 BOM 还原——文档编码随文档走，「另存为」沿用同一 source_encoding）。
-        let enc = self.tabs.get(idx).and_then(|t| t.source_encoding);
+        let enc = self.model.borrow().tabs.get(idx).and_then(|t| t.source_encoding);
         let bytes = text_open::encode_for_save(&text, enc);
         match fs::write(path, bytes) {
             Ok(()) => {
-                if let Some(tab) = self.tabs.get_mut(idx) {
+                let mut model = self.model.borrow_mut();
+                if let Some(tab) = model.tabs.get_mut(idx) {
                     tab.file_path = Some(path.to_path_buf());
                     tab.dirty = false;
                 }
-                self.status = SharedString::from(format!("已保存：{}", path.display()));
-                self.status_ok = true;
+                drop(model);
+                self.model.borrow_mut().status = SharedString::from(format!("已保存：{}", path.display()));
+                self.model.borrow_mut().status_ok = true;
                 // 未命名 → 有路径（save/save_as 成功落盘）：立即持久化纠正会话为 File 型。
                 self.schedule_session_flush(cx, true);
                 cx.notify();
                 true
             }
             Err(e) => {
-                self.status = SharedString::from(format!("保存失败：{e}"));
-                self.status_ok = false;
+                self.model.borrow_mut().status = SharedString::from(format!("保存失败：{e}"));
+                self.model.borrow_mut().status_ok = false;
                 cx.notify();
                 false
             }
@@ -1337,7 +1341,8 @@ impl EditorApp {
     }
 
     pub(super) fn save_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(tab) = self.tabs.get(idx) else {
+        let model = self.model.borrow();
+        let Some(tab) = model.tabs.get(idx) else {
             return false;
         };
         // PDF 选项卡（待保存模型）：**绝不允许**走文本 `write_to_path`（编辑区为空，
@@ -1346,8 +1351,9 @@ impl EditorApp {
         if let MediaReader::Pdf(pdf) = &tab.reader {
             let dirty = pdf.read(cx).is_dirty();
             if !dirty {
-                self.status = SharedString::from("已保存（无未保存修改）");
-                self.status_ok = true;
+                drop(model);
+                self.model.borrow_mut().status = SharedString::from("已保存（无未保存修改）");
+                self.model.borrow_mut().status_ok = true;
                 return true;
             }
             // save 异步完成：成功清 dirty + notify（observe 同步 tab dirty 圆点回落；
@@ -1356,11 +1362,13 @@ impl EditorApp {
             return pdf.update(cx, |v, cx| v.save(cx));
         }
         let Some(p) = tab.file_path.clone() else {
+            drop(model);
             return self.save_tab_as(idx, window, cx);
         };
+        drop(model);
         // WYSIWYG（live2）模式下源码编辑区不再实时镜像（去 O(n)）——直接读 WyEditor
         // 的 rope 文本（等效实时内容），否则保存的是陈旧/空内容。
-        let text = self.tab_effective_text(idx, cx);
+        let text = self.model.borrow().tab_effective_text(idx, cx);
         self.write_to_path(idx, &p, text, cx)
     }
 
@@ -1370,13 +1378,13 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if idx >= self.tabs.len() {
+        if idx >= self.model.borrow().tabs.len() {
             return false;
         }
         // PDF 另存为（待保存模型）：把内存工作副本（含待存注释合并）写到用户选的新路径；
         // 成功后阅读器重指新路径并清 dirty（原文件保持原样）。另存走 PdfViewer::save_as。
         let pdf: Option<gpui::Entity<pdf::PdfViewer>> = self
-            .tabs
+            .model.borrow().tabs
             .get(idx)
             .and_then(|t| match &t.reader {
                 MediaReader::Pdf(p) => Some(p.clone()),
@@ -1423,7 +1431,7 @@ impl EditorApp {
         }
         let file_name = self.tab_file_name(idx);
         // 同 `save_tab`：WYSIWYG 开启时读 WyEditor 实时内容，而非陈旧的编辑区。
-        let text = self.tab_effective_text(idx, cx);
+        let text = self.model.borrow().tab_effective_text(idx, cx);
         let entity = cx.entity();
         window
             .spawn(cx, async move |cx| {
@@ -1445,11 +1453,13 @@ impl EditorApp {
     }
 
     pub(super) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_tab(self.active_tab, window, cx);
+        let active = self.model.borrow().active_tab;
+        self.save_tab(active, window, cx);
     }
 
     pub(super) fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_tab_as(self.active_tab, window, cx);
+        let active = self.model.borrow().active_tab;
+        self.save_tab_as(active, window, cx);
     }
 
     pub(super) fn paste_normalized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1459,7 +1469,7 @@ impl EditorApp {
         let Some(text) = clipboard.text() else {
             return;
         };
-        let text = Self::normalize_newlines(&text);
+        let text = shell_scan::normalize_newlines(&text);
         // 若侧边栏搜索框持有焦点 → 粘贴到搜索框（其不处理应用级 PasteNormalized）
         let search_focused = window
             .focused(cx)
@@ -1471,7 +1481,9 @@ impl EditorApp {
             });
             return;
         }
-        let Some(tab) = self.tabs.get(self.active_tab) else {
+        let active = self.model.borrow().active_tab;
+        let model = self.model.borrow();
+        let Some(tab) = model.tabs.get(active) else {
             return;
         };
         // 数学编辑卡内嵌编辑器聚焦（live2 WYSIWYG 的卡片输入区）：Ctrl+V（app 根
@@ -1486,58 +1498,4 @@ impl EditorApp {
             editor.paste_text(&text, cx);
         });
     }
-}
-
-/// 读盘→归一化→Rope→行宽统计 的打开预处理产物：UI 线程据此 O(1) 装配，
-/// 不在 UI 线程做任何 O(n) 重扫。可跨线程（`Rope`/`BTreeMap` 均 `Send`）。
-struct PreparedText {
-    /// 全文 Rope（编辑器 + WyEditor 预览共享，O(1) 克隆）。
-    rope: Rope,
-    /// 显示行数（`str::lines()` 语义，尾换行不追加行）。
-    lines: usize,
-    /// 字符总数（Unicode 标量）。
-    chars: usize,
-    /// 原文件字节数。
-    src_len: usize,
-    /// 全文最长行（字符数）。
-    max_line_chars: usize,
-    /// 行宽直方图（最宽行 / 横向滚动条量程依据；通常由后台线程算好）。
-    line_width_histogram: editor::buffer::LineWidthHistogram,
-}
-
-/// 把归一化文本预处理成编辑器装配产物（纯函数，可在后台线程跑）：
-/// Rope::from + 行/字计数 + 行宽直方图 —— 这一整条 O(n) 链路（大文档合计
-/// 几百 ms）由调用方决定放在后台线程，UI 线程不再背。
-fn prepare_text(text: String) -> PreparedText {
-    let src_len = text.len();
-    let t = std::time::Instant::now();
-    let lines = text.lines().count().max(1);
-    let chars = text.chars().count();
-    let counts_ms = t.elapsed().as_millis();
-    let t = std::time::Instant::now();
-    let rope = Rope::from(text.as_str());
-    let rope_ms = t.elapsed().as_millis();
-    let t = std::time::Instant::now();
-    let (max_line_chars, line_width_histogram) = editor::buffer::compute_line_stats(&rope);
-    let stats_ms = t.elapsed().as_millis();
-    if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-        eprintln!(
-            "[MD_OPEN_DEBUG] 准备文本: 计数(lines+chars)={counts_ms} ms, Rope::from({src_len} B)={rope_ms} ms, compute_line_stats({lines} 行)={stats_ms} ms"
-        );
-    }
-    PreparedText {
-        rope,
-        lines,
-        chars,
-        src_len,
-        max_line_chars,
-        line_width_histogram,
-    }
-}
-
-/// 是否走「后台打开」流水线：按文件大小元数据判断（无需读盘）。
-fn is_large_path(p: &std::path::Path) -> bool {
-    std::fs::metadata(p)
-        .map(|m| m.len() > OPEN_ASYNC_MIN_BYTES)
-        .unwrap_or(false)
 }

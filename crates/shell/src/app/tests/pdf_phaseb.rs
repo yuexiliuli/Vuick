@@ -37,7 +37,7 @@ fn wait_pdf_loaded(app: &Entity<EditorApp>, cx: &mut VisualTestContext) -> bool 
         cx.run_until_parked();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let loaded = cx.update(|_w, cx| {
-            tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+            tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
                 .map(|pv| pv.read(cx).is_loaded())
                 .unwrap_or(false)
         });
@@ -70,7 +70,7 @@ fn first_char_range_points(
 ) -> ((usize, usize), (gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)) {
     let mut found: Option<((usize, usize), (gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>))> = None;
     cx.update(|window, cx| {
-        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+        let pv = tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
             .expect("活动选项卡应挂 PDF")
             .clone();
         for page in 0..12usize {
@@ -109,7 +109,7 @@ fn drag_select(cx: &mut VisualTestContext, from: gpui::Point<gpui::Pixels>, to: 
 /// 测试探针直接弹选中卡（跳过真实拖选几何）：选区 `(page, lo)..(page, hi)`。
 fn open_sel_card(app: &Entity<EditorApp>, cx: &mut VisualTestContext, page: usize, lo: usize, hi: usize) {
     cx.update(|window, cx| {
-        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).unwrap().clone();
+        let pv = tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]).unwrap().clone();
         pv.update(cx, |v, cx| v.open_selection_card_for_test((page, lo), (page, hi), window, cx));
     });
     settle_frames(cx, 3);
@@ -122,7 +122,7 @@ fn pdf_right_click(app: &Entity<EditorApp>, cx: &mut VisualTestContext) -> gpui:
     cx.simulate_mouse_up(pos, gpui::MouseButton::Right, gpui::Modifiers::default());
     settle_frames(cx, 3);
     let pdf = cx.update(|_w, cx| {
-        tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+        tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
             .expect("PDF 菜单需活动 PDF")
             .clone()
     });
@@ -236,7 +236,7 @@ async fn b1_drag_selection_card_copy_and_highlight(cx: &mut TestAppContext) {
 
     // 重新弹卡（同页同段）→ 点「高亮」→ 只进内存待存（pending≥1、dirty、磁盘不变）
     let wk = cx.update(|window, cx| {
-        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).unwrap().clone();
+        let pv = tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]).unwrap().clone();
         pv.update(cx, |v, cx| {
             v.open_selection_card_for_test((page, k), (page, k + 3), window, cx)
         });
@@ -301,7 +301,7 @@ async fn b1_selection_card_closes_on_outside_escape_scroll(cx: &mut TestAppConte
     }
     let p = temp_pdf_copy("b1close");
     open_pdf(&app, cx, &p);
-    let pdf = cx.update(|_w, cx| tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).unwrap().clone());
+    let pdf = cx.update(|_w, cx| tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]).unwrap().clone());
     let ((page, k), _) = first_char_range_points(&app, cx);
 
     // 点卡片外（PDF 正文空白处）→ 关闭
@@ -487,7 +487,7 @@ async fn b2_extract_creates_single_page_and_delete_disabled(cx: &mut TestAppCont
     }
     let p = temp_pdf_copy("b2extract");
     open_pdf(&app, cx, &p);
-    let pdf = cx.update(|_w, cx| tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).unwrap().clone());
+    let pdf = cx.update(|_w, cx| tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]).unwrap().clone());
 
     // 提取第 1 页到独立文件（生产路径经 cfg(not(test)) 走另存为对话框；测试直接驱动 API）
     let out = std::env::temp_dir()
@@ -538,7 +538,7 @@ async fn c1_pending_annot_ctrlz_undo_and_tab_dirty(cx: &mut TestAppContext) {
     let p = temp_pdf_copy("c1undo");
     let disk0 = std::fs::read(&p).expect("读初始磁盘");
     open_pdf(&app, cx, &p);
-    let wk = cx.update(|_w, cx| tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).unwrap().clone());
+    let wk = cx.update(|_w, cx| tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]).unwrap().clone());
     let ((page, k), (a, _)) = first_char_range_points(&app, cx);
 
     // 加一条高亮（待存）
@@ -553,7 +553,7 @@ async fn c1_pending_annot_ctrlz_undo_and_tab_dirty(cx: &mut TestAppContext) {
     assert_eq!(std::fs::read(&p).expect("重读磁盘"), disk0, "注释只进内存：磁盘不变");
     // tab.dirty 经 observe 同步置真（工具栏圆点）
     assert!(
-        pump_until(cx, |cx| cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].dirty)),
+        pump_until(cx, |cx| cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].dirty)),
         "加注释后 tab.dirty 应置真（observe 同步）"
     );
 
@@ -575,7 +575,7 @@ async fn c1_pending_annot_ctrlz_undo_and_tab_dirty(cx: &mut TestAppContext) {
         "Ctrl+Z 应撤销该条待存注释并清脏"
     );
     assert!(
-        pump_until(cx, |cx| cx.update(|_w, cx| !app.read(cx).tabs[app.read(cx).active_tab].dirty)),
+        pump_until(cx, |cx| cx.update(|_w, cx| !app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].dirty)),
         "撤销后 tab.dirty 应回落"
     );
     assert_eq!(std::fs::read(&p).expect("重读磁盘"), disk0, "撤销全程磁盘不变（未保存）");
@@ -601,7 +601,7 @@ async fn c2_greybox_and_annot_delete_menu(cx: &mut TestAppContext) {
     let p = temp_pdf_copy("c2grey");
     let disk0 = std::fs::read(&p).expect("读初始磁盘");
     open_pdf(&app, cx, &p);
-    let wk = cx.update(|_w, cx| tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).unwrap().clone());
+    let wk = cx.update(|_w, cx| tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]).unwrap().clone());
     let ((page, k), (a, _)) = first_char_range_points(&app, cx);
 
     // 加一条高亮（待存）→ 点被注释文字 → 灰框焦
@@ -670,9 +670,12 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
     let add_annot = |app: &Entity<EditorApp>, cx: &mut VisualTestContext| {
         // 重新预热该页文本层：渲染的 LRU 缓存可能把 early page 文本淘汰 → 弹卡锚点算不出
         cx.update(|_w, cx| {
-            if let Some(pv) =
-                tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).cloned()
-            {
+            let pv = {
+                let model = app.read(cx).model.borrow();
+                let active = model.active_tab;
+                tab_pdf(&model.tabs[active]).cloned()
+            };
+            if let Some(pv) = pv {
                 pv.update(cx, |v, _| v.load_text_for_test(page));
             }
         });
@@ -683,7 +686,7 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
         assert!(
             pump_until(cx, |cx| {
                 cx.update(|_w, cx| {
-                    tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+                    tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
                         .map(|v| v.read(cx).pending_annot_count() == 1)
                         .unwrap_or(false)
                 })
@@ -697,7 +700,7 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
     let pdf_idx = |app: &Entity<EditorApp>, cx: &mut VisualTestContext| -> usize {
         cx.update(|_w, cx| {
             app.read(cx)
-                .tabs
+                .model.borrow().tabs
                 .iter()
                 .position(|t| matches!(&t.reader, MediaReader::Pdf(_)))
                 .expect("应有 PDF 选项卡")
@@ -717,11 +720,11 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
     let (n_tabs, pdf_dirty) = cx.update(|_w, cx| {
         let app_ref = app.read(cx);
         let idx = app_ref
-            .tabs
+            .model.borrow().tabs
             .iter()
             .position(|t| matches!(&t.reader, MediaReader::Pdf(_)))
             .expect("应有 PDF 选项卡");
-        (app_ref.tabs.len(), app_ref.tabs[idx].dirty)
+        (app_ref.model.borrow().tabs.len(), app_ref.model.borrow().tabs[idx].dirty)
     });
     assert!(n_tabs == 2 && pdf_dirty, "取消后选项卡应保留且 dirty 仍在");
 
@@ -741,7 +744,7 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
         cx.run_until_parked();
         std::thread::sleep(std::time::Duration::from_millis(8));
         closed = cx.update(|_w, cx| {
-            !app.read(cx).tabs.iter().any(|t| matches!(&t.reader, MediaReader::Pdf(_)))
+            !app.read(cx).model.borrow().tabs.iter().any(|t| matches!(&t.reader, MediaReader::Pdf(_)))
         });
         if closed {
             break;
@@ -767,7 +770,7 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
     cx.simulate_prompt_answer("不保存");
     let closed2 = pump_until(cx, |cx| {
         cx.update(|_w, cx| {
-            !app.read(cx).tabs.iter().any(|t| matches!(&t.reader, MediaReader::Pdf(_)))
+            !app.read(cx).model.borrow().tabs.iter().any(|t| matches!(&t.reader, MediaReader::Pdf(_)))
         })
     });
     assert!(closed2, "「不保存」应直接关闭");
@@ -801,7 +804,7 @@ async fn d1_save_as_updates_tab_path_and_writes_annots(cx: &mut TestAppContext) 
     open_pdf(&app, cx, &p);
 
     let wk = cx
-        .update(|_w, cx| tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).unwrap().clone());
+        .update(|_w, cx| tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]).unwrap().clone());
     let ((page, k), _) = first_char_range_points(&app, cx);
     open_sel_card(&app, cx, page, k, k + 3);
     let hl = cx.debug_bounds("pdf-sel-card-highlight").expect("高亮项").center();
@@ -819,11 +822,11 @@ async fn d1_save_as_updates_tab_path_and_writes_annots(cx: &mut TestAppContext) 
             cx.update(|_w, cx| {
                 let idx = app
                     .read(cx)
-                    .tabs
+                    .model.borrow().tabs
                     .iter()
                     .position(|t| matches!(&t.reader, MediaReader::Pdf(_)))
                     .unwrap();
-                app.read(cx).tabs[idx].file_path.as_deref() == Some(out.as_path())
+                app.read(cx).model.borrow().tabs[idx].file_path.as_deref() == Some(out.as_path())
             })
         }),
         "另存为后选项卡 file_path 应同步为新路径（tab 标题不再显示旧名）"
@@ -873,7 +876,7 @@ fn first_image_hit_point(
 ) -> Option<(usize, usize, gpui::Point<gpui::Pixels>)> {
     let mut target: Option<(usize, usize)> = None;
     cx.update(|_w, cx| {
-        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+        let pv = tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
             .expect("活动选项卡应挂 PDF")
             .clone();
         for page in 0..20usize {
@@ -894,7 +897,7 @@ fn first_image_hit_point(
     });
     let (page, obj) = target?;
     cx.update(|_w, cx| {
-        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+        let pv = tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
             .expect("活动选项卡应挂 PDF")
             .clone();
         pv.update(cx, |v, cx| {
@@ -904,7 +907,9 @@ fn first_image_hit_point(
     });
     settle_frames(cx, 8);
     cx.update(|window, cx| {
-        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])?;
+        let model = app.read(cx).model.borrow();
+        let active = model.active_tab;
+        let pv = tab_pdf(&model.tabs[active])?;
         pv.read(cx).image_pos(window, page, obj)
     })
     .map(|pos| (page, obj, pos))
@@ -990,7 +995,9 @@ async fn image_copy_image_writes_clipboard_dib(cx: &mut TestAppContext) {
     // 期望像素：与菜单动作同源（view request_image_pixels → worker ImagePixels），
     // 测试线程同步取（阻塞等结果，真实对比源）。
     let expected = cx.update(|_w, cx| {
-        let pv = tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])?;
+        let model = app.read(cx).model.borrow();
+        let active = model.active_tab;
+        let pv = tab_pdf(&model.tabs[active])?;
         pv.read(cx).request_image_pixels(page, obj)
     });
     let Some(rx) = expected else {

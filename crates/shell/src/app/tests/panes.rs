@@ -13,10 +13,11 @@
                 .filter_map(|(weak, _)| {
                     let entity = weak.upgrade()?;
                     let snap = entity.read_with(cx, |a, c| {
-                        let tab = a.tabs.get(a.active_tab);
+                        let model = a.model.borrow();
+                        let tab = model.tabs.get(model.active_tab);
                         (
                             a.is_detached,
-                            a.tabs.len(),
+                            a.model.borrow().tabs.len(),
                             tab.and_then(|t| t.file_path.clone()).is_some(),
                             tab.map(|t| t.editor.read(c).value()),
                         )
@@ -45,7 +46,7 @@
             cx.run_until_parked();
         }
         // 编辑区输入 → 置脏（insert_text 属真实编辑，经 EditorEvent::Edited 置脏）
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[1].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[1].editor.clone());
         cx.update(|_w, cx| editor.update(cx, |ed, cx| ed.insert_text("初始内容", cx)));
         for _ in 0..2 {
             cx.run_until_parked();
@@ -60,11 +61,11 @@
         }
         let (text, dirty, count, has_path) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.editor.read(cx).value(),
                 t.dirty,
-                a.tabs.len(),
+                a.model.borrow().tabs.len(),
                 t.file_path.is_some(),
             )
         });
@@ -128,7 +129,7 @@
         );
         let (armed, ghost_alive, tab_count) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_outside_armed, a.drag_ghost.is_some(), a.tabs.len())
+            (a.model.borrow().drag_outside_armed, a.drag_ghost.is_some(), a.model.borrow().tabs.len())
         });
         assert!(armed, "越界未松手应已置「松开才建窗」预位");
         assert!(ghost_alive, "越界后应有窗外跟手幽灵窗");
@@ -233,7 +234,7 @@
             })
             .expect("应存在独立窗口");
         assert_eq!(
-            cx.update(|_w, cx| det.read_with(cx, |a, _| a.tabs.len())),
+            cx.update(|_w, cx| det.read_with(cx, |a, _| a.model.borrow().tabs.len())),
             1,
             "独立窗口应恰好 1 个选项卡"
         );
@@ -249,7 +250,8 @@
 
         let (has_file, content) = cx.update(|_w, cx| {
             let a = primary.read(cx);
-            let tab = a.tabs.iter().find(|t| t.file_path.is_some());
+            let model = a.model.borrow();
+            let tab = model.tabs.iter().find(|t| t.file_path.is_some());
             (
                 tab.is_some(),
                 tab.map(|t| t.editor.read(cx).value().to_string()),
@@ -325,7 +327,7 @@
         }
         let (armed_out, ghost_alive) = cx.update(|_w, cx| {
             let a = det.read(cx);
-            (a.drag_outside_armed, a.drag_ghost.is_some())
+            (a.model.borrow().drag_outside_armed, a.drag_ghost.is_some())
         });
         assert!(armed_out, "独立窗口拖出窗外应置「松开才还原」预位");
         assert!(ghost_alive, "独立窗口拖出窗外应有跟手幽灵窗");
@@ -336,7 +338,8 @@
         }
         let (has_file, content) = cx.update(|_w, cx| {
             let a = primary.read(cx);
-            let tab = a.tabs.iter().find(|t| t.file_path.is_some());
+            let model = a.model.borrow();
+            let tab = model.tabs.iter().find(|t| t.file_path.is_some());
             (
                 tab.is_some(),
                 tab.map(|t| t.editor.read(cx).value().to_string()),
@@ -399,7 +402,7 @@
             "窗口内拖拽+松开不应拆出独立窗口，快照={snap:?}"
         );
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             1,
             "主窗口选项卡应保持原样"
         );
@@ -440,7 +443,7 @@
         }
         let (was_armed, ghost_alive) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_outside_armed, a.drag_ghost.is_some())
+            (a.model.borrow().drag_outside_armed, a.drag_ghost.is_some())
         });
         assert!(was_armed, "拖出窗外应已置「松开才建窗」预位");
         assert!(ghost_alive, "拖出窗外应有跟手幽灵窗");
@@ -452,7 +455,7 @@
         }
         let (armed_after_back, ghost_after_back) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_outside_armed, a.drag_ghost.is_some())
+            (a.model.borrow().drag_outside_armed, a.drag_ghost.is_some())
         });
         assert!(!armed_after_back, "拖回窗内应复位「松开才建窗」预位");
         assert!(ghost_after_back, "拖回窗内幽灵窗仍全程跟随（拖拽结束才销毁）");
@@ -472,7 +475,7 @@
             "窗内松开后幽灵窗应销毁"
         );
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             1,
             "取消拖出后选项卡应原位保留"
         );
@@ -527,7 +530,7 @@
         }
         let (armed_mid, ghost_mid) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_outside_armed, a.drag_ghost.is_some())
+            (a.model.borrow().drag_outside_armed, a.drag_ghost.is_some())
         });
         assert!(!armed_mid, "拖回窗内应复位「松开才建窗」预位");
         assert!(ghost_mid, "拖回窗内幽灵窗仍全程跟随（窗口全程复用、边缘无卡顿）");
@@ -542,7 +545,7 @@
         }
         let (armed_again, ghost_again, tab_count) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_outside_armed, a.drag_ghost.is_some(), a.tabs.len())
+            (a.model.borrow().drag_outside_armed, a.drag_ghost.is_some(), a.model.borrow().tabs.len())
         });
         assert!(armed_again, "再次越界应重新置「松开才建窗」预位");
         assert!(ghost_again, "再次越界应重新跟手幽灵窗");
@@ -613,7 +616,7 @@
         // 拖拽开始（窗内）即已建幽灵窗
         let (ghost_start, grab_set) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_ghost.is_some(), a.tab_drag_grab.is_some())
+            (a.drag_ghost.is_some(), a.model.borrow().tab_drag_grab.is_some())
         });
         assert!(ghost_start, "拖拽开始（窗内）即建幽灵窗");
         assert!(grab_set, "拖拽开始应已记录抓取偏移");
@@ -645,7 +648,7 @@
             "拖拽结束幽灵窗应销毁"
         );
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             1,
             "窗内松开选卡原位保留"
         );
@@ -744,7 +747,7 @@
         }
         let (armed, ghost_alive) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_outside_armed, a.drag_ghost.is_some())
+            (a.model.borrow().drag_outside_armed, a.drag_ghost.is_some())
         });
         assert!(armed, "越出窗口未松手应置「松开才拆窗」预位");
         assert!(ghost_alive, "越出窗口跟手幽灵窗应在");
@@ -854,7 +857,7 @@
         }
         let (ghost_visible, armed) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_ghost_visible, a.drag_outside_armed)
+            (a.model.borrow().drag_ghost_visible, a.model.borrow().drag_outside_armed)
         });
         assert!(ghost_visible, "picture 贴左缘（光标仍在窗内）应提前显示完整幽灵窗");
         assert!(!armed, "光标仍在窗内：不应置「松开才建窗」预位");
@@ -864,7 +867,7 @@
         for _ in 0..4 {
             cx.run_until_parked();
         }
-        let ghost_center = cx.update(|_w, cx| app.read(cx).drag_ghost_visible);
+        let ghost_center = cx.update(|_w, cx| app.read(cx).model.borrow().drag_ghost_visible);
         assert!(!ghost_center, "拖回窗内中央：幽灵窗应隐藏（用窗内 picture）");
         // 越出窗口 → 预位 + 幽灵窗同时显示
         cx.simulate_mouse_move(
@@ -877,7 +880,7 @@
         }
         let (armed_out, visible_out) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_outside_armed, a.drag_ghost_visible)
+            (a.model.borrow().drag_outside_armed, a.model.borrow().drag_ghost_visible)
         });
         assert!(armed_out, "越出窗口应置「松开才建窗」预位");
         assert!(visible_out, "越出窗口幽灵窗应显示");
@@ -888,7 +891,7 @@
         }
         let (ghost_gone, tab_count) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.drag_ghost.is_none(), a.tabs.len())
+            (a.drag_ghost.is_none(), a.model.borrow().tabs.len())
         });
         assert!(ghost_gone, "窗内松开幽灵窗应销毁");
         assert_eq!(tab_count, 1, "窗内松开选卡应原位保留");
@@ -934,8 +937,8 @@
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.tabs.len().saturating_sub(1);
-                !a.tabs[i].editor_pending
+                let i = a.model.borrow().tabs.len().saturating_sub(1);
+                !a.model.borrow().tabs[i].editor_pending
             });
             if ready {
                 break;
@@ -950,7 +953,7 @@
         let editor = cx.update(|window, cx| {
             let focus = app.read(cx).editor_focus_handle(cx);
             window.focus(&focus, cx);
-            app.read(cx).tabs[app.read(cx).active_tab].editor.clone()
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone()
         });
 
         // ---------- 编辑器输入（insert_text × 6，拆「insert」与「draw/渲染」） ----------
@@ -1019,9 +1022,9 @@
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.tabs.len().saturating_sub(1);
-                !a.tabs[i].editor_pending
-                    && a.tabs[i]
+                let i = a.model.borrow().tabs.len().saturating_sub(1);
+                !a.model.borrow().tabs[i].editor_pending
+                    && a.model.borrow().tabs[i]
                         .md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
@@ -1067,7 +1070,7 @@
         crate::prof::dump("preview_scroll");
 
         // ---------- 预览编辑区输入（md 编辑区 insert_text，拆 ins/draw） ----------
-        let md_editor = cx.update(|_, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let md_editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         for k in 0..4 {
             let t0 = std::time::Instant::now();
             cx.update(|_, cx| md_editor.update(cx, |e, cx| e.insert_text("y", cx)));
@@ -1130,7 +1133,7 @@
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                !a.tabs[a.tabs.len().saturating_sub(1)].editor_pending
+                !a.model.borrow().tabs[a.model.borrow().tabs.len().saturating_sub(1)].editor_pending
             });
             if ready {
                 break;
@@ -1142,11 +1145,11 @@
         }
         let (editor, mdw, vhand) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.active_tab;
+            let i = a.model.borrow().active_tab;
             (
-                a.tabs[i].editor.clone(),
-                a.tabs[i].md_wy.clone().expect("预览应在场"),
-                a.tabs[i].md_wy_vscroll.clone(),
+                a.model.borrow().tabs[i].editor.clone(),
+                a.model.borrow().tabs[i].md_wy.clone().expect("预览应在场"),
+                a.model.borrow().tabs[i].md_wy_vscroll.clone(),
             )
         });
         let read = |cx: &mut VisualTestContext| -> (usize, Option<usize>, f32) {
@@ -1292,7 +1295,7 @@
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                !a.tabs[a.tabs.len().saturating_sub(1)].editor_pending
+                !a.model.borrow().tabs[a.model.borrow().tabs.len().saturating_sub(1)].editor_pending
             });
             if ready {
                 break;
@@ -1304,11 +1307,11 @@
         }
         let (editor, mdw, vhand) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.active_tab;
+            let i = a.model.borrow().active_tab;
             (
-                a.tabs[i].editor.clone(),
-                a.tabs[i].md_wy.clone().expect("预览应在场"),
-                a.tabs[i].md_wy_vscroll.clone(),
+                a.model.borrow().tabs[i].editor.clone(),
+                a.model.borrow().tabs[i].md_wy.clone().expect("预览应在场"),
+                a.model.borrow().tabs[i].md_wy_vscroll.clone(),
             )
         });
         let read = |cx: &mut VisualTestContext| -> (usize, Option<usize>, f32) {
@@ -1382,7 +1385,7 @@
     ) -> Vec<Option<String>> {
         cx.update(|_w, cx| {
             app.read(cx)
-                .tabs
+                .model.borrow().tabs
                 .iter()
                 .map(|t| {
                     t.file_path
@@ -1571,8 +1574,8 @@
         let (active, body) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.active_tab,
-                a.tabs[a.active_tab].editor.read(cx).value().to_string(),
+                a.model.borrow().active_tab,
+                a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(
@@ -1649,7 +1652,7 @@
             cx.run_until_parked();
         }
         // 拖拽中：光标命中行内目标 → tab_reorder_target 有值 + 指示线渲染
-        let target = cx.update(|_w, cx| app.read(cx).tab_reorder_target);
+        let target = cx.update(|_w, cx| app.read(cx).model.borrow().tab_reorder_target);
         let line = cx.debug_bounds("tab-reorder-line");
         assert!(target.is_some(), "拖拽悬停目标应有插入位");
         assert!(line.is_some(), "拖拽悬停目标应渲染白色插入指示线 line={line:?}");
@@ -1659,7 +1662,7 @@
             cx.run_until_parked();
         }
         let line_after = cx.debug_bounds("tab-reorder-line");
-        let target_after = cx.update(|_w, cx| app.read(cx).tab_reorder_target);
+        let target_after = cx.update(|_w, cx| app.read(cx).model.borrow().tab_reorder_target);
         assert!(line_after.is_none(), "松手后指示线应消失");
         assert!(target_after.is_none(), "松手后插入位应清空");
     }
@@ -1698,7 +1701,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let target = cx.update(|_w, cx| app.read(cx).tab_reorder_target);
+        let target = cx.update(|_w, cx| app.read(cx).model.borrow().tab_reorder_target);
         let line = cx.debug_bounds("tab-reorder-line");
         assert!(target.is_some(), "被拖选项卡边缘入行即应有插入位 target={target:?}");
         assert!(line.is_some(), "被拖选项卡边缘入行即应出现白线");

@@ -4288,12 +4288,50 @@ dependencies = [
  "ropey",
  "serde_json",
  "session_store",
+ "shell_commands",
+ "shell_core",
+ "shell_scan",
  "syntax",
  "text_open",
  "toc",
  "tray",
  "ui",
  "video",
+]
+
+[[package]]
+name = "shell_commands"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "gpui",
+]
+
+[[package]]
+name = "shell_core"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "config",
+ "editor",
+ "encoding_rs",
+ "gpui",
+ "image_viewer",
+ "markdown_wysiwyg",
+ "pdf",
+ "ropey",
+ "session_store",
+ "shell_scan",
+ "ui",
+ "video",
+]
+
+[[package]]
+name = "shell_scan"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "memchr",
 ]
 
 [[package]]

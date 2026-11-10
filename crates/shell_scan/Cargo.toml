@@ -1,0 +1,12 @@
+[package]
+name = "shell_scan"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 侧边栏跨文件搜索的纯文件扫描层叶子 crate（文件夹级后台递归扫描 + 行级命中收集 + ASCII 大小写不敏感查找，自 shell 的 app/sidebar/mod.rs 纯扫描部分拆出；纯结构移动，只重分配既有依赖，不新增外部包）"
+
+[dependencies]
+# 后台扫描 → 主线程的有界 mpsc 通道与异步外推（futures::channel::mpsc）。
+futures = { workspace = true }
+# ASCII 大小写不敏感子串查找的首字节双形快路径（memchr2）。
+memchr = { workspace = true }

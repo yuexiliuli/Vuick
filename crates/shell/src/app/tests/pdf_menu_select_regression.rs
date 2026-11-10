@@ -60,7 +60,7 @@ async fn pdf_menu_click_then_move_leaves_no_selection(cx: &mut TestAppContext) {
 
     // 菜单项点击后移动鼠标不得选中文字（旧行为：selecting 滞留 → 扫出大段选区）。
     let sel = cx.update(|_w, cx| {
-        tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+        tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
             .unwrap()
             .read(cx)
             .selected_text()
@@ -103,7 +103,7 @@ async fn pdf_direct_drag_select_still_works(cx: &mut TestAppContext) {
 
     // 拖选应得到非空选区文本（直接划选正常）。
     let sel = cx.update(|_w, cx| {
-        tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+        tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
             .unwrap()
             .read(cx)
             .selected_text()

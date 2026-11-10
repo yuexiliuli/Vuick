@@ -15,11 +15,12 @@
     ) -> (bool, Option<std::path::PathBuf>, usize) {
         cx.update(|cx| {
             let a = e.read(cx);
-            let tab = a.tabs.get(a.active_tab);
+            let model = a.model.borrow();
+            let tab = model.tabs.get(model.active_tab);
             (
-                a.music_mode,
+                a.model.borrow().music_mode,
                 tab.and_then(|t| t.file_path.clone()),
-                a.tabs.len(),
+                a.model.borrow().tabs.len(),
             )
         })
     }
@@ -29,8 +30,8 @@
     fn active_is_video(cx: &mut TestAppContext, e: &gpui::Entity<EditorApp>) -> bool {
         cx.update(|cx| {
             let a = e.read(cx);
-            a.tabs
-                .get(a.active_tab)
+            a.model.borrow().tabs
+                .get(a.model.borrow().active_tab)
                 .map(|t| matches!(t.reader, MediaReader::Video(_)))
                 .unwrap_or(false)
         })
@@ -169,8 +170,8 @@
         let v1 = placeholder_video("off1");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.media_new_window = false;
-                app.reuse_media_window = false;
+                app.model.borrow_mut().media_new_window = false;
+                app.model.borrow_mut().reuse_media_window = false;
                 app.open_file(v1.to_str().unwrap(), window, cx);
             });
         });
@@ -197,7 +198,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         let v1 = placeholder_video("new1");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(v1.to_str().unwrap(), window, cx));
@@ -207,7 +208,7 @@
         }
         assert_eq!(registry_window_count(cx), 2, "无媒体窗口 → 应新开 1 个窗口");
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             tabs_before,
             "源窗口（非媒体）tabs 应不变"
         );
@@ -248,7 +249,7 @@
         assert!(active_is_video(cx, &media_win), "前置：B 应为视频媒体窗口");
 
         // 再从 A（非媒体，活动仍是空选项卡）开视频2 → 复用 B，窗口数不变。
-        let tabs_before_a = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before_a = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(v2.to_str().unwrap(), window, cx));
         });
@@ -261,7 +262,7 @@
             "复用已有媒体窗口：窗口数应不变"
         );
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             tabs_before_a,
             "源非媒体窗口内容应不变"
         );
@@ -289,7 +290,7 @@
         let v2 = placeholder_video("d2");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.media_new_window = false;
+                app.model.borrow_mut().media_new_window = false;
                 app.open_file(v1.to_str().unwrap(), window, cx);
             });
         });
@@ -302,8 +303,8 @@
         // 开开关+复用开 → 再开视频2：当前是媒体窗口 → 复用当前（窗口数不变、切换内容）。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.media_new_window = true;
-                app.reuse_media_window = true;
+                app.model.borrow_mut().media_new_window = true;
+                app.model.borrow_mut().reuse_media_window = true;
                 app.open_file(v2.to_str().unwrap(), window, cx);
             });
         });
@@ -330,12 +331,12 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         let v1 = placeholder_video("e1");
         let v2 = placeholder_video("e2");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.reuse_media_window = false;
+                app.model.borrow_mut().reuse_media_window = false;
                 app.open_file(v1.to_str().unwrap(), window, cx);
             });
         });
@@ -351,7 +352,7 @@
         }
         assert_eq!(registry_window_count(cx), 3, "复用关：每次打开都应新开 1 个窗口");
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             tabs_before,
             "源窗口 tabs 应始终不变"
         );
@@ -374,7 +375,7 @@
         let v2 = placeholder_video("f2");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.media_new_window = false;
+                app.model.borrow_mut().media_new_window = false;
                 app.open_file(v1.to_str().unwrap(), window, cx);
             });
         });
@@ -384,8 +385,8 @@
         // 开开关、复用关 → 开视频2：+1 窗口且 A 当前内容不变。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.media_new_window = true;
-                app.reuse_media_window = false;
+                app.model.borrow_mut().media_new_window = true;
+                app.model.borrow_mut().reuse_media_window = false;
                 app.open_file(v2.to_str().unwrap(), window, cx);
             });
         });
@@ -419,7 +420,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         let s = placeholder_audio("song");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(s.to_str().unwrap(), window, cx));
@@ -429,7 +430,7 @@
         }
         assert_eq!(registry_window_count(cx), 2, "音频默认开+复用、无媒体窗口 → 新开窗口");
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             tabs_before,
             "源窗口不变（音频不进当前窗口）"
         );
@@ -456,7 +457,7 @@
         let read_flags = |app: &gpui::Entity<EditorApp>, cx: &mut TestAppContext| {
             cx.update(|cx| {
                 let a = app.read(cx);
-                (a.media_new_window, a.reuse_media_window)
+                (a.model.borrow().media_new_window, a.model.borrow().reuse_media_window)
             })
         };
         assert_eq!(
@@ -594,8 +595,8 @@
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
                 // 故意给一组不同的音乐尺寸：视频新窗应只跟 video 记录（互不影响）。
-                app.music_window_size = Some(gpui::size(px(300.), px(200.)));
-                app.video_window_size = Some(gpui::size(px(900.), px(540.)));
+                app.model.borrow_mut().music_window_size = Some(gpui::size(px(300.), px(200.)));
+                app.model.borrow_mut().video_window_size = Some(gpui::size(px(900.), px(540.)));
             });
         });
         let v1 = placeholder_video("szv");
@@ -626,7 +627,7 @@
         }
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.music_window_size = Some(gpui::size(px(800.), px(600.)));
+                app.model.borrow_mut().music_window_size = Some(gpui::size(px(800.), px(600.)));
             });
         });
         let s = placeholder_audio("szm");
@@ -667,7 +668,7 @@
         });
         let (m0, v0) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.music_window_size, a.video_window_size)
+            (a.model.borrow().music_window_size, a.model.borrow().video_window_size)
         });
         assert_eq!(m0, None, "非媒体窗口不应记录音乐尺寸");
         assert_eq!(v0, None, "非媒体窗口不应记录视频尺寸");
@@ -675,7 +676,7 @@
         let s = placeholder_audio("kindm");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.media_new_window = false;
+                app.model.borrow_mut().media_new_window = false;
                 app.open_file(s.to_str().unwrap(), window, cx);
             });
         });
@@ -685,7 +686,7 @@
         assert!(
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                a.music_mode && a.music.is_some()
+                a.model.borrow().music_mode && a.music.is_some()
             }),
             "前置：应处于真实音乐模式（含 MusicView）"
         );
@@ -707,12 +708,12 @@
         });
         let (m1, v1) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.music_window_size, a.video_window_size)
+            (a.model.borrow().music_window_size, a.model.borrow().video_window_size)
         });
         assert_eq!(m1, Some(gpui::size(px(700.), px(500.))), "音乐记录跟随最新 resize");
         assert_eq!(v1, None, "音乐模式下不应记录视频尺寸");
         // kind = Video：退出音乐模式 + 活动选项卡为视频 → 只更新 video 字段。
-        cx.update(|_w, cx| app.update(cx, |app, _| app.music_mode = false));
+        cx.update(|_w, cx| app.update(cx, |app, _| app.model.borrow_mut().music_mode = false));
         let vp = placeholder_video("kindv");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -730,7 +731,7 @@
         });
         let (m2, v2) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.music_window_size, a.video_window_size)
+            (a.model.borrow().music_window_size, a.model.borrow().video_window_size)
         });
         assert_eq!(m2, Some(gpui::size(px(700.), px(500.))), "视频记录不影响音乐字段");
         assert_eq!(v2, Some(gpui::size(px(900.), px(540.))), "视频记录应就位");
@@ -761,7 +762,7 @@
         // 初始（kind=None）resize → 不记录。
         let (m0, v0) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.music_window_size, a.video_window_size)
+            (a.model.borrow().music_window_size, a.model.borrow().video_window_size)
         });
         assert_eq!(m0, None, "kind=None 的 resize 不应记录");
         assert_eq!(v0, None);
@@ -769,7 +770,7 @@
         let vp = placeholder_video("obsv");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.media_new_window = false;
+                app.model.borrow_mut().media_new_window = false;
                 app.open_file(vp.to_str().unwrap(), window, cx);
             });
         });
@@ -783,7 +784,7 @@
         }
         let (m1, v1) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.music_window_size, a.video_window_size)
+            (a.model.borrow().music_window_size, a.model.borrow().video_window_size)
         });
         assert_eq!(m1, None, "视频 resize 不应写音乐字段");
         assert_eq!(

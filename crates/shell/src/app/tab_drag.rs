@@ -56,64 +56,9 @@ impl EditorApp {
     /// 实体与元数据整体移到目标窗口），下标与激活态自动校正。
     /// 整结构 move：一次解构 `EditorTab` 搬到 `DetachedTab`（`..` 丢弃源窗口专属的
     /// live 态 / 订阅），不再逐字段手抄。
+    /// SC-4：payload 动作体已迁 `AppModel::take_tab_payload`。glue 转发。
     pub(super) fn take_tab_payload(&mut self, idx: usize) -> Option<DetachedTab> {
-        if idx >= self.tabs.len() {
-            return None;
-        }
-        let tab = self.tabs.remove(idx);
-        if idx < self.active_tab {
-            self.active_tab -= 1;
-        } else if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len().saturating_sub(1);
-        }
-        self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
-        let EditorTab {
-            editor,
-            reader,
-            md_wy,
-            md_wy_vscroll,
-            md_wy_install,
-            epub_images,
-            epub_notes,
-            file_path,
-            dirty,
-            source_encoding,
-            content,
-            line_count,
-            char_count,
-            cursor_row,
-            cursor_col,
-            preview_on,
-            preview_fullscreen,
-            readonly_preview,
-            editor_pending,
-            loading_lock,
-            edit_version,
-            ..
-        } = tab;
-        Some(DetachedTab {
-            editor,
-            reader,
-            md_wy,
-            md_wy_vscroll,
-            md_wy_install,
-            epub_images,
-            epub_notes,
-            file_path,
-            dirty,
-            source_encoding,
-            content,
-            line_count,
-            char_count,
-            cursor_row,
-            cursor_col,
-            preview_on,
-            preview_fullscreen,
-            readonly_preview,
-            editor_pending,
-            loading_lock,
-            edit_version,
-        })
+        self.model.borrow_mut().take_tab_payload(idx)
     }
 
     /// 移出选项卡前的统一收尾（live2 守卫下沉）：实时预览编辑实体不随选项卡搬迁——
@@ -126,7 +71,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<DetachedTab> {
-        if self.tabs[idx].live_edit {
+        if self.model.borrow().tabs[idx].live_edit {
             self.commit_live(idx, window, cx);
         }
         self.take_tab_payload(idx)
@@ -172,8 +117,8 @@ impl EditorApp {
             .as_ref()
             .map(|p| Self::is_markdown_path(p))
             .unwrap_or(false);
-        let idx = self.tabs.len();
-        self.tabs.push(EditorTab {
+        let idx = self.model.borrow().tabs.len();
+        self.model.borrow_mut().tabs.push(EditorTab {
             editor,
             file_path,
             dirty,
@@ -205,18 +150,19 @@ impl EditorApp {
             // PDF 阅读器订阅随选项卡重建（源窗口的 `_pdf_sub` 已随 take_tab_payload 丢弃）
             _pdf_sub: None,
         });
-        self.active_tab = idx;
-        self.search_scan = None;
+        self.model.borrow_mut().active_tab = idx;
+        self.model.borrow_mut().search_scan = None;
         // 编辑区软换行与目标窗口偏好对齐（md 默认换行、预览开着强制换行）
-        let wrap = is_md || self.wrap_enabled || self.tabs[idx].preview_on;
-        self.tabs[idx].editor.update(cx, |ed, _cx| {
+        let wrap = is_md || self.model.borrow().wrap_enabled || self.model.borrow().tabs[idx].preview_on;
+        self.model.borrow().tabs[idx].editor.update(cx, |ed, _cx| {
             ed.set_soft_wrap(wrap);
         });
         // 预览/PDF 主题背景刷新 + PDF 订阅重建
         let canvas_bg = self.window_bg();
         // P4-2：MD / EPUB 预览都走统一 WyEditor 只读宿主——实体随选项卡搬迁已带内容，
         // 无需再喂 MarkdownPreview（该后端已删除）。
-        match self.tabs[idx].reader.clone() {
+        let reader = self.model.borrow().tabs[idx].reader.clone();
+        match reader {
             MediaReader::Pdf(pdf) => {
                 // PDF 画布底色按当前偏好恢复（默认跟随主题；显式档保持冻结色）。
                 self.apply_pdf_background(&pdf, cx);
@@ -232,20 +178,20 @@ impl EditorApp {
             }
             MediaReader::None => {}
         }
-        self.pdf_search = None; // 重新推送检索查询
+        self.model.borrow_mut().pdf_search = None; // 重新推送检索查询
         if let Some(window) = window.as_mut() {
             self.activate_tab(idx, window, cx);
-            self.status = SharedString::from("已拆分为独立窗口");
+            self.model.borrow_mut().status = SharedString::from("已拆分为独立窗口");
             // 窗口标题跟随当前文件（拆出的新窗口直接以此命名）
-            if let Some(p) = self.tabs[idx].file_path.as_ref() {
+            if let Some(p) = self.model.borrow().tabs[idx].file_path.as_ref() {
                 window.set_window_title(&p.to_string_lossy());
             } else {
                 window.set_window_title("未命名");
             }
         } else {
-            self.status = SharedString::from("已还原到主窗口");
+            self.model.borrow_mut().status = SharedString::from("已还原到主窗口");
         }
-        self.status_ok = true;
+        self.model.borrow_mut().status_ok = true;
         // 收纳后选项卡集合变化 → 立即持久化（detached 窗口由 persist 内部早退）。
         self.schedule_session_flush(cx, true);
         // 构造期（`new_detached` → `open_window` 同步首帧紧后）抑制多余 notify：
@@ -265,11 +211,14 @@ impl EditorApp {
     ) {
         // 窗口外松开：先销毁越界时创建的跟手幽灵窗，真文件窗口随后按落点建立/还原。
         self.destroy_drag_ghost(cx);
-        self.drag_outside_armed = false;
-        let Some(idx) = self.tab_dragging.take() else {
+        self.model.borrow_mut().drag_outside_armed = false;
+        // SC-3：先提纯 owned 再 let-else，避免 `tab_dragging.take()` 的 RefMut 临时
+        // 存活整个 `let-else` 作用域（后续 borrow_mut 运行期双借 panic）。
+        let tab_dragging = self.model.borrow_mut().tab_dragging.take();
+        let Some(idx) = tab_dragging else {
             return;
         };
-        if idx >= self.tabs.len() {
+        if idx >= self.model.borrow().tabs.len() {
             return;
         }
         // 实时预览编辑模式下鼠标按住拖出：先把内容写回编辑区（实时实体不随选项卡搬）。
@@ -307,7 +256,7 @@ impl EditorApp {
         // on_drag 即拖拽真实开始：登记拖拽下标（否则 `ensure_drag_ghost` 的 defer 回调按
         // `tab_dragging.is_none()` 判定「拖拽已结束」而跳过创建，前移落空）。on_drag_move
         // 会重复写同值，幂等。
-        self.tab_dragging = Some(idx);
+        self.model.borrow_mut().tab_dragging = Some(idx);
         let s = size_cell.get();
         let size = if s.width > px(0.) && s.height > px(0.) {
             s
@@ -344,7 +293,8 @@ impl EditorApp {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.tabs.get(idx) else {
+        let model = self.model.borrow();
+        let Some(tab) = model.tabs.get(idx) else {
             return;
         };
         let name: SharedString = tab
@@ -355,6 +305,7 @@ impl EditorApp {
             .unwrap_or_else(|| "未命名".to_string())
             .into();
         let dirty = tab.dirty;
+        drop(model);
         // 幽灵窗/预览尺寸 = 真实选项卡 laid-out 尺寸（`tabs::TabBoundsRecorder` 每帧写入
         // `drag_size`）；首帧尚无记录时回退到估算。同步给下面创建的窗口 bounds/min_size。
         let s = drag_size.get();
@@ -363,7 +314,7 @@ impl EditorApp {
         } else {
             tab_preview_size(&name, dirty, window)
         };
-        let grab = self.tab_drag_grab.unwrap_or(Point::default());
+        let grab = self.model.borrow().tab_drag_grab.unwrap_or(Point::default());
         // 幽灵左上角（屏幕逻辑 px）＝ 源窗口左上角 + (拖拽点 - 抓取偏移)，与 gpui 在
         // 窗内绘制拖拽 picture 的位置（mouse_position - cursor_offset）完全一致。
         let screen = window.bounds().origin + (pos - grab);
@@ -372,7 +323,7 @@ impl EditorApp {
         // 尺寸的完整幽灵窗，杜绝「一半被裁 → 越界才突然完整」。记录决策供测试锁定。
         let visible = outside
             || drag_picture_about_to_clip(pos, grab, size, window.bounds().size);
-        self.drag_ghost_visible = visible;
+        self.model.borrow_mut().drag_ghost_visible = visible;
         // B：幽灵窗 open_window 延迟（内部 `cx.defer`）→ 首个 on_drag_move 的 dispatch
         // 不被 Windows 透明置顶 popup 创建 + 首帧 DCOMP 的 OS 成本阻塞；幽灵窗仍在拖拽
         // 开始后 1 帧内建成（defer 会跨过可见行构建 / SetWindowPos 前落下）。
@@ -436,7 +387,7 @@ impl EditorApp {
                 this.update(cx, |this, cx| {
                     this.drag_ghost_pending = false;
                     // 拖拽已结束/取消（tab_dragging 已清空）或已另有幽灵窗 → 不再补建。
-                    if this.tab_dragging.is_none() || this.drag_ghost.is_some() {
+                    if this.model.borrow().tab_dragging.is_none() || this.drag_ghost.is_some() {
                         return;
                     }
                     let handle = cx.open_window(
@@ -613,7 +564,8 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         // 主窗口剩下的选项卡接管焦点；零选项卡时 `activate_tab` 空返回（欢迎页）。
-        self.activate_tab(self.active_tab, window, cx);
+        let active_idx = self.model.borrow().active_tab;
+        self.activate_tab(active_idx, window, cx);
         let src_bounds = window.bounds();
         let bounds = Bounds {
             origin: src_bounds.origin + release_position,

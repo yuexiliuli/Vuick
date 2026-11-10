@@ -4,11 +4,6 @@
 use super::*;
 
 impl EditorApp {
-    /// 组件编辑器内部统一使用 LF，避免 Windows 剪贴板 CRLF 进入文本布局。
-    pub(super) fn normalize_newlines(text: &str) -> String {
-        text.replace("\r\n", "\n").replace('\r', "\n")
-    }
-
     /// 创建并注册 `EditorApp` 实体（作为窗口的第一层视图，外层再由
     /// `ui::root::Root` 宿主包裹）。
     /// P5：shell 独立 crate 后由二进制壳 `main.rs` 消费，`pub(crate)` → `pub`。
@@ -41,6 +36,9 @@ impl EditorApp {
         startup: bool,
     ) -> EditorApp {
         let focus_handle = cx.focus_handle();
+        // SC-4：宿主实体自身的弱句柄与 id（AppHost `&self` 服务经它再入宿主实体）。
+        let own_weak = cx.weak_entity();
+        let own_entity_id = cx.entity_id();
         // 侧边栏搜索输入框：内容变化 → 重刷 app（从而重算并展示搜索结果）
         let search = cx.new(|cx| {
             InputState::new(window, cx)
@@ -78,45 +76,42 @@ impl EditorApp {
             .font_size
             .map(|v| v.clamp(FONT_MIN, FONT_MAX))
             .unwrap_or(DEFAULT_FONT_SIZE);
+        // SC-2/SC-3：模型半状态统一迁入 shell_core::AppModel——启动初值在此**一次性汇集**
+        // 交给 `AppModel::new`（语义与旧 `new_impl` 的同名字段完全一致；零选项卡 +
+        // active_tab=0 起手，其余派生状态取模型内默认）。
+        let model = Rc::new(RefCell::new(AppModel::new(
+            // 顶部状态文字（状态栏）：默认「就绪 / 正常」。
+            SharedString::from("就绪"),
+            true,
+            // 编辑器正文字号（按偏好 clamp 到允许区间）。
+            start_font,
+            // 初始主题：按偏好解析（Follow → 当前系统明暗；Light/Dark → 强制）。
+            start_dark,
+            // 手动切主题会退到强制档；此处仅为「跟随 / 强制」的偏好记录。
+            prefs.theme,
+            // PDF 画布背景偏好：启动即随配置恢复（默认跟随主题；显式档在打开时冻结）。
+            prefs.pdf_bg,
+            prefs.pdf_bg_custom.clone(),
+            // 会话恢复 / 托盘 / 媒体打开位置开关：None（未设置）= 默认开/关。
+            prefs.session_restore.unwrap_or(true),
+            prefs.close_to_tray.unwrap_or(false),
+            prefs.media_new_window.unwrap_or(true),
+            prefs.reuse_media_window.unwrap_or(true),
+            // 媒体窗口记录尺寸：None（未记录）= 新开跟随发起窗口大小。
+            prefs.music_window_size.map(|(w, h)| gpui::size(px(w), px(h))),
+            prefs.video_window_size.map(|(w, h)| gpui::size(px(w), px(h))),
+            // 最近打开（文件夹 / 文件）：新→旧的路径列表，跨重启恢复「打开最近」面板。
+            recent_folders,
+            recent_files,
+            // A4：PDF 书签进程级读盘一次（`load_cached`；每窗构造都读盘是浪费）。
+            pdf_bookmarks::load_cached(),
+        )));
         let mut app = EditorApp {
-            tabs: Vec::new(),
-            active_tab: 0,
+            model,
             tab_bar_hscroll: TableScrollState::new(),
             tab_hscroll_delay: SeqAfter::default(),
-            status: SharedString::from("就绪"),
-            status_ok: true,
             notifications: Vec::new(),
-            font_size: start_font,
-            dark_mode: start_dark,
-            // 手动切主题会退到强制档；此处仅为「跟随 / 强制」的偏好记录。
-            theme_pref: prefs.theme,
-            // PDF 画布背景偏好：启动即随配置恢复（默认跟随主题；显式档在打开时冻结）。
-            pdf_bg: prefs.pdf_bg,
-            pdf_bg_custom: prefs.pdf_bg_custom.clone(),
             split_ratio: 0.5,
-            // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。
-            wrap_enabled: false,
-            // 会话恢复开关：None（未设置）= 默认开。
-            session_restore: prefs.session_restore.unwrap_or(true),
-            // 关闭到托盘开关：None（未设置）= 默认关（点 × 直接退出）。
-            close_to_tray: prefs.close_to_tray.unwrap_or(false),
-            // 媒体打开位置开关：None（未设置）= 默认开。
-            media_new_window: prefs.media_new_window.unwrap_or(true),
-            reuse_media_window: prefs.reuse_media_window.unwrap_or(true),
-            // 媒体窗口记录尺寸：None（未记录）= 新开跟随发起窗口大小。
-            music_window_size: prefs
-                .music_window_size
-                .map(|(w, h)| gpui::size(px(w), px(h))),
-            video_window_size: prefs
-                .video_window_size
-                .map(|(w, h)| gpui::size(px(w), px(h))),
-            // 媒体窗口尺寸落盘防抖（可重入、代序作废，仿会话防抖姿势，见 media_window.rs）。
-            media_size_flush_debounce: SeqAfter::default(),
-            // 会话持久化防抖（可重入、代序作废） / 恢复期间抑制标记 / 槽位指纹表（见 session 模块）。
-            session_flush_debounce: SeqAfter::default(),
-            session_restoring: false,
-            session_slot_hashes: std::collections::HashMap::new(),
-            session_last_manifest_digest: None,
             split_drag: None,
             pending_split_ratio: None,
             splitter_hovered: false,
@@ -143,30 +138,11 @@ impl EditorApp {
             },
             search_state,
             _search_sub: search_sub,
-            pdf_search: None,
-            search_scan: None,
-            search_scope: sidebar::SearchScopeTab::CurrentFile,
-            search_scope_manual: false,
-            folder_search: None,
-            folder_search_gen: 0,
-            quick_open_gen: 0,
-            goto_line_toast_key: None,
-            find_toast_key: None,
-            settings_toast_key: None,
-            search_scan_count: 0,
-            search_committed: String::new(),
-            search_pending: String::new(),
-            search_debounce: SeqAfter::default(),
             open_fast_count: 0,
             open_finish_count: 0,
             open_dialog_calls: 0,
             last_title_ctrl_fg: None,
             tab_bounds: Vec::new(),
-            tab_dragging: None,
-            tab_reorder_target: None,
-            tab_drag_grab: None,
-            drag_outside_armed: false,
-            drag_ghost_visible: false,
             drag_ghost: None,
             constructing: false,
             drag_ghost_pending: false,
@@ -180,9 +156,6 @@ impl EditorApp {
             pdf_menu_pos: None,
             pdf_menu_entity: None,
             pdf_menu_sub: None,
-            pdf_last_error_seen: None,
-            // A4：PDF 书签进程级读盘一次（`load_cached`；每窗构造都读盘是浪费）。
-            pdf_bookmarks: pdf_bookmarks::load_cached(),
             tab_bar_menu_pos: None,
             tab_bar_menu_entity: None,
             tab_bar_menu_sub: None,
@@ -193,11 +166,6 @@ impl EditorApp {
             _file_tree_prompt_sub: None,
             files_filter_state: files_filter,
             _files_filter_sub: files_filter_sub,
-            files_filter: String::new(),
-            files_filter_pending: String::new(),
-            files_filter_debounce: SeqAfter::default(),
-            recent_folders,
-            recent_files,
             recent_panel: None,
             _recent_panel_sub: None,
             focus_handle,
@@ -208,19 +176,18 @@ impl EditorApp {
             _bounds_sub: None,
             palette: None,
             _palette_sub: None,
-            // A：旧 live2 实体延迟回收队列（`commit_live` 暂存、下一帧 on_next_frame 清空）。
-            retired_live2: Vec::new(),
-            // 音乐播放器视图与模式（惰性创建；退出音乐模式不销毁 MusicView——播放继续）。
+            // 音乐播放器视图（惰性创建；退出音乐模式不销毁 MusicView——播放继续）。
             music: None,
-            music_mode: false,
             _music_sub: None,
+            own_weak,
+            own_entity_id,
         };
         app.register_window(window, cx);
         // 打开文件夹持久化 → 启动恢复：**仅当「恢复上次会话」开启时生效**（与恢复上次
         // 选项卡同一开关——关闭恢复 = 干净启动，不再自动重开上次打开的文件夹）。
         // opened_folder 仍持久化，手动打开文件夹 / 导入设置不受此门控影响。
         // 路径失效 / 不存在 → 不设根，首次 `persist_prefs` 时清掉（写 null）。
-        let restore_folder = opened_folder.filter(|_| app.session_restore);
+        let restore_folder = opened_folder.filter(|_| app.model.borrow().session_restore);
         if let Some(folder) = restore_folder {
             let p = PathBuf::from(&folder);
             if p.is_dir() {
@@ -240,7 +207,7 @@ impl EditorApp {
         // 主题模式未变则跳过 `Theme::set`：它内部会 `refresh_windows`（入队 RefreshWindows
         // 效果），构造期入队的该效果会在 `open_window` 同步首帧**之后**才 flush → 新窗口
         // 白画一整帧冗余重绘（大档拆窗松手延时的大头之一）。跳过不丢视觉（同模式同色板）。
-        let want_dark = app.dark_mode;
+        let want_dark = app.model.borrow().dark_mode;
         if ui::theme::Theme::global(cx).is_dark() != want_dark {
             ui::theme::Theme::set(
                 if want_dark {
@@ -263,8 +230,12 @@ impl EditorApp {
                             cx.window_appearance(),
                             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
                         );
-                        if this.theme_pref == ThemePref::Follow && this.dark_mode != dark {
-                            this.dark_mode = dark;
+                        // SC-3：先提纯 Boolean 再进 if（条件里的 borrow 临时 Ref 存活整个
+                        // 分支 → 块内 borrow_mut 运行期双借 panic）。
+                        let follow = this.model.borrow().theme_pref == ThemePref::Follow;
+                        let not_equals_dark = this.model.borrow().dark_mode != dark;
+                        if follow && not_equals_dark {
+                            this.model.borrow_mut().dark_mode = dark;
                             this.refresh_theme_ui(cx);
                         }
                     });
@@ -325,7 +296,7 @@ impl EditorApp {
             // 打开文件后立即开启「本项目 WYSIWYG（预览编辑测试）」左面板，便于截图/识图验证。
             if opened_cli_file
                 && std::env::var_os("WY_AUTOTEST").is_some()
-                && app.is_markdown_tab(app.active_tab)
+                && app.is_markdown_tab(app.model.borrow().active_tab)
             {
                 app.toggle_live_test(window, cx);
             }
@@ -372,7 +343,7 @@ impl EditorApp {
                     {
                         tray::set_main_hwnd(win32.hwnd.get() as isize);
                     }
-                    tray::set_close_to_tray(app.close_to_tray);
+                    tray::set_close_to_tray(app.model.borrow().close_to_tray);
                     // A5：托盘图标 / 程序窗口图标 **defer 到首帧后**（窗口先显示、图标随后
                     // 毫秒级出现）。`add_tray_icon`（建隐藏消息窗口 + 解码 PNG +
                     // Shell_NotifyIconW）与 `WM_SETICON` 不再挡首帧；`set_main_hwnd` /
@@ -411,22 +382,16 @@ impl EditorApp {
         registry.windows.push((weak, handle));
     }
 
-    /// 选项卡的编辑焦点句柄：预览编辑模式返回 WYSIWYG 编辑器（否则键盘进
-    /// 不可见的源码编辑区）；否则返回源码编辑区。
+    /// 选项卡的编辑焦点句柄：SC-4 逻辑已迁 `AppModel::tab_focus_handle`
+    /// （shell_core::actions，模型直读）；此处 glue 转发。
     pub(super) fn tab_focus_handle(&self, idx: usize, cx: &App) -> FocusHandle {
-        let Some(tab) = self.tabs.get(idx) else {
-            return self.focus_handle.clone();
-        };
-        if tab.live_edit
-            && let Some(l2) = &tab.live2 {
-                let h = gpui::Focusable::focus_handle(l2.read(cx), cx);
-                return h;
-            }
-        tab.editor.read(cx).focus_handle()
+        let host: &dyn AppHost = self;
+        self.model.borrow().tab_focus_handle(idx, host, cx)
     }
 
     /// 当前激活选项卡的编辑区焦点句柄（供入口聚焦，二进制壳 `main.rs` 消费）。
     pub fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
-        self.tab_focus_handle(self.active_tab, cx)
+        let active_idx = self.model.borrow().active_tab;
+        self.tab_focus_handle(active_idx, cx)
     }
 }

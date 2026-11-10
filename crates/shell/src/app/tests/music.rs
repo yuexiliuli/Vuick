@@ -69,7 +69,7 @@
         }
         let (mode, has_view) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.music_mode, a.music.is_some())
+            (a.model.borrow().music_mode, a.music.is_some())
         });
         assert!(mode, "toggle 开应进入音乐模式");
         assert!(has_view, "进入音乐模式应已创建 MusicView");
@@ -85,7 +85,7 @@
             cx.run_until_parked();
             let _ = cx.cx.refresh();
         }
-        let mode2 = cx.update(|_w, cx| app.read(cx).music_mode);
+        let mode2 = cx.update(|_w, cx| app.read(cx).model.borrow().music_mode);
         assert!(!mode2, "再次 toggle 应退出音乐模式");
         music_restore_config(&cfg);
     }
@@ -107,12 +107,12 @@
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("示例曲目.ogg");
         std::fs::write(&p, b"OggS placeholder").unwrap();
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 // 断言对象是「当前窗口音乐模式路由」：显式关掉媒体重定向开关（默认开），
                 // 否则 `open_file` 会把音频改投同进程新窗口（见 media_window.rs 行为表）。
-                app.media_new_window = false;
+                app.model.borrow_mut().media_new_window = false;
                 app.open_file(p.to_str().unwrap(), window, cx);
             });
         });
@@ -122,7 +122,7 @@
         }
         let (mode, tabs, has_view) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.music_mode, a.tabs.len(), a.music.is_some())
+            (a.model.borrow().music_mode, a.model.borrow().tabs.len(), a.music.is_some())
         });
         assert!(mode, "打开 .ogg 应进入音乐模式");
         assert_eq!(tabs, tabs_before, "打开音频不应创建文本选项卡");
@@ -153,7 +153,7 @@
             let _ = cx.cx.refresh();
         }
         assert!(
-            cx.update(|_w, cx| app.read(cx).music_mode),
+            cx.update(|_w, cx| app.read(cx).model.borrow().music_mode),
             "前置：应先进入音乐模式"
         );
         // 直接对 MusicView emit ExitRequested → 订阅者应把 music_mode 置 false。
@@ -165,7 +165,7 @@
             cx.run_until_parked();
             let _ = cx.cx.refresh();
         }
-        let mode = cx.update(|_w, cx| app.read(cx).music_mode);
+        let mode = cx.update(|_w, cx| app.read(cx).model.borrow().music_mode);
         assert!(!mode, "ExitRequested 应退出音乐模式");
         music_restore_config(&cfg);
     }

@@ -8,7 +8,7 @@
             cx.run_until_parked();
         }
         // 第 1 个选项卡输入内容
-        let editor0 = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
+        let editor0 = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.clone());
         cx.update(|_, cx| {
             editor0.update(cx, |ed, _| ed.set_text("hello"));
         });
@@ -25,10 +25,10 @@
         let (count, active, tab1_dirty, tab0_content) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs.len(),
-                a.active_tab,
-                a.tabs[a.active_tab].dirty,
-                a.tabs[0].editor.read(cx).value(),
+                a.model.borrow().tabs.len(),
+                a.model.borrow().active_tab,
+                a.model.borrow().tabs[a.model.borrow().active_tab].dirty,
+                a.model.borrow().tabs[0].editor.read(cx).value(),
             )
         });
         assert_eq!(count, 2, "新建后应有 2 个选项卡");
@@ -102,7 +102,7 @@
             (
                 a.active_media_locked(cx),
                 a.media_lock_menu_pos.is_none(),
-                tab_image(&a.tabs[a.active_tab])
+                tab_image(&a.model.borrow().tabs[a.model.borrow().active_tab])
                     .map(|v| v.read(cx).is_locked())
                     .unwrap_or(false),
             )
@@ -195,7 +195,7 @@
             (
                 a.active_media_locked(cx),
                 a.media_lock_menu_pos.is_none(),
-                tab_video(&a.tabs[a.active_tab])
+                tab_video(&a.model.borrow().tabs[a.model.borrow().active_tab])
                     .map(|v| v.read(cx).is_locked())
                     .unwrap_or(false),
             )
@@ -231,7 +231,7 @@
         let editor = cx.update(|window, cx| {
             let focus = app.read(cx).editor_focus_handle(cx);
             window.focus(&focus, cx);
-            app.read(cx).tabs[app.read(cx).active_tab].editor.clone()
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone()
         });
         cx.update(|_, cx| {
             editor.update(cx, |ed, _| ed.set_text("hello"));
@@ -302,7 +302,7 @@
         let editor = cx.update(|window, cx| {
             let focus = app.read(cx).editor_focus_handle(cx);
             window.focus(&focus, cx);
-            app.read(cx).tabs[app.read(cx).active_tab].editor.clone()
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone()
         });
 
         let chunk = "Option<Vec<WrappedLine>>";
@@ -322,7 +322,7 @@
         // 内容不丢失不错乱；普通选项卡不再整份镜像全文到 content（省一份副本）
         let (value, cached, dirty) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let tab = &a.tabs[a.active_tab];
+            let tab = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 editor.read(cx).value().to_string(),
                 tab.content.to_string(),
@@ -392,7 +392,7 @@
         }
 
         let value = cx.update(|_window, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .editor
                 .read(cx)
                 .value()
@@ -518,7 +518,7 @@
         let (content, preview) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs[a.active_tab].editor.read(cx).value().to_string(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string(),
                 a.show_preview(),
             )
         });
@@ -542,7 +542,8 @@
         app.update(cx, |app, cx| {
             app.change_font_size(3.0, cx);
             app.change_font_size(-1.0, cx);
-            app.tabs[app.active_tab].preview_on = true;
+            let active = app.model.borrow().active_tab;
+            app.model.borrow_mut().tabs[active].preview_on = true;
             cx.notify();
         });
         for _ in 0..3 {
@@ -550,7 +551,7 @@
         }
         let (font, preview) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.font_size, a.show_preview())
+            (a.model.borrow().font_size, a.show_preview())
         });
         assert_eq!(font, DEFAULT_FONT_SIZE + 2.0);
         assert!(
@@ -707,8 +708,8 @@
         let (row0, col0) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs[a.active_tab].cursor_row,
-                a.tabs[a.active_tab].cursor_col,
+                a.model.borrow().tabs[a.model.borrow().active_tab].cursor_row,
+                a.model.borrow().tabs[a.model.borrow().active_tab].cursor_col,
             )
         });
         assert_eq!((row0, col0), (0, 0), "打开文件后光标应位于 (0,0)");
@@ -730,8 +731,8 @@
         let (row1, col1) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs[a.active_tab].cursor_row,
-                a.tabs[a.active_tab].cursor_col,
+                a.model.borrow().tabs[a.model.borrow().active_tab].cursor_row,
+                a.model.borrow().tabs[a.model.borrow().active_tab].cursor_col,
             )
         });
         assert_eq!((row1, col1), (0, 1), "光标处粘贴后列号推进为 1");
@@ -778,7 +779,7 @@
         }
         let (row0, col0) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs[a.active_tab].cursor_row, a.tabs[a.active_tab].cursor_col)
+            (a.model.borrow().tabs[a.model.borrow().active_tab].cursor_row, a.model.borrow().tabs[a.model.borrow().active_tab].cursor_col)
         });
         assert_eq!((row0, col0), (0, 0), "打开文件后光标应位于 (0,0)");
         assert!(
@@ -791,7 +792,7 @@
         let ed_b = cx.debug_bounds("code-editor").expect("编辑区应渲染");
         let (cw, lh, gutter) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let ed = a.tabs[a.active_tab].editor.read(cx);
+            let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
             ed.test_metrics()
         });
         let click = gpui::Point::new(
@@ -807,7 +808,7 @@
         }
         let (row1, _col1) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs[a.active_tab].cursor_row, a.tabs[a.active_tab].cursor_col)
+            (a.model.borrow().tabs[a.model.borrow().active_tab].cursor_row, a.model.borrow().tabs[a.model.borrow().active_tab].cursor_col)
         });
         assert_eq!(
             row1, target_row,
@@ -829,7 +830,7 @@
         }
         let (row2, _) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs[a.active_tab].cursor_row, a.tabs[a.active_tab].cursor_col)
+            (a.model.borrow().tabs[a.model.borrow().active_tab].cursor_row, a.model.borrow().tabs[a.model.borrow().active_tab].cursor_col)
         });
         assert_eq!(row2, target_row + 1, "方向键下移后光标行应 +1（行数据刷新）");
 
@@ -847,7 +848,7 @@
         }
         let (row3, col3) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs[a.active_tab].cursor_row, a.tabs[a.active_tab].cursor_col)
+            (a.model.borrow().tabs[a.model.borrow().active_tab].cursor_row, a.model.borrow().tabs[a.model.borrow().active_tab].cursor_col)
         });
         assert_eq!((row3, col3), (0, 0), "切到新选项卡后光标数据源应为其 (0,0)");
         assert!(
@@ -890,7 +891,8 @@
         // 点击眼睛：应关闭当前选项卡的预览（当前仍是 .md，眼睛保持显示，仅变关闭）
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.toggle_preview_for_tab(app.active_tab, window, cx)
+                let active_idx = app.model.borrow().active_tab;
+                app.toggle_preview_for_tab(active_idx, window, cx)
             });
         });
         for _ in 0..3 {
@@ -950,14 +952,14 @@
             "手绘 ＋ 图标 tab-add-icon 应已移除"
         );
         // 新建选项卡的能力仍在
-        let tabs0 = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs0 = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.new_tab(window, cx));
         });
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let tabs1 = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs1 = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         assert_eq!(tabs1, tabs0 + 1, "新建应增加 1 个选项卡");
     }
 
@@ -971,7 +973,7 @@
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         settle_frames(cx, 3);
-        let tabs0 = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs0 = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
 
         // 右键选项卡栏**空白区**（首标签之后的栏内区域，语义 = 栏级菜单；标签上右键已
         // 专属「选项卡管理菜单」，见 tabs_context.rs）→ 弹「新建文件/打开文件」菜单
@@ -1005,7 +1007,7 @@
         settle_frames(cx, 3);
         let (tabs1, menu_closed) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs.len(), a.tab_bar_menu_pos.is_none())
+            (a.model.borrow().tabs.len(), a.tab_bar_menu_pos.is_none())
         });
         assert_eq!(tabs1, tabs0 + 1, "点「新建文件」应新建 1 个选项卡");
         assert!(menu_closed, "点菜单项后菜单应关闭");

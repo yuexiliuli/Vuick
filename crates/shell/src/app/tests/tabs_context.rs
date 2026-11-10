@@ -116,7 +116,7 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        assert_eq!(cx.update(|_w, cx| app.read(cx).tabs.len()), 3);
+        assert_eq!(cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()), 3);
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.tab_close_all(window, cx));
         });
@@ -126,7 +126,7 @@
             cx.run_until_parked();
         }
         assert!(
-            cx.update(|_w, cx| app.read(cx).tabs.is_empty()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.is_empty()),
             "全干净 → 关闭全部应清空（欢迎页）"
         );
 
@@ -142,12 +142,12 @@
         }
         cx.update(|_w, cx| {
             app.update(cx, |a, _cx| {
-                if let Some(t) = a.tabs.iter_mut().find(|t| t.file_path.is_some()) {
+                if let Some(t) = a.model.borrow_mut().tabs.iter_mut().find(|t| t.file_path.is_some()) {
                     t.dirty = true;
                 }
             });
         });
-        let before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.tab_close_all(window, cx));
         });
@@ -155,11 +155,11 @@
             cx.run_until_parked();
         }
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             before,
             "任一脏 → 关闭全部应中止（一个不关）"
         );
-        let status = cx.update(|_w, cx| app.read(cx).status.to_string());
+        let status = cx.update(|_w, cx| app.read(cx).model.borrow().status.to_string());
         assert!(status.contains("未保存的更改"), "应提示有未保存的更改，实际={status}");
 
         // 未命名中止路径：存在一个未命名（file_path=None）空选项卡 → 关闭全部也中止。
@@ -169,7 +169,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let before2 = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let before2 = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.tab_close_all(window, cx));
         });
@@ -177,11 +177,11 @@
             cx.run_until_parked();
         }
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             before2,
             "任一未命名 → 关闭全部应中止（一个不关）"
         );
-        let status2 = cx.update(|_w, cx| app.read(cx).status.to_string());
+        let status2 = cx.update(|_w, cx| app.read(cx).model.borrow().status.to_string());
         assert!(status2.contains("未保存的更改"), "未命名也应提示，实际={status2}");
         for f in [&f1, &f2, &f3] {
             let _ = std::fs::remove_file(f);
@@ -221,12 +221,12 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let tabs = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         assert_eq!(tabs, 1, "关闭其他应只剩目标 tab，实际={tabs}");
         assert!(
             cx.update(|_w, cx| {
                 app.read(cx)
-                    .tabs
+                    .model.borrow().tabs
                     .iter()
                     .any(|t| t.file_path.as_deref() == Some(mk(2).as_path()))
             }),
@@ -262,7 +262,7 @@
             cx.run_until_parked();
         }
         let paths: Vec<Option<std::path::PathBuf>> = cx.update(|_w, cx| {
-            app.read(cx).tabs.iter().map(|t| t.file_path.clone()).collect()
+            app.read(cx).model.borrow().tabs.iter().map(|t| t.file_path.clone()).collect()
         });
         assert_eq!(paths.len(), 1, "关闭右侧后应剩 1 tab");
         assert_eq!(paths[0].as_deref(), Some(mk(1).as_path()), "目标 1 保留");
@@ -271,7 +271,7 @@
         cx.update(|_w, cx| {
             app.update(cx, |a, _cx| {
                 if let Some(t) = a
-                    .tabs
+                    .model.borrow_mut().tabs
                     .get_mut(1)
                     .filter(|t| t.file_path.as_deref() == Some(mk(2).as_path()))
                 {
@@ -279,7 +279,7 @@
                 }
             });
         });
-        let before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.tab_close_right(0, window, cx));
         });
@@ -287,7 +287,7 @@
             cx.run_until_parked();
         }
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             before,
             "目标右侧有脏 → 关闭右侧应中止（一个不关）"
         );
@@ -321,7 +321,7 @@
         // tabs: [未命名(0), A(1,clean), B(2)]；把 A(1) 置脏 → 已保存只有 B(2)。
         cx.update(|_w, cx| {
             app.update(cx, |a, _cx| {
-                if let Some(t) = a.tabs.get_mut(1) {
+                if let Some(t) = a.model.borrow_mut().tabs.get_mut(1) {
                     t.dirty = true;
                 }
             });
@@ -337,11 +337,11 @@
         let (paths, dirty) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs
+                a.model.borrow().tabs
                     .iter()
                     .map(|t| t.file_path.as_deref().map(|p| p.to_path_buf()))
                     .collect::<Vec<_>>(),
-                a.tabs.iter().map(|t| t.dirty).collect::<Vec<_>>(),
+                a.model.borrow().tabs.iter().map(|t| t.dirty).collect::<Vec<_>>(),
             )
         });
         assert_eq!(paths.len(), 2, "关闭已保存后应剩未命名 + 脏文件 B(实际只剩下未命名+A)");
@@ -407,7 +407,7 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 let f2_idx = app
-                    .tabs
+                    .model.borrow().tabs
                     .iter()
                     .position(|t| t.file_path.as_deref() == Some(f2.as_path()))
                     .expect("F2 应在场");
@@ -450,8 +450,8 @@
         // tabs: [未命名(0), F(1)]。把 F(1) 复制到新窗口。
         let source_before = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[1];
-            (a.tabs.len(), t.dirty, t.editor.read(cx).value().to_string())
+            let t = &a.model.borrow().tabs[1];
+            (a.model.borrow().tabs.len(), t.dirty, t.editor.read(cx).value().to_string())
         });
         assert_eq!(source_before.1, false, "打开文件默认不脏");
         cx.update(|window, cx| {
@@ -475,9 +475,9 @@
         let source_after = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs.len(),
-                a.tabs[1].dirty,
-                a.tabs[1].editor.read(cx).value().to_string(),
+                a.model.borrow().tabs.len(),
+                a.model.borrow().tabs[1].dirty,
+                a.model.borrow().tabs[1].editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(source_after.0, source_before.0, "源窗口 tab 数不变");
@@ -497,16 +497,16 @@
         });
         cx.update(|_w, cx| {
             det_entity.update(cx, |app, cx| {
-                let ed = app.tabs[0].editor.clone();
+                let ed = app.model.borrow().tabs[0].editor.clone();
                 ed.update(cx, |ed, _| ed.set_text("UPDATED COPY"));
-                app.tabs[0].dirty = true;
+                app.model.borrow_mut().tabs[0].dirty = true;
             });
         });
         for _ in 0..3 {
             cx.run_until_parked();
         }
         let src_final = cx.update(|_w, cx| {
-            app.read(cx).tabs[1].editor.read(cx).value().to_string()
+            app.read(cx).model.borrow().tabs[1].editor.read(cx).value().to_string()
         });
         assert_eq!(
             src_final,
@@ -565,7 +565,7 @@
                         .is_some_and(|e| e.read_with(cx, |a, _| a.is_detached))
                 })
                 .count();
-            (main.active_tab, main.tabs.len(), det_count)
+            (main.model.borrow().active_tab, main.model.borrow().tabs.len(), det_count)
         });
         assert_eq!(active, 0, "复制中间 tab 后源窗口活动应保持 0，实际={active}");
         assert_eq!(tabs_len, 3, "源窗口 tab 数不变，实际={tabs_len}");

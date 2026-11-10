@@ -39,8 +39,7 @@
 
 use super::*;
 use session_store::{
-    SessionManifest, SessionTab, clear_session, prune_unreferenced_slots, read_manifest,
-    read_slot, write_manifest, write_slot,
+    SessionManifest, SessionTab, clear_session, read_manifest, read_slot,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -61,15 +60,17 @@ impl EditorApp {
     /// 「恢复上次会话」开关：翻转 + 立即持久化（不等退出）。关闭时顺带清掉遗留
     /// 会话清单/槽位，避免日后重新开启时恢复陈旧会话。
     pub(super) fn toggle_session_restore(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.session_restore = !self.session_restore;
+        // SC-3：先提纯 owned 再写回，避免同语句 `borrow_mut`+`borrow`（运行期双借 panic）。
+        let session_restore = !self.model.borrow().session_restore;
+        self.model.borrow_mut().session_restore = session_restore;
         // 与其它偏好同款落盘（persist_prefs 已纳入 session_restore 字段）。
         self.persist_prefs();
-        if !self.session_restore {
+        if !session_restore {
             // 清槽位指纹：重开时若沿用旧指纹会误跳过写槽位（盘面已被清，内容却判「未变」），
             // 导致恢复读到缺失槽位 → 空内容。测试构建不触碰真实会话目录（clear 走显式目录的
             // 纯逻辑），但指纹表在两种构建都清（save_session_to 关闭分支同样兜底）。
-            self.session_slot_hashes.clear();
-            self.session_last_manifest_digest = None;
+            self.model.borrow_mut().session_slot_hashes.clear();
+            self.model.borrow_mut().session_last_manifest_digest = None;
             #[cfg(not(test))]
             {
                 let _ = clear_session(&UserPrefs::session_dir());
@@ -98,7 +99,7 @@ impl EditorApp {
     #[cfg(not(test))]
     pub(super) fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dir = UserPrefs::session_dir();
-        if !self.session_restore {
+        if !self.model.borrow().session_restore {
             return;
         }
         let Some(manifest) = read_manifest(&dir) else {
@@ -121,7 +122,7 @@ impl EditorApp {
         manifest: SessionManifest,
     ) {
         // 恢复期间抑制持久化（同 [`restore_session_from`] 语义，覆盖整个渐进恢复窗口）
-        self.session_restoring = true;
+        self.model.borrow_mut().session_restoring = true;
         let SessionManifest { active_tab, tabs, .. } = manifest;
         let pending = VecDeque::from(tabs);
         cx.on_next_frame(window, move |this, window, cx| {
@@ -183,26 +184,29 @@ impl EditorApp {
             });
         } else {
             // 全部选项卡已恢复：活动选项卡越界收敛到合法值（多开/缺文件只多不少时同 clamp）。
-            self.active_tab = if self.tabs.is_empty() {
+            // SC-2：先提纯 len（owned）再写，避免同一语句 `borrow_mut()` 与 `borrow()`
+            // 同时存活（运行期 RefCell 双借 panic）。
+            let len = self.model.borrow().tabs.len();
+            self.model.borrow_mut().active_tab = if len == 0 {
                 0
             } else {
-                active_tab.min(self.tabs.len() - 1)
+                active_tab.min(len - 1)
             };
             // 恢复完成放行持久化，随后删除清单/槽位（避免重复恢复）。
-            self.session_restoring = false;
+            self.model.borrow_mut().session_restoring = false;
             clear_session(&dir);
             // 盘面已被清（槽位/清单删除）：指纹表也必须清，否则此后首次持久化会拿
             //「恢复前内容」的旧指纹误判「未变」而跳过写槽位/清单 → 恢复出的选项卡内容不再落盘。
-            self.session_slot_hashes.clear();
-            self.session_last_manifest_digest = None;
+            self.model.borrow_mut().session_slot_hashes.clear();
+            self.model.borrow_mut().session_last_manifest_digest = None;
             // D1（评审修复）：恢复窗口内结构性变更（新建未命名 tab / 打开文件）的
             // `schedule_session_flush(immediate)` 被 `session_restoring` 抑制，且结构变更
             // 不走防抖重排 → 补一发**即时补偿落盘**（此刻 `session_restoring` 已置 false、
             // 指纹表已清，`persist_session` 会写全新指纹，避免误跳过槽位/清单），把恢复
             // 出的选项卡集合写回会话目录作新基线——退出/崩溃时未命名 tab 内容不丢。
             self.schedule_session_flush(cx, true);
-            self.status = SharedString::from("已恢复上次会话");
-            self.status_ok = true;
+            self.model.borrow_mut().status = SharedString::from("已恢复上次会话");
+            self.model.borrow_mut().status_ok = true;
             // A1 测量：渐进恢复完成墙钟（发生在首帧之后，[STARTUP] 汇总行打印在前，
             // 故此处按 boot 基准补打一行，供 before/after 对比「恢复总耗时」）。
             if let Some(ms) = base::startup::elapsed_ms() {
@@ -216,22 +220,11 @@ impl EditorApp {
     /// 状态本就在盘上，天然覆盖全部退出路径——退出钩子在部分平台不触发）。
     /// 仅在**会话责任窗口**（首个主窗口 `session_persist`）、非 detached、开关开启、
     /// 非恢复期间落盘；测试构建恒跳过（**绝不**触碰真实会话目录，验证走显式临时目录的
-    /// 纯逻辑 [`save_session_to`]，见 `tests/session.rs`）。
-    /// `session_persist` 门控（2026-10）：媒体窗口 / 拆出窗口共享**单份**全局会话清单，
-    /// 若参与写盘会用自身选项卡（视频 tab 或空）顶替主窗口会话 → 下次启动丢失。由
-    /// `new_impl` 的 `startup` 标志初始化（media_window.rs 的 `new_media_window` 传
-    /// `startup=false`），与「退出/托盘钩子只挂主窗口」同一职责划分。
+    /// 纯逻辑 [`AppModel::save_session_to`]，见 `tests/session.rs`）。
+    /// SC-4：编排逻辑已迁 `AppModel::persist_session`（shell_core::actions）；此处 glue 转发。
     pub(super) fn persist_session(&mut self, cx: &mut Context<Self>) {
-        if !self.session_persist
-            || self.is_detached
-            || !self.session_restore
-            || self.session_restoring
-            // cfg!(test) 为编译期常量，测试构建恒短路早退；磁盘写不触碰真实 APPDATA。
-            || cfg!(test)
-        {
-            return;
-        }
-        let _ = save_session_to(self, &UserPrefs::session_dir(), cx);
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().persist_session(host, &mut **cx);
     }
 
     /// 安排一次会话持久化：结构变化 `immediate=true` 立即写盘；内容变化 `false` 走
@@ -247,7 +240,7 @@ impl EditorApp {
         #[cfg(not(test))]
         {
             let weak = cx.weak_entity();
-            self.session_flush_debounce.after(
+            self.model.borrow().session_flush_debounce.after(
                 cx,
                 std::time::Duration::from_millis(SESSION_FLUSH_DEBOUNCE_MS),
                 move |app| {
@@ -260,107 +253,24 @@ impl EditorApp {
     }
 }
 
-/// 内容指纹：u64 哈希（`std` 默认 Hasher / SipHash-1-3，无新增依赖）。仅用于「内容未变
-/// 则跳过槽位重写」的判定；撞车率 ~2^-64，且被跳过时盘面恰是本次内容（此前自身写入的
-/// 产物），碰撞失真的风险可忽略。
-fn content_hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
 /// 从当前选项卡集合生成会话数据（清单 + 各未命名槽位内容，纯内存、无磁盘副作用）。
-/// [`EditorApp::save_session_to`] 与「导出设置」（`settings_xfer`）共用同一序列化口径：
-/// 文件选项卡只记路径、未命名选项卡经 [`EditorApp::tab_effective_text`] 取有效内容
-/// （live2/WYSIWYG 开启时读 WyEditor 实时内容）。槽位名 `t0..tN` 随未命名顺序位移。
+/// 与「导出设置」（`settings_xfer`）共用同一序列化口径：文件选项卡只记路径、未命名
+/// 选项卡经 [`AppModel::tab_effective_text`] 取有效内容（live2/WYSIWYG 开启时读 WyEditor
+/// 实时内容）。槽位名 `t0..tN` 随未命名顺序位移。
+/// SC-4：逻辑已迁 `AppModel::collect_session_data`；此处保留 free fn 挂导出设置/测试。
 pub(crate) fn collect_session_data(
     app: &EditorApp,
     cx: &App,
 ) -> (SessionManifest, Vec<(String, String)>) {
-    let mut tabs = Vec::new();
-    let mut slots = Vec::new();
-    let mut n_slots = 0usize;
-    for (idx, tab) in app.tabs.iter().enumerate() {
-        match &tab.file_path {
-            Some(p) => tabs.push(SessionTab::File { path: p.clone() }),
-            None => {
-                let slot = format!("t{n_slots}");
-                n_slots += 1;
-                let text = app.tab_effective_text(idx, cx);
-                slots.push((slot.clone(), text));
-                tabs.push(SessionTab::New {
-                    slot,
-                    name: "未命名".to_string(),
-                });
-            }
-        }
-    }
-    let manifest = SessionManifest {
-        version: 1,
-        active_tab: app.active_tab,
-        tabs,
-    };
-    (manifest, slots)
+    app.model.borrow().collect_session_data(cx)
 }
 
-/// 保存会话（纯逻辑，显式目录，可测试）：开关关闭 → 只清不做；否则先写槽位内容、
-    /// 再原子写清单（清单是"本次会话可恢复"的原子信号）。文件选项卡只记路径，未命名
-    /// 选项卡经 [`EditorApp::tab_effective_text`]（与手动保存同口径：live2/WYSIWYG 开启
-    /// 时读 WyEditor 实时内容）取内容写槽位。
-    /// **跳过未变槽位**：以「槽位名 + 内容 hash」对照 [`EditorApp::session_slot_hashes`]，
-    /// 内容未变的槽位不重写整份文件——切换选项卡 / 结构变化（旧实现每次都全量重写全部
-    /// 未命名内容并在主线程同步磁盘 IO）摊薄到只剩一份清单写 + 目录扫描；仅真正变化的
-    /// 槽位才写。槽位名随未命名顺序位移时（关选项卡重编号）名不同 → 照写，旧槽位交给
-    /// `session_store::prune_unreferenced_slots` 清理。
-    /// 写清单成功后顺带 `session_store::prune_unreferenced_slots` 清理不再被引用的陈旧槽位
-    /// （`remove_tab` 后重编号产生的孤儿），保证「否→删除临时文件」真正落盘。
-    /// 会话数据生成已抽到 [`collect_session_data`]（导出设置共用，不复制逻辑）。
-    pub(crate) fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool {
-        if !app.session_restore {
-            // 开关关闭：清盘面 + 清指纹（重开时旧指纹会误判「盘上有同内容」而跳过写槽位
-            // → 恢复读到缺失槽位为空内容；此处一并清掉，杜绝该竞态）。
-            app.session_slot_hashes.clear();
-            app.session_last_manifest_digest = None;
-            return clear_session(dir);
-        }
-        let (manifest, slots) = collect_session_data(app, cx);
-        for (slot, text) in &slots {
-            let h = content_hash(text);
-            // 槽位名与指纹都未变 → 内容与盘面一致，跳过重写（消除切选项卡/结构
-            // 变化时的全量同步磁盘写）。写失败仅当确实要写时返回（跳过不影响盘面）。
-            let unchanged = app.session_slot_hashes.get(slot).copied() == Some(h);
-            if !unchanged {
-                if !write_slot(dir, slot, text) {
-                    return false;
-                }
-                app.session_slot_hashes.insert(slot.clone(), h);
-            }
-        }
-        // 收敛指纹表规模：本次不再存在的旧槽位（选项卡被关/重编号后）直接淘汰，
-        // 避免 HashMap 随「反复新建/关闭未命名选项卡」长期累积（内存不放大）。
-        let n_slots = slots.len();
-        app.session_slot_hashes.retain(|slot, _| {
-            slot.strip_prefix('t')
-                .and_then(|s| s.parse::<usize>().ok())
-                .map_or(false, |n| n < n_slots)
-        });
-        // 清单是"本次会话可恢复"的原子信号，但写它恰是切选项卡/新建时最贵的原语
-        // （本机防病毒下原子写 ~5-25ms）。清单未变（`new_tab` 紧随 `make_tab` 的二次
-        // 即时落盘、内容防抖收敛后的等价重写等「无变化重入」）→ 字节级相同，盘面已最
-        // 新，直接跳过清单写 + prune（零文件 IO）；槽位已在上面写完。
-        let body = manifest.to_value().to_string();
-        let digest = content_hash(&body);
-        if app.session_last_manifest_digest == Some(digest) {
-            return true;
-        }
-        if !write_manifest(dir, &manifest) {
-            return false;
-        }
-        app.session_last_manifest_digest = Some(digest);
-        let _ = prune_unreferenced_slots(dir, &manifest);
-        true
-    }
+/// 保存会话（纯逻辑，显式目录，可测试）：SC-4 逻辑已迁
+/// [`AppModel::save_session_to`]（shell_core::actions）；此处保留 free fn 挂测试与
+/// 退出钩子（`save_session`），逐字保持既有语义（开关关闭只清、未变槽位跳过等）。
+pub(crate) fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool {
+    app.model.borrow_mut().save_session_to(dir, cx)
+}
 
 /// 恢复会话（纯逻辑，显式目录，**同步版**）：读清单 → 依次开文件 / 建未命名选项卡并
 /// 灌槽位内容 → 活动选项卡按清单取并 clamp 到 `[0, tabs.len())` → 删除清单并清理
@@ -376,7 +286,7 @@ pub(crate) fn restore_session_from(
     window: &mut Window,
     cx: &mut Context<EditorApp>,
 ) -> bool {
-    if !app.session_restore {
+    if !app.model.borrow().session_restore {
         return false;
     }
     let Some(manifest) = read_manifest(dir) else {
@@ -384,7 +294,7 @@ pub(crate) fn restore_session_from(
     };
     // 恢复期间抑制持久化：重建选项卡 / 灌内容不触发写盘（避免反复落盘 / 抵抗尾部
     // `clear_session` 清理）。
-    app.session_restoring = true;
+    app.model.borrow_mut().session_restoring = true;
     for tab in &manifest.tabs {
         match tab {
             SessionTab::File { path } => {
@@ -400,20 +310,23 @@ pub(crate) fn restore_session_from(
         }
     }
     // 活动选项卡越界收敛到合法值（多开/缺文件只多不少时同样 clamp）。
-    app.active_tab = if app.tabs.is_empty() {
+    // SC-2：先提纯 len（owned）再写，避免同一语句 `borrow_mut()` 与 `borrow()`
+    // 同时存活（运行期 RefCell 双借 panic）。
+    let len = app.model.borrow().tabs.len();
+    app.model.borrow_mut().active_tab = if len == 0 {
         0
     } else {
-        manifest.active_tab.min(app.tabs.len() - 1)
+        manifest.active_tab.min(len - 1)
     };
     // 恢复完成放行持久化，随后既有 `clear_session` 删除清单/槽位（避免重复恢复）。
-    app.session_restoring = false;
+    app.model.borrow_mut().session_restoring = false;
     clear_session(dir);
     // 盘面已被清（槽位/清单删除）：指纹表也必须清，否则此后首次持久化会拿「恢复前内容」
     // 的旧指纹误判「未变」而跳过写槽位/清单 → 恢复出的选项卡内容不再落盘。
-    app.session_slot_hashes.clear();
-    app.session_last_manifest_digest = None;
-    app.status = SharedString::from("已恢复上次会话");
-    app.status_ok = true;
+    app.model.borrow_mut().session_slot_hashes.clear();
+    app.model.borrow_mut().session_last_manifest_digest = None;
+    app.model.borrow_mut().status = SharedString::from("已恢复上次会话");
+    app.model.borrow_mut().status_ok = true;
     cx.notify();
     true
 }

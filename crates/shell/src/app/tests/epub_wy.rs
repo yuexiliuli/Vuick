@@ -24,7 +24,7 @@ async fn epub_opens_in_wy_readonly_host(cx: &mut TestAppContext) {
     }
     let (md_wy, editable, has_text, toc_len, routed) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let t = &a.tabs[a.active_tab];
+        let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
         (
             t.md_wy.clone(),
             t.md_wy
@@ -52,7 +52,7 @@ async fn epub_opens_in_wy_readonly_host(cx: &mut TestAppContext) {
     // 语义（%%ALIGN%%/标题居中）→ 应产出内存图行与对齐行（P4-1 需求 1/2 的渲染回归）。
     let (img_rows, aligned_rows, mem_images) = cx.update(|window, cx| {
         let a = app.read(cx);
-        let wy = a.tabs[a.active_tab].md_wy.clone().unwrap();
+        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().unwrap();
         let width = window.viewport_size().width.max(px(1.));
         let frame = markdown_wysiwyg::build_frame(
             wy.read(cx),
@@ -96,8 +96,8 @@ async fn epub_flip_chapter_moves_between_headings(cx: &mut TestAppContext) {
     // 下一章：应把滚动目标设到「当前章之后的章标题」源码行。
     let (moved, target_is_heading) = cx.update(|_w, cx| {
         let moved = app.update(cx, |a, cx| a.epub_flip_chapter(1, cx));
-        let idx = app.read(cx).active_tab;
-        let wy = app.read(cx).tabs[idx].md_wy.clone();
+        let idx = app.read(cx).model.borrow().active_tab;
+        let wy = app.read(cx).model.borrow().tabs[idx].md_wy.clone();
         let is_heading = wy
             .as_ref()
             .map(|w| {
@@ -112,9 +112,9 @@ async fn epub_flip_chapter_moves_between_headings(cx: &mut TestAppContext) {
     assert!(moved, "多章且未到末章应能翻下一章");
     assert!(target_is_heading, "滚动目标应为某个章标题源码行");
     // 让重钉落位（prepaint 逐帧把目标块精确顶写回宿主）：有界等待「顶行已离开首块」。
-    let idx0 = cx.update(|_w, cx| app.read(cx).active_tab);
+    let idx0 = cx.update(|_w, cx| app.read(cx).model.borrow().active_tab);
     let initial_top = cx.update(|_w, cx| {
-        app.read(cx).tabs[idx0]
+        app.read(cx).model.borrow().tabs[idx0]
             .md_wy
             .as_ref()
             .and_then(|w| w.read(cx).top_source_line())
@@ -126,7 +126,7 @@ async fn epub_flip_chapter_moves_between_headings(cx: &mut TestAppContext) {
         let _ = cx.cx.refresh();
         cx.run_until_parked();
         let top = cx.update(|_w, cx| {
-            app.read(cx).tabs[idx0]
+            app.read(cx).model.borrow().tabs[idx0]
                 .md_wy
                 .as_ref()
                 .and_then(|w| w.read(cx).top_source_line())
@@ -169,7 +169,7 @@ async fn md_wy_notes_citation_index_and_navigation_app_level(cx: &mut TestAppCon
     }
     let (cit_ref_line, cit_def_line, note_txt, routed) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let t = &a.tabs[a.active_tab];
+        let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
         let wy = t.md_wy.clone().expect("MD 打开应建统一 WyEditor 预览");
         let cit = wy.read(cx).citation_index();
         (
@@ -186,7 +186,7 @@ async fn md_wy_notes_citation_index_and_navigation_app_level(cx: &mut TestAppCon
     // 引用 → 定义 双向跳转（同一 update 内读，scroll_target 下一帧被 prepaint 消费）。
     let (stl, mhl) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let wy = a.tabs[a.active_tab].md_wy.clone().unwrap();
+        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().unwrap();
         let hit = markdown_wysiwyg::NoteMarkerHit {
             src_line: 0,
             n: 1,
@@ -233,7 +233,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
         let _ = cx.cx.refresh();
         cx.run_until_parked();
         ready = cx.update(|_, cx| {
-            app.read(cx).tabs.last().map(|t| {
+            app.read(cx).model.borrow().tabs.last().map(|t| {
                 t.md_wy.is_some()
                     && t.md_wy
                         .as_ref()
@@ -250,7 +250,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
     // 选一条文内 ref（靠前）→ 其 def 在尾部注释章。
     let (n, ref_line, def_line) = cx.update(|_, cx| {
         let a = app.read(cx);
-        let t = &a.tabs[a.active_tab];
+        let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
         let wy = t.md_wy.clone().unwrap();
         let cit = wy.read(cx).citation_index();
         let best = cit.refs.iter().find_map(|(&n, &(rl, _))| {
@@ -270,7 +270,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
     };
     cx.update(|_, cx| {
         let a = app.read(cx);
-        let wy = a.tabs[a.active_tab].md_wy.clone().unwrap();
+        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().unwrap();
         wy.update(cx, |w, cx| w.navigate_marker(&hit, cx));
     });
     // 驱动真实重排帧：落在 = scroll_target 已消费且顶行到达定义块起点。
@@ -281,7 +281,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
         cx.run_until_parked();
         let (target_active, top) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             let wy = t.md_wy.clone().unwrap();
             (
                 wy.read(cx).scroll_target_line().is_some(),
@@ -307,7 +307,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
     // 落位后宿主偏移停稳在远端（负偏移，内容坐标 ≈ def 块顶），且不再有滚动目标待处理。
     let (off_y, target_none) = cx.update(|_, cx| {
         let a = app.read(cx);
-        let t = &a.tabs[a.active_tab];
+        let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
         let wy = t.md_wy.clone().unwrap();
         (wy.read(cx).host_scroll().map(|(h, _)| h.offset().y.as_f32()), wy.read(cx).scroll_target_line().is_none())
     });
@@ -353,7 +353,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
         let _ = cx.cx.refresh();
         cx.run_until_parked();
         ready = cx.update(|_, cx| {
-            app.read(cx).tabs.last().map(|t| {
+            app.read(cx).model.borrow().tabs.last().map(|t| {
                 t.md_wy.is_some()
                     && t.md_wy
                         .as_ref()
@@ -380,7 +380,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
     // 选一条文内 ref（靠前）→ 其 def 在尾部注释章。
     let (n, ref_line, def_line) = cx.update(|_, cx| {
         let a = app.read(cx);
-        let t = &a.tabs[a.active_tab];
+        let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
         let wy = t.md_wy.clone().unwrap();
         let cit = wy.read(cx).citation_index();
         let best = cit.refs.iter().find_map(|(&n, &(rl, _))| {
@@ -400,7 +400,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
     };
     cx.update(|_, cx| {
         let a = app.read(cx);
-        let wy = a.tabs[a.active_tab].md_wy.clone().unwrap();
+        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().unwrap();
         wy.update(cx, |w, cx| w.navigate_marker(&hit, cx));
     });
     // —— 关键：跳转后不 refresh、不发输入；只投递 app 主动请求的下一帧 ——
@@ -413,7 +413,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
         cx.run_until_parked();
         let (target_active, top) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             let wy = t.md_wy.clone().unwrap();
             (
                 wy.read(cx).scroll_target_line().is_some(),

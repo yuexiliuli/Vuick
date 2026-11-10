@@ -50,7 +50,7 @@ async fn find_dispatch_opens_bar_types_and_navigates(cx: &mut TestAppContext) {
     }
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.tabs[a.active_tab].editor.clone()
+        a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone()
     });
     let (open, _, _, _, _) = cx.update(|_, cx| ed.read(cx).test_find_state());
     assert!(open, "文本选项卡 Ctrl+F 应打开 find 条");
@@ -133,7 +133,8 @@ async fn find_non_text_tab_toasts_not_opens(cx: &mut TestAppContext) {
             let viewer = cx.new(|cx| {
                 image_viewer::ImageViewer::new(std::path::PathBuf::from("___"), cx)
             });
-            app.tabs[app.active_tab].reader = MediaReader::Image(viewer);
+            let idx = app.model.borrow().active_tab;
+            app.model.borrow_mut().tabs[idx].reader = MediaReader::Image(viewer);
         });
     });
     for _ in 0..3 {
@@ -152,7 +153,7 @@ async fn find_non_text_tab_toasts_not_opens(cx: &mut TestAppContext) {
     }
     let (open, toast) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let ed = a.tabs[a.active_tab].editor.read(cx);
+        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
         (
             ed.test_find_state().0,
             a.notifications

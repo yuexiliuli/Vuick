@@ -45,12 +45,13 @@ impl EditorApp {
     /// 当前 PDF 画布底色映射：`None` = 跟随主题（viewer 回落 `default_canvas`）；
     /// 自定义档自定义色缺失/非法 → 回退 `None`（default，安全护栏）。
     pub(super) fn pdf_canvas_bg(&self) -> Option<gpui::Hsla> {
-        match self.pdf_bg {
+        let m = self.model.borrow();
+        match m.pdf_bg {
             PdfBgPref::Default => None,
             PdfBgPref::Night => Some(gpui::rgb(0x20_20_20).into()),
             PdfBgPref::Eye => Some(gpui::rgb(0xC7_ED_CC).into()),
             PdfBgPref::Parchment => Some(gpui::rgb(0xFB_F0_D9).into()),
-            PdfBgPref::Custom => self.pdf_bg_custom.as_deref().and_then(parse_hex_hsla),
+            PdfBgPref::Custom => m.pdf_bg_custom.as_deref().and_then(parse_hex_hsla),
         }
     }
 
@@ -61,12 +62,13 @@ impl EditorApp {
     /// 浅色档（护眼/羊皮纸/浅色自定义）只染纸面、内容直通（既有行为）。
     pub(super) fn pdf_canvas_recolor(&self) -> Option<pdf::RecolorParams> {
         let dark_ink = is_dark_bg;
-        match self.pdf_bg {
+        let m = self.model.borrow();
+        match m.pdf_bg {
             PdfBgPref::Default => None,
             PdfBgPref::Night => Some(pdf::RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some(DARK_INK) }),
             PdfBgPref::Eye => Some(pdf::RecolorParams { bg: [0xC7, 0xED, 0xCC], ink: None }),
             PdfBgPref::Parchment => Some(pdf::RecolorParams { bg: [0xFB, 0xF0, 0xD9], ink: None }),
-            PdfBgPref::Custom => self
+            PdfBgPref::Custom => m
                 .pdf_bg_custom
                 .as_deref()
                 .and_then(parse_hex_rgb)
@@ -99,7 +101,7 @@ impl EditorApp {
     /// 与 `refresh_theme_ui` 一致的窗口内作用域）。
     pub(super) fn apply_pdf_backgrounds(&self, cx: &mut Context<Self>) {
         let pdfs: Vec<gpui::Entity<pdf::PdfViewer>> = self
-            .tabs
+            .model.borrow().tabs
             .iter()
             .filter_map(|t| match &t.reader {
                 MediaReader::Pdf(pv) => Some(pv.clone()),
@@ -119,10 +121,12 @@ impl EditorApp {
         custom: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.pdf_bg = pref;
+        let mut m = self.model.borrow_mut();
+        m.pdf_bg = pref;
         if custom.is_some() {
-            self.pdf_bg_custom = custom;
+            m.pdf_bg_custom = custom;
         }
+        drop(m);
         self.apply_pdf_backgrounds(cx);
         self.persist_prefs();
         cx.notify();

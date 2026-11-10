@@ -8,7 +8,7 @@ use super::super::pdf_bookmarks; // Phase B3：PDF 书签存储模块（app 私�
 impl EditorApp {
     /// 折叠/展开某个目录父项（仅「有下级」的条目可折叠）。
     pub(crate) fn toggle_sidebar_toc_collapse(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let has_child = match self.tabs.get(self.active_tab) {
+        let has_child = match self.model.borrow().tabs.get(self.model.borrow().active_tab) {
             Some(tab) => match &tab.reader {
                 MediaReader::Pdf(pv) => {
                     let outlines = pv.read(cx).outlines().to_vec();
@@ -56,7 +56,8 @@ impl EditorApp {
 
     /// 计算当前激活文档目录所需的最大行宽（px）；无文档/无标题返回 `None`。
     fn compute_sidebar_toc_width(&self, cx: &gpui::App) -> Option<f32> {
-        let tab = self.tabs.get(self.active_tab)?;
+        let model = self.model.borrow();
+        let tab = model.tabs.get(model.active_tab)?;
         let font_px = 13.0f32;
         // 右侧页码列宽（PDF 书签有页码，Markdown 无）：预留以免标题被截断
         let page_col_w = 34.0f32;
@@ -123,7 +124,7 @@ impl EditorApp {
         let accent = ui::theme::Theme::global(cx).colors.accent.into();
 
         // 折叠状态按文档缓存：切换文档即清空，并重新按新文档内容自适应宽度
-        let active = self.active_tab;
+        let active = self.model.borrow().active_tab;
         if self.sidebar.toc_tab != Some(active) {
             self.sidebar.toc_tab = Some(active);
             self.sidebar.toc_collapsed.clear();
@@ -135,7 +136,8 @@ impl EditorApp {
         // 目录视图自适应宽：按当前文档最宽目录条目估算（未手动拖拽时）。
         // 按 (选项卡, 编辑版本, WyEditor 内容代号) 缓存：内容没变只算一次，禁逐帧 O(N) 全量测宽。
         if self.sidebar.width_auto {
-            let tab = self.tabs.get(active);
+            let model = self.model.borrow();
+            let tab = model.tabs.get(active);
             let ver = tab.map(|t| t.edit_version).unwrap_or(0);
             let cg = tab
                 .and_then(|t| t.md_wy.as_ref())
@@ -155,7 +157,7 @@ impl EditorApp {
             }
         }
 
-        let inner: gpui::AnyElement = match self.tabs.get(self.active_tab) {
+        let inner: gpui::AnyElement = match self.model.borrow().tabs.get(self.model.borrow().active_tab) {
             Some(tab) => {
                 let collapsed = self.sidebar.toc_collapsed.clone();
                 // PDF 书签目录 + Phase B3 「书签」区段（阅读位置书签：点击跳页、× 删除）
@@ -200,14 +202,15 @@ impl EditorApp {
                                 .into_any_element(),
                         );
                         let rows = self.sidebar_toc_bookmark_rows(
-                            window, &bm_path, bms, fg, muted, active_bg, accent, pdf.clone(), cx,
+                            window, &bm_path, &bms, fg, muted, active_bg, accent, pdf.clone(), cx,
                         );
                         blocks.push(div().flex().flex_col().pb_1().children(rows).into_any_element());
                     }
                     div().flex().flex_col().children(blocks).into_any_element()
                 } else {
                     // Markdown 标题（P4-2：MD / EPUB 目录都来自统一 WyEditor 宿主）。
-                    let tab = self.tabs.get(active);
+                    let model = self.model.borrow();
+                    let tab = model.tabs.get(active);
                     let ver = tab.map(|t| t.edit_version).unwrap_or(0);
                     let wy = tab.and_then(|t| t.md_wy.as_ref());
                     let cg = wy.map(|wy| wy.read(cx).content_gen()).unwrap_or(0);

@@ -13,7 +13,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let muted = self.text_minor();
-        let query = self.search_committed.clone();
+        let query = self.model.borrow().search_committed.clone();
         let search = self.search_state.clone();
         // Fluent 文本框：整圈细边框 + 内缩边距（背景随 chrome 保持透明）；
         // 聚焦时边框点亮为强调色。
@@ -171,8 +171,9 @@ impl EditorApp {
                 |this: &mut EditorApp, _ev, window, cx| {
                     // 未打开文件夹 → 「整个文件夹」不可用：仅提示，保持只搜当前文件。
                     if this.sidebar.files.root.is_none() {
-                        this.status = SharedString::from("先打开文件夹，再搜索整个文件夹");
-                        this.status_ok = false;
+                        this.model.borrow_mut().status =
+                            SharedString::from("先打开文件夹，再搜索整个文件夹");
+                        this.model.borrow_mut().status_ok = false;
                         cx.notify();
                         return;
                     }
@@ -209,8 +210,9 @@ impl EditorApp {
     /// 当前生效的搜索范围：用户手动选过 → 手动值；否则**有打开文件夹时默认
     /// 「整个文件夹」**，无文件夹回退「当前文件」（未打开文件夹时文件夹范围不可用）。
     pub(crate) fn effective_search_scope(&self) -> SearchScopeTab {
-        if self.search_scope_manual {
-            self.search_scope
+        let m = self.model.borrow();
+        if m.search_scope_manual {
+            m.search_scope
         } else if self.sidebar.files.root.is_some() {
             SearchScopeTab::Folder
         } else {
@@ -225,9 +227,9 @@ impl EditorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.search_scope_manual = true;
-        self.search_scope = scope;
-        self.search_scan = None; // 范围变化 → 当前文件扫描缓存也一并失效（下帧重建）
+        self.model.borrow_mut().search_scope_manual = true;
+        self.model.borrow_mut().search_scope = scope;
+        self.model.borrow_mut().search_scan = None; // 范围变化 → 当前文件扫描缓存也一并失效（下帧重建）
         cx.notify();
     }
 
@@ -247,16 +249,19 @@ impl EditorApp {
         // 查询按（标签, 词）键控、变化才推送（阅读器内部 250ms 防抖）；侧边栏只展示
         // 计数/页列表并驱动跳转。结果异步到达 → 经对应 PDF 选项卡的 `_pdf_sub` 订阅
         // 重绘本面板（多 PDF 并存各自独立订阅，见 `subscribe_pdf`）。
-        if let Some(MediaReader::Pdf(pdf)) =
-            self.tabs.get(self.active_tab).map(|t| t.reader.clone())
-        {
+        // 先取出 reader（owned 克隆）再 `if let`，避免 `if let` 掮获 `borrow()` 临时
+        // Ref 跨过块内 `&mut self` / `borrow_mut`（E0502 / 借用纪律收窄）。
+        let reader =
+            self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.reader.clone());
+        if let Some(MediaReader::Pdf(pdf)) = reader {
             let push = self
-                .pdf_search
+                .model.borrow().pdf_search
                 .as_ref()
-                .map(|(ti, q0)| *ti != self.active_tab || q0 != q)
+                .map(|(ti, q0)| *ti != self.model.borrow().active_tab || q0 != q)
                 .unwrap_or(true);
             if push {
-                self.pdf_search = Some((self.active_tab, q.to_string()));
+                let active = self.model.borrow().active_tab;
+                self.model.borrow_mut().pdf_search = Some((active, q.to_string()));
                 let qo = q.to_string();
                 pdf.update(cx, |v, cx| v.set_search(&qo, cx));
             }
@@ -534,14 +539,14 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> Option<Rc<FolderSearchScan>> {
         let root = self.sidebar.files.root.clone()?;
-        if let Some(s) = &self.folder_search
+        if let Some(s) = &self.model.borrow().folder_search
             && s.query == q
             && s.root.as_deref() == Some(root.as_path())
         {
             return Some(s.clone());
         }
         self.start_folder_scan(root, q, window, cx);
-        self.folder_search.clone()
+        self.model.borrow().folder_search.clone()
     }
 
     /// 发起一把文件夹级后台扫描：**不在主线程同步扫整棵**——生产者（后台线程）递归
@@ -555,9 +560,9 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let generation = self.folder_search_gen.wrapping_add(1);
-        self.folder_search_gen = generation;
-        self.folder_search = Some(Rc::new(FolderSearchScan {
+        let generation = self.model.borrow().folder_search_gen.wrapping_add(1);
+        self.model.borrow_mut().folder_search_gen = generation;
+        self.model.borrow_mut().folder_search = Some(Rc::new(FolderSearchScan {
             query: q.to_string(),
             root: Some(root.clone()),
             files: Vec::new(),
@@ -600,14 +605,17 @@ impl EditorApp {
                 while let Some(update) = rx.next().await {
                     let scan_gen = generation;
                     let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
-                        let Some(existing) = this.folder_search.as_ref() else {
+                        // SC-3：先提纯 owned Rc 再 let-else，避免 `if let` 掮获的 Ref 临时
+                        // 存活整个分支体（块内 `borrow_mut` 运行期双借 panic）。
+                        let folder_search = this.model.borrow().folder_search.clone();
+                        let Some(existing) = folder_search else {
                             return;
                         };
                         if existing.generation != scan_gen {
                             return; // 已被更新的查询/换根取代 → 丢弃旧代结果
                         }
                         // 逐块增量：基于当前状态克隆应用增量后放回（Rc 共享读、写时替换）。
-                        let mut next = (**existing).clone();
+                        let mut next = existing.as_ref().clone();
                         match update {
                             FolderScanUpdate::File(f) => {
                                 next.total_hits += f.hits.len();
@@ -618,7 +626,7 @@ impl EditorApp {
                                 next.running = false;
                             }
                         }
-                        this.folder_search = Some(Rc::new(next));
+                        this.model.borrow_mut().folder_search = Some(Rc::new(next));
                         cx.notify();
                     });
                 }
@@ -639,13 +647,14 @@ impl EditorApp {
     ) {
         // 错误分类：命中路径在点击时已失效（文件被删除/改名）→ 不打开并提示。
         if !path.is_file() {
-            self.status = SharedString::from(format!("命中文件已不存在：{}", path.display()));
-            self.status_ok = false;
+            self.model.borrow_mut().status =
+                SharedString::from(format!("命中文件已不存在：{}", path.display()));
+            self.model.borrow_mut().status_ok = false;
             cx.notify();
             return;
         }
         self.open_path_or_activate(path, window, cx);
-        let Some(ti) = self.tabs.iter().position(|t| t.file_path.as_deref() == Some(path))
+        let Some(ti) = self.model.borrow().tabs.iter().position(|t| t.file_path.as_deref() == Some(path))
         else {
             return;
         };
@@ -664,7 +673,8 @@ impl EditorApp {
         q_owned: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.tabs.get(ti) else {
+        let model = self.model.borrow();
+        let Some(tab) = model.tabs.get(ti) else {
             return;
         };
         if tab.readonly_preview {
@@ -704,13 +714,13 @@ impl EditorApp {
     ) -> Vec<gpui::AnyElement> {
         let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
         for ti in scan.file_tabs.iter().copied() {
-            let name = self.tabs[ti]
+            let name = self.model.borrow().tabs[ti]
                 .file_path
                 .as_ref()
                 .and_then(|p| p.file_name())
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "未命名".to_string());
-            let row_fg = if ti == self.active_tab { fg } else { muted };
+            let row_fg = if ti == self.model.borrow().active_tab { fg } else { muted };
             let nm = name;
             // P2-10：hover 状态跨帧记录 → 行背景淡入。
             let hover = window.use_keyed_state(format!("ss-file-{ti}-hover"), cx, |_, _| false);
@@ -769,7 +779,7 @@ impl EditorApp {
         active_bg: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
-        let ti = self.active_tab;
+        let ti = self.model.borrow().active_tab;
         let mut line_rows: Vec<gpui::AnyElement> = Vec::new();
         for hit in &scan.line_hits {
             let li = hit.line;
@@ -1066,18 +1076,20 @@ impl EditorApp {
     /// 期满且无新输入才把 `search_pending` 提交为 `search_committed` 并通知（触发一次
     /// 扫描）。连续输入（间隔 < 防抖窗）时扫描零触发——大文档不再每键全量重扫正文。
     pub(crate) fn schedule_search_debounce(&mut self, value: String, cx: &mut Context<Self>) {
-        self.search_pending = normalize_search_query(&value);
+        self.model.borrow_mut().search_pending = normalize_search_query(&value);
         cx.notify();
         let weak = cx.weak_entity();
-        self.search_debounce.after(
+        self.model.borrow().search_debounce.after(
             cx,
             std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS),
             move |app| {
                 let _ = weak.update(app, |this, cx| {
                     // 期间有新输入 → 代序已前进，本定时器作废（防抖可重入）。
-                    let pending = std::mem::take(&mut this.search_pending);
-                    if this.search_committed != pending {
-                        this.search_committed = pending;
+                    // SC-3：先提纯 owned 再比较（if 条件里的 borrow 临时 Ref 存活整分支）。
+                    let pending = std::mem::take(&mut this.model.borrow_mut().search_pending);
+                    let search_committed = this.model.borrow().search_committed.clone();
+                    if search_committed != pending {
+                        this.model.borrow_mut().search_committed = pending;
                         cx.notify();
                     }
                 });
@@ -1093,16 +1105,19 @@ impl EditorApp {
     /// （memmem 快路径，零逐行分配）；非 ASCII 查询词回退 [`find_ci`] 字符级折叠扫描。
     /// 结果在 [`EditorApp::search_scan`] 缓存，编辑/加载/切文档时清空重扫。
     fn sidebar_search_scan(&mut self, q: &str, cx: &App) -> Rc<SidebarSearchScan> {
-        if let Some(s) = &self.search_scan
-            && s.tab == self.active_tab && s.query == q {
-                return s.clone();
+        // SC-3：先提纯 owned Rc 再 if-let（`search_scan` 迁入模型后，if-let 掮获的 Ref
+        // 临时会跨过 `borrow_mut` 判定，运行期双借 panic）。
+        let scan = self.model.borrow().search_scan.clone();
+        if let Some(s) = scan
+            && s.tab == self.model.borrow().active_tab && s.query == q {
+                return s;
             }
-        self.search_scan_count += 1;
+        self.model.borrow_mut().search_scan_count += 1;
 
         let mut file_tabs: Vec<usize> = Vec::new();
         let mut line_hits: Vec<SearchLineHit> = Vec::new();
         // 文件名匹配（跨所有打开文件）
-        for (ti, tab) in self.tabs.iter().enumerate() {
+        for (ti, tab) in self.model.borrow().tabs.iter().enumerate() {
             if file_tabs.len() + line_hits.len() >= SEARCH_RESULT_CAP {
                 break;
             }
@@ -1120,7 +1135,7 @@ impl EditorApp {
         // 一次物化）。文件名已占的配额扣掉后，剩余额度交给行内容扫描（共用 CAP）。
         let remaining = SEARCH_RESULT_CAP.saturating_sub(file_tabs.len());
         if remaining > 0
-            && let Some(tab) = self.tabs.get(self.active_tab) {
+            && let Some(tab) = self.model.borrow().tabs.get(self.model.borrow().active_tab) {
                 if tab.readonly_preview {
                     // 只读预览：直接借内容镜像（零物化；打开时已 LF 归一化）。
                     scan_line_hits(tab.content.as_ref(), q, remaining, &mut line_hits);
@@ -1139,11 +1154,11 @@ impl EditorApp {
 
         let scan = std::rc::Rc::new(SidebarSearchScan {
             query: q.to_string(),
-            tab: self.active_tab,
+            tab: self.model.borrow().active_tab,
             file_tabs,
             line_hits,
         });
-        self.search_scan = Some(scan.clone());
+        self.model.borrow_mut().search_scan = Some(scan.clone());
         scan
     }
 }

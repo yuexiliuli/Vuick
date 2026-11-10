@@ -77,7 +77,7 @@
         let _ = root;
         let app = holder.borrow().clone().unwrap();
         assert!(
-            cx.update(|_w, cx| app.read(cx).tabs.is_empty()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.is_empty()),
             "零选项卡助手应保持零 tab"
         );
         (app, cx)

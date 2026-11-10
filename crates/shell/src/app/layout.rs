@@ -11,7 +11,7 @@ impl Render for EditorApp {
         // 两套都挂 `toggle_music_player`（同一 listener 两处挂载，命中任一即可切关）。
         // 返回 `AnyElement`：与下方 render_root 的 opaque 返回统一成同一具体类型
         //（`impl IntoElement` 的所有返回路径必须是同一类型）。
-        if self.music_mode {
+        if self.model.borrow().music_mode {
             if let Some(mv) = &self.music {
                 return div()
                     .id("music-root-shell")
@@ -22,7 +22,7 @@ impl Render for EditorApp {
                     .into_any_element();
             }
             // 兜底：视图缺失（异常销毁）→ 退出音乐模式，走正常编辑器界面。
-            self.music_mode = false;
+            self.model.borrow_mut().music_mode = false;
         }
         // WY_TRACE 归因：操作（按键/滚动）起点 → 本帧 render 开始的等待，单独记账
         // 供「每键真实延迟」拆账——多为 60Hz vsync/帧调度，不是 CPU 段。
@@ -54,7 +54,7 @@ impl EditorApp {
         // 新模型：欢迎页只在「零选项卡」时呈现。只要有 ≥1 个选项卡——哪怕新建出的
         // 空白未命名文档——就直接渲染编辑区（可键入），绝不叠欢迎页（原 `is_empty_body`
         // 把「未命名空文档」也算空态的语义已被模型 3 取代：有 tab 即不显示欢迎页）。
-        if self.tabs.is_empty() {
+        if self.model.borrow().tabs.is_empty() {
             return Self::pane_wrap(
                 Some("app-empty-body"),
                 Some("app-empty-body"),
@@ -63,8 +63,8 @@ impl EditorApp {
             );
         }
         let live_edit = self
-            .tabs
-            .get(self.active_tab)
+            .model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .map(|t| t.live_edit)
             .unwrap_or(false);
         if live_edit {
@@ -80,8 +80,8 @@ impl EditorApp {
             let ratio = self.split_ratio;
             // EPUB 等全屏预览：预览区占满整个内容区，不显示编辑区与分割线。
             let fullscreen = self
-                .tabs
-                .get(self.active_tab)
+                .model.borrow().tabs
+                .get(self.model.borrow().active_tab)
                 .map(|t| t.preview_fullscreen)
                 .unwrap_or(false);
             if fullscreen {
@@ -326,12 +326,12 @@ impl EditorApp {
                 |this: &mut EditorApp, ev: &DragMoveEvent<TabDragData>, window, cx| {
                     let idx = ev.drag(cx).idx; // 拷贝下标，避免持有对 cx 的借用
                     // 已拔出（松开后源窗口不再有该选项卡）→ 忽略后续移动
-                    if idx >= this.tabs.len() {
+                    if idx >= this.model.borrow().tabs.len() {
                         return;
                     }
                     // 真实选项卡 laid-out 尺寸（TabBoundsRecorder 每帧写入），供预览定宽。
                     let drag_size = ev.drag(cx).size.clone();
-                    this.tab_dragging = Some(idx);
+                    this.model.borrow_mut().tab_dragging = Some(idx);
                     let pos = ev.event.position;
                     let inside = gpui::Bounds::new(gpui::Point::default(), window.bounds().size)
                         .contains(&pos);
@@ -339,17 +339,18 @@ impl EditorApp {
                     // 幽灵窗显示：光标越出窗口、或窗内拖拽 picture 将要被窗口边缘遮断
                     // （含 4px 余量，见 tab_drag::drag_picture_about_to_clip）——贴边即提前
                     // 切同位置同尺寸完整版；远离边缘时窗内无浮窗、无蓝块（幽灵窗隐藏）。
-                    this.drag_outside_armed = !inside;
+                    this.model.borrow_mut().drag_outside_armed = !inside;
                     // 栏内排序插入位：以**被拖选项卡 picture 盒的边缘**是否进入选项卡行为准
                     // （不再要求鼠标光标在行内）——盒上/下任一边碰到行即激活白线；插入下标
                     // 按光标 x 判定。拖出窗口 / 盒未入行 → None（不排序 / 拆窗）。
-                    let grab = this.tab_drag_grab.unwrap_or(gpui::Point::default());
+                    let grab = this.model.borrow().tab_drag_grab.unwrap_or(gpui::Point::default());
                     let drag_bounds = gpui::Bounds::new(pos - grab, drag_size.get());
-                    this.tab_reorder_target = if inside && this.tab_drag_over_row(drag_bounds) {
-                        this.tab_insert_index(pos.x)
-                    } else {
-                        None
-                    };
+                    this.model.borrow_mut().tab_reorder_target =
+                        if inside && this.tab_drag_over_row(drag_bounds) {
+                            this.tab_insert_index(pos.x)
+                        } else {
+                            None
+                        };
                     this.update_drag_ghost(idx, drag_size, pos, !inside, window, cx);
                     cx.notify();
                 },
@@ -359,15 +360,19 @@ impl EditorApp {
                 cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
                     // 窗口内松开：若本次拖拽落在选项卡行内的插入位 → 落地排序；
                     // 无插入位 = 原位保留。无论与否都撤预位、销毁幽灵窗。
-                    if let Some(from) = this.tab_dragging {
-                        if let Some(target) = this.tab_reorder_target.take() {
+                    // SC-3：先提纯 owned 再分支——避免 `if let` 掮获的 Ref/RefMut 临时
+                    // 存活整个分支体（运行期双借 panic / E0502 拦 &mut self 方法）。
+                    let dragging = this.model.borrow().tab_dragging;
+                    if let Some(from) = dragging {
+                        let reorder_target = this.model.borrow_mut().tab_reorder_target.take();
+                        if let Some(target) = reorder_target {
                             this.reorder_tab(from, target, cx);
                         }
-                        this.drag_outside_armed = false;
+                        this.model.borrow_mut().drag_outside_armed = false;
                         this.destroy_drag_ghost(cx);
                     }
-                    this.tab_dragging = None;
-                    this.tab_reorder_target = None;
+                    this.model.borrow_mut().tab_dragging = None;
+                    this.model.borrow_mut().tab_reorder_target = None;
                     cx.notify();
                 }),
             )
@@ -375,7 +380,7 @@ impl EditorApp {
                 MouseButton::Left,
                 cx.listener(|this: &mut EditorApp, ev: &gpui::MouseUpEvent, window, cx| {
                     // 窗口外松开 = 拆窗/还原路径，插入位不落地。
-                    this.tab_reorder_target = None;
+                    this.model.borrow_mut().tab_reorder_target = None;
                     this.release_tab_drag_outside(window, ev.position, cx);
                 }),
             )
@@ -412,12 +417,13 @@ impl EditorApp {
             )
             .on_action(
                 cx.listener(|this: &mut EditorApp, _: &CloseTab, window, cx| {
-                    this.close_tab(this.active_tab, window, cx);
+                    let active_idx = this.model.borrow().active_tab;
+                    this.close_tab(active_idx, window, cx);
                 }),
             )
             .on_action(
                 cx.listener(|this: &mut EditorApp, _: &TogglePreview, window, cx| {
-                    let idx = this.active_tab;
+                    let idx = this.model.borrow().active_tab;
                     this.toggle_preview_for_tab(idx, window, cx);
                 }),
             )

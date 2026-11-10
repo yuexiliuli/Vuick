@@ -51,7 +51,7 @@ async fn goto_line_dispatches_to_active_editor(cx: &mut TestAppContext) {
     }
     let (open, focused) = cx.update(|window, cx| {
         let a = app.read(cx);
-        let ed = a.tabs[a.active_tab].editor.read(cx);
+        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
         let input_focused = ed
             .test_goto_input()
             .map(|i| {
@@ -66,7 +66,7 @@ async fn goto_line_dispatches_to_active_editor(cx: &mut TestAppContext) {
 
     // 输入 42 + Enter → 立即跳到第 42 行（0 基 41）、卡片保持打开。
     cx.update(|window, cx| {
-        let ed = app.read(cx).tabs[app.read(cx).active_tab]
+        let ed = app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
             .editor
             .clone();
         let input = ed.read(cx).test_goto_input().cloned().unwrap();
@@ -81,7 +81,7 @@ async fn goto_line_dispatches_to_active_editor(cx: &mut TestAppContext) {
     }
     let (pos, open2) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let ed = a.tabs[a.active_tab].editor.read(cx);
+        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
         (ed.cursor_position(), ed.test_goto_state().0)
     });
     assert_eq!(pos, (41, 0), "Enter 应跳到第 42 行");
@@ -107,7 +107,8 @@ async fn goto_line_non_text_tab_toasts(cx: &mut TestAppContext) {
             let viewer = cx.new(|cx| {
                 image_viewer::ImageViewer::new(std::path::PathBuf::from("___"), cx)
             });
-            app.tabs[app.active_tab].reader = MediaReader::Image(viewer);
+            let idx = app.model.borrow().active_tab;
+            app.model.borrow_mut().tabs[idx].reader = MediaReader::Image(viewer);
         });
     });
     for _ in 0..3 {
@@ -125,7 +126,7 @@ async fn goto_line_non_text_tab_toasts(cx: &mut TestAppContext) {
     }
     let (open, toast) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let ed = a.tabs[a.active_tab].editor.read(cx);
+        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
         (
             ed.test_goto_state().0,
             a.notifications

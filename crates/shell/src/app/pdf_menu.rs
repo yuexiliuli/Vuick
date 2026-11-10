@@ -29,7 +29,7 @@ fn pdf_bg_preset_item(
 ) -> PopupMenuItem {
     let app2 = app.clone();
     PopupMenuItem::element(move |_, cx| {
-        let checked = app.read(cx).pdf_bg == pref;
+        let checked = app.read(cx).model.borrow().pdf_bg == pref;
         div()
             .flex()
             .items_center()
@@ -50,7 +50,7 @@ fn pdf_bg_preset_item(
 fn pdf_bg_custom_item(app: gpui::Entity<EditorApp>) -> PopupMenuItem {
     let app2 = app.clone();
     PopupMenuItem::element(move |_, cx| {
-        let checked = app.read(cx).pdf_bg == config::user::PdfBgPref::Custom;
+        let checked = app.read(cx).model.borrow().pdf_bg == config::user::PdfBgPref::Custom;
         div()
             .flex()
             .items_center()
@@ -104,7 +104,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pdf = match self.tabs.get(self.active_tab).map(|t| t.reader.clone()) {
+        let pdf = match self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.reader.clone()) {
             Some(MediaReader::Pdf(pv)) => pv,
             _ => return,
         };
@@ -297,8 +297,8 @@ impl EditorApp {
         _cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let still_pdf = self
-            .tabs
-            .get(self.active_tab)
+            .model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .map(|t| matches!(t.reader, MediaReader::Pdf(_)))
             .unwrap_or(false);
         if !still_pdf {
@@ -535,13 +535,17 @@ impl EditorApp {
     /// 由 None → Some 才算「变化」，同一错误不重复提示）。
     pub(crate) fn pdf_notify_last_error(&mut self, pdf: &gpui::Entity<pdf::PdfViewer>, cx: &mut Context<Self>) {
         let err = pdf.read(cx).last_modify_error().map(|s| s.to_string());
+        // SC-3：先提纯 owned 再 match（match 分支守卫里的 borrow 临时 Ref 存活整个
+        // 分支体 → 块内 borrow_mut 运行期双借 panic）。
+        let seen = self.model.borrow().pdf_last_error_seen.clone();
+        let changed = err.as_ref().is_some_and(|e| seen.as_deref() != Some(e.as_str()));
         match err {
-            Some(e) if self.pdf_last_error_seen.as_deref() != Some(e.as_str()) => {
-                self.pdf_last_error_seen = Some(e.clone());
+            Some(e) if changed => {
+                self.model.borrow_mut().pdf_last_error_seen = Some(e.clone());
                 self.pdf_toast("PDF 操作失败", pdf_modify_error_msg(&e));
             }
             Some(_) => {}
-            None => self.pdf_last_error_seen = None,
+            None => self.model.borrow_mut().pdf_last_error_seen = None,
         }
     }
 }

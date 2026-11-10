@@ -3,7 +3,7 @@
 //! 收敛背景：同一批命令此前在 `app::menu`（菜单 label+快捷键）、`app::palette`
 //! （命令面板 label+快捷键）、`src/main.rs`（根级键位键串）三处手写，改一个快捷键
 //! 要动三处。本轮把 **label + 快捷键展示串 + 根级键位串**收敛为本表：
-//! - 菜单（[`app::menu`]）与命令面板（[`app::palette`]）直接引用本表常量的
+//! - 宿主 shell 的菜单（`app::menu`）与命令面板（`app::palette`）直接引用本表常量的
 //!   [`Command::menu_label`] / [`Command::label`] 与 [`Command::shortcut`]；
 //! - 根级键位（`src/main.rs`）由 [`root_keybindings`] 从本表键串推导（取代手写键串）。
 //!

@@ -34,50 +34,69 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let tab = self.tabs.get(self.active_tab);
-        let (line_count, char_count) = tab.map(|t| (t.line_count, t.char_count)).unwrap_or((0, 0));
-        let dirty = tab.map(|t| t.dirty).unwrap_or(false);
-        let language = self.language_label().to_string();
+        // 借用纪律（SC-5）：一次 borrow 取出激活选项卡的全部廉价字段（Scalar/String/实体引用
+        // 读数）即释放 guard——杜绝「长借用 model.borrow() 构造子元素」后子元素继续借用的
+        // 隐患；后续 `status_bar_left/right` 等自身再 borrow，互不嵌套。
+        let (line_count, char_count, dirty, language, preview_on, readonly_preview, fullscreen, wrap_on, is_markdown, epub_page, pdf_page, cursor_pos) = {
+            let model = self.model.borrow();
+            let tab = model.tabs.get(model.active_tab);
+            let (line_count, char_count) =
+                tab.map(|t| (t.line_count, t.char_count)).unwrap_or((0, 0));
+            let dirty = tab.map(|t| t.dirty).unwrap_or(false);
+            let language = self.language_label().to_string();
+            // 右侧条件沿用既有判定：
+            // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。
+            let preview_on = tab.map(|t| t.preview_on).unwrap_or(false);
+            let readonly_preview = tab.map(|t| t.readonly_preview).unwrap_or(false);
+            let fullscreen = tab.map(|t| t.preview_fullscreen).unwrap_or(false);
+            // P4-2：预览统一 WyEditor（页面恒换行，`MarkdownPreview::is_wrap` 已删）；
+            // 「换行」按钮显示 = 有统一 WyEditor 预览在场。
+            let wrap_on = tab.map(|t| t.md_wy.is_some()).unwrap_or(false);
+            let is_markdown = tab
+                .and_then(|t| t.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
+                .unwrap_or(false);
+            // 中间区数据源（派生自激活选项卡，无新状态）：只读预览页码 / PDF 页码 / 光标行列。
+            let epub_page = tab.map(|_| self.epub_page_bounds(window, cx)).unwrap_or(None);
+            let pdf_page = tab.and_then(|t| match &t.reader {
+                MediaReader::Pdf(pv) => {
+                    let v = pv.read(cx);
+                    v.current_page()
+                        .map(|(page, total)| (page, total, v.zoom_factor()))
+                }
+                _ => None,
+            });
+            let cursor_pos = tab.and_then(|t| {
+                // 只读预览（EPUB/PDF/图片/视频）编辑区为空，无光标位置可示（EPUB 的
+                // `char_count` 是书目正文统计，不能当「有编辑内容」）。
+                if t.readonly_preview {
+                    return None;
+                }
+                // 「有编辑内容」以字符数为准（空文档 line_count 恒为 1 行空行，不能当内容）。
+                if t.char_count > 0 || t.cursor_row != 0 || t.cursor_col != 0 {
+                    Some((t.cursor_row + 1, t.cursor_col + 1))
+                } else {
+                    None
+                }
+            });
+            (
+                line_count,
+                char_count,
+                dirty,
+                language,
+                preview_on,
+                readonly_preview,
+                fullscreen,
+                wrap_on,
+                is_markdown,
+                epub_page,
+                pdf_page,
+                cursor_pos,
+            )
+        };
         let bar_border = self.bar_border();
-
-        // 右侧条件沿用既有判定：
-        // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。
-        let preview_on = tab.map(|t| t.preview_on).unwrap_or(false);
-        let readonly_preview = tab.map(|t| t.readonly_preview).unwrap_or(false);
-        let fullscreen = tab.map(|t| t.preview_fullscreen).unwrap_or(false);
-        // P4-2：预览统一 WyEditor（页面恒换行，`MarkdownPreview::is_wrap` 已删）；
-        // 「换行」按钮显示 = 有统一 WyEditor 预览在场。
-        let wrap_on = tab.map(|t| t.md_wy.is_some()).unwrap_or(false);
-        let is_markdown = tab
-            .and_then(|t| t.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
-            .unwrap_or(false);
 
         // 左侧区：语言徽标 + 文件名
         let left = self.status_bar_left(dirty, language, window, cx);
-
-        // 中间区数据源（派生自激活选项卡，无新状态）：只读预览页码 / PDF 页码 / 光标行列。
-        let epub_page = tab.map(|_| self.epub_page_bounds(window, cx)).unwrap_or(None);
-        let pdf_page = tab.and_then(|t| match &t.reader {
-            MediaReader::Pdf(pv) => {
-                let v = pv.read(cx);
-                v.current_page()
-                    .map(|(page, total)| (page, total, v.zoom_factor()))
-            }
-            _ => None,
-        });
-        let cursor_pos = tab.and_then(|t| {
-            // 只读预览（EPUB/PDF/图片/视频）编辑区为空，无光标位置可示（EPUB 的
-            // `char_count` 是书目正文统计，不能当「有编辑内容」）。
-            if t.readonly_preview {
-                return None;
-            }
-            // 「有编辑内容」以字符数为准（空文档 line_count 恒为 1 行空行，不能当内容）。
-            if t.char_count > 0 || t.cursor_row != 0 || t.cursor_col != 0 {
-                Some((t.cursor_row + 1, t.cursor_col + 1))
-            } else {
-                None
-            }
-        });
         let middle = self.status_bar_middle(epub_page, pdf_page, cursor_pos);
 
         let mut root = div()
@@ -134,8 +153,8 @@ impl EditorApp {
         let file_name = self.file_display_name();
         // P2-9 tooltip：文件名悬停后展示完整路径（路径提示）。
         let path_hint = self
-            .tabs
-            .get(self.active_tab)
+            .model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .and_then(|t| t.file_path.as_ref())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -240,7 +259,7 @@ impl EditorApp {
     /// 语言徽标 pill：圆角小底（`pill_*` 令牌）+ 前端「徽记色点」
     /// （`ui::theme::language_badge_color`，VS Code 式按语言类别着色）。
     fn status_language_badge(&self, language: &str) -> gpui::Div {
-        let dot = ui::theme::language_badge_color(language, self.dark_mode);
+        let dot = ui::theme::language_badge_color(language, self.model.borrow().dark_mode);
         let owned = "status-language-badge".to_string();
         div()
             .debug_selector(move || owned.clone())
@@ -328,7 +347,7 @@ impl EditorApp {
             right = right.child(self.status_item("status-mode-readonly", "只读", chip_text));
         }
         // 主题三态：跟随系统主题 / 浅色 / 深色。
-        let theme_label = match self.theme_pref {
+        let theme_label = match self.model.borrow().theme_pref {
             config::user::ThemePref::Follow => "跟随系统主题",
             config::user::ThemePref::Light => "浅色",
             config::user::ThemePref::Dark => "深色",
@@ -370,7 +389,7 @@ impl EditorApp {
 
         // 音乐指示（编辑器模式且 MusicView 存在、当前有曲目时）：♪ 歌名 + 播放/暂停符号，
         // 点击切 播放/暂停（不切音乐模式）。
-        if !self.music_mode {
+        if !self.model.borrow().music_mode {
             let music_hint = self.music.as_ref().map(|mv| {
                 let pl = mv.read(cx).player.read(cx);
                 (

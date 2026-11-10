@@ -367,7 +367,7 @@
         // 切深色再断言（真主题切换路径 `refresh_theme_ui`，不写盘用户偏好）。
         cx.update(|_w, cx| {
             app.update(cx, |a, cx| {
-                a.dark_mode = true;
+                a.model.borrow_mut().dark_mode = true;
                 a.refresh_theme_ui(cx);
                 cx.notify();
             });
@@ -381,7 +381,7 @@
         // 再切回浅色（还原现场，避免污染后续测试的 theme 全局态）。
         cx.update(|_w, cx| {
             app.update(cx, |a, cx| {
-                a.dark_mode = false;
+                a.model.borrow_mut().dark_mode = false;
                 a.refresh_theme_ui(cx);
                 cx.notify();
             });
@@ -431,7 +431,7 @@
         }
         let vhand = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_wy_vscroll.clone()
+            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy_vscroll.clone()
         });
         let before = cx.update(|_w, _cx| (-vhand.offset().y).as_f32());
         assert_eq!(before, 0.0, "初始预览滚动在顶部");
@@ -572,7 +572,7 @@
         // 带内条目点击 → 右栏 WyEditor 预览滚动到对应标题（虚拟化带宽内命中可用）。
         let vhand_wy = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_wy_vscroll.clone()
+            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy_vscroll.clone()
         });
         let before = cx.update(|_w, _cx| (-vhand_wy.offset().y).as_f32());
         let row = cx
@@ -872,7 +872,7 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        let ti = cx.update(|_w, cx| app.read(cx).active_tab);
+        let ti = cx.update(|_w, cx| app.read(cx).model.borrow().active_tab);
 
         // 打开搜索面板（查询为空）：空查询不做扫描
         cx.update(|_window, cx| {
@@ -884,7 +884,7 @@
             cx.run_until_parked();
             let _ = cx.cx.refresh();
         }
-        let before = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        let before = cx.update(|_w, cx| app.read(cx).model.borrow().search_scan_count);
         assert_eq!(before, 0, "查询为空时不应扫描");
 
         // 第一次键入「shanghai」：防抖期内（<150ms）不扫描、不提交
@@ -896,7 +896,7 @@
             cx.run_until_parked();
             let _ = cx.cx.refresh();
         }
-        let debounced = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        let debounced = cx.update(|_w, cx| app.read(cx).model.borrow().search_scan_count);
         assert_eq!(debounced, before, "防抖期内不应执行扫描");
 
         // 时钟推进越过防抖 → 提交并扫描 1 次，命中第 1 行
@@ -908,10 +908,10 @@
             let _ = cx.cx.refresh();
         }
         cx.run_until_parked();
-        let after = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        let after = cx.update(|_w, cx| app.read(cx).model.borrow().search_scan_count);
         assert_eq!(after, before + 1, "防抖期满后应精确扫描 1 次");
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).search_committed.clone()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().search_committed.clone()),
             "shanghai",
             "防抖提交词应等于最终输入（归一化）"
         );
@@ -927,7 +927,7 @@
             let _ = cx.cx.refresh();
         }
         cx.run_until_parked();
-        let steady = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        let steady = cx.update(|_w, cx| app.read(cx).model.borrow().search_scan_count);
         assert_eq!(steady, after, "查询未变时重复渲染不应重扫");
 
         // 换查询「beta」→ 防抖后扫描一次，命中第 2 行
@@ -943,7 +943,7 @@
             let _ = cx.cx.refresh();
         }
         cx.run_until_parked();
-        let changed = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        let changed = cx.update(|_w, cx| app.read(cx).model.borrow().search_scan_count);
         assert_eq!(changed, steady + 1, "查询变化应再扫描一次");
         let hit_row2 = Box::leak(format!("sidebar-search-line-{ti}-2").into_boxed_str());
         assert!(
@@ -994,7 +994,7 @@
                 cx.run_until_parked();
             }
         }
-        let during = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        let during = cx.update(|_w, cx| app.read(cx).model.borrow().search_scan_count);
         assert_eq!(during, 0, "防抖窗外仅 20ms/键 → 全程零扫描");
 
         // 最后停顿超过防抖 → 只提交最终词，恰好扫描 1 次
@@ -1006,9 +1006,9 @@
             let _ = cx.cx.refresh();
         }
         cx.run_until_parked();
-        let committed = cx.update(|_w, cx| app.read(cx).search_committed.clone());
+        let committed = cx.update(|_w, cx| app.read(cx).model.borrow().search_committed.clone());
         assert_eq!(committed, "预览编辑", "防抖应提交最终输入词");
-        let scans = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        let scans = cx.update(|_w, cx| app.read(cx).model.borrow().search_scan_count);
         assert_eq!(scans, 1, "6 键快速输入应只扫描 1 次（最终词）");
         let _ = std::fs::remove_file(&txt);
     }
@@ -1063,7 +1063,7 @@
         cx.executor()
             .advance_clock(std::time::Duration::from_millis(200));
         cx.run_until_parked();
-        let committed = cx.update(|_w, cx| app.read(cx).search_committed.clone());
+        let committed = cx.update(|_w, cx| app.read(cx).model.borrow().search_committed.clone());
         assert_eq!(committed, "编辑", "防抖提交的扫描词应是干净中文而非拼音拼接");
     }
 
@@ -1113,7 +1113,7 @@
         let calls = cx.update(|_w, cx| app.read(cx).open_dialog_calls);
         assert_eq!(calls, 1, "点击「打开文件…」应触发一次 open_dialog");
         assert!(
-            cx.update(|_w, cx| app.read(cx).tabs.is_empty()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.is_empty()),
             "点「打开文件…」只弹系统对话框、不应新建选项卡"
         );
     }
@@ -1174,7 +1174,7 @@
         cx.simulate_click(btn.center(), Default::default());
         settle_frames(cx, 5);
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             1,
             "点「新建文件」应新建 1 个选项卡"
         );
@@ -1188,15 +1188,15 @@
         );
         // 焦点应落在新编辑区（开箱即输入）。
         let focused = cx.update(|window, cx| {
-            app.read(cx).tabs[0].editor.read(cx).focus_handle().is_focused(window)
+            app.read(cx).model.borrow().tabs[0].editor.read(cx).focus_handle().is_focused(window)
         });
         assert!(focused, "新建后编辑区应获得焦点");
         // 直接键入（真实键入路径）→ 内容写入且欢迎页不回来。
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.clone());
         cx.update(|_, cx| editor.update(cx, |ed, cx| ed.insert_text("hi", cx)));
         settle_frames(cx, 3);
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs[0].editor.read(cx).value().to_string()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.read(cx).value().to_string()),
             "hi",
             "新建选项卡应可直接键入"
         );
@@ -1219,7 +1219,7 @@
         simulate_double_click(cx, gpui::Point::new(px(400.), px(200.)));
         settle_frames(cx, 5);
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             1,
             "双击欢迎页应新建 1 个选项卡"
         );
@@ -1245,7 +1245,7 @@
         cx.simulate_prompt_answer("不保存");
         settle_frames(cx, 5);
         assert!(
-            cx.update(|_w, cx| app.read(cx).tabs.is_empty()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.is_empty()),
             "关闭最后一个选项卡后应零 tab"
         );
         assert!(cx.debug_bounds("empty-state").is_some(), "应回到欢迎页");
@@ -1260,11 +1260,11 @@
         let (app, cx) = add_app(cx); // 1 个空未命名选项卡
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         settle_frames(cx, 5);
-        assert_eq!(cx.update(|_w, cx| app.read(cx).tabs.len()), 1, "预建 1 个空未命名选项卡");
+        assert_eq!(cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()), 1, "预建 1 个空未命名选项卡");
         assert!(cx.debug_bounds("editor-area").is_some(), "空未命名 tab 也直接渲染编辑区");
         assert!(cx.debug_bounds("empty-state").is_none(), "有 tab（哪怕空未命名）就不显示欢迎页");
         // 键入后依旧不显示欢迎页（新模型没有「欢迎页盖在有内容上」的路径）。
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.clone());
         cx.update(|_, cx| editor.update(cx, |ed, cx| ed.insert_text("x", cx)));
         settle_frames(cx, 3);
         assert!(cx.debug_bounds("empty-state").is_none(), "输入后仍不显示欢迎页");
@@ -1285,7 +1285,7 @@
         cx.dispatch_action(NewFile);
         settle_frames(cx, 5);
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             1,
             "Ctrl+N 应从欢迎页新建选项卡"
         );
@@ -1409,7 +1409,7 @@
     /// 中文/混合大小写/Unicode 折叠边界的语料，逐 (haystack, needle) 比对命中区间。
     #[test]
     fn find_ci_non_ascii_semantics_match_old() {
-        use crate::app::sidebar::find_ci;
+        use shell_scan::find_ci;
         fn find_ci_old(haystack: &str, needle: &str) -> Option<std::ops::Range<usize>> {
             if needle.is_empty() {
                 return None;
@@ -1509,7 +1509,7 @@
     #[test]
     #[ignore]
     fn bench_sidebar_search_old_vs_new() {
-        use crate::app::sidebar::find_ci;
+        use shell_scan::find_ci;
         use std::time::Instant;
         let block = "# 章节标题\n\n普通段落内容 alpha beta 关键字 shanghai 你好\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
         let mut doc = String::with_capacity(block.len() * 12000);
@@ -1655,7 +1655,7 @@
             cx.run_until_parked();
             let _ = cx.cx.refresh();
             cx.run_until_parked();
-            let snap = cx.update(|_w, cx| app.read(cx).folder_search.clone());
+            let snap = cx.update(|_w, cx| app.read(cx).model.borrow().folder_search.clone());
             if let Some(s) = &snap {
                 last = Some((**s).clone());
                 if !s.running && s.total_hits >= expect_min_hits {
@@ -1732,7 +1732,7 @@
             crate::app::sidebar::SearchScopeTab::CurrentFile,
             "无文件夹时点「整个文件夹」不应切换范围（保持只搜当前文件）"
         );
-        let hint = cx.update(|_w, cx| app.read(cx).status.clone());
+        let hint = cx.update(|_w, cx| app.read(cx).model.borrow().status.clone());
         assert!(
             hint.contains("先打开文件夹"),
             "无文件夹点「整个文件夹」应提示先打开文件夹，实际={hint}"
@@ -1919,7 +1919,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         let hit = cx
             .debug_bounds("sidebar-search-folder-hit-0-0")
             .expect("应渲染文件夹命中行");
@@ -1931,9 +1931,9 @@
         }
         let (tabs_after, ti, pos) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let ti = a.active_tab;
-            let pos = a.tabs[ti].editor.read(cx).cursor_position();
-            (a.tabs.len(), ti, pos)
+            let ti = a.model.borrow().active_tab;
+            let pos = a.model.borrow().tabs[ti].editor.read(cx).cursor_position();
+            (a.model.borrow().tabs.len(), ti, pos)
         });
         assert_eq!(
             tabs_after,
@@ -1941,12 +1941,12 @@
             "点击未打开文件应新建 1 个选项卡"
         );
         let opened = cx.update(|_w, cx| {
-            app.read(cx).tabs[ti].file_path.as_deref() == Some(target.as_path())
+            app.read(cx).model.borrow().tabs[ti].file_path.as_deref() == Some(target.as_path())
         });
         assert!(opened, "点击应打开 jump.txt 并激活");
         assert_eq!(pos.0, 2, "光标应落在命中行（0 基第 2 行）");
         // 再点同一命中行：不新建选项卡，激活既有并仍定位
-        let tabs_before2 = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before2 = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         let hit = cx
             .debug_bounds("sidebar-search-folder-hit-0-0")
             .expect("命中行仍在");
@@ -1958,9 +1958,9 @@
         }
         let (tabs_after2, row2) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let ti = a.active_tab;
-            let pos = a.tabs[ti].editor.read(cx).cursor_position();
-            (a.tabs.len(), pos.0)
+            let ti = a.model.borrow().active_tab;
+            let pos = a.model.borrow().tabs[ti].editor.read(cx).cursor_position();
+            (a.model.borrow().tabs.len(), pos.0)
         });
         assert_eq!(tabs_after2, tabs_before2, "再次点击已打开文件不应新建选项卡");
         assert_eq!(row2, 2, "再次点击后光标仍应在命中行");
@@ -2275,7 +2275,7 @@
             .advance_clock(std::time::Duration::from_millis(150));
         ft_wait_layout(&app, cx);
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).files_filter.clone()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().files_filter.clone()),
             "be",
             "过滤词应防抖提交"
         );
@@ -2328,7 +2328,7 @@
         std::fs::create_dir_all(dir.join("subdir")).unwrap();
         std::fs::write(dir.join("a.txt"), "A").unwrap();
         ft_open_folder(&app, cx, &dir);
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
 
         // 文件行（行序 root=0、subdir=1、a.txt=2）右键 → 只有重命名/删除。
         let file_row = cx.debug_bounds("sidebar-file-row-2").expect("a.txt 行应渲染");
@@ -2354,7 +2354,7 @@
         );
         // 右键不误触发行点击（未打开任何文件 / 未切换选项卡）。
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             tabs_before,
             "右键文件行不应触发行点击打开"
         );
@@ -2469,7 +2469,7 @@
         assert!(
             cx.update(|_w, cx| {
                 app.read(cx)
-                    .tabs
+                    .model.borrow().tabs
                     .iter()
                     .any(|t| t.file_path.as_deref() == Some(target.as_path()))
             }),
@@ -2692,7 +2692,7 @@
         assert!(
             cx.update(|_w, cx| {
                 app.read(cx)
-                    .tabs
+                    .model.borrow().tabs
                     .iter()
                     .any(|t| t.file_path.as_deref() == Some(old_path.as_path()))
             }),
@@ -2740,7 +2740,7 @@
         assert!(
             cx.update(|_w, cx| {
                 app.read(cx)
-                    .tabs
+                    .model.borrow().tabs
                     .iter()
                     .any(|t| t.file_path.as_deref() == Some(new_path.as_path()))
             }),
@@ -2855,11 +2855,11 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         assert!(
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                a.tabs
+                a.model.borrow().tabs
                     .iter()
                     .any(|t| t.file_path.as_deref() == Some(d_path.as_path()))
             }),
@@ -2880,14 +2880,14 @@
         assert!(
             cx.update(|_w, cx| {
                 !app.read(cx)
-                    .tabs
+                    .model.borrow().tabs
                     .iter()
                     .any(|t| t.file_path.as_deref() == Some(d_path.as_path()))
             }),
             "已打开选项卡应同步关闭"
         );
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             tabs_before - 1,
             "只应关掉 d.txt 一个选项卡"
         );
@@ -2909,7 +2909,7 @@
         cx.update(|_w, cx| {
             app.update(cx, |app, _cx| {
                 if let Some(t) = app
-                    .tabs
+                    .model.borrow_mut().tabs
                     .iter_mut()
                     .find(|t| t.file_path.as_deref() == Some(dirty_path.as_path()))
                 {
@@ -2931,13 +2931,13 @@
         assert!(
             cx.update(|_w, cx| {
                 app.read(cx)
-                    .tabs
+                    .model.borrow().tabs
                     .iter()
                     .any(|t| t.file_path.as_deref() == Some(dirty_path.as_path()))
             }),
             "有未保存修改的选项卡不应被关闭"
         );
-        let status = cx.update(|_w, cx| app.read(cx).status.to_string());
+        let status = cx.update(|_w, cx| app.read(cx).model.borrow().status.to_string());
         assert!(status.contains("未保存修改"), "应提示存在未保存修改，实际={status}");
         let _ = std::fs::remove_dir_all(&dir);
     }

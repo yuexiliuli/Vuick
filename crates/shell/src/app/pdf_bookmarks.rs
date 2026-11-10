@@ -16,14 +16,10 @@ use super::*;
 use config::user::UserPrefs;
 use serde_json::{Value, json};
 
-/// 一条阅读位置书签：目标页码（0 基）+ 展示标题。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PdfBookmark {
-    /// 目标页码（0 基；`PdfViewer::scroll_to_page` 的直接入参）。
-    pub(crate) page_index: usize,
-    /// 展示标题（优先当前大纲标题；无则「第 N 页」，N 为 1 基页码）。
-    pub(crate) title: String,
-}
+// SC-3：`PdfBookmark` 类型随 `EditorApp::pdf_bookmarks` 字段迁入 shell_core（`AppModel`
+// 字段类型需跨 crate 命名）。此处显式重导出保住模块路径 `pdf_bookmarks::PdfBookmark`
+// （`sidebar::toc` 与测试按此引用）与 bare 名（本模块 `use super::*` 亦同可见）。
+pub(crate) use shell_core::PdfBookmark;
 
 /// 书签存储文件路径 = 配置父目录 / `pdf_bookmarks.json`（`%APPDATA%\gpui-editor\`）。
 pub(crate) fn bookmarks_path() -> std::path::PathBuf {
@@ -141,9 +137,11 @@ pub(crate) fn save(map: &HashMap<String, Vec<PdfBookmark>>) {
 
 impl EditorApp {
     /// 某路径当前内存态的书签列表（无 → `None`）。侧边栏 TOC「书签」区段与测试读。
-    pub(crate) fn pdf_bookmarks_for(&self, path: &std::path::Path) -> Option<&[PdfBookmark]> {
+    /// SC-3：`pdf_bookmarks` 迁入 `AppModel`（`Rc<RefCell>`）后无法再经「方法内临时
+    /// guard」返回 `&[PdfBookmark]` 引用——改为返回 owned 克隆，语义/内容不变。
+    pub(crate) fn pdf_bookmarks_for(&self, path: &std::path::Path) -> Option<Vec<PdfBookmark>> {
         let key = normalize_key(path);
-        self.pdf_bookmarks.get(&key).map(|v| v.as_slice())
+        self.model.borrow().pdf_bookmarks.get(&key).cloned()
     }
 
     /// 添加/覆盖一条书签（同页去重）：更新内存 + 原子落盘 + notify。
@@ -155,13 +153,14 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         let key = normalize_key(path);
-        let list = self.pdf_bookmarks.entry(key.clone()).or_default();
+        let mut m = self.model.borrow_mut();
+        let list = m.pdf_bookmarks.entry(key.clone()).or_default();
         if let Some(existing) = list.iter_mut().find(|b| b.page_index == page_index) {
             existing.title = title;
         } else {
             list.push(PdfBookmark { page_index, title });
         }
-        save(&self.pdf_bookmarks);
+        save(&m.pdf_bookmarks);
         cx.notify();
     }
 
@@ -173,7 +172,8 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let key = normalize_key(path);
-        let Some(list) = self.pdf_bookmarks.get_mut(&key) else {
+        let mut m = self.model.borrow_mut();
+        let Some(list) = m.pdf_bookmarks.get_mut(&key) else {
             return false;
         };
         if idx >= list.len() {
@@ -181,9 +181,9 @@ impl EditorApp {
         }
         list.remove(idx);
         if list.is_empty() {
-            self.pdf_bookmarks.remove(&key);
+            m.pdf_bookmarks.remove(&key);
         }
-        save(&self.pdf_bookmarks);
+        save(&m.pdf_bookmarks);
         cx.notify();
         true
     }

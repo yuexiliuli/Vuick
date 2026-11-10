@@ -78,12 +78,12 @@
             app_a.update(cx, |app, cx| {
                 for (i, txt) in ["", "内容甲", "内容乙"].iter().enumerate() {
                     let idx = app.make_tab(window, cx);
-                    app.tabs[idx].editor.update(cx, |ed, _| ed.set_text(txt));
+                    app.model.borrow().tabs[idx].editor.update(cx, |ed, _| ed.set_text(txt));
                     if i == 2 {
                         app.activate_tab(idx, window, cx);
                     }
                 }
-                assert_eq!(app.active_tab, 2, "激活最后建的未命名选项卡");
+                assert_eq!(app.model.borrow().active_tab, 2, "激活最后建的未命名选项卡");
             });
         });
         cx.update(|_w, cx| {
@@ -110,8 +110,8 @@
         let (tabs, act, contents) = cx.update(|_w, cx| {
             let a = app_b.read(cx);
             let contents: Vec<String> =
-                a.tabs.iter().map(|t| t.editor.read(cx).value().to_string()).collect();
-            (a.tabs.len(), a.active_tab, contents)
+                a.model.borrow().tabs.iter().map(|t| t.editor.read(cx).value().to_string()).collect();
+            (a.model.borrow().tabs.len(), a.model.borrow().active_tab, contents)
         });
         assert_eq!(tabs, 3, "恢复后选项卡数量应一致");
         assert_eq!(act, 2, "恢复后的活动选项卡应一致");
@@ -140,7 +140,7 @@
             app_a.update(cx, |app, cx| {
                 app.open_file(f1.to_str().unwrap(), window, cx); // idx 0 = file
                 let idx1 = app.make_tab(window, cx); // idx 1 = 未命名
-                app.tabs[idx1].editor.update(cx, |ed, _| ed.set_text("未命名内容"));
+                app.model.borrow().tabs[idx1].editor.update(cx, |ed, _| ed.set_text("未命名内容"));
                 app.open_file(f2.to_str().unwrap(), window, cx); // idx 2 = file
             });
         });
@@ -149,7 +149,7 @@
         }
         cx.update(|_w, cx| {
             app_a.update(cx, |app, cx| {
-                assert_eq!(app.active_tab, 2, "激活最后打开的 f2");
+                assert_eq!(app.model.borrow().active_tab, 2, "激活最后打开的 f2");
                 assert!(session::save_session_to(app, &dir, cx));
             });
         });
@@ -171,10 +171,10 @@
         let (tabs, act, paths, contents) = cx.update(|_w, cx| {
             let a = app_b.read(cx);
             let paths: Vec<Option<std::path::PathBuf>> =
-                a.tabs.iter().map(|t| t.file_path.clone()).collect();
+                a.model.borrow().tabs.iter().map(|t| t.file_path.clone()).collect();
             let contents: Vec<String> =
-                a.tabs.iter().map(|t| t.editor.read(cx).value().to_string()).collect();
-            (a.tabs.len(), a.active_tab, paths, contents)
+                a.model.borrow().tabs.iter().map(|t| t.editor.read(cx).value().to_string()).collect();
+            (a.model.borrow().tabs.len(), a.model.borrow().active_tab, paths, contents)
         });
         assert_eq!(tabs, 3, "恢复后 3 个选项卡");
         assert_eq!(act, 2);
@@ -210,7 +210,7 @@
         });
         let (tabs, act) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs.len(), a.active_tab)
+            (a.model.borrow().tabs.len(), a.model.borrow().active_tab)
         });
         assert_eq!(tabs, 1);
         assert_eq!(act, 0, "越界 active_tab 应 clamp 到合法范围 0");
@@ -236,7 +236,7 @@
         // 开关关 + 保存 → 只清不写（遗留清单/槽位被清理）。
         cx.update(|_w, cx| {
             app.update(cx, |app, cx| {
-                app.session_restore = false;
+                app.model.borrow_mut().session_restore = false;
                 assert!(session::save_session_to(app, &dir, cx));
             });
         });
@@ -245,14 +245,14 @@
         // 开关关 + 恢复 → false，不动作。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.session_restore = false;
+                app.model.borrow_mut().session_restore = false;
                 assert!(!session::restore_session_from(app, &dir, window, cx));
             });
         });
         // 开关开但没有清单 → 恢复 false。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.session_restore = true;
+                app.model.borrow_mut().session_restore = true;
                 assert!(
                     !session::restore_session_from(app, &dir, window, cx),
                     "无清单时不恢复"
@@ -295,8 +295,8 @@
         let (tabs, act, paths) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let paths: Vec<Option<std::path::PathBuf>> =
-                a.tabs.iter().map(|t| t.file_path.clone()).collect();
-            (a.tabs.len(), a.active_tab, paths)
+                a.model.borrow().tabs.iter().map(|t| t.file_path.clone()).collect();
+            (a.model.borrow().tabs.len(), a.model.borrow().active_tab, paths)
         });
         assert_eq!(tabs, 1, "被删除文件应跳过，只恢复存在文件");
         assert_eq!(act, 0, "active_tab 越界（只 1 项）应 clamp 到 0");
@@ -348,9 +348,9 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 let i0 = app.make_tab(window, cx);
-                app.tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲"));
+                app.model.borrow().tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲"));
                 let i1 = app.make_tab(window, cx);
-                app.tabs[i1].editor.update(cx, |ed, _| ed.set_text("乙"));
+                app.model.borrow().tabs[i1].editor.update(cx, |ed, _| ed.set_text("乙"));
                 assert!(session::save_session_to(app, &dir, cx), "首次保存应成功");
                 assert!(session_store::read_slot(&dir, "t0").is_some(), "首轮 t0 在盘");
                 assert!(session_store::read_slot(&dir, "t1").is_some(), "首轮 t1 在盘");
@@ -377,9 +377,9 @@
             app.update(cx, |app, cx| {
                 let _ = app.make_tab(window, cx); // 空（仅需存在，无需用下标）
                 let i1 = app.make_tab(window, cx);
-                app.tabs[i1].editor.update(cx, |ed, _| ed.set_text("乙"));
+                app.model.borrow().tabs[i1].editor.update(cx, |ed, _| ed.set_text("乙"));
                 let i2 = app.make_tab(window, cx);
-                app.tabs[i2].editor.update(cx, |ed, _| ed.set_text("丙"));
+                app.model.borrow().tabs[i2].editor.update(cx, |ed, _| ed.set_text("丙"));
                 assert!(session::save_session_to(app, &dir, cx));
                 assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some(""), "空内容也在盘");
                 assert_eq!(session_store::read_slot(&dir, "t2").as_deref(), Some("丙"), "t2 首轮在盘");
@@ -406,7 +406,7 @@
                 app.update(cx, |app, cx| {
                     let i = app.make_tab(window, cx);
                     if make_dirty {
-                        app.tabs[i].editor.update(cx, |ed, _| ed.set_text("内容"));
+                        app.model.borrow().tabs[i].editor.update(cx, |ed, _| ed.set_text("内容"));
                     }
                     app.close_tab(i, window, cx);
                 });
@@ -420,7 +420,7 @@
             assert_eq!(msg, "未保存的更改", "确认框标题一致");
             cx.simulate_prompt_answer("不保存");
             settle_frames(cx, 5);
-            let tabs = cx.update(|_w, cx| app.read(cx).tabs.len());
+            let tabs = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
             assert_eq!(tabs, 0, "「不保存」应移除未命名选项卡");
         }
     }
@@ -439,7 +439,7 @@
         assert!(cx.has_pending_prompt(), "空未命名关闭应弹确认");
         cx.simulate_prompt_answer("Cancel");
         settle_frames(cx, 5);
-        let tabs = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         assert_eq!(tabs, 1, "取消应留在应用");
         assert!(!cx.has_pending_prompt(), "确认框已应答");
     }
@@ -455,14 +455,14 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 let i0 = app.make_tab(window, cx);
-                app.tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲"));
+                app.model.borrow().tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲"));
                 let i1 = app.make_tab(window, cx);
-                app.tabs[i1].editor.update(cx, |ed, _| ed.set_text("乙"));
+                app.model.borrow().tabs[i1].editor.update(cx, |ed, _| ed.set_text("乙"));
                 assert!(session::save_session_to(app, &dir, cx));
-                assert_eq!(app.session_slot_hashes.len(), 2, "两未命名 → 两指纹");
+                assert_eq!(app.model.borrow_mut().session_slot_hashes.len(), 2, "两未命名 → 两指纹");
 
                 // 只改 t0 内容：重存后盘上 t0 更新、t1 不变（盘点正确性不受跳过影响）。
-                app.tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲改"));
+                app.model.borrow().tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲改"));
                 assert!(session::save_session_to(app, &dir, cx));
                 assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("甲改"), "变化槽位重写");
                 assert_eq!(session_store::read_slot(&dir, "t1").as_deref(), Some("乙"), "未变槽位盘面原样");
@@ -471,7 +471,7 @@
                 app.remove_tab(i1, window, cx);
                 assert!(session::save_session_to(app, &dir, cx));
                 assert!(
-                    app.session_slot_hashes.len() == 1 && app.session_slot_hashes.contains_key("t0"),
+                    app.model.borrow_mut().session_slot_hashes.len() == 1 && app.model.borrow_mut().session_slot_hashes.contains_key("t0"),
                     "指纹只留 live 槽（内存不膨胀）"
                 );
                 assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("甲改"));
@@ -490,21 +490,21 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 let i = app.make_tab(window, cx);
-                app.tabs[i].editor.update(cx, |ed, _| ed.set_text("内容"));
+                app.model.borrow().tabs[i].editor.update(cx, |ed, _| ed.set_text("内容"));
 
                 // 开启态保存：槽位落盘 + 指纹记录。
-                app.session_restore = true;
+                app.model.borrow_mut().session_restore = true;
                 assert!(session::save_session_to(app, &dir, cx));
                 assert!(session_store::read_slot(&dir, "t0").is_some(), "开启态槽位在盘");
 
                 // 关（只清不写）：盘面与指纹一并清空。
-                app.session_restore = false;
+                app.model.borrow_mut().session_restore = false;
                 assert!(session::save_session_to(app, &dir, cx));
                 assert!(!dir.join("t0").exists(), "关闭态应清盘面");
-                assert!(app.session_slot_hashes.is_empty(), "关闭态应清指纹");
+                assert!(app.model.borrow_mut().session_slot_hashes.is_empty(), "关闭态应清指纹");
 
                 // 重开 → 重存：必须重新写槽位（不被旧指纹误跳过）。
-                app.session_restore = true;
+                app.model.borrow_mut().session_restore = true;
                 assert!(session::save_session_to(app, &dir, cx));
                 assert_eq!(
                     session_store::read_slot(&dir, "t0").as_deref(),
@@ -579,15 +579,15 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 let i = app.make_tab(window, cx);
-                app.tabs[i].editor.update(cx, |ed, _| ed.set_text("内容"));
+                app.model.borrow().tabs[i].editor.update(cx, |ed, _| ed.set_text("内容"));
                 assert!(session::save_session_to(app, &dir, cx));
                 let body1 = std::fs::read_to_string(dir.join("session.json")).unwrap();
-                let digest1 = app.session_last_manifest_digest;
+                let digest1 = app.model.borrow_mut().session_last_manifest_digest;
                 assert!(digest1.is_some(), "首存应记录清单指纹");
 
                 // 同状态重存 → 指纹未变 → 跳过清单写（清单文件保持原内容）。
                 assert!(session::save_session_to(app, &dir, cx));
-                assert_eq!(app.session_last_manifest_digest, digest1, "无变化指纹不变");
+                assert_eq!(app.model.borrow_mut().session_last_manifest_digest, digest1, "无变化指纹不变");
                 assert_eq!(
                     std::fs::read_to_string(dir.join("session.json")).unwrap(),
                     body1,
@@ -595,16 +595,16 @@
                 );
 
                 // 内容变化只重写槽位；清单不含正文 → 清单不重写（指纹不变）。
-                app.tabs[i].editor.update(cx, |ed, _| ed.set_text("内容2"));
+                app.model.borrow().tabs[i].editor.update(cx, |ed, _| ed.set_text("内容2"));
                 assert!(session::save_session_to(app, &dir, cx));
                 assert_eq!(session_store::read_slot(&dir, "t0").as_deref(), Some("内容2"), "内容变化重写槽位");
-                assert_eq!(app.session_last_manifest_digest, digest1, "内容不入清单 → 清单指纹不变");
+                assert_eq!(app.model.borrow_mut().session_last_manifest_digest, digest1, "内容不入清单 → 清单指纹不变");
 
                 // 结构变化（新建 + 激活新 tab → active_tab 变）→ 清单指纹变并重写。
                 let i2 = app.make_tab(window, cx);
-                app.tabs[i2].editor.update(cx, |ed, _| ed.set_text("新"));
+                app.model.borrow().tabs[i2].editor.update(cx, |ed, _| ed.set_text("新"));
                 assert!(session::save_session_to(app, &dir, cx));
-                assert_ne!(app.session_last_manifest_digest, digest1, "active_tab 变化 → 清单重写");
+                assert_ne!(app.model.borrow_mut().session_last_manifest_digest, digest1, "active_tab 变化 → 清单重写");
                 let body3 = std::fs::read_to_string(dir.join("session.json")).unwrap();
                 assert_ne!(body3, body1, "清单文件应随 active_tab 重写");
             });
@@ -637,7 +637,7 @@
                 app.update(cx, |app, cx| {
                     for _ in 0..n_tabs {
                         let idx = app.make_tab(window, cx);
-                        app.tabs[idx].editor.update(cx, |ed, _| ed.set_text(body));
+                        app.model.borrow().tabs[idx].editor.update(cx, |ed, _| ed.set_text(body));
                     }
                     for r in 0..rounds {
                         let a = std::time::Instant::now();
@@ -646,7 +646,7 @@
                             eprintln!(
                                 "[bench] slot={label}: 首轮 {}ms，指纹表 {} 项，目录项 {}",
                                 a.elapsed().as_secs_f64() * 1000.0,
-                                app.session_slot_hashes.len(),
+                                app.model.borrow_mut().session_slot_hashes.len(),
                                 std::fs::read_dir(&dir).map(|it| it.count()).unwrap_or(0)
                             );
                         }
@@ -667,7 +667,7 @@
                     let t_sw = std::time::Instant::now();
                     let sw_n = 24usize;
                     for r in 0..sw_n {
-                        app.active_tab = r % n_tabs.max(1);
+                        app.model.borrow_mut().active_tab = r % n_tabs.max(1);
                         assert!(session::save_session_to(app, &dir, cx));
                     }
                     let sw_ms = t_sw.elapsed().as_secs_f64() * 1000.0 / sw_n as f64;
@@ -698,13 +698,13 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let idx = cx.update(|_w, cx| app.read(cx).tabs.len() - 1);
+        let idx = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len() - 1);
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.close_tab(idx, window, cx));
         });
         settle_frames(cx, 5);
         assert!(!cx.has_pending_prompt(), "命名干净 tab 不应弹确认");
-        let tabs = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         assert_eq!(tabs, 0, "命名干净 tab 应直通 remove_tab");
         let _ = std::fs::remove_file(&f1);
     }
@@ -744,14 +744,14 @@
         let sync_snap = cx_sync.update(|_w, cx| {
             let a = app_sync.read(cx);
             (
-                a.tabs.len(),
-                a.active_tab,
-                a.tabs
+                a.model.borrow().tabs.len(),
+                a.model.borrow().active_tab,
+                a.model.borrow().tabs
                     .iter()
                     .map(|t| t.editor.read(cx).value().to_string())
                     .collect::<Vec<String>>(),
-                a.tabs.iter().map(|t| t.file_path.clone()).collect::<Vec<Option<PathBuf>>>(),
-                a.tabs.iter().map(|t| t.dirty).collect::<Vec<bool>>(),
+                a.model.borrow().tabs.iter().map(|t| t.file_path.clone()).collect::<Vec<Option<PathBuf>>>(),
+                a.model.borrow().tabs.iter().map(|t| t.dirty).collect::<Vec<bool>>(),
             )
         });
 
@@ -765,8 +765,8 @@
             app_prog.update(cx, |app, cx| {
                 let man = session_store::read_manifest(&dir).expect("清单应可读回");
                 app.schedule_restore(window, cx, dir.clone(), man);
-                assert!(app.tabs.is_empty(), "首帧前（on_next_frame 前）不得同步恢复任何 tab");
-                assert!(app.session_restoring, "恢复期间应抑制持久化");
+                assert!(app.model.borrow().tabs.is_empty(), "首帧前（on_next_frame 前）不得同步恢复任何 tab");
+                assert!(app.model.borrow_mut().session_restoring, "恢复期间应抑制持久化");
             });
         });
         let mut ran = 0usize;
@@ -777,27 +777,27 @@
             if d > 0 {
                 ran += 1;
             }
-            let restoring = cx_prog.update(|_w, cx| app_prog.read(cx).session_restoring);
+            let restoring = cx_prog.update(|_w, cx| app_prog.read(cx).model.borrow().session_restoring);
             if !restoring {
                 break;
             }
         }
         assert!(ran >= 3, "渐进恢复应至少逐帧推进 3 次（3 个 tab），实际 {ran}");
         assert!(
-            !cx_prog.update(|_w, cx| app_prog.read(cx).session_restoring),
+            !cx_prog.update(|_w, cx| app_prog.read(cx).model.borrow().session_restoring),
             "恢复完成后应放行持久化"
         );
         let prog_snap = cx_prog.update(|_w, cx| {
             let a = app_prog.read(cx);
             (
-                a.tabs.len(),
-                a.active_tab,
-                a.tabs
+                a.model.borrow().tabs.len(),
+                a.model.borrow().active_tab,
+                a.model.borrow().tabs
                     .iter()
                     .map(|t| t.editor.read(cx).value().to_string())
                     .collect::<Vec<String>>(),
-                a.tabs.iter().map(|t| t.file_path.clone()).collect::<Vec<Option<PathBuf>>>(),
-                a.tabs.iter().map(|t| t.dirty).collect::<Vec<bool>>(),
+                a.model.borrow().tabs.iter().map(|t| t.file_path.clone()).collect::<Vec<Option<PathBuf>>>(),
+                a.model.borrow().tabs.iter().map(|t| t.dirty).collect::<Vec<bool>>(),
             )
         });
         assert_eq!(

@@ -114,13 +114,13 @@ impl EditorApp {
     /// 否则活动选项卡为视频 → [`MediaWindowKind::Video`]；两者都不是（文本/PDF/图片/空）
     /// → `None`。尺寸记录按角色分写 music / video 两组，None 时不记录（不覆盖）。
     pub(super) fn media_window_kind(&self) -> Option<MediaWindowKind> {
-        if self.music_mode {
+        if self.model.borrow().music_mode {
             return Some(MediaWindowKind::Music);
         }
         #[cfg(feature = "video")]
         if self
-            .tabs
-            .get(self.active_tab)
+            .model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .map(|t| matches!(t.reader, MediaReader::Video(_)))
             .unwrap_or(false)
         {
@@ -146,14 +146,22 @@ impl EditorApp {
             px(size.width.as_f32().max(MIN_MEDIA_WIN_W)),
             px(size.height.as_f32().max(MIN_MEDIA_WIN_H)),
         );
+        // SC-3：`&mut music/video_window_size` 需长借 → 一次 hold 模型可变 guard 到本方法
+        // 结束（后半段只调 `&self` 的 `schedule_media_size_flush` / notify，无 `&mut self` 冲突）。
+        let mut model = self.model.borrow_mut();
         let slot = match kind {
-            MediaWindowKind::Music => &mut self.music_window_size,
-            MediaWindowKind::Video => &mut self.video_window_size,
+            MediaWindowKind::Music => &mut model.music_window_size,
+            MediaWindowKind::Video => &mut model.video_window_size,
         };
         if *slot == Some(size) {
             return; // 尺寸未变：不重复标记 / 不重复写盘
         }
         *slot = Some(size);
+        // SC-评审 BLOCK：RefCell 借用是运行期互斥，`&self` 编译通过 ≠ 安全——
+        // 这里 guard 不释放就调 `schedule_media_size_flush`（内部 cfg(not(test)) 分支再
+        // `self.model.borrow()`）会在生产 resize 时「already mutably borrowed」panic。
+        // `size/kind` 均为 owned 值，drop guard 后再走 &self 路径，语义零变化。
+        drop(model);
         self.schedule_media_size_flush(cx);
         if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
             eprintln!(
@@ -172,7 +180,7 @@ impl EditorApp {
         #[cfg(not(test))]
         {
             let weak = _cx.weak_entity();
-            self.media_size_flush_debounce.after(
+            self.model.borrow().media_size_flush_debounce.after(
                 _cx,
                 std::time::Duration::from_millis(MEDIA_SIZE_FLUSH_DEBOUNCE_MS),
                 move |app| {
@@ -207,14 +215,14 @@ impl EditorApp {
         let is_media = music::is_audio_extension(&p) || Self::is_video_path(&p);
         #[cfg(not(feature = "video"))]
         let is_media = music::is_audio_extension(&p);
-        if !is_media || !self.media_new_window {
+        if !is_media || !self.model.borrow().media_new_window {
             return false;
         }
         let self_is_media = self.is_media_window();
         let other = self.nearest_other_media_window(cx);
         let target = resolve_media_open_target(
-            self.media_new_window,
-            self.reuse_media_window,
+            self.model.borrow().media_new_window,
+            self.model.borrow().reuse_media_window,
             self_is_media,
             other.is_some(),
         );
@@ -302,8 +310,8 @@ impl EditorApp {
         let recorded = resolve_recorded_size(
             kind,
             self.media_window_kind().is_some(),
-            self.music_window_size,
-            self.video_window_size,
+            self.model.borrow().music_window_size,
+            self.model.borrow().video_window_size,
             disk.music_window_size,
             disk.video_window_size,
         );
@@ -346,8 +354,8 @@ impl EditorApp {
             Ok(h) => h.into(),
             Err(e) => {
                 // 新窗创建失败（罕见 / 平台禁用）→ 回退当前窗口打开，保证媒体仍可用。
-                self.status = SharedString::from(format!("打开媒体失败：{e}"));
-                self.status_ok = false;
+                self.model.borrow_mut().status = SharedString::from(format!("打开媒体失败：{e}"));
+                self.model.borrow_mut().status_ok = false;
                 self.open_file_here(&owned, window, cx);
                 return;
             }
@@ -391,7 +399,11 @@ impl EditorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.media_new_window = !self.media_new_window;
+        // SC-3：同一语句两次 `borrow_mut()`（LHS guard 存活时求值 RHS）运行期双借
+        // panic → 一次取 guard 内完成「读旧值后翻转」。
+        let mut m = self.model.borrow_mut();
+        m.media_new_window = !m.media_new_window;
+        drop(m);
         self.persist_prefs();
         cx.notify();
     }
@@ -403,10 +415,13 @@ impl EditorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.media_new_window {
+        if !self.model.borrow().media_new_window {
             return;
         }
-        self.reuse_media_window = !self.reuse_media_window;
+        // SC-3：同语句双 `borrow_mut()` panic → 一次 guard 内翻转。
+        let mut m = self.model.borrow_mut();
+        m.reuse_media_window = !m.reuse_media_window;
+        drop(m);
         self.persist_prefs();
         cx.notify();
     }

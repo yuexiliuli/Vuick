@@ -1,0 +1,43 @@
+[package]
+name = "shell_core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 外壳宿主模型类型 crate（自 shell 的 app/mod.rs 拆分：EditorTab / DetachedTab / MediaReader / MdWyInstall / 拖拽 / 标题栏等纯模型类型；纯结构移动，只重分配既有依赖，不新增外部包）"
+
+[dependencies]
+# 模型类型直接持有的 GPUI 句柄 / 值类型（Entity / SharedString / ScrollHandle / Subscription /
+# Hsla / WindowControlArea / Render 等）。
+gpui = { workspace = true }
+# 选项卡源文本编码（EditorTab / DetachedTab 的 source_encoding 字段）。
+encoding_rs = { workspace = true }
+# TabDragGhost 的 Render 实现（ui::theme）与 WinCtrlKind 的 hover/active 底色（ChromeColors）。
+ui = { path = "../ui" }
+# 选项卡编辑区实体（Entity<editor::CodeEditor>）。
+editor = { path = "../editor" }
+# WYSIWYG 预览 / 预览编辑实体（Entity<WyEditor>）。
+markdown_wysiwyg = { path = "../markdown_wysiwyg" }
+# MediaReader 的 PDF 阅读器实体。
+pdf = { path = "../pdf" }
+# MediaReader 的图片查看器实体。
+image_viewer = { path = "../image_viewer" }
+# MediaReader 的视频查看器实体随本 crate 的 `video` feature 开关（与 shell 一致，镜像转发）。
+video = { path = "../video", optional = true }
+# SC-3（2026-11-10）：AppModel 承接 EditorApp 模型半字段——会话防抖（SeqAfter）/ 主题
+# 与 PDF 画布偏好（ThemePref / PdfBgPref）/ 侧边栏搜索扫描缓存（SidebarSearchScan /
+# FolderSearchScan）等类型所属 crate（base / config / shell_scan，均为叶子 crate，无回环）。
+base = { path = "../base" }
+config = { path = "../config" }
+shell_scan = { path = "../shell_scan" }
+# SC-4（2026-11-10）：会话持久化编排纯逻辑（persist_session / save_session_to /
+# collect_session_data 迁入 AppModel）——session_store 为叶子 crate（无回环）。
+session_store = { path = "../session_store" }
+# SC-4（2026-11-10）：file_ops 纯逻辑（prepare_text / set_tab_text）迁入 AppModel——
+# Rope 为 workspace 既有的文本存储类型（shell 同款）。
+ropey = { workspace = true }
+
+[features]
+default = []
+# video：与 shell 同名 feature 一致——shell 经 `shell_core/video` 显式转发开启。
+# --no-default-features 时关闭 → 视频整链关闭、不拉 FFmpeg 依赖。
+video = ["dep:video"]

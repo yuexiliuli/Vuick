@@ -13,7 +13,7 @@ impl EditorApp {
     /// 当前明暗模式对应的外壳配色（[`ui::theme::ChromeColors`] 单一来源，
     /// 值逐字节保持收编前硬编码；本系列后续步骤的配色地基）。
     pub(super) fn chrome(&self) -> ChromeColors {
-        if self.dark_mode {
+        if self.model.borrow().dark_mode {
             ChromeColors::dark()
         } else {
             ChromeColors::light()
@@ -27,7 +27,7 @@ impl EditorApp {
 
     /// Win11 Mica chrome 透明度（亮 0.86 / 暗 0.82）：半透明才能透出系统 Mica 材质。
     pub(super) fn mica_alpha(&self) -> f32 {
-        if self.dark_mode {
+        if self.model.borrow().dark_mode {
             ui::theme::MICA_CHROME_ALPHA_DARK
         } else {
             ui::theme::MICA_CHROME_ALPHA_LIGHT
@@ -36,7 +36,7 @@ impl EditorApp {
     /// 标题栏/选项卡栏/侧栏工具条背景（Mica 半透明版；暗色主题改用 theme `chrome_bg`
     /// #191A1B（原 config `CHROME_BG_DARK`，常量已删）的不透明统一底色）。
     pub(super) fn mica_bar_bg(&self) -> gpui::Hsla {
-        if self.dark_mode {
+        if self.model.borrow().dark_mode {
             ui::theme::ChromeColors::for_mode(true).chrome_bg.into()
         } else {
             self.bar_bg().opacity(self.mica_alpha())
@@ -94,7 +94,7 @@ impl EditorApp {
     /// 编辑器/预览面板背景（暗色主题 = theme `editor_bg`（原 config `EDITOR_BG_DARK`
     /// #121314，常量已删）统一底色）。
     pub(super) fn panel_bg(&self) -> gpui::Hsla {
-        ui::shell::content_bg(self.dark_mode, self.chrome().panel_bg.into())
+        ui::shell::content_bg(self.model.borrow().dark_mode, self.chrome().panel_bg.into())
     }
 
     /// 主要文字颜色。
@@ -126,9 +126,10 @@ impl EditorApp {
     /// 偏好记为当前生效的强制档。驱动自研主题（`ui::theme`）双轨同色；
     /// 编辑器语法配色随明暗切换为 GitHub Light / Dark（见 [`syntax`]）。
     pub(super) fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.dark_mode = !self.dark_mode;
+        let dark_mode = !self.model.borrow().dark_mode;
+        self.model.borrow_mut().dark_mode = dark_mode;
         // 手动切换 = 退出跟随：记为强制档并写盘。
-        self.theme_pref = if self.dark_mode {
+        self.model.borrow_mut().theme_pref = if dark_mode {
             ThemePref::Dark
         } else {
             ThemePref::Light
@@ -139,8 +140,8 @@ impl EditorApp {
 
     /// 进入「跟随系统」模式：主题改由系统深浅色决定，并立即按当前系统落地一次。
     pub(super) fn follow_system_theme(&mut self, cx: &mut Context<Self>) {
-        self.theme_pref = ThemePref::Follow;
-        self.dark_mode = ThemePref::Follow.resolved_dark(cx.window_appearance());
+        self.model.borrow_mut().theme_pref = ThemePref::Follow;
+        self.model.borrow_mut().dark_mode = ThemePref::Follow.resolved_dark(cx.window_appearance());
         self.refresh_theme_ui(cx);
         self.persist_prefs();
     }
@@ -149,7 +150,7 @@ impl EditorApp {
     /// （toggle / 跟随系统 / 启动恢复共用同一入口）。
     pub(super) fn refresh_theme_ui(&mut self, cx: &mut Context<Self>) {
         ui::theme::Theme::set(
-            if self.dark_mode {
+            if self.model.borrow().dark_mode {
                 ui::theme::ThemeMode::Dark
             } else {
                 ui::theme::ThemeMode::Light
@@ -160,7 +161,7 @@ impl EditorApp {
         // 派生并缓存，主题切换后必须重建（MD / EPUB 统一走 `WyEditor`；`MarkdownPreview`
         // 后端已删，M5-B5 P4-2）。PDF 画布用灰色系（window_bg）与"纸面"卡片分隔。
         let canvas_bg = self.window_bg();
-        for tab in &self.tabs {
+        for tab in &self.model.borrow().tabs {
             // A2/A4：右栏统一 WyEditor 预览（md_wy）与 WYSIWYG 活区（live2）的调色主题
             //（原先只刷背景，内容色滞后 →"切换黑白后预览不完全重染色/用旧色"）。
             if let Some(wy) = tab.md_wy.clone() {
@@ -183,7 +184,7 @@ impl EditorApp {
                     let pv = pdf.clone();
                     // R6 守卫：PDF 画布背景**显式设置过**（非「默认」）→ 主题切换不得覆盖
                     // 画布色；仅「默认」档才跟随主题（回落 default_canvas = 新主题 window_bg）。
-                    if self.pdf_bg == PdfBgPref::Default {
+                    if self.model.borrow().pdf_bg == PdfBgPref::Default {
                         pv.update(cx, |view, cx| {
                             view.clear_background();
                             cx.notify();
@@ -214,55 +215,10 @@ impl EditorApp {
     /// 汇总当前偏好（主题三态 / 字号 / 侧栏宽度 / 会话与托盘开关 / 打开文件夹根 /
     /// 最近打开），供持久化与「导出设置」（`settings_xfer`）共用同一口径——导出即
     /// 「当前交互态」，两者始终一致。
+    /// SC-4：逻辑已迁 [`AppModel::collect_prefs`]（shell_core::actions）；此处 glue。
     pub(super) fn collect_prefs(&self) -> UserPrefs {
-        // 音乐播放器偏好（music_dir / music_liked / 音量 / 上次曲目）不由 shell 维护：
-        // 此处沿用已存值（与持久化既有口径一致，避免放空音乐目录/收藏）。
-        let existing = UserPrefs::load();
-        UserPrefs {
-            theme: self.theme_pref,
-            font_size: Some(self.font_size),
-            sidebar_width: if self.sidebar.width_auto {
-                None
-            } else {
-                Some(self.sidebar.width)
-            },
-            // 会话恢复开关随其它偏好一并落盘（否则一次字号/主题保存就会把它重置回默认开）。
-            session_restore: Some(self.session_restore),
-            // 关闭到托盘开关随其它偏好一并落盘（否则一次字号/主题保存就把它重置回默认关）。
-            close_to_tray: Some(self.close_to_tray),
-            // 媒体打开位置两个开关随其它偏好一并落盘（否则一次字号/主题保存就把开关重置
-            // 回默认开；K10/K41 副作用收敛：collect_prefs 是持久化唯一口径）。
-            media_new_window: Some(self.media_new_window),
-            reuse_media_window: Some(self.reuse_media_window),
-            // 媒体窗口记录尺寸一并落盘（否则一次字号/主题保存就把记录清空回 None，白记）。
-            // Size<Pixels> → (f32, f32) 逻辑像素；None（未记录）→ JSON null。
-            music_window_size: self
-                .music_window_size
-                .map(|s| (s.width.as_f32(), s.height.as_f32())),
-            video_window_size: self
-                .video_window_size
-                .map(|s| (s.width.as_f32(), s.height.as_f32())),
-            // 打开文件夹的根路径随偏好落盘（首次写前为空；路径失效时 `files.root` 为
-            // None → 这里写 null，下次启动不再恢复该失效文件夹）。
-            opened_folder: self
-                .sidebar
-                .files
-                .root
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            // 最近打开（文件夹 / 文件）：随偏好落盘（空 → `[]`），跨重启恢复（K11：
-            // 只随打开/移除/清空这类状态变化写，不逐帧 / 不重复全量重写）。
-            recent_folders: self.recent_folders.clone(),
-            recent_files: self.recent_files.clone(),
-            music_dir: existing.music_dir,
-            music_liked: existing.music_liked,
-            music_volume: existing.music_volume,
-            music_last_track: existing.music_last_track,
-            music_progress_secs: existing.music_progress_secs,
-            // PDF 画布背景偏好随其它偏好一并落盘（否则一次字号/主题保存就把它重置回默认）。
-            pdf_bg: self.pdf_bg,
-            pdf_bg_custom: self.pdf_bg_custom.clone(),
-        }
+        let host: &dyn AppHost = self;
+        self.model.borrow().collect_prefs(host)
     }
 
     /// 把当前偏好（主题三态 / 字号 / 侧栏宽度 / 最近打开）原子写盘。
@@ -270,13 +226,10 @@ impl EditorApp {
     /// 否则下次启动仍保持随内容自适应。
     /// **测试构建不写盘**（config crate 是依赖编译、不受其自身 `cfg!(test)` 门控，
     /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
+    /// SC-4：逻辑已迁 [`AppModel::persist_prefs`]；此处 glue。
     pub(super) fn persist_prefs(&self) {
-        // 用 `cfg!(test)` 而不是 `#[cfg(test)] return;`：后者在测试构建里把后续写成
-        // 不可达代码抛 `unreachable_code` 警告；cfg! 为运行时常量，不剪枝可达性。
-        if cfg!(test) {
-            return;
-        }
-        self.collect_prefs().save();
+        let host: &dyn AppHost = self;
+        self.model.borrow().persist_prefs(host);
     }
     /// 窗口控制钮图标前景（Win11「注入感」）：只换色、粗细/几何不动。
     /// - 关闭：空闲次要灰 → hover/按压 白 ×（红底白×，与 P1-7 `close_pressed` 搭配）

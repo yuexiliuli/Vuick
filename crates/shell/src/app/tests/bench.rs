@@ -36,15 +36,15 @@
             cx.run_until_parked();
             let (wy_loaded, editor_pending, editor_lines) = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.tabs.len().saturating_sub(1);
+                let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
-                    a.tabs[i]
+                    a.model.borrow().tabs[i]
                         .md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false),
-                    a.tabs[i].editor_pending,
-                    a.tabs[i].editor.read(cx).line_count(),
+                    a.model.borrow().tabs[i].editor_pending,
+                    a.model.borrow().tabs[i].editor.read(cx).line_count(),
                 )
             });
             if !d_ready && !editor_pending && editor_lines > 1000 {
@@ -118,11 +118,11 @@
             cx.run_until_parked();
             let (editor_lines, pending, wy_loaded) = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.tabs.len().saturating_sub(1);
+                let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
-                    a.tabs[i].editor.read(cx).line_count(),
-                    a.tabs[i].editor_pending,
-                    a.tabs[i]
+                    a.model.borrow().tabs[i].editor.read(cx).line_count(),
+                    a.model.borrow().tabs[i].editor_pending,
+                    a.model.borrow().tabs[i]
                         .md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
@@ -156,8 +156,8 @@
         // P4-2：MD 预览 = 唯一统一 WyEditor（`MarkdownPreview` 已删），无第二份扫描可量。
         let wy_blocks = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i]
+            let i = a.model.borrow().tabs.len().saturating_sub(1);
+            a.model.borrow().tabs[i]
                 .md_wy
                 .as_ref()
                 .map(|w| w.read(cx).frame_total().map_or(0., |t| t) as usize)
@@ -203,8 +203,8 @@
             cx.run_until_parked();
             wy_ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.tabs.len().saturating_sub(1);
-                a.tabs[i]
+                let i = a.model.borrow().tabs.len().saturating_sub(1);
+                a.model.borrow().tabs[i]
                     .md_wy
                     .as_ref()
                     .map(|w| w.read(cx).is_loaded())
@@ -273,11 +273,11 @@
             cx.run_until_parked();
             wy_ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.tabs.len().saturating_sub(1);
+                let i = a.model.borrow().tabs.len().saturating_sub(1);
                 // Step2：提前整篇解析可先于编辑区收尾装好预览 → 逐键一致性（m==e）必须
                 // 等**打开流水线整体完成**（open_finish_count>=1 ⇒ 编辑区已全文落定）。
                 a.open_finish_count >= 1
-                    && a.tabs[i]
+                    && a.model.borrow().tabs[i]
                         .md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
@@ -306,7 +306,7 @@
         // 真实逐键路径一致性：预览必须恒等于编辑区（增量桥正确性）。
         let (m, e) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.md_wy
                     .as_ref()
@@ -319,7 +319,7 @@
         // 隔离测量桥模型成本（独立 WyEditor 副本，绝不污染已对齐的 md_wy）：
         // ⚠️ 循环内不读 `text()`（O(n) 物化）；用 O(1) `len()` 取初始长后自行推进。
         let scratch = cx.update(|window, cx| {
-            let rope = app.read(cx).tabs[app.read(cx).active_tab]
+            let rope = app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .editor
                 .read(cx)
                 .rope()
@@ -411,7 +411,7 @@
                 cx.run_until_parked();
                 let pending = cx.update(|_, cx| {
                     let a = app.read(cx);
-                    a.tabs.last().map(|t| t.editor_pending).unwrap_or(true)
+                    a.model.borrow().tabs.last().map(|t| t.editor_pending).unwrap_or(true)
                 });
                 if !pending {
                     break;
@@ -426,10 +426,10 @@
             // 3) 聚焦当前编辑区
             let (editor, focus) = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let idx = a.active_tab;
+                let idx = a.model.borrow().active_tab;
                 (
-                    a.tabs[idx].editor.clone(),
-                    a.tabs[idx].editor.read(cx).focus_handle(),
+                    a.model.borrow().tabs[idx].editor.clone(),
+                    a.model.borrow().tabs[idx].editor.read(cx).focus_handle(),
                 )
             });
             cx.update(|window, cx| window.focus(&focus, cx));
@@ -603,9 +603,9 @@
             ticks += 1;
             let (lc, fin) = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.tabs.len().saturating_sub(1);
+                let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
-                    a.tabs[i].editor.read(cx).line_count(),
+                    a.model.borrow().tabs[i].editor.read(cx).line_count(),
                     a.open_finish_count,
                 )
             });
@@ -631,17 +631,17 @@
         // 最终字节级一致性（一次性物化比较；编辑器统一 LF，与读取后归一化对比）。
         let ok = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
+            let i = a.model.borrow().tabs.len().saturating_sub(1);
             let expected = std::fs::read_to_string(&path)
                 .unwrap()
                 .replace("\r\n", "\n")
                 .replace('\r', "\n");
-            a.tabs[i].editor.read(cx).value() == expected
+            a.model.borrow().tabs[i].editor.read(cx).value() == expected
         });
         let last_lc = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i].editor.read(cx).line_count()
+            let i = a.model.borrow().tabs.len().saturating_sub(1);
+            a.model.borrow().tabs[i].editor.read(cx).line_count()
         });
         let d_pf = peak_pf.load(Ordering::Relaxed).saturating_sub(base_pf);
         let d_ws = peak_ws.load(Ordering::Relaxed).saturating_sub(base_ws);
@@ -746,7 +746,7 @@
         loop {
             cx.run_until_parked();
             let pending =
-                cx.update(|_, cx| app.read(cx).tabs.last().map(|t| t.editor_pending).unwrap_or(true));
+                cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().map(|t| t.editor_pending).unwrap_or(true));
             if !pending {
                 break;
             }
@@ -755,7 +755,7 @@
                 panic!("打开超时");
             }
         }
-        let editor = cx.update(|_, cx| app.read(cx).tabs.last().unwrap().editor.clone());
+        let editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().unwrap().editor.clone());
         let sample = "x";
         // 预热：预览窗口物化 + 行高提示收敛
         for _ in 0..3 {
@@ -792,7 +792,10 @@
         }
         // 关预览后再测一次
         cx.update(|window, cx| {
-            app.update(cx, |a, cx| a.toggle_preview_for_tab(a.active_tab, window, cx));
+            app.update(cx, |a, cx| {
+                let idx = a.model.borrow().active_tab;
+                a.toggle_preview_for_tab(idx, window, cx);
+            });
         });
         for _ in 0..3 {
             cx.run_until_parked();
@@ -843,7 +846,7 @@
         loop {
             cx.run_until_parked();
             let pending = cx
-                .update(|_, cx| app.read(cx).tabs.last().map(|t| t.editor_pending).unwrap_or(true));
+                .update(|_, cx| app.read(cx).model.borrow().tabs.last().map(|t| t.editor_pending).unwrap_or(true));
             if !pending {
                 break;
             }
@@ -852,7 +855,7 @@
                 panic!("打开超时");
             }
         }
-        let editor = cx.update(|_, cx| app.read(cx).tabs.last().unwrap().editor.clone());
+        let editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().unwrap().editor.clone());
         // 预热：预览窗口物化 + 行高提示收敛
         for _ in 0..5 {
             cx.run_until_parked();
@@ -996,7 +999,7 @@
                 cx.run_until_parked();
                 let pending = cx.update(|_, cx| {
                     let a = app.read(cx);
-                    a.tabs.last().map(|t| t.editor_pending).unwrap_or(true)
+                    a.model.borrow().tabs.last().map(|t| t.editor_pending).unwrap_or(true)
                 });
                 if !pending {
                     break;
@@ -1010,7 +1013,7 @@
             // 3) 取编辑器实体；光标放正文中部，向前逐字符删 N 次（每次删 1 字符）。
             let editor = cx.update(|_, cx| {
                 let a = app.read(cx);
-                a.tabs[a.active_tab].editor.clone()
+                a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone()
             });
             let before = cx.update(|_, cx| editor.read(cx).value().len());
             if before < 2 {
@@ -1127,7 +1130,7 @@
             cx.run_until_parked();
             let n = cx.update(|_w, cx| {
                 app.read(cx)
-                    .tabs
+                    .model.borrow().tabs
                     .last()
                     .map(|t| t.editor.read(cx).line_count())
                     .unwrap_or(0)
@@ -1138,12 +1141,12 @@
             }
         }
         assert!(ready, "corpus 后台装配超时");
-        let ti = cx.update(|_w, cx| app.read(cx).active_tab);
+        let ti = cx.update(|_w, cx| app.read(cx).model.borrow().active_tab);
         let q = "needlemark"; // 查询词（归一化后小写）
 
         // 取正文（可编辑路径的一次 `value()` 整篇物化，内含物化耗时）
         let value_t = std::time::Instant::now();
-        let content = cx.update(|_w, cx| app.read(cx).tabs[ti].editor.read(cx).value());
+        let content = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[ti].editor.read(cx).value());
         let value_ms = value_t.elapsed().as_millis();
         // 多次取均（debug 单次抖动大；两者同轮同 jit/allocator 状态，比值才可信）
         const RUNS: usize = 20;
@@ -1246,8 +1249,8 @@
         let restored = cx.update(|_w, cx| {
             let a = app2.read(cx);
             (
-                a.tabs.len(),
-                a.tabs.iter().filter(|t| t.file_path.is_none()).count(),
+                a.model.borrow().tabs.len(),
+                a.model.borrow().tabs.iter().filter(|t| t.file_path.is_none()).count(),
             )
         });
         assert_eq!(restored, (5, 2), "恢复应得 5 选项卡（3 文件 + 2 未命名）");
@@ -1278,7 +1281,7 @@
             cx.run_until_parked();
         }
         let s = placeholder_audio("bench-wall");
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         // 预热首窗口首帧（排除在计时外）
         for _ in 0..3 {
             cx.run_until_parked();
@@ -1312,7 +1315,7 @@
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         assert!(ready, "媒体窗口应进入音乐模式（首帧就绪）");
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             tabs_before,
             "源窗口 tabs 应不变"
         );
@@ -1350,10 +1353,10 @@
             cx.run_until_parked();
             let (pending, lines) = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let i = a.tabs.len().saturating_sub(1);
+                let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
-                    a.tabs[i].editor_pending,
-                    a.tabs[i].editor.read(cx).line_count(),
+                    a.model.borrow().tabs[i].editor_pending,
+                    a.model.borrow().tabs[i].editor.read(cx).line_count(),
                 )
             });
             if !pending && lines > 1000 {
@@ -1365,7 +1368,7 @@
         }
         println!(
             "【大档就绪】tab 数={}",
-            cx.update(|_w, cx| app.read(cx).tabs.len())
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len())
         );
         // 拖**文件**选项卡（tab-1）出窗拆新窗 —— 大文档 open_window 首帧主路径
         let tab = cx

@@ -15,8 +15,8 @@ impl EditorApp {
     /// 切换音乐模式：关 → 开（首次惰性创建 MusicView；尚未加载目录则载默认音乐目录）；
     /// 开 → 关（回编辑器界面，焦点还给活跃编辑区）。
     pub(super) fn toggle_music_player(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.music_mode {
-            self.music_mode = false;
+        if self.model.borrow().music_mode {
+            self.model.borrow_mut().music_mode = false;
             window.focus(&self.editor_focus_handle(cx), cx);
             cx.notify();
             return;
@@ -26,7 +26,7 @@ impl EditorApp {
         if view.read(cx).player.read(cx).dir().is_none() {
             view.update(cx, |v, cx| v.load_default_dir(cx));
         }
-        self.music_mode = true;
+        self.model.borrow_mut().music_mode = true;
         window.focus(&view.read(cx).focus_handle(), cx);
         cx.notify();
     }
@@ -44,7 +44,7 @@ impl EditorApp {
         view.update(cx, |v, cx| {
             v.player.update(cx, |pl, cx| pl.play_path(&path, cx));
         });
-        self.music_mode = true;
+        self.model.borrow_mut().music_mode = true;
         window.focus(&view.read(cx).focus_handle(), cx);
         cx.notify();
     }
@@ -60,7 +60,7 @@ impl EditorApp {
         let sub = cx.subscribe(&view, |this, _view, ev: &music::MusicEvent, cx| {
             match *ev {
                 music::MusicEvent::ExitRequested => {
-                    this.music_mode = false;
+                    this.model.borrow_mut().music_mode = false;
                     let focus = this.editor_focus_handle(cx);
                     let entity = cx.entity();
                     // 事件在窗口更新栈内派发（同步 update_window 会空转）→ 延后到主线程

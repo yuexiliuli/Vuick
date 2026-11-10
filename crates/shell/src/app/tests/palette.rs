@@ -63,7 +63,7 @@
             cx.run_until_parked();
         }
         let (closed, tabs_len) = cx.update(|_w, cx| {
-            (app.read(cx).palette.is_none(), app.read(cx).tabs.len())
+            (app.read(cx).palette.is_none(), app.read(cx).model.borrow().tabs.len())
         });
         assert!(closed, "Enter 执行后面板应关闭（DismissEvent 清引用）");
         assert_eq!(tabs_len, 2, "「新建文件」应新增一个选项卡，实际={tabs_len}");
@@ -133,7 +133,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let tab_count = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tab_count = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         assert_eq!(tab_count, 3, "未命名 + A + B 共 3 个选项卡");
 
         // 聚焦编辑区后 Ctrl+P → 文件模式面板，列出已打开文件（含「打开文件…」入口）。
@@ -185,7 +185,7 @@
         }
         let (closed, active) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.palette.is_none(), a.active_tab)
+            (a.palette.is_none(), a.model.borrow().active_tab)
         });
         assert!(closed, "切换后面板应关闭");
         assert_eq!(active, 1, "Enter 后应切回 A 的选项卡，实际={active}");
@@ -722,7 +722,7 @@
         let (closed, opened_path) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let has = a
-                .tabs
+                .model.borrow().tabs
                 .iter()
                 .any(|t| t.file_path.as_deref() == Some(base.join("a_top.rs").as_path()));
             (a.palette.is_none(), has)

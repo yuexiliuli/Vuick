@@ -138,17 +138,17 @@ async fn import_applies_prefs_immediately(cx: &mut TestAppContext) {
     let dir = xfer_temp_dir("apply_prefs");
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
-            let before_tabs = app.tabs.len();
+            let before_tabs = app.model.borrow().tabs.len();
             app.apply_import_bundle(Some(parsed), &dir, _w, cx);
-            assert_eq!(app.theme_pref, ThemePref::Dark, "主题偏好即时生效");
-            assert!(app.dark_mode, "暗色主题即时生效");
-            assert_eq!(app.font_size, 17.0, "字号即时生效");
+            assert_eq!(app.model.borrow_mut().theme_pref, ThemePref::Dark, "主题偏好即时生效");
+            assert!(app.model.borrow_mut().dark_mode, "暗色主题即时生效");
+            assert_eq!(app.model.borrow_mut().font_size, 17.0, "字号即时生效");
             assert_eq!(app.sidebar.width, 123.0, "侧栏宽度即时生效");
             assert!(!app.sidebar.width_auto, "导入显式宽度 → 固定手动宽度");
-            assert!(app.session_restore, "prefs 未显式给 → 默认开（会话可恢复）");
-            assert!(app.close_to_tray, "托盘开关即时生效");
-            assert_eq!(app.recent_files, vec!["a.md".to_string()], "最近打开恢复");
-            assert_eq!(app.tabs.len(), before_tabs, "不重排当前窗口");
+            assert!(app.model.borrow_mut().session_restore, "prefs 未显式给 → 默认开（会话可恢复）");
+            assert!(app.model.borrow_mut().close_to_tray, "托盘开关即时生效");
+            assert_eq!(app.model.borrow_mut().recent_files, vec!["a.md".to_string()], "最近打开恢复");
+            assert_eq!(app.model.borrow().tabs.len(), before_tabs, "不重排当前窗口");
             let toast = app.notifications.last().map(|n| n.message_str().to_string());
             assert_eq!(toast.as_deref(), Some("已导入设置（配置 + 会话；会话下一启动恢复）"));
         });
@@ -189,7 +189,7 @@ async fn import_explicit_false_restore_honored(cx: &mut TestAppContext) {
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
             app.apply_import_bundle(Some(parsed), &dir, _w, cx);
-            assert!(!app.session_restore, "显式 false 诚实跟随");
+            assert!(!app.model.borrow_mut().session_restore, "显式 false 诚实跟随");
             let toast = app.notifications.last().map(|n| n.message_str().to_string());
             assert_eq!(
                 toast.as_deref(),
@@ -210,9 +210,9 @@ async fn import_session_does_not_rearrange_current_window(cx: &mut TestAppContex
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
             let i0 = app.make_tab(window, cx);
-            app.tabs[i0].editor.update(cx, |ed, _| ed.set_text("现有甲"));
+            app.model.borrow().tabs[i0].editor.update(cx, |ed, _| ed.set_text("现有甲"));
             let i1 = app.make_tab(window, cx);
-            app.tabs[i1].editor.update(cx, |ed, _| ed.set_text("现有乙"));
+            app.model.borrow().tabs[i1].editor.update(cx, |ed, _| ed.set_text("现有乙"));
             app.activate_tab(i1, window, cx);
         });
     });
@@ -230,13 +230,13 @@ async fn import_session_does_not_rearrange_current_window(cx: &mut TestAppContex
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
             app.apply_import_bundle(Some(parsed), &dir, _w, cx);
-            assert_eq!(app.tabs.len(), 2, "不立即重排：仍 2 个选项卡");
-            assert_eq!(app.active_tab, 1, "活动选项卡不变");
+            assert_eq!(app.model.borrow().tabs.len(), 2, "不立即重排：仍 2 个选项卡");
+            assert_eq!(app.model.borrow().active_tab, 1, "活动选项卡不变");
         });
     });
     let contents = cx.update(|_w, cx| {
         let a = app.read(cx);
-        a.tabs
+        a.model.borrow().tabs
             .iter()
             .map(|t| t.editor.read(cx).value().to_string())
             .collect::<Vec<_>>()
@@ -290,10 +290,10 @@ async fn import_session_restores_on_next_startup(cx: &mut TestAppContext) {
     let (tabs, act, paths, contents) = cx.update(|_w, cx| {
         let a = app2.read(cx);
         let paths: Vec<Option<std::path::PathBuf>> =
-            a.tabs.iter().map(|t| t.file_path.clone()).collect();
+            a.model.borrow().tabs.iter().map(|t| t.file_path.clone()).collect();
         let contents: Vec<String> =
-            a.tabs.iter().map(|t| t.editor.read(cx).value().to_string()).collect();
-        (a.tabs.len(), a.active_tab, paths, contents)
+            a.model.borrow().tabs.iter().map(|t| t.editor.read(cx).value().to_string()).collect();
+        (a.model.borrow().tabs.len(), a.model.borrow().active_tab, paths, contents)
     });
     assert_eq!(tabs, 2, "恢复 2 个选项卡");
     assert_eq!(act, 1);
@@ -346,8 +346,8 @@ async fn import_bundle_without_session_applies_prefs(cx: &mut TestAppContext) {
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
             app.apply_import_bundle(Some(parsed), &dir, _w, cx);
-            assert_eq!(app.theme_pref, ThemePref::Light, "配置照常应用");
-            assert_eq!(app.font_size, 15.0);
+            assert_eq!(app.model.borrow_mut().theme_pref, ThemePref::Light, "配置照常应用");
+            assert_eq!(app.model.borrow_mut().font_size, 15.0);
             let toast = app.notifications.last().map(|n| n.message_str().to_string());
             assert_eq!(toast.as_deref(), Some("配置已导入（导出包无会话）"));
         });
@@ -365,21 +365,23 @@ async fn apply_invalid_bundle_is_zero_side_effect(cx: &mut TestAppContext) {
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
             let before = (
-                app.theme_pref,
-                app.font_size,
+                // SC-3：同语句多次 `borrow_mut()`（RefMut 独占，先后求值即运行期
+                // 双借 panic）→ 纯读取改 `borrow()`（共享借可并存），断言语义不变。
+                app.model.borrow().theme_pref,
+                app.model.borrow().font_size,
                 app.sidebar.width,
                 app.sidebar.width_auto,
-                app.tabs.len(),
-                app.session_restore,
+                app.model.borrow().tabs.len(),
+                app.model.borrow().session_restore,
             );
             app.apply_import_bundle(None, &dir, _w, cx);
             let after = (
-                app.theme_pref,
-                app.font_size,
+                app.model.borrow().theme_pref,
+                app.model.borrow().font_size,
                 app.sidebar.width,
                 app.sidebar.width_auto,
-                app.tabs.len(),
-                app.session_restore,
+                app.model.borrow().tabs.len(),
+                app.model.borrow().session_restore,
             );
             assert_eq!(after, before, "非法包零副作用（不误应用）");
             let toast = app
@@ -412,8 +414,8 @@ async fn partial_prefs_valid_session_broken(cx: &mut TestAppContext) {
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
             app.apply_import_bundle(Some(parsed), &dir, _w, cx);
-            assert_eq!(app.theme_pref, ThemePref::Light, "配置照常应用");
-            assert_eq!(app.font_size, 14.0);
+            assert_eq!(app.model.borrow_mut().theme_pref, ThemePref::Light, "配置照常应用");
+            assert_eq!(app.model.borrow_mut().font_size, 14.0);
             let toast = app.notifications.last().map(|n| n.message_str().to_string());
             assert_eq!(toast.as_deref(), Some("配置已导入，会话无效已跳过"));
         });
@@ -445,9 +447,9 @@ async fn partial_session_valid_prefs_broken(cx: &mut TestAppContext) {
     let dir = xfer_temp_dir("partial_session");
     cx.update(|_w, cx| {
         app.update(cx, |app, cx| {
-            let before_theme = app.theme_pref;
+            let before_theme = app.model.borrow_mut().theme_pref;
             app.apply_import_bundle(Some(parsed), &dir, _w, cx);
-            assert_eq!(app.theme_pref, before_theme, "失效 prefs 不误应用");
+            assert_eq!(app.model.borrow_mut().theme_pref, before_theme, "失效 prefs 不误应用");
             let toast = app.notifications.last().map(|n| n.message_str().to_string());
             assert_eq!(toast.as_deref(), Some("配置无效已跳过，会话已导入"));
         });
@@ -465,13 +467,13 @@ async fn export_writes_file_and_reimports(cx: &mut TestAppContext) {
     let (app, cx) = add_app_zero_tabs(cx);
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            app.theme_pref = ThemePref::Dark;
-            app.dark_mode = true;
-            app.font_size = 16.0;
+            app.model.borrow_mut().theme_pref = ThemePref::Dark;
+            app.model.borrow_mut().dark_mode = true;
+            app.model.borrow_mut().font_size = 16.0;
             app.sidebar.width = 200.0;
             app.sidebar.width_auto = false;
             let i = app.make_tab(window, cx);
-            app.tabs[i].editor.update(cx, |ed, _| ed.set_text("被导出内容"));
+            app.model.borrow().tabs[i].editor.update(cx, |ed, _| ed.set_text("被导出内容"));
             app.activate_tab(i, window, cx);
         });
     });

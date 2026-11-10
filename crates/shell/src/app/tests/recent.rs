@@ -1,4 +1,4 @@
-﻿
+
     /// 「打开最近」记录：`record_recent_file/folder` 去重置顶 + 每类 ≤50（纯逻辑断言）。
     #[gpui::test]
     async fn record_recent_dedup_top_and_truncate(cx: &mut TestAppContext) {
@@ -12,8 +12,8 @@
         // 先清本实例最近列表，让断言与机器上真实 config 无关。
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders.clear();
-                app.recent_files.clear();
+                app.model.borrow_mut().recent_folders.clear();
+                app.model.borrow_mut().recent_files.clear();
             });
         });
         // 去重置顶：文件 a → b → a（重开 a 应置顶且无重复）。
@@ -29,7 +29,7 @@
                 app.record_recent_file(&a);
             });
         });
-        let files = cx.update(|_w, cx| app.read(cx).recent_files.clone());
+        let files = cx.update(|_w, cx| app.read(cx).model.borrow().recent_files.clone());
         assert_eq!(files, vec![sa.clone(), sb.clone()], "重复打开应去重置顶（新→旧）");
 
         // 文件夹：重复打开只保留一条。
@@ -42,7 +42,7 @@
                 app.record_recent_folder(&dir);
             });
         });
-        let folders = cx.update(|_w, cx| app.read(cx).recent_folders.clone());
+        let folders = cx.update(|_w, cx| app.read(cx).model.borrow().recent_folders.clone());
         assert_eq!(folders, vec![sd.clone()], "文件夹重复打开应只保留一条");
 
         // 超 50 条 → 最旧被挤出（每类各自独立 ≤50）。
@@ -53,7 +53,7 @@
                 app.update(cx, |app, _| app.record_recent_file(&p));
             });
         }
-        let files = cx.update(|_w, cx| app.read(cx).recent_files.clone());
+        let files = cx.update(|_w, cx| app.read(cx).model.borrow().recent_files.clone());
         assert_eq!(files.len(), config::limits::RECENT_MAX, "最近文件应截断到 50");
         assert_eq!(
             files[0],
@@ -88,8 +88,8 @@
         // 清本实例最近列表（K8：config load 无 cfg(test) 门控，勿依赖机器真实 config）。
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders.clear();
-                app.recent_files.clear();
+                app.model.borrow_mut().recent_folders.clear();
+                app.model.borrow_mut().recent_files.clear();
             });
         });
         let f = std::env::temp_dir().join("recent-open-good.txt");
@@ -105,7 +105,7 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        let files = cx.update(|_w, cx| app.read(cx).recent_files.clone());
+        let files = cx.update(|_w, cx| app.read(cx).model.borrow().recent_files.clone());
         assert_eq!(files, vec![s.clone()], "打开文件成功应记录最近");
 
         cx.update(|window, cx| {
@@ -114,7 +114,7 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        let folders = cx.update(|_w, cx| app.read(cx).recent_folders.clone());
+        let folders = cx.update(|_w, cx| app.read(cx).model.borrow().recent_folders.clone());
         assert_eq!(folders, vec![sd.clone()], "打开文件夹成功应记录最近");
 
         // 不可读文本文件：打开失败早退 → 不记录。
@@ -129,7 +129,7 @@
         }
         let (status_ok, files) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.status_ok, a.recent_files.clone())
+            (a.model.borrow().status_ok, a.model.borrow().recent_files.clone())
         });
         assert!(!status_ok, "打开失败应置失败状态");
         assert!(
@@ -214,8 +214,8 @@
             .collect();
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders = folders.clone();
-                app.recent_files = files.clone();
+                app.model.borrow_mut().recent_folders = folders.clone();
+                app.model.borrow_mut().recent_files = files.clone();
             });
         });
         open_panel(&app, cx);
@@ -246,8 +246,8 @@
         // 清本实例最近列表（K8：config load 无 cfg(test) 门控，须保证空态起点）。
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders.clear();
-                app.recent_files.clear();
+                app.model.borrow_mut().recent_folders.clear();
+                app.model.borrow_mut().recent_files.clear();
             });
         });
         open_panel(&app, cx);
@@ -272,9 +272,9 @@
         let f = std::env::temp_dir().join("recent-click-good.txt");
         std::fs::write(&f, "data").unwrap();
         let s = f.to_string_lossy().into_owned();
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|_w, cx| {
-            app.update(cx, |app, _| app.recent_files = vec![s.clone()]);
+            app.update(cx, |app, _| app.model.borrow_mut().recent_files = vec![s.clone()]);
         });
         open_panel(&app, cx);
         let row = cx
@@ -287,7 +287,7 @@
         }
         let (tabs, files, panel) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs.len(), a.recent_files.clone(), a.recent_panel.is_some())
+            (a.model.borrow().tabs.len(), a.model.borrow().recent_files.clone(), a.recent_panel.is_some())
         });
         assert_eq!(tabs, tabs_before + 1, "点文件行应打开新选项卡");
         assert_eq!(files, vec![s.clone()], "打开成功后最近记录保持（去重置顶）");
@@ -309,7 +309,7 @@
         std::fs::write(&f, "data").unwrap();
         let s = f.to_string_lossy().into_owned();
         cx.update(|_w, cx| {
-            app.update(cx, |app, _| app.recent_files = vec![s.clone()]);
+            app.update(cx, |app, _| app.model.borrow_mut().recent_files = vec![s.clone()]);
         });
         open_panel(&app, cx);
         let row = cx
@@ -323,7 +323,7 @@
         let (tab_present, panel, focused) = cx.update(|window, cx| {
             let a = app.read(cx);
             (
-                a.tabs.get(a.active_tab).map(|t| t.file_path.clone()).flatten().is_some(),
+                a.model.borrow().tabs.get(a.model.borrow().active_tab).map(|t| t.file_path.clone()).flatten().is_some(),
                 a.recent_panel.is_some(),
                 window.focused(cx),
             )
@@ -354,9 +354,9 @@
         let f = std::env::temp_dir().join("focus-menu-recent.txt");
         std::fs::write(&f, "data").unwrap();
         let s = f.to_string_lossy().into_owned();
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|_w, cx| {
-            app.update(cx, |app, _| app.recent_files = vec![s.clone()]);
+            app.update(cx, |app, _| app.model.borrow_mut().recent_files = vec![s.clone()]);
         });
         // 点标题栏「文件」菜单按钮 → 菜单含「打开最近…」（根行带 › 指示）→ 悬停展开次级。
         cx.simulate_click(gpui::Point::new(px(36.), px(16.)), Default::default());
@@ -382,7 +382,7 @@
         cx.simulate_click(row, Default::default());
         pump_panel(cx);
         let (tabs, focused, menu_gone, fly_gone) = {
-            let tabs = cx.update(|_w, cx| app.read(cx).tabs.len());
+            let tabs = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
             let focused = cx.update(|window, cx| window.focused(cx));
             (tabs, focused, cx.debug_bounds("recent-menu-open").is_none(), cx.debug_bounds("menu-flyout").is_none())
         };
@@ -410,9 +410,9 @@
         let f = std::env::temp_dir().join("recent-kbd.txt");
         std::fs::write(&f, "data").unwrap();
         let s = f.to_string_lossy().into_owned();
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|_w, cx| {
-            app.update(cx, |app, _| app.recent_files = vec![s.clone()]);
+            app.update(cx, |app, _| app.model.borrow_mut().recent_files = vec![s.clone()]);
         });
         open_panel(&app, cx);
         // 面板打开即聚焦自身 → ↓ 选中第一个可导航行（文件行）→ Enter 执行。
@@ -435,7 +435,7 @@
         }
         let (tabs, panel) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs.len(), a.recent_panel.is_some())
+            (a.model.borrow().tabs.len(), a.recent_panel.is_some())
         });
         assert_eq!(tabs, tabs_before + 1, "↓+Enter 应打开选中的文件行");
         assert!(!panel, "Enter 后面板应关闭");
@@ -453,9 +453,9 @@
         }
         let missing = std::env::temp_dir().join("recent-missing.txt");
         let s = missing.to_string_lossy().into_owned();
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         cx.update(|_w, cx| {
-            app.update(cx, |app, _| app.recent_files = vec![s.clone()]);
+            app.update(cx, |app, _| app.model.borrow_mut().recent_files = vec![s.clone()]);
         });
         open_panel(&app, cx);
         let row = cx
@@ -469,10 +469,10 @@
         let (tabs, files, status, status_ok, panel) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs.len(),
-                a.recent_files.clone(),
-                a.status.to_string(),
-                a.status_ok,
+                a.model.borrow().tabs.len(),
+                a.model.borrow().recent_files.clone(),
+                a.model.borrow().status.to_string(),
+                a.model.borrow().status_ok,
                 a.recent_panel.is_some(),
             )
         });
@@ -498,7 +498,7 @@
         let missing = std::env::temp_dir().join("recent-missing-dir");
         let s = missing.to_string_lossy().into_owned();
         cx.update(|_w, cx| {
-            app.update(cx, |app, _| app.recent_folders = vec![s.clone()]);
+            app.update(cx, |app, _| app.model.borrow_mut().recent_folders = vec![s.clone()]);
         });
         open_panel(&app, cx);
         let row = cx
@@ -511,7 +511,7 @@
         }
         let (folders, status, status_ok, panel) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.recent_folders.clone(), a.status.to_string(), a.status_ok, a.recent_panel.is_some())
+            (a.model.borrow().recent_folders.clone(), a.model.borrow().status.to_string(), a.model.borrow().status_ok, a.recent_panel.is_some())
         });
         assert!(folders.is_empty(), "失效文件夹应从最近列表移除");
         assert!(!status_ok, "失效文件夹应置状态为失败");
@@ -540,8 +540,8 @@
             .collect();
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders = folders.clone();
-                app.recent_files = files.clone();
+                app.model.borrow_mut().recent_folders = folders.clone();
+                app.model.borrow_mut().recent_files = files.clone();
             });
         });
         open_panel(&app, cx);
@@ -593,8 +593,8 @@
         let d = std::env::temp_dir().join("clear-dir").to_string_lossy().into_owned();
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders = vec![d.clone()];
-                app.recent_files = vec![f.clone()];
+                app.model.borrow_mut().recent_folders = vec![d.clone()];
+                app.model.borrow_mut().recent_files = vec![f.clone()];
             });
         });
         open_panel(&app, cx);
@@ -608,7 +608,7 @@
         }
         let (folders, files, panel) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.recent_folders.clone(), a.recent_files.clone(), a.recent_panel.is_some())
+            (a.model.borrow().recent_folders.clone(), a.model.borrow().recent_files.clone(), a.recent_panel.is_some())
         });
         assert!(folders.is_empty() && files.is_empty(), "Clear 应清空两类最近记录");
         assert!(!panel, "Clear 后面板应关闭");
@@ -629,11 +629,11 @@
         // 清空最近两类（K8：config load 无 cfg(test) 门控，勿依赖机器真实 config）。
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders.clear();
-                app.recent_files.clear();
+                app.model.borrow_mut().recent_folders.clear();
+                app.model.borrow_mut().recent_files.clear();
             });
         });
-        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         // 点标题栏「文件」菜单按钮 → 悬停「打开最近…」根行。
         cx.simulate_click(gpui::Point::new(px(36.), px(16.)), Default::default());
         pump_panel(cx);
@@ -662,7 +662,7 @@
         pump_panel(cx);
         cx.simulate_click(empty, Default::default());
         pump_panel(cx);
-        let tabs = cx.update(|_w, cx| app.read(cx).tabs.len());
+        let tabs = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
         assert_eq!(tabs, tabs_before, "点禁用占位项不应打开任何东西");
         assert!(cx.debug_bounds("menu-flyout").is_some(), "点禁用占位项后菜单应保持展开");
         assert!(cx.debug_bounds("recent-menu-open").is_some(), "点禁用占位项后父菜单保持展开");
@@ -687,8 +687,8 @@
         let (fd, fs) = (dir.to_string_lossy().into_owned(), f.to_string_lossy().into_owned());
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders = vec![fd.clone()];
-                app.recent_files = vec![fs.clone()];
+                app.model.borrow_mut().recent_folders = vec![fd.clone()];
+                app.model.borrow_mut().recent_files = vec![fs.clone()];
             });
         });
         // 打开文件菜单 → 悬停「打开最近…」。
@@ -741,8 +741,8 @@
         let (fd, fs) = (dir.to_string_lossy().into_owned(), f.to_string_lossy().into_owned());
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.recent_folders = vec![fd.clone()];
-                app.recent_files = vec![fs.clone()];
+                app.model.borrow_mut().recent_folders = vec![fd.clone()];
+                app.model.borrow_mut().recent_files = vec![fs.clone()];
             });
         });
         cx.simulate_click(gpui::Point::new(px(36.), px(16.)), Default::default());
@@ -764,7 +764,7 @@
         pump_panel(cx);
         let (folders, files) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.recent_folders.clone(), a.recent_files.clone())
+            (a.model.borrow().recent_folders.clone(), a.model.borrow().recent_files.clone())
         });
         assert!(folders.is_empty() && files.is_empty(), "清空应清两类最近记录");
         assert!(cx.debug_bounds("menu-flyout").is_none(), "清空后次级应关闭");

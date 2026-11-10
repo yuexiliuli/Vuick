@@ -34,8 +34,8 @@ impl EditorApp {
     ) -> gpui::AnyElement {
         // PDF / EPUB 等只读预览文档不生成编辑区（即使处于分屏/编辑-only 布局也直接跳过）。
         let readonly = self
-            .tabs
-            .get(self.active_tab)
+            .model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .map(|t| t.readonly_preview)
             .unwrap_or(false);
         if readonly {
@@ -45,19 +45,23 @@ impl EditorApp {
         // 这一帧渲染轻量占位（不含 16 万行编辑器 → 布局轻快），并复位标记请求
         // 下一帧挂载编辑器；编辑器的首帧 DisplayMap 布局（可能冻结一两秒）
         // 因此排在用户看到预览内容之后，而不是挡在最前面。
-        if self.tabs[self.active_tab].editor_pending {
-            self.tabs[self.active_tab].editor_pending = false;
+        let active = self.model.borrow().active_tab;
+        if self.model.borrow().tabs[active].editor_pending {
+            self.model.borrow_mut().tabs[active].editor_pending = false;
             cx.notify();
             return self.render_editor_pending(grow);
         }
         // P1 大文档整篇仍在后台装配：编辑区已有首块内容但**锁输入**（全区域透明拦截，
         // 防「打开期间编辑」与 EOF 整篇换装竞态）；`finish_file_text` 换装后同帧解锁。
-        if self.tabs[self.active_tab].loading_lock {
+        if self.model.borrow().tabs[active].loading_lock {
             return self.render_plain_editor(grow, true, cx);
         }
         // 所见即所得预览编辑（WYSIWYG）模式：左面板 = 本项目 `WyEditor`
         // （AUTO-GROW，内部无滚动条，宿主负责滚动 + 自绘纵向滚动条）。
-        if let Some(ed) = self.tabs[self.active_tab].live2.clone() {
+        // 先取出 live2 实体（owned）再 `if let`，避免 `if let` 掮获 `borrow()` 临时
+        // Ref 的生命周期跨过块内 `&mut self` 调用（E0502 / 借用纪律收窄）。
+        let live2 = self.model.borrow().tabs[active].live2.clone();
+        if let Some(ed) = live2 {
             // live2 未就绪（大文档后台装配在途）：**冻结源码编辑区** + 全区域透明输入
             // 拦截层——窗口期内不整白屏等后台（原白屏根因），也不在空壳上画空白帧。
             // 就绪后下一帧自动切入 `render_live_area`（首帧即真内容，靠既有预建槽）。
@@ -108,7 +112,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let fs = self.font_size;
+        let fs = self.model.borrow().font_size;
         let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
         ed.update(cx, |ed, _| {
             ed.set_host_scroll(Some(vhand.clone()), LIVE_BODY_PAD_Y);
@@ -130,14 +134,14 @@ impl EditorApp {
         grow: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let vhand = self.tabs[self.active_tab].live_vscroll.clone();
+        let vhand = self.model.borrow().tabs[self.model.borrow().active_tab].live_vscroll.clone();
         self.drive_wy_host(ed, &vhand, window, cx);
         let live_any = ed.clone().into_any_element();
         let text_color = self.text_primary();
-        let fs = self.font_size;
+        let fs = self.model.borrow().font_size;
         // 纵向滚动句柄（跨帧稳定）：`#live-scroll` 原生 `overflow_y_scroll` 在此
         // GPUI 不绘制可见滚动条，右侧 `Scrollbar::vertical` 自绘跟随它。
-        let vhand = self.tabs[self.active_tab].live_vscroll.clone();
+        let vhand = self.model.borrow().tabs[self.model.borrow().active_tab].live_vscroll.clone();
         div()
             .id("editor-area")
             .debug_selector(|| "editor-area".into())
@@ -192,9 +196,9 @@ impl EditorApp {
         freeze_input: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let editor = self.tabs[self.active_tab].editor.clone();
+        let editor = self.model.borrow().tabs[self.model.borrow().active_tab].editor.clone();
         // 字号覆盖（用户 Ctrl+=/- 调节；None=主题默认）。渲染时由 CodeEditor 自身读取。
-        let font_size = self.font_size;
+        let font_size = self.model.borrow().font_size;
         editor.update(cx, |ed, _| ed.set_font_override(Some(font_size)));
         let mut el = div()
             .id("editor-area")
@@ -367,13 +371,13 @@ impl EditorApp {
             .relative()
             // PDF → PdfViewer（整页原样）；其余 → Markdown 渲染器。
             // Entity 直接作为子元素渲染（内部 size_full）。
-            .child(Self::preview_element(&self.tabs[self.active_tab]));
+            .child(Self::preview_element(&self.model.borrow().tabs[self.model.borrow().active_tab]));
         // 自包含阅读器（PDF/图片/视频）各自处理滚轮：不再挂全局 zoom_overlay（对齐
         // `render_fullscreen_preview` 同一口径）。否则绝对定位的覆盖层（命中测试最靠前）
         // 会在 Ctrl+滚轮时**先于阅读器**消费并 `stop_propagation`，媒体自身 Ctrl+滚轮
         // 缩放失效——普通滚轮则被不拦截地透传到阅读器。仅非阅读器占位（无 md_wy 的
         // 文本/纯文本等）保留全局字号入口。
-        if !self.tabs[self.active_tab].reader.is_reader() {
+        if !self.model.borrow().tabs[self.model.borrow().active_tab].reader.is_reader() {
             preview_pane = preview_pane.child(Self::zoom_overlay(cx));
         }
         div()
@@ -415,9 +419,9 @@ impl EditorApp {
         if !ed.read(cx).is_loaded() {
             return self.md_wy_pending_placeholder(fullscreen, grow);
         }
-        let vhand = self.tabs[self.active_tab].md_wy_vscroll.clone();
+        let vhand = self.model.borrow().tabs[self.model.borrow().active_tab].md_wy_vscroll.clone();
         self.drive_wy_host(&ed, &vhand, window, cx);
-        let fs = self.font_size;
+        let fs = self.model.borrow().font_size;
         let any = ed.clone().into_any_element();
         let text_color = self.text_primary();
         let scroll = div()
@@ -551,7 +555,7 @@ impl EditorApp {
             cx.notify();
         }
         // 全屏阅读（PDF / 图片 / 视频）：自包含阅读器自处理缩放，无需全局字号推进。
-        let tab = &self.tabs[self.active_tab];
+        let tab = &self.model.borrow().tabs[self.model.borrow().active_tab];
         let mut el = div()
             .id("fullscreen-preview")
             .debug_selector(|| "fullscreen-preview".into())

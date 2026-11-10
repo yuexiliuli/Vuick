@@ -20,12 +20,12 @@
         let (preview_on, content, tabs, status_ok, fullscreen, wrap) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs[a.active_tab].preview_on,
-                a.tabs[a.active_tab].content.to_string(),
-                a.tabs.len(),
-                a.status_ok,
-                a.tabs[a.active_tab].preview_fullscreen,
-                a.tabs[a.active_tab].md_wy.is_some(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].preview_on,
+                a.model.borrow().tabs[a.model.borrow().active_tab].content.to_string(),
+                a.model.borrow().tabs.len(),
+                a.model.borrow().status_ok,
+                a.model.borrow().tabs[a.model.borrow().active_tab].preview_fullscreen,
+                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some(),
             )
         });
         assert!(status_ok, "打开 EPUB 应成功");
@@ -43,7 +43,8 @@
         // 不能翻转进空白编辑区或把预览源覆盖成空串导致内容消失。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.toggle_preview_for_tab(app.active_tab, window, cx);
+                let active_idx = app.model.borrow().active_tab;
+                app.toggle_preview_for_tab(active_idx, window, cx);
             });
         });
         for _ in 0..8 {
@@ -51,7 +52,7 @@
         }
         let (still_on, still_fullscreen, still_content) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.preview_on,
                 t.preview_fullscreen,
@@ -99,7 +100,7 @@
         for _ in 0..200 {
             cx.run_until_parked();
             let loaded = cx.update(|_w, cx| {
-                tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+                tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
                     .map(|pv| pv.read(cx).is_loaded())
                     .unwrap_or(false)
             });
@@ -110,12 +111,12 @@
         let (page_count, tabs, status, status_ok, fullscreen, readonly, no_md_content) =
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 (
                     tab_pdf(t).map(|pv| pv.read(cx).page_count()).unwrap_or(0),
-                    a.tabs.len(),
-                    a.status.to_string(),
-                    a.status_ok,
+                    a.model.borrow().tabs.len(),
+                    a.model.borrow().status.to_string(),
+                    a.model.borrow().status_ok,
                     t.preview_fullscreen,
                     t.readonly_preview,
                     t.content.is_empty(),
@@ -170,7 +171,7 @@
             cx.run_until_parked();
             let loaded = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                tab_pdf(&a.tabs[a.active_tab])
+                tab_pdf(&a.model.borrow().tabs[a.model.borrow().active_tab])
                     .map(|pv| pv.read(cx).is_loaded())
                     .unwrap_or(false)
             });
@@ -193,7 +194,7 @@
         }
         let (loaded, tiles, cover, pending) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let pv = tab_pdf(&a.tabs[a.active_tab]).expect("PDF 阅读器在场").read(cx);
+            let pv = tab_pdf(&a.model.borrow().tabs[a.model.borrow().active_tab]).expect("PDF 阅读器在场").read(cx);
             // P4：pdf 已独立 crate，经只读访问器取内部调度状态（不再直接读 slots/pending_tiles）。
             let (tiles, cover, pending) = pv.tiles_schedule_progress();
             (pv.is_loaded(), tiles, cover, pending)
@@ -239,7 +240,7 @@
         for _ in 0..400 {
             cx.run_until_parked();
             let loaded = cx.update(|_w, cx| {
-                tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+                tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
                     .map(|pv| pv.read(cx).is_loaded())
                     .unwrap_or(false)
             });
@@ -249,10 +250,10 @@
         }
         let (page_count, status_ok) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 tab_pdf(t).map(|pv| pv.read(cx).page_count()).unwrap_or(0),
-                a.status_ok,
+                a.model.borrow().status_ok,
             )
         });
         let elapsed = t0.elapsed();
@@ -313,7 +314,7 @@
         if n > 1 {
             let last_toc_line = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 // P4-2：统一 WyEditor 只读宿主（`MarkdownPreview` 已删）。
                 t.md_wy
                     .as_ref()
@@ -321,10 +322,14 @@
             });
             if let Some(Some(line)) = last_toc_line {
                 cx.update(|_w, cx| {
-                    let a = app.read(cx);
-                    let t = &a.tabs[a.active_tab];
                     // 统一宿主：set_scroll_target（prepaint 重钉到章标题所在块顶）。
-                    let wy = t.md_wy.clone().expect("统一宿主在场");
+                    // 先取出 wy（owned）再 release 守卫，避免持 `a`/`t` 时 `wy.update(cx,..)`
+                    // 对 `*cx` 的可变借用与 `app.read(cx)` 的不可变借用冲突（E0502）。
+                    let wy = {
+                        let a = app.read(cx);
+                        let model = a.model.borrow();
+                        model.tabs[model.active_tab].md_wy.clone().expect("统一宿主在场")
+                    };
                     wy.update(cx, |v, _| v.set_scroll_target(line));
                 });
                 for _ in 0..8 {
@@ -367,7 +372,7 @@
         // 初始：全屏 + 换行
         let (fs0, wrap0) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             // P4-2：预览统一 WyEditor 恒换行（`MarkdownPreview::is_wrap` 已删）。
             (t.preview_fullscreen, t.md_wy.is_some())
         });
@@ -393,7 +398,7 @@
         }
         let (fs1, wrap1) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (t.preview_fullscreen, t.md_wy.is_some())
         });
         assert!(!fs1, "切换后应退出全屏");
@@ -409,8 +414,8 @@
         let (wrap2, pref2) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs[a.active_tab].md_wy.is_some(),
-                a.wrap_enabled,
+                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some(),
+                a.model.borrow().wrap_enabled,
             )
         });
         assert!(wrap2, "切换换行开关不应影响 EPUB 预览（预览独立保持换行）");
@@ -426,8 +431,8 @@
         let (wrap3, pref3) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs[a.active_tab].md_wy.is_some(),
-                a.wrap_enabled,
+                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some(),
+                a.model.borrow().wrap_enabled,
             )
         });
         assert!(wrap3, "预览应保持换行");
@@ -505,7 +510,7 @@
          -> Common {
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[idx];
+                let t = &a.model.borrow().tabs[idx];
                 (
                     t.preview_on,
                     t.preview_fullscreen,
@@ -535,7 +540,7 @@
         );
         assert_eq!(c.10, pdf_p, "PDF 应装配文件路径");
         assert!(
-            cx.update(|_w, cx| matches!(&app.read(cx).tabs[i_pdf].reader, MediaReader::Pdf(_))),
+            cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_pdf].reader, MediaReader::Pdf(_))),
             "PDF 应挂 Pdf 阅读器"
         );
 
@@ -549,7 +554,7 @@
         );
         assert_eq!(c.10, img_p, "图片应装配文件路径");
         assert!(
-            cx.update(|_w, cx| matches!(&app.read(cx).tabs[i_img].reader, MediaReader::Image(_))),
+            cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_img].reader, MediaReader::Image(_))),
             "图片应挂 Image 查看器"
         );
 
@@ -565,7 +570,7 @@
             );
             assert_eq!(c.10, vid_p, "视频应装配文件路径");
             assert!(
-                cx.update(|_w, cx| matches!(&app.read(cx).tabs[i_vid].reader, MediaReader::Video(_))),
+                cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_vid].reader, MediaReader::Video(_))),
                 "视频应挂 Video 查看器"
             );
         }
@@ -588,7 +593,7 @@
         assert!(c.7 > 0 && c.8 > 0, "EPUB 应有真实行/字计数（实际 {}/{}）", c.7, c.8);
         let (epub_status_ok, epub_reader_none) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.status_ok, matches!(&a.tabs[i_epub].reader, MediaReader::None))
+            (a.model.borrow().status_ok, matches!(&a.model.borrow().tabs[i_epub].reader, MediaReader::None))
         });
         assert!(epub_status_ok, "EPUB 打开状态应成功");
         assert!(epub_reader_none, "EPUB 不挂媒体阅读器（纯 WyEditor 宿主）");
@@ -632,7 +637,7 @@
         let reader_bg = |cx: &mut VisualTestContext, idx: usize| -> Option<gpui::Hsla> {
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                match &a.tabs[idx].reader {
+                match &a.model.borrow().tabs[idx].reader {
                     MediaReader::Pdf(p) => p.read(cx).background(),
                     MediaReader::Image(i) => i.read(cx).background(),
                     #[cfg(feature = "video")]
@@ -658,7 +663,11 @@
         // refresh_theme_ui 内同步完成，无需 pump 渲染即可读）。回归点：曾漏刷非 PDF 阅读器。
         cx.update(|_w, cx| {
             app.update(cx, |a, cx| {
-                a.dark_mode = !a.dark_mode;
+                // SC-3：同语句 `borrow_mut()`（LHS guard 存活）时求值 `borrow()`（RHS）
+                // → 运行期双借 panic → 先提纯 owned 旧值再单独写（guard 不残留，避免
+                // 与后续 `&mut self` 调用 E0502）。
+                let dark = a.model.borrow().dark_mode;
+                a.model.borrow_mut().dark_mode = !dark;
                 a.refresh_theme_ui(cx);
                 cx.notify();
             });
@@ -675,7 +684,11 @@
         // 切回 → 图片背景还原到打开时值；PDF 默认档仍 None。
         cx.update(|_w, cx| {
             app.update(cx, |a, cx| {
-                a.dark_mode = !a.dark_mode;
+                // SC-3：同语句 `borrow_mut()`（LHS guard 存活）时求值 `borrow()`（RHS）
+                // → 运行期双借 panic → 先提纯 owned 旧值再单独写（guard 不残留，避免
+                // 与后续 `&mut self` 调用 E0502）。
+                let dark = a.model.borrow().dark_mode;
+                a.model.borrow_mut().dark_mode = !dark;
                 a.refresh_theme_ui(cx);
                 cx.notify();
             });
@@ -721,7 +734,7 @@
             for _ in 0..600 {
                 cx.run_until_parked();
                 let loaded = cx.update(|_w, cx| {
-                    tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+                    tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
                         .map(|pv| pv.read(cx).is_loaded())
                         .unwrap_or(false)
                 });
@@ -740,7 +753,7 @@
         });
         wait_loaded(cx);
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len()),
             3,
             "初始空 tab + A + B 共 3 个选项卡"
         );
@@ -770,7 +783,7 @@
         cx.run_until_parked();
         assert!(
             cx.update(|_w, cx| {
-                app.read(cx).pdf_search.as_ref()
+                app.read(cx).model.borrow().pdf_search.as_ref()
                     == Some(&(a_idx, "配置".to_string()))
             }),
             "应在侧栏渲染时把查询推给 A（pdf_search 键 (A,配置)）"
@@ -789,7 +802,7 @@
             cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(5));
             let hits = cx.update(|_w, cx| {
-                tab_pdf(&app.read(cx).tabs[a_idx])
+                tab_pdf(&app.read(cx).model.borrow().tabs[a_idx])
                     .expect("A 应挂 PDF 阅读器")
                     .read(cx)
                     .search_summary()
@@ -827,7 +840,7 @@
         // `PdfViewer::focus_match_on_page`）→ 阅读器在 update 上下文内 emit notify →
         // （per-tab 订阅下）`_pdf_sub` 回调 `cx.notify()` → 本计数器 +1。
         let a_pdf = cx.update(|_w, cx| {
-            tab_pdf(&app.read(cx).tabs[a_idx])
+            tab_pdf(&app.read(cx).model.borrow().tabs[a_idx])
                 .expect("A 应挂 PDF 阅读器")
                 .clone()
         });
@@ -871,7 +884,7 @@
             for _ in 0..600 {
                 cx.run_until_parked();
                 let loaded = cx.update(|_w, cx| {
-                    tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
+                    tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
                         .map(|pv| pv.read(cx).is_loaded())
                         .unwrap_or(false)
                 });
@@ -891,7 +904,7 @@
         wait_loaded(cx);
         // 记住第一个 PDF 的阅读器实体（换位后按实体身份找回它的选项卡，防下标漂移）。
         let first_pdf = cx.update(|_w, cx| {
-            tab_pdf(&app.read(cx).tabs[1])
+            tab_pdf(&app.read(cx).model.borrow().tabs[1])
                 .expect("第 1 个 PDF 阅读器应在场")
                 .clone()
         });
@@ -945,7 +958,7 @@
         // 兜底：换位后第一个 PDF 仍指向同一阅读器实体（未错位）。
         let still_first = cx.update(|_w, cx| {
             app.read(cx)
-                .tabs
+                .model.borrow().tabs
                 .iter()
                 .any(|t| matches!(&t.reader, MediaReader::Pdf(p) if p.entity_id() == first_pdf_entity_id))
         });

@@ -97,58 +97,16 @@ pub(super) enum ReorderSide {
 }
 
 impl EditorApp {
+    /// SC-4：动作体已迁 `AppModel::make_tab`（shell_core::actions）。此处 glue 转发。
     pub(super) fn make_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> usize {
-        // 自研编辑器组件：创建即空文档；语法高亮语言在打开文件时 set_language。
-        let editor = cx.new(|cx| editor::CodeEditor::new(cx));
-        // 编辑内容被修改 → 置脏 + 同步内容/行列缓存 + 预览增量入口。
-        let edit_sub = self.subscribe_editor(&editor, cx);
-
-        self.tabs.push(EditorTab {
-            editor,
-            file_path: None,
-            source_encoding: None, // 新建选项卡 = 纯 UTF-8
-            dirty: false,
-            content: SharedString::default(),
-            line_count: 1,
-            char_count: 0,
-            cursor_row: 0,
-            cursor_col: 0,
-            reader: MediaReader::None,
-            preview_on: false,
-            preview_fullscreen: false,
-            readonly_preview: false,
-            editor_pending: false,
-            loading_lock: false,
-            live_edit: false,
-            live2: None,
-            live2_dirty: false,
-            _live2_sub: None,
-            live_vscroll: gpui::ScrollHandle::new(),
-            md_wy: None,
-            md_wy_vscroll: gpui::ScrollHandle::new(),
-            md_wy_install: MdWyInstall::default(),
-            epub_images: Default::default(),
-            epub_notes: Default::default(),
-            edit_version: 0,
-            _edit_sub: edit_sub,
-            _pdf_sub: None,
-        });
-        let idx = self.tabs.len() - 1;
-        self.active_tab = idx;
-        // 新选项卡 → 结构变化立即持久化（恢复期间由 `session_restoring` 抑制）。
-        self.schedule_session_flush(cx, true);
-        idx
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().make_tab(host, &mut **cx)
     }
 
+    /// SC-4：动作体已迁 `AppModel::new_tab`。glue 转发。
     pub(super) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let idx = self.make_tab(window, cx);
-        let focus = self.tab_focus_handle(idx, cx);
-        window.focus(&focus, cx);
-        self.status = SharedString::from("新建文件");
-        self.status_ok = true;
-        // make_tab 已即时持久化；此处再安排一次（幂等）以覆盖「新建即激活」语义。
-        self.schedule_session_flush(cx, true);
-        cx.notify();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().new_tab(host, window, &mut **cx);
     }
 
     /// 计算拖拽光标 x 落在选项卡行内的「插入下标」（相对当前 `tabs`；`tabs.len()` =
@@ -159,7 +117,7 @@ impl EditorApp {
     /// 本函数只按 x 定下标。命中依据 `self.tab_bounds`（上一帧渲染的真实 laid-out
     /// 边界，与输入坐标同系、含横向滚动）。
     pub(super) fn tab_insert_index(&self, x: Pixels) -> Option<usize> {
-        if self.tabs.is_empty() || self.tab_bounds.is_empty() {
+        if self.model.borrow().tabs.is_empty() || self.tab_bounds.is_empty() {
             return None;
         }
         let first = self.tab_bounds[0].get();
@@ -202,66 +160,26 @@ impl EditorApp {
     /// （`tab_insert_index` 输出，相对当前 `tabs`；`tabs.len()` = 末尾）。
     /// 插回原位 / 原相邻位（顺序不变）→ 不动作；单选项卡天然不动作。活动下标随移动
     /// 校正；各选项卡内容/脏点/路径不变；结构变化即时持久化。
+    /// SC-4：动作体已迁 `AppModel::reorder_tab`。glue 转发。
     pub(super) fn reorder_tab(&mut self, from: usize, target: usize, cx: &mut Context<Self>) {
-        let n = self.tabs.len();
-        if n <= 1 || from >= n {
-            return;
-        }
-        let target = target.min(n);
-        // remove(from) 后相对原数组的插入位：`from < target` 时左移一位。
-        if target == from || target == from + 1 {
-            return; // 落回原位 / 原相邻交界 = 顺序无变化
-        }
-        let tab = self.tabs.remove(from);
-        let insert_at = if from < target { target - 1 } else { target };
-        self.tabs.insert(insert_at, tab);
-        // 活动选项卡跟随：被拖动项 = insert_at；其余按「先删后插」的下标迁移校正——
-        // 删 from（>from 者 -1）再插 insert_at（≥insert_at 者 +1）。
-        let a0 = self.active_tab;
-        if a0 == from {
-            self.active_tab = insert_at;
-        } else {
-            let a1 = if a0 > from { a0 - 1 } else { a0 };
-            self.active_tab = if a1 >= insert_at { a1 + 1 } else { a1 };
-        }
-        self.search_scan = None; // 选项卡集合结构变化 → 搜索缓存失效
-        self.schedule_session_flush(cx, true);
-        cx.notify();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().reorder_tab(host, from, target, &mut **cx);
     }
 
+    /// SC-4：动作体已迁 `AppModel::activate_tab`。glue 转发。
     pub(super) fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if idx >= self.tabs.len() {
-            return;
-        }
-        self.active_tab = idx;
-        // 活动选项卡变化（用户点击切换）→ 立即持久化（便宜；make_tab/remove_tab
-        // 等已自带，这里覆盖纯「切换激活」的用户操作）。
-        self.schedule_session_flush(cx, true);
-        // PDF / EPUB 等只读预览文档没有可见编辑区，不把焦点给隐藏的编辑器，
-        // 而是给 App 根（让窗口级快捷键仍可用）。
-        let readonly = self.tabs[idx].readonly_preview;
-        if readonly {
-            let root = self.focus_handle(cx);
-            window.focus(&root, cx);
-        } else {
-            let focus = self.tab_focus_handle(idx, cx);
-            window.focus(&focus, cx);
-        }
-        // 拆出窗口构造期（`constructing=true`）抑制：`window.focus` 已直接 `refresh`
-        // （首帧前落定、被同步首帧清除），无需再入队 notify 让首帧后补刷一整帧。
-        if !self.constructing {
-            cx.notify();
-        }
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().activate_tab(host, idx, window, &mut **cx);
     }
 
     pub(super) fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if idx >= self.tabs.len() {
+        if idx >= self.model.borrow().tabs.len() {
             return;
         }
         // 未命名选项卡（无论脏与否：空内容同样在盘上有会话槽位）→ 一律弹确认
         // （是=另存为转正、否=删除临时槽位、取消=留在应用）；命名文件仅当脏（有
         // 未落盘修改）才询问，干净直通关闭。
-        if self.tabs[idx].file_path.is_some() && !self.tabs[idx].dirty {
+        if self.model.borrow().tabs[idx].file_path.is_some() && !self.model.borrow().tabs[idx].dirty {
             self.remove_tab(idx, window, cx);
             return;
         }
@@ -284,7 +202,7 @@ impl EditorApp {
                         // 保存成功（或本就无待存）才关，失败保留标签（observe 已 toast）。
                         let is_pdf = cx
                             .update_window_entity(&entity, |this, _w, _cx| {
-                                this.tabs
+                                this.model.borrow().tabs
                                     .get(idx)
                                     .is_some_and(|t| matches!(t.reader, MediaReader::Pdf(_)))
                             })
@@ -297,7 +215,7 @@ impl EditorApp {
                             let started = cx
                                 .update_window_entity(&entity, |this, _w, cx| {
                                     let p = this
-                                        .tabs
+                                        .model.borrow().tabs
                                         .get(idx)
                                         .and_then(|t| match &t.reader {
                                             MediaReader::Pdf(p) => Some(p.clone()),
@@ -316,7 +234,7 @@ impl EditorApp {
                                 for _ in 0..200 {
                                     let clean = cx
                                         .update_window_entity(&entity, |this, _w, cx| {
-                                            this.tabs
+                                            this.model.borrow().tabs
                                                 .get(idx)
                                                 .map(|t| match &t.reader {
                                                     MediaReader::Pdf(p) => {
@@ -339,18 +257,23 @@ impl EditorApp {
                             }
                         } else {
                             let (saved, need_dialog) = cx
-                                .update_window_entity(&entity, |this, _window, cx| match this
-                                    .tabs
-                                    .get(idx)
-                                    .and_then(|t| t.file_path.clone())
-                                {
-                                    Some(p) => {
-                                        // 走统一口径：live2 开启时读 WyEditor 实时内容
-                                        // （否则关闭保存的是陈旧的源码编辑区，丢整段编辑）。
-                                        let text = this.tab_effective_text(idx, cx);
-                                        (Some(this.write_to_path(idx, &p, text, cx)), false)
+                                .update_window_entity(&entity, |this, _window, cx| {
+                                    // 先取出 path（owned）再 match，避免 `match` 掮获 `borrow()`
+                                    // 临时 Ref 跨过块内 `&mut self` 调用（E0502 / 借用纪律收窄）。
+                                    let path = this
+                                        .model.borrow().tabs
+                                        .get(idx)
+                                        .and_then(|t| t.file_path.clone());
+                                    match path {
+                                        Some(p) => {
+                                            // 走统一口径：live2 开启时读 WyEditor 实时内容
+                                            // （否则关闭保存的是陈旧的源码编辑区，丢整段编辑）。
+                                            let text =
+                                                this.model.borrow().tab_effective_text(idx, cx);
+                                            (Some(this.write_to_path(idx, &p, text, cx)), false)
+                                        }
+                                        None => (None, true),
                                     }
-                                    None => (None, true),
                                 })
                                 .unwrap_or((None, false));
                             if need_dialog {
@@ -377,12 +300,12 @@ impl EditorApp {
     }
 
     fn save_unnamed_and_close(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if idx >= self.tabs.len() {
+        if idx >= self.model.borrow().tabs.len() {
             return;
         }
         let file_name = self.tab_file_name(idx);
         // live2 开启时读 WyEditor 实时内容（防关闭保存丢编辑）。
-        let text = self.tab_effective_text(idx, cx);
+        let text = self.model.borrow().tab_effective_text(idx, cx);
         let entity = cx.entity();
         window
             .spawn(cx, async move |cx| {
@@ -409,45 +332,10 @@ impl EditorApp {
             .detach();
     }
 
+    /// SC-4：动作体已迁 `AppModel::remove_tab`。glue 转发。
     pub(super) fn remove_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if idx >= self.tabs.len() {
-            return;
-        }
-        self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
-        // 释放被移除选项卡持有的重资源（PDF 纹理 / 图片解码），实体随后随之释放。
-        // 顺序保持旧行为：先 PDF、再图片；视频无显式 release（随选项卡直接释放）。
-        let reader = std::mem::replace(&mut self.tabs[idx].reader, MediaReader::None);
-        match reader {
-            MediaReader::Pdf(pdf) => {
-                pdf.update(cx, |view, cx| view.release(window, cx));
-            }
-            MediaReader::Image(img) => {
-                img.update(cx, |view, cx| view.release(window, cx));
-            }
-            MediaReader::None => {}
-            #[cfg(feature = "video")]
-            MediaReader::Video(_) => {}
-        }
-        self.tabs.remove(idx);
-        // 选项卡被移除 → 结构变化立即持久化（零 tab 与重排后都写）。
-        self.schedule_session_flush(cx, true);
-        if self.tabs.is_empty() {
-            // 关闭最后一个选项卡 → 零选项卡，回到欢迎页：不退出、不新建空选项卡、
-            // 不 panic。此时没有编辑区可聚焦，焦点给应用根（窗口级快捷键照样可用）。
-            self.active_tab = 0;
-            let root = self.focus_handle(cx);
-            window.focus(&root, cx);
-            self.status = SharedString::from("已关闭");
-            self.status_ok = true;
-            cx.notify();
-            return;
-        }
-        if idx < self.active_tab {
-            self.active_tab -= 1;
-        } else if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        }
-        self.activate_tab(self.active_tab, window, cx);
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().remove_tab(host, idx, window, &mut **cx);
     }
 
     /// 标记“选项卡栏最近在滚动”：横向滚动条立即可见，并重启自动隐藏计时
@@ -485,7 +373,8 @@ impl EditorApp {
     /// `reorder_line` = 拖拽排序时本选项卡要绘制的白色插入指示线侧（None = 不画）；
     /// `bounds_cell` = 每帧真实 laid-out 边界写入点（`self.tab_bounds` 槽位，排序命中用）。
     fn tab_bar_item(
-        tab: &EditorTab,
+        name: &str,
+        dirty: bool,
         idx: usize,
         is_active: bool,
         reorder_line: Option<ReorderSide>,
@@ -494,13 +383,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let name = tab
-            .file_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "未命名".to_string());
-        let dirty = tab.dirty;
+        let name = name.to_string();
 
         // 元素级 hover 状态：跨帧记住「该 tab 是否被悬停」，关闭 × 因此在
         // 激活项恒定可见、非激活项悬停显现（VS Code 观感）。
@@ -598,7 +481,7 @@ impl EditorApp {
             move |_value: &TabDragData, offset, window, cx| {
                 if let Some(app) = app_weak.upgrade() {
                     let _ = app.update(cx, |app, cx| {
-                        app.tab_drag_grab = Some(offset);
+                        app.model.borrow_mut().tab_drag_grab = Some(offset);
                         // 拖拽开始即预建幽灵窗（隐藏；本周期 flush 落地）：Windows 透明置顶
                         // popup 的 OS 创建成本前移到拖拽起点，首个 on_drag_move 只 SetWindowPos
                         // 定位 → 胶囊从拖动一开始就跟手（原「建在首个 on_drag_move」会几百 ms
@@ -682,8 +565,8 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let active_is_md = self
-            .tabs
-            .get(self.active_tab)
+            .model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .and_then(|t| t.file_path.as_ref())
             .map(|p| Self::is_markdown_path(p))
             .unwrap_or(false);
@@ -734,7 +617,7 @@ impl EditorApp {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                        let idx = this.active_tab;
+                        let idx = this.model.borrow().active_tab;
                         this.toggle_preview_for_tab(idx, window, cx);
                     }),
                 )
@@ -755,7 +638,7 @@ impl EditorApp {
             && (*self.tab_bar_hscroll.visible.borrow() || hscroll_dragging)
         {
             // 滑块底色取主题语义 token（ChromeColors::scrollbar_thumb，亮暗同值）。
-            let thumb = ChromeColors::for_mode(self.dark_mode).scrollbar_thumb;
+            let thumb = ChromeColors::for_mode(self.model.borrow().dark_mode).scrollbar_thumb;
             Some(
                 div()
                     .absolute()
@@ -786,34 +669,53 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        if self.tabs.is_empty() {
+        if self.model.borrow().tabs.is_empty() {
             self.tab_bounds.clear();
             return div().into_any_element();
         }
-        let active = self.active_tab;
+        let active = self.model.borrow().active_tab;
         let colors = self.tab_bar_colors(cx);
         // 重建每帧的页卡边界槽（排序命中测试读上一帧值；记录器在 prepaint 写入）。
-        self.tab_bounds = (0..self.tabs.len())
+        self.tab_bounds = (0..self.model.borrow().tabs.len())
             .map(|_| Rc::new(Cell::new(Bounds::default())))
             .collect();
         // 拖拽排序插入指示线：仅拖拽中按 `tab_reorder_target` 指派——目标 < n → 该目标
         // 选项卡左缘一线；目标 == n（末尾）→ 最后一个选项卡右缘一线。
-        let reorder_target = if self.tab_dragging.is_some() {
-            self.tab_reorder_target
+        let reorder_target = if self.model.borrow().tab_dragging.is_some() {
+            self.model.borrow().tab_reorder_target
         } else {
             None
         };
+        // 借用纪律（SC-5）：先一次 borrow 快照每个选项卡渲染所需的廉价字段（显示名 +
+        // 脏标记），guard 随即释放——构造期不再持 `tabs` 长借用。`tab_bar_item` 只消费
+        // 这两项派生数据，改动零渲染差异。
+        let tab_meta: Vec<(String, bool)> = {
+            let model = self.model.borrow();
+            model
+                .tabs
+                .iter()
+                .map(|t| {
+                    let name = t
+                        .file_path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "未命名".to_string());
+                    (name, t.dirty)
+                })
+                .collect()
+        };
+        let tabs_len = tab_meta.len();
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
-        for (i, tab) in self.tabs.iter().enumerate() {
+        for (i, (name, dirty)) in tab_meta.into_iter().enumerate() {
             let line = match reorder_target {
                 Some(t) if i == t => Some(ReorderSide::Left),
-                Some(t) if t == self.tabs.len() && i + 1 == self.tabs.len() => {
-                    Some(ReorderSide::Right)
-                }
+                Some(t) if t == tabs_len && i + 1 == tabs_len => Some(ReorderSide::Right),
                 _ => None,
             };
             tabs.push(Self::tab_bar_item(
-                tab,
+                &name,
+                dirty,
                 i,
                 i == active,
                 line,
@@ -1140,69 +1042,30 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 批量关闭前的脏/未命名审查：`affected(i)` 为真的选项卡中**任一** `dirty` 或
-    /// `file_path.is_none()`（未命名）→ 中止整次批量（一个都不关）+ 状态栏提示；
-    /// 全部干净 → 返回 true 放行。headless 可测：中止路径不下发任何 `remove_tab`。
-    fn tab_close_guard(&mut self, affected: &dyn Fn(usize) -> bool, cx: &mut Context<Self>) -> bool {
-        let any_unsaved = self
-            .tabs
-            .iter()
-            .enumerate()
-            .any(|(i, t)| affected(i) && (t.dirty || t.file_path.is_none()));
-        if any_unsaved {
-            self.status = SharedString::from("有未保存的更改，未关闭");
-            self.status_ok = false;
-            cx.notify();
-            return false;
-        }
-        true
-    }
-
+    /// SC-4：批量关闭动作体已迁 `AppModel`（tab_close_guard/others/right/all/saved）。
     /// 「关闭其他」：关闭除 `idx` 外全部；任一受影响脏/未命名 → 中止一个都不关。
     pub(super) fn tab_close_others(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tab_close_guard(&|i| i != idx, cx) {
-            return;
-        }
-        for i in (0..self.tabs.len()).rev() {
-            if i != idx {
-                self.remove_tab(i, window, cx);
-            }
-        }
-        cx.notify();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().tab_close_others(host, idx, window, &mut **cx);
     }
 
     /// 「关闭右侧」：关闭 `idx` 右侧全部；任一受影响脏/未命名 → 中止一个都不关。
     pub(super) fn tab_close_right(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tab_close_guard(&|i| i > idx, cx) {
-            return;
-        }
-        for i in (idx + 1..self.tabs.len()).rev() {
-            self.remove_tab(i, window, cx);
-        }
-        cx.notify();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().tab_close_right(host, idx, window, &mut **cx);
     }
 
     /// 「关闭全部」：关闭全部；任一脏/未命名 → 中止一个都不关。
     pub(super) fn tab_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tab_close_guard(&|_| true, cx) {
-            return;
-        }
-        for i in (0..self.tabs.len()).rev() {
-            self.remove_tab(i, window, cx);
-        }
-        cx.notify();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().tab_close_all(host, window, &mut **cx);
     }
 
     /// 「关闭已保存」：只关 `有路径 && !dirty` 的选项卡（定义如此，无中止语义）；
     /// 脏 / 未命名 / 无路径空选项卡保留。
     pub(super) fn tab_close_saved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for i in (0..self.tabs.len()).rev() {
-            let saved = self.tabs[i].file_path.is_some() && !self.tabs[i].dirty;
-            if saved {
-                self.remove_tab(i, window, cx);
-            }
-        }
-        cx.notify();
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().tab_close_saved(host, window, &mut **cx);
     }
 
     /// 「移入新窗口」：取载荷 → 拆进新独立窗口（级联偏移 = 源窗口左上 + (24,24)）。
@@ -1213,7 +1076,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if idx >= self.tabs.len() {
+        if idx >= self.model.borrow().tabs.len() {
             return;
         }
         let Some(payload) = self.commit_live_and_take_tab_payload(idx, window, cx) else {
@@ -1230,12 +1093,16 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if idx >= self.tabs.len() {
+        if idx >= self.model.borrow().tabs.len() {
             return;
         }
-        if self.tabs[idx].reader.is_none() {
+        // 先提纯 reader_none / media_path（owned）再分支，避免 `if` 条件里的 `borrow()`
+        // 临时 Ref 跨过块内 `&mut self` 调用（E0502 / 借用纪律收窄）。
+        let reader_none = self.model.borrow().tabs[idx].reader.is_none();
+        let media_path = self.model.borrow().tabs[idx].file_path.clone();
+        if reader_none {
             self.tab_copy_text_to_new_window(idx, window, cx);
-        } else if let Some(p) = self.tabs[idx].file_path.clone() {
+        } else if let Some(p) = media_path {
             // 媒体（PDF/图片/视频）：文件型不可变 → 新窗口按路径重开（路径即快照）。
             self.tab_copy_media_to_new_window(&p, window, cx);
         }
@@ -1253,9 +1120,10 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         let (text, path, dirty, preview_on, readonly_preview, cursor_row, cursor_col, line_count, char_count, src_enc) = {
-            let t = &self.tabs[idx];
+            let model = self.model.borrow();
+            let t = &model.tabs[idx];
             (
-                self.tab_effective_text(idx, cx),
+                model.tab_effective_text(idx, &**cx),
                 t.file_path.clone(),
                 t.dirty,
                 t.preview_on,
@@ -1271,10 +1139,10 @@ impl EditorApp {
         // 复制前记下源窗口活动选项卡：`make_tab` 把 `active_tab` 指到瞬态副本、
         // `take_tab_payload` 拔出副本后又把它改到末位选项卡——复制「非末位」选项卡时
         // 源窗口活动会跳到最后一个选项卡（可见闪烁）。取下后还原到复制前活动。
-        let kept_active = self.active_tab;
+        let kept_active = self.model.borrow().active_tab;
         let new_idx = self.make_tab(window, cx);
         // ① 先喂独立编辑器（新实体，不共享源缓冲）：内容 / 语言沿用 / 光标保留。
-        self.tabs[new_idx].editor.update(cx, |ed, _cx| {
+        self.model.borrow().tabs[new_idx].editor.update(cx, |ed, _cx| {
             ed.set_text(&text);
             if let Some(l) = lang {
                 ed.set_language(Some(l));
@@ -1283,7 +1151,8 @@ impl EditorApp {
         });
         // ② 后回填元数据（覆盖 set_text 触发的编辑事件副作用，保 dirty/preview 语义）。
         {
-            let t = &mut self.tabs[new_idx];
+            let mut model = self.model.borrow_mut();
+            let t = &mut model.tabs[new_idx];
             t.file_path = path.clone();
             t.source_encoding = src_enc;
             t.dirty = dirty;
@@ -1299,7 +1168,7 @@ impl EditorApp {
             return;
         };
         // 还原源窗口活动选项卡（瞬态副本已拔出，原下标全部未变）。
-        self.active_tab = kept_active;
+        self.model.borrow_mut().active_tab = kept_active;
         // make_tab 期间的会话快照带瞬态副本 tab → 取下后立即补刷（detached 内部早退）。
         self.schedule_session_flush(cx, true);
         self.split_tab_to_new_window(payload, Point::new(px(24.), px(24.)), window, cx);
@@ -1366,7 +1235,7 @@ impl EditorApp {
         let reopen = path.to_path_buf();
         let _ = wh.update(cx, |_root, w, cx| {
             let _ = target.update(cx, |app, cx| {
-                if !app.tabs.is_empty() {
+                if !app.model.borrow().tabs.is_empty() {
                     app.remove_tab(0, w, cx); // 占位空选项卡让位
                 }
                 // 直调 `open_file_here`（而非 `open_file`）：本动作的目标窗口就是刚建的新

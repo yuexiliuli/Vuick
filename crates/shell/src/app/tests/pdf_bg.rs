@@ -29,13 +29,13 @@ fn bg_menu_center(cx: &mut VisualTestContext, id: &'static str) -> gpui::Point<g
 /// 活动 PDF 阅读器实体。
 fn bg_active_pdf(app: &gpui::Entity<EditorApp>, cx: &mut VisualTestContext) -> gpui::Entity<pdf::PdfViewer> {
     cx.update(|_w, cx| {
-        tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab]).unwrap().clone()
+        tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]).unwrap().clone()
     })
 }
 
 /// 读应用当前 pdf_bg 偏好。
 fn bg_pref(app: &gpui::Entity<EditorApp>, cx: &mut VisualTestContext) -> PdfBgPref {
-    cx.update(|_w, cx| app.read(cx).pdf_bg)
+    cx.update(|_w, cx| app.read(cx).model.borrow().pdf_bg)
 }
 
 /// R1/R2/R3/R6：右键菜单含「背景色」（根行带 › 指示）；悬停 → 次级菜单展开、父项全部

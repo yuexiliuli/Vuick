@@ -22,9 +22,10 @@
 
 pub mod app;
 
-/// 公共命令表（单一真值）：菜单 / 命令面板 / 根级快捷键共享 label 与快捷键常量，
-/// 根级键位 [`commands::root_keybindings`] 供二进制壳 `src/main.rs` 绑定。
-pub mod commands;
+/// 公共命令表已拆独立 crate `shell_commands`（菜单 / 命令面板 / 根级快捷键共享
+/// label 与快捷键常量，[`commands::root_keybindings`] 供二进制壳 `src/main.rs` 绑定）。
+/// 此处经 `commands` 别名重导出，维持既有 `shell::commands::*` 路径。
+pub use shell_commands as commands;
 
 /// 自绘横向滚动条（原根级 `src/scrollbar.rs`，仅 app 消费，随 shell 吸收）。
 mod scrollbar;

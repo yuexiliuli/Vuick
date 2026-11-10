@@ -12,14 +12,14 @@
                 // （config crate 作依赖编译不带自身 cfg(test)，照常读盘）——真机配置可能含
                 // 用户开启过的 "close_to_tray":true，测试须与真机配置解耦：显式归零默认关
                 // 再跑翻转断言，不断言从真实 config 读到的初始值。
-                app.close_to_tray = false;
+                app.model.borrow_mut().close_to_tray = false;
                 app.toggle_close_to_tray(window, cx);
-                assert!(app.close_to_tray, "点击一次 → 开");
+                assert!(app.model.borrow_mut().close_to_tray, "点击一次 → 开");
                 // tray crate 状态联动：开关已翻、主窗口已知 → 应判定「点 × 隐藏到托盘」。
                 tray::set_main_hwnd(12345);
                 assert!(tray::should_close_to_tray(), "开关开且主窗口已知 → 进托盘");
                 app.toggle_close_to_tray(window, cx);
-                assert!(!app.close_to_tray, "再点 → 关");
+                assert!(!app.model.borrow_mut().close_to_tray, "再点 → 关");
                 assert!(!tray::should_close_to_tray(), "开关关 → 点 × 真退出");
                 // 收尾清掉测试进程内的托盘全局状态，避免污染其它 shell 测试。
                 tray::set_main_hwnd(0);

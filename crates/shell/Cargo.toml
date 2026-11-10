@@ -41,6 +41,13 @@ epub = { path = "../epub" }
 # 会话持久化 / 设置导出 / 最近面板实体 叶子 crate（自 app/session + app/settings_xfer +
 # app/recent_panel 拆出；shell 保留编排、经 RecentPanelHost trait 接入面板）。
 session_store = { path = "../session_store" }
+# 公共命令表（纯命令表）与侧边栏跨文件搜索纯扫描层叶子 crate（自 commands.rs /
+# app/sidebar/mod.rs 纯扫描部分拆出；shell 保留编排与重导出）。
+shell_commands = { workspace = true }
+shell_scan = { workspace = true }
+# SC-1：外壳宿主纯模型类型（EditorTab/DetachedTab/MediaReader/MdWyInstall/拖拽/标题栏
+# 等，自 app/mod.rs 拆出；shell 保留全部编排与 impl EditorApp，经 app 模块重导出）。
+shell_core = { path = "../shell_core" }
 # 音乐播放器（Phase A 引擎 + Phase B UI 已提交）：shell 集成（整窗音乐模式 /
 # 打开音频文件路由 / 状态栏指示）。不静态链 FFmpeg（运行时经 libloading 加载）。
 music = { path = "../music" }
@@ -51,7 +58,9 @@ default = ["video"]
 # ui 的 `video` 图标变体不在此转发：video crate 自身声明 `ui{features=["video"]}`
 # （见 crates/video/Cargo.toml），一经 `dep:video` 开启即随之启用；显式转发点统一在根包。
 # --no-default-features 时本 feature 关闭 → 视频整链关闭、不拉 FFmpeg 依赖。
-video = ["dep:video"]
+# 同步转发 `shell_core/video`（MediaReader::Video 变体随 shell_core 的 `video` feature
+# 编译，与 shell 同一开关联动，避免两侧编译态分叉）。
+video = ["dep:video", "shell_core/video"]
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。

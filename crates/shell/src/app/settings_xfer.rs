@@ -150,16 +150,16 @@ impl EditorApp {
         if let Some(pv) = bundle.prefs {
             let prefs = UserPrefs::from_json_value(&pv);
             // 主题即时生效：偏好三态落地 + 刷新全局主题与各预览/画布背景。
-            self.theme_pref = prefs.theme;
-            self.dark_mode = prefs.theme.resolved_dark(cx.window_appearance());
+            self.model.borrow_mut().theme_pref = prefs.theme;
+            self.model.borrow_mut().dark_mode = prefs.theme.resolved_dark(cx.window_appearance());
             // PDF 画布背景偏好：**先于** refresh_theme_ui 落地（其 default 守卫按新值走），
             // 之后再按偏好应用显式色到各 PDF 画布（default 档由守卫回落主题）。
-            self.pdf_bg = prefs.pdf_bg;
-            self.pdf_bg_custom = prefs.pdf_bg_custom.clone();
+            self.model.borrow_mut().pdf_bg = prefs.pdf_bg;
+            self.model.borrow_mut().pdf_bg_custom = prefs.pdf_bg_custom.clone();
             self.refresh_theme_ui(cx);
             self.apply_pdf_backgrounds(cx);
             // 字号即时生效（沿用启动同款 clamp / 默认口径）。
-            self.font_size = prefs
+            self.model.borrow_mut().font_size = prefs
                 .font_size
                 .map(|v| v.clamp(FONT_MIN, FONT_MAX))
                 .unwrap_or(DEFAULT_FONT_SIZE);
@@ -167,21 +167,21 @@ impl EditorApp {
             self.sidebar.width = prefs.sidebar_width.unwrap_or(SIDEBAR_WIDTH);
             self.sidebar.width_auto = prefs.sidebar_width.is_none();
             // 会话恢复 / 关闭到托盘开关：以导入值为准（诚实跟随，含显式 false）。
-            self.session_restore = prefs.session_restore.unwrap_or(true);
-            self.close_to_tray = prefs.close_to_tray.unwrap_or(false);
+            self.model.borrow_mut().session_restore = prefs.session_restore.unwrap_or(true);
+            self.model.borrow_mut().close_to_tray = prefs.close_to_tray.unwrap_or(false);
             // 媒体打开位置两个开关：以导入值为准（诚实跟随，含显式 false），即时生效。
-            self.media_new_window = prefs.media_new_window.unwrap_or(true);
-            self.reuse_media_window = prefs.reuse_media_window.unwrap_or(true);
+            self.model.borrow_mut().media_new_window = prefs.media_new_window.unwrap_or(true);
+            self.model.borrow_mut().reuse_media_window = prefs.reuse_media_window.unwrap_or(true);
             // 媒体窗口记录尺寸：以导入值为准（None = 还原为「新开跟随发起窗口大小」）。
-            self.music_window_size = prefs
+            self.model.borrow_mut().music_window_size = prefs
                 .music_window_size
                 .map(|(w, h)| gpui::size(px(w), px(h)));
-            self.video_window_size = prefs
+            self.model.borrow_mut().video_window_size = prefs
                 .video_window_size
                 .map(|(w, h)| gpui::size(px(w), px(h)));
             // 最近打开列表随配置恢复。
-            self.recent_folders = prefs.recent_folders;
-            self.recent_files = prefs.recent_files;
+            self.model.borrow_mut().recent_folders = prefs.recent_folders;
+            self.model.borrow_mut().recent_files = prefs.recent_files;
             // 打开文件夹根：有效目录 → 设根并（与启动/换根同一语义）后台扫根直接子项
             // ——只设根不拉侧栏，也绝不把树停在「根已展开却永不填充」的死态。路径失效/
             // 无效 → 不设根（首次 persist 时按既有路径写回 null）。
@@ -200,7 +200,7 @@ impl EditorApp {
         // 会话：写回当前 session 目录、下一启动恢复；开关按导入值显式关闭 → 诚实跟随
         // （清而不写，对齐既有「开关关只清不写」语义）。
         let out = if let Some((manifest, slots)) = bundle.session {
-            if self.session_restore {
+            if self.model.borrow().session_restore {
                 if write_imported_session(session_dir, &manifest, &slots) {
                     SessionOutcome::Written
                 } else {
@@ -238,7 +238,8 @@ impl EditorApp {
     /// 右上角 toast（导出/导入结果统一入口）：替换上一条同款提示（自持 key 不堆积，
     /// 同 `goto_line_toast` 姿势）。
     fn settings_toast(&mut self, msg: String, cx: &mut Context<Self>) {
-        if let Some(key) = self.settings_toast_key.take() {
+        let key = self.model.borrow_mut().settings_toast_key.take();
+        if let Some(key) = key {
             self.remove_notification1::<SettingsTransferToast>(key);
         }
         let key = gpui::ElementId::from(SharedString::from(format!(
@@ -248,7 +249,7 @@ impl EditorApp {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         )));
-        self.settings_toast_key = Some(key.clone());
+        self.model.borrow_mut().settings_toast_key = Some(key.clone());
         self.push_notification(
             Notification::new()
                 .id1::<SettingsTransferToast>(key)

@@ -397,7 +397,7 @@ impl EditorApp {
             self.file_tree_invalidate(path, window, cx);
         }
         // 已打开选项卡路径同步（文件精确 / 目录下子树整体前缀改写）。
-        for tab in self.tabs.iter_mut() {
+        for tab in self.model.borrow_mut().tabs.iter_mut() {
             let Some(fp) = tab.file_path.clone() else { continue };
             if fp == path {
                 tab.file_path = Some(target.clone());
@@ -459,7 +459,7 @@ impl EditorApp {
         let is_dir = path.is_dir();
         // 受影响的打开选项卡：文件精确匹配 / 目录按前缀覆盖子树。
         let affected: Vec<usize> = self
-            .tabs
+            .model.borrow().tabs
             .iter()
             .enumerate()
             .filter(|(_, t)| {
@@ -474,11 +474,11 @@ impl EditorApp {
             .map(|(i, _)| i)
             .collect();
         // 决策：任一受影响选项卡有未保存修改 → 不删磁盘（不可静默丢内容），提示后取消。
-        if affected.iter().any(|&i| self.tabs[i].dirty) {
-            self.status = SharedString::from(
+        if affected.iter().any(|&i| self.model.borrow().tabs[i].dirty) {
+            self.model.borrow_mut().status = SharedString::from(
                 "有未保存修改，未删除：请先保存或关闭相关选项卡，再重试删除",
             );
-            self.status_ok = false;
+            self.model.borrow_mut().status_ok = false;
             cx.notify();
             return;
         }
@@ -502,16 +502,16 @@ impl EditorApp {
                     self.file_tree_invalidate(path, window, cx);
                 }
                 self.schedule_session_flush(cx, true);
-                self.status = SharedString::from(format!(
+                self.model.borrow_mut().status = SharedString::from(format!(
                     "已删除{}{}",
                     if is_dir { "文件夹" } else { "文件" },
                     path.display()
                 ));
-                self.status_ok = true;
+                self.model.borrow_mut().status_ok = true;
             }
             Err(e) => {
-                self.status = SharedString::from(format!("删除失败：{e}"));
-                self.status_ok = false;
+                self.model.borrow_mut().status = SharedString::from(format!("删除失败：{e}"));
+                self.model.borrow_mut().status_ok = false;
             }
         }
         cx.notify();
@@ -561,8 +561,8 @@ impl EditorApp {
         match cmd.spawn() {
             Ok(_) => {}
             Err(e) => {
-                self.status = SharedString::from(format!("无法在资源管理器中显示：{e}"));
-                self.status_ok = false;
+                self.model.borrow_mut().status = SharedString::from(format!("无法在资源管理器中显示：{e}"));
+                self.model.borrow_mut().status_ok = false;
             }
         }
         cx.notify();
@@ -614,15 +614,15 @@ impl EditorApp {
         let label = if copy { "已复制：" } else { "已剪切：" };
         match tray::set_clipboard_file_drop(path, copy) {
             Ok(()) => {
-                self.status = SharedString::from(format!(
+                self.model.borrow_mut().status = SharedString::from(format!(
                     "{label}{}",
                     path.display()
                 ));
-                self.status_ok = true;
+                self.model.borrow_mut().status_ok = true;
             }
             Err(e) => {
-                self.status = SharedString::from(e);
-                self.status_ok = false;
+                self.model.borrow_mut().status = SharedString::from(e);
+                self.model.borrow_mut().status_ok = false;
             }
         }
         cx.notify();

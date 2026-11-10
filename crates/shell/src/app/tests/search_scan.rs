@@ -2,7 +2,7 @@
 // `find_ci` 大小写折叠、首个命中、UTF-8 字节区间；`scan_line_hits` 行偏移、
 // 单行多命中、上限截断、空文档/尾换行、极长行。保证优化不漂移命中语义。
 
-use crate::app::sidebar::{find_ci, folder_scan_collect, scan_line_hits, FolderScanUpdate};
+use shell_scan::{find_ci, folder_scan_collect, scan_line_hits, FolderScanUpdate};
 use config::limits::SEARCH_RESULT_CAP;
 
 #[test]

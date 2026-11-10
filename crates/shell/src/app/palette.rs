@@ -1,14 +1,14 @@
 //! 命令面板宿主接线（P2-8）：打开/关闭 + 命令/文件条目构建。
 //!
 //! 单一来源说明：命令面板的命令 label / 快捷键与顶部菜单（`menu.rs`）共享公共命令表
-//! （`crate::commands`）为唯一真值——两处从同一常量取 label + 快捷键展示串（个别命令
+//! （`shell_commands`）为唯一真值——两处从同一常量取 label + 快捷键展示串（个别命令
 //! 的菜单/面板 label 历史不同，如「新建」 vs 「新建文件」，同在表内一行）。菜单还承载
-//! disabled / 分隔线 / 动态勾选等渲染细节，仍保留各自结构（见 `commands.rs` 模块注释）；
+//! disabled / 分隔线 / 动态勾选等渲染细节，仍保留各自结构（见 `shell_commands` 模块注释）；
 //! 分类（文件/编辑/查看/设置）只被面板使用，随面板内联。
 
 use super::*;
 use crate::actions::{Copy, Cut, Redo, SelectAll, Undo};
-use crate::commands::{
+use shell_commands::{
     COPY, CUT, DECREASE_FONT, FOLLOW_THEME, INCREASE_FONT, NEW_FILE, OPEN_FILE, OPEN_FOLDER,
     PASTE, PREVIEW, QUIT, REDO, RESET_FONT, SAVE, SAVE_AS, SELECT_ALL, THEME, TOGGLE_SIDEBAR,
     TOGGLE_WRAP, UNDO,
@@ -57,16 +57,22 @@ impl EditorApp {
     /// （PDF/图片/视频/EPUB/音乐整窗）→ toast「当前选项卡不支持跳转行」，不崩、不开卡。
     /// （旧命令面板 GoToLine 已被编辑区顶部居中卡片取代，见 `crates/editor/src/goto.rs`。）
     pub(super) fn goto_line_in_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
-            return; // 零选项卡欢迎页 → 静默
+        // SC-2：把「媒体/只读判定 + 编辑器克隆」提到共享 guard 作用域内取完即释放——
+        // 否则命名 `model: Ref` 会拦后续 `&mut self`（E0502），先量后放、语义不变。
+        let (is_media, ed) = {
+            let active = self.model.borrow().active_tab;
+            let model = self.model.borrow();
+            let Some(tab) = model.tabs.get(active) else {
+                return; // 零选项卡欢迎页 → 静默
+            };
+            (tab.reader.is_reader() || tab.readonly_preview, tab.editor.clone())
         };
         // 守卫对齐 find 的判定：音乐整窗 / MediaReader / EPUB 只读预览。
-        if self.music_mode || tab.reader.is_reader() || tab.readonly_preview {
+        if self.model.borrow().music_mode || is_media {
             self.goto_line_toast("当前选项卡不支持跳转行");
             cx.notify();
             return;
         }
-        let ed = tab.editor.clone();
         ed.update(cx, |ed, cx| ed.open_goto(window, cx));
         cx.notify();
     }
@@ -74,7 +80,8 @@ impl EditorApp {
     /// 非文本选项卡 Ctrl+G「不支持跳转行」提示（进入 toast，替换上一条同款提示，不堆积）。
     fn goto_line_toast(&mut self, msg: &str) {
         // 先移除上一条（自持 key，只在跳转行路径使用）。
-        if let Some(key) = self.goto_line_toast_key.take() {
+        let key = self.model.borrow_mut().goto_line_toast_key.take();
+        if let Some(key) = key {
             self.remove_notification1::<GotoLineToast>(key);
         }
         let key = gpui::ElementId::from(SharedString::from(format!(
@@ -84,7 +91,7 @@ impl EditorApp {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         )));
-        self.goto_line_toast_key = Some(key.clone());
+        self.model.borrow_mut().goto_line_toast_key = Some(key.clone());
         self.push_notification(
             Notification::new()
                 .id1::<GotoLineToast>(key)
@@ -97,16 +104,21 @@ impl EditorApp {
     /// Ctrl+F：活动文本选项卡打开查找条；非文本选项卡（PDF/图片/视频/EPUB/音乐整窗）
     /// → toast「当前选项卡不支持查找」，不崩、不开条。
     pub(super) fn find_in_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
-            return; // 零选项卡欢迎页 → 静默
+        // SC-2：同 `goto_line_in_active_tab`——判定 + 克隆在 guard 作用域内取完即放。
+        let (is_media, ed) = {
+            let active = self.model.borrow().active_tab;
+            let model = self.model.borrow();
+            let Some(tab) = model.tabs.get(active) else {
+                return; // 零选项卡欢迎页 → 静默
+            };
+            (tab.reader.is_reader() || tab.readonly_preview, tab.editor.clone())
         };
         // 守卫对齐 goto_line 的判定：音乐整窗 / MediaReader / EPUB 只读预览。
-        if self.music_mode || tab.reader.is_reader() || tab.readonly_preview {
+        if self.model.borrow().music_mode || is_media {
             self.find_toast("当前选项卡不支持查找");
             cx.notify();
             return;
         }
-        let ed = tab.editor.clone();
         ed.update(cx, |ed, cx| ed.open_find(window, cx));
         cx.notify();
     }
@@ -119,13 +131,18 @@ impl EditorApp {
         cx: &mut Context<Self>,
         next: bool,
     ) {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
-            return;
+        // SC-2：同 `goto_line_in_active_tab`——判定 + 克隆在 guard 作用域内取完即放。
+        let (is_media, ed) = {
+            let active = self.model.borrow().active_tab;
+            let model = self.model.borrow();
+            let Some(tab) = model.tabs.get(active) else {
+                return;
+            };
+            (tab.reader.is_reader() || tab.readonly_preview, tab.editor.clone())
         };
-        if self.music_mode || tab.reader.is_reader() || tab.readonly_preview {
+        if self.model.borrow().music_mode || is_media {
             return;
         }
-        let ed = tab.editor.clone();
         ed.update(cx, |ed, cx| {
             if next {
                 ed.find_next(cx);
@@ -139,7 +156,8 @@ impl EditorApp {
 
     /// Find「不支持查找」提示（进入 toast，替换上一条同款提示，不堆积）。
     fn find_toast(&mut self, msg: &str) {
-        if let Some(key) = self.find_toast_key.take() {
+        let key = self.model.borrow_mut().find_toast_key.take();
+        if let Some(key) = key {
             self.remove_notification1::<FindToast>(key);
         }
         let key = gpui::ElementId::from(SharedString::from(format!(
@@ -149,7 +167,7 @@ impl EditorApp {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         )));
-        self.find_toast_key = Some(key.clone());
+        self.model.borrow_mut().find_toast_key = Some(key.clone());
         self.push_notification(
             Notification::new()
                 .id1::<FindToast>(key)
@@ -194,7 +212,7 @@ impl EditorApp {
         }
     }
 
-    /// 命令列表：与顶部菜单共享公共命令表（`crate::commands`）的 label/快捷键单一真值。
+    /// 命令列表：与顶部菜单共享公共命令表（`shell_commands`）的 label/快捷键单一真值。
     fn command_palette_items(&self, cx: &Context<Self>) -> Vec<PaletteItem> {
         let weak = cx.weak_entity();
         macro_rules! command {
@@ -250,7 +268,7 @@ impl EditorApp {
             }),
             // 查看
             command!("查看", PREVIEW, |this, window, cx| {
-                let idx = this.active_tab;
+                let idx = this.model.borrow().active_tab;
                 this.toggle_preview_for_tab(idx, window, cx);
             }),
             command!("查看", TOGGLE_SIDEBAR, |this, _window, cx| {
@@ -290,8 +308,8 @@ impl EditorApp {
     /// 已打开选项卡条目（不含「打开文件…」入口；quick open 扫描刷新时复用打头部分）。
     fn file_palette_opened_items(&self, cx: &Context<Self>) -> Vec<PaletteItem> {
         let weak = cx.weak_entity();
-        let mut items: Vec<PaletteItem> = Vec::with_capacity(self.tabs.len());
-        for (idx, tab) in self.tabs.iter().enumerate() {
+        let mut items: Vec<PaletteItem> = Vec::with_capacity(self.model.borrow().tabs.len());
+        for (idx, tab) in self.model.borrow().tabs.iter().enumerate() {
             let name = tab
                 .file_path
                 .as_ref()
@@ -340,7 +358,7 @@ impl EditorApp {
         let weak = cx.weak_entity();
         // 已打开文件不重复列为候选（去重；标题栏部分复用打头，避免同一文件出现两行）。
         let opened: std::collections::HashSet<PathBuf> = self
-            .tabs
+            .model.borrow().tabs
             .iter()
             .filter_map(|t| t.file_path.clone())
             .collect();
@@ -375,8 +393,8 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let generation = self.quick_open_gen.wrapping_add(1);
-        self.quick_open_gen = generation;
+        let generation = self.model.borrow().quick_open_gen.wrapping_add(1);
+        self.model.borrow_mut().quick_open_gen = generation;
         let Some(palette) = self.palette.clone() else {
             return;
         };
@@ -413,7 +431,7 @@ impl EditorApp {
                     }
                 }
                 let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
-                    if this.quick_open_gen != generation {
+                    if this.model.borrow().quick_open_gen != generation {
                         return; // 已被重新打开 / 换工作区取代 → 丢弃旧代结果
                     }
                     let Some(palette) = this.palette.clone() else {

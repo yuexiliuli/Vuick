@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::actions::{Copy, Cut, Redo, SelectAll, Undo};
-use crate::commands::{
+use shell_commands::{
     COPY, CUT, DECREASE_FONT, FOLLOW_THEME, INCREASE_FONT, NEW_FILE, OPEN_FILE, OPEN_FOLDER,
     PASTE, PREVIEW, QUIT, REDO, RESET_FONT, SAVE, SAVE_AS, SELECT_ALL, THEME,
     TOGGLE_MUSIC_PLAYER, TOGGLE_WRAP, UNDO,
@@ -44,7 +44,7 @@ impl EditorApp {
         })
     }
 
-    /// "文件"菜单。label / 快捷键来自公共命令表（`crate::commands` 单一真值）。
+    /// "文件"菜单。label / 快捷键来自公共命令表（`shell_commands` 单一真值）。
     /// 「打开最近…」已由「keep_open + 居中大面板」改为 **flyout 悬浮次级菜单**
     /// （悬停展开到右侧，见 [`Self::recent_flyout_items`]）；`cx` 用于在每次菜单
     /// 打开时快照最近列表（与 recent_panel「每次打开取最新」同语义）。
@@ -58,11 +58,11 @@ impl EditorApp {
         // （recent_panel 的「每次打开取最新」语义；列表更新仍走 file_ops 记录/落盘）。
         let recent_folders = weak
             .upgrade()
-            .map(|e| e.read(cx).recent_folders.clone())
+            .map(|e| e.read(cx).model.borrow().recent_folders.clone())
             .unwrap_or_default();
         let recent_files = weak
             .upgrade()
-            .map(|e| e.read(cx).recent_files.clone())
+            .map(|e| e.read(cx).model.borrow().recent_files.clone())
             .unwrap_or_default();
         menu.item(Self::menu_action_item(
             NEW_FILE.menu_label,
@@ -284,8 +284,8 @@ impl EditorApp {
         })
         .on_click(move |_click, _window, cx| {
             let _ = weak.update(cx, |app, cx| {
-                app.recent_folders.clear();
-                app.recent_files.clear();
+                app.model.borrow_mut().recent_folders.clear();
+                app.model.borrow_mut().recent_files.clear();
                 app.persist_prefs();
                 cx.notify();
             });
@@ -353,7 +353,7 @@ impl EditorApp {
             PREVIEW.shortcut,
             weak.clone(),
             |this, window, cx| {
-                let idx = this.active_tab;
+                let idx = this.model.borrow().active_tab;
                 this.toggle_preview_for_tab(idx, window, cx);
             },
         ))
@@ -434,7 +434,7 @@ impl EditorApp {
         PopupMenuItem::element(move |_, cx| {
             let on = weak
                 .upgrade()
-                .map(|e| e.read(cx).media_new_window)
+                .map(|e| e.read(cx).model.borrow().media_new_window)
                 .unwrap_or(true);
             let chrome = ui::theme::ChromeColors::for_mode(
                 ui::theme::Theme::global(cx).is_dark(),
@@ -462,11 +462,11 @@ impl EditorApp {
         PopupMenuItem::element(move |_, cx| {
             let enabled = weak
                 .upgrade()
-                .map(|e| e.read(cx).media_new_window)
+                .map(|e| e.read(cx).model.borrow().media_new_window)
                 .unwrap_or(true);
             let on = weak
                 .upgrade()
-                .map(|e| e.read(cx).reuse_media_window)
+                .map(|e| e.read(cx).model.borrow().reuse_media_window)
                 .unwrap_or(true);
             let chrome = ui::theme::ChromeColors::for_mode(
                 ui::theme::Theme::global(cx).is_dark(),
@@ -507,10 +507,10 @@ impl EditorApp {
             "",
             weak,
             |this, _window, cx| {
-                this.status = SharedString::from(
-                    "GPUI 编辑器 v0.1.0 — 基于 Rust + GPUI 0.2.2 + gpui-component",
+                this.model.borrow_mut().status = SharedString::from(
+                    "已剪贴板生效：文件更改已复制到剪贴板",
                 );
-                this.status_ok = true;
+                this.model.borrow_mut().status_ok = true;
                 cx.notify();
             },
         ))
@@ -524,8 +524,9 @@ impl EditorApp {
             let on = weak
                 .upgrade()
                 .map(|e| {
-                    let i = e.read(cx).active_tab;
-                    e.read(cx).tabs.get(i).map(|t| t.live2.is_some()).unwrap_or(false)
+                    let e = e.read(cx);
+                    let i = e.model.borrow().active_tab;
+                    e.model.borrow().tabs.get(i).map(|t| t.live2.is_some()).unwrap_or(false)
                 })
                 .unwrap_or(false);
             div()
@@ -546,13 +547,13 @@ impl EditorApp {
     }
 
     /// "自动换行"菜单项：动态显示当前是否开启（前导 ☑/☐），点击切换。
-    /// label 与快捷键来自公共命令表（`commands::TOGGLE_WRAP`）。
+    /// label 与快捷键来自公共命令表（`shell_commands::TOGGLE_WRAP`）。
     fn wrap_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
         let weak2 = weak.clone();
         PopupMenuItem::element(move |_, cx| {
             let on = weak
                 .upgrade()
-                .map(|e| e.read(cx).wrap_enabled)
+                .map(|e| e.read(cx).model.borrow().wrap_enabled)
                 .unwrap_or(true);
             let chrome = ui::theme::ChromeColors::for_mode(
                 ui::theme::Theme::global(cx).is_dark(),
@@ -583,7 +584,7 @@ impl EditorApp {
         PopupMenuItem::element(move |_, cx| {
             let on = weak
                 .upgrade()
-                .map(|e| e.read(cx).session_restore)
+                .map(|e| e.read(cx).model.borrow().session_restore)
                 .unwrap_or(true);
             div()
                 .w_full()
@@ -615,7 +616,7 @@ impl EditorApp {
         PopupMenuItem::element(move |_, cx| {
             let on = weak
                 .upgrade()
-                .map(|e| e.read(cx).close_to_tray)
+                .map(|e| e.read(cx).model.borrow().close_to_tray)
                 .unwrap_or(false);
             div()
                 .w_full()
@@ -632,7 +633,7 @@ impl EditorApp {
 
     /// 把焦点还给当前激活选项卡的编辑区（编辑动作派发到 Input 上下文所需）。
     pub(super) fn focus_active_editor(this: &mut Self, window: &mut Window, cx: &mut Context<Self>) {
-        let idx = this.active_tab;
+        let idx = this.model.borrow().active_tab;
         let focus = this.tab_focus_handle(idx, cx);
         window.focus(&focus, cx);
     }
@@ -700,8 +701,8 @@ impl EditorApp {
     pub(super) fn open_recent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 最近列表快照：面板打开期间被别处更新 → 下次打开才反映最新（面板实体不
         // 在渲染路径反读宿主演变状态，避免 re-entrant borrow；记录逻辑仍走 file_ops）。
-        let folders = self.recent_folders.clone();
-        let files = self.recent_files.clone();
+        let folders = self.model.borrow().recent_folders.clone();
+        let files = self.model.borrow().recent_files.clone();
         // 打开前的焦点 = 仍展开的文件菜单句柄；面板关闭（动作未带走焦点）时归还它。
         let previous_focus = window.focused(cx);
         let host = cx.weak_entity();
@@ -750,8 +751,8 @@ impl RecentPanelHost for EditorApp {
     }
 
     fn clear_recents(&mut self, cx: &mut Context<Self>) {
-        self.recent_folders.clear();
-        self.recent_files.clear();
+        self.model.borrow_mut().recent_folders.clear();
+        self.model.borrow_mut().recent_files.clear();
         self.persist_prefs();
         cx.notify();
     }

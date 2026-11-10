@@ -11,7 +11,7 @@ impl EditorApp {
     /// 媒体走，状态栏显示「图片/视频 n/m：路径」）。仅在激活选项卡持有图片/视频查看器时
     /// 更新；**幂等**：路径未变返回 false（调用方不 notify，无重绘循环）。
     pub(super) fn sync_active_media_meta(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(reader) = self.tabs.get(self.active_tab).map(|t| t.reader.clone()) else {
+        let Some(reader) = self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.reader.clone()) else {
             return false;
         };
         let (label, cur) = match reader {
@@ -38,22 +38,28 @@ impl EditorApp {
             }
             MediaReader::Pdf(_) | MediaReader::None => return false,
         };
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        // 先提纯 active（owned）再借可变 guard，避免 `get_mut` 参数在场的
+        // `borrow()` 与 guard 的 `borrow_mut()` 同语句运行期双借（借用纪律收窄）。
+        let active = self.model.borrow().active_tab;
+        let mut model = self.model.borrow_mut();
+        let Some(tab) = model.tabs.get_mut(active) else {
             return false;
         };
         if tab.file_path.as_deref() == Some(cur.as_path()) {
             return false;
         }
-        self.status = SharedString::from(label);
-        self.status_ok = true;
+        // SC-3：先收尾 `tab` 派生借（file_path 写入为 tab 最后使用）再写 model 同 guard
+        // 的 status——`tab` 可变借与 `model.status` 同 guard 内互斥（E0499），顺序调换语义不变。
         tab.file_path = Some(cur);
+        model.status = SharedString::from(label);
+        model.status_ok = true;
         true
     }
 
     /// 当前激活选项卡是否在「锁定」干净阅读模式（图片/视频查看器实体状态）。
     /// 与 `active_media_locked` 同口径：图片 / 视频任一锁定即 true，其余 false。
     pub(super) fn active_media_locked(&self, cx: &App) -> bool {
-        match self.tabs.get(self.active_tab).map(|t| &t.reader) {
+        match self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| &t.reader) {
             Some(MediaReader::Image(v)) => v.read(cx).is_locked(),
             #[cfg(feature = "video")]
             Some(MediaReader::Video(v)) => v.read(cx).is_locked(),
@@ -63,7 +69,7 @@ impl EditorApp {
 
     /// 当前激活选项卡的「可锁定」媒体查看器（图片或视频；PDF 无锁定语义，置 None）。
     pub(super) fn active_media_viewer(&self) -> Option<MediaReader> {
-        let reader = self.tabs.get(self.active_tab).map(|t| t.reader.clone())?;
+        let reader = self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.reader.clone())?;
         reader.is_lockable().then_some(reader)
     }
 
@@ -79,8 +85,8 @@ impl EditorApp {
         // Phase B2：PDF 分支（此前 `is_lockable()` 过滤掉了 Pdf）。事件统一经根元素
         // 冒泡到此，PDF 无「锁定」菜单，直接分派给页操作菜单。
         let is_pdf = self
-            .tabs
-            .get(self.active_tab)
+            .model.borrow().tabs
+            .get(self.model.borrow().active_tab)
             .map(|t| matches!(t.reader, MediaReader::Pdf(_)))
             .unwrap_or(false);
         if is_pdf {

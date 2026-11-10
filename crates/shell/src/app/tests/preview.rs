@@ -40,7 +40,7 @@
         // 实体级：只读门控 + 源文本就位（含超宽代码行）。
         let (editable, text) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             let ed = t.md_wy.clone().expect("md 打开应创建右栏 WyEditor 预览");
             (ed.read(cx).is_editable(), ed.read(cx).text().to_string())
         });
@@ -70,10 +70,10 @@
         // 建「空壳未装」的右栏 WyEditor：等价大文档打开首块挂载后、整篇解析完成前。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                let idx = app.active_tab;
+                let idx = app.model.borrow().active_tab;
                 app.ensure_md_wy(idx, window, cx, false);
                 // 等价大文档 md 打开：预览打开（空壳已建、正文待后台装）。
-                app.tabs[idx].preview_on = true;
+                app.model.borrow_mut().tabs[idx].preview_on = true;
             });
         });
         for _ in 0..8 {
@@ -83,7 +83,7 @@
         }
         let (loaded,) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let wy = a.tabs[a.active_tab].md_wy.clone().expect("空壳应已创建");
+            let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().expect("空壳应已创建");
             (wy.read(cx).is_loaded(),)
         });
         let (label_shown, scroll_shown) = (
@@ -98,7 +98,7 @@
         // 就绪：install 全量 → 下一帧起正式宿主出现、占位消失。
         cx.update(|_window, cx| {
             app.update(cx, |app, cx| {
-                let wy = app.tabs[app.active_tab].md_wy.clone().unwrap();
+                let wy = app.model.borrow().tabs[app.model.borrow().active_tab].md_wy.clone().unwrap();
                 wy.update(cx, |ed, _cx| {
                     ed.install_open(markdown_wysiwyg::WyEditor::open_from_str(
                         "# 就绪正文\n\n解析完成后的预览内容。\n".into(),
@@ -113,7 +113,7 @@
         }
         let (loaded,) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let wy = a.tabs[a.active_tab].md_wy.clone().expect("md_wy 应仍在");
+            let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().expect("md_wy 应仍在");
             (wy.read(cx).is_loaded(),)
         });
         let (label_shown, scroll_shown) = (
@@ -186,7 +186,7 @@
                 let eb = vcx
                     .update(|_w, cx| {
                         let a = app.read(cx);
-                        let ed = a.tabs[a.active_tab]
+                        let ed = a.model.borrow().tabs[a.model.borrow().active_tab]
                             .md_wy
                             .clone()
                             .expect("md 打开应创建右栏 WyEditor 预览");
@@ -267,7 +267,7 @@
         }
         let read_theme = |cx: &mut gpui::App| {
             let a = app.read(cx);
-            let ed = a.tabs[a.active_tab].md_wy.clone()?;
+            let ed = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone()?;
             let e = ed.read(cx);
             Some((
                 e.test_theme_fg(),
@@ -282,7 +282,7 @@
         // 切暗色（真切换路径 refresh_theme_ui）。
         cx.update(|_w, cx| {
             app.update(cx, |a, cx| {
-                a.dark_mode = true;
+                a.model.borrow_mut().dark_mode = true;
                 a.refresh_theme_ui(cx);
                 cx.notify();
             });
@@ -310,7 +310,7 @@
         // 切回亮色。
         cx.update(|_w, cx| {
             app.update(cx, |a, cx| {
-                a.dark_mode = false;
+                a.model.borrow_mut().dark_mode = false;
                 a.refresh_theme_ui(cx);
                 cx.notify();
             });
@@ -407,7 +407,7 @@
         }
         let wy = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_wy.clone().expect("应有右栏 WyEditor 预览")
+            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().expect("应有右栏 WyEditor 预览")
         });
         let (editable, before) = cx.update(|_, cx| {
             (wy.read(cx).is_editable(), wy.read(cx).text().to_string())
@@ -445,7 +445,7 @@
         // 打开即创建 + 喂源（源 = 编辑区文本）。
         let (fed, src) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.md_wy
                     .as_ref()
@@ -460,19 +460,21 @@
         // 关预览 → 释放（md_wy=None）。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.toggle_preview_for_tab(app.active_tab, window, cx)
+                let active_idx = app.model.borrow().active_tab;
+                app.toggle_preview_for_tab(active_idx, window, cx)
             });
         });
         for _ in 0..4 {
             cx.run_until_parked();
         }
-        let off = cx.update(|_, cx| app.read(cx).tabs[app.read(cx).active_tab].md_wy.is_none());
+        let off = cx.update(|_, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].md_wy.is_none());
         assert!(off, "关闭预览应释放右栏 WyEditor 预览实体");
 
         // 再开 → 重建 + 重新喂源。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.toggle_preview_for_tab(app.active_tab, window, cx)
+                let active_idx = app.model.borrow().active_tab;
+                app.toggle_preview_for_tab(active_idx, window, cx)
             });
         });
         for _ in 0..8 {
@@ -482,7 +484,7 @@
         }
         let (on, fed2, src2) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.md_wy.is_some(),
                 t.md_wy
@@ -520,7 +522,7 @@
         let par = |cx: &mut VisualTestContext| {
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 (
                     t.md_wy
                         .as_ref()
@@ -589,7 +591,7 @@
         let md_text = |cx: &mut VisualTestContext| {
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                a.tabs[a.active_tab]
+                a.model.borrow().tabs[a.model.borrow().active_tab]
                     .md_wy
                     .clone()
                     .expect("应有 md_wy")
@@ -599,7 +601,7 @@
             })
         };
         let ed_text = |cx: &mut VisualTestContext| {
-            cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.read(cx).value().to_string())
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.read(cx).value().to_string())
         };
         assert!(ed_text(cx).contains('X'), "基线：粘贴生效");
         assert_eq!(md_text(cx), ed_text(cx), "粘贴后预览应含 X");
@@ -649,7 +651,7 @@
         let par = |cx: &mut VisualTestContext| {
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 (
                     t.md_wy
                         .as_ref()
@@ -699,7 +701,7 @@
         // A4：MD 预览走统一组件 WyEditor（自动换行由组件默认保障，不再有 md_preview 可查）。
         let wy_active = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_wy.is_some()
+            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some()
         });
         assert!(wy_active, "刚打开 Markdown 预览应走统一组件（WyEditor 自动换行）");
         let _ = std::fs::remove_file(&md);
@@ -742,7 +744,7 @@
         // 初始：全局编辑区换行偏好默认关闭（仅 md 编辑区默认换行）；MD 预览走统一组件。
         let (wy0, pref0) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs[a.active_tab].md_wy.is_some(), a.wrap_enabled)
+            (a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some(), a.model.borrow().wrap_enabled)
         });
         assert!(wy0, "initial: MD 预览应走统一组件 WyEditor（自动换行由组件保障）");
         assert!(!pref0, "全局编辑区换行偏好应默认关闭（仅 md 编辑区换行），pref0={pref0}");
@@ -756,7 +758,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let pref1 = cx.update(|_w, cx| app.read(cx).wrap_enabled);
+        let pref1 = cx.update(|_w, cx| app.read(cx).model.borrow().wrap_enabled);
         let host1 = cx.debug_bounds("preview-md-wy").is_some();
         assert!(
             host1,
@@ -773,7 +775,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let pref2 = cx.update(|_w, cx| app.read(cx).wrap_enabled);
+        let pref2 = cx.update(|_w, cx| app.read(cx).model.borrow().wrap_enabled);
         let host2 = cx.debug_bounds("preview-md-wy").is_some();
         assert!(host2, "再切换后预览应仍渲染");
         assert!(!pref2, "再切换后全局编辑区换行偏好应恢复关闭");
@@ -870,7 +872,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -884,7 +886,7 @@
             cx.run_until_parked();
         }
         let live_text = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -904,7 +906,7 @@
         }
         let committed = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].editor.read(cx).value().to_string()
+            a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string()
         });
         assert_eq!(committed, format!("{inserted}{src_expected}"), "切换 OFF 应把 WYSIWYG 全文写回编辑区");
         // ON 再切回：WYSIWYG 以已提交文本重建，往复一致、不 panic。
@@ -918,7 +920,7 @@
         }
         let re_on = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab]
+            a.model.borrow().tabs[a.model.borrow().active_tab]
                 .live2
                 .as_ref()
                 .map(|w| w.read(cx).text().to_string())
@@ -962,7 +964,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         // 编辑区首格内按下：模拟菜单项 MouseDown 漏进编辑区。不派发 MouseUp，对应真实
         // 场景里 MouseUp 被菜单项 `activate` 的 stop_propagation 截断、到不了编辑器。
         let top_left = cx.debug_bounds("code-editor").expect("编辑区应渲染").origin;
@@ -1078,7 +1080,7 @@
         }
         // 在 WYSIWYG 文档里按同一偏移删掉该 `#`（标题 → 普通段落）。
         let live = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -1107,7 +1109,7 @@
         }
         let committed = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].editor.read(cx).value().to_string()
+            a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string()
         });
         assert_eq!(
             committed, expected_after,
@@ -1124,7 +1126,7 @@
         }
         let re_on = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab]
+            a.model.borrow().tabs[a.model.borrow().active_tab]
                 .live2
                 .as_ref()
                 .map(|w| w.read(cx).text().to_string())
@@ -1161,7 +1163,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         let (src_before, ver_before, skip_before) = cx.update(|_w, cx| {
             let ed = editor.read(cx);
             (
@@ -1192,13 +1194,13 @@
         }
         let (src_after, ver_after, skip_after) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             assert!(t.live2.is_none(), "切回后 live2 实体应已销毁");
             assert!(!t.live_edit, "切回后应退出 live_edit 模式");
             assert!(
-                a.status.to_string().contains("未改动，无需写回"),
+                a.model.borrow().status.to_string().contains("未改动，无需写回"),
                 "未编辑切回应提示「无需写回」，实际状态：{}",
-                a.status
+                a.model.borrow().status
             );
             let ed = editor.read(cx);
             (
@@ -1262,7 +1264,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         let wb_before = crate::app::preview::LIVE_COMMIT_WRITEBACK
             .load(std::sync::atomic::Ordering::Relaxed);
         // ON：进入 WYSIWYG（live2）。
@@ -1279,7 +1281,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -1301,12 +1303,12 @@
         }
         cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             assert!(t.live2.is_none(), "切回后 live2 实体应已销毁");
             assert!(
-                a.status.to_string().contains("内容已写回编辑区"),
+                a.model.borrow().status.to_string().contains("内容已写回编辑区"),
                 "有改动切回应提示「已写回」，实际状态：{}",
-                a.status
+                a.model.borrow().status
             );
         });
         let committed = cx.update(|_w, cx| editor.read(cx).value());
@@ -1357,7 +1359,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         // ON：进入 WYSIWYG（live2），等加载完成。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
@@ -1371,7 +1373,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -1380,7 +1382,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -1395,7 +1397,7 @@
         // 采样切回前的探针与本 live2 最终文本。
         let (expected, ops_replayed_pre, ops_count_pre, wy_text_pre) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             let l2 = t.live2.clone().expect("live2 应存在");
             let expected = l2.read(cx).text().to_string();
             let wy_text_pre = t.md_wy.clone().map(|w| w.read(cx).text().to_string());
@@ -1424,12 +1426,12 @@
         let (committed, ops_replayed_after, ops_count_after, wy_text_after) =
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 assert!(t.live2.is_none(), "切回后 live2 实体应已销毁");
                 assert!(
-                    a.status.to_string().contains("内容已写回编辑区"),
+                    a.model.borrow().status.to_string().contains("内容已写回编辑区"),
                     "有改动切回应提示「已写回」，实际状态：{}",
-                    a.status
+                    a.model.borrow().status
                 );
                 let ed = editor.read(cx);
                 (
@@ -1499,7 +1501,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
@@ -1512,7 +1514,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -1526,7 +1528,7 @@
             cx.run_until_parked();
         }
         let expected = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -1536,7 +1538,7 @@
         });
         // 采样切回前（实例级，确定性）：编辑日志应恰 1 条 op。
         let ops_len = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -1592,7 +1594,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         // ON：进入 WYSIWYG（live2）。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
@@ -1603,7 +1605,7 @@
             cx.run_until_parked();
         }
         let live = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -1629,10 +1631,10 @@
         }
         let (expected, wy_text_pre, ops_len) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let l2 = a.tabs[a.active_tab].live2.clone().expect("live2 应存在");
+            let l2 = a.model.borrow().tabs[a.model.borrow().active_tab].live2.clone().expect("live2 应存在");
             (
                 l2.read(cx).text().to_string(),
-                a.tabs[a.active_tab]
+                a.model.borrow().tabs[a.model.borrow().active_tab]
                     .md_wy
                     .clone()
                     .map(|w| w.read(cx).text().to_string()),
@@ -1659,7 +1661,7 @@
         }
         let (committed, replays, wy_text_after) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             let ed = editor.read(cx);
             (ed.value(), ed.live_replay_calls(), t.md_wy.clone().map(|w| w.read(cx).text().to_string()))
         });
@@ -1697,7 +1699,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
@@ -1713,7 +1715,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -1725,7 +1727,7 @@
             cx.run_until_parked();
         }
         let expected = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -1735,7 +1737,7 @@
         });
         // 采样切回前（实例级）：大段粘贴应恰缴存 1 条 op（单大 op）。
         let ops_len = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -1791,7 +1793,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
@@ -1804,7 +1806,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -1820,7 +1822,7 @@
             editor.update(cx, |ed, _| ed.set_text(&format!("漂移基线\n{src}")));
         });
         let expected = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -1830,7 +1832,7 @@
         });
         // 采样切回前（实例级）：up 日志确有 1 条 op（护栏将被触发，重放不应成功）。
         let ops_len = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -1887,7 +1889,7 @@
             .expect("MD WyEditor 预览纵向滚动条叠层应渲染");
         let vhand = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_wy_vscroll.clone()
+            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy_vscroll.clone()
         });
         let abs_top = |cx: &mut VisualTestContext| {
             cx.update(|_w, _cx| (-vhand.offset().y).as_f32())
@@ -2003,7 +2005,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -2018,7 +2020,7 @@
         }
         // 切回前快照：`text()` 返回与 `commit_live` 内部**同源同分配**的 SharedString。
         let snap = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -2032,7 +2034,7 @@
         });
         // 探针：`tab.content` 与快照同一分配（零拷贝共享，非 to_string 物化）＋内容等价。
         let (mirror_ptr, mirror) = cx.update(|_w, cx| {
-            let c = app.read(cx).tabs[app.read(cx).active_tab].content.clone();
+            let c = app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].content.clone();
             (c.as_ptr() as usize, c)
         });
         assert_eq!(mirror.len(), snap_len, "tab.content 应等于 live2 最终文本长度");
@@ -2174,7 +2176,7 @@
             cx.run_until_parked();
             ready = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 t.editor.read(cx).value().len() >= src.len()
                     && t.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false)
             });
@@ -2184,7 +2186,7 @@
         }
         assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
         let wy_old = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .md_wy
                 .clone()
                 .expect("md_wy 应存在")
@@ -2203,7 +2205,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             l2_loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                     .live2
                     .as_ref()
                     .map(|l| l.read(cx).is_loaded())
@@ -2220,7 +2222,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -2232,7 +2234,7 @@
             cx.run_until_parked();
         }
         let expected = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -2249,7 +2251,7 @@
         // 不泵后台，立即断言：异步已登记、右栏仍是旧内容（未同步解析）、探针 +1。
         let (pending, wy_now) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.md_wy_install.pending.clone(),
                 t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
@@ -2274,7 +2276,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             done = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                     .md_wy_install.pending
                     .is_none()
             });
@@ -2285,14 +2287,14 @@
         assert!(done, "后台装配应在 200 帧内完成（pending 清空）");
         let (wy_final, committed) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let w = a.tabs[a.active_tab]
+            let w = a.model.borrow().tabs[a.model.borrow().active_tab]
                 .md_wy
                 .clone()
                 .expect("md_wy 应在")
                 .read(cx)
                 .text()
                 .to_string();
-            (w, a.tabs[a.active_tab].editor.read(cx).value().to_string())
+            (w, a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string())
         });
         assert_eq!(wy_final, expected, "右栏 md_wy 最终应等价于 live2 全文（后到一致）");
         assert_eq!(committed, expected, "源码编辑区切回内容应等价（未回归写回）");
@@ -2324,7 +2326,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
@@ -2337,7 +2339,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -2351,7 +2353,7 @@
             cx.run_until_parked();
         }
         let expected = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -2370,7 +2372,7 @@
             let ed = editor.read(cx);
             (
                 ed.value().to_string(),
-                a.tabs[a.active_tab]
+                a.model.borrow().tabs[a.model.borrow().active_tab]
                     .md_wy
                     .clone()
                     .map(|w| w.read(cx).text().to_string()),
@@ -2415,7 +2417,7 @@
             cx.run_until_parked();
             ready = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 t.editor.read(cx).value().len() >= src.len()
                     && t.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false)
             });
@@ -2424,7 +2426,7 @@
             }
         }
         assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
@@ -2434,7 +2436,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             l2_loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                     .live2
                     .as_ref()
                     .map(|l| l.read(cx).is_loaded())
@@ -2448,11 +2450,15 @@
         // 大段插入 X（切回登记后台装配 CX）。
         let big_x = format!("## 大段 X\n{}\n", "X 内容，构成大跨度。\n".repeat(3000));
         cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            let live2 = app
+                .read(cx)
+                .model
+                .borrow()
+                .tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
-                .expect("live2")
-                .update(cx, |e, cx| e.replace_range(0..0, &big_x, cx));
+                .expect("live2");
+            live2.update(cx, |e, cx| e.replace_range(0..0, &big_x, cx));
         });
         for _ in 0..10 {
             cx.run_until_parked();
@@ -2465,7 +2471,7 @@
         // 尚未泵后台：异步装配在途（pending 挂着 CX）。
         let (pending, wy) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.md_wy_install.pending.clone(),
                 t.md_wy.clone().expect("md_wy 应在"),
@@ -2478,7 +2484,10 @@
             editor.update(cx, |ed, _| ed.set_text(&cy));
         });
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.ensure_md_wy(app.active_tab, window, cx, true));
+            app.update(cx, |app, cx| {
+                let idx = app.model.borrow().active_tab;
+                app.ensure_md_wy(idx, window, cx, true);
+            });
         });
         let wy_now = cx.update(|_w, cx| wy.read(cx).text().to_string());
         assert_eq!(wy_now, cy, "同步喂源后右栏应立即显示 CY");
@@ -2524,7 +2533,7 @@
             cx.run_until_parked();
             ready = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 t.editor.read(cx).value().len() >= src.len()
                     && t.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false)
             });
@@ -2533,7 +2542,7 @@
             }
         }
         assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
@@ -2543,7 +2552,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             l2_loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                     .live2
                     .as_ref()
                     .map(|l| l.read(cx).is_loaded())
@@ -2556,11 +2565,15 @@
         assert!(l2_loaded, "live2 应在 200 帧内加载完大文档");
         let big_x = format!("## 大段 X\n{}\n", "X 内容，构成大跨度。\n".repeat(3000));
         cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            let live2 = app
+                .read(cx)
+                .model
+                .borrow()
+                .tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
-                .expect("live2")
-                .update(cx, |e, cx| e.replace_range(0..0, &big_x, cx));
+                .expect("live2");
+            live2.update(cx, |e, cx| e.replace_range(0..0, &big_x, cx));
         });
         for _ in 0..10 {
             cx.run_until_parked();
@@ -2576,13 +2589,19 @@
             editor.update(cx, |ed, _| ed.set_text(&cy));
         });
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_preview_for_tab(app.active_tab, window, cx));
+            app.update(cx, |app, cx| {
+                let idx = app.model.borrow().active_tab;
+                app.toggle_preview_for_tab(idx, window, cx);
+            });
         });
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_preview_for_tab(app.active_tab, window, cx));
+            app.update(cx, |app, cx| {
+                let idx = app.model.borrow().active_tab;
+                app.toggle_preview_for_tab(idx, window, cx);
+            });
         });
         let new_wy_text = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .md_wy
                 .clone()
                 .expect("重开后 md_wy 应在")
@@ -2598,7 +2617,7 @@
             cx.run_until_parked();
         }
         let wy_final = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .md_wy
                 .clone()
                 .expect("md_wy 应在")
@@ -2651,7 +2670,7 @@
             // 按字节长比对；行数 >1000 即视为内容已就位）。
             ready = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 !t.editor_pending && t.editor.read(cx).line_count() > 1000
             });
             if ready {
@@ -2668,7 +2687,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             l2_loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                     .live2
                     .as_ref()
                     .map(|l| l.read(cx).is_loaded())
@@ -2682,11 +2701,15 @@
         // 大段插入（单 op，跨度 >64KB → 整篇喂源）。
         let big = format!("## 大段\n{}\n", "插入正文，构成大跨度。\n".repeat(5000));
         cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            let live2 = app
+                .read(cx)
+                .model
+                .borrow()
+                .tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
-                .expect("live2")
-                .update(cx, |e, cx| e.replace_range(0..0, &big, cx));
+                .expect("live2");
+            live2.update(cx, |e, cx| e.replace_range(0..0, &big, cx));
         });
         for _ in 0..10 {
             cx.run_until_parked();
@@ -2707,7 +2730,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             done = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                     .md_wy_install.pending
                     .is_none()
             });
@@ -2719,7 +2742,7 @@
         let bg_ms = bg_t0.elapsed().as_millis();
         let (wy_len, committed_len) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.md_wy.clone().map(|w| w.read(cx).len()).unwrap_or(0),
                 t.editor.read(cx).value().len(),
@@ -2771,7 +2794,7 @@
             cx.run_until_parked();
             ready = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 !t.editor_pending && t.editor.read(cx).line_count() > 1000
             });
             if ready {
@@ -2789,7 +2812,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             l2_loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                     .live2
                     .as_ref()
                     .map(|l| l.read(cx).is_loaded())
@@ -2802,7 +2825,7 @@
         assert!(l2_loaded, "live2 应在 200 帧内加载完 6.4MB");
         // 单字符编辑。
         cx.update(|_w, cx| {
-            let live = app.read(cx).tabs[app.read(cx).active_tab]
+            let live = app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2.clone().expect("live2");
             let e = live.read(cx).text().to_string();
             let at = e.find('段').expect("应有中文");
@@ -2818,7 +2841,7 @@
         // 让延迟回收队列清空、再把最后的句柄 drop 掉——complete 级联释放就是旧代码在
         // 点击路径内同步做掉的成本。
         let live_handle = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2.clone().expect("live2")
         });
         // ① OFF 切回（改动后）同步路径耗时 = 写回 + A1 物化下限；不含 Drop（已延迟到
@@ -2874,17 +2897,17 @@
             .collect::<String>();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                let idx = app.active_tab;
+                let idx = app.model.borrow().active_tab;
                 let rope = ropey::Rope::from(prefix.as_str());
-                app.tabs[idx].editor.update(cx, |ed, cx| {
+                app.model.borrow().tabs[idx].editor.update(cx, |ed, cx| {
                     ed.set_rope_with_stats(rope.clone(), 0, Default::default());
                     cx.notify();
                 });
                 app.ensure_md_wy(idx, window, cx, false);
-                app.tabs[idx].preview_on = true;
+                app.model.borrow_mut().tabs[idx].preview_on = true;
                 // 等价 `md_wy_spawn_early_install` 启动后（代号 = ensure_md_wy 已 invalidate →
                 // seq=1；整篇在途、未编辑）。
-                app.tabs[idx].md_wy_install.early = Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
+                app.model.borrow_mut().tabs[idx].md_wy_install.early = Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
                 app.md_wy_spawn_prefix_install(idx, rope.clone(), 1, cx);
             });
         });
@@ -2895,13 +2918,13 @@
         }
         let (loaded, text, pending, early) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.active_tab;
-            let wy = a.tabs[i].md_wy.clone().expect("prefix 首装前应已建空壳");
+            let i = a.model.borrow().active_tab;
+            let wy = a.model.borrow().tabs[i].md_wy.clone().expect("prefix 首装前应已建空壳");
             (
                 wy.read(cx).is_loaded(),
                 wy.read(cx).text().to_string(),
-                a.tabs[i].md_wy_install.pending_full,
-                a.tabs[i].md_wy_install.early,
+                a.model.borrow().tabs[i].md_wy_install.pending_full,
+                a.model.borrow().tabs[i].md_wy_install.early,
             )
         });
         assert!(loaded, "prefix 首装应 `install_open`（loaded=true），首屏立刻真内容");
@@ -2940,15 +2963,15 @@
         let target_line = 300usize; // 4*75 → `## 标题 75`（块起点，prefix / full 同名同列）
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                let idx = app.active_tab;
+                let idx = app.model.borrow().active_tab;
                 let rope = ropey::Rope::from(prefix.as_str());
-                app.tabs[idx].editor.update(cx, |ed, cx| {
+                app.model.borrow().tabs[idx].editor.update(cx, |ed, cx| {
                     ed.set_rope_with_stats(rope.clone(), 0, Default::default());
                     cx.notify();
                 });
                 app.ensure_md_wy(idx, window, cx, false);
-                app.tabs[idx].preview_on = true;
-                app.tabs[idx].md_wy_install.early =
+                app.model.borrow_mut().tabs[idx].preview_on = true;
+                app.model.borrow_mut().tabs[idx].md_wy_install.early =
                     Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
                 app.md_wy_spawn_prefix_install(idx, rope.clone(), 1, cx);
             });
@@ -2963,10 +2986,10 @@
         cx.update(|_, cx| {
             let (mdw, ed) = {
                 let a = app.read(cx);
-                let idx = a.active_tab;
+                let idx = a.model.borrow().active_tab;
                 (
-                    a.tabs[idx].md_wy.clone().unwrap(),
-                    a.tabs[idx].editor.clone(),
+                    a.model.borrow().tabs[idx].md_wy.clone().unwrap(),
+                    a.model.borrow().tabs[idx].editor.clone(),
                 )
             };
             mdw.update(cx, |w, _| w.set_scroll_target(target_line));
@@ -2979,8 +3002,8 @@
             cx.run_until_parked();
             before = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.active_tab;
-                a.tabs[i].md_wy.as_ref().unwrap().read(cx).top_source_line()
+                let i = a.model.borrow().active_tab;
+                a.model.borrow().tabs[i].md_wy.as_ref().unwrap().read(cx).top_source_line()
             });
             // 首帧 viewport_top 还是旧值（0），advance_pending_scroll 逐帧重钉后收敛。
             if before.is_some_and(|b| b != 0) {
@@ -2996,8 +3019,8 @@
         let wy_open = markdown_wysiwyg::WyEditor::open_from_str(full.clone().into());
         cx.update(|_, cx| {
             app.update(cx, |app, cx| {
-                let idx = app.active_tab;
-                let wy = app.tabs[idx].md_wy.clone().unwrap();
+                let idx = app.model.borrow().active_tab;
+                let wy = app.model.borrow().tabs[idx].md_wy.clone().unwrap();
                 app.md_wy_install_full_swap(idx, &wy, wy_open, cx);
             });
         });
@@ -3008,8 +3031,8 @@
             cx.run_until_parked();
             after = cx.update(|_, cx| {
                 let a = app.read(cx);
-                let i = a.active_tab;
-                a.tabs[i].md_wy.as_ref().unwrap().read(cx).top_source_line()
+                let i = a.model.borrow().active_tab;
+                a.model.borrow().tabs[i].md_wy.as_ref().unwrap().read(cx).top_source_line()
             });
             // 换入后由 advance_pending_scroll 重钉回锚点；收敛到 before 即稳定。
             if after == Some(before) {
@@ -3018,13 +3041,14 @@
         }
         let (after, text, early, pending) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.active_tab;
-            let wy = a.tabs[i].md_wy.as_ref().unwrap();
+            let i = a.model.borrow().active_tab;
+            let model = a.model.borrow();
+            let wy = model.tabs[i].md_wy.as_ref().unwrap();
             (
                 after,
                 wy.read(cx).text().to_string(),
-                a.tabs[i].md_wy_install.early,
-                a.tabs[i].md_wy_install.pending_full,
+                a.model.borrow().tabs[i].md_wy_install.early,
+                a.model.borrow().tabs[i].md_wy_install.pending_full,
             )
         });
         assert_eq!(after, Some(before), "整篇换入后顶行 src_line 应锚定不变（视觉不跳）");
@@ -3058,16 +3082,16 @@
             .collect::<String>();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                let idx = app.active_tab;
+                let idx = app.model.borrow().active_tab;
                 // 编辑器 rope = 全文（等价「编辑区已追加超出 prefix」）；预览只装 prefix。
                 let rope_full = ropey::Rope::from(full.as_str());
-                app.tabs[idx].editor.update(cx, |ed, cx| {
+                app.model.borrow().tabs[idx].editor.update(cx, |ed, cx| {
                     ed.set_rope_with_stats(rope_full.clone(), 0, Default::default());
                     cx.notify();
                 });
                 app.ensure_md_wy(idx, window, cx, false);
-                app.tabs[idx].preview_on = true;
-                app.tabs[idx].md_wy_install.early =
+                app.model.borrow_mut().tabs[idx].preview_on = true;
+                app.model.borrow_mut().tabs[idx].md_wy_install.early =
                     Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
                 let rope_prefix = ropey::Rope::from(prefix.as_str());
                 app.md_wy_spawn_prefix_install(idx, rope_prefix.clone(), 1, cx);
@@ -3081,9 +3105,10 @@
         // 前置断言：预览 = prefix（已装、整篇在途），与编辑区长度不等。
         let (pre_loaded, pre_pending, pre_len) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.active_tab;
-            let wy = a.tabs[i].md_wy.as_ref().unwrap();
-            (wy.read(cx).is_loaded(), a.tabs[i].md_wy_install.pending_full, wy.read(cx).len())
+            let i = a.model.borrow().active_tab;
+            let model = a.model.borrow();
+            let wy = model.tabs[i].md_wy.as_ref().unwrap();
+            (wy.read(cx).is_loaded(), a.model.borrow().tabs[i].md_wy_install.pending_full, wy.read(cx).len())
         });
         assert!(pre_loaded, "prefix 应已 install（loaded）");
         assert_eq!(pre_pending, Some((1, prefix.len())));
@@ -3102,12 +3127,13 @@
         }
         let (wy_text, ed_text, pending, loaded) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let i = a.active_tab;
-            let wy = a.tabs[i].md_wy.as_ref().unwrap();
+            let i = a.model.borrow().active_tab;
+            let model = a.model.borrow();
+            let wy = model.tabs[i].md_wy.as_ref().unwrap();
             (
                 wy.read(cx).text().to_string(),
-                a.tabs[i].editor.read(cx).value(),
-                a.tabs[i].md_wy_install.pending_full,
+                a.model.borrow().tabs[i].editor.read(cx).value(),
+                a.model.borrow().tabs[i].md_wy_install.pending_full,
                 wy.read(cx).is_loaded(),
             )
         });
@@ -3164,13 +3190,13 @@
         // 等价大文档装配在途：建「空壳未装」的左面板 live2（不 install_open → is_loaded()==false）。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                let idx = app.active_tab;
+                let idx = app.model.borrow().active_tab;
                 let ed = cx.new(|cx| markdown_wysiwyg::WyEditor::new(window, cx));
                 ed.update(cx, |ed, _| ed.capture_live_ops());
-                app.tabs[idx].live2 = Some(ed.clone());
-                app.tabs[idx]._live2_sub = None;
-                app.tabs[idx].live_edit = true;
-                app.tabs[idx].live2_dirty = false;
+                app.model.borrow_mut().tabs[idx].live2 = Some(ed.clone());
+                app.model.borrow_mut().tabs[idx]._live2_sub = None;
+                app.model.borrow_mut().tabs[idx].live_edit = true;
+                app.model.borrow_mut().tabs[idx].live2_dirty = false;
             });
         });
         for _ in 0..8 {
@@ -3180,7 +3206,7 @@
         }
         let (loaded,) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let live = a.tabs[a.active_tab].live2.clone().expect("live2 应已创建");
+            let live = a.model.borrow().tabs[a.model.borrow().active_tab].live2.clone().expect("live2 应已创建");
             (live.read(cx).is_loaded(),)
         });
         let (freeze_shown, live_shown) = (
@@ -3195,7 +3221,7 @@
         // 就绪：install 全量 → 下一帧起正式 live 宿主出现、拦截层消失。
         cx.update(|_window, cx| {
             app.update(cx, |app, cx| {
-                let live = app.tabs[app.active_tab].live2.clone().unwrap();
+                let live = app.model.borrow().tabs[app.model.borrow().active_tab].live2.clone().unwrap();
                 live.update(cx, |ed, _cx| {
                     ed.install_open(markdown_wysiwyg::WyEditor::open_from_str(
                         "# 就绪正文\n\n装配完成后的 WYSIWYG 内容。\n".into(),
@@ -3210,7 +3236,7 @@
         }
         let (loaded,) = cx.update(|_, cx| {
             let a = app.read(cx);
-            let live = a.tabs[a.active_tab].live2.clone().expect("live2 应仍在");
+            let live = a.model.borrow().tabs[a.model.borrow().active_tab].live2.clone().expect("live2 应仍在");
             (live.read(cx).is_loaded(),)
         });
         let (freeze_shown, live_shown) = (
@@ -3257,7 +3283,7 @@
             cx.run_until_parked();
             ready = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let t = &a.tabs[a.active_tab];
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 t.editor.read(cx).value().len() >= src.len()
                     && t.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false)
             });
@@ -3267,7 +3293,7 @@
         }
         assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
         let md_old = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .md_wy
                 .clone()
                 .expect("md_wy 应存在")
@@ -3298,7 +3324,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             l2_loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                     .live2
                     .as_ref()
                     .map(|l| l.read(cx).is_loaded())
@@ -3311,7 +3337,7 @@
         assert!(l2_loaded, "live2 应在 200 帧内装配完（复用路径 = 克隆 + 预建）");
         let (l2_len, l2_text, md_now) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             let l2 = t.live2.clone().expect("live2 应存在");
             (
                 l2.read(cx).len(),
@@ -3326,7 +3352,7 @@
         cx.update(|_w, cx| {
             let live = app
                 .read(cx)
-                .tabs[app.read(cx).active_tab]
+                .model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在");
@@ -3339,7 +3365,7 @@
         }
         let (l2_after, md_after) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 t.live2.clone().expect("live2 应存在").read(cx).text().to_string(),
                 t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
@@ -3395,7 +3421,7 @@
             cx.run_until_parked();
         }
         let live = cx.update(|_w, cx| {
-            app.read(cx).tabs[app.read(cx).active_tab]
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
                 .clone()
                 .expect("live2 应存在")
@@ -3434,7 +3460,7 @@
         }
         let (card_text, src_value, live_text) = cx.update(|_w, cx: &mut App| {
             let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
                 card.read(cx).text_string(),
                 t.editor.read(cx).value().to_string(),
