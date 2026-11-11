@@ -18,9 +18,11 @@
 
 use std::path::Path;
 
-use gpui::Context;
+use gpui::{Context, Entity, Window};
+use ui::menu::PopupMenu;
 
-use crate::state::SidebarView;
+use crate::prompt::{FileTreePrompt, FileTreePromptHost, FileTreePromptKind};
+use crate::state::{SidebarView, TreeEntry};
 
 /// 侧边栏宿主抽象：把侧栏对宿主的交互收敛为最小接口，使域 crate（shell_sidebar）不
 /// 依赖 shell 的具体宿主类型。shell 侧以 `impl SidebarHost for EditorApp` 提供实现
@@ -62,6 +64,107 @@ pub trait SidebarHost: 'static {
 
     /// PDF「书签」区段删除一条（宿主既有 `remove_pdf_bookmark`：改模型 + 落盘 + notify）。
     fn sidebar_remove_pdf_bookmark(&mut self, path: &Path, idx: usize, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 文件树行「打开/激活」：宿主 `open_file`/`activate_tab` 能力——文件树深层链接到
+    /// 宿主 file_ops / panes 的「已打开 → 激活既有 / 未打开 → 完整打开」语义保持不变。
+    fn sidebar_open_path_or_activate(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        Self: Sized;
+
+    /// 文件树目录行展开/折叠（生产事件入口）：宿主把状态落在 `self.sidebar.files`
+    /// （变换逻辑在 `Sidebar::file_tree_toggle` 实体方法）并 notify；测试程序化入口
+    /// `app.file_tree_toggle` 与它同语义。
+    fn sidebar_file_tree_toggle(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        Self: Sized;
+
+    /// 文件树后台扫描完成：把该目录直接子项写进 `self.sidebar.files`
+    /// （纯变换 [`crate::state::file_tree_scan_complete`]，换根在途丢弃在变换内）+ notify。
+    fn sidebar_file_tree_scan_complete(
+        &mut self,
+        path: std::path::PathBuf,
+        entries: Vec<TreeEntry>,
+        cx: &mut Context<Self>,
+    ) where
+        Self: Sized;
+
+    /// 文件树过滤防抖提交：宿主把 `self.sidebar.files.layout_gen` +1（模型过滤词已由
+    /// 域实体经共享模型写入）+ notify。
+    fn sidebar_files_filter_commit(&mut self, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 文件树右键菜单句柄镜像同步：实体自持 pos/menu/sub（渲染与关闭判定在域内），
+    /// 宿主只留测试兼容镜像字段 `file_tree_menu_entity` + notify（None = 关闭清理）。
+    fn sidebar_set_file_tree_menu(&mut self, menu: Option<Entity<PopupMenu>>, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 文件树输入弹层句柄镜像同步：实体自持 prompt/sub，宿主只留测试兼容镜像字段
+    /// `file_tree_prompt` + notify（None = 关闭清理）。
+    fn sidebar_set_file_tree_prompt(
+        &mut self,
+        prompt: Option<Entity<FileTreePrompt<Self>>>,
+        cx: &mut Context<Self>,
+    ) where
+        Self: Sized + FileTreePromptHost;
+
+    /// 文件树右键「新建/重命名…」：打开输入弹层（新建/重命名共用入口）。
+    fn sidebar_open_file_tree_prompt(
+        &mut self,
+        kind: FileTreePromptKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        Self: Sized;
+
+    /// 文件树空态「打开文件夹…」：宿主系统文件夹选择对话框（open_folder_dialog 能力）。
+    fn sidebar_open_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 文件树右键「删除…」：原生确认框 → 确认后执行删除（宿主 file_ops 副作用）。
+    fn sidebar_file_tree_delete_request(
+        &mut self,
+        path: &Path,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        Self: Sized;
+
+    /// 文件树右键「在资源管理器中显示」：`explorer /select,<绝对路径>`。
+    fn sidebar_file_tree_reveal_in_explorer(&mut self, path: &Path, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 文件树右键「复制路径」：绝对路径文本写入剪贴板。
+    fn sidebar_file_tree_copy_path(&mut self, path: &Path, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 文件树右键「复制相对路径」：相对已打开文件夹根（原生分隔符、无引号）。
+    fn sidebar_file_tree_copy_relative_path(&mut self, path: &Path, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 文件树右键「剪切」：系统剪贴板文件操作（`CF_HDROP` + Move）。
+    fn sidebar_file_tree_cut(&mut self, path: &Path, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 文件树右键「复制」：系统剪贴板文件操作（`CF_HDROP` + Copy）。
+    fn sidebar_file_tree_copy_file(&mut self, path: &Path, cx: &mut Context<Self>)
     where
         Self: Sized;
 }

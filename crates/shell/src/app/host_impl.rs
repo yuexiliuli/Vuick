@@ -89,8 +89,8 @@ impl AppHost for EditorApp {
 }
 
 // 2026-11-11：侧栏域 crate 宿主服务面（shell_sidebar）。事件回调改侧栏状态统一经此
-// trait 落地；宿主实现只调 `shell_sidebar::state` 的**状态纯变换** + notify/persist，
-// 零业务逻辑（状态变换的单一事实源在域 crate，防双写漂移）。
+// trait 落地；宿主实现只调 `shell_sidebar::state` 的**状态纯变换** + notify/persist，或
+// 转发宿主既有文件侧副作用（打开/激活/新建/重命名/删除/剪贴板/探索器），零业务逻辑。
 impl shell_sidebar::SidebarHost for EditorApp {
     fn sidebar_toggle_view(&mut self, view: crate::app::SidebarView, cx: &mut Context<Self>) {
         self.sidebar.toggle_view(view);
@@ -121,10 +121,125 @@ impl shell_sidebar::SidebarHost for EditorApp {
     ) {
         let _ = self.remove_pdf_bookmark(path, idx, cx);
     }
+
+    /// 打开/激活文件：宿主 `open_file`/`activate_tab` 能力（file_ops.rs 的既有实现）。
+    fn sidebar_open_path_or_activate(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_path_or_activate(path, window, cx);
+    }
+
+    /// 目录行展开/折叠（生产事件入口）：转发宿主 facade `file_tree_toggle`——宿主侧
+    /// 直落 `state::file_tree_toggle` 纯变换 + 首展宿主侧 spawn 扫描，全程不回租 Sidebar
+    /// 实体（目录行 on_click 回调期间实体已租用，回租即 `double_lease_panic`，D1 评审
+    /// BLOCK 方向 A；与 toc_collapse 同构）。
+    fn sidebar_file_tree_toggle(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_toggle(path, window, cx);
+    }
+
+    /// 后台扫描完成落地：`shell_sidebar::state::file_tree_scan_complete` 纯变换 + notify。
+    fn sidebar_file_tree_scan_complete(
+        &mut self,
+        path: std::path::PathBuf,
+        entries: Vec<shell_sidebar::TreeEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        shell_sidebar::state::file_tree_scan_complete(&mut self.sidebar.files, &path, entries);
+        cx.notify();
+    }
+
+    /// 过滤防抖提交：模型过滤词已由域实体写入，此处只作文件树布局失效 + notify。
+    fn sidebar_files_filter_commit(&mut self, cx: &mut Context<Self>) {
+        self.sidebar.files.layout_gen = self.sidebar.files.layout_gen.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// 右键菜单句柄镜像同步（实体侧置入/清除后调用）：写测试兼容镜像 + notify。
+    fn sidebar_set_file_tree_menu(
+        &mut self,
+        menu: Option<gpui::Entity<ui::menu::PopupMenu>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_menu_entity = menu;
+        cx.notify();
+    }
+
+    /// 输入弹层句柄镜像同步（实体侧置入/清除后调用）：写测试兼容镜像 + notify。
+    fn sidebar_set_file_tree_prompt(
+        &mut self,
+        prompt: Option<gpui::Entity<shell_sidebar::FileTreePrompt<EditorApp>>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_prompt = prompt;
+        cx.notify();
+    }
+
+    /// 打开文件树输入弹层（菜单「新建/重命名…」）：转发宿主 facade（实体建弹层+聚焦）。
+    fn sidebar_open_file_tree_prompt(
+        &mut self,
+        kind: shell_sidebar::FileTreePromptKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file_tree_prompt(kind, window, cx);
+    }
+
+    /// 空态「打开文件夹…」：宿主 `open_folder_dialog`（系统文件夹选择框）。
+    fn sidebar_open_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_folder_dialog(window, cx);
+    }
+
+    /// 删除请求（原生确认框 → 确认后删除）：宿主 file_ops 副作用。
+    fn sidebar_file_tree_delete_request(
+        &mut self,
+        path: &std::path::Path,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_delete_request(path, is_dir, window, cx);
+    }
+
+    /// 在资源管理器中显示。
+    fn sidebar_file_tree_reveal_in_explorer(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.file_tree_reveal_in_explorer(path, cx);
+    }
+
+    /// 复制绝对路径到文本剪贴板。
+    fn sidebar_file_tree_copy_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.file_tree_copy_path(path, cx);
+    }
+
+    /// 复制相对路径到文本剪贴板。
+    fn sidebar_file_tree_copy_relative_path(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_copy_relative_path(path, cx);
+    }
+
+    /// 剪切（CF_HDROP + Move）。
+    fn sidebar_file_tree_cut(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.file_tree_cut(path, cx);
+    }
+
+    /// 复制文件（CF_HDROP + Copy）。
+    fn sidebar_file_tree_copy_file(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.file_tree_copy_file(path, cx);
+    }
 }
 
 // 2026-11-11：文件树输入弹层宿主服务面（shell_sidebar）。提交动作在宿主
-// （`app/sidebar/files_ops.rs` 的既有 `file_tree_submit_prompt`），行为零变。
+// （`app/file_tree_ops.rs` 的既有 `file_tree_submit_prompt`），行为零变。
 impl shell_sidebar::FileTreePromptHost for EditorApp {
     fn file_tree_submit_prompt(
         &mut self,

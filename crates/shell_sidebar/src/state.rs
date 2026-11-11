@@ -11,7 +11,7 @@
 //! - 状态纯变换：`toggle_view` / [`resize_start`] / [`resize_update`] / [`resize_end`] /
 //!   [`toc_collapse`]——宿主侧与域侧共用同一份变换，杜绝逻辑双写漂移。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::SharedString;
 
@@ -86,6 +86,51 @@ impl FileTreeState {
         self.pending.clear();
         self.layout_gen = self.layout_gen.wrapping_add(1);
     }
+}
+
+/// 文件树后台扫描完成的**纯变换**：把某个目录的直接子项写入 `children` 缓存 + 布局代 +1；
+/// 换根后旧目录的在途扫描结果不落地（路径已不在当前根下 → 丢弃，防孤儿缓存膨胀）。
+/// 宿主 [`crate::host::SidebarHost::sidebar_file_tree_scan_complete`] 与域实体扫描任务共用
+/// 同一份变换（单一事实源，防双写漂移）。`pub`：宿主侧（shell 的 file_ops/init 等）经
+/// 宿主服务间接调用，本变换亦作测试可复用的纯函数。
+pub fn file_tree_scan_complete(files: &mut FileTreeState, path: &Path, entries: Vec<TreeEntry>) {
+    files.pending.remove(path);
+    let stale = files
+        .root
+        .as_ref()
+        .map(|r| !path.starts_with(r))
+        .unwrap_or(true);
+    if !stale {
+        files.layout_gen = files.layout_gen.wrapping_add(1);
+        files.children.insert(path.to_path_buf(), entries);
+    }
+}
+
+/// 文件树失效的**纯变换**（新建 / 重命名 / 删除后的派生状态失效源）：`changed`（目录时
+/// 含其后代）的展开集 / 子项缓存 / 在途扫描一并作废 + 布局代 +1。
+/// 父目录重扫（`spawn_file_tree_scan`）由调用方负责（宿主侧文件副作用 / 域实体）。
+pub fn file_tree_invalidate(files: &mut FileTreeState, changed: &Path) {
+    files
+        .children
+        .retain(|p, _| p != changed && !p.starts_with(changed));
+    files.pending.retain(|p| p != changed && !p.starts_with(changed));
+    files.expanded.retain(|p| p != changed && !p.starts_with(changed));
+    files.layout_gen = files.layout_gen.wrapping_add(1);
+}
+
+/// 文件树目录行展开/折叠的**纯变换**（单一事实源，宿主 `sidebar_file_tree_toggle` /
+/// facade `file_tree_toggle` 共用）：折叠只移出 `expanded`；展开把目录入集合。
+/// 两条分支都作废可见行布局缓存（`layout_gen` +1）。返回 `true` = **首展未扫**（`children`
+/// 无该目录缓存），调用方需在**宿主侧** spawn 后台读那一层直接子项（不在域/回调内回租
+/// 实体——目录行 on_click 回调期间 Sidebar 实体已租用，回租即 `double_lease_panic`）。
+pub fn file_tree_toggle(files: &mut FileTreeState, path: &Path) -> bool {
+    if files.expanded.remove(path) {
+        files.layout_gen = files.layout_gen.wrapping_add(1);
+        return false;
+    }
+    files.expanded.insert(path.to_path_buf());
+    files.layout_gen = files.layout_gen.wrapping_add(1);
+    !files.children.contains_key(path)
 }
 
 /// 文件树**可见行**描述（不含元素；根 + 已展开递归子项 + 空目录占位）。

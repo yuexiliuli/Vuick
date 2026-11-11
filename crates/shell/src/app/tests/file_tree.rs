@@ -419,3 +419,84 @@
             "并切到「文件」视图"
         );
     }
+
+    /// 生产热路径回归（评审 BLOCK，2026-11-11）：目录行**左键单击**（`simulate_click`，
+    /// 非程序化 `file_tree_toggle`）→ 展开 + 后台子项扫描落地（children 可见 / pending 清空）；
+    /// 再次单击 → 折叠移出 expanded、children 缓存保留。旧实现目录行 on_click 绑定 Sidebar
+    /// 实体（回调期间实体已租用 lease#1）→ 宿主 `sidebar_file_tree_toggle` → facade
+    /// `sidebar_view.update` 回租同一实体（lease#2）→ `double_lease_panic` 硬崩溃；本用例
+    /// 走真实事件链钉死该路径（修复前红 / 修复后绿）。
+    #[gpui::test]
+    async fn dir_row_click_expands_scans_and_collapses(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let base =
+            std::env::temp_dir().join(format!("gpui-tree-rowclick-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub/nested.txt"), "NEST").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_folder_path(base.clone(), window, cx));
+        });
+        ft_wait_tree_loaded(&app, cx, &base);
+        ft_stabilize(cx);
+        let sub = base.join("sub");
+        // 行序：root=0、sub=1（子项未加载前仅渲染已扫描的根层）。
+        let row = cx.debug_bounds("sidebar-file-row-1").expect("sub 目录行应渲染");
+        // 单击目录行 → 展开（行 on_click → SidebarHost::sidebar_file_tree_toggle 宿主反调）。
+        cx.simulate_click(row.center(), Default::default());
+        ft_wait_tree_loaded(&app, cx, &sub);
+        ft_stabilize(cx);
+        let (expanded, kids) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.sidebar.files.expanded.contains(&sub),
+                a.sidebar.files
+                    .children
+                    .get(&sub)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        });
+        assert!(expanded, "单击目录行应把 sub 加入 expanded");
+        assert_eq!(kids.len(), 1, "单击展开后应后台扫描落地子项");
+        assert_eq!(kids[0].name, "nested.txt");
+        assert!(
+            cx.debug_bounds("sidebar-file-row-2").is_some(),
+            "sub 展开后子树应物化渲染（nested.txt 行）"
+        );
+        // 再次单击同一行 → 折叠（移出 expanded；children 缓存保留复用，不重扫）。
+        let row2 = cx.debug_bounds("sidebar-file-row-1").expect("sub 行应仍在");
+        cx.simulate_click(row2.center(), Default::default());
+        ft_stabilize(cx);
+        let (collapsed, kids_kept) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                !a.sidebar.files.expanded.contains(&sub),
+                a.sidebar.files.children.contains_key(&sub),
+            )
+        });
+        assert!(collapsed, "再次单击应折叠 sub（移出 expanded）");
+        assert!(kids_kept, "折叠应保留 children 缓存（复用不重扫）");
+        assert!(
+            cx.debug_bounds("sidebar-file-row-2").is_none(),
+            "折叠后子树行应不再渲染"
+        );
+        // 根行同走「目录行」on_click 热路径（评审点「含根行」）：open_folder_path 已把根
+        // 展开，单击根行 → 折叠根（expanded 移出根；根行恒可见仍渲染）。
+        let root_row = cx.debug_bounds("sidebar-file-row-0").expect("根行应渲染");
+        cx.simulate_click(root_row.center(), Default::default());
+        ft_stabilize(cx);
+        let root_collapsed = cx.update(|_w, cx| {
+            !app.read(cx).sidebar.files.expanded.contains(&base)
+        });
+        assert!(root_collapsed, "单击根行应折叠根目录");
+        assert!(
+            cx.debug_bounds("sidebar-file-row-0").is_some(),
+            "折叠根后根行仍渲染（树根恒可见）"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }

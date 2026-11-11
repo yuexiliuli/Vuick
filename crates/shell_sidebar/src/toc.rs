@@ -15,6 +15,7 @@ use ui::motion::hover_spring;
 
 use crate::chrome::Sidebar;
 use crate::host::SidebarHost;
+use crate::prompt::FileTreePromptHost;
 use crate::state::{SidebarChromeState, toc_collapse};
 use ::toc; // 显式导入外部 crate `toc`（本子模块名与之同名，需显式绑定避免 glob 遮蔽）
 
@@ -25,7 +26,7 @@ pub const TOC_VIRTUALIZE_MIN: usize = 200;
 /// `pub`：shell 仍留的 `files.rs`（文件树虚拟化同口径）跨 crate 引用。
 pub const TOC_BAND_BUFFER: usize = 8;
 
-impl<H: SidebarHost> Sidebar<H> {
+impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 当前激活选项卡的 Markdown TOC 数据源 + 跳转目标（A4，经模型直取，与宿主
     /// `EditorApp::md_toc_source` 同口径）：MD / EPUB 统一预览都走 WyEditor 只读宿主
     /// （条目 = 源码行，点击滚动统一组件）；无 WyEditor → `None`。

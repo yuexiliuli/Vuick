@@ -1062,6 +1062,27 @@ impl EditorApp {
         self.load_media(idx, &p, MediaKind::Pdf, window, cx);
     }
 
+    /// 打开文件行：已打开 → 激活既有选项卡（**不新建**）；未打开 → 复用 `open_file`
+    /// 完整打开语义（内部已分流 PDF / EPUB / 图 / 视频 / 文本）。
+    /// （2026-11-11 自 `app/sidebar/files.rs` 迁入——文件树域 crate 经
+    /// `SidebarHost::sidebar_open_path_or_activate` 反调本方法，宿主打开能力不收进域。）
+    pub(crate) fn open_path_or_activate(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let idx = self
+            .model.borrow().tabs
+            .iter()
+            .position(|t| t.file_path.as_deref() == Some(path));
+        if let Some(idx) = idx {
+            self.activate_tab(idx, window, cx);
+        } else {
+            self.open_file(&path.to_string_lossy(), window, cx);
+        }
+    }
+
     /// 打开文件的中心入口：sidebar/files、palette、recent_panel、file_dialog、init CLI
     /// 首参、会话恢复等**全部既有调用点仍调本函数**。本函数只做「媒体窗口重定向」包装——
     /// 对音频/视频且 `media_new_window` 开启时，按纯决策分流（新窗口 / 复用媒体窗口 /

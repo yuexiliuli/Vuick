@@ -59,6 +59,7 @@ mod init;
 mod layout;
 mod media;
 mod media_window;
+mod file_tree_ops;
 mod pdf_bookmarks;
 mod pdf_menu;
 mod pdf_bg;
@@ -274,18 +275,16 @@ pub struct EditorApp {
     tab_bar_menu_entity: Option<gpui::Entity<PopupMenu>>,
     /// 选项卡栏右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     tab_bar_menu_sub: Option<Subscription>,
-    /// 文件树右键上下文菜单：弹出位置（窗口坐标）。None = 未打开。
-    file_tree_menu_pos: Option<Point<Pixels>>,
-    /// 已打开的文件树右键菜单实体（随位置同生同灭）。
-    file_tree_menu_entity: Option<gpui::Entity<PopupMenu>>,
-    /// 文件树右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
-    file_tree_menu_sub: Option<Subscription>,
-    /// 文件树「新建/重命名」输入弹层：打开时为 `Some`，提交/取消（`DismissEvent`）
-    /// 关闭后清空。弹层是独立 [`file_tree_prompt::FileTreePrompt`] 实体（泛型宿主
-    /// `H = EditorApp`）。
-    file_tree_prompt: Option<gpui::Entity<file_tree_prompt::FileTreePrompt<EditorApp>>>,
-    /// 文件树输入弹层的关闭订阅（提交成功/取消 → 清空引用释放实体）。
-    _file_tree_prompt_sub: Option<Subscription>,
+    /// 文件树右键上下文菜单**测试兼容镜像**：实体（`shell_sidebar::files_ops`）自持
+    /// pos/菜单实体/订阅，宿主只镜像菜单实体供 `app::tests` 直接字段断言
+    /// （2026-11-11 迁 shell_sidebar 后留薄兼容）。
+    #[doc(hidden)]
+    pub file_tree_menu_entity: Option<gpui::Entity<PopupMenu>>,
+    /// 文件树「新建/重命名」输入弹层**测试兼容镜像**：实体（`shell_sidebar::files_ops`）
+    /// 自持弹层实体/订阅，宿主只镜像弹层实体供 `app::tests` 直接字段断言/驱动输入
+    /// （2026-11-11 迁 shell_sidebar 后留薄兼容）。
+    #[doc(hidden)]
+    pub file_tree_prompt: Option<gpui::Entity<shell_sidebar::FileTreePrompt<EditorApp>>>,
     /// 文件树「过滤文件名」输入框（typeahead 按名过滤树；防抖后提交生效）。
     files_filter_state: gpui::Entity<InputState>,
     /// 过滤输入框变化订阅（防抖调度）。

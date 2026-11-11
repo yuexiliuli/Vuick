@@ -1,99 +1,34 @@
-//! 侧边栏「文件树」子模块：以打开文件夹为根的嵌套目录树渲染 / 懒加载子项扫描 /
-//! 展开折叠 / 过滤防抖与行级打开跳转。
+//! 侧边栏「文件树」实体视图子模块（2026-11 自 shell 的 `app/sidebar/files.rs` 迁入）。
+//!
+//! 以打开文件夹为根的嵌套目录树渲染（懒加载子项扫描 / 展开折叠 / 过滤防抖 typeahead /
+//! 行级打开跳转）。渲染期文件树状态（`FileTreeState` / 布局缓存 / 滚动句柄）在宿主
+//! `EditorApp.sidebar`（[`crate::state::SidebarChromeState`]）普通字段，实体方法以
+//! `&mut sb` 入参读写；事件回调（行点击 / 右键 / 过滤防抖提交 / 扫描完成）经
+//! [`crate::host::SidebarHost`] 反调宿主办状态迁移或文件副作用（打开/激活/对话框），
+//! 与 chrome / toc 姿势一致（渲染期禁再入宿主，见 [`crate::host`]）。
 
-use super::*;
+use gpui::{
+    div, px, AnimationExt, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window,
+};
+use ui::icon::{Icon, IconName};
+use ui::input::{Input, InputState};
+use ui::motion::hover_spring;
 
-impl EditorApp {
-    /// 打开文件行：已打开 → 激活既有选项卡（**不新建**）；未打开 → 复用 `open_file`
-    /// 完整打开语义（内部已分流 PDF / EPUB / 图 / 视频 / 文本）。
-    pub(crate) fn open_path_or_activate(
-        &mut self,
-        path: &std::path::Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let idx = self
-            .model.borrow().tabs
-            .iter()
-            .position(|t| t.file_path.as_deref() == Some(path));
-        if let Some(idx) = idx {
-            self.activate_tab(idx, window, cx);
-        } else {
-            self.open_file(&path.to_string_lossy(), window, cx);
-        }
-    }
+use crate::chrome::Sidebar;
+use crate::host::SidebarHost;
+use crate::prompt::FileTreePromptHost;
+use crate::state::{
+    FileRow, SidebarChromeState, FILE_TREE_INDENT, FILE_TREE_ROW_H, FILES_FILTER_DEBOUNCE_MS,
+};
+use crate::toc::{TOC_BAND_BUFFER, TOC_VIRTUALIZE_MIN};
 
-    /// 文件树行点击（目录行）：展开/折叠切换。折叠只移出 `expanded`（children 缓存
-    /// 保留，折叠再展开复用不重读）；首展未扫描 → 后台读直接子项。
-    pub(crate) fn file_tree_toggle(
-        &mut self,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.sidebar.files.expanded.contains(&path) {
-            self.sidebar.files.expanded.remove(&path);
-            self.sidebar.files.layout_gen = self.sidebar.files.layout_gen.wrapping_add(1);
-            cx.notify();
-            return;
-        }
-        // 展开：先入集合（行态立到「展开」），未扫描才异步读这一层子项。
-        self.sidebar.files.expanded.insert(path.clone());
-        self.sidebar.files.layout_gen = self.sidebar.files.layout_gen.wrapping_add(1);
-        if !self.sidebar.files.children.contains_key(&path) {
-            self.spawn_file_tree_scan(path, window, cx);
-        }
-        cx.notify();
-    }
-
-    /// 后台读取某目录的**直接子项**并缓存（懒加载：一次只读这一层，绝不整棵递归预
-    /// 扫描）。`std::fs::read_dir` 在后台线程执行（大目录万级不卡主线程），完成后
-    /// 回主线程更新 state + notify。已在缓存 → 不复读；已在途 → 幂等返回。
-    pub(crate) fn spawn_file_tree_scan(
-        &mut self,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.sidebar.files.children.contains_key(&path)
-            || !self.sidebar.files.pending.insert(path.clone())
-        {
-            return;
-        }
-        let entity = cx.entity();
-        window.spawn(cx, async move |cx| {
-            let p_read = path.clone();
-            let entries = cx
-                .background_executor()
-                .spawn(async move { read_dir_entries(&p_read) })
-                .await;
-            // 换根期间旧目录的在途扫描结果不落地（路径已不在当前根下 → 丢弃，防孤儿
-            // 缓存膨胀；新根路径不同则互不干扰、同路径重开则幂等覆盖）。
-            let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
-                this.sidebar.files.pending.remove(&path);
-                let stale = this
-                    .sidebar
-                    .files
-                    .root
-                    .as_ref()
-                    .map(|r| !path.starts_with(r))
-                    .unwrap_or(true);
-                if !stale {
-                    this.sidebar.files.layout_gen = this.sidebar.files.layout_gen.wrapping_add(1);
-                    this.sidebar.files.children.insert(path.clone(), entries);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
+impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 「文件」视图顶栏：「文件」标题 + 根目录名（路径尾段，超长省略）。
-    fn render_sidebar_files_header(&mut self) -> impl IntoElement {
+    fn render_sidebar_files_header(&self, sb: &SidebarChromeState) -> impl IntoElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let border = self.bar_border();
-        let root = self
-            .sidebar
+        let root = sb
             .files
             .root
             .as_ref()
@@ -133,7 +68,8 @@ impl EditorApp {
     }
 
     /// 未打开文件夹 / 根路径失效的空态：文件夹图标 + 文案 + 可点「打开文件夹…」。
-    fn sidebar_files_empty(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// 点击经宿主服务 `sidebar_open_folder_dialog`（宿主 file_ops 能力）。
+    fn sidebar_files_empty(&mut self, _sb: &SidebarChromeState, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let muted = self.text_minor();
         let accent: gpui::Hsla = ui::theme::Theme::global(cx).colors.accent.into();
         div()
@@ -166,10 +102,14 @@ impl EditorApp {
                     .rounded_md()
                     .text_size(px(12.))
                     .text_color(accent)
-                    .cursor(CursorStyle::PointingHand)
+                    .cursor(gpui::CursorStyle::PointingHand)
                     .on_click(cx.listener(
-                        |this: &mut EditorApp, _: &gpui::ClickEvent, window, cx| {
-                            this.open_folder_dialog(window, cx);
+                        |this: &mut Self, _: &gpui::ClickEvent, window, cx| {
+                            if let Some(h) = this.host_weak().upgrade() {
+                                let _ = h.update(cx, |app, cx| {
+                                    app.sidebar_open_folder_dialog(window, cx)
+                                });
+                            }
                         },
                     ))
                     .child("打开文件夹…"),
@@ -178,12 +118,12 @@ impl EditorApp {
     }
 
     /// 文件树滚动容器包装：`relative` 包装层 + `overflow_y_scroll` 滚动容器 + 常显
-    /// 纵向滚动条——与搜索/目录同款语义（内容超量可滚时随 [`Self::files_vscroll`]
+    /// 纵向滚动条——与搜索/目录同款语义（内容超量可滚时随 [`SidebarChromeState::files_vscroll`]
     /// 显示 thumb，轨道点击跳转、thumb 可拖）。结构/样式收敛到
     /// `ui::scroll_panel::ScrollPanelBuilder`：包装层 / 滚动条覆盖层 id 显式覆盖为
     /// sidebar 既有 id（派生 `{id}-wrap` / `{id}-vscrollbar` 与之不一致）。
-    fn wrap_files_scroll(&self, inner: impl IntoElement) -> gpui::AnyElement {
-        let vhand = self.sidebar.files_vscroll.clone();
+    fn wrap_files_scroll(&self, sb: &SidebarChromeState, inner: impl IntoElement) -> gpui::AnyElement {
+        let vhand = sb.files_vscroll.clone();
         ui::scroll_panel::ScrollPanelBuilder::new("sidebar-files-scroll", vhand)
             .wrap_id("sidebar-files-wrap")
             .bar_id("sidebar-files-vscrollbar")
@@ -192,37 +132,42 @@ impl EditorApp {
     }
 
     /// 「文件」视图：以打开文件夹为根的嵌套目录树。
-    /// - 根 = `files.root`；未打开 / 路径失效 → 空态（可点「打开文件夹…」）。
+    /// - 根 = `sb.files.root`；未打开 / 路径失效 → 空态（可点「打开文件夹…」）。
     /// - 可见行 = 根 + 按 `expanded` 递归展开的子目录（懒加载：只物化已读层）。
     /// - 行样式复用搜索文件名行（active_bg hover、gap icon、单行截断）。
-    pub(super) fn render_sidebar_files(
+    /// `files_filter_state` = 宿主预取的「过滤文件名」输入框实体（域渲染期禁再入宿主，
+    /// 数据以参数传入，同 toc 的 `bookmarks` 姿势）；输入框状态/订阅仍归宿主。
+    pub fn render_sidebar_files(
         &mut self,
+        sb: &mut SidebarChromeState,
+        files_filter_state: gpui::Entity<InputState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let active_bg = self.tab_active_bg();
-        let content: gpui::AnyElement = if self.sidebar.files.root.is_none() {
-            self.sidebar_files_empty(cx)
+        let content: gpui::AnyElement = if sb.files.root.is_none() {
+            self.sidebar_files_empty(sb, window, cx)
         } else {
-            // 行描述按 `files.layout_gen` 缓存：树结构（根/展开/子项）没变逐帧复用，只把
+            // 行描述按 `sb.files.layout_gen` 缓存：树结构（根/展开/子项）没变逐帧复用，只把
             // 可视带内的行物化为元素——万级子项下不再每帧全量构造行元素/键控状态。
-            let layout_gen = self.sidebar.files.layout_gen;
-            let cached = match &self.sidebar.files_layout {
+            let layout_gen = sb.files.layout_gen;
+            let cached = match &sb.files_layout {
                 Some((g, _)) => *g == layout_gen,
                 None => false,
             };
             if !cached {
-                let rows = self.sidebar_files_collect();
-                self.sidebar.files_layout = Some((layout_gen, rows));
-            }            let layout_rows = &self.sidebar.files_layout.as_ref().unwrap().1;
+                let rows = self.sidebar_files_collect(sb);
+                sb.files_layout = Some((layout_gen, rows));
+            }
+            let layout_rows = &sb.files_layout.as_ref().unwrap().1;
             let total = layout_rows.len();
             // 虚拟化：只物化可视带 + 上下 M 行缓冲（同目录视图 render_sidebar_toc 口径），
             // 行等高 `FILE_TREE_ROW_H` → divisor 精确；带外以等高 spacer 占位，滚动量程稳定。
             let (start, end) = if total <= TOC_VIRTUALIZE_MIN {
                 (0usize, total)
             } else {
-                let vhand = &self.sidebar.files_vscroll;
+                let vhand = &sb.files_vscroll;
                 let offset = (-vhand.offset().y).max(px(0.)).as_f32();
                 let viewport_h = vhand.bounds().size.height.as_f32();
                 let vh = if viewport_h > 0.0 {
@@ -238,7 +183,7 @@ impl EditorApp {
             };
             let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(end - start);
             for (i, row) in layout_rows.iter().enumerate().skip(start).take(end - start) {
-                rows.push(self.sidebar_files_row(window, i, row, fg, muted, active_bg, cx));
+                rows.push(self.sidebar_files_row(window, i, row, fg, muted, active_bg, sb, cx));
             }
             let (top_h, bottom_h) = (
                 start as f32 * FILE_TREE_ROW_H,
@@ -270,9 +215,9 @@ impl EditorApp {
             .overflow_hidden()
             .flex()
             .flex_col()
-            .child(self.render_sidebar_files_header())
-            .child(self.render_files_filter_input(window, cx))
-            .child(self.wrap_files_scroll(content))
+            .child(self.render_sidebar_files_header(sb))
+            .child(self.render_files_filter_input(sb, &files_filter_state, window, cx))
+            .child(self.wrap_files_scroll(sb, content))
             // P2-10：面板开合轻淡入（同目录/搜索面板）。
             .with_spring(
                 "sidebar-files-fade",
@@ -286,10 +231,10 @@ impl EditorApp {
     /// 过滤词非空时按「名称不区分大小写子串」过滤：不匹配的条目（含目录）整体隐藏，
     /// 目录不匹配则其子树一并隐藏；过滤中省略「（空）」占位行（无意义）。
     /// O(可见行) 且只克隆轻量描述，不构造元素；结果按 [`SidebarChromeState::files_layout`]
-    /// 缓存（`files.layout_gen` 失效），渲染逐帧 O(可视带) 物化。
-    fn sidebar_files_collect(&self) -> Vec<FileRow> {
+    /// 缓存（`sb.files.layout_gen` 失效），渲染逐帧 O(可视带) 物化。
+    fn sidebar_files_collect(&self, sb: &SidebarChromeState) -> Vec<FileRow> {
         let mut out: Vec<FileRow> = Vec::new();
-        let Some(root) = self.sidebar.files.root.clone() else {
+        let Some(root) = sb.files.root.clone() else {
             return out;
         };
         // SC-3：hold Ref guard 供 `filter` 引用（`borrow()` 临时在某语句末即释放，
@@ -308,11 +253,11 @@ impl EditorApp {
             depth: 0,
             placeholder: false,
         });
-        self.sidebar_files_collect_children(&root, 0, filter, &mut out);
+        self.sidebar_files_collect_children(sb, &root, 0, filter, &mut out);
         // 过滤无匹配空态：仅剩根行且根的子项已加载（过滤有意义）→ 追加「无匹配结果」占位。
         if !filter.is_empty()
             && out.len() == 1
-            && self.sidebar.files.children.contains_key(&root)
+            && sb.files.children.contains_key(&root)
         {
             out.push(FileRow {
                 path: root.clone(),
@@ -328,12 +273,13 @@ impl EditorApp {
     /// 递归收集某个**已展开目录**的直接子行描述（空目录 → 「（空）」占位行；过滤中省略）。
     fn sidebar_files_collect_children(
         &self,
+        sb: &SidebarChromeState,
         dir: &std::path::Path,
         depth: usize,
         filter: &str,
         out: &mut Vec<FileRow>,
     ) {
-        let Some(children) = self.sidebar.files.children.get(dir) else {
+        let Some(children) = sb.files.children.get(dir) else {
             return; // 尚未扫描完成（加载中）→ 无子行，扫描完成后 `layout_gen` 递增重收
         };
         if children.is_empty() {
@@ -353,7 +299,7 @@ impl EditorApp {
             if !filter.is_empty() && !child.name.to_lowercase().contains(filter) {
                 continue;
             }
-            let is_expanded = child.is_dir && self.sidebar.files.expanded.contains(&child.path);
+            let is_expanded = child.is_dir && sb.files.expanded.contains(&child.path);
             out.push(FileRow {
                 path: child.path.clone(),
                 label: child.name.clone().into(),
@@ -362,15 +308,16 @@ impl EditorApp {
                 placeholder: false,
             });
             if is_expanded {
-                self.sidebar_files_collect_children(&child.path, depth + 1, filter, out);
+                self.sidebar_files_collect_children(sb, &child.path, depth + 1, filter, out);
             }
         }
     }
 
     /// 单条文件树行：缩进 + 目录指示（ChevronRight/Down + 文件夹图标）+ 名。
-    /// 点击：目录行展开/折叠；文件行打开（已打开 → 激活既有选项卡）。当前激活
-    /// 文件行高亮（active_bg 常显 + 主前景文字）。行强制 `FILE_TREE_ROW_H` 等高
-    /// （虚拟化 divisor 精确）；空目录占位行显示「（空）」，无点击语义。
+    /// 点击：目录行展开/折叠（宿主服务 `sidebar_file_tree_toggle`）；文件行打开/激活
+    /// （宿主服务 `sidebar_open_path_or_activate`）。当前激活文件行高亮（active_bg 常显
+    /// + 主前景文字）。行强制 `FILE_TREE_ROW_H` 等高（虚拟化 divisor 精确）；空目录占位
+    /// 行显示「（空）」，无点击语义。右键 → 域内 `on_file_tree_right_click`（files_ops.rs）。
     fn sidebar_files_row(
         &self,
         window: &mut Window,
@@ -379,6 +326,7 @@ impl EditorApp {
         fg: gpui::Hsla,
         muted: gpui::Hsla,
         active_bg: gpui::Hsla,
+        sb: &SidebarChromeState,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let rows_id = format!("sidebar-file-row-{key}");
@@ -402,7 +350,7 @@ impl EditorApp {
                 .child(placeholder_text)
                 .into_any_element();
         }
-        let is_expanded = row.is_dir && self.sidebar.files.expanded.contains(&row.path);
+        let is_expanded = row.is_dir && sb.files.expanded.contains(&row.path);
         let is_active = !row.is_dir && self.active_file_path_matches(&row.path);
         let row_fg = if is_active { fg } else { muted };
         // P2-10：hover 状态跨帧记录 → 行背景淡入（与搜索行同款）。
@@ -435,6 +383,7 @@ impl EditorApp {
             Icon::new(IconName::File).size(px(13.)).text_color(row_fg).into_any_element()
         };
         let path = row.path.clone();
+        let rc_path = path.clone();
         let is_dir = row.is_dir;
         let label = row.label.clone();
         let depth = row.depth;
@@ -453,7 +402,7 @@ impl EditorApp {
             .rounded_md()
             .min_w(px(0.))
             .text_color(row_fg)
-            .cursor(CursorStyle::PointingHand)
+            .cursor(gpui::CursorStyle::PointingHand)
             .on_hover({
                 let st = hover.clone();
                 move |h, _w, cx| {
@@ -461,24 +410,24 @@ impl EditorApp {
                     cx.notify(view_id);
                 }
             })
-            .on_click({
-                let lc_path = path.clone();
-                cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                    if is_dir {
-                        this.file_tree_toggle(lc_path.clone(), window, cx);
-                    } else {
-                        this.open_path_or_activate(&lc_path, window, cx);
+            .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
+                if is_dir {
+                    if let Some(h) = this.host_weak().upgrade() {
+                        let _ = h.update(cx, |app, cx| {
+                            app.sidebar_file_tree_toggle(path.clone(), window, cx)
+                        });
                     }
-                })
-            })
+                } else if let Some(h) = this.host_weak().upgrade() {
+                    let _ = h.update(cx, |app, cx| {
+                        app.sidebar_open_path_or_activate(&path, window, cx)
+                    });
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
-                {
-                    let rc_path = path.clone();
-                    cx.listener(move |this: &mut EditorApp, ev, window, cx| {
-                        this.on_file_tree_right_click(&rc_path, is_dir, ev, window, cx);
-                    })
-                },
+                cx.listener(move |this: &mut Self, ev, window, cx| {
+                    this.on_file_tree_right_click(&rc_path, is_dir, ev, window, cx);
+                }),
             )
             .child(chevron)
             .child(type_icon)
@@ -514,17 +463,24 @@ impl EditorApp {
     // -----------------------------------------------------------------
 
     /// 文件树过滤输入框：typeahead 按名字过滤树（防抖提交见
-    /// [`Self::schedule_files_filter_debounce`]），清空恢复全树。
+    /// [`Sidebar::schedule_files_filter_debounce`]），清空恢复全树。
     /// 规则：过滤只作用于**已加载（已扫描且所在目录已展开）的条目**——匹配折叠/未
-    /// 扫描目录内的名字不会命中（懒加载不整棵预扫，见 [`FileTreeState`]）；命中的目录
-    /// 行保留并可展开（其子树仍按同词继续过滤）。
-    fn render_files_filter_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// 扫描目录内的名字不会命中（懒加载不整棵预扫）；命中的目录行保留并可展开
+    /// （其子树仍按同词继续过滤）。输入框实体状态/订阅仍归宿主（`init.rs`），此处
+    /// 只读渲染。
+    fn render_files_filter_input(
+        &mut self,
+        sb: &SidebarChromeState,
+        files_filter_state: &gpui::Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         // 未打开文件夹 → 过滤框不显示（空态占满）。
-        if self.sidebar.files.root.is_none() {
+        if sb.files.root.is_none() {
             return div().into_any_element();
         }
-        let search = self.files_filter_state.clone();
-        let focused = window.focused(cx) == Some(self.files_filter_state.read(cx).focus_handle(cx));
+        let search = files_filter_state.clone();
+        let focused = window.focused(cx) == Some(files_filter_state.read(cx).focus_handle(cx));
         let border_color: gpui::Hsla = if focused {
             ui::theme::Theme::global(cx).colors.focus_ring.into()
         } else {
@@ -547,23 +503,33 @@ impl EditorApp {
 
     /// 输入变化 → 登记防抖待提交过滤词并重启防抖计时器（`SeqAfter` 代序作废旧定时器）。
     /// 防抖期满提交 `files_filter` + 作废文件树布局缓存（下次渲染按新过滤词重收集可见行）。
-    pub(crate) fn schedule_files_filter_debounce(&mut self, value: String, cx: &mut Context<Self>) {
+    /// 宿主的输入框订阅（`init.rs`）转发到本方法；**不 notify**——宿主 forwarder
+    /// 在自身上下文 `cx.notify()`（同 `file_tree_toggle` 注释）。
+    pub fn schedule_files_filter_debounce(
+        &mut self,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
         self.model.borrow_mut().files_filter_pending = value.trim().to_lowercase();
-        cx.notify();
-        let weak = cx.weak_entity();
+        let weak_self = cx.weak_entity();
         self.model.borrow().files_filter_debounce.after(
             cx,
             std::time::Duration::from_millis(FILES_FILTER_DEBOUNCE_MS),
             move |app| {
-                let _ = weak.update(app, |this, cx| {
+                let _ = weak_self.update(app, |this, app| {
                     // SC-3：先提纯 owned 再比较（`if` 条件里的 borrow 临时 Ref 会存活
                     // 整个分支块 → 块内 borrow_mut 运行期双借 panic）。
                     let pending = std::mem::take(&mut this.model.borrow_mut().files_filter_pending);
                     let files_filter = this.model.borrow().files_filter.clone();
                     if files_filter != pending {
                         this.model.borrow_mut().files_filter = pending;
-                        this.sidebar.files.layout_gen = this.sidebar.files.layout_gen.wrapping_add(1);
-                        cx.notify();
+                        // `sb.files.layout_gen` 在宿主（域实体不持侧栏状态）→ 经宿主服务
+                        // 提交 + notify（实体上下文此时可安全反调宿主：定时器到点）。
+                        if let Some(h) = this.host_weak().upgrade() {
+                            let _ = h.update(app, |host, cx| {
+                                host.sidebar_files_filter_commit(cx);
+                            });
+                        }
                     }
                 });
             },

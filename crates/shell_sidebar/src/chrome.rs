@@ -17,9 +17,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    div, px, AnimationExt, AnyElement, Context, CursorStyle, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    WeakEntity, Window,
+    div, px, AnimationExt, AnyElement, Context, CursorStyle, Entity, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Point, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, WeakEntity, Window,
 };
 use shell_core::AppModel;
 use ui::icon::{Icon, IconName};
@@ -27,24 +27,46 @@ use ui::motion::{hover_bg_fade, hover_spring};
 use ui::theme::ChromeColors;
 
 use crate::host::SidebarHost;
+use crate::prompt::FileTreePromptHost;
 use crate::state::{SidebarChromeState, SidebarView};
 
-/// 侧边栏域实体：宿主 `sidebar_view: Entity<Sidebar<H>>` 持有，承载外壳 / 目录的渲染与
-/// 事件（`Context<Self>` 内 `cx.listener` 绑定本实体）。不持 `SidebarChromeState`
+/// 侧边栏域实体：宿主 `sidebar_view: Entity<Sidebar<H>>` 持有，承载外壳 / 目录 / 文件树的
+/// 渲染与事件（`Context<Self>` 内 `cx.listener` 绑定本实体）。不持 `SidebarChromeState`
 /// （状态在宿主普通字段，渲染期以 `&mut` 入参传入；事件回调经宿主服务落地）。
-pub struct Sidebar<H: SidebarHost> {
+/// 文件树右键菜单 / 输入弹层等**实体自有 UI 暂存**亦收在本实体（宿主仅留测试兼容镜像）。
+pub struct Sidebar<H: SidebarHost + FileTreePromptHost> {
     /// 宿主模型（与 `EditorApp.model` 同一 `Rc<RefCell>` 共享）：目录视图读 tabs /
     /// reader / md_wy / pdf_bookmarks 与主题明暗，均在域内直取。
-    /// `pub(crate)`：`toc.rs` 拆分模块需直读。
+    /// `pub(crate)`：`toc.rs` / `files.rs` 拆分模块需直读。
     pub(crate) model: Rc<RefCell<AppModel>>,
     /// 宿主实体弱引用：事件回调 → 宿主服务（改侧栏状态 / notify / persist）。
     host: WeakEntity<H>,
+    /// 文件树右键上下文菜单：弹出位置（窗口坐标）。实体自有（`files_ops.rs` 读写）；
+    /// 宿主仅镜像 `menu_entity` 供测试断言。
+    pub(crate) file_tree_menu_pos: Option<Point<Pixels>>,
+    /// 已打开的文件树右键菜单实体（随位置同生同灭）。
+    pub(crate) file_tree_menu_entity: Option<Entity<ui::menu::PopupMenu>>,
+    /// 文件树右键菜单的关闭订阅（选择/Esc/点击外 → 清位置与实体）。
+    pub(crate) file_tree_menu_sub: Option<Subscription>,
+    /// 文件树「新建/重命名」输入弹层实体（泛型宿主 `H`）。实体自有（`files_ops.rs`
+    /// 读写）；宿主仅镜像供测试。
+    pub(crate) file_tree_prompt: Option<Entity<crate::prompt::FileTreePrompt<H>>>,
+    /// 文件树输入弹层的关闭订阅（提交成功/取消 → 清引用释放实体）。
+    pub(crate) file_tree_prompt_sub: Option<Subscription>,
 }
 
-impl<H: SidebarHost> Sidebar<H> {
+impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 构造：共享模型 + 宿主弱引用。
     pub fn new(model: Rc<RefCell<AppModel>>, host: WeakEntity<H>) -> Self {
-        Self { model, host }
+        Self {
+            model,
+            host,
+            file_tree_menu_pos: None,
+            file_tree_menu_entity: None,
+            file_tree_menu_sub: None,
+            file_tree_prompt: None,
+            file_tree_prompt_sub: None,
+        }
     }
 
     /// 宿主弱引用（活动栏/手柄/toc 主题回调需要；`pub(crate)` 供 `toc.rs`）。
