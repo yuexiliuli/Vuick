@@ -273,6 +273,10 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let media_locked = self.active_media_locked(cx);
+        // 视频选项卡激活时隐藏底部状态栏与左侧侧边栏（**渲染级守卫**、不写
+        // `sidebar.open` 等状态；切到非视频 tab 即恢复）。与 media_locked 互不重叠：
+        // locked 是全隐（连标题栏/选项卡栏都藏），此处仅藏状态栏与侧边栏。
+        let hide_video_chrome = self.active_media_is_video();
         let mut out: Vec<gpui::AnyElement> = Vec::new();
         if media_locked {
             // 锁定：正文（图片/视频查看器）直接铺满窗口，其余全藏 —— 媒体经重排后自动放大填满
@@ -281,8 +285,13 @@ impl EditorApp {
             out.push(self.render_title_bar(window, cx).into_any_element());
             // 侧边栏与【选项卡栏 + 编辑区】并列：render_body_sidebar 组装整行
             // [侧栏(紧贴标题栏下) + 分隔带 | 右列(选项卡栏在上、编辑区在下)]。
-            out.push(self.render_body_sidebar(body, window, cx).into_any_element());
-            out.push(self.render_status_bar(window, cx).into_any_element());
+            out.push(
+                self.render_body_sidebar(body, hide_video_chrome, window, cx)
+                    .into_any_element(),
+            );
+            if !hide_video_chrome {
+                out.push(self.render_status_bar(window, cx).into_any_element());
+            }
         }
         // 右键菜单 Overlay（媒体锁定 + PDF 页操作 + 选项卡栏 + 文件树）恒在最上层（通知层提升到外层根最后绘制，见 render_root）
         out.push(self.render_media_lock_menu(window, cx).into_any_element());

@@ -132,6 +132,8 @@ impl EditorApp {
             panes: PanesState::default(),
             sidebar: sidebar::SidebarChromeState {
                 open: true,
+                // 视频自动隐藏的手动打开覆盖默认关闭（视频激活即藏）。
+                video_hide_override: false,
                 view: sidebar::SidebarView::Toc,
                 // 目录面板默认收起（仅留 46px 活动栏，不挤占正文）；
                 // 点活动栏「目录」按钮再展开。

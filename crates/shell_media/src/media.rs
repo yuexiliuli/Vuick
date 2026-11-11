@@ -30,6 +30,18 @@ pub fn active_media_locked(m: &AppModel, cx: &gpui::App) -> bool {
     }
 }
 
+/// 当前激活选项卡是否在播放**视频**（活动 tab 的阅读器为 [`MediaReader::Video`]）。
+/// 与 [`active_media_locked`] 同口径：仅视频 true，其余（文本 / Markdown / PDF / 图片）
+/// 一律 false。用于视频 tab 激活时**隐藏底部状态栏与左侧侧边栏**——渲染级守卫、不写状态，
+/// 切到非视频 tab 即恢复（见 shell `render_shell_children`）。
+pub fn active_media_is_video(m: &AppModel) -> bool {
+    match m.tabs.get(m.active_tab).map(|t| &t.reader) {
+        #[cfg(feature = "video")]
+        Some(MediaReader::Video(_)) => true,
+        _ => false,
+    }
+}
+
 /// 媒体查看器切换/加载后的标签标题与状态栏同步（**渲染期调用**，见 shell
 /// `render_fullscreen_preview`）：查看器切换图片/视频后 `refresh_windows` 触发本窗口
 /// 重绘，全屏预览渲染前据此把选项卡 `file_path` 与状态栏跟到当前媒体（标签标题跟着

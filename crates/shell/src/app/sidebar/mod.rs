@@ -247,7 +247,12 @@ impl EditorApp {
     }
 
     /// 内容区整行：侧边栏展开时在左侧停靠（紧贴标题栏下），右侧为一「右列」——
-    /// 上方选项卡栏 + 下方正文 `body`（正文块承载）；收起时仅返回右列本身。
+    /// 上方选项卡栏 + 下方正文 `body`（正文块承载）；收起时仅返回右列本身。 `hide_sidebar`
+    /// = 视频选项卡激活时的**渲染级守卫**（宿主在 `render_shell_children` 求值传入）：
+    /// 为 true 且未被用户手动覆盖（`video_hide_override`）时即使 `sidebar.open` 仍为真也
+    /// 只返回右列——**仅改可见性、不写状态**，与「收起」同款路径，恢复后回到原开合态。
+    /// 用户点标题栏侧边栏按钮显式打开 → `video_hide_override=true` 挂起守卫（`open` 同时
+    /// 置 true），再点复位；活动选项卡切换自动重新武装（见 chrome.rs / tabs.rs）。
     ///
     /// 无缝直连外壳：侧边栏（mica 底色）与右列（选项卡栏 + 正文块）之间无缝隙/圆角，
     /// 仅靠侧边栏右缘一条发丝线分隔；正文右缘贴窗、编辑区直落选项卡栏之下，状态栏
@@ -255,6 +260,7 @@ impl EditorApp {
     pub(crate) fn render_body_sidebar(
         &mut self,
         body: gpui::AnyElement,
+        hide_sidebar: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -270,7 +276,7 @@ impl EditorApp {
             .child(self.render_tab_bar(window, cx))
             .child(self.render_body_card(body, window, cx));
 
-        if !self.sidebar.open {
+        if !self.sidebar.open || (hide_sidebar && !self.sidebar.video_hide_override) {
             return right_col.into_any_element();
         }
         // 面板内容：目录/文件树/搜索 → 域实体（`shell_sidebar` 的 toc/files/search；书签、

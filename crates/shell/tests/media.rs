@@ -90,8 +90,8 @@ use common::*;
         p
     }
 
-    /// 纯决策函数 `resolve_media_open_target` 与行为表逐行一致（16 组真值全覆盖，
-    /// 其中「关(any)」8 组、开分支 8 组）。
+    /// 纯决策函数 `resolve_media_open_target` 与行为表逐行一致（旧 16 组真值全覆盖 +
+    /// 空窗（`self_has_tabs=false`）恒 Here；实际枚举 16×2=32 全真值组合）。
     #[test]
     fn media_window_resolve_behavior_table() {
         use shell::app::MediaOpenTarget::*;
@@ -100,24 +100,34 @@ use common::*;
             for reuse in [false, true] {
                 for self_media in [false, true] {
                     for other in [false, true] {
-                        let got =
-                            resolve_media_open_target(media_new, reuse, self_media, other);
-                        // 逐行按行为表推导期望（与实现同表，防改乱回归断言）。
-                        let want = if !media_new {
-                            Here
-                        } else if !reuse {
-                            NewWindow
-                        } else if self_media {
-                            Here
-                        } else if other {
-                            ReuseExisting
-                        } else {
-                            NewWindow
-                        };
-                        assert_eq!(
-                            got, want,
-                            "行为表: media_new={media_new} reuse={reuse} self_media={self_media} other={other}"
-                        );
+                        for self_has_tabs in [false, true] {
+                            let got = resolve_media_open_target(
+                                media_new,
+                                reuse,
+                                self_media,
+                                other,
+                                self_has_tabs,
+                            );
+                            // 逐行按行为表推导期望（与实现同表，防改乱回归断言）：
+                            // 空窗（无 tab）恒 Here；有窗行 = 旧表逐行。
+                            let want = if !self_has_tabs {
+                                Here
+                            } else if !media_new {
+                                Here
+                            } else if !reuse {
+                                NewWindow
+                            } else if self_media {
+                                Here
+                            } else if other {
+                                ReuseExisting
+                            } else {
+                                NewWindow
+                            };
+                            assert_eq!(
+                                got, want,
+                                "行为表: media_new={media_new} reuse={reuse} self_media={self_media} other={other} self_has_tabs={self_has_tabs}"
+                            );
+                        }
                     }
                 }
             }
@@ -195,6 +205,42 @@ use common::*;
             media_win_snap(cx, &app).1.as_deref(),
             Some(v1.as_path()),
             "当前窗口活动选项卡应即所开视频"
+        );
+        let _ = std::fs::remove_file(&v1);
+    }
+
+    /// 行为表 g：**空窗口（0 文件选项卡，欢迎页）**开视频 → 直接在本窗口打开为视频选项卡，
+    /// 不新开媒体窗口、也不复用其它媒体窗口（窗口数不变、本窗出一视频 tab）。
+    #[cfg(feature = "video")]
+    #[gpui::test]
+    async fn media_window_empty_window_opens_video_in_place(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app_zero_tabs(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs.is_empty()),
+            "前置：零 tab 空窗口（欢迎页）"
+        );
+        let v1 = placeholder_video("empty1");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(v1.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            registry_window_count(cx),
+            1,
+            "空窗口开视频：窗口数应不变（不新开、不复用别窗）"
+        );
+        assert!(active_is_video(cx, &app), "视频应在空窗口就地打开为活动选项卡");
+        assert_eq!(
+            media_win_snap(cx, &app).1.as_deref(),
+            Some(v1.as_path()),
+            "空窗口活动选项卡应即所开视频"
         );
         let _ = std::fs::remove_file(&v1);
     }

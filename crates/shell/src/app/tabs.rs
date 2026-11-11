@@ -24,6 +24,9 @@ impl EditorApp {
     /// 动作体在 `AppModel::make_tab`（shell_core::actions）。此处 glue 转发。
     #[doc(hidden)]
     pub fn make_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> usize {
+        // 新建选项卡成为活动（含打开视频文件）→ 重新武装视频自动隐藏：手动打开覆盖复位，
+        // 保证「每次视频激活都从隐藏开始」。
+        self.sidebar.video_hide_override = false;
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().make_tab(host, &mut **cx)
     }
@@ -47,6 +50,13 @@ impl EditorApp {
     /// 动作体在 `AppModel::activate_tab`。glue 转发。
     #[doc(hidden)]
     pub fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // 活动选项卡**真正切换**（idx != 现活动）→ 重新武装视频自动隐藏：手动打开覆盖
+        // 复位（每次切到视频都从隐藏开始）。相同下标重复点击不重置（避免误关已手动打开的
+        // 侧边栏）。
+        let switching = self.model.borrow().active_tab != idx;
+        if switching {
+            self.sidebar.video_hide_override = false;
+        }
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().activate_tab(host, idx, window, &mut **cx);
     }
@@ -219,6 +229,13 @@ impl EditorApp {
     /// 动作体在 `AppModel::remove_tab`。glue 转发。
     #[doc(hidden)]
     pub fn remove_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // 关闭的正是活动选项卡 → 活动下标变化（域内选中新活动，不经本 activate_tab glue）
+        // → 重新武装视频自动隐藏：手动打开覆盖复位（落回文本/另一视频都从隐藏开始）。
+        // 移除非活动选项卡不扰动（仍在同一视频 tab 上，保留用户手动打开）。
+        let removing_active = self.model.borrow().active_tab == idx;
+        if removing_active {
+            self.sidebar.video_hide_override = false;
+        }
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().remove_tab(host, idx, window, &mut **cx);
     }

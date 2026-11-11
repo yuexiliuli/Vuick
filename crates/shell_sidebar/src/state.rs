@@ -167,6 +167,13 @@ pub struct SidebarChromeState {
     /// 侧边栏是否展开。
     /// `pub`：宿主/测试直写可见。
     pub open: bool,
+    /// 视频选项卡激活时「侧边栏自动隐藏」的用户**手动打开覆盖**：默认 `false` = 自动隐藏
+    /// 生效（视频下侧边栏藏起）；用户在视频下点标题栏【打开/隐藏侧边栏】按钮显式打开后置
+    /// `true` = 自动隐藏被挂起（侧边栏出现）；再点一次回到隐藏时复位 `false`。**非持久化**
+    /// （不随 `/sidebar` 写偏好）；活动选项卡切换时重新武装复位（见 shell
+    /// `EditorApp::activate_tab` / `make_tab`）。
+    /// `pub`：宿主/测试直读直写可见。
+    pub video_hide_override: bool,
     /// 侧边栏当前视图（目录 / 搜索 / 文件树）。
     /// `pub`：宿主/测试直写可见（init/file_ops 直写）。
     pub view: SidebarView,

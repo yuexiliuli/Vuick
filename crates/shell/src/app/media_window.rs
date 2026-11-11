@@ -115,6 +115,9 @@ impl EditorApp {
             self.model.borrow().reuse_media_window,
             self_is_media,
             other,
+            // 发起窗口无任何文件选项卡（空窗/欢迎页）→ 媒体就地打开（域决策
+            // `self_has_tabs` 语义见 shell_media::media_window::resolve_media_open_target）。
+            !self.model.borrow().tabs.is_empty(),
         );
         // K39 姿势诊断探针：真机冒烟取证用（GPUI_EDITOR_DIAG 守卫，平时零开销）。
         let windows_n = cx

@@ -70,12 +70,13 @@ pub fn is_media_path(p: &Path) -> bool {
 
 /// 纯决策函数：按「媒体打开行为表」逐行解析打开去向。
 ///
-///   | media_new_window | reuse_media_window | 当前窗口是媒体 | 另有媒体窗口 | 结果        |
-///   | 关(any)          | any                | any            | any            | Here        |
-///   | 开               | 开                 | 是             | any            | Here        |
-///   | 开               | 开                 | 否             | 是             | ReuseExisting|
-///   | 开               | 开                 | 否             | 否             | NewWindow   |
-///   | 开               | 关                 | any            | any            | NewWindow   |
+///   | media_new_window | reuse_media_window | 当前窗口是媒体 | 另有媒体窗口 | 当前窗空(无 tab) | 结果        |
+///   | any              | any                | any            | any            | 是               | Here        |
+///   | 关(any)          | any                | any            | any            | 否               | Here        |
+///   | 开               | 开                 | 是             | any            | 否               | Here        |
+///   | 开               | 开                 | 否             | 是             | 否               | ReuseExisting|
+///   | 开               | 开                 | 否             | 否             | 否               | NewWindow   |
+///   | 开               | 关                 | any            | any            | 否               | NewWindow   |
 ///
 /// 纯函数、无副作用，单测直接覆盖全真值组合。
 pub fn resolve_media_open_target(
@@ -83,7 +84,15 @@ pub fn resolve_media_open_target(
     reuse: bool,
     self_is_media: bool,
     has_other_media: bool,
+    self_has_tabs: bool,
 ) -> MediaOpenTarget {
+    // 发起窗口无任何文件选项卡（空窗/欢迎页）→ 媒体**就地打开**：空窗新开媒体窗口 =
+    // 浪费一个窗口。此分支最前短路——`self_has_tabs=false` 表示发起窗口无任何文件选项卡
+    // （空窗），此时媒体应就地打开；仅当 `media_new_window` 开启且已确认 is_media 时才
+    // 可能到达此处。
+    if !self_has_tabs {
+        return MediaOpenTarget::Here;
+    }
     if !media_new_window {
         MediaOpenTarget::Here
     } else if !reuse {
@@ -116,8 +125,15 @@ pub fn resolve_media_open_action(
     reuse: bool,
     self_is_media: bool,
     other: Option<AnyWindowHandle>,
+    self_has_tabs: bool,
 ) -> MediaOpenAction {
-    match resolve_media_open_target(media_new_window, reuse, self_is_media, other.is_some()) {
+    match resolve_media_open_target(
+        media_new_window,
+        reuse,
+        self_is_media,
+        other.is_some(),
+        self_has_tabs,
+    ) {
         MediaOpenTarget::Here => MediaOpenAction::Here,
         MediaOpenTarget::NewWindow => MediaOpenAction::NewWindow,
         MediaOpenTarget::ReuseExisting => match other {
@@ -213,7 +229,9 @@ mod tests {
     use super::*;
     use shell_core::AppModel;
 
-    /// `resolve_media_open_target` 与行为表逐行一致（16 组真值全覆盖）。
+    /// `resolve_media_open_target` 与行为表逐行一致（19 组真值全覆盖：旧 16 组在
+    /// `self_has_tabs=true` 逐行保持 + 空窗 16 组恒 Here——空窗行只随 `self_has_tabs=false`
+    /// 短路，其余输入不改变空窗结果，实际枚举 16×2=32 全真值组合）。
     #[test]
     fn resolve_media_open_target_behavior_table() {
         use MediaOpenTarget::*;
@@ -221,23 +239,34 @@ mod tests {
             for reuse in [false, true] {
                 for self_media in [false, true] {
                     for other in [false, true] {
-                        let got = resolve_media_open_target(media_new, reuse, self_media, other);
-                        // 逐行按行为表推导期望（与实现同表，防改乱回归断言）。
-                        let want = if !media_new {
-                            Here
-                        } else if !reuse {
-                            NewWindow
-                        } else if self_media {
-                            Here
-                        } else if other {
-                            ReuseExisting
-                        } else {
-                            NewWindow
-                        };
-                        assert_eq!(
-                            got, want,
-                            "行为表: media_new={media_new} reuse={reuse} self_media={self_media} other={other}"
-                        );
+                        for self_has_tabs in [false, true] {
+                            let got = resolve_media_open_target(
+                                media_new,
+                                reuse,
+                                self_media,
+                                other,
+                                self_has_tabs,
+                            );
+                            // 逐行按行为表推导期望（与实现同表，防改乱回归断言）：
+                            // 空窗（无任何文件选项卡）恒 Here；有窗行 = 旧表逐行。
+                            let want = if !self_has_tabs {
+                                Here
+                            } else if !media_new {
+                                Here
+                            } else if !reuse {
+                                NewWindow
+                            } else if self_media {
+                                Here
+                            } else if other {
+                                ReuseExisting
+                            } else {
+                                NewWindow
+                            };
+                            assert_eq!(
+                                got, want,
+                                "行为表: media_new={media_new} reuse={reuse} self_media={self_media} other={other} self_has_tabs={self_has_tabs}"
+                            );
+                        }
                     }
                 }
             }
@@ -248,24 +277,29 @@ mod tests {
     /// 纯布尔决策面全覆盖；`OpenIn` 臂只差句柄装订，由集成测试经真实窗口句柄覆盖）。
     #[test]
     fn resolve_media_open_action_decision() {
+        // 空窗口（无任何文件选项卡）→ Here（就地打开，不新开/不复用媒体窗口）
+        assert_eq!(
+            resolve_media_open_action(true, true, false, None, false),
+            MediaOpenAction::Here
+        );
         // 配置关 → Here
         assert_eq!(
-            resolve_media_open_action(false, true, false, None),
+            resolve_media_open_action(false, true, false, None, true),
             MediaOpenAction::Here
         );
         // 开 + 复用关 → NewWindow
         assert_eq!(
-            resolve_media_open_action(true, false, false, None),
+            resolve_media_open_action(true, false, false, None, true),
             MediaOpenAction::NewWindow
         );
         // 开 + 复用开 + 自身是媒体 → Here
         assert_eq!(
-            resolve_media_open_action(true, true, true, None),
+            resolve_media_open_action(true, true, true, None, true),
             MediaOpenAction::Here
         );
         // 开 + 复用开 + 无其它媒体窗口 → NewWindow
         assert_eq!(
-            resolve_media_open_action(true, true, false, None),
+            resolve_media_open_action(true, true, false, None, true),
             MediaOpenAction::NewWindow
         );
         // 开 + 复用开 + 由宿主给句柄：本函数只透传（不作为候选判定——None 与 Some 语义

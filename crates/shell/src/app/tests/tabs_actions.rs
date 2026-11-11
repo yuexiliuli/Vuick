@@ -1101,3 +1101,462 @@
         );
     }
 
+    /// 视频选项卡激活 → 隐藏底部状态栏 + 左侧侧边栏（渲染级守卫，不写 `sidebar.open`；
+    /// 切到非视频 tab 立即恢复）。R1/R2/R3 + 「非活动视频 tab 时安全」触发腿：
+    /// - 视频 tab 在列但**非活动** → 两栏照常渲染（触发点=活动 tab 的 reader）；
+    /// - 切到视频 tab（活动 = 视频）→ 状态栏不渲染、侧边栏包裹层不渲染、右列/标题栏/
+    ///   选项卡栏/正文块仍在；`sidebar.open` 全程不变；
+    /// - 切回文本 tab → 状态栏 + 侧边栏恢复。
+    /// 视频用假字节（解码失败不影响 reader 变体判定，P0-A 已让失败路径快速静止）。
+    #[cfg(feature = "video")]
+    #[gpui::test]
+    async fn video_autohide_hides_status_bar_and_sidebar(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 默认侧边栏即展开（`sidebar.open = true`，只留窄活动栏）。确认 `app-body-with-sidebar`
+        // 在场作为「非视频态」预置（视频激活时隐藏是**渲染级守卫**而非改写 open，R3 依赖）。
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "预置：默认侧边栏展开，包裹层应渲染"
+        );
+        assert!(
+            cx.debug_bounds("status-bar").is_some(),
+            "预置：非视频态状态栏应渲染"
+        );
+
+        // tab 0 = 空文本；新建 tab 1 作为「切回」目标（new_tab 建后即激活，活动=1）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.new_tab(window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 把视频载入 tab 0（**非活动**）→ 两栏应照常渲染
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-app-vid-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.mp4");
+        std::fs::write(&p, b"not really a video").unwrap();
+        cx.update(|window, cx| {
+            app.update(
+                cx,
+                |app, cx| app.load_media(0, &p, MediaKind::Video, window, cx),
+            );
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-bar").is_some(),
+            "视频 tab 非活动时状态栏应照常渲染"
+        );
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "视频 tab 非活动时侧边栏应照常渲染"
+        );
+
+        // 切到视频 tab（活动 = 视频）→ R1：状态栏 + 侧边栏不渲染，标题栏/选项卡栏/右列仍在
+        let open_before = cx.update(|_w, cx| app.read(cx).sidebar.open);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(0, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-bar").is_none(),
+            "R1：视频激活时底部状态栏不应渲染"
+        );
+        assert!(
+            cx.debug_bounds("sidebar").is_none(),
+            "R1：视频激活时侧边栏本体不应渲染"
+        );
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "R1：视频激活时侧边栏包裹层不应渲染"
+        );
+        assert!(
+            cx.debug_bounds("app-right-column").is_some(),
+            "R1：右列（选项卡栏+正文）应在"
+        );
+        assert!(
+            cx.debug_bounds("title-bar").is_some(),
+            "R1：标题栏应仍在"
+        );
+        assert!(
+            cx.debug_bounds("tab-bar").is_some(),
+            "R1：选项卡栏应仍在"
+        );
+        assert!(
+            cx.debug_bounds("app-main-card").is_some(),
+            "R1：正文块应在"
+        );
+        // R3：隐藏动作不改变 sidebar.open
+        let open_after = cx.update(|_w, cx| app.read(cx).sidebar.open);
+        assert_eq!(
+            open_before, open_after,
+            "R3：视频激活仅隐藏渲染、不写 sidebar.open"
+        );
+
+        // R2：切到文本 tab → 状态栏 + 侧边栏恢复；R3 延续：open 仍保持展开原态
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(1, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-bar").is_some(),
+            "R2：切回文本后状态栏应恢复"
+        );
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "R2：切回文本后侧边栏应恢复"
+        );
+        let open_restored = cx.update(|_w, cx| app.read(cx).sidebar.open);
+        assert_eq!(
+            open_before, open_restored,
+            "R3：恢复后 sidebar.open 仍保持原开合态"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 视频「打开文件」触发腿 + 关闭视频 tab 后恢复正常：
+    /// - 把视频直接载入当前**活动** tab（打开文件路由）→ 状态栏 + 侧边栏立即隐藏；
+    /// - 关闭该视频 tab（命名文件、干净 → 直通 `remove_tab`，不弹确认）→ 回到余下文本
+    ///   tab，状态栏 + 侧边栏恢复正常。
+    #[cfg(feature = "video")]
+    #[gpui::test]
+    async fn video_autohide_open_and_close_toggles(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-bar").is_some(),
+            "预置：文本态状态栏应渲染"
+        );
+
+        // 新建文本 tab 1（视频关闭后落到它）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.new_tab(window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 把视频载入当前活动 tab（tab 1）→ 打开文件即生效
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-app-vid-open-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.mp4");
+        std::fs::write(&p, b"not really a video").unwrap();
+        cx.update(|window, cx| {
+            app.update(
+                cx,
+                |app, cx| app.load_media(1, &p, MediaKind::Video, window, cx),
+            );
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-bar").is_none(),
+            "打开视频（活动）即隐藏状态栏"
+        );
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "打开视频（活动）即隐藏侧边栏"
+        );
+
+        // 关闭视频 tab（命名文件、干净）→ 落回文本 tab，两栏恢复
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.close_tab(1, window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        assert!(
+            !cx.has_pending_prompt(),
+            "干净命名视频 tab 关闭不应弹确认"
+        );
+        assert!(
+            cx.debug_bounds("status-bar").is_some(),
+            "关闭视频 tab 后状态栏应恢复"
+        );
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "关闭视频 tab 后侧边栏应恢复"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 视频激活时标题栏【打开/隐藏侧边栏】按钮 = 显式打开（覆盖自动隐藏），再点为关闭；
+    /// 活动选项卡切换自动重新武装（切走复位 override、切回视频从隐藏开始）。延续
+    /// `video_autohide_*` 夹具姿势（假字节视频、reader 变体判定）；复核 `video_hide_override`
+    /// 状态机与 `open` 不被持久化改写：
+    /// - 视频激活 → 侧边栏自动隐藏（open 保持 true）；
+    /// - 视频下点按钮 → 侧边栏出现（open=true、override=true）；再点 → 关闭（open=false、
+    ///   override=false）；
+    /// - 切走文本 → override 复位、`open` 不变；切回视频 → 自动隐藏重新武装（即使 open=true
+    ///   也隐藏）。
+    #[cfg(feature = "video")]
+    #[gpui::test]
+    async fn video_autohide_toggle_opens_and_rearms(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (open0, over0) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar.open, a.sidebar.video_hide_override)
+        });
+        assert!(open0 && !over0, "预置：默认侧边栏展开、无手动覆盖");
+
+        // 新建文本 tab（切回/切走目标），视频载入 tab 0（非活动）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.new_tab(window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-app-vid-tg-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.mp4");
+        std::fs::write(&p, b"not really a video").unwrap();
+        cx.update(|window, cx| {
+            app.update(
+                cx,
+                |app, cx| app.load_media(0, &p, MediaKind::Video, window, cx),
+            );
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+
+        // 切到视频（活动=0）→ 自动隐藏生效（open 保持 true、override false）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(0, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "视频激活：侧边栏自动隐藏"
+        );
+        let over_enter = cx.update(|_w, cx| app.read(cx).sidebar.video_hide_override);
+        assert!(!over_enter, "进视频时 override 应为 false（自动隐藏武装）");
+
+        // 视频下点按钮 → 显式打开：override=true、open=true、侧边栏出现；状态栏仍藏
+        cx.update(|_w, cx| app.update(cx, |app, cx| app.toggle_sidebar(cx)));
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (open_on, over_on) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar.open, a.sidebar.video_hide_override)
+        });
+        assert!(open_on && over_on, "视频下点按钮→显式打开：open=true、override=true");
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "视频下点按钮后侧边栏应出现"
+        );
+        assert!(
+            cx.debug_bounds("status-bar").is_none(),
+            "状态栏仍按视频激活即藏（无按钮、不涉覆盖）"
+        );
+
+        // 再点 → 关闭（回到隐藏）：open=false、override=false
+        cx.update(|_w, cx| app.update(cx, |app, cx| app.toggle_sidebar(cx)));
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (open_off, over_off) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar.open, a.sidebar.video_hide_override)
+        });
+        assert!(!open_off && !over_off, "再点→关闭：open=false、override=false");
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "再点后侧边栏应回到隐藏"
+        );
+
+        // 切走文本 → override 复位（open 不变，仍 false 故隐藏）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(1, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (open_text, over_text) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar.open, a.sidebar.video_hide_override)
+        });
+        assert!(!over_text, "切到文本后 override 应复位 false");
+        assert_eq!(open_text, open_off, "切走不改 open（保持用户关闭语义）");
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "文本下按 open=false 保持隐藏"
+        );
+
+        // 回视频（open 仍 false）→ 自动隐藏重新武装（无需点按钮）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(0, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let over_back = cx.update(|_w, cx| app.read(cx).sidebar.video_hide_override);
+        assert!(!over_back, "回视频：override 重新武装 false");
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "回视频：自动隐藏重新武装"
+        );
+
+        // 视频下再开一次侧边栏（open=true、override=true）→ 出现的状态；随后
+        // 切走文本 → override 复位、侧边栏按 open=true 恢复；再切回视频 → open=true 也
+        // 仍被自动隐藏覆盖（武装生效的关键断言）。
+        cx.update(|_w, cx| app.update(cx, |app, cx| app.toggle_sidebar(cx)));
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "视频下再开侧边栏应出现"
+        );
+        let open_re = cx.update(|_w, cx| app.read(cx).sidebar.open);
+        assert!(open_re, "视频下再开：open 回 true");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(1, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let over_final = cx.update(|_w, cx| app.read(cx).sidebar.video_hide_override);
+        assert!(!over_final, "切回文本：override 复位");
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "文本下按 open=true 恢复侧边栏"
+        );
+        // 关键：回视频 → 即使 open=true 也自动隐藏（每次视频激活都从隐藏开始）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(0, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (open_back, over_back2) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar.open, a.sidebar.video_hide_override)
+        });
+        assert_eq!(open_back, true, "回视频不改 open（仍为用户开的 true）");
+        assert!(!over_back2, "回视频：override 重新武装 false");
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "回视频：open=true 仍被自动隐藏覆盖（重新武装）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关闭**活动**视频选项卡落回另一视频 tab → 自动隐藏重新武装：即便用户先前已手动
+    /// 打开侧边栏（override=true、open=true），关闭活动视频后 override 复位 false，侧边栏
+    /// 按「每次视频激活都从隐藏开始」归于隐藏；`open` 不被改写（仅渲染级掉隐藏）。
+    /// 该腿走 `remove_tab` glue（域内自选新活动、不经 activate_tab glue），回归保护
+    /// `EditorApp::remove_tab` 的重新武装。
+    #[cfg(feature = "video")]
+    #[gpui::test]
+    async fn video_autohide_close_active_video_rearms(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-app-vid-close-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 两个视频 tab（1、2）+ 落点文本 tab 0；当前活动 = tab 2（视频）
+        for vid in 1..=2 {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| app.new_tab(window, cx));
+            });
+            for _ in 0..3 {
+                cx.run_until_parked();
+            }
+            let p = dir.join(&format!("v{vid}.mp4"));
+            std::fs::write(&p, b"not really a video").unwrap();
+            cx.update(|window, cx| {
+                app.update(
+                    cx,
+                    |app, cx| app.load_media(vid, &p, MediaKind::Video, window, cx),
+                );
+            });
+            for _ in 0..4 {
+                cx.run_until_parked();
+            }
+        }
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "预置：视频激活自动隐藏"
+        );
+        // 手动打开侧边栏（override=true、open=true）
+        cx.update(|_w, cx| app.update(cx, |app, cx| app.toggle_sidebar(cx)));
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "手动打开后侧边栏应出现"
+        );
+        // 关闭活动视频 tab 2 → 落回视频 tab 1 → 重新武装：隐藏 + override 复位 + open 不变
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.close_tab(2, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            !cx.has_pending_prompt(),
+            "干净命名视频 tab 关闭不应弹确认"
+        );
+        let (open_after, over_after) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar.open, a.sidebar.video_hide_override)
+        });
+        assert!(open_after, "关闭活动视频不写 open（仍为用户开的 true）");
+        assert!(!over_after, "关闭活动视频 → override 重新武装 false");
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "落回另一视频 tab：侧边栏归于隐藏（重新武装）"
+        );
+        // 切回文本 tab 0 → 按 open=true 恢复（override 已复位、无视频隐藏）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(0, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_some(),
+            "切回文本：按 open=true 恢复侧边栏"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+

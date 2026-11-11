@@ -27,6 +27,12 @@ impl EditorApp {
         shell_media::media::active_media_locked(&self.model.borrow(), cx)
     }
 
+    /// 当前激活选项卡是否在播放视频。域逻辑
+    /// [`shell_media::media::active_media_is_video`]。
+    pub(super) fn active_media_is_video(&self) -> bool {
+        shell_media::media::active_media_is_video(&self.model.borrow())
+    }
+
     /// 当前激活选项卡的「可锁定」媒体查看器（图片或视频；PDF 无锁定语义，置 None）。
     /// 域逻辑 [`shell_media::media::active_media_viewer`]。
     pub(super) fn active_media_viewer(&self) -> Option<MediaReader> {

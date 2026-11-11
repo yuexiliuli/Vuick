@@ -6,9 +6,23 @@ use super::*;
 impl EditorApp {
     /// 切换侧边栏「展开/收起」。
     /// `#[doc(hidden)] pub`：`tests/palette.rs` 侧栏几何断言（§8.6 外提清单）。
+    ///
+    /// 视频选项卡激活时（自动隐藏生效中）点击 = **显式打开**：把 `video_hide_override`
+    /// 置 true 挂起自动隐藏、`open` 置 true，侧边栏出现；再点一次走普通翻转关闭（同时
+    /// 复位 override）。非视频上下文行为与旧版完全一致（普通翻转 `open`）。
     #[doc(hidden)]
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar.open = !self.sidebar.open;
+        // 先判状态再写字段（`active_media_is_video` 只读借用 self.model，先取 bool
+        // 避免与后续 &mut self.sidebar 冲突）。
+        let video_autohide_active = self.active_media_is_video() && !self.sidebar.video_hide_override;
+        if video_autohide_active {
+            // 视频自动隐藏生效中 → 本次点击=显式打开（不翻 open、挂起自动隐藏）。
+            self.sidebar.open = true;
+            self.sidebar.video_hide_override = true;
+        } else {
+            self.sidebar.open = !self.sidebar.open;
+            self.sidebar.video_hide_override = false;
+        }
         cx.notify();
     }
 
