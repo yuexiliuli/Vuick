@@ -49,7 +49,11 @@ mod tabs;
 // （可见于 `app`）；原 `pub` / `pub(super)`（= crate 可见）搬入私有子模块后升为 `pub(crate)`）。
 mod chrome;
 mod close_tray;
-mod file_tree_prompt;
+// 文件树「新建/重命名」输入弹层（2026-11-11 整迁 shell_sidebar 后为重导出 facade：
+// 类型/渲染在域 crate，宿主经 FileTreePromptHost 反调提交动作，路径保持既有）。
+pub mod file_tree_prompt {
+    pub use shell_sidebar::{FileTreePrompt, FileTreePromptHost, FileTreePromptKind};
+}
 mod host_impl;
 mod init;
 mod layout;
@@ -198,11 +202,17 @@ pub struct EditorApp {
     #[doc(hidden)]
     pub panes: PanesState,
     /// 侧边栏「外壳」状态：可见性 / 视图 / 目录折叠 / 宽度与右缘拖拽
-    /// （检索输入 + 扫描缓存等仍在此处，见 [`sidebar::SidebarChromeState`]）。
+    /// （类型 `SidebarChromeState` 已迁 shell_sidebar；本字段仍是**普通值**——
+    /// `app::tests` 与 `tests/*` 的既有字段读写不变量强制，见 §8.6 外提链）。
     /// `#[doc(hidden)] pub`：`tests/settings_xfer.rs` 直读/直写 `width`/`width_auto`/
     /// `files.root`/`files.children`（§8.6 外提清单）。
     #[doc(hidden)]
-    pub sidebar: sidebar::SidebarChromeState,
+    pub sidebar: shell_sidebar::SidebarChromeState,
+    /// 侧边栏**渲染/事件实体**（2026-11-11 起承接自 shell_sidebar 域 crate）：
+    /// 外壳（活动栏/调宽手柄）+ 目录（TOC）视图在 `Entity<Sidebar<EditorApp>>` 上构建
+    /// （`Context<Sidebar>` 内 `cx.listener` 绑定域实体）；宿主渲染期以 `&mut self.sidebar`
+    /// 传入状态、事件回调经 `SidebarHost` 反调本宿主。搜索 / 文件树面板仍由宿主直渲。
+    sidebar_view: gpui::Entity<shell_sidebar::Sidebar<EditorApp>>,
     /// 侧边栏「搜索」关键字输入控件。
     /// `#[doc(hidden)] pub`：`tests/pdf.rs` 检索在途断言 `set_value` 推查询（§8.6 外提清单）。
     #[doc(hidden)]
@@ -271,8 +281,9 @@ pub struct EditorApp {
     /// 文件树右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     file_tree_menu_sub: Option<Subscription>,
     /// 文件树「新建/重命名」输入弹层：打开时为 `Some`，提交/取消（`DismissEvent`）
-    /// 关闭后清空。弹层是独立 [`file_tree_prompt::FileTreePrompt`] 实体。
-    file_tree_prompt: Option<gpui::Entity<file_tree_prompt::FileTreePrompt>>,
+    /// 关闭后清空。弹层是独立 [`file_tree_prompt::FileTreePrompt`] 实体（泛型宿主
+    /// `H = EditorApp`）。
+    file_tree_prompt: Option<gpui::Entity<file_tree_prompt::FileTreePrompt<EditorApp>>>,
     /// 文件树输入弹层的关闭订阅（提交成功/取消 → 清空引用释放实体）。
     _file_tree_prompt_sub: Option<Subscription>,
     /// 文件树「过滤文件名」输入框（typeahead 按名过滤树；防抖后提交生效）。

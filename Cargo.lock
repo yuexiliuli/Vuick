@@ -4291,6 +4291,7 @@ dependencies = [
  "shell_commands",
  "shell_core",
  "shell_scan",
+ "shell_sidebar",
  "shell_widgets",
  "syntax",
  "text_open",
@@ -4333,6 +4334,19 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "memchr",
+]
+
+[[package]]
+name = "shell_sidebar"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "gpui",
+ "markdown_wysiwyg",
+ "pdf",
+ "shell_core",
+ "toc",
+ "ui",
 ]
 
 [[package]]

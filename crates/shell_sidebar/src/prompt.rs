@@ -1,16 +1,42 @@
-//! 文件树「新建/重命名」输入弹层：居中 Acrylic 卡片 + 单行输入框（复用 `ui::input`），
-//! 回车/确定提交 → 回调宿主执行文件系统操作；失败在卡片内联提示（不静默丢反馈）；
-//! Esc/取消/点外 → 关闭（发 `DismissEvent`，宿主清引用释放实体）。焦点管理同
-//! [`session_store::RecentPanel`]（开前记焦点、动作未带走才归还）。
+//! 文件树「新建/重命名」输入弹层（2026-11 自 shell 的 `app/file_tree_prompt.rs` 整迁）。
+//!
+//! 居中 Acrylic 卡片 + 单行输入框（复用 `ui::input`），回车/确定提交 → 回调宿主执行
+//! 文件系统操作；失败在卡片内联提示（不静默丢反馈）；Esc/取消/点外 → 关闭（发
+//! `DismissEvent`，宿主清引用释放实体）。焦点管理同 `session_store::RecentPanel`
+//! （开前记焦点、动作未带走才归还）。
+//!
+//! 泛型宿主 [`FileTreePromptHost`]（对照 `RecentPanelHost` 先例）：域 crate 不依赖 shell
+//! 具体宿主类型，`WeakEntity<H>` 弱引用反调提交动作。
 
-use super::*;
-use gpui::{EventEmitter, KeyDownEvent, WeakEntity};
-use ui::input::Input;
+use std::path::PathBuf;
+
+use gpui::{
+    deferred, div, px, AnimationExt, App, AppContext, Context, CursorStyle, DismissEvent,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, StatefulInteractiveElement, Styled, WeakEntity, Window,
+};
+use ui::input::{Input, InputState};
 use ui::motion::hover_spring;
+
+/// 文件树输入弹层的宿主抽象（提交动作在宿主：文件系统操作 + 树/选项卡同步）。
+pub trait FileTreePromptHost: 'static {
+    /// 提交：读输入值 → 按 `kind` 执行新建/重命名文件系统操作；成功 `Ok(())`，失败
+    /// `Err(内联提示文案)`（弹层留在卡片上显式展示，不静默丢反馈）。宿主内部完成
+    /// 提交后「成功才关、失败留卡」由弹层依返回值处理。
+    fn file_tree_submit_prompt(
+        &mut self,
+        kind: &FileTreePromptKind,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String>
+    where
+        Self: Sized;
+}
 
 /// 弹层操作类型（决定标题 / 预填名 / 提交后动作）。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FileTreePromptKind {
+pub enum FileTreePromptKind {
     /// 在 `parent` 目录下新建文件（提交成功 → 自动打开成选项卡）。
     NewFile { parent: PathBuf },
     /// 在 `parent` 目录下新建文件夹。
@@ -43,12 +69,13 @@ impl FileTreePromptKind {
 }
 
 /// 文件树输入弹层实体（宿主持有 `Option<Entity<Self>>`；渲染挂根级高优先级层）。
-pub(crate) struct FileTreePrompt {
+/// 泛型参数 `H` = 宿主实体类型（`impl FileTreePromptHost`），经弱引用反调。
+pub struct FileTreePrompt<H: FileTreePromptHost> {
     kind: FileTreePromptKind,
     /// 单行输入框状态（预填默认名；IME/占位符复用）。
     input: gpui::Entity<InputState>,
-    /// 宿主（EditorApp）弱引用：提交回调执行文件系统操作与树/选项卡同步。
-    host: WeakEntity<EditorApp>,
+    /// 宿主（泛型 `H`）弱引用：提交回调执行文件系统操作与树/选项卡同步。
+    host: WeakEntity<H>,
     /// 最近一次提交失败的内联提示（重名/非法名/权限等；成功后置 None）。
     hint: Option<String>,
     /// 打开前的焦点句柄（关闭时归还；提交成功后文件已打开 → 焦点被动作带走不归还）。
@@ -56,9 +83,9 @@ pub(crate) struct FileTreePrompt {
     focus_handle: FocusHandle,
 }
 
-impl FileTreePrompt {
-    pub(crate) fn new(
-        host: WeakEntity<EditorApp>,
+impl<H: FileTreePromptHost> FileTreePrompt<H> {
+    pub fn new(
+        host: WeakEntity<H>,
         kind: FileTreePromptKind,
         previous_focus: Option<FocusHandle>,
         window: &mut Window,
@@ -86,8 +113,8 @@ impl FileTreePrompt {
             self.close(window, cx);
             return;
         };
-        let result = host.update(cx, |app, cx| {
-            app.file_tree_submit_prompt(&kind, &value, window, cx)
+        let result = host.update(cx, |host, cx| {
+            host.file_tree_submit_prompt(&kind, &value, window, cx)
         });
         match result {
             Ok(()) => self.close(window, cx),
@@ -114,8 +141,26 @@ impl FileTreePrompt {
     }
 
     /// 输入框焦点句柄（宿主打开时聚焦 + 关闭判定共用）。
-    pub(crate) fn input_focus(&self, cx: &App) -> FocusHandle {
+    pub fn input_focus(&self, cx: &App) -> FocusHandle {
         self.input.read(cx).focus_handle(cx)
+    }
+
+    /// 测试可见性（shell 的 `app/tests/sidebar.rs` 跨 crate 断言用）。
+    #[doc(hidden)]
+    pub fn kind(&self) -> &FileTreePromptKind {
+        &self.kind
+    }
+
+    /// 测试可见性（当前输入值）。
+    #[doc(hidden)]
+    pub fn input_value(&self, cx: &App) -> String {
+        self.input.read(cx).value().to_string()
+    }
+
+    /// 测试可见性（输入框实体：测试经 `set_value` 程序化改输入）。
+    #[doc(hidden)]
+    pub fn input_entity(&self) -> gpui::Entity<InputState> {
+        self.input.clone()
     }
 
     fn on_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -141,35 +186,17 @@ impl FileTreePrompt {
     ) {
         self.close(window, cx);
     }
-
-    /// 测试可见性。
-    #[allow(dead_code)] // 测试断言用（app::tests）
-    pub(crate) fn kind(&self) -> &FileTreePromptKind {
-        &self.kind
-    }
-
-    /// 测试可见性（当前输入值）。
-    #[allow(dead_code)] // 测试断言用（app::tests）
-    pub(crate) fn input_value(&self, cx: &App) -> String {
-        self.input.read(cx).value().to_string()
-    }
-
-    /// 测试可见性（输入框实体：测试经 `set_value` 程序化改输入）。
-    #[allow(dead_code)] // 测试断言用（app::tests）
-    pub(crate) fn input_entity(&self) -> gpui::Entity<InputState> {
-        self.input.clone()
-    }
 }
 
-impl EventEmitter<DismissEvent> for FileTreePrompt {}
+impl<H: FileTreePromptHost> EventEmitter<DismissEvent> for FileTreePrompt<H> {}
 
-impl Focusable for FileTreePrompt {
+impl<H: FileTreePromptHost> Focusable for FileTreePrompt<H> {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for FileTreePrompt {
+impl<H: FileTreePromptHost> Render for FileTreePrompt<H> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 开卡即聚焦输入框（回车/直接敲字直达）。每帧重夺焦点：右键菜单关闭时会按
         // `spawn_context_menu` 的 previous_focus 归还旧焦点（如刚打开的文件编辑器），
@@ -206,7 +233,7 @@ impl Render for FileTreePrompt {
             .text_size(px(12.))
             .text_color(accent)
             .cursor(CursorStyle::PointingHand)
-            .on_click(cx.listener(move |this: &mut FileTreePrompt, _ev, window, cx| {
+            .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                 this.submit(window, cx);
             }))
             .child("确定")
@@ -220,7 +247,7 @@ impl Render for FileTreePrompt {
             .text_size(px(12.))
             .text_color(muted)
             .cursor(CursorStyle::PointingHand)
-            .on_click(cx.listener(move |this: &mut FileTreePrompt, _ev, window, cx| {
+            .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                 this.close(window, cx);
             }))
             .child("取消")

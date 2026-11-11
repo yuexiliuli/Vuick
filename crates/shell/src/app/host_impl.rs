@@ -87,3 +87,52 @@ impl AppHost for EditorApp {
         cfg!(test) || matches!(std::env::var("GPUI_EDITOR_TEST").as_deref(), Ok("1"))
     }
 }
+
+// 2026-11-11：侧栏域 crate 宿主服务面（shell_sidebar）。事件回调改侧栏状态统一经此
+// trait 落地；宿主实现只调 `shell_sidebar::state` 的**状态纯变换** + notify/persist，
+// 零业务逻辑（状态变换的单一事实源在域 crate，防双写漂移）。
+impl shell_sidebar::SidebarHost for EditorApp {
+    fn sidebar_toggle_view(&mut self, view: crate::app::SidebarView, cx: &mut Context<Self>) {
+        self.sidebar.toggle_view(view);
+        cx.notify();
+    }
+
+    fn sidebar_set_resize_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.sidebar.resize_hovered = hovered;
+        cx.notify();
+    }
+
+    fn sidebar_resize_start(&mut self, start_x: f32, cx: &mut Context<Self>) {
+        shell_sidebar::state::resize_start(&mut self.sidebar, start_x);
+        cx.notify();
+    }
+
+    fn sidebar_toc_collapse(&mut self, idx: usize, has_child: bool, cx: &mut Context<Self>) {
+        if shell_sidebar::state::toc_collapse(&mut self.sidebar, idx, has_child) {
+            cx.notify();
+        }
+    }
+
+    fn sidebar_remove_pdf_bookmark(
+        &mut self,
+        path: &std::path::Path,
+        idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.remove_pdf_bookmark(path, idx, cx);
+    }
+}
+
+// 2026-11-11：文件树输入弹层宿主服务面（shell_sidebar）。提交动作在宿主
+// （`app/sidebar/files_ops.rs` 的既有 `file_tree_submit_prompt`），行为零变。
+impl shell_sidebar::FileTreePromptHost for EditorApp {
+    fn file_tree_submit_prompt(
+        &mut self,
+        kind: &shell_sidebar::FileTreePromptKind,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.file_tree_submit_prompt(kind, value, window, cx)
+    }
+}

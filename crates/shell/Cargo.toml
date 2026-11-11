@@ -51,6 +51,10 @@ shell_core = { path = "../shell_core" }
 # L0 纯 UI 组件叶子 crate（自 shell 的 scrollbar.rs + app/tabs.rs 的 TabBoundsRecorder
 # 拆出；纯结构移动，零 EditorApp 依赖，shell 保留编排与消费）。
 shell_widgets = { path = "../shell_widgets" }
+# 侧边栏域 crate（自 shell 的 app/sidebar 拆出：状态 + chrome 外壳渲染 + toc 目录视图 +
+# FileTreePrompt 输入弹层；纯结构移动，shell 保留 `sidebar: SidebarChromeState` 状态
+# 与宿主编排，经 `sidebar_view: Entity<Sidebar<EditorApp>>` 实体接线）。
+shell_sidebar = { path = "../shell_sidebar" }
 # 音乐播放器（Phase A 引擎 + Phase B UI 已提交）：shell 集成（整窗音乐模式 /
 # 打开音频文件路由 / 状态栏指示）。不静态链 FFmpeg（运行时经 libloading 加载）。
 music = { path = "../music" }

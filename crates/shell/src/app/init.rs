@@ -108,8 +108,14 @@ impl EditorApp {
             // A4：PDF 书签进程级读盘一次（`load_cached`；每窗构造都读盘是浪费）。
             pdf_bookmarks::load_cached(),
         )));
+        // 侧边栏渲染/事件实体（2026-11-11 迁 shell_sidebar）：经共享 model + 宿主弱引用
+        // 构造；宿主渲染期以 `&mut self.sidebar` 入参调用其外壳/目录渲染。
+        let sidebar_view = cx.new(|_| {
+            shell_sidebar::Sidebar::new(model.clone(), own_weak.clone())
+        });
         let mut app = EditorApp {
             model,
+            sidebar_view,
             tab_bar_hscroll: TableScrollState::new(),
             tab_hscroll_delay: SeqAfter::default(),
             notifications: Vec::new(),
