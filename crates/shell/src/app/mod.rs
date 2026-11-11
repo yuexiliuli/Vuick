@@ -96,7 +96,8 @@ use ui::motion::hover_spring;
 use base::util::SeqAfter;
 
 // WYSIWYG 预览编辑——本项目 `markdown_wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
-use markdown_wysiwyg::{WyEditor, WyEvent};
+// （`WyEvent` 已随 toggle_live_test 的订阅实现迁 shell_preview，无需再在宿主 prelude。）
+use markdown_wysiwyg::WyEditor;
 
 use crate::actions::*;
 use config::layout::{
@@ -145,10 +146,6 @@ pub use palette::{quick_open_collect, QUICK_OPEN_MAX_FILE_BYTES, QUICK_OPEN_MAX_
 pub use shell_pdf::bookmarks::{load, normalize_key};
 #[doc(hidden)]
 pub use file_ops::MediaKind;
-
-/// 编辑器被预览驱动后的落位收敛宽限（帧）：边界块（表格等）顶行读取可能滞后/抖动
-/// 一两帧，此期内「编辑器落位」不回显为「编辑器主动滚动」；超过才放手由正常双向同步接管。
-const DRIVEN_EDITOR_MAX_AWAIT: u32 = 8;
 
 /// A4：Markdown 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：
 /// 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。

@@ -12,8 +12,6 @@ gpui = { workspace = true }
 ui = { path = "../ui" }
 # 宿主模型（AppModel / MediaReader；跨 crate 命名经它）。
 shell_core = { path = "../shell_core" }
-# MediaReader::Image 实体（锁定判定 / 元数据读取）。
-image_viewer = { path = "../image_viewer" }
 # 音频路由判定（is_audio_extension）与 MusicView 播放请求（不静态链 FFmpeg）。
 music = { path = "../music" }
 # 视频路径判定随本 crate 的 `video` feature 开关（与 shell 一致，镜像转发）。

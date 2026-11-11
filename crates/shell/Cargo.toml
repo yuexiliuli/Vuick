@@ -60,6 +60,11 @@ shell_sidebar = { path = "../shell_sidebar" }
 # notify/persist 落地）、右键菜单视图/挂载与 win32 取色宿主 window 部分；经 PdfHost
 # 宿主服务面反调本宿主）。
 shell_pdf = { path = "../shell_pdf" }
+# 预览域 crate（自 shell 的 app/preview + app/panes 的预览渲染半拆出：md_wy 统一
+# WyEditor 安装/swap/切换/活区 + 编辑⇄预览滚动同步 + 路径分类 + 预览渲染元素；纯结构
+# 移动，shell 保留薄适配（编辑事件订阅与 feed 入口、commit_live 宿主收尾、媒体/PDF
+# 查看器渲染分支、布局/菜单编排）；经 PreviewHost 宿主服务面反调本宿主）。
+shell_preview = { path = "../shell_preview" }
 # 媒体/音乐域 crate（自 shell 的 app/media + app/media_window + app/music_player 拆出：
 # 查看器元数据同步 / 锁定菜单项构建 / 媒体窗口打开决策与路由决议 / 音乐模式判定；纯结构
 # 移动，shell 保留薄适配（菜单挂载 / 窗口装配 / MusicView 惰性创建与焦点编排）；经
@@ -76,9 +81,10 @@ default = ["video"]
 # （见 crates/video/Cargo.toml），一经 `dep:video` 开启即随之启用；显式转发点统一在根包。
 # --no-default-features 时本 feature 关闭 → 视频整链关闭、不拉 FFmpeg 依赖。
 # 同步转发 `shell_core/video`（MediaReader::Video 变体随 shell_core 的 `video` feature
-# 编译）与 `shell_media/video`（域 crate 的 video 半边随同一开关联动，避免两侧编译态
-# 分叉），保持「转发点统一在 shell」。
-video = ["dep:video", "shell_core/video", "shell_media/video"]
+# 编译）、`shell_media/video`（域 crate 的 video 半边随同一开关联动）与
+# `shell_preview/video`（预览域路径分类的视频判定），避免各侧编译态分叉，
+# 保持「转发点统一在 shell」。
+video = ["dep:video", "shell_core/video", "shell_media/video", "shell_preview/video"]
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。

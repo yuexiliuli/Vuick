@@ -1,0 +1,33 @@
+[package]
+name = "shell_preview"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 预览域 crate（自 shell 的 app/preview + app/panes 的预览渲染半拆出：md_wy 统一 WyEditor 安装/swap/切换/活区 + 编辑⇄预览滚动同步 + 路径分类 + 预览渲染元素；纯结构移动只重分配既有依赖，不新增外部包；经 PreviewHost 宿主服务面与 shell 解耦，编辑事件订阅/feed 宿主薄适配留 shell）"
+
+[dependencies]
+# 域逻辑：Entity / Window / Context / AnyElement / ScrollHandle / SharedString / Focus 等。
+gpui = { workspace = true }
+# 预览/活区自绘纵向滚动条（Scrollbar::vertical / ScrollbarMode）。
+ui = { path = "../ui" }
+# 预览内容列留白单一来源（config::markdown::PREVIEW_SIDE_GAP_PX）。
+config = { path = "../config" }
+# 宿主模型（AppModel / EditorTab / MediaReader / MdScrollSync / MdTocScroll / MdWyEarly /
+# MdWyInstall / LIVE_BODY_PAD_Y）。
+shell_core = { path = "../shell_core" }
+# 统一 WyEditor 预览/活区（Doc 管线只读宿主 + 增量回放 + 装配）。
+markdown_wysiwyg = { path = "../markdown_wysiwyg" }
+# 大文档 md「打开即提前整篇解析」的归一化分块读盘（ChunkReader）。
+text_open = { path = "../text_open" }
+# 路径分类（classify）：图片/视频扩展名白名单委托各查看器。
+image_viewer = { path = "../image_viewer" }
+# 文本存储类型（Rope：活区/整篇重喂快照）。
+ropey = { workspace = true }
+# 视频路径判定随本 crate 的 `video` feature 开关（与 shell 一致，镜像转发）。
+video = { path = "../video", optional = true }
+
+[features]
+default = []
+# video：与根包同名 feature 一致——shell 经 `shell_preview/video` 显式转发开启。
+# --no-default-features 时关闭 → 视频整链关闭、不拉 FFmpeg 依赖。
+video = ["dep:video", "shell_core/video"]

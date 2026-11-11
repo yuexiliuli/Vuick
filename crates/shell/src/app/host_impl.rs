@@ -417,3 +417,26 @@ impl shell_media::MediaHost for EditorApp {
         });
     }
 }
+
+// 2026-11-11：预览域宿主服务面（shell_preview）。预览域对宿主的副作用收敛到此 trait：
+// WYSIWYG 活区内容变更的防抖会话持久化 / Ctrl+滚轮缩放字号 / 预览拖放打开。域逻辑在
+// shell_preview（`live::enter_live` 订阅回调、`render::zoom_overlay`、`render::md_wy_host_children`
+// 的 on_drop 经 `cx.listener` 的 `&mut H` 直调），宿主实现零业务逻辑（转发既有方法）。
+impl shell_preview::PreviewHost for EditorApp {
+    fn preview_schedule_session_flush(&mut self, cx: &mut Context<Self>) {
+        self.schedule_session_flush(cx, false);
+    }
+
+    fn preview_change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.change_font_size(delta, cx);
+    }
+
+    fn preview_open_dropped_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_dropped_paths(paths, window, cx);
+    }
+}

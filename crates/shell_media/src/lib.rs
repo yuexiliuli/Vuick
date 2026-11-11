@@ -22,7 +22,8 @@
 //! - [`music`]：音乐模式路由判定（什么路径进音乐模式）、toggle 状态判定与播放请求核心。
 //! - [`host`]：[`MediaHost`] 宿主服务面（路由执行 / 最近媒体窗口查询）。
 //!
-//! 依赖只重分配 workspace 既有包（gpui / ui / shell_core / image_viewer / music / video 可选），
+//! 依赖只重分配 workspace 既有包（gpui / ui / shell_core / music / video 可选——
+//! `image_viewer` 死依赖已随评审 nit 移除，`MediaReader::Image` 实体仅经 shell_core 命名），
 //! 不新增外部包。
 
 pub mod host;

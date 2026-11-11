@@ -4292,6 +4292,7 @@ dependencies = [
  "shell_core",
  "shell_media",
  "shell_pdf",
+ "shell_preview",
  "shell_scan",
  "shell_sidebar",
  "shell_widgets",
@@ -4335,7 +4336,6 @@ name = "shell_media"
 version = "0.1.0"
 dependencies = [
  "gpui",
- "image_viewer",
  "music",
  "shell_core",
  "ui",
@@ -4353,6 +4353,21 @@ dependencies = [
  "rfd",
  "serde_json",
  "shell_core",
+]
+
+[[package]]
+name = "shell_preview"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "gpui",
+ "image_viewer",
+ "markdown_wysiwyg",
+ "ropey",
+ "shell_core",
+ "text_open",
+ "ui",
+ "video",
 ]
 
 [[package]]
