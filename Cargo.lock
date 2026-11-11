@@ -4295,6 +4295,7 @@ dependencies = [
  "shell_preview",
  "shell_scan",
  "shell_sidebar",
+ "shell_tabs",
  "shell_widgets",
  "syntax",
  "text_open",
@@ -4390,6 +4391,16 @@ dependencies = [
  "shell_core",
  "shell_scan",
  "toc",
+ "ui",
+]
+
+[[package]]
+name = "shell_tabs"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "shell_core",
+ "shell_widgets",
  "ui",
 ]
 

@@ -50,7 +50,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["crates/media_ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/editor_core", "crates/text_open", "crates/markdown", "crates/markdown_wysiwyg", "crates/markdown_wysiwyg_engine", "crates/markdown_wysiwyg_mermaid", "crates/markdown_wysiwyg_math", "crates/toc", "crates/pdf", "crates/pdf_core", "crates/image_viewer", "crates/video", "crates/epub",     "crates/shell", "crates/shell_core", "crates/shell_sidebar", "crates/shell_pdf", "crates/shell_media", "crates/shell_preview", "crates/tray", "crates/music", "crates/session_store", "crates/shell_commands", "crates/shell_scan", "crates/shell_widgets", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp",     "crates/kimg_ico", "crates/kimg_pnm", "crates/kimg_heif",
+members = ["crates/media_ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/editor_core", "crates/text_open", "crates/markdown", "crates/markdown_wysiwyg", "crates/markdown_wysiwyg_engine", "crates/markdown_wysiwyg_mermaid", "crates/markdown_wysiwyg_math", "crates/toc", "crates/pdf", "crates/pdf_core", "crates/image_viewer", "crates/video", "crates/epub",     "crates/shell", "crates/shell_core", "crates/shell_sidebar", "crates/shell_pdf", "crates/shell_media", "crates/shell_preview", "crates/shell_tabs", "crates/tray", "crates/music", "crates/session_store", "crates/shell_commands", "crates/shell_scan", "crates/shell_widgets", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp",     "crates/kimg_ico", "crates/kimg_pnm", "crates/kimg_heif",
     "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`media_ffmpeg.dll`
@@ -169,6 +169,10 @@ shell_preview = { path = "crates/shell_preview" }
 # 音乐模式判定；纯结构移动只重分配既有依赖，不新增外部包；经 MediaHost 宿主服务面与 shell
 # 解耦，菜单挂载与窗口/宿主编排留 shell）。
 shell_media = { path = "crates/shell_media" }
+# shell_tabs 拆分（2026-11-11）：选项卡栏域 crate（自 shell 的 app/tabs 拆出：TabBar 实体
+# 渲染 + 选项卡右键菜单项构建 + TabsHost 宿主服务面；纯结构移动只重分配既有依赖，不新增
+# 外部包；经 TabsHost 宿主服务面与 shell 解耦，tab_drag 相关入口留 shell 经宿主原路径）。
+shell_tabs = { path = "crates/shell_tabs" }
 # LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = "0.1"
 ratex-layout = "0.1"

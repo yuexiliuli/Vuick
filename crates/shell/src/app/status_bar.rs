@@ -142,7 +142,7 @@ impl EditorApp {
     }
 
     /// 左侧区：语言徽标 pill（文件名与「悬停显示完整路径」提示已迁移到选项卡栏，
-    /// 见 [`crate::app::tabs::tab_bar_item`]，2026-11-10）。
+    /// 见 `shell_tabs::TabBar` 的选项卡元素，2026-11-10）。
     fn status_bar_left(&self, language: String) -> gpui::Div {
         div()
             .flex()

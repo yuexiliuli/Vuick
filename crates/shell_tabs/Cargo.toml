@@ -1,0 +1,16 @@
+[package]
+name = "shell_tabs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 选项卡栏域 crate（自 shell 的 app/tabs 拆出：TabBar 实体渲染 + 选项卡右键菜单项构建，宿主副作用经 TabsHost 宿主服务面反调；纯结构移动，只重分配既有依赖，不新增外部包）"
+
+[dependencies]
+# 选项卡栏实体 / 事件监听 / 元素渲染 / ScrollHandle / Hsla 等。
+gpui = { workspace = true }
+# 主题取色（ChromeColors / tooltip / menu / motion hover_spring / PopupMenu）。
+ui = { path = "../ui" }
+# 宿主模型（AppModel / TabDragData / TabDragGhost）；跨 crate 命名经它。
+shell_core = { path = "../shell_core" }
+# L0 纯 UI 组件：自绘横向滚动条（TableScrollState / horizontal_scrollbar）+ TabBoundsRecorder。
+shell_widgets = { path = "../shell_widgets" }

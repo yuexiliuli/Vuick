@@ -147,11 +147,6 @@ pub use shell_pdf::bookmarks::{load, normalize_key};
 #[doc(hidden)]
 pub use file_ops::MediaKind;
 
-/// A4：Markdown 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：
-/// 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。
-/// 原定义（`pub(crate) enum`）已随 SC 下沉 shell_core，此处重导出维持既有路径与可见性。
-pub(crate) use shell_core::MdTocScroll;
-
 /// 所有 `EditorApp` 窗口的注册表（全局）：记录每个窗口的弱实体句柄与窗口句柄。
 /// 「拖出拆分」创建的子窗口带 `is_detached=true`，把选项卡拖回主窗口时据此找到
 /// 主窗口（第一个非 detached 的 EditorApp 窗口）。
@@ -185,10 +180,13 @@ pub struct EditorApp {
     /// `borrow_mut()` 守卫时不可再 `borrow()`/`borrow_mut()`（运行期双借 panic）。
     pub model: Rc<RefCell<AppModel>>,
     /// 选项卡栏内各选项卡**上一帧** laid-out 的边界（与拖拽事件 `position` 同一输入坐标
-    /// 空间、含横向滚动偏移）：栏内拖拽排序的**命中测试**用。`render_tab_bar` 每次重建
-    /// （长度 = `tabs.len()`、按下标对应；记录器在 prepaint 阶段把真实边界写回各槽位）。
+    /// 空间、含横向滚动偏移）：栏内拖拽排序的**命中测试**用（`tab_insert_index` /
+    /// `tab_drag_over_row`，tab_drag 域留宿主经原路径）。`TabBar` 实体渲染期每帧重建
+    /// （长度 = `tabs.len()`、按下标对应；经 `render_tab_bar` 的 `&mut` 入参写回本宿主
+    /// 字段——记录器在 prepaint 阶段把真实边界写回各槽位）。
     tab_bounds: Vec<Rc<Cell<Bounds<Pixels>>>>,
-    /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条）
+    /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条；`TabBar` 实体渲染期以 `&`
+    /// 入参接线）。
     tab_bar_hscroll: TableScrollState,
     /// 横向滚动条自动隐藏延迟（`poke_tab_hscroll` 重启）：可重入、代序作废，旧定时器
     /// 到点不误清新滚动。[`TAB_HSCROLL_HIDE_MS`] 后无新滚动再隐藏滚动条。
@@ -221,6 +219,12 @@ pub struct EditorApp {
     sidebar_view: gpui::Entity<shell_sidebar::Sidebar<EditorApp>>,
     /// 监听搜索框输入变化 → 刷新搜索结果。
     _search_sub: Subscription,
+    /// 选项卡栏**渲染/事件实体**（2026-11-11 起承接自 shell_tabs 域 crate）：选项卡栏
+    /// 渲染 + 选项卡元素 + 眼睛预览钮 + 横向滚动条接线 + 右键菜单项构建在
+    /// `Entity<TabBar<EditorApp>>` 上（`Context<TabBar>` 内 `cx.listener` 绑定域实体）；
+    /// 宿主渲染期把 `&mut self.tab_bounds` / `&self.tab_bar_hscroll` 与预取的
+    /// `active_is_md`/`preview_on` 传入，事件回调经 `TabsHost` 反调本宿主。
+    tab_bar_view: gpui::Entity<shell_tabs::TabBar<EditorApp>>,
     /// 大文档「两段式打开」快段（`load_file_text` 延迟挂载编辑器）执行次数。
     /// 测试用：验证大文件先瞬时挂编辑器、再后台补齐统计/预览的完整流程两段都跑了。
     pub(crate) open_fast_count: usize,
@@ -271,6 +275,9 @@ pub struct EditorApp {
     /// PDF 右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     pdf_menu_sub: Option<Subscription>,
     /// 选项卡栏右键「新建/打开」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
+    /// （2026-11-11：菜单**构建与交互**已迁 shell_tabs `TabBar` 实体，槽位仍留宿主——
+    /// `app/tests/{tabs_actions,tabs_context}.rs` 直读、media/pdf 前置弹窗互关直清；实体
+    /// 经 `TabsHost` 落地。）
     tab_bar_menu_pos: Option<Point<Pixels>>,
     /// 已打开的选项卡栏右键菜单实体（随位置同生同灭）。
     tab_bar_menu_entity: Option<gpui::Entity<PopupMenu>>,

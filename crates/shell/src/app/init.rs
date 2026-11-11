@@ -116,9 +116,14 @@ impl EditorApp {
         let sidebar_view = cx.new(|_| {
             shell_sidebar::Sidebar::new(model.clone(), own_weak.clone(), search.clone())
         });
+        // 选项卡栏渲染/事件实体（2026-11-11 迁 shell_tabs）：共享 model + 宿主弱引用构造；
+        // 宿主渲染期以 `&mut self.tab_bounds`（拖拽命中槽）/ `&self.tab_bar_hscroll` 入参
+        // 调用其 render_tab_bar，事件回调经 TabsHost 反调宿主。
+        let tab_bar_view = cx.new(|_| shell_tabs::TabBar::new(model.clone(), own_weak.clone()));
         let mut app = EditorApp {
             model,
             sidebar_view,
+            tab_bar_view,
             tab_bar_hscroll: TableScrollState::new(),
             tab_hscroll_delay: SeqAfter::default(),
             notifications: Vec::new(),

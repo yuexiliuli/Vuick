@@ -4,7 +4,7 @@
 //! 本模块只保留 `EditorApp` 的薄包装 / 宿主侧收尾（纯结构移动，行为零变）：
 //!
 //! - **薄包装**：`tab_file_name` / `show_preview` / `md_wy_preview` / `epub_page_bounds` /
-//!   `sync_editor_preview_scroll` / `md_toc_source` / `ensure_md_wy` / `ensure_epub_wy` /
+//!   `sync_editor_preview_scroll` / `ensure_md_wy` / `ensure_epub_wy` /
 //!   `epub_flip_chapter` / `toggle_preview_for_tab` / `toggle_preview_fullscreen` /
 //!   `toggle_wrap` / `is_*` / `language_id` / `language_label` / `md_wy_invalidate_async` /
 //!   `md_wy_spawn_early_install` / `md_wy_install_full_swap` / `md_wy_spawn_prefix_install` /
@@ -84,17 +84,6 @@ impl EditorApp {
         shell_preview::scroll::sync_editor_preview_scroll(&mut self.md_scroll_sync, &self.model, cx);
     }
 
-    /// A4：当前激活选项卡的 Markdown TOC 数据源 + 跳转目标——域逻辑
-    /// [`shell_preview::mdwy::md_toc_source`]。宿主已无直调消费方（侧边栏目录走
-    /// `WyEditor` 实体与域函数），此包装为保留兼容面已随本节移除（无宿主调用点）。
-    #[allow(dead_code)]
-    pub(super) fn md_toc_source(
-        &self,
-        cx: &gpui::App,
-    ) -> Option<(markdown_wysiwyg::TocEntries, MdTocScroll)> {
-        shell_preview::mdwy::md_toc_source(&self.model.borrow(), cx)
-    }
-
     /// A2：确保某选项卡的右栏 WyEditor 预览已创建（懒创建 + A1 只读门控 + 全局字号/
     /// 基准目录）。`feed=true` 用当前编辑区文本**同步喂源**。域逻辑
     /// [`shell_preview::mdwy::ensure_md_wy`]。
@@ -166,14 +155,6 @@ impl EditorApp {
     /// 选项卡是否 Markdown 文件（编辑区/预览默认换行的依据）。
     pub(super) fn is_markdown_tab(&self, idx: usize) -> bool {
         shell_preview::classify::is_markdown_tab(&self.model.borrow(), idx)
-    }
-
-    /// 选项卡是否 EPUB 文件（按扩展名识别；EPUB 预览走 WyEditor 只读宿主的依据）。
-    /// 宿主无直调消费方（域内 `epub_page_bounds` / `epub_flip_chapter` 直接用域分类），
-    /// 保留为兼容面。
-    #[allow(dead_code)]
-    pub(super) fn is_epub_tab(&self, idx: usize) -> bool {
-        shell_preview::classify::is_epub_tab(&self.model.borrow(), idx)
     }
 
     /// 是否 EPUB 文件（按扩展名识别；EPUB 预览走 WyEditor 只读宿主的依据）。

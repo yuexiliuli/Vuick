@@ -116,16 +116,6 @@ impl EditorApp {
         self.chrome().chip_text.into()
     }
 
-    /// 激活选项卡背景。
-    pub(super) fn tab_active_bg(&self) -> gpui::Hsla {
-        self.chrome().tab_active_bg.into()
-    }
-
-    /// 激活选项卡边框。
-    pub(super) fn tab_active_border(&self) -> gpui::Hsla {
-        self.chrome().tab_active_border.into()
-    }
-
     /// 切换黑白（深色/浅色）主题：作为 light↔dark 两态切换（退出「跟随」），
     /// 偏好记为当前生效的强制档。驱动自研主题（`ui::theme`）双轨同色；
     /// 编辑器语法配色随明暗切换为 GitHub Light / Dark（见 [`syntax`]）。

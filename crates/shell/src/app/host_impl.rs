@@ -440,3 +440,132 @@ impl shell_preview::PreviewHost for EditorApp {
         self.open_dropped_paths(paths, window, cx);
     }
 }
+
+// 2026-11-11：选项卡栏域宿主服务面（shell_tabs）。选项卡栏渲染/事件在 `TabBar` 实体
+// （`tab_bar_view`），凡事件回调必须落宿主副作用的动作统一经此 trait 反调；宿主实现
+// 只薄转发既有方法（`tabs.rs` 生命周期 glue / `tab_drag.rs` 幽灵窗 / `preview.rs` 预览
+// 切换 / 菜单槽位落地），零业务逻辑。
+impl shell_tabs::TabsHost for EditorApp {
+    fn tabs_host_activate_tab(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_tab(idx, window, cx);
+    }
+
+    fn tabs_host_close_tab(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_tab(idx, window, cx);
+    }
+
+    fn tabs_host_close_others(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_close_others(idx, window, cx);
+    }
+
+    fn tabs_host_close_right(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_close_right(idx, window, cx);
+    }
+
+    fn tabs_host_close_saved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_close_saved(window, cx);
+    }
+
+    fn tabs_host_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_close_all(window, cx);
+    }
+
+    fn tabs_host_move_to_new_window(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_move_to_new_window(idx, window, cx);
+    }
+
+    fn tabs_host_copy_to_new_window(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_copy_to_new_window(idx, window, cx);
+    }
+
+    fn tabs_host_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_tab(window, cx);
+    }
+
+    fn tabs_host_open_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_dialog(window, cx);
+    }
+
+    fn tabs_host_toggle_preview_for_tab(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_preview_for_tab(idx, window, cx);
+    }
+
+    fn tabs_host_poke_tab_hscroll(&mut self, cx: &mut Context<Self>) {
+        self.poke_tab_hscroll(cx);
+    }
+
+    fn tabs_host_prime_drag_ghost(
+        &mut self,
+        idx: usize,
+        name: SharedString,
+        dirty: bool,
+        size_cell: Rc<Cell<Size<Pixels>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prime_drag_ghost(idx, name, dirty, size_cell, window, cx);
+    }
+
+    /// 右键菜单落地（测试直读宿主 `tab_bar_menu_*` 槽位 + media/pdf 前置弹窗互关直清，
+    /// 故槽位留宿主）。
+    fn tabs_host_open_tab_bar_menu(
+        &mut self,
+        pos: Point<Pixels>,
+        menu: gpui::Entity<PopupMenu>,
+        sub: Subscription,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_bar_menu_pos = Some(pos);
+        self.tab_bar_menu_entity = Some(menu);
+        self.tab_bar_menu_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// 关闭清理（emitter 身份校验后清槽位 + notify；旧订阅带身份校验不会误清新菜单）。
+    fn tabs_host_dismiss_tab_bar_menu(
+        &mut self,
+        menu: &gpui::Entity<PopupMenu>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_bar_menu_entity.as_ref() == Some(menu) {
+            self.tab_bar_menu_entity = None;
+            self.tab_bar_menu_pos = None;
+        }
+        cx.notify();
+    }
+}
