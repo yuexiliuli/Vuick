@@ -60,9 +60,10 @@ mod layout;
 mod media;
 mod media_window;
 mod file_tree_ops;
-mod pdf_bookmarks;
-mod pdf_menu;
-mod pdf_bg;
+// PDF 域宿主薄适配（2026-11-11）：域逻辑在 shell_pdf；本模块为宿主 EditorApp 的
+// 书签/背景/菜单动作薄适配 + 右键菜单视图/挂载。命名避开 `pdf`（作 `pdf` 会遮蔽
+// 同 subtree 的 `pdf::PdfViewer` 等 extern crate 路径）。
+mod pdf_host;
 mod preview;
 mod session;
 mod settings_xfer;
@@ -136,7 +137,9 @@ pub use media_window::{
 #[doc(hidden)]
 pub use palette::{quick_open_collect, QUICK_OPEN_MAX_FILE_BYTES, QUICK_OPEN_MAX_FILES};
 #[doc(hidden)]
-pub use pdf_bookmarks::{load, normalize_key};
+// 2026-11-11：`pdf_bookmarks` 纯逻辑已随 PDF 域迁 `shell_pdf`（`bookmarks` 模块），
+// 此处经 shell_pdf 重导出维持既有 `app::{load, normalize_key}` 面（书签盘上断言）。
+pub use shell_pdf::bookmarks::{load, normalize_key};
 #[doc(hidden)]
 pub use file_ops::MediaKind;
 

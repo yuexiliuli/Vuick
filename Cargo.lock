@@ -4290,6 +4290,7 @@ dependencies = [
  "session_store",
  "shell_commands",
  "shell_core",
+ "shell_pdf",
  "shell_scan",
  "shell_sidebar",
  "shell_widgets",
@@ -4326,6 +4327,19 @@ dependencies = [
  "shell_scan",
  "ui",
  "video",
+]
+
+[[package]]
+name = "shell_pdf"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "config",
+ "gpui",
+ "pdf",
+ "rfd",
+ "serde_json",
+ "shell_core",
 ]
 
 [[package]]

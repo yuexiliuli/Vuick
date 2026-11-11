@@ -1445,7 +1445,7 @@ impl EditorApp {
                             let p = pdf2.clone();
                             p.update(cx, |v, cx| v.save_as(out, cx));
                             if let Some(err) = pdf2.read(cx).last_modify_error().map(|s| s.to_string()) {
-                                this.pdf_toast("另存为失败", crate::app::pdf_menu::pdf_modify_error_msg(&err));
+                                this.pdf_toast("另存为失败", shell_pdf::menu::pdf_modify_error_msg(&err));
                             }
                         });
                     })

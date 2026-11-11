@@ -7,31 +7,29 @@
 //!   落在隔离临时目录（K8），不触碰真实 `%APPDATA%`。
 //! - **原子写**：复用 `base::util::atomic_write`（临时文件 + rename，hash-skip 不做——
 //!   书签量小且只在变更时写，量级远低于会话/配置）。
+//! - **2026-11-11 迁自 shell 的 app/pdf_bookmarks.rs**：纯逻辑（路径/序列化/落盘/缓存）
+//!   与模型读数 [`bookmarks_for`] / 模型写数 [`add_bookmark`] / [`remove_bookmark`] 全迁
+//!   本 crate；宿主 `EditorApp` 只留薄适配（notify/toast 由宿主落地）。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, OnceLock};
 
-use super::*;
 use config::user::UserPrefs;
 use serde_json::{Value, json};
-
-// SC-3：`PdfBookmark` 类型随 `EditorApp::pdf_bookmarks` 字段迁入 shell_core（`AppModel`
-// 字段类型需跨 crate 命名）。此处显式重导出保住模块路径 `pdf_bookmarks::PdfBookmark`
-// （`sidebar::toc` 与测试按此引用）与 bare 名（本模块 `use super::*` 亦同可见）。
-pub(crate) use shell_core::PdfBookmark;
+use shell_core::{AppModel, PdfBookmark};
 
 /// 书签存储文件路径 = 配置父目录 / `pdf_bookmarks.json`（`%APPDATA%\gpui-editor\`）。
-pub(crate) fn bookmarks_path() -> std::path::PathBuf {
+pub fn bookmarks_path() -> PathBuf {
     match UserPrefs::config_path().parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join("pdf_bookmarks.json"),
-        _ => std::path::PathBuf::from("pdf_bookmarks.json"),
+        _ => PathBuf::from("pdf_bookmarks.json"),
     }
 }
 
 /// 规范化路径键：先 `canonicalize`（消 `.`/`..`、接真实盘符大小写形态），失败回退
 /// 原样字符串。同一文件的后续打开 / 绝对化写法都落到同一键。
-/// `pub`：经 `app` 重导出供 `tests/pdf.rs` 书签盘上读出断言（§8.6 外提清单）。
+/// `pub`：经 `shell::app` 重导出供 `tests/pdf.rs` 书签盘上读出断言（§8.6 外提清单）。
 pub fn normalize_key(path: &Path) -> String {
     std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
@@ -39,7 +37,7 @@ pub fn normalize_key(path: &Path) -> String {
 }
 
 /// 序列化为 JSON 对象（纯函数，供 [`save`] / 测试）。空 map 也落一个合法空对象。
-pub(crate) fn to_json(map: &HashMap<String, Vec<PdfBookmark>>) -> Value {
+pub fn to_json(map: &HashMap<String, Vec<PdfBookmark>>) -> Value {
     let mut obj = serde_json::Map::new();
     for (key, bms) in map {
         let arr: Vec<Value> = bms
@@ -57,7 +55,7 @@ pub(crate) fn to_json(map: &HashMap<String, Vec<PdfBookmark>>) -> Value {
 }
 
 /// 从 JSON 值解析（纯函数）：字段缺省 / 类型不符 / 值非法一律跳过该条，绝不 panic。
-pub(crate) fn from_json(v: &Value) -> HashMap<String, Vec<PdfBookmark>> {
+pub fn from_json(v: &Value) -> HashMap<String, Vec<PdfBookmark>> {
     let mut out = HashMap::new();
     let Some(map) = v.as_object() else {
         return out;
@@ -95,7 +93,7 @@ pub(crate) fn from_json(v: &Value) -> HashMap<String, Vec<PdfBookmark>> {
 }
 
 /// 从磁盘加载书签存储（缺失 / 损坏 → 空 map）。
-/// `pub`：经 `app` 重导出供 `tests/pdf.rs` 书签盘上读出断言（§8.6 外提清单）。
+/// `pub`：经 `shell::app` 重导出供 `tests/pdf.rs` 书签盘上读出断言（§8.6 外提清单）。
 pub fn load() -> HashMap<String, Vec<PdfBookmark>> {
     let Ok(text) = std::fs::read_to_string(bookmarks_path()) else {
         return HashMap::new();
@@ -107,7 +105,7 @@ pub fn load() -> HashMap<String, Vec<PdfBookmark>> {
 }
 
 /// A4 进程级书签缓存（`OnceLock<Mutex<Option<_>>>`）：每窗构造都读盘是浪费（构造链
-/// `new_impl` → `pdf_bookmarks::load()`），首次构造读一次、后续复用；`save` 同步回写
+/// `new_impl` → `bookmarks::load()`），首次构造读一次、后续复用；`save` 同步回写
 /// 缓存 → 进程内新窗口读到最新书签（本应用单进程，无外部改写，安全）。
 static BOOKMARK_CACHE: OnceLock<StdMutex<Option<HashMap<String, Vec<PdfBookmark>>>>> =
     OnceLock::new();
@@ -117,7 +115,7 @@ fn bookmark_cache() -> &'static StdMutex<Option<HashMap<String, Vec<PdfBookmark>
 }
 
 /// 取书签（进程级缓存一次读盘；`save` 更新缓存保证进程内一致）。
-pub(crate) fn load_cached() -> HashMap<String, Vec<PdfBookmark>> {
+pub fn load_cached() -> HashMap<String, Vec<PdfBookmark>> {
     let mut guard = bookmark_cache().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(v) = guard.as_ref() {
         return v.clone();
@@ -128,7 +126,7 @@ pub(crate) fn load_cached() -> HashMap<String, Vec<PdfBookmark>> {
 }
 
 /// 原子落盘整份书签存储；A4：先写好盘面再回写缓存（缓存镜像盘面）。
-pub(crate) fn save(map: &HashMap<String, Vec<PdfBookmark>>) {
+pub fn save(map: &HashMap<String, Vec<PdfBookmark>>) {
     let ok = base::util::atomic_write(bookmarks_path(), to_json(map).to_string().as_bytes()).is_ok();
     if ok {
         if let Ok(mut guard) = bookmark_cache().lock() {
@@ -137,85 +135,42 @@ pub(crate) fn save(map: &HashMap<String, Vec<PdfBookmark>>) {
     }
 }
 
-impl EditorApp {
-    /// 某路径当前内存态的书签列表（无 → `None`）。侧边栏 TOC「书签」区段与测试读。
-    /// SC-3：`pdf_bookmarks` 迁入 `AppModel`（`Rc<RefCell>`）后无法再经「方法内临时
-    /// guard」返回 `&[PdfBookmark]` 引用——改为返回 owned 克隆，语义/内容不变。
-    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 书签持久化断言（§8.6 外提清单）。
-    #[doc(hidden)]
-    pub fn pdf_bookmarks_for(&self, path: &std::path::Path) -> Option<Vec<PdfBookmark>> {
-        let key = normalize_key(path);
-        self.model.borrow().pdf_bookmarks.get(&key).cloned()
-    }
+/// 某路径当前内存态的书签列表（无 → `None`）。模型读数（宿主 `EditorApp` 薄适配转发；
+/// 侧栏 TOC「书签」区段与测试读）。`Option<Vec<..>>`：`AppModel` 为 `Rc<RefCell>`、
+/// 跨 crate 命名，owned 克隆语义与原 `EditorApp::pdf_bookmarks_for` 一致。
+pub fn bookmarks_for(m: &AppModel, path: &Path) -> Option<Vec<PdfBookmark>> {
+    let key = normalize_key(path);
+    m.pdf_bookmarks.get(&key).cloned()
+}
 
-    /// 添加/覆盖一条书签（同页去重）：更新内存 + 原子落盘 + notify。
-    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 书签持久化断言（§8.6 外提清单）。
-    #[doc(hidden)]
-    pub fn add_pdf_bookmark(
-        &mut self,
-        path: &std::path::Path,
-        page_index: usize,
-        title: String,
-        cx: &mut Context<Self>,
-    ) {
-        let key = normalize_key(path);
-        let mut m = self.model.borrow_mut();
-        let list = m.pdf_bookmarks.entry(key.clone()).or_default();
-        if let Some(existing) = list.iter_mut().find(|b| b.page_index == page_index) {
-            existing.title = title;
-        } else {
-            list.push(PdfBookmark { page_index, title });
-        }
-        save(&m.pdf_bookmarks);
-        cx.notify();
+/// 添加/覆盖一条书签（同页去重）：更新内存 + 原子落盘。宿主在模型借用结束后自行
+/// notify（原 `EditorApp::add_pdf_bookmark` 的模型 + save 部分）。
+pub fn add_bookmark(m: &mut AppModel, path: &Path, page_index: usize, title: String) {
+    let key = normalize_key(path);
+    let list = m.pdf_bookmarks.entry(key.clone()).or_default();
+    if let Some(existing) = list.iter_mut().find(|b| b.page_index == page_index) {
+        existing.title = title;
+    } else {
+        list.push(PdfBookmark { page_index, title });
     }
+    save(&m.pdf_bookmarks);
+}
 
-    /// 移除某路径书签列表中第 `idx` 条（列表空 → 整键删除）+ 落盘 + notify；返回是否移除。
-    pub(crate) fn remove_pdf_bookmark(
-        &mut self,
-        path: &std::path::Path,
-        idx: usize,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let key = normalize_key(path);
-        let mut m = self.model.borrow_mut();
-        let Some(list) = m.pdf_bookmarks.get_mut(&key) else {
-            return false;
-        };
-        if idx >= list.len() {
-            return false;
-        }
-        list.remove(idx);
-        if list.is_empty() {
-            m.pdf_bookmarks.remove(&key);
-        }
-        save(&m.pdf_bookmarks);
-        cx.notify();
-        true
+/// 移除某路径书签列表中第 `idx` 条（列表空 → 整键删除）+ 落盘；返回是否移除。
+pub fn remove_bookmark(m: &mut AppModel, path: &Path, idx: usize) -> bool {
+    let key = normalize_key(path);
+    let Some(list) = m.pdf_bookmarks.get_mut(&key) else {
+        return false;
+    };
+    if idx >= list.len() {
+        return false;
     }
-
-    /// PDF 右键「添加书签」动作：当前页 + 标题（优先当前大纲标题；无则「第 N 页」）。
-    pub(crate) fn pdf_add_bookmark_action(
-        &mut self,
-        pdf: &gpui::Entity<pdf::PdfViewer>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((page1, _)) = pdf.read(cx).current_page() else {
-            return;
-        };
-        let page_index = page1.saturating_sub(1);
-        let title = pdf
-            .read(cx)
-            .outlines()
-            .iter()
-            .find(|o| o.page_index == page_index)
-            .map(|o| o.title.clone())
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| format!("第 {page1} 页"));
-        let path = pdf.read(cx).path().to_path_buf();
-        self.add_pdf_bookmark(&path, page_index, title.clone(), cx);
-        self.pdf_toast("已添加书签", format!("第 {page1} 页 · {title}"));
+    list.remove(idx);
+    if list.is_empty() {
+        m.pdf_bookmarks.remove(&key);
     }
+    save(&m.pdf_bookmarks);
+    true
 }
 
 #[cfg(test)]

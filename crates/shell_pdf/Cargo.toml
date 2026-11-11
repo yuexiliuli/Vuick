@@ -1,0 +1,22 @@
+[package]
+name = "shell_pdf"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor PDF 域 crate（自 shell 的 app/pdf_bookmarks + app/pdf_bg + app/pdf_menu 拆出：书签持久化 / 背景重着色 / 页操作动作逻辑；纯结构移动只重分配既有依赖，不新增外部包；经 PdfHost 宿主服务面与 shell 解耦，菜单视图/挂载与 win32 取色宿主适配留 shell）"
+
+[dependencies]
+# 书签/背景/菜单域逻辑：gpui 实体/窗口/上下文/确认框/通知 key。
+gpui = { workspace = true }
+# 背景预设枚举（PdfBgPref）与书签存储路径（UserPrefs::config_path，test-mode 隔离）。
+config = { path = "../config" }
+# 原子写（临时文件 + rename）。
+base = { path = "../base" }
+# 宿主模型（AppModel / PdfBookmark / MediaReader）。
+shell_core = { path = "../shell_core" }
+# PDF 栅格化视图实体（PdfViewer / RecolorParams / is_writeback_busy_error）。
+pdf = { path = "../pdf" }
+# 书签存储 / 背景偏好 JSON 读写（手写 serde_json::Value，不引入 serde derive）。
+serde_json = { workspace = true }
+# 「提取页面为 PDF」另存为对话框（原 shell pdf_menu 同款）。
+rfd = { workspace = true }

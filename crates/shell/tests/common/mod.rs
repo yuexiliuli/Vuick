@@ -44,9 +44,10 @@ pub(crate) mod session {
     pub use shell::app::{restore_session_from, save_session_to};
 }
 
-/// `shell::app::pdf_bookmarks` 私有模块的测试可见面：`load` / `normalize_key` 已由
-/// `shell::app` 重导出；此处经子模块别名复现 `tests/pdf.rs` 的书签盘上读出断言
-/// （`crate::app::pdf_bookmarks::` 路径在 integration 不可达，改 `pdf_bookmarks::` 面）。
+/// `shell::app` 的 PDF 书签盘上读写面：`load` / `normalize_key` 已由 `shell::app` 重导出
+/// （2026-11-11 起域逻辑迁 shell_pdf、经 `shell::app` facade 保持既有路径）；此处经子模块
+/// 别名复现 `tests/pdf.rs` 的书签盘上读出断言（`crate::app::pdf_bookmarks::` 路径在
+/// integration 不可达，改 `pdf_bookmarks::` 面）。
 pub(crate) mod pdf_bookmarks {
     pub use shell::app::{load, normalize_key};
 }

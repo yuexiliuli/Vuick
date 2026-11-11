@@ -55,6 +55,11 @@ shell_widgets = { path = "../shell_widgets" }
 # FileTreePrompt 输入弹层；纯结构移动，shell 保留 `sidebar: SidebarChromeState` 状态
 # 与宿主编排，经 `sidebar_view: Entity<Sidebar<EditorApp>>` 实体接线）。
 shell_sidebar = { path = "../shell_sidebar" }
+# PDF 域 crate（自 shell 的 app/pdf_bookmarks + app/pdf_bg + app/pdf_menu 拆出：
+# 书签持久化 / 背景重着色 / 页操作动作逻辑；纯结构移动，shell 保留薄适配（模型读写 +
+# notify/persist 落地）、右键菜单视图/挂载与 win32 取色宿主 window 部分；经 PdfHost
+# 宿主服务面反调本宿主）。
+shell_pdf = { path = "../shell_pdf" }
 # 音乐播放器（Phase A 引擎 + Phase B UI 已提交）：shell 集成（整窗音乐模式 /
 # 打开音频文件路由 / 状态栏指示）。不静态链 FFmpeg（运行时经 libloading 加载）。
 music = { path = "../music" }

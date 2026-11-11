@@ -258,3 +258,17 @@ impl shell_sidebar::FileTreePromptHost for EditorApp {
         self.file_tree_submit_prompt(kind, value, window, cx)
     }
 }
+
+// 2026-11-11：PDF 域宿主服务面（shell_pdf）。PDF 页操作动作对宿主的交互收敛到此：
+// toast 通知（宿主通知容器 + `PdfToast` 去重标记）与右键新弹前弹窗互关（清宿主
+// `tab_bar_menu_*` / `media_lock_menu_*` / `pdf_menu_*` 槽位）。域逻辑在 shell_pdf，
+// 宿主实现零业务逻辑。
+impl shell_pdf::PdfHost for EditorApp {
+    fn pdf_host_toast(&mut self, title: &str, msg: String) {
+        self.pdf_toast(title, msg);
+    }
+
+    fn pdf_host_close_all_popups(&mut self) {
+        self.close_pdf_popups_predecessors();
+    }
+}
