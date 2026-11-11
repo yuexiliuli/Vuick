@@ -4,7 +4,8 @@
 //! 持有，渲染期以「宿主字段引用 + 预取派生数据」为入参调用（`tab_bounds` 拖拽命中槽 /
 //! `tab_bar_hscroll` 横向滚动条仍是宿主字段、以 `&mut`/`&` 传入；`preview_on` /
 //! `active_is_md` 是渲染期禁入宿主、由宿主预取传入的派生布尔）；事件回调（激活 / 关闭 /
-//! 右键菜单项 / 滚轮 / 拖拽幽灵）经 [`crate::host::TabsHost`] 反调宿主落地副作用，行为零变。
+//! 右键菜单项 / 滚轮 / 拖拽幽灵）经 [`crate::host::TabsHost`] 反调宿主落地副作用，
+//! 拖拽开始预建幽灵窗经 [`crate::drag::TabDragHost::tab_drag_host_prime_ghost`]，行为零变。
 //!
 //! 与旧 `impl EditorApp` 的对应关系（逐行迁移）：
 //!
@@ -32,6 +33,7 @@ use ui::menu::PopupMenuItem;
 use ui::motion::hover_spring;
 use ui::theme::ChromeColors;
 
+use crate::drag::TabDragHost;
 use crate::host::TabsHost;
 
 /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
@@ -55,7 +57,9 @@ pub enum ReorderSide {
 /// 选项卡栏域实体：宿主 `tab_bar_view: Entity<TabBar<H>>` 持有，承载选项卡栏的渲染与
 /// 事件（`Context<Self>` 内 `cx.listener` 绑定本实体）。共享模型（`model`）域内直读；
 /// 其余宿主状态（`tab_bounds` / `tab_bar_hscroll`）渲染期以引用入参、副作用反调宿主。
-pub struct TabBar<H: TabsHost> {
+/// `H: TabsHost + TabDragHost`：选项卡生命周期动作 / 菜单槽位经 `TabsHost`，拖拽开始
+/// 预建幽灵窗经 `TabDragHost`（H2 把 TabsHost::tabs_host_prime_drag_ghost 迁此）。
+pub struct TabBar<H: TabsHost + TabDragHost> {
     /// 宿主模型（与 `EditorApp.model` 同一 `Rc<RefCell>` 共享）：选项卡栏读 `tabs` /
     /// `active_tab` / `dark_mode` / `tab_dragging` / `tab_reorder_target` 与写
     /// `tab_drag_grab`（拖拽开始），均在域内直取（同 `shell_sidebar::Sidebar::model`）。
@@ -64,7 +68,7 @@ pub struct TabBar<H: TabsHost> {
     host: WeakEntity<H>,
 }
 
-impl<H: TabsHost> TabBar<H> {
+impl<H: TabsHost + TabDragHost> TabBar<H> {
     /// 构造：共享模型 + 宿主弱引用（宿主 `init.rs` 于窗口构造时创建）。
     pub fn new(model: Rc<RefCell<AppModel>>, host: WeakEntity<H>) -> Self {
         Self { model, host }
@@ -373,7 +377,7 @@ impl<H: TabsHost> TabBar<H> {
                 }
                 if let Some(h) = host_for_drag.upgrade() {
                     let _ = h.update(cx, |app, cx| {
-                        app.tabs_host_prime_drag_ghost(
+                        app.tab_drag_host_prime_ghost(
                             _value.idx,
                             _value.name.clone(),
                             dirty,
@@ -560,10 +564,10 @@ impl<H: TabsHost> TabBar<H> {
     /// 零选项卡（`tabs.is_empty()`，即欢迎页呈现时）提前返回空元素——选项卡栏
     /// 在 flex 列中占零高度，欢迎页从标题栏下直接铺到状态栏。
     /// `tab_bounds` 以 `&mut` 传入：每帧重建边界槽（排序命中测试读上一帧值；记录器在
-    /// prepaint 写入）——宿主 `tab_drag.rs` 的 `tab_insert_index`/`tab_drag_over_row` 直读
-    /// 宿主该字段（本阶段 tab_drag 仍走宿主原路径）。`hscroll` 为宿主横向滚动条状态
-    /// （`app/tests/tab_bar.rs` 直读宿主字段，故留宿主）。`active_is_md` / `preview_on`
-    /// 渲染期禁入宿主、由宿主按模型预取传入（眼睛钮用）。
+    /// prepaint 写入）——宿主 `on_drag_move`（layout.rs）把快照传给域
+    /// `shell_tabs::drag::{tab_insert_index, tab_drag_over_row}` 做命中计算。`hscroll` 为
+    /// 宿主横向滚动条状态（`app/tests/tab_bar.rs` 直读宿主字段，故留宿主）。`active_is_md`
+    /// / `preview_on` 渲染期禁入宿主、由宿主按模型预取传入（眼睛钮用）。
     pub fn render_tab_bar(
         &mut self,
         tab_bounds: &mut Vec<Rc<Cell<Bounds<Pixels>>>>,

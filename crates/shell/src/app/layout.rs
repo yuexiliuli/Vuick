@@ -325,33 +325,34 @@ impl EditorApp {
             .on_drag_move(cx.listener(
                 |this: &mut EditorApp, ev: &DragMoveEvent<TabDragData>, window, cx| {
                     let idx = ev.drag(cx).idx; // 拷贝下标，避免持有对 cx 的借用
-                    // 已拔出（松开后源窗口不再有该选项卡）→ 忽略后续移动
-                    if idx >= this.model.borrow().tabs.len() {
-                        return;
-                    }
                     // 真实选项卡 laid-out 尺寸（TabBoundsRecorder 每帧写入），供预览定宽。
                     let drag_size = ev.drag(cx).size.clone();
-                    this.model.borrow_mut().tab_dragging = Some(idx);
                     let pos = ev.event.position;
-                    let inside = gpui::Bounds::new(gpui::Point::default(), window.bounds().size)
-                        .contains(&pos);
-                    // 越界 = 进入「松开才建窗」预位；回到窗内即复位。真窗口只在松开时建。
-                    // 幽灵窗显示：光标越出窗口、或窗内拖拽 picture 将要被窗口边缘遮断
-                    // （含 4px 余量，见 tab_drag::drag_picture_about_to_clip）——贴边即提前
-                    // 切同位置同尺寸完整版；远离边缘时窗内无浮窗、无蓝块（幽灵窗隐藏）。
-                    this.model.borrow_mut().drag_outside_armed = !inside;
-                    // 栏内排序插入位：以**被拖选项卡 picture 盒的边缘**是否进入选项卡行为准
-                    // （不再要求鼠标光标在行内）——盒上/下任一边碰到行即激活白线；插入下标
-                    // 按光标 x 判定。拖出窗口 / 盒未入行 → None（不排序 / 拆窗）。
-                    let grab = this.model.borrow().tab_drag_grab.unwrap_or(gpui::Point::default());
-                    let drag_bounds = gpui::Bounds::new(pos - grab, drag_size.get());
-                    this.model.borrow_mut().tab_reorder_target =
-                        if inside && this.tab_drag_over_row(drag_bounds) {
-                            this.tab_insert_index(pos.x)
-                        } else {
-                            None
-                        };
-                    this.update_drag_ghost(idx, drag_size, pos, !inside, window, cx);
+                    let grab = this
+                        .model
+                        .borrow()
+                        .tab_drag_grab
+                        .unwrap_or(gpui::Point::default());
+                    // 拖拽状态机单步迁移（域 `shell_tabs::drag`）：已被拔出（idx 越界）→
+                    // None 忽略后续移动；否则写 `tab_dragging` / `drag_outside_armed` /
+                    // `tab_reorder_target`，返回本次移动 `outside`。栏内排序命中 / 幽灵窗
+                    // 布局参数全部在域内纯计算（宿主 `tab_bounds` 快照以参数传入）。
+                    let Some(step) = shell_tabs::drag::tab_drag_move_step(
+                        &this.model,
+                        &this.tab_bounds,
+                        idx,
+                        pos,
+                        grab,
+                        drag_size.get(),
+                        window.bounds(),
+                    ) else {
+                        return;
+                    };
+                    // 越界 = 进入「松开才建窗」预位（step.outside）；回到窗内即复位。
+                    // 真窗口只在松开时建。幽灵窗显示：光标越出窗口、或窗内拖拽 picture
+                    // 将要被窗口边缘遮断（含 4px 余量）——贴边即提前切同位置同尺寸完整版；
+                    // 远离边缘时窗内无浮窗、无蓝块（幽灵窗隐藏）。
+                    this.update_drag_ghost(idx, drag_size, pos, step.outside, window, cx);
                     cx.notify();
                 },
             ))

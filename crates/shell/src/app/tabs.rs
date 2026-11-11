@@ -8,9 +8,10 @@
 //!   （经 `AppHost` 反调宿主），此处保留薄转发（`app/tests` 与 shell 其它模块经此面调用）。
 //! - **关闭保存流程**：`close_tab`（脏/未命名弹原生确认框异步等待）+ `save_unnamed_and_close`
 //!   （另存为对话框）——宿主文件保存副作用，留在宿主。
-//! - **tab_drag 相关入口（本阶段留宿主原路径，H2 补拖出）**：`tab_insert_index` /
-//!   `tab_drag_over_row` / `reorder_tab`（栏内排序命中读宿主 `tab_bounds`，由 `TabBar`
-//!   实体渲染期写回）。
+//! - **tab_drag 相关入口（H2 起命中计算迁域，编排留宿主）**：`reorder_tab`（排序落地
+//!   动作体已迁 `AppModel`，glue 转发）；`tab_insert_index` / `tab_drag_over_row`（栏内
+//!   排序命中）已迁 `shell_tabs::drag` 纯函数（宿主 `tab_bounds` 快照以参数传入），
+//!   layout.rs `on_drag_move` 直调域函数。
 //! - **横向滚动条宿主面**：`poke_tab_hscroll`（宿主字段 `tab_bar_hscroll` + 计时
 //!   `tab_hscroll_delay`）。
 //! - **渲染 facade**：`render_tab_bar` 经 `tab_bar_view` 实体渲染（宿主预取派生数据传入）；
@@ -34,55 +35,8 @@ impl EditorApp {
         self.model.borrow_mut().new_tab(host, window, &mut **cx);
     }
 
-    /// 计算拖拽光标 x 落在选项卡行内的「插入下标」（相对当前 `tabs`；`tabs.len()` =
-    /// 插到末尾）：
-    /// - 最左 / 最右 / 选项卡间空隙 → 对应插入位
-    /// - 落在某选项卡内 → 左半 = 该选项卡之前（下标 = 该选项卡），右半 = 之后（下标 +1）
-    /// 「是否已入行」由调用方 `tab_drag_over_row` 负责（被拖选项卡边缘进入行即算），
-    /// 本函数只按 x 定下标。命中依据 `self.tab_bounds`（上一帧渲染的真实 laid-out
-    /// 边界，与输入坐标同系、含横向滚动；由 `TabBar` 实体渲染期写回宿主字段）。
-    pub(super) fn tab_insert_index(&self, x: Pixels) -> Option<usize> {
-        if self.model.borrow().tabs.is_empty() || self.tab_bounds.is_empty() {
-            return None;
-        }
-        let first = self.tab_bounds[0].get();
-        if first.size.width <= px(0.) {
-            return None; // 尚未渲染出真实边界（首帧）
-        }
-        if x < first.origin.x {
-            return Some(0);
-        }
-        for (i, cell) in self.tab_bounds.iter().enumerate() {
-            let b = cell.get();
-            if x < b.origin.x {
-                return Some(i); // 落在选项卡 i 左侧的空隙
-            }
-            if x <= b.bottom_right().x {
-                let mid = b.origin.x + b.size.width / 2.;
-                return Some(if x < mid { i } else { i + 1 });
-            }
-        }
-        Some(self.tab_bounds.len())
-    }
-
-    /// 拖拽中的选项卡（picture 盒 `drag`，= `鼠标 - 抓取偏移` 处、按真实 tab 尺寸）的
-    /// 上下边缘是否**进入**选项卡行内的 y 区间（任一边进入即 true）：白线出现的触发——
-    /// **不要求鼠标光标在行内**，只要被拖选项卡的边缘碰到行即可。
-    pub(super) fn tab_drag_over_row(&self, drag: Bounds<Pixels>) -> bool {
-        if self.tab_bounds.is_empty() {
-            return false;
-        }
-        let first = self.tab_bounds[0].get();
-        if first.size.width <= px(0.) {
-            return false; // 尚未渲染出真实边界（首帧）
-        }
-        let row_top = first.origin.y;
-        let row_bottom = first.bottom_right().y;
-        drag.origin.y < row_bottom && (drag.origin.y + drag.size.height) > row_top
-    }
-
     /// 栏内拖拽排序落地：把当前下标 `from` 的选项卡移动到「插入下标」`target`
-    /// （`tab_insert_index` 输出，相对当前 `tabs`；`tabs.len()` = 末尾）。
+    /// （`shell_tabs::drag::tab_insert_index` 输出，相对当前 `tabs`；`tabs.len()` = 末尾）。
     /// 插回原位 / 原相邻位（顺序不变）→ 不动作；单选项卡天然不动作。活动下标随移动
     /// 校正；各选项卡内容/脏点/路径不变；结构变化即时持久化。
     /// SC-4：动作体已迁 `AppModel::reorder_tab`。glue 转发。

@@ -5,51 +5,15 @@
 //! 「松开才建窗」——越界只置 `drag_outside_armed` 预位 + 用置顶透明幽灵窗让被拖选项卡
 //! 在窗外仍跟手可见（gpui 拖拽幽灵只画在源窗口帧缓冲内，窗外被裁剪），真文件窗口在
 //! `release_tab_drag_outside`（`on_mouse_up_out`）时才建立。
+//!
+//! H2（2026-11-11）：**纯逻辑已迁 `shell_tabs::drag`**（命中计算 `tab_insert_index` /
+//! `tab_drag_over_row`、幽灵窗布局参数 `tab_drag_ghost_layout`、预告尺寸兜底
+//! `tab_preview_size`、边缘遮断判定 `drag_picture_about_to_clip`、拖拽状态机单步迁移
+//! `tab_drag_move_step`、拆分决策 `tab_drag_release_kind`）。本模块只剩宿主编排 + win32：
+//! 拖拽动作编排（take/adopt/split/restore/release）、幽灵窗实体创建/销毁与
+//! `SetWindowPos`/DWM 原生调用（经 `TabDragHost` 宿主服务面路由，`app/host_impl.rs`）。
 
 use super::*;
-
-/// 拖拽预告（半透明选项卡）尺寸的**兜底估算**（仅真实 laid-out 尺寸尚未记录的首帧用）：
-/// 宽 = `shape_line` 文本宽 + px_2 两侧(16) + 2×gap(8) + 关闭钮(18) + 边框(4) ≈ +46；
-/// 高 = 选项卡 26。正常情况下 [`shell_widgets::TabBoundsRecorder`] 已把真实尺寸写入，
-/// 不会走这里。
-pub(super) fn tab_preview_size(name: &str, dirty: bool, window: &Window) -> Size<Pixels> {
-    let text = if dirty {
-        format!("● {name}")
-    } else {
-        name.to_string()
-    };
-    let line = window
-        .text_system()
-        .shape_line(SharedString::from(text), px(12.), &[], None);
-    let text_w = line.width();
-    gpui::size((text_w + px(46.)).max(px(64.)), px(26.))
-}
-
-/// 窗内拖拽 picture 距窗口边缘小于该值（px）即视为「将要被窗口边缘遮断」→ 提前切到
-/// 同位置、同尺寸的完整版幽灵窗。余量保证：picture 真正开始被裁之前幽灵窗已接管，
-/// 不存在「贴边被切 → 越界才突然完整」的可见跳变。
-pub(super) const DRAG_EDGE_CLIP_MARGIN: f32 = 4.0;
-
-/// 窗内 gpui 拖拽 picture 是否**将要**被窗口边缘遮断（含 [`DRAG_EDGE_CLIP_MARGIN`] 余量）？
-/// 拖拽 picture 恒画在 `鼠标 - 抓取偏移`（gpui window.rs `prepaint_as_root(mouse - cursor_offset)`），
-/// 原点为窗口坐标、越出窗口帧缓冲的部分被窗口边缘裁掉——而光标本身仍可留在窗内（如抓取
-/// 偏移偏大、picture 已探出边缘）。`window_size` 用 `window.bounds().size`（与 `on_drag_move`
-/// 判 `inside` 同一坐标空间）。返回 true → [`EditorApp::update_drag_ghost`] 提前显示
-/// **同位置、同尺寸**的完整幽灵窗（屏幕原点 = `window.bounds().origin + (pos - grab)`，
-/// 与窗内 picture 同位 → 无跳变）。
-pub(super) fn drag_picture_about_to_clip(
-    pos: Point<Pixels>,
-    grab: Point<Pixels>,
-    size: Size<Pixels>,
-    window_size: Size<Pixels>,
-) -> bool {
-    let m = px(DRAG_EDGE_CLIP_MARGIN);
-    let o = pos - grab; // picture 左上角（窗口坐标）
-    o.x < m
-        || o.y < m
-        || o.x + size.width > window_size.width - m
-        || o.y + size.height > window_size.height - m
-}
 
 impl EditorApp {
     /// 从本窗口「拔出」一个选项卡：移除选项卡（**不**释放 PDF 纹理、不重置编辑器——
@@ -265,7 +229,7 @@ impl EditorApp {
         let size = if s.width > px(0.) && s.height > px(0.) {
             s
         } else {
-            tab_preview_size(&name, dirty, window)
+            shell_tabs::drag::tab_preview_size(&name, dirty, window)
         };
         self.ensure_drag_ghost(
             name,
@@ -280,9 +244,9 @@ impl EditorApp {
 
     /// 拖拽选项卡期间维护「幽灵胶囊」窗：本次拖拽**开始**（`on_drag`，见
     /// [`Self::prime_drag_ghost`]）已**隐藏创建**置顶透明小窗并全程复用；显示条件 = 光标越出窗口
-    /// **或** 窗内拖拽 picture 将要被窗口边缘遮断（含 4px 余量，见 [`drag_picture_about_to_clip`]）
-    /// ——picture 一旦贴边即提前切到同位置、同尺寸的完整版幽灵窗（杜绝「一半被裁 → 越界才
-    /// 突然完整」）。因此：
+    /// **或** 窗内拖拽 picture 将要被窗口边缘遮断（含 4px 余量，见
+    /// [`shell_tabs::drag::drag_picture_about_to_clip`]）——picture 一旦贴边即提前切到同位置、
+    /// 同尺寸的完整版幽灵窗（杜绝「一半被裁 → 越界才突然完整」）。因此：
     /// - 窗内 picture 远离边缘：只见原有 gpui 小胶囊，**没有浮窗/蓝块**（幽灵窗隐藏）；
     /// - 贴边 / 拖出拖入：只是「显示 ⇄ 隐藏 + 定位」（一次 `SetWindowPos`），无创建/销毁
     ///   卡顿、无抓取偏移跳变（窗内 picture 与幽灵窗都画在 `鼠标 - 抓取偏移`）；
@@ -316,24 +280,36 @@ impl EditorApp {
         let size = if s.width > px(0.) && s.height > px(0.) {
             s
         } else {
-            tab_preview_size(&name, dirty, window)
+            shell_tabs::drag::tab_preview_size(&name, dirty, window)
         };
         let grab = self.model.borrow().tab_drag_grab.unwrap_or(Point::default());
-        // 幽灵左上角（屏幕逻辑 px）＝ 源窗口左上角 + (拖拽点 - 抓取偏移)，与 gpui 在
-        // 窗内绘制拖拽 picture 的位置（mouse_position - cursor_offset）完全一致。
-        let screen = window.bounds().origin + (pos - grab);
-        // 幽灵窗显示条件：光标越出窗口（窗外完整版）**或** 窗内 picture 将要被窗口边缘
-        // 遮断（含 4px 余量，见 `drag_picture_about_to_clip`）——贴边即提前切同位置同
-        // 尺寸的完整幽灵窗，杜绝「一半被裁 → 越界才突然完整」。记录决策供测试锁定。
-        let visible = outside
-            || drag_picture_about_to_clip(pos, grab, size, window.bounds().size);
-        self.model.borrow_mut().drag_ghost_visible = visible;
+        // 幽灵窗布局参数（域纯计算）：屏幕原点 = 源窗口左上角 + (拖拽点 − 抓取偏移)
+        // （与 gpui 窗内绘制拖拽 picture 的位置完全一致）；显示条件 = 越出窗口 **或**
+        // 窗内 picture 将要被窗口边缘遮断（含 4px 余量）——贴边即提前切同位置同尺寸的
+        // 完整幽灵窗，杜绝「一半被裁 → 越界才突然完整」。记录决策供测试锁定。
+        let layout = shell_tabs::drag::tab_drag_ghost_layout(
+            window.bounds().origin,
+            window.bounds().size,
+            pos,
+            grab,
+            size,
+            outside,
+        );
+        self.model.borrow_mut().drag_ghost_visible = layout.visible;
         // B：幽灵窗 open_window 延迟（内部 `cx.defer`）→ 首个 on_drag_move 的 dispatch
         // 不被 Windows 透明置顶 popup 创建 + 首帧 DCOMP 的 OS 成本阻塞；幽灵窗仍在拖拽
         // 开始后 1 帧内建成（defer 会跨过可见行构建 / SetWindowPos 前落下）。
-        self.ensure_drag_ghost(name, dirty, size, drag_size, screen, visible, cx);
+        self.ensure_drag_ghost(
+            name,
+            dirty,
+            size,
+            drag_size,
+            layout.screen,
+            layout.visible,
+            cx,
+        );
         if let Some(gh) = self.drag_ghost {
-            Self::place_drag_ghost(gh, screen, visible, cx);
+            Self::place_drag_ghost(gh, layout.screen, layout.visible, cx);
         }
     }
 

@@ -180,10 +180,10 @@ pub struct EditorApp {
     /// `borrow_mut()` 守卫时不可再 `borrow()`/`borrow_mut()`（运行期双借 panic）。
     pub model: Rc<RefCell<AppModel>>,
     /// 选项卡栏内各选项卡**上一帧** laid-out 的边界（与拖拽事件 `position` 同一输入坐标
-    /// 空间、含横向滚动偏移）：栏内拖拽排序的**命中测试**用（`tab_insert_index` /
-    /// `tab_drag_over_row`，tab_drag 域留宿主经原路径）。`TabBar` 实体渲染期每帧重建
-    /// （长度 = `tabs.len()`、按下标对应；经 `render_tab_bar` 的 `&mut` 入参写回本宿主
-    /// 字段——记录器在 prepaint 阶段把真实边界写回各槽位）。
+    /// 空间、含横向滚动偏移）：栏内拖拽排序的**命中测试**用（H2 起命中计算迁
+    /// `shell_tabs::drag::{tab_insert_index, tab_drag_over_row}` 纯函数，此快照以参数传入）。
+    /// `TabBar` 实体渲染期每帧重建（长度 = `tabs.len()`、按下标对应；经 `render_tab_bar`
+    /// 的 `&mut` 入参写回本宿主字段——记录器在 prepaint 阶段把真实边界写回各槽位）。
     tab_bounds: Vec<Rc<Cell<Bounds<Pixels>>>>,
     /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条；`TabBar` 实体渲染期以 `&`
     /// 入参接线）。

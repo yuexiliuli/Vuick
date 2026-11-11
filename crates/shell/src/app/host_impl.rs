@@ -443,8 +443,8 @@ impl shell_preview::PreviewHost for EditorApp {
 
 // 2026-11-11：选项卡栏域宿主服务面（shell_tabs）。选项卡栏渲染/事件在 `TabBar` 实体
 // （`tab_bar_view`），凡事件回调必须落宿主副作用的动作统一经此 trait 反调；宿主实现
-// 只薄转发既有方法（`tabs.rs` 生命周期 glue / `tab_drag.rs` 幽灵窗 / `preview.rs` 预览
-// 切换 / 菜单槽位落地），零业务逻辑。
+// 只薄转发既有方法（`tabs.rs` 生命周期 glue / `preview.rs` 预览切换 / 菜单槽位落地），
+// 零业务逻辑。拖拽开始预建幽灵窗入口已迁 `shell_tabs::TabDragHost`（下方 impl）。
 impl shell_tabs::TabsHost for EditorApp {
     fn tabs_host_activate_tab(
         &mut self,
@@ -529,18 +529,6 @@ impl shell_tabs::TabsHost for EditorApp {
         self.poke_tab_hscroll(cx);
     }
 
-    fn tabs_host_prime_drag_ghost(
-        &mut self,
-        idx: usize,
-        name: SharedString,
-        dirty: bool,
-        size_cell: Rc<Cell<Size<Pixels>>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.prime_drag_ghost(idx, name, dirty, size_cell, window, cx);
-    }
-
     /// 右键菜单落地（测试直读宿主 `tab_bar_menu_*` 槽位 + media/pdf 前置弹窗互关直清，
     /// 故槽位留宿主）。
     fn tabs_host_open_tab_bar_menu(
@@ -567,5 +555,80 @@ impl shell_tabs::TabsHost for EditorApp {
             self.tab_bar_menu_pos = None;
         }
         cx.notify();
+    }
+}
+
+// 2026-11-11：跨窗口选项卡拖拽宿主服务面（shell_tabs::drag）。拖拽流程的纯逻辑
+// （命中 / 布局参数 / 状态机迁移 / 拆分决策）在 `shell_tabs::drag`；宿主侧「真正执行」
+// （open_window 建新窗 / EditorAppRegistry 查询 / HWND·DWM / 幽灵窗实体创建销毁 /
+// adopt·restore 目标窗操作）统一经本 trait 反调宿主。方法体自原 `app/tab_drag.rs`
+// 既有方法薄转发（`tab_drag.rs` 仍为主编排列写点），行为零变化。
+impl shell_tabs::TabDragHost for EditorApp {
+    fn tab_drag_host_prime_ghost(
+        &mut self,
+        idx: usize,
+        name: SharedString,
+        dirty: bool,
+        size_cell: Rc<Cell<Size<Pixels>>>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prime_drag_ghost(idx, name, dirty, size_cell, window, cx);
+    }
+
+    fn tab_drag_host_update_ghost(
+        &mut self,
+        idx: usize,
+        drag_size: Rc<Cell<Size<Pixels>>>,
+        pos: Point<Pixels>,
+        outside: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_drag_ghost(idx, drag_size, pos, outside, window, cx);
+    }
+
+    fn tab_drag_host_destroy_ghost(&mut self, cx: &mut Context<Self>) {
+        self.destroy_drag_ghost(cx);
+    }
+
+    fn tab_drag_host_take_payload(&mut self, idx: usize) -> Option<DetachedTab> {
+        self.take_tab_payload(idx)
+    }
+
+    fn tab_drag_host_commit_live_and_take_payload(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<DetachedTab> {
+        self.commit_live_and_take_tab_payload(idx, window, cx)
+    }
+
+    fn tab_drag_host_release_outside(
+        &mut self,
+        window: &mut Window,
+        release_position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.release_tab_drag_outside(window, release_position, cx);
+    }
+
+    fn tab_drag_host_split_to_new_window(
+        &mut self,
+        payload: DetachedTab,
+        release_position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.split_tab_to_new_window(payload, release_position, window, cx);
+    }
+
+    fn tab_drag_host_restore_to_primary(
+        &mut self,
+        payload: DetachedTab,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_tab_to_primary(payload, cx);
     }
 }

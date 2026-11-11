@@ -778,7 +778,7 @@
     /// / 恰好贴边缘但未进入余量 = false。光标可在窗内而 picture 已探出边缘（抓取偏移大）。
     #[test]
     fn drag_picture_about_to_clip_geometry() {
-        use super::tab_drag::{drag_picture_about_to_clip, DRAG_EDGE_CLIP_MARGIN};
+        use shell_tabs::drag::{drag_picture_about_to_clip, DRAG_EDGE_CLIP_MARGIN};
         let win = gpui::size(px(980.), px(720.));
         let tab_size = gpui::size(px(120.), px(26.));
         let grab = gpui::Point::new(px(20.), px(13.));

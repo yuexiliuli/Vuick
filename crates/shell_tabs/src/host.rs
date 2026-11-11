@@ -3,10 +3,11 @@
 //!
 //! 选项卡栏域对宿主的交互收敛为最小接口：域逻辑（[`crate::bar::TabBar`] 实体渲染 +
 //! 共享 `AppModel` 模型态）不依赖 shell 的具体宿主类型；凡**必须落宿主的副作用**
-//! （激活/关闭/批关闭/跨窗动作、预览切换、横向滚动条点亮、窗外幽灵窗预建、右键菜单
-//! 槽位落地）经本 trait 反调宿主 `EditorApp`。shell 侧以 `impl shell_tabs::TabsHost for
-//! EditorApp` 提供实现（`app/host_impl.rs`，方法体自原 `EditorApp` 既有方法薄转发，
-//! 行为零变化）。
+//! （激活/关闭/批关闭/跨窗动作、预览切换、横向滚动条点亮、右键菜单槽位落地）经本
+//! trait 反调宿主 `EditorApp`；拖拽开始预建窗外幽灵窗入口
+//! `tabs_host_prime_drag_ghost` 已随 H2 迁至 [`crate::drag::TabDragHost`]。shell 侧以
+//! `impl shell_tabs::TabsHost for EditorApp` 提供实现（`app/host_impl.rs`，方法体自原
+//! `EditorApp` 既有方法薄转发，行为零变化）。
 //!
 //! ## 借用纪律
 //!
@@ -16,10 +17,7 @@
 //! 渲染期所需的宿主只读数据（`show_preview` / 活动 tab 是否 Markdown）由宿主在调用域
 //! 渲染前**以参数预取传入**（`TabBar::render_tab_bar` 的 `preview_on` / `active_is_md`）。
 
-use std::cell::Cell;
-use std::rc::Rc;
-
-use gpui::{Context, Entity, Pixels, Point, SharedString, Size, Subscription, Window};
+use gpui::{Context, Entity, Pixels, Point, Subscription, Window};
 use ui::menu::PopupMenu;
 
 /// 选项卡栏**宿主服务面**：把选项卡栏对宿主的副作用收敛为最小接口，使本 crate 不依赖
@@ -109,18 +107,6 @@ pub trait TabsHost: 'static {
     /// + 自动隐藏计时 `tab_hscroll_delay`）。
     fn tabs_host_poke_tab_hscroll(&mut self, cx: &mut Context<Self>)
     where
-        Self: Sized;
-
-    /// 拖拽开始预建窗外幽灵窗（宿主 `prime_drag_ghost`；tab_drag 域留宿主原路径，H2 补拖出）。
-    fn tabs_host_prime_drag_ghost(
-        &mut self,
-        idx: usize,
-        name: SharedString,
-        dirty: bool,
-        size_cell: Rc<Cell<Size<Pixels>>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) where
         Self: Sized;
 
     /// 右键菜单落地（宿主 `tab_bar_menu_*` 槽位）——测试直读宿主字段，media/pdf 前置
