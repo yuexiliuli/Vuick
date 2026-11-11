@@ -13,8 +13,9 @@
 //! `pdf` / `image_viewer` / `video`（feature 转发）/ `encoding_rs`，不新增外部包。
 //!
 //! 宿主模型类型 `EditorAppRegistry`（持 `WeakEntity<EditorApp>`，随宿主 `EditorApp`
-//! 一起，待 AppHost 抽象落地）与 `MdScrollSync` / `MdTocScroll` / `EditorApp` 本体
-//! 留在 shell，不属本 crate。
+//! 一起，待 AppHost 抽象落地）与 `EditorApp` 本体留在 shell，不属本 crate；滚动同步 /
+//! 面板分割 / 活区内衬 / 滚屏基准等纯值类型（[`MdScrollSync`] / [`MdTocScroll`] /
+//! [`PanesState`] / [`LIVE_BODY_PAD_Y`]）已随 SC 下沉至 [`model`]，宿主以重导出维持路径。
 
 pub mod actions;
 pub mod file_ops;
@@ -23,6 +24,8 @@ pub mod model;
 
 pub use host::AppHost;
 pub use model::{
-    AppModel, DetachedTab, EditorTab, MdWyEarly, MdWyInstall, MediaReader, PdfBookmark,
-    SearchScopeTab, TabDragData, TabDragGhost, TitleCtrlIconFg, WinCtrlKind,
+    AppModel, CommitLiveAlign, DetachedTab, EditorTab, LIVE_BODY_PAD_Y, LIVE_COMMIT_OPS_COUNT,
+    LIVE_COMMIT_OPS_REPLAYED, LIVE_COMMIT_SKIP_UNCHANGED, LIVE_COMMIT_WRITEBACK, MdScrollSync,
+    MdTocScroll, MdWyEarly, MdWyInstall, MediaReader, PanesState, PdfBookmark, SearchScopeTab,
+    TabDragData, TabDragGhost, TitleCtrlIconFg, WinCtrlKind,
 };

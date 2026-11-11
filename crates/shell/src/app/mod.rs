@@ -104,8 +104,9 @@ use crate::scrollbar::TableScrollState;
 // 此处经 `pub use` 重导出，维持既有 `app::EditorTab` / `app::DetachedTab` 等路径
 // 与子模块 `use super::*` 的可见性语义不变（宿主/测试零或最少改动）。
 pub use shell_core::{
-    AppHost, AppModel, DetachedTab, EditorTab, MdWyEarly, MdWyInstall, MediaReader, PdfBookmark,
-    SearchScopeTab, TabDragData, TabDragGhost, TitleCtrlIconFg, WinCtrlKind,
+    AppHost, AppModel, CommitLiveAlign, DetachedTab, EditorTab, MdWyEarly, MdWyInstall, MediaReader,
+    PanesState, PdfBookmark, SearchScopeTab, TabDragData, TabDragGhost, TitleCtrlIconFg,
+    WinCtrlKind,
 };
 
 /// 测试可见重导出（2026-11-10 P1 测试域化，§8.6 外提清单）：
@@ -140,10 +141,8 @@ const DRIVEN_EDITOR_MAX_AWAIT: u32 = 8;
 
 /// A4：Markdown 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：
 /// 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。
-#[derive(Clone)]
-pub(crate) enum MdTocScroll {
-    Unified(gpui::Entity<WyEditor>),
-}
+/// 原定义（`pub(crate) enum`）已随 SC 下沉 shell_core，此处重导出维持既有路径与可见性。
+pub(crate) use shell_core::MdTocScroll;
 
 /// 所有 `EditorApp` 窗口的注册表（全局）：记录每个窗口的弱实体句柄与窗口句柄。
 /// 「拖出拆分」创建的子窗口带 `is_detached=true`，把选项卡拖回主窗口时据此找到
@@ -164,60 +163,9 @@ impl gpui::Global for EditorAppRegistry {}
 /// 编辑区⇄预览滚动同步基线（见 [`EditorApp::sync_editor_preview_scroll`]）。记录
 /// 当前选项卡 + 编辑器内容版本 + 上次已同步的双方「块起点」键，渲染帧比对后由动了
 /// 的那一侧驱动对端。切换选项卡 / 同一选项卡内换文档 / 编辑使内容版本变化 → 重建。
-#[derive(Clone, Copy)]
-struct MdScrollSync {
-    tab: usize,
-    editor_version: Option<u64>,
-    editor_block: Option<usize>,
-    preview_block: Option<usize>,
-    /// 我方（编辑器主导时）最近一次要求预览到达的目标块：预览重钉落位到该块是「按
-    /// 我方命令跟上」，不得反被当成用户滚动预览而把编辑器拽回（来回跳动）。
-    driven_preview_target: Option<usize>,
-    /// 我方（预览主导时）最近一次要求编辑器到达的目标块：编辑器落位到该块是「按
-    /// 我方命令跟上」，与 `driven_preview_target` 对称——否则编辑器跟随落位会被
-    /// 误判成「编辑器先动 → 驱动预览」的反馈回声，把预览拽回（来回跳动/滚不下去）。
-    driven_editor_target: Option<usize>,
-    /// `driven_editor_target` 的收敛宽限帧数：编辑器落位通常同步、但边界块（表格等）
-    /// 顶行读取可能滞后/抖动一帧到数帧，期间回显必须被抑制；超过宽限才放手让正常
-    /// 双向同步接管（防编辑器永远到不了目标时同步停摆）。
-    driven_editor_await: u32,
-    /// 右栏预览「Scrub 延后」在途（I2）：预览被快速拖动 / 高频滚屏**连续跨块**时置
-    /// 真，期内的编辑区 `scroll_to_line` 跟随**延后**（不逐帧嵌编辑器全窗重建）；
-    /// 预览静止（松手 / 停滚）后一次收敛到最终目标，恢复双侧对齐。
-    scrub: bool,
-    /// 进入 Scrub 的连续「预览跨块」帧计数：由同步函数逐帧维护（`preview_moved`
-    /// 连续即累加、中断即清零），达到 [`crate::app::preview::SCRUB_ENTER_STREAK`]
-    /// 才进入延后——低频单步滚屏不触发，保持慢滚逐帧对齐。
-    scrub_streak: u32,
-    /// Scrub 延后期内「预览静止」的连续帧计数：达到
-    /// [`crate::app::preview::SCRUB_IDLE_FRAMES`]（或墙钟兜底）即一次收敛。
-    scrub_idle_frames: u32,
-    /// Scrub 延后的收敛目标 = 延后期内最新一次预览顶块（松手/静止后编辑器一次
-    /// 收敛到它）。
-    scrub_target: Option<usize>,
-    /// 距上次预览跨块的墙钟（静止收敛的墙钟兜底，见
-    /// [`crate::app::preview::SCRUB_IDLE`]；帧稀疏时保证仍会收敛）。
-    scrub_last_cross: std::time::Instant,
-}
-
-impl Default for MdScrollSync {
-    fn default() -> Self {
-        Self {
-            tab: usize::MAX,
-            editor_version: None,
-            editor_block: None,
-            preview_block: None,
-            driven_preview_target: None,
-            driven_editor_target: None,
-            driven_editor_await: 0,
-            scrub: false,
-            scrub_streak: 0,
-            scrub_idle_frames: 0,
-            scrub_target: None,
-            scrub_last_cross: std::time::Instant::now(),
-        }
-    }
-}
+/// 原定义（`struct` + 手写 `Default`）已随 SC 下沉 shell_core；仅 `mod app` 子树消费，
+/// 故用模块私有 `use` 引入（与旧 `struct` 的模块内可见语义一致，无需 pub(crate)）。
+use shell_core::MdScrollSync;
 
 pub struct EditorApp {
     /// SC-2（2026-11-10）：模型半状态统一容器——`tabs` / `active_tab` 已随
@@ -242,22 +190,13 @@ pub struct EditorApp {
     /// （`app.notifications.last().message_str()`，§8.6 外提清单）。
     #[doc(hidden)]
     pub notifications: Vec<ui::notification::Notification>,
-    /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）。
-    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 拖拽断言读（§8.6 外提清单）。
+    /// 「编辑区 ⇄ 预览分割条」面板状态（[`PanesState`]，纯值类型，SC 下沉 shell_core）：
+    /// `split_ratio` / `split_drag` / `pending_split_ratio` / `splitter_hovered` 四字段
+    /// 收敛于此。以**普通字段**持有（非 `Rc<RefCell>`）：render / 拖拽事件路径多处直读，
+    /// 保持借用语义零变化。
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 拖拽/悬停断言读 `panes.*`（§8.6 外提清单）。
     #[doc(hidden)]
-    pub split_ratio: f32,
-    /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`。
-    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 拖拽开始/结束断言（§8.6 外提清单）。
-    #[doc(hidden)]
-    pub split_drag: Option<(f32, f32)>,
-    /// 拖分割条帧级合并（B4）：`on_mouse_move` 只记**最新目标比例**，本帧 `render`
-    /// 开头统一落地到 `split_ratio`（对齐 scrollbar `pending_target`→prepaint 先例）。
-    /// 语义不变：分割条拖动仍实时跟手（每帧一落），只合并 notify 频率。
-    pending_split_ratio: Option<f32>,
-    /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）。
-    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 悬停高亮断言（§8.6 外提清单）。
-    #[doc(hidden)]
-    pub splitter_hovered: bool,
+    pub panes: PanesState,
     /// 侧边栏「外壳」状态：可见性 / 视图 / 目录折叠 / 宽度与右缘拖拽
     /// （检索输入 + 扫描缓存等仍在此处，见 [`sidebar::SidebarChromeState`]）。
     /// `#[doc(hidden)] pub`：`tests/settings_xfer.rs` 直读/直写 `width`/`width_auto`/

@@ -4,8 +4,9 @@ use super::*;
 use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 /// WYSIWYG 宿主 `#live-body` 的顶部内衬（px）：缩放锚点在做「宿主 ScrollHandle 偏移 ↔
-/// WyEditor 元素局部 y」换算时使用，必须与下方 `.py(px(LIVE_BODY_PAD_Y))` 保持一致。
-pub(crate) const LIVE_BODY_PAD_Y: f32 = 8.0;
+/// WyEditor 元素局部 y」换算时使用，必须与各宿主 `.py(px(LIVE_BODY_PAD_Y))` 保持一致。
+/// 原定义已随 SC 下沉 `shell_core::LIVE_BODY_PAD_Y`，此处重导出维持 `app::panes::…` 路径。
+pub(crate) use shell_core::LIVE_BODY_PAD_Y;
 
 impl EditorApp {
     /// 当前选项卡的预览视图：图片选项卡用 `ImageViewer`（自处理滚轮），
@@ -309,7 +310,8 @@ impl EditorApp {
         let border = self.bar_border();
         let drag_line: gpui::Hsla =
             ui::theme::Theme::global(cx).colors.drag_hover_border.into();
-        let line_color: gpui::Hsla = if self.splitter_hovered || self.split_drag.is_some() {
+        let line_color: gpui::Hsla = if self.panes.splitter_hovered || self.panes.split_drag.is_some()
+        {
             drag_line
         } else {
             border
@@ -328,13 +330,13 @@ impl EditorApp {
             // 命中测试加宽（左右各 3px），视觉只有中间 2px 细线
             .on_hover(cx.listener(
                 |this: &mut EditorApp, hovered: &bool, _window, cx| {
-                    this.splitter_hovered = *hovered;
+                    this.panes.splitter_hovered = *hovered;
                     cx.notify();
                 },
             ))
             .on_mouse_down(MouseButton::Left, cx.listener(
                 |this: &mut EditorApp, ev: &gpui::MouseDownEvent, _window, cx| {
-                    this.split_drag = Some((ev.position.x.as_f32(), this.split_ratio));
+                    this.panes.split_drag = Some((ev.position.x.as_f32(), this.panes.split_ratio));
                     cx.notify();
                 },
             ))

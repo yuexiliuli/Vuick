@@ -32,8 +32,8 @@ impl Render for EditorApp {
         let _t = crate::prof::begin();
         // 拖分割条帧级合并（B4）：`on_mouse_move` 只记最新目标比例，这里本帧开始统一
         // 落地到 `split_ratio`（在 `render_body` 读取它之前，当帧即生效）。
-        if let Some(r) = self.pending_split_ratio.take() {
-            self.split_ratio = r;
+        if let Some(r) = self.panes.pending_split_ratio.take() {
+            self.panes.split_ratio = r;
         }
         // 编辑区⇄预览滚动同步：动了的一侧驱动另一侧到对应块（仅 MD 分屏、非 live2）。
         self.sync_editor_preview_scroll(cx);
@@ -77,7 +77,7 @@ impl EditorApp {
                 self.render_editor_pane(window, 1.0, cx),
             )
         } else if self.show_preview() {
-            let ratio = self.split_ratio;
+            let ratio = self.panes.split_ratio;
             // EPUB 等全屏预览：预览区占满整个内容区，不显示编辑区与分割线。
             let fullscreen = self
                 .model.borrow().tabs
@@ -107,14 +107,14 @@ impl EditorApp {
                     // clamp 住）直接跳过 notify，不再白重建一帧。
                     .on_mouse_move(cx.listener(
                         |this: &mut EditorApp, ev: &gpui::MouseMoveEvent, window, cx| {
-                            if let Some((start_x, start_ratio)) = this.split_drag {
+                            if let Some((start_x, start_ratio)) = this.panes.split_drag {
                                 let total = window.bounds().size.width.as_f32();
                                 if total > 0. {
                                     let x = ev.position.x.as_f32();
                                     let ratio = (start_ratio + (x - start_x) / total)
                                         .clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX);
-                                    if (ratio - this.split_ratio).abs() > 1e-5 {
-                                        this.pending_split_ratio = Some(ratio);
+                                    if (ratio - this.panes.split_ratio).abs() > 1e-5 {
+                                        this.panes.pending_split_ratio = Some(ratio);
                                         cx.notify();
                                     }
                                 }
@@ -125,8 +125,8 @@ impl EditorApp {
                         MouseButton::Left,
                         cx.listener(
                             |this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
-                                this.pending_split_ratio = None;
-                                this.split_drag = None;
+                                this.panes.pending_split_ratio = None;
+                                this.panes.split_drag = None;
                                 cx.notify();
                             },
                         ),
@@ -135,8 +135,8 @@ impl EditorApp {
                         MouseButton::Left,
                         cx.listener(
                             |this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
-                                this.pending_split_ratio = None;
-                                this.split_drag = None;
+                                this.panes.pending_split_ratio = None;
+                                this.panes.split_drag = None;
                                 cx.notify();
                             },
                         ),

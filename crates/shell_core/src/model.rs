@@ -5,23 +5,183 @@
 //! （最小面，SC-2 再全面）；类型自包含的 inherent impl（[`MediaReader`] /
 //! [`WinCtrlKind`] / [`Render` for [`TabDragGhost`]]）随类型迁入。
 //!
-//! 依赖的宿主类型（[`crate::app::EditorApp`] / `EditorAppRegistry` / `MdScrollSync` /
-//! `MdTocScroll`）不在此 crate。
+//! 依赖的宿主类型（[`crate::app::EditorApp`] / `EditorAppRegistry`）不在此 crate；滚动
+//! 同步 / 面板分割 / 活区内衬等纯值类型（[`MdScrollSync`] / [`MdTocScroll`] / [`PanesState`]
+//! / [`LIVE_BODY_PAD_Y`]）随 SC 下沉至此，宿主以重导出维持既有路径。
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    div, px, Context, ElementId, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
-    Render, SharedString, Size, Styled, Subscription, Window,
+    div, px, App, Context, ElementId, InteractiveElement, IntoElement, ParentElement, Pixels,
+    Point, Render, SharedString, Size, Styled, Subscription, Window,
 };
 use markdown_wysiwyg::WyEditor;
 use ui::theme::ChromeColors;
 
 use base::util::SeqAfter;
 use config::user::{PdfBgPref, ThemePref};
+
+/// WYSIWYG / MD 统一预览宿主 `#live-body` 的顶部内衬（px）：缩放锚点在做「宿主
+/// ScrollHandle 偏移 ↔ WyEditor 元素局部 y」换算时使用，必须与各宿主容器
+/// `.py(px(LIVE_BODY_PAD_Y))` 保持一致（原 `app::panes::LIVE_BODY_PAD_Y` 下沉）。
+pub const LIVE_BODY_PAD_Y: f32 = 8.0;
+
+/// A4：Markdown 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：
+/// 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。
+/// 自 `crate::app` 下沉（纯值类型，壳侧以重导出维持既有路径）。
+#[derive(Clone)]
+pub enum MdTocScroll {
+    Unified(gpui::Entity<WyEditor>),
+}
+
+/// 编辑区⇄预览滚动同步基线（见 shell 侧 `preview::sync_editor_preview_scroll`）。记录
+/// 当前选项卡 + 编辑器内容版本 + 上次已同步的双方「块起点」键，渲染帧比对后由动了
+/// 的那一侧驱动对端。切换选项卡 / 同一选项卡内换文档 / 编辑使内容版本变化 → 重建。
+/// 自 `crate::app` 下沉（纯值类型，壳侧以重导出维持既有路径）。字段跨 crate 读写
+/// （宿主 sync 每帧改 / 测试断言语义）→ 按本 crate 模型类型约定全部 `pub`。
+#[derive(Clone, Copy)]
+pub struct MdScrollSync {
+    pub tab: usize,
+    pub editor_version: Option<u64>,
+    pub editor_block: Option<usize>,
+    pub preview_block: Option<usize>,
+    /// 我方（编辑器主导时）最近一次要求预览到达的目标块：预览重钉落位到该块是「按
+    /// 我方命令跟上」，不得反被当成用户滚动预览而把编辑器拽回（来回跳动）。
+    pub driven_preview_target: Option<usize>,
+    /// 我方（预览主导时）最近一次要求编辑器到达的目标块：编辑器落位到该块是「按
+    /// 我方命令跟上」，与 `driven_preview_target` 对称——否则编辑器跟随落位会被
+    /// 误判成「编辑器先动 → 驱动预览」的反馈回声，把预览拽回（来回跳动/滚不下去）。
+    pub driven_editor_target: Option<usize>,
+    /// `driven_editor_target` 的收敛宽限帧数：编辑器落位通常同步、但边界块（表格等）
+    /// 顶行读取可能滞后/抖动一帧到数帧，期间回显必须被抑制；超过宽限才放手让正常
+    /// 双向同步接管（防编辑器永远到不了目标时同步停摆）。
+    pub driven_editor_await: u32,
+    /// 右栏预览「Scrub 延后」在途（I2）：预览被快速拖动 / 高频滚屏**连续跨块**时置
+    /// 真，期内的编辑区 `scroll_to_line` 跟随**延后**（不逐帧嵌编辑器全窗重建）；
+    /// 预览静止（松手 / 停滚）后一次收敛到最终目标，恢复双侧对齐。
+    pub scrub: bool,
+    /// 进入 Scrub 的连续「预览跨块」帧计数：由同步函数逐帧维护（`preview_moved`
+    /// 连续即累加、中断即清零），达到 shell 侧 `preview::SCRUB_ENTER_STREAK` 才进入
+    /// 延后——低频单步滚屏不触发，保持慢滚逐帧对齐。
+    pub scrub_streak: u32,
+    /// Scrub 延后期内「预览静止」的连续帧计数：达到 shell 侧 `preview::SCRUB_IDLE_FRAMES`
+    /// （或墙钟兜底）即一次收敛。
+    pub scrub_idle_frames: u32,
+    /// Scrub 延后的收敛目标 = 延后期内最新一次预览顶块（松手/静止后编辑器一次
+    /// 收敛到它）。
+    pub scrub_target: Option<usize>,
+    /// 距上次预览跨块的墙钟（静止收敛的墙钟兜底，见 shell 侧 `preview::SCRUB_IDLE`；
+    /// 帧稀疏时保证仍会收敛）。
+    pub scrub_last_cross: std::time::Instant,
+}
+
+impl Default for MdScrollSync {
+    fn default() -> Self {
+        Self {
+            tab: usize::MAX,
+            editor_version: None,
+            editor_block: None,
+            preview_block: None,
+            driven_preview_target: None,
+            driven_editor_target: None,
+            driven_editor_await: 0,
+            scrub: false,
+            scrub_streak: 0,
+            scrub_idle_frames: 0,
+            scrub_target: None,
+            scrub_last_cross: std::time::Instant::now(),
+        }
+    }
+}
+
+/// 「编辑区 ⇄ 预览分割条」面板状态包（原 `EditorApp` 四个 split 字段收敛；纯值类型，
+/// 随 SC 模型下沉迁入本 crate）。宿主 `EditorApp` 以**普通字段** `panes: PanesState`
+/// 持有（非 `Rc<RefCell>`：渲染 / 拖拽事件路径多处直读，保持借用语义零变化）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PanesState {
+    /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）。
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 拖拽断言读（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub split_ratio: f32,
+    /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`。
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 拖拽开始/结束断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub split_drag: Option<(f32, f32)>,
+    /// 拖分割条帧级合并（B4）：`on_mouse_move` 只记**最新目标比例**，本帧 `render`
+    /// 开头统一落地到 `split_ratio`（对齐 scrollbar `pending_target`→prepaint 先例）。
+    /// 语义不变：分割条拖动仍实时跟手（每帧一落），只合并 notify 频率。
+    /// 须保持 `pub`（`PanesState` 在 shell_core、唯一消费方 layout.rs 在 shell，跨 crate
+    /// 读写），doc-hidden 收敛对外文档面。
+    #[doc(hidden)]
+    pub pending_split_ratio: Option<f32>,
+    /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）。
+    /// `#[doc(hidden)] pub`：`tests/splitter.rs` 悬停高亮断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub splitter_hovered: bool,
+}
+
+impl Default for PanesState {
+    fn default() -> Self {
+        Self {
+            split_ratio: 0.5,
+            split_drag: None,
+            pending_split_ratio: None,
+            splitter_hovered: false,
+        }
+    }
+}
+
+/// 测试探针（`AppModel::commit_live` 退出路径计数）：整篇写回（有改动）vs 未改动直接
+/// 销毁实体（O(1) 跳过写回）。shell 侧回归测试据此断言「未编辑不写回」。
+/// 常驻编译（无 `#[cfg(test)]`）：`commit_live` 逻辑在 shell_core，而 shell 的测试构建
+/// 把 shell_core 当普通依赖编译（`cfg(test)` 恒关）——探针须常驻才可被 shell 测试读取；
+/// 生产进程对从未被读的原子做 fetch_add 成本可忽略，无行为差异。
+#[doc(hidden)]
+pub static LIVE_COMMIT_WRITEBACK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// 测试探针：`commit_live`「未改动 O(1) 跳过写回」路径计数（见 [`LIVE_COMMIT_WRITEBACK`]）。
+#[doc(hidden)]
+pub static LIVE_COMMIT_SKIP_UNCHANGED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// 测试探针：走**编辑日志重放**（方案2，`apply_live_replay` 主路径）写回的 `commit_live`
+/// 次数（op 非空且护栏自检通过）。
+#[doc(hidden)]
+pub static LIVE_COMMIT_OPS_REPLAYED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// 测试探针：编辑日志重放实际应用的 op 累计数（= 该 live 会话缴存的内容变更条数；
+/// 引用计数断言「单字符恰 1 条」「大粘贴单大 op」）。
+#[doc(hidden)]
+pub static LIVE_COMMIT_OPS_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `AppModel::commit_live` 的宿主收尾指令：模型/实体侧写回完成后，把**必须留在视图层**
+/// 的收尾（`on_next_frame` 清 `retired_live2`、右栏 `md_wy` 对齐 / 行级 diff 兜底）交给
+/// 宿主 shell 侧执行，逐路径与旧 `EditorApp::commit_live` 行为一致。
+pub enum CommitLiveAlign {
+    /// 该选项卡无 live2（下标越界 / 未启用）：未暂存任何实体，宿主无需收尾。
+    NoLive2,
+    /// 已把 live2 暂存 `retired_live2`（宿主须调度 `on_next_frame` 清空队列），
+    /// 无需右栏 `md_wy` 对齐（未改动 / 加载中退出）。
+    NoAlign,
+    /// 已暂存 + 编辑日志重放成功：宿主对右栏 `md_wy` 做逐 op 增量对齐
+    /// （`md_wy_align_after_ops`）。
+    Ops {
+        ops: Vec<(Range<usize>, SharedString)>,
+        src_len: usize,
+        content: SharedString,
+    },
+    /// 已暂存 + 走到行级 diff 兜底：宿主先 `text_open::line_diff` 产 hunk 并应用到源码
+    /// 编辑区，再对右栏 `md_wy` 做 diff 对齐（`md_wy_align_after_diff`）。行级 diff 计算
+    /// 依赖 `text_open`（shell 既有依赖），留在宿主侧，本 crate 不新增依赖。
+    Diff {
+        base: String,
+        content: SharedString,
+    },
+}
 
 /// 外壳宿主「模型半」状态的统一容器（SC-2/SC-3，2026-11-10 自 `EditorApp` 迁出）。
 ///
@@ -213,6 +373,131 @@ impl AppModel {
             retired_live2: Vec::new(),
             music_mode: false,
         }
+    }
+}
+
+impl AppModel {
+    /// 退出预览编辑的**纯模型 + 实体**部分（原 `EditorApp::commit_live` 迁出）：把
+    /// WYSIWYG 内容写回源码编辑区 + 内容镜像；live2 实体**延迟**暂存 `retired_live2`
+    /// 由宿主调度 `on_next_frame` 到下一帧渲染后销毁（A：实体级联 Drop ~36ms 移出
+    /// 点击同步路径）。
+    ///
+    /// 视图层收尾（`on_next_frame` 清 `retired_live2`、右栏 `md_wy` 对齐 / 行级 diff
+    /// 兜底）不在本方法——宿主据返回值 [`CommitLiveAlign`] 执行，逐调用点核对过
+    /// 借用范围 / 事件顺序 / 返回值语义与旧实现完全一致。
+    pub fn commit_live(&mut self, idx: usize, cx: &mut App) -> CommitLiveAlign {
+        // 读取 + 拆 live2：直接持 `&mut self`，无需 RefCell（宿主调用时已持有模型守卫）。
+        let (l2, l2_dirty) = match self.tabs.get_mut(idx) {
+            Some(tab) => {
+                // 本 live 会话是否有内容编辑（读后再清，供下方「未改动跳过写回」判定）。
+                let l2_dirty = tab.live2_dirty;
+                tab.live2_dirty = false;
+                tab.live_edit = false;
+                tab._live2_sub = None;
+                let Some(l2) = tab.live2.take() else {
+                    return CommitLiveAlign::NoLive2;
+                };
+                (l2, l2_dirty)
+            }
+            None => return CommitLiveAlign::NoLive2,
+        };
+        // A2：**延迟回收**。live2 实体（WyEditor 大对象：Doc 的 rope/行索引/派生缓存 +
+        // 整 `Rc` 级联）的销毁占切回 ~36ms，不能丢在点击事件路径里同步 Drop。先把实体
+        // 暂存到 `retired_live2`（clone 是 O(1) 句柄；本方法内 `l2` 继续照常读写），宿主
+        // 再用 `cx.on_next_frame`（gpui 保证「下一帧渲染完之后」触发）清空队列放实体
+        // 出作用域 Drop。**渲染引用安全性**：此处已 `tab.live2 = None`，切回后的任何
+        // render 都不再引用旧实体；`on_next_frame` 又晚于「下一帧已渲染/呈现」，故延迟
+        // Drop 时既无渲染在读它、也不占用展示切回结果的那一帧的 CPU。本方法所有提前
+        // return 路径共用此延迟（未改动 O(1) 跳过 / 加载中退出同样受益）。
+        self.retired_live2.push(l2.clone());
+        // 视图从 WYSIWYG 换回源码编辑区：先清空两端编辑器可能残留的鼠标拖选状态
+        // （须在任何提前 return 之前）。点击「预览编辑测试」菜单项时 GPUI 把 MouseDown
+        // 按 `hitbox.is_hovered` 漏进编辑区置 `dragging=true`（不按 z-order 裁掉被菜单
+        // 遮挡的区间）；对应的 MouseUp 又被菜单项 `activate` 的 `stop_propagation`
+        // 截断派发、到不了编辑器 `on_mouse_up` → `dragging` 残留。切回后仅移动鼠标
+        // 就会从 anchor=0（`set_text` 收拢到行首）自动扩选到指针处。在此「切回/切离」
+        // 生命周期边界触发编辑器的统一拖选复位钩子（`cancel_mouse_drag`），并覆盖提前
+        // return 路径（大文档未加载完不走 `set_text`）：WYSIWYG 实体（随后即销毁）与
+        // 源码编辑区（转前台显示）都不留拖选态。
+        l2.update(cx, |ed, _| ed.end_selection());
+        self.tabs[idx]
+            .editor
+            .update(cx, |ed, _| ed.cancel_mouse_drag());
+        // 大文档后台解析在途就退出：live2 尚无内容，不能写回（否则源码编辑区被清空）。
+        // 源码编辑区仍是权威源，直接丢弃空壳实体即可。
+        if !l2.read(cx).is_loaded() {
+            self.status = SharedString::from("预览编辑测试：关（加载中退出，未写回编辑区）");
+            self.status_ok = false;
+            return CommitLiveAlign::NoAlign;
+        }
+        // 未改动（live 期间无任何内容编辑，`live2_dirty == false`）：live2 文本恒等于
+        // 打开瞬间的源码 COW 快照（toggle ON 只从该快照建实体，无其它写入路径），
+        // 整篇物化 + `set_text` 写回 + 喂右栏纯属 O(n) 浪费（大文档级联重排卡 7-8s）——
+        // 直接销毁实体切回（O(1)），源码编辑区仍是原内容、可继续编辑。
+        if !l2_dirty {
+            LIVE_COMMIT_SKIP_UNCHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.status = SharedString::from("预览编辑测试：关（未改动，无需写回）");
+            self.status_ok = true;
+            return CommitLiveAlign::NoAlign;
+        }
+        LIVE_COMMIT_WRITEBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // —— 编辑日志重放（M：方案2，取代行级 diff 的主路径）——
+        // live2 在 live 会话期把每笔内容变更（`replace_range` / 撤销 / 重做统一缴存）记成
+        // `(字节区间, 新文本)` op 日志：两步起点同源（toggle ON 的源码 COW Rope 快照、
+        // live 期间源码编辑区不被改写）→ op 字节偏移在源码编辑区与 live2 恒等，**按序
+        // 重放即得最终态**，无需行级 LCS / 整篇物化比对。单 op = O(log n) Rope 编辑 +
+        // 窗口化高亮增量。实测（debug，6.4MB）：写回本体 1 字符 ~1ms、3 行 ~3ms（旧 diff
+        // 光行级扫描就 ~45ms）；`tab.content` 经 A1 走 SharedString 零拷贝分配（大文档 rope
+        // 源首次 `text_shared` 恰一次 O(n) 物化 ~20ms 属固有下限）；live2 实体销毁（~36ms）
+        // 已由 A2 延迟到下一帧（见上 `retired_live2`），不再计进本点击路径。
+        let ops = l2.update(cx, |ed, _| ed.take_live_ops());
+        if !ops.is_empty() {
+            // 最终态 = live2 文本（A1：`SharedString` 句柄的 O(1) clone 赋给 `tab.content`，
+            // 零拷贝共享同一缓冲；大文档 rope 源首次 `text_shared` 恰一次 O(n) 物化是
+            // `tab.content` 必须为整段字符串的固有下限，已是最小化作一次）。
+            let content = l2.read(cx).text();
+            let src_len;
+            let ok = {
+                let tab = &mut self.tabs[idx];
+                tab.content = content.clone();
+                // 行/字符计数直接取 WyEditor 增量维护的 O(1) 值（订阅已随每次编辑更新；
+                // 不再对 6.4MB 全文做 lines()/chars() 线性扫——那是旧路径 ~90ms 的主来源）。
+                tab.line_count = l2.read(cx).line_count();
+                tab.char_count = l2.read(cx).char_count();
+                // 重放前的源缓冲区长度（O(1)；右栏 md_wy 逐 op 重放的前提 = 起点与源同长，
+                // 长度不等即空壳/失步 → 整篇喂源兜底，见宿主 `md_wy_align_after_ops`）。
+                src_len = tab.editor.read(cx).text().len();
+                // 重放到源码编辑区（`apply_live_replay` 内置「干跑 + O(1) 长度栏」护栏）：
+                // 自检失败 → 缓冲区未被改动，落宿主行级 diff 兜底（content 仍是最终态）。
+                tab.editor
+                    .update(cx, |ed, _| ed.apply_live_replay(&ops, content.as_ref()))
+            };
+            if ok {
+                LIVE_COMMIT_OPS_REPLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                LIVE_COMMIT_OPS_COUNT.fetch_add(ops.len(), std::sync::atomic::Ordering::Relaxed);
+                self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
+                self.status_ok = true;
+                return CommitLiveAlign::Ops { ops, src_len, content };
+            }
+            // 护栏失败 → 落到行级 diff 兜底（源码编辑区未被重放污染，`base` 仍有效）。
+        }
+        // —— 既有行级 diff 写回兜底（护栏失败 / 有脏标记但无日志；行级 hunk 计算与源码
+        // 编辑区应用留在宿主 shell 侧，见 [`CommitLiveAlign::Diff`]）——
+        // 模型侧在此只更新 `tab.content` / `line_count` / `char_count`（与旧实现同一位置
+        // 一并以 live2 最终文本为权威），`base`（源缓冲区）与 `content`（最终态）交宿主。
+        let base = self.tabs[idx].editor.read(cx).text().to_string();
+        let content = l2.read(cx).text();
+        let tab = &mut self.tabs[idx];
+        tab.content = content.clone();
+        let n_lines = content.as_ref().lines().count().max(1);
+        let n_chars = content.as_ref().chars().count();
+        tab.line_count = n_lines;
+        tab.char_count = n_chars;
+        // 与 Ops 臂同款收尾（旧实现 `commit_live` 最后一条即此 status，评审 nits 补回）：
+        // diff 兜底写回后状态栏归位「内容已写回编辑区 / 正常」，防残留「关闭中」旧文案。
+        self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
+        self.status_ok = true;
+        CommitLiveAlign::Diff { base, content }
     }
 }
 

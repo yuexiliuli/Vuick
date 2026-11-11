@@ -1169,7 +1169,7 @@
             (
                 ed.value(),
                 ed.version(),
-                crate::app::preview::LIVE_COMMIT_SKIP_UNCHANGED
+                shell_core::LIVE_COMMIT_SKIP_UNCHANGED
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
         });
@@ -1206,7 +1206,7 @@
             (
                 ed.value(),
                 ed.version(),
-                crate::app::preview::LIVE_COMMIT_SKIP_UNCHANGED
+                shell_core::LIVE_COMMIT_SKIP_UNCHANGED
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
         });
@@ -1265,7 +1265,7 @@
             cx.run_until_parked();
         }
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
-        let wb_before = crate::app::preview::LIVE_COMMIT_WRITEBACK
+        let wb_before = shell_core::LIVE_COMMIT_WRITEBACK
             .load(std::sync::atomic::Ordering::Relaxed);
         // ON：进入 WYSIWYG（live2）。
         cx.update(|window, cx| {
@@ -1319,7 +1319,7 @@
         );
         // 全局写回探针：并行的其它用例（编辑过再切回）也走同一写回路径 → 用 ≥（本用例
         // 至少一次）。「写回真的发生」的确定性判据是上方的内容相等。
-        let wb_after = crate::app::preview::LIVE_COMMIT_WRITEBACK
+        let wb_after = shell_core::LIVE_COMMIT_WRITEBACK
             .load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             wb_after >= wb_before + 1,
@@ -1403,9 +1403,9 @@
             let wy_text_pre = t.md_wy.clone().map(|w| w.read(cx).text().to_string());
             (
                 expected,
-                crate::app::preview::LIVE_COMMIT_OPS_REPLAYED
+                shell_core::LIVE_COMMIT_OPS_REPLAYED
                     .load(std::sync::atomic::Ordering::Relaxed),
-                crate::app::preview::LIVE_COMMIT_OPS_COUNT
+                shell_core::LIVE_COMMIT_OPS_COUNT
                     .load(std::sync::atomic::Ordering::Relaxed),
                 wy_text_pre,
             )
@@ -1436,9 +1436,9 @@
                 let ed = editor.read(cx);
                 (
                     ed.value(),
-                    crate::app::preview::LIVE_COMMIT_OPS_REPLAYED
+                    shell_core::LIVE_COMMIT_OPS_REPLAYED
                         .load(std::sync::atomic::Ordering::Relaxed),
-                    crate::app::preview::LIVE_COMMIT_OPS_COUNT
+                    shell_core::LIVE_COMMIT_OPS_COUNT
                         .load(std::sync::atomic::Ordering::Relaxed),
                     t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
                 )
@@ -1857,6 +1857,18 @@
         assert_eq!(committed, expected, "护栏回退 diff 后仍须与 live2 全文等价");
         assert_eq!(replays, 0, "错位时不得走 op 重放路径（护栏应拦截）");
         assert_eq!(diffs, 1, "错位时应回退走既有行级 diff 兜底（本用例一次）");
+        // 评审 nits：diff 兜底路径必须落下与旧实现一致的收尾 status/status_ok（拆分后
+        // Diff 分支曾漏设 status，状态栏残留旧文案——与「行为零变」矛盾）。防再漂移。
+        let (status, status_ok) = cx.update(|_w, cx| {
+            let m = app.read(cx).model.borrow();
+            (m.status.to_string(), m.status_ok)
+        });
+        assert_eq!(
+            status,
+            "预览编辑（WYSIWYG）：关（内容已写回编辑区）",
+            "diff 兜底写回应把状态栏文案归位为已写回"
+        );
+        assert!(status_ok, "diff 兜底写回应置 status_ok = true");
         let _ = std::fs::remove_file(&md);
     }
 

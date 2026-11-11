@@ -97,17 +97,17 @@ async fn splitter_grip_drag_still_resizes(cx: &mut TestAppContext) {
         cx.run_until_parked();
     }
     assert!(
-        cx.update(|_w, cx| app.read(cx).splitter_hovered),
+        cx.update(|_w, cx| app.read(cx).panes.splitter_hovered),
         "悬停分割条应打开高亮态 splitter_hovered"
     );
     // 按下 → 拖拽开始；右移 100px → 编辑区比例增大。
-    let r0 = cx.update(|_w, cx| app.read(cx).split_ratio);
+    let r0 = cx.update(|_w, cx| app.read(cx).panes.split_ratio);
     cx.simulate_mouse_down(at, MouseButton::Left, Default::default());
     for _ in 0..2 {
         cx.run_until_parked();
     }
     assert!(
-        cx.update(|_w, cx| app.read(cx).split_drag.is_some()),
+        cx.update(|_w, cx| app.read(cx).panes.split_drag.is_some()),
         "按下分割条应开始拖拽"
     );
     let target = gpui::point(at.x + px(100.), at.y);
@@ -115,7 +115,7 @@ async fn splitter_grip_drag_still_resizes(cx: &mut TestAppContext) {
     for _ in 0..3 {
         cx.run_until_parked();
     }
-    let r1 = cx.update(|_w, cx| app.read(cx).split_ratio);
+    let r1 = cx.update(|_w, cx| app.read(cx).panes.split_ratio);
     assert!(
         r1 > r0,
         "右拖 100px 应加大编辑区比例：{r0:.3} → {r1:.3}"
@@ -125,7 +125,7 @@ async fn splitter_grip_drag_still_resizes(cx: &mut TestAppContext) {
         cx.run_until_parked();
     }
     assert!(
-        cx.update(|_w, cx| app.read(cx).split_drag.is_none()),
+        cx.update(|_w, cx| app.read(cx).panes.split_drag.is_none()),
         "松开应结束拖拽"
     );
     let _ = std::fs::remove_file(&md);

@@ -113,10 +113,9 @@ impl EditorApp {
             tab_bar_hscroll: TableScrollState::new(),
             tab_hscroll_delay: SeqAfter::default(),
             notifications: Vec::new(),
-            split_ratio: 0.5,
-            split_drag: None,
-            pending_split_ratio: None,
-            splitter_hovered: false,
+            // 分割条面板状态（SC 下沉 PanesState）：split_ratio=0.5 / split_drag / 
+            // pending_split_ratio / splitter_hovered 四态收敛为一字段，默认值同旧逐字段。
+            panes: PanesState::default(),
             sidebar: sidebar::SidebarChromeState {
                 open: true,
                 view: sidebar::SidebarView::Toc,

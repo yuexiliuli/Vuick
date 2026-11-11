@@ -47,35 +47,19 @@ pub(crate) static LIVE_COMMIT_MD_WY_ASYNC: std::sync::atomic::AtomicUsize =
 pub(crate) static LIVE_ON_MD_WY_REUSE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// 测试探针（`cfg(test)`）：`commit_live` 退出路径计数——整篇写回（有改动）vs
-/// 未改动直接销毁实体（O(1) 跳过写回）。app 层回归测试据此断言「未编辑不写回」。
-#[cfg(test)]
-pub(crate) static LIVE_COMMIT_WRITEBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-pub(crate) static LIVE_COMMIT_SKIP_UNCHANGED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 /// 测试探针（`cfg(test)`）：走**增量 diff 写回**（replaces 非空 → `apply_replaces` /
 /// `preview_apply_edit` 被调用）的 `commit_live` 次数。方案2 后仅「编辑日志重放护栏
 /// 失败 / 有脏标记但无日志」的兜底路径累加。
+/// （`LIVE_COMMIT_WRITEBACK` / `LIVE_COMMIT_SKIP_UNCHANGED` / `LIVE_COMMIT_OPS_REPLAYED`
+/// / `LIVE_COMMIT_OPS_COUNT` 已随 `commit_live` 纯模型部分下沉 `shell_core`。）
 #[cfg(test)]
 pub(crate) static LIVE_COMMIT_DIFF_APPLIED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// 测试探针（`cfg(test)`）：增量写回实际应用的替换 hunk 累计数（>0 即非整篇替换）。
-/// 仅「护栏/无日志」兜底走 diff 时累加——主路径已被编辑日志重放（[`LIVE_COMMIT_OPS_*`]）
+/// 仅「护栏/无日志」兜底走 diff 时累加——主路径已被编辑日志重放（`shell_core::LIVE_COMMIT_OPS_*`）
 /// 取代。
 #[cfg(test)]
 pub(crate) static LIVE_COMMIT_DIFF_HUNKS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-/// 测试探针（`cfg(test)`）：走**编辑日志重放**（方案2，`apply_live_replay` 主路径）写回
-/// 的 `commit_live` 次数（op 非空且护栏自检通过）。
-#[cfg(test)]
-pub(crate) static LIVE_COMMIT_OPS_REPLAYED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-/// 测试探针（`cfg(test)`）：编辑日志重放实际应用的 op 累计数（= 该 live 会话缴存的
-/// 内容变更条数；引用计数断言「单字符恰 1 条」「大粘贴单大 op」）。
-#[cfg(test)]
-pub(crate) static LIVE_COMMIT_OPS_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 impl EditorApp {
@@ -673,162 +657,62 @@ impl EditorApp {
 
     /// 退出预览编辑：把 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览；live2 实体**延迟**
     /// 到下一帧渲染后销毁（A：实体级联 Drop ~36ms 移出点击同步路径）。
+    ///
+    /// SC（2026-11）：`commit_live` 的**纯模型 + 实体**部分已下沉 `AppModel::commit_live`
+    /// （shell_core），本方法保留必须留在宿主侧的视图收尾并按返回值分派：`on_next_frame`
+    /// 清 `retired_live2`、右栏 `md_wy` ops/diff 对齐、以及行级 diff 兜底的 hunk 计算
+    /// （`line_diff` 依赖 `text_open`，留在 shell，shell_core 不新增依赖）。借用范围 /
+    /// 事件顺序 / 返回值语义与旧单一实现逐路径核对一致。
     pub(super) fn commit_live(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // SC-3：把「读取 + 拆 live2」收进一个礼盒作用域（tab 可变借与同 guard 的
-        // `retired_live2` 写入互斥，E0499）→ 出作用域后模型可再借。
-        let (l2, l2_dirty) = {
-            let mut model = self.model.borrow_mut();
-            let Some(tab) = model.tabs.get_mut(idx) else { return };
-            // 本 live 会话是否有内容编辑（读后再清，供下方「未改动跳过写回」判定）。
-            let l2_dirty = tab.live2_dirty;
-            tab.live2_dirty = false;
-            tab.live_edit = false;
-            tab._live2_sub = None;
-            let Some(l2) = tab.live2.take() else { return };
-            (l2, l2_dirty)
-        };
-        // A2：**延迟回收**。live2 实体（WyEditor 大对象：Doc 的 rope/行索引/派生缓存 +
-        // 整`Rc` 级联）的销毁占切回 ~36ms，不能丢在点击事件路径里同步 Drop。先把实体
-        // 暂存到 app 侧 `retired_live2`（clone 是 O(1) 句柄；本函数内 `l2` 继续照常读写），
-        // 再用 `cx.on_next_frame`（gpui 保证「下一帧渲染完之后」触发）清空队列放实体
-        // 出作用域 Drop。**渲染引用安全性**：此处已 `tab.live2 = None`，切回后的任何
-        // render 都不再引用旧实体；`on_next_frame` 又晚于「下一帧已渲染/呈现」，故延迟
-        // Drop 时既无渲染在读它、也不占用展示切回结果的那一帧的 CPU。本函数所有提前
-        // return 路径共用此延迟（未改动 O(1) 跳过 / 加载中退出同样受益）。
-        self.model.borrow_mut().retired_live2.push(l2.clone());
-        cx.on_next_frame(window, |this, _window, _cx| {
-            this.model.borrow_mut().retired_live2.clear();
-        });
-        // 视图从 WYSIWYG 换回源码编辑区：先清空两端编辑器可能残留的鼠标拖选状态
-        // （须在任何提前 return 之前）。点击「预览编辑测试」菜单项时 GPUI 把 MouseDown
-        // 按 `hitbox.is_hovered` 漏进编辑区置 `dragging=true`（不按 z-order 裁掉被菜单
-        // 遮挡的区间）；对应的 MouseUp 又被菜单项 `activate` 的 `stop_propagation`
-        // 截断派发、到不了编辑器 `on_mouse_up` → `dragging` 残留。切回后仅移动鼠标
-        // 就会从 anchor=0（`set_text` 收拢到行首）自动扩选到指针处。宿主在此「切回/
-        // 切离」生命周期边界触发编辑器的统一拖选复位钩子（`cancel_mouse_drag`），
-        // 并覆盖提前 return 路径（大文档未加载完不走 `set_text`）：WYSIWYG 实体
-        // （随后即销毁）与源码编辑区（转前台显示）都不留拖选态。
-        l2.update(cx, |ed, _| ed.end_selection());
-        self.model.borrow().tabs[idx]
-            .editor
-            .update(cx, |ed, _| ed.cancel_mouse_drag());
-        // 大文档后台解析在途就退出：live2 尚无内容，不能写回（否则源码编辑区被清空）。
-        // 源码编辑区仍是权威源，直接丢弃空壳实体即可。
-        if !l2.read(cx).is_loaded() {
-            self.model.borrow_mut().status = SharedString::from("预览编辑测试：关（加载中退出，未写回编辑区）");
-            self.model.borrow_mut().status_ok = false;
-            return;
-        }
-        // 未改动（live 期间无任何内容编辑，`live2_dirty == false`）：live2 文本恒等于
-        // 打开瞬间的源码 COW 快照（toggle ON 只从该快照建实体，无其它写入路径），
-        // 整篇物化 + `set_text` 写回 + 喂右栏纯属 O(n) 浪费（大文档级联重排卡 7-8s）——
-        // 直接销毁实体切回（O(1)），源码编辑区仍是原内容、可继续编辑。
-        if !l2_dirty {
-            #[cfg(test)]
-            LIVE_COMMIT_SKIP_UNCHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.model.borrow_mut().status = SharedString::from("预览编辑测试：关（未改动，无需写回）");
-            self.model.borrow_mut().status_ok = true;
-            return;
-        }
-        #[cfg(test)]
-        LIVE_COMMIT_WRITEBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // —— 编辑日志重放（M：方案2，取代行级 diff 的主路径）——
-        // live2 在 live 会话期把每笔内容变更（`replace_range` / 撤销 / 重做统一缴存）记成
-        // `(字节区间, 新文本)` op 日志：两步起点同源（toggle ON 的源码 COW Rope 快照、
-        // live 期间源码编辑区不被改写）→ op 字节偏移在源码编辑区与 live2 恒等，**按序
-        // 重放即得最终态**，无需行级 LCS / 整篇物化比对。单 op = O(log n) Rope 编辑 +
-        // 窗口化高亮增量。实测（debug，6.4MB）：写回本体 1 字符 ~1ms、3 行 ~3ms（旧 diff
-        // 光行级扫描就 ~45ms）；`tab.content` 经 A1 走 SharedString 零拷贝分配（大文档 rope
-        // 源首次 `text_shared` 恰一次 O(n) 物化 ~20ms 属固有下限）；live2 实体销毁（~36ms）
-        // 已由 A2 延迟到下一帧（见上 `retired_live2`），不再计进本点击路径。
-        let ops = l2.update(cx, |ed, _| ed.take_live_ops());
-        if !ops.is_empty() {
-            // 最终态 = live2 文本（A1：`SharedString` 句柄的 O(1) clone 赋给 `tab.content`，
-            // 零拷贝共享同一缓冲；大文档 rope 源首次 `text_shared` 恰一次 O(n) 物化是
-            // `tab.content` 必须为整段字符串的固有下限，已是最小化作一次）。
-            let content = l2.read(cx).text();
-            let src_len;
-            let ok = {
-                let mut model = self.model.borrow_mut();
-                let tab = &mut model.tabs[idx];
-                tab.content = content.clone();
-                // 行/字符计数直接取 WyEditor 增量维护的 O(1) 值（订阅已随每次编辑更新；
-                // 不再对 6.4MB 全文做 lines()/chars() 线性扫——那是旧路径 ~90ms 的主来源）。
-                tab.line_count = l2.read(cx).line_count();
-                tab.char_count = l2.read(cx).char_count();
-                // 重放前的源缓冲区长度（O(1)；右栏 md_wy 逐 op 重放的前提 = 起点与源同长，
-                // 长度不等即空壳/失步 → 整篇喂源兜底，见 `md_wy_align_after_ops`）。
-                src_len = tab.editor.read(cx).text().len();
-                // 重放到源码编辑区（`apply_live_replay` 内置「干跑 + O(1) 长度栏」护栏）：
-                // 自检失败 → 缓冲区未被改动，落下方既有 diff 兜底（content 仍是最终态）。
-                tab.editor.update(cx, |ed, _| ed.apply_live_replay(&ops, content.as_ref()))
-            };
-            if ok {
-                #[cfg(test)]
-                {
-                    LIVE_COMMIT_OPS_REPLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    LIVE_COMMIT_OPS_COUNT
-                        .fetch_add(ops.len(), std::sync::atomic::Ordering::Relaxed);
-                }
-                // A2/A3 + B3：右栏只读预览 `md_wy`（若存在）随写回对齐。小跨度维持增量
-                // `preview_apply_edit`（1-3ms，不回归）；大跨度/失步改整篇喂源——大内容
-                // **后台异步装配**（`md_wy_feed_full`），同步路径不再 O(n) `Doc::open`。
+        let align = self.model.borrow_mut().commit_live(idx, cx);
+        // 仅在确实取到 live2（已暂存 `retired_live2`）的路径调度下一帧清空；`NoLive2` 无
+        // 暂存、不调度（与旧实现「取不到 live2 提前 return 不注册 on_next_frame」一致）。
+        let mut schedule_retire_clear = false;
+        match align {
+            CommitLiveAlign::NoLive2 => {}
+            CommitLiveAlign::NoAlign => schedule_retire_clear = true,
+            // A2/A3 + B3：右栏只读预览 `md_wy`（若存在）随写回对齐。小跨度维持增量
+            // `preview_apply_edit`（1-3ms，不回归）；大跨度/失步改整篇喂源——大内容
+            // **后台异步装配**（`md_wy_feed_full`），同步路径不再 O(n) `Doc::open`。
+            CommitLiveAlign::Ops {
+                ops,
+                src_len,
+                content,
+            } => {
+                schedule_retire_clear = true;
                 self.md_wy_align_after_ops(idx, &ops, src_len, content, cx);
-                self.model.borrow_mut().status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
-                self.model.borrow_mut().status_ok = true;
-                return;
             }
-            // 护栏失败 → 落到既有行级 diff 兜底（源码编辑区未被重放污染，`base` 仍有效）。
-        }
-        // —— 既有行级 diff 写回（护栏失败 / 有脏标记但无日志时的兜底，见 src/app/diff.rs）——
-        // 与「toggle ON 的源快照」（= 当前源码编辑区缓冲区，live 期间无其它写入路径）
-        // 做**行级 diff**，产出少量（字节区间, 文本）替换 → 应用到：
-        //   1) 源码编辑区缓冲区：`CodeEditor::apply_replaces`（每处 O(log n) Rope 编辑 +
-        //      窗口化高亮局部重解析，**不整篇重建**——区别于旧 `set_text` 的 reset_document
-        //      级联，大文档 debug ~11s）；
-        //   2) 右栏只读预览 `md_wy`：同 diff 逐 hunk 用 `preview_apply_edit` 增量重放
-        //      （与 A3 逐键桥同一无门控增量管线；大跨度改动按 `md_wy_align_after_diff`
-        //      改整篇喂源——大内容后台异步装配）。
-        // 典型小改动（几字符/几行）切回落到数百 ms；大范围改动也只重排受影响块，不退化
-        // 成整篇 set_text 级联。基线文本与 live2 同源（全 LF 规范化），无需再处理 CRLF。
-        let base;
-        let content;
-        let replaces;
-        {
-            let mut model = self.model.borrow_mut();
-            let tab = &mut model.tabs[idx];
-            base = tab.editor.read(cx).text().to_string();
-            // A1：`l2.text()` 直接返回 `SharedString`（`Doc::text_shared` 的 O(1) 句柄），
-            // 零拷贝赋给 `tab.content` —— 不再 `.to_string()` 又 `SharedString::from` 绕一圈
-            // （省掉那份 6.4MB 副本与分配）。`content` 与 live2 的 rope 同源同值；SharedString
-            // 不可变（仅 `Deref<Target=str>`），源码编辑区后续任何写入都会新建缓冲，不会
-            // 改到被 `tab.content` 持有的这份 → 保存/脏标整篇读取安全。
-            content = l2.read(cx).text();
-            tab.content = content.clone();
-            let n_lines = content.as_ref().lines().count().max(1);
-            let n_chars = content.as_ref().chars().count();
-            tab.line_count = n_lines;
-            tab.char_count = n_chars;
-            replaces = text_open::line_diff(base.as_str(), content.as_ref());
-            if !replaces.is_empty() {
-                tab.editor.update(cx, |ed, _| ed.apply_replaces(&replaces));
+            // 既有行级 diff 写回兜底（护栏失败 / 有脏标记但无日志时）：模型侧字段
+            // （`tab.content` / `line_count` / `char_count`）已由 `AppModel::commit_live`
+            // 更新；此处补「hunk 计算 + 源码编辑区应用 + 右栏 md_wy 对齐」——与旧实现
+            // 同一 diff（同源基线，live 期间源码编辑区不被改写）逐 hunk 对齐。
+            CommitLiveAlign::Diff { base, content } => {
+                schedule_retire_clear = true;
+                let replaces = text_open::line_diff(base.as_str(), content.as_ref());
+                if !replaces.is_empty() {
+                    self.model.borrow().tabs[idx]
+                        .editor
+                        .update(cx, |ed, _| ed.apply_replaces(&replaces));
+                }
+                #[cfg(test)]
+                LIVE_COMMIT_DIFF_HUNKS.fetch_add(replaces.len(), std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                if !replaces.is_empty() {
+                    LIVE_COMMIT_DIFF_APPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                // A2/A3 + B3：右栏 WyEditor 预览（若存在）随写回对齐。优先与源码编辑区同
+                // diff 逐 hunk 增量重放（后→前；`preview_apply_edit` 绕过只读门控、不写撤销
+                // 栈、增量块重排，典型小改动几十 ms）。**大跨度 diff（被替换基线字节总量
+                // 超阈值）改整篇喂源**：大内容整篇喂源改后台异步装配（`md_wy_feed_full`）——
+                // 同步路径不再 O(n)。md_wy 内容 ≠ 源快照（含空壳未就绪）也整篇兜底。
+                self.md_wy_align_after_diff(idx, &replaces, base.as_str(), content, cx);
             }
         }
-        #[cfg(test)]
-        LIVE_COMMIT_DIFF_HUNKS.fetch_add(replaces.len(), std::sync::atomic::Ordering::Relaxed);
-        #[cfg(test)]
-        if !replaces.is_empty() {
-            LIVE_COMMIT_DIFF_APPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if schedule_retire_clear {
+            cx.on_next_frame(window, |this, _window, _cx| {
+                this.model.borrow_mut().retired_live2.clear();
+            });
         }
-        // A2/A3 + B3：右栏 WyEditor 预览（若存在）随写回对齐。优先与源码编辑区同 diff
-        // 逐 hunk 增量重放（后→前；`preview_apply_edit` 绕过只读门控、不写撤销栈、增量
-        // 块重排，典型小改动几十 ms）。**大跨度 diff（被替换基线字节总量超阈值）改整篇
-        // 喂源**：WYSIWYG 对深部大结构改动的「增量」会把最贵的整篇重排推迟到切回后第一
-        // 帧，实测 6.4MB 大段替换更慢；B3 起大内容整篇喂源改后台异步装配（`md_wy_feed_full`）
-        // ——同步路径不再 O(n)。md_wy 内容 ≠ 源快照（含空壳未就绪）也整篇兜底。
-        self.md_wy_align_after_diff(idx, &replaces, base.as_str(), content, cx);
-        self.model.borrow_mut().status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
-        self.model.borrow_mut().status_ok = true;
     }
 
     // —— B3：右栏 `md_wy` 整篇喂源 / 后台异步装配 ——
