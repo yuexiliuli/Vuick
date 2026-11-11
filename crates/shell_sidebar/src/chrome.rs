@@ -7,7 +7,7 @@
 //! 与旧 `impl EditorApp` 的对应关系（逐行迁移，行为零变）：
 //!
 //! - `render_sidebar` → [`Sidebar::render_sidebar_shell`]（`panel` 由宿主预构建传入：
-//!   Toc 走本 crate `toc`、Search/Files 仍留 shell）。
+//!   Toc/Files 走本 crate `toc`/`files`、Search 走本 crate `search`）。
 //! - `render_sidebar_activity_bar` / `render_sidebar_resize_handle` → 同名私有方法。
 //! - `toggle_sidebar_view` / `update_sidebar_resize` / `end_sidebar_resize` → 本实体方法
 //!   （`update/end` 由宿主外层 `on_mouse_move/up` 持 `&mut SidebarChromeState` 调本实体，
@@ -29,6 +29,7 @@ use ui::theme::ChromeColors;
 use crate::host::SidebarHost;
 use crate::prompt::FileTreePromptHost;
 use crate::state::{SidebarChromeState, SidebarView};
+use ui::input::InputState;
 
 /// 侧边栏域实体：宿主 `sidebar_view: Entity<Sidebar<H>>` 持有，承载外壳 / 目录 / 文件树的
 /// 渲染与事件（`Context<Self>` 内 `cx.listener` 绑定本实体）。不持 `SidebarChromeState`
@@ -41,6 +42,12 @@ pub struct Sidebar<H: SidebarHost + FileTreePromptHost> {
     pub(crate) model: Rc<RefCell<AppModel>>,
     /// 宿主实体弱引用：事件回调 → 宿主服务（改侧栏状态 / notify / persist）。
     host: WeakEntity<H>,
+    /// 侧边栏「搜索」关键字输入控件（**实体自有态**；宿主仅留测试兼容 `search_state(cx)`
+    /// 读取器）。输入事件订阅在宿主（`init.rs`）转发到 `search::schedule_search_debounce`，
+    /// 渲染期实体直读本字段（同文件树过滤输入宿主持有、本实体却只读渲染的分工，搜索侧
+    /// 把输入实体也收进域内）。`#[doc(hidden)] pub`：`search.rs` 拆分模块需直读。
+    #[doc(hidden)]
+    pub search_input: Entity<InputState>,
     /// 文件树右键上下文菜单：弹出位置（窗口坐标）。实体自有（`files_ops.rs` 读写）；
     /// 宿主仅镜像 `menu_entity` 供测试断言。
     pub(crate) file_tree_menu_pos: Option<Point<Pixels>>,
@@ -56,11 +63,16 @@ pub struct Sidebar<H: SidebarHost + FileTreePromptHost> {
 }
 
 impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
-    /// 构造：共享模型 + 宿主弱引用。
-    pub fn new(model: Rc<RefCell<AppModel>>, host: WeakEntity<H>) -> Self {
+    /// 构造：共享模型 + 宿主弱引用 + 搜索输入实体（宿主创建后传入，实体持有为自有态）。
+    pub fn new(
+        model: Rc<RefCell<AppModel>>,
+        host: WeakEntity<H>,
+        search_input: Entity<InputState>,
+    ) -> Self {
         Self {
             model,
             host,
+            search_input,
             file_tree_menu_pos: None,
             file_tree_menu_entity: None,
             file_tree_menu_sub: None,
@@ -69,9 +81,15 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         }
     }
 
-    /// 宿主弱引用（活动栏/手柄/toc 主题回调需要；`pub(crate)` 供 `toc.rs`）。
+    /// 宿主弱点（活动栏/手柄/toc 主题回调需要；`pub(crate)` 供 `toc.rs`）。
     pub(crate) fn host_weak(&self) -> WeakEntity<H> {
         self.host.clone()
+    }
+
+    /// 搜索输入实体句柄（宿主 `schedule_search_debounce` forwarder / 测试 `search_state(cx)`
+    /// 读取器经它取输入实体；实体对宿主只外借只读句柄，状态本体仍在实体自有字段）。
+    pub fn search_input_handle(&self) -> Entity<InputState> {
+        self.search_input.clone()
     }
 
     /// 当前明暗模式对应的外壳配色（`ui::theme::ChromeColors` 单一来源，与宿主
@@ -142,8 +160,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     }
 
     /// 侧边栏整体：左侧为常驻竖列切换栏（活动栏），右侧为可展开的内容面板
-    /// （目录/搜索/文件树——`panel` 由宿主预构建传入，Toc 走本 crate `toc`、
-    /// Search/Files 仍留 shell）。面板收起时仅剩 46px 活动栏，正文区随之占满。
+    /// （目录/搜索/文件树——`panel` 由宿主预构建传入，Toc/Files 走本 crate `toc`/`files`、
+    /// Search 走本 crate `search`）。面板收起时仅剩 46px 活动栏，正文区随之占满。
     ///
     /// 无缝 mica 直连外壳：整块 = 左侧活动栏 + 右侧面板（面板收起时仅活动栏），
     /// 底色用半透明 mica（`mica_bar_bg`）、无圆角、无四周边框，右缘一条发丝线

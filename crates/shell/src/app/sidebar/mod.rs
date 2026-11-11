@@ -1,62 +1,85 @@
 //! 侧边栏（2026-11-11 起为 **facade 模块**）。
 //!
-//! 本模块原承担侧栏「类型 / 状态 / chrome 外壳渲染 / toc 目录视图 / 文件树渲染与操作」；
-//! 类型、外壳渲染、目录视图、文件树渲染与操作（`files.rs` / `files_ops.rs`）已整迁
-//! `crates/shell_sidebar`（纯结构移动，行为零变），此处保留：
+//! 本模块原承担侧栏「类型 / 状态 / chrome 外壳渲染 / toc 目录视图 / 文件树渲染与操作 /
+//! 搜索」；类型、外壳渲染、目录视图、文件树渲染与操作（`files.rs` / `files_ops.rs`）与
+//! 搜索（`search.rs`）已整迁 `crates/shell_sidebar`（纯结构移动，行为零变），此处保留：
 //!
 //! - 对 `shell_sidebar` 的类型/常量/纯函数 **`pub use` 重导出**，维持既有
-//!   `sidebar::SidebarChromeState` / `SidebarView` / `FileTreeState` 等路径与沙盒
-//!   （`search.rs` 下一阶段随迁，`app::tests` 引用不变）。
-//! - 侧栏搜索**纯扫描层**（`shell_scan` / `shell_core::SearchScopeTab`）重导出（不变）。
+//!   `sidebar::SidebarChromeState` / `SidebarView` / `FileTreeState` 等路径（`app::tests`
+//!   引用不变）。
+//! - 侧边栏搜索**纯扫描层**（`shell_scan` / `shell_core::SearchScopeTab`）重导出（不变，
+//!   测试经 `crate::app::sidebar::FolderSearchScan` / `SearchScopeTab` 引用）。
 //! - 宿主侧**接线**（`impl EditorApp`）：
 //!   [`EditorApp::render_body_sidebar`]（右列 + 侧栏实体组装整行）与 [`EditorApp::render_body_card`]
 //!   （正文无缝方块）——两者牵扯选项卡栏 / 编辑区，宿主编排留在 shell；
 //!   文件树视图渲染 / 展开折叠 / 过滤防抖 / 后台扫描 / 右键菜单与输入弹层 overlay 的
 //!   **薄转发**（逻辑在域实体 `Sidebar<H>`，宿主侧不能在自身已持 `&mut` 的上下文再入域
 //!   `host` 服务 → 转发器在 `sidebar_view.update/read` 返回后由宿主自身 notify/镜像）；
-//!   `toggle_sidebar_view` / `toggle_sidebar_toc_collapse` 薄转发（测试入口，逻辑在域实体）。
+//!   `toggle_sidebar_view` / `toggle_sidebar_toc_collapse` 薄转发（测试入口，逻辑在域实体）；
+//!   搜索的 `schedule_search_debounce`（输入订阅转发）与 `effective_search_scope`（范围
+//!   纯逻辑）亦薄转发，`search_state(cx)` 为测试兼容输入实体读取器（实体自有态）。
 //!
 //! `EditorApp` 的侧栏状态**仍是普通字段 `sidebar: SidebarChromeState`**（测试字段读写
 //! 不变量），渲染/事件的实体侧由 `sidebar_view: Entity<shell_sidebar::Sidebar<EditorApp>>`
 //! 承接（见 [`crate::app::mod`] 字段注释）——其中文件树**右键菜单/输入弹层暂时句柄**
-//! 也随迁到实体（实体自有 pos/menu/sub/prompt），本宿主只留 `file_tree_menu_entity` /
-//! `file_tree_prompt` **测试兼容镜像**字段（`app::tests` 直接字段读取），生产渲染读实体。
-
-use std::rc::Rc;
+//! 与搜索**输入实体**也随迁到实体（实体自有 pos/menu/sub/prompt / search_input），本宿主
+//! 只留 `file_tree_menu_entity` / `file_tree_prompt` **测试兼容镜像**字段（`app::tests`
+//! 直接字段读取），生产渲染读实体。
 
 use super::file_tree_prompt::FileTreePromptKind;
 use super::*;
-use config::limits::{FOLDER_SEARCH_RESULT_CAP, SEARCH_RESULT_CAP};
-use config::user::UserPrefs;
-use gpui::{HighlightStyle, StyledText};
+use gpui::Entity;
 use shell_sidebar::SidebarHost;
-use ui::input::Input;
-use ui::motion::{hover_bg_fade, hover_spring};
+use ui::input::InputState;
 
-/// 侧边栏搜索**纯扫描层**（`shell_scan`）重导出：`search.rs` / `app` 字段类型 /
-/// `app::tests` 沿用既有 `sidebar::…` 与 `use super::*` 路径，纯结构移动不改调用面。
-/// （`find_ci` / `FolderFileHit` 仅测试或 crate 内部按名引用，不在此重导出，测试直连
-/// `shell_scan`。）
-pub(super) use shell_scan::{
-    contains_ci, folder_scan_collect, highlight_ranges, scan_line_hits, FolderScanUpdate,
-    FolderSearchScan, SearchLineHit, SidebarSearchScan,
-};
+/// 侧边栏搜索**纯扫描层**（`shell_scan`）重导出：`app::tests` 沿用既有 `sidebar::…` 路径
+/// 泵查文件夹扫描结果。仅测试（`#[cfg(test)]` 的 `app::tests`）引用 → 非测试 lib 构建
+/// 视为未用，故 `#[allow(unused_imports)]`（与「测试可见性」入口同口径）。
+/// （`find_ci` / `FolderFileHit` / `SearchLineHit` / `SidebarSearchScan` 等仅测试或 crate
+/// 内部直连 `shell_scan`，不在此重导出。）
+#[allow(unused_imports)]
+pub(super) use shell_scan::FolderSearchScan;
 // SC-3：搜索**范围**枚举随 `EditorApp::search_scope` 迁入 shell_core（`AppModel` 字段
-// 类型需跨 crate 命名），此处重导出维持 `sidebar::SearchScopeTab` / 子模块（`use super::*`）
-// 与测试（`crate::app::sidebar::SearchScopeTab`）的既有路径。
+// 类型需跨 crate 命名），此处重导出维持 `sidebar::SearchScopeTab` 与测试
+// （`crate::app::sidebar::SearchScopeTab`）的既有路径。
 pub(super) use shell_core::SearchScopeTab;
 
-// 侧栏域 crate 重导出（shell_sidebar）：状态 / 类型 / 常量 / 纯函数。`pub` 者被
+// 侧边栏域 crate 重导出（shell_sidebar）：状态 / 类型 / 常量 / 纯函数。`pub` 者被
 // `crate::app` 二次 `pub use`（`shell::app::SidebarView` 等经 §8.6 外提链）；
-// `pub(super)` 者供 shell 仍留的 `search.rs` 子模块（`use super::*`）使用。
+// `pub(super)` 者供 shell 内模块与测试（`app::tests`）使用。
 pub use shell_sidebar::{
     FileTreeState, SidebarChromeState, SidebarView, TreeEntry,
 };
-pub(super) use shell_sidebar::{normalize_search_query, SEARCH_DEBOUNCE_MS};
-
-mod search;
 
 impl EditorApp {
+    /// 侧边栏「搜索」输入实体句柄（**测试兼容读取器**）：输入实体为域实体自有态
+    /// （`shell_sidebar::Sidebar::search_input`），宿主不再持字段；测试沿用
+    /// `app.read(cx).search_state(cx)` 取得同一实体做 `set_value` / 值断言。
+    /// `#[doc(hidden)] pub`：`app::tests` 与 `tests/pdf.rs` 直接调用（§8.6 兼容面）。
+    #[doc(hidden)]
+    pub fn search_state(&self, cx: &gpui::App) -> Entity<InputState> {
+        self.sidebar_view.read(cx).search_input_handle()
+    }
+
+    /// 当前生效的搜索范围（测试入口与域渲染共用同一纯逻辑）：`search_scope_manual`
+    /// / `search_scope` 在共享模型，`files.root` 在 `self.sidebar`——经
+    /// `shell_sidebar::state::effective_search_scope` 纯函数求值（单一事实源，防双写漂移）。
+    /// 仅 `app::tests` 程序化断言用，故 `#[allow(dead_code)]`（与既有「测试可见性」
+    /// 入口同口径）。
+    #[allow(dead_code)]
+    pub(crate) fn effective_search_scope(&self) -> SearchScopeTab {
+        shell_sidebar::state::effective_search_scope(&self.model.borrow(), &self.sidebar)
+    }
+
+    /// 搜索输入防抖调度（`init.rs` 输入框订阅转发到本方法）→ 实体侧
+    /// `schedule_search_debounce`（模型待提交词 + SeqAfter 防抖）；notify 在本宿主
+    /// 上下文（同 `schedule_files_filter_debounce` 注释）。
+    pub(crate) fn schedule_search_debounce(&mut self, value: String, cx: &mut Context<Self>) {
+        self.sidebar_view
+            .update(cx, |v, cx| v.schedule_search_debounce(value, cx));
+        cx.notify();
+    }
+
     /// 当前激活选项卡若为 PDF：返回该 PDF 路径的书签列表（宿主渲染期预取，供侧栏目录实体
     /// TOC 渲染——域渲染期禁再入宿主，数据以参数传入）。
     fn active_pdf_bookmarks(&self, cx: &gpui::App) -> Option<Vec<shell_core::PdfBookmark>> {
@@ -251,8 +274,8 @@ impl EditorApp {
         if !self.sidebar.open {
             return right_col.into_any_element();
         }
-        // 面板内容：目录/文件树 → 域实体（`shell_sidebar` 的 toc/files；书签与过滤输入框
-        // 等宿主预取以参数传入）；搜索 → 仍留 shell（search.rs）。顺序=「先构建内容
+        // 面板内容：目录/文件树/搜索 → 域实体（`shell_sidebar` 的 toc/files/search；书签、
+        // 过滤输入框等宿主预取以参数传入，搜索输入实体为域自有）。顺序=「先构建内容
         // （目录会自适应更新 sidebar.width），再取宽」——实体外壳渲染读更新后的宽度。
         let content: Option<gpui::AnyElement> = if self.sidebar.panel_open {
             Some(match self.sidebar.view {
@@ -263,7 +286,12 @@ impl EditorApp {
                         v.render_sidebar_toc(sb, bookmarks, window, cx)
                     })
                 }
-                SidebarView::Search => self.render_sidebar_search(window, cx),
+                SidebarView::Search => {
+                    let sb = &mut self.sidebar;
+                    self.sidebar_view.update(cx, |v, cx| {
+                        v.render_sidebar_search(sb, window, cx)
+                    })
+                }
                 SidebarView::Files => {
                     let filter_state = self.files_filter_state.clone();
                     let sb = &mut self.sidebar;

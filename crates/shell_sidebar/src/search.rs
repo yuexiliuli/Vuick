@@ -1,23 +1,68 @@
-//! 侧边栏「跨文件搜索」子模块：关键词输入 + 范围切换（当前文件 / 整个文件夹）+
-//! 结果渲染与防抖扫描（含文件夹后台分块扫描、PDF 全文检索接线与命中跳转）。
+//! 侧边栏「跨文件搜索」实体子模块（2026-11 自 shell 的 `app/sidebar/search.rs` 迁入）。
+//!
+//! 关键词输入 + 范围切换（当前文件 / 整个文件夹）+ 结果渲染与防抖扫描（含文件夹后台
+//! 分块扫描、PDF 全文检索接线与命中跳转）。与 chrome / toc / files / files_ops 同构：
+//! 渲染期状态（`SidebarChromeState` / 共享 `AppModel`）以参数 / 共享模型入读，事件回调
+//! （范围 tab 点击 / 命中行打开）经 [`crate::host::SidebarHost`] 反调宿主（打开/激活 /
+//! notify），扫描与防抖均为**实体弱句柄自更新**（写共享模型 + 自 notify），不回流宿主。
+//!
+//! 与旧 `impl EditorApp` 的对应关系（逐行迁移，行为零变）：
+//!
+//! - `render_sidebar_search` / `render_search_scope_tabs` / `render_sidebar_search_results` /
+//!   `render_sidebar_folder_search` / `sidebar_folder_*` / `sidebar_search_*` /
+//!   `render_sidebar_pdf_search` / `sidebar_pdf_*` → 同名实体方法（`self.sidebar` →
+//!   `sb` 入参，`self.search_state` → `self.search_input`）。
+//! - `effective_search_scope` → [`crate::state::effective_search_scope`] 纯函数（单一事实源，
+//!   宿主 facade 与域渲染共用）。
+//! - `sidebar_search_scan` / `folder_search_scan` / `start_folder_scan` → 实体方法，扫描缓存
+//!   与防抖状态经共享模型读写（`search_committed` / `search_pending` / `search_scan` /
+//!   `folder_search` / `folder_search_gen` / `search_debounce`），宿主只保留模型失效埋点。
+//! - `folder_search_open_hit` → 实体方法；「打开/激活」经既有 [`SidebarHost::sidebar_open_path_or_activate`]，
+//!   「文件名命中 → 激活既有选项卡」经新增 [`SidebarHost::sidebar_activate_tab`]。
 
-use super::*;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-impl EditorApp {
+use gpui::{
+    div, px, AnimationExt, App, Context, CursorStyle, HighlightStyle, InteractiveElement,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledText,
+    VisualContext, Window,
+};
+use shell_core::{MediaReader, SearchScopeTab};
+use shell_scan::{
+    contains_ci, folder_scan_collect, highlight_ranges, scan_line_hits, FolderScanUpdate,
+    FolderSearchScan, SearchLineHit, SidebarSearchScan,
+};
+use ui::icon::{Icon, IconName};
+use ui::input::Input;
+use ui::motion::{hover_bg_fade, hover_spring};
+
+use crate::chrome::Sidebar;
+use crate::host::SidebarHost;
+use crate::prompt::FileTreePromptHost;
+use crate::state::{
+    effective_search_scope, normalize_search_query, SidebarChromeState, SEARCH_DEBOUNCE_MS,
+};
+
+impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 「搜索」视图：关键词输入框 + 范围切换（当前文件 / 整个文件夹）+ 匹配结果。
     /// 「当前文件」= 当前文档内容 + 跨打开文件文件名匹配（旧语义）；
     /// 「整个文件夹」= 递归扫已打开文件夹内文本文件内容（后台分块，按文件分组展示）。
-    pub(super) fn render_sidebar_search(
+    /// 搜索输入实体为本实体自有（`self.search_input`），渲染直读；`sb` 提供
+    /// `files.root`（范围判断）与 `search_vscroll`（结果滚动容器）。
+    pub fn render_sidebar_search(
         &mut self,
+        sb: &mut SidebarChromeState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let muted = self.text_minor();
         let query = self.model.borrow().search_committed.clone();
-        let search = self.search_state.clone();
+        let search = self.search_input.clone();
         // Fluent 文本框：整圈细边框 + 内缩边距（背景随 chrome 保持透明）；
         // 聚焦时边框点亮为强调色。
-        let focused = window.focused(cx) == Some(self.search_state.read(cx).focus_handle(cx));
+        let focused = window.focused(cx) == Some(self.search_input.read(cx).focus_handle(cx));
         let border_color: gpui::Hsla = if focused {
             ui::theme::Theme::global(cx).colors.focus_ring.into()
         } else {
@@ -38,9 +83,9 @@ impl EditorApp {
             .child(Input::new(&search));
 
         // 扫描用「防抖后已提交」的查询词（已归一化 trim+小写）；输入框实时文本在
-        // `search_state` —— 连续输入时这里沿用上次提交词的结果，防抖期满才重扫。
+        // `search_input` —— 连续输入时这里沿用上次提交词的结果，防抖期满才重扫。
         let q = query;
-        let scope = self.effective_search_scope();
+        let scope = effective_search_scope(&self.model.borrow(), sb);
         let hint_text = match scope {
             SearchScopeTab::CurrentFile => {
                 "输入关键字，搜索当前文件内容；文件名匹配所有打开文件"
@@ -64,9 +109,9 @@ impl EditorApp {
         } else {
             match scope {
                 SearchScopeTab::CurrentFile => {
-                    self.render_sidebar_search_results(window, &q, cx)
+                    self.render_sidebar_search_results(sb, window, &q, cx)
                 }
-                SearchScopeTab::Folder => self.render_sidebar_folder_search(window, &q, cx),
+                SearchScopeTab::Folder => self.render_sidebar_folder_search(sb, window, &q, cx),
             }
         };
 
@@ -80,7 +125,7 @@ impl EditorApp {
             .min_h(px(0.))
             .overflow_hidden()
             .child(input)
-            .child(self.render_search_scope_tabs(window, cx))
+            .child(self.render_search_scope_tabs(sb, window, cx))
             .child(result_area)
             // P2-10：面板开合轻淡入（同目录面板，见 `sidebar-toc-fade`）。
             .with_spring(
@@ -93,16 +138,19 @@ impl EditorApp {
 
     /// 搜索范围「当前文件 / 整个文件夹」切换 tab 条：输入框下方横排两个小 tab。
     /// 未打开文件夹时「整个文件夹」置灰不可用（点击仅提示「先打开文件夹」，
-    /// 保持只搜当前文件）；活动项以活动背景 + 主前景色标示。
+    /// 保持只搜当前文件）；活动项以活动背景 + 主前景色标示。范围状态在共享模型
+    /// （`search_scope` / `search_scope_manual`），点击经 [`Self::set_search_scope`]
+    /// 实体直接改写 + 自 notify；无文件夹提示写共享模型 `status`。
     fn render_search_scope_tabs(
         &mut self,
+        sb: &SidebarChromeState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let active_bg = self.tab_active_bg();
-        let has_folder = self.sidebar.files.root.is_some();
-        let scope = self.effective_search_scope();
+        let has_folder = sb.files.root.is_some();
+        let scope = effective_search_scope(&self.model.borrow(), sb);
         let view_id = window.current_view();
 
         let current_hover =
@@ -132,8 +180,8 @@ impl EditorApp {
                 }
             })
             .on_click(cx.listener(
-                |this: &mut EditorApp, _ev, window, cx| {
-                    this.set_search_scope(SearchScopeTab::CurrentFile, window, cx);
+                |this: &mut Self, _ev, _window, cx| {
+                    this.set_search_scope(SearchScopeTab::CurrentFile, cx);
                 },
             ))
             .child("当前文件");
@@ -168,16 +216,18 @@ impl EditorApp {
                 }
             })
             .on_click(cx.listener(
-                |this: &mut EditorApp, _ev, window, cx| {
+                move |this: &mut Self, _ev, _window, cx| {
                     // 未打开文件夹 → 「整个文件夹」不可用：仅提示，保持只搜当前文件。
-                    if this.sidebar.files.root.is_none() {
+                    // `has_folder` 渲染期捕获（文件夹有无变化必伴随宿主 notify → 本面板
+                    // 重渲染更新捕获值，与旧「点击时读 sidebar.files.root」语义等价）。
+                    if !has_folder {
                         this.model.borrow_mut().status =
                             SharedString::from("先打开文件夹，再搜索整个文件夹");
                         this.model.borrow_mut().status_ok = false;
                         cx.notify();
                         return;
                     }
-                    this.set_search_scope(SearchScopeTab::Folder, window, cx);
+                    this.set_search_scope(SearchScopeTab::Folder, cx);
                 },
             ))
             .child("整个文件夹");
@@ -207,26 +257,11 @@ impl EditorApp {
             .into_any_element()
     }
 
-    /// 当前生效的搜索范围：用户手动选过 → 手动值；否则**有打开文件夹时默认
-    /// 「整个文件夹」**，无文件夹回退「当前文件」（未打开文件夹时文件夹范围不可用）。
-    pub(crate) fn effective_search_scope(&self) -> SearchScopeTab {
-        let m = self.model.borrow();
-        if m.search_scope_manual {
-            m.search_scope
-        } else if self.sidebar.files.root.is_some() {
-            SearchScopeTab::Folder
-        } else {
-            SearchScopeTab::CurrentFile
-        }
-    }
-
     /// 用户点击范围 tab：记录手动选择（此后不再自动跟随文件夹有无），并通知刷新。
-    pub(crate) fn set_search_scope(
-        &mut self,
-        scope: SearchScopeTab,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// 范围 / 手动标记 / 当前文件扫描缓存都在共享模型（`search_scan` 亦一并失效，
+    /// 下帧重建），实体直改 + 自 notify（面板开启时本实体在窗口渲染态内，notify 即
+    /// 重绘窗口，行为与旧宿主 `cx.notify()` 一致）。
+    pub fn set_search_scope(&mut self, scope: SearchScopeTab, cx: &mut Context<Self>) {
         self.model.borrow_mut().search_scope_manual = true;
         self.model.borrow_mut().search_scope = scope;
         self.model.borrow_mut().search_scan = None; // 范围变化 → 当前文件扫描缓存也一并失效（下帧重建）
@@ -234,11 +269,12 @@ impl EditorApp {
     }
 
     /// 计算并渲染搜索结果（文件名命中 + 行内容命中，按打开顺序排列，封顶）。
-    /// 扫描结果缓存在 [`Self::search_scan`]：查询词/活动文档未变时，反复渲染帧
-    /// 直接 O(1) 复用，不再每帧 O(全文) 重扫（旧逻辑在 render 里逐帧全量扫 + 
+    /// 扫描结果缓存在 [`Self::search_scan`] 对应模型字段：查询词/活动文档未变时，反复
+    /// 渲染帧直接 O(1) 复用，不再每帧 O(全文) 重扫（旧逻辑在 render 里逐帧全量扫 +
     /// 每行 `to_lowercase()` 分配）。
     fn render_sidebar_search_results(
         &mut self,
+        sb: &SidebarChromeState,
         window: &mut Window,
         q: &str,
         cx: &mut Context<Self>,
@@ -266,13 +302,14 @@ impl EditorApp {
                 pdf.update(cx, |v, cx| v.set_search(&qo, cx));
             }
             let pdf_results = self.render_sidebar_pdf_search(window, &pdf, q, cx);
-            return self.wrap_search_scroll("sidebar-search-results-pdf", pdf_results);
+            return self.wrap_search_scroll(sb, "sidebar-search-results-pdf", pdf_results);
         }
         let scan = self.sidebar_search_scan(q, cx);
         let hits = scan.file_tabs.len() + scan.line_hits.len();
         // 无命中 → 居中「灰色搜索图标 + 文案」空态占位（与目录/正文区空态同款视觉）。
         if hits == 0 {
             return self.wrap_search_scroll(
+                sb,
                 "sidebar-search-results",
                 ui::empty_state::compact_empty_state(
                     "sidebar-search-empty",
@@ -296,21 +333,22 @@ impl EditorApp {
         let inner = div()
             .child(self.sidebar_search_summary(hits, muted))
             .child(div().flex().flex_col().py_1().children(rows));
-        self.wrap_search_scroll("sidebar-search-results", inner)
+        self.wrap_search_scroll(sb, "sidebar-search-results", inner)
     }
 
     /// 搜索结果滚动容器包装：`overflow_y_scroll` 滚动容器外套 `relative` 包装层，
     /// 叠一条常显（`Always`）纵向滚动条——与目录/编辑器/预览同一语义：内容超量可滚
-    /// 时随 [`Self::search_vscroll`] 显示 thumb，轨道点击跳转、thumb 可拖。
+    /// 时随 `sb.search_vscroll` 显示 thumb，轨道点击跳转、thumb 可拖。
     /// `container_id` 透传（普通搜索 `sidebar-search-results` / PDF 搜索 `-pdf`，测试沿用）。
     /// 结构/样式收敛到 `ui::scroll_panel::ScrollPanelBuilder`：滚动条覆盖层 id 显式覆盖为
     /// `sidebar-search-vscrollbar`（派生 `{id}-vscrollbar` 与之不一致）。
     fn wrap_search_scroll(
         &self,
+        sb: &SidebarChromeState,
         container_id: &'static str,
         inner: impl IntoElement,
     ) -> gpui::AnyElement {
-        let vhand = self.sidebar.search_vscroll.clone();
+        let vhand = sb.search_vscroll.clone();
         ui::scroll_panel::ScrollPanelBuilder::new(container_id, vhand)
             .wrap_id("sidebar-search-results-wrap")
             .bar_id("sidebar-search-vscrollbar")
@@ -323,12 +361,14 @@ impl EditorApp {
     /// 命中后按 [`FOLDER_SEARCH_RESULT_CAP`] 截断并提示。
     fn render_sidebar_folder_search(
         &mut self,
+        sb: &SidebarChromeState,
         window: &mut Window,
         q: &str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let Some(scan) = self.folder_search_scan(q, window, cx) else {
+        let Some(scan) = self.folder_search_scan(sb, q, window, cx) else {
             return self.wrap_search_scroll(
+                sb,
                 "sidebar-search-results",
                 ui::empty_state::compact_empty_state(
                     "sidebar-search-empty",
@@ -340,10 +380,11 @@ impl EditorApp {
         };
         // 扫描进行中且尚无任何命中 → 「搜索中…」占位（有命中则走汇总头计数 + 分组行）。
         if scan.running && scan.total_hits == 0 {
-            return self.folder_search_loading();
+            return self.folder_search_loading(sb);
         }
         if scan.total_hits == 0 {
             return self.wrap_search_scroll(
+                sb,
                 "sidebar-search-results",
                 ui::empty_state::compact_empty_state(
                     "sidebar-search-empty",
@@ -359,11 +400,11 @@ impl EditorApp {
         let inner = div()
             .child(self.sidebar_folder_search_summary(&scan, muted))
             .child(div().flex().flex_col().py_1().children(rows));
-        self.wrap_search_scroll("sidebar-search-results", inner)
+        self.wrap_search_scroll(sb, "sidebar-search-results", inner)
     }
 
     /// 文件夹搜索「搜索中…」占位（扫描进行中、尚无命中时的整块提示）。
-    fn folder_search_loading(&self) -> gpui::AnyElement {
+    fn folder_search_loading(&self, sb: &SidebarChromeState) -> gpui::AnyElement {
         let muted = self.text_minor();
         let container = div()
             .id("sidebar-search-loading")
@@ -377,7 +418,7 @@ impl EditorApp {
             .text_color(muted)
             .child(Icon::new(IconName::Search).size(px(14.)).text_color(muted))
             .child("搜索中…");
-        self.wrap_search_scroll("sidebar-search-results", container)
+        self.wrap_search_scroll(sb, "sidebar-search-results", container)
     }
 
     /// 文件夹搜索汇总头：n 处匹配（m 个文件）/ 搜索中计数 / 已达上限截断提示。
@@ -406,7 +447,7 @@ impl EditorApp {
 
     /// 文件夹级搜索**分组渲染**：每文件一个组 = 文件头行（文件名 + 命中词频计数）+
     /// 逐命中行（`L行号  命中行预览`，命中词以强调色高亮）。点击命中行 → 打开/激活 +
-    /// 光标定位 + 滚动可见 + 命中词临时高亮（见 [`EditorApp::folder_search_open_hit`]）。
+    /// 光标定位 + 滚动可见 + 命中词临时高亮（见 [`Self::folder_search_open_hit`]）。
     #[allow(clippy::too_many_arguments)] // 三色 + 数据源 + 滚动句柄，与其它行渲染同构
     fn sidebar_folder_file_rows(
         &self,
@@ -510,7 +551,7 @@ impl EditorApp {
                             cx.notify(view_id);
                         }
                     })
-                    .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                    .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                         this.folder_search_open_hit(&path, li, match_range.clone(), &q_owned, window, cx);
                     }))
                     .child(
@@ -534,11 +575,12 @@ impl EditorApp {
     /// 未打开文件夹返回 `None`；查询词 / 根变化 → 发起新一轮后台扫描（新代，旧代结果丢弃）。
     fn folder_search_scan(
         &mut self,
+        sb: &SidebarChromeState,
         q: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Rc<FolderSearchScan>> {
-        let root = self.sidebar.files.root.clone()?;
+        let root = sb.files.root.clone()?;
         if let Some(s) = &self.model.borrow().folder_search
             && s.query == q
             && s.root.as_deref() == Some(root.as_path())
@@ -551,15 +593,12 @@ impl EditorApp {
 
     /// 发起一把文件夹级后台扫描：**不在主线程同步扫整棵**——生产者（后台线程）递归
     /// 读盘并逐文件外推命中块（有界 channel 背压，参考 `spawn_progressive_open` 大文档
-    /// 分块读盘姿势），主线程只收块增量装配到 [`Self::folder_search`]，扫描中 UI 显示
+    /// 分块读盘姿势），主线程只收块增量装配到 `model.folder_search`，扫描中 UI 显示
     /// 「搜索中…」。查询词 / 根变化 → 换代；旧代异步回调按代丢弃（不覆盖新结果）。
-    fn start_folder_scan(
-        &mut self,
-        root: PathBuf,
-        q: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// **实体弱句柄自更新**（写共享模型 + 自 notify），不回流宿主（对照 files.rs 的
+    /// 「宿主侧 spawn + update_window_entity 反调纯变换」——本扫描缓存就在共享模型，
+    /// 实体直接 self-update 更贴合；绝不在行 on_click/on_input 回调经宿主回租本实体）。
+    fn start_folder_scan(&mut self, root: PathBuf, q: &str, window: &mut Window, cx: &mut Context<Self>) {
         let generation = self.model.borrow().folder_search_gen.wrapping_add(1);
         self.model.borrow_mut().folder_search_gen = generation;
         self.model.borrow_mut().folder_search = Some(Rc::new(FolderSearchScan {
@@ -581,7 +620,7 @@ impl EditorApp {
                 let mut prod_tx = tx.clone();
                 let prod_root = root;
                 let prod_q = q_owned;
-                let prod_sess = UserPrefs::session_dir();
+                let prod_sess = config::user::UserPrefs::session_dir();
                 cx.background_executor()
                     .spawn(async move {
                         let mut total = 0usize;
@@ -591,7 +630,7 @@ impl EditorApp {
                             prod_tx.clone(),
                             &prod_sess,
                             &mut total,
-                            FOLDER_SEARCH_RESULT_CAP,
+                            config::limits::FOLDER_SEARCH_RESULT_CAP,
                         )
                         .await;
                         let _ = prod_tx.send(FolderScanUpdate::Done { truncated }).await;
@@ -636,11 +675,13 @@ impl EditorApp {
 
     /// 文件夹搜索点击命中行：路径失效 → 提示不打开；有效 → 打开/激活（已打开激活既有
     /// 选项卡）+ 光标定位到命中行 + 滚动可见 + 命中词临时高亮（编辑区选区 / 预览搜索高亮）。
-    pub(crate) fn folder_search_open_hit(
+    /// 「打开/激活」经宿主服务 [`SidebarHost::sidebar_open_path_or_activate`]（实体经
+    /// host_weak 反调，单向下行不回流实体），定位/高亮在本实体（共享模型 tab 直读）。
+    pub fn folder_search_open_hit(
         &mut self,
-        path: &std::path::Path,
+        path: &Path,
         line: usize,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         q_owned: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -653,7 +694,9 @@ impl EditorApp {
             cx.notify();
             return;
         }
-        self.open_path_or_activate(path, window, cx);
+        if let Some(h) = self.host_weak().upgrade() {
+            let _ = h.update(cx, |app, cx| app.sidebar_open_path_or_activate(path, window, cx));
+        }
         let Some(ti) = self.model.borrow().tabs.iter().position(|t| t.file_path.as_deref() == Some(path))
         else {
             return;
@@ -669,7 +712,7 @@ impl EditorApp {
         &mut self,
         ti: usize,
         li: usize,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         q_owned: &str,
         cx: &mut Context<Self>,
     ) {
@@ -703,6 +746,8 @@ impl EditorApp {
     }
 
     /// 文件名命中（跨所有打开文件）：相当于「打开文件」快速选择器，点击激活选项卡。
+    /// 「激活既有选项卡」经宿主服务 [`SidebarHost::sidebar_activate_tab`]（选项卡集合/
+    /// 活动索引是宿主 panes 域能力）。
     fn sidebar_search_file_rows(
         &self,
         window: &mut Window,
@@ -746,8 +791,11 @@ impl EditorApp {
                         cx.notify(view_id);
                     }
                 })
-                .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                    this.activate_tab(ti, window, cx);
+                .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
+                    if let Some(h) = this.host_weak().upgrade() {
+                        let _ = h.update(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
+                    }
+                    cx.notify();
                 }))
                 .child(Icon::new(IconName::File).size(px(13.)).text_color(row_fg))
                 .child(
@@ -808,8 +856,10 @@ impl EditorApp {
                         cx.notify(view_id);
                     }
                 })
-                .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                    this.activate_tab(ti, window, cx);
+                .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
+                    if let Some(h) = this.host_weak().upgrade() {
+                        let _ = h.update(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
+                    }
                     this.jump_tab_to_hit(ti, li, match_range.clone(), &q_owned, cx);
                     cx.notify();
                 }))
@@ -901,6 +951,7 @@ impl EditorApp {
 
     /// PDF 搜索头部「上一处 / 下一处」导航按钮（↑/↓，点击在命中间移动）。
     /// 返回 owned `AnyElement`（避免 RPIT 捕获 `cx` 生命周期导致连续两按钮借用冲突）。
+    /// 跳转直接驱动 PdfViewer 实体（`move_match`），无需宿主介入。
     #[allow(clippy::too_many_arguments)] // 导航按钮：命中实体 + 几何 + 配色均为正交参数，拆结构体反添噪音
     fn sidebar_pdf_nav_btn(
         &self,
@@ -948,7 +999,7 @@ impl EditorApp {
                     cx.notify(view_id);
                 }
             })
-            .on_click(cx.listener(move |_this: &mut EditorApp, _ev, _w, cx| {
+            .on_click(cx.listener(move |_this: &mut Self, _ev, _w, cx| {
                 target.update(cx, |v, cx| v.move_match(delta, cx));
                 cx.notify();
             }))
@@ -1008,7 +1059,7 @@ impl EditorApp {
     }
 
     /// PDF 搜索命中行（每个命中一行）：`L N  前5字…目标…后5字`，单行显示、超出省略；
-    /// 当前激活命中高亮，点击跳转到该命中页。
+    /// 当前激活命中高亮，点击跳转到该命中页（直接驱动 PdfViewer `focus_match_on_page`）。
     #[allow(clippy::too_many_arguments)] // 三色 + 数据源 + 命中列表，与 render_* 同构
     fn sidebar_pdf_hit_rows(
         &self,
@@ -1050,7 +1101,7 @@ impl EditorApp {
                         cx.notify(view_id);
                     }
                 })
-                .on_click(cx.listener(move |_this: &mut EditorApp, _ev, _w, cx| {
+                .on_click(cx.listener(move |_this: &mut Self, _ev, _w, cx| {
                     row_pdf.update(cx, |v, cx| v.focus_match_on_page(page, cx));
                     cx.notify();
                 }))
@@ -1071,13 +1122,14 @@ impl EditorApp {
         hit_rows
     }
 
-    /// 输入变化 → 登记防抖待提交词并重启防抖计时器（`base::SeqAfter` 代序作废旧
-    /// 定时器）。每键只做 O(1) 更新 + 即时通知刷新输入框渲染；[`SEARCH_DEBOUNCE_MS`]
-    /// 期满且无新输入才把 `search_pending` 提交为 `search_committed` 并通知（触发一次
+    /// 输入变化 → 登记防抖待提交词并重启防抖计时器（`SeqAfter` 代序作废旧定时器）。
+    /// 每键只做 O(1) 更新 + 宿主 forwarder 即时通知刷新输入框渲染；[`SEARCH_DEBOUNCE_MS`]
+    /// 期满且无新输入才把 `search_pending` 提交为 `search_committed` 并 notify（触发一次
     /// 扫描）。连续输入（间隔 < 防抖窗）时扫描零触发——大文档不再每键全量重扫正文。
-    pub(crate) fn schedule_search_debounce(&mut self, value: String, cx: &mut Context<Self>) {
+    /// 宿主的输入框订阅（`init.rs`）转发到本方法；**提交由实体弱句柄自更新 + 自 notify**
+    /// （写共享模型，不回流宿主）。
+    pub fn schedule_search_debounce(&mut self, value: String, cx: &mut Context<Self>) {
         self.model.borrow_mut().search_pending = normalize_search_query(&value);
-        cx.notify();
         let weak = cx.weak_entity();
         self.model.borrow().search_debounce.after(
             cx,
@@ -1103,9 +1155,9 @@ impl EditorApp {
     /// 一次性物化后借 `&str` 逐行扫（`scan_line_hits`）——同一轮搜索只物化一次、逐行借用，
     /// 不再每行新分配小写临时串。匹配：ASCII 查询一次性小写全文副本 + std `str::find`
     /// （memmem 快路径，零逐行分配）；非 ASCII 查询词回退 [`find_ci`] 字符级折叠扫描。
-    /// 结果在 [`EditorApp::search_scan`] 缓存，编辑/加载/切文档时清空重扫。
+    /// 结果缓存在共享模型 `search_scan`，编辑/加载/切文档时宿主清空重扫（交互零变化）。
     fn sidebar_search_scan(&mut self, q: &str, cx: &App) -> Rc<SidebarSearchScan> {
-        // SC-3：先提纯 owned Rc 再 if-let（`search_scan` 迁入模型后，if-let 掮获的 Ref
+        // SC-3：先提纯 owned Rc 再 if-let（`search_scan` 在共享模型，if-let 掮获的 Ref
         // 临时会跨过 `borrow_mut` 判定，运行期双借 panic）。
         let scan = self.model.borrow().search_scan.clone();
         if let Some(s) = scan
@@ -1118,7 +1170,7 @@ impl EditorApp {
         let mut line_hits: Vec<SearchLineHit> = Vec::new();
         // 文件名匹配（跨所有打开文件）
         for (ti, tab) in self.model.borrow().tabs.iter().enumerate() {
-            if file_tabs.len() + line_hits.len() >= SEARCH_RESULT_CAP {
+            if file_tabs.len() + line_hits.len() >= config::limits::SEARCH_RESULT_CAP {
                 break;
             }
             let name = tab
@@ -1133,7 +1185,7 @@ impl EditorApp {
         }
         // 行内容命中（仅当前活动文档；readonly 走 content 镜像，可编辑走编辑器 Rope
         // 一次物化）。文件名已占的配额扣掉后，剩余额度交给行内容扫描（共用 CAP）。
-        let remaining = SEARCH_RESULT_CAP.saturating_sub(file_tabs.len());
+        let remaining = config::limits::SEARCH_RESULT_CAP.saturating_sub(file_tabs.len());
         if remaining > 0
             && let Some(tab) = self.model.borrow().tabs.get(self.model.borrow().active_tab) {
                 if tab.readonly_preview {

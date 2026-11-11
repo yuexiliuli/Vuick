@@ -24,16 +24,19 @@
 //! - [`files`]：[`Sidebar`] 实体的文件树视图（懒加载扫描 / 展开折叠 / 过滤 typeahead / 打开）。
 //! - [`files_ops`]：[`Sidebar`] 实体的文件树操作（右键菜单 / 输入弹层生命周期）；文件系统
 //!   副作用经 [`host::SidebarHost`] / [`prompt::FileTreePromptHost`] 分发宿主。
+//! - [`search`]：[`Sidebar`] 实体的跨文件搜索（输入 / 范围切换 / 防抖 / 结果渲染与 PDF
+//!   检索接线 / 文件夹后台分块扫描 / 命中跳转）；扫描与防抖为实体弱句柄自更新（写共享
+//!   模型 + 自 notify），打开/激活经 [`host::SidebarHost`] 分发宿主。
 //!
-//! `search.rs` 仍在 shell（下一阶段随迁）；本 crate 只承载上述「地基 + 视图主体」。依赖
-//! 只重分配 workspace 既有包（gpui / ui / config / shell_core / toc / pdf / markdown_wysiwyg），
-//! 不新增外部包。
+//! 依赖只重分配 workspace 既有包（gpui / ui / config / shell_core / shell_scan / toc / pdf /
+//! markdown_wysiwyg / futures），不新增外部包。
 
 pub mod chrome;
 pub mod files;
 pub mod files_ops;
 pub mod host;
 pub mod prompt;
+pub mod search;
 pub mod state;
 pub mod toc;
 
@@ -41,9 +44,10 @@ pub use chrome::Sidebar;
 pub use host::SidebarHost;
 pub use prompt::{FileTreePrompt, FileTreePromptHost, FileTreePromptKind};
 pub use state::{
-    file_tree_invalidate, file_tree_scan_complete, file_tree_toggle, read_dir_entries,
-    normalize_search_query, FileRow, FileTreeState, SidebarChromeState, SidebarView, TreeEntry,
-    FILE_TREE_INDENT, FILE_TREE_ROW_H, FILES_FILTER_DEBOUNCE_MS, SEARCH_DEBOUNCE_MS,
+    effective_search_scope, file_tree_invalidate, file_tree_scan_complete, file_tree_toggle,
+    read_dir_entries, normalize_search_query, FileRow, FileTreeState, SidebarChromeState,
+    SidebarView, TreeEntry, FILE_TREE_INDENT, FILE_TREE_ROW_H, FILES_FILTER_DEBOUNCE_MS,
+    SEARCH_DEBOUNCE_MS,
 };
 // 目录虚拟化常量（文件树视图共用，`pub` 供宿主按需重导出）。
 pub use toc::{TOC_BAND_BUFFER, TOC_VIRTUALIZE_MIN};

@@ -1502,9 +1502,9 @@ impl EditorApp {
         // 若侧边栏搜索框持有焦点 → 粘贴到搜索框（其不处理应用级 PasteNormalized）
         let search_focused = window
             .focused(cx)
-            .is_some_and(|fh| fh == self.search_state.read(cx).focus_handle(cx));
+            .is_some_and(|fh| fh == self.search_state(cx).read(cx).focus_handle(cx));
         if search_focused {
-            let search = self.search_state.clone();
+            let search = self.search_state(cx);
             search.update(cx, |s, cx| {
                 s.replace(text, window, cx);
             });

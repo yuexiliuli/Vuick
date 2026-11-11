@@ -297,8 +297,9 @@ impl EditorApp {
 
     /// 文件模式条目：已打开选项卡（名称 + 路径提示），末尾追加「打开文件…」入口。
     ///
-    /// 复用侧边栏搜索的「文件名匹配 + 点击激活选项卡」语义（`sidebar_search_file_rows`），
-    /// 但只列**已打开文件**，不做全文检索（那是侧栏搜索的职责）；过滤走面板过滤。
+    /// 复用侧边栏搜索的「文件名匹配 + 点击激活选项卡」语义（`shell_sidebar::search` 的
+    /// `sidebar_search_file_rows`），但只列**已打开文件**，不做全文检索（那是侧栏搜索的
+    /// 职责）；过滤走面板过滤。
     fn file_palette_items(&self, cx: &Context<Self>) -> Vec<PaletteItem> {
         let mut items = self.file_palette_opened_items(cx);
         items.push(Self::file_dialog_item(cx));

@@ -132,6 +132,13 @@ impl shell_sidebar::SidebarHost for EditorApp {
         self.open_path_or_activate(path, window, cx);
     }
 
+    /// 「搜索」文件名命中/行命中点击「激活已有选项卡」：宿主 `activate_tab`（选项卡集合、
+    /// 活动索引、脏标记等属宿主 panes/tab-bar 域；文件树「打开」经
+    /// `sidebar_open_path_or_activate`，此处是按下标激活已打开文档，两者语义区分）。
+    fn sidebar_activate_tab(&mut self, tab_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_tab(tab_idx, window, cx);
+    }
+
     /// 目录行展开/折叠（生产事件入口）：转发宿主 facade `file_tree_toggle`——宿主侧
     /// 直落 `state::file_tree_toggle` 纯变换 + 首展宿主侧 spawn 扫描，全程不回租 Sidebar
     /// 实体（目录行 on_click 回调期间实体已租用，回租即 `double_lease_panic`，D1 评审

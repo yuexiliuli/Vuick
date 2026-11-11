@@ -78,14 +78,22 @@ pub trait SidebarHost: 'static {
         Self: Sized;
 
     /// 文件树目录行展开/折叠（生产事件入口）：宿主把状态落在 `self.sidebar.files`
-    /// （变换逻辑在 `Sidebar::file_tree_toggle` 实体方法）并 notify；测试程序化入口
-    /// `app.file_tree_toggle` 与它同语义。
+    /// （变换逻辑在 [`crate::state::file_tree_toggle`] 纯变换 + 宿主 facade）并 notify；
+    /// 测试程序化入口 `app.file_tree_toggle` 与它同语义。
     fn sidebar_file_tree_toggle(
         &mut self,
         path: std::path::PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) where
+        Self: Sized;
+
+    /// 「搜索」文件名命中行「激活」：宿主 `activate_tab` 能力（选项卡集合 / 活动索引 /
+    /// 相关通知是宿主 panes/tab-bar 域，域实体不可达；搜索文件名命中与行内容命中共用）。
+    /// 与「打开新文件」的 [`Self::sidebar_open_path_or_activate`] 区分：这里是**按选项卡
+    /// 下标**激活**已打开**的文档（不打开新文件），搜索「当前文件」结果点击即此语义。
+    fn sidebar_activate_tab(&mut self, tab_idx: usize, window: &mut Window, cx: &mut Context<Self>)
+    where
         Self: Sized;
 
     /// 文件树后台扫描完成：把该目录直接子项写进 `self.sidebar.files`

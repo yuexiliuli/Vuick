@@ -4341,10 +4341,12 @@ name = "shell_sidebar"
 version = "0.1.0"
 dependencies = [
  "config",
+ "futures",
  "gpui",
  "markdown_wysiwyg",
  "pdf",
  "shell_core",
+ "shell_scan",
  "toc",
  "ui",
 ]

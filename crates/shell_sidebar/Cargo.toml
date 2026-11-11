@@ -12,8 +12,12 @@ gpui = { workspace = true }
 ui = { path = "../ui" }
 # 布局常量：SIDEBAR_ACTIVITY_W / SIDEBAR_WIDTH_MIN / SIDEBAR_WIDTH_MAX。
 config = { path = "../config" }
-# 宿主模型（AppModel / MdTocScroll / PdfBookmark / MediaReader）与 ScrollHandle；跨 crate 命名经它。
+# 宿主模型（AppModel / MdTocScroll / PdfBookmark / MediaReader / SearchScopeTab）与 ScrollHandle；跨 crate 命名经它。
 shell_core = { path = "../shell_core" }
+# 侧栏搜索的纯扫描层（文件夹级后台递归扫描 + 行级命中收集 + 大小写不敏感查找；自 shell 拆出的叶子 crate）。
+shell_scan = { path = "../shell_scan" }
+# 文件夹级搜索的后台分块扫描：主线程只收块增量装配（有界 mpsc 通道背压，参考 spawn_progressive_open）。
+futures = { workspace = true }
 # 目录树折叠/可见性纯函数 + toc_item_frame 单条目录可视件（TOC_ROW_H）。
 toc = { path = "../toc" }
 # PDF 大纲条目 / PdfViewer 实体（目录 PDF outlines 读取与书签跳页）。

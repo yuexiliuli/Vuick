@@ -210,14 +210,12 @@ pub struct EditorApp {
     #[doc(hidden)]
     pub sidebar: shell_sidebar::SidebarChromeState,
     /// 侧边栏**渲染/事件实体**（2026-11-11 起承接自 shell_sidebar 域 crate）：
-    /// 外壳（活动栏/调宽手柄）+ 目录（TOC）视图在 `Entity<Sidebar<EditorApp>>` 上构建
+    /// 外壳（活动栏/调宽手柄）+ 目录（TOC）视图 + 搜索（`search.rs`，2026-11-11 随迁）
+    /// + 文件树（files/files_ops）在 `Entity<Sidebar<EditorApp>>` 上构建
     /// （`Context<Sidebar>` 内 `cx.listener` 绑定域实体）；宿主渲染期以 `&mut self.sidebar`
-    /// 传入状态、事件回调经 `SidebarHost` 反调本宿主。搜索 / 文件树面板仍由宿主直渲。
+    /// 传入状态、事件回调经 `SidebarHost` 反调本宿主。搜索输入实体亦收进域
+    /// （测试经 `sidebar::EditorApp::search_state(cx)` 兼容读取器取句柄）。
     sidebar_view: gpui::Entity<shell_sidebar::Sidebar<EditorApp>>,
-    /// 侧边栏「搜索」关键字输入控件。
-    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 检索在途断言 `set_value` 推查询（§8.6 外提清单）。
-    #[doc(hidden)]
-    pub search_state: gpui::Entity<InputState>,
     /// 监听搜索框输入变化 → 刷新搜索结果。
     _search_sub: Subscription,
     /// 大文档「两段式打开」快段（`load_file_text` 延迟挂载编辑器）执行次数。

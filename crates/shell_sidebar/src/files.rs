@@ -504,7 +504,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 输入变化 → 登记防抖待提交过滤词并重启防抖计时器（`SeqAfter` 代序作废旧定时器）。
     /// 防抖期满提交 `files_filter` + 作废文件树布局缓存（下次渲染按新过滤词重收集可见行）。
     /// 宿主的输入框订阅（`init.rs`）转发到本方法；**不 notify**——宿主 forwarder
-    /// 在自身上下文 `cx.notify()`（同 `file_tree_toggle` 注释）。
+    /// 在自身上下文 `cx.notify()`（同 `sidebar_file_tree_toggle` 宿主服务注释）。
     pub fn schedule_files_filter_debounce(
         &mut self,
         value: String,

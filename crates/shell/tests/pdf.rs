@@ -784,7 +784,7 @@ use config::user::PdfBgPref;
             });
         });
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("配置", window, cx));
         });
         // 防抖期满提交 → 侧栏渲染推 set_search 到 A → 检索在途

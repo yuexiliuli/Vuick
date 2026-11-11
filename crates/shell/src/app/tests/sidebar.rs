@@ -812,7 +812,7 @@
             app.update(cx, |app, cx| {
                 app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx);
             });
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("shanghai", window, cx));
         });
         // 防抖期满提交查询（否则渲染不触发扫描）
@@ -889,7 +889,7 @@
 
         // 第一次键入「shanghai」：防抖期内（<150ms）不扫描、不提交
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("shanghai", window, cx));
         });
         for _ in 0..3 {
@@ -932,7 +932,7 @@
 
         // 换查询「beta」→ 防抖后扫描一次，命中第 2 行
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("beta", window, cx));
         });
         cx.executor()
@@ -985,7 +985,7 @@
         // 快速键入 6 个中间词（不给防抖窗到期机会）：期间应零扫描
         for q in ["p", "pr", "pre", "prev", "previ", "预览编辑"] {
             cx.update(|window, cx| {
-                let input = app.read(cx).search_state.clone();
+                let input = app.read(cx).search_state(cx);
                 input.update(cx, |s, cx| s.set_value(q, window, cx));
             });
             cx.executor()
@@ -1039,7 +1039,7 @@
         }
         // Windows IME 组合更新序列：每键重发完整组合串（range=None）
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| {
                 s.replace_and_mark_text_in_range(None, "b", None, window, cx);
                 s.replace_and_mark_text_in_range(None, "bi", None, window, cx);
@@ -1051,13 +1051,13 @@
         });
         // 确认：提交中文（range=None）
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| {
                 s.replace_text_in_range(None, "编辑", window, cx);
             });
         });
         let box_value =
-            cx.update(|_w, cx| app.read(cx).search_state.read(cx).value().to_string());
+            cx.update(|_w, cx| app.read(cx).search_state(cx).read(cx).value().to_string());
         assert_eq!(box_value, "编辑", "输入框文本应为干净中文（组合替换不追加）");
         // 防抖期满提交 → 扫描查询词同样是干净中文
         cx.executor()
@@ -1369,7 +1369,7 @@
         }
         // 无匹配 → 空态占位
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("zzz-无匹配", window, cx));
         });
         cx.executor()
@@ -1386,7 +1386,7 @@
         );
         // 命中 → 恢复正常结果列表（不再有空态）
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("hello", window, cx));
         });
         cx.executor()
@@ -1619,7 +1619,7 @@
             );
         });
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("正文", window, cx));
         });
         cx.executor()
@@ -1817,7 +1817,7 @@
             );
         });
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("needle", window, cx));
         });
         cx.executor()
@@ -1903,7 +1903,7 @@
             );
         });
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("needle", window, cx));
         });
         cx.executor()
@@ -1997,7 +1997,7 @@
             );
         });
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("needle", window, cx));
         });
         cx.executor()
@@ -2050,7 +2050,7 @@
         });
         // 搜索「needle」→ A 有命中
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("needle", window, cx));
         });
         cx.executor()
@@ -2074,7 +2074,7 @@
 
         // 清空查询（重扫空 → 不显示结果，回到输入提示）
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("", window, cx));
         });
         cx.executor()
@@ -2109,7 +2109,7 @@
             cx.run_until_parked();
         }
         cx.update(|window, cx| {
-            let input = app.read(cx).search_state.clone();
+            let input = app.read(cx).search_state(cx);
             input.update(cx, |s, cx| s.set_value("needle", window, cx));
         });
         cx.executor()

@@ -41,17 +41,19 @@ impl EditorApp {
         // SC-4：宿主实体自身的弱句柄与 id（AppHost `&self` 服务经它再入宿主实体）。
         let own_weak = cx.weak_entity();
         let own_entity_id = cx.entity_id();
-        // 侧边栏搜索输入框：内容变化 → 重刷 app（从而重算并展示搜索结果）
+        // 侧边栏搜索输入框：内容变化 → 重刷 app（从而重算并展示搜索结果）。
+        // **输入实体为域自有态**（`shell_sidebar::Sidebar::search_input`），此处创建后
+        // 传入实体构造；宿主只经 `search_state(cx)` 兼容读取器取句柄做订阅/粘贴。
         let search = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("搜索文件与内容…")
                 .default_value("")
         });
-        let search_state = search.clone();
         // 侧边栏搜索输入框：内容变化 → 更新「防抖待提交查询」并即时刷新输入框渲染；
-        // 防抖期满才提交给扫描（连续输入不再每键全量重扫大文档正文）。
+        // 防抖期满才提交给扫描（连续输入不再每键全量重扫大文档正文）。订阅仍挂宿主
+        // （`this.search_state(cx)` 取实体句柄），转发到域实体 `schedule_search_debounce`。
         let search_sub = cx.subscribe(&search, |this, _emitter, _ev: &InputEvent, cx| {
-            let value = this.search_state.read(cx).value().to_string();
+            let value = this.search_state(cx).read(cx).value().to_string();
             this.schedule_search_debounce(value, cx);
         });
         // 加载持久化用户偏好（主题三态 / 字号 / 侧边栏宽度；缺失或损坏 → 默认）。
@@ -109,9 +111,10 @@ impl EditorApp {
             pdf_bookmarks::load_cached(),
         )));
         // 侧边栏渲染/事件实体（2026-11-11 迁 shell_sidebar）：经共享 model + 宿主弱引用
-        // 构造；宿主渲染期以 `&mut self.sidebar` 入参调用其外壳/目录渲染。
+        // + 搜索输入实体（域自有态）构造；宿主渲染期以 `&mut self.sidebar` 入参调用其
+        // 外壳/目录/搜索/文件树渲染。
         let sidebar_view = cx.new(|_| {
-            shell_sidebar::Sidebar::new(model.clone(), own_weak.clone())
+            shell_sidebar::Sidebar::new(model.clone(), own_weak.clone(), search.clone())
         });
         let mut app = EditorApp {
             model,
@@ -143,7 +146,6 @@ impl EditorApp {
                 resize: None,
                 resize_hovered: false,
             },
-            search_state,
             _search_sub: search_sub,
             open_fast_count: 0,
             open_finish_count: 0,

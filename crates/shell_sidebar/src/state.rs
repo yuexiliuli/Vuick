@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use gpui::SharedString;
 
 use config::layout::{SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
-use shell_core::MdTocScroll;
+use shell_core::{AppModel, MdTocScroll, SearchScopeTab};
 
 /// 侧边栏视图。
 /// `#[doc(hidden)] pub`：`EditorApp::sidebar.view` 与 `app::tests` 枚举比较。
@@ -25,9 +25,9 @@ use shell_core::MdTocScroll;
 pub enum SidebarView {
     /// 当前文档目录（Markdown 标题 / PDF 书签）。
     Toc,
-    /// 跨打开文件的搜索（`search.rs` 仍留 shell）。
+    /// 跨打开文件的搜索（`search.rs` 已迁本 crate）。
     Search,
-    /// 打开文件夹的文件树（`files.rs` 仍留 shell）。
+    /// 打开文件夹的文件树（`files.rs` 已迁本 crate）。
     Files,
 }
 
@@ -51,7 +51,7 @@ pub struct TreeEntry {
 /// 文件树状态：根 + 已展开目录集 + 每个已展开目录的直接子项缓存。
 ///
 /// 懒加载纪律：**禁止整棵递归预扫描**——只在目录首次展开时后台读一次直接子项
-/// （宿主 `spawn_file_tree_scan` 仍留 shell/files.rs），建材缓存后折叠再展开复用；
+/// （宿主 `spawn_file_tree_scan` 位于 shell::app::sidebar host facade），建材缓存后折叠再展开复用；
 /// 渲染逐帧 O(可见行)，绝不每帧重扫 `read_dir` 或重建 HashMap。换根 → 全清。
 /// `#[doc(hidden)] pub`：`EditorApp.sidebar.files`（§8.6 外提链）元素类型。
 #[derive(Default)]
@@ -61,7 +61,7 @@ pub struct FileTreeState {
     /// `pub`：宿主/测试直写可见。
     pub root: Option<PathBuf>,
     /// 已展开的目录完整路径集合（折叠即移除，children 缓存保留复用）。
-    /// `pub`：宿主/测试直写可见（files.rs 仍留 shell）。
+    /// `pub`：宿主/测试直写可见（files.rs 已迁本 crate）。
     pub expanded: std::collections::HashSet<PathBuf>,
     /// 每个**已扫描过**目录的直接子项缓存（漏项 = 尚未扫描，展示层按「加载中」处理）。
     /// `pub`：宿主/测试直写可见（settings_xfer 读 children）。
@@ -158,7 +158,7 @@ pub struct FileRow {
 }
 
 /// 侧边栏「外壳」状态：可见性、当前视图与目录（TOC）面板的宽度/折叠/右缘拖拽。
-/// 与「检索输入 + 缓存 + 订阅」分属（后者仍在 `EditorApp`，`search.rs` 未迁）。
+/// 与「检索输入 + 扫描缓存 + 订阅」分属（后者 `search.rs` 已迁本 crate，渲染经共享模型）。
 /// 纯结构移动（2026-11 自 shell 的 `app/sidebar/mod.rs` 迁入本 crate 后**原样保留字段**），
 /// 由宿主 `EditorApp.sidebar` 普通字段持有，跨 crate（shell 编排 + 测试）字段全 `pub`。
 /// `#[doc(hidden)] pub`：`EditorApp.sidebar` 字段 + `width/width_auto/files` 供
@@ -185,7 +185,7 @@ pub struct SidebarChromeState {
     pub toc_vscroll: gpui::ScrollHandle,
     /// 搜索结果滚动句柄：`#sidebar-search-results*` 经 `track_scroll` 跟踪，
     /// 右侧自绘纵向滚动条跟随（与目录/编辑器一致）。
-    /// `pub`：宿主/测试直写可见（search.rs 仍留 shell）。
+    /// `pub`：宿主/测试直写可见（`search.rs` 已迁本 crate）。
     pub search_vscroll: gpui::ScrollHandle,
     /// 文件树根 / 展开集 / 子项缓存（懒加载，见 [`FileTreeState`]）。
     /// `pub`：宿主/测试直写可见。
@@ -196,7 +196,7 @@ pub struct SidebarChromeState {
     pub files_layout: Option<(u64, Vec<FileRow>)>,
     /// 文件树滚动句柄：`#sidebar-files-scroll` 经 `track_scroll` 跟踪，
     /// 右侧自绘纵向滚动条跟随（与目录/搜索一致）。
-    /// `pub`：宿主/测试直写可见（files.rs 仍留 shell）。
+    /// `pub`：宿主/测试直写可见（files.rs 已迁本 crate）。
     pub files_vscroll: gpui::ScrollHandle,
     /// 目录自适应宽缓存 `(选项卡下标, 编辑版本, WyEditor 内容代号, 宽)`：内容没变只算一次，
     /// 禁逐帧 O(N) 全量测宽（大文档上万标题下每帧重扫 = 卡死热源之一）。
@@ -296,15 +296,31 @@ pub const FILES_FILTER_DEBOUNCE_MS: u64 = 120;
 /// 连续输入（间隔 < 本值）只更新待提交词，不触发每键全量重扫。
 pub const SEARCH_DEBOUNCE_MS: u64 = 150;
 
+/// 当前生效的搜索范围（**纯逻辑**，侧栏搜索视图渲染 / 范围 tab 光用，单一事实源）：
+/// 用户手动选过 → 手动值；否则**有打开文件夹时默认「整个文件夹」**，无文件夹回退
+/// 「当前文件」（未打开文件夹时文件夹范围不可用）。
+/// `model` 为宿主共享模型（`search_scope` / `search_scope_manual`），`sb` 为本状态
+/// （`files.root`）；因分属两处，以参数传入保持纯函数（宿主 facade `effective_search_scope`
+/// 与域实体渲染共用同一份，防逻辑双写漂移）。
+pub fn effective_search_scope(model: &AppModel, sb: &SidebarChromeState) -> SearchScopeTab {
+    if model.search_scope_manual {
+        model.search_scope
+    } else if sb.files.root.is_some() {
+        SearchScopeTab::Folder
+    } else {
+        SearchScopeTab::CurrentFile
+    }
+}
+
 /// 归一化搜索查询词（与旧 `value().trim().to_lowercase()` 一致，作缓存键与渲染用词）。
-/// `pub`：shell 的 `search.rs`（仍留 shell）跨 crate 调用。
+/// `pub`：本 crate 的 `search.rs` 跨模块调用。
 pub fn normalize_search_query(q: &str) -> String {
     q.trim().to_lowercase()
 }
 
 /// 读取目录**直接子项**：文件夹优先、组内按显示名（`to_string_lossy`）字符串排序
 /// （ASCII/CJK 一视同仁）；过滤读取错误项，绝不 panic（失败返回空，展示为「（空）」）。
-/// `pub`：shell 的 `files.rs`（仍留 shell）后台扫描跨 crate 调用。
+/// `pub`：本 crate 的 `files.rs` 后台扫描跨模块调用。
 pub fn read_dir_entries(path: &std::path::Path) -> Vec<TreeEntry> {
     let mut dirs: Vec<TreeEntry> = Vec::new();
     let mut files: Vec<TreeEntry> = Vec::new();
