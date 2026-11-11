@@ -938,6 +938,98 @@ fn active_line_bg_highlights_cursor_row_when_focused(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn active_line_bg_highlights_cursor_row_number_gutter(cx: &mut TestAppContext) {
+    // 光标行整行高亮**延伸到行号列**：行号单元格随行高亮（复用既有行高亮底色，
+    // 见 `gutter_items_for` 的 fold/active 两档判定）。未聚焦不渲染；聚焦后默认光标
+    // 在首行 → 首行行号格高亮（y≈0、高≈行高）；光标移到第 3 行 → 高亮转移到该行
+    // （y≈2×行高）；存在非坍缩选区（文字被选中）时整行高亮让位 → 行号格高亮消失。
+    let (host, cx) = open(cx, "aaa\nbbb\nccc\nddd\neee");
+    assert!(
+        cx.debug_bounds("ce-gutter-active-bg").is_none(),
+        "未聚焦时行号列不应渲染光标行高亮"
+    );
+    let (_, lh, gw) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    // 聚焦 → 默认光标在首行 → 首行行号格出现高亮，高=行高、y=首行顶、宽=整行号列宽。
+    focus(&host, cx);
+    let bg = cx
+        .debug_bounds("ce-gutter-active-bg")
+        .expect("持焦后首行行号格应高亮");
+    assert!(
+        (bg.size.height.as_f32() - lh).abs() < 1.0,
+        "行号格高亮高应=行高（{} vs 行高 {lh}）",
+        bg.size.height.as_f32()
+    );
+    assert!(
+        (bg.origin.y.as_f32() - 0.0).abs() < 1.0,
+        "默认光标在首行：行号格高亮 y 应=首行顶（{}）",
+        bg.origin.y.as_f32()
+    );
+    assert!(
+        (bg.size.width.as_f32() - gw).abs() < 1.0,
+        "行号格高亮宽应=整行号列宽（{} vs 行号列宽 {gw}）——宽≈0 时背景不可见",
+        bg.size.width.as_f32()
+    );
+    // 行号**数字本身**高亮（强调色）：数字格与单元格高亮同位置同尺寸（首行 y≈0）。
+    let num = cx
+        .debug_bounds("ce-gutter-number-active")
+        .expect("持焦后活动行行号数字应挂高亮 selector");
+    assert!(
+        (num.origin.y.as_f32() - bg.origin.y.as_f32()).abs() < 1.0
+            && (num.size.height.as_f32() - bg.size.height.as_f32()).abs() < 1.0,
+        "活动行数字应与单元格高亮同 y/高（num y {} 高 {}；bg y {} 高 {}）",
+        num.origin.y.as_f32(),
+        num.size.height.as_f32(),
+        bg.origin.y.as_f32(),
+        bg.size.height.as_f32()
+    );
+    assert!(
+        (num.origin.y.as_f32() - 0.0).abs() < 1.0,
+        "默认光标在首行：活动行数字 y 应=首行顶（{}）",
+        num.origin.y.as_f32()
+    );
+    // 光标移到第 3 行（行索引 2，0 基）→ 行号列高亮转移到该行（y ≈ 2×行高）。
+    let off2 = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(2, 0));
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(off2..off2, cx));
+    });
+    settle(cx);
+    let bg2 = cx
+        .debug_bounds("ce-gutter-active-bg")
+        .expect("光标移到第 3 行后该行号格应高亮");
+    assert!(
+        (bg2.origin.y.as_f32() - 2.0 * lh).abs() < 1.0,
+        "行号格高亮应转移到新光标行（y {} vs 期望 {}）",
+        bg2.origin.y.as_f32(),
+        2.0 * lh
+    );
+    let num2 = cx
+        .debug_bounds("ce-gutter-number-active")
+        .expect("光标移到第 3 行后活动行数字应跟随");
+    assert!(
+        (num2.origin.y.as_f32() - 2.0 * lh).abs() < 1.0,
+        "活动行数字应转移到新光标行（y {} vs 期望 {}）",
+        num2.origin.y.as_f32(),
+        2.0 * lh
+    );
+    // 选中文字（非坍缩选区）→ 整行高亮让位给选中字符 → 行号格高亮消失。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(0..3, cx));
+    });
+    settle(cx);
+    assert!(
+        cx.debug_bounds("ce-gutter-active-bg").is_none(),
+        "存在非坍缩选区时行号列不应渲染光标行高亮"
+    );
+    assert!(
+        cx.debug_bounds("ce-gutter-number-active").is_none(),
+        "存在非坍缩选区时活动行数字高亮应消失"
+    );
+}
+
+#[gpui::test]
 fn active_line_bg_requires_focus(cx: &mut TestAppContext) {
     // 光标行整行高亮**强依赖持焦**：未持焦时移动光标（notify + settle 重建行元素）
     // 不产生任何高亮；持焦瞬间该高亮才出现在光标所在行。这从状态层锁死「失焦 →
@@ -1010,6 +1102,51 @@ fn active_line_bg_yields_to_folded_row_bg(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("ce-active-line-bg").is_none(),
         "光标落在已折叠首行时不应渲染 active 高亮（折叠底优先）"
+    );
+}
+
+#[gpui::test]
+fn active_line_bg_gutter_yields_to_folded_row_bg(cx: &mut TestAppContext) {
+    // 折叠优先互斥同样延伸到行号列：光标所在行恰为已折叠首行时，行号格格底显示
+    // `ce-gutter-fold-bg`、不显示 `ce-gutter-active-bg`（镜像文本侧
+    // `active_line_bg_yields_to_folded_row_bg` 的断言骨架）。
+    let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    // 默认光标在首行（未折叠行）→ 行号格 active 高亮正常出现（基线正常态）。
+    assert!(
+        cx.debug_bounds("ce-gutter-active-bg").is_some(),
+        "聚焦后未折叠行应渲染行号格光标行高亮"
+    );
+    assert!(
+        cx.debug_bounds("ce-gutter-fold-bg").is_none(),
+        "未折叠行不应渲染折叠行号格底"
+    );
+    // 光标移到 if 块首行（逻辑行 1）并折叠它 → 该行号格显示折叠底、不显示 active 底。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(ed.offset_for_line_col(1, 0)..ed.offset_for_line_col(1, 0), cx));
+    });
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_toggle_fold_at(1));
+    });
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |_, cx| cx.notify());
+    });
+    settle(cx);
+    assert!(
+        cx.debug_bounds("ce-gutter-fold-bg").is_some(),
+        "已折叠首行号格应渲染折叠底"
+    );
+    assert!(
+        cx.debug_bounds("ce-gutter-active-bg").is_none(),
+        "光标落在已折叠首行时行号格不应渲染 active 高亮（折叠底优先）"
+    );
+    assert!(
+        cx.debug_bounds("ce-gutter-number-active").is_none(),
+        "已折叠首行的行号数字应保持灰显（不挂强调 selector）"
     );
 }
 
@@ -1123,7 +1260,7 @@ fn bracket_guides_stay_visible_over_fold_and_active_rows(cx: &mut TestAppContext
             cx.update(|_, cx| {
                 let ed = host.read(cx).ed.clone();
                 ed.read(cx)
-                    .test_bracket_guide_segments(0, 0.0, lh, 1200.0, 1000.0)
+                    .test_bracket_guide_segments(0, 0.0, lh, 1.0, 1200.0, 1000.0)
                     .into_iter()
                     .any(|(_, y, h)| y < band.1 && y + h > band.0)
             })
@@ -1266,6 +1403,8 @@ fn bracket_guide_window_keeps_enclosing_pair_when_viewport_deep(cx: &mut TestApp
     let (host, cx) = open(cx, &text);
     let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
     let lh = lh.max(1.);
+    // 段几何行距 = 吸附行距 pitch（sf=1.0 时与生产同式 rhtz 正值变体），非裸 lh。
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
     let top_vis = 20; // 视口在两层块中间（外层 open=0 上方远处、仍回看窗口内）。
     assert!(
         top_vis < LOOKBACK,
@@ -1274,14 +1413,14 @@ fn bracket_guide_window_keeps_enclosing_pair_when_viewport_deep(cx: &mut TestApp
     // 视口内可见竖线段：外层 fn（x≈0）从 21 到底、内层 {（x≈4）从 21 到 39。
     let segs = cx.update(|_, cx| {
         let ed = host.read(cx).ed.clone();
-        ed.read(cx).test_bracket_guide_segments(top_vis, 0.0, lh, 1200.0, 1000.0)
+        ed.read(cx).test_bracket_guide_segments(top_vis, 0.0, lh, 1.0, 1200.0, 1000.0)
     });
     let outer = segs
         .iter()
-        .find(|(x, _, h)| (*x - 0.0 * cw).abs() < 1.0 && *h > (40 - top_vis - 1) as f32 * lh)
+        .find(|(x, _, h)| (*x - 0.0 * cw).abs() < 1.0 && *h > (40 - top_vis - 1) as f32 * pitch)
         .expect("视口深处仍应有外层 fn 竖线（贯穿视口）");
     assert!(
-        outer.1 < lh * 2.,
+        outer.1 < pitch * 2.,
         "外层竖线应贴视口顶（从 open 之后的深处横贯）：y={}",
         outer.1
     );
@@ -1302,26 +1441,28 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
     use config::layout::{
         BRACKET_GUIDE_CLOSE_TAIL_LINES as TAIL, BRACKET_GUIDE_OPEN_HEAD_LINES as HEAD,
     };
-    // 与用户样例同构。注意 spans：竖线从开行**之后**画到闭行**内约半行**（贴 `}` 字形），
-    // 端点微调一律按 config 常量算期望（用户调 HEAD/TAIL 后不打红）。
+    // 与用户样例同构。注意 spans：竖线从开行**之后**画到底端停于**闭行顶缘**（TAIL=0，
+    // 用户口径 0.0）；端点微调一律按 config 常量算期望（用户调 HEAD/TAIL 后不打红）。
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}";
     let (host, cx) = open(cx, text);
     let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
     let lh = lh.max(1.);
+    // 段几何行距 = 吸附行距 pitch（sf=1.0 时与生产同式 rhtz 正值变体），非裸 lh。
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
     let harea_w = 1200.0;
     let view_h = 1000.0;
     let segs = cx.update(|_, cx| {
         let ed = host.read(cx).ed.clone();
-        ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, harea_w, view_h)
+        ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, 1.0, harea_w, view_h)
     });
     // 三条竖线：x = 块首行缩进列 0/4/8；跨度 [开行+1, 闭行) 底端再伸 TAIL、顶部缩 HEAD。
     assert_eq!(segs.len(), 3, "三对跨行花括号 → 三条竖线");
-    // 外层 impl 块：x≈0cw，y=(1+HEAD)lh 起、高 (5−HEAD+TAIL)lh（行 1..5 + 尾巴）。
+    // 外层 impl 块：x≈0cw，y=(1+HEAD)pitch 起、高 (5−HEAD+TAIL)pitch（行 1..5 + 尾巴）。
     let impl_guide = segs
         .iter()
         .find(|(_, y, h)| {
-            (*y - (1.0 + HEAD) * lh).abs() < 0.5
-                && (*h - (5.0 - HEAD + TAIL) * lh).abs() < 0.5
+            (*y - (1.0 + HEAD) * pitch).abs() < 0.5
+                && (*h - (5.0 - HEAD + TAIL) * pitch).abs() < 0.5
         })
         .expect("应有 impl 块竖线");
     assert!(
@@ -1329,12 +1470,12 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
         "外层竖线应在块首列 0×字宽，实际 {}",
         impl_guide.0
     );
-    // Self 块：x≈8cw，y=(3+HEAD)lh 起、高 (1−HEAD+TAIL)lh（行 3 + 尾巴）。
+    // Self 块：x≈8cw，y=(3+HEAD)pitch 起、高 (1−HEAD+TAIL)pitch（行 3 + 尾巴）。
     let self_guide = segs
         .iter()
         .find(|(_, y, h)| {
-            (*y - (3.0 + HEAD) * lh).abs() < 0.5
-                && (*h - (1.0 - HEAD + TAIL) * lh).abs() < 0.5
+            (*y - (3.0 + HEAD) * pitch).abs() < 0.5
+                && (*h - (1.0 - HEAD + TAIL) * pitch).abs() < 0.5
         })
         .expect("应有 Self 块竖线");
     assert!(
@@ -1354,15 +1495,17 @@ fn bracket_guide_overlapping_same_column_merged(cx: &mut TestAppContext) {
     let (host, cx) = open(cx, text);
     let (_, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
     let lh = lh.max(1.);
+    // 段几何行距 = 吸附行距 pitch（sf=1.0 时与生产同式 rhtz 正值变体），非裸 lh。
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
     let segs = cx.update(|_, cx| {
         let ed = host.read(cx).ed.clone();
-        ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, 1200.0, 1000.0)
+        ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, 1.0, 1200.0, 1000.0)
     });
     // 两根（fn a 的 [1,4) 与内层 { 的 [2,3)）同列 → 合并成一根 [1,4)，端点半行微调。
     assert_eq!(segs.len(), 1, "同列重叠竖线应合并为一根");
     assert!(
-        (segs[0].1 - (1.0 + HEAD) * lh).abs() < 0.5
-            && (segs[0].2 - (3.0 - HEAD + TAIL) * lh).abs() < 0.5,
+        (segs[0].1 - (1.0 + HEAD) * pitch).abs() < 0.5
+            && (segs[0].2 - (3.0 - HEAD + TAIL) * pitch).abs() < 0.5,
         "合并段应覆盖行 1..3 + 端点半行（实际 y={} h={}）",
         segs[0].1,
         segs[0].2

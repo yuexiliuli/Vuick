@@ -592,10 +592,11 @@ impl CodeEditor {
         top_vis: usize,
         off: f32,
         lh: f32,
+        sf: f32,
         harea_w: f32,
         view_h: f32,
     ) -> Vec<(f32, f32, f32)> {
-        self.bracket_guide_segments(top_vis, off, lh, harea_w, view_h)
+        self.bracket_guide_segments(top_vis, off, lh, sf, harea_w, view_h)
     }
 
     /// 测试用：当前点亮的标尺块（`open_line`，`None` = 未点亮）。

@@ -428,11 +428,14 @@ impl CodeEditor {
 
     /// 同 [`Self::bracket_guide_segments`]，但每个合并段额外带 `bool` = 该段是否命中
     /// `active`（点亮标尺的 `open_line`）。合并同列样本段时，任一样本命中则整段点亮。
+    /// `sf` = 窗口 scale_factor：段几何行距用 pitch（吸附行距），与渲染吸附同源
+    /// （见 `snap_guide_extent`），确保竖线底端贴真实渲染行网格、不逐行漂移。
     pub(super) fn bracket_guide_segments_flagged(
         &self,
         top_vis: usize,
         off: f32,
         lh: f32,
+        sf: f32,
         harea_w: f32,
         view_h: f32,
         active: Option<usize>,
@@ -444,6 +447,11 @@ impl CodeEditor {
         // 顶部从首覆盖行向下缩进控制留白。均为可配置行高系数。
         let head = BRACKET_GUIDE_OPEN_HEAD_LINES * lh;
         let tail = BRACKET_GUIDE_CLOSE_TAIL_LINES * lh;
+        // 段几何以 pitch（吸附行距）为行距，与 snap_guide_extent 同源：行高经 gpui
+        // round_half_toward_zero 预吸附成整数设备 px（正值 = ceil(lh·sf − 0.5)，vendored
+        // util.rs:130），竖线累计必须用吸附后行距，否则 lh·sf 小数部分 >0.5 时逐行短
+        // 1px、底端累计不贴「下一行顶」（须与 taffy 同式，勿用 round()）。
+        let pitch = ((lh * sf - 0.5).ceil()).max(1.0) / sf;
         let cw = self.char_width.as_f32().max(1.);
         let hscroll = self.hscroll_px();
         let bottom_vis = top_vis.saturating_add(((view_h / lh).ceil() as usize) + 1);
@@ -505,8 +513,8 @@ impl CodeEditor {
                     if let Some((cx, ct, cb, ca)) = cur.take() {
                         out.push((
                             cx,
-                            (ct as f32 - top_vis as f32) * lh - off + head,
-                            (cb - ct) as f32 * lh - head + tail,
+                            (ct as f32 - top_vis as f32) * pitch - off + head,
+                            (cb - ct) as f32 * pitch - head + tail,
                             ca,
                         ));
                     }
@@ -517,8 +525,8 @@ impl CodeEditor {
         if let Some((cx, ct, cb, ca)) = cur {
             out.push((
                 cx,
-                (ct as f32 - top_vis as f32) * lh - off + head,
-                (cb - ct) as f32 * lh - head + tail,
+                (ct as f32 - top_vis as f32) * pitch - off + head,
+                (cb - ct) as f32 * pitch - head + tail,
                 ca,
             ));
         }
@@ -530,11 +538,12 @@ impl CodeEditor {
         top_vis: usize,
         off: f32,
         lh: f32,
+        sf: f32,
         harea_w: f32,
         view_h: f32,
     ) -> Vec<(f32, f32, f32)> {
         // 未点亮（active=None）→ 与旧实现语义一致（3 元组）。
-        self.bracket_guide_segments_flagged(top_vis, off, lh, harea_w, view_h, None)
+        self.bracket_guide_segments_flagged(top_vis, off, lh, sf, harea_w, view_h, None)
             .into_iter()
             .map(|(x, y, h, _)| (x, y, h))
             .collect()

@@ -89,7 +89,7 @@ impl Render for CodeEditor {
 
         // 文本区（List 文本 + 横向滚动容器）、行号列、标尺/括号竖线叠层 → 各自 &self 助手
         // （`vscrollbar_overlay` 之后仍需 `list_state`，故此处给 text_area_layer 传克隆）。
-        let harea = self.text_area_layer(rv, content_w_px, self.list_state.clone());
+        let harea = self.text_area_layer(rv.clone(), content_w_px, self.list_state.clone());
 
         // 行号 gutter：固定编辑区左缘、不随内容横向滚动；同一帧反推绝对行号叠层
         // （不建独立 O(N) 树，见 `gutter_overlay`）。
@@ -98,14 +98,16 @@ impl Render for CodeEditor {
             mono: self.mono.clone(),
             font_size: self.font_size,
             fg: self.gutter_fg,
+            active_fg: self.fg,
         });
-        let gutter = self.gutter_overlay(view_h, lh, bg, gv);
+        let gutter = self.gutter_overlay(&rv, view_h, lh, bg, gv);
 
         // 垂直标尺（margin guide）：纯视觉覆盖层（见 `ruler_overlay`）。
         let ruler = self.ruler_overlay(avail_w);
 
         // 括号标尺（bracket guides）：跨行括号配对竖线叠层（见 `bracket_guide_overlay`）。
-        let guides = self.bracket_guide_overlay(vis_top, vis_off, lh, harea_w, view_h);
+        let guides = self
+            .bracket_guide_overlay(vis_top, vis_off, lh, harea_w, view_h, window.scale_factor());
 
         let core = div()
             .id("code-editor")
@@ -205,6 +207,7 @@ impl CodeEditor {
     /// 底部预留区自然不显示行号，视口外被 `overflow_hidden` 裁掉。
     fn gutter_overlay(
         &self,
+        rv: &std::rc::Rc<RowView>,
         view_h: f32,
         lh: f32,
         bg: Hsla,
@@ -217,7 +220,7 @@ impl CodeEditor {
         // 折叠后 gutter 按**视觉行**取逻辑行号（隐藏行不占视觉行 → 行号呈缺口，
         // 折叠首行按 `fold_arrow_state` 渲染方向箭头：已折叠「▸」/仅候选「▾」）。
         // 先快照（closure 不捕获 self）。
-        let gutter_items = self.gutter_items_for(g_top_abs, gutter_rows, view_h, lh);
+        let gutter_items = self.gutter_items_for(rv, g_top_abs, gutter_rows, view_h, lh);
         let gutter_col = div()
             .id("ce-gutter-col")
             .debug_selector(|| "ce-gutter-col".into())
@@ -226,8 +229,8 @@ impl CodeEditor {
             .top(px(-gutter_offset))
             .w_full()
             .children(gutter_items.into_iter().map(move |item| match item {
-                Some((logical, arrow)) => {
-                    number_element(logical, arrow, &gv).into_any_element()
+                Some((logical, arrow, bg, folded)) => {
+                    number_element(logical, arrow, bg, folded, &gv).into_any_element()
                 }
                 None => div().h(gv.line_height).into_any_element(),
             }));
@@ -275,10 +278,30 @@ impl CodeEditor {
         )
     }
 
+    /// 括号标尺竖线段端点吸附到**渲染行网格**（纯函数）。根因：sf 为小数（如 1.75）时
+    /// `lh·sf` 为小数，1px 竖线按 lh 累计会与真实渲染行距逐行累积偏差。真实行距经 gpui
+    /// `round_half_toward_zero` 预吸附成**整数设备 px**（vendored util.rs:130，正值 =
+    /// `ceil(lh·sf − 0.5)`，与 taffy 同式）。顶部就近吸附到设备像素（保持贴行）；底部
+    /// = 行顶 + 整行数×吸附行距，恰贴「下一行顶」、**永不越过**渲染行界（只会「贴」或
+    /// 「短」，不会「超过」）。返回 `(新 top, 新高)`。
+    fn snap_guide_extent(y: f32, h: f32, lh: f32, scale_factor: f32) -> (f32, f32) {
+        let sf = scale_factor.max(1e-6);
+        // 每行真实渲染设备像素（rhtz 正值变体：ceil(lh·sf−0.5)，实证 = taffy 预吸附）。
+        let pitch_dev = ((lh * sf - 0.5).ceil()).max(1.0);
+        // 顶：就近吸附到设备像素。
+        let top_dev = (y * sf).round();
+        // 段占整行数（head/tail=0 时 h=n·pitch_log 恰整行；就地近取整）。分母用吸附行距
+        // pitch_log（= pitch_dev/sf），防深块 P/P′（h 略超整行）通胀多算 1 行、溢过行界。
+        let rows = (h / (pitch_dev / sf)).round().max(0.0);
+        let bottom_dev = top_dev + rows * pitch_dev;
+        (top_dev / sf, (bottom_dev - top_dev).max(0.0) / sf)
+    }
+
     /// 括号标尺（bracket guides）：每个跨行括号配对一条竖线，从开括号列画到闭行。
     /// 坐标在**文本区本地**（x 含横向滚动换算、y 含纵向滚动换算），随内容滚动；
     /// 与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。点击代码区域点亮的
     /// 最内层块竖线（`active_guide_open`）用强调蓝加宽。
+    /// `sf` = `window.scale_factor()`，用于把段端点吸附到物理像素网格（见 `snap_guide_extent`）。
     fn bracket_guide_overlay(
         &self,
         vis_top: usize,
@@ -286,9 +309,10 @@ impl CodeEditor {
         lh: f32,
         harea_w: f32,
         view_h: f32,
+        sf: f32,
     ) -> gpui::Stateful<gpui::Div> {
         let guide_segments = self.bracket_guide_segments_flagged(
-            vis_top, vis_off, lh, harea_w, view_h, self.active_guide_open,
+            vis_top, vis_off, lh, sf, harea_w, view_h, self.active_guide_open,
         );
         let guide_color = self.guide_color;
         let active_guide_color = self.active_guide_color;
@@ -302,17 +326,21 @@ impl CodeEditor {
             .right(px(0.))
             .overflow_hidden()
             .children(guide_segments.into_iter().map(|(x, y, h, active)| {
+                // 端点吸附**渲染行网格**：底 = 行顶 + 整行数×吸附行距（rhtz，与 taffy
+                // 同式）——恰贴「下一行顶」、绝不越过渲染行界（见 `snap_guide_extent`）。
+                // x 不动（横向 1px 竖线，无需 snap）。
+                let (gy, gh) = Self::snap_guide_extent(y, h, lh, sf);
                 div()
                     .absolute()
                     .debug_selector(|| "ce-bracket-guide".into())
                     .left(px(x))
-                    .top(px(y))
+                    .top(px(gy))
                     .w(px(if active {
                         BRACKET_GUIDE_ACTIVE_WIDTH
                     } else {
                         BRACKET_GUIDE_WIDTH
                     }))
-                    .h(px(h.max(0.)))
+                    .h(px(gh))
                     .bg(if active { active_guide_color } else { guide_color })
             }))
     }
@@ -416,23 +444,45 @@ impl CodeEditor {
         (content_w_px, harea_w)
     }
 
-    /// 可见行号叠层条目：`Some((逻辑行号, 箭头状态))` 或 `None`（底部预留区/文档末尾）。
-    /// 第二项 = [`CodeEditor::fold_arrow_state`] 直接透传：`Some(true)`=已折叠首行、
-    /// `Some(false)`=仅候选起点、`None`=不画箭头（渲染口径与测试同源，不在此重判）。
+    /// 可见行号叠层条目：`Some((逻辑行号, 箭头状态, 行号单元格背景色, 是否折叠行))` 或
+    /// `None`（底部预留区/文档末尾）。第二项 = [`CodeEditor::fold_arrow_state`] 直接
+    /// 透传：`Some(true)`=已折叠首行、`Some(false)`=仅候选起点、`None`=不画箭头（渲染
+    /// 口径与测试同源，不在此重判）。第三项 = 光标行/折叠行整行高亮延伸到行号列时的
+    /// 单元格底色（折叠优先、否则持焦光标行，互斥口径与 `row_bg_overlay` 一致），无
+    /// 高亮为 `None`；第四项 = 该视觉行是否折叠首行（决定 selector，见 `number_element`）。
     fn gutter_items_for(
         &self,
+        rv: &std::rc::Rc<RowView>,
         gutter_start: usize,
         gutter_rows: usize,
         view_h: f32,
         lh: f32,
-    ) -> Vec<Option<(usize, Option<bool>)>> {
+    ) -> Vec<Option<(usize, Option<bool>, Option<Hsla>, bool)>> {
         let gutter_count = ((view_h / lh).ceil() as usize).clamp(1, 4096) + 1;
+        let last_v = self.folds.visual_line_count().saturating_sub(1);
+        let fold_bg = rv.fold_bg;
+        let active_line_bg = rv.active_line_bg;
         (gutter_start..gutter_start + gutter_count)
             .map(|vix| {
                 if vix < gutter_rows {
                     let l = self.folds.logical_row(vix);
                     let arrow = self.fold_arrow_state(l);
-                    Some((l, arrow))
+                    // 越窗/越过文档末尾（底部预留区）取空行兜底（未激活、无底色）：
+                    // 折叠优先于光标行（同 `row_bg_overlay` 口径，两处叠层不打架）。
+                    let rd = if vix <= last_v && vix >= rv.lo && vix - rv.lo < rv.rows.len() {
+                        &rv.rows[vix - rv.lo]
+                    } else {
+                        &RowData::empty()
+                    };
+                    let folded = rd.folded.is_some();
+                    let bg = if folded {
+                        Some(fold_bg)
+                    } else if rd.active {
+                        Some(active_line_bg)
+                    } else {
+                        None
+                    };
+                    Some((l, arrow, bg, folded))
                 } else {
                     None
                 }
@@ -1461,7 +1511,11 @@ struct GutterView {
     line_height: Pixels,
     mono: SharedString,
     font_size: Pixels,
+    /// 行号常规色（`gutter_fg`，折叠/普通行灰显用）。
     fg: Hsla,
+    /// 活动行（持焦光标行）行号强调色（= 编辑器主文字色 `self.fg`，主题驱动、
+    /// 比 `gutter_fg` 亮）。
+    active_fg: Hsla,
 }
 
 /// 行号单元格：行高与文本行一致，由共享 ListState 的第二个 `list()` 驱动 → 行号与
@@ -1469,11 +1523,26 @@ struct GutterView {
 /// （[`CodeEditor::fold_arrow_state`] 透传）：`Some(true)`=已折叠首行 → 右向「▸」；
 /// `Some(false)`=候选起点 → 下向「▾」；`None`=不画。
 ///
-/// 布局：flex-grow 的**数字格**（内部 `justify_end` 右对齐）+ 固定宽**箭头槽**（恒占位）
-/// → 无论有无箭头，数字右缘都钉在「gutter 右缘 − 右内边距 − 槽宽」，有箭头行不把
-/// 行号左推、与无箭头行数字列对齐（避免真机「行号被挤/错位」回归）。
-fn number_element(ix: usize, arrow: Option<bool>, gv: &GutterView) -> gpui::Div {
+/// `bg` = 光标行/折叠行整行高亮延伸到行号列时的单元格底色（`Some` 时铺满整格、
+/// 兼顾行号+箭头槽；`None` 无底色）；`folded` = 该行是否折叠首行，决定底色
+/// selector（折叠行 `ce-gutter-fold-bg` / 光标行 `ce-gutter-active-bg`，镜像文本侧
+/// `ce-fold-row-bg`/`ce-active-line-bg` 的分叉命名）。**行号数字本身**在活动行
+/// （有底色且非折叠行）用 `gv.active_fg`（主文字色）强调并挂
+/// `ce-gutter-number-active`；其余行保持 `gv.fg` 与 `ce-gutter-number`。布局：
+/// flex-grow 的**数字格**（内部 `justify_end` 右对齐）+ 固定宽**箭头槽**（恒占位）→
+/// 无论有无箭头，数字右缘都钉在「gutter 右缘 − 右内边距 − 槽宽」，有箭头行不把行号
+/// 左推、与无箭头行数字列对齐（避免真机「行号被挤/错位」回归）。
+fn number_element(
+    ix: usize,
+    arrow: Option<bool>,
+    bg: Option<Hsla>,
+    folded: bool,
+    gv: &GutterView,
+) -> gpui::Div {
     let number = SharedString::from((ix + 1).to_string());
+    // 活动行 = 有底色且非折叠行（折叠行保持灰显在折叠底色上）。
+    let active = bg.is_some() && !folded;
+    let number_selector = if active { "ce-gutter-number-active" } else { "ce-gutter-number" };
     div()
         .h(gv.line_height)
         .flex()
@@ -1483,13 +1552,22 @@ fn number_element(ix: usize, arrow: Option<bool>, gv: &GutterView) -> gpui::Div 
         .text_color(gv.fg)
         .text_size(gv.font_size)
         .font_family(gv.mono.clone())
+        // 光标行/折叠行高亮延伸到行号列：整格（含行号+箭头槽）铺同一底色；有底色时
+        // 按行语义挂分叉 selector（折叠 `ce-gutter-fold-bg` / 光标 `ce-gutter-active-bg`）。
+        .when_some(bg, |this, color| {
+            let sel = if folded { "ce-gutter-fold-bg" } else { "ce-gutter-active-bg" };
+            this.debug_selector(move || sel.into())
+                .bg(color)
+        })
         .child(
             div()
-                .debug_selector(|| "ce-gutter-number".into())
+                .debug_selector(move || number_selector.into())
+                .h_full()
                 .flex()
                 .flex_grow(1.0)
                 .justify_end()
                 .items_center()
+                .text_color(if active { gv.active_fg } else { gv.fg })
                 .child(number),
         )
         .child(
@@ -1706,6 +1784,126 @@ mod tests {
     /// 与生产 `layout_width` 同一「字符→宽度」映射口径，纯算术、无需真实字体。
     fn units_w(ch: char) -> f32 {
         char_width_units(ch) as f32
+    }
+
+    /// 行网格吸附（单元）：顶就近吸附设备像素格、底 = 行顶 + 整行数×渲染行距
+    /// floor(lh·sf)；顶/底都落设备格，底不越过原底。
+    #[test]
+    fn snap_guide_extent_snaps_to_row_grid() {
+        // sf=2.0、lh=10.0 → 渲染行距 floor(10*2)=20。6 行块 h=60：
+        // 顶 round(10.2*2=20.4)=20 → 10.0（向下取整 → 底不越过）；底 20+6*20=140。
+        let (top, h) = CodeEditor::snap_guide_extent(10.2, 60.0, 10.0, 2.0);
+        assert_eq!((top, h), (10.0, 60.0));
+        assert_eq!(top * 2.0, 20.0, "(a) 顶在设备格");
+        assert_eq!((top + h) * 2.0, 140.0, "(a) 底在设备格");
+        assert!((top + h) * 2.0 <= (10.2 + 60.0) * 2.0, "(b) 底不越过原底 140.4");
+
+        // .5 临界：round 半离开 0 → 顶 10.75*2=21.5 → 22 → 11.0；底 22+3*20=82。
+        let (top, h) = CodeEditor::snap_guide_extent(10.75, 30.0, 10.0, 2.0);
+        assert_eq!(top, 11.0, "round(21.5)=22");
+        assert_eq!(h, 30.0);
+        assert_eq!((top + h) * 2.0, 82.0, "(a) 底在设备格");
+
+        // sf=1.0：整数输入零变化（常规/测试环境不动画）。
+        assert_eq!(
+            CodeEditor::snap_guide_extent(10.0, 20.0, 10.0, 1.0),
+            (10.0, 20.0)
+        );
+    }
+
+    /// 复刻本机真实数据：lh=43.077、sf=1.75（lh·sf=75.385 为小数）→ 渲染行距
+    /// floor=75。6 行块（y=43.08,h=258.46）：顶 round(75.39)=75、底 75+6*75=525；
+    /// 3 行块（h=129.23）：底 75+3*75=300——底落在 75 的行网格上、不越过原底。
+    #[test]
+    fn snap_guide_extent_lands_on_row_grid() {
+        let lh = 43.077_f32;
+        let sf = 1.75_f32;
+        // 6 行块：y*sf=75.39 → 顶 75；rows=round(258.46/43.077)=6 → 底 525。
+        let (gy, gh) = CodeEditor::snap_guide_extent(43.08, 258.46, lh, sf);
+        assert_eq!(gy * sf, 75.0, "(a) 顶就近在设备格");
+        assert_eq!((gy + gh) * sf, 525.0, "(c) 底 = 75 + 6*75 行网格");
+        assert!(((gy + gh) * sf).fract() == 0.0, "(a) 顶/底都在设备格");
+        assert!((gy + gh) * sf <= (43.08 + 258.46) * sf, "(b) 不越过原底 527.695");
+
+        // 3 行块：底 75 + 3*75 = 300。
+        let (gy, gh) = CodeEditor::snap_guide_extent(43.08, 129.23, lh, sf);
+        assert_eq!(gy * sf, 75.0);
+        assert_eq!((gy + gh) * sf, 300.0, "(c) 3 行档 = 75+3*75");
+        assert!((gy + gh) * sf <= (43.08 + 129.23) * sf, "(b) 不越过原底 301.54");
+    }
+
+    /// 退化输入（`h` 极小，仅纯函数边界用例，真实路径 `h ≥ lh` 恒满足）：段占整行数
+    /// 就近取整到 0 → `bottom_dev == top_dev` → `gh` 被 `.max(0)` 夹 0，不 panic。
+    #[test]
+    fn snap_guide_extent_clamps_degenerate_negative_height() {
+        // rows = round(0.2/10)=0 → 底 == 顶 → gh 夹 0（不画反向/负高竖线）。
+        let (top, gh) = CodeEditor::snap_guide_extent(10.75, 0.2, 10.0, 2.0);
+        assert_eq!(top, 11.0, "顶仍就近吸附 10.75*2=21.5 → round 22 → 11.0");
+        assert_eq!(gh, 0.0, "(d) rows=0 → gh 夹 0");
+        assert!(gh >= 0.0, "不产生负高");
+    }
+
+    /// lh·sf 小数部分 >0.5 时，旧 floor 行距每行短 1px、底端累计不贴行（旧代码会短
+    /// rows×1px）；rhtz（ceil(lh·sf−0.5)）与 taffy 同式 → 底恰贴「下一行顶」。
+    /// lh=43.2、sf=1.75：lh·sf=75.6 → 吸附行距 76 设备px（旧 floor=75，每行短 1px）。
+    #[test]
+    fn snap_guide_extent_frac_above_half_lands_on_real_row_top() {
+        let lh = 43.2_f32;
+        let sf = 1.75_f32;
+        let pitch = 76.0_f32 / sf; // rhtz 吸附行距（设备 76px；旧 floor 会 75px）。
+        // 浅块：y=0、6 行。底 = 0 + 6·76 = 456（旧 floor 会 450，短 6 = rows×1px）。
+        let (top, h) = CodeEditor::snap_guide_extent(0.0, 6.0 * pitch, lh, sf);
+        assert!(
+            ((top + h) * sf - 456.0).abs() < 0.01,
+            "6 行 → 底 456 == 行6顶精确（旧 floor=450 短 1px/行）"
+        );
+        // 深块+滚动：y=10·pitch−1.3（= ct−top_vis=10 行、off=1.3、head=0）、6 行。
+        // top_dev=round(10·76 − 1.3·1.75)=round(757.725)=758；底=758+6·76=1214==行cb顶。
+        let y = 10.0 * pitch - 1.3;
+        let (top2, h2) = CodeEditor::snap_guide_extent(y, 6.0 * pitch, lh, sf);
+        assert_eq!(top2 * sf, 758.0, "顶就近吸附 758 设备px");
+        assert!(
+            ((top2 + h2) * sf - 1214.0).abs() < 0.01,
+            "底 1214 == 行cb顶精确（旧 floor 会短 6px）"
+        );
+        assert!((h2 * sf - 456.0).abs() < 0.01, "段高 6 行 = 456 设备px");
+        // 20 行：底 = 20·76 = 1520（旧 floor=1500，短 20px）。
+        let (top3, h3) = CodeEditor::snap_guide_extent(0.0, 20.0 * pitch, lh, sf);
+        assert!(
+            ((top3 + h3) * sf - 1520.0).abs() < 0.01,
+            "20 行 → 底 1520（旧 floor=1500 短 20px）"
+        );
+    }
+
+    /// head/tail 非零（HEAD=TAIL=0.25·lh）时，段 y/h 含端点半行、经吸附后底仍落
+    /// 「≥ 行cb顶、< 行cb底」区间、不越过渲染行界。段由 `bracket_guide_segments_flagged`
+    /// 发射（y=(ct−top_vis)·pitch−off+head、h=(cb−ct)·pitch−head+tail，off=top_vis=0），
+    /// head/tail 相互抵消于高 → h = 整行数×pitch；底 = round(y·sf) + rows·pitch_dev。
+    #[test]
+    fn snap_guide_extent_head_tail_bottom_stays_within_close_row() {
+        let lh = 43.2_f32;
+        let sf = 1.75_f32;
+        // BRACKET_GUIDE_OPEN_HEAD_LINES / BRACKET_GUIDE_CLOSE_TAIL_LINES 现为 0.0/0.0；
+        // 本用例手写 0.25 常数验证「非零端点半行」语义（与 config 常量无关的纯几何用例）。
+        let head = 0.25_f32 * lh;
+        let tail = 0.25_f32 * lh;
+        let pitch = 76.0_f32 / sf;
+        let (ct, cb) = (2.0_f32, 5.0_f32); // 段覆盖视觉行 2..5（3 行），闭行 = 行5
+        let y = ct * pitch + head; // = (ct−top_vis)·pitch − off + head
+        let h = (cb - ct) * pitch - head + tail; // 3·pitch（head/tail 抵消）
+        let (top, gh) = CodeEditor::snap_guide_extent(y, h, lh, sf);
+        // 底（设备px）推导：round(y·sf) = round(2·76 + 0.25·lh·sf) = round(152+18.9) = 171；
+        // rows = round(3·pitch/pitch) = 3；底 = 171 + 3·76 = 399。行 cb(=5) 顶 = 5·76 = 380、
+        // 底 = 6·76 = 456 → 399 ∈ [380, 456) 且不越过行 cb 底（旧 floor 行距会 375/450）。
+        let bottom = (top + gh) * sf;
+        assert!(
+            (bottom - 399.0).abs() < 0.01,
+            "非零 head/tail 底仍精确贴行网格 399"
+        );
+        assert!(
+            bottom >= 380.0 && bottom < 456.0,
+            "底落在行 cb(=5) 区间 [行顶 380, 行底 456)、不越过渲染行界：{bottom}"
+        );
     }
 
     #[test]
