@@ -131,7 +131,10 @@ pub use sidebar::{FileTreeState, SidebarChromeState, SidebarView, TreeEntry};
 // 私有模块的纯逻辑面供 `tests/palette.rs`（quick open 检索）、`tests/media.rs`
 // （媒体窗口打开决策/尺寸取值）、`tests/pdf.rs`（书签盘上读写）访问。
 #[doc(hidden)]
-pub use media_window::{
+// 2026-11-11：`media_window` 纯决策已随媒体域迁 `shell_media`（`media_window` 模块），
+// 此处经 shell_media 重导出维持既有 `app::{resolve_media_open_target, ...}` 面
+// （`tests/media.rs` 行为表 / 尺寸取值断言）。
+pub use shell_media::media_window::{
     resolve_media_open_target, resolve_recorded_size, MediaOpenTarget, MediaWindowKind,
 };
 #[doc(hidden)]

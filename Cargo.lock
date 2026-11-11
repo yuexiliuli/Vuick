@@ -4290,6 +4290,7 @@ dependencies = [
  "session_store",
  "shell_commands",
  "shell_core",
+ "shell_media",
  "shell_pdf",
  "shell_scan",
  "shell_sidebar",
@@ -4325,6 +4326,18 @@ dependencies = [
  "ropey",
  "session_store",
  "shell_scan",
+ "ui",
+ "video",
+]
+
+[[package]]
+name = "shell_media"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "image_viewer",
+ "music",
+ "shell_core",
  "ui",
  "video",
 ]

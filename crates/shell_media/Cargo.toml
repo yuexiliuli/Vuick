@@ -1,0 +1,26 @@
+[package]
+name = "shell_media"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 媒体/音乐域 crate（自 shell 的 app/media + app/media_window + app/music_player 拆出：查看器元数据同步 / 锁定菜单项构建 / 媒体窗口打开决策与路由决议 / 音乐模式判定；纯结构移动只重分配既有依赖，不新增外部包；经 MediaHost 宿主服务面与 shell 解耦，菜单挂载与窗口/宿主编排留 shell）"
+
+[dependencies]
+# 决策/值类型：Entity / App / Context / Window / Size / AnyWindowHandle / Point 等。
+gpui = { workspace = true }
+# 右键「锁定」菜单项 / 浮层类型（PopupMenuItem / PopupMenu）。
+ui = { path = "../ui" }
+# 宿主模型（AppModel / MediaReader；跨 crate 命名经它）。
+shell_core = { path = "../shell_core" }
+# MediaReader::Image 实体（锁定判定 / 元数据读取）。
+image_viewer = { path = "../image_viewer" }
+# 音频路由判定（is_audio_extension）与 MusicView 播放请求（不静态链 FFmpeg）。
+music = { path = "../music" }
+# 视频路径判定随本 crate 的 `video` feature 开关（与 shell 一致，镜像转发）。
+video = { path = "../video", optional = true }
+
+[features]
+default = []
+# video：与根包同名 feature 一致——shell 经 `shell_media/video` 显式转发开启。
+# --no-default-features 时关闭 → 视频整链关闭、不拉 FFmpeg 依赖。
+video = ["dep:video", "shell_core/video"]

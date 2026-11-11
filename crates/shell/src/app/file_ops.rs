@@ -1107,8 +1107,9 @@ impl EditorApp {
         let p = PathBuf::from(path.trim());
         // 音频文件：整窗切到音乐模式播放（不进文本/媒体选项卡路由）。此拦截在 EPUB/PDF/
         // 图片/视频/文本分类**之前**——覆盖文件树双击、打开对话框、拖放、会话恢复、
-        // 最近打开等全部进 open_file 的中心入口（clap 一下）。
-        if music::is_audio_extension(&p) {
+        // 最近打开等全部进 open_file 的中心入口（clap 一下）。路由判定在
+        // `shell_media::music::is_audio_path`（域 crate）。
+        if shell_media::music::is_audio_path(&p) {
             self.open_music_path(p, window, cx);
             return;
         }

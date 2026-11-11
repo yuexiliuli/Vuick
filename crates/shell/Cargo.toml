@@ -60,6 +60,11 @@ shell_sidebar = { path = "../shell_sidebar" }
 # notify/persist 落地）、右键菜单视图/挂载与 win32 取色宿主 window 部分；经 PdfHost
 # 宿主服务面反调本宿主）。
 shell_pdf = { path = "../shell_pdf" }
+# 媒体/音乐域 crate（自 shell 的 app/media + app/media_window + app/music_player 拆出：
+# 查看器元数据同步 / 锁定菜单项构建 / 媒体窗口打开决策与路由决议 / 音乐模式判定；纯结构
+# 移动，shell 保留薄适配（菜单挂载 / 窗口装配 / MusicView 惰性创建与焦点编排）；经
+# MediaHost 宿主服务面反调本宿主）。
+shell_media = { path = "../shell_media" }
 # 音乐播放器（Phase A 引擎 + Phase B UI 已提交）：shell 集成（整窗音乐模式 /
 # 打开音频文件路由 / 状态栏指示）。不静态链 FFmpeg（运行时经 libloading 加载）。
 music = { path = "../music" }
@@ -71,8 +76,9 @@ default = ["video"]
 # （见 crates/video/Cargo.toml），一经 `dep:video` 开启即随之启用；显式转发点统一在根包。
 # --no-default-features 时本 feature 关闭 → 视频整链关闭、不拉 FFmpeg 依赖。
 # 同步转发 `shell_core/video`（MediaReader::Video 变体随 shell_core 的 `video` feature
-# 编译，与 shell 同一开关联动，避免两侧编译态分叉）。
-video = ["dep:video", "shell_core/video"]
+# 编译）与 `shell_media/video`（域 crate 的 video 半边随同一开关联动，避免两侧编译态
+# 分叉），保持「转发点统一在 shell」。
+video = ["dep:video", "shell_core/video", "shell_media/video"]
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。

@@ -272,3 +272,148 @@ impl shell_pdf::PdfHost for EditorApp {
         self.close_pdf_popups_predecessors();
     }
 }
+
+// 2026-11-11：媒体域宿主服务面（shell_media）。媒体窗口路由的「真正执行」与「最近其它
+// 媒体窗口」查询收敛到此 trait（方法体自原 app/media_window.rs 的 `open_media_in_new_window` /
+// `route_media_to_window` / `nearest_other_media_window` 整迁，行为零变化）；纯决策在
+// `shell_media::media_window`，宿主编排（`maybe_redirect_media_open` 等）据此分发执行。
+impl shell_media::MediaHost for EditorApp {
+    /// 「最近其它媒体窗口」查询：`EditorAppRegistry` 依赖收敛到宿主实现（域不直读注册表）。
+    /// 列表逆序首个媒体窗口 = 最近创建的媒体窗口；排除自身（按实体 id 比对）。
+    fn media_host_nearest_other_media_window(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyWindowHandle> {
+        if !cx.has_global::<EditorAppRegistry>() {
+            return None;
+        }
+        let self_id = cx.entity().entity_id();
+        let registry = cx.global::<EditorAppRegistry>();
+        registry.windows.iter().rev().find_map(|(weak, wh)| {
+            let entity = weak.upgrade()?;
+            if entity.entity_id() == self_id {
+                return None;
+            }
+            let is_media = entity.read_with(cx, |app, _| {
+                shell_media::media_window::media_window_kind(&app.model.borrow()).is_some()
+            });
+            is_media.then_some(*wh)
+        })
+    }
+
+    /// 媒体路由「真正执行」：新开同进程独立窗口并打开该媒体（原
+    /// `EditorApp::open_media_in_new_window`）。`open_window` 闭包内只造 app + root（构造
+    /// 期不打开文件——`new_media_window` 不读 CLI 首参/不恢复会话，防重定向循环与重复
+    /// 恢复），窗口创建成功后经窗口句柄补开媒体。发起窗口内容零改动。
+    /// 窗口尺寸：本次媒体种类（音频→音乐组 / 视频→视频组）有记录尺寸 → 按该尺寸居中开；
+    /// 未记录 → **跟随当前窗口大小**（`window.bounds()`，解决「新窗口比原窗口大不一致」）。
+    fn media_host_open_media_new_window(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let owned = path.to_string_lossy().into_owned();
+        // 首帧墙钟诊断（GPUI_EDITOR_DIAG 守卫，平时零开销零行为）：触发起点 = 本函数
+        // 入口；下方 [MEDIAWNDSZ] open / 路由完成两处补 wall 字段（轨 D 基线）。
+        let diag_t0 = if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        // 按本次媒体种类取对应记录尺寸（新窗口尚未是媒体窗口，按扩展名决定角色即可；
+        // 域决策 `shell_media::media_window::open_target_kind`）。
+        let kind = shell_media::media_window::open_target_kind(path);
+        // 取该角色记录尺寸：发起者是**媒体窗口**时自身内存即最新（本窗刚 record 过 /
+        // 当前角色同组，防抖未落盘期间也正确）；否则（主窗口等非媒体窗）内存可能陈旧——
+        // 媒体窗口 resize 自动写盘后不会广播到主窗口内存，会退化成「改好音乐窗尺寸→关→
+        // 再开仍是旧尺寸」。此时以 config 盘上最新记录优先、内存兜底（`UserPrefs::load()`
+        // 每次读盘，代价仅打开动作）。域决策 `shell_media::media_window::resolve_recorded_size`。
+        let disk = UserPrefs::load();
+        let recorded = shell_media::media_window::resolve_recorded_size(
+            kind,
+            self.media_window_kind().is_some(),
+            self.model.borrow().music_window_size,
+            self.model.borrow().video_window_size,
+            disk.music_window_size,
+            disk.video_window_size,
+        );
+        let bounds = match recorded {
+            Some(size) => {
+                // 最小尺寸护栏（防记录值退化到过小）：clamp 后居中于主显示器。
+                let size = gpui::size(
+                    px(size.width.as_f32().max(shell_media::media_window::MIN_MEDIA_WIN_W)),
+                    px(size.height.as_f32().max(shell_media::media_window::MIN_MEDIA_WIN_H)),
+                );
+                Bounds::centered(None, size, cx)
+            }
+            None => window.bounds(),
+        };
+        let titlebar_options = gpui::TitlebarOptions {
+            title: Some("GPUI 编辑器".into()),
+            appears_transparent: true,
+            ..Default::default()
+        };
+        if let Some(t0) = diag_t0 {
+            eprintln!(
+                "[MEDIAWNDSZ] open kind={kind:?} size={}x{} follow-source={} wall={:.1}ms",
+                bounds.size.width.as_f32().round() as i64,
+                bounds.size.height.as_f32().round() as i64,
+                recorded.is_none(),
+                t0.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        let handle: AnyWindowHandle = match cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(titlebar_options),
+                ..Default::default()
+            },
+            |new_window, cx| {
+                let view = cx.new(|cx| EditorApp::new_media_window(new_window, cx));
+                cx.new(|cx| ui::root::Root::new(view, new_window, cx))
+            },
+        ) {
+            Ok(h) => h.into(),
+            Err(e) => {
+                // 新窗创建失败（罕见 / 平台禁用）→ 回退当前窗口打开，保证媒体仍可用。
+                self.model.borrow_mut().status = SharedString::from(format!("打开媒体失败：{e}"));
+                self.model.borrow_mut().status_ok = false;
+                self.open_file_here(&owned, window, cx);
+                return;
+            }
+        };
+        self.media_host_route_media_to_window(path, handle, cx);
+        // 墙钟：触发 → 新窗口已创建 + 媒体已路由到目标窗口（`route_media_to_window` 内
+        // 直调目标窗口 `open_file_here` 同步打开）≈ 新窗口首帧前。
+        if let Some(t0) = diag_t0 {
+            eprintln!(
+                "[MEDIAWND] routed path={owned} wall={:.1}ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    /// 媒体路由「真正执行」：把媒体文件经目标窗口句柄转交该窗口 EditorApp 本体打开（原
+    /// `EditorApp::route_media_to_window`；同进程跨窗口实体 update；复用既有
+    /// `open_file_here`，目标窗口注册表已含自身）。目标窗口可能聚焦（打开动作里的
+    /// window.focus），复用已有媒体窗口时属预期行为。
+    fn media_host_route_media_to_window(
+        &self,
+        path: &std::path::Path,
+        wh: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let owned = path.to_string_lossy().into_owned();
+        let _ = wh.update(cx, |root, window, cx| {
+            // AnyWindowHandle::update 给的是窗口根视图（ui::root::Root），经
+            // Root::view() 下转型取承载的 EditorApp（root.rs 注释明确此用途）。
+            if let Ok(root) = root.downcast::<ui::root::Root>() {
+                let view = root.read(cx).view().clone();
+                if let Ok(app) = view.downcast::<EditorApp>() {
+                    let _ = app.update(cx, |app, cx| app.open_file_here(&owned, window, cx));
+                }
+            }
+        });
+    }
+}
