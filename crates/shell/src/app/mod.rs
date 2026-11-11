@@ -98,7 +98,7 @@ use config::layout::{
     SPLIT_RATIO_MIN,
 };
 use config::user::{PdfBgPref, ThemePref, UserPrefs};
-use crate::scrollbar::TableScrollState;
+use shell_widgets::scrollbar::TableScrollState;
 
 // SC-1：`EditorApp` 的纯模型类型已拆入独立 crate `shell_core`（2026-11-10）。
 // 此处经 `pub use` 重导出，维持既有 `app::EditorTab` / `app::DetachedTab` 等路径

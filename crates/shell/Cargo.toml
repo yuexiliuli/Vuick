@@ -48,6 +48,9 @@ shell_scan = { workspace = true }
 # SC-1：外壳宿主纯模型类型（EditorTab/DetachedTab/MediaReader/MdWyInstall/拖拽/标题栏
 # 等，自 app/mod.rs 拆出；shell 保留全部编排与 impl EditorApp，经 app 模块重导出）。
 shell_core = { path = "../shell_core" }
+# L0 纯 UI 组件叶子 crate（自 shell 的 scrollbar.rs + app/tabs.rs 的 TabBoundsRecorder
+# 拆出；纯结构移动，零 EditorApp 依赖，shell 保留编排与消费）。
+shell_widgets = { path = "../shell_widgets" }
 # 音乐播放器（Phase A 引擎 + Phase B UI 已提交）：shell 集成（整窗音乐模式 /
 # 打开音频文件路由 / 状态栏指示）。不静态链 FFmpeg（运行时经 libloading 加载）。
 music = { path = "../music" }

@@ -6,81 +6,9 @@
 
 use super::*;
 use config::timing::TAB_HSCROLL_HIDE_MS;
-use crate::scrollbar::horizontal_scrollbar;
+use shell_widgets::scrollbar::horizontal_scrollbar;
+use shell_widgets::TabBoundsRecorder;
 use ui::motion::hover_spring;
-
-/// 记录子元素（选项卡）每一帧 laid-out 的 border-box **边界**：`size` 供拖拽预览
-/// （[`TabDragGhost`] / 窗外幽灵窗）按真实选项卡尺寸定宽定高；`bounds` 供栏内拖拽排序
-/// 的命中测试（`self.tab_bounds`，与拖拽事件 `position` 同一输入坐标空间）。wrapper 与
-/// child **共享同一 LayoutId**（`request_layout` 直接转发 child 的（`div.rs:4817` 同款
-/// 姿势）），故 `prepaint` 收到的 `bounds` 即 child 的真实布局边界；host `debug_selector`
-/// 仍在 child 上、不受影响。
-struct TabBoundsRecorder {
-    size: Rc<Cell<Size<Pixels>>>,
-    bounds: Rc<Cell<Bounds<Pixels>>>,
-    child: gpui::AnyElement,
-}
-
-impl IntoElement for TabBoundsRecorder {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl gpui::Element for TabBoundsRecorder {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
-    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        (self.child.request_layout(window, cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: gpui::Bounds<gpui::Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
-    ) -> Self::PrepaintState {
-        if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
-            self.size.set(bounds.size);
-            self.bounds.set(bounds);
-        }
-        self.child.prepaint(window, cx);
-        ()
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        _bounds: gpui::Bounds<gpui::Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
-    ) {
-        self.child.paint(window, cx);
-    }
-}
 
 /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
 struct TabBarColors {

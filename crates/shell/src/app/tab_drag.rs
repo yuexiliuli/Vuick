@@ -10,7 +10,7 @@ use super::*;
 
 /// 拖拽预告（半透明选项卡）尺寸的**兜底估算**（仅真实 laid-out 尺寸尚未记录的首帧用）：
 /// 宽 = `shape_line` 文本宽 + px_2 两侧(16) + 2×gap(8) + 关闭钮(18) + 边框(4) ≈ +46；
-/// 高 = 选项卡 26。正常情况下 [`crate::app::tabs::TabBoundsRecorder`] 已把真实尺寸写入，
+/// 高 = 选项卡 26。正常情况下 [`shell_widgets::TabBoundsRecorder`] 已把真实尺寸写入，
 /// 不会走这里。
 pub(super) fn tab_preview_size(name: &str, dirty: bool, window: &Window) -> Size<Pixels> {
     let text = if dirty {

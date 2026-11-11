@@ -4291,6 +4291,7 @@ dependencies = [
  "shell_commands",
  "shell_core",
  "shell_scan",
+ "shell_widgets",
  "syntax",
  "text_open",
  "toc",
@@ -4332,6 +4333,14 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "memchr",
+]
+
+[[package]]
+name = "shell_widgets"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "gpui",
 ]
 
 [[package]]

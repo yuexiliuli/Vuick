@@ -50,7 +50,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["crates/media_ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/editor_core", "crates/text_open", "crates/markdown", "crates/markdown_wysiwyg", "crates/markdown_wysiwyg_engine", "crates/markdown_wysiwyg_mermaid", "crates/markdown_wysiwyg_math", "crates/toc", "crates/pdf", "crates/pdf_core", "crates/image_viewer", "crates/video", "crates/epub",     "crates/shell", "crates/shell_core", "crates/tray", "crates/music", "crates/session_store", "crates/shell_commands", "crates/shell_scan", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp",     "crates/kimg_ico", "crates/kimg_pnm", "crates/kimg_heif",
+members = ["crates/media_ffmpeg", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/editor_core", "crates/text_open", "crates/markdown", "crates/markdown_wysiwyg", "crates/markdown_wysiwyg_engine", "crates/markdown_wysiwyg_mermaid", "crates/markdown_wysiwyg_math", "crates/toc", "crates/pdf", "crates/pdf_core", "crates/image_viewer", "crates/video", "crates/epub",     "crates/shell", "crates/shell_core", "crates/tray", "crates/music", "crates/session_store", "crates/shell_commands", "crates/shell_scan", "crates/shell_widgets", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp",     "crates/kimg_ico", "crates/kimg_pnm", "crates/kimg_heif",
     "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`media_ffmpeg.dll`
@@ -142,6 +142,10 @@ session_store = { path = "crates/session_store" }
 # 纯结构移动，只重分配既有依赖，不新增外部包）。
 shell_commands = { path = "crates/shell_commands" }
 shell_scan = { path = "crates/shell_scan" }
+# shell_widgets 拆分（L0，2026-11-11）：纯 UI 组件叶子 crate（自 shell 的 scrollbar.rs +
+# app/tabs.rs 的 TabBoundsRecorder 拆出；纯结构移动，只重分配既有依赖，不新增外部包，
+# 零 EditorApp 依赖，供 shell 各域承接复用）。
+shell_widgets = { path = "crates/shell_widgets" }
 # shell_core 拆分（SC-1，2026-11）：外壳宿主纯模型类型（自 shell 的 app/mod.rs
 # 的 EditorTab/DetachedTab/MediaReader/MdWyInstall/拖拽/标题栏等拆出；纯结构移动，
 # 只重分配既有依赖，不新增外部包；宿主编排留在 shell）。

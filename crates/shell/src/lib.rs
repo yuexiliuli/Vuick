@@ -1,16 +1,16 @@
 //! gpui-editor 的**应用外壳 crate**（P5 顶层，最大迁移块）。
 //!
 //! 自根包 `src/app/`（31 文件）整体迁出的 crate：承载 `EditorApp` 主视图
-//! （自绘标题栏 + 菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览 + 状态栏）、
-//! 以及原根级 `src/scrollbar.rs`（`TableScrollState` / `horizontal_scrollbar`，
-//! 仅 app 消费的自绘美化横向滚动条）。
+//! （自绘标题栏 + 菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览 + 状态栏）。
+//! 原根级 `src/scrollbar.rs`（`TableScrollState` / `horizontal_scrollbar`）与
+//! 选项卡边界记录器 `TabBoundsRecorder` 已于 2026-11-11 迁入 L0 纯 UI 组件
+//! crate `shell_widgets`（本 shell 仅消费）。
 //!
 //! ## 结构
 //!
 //! - [`app`]：应用主视图 `EditorApp`（类型 / 状态 / 共享 prelude 在 `app::mod`，
 //!   方法按职责拆分到 `init`/`sync`/`preview`/`media`/`chrome`/`layout`/`file_ops`/
 //!   `open_progress`/`menu`/`palette`/`panes`/`sidebar`/`status_bar`/`tabs` 等子模块）
-//! - [`scrollbar`]：自绘横向滚动条（选项卡栏用）
 //! - [`bind_local_keymaps`]：完整本地快捷键组合（编辑区 Input + 窗口根 Root +
 //!   WYSIWYG wy-editor 三套键上下文），自原根包 `src/actions.rs` 上移而来
 //!
@@ -26,9 +26,6 @@ pub mod app;
 /// label 与快捷键常量，[`commands::root_keybindings`] 供二进制壳 `src/main.rs` 绑定）。
 /// 此处经 `commands` 别名重导出，维持既有 `shell::commands::*` 路径。
 pub use shell_commands as commands;
-
-/// 自绘横向滚动条（原根级 `src/scrollbar.rs`，仅 app 消费，随 shell 吸收）。
-mod scrollbar;
 
 /// 应用主视图 `EditorApp`（文本 / 代码 / Markdown 编辑器主窗口）。
 pub use app::EditorApp;
