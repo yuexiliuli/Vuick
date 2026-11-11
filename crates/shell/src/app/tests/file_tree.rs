@@ -420,7 +420,7 @@
         );
     }
 
-    /// 生产热路径回归（评审 BLOCK，2026-11-11）：目录行**左键单击**（`simulate_click`，
+    /// 生产热路径回归：目录行**左键单击**（`simulate_click`，
     /// 非程序化 `file_tree_toggle`）→ 展开 + 后台子项扫描落地（children 可见 / pending 清空）；
     /// 再次单击 → 折叠移出 expanded、children 缓存保留。旧实现目录行 on_click 绑定 Sidebar
     /// 实体（回调期间实体已租用 lease#1）→ 宿主 `sidebar_file_tree_toggle` → facade
@@ -485,7 +485,7 @@
             cx.debug_bounds("sidebar-file-row-2").is_none(),
             "折叠后子树行应不再渲染"
         );
-        // 根行同走「目录行」on_click 热路径（评审点「含根行」）：open_folder_path 已把根
+        // 根行同走「目录行」on_click 热路径（含根行）：open_folder_path 已把根
         // 展开，单击根行 → 折叠根（expanded 移出根；根行恒可见仍渲染）。
         let root_row = cx.debug_bounds("sidebar-file-row-0").expect("根行应渲染");
         cx.simulate_click(root_row.center(), Default::default());

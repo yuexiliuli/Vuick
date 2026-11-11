@@ -1,5 +1,4 @@
-//! 预览开关 / 全屏 / 换行的**模型半**（2026-11-11 自 `crates/shell` 的 `app/preview.rs`
-//! 迁出，纯结构移动）。
+//! 预览开关 / 全屏 / 换行的**模型半**。
 //!
 //! `toggle_preview_for_tab` 的「先激活目标选项卡」是宿主动作（tabs/pane 域），由 shell
 //! wrapper 在调用本模块状态函数**之前**执行（`activate_tab` → [`toggle_preview_for_tab_state`]），

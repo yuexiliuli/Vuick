@@ -1,5 +1,4 @@
-//! 编辑区 ⇄ 预览滚动同步（2026-11-11 自 `crates/shell` 的 `app/preview.rs` 迁出，纯结构
-//! 移动）。
+//! 编辑区 ⇄ 预览滚动同步。
 //!
 //! 同步单位 = 源码行所在**块起点**（两侧都经 `WyEditor::block_start_of_line` /
 //! `WyEditor::top_source_line` 归一成块）：同一块（段落/代码块/标题）内微滚动双方键不变、
@@ -17,7 +16,7 @@ use shell_core::{MdScrollSync, AppModel};
 /// I2：右栏预览「Scrub 延后」进入判定的连续跨块帧下限。预览连续 ≥ 此帧数快速跨块
 /// （右栏拖滚动条 / 高频滚屏）即判定为 Scrub 期——期内的编辑区 `scroll_to_line` 跟随
 /// **延后**到静止后一次收敛，消除「拖动每帧嵌编辑器全窗重建」的 28ms/帧卡顿
-/// （D1：ed.build_rows+prepaint+paint ≈11ms 叠加 WYSIWYG ~17ms）。低频单步滚屏
+/// （编辑区 build_rows+prepaint+paint ≈11ms 叠加 WYSIWYG ~17ms）。低频单步滚屏
 /// 跨块数不足、不触发，保持慢滚逐帧对齐。
 pub const SCRUB_ENTER_STREAK: u32 = 2;
 /// Scrub 延后期内「预览静止」的收敛帧数：预览连续 ≥ 此帧数不再跨块（拖条松手 /
@@ -45,7 +44,7 @@ pub const DRIVEN_EDITOR_MAX_AWAIT: u32 = 8;
 /// 上一帧渲染期推入的 `viewport_top_px`）——本帧推入发生在 sync 之后，故同步天然
 /// 滞后一帧；对逐帧收敛无影响，反而更稳。
 ///
-/// `state` = 宿主持有的 `MdScrollSync` 基线（builder 值类型随 SC 下沉 shell_core；
+/// `state` = 宿主持有的 `MdScrollSync` 基线（builder 值类型在 shell_core；
 /// `cx` 只用于读/写编辑区与预览实体，无需宿主服务。
 pub fn sync_editor_preview_scroll(
     state: &mut MdScrollSync,

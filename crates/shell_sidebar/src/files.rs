@@ -1,4 +1,4 @@
-//! 侧边栏「文件树」实体视图子模块（2026-11 自 shell 的 `app/sidebar/files.rs` 迁入）。
+//! 侧边栏「文件树」实体视图子模块。
 //!
 //! 以打开文件夹为根的嵌套目录树渲染（懒加载子项扫描 / 展开折叠 / 过滤防抖 typeahead /
 //! 行级打开跳转）。渲染期文件树状态（`FileTreeState` / 布局缓存 / 滚动句柄）在宿主
@@ -237,7 +237,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let Some(root) = sb.files.root.clone() else {
             return out;
         };
-        // SC-3：hold Ref guard 供 `filter` 引用（`borrow()` 临时在某语句末即释放，
+        // hold Ref guard 供 `filter` 引用（`borrow()` 临时在某语句末即释放，
         // 不能直接 `self.model.borrow().files_filter.as_str()` 返回 &str）。
         let m = self.model.borrow();
         let filter = m.files_filter.as_str();
@@ -517,7 +517,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             std::time::Duration::from_millis(FILES_FILTER_DEBOUNCE_MS),
             move |app| {
                 let _ = weak_self.update(app, |this, app| {
-                    // SC-3：先提纯 owned 再比较（`if` 条件里的 borrow 临时 Ref 会存活
+                    // 先提纯 owned 再比较（`if` 条件里的 borrow 临时 Ref 会存活
                     // 整个分支块 → 块内 borrow_mut 运行期双借 panic）。
                     let pending = std::mem::take(&mut this.model.borrow_mut().files_filter_pending);
                     let files_filter = this.model.borrow().files_filter.clone();

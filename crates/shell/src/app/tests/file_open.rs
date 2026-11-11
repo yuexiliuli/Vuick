@@ -995,10 +995,10 @@
         let _ = std::fs::remove_file(&dir);
     }
 
-    /// 评审 BLOCK-1 回归：大文档分块读盘**中途出错**（首块已挂载、EOF 前读盘报错，如
+    /// 回归：大文档分块读盘**中途出错**（首块已挂载、EOF 前读盘报错，如
     /// 后续读到非法 UTF-8 → 只发 `Err` 不发 `Eof`）时，`report_open_failure` 必须**解锁**
     /// `loading_lock`——否则选项卡永久停在「已显示首块但不可编辑/滚动」的锁状态
-    /// （评审发现 `loading_lock` 只在 `finish_file_text` 复位，失败路径此前漏解锁）。
+    /// （此前 `loading_lock` 只在 `finish_file_text` 复位，失败路径漏解锁）。
     /// 失败语义 = 保留已读到的部分内容、可继续查看/编辑。
     #[gpui::test]
     async fn mid_read_failure_unlocks_loading_lock(cx: &mut TestAppContext) {
@@ -1336,7 +1336,7 @@
         let _ = std::fs::remove_file(&dir);
     }
 
-    /// 回归（专家评审 P1 升级版）：固定窗口虚拟化下的大文档「深跳」——Ctrl+End /
+    /// 回归：固定窗口虚拟化下的大文档「深跳」——Ctrl+End /
     /// 搜索跳到远超视口的行时：
     /// 1. ListState 恒是**固定小窗口**（O(WINDOW) 挂载，不建 3.2M 条 → 内存 O(1)）；
     /// 2. 跳转**瞬时落位**（重定位 `window_base` 到目标行附近并渲染：无占位符、无

@@ -57,8 +57,8 @@ impl EditorApp {
     /// （PDF/图片/视频/EPUB/音乐整窗）→ toast「当前选项卡不支持跳转行」，不崩、不开卡。
     /// （旧命令面板 GoToLine 已被编辑区顶部居中卡片取代，见 `crates/editor/src/goto.rs`。）
     pub(super) fn goto_line_in_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // SC-2：把「媒体/只读判定 + 编辑器克隆」提到共享 guard 作用域内取完即释放——
-        // 否则命名 `model: Ref` 会拦后续 `&mut self`（E0502），先量后放、语义不变。
+        // 把「媒体/只读判定 + 编辑器克隆」提到共享 guard 作用域内取完即释放——
+        // 否则命名 `model: Ref` 会拦后续 `&mut self`（E0502），先量后放。
         let (is_media, ed) = {
             let active = self.model.borrow().active_tab;
             let model = self.model.borrow();
@@ -104,7 +104,7 @@ impl EditorApp {
     /// Ctrl+F：活动文本选项卡打开查找条；非文本选项卡（PDF/图片/视频/EPUB/音乐整窗）
     /// → toast「当前选项卡不支持查找」，不崩、不开条。
     pub(super) fn find_in_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // SC-2：同 `goto_line_in_active_tab`——判定 + 克隆在 guard 作用域内取完即放。
+        // 同 `goto_line_in_active_tab`——判定 + 克隆在 guard 作用域内取完即放。
         let (is_media, ed) = {
             let active = self.model.borrow().active_tab;
             let model = self.model.borrow();
@@ -131,7 +131,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
         next: bool,
     ) {
-        // SC-2：同 `goto_line_in_active_tab`——判定 + 克隆在 guard 作用域内取完即放。
+        // 同 `goto_line_in_active_tab`——判定 + 克隆在 guard 作用域内取完即放。
         let (is_media, ed) = {
             let active = self.model.borrow().active_tab;
             let model = self.model.borrow();

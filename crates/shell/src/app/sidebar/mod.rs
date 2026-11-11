@@ -1,8 +1,7 @@
-//! 侧边栏（2026-11-11 起为 **facade 模块**）。
+//! 侧边栏 **facade 模块**。
 //!
-//! 本模块原承担侧栏「类型 / 状态 / chrome 外壳渲染 / toc 目录视图 / 文件树渲染与操作 /
-//! 搜索」；类型、外壳渲染、目录视图、文件树渲染与操作（`files.rs` / `files_ops.rs`）与
-//! 搜索（`search.rs`）已整迁 `crates/shell_sidebar`（纯结构移动，行为零变），此处保留：
+//! 类型、外壳渲染、目录视图、文件树渲染与操作（`files.rs` / `files_ops.rs`）与
+//! 搜索（`search.rs`）在独立 crate `shell_sidebar`，此处保留：
 //!
 //! - 对 `shell_sidebar` 的类型/常量/纯函数 **`pub use` 重导出**，维持既有
 //!   `sidebar::SidebarChromeState` / `SidebarView` / `FileTreeState` 等路径（`app::tests`
@@ -21,8 +20,8 @@
 //!
 //! `EditorApp` 的侧栏状态**仍是普通字段 `sidebar: SidebarChromeState`**（测试字段读写
 //! 不变量），渲染/事件的实体侧由 `sidebar_view: Entity<shell_sidebar::Sidebar<EditorApp>>`
-//! 承接（见 [`crate::app::mod`] 字段注释）——其中文件树**右键菜单/输入弹层暂时句柄**
-//! 与搜索**输入实体**也随迁到实体（实体自有 pos/menu/sub/prompt / search_input），本宿主
+//! 承接（见 [`crate::app::mod`] 字段注释）——其中文件树**右键菜单/输入弹层句柄**
+//! 与搜索**输入实体**也在实体（实体自有 pos/menu/sub/prompt / search_input），本宿主
 //! 只留 `file_tree_menu_entity` / `file_tree_prompt` **测试兼容镜像**字段（`app::tests`
 //! 直接字段读取），生产渲染读实体。
 
@@ -39,7 +38,7 @@ use ui::input::InputState;
 /// 内部直连 `shell_scan`，不在此重导出。）
 #[allow(unused_imports)]
 pub(super) use shell_scan::FolderSearchScan;
-// SC-3：搜索**范围**枚举随 `EditorApp::search_scope` 迁入 shell_core（`AppModel` 字段
+// 搜索**范围**枚举在 shell_core（`AppModel` 字段
 // 类型需跨 crate 命名），此处重导出维持 `sidebar::SearchScopeTab` 与测试
 // （`crate::app::sidebar::SearchScopeTab`）的既有路径。
 pub(super) use shell_core::SearchScopeTab;
@@ -159,7 +158,7 @@ impl EditorApp {
 
     /// 后台读取某目录的**直接子项**并缓存（懒加载：一次只读这一层）。**宿主侧 spawn**
     /// （不 `sidebar_view.update` 回租 Sidebar 实体——目录行 on_click 回调期间实体已租用，
-    /// 回租即 `double_lease_panic`，见 D1 评审 BLOCK）；完成回调经 `update_window_entity`
+    /// 回租即 `double_lease_panic`）；完成回调经 `update_window_entity`
     /// 反调宿主 `SidebarHost::sidebar_file_tree_scan_complete`（纯变换 + notify）。
     /// 已在缓存 → 不复读；已在途 → 幂等返回。宿主既有调用点
     /// （`open_folder_path` / `settings_xfer` 导入 / `init` 启动恢复 / 树失效重扫）与目录
@@ -201,7 +200,7 @@ impl EditorApp {
     /// 文件树目录行展开/折叠（测试程序化入口与 `SidebarHost::sidebar_file_tree_toggle`
     /// 生产事件入口共用）。**宿主侧直落状态纯变换** `state::file_tree_toggle`（不再
     /// `sidebar_view.update` 回租 Sidebar 实体——行点击回调期间实体已租用，回租即
-    /// `double_lease_panic`，D1 评审 BLOCK；与 toc_collapse 同构）+ 首展宿主侧 spawn 扫描。
+    /// `double_lease_panic`；与 toc_collapse 同构）+ 首展宿主侧 spawn 扫描。
     pub(crate) fn file_tree_toggle(
         &mut self,
         path: PathBuf,

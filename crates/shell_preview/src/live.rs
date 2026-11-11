@@ -1,12 +1,11 @@
-//! WYSIWYG 活区（`live2`，本项目 `markdown_wysiwyg::WyEditor`）的**进入**（2026-11-11 自
-//! `crates/shell` 的 `app/preview.rs` 迁出，纯结构移动）。
+//! WYSIWYG 活区（`live2`，本项目 `markdown_wysiwyg::WyEditor`）的**进入**。
 //!
 //! 即「预览编辑测试」toggle ON 分支：以当前编辑区源快照（O(1) COW Rope）为数据源创建
 //! live2 实体（大文档后台解析 / 共享复用右栏已解析 Doc·消双解析），开启编辑日志收集
 //! （方案2）并订阅变更 → 行/字/脏计数 + 防抖会话持久化（经宿主
 //! [`crate::host::PreviewHost`]）。toggle OFF 分支（`commit_live` 写回）是宿主收尾，留 shell。
 //!
-//! ⚠️ 原 `EditorApp::toggle_live_test` 的**前置守卫**（`is_markdown_tab` 校验 + 状态栏
+//! ⚠️ `EditorApp::toggle_live_test` 的**前置守卫**（`is_markdown_tab` 校验 + 状态栏
 //! 文案 + 已开则 `commit_live` 关闭）留在 shell wrapper，此处只实现「未开则进入」。
 
 use std::cell::RefCell;
@@ -22,7 +21,7 @@ use crate::PreviewHost;
 /// `md_wy.doc().clone()` O(1) 复用（消双解析）而非 `open_from_rope` 整篇重解析。
 /// 回归测试据此断言「复用路径真的被走上」。
 /// 常驻编译（无 `#[cfg(test)]`）：shell 的测试构建把本 crate 当普通依赖编译（`cfg(test)`
-/// 恒关），探针须常驻才可被 shell 测试经重导出读取（同 shell_core `LIVE_COMMIT_*` 先例）。
+/// 恒关），探针须常驻才可被 shell 测试经重导出读取。
 #[doc(hidden)]
 pub static LIVE_ON_MD_WY_REUSE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -97,7 +96,7 @@ pub fn enter_live<H: PreviewHost>(
     let ed_sub = cx.subscribe(&ed, move |this, emitter, ev: &WyEvent, cx| {
         match ev {
             WyEvent::Changed => {
-                // SC-2：命名 RefMut guard + 用完即 drop（借用纪律收窄），
+                // 命名 RefMut guard + 用完即 drop（借用约束），
                 // 否则宿主 `preview_schedule_session_flush` 在 guard 存活期 → E0502。
                 let mut model_sub = model_c.borrow_mut();
                 if let Some(tab) =

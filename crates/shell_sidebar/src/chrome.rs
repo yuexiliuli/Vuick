@@ -1,10 +1,10 @@
-//! 侧边栏「外壳」实体（2026-11 自 shell 的 `app/sidebar/chrome.rs` 迁入并解耦）。
+//! 侧边栏「外壳」实体。
 //!
 //! [`Sidebar`] = 侧栏域实体：宿主 `EditorApp` 经 `sidebar_view: Entity<Sidebar<EditorApp>>`
 //! 持有，渲染期以 `&mut SidebarChromeState` 入参调用（状态在宿主普通字段、域内构建元素），
 //! 事件回调（活动栏点击 / 调宽手柄）经 [`crate::host::SidebarHost`] 反调宿主落地状态迁移。
 //!
-//! 与旧 `impl EditorApp` 的对应关系（逐行迁移，行为零变）：
+//! `EditorApp` 的既有 `impl` 入口对应到本实体的方法：
 //!
 //! - `render_sidebar` → [`Sidebar::render_sidebar_shell`]（`panel` 由宿主预构建传入：
 //!   Toc/Files 走本 crate `toc`/`files`、Search 走本 crate `search`）。

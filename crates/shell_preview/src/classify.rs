@@ -1,4 +1,4 @@
-//! 文件分类（模块级单一真值，2026-11-11 自 `crates/shell` 的 `app/preview.rs` 迁出）：
+//! 文件分类（模块级单一真值）。
 //! `classify` 把「扩展名 → 类型」与「语言 id / 状态栏 label」三张手写表合为一处；
 //! `is_*` 判定与 `language_id` / `language_label` 全部改调它。纯函数，无宿主依赖。
 

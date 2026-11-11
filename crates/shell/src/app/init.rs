@@ -6,7 +6,7 @@ use super::*;
 impl EditorApp {
     /// 创建并注册 `EditorApp` 实体（作为窗口的第一层视图，外层再由
     /// `ui::root::Root` 宿主包裹）。
-    /// P5：shell 独立 crate 后由二进制壳 `main.rs` 消费，`pub(crate)` → `pub`。
+    /// shell 独立 crate 后由二进制壳 `main.rs` 消费，`pub(crate)` → `pub`。
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
         Self::new_impl(window, cx, None, false, true)
     }
@@ -38,7 +38,7 @@ impl EditorApp {
         startup: bool,
     ) -> EditorApp {
         let focus_handle = cx.focus_handle();
-        // SC-4：宿主实体自身的弱句柄与 id（AppHost `&self` 服务经它再入宿主实体）。
+        // 宿主实体自身的弱句柄与 id（AppHost `&self` 服务经它再入宿主实体）。
         let own_weak = cx.weak_entity();
         let own_entity_id = cx.entity_id();
         // 侧边栏搜索输入框：内容变化 → 重刷 app（从而重算并展示搜索结果）。
@@ -80,8 +80,8 @@ impl EditorApp {
             .font_size
             .map(|v| v.clamp(FONT_MIN, FONT_MAX))
             .unwrap_or(DEFAULT_FONT_SIZE);
-        // SC-2/SC-3：模型半状态统一迁入 shell_core::AppModel——启动初值在此**一次性汇集**
-        // 交给 `AppModel::new`（语义与旧 `new_impl` 的同名字段完全一致；零选项卡 +
+        // 模型半状态统一容器在 shell_core::AppModel——启动初值在此**一次性汇集**
+        // 交给 `AppModel::new`（语义与 `new_impl` 的同名字段一致；零选项卡 +
         // active_tab=0 起手，其余派生状态取模型内默认）。
         let model = Rc::new(RefCell::new(AppModel::new(
             // 顶部状态文字（状态栏）：默认「就绪 / 正常」。
@@ -110,13 +110,13 @@ impl EditorApp {
             // A4：PDF 书签进程级读盘一次（`load_cached`；每窗构造都读盘是浪费）。
             shell_pdf::bookmarks::load_cached(),
         )));
-        // 侧边栏渲染/事件实体（2026-11-11 迁 shell_sidebar）：经共享 model + 宿主弱引用
+        // 侧边栏渲染/事件实体（shell_sidebar 域 crate）：经共享 model + 宿主弱引用
         // + 搜索输入实体（域自有态）构造；宿主渲染期以 `&mut self.sidebar` 入参调用其
         // 外壳/目录/搜索/文件树渲染。
         let sidebar_view = cx.new(|_| {
             shell_sidebar::Sidebar::new(model.clone(), own_weak.clone(), search.clone())
         });
-        // 选项卡栏渲染/事件实体（2026-11-11 迁 shell_tabs）：共享 model + 宿主弱引用构造；
+        // 选项卡栏渲染/事件实体（shell_tabs 域 crate）：共享 model + 宿主弱引用构造；
         // 宿主渲染期以 `&mut self.tab_bounds`（拖拽命中槽）/ `&self.tab_bar_hscroll` 入参
         // 调用其 render_tab_bar，事件回调经 TabsHost 反调宿主。
         let tab_bar_view = cx.new(|_| shell_tabs::TabBar::new(model.clone(), own_weak.clone()));
@@ -127,7 +127,7 @@ impl EditorApp {
             tab_bar_hscroll: TableScrollState::new(),
             tab_hscroll_delay: SeqAfter::default(),
             notifications: Vec::new(),
-            // 分割条面板状态（SC 下沉 PanesState）：split_ratio=0.5 / split_drag / 
+            // 分割条面板状态（PanesState 在 shell_core）：split_ratio=0.5 / split_drag / 
             // pending_split_ratio / splitter_hovered 四态收敛为一字段，默认值同旧逐字段。
             panes: PanesState::default(),
             sidebar: sidebar::SidebarChromeState {
@@ -241,7 +241,7 @@ impl EditorApp {
                             cx.window_appearance(),
                             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
                         );
-                        // SC-3：先提纯 Boolean 再进 if（条件里的 borrow 临时 Ref 存活整个
+                        // 先提纯 Boolean 再进 if（条件里的 borrow 临时 Ref 存活整个
                         // 分支 → 块内 borrow_mut 运行期双借 panic）。
                         let follow = this.model.borrow().theme_pref == ThemePref::Follow;
                         let not_equals_dark = this.model.borrow().dark_mode != dark;
@@ -393,7 +393,7 @@ impl EditorApp {
         registry.windows.push((weak, handle));
     }
 
-    /// 选项卡的编辑焦点句柄：SC-4 逻辑已迁 `AppModel::tab_focus_handle`
+    /// 选项卡的编辑焦点句柄：逻辑在 `AppModel::tab_focus_handle`
     /// （shell_core::actions，模型直读）；此处 glue 转发。
     pub(super) fn tab_focus_handle(&self, idx: usize, cx: &App) -> FocusHandle {
         let host: &dyn AppHost = self;

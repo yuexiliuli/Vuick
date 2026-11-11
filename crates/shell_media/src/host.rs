@@ -1,12 +1,11 @@
-//! 媒体域**宿主服务面**（2026-11-11，对照 `shell_pdf::PdfHost` / `shell_sidebar::SidebarHost`
-//! 先例）。
+//! 媒体域**宿主服务面**。
 //!
 //! 媒体窗口路由对宿主的交互收敛为最小接口：**纯决策**在 [`crate::media_window`]，路由的
 //! **真正执行**（新开窗口 / 跨窗口打开）与 **「最近其它媒体窗口」查询**（`EditorAppRegistry`
 //! 依赖是宿主内部实现）收敛到此 trait，使本 crate 不依赖 shell 的具体宿主类型。shell 侧
-//! 以 `impl MediaHost for EditorApp` 提供实现（`app/host_impl.rs`，方法体自原
-//! `media_window.rs` 的 `open_media_in_new_window` / `route_media_to_window` /
-//! `nearest_other_media_window` 整迁，行为零变化）。
+//! 以 `impl MediaHost for EditorApp` 提供实现（`app/host_impl.rs`，方法体薄转发宿主
+//! 的 `open_media_in_new_window` / `route_media_to_window` /
+//! `nearest_other_media_window`）。
 //!
 //! 本 trait 方法由宿主薄适配（`app::media_window::maybe_redirect_media_open`）**在自身
 //! `&mut self` 上下文中调用**——不是 SidebarHost 式 `WeakEntity` 反调，而是「域定义服务
@@ -31,7 +30,7 @@ pub trait MediaHost: 'static {
         Self: Sized;
 
     /// 媒体路由「真正执行」：新开同进程独立窗口并打开该媒体（窗口构造 / 尺寸选择 / 路由
-    /// 是宿主编排；原 `open_media_in_new_window`）。
+    /// 是宿主编排）。
     fn media_host_open_media_new_window(
         &mut self,
         path: &Path,
@@ -41,7 +40,7 @@ pub trait MediaHost: 'static {
         Self: Sized;
 
     /// 媒体路由「真正执行」：把媒体文件经目标窗口句柄转交该窗口宿主本体打开（跨窗口
-    /// `open_file_here`；原 `route_media_to_window`）。
+    /// `open_file_here`）。
     fn media_host_route_media_to_window(
         &self,
         path: &Path,

@@ -1,15 +1,13 @@
-//! 选项卡栏**宿主服务面**（2026-11-11，对照 `shell_sidebar::SidebarHost` /
-//! `shell_preview::PreviewHost` 先例）。
+//! 选项卡栏**宿主服务面**。
 //!
 //! 选项卡栏域对宿主的交互收敛为最小接口：域逻辑（[`crate::bar::TabBar`] 实体渲染 +
 //! 共享 `AppModel` 模型态）不依赖 shell 的具体宿主类型；凡**必须落宿主的副作用**
 //! （激活/关闭/批关闭/跨窗动作、预览切换、横向滚动条点亮、右键菜单槽位落地）经本
 //! trait 反调宿主 `EditorApp`；拖拽开始预建窗外幽灵窗入口
-//! `tabs_host_prime_drag_ghost` 已随 H2 迁至 [`crate::drag::TabDragHost`]。shell 侧以
-//! `impl shell_tabs::TabsHost for EditorApp` 提供实现（`app/host_impl.rs`，方法体自原
-//! `EditorApp` 既有方法薄转发，行为零变化）。
+//! `tabs_host_prime_drag_ghost` 位于 [`crate::drag::TabDragHost`]。shell 侧以
+//! `impl shell_tabs::TabsHost for EditorApp` 提供实现（`app/host_impl.rs`，方法体薄转发）。
 //!
-//! ## 借用纪律
+//! ## 借用约束
 //!
 //! 域侧调用点都在「宿主实体未被租用」的**事件回调**（选项卡元素 `mouse_down` /
 //! `on_drag` / 滚轮 / 菜单项 `on_click`）内经 `WeakEntity<H>::update` 反调宿主——渲染期

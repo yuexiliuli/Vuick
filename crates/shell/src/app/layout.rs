@@ -52,8 +52,8 @@ impl EditorApp {
     /// 零选项卡 → 欢迎页整屏占满正文区（不渲染编辑区）。
     pub(super) fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         // 新模型：欢迎页只在「零选项卡」时呈现。只要有 ≥1 个选项卡——哪怕新建出的
-        // 空白未命名文档——就直接渲染编辑区（可键入），绝不叠欢迎页（原 `is_empty_body`
-        // 把「未命名空文档」也算空态的语义已被模型 3 取代：有 tab 即不显示欢迎页）。
+        // 空白未命名文档——就直接渲染编辑区（可键入），绝不叠加欢迎页（「未命名空文档」
+        // 也视为已打开，不再算空态）。
         if self.model.borrow().tabs.is_empty() {
             return Self::pane_wrap(
                 Some("app-empty-body"),
@@ -155,7 +155,7 @@ impl EditorApp {
     }
 
     /// 正文区面板统一外壳：`.flex().flex_1().min_h(0).min_w(0).overflow_hidden()`
-    /// 防坍缩样板收敛为一处（`flex_1` 高度坍缩会毁滚动/命中，K19 同款先例），外加
+    /// 防坍缩样板收敛为一处（`flex_1` 高度坍缩会毁滚动/命中），外加
     /// 可选 id / debug_selector / relative（欢迎页需 relative，其余分支不设）。
     /// id/debug_selector 的组合在宏内每臂保持单一具体元素类型（`Div` 与
     /// `Stateful<Div>` 互斥），避免 `if` 赋值跨类型分叉。
@@ -361,7 +361,7 @@ impl EditorApp {
                 cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
                     // 窗口内松开：若本次拖拽落在选项卡行内的插入位 → 落地排序；
                     // 无插入位 = 原位保留。无论与否都撤预位、销毁幽灵窗。
-                    // SC-3：先提纯 owned 再分支——避免 `if let` 掮获的 Ref/RefMut 临时
+                    // 先提纯 owned 再分支——避免 `if let` 掮获的 Ref/RefMut 临时
                     // 存活整个分支体（运行期双借 panic / E0502 拦 &mut self 方法）。
                     let dragging = this.model.borrow().tab_dragging;
                     if let Some(from) = dragging {
@@ -508,7 +508,7 @@ impl EditorApp {
             // flex 内部容器的 absolute 子元素在真机合成路径一直不被绘制（历史遗留 bug）——
             // 作为外层 relative 的直子（如材质层）才正常渲染。
             .child(self.render_notifications(window, cx))
-            // 命令面板浮层（P2-8）：同样作为外层 relative 的直子挂载（合成层纪律同上）。
+            // 命令面板浮层：同样作为外层 relative 的直子挂载（合成层约束同上）。
             .child(self.render_palette(window, cx))
     }
 

@@ -1,5 +1,5 @@
-//! PDF 域**宿主薄适配**（2026-11-11）：域逻辑（书签持久化 / 背景重着色 / 页操作动作 /
-//! 错误映射）已迁独立 crate `shell_pdf`；本模块只保留宿主 `EditorApp` 的薄适配与右键
+//! PDF 域**宿主薄适配**：域逻辑（书签持久化 / 背景重着色 / 页操作动作 /
+//! 错误映射）在独立 crate `shell_pdf`；本模块只保留宿主 `EditorApp` 的薄适配与右键
 //! 菜单的**视图/挂载**：
 //!
 //! - **书签 / 背景 / 失败 toast**：模型读数/写数转发 `shell_pdf` 域函数，宿主落地
@@ -11,7 +11,7 @@
 //!   槽位收敛到 [`EditorApp::close_pdf_popups_predecessors`]，供
 //!   `shell_pdf::PdfHost::pdf_host_close_all_popups`（宿主实现，`host_impl.rs`）与
 //!   [`EditorApp::on_pdf_right_click`] 共用。
-//! - **取色**：win32 `CHOOSECOLORW` FFI 已迁 `shell_pdf::bg::pick_color`；本模块只留
+//! - **取色**：win32 `CHOOSECOLORW` FFI 在 `shell_pdf::bg::pick_color`；本模块只留
 //!   当前窗口 HWND 提取 + `set_pdf_bg` 落地的宿主 window 部分。
 
 use super::*;
@@ -459,7 +459,7 @@ impl EditorApp {
     /// `tray::set_clipboard_image_bgra` 写系统剪贴板 CF_DIB。成功 toast 尺寸；取图失败
     /// （文档已关闭 / 对象失效 / worker 超时）或剪贴板被占用 → toast 失败文案。
     /// 取数是**按需一次性**、不缓存大图像素（只过一手剪贴板）。
-    /// （2026-11-11：走 `tray` 剪贴板宿主服务，随 tray 留宿主。）
+    /// （走 `tray` 剪贴板宿主服务，随 tray 留宿主。）
     pub(crate) fn pdf_copy_image_action(
         &mut self,
         window: &mut Window,

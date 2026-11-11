@@ -1,9 +1,9 @@
-//! 文件树**宿主侧文件副作用**（2026-11-11 自 `app/sidebar/files_ops.rs` 拆出）。
+//! 文件树**宿主侧文件副作用**。
 //!
-//! 菜单结构 / 输入弹层生命周期已迁 `shell_sidebar`（`files_ops.rs`）；这里只剩「新建 /
+//! 菜单结构 / 输入弹层生命周期在 `shell_sidebar`（`files_ops.rs`）；这里只剩「新建 /
 //! 重命名 / 删除 / 复制 / 剪贴板 / 拖放落盘」这类**文件系统副作用** + 树失效 + 会话落盘，
 //! 经 [`shell_sidebar::SidebarHost`] / [`shell_sidebar::FileTreePromptHost`] 由域实体分发
-//! 到本模块执行（行为零变）。`file_tree_submit_prompt` 即 `FileTreePromptHost` 的提交目标。
+//! 到本模块执行。`file_tree_submit_prompt` 即 `FileTreePromptHost` 的提交目标。
 
 use super::file_tree_prompt::FileTreePromptKind;
 use super::*;

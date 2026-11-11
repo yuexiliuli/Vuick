@@ -1,5 +1,4 @@
-//! 统一 `md_wy` WyEditor 预览（2026-11-11 自 `crates/shell` 的 `app/preview.rs` 迁出，
-//! 纯结构移动）。
+//! 统一 `md_wy` WyEditor 预览。
 //!
 //! 右栏 / 全屏预览统一组件 `WyEditor`（A1 只读门控，MD / EPUB / 纯文本共用）的懒创建 /
 //! 喂源 / 增量对齐 / 整篇装配。含 B3 后台整篇异步装配（`md_wy_feed_full` /
@@ -42,7 +41,7 @@ pub const MD_WY_ASYNC_INSTALL_MIN_BYTES: usize = 512 * 1024;
 /// 同步路径不再 O(n) 解析」。
 ///
 /// 常驻编译（无 `#[cfg(test)]`）：shell 的测试构建把本 crate 当普通依赖编译（`cfg(test)`
-/// 恒关），探针须常驻才可被 shell 测试经重导出读取（同 shell_core `LIVE_COMMIT_*` 先例）。
+/// 恒关），探针须常驻才可被 shell 测试经重导出读取。
 #[doc(hidden)]
 pub static LIVE_COMMIT_MD_WY_ASYNC: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -221,7 +220,7 @@ pub fn ensure_md_wy<H: 'static>(
 /// EPUB：确保右栏 WyEditor **只读宿主**已创建（懒创建 + A1 只读门控 + 全局字号/
 /// 基准目录/内存图片表），并用 EPUB 源**同步喂源**（P4-1：EPUB 迁 WyEditor）。
 /// 只读（`set_editable(false)`）、标题居中（`set_epub(true)`）、`epubimg://…` 内存图
-/// （`set_memory_images`）、注记浮卡/引文跳转正文（`set_notes`，P4-2 迁入）。
+/// （`set_memory_images`）、注记浮卡/引文跳转正文（`set_notes`）。
 pub fn ensure_epub_wy<H: 'static>(
     model: &Rc<RefCell<AppModel>>,
     idx: usize,

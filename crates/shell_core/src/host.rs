@@ -1,11 +1,11 @@
-//! AppHost——宿主服务面（SC-4，2026-11-10 自 shell 的 `impl EditorApp` 动作方法体迁出）。
+//! AppHost——宿主服务面。
 //!
-//! 迁入 `crates/shell_core::AppModel` 的动作方法体（tabs 动作半 / tab_drag payload 半 /
-//! session 编排纯逻辑 / file_ops 纯逻辑）要把原本对宿主的直调统一收口到本 trait：
+//! `crates/shell_core::AppModel` 的动作方法体（tabs 动作半 / tab_drag payload 半 /
+//! session 编排纯逻辑 / file_ops 纯逻辑）把原本对宿主的直调统一收口到本 trait：
 //! AppModel 方法持 `&dyn AppHost`（宿主把 `&*self` 作为 `&dyn AppHost` 传进来），
 //! 宿主服务在本 trait 声明、在 `impl AppHost for EditorApp`（shell 侧）实现。
 //!
-//! ## 借用纪律（本 trait 方法的硬约束，违反 = 运行期 RefCell 双借 panic）
+//! ## 借用约束（本 trait 方法的硬约束，违反 = 运行期 RefCell 双借 panic）
 //!
 //! 动作方法被调用时，宿主正持有 `AppModel` 的**可变借用**（
 //! `self.model.borrow_mut().yyy(host_self, …)`）；因此：
@@ -34,7 +34,7 @@ pub trait AppHost: 'static {
     /// 返回 `AnyWeakEntity` 是为保证本 crate 无需命名宿主具体类型（如 `EditorApp`）。
     fn self_weak(&self) -> AnyWeakEntity;
 
-    /// 宿主通知（= 原 `Context::notify()`：标脏宿主实体所在窗口，下一帧重绘）。
+    /// 宿主通知（= `Context::notify()`：标脏宿主实体所在窗口，下一帧重绘）。
     fn notify_host(&self, cx: &mut App);
 
     /// 拆出/拖拽窗口构造期标志（宿主 `constructing` 字段）：构造中抑制多余 notify，
@@ -63,9 +63,8 @@ pub trait AppHost: 'static {
 
     /// 当前是否为 **shell 测试构建**（宿主侧 `cfg!(test)`）。
     ///
-    /// 迁入 `AppModel` 的持久化逻辑（`persist_session` / `persist_prefs`）原以
-    /// `cfg!(test)` 在 shell 侧短路「测试不落盘」；shell_core 作依赖编译时该宏恒假，
-    /// 无法复现。借此 getter 把「shell 是否测试构建」经宿主回传，行为逐字保持
-    /// （测试构建恒跳过写盘；生产恒走盘）。
+    /// `AppModel` 的持久化逻辑（`persist_session` / `persist_prefs`）以 `cfg!(test)`
+    /// 在 shell 侧短路「测试不落盘」；shell_core 作依赖编译时该宏恒假，无法复现。
+    /// 借此 getter 把「shell 是否测试构建」经宿主回传（测试构建恒跳过写盘；生产恒走盘）。
     fn is_test_build(&self) -> bool;
 }

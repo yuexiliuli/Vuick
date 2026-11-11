@@ -1,6 +1,6 @@
-//! 媒体查看器（图片 / 视频 / PDF）接线**宿主薄适配**（2026-11-11）：活动选项卡的媒体
+//! 媒体查看器（图片 / 视频 / PDF）接线**宿主薄适配**：活动选项卡的媒体
 //! 判定与元数据同步（标签标题 / 状态栏跟随）、右键「锁定/解锁」上下文菜单及其浮层渲染
-//! 的**逻辑段**已迁独立 crate `shell_media`（`sync_active_media_meta` /
+//! 的**逻辑段**在独立 crate `shell_media`（`sync_active_media_meta` /
 //! `active_media_viewer` / `active_media_locked` / `lock_menu_item` / `lock_menu_overlay`）；
 //! 本模块保留**菜单挂载**与宿主 `media_lock_menu_*` 槽位：
 //!

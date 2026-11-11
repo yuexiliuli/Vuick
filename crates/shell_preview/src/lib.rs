@@ -1,16 +1,15 @@
-//! 预览域 crate（2026-11-11 自 `crates/shell` 的 `app/preview` + `app/panes` 的预览渲染半
-//! 拆出）。
+//! 预览域 crate。
 //!
-//! 纯结构移动 + 域内解耦：把预览域的**统一 WyEditor（`md_wy`）安装 / 整篇装配 / 增量对齐 /
+//! 把预览域的**统一 WyEditor（`md_wy`）安装 / 整篇装配 / 增量对齐 /
 //! 活区（WYSIWYG）进入 / 编辑⇄预览滚动同步 / 路径分类 / 预览渲染元素**从 `EditorApp` 的
-//! `impl` 块整迁出来，使这些逻辑可独立编译 / 独立测试。宿主 `EditorApp` 只保留薄适配：
+//! `impl` 块移交出来，使这些逻辑可独立编译 / 独立测试。宿主 `EditorApp` 只保留薄适配：
 //!
 //! - **模型字段**：`tabs[].md_wy` / `md_wy_vscroll` / `md_wy_install` / `live2` / `live_edit`
 //!   / `live2_dirty` / `_live2_sub` / `live_vscroll` / `preview_on` / `preview_fullscreen` /
 //!   `readonly_preview` / `epub_images` / `epub_notes` 与 `font_size` / `wrap_enabled` /
 //!   `status` 等仍在 `shell_core::AppModel`（本 crate 直接消费，跨 crate 命名经 shell_core）。
 //! - **宿主服务面**：活区编辑防抖持久化 / Ctrl+滚轮缩放字号 / 预览拖放打开 经泛型宿主
-//!   [`host::PreviewHost`]（对照 `shell_pdf::PdfHost` / `shell_media::MediaHost` 先例）
+//!   [`host::PreviewHost`]
 //!   反调宿主；域不直读 `EditorApp`。
 //! - **留宿主的薄适配**：编辑事件**订阅与 feed 入口**（`app/sync.rs`：`subscribe_editor` /
 //!   `on_editor_edited` 等，改经 `md_wy_feed_full_rope` / `preview_apply_edit` 调域）、
@@ -32,8 +31,8 @@
 //!   元素复用与自绘滚动条）。
 //! - [`host`]：[`PreviewHost`] 宿主服务面。
 //!
-//! 依赖只重分配 workspace 既有包（gpui / ui / config / shell_core / markdown_wysiwyg /
-//! text_open / image_viewer / ropey / video 可选），不新增外部包。
+//! 依赖 workspace 既有包（gpui / ui / config / shell_core / markdown_wysiwyg /
+//! text_open / image_viewer / ropey / video 可选）。
 
 pub mod classify;
 pub mod host;

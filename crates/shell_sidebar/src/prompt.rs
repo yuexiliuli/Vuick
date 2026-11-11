@@ -1,11 +1,11 @@
-//! 文件树「新建/重命名」输入弹层（2026-11 自 shell 的 `app/file_tree_prompt.rs` 整迁）。
+//! 文件树「新建/重命名」输入弹层。
 //!
 //! 居中 Acrylic 卡片 + 单行输入框（复用 `ui::input`），回车/确定提交 → 回调宿主执行
 //! 文件系统操作；失败在卡片内联提示（不静默丢反馈）；Esc/取消/点外 → 关闭（发
 //! `DismissEvent`，宿主清引用释放实体）。焦点管理同 `session_store::RecentPanel`
 //! （开前记焦点、动作未带走才归还）。
 //!
-//! 泛型宿主 [`FileTreePromptHost`]（对照 `RecentPanelHost` 先例）：域 crate 不依赖 shell
+//! 泛型宿主 [`FileTreePromptHost`]：域 crate 不依赖 shell
 //! 具体宿主类型，`WeakEntity<H>` 弱引用反调提交动作。
 
 use std::path::PathBuf;
@@ -323,7 +323,7 @@ impl<H: FileTreePromptHost> Render for FileTreePrompt<H> {
                     .child(ok_btn),
             );
 
-        // 合成层纪律（同 RecentPanel/命令面板）：整层 deferred 独立绘制 + 全窗包裹
+        // 合成层约束：整层 deferred 独立绘制 + 全窗包裹
         // 做水平居中 + `occlude()`（BlockMouse）防点击穿透到下层。
         let win_w = window.bounds().size.width.as_f32();
         let x = ((win_w - 360.) / 2.).max(8.);

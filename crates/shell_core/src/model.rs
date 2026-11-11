@@ -1,13 +1,13 @@
-//! 外壳宿主模型类型（2026-11 自 `crates/shell` 的 `app/mod.rs` 拆出）。
+//! 外壳宿主模型类型。
 //!
-//! 纯结构移动：`EditorApp` 的模型类型独立成 `shell_core` crate，宿主编排（`impl
-//! EditorApp`）留在 shell。字段可见性按「宿主 / 测试跨 crate 要读写者 → `pub`」调整
-//! （最小面，SC-2 再全面）；类型自包含的 inherent impl（[`MediaReader`] /
-//! [`WinCtrlKind`] / [`Render` for [`TabDragGhost`]]）随类型迁入。
+//! `EditorApp` 的模型类型独立成 `shell_core` crate，宿主编排（`impl
+//! EditorApp`）留在 shell。字段可见性按「宿主 / 测试跨 crate 要读写者 → `pub`」调整；
+//! 类型自包含的 inherent impl（[`MediaReader`] / [`WinCtrlKind`] / [`Render` for
+//! [`TabDragGhost`]]）随类型一并置于本 crate。
 //!
 //! 依赖的宿主类型（[`crate::app::EditorApp`] / `EditorAppRegistry`）不在此 crate；滚动
 //! 同步 / 面板分割 / 活区内衬等纯值类型（[`MdScrollSync`] / [`MdTocScroll`] / [`PanesState`]
-//! / [`LIVE_BODY_PAD_Y`]）随 SC 下沉至此，宿主以重导出维持既有路径。
+//! / [`LIVE_BODY_PAD_Y`]）下沉至此，宿主以重导出维持既有路径。
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -27,12 +27,12 @@ use config::user::{PdfBgPref, ThemePref};
 
 /// WYSIWYG / MD 统一预览宿主 `#live-body` 的顶部内衬（px）：缩放锚点在做「宿主
 /// ScrollHandle 偏移 ↔ WyEditor 元素局部 y」换算时使用，必须与各宿主容器
-/// `.py(px(LIVE_BODY_PAD_Y))` 保持一致（原 `app::panes::LIVE_BODY_PAD_Y` 下沉）。
+/// `.py(px(LIVE_BODY_PAD_Y))` 保持一致。
 pub const LIVE_BODY_PAD_Y: f32 = 8.0;
 
-/// A4：Markdown 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：
-/// 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。
-/// 自 `crate::app` 下沉（纯值类型，壳侧以重导出维持既有路径）。
+/// 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：右栏统一组件
+/// `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。纯值类型，壳侧以重导出
+/// 维持既有路径。
 #[derive(Clone)]
 pub enum MdTocScroll {
     Unified(gpui::Entity<WyEditor>),
@@ -41,7 +41,7 @@ pub enum MdTocScroll {
 /// 编辑区⇄预览滚动同步基线（见 shell 侧 `preview::sync_editor_preview_scroll`）。记录
 /// 当前选项卡 + 编辑器内容版本 + 上次已同步的双方「块起点」键，渲染帧比对后由动了
 /// 的那一侧驱动对端。切换选项卡 / 同一选项卡内换文档 / 编辑使内容版本变化 → 重建。
-/// 自 `crate::app` 下沉（纯值类型，壳侧以重导出维持既有路径）。字段跨 crate 读写
+/// 纯值类型，壳侧以重导出维持既有路径。字段跨 crate 读写
 /// （宿主 sync 每帧改 / 测试断言语义）→ 按本 crate 模型类型约定全部 `pub`。
 #[derive(Clone, Copy)]
 pub struct MdScrollSync {
@@ -98,9 +98,9 @@ impl Default for MdScrollSync {
     }
 }
 
-/// 「编辑区 ⇄ 预览分割条」面板状态包（原 `EditorApp` 四个 split 字段收敛；纯值类型，
-/// 随 SC 模型下沉迁入本 crate）。宿主 `EditorApp` 以**普通字段** `panes: PanesState`
-/// 持有（非 `Rc<RefCell>`：渲染 / 拖拽事件路径多处直读，保持借用语义零变化）。
+/// 「编辑区 ⇄ 预览分割条」面板状态包（`EditorApp` 四个 split 字段收敛的纯值类型）。
+/// 宿主 `EditorApp` 以**普通字段** `panes: PanesState` 持有（非 `Rc<RefCell>`：
+/// 渲染 / 拖拽事件路径多处直读）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PanesState {
     /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）。
@@ -112,8 +112,8 @@ pub struct PanesState {
     #[doc(hidden)]
     pub split_drag: Option<(f32, f32)>,
     /// 拖分割条帧级合并（B4）：`on_mouse_move` 只记**最新目标比例**，本帧 `render`
-    /// 开头统一落地到 `split_ratio`（对齐 scrollbar `pending_target`→prepaint 先例）。
-    /// 语义不变：分割条拖动仍实时跟手（每帧一落），只合并 notify 频率。
+    /// 开头统一落地到 `split_ratio`（同 scrollbar `pending_target`→prepaint 的帧末统一
+    /// 落地节奏）。语义不变：分割条拖动仍实时跟手（每帧一落），只合并 notify 频率。
     /// 须保持 `pub`（`PanesState` 在 shell_core、唯一消费方 layout.rs 在 shell，跨 crate
     /// 读写），doc-hidden 收敛对外文档面。
     #[doc(hidden)]
@@ -183,125 +183,124 @@ pub enum CommitLiveAlign {
     },
 }
 
-/// 外壳宿主「模型半」状态的统一容器（SC-2/SC-3，2026-11-10 自 `EditorApp` 迁出）。
+/// 外壳宿主「模型半」状态的统一容器。
 ///
 /// 只装**跨窗口搬迁 / 会话持久化 / 设置与搜索态 / 测试直接断言的模型态**（tabs /
 /// active_tab / 侧边栏搜索态 / 最近文件 / 会话编排 / 偏好设置等）；UI 半状态（窗口句柄 /
 /// 布局 / 聚焦 / 主题 glue / registry / 输入框实体 / 菜单实体）留在宿主 `EditorApp`。
 /// 宿主经 `Rc<RefCell<AppModel>>` 持有，借 read/write 分 `borrow()/.borrow_mut()`。
 ///
-/// ⚠️ 借用纪律（SC-2 同款）：RefCell 是**单元格级**互斥，同一方法内持有 `borrow_mut()`
+/// ⚠️ 借用约束：RefCell 是**单元格级**互斥，同一方法内持有 `borrow_mut()`
 /// 守卫时不可再 `borrow()`/`borrow_mut()`（运行期双借 panic）；跨字段读写在守卫内一次
 /// 完成，方法调用前先 `drop` 守卫。
 pub struct AppModel {
-    /// 所有文件选项卡（原 `EditorApp::tabs`）。
+    /// 所有文件选项卡。
     pub tabs: Vec<EditorTab>,
-    /// 当前激活的选项卡下标（原 `EditorApp::active_tab`）。
+    /// 当前激活的选项卡下标。
     pub active_tab: usize,
-    /// 顶部状态文字（状态栏；原 `EditorApp::status`）。
+    /// 顶部状态文字（状态栏）。
     pub status: SharedString,
-    /// 顶部状态文字是否"正常"（原 `EditorApp::status_ok`）。
+    /// 顶部状态文字是否"正常"。
     pub status_ok: bool,
-    /// 编辑器正文字号（px，用户可调；原 `EditorApp::font_size`）。
+    /// 编辑器正文字号（px，用户可调）。
     pub font_size: f32,
-    /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅（原 `dark_mode`）。
+    /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅。
     pub dark_mode: bool,
-    /// 主题偏好三态：Follow=跟随系统 / Light / Dark（原 `EditorApp::theme_pref`）。
+    /// 主题偏好三态：Follow=跟随系统 / Light / Dark。
     pub theme_pref: ThemePref,
-    /// 编辑区是否自动换行（默认换行；原 `EditorApp::wrap_enabled`）。
+    /// 编辑区是否自动换行（默认换行）。
     pub wrap_enabled: bool,
-    /// 「恢复上次会话」开关（文件 → 菜单切换，随 [`UserPrefs`] 持久化；原 `session_restore`）。
+    /// 「恢复上次会话」开关（文件 → 菜单切换，随 [`UserPrefs`] 持久化）。
     pub session_restore: bool,
-    /// 「关闭到系统托盘」开关（文件 → 菜单切换，持久化；原 `EditorApp::close_to_tray`）。
+    /// 「关闭到系统托盘」开关（文件 → 菜单切换，持久化）。
     pub close_to_tray: bool,
-    /// 「媒体在新窗口打开」开关（查看 → 菜单切换，持久化；原 `media_new_window`）。
+    /// 「媒体在新窗口打开」开关（查看 → 菜单切换，持久化）。
     pub media_new_window: bool,
-    /// 「复用已有媒体窗口」开关（查看 → 菜单切换，持久化；原 `reuse_media_window`）。
+    /// 「复用已有媒体窗口」开关（查看 → 菜单切换，持久化）。
     pub reuse_media_window: bool,
-    /// 音乐窗口的已记录尺寸（逻辑像素，来自 [`UserPrefs::music_window_size`]；原 `music_window_size`）。
+    /// 音乐窗口的已记录尺寸（逻辑像素，来自 [`UserPrefs::music_window_size`]）。
     pub music_window_size: Option<Size<Pixels>>,
-    /// 视频窗口的已记录尺寸（与 `music_window_size` 对称；原 `video_window_size`）。
+    /// 视频窗口的已记录尺寸（与 `music_window_size` 对称）。
     pub video_window_size: Option<Size<Pixels>>,
-    /// 媒体窗口尺寸记录的防抖落盘（原 `EditorApp::media_size_flush_debounce`）。
+    /// 媒体窗口尺寸记录的防抖落盘。
     pub media_size_flush_debounce: SeqAfter,
-    /// 会话持久化防抖（原 `EditorApp::session_flush_debounce`）：可重入、代序作废，
+    /// 会话持久化防抖：可重入、代序作废，
     /// 内容变化停顿后才写盘一次。
     pub session_flush_debounce: SeqAfter,
-    /// 会话恢复进行中：恢复期间重建的选项卡不触发持久化（原 `session_restoring`）。
+    /// 会话恢复进行中：恢复期间重建的选项卡不触发持久化。
     pub session_restoring: bool,
-    /// 会话槽位「上次落盘内容」指纹：slot 名 → 内容 hash（原 `session_slot_hashes`）。
+    /// 会话槽位「上次落盘内容」指纹：slot 名 → 内容 hash。
     pub session_slot_hashes: HashMap<String, u64>,
-    /// 上次成功写盘时的清单指纹（清单序列化后 hash；原 `session_last_manifest_digest`）。
+    /// 上次成功写盘时的清单指纹（清单序列化后 hash）。
     pub session_last_manifest_digest: Option<u64>,
-    /// 已推送给 PDF 阅读器的查询 `(活动标签, 查询词)`（原 `EditorApp::pdf_search`）。
+    /// 已推送给 PDF 阅读器的查询 `(活动标签, 查询词)`。
     pub pdf_search: Option<(usize, String)>,
-    /// 侧边栏搜索的惰性扫描缓存：按（查询词, 活动文档）复用（原 `EditorApp::search_scan`）。
+    /// 侧边栏搜索的惰性扫描缓存：按（查询词, 活动文档）复用。
     pub search_scan: Option<Rc<shell_scan::SidebarSearchScan>>,
-    /// 侧边栏搜索**范围**（当前文件 / 整个文件夹；原 `EditorApp::search_scope`）。
+    /// 侧边栏搜索**范围**（当前文件 / 整个文件夹）。
     pub search_scope: SearchScopeTab,
-    /// 用户是否**手动**切换过搜索范围（原 `EditorApp::search_scope_manual`）。
+    /// 用户是否**手动**切换过搜索范围。
     pub search_scope_manual: bool,
-    /// 文件夹级内容搜索的扫描结果（原 `EditorApp::folder_search`）。
+    /// 文件夹级内容搜索的扫描结果。
     pub folder_search: Option<Rc<shell_scan::FolderSearchScan>>,
-    /// 文件夹扫描**代**：每次发起新扫描 +1（原 `EditorApp::folder_search_gen`）。
+    /// 文件夹扫描**代**：每次发起新扫描 +1。
     pub folder_search_gen: u64,
-    /// quick open 后台扫描**代**（原 `EditorApp::quick_open_gen`）。
+    /// quick open 后台扫描**代**。
     pub quick_open_gen: u64,
-    /// 最近一条 GoToLine 提示通知的 key（原 `EditorApp::goto_line_toast_key`）。
+    /// 最近一条 GoToLine 提示通知的 key。
     pub goto_line_toast_key: Option<ElementId>,
-    /// 最近一条 Find「当前选项卡不支持查找」提示通知的 key（原 `find_toast_key`）。
+    /// 最近一条 Find「当前选项卡不支持查找」提示通知的 key。
     pub find_toast_key: Option<ElementId>,
-    /// 最近一条「导出/导入设置」结果提示通知的 key（原 `settings_toast_key`）。
+    /// 最近一条「导出/导入设置」结果提示通知的 key。
     pub settings_toast_key: Option<ElementId>,
-    /// 实际执行过的搜索扫描次数（原 `EditorApp::search_scan_count`；测试用）。
+    /// 实际执行过的搜索扫描次数（测试用）。
     pub search_scan_count: usize,
-    /// 侧边栏搜索「防抖后提交生效」的查询词（已归一化；原 `search_committed`）。
+    /// 侧边栏搜索「防抖后提交生效」的查询词（已归一化）。
     pub search_committed: String,
-    /// 防抖窗口内最新一次输入（未提交的归一化查询词；原 `search_pending`）。
+    /// 防抖窗口内最新一次输入（未提交的归一化查询词）。
     pub search_pending: String,
-    /// 搜索防抖（原 `EditorApp::search_debounce`）：可重入、代序作废。
+    /// 搜索防抖：可重入、代序作废。
     pub search_debounce: SeqAfter,
-    /// 正在拖拽的选项卡下标（原 `EditorApp::tab_dragging`；None = 未在拖拽）。
+    /// 正在拖拽的选项卡下标（None = 未在拖拽）。
     pub tab_dragging: Option<usize>,
-    /// 本次拖拽开始时 gpui 拖拽 picture 的「抓取偏移」（原 `EditorApp::tab_drag_grab`）。
+    /// 本次拖拽开始时 gpui 拖拽 picture 的「抓取偏移」。
     pub tab_drag_grab: Option<Point<Pixels>>,
-    /// 拖拽中的选项卡光标已越出窗口边缘（尚未松手；原 `drag_outside_armed`）。
+    /// 拖拽中的选项卡光标已越出窗口边缘（尚未松手）。
     pub drag_outside_armed: bool,
-    /// 本次 `on_drag_move` 算出的「幽灵窗应显示」决策（原 `drag_ghost_visible`）。
+    /// 本次 `on_drag_move` 算出的「幽灵窗应显示」决策。
     pub drag_ghost_visible: bool,
-    /// 拖拽选项卡排序：本次拖拽过程光标下的「插入下标」（原 `tab_reorder_target`）。
+    /// 拖拽选项卡排序：本次拖拽过程光标下的「插入下标」。
     pub tab_reorder_target: Option<usize>,
-    /// PDF 阅读画布背景预设（config `pdf_bg`；原 `EditorApp::pdf_bg`）。
+    /// PDF 阅读画布背景预设（config `pdf_bg`）。
     pub pdf_bg: PdfBgPref,
-    /// PDF 自定义画布底色（config `pdf_bg_custom`；原 `pdf_bg_custom`）。
+    /// PDF 自定义画布底色（config `pdf_bg_custom`）。
     pub pdf_bg_custom: Option<String>,
-    /// 最近一次对 PDF 页操作失败已提示过的错误文案（原 `pdf_last_error_seen`，toast 去重）。
+    /// 最近一次对 PDF 页操作失败已提示过的错误文案（toast 去重）。
     pub pdf_last_error_seen: Option<String>,
-    /// PDF 阅读位置书签（规范化路径 → 列表；原 `EditorApp::pdf_bookmarks`）。
+    /// PDF 阅读位置书签（规范化路径 → 列表）。
     pub pdf_bookmarks: HashMap<String, Vec<PdfBookmark>>,
-    /// 文件树过滤词（防抖后提交、已归一化小写；原 `EditorApp::files_filter`）。
+    /// 文件树过滤词（防抖后提交、已归一化小写）。
     pub files_filter: String,
-    /// 防抖窗口内最新一次过滤输入（未提交；原 `files_filter_pending`）。
+    /// 防抖窗口内最新一次过滤输入（未提交）。
     pub files_filter_pending: String,
-    /// 文件树过滤防抖（原 `EditorApp::files_filter_debounce`）。
+    /// 文件树过滤防抖。
     pub files_filter_debounce: SeqAfter,
-    /// 最近打开的文件夹路径（新→旧；原 `EditorApp::recent_folders`）。
+    /// 最近打开的文件夹路径（新→旧）。
     pub recent_folders: Vec<String>,
-    /// 最近打开的文件路径（新→旧；原 `EditorApp::recent_files`）。
+    /// 最近打开的文件路径（新→旧）。
     pub recent_files: Vec<String>,
-    /// A：旧 live2 实体延迟回收队列（原 `EditorApp::retired_live2`；`commit_live` 暂存、
-    /// 下一帧 `on_next_frame` 清空，把级联 Drop 移出点击同步路径）。
+    /// 已退役的 live2 实体延迟回收队列（`commit_live` 暂存、下一帧 `on_next_frame`
+    /// 清空，把级联 Drop 移出点击同步路径）。
     pub retired_live2: Vec<gpui::Entity<WyEditor>>,
-    /// 是否正处于音乐模式（整窗渲染 MusicView；原 `EditorApp::music_mode`）。
+    /// 是否正处于音乐模式（整窗渲染 MusicView）。
     pub music_mode: bool,
 }
 
 impl AppModel {
-    /// 构造带初值的模型（原 `EditorApp::new_impl` 的逐初值语义迁移）：零选项卡起手，
-    /// 前 16 个参数为 `new_impl` 从 `UserPrefs` / 窗口外观解析出的启动初值，其余派生
-    /// 状态取全零/空默认。
+    /// 构造带初值的模型：零选项卡起手，前 16 个参数为 `new_impl` 从 `UserPrefs` /
+    /// 窗口外观解析出的启动初值，其余派生状态取全零/空默认。
     ///
-    /// 命名与旧 `EditorApp::new_impl` 的 struct 字段一致，语义零变化。
+    /// 命名与 `EditorApp::new_impl` 的 struct 字段一致。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         status: SharedString,
@@ -377,14 +376,13 @@ impl AppModel {
 }
 
 impl AppModel {
-    /// 退出预览编辑的**纯模型 + 实体**部分（原 `EditorApp::commit_live` 迁出）：把
+    /// 退出预览编辑的**纯模型 + 实体**部分：把
     /// WYSIWYG 内容写回源码编辑区 + 内容镜像；live2 实体**延迟**暂存 `retired_live2`
     /// 由宿主调度 `on_next_frame` 到下一帧渲染后销毁（A：实体级联 Drop ~36ms 移出
     /// 点击同步路径）。
     ///
     /// 视图层收尾（`on_next_frame` 清 `retired_live2`、右栏 `md_wy` 对齐 / 行级 diff
-    /// 兜底）不在本方法——宿主据返回值 [`CommitLiveAlign`] 执行，逐调用点核对过
-    /// 借用范围 / 事件顺序 / 返回值语义与旧实现完全一致。
+    /// 兜底）不在本方法——宿主据返回值 [`CommitLiveAlign`] 执行。
     pub fn commit_live(&mut self, idx: usize, cx: &mut App) -> CommitLiveAlign {
         // 读取 + 拆 live2：直接持 `&mut self`，无需 RefCell（宿主调用时已持有模型守卫）。
         let (l2, l2_dirty) = match self.tabs.get_mut(idx) {
@@ -493,7 +491,7 @@ impl AppModel {
         let n_chars = content.as_ref().chars().count();
         tab.line_count = n_lines;
         tab.char_count = n_chars;
-        // 与 Ops 臂同款收尾（旧实现 `commit_live` 最后一条即此 status，评审 nits 补回）：
+        // 与 Ops 臂同款收尾（`commit_live` 最后一条即此 status）：
         // diff 兜底写回后状态栏归位「内容已写回编辑区 / 正常」，防残留「关闭中」旧文案。
         self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
         self.status_ok = true;
@@ -557,8 +555,7 @@ impl Default for AppModel {
     }
 }
 
-/// PDF「阅读位置书签」一条：目标页码（0 基）+ 展示标题（SC-3 随
-/// `EditorApp::pdf_bookmarks` 字段迁入；原 `app::pdf_bookmarks::PdfBookmark`）。
+/// PDF「阅读位置书签」一条：目标页码（0 基）+ 展示标题。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfBookmark {
     /// 目标页码（0 基；`PdfViewer::scroll_to_page` 的直接入参）。
@@ -567,8 +564,7 @@ pub struct PdfBookmark {
     pub title: String,
 }
 
-/// 侧边栏搜索**范围**（SC-3 自 `app::sidebar::SearchScopeTab` 迁入）：只搜当前文件 /
-/// 递归搜已打开文件夹内文本文件。沿 `app` / `app::sidebar` 重导出维持既有路径。
+/// 侧边栏搜索**范围**：只搜当前文件 / 递归搜已打开文件夹内文本文件。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SearchScopeTab {
     /// 当前文档内容（+ 跨打开文件文件名匹配），旧语义。
@@ -729,23 +725,22 @@ pub enum MdWyEarly {
 /// （`early`）、Step3（`pending_full`）三代叠加态，EditorTab ⇄ DetachedTab 搬迁时作为
 /// **一个字段**整包搬移（不再逐带双份复制进 DetachedTab）。
 ///
-/// 四子项的语义与旧字段一一对应（行为零变化）：`pending` 与 `seq` 可共存（`feed_full`
-/// 同时登记后台整篇在途与代号）；`early` 与 `pending_full` 亦可在 Step2/3 两阶段协作时
-/// 同时置位——故收敛为**状态包**而非互斥枚举，避免改变「各标记独立置位/清位」的既有
-/// 时序语义。
+/// 四个子项各自独立置位/清位（非互斥枚举）：`pending` 与 `seq` 可共存（`feed_full`
+/// 同时登记后台整篇在途与代号）；`early` 与 `pending_full` 亦可在多阶段协作时同时
+/// 置位——故收敛为**状态包**而非互斥枚举，保持「各标记独立置位/清位」的时序语义。
 #[derive(Default)]
 pub struct MdWyInstall {
-    /// 后台整篇装配在途（原 `md_wy_pending`）：`Some((装配代号, 目标内容))` = 已登记
+    /// 后台整篇装配在途：`Some((装配代号, 目标内容))` = 已登记
     /// 后台 `open_from_str` 解析、尚未 `install_open`；`None` = 无在途。异步完成回调按
     /// 代号与 `seq` 匹配才装配（不装错、不泄漏）。
     pub pending: Option<(usize, SharedString)>,
-    /// 装配代号单调计数器（原 `md_wy_install_seq`）：每次发起后台整篇装配 / 任何同步
+    /// 装配代号单调计数器：每次发起后台整篇装配 / 任何同步
     /// 改源（增量重放、同步喂源、换源 install_open、预览关闭）递增，结束在途旧装配
     /// （代号不匹配即丢弃其完成回调，防陈旧整篇覆盖刚改好的内容）。
     pub seq: usize,
-    /// Step2 提前整篇解析在途状态（原 `md_wy_early`，见 [`MdWyEarly`]）。
+    /// Step2 提前整篇解析在途状态（见 [`MdWyEarly`]）。
     pub early: Option<MdWyEarly>,
-    /// Step3「整篇在途」标记（原 `md_wy_pending_full`）：`Some((装配代号, prefix 字节
+    /// Step3「整篇在途」标记：`Some((装配代号, prefix 字节
     /// 长))` = 预览只装了**首块 prefix**（已 `is_loaded`）、整篇后台解析在途——此期间
     /// 预览 ≠ 编辑区全文，`sync` 增量桥**禁止**把编辑区坐标增量打到 prefix（会错位），
     /// 改走「作废在途整篇 + 异步整篇重喂」；整篇就绪带守卫换入全文后置 `None`。

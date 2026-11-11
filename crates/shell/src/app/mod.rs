@@ -14,13 +14,13 @@
 //! 文本编辑动作由编辑区在 `Input` 键上下文中自行处理，这里只订阅其编辑事件
 //! （`EditorEvent::Edited`）刷新状态栏、脏标记与预览增量。
 //!
-//! ## 模块结构（M2.2 拆分 + SC-1 模型迁出）
+//! ## 模块结构
 //!
 //! 本模块只保留 **类型定义 / 状态与共享 prelude**（`EditorApp` 结构、`MdScrollSync`、
 //! `MdTocScroll` / `EditorAppRegistry`，及对全部子模块可见的 `use` 预导入）。`EditorTab`
-//! / `DetachedTab` / `MediaReader` / `MdWyInstall` 等**纯模型类型**已于 SC-1 拆入
-//! 独立 crate `shell_core`，此处 `pub use shell_core::{…}` 重导出维持既有路径。`EditorApp`
-//! 的方法按职责拆分到下列子模块（`impl` 块跨文件合并，行为与可见性语义不变）：
+//! / `DetachedTab` / `MediaReader` / `MdWyInstall` 等**纯模型类型**在独立 crate
+//! `shell_core`，此处 `pub use shell_core::{…}` 重导出维持既有路径。`EditorApp`
+//! 的方法按职责拆分到下列子模块（`impl` 块跨文件合并）：
 //!
 //! - [`init`]：构造 / 窗口注册 / 焦点句柄（`EditorApp::new`）
 //! - [`sync`]：编辑器事件订阅、脏追踪与后台预览增量同步循环
@@ -30,7 +30,7 @@
 //! - [`chrome`]：主题 / 外壳配色、标题栏与通知层
 //! - [`layout`]：主体布局与根视图渲染（`Render` 实现、欢迎页、快捷键接线）
 //!
-//! 其余职责已在更早拆分：`file_ops`（打开/保存/粘贴）、`text_open`（大文档分块
+//! 其余职责分布：`file_ops`（打开/保存/粘贴）、`text_open`（大文档分块
 //! 异步就绪 / 编码 / 差异，独立叶子 crate）、`menu`（菜单栏）、`palette`（命令面板）、
 //! `panes`（编辑/预览宿主与分割线）、`sidebar`（侧边栏）、`status_bar`（状态栏）、
 //! `tabs`（选项卡栏）。
@@ -44,13 +44,13 @@ mod sidebar;
 mod status_bar;
 mod tabs;
 
-// M2.2：新增的职责子模块（`use super::*` 共享下方 prelude）。可见性语义与原 mod.rs 等价：
-// 原私有条目在 `app` 内对整棵子树（含 app::tests）可见 → 搬入子模块后统一 `pub(super)`
-// （可见于 `app`）；原 `pub` / `pub(super)`（= crate 可见）搬入私有子模块后升为 `pub(crate)`）。
+// 职责子模块（`use super::*` 共享下方 prelude）的可见性约定：
+// 私有条目在 `app` 内对整棵子树（含 app::tests）可见 → 统一 `pub(super)`（可见于 `app`）；
+// 原 `pub` / `pub(super)`（= crate 可见）在私有子模块内升为 `pub(crate)`）。
 mod chrome;
 mod close_tray;
-// 文件树「新建/重命名」输入弹层（2026-11-11 整迁 shell_sidebar 后为重导出 facade：
-// 类型/渲染在域 crate，宿主经 FileTreePromptHost 反调提交动作，路径保持既有）。
+// 文件树「新建/重命名」输入弹层：类型/渲染在域 crate（shell_sidebar），宿主经
+// FileTreePromptHost 反调提交动作；此处为重导出 facade（路径保持既有）。
 pub mod file_tree_prompt {
     pub use shell_sidebar::{FileTreePrompt, FileTreePromptHost, FileTreePromptKind};
 }
@@ -60,7 +60,7 @@ mod layout;
 mod media;
 mod media_window;
 mod file_tree_ops;
-// PDF 域宿主薄适配（2026-11-11）：域逻辑在 shell_pdf；本模块为宿主 EditorApp 的
+// PDF 域宿主薄适配：域逻辑在 shell_pdf；本模块为宿主 EditorApp 的
 // 书签/背景/菜单动作薄适配 + 右键菜单视图/挂载。命名避开 `pdf`（作 `pdf` 会遮蔽
 // 同 subtree 的 `pdf::PdfViewer` 等 extern crate 路径）。
 mod pdf_host;
@@ -96,7 +96,7 @@ use ui::motion::hover_spring;
 use base::util::SeqAfter;
 
 // WYSIWYG 预览编辑——本项目 `markdown_wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
-// （`WyEvent` 已随 toggle_live_test 的订阅实现迁 shell_preview，无需再在宿主 prelude。）
+// （`WyEvent` 随订阅实现在 `shell_preview`，无需再在宿主 prelude。）
 use markdown_wysiwyg::WyEditor;
 
 use crate::actions::*;
@@ -107,19 +107,19 @@ use config::layout::{
 use config::user::{PdfBgPref, ThemePref, UserPrefs};
 use shell_widgets::scrollbar::TableScrollState;
 
-// SC-1：`EditorApp` 的纯模型类型已拆入独立 crate `shell_core`（2026-11-10）。
+// `EditorApp` 的纯模型类型在独立 crate `shell_core`。
 // 此处经 `pub use` 重导出，维持既有 `app::EditorTab` / `app::DetachedTab` 等路径
-// 与子模块 `use super::*` 的可见性语义不变（宿主/测试零或最少改动）。
+// 与子模块 `use super::*` 的可见性语义不变。
 pub use shell_core::{
     AppHost, AppModel, CommitLiveAlign, DetachedTab, EditorTab, MdWyEarly, MdWyInstall, MediaReader,
     PanesState, PdfBookmark, SearchScopeTab, TabDragData, TabDragGhost, TitleCtrlIconFg,
     WinCtrlKind,
 };
 
-/// 测试可见重导出（2026-11-10 P1 测试域化，§8.6 外提清单）：
+/// 测试可见重导出：
 /// - `app::session` 私有模块的纯逻辑入口（`save_session_to` / `restore_session_from`）：
 ///   integration 目标（`tests/*.rs` 独立二进制）只能见 lib pub 面，私有 `mod session` 的
-///   路径不可达，经此 `pub use` 暴露。`restore_session_from` 原 `#[cfg(test)]` 归位为恒编
+///   路径不可达，经此 `pub use` 暴露。`restore_session_from` 恒编译
 ///   （测试/基准唯一驱动，生产进程不调用，pub 故无 dead_code 告警）。
 /// - `app::sidebar` 私有模块的宿主状态类型与视图枚举：它们的 `width`/`files` 等字段随
 ///   `EditorApp::sidebar` 字段一并 pub，供 `tests/settings_xfer.rs` 直读/直写
@@ -128,11 +128,11 @@ pub use shell_core::{
 pub use session::{restore_session_from, save_session_to};
 #[doc(hidden)]
 pub use sidebar::{FileTreeState, SidebarChromeState, SidebarView, TreeEntry};
-// P1 测试域化（2026-11-10 §8.3 中批）：`palette`/`media_window`/`pdf_bookmarks`
+// `palette`/`media_window`/`pdf_bookmarks`
 // 私有模块的纯逻辑面供 `tests/palette.rs`（quick open 检索）、`tests/media.rs`
 // （媒体窗口打开决策/尺寸取值）、`tests/pdf.rs`（书签盘上读写）访问。
 #[doc(hidden)]
-// 2026-11-11：`media_window` 纯决策已随媒体域迁 `shell_media`（`media_window` 模块），
+// `media_window` 纯决策在 `shell_media::media_window`；
 // 此处经 shell_media 重导出维持既有 `app::{resolve_media_open_target, ...}` 面
 // （`tests/media.rs` 行为表 / 尺寸取值断言）。
 pub use shell_media::media_window::{
@@ -141,7 +141,7 @@ pub use shell_media::media_window::{
 #[doc(hidden)]
 pub use palette::{quick_open_collect, QUICK_OPEN_MAX_FILE_BYTES, QUICK_OPEN_MAX_FILES};
 #[doc(hidden)]
-// 2026-11-11：`pdf_bookmarks` 纯逻辑已随 PDF 域迁 `shell_pdf`（`bookmarks` 模块），
+// `pdf_bookmarks` 纯逻辑在 `shell_pdf::bookmarks`；
 // 此处经 shell_pdf 重导出维持既有 `app::{load, normalize_key}` 面（书签盘上断言）。
 pub use shell_pdf::bookmarks::{load, normalize_key};
 #[doc(hidden)]
@@ -166,21 +166,20 @@ impl gpui::Global for EditorAppRegistry {}
 /// 编辑区⇄预览滚动同步基线（见 [`EditorApp::sync_editor_preview_scroll`]）。记录
 /// 当前选项卡 + 编辑器内容版本 + 上次已同步的双方「块起点」键，渲染帧比对后由动了
 /// 的那一侧驱动对端。切换选项卡 / 同一选项卡内换文档 / 编辑使内容版本变化 → 重建。
-/// 原定义（`struct` + 手写 `Default`）已随 SC 下沉 shell_core；仅 `mod app` 子树消费，
-/// 故用模块私有 `use` 引入（与旧 `struct` 的模块内可见语义一致，无需 pub(crate)）。
+/// 原定义（`struct` + 手写 `Default`）在 shell_core；仅 `mod app` 子树消费，
+/// 故用模块私有 `use` 引入。
 use shell_core::MdScrollSync;
 
 pub struct EditorApp {
-    /// SC-2（2026-11-10）：模型半状态统一容器——`tabs` / `active_tab` 已随
-    /// `shell_core::AppModel` 迁入，其余模型组（搜索态 / recent / session / tab_drag
-    /// payload 等）留待 SC-3 迁入。UI 半状态（窗口 / 布局 / 聚焦 / 主题 glue / registry）
-    /// 仍留宿主字段。宿主读写 `tabs`/`active_tab` 一律走
-    /// `self.model.borrow()/.borrow_mut()`。`Rc<RefCell>` 供宿主与 SC-4 `AppHost` 共享。
+    /// 模型半状态统一容器：`tabs` / `active_tab` 等文件/会话/搜索/偏好模型态在
+    /// `shell_core::AppModel`；UI 半状态（窗口 / 布局 / 聚焦 / 主题 glue / registry）
+    /// 仍留宿主字段。宿主读写模型态一律走
+    /// `self.model.borrow()/.borrow_mut()`。`Rc<RefCell>` 供宿主与 `AppHost` 共享。
     /// 注意：RefCell 是**单元格级**互斥（非字段级 split 借用），同一方法内持有
     /// `borrow_mut()` 守卫时不可再 `borrow()`/`borrow_mut()`（运行期双借 panic）。
     pub model: Rc<RefCell<AppModel>>,
     /// 选项卡栏内各选项卡**上一帧** laid-out 的边界（与拖拽事件 `position` 同一输入坐标
-    /// 空间、含横向滚动偏移）：栏内拖拽排序的**命中测试**用（H2 起命中计算迁
+    /// 空间、含横向滚动偏移）：栏内拖拽排序的**命中测试**用（命中计算在
     /// `shell_tabs::drag::{tab_insert_index, tab_drag_over_row}` 纯函数，此快照以参数传入）。
     /// `TabBar` 实体渲染期每帧重建（长度 = `tabs.len()`、按下标对应；经 `render_tab_bar`
     /// 的 `&mut` 入参写回本宿主字段——记录器在 prepaint 阶段把真实边界写回各槽位）。
@@ -196,22 +195,21 @@ pub struct EditorApp {
     /// （`app.notifications.last().message_str()`，§8.6 外提清单）。
     #[doc(hidden)]
     pub notifications: Vec<ui::notification::Notification>,
-    /// 「编辑区 ⇄ 预览分割条」面板状态（[`PanesState`]，纯值类型，SC 下沉 shell_core）：
+    /// 「编辑区 ⇄ 预览分割条」面板状态（[`PanesState`]，纯值类型，在 shell_core）：
     /// `split_ratio` / `split_drag` / `pending_split_ratio` / `splitter_hovered` 四字段
-    /// 收敛于此。以**普通字段**持有（非 `Rc<RefCell>`）：render / 拖拽事件路径多处直读，
-    /// 保持借用语义零变化。
+    /// 收敛于此。以**普通字段**持有（非 `Rc<RefCell>`）：render / 拖拽事件路径多处直读。
     /// `#[doc(hidden)] pub`：`tests/splitter.rs` 拖拽/悬停断言读 `panes.*`（§8.6 外提清单）。
     #[doc(hidden)]
     pub panes: PanesState,
     /// 侧边栏「外壳」状态：可见性 / 视图 / 目录折叠 / 宽度与右缘拖拽
-    /// （类型 `SidebarChromeState` 已迁 shell_sidebar；本字段仍是**普通值**——
+    /// （类型 `SidebarChromeState` 在 shell_sidebar；本字段仍是**普通值**——
     /// `app::tests` 与 `tests/*` 的既有字段读写不变量强制，见 §8.6 外提链）。
     /// `#[doc(hidden)] pub`：`tests/settings_xfer.rs` 直读/直写 `width`/`width_auto`/
     /// `files.root`/`files.children`（§8.6 外提清单）。
     #[doc(hidden)]
     pub sidebar: shell_sidebar::SidebarChromeState,
-    /// 侧边栏**渲染/事件实体**（2026-11-11 起承接自 shell_sidebar 域 crate）：
-    /// 外壳（活动栏/调宽手柄）+ 目录（TOC）视图 + 搜索（`search.rs`，2026-11-11 随迁）
+    /// 侧边栏**渲染/事件实体**（承接自 shell_sidebar 域 crate）：
+    /// 外壳（活动栏/调宽手柄）+ 目录（TOC）视图 + 搜索（`crate::search`)
     /// + 文件树（files/files_ops）在 `Entity<Sidebar<EditorApp>>` 上构建
     /// （`Context<Sidebar>` 内 `cx.listener` 绑定域实体）；宿主渲染期以 `&mut self.sidebar`
     /// 传入状态、事件回调经 `SidebarHost` 反调本宿主。搜索输入实体亦收进域
@@ -219,7 +217,7 @@ pub struct EditorApp {
     sidebar_view: gpui::Entity<shell_sidebar::Sidebar<EditorApp>>,
     /// 监听搜索框输入变化 → 刷新搜索结果。
     _search_sub: Subscription,
-    /// 选项卡栏**渲染/事件实体**（2026-11-11 起承接自 shell_tabs 域 crate）：选项卡栏
+    /// 选项卡栏**渲染/事件实体**（承接自 shell_tabs 域 crate）：选项卡栏
     /// 渲染 + 选项卡元素 + 眼睛预览钮 + 横向滚动条接线 + 右键菜单项构建在
     /// `Entity<TabBar<EditorApp>>` 上（`Context<TabBar>` 内 `cx.listener` 绑定域实体）；
     /// 宿主渲染期把 `&mut self.tab_bounds` / `&self.tab_bar_hscroll` 与预取的
@@ -275,7 +273,7 @@ pub struct EditorApp {
     /// PDF 右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     pdf_menu_sub: Option<Subscription>,
     /// 选项卡栏右键「新建/打开」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
-    /// （2026-11-11：菜单**构建与交互**已迁 shell_tabs `TabBar` 实体，槽位仍留宿主——
+    /// （菜单**构建与交互**在 shell_tabs `TabBar` 实体，槽位仍留宿主——
     /// `app/tests/{tabs_actions,tabs_context}.rs` 直读、media/pdf 前置弹窗互关直清；实体
     /// 经 `TabsHost` 落地。）
     tab_bar_menu_pos: Option<Point<Pixels>>,
@@ -285,12 +283,12 @@ pub struct EditorApp {
     tab_bar_menu_sub: Option<Subscription>,
     /// 文件树右键上下文菜单**测试兼容镜像**：实体（`shell_sidebar::files_ops`）自持
     /// pos/菜单实体/订阅，宿主只镜像菜单实体供 `app::tests` 直接字段断言
-    /// （2026-11-11 迁 shell_sidebar 后留薄兼容）。
+    /// （实体在 shell_sidebar，宿主留薄兼容镜像）。
     #[doc(hidden)]
     pub file_tree_menu_entity: Option<gpui::Entity<PopupMenu>>,
     /// 文件树「新建/重命名」输入弹层**测试兼容镜像**：实体（`shell_sidebar::files_ops`）
     /// 自持弹层实体/订阅，宿主只镜像弹层实体供 `app::tests` 直接字段断言/驱动输入
-    /// （2026-11-11 迁 shell_sidebar 后留薄兼容）。
+    /// （实体在 shell_sidebar，宿主留薄兼容镜像）。
     #[doc(hidden)]
     pub file_tree_prompt: Option<gpui::Entity<shell_sidebar::FileTreePrompt<EditorApp>>>,
     /// 文件树「过滤文件名」输入框（typeahead 按名过滤树；防抖后提交生效）。
@@ -299,8 +297,8 @@ pub struct EditorApp {
     _files_filter_sub: Subscription,
     /// 「打开最近」居中大面板（反馈 2）：打开时为 `Some`，择项 / Esc / 点击外
     /// （`DismissEvent`）关闭后清空。面板是独立 [`session_store::RecentPanel`] 实体
-    /// （mode/选中/最近列表快照自持；More/返回 单实体切模式），实体已迁独立 crate
-    /// `session_store`（`<EditorApp>` 为 [`session_store::RecentPanelHost`] 宿主）。
+    /// （mode/选中/最近列表快照自持；More/返回 单实体切模式），`<EditorApp>` 为
+    /// [`session_store::RecentPanelHost`] 宿主。
     /// `#[doc(hidden)] pub`：`tests/recent.rs` 大量面板断言（§8.6 外提清单）。
     #[doc(hidden)]
     pub recent_panel: Option<gpui::Entity<session_store::RecentPanel<EditorApp>>>,
@@ -332,8 +330,8 @@ pub struct EditorApp {
     pub music: Option<gpui::Entity<music::MusicView>>,
     /// 音乐视图事件订阅（`MusicEvent::ExitRequested` → 退出音乐模式并把焦点还给编辑区）。
     _music_sub: Option<Subscription>,
-    /// SC-4：宿主实体自身弱句柄/实体 id——`AppHost` 的 `&self` 服务方法经它再入宿主实体
-    /// （订阅回调 / 延迟回调 / 异步任务里读模型需在回调体进行，见 host.rs 借用纪律）。
+    /// 宿主实体自身弱句柄/实体 id——`AppHost` 的 `&self` 服务方法经它再入宿主实体
+    /// （订阅回调 / 延迟回调 / 异步任务里读模型需在回调体进行，见 host.rs 借用约束）。
     own_weak: WeakEntity<EditorApp>,
     own_entity_id: EntityId,
 }

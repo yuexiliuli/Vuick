@@ -6,8 +6,8 @@ use ui::notification::{Notification, NotificationKind};
 use text_open::TextChunk;
 use config::limits::EDITOR_WRAP_MAX_LINES;
 use config::timing::OPEN_FAILURE_AUTOHIDE_SECS;
-// SC-4：file_ops 纯逻辑（prepare_text / is_large_path / PreparedText / set_tab_text）
-// 已迁 shell_core::file_ops，此处收敛为 `use` 引用（见下方 glue 转发）。
+// file_ops 纯逻辑（prepare_text / is_large_path / PreparedText / set_tab_text）
+// 在 shell_core::file_ops，此处收敛为 `use` 引用（见下方 glue 转发）。
 use shell_core::file_ops::{prepare_text, PreparedText, is_large_path};
 
 /// [`EditorApp::apply_open_chunk`] 的结果：一块被如何处理（消费者据此决定继续/中止）。
@@ -187,7 +187,7 @@ impl EditorApp {
     /// 打开失败：状态栏置为失败，并弹出可点击关闭、5 秒后自动消失的通知。
     /// 同时**解锁**该路径选项卡的「加载期锁输入」：大文档分块流水线若在首块已挂载、
     /// EOF 之前读盘出错，`loading_lock` 只在 `finish_file_text` 复位——若失败路径不解锁，
-    /// 选项卡将永久停在「已显示首块但不可编辑/滚动」的锁状态（评审 BLOCK-1）。
+    /// 选项卡将永久停在「已显示首块但不可编辑/滚动」的锁状态。
     /// 失败语义 = 保留已读到的部分内容、可继续查看/编辑（与旧同步失败的「不建 tab」
     /// 不同，这是异步路径的既有取舍）。
     fn report_open_failure(
@@ -248,9 +248,9 @@ impl EditorApp {
     }
 
     /// 记录最近打开的文件：去重置顶 + 截 [`RECENT_MAX`] + 立即持久化。
-    /// 「打开最近」副作用集中入口（K10/K11：一次调用内完成「列表更新 + 落盘」，
+    /// 「打开最近」副作用集中入口（一次调用内完成「列表更新 + 落盘」，
     /// 消费点只调它，不散点直调 persist）。
-    /// SC-4：逻辑已迁 [`AppModel::record_recent_file`]；此处 glue。
+    /// 逻辑在 [`AppModel::record_recent_file`]；此处 glue。
     #[doc(hidden)]
     pub fn record_recent_file(&mut self, path: &std::path::Path) {
         let host: &dyn AppHost = &*self;
@@ -259,7 +259,7 @@ impl EditorApp {
 
     /// 记录最近打开的文件夹：去重置顶 + 截 [`RECENT_MAX`] + 立即持久化
     /// （同 [`Self::record_recent_file`] 的副作用集中入口）。
-    /// SC-4：逻辑已迁 [`AppModel::record_recent_folder`]；此处 glue。
+    /// 逻辑在 [`AppModel::record_recent_folder`]；此处 glue。
     #[doc(hidden)]
     pub fn record_recent_folder(&mut self, path: &std::path::Path) {
         let host: &dyn AppHost = &*self;
@@ -268,7 +268,7 @@ impl EditorApp {
 
     /// 从最近文件列表移除失效路径（点击失效项 → 命中同步路径外移除 + 落盘）：
     /// 状态栏提示，不尝试打开。
-    /// SC-4：逻辑已迁 [`AppModel::remove_recent_file`]；此处 glue。
+    /// 逻辑在 [`AppModel::remove_recent_file`]；此处 glue。
     pub(super) fn remove_recent_file(
         &mut self,
         path: &str,
@@ -281,7 +281,7 @@ impl EditorApp {
     }
 
     /// 从最近文件夹列表移除失效路径（同 [`Self::remove_recent_file`]）。
-    /// SC-4：逻辑已迁 [`AppModel::remove_recent_folder`]；此处 glue。
+    /// 逻辑在 [`AppModel::remove_recent_folder`]；此处 glue。
     pub(super) fn remove_recent_folder(
         &mut self,
         path: &str,
@@ -405,7 +405,7 @@ impl EditorApp {
     /// [`Self::load_file_text`] 走同一条 O(n) 装配管线（`prepare_text` → Rope +
     /// 行宽统计 + 行/字计数），但不设 `file_path`（保持「未命名」语义）、不建
     /// Markdown 预览（未命名选项卡 = 纯文本）。`make_tab` 已建空编辑器。
-    /// SC-4：动作体已迁 [`AppModel::set_tab_text`]（shell_core::file_ops）；此处 glue。
+    /// 动作体在 [`AppModel::set_tab_text`]（shell_core::file_ops）；此处 glue。
     pub(super) fn set_tab_text(
         &mut self,
         idx: usize,
@@ -771,7 +771,7 @@ impl EditorApp {
                         this.toggle_live_test(window, cx);
                     }
                     // 最终状态：内容就绪，恢复「已打开」（含大文档关闭软换行的提示）。
-                    // SC-3：先提纯 owned line_count 再写——避免 `if let` 掮获的共享 Ref
+                    // 先提纯 owned line_count 再写——避免 `if let` 掮获的共享 Ref
                     // 存活整个块、块内 `borrow_mut()` 运行期双借 panic。
                     let opened_line_count = {
                         let m = this.model.borrow();
@@ -859,7 +859,7 @@ impl EditorApp {
                 self.md_wy_spawn_prefix_install(idx, prefix, full_seq, cx);
             }
             // 首块后内容已可见，但整篇仍在读盘 → 保持「正在打开」；锁输入防编辑竞态。
-            // SC-3：先收窄取 mounted（loading_lock + 版本）再写状态——`tab` 是对 model 的
+            // 先收窄取 mounted（loading_lock + 版本）再写状态——`tab` 是对 model 的
             // 可变派生引用，与 `model.status` 同 guard 内互排斥（E0499），故两段分开。
             let mounted = {
                 let mut model = self.model.borrow_mut();
@@ -967,7 +967,7 @@ impl EditorApp {
             // 订阅阅读器 notify：检索结果/加载进度到达 → 重绘 app（侧边栏 PDF 命中计数/
             // 页列表更新）。订阅收进**选项卡**（`_pdf_sub`）而非全局单槽：多 PDF 并存各自
             // 独立、不被后打开者覆盖（旧 `_pdf_observe` 单槽即此缺陷）。单一写点
-            // `subscribe_pdf`（新建/跨窗口移交共用，K10 收敛）。
+            // `subscribe_pdf`（新建/跨窗口移交共用）。
             self.subscribe_pdf(idx, &viewer, cx);
             let mut model = self.model.borrow_mut();
             let tab = model.tabs.get_mut(idx).expect("PDF 选项卡应已在场");
@@ -1064,8 +1064,8 @@ impl EditorApp {
 
     /// 打开文件行：已打开 → 激活既有选项卡（**不新建**）；未打开 → 复用 `open_file`
     /// 完整打开语义（内部已分流 PDF / EPUB / 图 / 视频 / 文本）。
-    /// （2026-11-11 自 `app/sidebar/files.rs` 迁入——文件树域 crate 经
-    /// `SidebarHost::sidebar_open_path_or_activate` 反调本方法，宿主打开能力不收进域。）
+    /// （文件树域 crate 经 `SidebarHost::sidebar_open_path_or_activate` 反调本方法，
+    /// 宿主打开能力不收进域。）
     pub(crate) fn open_path_or_activate(
         &mut self,
         path: &std::path::Path,
@@ -1087,7 +1087,7 @@ impl EditorApp {
     /// 首参、会话恢复等**全部既有调用点仍调本函数**。本函数只做「媒体窗口重定向」包装——
     /// 对音频/视频且 `media_new_window` 开启时，按纯决策分流（新窗口 / 复用媒体窗口 /
     /// 当前窗口，见 [`crate::app::media_window`]）；否则原样在当前窗口打开。
-    /// 主体逻辑下沉到 [`Self::open_file_here`]（永不重定向，供新窗口 / 复用目标直调）。
+    /// 主体逻辑在 [`Self::open_file_here`]（永不重定向，供新窗口 / 复用目标直调）。
     #[doc(hidden)]
     pub fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.maybe_redirect_media_open(path, window, cx) {

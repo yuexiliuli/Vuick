@@ -1,5 +1,4 @@
-//! 跨窗口选项卡搬迁与拖拽：**域内纯逻辑** + `TabDragHost` 宿主服务面（2026-11-11 自
-//! shell `app/tab_drag.rs` / `app/tabs.rs` 迁入并解耦，同 `lib.rs` 模块清单的 H2 拖出补全）。
+//! 跨窗口选项卡搬迁与拖拽：**域内纯逻辑** + `TabDragHost` 宿主服务面。
 //!
 //! 拆分层：
 //!
@@ -12,16 +11,14 @@
 //! - **宿主服务面**（[`TabDragHost`]）：拖拽流程对宿主的副作用收敛为最小接口——开/建窗
 //!   （`open_window` 建新窗、幽灵窗）、窗口注册表查询/登记、HWND（`SetWindowPos` / DWM），
 //!   以及幽灵窗实体创建/销毁、adopt/restore 目标窗操作。宿主 `EditorApp` 在 shell
-//!   `app/host_impl.rs` `impl TabDragHost for EditorApp`（方法体自原 `app/tab_drag.rs` 既有
-//!   方法薄转发，行为零变化）。
+//!   `app/host_impl.rs` `impl TabDragHost for EditorApp`（方法体薄转发）。
 //!
-//! ## 借用纪律
+//! ## 借用约束
 //!
 //! 纯计算函数持 `&RefCell<AppModel>` 即跨帧共享模型（与 [`crate::bar::TabBar`] 同一姿势）；
-//! 继承 `TabsHost` 先例：**事件回调内经 `WeakEntity<H>::update` 反调宿主**，渲染期（宿主
-//! 正持 `&mut EditorApp`）禁入宿主。拖拽移动/松开编排（`update_drag_ghost` /
-//! `release_tab_drag_outside`）在宿主 layout.rs 回调体内以 `&mut EditorApp` 直调本宿主，
-//! 无实体回租（不涉双借）。
+//! **事件回调内经 `WeakEntity<H>::update` 反调宿主**，渲染期（宿主正持 `&mut EditorApp`）
+//! 禁入宿主。拖拽移动/松开编排（`update_drag_ghost` / `release_tab_drag_outside`）在宿主
+//! layout.rs 回调体内以 `&mut EditorApp` 直调本宿主，无实体回租（不涉双借）。
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -168,7 +165,7 @@ pub struct DragMoveStep {
 /// 拖拽状态机（`on_drag_move`）单步迁移：写共享模型的拖拽态（`tab_dragging` /
 /// `drag_outside_armed` / `tab_reorder_target`），返回本次移动的 `outside` 与排序命中——
 /// 「拖拽状态迁移」（含读 `AppModel` 态）全部收在域内，宿主只消费返回值。下标越界
-/// （已拔出后残留移动事件）→ `None`，宿主早退（与原 `on_drag_move` 守卫一致）。
+/// （已拔出后残留移动事件）→ `None`，宿主早退。
 pub fn tab_drag_move_step(
     model: &RefCell<AppModel>,
     tab_bounds: &[TabBoundsCell],
@@ -223,11 +220,10 @@ pub fn tab_drag_release_kind(is_detached: bool) -> DragRelease {
 
 /// 跨窗口选项卡拖拽的**宿主服务面**：把拖拽流程对宿主的副作用收敛为最小接口，使本
 /// crate 不依赖 shell 的具体宿主类型。shell 侧 `impl TabDragHost for EditorApp` 在
-/// `app/host_impl.rs`（方法体自原 `app/tab_drag.rs` 既有方法薄转发，行为零变化）。
-/// 拖拽开始预建幽灵窗（原 `TabsHost::tabs_host_prime_drag_ghost`，H1 期间放在 TabsHost，
-/// H2 随其余拖拽宿主入口一起迁此）。
+/// `app/host_impl.rs`（方法体薄转发）。拖拽开始预建幽灵窗入口
+/// `tabs_host_prime_drag_ghost` 一并位于本 trait。
 pub trait TabDragHost: 'static {
-    /// 拖拽开始预建窗外幽灵窗（原 `EditorApp::prime_drag_ghost`）：把 Windows 透明置顶
+    /// 拖拽开始预建窗外幽灵窗：把 Windows 透明置顶
     /// popup 的 OS 创建成本（首帧 DCOMP）前移到拖拽起点。宿主独占：`Context<Self>` 建
     /// `TabDragGhost` 幽灵窗实体 + 宿主 `drag_ghost`/`drag_ghost_pending` 字段。
     fn tab_drag_host_prime_ghost(
@@ -241,7 +237,7 @@ pub trait TabDragHost: 'static {
     ) where
         Self: Sized;
 
-    /// 拖拽移动期间维护幽灵窗（原 `EditorApp::update_drag_ghost`）：取 tab 元数据 →
+    /// 拖拽移动期间维护幽灵窗：取 tab 元数据 →
     /// 域 [`tab_drag_ghost_layout`] 算布局参数 → 懒建/复用幽灵窗 + `SetWindowPos` 定位 +
     /// 写 `drag_ghost_visible`。宿主独占：建窗 / HWND / `drag_ghost` 句柄字段 + win32 定位。
     fn tab_drag_host_update_ghost(
@@ -261,14 +257,14 @@ pub trait TabDragHost: 'static {
     where
         Self: Sized;
 
-    /// 取模型载荷（原 `EditorApp::take_tab_payload`，动作体已迁 `AppModel`）：整结构 move
-    /// `EditorTab` → `DetachedTab`。经宿主暴露维持既有 `pub` 路径（`tests/pdf.rs` 多窗口
+    /// 取模型载荷（动作体在 `AppModel`）：整结构 move
+    /// `EditorTab` → `DetachedTab`。经宿主暴露维持 `pub` 路径（`tests/pdf.rs` 多窗口
     /// 换位回归 / 宿主 tabs.rs 复制新窗直调）。
     fn tab_drag_host_take_payload(&mut self, idx: usize) -> Option<DetachedTab>
     where
         Self: Sized;
 
-    /// live2 守卫后取载荷（原 `EditorApp::commit_live_and_take_tab_payload`）：实时预览编辑
+    /// live2 守卫后取载荷：实时预览编辑
     /// 实体不随选项卡搬迁——先 `commit_live` 把 live2 写回编辑区再取载荷。宿主独占：
     /// `commit_live` 的宿主实体/订阅 + WYSIWYG 回收副作用。
     fn tab_drag_host_commit_live_and_take_payload(
@@ -280,7 +276,7 @@ pub trait TabDragHost: 'static {
     where
         Self: Sized;
 
-    /// 窗外松开编排（原 `EditorApp::release_tab_drag_outside`）：销毁幽灵 → 取载荷 →
+    /// 窗外松开编排：销毁幽灵 → 取载荷 →
     /// 按 [`tab_drag_release_kind`]（读宿主 `is_detached`）拆新窗 / 还原主窗 → 本窗口销毁。
     /// 宿主独占：`open_window` 建新窗 / `EditorAppRegistry` 查询 / `remove_window`。
     fn tab_drag_host_release_outside(
@@ -291,7 +287,7 @@ pub trait TabDragHost: 'static {
     ) where
         Self: Sized;
 
-    /// 把选项卡拆进新开独立窗口（原 `EditorApp::split_tab_to_new_window`）：`open_window`
+    /// 把选项卡拆进新开独立窗口：`open_window`
     /// 建窗（构造 `new_detached`），窗口左上角跟随鼠标释放位置。宿主独占：`open_window`
     /// + `EditorApp::new_detached` 构造（注册表登记随窗口创建发生）。
     fn tab_drag_host_split_to_new_window(
@@ -303,7 +299,7 @@ pub trait TabDragHost: 'static {
     ) where
         Self: Sized;
 
-    /// 还原到主（非 detached）窗口（原 `EditorApp::restore_tab_to_primary`）：`EditorAppRegistry`
+    /// 还原到主（非 detached）窗口：`EditorAppRegistry`
     /// 查询首个非 detached 窗口 → 目标窗 `adopt_tab` 收纳 + 聚焦；找不到主窗口则本窗转正
     /// 原地收纳。宿主独占：注册表查询 / 跨窗口实体 update / 焦点。
     fn tab_drag_host_restore_to_primary(

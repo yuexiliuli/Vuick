@@ -1,16 +1,16 @@
-//! 侧边栏域 crate（2026-11 自 `crates/shell` 的 `app/sidebar` 拆出）。
+//! 侧边栏域 crate。
 //!
-//! 纯结构移动 + 域内解耦：把侧边栏的**状态 / 外壳（chrome）渲染 / 目录（toc）视图 /
-//! 文件树输入弹层（FileTreePrompt）**从 `EditorApp` 的 `impl` 块中整迁出来，使这些
+//! 把侧边栏的**状态 / 外壳（chrome）渲染 / 目录（toc）视图 /
+//! 文件树输入弹层（FileTreePrompt）**从 `EditorApp` 的 `impl` 块移交出来，使这些
 //! 逻辑可独立编译 / 独立测试，宿主 `EditorApp` 只保留：
 //!
 //! - **状态**：`sidebar: SidebarChromeState` 仍作 `EditorApp` 的普通字段（Pub 重导出
-//!   保持 `app::sidebar::…` 与测试既有路径；调用面零变化）。
+//!   保持 `app::sidebar::…` 与测试既有路径）。
 //! - **实体接线**：`sidebar_view: Entity<Sidebar<EditorApp>>` 承接外壳 / 目录的渲染与
 //!   事件（`Context<Sidebar>` 内 `cx.listener` 绑定域实体），宿主渲染期以
-//!   `&mut SidebarChromeState` 传入（状态在宿主、渲染在域内，行为与既有一致）。
-//! - **宿主服务面**：事件回调改状态统一经 [`host::SidebarHost`]（`WeakEntity<H>` 反调，
-//!   对照 `session_store::RecentPanelHost` 先例）；状态**纯变换**收在
+//!   `&mut SidebarChromeState` 传入（状态在宿主、渲染在域内）。
+//! - **宿主服务面**：事件回调改状态统一经 [`host::SidebarHost`]（`WeakEntity<H>` 反调）；
+//!   状态**纯变换**收在
 //!   [`state`]（`toggle_view` / `resize_*` / `toc_collapse`），宿主侧零逻辑。
 //!
 //! ## 模块
@@ -28,8 +28,8 @@
 //!   检索接线 / 文件夹后台分块扫描 / 命中跳转）；扫描与防抖为实体弱句柄自更新（写共享
 //!   模型 + 自 notify），打开/激活经 [`host::SidebarHost`] 分发宿主。
 //!
-//! 依赖只重分配 workspace 既有包（gpui / ui / config / shell_core / shell_scan / toc / pdf /
-//! markdown_wysiwyg / futures），不新增外部包。
+//! 依赖 workspace 既有包（gpui / ui / config / shell_core / shell_scan / toc / pdf /
+//! markdown_wysiwyg / futures）。
 
 pub mod chrome;
 pub mod files;

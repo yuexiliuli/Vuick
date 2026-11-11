@@ -7,9 +7,9 @@
 //!   落在隔离临时目录（K8），不触碰真实 `%APPDATA%`。
 //! - **原子写**：复用 `base::util::atomic_write`（临时文件 + rename，hash-skip 不做——
 //!   书签量小且只在变更时写，量级远低于会话/配置）。
-//! - **2026-11-11 迁自 shell 的 app/pdf_bookmarks.rs**：纯逻辑（路径/序列化/落盘/缓存）
-//!   与模型读数 [`bookmarks_for`] / 模型写数 [`add_bookmark`] / [`remove_bookmark`] 全迁
-//!   本 crate；宿主 `EditorApp` 只留薄适配（notify/toast 由宿主落地）。
+//! - **纯逻辑与模型读写**：路径 / 序列化 / 落盘 / 缓存与模型读数 [`bookmarks_for`] /
+//!   模型写数 [`add_bookmark`] / [`remove_bookmark`] 均在本 crate；宿主 `EditorApp` 只留
+//!   薄适配（notify/toast 由宿主落地）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -137,14 +137,14 @@ pub fn save(map: &HashMap<String, Vec<PdfBookmark>>) {
 
 /// 某路径当前内存态的书签列表（无 → `None`）。模型读数（宿主 `EditorApp` 薄适配转发；
 /// 侧栏 TOC「书签」区段与测试读）。`Option<Vec<..>>`：`AppModel` 为 `Rc<RefCell>`、
-/// 跨 crate 命名，owned 克隆语义与原 `EditorApp::pdf_bookmarks_for` 一致。
+/// 跨 crate 命名，owned 克隆语义与 `EditorApp::pdf_bookmarks_for` 一致。
 pub fn bookmarks_for(m: &AppModel, path: &Path) -> Option<Vec<PdfBookmark>> {
     let key = normalize_key(path);
     m.pdf_bookmarks.get(&key).cloned()
 }
 
 /// 添加/覆盖一条书签（同页去重）：更新内存 + 原子落盘。宿主在模型借用结束后自行
-/// notify（原 `EditorApp::add_pdf_bookmark` 的模型 + save 部分）。
+/// notify（`EditorApp::add_pdf_bookmark` 的模型 + save 部分）。
 pub fn add_bookmark(m: &mut AppModel, path: &Path, page_index: usize, title: String) {
     let key = normalize_key(path);
     let list = m.pdf_bookmarks.entry(key.clone()).or_default();

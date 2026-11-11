@@ -1,20 +1,20 @@
-//! 编辑 ⇄ 预览切换与统一 MD 预览/所见即所得（WYSIWYG）的**宿主薄适配**（2026-11-11：
-//! 域逻辑已整迁独立 crate `shell_preview`）。
+//! 编辑 ⇄ 预览切换与统一 MD 预览/所见即所得（WYSIWYG）的**宿主薄适配**（域逻辑在
+//! 独立 crate `shell_preview`）。
 //!
-//! 本模块只保留 `EditorApp` 的薄包装 / 宿主侧收尾（纯结构移动，行为零变）：
+//! 本模块只保留 `EditorApp` 的薄包装 / 宿主侧收尾：
 //!
 //! - **薄包装**：`tab_file_name` / `show_preview` / `md_wy_preview` / `epub_page_bounds` /
 //!   `sync_editor_preview_scroll` / `ensure_md_wy` / `ensure_epub_wy` /
 //!   `epub_flip_chapter` / `toggle_preview_for_tab` / `toggle_preview_fullscreen` /
 //!   `toggle_wrap` / `is_*` / `language_id` / `language_label` / `md_wy_invalidate_async` /
 //!   `md_wy_spawn_early_install` / `md_wy_install_full_swap` / `md_wy_spawn_prefix_install` /
-//!   `md_wy_feed_full_rope` 全部转发 `shell_preview` 域函数（签名/可见性逐字不变，
-//!   `app/tests/preview.rs` + `scroll_sync.rs` 等宿主↔预览联动集成测试靠此兼容面编译绿）。
+//!   `md_wy_feed_full_rope` 全部转发 `shell_preview` 域函数（`app/tests/preview.rs` +
+//!   `scroll_sync.rs` 等宿主↔预览联动集成测试靠此兼容面编译）。
 //! - **宿主收尾**：`commit_live` 的视图收尾（`on_next_frame` 清 `retired_live2` + 行级
 //!   diff 兜底 hunk 计算，`text_open::line_diff` 依赖留在宿主）+ `md_wy_align_after_*`
 //!   对齐转域；`toggle_live_test` 的守卫/关闭（`commit_live`）+ ON 分支转域 `enter_live`；
 //!   `change_font_size`/`reset_font_size`（字号持久化）+ 测试探针 `retired_live2_len`。
-//! - **测试探针重导出**：`LIVE_COMMIT_MD_WY_ASYNC` / `LIVE_ON_MD_WY_REUSE` 已随域逻辑迁
+//! - **测试探针重导出**：`LIVE_COMMIT_MD_WY_ASYNC` / `LIVE_ON_MD_WY_REUSE` 在
 //!   `shell_preview`（常驻编译），此处重导出维持 `crate::app::preview::…` 既有路径；
 //!   `LIVE_COMMIT_DIFF_APPLIED` / `LIVE_COMMIT_DIFF_HUNKS` 仍由本模块 `commit_live` 的
 //!   Diff 兜底分支维护（保留在宿主侧）。
@@ -35,7 +35,7 @@ pub(crate) use shell_preview::LIVE_ON_MD_WY_REUSE;
 /// `preview_apply_edit` 被调用）的 `commit_live` 次数。方案2 后仅「编辑日志重放护栏
 /// 失败 / 有脏标记但无日志」的兜底路径累加。
 /// （`LIVE_COMMIT_WRITEBACK` / `LIVE_COMMIT_SKIP_UNCHANGED` / `LIVE_COMMIT_OPS_REPLAYED`
-/// / `LIVE_COMMIT_OPS_COUNT` 已随 `commit_live` 纯模型部分下沉 `shell_core`。）
+/// / `LIVE_COMMIT_OPS_COUNT` 在 `shell_core`，随 `commit_live` 纯模型部分维护。）
 #[cfg(test)]
 pub(crate) static LIVE_COMMIT_DIFF_APPLIED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -224,11 +224,11 @@ impl EditorApp {
     /// 退出预览编辑：把 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览；live2 实体**延迟**
     /// 到下一帧渲染后销毁（A：实体级联 Drop ~36ms 移出点击同步路径）。
     ///
-    /// SC（2026-11）：`commit_live` 的**纯模型 + 实体**部分已下沉 `AppModel::commit_live`
+    /// `commit_live` 的**纯模型 + 实体**部分在 `AppModel::commit_live`
     /// （shell_core）。本方法保留必须留在宿主侧的视图收尾并按返回值分派：`on_next_frame`
     /// 清 `retired_live2`、右栏 `md_wy` ops/diff 对齐（转域 `shell_preview::mdwy`）、以及
     /// 行级 diff 兜底的 hunk 计算（`line_diff` 依赖 `text_open`，留在 shell，shell_core
-    /// 不新增依赖）。借用范围 / 事件顺序 / 返回值语义与旧单一实现逐路径核对一致。
+    /// 不新增依赖）。
     pub(super) fn commit_live(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let align = self.model.borrow_mut().commit_live(idx, cx);
         // 仅在确实取到 live2（已暂存 `retired_live2`）的路径调度下一帧清空；`NoLive2` 无

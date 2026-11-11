@@ -1,4 +1,4 @@
-//! 侧边栏「目录（TOC）」视图（2026-11 自 shell 的 `app/sidebar/toc.rs` 迁入并解耦）。
+//! 侧边栏「目录（TOC）」视图。
 //!
 //! 当前文档标题大纲（Markdown 标题 / PDF 书签）的折叠 / 自适应宽 / 虚拟化渲染与点击
 //! 跳转。全部数据（模型 / WyEditor / PdfViewer 实体）经共享 `Rc<RefCell<AppModel>>` 域内

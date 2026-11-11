@@ -1,10 +1,10 @@
-//! 侧边栏「文件树操作」实体子模块（2026-11 自 shell 的 `app/sidebar/files_ops.rs` 迁入）。
+//! 侧边栏「文件树操作」实体子模块。
 //!
 //! 右键菜单（新建文件/文件夹、重命名、删除、资源管理器定位、复制路径、剪切/复制）的
 //! **菜单结构 / 输入弹层生命周期**收在域实体；菜单动作与「新建/重命名/删除」等
 //! **文件系统副作用**（落盘 + 树失效 + 会话落盘）经 [`crate::host::SidebarHost`] /
-//! [`crate::prompt::FileTreePromptHost`] 分发到宿主（shell 的 `app/file_tree_ops.rs`），
-//! 行为零变。右键菜单 / 输入弹层的实体句柄（pos/menu/sub/prompt）为实体自有，宿主仅
+//! [`crate::prompt::FileTreePromptHost`] 分发到宿主（shell 的 `app/file_tree_ops.rs`）。
+//! 右键菜单 / 输入弹层的实体句柄（pos/menu/sub/prompt）为实体自有，宿主仅
 //! 镜像菜单实体与弹层实体（测试断言用）。
 
 use gpui::{

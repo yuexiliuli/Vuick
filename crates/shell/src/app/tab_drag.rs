@@ -6,7 +6,7 @@
 //! 在窗外仍跟手可见（gpui 拖拽幽灵只画在源窗口帧缓冲内，窗外被裁剪），真文件窗口在
 //! `release_tab_drag_outside`（`on_mouse_up_out`）时才建立。
 //!
-//! H2（2026-11-11）：**纯逻辑已迁 `shell_tabs::drag`**（命中计算 `tab_insert_index` /
+//! **纯逻辑在 `shell_tabs::drag`**（命中计算 `tab_insert_index` /
 //! `tab_drag_over_row`、幽灵窗布局参数 `tab_drag_ghost_layout`、预告尺寸兜底
 //! `tab_preview_size`、边缘遮断判定 `drag_picture_about_to_clip`、拖拽状态机单步迁移
 //! `tab_drag_move_step`、拆分决策 `tab_drag_release_kind`）。本模块只剩宿主编排 + win32：
@@ -20,14 +20,14 @@ impl EditorApp {
     /// 实体与元数据整体移到目标窗口），下标与激活态自动校正。
     /// 整结构 move：一次解构 `EditorTab` 搬到 `DetachedTab`（`..` 丢弃源窗口专属的
     /// live 态 / 订阅），不再逐字段手抄。
-    /// SC-4：payload 动作体已迁 `AppModel::take_tab_payload`。glue 转发。
+    /// payload 动作体在 `AppModel::take_tab_payload`。glue 转发。
     /// `#[doc(hidden)] pub`：`tests/pdf.rs` 多窗口换位回归（真实拔出/收纳路径，§8.6 外提清单）。
     #[doc(hidden)]
     pub fn take_tab_payload(&mut self, idx: usize) -> Option<DetachedTab> {
         self.model.borrow_mut().take_tab_payload(idx)
     }
 
-    /// 移出选项卡前的统一收尾（live2 守卫下沉）：实时预览编辑实体不随选项卡搬迁——
+    /// 移出选项卡前的统一收尾（live2 守卫）：实时预览编辑实体不随选项卡搬迁——
     /// 先 `commit_live` 把 live2 写回编辑区再取载荷。拖拽移出路径（`release_tab_drag_outside`
     /// 窗口外松开）此前各自手抄「`live_edit` → `commit_live`」守卫，收敛为此 helper；
     /// `take_tab_payload` 本身保持无副作用（测试直调、不隐含 commit）。
@@ -180,7 +180,7 @@ impl EditorApp {
         // 窗口外松开：先销毁越界时创建的跟手幽灵窗，真文件窗口随后按落点建立/还原。
         self.destroy_drag_ghost(cx);
         self.model.borrow_mut().drag_outside_armed = false;
-        // SC-3：先提纯 owned 再 let-else，避免 `tab_dragging.take()` 的 RefMut 临时
+        // 先提纯 owned 再 let-else，避免 `tab_dragging.take()` 的 RefMut 临时
         // 存活整个 `let-else` 作用域（后续 borrow_mut 运行期双借 panic）。
         let tab_dragging = self.model.borrow_mut().tab_dragging.take();
         let Some(idx) = tab_dragging else {

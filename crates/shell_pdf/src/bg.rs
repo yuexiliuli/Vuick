@@ -11,9 +11,9 @@
 //! ColorPicker 行在 rfd 文档表中即为未实现；改用手写 `#[link]` FFI 直调 comdlg32，
 //! 零新依赖零新 feature），测试构建 / 非 windows 不弹框（no-op，headless 无法真弹）。
 //!
-//! 2026-11-11 迁自 shell 的 app/pdf_bg.rs：解析 / 重着色 / 自定义色应用逻辑全迁本
-//! crate（`&AppModel` 读数 + `Engity<PdfViewer>` 应用）；`pick_custom_pdf_bg` 的
-//! **宿主 window 部分**（当前窗口 HWND 提取 + set_pdf_bg 落地）留 shell 薄适配。
+//! 解析 / 重着色 / 自定义色应用逻辑在本 crate（`&AppModel` 读数 + `Entity<PdfViewer>`
+//! 应用）；`pick_custom_pdf_bg` 的**宿主 window 部分**（当前窗口 HWND 提取 +
+//! set_pdf_bg 落地）留在 shell 薄适配。
 
 use config::user::PdfBgPref;
 use gpui::App;
@@ -133,7 +133,7 @@ pub fn set_pdf_bg_model(m: &mut AppModel, pref: PdfBgPref, custom: Option<String
 /// `Win32::UI::Controls::Dialogs` 整模块会引入其巨量类型，与 shell 巨型测试二进制叠加后
 /// 触发 MSVC 链接 `LNK1140: PDB 类型上限`——手写 FFI 既零新依赖也零 PDB 暴涨。
 ///
-/// 2026-11-11 迁自 shell 的 app/pdf_bg.rs `native` 模块；宿主只在 `pick_custom_pdf_bg`
+/// 宿主只在 `pick_custom_pdf_bg`
 /// 里提取当前窗口 HWND 后调用本函数。
 #[cfg(all(windows, not(test)))]
 pub fn pick_color(initial: Option<gpui::Hsla>, owner_hwnd: isize) -> Option<String> {

@@ -1,4 +1,4 @@
-//! 侧边栏**宿主服务面**（2026-11-11，对照 `session_store::RecentPanelHost` 先例）。
+//! 侧边栏**宿主服务面**。
 //!
 //! 侧栏实体 [`crate::chrome::Sidebar`] 与 [`crate::toc`] 在**事件回调**（活动栏点击 /
 //! 调宽手柄 / 目录折叠 / PDF 书签删除）里改的侧栏状态不在域之内（`SidebarChromeState`
@@ -26,9 +26,9 @@ use crate::state::{SidebarView, TreeEntry};
 
 /// 侧边栏宿主抽象：把侧栏对宿主的交互收敛为最小接口，使域 crate（shell_sidebar）不
 /// 依赖 shell 的具体宿主类型。shell 侧以 `impl SidebarHost for EditorApp` 提供实现
-/// （方法转发到 [`crate::state`] 状态纯变换 / 既有文件操作 + `notify`，行为不变）。
+/// （方法转发到 [`crate::state`] 状态纯变换 / 既有文件操作 + `notify`）。
 ///
-/// ## 再入纪律（硬约束）
+/// ## 再入约束（硬约束）
 ///
 /// 本 trait 方法只从**域实体的事件回调**（`cx.listener` 在元素事件派发中被调用，此刻
 /// 宿主实体未被借用）经 `WeakEntity<H>::update` 反调宿主；宿主实现 `&mut Context<Self>`

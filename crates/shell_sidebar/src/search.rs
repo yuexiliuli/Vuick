@@ -1,4 +1,4 @@
-//! 侧边栏「跨文件搜索」实体子模块（2026-11 自 shell 的 `app/sidebar/search.rs` 迁入）。
+//! 侧边栏「跨文件搜索」实体子模块。
 //!
 //! 关键词输入 + 范围切换（当前文件 / 整个文件夹）+ 结果渲染与防抖扫描（含文件夹后台
 //! 分块扫描、PDF 全文检索接线与命中跳转）。与 chrome / toc / files / files_ops 同构：
@@ -6,7 +6,7 @@
 //! （范围 tab 点击 / 命中行打开）经 [`crate::host::SidebarHost`] 反调宿主（打开/激活 /
 //! notify），扫描与防抖均为**实体弱句柄自更新**（写共享模型 + 自 notify），不回流宿主。
 //!
-//! 与旧 `impl EditorApp` 的对应关系（逐行迁移，行为零变）：
+//! `EditorApp` 的既有 `impl` 入口对应到本实体的方法：
 //!
 //! - `render_sidebar_search` / `render_search_scope_tabs` / `render_sidebar_search_results` /
 //!   `render_sidebar_folder_search` / `sidebar_folder_*` / `sidebar_search_*` /
@@ -286,7 +286,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         // 计数/页列表并驱动跳转。结果异步到达 → 经对应 PDF 选项卡的 `_pdf_sub` 订阅
         // 重绘本面板（多 PDF 并存各自独立订阅，见 `subscribe_pdf`）。
         // 先取出 reader（owned 克隆）再 `if let`，避免 `if let` 掮获 `borrow()` 临时
-        // Ref 跨过块内 `&mut self` / `borrow_mut`（E0502 / 借用纪律收窄）。
+        // Ref 跨过块内 `&mut self` / `borrow_mut`（E0502 / 借用约束收窄）。
         let reader =
             self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.reader.clone());
         if let Some(MediaReader::Pdf(pdf)) = reader {
@@ -644,7 +644,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 while let Some(update) = rx.next().await {
                     let scan_gen = generation;
                     let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
-                        // SC-3：先提纯 owned Rc 再 let-else，避免 `if let` 掮获的 Ref 临时
+                        // 先提纯 owned Rc 再 let-else，避免 `if let` 掮获的 Ref 临时
                         // 存活整个分支体（块内 `borrow_mut` 运行期双借 panic）。
                         let folder_search = this.model.borrow().folder_search.clone();
                         let Some(existing) = folder_search else {
@@ -1137,7 +1137,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             move |app| {
                 let _ = weak.update(app, |this, cx| {
                     // 期间有新输入 → 代序已前进，本定时器作废（防抖可重入）。
-                    // SC-3：先提纯 owned 再比较（if 条件里的 borrow 临时 Ref 存活整分支）。
+                    // 先提纯 owned 再比较（if 条件里的 borrow 临时 Ref 存活整分支）。
                     let pending = std::mem::take(&mut this.model.borrow_mut().search_pending);
                     let search_committed = this.model.borrow().search_committed.clone();
                     if search_committed != pending {
@@ -1155,9 +1155,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 一次性物化后借 `&str` 逐行扫（`scan_line_hits`）——同一轮搜索只物化一次、逐行借用，
     /// 不再每行新分配小写临时串。匹配：ASCII 查询一次性小写全文副本 + std `str::find`
     /// （memmem 快路径，零逐行分配）；非 ASCII 查询词回退 [`find_ci`] 字符级折叠扫描。
-    /// 结果缓存在共享模型 `search_scan`，编辑/加载/切文档时宿主清空重扫（交互零变化）。
+    /// 结果缓存在共享模型 `search_scan`，编辑/加载/切文档时宿主清空重扫。
     fn sidebar_search_scan(&mut self, q: &str, cx: &App) -> Rc<SidebarSearchScan> {
-        // SC-3：先提纯 owned Rc 再 if-let（`search_scan` 在共享模型，if-let 掮获的 Ref
+        // 先提纯 owned Rc 再 if-let（`search_scan` 在共享模型，if-let 掮获的 Ref
         // 临时会跨过 `borrow_mut` 判定，运行期双借 panic）。
         let scan = self.model.borrow().search_scan.clone();
         if let Some(s) = scan

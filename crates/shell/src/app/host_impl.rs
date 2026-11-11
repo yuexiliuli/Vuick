@@ -1,6 +1,6 @@
-//! SC-4（2026-11-10）：`impl AppHost for EditorApp`——宿主服务面的 shell 侧实现。
+//! `impl AppHost for EditorApp`——宿主服务面的 shell 侧实现。
 //!
-//! 借用纪律（见 `shell_core::host` 模块注释）：`AppHost` 方法一律 `&self`、实现**不得
+//! 借用约束（见 `shell_core::host` 模块注释）：`AppHost` 方法一律 `&self`、实现**不得
 //! 同步**读/写 `AppModel`（动作方法运行时宿主正持 `AppModel` 可变借用）；凡回调体需读
 //! 模型（订阅 / 延迟），把模型读写放进**回调体**再经 `own_weak` 再入宿主实体——此刻
 //! 动作方法的模型借用已结束。纯取值方法（`is_detached` 等）只读宿主字段，安全。
@@ -46,7 +46,7 @@ impl AppHost for EditorApp {
         let ed = editor.clone();
         cx.subscribe(&ed, move |emitter, ev: &editor::EditorEvent, cx| {
             // 事件回调触发时动作方法的模型借用早已结束：经自身弱句柄再入宿主实体，
-            // 执行与既有 `subscribe_editor` 逐字一致的订阅体（行为/时机零变化）。
+            // 执行与 `subscribe_editor` 一致的订阅体。
             let _ = weak.update(cx, |this, cx| {
                 let pos = this.model.borrow().tabs.iter().position(|t| t.editor == emitter);
                 if let Some(t) = pos {
@@ -76,7 +76,7 @@ impl AppHost for EditorApp {
         }
     }
 
-    /// 「测试构建」运行时注入（R3，2026-11-10）：integration 测试目标下 shell lib 以
+    /// 「测试构建」运行时注入：integration 测试目标下 shell lib 以
     /// **非 test** 编译 → `cfg!(test)` 恒 false，`persist_session`/`persist_prefs` 会
     /// 真写 `%APPDATA%`（K8 复发）。正解 = 由各 integration 目标 `tests/common/mod.rs`
     /// 的 `init_test()` 在 gpui App 启动前设 `GPUI_EDITOR_TEST=1`，此处运行时判定：
@@ -88,7 +88,7 @@ impl AppHost for EditorApp {
     }
 }
 
-// 2026-11-11：侧栏域 crate 宿主服务面（shell_sidebar）。事件回调改侧栏状态统一经此
+// 侧栏域 crate 宿主服务面（shell_sidebar）。事件回调改侧栏状态统一经此
 // trait 落地；宿主实现只调 `shell_sidebar::state` 的**状态纯变换** + notify/persist，或
 // 转发宿主既有文件侧副作用（打开/激活/新建/重命名/删除/剪贴板/探索器），零业务逻辑。
 impl shell_sidebar::SidebarHost for EditorApp {
@@ -141,8 +141,8 @@ impl shell_sidebar::SidebarHost for EditorApp {
 
     /// 目录行展开/折叠（生产事件入口）：转发宿主 facade `file_tree_toggle`——宿主侧
     /// 直落 `state::file_tree_toggle` 纯变换 + 首展宿主侧 spawn 扫描，全程不回租 Sidebar
-    /// 实体（目录行 on_click 回调期间实体已租用，回租即 `double_lease_panic`，D1 评审
-    /// BLOCK 方向 A；与 toc_collapse 同构）。
+    /// 实体（目录行 on_click 回调期间实体已租用，回租即 `double_lease_panic`；
+    /// 与 toc_collapse 同构）。
     fn sidebar_file_tree_toggle(
         &mut self,
         path: std::path::PathBuf,
@@ -245,8 +245,8 @@ impl shell_sidebar::SidebarHost for EditorApp {
     }
 }
 
-// 2026-11-11：文件树输入弹层宿主服务面（shell_sidebar）。提交动作在宿主
-// （`app/file_tree_ops.rs` 的既有 `file_tree_submit_prompt`），行为零变。
+// 文件树输入弹层宿主服务面（shell_sidebar）。提交动作在宿主
+// （`app/file_tree_ops.rs` 的 `file_tree_submit_prompt`）。
 impl shell_sidebar::FileTreePromptHost for EditorApp {
     fn file_tree_submit_prompt(
         &mut self,
@@ -259,7 +259,7 @@ impl shell_sidebar::FileTreePromptHost for EditorApp {
     }
 }
 
-// 2026-11-11：PDF 域宿主服务面（shell_pdf）。PDF 页操作动作对宿主的交互收敛到此：
+// PDF 域宿主服务面（shell_pdf）。PDF 页操作动作对宿主的交互收敛到此：
 // toast 通知（宿主通知容器 + `PdfToast` 去重标记）与右键新弹前弹窗互关（清宿主
 // `tab_bar_menu_*` / `media_lock_menu_*` / `pdf_menu_*` 槽位）。域逻辑在 shell_pdf，
 // 宿主实现零业务逻辑。
@@ -273,9 +273,9 @@ impl shell_pdf::PdfHost for EditorApp {
     }
 }
 
-// 2026-11-11：媒体域宿主服务面（shell_media）。媒体窗口路由的「真正执行」与「最近其它
-// 媒体窗口」查询收敛到此 trait（方法体自原 app/media_window.rs 的 `open_media_in_new_window` /
-// `route_media_to_window` / `nearest_other_media_window` 整迁，行为零变化）；纯决策在
+// 媒体域宿主服务面（shell_media）。媒体窗口路由的「真正执行」与「最近其它
+// 媒体窗口」查询收敛到此 trait（宿主方法体薄转发 `open_media_in_new_window` /
+// `route_media_to_window` / `nearest_other_media_window`）；纯决策在
 // `shell_media::media_window`，宿主编排（`maybe_redirect_media_open` 等）据此分发执行。
 impl shell_media::MediaHost for EditorApp {
     /// 「最近其它媒体窗口」查询：`EditorAppRegistry` 依赖收敛到宿主实现（域不直读注册表）。
@@ -418,7 +418,7 @@ impl shell_media::MediaHost for EditorApp {
     }
 }
 
-// 2026-11-11：预览域宿主服务面（shell_preview）。预览域对宿主的副作用收敛到此 trait：
+// 预览域宿主服务面（shell_preview）。预览域对宿主的副作用收敛到此 trait：
 // WYSIWYG 活区内容变更的防抖会话持久化 / Ctrl+滚轮缩放字号 / 预览拖放打开。域逻辑在
 // shell_preview（`live::enter_live` 订阅回调、`render::zoom_overlay`、`render::md_wy_host_children`
 // 的 on_drop 经 `cx.listener` 的 `&mut H` 直调），宿主实现零业务逻辑（转发既有方法）。
@@ -441,10 +441,10 @@ impl shell_preview::PreviewHost for EditorApp {
     }
 }
 
-// 2026-11-11：选项卡栏域宿主服务面（shell_tabs）。选项卡栏渲染/事件在 `TabBar` 实体
+// 选项卡栏域宿主服务面（shell_tabs）。选项卡栏渲染/事件在 `TabBar` 实体
 // （`tab_bar_view`），凡事件回调必须落宿主副作用的动作统一经此 trait 反调；宿主实现
 // 只薄转发既有方法（`tabs.rs` 生命周期 glue / `preview.rs` 预览切换 / 菜单槽位落地），
-// 零业务逻辑。拖拽开始预建幽灵窗入口已迁 `shell_tabs::TabDragHost`（下方 impl）。
+// 零业务逻辑。拖拽开始预建幽灵窗入口在 `shell_tabs::TabDragHost`（下方 impl）。
 impl shell_tabs::TabsHost for EditorApp {
     fn tabs_host_activate_tab(
         &mut self,
@@ -558,11 +558,11 @@ impl shell_tabs::TabsHost for EditorApp {
     }
 }
 
-// 2026-11-11：跨窗口选项卡拖拽宿主服务面（shell_tabs::drag）。拖拽流程的纯逻辑
+// 跨窗口选项卡拖拽宿主服务面（shell_tabs::drag）。拖拽流程的纯逻辑
 // （命中 / 布局参数 / 状态机迁移 / 拆分决策）在 `shell_tabs::drag`；宿主侧「真正执行」
 // （open_window 建新窗 / EditorAppRegistry 查询 / HWND·DWM / 幽灵窗实体创建销毁 /
-// adopt·restore 目标窗操作）统一经本 trait 反调宿主。方法体自原 `app/tab_drag.rs`
-// 既有方法薄转发（`tab_drag.rs` 仍为主编排列写点），行为零变化。
+// adopt·restore 目标窗操作）统一经本 trait 反调宿主。宿主方法体薄转发
+// `app/tab_drag.rs` 既有实现（该文件仍为主编排列写点）。
 impl shell_tabs::TabDragHost for EditorApp {
     fn tab_drag_host_prime_ghost(
         &mut self,

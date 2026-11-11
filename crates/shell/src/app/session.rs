@@ -8,9 +8,9 @@
 //! - 未命名选项卡内容写槽位文件 `session/t0`、`t1`…（LF 规范化，空内容也写空文件）。
 //! - 清单 + 槽位一律「临时文件 + rename」原子写；损坏 / 缺字段一律安全回退（不 panic）。
 //!
-//! **结构**（2026-11 拆 crate）：本模块只保留 host-bound 编排（`impl EditorApp` 的
+//! **结构**：本模块只保留 host-bound 编排（`impl EditorApp` 的
 //! 收集 / 渐进恢复 / 开关 / 退出钩子）；清单 / 槽位 / 导入 / 孤儿清理的**纯存储层**
-//! 已迁入独立叶子 crate `session_store`（`crate` 内 `session_store::*`），本模块不再
+//! 在独立叶子 crate `session_store`（`crate` 内 `session_store::*`），本模块不再
 //! 触及磁盘原语。
 //!
 //! 范围与限制：
@@ -60,7 +60,7 @@ impl EditorApp {
     /// 「恢复上次会话」开关：翻转 + 立即持久化（不等退出）。关闭时顺带清掉遗留
     /// 会话清单/槽位，避免日后重新开启时恢复陈旧会话。
     pub(super) fn toggle_session_restore(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        // SC-3：先提纯 owned 再写回，避免同语句 `borrow_mut`+`borrow`（运行期双借 panic）。
+        // 先提纯 owned 再写回，避免同语句 `borrow_mut`+`borrow`（运行期双借 panic）。
         let session_restore = !self.model.borrow().session_restore;
         self.model.borrow_mut().session_restore = session_restore;
         // 与其它偏好同款落盘（persist_prefs 已纳入 session_restore 字段）。
@@ -186,7 +186,7 @@ impl EditorApp {
             });
         } else {
             // 全部选项卡已恢复：活动选项卡越界收敛到合法值（多开/缺文件只多不少时同 clamp）。
-            // SC-2：先提纯 len（owned）再写，避免同一语句 `borrow_mut()` 与 `borrow()`
+            // 先提纯 len（owned）再写，避免同一语句 `borrow_mut()` 与 `borrow()`
             // 同时存活（运行期 RefCell 双借 panic）。
             let len = self.model.borrow().tabs.len();
             self.model.borrow_mut().active_tab = if len == 0 {
@@ -201,7 +201,7 @@ impl EditorApp {
             //「恢复前内容」的旧指纹误判「未变」而跳过写槽位/清单 → 恢复出的选项卡内容不再落盘。
             self.model.borrow_mut().session_slot_hashes.clear();
             self.model.borrow_mut().session_last_manifest_digest = None;
-            // D1（评审修复）：恢复窗口内结构性变更（新建未命名 tab / 打开文件）的
+            // 恢复窗口内结构性变更（新建未命名 tab / 打开文件）的
             // `schedule_session_flush(immediate)` 被 `session_restoring` 抑制，且结构变更
             // 不走防抖重排 → 补一发**即时补偿落盘**（此刻 `session_restoring` 已置 false、
             // 指纹表已清，`persist_session` 会写全新指纹，避免误跳过槽位/清单），把恢复
@@ -223,7 +223,7 @@ impl EditorApp {
     /// 仅在**会话责任窗口**（首个主窗口 `session_persist`）、非 detached、开关开启、
     /// 非恢复期间落盘；测试构建恒跳过（**绝不**触碰真实会话目录，验证走显式临时目录的
     /// 纯逻辑 [`AppModel::save_session_to`]，见 `tests/session.rs`）。
-    /// SC-4：编排逻辑已迁 `AppModel::persist_session`（shell_core::actions）；此处 glue 转发。
+    /// 编排逻辑在 `AppModel::persist_session`（shell_core::actions）；此处 glue 转发。
     pub(super) fn persist_session(&mut self, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().persist_session(host, &mut **cx);
@@ -259,7 +259,7 @@ impl EditorApp {
 /// 与「导出设置」（`settings_xfer`）共用同一序列化口径：文件选项卡只记路径、未命名
 /// 选项卡经 [`AppModel::tab_effective_text`] 取有效内容（live2/WYSIWYG 开启时读 WyEditor
 /// 实时内容）。槽位名 `t0..tN` 随未命名顺序位移。
-/// SC-4：逻辑已迁 `AppModel::collect_session_data`；此处保留 free fn 挂导出设置/测试。
+/// 逻辑在 `AppModel::collect_session_data`；此处保留 free fn 挂导出设置/测试。
 pub(crate) fn collect_session_data(
     app: &EditorApp,
     cx: &App,
@@ -267,9 +267,9 @@ pub(crate) fn collect_session_data(
     app.model.borrow().collect_session_data(cx)
 }
 
-/// 保存会话（纯逻辑，显式目录，可测试）：SC-4 逻辑已迁
+/// 保存会话（纯逻辑，显式目录，可测试）：逻辑在
 /// [`AppModel::save_session_to`]（shell_core::actions）；此处保留 free fn 挂测试与
-/// 退出钩子（`save_session`），逐字保持既有语义（开关关闭只清、未变槽位跳过等）。
+/// 退出钩子（`save_session`）（开关关闭只清、未变槽位跳过等）。
 /// `#[doc(hidden)] pub`：integration 测试经 `shell::app::save_session_to` 访问（§8.6）。
 #[doc(hidden)]
 pub fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool {
@@ -280,10 +280,10 @@ pub fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool {
 /// 灌槽位内容 → 活动选项卡按清单取并 clamp 到 `[0, tabs.len())` → 删除清单并清理
 /// 槽位（避免重复恢复）。开关关闭 / 清单缺失 → false（不动作）。文件已不存在 → 跳过
 /// （与 CLI 首参打开同口径：`is_file` 才开）。
-/// **A1 之后生产启动不再走本函数**（改走渐进的 [`EditorApp::schedule_restore`]）；此处
+/// **生产启动不再走本函数**（改走渐进的 [`EditorApp::schedule_restore`]）；此处
 /// 保留为测试与基准（`tests/session.rs`、`tests/bench.rs`、`tests/settings_xfer.rs`）
-/// 的「改前行为基准」驱动。原 `#[cfg(test)]` 归位为恒编：integration 目标下 shell lib
-/// 以非 test 编译，`#[cfg(test)]` 项不可见，必须恒编 + `pub`（生产不调用，pub 故无
+/// 的行为基准驱动。恒编 + `pub`：integration 目标下 shell lib
+/// 以非 test 编译，`#[cfg(test)]` 项不可见（生产不调用，pub 故无
 /// dead_code 告警）。
 #[doc(hidden)]
 pub fn restore_session_from(
@@ -316,7 +316,7 @@ pub fn restore_session_from(
         }
     }
     // 活动选项卡越界收敛到合法值（多开/缺文件只多不少时同样 clamp）。
-    // SC-2：先提纯 len（owned）再写，避免同一语句 `borrow_mut()` 与 `borrow()`
+    // 先提纯 len（owned）再写，避免同一语句 `borrow_mut()` 与 `borrow()`
     // 同时存活（运行期 RefCell 双借 panic）。
     let len = app.model.borrow().tabs.len();
     app.model.borrow_mut().active_tab = if len == 0 {

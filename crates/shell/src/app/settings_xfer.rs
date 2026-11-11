@@ -13,7 +13,7 @@
 //! - session 复用 [`collect_session_data`]（与 [`crate::app::session::save_session_to`]
 //!   同一序列化路径，不复制整套会话逻辑），各槽位正文经 serde_json 字符串转义嵌入。
 //!
-//! **结构**（2026-11 拆 crate）：打包包的**纯序列化**（构建 / 校验 / 解析）已迁入独立
+//! **结构**：打包包的**纯序列化**（构建 / 校验 / 解析）在独立
 //! 叶子 crate `session_store`（`session_store::build_export_bundle` /
 //! `parse_export_bundle`）；本模块只保留 host-bound 应用层（对话框 / 配置即时生效 /
 //! 会话写回目录 / toast）。
@@ -87,7 +87,7 @@ impl EditorApp {
     }
 
     /// 把当前应用状态导出到指定路径（纯逻辑、可测）：收集 prefs（当前交互态）+ 会话
-    /// 清单/槽位 → 构建导出包 → 原子写盘 → toast（成功带路径 / 失败带原因，K11 不崩）。
+    /// 清单/槽位 → 构建导出包 → 原子写盘 → toast（成功带路径 / 失败带原因，不崩）。
     /// `#[doc(hidden)] pub`：`tests/session.rs`（settings_xfer 合并域）直驱（§8.6）。
     #[doc(hidden)]
     pub fn export_to_path(&mut self, save_path: &std::path::Path, cx: &mut Context<Self>) {

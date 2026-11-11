@@ -1,5 +1,4 @@
-//! 预览 / WYSIWYG 渲染元素（2026-11-11 自 `crates/shell` 的 `app/panes.rs` 预览渲染半 +
-//! `app/preview.rs` 迁出，纯结构移动）。
+//! 预览 / WYSIWYG 渲染元素。
 //!
 //! 统一 `md_wy` WyEditor 右栏/全屏宿主（`md_wy_host_children` + 占位）、WYSIWYG 活区
 //! 左面板宿主（`render_live_area` / `drive_wy_host`）、编辑区/预览区共用 Ctrl+滚轮缩放

@@ -1,10 +1,10 @@
-﻿//! panes（2026-11-11：预览渲染半已整迁 `shell_preview`）。
+﻿//! panes（预览渲染半在 `shell_preview`）。
 //!
 //! 本模块只保留**编辑区 / 分割条**宿主半：`render_editor_pane`（编辑区 + WYSIWYG 活区
 //! 左面板接入）、`render_plain_editor` / `render_editor_pending`（大文档占位与冻结）、
 //! `render_splitter`（分屏分割线拖拽）。预览渲染半（`render_preview_pane` /
 //! `render_fullscreen_preview` 的 md_wy 分支、`md_wy_host_children` / `preview_element` /
-//! `render_live_area` / `zoom_overlay` 元素构建）已迁 `shell_preview`，宿主经薄适配调用；
+//! `render_live_area` / `zoom_overlay` 元素构建）在 `shell_preview`，宿主经薄适配调用；
 //! 媒体/PDF 查看器渲染分支（`md_wy_preview()==None`，依赖 `sync_active_media_meta` 等宿主
 //! 媒体域）留本模块。
 
@@ -12,7 +12,7 @@ use super::*;
 
 /// WYSIWYG 宿主 `#live-body` 的顶部内衬（px）：缩放锚点在做「宿主 ScrollHandle 偏移 ↔
 /// WyEditor 元素局部 y」换算时使用，必须与各宿主 `.py(px(LIVE_BODY_PAD_Y))` 保持一致。
-/// 原定义已随 SC 下沉 `shell_core::LIVE_BODY_PAD_Y`，此处重导出维持 `app::panes::…` 路径
+/// 定义在 `shell_core::LIVE_BODY_PAD_Y`，此处重导出维持 `app::panes::…` 路径
 ///（`app/tests/scroll_sync.rs` 断言读；生产构建不再直接消费 → 允许未使用）。
 #[allow(unused_imports)]
 pub(crate) use shell_core::LIVE_BODY_PAD_Y;
@@ -51,7 +51,7 @@ impl EditorApp {
         // 所见即所得预览编辑（WYSIWYG）模式：左面板 = 本项目 `WyEditor`
         // （AUTO-GROW，内部无滚动条，宿主负责滚动 + 自绘纵向滚动条）。
         // 先取出 live2 实体（owned）再 `if let`，避免 `if let` 掮获 `borrow()` 临时
-        // Ref 的生命周期跨过块内 `&mut self` 调用（E0502 / 借用纪律收窄）。
+        // Ref 的生命周期跨过块内 `&mut self` 调用（E0502 / 借用约束收窄）。
         let live2 = self.model.borrow().tabs[active].live2.clone();
         if let Some(ed) = live2 {
             // live2 未就绪（大文档后台装配在途）：**冻结源码编辑区** + 全区域透明输入

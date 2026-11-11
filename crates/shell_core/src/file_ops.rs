@@ -1,8 +1,8 @@
-//! SC-4（2026-11-10）：file_ops 纯逻辑迁入 shell_core——[`PreparedText`] /
+//! file_ops 纯逻辑——[`PreparedText`] /
 //! [`prepare_text`]（读预处理物化产物，纯函数后台线程可跑）/[`is_large_path`]（大文档
 //! 后台打开判定）/[`AppModel::set_tab_text`]（会话恢复的未命名选项卡灌文本）。宿主
 //! file_ops 流水线的 async / host 段（`load_file_text` / `spawn_progressive_open` /
-//! `apply_open_chunk` / `open_file*`）仍留 shell，仅把这条纯逻辑沉降。
+//! `apply_open_chunk` / `open_file*`）仍留 shell，本模块只承载上述纯逻辑。
 
 use std::path::Path;
 

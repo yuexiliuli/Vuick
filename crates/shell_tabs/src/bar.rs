@@ -1,13 +1,13 @@
-//! 选项卡栏「域实体」渲染（2026-11-11 自 shell 的 `app/tabs.rs` 迁入并解耦）。
+//! 选项卡栏「域实体」渲染。
 //!
 //! [`TabBar`] = 选项卡栏域实体：宿主 `EditorApp` 经 `tab_bar_view: Entity<TabBar<EditorApp>>`
 //! 持有，渲染期以「宿主字段引用 + 预取派生数据」为入参调用（`tab_bounds` 拖拽命中槽 /
 //! `tab_bar_hscroll` 横向滚动条仍是宿主字段、以 `&mut`/`&` 传入；`preview_on` /
 //! `active_is_md` 是渲染期禁入宿主、由宿主预取传入的派生布尔）；事件回调（激活 / 关闭 /
 //! 右键菜单项 / 滚轮 / 拖拽幽灵）经 [`crate::host::TabsHost`] 反调宿主落地副作用，
-//! 拖拽开始预建幽灵窗经 [`crate::drag::TabDragHost::tab_drag_host_prime_ghost`]，行为零变。
+//! 拖拽开始预建幽灵窗经 [`crate::drag::TabDragHost::tab_drag_host_prime_ghost`]。
 //!
-//! 与旧 `impl EditorApp` 的对应关系（逐行迁移）：
+//! `EditorApp` 的既有 `impl` 入口对应到本实体的方法：
 //!
 //! - `render_tab_bar` → [`TabBar::render_tab_bar`]（`tab_bounds` 以 `&mut` 传入重建、
 //!   `tab_bar_hscroll` 以 `&` 传入接线）。
@@ -58,7 +58,7 @@ pub enum ReorderSide {
 /// 事件（`Context<Self>` 内 `cx.listener` 绑定本实体）。共享模型（`model`）域内直读；
 /// 其余宿主状态（`tab_bounds` / `tab_bar_hscroll`）渲染期以引用入参、副作用反调宿主。
 /// `H: TabsHost + TabDragHost`：选项卡生命周期动作 / 菜单槽位经 `TabsHost`，拖拽开始
-/// 预建幽灵窗经 `TabDragHost`（H2 把 TabsHost::tabs_host_prime_drag_ghost 迁此）。
+/// 预建幽灵窗经 `TabDragHost`。
 pub struct TabBar<H: TabsHost + TabDragHost> {
     /// 宿主模型（与 `EditorApp.model` 同一 `Rc<RefCell>` 共享）：选项卡栏读 `tabs` /
     /// `active_tab` / `dark_mode` / `tab_dragging` / `tab_reorder_target` 与写
@@ -224,8 +224,8 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         let host_close = host.clone();
         let close = div()
             .id(SharedString::from(format!("tab-close-{idx}")))
-            // H1 评审回归：debug_selector 供 app::tests::tab_bar 断言关闭钮渲染
-            // （`debug_bounds` 只收录带 debug_selector 的元素；行为零影响）。
+            // debug_selector 供 app::tests::tab_bar 断言关闭钮渲染
+            // （`debug_bounds` 只收录带 debug_selector 的元素）。
             .debug_selector(move || format!("tab-close-{idx}"))
             .w(px(18.))
             .h(px(18.))
@@ -594,7 +594,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         } else {
             None
         };
-        // 借用纪律（SC-5）：先一次 borrow 快照每个选项卡渲染所需的廉价字段（显示名 +
+        // 借用约束：先一次 borrow 快照每个选项卡渲染所需的廉价字段（显示名 +
         // 脏标记 + 完整路径），guard 随即释放——构造期不再持 `tabs` 长借用。
         // `render_tab_bar_item` 只消费这三项派生数据，改动零渲染差异（未命名路径为 None）。
         let tab_meta: Vec<(String, bool, Option<String>)> = {

@@ -1,4 +1,4 @@
-//! PDF 右键菜单的**动作逻辑与错误映射**（2026-11-11 迁自 shell 的 app/pdf_menu.rs）。
+//! PDF 右键菜单的**动作逻辑与错误映射**。
 //!
 //! 菜单的**视图/挂载**（`ui::menu` 弹出结构 + 宿主 `pdf_menu_*` 字段 + 浮层渲染）留 shell
 //! 薄适配；此处收敛页操作动作（插入/删除/提取/删除注释）、添加书签动作、失败 toast 判定
@@ -20,9 +20,9 @@ use crate::bookmarks::add_bookmark;
 /// 宿主 `PdfHost::pdf_host_toast` 以它作通知去重键——先移除同 key 再推送，不堆积）。
 pub struct PdfToast;
 
-/// PDF 域**宿主服务面**（对照 `shell_sidebar::SidebarHost` 先例）：把 PDF 域动作对宿主
+/// PDF 域**宿主服务面**：把 PDF 域动作对宿主
 /// 的交互收敛为最小接口，使本 crate 不依赖 shell 的具体宿主类型。shell 侧以
-/// `impl PdfHost for EditorApp` 提供实现（method 转发既有通知/菜单字段清理，行为不变）。
+/// `impl PdfHost for EditorApp` 提供实现（method 转发既有通知/菜单字段清理）。
 pub trait PdfHost: 'static {
     /// PDF 操作 toast（自托管 key：先移除上一条再推送，不堆积；宿主实现）。
     fn pdf_host_toast(&mut self, title: &str, msg: String)
@@ -87,7 +87,7 @@ pub fn delete_annot_action(pdf: &Entity<PdfViewer>, id: u64, cx: &mut App) {
 /// 返回要 toast 的失败文案（`None` = 无新变化，不加提示）。
 pub fn notify_last_error(m: &mut AppModel, pdf: &Entity<PdfViewer>, cx: &mut App) -> Option<String> {
     let err = pdf.read(cx).last_modify_error().map(|s| s.to_string());
-    // SC-3：先提纯 owned 再 match（match 分支守卫里的 borrow 临时 Ref 存活整个
+    // 先提纯 owned 再 match（match 分支守卫里的 borrow 临时 Ref 存活整个
     // 分支体 → 块内 borrow_mut 运行期双借 panic）。
     let seen = m.pdf_last_error_seen.clone();
     let changed = err.as_ref().is_some_and(|e| seen.as_deref() != Some(e.as_str()));

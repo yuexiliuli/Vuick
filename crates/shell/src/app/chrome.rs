@@ -213,7 +213,7 @@ impl EditorApp {
     /// 汇总当前偏好（主题三态 / 字号 / 侧栏宽度 / 会话与托盘开关 / 打开文件夹根 /
     /// 最近打开），供持久化与「导出设置」（`settings_xfer`）共用同一口径——导出即
     /// 「当前交互态」，两者始终一致。
-    /// SC-4：逻辑已迁 [`AppModel::collect_prefs`]（shell_core::actions）；此处 glue。
+    /// 逻辑在 [`AppModel::collect_prefs`]（shell_core::actions）；此处 glue。
     pub(super) fn collect_prefs(&self) -> UserPrefs {
         let host: &dyn AppHost = self;
         self.model.borrow().collect_prefs(host)
@@ -224,7 +224,7 @@ impl EditorApp {
     /// 否则下次启动仍保持随内容自适应。
     /// **测试构建不写盘**（config crate 是依赖编译、不受其自身 `cfg!(test)` 门控，
     /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
-    /// SC-4：逻辑已迁 [`AppModel::persist_prefs`]；此处 glue。
+    /// 逻辑在 [`AppModel::persist_prefs`]；此处 glue。
     pub(super) fn persist_prefs(&self) {
         let host: &dyn AppHost = self;
         self.model.borrow().persist_prefs(host);
@@ -444,7 +444,7 @@ impl EditorApp {
 
     /// 右上角 toast 层：卡片可见即渲染，点击卡片按「类型 + key」精确关闭。
     ///
-    /// 合成层纪律：浮层一律走 `deferred(...)` 独立绘制层（与菜单
+    /// 合成层约束：浮层一律走 `deferred(...)` 独立绘制层（与菜单
     /// `deferred(anchored())` 同款机制，见 src/ui/menu.rs），不要用裸 absolute。
     /// 每张卡片按 left = 窗口宽 - 卡片宽 - 右缘、right = 右缘、top = 4 + i*92、h 固定
     /// 显式定位（headless 与真机布局一致）；保留 .id + on_click 交互。

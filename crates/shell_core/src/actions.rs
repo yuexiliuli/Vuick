@@ -1,15 +1,14 @@
-//! SC-4（2026-11-10）：迁入 `AppModel` 的**动作方法体**——tabs 动作半（make/new/reorder/
+//! `AppModel` 的**动作方法体**：tabs 动作半（make/new/reorder/
 //! activate/remove/tab_close_*）、tab_drag payload 半（take_tab_payload）、session 编排
 //! 纯逻辑（persist_session / save_session_to / collect_session_data）与它们依赖的模型直读
 //! helper（tab_focus_handle / tab_effective_text）。
 //!
-//! 签名统一自 `(&mut self, cx)` 改为 `(&mut self, host: &dyn AppHost, …)` 形式：模型字段
-//! 同 crate 直取，宿主服务经 [`crate::host::AppHost`] 反向调用。**逻辑 / 行为 / 时机逐字
-//! 保持**（性能红线）：除「寻址与调用方式」外零语义改动。宿主 glue（按钮 / 菜单 / 事件 /
-//! 异步实体再入）留在 shell 的 `impl EditorApp`，迁出后转发
-//! `self.model.borrow_mut().yyy(host_self, …)`。
+//! 签名统一为 `(&mut self, host: &dyn AppHost, …)` 形式：模型字段同 crate 直取，宿主
+//! 服务经 [`crate::host::AppHost`] 反向调用。宿主 glue（按钮 / 菜单 / 事件 / 异步实体
+//! 再入）留在 shell 的 `impl EditorApp`，经 `self.model.borrow_mut().yyy(host_self, …)`
+//! 转发。
 //!
-//! 借用纪律：host 方法 `&self`、host 实现不得同步触碰 `AppModel`（见 host.rs 模块注释）；
+//! 借用约束：host 方法 `&self`、host 实现不得同步触碰 `AppModel`（见 host.rs 模块注释）；
 //! 本模块内 `self` 即 `&mut AppModel`，随取随用，不需 RefCell。
 
 use std::path::Path;
@@ -186,7 +185,7 @@ impl AppModel {
             return;
         }
         // 先提纯 active/len（owned）再分支，避免 `if` 条件里的临时 Ref 跨过块内
-        // 可变借用（SC-2/SC-3 借用纪律同款）。
+        // 可变借用（借用约束）。
         let active = self.active_tab;
         let len = self.tabs.len();
         if idx < active {
@@ -295,9 +294,8 @@ impl AppModel {
             return None;
         }
         let tab = self.tabs.remove(idx);
-        // SC-2：先提纯 active/len（owned）再分支写——避免同一语句里
-        // 可变与共享借用同时存活（SC-2 借用纪律；同 crate 内已无 RefCell，仍按
-        // 「先取后写」保持原语义）。
+        // 先提纯 active/len（owned）再分支写——避免同一语句里
+        // 可变与共享借用同时存活（同 crate 内已无 RefCell，仍按「先取后写」保持原语义）。
         let active = self.active_tab;
         let len = self.tabs.len();
         if idx < active {
@@ -519,7 +517,7 @@ impl AppModel {
             // 关闭到托盘开关随其它偏好一并落盘（否则一次字号/主题保存就把它重置回默认关）。
             close_to_tray: Some(self.close_to_tray),
             // 媒体打开位置两个开关随其它偏好一并落盘（否则一次字号/主题保存就把开关重置
-            // 回默认开；K10/K41 副作用收敛：collect_prefs 是持久化唯一口径）。
+            // 回默认开；collect_prefs 是持久化唯一口径）。
             media_new_window: Some(self.media_new_window),
             reuse_media_window: Some(self.reuse_media_window),
             // 媒体窗口记录尺寸一并落盘（否则一次字号/主题保存就把记录清空回 None，白记）。
@@ -535,8 +533,8 @@ impl AppModel {
             opened_folder: host
                 .files_root()
                 .map(|p| p.to_string_lossy().into_owned()),
-            // 最近打开（文件夹 / 文件）：随偏好落盘（空 → `[]`），跨重启恢复（K11：
-            // 只随打开/移除/清空这类状态变化写，不逐帧 / 不重复全量重写）。
+            // 最近打开（文件夹 / 文件）：随偏好落盘（空 → `[]`），跨重启恢复（只随
+            // 打开/移除/清空这类状态变化写，不逐帧 / 不重复全量重写）。
             recent_folders: self.recent_folders.clone(),
             recent_files: self.recent_files.clone(),
             music_dir: existing.music_dir,
@@ -554,7 +552,7 @@ impl AppModel {
     /// 侧栏宽度只在用户手动拖过（`width_auto == false`）时才持久化，
     /// 否则下次启动仍保持随内容自适应。
     /// **测试构建不写盘**（config crate 是依赖编译、不受其自身 `cfg!(test)` 门控，
-    /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
+    /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`）。
     pub fn persist_prefs(&self, host: &dyn AppHost) {
         // 测试构建恒跳过（cfg!(test) 经 host 回传）：避免污染真实/隔离配置。
         if host.is_test_build() {
@@ -564,7 +562,7 @@ impl AppModel {
     }
 
     /// 记录最近打开的文件：去重置顶 + 截 [`config::limits::RECENT_MAX`] + 立即持久化。
-    /// 「打开最近」副作用集中入口（K10/K11：一次调用内完成「列表更新 + 落盘」，
+    /// 「打开最近」副作用集中入口（一次调用内完成「列表更新 + 落盘」，
     /// 消费点只调它，不散点直调 persist）。
     pub fn record_recent_file(&mut self, host: &dyn AppHost, path: &Path) {
         push_recent(&mut self.recent_files, &path.to_string_lossy());

@@ -1,16 +1,15 @@
-//! tabs：选项卡栏的**宿主薄适配**（2026-11-11：渲染/交互/右键菜单项构建整迁 shell_tabs
-//! 的 `TabBar` 实体）。
+//! tabs：选项卡栏的**宿主薄适配**（渲染/交互/右键菜单项构建在 shell_tabs 的 `TabBar` 实体）。
 //!
-//! 本模块只保留 `EditorApp` 的宿主侧内容（纯结构移动，行为零变）：
+//! 本模块只保留 `EditorApp` 的宿主侧内容：
 //!
 //! - **生命周期动作 glue**：`make_tab` / `new_tab` / `activate_tab` / `remove_tab` /
-//!   `reorder_tab` / `tab_close_*` / `tab_move/copy_*` —— 动作体已迁 `shell_core::AppModel`
+//!   `reorder_tab` / `tab_close_*` / `tab_move/copy_*` —— 动作体在 `shell_core::AppModel`
 //!   （经 `AppHost` 反调宿主），此处保留薄转发（`app/tests` 与 shell 其它模块经此面调用）。
 //! - **关闭保存流程**：`close_tab`（脏/未命名弹原生确认框异步等待）+ `save_unnamed_and_close`
 //!   （另存为对话框）——宿主文件保存副作用，留在宿主。
-//! - **tab_drag 相关入口（H2 起命中计算迁域，编排留宿主）**：`reorder_tab`（排序落地
-//!   动作体已迁 `AppModel`，glue 转发）；`tab_insert_index` / `tab_drag_over_row`（栏内
-//!   排序命中）已迁 `shell_tabs::drag` 纯函数（宿主 `tab_bounds` 快照以参数传入），
+//! - **tab_drag 相关入口**：`reorder_tab`（排序落地
+//!   动作体在 `AppModel`，glue 转发）；`tab_insert_index` / `tab_drag_over_row`（栏内
+//!   排序命中）在 `shell_tabs::drag` 纯函数（宿主 `tab_bounds` 快照以参数传入），
 //!   layout.rs `on_drag_move` 直调域函数。
 //! - **横向滚动条宿主面**：`poke_tab_hscroll`（宿主字段 `tab_bar_hscroll` + 计时
 //!   `tab_hscroll_delay`）。
@@ -22,14 +21,14 @@ use super::*;
 use config::timing::TAB_HSCROLL_HIDE_MS;
 
 impl EditorApp {
-    /// SC-4：动作体已迁 `AppModel::make_tab`（shell_core::actions）。此处 glue 转发。
+    /// 动作体在 `AppModel::make_tab`（shell_core::actions）。此处 glue 转发。
     #[doc(hidden)]
     pub fn make_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> usize {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().make_tab(host, &mut **cx)
     }
 
-    /// SC-4：动作体已迁 `AppModel::new_tab`。glue 转发。
+    /// 动作体在 `AppModel::new_tab`。glue 转发。
     pub(super) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().new_tab(host, window, &mut **cx);
@@ -39,13 +38,13 @@ impl EditorApp {
     /// （`shell_tabs::drag::tab_insert_index` 输出，相对当前 `tabs`；`tabs.len()` = 末尾）。
     /// 插回原位 / 原相邻位（顺序不变）→ 不动作；单选项卡天然不动作。活动下标随移动
     /// 校正；各选项卡内容/脏点/路径不变；结构变化即时持久化。
-    /// SC-4：动作体已迁 `AppModel::reorder_tab`。glue 转发。
+    /// 动作体在 `AppModel::reorder_tab`。glue 转发。
     pub(super) fn reorder_tab(&mut self, from: usize, target: usize, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut().reorder_tab(host, from, target, &mut **cx);
     }
 
-    /// SC-4：动作体已迁 `AppModel::activate_tab`。glue 转发。
+    /// 动作体在 `AppModel::activate_tab`。glue 转发。
     #[doc(hidden)]
     pub fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
@@ -143,7 +142,7 @@ impl EditorApp {
                             let (saved, need_dialog) = cx
                                 .update_window_entity(&entity, |this, _window, cx| {
                                     // 先取出 path（owned）再 match，避免 `match` 掮获 `borrow()`
-                                    // 临时 Ref 跨过块内 `&mut self` 调用（E0502 / 借用纪律收窄）。
+                                    // 临时 Ref 跨过块内 `&mut self` 调用（E0502 / 借用约束收窄）。
                                     let path = this
                                         .model.borrow().tabs
                                         .get(idx)
@@ -217,7 +216,7 @@ impl EditorApp {
             .detach();
     }
 
-    /// SC-4：动作体已迁 `AppModel::remove_tab`。glue 转发。
+    /// 动作体在 `AppModel::remove_tab`。glue 转发。
     #[doc(hidden)]
     pub fn remove_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
@@ -310,10 +309,10 @@ impl EditorApp {
     }
 
     // -----------------------------------------------------------------
-    // 批量关闭 + 移入/复制新窗口（动作体已迁 AppModel，glue 转发）
+        // 批量关闭 + 移入/复制新窗口（动作体在 AppModel，glue 转发）
     // -----------------------------------------------------------------
 
-    /// SC-4：批量关闭动作体已迁 `AppModel`（tab_close_guard/others/right/all/saved）。
+    /// 批量关闭动作体在 `AppModel`（tab_close_guard/others/right/all/saved）。
     /// 「关闭其他」：关闭除 `idx` 外全部；任一受影响脏/未命名 → 中止一个都不关。
     pub(super) fn tab_close_others(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
@@ -368,7 +367,7 @@ impl EditorApp {
             return;
         }
         // 先提纯 reader_none / media_path（owned）再分支，避免 `if` 条件里的 `borrow()`
-        // 临时 Ref 跨过块内 `&mut self` 调用（E0502 / 借用纪律收窄）。
+        // 临时 Ref 跨过块内 `&mut self` 调用（E0502 / 借用约束收窄）。
         let reader_none = self.model.borrow().tabs[idx].reader.is_none();
         let media_path = self.model.borrow().tabs[idx].file_path.clone();
         if reader_none {

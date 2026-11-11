@@ -1,4 +1,4 @@
-//! 侧边栏**纯状态与类型**（2026-11 自 shell 的 `app/sidebar/mod.rs` 迁入）。
+//! 侧边栏**纯状态与类型**。
 //!
 //! 只交付类型 / 常量 / 共享 helper / **状态纯变换**：
 //!
@@ -6,8 +6,8 @@
 //!   拖拽 / 目录与文件树缓存 / 滚动句柄）。状态本体**仍作 `EditorApp::sidebar` 普通字段**
 //!   （`app::tests::sidebar` 等跨 crate 既有字段读写不变量强制），实体的渲染/事件经
 //!   `&mut SidebarChromeState` 或 [`crate::host::SidebarHost`] 服务在宿主侧落地。
-//! - [`SidebarView`] / [`TreeEntry`] / [`FileTreeState`] / [`FileRow`]（文件树下一阶段随迁，
-//!   本阶段保持类型/字段可见性与既有路径）。
+//! - [`SidebarView`] / [`TreeEntry`] / [`FileTreeState`] / [`FileRow`]（类型/字段可见性
+//!   维持既有路径）。
 //! - 状态纯变换：`toggle_view` / [`resize_start`] / [`resize_update`] / [`resize_end`] /
 //!   [`toc_collapse`]——宿主侧与域侧共用同一份变换，杜绝逻辑双写漂移。
 
@@ -25,9 +25,9 @@ use shell_core::{AppModel, MdTocScroll, SearchScopeTab};
 pub enum SidebarView {
     /// 当前文档目录（Markdown 标题 / PDF 书签）。
     Toc,
-    /// 跨打开文件的搜索（`search.rs` 已迁本 crate）。
+    /// 跨打开文件的搜索（[`crate::search`]）。
     Search,
-    /// 打开文件夹的文件树（`files.rs` 已迁本 crate）。
+    /// 打开文件夹的文件树（[`crate::files`]）。
     Files,
 }
 
@@ -38,7 +38,7 @@ pub enum SidebarView {
 #[doc(hidden)]
 pub struct TreeEntry {
     /// 显示名（`file_name` 的 UTF-8 字符串，排序键）。
-    /// `pub`：宿主/测试直写可见（下一阶段 files.rs 随迁前跨 crate 构造）。
+    /// `pub`：宿主/测试直写可见（跨 crate 构造）。
     pub name: String,
     /// 是否目录（目录优先于文件）。
     /// `pub`：宿主/测试直写可见。
@@ -50,7 +50,7 @@ pub struct TreeEntry {
 
 /// 文件树状态：根 + 已展开目录集 + 每个已展开目录的直接子项缓存。
 ///
-/// 懒加载纪律：**禁止整棵递归预扫描**——只在目录首次展开时后台读一次直接子项
+/// 懒加载约束：**禁止整棵递归预扫描**——只在目录首次展开时后台读一次直接子项
 /// （宿主 `spawn_file_tree_scan` 位于 shell::app::sidebar host facade），建材缓存后折叠再展开复用；
 /// 渲染逐帧 O(可见行)，绝不每帧重扫 `read_dir` 或重建 HashMap。换根 → 全清。
 /// `#[doc(hidden)] pub`：`EditorApp.sidebar.files`（§8.6 外提链）元素类型。
@@ -61,7 +61,7 @@ pub struct FileTreeState {
     /// `pub`：宿主/测试直写可见。
     pub root: Option<PathBuf>,
     /// 已展开的目录完整路径集合（折叠即移除，children 缓存保留复用）。
-    /// `pub`：宿主/测试直写可见（files.rs 已迁本 crate）。
+    /// `pub`：宿主/测试直写可见（消费方在 [`crate::files`]）。
     pub expanded: std::collections::HashSet<PathBuf>,
     /// 每个**已扫描过**目录的直接子项缓存（漏项 = 尚未扫描，展示层按「加载中」处理）。
     /// `pub`：宿主/测试直写可见（settings_xfer 读 children）。
@@ -136,7 +136,7 @@ pub fn file_tree_toggle(files: &mut FileTreeState, path: &Path) -> bool {
 /// 文件树**可见行**描述（不含元素；根 + 已展开递归子项 + 空目录占位）。
 /// 树结构没变（`files.layout_gen`）时整表复用，渲染只把可视带内的行物化为元素——
 /// 万级子项下不再每帧全量构造行元素 / 键控状态 / 路径克隆。
-/// `#[doc(hidden)] pub`：字段供 shell 的 files.rs（下一阶段随迁）跨 crate 构造。
+/// `#[doc(hidden)] pub`：字段供 shell 的 files.rs 跨 crate 构造。
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct FileRow {
@@ -158,9 +158,8 @@ pub struct FileRow {
 }
 
 /// 侧边栏「外壳」状态：可见性、当前视图与目录（TOC）面板的宽度/折叠/右缘拖拽。
-/// 与「检索输入 + 扫描缓存 + 订阅」分属（后者 `search.rs` 已迁本 crate，渲染经共享模型）。
-/// 纯结构移动（2026-11 自 shell 的 `app/sidebar/mod.rs` 迁入本 crate 后**原样保留字段**），
-/// 由宿主 `EditorApp.sidebar` 普通字段持有，跨 crate（shell 编排 + 测试）字段全 `pub`。
+/// 与「检索输入 + 扫描缓存 + 订阅」分属（后者在 [`crate::search`]，渲染经共享模型）。
+/// 由宿主 `EditorApp.sidebar` 普通字段持有，字段跨 crate（shell 编排 + 测试）全 `pub`。
 /// `#[doc(hidden)] pub`：`EditorApp.sidebar` 字段 + `width/width_auto/files` 供
 /// `tests/settings_xfer.rs` 直读/直写（§8.6 外提清单）。
 #[doc(hidden)]
@@ -185,7 +184,7 @@ pub struct SidebarChromeState {
     pub toc_vscroll: gpui::ScrollHandle,
     /// 搜索结果滚动句柄：`#sidebar-search-results*` 经 `track_scroll` 跟踪，
     /// 右侧自绘纵向滚动条跟随（与目录/编辑器一致）。
-    /// `pub`：宿主/测试直写可见（`search.rs` 已迁本 crate）。
+    /// `pub`：宿主/测试直写可见（消费方在 [`crate::search`]）。
     pub search_vscroll: gpui::ScrollHandle,
     /// 文件树根 / 展开集 / 子项缓存（懒加载，见 [`FileTreeState`]）。
     /// `pub`：宿主/测试直写可见。
@@ -196,7 +195,7 @@ pub struct SidebarChromeState {
     pub files_layout: Option<(u64, Vec<FileRow>)>,
     /// 文件树滚动句柄：`#sidebar-files-scroll` 经 `track_scroll` 跟踪，
     /// 右侧自绘纵向滚动条跟随（与目录/搜索一致）。
-    /// `pub`：宿主/测试直写可见（files.rs 已迁本 crate）。
+    /// `pub`：宿主/测试直写可见（消费方在 [`crate::files`]）。
     pub files_vscroll: gpui::ScrollHandle,
     /// 目录自适应宽缓存 `(选项卡下标, 编辑版本, WyEditor 内容代号, 宽)`：内容没变只算一次，
     /// 禁逐帧 O(N) 全量测宽（大文档上万标题下每帧重扫 = 卡死热源之一）。

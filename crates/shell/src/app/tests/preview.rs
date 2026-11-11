@@ -1857,8 +1857,8 @@
         assert_eq!(committed, expected, "护栏回退 diff 后仍须与 live2 全文等价");
         assert_eq!(replays, 0, "错位时不得走 op 重放路径（护栏应拦截）");
         assert_eq!(diffs, 1, "错位时应回退走既有行级 diff 兜底（本用例一次）");
-        // 评审 nits：diff 兜底路径必须落下与旧实现一致的收尾 status/status_ok（拆分后
-        // Diff 分支曾漏设 status，状态栏残留旧文案——与「行为零变」矛盾）。防再漂移。
+        // diff 兜底路径必须落下与拆分前一致的收尾 status/status_ok（拆分后
+        // Diff 分支曾漏设 status，状态栏残留旧文案）。防再漂移。
         let (status, status_ok) = cx.update(|_w, cx| {
             let m = app.read(cx).model.borrow();
             (m.status.to_string(), m.status_ok)

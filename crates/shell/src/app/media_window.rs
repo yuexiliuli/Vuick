@@ -1,6 +1,6 @@
-//! 媒体窗口打开重定向**宿主薄适配**（2026-11-11）：查看菜单两个开关（`media_new_window` /
+//! 媒体窗口打开重定向**宿主薄适配**：查看菜单两个开关（`media_new_window` /
 //! `reuse_media_window`）驱动 `open_file` 对音频/视频的分流——新开同进程独立窗口 / 复用
-//! 已有媒体窗口 / 当前窗口。**纯决策**已迁 `shell_media::media_window`（`MediaOpenTarget` /
+//! 已有媒体窗口 / 当前窗口。**纯决策**在 `shell_media::media_window`（`MediaOpenTarget` /
 //! `MediaWindowKind` / `resolve_*` / `media_window_kind` / `is_media_path` /
 //! `resolve_media_open_action` / `record_media_window_size` 模型段 / `open_target_kind`）；
 //! 路由的**真正执行**（开新窗 / 跨窗口 `open_file_here`）与「最近其它媒体窗口」查询经
@@ -47,7 +47,7 @@ impl EditorApp {
         else {
             return;
         };
-        // SC-评审 BLOCK：`&mut self.model.borrow_mut()` 的 guard 在语句结束已 drop，
+        // `&mut self.model.borrow_mut()` 的 guard 在语句结束已 drop，
         // 此处 `&self` 路径（schedule / 诊断）不再持有模型借用（防 RefCell 双借 panic）。
         self.schedule_media_size_flush(cx);
         if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
@@ -150,7 +150,7 @@ impl EditorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // SC-3：同一语句两次 `borrow_mut()`（LHS guard 存活时求值 RHS）运行期双借
+        // 同一语句两次 `borrow_mut()`（LHS guard 存活时求值 RHS）运行期双借
         // panic → 一次取 guard 内完成「读旧值后翻转」。
         let mut m = self.model.borrow_mut();
         m.media_new_window = !m.media_new_window;
@@ -171,7 +171,7 @@ impl EditorApp {
         if !self.model.borrow().media_new_window {
             return;
         }
-        // SC-3：同语句双 `borrow_mut()` panic → 一次 guard 内翻转。
+        // 同语句双 `borrow_mut()` panic → 一次 guard 内翻转。
         let mut m = self.model.borrow_mut();
         m.reuse_media_window = !m.reuse_media_window;
         drop(m);

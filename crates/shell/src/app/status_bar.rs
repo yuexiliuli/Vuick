@@ -2,7 +2,7 @@
 //!
 //! 布局（自左向右，区之间用细分隔线，见 [`status_section_divider`]）：
 //! - **左侧区**：语言徽标（圆角小底 + 语言类别「徽记色点」，色源 [`ui::theme::language_badge_color`]）。
-//!   文件名与「悬停显示完整路径」提示已迁移到选项卡栏（2026-11-10）：每个有名文件选项卡
+//!   文件名与「悬停显示完整路径」提示在选项卡栏：每个有名文件选项卡
 //!   悬停 200ms 后在其下方浮出自身完整路径 tooltip（见 [`crate::app::tabs`]）；未打开文件时
 //!   徽标显示「纯文本」占位。
 //! - **中间区**：光标位置（编辑区 `Ln x, Col y`）或滚动位置（预览/PDF 页码）；无编辑内容时整段省略。
@@ -36,7 +36,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // 借用纪律（SC-5）：一次 borrow 取出激活选项卡的全部廉价字段（Scalar/String/实体引用
+        // 借用约束：一次 borrow 取出激活选项卡的全部廉价字段（Scalar/String/实体引用
         // 读数）即释放 guard——杜绝「长借用 model.borrow() 构造子元素」后子元素继续借用的
         // 隐患；后续 `status_bar_left/right` 等自身再 borrow，互不嵌套。
         let (line_count, char_count, language, preview_on, readonly_preview, fullscreen, wrap_on, is_markdown, epub_page, pdf_page, cursor_pos) = {
@@ -141,8 +141,8 @@ impl EditorApp {
         root
     }
 
-    /// 左侧区：语言徽标 pill（文件名与「悬停显示完整路径」提示已迁移到选项卡栏，
-    /// 见 `shell_tabs::TabBar` 的选项卡元素，2026-11-10）。
+    /// 左侧区：语言徽标 pill（文件名与「悬停显示完整路径」提示在选项卡栏，
+    /// 见 `shell_tabs::TabBar` 的选项卡元素）。
     fn status_bar_left(&self, language: String) -> gpui::Div {
         div()
             .flex()

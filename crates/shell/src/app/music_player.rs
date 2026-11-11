@@ -1,5 +1,5 @@
-//! music_player：shell 对音乐播放器（`crates/music`）的集成层**宿主薄适配**（2026-11-11）。
-//! 播放器引擎与 UI 核心逻辑不改动；**路由/判定核心**已迁 `shell_media::music`——什么
+//! music_player：shell 对音乐播放器（`crates/music`）的集成层**宿主薄适配**。
+//! 播放器引擎与 UI 核心逻辑不改动；**路由/判定核心**在 `shell_media::music`——什么
 //! 路径进音乐模式（`is_audio_path`）、toggle 状态判定（`plan_music_toggle`）、首次进
 //! 目录判定（`should_load_default_dir`）、播放请求（`play_path_in`）。本模块保留
 //! `MusicView` 惰性创建（连同 `MusicPlayer` 实体与 `ExitRequested` 订阅）与焦点/状态

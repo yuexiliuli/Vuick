@@ -1,16 +1,14 @@
-//! 预览域**宿主服务面**（2026-11-11，对照 `shell_pdf::PdfHost` / `shell_media::MediaHost`
-//! 先例）。
+//! 预览域**宿主服务面**。
 //!
 //! 预览域对宿主的交互收敛为最小接口：域逻辑（聚合 `AppModel` 模型态 + `WyEditor` 实体 +
 //! gpui 上下文）不依赖 shell 的具体宿主类型；凡**必须落宿主的副作用**（会话持久化 /
 //! 字号缩放入口 / 拖放打开文件）经本 trait 反调宿主 `EditorApp`。shell 侧以
-//! `impl shell_preview::PreviewHost for EditorApp` 提供实现（`app/host_impl.rs`，方法体自
-//! 原 `EditorApp` 既有方法薄转发，行为零变化）。
+//! `impl shell_preview::PreviewHost for EditorApp` 提供实现（`app/host_impl.rs`，方法体薄转发）。
 //!
 //! 三个方法都是 `cx.listener` 回调 `&mut H`（订阅 / 事件回调）内调用，不涉及域函数自身的
 //! `Context<H>` 回借，无双借风险。
 //!
-//! ## 借用纪律
+//! ## 借用约束
 //!
 //! 域侧调用点都在「宿主实体未被租用」的回调体（WyEditor 变更订阅 / Ctrl+滚轮缩放 /
 //! 预览拖放）内经 `cx.listener` 或 `cx.subscribe` 的 `&mut H` 直调——不持有 `AppModel`
