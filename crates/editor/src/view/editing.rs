@@ -395,25 +395,27 @@ impl CodeEditor {
 
     /// 括号标尺在当前视口内的竖线段：`(x_px, y_rel, h_px)`（文本区本地坐标）。
     /// 每个跨行括号配对一根竖线，位于**块首行缩进列**（`guide_units` × 字宽，随横向
-    /// 滚动），从开行**之后**画到闭行**内约 0.4 行深**（可配）——`}` 字形位于闭行
-    /// 中部，竖线底端伸入闭行以贴近 `}` 字形顶端、与顶部距离一致（不画满整行，
-    /// 避免穿过 `}`）。端点微调常量见 `config::layout`。
+    /// 滚动），从开行**之后**画到闭行**内约 0.25 行深**——两端「抵行不抵字」：顶部
+    /// 恰接触首覆盖行上缘（开行底缘、不伸入开行、不与 `{` 字形相抵），底部伸入闭行
+    /// 内约 0.25 行，留小空隙（可配，不画满整行，避免穿过字形）。端点微调常量见
+    /// `config::layout`。
     ///
     /// **同列区间合并**：同一列上重叠/相邻的竖线合并成一根连续线——否则两条 1px
     /// 线在同像素叠加会显得更暗/更粗（同列嵌套块会命中此情况）。
     /// `top_vis`/`off` = `abs_scroll_top()`；`lh` 行高；`harea_w` 文本区宽；`view_h` 视口高。
-    /// 光标逻辑行 L 落在配对跨度 `(open_line, close_line]` 内即命中（点击点亮用）。
+    /// 光标逻辑行 L 落在配对跨度 `[open_line, close_line]` 内即命中（点击点亮用）；
+    /// 开行**含本身**（点击 `Self {` 那行的 `{` → 点亮 Self 自己打开的块，而非外层 fn）。
     /// 多对命中时取**最深**（`open_line` 最大的那个）——即光标所在的最内层块。
     pub(super) fn guide_pair_for_logical_row(&self, logical: usize) -> Option<usize> {
         // 配对表按 `open_line` 升序（`recompute_fold_brackets_full` / `refresh_fold_brackets`
-        // 两处落地排序）→ 先二分裁出候选前缀 `open_line < logical`；最内层包含 logical
+        // 两处落地排序）→ 先二分裁出候选前缀 `open_line <= logical`；最内层包含 logical
         // 的配对 = 前缀中 `close_line >= logical` 且 `open_line` 最大者。配对为规范嵌套
         // （跨行括号可嵌套/并列，不交叉）→ 从右往左首个 `close_line >= logical` 即最深
         // 包含（更左配对的 open_line 更小，不可能更深）。典型点击位于块体内 → 一次命中
         // （O(log N) + O(1)）；仅当光标落在全部配对之后（本行无命中）才线性回扫兜底。
         #[cfg(test)]
         self.guide_scan_steps.set(0);
-        let i = self.bracket_pairs.partition_point(|p| p.open_line < logical);
+        let i = self.bracket_pairs.partition_point(|p| p.open_line <= logical);
         for p in self.bracket_pairs[..i].iter().rev() {
             #[cfg(test)]
             self.guide_scan_steps.set(self.guide_scan_steps.get() + 1);

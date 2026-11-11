@@ -1289,6 +1289,8 @@ fn bracket_guide_window_keeps_enclosing_pair_when_viewport_deep(cx: &mut TestApp
         .iter()
         .find(|(x, _, h)| (*x - 4.0 * cw).abs() < 1.0 && *h > 15.)
         .expect("应有内层 { 竖线");
+    // 内层 { 首覆盖行恰在视口顶（ct=top_vis）→ 顶部恰接触该行上缘（y=0，head=0
+    // 不越界），线在视口内可见（h>0）。
     assert!(
         inner.1 >= 0. && inner.2 > 0.,
         "内层竖线应在视口内可见：{inner:?}"
@@ -1370,7 +1372,8 @@ fn bracket_guide_overlapping_same_column_merged(cx: &mut TestAppContext) {
 #[gpui::test]
 fn guide_click_highlights_pair_and_elsewhere_clears(cx: &mut TestAppContext) {
     // 语义（用户确认）：标尺不可点选；点体内某行 → 点亮该行所属**最内层**括号块竖线；
-    // 点非块内行（如顶层）→ 清除。命中断言：行 3 ∈ Self 块 [2,4)、行 2 = 开行 → 外层。
+    // 点非块内行（如顶层）→ 清除。命中断言：行 3 ∈ Self 块 [2,4)、行 2 = Self 开行
+    // （开行含本身）→ 点亮 Self 自己打开的块（open_line=2）。
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}\nfn other() {}";
     let (host, cx) = open(cx, text);
     // 口径断言（不依赖鼠标坐标）。
@@ -1383,7 +1386,7 @@ fn guide_click_highlights_pair_and_elsewhere_clears(cx: &mut TestAppContext) {
         )
     });
     assert_eq!(case, Some(2), "行 3 ∈ Self 块 [2,4) → 点亮 Self 开行 2");
-    assert_eq!(case2, Some(1), "行 2 = Self 开行（非块内）→ 归外层 fn 块");
+    assert_eq!(case2, Some(2), "行 2 = Self 开行 → 点亮 Self 本块（open_line=2）");
     assert_eq!(case7, None, "行 7 = 顶层 fn 行 → 无命中");
     let (lh, gutter) = cx.update(|_, cx| {
         let ed = host.read(cx).ed.read(cx).test_metrics();
@@ -1399,6 +1402,13 @@ fn guide_click_highlights_pair_and_elsewhere_clears(cx: &mut TestAppContext) {
     // 点亮 Self 块。
     let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide());
     assert_eq!(lit, Some(2), "点行 3 应点亮 Self 块（open_line=2）");
+    // 点开行（行 2 = `Self {` 开行）→ 同样点亮 Self 本块（不是外层 fn）。
+    let y2 = px(lh * 2.5);
+    cx.simulate_mouse_move(point(x, y2), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, y2), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, y2), MouseButton::Left, mods);
+    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide());
+    assert_eq!(lit, Some(2), "点开行 2 应点亮 Self 本块（open_line=2），非外层 fn");
     // 点顶层行 7 → 清除。
     let y7 = px(lh * 7.5);
     cx.simulate_mouse_move(point(x, y7), MouseButton::Left, mods);
@@ -1431,11 +1441,11 @@ fn guide_pair_binary_search_matches_linear_reference(cx: &mut TestAppContext) {
         (pairs, max_row)
     });
     assert!(pairs.len() >= 400, "大表应生成 ≥400 跨行括号配对（实际 {}）", pairs.len());
-    // 线性参考 = 旧实现口径。
+    // 线性参考 = 旧实现口径（开行含本身：`open_line <= logical <= close_line`）。
     let linear = |logical: usize| -> Option<usize> {
         pairs
             .iter()
-            .filter(|p| p.open_line < logical && logical <= p.close_line)
+            .filter(|p| p.open_line <= logical && logical <= p.close_line)
             .map(|p| p.open_line)
             .max()
     };

@@ -43,13 +43,14 @@ pub const EDITOR_RULER_COLUMNS: &[usize] = &[];
 // ---------------------------------------------------------------------------
 
 /// 竖线**底部**伸入闭行的行高系数：0 = 停在闭行顶部（底部留约半行空档）；
-/// 1 = 画满整个闭行（穿过 `}` 字形）。取 0.4 ≈ 贴 `}` 字形顶端、与顶部距离一致。
-pub const BRACKET_GUIDE_CLOSE_TAIL_LINES: f32 = 0.4;
+/// 1 = 画满整个闭行（穿过 `}` 字形）。取 0.25 ≈ 贴 `}` 字形顶端、与顶部距离一致。
+pub const BRACKET_GUIDE_CLOSE_TAIL_LINES: f32 = 0.25;
 
-/// 竖线**顶部**从首覆盖行（开行下一行）顶部向下缩进的行高系数：0 = 紧贴开行
-/// （默认）；调大 → 顶部留白（开行与竖线起点间距）增大。与
-/// [`BRACKET_GUIDE_CLOSE_TAIL_LINES`] 配套微调上下观感。
-pub const BRACKET_GUIDE_OPEN_HEAD_LINES: f32 = 0.4;
+/// 竖线**顶部**相对首覆盖行（开行下一行）上缘的行高系数：0 = 顶部恰接触行（开行
+/// 底缘，见用户口径）；>0 = 向体内缩进（顶部与开行底缘留空隙）；<0 = 向上伸入开行、
+/// 直抵 `{` 字形（不美观）。取 0 ≈ 顶部接触行、不抵字形；与底部
+/// [`BRACKET_GUIDE_CLOSE_TAIL_LINES`] 配成「顶部贴行、底部留小空隙」的观感。
+pub const BRACKET_GUIDE_OPEN_HEAD_LINES: f32 = 0.0;
 
 /// 括号标尺竖线宽度（px）：普通（未点亮）竖线。
 pub const BRACKET_GUIDE_WIDTH: f32 = 1.0;
