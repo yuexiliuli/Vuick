@@ -3497,3 +3497,94 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// 场景 B（用户真机确认）：WYSIWYG live2 编辑区点击**内容元素下方大片空白** →
+    /// 光标应跳到文档内容末尾并聚焦（等效于点末尾后）。live2 是 auto-grow（元素高=内容
+    /// 高），这片空白在元素之外、`#live-scroll` 容器之内——普通鼠标事件到不了 WyEditor，
+    /// 由 `render_live_area` 在容器挂的转发处理（严格低于 `last_bounds` 底部才转发，
+    /// 元素内点击放行给 WyEditor 自身命中路径，不重复触发）。
+    #[gpui::test]
+    async fn wysiwyg_live_click_below_content_jumps_caret_to_end(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-below-click-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&md, "# 标题\n一段正文内容。\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 取 live2 + 其元素底部（paint 期 last_bounds），点击点须在元素底之下、编辑区内。
+        let live2_ent = cx.update(|_w, cx| {
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+        });
+        let (len, bottom) = cx.update(|_w, cx| {
+            let e = live2_ent.read(cx);
+            let b = e.last_bounds().expect("live2 已渲染应有 last_bounds");
+            (e.len(), b.bottom().as_f32())
+        });
+        let area = cx.debug_bounds("editor-area").expect("编辑区应渲染");
+        let click_y = bottom + 40.;
+        assert!(
+            click_y < area.bottom().as_f32() - 2.,
+            "点击点应在编辑区内（area origin={:?} bottom={:.1}，click_y={:.1}）否则内容超高本用例无效",
+            area.origin,
+            area.bottom().as_f32(),
+            click_y
+        );
+        let click_x = (area.left() + px(40.)).as_f32();
+        // 先落一个确定的非末尾光标（行 0），确认下方空白点击真实「移动」到末尾并聚焦。
+        cx.update(|_w, cx| {
+            live2_ent.update(cx, |e, _| e.set_caret(0));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| live2_ent.read(cx).caret()),
+            0,
+            "前置：光标应先落在非末尾"
+        );
+        cx.simulate_click(
+            gpui::point(px(click_x), px(click_y)),
+            gpui::Modifiers::default(),
+        );
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (caret_after, focused) = cx.update(|_w, cx| {
+            let e = live2_ent.read(cx);
+            (e.caret(), e.is_focused())
+        });
+        assert_eq!(
+            caret_after, len,
+            "点击 WYSIWYG 元素下方空白 → 光标应钳到内容末尾 len={len}，实际 caret={caret_after}"
+        );
+        assert!(focused, "点击 WYSIWYG 元素下方空白 → 编辑器应已聚焦");
+        let _ = std::fs::remove_file(&md);
+    }
+

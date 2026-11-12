@@ -168,6 +168,11 @@ impl WyEditor {
         self.editable
     }
 
+    /// 当前是否聚焦（`track_focus` 事件态，paint 门控与 shell 测试共用）。
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
+
     /// 切 EPUB 阅读模式（EPUB 只读宿主）：标题默认居中（对齐 A 侧
     /// `MarkdownPreview::set_epub` 排版语义），带 `%%ALIGN:X%%` 指令的行以指令为准。
     /// 纯视图态，不进撤销栈；切换自增内容代使下帧全量重排。
@@ -620,7 +625,8 @@ impl WyEditor {
     pub fn alert_marker_cnt(&self) -> usize {
         self.rd.borrow().alert_marker_cnt.get()
     }
-    pub(crate) fn caret(&self) -> usize {
+    /// 当前光标（源字节偏移；只读，host/tests/状态栏共用）。
+    pub fn caret(&self) -> usize {
         self.caret
     }
     /// 全文字节长（O(1)，rope 单真源）。
@@ -629,7 +635,7 @@ impl WyEditor {
     }
 
     /// 直接放置光标（源字节偏移）。命中/测试/编程式定位共用。
-    pub(crate) fn set_caret(&mut self, off: usize) {
+    pub fn set_caret(&mut self, off: usize) {
         self.caret = off.min(self.len());
         self.sel_anchor = None;
         // 光标移动 → 打断撤销合并组（同 editor/undo.rs 的 cooperative=false）。
@@ -638,6 +644,15 @@ impl WyEditor {
         // 光标移动 → 静止期常亮（blink 暂停，先亮住再继续闪）。
         self.kick_caret();
         *self.rd.borrow_mut().frame.borrow_mut() = None;
+    }
+
+    /// live2 容器「内容下方空白」点击转发（场景 B）：光标钳到内容末尾 + 聚焦 +
+    /// 静止期常亮——等效于用户点文档末尾后。不置选区、不开拖选（空白点击不是拖选
+    /// 起点，避免 `dragging` 残留：拖到元素外松开由 `on_window_mouse_up` 兜底，但
+    /// 这里不在容器路径引入拖选态）。调用方（shell 容器 `on_mouse_down`）随后 notify。
+    pub fn move_caret_to_doc_end_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        self.set_caret(self.len());
     }
     /* ---------- 选区 ---------- */
 

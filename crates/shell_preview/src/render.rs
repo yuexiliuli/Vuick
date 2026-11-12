@@ -150,6 +150,12 @@ pub fn render_live_area<H: PreviewHost>(
     let vhand = model.borrow().tabs[active].live_vscroll.clone();
     drive_wy_host(model, ed, &vhand, window, cx);
     let live_any = ed.clone().into_any_element();
+    // 场景 B 转发句柄：`#live-scroll` 容器点击命中 WyEditor 下方空白 → 光标钳到
+    // 内容末尾 + 聚焦（等效于点末尾后）。命中在 WyEditor 元素内 → 不转发（元素自身
+    // `on_mouse_down` 走普通命中路径）；`#live-scroll` 是 `size_full` 容器、覆盖
+    // auto-grow 元素之下的整片可见空区（素材：元素高=内容高，底部空白在元素之外
+    // 容器之内，普通点击到不了 WyEditor），选容器挂即覆盖。
+    let live_ed = ed.clone();
     let text_color = text_primary;
     let fs = model.borrow().font_size;
     // 纵向滚动句柄（跨帧稳定）：`#live-scroll` 原生 `overflow_y_scroll` 在此
@@ -173,6 +179,34 @@ pub fn render_live_area<H: PreviewHost>(
                 .size_full()
                 .overflow_y_scroll()
                 .track_scroll(&vhand)
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |_: &mut H,
+                                 ev: &gpui::MouseDownEvent,
+                                 window: &mut Window,
+                                 cx: &mut Context<H>| {
+                        // 仅处理严格落在 WyEditor 元素底下的空白（元素内点击由元素自身
+                        // on_mouse_down 消费，这里再放行不发重复转发——K15 冒泡不误触）。
+                        let Some(b) = live_ed.read(cx).last_bounds() else {
+                            return;
+                        };
+                        if ev.position.y <= b.bottom() {
+                            return;
+                        }
+                        // 光标立即钳到内容末尾；聚焦放到**本次鼠标派发之后**（`window.defer`）——
+                        // 实测同一次 mouse_down 派发链里存在把焦点抢走的监听（当场 `focus()` 会被
+                        // 后续监听覆盖成别的句柄），派发结束后的 defer 再断言一次才稳定
+                        //（headless 实测：defer 后窗口聚焦恒为 live2）。
+                        let fwd = live_ed.clone();
+                        live_ed.update(cx, |e, e_cx| e.move_caret_to_doc_end_focused(window, e_cx));
+                        window.defer(cx, move |window, cx| {
+                            fwd.update(cx, |e, e_cx| {
+                                e.move_caret_to_doc_end_focused(window, e_cx)
+                            });
+                        });
+                        cx.notify();
+                    }),
+                )
                 .child(
                     div()
                         .id("live-body")

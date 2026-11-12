@@ -55,11 +55,19 @@ pub fn caret_geometry(
         if !r.src_lines.contains(&cl) {
             continue;
         }
+        // 不可编辑行（空标题 `# ` / 空列表项 / 分隔线 / 空引述 / 空代码块 / Blank 等）：
+        // 只要光标落在这行（点击 / 键盘导航），就画光标竖条于行首内容起点。这是既有
+        // `Blank` 特殊分支的语义推广——否则「点空标题行 → 光标不画」（用户报告的
+        // 「光标消失」）。只读预览的竖条由宿主绘制门控 `is_editable()` 另行抑制。
+        //
+        // 垂直锚 = 与可编辑分支同一推导（`text_y_off` + `text_row_shift` + 行带内居中
+        // `(lh − line_h)/2`）：空标题行行带更高（标题字号），光标不能锚带顶（视觉偏上），
+        // 锚到「该行文本将出现的带内居中位置」——与输入一个字符后的光标位置一致。
+        // Blank（`lh == f.line_h`）→ 居中量 0、无撑高下移 → 行为零变化（现状观感正确）。
         if !r.editable {
-            if r.kind == IrKind::Blank {
-                return (true, f.padding + r.x_off, r.top);
-            }
-            return (false, f.padding, r.top);
+            let caret_shift = ((f32::from(r.lh) - f32::from(f.line_h)) / 2.).max(0.);
+            let ctop = r.top + px(text_y_off(r) + text_row_shift(r) + caret_shift);
+            return (true, f.padding + r.x_off, ctop);
         }
         if let (Some(te), Some(t)) = (&r.table_edit, &r.table) {
             let Some(row_ix) = te.rows.iter().position(|rr| rr.src_line == cl) else {
@@ -205,6 +213,17 @@ pub fn source_offset_at_local(
             let le = docutil::line_end(host.doc(), r.src_line).max(ls);
             return ls.min(le);
         }
+    }
+    // 未命中任何行：点击落在元素内空白区（首行之上 / 内容尾部之后）。旧行为返回当前
+    // 光标 = 「点空白无反应」（用户报告的「点文档尾部之后的空白 → 光标到不了末尾」）。
+    // 按 y 相对内容钳位：落在**末行之下** → 钳到内容末尾（source_end，跟手即得 +
+    // 可画）；首行之上保留现状（不动，避免顶内衬 / 元素上缘点击误移光标）。
+    if let Some(last) = frame.rows.last()
+        && rel_y >= f32::from(last.top) + f32::from(last.height)
+    {
+        let ls = docutil::line_start(host.doc(), last.src_line);
+        let le = docutil::line_end(host.doc(), last.src_line).max(ls);
+        return le.min(host.doc().len());
     }
     host.caret()
 }
