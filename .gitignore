@@ -15,3 +15,6 @@ docs/
 fixtures/*
 
 .cargo/config.toml
+
+# 阅读进度诊断探针日志（GPUI_EDITOR_RP_DIAG=1 时追加写，保留供排查，不入库）
+rp_diag.log

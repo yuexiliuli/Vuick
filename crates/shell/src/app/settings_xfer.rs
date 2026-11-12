@@ -173,6 +173,9 @@ impl EditorApp {
             // 会话恢复 / 关闭到托盘开关：以导入值为准（诚实跟随，含显式 false）。
             self.model.borrow_mut().session_restore = prefs.session_restore.unwrap_or(true);
             self.model.borrow_mut().close_to_tray = prefs.close_to_tray.unwrap_or(false);
+            // 「记住阅读进度」开关：以导入值为准（诚实跟随，含显式 false），即时生效。
+            self.model.borrow_mut().restore_reading_progress =
+                prefs.restore_reading_progress.unwrap_or(true);
             // 媒体打开位置两个开关：以导入值为准（诚实跟随，含显式 false），即时生效。
             self.model.borrow_mut().media_new_window = prefs.media_new_window.unwrap_or(true);
             self.model.borrow_mut().reuse_media_window = prefs.reuse_media_window.unwrap_or(true);

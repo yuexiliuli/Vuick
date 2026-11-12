@@ -11,13 +11,13 @@
 //! 借用约束：host 方法 `&self`、host 实现不得同步触碰 `AppModel`（见 host.rs 模块注释）；
 //! 本模块内 `self` 即 `&mut AppModel`，随取随用，不需 RefCell。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gpui::{App, FocusHandle, Window};
 use gpui::AppContext as _;
 use session_store::{
-    SessionManifest, SessionTab, clear_session, prune_unreferenced_slots, write_manifest,
-    write_slot,
+    ReadingProgress, SessionManifest, SessionTab, clear_session, prune_unreferenced_slots,
+    reading_progress, write_manifest, write_slot,
 };
 
 use config::user::UserPrefs;
@@ -65,6 +65,8 @@ impl AppModel {
             edit_version: 0,
             _edit_sub: edit_sub,
             _pdf_sub: None,
+            reading_restore: None,
+            md_restore_pending: None,
         });
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
@@ -154,6 +156,9 @@ impl AppModel {
         if idx >= self.tabs.len() {
             return;
         }
+        // 阅读进度：关闭前保存该 tab 位置（开关开着才写；恢复期抑制；未命名跳过；
+        // 必须在 reader 被拔出/移除之前读——PDF 位置来自阅读器实体）。
+        self.save_reading_progress(host, idx, cx);
         self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
         // 释放被移除选项卡持有的重资源（PDF 纹理 / 图片解码），实体随后随之释放。
         // 顺序保持旧行为：先 PDF、再图片；视频无显式 release（随选项卡直接释放）。
@@ -326,6 +331,8 @@ impl AppModel {
             editor_pending,
             loading_lock,
             edit_version,
+            reading_restore,
+            md_restore_pending,
             ..
         } = tab;
         Some(DetachedTab {
@@ -350,6 +357,8 @@ impl AppModel {
             editor_pending,
             loading_lock,
             edit_version,
+            reading_restore,
+            md_restore_pending,
         })
     }
 
@@ -406,6 +415,94 @@ impl AppModel {
             return;
         }
         let _ = self.save_session_to(&UserPrefs::session_dir(), cx);
+    }
+
+    // ---------- 阅读进度编排纯逻辑 ----------
+
+    /// 阅读进度文件的**默认路径** = 配置文件父目录 / `reading_progress.json`
+    /// （`%APPDATA%\gpui-editor\`；测试构建经 config `test-mode` 落隔离临时目录）。
+    /// `pub`：shell 宿主与集成测试经 `shell::app` 重导出访问（§8.6 外提清单）。
+    pub fn reading_progress_path() -> PathBuf {
+        match UserPrefs::config_path().parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.join("reading_progress.json"),
+            _ => PathBuf::from("reading_progress.json"),
+        }
+    }
+
+    /// 读取某选项卡当前的「阅读位置」（尚未落盘；`None` = 不可定位：
+    /// 未命名选项卡 / PDF 未加载完 / EPUB 右栏宿主未就绪）。
+    /// `pub`：shell 宿主**每帧渲染**的阅读进度脏哨兵比对（`check_reading_progress`）
+    /// 经 `model.borrow().tab_reading_position(idx, &*cx)` 复用同一读数。
+    pub fn tab_reading_position(&self, idx: usize, cx: &App) -> Option<ReadingProgress> {
+        let tab = self.tabs.get(idx)?;
+        if tab.file_path.is_none() {
+            return None; // 未命名选项卡不记进度
+        }
+        // PDF：页 + 页内比例 + 缩放（阅读器自算）。
+        if let MediaReader::Pdf(pv) = &tab.reader {
+            let (page, frac, zoom) = pv.read(cx).reading_progress()?;
+            return Some(ReadingProgress::Pdf { page_index: page, in_page_frac: frac, zoom });
+        }
+        // EPUB：只读预览宿主（WyEditor）的视口顶源码行。
+        if tab.readonly_preview {
+            let line = tab.md_wy.as_ref()?.read(cx).top_source_line()?;
+            return Some(ReadingProgress::Epub { top_line: line });
+        }
+        // md / txt：编辑区视口顶源码行（0 基）。
+        let top_line = tab.editor.read(cx).viewport_top_line();
+        Some(ReadingProgress::Markdown { top_line })
+    }
+
+    /// 保存**单个选项卡**的阅读进度：更新模型 map（恢复读取源）+ 落盘（未变跳过；
+    /// 测试构建只更新内存、不触碰磁盘）。关 tab / 滚动防抖 / 退出兜底共用。
+    /// 只读 `&App`：仅经 `pv.read/ed.read/wy.read` 读实体状态 + 写 `self.reading_progress`，
+    /// 不触发任何实体动作（退出钩子 `save_session(&Context)` 可直接复用）。
+    /// `pub`：shell 宿主 glue（`schedule_reading_progress_flush`）与集成测试经
+    /// `shell::app` 重导出访问（§8.6 外提清单）。
+    pub fn save_reading_progress(&mut self, host: &dyn AppHost, idx: usize, cx: &App) {
+        if !host.is_session_persist()
+            || host.is_detached()
+            || !self.restore_reading_progress
+            || self.session_restoring
+        {
+            return;
+        }
+        let Some(progress) = self.tab_reading_position(idx, cx) else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(idx) else {
+            return;
+        };
+        let Some(path) = tab.file_path.clone() else {
+            return;
+        };
+        let key = reading_progress::normalize_key(&path);
+        let unchanged = self.reading_progress.get(&key) == Some(&progress);
+        crate::rp_diag::diag(
+            "save",
+            &format!(
+                "key={key} {} written={}",
+                crate::rp_diag::rp_value(&progress),
+                !unchanged
+            ),
+        );
+        if unchanged {
+            return; // 原地未变：不重复落盘
+        }
+        self.reading_progress.insert(key, progress);
+        if !host.is_test_build() {
+            reading_progress::save(&Self::reading_progress_path(), &self.reading_progress);
+        }
+    }
+
+    /// 保存**全部**选项卡的阅读进度（退出兜底：平台最后窗口关闭不回调 `on_app_quit`，
+    /// 各 tab 的滚动防抖已在实际读位置持续落盘，这里补一发全量收口）。
+    /// `pub`：shell 宿主退出钩子 glue 与集成测试经 `shell::app` 重导出访问。
+    pub fn save_all_reading_progress(&mut self, host: &dyn AppHost, cx: &App) {
+        let len = self.tabs.len();
+        for i in 0..len {
+            self.save_reading_progress(host, i, cx);
+        }
     }
 
     /// 保存会话（纯逻辑，显式目录，可测试）：开关关闭 → 只清不做；否则先写槽位内容、
@@ -516,6 +613,8 @@ impl AppModel {
             session_restore: Some(self.session_restore),
             // 关闭到托盘开关随其它偏好一并落盘（否则一次字号/主题保存就把它重置回默认关）。
             close_to_tray: Some(self.close_to_tray),
+            // 「记住阅读进度」开关随其它偏好一并落盘（否则一次字号/主题保存就重置回默认开）。
+            restore_reading_progress: Some(self.restore_reading_progress),
             // 媒体打开位置两个开关随其它偏好一并落盘（否则一次字号/主题保存就把开关重置
             // 回默认开；collect_prefs 是持久化唯一口径）。
             media_new_window: Some(self.media_new_window),

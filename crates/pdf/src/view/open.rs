@@ -96,6 +96,8 @@ impl PdfViewer {
             window_settled: false,
             idle_gate_skips: 0,
             reload_anchor: None,
+            restore_anchor: None,
+            restore_pending: None,
             last_modify_error: None,
             sel_card: None,
             pending_annots: Vec::new(),
@@ -165,6 +167,16 @@ impl PdfViewer {
         if let Some(w) = self.worker.as_ref() {
             w.set_recolor(self.doc_id, self.recolor, self.recolor_epoch);
         }
+        // 阅读进度恢复锚消费：先落 zoom，再把 `(页, 页内比例)` 暂存为待落地滚动——真实
+        // scroll 施加延到**首个 ensure_window（base_w refit 后）**，因本刻 base_w 还是
+        // `PAGE_WIDTH` 窗口宽回退值、非真实可视宽（refit 会重算 tops；若即刻 set_offset
+        // 会按回退档 tops 算页，refit 后仍不搬 scroll → 落到错档/错页）。
+        if let Some((page, frac, zoom)) = self.restore_anchor.take() {
+            self.zoom = zoom.clamp(config::pdf::ZOOM_MIN, config::pdf::ZOOM_MAX);
+            if !self.dims.is_empty() {
+                self.restore_pending = Some((page, frac));
+            }
+        }
         let (tops, total) = compute_layout(&self.dims, self.page_width());
         self.page_tops = tops;
         self.total_height = total;
@@ -222,6 +234,77 @@ impl PdfViewer {
         }
         let top = self.page_tops.get(page_index).copied().unwrap_or(0.0);
         self.scroll.set_offset(gpui::point(px(0.), px(-top)));
+    }
+
+    /// 把页列滚到「内容已滚动的像素数」（0 = 顶部；越界夹到文档量程内）。`#[doc(hidden)]`：
+    /// 主要供 headless 集成测试构造「页内非零偏移」的阅读位置（生产滚动由滚轮 / 滚动条 /
+    /// [`Self::scroll_to_page`] 目录跳页驱动）。
+    #[doc(hidden)]
+    pub fn scroll_to_top_px(&mut self, scroll_y: f32) {
+        if self.dims.is_empty() {
+            return;
+        }
+        let sy = scroll_y.clamp(0.0, self.total_height.max(0.0));
+        self.scroll.set_offset(gpui::point(px(0.), px(-sy)));
+    }
+
+    /// 当前阅读位置：`(页下标 0 基, 页内比例, zoom)`；`None` = 文档未加载完成。
+    ///
+    /// **页内比例 = (scroll_y − tops[K]) / 显示高**（`display_height(pw)`，随 zoom/页宽
+    /// 伸缩）——绝不可以用 pt 高（页高 pt 与显示高相差一个 `pw/pt_w` 缩放因子，跨 zoom
+    /// 会失配）。与 [`Self::set_restore_anchor`] 的恢复公式互逆：同档往返无漂移。
+    pub fn reading_progress(&self) -> Option<(usize, f32, f32)> {
+        if self.dims.is_empty() || self.page_tops.len() != self.dims.len() {
+            return None;
+        }
+        let scroll_y = f32::from(-self.scroll.offset().y);
+        let k = first_visible_page(&self.dims, &self.page_tops, self.page_width(), scroll_y);
+        let top = self.page_tops.get(k).copied().unwrap_or(0.0);
+        let disp_h = display_height(self.dims[k], self.page_width()).max(1.0);
+        let frac = ((scroll_y - top) / disp_h).clamp(0.0, 1.0);
+        Some((k, frac, self.zoom))
+    }
+
+    /// 设置「阅读进度恢复锚」（外壳打开 PDF 时写入；`apply_loaded` 装配后消费）。
+    /// `page_index` = 页下标（消费时夹取到合法页）；`in_page_frac` 与 `zoom` 在此防呆 clamp
+    /// （比例 [0,1]、zoom [ZOOM_MIN, ZOOM_MAX]）。
+    pub fn set_restore_anchor(&mut self, page_index: usize, in_page_frac: f32, zoom: f32) {
+        self.restore_anchor = Some((
+            page_index,
+            in_page_frac.clamp(0.0, 1.0),
+            zoom.clamp(ZOOM_MIN, ZOOM_MAX),
+        ));
+    }
+
+    /// 程序化设置缩放倍数（clamp 到 [ZOOM_MIN, ZOOM_MAX]），并按 [`layout::zoom_rescroll_anchor`]
+    /// 把当前滚动重锚到**页内显示比例不变**（页顶线性缩放 + 页内偏移同比）。`#[doc(hidden)]`：
+    /// 供 headless 集成测试「跨 zoom 校验阅读比例语义」用；真实交互缩放走 `adjust_zoom`
+    /// （含 worker 世代 / 调度状态机 / notify）。
+    #[doc(hidden)]
+    pub fn set_zoom(&mut self, zoom: f32) {
+        if self.dims.is_empty() {
+            return;
+        }
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (self.zoom - zoom).abs() < 1e-4 {
+            return;
+        }
+        let old_w = self.page_width();
+        self.zoom = zoom;
+        let new_w = self.page_width();
+        let ratio = new_w / old_w;
+        let sy = f32::from(-self.scroll.offset().y);
+        let old_tops = std::mem::take(&mut self.page_tops);
+        let (new_tops, total) = compute_layout(&self.dims, new_w);
+        self.page_tops = new_tops;
+        self.total_height = total;
+        // 与新布局量程一致的 clamp（防停底锚点越界假速度，同 adjust_zoom #2 语义）。
+        let viewport_h = f32::from(self.scroll.bounds().size.height);
+        let max_sy = (self.total_height - viewport_h).max(0.0);
+        let new_y = zoom_rescroll_anchor(&self.dims, &old_tops, &self.page_tops, old_w, ratio, sy)
+            .clamp(0.0, max_sy.max(self.total_height.max(0.0)));
+        self.scroll.set_offset(gpui::point(px(-f32::from(self.scroll.offset().x)), px(-new_y)));
+        self.last_scroll_y = new_y;
     }
 
     /// 页数（文档尚未加载完时为 0）。P4 拆 crate 后根包 app::tests 亦消费，取消 `cfg(test)`。
@@ -597,6 +680,19 @@ impl PdfViewer {
                 );
             }
             cx.notify();
+        }
+        // 阅读进度恢复**待落地滚动**：base_w 已按真实可视宽 refit、`page_tops` 为本帧
+        // 布局值——按保存的 `(页, 页内比例)` 逆公式滚回（分母用**显示高**，与 `reading_progress()`
+        // 保存侧互逆）。首帧 `scroll.bounds()` 宽为 0 → 容器宽回退窗口宽（base_w 非真实
+        // 可视宽）→ 此时**不施加**（保持待落地），下一帧容器宽就位后再按真实布局滚。
+        if container_w > 0.0
+            && let Some((page, frac)) = self.restore_pending.take()
+        {
+            let k = page.min(self.dims.len().saturating_sub(1));
+            let disp_h = display_height(self.dims[k], self.page_width()).max(1.0);
+            let top = self.page_tops.get(k).copied().unwrap_or(0.0);
+            let sy = (top + frac.clamp(0.0, 1.0) * disp_h).min(self.total_height.max(0.0));
+            self.scroll.set_offset(gpui::point(px(0.), px(-sy)));
         }
         let scale_factor = window.scale_factor();
         let page_width = self.page_width();

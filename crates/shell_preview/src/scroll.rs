@@ -157,11 +157,15 @@ pub fn sync_editor_preview_scroll(
             || state.scrub_last_cross.elapsed() >= SCRUB_IDLE
         {
             if let Some(t) = state.scrub_target {
-                editor.update(cx, |ed, _| ed.scroll_to_line(t));
-                state.driven_editor_target = Some(t);
-                state.driven_editor_await = 0;
-                state.editor_block = Some(t);
-                state.driven_preview_target = None;
+                if tab.md_restore_pending.is_none() {
+                    editor.update(cx, |ed, _| ed.scroll_to_line(t));
+                    state.driven_editor_target = Some(t);
+                    state.driven_editor_await = 0;
+                    state.editor_block = Some(t);
+                    state.driven_preview_target = None;
+                } else {
+                    shell_core::rp_diag::diag("sync_guard_blocked", "site=scrub_converge");
+                }
             }
             state.scrub = false;
             state.scrub_idle_frames = 0;
@@ -190,14 +194,21 @@ pub fn sync_editor_preview_scroll(
             return;
         }
         // 首次/低频跨块：照常立即跟随（同块内微滚 / 慢速单步滚仍逐帧对齐，行为不变）。
+        // md 阅读进度恢复窗口（`tab.md_restore_pending` 在途）例外：编辑区恢复位是这段的
+        // 权威面，预览首次就绪/装配抖动读到顶部块正是「把恢复行拉回顶部」的触发源
+        // （rp_diag 49→2）——守卫期不跟随，由 `advance_md_restore_window` 收敛后归还。
         if let Some(pb) = preview_block {
-            editor.update(cx, |ed, _| ed.scroll_to_line(pb));
-            // 预置编辑器基线为驱动目标：编辑器下一帧实际到位即与基线一致，不再被误判
-            // 成「编辑器用户主动滚动」而把预览拽回（来回跳动）；预览现为主导，旧等待
-            // 目标作废。
-            state.driven_editor_target = Some(pb);
-            state.driven_editor_await = 0;
-            state.editor_block = Some(pb);
+            if tab.md_restore_pending.is_none() {
+                editor.update(cx, |ed, _| ed.scroll_to_line(pb));
+                // 预置编辑器基线为驱动目标：编辑器下一帧实际到位即与基线一致，不再被误判
+                // 成「编辑器用户主动滚动」而把预览拽回（来回跳动）；预览现为主导，旧等待
+                // 目标作废。
+                state.driven_editor_target = Some(pb);
+                state.driven_editor_await = 0;
+                state.editor_block = Some(pb);
+            } else {
+                shell_core::rp_diag::diag("sync_guard_blocked", "site=preview_follow");
+            }
         }
     } else if state.driven_preview_target.is_none()
         // 预览已稳定（上帧到本帧未变）：
@@ -217,11 +228,16 @@ pub fn sync_editor_preview_scroll(
         {
             // 以（用户当前所在的）静态预览为准回拉编辑器：幂等收敛「大跳后编辑器过冲
             // 未对齐」，不再依赖原「编辑器→预览」回声把预览拽回（那正是来回跳动/滚不
-            // 下去的根因）。
-            editor.update(cx, |ed, _| ed.scroll_to_line(pb));
-            state.driven_editor_target = Some(pb);
-            state.driven_editor_await = 0;
-            state.editor_block = Some(pb);
+            // 下去的根因）。md 恢复在途例外（与上方「预览自主跨块跟随」同守卫）：恢复期
+            // 「预览稳定在顶 + 编辑器在恢复行」是装配还没跟上，不是用户把编辑器移走。
+            if tab.md_restore_pending.is_none() {
+                editor.update(cx, |ed, _| ed.scroll_to_line(pb));
+                state.driven_editor_target = Some(pb);
+                state.driven_editor_await = 0;
+                state.editor_block = Some(pb);
+            } else {
+                shell_core::rp_diag::diag("sync_guard_blocked", "site=static_pull");
+            }
         }
     }
 }

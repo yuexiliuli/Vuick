@@ -79,6 +79,8 @@ impl EditorApp {
             editor_pending,
             loading_lock,
             edit_version,
+            reading_restore,
+            md_restore_pending,
         } = payload;
         let edit_sub = self.subscribe_editor(&editor, cx);
         let is_md = file_path
@@ -108,6 +110,10 @@ impl EditorApp {
             editor_pending,
             loading_lock,
             edit_version,
+            // 阅读进度恢复锚随选项卡搬迁（若打开瞬间的恢复尚未消费、随后被拖走）。
+            reading_restore,
+            // md 恢复在途守卫随选项卡搬迁（同 reading_restore）。
+            md_restore_pending,
             // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交写回，见 take_tab_payload 调用点）
             live_edit: false,
             live2: None,

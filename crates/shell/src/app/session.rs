@@ -52,6 +52,12 @@ use syntax::{prewarm_done, prewarm_started};
 #[cfg(not(test))]
 const SESSION_FLUSH_DEBOUNCE_MS: u64 = 300;
 
+/// 「阅读进度」落盘防抖窗口（ms）：活动选项卡阅读位置变化后停顿该时长才写盘一次。
+/// 镜像 `SESSION_FLUSH_DEBOUNCE_MS`（关 tab / 退出兜底是立即写，这里只覆盖「滚动停止」
+/// 的连续落盘——本平台最后窗口关闭不回调 `on_app_quit`，只挂关闭/退出必然丢进度）。
+#[cfg(not(test))]
+const READING_PROGRESS_DEBOUNCE_MS: u64 = 300;
+
 /// A1/A2：等语法预热的让帧上限（≈1s @60fps）。`prewarm` 实际在启动后台线程早于首帧
 /// 完成，正常等待远小于此上限；仅当预热任务异常（不应发生）时兜底，避免恢复挂起。
 const RESTORE_PREWARM_MAX_WAIT_FRAMES: u32 = 60;
@@ -87,6 +93,10 @@ impl EditorApp {
     #[cfg(not(test))]
     pub(super) fn save_session(&mut self, cx: &Context<Self>) {
         let _ = save_session_to(self, &UserPrefs::session_dir(), cx);
+        // 阅读进度全量兜底：各选项卡的滚动防抖已在实际读位置持续落盘，这里补一发收口
+        // （防抖到点前强杀 / 边界丢失）。
+        let host: &dyn AppHost = self;
+        self.model.borrow_mut().save_all_reading_progress(host, &**cx);
     }
 
     /// 启动恢复入口（`new_impl` 里无 CLI 首参时调用）：开关开启且清单存在且有效才恢复。
@@ -201,6 +211,10 @@ impl EditorApp {
             //「恢复前内容」的旧指纹误判「未变」而跳过写槽位/清单 → 恢复出的选项卡内容不再落盘。
             self.model.borrow_mut().session_slot_hashes.clear();
             self.model.borrow_mut().session_last_manifest_digest = None;
+            // R2：恢复完成即播种阅读进度脏哨兵为当前活动选项卡的真实位置——恢复期每帧
+            // `check_reading_progress` 都把它清成 None，不复播则恢复后首帧误判「位置变化」
+            // → 防抖把已存档真实进度覆写 0（永久丢失）；播种植后首帧比对相等不落盘。
+            self.seed_reading_progress_sentinel(cx);
             // 恢复窗口内结构性变更（新建未命名 tab / 打开文件）的
             // `schedule_session_flush(immediate)` 被 `session_restoring` 抑制，且结构变更
             // 不走防抖重排 → 补一发**即时补偿落盘**（此刻 `session_restoring` 已置 false、
@@ -252,6 +266,125 @@ impl EditorApp {
                 },
             );
         }
+    }
+
+    /// 阅读进度**每帧渲染开头**的脏哨兵比对（`render` 调 [`Self::check_reading_progress`]
+    /// 之前的当前位置快照哨兵存宿主字段，见 [`EditorApp::rp_last`]）：活动选项卡阅读
+    /// 位置变化 → 重启防抖定时（停顿 `READING_PROGRESS_DEBOUNCE_MS` 落盘一次）；未变 /
+    /// 开关关 / 恢复期间 → 不动作。`flush_reading_progress` 只落活动选项卡（关 tab / 退出
+    /// 兜底另在 `remove_tab` / `save_all_reading_progress` 全量覆盖，这里只担「滚动停止」）。
+    ///
+    /// R2 防覆写：①「None→Some 的**首观测**」只登记哨兵、不安排防抖（与「真实位置变化」
+    /// 分开）——若把纯首次观测也当变化，会立刻排一发 300ms 落盘，把此刻的瞬时位置覆写成
+    /// 存档值；②恢复完成处由 [`Self::seed_reading_progress_sentinel`] 播种真实位置，使
+    /// 恢复后首帧比对相等、不触发落盘。
+    pub(super) fn check_reading_progress(&mut self, cx: &mut Context<Self>) {
+        let on = self.model.borrow().restore_reading_progress
+            && !self.model.borrow().session_restoring;
+        if !on {
+            // 恢复期间 / 开关关：哨兵清零。恢复完成后由 `seed_reading_progress_sentinel`
+            // 重新播种为真实位置；开关重开则靠下方「None→Some 首观测不安排落盘」兜底。
+            self.rp_last = None;
+            return;
+        }
+        let app: &gpui::App = &**cx;
+        let cur = {
+            let m = self.model.borrow();
+            let idx = m.active_tab;
+            Some((idx, m.tab_reading_position(idx, app)))
+        };
+        if self.rp_last == cur {
+            return; // 位置未变：不重复安排防抖
+        }
+        let first_observation = self.rp_last.is_none();
+        let old = self.rp_last.clone();
+        self.rp_last = cur;
+        if !first_observation {
+            // 诊断：脏哨兵置脏（仅新触发一行：旧→新；验证存档是否被防抖覆写——候选 c）。
+            shell_core::rp_diag::diag(
+                "check",
+                &format!(
+                    "dirty {} → {}",
+                    shell_core::rp_diag::pos_value(&old),
+                    shell_core::rp_diag::pos_value(&self.rp_last)
+                ),
+            );
+            self.schedule_reading_progress_flush(cx, false);
+        }
+    }
+
+    /// R2：把阅读进度脏哨兵 `rp_last` 播种为当前活动选项卡的**真实阅读位置**。
+    /// 会话恢复完成处调用（渐进 [`Self::restore_step`] 与同步 [`restore_session_from`]
+    /// 共用）：恢复期 `check_reading_progress` 每帧把 `rp_last` 清成 None；若完成后不
+    /// 复播，首帧会把「从 None 到当前位置（活动 tab 顶部尚未落位）」误判成位置变化 →
+    /// 防抖 300ms 后把已存档真实进度覆写成瞬时位置（0），永久丢失。播种后首帧比对相等
+    /// 不落盘；其后真实滚动变化仍按既有防抖落盘。
+    fn seed_reading_progress_sentinel(&mut self, cx: &mut Context<Self>) {
+        let app: &gpui::App = &**cx;
+        let cur = {
+            let m = self.model.borrow();
+            let idx = m.active_tab;
+            Some((idx, m.tab_reading_position(idx, app)))
+        };
+        self.rp_last = cur;
+        // 诊断：恢复完成点的哨兵播种（open-recent 路径不播种 → 无此行，可对照）。
+        shell_core::rp_diag::diag(
+            "seed",
+            &format!("{}", shell_core::rp_diag::pos_value(&self.rp_last)),
+        );
+    }
+
+    /// 安排一次阅读进度落盘：`immediate=true` 立即写；`false` 走 [`READING_PROGRESS_DEBOUNCE_MS`]
+    /// 防抖（滚动停顿后才写一次，不逐帧写盘）。收敛自 `schedule_session_flush` 的
+    /// `SeqAfter` 可重入 / 代序作废模式。
+    pub(super) fn schedule_reading_progress_flush(&mut self, cx: &mut Context<Self>, immediate: bool) {
+        if immediate {
+            self.flush_reading_progress(cx);
+            return;
+        }
+        // 防抖只挂在非测试构建（测试直接驱动纯逻辑，不在测试进程残留定时任务）。
+        #[cfg(not(test))]
+        {
+            let weak = cx.weak_entity();
+            self.model.borrow().reading_progress_debounce.after(
+                cx,
+                std::time::Duration::from_millis(READING_PROGRESS_DEBOUNCE_MS),
+                move |app| {
+                    let _ = weak.update(app, |this, cx| {
+                        this.flush_reading_progress(cx);
+                    });
+                },
+            );
+        }
+    }
+
+    /// 立即把**活动选项卡**的阅读进度落盘（防抖到点回调；同 `persist_session` 的
+    /// 模型 glue 转发，测试构建在 AppModel 内短路磁盘写）。
+    fn flush_reading_progress(&mut self, cx: &mut Context<Self>) {
+        let idx = self.model.borrow().active_tab;
+        let host: &dyn AppHost = &*self;
+        self.model.borrow_mut().save_reading_progress(host, idx, &**cx);
+    }
+
+    /// 「记住阅读进度」开关：翻转 + 立即持久化（不等退出）。关 → 顺带把「恢复期/防抖
+    /// 哨兵」清掉（重开不再恢复任何旧进度，回顶部）。
+    /// `#[doc(hidden)] pub`：集成测试（`tests/reading_progress.rs`）驱动 R5「勾选状态随
+    /// 开关翻转」断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn toggle_remember_reading_progress(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on = !self.model.borrow().restore_reading_progress;
+        self.model.borrow_mut().restore_reading_progress = on;
+        // 与其它偏好同款落盘（persist_prefs 已纳入 restore_reading_progress 字段）。
+        self.persist_prefs();
+        if !on {
+            // 关闭后停止脏哨兵比对（下帧 render 起不再安排防抖）。
+            self.rp_last = None;
+        }
+        cx.notify();
     }
 }
 
@@ -331,6 +464,9 @@ pub fn restore_session_from(
     // 的旧指纹误判「未变」而跳过写槽位/清单 → 恢复出的选项卡内容不再落盘。
     app.model.borrow_mut().session_slot_hashes.clear();
     app.model.borrow_mut().session_last_manifest_digest = None;
+    // R2：同步恢复完成同样播种阅读进度脏哨兵（语义同 `restore_step` 的渐进完成——防
+    // 恢复后首帧把存档进度覆写 0）。
+    app.seed_reading_progress_sentinel(cx);
     app.model.borrow_mut().status = SharedString::from("已恢复上次会话");
     app.model.borrow_mut().status_ok = true;
     cx.notify();

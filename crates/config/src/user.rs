@@ -121,6 +121,9 @@ pub struct UserPrefs {
     /// 「关闭到系统托盘」开关。`None` = 未设置过，默认关（点标题栏 × 直接关闭退出）；
     /// `Some(true)` = 开启（点 × / Alt+F4 隐藏到系统托盘图标，托盘退出才真正退出）。
     pub close_to_tray: Option<bool>,
+    /// 「记住阅读进度」开关。`None` = 未设置，默认开（重开文件回到上次阅读位置）；
+    /// `Some(false)` = 显式关闭（重开回到顶部）。
+    pub restore_reading_progress: Option<bool>,
     /// 「媒体在新窗口打开」开关。`None` = 未设置过，默认开（打开音乐/视频进同进程新窗口
     /// 或复用已有媒体窗口）；`Some(false)` = 显式关闭，保持现行行为（当前窗口打开）。
     pub media_new_window: Option<bool>,
@@ -246,6 +249,9 @@ impl UserPrefs {
         if let Some(Value::Bool(b)) = map.get("close_to_tray") {
             prefs.close_to_tray = Some(*b);
         }
+        if let Some(Value::Bool(b)) = map.get("restore_reading_progress") {
+            prefs.restore_reading_progress = Some(*b);
+        }
         if let Some(Value::Bool(b)) = map.get("media_new_window") {
             prefs.media_new_window = Some(*b);
         }
@@ -348,6 +354,7 @@ impl UserPrefs {
             "sidebar_width": self.sidebar_width,
             "session_restore": self.session_restore,
             "close_to_tray": self.close_to_tray,
+            "restore_reading_progress": self.restore_reading_progress,
             "media_new_window": self.media_new_window,
             "reuse_media_window": self.reuse_media_window,
             "music_window_size": self.music_window_size,
@@ -457,6 +464,7 @@ mod tests {
             sidebar_width: None,
             session_restore: Some(false),
             close_to_tray: None,
+            restore_reading_progress: None,
             media_new_window: None,
             reuse_media_window: None,
             music_window_size: None,
@@ -516,6 +524,36 @@ mod tests {
         // 非对象 → 全默认。
         let back = UserPrefs::from_json_value(&Value::Null);
         assert_eq!(back.close_to_tray, None);
+    }
+
+    /// 「记住阅读进度」开关字段 roundtrip：None = 默认开；Some(false/true) 显式保留；
+    /// 缺字段 / 非法值回退默认。走纯函数（`to_json_value` / `from_json_value`），
+    /// 不触碰真实配置路径（cfg!(test) 下 load/save 为空操作）。
+    #[test]
+    fn restore_reading_progress_json_roundtrip() {
+        // None（从未设置）= 默认开：不写入 JSON、读回为 None。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["restore_reading_progress"], Value::Null);
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.restore_reading_progress, None);
+
+        // Some(false/true) 显式持久化并读回。
+        let p = UserPrefs { restore_reading_progress: Some(false), ..UserPrefs::default() };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(back.restore_reading_progress, Some(false));
+        assert_eq!(p.to_json_value()["restore_reading_progress"], serde_json::json!(false));
+        let p2 = UserPrefs { restore_reading_progress: Some(true), ..UserPrefs::default() };
+        assert_eq!(
+            UserPrefs::from_json_value(&p2.to_json_value()).restore_reading_progress,
+            Some(true)
+        );
+
+        // 非法值（非布尔）→ 回退 None。
+        let v = serde_json::json!({ "restore_reading_progress": "yes" });
+        assert_eq!(UserPrefs::from_json_value(&v).restore_reading_progress, None);
+        // 非对象 → 全默认。
+        let back = UserPrefs::from_json_value(&Value::Null);
+        assert_eq!(back.restore_reading_progress, None);
     }
 
     /// 「媒体打开位置」两个开关字段 roundtrip：media_new_window / reuse_media_window 均

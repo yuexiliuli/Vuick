@@ -111,6 +111,8 @@ impl CodeEditor {
             // 固定窗口虚拟化：窗口首行绝对行号（初始 0）。
             window_base: 0,
             desired_scroll: std::rc::Rc::new(Cell::new(0.)),
+            // 指标未就绪前收到的「滚动目标逻辑行」（见 [`Self::scroll_to_line`]）。
+            pending_scroll_line: None,
             tab_size: 4,
             folds: FoldMap::new(),
             fold_candidates: Vec::new(),
@@ -292,6 +294,13 @@ impl CodeEditor {
         self.active_guide_open = None;
         // 滚动目标回零（新文档从头开始；分帧增长中的深跳占位也随之复位）。
         self.desired_scroll.set(0.);
+        // 整篇替换 = 新文档：就绪前暂存的旧滚动目标逻辑行失效，一并清位。
+        self.pending_scroll_line = None;
+        // 诊断：`desired_scroll` 直写零的调用点（真机「47→2」若此处命中即编辑区被打回顶）。
+        crate::diag::ed_scroll(
+            "reset_document_impl.desired_zero",
+            &format!("row_count={} keep_highlight={keep_highlight}", self.row_count),
+        );
         // 整篇替换：折叠视图投影一并清空（文本结构已变）。
         self.folds.clear();
         self.resync_list(defer_scans);

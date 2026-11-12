@@ -37,6 +37,36 @@ impl Render for EditorApp {
         }
         // 编辑区⇄预览滚动同步：动了的一侧驱动另一侧到对应块（仅 MD 分屏、非 live2）。
         self.sync_editor_preview_scroll(cx);
+        // Fix B：md 阅读进度恢复窗口的逐帧推进——预览顶块收敛到存档块即清位归还正常
+        // 双向同步；预览就绪后超 [`MD_RESTORE_WAIT_FRAMES`] 帧仍未收敛也清位（防锁死）。
+        // 放在 sync 之后执行：本帧 sync 仍见守卫开启（预览即便刚就绪也不会把编辑区拉回），
+        // 清位后下一帧起恢复正常的「预览主导→回拉编辑区」语义。
+        self.advance_md_restore_window(cx);
+        // 阅读进度诊断：apply 命中 markdown 后 2 帧，上报右栏预览顶源码行（验证预览
+        // 是否随编辑区恢复收敛——真机「重开停在顶部」候选 b 的证据通道）。
+        if let Some(key) = shell_core::rp_diag::preview_pending_due() {
+            let wy = self
+                .model
+                .borrow()
+                .tabs
+                .get(self.model.borrow().active_tab)
+                .and_then(|t| t.md_wy.clone());
+            let app: &gpui::App = &**cx;
+            match wy {
+                Some(w) => {
+                    let top = w.read(app).top_source_line();
+                    shell_core::rp_diag::diag(
+                        "apply_preview",
+                        &format!("key={key} md_wy_top_source_line={top:?}"),
+                    );
+                }
+                None => {
+                    shell_core::rp_diag::diag("apply_preview", &format!("key={key} md_wy=none"));
+                }
+            }
+        }
+        // 阅读进度防抖落盘：活动选项卡位置变化 → 脏哨兵比对 + 重启防抖（滚停才写盘）。
+        self.check_reading_progress(cx);
         // 实时预览编辑（WYSIWYG）本身即「所见即所得」，右侧 Markdown 预览冗余 →
         // 编辑区占满整块（不显示分割线与预览区），退出实时模式后恢复原分屏。
         let body = self.render_body(window, cx);
@@ -48,6 +78,77 @@ impl Render for EditorApp {
 }
 
 impl EditorApp {
+    /// Fix B：md 阅读进度恢复窗口的逐帧推进（每渲染帧调用）：守卫开启期
+    /// ① 把右栏预览**重钉**到存档块（Fix A 的 `set_scroll_target` 在大文档两段式空壳期会被
+    /// `advance_pending_scroll` 丢弃——空文档 `scroll_to_line_impl` 返 NAN → 清 scroll_target；
+    /// 预览就绪后这里逐帧重钉直至收敛，蕴收藏档块不受「装配期读到顶部块」牵制）；
+    /// ② 预览顶块已收敛到存档块（`top_source_line()` == `block_start_of_line(目标)`，
+    /// 与 [`shell_preview::scroll`] 同口径块对齐）→ 清位；③ 预览就绪后计数超
+    /// [`shell_core::model::MD_RESTORE_WAIT_FRAMES`] → 清位（防目标不可达 / 预览异常永久
+    /// 锁死「预览→编辑区」驱动）。清位即归还编辑区⇄预览正常双向同步（含预览主导回拉）。
+    fn advance_md_restore_window(&mut self, cx: &mut Context<Self>) {
+        let app: &gpui::App = &**cx;
+        let active = self.model.borrow().active_tab;
+        let Some((target, n)) = self
+            .model
+            .borrow()
+            .tabs
+            .get(active)
+            .and_then(|t| t.md_restore_pending)
+        else {
+            return; // 无恢复窗口在途（绝大多数帧）
+        };
+        // NITS-③：文件 key（诊断行跨文件归因；仅恢复窗口期取，平时不触发）。
+        let file_key = self
+            .model
+            .borrow()
+            .tabs
+            .get(active)
+            .and_then(|t| t.file_path.as_ref())
+            .map(|p| session_store::reading_progress::normalize_key(p.as_path()))
+            .unwrap_or_default();
+        // 预览尚未就绪（空壳装配 / 元素未渲染）→ 只保持守卫，不计数（ready 才起算超时）。
+        let Some(wy) = ({
+            let m = self.model.borrow();
+            let Some(tab) = m.tabs.get(active) else {
+                return;
+            };
+            tab.md_wy.clone()
+        }) else {
+            // NITS-①：纯 txt / 无预览（`md_wy` 恒 None）时守卫无物可守 → 直接清位归还
+            // （防 `md_restore_pending` 悬空 Some 永久占用）。既有行为不变：txt 恢复只滚
+            // 编辑区、不建预览，本就无预览可守。
+            self.model.borrow_mut().tabs[active].md_restore_pending = None;
+            return;
+        };
+        let w = wy.read(app);
+        let (top, target_block) = (w.top_source_line(), w.block_start_of_line(target));
+        let Some(top) = top else {
+            return;
+        };
+        if top == target_block {
+            self.model.borrow_mut().tabs[active].md_restore_pending = None;
+            shell_core::rp_diag::diag(
+                "md_restore",
+                &format!("key={file_key} converged top={top} target_block={target_block}"),
+            );
+            return;
+        }
+        // 预览就绪但未收敛：**逐帧重钉到存档块**（拖住预览、不让它按装配初值停在顶部块；
+        // 幂等——目标已到即下一帧进收敛分支清位）。此重钉经 `set_scroll_target` 写 Cell，
+        // 不写宿主偏移，仍由 WyEditor prepaint 自钉，与渲染期布局复位解耦。
+        wy.read(app).set_scroll_target(target);
+        if n + 1 >= shell_core::model::MD_RESTORE_WAIT_FRAMES {
+            self.model.borrow_mut().tabs[active].md_restore_pending = None;
+            shell_core::rp_diag::diag(
+                "md_restore",
+                &format!("key={file_key} timeout target={target} top={top} n={n}"),
+            );
+            return;
+        }
+        self.model.borrow_mut().tabs[active].md_restore_pending = Some((target, n + 1));
+    }
+
     /// 内容区三态：有选项卡 → 实时编辑占满 / 预览分屏（EPUB 等全屏预览）/ 纯编辑占满；
     /// 零选项卡 → 欢迎页整屏占满正文区（不渲染编辑区）。
     pub(super) fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {

@@ -101,6 +101,8 @@ impl EditorApp {
             prefs.close_to_tray.unwrap_or(false),
             prefs.media_new_window.unwrap_or(true),
             prefs.reuse_media_window.unwrap_or(true),
+            // 「记住阅读进度」开关：None = 默认开。
+            prefs.restore_reading_progress.unwrap_or(true),
             // 媒体窗口记录尺寸：None（未记录）= 新开跟随发起窗口大小。
             prefs.music_window_size.map(|(w, h)| gpui::size(px(w), px(h))),
             prefs.video_window_size.map(|(w, h)| gpui::size(px(w), px(h))),
@@ -109,6 +111,8 @@ impl EditorApp {
             recent_files,
             // A4：PDF 书签进程级读盘一次（`load_cached`；每窗构造都读盘是浪费）。
             shell_pdf::bookmarks::load_cached(),
+            // 阅读进度进程级读盘一次（路径守卫缓存；`GPUI_EDITOR_TEST` 下 .tmp 隔离目录）。
+            session_store::reading_progress::load_cached(&AppModel::reading_progress_path()),
         )));
         // 侧边栏渲染/事件实体（shell_sidebar 域 crate）：经共享 model + 宿主弱引用
         // + 搜索输入实体（域自有态）构造；宿主渲染期以 `&mut self.sidebar` 入参调用其
@@ -183,6 +187,7 @@ impl EditorApp {
             _recent_panel_sub: None,
             focus_handle,
             md_scroll_sync: MdScrollSync::default(),
+            rp_last: None,
             _appearance_sub: None,
             // 专用媒体窗口尺寸变化订阅：仅 `new_media_window` 构造并在下方注册（未注册 =
             // None，见 `!startup && !is_detached` 分支）。

@@ -498,6 +498,16 @@ pub struct PdfViewer {
     /// 由 [`super::open::PdfViewer::submit_modify`] 在提交时按操作语义设定，`start_load`
     /// 打开成功铺槽后消费（插入保持在原页之后 / 删除夹取到合法页）。
     pub(crate) reload_anchor: Option<usize>,
+    /// 「阅读进度恢复」锚点：打开时由外壳写入 `(页下标 0 基, 页内比例, zoom)`，
+    /// [`super::open::PdfViewer::apply_loaded`] 装配后消费（设 zoom → 按当次布局滚到
+    /// 页内比例位置）。与 [`Self::reload_anchor`] 正交：前者用于「重开回到上次阅读
+    /// 位置」，后者用于「写回后保持重载页」。`None` = 无恢复（回顶部）。
+    pub(crate) restore_anchor: Option<(usize, f32, f32)>,
+    /// 「阅读进度恢复」待落地滚动：`apply_loaded` 消费 `restore_anchor` 后把 `(页, 比例)`
+    /// 暂存于此；**首个 `ensure_window` 在 base_w 按可视宽 refit 之后**施加（首帧真布局
+    /// 落点——`apply_loaded` 时 base_w 还是 `PAGE_WIDTH` 回退值，非真实可视宽，若当时就该
+    /// 落 scroll 会按错档 tops 算页）。施加后置 `None`。
+    pub(crate) restore_pending: Option<(usize, f32)>,
     /// 最近一次写回/页操作失败的文案（成功或未操作时为 None）。Phase B 弹卡/提示用。
     pub(crate) last_modify_error: Option<String>,
     /// Phase B1：选中文字后自动弹出的操作卡片（`None` = 未弹出）。
@@ -671,6 +681,8 @@ mod tests {
                     window_settled: false,
                     idle_gate_skips: 0,
                     reload_anchor: None,
+                    restore_anchor: None,
+                    restore_pending: None,
                     last_modify_error: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
@@ -909,6 +921,8 @@ mod tests {
                     window_settled: false,
                     idle_gate_skips: 0,
                     reload_anchor: None,
+                    restore_anchor: None,
+                    restore_pending: None,
                     last_modify_error: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
@@ -1050,6 +1064,8 @@ mod tests {
                     window_settled: false,
                     idle_gate_skips: 0,
                     reload_anchor: None,
+                    restore_anchor: None,
+                    restore_pending: None,
                     last_modify_error: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
@@ -1177,6 +1193,8 @@ mod tests {
             window_settled: false,
             idle_gate_skips: 0,
             reload_anchor: None,
+            restore_anchor: None,
+            restore_pending: None,
             last_modify_error: None,
             sel_card: None,
             pending_annots: Vec::new(),

@@ -3030,3 +3030,47 @@ fn long_line_cjk_window_offset_matches_real_layout(cx: &mut TestAppContext) {
         println!("  拖选(ed_drag)  N={N}: min={d_min:.3}ms median={d_med:.3}ms p95={d_p95:.3}ms");
     }
 
+
+/// 回归：首帧绘制/指标准备**之前**的 `scroll_to_line`（阅读进度恢复在 apply_text_restore
+/// 经 on_next_frame 触发，先于新鲜编辑区元素首帧 paint → `line_height` 仍 0）不得把目标
+/// 行按回退行高 1.0 换算成 px 写进 `desired_scroll`——否则首个真实指标落地时
+/// `apply_desired_to_window` 把 `N×1px` 重映射到 `N/真实行高` 行（真机「md 重开：编辑区
+/// 被拉回顶端 47→2」根因，rp_diag：apply after=47 → 下一帧 check top_line=2；headless
+/// 测不出因为它给帧前指标已就绪）。修复 = 未就绪只暂存**逻辑行**，指标就绪后按真实
+/// 行高落地（`refresh_metrics` 消费 `pending_scroll_line`）。
+#[gpui::test]
+fn early_line_scroll_survives_first_metrics_resolution(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let text = (0..89)
+        .map(|i| format!("第 {i} 行"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // 无窗口创建编辑器：绝不触发首帧 render → 指标未就绪（line_height==0）保真。
+    let ed = cx.update(|cx| {
+        let ed = cx.new(|cx| {
+            let mut e = CodeEditor::new(cx);
+            e.set_text(&text);
+            e
+        });
+        ed.update(cx, |e, _| e.scroll_to_line(47));
+        assert_eq!(
+            ed.read(cx).test_desired_scroll_px(),
+            0.,
+            "指标未就绪时 scroll_to_line 不得写 desired（防 px 错拍）"
+        );
+        ed
+    });
+    // 挂进窗口渲染：首帧 `refresh_metrics` 解析真实行高并按真实行高落地暂存逻辑行——
+    // 视口顶必须停在源码行 47。
+    let (host, cx) = cx.add_window_view(|_window, _cx| Host { ed: ed.clone() });
+    for _ in 0..6 {
+        cx.run_until_parked();
+        let _ = cx.refresh();
+        cx.run_until_parked();
+    }
+    let top = cx.update(|_, cx| host.read(cx).ed.read(cx).viewport_top_line());
+    assert_eq!(
+        top, 47,
+        "首帧前滚到 47：指标准备后视口顶应仍=47（不被 px 重映射回拢）"
+    );
+}

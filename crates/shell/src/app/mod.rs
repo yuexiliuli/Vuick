@@ -115,6 +115,9 @@ pub use shell_core::{
     PanesState, PdfBookmark, SearchScopeTab, TabDragData, TabDragGhost, TitleCtrlIconFg,
     WinCtrlKind,
 };
+/// 「阅读进度恢复」值类型（属 session_store 叶子 crate；经 `shell::app` 重导出供
+/// 集成测试（`tests/reading_progress.rs`）按其 variant 断言与宿主共同引用同一类型。
+pub use session_store::ReadingProgress;
 
 /// 测试可见重导出：
 /// - `app::session` 私有模块的纯逻辑入口（`save_session_to` / `restore_session_from`）：
@@ -309,6 +312,11 @@ pub struct EditorApp {
     /// 双方块起点键。每帧渲染开头比对、由「动了的那一侧」驱动对端；切换选项卡/换
     /// 文档（块号失义）即重置。
     md_scroll_sync: MdScrollSync,
+    /// 阅读进度脏哨兵：`(活动选项卡下标, 上次观测到的阅读位置)`。每帧 `render` 由
+    /// [`Self::check_reading_progress`] 比对——位置变化才重启防抖落盘（防抖只该在
+    /// 滚动停顿后触发一次，避免滚停后无限周期重写）。会话恢复完成处由
+    /// `seed_reading_progress_sentinel` 播种为真实位置（R2：防恢复后首帧把存档覆写 0）。
+    rp_last: Option<(usize, Option<session_store::ReadingProgress>)>,
     /// 「跟随系统主题」时的外观变化订阅（`Window::observe_window_appearance`）；
     /// 离开跟随模式后回调只是空返，切换回跟随会立即按当前系统落地一次。
     _appearance_sub: Option<Subscription>,

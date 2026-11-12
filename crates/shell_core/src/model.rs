@@ -24,11 +24,18 @@ use ui::theme::ChromeColors;
 
 use base::util::SeqAfter;
 use config::user::{PdfBgPref, ThemePref};
+use session_store::ReadingProgress;
 
 /// WYSIWYG / MD 统一预览宿主 `#live-body` 的顶部内衬（px）：缩放锚点在做「宿主
 /// ScrollHandle 偏移 ↔ WyEditor 元素局部 y」换算时使用，必须与各宿主容器
 /// `.py(px(LIVE_BODY_PAD_Y))` 保持一致。
 pub const LIVE_BODY_PAD_Y: f32 = 8.0;
+
+/// md 阅读进度恢复窗口的渲染帧计数上限（≈1.5s@60fps）：恢复后预览未能在该帧数内收敛
+/// 到存档块即清位归还正常双向同步——防「预览装配异常 / 目标块不可达」导致
+/// [`EditorTab::md_restore_pending`] 永久锁死「预览→编辑区」驱动。取 `WyEditor` 的
+/// `SCROLL_TARGET_MAX_APPLIES` 同量级、并覆盖大文档两段式装配（~200ms≈12 帧）+ 收敛。
+pub const MD_RESTORE_WAIT_FRAMES: u32 = 90;
 
 /// 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：右栏统一组件
 /// `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。纯值类型，壳侧以重导出
@@ -212,6 +219,12 @@ pub struct AppModel {
     pub wrap_enabled: bool,
     /// 「恢复上次会话」开关（文件 → 菜单切换，随 [`UserPrefs`] 持久化）。
     pub session_restore: bool,
+    /// 「记住阅读进度」开关（文件 → 菜单切换，随 [`UserPrefs`] 持久化）：开 = 重开
+    /// 文件回到上次阅读位置（md/txt 行、EPUB 行、PDF 页+比例+缩放），关 = 重开回顶部。
+    pub restore_reading_progress: bool,
+    /// 阅读进度存储（规范化路径 → 进度）。启动经 `load_cached` 注入；各保存点
+    /// （关 tab / 滚动防抖）更新并落盘；重开文件时恢复读取。
+    pub reading_progress: HashMap<String, ReadingProgress>,
     /// 「关闭到系统托盘」开关（文件 → 菜单切换，持久化）。
     pub close_to_tray: bool,
     /// 「媒体在新窗口打开」开关（查看 → 菜单切换，持久化）。
@@ -227,6 +240,9 @@ pub struct AppModel {
     /// 会话持久化防抖：可重入、代序作废，
     /// 内容变化停顿后才写盘一次。
     pub session_flush_debounce: SeqAfter,
+    /// 「阅读进度」落盘防抖：可重入、代序作废，滚动停止停顿后才写盘一次
+    /// （镜像 `session_flush_debounce`；`#[cfg(not(test))]` 挂在防抖定时器里）。
+    pub reading_progress_debounce: SeqAfter,
     /// 会话恢复进行中：恢复期间重建的选项卡不触发持久化。
     pub session_restoring: bool,
     /// 会话槽位「上次落盘内容」指纹：slot 名 → 内容 hash。
@@ -314,11 +330,13 @@ impl AppModel {
         close_to_tray: bool,
         media_new_window: bool,
         reuse_media_window: bool,
+        restore_reading_progress: bool,
         music_window_size: Option<Size<Pixels>>,
         video_window_size: Option<Size<Pixels>>,
         recent_folders: Vec<String>,
         recent_files: Vec<String>,
         pdf_bookmarks: HashMap<String, Vec<PdfBookmark>>,
+        reading_progress: HashMap<String, ReadingProgress>,
     ) -> Self {
         Self {
             tabs: Vec::new(),
@@ -334,10 +352,13 @@ impl AppModel {
             close_to_tray,
             media_new_window,
             reuse_media_window,
+            restore_reading_progress,
+            reading_progress,
             music_window_size,
             video_window_size,
             media_size_flush_debounce: SeqAfter::default(),
             session_flush_debounce: SeqAfter::default(),
+            reading_progress_debounce: SeqAfter::default(),
             session_restoring: false,
             session_slot_hashes: HashMap::new(),
             session_last_manifest_digest: None,
@@ -514,10 +535,13 @@ impl Default for AppModel {
             close_to_tray: false,
             media_new_window: true,
             reuse_media_window: true,
+            restore_reading_progress: true,
+            reading_progress: HashMap::new(),
             music_window_size: None,
             video_window_size: None,
             media_size_flush_debounce: SeqAfter::default(),
             session_flush_debounce: SeqAfter::default(),
+            reading_progress_debounce: SeqAfter::default(),
             session_restoring: false,
             session_slot_hashes: HashMap::new(),
             session_last_manifest_digest: None,
@@ -650,6 +674,19 @@ pub struct EditorTab {
     pub edit_version: u64,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     pub _edit_sub: Subscription,
+    /// 「阅读进度恢复」目标：打开瞬间从 store 装进、恢复消费后置 None；跨窗搬迁随身
+    /// （文本待首帧后滚动的在途目标经此随 DetachedTab 一起走，不被丢失）。
+    pub reading_restore: Option<ReadingProgress>,
+    /// 「md 阅读进度恢复在途」守卫：`Some((目标源码行, 自谋划起渲染帧计数))` = 重开时
+    /// 编辑区已滚到存档目标行，右栏预览仍在装配 / 未收敛到该块——此期间
+    /// [`shell_preview::scroll::sync_editor_preview_scroll`] 的**预览→编辑区**驱动
+    /// （预览自主跨块立即跟随 / 静态预览回拉编辑器）一律不发，否则真机「重开 md 被拉回
+    /// 顶部」——rp_diag 实证：`apply_text_restore after=49` → 预览首次就绪读到顶部块 2 →
+    /// 编辑区被 `ed.scroll_to_line(2)` 拉回 2（200ms 防抖再把 2 覆写进存档，二次伤害）。
+    /// 预览顶块收敛到 `block_start_of_line(目标)` 即清位归还正常双向同步；预览就绪后帧
+    /// 计数超 [`MD_RESTORE_WAIT_FRAMES`] 也清位（防目标不可达 / 预览装配异常永久锁死
+    /// 「预览→编辑区」驱动）。随选项卡搬迁（`take_tab_payload`/`adopt_tab` 整包移动）。
+    pub md_restore_pending: Option<(usize, u32)>,
     /// 监听 PDF 阅读器 `notify()`（检索结果/加载进度到达）→ 刷新 app（侧边栏计数）。
     /// **随选项卡持有**：多 PDF 选项卡并存时各自独立订阅，避免旧单槽全局
     /// `EditorApp::_pdf_observe` 被后打开者覆盖、先打开 PDF 的 notify 丢失（真 bug）。
@@ -701,6 +738,11 @@ pub struct DetachedTab {
     /// 竞态；`finish_file_text` 换装成功后置 false。
     pub loading_lock: bool,
     pub edit_version: u64,
+    /// 「阅读进度恢复」目标（与 [`EditorTab::reading_restore`] 同语义，随选项卡搬迁）。
+    pub reading_restore: Option<ReadingProgress>,
+    /// 「md 阅读进度恢复在途」守卫（与 [`EditorTab::md_restore_pending`] 同语义；
+    /// 未消费完就被拖到新窗口时随选项卡搬迁）。
+    pub md_restore_pending: Option<(usize, u32)>,
 }
 
 /// Step2/3：大文档 md「打开即提前后台整篇解析」（与分块读盘并行、不等 EOF）在途状态。

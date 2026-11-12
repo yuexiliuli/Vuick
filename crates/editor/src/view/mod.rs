@@ -465,6 +465,12 @@ pub struct CodeEditor {
     /// （`Rc<Cell<f32>>`，见 [`VerticalScrollHandle`]）。滚动条拖动只写这里，render
     /// 每帧按它重定位窗口；键盘/滚轮/跳转经 [`Self::scroll_to_px`] 同步落窗口。
     desired_scroll: std::rc::Rc<Cell<f32>>,
+    /// 指标未就绪（`line_height`=0 / `metrics_ready=false`）期间经 `scroll_to_line` 暂存的
+    /// 目标**逻辑行**：首帧 paint 前 `scroll_to_line` 无法按真实行高换算 px（回退 1.0 会
+    /// 写出错 px，随后真实指标落地时被 `apply_desired_to_window` 重映射到 `N/真实行高` 行
+    /// ——真机「md 重开：编辑区被拉回顶端 47→2」根因），故先存逻辑行、`refresh_metrics`
+    /// 就绪后按真实行高落地；`None` = 无暂存（绝大多数）。
+    pending_scroll_line: Option<usize>,
 
     // —— 配置 ——
     tab_size: usize,

@@ -11,10 +11,12 @@
 //!
 //! 依赖只重分配 workspace 既有包：`gpui` / `ui` / `base` / `serde_json`。
 
+pub mod reading_progress;
 pub mod recent_panel;
 pub mod session;
 pub mod settings_xfer;
 
+pub use reading_progress::{ReadingProgress, from_json, load, load_cached, normalize_key, save, to_json};
 pub use recent_panel::{RecentMode, RecentPanel, RecentPanelHost};
 pub use session::{
     MAX_IMPORT_SLOT_BYTES, SessionManifest, SessionTab, clear_session, prune_unreferenced_slots,

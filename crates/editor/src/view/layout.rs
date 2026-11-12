@@ -195,6 +195,16 @@ impl CodeEditor {
         self.mono = mono;
         self.font_size = font_size;
         self.line_height = line_height;
+        // 指标就绪：把「就绪前暂存的滚动目标逻辑行」按真实行高落地（修「md 重开编辑区
+        // 被拉回顶部」：apply_text_restore 的 scroll_to_line 在首帧 paint 前触发，当时
+        // line_height=0 只能存逻辑行；这里换算成真实 px 后同一帧 apply_desired_to_window
+        // 即落窗口）。幂等：无暂存/已就绪时为 None，零开销。
+        if let Some(line) = self.pending_scroll_line.take()
+            && new_lh > 0.
+        {
+            let vis = self.folds.visual_row(line);
+            self.scroll_to_px(vis as f32 * new_lh);
+        }
         // 主题色/画布底色/行号列宽等便宜字段：每帧无条件写（主题切换后下一帧立即
         // 生效，成本可忽略，不与昂贵字体度量共用门控）。
         self.bg = ui::shell::content_bg(dark, colors.bg.into());
@@ -249,6 +259,16 @@ impl CodeEditor {
         self.list_state.reset(LIST_WINDOW_ROWS);
         self.window_base = 0;
         self.desired_scroll.set(0.);
+        // 硬化：`resync_list` 回顶后暂存逻辑行坐标已失义（list 重挂）——清位防「字体
+        // 覆盖 + 恢复期 undo」等未来路径把暂存值覆写到 reveal_caret 落点。评审已核：
+        // md 重开/重驱动流中 resync 均发生在暂存之前，此处清位不破坏主修复，仅兜底。
+        self.pending_scroll_line = None;
+        // 诊断：`resync_list` 把滚动目标清零 + 列表回顶的调用点（真机「47→2」若此处命中
+        // 即内容重挂导致的回顶）。
+        crate::diag::ed_scroll(
+            "resync_list.desired_zero",
+            &format!("row_count={new_n} defer_scans={defer_scans}"),
+        );
         // 整段重挂：滞留的高亮增量登记作废（撤销/重做后走整段重解析）。
         self.hl_dirty = None;
         // 折叠投影总行数跟随文档行数（区间越界由 FoldMap 侧裁剪）。
@@ -342,7 +362,23 @@ impl CodeEditor {
 
     /// 滚动到目标**源码行**置于视口顶部（统一行高模型；逻辑行经折叠映射成视觉行，
     /// 再换算像素交给 `scroll_to_px`——夹到量程内，底部预留让末行停在横向条上方）。
+    /// `#[track_caller]`：配合 `scroll_to_px` 的同类标注，`ed_scroll` 探针能打出
+    /// **最外层**真实调用点（apply_text_restore / sync 各分支 / find_goto …）。
+    ///
+    /// 指标未就绪（首帧布局/重挂前 `line_height`=0，`metrics_ready=false`）时目标是
+    /// **按行高换算 px** 的，直接用回退行高 `1.0` 会写进错误 px——随后首个真实指标落地
+    /// 时 `apply_desired_to_window` 会把 `N×1px` 重映射到 `N/真实行高` 行（真机「md 重开：
+    /// 编辑区被拉回顶端 47→2」根因：apply_text_restore 经 on_next_frame 先于新编辑区元素
+    /// 首帧 paint 触发）。此时**暂存逻辑行** `pending_scroll_line`，指标就绪后由
+    /// `refresh_metrics` 按真实行高落地。
+    #[track_caller]
     pub fn scroll_to_line(&mut self, line: usize) {
+        if !self.metrics_ready || self.line_height.as_f32() <= 0. {
+            // 指标未就绪：只记目标逻辑行，不写 desired_scroll（防 px 错拍）。
+            self.pending_scroll_line = Some(line);
+            return;
+        }
+        self.pending_scroll_line = None;
         let lh = self.line_height.as_f32().max(1.);
         let vis = self.folds.visual_row(line);
         self.scroll_to_px(vis as f32 * lh);
@@ -400,13 +436,31 @@ impl CodeEditor {
 
     /// 滚到目标像素（夹到 [0, 全文高−视口]），写入 `desired_scroll` 并落窗口。
     /// 底部预留让最后一行能滚到横向滚动条之上（见 `pad_row_count`）。
+    /// `#[track_caller]`：诊断用——`crate::diag::ed_scroll` 据此打出**真实调用点**
+    /// （editor 内部所有滚动都经此咽喉），真机「编辑区 47→2」靠此行定位来源。
+    #[track_caller]
     pub(super) fn scroll_to_px(&mut self, target_px: f32) {
         let px = target_px.clamp(0., self.reach_px());
+        let prev = self.desired_scroll.get();
         self.desired_scroll.set(px);
+        // 探针默认关：只在开启时做 format（`ed_scroll` 内部再判一次 enabled，OnceLock
+        // 近零成本）——热路径零分配、零格式化，遵守「探针不入热路径」。
+        if crate::diag::enabled() {
+            crate::diag::ed_scroll(
+                &format!("{}", std::panic::Location::caller()),
+                &format!(
+                    "to_px={px:.1} prev={prev:.1} lh={:.1} top_vis={} top_logical={}",
+                    self.line_height.as_f32().max(1.),
+                    self.abs_scroll_top().0,
+                    self.folds.logical_row(self.abs_scroll_top().0),
+                ),
+            );
+        }
         self.apply_desired_to_window();
     }
 
     /// 滚轮竖向滚动（dy = 滚轮 delta，负=向下）。
+    #[track_caller]
     pub(super) fn scroll_vertical(&mut self, dy: f32) {
         // WY_TRACE：滚轮竖向滚动登记一次 scroll 操作；编辑已在 insert_edit 起会话，
         // 不重复起（避免滚轮同帧把编辑会话误标成 scroll）。

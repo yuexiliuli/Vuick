@@ -124,6 +124,7 @@ impl EditorApp {
         ))
         .separator()
         .item(Self::session_restore_menu_item(weak.clone()))
+        .item(Self::remember_reading_progress_menu_item(weak.clone()))
         .item(Self::close_to_tray_menu_item(weak.clone()))
         .separator()
         .item(Self::menu_action_item(
@@ -629,6 +630,39 @@ impl EditorApp {
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_close_to_tray(window, cx));
+        })
+    }
+
+    /// 「记住阅读进度」菜单标签（动态 ☑/☐ 复选标记，同 `session_restore_menu_item`
+    /// 模式；纯函数供菜单渲染与 R5 回归断言共用）。
+    #[doc(hidden)]
+    pub fn remember_reading_progress_label(on: bool) -> &'static str {
+        if on {
+            "☑ 记住阅读进度"
+        } else {
+            "☐ 记住阅读进度"
+        }
+    }
+
+    /// "记住阅读进度"菜单项：动态显示当前开关状态（前导 ☑/☐），点击切换并立即持久化
+    /// （同 [`Self::close_to_tray_menu_item`] 的 ☑/☐ 动态项模式）。
+    fn remember_reading_progress_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        let weak2 = weak.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let on = weak
+                .upgrade()
+                .map(|e| e.read(cx).model.borrow().restore_reading_progress)
+                .unwrap_or(true);
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(Self::remember_reading_progress_label(on))
+        })
+        .on_click(move |_, window, cx| {
+            let _ = weak2.update(cx, |this, cx| this.toggle_remember_reading_progress(window, cx));
         })
     }
 

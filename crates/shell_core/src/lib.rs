@@ -20,6 +20,7 @@ pub mod actions;
 pub mod file_ops;
 pub mod host;
 pub mod model;
+pub mod rp_diag;
 
 pub use host::AppHost;
 pub use model::{

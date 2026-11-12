@@ -9,6 +9,7 @@ use config::timing::OPEN_FAILURE_AUTOHIDE_SECS;
 // file_ops 纯逻辑（prepare_text / is_large_path / PreparedText / set_tab_text）
 // 在 shell_core::file_ops，此处收敛为 `use` 引用（见下方 glue 转发）。
 use shell_core::file_ops::{prepare_text, PreparedText, is_large_path};
+use session_store::ReadingProgress;
 
 /// [`EditorApp::apply_open_chunk`] 的结果：一块被如何处理（消费者据此决定继续/中止）。
 enum ChunkApply {
@@ -293,6 +294,140 @@ impl EditorApp {
             .remove_recent_folder(host, path, _window, &mut **cx);
     }
 
+    /// 应用某选项卡的「阅读进度恢复」目标：把 store 值装入 `tab.reading_restore`
+    /// （跨窗搬迁随身），再按 kind 分派实际恢复动作：
+    /// - markdown/txt：编辑区主导（**首帧后** `scroll_to_line` + `set_caret_to`——编辑区
+    ///   挂载但未布局时 `scroll_to_px` 会被 viewport 高 0 clamp 回顶）；预览右栏由既有
+    ///   sync 状态机（shell_preview::scroll）自动收敛，**不手动驱动**。
+    /// - epub：`md_wy.set_scroll_target`（WY 自钉循环，天生延迟安全、无需 window）。
+    /// - pdf：写入 `viewer.restore_anchor`（`apply_loaded` 装配后消费）。
+    /// 开关关 / store 无该路径 → 不动作。**会话恢复期间也套进度**：apply 只读 store
+    /// 并设滚动/锚点，**不触发任何写盘**（写盘只走 [`Self::check_reading_progress`] /
+    /// `remove_tab` / `save_all_reading_progress`），恢复期安全——用户最常见的「读到中途
+    /// → 关 app → 重开 app」（渐进恢复 `restore_step → open_file → load_file_text`）
+    /// 必须能套上存档进度，否则恢复出的 tab 停在开头（真机「阅读进度没作用」）。
+    ///
+    /// 已读进度在恢复**消费后**（文本：首帧滚动完成；epub/pdf：分派后）置
+    /// `tab.reading_restore = None`（见 [`Self::apply_text_restore`] 与各匹配臂）。
+    fn apply_reading_progress(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.model.borrow().restore_reading_progress {
+            return;
+        }
+        // 从 store 按规范化路径取出进度（只读借用），随后再装入 `tab.reading_restore`
+        // （跨窗搬迁随身）——先取后写，避免同语句双借。
+        let (key, saved): (String, Option<ReadingProgress>) = {
+            let model = self.model.borrow();
+            let Some(tab) = model.tabs.get(idx) else {
+                return;
+            };
+            let Some(path) = tab.file_path.clone() else {
+                return; // 未命名选项卡无进度
+            };
+            let key = session_store::reading_progress::normalize_key(&path);
+            (key.clone(), model.reading_progress.get(&key).cloned())
+        };
+        let Some(saved) = saved else {
+            shell_core::rp_diag::diag("apply", &format!("key={key} hit=miss"));
+            return;
+        };
+        let kind = match &saved {
+            ReadingProgress::Markdown { .. } => "markdown",
+            ReadingProgress::Epub { .. } => "epub",
+            ReadingProgress::Pdf { .. } => "pdf",
+        };
+        shell_core::rp_diag::diag(
+            "apply",
+            &format!(
+                "key={key} hit kind={kind} value={}",
+                shell_core::rp_diag::rp_value(&saved)
+            ),
+        );
+        self.model.borrow_mut().tabs[idx].reading_restore = Some(saved.clone());
+        match saved {
+            ReadingProgress::Markdown { top_line } => {
+                shell_core::rp_diag::mark_preview_pending(key);
+                let editor = self.model.borrow().tabs[idx].editor.clone();
+                // Fix A：编辑区恢复之外，**同时**把右栏预览滚到存档块（对齐 EPUB 姿势）。
+                // 目标写进 WyEditor `scroll_target` 由其 prepaint 自钉（小文档已同步喂源 →
+                // 立即生效）；大文档两段式**空壳装配期**该目标会被 `advance_pending_scroll`
+                // 丢弃（空文档 `scroll_to_line_impl` 返 NAN / 宿主未挂载 → 清 scroll_target，
+                // markdown_wysiwyg view.rs:123-127/150-154，而 `install_open` 不动 target）、
+                // 保底靠下方 Fix B 的 `md_restore_pending` 护栏兜住「预览→编辑区」回拉。
+                if let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) {
+                    wy.update(cx, |wy, _| wy.set_scroll_target(top_line));
+                }
+                // Fix B：进入「md 阅读进度恢复在途」守卫窗口——预览未收敛到存档块前，
+                // sync 的「预览自主跨块跟随 / 静态预览回拉编辑器」（scroll.rs:192-201/215-224）
+                // 一律不发（编辑器恢复位是这段的权威面，真机「49→2 拉回顶部」即此）。
+                // 收敛/超时由宿主每帧 `advance_md_restore_window` 清位归还正常双向同步。
+                self.model.borrow_mut().tabs[idx].md_restore_pending = Some((top_line, 0));
+                // 回调里按**编辑区实体**重新定位选项卡而非记住的下标——next-frame 到达前
+                // 若有其它 tab 被关/开，下标已搬移（回调读旧 idx 会白丢恢复），实体身份
+                // 恒可靠；回调体会在选项卡集合里没找到该实体时安全早退（tab 已关/已搬走）。
+                cx.on_next_frame(window, move |this, _window, cx| {
+                    this.apply_text_restore(&editor, top_line, cx);
+                });
+            }
+            ReadingProgress::Epub { top_line } => {
+                let wy = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone());
+                if let Some(wy) = wy {
+                    wy.update(cx, |wy, _| wy.set_scroll_target(top_line));
+                }
+                self.model.borrow_mut().tabs[idx].reading_restore = None;
+            }
+            ReadingProgress::Pdf { page_index, in_page_frac, zoom } => {
+                let pv = {
+                    let model = self.model.borrow();
+                    match model.tabs.get(idx).map(|t| &t.reader) {
+                        Some(MediaReader::Pdf(pv)) => Some(pv.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(pv) = pv {
+                    pv.update(cx, |v, _| {
+                        v.set_restore_anchor(page_index, in_page_frac, zoom)
+                    });
+                }
+                self.model.borrow_mut().tabs[idx].reading_restore = None;
+            }
+        }
+    }
+
+    /// 阅读进度**文本恢复**（`apply_reading_progress` 的 next-frame 回调体）：编辑区主导
+    /// 滚到目标源码行 + 光标落该行。此时编辑器已首帧渲染有真实视口，`scroll_to_px` 不再
+    /// 被 viewport 高 0 clamp 回顶；目标行夹到当前行数（大文档首块在途时保守下取）。
+    /// 恢复消费完成后清 `tab.reading_restore`。
+    fn apply_text_restore(
+        &mut self,
+        editor: &gpui::Entity<editor::CodeEditor>,
+        top_line: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let line = {
+            let mut model = self.model.borrow_mut();
+            // 以编辑区实体重新定位选项卡（关闭/搬移后下标会漂移，实体身份恒可靠）；
+            // 已关/被换成其它文件（实体已不在选项卡集合）→ 安全早退。
+            let Some(tab) = model.tabs.iter_mut().find(|t| t.editor == *editor) else {
+                return; // 选项卡已关/被换成其它文件
+            };
+            let line = top_line.min(tab.editor.read(cx).line_count().saturating_sub(1));
+            tab.reading_restore = None; // 消费完成
+            line
+        };
+        editor.update(cx, |ed, _| {
+            let offset = ed.offset_for_line_col(line, 0);
+            ed.scroll_to_line(line);
+            ed.set_caret_to(offset);
+        });
+        // 诊断：请求行 / 夹后行 / 调用后实际视口顶（验证是否被 clamp 回顶——候选 d）。
+        let after_top = editor.read(cx).viewport_top_line();
+        shell_core::rp_diag::diag(
+            "apply_text_restore",
+            &format!("requested={top_line} clamped={line} after_viewport_top={after_top}"),
+        );
+        cx.notify();
+    }
+
     /// 把已读取并预处理好的 UTF-8 文本载入指定选项卡，并刷新文件信息与状态。
     ///
     /// `prep`：读盘→归一化→Rope→行宽统计 的产物。同步小文档在 UI 线程现算
@@ -396,6 +531,9 @@ impl EditorApp {
         if is_md {
             self.ensure_md_wy(idx, window, cx, !defer_preview);
         }
+        // 阅读进度恢复：文本装载完成 → 按 kind 分派（md/txt 走首帧后滚动；右栏预览由
+        // sync 状态机自动收敛）。大文档首块（defer）也在此分派（next-frame 内夹当前行数）。
+        self.apply_reading_progress(idx, window, cx);
         // 文件路径就位（make_tab 时机为未命名）→ 立即持久化记成 File 型。
         self.schedule_session_flush(cx, true);
         cx.notify();
@@ -432,6 +570,7 @@ impl EditorApp {
         line_width_histogram: editor::buffer::LineWidthHistogram,
         md_wy_open: Option<markdown_wysiwyg::WyOpenResult>,
         resume_version: Option<u64>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // B3：文件换源会同步改写右栏 md_wy（install_open）→ 先作废任何在途后台装配
@@ -466,6 +605,7 @@ impl EditorApp {
             tab.loading_lock = false;
             return;
         }
+        let mut swapped = false;
         if let Some(full) = full {
             // P1 换装：整篇 rope + 统计一次装入（O(1)；取代逐块追加）。换装后行/字计数
             // 跟着整篇统计走（与 `load_file_text` 同款更新）。
@@ -488,6 +628,7 @@ impl EditorApp {
             });
             tab.line_count = tab.editor.read(cx).display_line_count();
             tab.char_count = tab.editor.read(cx).char_count();
+            swapped = true;
         } else {
             // 无整篇（异常兜底）：统计就位（内容已是首块）。
             tab.editor.update(cx, |ed, _| {
@@ -495,6 +636,17 @@ impl EditorApp {
             });
         }
         tab.loading_lock = false; // 整篇就绪：解锁编辑；同帧 status 由消费者置「已打开」。
+        // 诊断：EOF 整篇换装前后编辑区视口顶（验证「换装清回顶部」机制 + 修复后回位）。
+        if swapped {
+            shell_core::rp_diag::diag(
+                "finish_swap",
+                &format!(
+                    "after_viewport_top={} line_count={}",
+                    tab.editor.read(cx).viewport_top_line(),
+                    tab.line_count,
+                ),
+            );
+        }
         // A4 脱离：MD 不再喂 MarkdownPreview / 登记增量基底（预览统一走 md_wy）——
         // 后台预建的 `WyOpenResult` 一次性 `install_open` 装配右栏 WyEditor 预览
         // （UI 线程只做 O(块) 换源重置，不背 Doc::open）。
@@ -529,6 +681,15 @@ impl EditorApp {
             );
         }
         cx.notify();
+        // 阅读进度：大文档 EOF 整篇换装（`set_rope_with_stats_keep_highlight` → editor
+        // `reset_document_impl` 置 `desired_scroll=0`）会把编辑区滚动目标清回顶部，而首块
+        // 挂载时 `apply_text_restore` 已把 `reading_restore` 消费掉 → 换装后无人再驱动。
+        // 这里（未编辑换装守卫已在上方早退，`line_count` 已是整篇）**重新按存档驱动**到
+        // 真实行：既修复「停回顶部」，也把首块行数夹取的位置修正到整篇真实行。
+        drop(model); // 释放 RefCell 借（RefMut 有 Drop，默认活到函数尾），才能再借 &mut self
+        if swapped {
+            self.apply_reading_progress(idx, window, cx);
+        }
     }
 
     /// 大文档「分块读盘 · 渐进装配」打开流水线：
@@ -759,6 +920,7 @@ impl EditorApp {
                         full_hist,
                         md_wy_open,
                         resume_version,
+                        window,
                         cx,
                     );
                     // 自动化测试钩子：大文档异步打开补齐完成后启动 WYSIWYG 左面板
@@ -922,6 +1084,10 @@ impl EditorApp {
         tab.epub_images = doc.images.clone();
         // P4-2：EPUB 注记正文表随选项卡持有（`ensure_epub_wy` → `WyEditor::set_notes`）。
         tab.epub_notes = doc.notes.clone();
+        drop(model);
+        // 阅读进度恢复：EPUB 直接 `md_wy.set_scroll_target`（WY 自钉循环，无需 window）。
+        self.apply_reading_progress(idx, _window, cx);
+        let mut model = self.model.borrow_mut();
         let author = if doc.author.is_empty() {
             String::new()
         } else {
@@ -969,9 +1135,13 @@ impl EditorApp {
             // 独立、不被后打开者覆盖（旧 `_pdf_observe` 单槽即此缺陷）。单一写点
             // `subscribe_pdf`（新建/跨窗口移交共用）。
             self.subscribe_pdf(idx, &viewer, cx);
-            let mut model = self.model.borrow_mut();
-            let tab = model.tabs.get_mut(idx).expect("PDF 选项卡应已在场");
-            tab.reader = MediaReader::Pdf(viewer);
+            {
+                let mut model = self.model.borrow_mut();
+                let tab = model.tabs.get_mut(idx).expect("PDF 选项卡应已在场");
+                tab.reader = MediaReader::Pdf(viewer);
+            }
+            // 阅读进度恢复：把恢复锚写入 viewer（`apply_loaded` 装配后按恢复档 zoom 消费）。
+            self.apply_reading_progress(idx, _window, cx);
         } else {
             let mut model = self.model.borrow_mut();
             let Some(tab) = model.tabs.get_mut(idx) else {
