@@ -350,6 +350,7 @@ pub fn paint_image_row(
         window.paint_quad(gpui::PaintQuad {
             bounds: hb,
             corner_radii: gpui::Corners::all(px(3.)),
+            // 图片缩放柄 = 黑玻璃 × 白细边（浮在图上、专属控件色，不升 token）
             background: gpui::hsla(0., 0., 0.9, 0.65).into(),
             border_widths: gpui::Edges::all(px(1.)),
             border_color: gpui::hsla(0., 0., 1., 0.55),
@@ -377,6 +378,7 @@ fn paint_image_edit_button(
     window.paint_quad(gpui::PaintQuad {
         bounds: btn,
         corner_radii: gpui::Corners::all(px((f32::from(btn.size.width) * 0.25).min(6.))),
+        // 图片编辑钮 = 黑玻璃 × 白细边（专属控件色，不升 token）
         background: gpui::hsla(0., 0., 0.9, 0.6).into(),
         border_widths: gpui::Edges::all(px(1.)),
         border_color: gpui::hsla(0., 0., 1., 0.55),
@@ -395,6 +397,7 @@ fn paint_image_edit_button(
         window.paint_quad(gpui::PaintQuad {
             bounds: Bounds::new(point(dot_x, dot_y0 + px(k as f32 * step)), dot),
             corner_radii: gpui::Corners::all(px(dot_size / 2.)),
+            // 编辑钮三点 = 纯黑不透明（专属控件色，不升 token）
             background: gpui::hsla(0., 0., 0.22, 1.).into(),
             border_widths: gpui::Edges::default(),
             border_color: gpui::Hsla::default(),
@@ -561,6 +564,7 @@ pub fn paint_quote_band(
 
 /// 每个警报（callout）对应的条色（明/暗主题微调，区分五类警报）。
 pub fn alert_color(theme: &WyTheme, kind: AlertKind) -> Hsla {
+    // 5 类警报条专属 accent（表单内容色、仅 callout 条消费；WyTheme 无此栏，值≠既有 token，不升 token）
     let mut c: Hsla = match kind {
         AlertKind::Note => gpui::rgb(0x3b82f6).into(),
         AlertKind::Tip => gpui::rgb(0x10b981).into(),
@@ -1393,6 +1397,7 @@ pub fn paint_note_marker_highlight(
     window: &mut Window,
     cx: &mut App,
 ) {
+    // 注记跳转加亮 = 蓝系 accent 淡色半透明（仅预览引擎消费；doc_selection_bg 值不同，非 A/B）
     let hl: Hsla = if ui::theme::Theme::global(cx).is_dark() {
         gpui::rgba(0x58a6ff59).into()
     } else {
@@ -1419,6 +1424,7 @@ pub fn paint_search_highlight(
     let Some(range) = host.search_highlight_range() else {
         return;
     };
+    // 预览搜索命中 = 淡黄半透明（仅本引擎消费；editor_find_* 值不同，非 A/B）
     let hl: Hsla = if ui::theme::Theme::global(cx).is_dark() {
         gpui::rgba(0xf59e0b47).into()
     } else {

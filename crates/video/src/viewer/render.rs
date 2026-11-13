@@ -33,6 +33,7 @@ impl super::VideoViewer {
                     }))
                     .border_1()
                     .border_color(border)
+                    // 玻璃卡投影 = 黑 hsla 散值（明暗同值、按高程定 alpha/blur；ui::theme 无阴影 token，表单专属留注释）
                     .shadow(vec![
                         gpui::BoxShadow::new(px(0.), px(4.), gpui::hsla(0., 0., 0., 0.16))
                             .blur_radius(px(12.)),
@@ -108,6 +109,7 @@ impl super::VideoViewer {
             } else {
                 GLASS_PANEL_ALPHA_LIGHT
             }))
+            // 投影同 placeholder 玻璃卡：黑 hsla 0.16@6，表单专属（theme 无阴影 token）
             .shadow(vec![
                 gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.16))
                     .blur_radius(px(6.)),
@@ -219,6 +221,7 @@ impl super::VideoViewer {
             .bg(panel)
             .border_1()
             .border_color(border)
+            // 控制条上抛投影 = 黑 hsla 双散值（0.18@16 + 0.14@4），面板专属，theme 无阴影 token
             .shadow(vec![
                 gpui::BoxShadow::new(px(0.), px(-6.), gpui::hsla(0., 0., 0., 0.18))
                     .blur_radius(px(16.)),
@@ -639,6 +642,7 @@ impl Render for VideoViewer {
                     } else {
                         GLASS_PANEL_ALPHA_LIGHT
                     }))
+                    // 状态浮层投影 = 黑 hsla 双散值（0.18@10 + 0.14@2），玻璃卡专属，theme 无阴影 token
                     .shadow(vec![
                         gpui::BoxShadow::new(px(0.), px(4.), gpui::hsla(0., 0., 0., 0.18))
                             .blur_radius(px(10.)),
