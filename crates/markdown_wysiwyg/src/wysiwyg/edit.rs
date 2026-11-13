@@ -322,13 +322,27 @@ impl WyEditor {
     }
 
     /// 表格内容行：取离 `col` 最近的单元格内容边界 `(start, end)`（相对行首）。
-    /// 非表格行/无格 → None。
+    /// 非表格行/无格 → None。引号内表格先剥 `>` 前缀再拆格，格区间回加前缀
+    /// （对齐 `Doc::table_row_maps` 的换算，见 doc.rs）。
     fn table_cell_bounds(&self, line: usize, col: usize) -> Option<(usize, usize)> {
         if !matches!(self.region_content(line), Some(BlockRegion::Table { .. })) {
             return None;
         }
         let raw = self.line_text(line);
-        let cells = crate::markdown::parse::split_table_cells_mapped(&raw);
+        let prefix =
+            crate::markdown::parse::inline_style::blockquote_prefix(&raw).unwrap_or(0);
+        let stripped = &raw[prefix.min(raw.len())..];
+        let cells: Vec<(Range<usize>, gpui::SharedString, Vec<usize>)> =
+            crate::markdown::parse::split_table_cells_mapped(stripped)
+                .into_iter()
+                .map(|(r, text, map)| {
+                    (
+                        r.start + prefix..r.end + prefix,
+                        text,
+                        map.into_iter().map(|b| b + prefix).collect(),
+                    )
+                })
+                .collect();
         if cells.is_empty() {
             return None;
         }
@@ -1241,8 +1255,38 @@ impl WyEditor {
         {
             return;
         }
+        // 引号区内回车：自动续 `>` 前缀（保引用深度，`>> ` 续 `>> `）；
+        // 引号内列表行再续列表 marker（`- ` / `1. ` 等），新行仍落在引用内
+        // （2026-11-13）。表格已在上方 no-op，不会走到续写。
+        let mut nl_text = String::from("\n");
+        let raw = self.line_text(nl);
+        if let Some(p) = crate::markdown::parse::inline_style::blockquote_prefix(&raw) {
+            nl_text.push_str(&raw[..p]);
+            let body = raw[p..].trim_start();
+            // 引号内列表行续 marker（字面 `- `/`* `/`+ `/`1. `/`1) `）。
+            let mut found = false;
+            for m in ["- ", "* ", "+ "] {
+                if body.strip_prefix(m).is_some() {
+                    nl_text.push_str(m);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                let d = body.chars().take_while(|c| c.is_ascii_digit()).count();
+                if (1..4).contains(&d) {
+                    let after = &body[d..];
+                    for m in [". ", ") "] {
+                        if after.strip_prefix(m).is_some() {
+                            nl_text.push_str(&body[..d + m.len()]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let range = self.selection().unwrap_or(self.caret..self.caret);
-        self.replace_range(range, "\n", cx);
+        self.replace_range(range, &nl_text, cx);
     }
 
     /* ---------- 光标移动 ---------- */

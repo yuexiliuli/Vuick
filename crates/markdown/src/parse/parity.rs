@@ -784,3 +784,71 @@ fn doc_utf16_index_matches_full_recompute() {
         }
     }
 }
+
+    /// 引号区内块级嵌套（2026-11-13）：`Doc`（统一行）与预览、IR 在嵌套语料上
+    /// 逐行一致；且 `byte_map` / 表格单元格映射可回源（多字节中文，0993a6e 同族 P0）。
+    /// 说明：live 侧 `inline_style` 逐行代理只建模对齐子集（不含 `> |` 结构行——
+    /// 引号内结构的真实裁决在共享 `parse/classify`，`Doc` 是唯一消费面）。
+    #[test]
+    fn doc_quoted_nested_blocks_agree_and_round_trip() {
+        let src = "> 说明\n> | 列A | 含中文$公式$ |\n> | :- | -: |\n> | 一 | 中文字 |\n> | 二 | tail |\n> 收尾行\n> - 列表项\n> # 引内标题\n> ![图](a.png)\n";
+        let n_lines = src.split('\n').count();
+        let doc = crate::markdown::doc::Doc::open(SharedString::from(src));
+        let rows = doc.rows_in_line_window(0, n_lines);
+
+        // 与预览 parse_to_rows 逐块一致（kind + quoted），并经 IR 金标准逐行复核。
+        let pv = parse_to_rows(src);
+        assert_eq!(rows.len(), pv.len(), "Doc 与预览块数一致");
+        let rk = crate::markdown::doc::row_kind;
+        for (d, p) in rows.iter().zip(pv.iter()) {
+            assert_eq!(d.kind, rk(p.kind), "src_line {} kind 不一致", p.src_line);
+            assert_eq!(d.quoted, p.quoted, "src_line {} quoted 不一致", p.src_line);
+        }
+        let ir_blocks = crate::markdown::ir::build_ir(src);
+        for r in &rows {
+            for line in r.lines.clone() {
+                let ir_kind = ir_blocks
+                    .iter()
+                    .find(|b| b.lines.contains(&line))
+                    .map(|b| b.kind)
+                    .expect("IR 应有该行");
+                assert_eq!(r.kind, ir_kind, "line {line} 语义不一致");
+            }
+        }
+
+        // 块结构断言
+        assert_eq!(rows[0].kind, rk(RowKind::Quote), "首行应为引述");
+        assert_eq!(rows[1].kind, rk(RowKind::Table), "引号内表格应为 Table 块");
+        assert_eq!(
+            rows[1].quoted.as_deref(),
+            Some(&[2usize, 2, 2][..]),
+            "表格 quoted = 逐内容行前缀偏移（表头+数据，跳过分隔行）"
+        );
+
+        // P0：引号内表格首格（中文多字节）源区间回源正确（相对行首、含 `> `）。
+        let t = rows[1].table_rows.as_ref().expect("表格行应带 table_rows");
+        assert_eq!(t.len(), 3, "可见行 = 表头 + 2 数据行");
+        let hdr = &t[0];
+        assert_eq!(hdr.src_line, 1);
+        assert_eq!(hdr.cells[0].text.as_ref(), "列A");
+        assert_eq!(hdr.cells[0].src, 4..8, "`列A`(4B) 在源字节 4..8（含 `> | ` 前缀）");
+        let d0 = &t[1];
+        assert_eq!(d0.src_line, 3, "首个数据行源行号（跳过分隔行）");
+        assert_eq!(d0.cells[0].text.as_ref(), "一");
+        assert_eq!(d0.cells[0].src, 4..7, "`一`(3B) 在源字节 4..7");
+
+        // P0：引号内列表项 byte_map 回源（`> - 列表项` → 正文自源字节 4 起）。
+        let bullet = &rows[3]; // "> - 列表项"
+        assert_eq!(bullet.kind, rk(RowKind::Bullet));
+        assert_eq!(
+            bullet.byte_map,
+            vec![4usize, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            "列表项 byte_map 应回源到内容起点（9B 文本 + 1 哨兵）"
+        );
+
+        // P0：引号内图片题注 byte_map 回源（`> ![图](a.png)` → alt `图` 自源字节 4 起，
+        // `quoted` 前缀 + `![` 各计；评审 NIT-D 回归锚）。
+        let img = rows.iter().find(|r| r.kind == rk(RowKind::Image)).expect("应有引号内图片");
+        assert_eq!(img.byte_map, vec![4usize, 5, 6, 7], "引号内图片 alt byte_map 应含前缀");
+    }
+

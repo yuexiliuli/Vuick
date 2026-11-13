@@ -75,16 +75,19 @@ pub fn paint_table_row(
 ) {
     let hgeo = table_hscroll_geo(rd, host, f, row);
     let scroll = table_hscroll_clamped(rd, host, f, row);
-    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+    // 网格视口以**表格内容左缘**起算（`padding + x_off`，引号内表格缩进）：遮罩
+    // 同步左移并收窄，保证①滚动条对齐表格边缘②内容拖拽不盖引号竖条③右缘可达
+    // （2026-11-13 真机复查 #1/#2/#3，与 `table_hscroll_geo` 同口径）。
+    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2. - f32::from(row.x_off)).max(1.);
     let total_w = t.total_w.max(1.);
-    let x0 = f32::from(origin.x) + f32::from(f.padding) - scroll;
+    let x0 = f32::from(origin.x) + f32::from(f.padding) + f32::from(row.x_off) - scroll;
     let top0 = f32::from(origin.y) + f32::from(row.top);
     let row_h_f = f32::from(t.row_h);
     let ncols = t.header_texts.len().max(1);
     let n_rows = t.rows_texts.len();
     let block_h = f32::from(table_block_height(theme, n_rows));
     let content_rect = Bounds::new(
-        point(origin.x + f.padding, origin.y + row.top),
+        point(origin.x + f.padding + row.x_off, origin.y + row.top),
         size(px(viewport), px(block_h)),
     );
     let border: gpui::Hsla = theme.divider;

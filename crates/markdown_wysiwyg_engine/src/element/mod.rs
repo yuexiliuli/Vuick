@@ -726,6 +726,9 @@ pub struct ShapedRow {
     pub top: Pixels,
     /// 块语义（paint 按类型分派：代码面板/表格网格/图片）。
     pub kind: IrKind,
+    /// 是否属引用区（`>` 前缀行；含 kind==Quote 与引号内结构行）。paint 据此画
+    /// 引号灰底带 + 左指示条（2026-11-13）。
+    pub quoted: bool,
     /// Table 块的网格数据（带外块为 None）。
     pub table: Option<ShapedTable>,
     /// Table 块的单元格编辑排版（带外块为 None；表格可编辑靠它，`byte_map` 仍空）。

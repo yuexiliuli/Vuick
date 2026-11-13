@@ -6,6 +6,7 @@
 
 use gpui::SharedString;
 
+use super::inline_style::blockquote_prefix;
 use super::rows::{
     fence_len, inline_strip, is_rule, list_prefix, parse_image_line, strip_align_directive,
     try_parse_table, RowKind,
@@ -585,7 +586,7 @@ pub(crate) fn classify_block(lines: &[&str], idx: usize, t: &str) -> BlockClass 
         };
     }
     if t.starts_with('>') {
-        return BlockClass { kind: RowKind::Quote, consumed: 1, aux: 0, hashes: 0 };
+        return classify_quote_region(lines, idx, t);
     }
     if list_prefix(t).is_some() {
         return BlockClass { kind: RowKind::Bullet, consumed: 1, aux: 0, hashes: 0 };
@@ -605,6 +606,86 @@ pub(crate) fn classify_block(lines: &[&str], idx: usize, t: &str) -> BlockClass 
         };
     }
     BlockClass { kind: RowKind::Paragraph, consumed: 1, aux: 0, hashes: 0 }
+}
+
+/// 引号区：收集从 `idx` 起连续 `>` 行，逐行剥前缀+对齐指令+前导空白成 body
+/// （与 [`super::rows::parse_quote_region`] 同口径）。返回（body 行切片，区长度）。
+/// 供块索引**全量/增量扫描**一次收集、逐子块发射用（避免逐子块重扫整段 → O(L²)，
+/// 2026-11-13 性能评审修复）。
+pub(crate) fn quote_region_body<'a>(
+    lines: &'a [&'a str],
+    idx: usize,
+) -> (Vec<&'a str>, usize) {
+    let mut j = idx;
+    while j < lines.len()
+        && lines[j].trim_end_matches('\r').trim_start().starts_with('>')
+    {
+        j += 1;
+    }
+    let mut body: Vec<&str> = Vec::with_capacity(j - idx);
+    for raw in &lines[idx..j] {
+        let raw = raw.trim_end_matches('\r');
+        match blockquote_prefix(raw) {
+            Some(p) => {
+                let b = raw[p..].trim_start();
+                let (_, b) = strip_align_directive(b);
+                body.push(b);
+            }
+            None => body.push(raw),
+        }
+    }
+    (body, j - idx)
+}
+
+/// 引号区内 `body[k]` 起单个（子）块的分类（对齐 [`classify_quote_region`] 首块
+/// 语义 + TOC 写入）：残留 `>` 按单行引述；段落/空行降级 [`RowKind::Quote`]；
+/// 标题把目录文本写入 `toc`（body 已剥 `>` 前缀）。
+pub(crate) fn classify_quote_line(
+    body: &[&str],
+    k: usize,
+    build_toc: bool,
+    row_start: usize,
+    toc: &mut Vec<(usize, u8, SharedString)>,
+) -> BlockClass {
+    let Some(bk) = body.get(k) else {
+        return BlockClass { kind: RowKind::Quote, consumed: 1, aux: 0, hashes: 0 };
+    };
+    let t0 = bk.trim_start();
+    // 残留 `>`（双空格剥后仍以 `>` 开头）：按单行引述
+    if t0.starts_with('>') {
+        return BlockClass { kind: RowKind::Quote, consumed: 1, aux: 0, hashes: 0 };
+    }
+    let mut c = classify_block(body, k, t0);
+    // 引号区内：段落/空行降级为 Quote（保持引号灰带连续，与 rows 侧一致）
+    match c.kind {
+        RowKind::Paragraph | RowKind::Blank => {
+            c.kind = RowKind::Quote;
+            c.consumed = 1;
+            c.aux = 0;
+            c.hashes = 0;
+        }
+        _ => {}
+    }
+    if build_toc
+        && let RowKind::Heading(h) = c.kind
+    {
+        let text = inline_strip(t0[h as usize..].trim_start());
+        toc.push((row_start, h, text));
+    }
+    c
+}
+
+/// 引号区：收集连续 `>` 行，剥前缀后对**首个子块**分类（并列 [`classify_block`]）。
+/// 与 [`super::rows::parse_quote_region`] 的块边界 / consumed 严格一致（同款
+/// 判定顺序与剥前缀逻辑），保证窗口物化不变式 `rows.len() == hi-lo+1` 与
+/// 增量/全量一致（2026-11-13）。
+fn classify_quote_region(lines: &[&str], idx: usize, _t: &str) -> BlockClass {
+    let (body, _) = quote_region_body(lines, idx);
+    if body.is_empty() {
+        return BlockClass { kind: RowKind::Quote, consumed: 1, aux: 0, hashes: 0 };
+    }
+    let mut dummy_toc = Vec::new();
+    classify_quote_line(&body, 0, false, idx, &mut dummy_toc)
 }
 
 /// 一次遍历产出整篇轻量块索引（不复制文本，不建 [`Row`]）。
@@ -648,12 +729,43 @@ pub(crate) fn scan_blocks_with_line_starts(
         // 与 parse_to_rows 一致的 EPUB 对齐指令剥离（kind 判定对同一份内容做）。
         let (_, line) = strip_align_directive(raw_line);
         let t = line.trim_start();
+        if t.starts_with('>') {
+            // 引号区：一次收集 body、逐子块发射，idx 直接跳过整区
+            //（避免单行子块每次重扫整段 → O(L²)，2026-11-13 性能评审修复）。
+            let (body, region_len) = quote_region_body(lines, idx);
+            let mut k = 0usize;
+            while k < body.len() {
+                let sub_row = row_start + k;
+                let c = classify_quote_line(&body, k, build_toc, sub_row, &mut toc);
+                let sub_raw = lines[sub_row].trim_end_matches('\r');
+                blocks.push(BlockMeta {
+                    src_line: sub_row as u32,
+                    byte: line_starts[sub_row],
+                    kind: c.kind,
+                    raw_len: if c.kind == RowKind::Blank {
+                        0
+                    } else {
+                        sub_raw.len() as u32
+                    },
+                    aux: c.aux,
+                });
+                k += c.consumed.max(1);
+            }
+            idx += region_len;
+            continue;
+        }
         let c = classify_block(lines, idx, t);
         if build_toc
             && let RowKind::Heading(h) = c.kind
         {
+            // 引号区内标题：目录文本取剥前缀后的 body（`>` 前缀不落入 TOC）。
+            let tt: &str = if t.starts_with('>') {
+                blockquote_prefix(t).map(|p| t[p..].trim_start()).unwrap_or(t)
+            } else {
+                t
+            };
             let _t = crate::prof::begin();
-            let text = inline_strip(t[h as usize..].trim_start());
+            let text = inline_strip(tt[h as usize..].trim_start());
             toc.push((row_start, h, text));
             crate::prof::end("scan.blocks.toc", _t);
         }

@@ -303,6 +303,7 @@ pub fn shape_text_row(
         height,
         top: px(0.),
         kind,
+        quoted: r.quoted.is_some() || kind == IrKind::Quote,
         table: None,
         table_edit: None,
         image: None,
@@ -376,12 +377,27 @@ pub fn shape_text_row_decorated(
         }
     }
     let mut bullet_g: Option<RowGutter> = None;
-    if r.kind == IrKind::Bullet
-        && let Some(g) = bullet_gutter(&raw)
-    {
-        bullet_g = Some(g);
+    if r.kind == IrKind::Bullet {
+        // 引号内列表行：从剥掉 `>` 前缀后的正文判符号/gutter（2026-11-13）。
+        let bullet_raw = if r.quoted.is_some() {
+            inline_style::blockquote_prefix(&raw)
+                .map(|p| &raw[p..])
+                .unwrap_or(raw.as_str())
+        } else {
+            raw.as_str()
+        };
+        if let Some(g) = bullet_gutter(bullet_raw) {
+            bullet_g = Some(g);
+        }
     }
     let pad = f32::from(px(config::markdown::CONTENT_EDGE_PAD_X_PX));
+    // 引号区内的结构行（Bullet/Heading/Rule 等；Quote 行自身已带 15px 缩进，不加）
+    // 在各自 gutter 基础上再右移一个引述缩进，与引号带对齐。
+    let quote_off = if r.quoted.is_some() && !matches!(r.kind, IrKind::Quote) {
+        QUOTE_TEXT_INDENT_PX
+    } else {
+        0.
+    };
     let gutter_x: f32 = if alert.is_some() {
         84.
     } else if let Some(g) = &bullet_g {
@@ -396,7 +412,7 @@ pub fn shape_text_row_decorated(
         QUOTE_TEXT_INDENT_PX
     } else {
         0.
-    };
+    } + quote_off;
     let wrap_w = (f32::from(width) - 2. * pad - gutter_x).max(1.);
     let mut srow = shape_text_row(rd, host, r.clone(), window, width, theme, base_font, wrap_w);
     if let Some(g @ RowGutter::Alert { .. }) = &alert {
@@ -406,10 +422,10 @@ pub fn shape_text_row_decorated(
     if let Some(g) = bullet_g {
         let is_check = matches!(g, RowGutter::Check { .. });
         srow.extra.gutter = Some(g);
-        srow.x_off = if is_check { px(24.) } else { px(18.) };
+        srow.x_off = px(if is_check { 24. } else { 18. } + quote_off);
     }
     if matches!(r.kind, IrKind::Heading(_)) {
-        srow.x_off = px(HEADING_GUTTER_W);
+        srow.x_off = px(HEADING_GUTTER_W + quote_off);
     }
     if !srow.align_offsets.is_empty() || r.align.is_some() || host.is_epub() {
         let avail = wrap_w + gutter_x;
@@ -662,6 +678,7 @@ pub fn shape_code_row(
             height,
             top: px(0.),
             kind,
+            quoted: r.quoted.is_some(),
             table: None,
             table_edit: None,
             image: None,
@@ -780,6 +797,7 @@ pub fn shape_code_row(
         height,
         top: px(0.),
         kind,
+        quoted: r.quoted.is_some(),
         table: None,
         table_edit: None,
         image: None,
@@ -939,11 +957,12 @@ pub fn shape_table_row(
         multi_offsets: Vec::new(),
         code_ranges: Vec::new(),
         lh: row_h,
-        x_off: px(0.),
+        x_off: px(if r.quoted.is_some() { QUOTE_TEXT_INDENT_PX } else { 0. }),
         align_offsets: Vec::new(),
         height,
         top: px(0.),
         kind,
+        quoted: r.quoted.is_some(),
         table_edit: if trow_edit.is_empty() {
             None
         } else {
@@ -1094,6 +1113,7 @@ pub fn shape_image_row(
         height,
         top: px(0.),
         kind,
+        quoted: r.quoted.is_some(),
         table: None,
         table_edit: None,
         image: Some(ShapedImage {
@@ -1259,6 +1279,7 @@ pub fn build_math_card_row(
         height,
         top,
         kind: IrKind::Paragraph,
+        quoted: false,
         table: None,
         table_edit: None,
         image: None,

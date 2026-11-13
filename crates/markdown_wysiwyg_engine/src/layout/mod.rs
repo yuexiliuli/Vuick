@@ -658,5 +658,6 @@ pub fn docrow_for_height(r: &Row) -> DocRow {
         align: r.align,
         notes: r.notes.clone(),
         note_defs: r.note_defs.clone(),
+        quoted: r.quoted.clone(),
     }
 }

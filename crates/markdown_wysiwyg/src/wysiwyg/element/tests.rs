@@ -33,3 +33,4 @@ include!("tests/tail_blank_heading_click.rs");
 include!("tests/live2_edits.rs");
 include!("tests/tab.rs");
 include!("tests/p0_p1.rs");
+include!("tests/quote_blocks.rs");

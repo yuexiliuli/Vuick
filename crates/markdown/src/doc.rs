@@ -102,6 +102,8 @@ pub struct DocRow {
     /// 表格块的逐行/单元格编辑映射（仅 [`IrKind::Table`] 行非 `Some`；代码块用
     /// `byte_map`，表格因单元格多列需要更细粒度）。`Rc` 压低克隆成本。
     pub table_rows: Option<std::rc::Rc<Vec<TableRowMap>>>,
+    /// 每个内容行的 `>` 前缀源字节偏移（暂无用途，后续阶段用）。
+    pub quoted: Option<Vec<usize>>,
 }
 
 /// 文档源：`Str`（小文档）或 `Rope`（大文档，COW，与编辑器共享底层树）。
@@ -1024,18 +1026,31 @@ pub(crate) fn assemble_docrow<V: DocLineView>(
     let byte_map = match r.kind {
         RowKind::Paragraph | RowKind::Heading(_) | RowKind::Bullet | RowKind::Quote => {
             let line = view.line_str(r.src_line);
-            parse::text_segment(&line, r.kind)
+            // 引号区内结构行（Bullet/Heading 等）：正文从 `quoted` 前缀偏移开始，
+            // `text_segment` 无法直接识别 `> `，先剥前缀再按段偏移 + 回加前缀。
+            let prefix = r
+                .quoted
+                .as_ref()
+                .and_then(|q| q.first())
+                .copied()
+                .unwrap_or(0);
+            parse::text_segment(&line[prefix.min(line.len())..], r.kind)
                 .map(|(off, seg)| {
-                    parse::inline_style_mapped(seg).2.into_iter().map(|b| off + b).collect()
+                    parse::inline_style_mapped(seg)
+                        .2
+                        .into_iter()
+                        .map(|b| prefix + off + b)
+                        .collect()
                 })
                 .unwrap_or_default()
         }
-        RowKind::Code => code_byte_map(view, r.src_line, &code_lines),
+        RowKind::Code => code_byte_map(view, r.src_line, &code_lines, r.quoted.as_deref()),
         RowKind::Image => {
             // 独立图片行 `![alt](src)`：alt 文本与源字节 1:1 连续（`!`/`[`
             // 各占 1 字节，alt 自字节 2 起；末项哨兵 = 闭合 `]` 前 = 2+alt.len()）。
-            // 让图片题注成为与普通文本行同构的可编辑段（编辑正确映射回源）。
-            (0..=r.text.len()).map(|i| 2 + i).collect()
+            // 引号内图片行：另加 `quoted` 前缀偏移（评审 NIT-D，2026-11-13）。
+            let prefix = r.quoted.as_ref().and_then(|q| q.first()).copied().unwrap_or(0);
+            (0..=r.text.len()).map(|i| prefix + 2 + i).collect()
         }
         _ => Vec::new(),
     };
@@ -1053,7 +1068,7 @@ pub(crate) fn assemble_docrow<V: DocLineView>(
     let table_rows = match r.kind {
         RowKind::Table => {
             let n_data = r.table().map_or(0, |t| t.rows.len());
-            table_row_maps(view, r.src_line, n_data)
+            table_row_maps(view, r.src_line, n_data, r.quoted.as_deref())
         }
         _ => None,
     };
@@ -1069,24 +1084,34 @@ pub(crate) fn assemble_docrow<V: DocLineView>(
         align: r.align,
         notes: r.notes.clone(),
         note_defs: r.note_defs.clone(),
+        quoted: r.quoted,
     }
 }
 
 /// 表格块：逐可见行（表头 + 各数据行，跳过分隔行）用
 /// [`parse::split_table_cells_mapped`] 装配单元格编辑映射。
+/// 引号内表格（`quoted` 为 Some）逐行先剥 `>` 前缀再拆格，单元格区间/映射
+/// 整体回加前缀（相对该行进首，保证 `ls + local` 命中正确）。
 fn table_row_maps<V: DocLineView>(
     view: &V,
     src_line: usize,
     n_data: usize,
+    quoted: Option<&[usize]>,
 ) -> Option<std::rc::Rc<Vec<TableRowMap>>> {
     let mut out = Vec::with_capacity(1 + n_data);
     for k in 0..=n_data {
         // k=0 表头（src_line）；数据行 i（0 基，k=i+1）源行 = src_line + 1 + k。
         let line_ix = if k == 0 { src_line } else { src_line + 1 + k };
         let line = view.line_str(line_ix);
-        let cells = parse::split_table_cells_mapped(&line)
+        let prefix = quoted.map(|q| q.get(k).copied().unwrap_or(0)).unwrap_or(0);
+        let stripped = &line[prefix.min(line.len())..];
+        let cells = parse::split_table_cells_mapped(stripped)
             .into_iter()
-            .map(|(src, text, map)| TableCellMap { src, text, map })
+            .map(|(src, text, map)| TableCellMap {
+                src: src.start + prefix..src.end + prefix,
+                text,
+                map: map.into_iter().map(|b| b + prefix).collect(),
+            })
             .collect();
         out.push(TableRowMap { src_line: line_ix, cells });
     }
@@ -1098,27 +1123,34 @@ fn table_row_maps<V: DocLineView>(
 /// 第 `i` 个渲染字节对应的**块首源偏移**（相对 `src_line` 围栏行起始），使元素层
 /// 可对围栏内任意内容行做「渲染位置 ↔ 源字节」换算。末项哨兵 = 末内容行行尾
 /// （= 闭合围栏行起始）。`CRLF` 下分隔符映射到上一行的 `\n`（`line_starts` 已跳过 `\r\n`）。
+/// 引号内代码块（`quoted` 为 Some）：行内容起点 = 行首 + 前缀偏移。
 fn code_byte_map<V: DocLineView>(
     view: &V,
     src_line: usize,
     code_lines: &[SharedString],
+    quoted: Option<&[usize]>,
 ) -> Vec<usize> {
     let block_start = view.line_start(src_line);
     let mut map = Vec::new();
-    for (k, line) in code_lines.iter().enumerate() {
+    for (k, _line) in code_lines.iter().enumerate() {
         // 行与行之间的渲染 `\n`（首行前无分隔符）。
         if k > 0 {
             let prev_nl = view.line_start(src_line + 1 + k).saturating_sub(1);
             map.push(prev_nl.saturating_sub(block_start));
         }
+        let line_prefix = quoted.map(|q| q.get(k).copied().unwrap_or(0)).unwrap_or(0);
         let line_start = view.line_start(src_line + 1 + k);
-        for (i, _) in line.as_bytes().iter().enumerate() {
-            map.push(line_start.saturating_sub(block_start) + i);
+        for (i, _) in view.line_str(src_line + 1 + k).as_bytes().iter().enumerate() {
+            map.push(line_start.saturating_sub(block_start) + line_prefix + i);
         }
     }
-    let sentinel = view
-        .line_start(src_line + 1 + code_lines.len())
-        .saturating_sub(block_start);
+    let close_ix = src_line + 1 + code_lines.len();
+    let mut sentinel = view.line_start(close_ix).saturating_sub(block_start);
+    // 引号代码块：闭合围栏行也带 `>` 前缀，哨兵指向其正文起点之后。
+    if quoted.is_some() {
+        let close_line = view.line_str(close_ix);
+        sentinel += parse::inline_style::blockquote_prefix(&close_line).unwrap_or(0);
+    }
     map.push(sentinel);
     map
 }

@@ -128,6 +128,30 @@ pub(crate) fn build_ir(src: &str) -> Vec<IrBlock> {
             i = end;
             continue;
         }
+        // 引号区：收集连续 `>` 行，剥前缀后对 body 递归 build_ir；
+        // 引号区内段落/空行降级为 Quote（与 rows/blocks 侧一致，2026-11-13）。
+        if blockquote_prefix(lines[i]).is_some() {
+            let mut j = i;
+            while j < n && blockquote_prefix(lines[j]).is_some() {
+                j += 1;
+            }
+            let body: Vec<&str> = (i..j)
+                .map(|k| match blockquote_prefix(lines[k]) {
+                    Some(p) => lines[k][p..].trim_end_matches('\r').trim_start(),
+                    None => lines[k],
+                })
+                .collect();
+            let mut sub = build_ir(&body.join("\n"));
+            for b in &mut sub {
+                if b.kind == IrKind::Paragraph || b.kind == IrKind::Blank {
+                    b.kind = IrKind::Quote;
+                }
+                b.lines = (i + b.lines.start)..(i + b.lines.end);
+            }
+            out.extend(sub);
+            i = j;
+            continue;
+        }
         // 单行块：判定顺序与 live `block_kind_at` 一致。
         let kind = if lines[i].trim().is_empty() {
             IrKind::Blank

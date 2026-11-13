@@ -709,7 +709,10 @@ impl WyEditorElement {
     ) {
         let _t_row = crate::prof::begin();
         for row in &f.rows {
-            if row.kind == IrKind::Quote && !row.wrapped.is_empty() {
+            // 引号区统一画灰底带 + 左指示条：普通 Quote 行 + 引号内结构行
+            //（表格/代码/列表/标题/图片/规则，2026-11-13）。仅对已整形可见行画
+            //（带外占位 `wrapped` 空且无 `table` 的行跳过，避免画空带）。
+            if row.quoted && (row.table.is_some() || !row.wrapped.is_empty()) {
                 paint_quote_band(origin, theme, f, row, alert_kinds, window);
             }
         }

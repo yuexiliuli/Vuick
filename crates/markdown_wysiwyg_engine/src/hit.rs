@@ -163,7 +163,7 @@ pub fn caret_geometry(
             let scroll = table_hscroll_clamped(rd, host, f, r);
             return (
                 true,
-                f.padding + px(cell_x0 + cell.text_x + col_x - scroll),
+                f.padding + r.x_off + px(cell_x0 + cell.text_x + col_x - scroll),
                 ctop,
             );
         }
@@ -229,7 +229,9 @@ pub fn source_offset_at_local(
                     return host.caret();
                 };
                 let scroll = table_hscroll_clamped(rd, host, frame, r);
-                let rel_x = (f32::from(p.x) - f32::from(frame.padding) + scroll).max(0.);
+                let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off)
+                    + scroll)
+                    .max(0.);
                 let cell_ix =
                     table_cell_index(&t.widths, rel_x).unwrap_or(t.widths.len().saturating_sub(1));
                 let Some(cell) = row_l.cells.get(cell_ix) else {
@@ -1006,7 +1008,11 @@ pub fn table_hscroll_geo(
     row: &ShapedRow,
 ) -> Option<(f32, f32, f32, f32, f32)> {
     let t = row.table.as_ref()?;
-    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+    // 表格内容左缘 = 内容盒左缘 + 行 `x_off`（引号内表格缩进）；视口与滚动条
+    // 均以该左缘为准，保证：滚动条对齐表格边缘、max_scroll 含右缘可达、内容
+    // 遮罩不盖住引号竖条（2026-11-13，真机复查 #1/#2/#3）。
+    let x_off = f32::from(row.x_off);
+    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2. - x_off).max(1.);
     let max_w = t.total_w.max(1.);
     let max_scroll = (max_w - viewport).max(0.);
     let scroll = rd
@@ -1023,7 +1029,7 @@ pub fn table_hscroll_geo(
     } else {
         0.
     };
-    let bar_x = f32::from(f.padding);
+    let bar_x = f32::from(f.padding) + x_off;
     let bar_w = viewport.max(1.);
     let thumb_w = (bar_w * viewport / max_w)
         .max(config::layout::CODE_HSCROLL_THUMB_MIN)

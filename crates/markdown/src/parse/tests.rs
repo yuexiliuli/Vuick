@@ -1894,4 +1894,103 @@ mod dt {
         let from_rows = citation_index_from_rows(&rows);
         assert_eq!(idx, from_rows, "scan_citations 应与全量行推导一致");
     }
+
+    /// 引号区内块级结构解析（2026-11-13）：表格/围栏/列表/标题/分隔线在 `>` 引用内
+    /// 被解析为对应结构块并携带 `> ` 前缀字节偏移；纯文本与空 `>` 行仍为 Quote。
+    #[test]
+    fn quoted_region_parses_nested_blocks() {
+        // 用户样例：引用内表格（整块 3 行 → 1 个 Table 行）
+        let rows = parse_to_rows(
+            "> | 方案 | 做法 |\n> |---|---|\n> | 一 | 纯 Python |\n> 最终链路 **粗体**",
+        );
+        assert_eq!(rows.len(), 2, "表格整块 + 尾随一句");
+        assert_eq!(rows[0].kind, RowKind::Table);
+        assert_eq!(rows[0].quoted.as_deref(), Some(&[2usize, 2][..]));
+        let t = rows[0].table().cloned().expect("表格块应带 payload");
+        assert_eq!(
+            t.header,
+            vec![SharedString::from("方案"), SharedString::from("做法")]
+        );
+        assert_eq!(
+            t.rows,
+            vec![vec![SharedString::from("一"), SharedString::from("纯 Python")]]
+        );
+        assert_eq!(rows[0].src_line, 0, "表格块 src_line = 表头行");
+        assert_eq!(rows[1].kind, RowKind::Quote);
+        assert!(rows[1].text.as_ref().contains("最终链路"));
+        assert!(rows[1].text.as_ref().contains("粗体"), "行内记号仍解析");
+
+        // 列表 / 标题 / 分隔线 / 纯文本
+        let rows = parse_to_rows("> - 列表项\n> # 标题\n> ---\n> 纯文本");
+        assert_eq!(rows[0].kind, RowKind::Bullet);
+        assert_eq!(rows[0].quoted.as_deref(), Some(&[2usize][..]));
+        assert_eq!(rows[0].text.as_ref(), "列表项");
+        assert_eq!(rows[1].kind, RowKind::Heading(1));
+        assert_eq!(rows[1].quoted.as_deref(), Some(&[2usize][..]));
+        assert_eq!(rows[2].kind, RowKind::Rule);
+        assert_eq!(rows[2].quoted.as_deref(), Some(&[2usize][..]));
+        assert_eq!(rows[3].kind, RowKind::Quote);
+        assert_eq!(rows[3].text.as_ref(), "纯文本");
+
+        // 代码围栏（引用内）
+        let rows = parse_to_rows("> ```rs\n> let a = 1;\n> ```");
+        assert_eq!(rows[0].kind, RowKind::Code);
+        assert_eq!(rows[0].code_language(), Some("rs"));
+        assert_eq!(rows[0].quoted.as_deref(), Some(&[2usize][..]));
+
+        // 空 `> ` 行保留 Quote（灰带连续）
+        let empty = parse_to_rows("> 说明\n> ");
+        assert_eq!(empty.len(), 2);
+        assert_eq!(empty[1].kind, RowKind::Quote);
+
+        // 嵌套 `>> `（正规格）扁平为深层引述；`>  >`（双空格）边缘不 panic
+        let deep = parse_to_rows("> > 深层");
+        assert_eq!(deep[0].kind, RowKind::Quote);
+        assert_eq!(deep[0].text.as_ref(), "深层");
+        let edge = parse_to_rows(">  > 深度");
+        assert_eq!(edge[0].kind, RowKind::Quote, "双空格边缘不 panic、仍为引述");
+
+        // 混合区：引号区内表格与段落交叠，块按序产出
+        let rows = parse_to_rows("> 说明\n> | a | b |\n> | - | - |\n> | 1 | 2 |\n> 收尾");
+        assert_eq!(rows.len(), 3, "说明 + 表格 + 收尾");
+        assert_eq!(rows[0].kind, RowKind::Quote);
+        assert_eq!(rows[1].kind, RowKind::Table);
+        assert_eq!(rows[2].kind, RowKind::Quote);
+
+        // 顶层非引用行为不变（无 quoted）
+        let rows = parse_to_rows("| a | b |\n| - | - |\n| 1 | 2 |");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, RowKind::Table);
+        assert_eq!(rows[0].quoted, None);
+    }
+
+    /// 引用内多行块（引号表格）的窗口物化一致：任一 `[lo,hi]` 窗口重解析
+    /// 行数必须 == 块数（`parse_block_window` 不变式；防索引漂移）。
+    #[test]
+    fn quoted_table_window_blocks_consistent() {
+        let src = "> 说明\n> | a | b |\n> | - | - |\n> | 1 | 2 |\n> | 3 | 4 |\n> 收尾\n尾\n";
+        let index = scan_blocks(src);
+        let n = index.blocks.len();
+        assert!(n >= 3, "应有引述+表格+段等块，得 {n}");
+        for lo in 0..n {
+            for hi in lo..n {
+                let rows = parse_block_window(src, &index, lo, hi);
+                assert_eq!(
+                    rows.len(),
+                    hi - lo + 1,
+                    "window [{lo},{hi}]：窗口重解析行数应 == 块数"
+                );
+            }
+        }
+        // Rope 路径同口径。
+        let rope = ropey::Rope::from(src);
+        let rindex = crate::markdown::parse::scan_blocks_rope(&rope);
+        let n = rindex.blocks.len();
+        for lo in 0..n {
+            for hi in lo..n {
+                let rows = parse_block_window_rope(&rope, &rindex, lo, hi);
+                assert_eq!(rows.len(), hi - lo + 1, "rope window [{lo},{hi}] 行数应 == 块数");
+            }
+        }
+    }
 }

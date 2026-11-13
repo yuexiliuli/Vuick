@@ -12,6 +12,7 @@ use gpui::{Image, SharedString};
 use regex::Regex;
 
 use super::cells;
+use super::inline_style::blockquote_prefix;
 
 /// 样式段列表：`(字节区间, 样式类别)`（行内解析的通用产物）。
 pub(crate) type StyledRuns = Vec<(Range<usize>, RunKind)>;
@@ -149,6 +150,8 @@ pub struct Row {
     /// 注释**定义**标记：`(字节区间, 注记号)`（EPUB「注释」章 `p.note` 的 `[!n]`，
     /// 逆跳到文内对应位置用）。显示成 `[n]`（`!` 已剥掉）。
     pub note_defs: Vec<(Range<usize>, usize)>,
+    /// 每个内容行的 `>` 前缀源字节偏移（暂无用途，后续阶段用）。
+    pub quoted: Option<Vec<usize>>,
 }
 
 impl Row {
@@ -168,6 +171,7 @@ impl Row {
             align: None,
             notes: Vec::new(),
             note_defs: Vec::new(),
+            quoted: None,
         }
     }
 
@@ -207,6 +211,7 @@ impl Row {
             align: None,
             notes: Vec::new(),
             note_defs: Vec::new(),
+            quoted: None,
         }
     }
 
@@ -222,6 +227,7 @@ impl Row {
             align: None,
             notes: Vec::new(),
             note_defs: Vec::new(),
+            quoted: None,
         }
     }
 
@@ -242,6 +248,7 @@ impl Row {
             align: None,
             notes: Vec::new(),
             note_defs: Vec::new(),
+            quoted: None,
         }
     }
 
@@ -872,6 +879,170 @@ pub fn parse_image_line(t: &str) -> Option<(String, String)> {
     Some((r.alt.to_string(), r.src.to_string()))
 }
 
+/// 引号区：从 `region`（首个元素是 `>` 开头行）收集连续 `>` 行成引号区，
+/// 逐行用 [`blockquote_prefix`] 剥掉 `>` 前缀（含其后至多一个空格 + 前导空白），
+/// 记录每行「正文起点」相对真实源行的字节偏移，然后交给 [`parse_rows_inside`]
+/// 对区内内容递归子分类（表格/围栏/列表/标题/分隔线/图片；其余降级 [`RowKind::Quote`]）。
+/// 返回（引号区内全部渲染行，消费的源码行数）。
+fn parse_quote_region(region: &[&str], base: usize) -> (Vec<Row>, usize) {
+    let mut j = 0;
+    while j < region.len() && region[j].trim_start().starts_with('>') {
+        j += 1;
+    }
+    let mut body: Vec<&str> = Vec::with_capacity(j);
+    let mut offs: Vec<usize> = Vec::with_capacity(j);
+    for raw in &region[..j] {
+        let raw = raw.trim_end_matches('\r');
+        match blockquote_prefix(raw) {
+            Some(p) => {
+                let body0 = &raw[p..];
+                let b = body0.trim_start();
+                offs.push(p + (body0.len() - b.len()));
+                body.push(b);
+            }
+            None => {
+                offs.push(0);
+                body.push(raw);
+            }
+        }
+    }
+    parse_rows_inside(&body, &offs, base)
+}
+
+/// 解析引号区内容（剥过 `>` 前缀的 body 行），复用与顶层 [`parse_to_rows`]
+/// **完全一致**的判定顺序（围栏/空行/标题/残留引述/列表/分隔线/图片/表格/段落），
+/// 保证块边界与 [`super::blocks::classify_block`] 严格一致（窗口物化不变式）。
+///
+/// - 结构与顶层同名（`Table`/`Code`/`Bullet`/`Heading(n)`/`Rule`/`Image`），并携带
+///   `quoted`：每个被覆盖内容行的 `>` 前缀源字节偏移（单行块 = 1 元素）。
+/// - 非结构内容行（含空行）降级为 [`RowKind::Quote`]，保持引号灰带连续。
+fn parse_rows_inside(body: &[&str], offs: &[usize], base: usize) -> (Vec<Row>, usize) {
+    let mut rows = Vec::new();
+    let mut idx = 0usize;
+    while idx < body.len() {
+        let row_abs = base + idx;
+        let (align, line) = strip_align_directive(body[idx]);
+        let t = line.trim_start();
+        // 栅栏开头：收集到同字符闭合行之间的所有行，折叠成一个 Code 渲染行
+        if let Some((fc, _)) = fence_len(t) {
+            let language = fence_language(t).map(|s| s.into());
+            let mut code_lines = Vec::new();
+            let mut content_offs = Vec::new();
+            idx += 1;
+            while idx < body.len() {
+                let l = body[idx];
+                if let Some((c, _)) = fence_len(l.trim_start())
+                    && c == fc {
+                    idx += 1;
+                    break;
+                }
+                code_lines.push(SharedString::from(l));
+                content_offs.push(offs[idx]);
+                idx += 1;
+            }
+            let mut row = Row::code_block(code_lines, language).with_line(row_abs);
+            row.quoted = Some(content_offs);
+            rows.push(row);
+            continue;
+        }
+        if t.is_empty() {
+            rows.push(Row::new("", RowKind::Quote, Vec::new(), None).with_line(row_abs));
+            idx += 1;
+            continue;
+        }
+        // 标题：`#{1,6} ` 后跟内容
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hashes) && t.len() > hashes {
+            let (raw, runs) = inline_style(t[hashes..].trim_start());
+            let (text, runs, notes, note_defs) = extract_notes(raw, runs);
+            let mut row = Row::new(
+                text.as_ref(),
+                RowKind::Heading(hashes as u8),
+                runs,
+                None,
+            )
+            .with_line(row_abs)
+            .with_format(align, notes, note_defs);
+            row.quoted = Some(vec![offs[idx]]);
+            rows.push(row);
+            idx += 1;
+            continue;
+        }
+        // 残留 `>`（如 `>  >` 双空格剥后仍以 `>` 开头）：按单行引述处理，
+        // 剥前缀口径与 `text_segment(Quote)` 一致（byte_map 对齐）。
+        if t.starts_with('>') {
+            let (content_align, rest) = strip_align_directive(t.trim_start_matches('>').trim_start());
+            let align = content_align.or(align);
+            let (raw, runs) = inline_style(rest);
+            let (text, runs, notes, note_defs) = extract_notes(raw, runs);
+            rows.push(
+                Row::new(text.as_ref(), RowKind::Quote, runs, None)
+                    .with_line(row_abs)
+                    .with_format(align, notes, note_defs),
+            );
+            idx += 1;
+            continue;
+        }
+        // 列表项：`- ` / `* ` / `+ ` / `1. ` / 任务列表
+        if let Some((prefix, content)) = list_prefix(t) {
+            let (content_align, content) = strip_align_directive(content);
+            let align = content_align.or(align);
+            let (raw, runs) = inline_style(content);
+            let (text, runs, notes, note_defs) = extract_notes(raw, runs);
+            let mut row = Row::new(
+                text.as_ref(),
+                RowKind::Bullet,
+                runs,
+                Some(prefix.clone()),
+            )
+            .with_line(row_abs)
+            .with_format(align, notes, note_defs);
+            row.quoted = Some(vec![offs[idx]]);
+            rows.push(row);
+            idx += 1;
+            continue;
+        }
+        // 水平分隔线
+        if is_rule(t) {
+            let mut row = Row::new("", RowKind::Rule, Vec::new(), None).with_line(row_abs);
+            row.quoted = Some(vec![offs[idx]]);
+            rows.push(row);
+            idx += 1;
+            continue;
+        }
+        // 独立图片行：`![alt](src)` 整行占位
+        if let Some((alt, src)) = parse_image_line(t) {
+            let mut row = Row::new_image(&alt, &src).with_line(row_abs);
+            row.quoted = Some(vec![offs[idx]]);
+            rows.push(row);
+            idx += 1;
+            continue;
+        }
+        // 表格：当前行是表头、下一行是分隔行（结构块优先于表格，故放在最后判定）
+        if let Some((table, consumed)) = try_parse_table(body, idx) {
+            let content_offs: Vec<usize> = (idx..idx + consumed)
+                .filter(|&k| k != idx + 1) // 跳过分隔行
+                .map(|k| offs[k])
+                .collect();
+            let mut row = Row::with_table(table).with_line(row_abs);
+            row.quoted = Some(content_offs);
+            rows.push(row);
+            idx += consumed;
+            continue;
+        }
+        // 段落：引号区内降级为 Quote
+        let (raw, runs) = inline_style(trim_paragraph(line));
+        let (text, runs, notes, note_defs) = extract_notes(raw, runs);
+        rows.push(
+            Row::new(text.as_ref(), RowKind::Quote, runs, None)
+                .with_line(row_abs)
+                .with_format(align, notes, note_defs),
+        );
+        idx += 1;
+    }
+    (rows, idx)
+}
+
 /// 把 Markdown 源码解析成渲染行（每行一行，含行内清理）。
 pub fn parse_to_rows(src: &str) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -924,18 +1095,13 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
             idx += 1;
             continue;
         }
-        // 引述：`>` 开头
+        // 引述：`>` 开头——收集连续 `>` 行成引号区，剥前缀后对区内内容
+        // 递归子分类（表格/围栏/列表/标题/分隔线/图片/段落），让块级结构在
+        // 引用内也被解析（2026-11-13）。
         if t.starts_with('>') {
-            let (content_align, rest) = strip_align_directive(t.trim_start_matches('>').trim_start());
-            let align = content_align.or(align);
-            let (raw, runs) = inline_style(rest);
-            let (text, runs, notes, note_defs) = extract_notes(raw, runs);
-            rows.push(
-                Row::new(text.as_ref(), RowKind::Quote, runs, None)
-                    .with_line(row_start)
-                    .with_format(align, notes, note_defs),
-            );
-            idx += 1;
+            let (sub_rows, consumed) = parse_quote_region(&lines[idx..], row_start);
+            rows.extend(sub_rows);
+            idx += consumed;
             continue;
         }
         // 列表项：`- ` / `* ` / `+ ` / `1. ` / 任务列表

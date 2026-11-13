@@ -11,7 +11,8 @@ use gpui::{Image, SharedString};
 use ropey::{LineType, Rope};
 
 use super::blocks::{
-    classify_block, scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg, Toc, TocSeg,
+    classify_block, classify_quote_line, quote_region_body, scan_blocks, BlockIndex, BlockMeta,
+    Blocks, BlocksSeg, Toc, TocSeg,
 };
 use super::rows::{
     fence_len, inline_strip, parse_to_rows, Row, RowKind, RunKind, TableAlign, TableData,
@@ -392,6 +393,40 @@ fn scan_blocks_incremental_rope_impl(
         let t = line.trim_start();
         let raw_len = line.len() as u32;
         let blk_byte = (anchor_byte as u32).wrapping_add(cur_byte); // 文档绝对字节
+        if t.starts_with('>') {
+            // 引号区：一次收集、逐子块发射（O(L) 而非 O(L²)，2026-11-13 性能评审
+            // 修复；语义与 `scan_blocks_with_line_starts` 引号分支一致）。
+            let (body, region_len) = quote_region_body(&new_lines, idx);
+            let mut k = 0usize;
+            let mut sub_cur = cur_byte;
+            while k < body.len() {
+                let sub_row = row_start + k;
+                let c = classify_quote_line(&body, k, rebuild_toc, sub_row, &mut toc_mid);
+                let sub_line = new_lines[idx + k].trim_end_matches('\r');
+                let sub_blk_byte = (anchor_byte as u32).wrapping_add(sub_cur);
+                blocks.push(BlockMeta {
+                    src_line: sub_row as u32,
+                    byte: sub_blk_byte,
+                    kind: c.kind,
+                    raw_len: if c.kind == RowKind::Blank {
+                        0
+                    } else {
+                        sub_line.len() as u32
+                    },
+                    aux: c.aux,
+                });
+                let consumed = c.consumed.max(1);
+                for kk in 0..consumed {
+                    sub_cur = next_line_byte(&new_lines, sub_cur, idx + k + kk, region_bytes);
+                }
+                k += consumed;
+            }
+            for kk in idx..idx + region_len {
+                cur_byte = next_line_byte(&new_lines, cur_byte, kk, region_bytes);
+            }
+            idx += region_len;
+            continue;
+        }
         let c = classify_block(&new_lines, idx, t);
         if rebuild_toc
             && let RowKind::Heading(h) = c.kind
