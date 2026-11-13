@@ -1925,6 +1925,11 @@ pub fn prewarm_band(
             if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
                 #[cfg(feature = "test-mode")]
                 bump_prewarm_shapes(rd);
+                // 先 clone 落局部：`&rd.borrow().theme` 直写实参时临时 `Ref` 活到整条调用
+                // 语句结束，会跨 image 行 shape 内 `lazy_ensure_image_size` 的
+                // `rd.borrow_mut()` → `RefCell already borrowed` panic。
+                let theme = rd.borrow().theme.clone();
+                let base_font = rd.borrow().theme.font.clone();
                 let row = crate::shape::shape_docrow(
                     r,
                     rd,
@@ -1932,8 +1937,8 @@ pub fn prewarm_band(
                     window,
                     frame.width,
                     avail,
-                    &rd.borrow().theme,
-                    &rd.borrow().theme.font,
+                    &theme,
+                    &base_font,
                 );
                 if !shaped_row_has_notdef(&row) {
                     rd.borrow_mut()
@@ -2001,6 +2006,10 @@ pub fn settle_giant_blocks(
     let sk = (f32::from(frame.width).to_bits() as u64) ^ mermaid_zoom_gen(rd);
     let avail = (f32::from(frame.width) - f32::from(frame.padding) * 2.).max(1.);
     if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
+        // 同 prewarm_band：临时 `Ref` 活到整条调用结束，先 clone 落局部让借用当场 drop，
+        // 避免撞 `lazy_ensure_image_size` 的 `rd.borrow_mut()`。
+        let theme = rd.borrow().theme.clone();
+        let base_font = rd.borrow().theme.font.clone();
         let row = crate::shape::shape_docrow(
             r,
             rd,
@@ -2008,8 +2017,8 @@ pub fn settle_giant_blocks(
             window,
             frame.width,
             avail,
-            &rd.borrow().theme,
-            &rd.borrow().theme.font,
+            &theme,
+            &base_font,
         );
         let cid = block_content_id(doc, k);
         if let Ok(mut b) = frame.base.try_borrow_mut() {

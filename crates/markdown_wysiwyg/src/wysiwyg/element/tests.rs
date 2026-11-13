@@ -34,3 +34,5 @@ include!("tests/live2_edits.rs");
 include!("tests/tab.rs");
 include!("tests/p0_p1.rs");
 include!("tests/quote_blocks.rs");
+include!("tests/prewarm_band_double_borrow.rs");
+include!("tests/math_edit_enter_diag.rs");
