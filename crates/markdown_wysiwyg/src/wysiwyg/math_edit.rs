@@ -416,6 +416,11 @@ impl WyEditor {
                 gpui::div()
                     .id("wy-math-edit-editor")
                     .debug_selector(|| "wy-math-edit-editor".into())
+                    // Math 卡内层键上下文：压制外层 CONTEXT 的 enter→wysiwyg::Enter，
+                    // 把 Enter 放行给 CodeEditor 的 key_down 原样换行。不得照搬
+                    // image.rs:505 的 `on_action(Enter)` stop 形态（会吞 key_down、
+                    // 公式无法换行）；须走 `MATH_EDIT_CONTEXT` 的 NoAction 压制。
+                    .key_context(MATH_EDIT_CONTEXT)
                     .flex()
                     .h(px(element::MATH_EDIT_EDITOR_H))
                     .w_full()

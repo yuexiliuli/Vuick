@@ -456,6 +456,12 @@ pub struct WyEditor {
 /// 键上下文（Render 的 div 挂载；键位由 [`bind_keys`] 装配）。
 pub const CONTEXT: &str = "wy-editor";
 
+/// Math 卡专用键上下文（内嵌 CodeEditor 的承载体 div 挂载）：内层 context 深度优先，
+/// 把外层 `CONTEXT`（wy-editor）的 `enter → wysiwyg::Enter` 从 match_result 压制掉 →
+/// 动作层放空 → key_down 照常派发进 CodeEditor 原样换行（卡片内聚焦须经本 context，
+/// 否则 Enter 仍漏到 WY 根向文档插换行）。
+pub const MATH_EDIT_CONTEXT: &str = "wy-math-edit";
+
 macro_rules! wy_action {
     ($name:ident, $s:literal) => {
         #[derive(Clone, Debug, PartialEq)]
@@ -532,6 +538,11 @@ pub fn bind_keys(cx: &mut gpui::App) {
         KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
         // E3：Tab → 光标处插入可见缩进（`\t` 字面量，与源码编辑区同一单位）。
         KeyBinding::new("tab", Tab, Some(CONTEXT)),
+        // Math 卡（内嵌 CodeEditor）内层上下文：enter→NoAction 压制外层 CONTEXT 的
+        // enter→wysiwyg::Enter。否则动作层先命中该绑定并 stop（gpui 先动作层后
+        // key_down）→ CodeEditor 的 key_down 换行永不执行、且换行错误地插到文档。
+        // NoAction 在 match_result 里放空 → key_down 照常派发进 CodeEditor 原样换行。
+        KeyBinding::new("enter", gpui::NoAction, Some(MATH_EDIT_CONTEXT)),
     ])
 }
 
