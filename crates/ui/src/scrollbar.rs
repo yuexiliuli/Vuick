@@ -214,12 +214,25 @@ struct Geom {
 }
 
 /// 自绘滚动条。见模块文档。
+///
+/// 渐变/隐藏/增宽类参数均为构建期配置（重建即重设，无跨帧持久化需求，
+/// 与 `mode`/`axis` 同放组件本身；跨帧的拖拽/悬停/隐藏状态仍在 `UiState`）。
 pub struct Scrollbar<H: ScrollbarHandle + Clone> {
     handle: H,
     axis: ScrollbarAxis,
     mode: ScrollbarMode,
     id: ElementId,
     layout_viewport: bool,
+    /// `Auto` 空闲隐藏延时（`autohide()`，默认 2s，见 `AUTO_HIDE_IDLE`）。
+    autohide_idle: Duration,
+    /// 滑块最小长度（`thumb_min()`，默认 48px，见 `MIN_THUMB_SIZE`）。
+    min_thumb: f32,
+    /// 悬停是否保显（`hide_on_hover()`，默认 true：Auto 悬停不隐藏）。
+    hide_on_hover: bool,
+    /// 拖拽是否常显（`drag_keep_visible()`，默认 true：Auto 拖拽不隐藏）。
+    drag_keep_visible: bool,
+    /// 悬停/拖拽是否把滑块 6→8px 增宽（`auto_widen()`，默认 true）。
+    auto_widen: bool,
 }
 
 impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
@@ -233,6 +246,11 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
             mode: ScrollbarMode::Always,
             id: ElementId::CodeLocation(*caller),
             layout_viewport: false,
+            autohide_idle: AUTO_HIDE_IDLE,
+            min_thumb: MIN_THUMB_SIZE,
+            hide_on_hover: true,
+            drag_keep_visible: true,
+            auto_widen: true,
         }
     }
 
@@ -257,6 +275,49 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
         self.axis = axis;
         self
     }
+
+    /// `Auto` 模式下的空闲隐藏延时：停止滚动超过该时长即隐藏。默认 2s（保全现状）。
+    pub fn autohide(mut self, idle: Duration) -> Self {
+        self.autohide_idle = idle;
+        self
+    }
+
+    /// 滑块最小长度（px）。默认 48（保全现状）；music 自绘滚动条用 24。
+    pub fn thumb_min(mut self, px: f32) -> Self {
+        self.min_thumb = px;
+        self
+    }
+
+    /// 悬停是否保显：`true`（默认）时 Auto 悬停轨道不隐藏、`false` 时悬停只换色不保显。
+    pub fn hide_on_hover(mut self, keep: bool) -> Self {
+        self.hide_on_hover = keep;
+        self
+    }
+
+    /// 拖拽是否常显：`true`（默认）时 Auto 拖拽期间不隐藏。
+    pub fn drag_keep_visible(mut self, keep: bool) -> Self {
+        self.drag_keep_visible = keep;
+        self
+    }
+
+    /// 悬停/拖拽是否把滑块 6→8px 增宽：`true`（默认）增宽、`false` 恒 6px。
+    pub fn auto_widen(mut self, widen: bool) -> Self {
+        self.auto_widen = widen;
+        self
+    }
+
+    /// `Auto` 模式隐藏判定（纯函数，便于测试）：距上次滚动 `since_last_scroll` 超
+    /// `autohide_idle` 且（不满足保显条件）→ 隐藏。`None`（从未滚动）→ 隐藏。
+    /// 保显条件：`hide_on_hover && hovering`、`drag_keep_visible && dragging` 任一成立即不隐藏。
+    fn auto_hidden(&self, since_last_scroll: Option<Duration>, hovering: bool, dragging: bool) -> bool {
+        let Some(idle) = since_last_scroll else {
+            return true; // 从未滚动 → 隐藏
+        };
+        let over_idle = idle >= self.autohide_idle;
+        let holds = (self.hide_on_hover && hovering) || (self.drag_keep_visible && dragging);
+        over_idle && !holds
+    }
+
 
     /// 用元素自身布局边界作为视口（覆盖句柄的 `viewport_bounds`）。
     pub fn viewport_from_layout(mut self) -> Self {
@@ -322,7 +383,7 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
             offset.x.as_f32()
         }; // 向下滚 → 负
 
-        let thumb_len = (container / scroll_area * container).max(MIN_THUMB_SIZE);
+        let thumb_len = (container / scroll_area * container).max(self.min_thumb);
         let travel = (container - thumb_len).max(0.);
         let max_scroll = (scroll_area - container).max(0.);
 
@@ -337,9 +398,12 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
         // 命中/着色长度：两端各缩进 inset（与 gpui-component 一致）
         let hit_len = (thumb_end - thumb_start - THUMB_INSET * 2.).max(0.);
 
-        // 滑块粗细随悬停/拖拽插值伸缩。
-        let fill_w =
-            px(THUMB_WIDTH + (THUMB_ACTIVE_WIDTH - THUMB_WIDTH) * present.clamp(0., 1.));
+        // 滑块粗细随悬停/拖拽插值伸缩（`auto_widen=false` 时恒 6px，不随插值增宽）。
+        let fill_w = if self.auto_widen {
+            px(THUMB_WIDTH + (THUMB_ACTIVE_WIDTH - THUMB_WIDTH) * present.clamp(0., 1.))
+        } else {
+            px(THUMB_WIDTH)
+        };
         // 命中/着色区锚定 rail 内缘（含 inset）：
         // - 垂直：右对齐到 track.right()-inset，向**左**延展（滑块在轨道内）。
         // - 水平：下对齐到 track.bottom()-inset，向**上**延展。
@@ -624,11 +688,11 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
                 last_scroll: s.last_scroll,
             }
         };
+        // Auto 隐藏判定收敛到 `auto_hidden`（autohide/hide_on_hover/drag_keep_visible 参数
+        // 生效，默认值 = 现状）；Always 仍走持久化的 `st.hidden`，逐位不变。
+        let dragging = state.read(cx).drag_grab.is_some();
         let hidden = if self.mode == ScrollbarMode::Auto {
-            match st.last_scroll {
-                Some(ts) => ts.elapsed() >= AUTO_HIDE_IDLE && !st.hovering,
-                None => true,
-            }
+            self.auto_hidden(st.last_scroll.map(|ts| ts.elapsed()), st.hovering, dragging)
         } else {
             st.hidden
         };
@@ -942,5 +1006,125 @@ mod tests {
             gh.thumb_fill.top() >= gh.track.top() - px(0.5),
             "水平滑块着色区应位于轨道附近"
         );
+    }
+
+    // —— Auto 可配置参数：先红后绿（K144），默认值必须保全现状 ——
+
+    /// 构造一个内容超长、可滚动的竖直 Auto 滚动条（几何相关测试共用）。
+    fn auto_scrollbar(h: &FakeHandle) -> Scrollbar<FakeHandle> {
+        Scrollbar::vertical(h).mode(ScrollbarMode::Auto)
+    }
+
+    #[test]
+    fn autohide_delay_parameter_takes_effect() {
+        // 默认 2s：滚动后 0.5s 不隐藏、3s 隐藏；从未滚动 → 隐藏。
+        let h = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(200.), px(1600.)),
+        };
+        let sb = auto_scrollbar(&h);
+        assert!(!sb.auto_hidden(Some(Duration::from_millis(500)), false, false), "滚动刚发生不隐藏");
+        assert!(sb.auto_hidden(Some(Duration::from_secs(3)), false, false), "超过默认 2s 隐藏");
+        assert!(sb.auto_hidden(None, false, false), "从未滚动即隐藏");
+        // autohide(3s)：2s 时仍不隐藏、3s 隐藏 → 参数生效。
+        let sb3 = sb.autohide(Duration::from_secs(3));
+        assert!(!sb3.auto_hidden(Some(Duration::from_secs(2)), false, false), "3s 延时下 2s 仍显示");
+        assert!(sb3.auto_hidden(Some(Duration::from_secs(3)), false, false), "3s 延时下 3s 隐藏");
+    }
+
+    #[test]
+    fn drag_keeps_visible_during_drag() {
+        let h = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(200.), px(1600.)),
+        };
+        let sb = auto_scrollbar(&h);
+        // 默认 drag_keep_visible=true：已过 idle 但正拖拽 → 不隐藏。
+        assert!(!sb.auto_hidden(Some(Duration::from_secs(10)), false, true), "拖拽期间不隐藏");
+        // drag_keep_visible(false)：拖拽不保显 → 仍隐藏。
+        let sb_off = sb.drag_keep_visible(false);
+        assert!(sb_off.auto_hidden(Some(Duration::from_secs(10)), false, true), "关闭拖拽保显后照常隐藏");
+    }
+
+    #[test]
+    fn hide_on_hover_false_does_not_keep_visible_on_hover() {
+        let h = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(200.), px(1600.)),
+        };
+        let sb = auto_scrollbar(&h);
+        // 默认 hide_on_hover=true：已过 idle 但正悬停 → 不隐藏（hover 保显）。
+        assert!(!sb.auto_hidden(Some(Duration::from_secs(10)), true, false), "默认 hover 保显");
+        // hide_on_hover(false)：悬停不再保显 → 隐藏。
+        let sb_off = sb.hide_on_hover(false);
+        assert!(sb_off.auto_hidden(Some(Duration::from_secs(10)), true, false), "关闭保显后悬停也隐藏");
+        // 未过 idle 不隐藏（对照）。
+        assert!(!sb_off.auto_hidden(Some(Duration::from_millis(10)), true, false), "未过 idle 不隐藏");
+    }
+
+    #[test]
+    fn thumb_min_parameter_takes_effect() {
+        // 小视口 + 短内容：raw 命中长 = 100/300*100 ≈ 33.3 < 默认 min 48 → 被钳到 48。
+        let vp_small = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.)));
+        let h = FakeHandle {
+            viewport: vp_small,
+            offset: point(px(0.), px(0.)),
+            content: size(px(100.), px(300.)),
+        };
+        // 默认 48：geom.thumb_len 是两端缩进 inset 后的命中长 → + 2*inset = 原始滑块长 = 48。
+        let g = Scrollbar::vertical(&h).geom(vp_small, 0.).expect("仍超长");
+        assert!(
+            (g.thumb_len + 2.0 * THUMB_INSET - 48.).abs() < 0.001,
+            "默认最小滑块 48 生效"
+        );
+        // thumb_min(24)：33.3 > 24 → 不再钳，滑块明显更短。
+        let g2 = Scrollbar::vertical(&h).thumb_min(24.).geom(vp_small, 0.).expect("仍超长");
+        assert!(
+            g2.thumb_len + 2.0 * THUMB_INSET < 40.,
+            "thumb_min=24 允许更短滑块"
+        );
+        // 断言几何仍不越视口。
+        assert!(g2.thumb_fill.bottom() <= vp_small.bottom() + px(0.5));
+    }
+
+    #[test]
+    fn auto_widen_false_keeps_rest_width_on_active() {
+        let h = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(200.), px(1600.)),
+        };
+        let sb = Scrollbar::vertical(&h).auto_widen(false);
+        let rest = sb.geom(vp(), 0.).expect("仍超长");
+        let hot = sb.geom(vp(), 1.).expect("仍超长");
+        assert_eq!(rest.thumb_fill.size.width, px(THUMB_WIDTH), "常态 6px");
+        assert_eq!(
+            hot.thumb_fill.size.width,
+            px(THUMB_WIDTH),
+            "auto_widen=false 激活不增宽（保持 6px）"
+        );
+        // 对照：默认激活加宽到 8px（现状保全）。
+        let dflt = Scrollbar::vertical(&h).geom(vp(), 1.).expect("仍超长");
+        assert_eq!(dflt.thumb_fill.size.width, px(THUMB_ACTIVE_WIDTH), "默认激活加宽 8px");
+    }
+
+    /// `auto_hidden` 在 `Since::Before(None)` 等形态下对 Always 模式不定义——此测试只核对
+    /// 默认构造的 Auto 参数值（默认保全现状的看门狗）。
+    #[test]
+    fn auto_params_default_preserve_current_behavior() {
+        let h = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(200.), px(1600.)),
+        };
+        let sb = auto_scrollbar(&h);
+        assert_eq!(sb.autohide_idle, AUTO_HIDE_IDLE, "默认 2s");
+        assert_eq!(sb.min_thumb, MIN_THUMB_SIZE, "默认 48");
+        assert!(sb.hide_on_hover, "默认 hover 保显");
+        assert!(sb.drag_keep_visible, "默认拖拽常显");
+        assert!(sb.auto_widen, "默认激活增宽");
     }
 }
