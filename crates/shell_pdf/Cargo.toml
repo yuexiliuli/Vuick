@@ -14,6 +14,9 @@ config = { path = "../config" }
 base = { path = "../base" }
 # 宿主模型（AppModel / PdfBookmark / MediaReader）。
 shell_core = { path = "../shell_core" }
+# 通用「路径键 + 进程缓存 + 原子写」JSON 存储层（path_key_json_store：书签/阅读进度
+# 共用的持久化骨架；shell_core 已依赖 session_store，本边无新增传递包）。
+session_store = { path = "../session_store" }
 # PDF 栅格化视图实体（PdfViewer / RecolorParams / is_writeback_busy_error）。
 pdf = { path = "../pdf" }
 # 书签存储 / 背景偏好 JSON 读写（手写 serde_json::Value，不引入 serde derive）。

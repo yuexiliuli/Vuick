@@ -11,6 +11,7 @@
 //!
 //! 依赖只重分配 workspace 既有包：`gpui` / `ui` / `base` / `serde_json`。
 
+pub mod path_key_json_store;
 pub mod reading_progress;
 pub mod recent_panel;
 pub mod session;

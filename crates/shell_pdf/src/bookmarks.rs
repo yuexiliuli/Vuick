@@ -13,10 +13,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::OnceLock;
 
 use config::user::UserPrefs;
 use serde_json::{Value, json};
+use session_store::path_key_json_store::{Cache, PathKeyJsonStore};
 use shell_core::{AppModel, PdfBookmark};
 
 /// 书签存储文件路径 = 配置父目录 / `pdf_bookmarks.json`（`%APPDATA%\gpui-editor\`）。
@@ -27,13 +28,11 @@ pub fn bookmarks_path() -> PathBuf {
     }
 }
 
-/// 规范化路径键：先 `canonicalize`（消 `.`/`..`、接真实盘符大小写形态），失败回退
-/// 原样字符串。同一文件的后续打开 / 绝对化写法都落到同一键。
+/// 规范化路径键：统一收口于 [`session_store::path_key_json_store::normalize_key`]
+/// （canonicalize + 失败回退原样），与 `reading_progress::normalize_key` 规则逐字符一致。
 /// `pub`：经 `shell::app` 重导出供 `tests/pdf.rs` 书签盘上读出断言（§8.6 外提清单）。
 pub fn normalize_key(path: &Path) -> String {
-    std::fs::canonicalize(path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+    session_store::path_key_json_store::normalize_key(path)
 }
 
 /// 序列化为 JSON 对象（纯函数，供 [`save`] / 测试）。空 map 也落一个合法空对象。
@@ -95,44 +94,28 @@ pub fn from_json(v: &Value) -> HashMap<String, Vec<PdfBookmark>> {
 /// 从磁盘加载书签存储（缺失 / 损坏 → 空 map）。
 /// `pub`：经 `shell::app` 重导出供 `tests/pdf.rs` 书签盘上读出断言（§8.6 外提清单）。
 pub fn load() -> HashMap<String, Vec<PdfBookmark>> {
-    let Ok(text) = std::fs::read_to_string(bookmarks_path()) else {
-        return HashMap::new();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return HashMap::new();
-    };
-    from_json(&v)
+    store().load()
 }
 
-/// A4 进程级书签缓存（`OnceLock<Mutex<Option<_>>>`）：每窗构造都读盘是浪费（构造链
-/// `new_impl` → `bookmarks::load()`），首次构造读一次、后续复用；`save` 同步回写
-/// 缓存 → 进程内新窗口读到最新书签（本应用单进程，无外部改写，安全）。
-static BOOKMARK_CACHE: OnceLock<StdMutex<Option<HashMap<String, Vec<PdfBookmark>>>>> =
-    OnceLock::new();
+/// A4 进程级书签缓存（路径守卫见 [`session_store::path_key_json_store::Cache`]）：每窗构造
+/// 都读盘是浪费（构造链 `new_impl` → `bookmarks::load_cached()`），首次构造读一次、后续
+/// 复用；`save` 同步回写缓存 → 进程内新窗口读到最新书签（本应用单进程，无外部改写，安全）。
+static BOOKMARK_CACHE: Cache<HashMap<String, Vec<PdfBookmark>>> = OnceLock::new();
 
-fn bookmark_cache() -> &'static StdMutex<Option<HashMap<String, Vec<PdfBookmark>>>> {
-    BOOKMARK_CACHE.get_or_init(|| StdMutex::new(None))
+/// 绑定书签存根（路径 = `bookmarks_path()` + 本模块缓存 + 编解码），读写、缓存全部走共享层
+/// （语义与旧实现逐字一致：缺失/损坏 → 空、写败静默、成功回写缓存）。
+fn store() -> PathKeyJsonStore<HashMap<String, Vec<PdfBookmark>>> {
+    PathKeyJsonStore::new(bookmarks_path(), &BOOKMARK_CACHE, from_json, to_json)
 }
 
 /// 取书签（进程级缓存一次读盘；`save` 更新缓存保证进程内一致）。
 pub fn load_cached() -> HashMap<String, Vec<PdfBookmark>> {
-    let mut guard = bookmark_cache().lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(v) = guard.as_ref() {
-        return v.clone();
-    }
-    let v = load();
-    *guard = Some(v.clone());
-    v
+    store().load_cached()
 }
 
 /// 原子落盘整份书签存储；A4：先写好盘面再回写缓存（缓存镜像盘面）。
 pub fn save(map: &HashMap<String, Vec<PdfBookmark>>) {
-    let ok = base::util::atomic_write(bookmarks_path(), to_json(map).to_string().as_bytes()).is_ok();
-    if ok {
-        if let Ok(mut guard) = bookmark_cache().lock() {
-            *guard = Some(map.clone());
-        }
-    }
+    store().save(map);
 }
 
 /// 某路径当前内存态的书签列表（无 → `None`）。模型读数（宿主 `EditorApp` 薄适配转发；

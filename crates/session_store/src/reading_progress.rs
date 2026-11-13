@@ -12,10 +12,12 @@
 //!   目录互不串。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::path::Path;
+use std::sync::OnceLock;
 
 use serde_json::{Value, json};
+
+use crate::path_key_json_store::{self, Cache, PathKeyJsonStore};
 
 /// 一种文件类型的「阅读进度」（保存源行 / 页；重开时恢复到该位置）。
 #[derive(Clone, Debug, PartialEq)]
@@ -81,12 +83,10 @@ impl ReadingProgress {
     }
 }
 
-/// 规范化路径键：先 `canonicalize`（消 `.`/`..`、接真实盘符大小写形态），失败回退原样。
-/// 与 `shell_pdf::bookmarks::normalize_key` 同款姿势（镜像 :33-37）。
+/// 规范化路径键：统一收口于 [`path_key_json_store::normalize_key`]（canonicalize + 失败回退
+/// 原样），与 `shell_pdf::bookmarks::normalize_key` 规则逐字符一致。
 pub fn normalize_key(path: &Path) -> String {
-    std::fs::canonicalize(path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+    path_key_json_store::normalize_key(path)
 }
 
 /// 序列化为整份 JSON 对象（`{ 规范化路径 → ReadingProgress }`；空 map 也落合法空对象）。
@@ -112,53 +112,40 @@ pub fn from_json(v: &Value) -> HashMap<String, ReadingProgress> {
     out
 }
 
-/// 从磁盘加载整份阅读进度（`progress_path` 缺失 / JSON 损坏 → 空 map）。
-pub fn load(progress_path: &Path) -> HashMap<String, ReadingProgress> {
-    let Ok(text) = std::fs::read_to_string(progress_path) else {
-        return HashMap::new();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return HashMap::new();
-    };
-    from_json(&v)
+/// A4 进程级缓存（路径守卫见 [`path_key_json_store::Cache`]）：条目带路径守卫——只有缓存
+/// 路径与本次请求一致才复用（防测试/外部换路径读到陈旧盘面）；`save` 成功同步回写缓存。
+static PROGRESS_CACHE: Cache<HashMap<String, ReadingProgress>> = OnceLock::new();
+
+/// 绑定本次存根（路径 + 本模块缓存 + 编解码），读写、缓存全部走共享层（语义与旧实现逐字
+/// 一致：缺失/损坏 → 空、写败静默、成功回写缓存）。
+fn store(progress_path: &Path) -> PathKeyJsonStore<HashMap<String, ReadingProgress>> {
+    PathKeyJsonStore::new(
+        progress_path.to_path_buf(),
+        &PROGRESS_CACHE,
+        from_json,
+        to_json,
+    )
 }
 
-/// A4 进程级缓存（`OnceLock<Mutex<Option<(PathBuf, map)>>>`）：条目带**路径守卫**——
-/// 只有缓存路径与本次请求一致才复用（防测试/外部换路径读到陈旧盘面）；`save` 成功
-/// 同步回写缓存 → 进程内后续读取拿到最新盘面（本应用单进程、无外部改写，安全）。
-static PROGRESS_CACHE: OnceLock<StdMutex<Option<(PathBuf, HashMap<String, ReadingProgress>)>>> =
-    OnceLock::new();
-
-fn progress_cache() -> &'static StdMutex<Option<(PathBuf, HashMap<String, ReadingProgress>)>> {
-    PROGRESS_CACHE.get_or_init(|| StdMutex::new(None))
+/// 从磁盘加载整份阅读进度（`progress_path` 缺失 / JSON 损坏 → 空 map）。
+pub fn load(progress_path: &Path) -> HashMap<String, ReadingProgress> {
+    store(progress_path).load()
 }
 
 /// 取整份阅读进度（进程级缓存一次读盘；`save` 更新缓存保证进程内一致）。
 pub fn load_cached(progress_path: &Path) -> HashMap<String, ReadingProgress> {
-    let mut guard = progress_cache().lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((p, v)) = guard.as_ref()
-        && p.as_path() == progress_path
-    {
-        return v.clone();
-    }
-    let v = load(progress_path);
-    *guard = Some((progress_path.to_path_buf(), v.clone()));
-    v
+    store(progress_path).load_cached()
 }
 
 /// 原子落盘整份阅读进度；A4：先写好盘面再回写缓存（缓存镜像盘面，失败不更新）。
 pub fn save(progress_path: &Path, map: &HashMap<String, ReadingProgress>) {
-    let ok = base::util::atomic_write(progress_path, to_json(map).to_string().as_bytes()).is_ok();
-    if ok {
-        if let Ok(mut guard) = progress_cache().lock() {
-            *guard = Some((progress_path.to_path_buf(), map.clone()));
-        }
-    }
+    store(progress_path).save(map);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// 进程内唯一临时存储路径（每次 save/load 用例一张独立盘面，互不串缓存）。
