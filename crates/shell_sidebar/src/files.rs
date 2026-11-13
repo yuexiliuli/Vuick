@@ -69,52 +69,36 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
 
     /// 未打开文件夹 / 根路径失效的空态：文件夹图标 + 文案 + 可点「打开文件夹…」。
     /// 点击经宿主服务 `sidebar_open_folder_dialog`（宿主 file_ops 能力）。
+    /// 结构/样式收编进 `ui::empty_state::compact_empty_state_with_action`（与 toc/search
+    /// 同统一组件），按钮行为留在宿主（`self.listener` 反调宿主）。
     fn sidebar_files_empty(&mut self, _sb: &SidebarChromeState, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let muted = self.text_minor();
         let accent: gpui::Hsla = ui::theme::Theme::global(cx).colors.accent.into();
-        div()
-            .id("sidebar-files-empty")
-            .debug_selector(|| "sidebar-files-empty".into())
-            .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(8.))
+        let action = div()
+            .id("sidebar-files-open-btn")
+            .debug_selector(|| "sidebar-files-open-btn".into())
             .px_3()
-            .py_4()
-            .child(Icon::new(IconName::Folder).size(px(20.)).text_color(muted))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(muted)
-                    .child("未打开文件夹"),
-            )
-            .child(
-                div()
-                    .id("sidebar-files-open-btn")
-                    .debug_selector(|| "sidebar-files-open-btn".into())
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .text_size(px(12.))
-                    .text_color(accent)
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .on_click(cx.listener(
-                        |this: &mut Self, _: &gpui::ClickEvent, window, cx| {
-                            if let Some(h) = this.host_weak().upgrade() {
-                                let _ = h.update(cx, |app, cx| {
-                                    app.sidebar_open_folder_dialog(window, cx)
-                                });
-                            }
-                        },
-                    ))
-                    .child("打开文件夹…"),
-            )
-            .into_any_element()
+            .py_1()
+            .rounded_md()
+            .text_size(px(12.))
+            .text_color(accent)
+            .cursor(gpui::CursorStyle::PointingHand)
+            .on_click(cx.listener(
+                |this: &mut Self, _: &gpui::ClickEvent, window, cx| {
+                    if let Some(h) = this.host_weak().upgrade() {
+                        let _ = h.update(cx, |app, cx| {
+                            app.sidebar_open_folder_dialog(window, cx)
+                        });
+                    }
+                },
+            ))
+            .child("打开文件夹…");
+        ui::empty_state::compact_empty_state_with_action(
+            "sidebar-files-empty",
+            IconName::Folder,
+            "未打开文件夹",
+            Some(action.into_any_element()),
+            cx,
+        )
     }
 
     /// 文件树滚动容器包装：`relative` 包装层 + `overflow_y_scroll` 滚动容器 + 常显

@@ -128,15 +128,32 @@ pub fn empty_state_hero(
 
 /// 侧栏窄面板的空态占位：小号灰色图标 + 弱化文案（与正文区空态同款灰蓝视觉）。
 /// `id` 供测试与样式定位；图标复用 [`IconName`]（Fluent 1.5 线性描边，P2 统一风格）。
+/// 纯提示型空态的便捷封装（toc/搜索等调用方保持原签名零改动，见
+/// [`compact_empty_state_with_action`]）。
 pub fn compact_empty_state(
     id: &'static str,
     icon: IconName,
     text: &str,
     cx: &mut App,
 ) -> gpui::AnyElement {
+    compact_empty_state_with_action(id, icon, text, None, cx)
+}
+
+/// 侧栏窄面板的空态占位（带可选操作按钮）：小号灰色图标 + 弱化文案 + 可选追加的
+/// 操作按钮（如文件树「打开文件夹…」）。样式与 [`compact_empty_state`] 完全一致，
+/// 仅多渲染 `action`（追加在文案之后）；`action` 由调用方自建（含宿主回调，行为留在
+/// 宿主），传 `None` 退化为纯提示型空态（= [`compact_empty_state`]）。
+/// `id` 供测试与样式定位；图标复用 [`IconName`]（Fluent 1.5 线性描边，P2 统一风格）。
+pub fn compact_empty_state_with_action(
+    id: &'static str,
+    icon: IconName,
+    text: &str,
+    action: Option<gpui::AnyElement>,
+    cx: &mut App,
+) -> gpui::AnyElement {
     let c = Theme::global(cx).colors;
     let muted: Hsla = c.fg_muted.into();
-    div()
+    let mut root = div()
         .id(id)
         .debug_selector(move || id.to_string())
         .flex_1()
@@ -156,8 +173,11 @@ pub fn compact_empty_state(
                 .text_size(px(12.))
                 .text_color(muted)
                 .child(text.to_string()),
-        )
-        .into_any_element()
+        );
+    if let Some(a) = action {
+        root = root.child(a);
+    }
+    root.into_any_element()
 }
 
 #[cfg(test)]
@@ -176,6 +196,19 @@ mod tests {
                 .child(empty_illustration())
                 .child(empty_state_hero("主", "副", None, Some("双击新建文件"), None, cx))
                 .child(compact_empty_state("compact-test", IconName::Search, "无结果", cx))
+                .child(compact_empty_state_with_action(
+                    "compact-action-test",
+                    IconName::Folder,
+                    "未打开文件夹",
+                    Some(
+                        div()
+                            .id("compact-action-btn")
+                            .debug_selector(|| "compact-action-btn".into())
+                            .child("打开文件夹…")
+                            .into_any_element(),
+                    ),
+                    cx,
+                ))
         }
     }
 
@@ -223,6 +256,14 @@ mod tests {
             assert!(
                 cx.debug_bounds("compact-test").is_some(),
                 "紧凑空态应渲染（{dark}）"
+            );
+            assert!(
+                cx.debug_bounds("compact-action-test").is_some(),
+                "带 action 的紧凑空态应渲染（{dark}）"
+            );
+            assert!(
+                cx.debug_bounds("compact-action-btn").is_some(),
+                "action 按钮应在紧凑空态中渲染（{dark}）"
             );
         }
     }
