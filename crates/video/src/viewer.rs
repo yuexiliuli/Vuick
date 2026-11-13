@@ -53,11 +53,11 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Anchor, AnimationExt, App, Bounds, Context, CursorStyle, DefiniteLength, Edges, Hsla,
+    Anchor, AnimationExt, App, Bounds, Context, CursorStyle, Edges, Hsla,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle,
-    ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledImage, Window, anchored, canvas,
-    deferred, div, img, point, px, prelude::FluentBuilder as _,
+    ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledImage, Window, anchored,
+    deferred, div, img, point, px,
 };
 use kimg::{Frame, RgbaImage};
 
@@ -587,6 +587,8 @@ struct AudioCmd {
 
 /// 把条的**窗口坐标**盒 + 屏幕 x 映射成 0..=1 的进度（钳位）。盒从未布局过
 ///（bounds=0，即某窗口从未画过本条）时返回 `None`。
+/// 生产路径已由 `ui::Slider` 内部映射接管（Wire-A），本函数现仅测试直连用。
+#[cfg(test)]
 fn fraction_at(bounds: &Cell<Bounds<Pixels>>, point: Point<Pixels>) -> Option<f32> {
     let b = bounds.get();
     let width = f32::from(b.size.width);
@@ -724,8 +726,8 @@ pub struct VideoViewer {
     /// [`::viewer::auto_hide`]；进锁定默认可见、切视频/悬停浮现、离开 1s 自隐、
     /// hover 抑制）。
     controls_auto: auto_hide::AutoHide,
-    /// seek 进度条自身在**窗口坐标**下的盒（每次 prepaint 由 canvas 子元素刷新；
-    /// 事件回调读它做屏 x→分数。**不**用 `use_keyed_state`——那只能在渲染期调用）。
+    /// seek 进度条自身在**窗口坐标**下的盒（每次 prepaint 由 `ui::Slider` 的 `on_geometry`
+    /// 回调刷新；事件回调读它做屏 x→分数。**不**用 `use_keyed_state`——那只能在渲染期调用）。
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// 音量条盒（同 `seek_bounds`）。
     vol_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -737,11 +739,13 @@ pub struct VideoViewer {
     /// `start_decoder_at(…, restart_audio=false)` 重开解码器而不打断音频）。
     decode_cap: u32,
     // --- M0 hover 预解码 ---
-    /// 进度条悬停位置（秒，钳位到 [0, duration]；未悬停 None，仅未拖拽的 `on_seek_move` 记录）。
+    /// 进度条悬停位置（秒，钳位到 [0, duration]；未悬停 None，仅未拖拽的 `on_controls_move`
+    /// 在 seek 条内记录）。
     hovered_target: Option<f64>,
-    /// F1 悬停时间浮层：悬停光标的**窗口坐标** x（px；在 seek 进度条盒内才记录，随 `on_seek_move`
-    /// 刷新；开始拖拽 / 移出进度条 / 换文件时清 None → 浮层隐藏）。不在 render 里做命中检测，
-    /// 由事件回调记录这一帧的横向位置，浮层紧随光标移动。
+    /// F1 悬停时间浮层：悬停光标的**窗口坐标** x（px；在 seek 进度条盒内才记录，随控制条
+    /// `on_controls_move` 在条内刷新 / `on_controls_up` 松手恢复；开始拖拽 / 移出进度条 /
+    /// 换文件时清 None → 浮层隐藏）。不在 render 里做命中检测，由事件回调记录这一帧的
+    /// 横向位置，浮层紧随光标移动。
     hover_x: Option<f32>,
     /// hover 预解码 worker 命令通道（独立线程 + 独立 `VideoReader`，与播放 worker 彻底隔离，
     /// 专做「悬停落点」单帧后台解码，永不阻塞/饿死播放 worker）。
