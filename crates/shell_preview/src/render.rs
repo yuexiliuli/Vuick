@@ -110,6 +110,25 @@ pub fn live_pending_input_overlay() -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// 预览区纵向滚动条叠层：`absolute inset_0` 上挂 `Scrollbar::vertical(Always)
+/// .viewport_from_layout()`，自绘可见滚动条跟随宿主 `overflow_y_scroll` 容器
+///（GPUI 原生不绘制可见滚动条）。左栏活区（`render_live_area`）与右栏/全屏
+/// WyEditor 宿主（`md_wy_host_children`）两段同构叠层统一走本 helper，行为
+/// 逐像素一致；`id` 同时作元素标识与 debug_selector，区分两条滚动免疫链路。
+pub fn vscrollbar_overlay(id: &'static str, viewport: &ScrollHandle) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .absolute()
+        .inset_0()
+        .child(
+            Scrollbar::vertical(viewport)
+                .mode(ScrollbarMode::Always)
+                .viewport_from_layout(),
+        )
+        .into_any_element()
+}
+
 /// 统一 WyEditor 宿主驱动（live2 左面板 / 右栏预览 / 全屏预览共用）：渲染期注入
 /// 宿主滚动句柄 + 内容顶部内衬，推入当前视口顶部（元素局部 y = 滚动偏移 − 顶部
 /// 内衬），再 `prepare_font_zoom`——字号变化时 WyEditor 在 render 期按新字号重建帧
@@ -219,18 +238,7 @@ pub fn render_live_area<H: PreviewHost>(
                         .child(live_any),
                 ),
         )
-        .child(
-            div()
-                .id("live-vscrollbar-overlay")
-                .debug_selector(|| "live-vscrollbar-overlay".into())
-                .absolute()
-                .inset_0()
-                .child(
-                    Scrollbar::vertical(&vhand)
-                        .mode(ScrollbarMode::Always)
-                        .viewport_from_layout(),
-                ),
-        )
+        .child(vscrollbar_overlay("live-vscrollbar-overlay", &vhand))
         .child(zoom_overlay::<H>(cx))
         .into_any_element()
 }
@@ -285,16 +293,7 @@ pub fn md_wy_host_children<H: PreviewHost>(
                 .text_color(text_color)
                 .child(any),
         );
-    let vscrollbar_overlay = div()
-        .id("md-wy-vscrollbar-overlay")
-        .debug_selector(|| "md-wy-vscrollbar-overlay".into())
-        .absolute()
-        .inset_0()
-        .child(
-            Scrollbar::vertical(&vhand)
-                .mode(ScrollbarMode::Always)
-                .viewport_from_layout(),
-        );
+    let scroll_overlay = vscrollbar_overlay("md-wy-vscrollbar-overlay", &vhand);
     let zoom_overlay = zoom_overlay::<H>(cx);
     if fullscreen {
         return div()
@@ -305,7 +304,7 @@ pub fn md_wy_host_children<H: PreviewHost>(
             .bg(panel_bg)
             .overflow_hidden()
             .child(scroll)
-            .child(vscrollbar_overlay)
+            .child(scroll_overlay)
             .child(zoom_overlay)
             .into_any_element();
     }
@@ -329,7 +328,7 @@ pub fn md_wy_host_children<H: PreviewHost>(
         .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
         .on_drop(drop_paths)
         .child(scroll)
-        .child(vscrollbar_overlay)
+        .child(scroll_overlay)
         .child(zoom_overlay)
         .into_any_element()
 }/// Step2：右栏 `md_wy` 未就绪（大文档后台整篇解析在途）时的「正在排版」占位。
