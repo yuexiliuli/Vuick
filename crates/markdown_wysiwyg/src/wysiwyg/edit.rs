@@ -15,29 +15,23 @@ impl WyEditor {
 
     /// 源字节偏移 → (源行, 行内字节偏移)。用 `Doc::line_starts` 二分（O(log n)），
     /// 不再每帧线性扫整篇源文本（7MB 大文档每帧 ~100ms+）。
+    /// 函数体与 `markdown_wysiwyg_engine::docutil::row_col` 逐字同义（`self.len()==doc.len()`、
+    /// `self.doc` 即 `Doc`），此处仅留薄壳委托，宿主调用点全量保留。
     pub(crate) fn row_col(&self, off: usize) -> (usize, usize) {
-        let off = off.min(self.len());
-        let ls = self.doc.line_starts();
-        // 最后一个 `line_starts[i] <= off` 的行。
-        let line = ls.partition_point(|&st| st <= off).saturating_sub(1);
-        let start = ls.get(line).unwrap_or(0);
-        (line, off - start)
+        markdown_wysiwyg_engine::docutil::row_col(&self.doc, off)
     }
 
     /// 源行 → 该行起始字节（O(log n)，`line_starts` 二分）。
+    /// 薄壳委托 `markdown_wysiwyg_engine::docutil::line_start`（类型逐字一致，无需换算）。
     pub(crate) fn line_start(&self, line: usize) -> usize {
-        self.doc.line_starts().get(line).unwrap_or(self.len())
+        markdown_wysiwyg_engine::docutil::line_start(&self.doc, line)
     }
 
     /// 源行 → 行尾字节（不含换行符；`line_starts[line+1]-1` = 行尾 `\n` 位置）。
     /// 末行（无换行）返回内容尾。`CRLF` 下返回 `\n`（含 `\r`，与原文语义一致）。
+    /// 薄壳委托 `markdown_wysiwyg_engine::docutil::line_end`（类型逐字一致，无需换算）。
     pub(crate) fn line_end(&self, line: usize) -> usize {
-        let ls = self.doc.line_starts();
-        let start = ls.get(line).unwrap_or(self.len());
-        match ls.get(line + 1) {
-            Some(next) => (next.saturating_sub(1)).min(self.len()).max(start),
-            None => self.len(),
-        }
+        markdown_wysiwyg_engine::docutil::line_end(&self.doc, line)
     }
 
     /// 该行的粗略 `RowKind`（行首启发，实体内部导航用；渲染以 `DocRow` 为准）。
