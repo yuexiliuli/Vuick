@@ -492,6 +492,19 @@ impl WyEditor {
         let card = gpui::div()
             .id("wy-image-edit-card")
             .debug_selector(|| "wy-image-edit-card".into())
+            // Enter 动作层拦截：deferred 浮层经 `set_active_node(prepaint_deferred_draws,
+            // vendor window.rs:3931)` 挂回 WyEditor dispatch 路径，而 gpui 按键**先动作层
+            // 后 key_down**（`dispatch_key_event` 先 `for binding in match_result.bindings {
+            // dispatch_action_on_node }`、后 `finish_dispatch_key_event` 才派发 key_down）→
+            // 卡片输入框在 key_down 层的 `stop_propagation` 拦不住 WyEditor 根的
+            // `on_action(Enter→newline)`（mod.rs:615 + bind_keys mod.rs:519）——焦点在卡片
+            // 输入框按 Enter 会把换行插进 caret 处正文（2026-11-13 实测回归）。此处把
+            // `Enter` 动作在**卡片根**（比 WyEditor 根更靠近焦点）消费并 `stop_propagation`，
+            // WyEditor 根不再收到该动作；Esc 未绑 wy-editor 键位、走 key_down 层由输入框
+            // Cancel 消费，无需动作层拦截。
+            .on_action(|_: &Enter, _: &mut Window, cx: &mut gpui::App| {
+                cx.stop_propagation();
+            })
             // 点击**卡片外**任意处 → 关闭卡片（控件内点击不外发，不误关）。
             .on_mouse_down_out(
                 move |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| {

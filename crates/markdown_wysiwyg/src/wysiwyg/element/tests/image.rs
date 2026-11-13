@@ -2080,3 +2080,123 @@ fn image_edit_enter_escape_snapshot_noop_caret_no_doc_rewrite(cx: &mut gpui::Tes
     );
 }
 
+/// **真实泄漏回归（Batch 2）**：caret 置于**普通可换行段落**（非图片行 alt 的 no-op 位置）、
+/// 焦点在图片编辑卡输入框时按 Enter，不得向文档正文插入换行。
+///
+/// 机制：deferred 浮层经 `set_active_node(prepaint_deferred_draws, window.rs:3931)` 挂回
+/// WyEditor dispatch 路径；gpui 按键派发**先动作层后 key_down**（`dispatch_key_event`：
+/// `for binding in match_result.bindings { dispatch_action_on_node }` → 之后才派发
+/// `key_down`）。由此 WyEditor 根的 `key_context(CONTEXT)` + `on_action(Enter→newline)`
+/// （wysiwyg/mod.rs:561,615 + bind_keys mod.rs:519，生产装配 shell/lib.rs:45）在动作层
+/// **先于** 卡片输入框 key_down 层派发——焦点在卡片时按 Enter 即向 caret 位置插换行。
+/// 修复：在卡片根 `.on_action(Enter)` 拦截（距离焦点比 WyEditor 根近，动作冒泡在此被
+/// 消费 + stop_propagation），WyEditor 根不再收到 Enter action。
+#[gpui::test]
+fn image_edit_enter_in_card_does_not_insert_newline_into_doc(cx: &mut gpui::TestAppContext) {
+    // 演算字节区间（ASCII 单字节）：`para one\n`=[0,8)+1、`![pic](a.png)\n`=13+1、
+    // `para two\n`=[23,31)+1；caret=4 落在首段 "para one" 中部（换行允许位）。
+    let before = "para one\n![pic](a.png)\npara two\n";
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(before));
+        WyHost { ed }
+    });
+    let vcx: &mut gpui::VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    // caret 置于普通段落中段（首行第 5 字节，源字节偏移 4）。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, _| e.set_caret(4));
+        assert_eq!(ed.read(cx).caret(), 4, "caret 应落到普通段落中段");
+    });
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            e.open_image_edit(
+                crate::markdown::wysiwyg::ImageEditTarget::Block { src_line: 1 },
+                window,
+                cx,
+            )
+        });
+    });
+    // 聚焦「链接」输入框（真实焦点态）。
+    vcx.update(|window, cx| {
+        let link = ed.read(cx).image_edit_link_input().expect("链接输入框");
+        let fh = link.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+        assert!(
+            ed.read(cx).image_edit_input_focused(window, cx),
+            "链接框聚焦时 image_edit_input_focused 应为 true"
+        );
+    });
+    let wh = vcx.windows().first().copied().expect("窗口句柄");
+    let content_before = vcx.update(|_w, cx| ed.read(cx).content());
+    assert_eq!(
+        content_before.as_str(),
+        before,
+        "测试前提：正文未改动"
+    );
+    // 打开卡片 + 聚焦后重断言 caret 仍在可换行位置（杜绝「被钳到 no-op 位」的假绿疑虑）。
+    vcx.update(|_w, cx| {
+        assert_eq!(
+            ed.read(cx).caret(),
+            4,
+            "打开图片卡后 caret 应仍在普通段落中段（换行允许位）"
+        );
+    });
+    // 链接输入框持焦按 Enter → 修复后文档不得插换行（caret 在可换行段落）。
+    vcx.dispatch_keystroke(wh, gpui::Keystroke::parse("enter").unwrap());
+    vcx.run_until_parked();
+    let (content_enter, link_enter) = vcx.update(|_w, cx| {
+        (
+            ed.read(cx).content(),
+            ed.read(cx)
+                .image_edit_link_input()
+                .map(|l| l.read(cx).value().to_string()),
+        )
+    });
+    assert_eq!(
+        content_enter.as_str(),
+        before,
+        "图片卡链接输入框 Enter 不得向正文插换行：{content_enter:?}"
+    );
+    assert_eq!(
+        link_enter.as_deref(),
+        Some("a.png"),
+        "Enter 不得改动链接输入框内容：{link_enter:?}"
+    );
+    // 文本框持焦按 Enter → 同样不得插换行。
+    vcx.update(|window, cx| {
+        let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
+        let fh = text.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+    });
+    vcx.dispatch_keystroke(wh, gpui::Keystroke::parse("enter").unwrap());
+    vcx.run_until_parked();
+    let (content_text, text_val) = vcx.update(|_w, cx| {
+        (
+            ed.read(cx).content(),
+            ed.read(cx)
+                .image_edit_text_input()
+                .map(|t| t.read(cx).value().to_string()),
+        )
+    });
+    assert_eq!(
+        content_text.as_str(),
+        before,
+        "图片卡文本框 Enter 不得向正文插换行：{content_text:?}"
+    );
+    assert_eq!(
+        text_val.as_deref(),
+        Some("pic"),
+        "Enter 不得改动文本框内容：{text_val:?}"
+    );
+    // Esc（wy-editor 上下文未绑 escape，走 key_down 层被输入框 Cancel 消费）→ 不改文。
+    vcx.dispatch_keystroke(wh, gpui::Keystroke::parse("escape").unwrap());
+    vcx.run_until_parked();
+    let content_esc = vcx.update(|_w, cx| ed.read(cx).content());
+    assert_eq!(
+        content_esc.as_str(),
+        before,
+        "图片卡输入框 Esc 不得改写文档：{content_esc:?}"
+    );
+}
+
