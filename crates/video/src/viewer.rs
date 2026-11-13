@@ -65,6 +65,9 @@ use ui::button::Button;
 use ui::button::ButtonVariants as _;
 use ui::icon::{Icon, IconName};
 use ui::motion::hover_spring;
+// 玻璃面板 α（亮 0.80 / 暗 0.72）随 B02b glass_card 收编进 theme（原散值在此定义，
+// 现已单源在 ui::theme::GLASS_PANEL_ALPHA_*；render.rs 经 sub::* 继承本 use）。
+use ui::theme::{GLASS_PANEL_ALPHA_DARK, GLASS_PANEL_ALPHA_LIGHT};
 
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
@@ -126,10 +129,6 @@ const VOLUME_STEP: f32 = 0.1;
 /// 底部控制条预留高度（px）：视频 contain 适配到「视口高 − 此值」，避免画面底部被
 /// 浮层控制条遮住。值略大于控制条实际高度（py 8×2 + 按钮 28 ≈ 44）。
 const CONTROL_BAR_H: f32 = 52.0;
-/// 玻璃拟态浮层透明度（控制条 / toast / 占位卡共用；基于 theme `surface` token 派生
-/// alpha，亮/暗各自一档——半透明才能透出视频画面，同时保留文字对比）。
-const GLASS_PANEL_ALPHA_LIGHT: f32 = 0.80;
-const GLASS_PANEL_ALPHA_DARK: f32 = 0.72;
 /// 右上角瞬时状态浮层（截图结果提示等）的显示时长（ms），到期自动清除。
 const STATUS_MS: u64 = 2500;
 /// 拖拽（scrub）期间视频重定位的最小间隔（ms）：拖拽天然高频，若每次 mouse_move 都

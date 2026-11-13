@@ -72,6 +72,11 @@ pub use focus::focus_border_color;
 /// `ui::overlay_centered(...)` / `ui::anchor_layer(...)`；枚举档位 `ui::FloatCard*`）。
 pub use float_card::{anchor_layer, float_card, overlay_centered, FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 
+/// B02b 玻璃卡便捷入口 + 档位的根级 re-export（`ui::glass_card(...)`；`ui::GlassCardBg` /
+/// `ui::CardShellShadow` / `ui::CardShellRadius` / `ui::CardShellPad`）。壳体（含
+/// `card_shell_shadows`）仍可经 `ui::card_shell::` 直达。
+pub use card_shell::{glass_card, CardShellPad, CardShellRadius, CardShellShadow, GlassCardBg};
+
 /// 横向滑块根级 re-export（`ui::Slider` / `ui::SliderFill` / `ui::SliderThumb` / `ui::CommitMode`）。
 pub use slider::{CommitMode, Slider, SliderFill, SliderThumb};
 

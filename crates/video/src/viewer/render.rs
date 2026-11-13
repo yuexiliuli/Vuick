@@ -13,36 +13,26 @@ impl super::VideoViewer {
     /// 半透明圆角卡内（与 toast / 控制条同一套玻璃样式）。
     pub(super) fn placeholder(text: &str, color: Hsla, cx: &App) -> gpui::AnyElement {
         let theme = ui::theme::Theme::global(cx);
-        let dark = theme.is_dark();
-        let surface: Hsla = theme.colors.surface.into();
-        let border: Hsla = theme.colors.border.into();
         div()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
             .child(
-                div()
-                    .px_4()
-                    .py_2()
-                    .rounded_lg()
-                    .bg(surface.opacity(if dark {
-                        GLASS_PANEL_ALPHA_DARK
-                    } else {
-                        GLASS_PANEL_ALPHA_LIGHT
-                    }))
-                    .border_1()
-                    .border_color(border)
-                    // 玻璃卡投影 = 黑 hsla 散值（明暗同值、按高程定 alpha/blur；ui::theme 无阴影 token，表单专属留注释）
-                    .shadow(vec![
-                        gpui::BoxShadow::new(px(0.), px(4.), gpui::hsla(0., 0., 0., 0.16))
-                            .blur_radius(px(12.)),
-                        gpui::BoxShadow::new(px(0.), px(1.), gpui::hsla(0., 0., 0., 0.12))
-                            .blur_radius(px(3.)),
-                    ])
-                    .text_size(px(14.))
-                    .text_color(color)
-                    .child(text.to_string()),
+                // 玻璃占位壳：走 ui::glass_card 纯壳——Acrylic 默认 α（theme 亮 0.80/暗 0.72）、
+                // NearDouble 双影逐值 = 原黑 hsla 0.16@12 + 0.12@3、PxPy(16,8) = 原 px_4/py_2；
+                // 宿主定位（外层 flex 居中）留在原位。
+                ui::glass_card(
+                    &theme.colors,
+                    theme.is_dark(),
+                    ui::GlassCardBg::Acrylic,
+                    ui::CardShellShadow::NearDouble,
+                    ui::CardShellRadius::Lg,
+                    ui::CardShellPad::PxPy(px(16.), px(8.)),
+                )
+                .text_size(px(14.))
+                .text_color(color)
+                .child(text.to_string()),
             )
             .into_any_element()
     }
@@ -88,40 +78,33 @@ impl super::VideoViewer {
             return div().into_any_element();
         }
         let theme = ui::theme::Theme::global(cx);
-        let surface: Hsla = theme.colors.surface.into();
-        let border: Hsla = theme.colors.border.into();
         let fg: Hsla = theme.colors.fg.into();
         let is_dark = theme.is_dark();
         let label = Self::fmt_time(secs);
         // 纵向固定：贴进度条上缘上移 `HOVER_TIME_GAP_PX`（BottomCenter 锚点 = 卡片底边中点）。
         let top = (b.origin.y - px(HOVER_TIME_GAP_PX)).as_f32().max(0.0);
-        let card = div()
-            .id("video-hover-time")
-            .debug_selector(move || "HOVER_TIME".to_string())
-            .whitespace_nowrap()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(surface.opacity(if is_dark {
-                GLASS_PANEL_ALPHA_DARK
-            } else {
-                GLASS_PANEL_ALPHA_LIGHT
-            }))
-            // 投影同 placeholder 玻璃卡：黑 hsla 0.16@6，表单专属（theme 无阴影 token）
-            .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.16))
-                    .blur_radius(px(6.)),
-            ])
-            .text_size(px(11.))
-            .text_color(fg)
-            .child(label)
-            .with_spring(
-                "video-hover-time-fade",
-                hover_spring(1.0).from(0.0),
-                |this, v| this.opacity(v),
-            );
+        // 玻璃悬停壳：走 ui::glass_card——Acrylic 默认 α、Single 单影逐值 = 原
+        // `hsla(0,0,0,0.16)@(0,2)blur6`、PxPy(8,4) = 原 px_2/py_1；id/debug_selector/
+        // 弹簧淡入等宿主交互留在原位。
+        let card = ui::glass_card(
+            &theme.colors,
+            is_dark,
+            ui::GlassCardBg::Acrylic,
+            ui::CardShellShadow::Single,
+            ui::CardShellRadius::Md,
+            ui::CardShellPad::PxPy(px(8.), px(4.)),
+        )
+        .id("video-hover-time")
+        .debug_selector(move || "HOVER_TIME".to_string())
+        .whitespace_nowrap()
+        .text_size(px(11.))
+        .text_color(fg)
+        .child(label)
+        .with_spring(
+            "video-hover-time-fade",
+            hover_spring(1.0).from(0.0),
+            |this, v| this.opacity(v),
+        );
         deferred(
             anchored()
                 .anchor(Anchor::BottomCenter)

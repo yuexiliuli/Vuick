@@ -766,7 +766,7 @@ impl PdfViewer {
         let colors = ui::theme::Theme::global(cx).colors;
         let ed = cx.entity();
         let colors_fg: gpui::Hsla = colors.fg.into();
-        let border: gpui::Hsla = colors.border.into();
+        let dark = ui::theme::Theme::global(cx).is_dark();
         let popover_bg: gpui::Hsla = colors.popover_bg.into();
 
         // 每一行菜单项：hover 底色 + 点击回调（捕获各自的注释类型 / 关闭动作）。
@@ -813,34 +813,30 @@ impl PdfViewer {
             },
         );
 
-        let card = div()
-            .id("pdf-sel-card")
-            .debug_selector(|| "pdf-sel-card".into())
-            // 点卡片外任意处 → 关闭（浮层内点击不外发，不误关；K15 事件互斥）。
-            .on_mouse_down_out(move |_: &gpui::MouseDownEvent, _w, cx| {
-                let ed = ed.clone();
-                ed.update(cx, |e, cx| e.close_sel_card(cx));
-            })
-            .occlude()
-            .flex()
-            .flex_col()
-            .gap_y(px(2.))
-            .p(px(4.))
-            .min_w(px(120.))
-            .rounded_lg()
-            .border_1()
-            .border_color(border)
-            .bg(popover_bg)
-            .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(6.), gpui::hsla(0., 0., 0., 0.18))
-                    .blur_radius(px(12.)),
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.12))
-                    .blur_radius(px(4.)),
-            ])
-            .child(copy_item)
-            .child(hl_item)
-            .child(st_item)
-            .child(ul_item);
+        // 选区弹卡壳：走 ui::glass_card——Solid(popover_bg) 底、PopoverDouble 双影逐值 =
+        // 原黑 hsla 0.18@12 + 0.12@4、Pg(4,2) = 原 flex_col+p4+gap_y2；id/debug_selector/
+        // on_mouse_down_out/occlude 宿主交互与 min_w120 补挂留在原位。
+        let card = ui::glass_card(
+            &colors,
+            dark,
+            ui::GlassCardBg::Solid(popover_bg),
+            ui::CardShellShadow::PopoverDouble,
+            ui::CardShellRadius::Lg,
+            ui::CardShellPad::Pg(px(4.), px(2.)),
+        )
+        .id("pdf-sel-card")
+        .debug_selector(|| "pdf-sel-card".into())
+        // 点卡片外任意处 → 关闭（浮层内点击不外发，不误关；K15 事件互斥）。
+        .on_mouse_down_out(move |_: &gpui::MouseDownEvent, _w, cx| {
+            let ed = ed.clone();
+            ed.update(cx, |e, cx| e.close_sel_card(cx));
+        })
+        .occlude()
+        .min_w(px(120.))
+        .child(copy_item)
+        .child(hl_item)
+        .child(st_item)
+        .child(ul_item);
 
         Some(
             gpui::deferred(

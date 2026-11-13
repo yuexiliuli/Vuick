@@ -354,6 +354,18 @@ pub const FLOAT_SHADOW_HIGH_ALPHA: f32 = 0.20;
 pub const FLOAT_SHADOW_PEAK_ALPHA: f32 = 0.14;
 /// 单影档 α（video hover_time 现值：(0,2) blur6，α0.16；B02b glass_card 预留）。
 pub const SINGLE_SHADOW_ALPHA: f32 = 0.16;
+/// B02b 玻璃面板默认 α（亮档）：`colors.surface` 玻璃底现值（video placeholder /
+/// hover_time / 状态浮层共用；半透明才能透出视频画面，同时保留文字对比）。
+/// 原散值在 video/viewer.rs `GLASS_PANEL_ALPHA_*`，随 glass_card 收编进 theme。
+pub const GLASS_PANEL_ALPHA_LIGHT: f32 = 0.80;
+/// B02b 玻璃面板默认 α（暗档）：同 [`GLASS_PANEL_ALPHA_LIGHT`]，暗主题深玻璃。
+pub const GLASS_PANEL_ALPHA_DARK: f32 = 0.72;
+/// 玻璃卡双层软影外层 α（video placeholder 现值：(0,4) blur12，α0.16）。
+pub const GLASS_DOUBLE_HIGH_ALPHA: f32 = 0.16;
+/// 玻璃卡/选区弹卡双层影近层 α（video (0,1) blur3 / pdf (0,2) blur4 共用 α0.12）。
+pub const GLASS_DOUBLE_PEAK_ALPHA: f32 = 0.12;
+/// 选区弹卡双层影外层 α（pdf sel_card 现值：(0,6) blur12，α0.18）。
+pub const POPOVER_DOUBLE_HIGH_ALPHA: f32 = 0.18;
 
 impl ChromeColors {
     pub fn light() -> Self {
