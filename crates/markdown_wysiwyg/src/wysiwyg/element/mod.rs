@@ -376,10 +376,13 @@ impl Element for WyEditorElement {
         if let Some(f) = frame.as_ref() {
             let editor = self.editor.read(cx);
             let (on, x, ctop) = caret_geometry(editor, f);
+            // S3：光标竖条高度跟随所在行行高（标题大字 → 高于正文），IME bounds
+            // 与 paint 光标条共用同一高度口径。
+            let lh = caret_bar_height(editor, f);
             super::set_caret_vis(CaretVis {
                 x,
                 top: if on { ctop } else { px(0.) },
-                line_height: f.line_h,
+                line_height: lh,
             });
         }
 
@@ -534,12 +537,18 @@ impl Element for WyEditorElement {
             let e = self.editor.read(cx);
             caret_geometry(e, f)
         };
+        // S3：光标竖条高度跟随所在行行高（标题行 → 更高光标、与 `r.lh`/该行字号匹配；
+        // 正文/B lank → 现状不变）。与 IME bounds（`caret_vis`）同源同口径。
+        let caret_bar_h = {
+            let e = self.editor.read(cx);
+            caret_bar_height(e, f)
+        };
         let caret_shown = self.editor.read(cx).caret_shown_now();
         if self.editor.read(cx).is_editable() && caret_on && caret_shown {
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(
                     point(origin.x + caret_x, origin.y + caret_top),
-                    size(px(2.), f.line_h),
+                    size(px(2.), caret_bar_h),
                 ),
                 corner_radii: gpui::Corners::default(),
                 background: theme.text.into(),

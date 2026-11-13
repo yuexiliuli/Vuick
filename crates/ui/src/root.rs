@@ -49,6 +49,9 @@ impl Root {
     }
 
     fn on_action_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        // 真机诊断（GPUI_EDITOR_TAB_DIAG=1）：Root 的 Tab 抢到事件（=焦点不在编辑区
+        // Input / WY wy-editor 上下文）→ focus_next 触发（H1 判别行）。
+        base::tab_diag::diag("root-focus_next", || "fired".into());
         window.focus_next(cx);
     }
 
@@ -108,5 +111,62 @@ mod tests {
         let _ = cx.refresh();
         let bounds = cx.debug_bounds("ui-root").expect("根元素应渲染");
         assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
+    }
+
+    /// 回归：窗口级 Tab 焦点循环在**非编辑焦点**下仍工作——Root 的 `tab→focus_next`
+    /// 只在没有更深（编辑器 `Input`/WYSIWYG `wy-editor`）键上下文抢走 Tab 时触发；
+    /// 本测试用两个普通可聚焦元素验证「Tab 仍移动焦点」，不受编辑器 Tab 绑定破坏。
+    #[gpui::test]
+    fn tab_focus_cycle_still_moves_focus_between_focusables(cx: &mut TestAppContext) {
+        use super::Root;
+        use gpui::{Keystroke, VisualTestContext};
+        cx.update(crate::test_support::bind_local_keymaps);
+
+        struct FocusPair {
+            a: gpui::FocusHandle,
+            b: gpui::FocusHandle,
+        }
+        impl Render for FocusPair {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .child(div().id("focus-a").track_focus(&self.a).size_full().child("A"))
+                    .child(div().id("focus-b").track_focus(&self.b).size_full().child("B"))
+            }
+        }
+
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            // 作为「普通可聚焦控件」：必须是 tab stop，focus_next 才会走到它。
+            let a = cx.focus_handle().tab_stop(true);
+            let b = cx.focus_handle().tab_stop(true);
+            let view = cx.new(move |_| FocusPair { a, b });
+            Root::new(view, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+        // 渲染一帧，使 dispatch tree 含两个可聚焦节点。
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.refresh();
+        }
+        cx.run_until_parked();
+        let (ha, hb) = cx.update(|_, cx| {
+            let fp = root
+                .read(cx)
+                .view()
+                .clone()
+                .downcast::<FocusPair>()
+                .expect("Root 内应承载 FocusPair");
+            (fp.read(cx).a.clone(), fp.read(cx).b.clone())
+        });
+        let w = cx.windows().first().copied().expect("窗口句柄");
+        // 聚焦 A → Tab → 焦点应移到 B（Root 的 focus_next 仍在非编辑焦点下工作）。
+        cx.update(|window, cx| window.focus(&ha, cx));
+        cx.dispatch_keystroke(w, Keystroke::parse("tab").unwrap());
+        cx.run_until_parked();
+        let focused = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(
+            focused,
+            Some(hb),
+            "非编辑焦点下 Tab 应触发 Root 焦点循环，焦点从 A 移到 B"
+        );
     }
 }

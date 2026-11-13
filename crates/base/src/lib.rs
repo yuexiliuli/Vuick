@@ -10,6 +10,7 @@
 pub mod actions;
 pub mod prof;
 pub mod startup;
+pub mod tab_diag;
 pub mod util;
 pub mod warm;
 

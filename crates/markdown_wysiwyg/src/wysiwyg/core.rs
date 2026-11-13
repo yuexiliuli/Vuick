@@ -3,6 +3,7 @@ use super::*;
 use std::time::Duration;
 
 use gpui::Pixels;
+use ime::ImeTextHost;
 use ropey::Rope;
 
 use crate::markdown::view::style::StyleParams;
@@ -1076,8 +1077,38 @@ impl WyEditor {
         if !self.editable {
             return;
         }
+        // S2 标题标记引导区空格钳制（仅键入路径）。平台直输（含空格键）走这里；
+        // 粘贴/撤销/其它路径直接进 `replace_range`，不经此入口 → 规则不波及。
+        if text == " " {
+            // 与 `ime::replace` 同一「实际替换区间」口径（None = marked，否则选区）。
+            let ins = self
+                .marked
+                .clone()
+                .unwrap_or_else(|| self.selection_bytes());
+            // 仅零宽插入且光标处于标题标记引导区 → 吞掉（不落盘、不再 notify）。
+            if ins.start == ins.end && self.swallow_title_guide_space(ins.start) {
+                return;
+            }
+        }
         crate::prof::op_start("type");
         ime::replace(self, range, text, None, false, cx);
+    }
+
+    /// S2 判定：在 `off`（源字节）处键入一个空格时是否应吞掉。条件 = 该处所在源码行
+    /// 以 `{1,6} 个 '#'` 标题标记开头、且光标停在「标记引导区」——标记之后到光标为止
+    /// 的前缀全为空格，且已有 ≥1 个分隔空格（第 1 个分隔空格照常插入）。一旦标记后
+    /// 出现非空格字符（前缀含非空格）→ 返回 false，空格输入照常。
+    pub(crate) fn swallow_title_guide_space(&self, off: usize) -> bool {
+        let (line, col) = self.row_col(off);
+        let lt = self.line_text(line);
+        let h = lt.bytes().take_while(|&b| b == b'#').count();
+        if !(1..=6).contains(&h) || col <= h {
+            return false;
+        }
+        // CRLF：`row_col` 的列含 `\r`，而 `line_str` 不含 → 钳到行文本长，防越界切片
+        // （钳到长时 `\r` 非空格 → 判定 false，安全地不吞）。
+        let col = col.min(lt.len());
+        lt[h..col].bytes().all(|b| b == b' ')
     }
 
     /// IME 组合更新（可测）：`range`（UTF-16 文档区间）为 `None` 时替换当前 marked

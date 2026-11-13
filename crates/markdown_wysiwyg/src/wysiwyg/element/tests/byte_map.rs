@@ -1,7 +1,7 @@
 use super::{
-    WyEditor, build_frame, caret_geometry, cell_selection_display, display_to_source,
-    layout_has_notdef, prewarm_band, quote_band_w, source_offset_at_local, source_to_display,
-    table_block_height, table_cell_x0, table_row_top,
+    WyEditor, build_frame, caret_bar_height, caret_geometry, cell_selection_display,
+    display_to_source, layout_has_notdef, prewarm_band, quote_band_w, source_offset_at_local,
+    source_to_display, table_block_height, table_cell_x0, table_row_top,
 };
 use gpui::{
     AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px, size,

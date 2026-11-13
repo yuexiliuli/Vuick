@@ -42,6 +42,81 @@ pub const MATH_EDIT_EDITOR_W: f32 = MATH_EDIT_CARD_W - 24. - 2. - 2.;
 /// 数学编辑卡内嵌编辑器的**横向尾部 gap**（px）。
 pub const MATH_EDIT_TAIL_GAP_PX: f32 = 64.;
 
+/// 标题字形的行带内占比估算（px→em 系数；仅防御性 fallback——空标题 `# ` 实际经
+/// `shape_text` 产出一条空 WrappedLine，走 `wrapped[0]` 真实度量，到不了本分支）。
+/// 取 1.0 em（≈CJK 字形主体）：本机默认字体实测 ascent+descent≈0.86 em，
+/// Latin 系 ≈1.1–1.3 em——按 1.0 落在区间中段、不显著过度，且夹到行带内；观感余量
+/// 属真机可调项。
+const TITLE_GLYPH_H_EM: f32 = 1.0;
+
+/// 标题行光标竖条应覆盖的**文字字形高**（px）：
+/// - 有字标题行（有 shaped text）：用该行 `wrapped[0]` 的真实 `ascent+descent`——这是
+///   gpui paint 定位基线的**同一源数据**（`vendor/zed/crates/gpui/src/text_system/line.rs`
+///   `paint_line`：`padding_top=(line_height−ascent−descent)/2` → 基线落在
+///   `padding_top+ascent`；竖条顶=字形顶、下沿=基线+descent，正好贴文字字形）。夹到
+///   `row.lh` 内：极端字体（ascent+descent>lh，如 h1 的 lh=1.3×fs 最紧）下竖条退化
+///   满行带、不越带——与下方估算分支同一夹取口径，锁住「竖条底不越行带」不变式。
+/// - 空标题行（`# `）：`shape_text` 对空串仍产出一条**空 `WrappedLine`**（
+///   `text_system.rs` 每物理行无条件 push），故实际走上一分支取空行 layout 的真实
+///   字形度量（同字号同字体 → 与有字标题观感一致）。本 fallback 仅防御「wrapped 为
+///   空」的标题行（当前所有标题行都经 `shape_text`，到不了）：按 `r.lh`（== 该级
+///   `heading_line`）反查标题级 → 该级 `heading_fs` × 系数估算，夹到行带内。
+fn title_glyph_height(row: &ShapedRow, rd: &RefCell<WyRenderModel>) -> Pixels {
+    if let Some(w0) = row.wrapped.first() {
+        let l = &w0.unwrapped_layout;
+        return px((f32::from(l.ascent) + f32::from(l.descent)).min(f32::from(row.lh)));
+    }
+    let theme = &rd.borrow().theme;
+    let fs = (1..=6u8)
+        .find(|&lv| (f32::from(theme.heading_line(lv)) - f32::from(row.lh)).abs() < 0.5)
+        .map(|lv| theme.heading_fs(lv))
+        .unwrap_or(theme.font_size);
+    px((f32::from(fs) * TITLE_GLYPH_H_EM).min(f32::from(row.lh)))
+}
+
+/// 光标竖条在行带内的**垂直位移**（px，相对该行文本带顶）：
+/// 标题行 = `(行带高 − 字形高)/2` → 竖条精确覆盖字形框（顶=字形顶、底=基线+descent，
+/// 如 I-beam 落在该行文字上），不再「偏下/悬在行带下方」；
+/// 其余（正文/代码/B lank/分隔等）保持既有 `(r.lh − f.line_h)/2` 居中口径 → 现状不变。
+fn caret_shift_for(row: &ShapedRow, rd: &RefCell<WyRenderModel>, f: &Frame) -> f32 {
+    if matches!(row.kind, IrKind::Heading(_)) {
+        let glyph = f32::from(title_glyph_height(row, rd));
+        ((f32::from(row.lh) - glyph) / 2.).max(0.)
+    } else {
+        ((f32::from(row.lh) - f32::from(f.line_h)) / 2.).max(0.)
+    }
+}
+
+/// 光标竖条高度（px）：标题行 = 该行文字字形高（见 [`title_glyph_height`]）；文本/
+/// 代码/空/分隔行 = 所在行行高 `r.lh`；表格单元保持既有 `para_line` 居中高（行内垂直
+/// 居中口径不变）；未命中行兜底正文行高 `f.line_h`。独立扫行（量程高频但仅几十行），
+/// 不动 [`caret_geometry`] 既有关键几何路径。
+pub fn caret_bar_height(
+    rd: &RefCell<WyRenderModel>,
+    host: &dyn WyRenderHost,
+    f: &Frame,
+) -> Pixels {
+    let (cl, _col) = docutil::row_col(host.doc(), host.caret());
+    for r in &f.rows {
+        if !r.src_lines.contains(&cl) {
+            continue;
+        }
+        // 表格单元：光标条按既有 `para_line` 高度垂直居中于行，保持原观感。
+        if let (Some(te), Some(_t)) = (&r.table_edit, &r.table)
+            && te.rows.iter().any(|rr| rr.src_line == cl)
+        {
+            return rd.borrow().theme.para_line();
+        }
+        // 标题行：竖条覆盖该行文字字形（I-beam 落在标题文字上），而非整行带。
+        if matches!(r.kind, IrKind::Heading(_)) {
+            return title_glyph_height(r, rd);
+        }
+        // 其余（正文/代码/空行/分隔等）：跟随所在行行高。
+        return r.lh;
+    }
+    f.line_h
+}
+
 /// 源 caret → 光标条几何。非文本行停在块首（只读）；代码块内停在对应内容行。
 pub fn caret_geometry(
     rd: &RefCell<WyRenderModel>,
@@ -60,12 +135,13 @@ pub fn caret_geometry(
         // `Blank` 特殊分支的语义推广——否则「点空标题行 → 光标不画」（用户报告的
         // 「光标消失」）。只读预览的竖条由宿主绘制门控 `is_editable()` 另行抑制。
         //
-        // 垂直锚 = 与可编辑分支同一推导（`text_y_off` + `text_row_shift` + 行带内居中
-        // `(lh − line_h)/2`）：空标题行行带更高（标题字号），光标不能锚带顶（视觉偏上），
-        // 锚到「该行文本将出现的带内居中位置」——与输入一个字符后的光标位置一致。
-        // Blank（`lh == f.line_h`）→ 居中量 0、无撑高下移 → 行为零变化（现状观感正确）。
+        // 垂直锚 = 与可编辑分支同一推导（`text_y_off` + `text_row_shift` + 行带内
+        // 位移）：标题行按字形高居中（`caret_shift_for`，竖条覆盖字形框），其余按
+        // `(lh − line_h)/2`（现状）。空标题行行带更高（标题字号），光标不能锚带顶
+        // （视觉偏上），锚到「该行文本将出现的字形位置」——与输入一个字符后的光标
+        // 位置一致。Blank（`lh == f.line_h`）→ 位移 0、无撑高下移 → 行为零变化。
         if !r.editable {
-            let caret_shift = ((f32::from(r.lh) - f32::from(f.line_h)) / 2.).max(0.);
+            let caret_shift = caret_shift_for(r, rd, f);
             let ctop = r.top + px(text_y_off(r) + text_row_shift(r) + caret_shift);
             return (true, f.padding + r.x_off, ctop);
         }
@@ -118,7 +194,7 @@ pub fn caret_geometry(
             .get(text_band_at(r, f32::from(p.y)))
             .copied()
             .unwrap_or(px(0.));
-        let caret_shift = ((f32::from(r.lh) - f32::from(f.line_h)) / 2.).max(0.);
+        let caret_shift = caret_shift_for(r, rd, f);
         return (
             true,
             f.padding + r.x_off + aln + p.x,

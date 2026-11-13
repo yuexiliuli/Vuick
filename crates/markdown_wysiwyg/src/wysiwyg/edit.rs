@@ -4,6 +4,11 @@ use crate::markdown::parse::inline_style;
 use crate::markdown::parse::recognition;
 use crate::markdown::parse::BlockMeta;
 
+/// Tab 键的可见缩进单位（H2 修复：不插 `\t`——真机 DirectWrite 把它排成零宽）。
+/// 与编辑区 `tab_size=4` 同格（4 个空格），真机 DirectWrite 对空格排正常可见宽；
+/// `outdent`/回车对齐逻辑按前导空格处理，4 空格 = 一层缩进，单位一致。
+pub(crate) const TAB_INDENT: &str = "    ";
+
 /// WyEditor 编辑核心 / 撤销重做 / 区域导航 / 光标移动（M2.1 自 mod.rs 拆出）。
 impl WyEditor {
     /* ---------- 光标 ↔ 源辅助 ---------- */
@@ -1125,6 +1130,101 @@ impl WyEditor {
         }
     }
 
+    /// E3（+H2 修复）：Tab 键。无选区 → 光标处插入一小段**可见缩进**；**有选区** →
+    /// 与编辑区 `indent_selected_lines` 同语义：对选区覆盖的源行逐行行首前缀缩进
+    /// （零删除、一次原子、选区平移仍覆盖原行）。
+    ///
+    /// H2 根因：真机 Windows 生产字形用 `DirectWriteTextSystem`，直接把 `\t` 喂给它
+    /// 排成零宽（layout 位置只按逐字形 advance 累加，Tab 的推进不计入）→ 「光标
+    /// 动但没插入」；而 headless `#[gpui::test]` 用 `NoopTextSystem`（每字符统一 0.6em）
+    /// 测不出。故插入单位 = 4 个空格（与编辑区 `tab_size=4` 同格，真机 DirectWrite
+    /// 对空格排正常可见宽）。
+    ///
+    /// 经 `replace_range` 走同一撤销栈/事件/缓存作废主链；标题标记引导区
+    /// （`swallow_title_guide_space`）内按 Tab 视同按空格整体吞掉（见下方守卫），与
+    /// 空格键同语义。只读门控由调用方（render 只在 `editable` 时登记本动作）与这里的
+    /// `!self.editable` 双层兜底。
+    pub(crate) fn tab_insert(&mut self, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
+        crate::prof::op_start("tab");
+        let Some(sel) = self.selection() else {
+            // H2/S2 一致：标题标记引导区（`# ` … 首个内容字符之前）内按 Tab 视同按
+            // 空格——整体吞掉、不落盘。若无此闸，Tab 的 4 空格会绕过 S2（S2 只在
+            // `replace_text_utf16` 的单空格路径判定）在 `# ` 后留下 `#     ` 脏前缀，
+            // 正是 S2 要防的；渲染虽 trim、切源码视图/存盘即现（与空格键表现分裂）。
+            if self.swallow_title_guide_space(self.caret) {
+                return;
+            }
+            // 无选区：光标处插入可见缩进（空格；与编辑区 tab 同单位）。
+            base::tab_diag::diag("wy-insert", || {
+                format!("off={}", self.caret)
+            });
+            self.replace_range(self.caret..self.caret, TAB_INDENT, cx);
+            return;
+        };
+        base::tab_diag::diag("wy-indent", || "lines".into());
+        self.indent_selected_lines(sel, cx);
+    }
+
+    /// delta：选区 + Tab → 对「选区覆盖的源行」逐行行首前缀一层 4 空格缩进。整段作为
+    /// **一笔原子替换**（单 undo 事务、单次缓冲编辑、零删除），而非逐选区整段替换成
+    /// 单个 `\t`（旧行为 = 数据破坏，选中内容全部丢失）。选区两端按「其前已插缩进
+    /// 数」平移，仍覆盖原几行。列表行前缀 4 空格缩进即嵌套一层 = 用户接受的语义
+    /// （不特判）。
+    ///
+    /// 用 WY 源字节行结构（[`Self::row_col`]/[`Self::line_start`]/[`Self::line_end`]）
+    /// 实现；被替换段 = 首选中行的行首 → 选区终点（末行含未选中前缀也会被行首缩进，
+    /// 这是「选中即缩进该行」的标准语义）。
+    fn indent_selected_lines(&mut self, sel: Range<usize>, cx: &mut Context<Self>) {
+        let len = self.len();
+        let sel = sel.start.min(len)..sel.end.min(len);
+        if sel.end <= sel.start {
+            return;
+        }
+        let line_a = self.row_col(sel.start).0;
+        let line_b = self.row_col(sel.end - 1).0;
+        let span_start = self.line_start(line_a);
+        let span_end = sel.end.max(span_start);
+        if span_end <= span_start {
+            return;
+        }
+        // 各源行行首（编辑前坐标，升序）；用于选区端点平移计数。
+        let line_starts: Vec<usize> =
+            (line_a..=line_b).map(|r| self.line_start(r)).collect();
+        // 行首逐个前缀缩进（尾换行后的幻影空行不插；CRLF 的 `\r` 视为行内容保留）。
+        let old_span = self.doc.slice_str(span_start..span_end);
+        let mut new_span = String::with_capacity(old_span.len() + TAB_INDENT.len() * line_starts.len());
+        let mut at_start = true;
+        for ch in old_span.chars() {
+            if at_start {
+                new_span.push_str(TAB_INDENT);
+                at_start = false;
+            }
+            if ch == '\n' {
+                at_start = true;
+            }
+            new_span.push(ch);
+        }
+        // 选区两端平移：`[span_start, e]` 内每处行首前缀了一次缩进（含 e 恰为行首）。
+        let shift_endpoint = |e: usize| {
+            e + TAB_INDENT.len() * line_starts.iter().filter(|&&s| s <= e).count()
+        };
+        let (anchor, head) = match self.sel_anchor {
+            Some(a) => (a, self.caret),
+            None => (self.caret, self.caret),
+        };
+        let new_anchor = shift_endpoint(anchor);
+        let new_head = shift_endpoint(head);
+        // 单笔原子替换（撤销栈 / 缓存作废 / 事件经 replace_range）。
+        self.replace_range(span_start..span_end, &new_span, cx);
+        // 还原选区覆盖范围（replace_range 会把光标收敛到插入终点并清选区）。
+        self.sel_anchor = Some(new_anchor.min(self.len()));
+        self.caret = new_head.min(self.len());
+        self.kick_caret();
+    }
+
     pub(crate) fn newline(&mut self, cx: &mut Context<Self>) {
         if !self.editable {
             return;
@@ -1148,6 +1248,27 @@ impl WyEditor {
     /* ---------- 光标移动 ---------- */
 
     pub(crate) fn move_left(&mut self) {
+        self.move_left_select(false);
+    }
+
+    /// 光标左移。`select=true`（Shift+Left）固定 `sel_anchor` 建立并保持选区（与
+    /// 编辑区 `arrow(true, -1, 0)` 同语义）；`false` 只移光标并收起选区。
+    pub(crate) fn move_left_select(&mut self, select: bool) {
+        // 编辑区同语义（`arrow(false, -1, 0)` 的 `!select && !is_collapsed` 分支）：
+        // 无 Shift 且有选区 → 先收起选区到**选区起点**，不继续前移（VS Code 同款）。
+        if !select && self.sel_anchor.is_some() && self.sel_anchor != Some(self.caret) {
+            self.caret = self.sel_anchor.unwrap().min(self.caret);
+            self.sel_anchor = None;
+            self.moved();
+            return;
+        }
+        if select && self.sel_anchor.is_none() {
+            // Shift 首次按下：锚钉在当前 caret，此后固定、只移活动端（caret）。
+            self.sel_anchor = Some(self.caret);
+        }
+        if !select {
+            self.sel_anchor = None;
+        }
         let (line, col) = self.row_col(self.caret);
         if let Some((lo, hi)) = self.editable_segment(line) {
             let seg_start = self.line_start(line) + lo;
@@ -1183,6 +1304,26 @@ impl WyEditor {
     }
 
     pub(crate) fn move_right(&mut self) {
+        self.move_right_select(false);
+    }
+
+    /// 光标右移。`select=true`（Shift+Right）固定 `sel_anchor` 建立并保持选区（与
+    /// 编辑区 `arrow(true, 1, 0)` 同语义）；`false` 只移光标并收起选区。
+    pub(crate) fn move_right_select(&mut self, select: bool) {
+        // 编辑区同语义（`arrow(false, 1, 0)` 的 `!select && !is_collapsed` 分支）：
+        // 无 Shift 且有选区 → 先收起选区到**选区终点**，不继续前移。
+        if !select && self.sel_anchor.is_some() && self.sel_anchor != Some(self.caret) {
+            self.caret = self.sel_anchor.unwrap().max(self.caret);
+            self.sel_anchor = None;
+            self.moved();
+            return;
+        }
+        if select && self.sel_anchor.is_none() {
+            self.sel_anchor = Some(self.caret);
+        }
+        if !select {
+            self.sel_anchor = None;
+        }
         let (line, _col) = self.row_col(self.caret);
         if let Some((lo, hi)) = self.editable_segment(line) {
             let seg_start = self.line_start(line) + lo;
@@ -1217,6 +1358,18 @@ impl WyEditor {
     }
 
     pub(crate) fn move_up(&mut self) {
+        self.move_up_select(false);
+    }
+
+    /// 光标上移。`select=true`（Shift+Up）固定 `sel_anchor` 建立并保持选区；
+    /// `false` 只移光标并收起选区。纵向与编辑区同语义：起点 = 活动端（caret）。
+    pub(crate) fn move_up_select(&mut self, select: bool) {
+        if select && self.sel_anchor.is_none() {
+            self.sel_anchor = Some(self.caret);
+        }
+        if !select {
+            self.sel_anchor = None;
+        }
         let (line, _) = self.row_col(self.caret);
         self.caret = if line > 0 {
             self.place_in_line(self.up_target(line), self.visual_col())
@@ -1237,6 +1390,18 @@ impl WyEditor {
     }
 
     pub(crate) fn move_down(&mut self) {
+        self.move_down_select(false);
+    }
+
+    /// 光标下移。`select=true`（Shift+Down）固定 `sel_anchor` 建立并保持选区；
+    /// `false` 只移光标并收起选区。
+    pub(crate) fn move_down_select(&mut self, select: bool) {
+        if select && self.sel_anchor.is_none() {
+            self.sel_anchor = Some(self.caret);
+        }
+        if !select {
+            self.sel_anchor = None;
+        }
         let (line, _) = self.row_col(self.caret);
         let total = self.doc.line_starts().len();
         self.caret = if line + 1 < total {

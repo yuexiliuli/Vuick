@@ -484,6 +484,10 @@ wy_action!(Left, "wy-left");
 wy_action!(Right, "wy-right");
 wy_action!(Up, "wy-up");
 wy_action!(Down, "wy-down");
+wy_action!(SelectLeft, "wy-select-left");
+wy_action!(SelectRight, "wy-select-right");
+wy_action!(SelectUp, "wy-select-up");
+wy_action!(SelectDown, "wy-select-down");
 wy_action!(Backspace, "wy-backspace");
 wy_action!(Delete, "wy-delete");
 wy_action!(Enter, "wy-enter");
@@ -493,6 +497,9 @@ wy_action!(Cut, "wy-cut");
 wy_action!(Paste, "wy-paste");
 wy_action!(Undo, "wy-undo");
 wy_action!(Redo, "wy-redo");
+// E3：Tab 键进 WY。必须在 `wy-editor` 上下文注册键位（深于 Root 的 `tab→focus_next`），
+// 否则 WY 持焦时 Tab 被窗口级焦点循环劫走（用户「按 Tab 视觉无任何效果」的根因）。
+wy_action!(Tab, "wy-tab");
 
 /// 装配键位（入口：`main.rs` 与其它键位一并安装）。
 pub fn bind_keys(cx: &mut gpui::App) {
@@ -502,6 +509,10 @@ pub fn bind_keys(cx: &mut gpui::App) {
         KeyBinding::new("right", Right, Some(CONTEXT)),
         KeyBinding::new("up", Up, Some(CONTEXT)),
         KeyBinding::new("down", Down, Some(CONTEXT)),
+        KeyBinding::new("shift-left", SelectLeft, Some(CONTEXT)),
+        KeyBinding::new("shift-right", SelectRight, Some(CONTEXT)),
+        KeyBinding::new("shift-up", SelectUp, Some(CONTEXT)),
+        KeyBinding::new("shift-down", SelectDown, Some(CONTEXT)),
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CONTEXT)),
@@ -518,6 +529,8 @@ pub fn bind_keys(cx: &mut gpui::App) {
         KeyBinding::new("cmd-shift-z", Redo, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-z", Redo, Some(CONTEXT)),
         KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
+        // E3：Tab → 光标处插入可见缩进（`\t` 字面量，与源码编辑区同一单位）。
+        KeyBinding::new("tab", Tab, Some(CONTEXT)),
     ])
 }
 
@@ -565,6 +578,27 @@ impl gpui::Render for WyEditor {
             .on_action(cx.listener(
                 |this: &mut WyEditor, _: &Down, _: &mut Window, _: &mut Context<WyEditor>| {
                     this.move_down()
+                },
+            ))
+            // S1：Shift+方向键 → 与编辑区同语义的建立/收缩选区（固定锚 sel_anchor）。
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &SelectLeft, _: &mut Window, _: &mut Context<WyEditor>| {
+                    this.move_left_select(true)
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &SelectRight, _: &mut Window, _: &mut Context<WyEditor>| {
+                    this.move_right_select(true)
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &SelectUp, _: &mut Window, _: &mut Context<WyEditor>| {
+                    this.move_up_select(true)
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &SelectDown, _: &mut Window, _: &mut Context<WyEditor>| {
+                    this.move_down_select(true)
                 },
             ))
             .on_action(cx.listener(
@@ -656,6 +690,18 @@ impl gpui::Render for WyEditor {
             .child(element::WyEditorElement {
                 editor: cx.entity(),
             });
+        // E3（只读门控）：Tab 动作只在**可编辑**时登记。只读预览（md_wy/epub）中该
+        // `on_action` 不注册 → `wy-tab` 键位虽仍在 `wy-editor` 上下文内解析、却无监听可
+        // 消费 → 按键落回 Root 的 `tab→focus_next`（焦点循环不回归；只读不可编辑、插
+        // Tab 无意义）。gpui 动作冒泡默认停传（window.rs bubble 置 propagate=false），
+        // 可编辑时 `tab_insert` 消费即拦住 Root 焦点循环——两态分路互不干扰。
+        if self.editable {
+            root = root.on_action(cx.listener(
+                |this: &mut WyEditor, _: &Tab, _: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.tab_insert(cx)
+                },
+            ));
+        }
         if let Some(overlay) = image_edit_overlay {
             root = root.child(overlay);
         }

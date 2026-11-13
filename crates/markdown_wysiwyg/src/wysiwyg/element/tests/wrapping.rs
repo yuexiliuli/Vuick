@@ -335,14 +335,15 @@ fn list_marker_vertical_center_tracks_first_wrapped_line(cx: &mut TestAppContext
     });
 }
 
-/// 复现判定：标题行（`##`）点击后光标竖条必须**垂直居中**于行盒内。
+/// 复现判定：标题行（`##`）点击后光标竖条必须**垂直居中于该行字形框**内。
 /// 根因：标题行 `row.lh`（= `theme.heading_line(level)`，大于正文行高 `f.line_h`）内
 /// 文本按 `paint_text_row`（`row.lh` 排版）垂直居中，但 `caret_geometry` 把光标竖条
 /// 锚死**行盒顶**（top = `row.top`）、paint 高度固定 `f.line_h` → 光标竖条偏上
 /// （b5 实测 h2 约上偏 3.3px、h1 约 5.5px）。正文行 `lh == f.line_h` 不受影响。
-/// 修复 = 单文本行返回的 ctop 下移 `(row.lh − f.line_h)/2.max(0)`（正文/引述/code 等
-/// lh ≤ f.line_h 的行钳 0 → 行为不变）。本测试走真实渲染路径：点标题行文本垂直中心
-/// → 落光标 → `caret_geometry` 断言 top = `row.top + (lh−f.line_h)/2`；若回归到旧行为
+/// 修复 = 单文本行返回的 ctop 下移 `(row.lh − 字形高)/2.max(0)`（标题行字形高 =
+/// `caret_bar_height`，覆盖该行文字字形；正文/引述/code 等 lh ≤ f.line_h 的行钳 0 →
+/// 行为不变）。本测试走真实渲染路径：点标题行文本垂直中心 → 落光标 →
+/// `caret_geometry` 断言 top = `row.top + (lh−字形高)/2`；若回归到旧行为
 /// （top == row.top）断言必败（差值 = 居中偏移 ≥1px）。
 #[gpui::test]
 fn heading_line_caret_vertically_centered_in_row_box(cx: &mut TestAppContext) {
@@ -359,7 +360,7 @@ fn heading_line_caret_vertically_centered_in_row_box(cx: &mut TestAppContext) {
         let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         let line_h = f32::from(frame.line_h);
         let pad = f32::from(frame.padding);
-        // ① 标题行：点文本垂直中心 → 光标 top 应下移居中偏移（= row.top + (lh−line_h)/2）。
+        // ① 标题行：点文本垂直中心 → 光标 top 应下移居中偏移（= row.top + (lh−字形高)/2）。
         let heading = frame
             .rows
             .iter()
@@ -371,11 +372,6 @@ fn heading_line_caret_vertically_centered_in_row_box(cx: &mut TestAppContext) {
             h_lh > line_h,
             "复现前提：标题行高应大于正文行高（lh={h_lh:.2} > line_h={line_h:.2}）"
         );
-        let center_off = (h_lh - line_h) / 2.;
-        assert!(
-            center_off >= 1.0,
-            "复现前提：居中偏移应显著（≥1px，实际 {center_off:.2}px）"
-        );
         // 点击标题行文本垂直中心（x 在行内文本区：padding + x_off + 少量）。
         let click_x = pad + f32::from(heading.x_off) + 5.;
         let click_y = h_top + h_lh * 0.5;
@@ -384,7 +380,15 @@ fn heading_line_caret_vertically_centered_in_row_box(cx: &mut TestAppContext) {
         ed.update(cx, |e, _| e.set_caret(off));
         let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         let (on, _, caret_top) = caret_geometry(ed.read(cx), &frame);
+        let bar_h = caret_bar_height(ed.read(cx), &frame);
         assert!(on, "标题行应可放光标");
+        // 居中偏移 = (行带高 − 字形高)/2：标题行字形高 < lh → 偏移显著（≥1px）。
+        let center_off = ((h_lh - f32::from(bar_h)) / 2.).max(0.);
+        assert!(
+            center_off >= 1.0,
+            "复现前提：居中偏移应显著（≥1px，实际 {center_off:.2}px，bar_h={})",
+            f32::from(bar_h)
+        );
         let ctop = f32::from(caret_top);
         assert!(
             (ctop - (h_top + center_off)).abs() < 0.5,
@@ -397,6 +401,13 @@ fn heading_line_caret_vertically_centered_in_row_box(cx: &mut TestAppContext) {
             (ctop - h_top).abs() >= 0.5 * center_off,
             "回归到旧行为（光标锚行盒顶 top=row.top）时此断言必败：ctop−top={:.2}",
             (ctop - h_top).abs()
+        );
+        // 竖条不越出行带（「偏下/悬在行带下方」回归锁）。
+        assert!(
+            ctop + f32::from(bar_h) <= h_top + h_lh + 0.5,
+            "竖条底不越出行带：{:.2} ≤ {}",
+            ctop + f32::from(bar_h),
+            h_top + h_lh
         );
         // ② 正文段落行：lh == f.line_h → 偏移 =0，光标持续锚行盒顶（top = row.top）。
         let para = frame
@@ -417,11 +428,17 @@ fn heading_line_caret_vertically_centered_in_row_box(cx: &mut TestAppContext) {
         ed.update(cx, |e, _| e.set_caret(off_p));
         let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         let (on_p, _, caret_top_p) = caret_geometry(ed.read(cx), &frame);
+        let bar_h_p = caret_bar_height(ed.read(cx), &frame);
         assert!(on_p, "正文行应可放光标");
         assert!(
             (f32::from(caret_top_p) - p_top).abs() < 0.5,
             "正文行光标应锚行盒顶（偏移 =0）：top={p_top:.2}，实得 {:.2}",
             f32::from(caret_top_p)
+        );
+        assert!(
+            (f32::from(bar_h_p) - line_h).abs() < 0.5,
+            "正文行光标高 = 正文行高（现状不变），实得 {}",
+            f32::from(bar_h_p)
         );
     });
 }

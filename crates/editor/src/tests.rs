@@ -5,3 +5,4 @@ include!("tests/logic.rs");
 include!("tests/view.rs");
 include!("tests/find.rs");
 include!("tests/goto.rs");
+include!("tests/tab.rs");

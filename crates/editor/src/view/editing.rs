@@ -752,7 +752,73 @@ impl CodeEditor {
         if outdent {
             return self.outdent(cx);
         }
-        self.insert_edit(self.selection.range(), "\t", EditIntent::Atomic, cx);
+        // H2 修复（真机字形）：直接插 `\t` 在 Windows 生产 DirectWrite 整形下零宽
+        // （见 base::tab_diag 根因审计）→ 改插 `tab_size` 个空格（可见缩进；与
+        // `outdent` 吃掉 ≤tab_size 前导空格对称）。
+        let indent = " ".repeat(self.tab_size);
+        if self.selection.is_collapsed() {
+            // E1：无选区 → 在光标处插入一小段可见缩进（空格）。
+            base::tab_diag::diag("editor-insert", || {
+                format!("off={}", self.selection.head())
+            });
+            self.insert_edit(self.selection.range(), &indent, EditIntent::Atomic, cx);
+            return;
+        }
+        // E2：有选区 → 只缩进「选区覆盖的源行」（每行行首各加一小段空格缩进），
+        // **绝不替换/删除选中行**——旧实现 `insert_edit(selection.range(), "\t")`
+        // 会把整段选区替换成单字符，单选一整行即「行消失」的数据破坏。
+        base::tab_diag::diag("editor-indent", || "lines".into());
+        self.indent_selected_lines(&indent, cx);
+    }
+
+    /// E2：把选区覆盖的每一源行行首插入 `indent`（默认 `tab_size` 个空格缩进），选中
+    /// 文字原样保留。整段作为**一笔原子替换**（单 undo 事务、单次缓冲编辑、单 dirty
+    /// 段），而非逐行多次 push_edit——`UndoManager::push_edit` 对不邻接的 Atomic 编辑
+    /// 会各自成事务，逐行插入会把一次 Tab 拆成多笔撤销（见 undo.rs 的 commit-on-push
+    /// 语义）。选区两端按「其前已插缩进数」平移（每行一次缩进 = `indent.len()` 字节），
+    /// 仍覆盖原几行。
+    fn indent_selected_lines(&mut self, indent: &str, cx: &mut Context<Self>) {
+        let indent_len = indent.len().max(1);
+        let range = self.selection.range();
+        let line_a = self.buffer.line_of_offset(range.start);
+        let line_b = self
+            .buffer
+            .line_of_offset(range.end.saturating_sub(1).max(range.start));
+        // 被替换段 = 首选中行的行首 → 选区终点（末行含未选中前缀也会被行首缩进，
+        // 这是「选中即缩进该行」的标准语义；替换仅添加缩进，不删任何原字符）。
+        let span_start = self.buffer.line_start(line_a);
+        let span_end = range.end.max(span_start);
+        if span_end <= span_start {
+            return;
+        }
+        let old_span = self.buffer.text_in_range(span_start..span_end);
+        // 行首逐个前缀（尾换行后的幻影空行不插）。
+        let mut new_span = String::with_capacity(old_span.len() + indent_len * (line_b - line_a + 1));
+        let mut at_start = true;
+        for ch in old_span.chars() {
+            if at_start {
+                new_span.push_str(indent);
+                at_start = false;
+            }
+            if ch == '\n' {
+                at_start = true;
+            }
+            new_span.push(ch);
+        }
+        // 选区两端平移：`[span_start, e]` 内每处行首前缀了一次缩进（含 e 恰为行首）。
+        let shift_endpoint = |e: usize| {
+            e + indent_len * (line_a..=line_b).filter(|&r| self.buffer.line_start(r) <= e).count()
+        };
+        let new_anchor = shift_endpoint(self.selection.anchor);
+        let new_head = shift_endpoint(self.selection.head);
+        // 一笔原子替换（内部完成撤销事务/高亮增量/折叠同步/预览 dirty/通知）。
+        self.insert_edit(span_start..span_end, &new_span, EditIntent::Atomic, cx);
+        // 还原选区覆盖范围（insert_edit 会把光标收敛到插入终点）。
+        self.selection.anchor = new_anchor.min(self.buffer.len());
+        self.selection.head = new_head.min(self.buffer.len());
+        self.selection.preferred_column = None;
+        self.kick_caret();
+        cx.notify();
     }
 
     fn outdent(&mut self, cx: &mut Context<Self>) {

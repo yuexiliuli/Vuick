@@ -120,10 +120,10 @@ fn click_below_tail_clamps_caret_to_content_end(cx: &mut TestAppContext) {
     }
 }
 
-/// 场景 A：空标题行（`# ` / `## ` 无正文）点击后光标竖条要**垂直居中于行带**（= 该行
-/// 文本将出现的带内居中位置，与输入一字后的光标垂直位置一致），而非锚行带顶
-/// （偏上 bug）。对可编辑标题行（有正文）同样断言一致性：两条路径 ctop−top 都取
-/// `(lh − f.line_h)/2`。
+/// 场景 A：空标题行（`# ` / `## ` 无正文）点击后光标竖条要**垂直居中于该行字形框**（=
+/// 该行文本将出现的字形位置，与输入一字后的光标垂直位置一致），而非锚行带顶（偏上
+/// bug）。对可编辑标题行（有正文）同样断言一致性：两条路径 ctop−top 都取
+/// `(lh − 字形高)/2`（字形高 = `caret_bar_height`；标题行竖条覆盖该行文字字形）。
 #[gpui::test]
 fn empty_heading_caret_vertically_centered(cx: &mut TestAppContext) {
     use crate::markdown::ir::IrKind;
@@ -154,19 +154,28 @@ fn empty_heading_caret_vertically_centered(cx: &mut TestAppContext) {
             heading.src_line
         );
         let f2 = blank_harness(vcx, &ed);
-        let (on, _cx_geom, carety) = vcx.update(|_, cx| {
-            let g = caret_geometry(ed.read(cx), &f2);
-            (g.0, g.1, g.2)
+        let (on, carety, bar_h) = vcx.update(|_, cx| {
+            let e = ed.read(cx);
+            let g = caret_geometry(e, &f2);
+            (g.0, g.2, caret_bar_height(e, &f2))
         });
         assert!(on, "doc {text:?} 标题行光标应可画");
-        // 带内居中量：与可编辑分支同一推导（`(lh − line_h)/2`）。标题行 lh > line_h →
-        // 该量 ≠ 0，旧实现在不可编辑分支锚 `r.top`（偏上）时此断言必败。
-        let centered = ((lh - line_h) / 2.).max(0.);
+        // 带内居中量：与可编辑分支同一推导（`(lh − bar_h)/2`），bar_h = 该行字形高。
+        // 标题行 lh > bar_h → 该量 ≠ 0，旧实现在不可编辑分支锚 `r.top`（偏上）时必败。
+        let centered = ((lh - f32::from(bar_h)) / 2.).max(0.);
         let d = f32::from(carety) - top;
         assert!(
             (d - centered).abs() < 0.5,
-            "doc {text:?} 光标 ctop−top 应 = 带内居中 {centered:.2} \
-             （跟手即得：lh={lh:.2} line_h={line_h:.2}），实际 {d:.2}"
+            "doc {text:?} 光标 ctop−top 应 = 字形框居中 {centered:.2} \
+             （跟手即得：lh={lh:.2} bar_h={}），实际 {d:.2}",
+            f32::from(bar_h)
+        );
+        // 竖条不越出行带（「偏下/悬在行带下方」回归锁）。
+        assert!(
+            f32::from(carety) + f32::from(bar_h) <= top + lh + 0.5,
+            "doc {text:?} 竖条底不越出行带：{:.2} ≤ {}",
+            f32::from(carety) + f32::from(bar_h),
+            top + lh
         );
         if lh > line_h + 0.5 {
             assert!(

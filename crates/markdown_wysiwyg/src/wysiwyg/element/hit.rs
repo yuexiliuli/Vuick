@@ -28,6 +28,12 @@ pub fn caret_geometry(editor: &WyEditor, f: &Frame) -> (bool, Pixels, Pixels) {
     markdown_wysiwyg_engine::hit::caret_geometry(&editor.rd, editor, f)
 }
 
+/// 光标竖条高度（px）：文本/标题/代码行 = 所在行行高 `r.lh`（标题大字 → 光标同步
+/// 长高）；表格单元 = `para_line` 居中高；未命中行 = 正文行高 `f.line_h`。
+pub fn caret_bar_height(editor: &WyEditor, f: &Frame) -> Pixels {
+    markdown_wysiwyg_engine::hit::caret_bar_height(&editor.rd, editor, f)
+}
+
 /// 点命中（元素局部）→ 源字节偏移。
 pub fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> usize {
     markdown_wysiwyg_engine::hit::source_offset_at_local(&editor.rd, editor, frame, p)

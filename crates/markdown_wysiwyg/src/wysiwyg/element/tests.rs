@@ -30,3 +30,6 @@ include!("tests/caret_blink.rs");
 include!("tests/cache_cap.rs");
 include!("tests/structure_edit_clean.rs");
 include!("tests/tail_blank_heading_click.rs");
+include!("tests/live2_edits.rs");
+include!("tests/tab.rs");
+include!("tests/p0_p1.rs");
