@@ -96,16 +96,25 @@ const FIND_TIP_DELAY_MS: u64 = 400;
 impl CodeEditor {
     /// 打开 find 条（Ctrl+F）：输入框自动聚焦 + 自动带上最近一次查询（若有）。
     pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 首次打开懒创建输入框实体 + 订阅「文本变化 → 置脏 + 防抖」。
+        // 首次打开懒创建输入框实体 + 订阅「文本变化 → 置脏 + 防抖；Enter/Esc（组件
+        // 统一上抛 Submit/Cancel）→ 导航 / 关闭」。
         if self.find_input.is_none() {
             let input = cx
                 .new(|cx| ui::input::InputState::new(window, cx).placeholder("查找…"));
             let input_entity = input.clone();
-            self._find_sub = Some(cx.subscribe(&input, move |ed, _src, ev, cx| {
-                if matches!(ev, ui::input::InputEvent::Change) {
-                    let q = input_entity.read(cx).value().to_string();
-                    ed.find_query_changed(q, cx);
-                }
+            let weak_ed = cx.weak_entity();
+            self._find_sub = Some(window.subscribe(&input, cx, move |_, ev, window, cx| {
+                let Some(ed) = weak_ed.upgrade() else {
+                    return;
+                };
+                let _ = ed.update(cx, |ed, cx| match ev {
+                    ui::input::InputEvent::Change => {
+                        let q = input_entity.read(cx).value().to_string();
+                        ed.find_query_changed(q, cx);
+                    }
+                    ui::input::InputEvent::Submit { shift } => ed.find_step(!shift, cx),
+                    ui::input::InputEvent::Cancel => ed.close_find(window, cx),
+                });
             }));
             self.find_input = Some(input);
         }
@@ -365,16 +374,30 @@ impl CodeEditor {
     /// 打开跳转行卡片（Ctrl+G 分发到活动文本 tab）：输入框自动聚焦；再次打开回显
     /// 最近一次输入并防抖重跳（recall，同 find Esc 后 F3 复用语义）。
     pub fn open_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 首次打开懒创建输入框实体 + 订阅「文本变化 → 置脏 + 防抖」。
+        // 首次打开懒创建输入框实体 + 订阅「文本变化 → 置脏 + 防抖；Enter/Esc（组件
+        // 统一上抛 Submit/Cancel）→ 立即 flush（取消防抖）/ 关闭」。
         if self.goto_input.is_none() {
             let input = cx
                 .new(|cx| ui::input::InputState::new(window, cx).placeholder("行号（可 行:列）"));
             let input_entity = input.clone();
-            self._goto_sub = Some(cx.subscribe(&input, move |ed, _src, ev, cx| {
-                if matches!(ev, ui::input::InputEvent::Change) {
-                    let q = input_entity.read(cx).value().to_string();
-                    ed.goto_input_changed(q, cx);
-                }
+            let weak_ed = cx.weak_entity();
+            self._goto_sub = Some(window.subscribe(&input, cx, move |_, ev, window, cx| {
+                let Some(ed) = weak_ed.upgrade() else {
+                    return;
+                };
+                let _ = ed.update(cx, |ed, cx| match ev {
+                    ui::input::InputEvent::Change => {
+                        let q = input_entity.read(cx).value().to_string();
+                        ed.goto_input_changed(q, cx);
+                    }
+                    // Enter（Submit）：取消防抖、当场 flush（与旧 goto_card_key_down 同
+                    // 语义 —— 新代号作废旧任务后立即就地 flush，卡片不关、输入框持焦）。
+                    ui::input::InputEvent::Submit { .. } => {
+                        ed.goto.invalidate();
+                        ed.goto_flush(cx);
+                    }
+                    ui::input::InputEvent::Cancel => ed.close_goto(window, cx),
+                });
             }));
             self.goto_input = Some(input);
         }

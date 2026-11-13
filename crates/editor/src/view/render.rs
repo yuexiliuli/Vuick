@@ -7,8 +7,8 @@ use std::ops::Range;
 use gpui::{
     div, list, point, px, size, AnyElement, AnimationExt, App, Bounds, Context, DispatchPhase,
     Element, ElementId, ElementInputHandler, Entity, EventEmitter, Focusable, FocusHandle,
-    GlobalElementId, HighlightStyle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
-    ListState, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
+    GlobalElementId, HighlightStyle, Hsla, InteractiveElement, IntoElement, LayoutId, ListState,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
     ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledText, Window,
     prelude::FluentBuilder as _,
 };
@@ -659,9 +659,9 @@ impl CodeEditor {
                 gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.18))
                     .blur_radius(px(8.)),
             ])
-            // 点击卡片任意处不穿透到编辑区（移动光标）；Esc/Enter/Shift+Enter 原样按键。
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::find_bar_mouse_down))
-            .on_key_down(cx.listener(Self::find_bar_key_down));
+            // 点击卡片任意处不穿透到编辑区（移动光标）；Enter/Esc 已由输入框统一收敛
+            // 为 Submit/Cancel 事件上抛（find_goto.rs 订阅处理），不再挂容器 on_key_down。
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::find_bar_mouse_down));
 
         // ①输入框（`ui::InputState`，IME/组合/UTF-16 依赖其既有实现，本任务不动）。
         card = card.child(
@@ -776,28 +776,6 @@ impl CodeEditor {
         cx.stop_propagation();
     }
 
-    /// find 条按键：Escape=关条（移除高亮、焦点归还）；Enter/Shift+Enter=下一个/上一个。
-    fn find_bar_key_down(
-        &mut self,
-        e: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let k = &e.keystroke;
-        match k.key.to_ascii_lowercase().as_str() {
-            "escape" => {
-                cx.stop_propagation();
-                self.close_find(window, cx);
-            }
-            "enter" => {
-                cx.stop_propagation();
-                window.prevent_default();
-                self.find_step(!k.modifiers.shift, cx);
-            }
-            _ => {}
-        }
-    }
-
     /// 编辑区内跳转行卡片（Ctrl+G）。取代旧 shell 命令面板 GoToLine：一段紧凑悬浮卡片
     /// **顶部居中**（水平居中于编辑区，非整行通栏；不遮右上角 find 卡），含：
     /// ①输入框 ②内联提示区（钳制 / 非法 / 空）。圆角 + 边框 + 阴影，背景/边框/文字
@@ -850,10 +828,10 @@ impl CodeEditor {
                     .blur_radius(px(8.)),
             ])
             // 点击卡片任意处不穿透到编辑区（不落光标）；点击卡片外（Capture 阶段按
-            // hitbox 判定）关闭卡片；Enter/Esc 原样按键（Enter flush 不关、Esc 关闭）。
+            // hitbox 判定）关闭卡片；Enter/Esc 已由输入框统一收敛为 Submit/Cancel 事件
+            // 上抛（find_goto.rs 订阅处理），不再挂容器 on_key_down。
             .on_mouse_down(MouseButton::Left, cx.listener(Self::goto_card_mouse_down))
-            .on_mouse_down_out(cx.listener(Self::goto_card_mouse_down_out))
-            .on_key_down(cx.listener(Self::goto_card_key_down));
+            .on_mouse_down_out(cx.listener(Self::goto_card_mouse_down_out));
 
         // ①输入框（`ui::InputState`，IME/组合/UTF-16 依赖其既有实现，本任务不动）。
         card = card.child(
@@ -914,31 +892,6 @@ impl CodeEditor {
         cx: &mut Context<Self>,
     ) {
         self.close_goto(window, cx);
-    }
-
-    /// goto 卡片按键：Enter = 立即 flush（取消防抖、当场跳转，卡片不关、输入框保持
-    /// 焦点）；Esc = 关闭（焦点还编辑器）。
-    fn goto_card_key_down(
-        &mut self,
-        e: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let k = &e.keystroke;
-        match k.key.to_ascii_lowercase().as_str() {
-            "escape" => {
-                cx.stop_propagation();
-                self.close_goto(window, cx);
-            }
-            "enter" => {
-                cx.stop_propagation();
-                window.prevent_default();
-                // 取消防抖（新代号作废旧任务）→ 立即就地 flush（不关卡、输入框仍持焦）。
-                self.goto.invalidate();
-                self.goto_flush(cx);
-            }
-            _ => {}
-        }
     }
 }
 

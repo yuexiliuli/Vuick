@@ -42,6 +42,11 @@ use crate::ui::theme::Theme;
 pub enum InputEvent {
     /// 文本内容变化（搜索框变化 → 刷新搜索结果）。
     Change,
+    /// Enter 按下（Shift+Enter 时 `shift=true`）；组件已 `stop_propagation` +
+    /// `prevent_default`。消费方订阅即可复用「提交」语义，无需在容器层手工解析按键。
+    Submit { shift: bool },
+    /// Esc 按下；组件已 `stop_propagation`。消费方订阅复用「取消/关闭」语义。
+    Cancel,
 }
 
 /// 左右内边距（文本/光标相对元素左缘）。
@@ -502,7 +507,38 @@ impl InputState {
     /// `CodeEditor::on_key_down` 同套路——`Select{Left,Right}` 是组件/编辑器内部 action、
     /// 公共 keymap 未绑我们无法注册 handler，故在原样 key_down 层处理）；其余全走
     /// `on_action`。可打印字符（无修饰）放行给 IME/输入处理。
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter/Esc：组件统一收敛为「提交/取消」事件上抛（行为下取），**必须先于**可打印
+        // 字符早退处理。
+        //
+        // ⚠️ 机制边界（评审实证）：gpui 按键派发次序是 **先 keymap 动作层、后 key_down
+        // 事件层**（`window.rs dispatch_key_event`：`for binding in match_result.bindings {
+        // dispatch_action_on_node }` → `finish_dispatch_key_event` 才派发 key_down）。
+        // 因此本层 `stop_propagation` **拦不住祖先节点的 `on_action` 动作**——它只拦截
+        // 祖先的 key_down 处理。
+        // 本批 4 个消费方（prompt/find/goto/palette）祖先链均无 `on_action(Enter/Escape)`
+        //（全仓核实），所以「key_down 层 stop_propagation 即不冒泡」语义成立。
+        // 已知遗留：WYSIWYG 根挂 `on_action(Enter→newline)` + CONTEXT keybinding
+        //（markdown_wysiwyg/src/wysiwyg/mod.rs:519），且 deferred 浮层经
+        // `set_active_node(prepaint_deferred_draws, window.rs:3931)` 挂回 WyEditor
+        // dispatch 路径 → 图片编辑卡输入框内按 Enter 会泄漏触发文档换行：**既有 bug，
+        // 本批不动，下一批专项修**。
+        match event.keystroke.key.to_ascii_lowercase().as_str() {
+            "enter" => {
+                cx.stop_propagation();
+                window.prevent_default();
+                cx.emit(InputEvent::Submit {
+                    shift: event.keystroke.modifiers.shift,
+                });
+                return;
+            }
+            "escape" => {
+                cx.stop_propagation();
+                cx.emit(InputEvent::Cancel);
+                return;
+            }
+            _ => {}
+        }
         let k = &event.keystroke;
         let m = k.modifiers;
         if !m.control && !m.alt && !m.platform && k.key_char.is_some() {
@@ -1130,28 +1166,53 @@ mod tests {
         }
     }
 
-    /// 窗口宿主：div 包裹输入框（Render 走 InputElement），订阅 Change 计数。
+    /// 带「祖先 on_key_down 记录器」的宿主：断言组件 `stop_propagation` 后祖先不再收到
+    /// Enter/Esc。祖先 `on_key_down` 在输入框元素的祖先 dispatch 节点上。
+    struct AncestorHost {
+        input: Entity<InputState>,
+        _sub: gpui::Subscription,
+        ancestor: Rc<RefCell<usize>>,
+    }
+    impl Render for AncestorHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let anc = self.ancestor.clone();
+            div()
+                .on_key_down(move |_: &KeyDownEvent, _, _| *anc.borrow_mut() += 1)
+                .child(self.input.clone())
+        }
+    }
+
+    /// 窗口宿主：div 包裹输入框（Render 走 InputElement），订阅事件计数。
     fn add_input<'a>(
         cx: &'a mut TestAppContext,
         text: &str,
-    ) -> (Entity<InputState>, &'a mut VisualTestContext, Rc<RefCell<usize>>) {
+    ) -> (
+        Entity<InputState>,
+        &'a mut VisualTestContext,
+        Rc<RefCell<(usize, usize, usize)>>,
+    ) {
         let holder: Rc<RefCell<Option<Entity<InputState>>>> = Rc::default();
-        let changes = Rc::new(RefCell::new(0usize));
+        let events = Rc::new(RefCell::new((0usize, 0usize, 0usize)));
         let (_root, wcx) = cx.add_window_view(|window, cx| {
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("搜索…")
                     .default_value(text)
             });
-            let sub = changes.clone();
-            let _sub = cx.subscribe(&input, move |_, _, ev: &InputEvent, _| match ev {
-                InputEvent::Change => *sub.borrow_mut() += 1,
+            let sub = events.clone();
+            let _sub = cx.subscribe(&input, move |_, _, ev: &InputEvent, _| {
+                let mut e = sub.borrow_mut();
+                match ev {
+                    InputEvent::Change => e.0 += 1,
+                    InputEvent::Submit { .. } => e.1 += 1,
+                    InputEvent::Cancel => e.2 += 1,
+                }
             });
             *holder.borrow_mut() = Some(input.clone());
             InputHost { input, _sub }
         });
         let _ = _root;
-        (holder.borrow().clone().unwrap(), wcx, changes)
+        (holder.borrow().clone().unwrap(), wcx, events)
     }
 
     /// `default_value`/`value`/占位符 + `set_value` 发 Change。
@@ -1171,7 +1232,83 @@ mod tests {
         });
         let value = wcx.update(|_w, cx| input.read(cx).value().to_string());
         assert_eq!(value, "你好 world");
-        assert_eq!(*changes.borrow(), 1, "set_value 应发出一次 Change");
+        assert_eq!(changes.borrow().0, 1, "set_value 应发出一次 Change");
+    }
+
+    /// Enter/Esc 统一收敛为 Submit/Cancel 事件上抛（事件上抛、行为下取）：
+    /// 焦点在输入框时按 Enter → 恰好一个 Submit（shift=false）且**祖先 on_key_down
+    /// 不被调用**（组件已 `stop_propagation`）；Shift+Enter → Submit{shift=true}；
+    /// Esc → 恰好一个 Cancel 且祖先不被调用。这是「仅收到一个 Submit」的收敛断言
+    /// （对应 gpui `stop_propagation/prevent_default/action` 派发次序的实测定性：
+    /// key_down 层的 stop 拦截祖先 key_down；若祖先链还有 `on_action(Enter/Escape)`，
+    /// 动作层先于 KeyDownEvent 派发、本组件 stop 拦不住——见 WYSIWYG 图片卡泄漏项）。
+    #[gpui::test]
+    async fn input_enter_escape_submit_cancel_stops_at_component(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let holder: Rc<RefCell<Option<Entity<InputState>>>> = Rc::default();
+        let events = Rc::new(RefCell::new((0usize, 0usize, 0usize)));
+        let last_shift = Rc::new(RefCell::new(None::<bool>));
+        let ancestor_hits = Rc::new(RefCell::new(0usize));
+        let (_root, wcx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("搜索…")
+                    .default_value("abc")
+            });
+            let sub = events.clone();
+            let shift_cell = last_shift.clone();
+            let _sub = cx.subscribe(&input, move |_, _, ev: &InputEvent, _| {
+                let mut e = sub.borrow_mut();
+                match ev {
+                    InputEvent::Change => e.0 += 1,
+                    InputEvent::Submit { shift } => {
+                        e.1 += 1;
+                        *shift_cell.borrow_mut() = Some(*shift);
+                    }
+                    InputEvent::Cancel => e.2 += 1,
+                }
+            });
+            let anc = ancestor_hits.clone();
+            let anc_host = AncestorHost {
+                input,
+                _sub,
+                ancestor: anc,
+            };
+            *holder.borrow_mut() = Some(anc_host.input.clone());
+            anc_host
+        });
+        let _ = _root;
+        let input = holder.borrow().clone().unwrap();
+        settle_window(wcx);
+        let w = wcx.windows().first().copied().expect("有测试窗口");
+        // 聚焦输入框（真实键盘路径起点）。
+        wcx.update(|window, cx| {
+            let fh = input.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        });
+        wcx.run_until_parked();
+        // Enter → 恰好一个 Submit（shift=false），祖先 key_down 不触发。
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("enter").unwrap());
+        assert_eq!(*events.borrow(), (0, 1, 0), "Enter 应恰好发一个 Submit");
+        assert_eq!(
+            *last_shift.borrow(),
+            Some(false),
+            "普通 Enter 的 Submit.shift 应为 false"
+        );
+        assert_eq!(*ancestor_hits.borrow(), 0, "Enter 不应冒泡到祖先 on_key_down");
+        // Shift+Enter → Submit{shift=true}。
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("shift-enter").unwrap());
+        assert_eq!(*events.borrow(), (0, 2, 0), "Shift+Enter 应再发一个 Submit");
+        assert_eq!(
+            *last_shift.borrow(),
+            Some(true),
+            "Shift+Enter 的 Submit.shift 应为 true"
+        );
+        assert_eq!(*ancestor_hits.borrow(), 0, "Shift+Enter 不应冒泡到祖先 on_key_down");
+        // Esc → 恰好一个 Cancel，祖先 key_down 不触发。
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("escape").unwrap());
+        assert_eq!(*events.borrow(), (0, 2, 1), "Esc 应恰好发一个 Cancel");
+        assert_eq!(*ancestor_hits.borrow(), 0, "Esc 不应冒泡到祖先 on_key_down");
     }
 
     /// `replace_text_in_range`（IME/直输）正确落点 + 发 Change + 中文 UTF-16 换算。
@@ -1187,7 +1324,7 @@ mod tests {
             wcx.update(|_w, cx| input.read(cx).value().to_string()),
             "aXe"
         );
-        assert_eq!(*changes.borrow(), 1);
+        assert_eq!(changes.borrow().0, 1);
         // 中文：utf16[2] 是第二个字符后（"中文"后），字节偏移 ≠ utf16
         wcx.update(|window, cx| {
             input.update(cx, |s, cx| s.set_value("中文测试", window, cx));
@@ -1233,7 +1370,7 @@ mod tests {
         // → a界（提交替换 marked）
         assert_eq!(value, "a界");
         assert_eq!(caret, "a界".len().."a界".len(), "光标停在提交文本末尾");
-        assert_eq!(*changes.borrow(), 4, "组合每步与提交各发一次 Change");
+        assert_eq!(changes.borrow().0, 4, "组合每步与提交各发一次 Change");
     }
 
     /// 复现：侧边栏搜索框中文 IME「逐键追加乱码」——用户输「编辑」输入框出现
@@ -1269,7 +1406,7 @@ mod tests {
             "组合应逐键替换不追加，提交后只剩中文（而非拼音历史拼接）"
         );
         assert_eq!(caret, "编辑".len().."编辑".len(), "光标停在提交文本末尾");
-        assert_eq!(*changes.borrow(), 7, "组合每步与提交各发一次 Change");
+        assert_eq!(changes.borrow().0, 7, "组合每步与提交各发一次 Change");
     }
 
     /// 跑几帧，等渲染/layout/prepaint 就绪（element_bounds 供鼠标命中换算）。

@@ -2016,3 +2016,67 @@ fn image_edit_text_focus_paste_routes_into_text_input(cx: &mut TestAppContext) {
     );
 }
 
+/// **快照测试（诚实化，非「无泄漏」证明）**：本夹具下 WyEditor 的 caret/选区落在「换行
+/// 结构性 no-op」位置，焦点在图片编辑卡链接输入框时按 Enter/Esc，文档不改写。
+///
+/// ⚠️ 已知既存泄漏：deferred 浮层经 `set_active_node(prepaint_deferred_draws,
+/// window.rs:3931)` 挂回 WyEditor dispatch 路径，`wy-editor` CONTEXT 的
+/// `on_action(Enter→newline)`（mod.rs:519）在动作层**先于** key_down 派发——一旦 caret
+/// 移到可换行位置，图片卡输入框内按 Enter 会让 `WyEditor::newline` 向文档插换行。
+/// 本批不做修复（见 `ui::input::InputState::on_key_down` 注释的机制边界），下一批专项修。
+/// 本快照只在「单行图片 + 无显示 caret/选区」这一特定状态下成立；断言本身不改写。
+#[gpui::test]
+fn image_edit_enter_escape_snapshot_noop_caret_no_doc_rewrite(cx: &mut gpui::TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("![pic desc](http://ex.com/pic.png)\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut gpui::VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            e.open_image_edit(
+                crate::markdown::wysiwyg::ImageEditTarget::Block { src_line: 0 },
+                window,
+                cx,
+            )
+        });
+    });
+    // 打开后默认聚焦链接框（真实焦点态）。
+    vcx.update(|window, cx| {
+        let link = ed.read(cx).image_edit_link_input().expect("链接输入框");
+        let fh = link.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+        assert!(
+            ed.read(cx).image_edit_input_focused(window, cx),
+            "链接框聚焦时 image_edit_input_focused 应为 true"
+        );
+    });
+    let wh = vcx.windows().first().copied().expect("窗口句柄");
+    let before = vcx.update(|_w, cx| ed.read(cx).content());
+    assert_eq!(
+        before.as_str(),
+        "![pic desc](http://ex.com/pic.png)\n",
+        "测试前提：正文未改动"
+    );
+    // 快照：本状态下按 Enter（caret 处于换行结构性 no-op 位置）不改写文档。
+    vcx.dispatch_keystroke(wh, gpui::Keystroke::parse("enter").unwrap());
+    let after_enter = vcx.update(|_w, cx| ed.read(cx).content());
+    assert_eq!(
+        after_enter.as_str(),
+        before.as_str(),
+        "快照：图片卡链接输入框 Enter 在该 no-op 位置不改写文档：{after_enter:?}"
+    );
+    // 快照：按 Esc 同样不改写文档（卡片维持打开）。
+    vcx.dispatch_keystroke(wh, gpui::Keystroke::parse("escape").unwrap());
+    let after_esc = vcx.update(|_w, cx| ed.read(cx).content());
+    assert_eq!(
+        after_esc.as_str(),
+        before.as_str(),
+        "快照：图片卡链接输入框 Esc 不改写文档：{after_esc:?}"
+    );
+}
+

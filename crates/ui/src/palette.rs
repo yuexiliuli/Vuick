@@ -171,13 +171,29 @@ impl CommandPalette {
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let input_entity = input.clone();
-        let _input_sub = cx.subscribe(&input, move |this, _e, ev: &InputEvent, cx| match ev {
-            InputEvent::Change => {
-                this.query = input_entity.read(cx).value().to_string();
-                this.recompute_filter();
-                this.selected = (!this.filtered.is_empty()).then_some(0);
-                cx.notify();
-            }
+        // 订阅输入框事件：Change → 重算过滤；Enter（组件统一上抛 Submit）→ 激活选中
+        // 条目；Esc（上抛 Cancel）→ 关闭面板。up/down 列表导航仍留在面板根 `on_key_down`
+        // 冒泡处理（只有 enter/escape 收敛给组件事件）。
+        let weak_self = cx.weak_entity();
+        let _input_sub = window.subscribe(&input, cx, move |_, ev: &InputEvent, window, cx| {
+            let Some(this) = weak_self.upgrade() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| match ev {
+                InputEvent::Change => {
+                    this.query = input_entity.read(cx).value().to_string();
+                    this.recompute_filter();
+                    this.selected = (!this.filtered.is_empty()).then_some(0);
+                    cx.notify();
+                }
+                InputEvent::Submit { .. } => {
+                    // 与旧「面板根 on_key_down 的 enter 分支」同语义：有选中才激活执行。
+                    if this.selected.is_some() {
+                        this.activate(window, cx);
+                    }
+                }
+                InputEvent::Cancel => this.dismiss(window, cx),
+            });
         });
         let count = items.len();
         Self {
@@ -287,7 +303,9 @@ impl CommandPalette {
         !(f == self.focus_handle || f == self.input.read(cx).focus_handle(cx))
     }
 
-    fn on_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, e: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // 只保留**列表导航**（up/down 必须冒泡到面板根处理）；Enter/Esc 已由输入框
+        // 统一收敛为 `InputEvent::Submit/Cancel` 事件上抛（订阅处理，见 `new`）。
         match e.keystroke.key.as_ref() {
             "up" => {
                 cx.stop_propagation();
@@ -296,17 +314,6 @@ impl CommandPalette {
             "down" => {
                 cx.stop_propagation();
                 self.select_step(1, cx);
-            }
-            "enter" => {
-                if self.selected.is_some() {
-                    cx.stop_propagation();
-                    window.prevent_default();
-                    self.activate(window, cx);
-                }
-            }
-            "escape" => {
-                cx.stop_propagation();
-                self.dismiss(window, cx);
             }
             _ => {}
         }

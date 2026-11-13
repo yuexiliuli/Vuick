@@ -12,10 +12,10 @@ use std::path::PathBuf;
 
 use gpui::{
     deferred, div, px, AnimationExt, App, AppContext, Context, CursorStyle, DismissEvent,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, WeakEntity, Window,
 };
-use ui::input::{Input, InputState};
+use ui::input::{Input, InputEvent, InputState};
 use ui::motion::hover_spring;
 
 /// 文件树输入弹层的宿主抽象（提交动作在宿主：文件系统操作 + 树/选项卡同步）。
@@ -74,6 +74,8 @@ pub struct FileTreePrompt<H: FileTreePromptHost> {
     kind: FileTreePromptKind,
     /// 单行输入框状态（预填默认名；IME/占位符复用）。
     input: gpui::Entity<InputState>,
+    /// 输入框事件订阅（`Submit`/`Cancel` 上抛 → 提交/关闭；`Change` 无消费）。
+    _input_sub: gpui::Subscription,
     /// 宿主（泛型 `H`）弱引用：提交回调执行文件系统操作与树/选项卡同步。
     host: WeakEntity<H>,
     /// 最近一次提交失败的内联提示（重名/非法名/权限等；成功后置 None）。
@@ -95,9 +97,24 @@ impl<H: FileTreePromptHost> FileTreePrompt<H> {
         let input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("名称").default_value(default)
         });
+        // 订阅输入框事件：Enter（上抛 Submit）→ 提交；Esc（上抛 Cancel）→ 关闭。
+        // up 下取迁移：原在卡片 `on_key_down` 手工 parse "enter"/"escape"，现收敛到
+        // 输入组件统一事件（行为零变化）。
+        let weak_self = cx.weak_entity();
+        let _input_sub = window.subscribe(&input, cx, move |_, ev: &InputEvent, window, cx| {
+            let Some(this) = weak_self.upgrade() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| match ev {
+                InputEvent::Submit { .. } => this.submit(window, cx),
+                InputEvent::Cancel => this.close(window, cx),
+                InputEvent::Change => {}
+            });
+        });
         Self {
             kind,
             input,
+            _input_sub,
             host,
             hint: None,
             previous_focus,
@@ -161,21 +178,6 @@ impl<H: FileTreePromptHost> FileTreePrompt<H> {
     #[doc(hidden)]
     pub fn input_entity(&self) -> gpui::Entity<InputState> {
         self.input.clone()
-    }
-
-    fn on_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        match e.keystroke.key.as_ref() {
-            "enter" => {
-                cx.stop_propagation();
-                window.prevent_default();
-                self.submit(window, cx);
-            }
-            "escape" => {
-                cx.stop_propagation();
-                self.close(window, cx);
-            }
-            _ => {}
-        }
     }
 
     fn on_mouse_down_out(
@@ -256,7 +258,6 @@ impl<H: FileTreePromptHost> Render for FileTreePrompt<H> {
             .id("file-tree-prompt")
             .debug_selector(|| "file-tree-prompt".into())
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
             .flex()
             .flex_col()
