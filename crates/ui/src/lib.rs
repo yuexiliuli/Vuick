@@ -54,6 +54,7 @@ pub mod menu;
 pub mod motion;
 pub mod notification;
 pub mod palette;
+pub mod pill;
 pub mod root;
 pub mod scroll_panel;
 pub mod scrollbar;
@@ -71,6 +72,9 @@ pub use float_card::{anchor_layer, float_card, overlay_centered, FloatCardBg, Fl
 
 /// 横向滑块根级 re-export（`ui::Slider` / `ui::SliderFill` / `ui::SliderThumb` / `ui::CommitMode`）。
 pub use slider::{CommitMode, Slider, SliderFill, SliderThumb};
+
+/// 胶囊 chip 根级 re-export（`ui::Pill` / `ui::PillSize` / `ui::PillTone`）。
+pub use pill::{Pill, PillSize, PillTone};
 
 /// 迁移期别名：让本 crate 内部既有的 `crate::ui::` 路径（自引用）保持解析。
 use crate as ui;
