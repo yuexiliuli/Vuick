@@ -1178,8 +1178,13 @@ mod tests {
     /// 验证 compose 出的 map 判形 = Rot90 且 preimage 8 对齐在界（= 命中 SIMD 的适配条件）。
     #[test]
     fn img_0083_map_classifies_rot90_aligned() {
-        let corpus =
-            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Benchmarks/corpus/heif/IMG_0083.HEIC"));
+        // 语料装配统一走 kimg_core::testutil::corpus_dir（env `KIMG_HEIF_CORPUS` 覆盖；
+        // 缺省 `<workspace>/Benchmarks/corpus/HEIF`）；文件缺失 → SKIP 即常态。
+        let Some(dir) = kimg_core::testutil::corpus_dir("KIMG_HEIF_CORPUS", "HEIF") else {
+            eprintln!("SKIP: missing corpus/HEIF");
+            return;
+        };
+        let corpus = dir.join("IMG_0083.HEIC");
         if !corpus.exists() {
             eprintln!("SKIP: missing {corpus:?}");
             return;

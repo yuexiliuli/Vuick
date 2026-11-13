@@ -16,6 +16,7 @@ pub mod limits;
 pub mod metadata;
 pub mod pixel;
 pub mod simd;
+pub mod testutil;
 pub mod traits;
 
 pub use crate::animation::{AnimationDecoder, Delay, Frame, Frames, LoopCount, Ratio};

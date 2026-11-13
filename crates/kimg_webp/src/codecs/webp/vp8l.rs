@@ -1955,24 +1955,11 @@ mod parity_tests {
         reference_rgba_impl(data)
     }
 
-    /// 直连 image_webp（dev oracle）解为 RGBA8 字节。
+    /// 直连 image_webp（dev oracle）解为 RGBA8（eager：解码失败即 panic）。
+    /// 与 [`reference_rgba_opt`] 双胞胎收敛为单一实现（见 opt），此处仅 expect 薄包装，
+    /// 两侧调用点结果语义不变（eager / Option 经包装体现，断言数据不变）。
     fn reference_rgba_impl(data: &[u8]) -> (u32, u32, Vec<u8>) {
-        let mut dec =
-            image_webp::WebPDecoder::new(Cursor::new(data)).expect("image_webp 解码失败");
-        let (w, h) = dec.dimensions();
-        let has_alpha = dec.has_alpha();
-        let n = dec.output_buffer_size().expect("image_webp 缓冲大小");
-        let mut buf = vec![0u8; n];
-        dec.read_image(&mut buf).expect("image_webp read 失败");
-        if has_alpha {
-            (w, h, buf)
-        } else {
-            let mut rgba = Vec::with_capacity(buf.len() / 3 * 4);
-            for px in buf.chunks_exact(3) {
-                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-            }
-            (w, h, rgba)
-        }
+        reference_rgba_opt(data).expect("image_webp 解码失败")
     }
 
     /// 报告首个像素差（对齐 SimdCodecs DescribeRgbaMismatch 口径）。

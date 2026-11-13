@@ -16,9 +16,11 @@ use crate::free_functions::load_from_memory;
 use crate::ImageDecoder as _;
 
 fn corpus_dir() -> PathBuf {
-    std::env::var("IMG_BMP_CORPUS_DIR")
-        .unwrap_or_else(|_| r"E:\Rust\gpui-editor\Benchmarks\corpus\BMP".to_string())
-        .into()
+    // 统一走 kimg_core::testutil::corpus_dir：env `IMG_BMP_CORPUS_DIR` 覆盖；
+    // 缺省 `<workspace>/Benchmarks/corpus/BMP`（原硬编码绝对路径 = 同路径，改相对更通用，K66）。
+    // 缺失/无法读 → panic（与原 read_dir panic 语义一致）。
+    kimg_core::testutil::corpus_dir("IMG_BMP_CORPUS_DIR", "BMP")
+        .expect("语料目录缺失：设置 IMG_BMP_CORPUS_DIR 或装配 Benchmarks/corpus/BMP")
 }
 
 /// 语料最大 BMP（与 kimg_bmp probe 同口径：按像素数）。

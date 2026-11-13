@@ -1390,20 +1390,10 @@ mod diag_tests {
 #[cfg(test)]
 mod adam7_fast_tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    /// 语料目录：默认 `<workspace>/Benchmarks/corpus/PNG`；env `KIMG_PNG_CORPUS` 优先覆盖。
-    fn corpus_dir() -> PathBuf {
-        if let Ok(p) = std::env::var("KIMG_PNG_CORPUS") {
-            return PathBuf::from(p);
-        }
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("Benchmarks")
-            .join("corpus")
-            .join("PNG")
-    }
+    /// 语料目录：默认 `<workspace>/Benchmarks/corpus/PNG`；env `KIMG_PNG_CORPUS` 优先覆盖
+    /// （装配统一走 `kimg_core::testutil::corpus_dir`，键名/默认路径/缺失语义不变）。
 
     /// 3 个 adam7 落后文件 + 25__adam7（proto 分账证明 scatter 为其临界项）。
     const ADAM7_FILES: [&str; 4] = [
@@ -1517,7 +1507,10 @@ mod adam7_fast_tests {
     /// 正常随套件跑（fast 态）时仅解码打印，无副作用。
     #[test]
     fn scatter_fast_slow_dump_helper() {
-        let dir = corpus_dir();
+        let Some(dir) = kimg_core::testutil::corpus_dir("KIMG_PNG_CORPUS", "PNG") else {
+            eprintln!("SKIP: missing corpus/PNG");
+            return;
+        };
         for name in ADAM7_FILES {
             let p = dir.join(name);
             match decode_hash(&p) {
@@ -1534,11 +1527,10 @@ mod adam7_fast_tests {
     /// 断言退化为 slow-vs-slow 恒等（防误读：真对拍只在默认快态下成立）。
     #[test]
     fn scatter_fast_real_files_matches_slow() {
-        let dir = corpus_dir();
-        if !dir.is_dir() {
-            eprintln!("SKIP: missing corpus {}", dir.display());
+        let Some(dir) = kimg_core::testutil::corpus_dir("KIMG_PNG_CORPUS", "PNG") else {
+            eprintln!("SKIP: missing corpus/PNG");
             return;
-        }
+        };
         // 本进程快道摘要（若整套餐件在 env=0 下运行则为慢道，跨进程对拍仍成立）。
         let mut fast_hashes: Vec<(String, usize, u64)> = Vec::new();
         for name in ADAM7_FILES {

@@ -43,20 +43,9 @@ use super::segment::{
 use super::JpegDecoder;
 use kimg_core::ImageDecoder as _;
 
-/// 语料目录：`KIMG_JPEG_CORPUS` 覆盖（任务：Benchmarks/corpus/JPEG），
-/// 缺省主语料 `<workspace>/Benchmarks/corpus/JPEG`（446 矩阵，fixtures 同口径）。
-fn corpus_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("KIMG_JPEG_CORPUS") {
-        return PathBuf::from(p);
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("Benchmarks")
-        .join("corpus")
-        .join("JPEG")
-}
-
+/// 语料目录：`KIMG_JPEG_CORPUS` 覆盖（任务：Benchmarks/corpus/JPEG），缺省
+/// `<workspace>/Benchmarks/corpus/JPEG`（装配统一走 `kimg_core::testutil::corpus_dir`；
+/// 缺失 → None → SKIP）。
 fn collect_jpegs(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -335,11 +324,10 @@ fn median_walk_ms<const DISCARD: bool>(bytes: &[u8], rounds: usize) -> Option<f6
 #[test]
 #[ignore]
 fn m0_prescan_probe() {
-    let dir = corpus_dir();
-    if !dir.is_dir() {
-        println!("SKIP: corpus dir missing/unreadable: {}", dir.display());
+    let Some(dir) = kimg_core::testutil::corpus_dir("KIMG_JPEG_CORPUS", "JPEG") else {
+        println!("SKIP: corpus dir missing/unreadable");
         return;
-    }
+    };
     let files = collect_jpegs(&dir);
     if files.is_empty() {
         println!("SKIP: empty corpus: {}", dir.display());

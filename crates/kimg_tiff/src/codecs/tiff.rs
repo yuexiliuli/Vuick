@@ -1182,10 +1182,12 @@ mod tests {
     /// 还原预测输入）→ 覆盖真实灰度/RGB/RGBA 行布局与内容。缺语料 → SKIP（不入库惯例）。
     #[test]
     fn pred_fast_matches_scalar_corpus() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..");
-        let corpus = root.join("Benchmarks").join("corpus").join("TIFF");
+        // 语料装配统一走 kimg_core::testutil::corpus_dir（env `KIMG_TIFF_CORPUS` 覆盖，
+        // 与 tiff_bench_ours_vs_tiff 同键；缺省 `<workspace>/Benchmarks/corpus/TIFF`）。
+        let Some(corpus) = kimg_core::testutil::corpus_dir("KIMG_TIFF_CORPUS", "TIFF") else {
+            eprintln!("[pred-fast-corpus] SKIP: corpus/TIFF 缺失（先跑 Benchmarks/tiff/scripts/run_gen.ps1）");
+            return;
+        };
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&corpus) {
             for e in rd.flatten() {
