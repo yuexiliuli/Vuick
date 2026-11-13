@@ -62,6 +62,19 @@ impl Limits {
         Ok(())
     }
 
+    /// 组合校验：先查严格限制是否受支持，再验宽高是否超限。
+    /// 与逐次调 `check_support` + `check_dimensions` 的错误语义完全一致，供 `set_limits` 收敛复用。
+    pub fn validate_for(
+        &self,
+        support: &LimitSupport,
+        width: u32,
+        height: u32,
+    ) -> ImageResult<()> {
+        self.check_support(support)?;
+        self.check_dimensions(width, height)?;
+        Ok(())
+    }
+
     /// 从 `max_alloc` 中扣减 `amount` 字节；超出返回内存不足错误。
     pub fn reserve(&mut self, amount: u64) -> ImageResult<()> {
         if let Some(max_alloc) = self.max_alloc.as_mut() {

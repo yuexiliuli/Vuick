@@ -21,7 +21,7 @@ use kimg_core::error::{
     UnsupportedErrorKind,
 };
 use kimg_core::format::ImageFormat;
-use kimg_core::limits::Limits;
+use kimg_core::limits::{LimitSupport, Limits};
 use kimg_core::metadata::Orientation;
 use crate::{AnimationDecoder, ImageDecoder};
 
@@ -67,9 +67,8 @@ impl<R: Read> ImageDecoder for GifDecoder<R> {
     }
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
-        limits.check_support(&kimg_core::limits::LimitSupport::default())?;
         let (width, height) = self.dimensions();
-        limits.check_dimensions(width, height)?;
+        limits.validate_for(&LimitSupport::default(), width, height)?;
         self.limits = limits;
         Ok(())
     }

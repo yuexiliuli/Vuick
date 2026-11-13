@@ -1047,9 +1047,8 @@ where
     }
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
-        limits.check_support(&LimitSupport::default())?;
         let (w, h) = self.dimensions();
-        limits.check_dimensions(w, h)?;
+        limits.validate_for(&LimitSupport::default(), w, h)?;
         self.limits = limits;
         Ok(())
     }

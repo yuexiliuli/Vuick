@@ -137,8 +137,11 @@ impl<'a, R: BufRead + Seek> ImageDecoder for PngDecoder<'a, R> {
     }
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
-        limits.check_support(&LimitSupport::default())?;
-        limits.check_dimensions(self.engine.width(), self.engine.height())?;
+        limits.validate_for(
+            &LimitSupport::default(),
+            self.engine.width(),
+            self.engine.height(),
+        )?;
         self.limits = limits;
         Ok(())
     }

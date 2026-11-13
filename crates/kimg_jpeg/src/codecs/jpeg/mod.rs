@@ -196,9 +196,8 @@ impl<'a> ImageDecoder for JpegDecoder<'a> {
     }
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
-        limits.check_support(&LimitSupport::default())?;
         let (width, height) = self.dimensions();
-        limits.check_dimensions(width, height)?;
+        limits.validate_for(&LimitSupport::default(), width, height)?;
         self.limits = limits;
         Ok(())
     }
