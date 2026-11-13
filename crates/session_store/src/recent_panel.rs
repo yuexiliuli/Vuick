@@ -41,6 +41,7 @@ use gpui::{
     ScrollHandle, SharedString, StatefulInteractiveElement, Styled as _, WeakEntity, Window, div,
     px,
 };
+use ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 use ui::icon::{Icon, IconName};
 use ui::motion::hover_spring;
 use ui::scrollbar::{Scrollbar, ScrollbarMode};
@@ -514,7 +515,6 @@ impl<H: RecentPanelHost> Render for RecentPanel<H> {
         // 包裹（非 flex absolute）居中 + `with_spring` 弹簧淡入 + 键盘/点外关闭。
         let theme = ui::theme::Theme::global(cx);
         let (colors, is_dark) = (theme.colors, theme.is_dark());
-        let surface: Hsla = colors.surface.into();
 
         // 面板高度 = 窗口 2/3：完整列表（≤50+50 行）超高时列表区内部滚动。
         let panel_h = window.bounds().size.height.as_f32() * (2.0 / 3.0);
@@ -545,33 +545,25 @@ impl<H: RecentPanelHost> Render for RecentPanel<H> {
             .collect();
 
         // 顶部不设「打开最近」标题（反馈：不用文字标题标识四区域，直接列表 + 分割线）。
-        let panel = div()
-            .id("recent-panel")
-            .debug_selector(|| "recent-panel".into())
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
-            .flex()
-            .flex_col()
-            .w(px(600.))
-            .h(px(panel_h))
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(surface.opacity(if is_dark {
-                ui::theme::FLOAT_ACRYLIC_ALPHA_DARK
-            } else {
-                ui::theme::FLOAT_ACRYLIC_ALPHA_LIGHT
-            }))
-            // 与菜单/通知同款双层阴影（Win11 浮动卡片）。
-            .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
-                    .blur_radius(px(14.)),
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
-                    .blur_radius(px(4.)),
-            ])
-            // 打开淡入（尊重 reduce_motion：`with_spring` 自动落端点不调度帧）。
-            .with_spring(
+        let panel = ui::float_card(
+            &colors,
+            is_dark,
+            FloatCardBg::Acrylic,
+            FloatCardShadow::Double,
+            FloatCardRadius::Lg,
+            FloatCardPad::None,
+        )
+        .id("recent-panel")
+        .debug_selector(|| "recent-panel".into())
+        .track_focus(&self.focus_handle)
+        .on_key_down(cx.listener(Self::on_key_down))
+        .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
+        .flex()
+        .flex_col()
+        .w(px(600.))
+        .h(px(panel_h))
+        // 打开淡入（尊重 reduce_motion：`with_spring` 自动落端点不调度帧）。
+        .with_spring(
                 "recent-panel-fade",
                 hover_spring(1.0).from(0.0),
                 |this, v| this.opacity(v),
@@ -613,17 +605,6 @@ impl<H: RecentPanelHost> Render for RecentPanel<H> {
         //    全穿透到下层）；② 全窗包裹要 `occlude()`（BlockMouse）——否则点击仍会
         //    继续命中下层编辑器/仍展开的文件菜单的 hitbox。
         let win_w = window.bounds().size.width.as_f32();
-        let x = ((win_w - 600.) / 2.).max(8.);
-        gpui::deferred(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .occlude()
-                .child(div().absolute().left(px(x)).top(px(96.)).child(panel)),
-        )
-        .with_priority(210)
+        ui::float_card::overlay_centered(panel.into_any_element(), win_w, 600., 96., 210)
     }
 }

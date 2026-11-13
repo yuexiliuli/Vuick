@@ -27,7 +27,8 @@ use gpui::{
 use crate::ui::input::{Input, InputEvent, InputState};
 use crate::ui::motion::hover_spring;
 use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
-use crate::ui::theme::{ChromeColors, FLOAT_ACRYLIC_ALPHA_DARK, FLOAT_ACRYLIC_ALPHA_LIGHT, Theme};
+use crate::ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
+use crate::ui::theme::{ChromeColors, Theme};
 
 /// 面板模式（创建时定死；Ctrl+Shift+P / Ctrl+P 各自新建一个面板实体）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -431,7 +432,6 @@ impl Render for CommandPalette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::global(cx);
         let (colors, is_dark) = (theme.colors, theme.is_dark());
-        let surface: Hsla = colors.surface.into();
         let fg: Hsla = colors.fg.into();
         let fg_muted: Hsla = colors.fg_muted.into();
         let chrome = ChromeColors::for_mode(is_dark);
@@ -443,13 +443,10 @@ impl Render for CommandPalette {
         // `Scrollbar::vertical` 自绘跟随（宿主在此 GPUI 不绘制可见滚动条）。
         let scroll_handle = self.scroll_handle.clone();
 
-        // 顶部查询框：聚焦时边框点亮为主题 focus_ring（与侧栏搜索框同款 Fluent 视觉）。
-        let focused = window.focused(cx) == Some(self.input.read(cx).focus_handle(cx));
-        let input_border: Hsla = if focused {
-            colors.focus_ring.into()
-        } else {
-            colors.border.into()
-        };
+        // 顶部查询框：聚焦时边框点亮为主题 focus_ring（聚焦边框色经 focus_border_color
+        // 统一收敛，与侧栏搜索框同款 Fluent 视觉）。
+        let handle = self.input.read(cx).focus_handle(cx);
+        let input_border = crate::ui::focus_border_color(window, &handle, colors.border.into(), cx);
         let hint = match self.mode {
             PaletteMode::Commands => "命令面板",
             PaletteMode::Files => "打开文件",
@@ -557,33 +554,25 @@ impl Render for CommandPalette {
             None
         };
 
-        let panel = div()
-            .id("command-palette")
-            .debug_selector(|| "command-palette".into())
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
-            .flex()
-            .flex_col()
-            .w(px(600.))
-            .h(px(panel_h))
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(surface.opacity(if is_dark {
-                FLOAT_ACRYLIC_ALPHA_DARK
-            } else {
-                FLOAT_ACRYLIC_ALPHA_LIGHT
-            }))
-            // 与菜单/通知同款双层阴影（Win11 浮动卡片）。
-            .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
-                    .blur_radius(px(14.)),
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
-                    .blur_radius(px(4.)),
-            ])
-            // 打开淡入（尊重 reduce_motion：`with_spring` 自动落端点不调度帧）。
-            .with_spring(
+        let panel = crate::ui::float_card(
+            &colors,
+            is_dark,
+            FloatCardBg::Acrylic,
+            FloatCardShadow::Double,
+            FloatCardRadius::Lg,
+            FloatCardPad::None,
+        )
+        .id("command-palette")
+        .debug_selector(|| "command-palette".into())
+        .track_focus(&self.focus_handle)
+        .on_key_down(cx.listener(Self::on_key_down))
+        .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
+        .flex()
+        .flex_col()
+        .w(px(600.))
+        .h(px(panel_h))
+        // 打开淡入（尊重 reduce_motion：`with_spring` 自动落端点不调度帧）。
+        .with_spring(
                 "command-palette-fade",
                 hover_spring(1.0).from(0.0),
                 |this, v| this.opacity(v),
@@ -655,18 +644,7 @@ impl Render for CommandPalette {
         //   （输入框 `on_mouse_down` 不 stop_propagation）。occlude 让 hit-test 停在
         //   本层，点击不再穿透到编辑器。
         let win_w = window.bounds().size.width.as_f32();
-        let x = ((win_w - 600.) / 2.).max(8.);
-        gpui::deferred(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .occlude()
-                .child(div().absolute().left(px(x)).top(px(96.)).child(panel)),
-        )
-        .with_priority(210)
+        crate::ui::overlay_centered(panel.into_any_element(), win_w, 600., 96., 210)
     }
 }
 

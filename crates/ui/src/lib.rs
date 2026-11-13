@@ -46,6 +46,8 @@
 pub mod assets;
 pub mod button;
 pub mod empty_state;
+pub mod float_card;
+pub mod focus;
 pub mod icon;
 pub mod input;
 pub mod menu;
@@ -58,6 +60,13 @@ pub mod scrollbar;
 pub mod shell;
 pub mod theme;
 pub mod tooltip;
+
+/// 聚焦边框色收敛 helper 的根级 re-export（`ui::focus_border_color` 与 `ui::theme` 同层）。
+pub use focus::focus_border_color;
+
+/// 浮动卡片壳体 builder + 居中挂载 helper 的根级 re-export（`ui::float_card(...)` /
+/// `ui::overlay_centered(...)`；枚举档位 `ui::FloatCard*`）。
+pub use float_card::{float_card, overlay_centered, FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 
 /// 迁移期别名：让本 crate 内部既有的 `crate::ui::` 路径（自引用）保持解析。
 use crate as ui;

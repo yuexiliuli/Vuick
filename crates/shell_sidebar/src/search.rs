@@ -61,13 +61,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let query = self.model.borrow().search_committed.clone();
         let search = self.search_input.clone();
         // Fluent 文本框：整圈细边框 + 内缩边距（背景随 chrome 保持透明）；
-        // 聚焦时边框点亮为强调色。
-        let focused = window.focused(cx) == Some(self.search_input.read(cx).focus_handle(cx));
-        let border_color: gpui::Hsla = if focused {
-            ui::theme::Theme::global(cx).colors.focus_ring.into()
-        } else {
-            self.bar_border()
-        };
+        // 聚焦时边框点亮为强调色（聚焦边框色经 ui::focus_border_color 统一收敛）。
+        let handle = self.search_input.read(cx).focus_handle(cx);
+        let border_color = ui::focus_border_color(window, &handle, self.bar_border(), cx);
         let input = div()
             .id("sidebar-search-input")
             .debug_selector(|| "sidebar-search-input".into())

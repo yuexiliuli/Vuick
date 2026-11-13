@@ -11,10 +11,11 @@
 use std::path::PathBuf;
 
 use gpui::{
-    deferred, div, px, AnimationExt, App, AppContext, Context, CursorStyle, DismissEvent,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    div, px, AnimationExt, App, AppContext, Context, CursorStyle, DismissEvent, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement, Styled, WeakEntity, Window,
 };
+use ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 use ui::input::{Input, InputEvent, InputState};
 use ui::motion::hover_spring;
 
@@ -209,7 +210,6 @@ impl<H: FileTreePromptHost> Render for FileTreePrompt<H> {
         }
         let theme = ui::theme::Theme::global(cx);
         let (colors, is_dark) = (theme.colors, theme.is_dark());
-        let surface: gpui::Hsla = colors.surface.into();
         let fg: gpui::Hsla = colors.fg.into();
         let muted: gpui::Hsla = colors.fg_muted.into();
         let accent: gpui::Hsla = colors.accent.into();
@@ -217,13 +217,9 @@ impl<H: FileTreePromptHost> Render for FileTreePrompt<H> {
 
         let title = self.kind.title();
         let hint = self.hint.clone();
-        // 聚焦时输入框边框点亮为强调色（与侧栏搜索框同款）。
-        let input_focused = self.input_focus(cx).is_focused(window);
-        let border_color: gpui::Hsla = if input_focused {
-            colors.focus_ring.into()
-        } else {
-            colors.border.into()
-        };
+        // 聚焦时输入框边框点亮为强调色（聚焦边框色经 focus_border_color 统一收敛，
+        // 与侧栏搜索框同款 Fluent 视觉）。
+        let border_color = ui::focus_border_color(window, &input_focus, colors.border.into(), cx);
         // 按钮：取消 = 次要灰字；确定 = 强调色字（主题色，无硬编码）。
         // 点击确定 → 提交（与回车同语义）；点击取消 → 关闭（与 Esc 同语义）。
         let ok_btn = div()
@@ -254,31 +250,20 @@ impl<H: FileTreePromptHost> Render for FileTreePrompt<H> {
             }))
             .child("取消")
             .into_any_element();
-        let card = div()
-            .id("file-tree-prompt")
-            .debug_selector(|| "file-tree-prompt".into())
-            .track_focus(&self.focus_handle)
-            .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
-            .flex()
-            .flex_col()
-            .w(px(360.))
-            .p(px(16.))
-            .gap_y(px(12.))
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(surface.opacity(if is_dark {
-                ui::theme::FLOAT_ACRYLIC_ALPHA_DARK
-            } else {
-                ui::theme::FLOAT_ACRYLIC_ALPHA_LIGHT
-            }))
-            .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
-                    .blur_radius(px(14.)),
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
-                    .blur_radius(px(4.)),
-            ])
-            .with_spring(
+        let card = ui::float_card(
+            &colors,
+            is_dark,
+            FloatCardBg::Acrylic,
+            FloatCardShadow::Double,
+            FloatCardRadius::Lg,
+            FloatCardPad::P(px(16.), px(12.)),
+        )
+        .id("file-tree-prompt")
+        .debug_selector(|| "file-tree-prompt".into())
+        .track_focus(&self.focus_handle)
+        .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
+        .w(px(360.))
+        .with_spring(
                 "file-tree-prompt-fade",
                 hover_spring(1.0).from(0.0),
                 |this, v| this.opacity(v),
@@ -327,17 +312,6 @@ impl<H: FileTreePromptHost> Render for FileTreePrompt<H> {
         // 合成层约束：整层 deferred 独立绘制 + 全窗包裹
         // 做水平居中 + `occlude()`（BlockMouse）防点击穿透到下层。
         let win_w = window.bounds().size.width.as_f32();
-        let x = ((win_w - 360.) / 2.).max(8.);
-        deferred(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .occlude()
-                .child(div().absolute().left(px(x)).top(px(120.)).child(card)),
-        )
-        .with_priority(220)
+        ui::float_card::overlay_centered(card.into_any_element(), win_w, 360., 120., 220)
     }
 }

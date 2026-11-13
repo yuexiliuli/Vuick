@@ -480,12 +480,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             return div().into_any_element();
         }
         let search = files_filter_state.clone();
-        let focused = window.focused(cx) == Some(files_filter_state.read(cx).focus_handle(cx));
-        let border_color: gpui::Hsla = if focused {
-            ui::theme::Theme::global(cx).colors.focus_ring.into()
-        } else {
-            self.bar_border()
-        };
+        let handle = files_filter_state.read(cx).focus_handle(cx);
+        let border_color = ui::focus_border_color(window, &handle, self.bar_border(), cx);
         div()
             .id("sidebar-files-filter-input")
             .debug_selector(|| "sidebar-files-filter-input".into())
