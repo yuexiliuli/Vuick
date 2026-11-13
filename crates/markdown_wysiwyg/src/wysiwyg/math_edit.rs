@@ -350,8 +350,7 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         use gpui::{
-            Anchor, AnchoredPositionMode, Edges, InteractiveElement, IntoElement, MouseButton,
-            ParentElement, Styled,
+            InteractiveElement, MouseButton, ParentElement, Styled,
         };
         let popup = self.math_edit.as_ref()?;
         // 卡片几何（**窗口坐标**，供 `anchored(Window)` 定位）：**直接读 paint 期缓存好的
@@ -431,17 +430,6 @@ impl WyEditor {
                     .overflow_hidden()
                     .child(text_input),
             );
-        Some(
-            gpui::deferred(
-                gpui::anchored()
-                    .position_mode(AnchoredPositionMode::Window)
-                    .anchor(Anchor::TopLeft)
-                    .position(gpui::point(px(left), px(top)))
-                    .snap_to_window_with_margin(Edges::all(px(8.)))
-                    .child(card),
-            )
-            .with_priority(100)
-            .into_any_element(),
-        )
+        Some(ui::float_card::anchor_layer(gpui::point(px(left), px(top)), card))
     }
 }

@@ -982,8 +982,7 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         use gpui::{
-            Anchor, AnchoredPositionMode, Edges, InteractiveElement, IntoElement, ParentElement,
-            Styled,
+            InteractiveElement, ParentElement, Styled,
         };
         let hit = self.hover_note()?;
         let text = self.note_text_for(hit.n)?;
@@ -1011,18 +1010,7 @@ impl WyEditor {
                     .text_color(fg)
                     .child(text),
             );
-        Some(
-            gpui::deferred(
-                gpui::anchored()
-                    .position_mode(AnchoredPositionMode::Window)
-                    .anchor(Anchor::TopLeft)
-                    .position(at)
-                    .snap_to_window_with_margin(Edges::all(px(8.)))
-                    .child(card),
-            )
-            .with_priority(100)
-            .into_any_element(),
-        )
+        Some(ui::float_card::anchor_layer(at, card))
     }
 
     /// 复制：写入平台剪贴板（由 `on_action(Copy)` 装配）。

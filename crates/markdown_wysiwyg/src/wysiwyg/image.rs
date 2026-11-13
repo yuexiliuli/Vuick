@@ -465,10 +465,7 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         use ui::button::ButtonVariants as _;
-        use gpui::{
-            Anchor, AnchoredPositionMode, Edges, InteractiveElement, IntoElement, ParentElement,
-            Styled,
-        };
+        use gpui::{InteractiveElement, ParentElement, Styled};
         let popup = self.image_edit.as_ref()?;
         // 卡片几何（**窗口坐标**，供 `anchored(Window)` 定位）。**直接读 paint 期缓存好的
         // 锚点**（`image_edit_anchor`：同代 origin+frame 算出的窗口 TopLeft）——render 期
@@ -607,18 +604,7 @@ impl WyEditor {
                             }),
                     ),
             );
-        Some(
-            gpui::deferred(
-                gpui::anchored()
-                    .position_mode(AnchoredPositionMode::Window)
-                    .anchor(Anchor::TopLeft)
-                    .position(gpui::point(px(left), px(top)))
-                    .snap_to_window_with_margin(Edges::all(px(8.)))
-                    .child(card),
-            )
-            .with_priority(100)
-            .into_any_element(),
-        )
+        Some(ui::float_card::anchor_layer(gpui::point(px(left), px(top)), card))
     }
 
     /// 输入命中前确保帧存在（帧被置空后、下一次渲染还没重建时，点击才会落空——

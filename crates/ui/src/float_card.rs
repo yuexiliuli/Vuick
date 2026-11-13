@@ -12,8 +12,8 @@
 //! 机制，本组件只替换「造型 + 挂载」这两件纯视觉差事。
 
 use gpui::{
-    div, px, AnyElement, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Styled
-        as _,
+    div, px, AnyElement, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    Styled as _,
 };
 
 use crate::ui::theme::{ColorScheme, FLOAT_ACRYLIC_ALPHA_DARK, FLOAT_ACRYLIC_ALPHA_LIGHT};
@@ -132,5 +132,25 @@ pub fn overlay_centered(
             .child(div().absolute().left(px(x)).top(px(top)).child(card)),
     )
     .with_priority(priority)
+    .into_any_element()
+}
+
+/// 全窗锚定挂载 helper：`deferred(anchored(Window, TopLeft))` 锚定在**窗口坐标** `at`，
+/// 四边 `8px` 留边防贴边（`snap_to_window_with_margin`），带 priority 100。
+///
+/// 逐字复刻 `wysiwyg/image.rs` / `math_edit.rs` / `core.rs`（core.rs 系注记卡）三张
+/// WYSIWYG 锚定弹层卡完全相同的挂载链的收敛。**锚点来源（left/top）由调用方 paint 期缓存
+/// 提供，本 helper 不收锚逻辑**；卡片机制（focus / occlude / on_mouse_down_out / Enter
+/// 拦截 / 键上下文）仍在调用方原位，本 helper 只做挂载这一件纯结构差事（同 `overlay_centered`）。
+pub fn anchor_layer(at: gpui::Point<Pixels>, card: impl IntoElement) -> AnyElement {
+    gpui::deferred(
+        gpui::anchored()
+            .position_mode(gpui::AnchoredPositionMode::Window)
+            .anchor(gpui::Anchor::TopLeft)
+            .position(at)
+            .snap_to_window_with_margin(gpui::Edges::all(px(8.)))
+            .child(card),
+    )
+    .with_priority(100)
     .into_any_element()
 }
