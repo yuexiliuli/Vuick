@@ -156,10 +156,13 @@ impl super::VideoViewer {
         }
         // 可见控制条：双击不让其漏到画面区（与 `#video-main` 双击全屏互斥）；须挂在
         // `if 隐藏早退` 之后——隐藏态透明热区下方就是视频画面，双击仍需命中画面元素。
-        // on_mouse_move：F1 悬停浮层「移出 seek 条即隐藏」的清理点（条内任意移首都冒泡到这）。
+        // on_mouse_move：F1 悬停浮层「移出 seek 条即隐藏」的清理点（条内任意移首都冒泡到这）；
+        // on_mouse_up：F1「松手在 seek 条上即恢复悬停浮层」（Slider 松手不再 stop_propagation，
+        // 冒泡到控制条统一按松手点判定）。
         let strip = strip
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_controls_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_controls_move));
+            .on_mouse_move(cx.listener(Self::on_controls_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_controls_up));
         let colors = ui::theme::Theme::global(cx).colors;
         let dark = ui::theme::Theme::global(cx).is_dark();
         let fg: Hsla = colors.fg.into();
@@ -365,10 +368,13 @@ impl super::VideoViewer {
     }
 
 
-    /// 可交互横向条（seek 进度条 / 音量条共用）：玻璃细轨 + 主色填充 + hover 放大 thumb。
-    /// 轨道视觉厚度从 16px 收到 4px（交互热区仍是 16px，`bounds` 盒不变），canvas 记录
-    /// **窗口坐标**盒到 `bounds`（渲染期写入；事件回调读）。`seek=true` 时 `flex_1`
-    /// 拉伸并走 seek 处理器，否则固定宽走音量处理器。
+    /// 可交互横向条（seek 进度条 / 音量条共用）：走自绘 `ui::Slider`——整条 16px 命中高、
+    /// 玻璃细轨 + 主色填充 + hover 弹簧放大 thumb，交互语义与原自绘条逐点一致（坐标按条宽
+    /// 钳 [0,1]、点按即跳、拖拽节流、松手精提交）。`on_geometry` 每帧把**窗口坐标**命中盒
+    /// 回写 `bounds`（替代旧 canvas 记录，`seek_bounds`/`vol_bounds` 读法与事件路径不变）；
+    /// seek 走 `OnRelease`（on_change=点按预览 / on_change_during_drag=拖拽节流 /
+    /// on_commit=松手精提交），vol 走 `Immediate`（改变即生效）。seek=true 时 flex_1 拉伸，
+    /// 否则固定宽（包一层 56px 容器，slider 自身 flex_1 铺满）。
     pub(super) fn strip_element(
         id: &'static str,
         bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -376,97 +382,69 @@ impl super::VideoViewer {
         track: Hsla,
         fill: Hsla,
         seek: bool,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let f = fraction.clamp(0.0, 1.0);
-        // 元素级 hover 态：只驱动 thumb 放大/淡入（native 按钮同款姿势），不碰
-        // seek/vol 已有的 on_mouse_down/on_mouse_move 交互路径。
-        let hover_flag = window.use_keyed_state(format!("{id}-hover"), cx, |_, _| false);
-        let hovered = *hover_flag.read(cx);
-        let view_id = window.current_view();
-        let mut el = div()
-            .id(id)
-            .h(px(16.))
-            .relative()
-            .cursor(CursorStyle::PointingHand)
-            .on_hover({
-                let flag = hover_flag.clone();
-                move |hovered, _w, cx| {
-                    flag.update(cx, |v, _| *v = *hovered);
-                    cx.notify(view_id);
-                }
+        let entity = cx.entity();
+        let mut slider = ui::Slider::new(id)
+            .value(fraction.clamp(0.0, 1.0))
+            .commit_mode(if seek {
+                ui::CommitMode::OnRelease
+            } else {
+                ui::CommitMode::Immediate
             })
-            .child(
-                // 玻璃细轨（4px 半透明）+ 主色填充 + hover thumb：thumb 圆心始终对准
-                // 填充末端（= 播放位置）；大小/偏移/透明度共用同一 0..1 弹簧值，增大的
-                // 同时圆心不漂移（top/right 由尺寸反推）。
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .relative()
-                            .h(px(4.))
-                            .rounded_full()
-                            .bg(track.opacity(0.30))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(DefiniteLength::Fraction(f))
-                                    .rounded_full()
-                                    .bg(fill)
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .with_spring(
-                                                format!("{id}-thumb"),
-                                                hover_spring(if hovered { 1.0 } else { 0.0 }),
-                                                {
-                                                    let fill = fill;
-                                                    move |this, v| {
-                                                        let s = 4.0 + 6.0 * v;
-                                                        this.w(px(s))
-                                                            .h(px(s))
-                                                            // 垂直居中：轨道半高 2px − 半径 s/2
-                                                            .top(px(2.0 - s / 2.0))
-                                                            // 圆心对准填充末端：右缘外扩 s/2
-                                                            .right(px(-s / 2.0))
-                                                            .opacity(0.15 + 0.85 * v)
-                                                            .bg(fill)
-                                                    }
-                                                },
-                                            ),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(canvas(
-                move |b, _w, _app| {
-                    bounds.set(b);
-                },
-                |_, _, _, _| {},
-            ))
-            .when(seek, |this| this.flex_1())
-            .when(!seek, |this| this.w(px(56.)));
+            .track_height(px(4.))
+            // 轨道底色 = 旧玻璃细轨（fg_muted × 0.30）。
+            .track_color(track.opacity(0.30))
+            .fill(ui::SliderFill::Solid(fill))
+            // hover thumb：base 4px → hover 10px 弹簧放大（圆心贴填充末端，同旧 `4+6v`）；
+            // 颜色透明度随同一弹簧 0.15→1.0 淡显（同旧 `0.15+0.85v` 观感，静止不刺眼）。
+            .thumb(Some(ui::SliderThumb {
+                base: 4.0,
+                hover: 10.0,
+                color: fill,
+                glow: None,
+                opacity_base: 0.15,
+                opacity_hover: 1.0,
+            }))
+            // F1：每帧把真实命中盒（窗口坐标）回写，浮层定位/事件读 seek_bounds 同旧 canvas。
+            .on_geometry(move |geom, _w, _app| bounds.set(geom.bounds));
         if seek {
-            el = el
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_seek_down))
-                .on_mouse_move(cx.listener(Self::on_seek_move))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_seek_up))
-                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_seek_up));
+            slider = slider
+                .on_change({
+                    let entity = entity.clone();
+                    move |f, _w, app| entity.update(app, |v, cx| v.begin_scrub(f, cx))
+                })
+                .on_change_during_drag({
+                    let entity = entity.clone();
+                    move |f, _w, app| entity.update(app, |v, cx| v.update_scrub(f, cx))
+                })
+                .on_commit({
+                    let entity = entity.clone();
+                    move |f, _w, app| entity.update(app, |v, cx| v.end_scrub(f, cx))
+                });
         } else {
-            el = el
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_vol_down))
-                .on_mouse_move(cx.listener(Self::on_vol_move));
+            slider = slider
+                .on_change({
+                    let entity = entity.clone();
+                    move |f, _w, app| entity.update(app, |v, cx| v.set_volume(f, cx))
+                })
+                .on_change_during_drag({
+                    let entity = entity.clone();
+                    move |f, _w, app| entity.update(app, |v, cx| v.set_volume(f, cx))
+                });
         }
-        el.into_any_element()
+        if seek {
+            // seek 条铺满剩余宽度（flex_1）。
+            slider.into_any_element()
+        } else {
+            // 音量条定宽 56px（slider 自身 request_layout 铺满容器）。
+            div()
+                .w(px(56.))
+                .h(px(16.))
+                .child(slider)
+                .into_any_element()
+        }
     }
 }
 

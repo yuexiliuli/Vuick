@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, CursorStyle, Element, ElementId, Entity, EntityId, GlobalElementId, Hitbox,
-    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent,
+    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Point, Pixels, SpringConfig, SpringState, Window, fill,
     linear_color_stop, linear_gradient, point, px, size,
 };
@@ -54,6 +54,19 @@ fn clamp_value(v: f32) -> f32 {
 /// 回调别名：值 + 窗口/应用上下文。
 type SliderHandler = Rc<dyn Fn(f32, &mut Window, &mut App)>;
 
+/// 单帧几何快照（经 `.on_geometry` 在 **prepaint 期每帧**回传，供消费方浮层定位——
+/// 如 video 的 F1 悬停时间浮层据此对齐进度条命中盒 / 填充末端，不必再自己用 canvas 记录盒）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SliderGeom {
+    /// 真实命中盒（= 布局盒，窗口坐标，16px 高整条即命中区）。
+    pub bounds: Bounds<Pixels>,
+    /// 填充末端（thumb 圆心，随显示 fraction 前进）。
+    pub fill_end: Point<Pixels>,
+}
+
+/// 几何回调别名：几何快照 + 窗口/应用上下文。
+type GeomHandler = Rc<dyn Fn(&SliderGeom, &mut Window, &mut App)>;
+
 /// 填充样式：左对齐的进度填充。
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SliderFill {
@@ -63,7 +76,9 @@ pub enum SliderFill {
     Gradient([Hsla; 2]),
 }
 
-/// thumb 规格：常态 / hover 半径（弹簧插值）、颜色、可选辉光。
+/// thumb 规格：常态 / hover 半径（弹簧插值）、颜色（随 hover 弹簧淡显）、可选辉光。
+/// `opacity_base` / `opacity_hover` 默认 1.0/1.0（全不透明，短名 thumb 不刺眼）；需要
+/// 「静止淡显、hover 变实」的消费方（如 video seek/vol 的旧 `0.15+0.85v` 观感）传 0.15/1.0。
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct SliderThumb {
     /// 常态半径（px，弹簧 0）。
@@ -74,6 +89,10 @@ pub struct SliderThumb {
     pub color: Hsla,
     /// 可选辉光色（低于 alpha 的大半径光环）。
     pub glow: Option<Hsla>,
+    /// 弹簧 0（静止）时的颜色透明度（0..1，默认 1.0=不透明）。
+    pub opacity_base: f32,
+    /// 弹簧 1（hover）时的颜色透明度（0..1，默认 1.0=不透明）。
+    pub opacity_hover: f32,
 }
 
 /// 提交时机：值变更的"精提交"发生在何时。
@@ -105,6 +124,8 @@ pub struct Slider {
     on_change: Option<SliderHandler>,
     on_change_during_drag: Option<SliderHandler>,
     on_commit: Option<SliderHandler>,
+    /// 每帧几何回传（prepaint 调用；None 零开销）。
+    on_geometry: Option<GeomHandler>,
 }
 
 /// 元素级跨帧状态（按元素 id + `"hover"` 键隔离，见模块文档）。
@@ -184,6 +205,15 @@ fn thumb_radius(thumb: &SliderThumb, present: f32) -> f32 {
     }
 }
 
+/// thumb 颜色：随同一 hover 弹簧在 `opacity_base` → `opacity_hover` 间线性插值 alpha
+///（video seek/vol 借此保持旧「静止 0.15 淡显、hover 1.0 实」观感；默认 1→1 恒不透明）。
+fn thumb_color(thumb: &SliderThumb, present: f32) -> Hsla {
+    let v = present.clamp(0.0, 1.0);
+    thumb
+        .color
+        .opacity(thumb.opacity_base + (thumb.opacity_hover - thumb.opacity_base) * v)
+}
+
 /// thumb 弹簧单步推进：与 `motion::hover_spring` 同参数（临界阻尼，解析积分），
 /// 返回 `(新位置, 新速度, 是否仍在动画)`。提取成纯函数便于直接单测 0↔1 收敛。
 fn spring_step(present: f32, velocity: f32, target: f32, dt: f32) -> (f32, f32, bool) {
@@ -220,6 +250,7 @@ impl Slider {
             on_change: None,
             on_change_during_drag: None,
             on_commit: None,
+            on_geometry: None,
         }
     }
 
@@ -292,6 +323,13 @@ impl Slider {
     #[allow(dead_code)]
     pub fn on_commit(mut self, handler: impl Fn(f32, &mut Window, &mut App) + 'static) -> Self {
         self.on_commit = Some(Rc::new(handler));
+        self
+    }
+
+    /// **prepaint 期每帧**回传真实命中盒 + 填充末端（[`SliderGeom`]，窗口坐标），供消费方
+    /// 浮层定位（如 video 的 F1 悬停时间浮层）。默认 None（未挂回调零开销）。
+    pub fn on_geometry(mut self, handler: impl Fn(&SliderGeom, &mut Window, &mut App) + 'static) -> Self {
+        self.on_geometry = Some(Rc::new(handler));
         self
     }
 
@@ -377,6 +415,19 @@ impl Element for Slider {
         // 显示 fraction：拖拽中跟随手指，否则用消费方喂入的 value（内存 clamp 过）。
         let fraction = state.read(cx).drag_fraction.unwrap_or(self.value);
         let geom = self.geometry(bounds, fraction);
+
+        // F1 几何回传：prepaint 期每帧把真实命中盒 + 填充末端交给消费方（浮层定位用）。
+        // 未挂回调（None）零开销；回调默认只写 Cell，不触发重绘（重绘由值/交互路径驱动）。
+        if let Some(cb) = &self.on_geometry {
+            cb(
+                &SliderGeom {
+                    bounds: geom.cell,
+                    fill_end: geom.fill_end,
+                },
+                window,
+                cx,
+            );
+        }
 
         // 悬停弹簧：与 motion::hover_spring 同参数（临界阻尼），自驱动逐帧收敛。
         // dt 下限 1/60：headless 下帧间隔墙钟≈0，不加下限弹簧几乎不动、收敛要无数帧。
@@ -468,9 +519,11 @@ impl Element for Slider {
             window.paint_quad(fill(geom.fill, fill_color).corner_radii(radius));
         }
 
-        // 可选 thumb：圆心贴填充末端（随 fraction 移动，不随弹簧漂移），半径弹簧插值。
+        // 可选 thumb：圆心贴填充末端（随 fraction 移动，不随弹簧漂移），半径与颜色透明度
+        // 共用同一 hover 弹簧插值（视频 seek/vol 借此保持旧「静止 0.15 淡显、hover 实」观感）。
         if let Some(thumb) = prepaint.thumb {
             let r = thumb_radius(&thumb, prepaint.present);
+            let thumb_color = thumb_color(&thumb, prepaint.present);
             let c = geom.fill_end;
             if let Some(glow) = thumb.glow {
                 let gr = r * THUMB_GLOW_SCALE;
@@ -484,7 +537,7 @@ impl Element for Slider {
                 point(c.x - px(r), c.y - px(r)),
                 size(px(r * 2.0), px(r * 2.0)),
             );
-            window.paint_quad(fill(tb, thumb.color).corner_radii(px(r)));
+            window.paint_quad(fill(tb, thumb_color).corner_radii(px(r)));
         }
 
         // 仅 interactive：手型光标（gpui 只在该命中盒悬停时应用；只读模式无 cursor）。
@@ -527,10 +580,11 @@ impl PrepaintState {
         let on_commit = self.on_commit.clone();
         let commit_mode = self.commit_mode;
 
-        // 按下：命中盒内才响应（整条 16px 命中高即命中区，无 thumb 抓取）。
+        // 按下：**仅左键**命中盒内才响应（整条 16px 命中高即命中区，无 thumb 抓取）；
+        // 右键/中键不触发拖拽（保持消费方「右键进度条无动作」的既有语义）。
         let state_down = state.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-            if !phase.bubble() || !hit_contains(&cell, event.position) {
+            if !phase.bubble() || event.button != MouseButton::Left || !hit_contains(&cell, event.position) {
                 return;
             }
             cx.stop_propagation();
@@ -573,12 +627,13 @@ impl PrepaintState {
         });
 
         // 抬起：结束拖拽；OnRelease 用松手精确分数（窗外沿用最后锁定落点）精提交。
+        // 不 `stop_propagation`：松手事件继续冒泡给祖先，消费方可据松手点在自家元素树上恢复
+        // 宿主悬停浮层（如 video F1 时间浮层的「松手即复现」，由控制条 `on_mouse_up` 兜底）。
         let state_up = state.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-            if !phase.bubble() || !state_up.read(cx).dragging {
+            if !phase.bubble() || event.button != MouseButton::Left || !state_up.read(cx).dragging {
                 return;
             }
-            cx.stop_propagation();
             // 末值：松手点在盒内取该点精确分数，否则沿用拖拽最后锁定落点（拖出窗外松手）。
             let f = fraction_at(&cell, event.position.x)
                 .or(state_up.read(cx).drag_fraction)
@@ -641,6 +696,8 @@ mod tests {
                     hover: 8.,
                     color: gpui::hsla(0.60, 0.60, 0.90, 1.0),
                     glow: Some(gpui::hsla(0.60, 0.60, 0.90, 1.0)),
+                    opacity_base: 1.0,
+                    opacity_hover: 1.0,
                 }));
             }
             div()
@@ -648,6 +705,29 @@ mod tests {
                 .w(px(200.))
                 .h(px(16.))
                 .child(slider)
+        }
+    }
+
+    /// on_geometry guard 专用宿主：value 外部可注入改写，几何回传落到 `Option<SliderGeom>`。
+    struct GeomHarness {
+        value: Rc<RefCell<f32>>,
+        geom: Rc<RefCell<Option<SliderGeom>>>,
+    }
+
+    impl Render for GeomHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let geom = self.geom.clone();
+            div()
+                .debug_selector(|| "slider-geom-wrap".to_string())
+                .w(px(200.))
+                .h(px(16.))
+                .child(
+                    Slider::new("geom-sld")
+                        .value(*self.value.borrow())
+                        .on_geometry(move |g, _, _| {
+                            *geom.borrow_mut() = Some(*g);
+                        }),
+                )
         }
     }
 
@@ -760,10 +840,50 @@ mod tests {
             hover: 8.,
             color: gpui::hsla(0.5, 0.5, 0.9, 1.0),
             glow: None,
+            opacity_base: 0.15,
+            opacity_hover: 1.0,
         };
         assert_eq!(thumb_radius(&thumb, 0.0), 5.0, "弹簧 0 → base");
         assert_eq!(thumb_radius(&thumb, 1.0), 8.0, "弹簧 1 → hover");
         assert_eq!(thumb_radius(&thumb, 0.5), 6.5, "弹簧 0.5 → 线性中值");
+    }
+
+    /// guard：thumb 颜色 alpha 随 hover 弹簧在 `opacity_base`→`opacity_hover` 间平滑插值
+    ///（video seek/vol 传 0.15/1.0 → 静止淡显、hover 实）；默认 1/1 恒不透明（其它消费方不变）。
+    #[test]
+    fn thumb_alpha_fades_base_to_hover_with_spring() {
+        let thumb = SliderThumb {
+            base: 5.,
+            hover: 8.,
+            color: gpui::hsla(0.5, 0.5, 0.9, 1.0),
+            glow: None,
+            opacity_base: 0.15,
+            opacity_hover: 1.0,
+        };
+        assert!(
+            (thumb_color(&thumb, 0.0).a - 0.15).abs() < 0.001,
+            "弹簧 0 → opacity_base 0.15（静止淡显）"
+        );
+        assert!(
+            (thumb_color(&thumb, 1.0).a - 1.0).abs() < 0.001,
+            "弹簧 1 → opacity_hover 1.0（hover 实）"
+        );
+        // 演算：0.15 + (1.0 - 0.15) × 0.5 = 0.575。
+        assert!(
+            (thumb_color(&thumb, 0.5).a - 0.575).abs() < 0.001,
+            "弹簧 0.5 → 线性中值 0.575"
+        );
+        // 默认 1/1：静止/hover 恒为 1.0 不透明（未传透明度档的消费方观感不变）。
+        let dflt = SliderThumb {
+            base: 5.,
+            hover: 8.,
+            color: gpui::hsla(0.5, 0.5, 0.9, 0.6),
+            glow: None,
+            opacity_base: 1.0,
+            opacity_hover: 1.0,
+        };
+        assert!((thumb_color(&dflt, 0.0).a - 0.6).abs() < 0.001, "弹簧 0 → 保持原色 alpha");
+        assert!((thumb_color(&dflt, 1.0).a - 0.6).abs() < 0.001, "弹簧 1 → 保持原色 alpha");
     }
 
     #[test]
@@ -852,6 +972,73 @@ mod tests {
         );
         assert!(drags.borrow().is_empty());
         assert!(commits.borrow().is_empty());
+    }
+
+    /// on_geometry guard：prepaint 期每帧回传**真实命中盒**（== wrapper 布局盒，窗口坐标）
+    /// 与填充末端，且填充末端随 value 前进（0.25 → 0.75 重绘后右移至 3/4 处）。
+    #[gpui::test]
+    fn on_geometry_reports_real_bounds_and_fill_end_tracking_value(cx: &mut TestAppContext) {
+        let value = Rc::new(RefCell::new(0.25f32));
+        let geom = Rc::new(RefCell::new(None::<SliderGeom>));
+        let (_, cx) = cx.add_window_view({
+            let value = value.clone();
+            let geom = geom.clone();
+            move |_, _| GeomHarness { value, geom }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let b = cx.debug_bounds("slider-geom-wrap").expect("slider 应在场");
+        assert!(
+            b.size.width.as_f32() > 0.0,
+            "wrapper 已布局出宽（>0）"
+        );
+        // 演算：盒 w=200；value 0.25 → 填充末端 x = left + 50、y = 盒纵向中心。
+        let g = *geom.borrow().as_ref().expect("on_geometry 应已被 prepaint 调用");
+        assert_eq!(g.bounds, b, "回传命中盒 == 布局盒（真实命中盒）");
+        let expect_x_25 = f32::from(b.origin.x) + f32::from(b.size.width) * 0.25;
+        let expect_x_75 = f32::from(b.origin.x) + f32::from(b.size.width) * 0.75;
+        assert!(
+            (g.fill_end.x.as_f32() - expect_x_25).abs() < 0.001,
+            "value 0.25 → fill_end 在 1/4 处，实得 {:?}",
+            g.fill_end
+        );
+        assert!(
+            (g.fill_end.y.as_f32() - b.center().y.as_f32()).abs() < 0.001,
+            "fill_end 纵向居中"
+        );
+        // 改 value → 重绘 → 填充末端前进到 3/4。
+        *value.borrow_mut() = 0.75;
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let g2 = *geom.borrow().as_ref().expect("重绘后再回传");
+        assert!(
+            (g2.fill_end.x.as_f32() - expect_x_75).abs() < 0.001,
+            "value 0.75 → fill_end 在 3/4 处，实得 {:?}",
+            g2.fill_end
+        );
+        assert!(
+            g2.fill_end.x.as_f32() > g.fill_end.x.as_f32(),
+            "填充末端随 value 前进"
+        );
+    }
+
+    /// 右键 guard：非左键点按不得启动拖拽/触发任何回调（保持「右键进度条无动作」语义；
+    /// 左键路径由 `click_edges_map_to_zero_and_one` 等覆盖）。
+    #[gpui::test]
+    fn right_button_click_does_not_start_drag_or_commit(cx: &mut TestAppContext) {
+        let (cx, changes, drags, commits, _) =
+            harness(cx, 0.0, true, CommitMode::OnRelease, false);
+        let b = cell(cx);
+        let p = point(b.center().x, b.center().y);
+        cx.simulate_mouse_move(p, None, Modifiers::default());
+        cx.simulate_mouse_down(p, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_move(p, Some(MouseButton::Right), Modifiers::default());
+        cx.simulate_mouse_up(p, MouseButton::Right, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            changes.borrow().is_empty()
+                && drags.borrow().is_empty()
+                && commits.borrow().is_empty(),
+            "右键点按/拖拽不触发 on_change/on_change_during_drag/on_commit"
+        );
     }
 
     #[gpui::test]

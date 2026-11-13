@@ -218,57 +218,10 @@ impl super::VideoViewer {
     }
 
 
-    /// seek 点按：进入拖拽预览（begin_scrub）——先落点预览、静音；松手提交。
-    pub(super) fn on_seek_down(
-        &mut self,
-        e: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
-            self.begin_scrub(f, cx);
-        }
-    }
-
-
-    /// seek 拖拽（左键按住才推进；移出条到窗外松开由 `on_seek_up`/`on_mouse_up_out` 兜底）。
-    pub(super) fn on_seek_move(
-        &mut self,
-        e: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !e.dragging() {
-            // 已在拖拽但这一拍 dragging 变假（松开）而 mouse_up 未落在条上 → 按当前落点收尾
-            if self.scrubbing {
-                self.end_scrub_at_current(cx);
-                return;
-            }
-            // M0：未拖拽的悬停 → 记录悬停位置并（空闲时）后台预解码该落点帧，点击即现。
-            // F1：同时记下光标的窗口坐标 x，悬停时间浮层紧随光标横向移动。
-            if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
-                self.hover_x = Some(e.position.x.as_f32());
-                self.update_hover_target(self.clamped_scrub_target(f), cx);
-                cx.notify(); // 浮层文本/横坐标随光标实时刷新
-            }
-            return;
-        }
-        if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
-            if self.scrubbing {
-                self.update_scrub(f, cx);
-            } else {
-                self.begin_scrub(f, cx);
-            }
-        }
-        self.hover_x = None; // 开始拖拽 → 悬停浮层隐藏（拖拽时当前时间已跟手指）
-        cx.notify();
-    }
-
-
     /// F1：光标是否落在 seek 进度条**盒内**（窗口坐标，含纵向）。`fraction_at` 只做 x→进度
-    /// 映射、对条外点也返回钳位值，不能当「在条上」判据。盒由 canvas prepaint 记录：canvas
-    /// 自身布局高度为 0（条高由外层 `.h(px(16.))` 撑起、同 `strip_element`），故纵向用
-    /// 「盒顶 + 条高」重建。在 → 返回该点对应秒（钳位 [0, duration]）；不在/未布局 → None。
+    /// 映射、对条外点也返回钳位值，不能当「在条上」判据。盒由 `ui::Slider::on_geometry` 每帧
+    /// 回写真实命中盒（16px 高，窗口坐标），纵向直接用盒高判断。在 → 返回该点对应秒
+    /// （钳位 [0, duration]）；不在/未布局 → None。
     pub(super) fn seek_hover_target_at(&self, point: Point<Pixels>) -> Option<f64> {
         let b = self.seek_bounds.get();
         if b.size.width.as_f32() <= 0.0 {
@@ -279,11 +232,7 @@ impl super::VideoViewer {
         let left = b.origin.x.as_f32();
         let right = (b.origin.x + b.size.width).as_f32();
         let top = b.origin.y.as_f32();
-        let bar_h = if b.size.height.as_f32() > 0.0 {
-            b.size.height.as_f32()
-        } else {
-            16.0
-        };
+        let bar_h = b.size.height.as_f32().max(1.0);
         if x < left || x > right || y < top || y > top + bar_h {
             return None;
         }
@@ -292,74 +241,47 @@ impl super::VideoViewer {
     }
 
 
-    /// 控制条内任意指针移动：光标离开 seek 进度条（移到按钮/空隙/音量条等）→ 清除悬停
-    /// 浮层（x 不在盒内即隐藏；回到条上由 seek 元素自己的 `on_seek_move` 重新记录 → 复现）。
+    /// 控制条内任意指针移动（**未拖拽**才有意义——拖拽期 `ui::Slider` 已 `stop_propagation`
+    /// 吞掉 move，不会冒泡到这里）：①光标在 seek 进度条盒内 → 记录悬停位置（M0 预解码 + F1
+    /// 横向坐标）；②移出进度条（按钮/空隙/音量条等）→ 清除悬停浮层；③拖拽已结束但 `scrubbing`
+    /// 仍真（松手未落在条上被 Slider 兜底的极端路径）→ 按当前落点收尾提交。
     pub(super) fn on_controls_move(
         &mut self,
         e: &MouseMoveEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.seek_hover_target_at(e.position).is_none() && self.hover_x.is_some() {
+        // 兼容旧 on_seek_move 的兜底：拖拽中松手未落在条上（例：窗外松手）→ 按当前落点提交。
+        if self.scrubbing && !e.dragging() {
+            self.end_scrub_at_current(cx);
+            return;
+        }
+        if let Some(target) = self.seek_hover_target_at(e.position) {
+            self.hover_x = Some(e.position.x.as_f32());
+            self.update_hover_target(target, cx);
+            cx.notify(); // 浮层文本/横坐标随光标实时刷新
+        } else if self.hover_x.is_some() {
             self.hover_x = None;
             cx.notify();
         }
     }
 
 
-    /// seek 拖拽结束（窗口内松开）：按松手位置最终提交。
-    pub(super) fn on_seek_up(
+    /// F1：在控制条内**松开**左键时，按松手点刷新悬停浮层——落在 seek 进度条盒内 →
+    /// 恢复悬停（文本同步到松手落点，即刻复现，不等下一次 mouse_move；Slider 的 up 不再
+    /// `stop_propagation`，故本条能收到冒泡）；落在条外（x 或 y 出盒）→ 保持隐藏不残影。
+    pub(super) fn on_controls_up(
         &mut self,
         e: &MouseUpEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.scrubbing {
-            return;
+        if let Some(target) = self.seek_hover_target_at(e.position) {
+            self.hovered_target = Some(target);
+            self.hover_x = Some(e.position.x.as_f32());
+        } else if self.hover_x.is_some() {
+            self.hover_x = None;
         }
-        if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
-            self.end_scrub(f, cx);
-            // F1：松手仍在进度条盒内（含纵向，`fraction_at` 只比 x）→ 恢复正常 hover：
-            // 同步把 hovered_target 刷新到松手落点（否则浮层文本残留拖拽前悬停的旧秒数，
-            // 出现「文本与横坐标错位」）；拖到条外（纵向出去）松开 → 保持隐藏不残影。
-            if let Some(target) = self.seek_hover_target_at(e.position) {
-                self.hovered_target = Some(target);
-                self.hover_x = Some(e.position.x.as_f32());
-            } else {
-                self.hover_x = None;
-            }
-            cx.notify();
-        } else {
-            self.end_scrub_at_current(cx);
-        }
-    }
-
-
-    /// 音量条点按：屏 x → 分数 → 音量。
-    pub(super) fn on_vol_down(
-        &mut self,
-        e: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(f) = fraction_at(&self.vol_bounds, e.position) {
-            self.set_volume(f, cx);
-        }
-    }
-
-
-    /// 音量条拖拽。
-    pub(super) fn on_vol_move(
-        &mut self,
-        e: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !e.dragging() {
-            return;
-        }
-        if let Some(f) = fraction_at(&self.vol_bounds, e.position) {
-            self.set_volume(f, cx);
-        }
+        cx.notify();
     }
 }
