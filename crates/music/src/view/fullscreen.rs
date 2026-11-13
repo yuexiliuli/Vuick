@@ -629,7 +629,16 @@ impl super::MusicView {
                     .flex()
                     .gap_x(px(12.))
                     .child(
-                        self.fs_action(IconName::HeartBorder, cur_liked, "fs-like", cx),
+                        self.fs_action(
+                            if cur_liked {
+                                IconName::Heart
+                            } else {
+                                IconName::HeartBorder
+                            },
+                            cur_liked,
+                            "fs-like",
+                            cx,
+                        ),
                     )
                     .child(self.fs_action(IconName::QueueMusic, false, "fs-que", cx))
                     .child(self.fs_action(IconName::Download, false, "fs-dl", cx)),
