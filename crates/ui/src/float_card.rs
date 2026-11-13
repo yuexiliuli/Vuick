@@ -103,6 +103,8 @@ pub fn float_card(
             FloatCardPad::P(pad, gap) => ShellPad::Pg(pad, gap),
             FloatCardPad::P3 => ShellPad::P3,
         },
+        // 边框覆盖档：float_card 保留既有「theme border」默认（None）。
+        None,
     )
 }
 

@@ -823,6 +823,7 @@ impl PdfViewer {
             ui::CardShellShadow::PopoverDouble,
             ui::CardShellRadius::Lg,
             ui::CardShellPad::Pg(px(4.), px(2.)),
+            None,
         )
         .id("pdf-sel-card")
         .debug_selector(|| "pdf-sel-card".into())
