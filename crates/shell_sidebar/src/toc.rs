@@ -142,24 +142,15 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
 
     /// 目录视图顶栏：「目录」标题。开关交给左侧竖列「目录」按钮（再点一次收拢侧边栏）。
     fn render_sidebar_toc_header(&mut self) -> impl IntoElement {
-        let (fg, _muted) = (self.text_primary(), self.text_minor());
+        let fg = self.text_primary();
         let border = self.bar_border();
-        div()
-            .id("sidebar-toc-header")
-            .debug_selector(|| "sidebar-toc-header".into())
-            .flex()
-            .items_center()
-            .px(px(10.))
-            .h(px(36.))
-            .border_b_1()
-            .border_color(border)
-            .child(
-                div()
-                    .text_size(px(13.5))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(fg)
-                    .child("目录"),
-            )
+        crate::header::sidebar_panel_header(
+            "sidebar-toc-header",
+            "目录",
+            fg,
+            border,
+            None::<gpui::Div>,
+        )
     }
 
     /// 「目录」视图：当前文档的标题大纲（Markdown 标题 / PDF 书签），带面板头

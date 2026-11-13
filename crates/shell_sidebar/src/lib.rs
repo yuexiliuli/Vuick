@@ -24,6 +24,7 @@
 //! - [`files`]：[`Sidebar`] 实体的文件树视图（懒加载扫描 / 展开折叠 / 过滤 typeahead / 打开）。
 //! - [`files_ops`]：[`Sidebar`] 实体的文件树操作（右键菜单 / 输入弹层生命周期）；文件系统
 //!   副作用经 [`host::SidebarHost`] / [`prompt::FileTreePromptHost`] 分发宿主。
+//! - [`header`]：侧栏面板头公共渲染（toc / files 共用）。
 //! - [`search`]：[`Sidebar`] 实体的跨文件搜索（输入 / 范围切换 / 防抖 / 结果渲染与 PDF
 //!   检索接线 / 文件夹后台分块扫描 / 命中跳转）；扫描与防抖为实体弱句柄自更新（写共享
 //!   模型 + 自 notify），打开/激活经 [`host::SidebarHost`] 分发宿主。
@@ -34,6 +35,7 @@
 pub mod chrome;
 pub mod files;
 pub mod files_ops;
+mod header;
 pub mod host;
 pub mod prompt;
 pub mod search;

@@ -34,37 +34,19 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned());
-        div()
-            .id("sidebar-files-header")
-            .debug_selector(|| "sidebar-files-header".into())
-            .flex()
-            .items_center()
-            .gap_2()
-            .px(px(10.))
-            .h(px(36.))
-            .border_b_1()
-            .border_color(border)
-            .child(
-                div()
-                    .text_size(px(13.5))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(fg)
-                    .child("文件"),
-            )
-            .child(if let Some(name) = root {
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_overflow(gpui::TextOverflow::Truncate("…".into()))
-                    .text_size(px(11.))
-                    .text_color(muted)
-                    .child(name)
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
+        let extra = root.map(|name| {
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                .text_size(px(11.))
+                .text_color(muted)
+                .child(name)
+                .into_any_element()
+        });
+        crate::header::sidebar_panel_header("sidebar-files-header", "文件", fg, border, extra)
     }
 
     /// 未打开文件夹 / 根路径失效的空态：文件夹图标 + 文案 + 可点「打开文件夹…」。
