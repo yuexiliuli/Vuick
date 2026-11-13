@@ -27,6 +27,48 @@ pub enum IconName {
     Folder,
     /// 展开状态的文件夹（文件树中展开的目录行）。
     FolderOpen,
+    /// 首页（房子）。
+    Home,
+    /// 发现/探索（罗盘）。
+    Explore,
+    /// 音乐库（书本）。
+    Library,
+    /// 电台（广播波）。
+    Radio,
+    /// 收藏（实心心形：fill=currentColor 实心，替代 music 的 filled() 机制）。
+    Heart,
+    /// 收藏描边（空心心形：fill=none 仅描边）。
+    HeartBorder,
+    /// 最近播放（时钟）。
+    History,
+    /// 本地下载（箭头进托盘）。
+    Download,
+    /// 通知（铃铛）。
+    Bell,
+    /// 设置（齿轮）。
+    Settings,
+    /// 音乐符（封面占位）。
+    Note,
+    /// 随机播放（交叉箭头）。
+    Shuffle,
+    /// 循环（回路箭头）。
+    Repeat,
+    /// 队列（列表 + 音符）。
+    QueueMusic,
+    /// 分享（三点连线）。
+    Share,
+    /// 歌词/文本（三行对齐线）。
+    Lyrics,
+    /// 全屏（四角扩张）。
+    Fullscreen,
+    /// 退出全屏（四角收拢）。
+    FullscreenExit,
+    /// 加入播放列表（列表 + 加号）。
+    PlaylistAdd,
+    /// 拒绝/高品质（四角星）。
+    Badge,
+    /// 黑胶唱片（logo / 封面占位）。
+    Disc,
     /// 播放（视频控制条）。
     #[cfg(feature = "video")]
     Play,
@@ -98,6 +140,71 @@ impl IconName {
             }
             IconName::FolderOpen => {
                 "<path d=\"m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2\"/>"
+            }
+            IconName::Home => {
+                "<path d=\"M3 10.5 12 3l9 7.5\"/><path d=\"M5 9.5V21h14V9.5\"/><path d=\"M9 21v-6h6v6\"/>"
+            }
+            IconName::Explore => {
+                "<circle cx=\"12\" cy=\"12\" r=\"9\"/><polygon points=\"15.5 8.5 13.9 13.9 8.5 15.5 10.1 10.1 15.5 8.5\"/>"
+            }
+            IconName::Library => {
+                "<path d=\"M4 19.5A2.5 2.5 0 0 1 6.5 17H20\"/><path d=\"M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z\"/><path d=\"M9 7h7M9 11h5\"/>"
+            }
+            IconName::Radio => {
+                "<circle cx=\"12\" cy=\"13\" r=\"3\"/><path d=\"M7.2 8.2a7 7 0 0 0 0 9.6\"/><path d=\"M16.8 8.2a7 7 0 0 1 0 9.6\"/><path d=\"M4.2 5.6a11 11 0 0 0 0 12.8\"/>"
+            }
+            // 心形两态：Heart=实心（fill=currentColor+stroke，替代 music 的 filled() 机制）、
+            // HeartBorder=描边（fill=none 仅 stroke）；同路径不同 fill。
+            IconName::Heart => {
+                "<path d=\"M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z\" fill=\"currentColor\" stroke=\"currentColor\"/>"
+            }
+            IconName::HeartBorder => {
+                "<path d=\"M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z\"/>"
+            }
+            IconName::History => {
+                "<circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M12 7v5l3 2\"/>"
+            }
+            IconName::Download => {
+                "<path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><path d=\"m7 10 5 5 5-5\"/><path d=\"M12 15V3\"/>"
+            }
+            IconName::Bell => {
+                "<path d=\"M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9\"/><path d=\"M13.73 21a2 2 0 0 1-3.46 0\"/>"
+            }
+            IconName::Settings => {
+                "<circle cx=\"12\" cy=\"12\" r=\"3\"/><path d=\"M12 2v3M12 19v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M2 12h3M19 12h3M4.9 19.1 7 17M17 7l2.1-2.1\"/>"
+            }
+            IconName::Note => {
+                "<path d=\"M9 18V5l12-2v13\"/><circle cx=\"6\" cy=\"18\" r=\"3\"/><circle cx=\"18\" cy=\"16\" r=\"3\"/>"
+            }
+            IconName::Shuffle => {
+                "<path d=\"m16 3 4 4-4 4\"/><path d=\"M20 7H11a6 6 0 0 0-6 6v7\"/><path d=\"m8 21-4-4 4-4\"/><path d=\"M4 17h9a6 6 0 0 0 6-6V4\"/>"
+            }
+            IconName::Repeat => {
+                "<path d=\"m17 2 4 4-4 4\"/><path d=\"M3 11v-1a4 4 0 0 1 4-4h14\"/><path d=\"m7 22-4-4 4-4\"/><path d=\"M21 13v1a4 4 0 0 1-4 4H3\"/>"
+            }
+            IconName::QueueMusic => {
+                "<path d=\"M3 6h13\"/><path d=\"M3 12h13\"/><path d=\"M3 18h7\"/><circle cx=\"19\" cy=\"16\" r=\"3\"/><path d=\"M18 16v-4l2 1\"/>"
+            }
+            IconName::Share => {
+                "<circle cx=\"18\" cy=\"5\" r=\"3\"/><circle cx=\"6\" cy=\"12\" r=\"3\"/><circle cx=\"18\" cy=\"19\" r=\"3\"/><line x1=\"8.6\" y1=\"13.4\" x2=\"15.4\" y2=\"17.4\"/><line x1=\"15.4\" y1=\"6.6\" x2=\"8.6\" y2=\"10.6\"/>"
+            }
+            IconName::Lyrics => {
+                "<path d=\"M3 5h18\"/><path d=\"M3 11h12\"/><path d=\"M3 17h18\"/>"
+            }
+            IconName::Fullscreen => {
+                "<path d=\"M8 3H5a2 2 0 0 0-2 2v3\"/><path d=\"M21 8V5a2 2 0 0 0-2-2h-3\"/><path d=\"M3 16v3a2 2 0 0 0 2 2h3\"/><path d=\"M16 21h3a2 2 0 0 0 2-2v-3\"/>"
+            }
+            IconName::FullscreenExit => {
+                "<path d=\"M8 3v3a2 2 0 0 1-2 2H3\"/><path d=\"M21 8h-3a2 2 0 0 1-2-2V3\"/><path d=\"M3 16h3a2 2 0 0 1 2 2v3\"/><path d=\"M16 21v-3a2 2 0 0 1 2-2h3\"/>"
+            }
+            IconName::PlaylistAdd => {
+                "<path d=\"M3 6h13\"/><path d=\"M3 12h13\"/><path d=\"M3 18h7\"/><line x1=\"19\" y1=\"14\" x2=\"19\" y2=\"20\"/><line x1=\"16\" y1=\"17\" x2=\"22\" y2=\"17\"/>"
+            }
+            IconName::Badge => {
+                "<path d=\"M12 3l1.9 4.9L19 9.6l-4.2 1.8L12 16l-2.8-4.6L5 9.6l5.1-1.7z\"/>"
+            }
+            IconName::Disc => {
+                "<circle cx=\"12\" cy=\"12\" r=\"9\"/><circle cx=\"12\" cy=\"12\" r=\"2\" fill=\"currentColor\" stroke=\"currentColor\"/>"
             }
             // 播放/暂停（Feather 风格实心多边形，stroke 描边统一）
             #[cfg(feature = "video")]
@@ -260,6 +367,27 @@ mod tests {
             IconName::ChevronDown,
             IconName::Folder,
             IconName::FolderOpen,
+            IconName::Home,
+            IconName::Explore,
+            IconName::Library,
+            IconName::Radio,
+            IconName::Heart,
+            IconName::HeartBorder,
+            IconName::History,
+            IconName::Download,
+            IconName::Bell,
+            IconName::Settings,
+            IconName::Note,
+            IconName::Shuffle,
+            IconName::Repeat,
+            IconName::QueueMusic,
+            IconName::Share,
+            IconName::Lyrics,
+            IconName::Fullscreen,
+            IconName::FullscreenExit,
+            IconName::PlaylistAdd,
+            IconName::Badge,
+            IconName::Disc,
             #[cfg(feature = "video")]
             IconName::Play,
             #[cfg(feature = "video")]
