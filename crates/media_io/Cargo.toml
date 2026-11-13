@@ -1,0 +1,11 @@
+[package]
+name = "media_io"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "gpui-editor 媒体共享 IO crate（media_ffmpeg.dll FFI 桥 + CPAL 音频输出 sink；供 video/music 消费方迁移复用，本批不迁消费方）"
+
+[dependencies]
+libloading = { workspace = true }
+cpal = { workspace = true }
+anyhow = { workspace = true }
