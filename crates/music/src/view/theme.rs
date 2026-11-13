@@ -198,6 +198,7 @@ pub fn gradient_cover((light, dark): (Hsla, Hsla), radius: f32) -> AnyElement {
 /// 同 [`gradient_cover`]，但把 canvas **实际绘制盒**写入 `record`：供 fs 进度填充的
 /// 「填充随位置增长」回归断言——canvas 布局高度曾塌缩为 0（真机复报五：填充隐形只留轨道
 /// 一色），此盒可直接断言绘制面积非零且随 frac 变化（`bounds_canvas` 同款 Cell 姿势）。
+/// K24 休眠：已被 `ui::SliderFill::Gradient` 取代（fullscreen 用两色阶），保留防回归，勿删。
 pub fn gradient_cover_tracked(
     (light, dark): (Hsla, Hsla),
     radius: f32,

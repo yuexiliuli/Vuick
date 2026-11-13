@@ -12,10 +12,12 @@
 //! 文字间距忽略；黑胶圈用 svg 圆环 + 旋转动画（暂停即停）。Esc 关全屏由根 `on_key`
 //! 处理，close 钮也关。
 
+use std::time::Instant;
+
 use gpui::{
     AnyElement, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, StatefulInteractiveElement as _, Styled as _,
-    Window, div, px,
+    IntoElement, ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div,
+    px,
 };
 
 use crate::model::{RepeatMode, duration_str};
@@ -23,6 +25,7 @@ use crate::model::{RepeatMode, duration_str};
 use super::icon::{IconView, MusicIcon};
 use super::{IntoIconElement, MusicView, theme};
 use ui::icon::{Icon, IconName};
+use ui::{CommitMode, Slider, SliderFill, SliderThumb};
 
 /// 全屏封面边长（px），黑胶圈按比例派生。
 pub(super) const FS_COVER_PX: f32 = 320.0;
@@ -355,17 +358,110 @@ impl super::MusicView {
             .into_any_element()
     }
 
-    /// 进度条（v2 `.fs-bar*`）：5px 轨道 + accent 渐变填充 + 悬停圆点；可拖拽 seek。
+    // ---- 可交互条（全屏进度/音量条）事件 → 播放器 ----
+
+    /// seek 点按（Slider `on_change`，原 `on_strip_down(true)` seek 分支）：进拖拽态 + 立即
+    /// 真实 seek；同时补回根聚焦——Slider `mouse_down` 已 `stop_propagation`，点条不再冒泡到
+    /// 根 `on_root_mouse_down`（mod.rs 负责聚焦根），对齐 bottom/np `focus_music_root` 套路
+    /// （全屏由 MusicView 自身渲染，root 即 `self.focus_handle`）。
+    fn fs_begin_scrub(&mut self, f: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+        self.state.scrubbing = true;
+        self.state.last_scrub_retarget = Some(Instant::now());
+        // 同步钉住播放器显示基准：拖拽中 position = 手指落点，不随时钟漂移。
+        self.player.update(cx, |p, cx| p.set_scrubbing(true, cx));
+        self.seek_to_fraction(f, true, cx);
+    }
+
+    /// seek 拖拽 move（Slider `on_change_during_drag`，原 `on_strip_drag(true)` seek 分支）：
+    /// 节流真实 seek、节流窗内 set_seek_base 跟手；窗外钳 0/1 与松手兜底由 Slider 自有 MouseUp
+    /// 接管，不再需要旧 `ev.dragging()`/`on_mouse_up_out` 探针。
+    fn fs_drag_scrub(&mut self, f: f32, cx: &mut Context<Self>) {
+        self.seek_to_fraction(f, false, cx);
+    }
+
+    /// seek 松手精提交（Slider `on_commit`，原 `on_strip_up(true)`）：按松手点精确分数刷新落点
+    /// （窗外沿用最后锁定落点——Slider 把 f 算成精确/锁定分数），再补发末次精提交。
+    fn fs_end_scrub(&mut self, f: f32, cx: &mut Context<Self>) {
+        let dur = self.player.read(cx).duration();
+        self.state.scrub_target = dur * f as f64;
+        self.end_strip_scrub(cx);
+    }
+
+    /// 音量即时应用（Slider `on_change`/`on_change_during_drag` 共用，原 `on_strip_down/drag
+    /// (false)` → `apply_strip` vol 分支）：`set_volume` + 本视图 notify；同时补回根聚焦
+    /// （同 [`Self::fs_begin_scrub`] 的 NIT）。
+    fn fs_apply_vol(&mut self, f: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+        self.apply_strip(false, f, cx);
+    }
+
+    /// 进度条（v2 `.fs-bar*`）：走自绘 `ui::Slider`——5px/rounded(3) 细轨（bg_hover×0.8）+
+    /// accent→accent_light 横向渐变填充 + 悬停白点 thumb（accent 辉光）；整条 16px 命中高。
+    /// 组件只回传分数事件，宿主收口（[`Self::fs_begin_scrub`]/[`Self::fs_drag_scrub`]/
+    /// [`Self::fs_end_scrub`]，保 [`Self::seek_to_fraction`] 的 SCRUB_RETARGET 节流 + 松手精提交，
+    /// 对应旧 `on_strip_down(true)/on_strip_drag(true)/on_strip_up(true)` 语义）；elapsed/total
+    /// 时间行与 hover 高亮（`fs_hover`）留在消费方不进组件。`fs_progress`/`fs_fill_box` 由
+    /// `on_geometry` 每帧回写（后者 = Slider 填充盒的忠实重建，供「填充随进度增长」回归）。
     fn render_fs_progress(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let dur = p.duration();
         let pos = p.position();
         let frac = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
-        let hovered = self.fs_hover == Some("fs-prog");
-        let b_down = self.fs_progress.clone();
-        let b_drag = self.fs_progress.clone();
-        let b_up = self.fs_progress.clone();
-        let b_out = self.fs_progress.clone();
+        let entity = cx.entity();
+        let b_bar = self.fs_progress.clone();
+        let b_fill = self.fs_fill_box.clone();
+        let slider = Slider::new("fs-prog-slider")
+            .value(frac)
+            .commit_mode(CommitMode::OnRelease)
+            .track_height(px(5.))
+            .track_radius(3.)
+            // 轨道底色 = 现 track（bg_hover × 0.8）；填充 = accent→accent_light 横向渐变
+            //（组件内画 90° 渐变；旧 135° 对角渐变近似，见 Wire-B2 映射表）。
+            .track_color(theme::bg_hover().opacity(0.8))
+            .fill(SliderFill::Gradient([
+                theme::accent(),
+                theme::accent_light(),
+            ]))
+            // 白色 thumb + accent 辉光：静止透明度 0（不显现）、hover 弹簧淡入到 1——
+            // 对旧「hover 才显现 12px 白点」观感（新旧圆心都贴填充末端；12px 直径=半径 6）。
+            .thumb(Some(SliderThumb {
+                base: 0.0,
+                hover: 6.0,
+                color: gpui::white(),
+                glow: Some(theme::accent()),
+                opacity_base: 0.0,
+                opacity_hover: 1.0,
+            }))
+            // 每帧把真实命中盒（窗口坐标）回写 fs_progress；fs_fill_box = Slider 填充盒重建
+            //（轨 5px 居中：填充宽 = fill_end−左缘、高 5），替代旧 gradient_cover_tracked canvas。
+            .on_geometry({
+                let b_bar = b_bar.clone();
+                let b_fill = b_fill.clone();
+                move |geom, _w, _app| {
+                    b_bar.set(geom.bounds);
+                    let b = geom.bounds;
+                    let w = (geom.fill_end.x.as_f32() - b.origin.x.as_f32()).max(0.0);
+                    let cy = b.center().y.as_f32();
+                    b_fill.set(gpui::Bounds::new(
+                        gpui::point(b.origin.x, px(cy - 2.5)),
+                        gpui::size(px(w), px(5.0)),
+                    ));
+                }
+            })
+            // seek 三阶段事件 → 宿主收口（进/退拖拽态 + SCRUB_RETARGET 节流 + 松手精提交）。
+            .on_change({
+                let entity = entity.clone();
+                move |f, w, app| entity.update(app, |this, cx| this.fs_begin_scrub(f, w, cx))
+            })
+            .on_change_during_drag({
+                let entity = entity.clone();
+                move |f, _w, app| entity.update(app, |this, cx| this.fs_drag_scrub(f, cx))
+            })
+            .on_commit({
+                let entity = entity.clone();
+                move |f, _w, app| entity.update(app, |this, cx| this.fs_end_scrub(f, cx))
+            });
 
         div()
             .w_full()
@@ -379,83 +475,23 @@ impl super::MusicView {
                     .w_full()
                     .h(px(16.))
                     .cursor(CursorStyle::PointingHand)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev, _w, cx| {
-                            this.on_strip_down(true, b_down.clone(), ev, cx);
-                        }),
-                    )
-                    .on_mouse_move(
-                        cx.listener(move |this, ev, _w, cx| {
-                            this.on_strip_drag(true, b_drag.clone(), ev, cx);
-                        }),
-                    )
-                    // 松手收尾（与 strip_element/bb/np 同一套 handler，三处进度条共用一处修）：
-                    // 窗口内松开 → on_mouse_up；拖出窗外/条外松开 → on_mouse_up_out 兜底。
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev, _w, cx| {
-                            this.on_strip_up(true, b_up.clone(), ev, cx);
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev, _w, cx| {
-                            this.on_strip_up(true, b_out.clone(), ev, cx);
-                        }),
-                    )
                     .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
                         // 进度条只管理高亮/圆点，不弹名称提示（name=None 会清残留）。
                         this.set_fs_hover_and_tip("fs-prog", None, *hovered, cx);
                     }))
-                    .child(theme::bounds_canvas(self.fs_progress.clone()))
+                    // debug 只读探针：Slider 用 paint_quad 自绘填充（无元素盒），回归断言靠
+                    // `debug_bounds("fs-prog-fill")` 读「填充宽 = frac×条宽」——透明 div 只承载
+                    // debug_selector（不绘制、无命中盒；几何与 Slider 轨同 5px 居中）。
                     .child(
                         div()
+                            .debug_selector(|| "fs-prog-fill".into())
                             .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .relative()
-                                    .h(px(5.))
-                                    .rounded(px(3.))
-                                    .bg(theme::bg_hover().opacity(0.8))
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left_0()
-                                            .top_0()
-                                            .bottom_0()
-                                            .w(DefiniteLength::Fraction(frac))
-                                            .rounded(px(3.))
-                                            .debug_selector(|| "fs-prog-fill".into())
-                                            .child(theme::gradient_cover_tracked(
-                                                (theme::accent(), theme::accent_light()),
-                                                3.0,
-                                                self.fs_fill_box.clone(),
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .right(px(-6.))
-                                            .top(px(-3.5))
-                                            .w(px(12.))
-                                            .h(px(12.))
-                                            .rounded(px(6.))
-                                            .bg(gpui::white())
-                                            .shadow(vec![gpui::BoxShadow::new(
-                                                px(0.),
-                                                px(0.),
-                                                theme::accent().opacity(0.6),
-                                            )
-                                            .blur_radius(px(10.))])
-                                            .opacity(if hovered { 1.0 } else { 0.0 }),
-                                    ),
-                            ),
-                    ),
+                            .left_0()
+                            .top(px(5.5))
+                            .h(px(5.))
+                            .w(DefiniteLength::Fraction(frac)),
+                    )
+                    .child(slider),
             )
             .child(
                 div()
@@ -646,15 +682,42 @@ impl super::MusicView {
             .into_any_element()
     }
 
-    /// 音量条（点击/拖拽调音量）。
+    /// 音量条（点击/拖拽调音量）：走自绘 `ui::Slider`——120px 定宽、4px/rounded(2) 细轨 +
+    /// text2×0.85 实色填充（thumb=None）、`CommitMode::Immediate` 即时生效；悬停「音量」提示
+    /// 留在消费方（按 fs_vol 盒锚定，同旧）。点/拖都经 [`Self::fs_apply_vol`] 即时 set_volume +
+    /// 补回根聚焦。
     fn render_fs_volume(&mut self, cx: &mut Context<Self>, volume: f32) -> AnyElement {
-        let b_down = self.fs_vol.clone();
-        let b_drag = self.fs_vol.clone();
         // 提示盒记录：复用 fs_vol 条盒 cell（无需多余 canvas；悬停「音量」按此盒锚定）。
         self.tip_boxes
             .entry("fs-vol")
             .or_insert_with(|| self.fs_vol.clone());
         let hovered = self.fs_hover == Some("fs-vol");
+        let entity = cx.entity();
+        let b_vol = self.fs_vol.clone();
+        let slider = Slider::new("fs-vol-slider")
+            .value(volume.clamp(0.0, 1.0))
+            .commit_mode(CommitMode::Immediate)
+            .track_height(px(4.))
+            .track_radius(2.)
+            // 轨道底色 = 现 track（bg_hover × 0.8）；填充 = text2 × 0.85（thumb=None）。
+            .track_color(theme::bg_hover().opacity(0.8))
+            .fill(SliderFill::Solid(theme::text2().opacity(0.85)))
+            .thumb(None)
+            // 每帧把真实命中盒（120×16，窗口坐标）回写 fs_vol（替代旧 canvas 记录）。
+            .on_geometry({
+                let b_vol = b_vol.clone();
+                move |geom, _w, _app| b_vol.set(geom.bounds)
+            })
+            // vol 即时：点/拖都直接 set_volume（无 on_commit）。
+            .on_change({
+                let entity = entity.clone();
+                move |f, w, app| entity.update(app, |this, cx| this.fs_apply_vol(f, w, cx))
+            })
+            .on_change_during_drag({
+                let entity = entity.clone();
+                move |f, w, app| entity.update(app, |this, cx| this.fs_apply_vol(f, w, cx))
+            });
+
         div()
             .flex()
             .items_center()
@@ -670,42 +733,11 @@ impl super::MusicView {
                     .relative()
                     .w(px(120.))
                     .h(px(16.))
-                    .flex()
-                    .items_center()
                     .cursor(CursorStyle::PointingHand)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev, _w, cx| {
-                            this.on_strip_down(false, b_down.clone(), ev, cx);
-                        }),
-                    )
-                    .on_mouse_move(
-                        cx.listener(move |this, ev, _w, cx| {
-                            this.on_strip_drag(false, b_drag.clone(), ev, cx);
-                        }),
-                    )
                     .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
                         this.set_fs_hover_and_tip("fs-vol", Some("音量"), *hovered, cx);
                     }))
-                    .child(theme::bounds_canvas(self.fs_vol.clone()))
-                    .child(
-                        div()
-                            .relative()
-                            .w_full()
-                            .h(px(4.))
-                            .rounded(px(2.))
-                            .bg(theme::bg_hover().opacity(0.8))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(DefiniteLength::Fraction(volume.clamp(0.0, 1.0)))
-                                    .rounded(px(2.))
-                                    .bg(theme::text2().opacity(0.85)),
-                            ),
-                    ),
+                    .child(slider),
             )
             .into_any_element()
     }

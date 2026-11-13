@@ -180,11 +180,13 @@ pub struct MusicView {
     covers: HashMap<PathBuf, Arc<RenderImage>>,
     /// 正在解码的封面 path（防重复派发任务）。
     cover_loading: HashSet<PathBuf>,
-    // ---- 可交互条（进度/音量）的窗口坐标盒（canvas prepaint 记录） ----
+    // ---- 可交互条（进度/音量）的窗口坐标盒（`ui::Slider::on_geometry` 每帧回写；
+    //     旧 bounds_canvas「canvas prepaint 记录」已随 Wire-B2 退役） ----
     fs_progress: Rc<Cell<Bounds<Pixels>>>,
     fs_vol: Rc<Cell<Bounds<Pixels>>>,
-    /// 全屏进度条**填充渐变**的 canvas 实际绘制盒（`gradient_cover_tracked` 记录）：
-    /// 供「填充随播放位置增长」回归断言（canvas 高度曾塌缩 0 → 填充隐形，真机复报五）。
+    /// 全屏进度条**填充渐变**的实际绘制盒（`ui::Slider::on_geometry` 按 `geom.fill_end`
+    /// 忠实重建：填充宽 = fill_end−左缘、高 5，拖拽中显示分数同步）：供「填充随播放位置
+    /// 增长」回归断言（旧 gradient_cover_tracked canvas 高度曾塌缩 0 → 填充隐形，真机复报五）。
     fs_fill_box: Rc<Cell<Bounds<Pixels>>>,
     // ---- 悬停状态（hover 触发一次重绘即可，无需持续动画） ----
     hover_mix: Option<usize>,
@@ -763,71 +765,6 @@ impl MusicView {
         cx.notify();
     }
 
-    // ---- 可交互条（进度/音量 share）：条元素 + 事件 → 播放器 ----
-
-    fn on_strip_down(
-        &mut self,
-        is_seek: bool,
-        bounds: Rc<Cell<Bounds<Pixels>>>,
-        ev: &MouseDownEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(f) = fraction_at(&bounds, ev.position) {
-            if is_seek {
-                // 点按即跳：进拖拽态并以该点为基准立即真实 seek（显示由 seek_base 即时到落点）。
-                self.state.scrubbing = true;
-                self.state.last_scrub_retarget = Some(Instant::now());
-                // 同步钉住播放器显示基准：拖拽中 position = 手指落点，不随时钟漂移。
-                self.player.update(cx, |p, cx| p.set_scrubbing(true, cx));
-            }
-            self.apply_strip(is_seek, f, cx);
-        }
-    }
-
-    fn on_strip_drag(
-        &mut self,
-        is_seek: bool,
-        bounds: Rc<Cell<Bounds<Pixels>>>,
-        ev: &MouseMoveEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if !ev.dragging() {
-            // 已松开但 mouse_up 未送达本条（如拖出窗外释放）→ 按最后锁定落点收尾
-            // （对齐视频 `on_seek_move` 的 `!dragging && scrubbing` 兜底）。
-            if self.state.scrubbing {
-                self.end_strip_scrub(cx);
-            }
-            return;
-        }
-        if let Some(f) = fraction_at(&bounds, ev.position) {
-            if is_seek && self.state.scrubbing {
-                self.seek_to_fraction(f, false, cx);
-            } else if !is_seek {
-                self.apply_strip(false, f, cx);
-            }
-        }
-    }
-
-    /// 进度条松手收尾（窗口内 `on_mouse_up` / 拖出窗外 `on_mouse_up_out` 共用）：
-    /// 窗口内优先用松手位置的精确分数刷新落点；窗外（fraction_at None）沿用最后锁定
-    /// 落点。随后按最终落点提交，「松手停在当前位置」。
-    fn on_strip_up(
-        &mut self,
-        is_seek: bool,
-        bounds: Rc<Cell<Bounds<Pixels>>>,
-        ev: &MouseUpEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if !is_seek || !self.state.scrubbing {
-            return;
-        }
-        if let Some(f) = fraction_at(&bounds, ev.position) {
-            let dur = self.player.read(cx).duration();
-            self.state.scrub_target = dur * f as f64;
-        }
-        self.end_strip_scrub(cx);
-    }
-
     /// 拖拽收尾：若最终落点尚未真实 seek（节流窗口内直接松手）→ 补发最后一次精确
     /// 提交；否则（已 seek 过同落点）只退出拖拽态，不重复 seek（无杂音）。
     fn end_strip_scrub(&mut self, cx: &mut Context<Self>) {
@@ -1166,21 +1103,6 @@ impl EntityInputHandler for MusicView {
     ) -> TextInputConfiguration {
         TextInputConfiguration::default()
     }
-}
-
-/// 坐标盒 → 横向比例（x 出条返回 None；未布局宽<=0 返回 None）。
-fn fraction_at(bounds: &Rc<Cell<Bounds<Pixels>>>, pos: Point<Pixels>) -> Option<f32> {
-    let b = bounds.get();
-    if b.size.width.as_f32() <= 0.0 {
-        return None;
-    }
-    let left = b.origin.x.as_f32();
-    let right = (b.origin.x + b.size.width).as_f32();
-    let x = pos.x.as_f32();
-    if x < left || x > right {
-        return None;
-    }
-    Some(((x - left) / (right - left)).clamp(0.0, 1.0))
 }
 
 /// 主区搜索过滤纯函数：标题/艺术家大小写不敏感任一命中；空查询返回全部。
