@@ -465,7 +465,7 @@ mod tests {
     /// SSE4.1（含 DST 4 点）≡ scalar：尺寸 4/8/16/32 × 8/10-bit × maxX/maxY 覆盖（全列/uneven/单列/零列）× 随机。
     #[test]
     fn sse41_matches_scalar_random() {
-        if !std::is_x86_feature_detected!("sse4.1") {
+        if !kimg_core::simd::detect("sse4.1") {
             eprintln!("SKIP: 无 sse4.1");
             return;
         }
@@ -512,7 +512,7 @@ mod tests {
     /// AVX2（n≥8，DCT）≡ scalar：尺寸 8/16/32 × 8/10-bit × maxX/maxY 覆盖 × 随机。
     #[test]
     fn avx2_matches_scalar_random() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 avx2");
             return;
         }
@@ -554,7 +554,7 @@ mod tests {
     /// 生产分派入口 ≡ scalar：`inverse_add`（AVX2/SSE4.1 自动选路）与 `inverse_add_scalar` 对拍。
     #[test]
     fn inverse_add_dispatch_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") && !std::is_x86_feature_detected!("sse4.1") {
+        if !kimg_core::simd::detect("avx2") && !kimg_core::simd::detect("sse4.1") {
             eprintln!("SKIP: 无任意 SIMD");
             return;
         }
@@ -562,8 +562,8 @@ mod tests {
         for &(n, dst4) in &[(4usize, false), (4, true), (8, false), (16, false), (32, false)] {
             // 与生产分派同款运行时选路：avx2(&&sse4.1) 且 n≥8 → 8-lane，否则 4-lane。
             let w = if n >= 8
-                && std::is_x86_feature_detected!("avx2")
-                && std::is_x86_feature_detected!("sse4.1")
+                && kimg_core::simd::detect("avx2")
+                && kimg_core::simd::detect("sse4.1")
             {
                 8
             } else {
@@ -619,7 +619,7 @@ mod tests {
     /// SIMD 入口做块边界校验（非法参数报错而非溢出/越界）。
     #[test]
     fn simd_invalid_arguments_error() {
-        if !std::is_x86_feature_detected!("sse4.1") {
+        if !kimg_core::simd::detect("sse4.1") {
             eprintln!("SKIP: 无 sse4.1");
             return;
         }

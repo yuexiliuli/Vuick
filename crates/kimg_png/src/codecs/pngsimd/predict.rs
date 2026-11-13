@@ -17,8 +17,6 @@
 //! 全部向量路径都配纯标量回退，且向量结果与标量逐字节一致（见模块底部测试：随机行 5 filter × 各 bpp、
 //! Paeth 8 位 lane 专项大样本随机 parity）。
 
-use std::arch::is_x86_feature_detected;
-
 /// 每像素字节数（Shell 中为预测用 bpp）：`samples * ((depth + 7) >> 3)`，sub-byte 恒为 1，
 /// 与 png crate `bytes_per_pixel()` / SimdCodecs `bytesPerPixel` 同式。
 pub(crate) fn prediction_bpp(samples: usize, depth: usize) -> usize {
@@ -96,10 +94,10 @@ fn paeth(a: i32, b: i32, c: i32) -> i32 {
 fn unfilter_up(row: &mut [u8], above: &[u8]) {
     #[cfg(target_arch = "x86_64")]
     {
-        if !crate::codecs::pngsimd::simd_forced_off() && is_x86_feature_detected!("avx2") {
+        if kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "avx2") {
             return unsafe { sse::unfilter_up_avx2(row, above) };
         }
-        if !crate::codecs::pngsimd::simd_forced_off() && is_x86_feature_detected!("sse2") {
+        if kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "sse2") {
             return unsafe { sse::unfilter_up_sse2(row, above) };
         }
     }
@@ -115,16 +113,16 @@ fn unfilter_up(row: &mut [u8], above: &[u8]) {
 fn unfilter_sub(row: &mut [u8], bpp: usize) {
     let n = row.len();
     #[cfg(target_arch = "x86_64")]
-    if !cfg!(debug_assertions) && !crate::codecs::pngsimd::simd_forced_off() {
+    if !cfg!(debug_assertions) && !kimg_core::simd::env_off("KIMG_PNG_NO_SIMD") {
         if bpp == 1 {
             // bpp==1 每字节一个像素，串行链用「块前缀和」向量化（16/32 字节块 + 跨块 carry 传播）。
-            if is_x86_feature_detected!("avx2") {
+            if kimg_core::simd::detect("avx2") {
                 return unsafe { sse::unfilter_sub_bpp1_avx2(row) };
             }
-            if is_x86_feature_detected!("sse2") {
+            if kimg_core::simd::detect("sse2") {
                 return unsafe { sse::unfilter_sub_bpp1_sse2(row) };
             }
-        } else if (2..=8).contains(&bpp) && is_x86_feature_detected!("sse2") {
+        } else if (2..=8).contains(&bpp) && kimg_core::simd::detect("sse2") {
             return unsafe { sse::unfilter_sub_sse2(row, bpp) };
         }
     }
@@ -142,8 +140,7 @@ fn unfilter_average(row: &mut [u8], above: &[u8], bpp: usize) {
     #[cfg(target_arch = "x86_64")]
     if (2..=8).contains(&bpp)
         && !cfg!(debug_assertions)
-        && !crate::codecs::pngsimd::simd_forced_off()
-        && is_x86_feature_detected!("sse2")
+        && kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "sse2")
     {
         return unsafe { sse::unfilter_average_sse2(row, above, bpp) };
     }
@@ -162,22 +159,22 @@ fn unfilter_paeth(row: &mut [u8], above: &[u8], bpp: usize) {
     #[cfg(target_arch = "x86_64")]
     if (2..=8).contains(&bpp)
         && !cfg!(debug_assertions)
-        && !crate::codecs::pngsimd::simd_forced_off()
+        && !kimg_core::simd::env_off("KIMG_PNG_NO_SIMD")
     {
         if paeth_legacy_forced() {
             // 回退：旧 16 位 lane 实现（SSE2 通用）。
-            if is_x86_feature_detected!("sse2") {
+            if kimg_core::simd::detect("sse2") {
                 return unsafe { sse::unfilter_paeth_sse2_16lane(row, above, bpp) };
             }
         } else {
             // 8 位 lane FPNGE 主径：AVX2 256 位 / SSE4.1 128 位，逐像素一步（bpp 字节作道）。
-            if is_x86_feature_detected!("avx2") {
+            if kimg_core::simd::detect("avx2") {
                 return unsafe { sse::unfilter_paeth_avx2(row, above, bpp) };
             }
-            if is_x86_feature_detected!("sse4.1") {
+            if kimg_core::simd::detect("sse4.1") {
                 return unsafe { sse::unfilter_paeth_sse41(row, above, bpp) };
             }
-            if is_x86_feature_detected!("sse2") {
+            if kimg_core::simd::detect("sse2") {
                 return unsafe { sse::unfilter_paeth_sse2_16lane(row, above, bpp) };
             }
         }
@@ -202,10 +199,10 @@ fn unfilter_up_to(src: &[u8], dst: &mut [u8], above: &[u8]) {
     let n = dst.len();
     #[cfg(target_arch = "x86_64")]
     {
-        if !crate::codecs::pngsimd::simd_forced_off() && is_x86_feature_detected!("avx2") {
+        if kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "avx2") {
             return unsafe { sse::unfilter_up_to_avx2(src, dst, above) };
         }
-        if !crate::codecs::pngsimd::simd_forced_off() && is_x86_feature_detected!("sse2") {
+        if kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "sse2") {
             return unsafe { sse::unfilter_up_to_sse2(src, dst, above) };
         }
     }
@@ -217,16 +214,16 @@ fn unfilter_up_to(src: &[u8], dst: &mut [u8], above: &[u8]) {
 fn unfilter_sub_to(src: &[u8], dst: &mut [u8], bpp: usize) {
     let n = dst.len();
     #[cfg(target_arch = "x86_64")]
-    if !cfg!(debug_assertions) && !crate::codecs::pngsimd::simd_forced_off() {
+    if !cfg!(debug_assertions) && !kimg_core::simd::env_off("KIMG_PNG_NO_SIMD") {
         if bpp == 1 {
             // bpp==1 每字节一个像素：块前缀和（读 src 块、跨块 carry 写 dst）。
-            if is_x86_feature_detected!("avx2") {
+            if kimg_core::simd::detect("avx2") {
                 return unsafe { sse::unfilter_sub_to_bpp1_avx2(src, dst) };
             }
-            if is_x86_feature_detected!("sse2") {
+            if kimg_core::simd::detect("sse2") {
                 return unsafe { sse::unfilter_sub_to_bpp1_sse2(src, dst) };
             }
-        } else if (2..=8).contains(&bpp) && is_x86_feature_detected!("sse2") {
+        } else if (2..=8).contains(&bpp) && kimg_core::simd::detect("sse2") {
             return unsafe { sse::unfilter_sub_to_sse2(src, dst, bpp) };
         }
     }
@@ -241,8 +238,7 @@ fn unfilter_average_to(src: &[u8], dst: &mut [u8], above: &[u8], bpp: usize) {
     #[cfg(target_arch = "x86_64")]
     if (2..=8).contains(&bpp)
         && !cfg!(debug_assertions)
-        && !crate::codecs::pngsimd::simd_forced_off()
-        && is_x86_feature_detected!("sse2")
+        && kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "sse2")
     {
         return unsafe { sse::unfilter_average_to_sse2(src, dst, above, bpp) };
     }
@@ -257,20 +253,20 @@ fn unfilter_paeth_to(src: &[u8], dst: &mut [u8], above: &[u8], bpp: usize) {
     #[cfg(target_arch = "x86_64")]
     if (2..=8).contains(&bpp)
         && !cfg!(debug_assertions)
-        && !crate::codecs::pngsimd::simd_forced_off()
+        && !kimg_core::simd::env_off("KIMG_PNG_NO_SIMD")
     {
         if paeth_legacy_forced() {
-            if is_x86_feature_detected!("sse2") {
+            if kimg_core::simd::detect("sse2") {
                 return unsafe { sse::unfilter_paeth_to_sse2_16lane(src, dst, above, bpp) };
             }
         } else {
-            if is_x86_feature_detected!("avx2") {
+            if kimg_core::simd::detect("avx2") {
                 return unsafe { sse::unfilter_paeth_to_avx2(src, dst, above, bpp) };
             }
-            if is_x86_feature_detected!("sse4.1") {
+            if kimg_core::simd::detect("sse4.1") {
                 return unsafe { sse::unfilter_paeth_to_sse41(src, dst, above, bpp) };
             }
-            if is_x86_feature_detected!("sse2") {
+            if kimg_core::simd::detect("sse2") {
                 return unsafe { sse::unfilter_paeth_to_sse2_16lane(src, dst, above, bpp) };
             }
         }
@@ -1207,8 +1203,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn sse_unfilter_matches_scalar() {
-        use std::arch::is_x86_feature_detected;
-        if !is_x86_feature_detected!("sse2") {
+        if !kimg_core::simd::detect("sse2") {
             return;
         }
         for bpp in 2..=8usize {
@@ -1245,7 +1240,6 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn bpp1_sub_prefix_simd_matches_scalar() {
-        use std::arch::is_x86_feature_detected;
         let lens = [
             1, 2, 3, 4, 15, 16, 17, 31, 32, 33, 47, 48, 62, 63, 64, 65, 95, 96, 97, 127, 128, 129,
             255, 256, 257, 511, 1000, 1024, 4097,
@@ -1261,12 +1255,12 @@ mod tests {
                 let mut scalar = filtered.clone();
                 scal_sub(&mut scalar, 1);
                 assert_eq!(scalar, raw, "标量 len={len}");
-                if is_x86_feature_detected!("sse2") {
+                if kimg_core::simd::detect("sse2") {
                     let mut simd = filtered.clone();
                     unsafe { super::sse::unfilter_sub_bpp1_sse2(&mut simd) };
                     assert_eq!(simd, raw, "SSE2 bpp1 Sub len={len}");
                 }
-                if is_x86_feature_detected!("avx2") {
+                if kimg_core::simd::detect("avx2") {
                     let mut simd = filtered.clone();
                     unsafe { super::sse::unfilter_sub_bpp1_avx2(&mut simd) };
                     assert_eq!(simd, raw, "AVX2 bpp1 Sub len={len}");
@@ -1366,7 +1360,6 @@ mod tests {
         bpp: usize,
         tag: &str,
     ) {
-        use std::arch::is_x86_feature_detected;
         let len = raw_dst.len();
         let filtered = if len == 0 {
             Vec::new()
@@ -1387,7 +1380,7 @@ mod tests {
         assert_eq!(scalar, raw_dst, "标量不符 {tag} bpp={bpp} len={len}");
 
         if bpp >= 2 {
-            if is_x86_feature_detected!("sse4.1") {
+            if kimg_core::simd::detect("sse4.1") {
                 let mut simd = filtered.clone();
                 unsafe { super::sse::unfilter_paeth_sse41(&mut simd, above, bpp) };
                 assert_eq!(
@@ -1399,7 +1392,7 @@ mod tests {
                 unsafe { super::sse::unfilter_paeth_to_sse41(&filtered, &mut to, above, bpp) };
                 assert_eq!(to, raw_dst, "SSE4.1 to 不符 {tag} bpp={bpp} len={len}");
             }
-            if is_x86_feature_detected!("avx2") {
+            if kimg_core::simd::detect("avx2") {
                 let mut simd = filtered.clone();
                 unsafe { super::sse::unfilter_paeth_avx2(&mut simd, above, bpp) };
                 assert_eq!(simd, raw_dst, "AVX2 8位lane不符 {tag} bpp={bpp} len={len}");
@@ -1506,7 +1499,6 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn paeth_fpn8_predictor_core_parity() {
-        use std::arch::is_x86_feature_detected;
         let mut s: u64 = 0xA076_1D64_78BD_642Fu64;
         let mut rng = move || {
             s = s
@@ -1523,7 +1515,7 @@ mod tests {
 
         let mut iter = 0u64;
         let n_calls_128 = 60_000u64; // 60k×16 道 = 96 万三元组
-        if is_x86_feature_detected!("sse4.1") {
+        if kimg_core::simd::detect("sse4.1") {
             for _ in 0..n_calls_128 {
                 let mut av = [0u8; 16];
                 let mut bv = [0u8; 16];
@@ -1549,7 +1541,7 @@ mod tests {
                 }
             }
         }
-        if is_x86_feature_detected!("avx2") {
+        if kimg_core::simd::detect("avx2") {
             for _ in 0..n_calls_128 {
                 let mut av = [0u8; 32];
                 let mut bv = [0u8; 32];
@@ -1622,7 +1614,6 @@ mod tests {
     #[ignore = "手动内核 A/B 微基准"]
     #[allow(clippy::type_complexity)] // 诊断基准的 &dyn Fn 形参
     fn paeth_kernel_micro_bench() {
-        use std::arch::is_x86_feature_detected;
         use std::time::Instant;
 
         let mut s: u64 = 0xF1EA_5EED_C0FF_EE01u64;
@@ -1674,7 +1665,7 @@ mod tests {
             };
             let t_scalar = time(&scal);
             let mut line = format!("PRED_KERNEL_BENCH bpp={bpp} scalar={t_scalar:.2}ns/B");
-            if is_x86_feature_detected!("sse2") {
+            if kimg_core::simd::detect("sse2") {
                 let t16 =
                     time(&|r, a, bpp| unsafe { super::sse::unfilter_paeth_sse2_16lane(r, a, bpp) });
                 line.push_str(&format!(
@@ -1682,14 +1673,14 @@ mod tests {
                     t16 / t_scalar
                 ));
             }
-            if is_x86_feature_detected!("sse4.1") {
+            if kimg_core::simd::detect("sse4.1") {
                 let t41 = time(&|r, a, bpp| unsafe { super::sse::unfilter_paeth_sse41(r, a, bpp) });
                 line.push_str(&format!(
                     " sse41_8lane={t41:.2}ns/B (x{:.2})",
                     t41 / t_scalar
                 ));
             }
-            if is_x86_feature_detected!("avx2") {
+            if kimg_core::simd::detect("avx2") {
                 let tavx = time(&|r, a, bpp| unsafe { super::sse::unfilter_paeth_avx2(r, a, bpp) });
                 line.push_str(&format!(
                     " avx2_8lane={tavx:.2}ns/B (x{:.2})",

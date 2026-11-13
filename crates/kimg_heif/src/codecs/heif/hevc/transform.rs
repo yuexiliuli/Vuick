@@ -168,8 +168,8 @@ impl HevcTransform {
         // avx2 内核还用 `_mm_cvtepu16_epi32`/`_mm_packus_epi32`/`_mm_mullo_epi32` 等 SSE4.1 指令；
         // 真实 AVX2 CPU 均含 SSE4.1，此处显式并查只为意图清晰（无 SSE4.1 则回落 sse41/标量路径）。
         if n >= 8
-            && std::is_x86_feature_detected!("avx2")
-            && std::is_x86_feature_detected!("sse4.1")
+            && kimg_core::simd::detect("avx2")
+            && kimg_core::simd::detect("sse4.1")
         {
             let m: &[i32] = if dst4 {
                 &DST_N
@@ -181,7 +181,7 @@ impl HevcTransform {
             );
         }
         #[cfg(target_arch = "x86_64")]
-        if std::is_x86_feature_detected!("sse4.1") {
+        if kimg_core::simd::detect("sse4.1") {
             let m: &[i32] = if dst4 {
                 &DST_N
             } else {

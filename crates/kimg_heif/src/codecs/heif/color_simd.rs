@@ -183,7 +183,7 @@ mod tests {
     /// 标量段用真正标量行函数（非重复实现）作 oracle，只取向量覆盖范围比对。
     #[test]
     fn avx2_kernel_matches_scalar_randomised() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 AVX2，向量核不参与比较");
             return;
         }

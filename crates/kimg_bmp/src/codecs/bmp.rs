@@ -27,22 +27,6 @@ const MAX_WIDTH_HEIGHT: i32 = 0xFFFF;
 
 const RLE_ESCAPE: u8 = 0;
 
-/// `KIMG_BMP_NO_SIMD=1` 强制 BMP 行内核走标量（量化 SIMD 收益；与 pngsimd/webp 同款姿势）。
-/// 首次访问缓存环境变量，之后仅一次 Relaxed 原子读——正常热循环开销可忽略。
-fn bmp_no_simd() -> bool {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    static OFF: AtomicBool = AtomicBool::new(false);
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let off = std::env::var("KIMG_BMP_NO_SIMD")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        OFF.store(off, Relaxed);
-    });
-    OFF.load(Relaxed)
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum ImageType {
     Palette,
@@ -584,10 +568,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
 
         // 8bit 调色板主量走 AVX2 gather 行内核（`pshufb` 取指仅 4 位 = 16 项，256 色任
         // 意表须 gather）。LUT 展开为扁平 RGBA dword 表（1KB L1 常驻），逐行复用。
-        let simd8 = cfg!(target_arch = "x86_64")
-            && bit_count == 8
-            && !bmp_no_simd()
-            && std::arch::is_x86_feature_detected!("avx2");
+        let simd8 = bit_count == 8 && kimg_core::simd::gate("KIMG_BMP_NO_SIMD", "avx2");
         let mut lut8 = [0u8; 1024];
         if simd8 {
             for (i, rgb) in palette.iter().enumerate() {
@@ -598,10 +579,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
 
         // 4bit 调色板 = 16 项，SSSE3 `pshufb` 恰可单张查表（低 4 位取指）；分 R/G/B 三张
         // 16 字节 LUT。
-        let simd4 = cfg!(target_arch = "x86_64")
-            && bit_count == 4
-            && !bmp_no_simd()
-            && std::arch::is_x86_feature_detected!("ssse3");
+        let simd4 = bit_count == 4 && kimg_core::simd::gate("KIMG_BMP_NO_SIMD", "ssse3");
         let mut lut4 = [[0u8; 16]; 3];
         if simd4 {
             for (i, rgb) in palette.iter().take(16).enumerate() {
@@ -762,9 +740,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
         } else {
             None
         };
-        let simd = cfg!(target_arch = "x86_64")
-            && !bmp_no_simd()
-            && std::arch::is_x86_feature_detected!("ssse3");
+        let simd = kimg_core::simd::gate("KIMG_BMP_NO_SIMD", "ssse3");
 
         // 整行读取再批量展开（消除逐像素 read_u16_le 调用）。
         let mut raw = vec![0u8; width * 2];
@@ -861,9 +837,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
         };
         // SIMD 行内批处理：整行一次性读入（消除逐像素 read_exact 调用），
         // SSSE3/AVX2 shuffle 重排通道，标量尾收齐 SIMD 未覆盖的像素。
-        let simd = cfg!(target_arch = "x86_64")
-            && !bmp_no_simd()
-            && std::arch::is_x86_feature_detected!("ssse3");
+        let simd = kimg_core::simd::gate("KIMG_BMP_NO_SIMD", "ssse3");
         let raw_len = width * bpp;
         let mut raw = vec![0u8; raw_len];
         let mut pad = [0u8; 4];
@@ -913,7 +887,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
                         // BGR→RGBA（alpha=255），供 ICO/强制 alpha 的 24bit 输出。
                         self.reader.read_exact(&mut raw)?;
                         let mut x = 0;
-                        if std::arch::is_x86_feature_detected!("avx2") {
+                        if kimg_core::simd::detect("avx2") {
                             x += unsafe { bgr_ops::bgr24_to_rgba_avx2(&raw, row, width) };
                         }
                         if x < width {
@@ -955,7 +929,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
                         debug_assert!(drop.is_none());
                         self.reader.read_exact(row)?;
                         let mut x = 0;
-                        if std::arch::is_x86_feature_detected!("avx2") {
+                        if kimg_core::simd::detect("avx2") {
                             x += unsafe { bgr_ops::bgra_to_rgba_avx2(row, width) };
                         }
                         if x < width {
@@ -995,12 +969,10 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
 
         let simd8 = indexed
             && is_8bit
-            && !bmp_no_simd()
-            && std::arch::is_x86_feature_detected!("avx2");
+            && kimg_core::simd::gate("KIMG_BMP_NO_SIMD", "avx2");
         let simd4 = indexed
             && !is_8bit
-            && !bmp_no_simd()
-            && std::arch::is_x86_feature_detected!("ssse3");
+            && kimg_core::simd::gate("KIMG_BMP_NO_SIMD", "ssse3");
         // LUT 预计算（姿势同 read_palette_buf）：8bit 扁平 RGBA dword 表 / 4bit 三通道 16 项表。
         let mut lut8 = [0u8; 1024];
         if simd8 {
@@ -1588,7 +1560,7 @@ mod bgr_ops {
         fmt: super::Bmp16Fmt,
     ) -> usize {
         unsafe {
-            let avx2 = std::arch::is_x86_feature_detected!("avx2");
+            let avx2 = kimg_core::simd::detect("avx2");
             let mut x = 0usize;
             match (fmt, channels) {
                 (super::Bmp16Fmt::Rgb555, 3) => {

@@ -97,7 +97,7 @@ struct SimdPlan {
 /// 由 map 判出 Step-1 命中规划（否则 `None` → 调用方走通用循环）。判据与既有
 /// `apply_simd` 逐条一致：AVX2 检出 + classify 命中 irot + 源矩形在界 + 对齐。
 fn plan_irot(map: &TransformMap, canvas_w: i32, canvas_h: i32) -> Option<SimdPlan> {
-    if !simd_enabled() || !std::is_x86_feature_detected!("avx2") {
+    if !simd_enabled() || !kimg_core::simd::detect("avx2") {
         return None;
     }
     let form = classify(map.a, map.b, map.d, map.e)?;
@@ -955,7 +955,7 @@ mod tests {
     /// 8×8 转置原语 ≡ 标量转置（随机 RGBA 块逐像素对拍）。
     #[test]
     fn transpose8x8_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 AVX2");
             return;
         }
@@ -1023,7 +1023,7 @@ mod tests {
     /// 以及含平移的 clap+irot 8 对齐（真验证 SIMD 的平移路径）。
     #[test]
     fn dispatch_matches_generic_randomised() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 AVX2");
             return;
         }
@@ -1062,7 +1062,7 @@ mod tests {
     /// 直接调 SIMD 入口：8 对齐 irot 必须返回 true 且 ≡ 通用；非 8 对齐/非 Step-1 形式必须返回 false。
     #[test]
     fn apply_simd_hit_and_miss() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 AVX2");
             return;
         }
@@ -1098,7 +1098,7 @@ mod tests {
     /// 回退 × clap 平移；同时验证 `tiles=1`（门控 → 恒串行）与 `tiles=4`（并行）双双 ≡ 串行。
     #[test]
     fn parallel_parity_irot_all_forms() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 AVX2");
             return;
         }
@@ -1144,7 +1144,7 @@ mod tests {
     /// 奇数尺寸 → `Ok(false)`（调用方回通用串行）。小图（仅 1 带）亦 `Ok(true)`（落串行执行）。
     #[test]
     fn apply_simd_par_hit_and_miss() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 AVX2");
             return;
         }
@@ -1227,7 +1227,7 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_block_variants() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 AVX2");
             return;
         }

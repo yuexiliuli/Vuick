@@ -164,8 +164,8 @@ impl IntraPred {
             #[cfg(target_arch = "x86_64")]
             if n >= 8
                 && !planar_force_scalar()
-                && std::is_x86_feature_detected!("avx2")
-                && std::is_x86_feature_detected!("sse4.1")
+                && kimg_core::simd::detect("avx2")
+                && kimg_core::simd::detect("sse4.1")
             {
                 return super::intra_pred_simd::planar_avx2(refs, log2_size, dst, stride);
             }
@@ -187,7 +187,7 @@ impl IntraPred {
                 if n >= 8
                     && n <= 32
                     && !dc_force_scalar()
-                    && std::is_x86_feature_detected!("avx2")
+                    && kimg_core::simd::detect("avx2")
                 {
                     super::intra_pred_simd::dc_fill_avx2(n, dc_val as u16, stride, dst)?;
                     used_simd_fill = true;
@@ -225,8 +225,8 @@ impl IntraPred {
         let angular_simd = n >= 8
             && n <= 32
             && !angular_force_scalar()
-            && std::is_x86_feature_detected!("avx2")
-            && std::is_x86_feature_detected!("sse4.1");
+            && kimg_core::simd::detect("avx2")
+            && kimg_core::simd::detect("sse4.1");
         #[cfg(not(target_arch = "x86_64"))]
         let angular_simd = false;
         let refbuf_view = &refbuf[..3 * n + 1];
@@ -620,7 +620,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn planar_simd_matches_scalar_random() {
-        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("sse4.1") {
+        if !kimg_core::simd::detect("avx2") || !kimg_core::simd::detect("sse4.1") {
             eprintln!("SKIP: 无 avx2/sse4.1");
             return;
         }
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn angular_simd_matches_scalar_random() {
-        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("sse4.1") {
+        if !kimg_core::simd::detect("avx2") || !kimg_core::simd::detect("sse4.1") {
             eprintln!("SKIP: 无 avx2/sse4.1");
             return;
         }
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn angular_dispatch_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("sse4.1") {
+        if !kimg_core::simd::detect("avx2") || !kimg_core::simd::detect("sse4.1") {
             eprintln!("SKIP: 无 avx2/sse4.1");
             return;
         }
@@ -822,7 +822,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn dc_simd_fill_matches_scalar_random() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 avx2");
             return;
         }
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn dc_dispatch_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             eprintln!("SKIP: 无 avx2");
             return;
         }
@@ -926,7 +926,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn angular_kernel_perf_probe() {
         use std::time::Instant;
-        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("sse4.1") {
+        if !kimg_core::simd::detect("avx2") || !kimg_core::simd::detect("sse4.1") {
             eprintln!("SKIP: 无 avx2/sse4.1");
             return;
         }
@@ -1000,7 +1000,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn planar_kernel_perf_probe() {
         use std::time::Instant;
-        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("sse4.1") {
+        if !kimg_core::simd::detect("avx2") || !kimg_core::simd::detect("sse4.1") {
             eprintln!("SKIP: 无 avx2/sse4.1");
             return;
         }

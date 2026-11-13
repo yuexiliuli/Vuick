@@ -55,7 +55,7 @@ impl HevcSao {
             if count >= 16
                 && max <= i16::MAX as i32 - 31
                 && !sao_force_scalar()
-                && std::is_x86_feature_detected!("avx2")
+                && kimg_core::simd::detect("avx2")
             {
                 done = super::sao_simd::edge_row_avx2(cur, a, b, dst, count, offsets, max)?;
             }
@@ -134,7 +134,7 @@ impl HevcSao {
                 && count >= 16
                 && max <= i16::MAX as i32 - 31
                 && !sao_force_scalar()
-                && std::is_x86_feature_detected!("avx2")
+                && kimg_core::simd::detect("avx2")
             {
                 done =
                     super::sao_simd::band_row_avx2(cur, dst, count, band_position, shift, max, offsets)?;
@@ -478,7 +478,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn sao_leaf_avx2_direct_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !kimg_core::simd::detect("avx2") {
             return;
         }
         let mut rng = make_rng(0xabcd_ef01);

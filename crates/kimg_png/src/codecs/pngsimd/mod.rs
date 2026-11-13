@@ -24,44 +24,8 @@ use kimg_core::error::{
 };
 use kimg_core::format::ImageFormat;
 
-/// 运行时 CPU 特性查询（x86_64；非 x86_64 一律 false 走标量回退）。
-#[inline]
-pub(crate) fn simd_ok(feature: &str) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::arch::is_x86_feature_detected;
-        match feature {
-            "sse2" => is_x86_feature_detected!("sse2"),
-            "ssse3" => is_x86_feature_detected!("ssse3"),
-            "avx2" => is_x86_feature_detected!("avx2"),
-            _ => false,
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = feature;
-        false
-    }
-}
-
-/// 诊断用 SIMD 全局开关：`KIMG_PNG_NO_SIMD=1` 强制反滤波/展开走标量（量化 SIMD 收益）。
-/// 首次访问缓存环境变量，随后仅一次 Relaxed 原子读——正常路径对热循环开销可忽略。
-pub(crate) fn simd_forced_off() -> bool {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    static OFF: AtomicBool = AtomicBool::new(false);
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let off = std::env::var("KIMG_PNG_NO_SIMD")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        OFF.store(off, Relaxed);
-    });
-    OFF.load(Relaxed)
-}
-
 /// Adam7 scatter 快道开关：`KIMG_PNG_ADAM7_FAST=0|false|off` 强制走逐像素慢道（同二进制 A/B 裁决用）。
-/// 默认开启；首次访问缓存一次环境变量，与 `simd_forced_off` 同款 OnceLock 姿势。
+/// 默认开启；首次访问缓存一次环境变量，与 `kimg_core::simd` 的 env 闸同款惰性缓存姿势。
 pub(crate) fn adam7_fast_enabled() -> bool {
     use std::sync::OnceLock;
     static FAST: OnceLock<bool> = OnceLock::new();

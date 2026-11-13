@@ -317,15 +317,14 @@ fn rgb8_rgba8(
     // SSSE3 主径：每批 4 像素（16 源字节 → 16 输出字节）。一律多读尾字节保证边界安全，不越界。
     // 两者都返回「处理掉的像素数」，链式接力后再由标量尾补齐。
     #[cfg(target_arch = "x86_64")]
-    if !crate::codecs::pngsimd::simd_forced_off() && crate::codecs::pngsimd::simd_ok("avx2") {
+    if kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "avx2") {
         unsafe {
             x = pg_simd::rgb8_to_rgba_avx2(&src[3 * x..], &mut dst[4 * x..], width - x);
         }
     }
     #[cfg(target_arch = "x86_64")]
     if x < width
-        && !crate::codecs::pngsimd::simd_forced_off()
-        && crate::codecs::pngsimd::simd_ok("ssse3")
+        && kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "ssse3")
     {
         unsafe {
             x += pg_simd::rgb8_to_rgba_ssse3(&src[3 * x..], &mut dst[4 * x..], width - x);
@@ -345,8 +344,7 @@ fn clear_key_alpha8(rgba: &mut [u8], width: usize, key: [u8; 4]) {
     let mut x = 0;
     #[cfg(target_arch = "x86_64")]
     {
-        use std::arch::is_x86_feature_detected;
-        if !crate::codecs::pngsimd::simd_forced_off() && is_x86_feature_detected!("sse2") {
+        if kimg_core::simd::gate("KIMG_PNG_NO_SIMD", "sse2") {
             unsafe {
                 x = pg_simd::clear_key_alpha8_sse2(rgba, width, key);
             }
@@ -767,7 +765,6 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn rgbsimd_paths_byte_identical() {
-        use std::arch::is_x86_feature_detected;
         let widths = [
             1usize, 3, 4, 7, 8, 9, 12, 15, 16, 17, 24, 25, 31, 32, 33, 56, 63, 64, 65, 96, 128,
             129, 1000,
@@ -783,7 +780,7 @@ mod tests {
             }
             // SSSE3 路径（主径 + 标量尾）。
             let mut ssse3 = vec![0u8; 4 * width];
-            if is_x86_feature_detected!("ssse3") {
+            if kimg_core::simd::detect("ssse3") {
                 let n = unsafe { super::pg_simd::rgb8_to_rgba_ssse3(&src, &mut ssse3, width) };
                 for x in n..width {
                     ssse3[4 * x..4 * x + 3].copy_from_slice(&src[3 * x..3 * x + 3]);
@@ -793,7 +790,7 @@ mod tests {
             }
             // AVX2 路径（主径 + 标量尾）。
             let mut avx2 = vec![0u8; 4 * width];
-            if is_x86_feature_detected!("avx2") {
+            if kimg_core::simd::detect("avx2") {
                 let n = unsafe { super::pg_simd::rgb8_to_rgba_avx2(&src, &mut avx2, width) };
                 for x in n..width {
                     avx2[4 * x..4 * x + 3].copy_from_slice(&src[3 * x..3 * x + 3]);
@@ -804,7 +801,7 @@ mod tests {
             // AVX2→SSSE3 接力（走 dispatch 同款串联）：两段 SIMD 后再标量尾 == 标量。
             let mut chained = vec![0u8; 4 * width];
             let mut x = 0usize;
-            if is_x86_feature_detected!("avx2") {
+            if kimg_core::simd::detect("avx2") {
                 x = unsafe {
                     super::pg_simd::rgb8_to_rgba_avx2(
                         &src[3 * x..],
@@ -813,7 +810,7 @@ mod tests {
                     )
                 };
             }
-            if x < width && is_x86_feature_detected!("ssse3") {
+            if x < width && kimg_core::simd::detect("ssse3") {
                 x += unsafe {
                     super::pg_simd::rgb8_to_rgba_ssse3(
                         &src[3 * x..],

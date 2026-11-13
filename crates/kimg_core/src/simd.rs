@@ -39,7 +39,13 @@ pub fn detect(feature: &str) -> bool {
 
 /// `<env_key>=1|true`（不区分大小写）→ off 的布尔 env 标志；首次访问读一次并进程级缓存，
 /// 之后仅锁 + HashMap 读（调用方应在帧/宏块级提升判定，与迁移前 OnceLock+Relaxed 原子同语义）。
-fn env_off(key: &str) -> bool {
+///
+/// 公开提供纯粹「env 是否强制关」的判定（不掺特性检测），供 `gate` 之外的少数结构复用：
+/// 如 PNG 反滤波的「整块关闭」前置门 `!env_off("KIMG_PNG_NO_SIMD")`，避免把 `gate(key, "sse2")`
+/// 这类「借 x86_64 恒有 SSE2 当纯 env 闸」的隐式技巧散落在各 codec（K93 语义逐位等价的前提是
+/// 每个 codec 的 env 语义与 `env_off` 一致；HEIF 的 `KIMG_HEIF_TRANSFORM_SIMD=0` 反转极性
+/// 不适用本判定，见其本地实现）。
+pub fn env_off(key: &str) -> bool {
     fn flags() -> &'static Mutex<HashMap<String, bool>> {
         static FLAGS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
         FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
