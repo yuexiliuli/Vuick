@@ -89,16 +89,15 @@ impl WyEditor {
     pub(crate) fn image_edit_open(&self) -> bool {
         self.image_edit.is_some()
     }
-    /// 卡片的「链接」输入框实体（render / 测试读值）。
-    #[cfg(test)]
-    pub(crate) fn image_edit_link_input(
+    /// 卡片的「链接」输入框实体（render / 测试读值；跨 crate 测试探针，对齐
+    /// `math_edit_input`）。
+    pub fn image_edit_link_input(
         &self,
     ) -> Option<gpui::Entity<ui::input::InputState>> {
         self.image_edit.as_ref().map(|p| p.link.clone())
     }
-    /// 卡片的「文本」输入框实体。
-    #[cfg(test)]
-    pub(crate) fn image_edit_text_input(
+    /// 卡片的「文本」输入框实体（render / 测试读值；跨 crate 测试探针）。
+    pub fn image_edit_text_input(
         &self,
     ) -> Option<gpui::Entity<ui::input::InputState>> {
         self.image_edit.as_ref().map(|p| p.text.clone())
@@ -136,7 +135,9 @@ impl WyEditor {
 
     /// 打开 / 切换到目标图片的编辑卡片（仅可编辑模式；块图 / 行内图共用同一卡片表单）。
     /// 输入框以当前 alt / src 预填，打开后焦点落在「链接」输入框。已同一目标 → 关闭。
-    pub(crate) fn open_image_edit(
+    /// `pub`（跨 crate 可调）：宿主 shell 测试以真实 app 链路端到端打开 / 聚焦卡片，
+    /// 与 `open_math_edit` 对齐（同款浮层卡）。
+    pub fn open_image_edit(
         &mut self,
         target: ImageEditTarget,
         window: &mut Window,
@@ -245,6 +246,53 @@ impl WyEditor {
             self.image_edit_anchor.clear();
             cx.notify();
         }
+    }
+
+    /// 图片编辑卡「链接 / 文本」输入框**当前是否持有焦点**（app 层 `PasteNormalized`
+    /// 路由判定 + WYSIWYG `paste` 路由判定：Ctrl+V 落在卡内输入框时据此把剪贴板喂给
+    /// 当前聚焦的那个输入框，而非源码编辑区）。与 `math_edit_focused` 同款镜像。
+    pub(crate) fn image_edit_input_focused(
+        &self,
+        window: &mut Window,
+        cx: &gpui::App,
+    ) -> bool {
+        self.image_edit
+            .as_ref()
+            .map(|p| {
+                p.link.read(cx).focus_handle(cx).is_focused(window)
+                    || p.text.read(cx).focus_handle(cx).is_focused(window)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 图片编辑卡**任一输入框聚焦**时把 `text` 粘贴进**当前聚焦的那一个**输入框
+    /// （链接框/文本框）的**光标/选区处**——用 `EntityInputHandler::replace_text_in_range
+    /// (state, None, …)`（`None` 区间 = 替换当前 marked/选区 → 光标处插入，即粘贴插入
+    /// 语义；调用方已做 `\r\n` 归一化，勿重复）。不用 `InputState::replace`（那是整体
+    /// 替换，不是粘贴插入语义）。返回 `true` = 本次粘贴已路由到卡片，调用方（WYSIWYG
+    /// 的 `paste` / app 的 `paste_normalized`）应直接返回，不再落到文档/主编辑区。
+    pub fn paste_into_focused_image_edit(
+        &self,
+        window: &mut Window,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.image_edit_input_focused(window, cx) {
+            return false;
+        }
+        let Some(p) = &self.image_edit else {
+            return false;
+        };
+        use gpui::EntityInputHandler as _;
+        // 链接框聚焦 → 粘链接框；否则（文本框聚焦）→ 粘文本框。
+        if p.link.read(cx).focus_handle(cx).is_focused(window) {
+            p.link
+                .update(cx, |s, cx| s.replace_text_in_range(None, text, window, cx));
+        } else {
+            p.text
+                .update(cx, |s, cx| s.replace_text_in_range(None, text, window, cx));
+        }
+        true
     }
 
     /// 点击图片本体 → 选中该图：清除文本选区/拖选，选中态独立于指针（移开后编辑

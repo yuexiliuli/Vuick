@@ -103,11 +103,12 @@ pub(crate) use self::prewarm::Prewarm;
 pub(crate) use self::theme::{CaretVis, caret_vis, math_color, set_caret_vis};
 /// 跨 crate 面（shell/app 预览目录/后台装载装配）：`TocEntries` 目录条目、`WyOpenResult` 后台装载结果。
 pub use self::types::{TocEntries, WyOpenResult};
+/// 图片编辑卡目标（`open_image_edit` 入参）：宿主 shell 测试端到端打开卡片用。
+pub use self::types::ImageEditTarget;
 pub(crate) use self::types::{
-    BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageEditTarget,
-    ImageResizeDrag, ImageSrcBlocks, InlineImageRef, MathEditDrag, MathEditPopup,
-    PrebuildPass1, TocCacheEntry, UNDO_GROUP_MS, UNDO_LIMIT, UndoUnit, WyDerived,
-    is_plain_region_line, region_line_sig,
+    BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageResizeDrag,
+    ImageSrcBlocks, InlineImageRef, MathEditDrag, MathEditPopup, PrebuildPass1, TocCacheEntry,
+    UNDO_GROUP_MS, UNDO_LIMIT, UndoUnit, WyDerived, is_plain_region_line, region_line_sig,
 };
 pub(crate) use self::warm::{warm_emoji_is_done, warm_emoji_rasterizer};
 

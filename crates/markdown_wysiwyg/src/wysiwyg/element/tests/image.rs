@@ -1866,3 +1866,153 @@ fn inline_image_later_line_backspace_deletes_span(cx: &mut TestAppContext) {
     });
 }
 
+/// 图片编辑卡：聚焦链接输入框 + 光标摆到中部 → Ctrl+V（WYSIWYG `paste` 路由）应把
+/// 剪贴板**插入链接框光标处**（原文本 + 剪贴板内容在光标处插入），且不误粘文档正文；
+/// 未打开卡片时 `paste_into_focused_image_edit` 必须返回 false（走文档粘贴路径）。
+#[gpui::test]
+fn image_edit_link_focus_paste_routes_into_link_input(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("![pic desc](http://ex.com/pic.png)\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    // 未打开卡片：`paste_into_focused_image_edit` 必须 false（不截胡普通粘贴）。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            assert!(
+                !e.paste_into_focused_image_edit(window, "A", cx),
+                "未打开图片卡时不得路由到卡片输入框"
+            );
+        });
+    });
+    // 程序化打开编辑卡（焦点应落链接输入框，预填 src）。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            e.open_image_edit(
+                crate::markdown::wysiwyg::ImageEditTarget::Block { src_line: 0 },
+                window,
+                cx,
+            )
+        });
+    });
+    // 显式聚焦链接框（对齐真实点击后的焦点态）+ 光标摆到 "http://ex." 之后（中部）。
+    vcx.update(|window, cx| {
+        let link = ed.read(cx).image_edit_link_input().expect("链接输入框");
+        let fh = link.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+        link.update(cx, |s, cx| {
+            use gpui::EntityInputHandler as _;
+            s.set_selected_text_range(10..10, window, cx);
+        });
+        assert!(
+            ed.read(cx).image_edit_input_focused(window, cx),
+            "链接框聚焦时 image_edit_input_focused 应为 true"
+        );
+    });
+    // 写剪贴板 → 调 WYSIWYG `paste` → 应路由到链接框光标处插入（中部），正文不动。
+    vcx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".to_string()));
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| e.paste(window, cx));
+    });
+    let (link_val, content) = vcx.update(|_w, cx| {
+        (
+            ed.read(cx)
+                .image_edit_link_input()
+                .expect("链接输入框")
+                .read(cx)
+                .value()
+                .to_string(),
+            ed.read(cx).content(),
+        )
+    });
+    assert_eq!(
+        link_val.as_str(),
+        "http://ex.XYcom/pic.png",
+        "粘贴应落在链接框光标处（原文本 + 剪贴板内容在光标处插入）：{link_val:?}"
+    );
+    assert_eq!(
+        content.as_str(),
+        "![pic desc](http://ex.com/pic.png)\n",
+        "粘贴不得误粘到文档正文：{content:?}"
+    );
+}
+
+/// 图片编辑卡：**聚焦文本输入框**（非链接框）→ Ctrl+V 同样路由到文本框光标处，
+/// 链接框 / 文档正文保持原样。
+#[gpui::test]
+fn image_edit_text_focus_paste_routes_into_text_input(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("![pic desc](http://ex.com/pic.png)\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            e.open_image_edit(
+                crate::markdown::wysiwyg::ImageEditTarget::Block { src_line: 0 },
+                window,
+                cx,
+            )
+        });
+    });
+    // 打开后默认聚焦链接框 → 显式切到文本框（真实点击后的焦点态）+ 光标摆到中部
+    //（"pic " 之后，ASCII 4 字节 = UTF-16 4 单元）。
+    vcx.update(|window, cx| {
+        let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
+        let fh = text.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+        text.update(cx, |s, cx| {
+            use gpui::EntityInputHandler as _;
+            s.set_selected_text_range(4..4, window, cx);
+        });
+        assert!(
+            ed.read(cx).image_edit_input_focused(window, cx),
+            "文本框聚焦时 image_edit_input_focused 应为 true"
+        );
+    });
+    vcx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".to_string()));
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| e.paste(window, cx));
+    });
+    let (text_val, link_val, content) = vcx.update(|_w, cx| {
+        (
+            ed.read(cx)
+                .image_edit_text_input()
+                .expect("文本输入框")
+                .read(cx)
+                .value()
+                .to_string(),
+            ed.read(cx)
+                .image_edit_link_input()
+                .expect("链接输入框")
+                .read(cx)
+                .value()
+                .to_string(),
+            ed.read(cx).content(),
+        )
+    });
+    assert_eq!(
+        text_val.as_str(),
+        "pic XYdesc",
+        "粘贴应落在文本框光标处（中部插入）：{text_val:?}"
+    );
+    assert_eq!(
+        link_val.as_str(),
+        "http://ex.com/pic.png",
+        "链接框不得被改动：{link_val:?}"
+    );
+    assert_eq!(
+        content.as_str(),
+        "![pic desc](http://ex.com/pic.png)\n",
+        "文档正文不得被粘：{content:?}"
+    );
+}
+

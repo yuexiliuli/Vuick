@@ -68,8 +68,9 @@ pub(crate) enum BlockRegion {
 /// `selected_inline_image` 迁入 `markdown_wysiwyg_engine::model::InlineImageRef`，上面 re-export。
 
 /// 图片编辑卡片的目标：块级独立图片行 或 行内图片。
+/// `pub`：宿主 shell 测试经 `open_image_edit` 以真实 app 链路端到端打开卡片。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ImageEditTarget {
+pub enum ImageEditTarget {
     /// 独立图片行（整行 `![alt](src)`）。
     Block { src_line: usize },
     /// 行内 `![…](…)`（`InlineImageRef` 标识）。

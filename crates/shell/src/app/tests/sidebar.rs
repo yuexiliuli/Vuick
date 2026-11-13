@@ -118,6 +118,51 @@
         );
     }
 
+    /// 搜索输入框左右留白**对称**：右侧不得贴搜索面板右缘（=侧边栏与正文的分隔线）。
+    /// 回归：`w_full() + mx_2()` 在 flex 列下宽度=100%+margin → 右缘 2px 溢出被面板
+    /// `overflow_hidden` 裁掉 → 右侧贴边、左侧有缝（K138：锁真实对位量左右间隙，非趋势）。
+    #[gpui::test]
+    async fn sidebar_search_input_keeps_symmetric_margin(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let panel = cx
+            .debug_bounds("sidebar-search")
+            .expect("搜索视图应渲染 sidebar-search");
+        let input = cx
+            .debug_bounds("sidebar-search-input")
+            .expect("搜索视图应有输入框 sidebar-search-input");
+        let panel_right = (panel.origin.x + panel.size.width).as_f32();
+        let input_left = input.origin.x.as_f32();
+        let input_right = (input.origin.x + input.size.width).as_f32();
+        let left_gap = input_left - panel.origin.x.as_f32();
+        let right_gap = panel_right - input_right;
+        assert!(
+            left_gap > 0.0,
+            "输入框左侧应距面板左缘留白，left_gap={left_gap}"
+        );
+        assert!(
+            right_gap > 0.0,
+            "输入框右侧应距面板右缘（分隔线）留白，不得贴边，right_gap={right_gap}"
+        );
+        assert!(
+            (left_gap - right_gap).abs() < 0.5,
+            "输入框左右留白应对称：left={left_gap} right={right_gap}"
+        );
+    }
+
     /// P2-9：活动栏「目录」图标悬停 → 200ms 防抖后出现 tooltip（浮在按钮右侧、不盖活动栏），
     /// 移出立即消失。
     #[gpui::test]

@@ -3497,6 +3497,113 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// P10 同族（第 2 块/最后一块）：图片编辑卡的**链接输入框**在 live2（WYSIWYG 实时
+    /// 编辑）内聚焦时，Ctrl+V（真实 app 走 `PasteNormalized` 覆盖绑定 → app 根
+    /// `paste_normalized`）必须把剪贴板**路由进**卡内链接框（光标处插入），而不是误粘进
+    /// 源码编辑区；图片卡保存前不改源码 → live2 文档保持原状（对比数学卡：图片卡是
+    /// 输入框暂存 + 点「保存」才写回）。
+    #[gpui::test]
+    async fn wysiwyg_live_image_edit_ctrl_v_pastes_into_card_not_source_editor(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::actions::PasteNormalized;
+        use gpui::{App, KeyBinding, Keystroke};
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(800.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-image-paste-{}.md",
+            std::process::id()
+        ));
+        let src = "![独立图](img测试.png)\n";
+        std::fs::write(&md, src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // ON：进入 WYSIWYG（live2）实时编辑模式。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let live = cx.update(|_w, cx| {
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+        });
+        // 程序化打开图片编辑卡（锚定第 0 行图片）+ 显式聚焦链接输入框。
+        cx.update(|window, cx| {
+            live.update(cx, |e, cx| {
+                e.open_image_edit(
+                    markdown_wysiwyg::ImageEditTarget::Block { src_line: 0 },
+                    window,
+                    cx,
+                );
+                let fh = e
+                    .image_edit_link_input()
+                    .expect("应有链接输入框")
+                    .read(cx)
+                    .focus_handle(cx);
+                window.focus(&fh, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        let link = cx.update(|_w, cx| {
+            live.read(cx).image_edit_link_input().expect("应有链接输入框")
+        });
+        // 与 main.rs 同序：在 `bind_local_keymaps` **之后**补 `PasteNormalized` 覆盖
+        // 绑定（更高优先级 → 真实 app 链路：Ctrl+V → PasteNormalized → app 根路由）。
+        cx.update(|_w, cx: &mut App| {
+            cx.bind_keys([KeyBinding::new("ctrl-v", PasteNormalized, Some("Input"))]);
+        });
+        // Ctrl+V 粘贴 → 应进图片卡链接框（而非源码编辑区）。
+        let wh = cx.windows().first().copied().expect("窗口句柄");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".to_string()));
+        cx.dispatch_keystroke(wh, Keystroke::parse("ctrl-v").unwrap());
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (link_val, src_value, live_text) = cx.update(|_w, cx: &mut App| {
+            let a = app.read(cx);
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
+            (
+                link.read(cx).value().to_string(),
+                t.editor.read(cx).value().to_string(),
+                t.live2.clone().expect("live2 应存在").read(cx).text().to_string(),
+            )
+        });
+        assert_eq!(
+            link_val.as_str(),
+            "img测试.pngXY",
+            "Ctrl+V 应把剪贴板粘贴进图片卡链接框（光标在末尾插入）：link={link_val:?}"
+        );
+        assert_eq!(
+            src_value.as_str(),
+            src,
+            "源码编辑区不得被误粘（修复前 Ctrl+V 落在源码编辑区）：src={src_value:?}"
+        );
+        assert_eq!(
+            live_text.as_str(),
+            src,
+            "live2 文档不得被误粘（图片卡点保存才写回源码）：live={live_text:?}"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
     /// 场景 B（用户真机确认）：WYSIWYG live2 编辑区点击**内容元素下方大片空白** →
     /// 光标应跳到文档内容末尾并聚焦（等效于点末尾后）。live2 是 auto-grow（元素高=内容
     /// 高），这片空白在元素之外、`#live-scroll` 容器之内——普通鼠标事件到不了 WyEditor，

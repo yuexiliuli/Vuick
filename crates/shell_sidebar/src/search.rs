@@ -75,7 +75,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             .py_1()
             .mx_2()
             .my_1()
-            .w_full()
+            // 不设 `w_full()`：flex 列（父 `sidebar-search`）默认 stretch 会让子元素
+            // 撑满「容器宽 − 两翼 margin」→ 左右留白对称；`w_full()`(width:100%)
+            // + `mx_2` 会溢出右缘 margin 被父 `overflow_hidden` 裁掉 → 右侧贴分隔线。
             .min_h(px(34.))
             .rounded_sm()
             .border_1()

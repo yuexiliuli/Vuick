@@ -79,6 +79,10 @@ pub struct InputState {
     /// 提交/取消后由共享核心清空。单行框不画组合下划线，但必须跟踪以保证「替换不追加」。
     marked: Option<Range<usize>>,
     element_bounds: Bounds<Pixels>,
+    /// 水平滚动偏移（px，≥0）；0 = 文本从框左缘显示，实际绘制时文本整体左移 `scroll_x`。
+    /// 在 paint 期按光标须落在可见带内重算并写回（避免把 `&mut Window` 穿进每个移动
+    /// 光标的方法）；失焦复位 0（显示头部）。
+    scroll_x: f32,
 }
 
 impl InputState {
@@ -99,6 +103,7 @@ impl InputState {
             focus_registered: false,
             marked: None,
             element_bounds: Bounds::default(),
+            scroll_x: 0.0,
         }
     }
 
@@ -327,7 +332,10 @@ impl InputState {
         let line = window
             .text_system()
             .shape_line(SharedString::from(self.text.clone()), px(DEFAULT_FONT_SIZE), &[run], None);
-        let x_f = x.as_f32();
+        // 调用方传入的已是「框内 X - PAD」；文本被左移 scroll_x 后，屏幕上该坐标对应的
+        // 行内坐标 = X - PAD + scroll_x，故这里统一加回（保持「点击的字符」与「屏幕可见
+        // 的字符」一致；on_mouse_down / character_index_for_point 都经本函数，无需各改）。
+        let x_f = x.as_f32() + self.scroll_x;
         let text = self.text.as_str();
         let mut cursor = 0usize;
         for (i, c) in text.char_indices() {
@@ -360,10 +368,10 @@ impl InputState {
             .width()
     }
 
-    /// 光标矩形 x（元素原点 + pad + 前缀宽），供 IME `bounds_for_range`。
+    /// 光标矩形 x（元素原点 + pad + 前缀宽，文本左移 scroll_x），供 IME `bounds_for_range`。
     fn caret_px(&self, byte: usize, element_bounds: Bounds<Pixels>, window: &mut Window) -> Pixels {
         let prefix = &self.text[..byte.min(self.text.len())];
-        element_bounds.origin.x + px(PAD_PX) + self.text_width(prefix, window)
+        element_bounds.origin.x + px(PAD_PX) - px(self.scroll_x) + self.text_width(prefix, window)
     }
 
     // -- 事件回调 --
@@ -570,6 +578,8 @@ impl InputState {
         self.focused = false;
         self.caret_visible = true;
         self.cancel_mouse_drag();
+        // 失焦显示头部（再次聚焦后由 paint 期按光标重滚）。
+        self.scroll_x = 0.0;
         cx.notify();
     }
 
@@ -1014,52 +1024,89 @@ impl Element for InputElement {
             strikethrough: None,
         };
         let line_h = line_height();
-        let text_origin = point(bounds.origin.x + px(PAD_PX), bounds.origin.y + (bounds.size.height - line_h) / 2.);
-        if !display.is_empty() {
-            let line = window
-                .text_system()
-                .shape_line(SharedString::from(display.to_string()), fs, &[run], None);
-            let _ = line.paint(text_origin, line_h, gpui::TextAlign::Left, None, window, cx);
-        }
-        // 选区背景（拖选/键选时高亮，对齐编辑器选区底色）+ 光标：仅聚焦且显示真实
-        // 文本（非占位符）时。光标画在选区 head 端、由闪烁驱动显示。
-        if focused && !show_placeholder {
-            if selection.start < selection.end {
-                let s_x = text_origin.x
-                    + self.entity.read(cx).text_width(&text[..selection.start], window);
-                let e_x = text_origin.x
-                    + self.entity.read(cx).text_width(&text[..selection.end], window);
-                let sel_bg = theme.colors.editor_selection_bg;
-                window.paint_quad(gpui::PaintQuad {
-                    bounds: Bounds::new(point(s_x, text_origin.y), size(e_x - s_x, line_h)),
-                    corner_radii: gpui::Corners::default(),
-                    background: sel_bg.into(),
-                    border_widths: gpui::Edges::default(),
-                    border_color: sel_bg.into(),
-                    border_style: gpui::BorderStyle::Solid,
-                });
+        // 水平滚动：聚焦且显示真实文本时，按光标（selection_head 端）必须落在可见带内
+        // 重算 scroll_x 并写回实体（放 paint 期，避免把 `&mut Window` 穿进每个移动光标
+        // 的方法）；本帧绘制用本地算出的值（避免双读）。非聚焦/空文本/占位符 → 0。
+        let scroll_x = {
+            let state = self.entity.read(cx);
+            let caret_byte = selection_head.min(text.len());
+            // 光标框内偏移 = 左内边距 + 前缀宽（未加 scroll 的自然位置）。
+            let caret_offset = PAD_PX + state.text_width(&text[..caret_byte], window).as_f32();
+            if focused && !show_placeholder && !text.is_empty() {
+                let visible_w = bounds.size.width.as_f32();
+                // 右缘留白 = 光标宽 + 2px；左缘留白 = 左内边距。
+                let right_margin = CARET_PX + 2.0;
+                let left_margin = PAD_PX;
+                let mut s = state.scroll_x;
+                if caret_offset > s + visible_w - right_margin {
+                    // 光标超出右缘 → 右滚到光标停右缘。
+                    s = caret_offset - (visible_w - right_margin);
+                } else if caret_offset < s + left_margin {
+                    // 光标越过左缘 → 左滚到光标停左缘。
+                    s = (caret_offset - left_margin).max(0.0);
+                }
+                // 上界：光标到末尾时全文尾巴完全可见、右侧不留空白。
+                let max_s = (state.text_width(&text, window).as_f32() + 2.0 * PAD_PX - visible_w)
+                    .max(0.0);
+                s.clamp(0.0, max_s)
+            } else {
+                0.0
             }
-            if caret_shown {
-                let caret_byte = selection_head.min(text.len());
-                let prefix = &text[..caret_byte];
-                let caret_x = if prefix.is_empty() {
-                    text_origin.x
-                } else {
-                    text_origin.x + self.entity.read(cx).text_width(prefix, window)
-                };
-                window.paint_quad(gpui::PaintQuad {
-                    bounds: Bounds::new(
-                        point(caret_x, text_origin.y),
-                        size(px(CARET_PX), line_h),
-                    ),
-                    corner_radii: gpui::Corners::default(),
-                    background: theme.colors.fg.into(),
-                    border_widths: gpui::Edges::default(),
-                    border_color: theme.colors.fg.into(),
-                    border_style: gpui::BorderStyle::Solid,
-                });
+        };
+        self.entity.update(cx, |s, _| s.scroll_x = scroll_x);
+        // 文本/选区/光标真实绘制整体左移 scroll_x，并包进内容蒙板裁到框内；选区两端
+        // 与光标都基于同一 text_origin 继续加前缀宽，不重复减 scroll。
+        let text_origin = point(
+            bounds.origin.x + px(PAD_PX) - px(scroll_x),
+            bounds.origin.y + (bounds.size.height - line_h) / 2.,
+        );
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            if !display.is_empty() {
+                let line = window
+                    .text_system()
+                    .shape_line(SharedString::from(display.to_string()), fs, &[run], None);
+                let _ = line.paint(text_origin, line_h, gpui::TextAlign::Left, None, window, cx);
             }
-        }
+            // 选区背景（拖选/键选时高亮，对齐编辑器选区底色）+ 光标：仅聚焦且显示真实
+            // 文本（非占位符）时。光标画在选区 head 端、由闪烁驱动显示。
+            if focused && !show_placeholder {
+                if selection.start < selection.end {
+                    let s_x = text_origin.x
+                        + self.entity.read(cx).text_width(&text[..selection.start], window);
+                    let e_x = text_origin.x
+                        + self.entity.read(cx).text_width(&text[..selection.end], window);
+                    let sel_bg = theme.colors.editor_selection_bg;
+                    window.paint_quad(gpui::PaintQuad {
+                        bounds: Bounds::new(point(s_x, text_origin.y), size(e_x - s_x, line_h)),
+                        corner_radii: gpui::Corners::default(),
+                        background: sel_bg.into(),
+                        border_widths: gpui::Edges::default(),
+                        border_color: sel_bg.into(),
+                        border_style: gpui::BorderStyle::Solid,
+                    });
+                }
+                if caret_shown {
+                    let caret_byte = selection_head.min(text.len());
+                    let prefix = &text[..caret_byte];
+                    let caret_x = if prefix.is_empty() {
+                        text_origin.x
+                    } else {
+                        text_origin.x + self.entity.read(cx).text_width(prefix, window)
+                    };
+                    window.paint_quad(gpui::PaintQuad {
+                        bounds: Bounds::new(
+                            point(caret_x, text_origin.y),
+                            size(px(CARET_PX), line_h),
+                        ),
+                        corner_radii: gpui::Corners::default(),
+                        background: theme.colors.fg.into(),
+                        border_widths: gpui::Edges::default(),
+                        border_color: theme.colors.fg.into(),
+                        border_style: gpui::BorderStyle::Solid,
+                    });
+                }
+            }
+        });
     }
 }
 
@@ -1460,5 +1507,85 @@ mod tests {
         });
         assert!(!running2, "失焦后 blink 循环应退出");
         assert!(!shown2, "失焦后光标应不可见");
+    }
+
+    /// 长文本水平滚动：聚焦后 paint 期按光标（`default_value` 把光标落文本末尾）重算
+    /// `scroll_x>0` 使光标落入可见带内（锁真实对位量：光标 x ∈ 框内）；短文本聚焦时
+    /// `scroll_x==0`（无需滚动）。K138：锁真实对位量、不锁相对趋势。
+    #[gpui::test]
+    async fn long_text_scrolls_to_caret_when_focused(cx: &mut TestAppContext) {
+        let long = "a".repeat(400);
+        let (input, wcx, _) = add_input(cx, &long);
+        settle_window(wcx);
+        // 聚焦（不点按，光标仍在文本末尾）
+        wcx.update(|window, cx| window.focus(&input.read(cx).focus_handle(cx), cx));
+        settle_window(wcx);
+        let (scroll_x, caret_x, min_x, max_x) = wcx.update(|window, cx| {
+            let s = input.read(cx);
+            let bounds = s.element_bounds;
+            let caret = s.caret_px(long.len(), bounds, window);
+            (
+                s.scroll_x,
+                caret.as_f32(),
+                bounds.origin.x.as_f32(),
+                (bounds.origin.x + bounds.size.width).as_f32(),
+            )
+        });
+        assert!(scroll_x > 0.0, "长文本聚焦后应滚动（scroll_x={}）", scroll_x);
+        assert!(
+            caret_x >= min_x && caret_x <= max_x,
+            "光标 x 应落在框内 [{}, {}]，实际 {}",
+            min_x,
+            max_x,
+            caret_x
+        );
+    }
+
+    /// 短文本聚焦无需滚动：`scroll_x` 保持 0（光标在框内无溢出时不该滚）。
+    #[gpui::test]
+    async fn short_text_focus_keeps_scroll_zero(cx: &mut TestAppContext) {
+        let (input, wcx, _) = add_input(cx, "ab");
+        settle_window(wcx);
+        wcx.update(|window, cx| window.focus(&input.read(cx).focus_handle(cx), cx));
+        settle_window(wcx);
+        let scroll_x = wcx.update(|_, cx| input.read(cx).scroll_x);
+        assert_eq!(scroll_x, 0.0, "短文本聚焦不应滚动");
+    }
+
+    /// 命中换算同步：滚动后左缘（框内坐标 = PAD_PX）对应的不是第 0 个字符，而是滚动
+    /// 偏移处的字符——`index_at_x_impl` 内部已加回 `scroll_x`，保证「点击的字符」与
+    /// 「屏幕可见的字符」一致（on_mouse_down / character_index_for_point 都经它）。
+    #[gpui::test]
+    async fn long_text_hit_test_maps_with_scroll(cx: &mut TestAppContext) {
+        let long = "a".repeat(400);
+        let (input, wcx, _) = add_input(cx, &long);
+        settle_window(wcx);
+        wcx.update(|window, cx| window.focus(&input.read(cx).focus_handle(cx), cx));
+        settle_window(wcx);
+        let (scroll_x, idx) = wcx.update(|window, cx| {
+            let s = input.read(cx);
+            (s.scroll_x, s.index_at_x_impl(px(PAD_PX), window))
+        });
+        assert!(scroll_x > 0.0, "前置：长文本聚焦应已滚动");
+        assert!(idx > 0, "左缘可见应不是第 0 个字符（已滚动到中部），实际 {}", idx);
+    }
+
+    /// 失焦复位滚动：聚焦长文本滚动后失焦 → `scroll_x` 归 0（显示头部；再次聚焦由
+    /// paint 期按光标重滚）。
+    #[gpui::test]
+    async fn blur_resets_scroll(cx: &mut TestAppContext) {
+        let long = "a".repeat(400);
+        let (input, wcx, _) = add_input(cx, &long);
+        settle_window(wcx);
+        wcx.update(|window, cx| window.focus(&input.read(cx).focus_handle(cx), cx));
+        settle_window(wcx);
+        let scrolled = wcx.update(|_, cx| input.read(cx).scroll_x);
+        assert!(scrolled > 0.0, "前置：聚焦后应已滚动");
+        wcx.update(|window, cx| {
+            window.blur(cx);
+            input.update(cx, |s, cx| s.on_blur(window, cx));
+        });
+        let after_blur = wcx.update(|_, cx| input.read(cx).scroll_x);
+        assert_eq!(after_blur, 0.0, "失焦应复位 scroll_x 到 0");
     }
 }
