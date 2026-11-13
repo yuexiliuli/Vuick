@@ -11,12 +11,9 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::StyledImage as _;
 
 /// 选区背景色（半透蓝；深浅两版，与 markdown 预览同一套色值，视觉统一）。
+/// 已收编：读 `ui::theme::ColorScheme::doc_selection_bg`（明暗两值 = 本函数收编前原值）。
 fn selection_color(cx: &App) -> Hsla {
-    if ui::theme::Theme::global(cx).is_dark() {
-        rgba(0x4d6bfe61).into()
-    } else {
-        rgba(0x4d6bfe42).into()
-    }
+    ui::theme::Theme::global(cx).colors.doc_selection_bg.into()
 }
 
 /// 某页的选区高亮元素（**卡片局部**坐标，原点 = 卡片左上角，Y 向下）：
@@ -74,6 +71,8 @@ fn selection_overlays_for_page(
 }
 
 /// 检索命中（非激活）高亮色：半透蓝（与选区蓝区分度低一些）。
+/// 未收编：PDF 检索叠加速写色（单消费方；与编辑器查找弱黄 `editor_find_match_bg` 是
+/// 不同色相/语义，勿混用——需真机观感裁决是否升为共享 token）。
 fn search_hit_color(cx: &App) -> Hsla {
     if ui::theme::Theme::global(cx).is_dark() {
         rgba(0x60a5fab0).into()
@@ -83,6 +82,8 @@ fn search_hit_color(cx: &App) -> Hsla {
 }
 
 /// 检索激活命中的高亮色：橙（更醒目）。
+/// 未收编：PDF 检索激活叠加速写色（单消费方；虽与 WYSIWYG 告警橙同 `0xf59e0b` 色相，
+/// 但语义/透明度档不同，非共享语义）。
 fn search_active_color() -> Hsla {
     rgba(0xf59e0bcc).into()
 }
@@ -90,16 +91,20 @@ fn search_active_color() -> Hsla {
 // ---- 待保存注释叠加层（P1：内存叠加渲染，零重载零闪烁；save() 才落盘）----
 
 /// 待存高亮底色：半透明黄（叠在纸面之上、不遮正文；与写盘默认注释色同源系）。
+/// 未收编：PDF 注释表单专属覆盖色（单消费方）。
 fn annot_highlight_color() -> Hsla {
     rgba(0xffe67866).into()
 }
 
 /// 待存删除线色：红（不透明细条）。
+/// 未收编：PDF 注释表单专属覆盖色（单消费方；非 `colors.error`（#C42B1C/#F16A6A）
+/// 具体值，勿强行映射）。
 fn annot_strike_color() -> Hsla {
     rgba(0xe63c3cff).into()
 }
 
 /// 待存下划线色：蓝（不透明细条）。
+/// 未收编：PDF 注释表单专属覆盖色（单消费方）。
 fn annot_underline_color() -> Hsla {
     rgba(0x3c78e6ff).into()
 }
@@ -107,6 +112,8 @@ fn annot_underline_color() -> Hsla {
 /// 灰框（点击命中的待存注释包围盒）边框色：中性灰——与选中高亮蓝（`selection_color`）、
 /// 检索命中蓝/橙、折叠/点击高亮等所有既有叠加色**均可区分**（仓库既有「点击 vs 折叠
 /// 高亮颜色必须不同」先例同精神）。
+/// 未收编：PDF 注释表单专属中性灰（单消费方；与 `scrollbar_thumb` `0x6060604a` 非同一
+/// 具体值，勿强行映射）。
 fn annot_focus_frame_color() -> Hsla {
     rgba(0x6b6b6bdd).into()
 }
@@ -114,6 +121,7 @@ fn annot_focus_frame_color() -> Hsla {
 /// 图片选中描框色：**青绿系** rgb(0x2E_CC_8F)（暗处/亮处两版同色阶，透明度区分）。
 /// 选择依据：与既有叠加色全部**明显可分**——选区蓝（`0x4d6bfe`）、检索蓝/橙、注释
 /// 灰框、折叠/点击高亮均非青绿（对立色相），且对深色图片底也醒目（亮青描框）。
+/// 未收编：PDF 图片选中描框专属速写色（单消费方）。
 fn image_select_frame_color(cx: &App) -> Hsla {
     if ui::theme::Theme::global(cx).is_dark() {
         rgba(0x2ecc8fff).into()
@@ -257,6 +265,8 @@ fn annot_focus_frame_overlay_for_page(
     let pad = 2.0;
     let (x0, y_top) = pt_to_local(min_x - pad, max_y + pad, dim.0, dim.1, display_w, scale);
     let (x1, y_bottom) = pt_to_local(max_x + pad, min_y - pad, dim.0, dim.1, display_w, scale);
+    // 未收编：待存注释聚焦填充底 rgba(0x6b6b6b14) = 灰框同色相的低透明填充（与边框
+    // `annot_focus_frame_color` 配套、单消费方，随注释叠加整体保留本地）。
     Some(
         div()
             .absolute()

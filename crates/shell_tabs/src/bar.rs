@@ -43,6 +43,8 @@ struct TabBarColors {
     tab_active_bg: gpui::Hsla,
     tab_active_border: gpui::Hsla,
     hover_fill: gpui::Hsla,
+    /// 拖拽排序「插入指示线」纯白（亮暗同值，`ChromeColors::tab_reorder_line`）。
+    reorder_line: gpui::Hsla,
 }
 
 /// 拖拽排序的白色插入指示线画在哪一侧：`Left` = 本选项卡**左侧**边界（插到它之前）；
@@ -142,6 +144,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
             tab_active_bg: self.tab_active_bg(),
             tab_active_border: self.tab_active_border(),
             hover_fill: c.hover_fill.into(),
+            reorder_line: c.tab_reorder_line.into(),
         }
     }
 
@@ -426,7 +429,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 .top_0()
                 .bottom_0()
                 .w(px(2.))
-                .bg(gpui::white())
+                .bg(colors.reorder_line)
                 .rounded_full()
                 .debug_selector(|| "tab-reorder-line".into());
             match side {

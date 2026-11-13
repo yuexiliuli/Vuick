@@ -147,6 +147,11 @@ pub struct ColorScheme {
     /// 编辑器「查找」**当前命中**（导航所指）的字符底色（明 #FFB703 / 暗 #FFB703 同
     /// 一饱和橙黄，比非当前更醒目，与选区/折叠底都可辨）。
     pub editor_find_current_bg: Rgba,
+    /// **文档选区底色**（半透明补偿蓝叠加，markdown 预览 / WYSIWYG / PDF 阅读器共用；
+    /// 暗 `rgba(0x4d6bfe61)` / 亮 `rgba(0x4d6bfe42)` = 各消费方收编前原值，零观感变化）。
+    /// 与 `editor_selection_bg`（代码编辑器选区补偿色）语义区分：本 token 管**文档预览/纸面**
+    /// 上的文本选区。
+    pub doc_selection_bg: Rgba,
 }
 
 impl ColorScheme {
@@ -194,6 +199,7 @@ impl ColorScheme {
             editor_active_line_bg: rgb(0xe6eff8),
             editor_find_match_bg: rgb(0xffe497),
             editor_find_current_bg: rgb(0xffb703),
+            doc_selection_bg: rgba(0x4d6bfe42),
         }
     }
 
@@ -243,6 +249,7 @@ impl ColorScheme {
             editor_active_line_bg: rgb(0x242525),
             editor_find_match_bg: rgb(0x4a3f16),
             editor_find_current_bg: rgb(0xffb703),
+            doc_selection_bg: rgba(0x4d6bfe61),
         }
     }
 }
@@ -322,6 +329,9 @@ pub struct ChromeColors {
     pub menu_highlight: Rgba,
     /// 横向滚动条滑块底色（半透明中性灰，亮暗同值；原 shell 裸色 `rgba(0x6060604a)`）
     pub scrollbar_thumb: Rgba,
+    /// 选项卡拖拽排序「插入指示线」纯白（亮暗同值；原 shell_tabs 裸 `gpui::white()`，
+    /// 与外壳底再暗/再亮都保持白线对比）
+    pub tab_reorder_line: Rgba,
 }
 
 /// 自绘玻璃材质 chrome 透明度：标题栏/选项卡栏/侧栏/状态栏/窗口底用
@@ -366,6 +376,8 @@ impl ChromeColors {
             menu_highlight: rgba(0x00000014),
             // 滚动条滑块 = 半透明中性灰（亮暗同值，原 shell rgba(0x6060604a)）
             scrollbar_thumb: rgba(0x6060604a),
+            // 选项卡拖拽排序插入指示线 = 纯白（亮暗同值，原 shell_tabs gpui::white()）
+            tab_reorder_line: rgb(0xffffff),
         }
     }
 
@@ -404,6 +416,8 @@ impl ChromeColors {
             menu_highlight: rgba(0xffffff1a),
             // 滚动条滑块 = 半透明中性灰（亮暗同值，原 shell rgba(0x6060604a)）
             scrollbar_thumb: rgba(0x6060604a),
+            // 选项卡拖拽排序插入指示线 = 纯白（亮暗同值，原 shell_tabs gpui::white()）
+            tab_reorder_line: rgb(0xffffff),
         }
     }
 
@@ -668,6 +682,24 @@ mod tests {
     }
 
     #[gpui::test]
+    fn doc_selection_bg_pinned_both_themes(_cx: &mut TestAppContext) {
+        // 文档选区底色 token：半透蓝（markdown 预览 / WYSIWYG / PDF 阅读器共用）。
+        // 亮暗值 = 收编前各消费方原值逐字节（暗 0x4d6bfe61 / 亮 0x4d6bfe42），零观感回归；
+        // 半透明（a<1）保证叠在纸面/正文上透出下方内容。
+        let light = Theme::light().colors;
+        let dark = Theme::dark().colors;
+        assert_eq!(light.doc_selection_bg, rgba(0x4d6bfe42), "亮文档选区底=原 rgba(0x4d6bfe42)");
+        assert_eq!(dark.doc_selection_bg, rgba(0x4d6bfe61), "暗文档选区底=原 rgba(0x4d6bfe61)");
+        assert_ne!(light.doc_selection_bg, dark.doc_selection_bg, "文档选区底色随明暗");
+        assert!(light.doc_selection_bg.a < 1.0, "亮文档选区底应半透明（a<1）");
+        assert!(dark.doc_selection_bg.a < 1.0, "暗文档选区底应半透明（a<1）");
+        // 与按钮选中基底 / 编辑器选区补偿色彼此可辨（不同色相/透明度档，不可混用）。
+        assert_ne!(light.doc_selection_bg, light.selected_bg, "亮文档选区 ≠ 按钮选中基底");
+        assert_ne!(dark.doc_selection_bg, dark.selected_bg, "暗文档选区 ≠ 按钮选中基底");
+        assert_ne!(light.doc_selection_bg, light.editor_selection_bg, "亮文档选区 ≠ 编辑器选区");
+    }
+
+    #[gpui::test]
     fn chrome_palette_has_distinct_light_and_dark(_cx: &mut TestAppContext) {
         // 第 1 步把 App 外壳 11 个 helper 收编为 ChromeColors：亮/暗外壳底色必须分离。
         let light = ChromeColors::light();
@@ -769,6 +801,10 @@ mod tests {
         assert_eq!(light.drag_ghost_bg, ColorScheme::light().accent, "亮拖拽幽灵 = 亮强调色");
         assert_eq!(dark.drag_ghost_bg, ColorScheme::dark().accent, "暗拖拽幽灵 = 暗强调色");
         assert_ne!(light.drag_ghost_bg, dark.drag_ghost_bg, "拖拽幽灵随明暗");
+        // 选项卡拖拽排序插入指示线：纯白、亮暗同值（原 shell_tabs 裸 gpui::white()）。
+        assert_eq!(light.tab_reorder_line, rgb(0xffffff), "亮插入指示线=纯白");
+        assert_eq!(dark.tab_reorder_line, rgb(0xffffff), "暗插入指示线=纯白");
+        assert_eq!(light.tab_reorder_line, dark.tab_reorder_line, "插入指示线亮暗同值（白色不随外壳底）");
     }
 
     #[gpui::test]

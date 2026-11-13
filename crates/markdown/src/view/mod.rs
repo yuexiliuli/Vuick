@@ -22,12 +22,10 @@ use gpui::{App, Hsla};
 
 /// 文本选择的背景色（半透明蓝，浅/暗主题各一版；与搜索高亮同法，非主题强调色）。
 /// WYSIWYG(`markdown/wysiwyg`) 共用同一款，保证「选区背景色」全局一致。
+/// 已收编：读 `ui::theme::ColorScheme::doc_selection_bg`（与 PDF 阅读器同 token，明暗两值
+/// = 本函数收编前原值，零观感变化）。
 pub fn selection_color(cx: &App) -> Hsla {
-    if ui::theme::Theme::global(cx).is_dark() {
-        gpui::rgba(0x4d6bfe61).into()
-    } else {
-        gpui::rgba(0x4d6bfe42).into()
-    }
+    ui::theme::Theme::global(cx).colors.doc_selection_bg.into()
 }
 
 /// 在 `text` 内查找第一个忽略大小写命中小写 `needle` 的字节区间；未命中返回 `None`。
