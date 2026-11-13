@@ -29,6 +29,7 @@ impl super::VideoViewer {
                     ui::CardShellShadow::NearDouble,
                     ui::CardShellRadius::Lg,
                     ui::CardShellPad::PxPy(px(16.), px(8.)),
+                    None,
                 )
                 .text_size(px(14.))
                 .text_color(color)
@@ -93,6 +94,7 @@ impl super::VideoViewer {
             ui::CardShellShadow::Single,
             ui::CardShellRadius::Md,
             ui::CardShellPad::PxPy(px(8.), px(4.)),
+            None,
         )
         .id("video-hover-time")
         .debug_selector(move || "HOVER_TIME".to_string())
@@ -437,10 +439,10 @@ impl Render for VideoViewer {
         let theme = ui::theme::Theme::global(cx);
         let is_dark = theme.is_dark();
         let muted: Hsla = theme.colors.fg_muted.into();
-        // 状态浮层（右上角）配色：Copy 抽出，避免在 `control_bar(&mut cx)` 之后借用 theme
-        let toast_surface: Hsla = theme.colors.surface.into();
-        let toast_border: Hsla = theme.colors.border.into();
-        let toast_fg: Hsla = theme.colors.fg.into();
+        // 状态浮层（右上角）配色：ColorScheme Copy 抽出，避免在 `control_bar(&mut cx)` 之后借用
+        // theme（玻璃壳取色经 `glass_card` 走 `toast_colors`）；toast_fg 另给暂停徽标复用。
+        let toast_colors: ui::theme::ColorScheme = theme.colors;
+        let toast_fg: Hsla = toast_colors.fg.into();
 
         let (vw, vh) = self.viewport_size(window);
         // 普通模式预留底部控制条高度（控制条常驻，画面 contain 到其上）；
@@ -584,41 +586,32 @@ impl Render for VideoViewer {
         if let Some((text, at)) = &self.status
             && at.elapsed() < std::time::Duration::from_millis(STATUS_MS)
         {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top_3()
-                    .right_3()
-                    .px_3()
-                    .py_1()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(toast_border)
-                    // 状态浮层同样吞双击（归属 `on_controls_mouse_down` 互斥族：不向画面漏）。
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_controls_mouse_down))
-                    // 玻璃卡片：半透明表面 + 圆角 + 高光内阴影；出现时短弹簧淡入（收敛即静止，
-                    // 无持续重绘）。消失仍由 `STATUS_MS` 到期卸载，不做离场动画。
-                    .bg(toast_surface.opacity(if is_dark {
-                        GLASS_PANEL_ALPHA_DARK
-                    } else {
-                        GLASS_PANEL_ALPHA_LIGHT
-                    }))
-                    // 状态浮层投影 = 黑 hsla 双散值（0.18@10 + 0.14@2），玻璃卡专属，theme 无阴影 token
-                    .shadow(vec![
-                        gpui::BoxShadow::new(px(0.), px(4.), gpui::hsla(0., 0., 0., 0.18))
-                            .blur_radius(px(10.)),
-                        gpui::BoxShadow::new(px(0.), px(1.), gpui::hsla(0., 0., 0., 0.14))
-                            .blur_radius(px(2.)),
-                    ])
-                    .text_size(px(12.))
-                    .text_color(toast_fg)
-                    .child(text.clone())
-                    .with_spring(
-                        "video-toast-fade",
-                        hover_spring(1.0).from(0.0),
-                        |this, v| this.opacity(v),
-                    ),
+            // 状态浮层：走 ui::glass_card 纯壳——Acrylic 默认 α（theme 亮 0.80/暗 0.72，与原散值
+            // 同）、ToastDouble 双影逐值 = 原黑 hsla 0.18@10 + 0.14@2、Lg 圆角 + PxPy(12,4) =
+            // 原 px_3/py_1；宿主定位（absolute top_3 right_3）/吞双击 on_mouse_down/12px 文案/
+            // 弹簧淡入（收敛即静止）留在原位。
+            let toast_card = ui::glass_card(
+                &toast_colors,
+                is_dark,
+                ui::GlassCardBg::Acrylic,
+                ui::CardShellShadow::ToastDouble,
+                ui::CardShellRadius::Lg,
+                ui::CardShellPad::PxPy(px(12.), px(4.)),
+                None,
+            )
+            .absolute()
+            .top_3()
+            .right_3()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_controls_mouse_down))
+            .text_size(px(12.))
+            .text_color(toast_fg)
+            .child(text.clone())
+            .with_spring(
+                "video-toast-fade",
+                hover_spring(1.0).from(0.0),
+                |this, v| this.opacity(v),
             );
+            root = root.child(toast_card);
         }
         // 暂停标志（右上角）：仅放大 ❚❚ 双竖条图标，无圆底/边框/投影；暂停/停在结尾时
         // 显示。以**视频实际矩形** `vrect` 为基准（右上角内 32px），不随窗口/画布走；纯视觉

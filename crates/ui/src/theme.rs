@@ -366,6 +366,12 @@ pub const GLASS_DOUBLE_HIGH_ALPHA: f32 = 0.16;
 pub const GLASS_DOUBLE_PEAK_ALPHA: f32 = 0.12;
 /// 选区弹卡双层影外层 α（pdf sel_card 现值：(0,6) blur12，α0.18）。
 pub const POPOVER_DOUBLE_HIGH_ALPHA: f32 = 0.18;
+/// 状态浮层双层影外层 α（video status toast 现值：(0,4) blur10，α0.18；
+/// 与 PopoverDouble 外层同 α、偏移/模糊不同档，故独立成档）。
+pub const TOAST_DOUBLE_HIGH_ALPHA: f32 = 0.18;
+/// 状态浮层双层影近层 α（video status toast 现值：(0,1) blur2，α0.14；
+/// 与 NearDouble/PopoverDouble 的近层 α0.12 不同，故独立成档）。
+pub const TOAST_DOUBLE_PEAK_ALPHA: f32 = 0.14;
 
 impl ChromeColors {
     pub fn light() -> Self {

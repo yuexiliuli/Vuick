@@ -803,16 +803,23 @@ impl MusicView {
             .items_center()
             .justify_center()
             .child(
-                div()
-                    .px_7()
-                    .py_3()
-                    .rounded(px(12.))
-                    .bg(theme::glass())
-                    .border_1()
-                    .border_color(theme::accent())
-                    .text_size(px(14.))
-                    .text_color(theme::text())
-                    .child(msg.clone()),
+                // 去手绘：走 ui::glass_card 纯壳——Solid(theme::glass()) 底、accent 边框（经
+                // border 覆盖参数）、Xl 圆角(12px) + PxPy(28,12) = 原 px_7/py_3、无影；14px 文案
+                // 与外层居中宿主定位留在原位。本卡 Solid+无影+border 覆盖 → card_shell 的
+                // surface/border/card_shadow 三色全未使用，传任意 ColorScheme 仅满足签名
+                // （music 自含深紫主题，不依赖 ui theme）。
+                ui::glass_card(
+                    &ui::theme::ColorScheme::light(),
+                    false,
+                    ui::GlassCardBg::Solid(theme::glass()),
+                    ui::CardShellShadow::None,
+                    ui::CardShellRadius::Xl,
+                    ui::CardShellPad::PxPy(px(28.), px(12.)),
+                    Some(theme::accent()),
+                )
+                .text_size(px(14.))
+                .text_color(theme::text())
+                .child(msg.clone()),
             )
             .into_any_element()
     }

@@ -17,7 +17,8 @@ use gpui::{div, px, BoxShadow, Div, Hsla, Pixels, Styled as _};
 use crate::ui::theme::{
     ColorScheme, FLOAT_SHADOW_HIGH_ALPHA, FLOAT_SHADOW_PEAK_ALPHA, GLASS_DOUBLE_HIGH_ALPHA,
     GLASS_DOUBLE_PEAK_ALPHA, GLASS_PANEL_ALPHA_DARK, GLASS_PANEL_ALPHA_LIGHT,
-    POPOVER_DOUBLE_HIGH_ALPHA, SINGLE_SHADOW_ALPHA,
+    POPOVER_DOUBLE_HIGH_ALPHA, SINGLE_SHADOW_ALPHA, TOAST_DOUBLE_HIGH_ALPHA,
+    TOAST_DOUBLE_PEAK_ALPHA,
 };
 
 /// 卡底：Acrylic 半透明玻璃材质（α 由调用方指定），或调用方自供的纯色。
@@ -43,6 +44,9 @@ pub enum CardShellShadow {
     NearDouble,
     /// 悬浮小菜单双层影：(0,6) blur12 α0.18 + (0,2) blur4 α0.12（pdf 选中弹卡现值）。
     PopoverDouble,
+    /// 状态浮层双层影：(0,4) blur10 α0.18 + (0,1) blur2 α0.14（video status toast 现值；
+    /// 与 PopoverDouble 同层 α 但偏移/模糊档不同，独立成档）。
+    ToastDouble,
 }
 
 /// 圆角档。
@@ -50,10 +54,12 @@ pub enum CardShellShadow {
 pub enum CardShellRadius {
     /// 更小一档（`rounded_sm`）。
     Sm,
-    /// 中档（`rounded_md`）。
+    /// 中档（`rounded_md` = 6px）。
     Md,
-    /// 现有浮层卡圆角档（`rounded_lg`）。
+    /// 现有浮层卡圆角档（`rounded_lg` = 8px）。
     Lg,
+    /// 更大一档（`rounded_xl` = 12px；music 中央 toast 现值 `rounded(px(12.))`）。
+    Xl,
 }
 
 /// 内边距档。
@@ -78,19 +84,22 @@ pub enum CardShellPad {
 /// 着色全部取自 `colors`：Acrylic/Solid 从 `colors.surface` 派生、阴影色 =
 /// `colors.card_shadow` 按档取 alpha，本层零裸色。Acrylic alpha 由调用方直接给
 /// （float_card 按明暗取 `FLOAT_ACRYLIC_ALPHA_*` 现值；glass_card 可调）。
+/// `border` 覆盖档：`None` = 默认 `colors.border`；`Some(c)` 覆盖边框色
+/// （music toast 的 accent 边框、自含主题卡等走覆盖，不落 `colors`）。
 pub fn card_shell(
     colors: &ColorScheme,
     bg: CardShellBg,
     shadow: CardShellShadow,
     radius: CardShellRadius,
     pad: CardShellPad,
+    border: Option<Hsla>,
 ) -> Div {
     let surface: Hsla = colors.surface.into();
-    let border: Hsla = colors.border.into();
+    let border_color: Hsla = border.unwrap_or_else(|| colors.border.into());
     let shadow_base: Hsla = colors.card_shadow.into();
     let mut card = div()
         .border_1()
-        .border_color(border)
+        .border_color(border_color)
         .bg(match bg {
             CardShellBg::Acrylic(alpha) => surface.opacity(alpha),
             CardShellBg::Solid(color) => color,
@@ -99,6 +108,7 @@ pub fn card_shell(
         CardShellRadius::Sm => card.rounded_sm(),
         CardShellRadius::Md => card.rounded_md(),
         CardShellRadius::Lg => card.rounded_lg(),
+        CardShellRadius::Xl => card.rounded_xl(),
     };
     let shadows = card_shell_shadows(shadow, shadow_base);
     card = if shadows.is_empty() {
@@ -143,6 +153,12 @@ pub fn card_shell_shadows(shadow: CardShellShadow, shadow_base: Hsla) -> Vec<Box
             BoxShadow::new(px(0.), px(2.), shadow_base.opacity(GLASS_DOUBLE_PEAK_ALPHA))
                 .blur_radius(px(4.)),
         ],
+        CardShellShadow::ToastDouble => vec![
+            BoxShadow::new(px(0.), px(4.), shadow_base.opacity(TOAST_DOUBLE_HIGH_ALPHA))
+                .blur_radius(px(10.)),
+            BoxShadow::new(px(0.), px(1.), shadow_base.opacity(TOAST_DOUBLE_PEAK_ALPHA))
+                .blur_radius(px(2.)),
+        ],
     }
 }
 
@@ -176,7 +192,8 @@ pub fn glass_card_bg(bg: GlassCardBg, is_dark: bool) -> CardShellBg {
     }
 }
 
-/// B02b 玻璃卡便捷入口：`card_shell` 同款五参 + `is_dark` 注入——Acrylic 默认 α 由
+/// B02b 玻璃卡便捷入口：`card_shell` 同款五参 + `is_dark` 注入 + `border` 覆盖
+/// （`None` = 默认 `colors.border`，`Some(c)` 覆盖边框色）——Acrylic 默认 α 由
 /// [`glass_acrylic_alpha`] 给出（亮 0.80 / 暗 0.72），调用方不必每处传 α，另有
 /// [`GlassCardBg::AcrylicAlpha`] / [`GlassCardBg::Solid`] 覆盖。**只做壳**：返回可续挂的
 /// gpui [`Div`]，定位/事件/children（含 min_w 等宿主补挂）由调用方在原位续挂。
@@ -187,14 +204,27 @@ pub fn glass_card(
     shadow: CardShellShadow,
     radius: CardShellRadius,
     pad: CardShellPad,
+    border: Option<Hsla>,
 ) -> Div {
-    card_shell(colors, glass_card_bg(bg, is_dark), shadow, radius, pad)
+    card_shell(
+        colors,
+        glass_card_bg(bg, is_dark),
+        shadow,
+        radius,
+        pad,
+        border,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AbsoluteLength, DefiniteLength, Styled, hsla, red};
+    use gpui::{AbsoluteLength, DefiniteLength, Styled, hsla, red, rems};
+
+    /// 像素长 → 已定型 DefiniteLength（读取 `style().padding.*` 的断言口径）。
+    fn px_len(v: f32) -> DefiniteLength {
+        DefiniteLength::Absolute(AbsoluteLength::Pixels(px(v)))
+    }
 
     /// Acrylic 默认 α 守护：默认档 = 文档化现值（亮 0.80 / 暗 0.72），Solid 直通不受 is_dark 影响。
     #[test]
@@ -236,6 +266,16 @@ mod tests {
         assert_eq!(pop[1].blur_radius, px(4.));
         assert_eq!(pop[1].color, base.opacity(GLASS_DOUBLE_PEAK_ALPHA)); // α0.12
 
+        // B02c 新档：ToastDouble = video status toast 现值 (0,4)blur10 α0.18 + (0,1)blur2 α0.14。
+        let toast = card_shell_shadows(CardShellShadow::ToastDouble, base);
+        assert_eq!(toast.len(), 2);
+        assert_eq!(toast[0].offset, gpui::point(px(0.), px(4.)));
+        assert_eq!(toast[0].blur_radius, px(10.));
+        assert_eq!(toast[0].color, base.opacity(TOAST_DOUBLE_HIGH_ALPHA)); // α0.18
+        assert_eq!(toast[1].offset, gpui::point(px(0.), px(1.)));
+        assert_eq!(toast[1].blur_radius, px(2.));
+        assert_eq!(toast[1].color, base.opacity(TOAST_DOUBLE_PEAK_ALPHA)); // α0.14
+
         // 既有档不动（float_card 依赖）：Single 单影 / Double 双影 / None 空三路照旧。
         let single = card_shell_shadows(CardShellShadow::Single, base);
         assert_eq!(single.len(), 1);
@@ -255,11 +295,9 @@ mod tests {
     /// Pg = flex_col + p(4) + gap_y(2)（pdf 弹卡形态）；Solid+双影同落一壳体。
     #[test]
     fn glass_card_pad_forms() {
-        let px_len = |v: f32| DefiniteLength::Absolute(AbsoluteLength::Pixels(px(v)));
-
         let mut c = glass_card(
             &ColorScheme::light(), false, GlassCardBg::Acrylic, CardShellShadow::None,
-            CardShellRadius::Lg, CardShellPad::PxPy(px(16.), px(8.)),
+            CardShellRadius::Lg, CardShellPad::PxPy(px(16.), px(8.)), None,
         );
         let s = c.style();
         assert_eq!(s.padding.top, Some(px_len(8.)));
@@ -272,6 +310,7 @@ mod tests {
         let mut c = glass_card(
             &ColorScheme::light(), false, GlassCardBg::Solid(red()),
             CardShellShadow::PopoverDouble, CardShellRadius::Lg, CardShellPad::Pg(px(4.), px(2.)),
+            None,
         );
         let s = c.style();
         assert_eq!(s.display, Some(gpui::Display::Flex));
@@ -284,5 +323,38 @@ mod tests {
         assert_eq!(s.padding.right, Some(px_len(4.)));
         assert_eq!(s.gap.width, None);
         assert_eq!(s.gap.height, Some(px_len(2.)));
+    }
+
+    /// B02c 新参守护：`Xl` 圆角 = rounded_xl（0.75rem = 12px，music toast 现值）与
+    /// `border` 覆盖（`Some` → 边框色被覆盖 / `None` → 默认 theme border）——
+    /// music toast 的 accent 边框与 12px 圆角像素等价契约。
+    #[test]
+    fn glass_card_xl_radius_and_border_override() {
+        let accent = hsla(0.7, 0.8, 0.5, 1.);
+
+        // Xl 圆角 + border 覆盖：Solid 底 + 无影（music toast 路径）。
+        let mut c = glass_card(
+            &ColorScheme::light(), false, GlassCardBg::Solid(red()), CardShellShadow::None,
+            CardShellRadius::Xl, CardShellPad::PxPy(px(28.), px(12.)), Some(accent),
+        );
+        let s = c.style();
+        // rounded_xl 落盘 = `rems(0.75)`，即 gpui 语义 12px（rem_size=16px）。
+        assert_eq!(
+            s.corner_radii.top_left,
+            Some(AbsoluteLength::Rems(rems(0.75)))
+        );
+        assert_eq!(s.border_color, Some(accent), "border 覆盖生效");
+        assert!(s.box_shadow.is_none(), "无影档不入壳体");
+        assert_eq!(s.padding.top, Some(px_len(12.)));
+        assert_eq!(s.padding.left, Some(px_len(28.)));
+
+        // None 覆盖 → 保持默认 theme border（与旧行为一致，float_card/pdf 等零变化）。
+        let mut c = glass_card(
+            &ColorScheme::light(), false, GlassCardBg::Acrylic, CardShellShadow::None,
+            CardShellRadius::Md, CardShellPad::None, None,
+        );
+        let s = c.style();
+        let scheme = ColorScheme::light();
+        assert_eq!(s.border_color, Some(scheme.border.into()));
     }
 }
