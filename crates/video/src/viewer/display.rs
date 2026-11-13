@@ -288,14 +288,10 @@ impl super::VideoViewer {
     }
 
 
-    /// `秒` → `m:ss`；≥1h 自动 `h:mm:ss`（控制条时间与 F1 悬停时间浮层共用同一语义）。
+    /// `秒` → 时长字符串：m:ss，≥1h 自动 h:mm:ss（控制条时间与 F1 悬停时间浮层共用同一语义）。
+    /// 逻辑收敛在 [`base::util::format_duration`]（与 music `duration_str` 共用一份实现，
+    /// 音乐 ≥1h 一并显式统一为 h:mm:ss）。
     pub(super) fn fmt_time(secs: f64) -> String {
-        let s = secs.max(0.0) as u64;
-        let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
-        if h > 0 {
-            format!("{h}:{m:02}:{sec:02}")
-        } else {
-            format!("{m}:{sec:02}")
-        }
+        base::util::format_duration(secs)
     }
 }

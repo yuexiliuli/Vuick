@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "gpui-editor 音乐播放器核心引擎 crate（FFmpeg 音频经 libloading 运行时加载 + cpal 输出 + 播放引擎；UI 在后续阶段添加）"
 
 [dependencies]
+base = { path = "../base" }
 gpui = { workspace = true }
 cpal = { workspace = true }
 libloading = { workspace = true }

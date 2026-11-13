@@ -156,6 +156,25 @@ pub fn atomic_write<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// 时长（秒，f64）→ 时钟字符串。负值 / 非有限 / 0 一律按 0 处理（`"0:00"`）。
+///
+/// 格式与 video `fmt_time` 对齐（收敛自播放器双份独立实现）：
+/// - `< 1h`：`m:ss`（分不补零、秒两位补零）；
+/// - `≥ 1h`：`h:mm:ss`（小时不补零、分/秒两位补零），如 `1:01:23`。
+///
+/// 收敛前 music `duration_str` 无小时分支（≥1h 显示 `61:23` 这类 m:ss，属隐含 bug），
+/// 统一后按此处语义走 h:mm:ss——这是**显式语义统一（修隐含 bug）**，非回归。
+pub fn format_duration(secs: f64) -> String {
+    let secs = if secs.is_finite() && secs > 0.0 { secs } else { 0.0 };
+    let total = secs as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +239,22 @@ mod tests {
         assert_eq!(align(18, 999), 18..text.len());
         // 整体越界 → 不 panic、坍缩为同边界（调用方丢弃空段）。
         assert_eq!(align(500, 999), text.len()..text.len());
+    }
+
+    /// 时长格式化（video/music 播放器统一入口）：边界与进位逐一断言。
+    #[test]
+    fn format_duration_covers_edges_and_hours() {
+        // 边界清单：0 / 不足 1 分 / 整分 / 1h 前最后 1 秒 / 整点 1h / 跨 1h 进位。
+        assert_eq!(format_duration(0.0), "0:00");
+        assert_eq!(format_duration(59.9), "0:59");
+        assert_eq!(format_duration(60.0), "1:00");
+        assert_eq!(format_duration(3599.0), "59:59");
+        assert_eq!(format_duration(3600.0), "1:00:00");
+        assert_eq!(format_duration(3661.0), "1:01:01");
+        // 负值 / 非有限一律按 0 处理（video `fmt_time` 与 music `duration_str` 原有语义一致）。
+        assert_eq!(format_duration(-5.0), "0:00");
+        assert_eq!(format_duration(f64::NAN), "0:00");
+        assert_eq!(format_duration(f64::INFINITY), "0:00");
     }
 
     /// 幂等 / 基本时序：单次触发 → 未到点不执行、到点恰执行一次、此后不再重复。

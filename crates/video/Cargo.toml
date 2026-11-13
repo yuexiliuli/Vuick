@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "gpui-editor 视频查看器 crate（FFmpeg 经 libloading 运行时加载 + 帧钟播放 + 音频输出）"
 
 [dependencies]
+base = { path = "../base" }
 gpui = { workspace = true }
 kimg = { workspace = true }
 anyhow = { workspace = true }

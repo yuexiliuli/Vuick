@@ -156,11 +156,11 @@ pub fn parse_meta(stem: &str) -> (String, String) {
     }
 }
 
-/// 时长（秒）→ `"m:ss"`（秒两位补零）。
+/// 时长（秒）→ 时钟字符串。逻辑收敛在 [`base::util::format_duration`]（与 video `fmt_time`
+/// 共用一份实现）；**显式语义统一**：原来 ≥1h 显示 m:ss（如 `61:23`，隐含 bug），
+/// 现按共享 util 走 h:mm:ss（如 `1:01:23`）。
 pub fn duration_str(secs: f64) -> String {
-    let secs = if secs.is_finite() && secs > 0.0 { secs } else { 0.0 };
-    let total = secs as u64;
-    format!("{}:{:02}", total / 60, total % 60)
+    base::util::format_duration(secs)
 }
 
 /// 预设渐变主色调色板（对齐 Orbitrum 原型深紫暗调衍生色，主色用于渐变封面底）。
@@ -240,6 +240,9 @@ mod tests {
         assert_eq!(duration_str(125.7), "2:05");
         assert_eq!(duration_str(-3.0), "0:00");
         assert_eq!(duration_str(f64::NAN), "0:00");
+        // **显式语义统一**（修隐含 bug）：原 ≥1h 显示 m:ss（3661 → "61:01"），
+        // 统一走共享 util 后与 video 一致显示 h:mm:ss。
+        assert_eq!(duration_str(3661.0), "1:01:01");
     }
 
     #[test]
