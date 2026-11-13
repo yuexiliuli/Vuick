@@ -726,9 +726,3 @@ impl CodeEditor {
         .map(|w| (w.bytes, w.offset_px))
     }
 }
-/// 行首空白字节数（空格/Tab；缩进折叠启发式用）。
-fn leading_ws_len(s: &str) -> usize {
-    s.bytes()
-        .take_while(|b| *b == b' ' || *b == b'\t')
-        .count()
-}

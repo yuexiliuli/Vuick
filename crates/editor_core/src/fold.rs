@@ -52,23 +52,48 @@ pub struct BracketPair {
     pub guide_units: usize,
 }
 
-/// 行首空白（空格/Tab）的宽度单位数：空格=1、Tab=4（与 `char_width_units` 一致）。
-fn leading_ws_units(s: &str) -> usize {
-    s.bytes()
-        .take_while(|b| *b == b' ' || *b == b'\t')
-        .map(|b| if b == b'\t' { 4 } else { 1 })
-        .sum()
+/// 行首空白（空格/Tab）的计数结果：**一次扫描**同时给出字节数与宽度单位两种口径，
+/// 核心/视图两层共用这一处实现，杜绝跨 crate 双实现漂移。
+///
+/// - [`LeadingWs::bytes`]：行首空白**字节数**（空格/Tab 各 1）——折叠候选缩进比较、
+///   缩进折叠启发式用（与历史 `view::leading_ws_len` / `leading_ws_bytes` 逐位一致）；
+/// - [`LeadingWs::units`]：**宽度单位数**（空格=1、Tab=4，与 `char_width_units` 一致）——
+///   括号标尺竖线列用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeadingWs {
+    spaces: usize,
+    tabs: usize,
 }
 
-/// 行首空白**字节数**（空格/Tab 各 1 字节；折叠候选缩进比较用）。
-///
-/// 注意：与 [`leading_ws_units`]（宽度单位）不同——候选扫描沿用视图层原
-/// `view::leading_ws_len` 的「字节数」口径（`scan_fold_candidates` 里缩进只做
-/// 大小比较，两者各自单调、但与旧实现保持逐位一致以免候选集合变化）。
-fn leading_ws_bytes(s: &str) -> usize {
-    s.bytes()
-        .take_while(|b| *b == b' ' || *b == b'\t')
-        .count()
+impl LeadingWs {
+    /// 扫描 `s` 行首连续空格/Tab（遇其它字节即停；空行 → 全 0）。
+    pub fn scan(s: &str) -> Self {
+        let mut spaces = 0;
+        let mut tabs = 0;
+        for b in s.bytes() {
+            match b {
+                b' ' => spaces += 1,
+                b'\t' => tabs += 1,
+                _ => break,
+            }
+        }
+        Self { spaces, tabs }
+    }
+
+    /// 行首空白**字节数**（空格/Tab 各 1）。
+    pub fn bytes(self) -> usize {
+        self.spaces + self.tabs
+    }
+
+    /// 行首空白**宽度单位数**（空格=1、Tab=4）。
+    pub fn units(self) -> usize {
+        self.spaces + self.tabs * 4
+    }
+}
+
+/// 行首空白（空格/Tab）的统一入口：`leading_indent(s).bytes()` / `leading_indent(s).units()`。
+pub fn leading_indent(s: &str) -> LeadingWs {
+    LeadingWs::scan(s)
 }
 
 /// 跨行括号配对的**段扫描**结果。
@@ -164,7 +189,7 @@ where
                         if och == want {
                             if line_ix > ol {
                                 // 竖线列 = 开括号行的缩进宽（块首缩进）。
-                                let guide_units = leading_ws_units(line(ol).as_ref());
+                                let guide_units = leading_indent(line(ol).as_ref()).units();
                                 out.pairs.push(BracketPair {
                                     open_line: ol,
                                     open_col: oc,
@@ -223,7 +248,7 @@ pub struct FoldScanReport {
 ///
 /// 行 `i` 是候选起点 ⟺ 其后的首个非空行缩进更深（该行将藏起一个块）；块结束 = 首个
 /// 缩进回退 `/` 同级闭记号（`}` 等）行。`line` 按逻辑行号返回该行文本（只读）。
-/// 缩进口径 = 行首空白**字节数**（[`leading_ws_bytes`]，与折叠缩进启发式一致）。
+/// 缩进口径 = 行首空白**字节数**（[`LeadingWs::bytes`]，与折叠缩进启发式一致）。
 ///
 /// `scan_fold_candidates` 是其「从 0 整篇、扫到文末」的薄包装。
 /// 折叠扫描的持久状态只有 `stack`（`pending` 恒可由「上一非空行」行文本重建），
@@ -254,7 +279,7 @@ where
         let text = line(r);
         let trimmed = text.trim_start();
         if !trimmed.is_empty() {
-            let indent = leading_ws_bytes(text.as_ref());
+            let indent = leading_indent(text.as_ref()).bytes();
             let closing = matches!(
                 trimmed.chars().next(),
                 Some('}') | Some(')') | Some(']') | Some('#') | Some('`')
@@ -948,8 +973,9 @@ mod tests {
 
     #[test]
     fn fold_candidates_identical_to_view_metric() {
-        // 用 Tab 缩进回归：行首空白按**字节**计（与原 `view::leading_ws_len` 相同），
-        // 保证候选集合与折叠展开/收拢语义不因口径漂移而变化。
+        // 用 Tab 缩进回归：行首空白按**字节**计（`leading_indent(..).bytes()`，
+        // 与历史 `view::leading_ws_len` 相同），保证候选集合与折叠展开/收拢语义
+        // 不因口径漂移而变化。
         let lines = ["\tfn a() {", "\t\tx;", "\t}"];
         assert_eq!(
             scan_fold_candidates(line_fn(&lines), lines.len()),

@@ -2,8 +2,6 @@
 //! 方向/词/行/文档移动与选区扩展、代码折叠切换与括号标尺竖线（`bracket_guide_segments*`）、
 //! 插入/退格/删除/换行/Tab、复制剪切粘贴、撤销与重做。
 
-use super::leading_ws_len;
-
 use std::{
     ops::Range,
 };
@@ -24,6 +22,7 @@ use config::limits::{
 };
 use crate::editor::fold::{
     Fold,
+    leading_indent,
 };
 use crate::editor::movement;
 use crate::editor::undo::{
@@ -207,7 +206,7 @@ impl CodeEditor {
         if self.row_count == 0 || start >= self.row_count {
             return None;
         }
-        let base_indent = leading_ws_len(self.buffer.line_text(start).as_ref());
+        let base_indent = leading_indent(self.buffer.line_text(start).as_ref()).bytes();
         let mut end = None;
         for r in (start + 1)..self.row_count {
             let line = self.buffer.line_text(r);
@@ -215,7 +214,7 @@ impl CodeEditor {
             if trimmed.is_empty() {
                 continue;
             }
-            let indent = leading_ws_len(line.as_ref());
+            let indent = leading_indent(line.as_ref()).bytes();
             if indent < base_indent {
                 end = Some(r);
                 break;
