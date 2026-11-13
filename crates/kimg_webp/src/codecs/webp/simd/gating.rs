@@ -1,21 +1,3 @@
-use std::arch::is_x86_feature_detected;
-
-/// `KIMG_WEBP_NO_SIMD=1` 强制关 WebP 全部 SIMD（对标量回退性能对照；量化 SIMD 收益）。
-/// 首次访问缓存环境变量，之后仅一次 Relaxed 原子读——正常热循环开销可忽略。
-pub(crate) fn webp_no_simd() -> bool {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    static OFF: AtomicBool = AtomicBool::new(false);
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let off = std::env::var("KIMG_WEBP_NO_SIMD")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        OFF.store(off, Relaxed);
-    });
-    OFF.load(Relaxed)
-}
-
 /// `KIMG_WEBP_YUV_U16`（默认开，u16-mulhi 变体为生产路径）：`0`/`false`/`off` → 关，
 /// 走 i32 定点 AVX2 方案（A/B 对照保留；两个方案逐字节一致，分别对标 C# `ConvertRowAvx2`
 /// 与既有 i32 标量源）。首次访问缓存。
@@ -29,29 +11,12 @@ pub(crate) fn yuv_u16_enabled() -> bool {
     })
 }
 
-/// 运行时 CPU 特性查询（x86_64；非 x86_64 一律 false 走标量回退）。已并入 `webp_no_simd` 闸。
+/// `KIMG_WEBP_NO_SIMD=1` 强制关 WebP 全部 SIMD（对标量回退性能对照；量化 SIMD 收益）。
+/// 判定收敛到共享模块 `kimg_core::simd::gate`（CPU 特性检测 + env 主闸；env 惰性读一次 +
+/// 进程级缓存），语义与迁移前逐位一致。非 x86_64 恒 false 走标量回退。
 #[inline]
 pub(crate) fn simd_on(feature: &str) -> bool {
-    if webp_no_simd() {
-        return false;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        match feature {
-            "sse2" => is_x86_feature_detected!("sse2"),
-            "ssse3" => is_x86_feature_detected!("ssse3"),
-            "sse4.1" => is_x86_feature_detected!("sse4.1"),
-            "avx2" => is_x86_feature_detected!("avx2"),
-            // RC1 熵核双路径：`bmi2` ⇒ `bmi1` ⇒ `lzcnt`（语义安全链，`simd_on` 判定一次）。
-            "bmi2" => is_x86_feature_detected!("bmi2"),
-            _ => false,
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = feature;
-        false
-    }
+    kimg_core::simd::gate("KIMG_WEBP_NO_SIMD", feature)
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +111,7 @@ pub(crate) fn part_simd_on(part: &str, feature: &str) -> bool {
     if let Some(on) = part_override::get(part) {
         return on && simd_on(feature);
     }
-    if webp_no_simd() || part_env_off(part) {
+    if part_env_off(part) {
         return false;
     }
     // D2 环路滤波：宏块熔合 SIMD（`lf_filter_macroblock`，字节不变）默认接入生产；
@@ -154,6 +119,8 @@ pub(crate) fn part_simd_on(part: &str, feature: &str) -> bool {
     if part == "flt" && !flt_enabled() {
         return false;
     }
+    // `KIMG_WEBP_NO_SIMD` 主闸（迁移前 `webp_no_simd()`）已由 `simd_on`（＝
+    // `kimg_core::simd::gate("KIMG_WEBP_NO_SIMD", …)`）作最终一票否决，此处无需重复判定。
     simd_on(feature)
 }
 

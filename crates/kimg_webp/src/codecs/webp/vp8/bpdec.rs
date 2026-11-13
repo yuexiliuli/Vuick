@@ -8,7 +8,7 @@ use super::*;
 /// 熵 renorm 跳过开关：`KIMG_WEBP_ENT_RENORM_SKIP`（默认「开」＝启用跳过）：
 /// range≥128 时 renorm 位移恒为 0（no-op），跳过 lzcnt+shl；设 `0`/`false`/`off` 装回
 /// 无条件 renorm（同二进制 A/B 与双路径字节恒等交叉验证）。首次访问读一次 env 并缓存
-/// （同 simd.rs `webp_no_simd`/`yuv_u16_enabled` 的惰性 OnceLock 姿势，不引新依赖）。
+/// （同 `kimg_core::simd::gate` / `yuv_u16_enabled` 的惰性 OnceLock 姿势，不引新依赖）。
 /// `#[cfg(test)]` 可经 `set_renorm_skip_override` 进程内翻转（优先于 env，RC2 同窗 A/B 用）。
 #[inline]
 pub(crate) fn ent_renorm_skip() -> bool {
