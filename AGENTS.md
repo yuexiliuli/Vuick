@@ -1,8 +1,8 @@
 <!--
 REFACTORED: 2026-10-18
 STYLE: LLM Protocol Body (v3)
-LAST_AUDIT_PATCH: 2026-11-11-001
-AUDIT_PATCH: 2026-11-13-001 (沉淀 K140-K143 + 6.5 引号内嵌套战役时段账)
+LAST_AUDIT_PATCH: 2026-11-13-001
+AUDIT_PATCH: 2026-11-14-001 (沉淀 K144-K146：修复先复现禁行号派单 / K140 常态化切片闸 / 评审预算表)
 -->
 
 # AGENTS.md（LLM 执行协议 v3）
@@ -374,6 +374,9 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | K141 | **交付硬闸 = `cargo build --bin <app>` 真 `Finished`，check/test 绿不算交付**（2026-11-13）：exe 被运行中 app 占用时 build 报 `拒绝访问`（os error 5）——**修复根本没进二进制，用户测的是旧版**，会白吃一整轮「问题都没解决」假返工。凡交付前必确认 build 输出 `Finished … target(s)`；`拒绝访问` → **强行关闭对应 exe 进程再重编**（`Stop-Process -Name gpui-editor -Force` / `taskkill /F /IM gpui-editor.exe`；仅杀本应用的 exe，勿动无关进程），关闭失败或用户明确要求保留窗口才提示人工关，**禁止在旧二进制上上报「已交付」**。（实证：引号表格滚动条几何修复 build 被锁失败，用户按旧二进制误判三连 bug 未解决，实际新版已修；2026-11-13 用户确认：exe 被占即强杀重编） |
 | K142 | **对「锚定内容盒原点」的既有几何机制做偏移 = 全链审计清单**（2026-11-13 引号表格真机三连）：给表格（滚动条/内容遮罩/滚动上限/命中/绘制全套锚死 `padding` 原点）加 `x_off` 缩进，只改部分 → 滚动条贴竖线、拖拽表头遮竖线、右缘被裁三个真机 bug。对策：此类改动要么全链（shape/hit/paint/hscroll/mask/scroll-range）一次性成套，要么默认「不偏移既有机制、用带/条叠加层表达」（引用带走 paint 层即可零几何风险）。呼应 K113「改一处联动全链」。（实证：三 bug → 全链统一「表格内容左缘 = padding+x_off、视口 = width−2pad−x_off」一处口径修齐） |
 | K143 | **几何/字节数学断言先注释演算再落值**（2026-11-13）：跨大文件亲为 + 脑内算字节偏移，低级错频发（parity 测试被插进 `for` 循环体变 inner item ×2、误加尾随 `}`、`列A`=4B 错算 3B、表格首格 src 3..6 vs 4..8）。对策：断言值前先写一行注释演算（字节→区间），值由演算推得非脑补；大段编辑后先 `cargo test` 编译再续。呼应 K50「主会话浑浊」。（实证：5 次断言/花括号错各吃 1 轮编译往返） |
+| K144 | **修复先复现、禁行号假设派单**（2026-11-14 UI 统一战役滚动崩溃复盘）：bug 修复第一板斧 = 落「复现测试」；主 agent 凭 panic 行号猜根因直接派修复 → 实现侧红测**不 panic**、如实回报但已白耗 1 轮 + 1 个回滚脏改（误修 shape.rs `lazy_ensure_image_size`，真根因是 `prewarm_band` 把 `&rd.borrow().theme` 直写实参、临时 Ref 跨 image 懒装载 `borrow_mut`——靠后台 diagnosis headless 复现+完整栈才钉死）。对策：**行号假设 ≠ 根因**；5 分钟复现不了 → 派「只加失败测试」的 diagnosis（红），复现红 → 才派修复（绿）；「先问用户 backtrace」优先级低于「先派复现 agent」（headless 更快）。（实证：两轮浪费 ≈10% 子 agent 轮次；诊断 agent 一条栈帧 `prewarm_band 持有外层借用者` 直接指向真因） |
+| K145 | **K140 常态化：切片粒度闸**（2026-11-14 锚卡迁移复盘）：>3 文件或跨 crate 的 general 实现 brief（如 `anchor_layer`+3 卡+守护测试整包）→ **空返**；先由主 agent 精读 3 处挂载链（3 个小 read）→ 切「一函数+一调用点」canary 一次成功。对策：此类 brief 一律先 explore 钉落点（带回逐文件映射表）→ 切 ≤1 文件 canary slice；**单文件组件（Slider/input 型）才允许整包**。呼应 K140/K58。（实证：首轮整包空返 vs 切片一轮过；music 图标 3-slice 拆分亦一路顺） |
+| K146 | **评审预算表**（2026-11-14 UI 统一战役）：独立评审只对 **交互/几何/生命周期/并发** 类值得——本轮抓出 ≥5 处真实问题（WYSIWYG 泄漏测试假绿、math 生产路径断言存疑、fullscreen 心形实心态丢失、thumb 静止淡显 diff、music root 焦点回归、跨批 tests.rs 缠结）；**纯视觉/机械**（主题裸色收编、focus_ring）实现侧自验即可，不派评审。对策：派评审前按「交互/几何/生命周期/并发 → 必评；纯视觉/机械 → 自验」预算；评审只跑 delta 断言（K42）。（实证：6 处评审轮全在刀刃上；theme 3 slice 零评审零返工） |
 
 ## 6.5 复盘附录（2026-11-13 阅读进度/WYSIWYG 战役时段账）
 
