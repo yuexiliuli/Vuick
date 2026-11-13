@@ -12,14 +12,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Bounds, Context, CursorStyle, DefiniteLength, Entity, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Render, Styled as _, Window, div, px,
+    AnyElement, Bounds, Context, DefiniteLength, Entity, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Render, Styled as _, WeakEntity, Window, div, px,
 };
 
-use super::theme;
-use super::fraction_at;
+use super::{MusicView, theme};
 use crate::player::MusicPlayer;
+use ui::{CommitMode, Slider, SliderFill};
 
 /// 进度心跳周期（ms，对齐父原 tick 250ms）：可见且播放中每拍自 notify 刷新进度/时间。
 const HEARTBEAT_MS: u64 = 250;
@@ -32,6 +31,8 @@ const SCRUB_RETARGET_MS: u64 = 60;
 pub(super) struct NpBarView {
     /// 播放器实体（唯一状态源；只读）。
     pub(super) player: Entity<MusicPlayer>,
+    /// 父视图弱柄：seek 点按把焦点交回根（Slider stop_propagation 拦了冒泡，需显式补）。
+    parent: WeakEntity<MusicView>,
     /// 本实例当前是否被父挂在树上（父 render 按 right_tab/fs_open 门控 set）。离树心跳空转。
     pub(super) visible: bool,
     /// 进度条窗口坐标盒（canvas prepaint 记录；点/拖/松手与回归断言共用）。
@@ -46,7 +47,11 @@ pub(super) struct NpBarView {
 }
 
 impl NpBarView {
-    pub(super) fn new(player: Entity<MusicPlayer>, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        player: Entity<MusicPlayer>,
+        parent: WeakEntity<MusicView>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // 进度心跳：仅可见且播放中每 ~250ms 自 notify（子视图脏 → 重画拉最新 position）。
         // 离树/暂停空转——不 notify 就不重绘（K12）。
         let weak = cx.weak_entity();
@@ -64,6 +69,7 @@ impl NpBarView {
         });
         Self {
             player,
+            parent,
             visible: false,
             np_progress: Rc::new(Cell::new(Bounds::default())),
             scrubbing: false,
@@ -86,14 +92,7 @@ impl Render for NpBarView {
             0.0
         };
         // 进度条（np_progress）——点击/拖拽 seek 状态机本视图自管。
-        let progress = self.strip_element(
-            "np-progress",
-            self.np_progress.clone(),
-            frac,
-            true,
-            None,
-            cx,
-        );
+        let progress = self.strip_element("np-progress", self.np_progress.clone(), frac, cx);
         let time_cur = crate::model::duration_str(pos);
         let time_total = crate::model::duration_str(dur);
         div().flex().flex_col()
@@ -113,141 +112,100 @@ impl Render for NpBarView {
 }
 
 impl NpBarView {
-    // ---- 可交互条（seek 进度条）：条元素 + 事件 → player（拖拽态本视图自管） ----
+    // ---- 可交互条（seek 进度条）：走自绘 `ui::Slider`（拖拽态仍本视图自管） ----
 
-    /// 构建一条可交互 seek 进度条（对齐父/bottom `strip_element` 姿势）：`bounds` 由 canvas
-    /// prepaint 记录窗口坐标盒；点按即进拖拽态并真实 seek、拖动节流跟手、松手按落点收尾，
-    /// 全部在本视图内处理并 `cx.notify()` 自己——拖动跟手不寄生动画/tick 帧。
+    /// 构建 seek 进度条（替换原自绘条，与 bottom `strip_element` 同构）：整条 16px 命中高、
+    /// 4px 圆角细轨（`bg_hover×0.6`）+ accent 实色填充（thumb=None），观感/命中与旧自绘条
+    /// 一致；`bounds` 由 Slider `on_geometry` 每帧回写窗口坐标盒（替代旧 canvas 记录，点/拖/
+    /// 松手与回归断言读法不变）。组件只回传分数事件，宿主收口（`begin_scrub`/`drag_scrub`/
+    /// `end_scrub` 保 SCRUB_RETARGET 节流 + 松手精提交）。
     fn strip_element(
         &mut self,
         id: &'static str,
         bounds: Rc<Cell<Bounds<Pixels>>>,
         fraction: f32,
-        is_seek: bool,
-        width: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let entity = cx.entity();
         let f = fraction.clamp(0.0, 1.0);
-        let fill_col = theme::accent();
-        let track_col = theme::bg_hover();
-        let mut el = div()
-            .id(id)
+        let slider = Slider::new(id)
+            .value(f)
+            .commit_mode(CommitMode::OnRelease)
+            .track_height(px(4.))
+            .track_radius(2.)
+            // 轨道底色 = 现 track（bg_hover × 0.6）；填充 = music theme::accent()（thumb=None）。
+            .track_color(theme::bg_hover().opacity(0.6))
+            .fill(SliderFill::Solid(theme::accent()))
+            .thumb(None)
+            // 每帧把真实命中盒（窗口坐标）回写 `bounds`（替代旧 canvas 记录）。
+            .on_geometry({
+                let bounds = bounds.clone();
+                move |geom, _w, _app| bounds.set(geom.bounds)
+            })
+            // seek 三阶段事件 → 宿主收口（scrubbing 进/退 + SCRUB_RETARGET 节流 + 松手补发）。
+            .on_change({
+                let entity = entity.clone();
+                move |f, w, app| entity.update(app, |this, cx| this.begin_scrub(f, w, cx))
+            })
+            .on_change_during_drag({
+                let entity = entity.clone();
+                move |f, _w, app| entity.update(app, |this, cx| this.drag_scrub(f, cx))
+            })
+            .on_commit({
+                let entity = entity.clone();
+                move |f, _w, app| entity.update(app, |this, cx| this.end_scrub(f, cx))
+            });
+        div()
             .h(px(16.))
             .relative()
-            .cursor(CursorStyle::PointingHand)
+            // debug 只读探针：Slider 用 paint_quad 自绘填充（无元素盒），回归断言靠
+            // `debug_bounds("np-progress-fill")` 读「填充宽 = f×条宽」——此处透明 div 只承载
+            // debug_selector（不绘制、无命中盒），几何与 Slider 轨同（4px 居中）。
             .child(
                 div()
+                    .debug_selector(|| "np-progress-fill".into())
                     .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .relative()
-                            .h(px(4.))
-                            .rounded(px(2.))
-                            .bg(track_col.opacity(0.6))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(DefiniteLength::Fraction(f))
-                                    .debug_selector(|| "np-progress-fill".into())
-                                    .rounded(px(2.))
-                                    .bg(fill_col),
-                            ),
-                    ),
+                    .left_0()
+                    .top(px(6.))
+                    .h(px(4.))
+                    .w(DefiniteLength::Fraction(f)),
             )
-            .child(theme::bounds_canvas(bounds.clone()));
-        if let Some(w) = width {
-            el = el.w(px(w));
-        } else {
-            el = el.flex_1();
-        }
-        let b1 = bounds.clone();
-        el = el.on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, ev, _w, cx| this.on_strip_down(is_seek, b1.clone(), ev, cx)),
-        );
-        let b2 = bounds.clone();
-        el = el.on_mouse_move(
-            cx.listener(move |this, ev, _w, cx| this.on_strip_drag(is_seek, b2.clone(), ev, cx)),
-        );
-        let b3 = bounds.clone();
-        el = el.on_mouse_up(
-            MouseButton::Left,
-            cx.listener(move |this, ev, _w, cx| this.on_strip_up(is_seek, b3.clone(), ev, cx)),
-        );
-        let b4 = bounds.clone();
-        el = el.on_mouse_up_out(
-            MouseButton::Left,
-            cx.listener(move |this, ev, _w, cx| {
-                this.on_strip_up(is_seek, b4.clone(), ev, cx)
-            }),
-        );
-        el.into_any_element()
+            .child(slider)
+            .into_any_element()
     }
 
-    fn on_strip_down(
-        &mut self,
-        is_seek: bool,
-        bounds: Rc<Cell<Bounds<Pixels>>>,
-        ev: &MouseDownEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(f) = fraction_at(&bounds, ev.position) {
-            if is_seek {
-                self.scrubbing = true;
-                self.last_scrub_retarget = Some(Instant::now());
-                // 拖拽中 position() 钉在 seek_base（显示跟手指、不随时钟漂移）。
-                self.player.update(cx, |p, cx| p.set_scrubbing(true, cx));
-            }
-            self.apply_strip(is_seek, f, cx);
+    /// 点按把焦点交回音乐根：Slider `mouse_down` 已 `stop_propagation`，点条不再冒泡到根
+    /// `on_root_mouse_down`（mod.rs 负责聚焦根）——仅当根未持焦时 space/方向键全局快捷键
+    /// 会失效。此处补回与旧冒泡等价的聚焦路径（对齐 bottom 条；只加回焦点一拍）。
+    fn focus_music_root(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(root) = self.parent.upgrade() {
+            cx.focus_view(&root, window);
         }
     }
 
-    fn on_strip_drag(
-        &mut self,
-        is_seek: bool,
-        bounds: Rc<Cell<Bounds<Pixels>>>,
-        ev: &MouseMoveEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if !ev.dragging() {
-            // 已松开但 mouse_up 未送达本条（如拖出窗外释放）→ 按最后锁定落点收尾。
-            if self.scrubbing {
-                self.end_strip_scrub(cx);
-            }
-            return;
-        }
-        if let Some(f) = fraction_at(&bounds, ev.position) {
-            if is_seek && self.scrubbing {
-                self.seek_to_fraction(f, false, cx);
-            } else if !is_seek {
-                self.apply_strip(false, f, cx);
-            }
-        }
+    /// seek 点按进拖拽态 + 立即真实 seek（Slider `on_change`；原 `on_strip_down` seek 分支）。
+    fn begin_scrub(&mut self, f: f32, window: &mut Window, cx: &mut Context<Self>) {
+        // 补回根聚焦（Slider 拦了冒泡；点按即把焦点交回根）。
+        self.focus_music_root(window, cx);
+        self.scrubbing = true;
+        self.last_scrub_retarget = Some(Instant::now());
+        // 拖拽中 position() 钉在 seek_base（显示跟手指、不随时钟漂移）。
+        self.player.update(cx, |p, cx| p.set_scrubbing(true, cx));
+        self.seek_to_fraction(f, true, cx);
     }
 
-    /// 进度条松手收尾（窗口内 `on_mouse_up` / 拖出窗外 `on_mouse_up_out` 共用）：
-    /// 窗口内优先用松手位置的精确分数刷新落点；窗外（fraction_at None）沿用最后锁定落点。
-    fn on_strip_up(
-        &mut self,
-        is_seek: bool,
-        bounds: Rc<Cell<Bounds<Pixels>>>,
-        ev: &MouseUpEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if !is_seek || !self.scrubbing {
-            return;
-        }
-        if let Some(f) = fraction_at(&bounds, ev.position) {
-            let dur = self.player.read(cx).duration();
-            self.scrub_target = dur * f as f64;
-        }
+    /// seek 拖拽 move：节流真实 seek、节流窗内 set_seek_base 跟手（Slider
+    /// `on_change_during_drag`；原 `on_strip_drag` seek 分支）。
+    fn drag_scrub(&mut self, f: f32, cx: &mut Context<Self>) {
+        self.seek_to_fraction(f, false, cx);
+    }
+
+    /// seek 松手精提交：按松手点精确分数更新落点（窗外沿用最后锁定落点——Slider 把 f 算成
+    /// 精确/锁定分数），再补发末次精提交（Slider `on_commit`；原 `on_strip_up` +
+    /// `end_strip_scrub`）。
+    fn end_scrub(&mut self, f: f32, cx: &mut Context<Self>) {
+        let dur = self.player.read(cx).duration();
+        self.scrub_target = dur * f as f64;
         self.end_strip_scrub(cx);
     }
 
@@ -293,12 +251,5 @@ impl NpBarView {
         }
         // 拖动/点按跟手不寄生动画/tick：由本视图自己 notify 驱动重绘。
         cx.notify();
-    }
-
-    /// 应用拖拽比例（点按入口）：进度 → 立即真实 seek 并进拖拽态。
-    fn apply_strip(&mut self, is_seek: bool, f: f32, cx: &mut Context<Self>) {
-        if is_seek {
-            self.seek_to_fraction(f, true, cx);
-        }
     }
 }

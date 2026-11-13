@@ -320,7 +320,7 @@ impl MusicView {
                 .new(|cx| lyrics::LyricsView::new(player_for_views.clone(), "lyrics-r", cx)),
             lyrics_fs: cx
                 .new(|cx| lyrics::LyricsView::new(player_for_views.clone(), "lyrics-f", cx)),
-            np_bar: cx.new(|cx| npbar::NpBarView::new(player_for_views.clone(), cx)),
+            np_bar: cx.new(|cx| npbar::NpBarView::new(player_for_views.clone(), parent_weak.clone(), cx)),
         }
     }
 
