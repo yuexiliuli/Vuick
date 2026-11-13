@@ -7,16 +7,18 @@
 //!   `colors.surface/fg`（内容表面**实底**）——颜色一律走 `ui::theme` 语义 token，
 //!   组件内部零裸 rgba/hex。
 //!
-//! 可选前导色点（[`Pill::leading_dot`]，6×6 圆点，如状态栏语言徽记色点）与可选点击
-//! （[`Pill::on_click`]：挂回调即手型 cursor + click 上抛；不挂则纯展示、无 cursor、
-//! 无事件监听）。
+//! 可选前导色点（[`Pill::leading_dot`]，6×6 圆点，如状态栏语言徽记色点）与可选交互：
+//! [`Pill::on_click`]（点击上抛）/ [`Pill::on_mouse_down`]（**按下即响应**，左键，如
+//! 状态栏全屏/换行/音乐按钮）——挂其一即手型 cursor + 对应监听；不挂则纯展示、
+//! 无 cursor、无事件监听。
 
 use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, ClickEvent, CursorStyle, ElementId, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Refineable, RenderOnce, Stateful, StatefulInteractiveElement, StyleRefinement,
-    Styled, ViewElement, Window, div, prelude::FluentBuilder as _, px, relative,
+    MouseButton, MouseDownEvent, ParentElement, Refineable, RenderOnce, Stateful,
+    StatefulInteractiveElement, StyleRefinement, Styled, ViewElement, Window, div,
+    prelude::FluentBuilder as _, px, relative,
 };
 
 use crate::ui::theme::{ChromeColors, Theme};
@@ -36,6 +38,9 @@ const PILL_LABEL_GAP: f32 = 4.0;
 
 /// 点击回调别名：与 `ui::Button` 同款签名。
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+/// 鼠标按下回调别名：与 gpui `on_mouse_down` 同款签名（左键，按下即响应）。
+type MouseDownHandler = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 
 /// 元素 id → `debug_selector` 名：`ElementId::Name` 直接用；其余回退到 Debug 串
 /// （`debug_bounds` 只按 debug_selector 收录元素，见 `crates/shell` 既有备注；方法
@@ -103,6 +108,7 @@ pub struct Pill {
     leading_dot: Option<Hsla>,
     label: Option<AnyElement>,
     on_click: Option<ClickHandler>,
+    on_mouse_down: Option<MouseDownHandler>,
 }
 
 impl Pill {
@@ -119,6 +125,7 @@ impl Pill {
             leading_dot: None,
             label: None,
             on_click: None,
+            on_mouse_down: None,
         }
     }
 
@@ -154,6 +161,17 @@ impl Pill {
         self.on_click = Some(Rc::new(handler));
         self
     }
+
+    /// 注册鼠标**按下**回调（左键，按下即响应，不等点击抬起——状态栏全屏/换行/音乐
+    /// 等「按下即切换」按钮的时序；K2：时序变了=行为回归）。可交互 → 手型 cursor +
+    /// mouse_down 上抛；不调则无按下响应。
+    pub fn on_mouse_down(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_mouse_down = Some(Rc::new(handler));
+        self
+    }
 }
 
 impl Styled for Pill {
@@ -169,6 +187,7 @@ impl RenderOnce for Pill {
         let (bg, fg) = self.tone.colors(&theme, &chrome);
         let (text_size, height) = self.size.profile();
         let on_click = self.on_click;
+        let mouse_down = self.on_mouse_down;
         let caller_style = self.style.clone();
         let leading_dot = self.leading_dot;
         let label = self.label;
@@ -192,11 +211,18 @@ impl RenderOnce for Pill {
             PillSize::Sm => root.rounded_sm(),
             PillSize::Md => root.rounded_md(),
         };
-        // 可交互（挂 on_click）才给手型 cursor + click 监听；纯展示无 cursor 无监听
-        //（cursor 与监听同一门控，headless 无法读光标样式，行为断言见 tests）。
+        // 可交互（挂 on_click 或 on_mouse_down 任一）才给手型 cursor + 对应监听；
+        // 纯展示无 cursor 无监听（cursor 与监听同一门控，headless 无法读光标样式，
+        // 行为断言见 tests）。
+        let interactive = on_click.is_some() || mouse_down.is_some();
+        root = root.when(interactive, |this| this.cursor(CursorStyle::PointingHand));
+        root = root.when_some(mouse_down, |this, cb| {
+            this.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                cb(event, window, cx)
+            })
+        });
         root = root.when_some(on_click, |this, cb| {
-            this.cursor(CursorStyle::PointingHand)
-                .on_click(move |event, window, cx| cb(event, window, cx))
+            this.on_click(move |event, window, cx| cb(event, window, cx))
         });
         // 前导色点（6×6 圆点，debug_selector = "<pill id>::dot" 供定位）。
         if let Some(dot) = leading_dot {
@@ -231,13 +257,15 @@ impl IntoElement for Pill {
 mod tests {
     use super::*;
     use gpui::{
-        Context, Modifiers, Render, TestAppContext, VisualTestContext,
+        Context, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext,
     };
     use std::{cell::Cell, rc::Rc};
 
     struct Harness {
         /// pill-sm 是否挂 on_click（可交互）。
         interactive: bool,
+        /// pill-sm 是否挂 on_mouse_down（按下即响应；优先于 on_click 分支）。
+        press: bool,
         /// pill-sm 是否带前导色点（带点同时渲染无点对照 pill-plain）。
         with_dot: bool,
         clicks: Rc<Cell<usize>>,
@@ -253,7 +281,9 @@ mod tests {
             if self.with_dot {
                 sm = sm.leading_dot(gpui::hsla(0.60, 0.60, 0.90, 1.0));
             }
-            let sm = if self.interactive {
+            let sm = if self.press {
+                sm.on_mouse_down(move |_, _, _| clicks.set(clicks.get() + 1))
+            } else if self.interactive {
                 sm.on_click(move |_, _, _| clicks.set(clicks.get() + 1))
             } else {
                 sm
@@ -297,7 +327,26 @@ mod tests {
             let clicks = clicks.clone();
             move |_, _| Harness {
                 interactive,
+                press: false,
                 with_dot,
+                clicks,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, clicks)
+    }
+
+    /// 按下即响应（on_mouse_down）夹具。
+    fn press_harness(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<Cell<usize>>) {
+        let clicks = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let clicks = clicks.clone();
+            move |_, _| Harness {
+                interactive: false,
+                press: true,
+                with_dot: false,
                 clicks,
             }
         });
@@ -394,5 +443,19 @@ mod tests {
         let sm = cx.debug_bounds("pill-sm").expect("pill-sm 应在场");
         cx.simulate_click(sm.center(), Modifiers::default());
         assert_eq!(clicks.get(), 0, "纯展示 pill 应无 cursor 相关监听、点击无动作");
+    }
+
+    /// on_mouse_down：鼠标**按下**（down）即触发回调，无需等 mouse_up/click 抬起——
+    /// 与状态栏全屏/换行/音乐钮「按下即响应」时序一致（K2：时序变了=行为回归）。
+    #[gpui::test]
+    fn mouse_down_fires_on_press(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (cx, presses) = press_harness(cx);
+        let sm = cx.debug_bounds("pill-sm").expect("pill-sm 应在场");
+        cx.simulate_mouse_down(sm.center(), MouseButton::Left, Default::default());
+        assert_eq!(presses.get(), 1, "按下即应触发 on_mouse_down（不等点击抬起）");
+        // 抬起不二次触发：仅按下计一次（on_click 未挂，无点击重复计数）。
+        cx.simulate_mouse_up(sm.center(), MouseButton::Left, Default::default());
+        assert_eq!(presses.get(), 1, "抬起不应重复触发回调");
     }
 }

@@ -24,8 +24,9 @@ fn status_section_divider(color: gpui::Hsla) -> gpui::Div {
         .bg(color)
 }
 
-/// 状态栏内带底色小部件（语言徽标 / 全屏 / 换行按钮）统一高度（px）：
-/// 跟随 `STATUS_BAR_H` 收缩（上下各留 2px 内边距 + 12px 下限），保证底色不溢出状态栏。
+/// 状态栏右侧带底 pill（全屏/换行/音乐按钮）目标高度（px）：`ui::Pill` Md 档默认
+/// 22px 会在 23px 状态栏里顶满，这里按 `STATUS_BAR_H - 4 = 19` 覆写（上下各留
+/// 2px 内边距 + 12px 下限），保证底色不溢出状态栏。
 fn status_pill_h() -> f32 {
     (config::layout::STATUS_BAR_H - 4.0).max(12.0)
 }
@@ -153,25 +154,15 @@ impl EditorApp {
             .child(self.status_language_badge(&language))
     }
 
-    /// 语言徽标 pill：圆角小底（`pill_*` 令牌）+ 前端「徽记色点」
-    /// （`ui::theme::language_badge_color`，VS Code 式按语言类别着色）。
-    fn status_language_badge(&self, language: &str) -> gpui::Div {
+    /// 语言徽标 pill：`ui::Pill`（Sm/Chip 壳）＋前端「徽记色点」
+    /// （`ui::theme::language_badge_color`，VS Code 式按语言类别着色）；纯展示无点击。
+    fn status_language_badge(&self, language: &str) -> impl IntoElement {
         let dot = ui::theme::language_badge_color(language, self.model.borrow().dark_mode);
-        let owned = "status-language-badge".to_string();
-        div()
-            .debug_selector(move || owned.clone())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .h(px(status_pill_h()))
-            .rounded_sm()
-            .bg(self.chrome().pill_bg)
-            .text_size(px(11.))
-            .text_color(self.chrome().pill_fg)
-            .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(dot))
-            .child(language.to_string())
+        ui::Pill::new("status-language-badge")
+            .size(ui::PillSize::Sm)
+            .tone(ui::PillTone::Chip)
+            .leading_dot(dot)
+            .label(language.to_string())
     }
 
     /// 中间区：光标位置（编辑区 `Ln x, Col y`）或滚动位置（预览/PDF 页码）。
@@ -304,7 +295,7 @@ impl EditorApp {
         right
     }
 
-    /// 状态栏右侧「音乐」指示钮：`♪ 歌名` + 播放/暂停符号；点击切 播放/暂停
+    /// 状态栏右侧「音乐」指示钮：`♪ 歌名` + 播放/暂停符号；按下即切 播放/暂停
     ///（不切音乐模式，也不进入音乐界面）。
     fn status_music_btn(
         &self,
@@ -312,24 +303,22 @@ impl EditorApp {
         playing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
-            .id("status-music-btn")
-            .debug_selector(|| "status-music-btn".into())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .px_2()
+        ui::Pill::new("status-music-btn")
+            .size(ui::PillSize::Md)
+            .tone(ui::PillTone::Chip)
+            // Md 默认 22px 高/圆角 md 与状态栏壳不匹配，覆写回 19px + 圆角 sm（1:1 保留原壳）。
             .h(px(status_pill_h()))
             .rounded_sm()
-            .bg(self.chrome().pill_bg)
-            .text_size(px(12.))
-            .text_color(self.chrome().pill_fg)
-            .cursor(CursorStyle::PointingHand)
-            .child(if playing { "⏸ " } else { "▶ " })
-            .child(format!("♪ {title}"))
+            .label(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(if playing { "⏸ " } else { "▶ " })
+                    .child(format!("♪ {title}")),
+            )
             .on_mouse_down(
-                MouseButton::Left,
                 cx.listener(|this: &mut EditorApp, _ev, _w, cx| {
                     if let Some(mv) = &this.music {
                         mv.update(cx, |v, cx| v.toggle_play(cx));
@@ -349,48 +338,32 @@ impl EditorApp {
             .child(text.to_string())
     }
 
-    /// 状态栏右侧「全屏/还原」切换按钮（仅开启预览且非只读预览时挂载）。
+    /// 状态栏右侧「全屏/还原」切换按钮（仅开启预览且非只读预览时挂载）；按下即切换。
     fn status_fullscreen_btn(&self, fullscreen: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("status-fullscreen-btn")
-            .debug_selector(|| "status-fullscreen-btn".into())
-            .flex()
-            .flex_row()
-            .items_center()
-            .px_2()
+        ui::Pill::new("status-fullscreen-btn")
+            .size(ui::PillSize::Md)
+            .tone(ui::PillTone::Chip)
+            // Md 默认 22px 高/圆角 md 与状态栏壳不匹配，覆写回 19px + 圆角 sm（1:1 保留原壳）。
             .h(px(status_pill_h()))
             .rounded_sm()
-            .bg(self.chrome().pill_bg)
-            .text_size(px(12.))
-            .text_color(self.chrome().pill_fg)
-            .cursor(CursorStyle::PointingHand)
-            .child(if fullscreen { "还原" } else { "全屏" })
+            .label(if fullscreen { "还原" } else { "全屏" })
             .on_mouse_down(
-                MouseButton::Left,
                 cx.listener(|this: &mut EditorApp, _ev, window, cx| {
                     this.toggle_preview_fullscreen(window, cx);
                 }),
             )
     }
 
-    /// 状态栏右侧「换行/不换行」切换按钮（仅非只读预览且非 Markdown 时挂载）。
+    /// 状态栏右侧「换行/不换行」切换按钮（仅非只读预览且非 Markdown 时挂载）；按下即切换。
     fn status_wrap_btn(&self, wrap_on: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("status-wrap-btn")
-            .debug_selector(|| "status-wrap-btn".into())
-            .flex()
-            .flex_row()
-            .items_center()
-            .px_2()
+        ui::Pill::new("status-wrap-btn")
+            .size(ui::PillSize::Md)
+            .tone(ui::PillTone::Chip)
+            // Md 默认 22px 高/圆角 md 与状态栏壳不匹配，覆写回 19px + 圆角 sm（1:1 保留原壳）。
             .h(px(status_pill_h()))
             .rounded_sm()
-            .bg(self.chrome().pill_bg)
-            .text_size(px(12.))
-            .text_color(self.chrome().pill_fg)
-            .cursor(CursorStyle::PointingHand)
-            .child(if wrap_on { "换行" } else { "不换行" })
+            .label(if wrap_on { "换行" } else { "不换行" })
             .on_mouse_down(
-                MouseButton::Left,
                 cx.listener(|this: &mut EditorApp, _ev, window, cx| {
                     this.toggle_wrap(window, cx);
                 }),
