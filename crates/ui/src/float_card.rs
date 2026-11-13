@@ -5,6 +5,10 @@
 //! Acrylic/solid 底 + 双层阴影（或无）+ 圆角档 + 内边距档 + `border_1` + `colors.border`，
 //! 以及「deferred 全窗 absolute 非 flex + occlude 包裹、子 absolute 水平居中」的挂载姿势。
 //!
+//! 壳体绘制自 Batch 4b 起下沉到 [`crate::ui::card_shell`]（B02b `ui::glass_card` 共用底座）；
+//! 本模块保留公开 API（`FloatCard*` 枚举 + `float_card`）原样、内部转调 `card_shell`，
+//! 消费方（palette / recent / prompt）一行不改。
+//!
 //! # 只做壳体，禁止把卡片机制收进来
 //! 本组件**不包含** focus / on_key_down（Esc·Enter）/ on_mouse_down_out / 关闭逻辑——
 //! 各卡的这些机制不同（面板自身挂 `on_mouse_down_out` + 面板级 `on_key_down`；prompt 走
@@ -12,16 +16,20 @@
 //! 机制，本组件只替换「造型 + 挂载」这两件纯视觉差事。
 
 use gpui::{
-    div, px, AnyElement, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
-    Styled as _,
+    div, px, AnyElement, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    Pixels, Styled as _,
 };
 
+use crate::ui::card_shell::{
+    card_shell, CardShellBg, CardShellPad as ShellPad, CardShellRadius as ShellRadius,
+    CardShellShadow as ShellShadow,
+};
 use crate::ui::theme::{ColorScheme, FLOAT_ACRYLIC_ALPHA_DARK, FLOAT_ACRYLIC_ALPHA_LIGHT};
 
 /// 卡底：Acrylic 半透明玻璃材质，或调用方自供的纯色。
 #[derive(Clone, Copy, Debug)]
 pub enum FloatCardBg {
-    /// `colors.surface` 的 opacity 浮动层玻璃（亮 0.92 / 暗 0.94，theme.rs:332-333 现值）。
+    /// `colors.surface` 的 opacity 浮动层玻璃（亮 0.92 / 暗 0.94，theme.rs `FLOAT_ACRYLIC_*`）。
     Acrylic,
     /// 纯色底（WYSIWYG 等不需要分层玻璃材质的场合自供）。
     Solid(Hsla),
@@ -62,7 +70,8 @@ pub enum FloatCardPad {
 /// children 由调用方续挂；**只做壳体**（不发 enter/esc、不建房内布局、不做关闭）。
 ///
 /// `colors` / `is_dark` 由调用方从 `Theme::global(cx)` 注入（本 builder 是纯元素构造，
-/// 无 `Context` 可取全局主题）；Acrylic 透明度按 `is_dark` 取亮/暗两档现值。
+/// 无 `Context` 可取全局主题）；Acrylic 透明度按 `is_dark` 取亮/暗两档现值，随后转调
+/// [`card_shell`] 绘制（公开 API 签名不变，消费方一行不改）。
 pub fn float_card(
     colors: &ColorScheme,
     is_dark: bool,
@@ -71,37 +80,30 @@ pub fn float_card(
     radius: FloatCardRadius,
     pad: FloatCardPad,
 ) -> Div {
-    let surface: Hsla = colors.surface.into();
-    let border: Hsla = colors.border.into();
-    let mut card = div()
-        .border_1()
-        .border_color(border)
-        .bg(match bg {
-            FloatCardBg::Acrylic => surface.opacity(if is_dark {
+    card_shell(
+        colors,
+        match bg {
+            FloatCardBg::Acrylic => CardShellBg::Acrylic(if is_dark {
                 FLOAT_ACRYLIC_ALPHA_DARK
             } else {
                 FLOAT_ACRYLIC_ALPHA_LIGHT
             }),
-            FloatCardBg::Solid(color) => color,
-        });
-    card = match radius {
-        FloatCardRadius::Lg => card.rounded_lg(),
-        FloatCardRadius::Md => card.rounded_md(),
-    };
-    card = match shadow {
-        FloatCardShadow::Double => card.shadow(vec![
-            gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
-                .blur_radius(px(14.)),
-            gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
-                .blur_radius(px(4.)),
-        ]),
-        FloatCardShadow::None => card,
-    };
-    match pad {
-        FloatCardPad::None => card,
-        FloatCardPad::P(pad, gap) => card.flex().flex_col().p(pad).gap_y(gap),
-        FloatCardPad::P3 => card.flex().flex_col().p(px(16.)).gap_y(px(12.)),
-    }
+            FloatCardBg::Solid(color) => CardShellBg::Solid(color),
+        },
+        match shadow {
+            FloatCardShadow::Double => ShellShadow::Double,
+            FloatCardShadow::None => ShellShadow::None,
+        },
+        match radius {
+            FloatCardRadius::Lg => ShellRadius::Lg,
+            FloatCardRadius::Md => ShellRadius::Md,
+        },
+        match pad {
+            FloatCardPad::None => ShellPad::None,
+            FloatCardPad::P(pad, gap) => ShellPad::Pg(pad, gap),
+            FloatCardPad::P3 => ShellPad::P3,
+        },
+    )
 }
 
 /// 全窗居中挂载 helper：整层 `deferred` 独立绘制 + absolute **非 flex** 全窗包裹做水平

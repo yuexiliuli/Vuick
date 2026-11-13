@@ -105,6 +105,9 @@ pub struct ColorScheme {
     pub pressed_bg: Rgba,
     /// 拖拽/悬停强调线（分栏 splitter、侧栏右缘调宽等，亮暗 = 对应档强调色）
     pub drag_hover_border: Rgba,
+    /// 卡片/弹层投影底色（`card_shell` 阴影合成基底；亮暗一致黑色系，各层 alpha 由
+    /// `FLOAT_SHADOW_*_ALPHA` / `SINGLE_SHADOW_ALPHA` 给出，消费方经 `card_shell` 只读）
+    pub card_shadow: Rgba,
     /// 代码块背景（预览 / WYSIWYG 围栏底，明 #f5f5f5 / 暗 #262626）
     pub code_block_bg: Rgba,
     /// 行内代码（反引号）文字色（明 #202020 / 暗 #e8e8e8，近正文，靠底色+等宽区分）
@@ -176,6 +179,8 @@ impl ColorScheme {
             pressed_bg: rgba(0x00000024),
             // 分栏/调宽强调线 = 亮档强调色同源。
             drag_hover_border: rgb(0x005fb8),
+            // 卡片投影底色 = 不透明黑（原 float_card 裸 `hsla(0,0,0,α)` 收编；明暗一致）。
+            card_shadow: rgb(0x000000),
             code_block_bg: rgb(0xf5f5f5),
             code_inline_fg: rgb(0x202020),
             code_inline_bg: rgb(0xf0f0f0),
@@ -225,6 +230,8 @@ impl ColorScheme {
             pressed_bg: rgba(0xffffff3d),
             // 分栏/调宽强调线 = 暗档强调色同源。
             drag_hover_border: rgb(0x60cdff),
+            // 卡片投影底色 = 不透明黑（同亮档，原 float_card 裸 `hsla(0,0,0,α)` 收编）。
+            card_shadow: rgb(0x000000),
             code_block_bg: rgb(0x262626),
             code_inline_fg: rgb(0xe8e8e8),
             code_inline_bg: rgb(0x3a3a3a),
@@ -341,6 +348,12 @@ pub const MICA_CHROME_ALPHA_DARK: f32 = 0.82;
 /// 浮动层（菜单/通知等）自绘玻璃材质透明度（不依赖系统 acrylic）。
 pub const FLOAT_ACRYLIC_ALPHA_LIGHT: f32 = 0.92;
 pub const FLOAT_ACRYLIC_ALPHA_DARK: f32 = 0.94;
+/// 浮动卡片双层投影高层 α（palette 现值：(0,8) blur14，α0.20）。
+pub const FLOAT_SHADOW_HIGH_ALPHA: f32 = 0.20;
+/// 浮动卡片双层投影底层 α（palette 现值：(0,2) blur4，α0.14）。
+pub const FLOAT_SHADOW_PEAK_ALPHA: f32 = 0.14;
+/// 单影档 α（video hover_time 现值：(0,2) blur6，α0.16；B02b glass_card 预留）。
+pub const SINGLE_SHADOW_ALPHA: f32 = 0.16;
 
 impl ChromeColors {
     pub fn light() -> Self {

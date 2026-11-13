@@ -45,6 +45,8 @@
 
 pub mod assets;
 pub mod button;
+/// 卡片壳体绘制底层（`float_card` / B02b `glass_card` 共用底座，纯壳绘制、零裸色）。
+pub mod card_shell;
 pub mod empty_state;
 pub mod float_card;
 pub mod focus;
