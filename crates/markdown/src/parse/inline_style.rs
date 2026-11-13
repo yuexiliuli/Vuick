@@ -551,6 +551,19 @@ fn clip_runs(runs: &[TextRun], lo: usize, hi: usize) -> Vec<TextRun> {
     out
 }
 
+/// 把显示的字节偏移折到 `display` 最近的字符边界（偏下界）——**防御用**。
+/// 坐标错配（误把渲染坐标当源坐标）/ 退化映射下 `d0/d1` 可能落在多字节字符中间，
+/// 直接 `display[..d0]` 切片即 panic（P0：`end byte index … inside '能'`）。
+/// 正确调用方传源坐标时 `$`/`\` 是 ASCII、其源↔显示映射天然落在边界上，本折不影响
+/// 正确路径；纯保险让任何输入都不致崩溃。
+fn snap_to_char_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Replace each inline formula's `$…$` glyphs with an invisible spacer the caller paints the
 /// typeset image over. Takes `hidden_runs` output (`display`, `runs`, `map` — the display→source
 /// byte map of length `display.len() + 1`) and the line's `formulas` as `(source range, spacer
@@ -577,11 +590,19 @@ pub fn splice_inline_math(
         let d0 = map
             .iter()
             .position(|&s| s >= src.start)
-            .unwrap_or(display.len());
+            .unwrap_or(display.len())
+            .min(display.len());
         let d1 = map
             .iter()
             .position(|&s| s >= src.end)
-            .unwrap_or(display.len());
+            .unwrap_or(display.len())
+            .min(display.len());
+        // 防御：d0/d1 折到字符边界并保证 [d0..d1) 非短路（防止多字节字符串在中间切片
+        // 崩溃；`cursor=d1` 也必须是边界，否则下段切片起点即崩）。正确源坐标调用天然
+        // 落在边界上，本折纯保险。
+        let d0 = snap_to_char_boundary(display, d0);
+        let d1 = snap_to_char_boundary(display, d1);
+        let d0 = d0.min(d1);
         if d0 < cursor {
             continue; // overlapping / out-of-order formula — skip defensively
         }
@@ -821,6 +842,47 @@ mod tests {
         for r in inline_math_spans(line) {
             assert!(line.is_char_boundary(r.start) && line.is_char_boundary(r.end));
         }
+    }
+
+    /// P0 回归（2026-11-13）：行首带多字节（中文）+ 前导空白被剥（`trim_paragraph` /
+    /// 列表/引述/标题的 `byte_map` 都是「渲染字节 = 源字节 + off」的非恒等映射）时，
+    /// `splice_inline_math` 必须按**源坐标**定位公式区间并按字符边界切片——不得
+    /// panic。复现：源行 `" 质$x$"`（1 前导空格被剥，off=1），渲染行 `"质$x$"`，
+    /// byte_map = [1,2,3,4,5,6,7]；公式 `$x$` 源区间 4..7 → 显示区间 [3..6)（`质` 之后）。
+    /// 修复前（调用方把**渲染**坐标当源坐标传给 splice，且此处直接 `display[cursor..d0]`
+    /// 切片）d0 落进 `质`（0..3）内 → 崩溃。
+    #[test]
+    fn splice_offset_map_multibyte_source_coords() {
+        // 渲染行（前导空格已剥）与源行（含 1 前导空格）的映射。
+        let display = "质$x$"; // 质=bytes 0..3, $=3, x=4, $=5
+        let map: Vec<usize> = (0..=display.len()).map(|i| 1 + i).collect(); // off=1
+        assert_eq!(map, vec![1, 2, 3, 4, 5, 6, 7]);
+        // 公式源坐标（源行 " 质$x$"：`$` 在 4..7）。
+        let (nd, nr, nm, places) =
+            splice_inline_math(display, &[run(display.len())], &map, &[(4..7, 3)], &run(0));
+        // 显示区间 [3..6)：spacer 落在 质 之后，尾部为空。
+        assert_eq!(nd, "质   ");
+        assert_eq!(runs_len(&nr), nd.len(), "runs 仍铺满显示文本");
+        assert_eq!(places.len(), 1, "公式应有一个占位");
+        let pl = &places[0];
+        assert_eq!(pl.display_off, 3, "spacer 应从 `质` 之后（显示字节 3）开始");
+        assert_eq!(pl.source, 4..7, "source 保持公式源区间");
+        assert_eq!(*nm.last().unwrap(), 7, "哨兵 = 源段尾");
+        assert_eq!(nm.len(), nd.len() + 1, "byte_map 长度 = 显示文本长 + 1");
+    }
+
+    /// P0 防御锯齿：即使误用方把**渲染**坐标当源坐标传进来（修复前的 `splice_math_text`
+    /// 行为），`splice_inline_math` 也必须把切片端点折到字符边界，绝不 panic。
+    /// `display[cursor..d0]` 的 `d0` 若落在多字节字符中间 → `s[..end]` 崩溃（用户 P0：
+    /// 「end byte index 5 … inside '能'」），此处用 `"质$x$"` + off=1 复现同一形态
+    /// （渲染坐标 span 3..6 → 误算 d0=2 落在 `质` 内）。
+    #[test]
+    fn splice_offset_map_misuse_render_coords_never_panics() {
+        let display = "质$x$";
+        let map: Vec<usize> = (0..=display.len()).map(|i| 1 + i).collect();
+        // 渲染坐标 span 3..6（修复前调用方误传的形态）。
+        let _ = splice_inline_math(display, &[run(display.len())], &map, &[(3..6, 3)], &run(0));
+        // 到达此即算通过：任何切片都不得崩溃。
     }
 
     #[test]

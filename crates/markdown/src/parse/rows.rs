@@ -520,11 +520,17 @@ fn merge_marker_runs(
     out
 }
 
-/// 段落文本的行首/行尾修整：剥掉 ASCII 空格/Tab 与尾部空白，但**保留行首全角空格**
-/// （U+3000 在 Rust 的 `str::trim` 里也算空白——EPUB 正文首行缩进「　　」靠它实现，
-/// 不能被这里吃掉）。普通 Markdown 段落行首没有全角空格，行为与以前一致。
+/// 段落文本的行首/行尾修整：剥掉**尾部**空白，但**保留行首** ASCII 空格/Tab 与全角
+/// 空格（U+3000）。
+/// - 行首留白 = WY 行首按 Tab/空格插入的**可见缩进**（用户 P1：行首空白输入「没用」
+///   的根因——此前这里把行首 ASCII 空白剥掉，源文本有空格、渲染却不回显 → 看着没插）。
+/// - 本引擎不做 CommonMark 的「4 空格缩进代码块」：块分类只看行首符号
+///   （`#`/`-`/`>`/围栏/表格，`parse_to_rows` 先 `line.trim_start()` 再分类），
+///   行首空白不改变块语义，故放行可见也不会产生「意外代码块」。
+/// - 全角空格（U+3000）保留 += EPUB 正文首行缩进「　　」（`str::trim` 视 U+3000 为
+///   空白，此前特殊照顾，现在放行全部行首空白后语义自然覆盖）。
 pub(crate) fn trim_paragraph(line: &str) -> &str {
-    line.trim_end().trim_start_matches([' ', '\t'])
+    line.trim_end()
 }
 
 /// 一行源码 → 该行传给 [`inline_style_mapped`] 的**文本段**及其在行内的字节偏移。
@@ -541,7 +547,9 @@ pub fn text_segment(line: &str, kind: RowKind) -> Option<(usize, &str)> {
             if seg.is_empty() {
                 return None;
             }
-            Some((line.len() - line.trim_start_matches([' ', '\t']).len(), seg))
+            // 行首 blank 不再剥 → 渲染文本从源字节 0 起（off=0），byte_map 恒等；
+            // byte_map 直接把渲染位置换算回源 = 所见即所得（P1）。
+            Some((0, seg))
         }
         RowKind::Heading(_) => {
             let hashes = t.chars().take_while(|&c| c == '#').count();

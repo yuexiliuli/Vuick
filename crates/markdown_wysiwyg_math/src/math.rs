@@ -40,6 +40,12 @@ pub fn display_to_source(byte_map: &[usize], dcol: usize) -> usize {
     *byte_map.get(idx).unwrap_or(byte_map.last().unwrap_or(&0))
 }
 
+/// 源列 → 渲染列（与 `display_to_source` 互逆；与 engine `element::geom` 的
+/// `source_to_display` 同实现，host/engine 侧经各自重导出取用同口径）。
+pub fn source_to_display(byte_map: &[usize], scol: usize) -> usize {
+    byte_map.partition_point(|&b| b < scol)
+}
+
 /// 行内 `$…$` 数学：splice 后的 spacer 位置 + 要绘制的 LaTeX 文本。
 /// （不 derive Debug：`RenderImage` 未实现 `Debug`。）
 #[derive(Clone)]
@@ -135,11 +141,14 @@ pub fn splice_math_text(
         }
         // reveal-on-caret：光标严格落在 `$…$` 内（不碰定界符不算数，与块公式一致的
         // “单击停在边上、双击进去编辑”语义）→ 不 splice，显示可编辑的原始源码。
-        if let Some(c) = caret_disp
-            && c > span.start
-            && c < span.end
-        {
-            continue;
+        // `caret_disp` 是**源**列、`span` 是**渲染**坐标——恒等映射下二者重合，
+        // 前导空白被剥的行/列表/引述/标题的 byte_map 非恒等，须先转同坐标再比较
+        //（否则光标明明在公式里却判不到 reveal，P0 同源坐标错配修复）。
+        if let Some(c) = caret_disp {
+            let c_disp = source_to_display(&map, c);
+            if c_disp > span.start && c_disp < span.end {
+                continue;
+            }
         }
         let latex = inline_style::inline_math_latex(rtext, &span);
         if latex.trim().is_empty() {
@@ -190,11 +199,17 @@ pub fn splice_math_text(
         };
         if n > 0 {
             let n = n.max(1);
-            formulas.push((span.clone(), n));
-            // 源区间（绝对）：span 渲染列 → 经 byte_map 反查源列 → 加行首。
-            let src_lo = line_start + display_to_source(&map, span.start);
-            let src_hi = line_start
-                + display_to_source(&map, span.end.saturating_sub(1).max(span.start));
+            // `splice_inline_math` 的契约：`formulas` 是**源坐标**区间（byte_map 查显示
+            // 区间用）。渲染 span 须先经 byte_map 反查源列（左界 span.start、右界
+            // span.end-1 的映射 +1）再交 splice——修复前直接传渲染 span，非恒等映射
+            // 下显示端点错 off 字节、落进多字节字符中间 → 切片崩（P0）。
+            let src_lo_rel = display_to_source(&map, span.start);
+            let src_hi_rel =
+                display_to_source(&map, span.end.saturating_sub(1).max(span.start)) + 1;
+            // 源区间（绝对）：加行首 → InlineMathText 的 `source`。
+            let src_lo = line_start + src_lo_rel;
+            let src_hi = line_start + src_hi_rel - 1;
+            formulas.push((src_lo_rel..src_hi_rel, n));
             maths.push(InlineMathText {
                 display_off: 0,
                 len: n,
