@@ -3186,22 +3186,24 @@ async fn home_hot_song_columns_align_across_title_widths(cx: &mut TestAppContext
     }
 }
 
-// ---- 主区列表滚动条（自绘 overlay；参考原型 6px 圆角条；仅滚动/拖拽驱动显示，3s 自动隐藏）----
+// ---- 主区列表滚动条（迁移到 `ui::Scrollbar` Auto：滚轮/拖拽驱动显示、3s 空闲自动隐藏、
+//      点击跳页、拖出 track 跟手 clamp；可见性经组件回写快照 `main_sb_shown` 断言）----
 
-/// `#music-list` 滚轮激活 + 3s 无活动自动隐藏。滚动条「仅滚动驱动显示」：滚轮事件
-/// 刷新 `scrollbar_last_activity`; on_tick 检测「显示→隐藏」翻转才 notify。
+/// `#music-list` 滚轮激活 + 3s 无活动自动隐藏。滚动条「仅滚动驱动显示」：滚轮事件经
+/// `ui::Scrollbar`(Auto) 的滚动区滚轮监听刷新空闲计时；组件空闲定时器到点自行隐藏并
+/// notify 重绘。可见性经组件回写的 `main_sb_shown` 快照槽断言（单一事实源在组件内）。
 #[gpui::test]
 async fn main_scrollbar_shows_on_wheel_and_hides_after_3s(cx: &mut TestAppContext) {
     let player = library_with_n(cx, 200);
     let (view, mut wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
-    // 初始：无滚动活动 → 滚动条隐藏。
+    // 初始：无滚动活动 → 隐藏。
     assert!(
-        !wcx.cx.read(|app| view.read(app).scrollbar_shown_last),
+        !wcx.cx.read(|app| view.read(app).main_sb_shown.get()),
         "初始滚动条应隐藏"
     );
-    // 顶部行中心附近滚轮 → 激活显示（notify → 下一帧 shown）。
+    // 顶部行中心附近滚轮 → 激活显示（组件滚动区滚轮监听 → 下一帧 prepaint 回写可见）。
     let b0 = wcx.debug_bounds("song-row-0").expect("顶部行应物化");
     let pos = gpui::Point::new(
         px(b0.origin.x.as_f32() + 200.0),
@@ -3218,37 +3220,28 @@ async fn main_scrollbar_shows_on_wheel_and_hides_after_3s(cx: &mut TestAppContex
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
     assert!(
-        wcx.cx.read(|app| view.read(app).scrollbar_shown_last),
+        wcx.cx.read(|app| view.read(app).main_sb_shown.get()),
         "滚轮后滚动条应显示"
     );
     assert!(
-        wcx.debug_bounds("music-main-scrollbar-thumb").is_some(),
-        "显示时 thumb 应物化"
+        wcx.debug_bounds("music-main-scrollbar").is_some(),
+        "显示时 track 条应物化"
     );
-    // 滚动后 thumb 应下移（顶部 > 0）。
-    let thumb = wcx
-        .debug_bounds("music-main-scrollbar-thumb")
-        .expect("thumb 应有盒");
-    assert!(
-        thumb.origin.y.as_f32() > 0.0,
-        "滚轮滚动后 thumb 应下移，got top={:?}",
-        thumb.origin.y
-    );
-    // 3s 无滚动活动 → 自动隐藏（on_tick 检测翻转 → notify → 下一帧隐藏）。
+    // 3s 无滚动活动 → 自动隐藏（组件空闲定时器 → 隐藏 → 下一帧 prepaint 回写）。
     pump_ticks(&mut wcx, 13); // 250ms × 13 = 3250ms > 3s
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
     assert!(
-        !wcx.cx.read(|app| view.read(app).scrollbar_shown_last),
+        !wcx.cx.read(|app| view.read(app).main_sb_shown.get()),
         "3s 无滚动活动滚动条应隐藏"
     );
 }
 
-/// 内容不满可视窗 → 不渲染滚动条（track 不在树），滚轮也不显示。
+/// 内容不满可视窗 → 不渲染滚动条（track 不在树，组件未被装配），滚轮也不显示。
 #[gpui::test]
 async fn main_scrollbar_not_shown_when_content_fits(cx: &mut TestAppContext) {
     let player = library_with_n(cx, 5);
-    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
     // 放大窗口保证内容总高 < 可视窗高。
     wcx.simulate_resize(gpui::size(px(1600.), px(1200.)));
     wcx.update(|window, app| window.draw(app).clear(app));
@@ -3256,6 +3249,10 @@ async fn main_scrollbar_not_shown_when_content_fits(cx: &mut TestAppContext) {
     assert!(
         wcx.debug_bounds("music-main-scrollbar").is_none(),
         "内容不满可视窗不应渲染滚动条 track"
+    );
+    assert!(
+        !wcx.cx.read(|app| view.read(app).main_sb_shown.get()),
+        "内容不满可视窗 → 可见快照应为隐藏"
     );
     let b0 = wcx.debug_bounds("song-row-0").expect("顶部行应物化");
     let pos = gpui::Point::new(
@@ -3278,8 +3275,9 @@ async fn main_scrollbar_not_shown_when_content_fits(cx: &mut TestAppContext) {
     );
 }
 
-/// thumb 拖拽定位：track 上按下 → 跳转；拖到 50% 比例 → offset ≈ 中间（按
-/// `(total - viewport) * 0.5` 反算、容差 0.6px）。拖拽 = 滚动活动，dragging 期间保持显示。
+/// thumb 拖拽定位：滚轮激活后**按在 thumb 上**（`ui::Scrollbar` 只对 thumb-grab 起拖拽）
+/// → 拖到 60% 比例 → offset ≈ `-(0.6 * 量程)`（组件拖拽写回公式）；拖拽 = 滚动活动，
+/// 松手后活动时间已刷新 → 仍保持显示。
 #[gpui::test]
 async fn main_scrollbar_thumb_drag_seeks_list(cx: &mut TestAppContext) {
     use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, point};
@@ -3304,32 +3302,43 @@ async fn main_scrollbar_thumb_drag_seeks_list(cx: &mut TestAppContext) {
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
     assert!(
-        wcx.cx.read(|app| view.read(app).scrollbar_shown_last),
+        wcx.cx.read(|app| view.read(app).main_sb_shown.get()),
         "滚轮后应显示"
     );
     let track = wcx
         .debug_bounds("music-main-scrollbar")
         .expect("track 应物化");
-    let (viewport, total) = wcx.cx.read(|app| {
+    let (viewport, total, off0) = wcx.cx.read(|app| {
         let v = view.read(app);
         let home = v
             .main_list_cache
             .get(&(MainSection::Home, String::new()))
             .map(|(_rev, l)| l.clone())
             .expect("Home 列表应在缓存");
-        (v.main_scroll.bounds().size.height.as_f32(), home.total_h())
+        (
+            v.main_scroll.bounds().size.height.as_f32(),
+            home.total_h(),
+            v.main_scroll.offset().y.as_f32(),
+        )
     });
     let max_scroll = (total - viewport).max(0.0);
-    let thumb_h = (viewport * viewport / total)
-        .max(24.0)
-        .min(viewport);
-    let roll = (viewport - thumb_h).max(1.0);
+    // 按组件 geom 公式反算 thumb 命中盒（raw 滑块长 = max(视口占比, thumb_min=32 原始长)
+    // → 两端各缩 4px inset 得命中长；painted 最小高 = 32−8 = 24）。
+    let raw = (viewport * viewport / total).max(32.0).min(viewport);
+    let travel = (viewport - raw).max(0.0);
+    let frac = if max_scroll > 0.0 {
+        (-off0 / max_scroll).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let start = travel * frac;
+    let hit_len = (raw - 8.0).max(0.0);
+    let top_rel = 4.0 + start;
     let x = track.origin.x.as_f32() + track.size.width.as_f32() / 2.0;
-    // 按下在「middle 对应的 track y」：offset 精确 = -0.5 * max_scroll。
-    let y_mid = track.origin.y.as_f32() + thumb_h / 2.0 + 0.5 * roll;
-    let pos_mid = point(px(x), px(y_mid));
+    // 按在 thumb 中心 → 起拖拽（offset 原地不变）。
+    let y_thumb = track.origin.y.as_f32() + top_rel + hit_len / 2.0;
     wcx.simulate_event(MouseDownEvent {
-        position: pos_mid,
+        position: point(px(x), px(y_thumb)),
         modifiers: Modifiers::default(),
         button: MouseButton::Left,
         click_count: 1,
@@ -3338,36 +3347,28 @@ async fn main_scrollbar_thumb_drag_seeks_list(cx: &mut TestAppContext) {
     wcx.run_until_parked();
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
-    let off_mid = wcx
-        .cx
-        .read(|app| view.read(app).main_scroll.offset().y.as_f32());
-    assert!(
-        (off_mid - -(0.5 * max_scroll)).abs() < 0.6,
-        "thumb 拖到中部 offset 应≈ -0.5×量程：off={off_mid} expect={}",
-        -0.5 * max_scroll
-    );
-    // 拖到 25%（higher）→ offset 负幅变小（向上）。
-    let y_q = track.origin.y.as_f32() + thumb_h / 2.0 + 0.25 * roll;
-    let pos_q = point(px(x), px(y_q));
+    // 拖到 60% 比例的 track y（组件拖拽写回：pct=(pos-grab-origin)/denom，denom=viewport-hit_len）。
+    let y60 = track.origin.y.as_f32() + hit_len / 2.0 + 0.6 * (viewport - hit_len);
+    let pos60 = point(px(x), px(y60));
     wcx.simulate_event(MouseMoveEvent {
-        position: pos_q,
+        position: pos60,
         modifiers: Modifiers::default(),
         pressed_button: Some(MouseButton::Left),
     });
     wcx.run_until_parked();
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
-    let off_q = wcx
+    let off60 = wcx
         .cx
         .read(|app| view.read(app).main_scroll.offset().y.as_f32());
     assert!(
-        (off_q - -(0.25 * max_scroll)).abs() < 0.6,
-        "thumb 拖到 25% offset 应≈ -0.25×量程：off={off_q} expect={}",
-        -0.25 * max_scroll
+        (off60 - -(0.6 * max_scroll)).abs() < 1.0,
+        "thumb 拖到 60% offset 应≈ -0.6×量程：off={off60} expect={}",
+        -0.6 * max_scroll
     );
-    // 松手 → 拖拽结束（dragging=false，但活动时间刷新 → 仍保持显示、不立即隐藏）。
+    // 松手 → 拖拽结束（mouseup 刷新活动时间 → 仍保持显示、不立即隐藏）。
     wcx.simulate_event(MouseUpEvent {
-        position: pos_q,
+        position: pos60,
         modifiers: Modifiers::default(),
         button: MouseButton::Left,
         click_count: 1,
@@ -3375,17 +3376,23 @@ async fn main_scrollbar_thumb_drag_seeks_list(cx: &mut TestAppContext) {
     wcx.run_until_parked();
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
-    let (dragging, shown) = wcx.cx.read(|app| {
-        let v = view.read(app);
-        (v.scrollbar_dragging, v.scrollbar_shown_last)
+    wcx.simulate_event(MouseMoveEvent {
+        position: pos60,
+        modifiers: Modifiers::default(),
+        pressed_button: None,
     });
-    assert!(!dragging, "松手后拖拽态应结束");
-    assert!(shown, "拖拽后刚刷新活动 → 仍显示");
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.cx.read(|app| view.read(app).main_sb_shown.get()),
+        "拖拽后刚刷新活动 → 仍显示"
+    );
 }
 
-/// 越界拖拽：按下 thumb 后拖到 track 之外（上方远处），move 经根 `on_mouse_move` 冒泡兜底
-/// 仍持续更新 offset（clamp 到顶 → ≈0）；在 track 外松手也能结束拖拽态（根 `on_mouse_up`）。
-/// 旧实现 move 只挂 6px 窄 track、拖出即断、回区才跳位。
+/// 越界拖拽：按上 thumb 后拖到 track 之外（上方远处）仍持续跟手更新 offset（clamp 到顶
+/// → ≈0）；在 track 外松手拖拽结束（其后 move 不再改 offset）。`ui::Scrollbar` 用 gpui 窗口
+/// 级 `on_mouse_event` 监听（非元素 hover 依赖）——拖出轨道持续派发，天然满足。
 #[gpui::test]
 async fn main_scrollbar_drag_continues_outside_track(cx: &mut TestAppContext) {
     use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, point};
@@ -3407,22 +3414,37 @@ async fn main_scrollbar_drag_continues_outside_track(cx: &mut TestAppContext) {
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
     let track = wcx.debug_bounds("music-main-scrollbar").expect("track 应物化");
-    let (viewport, total) = wcx.cx.read(|app| {
+    let (viewport, total, off0) = wcx.cx.read(|app| {
         let v = view.read(app);
         let home = v
             .main_list_cache
             .get(&(MainSection::Home, String::new()))
             .map(|(_rev, l)| l.clone())
             .expect("Home 列表应在缓存");
-        (v.main_scroll.bounds().size.height.as_f32(), home.total_h())
+        (
+            v.main_scroll.bounds().size.height.as_f32(),
+            home.total_h(),
+            v.main_scroll.offset().y.as_f32(),
+        )
     });
-    let thumb_h = (viewport * viewport / total).max(24.0).min(viewport);
-    let roll = (viewport - thumb_h).max(1.0);
+    let max_scroll = (total - viewport).max(0.0);
+    // 按组件 geom 公式反算 thumb 命中盒（raw 滑块长 = max(视口占比, thumb_min=32 原始长)
+    // → 两端各缩 4px inset 得命中长；painted 最小高 = 32−8 = 24）。
+    let raw = (viewport * viewport / total).max(32.0).min(viewport);
+    let travel = (viewport - raw).max(0.0);
+    let frac = if max_scroll > 0.0 {
+        (-off0 / max_scroll).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let start = travel * frac;
+    let hit_len = (raw - 8.0).max(0.0);
+    let top_rel = 4.0 + start;
     let x = track.origin.x.as_f32() + track.size.width.as_f32() / 2.0;
-    // 按下在 60% 处。
-    let y60 = track.origin.y.as_f32() + thumb_h / 2.0 + 0.6 * roll;
+    // 按在 thumb 中心 → 起拖拽。滚到 60% 先按下便于后续「拖出应 clamp 到顶」有明显行程。
+    let y_thumb = track.origin.y.as_f32() + top_rel + hit_len / 2.0;
     wcx.simulate_event(MouseDownEvent {
-        position: point(px(x), px(y60)),
+        position: point(px(x), px(y_thumb)),
         modifiers: Modifiers::default(),
         button: MouseButton::Left,
         click_count: 1,
@@ -3431,19 +3453,26 @@ async fn main_scrollbar_drag_continues_outside_track(cx: &mut TestAppContext) {
     wcx.run_until_parked();
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
-    assert!(
-        wcx.cx.read(|app| view.read(app).scrollbar_dragging),
-        "按下后应进入拖拽态"
-    );
+    // 拖到 60% → 向下滚（证明拖拽在生效）。
+    let y60 = track.origin.y.as_f32() + hit_len / 2.0 + 0.6 * (viewport - hit_len);
+    wcx.simulate_event(MouseMoveEvent {
+        position: point(px(x), px(y60)),
+        modifiers: Modifiers::default(),
+        pressed_button: Some(MouseButton::Left),
+    });
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
     let off60 = wcx
         .cx
         .read(|app| view.read(app).main_scroll.offset().y.as_f32());
-    assert!(off60 < -0.5, "按 60% 应滚下去：off={off60}");
-    // 拖到 track 上方（窗口内、track 之外）→ clamp 到顶：offset ≈ 0（仍跟手、不断拖）。
-    let far_top = gpui::Point::new(
-        px(x),
-        px((track.origin.y.as_f32() - 60.0).max(20.0)),
+    assert!(
+        (off60 - -(0.6 * max_scroll)).abs() < 1.0,
+        "拖到 60% 应滚下去：off={off60} expect={}",
+        -0.6 * max_scroll
     );
+    // 拖到 track 上方（窗口内、track 之外）→ 仍跟手、clamp 到顶：offset ≈ 0。
+    let far_top = gpui::Point::new(px(x), px((track.origin.y.as_f32() - 60.0).max(20.0)));
     wcx.simulate_event(MouseMoveEvent {
         position: far_top,
         modifiers: Modifiers::default(),
@@ -3459,7 +3488,7 @@ async fn main_scrollbar_drag_continues_outside_track(cx: &mut TestAppContext) {
         off_top.abs() < 0.6,
         "拖出 track 上方仍应 clamp 到顶：off_top={off_top}"
     );
-    // track 外松手 → 拖拽态结束（根 on_mouse_up 兜底）。
+    // track 外松手 → 拖拽结束：其后在同一位置的 move 不再改 offset。
     wcx.simulate_event(MouseUpEvent {
         position: far_top,
         modifiers: Modifiers::default(),
@@ -3469,30 +3498,45 @@ async fn main_scrollbar_drag_continues_outside_track(cx: &mut TestAppContext) {
     wcx.run_until_parked();
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
+    wcx.simulate_event(MouseMoveEvent {
+        position: far_top,
+        modifiers: Modifiers::default(),
+        pressed_button: None,
+    });
+    wcx.run_until_parked();
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let off_after = wcx
+        .cx
+        .read(|app| view.read(app).main_scroll.offset().y.as_f32());
     assert!(
-        !wcx.cx.read(|app| view.read(app).scrollbar_dragging),
-        "track 外松手也应结束拖拽态"
+        off_after.abs() < 0.6,
+        "track 外松手后 move 不再改 offset：off={off_after}"
     );
 }
 
-/// 滚到底（并尝试过滚）thumb 钉在 track 底部不失形：`thumb_top` clamp 到 `roll`，
-/// thumb 底缘 = viewport（旧实现 offset 过界时 thumb_top 越界画出下缘、可见长度变短）。
+/// 滚到底（并尝试过滚）量程不失真：`ui::Scrollbar.geom` 用 `thumb_end=min(start+len, viewport)`
+/// 把过滚时的 thumb 底缘钉在 viewport 底部（旧自绘实现过滚时 thumb_top 越界画出下缘、可见
+/// 长度变短——用户实测「滚到底继续滚、滚动条缩短」）。组件级几何在 `ui::scrollbar` 单测覆盖
+/// （thumb 不越 viewport），此处守住音乐侧集成：过滚后 offset 被滚动容器钳到 **-最大量程**、
+/// 滚动条仍显示（拖拽/点击量程不失真）。
 #[gpui::test]
-async fn main_scrollbar_thumb_pins_at_bottom_when_over_scrolled(cx: &mut TestAppContext) {
+async fn main_scrollbar_offset_clamps_when_over_scrolled(cx: &mut TestAppContext) {
     let player = library_with_n(cx, 200);
     let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
-    // 滚到超界底部（set_offset 超量程会被 scroll 容器钳到 -max，再补一次越界滚轮）。
-    let total_h = wcx.cx.read(|app| {
+    // 滚到超界底部（set_offset 超量程会被 scroll 容器钳到 -max，再补一次越界滚轮激活显示）。
+    let (total_h, viewport) = wcx.cx.read(|app| {
         let v = _view.read(app);
         let home = v
             .main_list_cache
             .get(&(MainSection::Home, String::new()))
             .map(|(_rev, l)| l.clone())
             .expect("Home 列表应在缓存");
-        home.total_h()
+        (home.total_h(), v.main_scroll.bounds().size.height.as_f32())
     });
+    let max_scroll = (total_h - viewport).max(0.0);
     wcx.update(|_window, app| {
         _view.update(app, |v, _| {
             v.main_scroll
@@ -3502,9 +3546,7 @@ async fn main_scrollbar_thumb_pins_at_bottom_when_over_scrolled(cx: &mut TestApp
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
     // 激活显示。
-    let b_last = wcx
-        .debug_bounds("song-row-199")
-        .expect("滚到底末行应物化");
+    let b_last = wcx.debug_bounds("song-row-199").expect("滚到底末行应物化");
     let pos = gpui::Point::new(
         px(b_last.origin.x.as_f32() + 200.0),
         px(b_last.origin.y.as_f32() + 10.0),
@@ -3520,28 +3562,16 @@ async fn main_scrollbar_thumb_pins_at_bottom_when_over_scrolled(cx: &mut TestApp
     wcx.update(|window, app| window.draw(app).clear(app));
     wcx.run_until_parked();
     assert!(
-        wcx.cx.read(|app| _view.read(app).scrollbar_shown_last),
+        wcx.cx.read(|app| _view.read(app).main_sb_shown.get()),
         "过滚后滚动条应显示"
     );
-    let track = wcx.debug_bounds("music-main-scrollbar").expect("track 应物化");
-    let thumb = wcx
-        .debug_bounds("music-main-scrollbar-thumb")
-        .expect("thumb 应物化");
-    let track_bottom = track.origin.y.as_f32() + track.size.height.as_f32();
-    let thumb_bottom = thumb.origin.y.as_f32() + thumb.size.height.as_f32();
+    let off = wcx
+        .cx
+        .read(|app| _view.read(app).main_scroll.offset().y.as_f32());
     assert!(
-        (thumb_bottom - track_bottom).abs() < 0.6,
-        "过滚后 thumb 底缘应贴 track 底（不越界缩短）：thumb_bottom={thumb_bottom} track_bottom={track_bottom}"
-    );
-    // thumb 顶 = 可见滚程末端（`roll`），不画出下缘。
-    let track_top = track.origin.y.as_f32();
-    let thumb_top_rel = thumb.origin.y.as_f32() - track_top;
-    let viewport = track.size.height.as_f32();
-    let thumb_h = thumb.size.height.as_f32();
-    let roll = (viewport - thumb_h).max(1.0);
-    assert!(
-        (thumb_top_rel - roll).abs() < 0.6,
-        "过滚后 thumb 顶应停在 roll：top={thumb_top_rel} roll={roll}"
+        (off - -max_scroll).abs() < 1.0,
+        "过滚后 offset 应被钳到最大量程：off={off} expect={}",
+        -max_scroll
     );
 }
 

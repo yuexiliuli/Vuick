@@ -3,7 +3,10 @@
 //!
 //! 行为/几何复刻 gpui-component（轨道 16px 于边缘、滑块 6px 常态 / 8px 激活、最小 48px、
 //! 点击跳转、拖拽写回 [`ScrollbarHandle::set_offset`]）。App 内全部调用点原为
-//! `ScrollbarMode::Always`，此处 Always 全量实现；`Auto` 提供「滚动后 IDLE 隐藏」的基础版。
+//! `ScrollbarMode::Always`，此处 Always 全量实现；`Auto` 提供「滚动区滚轮显示 → 空闲
+//! [`autohide`](Scrollbar::autohide) 后自隐」：活动区域取句柄滚动容器边界（列表主体滚轮
+//! 也算活动）＋组件内空闲定时器到点自行隐藏并触发重绘（mousedown/mouseup 也刷新计时，
+//! 拖拽期间 `drag_keep_visible` 保显；计时走 `background_executor().now()`，测试可精确推进）。
 //!
 //! # 视觉
 //! 滑块为胶囊形 + 轴向微渐变（玻璃质感）；悬停/拖拽时滑块由 6px 平滑放大到 8px、
@@ -38,14 +41,16 @@
 //! 跨帧拖拽/悬停状态按元素 id 存放（`use_keyed_state`），每个滚动条实例独立；默认 id 取自
 //! 调用点（`ElementId::CodeLocation`），多实例天然分开。
 
+use std::cell::Cell;
 use std::panic::Location;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ContentMask, CursorStyle, Element, ElementId, Entity, EntityId,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
     ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, Pixels, ScrollHandle,
-    ScrollWheelEvent, Size, Window, fill, linear_color_stop, linear_gradient, point, px, size,
+    ScrollWheelEvent, Size, Task, Window, fill, linear_color_stop, linear_gradient, point, px, size,
 };
 
 /// 轨道厚（垂直=宽 / 水平=高）。
@@ -190,6 +195,9 @@ struct UiState {
     present: f32,
     /// 动画推进用的上一帧时间。
     last_frame: Option<Instant>,
+    /// Auto：**一次性**空闲自隐定时器句柄（存组件状态 → 新活动到达时 drop 旧句柄 = 立即
+    /// 取消，再按 `autohide(idle)` 重排；组件/状态释放时一并取消）。
+    hide_timer: Option<Task<()>>,
 }
 
 /// 单帧几何（prepaint 计算，paint/事件闭包共用；位置/边界为 Pixel、量程为 f32 标量）。
@@ -233,6 +241,9 @@ pub struct Scrollbar<H: ScrollbarHandle + Clone> {
     drag_keep_visible: bool,
     /// 悬停/拖拽是否把滑块 6→8px 增宽（`auto_widen()`，默认 true）。
     auto_widen: bool,
+    /// 把「Auto 是否可见」回写的只读快照（`report_visible_to()`，默认 None 零开销）。
+    /// prepaint 完成 Auto 判定后写入 `!hidden`；单一事实源仍是组件内部状态，槽只作观测。
+    visible_sink: Option<Rc<Cell<bool>>>,
 }
 
 impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
@@ -251,6 +262,7 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
             hide_on_hover: true,
             drag_keep_visible: true,
             auto_widen: true,
+            visible_sink: None,
         }
     }
 
@@ -306,16 +318,25 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
         self
     }
 
+    /// 把「Auto 是否可见」（`!hidden`）回写到调用方提供的槽，供测试/调试做只读快照。
+    /// 省略（默认）零开销；槽写方向只读——调用方不得写回覆盖组件内部判定。
+    pub fn report_visible_to(mut self, sink: Rc<Cell<bool>>) -> Self {
+        self.visible_sink = Some(sink);
+        self
+    }
+
     /// `Auto` 模式隐藏判定（纯函数，便于测试）：距上次滚动 `since_last_scroll` 超
     /// `autohide_idle` 且（不满足保显条件）→ 隐藏。`None`（从未滚动）→ 隐藏。
     /// 保显条件：`hide_on_hover && hovering`、`drag_keep_visible && dragging` 任一成立即不隐藏。
     fn auto_hidden(&self, since_last_scroll: Option<Duration>, hovering: bool, dragging: bool) -> bool {
-        let Some(idle) = since_last_scroll else {
-            return true; // 从未滚动 → 隐藏
-        };
-        let over_idle = idle >= self.autohide_idle;
-        let holds = (self.hide_on_hover && hovering) || (self.drag_keep_visible && dragging);
-        over_idle && !holds
+        should_auto_hide(
+            self.autohide_idle,
+            self.hide_on_hover,
+            self.drag_keep_visible,
+            since_last_scroll,
+            hovering,
+            dragging,
+        )
     }
 
 
@@ -443,6 +464,73 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
     }
 }
 
+/// Auto 隐藏判定纯函数（与 `Scrollbar::auto_hidden` 同源；供空闲自动隐藏定时器在后台
+/// 复读当前状态，保证判据单一事实源）。`since_last_scroll=None`（从未滚动）→ 隐藏。
+fn should_auto_hide(
+    idle: Duration,
+    hide_on_hover: bool,
+    drag_keep_visible: bool,
+    since_last_scroll: Option<Duration>,
+    hovering: bool,
+    dragging: bool,
+) -> bool {
+    let Some(idle_since) = since_last_scroll else {
+        return true;
+    };
+    let over_idle = idle_since >= idle;
+    let holds = (hide_on_hover && hovering) || (drag_keep_visible && dragging);
+    over_idle && !holds
+}
+
+/// Auto：**精确空闲自隐**——每次滚动/拖拽活动都取消既有 pending 隐藏定时器（drop 旧
+/// `Task` = 立即取消，见 scheduler `Task` drop 语义）、按 `autohide(idle)` 重新排**一枚
+/// 一次性**定时器，到点即判隐并 `notify`（状态实体被当前视图 observe → 窗口重绘 → thumb
+/// 消失）。对比「固定间隔轮询」：活动落在轮询边界时旧实现隐藏延迟可达 ~2×idle（音乐旧
+/// 250ms tick ≈3s）；一次性排期最坏 = 上次活动后**精确 idle**。
+///
+/// 判据同 `should_auto_hide`（单一事实源）：`hide_on_hover=false` 时悬停不排/不刷；
+/// `drag_keep_visible=true` 拖拽期间到点不隐（定时器被消费，不重排）——由随后的
+/// mouseup / hover-out（hide_on_hover=true 才排）活动重新排期。组件/状态释放（weak
+/// 失效或句柄随实体 drop）即取消，不留悬挂任务。
+fn arm_auto_hide(
+    idle: Duration,
+    hide_on_hover: bool,
+    drag_keep_visible: bool,
+    sink: Option<Rc<Cell<bool>>>,
+    state: &Entity<UiState>,
+    cx: &mut App,
+) {
+    let weak = state.downgrade();
+    let task = cx.spawn(async move |cx| {
+        cx.background_executor().timer(idle).await;
+        let Some(ent) = weak.upgrade() else { return };
+        cx.update(|app| {
+            let s = ent.read(app);
+            // 复读用 fake 时钟对齐（与写入侧 `background_executor().now()` 同源）。
+            let now = app.background_executor().now();
+            let elapsed = s.last_scroll.map(|t| now.saturating_duration_since(t));
+            if !should_auto_hide(
+                idle,
+                hide_on_hover,
+                drag_keep_visible,
+                elapsed,
+                s.hovering,
+                s.drag_grab.is_some(),
+            ) {
+                // 拖拽/悬停按保显条件不隐：等 mouseup / hover-out 活动重新排期。
+                return;
+            }
+            ent.update(app, |s, _| s.hidden = true);
+            if let Some(sink) = &sink {
+                sink.set(false); // 让测试可在「不重绘」下直接观测到隐藏落定。
+            }
+            app.notify(ent.entity_id());
+        });
+    });
+    // 存新句柄即 drop 旧句柄（= 取消上一枚定时器）。活动比定时器快时每枚只存活 ≤ idle。
+    state.update(cx, |s, _| s.hide_timer = Some(task));
+}
+
 /// 从元素状态快照出的只读字段（避免在闭包里二次 borrow）。
 struct UiStateSnapshot {
     hovering: bool,
@@ -461,6 +549,12 @@ pub struct PrepaintState<H> {
     handle: H,
     axis: ScrollbarAxis,
     mode: ScrollbarMode,
+    /// Auto 配置参数快照（paint 监听闭包复制用）。
+    autohide_idle: Duration,
+    hide_on_hover: bool,
+    drag_keep_visible: bool,
+    /// 可见性回写槽快照（paint 闭包/自隐定时器用）。
+    visible_sink: Option<Rc<Cell<bool>>>,
     state: Entity<UiState>,
     view_id: EntityId,
 }
@@ -472,25 +566,36 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
         let mode = self.mode;
         let is_v = self.axis.is_vertical();
 
-        // 记录最近一次滚动（Auto 隐藏依据；Always 无害）。
-        window.on_mouse_event({
-            let track = self.geom.as_ref().map(|g| g.track);
+        // Auto：滚动区滚轮 → 活动 + 排队空闲自动隐藏。活动区域 = 句柄滚动容器边界
+        // （`handle.viewport_bounds()`）：音乐主列表滚轮发生在**列表主体**而非 16px 条本体，
+        // 必须按滚动区判定（列表滚轮算活动、条内滚轮亦覆盖）；滚动区外（如并排歌词区）不误
+        // 触发。Always 无隐藏依据，不注册滚轮监听（对既有 Always 调用点零行为变化）。
+        if mode == ScrollbarMode::Auto {
+            let region = self.handle.viewport_bounds();
             let state = self.state.clone();
-            move |event: &ScrollWheelEvent, phase, _window, cx| {
-                if phase.bubble()
-                    && let Some(track) = track
-                    && track.contains(&event.position)
-                {
-                    state.update(cx, |s, _| {
-                        s.last_scroll = Some(Instant::now());
-                        if mode == ScrollbarMode::Auto {
-                            s.hidden = false;
-                        }
-                    });
-                    cx.notify(view_id);
+            let autohide_idle = self.autohide_idle;
+            let hide_on_hover = self.hide_on_hover;
+            let drag_keep_visible = self.drag_keep_visible;
+            let sink = self.visible_sink.clone();
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+                if !phase.bubble() || !region.contains(&event.position) {
+                    return;
                 }
-            }
-        });
+                // 时间戳一律走 `background_executor().now()`——测试用 fake 时钟可精确推进
+                // 超时（K29/`Instant::now()` 真机在测试里推进不了）。
+                let now = cx.background_executor().now();
+                state.update(cx, |s, _| s.last_scroll = Some(now));
+                cx.notify(view_id);
+                arm_auto_hide(
+                    autohide_idle,
+                    hide_on_hover,
+                    drag_keep_visible,
+                    sink.clone(),
+                    &state,
+                    cx,
+                );
+            });
+        }
 
         let Some(geom) = &self.geom else { return };
         let geom = geom.clone();
@@ -507,6 +612,11 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
         window.on_mouse_event({
             let handle = handle.clone();
             let state = state.clone();
+            let autohide_idle = self.autohide_idle;
+            let hide_on_hover = self.hide_on_hover;
+            let drag_keep_visible = self.drag_keep_visible;
+            let mode = self.mode;
+            let sink = self.visible_sink.clone();
             move |event: &MouseDownEvent, phase, _window, cx| {
                 if !phase.bubble() || !track.contains(&event.position) {
                     return;
@@ -544,6 +654,20 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
                         handle.set_offset(point(px(target), offset.y));
                     }
                 }
+                // 按下 = 滚动活动：刷新 Auto 空闲计时（从按下载 3s）；拖拽期间 drag_keep
+                // 保显、松手后从松手时刻再计时。每次活动取消旧定时器、重排一次性新定时器。
+                if mode == ScrollbarMode::Auto {
+                    let now = cx.background_executor().now();
+                    state.update(cx, |s, _| s.last_scroll = Some(now));
+                    arm_auto_hide(
+                        autohide_idle,
+                        hide_on_hover,
+                        drag_keep_visible,
+                        sink.clone(),
+                        &state,
+                        cx,
+                    );
+                }
                 cx.notify(view_id);
             }
         });
@@ -556,11 +680,30 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
         window.on_mouse_event({
             let handle = handle.clone();
             let state = state.clone();
+            let mode = self.mode;
+            let autohide_idle = self.autohide_idle;
+            let hide_on_hover = self.hide_on_hover;
+            let drag_keep_visible = self.drag_keep_visible;
+            let sink = self.visible_sink.clone();
             move |event: &MouseMoveEvent, _phase, _window, cx| {
                 let hovered = track.contains(&event.position);
                 let mut notify = false;
 
+                // 悬停状态切换：hover 进入不排/不刷（`hide_on_hover=false` 时不参与显隐）；
+                // hover 离开且为「保显型悬停」（hide_on_hover=true）→ 把被悬停保显“跳过”
+                // 的那枚一次性定时器补排一枚（判据仍锚定既有 `last_scroll`，不刷新计时）。
+                let prev_hovering = state.read(cx).hovering;
                 state.update(cx, |s, _| s.hovering = hovered);
+                if mode == ScrollbarMode::Auto && hide_on_hover && prev_hovering && !hovered {
+                    arm_auto_hide(
+                        autohide_idle,
+                        hide_on_hover,
+                        drag_keep_visible,
+                        sink.clone(),
+                        &state,
+                        cx,
+                    );
+                }
 
                 if state.read(cx).drag_grab.is_some() {
                     cx.stop_propagation();
@@ -612,10 +755,33 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
         window.on_mouse_event({
             let handle = handle.clone();
             let state = state.clone();
+            let mode = self.mode;
+            let autohide_idle = self.autohide_idle;
+            let hide_on_hover = self.hide_on_hover;
+            let drag_keep_visible = self.drag_keep_visible;
+            let sink = self.visible_sink.clone();
             move |_event: &MouseUpEvent, phase, _window, cx| {
                 if phase.bubble() && state.read(cx).drag_grab.is_some() {
                     handle.end_drag();
-                    state.update(cx, |s, _| s.drag_grab = None);
+                    // 松手 = 活动收尾：从此刻（fake 时钟）起 3s 无新活动才隐藏（对齐旧行为——
+                    // 拖拽整段由 drag_keep 保显，结束后从这里重新计空闲并重排一次性定时器）。
+                    if mode == ScrollbarMode::Auto {
+                        let up_now = cx.background_executor().now();
+                        state.update(cx, |s, _| {
+                            s.drag_grab = None;
+                            s.last_scroll = Some(up_now);
+                        });
+                        arm_auto_hide(
+                            autohide_idle,
+                            hide_on_hover,
+                            drag_keep_visible,
+                            sink.clone(),
+                            &state,
+                            cx,
+                        );
+                    } else {
+                        state.update(cx, |s, _| s.drag_grab = None);
+                    }
                     cx.notify(view_id);
                 }
             }
@@ -692,10 +858,21 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
         // 生效，默认值 = 现状）；Always 仍走持久化的 `st.hidden`，逐位不变。
         let dragging = state.read(cx).drag_grab.is_some();
         let hidden = if self.mode == ScrollbarMode::Auto {
-            self.auto_hidden(st.last_scroll.map(|ts| ts.elapsed()), st.hovering, dragging)
+            // 计时走 fake 时钟（`background_executor().now()`）：测试可精确推进 3s 超时。
+            let now = cx.background_executor().now();
+            self.auto_hidden(
+                st.last_scroll.map(|ts| now.saturating_duration_since(ts)),
+                st.hovering,
+                dragging,
+            )
         } else {
             st.hidden
         };
+        // 回写可见快照（调用方经 `report_visible_to` 提供 Rc<Cell<bool>> 时；prepaint 已
+        // 完成 Auto 判定，此值即当前帧真实可见性）。
+        if let Some(sink) = self.visible_sink.as_ref() {
+            sink.set(!hidden);
+        }
 
         // 悬停/拖拽插值：指数平滑朝目标收敛（自驱动逐帧推进，收敛后静止）。
         let now = Instant::now();
@@ -762,6 +939,10 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
             handle: self.handle.clone(),
             axis: self.axis,
             mode: self.mode,
+            autohide_idle: self.autohide_idle,
+            hide_on_hover: self.hide_on_hover,
+            drag_keep_visible: self.drag_keep_visible,
+            visible_sink: self.visible_sink.clone(),
             state,
             view_id,
         }
@@ -834,6 +1015,7 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
 
     #[derive(Clone)]
     struct FakeHandle {
@@ -1126,5 +1308,79 @@ mod tests {
         assert!(sb.hide_on_hover, "默认 hover 保显");
         assert!(sb.drag_keep_visible, "默认拖拽常显");
         assert!(sb.auto_widen, "默认激活增宽");
+    }
+
+    // —— N1：精确空闲自隐时序（真实事件 + fake 时钟；验证「上次活动 + 精确 idle」，非轮询边界）——
+
+    /// 承载 Auto 滚动条的宿主视图：render 直接返回 `ui::Scrollbar`，让窗口真实装配 + 每帧
+    /// 注册窗口级事件监听（`report_visible_to` 槽回写可见性快照）。
+    struct AutoSbHost {
+        handle: FakeHandle,
+        shown: Rc<Cell<bool>>,
+        idle: Duration,
+    }
+
+    impl gpui::Render for AutoSbHost {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            Scrollbar::vertical(&self.handle)
+                .mode(ScrollbarMode::Auto)
+                .autohide(self.idle)
+                .hide_on_hover(false)
+                .drag_keep_visible(true)
+                .report_visible_to(self.shown.clone())
+        }
+    }
+
+    /// N1 回归：自隐必须「上次活动 + **精确 idle**」落定，而非固定轮询边界（活动落在轮询
+    /// 边界时旧实现在 ~2×idle 才隐藏）。autohide(3s) 下：
+    /// t=0 滚轮 → 显示；t=2.9s 再滚轮 → 仍显示（此时 t=0 那枚一次性定时器已被取消）；
+    /// t=2.9+3.0=5.9s 无活动 → **已隐藏**（若退化为轮询边界 ≈6s 则此刻仍可见）。
+    #[gpui::test]
+    async fn auto_hide_fires_exactly_idle_after_last_activity(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase};
+        let shown = Rc::new(Cell::new(false));
+        let (_, wcx) = cx.add_window_view({
+            let shown = shown.clone();
+            move |_, _| AutoSbHost {
+                handle: FakeHandle {
+                    viewport: vp(),
+                    offset: point(px(0.), px(0.)),
+                    content: size(px(200.), px(1600.)),
+                },
+                shown,
+                idle: Duration::from_secs(3),
+            }
+        });
+        let mut wcx = wcx;
+        let mut wheel = |wcx: &mut gpui::VisualTestContext| {
+            let pos = point(px(100.), px(100.)); // 在句柄滚动区（0,0,200,400）内
+            wcx.simulate_event(ScrollWheelEvent {
+                position: pos,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-60.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+            wcx.run_until_parked();
+        };
+        // 首帧：从未滚动 → 隐藏。
+        wcx.update(|window, cx| window.draw(cx).clear(cx));
+        wcx.run_until_parked();
+        assert!(!shown.get(), "初始应隐藏");
+        // t=0：滚轮 → 显示。
+        wheel(&mut wcx);
+        wcx.update(|window, cx| window.draw(cx).clear(cx));
+        wcx.run_until_parked();
+        assert!(shown.get(), "t=0 滚轮后应显示");
+        // t=2.9s：再滚轮（取消 t=0 定时器、重排）→ 仍显示。
+        wcx.executor().advance_clock(Duration::from_millis(2900));
+        wcx.run_until_parked();
+        wheel(&mut wcx);
+        wcx.update(|window, cx| window.draw(cx).clear(cx));
+        wcx.run_until_parked();
+        assert!(shown.get(), "t=2.9s 再滚轮后仍显示");
+        // t=2.9+3.0=5.9s：无活动 → 一次性定时器到点即隐（精确 3s，非轮询边界 ≈6s）。
+        wcx.executor().advance_clock(Duration::from_millis(3000));
+        wcx.run_until_parked();
+        assert!(!shown.get(), "距上次活动精确 3.0s 应已隐藏（证明非轮询边界延迟）");
     }
 }

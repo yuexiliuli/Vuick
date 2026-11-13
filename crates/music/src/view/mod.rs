@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     Anchor, App, AnyElement, Bounds, ClipboardItem, Context, Edges,
     Entity, EntityInputHandler, EventEmitter, Focusable, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit,
     ParentElement as _, Point, Pixels, Render, RenderImage, ScrollHandle, SharedString, Styled as _,
     StyledImage, TextInputConfiguration, UTF16Selection, Window,
     anchored, deferred, div, img, point, px, size,
@@ -224,18 +224,11 @@ pub struct MusicView {
     /// 主区「过滤/分组显示模型」缓存（`(分区, 搜索词)` → `(库变更计数, Rc<显示模型>)`）：
     /// 同一搜索词且 `player.mutation()` 不变则复用——消除每帧重过滤 + `Vec<Track>` 深克隆。
     main_list_cache: HashMap<(MainSection, String), (u64, Rc<main::MainList>)>,
-    // ---- 主区列表滚动条（自绘 overlay；参考 Orbitrum 原型 6px 圆角条；仅滚动/拖拽刷新）----
-    /// 最近一次滚动活动时刻（滚轮/拖拽 thumb；fake 时钟 `background_executor::now` 可控）。
-    /// None = 从未滚动（滚动条隐藏）。「鼠标移动不算动作」——列表内移动不刷新此值。
-    scrollbar_last_activity: Option<Instant>,
-    /// 滚动条 hover（换 thumb 色；不参与显隐——按「仅滚动驱动显示」契约）。
-    scrollbar_hovered: bool,
-    /// thumb 拖拽中（拖拽期间强制保持显示；鼠标 up/up_out 复位）。
-    scrollbar_dragging: bool,
-    /// 上次渲染时滚动条是否显示（on_tick 据此判定「显示→隐藏」翻转发 notify）。
-    scrollbar_shown_last: bool,
-    /// 主区列表滚动条 track 窗口坐标盒（canvas prepaint 写入；拖拽 fraction 反算用）。
-    main_sb_bounds: Rc<Cell<gpui::Bounds<gpui::Pixels>>>,
+    // ---- 主区列表滚动条（迁移到 `ui::Scrollbar` Auto；见 `main::main_scrollbar`）----
+    /// 主区列表滚动条「是否可见」**只读快照槽**：`ui::Scrollbar` 组件 prepaint 回写 `!hidden`
+    /// （Auto 判定唯一事实源在组件内，空闲自动隐藏/重绘由组件定时器驱动；本槽只作测试/
+    /// 调试观测，不回写）。
+    main_sb_shown: Rc<Cell<bool>>,
     // ---- 高频重绘热区 → 纯展示子视图（性能优化第三步）：动画 notify 只落子视图 ----
     /// 主区「当前播放行」均衡器动画子视图（动画每帧只 notify 它，不再带动父整树）。
     eq_main: Entity<widgets::EqBarsView>,
@@ -292,11 +285,7 @@ impl MusicView {
             main_scroll: ScrollHandle::new(),
             main_mix_scroll: ScrollHandle::new(),
             main_list_cache: HashMap::new(),
-            scrollbar_last_activity: None,
-            scrollbar_hovered: false,
-            scrollbar_dragging: false,
-            scrollbar_shown_last: false,
-            main_sb_bounds: Rc::new(Cell::new(gpui::Bounds::default())),
+            main_sb_shown: Rc::new(Cell::new(false)),
             eq_main: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "row-current")),
             eq_queue: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "queue-current")),
             vinyl_np: cx
@@ -513,11 +502,6 @@ impl MusicView {
         if self.player.read(cx).playing() && self.state.fs_open {
             cx.notify();
         }
-        // 主区滚动条自动隐藏：3s 无滚动活动（滚轮/拖拽 thumb）且未在拖拽 → 淡出隐藏。
-        // 只在「显示→隐藏」翻转那拍 notify（持续隐藏不通知）；鼠标移动不刷新（仅滚动驱动）。
-        if self.scrollbar_shown_last && !self.main_scrollbar_shown(cx) {
-            cx.notify();
-        }
     }
 
     // ---- 封面图像懒加载（解码在后台线程；渲染只读缓存，None 回退渐变） ----
@@ -608,31 +592,6 @@ impl MusicView {
     fn on_root_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if ev.button == MouseButton::Left {
             self.focus_handle.focus(window, cx);
-        }
-    }
-
-    /// 根冒泡兜底：主区滚动条 thumb 拖拽 move（gpui 无隐式 pointer-capture——move 只派发
-    /// hover 元素，拖出 6px 窄条就断；根 `size_full` 收所有 move，拖拽全程持续更新 offset）。
-    fn on_root_mouse_move(
-        &mut self,
-        ev: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.on_main_sb_drag_move(ev, cx);
-    }
-
-    /// 根冒泡兜底：thumb 拖拽松手（up 可能在 track 之外，track 自身收不到）→ 结束拖拽态。
-    fn on_root_mouse_up(
-        &mut self,
-        _ev: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.scrollbar_dragging {
-            self.scrollbar_dragging = false;
-            self.scrollbar_last_activity = Some(cx.background_executor().now());
-            cx.notify();
         }
     }
 
@@ -903,9 +862,7 @@ impl Render for MusicView {
             .text_color(theme::text())
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_root_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_root_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_mouse_up));
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_root_mouse_down));
         // 主界面顶层：Windows 风格标题栏（左 logo+标题、中拖动区、右三钮），真实作用于
         // 应用窗口（`window_control_area` 原生最小化/最大化/关闭 + 拖动/双击切换）。
         root = root
