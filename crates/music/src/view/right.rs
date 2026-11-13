@@ -12,7 +12,8 @@ use gpui::{
 use crate::model::RepeatMode;
 
 use super::icon::{IconView, MusicIcon};
-use super::{MusicView, RightTab, theme};
+use super::{IntoIconElement, MusicView, RightTab, theme};
+use ui::icon::{Icon, IconName};
 
 /// 右侧大封面固定边长（px），黑胶圈按比例从它派生。
 pub(super) const ART_PX: f32 = 264.0;
@@ -149,7 +150,7 @@ impl super::MusicView {
                         .items_center()
                         .justify_center()
                         .child(
-                            IconView::new(MusicIcon::Note)
+                            Icon::new(IconName::Note)
                                 .size(px(64.))
                                 .text_color(gpui::white().opacity(0.15)),
                         ),
@@ -199,7 +200,7 @@ impl super::MusicView {
                     .justify_center()
                     .gap_x(px(18.))
                     .pb(px(18.))
-                    .child(self.np_control(MusicIcon::Shuffle, 22., shuffle, "随机播放", cx))
+                    .child(self.np_control(IconName::Shuffle, 22., shuffle, "随机播放", cx))
                     .child(self.np_control(MusicIcon::Prev, 24., false, "上一首", cx))
                     .child(self.np_play_main(cx))
                     .child(self.np_control(MusicIcon::Next, 24., false, "下一首", cx))
@@ -210,27 +211,35 @@ impl super::MusicView {
                     .flex()
                     .justify_between()
                     .pb(px(16.))
-                    .child(self.extra_btn(MusicIcon::Heart, "收藏", cur_liked, "right-like", cx))
-                    .child(self.extra_btn(MusicIcon::QueueMusic, "加入队列", false, "right-que", cx))
-                    .child(self.extra_btn(MusicIcon::Share, "分享", false, "right-share", cx)),
+                    .child(
+                        self.extra_btn(
+                            if cur_liked { IconName::Heart } else { IconName::HeartBorder },
+                            "收藏",
+                            cur_liked,
+                            "right-like",
+                            cx,
+                        ),
+                    )
+                    .child(self.extra_btn(IconName::QueueMusic, "加入队列", false, "right-que", cx))
+                    .child(self.extra_btn(IconName::Share, "分享", false, "right-share", cx)),
             )
             .into_any_element()
     }
 
     /// 小控制钮（shuffle/prev/next 等）：hover 前色；active 高亮 accent。
-    fn np_control(
+    fn np_control<I: IntoIconElement>(
         &mut self,
-        icon: MusicIcon,
+        icon: I,
         size: f32,
         active: bool,
         label: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
-            match icon {
-                MusicIcon::Shuffle => this.toggle_shuffle(cx),
-                MusicIcon::Prev => this.player.update(cx, |p, cx| p.prev(cx)),
-                MusicIcon::Next => this.player.update(cx, |p, cx| p.next(cx)),
+            match label {
+                "随机播放" => this.toggle_shuffle(cx),
+                "上一首" => this.player.update(cx, |p, cx| p.prev(cx)),
+                "下一首" => this.player.update(cx, |p, cx| p.next(cx)),
                 _ => this.toast_msg(label, cx),
             }
         });
@@ -244,7 +253,7 @@ impl super::MusicView {
             .cursor(CursorStyle::PointingHand)
             .text_color(if active { theme::accent_light() } else { theme::text2() })
             .on_click(cl)
-            .child(IconView::new(icon).size(px(size - 2.)).text_color(if active {
+            .child(icon.icon_element(px(size - 2.), if active {
                 theme::accent_light()
             } else {
                 theme::text2()
@@ -272,8 +281,7 @@ impl super::MusicView {
             .child(
                 IconView::new(icon)
                     .size(px(26.))
-                    .text_color(gpui::white())
-                    .filled(true),
+                    .text_color(gpui::white()),
             )
             .into_any_element()
     }
@@ -293,7 +301,7 @@ impl super::MusicView {
             .text_color(if active { theme::accent_light() } else { theme::text2() })
             .on_click(cl)
             .child(
-                IconView::new(MusicIcon::Repeat)
+                Icon::new(IconName::Repeat)
                     .size(px(20.))
                     .text_color(if active { theme::accent_light() } else { theme::text2() }),
             )
@@ -303,7 +311,7 @@ impl super::MusicView {
     /// 附加钮（收藏/加入队列/分享），供 right / fullscreen 复用。
     pub(super) fn extra_btn(
         &mut self,
-        icon: MusicIcon,
+        icon: IconName,
         label: &'static str,
         active: bool,
         id: &'static str,
@@ -335,8 +343,7 @@ impl super::MusicView {
             .on_hover(self.hover_tip_listener(cx, id, label))
             .child(theme::bounds_canvas(self.tip_box_cell(id)))
             .child(
-                IconView::new(icon)
-                    .filled(active && matches!(icon, MusicIcon::Heart))
+                Icon::new(icon)
                     .size(px(15.))
                     .text_color(if active { theme::pink() } else { theme::text3() }),
             )
@@ -386,7 +393,7 @@ impl super::MusicView {
                                     .items_center()
                                     .justify_center()
                                     .child(
-                                        IconView::new(MusicIcon::Note)
+                                        Icon::new(IconName::Note)
                                             .size(px(17.))
                                             .text_color(gpui::white().opacity(0.4)),
                                     ),
@@ -486,7 +493,7 @@ impl super::MusicView {
                                     .items_center()
                                     .justify_center()
                                     .child(
-                                        IconView::new(MusicIcon::Note)
+                                        Icon::new(IconName::Note)
                                             .size(px(15.))
                                             .text_color(gpui::white().opacity(0.4)),
                                     ),

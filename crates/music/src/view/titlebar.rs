@@ -23,6 +23,7 @@ use gpui::{
 
 use super::icon::{IconView, MusicIcon};
 use super::theme;
+use ui::icon::{Icon, IconName};
 
 /// 标题栏高度（px）：原型 32 / shell 32，取 36（规格 36–40 下沿，容纳 46×36 三钮）。
 pub const TITLE_BAR_H: f32 = 36.0;
@@ -81,13 +82,8 @@ fn ctrl_button(window: &mut Window, cx: &mut App, kind: Ctl) -> AnyElement {
     let hovered = *hovered_s.read(cx);
     let pressed = *pressed_s.read(cx);
 
-    let icon = match kind {
-        Ctl::Minimize => MusicIcon::Minimize,
-        Ctl::Maximize => max_icon(window.is_maximized()),
-        Ctl::Close => MusicIcon::Close,
-    };
     // 图标注入色：空闲次要灰 → hover/按压 主前景（关闭钮白 ×，红底白 ×，同 shell
-    // `title_ctrl_fg`；注意 IconView 显式 `text_color` 会覆盖父级级联，必须在分支里定）。
+    // `title_ctrl_fg`；注意 IconView/ui 显式 `text_color` 会覆盖父级级联，必须在分支里定）。
     let icon_color = if hovered || pressed {
         if kind.is_close() {
             gpui::white()
@@ -96,6 +92,22 @@ fn ctrl_button(window: &mut Window, cx: &mut App, kind: Ctl) -> AnyElement {
         }
     } else {
         theme::text2()
+    };
+    // 图标组件：Minimize/Maximize/Restore 未迁（Slice2 排除项）仍走本地 IconView；Close 已迁
+    // `ui::IconName::WindowClose`（23 项之一）。三钮同尺寸 12、注入色同源。
+    let icon: AnyElement = match kind {
+        Ctl::Minimize => IconView::new(MusicIcon::Minimize)
+            .size(px(12.))
+            .text_color(icon_color)
+            .into_any_element(),
+        Ctl::Maximize => IconView::new(max_icon(window.is_maximized()))
+            .size(px(12.))
+            .text_color(icon_color)
+            .into_any_element(),
+        Ctl::Close => Icon::new(IconName::WindowClose)
+            .size(px(12.))
+            .text_color(icon_color)
+            .into_any_element(),
     };
     // 按压底优先于 hover 底（压住不放时保持按压填充，同 shell `active` 与 spring 叠加）。
     let bg = if pressed {
@@ -125,7 +137,7 @@ fn ctrl_button(window: &mut Window, cx: &mut App, kind: Ctl) -> AnyElement {
         // 原生标题钮默认箭头光标（不显式设手型）。
         .bg(bg)
         .window_control_area(kind.area())
-        .child(IconView::new(icon).size(px(12.)).text_color(icon_color))
+        .child(icon)
         .on_hover({
             let st = hovered_s.clone();
             move |hovered, _w, cx| {
@@ -180,7 +192,7 @@ pub fn render(window: &mut Window, cx: &mut App) -> AnyElement {
                 .overflow_hidden()
                 .child(theme::gradient_cover((theme::accent(), theme::pink()), 3.0))
                 .child(
-                    IconView::new(MusicIcon::Disc)
+                    Icon::new(IconName::Disc)
                         .size(px(10.))
                         .text_color(gpui::white()),
                 ),

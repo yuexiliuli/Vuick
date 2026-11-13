@@ -10,8 +10,8 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
-use super::icon::{IconView, MusicIcon};
 use super::{MainSection, MusicView, theme};
+use ui::icon::{Icon, IconName};
 
 /// 导航项行为：切换分区 / 只弹 toast（未实现功能）。
 #[derive(Clone, Copy)]
@@ -73,10 +73,9 @@ impl super::MusicView {
                             )),
                     )
                     .child(
-                        IconView::new(MusicIcon::Disc)
+                        Icon::new(IconName::Disc)
                             .size(px(20.))
-                            .text_color(gpui::white())
-                            .filled(true),
+                            .text_color(gpui::white()),
                     ),
             )
             .child(
@@ -95,7 +94,7 @@ impl super::MusicView {
         &mut self,
         title: &str,
         cx: &mut Context<Self>,
-        items: &mut Vec<(MusicIcon, &'static str, NavAction)>,
+        items: &mut Vec<(IconName, &'static str, NavAction)>,
     ) -> AnyElement {
         let mut children: Vec<AnyElement> = Vec::new();
         children.push(
@@ -122,7 +121,7 @@ impl super::MusicView {
     /// 单个导航项（含 active 高亮 + 左缘竖条）。
     fn render_nav_item(
         &mut self,
-        icon: MusicIcon,
+        icon: IconName,
         label: &'static str,
         action: NavAction,
         cx: &mut Context<Self>,
@@ -164,7 +163,7 @@ impl super::MusicView {
                     .bg(theme::accent())
                     .opacity(if active { 1.0 } else { 0.0 }),
             )
-            .child(IconView::new(icon).size(px(20.)).text_color(fg))
+            .child(Icon::new(icon).size(px(20.)).text_color(fg))
             .child(
                 div()
                     .flex_1()
@@ -177,21 +176,21 @@ impl super::MusicView {
     }
 
     /// 「菜单」组：首页（可切）/ 发现（toast）/ 音乐库（可切）/ 电台（toast，NEW 徽标省）。
-    fn nav_items_menu(&self) -> Vec<(MusicIcon, &'static str, NavAction)> {
+    fn nav_items_menu(&self) -> Vec<(IconName, &'static str, NavAction)> {
         vec![
-            (MusicIcon::Home, "首页", NavAction::Section(MainSection::Home)),
-            (MusicIcon::Explore, "发现", NavAction::ComingSoon("发现即将到来")),
-            (MusicIcon::Library, "音乐库", NavAction::Section(MainSection::Library)),
-            (MusicIcon::Radio, "电台", NavAction::ComingSoon("电台即将到来")),
+            (IconName::Home, "首页", NavAction::Section(MainSection::Home)),
+            (IconName::Explore, "发现", NavAction::ComingSoon("发现即将到来")),
+            (IconName::Library, "音乐库", NavAction::Section(MainSection::Library)),
+            (IconName::Radio, "电台", NavAction::ComingSoon("电台即将到来")),
         ]
     }
 
     /// 「我的」组：收藏（可切）/ 最近播放（可切）/ 本地下载（toast）。
-    fn nav_items_mine(&self) -> Vec<(MusicIcon, &'static str, NavAction)> {
+    fn nav_items_mine(&self) -> Vec<(IconName, &'static str, NavAction)> {
         vec![
-            (MusicIcon::Heart, "收藏", NavAction::Section(MainSection::Liked)),
-            (MusicIcon::History, "最近播放", NavAction::Section(MainSection::Recent)),
-            (MusicIcon::Download, "本地下载", NavAction::ComingSoon("本地下载即将到来")),
+            (IconName::Heart, "收藏", NavAction::Section(MainSection::Liked)),
+            (IconName::History, "最近播放", NavAction::Section(MainSection::Recent)),
+            (IconName::Download, "本地下载", NavAction::ComingSoon("本地下载即将到来")),
         ]
     }
 

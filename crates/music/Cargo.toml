@@ -12,6 +12,7 @@ libloading = { workspace = true }
 anyhow = { workspace = true }
 kimg = { workspace = true }
 config = { path = "../config" }
+ui = { path = "../ui" }
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。

@@ -21,7 +21,8 @@ use gpui::{
 use crate::model::{RepeatMode, duration_str};
 
 use super::icon::{IconView, MusicIcon};
-use super::{MusicView, theme};
+use super::{IntoIconElement, MusicView, theme};
+use ui::icon::{Icon, IconName};
 
 /// 全屏封面边长（px），黑胶圈按比例派生。
 pub(super) const FS_COVER_PX: f32 = 320.0;
@@ -115,8 +116,8 @@ impl super::MusicView {
                     .flex()
                     .items_center()
                     .gap_x(px(12.))
-                    .child(self.fs_icon_btn(MusicIcon::PlaylistAdd, "已添加到播放列表", cx))
-                    .child(self.fs_icon_btn(MusicIcon::Share, "分享链接已复制", cx)),
+                    .child(self.fs_icon_btn(IconName::PlaylistAdd, "已添加到播放列表", cx))
+                    .child(self.fs_icon_btn(IconName::Share, "分享链接已复制", cx)),
             )
             .child(
                 div()
@@ -130,7 +131,7 @@ impl super::MusicView {
                     .flex()
                     .items_center()
                     .gap_x(px(12.))
-                    .child(self.fs_icon_btn(MusicIcon::Badge, "高音质", cx))
+                    .child(self.fs_icon_btn(IconName::Badge, "高音质", cx))
                     .child(self.fs_close_btn(cx)),
             )
             .into_any_element()
@@ -139,7 +140,7 @@ impl super::MusicView {
     /// 工具条圆钮（40px，v2 悬停变亮）。
     fn fs_icon_btn(
         &mut self,
-        icon: MusicIcon,
+        icon: IconName,
         tip: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -166,7 +167,7 @@ impl super::MusicView {
             }))
             .child(theme::bounds_canvas(self.tip_box_cell(tip)))
             .child(
-                IconView::new(icon)
+                Icon::new(icon)
                     .size(px(20.))
                     .text_color(if hovered { theme::text() } else { theme::text2() }),
             )
@@ -207,7 +208,7 @@ impl super::MusicView {
             }))
             .child(theme::bounds_canvas(self.tip_box_cell("fs-close")))
             .child(
-                IconView::new(MusicIcon::FullscreenExit)
+                Icon::new(IconName::FullscreenExit)
                     .size(px(20.))
                     .text_color(if hovered {
                         gpui::hsla(5., 0.7, 0.7, 1.)
@@ -293,7 +294,7 @@ impl super::MusicView {
                         .items_center()
                         .justify_center()
                         .child(
-                            IconView::new(MusicIcon::Note)
+                            Icon::new(IconName::Note)
                                 .size(px(80.))
                                 .text_color(gpui::white().opacity(0.12)),
                         ),
@@ -481,7 +482,7 @@ impl super::MusicView {
             .justify_center()
             .gap_x(px(24.))
             .mb(px(16.))
-            .child(self.fs_ctrl(MusicIcon::Shuffle, 26., shuffle, "fs-shuffle", cx))
+            .child(self.fs_ctrl(IconName::Shuffle, 26., shuffle, "fs-shuffle", cx))
             .child(self.fs_ctrl(MusicIcon::Prev, 26., false, "fs-prev", cx))
             .child(self.fs_play_btn(cx))
             .child(self.fs_ctrl(MusicIcon::Next, 26., false, "fs-next", cx))
@@ -490,9 +491,9 @@ impl super::MusicView {
     }
 
     /// 普通控制钮（shuffle/prev/next）：active 变 accent，悬停变亮。
-    fn fs_ctrl(
+    fn fs_ctrl<I: IntoIconElement>(
         &mut self,
-        icon: MusicIcon,
+        icon: I,
         size: f32,
         active: bool,
         id: &'static str,
@@ -527,15 +528,16 @@ impl super::MusicView {
             }))
             .child(theme::bounds_canvas(self.tip_box_cell(id)))
             .child(
-                IconView::new(icon)
-                    .size(px(size))
-                    .text_color(if active {
+                icon.icon_element(
+                    px(size),
+                    if active {
                         theme::accent()
                     } else if hovered {
                         theme::text()
                     } else {
                         theme::text2()
-                    }),
+                    },
+                ),
             )
             .into_any_element()
     }
@@ -572,8 +574,7 @@ impl super::MusicView {
             .child(
                 IconView::new(icon)
                     .size(px(28.))
-                    .text_color(gpui::white())
-                    .filled(true),
+                    .text_color(gpui::white()),
             )
             .into_any_element()
     }
@@ -598,7 +599,7 @@ impl super::MusicView {
             }))
             .child(theme::bounds_canvas(self.tip_box_cell("fs-repeat")))
             .child(
-                IconView::new(MusicIcon::Repeat)
+                Icon::new(IconName::Repeat)
                     .size(px(24.))
                     .text_color(if active {
                         theme::accent()
@@ -628,19 +629,10 @@ impl super::MusicView {
                     .flex()
                     .gap_x(px(12.))
                     .child(
-                        self.fs_action(
-                            if cur_liked {
-                                MusicIcon::Heart
-                            } else {
-                                MusicIcon::HeartBorder
-                            },
-                            cur_liked,
-                            "fs-like",
-                            cx,
-                        ),
+                        self.fs_action(IconName::HeartBorder, cur_liked, "fs-like", cx),
                     )
-                    .child(self.fs_action(MusicIcon::QueueMusic, false, "fs-que", cx))
-                    .child(self.fs_action(MusicIcon::Download, false, "fs-dl", cx)),
+                    .child(self.fs_action(IconName::QueueMusic, false, "fs-que", cx))
+                    .child(self.fs_action(IconName::Download, false, "fs-dl", cx)),
             )
             .into_any_element()
     }
@@ -712,7 +704,7 @@ impl super::MusicView {
     /// 操作小钮（收藏/队列/下载）：liked 用 pink，否则 text3（悬停变亮）。
     fn fs_action(
         &mut self,
-        icon: MusicIcon,
+        icon: IconName,
         liked: bool,
         id: &'static str,
         cx: &mut Context<Self>,
@@ -757,7 +749,7 @@ impl super::MusicView {
             }))
             .child(theme::bounds_canvas(self.tip_box_cell(id)))
             .child(
-                IconView::new(icon)
+                Icon::new(icon)
                     .size(px(18.))
                     .text_color(if liked {
                         theme::pink()

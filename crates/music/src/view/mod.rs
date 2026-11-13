@@ -54,6 +54,33 @@ use gpui::AppContext as _;
 use crate::model::{RepeatMode, Track};
 use crate::player::MusicPlayer;
 
+/// 图标枚举 → 已着色/缩放元素（Slice2 迁移期桥）：本 crate 的 [`icon::MusicIcon`]（经
+/// [`icon::IconView`]）与 `ui::icon::IconName`（经 [`ui::icon::Icon`]）二者同构——供「已迁
+/// ui 的项 + 8 项仍留本地」同框渲染的 helper（bottom `bb_icon` / right `np_control` /
+/// fullscreen `fs_ctrl`）泛型化使用，调用点差异仅枚举类型。三个 helper 均仍混合两种来源
+/// （MusicIcon 剩 Play/Pause/Volume/Prev/Next + IconName），故暂保留两 impl。
+pub(super) trait IntoIconElement {
+    fn icon_element(self, size: Pixels, color: gpui::Hsla) -> AnyElement;
+}
+
+impl IntoIconElement for icon::MusicIcon {
+    fn icon_element(self, size: Pixels, color: gpui::Hsla) -> AnyElement {
+        icon::IconView::new(self)
+            .size(size)
+            .text_color(color)
+            .into_any_element()
+    }
+}
+
+impl IntoIconElement for ui::icon::IconName {
+    fn icon_element(self, size: Pixels, color: gpui::Hsla) -> AnyElement {
+        ui::icon::Icon::new(self)
+            .size(size)
+            .text_color(color)
+            .into_any_element()
+    }
+}
+
 /// 侧栏主导航分区。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum MainSection {

@@ -24,7 +24,8 @@ use crate::model::RepeatMode;
 use crate::player::MusicPlayer;
 
 use super::icon::{IconView, MusicIcon};
-use super::{MusicView, RightTab, fraction_at, theme};
+use super::{IntoIconElement, MusicView, RightTab, fraction_at, theme};
+use ui::icon::{Icon, IconName};
 
 /// 底部栏高（px）。
 pub(super) const BOTTOM_H: f32 = 80.0;
@@ -239,7 +240,7 @@ impl BottomBarView {
                     .items_center()
                     .justify_center()
                     .child(
-                        IconView::new(MusicIcon::Note)
+                        Icon::new(IconName::Note)
                             .size(px(22.))
                             .text_color(gpui::white().opacity(0.4)),
                     )
@@ -299,8 +300,7 @@ impl BottomBarView {
                         ),
                     )
                     .child(
-                        IconView::new(if liked { MusicIcon::Heart } else { MusicIcon::HeartBorder })
-                            .filled(liked)
+                        Icon::new(if liked { IconName::Heart } else { IconName::HeartBorder })
                             .size(px(18.))
                             .text_color(if liked { theme::pink() } else { theme::text3() }),
                     ),
@@ -337,7 +337,7 @@ impl BottomBarView {
                     .flex()
                     .items_center()
                     .gap_x(px(14.))
-                    .child(self.bb_icon(MusicIcon::Shuffle, 20., shuffle, "bb-shuffle", true, cx))
+                    .child(self.bb_icon(IconName::Shuffle, 20., shuffle, "bb-shuffle", true, cx))
                     .child(self.bb_icon(MusicIcon::Prev, 20., false, "bb-prev", false, cx))
                     .child(self.bb_main_btn(cx))
                     .child(self.bb_icon(MusicIcon::Next, 20., false, "bb-next", false, cx))
@@ -372,9 +372,9 @@ impl BottomBarView {
     }
 
     /// 中列小型图标钮（shuffle/prev/next）。
-    fn bb_icon(
+    fn bb_icon<I: IntoIconElement>(
         &mut self,
-        icon: MusicIcon,
+        icon: I,
         size: f32,
         active: bool,
         id: &'static str,
@@ -412,9 +412,10 @@ impl BottomBarView {
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
             .child(
-                IconView::new(icon)
-                    .size(px(size))
-                    .text_color(if active { theme::accent_light() } else { theme::text2() }),
+                icon.icon_element(
+                    px(size),
+                    if active { theme::accent_light() } else { theme::text2() },
+                ),
             );
         if let Some(t) = tip {
             let cell = self.tip_cells.get(id).cloned().unwrap_or_default();
@@ -455,7 +456,7 @@ impl BottomBarView {
                     self.tip_cells.get("bb-play").cloned().unwrap_or_default(),
                 ),
             )
-            .child(IconView::new(icon).size(px(20.)).text_color(gpui::white()).filled(true))
+            .child(IconView::new(icon).size(px(20.)).text_color(gpui::white()))
             .into_any_element()
     }
 
@@ -486,7 +487,7 @@ impl BottomBarView {
                 ),
             )
             .child(
-                IconView::new(MusicIcon::Repeat)
+                Icon::new(IconName::Repeat)
                     .size(px(18.))
                     .text_color(if active { theme::accent_light() } else { theme::text2() }),
             )
@@ -513,8 +514,8 @@ impl BottomBarView {
             .items_center()
             .justify_end()
             .gap_x(px(12.))
-            .child(self.bb_tab_toggle(MusicIcon::Lyrics, RightTab::Lyrics, "bb-lyrics", cx))
-            .child(self.bb_tab_toggle(MusicIcon::QueueMusic, RightTab::Queue, "bb-queue", cx))
+            .child(self.bb_tab_toggle(IconName::Lyrics, RightTab::Lyrics, "bb-lyrics", cx))
+            .child(self.bb_tab_toggle(IconName::QueueMusic, RightTab::Queue, "bb-queue", cx))
             .child(
                 div()
                     .flex()
@@ -547,7 +548,7 @@ impl BottomBarView {
                         ),
                     )
                     .child(
-                        IconView::new(MusicIcon::Fullscreen)
+                        Icon::new(IconName::Fullscreen)
                             .size(px(18.))
                             .text_color(theme::text2()),
                     ),
@@ -558,7 +559,7 @@ impl BottomBarView {
     /// 右列歌词/队列 tab 钮：切右侧面板 tab（回父 `set_right_tab`，父状态真变）。
     fn bb_tab_toggle(
         &mut self,
-        icon: MusicIcon,
+        icon: IconName,
         tab: RightTab,
         id: &'static str,
         cx: &mut Context<Self>,
@@ -583,7 +584,7 @@ impl BottomBarView {
             .on_hover(self.hover_listener(tip, cell.clone()))
             .child(theme::bounds_canvas(cell))
             .child(
-                IconView::new(icon)
+                Icon::new(icon)
                     .size(px(18.))
                     .text_color(if active { theme::accent_light() } else { theme::text2() }),
             )

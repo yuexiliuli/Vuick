@@ -18,8 +18,8 @@ use gpui::{
     ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _, Window, div, point, px,
 };
 
-use super::icon::{IconView, MusicIcon};
 use super::theme;
+use ui::icon::{Icon, IconName};
 use crate::player::MusicPlayer;
 
 /// 歌词固定行高（px）：滚动量程反算与行窗物化都按它——三态行统一高，便于按偏移/视口
@@ -178,7 +178,7 @@ impl LyricsView {
                 .justify_center()
                 .px(px(16.))
                 .child(
-                    IconView::new(MusicIcon::Lyrics)
+                    Icon::new(IconName::Lyrics)
                         .size(px(32.))
                         .text_color(theme::text3()),
                 )

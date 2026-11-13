@@ -29,6 +29,7 @@ use crate::model::Track;
 
 use super::icon::{IconView, MusicIcon};
 use super::{MainSection, MusicView, theme};
+use ui::icon::{Icon, IconName};
 
 /// 主区横向内边距（px，左右同值）：`#music-main` 内容区留白；overlay 滚动条用
 /// `right(-MAIN_PAD_X)` 贴主区右缘（跨过右 padding），两端共用同一常量防漂移。
@@ -183,7 +184,7 @@ fn song_thumb_div(cover: Option<Arc<RenderImage>>, (light, dark): (gpui::Hsla, g
                     .items_center()
                     .justify_center()
                     .child(
-                        IconView::new(MusicIcon::Note)
+                        Icon::new(IconName::Note)
                             .size(px(18.))
                             .text_color(gpui::white().opacity(0.5)),
                     ),
@@ -257,8 +258,8 @@ impl super::MusicView {
             .child(
                 div().flex().items_center().gap_x(px(12.))
                     .child(self.render_search_box(window, cx))
-                    .child(self.round_icon_button("music-notify", MusicIcon::Bell, "通知中心", cx))
-                    .child(self.round_icon_button("music-settings", MusicIcon::Settings, "设置", cx)),
+                    .child(self.round_icon_button("music-notify", IconName::Bell, "通知中心", cx))
+                    .child(self.round_icon_button("music-settings", IconName::Settings, "设置", cx)),
             )
             .into_any_element()
     }
@@ -302,7 +303,7 @@ impl super::MusicView {
                 }),
             )
             .on_key_down(cx.listener(Self::on_search_key))
-            .child(IconView::new(MusicIcon::Search).size(px(16.)).text_color(theme::text3()))
+            .child(Icon::new(IconName::Search).size(px(16.)).text_color(theme::text3()))
             .child(
                 div()
                     .flex_1()
@@ -366,7 +367,7 @@ impl super::MusicView {
     fn round_icon_button(
         &mut self,
         id: &'static str,
-        icon: MusicIcon,
+        icon: IconName,
         label: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -386,7 +387,7 @@ impl super::MusicView {
             .border_color(theme::border())
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
-            .child(IconView::new(icon).size(px(17.)).text_color(theme::text2()))
+            .child(Icon::new(icon).size(px(17.)).text_color(theme::text2()))
             .into_any_element()
     }
 
@@ -595,7 +596,7 @@ impl super::MusicView {
                         .items_center()
                         .justify_center()
                         .child(
-                            IconView::new(MusicIcon::Note)
+                            Icon::new(IconName::Note)
                                 .size(px(44.))
                                 .text_color(gpui::white().opacity(0.4)),
                         ),
@@ -627,8 +628,7 @@ impl super::MusicView {
                     .child(
                         IconView::new(MusicIcon::Play)
                             .size(px(20.))
-                            .text_color(gpui::white())
-                            .filled(true),
+                            .text_color(gpui::white()),
                     ),
             );
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
@@ -1129,8 +1129,7 @@ impl super::MusicView {
                     cx.stop_propagation();
                 }))
                 .child(
-                    IconView::new(if liked { MusicIcon::Heart } else { MusicIcon::HeartBorder })
-                        .filled(liked)
+                    Icon::new(if liked { IconName::Heart } else { IconName::HeartBorder })
                         .size(px(17.))
                         .text_color(if liked { theme::pink() } else { theme::text3() }),
                 ),
