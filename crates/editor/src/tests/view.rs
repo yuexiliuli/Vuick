@@ -3074,3 +3074,43 @@ fn early_line_scroll_survives_first_metrics_resolution(cx: &mut TestAppContext) 
         "首帧前滚到 47：指标准备后视口顶应仍=47（不被 px 重映射回拢）"
     );
 }
+
+#[gpui::test]
+fn hscrollbar_overlay_container_flush_to_editor_bottom(cx: &mut TestAppContext) {
+    // 结构护栏（非 TDD 复现——评审 stash 实证本量法在修复前后皆绿）：横向滚动条叠层
+    // `#ce-hscrollbar-overlay`（`absolute inset_0`，render.rs hscrollbar_overlay）必须
+    // 撑满并贴住 `#code-editor` 底边。若有人给编辑区/叠层加底部 padding、或父容器
+    // 不给足高，此护栏即红。
+    //
+    // ⚠️ 本护栏**不**测横条自身的可见贴底（滑块/轨道胶囊交叉轴底缘）——叠层底 ==
+    // 编辑区底只是该可见贴底的几何前提；横条贴底行为本身由 `ui::scrollbar` 单测
+    // `geom` 锁（水平贴底精确定位、旧几何会红）。两层各司其职，勿把本护栏当复现。
+    let text = "x".repeat(500);
+    let (host, cx) = open(cx, &text);
+
+    // 横向溢出确证：500 个 x 远超一屏（>1920px）→ 滚动条轨道几何存在（几何存在才有绘制）。
+    let wide = cx
+        .debug_bounds("ce-hscrollbar-overlay")
+        .expect("横向滚动条叠层应渲染");
+    let editor = cx.debug_bounds("code-editor").expect("编辑区应渲染");
+    assert!(
+        wide.size.width > px(0.) && wide.size.height > px(0.),
+        "叠层应撑满编辑区（{wide:?}）"
+    );
+
+    // 结构不变式：叠层（其中水平 Scrollbar 的 viewport）底缘 == 编辑区底缘。
+    let track_bottom = wide.bottom();
+    let area_bottom = editor.bottom();
+    let layout_gap = (area_bottom - track_bottom).max(px(0.));
+    eprintln!(
+        "[HSCROLL] editor.bottom={:?} overlay.bottom={:?} overlay.h={:?} editor.h={:?}",
+        area_bottom,
+        track_bottom,
+        wide.size.height,
+        editor.size.height
+    );
+    assert!(
+        layout_gap < px(1.),
+        "横向滚动条叠层底未贴编辑区底边：空隙 {layout_gap:?}"
+    );
+}

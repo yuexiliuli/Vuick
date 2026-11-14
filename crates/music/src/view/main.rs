@@ -64,8 +64,8 @@ pub(super) const HOME_EMPTY_H: f32 = 120.0;
 const VISIBLE_BUFFER: usize = 6;
 
 /// 主区列表 overlay 滚动条（[`ui::Scrollbar`] Auto）：16px 轨道条右缘贴「内容右缘 +
-/// [`MAIN_PAD_X`] + 4px」——`ui::Scrollbar` 的 thumb 常态 6px 但右内缩 4px（THUMB_INSET
-/// 语义），条右缘再 +4 才让 thumb 右缘精确落回旧自绘 6px 条位置（原观感位移契约，勿改）。
+/// [`MAIN_PAD_X`]」——`ui::Scrollbar` vertical 的 thumb 右缘贴 `track.right()`（交叉轴
+/// 无内缩，贴右缘契约），条右缘即 thumb 右缘，与旧自绘 6px 条右缘一致（防观感位移）。
 const SB_TRACK_W: f32 = 16.0;
 
 /// 主区列表滚动条 Auto 空闲隐藏延时（ms）：最后一次滚动活动（滚轮/拖拽 thumb）后 3s 无新
@@ -789,9 +789,9 @@ impl super::MusicView {
     /// 冒泡兜底退役）。参数按契约冻结：autohide 3s、thumb_min 24、hover 只换色不保显
     /// （hide_on_hover=false）、拖拽常显、激活不增宽（auto_widen=false）。
     ///
-    /// 位置契约：旧自绘 6px 条右缘 = 内容右缘 + [`MAIN_PAD_X`]；`ui::Scrollbar` 常态 6px
-    /// thumb 右内缩 4px → 16px 轨道条右缘 = 内容右缘 + `MAIN_PAD_X` + 4，thumb 视觉精确落回
-    /// 原处（禁观感位移）。内容 ≤ 视口 → 不渲染。
+    /// 位置契约：`ui::Scrollbar` vertical 贴右缘（thumb 右缘 = track.right = 条右缘），
+    /// 条右缘 = 内容右缘 + [`MAIN_PAD_X`]（跨过右 padding、无 THUMB_INSET 补偿），与旧自绘
+    /// 6px 条右缘一致（禁观感位移）。内容 ≤ 视口 → 不渲染。
     fn main_scrollbar(&mut self, list: &Rc<MainList>, _cx: &mut Context<Self>) -> AnyElement {
         let viewport = self.main_scroll.bounds().size.height.as_f32();
         if list.total_h() <= viewport {
@@ -822,7 +822,7 @@ impl super::MusicView {
             .absolute()
             .top_0()
             .bottom_0()
-            .right(px(-(MAIN_PAD_X + 4.0)))
+            .right(px(-MAIN_PAD_X))
             .w(px(SB_TRACK_W))
             .child(sb)
             .into_any_element()

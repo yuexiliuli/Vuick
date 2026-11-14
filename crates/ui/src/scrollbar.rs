@@ -400,17 +400,22 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
             )
         };
 
-        // 轨道胶囊：与轨道同轴居中、宽于激活滑块，悬停后淡入。
+        // 轨道胶囊：贴视口边缘（垂直贴右 / 水平贴底）、宽于激活滑块，悬停后淡入。
         let pill_w = px(TRACK_PILL_WIDTH);
-        let track_center = track.center();
         let track_pill = if is_v {
+            // 垂直条：轨道胶囊右缘贴住视口右缘（贴右，对称横向贴底）。此前胶囊以轨道
+            // 中线居中悬在右缘内侧 3px，真机观感=竖条与右侧边缘之间留有空隙。
             Bounds::new(
-                point(track_center.x - pill_w / 2., viewport.top()),
+                point(viewport.right() - pill_w, viewport.top()),
                 size(pill_w, viewport.size.height),
             )
         } else {
+            // 水平条：轨道胶囊底缘贴住视口底（贴底）。此前胶囊以轨道中线居中悬在
+            // 底边上方 3px，真机观感=横条与编辑区底边之间留有空隙（容器贴底护栏见
+            // `editor/tests/view.rs hscrollbar_overlay_container_flush_to_editor_bottom`；
+            // 横条交叉轴贴底以本单测锁死）。
             Bounds::new(
-                point(viewport.left(), track_center.y - pill_w / 2.),
+                point(viewport.left(), viewport.bottom() - pill_w),
                 size(viewport.size.width, pill_w),
             )
         };
@@ -460,20 +465,26 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
         // 当左上角——那是 TopRight/BottomLeft 锚的算法，会整块滑到轨道外，导致点不到滑块。
         let (thumb_hit, thumb_fill) = if is_v {
             let top = track.top() + px(THUMB_INSET + thumb_start);
-            let hit_right = track.right() - px(THUMB_INSET);
+            // 垂直条贴右（对称 K144 横向贴底）：滑块/命中区右缘贴住轨道右缘（交叉轴
+            // 不再内缩 THUMB_INSET）；`THUMB_INSET` 保留在长轴起始端（顶，行程起点
+            // 内缩，两轴对称手感不变）。
+            let hit_right = track.right();
             (
                 Bounds::new(point(hit_right - track_w, top), size(track_w, px(hit_len))),
                 Bounds::new(point(hit_right - fill_w, top), size(fill_w, px(hit_len))),
             )
         } else {
             let left = track.left() + px(THUMB_INSET + thumb_start);
+            // 水平条：滑块底缘贴住轨道/视口底（与胶囊一同贴底）。交叉轴不再从底部
+            // 内缩 THUMB_INSET（原 4px 悬空 = 用户真机「横条与编辑区底边有空隙」根因）；
+            // `THUMB_INSET` 仍保留在长轴左端（行程起点内缩，两轴对称手感不变）。
             (
                 Bounds::new(
-                    point(left, track.bottom() - px(THUMB_INSET) - track_w),
+                    point(left, track.bottom() - track_w),
                     size(px(hit_len), track_w),
                 ),
                 Bounds::new(
-                    point(left, track.bottom() - px(THUMB_INSET) - fill_w),
+                    point(left, track.bottom() - fill_w),
                     size(px(hit_len), fill_w),
                 ),
             )
@@ -1146,11 +1157,12 @@ mod tests {
         let g_hot = Scrollbar::vertical(&make(0.)).geom(vp(), 1.).expect("仍超长");
         assert_eq!(g_hot.thumb_fill.size.width, px(THUMB_ACTIVE_WIDTH));
         assert_eq!(g0.thumb_fill.size.width, px(THUMB_WIDTH));
-        // 轨道胶囊与轨道同轴居中、宽于激活滑块
+        // 轨道胶囊宽于激活滑块、长度轴铺满轨道高、交叉轴右缘贴住视口右（贴右，对称
+        // 于横向贴底；旧几何胶囊以轨道中线居中悬在右缘内侧 3px）。
         assert!(g_hot.track_pill.size.width > g_hot.thumb_fill.size.width);
         assert!(
-            (g_hot.track_pill.center().x - g_hot.track.center().x).as_f32().abs() < 0.5,
-            "轨道胶囊应居中于 16px 轨道条"
+            (g_hot.track_pill.right() - vp().right()).as_f32().abs() < 0.5,
+            "垂直轨道胶囊右缘应贴住视口右（贴右，不悬浮；对称 K144 横向贴底）"
         );
         assert_eq!(g_hot.track_pill.size.height, g_hot.track.size.height);
     }
@@ -1189,8 +1201,12 @@ mod tests {
         );
         assert!(hot.track_pill.size.width > hot.thumb_fill.size.width, "轨道胶囊宽于滑块");
         assert!(
-            (hot.track_pill.center().y - hot.track.center().y).as_f32().abs() < 0.5,
-            "水平轨道胶囊应居中于 16px 轨道条"
+            (hot.track_pill.center().x - hot.track.center().x).as_f32().abs() < 0.5,
+            "水平轨道胶囊长度轴应居中于轨道"
+        );
+        assert!(
+            (hot.track_pill.bottom() - vp().bottom()).as_f32().abs() < 0.5,
+            "水平轨道胶囊底应贴住视口底（贴底，不悬浮；见 K144 横条空隙复现）"
         );
         assert_eq!(
             hot.track_pill.size.width,
@@ -1210,20 +1226,33 @@ mod tests {
             content: size(px(200.), px(1600.)),
         };
         let gv = Scrollbar::vertical(&h).geom(vp(), 0.).expect("仍超长");
-        // 回归性质：命中/着色区必须锚在轨道**内缘**（垂直右 = track.right - inset），
-        // 不得用左上锚把 TopRight 算法整块外推出轨道右缘。
-        let v_hit_right = gv.track.right() - px(THUMB_INSET);
+        // 垂直条贴右精确钉死（对称 K144 横向贴底）：滑块/命中区右缘 == 轨道右缘
+        // （交叉轴不再内缩 THUMB_INSET）；着色区左缘 == 轨道右缘 − 滑块粗细（钉死厚度）。
+        // 同时保留左边界守卫：着色区不越轨道左界——旧 TopRight 锚会把命中区整块外推
+        // 到轨道右侧导致点不到滑块，此处左界守卫防「贴右后却溢出左缘」的形态。
+        let v_track_right = gv.track.right();
+        let v_fill_w = gv.thumb_fill.size.width.as_f32();
         assert!(
-            (gv.thumb_hit.right() - v_hit_right).as_f32().abs() < 0.5,
-            "垂直命中区右缘应锚在轨道右缘-inset（拖拽可点中）"
+            (gv.thumb_hit.right() - v_track_right).as_f32().abs() < 0.5,
+            "垂直命中区右缘应贴住轨道右缘（{:.1} vs {:.1}）",
+            gv.thumb_hit.right().as_f32(),
+            v_track_right.as_f32()
         );
         assert!(
-            gv.thumb_fill.right() <= v_hit_right + px(0.5),
-            "垂直滑块右缘应内缩 inset"
+            (gv.thumb_fill.right() - v_track_right).as_f32().abs() < 0.5,
+            "垂直滑块右缘应贴住轨道右缘（{:.1} vs {:.1}）",
+            gv.thumb_fill.right().as_f32(),
+            v_track_right.as_f32()
+        );
+        assert!(
+            (gv.thumb_fill.left().as_f32() - (v_track_right.as_f32() - v_fill_w)).abs() < 0.5,
+            "垂直滑块着色区左缘应精确=轨道右缘−滑块粗细（{:.1} vs {:.1}）",
+            gv.thumb_fill.left().as_f32(),
+            v_track_right.as_f32() - v_fill_w
         );
         assert!(
             gv.thumb_fill.left() >= gv.track.left() - px(0.5),
-            "垂直滑块着色区应位于轨道附近"
+            "垂直滑块着色区不越轨道左界（保留左边界守卫）"
         );
 
         let hh = FakeHandle {
@@ -1232,18 +1261,34 @@ mod tests {
             content: size(px(1600.), px(400.)),
         };
         let gh = Scrollbar::horizontal(&hh).geom(vp(), 0.).expect("仍超宽");
-        let h_bottom_inset = gh.track.bottom() - px(THUMB_INSET);
+        // 水平条贴底精确钉死（K144 修复的新不变式）：滑块/命中区底缘 == 轨道底
+        // （交叉轴不再内缩 THUMB_INSET）；着色区顶缘 == 轨道底 − 滑块粗细（钉死厚度）。
+        // 同时**恢复旧守卫**：着色区不越轨道上界（fill.top >= track.top−0.5）——
+        // 新几何下该式恒真（fill.top=底−6 ≫ track.top=底−16），但作为「贴底后仍不越界」
+        // 的边界守卫保留，防止未来把滑块改成超出轨道上沿的形态。
+        let h_track_bottom = gh.track.bottom();
+        let h_fill_w = gh.thumb_fill.size.height.as_f32();
         assert!(
-            (gh.thumb_hit.bottom() - h_bottom_inset).as_f32().abs() < 0.5,
-            "水平命中区下缘应锚在轨道下缘-inset"
+            (gh.thumb_hit.bottom() - h_track_bottom).as_f32().abs() < 0.5,
+            "水平命中区下缘应贴住轨道底（{:.1} vs {:.1}）",
+            gh.thumb_hit.bottom().as_f32(),
+            h_track_bottom.as_f32()
         );
         assert!(
-            gh.thumb_fill.bottom() <= h_bottom_inset + px(0.5),
-            "水平滑块下缘应内缩 inset"
+            (gh.thumb_fill.bottom() - h_track_bottom).as_f32().abs() < 0.5,
+            "水平滑块下缘应贴住轨道底（{:.1} vs {:.1}）",
+            gh.thumb_fill.bottom().as_f32(),
+            h_track_bottom.as_f32()
+        );
+        assert!(
+            (gh.thumb_fill.top().as_f32() - (h_track_bottom.as_f32() - h_fill_w)).abs() < 0.5,
+            "水平滑块着色区顶缘应精确=轨道底−滑块粗细（{:.1} vs {:.1}）",
+            gh.thumb_fill.top().as_f32(),
+            h_track_bottom.as_f32() - h_fill_w
         );
         assert!(
             gh.thumb_fill.top() >= gh.track.top() - px(0.5),
-            "水平滑块着色区应位于轨道附近"
+            "水平滑块着色区不越轨道上界（恢复旧守卫）"
         );
     }
 
