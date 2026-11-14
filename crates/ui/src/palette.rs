@@ -25,6 +25,7 @@ use gpui::{
 };
 
 use crate::ui::input::{Input, InputEvent, InputState};
+use crate::ui::list_item_row::ListItemRow;
 use crate::ui::motion::hover_spring;
 use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 use crate::ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
@@ -123,9 +124,6 @@ fn fuzzy_score(query: &str, label: &str) -> Option<u32> {
         None
     }
 }
-
-/// 条目行高。
-const ITEM_HEIGHT: f32 = 30.;
 
 /// 居中的命令面板视图（独立实体，宿主持有 `Option<Entity<Self>>`）。
 pub struct CommandPalette {
@@ -464,7 +462,11 @@ impl Render for CommandPalette {
             .border_color(input_border)
             .child(Input::new(&self.input));
 
-        // 列表行。
+        // 列表行（Pattern 5.2：统一用 `ListItemRow` 行壳——选中断言/弹簧背景/debug_selector
+        // 由行 id 派生；hover/activate 上抛宿主管理 `selected` + notify，与旧 `cx.listener`
+        // 逐语义等价（gpui invoke_listener == `WeakEntity::update(...)`），notify 仍每 hover
+        // 事件恰好一次）。
+        let weak = cx.weak_entity();
         let rows: Vec<AnyElement> = self
             .filtered
             .iter()
@@ -472,66 +474,66 @@ impl Render for CommandPalette {
             .map(|(row_ix, &item_ix)| {
                 let item = &self.items[item_ix];
                 let is_selected = self.selected == Some(row_ix);
-                let row = div()
-                    .id(ElementId::from(format!("command-palette-item-{row_ix}")))
-                    .debug_selector(move || format!("command-palette-item-{row_ix}"))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .min_h(px(ITEM_HEIGHT))
-                    .mx_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_color(fg)
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        if *hovered {
-                            this.selected = Some(row_ix);
-                        } else if this.selected == Some(row_ix) {
-                            this.selected = None;
-                        }
-                        cx.notify();
-                    }))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.selected = Some(row_ix);
-                        this.activate(window, cx);
-                    }))
-                    // P2-10：选中/悬停高亮淡入（键盘 ↑↓ 与鼠标同一弹簧曲线）。
-                    .with_spring(
-                        format!("command-palette-item-bg-{row_ix}"),
-                        hover_spring(if is_selected { 1.0 } else { 0.0 }),
-                        move |d, v| d.bg(selected_bg.opacity(v)),
-                    );
-                row.child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(px(13.))
-                        .child(item.label.clone()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(fg_muted)
-                                .child(item.detail.clone()),
-                        )
-                        .when(!item.shortcut.is_empty(), |d| {
-                            d.child(
+                let weak_hover = weak.clone();
+                let weak_activate = weak.clone();
+                ListItemRow::new(ElementId::named_usize("command-palette-item", row_ix))
+                    .content(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
                                 div()
-                                    .text_size(px(11.))
-                                    .text_color(chrome.text_tertiary)
-                                    .child(item.shortcut.clone()),
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_size(px(13.))
+                                    .text_color(fg)
+                                    .child(item.label.clone()),
                             )
-                        }),
-                )
-                .into_any_element()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(fg_muted)
+                                            .child(item.detail.clone()),
+                                    )
+                                    .when(!item.shortcut.is_empty(), |d| {
+                                        d.child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(chrome.text_tertiary)
+                                                .child(item.shortcut.clone()),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .selected(is_selected)
+                    .accent(selected_bg)
+                    .on_hover_select(move |hovered, _window, cx| {
+                        let _ = weak_hover.update(cx, |this, cx| {
+                            if hovered {
+                                this.selected = Some(row_ix);
+                            } else if this.selected == Some(row_ix) {
+                                this.selected = None;
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .on_activate(move |_event, window, cx| {
+                        let _ = weak_activate.update(cx, |this, cx| {
+                            this.selected = Some(row_ix);
+                            this.activate(window, cx);
+                        });
+                    })
+                    .into_any_element()
             })
             .collect();
 

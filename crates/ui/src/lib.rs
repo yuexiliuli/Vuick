@@ -54,6 +54,7 @@ pub mod float_card;
 pub mod focus;
 pub mod icon;
 pub mod input;
+pub mod list_item_row;
 pub mod menu;
 pub mod motion;
 pub mod notification;
@@ -65,6 +66,7 @@ pub mod root;
 pub mod scroll_panel;
 pub mod scrollbar;
 pub mod shell;
+pub mod sidebar_row;
 pub mod slider;
 pub mod theme;
 pub mod tooltip;
@@ -86,6 +88,12 @@ pub use slider::{CommitMode, Slider, SliderFill, SliderThumb};
 
 /// 胶囊 chip 根级 re-export（`ui::Pill` / `ui::PillSize` / `ui::PillTone`）。
 pub use pill::{Pill, PillSize, PillTone};
+
+/// 列表项行根级 re-export（`ui::ListItemRow`）。
+pub use list_item_row::ListItemRow;
+
+/// 侧栏列表行根级 re-export（`ui::SidebarRow`）。
+pub use sidebar_row::SidebarRow;
 
 /// 异步资源加载状态根级 re-export（`ui::AsyncState`）。
 pub use async_state::AsyncState;

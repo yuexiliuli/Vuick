@@ -36,7 +36,8 @@ use shell_scan::{
 };
 use ui::icon::{Icon, IconName};
 use ui::input::Input;
-use ui::motion::{hover_bg_fade, hover_spring, hoverable};
+use ui::motion::{hover_bg_fade, hover_spring};
+use ui::SidebarRow;
 
 use crate::chrome::Sidebar;
 use crate::host::SidebarHost;
@@ -446,10 +447,12 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 文件夹级搜索**分组渲染**：每文件一个组 = 文件头行（文件名 + 命中词频计数）+
     /// 逐命中行（`L行号  命中行预览`，命中词以强调色高亮）。点击命中行 → 打开/激活 +
     /// 光标定位 + 滚动可见 + 命中词临时高亮（见 [`Self::folder_search_open_hit`]）。
+    /// 文件头行为**静态行**（不迁移 `SidebarRow`：无点击、无 hover 交互），命中行走
+    /// [`ui::SidebarRow`] 统一行壳。
     #[allow(clippy::too_many_arguments)] // 三色 + 数据源 + 滚动句柄，与其它行渲染同构
     fn sidebar_folder_file_rows(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         scan: &FolderSearchScan,
         fg: gpui::Hsla,
         muted: gpui::Hsla,
@@ -526,30 +529,18 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                             .collect::<Vec<_>>(),
                     );
                 let row_id = SharedString::from(format!("sidebar-search-folder-hit-{fi}-{ki}"));
-                let r = div()
-                    .id(row_id.clone())
-                    .debug_selector(move || format!("sidebar-search-folder-hit-{fi}-{ki}"))
-                    .px_2()
-                    .py_1()
-                    .mx(px(4.))
-                    .rounded_md()
-                    .text_size(px(12.))
-                    .text_color(muted)
-                    .cursor(CursorStyle::PointingHand)
+                let r = SidebarRow::new(row_id.clone())
+                    .fill(active_bg)
+                    .title(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .child(styled),
+                    )
                     .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                         this.folder_search_open_hit(&path, li, match_range.clone(), &q_owned, window, cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(styled),
-                    );
-                rows.push(
-                    hoverable(r, row_id, active_bg, window, cx).into_any_element(),
-                );
+                    }));
+                rows.push(r.into_any_element());
             }
         }
         rows
@@ -734,7 +725,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 活动索引是宿主 panes 域能力）。
     fn sidebar_search_file_rows(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         scan: &SidebarSearchScan,
         fg: gpui::Hsla,
         muted: gpui::Hsla,
@@ -752,37 +743,22 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             let row_fg = if ti == self.model.borrow().active_tab { fg } else { muted };
             let nm = name;
             let file_row_id = SharedString::from(format!("sidebar-search-file-{ti}"));
-            let r = div()
-                .id(file_row_id.clone())
-                .debug_selector(move || format!("sidebar-search-file-{ti}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .mx(px(4.))
-                .rounded_md()
-                .text_color(row_fg)
-                .cursor(CursorStyle::PointingHand)
+            let r = SidebarRow::new(file_row_id.clone())
+                .fill(active_bg)
+                .leading(Icon::new(IconName::File).size(px(13.)).text_color(row_fg))
+                .title(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(row_fg)
+                        .child(nm),
+                )
                 .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                     if let Some(h) = this.host_weak().upgrade() {
                         let _ = h.update(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
                     }
                     cx.notify();
-                }))
-                .child(Icon::new(IconName::File).size(px(13.)).text_color(row_fg))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(px(12.))
-                        .text_color(row_fg)
-                        .child(nm),
-                );
-            file_rows.push(hoverable(r, file_row_id, active_bg, window, cx).into_any_element());
+                }));
+            file_rows.push(r.into_any_element());
         }
         file_rows
     }
@@ -792,7 +768,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 的内容，看起来像搜索到了错误文档。点击：激活文档 + 光标/预览滚到命中行并高亮。
     fn sidebar_search_line_rows(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         scan: &SidebarSearchScan,
         muted: gpui::Hsla,
         active_bg: gpui::Hsla,
@@ -806,32 +782,22 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             let snippet = hit.snippet.clone();
             let q_owned = scan.query.clone();
             let line_row_id = SharedString::from(format!("sidebar-search-line-{ti}-{li}"));
-            let r = div()
-                .id(line_row_id.clone())
-                .debug_selector(move || format!("sidebar-search-line-{ti}-{li}"))
-                .px_2()
-                .py_1()
-                .mx(px(4.))
-                .rounded_md()
-                .text_size(px(12.))
-                .text_color(muted)
-                .cursor(CursorStyle::PointingHand)
+            let r = SidebarRow::new(line_row_id.clone())
+                .fill(active_bg)
+                .title(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child(format!("L{}  {}", li + 1, snippet)),
+                )
                 .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                     if let Some(h) = this.host_weak().upgrade() {
                         let _ = h.update(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
                     }
                     this.jump_tab_to_hit(ti, li, match_range.clone(), &q_owned, cx);
                     cx.notify();
-                }))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(format!("L{}  {}", li + 1, snippet)),
-                );
-            line_rows.push(hoverable(r, line_row_id, active_bg, window, cx).into_any_element());
+                }));
+            line_rows.push(r.into_any_element());
         }
         line_rows
     }
@@ -1020,7 +986,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     #[allow(clippy::too_many_arguments)] // 三色 + 数据源 + 命中列表，与 render_* 同构
     fn sidebar_pdf_hit_rows(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         pdf: &gpui::Entity<pdf::PdfViewer>,
         snippets: &[(usize, String)],
         active: usize,
@@ -1035,33 +1001,20 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             let color = if idx == active { fg } else { muted };
             let row_pdf = pdf.clone();
             let hit_row_id = SharedString::from(format!("sidebar-search-pdf-hit-{idx}"));
-            let r = div()
-                .id(hit_row_id.clone())
-                .debug_selector(move || format!("sidebar-search-pdf-hit-{idx}"))
-                .px_2()
-                .py_1()
-                .mx(px(4.))
-                .rounded_md()
-                .flex()
-                .flex_row()
-                .items_center()
-                .text_size(px(12.))
-                .text_color(color)
-                .cursor(CursorStyle::PointingHand)
+            let r = SidebarRow::new(hit_row_id.clone())
+                .fill(active_bg)
+                .title(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(color)
+                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                        .child(format!("L{}  {}", page + 1, snippet)),
+                )
                 .on_click(cx.listener(move |_this: &mut Self, _ev, _w, cx| {
                     row_pdf.update(cx, |v, cx| v.focus_match_on_page(page, cx));
                     cx.notify();
-                }))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
-                        .child(format!("L{}  {}", page + 1, snippet)),
-                );
-            hit_rows.push(hoverable(r, hit_row_id, active_bg, window, cx).into_any_element());
+                }));
+            hit_rows.push(r.into_any_element());
         }
         hit_rows
     }
