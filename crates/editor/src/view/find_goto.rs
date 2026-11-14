@@ -99,8 +99,12 @@ impl CodeEditor {
         // 首次打开懒创建输入框实体 + 订阅「文本变化 → 置脏 + 防抖；Enter/Esc（组件
         // 统一上抛 Submit/Cancel）→ 导航 / 关闭」。
         if self.find_input.is_none() {
-            let input = cx
-                .new(|cx| ui::input::InputState::new(window, cx).placeholder("查找…"));
+            let input = cx.new(|cx| {
+                ui::input::InputState::new(window, cx)
+                    .placeholder("查找…")
+                    // 单行框：粘贴多行文本折叠为单空格（"aa\nbb" → "aa bb"）。
+                    .paste_mode(ui::input::PasteMode::StripNewlines)
+            });
             let input_entity = input.clone();
             let weak_ed = cx.weak_entity();
             self._find_sub = Some(window.subscribe(&input, cx, move |_, ev, window, cx| {
@@ -377,8 +381,12 @@ impl CodeEditor {
         // 首次打开懒创建输入框实体 + 订阅「文本变化 → 置脏 + 防抖；Enter/Esc（组件
         // 统一上抛 Submit/Cancel）→ 立即 flush（取消防抖）/ 关闭」。
         if self.goto_input.is_none() {
-            let input = cx
-                .new(|cx| ui::input::InputState::new(window, cx).placeholder("行号（可 行:列）"));
+            let input = cx.new(|cx| {
+                ui::input::InputState::new(window, cx)
+                    .placeholder("行号（可 行:列）")
+                    // 单行框：粘贴多行文本折叠为单空格（"12\n34" → "12 34"）。
+                    .paste_mode(ui::input::PasteMode::StripNewlines)
+            });
             let input_entity = input.clone();
             let weak_ed = cx.weak_entity();
             self._goto_sub = Some(window.subscribe(&input, cx, move |_, ev, window, cx| {

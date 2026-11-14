@@ -41,6 +41,31 @@ fn type_query(
     settle(cx);
 }
 
+/// 单行框粘贴折叠（P3 第二部分）：粘贴多行文本 → 折叠为单空格（无换行进查询词）。
+#[gpui::test]
+fn find_input_paste_strips_newlines(cx: &mut TestAppContext) {
+    use gpui::{ClipboardItem, EntityInputHandler};
+    let (host, cx) = open(cx, "aa bb aa");
+    focus(&host, cx);
+    let ed = ed_of(&host, cx);
+    let input = open_find(&host, cx);
+
+    // 模拟 OS 粘贴（EntityInputHandler::paste → PasteMode::StripNewlines 折叠路径）。
+    cx.update(|window, cx| {
+        input.update(cx, |s, scx| {
+            s.paste(ClipboardItem::new_string("aa\nbb".to_string()), window, scx)
+        });
+    });
+    settle(cx);
+
+    let value = cx.update(|_, cx| input.read(cx).value().to_string());
+    assert_eq!(value, "aa bb", "粘贴多行应折叠为单空格，实际 {:?}", value);
+    assert!(!value.contains('\n'), "查询词不得含换行");
+    // 折叠结果经 Change 订阅进查询状态。
+    let q = cx.update(|_, cx| ed.read(cx).test_find_state().4);
+    assert_eq!(q, "aa bb", "find 查询词应为折叠后文本");
+}
+
 /// 打开即聚焦输入框、不带查询；已输入过则再次打开回显最近查询。
 #[gpui::test]
 fn find_open_focuses_input_and_recalls_query(cx: &mut TestAppContext) {

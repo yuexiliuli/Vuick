@@ -90,6 +90,31 @@ fn goto_open_focuses_input_card_at_top_center(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("find-bar").is_none(), "find 未开不渲染");
 }
 
+/// 单行框粘贴折叠（P3 第二部分）：粘贴多行文本 → 折叠为单空格（换行不进输入缓存）。
+#[gpui::test]
+fn goto_input_paste_strips_newlines(cx: &mut TestAppContext) {
+    use gpui::{ClipboardItem, EntityInputHandler};
+    let (host, cx) = open(cx, "a\nb\nc\n");
+    let ed = ed_of(&host, cx);
+    focus(&host, cx);
+    let input = open_goto(&host, cx);
+
+    // 模拟 OS 粘贴（EntityInputHandler::paste → PasteMode::StripNewlines 折叠路径）。
+    cx.update(|window, cx| {
+        input.update(cx, |s, scx| {
+            s.paste(ClipboardItem::new_string("12\n34".to_string()), window, scx)
+        });
+    });
+    settle(cx);
+
+    let value = cx.update(|_, cx| input.read(cx).value().to_string());
+    assert_eq!(value, "12 34", "粘贴多行应折叠为单空格，实际 {:?}", value);
+    assert!(!value.contains('\n'), "输入不得含换行");
+    // 折叠结果经 Change 订阅进输入缓存。
+    let cached = cx.update(|_, cx| ed.read(cx).test_goto_state().1);
+    assert_eq!(cached, "12 34", "goto 输入缓存应为折叠后文本");
+}
+
 /// 逐键实时跳（**真实防抖路径**，推进时钟跨过防抖窗）：1 → 12 → 123 → 1234 每键
 /// 落位正确（光标落位 + 滚动可见）。
 #[gpui::test]
