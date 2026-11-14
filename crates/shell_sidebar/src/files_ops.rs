@@ -9,9 +9,9 @@
 
 use gpui::{
     anchored, deferred, div, px, Anchor, AppContext, Context, DismissEvent, Edges, Entity,
-    InteractiveElement, IntoElement, MouseDownEvent, ParentElement, Styled, Window,
+    InteractiveElement, IntoElement, MouseDownEvent, ParentElement, Window,
 };
-use ui::menu::PopupMenuItem;
+use ui::menu::label_menu_item;
 
 use crate::chrome::Sidebar;
 use crate::host::SidebarHost;
@@ -48,15 +48,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     m = m.item({
                         let weak = weak.clone();
                         let parent = path.to_path_buf();
-                        PopupMenuItem::element(move |_, _| {
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .child("新建文件…")
-                                .debug_selector(|| "file-tree-menu-new-file".into())
-                        })
-                        .on_click(move |_, window, cx| {
+                        label_menu_item("新建文件…", "file-tree-menu-new-file")
+                            .on_click(move |_, window, cx| {
                             let _ = weak.update(cx, |this, cx| {
                                 this.sidebar_open_file_tree_prompt(
                                     FileTreePromptKind::NewFile { parent: parent.clone() },
@@ -69,15 +62,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     m = m.item({
                         let weak = weak.clone();
                         let parent = path.to_path_buf();
-                        PopupMenuItem::element(move |_, _| {
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .child("新建文件夹…")
-                                .debug_selector(|| "file-tree-menu-new-folder".into())
-                        })
-                        .on_click(move |_, window, cx| {
+                        label_menu_item("新建文件夹…", "file-tree-menu-new-folder")
+                            .on_click(move |_, window, cx| {
                             let _ = weak.update(cx, |this, cx| {
                                 this.sidebar_open_file_tree_prompt(
                                     FileTreePromptKind::NewFolder { parent: parent.clone() },
@@ -91,15 +77,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 m = m.item({
                     let weak = weak.clone();
                     let target = path.to_path_buf();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("重命名…")
-                            .debug_selector(|| "file-tree-menu-rename".into())
-                    })
-                    .on_click(move |_, window, cx| {
+                    label_menu_item("重命名…", "file-tree-menu-rename")
+                        .on_click(move |_, window, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             this.sidebar_open_file_tree_prompt(
                                 FileTreePromptKind::Rename {
@@ -115,15 +94,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 m = m.item({
                     let weak = weak.clone();
                     let target = path.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("删除…")
-                            .debug_selector(|| "file-tree-menu-delete".into())
-                    })
-                    .on_click(move |_, window, cx| {
+                    label_menu_item("删除…", "file-tree-menu-delete")
+                        .on_click(move |_, window, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             this.sidebar_file_tree_delete_request(&target, is_dir, window, cx);
                         });
@@ -134,15 +106,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 m = m.item({
                     let weak = weak.clone();
                     let target = path.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("在资源管理器中显示")
-                            .debug_selector(|| "file-tree-menu-reveal".into())
-                    })
-                    .on_click(move |_, _window, cx| {
+                    label_menu_item("在资源管理器中显示", "file-tree-menu-reveal")
+                        .on_click(move |_, _window, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             this.sidebar_file_tree_reveal_in_explorer(&target, cx);
                         });
@@ -153,15 +118,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 m = m.item({
                     let weak = weak.clone();
                     let target = path.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("复制路径")
-                            .debug_selector(|| "file-tree-menu-copy-path".into())
-                    })
-                    .on_click(move |_, _window, cx| {
+                    label_menu_item("复制路径", "file-tree-menu-copy-path")
+                        .on_click(move |_, _window, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             this.sidebar_file_tree_copy_path(&target, cx);
                         });
@@ -170,15 +128,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 m = m.item({
                     let weak = weak.clone();
                     let target = path.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("复制相对路径")
-                            .debug_selector(|| "file-tree-menu-copy-rel-path".into())
-                    })
-                    .on_click(move |_, _window, cx| {
+                    label_menu_item("复制相对路径", "file-tree-menu-copy-rel-path")
+                        .on_click(move |_, _window, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             this.sidebar_file_tree_copy_relative_path(&target, cx);
                         });
@@ -189,15 +140,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     .item({
                         let weak = weak.clone();
                         let target = path.clone();
-                        PopupMenuItem::element(move |_, _| {
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .child("剪切")
-                                .debug_selector(|| "file-tree-menu-cut".into())
-                        })
-                        .on_click(move |_, _window, cx| {
+                        label_menu_item("剪切", "file-tree-menu-cut")
+                            .on_click(move |_, _window, cx| {
                             let _ = weak.update(cx, |this, cx| {
                                 this.sidebar_file_tree_cut(&target, cx);
                             });
@@ -206,15 +150,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     .item({
                         let weak = weak.clone();
                         let target = path.clone();
-                        PopupMenuItem::element(move |_, _| {
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .child("复制")
-                                .debug_selector(|| "file-tree-menu-copy-file".into())
-                        })
-                        .on_click(move |_, _window, cx| {
+                        label_menu_item("复制", "file-tree-menu-copy-file")
+                            .on_click(move |_, _window, cx| {
                             let _ = weak.update(cx, |this, cx| {
                                 this.sidebar_file_tree_copy_file(&target, cx);
                             });

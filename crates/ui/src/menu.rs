@@ -23,8 +23,9 @@ use gpui::{
     Anchor, AnyElement, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context,
     DismissEvent, Edges, ElementId, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Point, Render, RenderOnce, Size, StatefulInteractiveElement, Styled, Subscription,
-    Window, accesskit, anchored, deferred, div, point, prelude::FluentBuilder as _, px, size,
+    Pixels, Point, Render, RenderOnce, SharedString, Size, StatefulInteractiveElement, Styled,
+    Subscription, Window, accesskit, anchored, deferred, div, point, prelude::FluentBuilder as _,
+    px, size,
 };
 
 use crate::ui::theme::{ChromeColors, Theme};
@@ -35,6 +36,27 @@ type ItemHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 /// `Rc`（非 `Box`）：`PopupMenuItem` 实现 `Clone`——二级菜单交换（[`PopupMenuItem::submenu`]）
 /// 需要把整组条目克隆进菜单（详见 `sub_stack`）。
 type ItemRenderer = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>;
+
+/// 「标签 + debug_selector」菜单项工厂：右键/上下文菜单最常见的单一形态——
+/// `div().w_full().flex().items_center().child(label).debug_selector(key)`。
+/// 收敛 shell_tabs / shell_sidebar / shell / shell_media 各处手写的同构元素
+/// （Pattern 1.2）；交互（`.on_click` / `.disabled` / `.keep_open` / `.flyout`…）
+/// 在返回值上继续包装，标签/选择器键由调用方注入。
+pub fn label_menu_item(
+    label: impl Into<SharedString>,
+    key: impl Into<String>,
+) -> PopupMenuItem {
+    let label: SharedString = label.into();
+    let key = key.into();
+    PopupMenuItem::element(move |_, _| {
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .child(label.clone())
+            .debug_selector(|| key.clone())
+    })
+}
 
 /// 单层下拉菜单项。
 pub enum PopupMenuItem {

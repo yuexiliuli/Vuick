@@ -29,7 +29,6 @@ use gpui::{
 use shell_core::{AppModel, TabDragData, TabDragGhost};
 use shell_widgets::scrollbar::{horizontal_scrollbar, TableScrollState};
 use shell_widgets::TabBoundsRecorder;
-use ui::menu::PopupMenuItem;
 use ui::motion::hover_spring;
 use ui::theme::ChromeColors;
 
@@ -729,31 +728,17 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
             move |menu, _window, _cx| {
                 menu.item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("新建文件")
-                            .debug_selector(|| "tab-bar-menu-item-new".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| this.tabs_host_new_tab(window, cx));
-                    })
+                    ui::menu::label_menu_item("新建文件", "tab-bar-menu-item-new")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| this.tabs_host_new_tab(window, cx));
+                        })
                 })
                 .item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("打开文件")
-                            .debug_selector(|| "tab-bar-menu-item-open".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| this.tabs_host_open_dialog(window, cx));
-                    })
+                    ui::menu::label_menu_item("打开文件", "tab-bar-menu-item-open")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| this.tabs_host_open_dialog(window, cx));
+                        })
                 })
             },
             |this, emitter, cx| {
@@ -799,116 +784,67 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
             move |menu, _window, _cx| {
                 menu.item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("关闭")
-                            .debug_selector(|| "tab-menu-close".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.tabs_host_close_tab(idx, window, cx);
-                        });
-                    })
+                    ui::menu::label_menu_item("关闭", "tab-menu-close")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_close_tab(idx, window, cx);
+                            });
+                        })
                 })
                 .item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("关闭其他")
-                            .debug_selector(|| "tab-menu-close-others".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.tabs_host_close_others(idx, window, cx);
-                        });
-                    })
+                    ui::menu::label_menu_item("关闭其他", "tab-menu-close-others")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_close_others(idx, window, cx);
+                            });
+                        })
                 })
                 .item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("关闭右侧")
-                            .debug_selector(|| "tab-menu-close-right".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.tabs_host_close_right(idx, window, cx);
-                        });
-                    })
+                    ui::menu::label_menu_item("关闭右侧", "tab-menu-close-right")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_close_right(idx, window, cx);
+                            });
+                        })
                 })
                 .item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("关闭已保存")
-                            .debug_selector(|| "tab-menu-close-saved".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.tabs_host_close_saved(window, cx);
-                        });
-                    })
+                    ui::menu::label_menu_item("关闭已保存", "tab-menu-close-saved")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_close_saved(window, cx);
+                            });
+                        })
                 })
                 .item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("关闭全部")
-                            .debug_selector(|| "tab-menu-close-all".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.tabs_host_close_all(window, cx);
-                        });
-                    })
+                    ui::menu::label_menu_item("关闭全部", "tab-menu-close-all")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_close_all(window, cx);
+                            });
+                        })
                 })
                 .separator()
                 .item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("移入新窗口")
-                            .debug_selector(|| "tab-menu-move-new-window".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.tabs_host_move_to_new_window(idx, window, cx);
-                        });
-                    })
+                    ui::menu::label_menu_item("移入新窗口", "tab-menu-move-new-window")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_move_to_new_window(idx, window, cx);
+                            });
+                        })
                 })
                 .item({
                     let weak = weak.clone();
-                    PopupMenuItem::element(move |_, _| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child("复制到新窗口")
-                            .debug_selector(|| "tab-menu-copy-new-window".into())
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.tabs_host_copy_to_new_window(idx, window, cx);
-                        });
-                    })
+                    ui::menu::label_menu_item("复制到新窗口", "tab-menu-copy-new-window")
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_copy_to_new_window(idx, window, cx);
+                            });
+                        })
                 })
             },
             |this, emitter, cx| {
