@@ -29,33 +29,24 @@ use markdown::{doc, ir};
 #[allow(unused_imports)]
 use markdown::view;
 /// 迁移期别名（私有 shim）：`crate::markdown::<core>` → `::markdown::<core>`（`::markdown`
-/// 是依赖 crate，非内部模块）；`crate::markdown::wysiwyg` / `crate::markdown::layout`
-/// → 本 crate 的本地模块（拆 crate 后它们不再是 markdown 的导出面）。
+/// 是依赖 crate，非内部模块）；`crate::markdown::wysiwyg` → 本 crate 的本地模块
+/// （拆 crate 后它们不再是 markdown 的导出面）。
 mod markdown {
     pub use ::markdown::*;
     pub use crate::wysiwyg;
-    /// 仅供宿主测试（layout_tests.rs 经 `crate::markdown::layout` 消费）；生产 lib 构建
-    /// 不引用 → allow 压 unused import 告警（同上面 `markdown::view` 别名姿势）。
-    #[allow(unused_imports)]
-    pub(crate) use crate::layout;
 }
 
 /// 所见即所得编辑器（原 `markdown::wysiwyg` 模块树整体迁入，含 `element`/`frame`/
 /// `mermaid`/`shape`/`math` 等子模块）。
 pub mod wysiwyg;
-/// 共享行整形核心（已整体迁入引擎 `markdown_wysiwyg_engine::layout`）：此处经别名
-/// re-export 保持 `crate::layout::X` / `crate::markdown::layout::Y`（下方
-/// `mod markdown` shim 的 `pub(crate) use crate::layout`）既有路径不变。
-/// `Shard`/`shape_docrow_shard` 等只在宿主测试/`shape/*` 消费，见引擎侧。
-pub(crate) use markdown_wysiwyg_engine::layout;
 /// 测试键位助手（`bind_local_keymaps`，见文件头）。
 #[cfg(test)]
 pub mod test_support;
-/// layout 模块自测（原 `layout/tests.rs`：依赖宿主 `WyEditor`/`build_frame` 无法随
-/// 引擎迁出，故留宿主挂为 `layout_tests`，避免与 `crate::layout` re-export 撞名；
-/// 内部路径经 `crate::markdown::layout` shim → 引擎 re-export，引用原样不变）。
+/// 块高恒等快照（防几何漂移护栏）：替代已删的 `layout_tests`——shard 整形并行面已
+/// 随预览引擎删除而真删，`shape_docrow` 是唯一生产几何真值；本测试把代表性文档
+/// 各块 `frame.block_height(k)` 钉成数值快照。
 #[cfg(test)]
-mod layout_tests;
+mod block_height_snapshot;
 
 /// 扁平重导出：`wysiwyg::*` 的 pub 面搬上 crate 根，保持 `markdown_wysiwyg::WyEditor`
 /// 等与旧 `markdown::wysiwyg::WyEditor` 对应（shell 等消费方只换 crate 前缀）。

@@ -3,8 +3,8 @@
 //!
 //! 注：页面已恒换行（无「非换行自然宽 + 页面级横向滚动」），单行文本宽估算
 //! （`est_row_width` / `est_row_width_meta`）已随该模式移除；表格列宽估算
-//! （`table_column_widths`）已随 P3-1c-2「表格内容切共享 shard」删除——列宽现由
-//! `layout::shape_table_shard` 按字形实测宽产出（与 WYSIWYG `shape_table_row` 同源）。
+//! （`table_column_widths`）已随 P3-1c-2「表格内容切共享 shard」删除——WYSIWYG
+//! 表格列宽由 `wysiwyg::shape::shape_table_row` 按字形实测宽产出（同源公式）。
 
 /// 读取 4 字节大端无符号整数（辅助解析 PNG/JPEG 头）。
 fn be_u32(d: &[u8], at: usize) -> Option<u32> {
