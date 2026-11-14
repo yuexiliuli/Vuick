@@ -477,58 +477,50 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
             self.chrome().text_tertiary.into()
         };
         let hover_fill: gpui::Hsla = self.chrome().hover_fill.into();
-        // P2-10：hover 状态跨帧记录 → 背景淡入。
-        let hover = window.use_keyed_state("tab-eye-hover", cx, |_, _| false);
-        let hovered = *hover.read(cx);
-        let view_id = window.current_view();
+        // P2-10：hover 状态跨帧记录 → 背景淡入（统一走 ui::motion::hoverable 接线：
+        // 状态键/弹簧键由元素 id 派生、只在悬停态实际翻转时 notify 宿主）。
         Some(
-            div()
-                .id("tab-bar-eye")
-                .debug_selector(|| "tab-bar-eye".into())
-                .w(px(22.))
-                .h(px(22.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_md()
-                .cursor(CursorStyle::PointingHand)
-                .on_hover({
-                    let st = hover.clone();
-                    move |h, _w, cx| {
-                        st.update(cx, |v, _| *v = *h);
-                        cx.notify(view_id);
-                    }
-                })
-                .child(
-                    div()
-                        .w(px(16.))
-                        .h(px(10.))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(eye_color)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(div().w(px(5.)).h(px(5.)).rounded_full().bg(eye_color)),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this: &mut Self, _ev, window, cx| {
-                        let idx = this.model.borrow().active_tab;
-                        let host = this.host_weak();
-                        if let Some(h) = host.upgrade() {
-                            let _ = h.update(cx, |app, cx| {
-                                app.tabs_host_toggle_preview_for_tab(idx, window, cx);
-                            });
-                        }
-                    }),
-                )
-                .with_spring(
-                    "tab-eye-bg",
-                    hover_spring(if hovered { 1.0 } else { 0.0 }),
-                    move |this, v| this.bg(hover_fill.opacity(v)),
-                )
-                .into_any_element(),
+            ui::motion::hoverable(
+                div()
+                    .id("tab-bar-eye")
+                    .debug_selector(|| "tab-bar-eye".into())
+                    .w(px(22.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor(CursorStyle::PointingHand)
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .h(px(10.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(eye_color)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().w(px(5.)).h(px(5.)).rounded_full().bg(eye_color)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this: &mut Self, _ev, window, cx| {
+                            let idx = this.model.borrow().active_tab;
+                            let host = this.host_weak();
+                            if let Some(h) = host.upgrade() {
+                                let _ = h.update(cx, |app, cx| {
+                                    app.tabs_host_toggle_preview_for_tab(idx, window, cx);
+                                });
+                            }
+                        }),
+                    ),
+                "tab-bar-eye",
+                hover_fill,
+                window,
+                cx,
+            )
+            .into_any_element(),
         )
     }
 

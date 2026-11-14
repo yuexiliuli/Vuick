@@ -36,7 +36,7 @@ use shell_scan::{
 };
 use ui::icon::{Icon, IconName};
 use ui::input::Input;
-use ui::motion::{hover_bg_fade, hover_spring};
+use ui::motion::{hover_bg_fade, hover_spring, hoverable};
 
 use crate::chrome::Sidebar;
 use crate::host::SidebarHost;
@@ -503,11 +503,6 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 let snippet = hit.snippet.clone();
                 let q_owned = scan.query.clone();
                 let path = file.path.clone();
-                // P2-10：hover 状态跨帧记录 → 行背景淡入。
-                let hover = window
-                    .use_keyed_state(format!("sf-hit-{fi}-{ki}-hover"), cx, |_, _| false);
-                let hovered = *hover.read(cx);
-                let view_id = window.current_view();
                 let line_prefix = format!("L{}  ", li + 1);
                 let display = format!("{line_prefix}{snippet}");
                 // 命中词在预览中高亮：snippet 内全部大小写不敏感命中区间，再平移到显示串。
@@ -530,10 +525,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                             })
                             .collect::<Vec<_>>(),
                     );
+                let row_id = SharedString::from(format!("sidebar-search-folder-hit-{fi}-{ki}"));
                 let r = div()
-                    .id(SharedString::from(format!(
-                        "sidebar-search-folder-hit-{fi}-{ki}"
-                    )))
+                    .id(row_id.clone())
                     .debug_selector(move || format!("sidebar-search-folder-hit-{fi}-{ki}"))
                     .px_2()
                     .py_1()
@@ -542,13 +536,6 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     .text_size(px(12.))
                     .text_color(muted)
                     .cursor(CursorStyle::PointingHand)
-                    .on_hover({
-                        let st = hover.clone();
-                        move |h, _w, cx| {
-                            st.update(cx, |v, _| *v = *h);
-                            cx.notify(view_id);
-                        }
-                    })
                     .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                         this.folder_search_open_hit(&path, li, match_range.clone(), &q_owned, window, cx);
                     }))
@@ -561,8 +548,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                             .child(styled),
                     );
                 rows.push(
-                    r.bg(if hovered { active_bg } else { active_bg.opacity(0.) })
-                        .into_any_element(),
+                    hoverable(r, row_id, active_bg, window, cx).into_any_element(),
                 );
             }
         }
@@ -765,12 +751,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 .unwrap_or_else(|| "未命名".to_string());
             let row_fg = if ti == self.model.borrow().active_tab { fg } else { muted };
             let nm = name;
-            // P2-10：hover 状态跨帧记录 → 行背景淡入。
-            let hover = window.use_keyed_state(format!("ss-file-{ti}-hover"), cx, |_, _| false);
-            let hovered = *hover.read(cx);
-            let view_id = window.current_view();
+            let file_row_id = SharedString::from(format!("sidebar-search-file-{ti}"));
             let r = div()
-                .id(SharedString::from(format!("sidebar-search-file-{ti}")))
+                .id(file_row_id.clone())
                 .debug_selector(move || format!("sidebar-search-file-{ti}"))
                 .flex()
                 .flex_row()
@@ -782,13 +765,6 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 .rounded_md()
                 .text_color(row_fg)
                 .cursor(CursorStyle::PointingHand)
-                .on_hover({
-                    let st = hover.clone();
-                    move |h, _w, cx| {
-                        st.update(cx, |v, _| *v = *h);
-                        cx.notify(view_id);
-                    }
-                })
                 .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                     if let Some(h) = this.host_weak().upgrade() {
                         let _ = h.update(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
@@ -806,10 +782,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                         .text_color(row_fg)
                         .child(nm),
                 );
-            file_rows.push(
-                r.bg(if hovered { active_bg } else { active_bg.opacity(0.) })
-                    .into_any_element(),
-            );
+            file_rows.push(hoverable(r, file_row_id, active_bg, window, cx).into_any_element());
         }
         file_rows
     }
@@ -832,13 +805,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             let match_range = hit.range.clone();
             let snippet = hit.snippet.clone();
             let q_owned = scan.query.clone();
-            // P2-10：hover 状态跨帧记录 → 行背景淡入。
-            let hover =
-                window.use_keyed_state(format!("ss-line-{ti}-{li}-hover"), cx, |_, _| false);
-            let hovered = *hover.read(cx);
-            let view_id = window.current_view();
+            let line_row_id = SharedString::from(format!("sidebar-search-line-{ti}-{li}"));
             let r = div()
-                .id(SharedString::from(format!("sidebar-search-line-{ti}-{li}")))
+                .id(line_row_id.clone())
                 .debug_selector(move || format!("sidebar-search-line-{ti}-{li}"))
                 .px_2()
                 .py_1()
@@ -847,13 +816,6 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 .text_size(px(12.))
                 .text_color(muted)
                 .cursor(CursorStyle::PointingHand)
-                .on_hover({
-                    let st = hover.clone();
-                    move |h, _w, cx| {
-                        st.update(cx, |v, _| *v = *h);
-                        cx.notify(view_id);
-                    }
-                })
                 .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                     if let Some(h) = this.host_weak().upgrade() {
                         let _ = h.update(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
@@ -869,10 +831,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                         .whitespace_nowrap()
                         .child(format!("L{}  {}", li + 1, snippet)),
                 );
-            line_rows.push(
-                r.bg(if hovered { active_bg } else { active_bg.opacity(0.) })
-                    .into_any_element(),
-            );
+            line_rows.push(hoverable(r, line_row_id, active_bg, window, cx).into_any_element());
         }
         line_rows
     }
@@ -1075,12 +1034,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             let page = *page;
             let color = if idx == active { fg } else { muted };
             let row_pdf = pdf.clone();
-            // P2-10：hover 状态跨帧记录 → 行背景淡入。
-            let hover = window.use_keyed_state(format!("ss-pdf-hit-{idx}-hover"), cx, |_, _| false);
-            let hovered = *hover.read(cx);
-            let view_id = window.current_view();
+            let hit_row_id = SharedString::from(format!("sidebar-search-pdf-hit-{idx}"));
             let r = div()
-                .id(SharedString::from(format!("sidebar-search-pdf-hit-{idx}")))
+                .id(hit_row_id.clone())
                 .debug_selector(move || format!("sidebar-search-pdf-hit-{idx}"))
                 .px_2()
                 .py_1()
@@ -1092,13 +1048,6 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 .text_size(px(12.))
                 .text_color(color)
                 .cursor(CursorStyle::PointingHand)
-                .on_hover({
-                    let st = hover.clone();
-                    move |h, _w, cx| {
-                        st.update(cx, |v, _| *v = *h);
-                        cx.notify(view_id);
-                    }
-                })
                 .on_click(cx.listener(move |_this: &mut Self, _ev, _w, cx| {
                     row_pdf.update(cx, |v, cx| v.focus_match_on_page(page, cx));
                     cx.notify();
@@ -1112,10 +1061,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                         .text_overflow(gpui::TextOverflow::Truncate("…".into()))
                         .child(format!("L{}  {}", page + 1, snippet)),
                 );
-            hit_rows.push(
-                r.bg(if hovered { active_bg } else { active_bg.opacity(0.) })
-                    .into_any_element(),
-            );
+            hit_rows.push(hoverable(r, hit_row_id, active_bg, window, cx).into_any_element());
         }
         hit_rows
     }
