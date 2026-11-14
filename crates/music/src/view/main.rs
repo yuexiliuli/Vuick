@@ -805,6 +805,12 @@ impl super::MusicView {
             .hide_on_hover(false)
             .drag_keep_visible(true)
             .auto_widen(false)
+            // P4：注入深紫子主题 token（全走 theme，零裸色）——thumb/track 用 bg_hover
+            // （暗紫表面，对照 B07 迁移前旧自绘条 rest=bg_hover、无可见轨道）、accent 用
+            // text3（旧 hover/拖拽变亮色同义值），三槽语义逐一对齐旧条。
+            .thumb_color(Some(theme::bg_hover()))
+            .track_color(Some(theme::bg_hover()))
+            .accent_color(Some(theme::text3()))
             .viewport_from_layout()
             // 可见性只读快照：组件 prepaint 提交 `!hidden`，测试/调试据此断言显隐（组件
             // 内部 Auto 判定是唯一事实源，此处不回写）。

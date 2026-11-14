@@ -244,6 +244,12 @@ pub struct Scrollbar<H: ScrollbarHandle + Clone> {
     /// 把「Auto 是否可见」回写的只读快照（`report_visible_to()`，默认 None 零开销）。
     /// prepaint 完成 Auto 判定后写入 `!hidden`；单一事实源仍是组件内部状态，槽只作观测。
     visible_sink: Option<Rc<Cell<bool>>>,
+    /// 滑块常态色（`thumb_color()`，默认 None = 全局主题 fg，editor/pdf/tabs 零变化）。
+    thumb_color: Option<Hsla>,
+    /// 轨道胶囊色（`track_color()`，默认 None = 全局主题 border，零变化）。
+    track_color: Option<Hsla>,
+    /// 拖拽/激活强调色（`accent_color()`，默认 None = 全局主题 accent，零变化）。
+    accent_color: Option<Hsla>,
 }
 
 impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
@@ -263,6 +269,9 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
             drag_keep_visible: true,
             auto_widen: true,
             visible_sink: None,
+            thumb_color: None,
+            track_color: None,
+            accent_color: None,
         }
     }
 
@@ -322,6 +331,25 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
     /// 省略（默认）零开销；槽写方向只读——调用方不得写回覆盖组件内部判定。
     pub fn report_visible_to(mut self, sink: Rc<Cell<bool>>) -> Self {
         self.visible_sink = Some(sink);
+        self
+    }
+
+    /// 滑块常态色注入（None=现全局主题 fg，保持现状）。music 等子主题调用点传自己的
+    /// theme token；editor/pdf/tabs 等全部默认调用点零变化。
+    pub fn thumb_color(mut self, color: Option<Hsla>) -> Self {
+        self.thumb_color = color;
+        self
+    }
+
+    /// 轨道胶囊色注入（None=现全局主题 border，保持现状）。
+    pub fn track_color(mut self, color: Option<Hsla>) -> Self {
+        self.track_color = color;
+        self
+    }
+
+    /// 拖拽/激活强调色注入（None=现全局主题 accent，保持现状）。
+    pub fn accent_color(mut self, color: Option<Hsla>) -> Self {
+        self.accent_color = color;
         self
     }
 
@@ -464,6 +492,29 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
     }
 }
 
+/// 滚动条三色解析结果（paint 消费；track/thumb/accent 已按注入或全局主题定案）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollbarColors {
+    track: Hsla,
+    thumb: Hsla,
+    accent: Hsla,
+}
+
+/// 解析滚动条三色：颜色参数有 → 用之；无 → 现全局主题（保持现状，editor/pdf/tabs 等
+/// 全部默认调用点零变化）。纯函数便于单测断言「注入生效 / 默认回退全局」。
+fn resolve_colors(
+    thumb: Option<Hsla>,
+    track: Option<Hsla>,
+    accent: Option<Hsla>,
+    theme: &crate::ui::theme::Theme,
+) -> ScrollbarColors {
+    ScrollbarColors {
+        track: track.unwrap_or(theme.colors.border.into()),
+        thumb: thumb.unwrap_or(theme.colors.fg.into()),
+        accent: accent.unwrap_or(theme.colors.accent.into()),
+    }
+}
+
 /// Auto 隐藏判定纯函数（与 `Scrollbar::auto_hidden` 同源；供空闲自动隐藏定时器在后台
 /// 复读当前状态，保证判据单一事实源）。`since_last_scroll=None`（从未滚动）→ 隐藏。
 fn should_auto_hide(
@@ -555,6 +606,10 @@ pub struct PrepaintState<H> {
     drag_keep_visible: bool,
     /// 可见性回写槽快照（paint 闭包/自隐定时器用）。
     visible_sink: Option<Rc<Cell<bool>>>,
+    /// 颜色参数快照（paint 取色用；None=全局主题，保持现状）。
+    thumb_color: Option<Hsla>,
+    track_color: Option<Hsla>,
+    accent_color: Option<Hsla>,
     state: Entity<UiState>,
     view_id: EntityId,
 }
@@ -943,6 +998,9 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
             hide_on_hover: self.hide_on_hover,
             drag_keep_visible: self.drag_keep_visible,
             visible_sink: self.visible_sink.clone(),
+            thumb_color: self.thumb_color,
+            track_color: self.track_color,
+            accent_color: self.accent_color,
             state,
             view_id,
         }
@@ -962,6 +1020,9 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
         prepaint.register_listeners(window, cx);
 
         let theme = crate::ui::theme::Theme::global(cx);
+        // 三色一次解析：参数有 → 用之；无 → 全局主题（status quo）。paint 只消费解析结果。
+        let colors =
+            resolve_colors(prepaint.thumb_color, prepaint.track_color, prepaint.accent_color, theme);
         let is_v = prepaint.axis.is_vertical();
         let present = prepaint.present;
 
@@ -969,7 +1030,7 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
         if let Some(geom) = &prepaint.geom {
             let track_alpha = (TRACK_ALPHA * present).clamp(0., 1.);
             if track_alpha > 0. {
-                let track_bg: Hsla = theme.colors.border.into();
+                let track_bg = colors.track;
                 let radius = geom.track_pill.size.width.min(geom.track_pill.size.height) / 2.;
                 window.paint_quad(
                     fill(geom.track_pill, track_bg.opacity(track_alpha))
@@ -981,18 +1042,14 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
         if !prepaint.hidden
             && let Some(geom) = &prepaint.geom
         {
-            // 拖拽 → accent 强调色；否则 fg 悬停加亮（透明度随插值过渡）。
+            // 拖拽 → accent 强调色；否则 thumb 常态色（透明度随插值过渡）。
             let dragging = prepaint.state.read(cx).drag_grab.is_some();
             let alpha = if dragging {
                 THUMB_ALPHA_DRAG
             } else {
                 THUMB_ALPHA_REST + (THUMB_ALPHA_HOVER - THUMB_ALPHA_REST) * present
             };
-            let base: Hsla = if dragging {
-                theme.colors.accent.into()
-            } else {
-                theme.colors.fg.into()
-            };
+            let base = if dragging { colors.accent } else { colors.thumb };
             // 胶囊滑块 + 轴向微渐变（玻璃质感：头部实、尾部淡）。
             let head = base.opacity(alpha);
             let tail = base.opacity(alpha * THUMB_GRADIENT_TAPER);
@@ -1308,6 +1365,34 @@ mod tests {
         assert!(sb.hide_on_hover, "默认 hover 保显");
         assert!(sb.drag_keep_visible, "默认拖拽常显");
         assert!(sb.auto_widen, "默认激活增宽");
+        assert!(
+            sb.thumb_color.is_none() && sb.track_color.is_none() && sb.accent_color.is_none(),
+            "颜色参数默认 None（走全局主题，status quo 保全）"
+        );
+    }
+
+    // —— 颜色参数（P4 深紫扩展点第一块）：注入生效 + 默认回退全局，二者都须守护 ——
+
+    #[gpui::test]
+    async fn color_params_override_global_and_default_to_global(cx: &mut TestAppContext) {
+        let theme = cx.update(|cx| crate::ui::theme::Theme::global(cx).clone());
+        // 默认 None → 全局主题（现状）：editor/pdf/tabs 等全部调用点零变化。
+        let dflt = resolve_colors(None, None, None, &theme);
+        assert_eq!(dflt.thumb, theme.colors.fg.into(), "默认 thumb=全局 fg");
+        assert_eq!(dflt.track, theme.colors.border.into(), "默认 track=全局 border");
+        assert_eq!(dflt.accent, theme.colors.accent.into(), "默认 accent=全局 accent");
+        // 三参全注入 → paint 用量色而非全局（assert 注入 Hsla 生效）。
+        let injected: Hsla = gpui::rgb(0x7c5cfc).into();
+        let got = resolve_colors(Some(injected), Some(injected), Some(injected), &theme);
+        assert_eq!(got.thumb, injected, "注入 thumb 生效");
+        assert_eq!(got.track, injected, "注入 track 生效");
+        assert_eq!(got.accent, injected, "注入 accent 生效");
+        assert_ne!(got.thumb, theme.colors.fg.into(), "注入后不再取全局 fg");
+        // 单参注入、其余默认：只覆盖对应槽（调用点部分注入安全）。
+        let half = resolve_colors(Some(injected), None, None, &theme);
+        assert_eq!(half.thumb, injected, "仅注入 thumb");
+        assert_eq!(half.track, theme.colors.border.into(), "track 仍默认全局");
+        assert_eq!(half.accent, theme.colors.accent.into(), "accent 仍默认全局");
     }
 
     // —— N1：精确空闲自隐时序（真实事件 + fake 时钟；验证「上次活动 + 精确 idle」，非轮询边界）——
