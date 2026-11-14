@@ -58,6 +58,83 @@ const CARET_BLINK_MS: u64 = 500;
 /// 光标交互后的静止期（ms，期间光标常亮不闪，对齐编辑器 `BLINK_PAUSE_MS`）。
 const CARET_BLINK_PAUSE_MS: u64 = 300;
 
+// -------------------------------------------------------------------------
+// P3/D1 声明式参数面：尺寸档 / 粘贴模式 / 提交校验（全部默认 = 现状行为，
+// 既有 8 个消费方不传参数即原样）。
+// -------------------------------------------------------------------------
+
+/// 输入框尺寸档。
+///
+/// 尺寸骨架（像素）统一走 `InputSize` 命名方法，禁在 render/paint 裸写魔数。
+/// 各档映射（高度/字号/行高 三轨等比缩放；左右内边距暂统一 `PAD_PX`，Regular 不变）：
+/// - 高度（px）：Compact 20 / Regular 24（现状 h24）/ Large 28；
+/// - 正文字号（px）：Compact 13 / Regular 14（=`DEFAULT_FONT_SIZE` 现状）/ Large 16；
+/// - 行高（px）：字号 × 行高系数，系数 Compact 1.2 / Regular 1.4（现状）/ Large 1.6。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputSize {
+    /// 现状外观（h24 / 字14 / 行高 1.4×14 / pad2）。
+    #[default]
+    Regular,
+    /// 紧凑档（h20）。
+    Compact,
+    /// 大档（h28）。
+    Large,
+}
+
+impl InputSize {
+    /// 框高（px）。
+    fn height_px(&self) -> f32 {
+        match self {
+            InputSize::Compact => 20.0,
+            InputSize::Regular => 24.0,
+            InputSize::Large => 28.0,
+        }
+    }
+
+    /// 正文字号（px），Regular = 现状 `DEFAULT_FONT_SIZE`。
+    fn font_size_px(&self) -> f32 {
+        match self {
+            InputSize::Compact => DEFAULT_FONT_SIZE - 1.0,
+            InputSize::Regular => DEFAULT_FONT_SIZE,
+            InputSize::Large => DEFAULT_FONT_SIZE + 2.0,
+        }
+    }
+
+    /// 行高系数（行高 = 字号 × 系数），Regular = 现状 1.4。
+    fn line_height_factor(&self) -> f32 {
+        match self {
+            InputSize::Compact => 1.2,
+            InputSize::Regular => 1.4,
+            InputSize::Large => 1.6,
+        }
+    }
+
+    /// 行高（px）。
+    fn line_height(&self) -> Pixels {
+        px(self.font_size_px() * self.line_height_factor())
+    }
+}
+
+/// 粘贴模式：对剪贴板文本换行的处理策略（默认 Passthrough = 现状）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PasteMode {
+    /// 现状：`\r\n`/`\r` → `\n` 原样插入（多行粘贴整段进框）。
+    #[default]
+    Passthrough,
+    /// 折叠：插入文本中每个换行折叠为单个空格（"a\r\nb\nc" → "a b c"）。
+    StripNewlines,
+    /// 拒绝：含换行的粘贴整段不插入（文本框保持原样）。
+    RejectMultiline,
+}
+
+/// 提交校验结果：`Ok` = 放行 Enter 提交；`Err(Option<String>)` = 拦截提交，
+/// 错误消息先存不用（预留后续展示），本批不落 UI。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Validation {
+    Ok,
+    Err(Option<String>),
+}
+
 /// 单行输入框状态（实体）：文本 + 占位符 + 焦点 + 光标（字节区间）+ 元素边界。
 pub struct InputState {
     text: String,
@@ -88,6 +165,14 @@ pub struct InputState {
     /// 在 paint 期按光标须落在可见带内重算并写回（避免把 `&mut Window` 穿进每个移动
     /// 光标的方法）；失焦复位 0（显示头部）。
     scroll_x: f32,
+    /// 尺寸档（框高/字号/行高骨架）。
+    size: InputSize,
+    /// 粘贴模式（换行处理策略）。
+    paste_mode: PasteMode,
+    /// 提交校验器（Enter 提交前，配合 `confirm_required` 用）；`None` = 不校验。
+    validate: Option<fn(&str, &Window) -> Validation>,
+    /// 提交需确认：`true` 时仅校验通过才 emit `Submit`；默认 `false` = 现状。
+    confirm_required: bool,
 }
 
 impl InputState {
@@ -109,6 +194,10 @@ impl InputState {
             marked: None,
             element_bounds: Bounds::default(),
             scroll_x: 0.0,
+            size: InputSize::default(),
+            paste_mode: PasteMode::default(),
+            validate: None,
+            confirm_required: false,
         }
     }
 
@@ -124,6 +213,36 @@ impl InputState {
         let len = self.text.len();
         self.selection = len..len;
         self.selection_head = len;
+        self
+    }
+
+    /// 尺寸档（默认 Regular = 现状外观；既有消费方不传即原样）。
+    pub fn size(mut self, size: InputSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// 粘贴模式（默认 Passthrough = 现状：`\r\n`→`\n` 原样插入）。
+    pub fn paste_mode(mut self, mode: PasteMode) -> Self {
+        self.paste_mode = mode;
+        self
+    }
+
+    /// 提交校验器（配合 `confirm_required`）：`Ok` = 放行 Enter 提交；
+    /// `Err` = 拦截（消息先存不用）。默认 `None` = 不校验。
+    ///
+    /// ⚠️ 签名说明：brief 写作 `fn(&str, &WindowContext)`，本仓 gpui 并无
+    /// `WindowContext` 类型（`Context<T>` deref 到 `App`、窗口句柄为 `Window`），
+    /// 取最贴近语义的 `&Window`。
+    pub fn validate(mut self, validate: fn(&str, &Window) -> Validation) -> Self {
+        self.validate = Some(validate);
+        self
+    }
+
+    /// 提交需确认：`true` 时 Enter 仅在 validate 通过才 emit `Submit`；
+    /// 默认 `false` = 现状（Enter 恒 emit Submit）。
+    pub fn confirm_required(mut self, confirm_required: bool) -> Self {
+        self.confirm_required = confirm_required;
         self
     }
 
@@ -336,7 +455,12 @@ impl InputState {
         };
         let line = window
             .text_system()
-            .shape_line(SharedString::from(self.text.clone()), px(DEFAULT_FONT_SIZE), &[run], None);
+            .shape_line(
+                SharedString::from(self.text.clone()),
+                px(self.size.font_size_px()),
+                &[run],
+                None,
+            );
         // 调用方传入的已是「框内 X - PAD」；文本被左移 scroll_x 后，屏幕上该坐标对应的
         // 行内坐标 = X - PAD + scroll_x，故这里统一加回（保持「点击的字符」与「屏幕可见
         // 的字符」一致；on_mouse_down / character_index_for_point 都经本函数，无需各改）。
@@ -369,7 +493,12 @@ impl InputState {
         };
         window
             .text_system()
-            .shape_line(SharedString::from(s.to_string()), px(DEFAULT_FONT_SIZE), &[run], None)
+            .shape_line(
+                SharedString::from(s.to_string()),
+                px(self.size.font_size_px()),
+                &[run],
+                None,
+            )
             .width()
     }
 
@@ -527,9 +656,13 @@ impl InputState {
             "enter" => {
                 cx.stop_propagation();
                 window.prevent_default();
-                cx.emit(InputEvent::Submit {
-                    shift: event.keystroke.modifiers.shift,
-                });
+                // confirm_required + validate：Err → 拦截提交（不 emit Submit），
+                // 其余键行为不变。默认（confirm_required=false）= 现状恒 Submit。
+                if !self.blocked_submit(window, cx) {
+                    cx.emit(InputEvent::Submit {
+                        shift: event.keystroke.modifiers.shift,
+                    });
+                }
                 return;
             }
             "escape" => {
@@ -551,6 +684,20 @@ impl InputState {
                 _ => {}
             }
         }
+    }
+
+    /// confirm_required=true 且 validate 返回 Err → 拦截提交（Enter 不 emit Submit）；
+    /// 默认（confirm_required=false 或未设 validate）= 现状：Enter 恒 Submit。
+    fn blocked_submit(&self, window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        if !self.confirm_required {
+            return false;
+        }
+        if let Some(validate) = self.validate {
+            if let Validation::Err(_) = validate(self.text.as_str(), window) {
+                return true;
+            }
+        }
+        false
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -835,7 +982,7 @@ impl EntityInputHandler for InputState {
     ) -> Option<Bounds<Pixels>> {
         let byte = ime::utf16_to_byte(self.text.as_str(), range_utf16.start.min(range_utf16.end));
         let x = self.caret_px(byte, element_bounds, window);
-        let line_h = line_height();
+        let line_h = self.size.line_height();
         Some(Bounds::new(
             point(x, element_bounds.origin.y + (element_bounds.size.height - line_h) / 2.),
             size(px(CARET_PX), line_h),
@@ -867,8 +1014,25 @@ impl EntityInputHandler for InputState {
 
     fn paste(&mut self, item: ClipboardItem, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = item.text() {
+            // 统一换行规范化先行：\r\n/\r → \n（现状行为）；后续模式判定/折叠都基于 \n。
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            self.edit_range(self.selection.clone(), &normalized, cx);
+            let insert: Option<String> = match self.paste_mode {
+                // 现状：规范化后原样插入（既有 Passthrough 语义）。
+                PasteMode::Passthrough => Some(normalized),
+                // 折叠：每个换行折叠为单个空格（"a\r\nb\nc" → "a b c"）。
+                PasteMode::StripNewlines => Some(normalized.replace('\n', " ")),
+                // 拒绝：含换行的粘贴整段不插入。
+                PasteMode::RejectMultiline => {
+                    if normalized.contains('\n') {
+                        None
+                    } else {
+                        Some(normalized)
+                    }
+                }
+            };
+            if let Some(insert) = insert {
+                self.edit_range(self.selection.clone(), &insert, cx);
+            }
         }
     }
 
@@ -879,10 +1043,6 @@ impl EntityInputHandler for InputState {
     ) -> TextInputConfiguration {
         TextInputConfiguration::default()
     }
-}
-
-fn line_height() -> Pixels {
-    px(DEFAULT_FONT_SIZE * 1.4)
 }
 
 // -------------------------------------------------------------------------
@@ -950,7 +1110,7 @@ impl Render for InputState {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up_out))
             .w_full()
-            .h(px(24.))
+            .h(px(self.size.height_px()))
             .overflow_hidden();
         InputElement {
             entity: cx.entity(),
@@ -1050,7 +1210,7 @@ impl Element for InputElement {
         } else {
             theme.colors.fg.into()
         };
-        let fs = px(DEFAULT_FONT_SIZE);
+        let fs = px(self.entity.read(cx).size.font_size_px());
         let run = TextRun {
             len: display.len(),
             font: gpui::font(SharedString::from(".SystemUIFont")),
@@ -1059,7 +1219,7 @@ impl Element for InputElement {
             underline: None,
             strikethrough: None,
         };
-        let line_h = line_height();
+        let line_h = self.entity.read(cx).size.line_height();
         // 水平滚动：聚焦且显示真实文本时，按光标（selection_head 端）必须落在可见带内
         // 重算 scroll_x 并写回实体（放 paint 期，避免把 `&mut Window` 穿进每个移动光标
         // 的方法）；本帧绘制用本地算出的值（避免双读）。非聚焦/空文本/占位符 → 0。
@@ -1724,5 +1884,217 @@ mod tests {
         });
         let after_blur = wcx.update(|_, cx| input.read(cx).scroll_x);
         assert_eq!(after_blur, 0.0, "失焦应复位 scroll_x 到 0");
+    }
+
+    // ---------------------------------------------------------------------
+    // P3/D1 声明式参数面守护测试（先 Red 后 Green）
+    // ---------------------------------------------------------------------
+
+    /// 按尺寸档建输入框并测量布局高度（settle 后取 element_bounds）。
+    fn input_height(cx: &mut TestAppContext, size: InputSize) -> f32 {
+        let holder: Rc<RefCell<Option<Entity<InputState>>>> = Rc::default();
+        let (_root, wcx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx).size(size));
+            let _sub = cx.subscribe(&input, |_, _, _: &InputEvent, _| {});
+            *holder.borrow_mut() = Some(input.clone());
+            InputHost { input, _sub }
+        });
+        let _ = _root;
+        let input = holder.borrow().clone().unwrap();
+        settle_window(wcx);
+        wcx.update(|_, cx| input.read(cx).element_bounds.size.height.as_f32())
+    }
+
+    /// P3/D1 A：尺寸档 — Compact/Regular/Large 产生不同布局高度
+    /// （Regular 保持现状 h24；断言 element_bounds 高度非趋势）。
+    #[gpui::test]
+    async fn input_size_tiers_yield_distinct_heights(cx: &mut TestAppContext) {
+        let compact = input_height(cx, InputSize::Compact);
+        let regular = input_height(cx, InputSize::Regular);
+        let large = input_height(cx, InputSize::Large);
+        assert_eq!(regular, 24.0, "Regular 应保持现状高度 24，实际 {}", regular);
+        assert_ne!(compact, regular, "Compact 高度应不同于 Regular");
+        assert_ne!(large, regular, "Large 高度应不同于 Regular");
+        assert_ne!(compact, large, "Compact 高度应不同于 Large");
+    }
+
+    /// 按粘贴模式建输入框（P3/D1 粘贴测试用）。
+    fn add_input_paste<'a>(
+        cx: &'a mut TestAppContext,
+        text: &str,
+        paste_mode: PasteMode,
+    ) -> (Entity<InputState>, &'a mut VisualTestContext) {
+        let holder: Rc<RefCell<Option<Entity<InputState>>>> = Rc::default();
+        let (_root, wcx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(text)
+                    .paste_mode(paste_mode)
+            });
+            let _sub = cx.subscribe(&input, |_, _, _: &InputEvent, _| {});
+            *holder.borrow_mut() = Some(input.clone());
+            InputHost { input, _sub }
+        });
+        let _ = _root;
+        (holder.borrow().clone().unwrap(), wcx)
+    }
+
+    /// P3/D1 B：StripNewlines — 粘贴 "a\r\nb\nc" → "a b c"（每个换行折叠为单个空格）。
+    #[gpui::test]
+    async fn paste_strip_newlines_folds_newlines(cx: &mut TestAppContext) {
+        let (input, wcx) = add_input_paste(cx, "base", PasteMode::StripNewlines);
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.paste(gpui::ClipboardItem::new_string("a\r\nb\nc".to_string()), window, cx)
+            });
+        });
+        let value = wcx.update(|_, cx| input.read(cx).value().to_string());
+        assert_eq!(value, "basea b c", "换行应折叠为单个空格后插入，实际 {:?}", value);
+    }
+
+    /// P3/D1 C：RejectMultiline — 含换行的粘贴整段拒绝（不插入）；单行粘贴照常。
+    #[gpui::test]
+    async fn paste_reject_multiline_blocks_folded_text(cx: &mut TestAppContext) {
+        let (input, wcx) = add_input_paste(cx, "ab", PasteMode::RejectMultiline);
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.paste(gpui::ClipboardItem::new_string("x\ny".to_string()), window, cx)
+            });
+        });
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "ab",
+            "含换行粘贴应整段拒绝（不插入）"
+        );
+        // 单行粘贴不受影响 → 正常插入
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.paste(gpui::ClipboardItem::new_string("z".to_string()), window, cx)
+            });
+        });
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "abz",
+            "单行粘贴应照常插入"
+        );
+    }
+
+    /// P3/D1 D：默认路径保全 — 不加 paste_mode = Passthrough（文本原样插入，
+    /// 不折叠不拒绝）。注：单行框 render 走 `shape_line`，含 `\n` 的文本会触发 gpui
+    /// "text should not contain newlines" panic（既有限制，非本批引入），故此处用
+    /// 无换行文本断言「默认不折叠不拒绝」。
+    #[gpui::test]
+    async fn paste_default_passthrough_preserves_text(cx: &mut TestAppContext) {
+        let (input, wcx) = add_input_paste(cx, "ab", PasteMode::default());
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.paste(gpui::ClipboardItem::new_string("xy".to_string()), window, cx)
+            });
+        });
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "abxy",
+            "默认粘贴应原样插入（现状行为）"
+        );
+    }
+
+    /// P3/D1 测试校验器：非空才放行。
+    fn validate_nonempty(text: &str, _window: &Window) -> Validation {
+        if text.is_empty() {
+            Validation::Err(Some("不能为空".into()))
+        } else {
+            Validation::Ok
+        }
+    }
+
+    /// P3/D1 E：validate+confirm_required — invalid → Enter 不 emit Submit；
+    /// valid → emit；且拦截不影响其它键（Esc 仍 Cancel）。
+    #[gpui::test]
+    async fn confirm_required_blocks_invalid_submit(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let holder: Rc<RefCell<Option<Entity<InputState>>>> = Rc::default();
+        let events = Rc::new(RefCell::new((0usize, 0usize, 0usize)));
+        let (_root, wcx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value("hi")
+                    .validate(validate_nonempty)
+                    .confirm_required(true)
+            });
+            let sub = events.clone();
+            let _sub = cx.subscribe(&input, move |_, _, ev: &InputEvent, _| {
+                let mut e = sub.borrow_mut();
+                match ev {
+                    InputEvent::Change => e.0 += 1,
+                    InputEvent::Submit { .. } => e.1 += 1,
+                    InputEvent::Cancel => e.2 += 1,
+                }
+            });
+            *holder.borrow_mut() = Some(input.clone());
+            InputHost { input, _sub }
+        });
+        let _ = _root;
+        let input = holder.borrow().clone().unwrap();
+        settle_window(wcx);
+        let w = wcx.windows().first().copied().expect("有测试窗口");
+        wcx.update(|window, cx| {
+            let fh = input.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        });
+        wcx.run_until_parked();
+        // 文本非空 → validate Ok → Enter 照常 emit Submit
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("enter").unwrap());
+        assert_eq!(events.borrow().1, 1, "valid → Enter 应 emit Submit");
+        // 置空文本 → validate Err → Enter 被拦截（不 emit Submit）
+        wcx.update(|window, cx| input.update(cx, |s, cx| s.set_value("", window, cx)));
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("enter").unwrap());
+        assert_eq!(events.borrow().1, 1, "invalid → Enter 不应再 emit Submit");
+        // 拦截提交不影响其它键（Esc 仍 Cancel）
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("escape").unwrap());
+        assert_eq!(events.borrow().2, 1, "拦截提交不影响其它键（Esc 仍 Cancel）");
+    }
+
+    /// P3/D1 F：confirm_required=false（默认）→ validate 返回 Err 时 Enter 也 emit
+    /// Submit（默认保全断言：不设置 confirm_required 即现状行为）。
+    #[gpui::test]
+    async fn confirm_not_required_emits_even_invalid(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let holder: Rc<RefCell<Option<Entity<InputState>>>> = Rc::default();
+        let events = Rc::new(RefCell::new((0usize, 0usize, 0usize)));
+        let (_root, wcx) = cx.add_window_view(|window, cx| {
+            // confirm_required 不设置 → 默认 false；validate 返回 Err 也不拦截
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value("")
+                    .validate(validate_nonempty)
+            });
+            let sub = events.clone();
+            let _sub = cx.subscribe(&input, move |_, _, ev: &InputEvent, _| {
+                let mut e = sub.borrow_mut();
+                match ev {
+                    InputEvent::Change => e.0 += 1,
+                    InputEvent::Submit { .. } => e.1 += 1,
+                    InputEvent::Cancel => e.2 += 1,
+                }
+            });
+            *holder.borrow_mut() = Some(input.clone());
+            InputHost { input, _sub }
+        });
+        let _ = _root;
+        let input = holder.borrow().clone().unwrap();
+        settle_window(wcx);
+        let w = wcx.windows().first().copied().expect("有测试窗口");
+        wcx.update(|window, cx| {
+            let fh = input.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        });
+        wcx.run_until_parked();
+        // 未设置 confirm_required：即使 text 为空（validate Err）Enter 仍 emit Submit
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("enter").unwrap());
+        assert_eq!(
+            events.borrow().1,
+            1,
+            "confirm_required=false 时 invalid 也应 emit Submit"
+        );
     }
 }
