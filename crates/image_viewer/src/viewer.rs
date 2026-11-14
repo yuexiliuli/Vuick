@@ -102,7 +102,7 @@ struct CacheEntry {
     /// 动图（GIF）逐帧切片：每帧一个**独立单帧** `RenderImage` + 各自时长；`None` = 静态图。
     /// 采用「按帧切片」而非 gpui 多帧 `RenderImage`：gpui `img()` 元素的自动动画只在窗口
     /// 聚焦（`window.is_window_active()`）时推进，失焦即冻结——改为本查看器用后台时钟
-    /// 逐帧推进 `self.image`（单帧 RenderImage），每次渲染直接画当前帧，与窗口焦点无关。
+    /// 逐帧推进 `self.state.data`（单帧 RenderImage），每次渲染直接画当前帧，与窗口焦点无关。
     gif: Option<(Vec<Arc<RenderImage>>, Vec<std::time::Duration>)>,
 }
 
@@ -234,8 +234,10 @@ impl<K, V> Default for LruMap<K, V> {
 pub struct ImageViewer {
     /// 当前显示的图片路径（标签标题 / 状态栏由此派生）。
     path: PathBuf,
-    /// 已解码的图片（`Some` = 可上屏；切换加载期间保留旧图避免闪白）。
-    image: Option<Arc<RenderImage>>,
+    /// 异步加载状态（loading / load_error / 已解码图片）：`data` = 已解码图片（`Some` =
+    /// 可上屏；切换加载期间保留旧图避免闪白）；`load_error` 渲染时优先于 `data`（有错误
+    /// 显示错误占位）。
+    state: ui::AsyncState<Arc<RenderImage>>,
     /// 图片固有像素尺寸（显示比例依据）。
     intrinsic: Option<(f32, f32)>,
     /// 同文件夹兄弟文件导航（清单文件名升序、恒含当前图、恒非空；循环翻页语义收敛在
@@ -243,10 +245,6 @@ pub struct ImageViewer {
     nav: FolderNav,
     /// 缩放倍数（1.0 = 适应视口；Ctrl+滚轮调）。
     zoom: f32,
-    /// 是否仍在后台解码（首张或切换中）。
-    loading: bool,
-    /// 加载失败信息（`Some` = 显示错误占位）。
-    load_error: Option<String>,
     /// 视口测量句柄：`#image-scroll`（`overflow_*_scroll` + `track_scroll`）布局后
     /// 经 `bounds()` 给出真实可视区尺寸（首帧回退窗口尺寸）。
     viewport: ScrollHandle,
@@ -308,12 +306,12 @@ pub struct ImageViewer {
     /// [`::viewer::auto_hide`]；切图/悬停浮现、1s 自隐、hover 抑制）。
     info_auto: auto_hide::AutoHide,
     /// 当前动图片段（帧切片 + 各帧时长）；`None` = 当前非动图。`install_current` 挂上，
-    /// 由 `spawn_anim_clock` 的后台时钟逐帧推进 `self.image`。
+    /// 由 `spawn_anim_clock` 的后台时钟逐帧推进 `self.state.data`。
     anim_clip: Option<(Vec<Arc<RenderImage>>, Vec<std::time::Duration>)>,
     /// 动图时钟代序号：每次 `install_current`（换图/重装）递增，旧时钟任务据此自停，
     /// 防止旧任务误推进新图帧。
     anim_gen: u64,
-    /// 当前动图帧下标（0 = 首帧；配合 `self.image` 落盘当前帧切片）。
+    /// 当前动图帧下标（0 = 首帧；配合 `self.state.data` 落盘当前帧切片）。
     anim_index: usize,
 }
 
@@ -322,12 +320,10 @@ impl ImageViewer {
     pub fn new(path: PathBuf, cx: &mut Context<Self>) -> Self {
         let this = Self {
             path: path.clone(),
-            image: None,
             intrinsic: None,
             nav: FolderNav::new(vec![path.clone()], 0),
             zoom: 1.0,
-            loading: true,
-            load_error: None,
+            state: ui::AsyncState::loading(),
             viewport: ScrollHandle::new(),
             bg: None,
             cache: LruMap::new(Some(CACHE_MAX_ITEMS), CACHE_MAX_BYTES, |e: &CacheEntry| e.bytes),
@@ -395,7 +391,7 @@ impl ImageViewer {
     /// 是否已加载完成（首张解码成功；仅测试消费）。
     #[cfg(test)]
     pub fn is_loaded(&self) -> bool {
-        !self.loading && self.image.is_some()
+        self.state.is_loaded()
     }
 
     /// 是否「锁定」干净看图模式（宿主据此隐藏菜单栏/选项卡栏/状态栏/侧边栏，图片充满窗口）。
@@ -455,7 +451,7 @@ impl ImageViewer {
 
     /// 释放已上屏与缓存的 GPU 纹理（关闭标签页时调用，与 PDF 阅读器同款）。
     pub fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(img) = self.image.take() {
+        if let Some(img) = self.state.data.take() {
             cx.drop_image(img, Some(window));
         }
         for entry in std::mem::take(&mut self.cache).into_iter() {
@@ -3190,7 +3186,7 @@ mod tests {
                 v.intrinsic.map(|i| i.0 as u32).unwrap_or(0),
                 v.intrinsic.map(|i| i.1 as u32).unwrap_or(0),
                 v.display_denom,
-                !v.loading,
+                !v.state.loading,
                 v.cache.len(),
                 v.thumb_pending.is_none(),
             )
@@ -3413,7 +3409,7 @@ mod tests {
         loop {
             let ready = cx.update(|app| {
                 let v = viewer.read(app);
-                !v.loading && v.image.is_some()
+                !v.state.loading && v.state.data.is_some()
             });
             if ready {
                 return;
@@ -3894,7 +3890,7 @@ mod tests {
         wait_until_ready(cx, &viewer);
         wait_idle(cx, &viewer); // 预取窗口铺满、在途清零 → 确定性起点
 
-        let prev = cx.update(|app| viewer.read(app).image.clone());
+        let prev = cx.update(|app| viewer.read(app).state.data.clone());
         assert!(prev.is_some(), "首图应已安装");
 
         // 清空解码缓存 → 后续 30 次切图全部未就绪（无缓存命中、无同步 install）
@@ -3921,7 +3917,7 @@ mod tests {
             "30 个未就绪切图不得产生任何同步 notify（不整窗重绘）：during={during}"
         );
         // ② 显示保持上一张已安装图（image Arc 指针不变 = 未置空/未抢换）
-        let mid = cx.update(|app| viewer.read(app).image.clone());
+        let mid = cx.update(|app| viewer.read(app).state.data.clone());
         assert!(
             Arc::ptr_eq(prev.as_ref().unwrap(), mid.as_ref().unwrap()),
             "未就绪期间必须保持上一张已安装图像（不得置空/抢换）"
@@ -3977,7 +3973,7 @@ mod tests {
         cx.update(|app| {
             viewer.update(app, |v, _| v.cache.clear());
         });
-        let prev = cx.update(|app| viewer.read(app).image.clone());
+        let prev = cx.update(|app| viewer.read(app).state.data.clone());
         assert!(prev.is_some());
 
         // 切到 01（未就绪 JPEG）→ 同步断言：不派 EXIF 缩略图占位
@@ -3986,7 +3982,7 @@ mod tests {
             let v = viewer.read(app);
             (
                 v.thumb_pending.is_none(),
-                Arc::ptr_eq(prev.as_ref().unwrap(), v.image.as_ref().unwrap()),
+                Arc::ptr_eq(prev.as_ref().unwrap(), v.state.data.as_ref().unwrap()),
                 v.path == dir.join("01.jpg"),
             )
         });
@@ -4038,7 +4034,7 @@ mod tests {
         wait_until_ready(cx, &viewer);
         wait_idle(cx, &viewer);
         let shown = cx
-            .update(|app| viewer.read(app).image.clone())
+            .update(|app| viewer.read(app).state.data.clone())
             .expect("a 已显示");
 
         // 场景 1：非当前条目（b）被 LRU 逐出 → drop_image(render) 分支；账一致、不 panic、
@@ -4053,7 +4049,7 @@ mod tests {
                 assert!(!v.cache_contains(&dir.join("b.png")), "b 应被逐出");
                 assert!(v.cache_contains(&dir.join("c.png")));
                 assert!(
-                    Arc::ptr_eq(&shown, v.image.as_ref().unwrap()),
+                    Arc::ptr_eq(&shown, v.state.data.as_ref().unwrap()),
                     "逐出非当前条目不得触碰当前显示 Arc"
                 );
             })
@@ -4068,7 +4064,7 @@ mod tests {
                 assert_eq!(v.cache.len(), 1);
                 assert!(!v.cache_contains(&dir.join("a.png")), "LRU 逐出语义不变");
                 assert!(
-                    Arc::ptr_eq(&shown, v.image.as_ref().unwrap()),
+                    Arc::ptr_eq(&shown, v.state.data.as_ref().unwrap()),
                     "当前正在显示的图被逐出时不得 drop_image（显示 Arc 必须原样保留）"
                 );
             })

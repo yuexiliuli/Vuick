@@ -83,27 +83,21 @@ impl ImageViewer {
         out
     }
 
-    /// 居中占位文本（加载中 / 加载失败共用）。`max_w` 给定则文本限定到该宽度内**自动换行**
-    /// （错误长文案不被窗口横向截断；`None` 不限宽，供「正在加载」短文案）。
+    /// 居中占位文本（加载中 / 加载失败共用）——委托共享组件 [`ui::centered_placeholder`]
+    /// （默认 14px、限宽自动换行、size_full/flex 居中；DOM 与既占位逐位一致）。
     fn placeholder(text: &str, color: Hsla, max_w: Option<f32>) -> gpui::AnyElement {
-        let mut txt = div().text_size(px(14.)).text_color(color);
+        let mut ph = ui::centered_placeholder(text).color(color).text_size(14.0);
         if let Some(w) = max_w {
-            txt = txt.max_w(px(w));
+            ph = ph.max_w(w);
         }
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size_full()
-            .child(txt.child(text.to_string()))
-            .into_any_element()
+        ph.into_any_element()
     }
 }
 
 impl Render for ImageViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 诊断探针（env 门控，默认关）：帧间隔 + 首帧上屏时延
-        super::diag::note_render(&self.path, self.image.is_some());
+        super::diag::note_render(&self.path, self.state.data.is_some());
         let theme = ui::theme::Theme::global(cx);
         let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
         let muted: Hsla = theme.colors.fg_muted.into();
@@ -113,20 +107,20 @@ impl Render for ImageViewer {
         self.update_display_need();
         let (vw, vh) = self.last_viewport;
 
-        let body: gpui::AnyElement = if let Some(err) = &self.load_error {
+        let body: gpui::AnyElement = if let Some(err) = self.state.error() {
             // 错误长文案限定到窗口宽-边距自动换行（避免单行被横向截断首尾缺失）
             Self::placeholder(
                 &format!("无法打开图片：{err}"),
                 muted,
                 Some((vw - 48.0).max(160.0)),
             )
-        } else if let (Some(render), Some((iw, ih))) = (self.image.clone(), self.intrinsic) {
+        } else if let (Some(render), Some((iw, ih))) = (self.state.data.clone(), self.intrinsic) {
             let (dw, dh) = self.display_size(iw, ih, vw, vh);
             // 放大后平移：clamp 到图始终覆盖视口（未放大时 pan 恒 0 = 居中；中心锚定缩放不变）
             self.pan = Self::clamp_pan(self.pan, vw, vh, dw, dh);
             let ox = (vw - dw) * 0.5 + self.pan.0;
             let oy = (vh - dh) * 0.5 + self.pan.1;
-            // 动图由本查看器时钟逐帧切 `self.image`（单帧 RenderImage）驱动（见
+            // 动图由本查看器时钟逐帧切 `state.data`（单帧 RenderImage）驱动（见
             // [`Self::spawn_anim_clock`]）；此处直接画当前帧，静态图同理，无需 element id。
             img(gpui::ImageSource::Render(render))
                 .object_fit(ObjectFit::Contain)

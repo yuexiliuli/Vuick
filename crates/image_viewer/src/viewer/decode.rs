@@ -59,7 +59,7 @@ impl super::ImageViewer {
                 }
                 if let Some((bgra, w, h, den)) = thumb
                     && this.path == target
-                    && this.loading
+                    && this.state.is_loading()
                     && let Some(frame) = bgra_single_frame(bgra, w, h)
                     && let Some(entry) =
                         Self::build_entry(target.clone(), vec![frame], w, h, den)
@@ -75,7 +75,7 @@ impl super::ImageViewer {
     /// （临时小图不触发升档）。不动 `loading`、不重锚预取、不进 LRU——真图
     /// [`Self::install_current`] 会覆盖这一切。
     fn install_provisional(&mut self, entry: CacheEntry, cx: &mut Context<Self>) {
-        self.image = Some(entry.render);
+        self.state.data = Some(entry.render);
         self.intrinsic = Some(entry.intrinsic);
         self.display_denom = 1;
         cx.notify();
@@ -212,16 +212,14 @@ impl super::ImageViewer {
                                         this.install_current(entry, &decode_path, cx);
                                     }
                                 } else if this.path == decode_path {
-                                    this.load_error = Some("解码结果尺寸异常".into());
-                                    this.loading = false;
+                                    this.state.set_error("解码结果尺寸异常");
                                     cx.notify();
                                     cx.refresh_windows();
                                 }
                             }
                             Err(e) => {
                                 if this.path == decode_path {
-                                    this.load_error = Some(e);
-                                    this.loading = false;
+                                    this.state.set_error(e);
                                     cx.notify();
                                     cx.refresh_windows();
                                 }
@@ -230,8 +228,7 @@ impl super::ImageViewer {
                     }
                     Err(e) => {
                         if this.path == decode_path {
-                            this.load_error = Some(e);
-                            this.loading = false;
+                            this.state.set_error(e);
                             cx.notify();
                             cx.refresh_windows();
                         }
@@ -448,12 +445,12 @@ impl super::ImageViewer {
         // 图，整段状态（path/image/intrinsic/denom/loading/动画/预取锚）已就位——直接早退，
         // 不再 notify + refresh，省下一次「全树重述 + present」周期。
         if self.path == *path
-            && self.image.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &entry.render))
+            && self.state.data.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &entry.render))
         {
             return;
         }
         self.path = path.to_path_buf();
-        self.image = Some(entry.render.clone());
+        self.state.set_ready(entry.render.clone());
         self.intrinsic = Some(entry.intrinsic);
         self.display_denom = entry.denom;
         // 动图：挂上帧切片并启动后台时钟（详见 [`Self::spawn_anim_clock`]；reduce_motion
@@ -467,8 +464,6 @@ impl super::ImageViewer {
         self.anim_clip = if anim { entry.gif.clone() } else { None };
         self.anim_index = 0;
         self.update_display_need();
-        self.loading = false;
-        self.load_error = None;
         cx.notify();
         cx.refresh_windows();
         if anim {
@@ -480,9 +475,9 @@ impl super::ImageViewer {
         self.pump_prefetch(cx);
     }
 
-    /// 后台动画时钟：按各帧时长逐帧推进当前动图（`self.image` = 当前帧单帧 `RenderImage`），
-    /// 并 `notify`+`refresh_windows` 触发重绘——由本查看器驱动，**不依赖窗口焦点**（gpui
-    /// `img()` 自动动画只在窗口聚焦时推进，失焦即冻结，故绕开它）。
+    /// 后台动画时钟：按各帧时长逐帧推进当前动图（`self.state.data` = 当前帧单帧
+    /// `RenderImage`），并 `notify`+`refresh_windows` 触发重绘——由本查看器驱动，**不依赖
+    /// 窗口焦点**（gpui `img()` 自动动画只在窗口聚焦时推进，失焦即冻结，故绕开它）。
     /// 以 `anim_gen` 代序号防旧任务误更新：换图/重装后 `install_current` 递增代序号，
     /// 旧任务在下一轮更新时发现不匹配即自停；实体销毁后 `update` 失败自停。
     fn spawn_anim_clock(&mut self, cx: &mut Context<Self>) {
@@ -508,7 +503,7 @@ impl super::ImageViewer {
                     }
                     idx = (idx + 1) % n;
                     this.anim_index = idx;
-                    this.image = Some(frames[idx].clone());
+                    this.state.data = Some(frames[idx].clone());
                     cx.notify();
                     cx.refresh_windows();
                     true

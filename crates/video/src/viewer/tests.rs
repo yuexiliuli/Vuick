@@ -30,8 +30,7 @@
             #[cfg(test)]
             last_frame_pts: None,
             intrinsic: None,
-            loading: false,
-            load_error: None,
+            state: ui::AsyncState::idle(),
             bg: None,
             playing: false,
             playhead: 0.0,
@@ -1181,7 +1180,7 @@
             return;
         }
         assert!(
-            !cx.update(|app| viewer.read(app).load_error.is_some()),
+            !cx.update(|app| viewer.read(app).state.load_error.is_some()),
             "双设备首帧期不应报告加载错误"
         );
         // 槽池循环复用：步进 30 帧（0.5s/步）→ 每次主线程装新帧归还旧槽 → worker reap 复用；
@@ -1303,7 +1302,7 @@
             assert!(wait < 6000, "等待自适应回归首帧上屏超时");
         }
         assert!(
-            !cx.update(|app| viewer.read(app).load_error.is_some()),
+            !cx.update(|app| viewer.read(app).state.load_error.is_some()),
             "首帧期不应报告加载错误"
         );
         if !shr_supported {
@@ -3227,7 +3226,7 @@
         let (frame_ok, intrinsic, err) = loop {
             let s = cx.update(|app| {
                 let v = viewer.read(app);
-                (v.frame.is_some(), v.intrinsic, v.load_error.clone())
+                (v.frame.is_some(), v.intrinsic, v.state.load_error.clone())
             });
             if s.0 || s.2.is_some() {
                 break s;
@@ -3269,7 +3268,7 @@
         let (ready, err) = loop {
             let s = cx.update(|app| {
                 let v = viewer.read(app);
-                (!v.loading, v.load_error.clone())
+                (!v.state.loading, v.state.load_error.clone())
             });
             if s.0 {
                 break s;
@@ -4675,7 +4674,7 @@
         for _ in 0..3000 {
             let s = cx.update(|app| {
                 let v = v.read(app);
-                (v.frame.is_some(), v.intrinsic.is_some(), v.load_error.clone())
+                (v.frame.is_some(), v.intrinsic.is_some(), v.state.load_error.clone())
             });
             if (s.0 && s.1) || s.2.is_some() {
                 return s;
@@ -4685,7 +4684,7 @@
         }
         cx.update(|app| {
             let v = v.read(app);
-            (v.frame.is_some(), v.intrinsic.is_some(), v.load_error.clone())
+            (v.frame.is_some(), v.intrinsic.is_some(), v.state.load_error.clone())
         })
     }
 

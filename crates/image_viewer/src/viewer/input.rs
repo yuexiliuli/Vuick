@@ -175,14 +175,13 @@ impl super::ImageViewer {
             self.escalate_display_denom(cx);
             return;
         }
-        // 未就绪：不改 `self.image`（显示保持上一张已安装图），也不在此 notify /
+        // 未就绪：不改 `state.data`（显示保持上一张已安装图），也不在此 notify /
         // refresh——重绘只由落盘（install_current）或缓存命中（上文）触发。
-        self.loading = true;
-        self.load_error = None;
+        self.state.set_loading();
         // P1b「即时首帧」只在**首开/无上一张**时派 EXIF 缩略图占位（冷打开首帧不空等
         // 熵解码）；已有显示图像的切换不再临时替换——否则快滚到未就绪 JPEG 会闪出模糊
         // 缩略图、且占位落盘还会多点一次整窗重绘（R4A 消除闪烁）。
-        if self.image.is_none() {
+        if self.state.data.is_none() {
             self.maybe_show_exif_thumb(&path, cx);
         }
         self.queue_decode(path, true, cx);

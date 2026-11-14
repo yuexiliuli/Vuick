@@ -60,8 +60,7 @@ impl PdfViewer {
             zoom_idle_frames: 0,
             zoom_epoch: 0,
             scroll: ScrollHandle::new(),
-            loading: true,
-            load_error: None,
+            state: ui::AsyncState::loading(),
             bg: None,
             recolor: None,
             recolor_epoch: 0, // W1：随 set_recolor 实际变更 +1
@@ -134,8 +133,7 @@ impl PdfViewer {
                         this.apply_loaded(worker, doc_id, dims, outlines, cx);
                     }
                     Err(e) => {
-                        this.loading = false;
-                        this.load_error = Some(e);
+                        this.state.set_error(e);
                         cx.refresh_windows();
                         cx.notify();
                     }
@@ -203,7 +201,7 @@ impl PdfViewer {
         }
         self.pending_drops.extend(old_images);
         self.slots = vec![Slot::default(); self.dims.len()];
-        self.loading = false;
+        self.state.loading = false;
         // 重载锚点：恢复滚动到目标页（越界夹取到末页；None 保持首帧原位）
         if let Some(anchor) = self.reload_anchor.take() {
             let p = anchor.min(self.dims.len().saturating_sub(1));
@@ -333,7 +331,7 @@ impl PdfViewer {
 
     /// 是否已加载完成。P4 拆 crate 后根包 app::tests 亦消费，取消 `cfg(test)`。
     pub fn is_loaded(&self) -> bool {
-        !self.loading && self.worker.is_some() && !self.dims.is_empty()
+        !self.state.loading && self.worker.is_some() && !self.dims.is_empty()
     }
 
     /// 无任何输入下「已调度渲染」进度快照（根包 app::tests 的 PDF 用例消费，验证
@@ -634,7 +632,7 @@ impl PdfViewer {
             eprintln!(
                 "[{:.1}ms] [VIEW-TICK] loading={} dims={} pending_t={} pending_c={} fast={} bounds_h={:.0} off_y={:.0}",
                 crate::pdf::timing_ms(),
-                self.loading,
+                self.state.loading,
                 self.dims.len(),
                 self.pending_tiles.len(),
                 self.pending_cover.len(),
@@ -1501,8 +1499,7 @@ impl PdfViewer {
                     this.apply_loaded(worker, doc_id, dims, outlines, cx);
                 }
                 Err(e) => {
-                    this.loading = false;
-                    this.load_error = Some(e);
+                    this.state.set_error(e);
                     cx.refresh_windows();
                     cx.notify();
                 }

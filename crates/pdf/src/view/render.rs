@@ -693,9 +693,9 @@ impl Render for PdfViewer {
         let page_width = self.page_width();
 
         // 错误 / 加载中 / 已加载三种状态
-        let body: gpui::AnyElement = if let Some(err) = &self.load_error {
+        let body: gpui::AnyElement = if let Some(err) = &self.state.load_error {
             Self::pdf_placeholder_body(&format!("无法打开 PDF：{err}"), page_border)
-        } else if self.loading || self.dims.is_empty() {
+        } else if self.state.loading || self.dims.is_empty() {
             Self::pdf_placeholder_body("正在解析 PDF…", page_border)
         } else {
             self.render_pdf_pages(window, cx, page_width, page_bg, page_border)
@@ -891,17 +891,10 @@ impl PdfViewer {
 
 impl PdfViewer {
     /// 错误 / 加载中的居中占位文本（两分支同构，仅文案不同）。
+    /// DOM 与旧手写版本逐字一致（size_full flex 居中 + 14px + `page_border` 色），
+    /// 改由 [`ui::centered_placeholder`] 承载（Pattern 1.1 收敛）。
     fn pdf_placeholder_body(text: &str, page_border: Hsla) -> gpui::AnyElement {
-        div()
-            .h_full()
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(14.))
-            .text_color(page_border)
-            .child(text.to_string())
-            .into_any_element()
+        ui::centered_placeholder(text).color(page_border).into_any_element()
     }
 
     /// 已加载正文：**页列 DOM 虚拟化**——scroll 容器里放一个「全文档总高」的定位容器，

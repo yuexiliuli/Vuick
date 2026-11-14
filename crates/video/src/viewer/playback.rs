@@ -343,7 +343,7 @@ impl super::VideoViewer {
         self.decode_pref = if self.decode_pref == 0 { 1 } else { 0 };
         crate::decode::set_decode_mode(self.decode_pref);
         // 活跃 reader：重开 @当前播放位置（软/硬解都以 seek(playhead) 接续，不跳帧不重头）
-        if self.frame.is_some() && !self.loading && self.pending_seek.is_none() {
+        if self.frame.is_some() && !self.state.loading && self.pending_seek.is_none() {
             let t = self.playhead;
             self.start_decoder_at(t, None, false);
         }
@@ -383,8 +383,7 @@ impl super::VideoViewer {
         // P0 姿势，否则切换 Playlist 多支时每切一次漏一片 tile / 槽位）
         self.swap_display(cx);
         self.intrinsic = None;
-        self.loading = true;
-        self.load_error = None;
+        self.state.set_loading();
         self.playing = true;
         self.playhead = 0.0;
         self.duration = 1.0;

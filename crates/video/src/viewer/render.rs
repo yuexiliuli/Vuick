@@ -10,31 +10,13 @@ impl super::VideoViewer {
 
 
     /// 居中占位玻璃卡（加载中 / 加载失败共用）：铺满画布再 flex 居中，信息收敛在
-    /// 半透明圆角卡内（与 toast / 控制条同一套玻璃样式）。
-    pub(super) fn placeholder(text: &str, color: Hsla, cx: &App) -> gpui::AnyElement {
-        let theme = ui::theme::Theme::global(cx);
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                // 玻璃占位壳：走 ui::glass_card 纯壳——Acrylic 默认 α（theme 亮 0.80/暗 0.72）、
-                // NearDouble 双影逐值 = 原黑 hsla 0.16@12 + 0.12@3、PxPy(16,8) = 原 px_4/py_2；
-                // 宿主定位（外层 flex 居中）留在原位。
-                ui::glass_card(
-                    &theme.colors,
-                    theme.is_dark(),
-                    ui::GlassCardBg::Acrylic,
-                    ui::CardShellShadow::NearDouble,
-                    ui::CardShellRadius::Lg,
-                    ui::CardShellPad::PxPy(px(16.), px(8.)),
-                    None,
-                )
-                .text_size(px(14.))
-                .text_color(color)
-                .child(text.to_string()),
-            )
+    /// 半透明圆角卡内（与 toast / 控制条同一套玻璃样式）。薄封装 [`ui::centered_placeholder`]
+    /// 的 glass 档——与原手写壳逐值一致（Acrylic 默认 α、NearDouble 双影、Lg 半径、
+    /// PxPy(16,8) 内边距、14px、size_full flex 居中）。
+    pub(super) fn placeholder(text: &str, color: Hsla, _cx: &App) -> gpui::AnyElement {
+        ui::centered_placeholder(text.to_string())
+            .color(color)
+            .glass(true)
             .into_any_element()
     }
 
@@ -456,7 +438,7 @@ impl Render for VideoViewer {
         // 重开视频解码器（restart_audio=false 不打断音频/进度），把 sws 输出与逐帧
         // 上传切成显示所需像素数（省 decode/swscale/纹理上传，播放 CPU 大头之一）。
         if self.has_frame()
-            && !self.loading
+            && !self.state.loading
             && self.pending_seek.is_none()
             && vw > 0.0
             && area_h > 0.0
@@ -471,7 +453,7 @@ impl Render for VideoViewer {
         // 视频实际显示矩形（contain 等比+缩放+平移后的像素框，单位 f32）。暂停徽标以此为基准
         // 挂右上角内边距，不随窗口/画布走——防止 contain 后有黑边时徽标飘出视频范围。
         let mut vrect = (0.0, 0.0, vw, area_h);
-        let body: gpui::AnyElement = if let Some(err) = &self.load_error {
+        let body: gpui::AnyElement = if let Some(err) = &self.state.load_error {
             Self::placeholder(&format!("无法打开视频：{err}"), muted, cx)
         } else {
             match (self.gpu_frame.as_ref(), self.frame.clone(), self.intrinsic) {
@@ -533,7 +515,7 @@ impl Render for VideoViewer {
                         .h(px(dh))
                         .into_any_element()
                 }
-                (_, _, _) if self.playing || self.loading => {
+                (_, _, _) if self.playing || self.state.loading => {
                     Self::placeholder("正在打开视频…", muted, cx)
                 }
                 (_, _, _) => Self::placeholder("暂停", muted, cx),
@@ -616,7 +598,7 @@ impl Render for VideoViewer {
         // 暂停标志（右上角）：仅放大 ❚❚ 双竖条图标，无圆底/边框/投影；暂停/停在结尾时
         // 显示。以**视频实际矩形** `vrect` 为基准（右上角内 32px），不随窗口/画布走；纯视觉
         // 无交互（不遮双击全屏）；仅在有画面且非播放、未出错时挂出。
-        let badge_shown = Self::paused_badge_shown(self.playing, self.has_frame(), self.load_error.is_some());
+        let badge_shown = Self::paused_badge_shown(self.playing, self.has_frame(), self.state.load_error.is_some());
         if badge_shown {
             let badge_left = (vrect.0 + vrect.2 - 80.0).max(4.0);
             let badge_top = (vrect.1 + 30.0).max(4.0);

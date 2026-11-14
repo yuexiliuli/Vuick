@@ -399,10 +399,12 @@ pub struct PdfViewer {
     pub(crate) settle_tile_burst_dispatch: u64,
     /// 竖向滚动句柄（页列外层 scroll 容器）。
     pub(crate) scroll: ScrollHandle,
-    /// 是否仍在后台解析。
-    pub(crate) loading: bool,
-    /// 加载失败信息。
-    pub(crate) load_error: Option<String>,
+    /// 异步文档加载状态（`loading` + `load_error`）。数据本体是多字段的
+    /// （worker / doc_id / dims / page_tops / …），故用 `AsyncState<()>` 只复用
+    /// 转移 helper 的加载/错误两字段；`data` 槽不标记已加载——「已加载」由
+    /// [`Self::is_loaded`] 按 `!loading && worker.is_some() && !dims.is_empty()` 自证，
+    /// 与旧 `loading` / `load_error` 两字段语义逐字一致（Pattern 2.1 收敛）。
+    pub(crate) state: ui::AsyncState<()>,
     /// 阅读画布背景（页面“纸面”之外底色；None 用主题推导）。
     pub(crate) bg: Option<Hsla>,
     /// 纸墨重着色（页面**位图显示**层；None = 直通无重着色）。与 worker 侧 `SetRecolor`
@@ -646,8 +648,7 @@ mod tests {
                     zoom_idle_frames: 0,
                     zoom_epoch: 0,
                     scroll: ScrollHandle::new(),
-                    loading: false,
-                    load_error: None,
+                    state: ui::AsyncState::idle(),
                     bg: None,
                     recolor: None,
                     recolor_epoch: 0,
@@ -886,8 +887,7 @@ mod tests {
                     zoom_idle_frames: 0,
                     zoom_epoch: 0,
                     scroll: ScrollHandle::new(),
-                    loading: false,
-                    load_error: None,
+                    state: ui::AsyncState::idle(),
                     bg: None,
                     recolor: None,
                     recolor_epoch: 0,
@@ -1029,8 +1029,7 @@ mod tests {
                     zoom_idle_frames: 0,
                     zoom_epoch: 0,
                     scroll: ScrollHandle::new(),
-                    loading: false,
-                    load_error: None,
+                    state: ui::AsyncState::idle(),
                     bg: None,
                     recolor: None,
                     recolor_epoch: 0,
@@ -1158,8 +1157,7 @@ mod tests {
             zoom_idle_frames: 0,
             zoom_epoch: 0,
             scroll: ScrollHandle::new(),
-            loading: false,
-            load_error: None,
+            state: ui::AsyncState::idle(),
             bg: None,
             recolor: None,
             recolor_epoch: 0,

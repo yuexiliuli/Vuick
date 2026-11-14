@@ -12,8 +12,7 @@ impl super::VideoViewer {
             // 解码 FFI，直接在窗口内报错提示。
             if !crate::video::decode::available() {
                 let _ = weak.update(cx, |this, cx| {
-                    this.loading = false;
-                    this.load_error = Some(
+                    this.state.set_error(
                         "缺少视频运行库（media_ffmpeg.dll 或 avcodec-63.dll / avformat-63.dll 等 FFmpeg 运行库），视频功能不可用。请把它们放到程序 exe 同目录后重新打开。"
                             .to_string(),
                     );
@@ -45,7 +44,10 @@ impl super::VideoViewer {
             match outcome {
                 Ok(Ok(p)) => {
                     let _ = weak.update(cx, |this, cx| {
-                        this.loading = false;
+                        // 开成功：只关 loading（AsyncState 的 `data` 不承载"已加载结果"——视频的
+                        // 已加载=帧/元数据各字段上屏，故保留字面写而非 set_ready(())，避免伪造
+                        // `is_loaded()` 真值）。
+                        this.state.loading = false;
                         this.duration = p.duration.max(0.001);
                         this.fps = p.frame_rate;
                         this.intrinsic.get_or_insert((p.width as f32, p.height as f32));
@@ -88,8 +90,7 @@ impl super::VideoViewer {
                 }
                 Ok(Err(e)) => {
                     let _ = weak.update(cx, |this, cx| {
-                        this.loading = false;
-                        this.load_error = Some(e);
+                        this.state.set_error(e);
                         this.stop_pump_on_failure();
                         cx.notify();
                     });
@@ -97,7 +98,7 @@ impl super::VideoViewer {
                 Err(_) => {
                     // 超时：至少把 loading 关掉（画面静态，不卡佔位）
                     let _ = weak.update(cx, |this, cx| {
-                        this.loading = false;
+                        this.state.loading = false;
                         this.stop_pump_on_failure();
                         cx.notify();
                     });

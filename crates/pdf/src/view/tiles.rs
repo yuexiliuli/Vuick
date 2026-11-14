@@ -92,7 +92,7 @@ impl PdfViewer {
         if self.pending_recolor.is_some() {
             return true;
         }
-        if !self.loading && !self.dims.is_empty() && self.load_error.is_none() {
+        if !self.state.loading && !self.dims.is_empty() && self.state.load_error.is_none() {
             let viewport_h = f32::from(self.scroll.bounds().size.height);
             if viewport_h <= 0.0 {
                 return true;

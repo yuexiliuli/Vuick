@@ -629,10 +629,9 @@ pub struct VideoViewer {
     last_frame_pts: Option<f64>,
     /// 视频原始像素尺寸（Contain 显示比例依据）。
     intrinsic: Option<(f32, f32)>,
-    /// 打开 / 解码初始化是否仍在进行。
-    loading: bool,
-    /// 打开 / 解码初始化失败信息。
-    load_error: Option<String>,
+    /// 打开 / 解码初始化加载状态（`loading` / `load_error`；真实"已加载"分散在上屏帧与
+    /// 元数据各字段，故 `data` 不用 → [`ui::AsyncState`] 只当纯 loading/error 容器）。
+    state: ui::AsyncState<()>,
     /// 画布背景（宿主显式设置；None → 主题推导）。
     bg: Option<Hsla>,
     // --- 播放状态 ---
@@ -796,8 +795,7 @@ impl VideoViewer {
             #[cfg(test)]
             last_frame_pts: None,
             intrinsic: None,
-            loading: true,
-            load_error: None,
+            state: ui::AsyncState::loading(),
             bg: None,
             playing: true,
             playhead: 0.0,

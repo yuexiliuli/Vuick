@@ -44,6 +44,8 @@
 //! `crate::ui::` 旧路径零改动即可解析（与根包 P1/P2 的别名过渡同一策略）。
 
 pub mod assets;
+/// 异步资源加载状态包（`AsyncState<T>` = loading + load_error + data 三字段）。
+pub mod async_state;
 pub mod button;
 /// 卡片壳体绘制底层（`float_card` / B02b `glass_card` 共用底座，纯壳绘制、零裸色）。
 pub mod card_shell;
@@ -57,6 +59,8 @@ pub mod motion;
 pub mod notification;
 pub mod palette;
 pub mod pill;
+/// 居中占位文本组件（加载中 / 加载失败共用；`centered_placeholder`）。
+pub mod placeholder;
 pub mod root;
 pub mod scroll_panel;
 pub mod scrollbar;
@@ -82,6 +86,12 @@ pub use slider::{CommitMode, Slider, SliderFill, SliderThumb};
 
 /// 胶囊 chip 根级 re-export（`ui::Pill` / `ui::PillSize` / `ui::PillTone`）。
 pub use pill::{Pill, PillSize, PillTone};
+
+/// 异步资源加载状态根级 re-export（`ui::AsyncState`）。
+pub use async_state::AsyncState;
+
+/// 居中占位文本根级 re-export（`ui::centered_placeholder`）。
+pub use placeholder::centered_placeholder;
 
 /// 迁移期别名：让本 crate 内部既有的 `crate::ui::` 路径（自引用）保持解析。
 use crate as ui;
