@@ -2,7 +2,9 @@
 //!
 //! 统一 `md_wy` WyEditor 右栏/全屏宿主（`md_wy_host_children` + 占位）、WYSIWYG 活区
 //! 左面板宿主（`render_live_area` / `drive_wy_host`）、编辑区/预览区共用 Ctrl+滚轮缩放
-//! 叠层（`zoom_overlay`，宿主缩放入口的唯一转发点）与自绘滚动条 / 输入拦截层。媒体/
+//! 叠层（`zoom_overlay`，宿主缩放入口的唯一转发点）与输入拦截层。两个滚动预览面的
+//! 「滚动容器 + 自绘纵向滚动条叠层」统一收敛到 `ui::scroll_panel::ScrollPanelBuilder`（对齐
+//! shell_sidebar），活区经构建器 `on_container_mouse_down` 注入容器级点击事件。媒体/
 //! PDF 查看器元素（`preview_element`）供 shell 的媒体渲染分支复用。
 //!
 //! 主题色（`panel_bg` / `text_primary` / `text_minor`）由宿主 chrome 提供、经参数传入
@@ -15,11 +17,10 @@ use std::rc::Rc;
 
 use gpui::{
     div, px, Context, ExternalPaths, Hsla, InteractiveElement, IntoElement, ParentElement,
-    ScrollDelta, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Window,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled, Window,
 };
 use markdown_wysiwyg::WyEditor;
 use shell_core::{AppModel, EditorTab, MediaReader, LIVE_BODY_PAD_Y};
-use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 use crate::PreviewHost;
 
@@ -110,25 +111,6 @@ pub fn live_pending_input_overlay() -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// 预览区纵向滚动条叠层：`absolute inset_0` 上挂 `Scrollbar::vertical(Always)
-/// .viewport_from_layout()`，自绘可见滚动条跟随宿主 `overflow_y_scroll` 容器
-///（GPUI 原生不绘制可见滚动条）。左栏活区（`render_live_area`）与右栏/全屏
-/// WyEditor 宿主（`md_wy_host_children`）两段同构叠层统一走本 helper，行为
-/// 逐像素一致；`id` 同时作元素标识与 debug_selector，区分两条滚动免疫链路。
-pub fn vscrollbar_overlay(id: &'static str, viewport: &ScrollHandle) -> gpui::AnyElement {
-    div()
-        .id(id)
-        .debug_selector(move || id.to_string())
-        .absolute()
-        .inset_0()
-        .child(
-            Scrollbar::vertical(viewport)
-                .mode(ScrollbarMode::Always)
-                .viewport_from_layout(),
-        )
-        .into_any_element()
-}
-
 /// 统一 WyEditor 宿主驱动（live2 左面板 / 右栏预览 / 全屏预览共用）：渲染期注入
 /// 宿主滚动句柄 + 内容顶部内衬，推入当前视口顶部（元素局部 y = 滚动偏移 − 顶部
 /// 内衬），再 `prepare_font_zoom`——字号变化时 WyEditor 在 render 期按新字号重建帧
@@ -171,84 +153,81 @@ pub fn render_live_area<H: PreviewHost>(
     let live_any = ed.clone().into_any_element();
     // 场景 B 转发句柄：`#live-scroll` 容器点击命中 WyEditor 下方空白 → 光标钳到
     // 内容末尾 + 聚焦（等效于点末尾后）。命中在 WyEditor 元素内 → 不转发（元素自身
-    // `on_mouse_down` 走普通命中路径）；`#live-scroll` 是 `size_full` 容器、覆盖
-    // auto-grow 元素之下的整片可见空区（素材：元素高=内容高，底部空白在元素之外
-    // 容器之内，普通点击到不了 WyEditor），选容器挂即覆盖。
+    // `on_mouse_down` 走普通命中路径）；`#live-scroll` 覆盖 auto-grow 元素之下的整片
+    // 可见空区（素材：元素高=内容高，底部空白在元素之外容器之内，普通点击到不了
+    // WyEditor），选容器挂即覆盖。逻辑经 `ScrollPanelBuilder::on_container_mouse_down`
+    // 整体搬进滚动容器（行为逐字，见 preview.rs 命中测试）。
     let live_ed = ed.clone();
     let text_color = text_primary;
     let fs = model.borrow().font_size;
     // 纵向滚动句柄（跨帧稳定）：`#live-scroll` 原生 `overflow_y_scroll` 在此
     // GPUI 不绘制可见滚动条，右侧 `Scrollbar::vertical` 自绘跟随它。
     let vhand = model.borrow().tabs[active].live_vscroll.clone();
+    let live_scroll = ui::scroll_panel::ScrollPanelBuilder::new("live-scroll", vhand)
+        .bar_id("live-vscrollbar-overlay")
+        .on_container_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |_: &mut H,
+                         ev: &gpui::MouseDownEvent,
+                         window: &mut Window,
+                         cx: &mut Context<H>| {
+                // 仅处理严格落在 WyEditor 元素底下的空白（元素内点击由元素自身
+                // on_mouse_down 消费，这里再放行不发重复转发——K15 冒泡不误触）。
+                let Some(b) = live_ed.read(cx).last_bounds() else {
+                    return;
+                };
+                if ev.position.y <= b.bottom() {
+                    return;
+                }
+                // 光标立即钳到内容末尾；聚焦放到**本次鼠标派发之后**（`window.defer`）——
+                // 实测同一次 mouse_down 派发链里存在把焦点抢走的监听（当场 `focus()` 会被
+                // 后续监听覆盖成别的句柄），派发结束后的 defer 再断言一次才稳定
+                //（headless 实测：defer 后窗口聚焦恒为 live2）。
+                let fwd = live_ed.clone();
+                live_ed.update(cx, |e, e_cx| e.move_caret_to_doc_end_focused(window, e_cx));
+                window.defer(cx, move |window, cx| {
+                    fwd.update(cx, |e, e_cx| {
+                        e.move_caret_to_doc_end_focused(window, e_cx)
+                    });
+                });
+                cx.notify();
+            }),
+        )
+        .build(
+            div()
+                .id("live-body")
+                .debug_selector(|| "live-body".into())
+                .w_full()
+                .px(px(12.))
+                .py(px(LIVE_BODY_PAD_Y))
+                .text_size(px(fs))
+                .text_color(text_color)
+                .child(live_any),
+        )
+        .into_any_element();
     div()
         .id("editor-area")
         .debug_selector(|| "editor-area".into())
         .relative()
+        .flex()
+        .flex_col()
         .flex_1()
         .flex_grow(grow)
         .min_w(px(0.))
         .min_h(px(0.))
         .bg(panel_bg)
         .overflow_hidden()
-        .child(
-            div()
-                .id("live-scroll")
-                .debug_selector(|| "live-scroll".into())
-                .relative()
-                .size_full()
-                .overflow_y_scroll()
-                .track_scroll(&vhand)
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |_: &mut H,
-                                 ev: &gpui::MouseDownEvent,
-                                 window: &mut Window,
-                                 cx: &mut Context<H>| {
-                        // 仅处理严格落在 WyEditor 元素底下的空白（元素内点击由元素自身
-                        // on_mouse_down 消费，这里再放行不发重复转发——K15 冒泡不误触）。
-                        let Some(b) = live_ed.read(cx).last_bounds() else {
-                            return;
-                        };
-                        if ev.position.y <= b.bottom() {
-                            return;
-                        }
-                        // 光标立即钳到内容末尾；聚焦放到**本次鼠标派发之后**（`window.defer`）——
-                        // 实测同一次 mouse_down 派发链里存在把焦点抢走的监听（当场 `focus()` 会被
-                        // 后续监听覆盖成别的句柄），派发结束后的 defer 再断言一次才稳定
-                        //（headless 实测：defer 后窗口聚焦恒为 live2）。
-                        let fwd = live_ed.clone();
-                        live_ed.update(cx, |e, e_cx| e.move_caret_to_doc_end_focused(window, e_cx));
-                        window.defer(cx, move |window, cx| {
-                            fwd.update(cx, |e, e_cx| {
-                                e.move_caret_to_doc_end_focused(window, e_cx)
-                            });
-                        });
-                        cx.notify();
-                    }),
-                )
-                .child(
-                    div()
-                        .id("live-body")
-                        .debug_selector(|| "live-body".into())
-                        .w_full()
-                        .px(px(12.))
-                        .py(px(LIVE_BODY_PAD_Y))
-                        .text_size(px(fs))
-                        .text_color(text_color)
-                        .child(live_any),
-                ),
-        )
-        .child(vscrollbar_overlay("live-vscrollbar-overlay", &vhand))
+        .child(live_scroll)
         .child(zoom_overlay::<H>(cx))
         .into_any_element()
 }
 
 /// A2：MD 右栏/全屏 WyEditor 预览宿主（对齐左栏活区 `render_live_area` 结构）：
-/// 单一外层容器（`.overflow_hidden()`）+ 直接子件三件套（滚动容器 + 自绘纵向滚动条
-/// 叠层 + Ctrl+滚轮缩放叠层）。渲染期推进全局字号并做**缩放视口锚定**（同左面板
-/// `render_live_area`）：注入宿主滚动句柄 + 顶部内衬，推入当前视口顶部（元素局部
-/// y），再 `prepare_font_zoom`——字号变化在 render 期按新字号重建帧并把锚点块精确
-/// 位置写回 `ScrollHandle`。
+/// 单一外层容器（`.overflow_hidden()`）+ 直接子件二件套（`ui::scroll_panel` 滚动面板
+/// ［滚动容器 + 自绘纵向滚动条叠层］+ Ctrl+滚轮缩放叠层）。渲染期推进全局字号并做
+/// **缩放视口锚定**（同左面板 `render_live_area`）：注入宿主滚动句柄 + 顶部内衬，推入
+/// 当前视口顶部（元素局部 y），再 `prepare_font_zoom`——字号变化在 render 期按新字号
+/// 重建帧并把锚点块精确位置写回 `ScrollHandle`。
 pub fn md_wy_host_children<H: PreviewHost>(
     model: &Rc<RefCell<AppModel>>,
     window: &mut Window,
@@ -272,14 +251,12 @@ pub fn md_wy_host_children<H: PreviewHost>(
     let fs = model.borrow().font_size;
     let any = ed.clone().into_any_element();
     let text_color = text_primary;
-    let scroll = div()
-        .id("md-wy-scroll")
-        .debug_selector(|| "md-wy-scroll".into())
-        .relative()
-        .size_full()
-        .overflow_y_scroll()
-        .track_scroll(&vhand)
-        .child(
+    // 滚动面板收敛到 ui::scroll_panel::ScrollPanelBuilder（wrap/bar id 用原值，测试按
+    // 这些 id 断言调试 bounds）；无容器事件钩子（md-wy 面无容器级点击处理）。
+    let scroll = ui::scroll_panel::ScrollPanelBuilder::new("md-wy-scroll", vhand)
+        .wrap_id("md-wy-scroll-wrap")
+        .bar_id("md-wy-vscrollbar-overlay")
+        .build(
             div()
                 .id("md-wy-body")
                 .debug_selector(|| "md-wy-body".into())
@@ -292,8 +269,8 @@ pub fn md_wy_host_children<H: PreviewHost>(
                 .text_size(px(fs))
                 .text_color(text_color)
                 .child(any),
-        );
-    let scroll_overlay = vscrollbar_overlay("md-wy-vscrollbar-overlay", &vhand);
+        )
+        .into_any_element();
     let zoom_overlay = zoom_overlay::<H>(cx);
     if fullscreen {
         return div()
@@ -301,10 +278,11 @@ pub fn md_wy_host_children<H: PreviewHost>(
             .debug_selector(|| "fullscreen-preview".into())
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
             .bg(panel_bg)
             .overflow_hidden()
             .child(scroll)
-            .child(scroll_overlay)
             .child(zoom_overlay)
             .into_any_element();
     }
@@ -317,6 +295,8 @@ pub fn md_wy_host_children<H: PreviewHost>(
         .id("preview-md-wy")
         .debug_selector(|| "preview-md-wy".into())
         .relative()
+        .flex()
+        .flex_col()
         // grow = 预览区占宽比例（与旧预览/左编辑区同为 flex 项：basis 0 + shrink 1）
         .flex_grow(grow)
         .flex_shrink_1()
@@ -328,7 +308,6 @@ pub fn md_wy_host_children<H: PreviewHost>(
         .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
         .on_drop(drop_paths)
         .child(scroll)
-        .child(scroll_overlay)
         .child(zoom_overlay)
         .into_any_element()
 }/// Step2：右栏 `md_wy` 未就绪（大文档后台整篇解析在途）时的「正在排版」占位。
