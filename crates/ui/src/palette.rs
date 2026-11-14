@@ -20,14 +20,14 @@ use std::rc::Rc;
 use gpui::{
     AnimationExt, AnyElement, App, AppContext, Context, DismissEvent, ElementId, Entity,
     EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseDownEvent, ParentElement as _, Render, ScrollHandle, StatefulInteractiveElement,
+    MouseDownEvent, ParentElement as _, Render, ScrollHandle,
     Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::ui::input::{Input, InputEvent, InputState};
 use crate::ui::list_item_row::ListItemRow;
 use crate::ui::motion::hover_spring;
-use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
+use crate::ui::scroll_panel::ScrollPanelBuilder;
 use crate::ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 use crate::ui::theme::{ChromeColors, Theme};
 
@@ -602,34 +602,17 @@ impl Render for CommandPalette {
                 )
             })
             .child(
-                div()
-                    .id("command-palette-list")
-                    .debug_selector(|| "command-palette-list".into())
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(
+                ScrollPanelBuilder::new("command-palette-scroll", scroll_handle)
+                    .wrap_id("command-palette-list")
+                    .bar_id("command-palette-vscrollbar")
+                    .container_style(|d| d.size_full().p(px(4.)))
+                    .build(
                         div()
-                            .id("command-palette-scroll")
-                            .debug_selector(|| "command-palette-scroll".into())
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&scroll_handle)
-                            .p(px(4.))
-                            .child(div().flex().flex_col().gap_y(px(1.)).children(rows))
+                            .flex()
+                            .flex_col()
+                            .gap_y(px(1.))
+                            .children(rows)
                             .when_some(list_empty, |d, e| d.child(e)),
-                    )
-                    .child(
-                        div()
-                            .id("command-palette-vscrollbar")
-                            .debug_selector(|| "command-palette-vscrollbar".into())
-                            .absolute()
-                            .inset_0()
-                            .child(
-                                Scrollbar::vertical(&scroll_handle)
-                                    .mode(ScrollbarMode::Always)
-                                    .viewport_from_layout(),
-                            ),
                     ),
             );
 

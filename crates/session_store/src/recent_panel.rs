@@ -44,7 +44,7 @@ use gpui::{
 use ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 use ui::icon::{Icon, IconName};
 use ui::motion::hover_spring;
-use ui::scrollbar::{Scrollbar, ScrollbarMode};
+use ui::scroll_panel::ScrollPanelBuilder;
 
 /// 「打开最近」面板的宿主抽象：把面板对宿主的 5 个交互收敛为最小接口，使面板实体
 /// （session_store）不依赖 shell 的具体宿主类型。shell 侧以 `impl RecentPanelHost for
@@ -569,34 +569,11 @@ impl<H: RecentPanelHost> Render for RecentPanel<H> {
                 |this, v| this.opacity(v),
             )
             .child(
-                div()
-                    .id("recent-panel-list")
-                    .debug_selector(|| "recent-panel-list".into())
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(
-                        div()
-                            .id("recent-panel-scroll")
-                            .debug_selector(|| "recent-panel-scroll".into())
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&scroll_handle)
-                            .p(px(4.))
-                            .child(div().flex().flex_col().gap_y(px(1.)).children(rows)),
-                    )
-                    .child(
-                        div()
-                            .id("recent-panel-vscrollbar")
-                            .debug_selector(|| "recent-panel-vscrollbar".into())
-                            .absolute()
-                            .inset_0()
-                            .child(
-                                Scrollbar::vertical(&scroll_handle)
-                                    .mode(ScrollbarMode::Always)
-                                    .viewport_from_layout(),
-                            ),
-                    ),
+                ScrollPanelBuilder::new("recent-panel-scroll", scroll_handle)
+                    .wrap_id("recent-panel-list")
+                    .bar_id("recent-panel-vscrollbar")
+                    .container_style(|d| d.size_full().p(px(4.)))
+                    .build(div().flex().flex_col().gap_y(px(1.)).children(rows)),
             );
 
         // 合成层纪律（同 CommandPalette，见其 render 末尾注释）：整层 deferred 独立
