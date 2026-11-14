@@ -594,7 +594,7 @@ impl MusicPlayer {
         let path = self.library[idx].path.clone();
         let rate = match &self.sink {
             Some(s) => s.sample_rate(),
-            None => match AudioSink::open() {
+            None => match AudioSink::open_with_tag("[music]") {
                 Ok(s) => {
                     self.spawn_worker(&s);
                     let rate = s.sample_rate();

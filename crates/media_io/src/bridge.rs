@@ -142,6 +142,9 @@ pub struct Bridge {
     pub video_set_skip_nonkey: libloading::Symbol<'static, FnVideoSetSkipNonkey>,
     pub video_skip_to_bgra: libloading::Symbol<'static, FnSkipToBgra>,
     pub open_audio: libloading::Symbol<'static, FnOpenAudio>,
+    /// 音频顶层参数读取（`vff_audio_params`；music 消费方音频子集依赖）。视频侧亦持该
+    /// 类型但只用 video_params——全符号表同时覆盖两宿主的音频/视频参数入口。
+    pub audio_params: libloading::Symbol<'static, FnParams>,
     pub video_params: libloading::Symbol<'static, FnParams>,
     pub video_seek: libloading::Symbol<'static, FnSeek>,
     pub audio_seek: libloading::Symbol<'static, FnSeek>,
@@ -206,6 +209,7 @@ fn load_bridge() -> Option<Bridge> {
         video_set_skip_nonkey: sym!(b"vff_video_set_skip_nonkey\0", FnVideoSetSkipNonkey),
         video_skip_to_bgra: sym!(b"vff_video_skip_to_bgra\0", FnSkipToBgra),
         open_audio: sym!(b"vff_open_audio\0", FnOpenAudio),
+        audio_params: sym!(b"vff_audio_params\0", FnParams),
         video_params: sym!(b"vff_video_params\0", FnParams),
         video_seek: sym!(b"vff_video_seek\0", FnSeek),
         audio_seek: sym!(b"vff_audio_seek\0", FnSeek),

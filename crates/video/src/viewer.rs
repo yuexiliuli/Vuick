@@ -69,7 +69,7 @@ use ui::motion::hover_spring;
 // 现已单源在 ui::theme::GLASS_PANEL_ALPHA_*；render.rs 经 sub::* 继承本 use）。
 use ui::theme::{GLASS_PANEL_ALPHA_DARK, GLASS_PANEL_ALPHA_LIGHT};
 
-use super::audio::AudioSink;
+use media_io::audio_sink::AudioSink;
 use super::decode::{AudioReader, VideoReader};
 use super::hw::{CopyError, SharedCopier, create_worker_d3d11_device};
 use super::subtitle::{SubtitleEntry, SubtitleStyle, find_active_subtitle, parse_ass_text};

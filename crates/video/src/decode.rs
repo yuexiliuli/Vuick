@@ -24,6 +24,14 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context as _, Result};
 
+// 共享 FFI 桥（媒体运行库）：find_lib / OnceLock 缓存 / sym! 符号提升 / available /
+// open_error_with_detail / utf8_cstr 全在 `media_io::bridge`（加载语义逐字一致：same
+// find_lib 路径、进程内缓存一次、损坏 dll 同 fallback）。本模块只保留视频侧
+// Reader / VideoParams 包装（rc!=0 Err / rc=1 set_len / -1 扩容 / `_into` 复用缓冲）。
+use media_io::bridge::{
+    bridge, open_error_with_detail, utf8_cstr, Handle, ParamFFI, SubtitleEntryFFI,
+};
+
 /// 视频顶层参数（打开即得，无需逐帧解码）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VideoParams {
@@ -43,21 +51,9 @@ pub struct VideoParams {
 #[allow(dead_code)] // 便捷壳 [`VideoReader::next_frame_bgra`] 用；播放 worker 走 `_into`（复用缓冲）
 pub type DecodedFrame = (f64, u32, u32, Vec<u8>);
 
-// ---------------- 运行时 FFI 桥 ----------------
+// ---------------- 共享 FFI 桥（media_io） ----------------
 
-/// 与 `media-ffmpeg` 的 `ParamFFI` 布局一致。
-#[repr(C)]
-struct ParamFFI {
-    width: u32,
-    height: u32,
-    duration: f64,
-    frame_rate_num: u32,
-    frame_rate_den: u32,
-    has_audio: u8,
-    sample_rate: u32,
-    channels: u32,
-}
-
+/// 视频参数换算（视频侧保留；FFI 布局 `ParamFFI` 来自共享桥）。
 impl From<ParamFFI> for VideoParams {
     fn from(p: ParamFFI) -> Self {
         VideoParams {
@@ -71,219 +67,10 @@ impl From<ParamFFI> for VideoParams {
     }
 }
 
-type Handle = *mut std::ffi::c_void;
-type CChar = std::ffi::c_char;
-type CInt = std::ffi::c_int;
-
-type FnOpen = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
-// 安全硬解（FFmpeg 自有设备，无注入）：打开/取 IS/HW/seek 预滚免转换跳帧
-type FnOpenHwPrefer = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
-type FnVideoIsHw = unsafe extern "C" fn(Handle) -> CInt;
-type FnVideoSetSkipNonkey = unsafe extern "C" fn(Handle, CInt);
-type FnSkipToBgra = unsafe extern "C" fn(
-    Handle,
-    f64,
-    *mut u8,
-    usize,
-    *mut f64,
-    *mut u32,
-    *mut u32,
-    *mut u64,
-) -> CInt;
-type FnOpenAudio = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
-type FnParams = unsafe extern "C" fn(Handle, *mut ParamFFI);
-type FnSeek = unsafe extern "C" fn(Handle, f64) -> CInt;
-type FnFrame = unsafe extern "C" fn(Handle, *mut u8, usize, *mut f64, *mut u32, *mut u32) -> CInt;
-type FnPcm = unsafe extern "C" fn(Handle, *mut f32, usize, *mut f64, *mut usize) -> CInt;
-type FnClose = unsafe extern "C" fn(Handle);
-// 双设备 GPU 直通（零回读）：外部 D3D11 设备注入解码——`device`/`device_context` 为
-// worker 自有 `ID3D11Device*`/`ID3D11DeviceContext*` 的 usize 裸指针（见 [`VideoReader::open_hw`]）。
-type FnOpenVideoHw = unsafe extern "C" fn(*const CChar, u32, usize, usize, *mut Handle) -> CInt;
-type FnVideoFrameHw = unsafe extern "C" fn(
-    Handle,
-    *mut f64,
-    *mut u32,
-    *mut u32,
-    *mut usize,
-    *mut u32,
-) -> *mut std::ffi::c_void;
-type FnVideoFrameRelease = unsafe extern "C" fn(*mut std::ffi::c_void);
-// 能力诊断：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」——进/出参姿势同
-// [`FnOpenVideoHw`]（worker 自有设备/上下文的 usize 裸指针）；1 = 支持、0 = 不支持/空指针。
-// 纯探测、无解码器副作用。**仅供能力自诊断/测试**——双设备直通不再以它为门（解码池恒
-// DECODER-only，渲染端只采样共享槽）。
-type FnSupportsShaderBoundTextures = unsafe extern "C" fn(usize, usize) -> CInt;
-
-// 字幕 FFI 类型
-#[repr(C)]
-#[allow(dead_code)] // FFI 布局定义，实际用独立函数取字幕
-struct SubtitleParamsFFI {
-    stream_count: u32,
-    format: u32,
-}
-
-#[repr(C)]
-struct SubtitleEntryFFI {
-    start_pts: f64,
-    end_pts: f64,
-    text_len: usize,
-}
-
-type FnOpenSubtitle = unsafe extern "C" fn(*const CChar, *mut *mut std::ffi::c_void) -> CInt;
-type FnSubtitleCount = unsafe extern "C" fn(*mut std::ffi::c_void) -> usize;
-type FnSubtitleGetInfo = unsafe extern "C" fn(*mut std::ffi::c_void, usize, *mut SubtitleEntryFFI) -> CInt;
-type FnSubtitleGetText = unsafe extern "C" fn(*mut std::ffi::c_void, usize, *mut u8, usize) -> CInt;
-type FnCloseSubtitle = unsafe extern "C" fn(*mut std::ffi::c_void);
-// R2-4：打开失败分类（dll 新增 additive 导出；老 dll 缺符号 → 桥可选解析、回退通用文案）
-type FnLastError = unsafe extern "C" fn() -> *const CChar;
-
-/// 已加载的动态函数集（持有 `Library` 保句柄存活；符号指针在进程生命周期内有效）。
-struct Bridge {
-    open_video: libloading::Symbol<'static, FnOpen>,
-    open_video_hw_prefer: libloading::Symbol<'static, FnOpenHwPrefer>,
-    video_is_hw: libloading::Symbol<'static, FnVideoIsHw>,
-    video_set_skip_nonkey: libloading::Symbol<'static, FnVideoSetSkipNonkey>,
-    video_skip_to_bgra: libloading::Symbol<'static, FnSkipToBgra>,
-    open_audio: libloading::Symbol<'static, FnOpenAudio>,
-    video_params: libloading::Symbol<'static, FnParams>,
-    video_seek: libloading::Symbol<'static, FnSeek>,
-    audio_seek: libloading::Symbol<'static, FnSeek>,
-    video_frame: libloading::Symbol<'static, FnFrame>,
-    audio_pcm: libloading::Symbol<'static, FnPcm>,
-    close_video: libloading::Symbol<'static, FnClose>,
-    close_audio: libloading::Symbol<'static, FnClose>,
-    // 双设备 GPU 直通：外部设备注入符号（kernel 已导出；见 FFI 类型注释）
-    open_video_hw: libloading::Symbol<'static, FnOpenVideoHw>,
-    video_frame_hw: libloading::Symbol<'static, FnVideoFrameHw>,
-    video_frame_release: libloading::Symbol<'static, FnVideoFrameRelease>,
-    #[allow(dead_code)] // 能力诊断 FFI（仅供测试 `dual_gate_capability` 用，非直通门控）
-    d3d11_supports_shader_bound_textures: libloading::Symbol<'static, FnSupportsShaderBoundTextures>,
-    #[allow(dead_code)] // FFI 符号，实际在 SubtitleReader 中用
-    open_subtitle: libloading::Symbol<'static, FnOpenSubtitle>,
-    #[allow(dead_code)]
-    subtitle_count: libloading::Symbol<'static, FnSubtitleCount>,
-    #[allow(dead_code)]
-    subtitle_get_info: libloading::Symbol<'static, FnSubtitleGetInfo>,
-    #[allow(dead_code)]
-    subtitle_get_text: libloading::Symbol<'static, FnSubtitleGetText>,
-    #[allow(dead_code)]
-    close_subtitle: libloading::Symbol<'static, FnCloseSubtitle>,
-    /// R2-4（可选）：打开失败分类串读取口。老 dll 无 `vff_last_error_message` → `None`，
-    /// 打开失败回落通用文案（ABI 向后兼容）；新 dll → 打开失败时把分类带进错误提示。
-    last_error: Option<libloading::Symbol<'static, FnLastError>>,
-    #[allow(dead_code)] // 保底：Library 被进程级持有，符号才始终有效
-    _lib: libloading::Library,
-}
-
-fn find_lib() -> std::path::PathBuf {
-    let name = "media_ffmpeg.dll";
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let cands = [dir.join(name), dir.join("..").join(name)];
-        for c in cands {
-            if c.is_file() {
-                return c;
-            }
-        }
-    }
-    // 兜底：交给 LoadLibrary 的 exe 目录 / CWD / PATH / 系统目录搜索
-    std::path::PathBuf::from(name)
-}
-
-fn load_bridge() -> Option<Bridge> {
-    let path = find_lib();
-    let lib = unsafe { libloading::Library::new(&path) }.ok()?;
-    macro_rules! sym {
-        ($n:literal, $ty:ty) => {{
-            let s = unsafe { lib.get::<$ty>($n).ok()? };
-            // 提升借期到 'static：Library 与本 struct 在进程级同生共死，符号不会失效。
-            unsafe {
-                std::mem::transmute::<libloading::Symbol<'_, $ty>, libloading::Symbol<'static, $ty>>(s)
-            }
-        }};
-    }
-    Some(Bridge {
-        open_video: sym!(b"vff_open_video\0", FnOpen),
-        open_video_hw_prefer: sym!(b"vff_open_video_hw_prefer\0", FnOpenHwPrefer),
-        video_is_hw: sym!(b"vff_video_is_hw\0", FnVideoIsHw),
-        video_set_skip_nonkey: sym!(b"vff_video_set_skip_nonkey\0", FnVideoSetSkipNonkey),
-        video_skip_to_bgra: sym!(b"vff_video_skip_to_bgra\0", FnSkipToBgra),
-        open_audio: sym!(b"vff_open_audio\0", FnOpenAudio),
-        video_params: sym!(b"vff_video_params\0", FnParams),
-        video_seek: sym!(b"vff_video_seek\0", FnSeek),
-        audio_seek: sym!(b"vff_audio_seek\0", FnSeek),
-        video_frame: sym!(b"vff_video_frame\0", FnFrame),
-        audio_pcm: sym!(b"vff_audio_pcm\0", FnPcm),
-        close_video: sym!(b"vff_close_video\0", FnClose),
-        close_audio: sym!(b"vff_close_audio\0", FnClose),
-        open_video_hw: sym!(b"vff_open_video_hw\0", FnOpenVideoHw),
-        video_frame_hw: sym!(b"vff_video_frame_hw\0", FnVideoFrameHw),
-        video_frame_release: sym!(b"vff_video_frame_release\0", FnVideoFrameRelease),
-        d3d11_supports_shader_bound_textures: sym!(
-            b"vff_d3d11_supports_shader_bound_textures\0",
-            FnSupportsShaderBoundTextures
-        ),
-        open_subtitle: sym!(b"vff_open_subtitle\0", FnOpenSubtitle),
-        subtitle_count: sym!(b"vff_subtitle_count\0", FnSubtitleCount),
-        subtitle_get_info: sym!(b"vff_subtitle_get_info\0", FnSubtitleGetInfo),
-        subtitle_get_text: sym!(b"vff_subtitle_get_text\0", FnSubtitleGetText),
-        close_subtitle: sym!(b"vff_close_subtitle\0", FnCloseSubtitle),
-        // R2-4 additive：新 dll 才导出 `vff_last_error_message`——**可选解析**（.ok()），
-        // 老 dll 缺符号不使整桥加载失败，打开失败回落通用文案。
-        last_error: {
-            let s = unsafe { lib.get::<FnLastError>(b"vff_last_error_message\0") }.ok();
-            s.map(|sym| unsafe {
-                std::mem::transmute::<libloading::Symbol<'_, FnLastError>, libloading::Symbol<'static, FnLastError>>(sym)
-            })
-        },
-        _lib: lib,
-    })
-}
-
-/// R2-4：取 dll 侧最近一次打开失败分类串（`vff_last_error_message` 可选符号；桥里有且
-/// 是在**同一线程**先失败后立即读取——视频/音频 worker 在 open 失败处同线程调用）。
-/// 老 dll / 桥不可用 → `None`（上层回落通用「打开媒体失败」文案）。
-fn dll_last_error() -> Option<String> {
-    let b = bridge()?;
-    let sym = b.last_error.as_ref()?;
-    let p = unsafe { (sym)() };
-    if p.is_null() {
-        return None;
-    }
-    let cstr = unsafe { std::ffi::CStr::from_ptr(p) };
-    let s = cstr.to_string_lossy();
-    if s.trim().is_empty() {
-        return None;
-    }
-    Some(s.trim_end().to_string())
-}
-
-/// R2-4：打开失败错误构造——dll 侧有分类串则附到主文案后（`（原因: …）`），无（老 dll /
-/// 桥不可用 / 串为空）则原样返回通用文案。分类串取首行并截断，避免长 anyhow 链刷屏。
-fn open_error_with_detail(base: String) -> anyhow::Error {
-    let Some(detail) = dll_last_error() else {
-        return anyhow::anyhow!("{base}");
-    };
-    let first_line = detail.split('\n').next().unwrap_or("").trim();
-    let capped: String = first_line.chars().take(200).collect();
-    anyhow::anyhow!("{base}（{}）", capped)
-}
-
 /// 视频运行库是否可用（`media_ffmpeg.dll` 与其 FFmpeg 依赖能否被加载，进程内缓存一次）。
-/// 缺库 → false → 查看器在窗口内报错而非害 exe 无法启动。
+/// 缺库 → false → 查看器在窗口内报错而非害 exe 无法启动。委托共享桥同口径。
 pub fn available() -> bool {
-    bridge().is_some()
-}
-
-fn bridge() -> Option<&'static Bridge> {
-    static B: OnceLock<Option<Bridge>> = OnceLock::new();
-    B.get_or_init(load_bridge).as_ref()
-}
-
-fn utf8_cstr(path: &Path) -> Result<std::ffi::CString> {
-    let bytes = path.as_os_str().as_encoded_bytes();
-    std::ffi::CString::new(bytes).context("路径含 NUL")
+    media_io::bridge::available()
 }
 
 // ---------------- 解码偏好旋钮（测试隔离用） ----------------

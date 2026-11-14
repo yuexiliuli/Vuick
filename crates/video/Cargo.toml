@@ -10,9 +10,10 @@ base = { path = "../base" }
 gpui = { workspace = true }
 kimg = { workspace = true }
 anyhow = { workspace = true }
-cpal = { workspace = true }
-libloading = { workspace = true }
 config = { path = "../config" }
+# 共享媒体 IO（FFmpeg FFI 桥 + CPAL 音频 sink）：本 crate 已迁至 media_io，不再直接依赖
+# cpal / libloading（media_io transitively 提供）。
+media_io = { path = "../media_io" }
 # video 图标变体（IconName::Play/Pause/Volume/…）由本 crate 的 ui 依赖开启其 `video` feature。
 ui = { path = "../ui", features = ["video"] }
 viewer = { path = "../viewer" }

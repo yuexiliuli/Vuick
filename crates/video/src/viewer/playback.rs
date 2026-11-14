@@ -22,9 +22,10 @@ impl super::VideoViewer {
             if self.diag_ticks >= 60 {
                 self.diag_ticks = 0;
                 if let Some(sink) = &self.audio {
-                    let (calls, underrun, lockfail, played) = sink.stats();
+                    // 共享 sink 统一 5 元 stats（dropped_samples：生产者侧队头丢弃，正常回压下恒 0）
+                    let (calls, underrun, lockfail, played, dropped) = sink.stats();
                     eprintln!(
-                        "[video-audio] calls={calls} underrun_samples={underrun} lockfail={lockfail} played_frames={played}"
+                        "[video-audio] calls={calls} underrun_samples={underrun} lockfail={lockfail} played_frames={played} dropped_samples={dropped}"
                     );
                 }
             }

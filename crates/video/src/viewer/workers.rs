@@ -1011,7 +1011,8 @@ impl super::VideoViewer {
         if self.audio.is_some() || self.audio_err {
             return;
         }
-        match AudioSink::open() {
+        // 共享媒体 IO sink（err 标签 "[video]"；open 失败仅报错一次 → 纯画面 + 墙钟）
+        match AudioSink::open_with_tag("[video]") {
             Ok(sink) => {
                 eprintln!(
                     "[video] 音频输出就绪：{}Hz 立体声",

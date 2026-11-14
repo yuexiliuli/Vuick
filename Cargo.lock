@@ -2820,7 +2820,7 @@ dependencies = [
  "cpal",
  "gpui",
  "kimg",
- "libloading",
+ "media_io",
  "ui",
 ]
 
@@ -5173,10 +5173,9 @@ dependencies = [
  "anyhow",
  "base",
  "config",
- "cpal",
  "gpui",
  "kimg",
- "libloading",
+ "media_io",
  "ui",
  "viewer",
  "windows 0.62.2",
