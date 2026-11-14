@@ -118,6 +118,68 @@ fn markdown_editor_renders_wysiwyg_styles(cx: &mut TestAppContext) {
     assert_eq!(editor_text(&host, cx), text);
 }
 
+/// 括号文本字符按嵌套层级着色（对齐 VS Code bracketPairColorization）：`build_rows`
+/// 对含括号行把 `col..col+1` span 覆为 `bracket_guide_palette[depth % 3]`（与引导线
+/// 同色池）；无括号行走零分配 Borrowed 分支、产物与纯语法一致。
+///
+/// 用无语法高亮语言（None）做精确断言：无基色 → 每行样式段恰为 bracket 覆色 span，
+/// 可逐字符验深度取色与「邻近非括号字节零分配不变」（空）。
+/// 字节列演算（col 皆字节下标）：
+/// - 行 0 `fn f() {`：`(`4、`)`5、`{`7（均 d0 → palette[0]）；
+/// - 行 1 `    if ok { foo(bar); }`：`{`10（d1）、`(`15/`)`19（d2）、`}`22（d1）
+///   （"    if ok { foo(bar); }"：i4..9、{10、f12..15、`(`15、`)`19、`}`22）；
+/// - 行 2 `    let n = 1;`：无括号 → 空。
+#[gpui::test]
+fn bracket_char_colorization_by_depth(cx: &mut TestAppContext) {
+    use std::ops::Range;
+    use gpui::HighlightStyle;
+
+    let text = "fn f() {\n    if ok { foo(bar); }\n    let n = 1;\n}\n";
+    let (host, cx) = open(cx, text);
+
+    let palette = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bracket_guide_palette());
+    let bracket_chars = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bracket_chars().to_vec());
+    // 括号字符表已随 set_text 同步落地（打开/替换路径 `recompute_fold_brackets_full`），
+    // 且按 (line,col) 升序——着色消费的数据源。
+    assert!(!bracket_chars.is_empty(), "打开路径应同步落地括号字符表");
+
+    let row = |cx: &mut VisualTestContext, l: usize| -> Vec<(Range<usize>, HighlightStyle)> {
+        cx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |ed, _| ed.test_line_styles(window, l))
+        })
+    };
+
+    // 行 0：单行配对 `(`/`)` 与开块 `{` 均 d0。
+    let r0 = row(cx, 0);
+    assert_eq!(
+        r0,
+        vec![
+            (4..5, HighlightStyle { color: Some(palette[0]), ..Default::default() }),
+            (5..6, HighlightStyle { color: Some(palette[0]), ..Default::default() }),
+            (7..8, HighlightStyle { color: Some(palette[0]), ..Default::default() }),
+        ],
+        "行 0 括号字符应各按 d0 覆 palette[0]: {r0:?}"
+    );
+
+    // 行 1：嵌套两层——`{` d1 → palette[1]，`(`/`)` d2 → palette[2]，`}` d1。
+    let r1 = row(cx, 1);
+    assert_eq!(
+        r1,
+        vec![
+            (10..11, HighlightStyle { color: Some(palette[1]), ..Default::default() }),
+            (15..16, HighlightStyle { color: Some(palette[2]), ..Default::default() }),
+            (19..20, HighlightStyle { color: Some(palette[2]), ..Default::default() }),
+            (22..23, HighlightStyle { color: Some(palette[1]), ..Default::default() }),
+        ],
+        "行 1 嵌套括号应按 depth 覆 palette[d%3]、相邻非括号字节不变: {r1:?}"
+    );
+
+    // 无括号行：零分配 Borrowed 分支 → 空前基色下无任何样式段（与改动前逐位一致）。
+    let r2 = row(cx, 2);
+    assert!(r2.is_empty(), "无括号行应保持纯语法产物（空）: {r2:?}");
+}
+
 #[gpui::test]
 fn large_rs_first_frame_colors_visible_area_sync(cx: &mut TestAppContext) {
     use std::ops::Range;
@@ -1194,16 +1256,17 @@ fn active_line_bg_suppressed_while_text_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn selection_bg_semi_transparent_keeps_bracket_guides_visible(cx: &mut TestAppContext) {
+fn selection_bg_semi_transparent_keeps_guides_visible(cx: &mut TestAppContext) {
     // 选区底 = **半透明补偿色**：存在非坍缩选区（文字被选中）时，选区像素叠编辑区
-    // 底仍复合出目标取色值，但 alpha<1 → 括号竖线（叠层在文字/选区层之下）能透出，
-    // 不再被不透明纯色盖死。z 序无法在 harness 断言，以 `sel_bg.a < 1.0` 为契约 +
-    // 同帧 `ce-bracket-guide` 存在性佐证。两主题各验一遍。
+    // 底仍复合出目标取色值，但 alpha<1 → 引导竖线（叠层在文字/选区层之下）能透出，
+    // 不再被不透明纯色盖死。缺省 Off（`BRACKET_GUIDES_MODE`，2026-11-14 用户真机口径）
+    // 下括对彩线默认关、缩进引导线全量回显 → 可见竖线 = 缩进引导线（`ce-indent-guide`，
+    // 同样位于文字/选区层之下），用同帧存在性佐证 z 序契约。
     let text = "fn a() {\n    x();\n}";
     let (host, cx) = open(cx, text);
     assert!(
-        cx.debug_bounds("ce-bracket-guides").is_some(),
-        "前置：括号竖线叠层应渲染"
+        cx.debug_bounds("ce-indent-guides").is_some(),
+        "前置：缩进引导线叠层应渲染"
     );
     let read_sel_alpha = |host: &Entity<Host>, cx: &mut VisualTestContext| -> f32 {
         cx.update(|_, cx| host.read(cx).ed.read(cx).test_sel_and_fold_bg().0.a)
@@ -1224,8 +1287,8 @@ fn selection_bg_semi_transparent_keeps_bracket_guides_visible(cx: &mut TestAppCo
         "亮：选区底应半透明（a={l_a} ∈ (0,1)）"
     );
     assert!(
-        cx.debug_bounds("ce-bracket-guide").is_some(),
-        "亮：选中文字帧括号竖线仍存在（半透明透出契约）"
+        cx.debug_bounds("ce-indent-guide").is_some(),
+        "亮：选中文字帧缩进引导竖线仍存在（半透明透出契约）"
     );
     // 暗：同样。
     cx.update(|_, cx| ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx));
@@ -1237,36 +1300,38 @@ fn selection_bg_semi_transparent_keeps_bracket_guides_visible(cx: &mut TestAppCo
         "暗：选区底应半透明（a={d_a} ∈ (0,1)）"
     );
     assert!(
-        cx.debug_bounds("ce-bracket-guide").is_some(),
-        "暗：选中文字帧括号竖线仍存在（半透明透出契约）"
+        cx.debug_bounds("ce-indent-guide").is_some(),
+        "暗：选中文字帧缩进引导竖线仍存在（半透明透出契约）"
     );
 }
 
 #[gpui::test]
-fn bracket_guides_stay_visible_over_fold_and_active_rows(cx: &mut TestAppContext) {
-    // 行底色拆成独立叠层（ruler < row_bg < guides < harea）后：跨行括号竖线在折叠行
+fn guides_stay_visible_over_fold_and_active_rows(cx: &mut TestAppContext) {
+    // 行底色拆成独立叠层（ruler < row_bg < guides < harea）后：引导竖线在折叠行
     // /光标行的整行底色上仍清晰可见——同帧两者共存、且几何上有 y 重叠（竖线不再被
-    // 不透明整行底色吞掉）。`debug_bounds` 不编码 z 序，故用「两选择器同帧都在 +
-    // 竖线段与底色带 y 区间重叠」锁定该回归（`test_bracket_guide_segments` 与渲染
-    // 同源，返回视口内全部竖线段，见 `bracket_guide_segments_flagged`）。
+    // 不透明整行底色吞掉）。缺省 Off（2026-11-14 用户真机口径）下括对彩线默认关、
+    // 缩进引导线全量回显 → 可见竖线 = 缩进引导线（`ce-indent-guide`，位于 row_bg 之上
+    // 的 guides 层）；代理与重叠断言走 `test_indent_guide_segments_flagged`
+    // （`debug_bounds` 不编码 z 序，故用「两者同帧都在 + 竖线段与底色带 y 区间重叠」锁定
+    // 该回归）。
     let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
     let (host, cx) = open(cx, text);
     let lh = cx
         .update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1)
         .max(1.);
-    // 任一竖线段的 y 区间与该行底色带 [band.0, band.1) 有交集。
+    // 任一缩进引导线段的 y 区间与该行底色带 [band.0, band.1) 有交集。
     let guides_overlap =
         |host: &Entity<Host>, cx: &mut VisualTestContext, band: (f32, f32)| -> bool {
             cx.update(|_, cx| {
                 let ed = host.read(cx).ed.clone();
                 ed.read(cx)
-                    .test_bracket_guide_segments(0, 0.0, lh, 1.0, 1200.0, 1000.0)
+                    .test_indent_guide_segments_flagged(0, 0.0, lh, 1.0, 1200.0, 1000.0, None)
                     .into_iter()
-                    .any(|(_, y, h)| y < band.1 && y + h > band.0)
+                    .any(|(_, y, h, _)| y < band.1 && y + h > band.0)
             })
         };
-    // Phase A：折叠 if 块首行（line 1，未聚焦）→ 折叠首行铺整行底色；`fn a() {`
-    // 配对的竖线跨过该折叠行 → 底色与竖线同帧共存且 y 重叠。
+    // Phase A：折叠 if 块首行（line 1，未聚焦）→ 折叠首行铺整行底色；外层 fn a 的
+    // 缩进引导线仍画 → 底色与竖线同帧共存且 y 重叠。
     cx.update(|_, cx| {
         let ed = host.read(cx).ed.clone();
         ed.update(cx, |ed, _| ed.test_toggle_fold_at(1));
@@ -1285,8 +1350,8 @@ fn bracket_guides_stay_visible_over_fold_and_active_rows(cx: &mut TestAppContext
         fold_bg.size.height.as_f32()
     );
     assert!(
-        cx.debug_bounds("ce-bracket-guide").is_some(),
-        "折叠帧同帧仍应渲染括号竖线"
+        cx.debug_bounds("ce-indent-guide").is_some(),
+        "折叠帧同帧仍应渲染缩进引导竖线"
     );
     let fold_band = (
         fold_bg.origin.y.as_f32(),
@@ -1294,7 +1359,7 @@ fn bracket_guides_stay_visible_over_fold_and_active_rows(cx: &mut TestAppContext
     );
     assert!(
         guides_overlap(&host, cx, fold_band),
-        "竖线段应跨过折叠行底色带 {fold_band:?}"
+        "缩进引导竖线段应跨过折叠行底色带 {fold_band:?}"
     );
     // Phase B：展开折叠、聚焦并放光标到 line 1（非折叠行）→ 光标行整行高亮与竖线
     // 共存（同样不被吞）。
@@ -1323,8 +1388,8 @@ fn bracket_guides_stay_visible_over_fold_and_active_rows(cx: &mut TestAppContext
         active.size.height.as_f32()
     );
     assert!(
-        cx.debug_bounds("ce-bracket-guide").is_some(),
-        "光标行帧同帧仍应渲染括号竖线"
+        cx.debug_bounds("ce-indent-guide").is_some(),
+        "光标行帧同帧仍应渲染缩进引导竖线"
     );
     let active_band = (
         active.origin.y.as_f32(),
@@ -1332,7 +1397,7 @@ fn bracket_guides_stay_visible_over_fold_and_active_rows(cx: &mut TestAppContext
     );
     assert!(
         guides_overlap(&host, cx, active_band),
-        "竖线段应跨过光标行高亮带 {active_band:?}"
+        "bracket 竖线段应跨过光标行高亮带 {active_band:?}"
     );
 }
 
@@ -1361,23 +1426,25 @@ fn ruler_infra_renders_but_defaults_off(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn bracket_guides_detected_and_rendered(cx: &mut TestAppContext) {
-    // 用户示例：三对跨行花括号 → 三条括号标尺竖线。
+    // 用户示例：三对跨行花括号 → 三条括号标尺竖线。配对集合（`bracket_pairs`）保留断言；
+    // 「渲染存在性」按历史规范 docs/bracket-guide-redesign.md §8.4 改指**新的默认主源叠层**
+    // `ce-indent-guides`（bracket 竖线已降级为默认关的可选叠加，其纯函数段测试在别处单独保留）。
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}";
     let (host, cx) = open(cx, text);
     let pairs = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bracket_pairs().to_vec());
-    // 落地点按 `open_line` 升序（标尺视口二分依赖排序）；配对集合不变。
+    // 落地点按 `open_line` 升序（标尺视口二分依赖排序）；配对集合不变；depth = 嵌套 DFS 深度。
     assert_eq!(
         pairs,
         vec![
-            crate::editor::fold::BracketPair { open_line: 0, open_col: 13, close_line: 6, guide_units: 0 },
-            crate::editor::fold::BracketPair { open_line: 1, open_col: 23, close_line: 5, guide_units: 4 },
-            crate::editor::fold::BracketPair { open_line: 2, open_col: 13, close_line: 4, guide_units: 8 },
+            crate::editor::fold::BracketPair { open_line: 0, open_col: 13, close_line: 6, close_col: 0, guide_units: 0, guide_body_min_units: Some(4), depth: 0 },
+            crate::editor::fold::BracketPair { open_line: 1, open_col: 23, close_line: 5, close_col: 4, guide_units: 4, guide_body_min_units: Some(8), depth: 1 },
+            crate::editor::fold::BracketPair { open_line: 2, open_col: 13, close_line: 4, close_col: 8, guide_units: 8, guide_body_min_units: Some(12), depth: 2 },
         ]
     );
-    // 竖线叠层确实渲染进树。
+    // 缩进引导线叠层确实渲染进树（默认视觉主源）。
     assert!(
-        cx.debug_bounds("ce-bracket-guides").is_some(),
-        "括号标尺叠层应渲染"
+        cx.debug_bounds("ce-indent-guides").is_some(),
+        "缩进引导线叠层应默认渲染"
     );
 }
 
@@ -1413,7 +1480,9 @@ fn bracket_guide_window_keeps_enclosing_pair_when_viewport_deep(cx: &mut TestApp
     // 视口内可见竖线段：外层 fn（x≈0）从 21 到底、内层 {（x≈4）从 21 到 39。
     let segs = cx.update(|_, cx| {
         let ed = host.read(cx).ed.clone();
-        ed.read(cx).test_bracket_guide_segments(top_vis, 0.0, lh, 1.0, 1200.0, 1000.0)
+        ed.read(cx).test_bracket_guide_segments(
+            top_vis, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        )
     });
     let outer = segs
         .iter()
@@ -1441,8 +1510,8 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
     use config::layout::{
         BRACKET_GUIDE_CLOSE_TAIL_LINES as TAIL, BRACKET_GUIDE_OPEN_HEAD_LINES as HEAD,
     };
-    // 与用户样例同构。注意 spans：竖线从开行**之后**画到底端停于**闭行顶缘**（TAIL=0，
-    // 用户口径 0.0）；端点微调一律按 config 常量算期望（用户调 HEAD/TAIL 后不打红）。
+    // 与用户样例同构。注意 spans：2026-11-14 第 4 片对齐 VSCode——竖线从**开行**含起，末行
+    // 按「闭括号前有无文本」决定含/不含（本例三条闭行都是行首独占 `}` → 不含闭行）。
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}";
     let (host, cx) = open(cx, text);
     let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
@@ -1453,16 +1522,18 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
     let view_h = 1000.0;
     let segs = cx.update(|_, cx| {
         let ed = host.read(cx).ed.clone();
-        ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, 1.0, harea_w, view_h)
+        ed.read(cx).test_bracket_guide_segments(
+            0, 0.0, lh, 1.0, harea_w, view_h, config::layout::BracketGuidesMode::All,
+        )
     });
-    // 三条竖线：x = 块首行缩进列 0/4/8；跨度 [开行+1, 闭行) 底端再伸 TAIL、顶部缩 HEAD。
+    // 三条竖线：x = 块首行缩进列 0/4/8；跨度 [开行, 闭行)（闭行独占 `}` 不含闭行）。
     assert_eq!(segs.len(), 3, "三对跨行花括号 → 三条竖线");
-    // 外层 impl 块：x≈0cw，y=(1+HEAD)pitch 起、高 (5−HEAD+TAIL)pitch（行 1..5 + 尾巴）。
+    // 外层 impl 块：x≈0cw，y=(0+HEAD)pitch 起、高 (6−HEAD+TAIL)pitch（行 0..5 + 尾巴）。
     let impl_guide = segs
         .iter()
         .find(|(_, y, h)| {
-            (*y - (1.0 + HEAD) * pitch).abs() < 0.5
-                && (*h - (5.0 - HEAD + TAIL) * pitch).abs() < 0.5
+            (*y - (0.0 + HEAD) * pitch).abs() < 0.5
+                && (*h - (6.0 - HEAD + TAIL) * pitch).abs() < 0.5
         })
         .expect("应有 impl 块竖线");
     assert!(
@@ -1470,12 +1541,12 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
         "外层竖线应在块首列 0×字宽，实际 {}",
         impl_guide.0
     );
-    // Self 块：x≈8cw，y=(3+HEAD)pitch 起、高 (1−HEAD+TAIL)pitch（行 3 + 尾巴）。
+    // Self 块：x≈8cw，y=(2+HEAD)pitch 起、高 (2−HEAD+TAIL)pitch（行 2..3 + 尾巴）。
     let self_guide = segs
         .iter()
         .find(|(_, y, h)| {
-            (*y - (3.0 + HEAD) * pitch).abs() < 0.5
-                && (*h - (1.0 - HEAD + TAIL) * pitch).abs() < 0.5
+            (*y - (2.0 + HEAD) * pitch).abs() < 0.5
+                && (*h - (2.0 - HEAD + TAIL) * pitch).abs() < 0.5
         })
         .expect("应有 Self 块竖线");
     assert!(
@@ -1490,47 +1561,264 @@ fn bracket_guide_overlapping_same_column_merged(cx: &mut TestAppContext) {
     use config::layout::{
         BRACKET_GUIDE_CLOSE_TAIL_LINES as TAIL, BRACKET_GUIDE_OPEN_HEAD_LINES as HEAD,
     };
-    // 同列（缩进 0）嵌套的两个块：原会画两条重叠竖线（视觉加粗/变色），合并成一根。
+    // 同列（缩进 0）嵌套的两个块：外层 fn a 与内层 `{` 同列、**异 depth**——2026-11-14
+    // 起仅同 depth 合并（VSCode 按 depth%3 取色，异 depth 各成段），故此处应画两根。
     let text = "fn a() {\n{\n    x();\n}\n}";
     let (host, cx) = open(cx, text);
-    let (_, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let (cw, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
     let lh = lh.max(1.);
     // 段几何行距 = 吸附行距 pitch（sf=1.0 时与生产同式 rhtz 正值变体），非裸 lh。
     let pitch = ((lh - 0.5).ceil()).max(1.0);
     let segs = cx.update(|_, cx| {
         let ed = host.read(cx).ed.clone();
-        ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, 1.0, 1200.0, 1000.0)
+        ed.read(cx).test_bracket_guide_segments(
+            0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        )
     });
-    // 两根（fn a 的 [1,4) 与内层 { 的 [2,3)）同列 → 合并成一根 [1,4)，端点半行微调。
-    assert_eq!(segs.len(), 1, "同列重叠竖线应合并为一根");
+    // 两根（fn a 的 [0,4) 与内层 `{` 的 [1,3)）同列（x=0）、异 depth → 各自成段；同列
+    // 不合并的语义由本用例锁死（depth 合并见 colored/depth 用例）。
+    assert_eq!(segs.len(), 2, "同列异 depth 竖线应各自成段（不合并）");
+    // 外层 depth0：行 0..3（+ 端点半行微调；闭 `}` 独占 → 不含闭行）。
+    let outer = segs
+        .iter()
+        .find(|(x, y, h)| {
+            (x / cw).round() as i64 == 0
+                && (*y - (0.0 + HEAD) * pitch).abs() < 0.5
+                && (*h - (4.0 - HEAD + TAIL) * pitch).abs() < 0.5
+        })
+        .expect("应有外层 fn a 竖线（[0,4) + 端点半行）");
+    assert!((outer.0 - 0.0 * cw).abs() < 1.0, "外层竖线应在列 0");
+    // 内层 depth1：行 1..2（+ 端点半行微调；闭 `}` 独占 → 不含闭行）。
+    let inner = segs
+        .iter()
+        .find(|(x, y, h)| {
+            (x / cw).round() as i64 == 0
+                && (*y - (1.0 + HEAD) * pitch).abs() < 0.5
+                && (*h - (2.0 - HEAD + TAIL) * pitch).abs() < 0.5
+        })
+        .expect("应有内层 `{` 竖线（[1,3) + 端点半行）");
     assert!(
-        (segs[0].1 - (1.0 + HEAD) * pitch).abs() < 0.5
-            && (segs[0].2 - (3.0 - HEAD + TAIL) * pitch).abs() < 0.5,
-        "合并段应覆盖行 1..3 + 端点半行（实际 y={} h={}）",
-        segs[0].1,
-        segs[0].2
+        (inner.0 - 0.0 * cw).abs() < 1.0,
+        "内层竖线也应在列 0（同列异 depth 各自成段）"
     );
+}
+
+/// 复现 `target/guidefix.rs`（gitignored 夹具，故意搞乱括号）前三处用户反馈——**C4 定案后的
+/// 预期断言**（2026-11-14 重写：原「现状快照」断言旧 LIFO 的 col8 伪标尺，按设计稿 §6 取反）：
+/// mega 8 开不配对 -> col8 消失；ifx1 配对 -> col4 出现；z1 前是 col4 真标尺。夹具抄自该文件
+/// 第 1-16 行（行内多括号 mega 行、错缩进、未配对全保留，行号对准）；第 17 行起的合法函数独立
+/// 配对、不会再闭合本区域残留栈，故截断到 16 行与本文件整篇在本区域逐位一致。
+#[gpui::test]
+fn bracket_guide_repro_guidefix_fixture(cx: &mut TestAppContext) {
+    // 夹具与 `guidefix_fixture_text()` 逐字节同（该 16 行内联 == 共享常量，直接用共享源）。
+    let text = guidefix_fixture_text();
+    let (host, cx) = open(cx, text);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    // 段几何行距 = 吸附行距 pitch（sf=1.0 时与生产同式 rhtz 正值变体），非裸 lh。
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    // 全部配对（17 行起的合法块独立配对，故视口内配对 open_line 只可能 ≤15）。
+    let pairs = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bracket_pairs().to_vec());
+    let near: Vec<_> = pairs.iter().filter(|p| p.open_line <= 15).copied().collect();
+    eprintln!("REPRO pairs (open_line open_col close_line guide_units):");
+    for p in &near {
+        eprintln!("  {p:?}");
+    }
+    // 实际画出的竖线段（HEAD=TAIL=0、sf=1、hscroll=0 → col=round(x/cw)，行区间可反解）。
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(
+            0, 0.0, lh, 1.0, 2000.0, 4000.0, config::layout::BracketGuidesMode::All,
+        )
+    });
+    eprintln!("REPRO segments (col, rows0idx=[ct,cb), rows1idx=[ct+1,cb]):");
+    let fmt = |x: f32, y: f32, h: f32| {
+        let col = (x / cw).round() as i64;
+        let ct = (y / pitch).round() as i64;
+        let cb = ct + (h / pitch).round() as i64;
+        format!("col={col} rows0idx=[{ct},{cb}) → 1idx=[{},{}]", ct + 1, cb)
+    };
+    for (x, y, h) in &segs {
+        eprintln!("  {}", fmt(*x, *y, *h));
+    }
+
+    // C1：line4(mega) 与 line15(t2;) 之间「不该出现」的标尺（col8 合并段）**整体消失**——
+    // C4 下 mega 8 开（缩进 8 层）永不配对。
+    let spurious = segs.iter().any(|(x, _, _)| (x / cw).round() as i64 == 8);
+    eprintln!("C1 spurious col8 1idx[5,15): present={spurious}");
+    assert!(
+        !spurious,
+        "C4：line4 mega 行 8 个未闭 `{{` 永不配对 → col8 伪标尺整体消失"
+    );
+
+    // C2：line3 `if x1 == 1 {`（缩进 4）与 line13 缩进 4 的 `}` 配对 → col4 标尺出现，
+    // 始于 1idx 行 4（行3..5 之间确有标尺，贯穿后续）。
+    let has_ifx1_pair = near.iter().any(|p| p.open_line == 2 && p.guide_units == 4);
+    let col4_in_gap = segs.iter().any(|(x, y, h)| {
+        let col = (x / cw).round() as i64;
+        let ct = (y / pitch).round() as i64;
+        let cb = ct + (h / pitch).round() as i64;
+        col == 4 && ct <= 3 && 3 < cb // 覆盖 0idx 行 3（=1idx 4，行3..5 之间）
+    });
+    eprintln!(
+        "C2 if-x1 pair open_line=2: present={has_ifx1_pair}; col4 guide at 1idx 行4: present={col4_in_gap}"
+    );
+    assert!(has_ifx1_pair, "C4：if x1 的 `{{` 应与缩进 4 层 `}}` 配对");
+    assert!(col4_in_gap, "C4：row3..5 之间应有 col4 竖线（始于行 4）");
+
+    // C3：line13 z1 前面是 col4 真标尺，且无 col8 伪标尺。
+    let col8_covers_13 = segs.iter().any(|(x, y, h)| {
+        let col = (x / cw).round() as i64;
+        let ct = (y / pitch).round() as i64;
+        let cb = ct + (h / pitch).round() as i64;
+        col == 8 && ct <= 12 && 12 < cb // 覆盖 0idx 行 12（=1idx 13）
+    });
+    let col4_covers_13 = segs.iter().any(|(x, y, h)| {
+        let col = (x / cw).round() as i64;
+        let ct = (y / pitch).round() as i64;
+        let cb = ct + (h / pitch).round() as i64;
+        col == 4 && ct <= 12 && 12 < cb
+    });
+    eprintln!("C3 row13 z1 前面：col8 伪标尺={col8_covers_13}, col4 真标尺={col4_covers_13}");
+    assert!(!col8_covers_13, "C4：row13 z1 前不应再有 col8 伪标尺");
+    assert!(col4_covers_13, "C4：row13 z1 前应有 col4 真标尺");
+}
+
+/// C4 新测试共用的 fixture 文本（`target/guidefix.rs` 前 16 行，1-16 行；mega 行/错缩进/
+/// 未配对全保留，行号对齐）。
+fn guidefix_fixture_text() -> &'static str {
+    "\
+fn a() {
+    let x = 1;
+    if x1 == 1 {
+        t1();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {
+    let x2 = 1;
+    if x == 1 {
+        y();
+        z();
+    }
+    w();
+}
+
+        z1();
+    }
+    t2();
+}
+"
+}
+
+/// `target/guidefix2.rs` 的真实文本（braced vs chained 双态，含中文注释；与
+/// `indent_guides_active_open_requires_block_opener` 同源，块体模型对拍/真值共用）。
+fn guidefix2_fixture_text() -> &'static str {
+    r#"impl Render for Root {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 启动首帧墙钟：首次 render 时补记 firstframe 段并打印 [STARTUP] 汇总
+        // （GPUI_EDITOR_STARTUP_DIAG=1 门控；未开启单次 var_os 检查即返回）。
+        base::startup::summarize();
+        let theme = Theme::global(cx);
+        // 与原组件库 Root 一致：以正文缺省字号为 rem 基准（本项目视图全走 px，供保险）。
+        window.set_rem_size(theme.typography.default_body_size);
+        div()
+            .id("ui-root")
+            .debug_selector(|| "ui-root".into())
+            .key_context(CONTEXT)
+            .on_action(cx.listener(Self::on_action_tab))
+            .on_action(cx.listener(Self::on_action_tab_prev))
+            .relative()
+            .size_full()
+            // 根层不铺不透明底色，最终底色由 EditorApp 的 Mica 半透明窗口底提供。
+            .bg(gpui::transparent_black())
+            .text_color(theme.colors.fg)
+            .child(self.view.clone())
+    }
+}"#
+}
+
+/// C4 视图三 case 之一：mega 8 开不配对 → col8 伪标尺整体消失；ifx1 配对 → col4 段出现。
+/// 段集 = col0 [1idx2,10) + col4 [1idx4,13)；行 15/16（1idx）无任何段。
+#[gpui::test]
+fn guidefix_col8_fake_gone_col4_present(cx: &mut TestAppContext) {
+    let text = guidefix_fixture_text();
+    let (host, cx) = open(cx, text);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(
+            0, 0.0, lh, 1.0, 2000.0, 4000.0, config::layout::BracketGuidesMode::All,
+        )
+    });
+    // 归一化 (列, 0idx 顶部行 ct, 0idx 开区间底 cb)。
+    let norm: Vec<(i64, i64, i64)> = segs
+        .iter()
+        .map(|(x, y, h)| {
+            (
+                (x / cw).round() as i64,
+                (y / pitch).round() as i64,
+                ((y + h) / pitch).round() as i64,
+            )
+        })
+        .collect();
+    // ① col8 完全消失（mega 8 开永不配对）。
+    assert!(!norm.iter().any(|(c, _, _)| *c == 8), "col8 伪标尺应整体消失: {norm:?}");
+    // ② col0（fn a）＝0idx[0,10) ＝ 1idx[1,10)（2026-11-14 第 4 片：含开行，闭 `}` 独占
+    // → 不含闭行）。
+    assert!(
+        norm.iter().any(|(c, ct, cb)| *c == 0 && *ct == 0 && *cb == 10),
+        "应有 col0 段 1idx[1,10): {norm:?}"
+    );
+    // ③ col4（ifx1）＝0idx[2,13) ＝ 1idx[3,13)（含开行，闭 `}` 独占 → 不含闭行）。
+    assert!(
+        norm.iter().any(|(c, ct, cb)| *c == 4 && *ct == 2 && *cb == 13),
+        "应有 col4 段 1idx[3,13): {norm:?}"
+    );
+    // 行 15/16（1idx，0idx 14/15）无任何段：两段 cb≤13 <14。
+    assert!(
+        !norm.iter().any(|(_, _, cb)| *cb > 13),
+        "行 15/16 不应有段经过: {norm:?}"
+    );
+}
+
+/// C4 列计算：体内「首非空白为 `} ) ]`」的行被 inner_min 排除——否则该 `}` 行（缩进 0）
+/// 会把 inner_min 拖到 0、c 被拖到 1。断言 C 块竖线画在 4 列而非 1 列。
+#[gpui::test]
+fn column_min_inner_excludes_closer(cx: &mut TestAppContext) {
+    // A=(0,4) 缩进0；B=(1,2) 缩进4；C=(3,6) 缩进4，体内行 4 是缩进 0 的孤立 `}`。
+    let text = "\
+fn a() {
+    {
+    }
+    if x {
+}
+    y();
+    }
+}
+";
+    let (host, cx) = open(cx, text);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(
+            0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        )
+    });
+    let cols: Vec<i64> = segs.iter().map(|(x, _, _)| (x / cw).round() as i64).collect();
+    assert!(cols.contains(&4), "C 块（体内含右花括号行）竖线应在 4 列: {cols:?}");
+    assert!(!cols.contains(&1), "体内右花括号行不应把列拖到 1: {cols:?}");
 }
 
 #[gpui::test]
 fn guide_click_highlights_pair_and_elsewhere_clears(cx: &mut TestAppContext) {
-    // 语义（用户确认）：标尺不可点选；点体内某行 → 点亮该行所属**最内层**括号块竖线；
-    // 点非块内行（如顶层）→ 清除。命中断言：行 3 ∈ Self 块 [2,4)、行 2 = Self 开行
-    // （开行含本身）→ 点亮 Self 自己打开的块（open_line=2）。
+    // 语义（用户确认，块体模型 2026-11-14 用户实测）：点体内某行 / 开行 → active 高亮 =
+    // 该行关联**最内层**括号块的**体**（由光标派生、随光标跟随）；点非块内行（如顶层）→
+    // 无高亮。命中断言：行 3 ∈ Self 块体 [3,4)、行 2 = Self 开行 → 同为 Self 块体；
+    // 行 7 = 顶层 fn 行 → None。
+    // 列演算：Self 体 = [open+1, close) = [3,4)；c = min(开列 units=13, 闭列 units=8,
+    // 体内 min 非闭缩进+1 = 12+1=13) = 8 → group = (8, 3, 4)。
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}\nfn other() {}";
     let (host, cx) = open(cx, text);
-    // 口径断言（不依赖鼠标坐标）。
-    let (case, case2, case7) = cx.update(|_, cx| {
-        let ed = host.read(cx).ed.read(cx);
-        (
-            ed.test_guide_for_logical_row(3),
-            ed.test_guide_for_logical_row(2),
-            ed.test_guide_for_logical_row(7),
-        )
-    });
-    assert_eq!(case, Some(2), "行 3 ∈ Self 块 [2,4) → 点亮 Self 开行 2");
-    assert_eq!(case2, Some(2), "行 2 = Self 开行 → 点亮 Self 本块（open_line=2）");
-    assert_eq!(case7, None, "行 7 = 顶层 fn 行 → 无命中");
     let (lh, gutter) = cx.update(|_, cx| {
         let ed = host.read(cx).ed.read(cx).test_metrics();
         (ed.1.max(1.), ed.2)
@@ -1542,71 +1830,492 @@ fn guide_click_highlights_pair_and_elsewhere_clears(cx: &mut TestAppContext) {
     cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
     cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
     cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
-    // 点亮 Self 块。
-    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide());
-    assert_eq!(lit, Some(2), "点行 3 应点亮 Self 块（open_line=2）");
-    // 点开行（行 2 = `Self {` 开行）→ 同样点亮 Self 本块（不是外层 fn）。
+    // 点亮 Self 块体。
+    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+    assert_eq!(lit, Some((8, 3, 4)), "点行 3 应点亮 Self 块体 (col8, [3,4))");
+    // 点开行（行 2 = `Self {` 开行）→ 同样点亮 Self 块体（不是外层 fn）。
     let y2 = px(lh * 2.5);
     cx.simulate_mouse_move(point(x, y2), MouseButton::Left, mods);
     cx.simulate_mouse_down(point(x, y2), MouseButton::Left, mods);
     cx.simulate_mouse_up(point(x, y2), MouseButton::Left, mods);
-    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide());
-    assert_eq!(lit, Some(2), "点开行 2 应点亮 Self 本块（open_line=2），非外层 fn");
-    // 点顶层行 7 → 清除。
+    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+    assert_eq!(lit, Some((8, 3, 4)), "点开行 2 应点亮 Self 块体 (col8, [3,4))，非外层 fn");
+    // 点顶层行 7 → 无高亮。
     let y7 = px(lh * 7.5);
     cx.simulate_mouse_move(point(x, y7), MouseButton::Left, mods);
     cx.simulate_mouse_down(point(x, y7), MouseButton::Left, mods);
     cx.simulate_mouse_up(point(x, y7), MouseButton::Left, mods);
-    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide());
-    assert_eq!(lit, None, "点顶层行 7 应清除点亮");
+    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+    assert_eq!(lit, None, "点顶层行 7 应无高亮");
 }
 
-/// B1 回归：`guide_pair_for_logical_row` 由「整表线性扫」改为「二分 + 从右往左首个
-/// 命中」。① 大表（并列 fn 块 + 各嵌一层 if 块，open_line 单调、close_line 交错）上
-/// 逐逻辑行与线性参考口径**逐位一致**（语义不变）；② 块体内命中只回扫常数步
-/// （`guide_scan_steps` 探针）——不再整表扫（旧实现在 800+ 对上每行全扫）。
+// ---------------------------------------------------------------------------
+// §8 缩进引导线（indentation guides）为视觉主源：主源算法 / 空行续线 / 折叠 /
+// 横滚 / active 列 / 叠层默认关
+// ---------------------------------------------------------------------------
+
+/// §8.2 预期表（is=4，行号 1 基，c1=0-based 列0、c5=0-based 列4）逐行画列集：
+/// 1..16 → 空 / c1 / c1 / c1+c5 / c1 / c1 / c1+c5 / c1+c5 / c1 / c1 / 空 /
+/// 空行续 c1 / c1+c5(孤线) / c1 / c1 / 空。段化后按 (列=round(x/cw), 1idx 行区间)
+/// 反解每 1idx 行的画列集，与预期表逐行对表。
 #[gpui::test]
-fn guide_pair_binary_search_matches_linear_reference(cx: &mut TestAppContext) {
-    let mut text = String::new();
-    for i in 0..400u32 {
-        text.push_str(&format!("fn f{i}() {{\n    if x {{\n        y\n    }}\n}}\n"));
+fn indent_guides_guidefix_table(cx: &mut TestAppContext) {
+    let text = guidefix_fixture_text();
+    let (host, cx) = open(cx, text);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_indent_guide_segments(0, 0.0, lh, 1.0, 2000.0, 4000.0)
+    });
+    // 1idx 行 → 画列（0-based col）：由段的 0idx 行区间 [ct, cb) 反解。
+    let mut rows: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for (x, y, h) in &segs {
+        let col = (x / cw).round() as i64;
+        let ct = (y / pitch).round() as i64;
+        let cb = ((y + h) / pitch).round() as i64;
+        for r in ct..cb {
+            let r1 = (r + 1) as usize;
+            rows.entry(r1).or_default().push(col as usize);
+        }
     }
+    // 预期（1idx 行 → 0-based 画列集，升序）；`‑` 表示该行无任何引导线。
+    let expected: &[(usize, &[usize])] = &[
+        (1, &[]),
+        (2, &[0]),
+        (3, &[0]),
+        (4, &[0, 4]),
+        (5, &[0]),
+        (6, &[0]),
+        (7, &[0, 4]),
+        (8, &[0, 4]),
+        (9, &[0]),
+        (10, &[0]),
+        (11, &[]),
+        (12, &[0]),
+        (13, &[0, 4]),
+        (14, &[0]),
+        (15, &[0]),
+        (16, &[]),
+    ];
+    for (r1, want) in expected {
+        let got = rows.get(r1).cloned().unwrap_or_default();
+        assert_eq!(got.as_slice(), *want, "1idx 行 {r1} 画列与 §8.2 预期表不符");
+    }
+    // 无列行（1/11/16）与 has-col 行的总集 = 全 16 行（无漏）；无列行不在 `rows` 内是
+    // 正常（该行没有引导线），由上一循环缺省空集断言兜底。
+    let covered: std::collections::BTreeSet<usize> = expected.iter().map(|(r, _)| *r).collect();
+    for r1 in &covered {
+        assert!(
+            rows.contains_key(r1) || expected.iter().any(|(r, c)| r == r1 && c.is_empty()),
+            "1idx 行 {r1} 应对表覆盖（有列或显式空）"
+        );
+    }
+}
+
+/// §8.2 空行续线：fixture 空行（0idx 11 = 1idx 12）按可视序 A=上一非空(0idx10 `}` indent0)、
+/// B=下一非空(0idx12 z1 indent8)、A<B → 1+⌊0/4⌋=1 → 只续 **c1（col0）**；c5 不续。
+/// 且该 col0 段把空行两侧贯通（行 11..16(0idx) 之间连续标尺）。
+#[gpui::test]
+fn indent_guides_blank_continuation(cx: &mut TestAppContext) {
+    let text = guidefix_fixture_text();
+    let (host, cx) = open(cx, text);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_indent_guide_segments(0, 0.0, lh, 1.0, 2000.0, 4000.0)
+    });
+    // 空行（1idx 12 = 0idx 11）被某段 col0 覆盖（跨空行续线）。
+    assert!(
+        segs.iter().any(|(x, y, h)| {
+            let col = (x / cw).round() as i64;
+            let ct = (y / pitch).round() as i64;
+            let cb = ((y + h) / pitch).round() as i64;
+            col == 0 && ct <= 11 && 11 < cb
+        }),
+        "空行 1idx 12 应被 col0 续线覆盖: {segs:?}"
+    );
+    // 空行不产 c5（A=0,B=8 → 级数 1 → 只 c1）：无 col4 段经过 0idx 11。
+    assert!(
+        !segs.iter().any(|(x, y, h)| {
+            let col = (x / cw).round() as i64;
+            let ct = (y / pitch).round() as i64;
+            let cb = ((y + h) / pitch).round() as i64;
+            col == 4 && ct <= 11 && 11 < cb
+        }),
+        "空行只续 c1，不应给 c5: {segs:?}"
+    );
+    // 贯通：col0 存在覆盖 0idx [10,15) 的段（空行把 11..16 前后连通）。
+    assert!(
+        segs.iter().any(|(x, y, h)| {
+            let col = (x / cw).round() as i64;
+            let ct = (y / pitch).round() as i64;
+            let cb = ((y + h) / pitch).round() as i64;
+            col == 0 && ct <= 11 && 15 <= cb
+        }),
+        "col0 应贯通空行两侧（0idx 11..16）: {segs:?}"
+    );
+}
+
+/// 评审 NIT guard：长纯空白段（≥500 连续空行）的空行邻居取值在改为「上一游标 + 下一
+/// 惰性预取（只前进不回头）」后，逐行画列须与「无界扫 `(0..v).rev()` / `(v+1)..vcount`」
+/// 参考**逐位一致**——证明复杂度优化（O(V×N)→O(V)）不改行为。
+#[gpui::test]
+fn indent_guides_blank_continuation_long_blank_run_matches_reference(cx: &mut TestAppContext) {
+    use crate::editor::fold::{blank_guide_level, indent_guide_level};
+    use config::layout::INDENT_GUIDE_INDENT_SIZE as IS;
+    // 0idx 0：`a();` 缩进 4；接着 500 个空行（0idx 1..=500）；0idx 501：`b();` 缩进 8。
+    let mut text = String::from("    a();\n");
+    for _ in 0..500 {
+        text.push('\n');
+    }
+    text.push_str("        b();\n");
     let (host, cx) = open(cx, &text);
-    let (pairs, max_row) = cx.update(|_, cx| {
-        let ed = host.read(cx).ed.read(cx);
-        let pairs = ed.test_bracket_pairs().to_vec();
-        let max_row = pairs
-            .iter()
-            .map(|p| p.close_line)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(3);
-        (pairs, max_row)
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    // 视口足够大到覆盖全部 503 行（含尾部幻影空行）。
+    let view_h = lh * 8000.0;
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_indent_guide_segments(0, 0.0, lh, 1.0, 2000.0, view_h)
     });
-    assert!(pairs.len() >= 400, "大表应生成 ≥400 跨行括号配对（实际 {}）", pairs.len());
-    // 线性参考 = 旧实现口径（开行含本身：`open_line <= logical <= close_line`）。
-    let linear = |logical: usize| -> Option<usize> {
-        pairs
-            .iter()
-            .filter(|p| p.open_line <= logical && logical <= p.close_line)
-            .map(|p| p.open_line)
-            .max()
-    };
-    for logical in 0..=max_row {
-        let got = cx.update(|_, cx| {
-            let ed = host.read(cx).ed.read(cx);
-            ed.test_guide_for_logical_row(logical)
-        });
-        assert_eq!(got, linear(logical), "逻辑行 {logical} 命中应与线性参考一致");
+    let mut rows: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for (x, y, h) in &segs {
+        let col = (x / cw).round() as i64;
+        let ct = (y / pitch).round() as i64;
+        let cb = ((y + h) / pitch).round() as i64;
+        for r in ct..cb {
+            rows.entry(r as usize).or_default().push(col as usize);
+        }
     }
-    // ② 块体内命中只回扫常数步（右边界前一个即命中），不再整表扫。
-    let steps_inside = cx.update(|_, cx| {
-        let ed = host.read(cx).ed.read(cx);
-        let inner = ed.test_guide_for_logical_row(2); // 首个 fn 块的 if 体内 → 最内层 if 块
-        assert_eq!(inner, Some(1), "行 2 属 if 块（open_line=1），应点亮 open_line=1");
-        ed.test_guide_scan_steps()
+    // 参考（旧无界扫语义）：仅 0 与 501 非空，其余为空 → A=4、B=8、A<B → 级数 2。
+    let indent_of = |logical: usize| -> Option<i32> {
+        match logical {
+            0 => Some(4),
+            501 => Some(8),
+            _ => None, // 500 空行 + 尾幻影行。
+        }
+    };
+    let rows_total = 503usize;
+    for v in 0..rows_total {
+        let want: Vec<usize> = match indent_of(v) {
+            Some(i) => (1..=indent_guide_level(i as usize, IS) as usize)
+                .map(|l| (l - 1) * IS)
+                .collect(),
+            None => {
+                let prev = (0..v).rev().find_map(|w| indent_of(w));
+                let next = ((v + 1)..rows_total).find_map(|w| indent_of(w));
+                let lvl = blank_guide_level(prev, next, IS as i32) as usize;
+                (1..=lvl).map(|l| (l - 1) * IS).collect()
+            }
+        };
+        let got = rows.get(&v).cloned().unwrap_or_default();
+        assert_eq!(got, want, "0idx 行 {v}（长空行段）画列应与无界扫参考一致");
+    }
+    // 形状断言：500 空行段 c1+c5 贯通（A<B → 级数 2），非散列。
+    assert!(
+        rows.get(&250).map(|c| c.as_slice()) == Some(&[0, 4usize][..]),
+        "空行中段应同画 c1+c5: {:?}",
+        rows.get(&250)
+    );
+}
+
+/// 折叠感知（历史规范 docs/bracket-guide-redesign.md §8.3；终稿 active 体口径见
+/// editing.rs active_pair / active_guide_group doc）：折叠一块后——
+/// ① 折叠体内行不出现在可视序 → 其缩进级竖线整体消失（本应画 c5 的体内行无任何线）；
+/// ② 折叠**头行**照常渲染、照常画自家引导线（col0）；
+/// ③ 空行恰在折叠边界处 → 上一/下一非空**可视**行（fold 展开态）取 A/B 续线；
+/// ④ 展开折叠 → c5 恢复（折叠只是视觉压缩，不改缩进）。
+#[gpui::test]
+fn indent_guides_fold_suppresses_interior(cx: &mut TestAppContext) {
+    // 0idx：0 fn a(缩进0)、1 if x(4)、2 y(8)、3 }(4)、4 空行、5 w(4)、6 }(0)。
+    let text = "\
+fn a() {
+    if x {
+        y();
+    }
+
+    w();
+}
+";
+    let (host, cx) = open(cx, text);
+    // 折叠 if 块（首行 1，隐藏体 `(1,end)`——行 2 隐藏；end=3 行可见）。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_toggle_fold_at(1));
     });
-    assert!(steps_inside <= 2, "块体内命中应只回扫 O(1) 步（实际 {steps_inside}）");
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |_, cx| cx.notify());
+    });
+    settle(cx);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    // 折叠后可视序：v0=行0、v1=行1(头)、v2=行3(})、v3=行4(空行)、v4=行5(w)、v5=行6(})。
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_indent_guide_segments(0, 0.0, lh, 1.0, 2000.0, 4000.0)
+    });
+    // ① 折叠体内（行 2 y() 缩进 8 本应画 c5）不出现在可视序 → 无任何 col4 段。
+    assert!(
+        !segs.iter().any(|(x, _, _)| (x / cw).round() as i64 == 4),
+        "折叠体内行不产引导线（col4 整体消失）: {segs:?}"
+    );
+    // ② 折叠头行（v1 = 行1 缩进 4）照常画 col0。
+    assert!(
+        segs.iter().any(|(x, y, h)| {
+            let col = (x / cw).round() as i64;
+            let ct = (y / pitch).round() as i64;
+            let cb = ((y + h) / pitch).round() as i64;
+            col == 0 && ct <= 1 && 1 < cb
+        }),
+        "折叠头行应画自家 col0: {segs:?}"
+    );
+    // ③ 空行（v3 = 0idx 4）在折叠边界处：可视邻居 A=v2(行3 `}` 缩进4)、B=v4(行5 缩进4)、
+    //    A==B → ⌈4/4⌉=1 → 续 col0（经空行）。
+    assert!(
+        segs.iter().any(|(x, y, h)| {
+            let col = (x / cw).round() as i64;
+            let ct = (y / pitch).round() as i64;
+            let cb = ((y + h) / pitch).round() as i64;
+            col == 0 && ct <= 3 && 3 < cb
+        }),
+        "折叠边界空行按可视邻居续 col0: {segs:?}"
+    );
+    // ④ 展开 → col4 恢复。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_toggle_fold_at(1));
+    });
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |_, cx| cx.notify());
+    });
+    settle(cx);
+    let segs2 = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_indent_guide_segments(0, 0.0, lh, 1.0, 2000.0, 4000.0)
+    });
+    assert!(
+        segs2.iter().any(|(x, _, _)| (x / cw).round() as i64 == 4),
+        "展开折叠后 col4 引导线应恢复: {segs2:?}"
+    );
+}
+
+/// §8.1/§8.6 横滚与裁剪：x = g·cw − hscroll（同 bracket 段公式）。
+/// ① 横滚 2 格 → c5 平移到 (4−2)·cw、c1(col0) 的 x<0 → 整列裁剪；② 深缩进行列
+/// 超出可视宽 harea_w → 超宽列裁剪（不越界画）。
+#[gpui::test]
+fn indent_guides_hscroll_moves_and_clips(cx: &mut TestAppContext) {
+    // 行0 缩进 4（式画 col0）、行1 缩进 12（画 col0+col4+col8）。
+    let text = "    x();\n            y();";
+    let (host, cx) = open(cx, text);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    // 基线（hscroll=0、宽视口）：col0/col4/col8 均画。
+    let base = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_indent_guide_segments(0, 0.0, lh, 1.0, 2000.0, 4000.0)
+    });
+    let base_cols: std::collections::BTreeSet<i64> =
+        base.iter().map(|(x, _, _)| (x / cw).round() as i64).collect();
+    assert!(
+        base_cols.contains(&0) && base_cols.contains(&4) && base_cols.contains(&8),
+        "基线应画 col0/4/8: {base_cols:?}"
+    );
+    // 横滚 2 格 → 列 x = g·cw − 2cw（归一化 col=round(x/cw) 随之整体左移 2，故按 x 断言）。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_set_hscroll(2));
+    });
+    let moved = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_indent_guide_segments(0, 0.0, lh, 1.0, 2000.0, 4000.0)
+    });
+    // g=0（c1）→ x=0−2cw=−2cw<0 → 整列裁剪。
+    assert!(
+        !moved.iter().any(|(x, _, _)| (x / cw).round() as i64 == 0),
+        "横滚后 c1 x<0 应整列裁剪: {moved:?}"
+    );
+    // g=4（c5）→ x=4cw−2cw=2cw。
+    assert!(
+        moved.iter().any(|(x, _, _)| (*x - 2.0 * cw).abs() < 1.0),
+        "c5 应平移到 (4−2)·cw=2cw: {moved:?}"
+    );
+    // g=8（c9）→ x=8cw−2cw=6cw。
+    assert!(
+        moved.iter().any(|(x, _, _)| (*x - 6.0 * cw).abs() < 1.0),
+        "c9 应平移到 (8−2)·cw=6cw: {moved:?}"
+    );
+    // 窄视口 harea_w=5.1cw：g=8 x=6cw > 5.1cw → 超宽裁剪；g=4 x=2cw 仍画。
+    let clipped = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx)
+            .test_indent_guide_segments(0, 0.0, lh, 1.0, 5.1 * cw, 1000.0)
+    });
+    assert!(
+        !clipped.iter().any(|(x, _, _)| (*x - 6.0 * cw).abs() < 1.0),
+        "超可视宽的列应裁剪: {clipped:?}"
+    );
+    assert!(
+        clipped.iter().any(|(x, _, _)| (*x - 2.0 * cw).abs() < 1.0),
+        "可视宽内列应保留: {clipped:?}"
+    );
+}
+
+/// active 视觉（**块体模型**，2026-11-14 用户实测唯一真值；替代旧「最内层块内容带」/
+/// 纯缩进组）：点 0idx 行 7（guidefix `z();`）→ 关联括对 = 严格含 7 的最内块 `if x==1`
+/// （open 5 / close 8，depth 最大）→ 体 `[visual(5)+1, visual(8))` = [6,8)、列 = 引导列 4
+/// → group = (4, 6, 8)。不看光标行自身缩进（除以块体为准）。
+#[gpui::test]
+fn indent_guides_active_column_on_grid(cx: &mut TestAppContext) {
+    let text = guidefix_fixture_text();
+    let (host, cx) = open(cx, text);
+    // 点 0idx 行 7（z();）中部（文本区，不碰 gutter）。
+    let lh = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1).max(1.);
+    let gutter = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().2);
+    let mods = Modifiers::default();
+    let y = px(lh * 7.5);
+    let x = px(gutter + 10.);
+    cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+    settle(cx);
+    let group = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+    assert_eq!(
+        group,
+        Some((4, 6, 8)),
+        "点 0idx 行 7 → 块体模型：if x==1 块体 [6,8)（z(); 所在最内块体）"
+    );
+}
+
+/// 主源叠层（历史规范 docs/bracket-guide-redesign.md §8.5 item 7）= `ce-indent-guides`
+/// 默认渲染；bracket 竖线叠层默认 **Off**
+/// （`BRACKET_GUIDES_MODE = BracketGuidesMode::Off`，2026-11-14 用户真机口径：彩色
+/// 「全部括对竖线」默认关掉，消除其盖住缩进 active 高亮造成的错乱）：光标进入括对体 →
+/// `ce-bracket-guides` 竖线层不渲染、只留横向钩线层 `ce-bracket-hooks`
+/// （bracketPairsHorizontal='active'），灰缩进线全量回显。结构化段数据 / Active/All 让位
+/// 表 / 钩线断言见 `bracket_guides_active_mode_only_active_pair_renders` /
+/// `bracket_guides_mode_all_toggle`。
+#[gpui::test]
+fn indentation_guides_detected_and_bracket_overlay_off_by_default(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    if b == 2 {\n        x1();\n        x2();\n    }\n    let c = 3;\n}";
+    let (host, cx) = open(cx, text);
+    assert!(
+        cx.debug_bounds("ce-indent-guides").is_some(),
+        "缩进引导线叠层应默认渲染"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-guides").is_none(),
+        "缺省 Off：bracket 竖线叠层应不渲染（彩线默认关，错乱根因已消除）"
+    );
+    // 缺省 Off：光标进 if 体 → 竖线层仍不渲染；钩线层恒挂（if 开行钩线在）；
+    // 灰缩进线全量回显。
+    focus(&host, cx);
+    set_caret_row_col(&host, cx, 2, 5); // 光标在 if 体 x1() 行 → active = if。
+    assert!(
+        cx.debug_bounds("ce-bracket-guides").is_none(),
+        "Off：active 括对也不产彩色竖线（只留钩线）"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-hooks").is_some(),
+        "Off：钩线层仍应渲染"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-hook-open").is_some(),
+        "Off：active 括对开行钩线应渲染（bracketPairsHorizontal 保留）"
+    );
+    assert!(
+        cx.debug_bounds("ce-indent-guide").is_some(),
+        "灰缩进线全量回显（Off 不受任何括对抑制）"
+    );
+}
+
+/// Active 模式（中间态/对比，`BRACKET_GUIDES_MODE` 翻转即启用）：仅活动括对产彩色竖线 +
+/// 钩线、其它括对不产线；非 active 括对列灰缩进
+/// 保留（VSCode `bracketPairs:'active'`）。夹具 `fn main(){ if b==2{ x1(); x2(); }
+/// let c=3; }`：
+/// - fn 括对（row0..row6，depth0，引导列 0）；
+/// - if 括对（row1..row4，depth1，引导列 4；`}` 独占 → 竖线 [1,4) 不含闭行）。
+/// 光标在 if 体（row2 x1()）→ active = if。断言**只一条** active 段（col4、depth1、
+/// active=true、行 [1,4)）+ if 开行底边钩线 + 让位表只含 if 括对（fn 括对列 0 灰缩进保留）。
+#[gpui::test]
+fn bracket_guides_active_mode_only_active_pair_renders(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    if b == 2 {\n        x1();\n        x2();\n    }\n    let c = 3;\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    set_caret_row_col(&host, cx, 2, 5); // 光标在 if 体 → active = if（open1/close4）。
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let cw = cw.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    let (segs, suppress) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (
+            ed.test_bracket_guide_segments_flagged(
+                0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::Active,
+            ),
+            ed.test_bracket_guide_suppress(
+                0, 1000.0, lh, config::layout::BracketGuidesMode::Active,
+            ),
+        )
+    });
+    // 只一条 active 段：col4、depth1、行 [1,4)（`}` 独占不含闭行）。fn 括对不产线。
+    assert_eq!(segs.len(), 1, "Active 模式应只产 active 括对一条竖线：{segs:?}");
+    let (x, y, h, depth, hl) = segs[0];
+    assert!(
+        (x / cw).round() as i64 == 4
+            && (y / pitch).round() as i64 == 1
+            && (h / pitch).round() as i64 == 3,
+        "if 竖线应 col4、行[1,4)、高3行：({x},{y},{h})"
+    );
+    assert_eq!(depth, 1, "if 括对 depth=1");
+    assert!(hl, "Active 模式产出的段应为 active=true");
+    // 让位表只含 if 括对行 × 引导列（fn 括对列 0 不在表 → 其灰缩进线保留、与 active 共存）。
+    assert_eq!(
+        suppress,
+        vec![(1usize, 4usize), (2, 4), (3, 4), (4, 4)],
+        "Active 让位表只含 active 括对行 × 引导列：{suppress:?}"
+    );
+    // 钩线：开列（13）> 引导列（4）→ 开行底边横段；闭列（4）== 引导列（4）→ 无闭行横段。
+    assert!(
+        cx.debug_bounds("ce-bracket-hook-open").is_some(),
+        "Active 模式（有 active 括对）应画开行钩线"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-hook-close").is_none(),
+        "闭列 == 引导列时不画闭行钩线"
+    );
+}
+
+/// All 模式（VSCode `bracketPairs:'always'`）：同夹具下 fn 括对（col0）与 if 括对（col4）
+/// 全部产线（现行为）——与 Active 模式互补验证可切换。
+#[gpui::test]
+fn bracket_guides_mode_all_toggle(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    if b == 2 {\n        x1();\n        x2();\n    }\n    let c = 3;\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    set_caret_row_col(&host, cx, 2, 5); // 光标在 if 体 → active = if。
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let cw = cw.max(1.);
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments_flagged(
+            0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        )
+    });
+    // 两条竖线：fn 括对 col0 depth0 + if 括对 col4 depth1（全部产线 → All 语义）。
+    let norm: Vec<(i64, usize)> = segs.iter().map(|(x, _, _, d, _)| ((x / cw).round() as i64, *d)).collect();
+    assert_eq!(segs.len(), 2, "All 模式应全部括对产线：{norm:?}");
+    assert!(norm.contains(&(0, 0)), "fn 括对段应在 col0/depth0：{norm:?}");
+    assert!(norm.contains(&(4, 1)), "if 括对段应在 col4/depth1：{norm:?}");
 }
 
 /// B2 回归：拖选改「帧级合并」（`on_mouse_move` 只记最新拖点、每帧 `render` 开头
@@ -3086,7 +3795,7 @@ fn hscrollbar_overlay_container_flush_to_editor_bottom(cx: &mut TestAppContext) 
     // 编辑区底只是该可见贴底的几何前提；横条贴底行为本身由 `ui::scrollbar` 单测
     // `geom` 锁（水平贴底精确定位、旧几何会红）。两层各司其职，勿把本护栏当复现。
     let text = "x".repeat(500);
-    let (host, cx) = open(cx, &text);
+    let (_host, cx) = open(cx, &text);
 
     // 横向溢出确证：500 个 x 远超一屏（>1920px）→ 滚动条轨道几何存在（几何存在才有绘制）。
     let wide = cx
@@ -3114,3 +3823,1232 @@ fn hscrollbar_overlay_container_flush_to_editor_bottom(cx: &mut TestAppContext) 
         "横向滚动条叠层底未贴编辑区底边：空隙 {layout_gap:?}"
     );
 }
+
+/// guidefix 1-16 是**故意错乱**夹具（K150/K152）：禁逐行期望对齐，只做不变式断言。
+/// 块体模型不变式（2026-11-14 用户实测口径）：逐 0idx 行断言引擎
+/// `test_active_guide_group` == 独立侧 `block_active_guide_port`（同算法；「任一行关联 P
+/// 或 None」——P = 块体模型 1/2/3 关联括对，体区间 = `[open+1, close)` 半开；None 则两边
+/// 同为 None）；Some 时体区间非空 `first < last` 且不越界（last ≤ vcount）。
+#[gpui::test]
+fn indent_guides_active_group_invariants_on_messy_fixture(cx: &mut TestAppContext) {
+    let text = guidefix_fixture_text();
+    let (host, cx) = open(cx, text);
+    let vcount = cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().visual_line_count());
+    assert!(vcount > 0, "guidefix 应有可视行");
+    let nrows = (text.split('\n').count()).min(vcount);
+    for caret_vis in 0..nrows {
+        set_caret_row(&host, cx, caret_vis);
+        let engine =
+            cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+        let port = block_active_guide_port(text, caret_vis);
+        assert_eq!(
+            engine, port,
+            "行 {caret_vis}: 引擎 ≠ 块体模型 port（乱夹具任一行同算法）"
+        );
+        if let Some((_col, f, l)) = engine {
+            assert!(
+                f < l && l <= vcount,
+                "行 {caret_vis}: 体区间 [{f},{l}) 应非空且不越界（vcount={vcount}）"
+            );
+        }
+    }
+}
+
+/// 块体模型（guidefix 乱夹具）：点 0idx12（尾部 `z1();`）→ 关联括对 = 严格含 12 的最内块
+/// `if x1`（open2/close13，depth 最大）→ 体 `[visual(2)+1, visual(13))` = [3,13)、列 = 引导列 4
+/// → (4, 3, 13)（整块体点亮，不再「只亮孤立光标连续段」）。
+#[gpui::test]
+fn indent_guides_active_repro_deep_row_isolated_segment_only(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, guidefix_fixture_text());
+    set_caret_row(&host, cx, 12);
+    let group = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+    assert_eq!(
+        group,
+        Some((4, 3, 13)),
+        "点 0idx12 → 块体模型：if x1 块体 [3,13)（z1(); 所在最内块体）"
+    );
+    assert_ne!(group, Some((4, 6, 8)), "非 if x==1 块体（0idx6/7 那个块）");
+    assert_ne!(group, Some((4, 12, 13)), "非「仅光标连续段」旧语义");
+}
+
+// ---------------------------------------------------------------------------
+// 缩进引导线 active 视觉（块体模型 = 括号块体高亮，2026-11-14 用户 3 夹具实测唯一真值；
+// 顶部 L 横线 active_line_marker_overlay 已删，仅剩 active 竖线灰系高亮，见 layout.rs 颜色口径）
+// ---------------------------------------------------------------------------
+
+/// 更深嵌套多行块（块体模型 TDD 期望表）：`fn main(){\n let a=1;\n if b==2 {\n x1();\n
+/// x2();\n }\n let c=3;\n}`。配对 fn(0,7,d0)、if(2,5,d1)：
+/// - r0（fn 开行）→ ① open==0 → fn 体 [1,7) col0；r1（let a）/ r6（let c）→ ② fn 严格含
+///   → fn 体 [1,7) col0；
+/// - r2（if 开行）→ ① open==2 → if 体 [3,5) col4；r3/r4（x1/x2）→ ② 最内 if；
+/// - r5（if `}`）→ ② fn 严格含 5（if 不含闭行）→ fn 体 [1,7) col0；
+/// - r7（fn `}`）→ ③ close==7 → fn 体 [1,7) col0。
+#[gpui::test]
+fn indent_guides_active_group_nested_clean_fixture(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    let a = 1;\n    if b == 2 {\n        x1();\n        x2();\n    }\n    let c = 3;\n}";
+    let (host, cx) = open(cx, text);
+    let cases: &[(usize, Option<(usize, usize, usize)>)] = &[
+        (0, Some((0, 1, 7))), // ① fn 开行 → fn 体
+        (1, Some((0, 1, 7))), // ② fn 严格含 → fn 体
+        (2, Some((4, 3, 5))), // ① if 开行 → if 体
+        (3, Some((4, 3, 5))), // ② 最内 if
+        (4, Some((4, 3, 5))), // ② 最内 if
+        (5, Some((0, 1, 7))), // if `}` → ② fn 严格含 → fn 体
+        (6, Some((0, 1, 7))), // ② fn 严格含 → fn 体
+        (7, Some((0, 1, 7))), // ③ fn `}` → fn 体
+    ];
+    for &(row, want) in cases {
+        set_caret_row(&host, cx, row);
+        let group = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+        assert_eq!(
+            group,
+            want,
+            "行 {row}（=1基{}）group 期望 {want:?}（块体模型）",
+            row + 1
+        );
+    }
+}
+
+/// **块体模型端口**（测试锚，2026-11-14 用户 3 夹具实测唯一真值）：与引擎
+/// `active_pair` / `active_guide_group` 同算法的独立侧实现（配对复用 `fold::scan_bracket_pairs`
+/// = 与引擎同口径的缩进分层配对；模型 1/2/3 + 体区间 + 列独立推演）。
+/// 输入整段文本 + 0idx 逻辑行 r，返回 `(列, 体首可视, 体末可视+1)`（无折叠时可视行==逻辑行）：
+/// - 关联 P：① open_line == r ② open_line < r < close_line（严格含，最内块）③ close_line == r
+///   ——按序取首个非空层，各层取 depth 最大者；无 → None。
+/// - 列 = `guide_pair_column` 同式（min(开列 units, 闭列 units, 对内最小非闭缩进+1)）。
+/// - 体 = `[open+1, close)` 半开（不含括号两行）；体空 → None。
+fn block_active_guide_port(text: &str, r: usize) -> Option<(usize, usize, usize)> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let n = lines.len();
+    let pairs = crate::editor::fold::scan_bracket_pairs(
+        |i: usize| {
+            lines
+                .get(i)
+                .map(|s| gpui::SharedString::from(*s))
+                .unwrap_or_else(|| gpui::SharedString::new_static(""))
+        },
+        n,
+    );
+    use crate::editor::fold::BracketPair;
+    // 列（与引擎 `guide_pair_column_fields` 同式）。
+    let units_upto = |line: usize, byte_col: usize| -> usize {
+        let s = lines.get(line).copied().unwrap_or("");
+        let upto = byte_col.min(s.len());
+        s[..upto]
+            .chars()
+            .map(crate::editor::buffer::char_width_units)
+            .sum()
+    };
+    let inner_min_noncloser = |open: usize, close: usize| -> Option<usize> {
+        const CAP: usize = 1024;
+        if close.saturating_sub(open).saturating_sub(1) > CAP {
+            return None;
+        }
+        let mut min: Option<usize> = None;
+        for rr in (open + 1)..close {
+            let s = lines.get(rr).copied().unwrap_or("");
+            let t = s.trim_start();
+            if t.is_empty() {
+                continue;
+            }
+            match t.as_bytes()[0] {
+                b'}' | b')' | b']' => continue,
+                _ => {}
+            }
+            let u = crate::editor::fold::leading_indent(s).units();
+            min = Some(min.map_or(u, |m| m.min(u)));
+        }
+        min
+    };
+    let pair_col = |p: &BracketPair| -> usize {
+        let o = units_upto(p.open_line, p.open_col);
+        let c = units_upto(p.close_line, p.close_col);
+        match inner_min_noncloser(p.open_line, p.close_line) {
+            Some(m) => o.min(c).min(m + 1),
+            None => o.min(c),
+        }
+    };
+    // 块体模型 1/2/3：按序取首个非空层，各层取 depth 最大（`block_pick_max_pair`）。
+    let step1: Vec<&BracketPair> = pairs.iter().filter(|p| p.open_line == r).collect();
+    let chosen = if !step1.is_empty() {
+        block_pick_max_pair(step1)
+    } else {
+        let step2: Vec<&BracketPair> = pairs
+            .iter()
+            .filter(|p| p.open_line < r && r < p.close_line)
+            .collect();
+        if !step2.is_empty() {
+            block_pick_max_pair(step2)
+        } else {
+            let step3: Vec<&BracketPair> = pairs.iter().filter(|p| p.close_line == r).collect();
+            block_pick_max_pair(step3)
+        }
+    }?;
+    let first = chosen.open_line + 1;
+    if first >= chosen.close_line {
+        return None; // 体空
+    }
+    Some((pair_col(chosen), first, chosen.close_line))
+}
+
+/// `block_active_guide_port` 的共享取大：候选取 depth 最大（跳过过期对；等 depth 保留首个，
+/// 与引擎 `active_pair` 的 `pick_max_depth` 同约定）。
+fn block_pick_max_pair<'a>(
+    cands: Vec<&'a crate::editor::fold::BracketPair>,
+) -> Option<&'a crate::editor::fold::BracketPair> {
+    let mut best: Option<&'a crate::editor::fold::BracketPair> = None;
+    for p in cands {
+        if p.open_line >= p.close_line {
+            continue;
+        }
+        match best {
+            None => best = Some(p),
+            Some(b) if b.depth < p.depth => best = Some(p),
+            _ => {}
+        }
+    }
+    best
+}
+
+/// **zip 锚：引擎 `active_guide_group` == `block_active_guide_port`**（2026-11-14 用户 3 夹具
+/// 实测唯一真值；块体模型 1/2/3 + 体区间 `[open+1, close)`），覆盖 干净/嵌套/乱夹具/
+/// guidefix2/空白行/深缩进全部内容行。任何一行分叉 = 引擎与 block_port 之一有 bug（两边同
+/// 算法、彼此对拍——「两者不符就是实现 bug」）。
+#[gpui::test]
+fn active_guide_group_matches_block_port(cx: &mut TestAppContext) {
+    let fixtures: &[&str] = &[
+        // 干净单/多层（真值表 focus）
+        "fn main() {\n    if a==1 {\n        foo();\n        bar();\n    }\n    baz();\n}",
+        "fn main() {\n    let a = 1;\n    if b == 2 {\n        x1();\n        x2();\n    }\n    let c = 3;\n}",
+        "fn main() {\n    bar();\n    baz();\n}",
+        // 空白行桥接
+        "fn a() {\n    if x {\n        \n    }\n}",
+        "fn a() {\n\n    x();\n    y();\n\n}",
+        // 深缩进 & 多块同列
+        "a() {\n        x();\n        y();\n}\n    z();\n    w();\n",
+        // 乱夹具 1-16（不变式；逐行值以 port 为准）
+        guidefix_fixture_text(),
+        // guidefix2（真实 .rs 文本；块体关键修复：点 div()/链式续行 .id() → fn 体 [2,20)）
+        guidefix2_fixture_text(),
+    ];
+    for text in fixtures {
+        let (host, cx) = open(cx, text);
+        let vcount = cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().visual_line_count());
+        // 不含幻影尾行（vcount 含尾换行幻影；比较 0..vcount 真实内容行）。
+        let content_rows = (text.split('\n').count().max(vcount)).min(vcount);
+        for row in 0..content_rows {
+            let want = block_active_guide_port(text, row);
+            set_caret_row(&host, cx, row);
+            let got = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+            assert_eq!(
+                got, want,
+                "夹具 {text:?} 行 {row}: 引擎 {got:?} ≠ 块体模型 port {want:?}"
+            );
+        }
+    }
+}
+
+
+/// headless 断言用的高级 getter `test_active_guide_group` 曾与渲染**分叉**（getter 已整带、
+/// 渲染仍按「含光标可视行的最近段」）。本测试让两条路径
+/// **走同一 active 派生**（`active_guide_group()` → flagged 段化），对干净夹具逐关键行断言：
+/// flagged 的 hl==true 段换算回 `(列, 行首, 行末+1)` 与 getter group 区间**逐位一致**（整块
+/// 体点亮：点 foo()/bar()（0idx2/3）→ if 体 col4 [2,4) 两行都亮、不只光标行；点 0idx4 `}` /
+/// 0idx5 baz() → fn 体 col0 [1,6) 整块体亮）。
+/// active 竖线灰系高亮（VSCode 默认色）、无顶部横线。
+#[gpui::test]
+fn indent_guides_render_path_matches_active_group(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    if a==1 {\n        foo();\n        bar();\n    }\n    baz();\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let cw = cw.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    // (光标 0idx 行, 期望整块体 hl 段 [(列, 行首, 行末半开)])——对照
+    // zip 锚 `active_guide_group_matches_block_port`（块体模型真值表）：
+    //   0idx0（fn 开行）/ 0idx4（if `}`，fn 严格含）/ 0idx5（baz）→ fn 体 col0 [1,6)；
+    //   0idx1（if 开行）~ 0idx3 → if 体 col4 [2,4)（foo/bar 两行都亮，不只光标行）。
+    // 关键覆盖：渲染路径须与 getter 同源同值（K153 封口），含 ① 开行（0idx0/1 → 该块体）
+    // 与闭行归外/自身块体（0idx4 → fn）——封口防两路径再分叉。
+    let cases: &[(usize, &[(usize, usize, usize)])] = &[
+        (0, &[(0, 1, 6)]),
+        (1, &[(4, 2, 4)]),
+        (2, &[(4, 2, 4)]),
+        (3, &[(4, 2, 4)]),
+        (4, &[(0, 1, 6)]),
+        (5, &[(0, 1, 6)]),
+    ];
+    for &(row, want) in cases {
+        set_caret_row(&host, cx, row);
+        let (flag_hl, group) = cx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            let ed = ed.read(cx);
+            // 与渲染（`indentation_guide_overlay`）同式派生 active：group →
+            // `(col, 组首, 组末+1, 光标可视行)`。干净夹具无折叠 → 光标可视行 == 0idx 行
+            // （与 render 的 `visual_row(logical)` 换算一致）。
+            let group = ed.test_active_guide_group();
+            let active = group.map(|(col, f, l_excl)| (col, f, l_excl, row));
+            let segs = ed.test_indent_guide_segments_flagged(
+                0, 0.0, lh, 1.0, 2000.0, 4000.0, active,
+            );
+            // hl==true 段 → (列, 行首, 行末+1)（与 group 区间同半开口径）。
+            let flag_hl: Vec<(usize, usize, usize)> = segs
+                .into_iter()
+                .filter(|(_, _, _, hl)| *hl)
+                .map(|(x, y, h, _)| {
+                    (
+                        (x / cw).round() as usize,
+                        (y / pitch).round() as usize,
+                        ((y + h) / pitch).round() as usize,
+                    )
+                })
+                .collect();
+            (flag_hl, group)
+        });
+        assert_eq!(
+            flag_hl.as_slice(),
+            want,
+            "行 {row}: 渲染路径 hl 段应整组 {want:?}（不只光标行）; 实际 {flag_hl:?}"
+        );
+        let want_group: Vec<(usize, usize, usize)> = group
+            .map(|(c, f, l_excl)| vec![(c, f, l_excl)])
+            .unwrap_or_default();
+        assert_eq!(
+            flag_hl.as_slice(),
+            want_group.as_slice(),
+            "行 {row}: 渲染路径 hl 段应 == getter group 区间（两条路径同规则）; \
+             {flag_hl:?} vs {want_group:?}"
+        );
+    }
+}
+
+/// 旧运行时 `guide_inner_min_noncloser` 的**测试参照**（生产路径已删、仅测试区保留，
+/// K153 单源——生产只走预存字段，旧算法留在测试作 parity 唯一参照，防复刻走样/双路径漂移）：
+/// 体内（`开+1 .. 闭−1`）最小「非闭行缩进 units」，跳过空行与「首非空白为 `} ) ]`」的行
+/// （closer，不参与列下吸）；跨度 > 1024（防退化）或无合格行 → `None`（= +∞）。
+/// 返回 `usize` 口径与预存字段（`u32`）语义一致。
+fn guide_inner_min_noncloser_ref(rope: &ropey::Rope, open: usize, close: usize) -> Option<usize> {
+    const INNER_SCAN_CAP: usize = 1024;
+    if close.saturating_sub(open).saturating_sub(1) > INNER_SCAN_CAP {
+        return None;
+    }
+    let mut min: Option<usize> = None;
+    for r in (open + 1)..close {
+        let s = crate::editor::buffer::line_shared(rope, r);
+        let s = s.as_ref();
+        let t = s.trim_start();
+        if t.is_empty() {
+            continue;
+        }
+        let first = t.as_bytes()[0];
+        if first == b'}' || first == b')' || first == b']' {
+            continue;
+        }
+        let units = crate::editor::fold::leading_indent(s).units();
+        min = Some(min.map_or(units, |m| m.min(units)));
+    }
+    min
+}
+
+/// **落地期预存字段 parity**（K153 单源 / K160）：对全部夹具/支线的每对 `BracketPair`，
+/// 断言 `guide_body_min_units`（折叠表扫描/增量期算好、帧内 O(1) 只读）== 旧运行时算法的
+/// 结果（[`guide_inner_min_noncloser_ref`] 参照，与生产旧实现逐字节同语义）。覆盖：干净多层、
+/// 单行块、欠缩进体内、深嵌套、多空行块、巨型括对（600 内行有值 / >1024 内行 → cap None）、
+/// 乱夹具（guidefix / guidefix2）。生产只留字段这一个真值源——旧算法生产路径已删。
+#[gpui::test]
+fn guide_body_min_units_matches_old_runtime_parity(cx: &mut TestAppContext) {
+    // 巨型括对：600 内行（<1024 → 应算值）；另 1100 内行（>1024 → cap → None）。
+    let giant = {
+        let mut t = String::from("fn big() {\n");
+        for _ in 0..600 {
+            t.push_str("    x();\n");
+        }
+        t.push('}');
+        t
+    };
+    let giant_capped = {
+        let mut t = String::from("fn big() {\n");
+        for _ in 0..1100 {
+            t.push_str("    x();\n");
+        }
+        t.push('}');
+        t
+    };
+    let texts: Vec<String> = vec![
+        // 干净多层（块体模型共源夹具）
+        "fn main() {\n    if a==1 {\n        foo();\n        bar();\n    }\n    baz();\n}".into(),
+        // 单行块 + 欠缩进体内（下拉列）
+        "fn a() {\n y();\n    z();\n}".into(),
+        // 深嵌套 + 同列多块
+        "a() {\n        x();\n        y();\n}\n    z();\n    w();\n".into(),
+        // 空行桥接 / 空体
+        "fn a() {\n\n    x();\n    y();\n\n}".into(),
+        "fn a() {\n    if x {\n        \n    }\n}".into(),
+        // 闭行首更深的体内行 + 注释/字符串行（旧实现不跳过注释——仅列首缩进，须逐位对齐）
+        "fn a() {\n  // comment\n    x();\n}".into(),
+        // 乱夹具 / 真实 .rs
+        guidefix_fixture_text().into(),
+        guidefix2_fixture_text().into(),
+        giant,
+        giant_capped,
+    ];
+    for text in &texts {
+        let (host, cx) = open(cx, text);
+        let rope = ropey::Rope::from_str(text);
+        let pairs = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bracket_pairs().to_vec());
+        assert!(
+            !pairs.is_empty(),
+            "夹具应至少有一对跨行括对（{text:?}; 前 {} 字）",
+            text.chars().take(40).collect::<String>()
+        );
+        for p in &pairs {
+            let want = guide_inner_min_noncloser_ref(&rope, p.open_line, p.close_line);
+            let got = p.guide_body_min_units.map(|u| u as usize);
+            assert_eq!(
+                got, want,
+                "夹具 {text:?} 配对 ({},{})：预存字段 {got:?} ≠ 旧运行时算法 {want:?}",
+                p.open_line, p.close_line
+            );
+        }
+    }
+}
+
+/// **性能旁证**（仅打印、不落断言；`#[ignore]` 手动跑）——F3 级巨型括对（600 内行）下：
+/// ① 旧运行时算法一次「逐内行 line_shared」耗时（示意旧路径逐帧 ×3 消费方的历史成本量级）；
+/// ② 新路径 `test_bracket_guide_segments` 整趟（视口窗口 + `guide_pair_column` O(1) 读字段 +
+/// 段合并）多轮中位。跑法：`cargo test -p editor guide_body_min_units_render_probe -- --ignored --nocapture`。
+#[gpui::test]
+#[ignore]
+fn guide_body_min_units_render_probe(cx: &mut TestAppContext) {
+    use std::time::Instant;
+    let mut text = String::from("fn f() {\n");
+    for _ in 0..600 {
+        text.push_str("    x();\n");
+    }
+    text.push_str("}");
+    let (host, cx) = open(cx, &text);
+    let (_, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pairs = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bracket_pairs().to_vec());
+    assert_eq!(pairs.len(), 1, "巨型括对应只产 1 对: {pairs:?}");
+    let p = pairs[0];
+    // ① 旧运行时逐内行扫（测试参照 = 历史逐帧行为量级）。
+    let rope = ropey::Rope::from_str(&text);
+    let t0 = Instant::now();
+    let _ref_min = guide_inner_min_noncloser_ref(&rope, p.open_line, p.close_line);
+    let ref_elapsed = t0.elapsed();
+    eprintln!(
+        "[PROBE] 旧运行时逐内行扫一次 (pair {}-{}): {:?} —— 旧路径逐帧 ×3 消费方 ≈3× 此值",
+        p.open_line, p.close_line, ref_elapsed
+    );
+    // ② 新路径整趟（O(1) 读字段）多轮中位。
+    let mut samples = Vec::new();
+    for _ in 0..30 {
+        let t1 = Instant::now();
+        let segs = cx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.read(cx).test_bracket_guide_segments(
+                0,
+                0.0,
+                lh,
+                1.0,
+                2000.0,
+                4000.0,
+                config::layout::BracketGuidesMode::All,
+            )
+        });
+        samples.push(t1.elapsed());
+        assert!(!segs.is_empty(), "巨型括对应产竖线");
+    }
+    samples.sort();
+    eprintln!(
+        "[PROBE] 新路径 test_bracket_guide_segments 整趟（30 次中位）: {:?}",
+        samples[samples.len() / 2]
+    );
+}
+
+/// 把光标移到 0idx 行 `row`（`set_selection_range` 同生产路径，方向键/点击同样派生）。
+fn set_caret_row(host: &Entity<Host>, cx: &mut VisualTestContext, row: usize) {
+    let off = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(row, 0));
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(off..off, cx));
+    });
+    settle(cx);
+}
+
+/// 缩进引导线两色完全对齐 VSCode 默认主题（2026-11-14，用户口径）：
+/// - 亮（Light+）非 active `guide_inactive` = #D3D3D3、active `guide_active` = #939393；
+/// - 暗（Dark+）非 active = #404040、active = #707070。
+/// 通过 `Theme::set(Dark)` + `settle` 切主题后重渲染读回（`refresh_metrics` 每帧无条件写颜色
+/// 字段，主题切换下一帧生效）——同 `indent_guides_render_path_matches_active_group` 的 getter
+/// 用法；渲染路径与 getter 同源（K153 封口：布局只走 `guide_inactive`/`guide_active`）。
+#[gpui::test]
+fn indent_guides_colors_match_vscode_default(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "fn a() {\n    x();\n}");
+    focus(&host, cx);
+    settle(cx);
+    let read_colors = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_guide_colors())
+    };
+    // 默认亮主题：VSCode Light+ 灰。
+    let (g, a) = read_colors(cx);
+    let want_g: gpui::Hsla = gpui::rgb(0xd3d3d3).into();
+    let want_a: gpui::Hsla = gpui::rgb(0x939393).into();
+    assert_eq!(g, want_g, "亮非 active = VSCode Light+ #D3D3D3");
+    assert_eq!(a, want_a, "亮 active = VSCode Light+ #939393");
+    // 切暗主题 → 重渲染 → VSCode Dark+ 灰。
+    cx.update(|_, cx| ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx));
+    settle(cx);
+    let (g, a) = read_colors(cx);
+    let want_g: gpui::Hsla = gpui::rgb(0x404040).into();
+    let want_a: gpui::Hsla = gpui::rgb(0x707070).into();
+    assert_eq!(g, want_g, "暗非 active = VSCode Dark+ #404040");
+    assert_eq!(a, want_a, "暗 active = VSCode Dark+ #707070");
+}
+
+/// 把光标移到 0idx 行 `row`、字符列 `col`（字节偏移；`offset_for_line_col` 同生产定位路径，
+/// 方向键/点击同样派生，供 `active_pair` 严格内含用例）。
+fn set_caret_row_col(host: &Entity<Host>, cx: &mut VisualTestContext, row: usize, col: usize) {
+    let off = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(row, col));
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(off..off, cx));
+    });
+    settle(cx);
+}
+
+/// 括号引导线按 `depth % 3` 循环池上色（第 3 片，VSCode bracket guides）——**异 depth 段
+/// 不合并**、各自成段并各自取色。干净夹具两层，演算（guide_pair_column = min(开列, 闭列,
+/// 对内最小非闭缩进+1)，HEAD=TAIL=0）：
+///   `fn a{`(0,c4)  `    if x{`(1,c8)  `        y();`(2)  `    }`(3,c4)  `}`(4,c0)
+///   - 外层 fn a（depth0）：min(4, 0)=0 → col0；
+///   - 内层 if x（depth1）：min(8, 4)=4 → col4。
+/// 断言每段的 depth/列与「渲染同源」的 `test_bracket_guide_color(depth, active)` 对上
+/// （getter 与渲染同式：palette[depth%3] · alpha 0.3/1.0）。
+#[gpui::test]
+fn bracket_guides_colored_by_depth(cx: &mut TestAppContext) {
+    let text = "fn a{\n    if x{\n        y();\n    }\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    settle(cx);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let (segs, colors) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        let segs = ed.test_bracket_guide_segments_flagged(
+            0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        );
+        let colors = (0..3)
+            .map(|d| (ed.test_bracket_guide_color(d, false), ed.test_bracket_guide_color(d, true)))
+            .collect::<Vec<_>>();
+        (segs, colors)
+    });
+    // 两个括对（异 depth）各自成段：col0 depth0 + col4 depth1。
+    // 光标默认 (0,0) = fn 开行 → 块体模型 ① 关联 fn → fn 段 active（hl=true）、if 段 inactive。
+    assert_eq!(segs.len(), 2, "两层括对 → 两根竖线（异 depth 不合并）");
+    let norm: Vec<(i64, usize, bool)> = segs
+        .iter()
+        .map(|(x, _, _, d, hl)| ((x / cw).round() as i64, *d, *hl))
+        .collect();
+    assert!(
+        norm.contains(&(0, 0, true)),
+        "col0 段应为 depth0 且 active（光标在 fn 开行，块体模型 ①）: {norm:?}"
+    );
+    assert!(
+        norm.contains(&(4, 1, false)),
+        "col4 段应为 depth1 且 inactive: {norm:?}"
+    );
+    // 颜色：active 段 = test_bracket_guide_color(depth, true) alpha 1.0；inactive 段 =
+    // test_bracket_guide_color(depth, false) alpha 0.3；深度间不同色。
+    let col_of = |d: usize| colors[d].0;
+    assert!(
+        col_of(0) != col_of(1),
+        "palette[depth%3] 按深度取色应互异（VSCode 3 色循环池）"
+    );
+    for &(_, d, hl) in &norm {
+        if hl {
+            let c_act = colors[d].1;
+            assert_eq!(c_act.a, 1.0, "active 段 alpha = 1.0（depth {d}）");
+        } else {
+            let c_in = colors[d].0;
+            assert_eq!(c_in.a, 0.3, "inactive 段 alpha = 0.3（depth {d}）");
+        }
+    }
+    // active 仅抬 alpha、hue/sat/light 与 inactive 同源（块体活跃段 getter 公式覆盖）。
+    let (c_in, c_act) = colors[0];
+    assert_eq!(
+        (c_act.h, c_act.s, c_act.l),
+        (c_in.h, c_in.s, c_in.l),
+        "active 只改 alpha，不改 hue/sat/light"
+    );
+    assert_eq!(c_act.a, 1.0, "active 段 alpha = 1.0");
+}
+
+/// E3 封口（K153，2026-11-14）：bracket 竖线取色 = `bracket_guide_color` 单源。渲染竖线
+/// 段（`bracket_guide_overlay` 内现直调 `bracket_guide_color(palette, depth, active)`）、
+/// 钩线（active）、active 缩进高亮（`active_guide_highlight_color` → helper active 色）、
+/// 测试 getter（`test_bracket_guide_color`）四处与 helper 输出逐项断言一致，防取色公式
+/// 再散写分叉（呼应 `indent_guides_render_path_matches_active_group` 的封口姿势：渲染
+/// 路径与 getter 走同一公式）。
+#[gpui::test]
+fn bracket_guide_color_render_path_matches_helper(cx: &mut TestAppContext) {
+    use crate::editor::view::bracket_guide_color;
+    // 两层括对干净夹具：fn col0（depth0）+ if col4（depth1）。
+    let text = "fn a{\n    if x{\n        y();\n    }\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    settle(cx);
+    let (palette, seg_cols, getter_cols) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        let lh = ed.test_metrics().1.max(1.);
+        let palette: [gpui::Hsla; 3] = ed.test_bracket_guide_palette();
+        // 渲染竖线段 → 真实产出字段 (depth, active)：render.rs:376 竖线条即消费自本路径的
+        // 这些字段计算颜色（`bracket_guide_color(&palette, depth, active)`）。
+        let segs = ed.test_bracket_guide_segments_flagged(
+            0,
+            0.0,
+            lh,
+            1.0,
+            1200.0,
+            1000.0,
+            config::layout::BracketGuidesMode::All,
+        );
+        let seg_cols: Vec<(usize, bool, gpui::Hsla)> = segs
+            .iter()
+            .map(|&(_, _, _, d, hl)| (d, hl, bracket_guide_color(&palette, d, hl)))
+            .collect();
+        // getter / 测试锚路径 = test_bracket_guide_color（现直调 helper；全 (depth, active)）。
+        let getter_cols: Vec<(usize, bool, gpui::Hsla)> = (0..3)
+            .flat_map(|d| {
+                [
+                    (d, false, ed.test_bracket_guide_color(d, false)),
+                    (d, true, ed.test_bracket_guide_color(d, true)),
+                ]
+            })
+            .collect();
+        (palette, seg_cols, getter_cols)
+    });
+    // **独立真值锚**（不经过 helper/getter，逐字写预重构公式）：任何消费方若私下改成
+    // 另一套公式（palette[d%2]、其他 alpha 等），对照真值必红——否决「helper 镜像 helper」
+    // 空转（评审 NEEDS-CHANGES #1）。hue/sat/light 同源、active 只抬 alpha。
+    let truth = |depth: usize, active: bool| -> gpui::Hsla {
+        let c = palette[depth % 3];
+        if active {
+            c.opacity(1.0)
+        } else {
+            c.opacity(0.3)
+        }
+    };
+    // 两层括对 → 两根竖线（异 depth 不合并）。渲染侧（真实段字段 → helper 输出）逐段
+    // 对照独立真值；同时与 getter 交叉（两条路径各自 == 真值 → 必相互一致）。
+    let getter_map: std::collections::HashMap<(usize, bool), gpui::Hsla> =
+        getter_cols.iter().map(|&(d, hl, c)| ((d, hl), c)).collect();
+    assert_eq!(seg_cols.len(), 2, "两层括对 → 两根竖线（异 depth 不合并）");
+    for &(d, hl, c) in &seg_cols {
+        assert_eq!(
+            c,
+            truth(d, hl),
+            "渲染侧取色（真实段 depth {d}, active {hl} → helper）应 == 独立真值公式"
+        );
+        assert_eq!(
+            c,
+            getter_map[&(d, hl)],
+            "渲染侧取色（真实段 depth {d}, active {hl}）应 == getter 输出（两路径同源封口）"
+        );
+    }
+    // getter 每 (depth, active) 对照真值（getter 与渲染同式同源封口的基础锚）。
+    for &(d, hl, c) in &getter_cols {
+        assert_eq!(
+            c,
+            truth(d, hl),
+            "getter 色（depth {d}, active {hl}）应 == 独立真值公式"
+        );
+    }
+    // active 缩进高亮（光标行 0 = fn 开行 → 块体模型① fn depth0）== 真值(0, true)。
+    let hl_color = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        ed.test_active_guide_highlight_color()
+    });
+    assert_eq!(
+        hl_color,
+        truth(0, true),
+        "active 引导高亮（fn d0 active 色）应 == 独立真值公式"
+    );
+}
+
+/// 活动括对由**块体模型**（2026-11-14 用户实测唯一真值）按光标**行号**派生（不再看字符列）：
+/// ① open_line == r ② 严格含（open < r < close）最内 ③ close_line == r，各取 depth 最大。
+/// 同 4 空格两层夹具 `fn a{\n    if x{\n        y();\n    }\n}`（P0 fn a(0,4,d0)、
+/// P1 if x(1,3,d1)）：
+/// - r0（fn 开行）→ ① P0；r1（if 开行）→ ① P1；r2（y(); 体）→ ② 最内 P1；
+/// - r3（if `}`）→ ② 仅 fn 严格含 → P0（if 闭行归外层）；r4（fn `}` 顶层）→ ③ P0。
+#[gpui::test]
+fn active_pair_strict_contains(cx: &mut TestAppContext) {
+    let text = "fn a{\n    if x{\n        y();\n    }\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    settle(cx);
+    let read = |host: &Entity<Host>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.read(cx).test_active_pair()
+        })
+    };
+    // r1（if 开行）→ ① open_line==1 → P1（open1/close3/depth1）。
+    set_caret_row_col(&host, cx, 1, 5);
+    let a = read(&host, cx).expect("if 开行应有活动括对 P1");
+    assert_eq!(
+        (a.open_line, a.close_line, a.depth),
+        (1, 3, 1),
+        "if 开行 → ① P1"
+    );
+    // r2（体内）→ ② 严格含 → 最内 P1。
+    set_caret_row_col(&host, cx, 2, 9);
+    let a = read(&host, cx).expect("体内应有活动括对");
+    assert_eq!(
+        (a.open_line, a.close_line, a.depth),
+        (1, 3, 1),
+        "体内中间应取最内层 P1"
+    );
+    // r3（if `}`）→ ② 仅 fn 严格含 → P0（闭行归外层）。
+    set_caret_row_col(&host, cx, 3, 4);
+    let a = read(&host, cx).expect("if 闭行应归外层 P0");
+    assert_eq!(
+        (a.open_line, a.close_line, a.depth),
+        (0, 4, 0),
+        "if 闭行 → ② fn 严格含 → P0"
+    );
+    // r0（fn 开行）→ ① open_line==0 → P0。
+    set_caret_row_col(&host, cx, 0, 4);
+    let a = read(&host, cx).expect("fn 开行应有活动括对 P0");
+    assert_eq!(
+        (a.open_line, a.close_line, a.depth),
+        (0, 4, 0),
+        "fn 开行 → ① P0"
+    );
+    // r4（fn `}` 顶层）→ ③ close_line==4 → P0。
+    set_caret_row_col(&host, cx, 4, 0);
+    let a = read(&host, cx).expect("fn 顶层闭行应有活动括对 P0");
+    assert_eq!(
+        (a.open_line, a.close_line, a.depth),
+        (0, 4, 0),
+        "fn `}}` → ③ P0"
+    );
+}
+
+/// 第 4 片：横向钩线—开行底边（active 括对三分支几何之一）。夹具与 brief 同构
+/// `fn a(){\n if x{\n y();\n }\n}`，光标在 if 体内 → active 括对 = if 块（open1/close3）。
+/// 演算（sf=Render 同 2.0，HEAD=TAIL=0）：
+///   - if 引导列 = min(开列5, 闭列1, 对内最小非闭缩进 1+1) = 1；
+///   - 开列 5 > 引导列 1 → 开行**底边**横段：左=1·cw、右=5·cw、y=开行下沿（2·pitch）− 半像素；
+///   - 闭列 1 == 引导列 1 → 无闭行横段（VSCode endVisibleColumn > guide 才画）；
+///   - active 括对唯一 → 只画 if 的钩线（fn a 非 active 不画）。
+/// 同时断言竖线段跨度含开行（2026-11-14 第 4 片 A：`[open .. close)`）。
+#[gpui::test]
+fn bracket_hook_open_bottom_edge(cx: &mut TestAppContext) {
+    let text = "fn a(){\n if x{\n y();\n }\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    settle(cx);
+    // 光标在 if 体内（0idx 行 2 → inside if 块 [open1, close3)）。
+    set_caret_row_col(&host, cx, 2, 1);
+    let (cw, lh, gutter) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let cw = cw.max(1.);
+    // 渲染用的吸附行距（sf=2.0 测试平台默认，与 render 的 pitch 同式）。
+    let pitch = ((lh * 2.0 - 0.5).ceil()).max(1.0) / 2.0;
+    let hairline = 1.0 / 2.0;
+    let ap = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_pair());
+    assert_eq!(
+        (ap.map(|p| p.open_line), ap.map(|p| p.close_line)),
+        (Some(1), Some(3)),
+        "active 括对应为 if 块"
+    );
+    let open_hook = cx
+        .debug_bounds("ce-bracket-hook-open")
+        .expect("开行底边横段应渲染");
+    // 左缘 = 引导列（1·cw）+ gutter；右缘 ≈ 开列（5·cw）+ gutter。
+    let x0 = gutter + 1.0 * cw;
+    let x1 = gutter + 5.0 * cw;
+    assert!(
+        (open_hook.origin.x.as_f32() - x0).abs() < 1.0
+            && (open_hook.origin.x.as_f32() + open_hook.size.width.as_f32() - x1).abs() < 1.0,
+        "开行钩线左=引导列、右=开列：{open_hook:?}（期望 x0={x0} x1={x1}）"
+    );
+    assert!(
+        (open_hook.size.width.as_f32() - 4.0 * cw).abs() < 1.5,
+        "开行钩线宽 = 开列−引导列 = 4·cw：{open_hook:?}"
+    );
+    // y = 开行下沿 − 半像素（1 物理 px 厚，sf=2 → hairline=0.5 逻辑 px）。
+    assert!(
+        (open_hook.origin.y.as_f32() - (2.0 * pitch - hairline)).abs() < 1.5,
+        "开行钩线应在开行下沿：{open_hook:?}（期望 {}）",
+        2.0 * pitch - hairline
+    );
+    assert!(
+        (open_hook.size.height.as_f32() - hairline).abs() < 0.5,
+        "钩线厚 1 物理 px：{open_hook:?}"
+    );
+    // 闭行 `}` 独占、闭列 == 引导列 → 无闭行横段。
+    assert!(
+        cx.debug_bounds("ce-bracket-hook-close").is_none(),
+        "闭列==引导列时不应画闭行横段"
+    );
+    // 竖线段跨度含开行、不含闭行（`}` 独占 → [open1, close3)）。
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(
+            0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        )
+    });
+    assert!(
+        segs.iter().any(|(x, y, h)| {
+            (x / cw).round() as i64 == 1
+                && (y / pitch).round() as i64 == 1
+                && (h / pitch).round() as i64 == 2
+        }),
+        "if 竖线段应含开行、不含闭行 [1,3)：{segs:?}"
+    );
+}
+
+/// 第 4 片：横向钩线—闭行独占 `}` → **顶边**横段 + 竖线段不含闭行。闭列（4）深于引导列
+/// （2）：体内行 ` y();` 缩进 1（欠缩进）把 `guide_pair_column` 下拉到 min(开9,闭4,2)=2，
+/// 闭列 > 引导列 → 触发闭行横段（VSCode endVisibleColumn > guide）；闭行 `    }` 行首独占
+/// `}` → hasTextBeforeClosingBracket=false → 顶边 + 竖线不含闭行。
+#[gpui::test]
+fn bracket_hook_close_alone_top_edge(cx: &mut TestAppContext) {
+    let text = "fn a() {\n    if x {\n y();\n    }\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    settle(cx);
+    set_caret_row_col(&host, cx, 2, 1); // 光标在 if 体内 → active = if（open1/close3）。
+    let (cw, lh, gutter) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let cw = cw.max(1.);
+    let pitch = ((lh * 2.0 - 0.5).ceil()).max(1.0) / 2.0;
+    let hairline = 1.0 / 2.0;
+
+    let close_hook = cx
+        .debug_bounds("ce-bracket-hook-close")
+        .expect("闭行独占 `}` 应画顶边横段");
+    // 左缘 = 引导列（2）+ gutter；右缘 = 闭列（4）+ gutter。
+    let x0 = gutter + 2.0 * cw;
+    let x1 = gutter + 4.0 * cw;
+    assert!(
+        (close_hook.origin.x.as_f32() - x0).abs() < 1.0
+            && (close_hook.origin.x.as_f32() + close_hook.size.width.as_f32() - x1).abs() < 1.0,
+        "闭行顶边钩线左=引导列、右=闭列：{close_hook:?}"
+    );
+    assert!(
+        (close_hook.origin.y.as_f32() - 3.0 * pitch).abs() < 1.0,
+        "闭行独占 `}}` 钩线画在闭行**上沿**：{close_hook:?}"
+    );
+    assert!(
+        (close_hook.size.height.as_f32() - hairline).abs() < 0.5,
+        "钩线厚 1 物理 px：{close_hook:?}"
+    );
+    // 竖线段 `}` 独占 → 不含闭行：[open1, close3)。
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(
+            0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        )
+    });
+    assert!(
+        segs.iter().any(|(x, y, h)| {
+            (x / cw).round() as i64 == 2
+                && (y / pitch).round() as i64 == 1
+                && (h / pitch).round() as i64 == 2
+        }),
+        "闭行独占 `}}` → 竖线段不含闭行 [1,3)：{segs:?}"
+    );
+}
+
+/// 第 4 片：横向钩线—闭行前有文本（`z(); }`）→ **底边**横段 + 竖线段**含闭行**
+/// （VSCode `hasTextBeforeClosingBracket`=true → offset=1）。闭列（9）深于引导列（2）同 F2。
+#[gpui::test]
+fn bracket_hook_close_text_bottom_edge(cx: &mut TestAppContext) {
+    let text = "fn a() {\n    if x {\n y();\n    z(); }\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    settle(cx);
+    set_caret_row_col(&host, cx, 2, 1); // 光标在 if 体内 → active = if（open1/close3）。
+    let (cw, lh, gutter) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let cw = cw.max(1.);
+    let pitch = ((lh * 2.0 - 0.5).ceil()).max(1.0) / 2.0;
+    let hairline = 1.0 / 2.0;
+
+    let close_hook = cx
+        .debug_bounds("ce-bracket-hook-close")
+        .expect("闭行前有文本应画底边横段");
+    let x0 = gutter + 2.0 * cw;
+    let x1 = gutter + 9.0 * cw; // `    z(); }`：} 在字节列 9。
+    assert!(
+        (close_hook.origin.x.as_f32() - x0).abs() < 1.0
+            && (close_hook.origin.x.as_f32() + close_hook.size.width.as_f32() - x1).abs() < 1.5,
+        "闭行底边钩线左=引导列、右=闭列：{close_hook:?}"
+    );
+    assert!(
+        (close_hook.origin.y.as_f32() - (4.0 * pitch - hairline)).abs() < 1.5,
+        "闭行前有文本 → 钩线画在闭行**下沿**：{close_hook:?}"
+    );
+    // 竖线段闭行前有文本 → 含闭行：[open1, close3+1)。
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(
+            0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        )
+    });
+    assert!(
+        segs.iter().any(|(x, y, h)| {
+            (x / cw).round() as i64 == 2
+                && (y / pitch).round() as i64 == 1
+                && (h / pitch).round() as i64 == 3
+        }),
+        "闭行前有文本 → 竖线段含闭行 [1,4)：{segs:?}"
+    );
+}
+
+/// 第 4 片（C3 让位）：`suppress` 表把「同 (行,列) 的缩进灰线」压掉；空表 → 行为与旧实现
+/// 逐位一致（对照断言）。夹具 `fn a() {\n    x();\n}`：唯一缩进灰线在 (1, 0)。
+#[gpui::test]
+fn bracket_suppress_same_col_gray(cx: &mut TestAppContext) {
+    let text = "fn a() {\n    x();\n}";
+    let (host, cx) = open(cx, text);
+    let (_, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    let mut segs_of = |suppress: &[(usize, usize)]| {
+        cx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.read(cx).test_indent_guide_segments_flagged_suppressed(
+                0, 0.0, lh, 1.0, 1200.0, 1000.0, None, suppress,
+            )
+        })
+    };
+    // 控制：无让位 → 缩进灰线段 (col0, 行1, 1 行, 非 active)。
+    let plain = segs_of(&[]);
+    assert_eq!(
+        plain,
+        vec![(0.0, 1.0 * pitch, 1.0 * pitch, false)],
+        "空表 = 旧实现逐位一致：{plain:?}"
+    );
+    // 让位 (1,0) 恰好是 fn a 引导列 → 该灰线消失（bracket 竖线接管）。
+    let suppressed = segs_of(&[(0, 0), (1, 0), (2, 0)]);
+    assert!(
+        suppressed.is_empty(),
+        "括对引导列 (1,0) 灰线应被压掉：{suppressed:?}"
+    );
+}
+
+/// 第 4 片（C3 让位）：`suppress_active_rows` 行保留灰线但**不点亮** active。夹具
+/// `fn a() {\n    x();\n    y();\n}`（行 1/2 缩进 4 → 同一 col0 连续组）；active 组
+/// [1,3) 整组点亮；让位表含行 2（`(2,4)` 非 col0 灰线位）→ 行 2 灰线保留但熄高亮。
+#[gpui::test]
+fn bracket_suppress_active_row_keeps_gray(cx: &mut TestAppContext) {
+    let text = "fn a() {\n    x();\n    y();\n}";
+    let (host, cx) = open(cx, text);
+    let (_, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    let active = Some((0usize, 1usize, 3usize, 1usize)); // col0、组 [1,3)、光标行 1。
+    let mut segs_of = |suppress: &[(usize, usize)]| {
+        cx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.read(cx).test_indent_guide_segments_flagged_suppressed(
+                0, 0.0, lh, 1.0, 1200.0, 1000.0, active, suppress,
+            )
+        })
+    };
+    let plain = segs_of(&[]);
+    assert_eq!(
+        plain,
+        vec![(0.0, 1.0 * pitch, 2.0 * pitch, true)],
+        "无让位：col0 组 [1,3) 整段点亮：{plain:?}"
+    );
+    let segs = segs_of(&[(2, 4)]);
+    assert_eq!(
+        segs,
+        vec![
+            (0.0, 1.0 * pitch, 1.0 * pitch, true),
+            (0.0, 2.0 * pitch, 1.0 * pitch, false),
+        ],
+        "行 2 在让位表 → 保留灰线但不点亮：{segs:?}"
+    );
+}
+
+/// 第 4 片（C3 让位表）：`bracket_guide_suppress` 覆盖括对行 × 引导列（每对 open..=close 视
+/// 行、列 = `guide_pair_column`）。夹具两层：fn a→col0 覆 0..=4、if b→col4 覆 1..=3。
+#[gpui::test]
+fn bracket_suppress_table_covers_pair_rows(cx: &mut TestAppContext) {
+    let text = "fn a() {\n    if b {\n        x();\n    }\n}";
+    let (host, cx) = open(cx, text);
+    let (_, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let tbl = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_suppress(0, 1000.0, lh, config::layout::BracketGuidesMode::All)
+    });
+    for want in &[(0usize, 0usize), (1, 0), (1, 4), (2, 4), (3, 0), (4, 0)] {
+        assert!(tbl.contains(want), "让位表应含 {want:?}: {tbl:?}");
+    }
+    assert!(!tbl.contains(&(5, 0)), "超出配对行范围不应有让位项: {tbl:?}");
+}
+
+/// 第 4 片（C3 让位 · 渲染路径封口）：overlay 的让位表压掉括对行的 **active 高亮**；对照组
+/// 无让位时 active 组照常点亮。断言 `test_active_guide_group` 仍返回组（派生不受让位影响）。
+#[gpui::test]
+fn bracket_suppress_overlay_kills_active_hl(cx: &mut TestAppContext) {
+    let text = "fn a() {\n    if x {\n        y();\n    }\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    settle(cx);
+    set_caret_row(&host, cx, 2);
+    let (_, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let (group, suppress) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (ed.test_active_guide_group(), ed.test_bracket_guide_suppress(
+            0, 1000.0, lh, config::layout::BracketGuidesMode::All,
+        ))
+    });
+    assert!(group.is_some(), "括对行上 active 组仍应派生（不受让位影响）");
+    // 与 render `indentation_guide_overlay` 同式映射 active。
+    let active = group.map(|(col, f, l_excl)| (col, f, l_excl, 2usize));
+    let mut segs_of = |suppress: &[(usize, usize)]| {
+        cx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.read(cx).test_indent_guide_segments_flagged_suppressed(
+                0, 0.0, lh, 1.0, 2000.0, 4000.0, active, suppress,
+            )
+        })
+    };
+    // 对照组：无让位 → 组内整段点亮。
+    let with_supp = segs_of(&suppress);
+    assert!(
+        with_supp.iter().all(|(_, _, _, hl)| !*hl),
+        "让位表压掉括对行 active 高亮：{with_supp:?}"
+    );
+    let no_supp = segs_of(&[]);
+    assert!(
+        no_supp.iter().any(|(_, _, _, hl)| *hl),
+        "无让位对照：active 组应点亮：{no_supp:?}"
+    );
+}
+
+/// **用户真机对照表**（2026-11-14，zip 已验证 = `active_guide_group` / 块体模型）：夹具 7
+/// 行，逐行放光标断言渲染 hl 段行集（0 基半开 `[体首, 体末+1)`）与块体真值逐行一致：
+///   点 1（fn 开行）/ 5（if `}`，fn 严格含）/ 6（baz）/ 7（fn `}`）→ 2-6 = [1,6)（fn 体）；
+///   点 2（if 开行）/ 3（foo）/ 4（bar）→ 3-4 = [2,4)（if 体）。
+/// 走 `indentation_guide_segments_flagged`（与渲染 `indentation_guide_overlay` 同式派生
+/// active：group → (col, 体首, 体末+1, 光标可视行)），hl 段换算回 `(行首, 行末+1)` 对照。
+#[gpui::test]
+fn active_highlight_matches_user_table(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    if a == 1 {\n        foo();\n        bar();\n    }\n    baz();\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    let (_, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let pitch = ((lh - 0.5).ceil()).max(1.0);
+    // (光标 0idx 行, 期望 hl 段行集 [体首, 体末+1) 半开)：
+    let cases: &[(usize, (usize, usize))] = &[
+        (0, (1, 6)), // 点 fn 开行 → ① fn 体
+        (1, (2, 4)), // 点 if 开行 → ① if 体
+        (2, (2, 4)), // 点 foo → ② if 体
+        (3, (2, 4)), // 点 bar → ② if 体
+        (4, (1, 6)), // 点 if `}` → ② fn 严格含 → fn 体
+        (5, (1, 6)), // 点 baz → ② fn 体
+        (6, (1, 6)), // 点 fn `}` → ③ fn 体
+    ];
+    for &(row, want) in cases {
+        set_caret_row(&host, cx, row);
+        let (flag_hl, group) = cx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            let ed = ed.read(cx);
+            let group = ed.test_active_guide_group();
+            let active = group.map(|(col, f, l_excl)| (col, f, l_excl, row));
+            let segs = ed.test_indent_guide_segments_flagged(
+                0, 0.0, lh, 1.0, 2000.0, 4000.0, active,
+            );
+            let flag_hl: Vec<(usize, usize)> = segs
+                .into_iter()
+                .filter(|(_, _, _, hl)| *hl)
+                .map(|(_, y, h, _)| {
+                    ((y / pitch).round() as usize, ((y + h) / pitch).round() as usize)
+                })
+                .collect();
+            (flag_hl, group)
+        });
+        assert_eq!(
+            flag_hl.as_slice(),
+            &[want],
+            "行 {row}: 渲染 hl 段应 == 用户表 {want:?}（0 基半开）；实际 {flag_hl:?}"
+        );
+        let want_group: Vec<(usize, usize)> = group
+            .map(|(_, f, l_excl)| vec![(f, l_excl)])
+            .unwrap_or_default();
+        assert_eq!(
+            flag_hl, want_group,
+            "行 {row}: 渲染 hl 段应 == active_guide_group 区间（两路径同规则）"
+        );
+    }
+}
+
+/// **块体模型 · guidefix2 真值**（2026-11-14 用户 3 夹具实测唯一真值）：`target/guidefix2.rs`
+/// 双态夹具（real file），配对 impl(0,21,d0)、fn-render(1,20,d1)。关键修复：点 `div()`
+/// （0idx8）与链式续行 `.id(...)`（0idx9，旧"缩进级"口径误作 lv3 子块）→ 均关联 fn-render
+/// 体 [2,20) col4 = (4,2,20)；fn-render 开行（0idx1）/ lv2 注释行（0idx2）同归 fn-render 体；
+/// impl 开行（0idx0）→ ① open==0 → impl 体 [1,21) col0 = (0,1,21)。
+/// 闭行（1 基 21 fn-render `}`、22 impl `}`，均 0idx 20/21）：fn-render `}` 无 open==20、
+/// fn-render 不严格含自己闭行 → ② impl 严格含 20 → impl 体 (0,1,21)；impl `}` ③ close==21
+/// → impl 体 (0,1,21)——两条都归外层 impl 体。
+#[gpui::test]
+fn indent_guides_active_open_requires_block_opener(cx: &mut TestAppContext) {
+    let text = guidefix2_fixture_text();
+    let (host, cx) = open(cx, text);
+    let cases: &[(usize, Option<(usize, usize, usize)>)] = &[
+        (8, Some((4, 2, 20))),  // div() → ② 最内 fn-render 体 [2,20)
+        (9, Some((4, 2, 20))),  // .id() 链式续行 → ② 最内 fn-render 体（关键修复）
+        (2, Some((4, 2, 20))),  // lv2 注释行 → ② fn-render 体
+        (1, Some((4, 2, 20))),  // fn render { → ① open==1 → fn-render 体
+        (0, Some((0, 1, 21))),  // impl { → ① open==0 → impl 体 [1,21)
+        (20, Some((0, 1, 21))), // fn render `}`（1基21）→ ② impl 严格含 20 → impl 体
+        (21, Some((0, 1, 21))), // impl `}`（1基22，顶级）→ ③ close==21 → impl 体
+    ];
+    for &(row, want) in cases {
+        set_caret_row(&host, cx, row);
+        let group = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide_group());
+        assert_eq!(
+            group,
+            want,
+            "行 {row}（=1基{}）group 期望 {want:?}（块体模型：关联括对体）",
+            row + 1
+        );
+    }
+}
+
+/// active 高亮**颜色**随「块体模型关联括对」（2026-11-14 用户实测唯一真值）：光标行关联括对
+/// （`active_pair`：① 开行 ② 严格含 ③ 闭行，取 depth 最大）→ 该括对色 `palette[depth % 3]`；
+/// 无关联括对 → 灰 `active_guide_color`。夹具 8 行（fn(open0,close6,d0) / if(open1,close4,
+/// d1) + 尾行顶层代码）：
+/// - r3（foo/bar 体）→ ② if → palette[1]；
+/// - r5（baz，fn 内 if 外）→ ② fn → palette[0]；
+/// - r0（fn 开行）→ ① fn → palette[0]；r6（fn `}` 顶层）→ ③ fn → palette[0]；
+/// - r7（顶层 `let top = 1;`，无关联块）→ 灰 active_guide_color。
+#[gpui::test]
+fn active_highlight_color_follows_containing_pair(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    if a == 1 {\n        foo();\n        bar();\n    }\n    baz();\n}\nlet top = 1;\n";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    let (want_if, want_fn, gray) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (
+            ed.test_bracket_guide_color(1, true), // palette[1%3] 全不透明 = if 括对 active 色
+            ed.test_bracket_guide_color(0, true), // palette[0%3] 全不透明 = fn 括对 active 色
+            ed.test_guide_colors().1,             // active_guide_color（VSCode 灰）
+        )
+    });
+    // 光标在 if 体内 → ② 最内 if（depth1）→ if 色。
+    set_caret_row(&host, cx, 3);
+    let (ap, color) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (ed.test_active_pair().map(|p| p.depth), ed.test_active_guide_highlight_color())
+    });
+    assert_eq!(ap, Some(1), "光标在 if 体 → 关联括对 = if（depth1）");
+    assert_eq!(color, want_if, "if 体内 hl 色应随 if 括对色 palette[1]");
+    // 光标在 baz（0idx5）：if 外但 fn 内 → fn 括对色。
+    set_caret_row(&host, cx, 5);
+    let (ap, color) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (ed.test_active_pair().map(|p| p.depth), ed.test_active_guide_highlight_color())
+    });
+    assert_eq!(ap, Some(0), "光标在 baz → 关联括对 = fn（depth0，if 不含 baz）");
+    assert_eq!(color, want_fn, "baz 行 hl 色随 fn 括对色 palette[0]");
+    // fn 开行（r0）/ fn 闭行（r6，顶层 `}`）→ ①/③ fn → fn 色（不再灰）。
+    set_caret_row(&host, cx, 0);
+    let (ap, color) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (ed.test_active_pair().map(|p| p.depth), ed.test_active_guide_highlight_color())
+    });
+    assert_eq!(ap, Some(0), "fn 开行 → ① fn");
+    assert_eq!(color, want_fn, "fn 开行 hl 色随 fn 括对色 palette[0]");
+    set_caret_row(&host, cx, 6);
+    let (ap, color) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (ed.test_active_pair().map(|p| p.depth), ed.test_active_guide_highlight_color())
+    });
+    assert_eq!(ap, Some(0), "fn `}}` 顶层 → ③ fn");
+    assert_eq!(color, want_fn, "fn `}}` hl 色随 fn 括对色 palette[0]");
+    // 无关联块（顶层代码行）→ 灰 active_guide_color。
+    set_caret_row(&host, cx, 7);
+    let (ap, color) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (ed.test_active_pair(), ed.test_active_guide_highlight_color())
+    });
+    assert_eq!(ap, None, "顶层 let top 行 → 无关联括对");
+    assert_eq!(color, gray, "无关联块 → hl 色应为灰 active_guide_color");
+}
+
+/// 缺省 Off（2026-11-14 用户真机口径）：括对彩色竖线层 `ce-bracket-guides` **不挂载**；
+/// 钩线层 `ce-bracket-hooks` 恒挂（bracketPairsHorizontal='active'，仅严格含光标的
+/// active 括对）——光标进 if 体 → if 开行底边钩线 1 根（闭列==引导列 → 无闭行钩线）。
+/// All 模式（对比用，`BRACKET_GUIDES_MODE` 编译期常量翻转）：竖线层挂载与否仅由
+/// `BRACKET_GUIDES_MODE != Off` 守卫——缺省 Off 的 None 已直接证明守卫在 Off 分支失效，
+/// 故 All 的竖线层渲染存在性 = 守卫取真 + 段数据非空（段数据在此按 All 显式断言非空、
+/// fn col0 + if col4 两根）；不必也无法在常量默认 Off 的测试二进制里直接 render 断言。
+#[gpui::test]
+fn bracket_rails_off_by_default_and_hooks_active_pair(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    if a == 1 {\n        foo();\n        bar();\n    }\n    baz();\n}";
+    let (host, cx) = open(cx, text);
+    assert!(
+        cx.debug_bounds("ce-bracket-guides").is_none(),
+        "缺省 Off：ce-bracket-guides 竖线层不应渲染"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-hooks").is_some(),
+        "钩线层恒挂（Off 也保留，容器在渲染树中）"
+    );
+    focus(&host, cx);
+    set_caret_row_col(&host, cx, 3, 2); // 光标在 if 体 foo() → active = if（open1/close4）。
+    settle(cx);
+    assert!(
+        cx.debug_bounds("ce-bracket-guides").is_none(),
+        "光标进 if 体，竖线层仍不渲染（Off 只留钩线）"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-hook-open").is_some(),
+        "if 开行钩线应渲染（bracketPairsHorizontal='active' 保留）"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-hook-close").is_none(),
+        "if 闭列==引导列（col4）→ 无闭行钩线（对照 bracket_hook_open_bottom_edge）"
+    );
+    // All 模式（对比）：段数据全括对产线——fn col0/depth0 + if col4/depth1 两根（见上注释）。
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let cw = cw.max(1.);
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments_flagged(
+            0, 0.0, lh, 1.0, 1200.0, 1000.0, config::layout::BracketGuidesMode::All,
+        )
+    });
+    assert_eq!(segs.len(), 2, "All 模式应全部括对产竖线：{segs:?}");
+    let norm: Vec<(i64, usize)> = segs.iter().map(|(x, _, _, d, _)| ((x / cw).round() as i64, *d)).collect();
+    assert!(norm.contains(&(0, 0)), "All：fn 括对段应在 col0/depth0：{norm:?}");
+    assert!(norm.contains(&(4, 1)), "All：if 括对段应在 col4/depth1：{norm:?}");
+}
+

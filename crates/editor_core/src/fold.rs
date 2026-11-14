@@ -20,6 +20,23 @@
 
 use gpui::SharedString;
 
+#[cfg(test)]
+thread_local! {
+    /// 最近一次 `incremental_fold_brackets` 的实际重扫包络
+    /// `(fold_from, fold_stop, bracket_from, bracket_stop)`：**确定性结构量**，供
+    /// 「打字包络不退化」回归探针断言（禁纯墙钟做主断，墙钟仅旁证）；`[0,0,0,0]` =
+    /// 未走增量路径（整篇兜底 / 超大文档清空）。
+    static LAST_INCREMENTAL_SPANS: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0, 0, 0, 0]) };
+}
+
+/// （仅测试）最近一次 [`incremental_fold_brackets`] 的重扫包络 `(fold_from, fold_stop,
+/// bracket_from, bracket_stop)`，供「栈永不清空」文档的增量包络有界回归探针读取。
+#[cfg(test)]
+pub(crate) fn last_incremental_spans() -> [usize; 4] {
+    LAST_INCREMENTAL_SPANS.with(|c| c.get())
+}
+
 /// 一个折叠区间：隐藏 `(start, end)`，`start` 行可见、`end` 行可见。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fold {
@@ -46,10 +63,79 @@ pub struct BracketPair {
     pub open_col: usize,
     /// 闭括号所在逻辑行（恒 > `open_line`）。
     pub close_line: usize,
+    /// 闭括号在行内的**字节列**（C4 缩进感知配对新增；供竖线列 `min(开列, 闭列, …)` 计算）。
+    pub close_col: usize,
     /// 竖线所在**宽度单位列**（空格=1、Tab=4，见 [`super::buffer::char_width_units`]）：
     /// **开括号行的缩进宽**（块首行缩进，如 impl 行缩进 0、fn 行缩进 4、Self 行缩进 8）。
     /// 竖线画在这里并与块体左对齐；不画在开/闭行上（避免压到 `{`/`}` 字形）。
     pub guide_units: usize,
+    /// 体内（`开+1 .. 闭−1`）最小「非闭行缩进 units」：跳过空行与「首非空白为 `} ) ]`」
+    /// 的行（closer，不参与列下吸）；跨度 > 上限（1024 行，防退化）或无合格行 → `None`
+    /// （= +∞，调用方退化为取 `min(开,闭)` 项）。
+    /// **落地期预存**（折叠表扫描/合并时算好，**非帧态**）：帧内 `guide_pair_column*`
+    /// O(1) 只读，替代运行时逐内行 `line_shared` 堆扫描（巨型括对逐帧 ×3 消费方各扫一遍
+    /// 的历史成本下移到扫描/增量期只算一次）。由 [`scan_bracket_segment`] 在闭号处算、
+    /// 增量「跨包络平移」处对受编辑括对重算（与整篇扫描对新增字段逐位一致，K160），
+    /// 且与旧运行时算法逐字节同语义（K153 单源，parity 测试钉死）。
+    /// u32 足矣：缩进 units 以行首空白计（空格=1、Tab=4），单行不可能超 2^32
+    /// （行文本超 4GB 即越文档行宽上限）；`None` 兜底无需哨兵。
+    pub guide_body_min_units: Option<u32>,
+    /// 开括号的**嵌套层级**（0 起，纯 DFS 嵌套深度）：供括号引导线 3 色循环池按
+    /// `depth % 3` 取色（对齐 VS Code bracket guides）。良构代码下 = 括号树深度；
+    /// 坏代码（永不闭的 `{`、交错错配）下计数器可偏差——竖线纯视觉，偏例不影响正确性。
+    /// 增量平移走 `..p` 结构更新自动保级；受影响段重扫从边界全新起算（边界各栈空 ⇒
+    /// depth 0，与整篇逐位一致）。
+    pub depth: usize,
+}
+
+/// 括号**字符**的嵌套层级（括号文本着色用，对齐 VS Code `bracketPairColorization`）：
+/// 与 [`BracketPair`]（只记**跨行**配对、画竖线）互补——**逐字符**记录每个被词法扫描
+/// 认可的括号（含单行配对、含永不匹配的开口；**成功配对**的闭括号也记、不匹配闭跳过），
+/// 按 `(line, col)` 升序产出。开括号 depth = 压栈前 `nest_depth`；闭括号 depth = 对应
+/// 开口的 depth（括对两端同色）。视图层按 `depth % 3` 取 `bracket_guide_palette` 给
+/// 该字符 `col..col+1` 字节 span 覆前景色；字符串/注释内的括号不在扫描内 → 不着色。
+/// 增量平移按 `line` 仿 [`BracketPair`] 尾部平移；受影响段重扫从边界全新起算（各栈
+/// 空 ⇒ depth 0，与整篇逐位一致）。坏代码（永不闭开口、交错错配）下计数可偏差——
+/// 纯视觉，偏例不影响正确性（与 `BracketPair::depth` 同口径）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BracketChar {
+    /// 括号所在逻辑行。
+    pub line: usize,
+    /// 括号在行内的**字节列**（着色 span = `col..col+1`）。
+    pub col: usize,
+    /// 嵌套层级（0 起）：开括号 = 压栈前 `nest_depth`；闭括号 = 对应开口的 `depth`。
+    pub depth: usize,
+}
+
+/// [`BracketPair`] 的轻量值拷贝（owned，`Copy`）：供「活动括对」派生与 bracket 段
+/// active 匹配传值，避免持 `&BracketPair` 跨借用边界（见 `editing::active_pair`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BracketPairLite {
+    /// 见 [`BracketPair::open_line`]。
+    pub open_line: usize,
+    /// 见 [`BracketPair::open_col`]。
+    pub open_col: usize,
+    /// 见 [`BracketPair::close_line`]。
+    pub close_line: usize,
+    /// 见 [`BracketPair::close_col`]。
+    pub close_col: usize,
+    /// 见 [`BracketPair::depth`]。
+    pub depth: usize,
+    /// 见 [`BracketPair::guide_body_min_units`]。
+    pub guide_body_min_units: Option<u32>,
+}
+
+impl From<&BracketPair> for BracketPairLite {
+    fn from(p: &BracketPair) -> Self {
+        Self {
+            open_line: p.open_line,
+            open_col: p.open_col,
+            close_line: p.close_line,
+            close_col: p.close_col,
+            depth: p.depth,
+            guide_body_min_units: p.guide_body_min_units,
+        }
+    }
 }
 
 /// 行首空白（空格/Tab）的计数结果：**一次扫描**同时给出字节数与宽度单位两种口径，
@@ -96,19 +182,175 @@ pub fn leading_indent(s: &str) -> LeadingWs {
     LeadingWs::scan(s)
 }
 
+// ---------------------------------------------------------------------------
+// §8 缩进引导线（VS Code indentation guides 主源）纯函数
+// ---------------------------------------------------------------------------
+
+/// 缩进引导线级数（§8.1 主源算法）：`level = (indent=0) ? 0 : ceil(cols/is)`。
+/// `cols` = 行首空白的**宽度单位**（空格=1、Tab=4，即 [`leading_indent`].units()）；
+/// `is` = indentSize（本仓默认 `config::layout::INDENT_GUIDE_INDENT_SIZE=4`）。
+/// 纯函数（无 gpui 依赖），editor_core 与视图层共用一处实现。
+/// 画列 = `{(L−1)·is | L=1..=level}`（0-based 列 g=0,is,2is,…）。
+pub fn indent_guide_level(leading_cols: usize, indent_size: usize) -> u32 {
+    let (d, r) = (leading_cols / indent_size, leading_cols % indent_size);
+    if r == 0 {
+        d as u32
+    } else {
+        (d + 1) as u32
+    }
+}
+
+/// 空/纯空白行的引导线级数（§8.1）：A=上一可视**非空**行缩进、B=下一可视**非空**行缩进
+/// （任一缺 → 0，monaco 同：首行/文档尾空行无线）。四分支：
+/// - `A<B` → `1 + ⌊A/is⌋`（从浅层 A 续一段警戒线）；
+/// - `A==B` → `⌈B/is⌉`（均等缩进 → 按本级续）；
+/// - `A>B` → `1 + ⌊B/is⌋`（从浅层 B 续，防竖线直穿闭合行）。
+/// cols 传 `Option<i32>`（None = 缺）；返回应画的级数（0 = 无线）。
+pub fn blank_guide_level(prev: Option<i32>, next: Option<i32>, indent_size: i32) -> u32 {
+    let is = indent_size.max(1);
+    let (Some(a), Some(b)) = (prev, next) else {
+        return 0;
+    };
+    let a = a.max(0);
+    let b = b.max(0);
+    if a < b {
+        1 + (a / is) as u32
+    } else if a == b {
+        ((b + is - 1) / is) as u32
+    } else {
+        1 + (b / is) as u32
+    }
+}
+
 /// 跨行括号配对的**段扫描**结果。
 #[derive(Debug, Default)]
-pub struct BracketScanReport {
+pub(crate) struct BracketScanReport {
     /// 段内产生的配对（`open_line ∈ [from, stop)`；`close_line ≤ stop`）。
     pub pairs: Vec<BracketPair>,
+    /// 段内产生的括号**字符**层级表（按 `(line, col)` 升序；含单行配对与永不匹配的
+    /// 开口、成功配对的闭括号，见 [`BracketChar`]）。
+    pub chars: Vec<BracketChar>,
     /// 段内「栈空 + 不在块注释内」边界行（升序；含 `from`）。
     pub boundaries: Vec<usize>,
     /// 实际扫描停止行（`stop_after` 命中首个边界后的行；未命中 = `row_count`）。
     pub stop: usize,
+    /// 段内「对齐行」记录的**入口栈状态快照**（升序；行 → 处理前行状态，见
+    /// [`SNAPSHOT_SPACING`] / ⑦ 打字卡顿修复）。空栈边界照旧，快照是「栈永不清空」
+    /// 文档的替代断点；空表 = 无对齐落点（短段）或预算封顶（记忆有界）。
+    pub snapshots: Vec<(usize, BracketSnapshot)>,
+    /// 扫描预算耗尽（病理文档：单行密括号 / 超深缩进）→ true：输出可能不全，上层应
+    /// **整体返回空表**（宁缺毋残，避免「有开无闭」的残缺高亮），见 `BRACKET_*_MAX`。
+    pub truncated: bool,
+}
+
+// ---------------------------------------------------------------------------
+// 括号扫描预算（2026-11-14 安全护栏）：扫描本无上限，病理文档会无界增长三处内存直至
+// OOM——① 单行密括号（1 行 2.5×10^7 个 `{`/`(`/`[`，row_count=1 绕开 limits.rs 200k
+// 行守卫）：out.chars 24B/项 + paren/brace 栈 32/24B/项同步爆；② 超深缩进（单行
+// `" ".repeat(10^7) + "{"`）：brace_stack.resize(k+1) 按缩进 depth 膨胀空层。
+// 预算耗尽 → truncated 置位、停止一切后续追加（`}` pop 仍执行防空栈 panic），上层见
+// truncated → 返回空表（该文件整体不渲染括对/高亮，视觉降级可接受）。数值取 2 的幂，
+// 正常源码（10 万行 × 平均每行 3~5 个括字符 ≈ 3~5×10^5）约为上限（1<<20 ≈ 1.05×10^6）的
+// 1/2~1/3，触发即属病理输入或超大生成文件；即便整个预算吃满：chars 表 ≈24MB、未闭栈 ≈32MB、
+// 派生 pair 表 ≈24MB、快照克隆最坏 ~100MB 级暂态，仍是有界而非 OOM。
+// ---------------------------------------------------------------------------
+/// 总括字符表（`out.chars`）的 push 上限：1<<20 ≈ 104.9 万项 ≈ 24B/项 = 24MB（有界上界）。
+pub(crate) const BRACKET_CHAR_MAX: usize = 1 << 20;
+/// 未闭栈项上限（paren_stack + Σ brace 各层）：同量级 ≈ 32MB（32B/项），与字符上限
+/// 联动约束「只开不闭」型病理输入的栈无界增长。
+pub(crate) const BRACKET_UNCLOSED_MAX: usize = 1 << 20;
+/// 缩进分层栈层数上限：`brace_stack` 只 resize 到此深度，防御超深缩进的空 Vec 膨胀
+/// （正常代码缩进深度远小于 4096；视觉上也不存在 4096 层竖线）。
+pub(crate) const BRACKET_DEPTH_MAX: usize = 4096;
+
+/// 体内（`开+1 .. 闭−1`）最小「非闭行缩进 units」**落地区间扫描**（语义 = 旧视图层运行时
+/// `guide_inner_min_noncloser` 逐字节复刻，K153/K160 单源）：跳过空行与「首非空白为
+/// `} ) ]`」的行（closer，不参与列下吸）；跨度 > `INNER_SCAN_CAP`（1024 行，防退化）
+/// 或无合格行 → `None`（= +∞，调用方退化为取 `min(开,闭)` 项）。
+/// 返回 u32（缩进 units，见 [`crate::editor::buffer::char_width_units`]）。
+///
+/// 用途：**落地期预存**（[`scan_bracket_segment`] 闭号处 / 增量「跨包络平移」处重算），
+/// 帧内 `guide_pair_column*` 只读字段、不再逐内行 `line_shared` 堆扫。全扫描期逐对
+/// 内扫有界：单对 ≤ 1024 行读（跨度超限即返回 None、零读）；病理深嵌套文档（栈永不
+/// 清空型）的对数 × 每对体长在预算内，且运行在后台线程、非帧热路径（代价转移是目标）。
+fn compute_guide_body_min_units<F>(line: &F, open: usize, close: usize) -> Option<u32>
+where
+    F: Fn(usize) -> SharedString,
+{
+    const INNER_SCAN_CAP: usize = 1024;
+    if close.saturating_sub(open).saturating_sub(1) > INNER_SCAN_CAP {
+        return None;
+    }
+    let mut min: Option<u32> = None;
+    for r in (open + 1)..close {
+        let s = line(r);
+        let s = s.as_ref();
+        let t = s.trim_start();
+        if t.is_empty() {
+            continue;
+        }
+        let first = t.as_bytes()[0];
+        if first == b'}' || first == b')' || first == b']' {
+            continue;
+        }
+        let units = leading_indent(s).units() as u32;
+        min = Some(min.map_or(units, |m| m.min(units)));
+    }
+    min
+}
+
+// ---------------------------------------------------------------------------
+// 增量重扫「栈永不清空」文档的快照断点（2026-11-14 打字卡顿 ⑦ 修复）：
+// 空栈边界依赖「整篇栈清空」才出现；深嵌套/未闭括号文档（单 `{` 未闭就令缩进层级栈
+// 永不清空）会令边界列表稀疏/空 → 受影响包络退化为 0..EOF，每次敲括号整篇重扫
+// （20k 深嵌套 debug 85-135ms）。对策 = 在**对齐行**持久化「入口栈状态」快照：
+// 增量重扫从最近快照还原真态（无需等栈空），并在「新态 == 旧态」的快照行汇聚提前
+// 收敛，与从 0 整篇扫描逐位一致（K160 对拍唯一真值，不用正确性换速度）。
+// 内存有界：快照点 = 行数/对齐间距、态条目预算按 `BRACKET_UNCLOSED_MAX` 同量级护栏
+// 封顶（超限不再落新快照，该行退化非快照点、由旧的空栈边界/0 兜底），不会无界增长。
+// ---------------------------------------------------------------------------
+/// 快照对齐间距：行号对齐到该倍数的行才落快照（fold/括号各一族）。正常文档的空栈
+/// 边界已足够密；此间距仅覆盖「栈永不清空」病理文档——越密包络越小、内存越多。
+pub(crate) const SNAPSHOT_SPACING: usize = 512;
+/// 单族（fold / 括号各算一族）快照**条目总预算**：全部快照栈项合计 ≤ 此值
+/// （每项约 16~24B → 预算 ≈ 1~1.5MB 有界上界）；超限不再落新快照。
+pub(crate) const SNAPSHOT_STATE_ITEMS_BUDGET: usize = 1 << 16;
+
+/// fold 扫描器入口状态快照（某行「处理前」的完整状态）：重扫从它还原即与从 0 整篇
+/// 扫描在 `≥ 该行` 逐位一致；`PartialEq` 供增量汇聚点「新态 == 旧态」校验（K160）。
+/// 跨 crate 由视图层**不透明**存储/透传（不进字段访问）。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[doc(hidden)]
+pub struct FoldSnapshot {
+    /// 挂起的块 `(start, indent)` 栈（见 [`scan_fold_segment`]）。
+    pub stack: Vec<(usize, usize)>,
+    /// 上一非空行 `(line, indent)`。
+    pub pending: Option<(usize, usize)>,
+}
+
+/// 括号扫描器入口状态快照（某行「处理前」的完整状态）：重扫从它还原即与从 0 整篇
+/// 扫描在 `≥ 该行` 逐位一致，含 C4 缩进分层花括号栈 / 全局括号栈 / 块注释位 / 嵌套
+/// 深度。`PartialEq` 用于增量汇聚点「新态 == 旧态」校验（字节恒等由状态相等 + 行内容
+/// 一致保证，K160）；跨 crate 由视图层**不透明**存储/透传。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[doc(hidden)]
+pub struct BracketSnapshot {
+    /// 各缩进层的花括号 LIFO 栈 `(开行, 开列, depth)`。
+    pub brace_stack: Vec<Vec<(usize, usize, usize)>>,
+    /// 全局圆括号/方括号 LIFO 栈 `(开行, 开列, 字符, depth)`。
+    pub paren_stack: Vec<(usize, usize, char, usize)>,
+    /// 是否正处块注释内。
+    pub in_block_comment: bool,
+    /// 纯 DFS 嵌套深度。
+    pub nest_depth: usize,
 }
 
 /// 扫描全文/受影响段的跨行括号配对（`{ }` / `( )` / `[ ]`），O(行数) 单遍、仅记录
 /// **跨行**配对（单行 `{}` 不产竖线）。`line` 按逻辑行号返回该行文本（只读）。
+///
+/// 配对规则（C4 缩进感知）：`{` 压入「开行缩进 units 层」的独立栈（`}`/`(`/`[` 不混层）；
+/// `}` 只查**本行缩进层**栈、命中最近未配 `{` 成对；该层空 → **丢弃**（绝不跨层偷配，
+/// 消灭坏代码里 mega 单行多括号吞掉别的层的闭号导致的伪标尺）。`()`/`[]` 保留全局 LIFO。
 ///
 /// 词法兜底：跳过 `//` 行注释、`/* */` 块注释（跨行状态）与 `"..."` 字符串
 /// （含 `\"` 转义）；**不**处理原样字符串/字符字面量（Rust 生命周期 `'a` 不宜当
@@ -117,16 +359,25 @@ pub struct BracketScanReport {
 ///
 /// `scan_bracket_pairs` 是其「从 0 整篇、扫到文末」的薄包装；[`BracketScanReport`]
 /// 额外给出「栈清空边界」供增量重算复用：
-/// **从某个边界行以全新状态（空栈、不在块注释内）开始扫描，与从 0 整篇扫描在
-/// `≥ 该行` 的处理上逐位一致**——括号不跨行（字符串在行内结束）、进入行只需
-/// 栈 + 块注释位两个状态，边界后无任何 OPEN 段残留，故可断点续扫。
+/// **从某个边界行以全新状态开始（各层花括号栈空 && 括号栈空 && 不在块注释内），
+/// 与从 0 整篇扫描在 `≥ 该行` 的处理上逐位一致**——括号不跨行（字符串在行内结束）、
+/// 进入行只需栈 + 块注释位两个状态，边界后无任何 OPEN 段残留，故可断点续扫。
 /// `stop_after = Some(m)` 时在**首个「行号 ≥ m 且处理后为边界」的行**停止
 /// （增量重算用它圈定受影响包络尾；未命中则扫到文末）。
+///
+/// 2026-11-14（打字卡顿 ⑦）：另支持两种「栈永不清空」文档的断点——
+/// - `init = Some(快照)`：以该快照（某行处理前状态）为起始态续扫（与从 0 整篇在
+///   `≥ from` 逐位一致，无需等栈空）；
+/// - `merge_snaps = &[(行, 期待旧态)]`：扫描到某检查点行时，若当前**入口态** == 期待
+///   旧态（即受影响段对栈的影响已在此行完全消解）→ 处理完该行后在此停（`out.stop`），
+///   尾部平移与整篇扫描等价（K160）。检查点行须 ≥ 受影响段尾（由增量侧预筛）。
 pub(crate) fn scan_bracket_segment<F>(
     line: F,
     row_count: usize,
     from: usize,
     stop_after: Option<usize>,
+    init: Option<BracketSnapshot>,
+    merge_snaps: &[(usize, &BracketSnapshot)],
 ) -> BracketScanReport
 where
     F: Fn(usize) -> SharedString,
@@ -136,15 +387,71 @@ where
         return out;
     }
     let from = from.min(row_count);
-    // 栈：(开括号行, 开括号字节列, 开括号字符)
-    let mut stack: Vec<(usize, usize, char)> = Vec::new();
+    // C4 缩进感知配对：
+    // - 花括号按「开行缩进 units」分层，每层独立 LIFO；`}` 只查**本行**缩进层栈，
+    //   命中最近未配 `{`；该层空 → 丢弃（绝不跨层偷配）。栈项 = (开括号行, 开括号字节列, depth)。
+    // - 圆括号/方括号保留全局 LIFO（不变）。栈项 = (开括号行, 开括号字节列, 字符, depth)。
+    // - `nest_depth` = 与分层栈解耦的**纯 DFS 嵌套深度**：每个开括号压入时记录当前
+    //   nest_depth 后 +1；闭括号**成功配对弹出**时 −1（坏代码下可偏差，见 `BracketPair::depth`）。
+    let mut brace_stack: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+    let mut paren_stack: Vec<(usize, usize, char, usize)> = Vec::new();
+    let mut nest_depth = 0usize;
     let mut in_block_comment = false;
+    // 起始态：空栈（from=0 / 空栈边界）或由快照还原（「栈永不清空」文档断点，含残差开口）。
+    if let Some(s) = init {
+        brace_stack = s.brace_stack;
+        paren_stack = s.paren_stack;
+        in_block_comment = s.in_block_comment;
+        nest_depth = s.nest_depth;
+    }
+    // 预算护栏状态：`truncated` = 预算耗尽（停止一切追加、返回截断报告）；
+    // `unclosed` = 未闭栈项数（paren_stack.len() + Σ brace 各层 len，压栈 +1 / 弹出 −1），
+    // 与字符上限联动约束「只开不闭」型病理输入的栈无界增长。
+    let mut truncated = false;
+    let mut unclosed = paren_stack.len();
+    for level in &brace_stack {
+        unclosed += level.len();
+    }
+    // 快照落点预算（⑦）：全部快照栈项合计 ≤ `SNAPSHOT_STATE_ITEMS_BUDGET`（有界上界，
+    // 超限不再落新快照，该行退化非快照点）；`merge_cur` 为汇聚检查点游标。
+    let mut snap_items_budget = SNAPSHOT_STATE_ITEMS_BUDGET;
+    let mut merge_cur = 0usize;
     let mut line_ix = from;
     while line_ix < row_count {
+        // ——— 处理本行之前：快照落点 + 汇聚检查点（都看「入口态」）———
+        let snap_items = paren_stack.len() + brace_stack.iter().map(|lv| lv.len()).sum::<usize>();
+        if line_ix % SNAPSHOT_SPACING == 0 && snap_items <= snap_items_budget {
+            out.snapshots.push((
+                line_ix,
+                BracketSnapshot {
+                    brace_stack: brace_stack.clone(),
+                    paren_stack: paren_stack.clone(),
+                    in_block_comment,
+                    nest_depth,
+                },
+            ));
+            snap_items_budget -= snap_items;
+        }
+        let mut snap_stop = false;
+        if merge_cur < merge_snaps.len() && merge_snaps[merge_cur].0 == line_ix {
+            let exp = &merge_snaps[merge_cur].1;
+            if exp.brace_stack == brace_stack
+                && exp.paren_stack == paren_stack
+                && exp.in_block_comment == in_block_comment
+                && exp.nest_depth == nest_depth
+            {
+                // 受影响段对栈的影响已在本行完全消解 → 处理完本行后在此停（尾部平移等价）。
+                snap_stop = true;
+            }
+            merge_cur += 1;
+        }
         let text: SharedString = line(line_ix);
         let s = text.as_ref();
         let mut col = 0usize;
         while col < s.len() {
+            if truncated {
+                break; // 预算耗尽：本行剩余不再扫描，返回截断报告
+            }
             let ch = s[col..].chars().next().unwrap_or('\0');
             if in_block_comment {
                 if s[col..].starts_with("*/") {
@@ -175,29 +482,89 @@ where
                         }
                     }
                 }
-                '{' | '(' | '[' => {
-                    stack.push((line_ix, col, ch));
+                '{' => {
+                    if out.chars.len() >= BRACKET_CHAR_MAX || unclosed >= BRACKET_UNCLOSED_MAX {
+                        // 字符/未闭预算耗尽 → 截断（停止一切后续追加）。
+                        truncated = true;
+                    } else {
+                        let k = leading_indent(s).units();
+                        if k >= BRACKET_DEPTH_MAX {
+                            // 超深缩进：resize 空层会随缩进 depth 无界膨胀 → 截断。
+                            truncated = true;
+                        } else {
+                            if brace_stack.len() <= k {
+                                brace_stack.resize(k + 1, Vec::new());
+                            }
+                            out.chars.push(BracketChar { line: line_ix, col, depth: nest_depth });
+                            brace_stack[k].push((line_ix, col, nest_depth));
+                            unclosed += 1;
+                            nest_depth += 1;
+                        }
+                    }
+                    col += ch.len_utf8();
+                }
+                '(' | '[' => {
+                    if out.chars.len() >= BRACKET_CHAR_MAX || unclosed >= BRACKET_UNCLOSED_MAX {
+                        // 字符/未闭预算耗尽 → 截断（停止一切后续追加）。
+                        truncated = true;
+                    } else {
+                        out.chars.push(BracketChar { line: line_ix, col, depth: nest_depth });
+                        paren_stack.push((line_ix, col, ch, nest_depth));
+                        unclosed += 1;
+                        nest_depth += 1;
+                    }
                     col += ch.len_utf8();
                 }
                 '}' | ')' | ']' => {
-                    let want = match ch {
-                        '}' => '{',
-                        ')' => '(',
-                        _ => '[',
-                    };
-                    while let Some((ol, oc, och)) = stack.pop() {
-                        if och == want {
-                            if line_ix > ol {
-                                // 竖线列 = 开括号行的缩进宽（块首缩进）。
-                                let guide_units = leading_indent(line(ol).as_ref()).units();
-                                out.pairs.push(BracketPair {
-                                    open_line: ol,
-                                    open_col: oc,
-                                    close_line: line_ix,
-                                    guide_units,
-                                });
+                    if ch == '}' {
+                        // `}` 只查本行缩进层栈；该层空 → 丢弃（不跨层回退、不跨层偷配）。
+                        let k = leading_indent(s).units();
+                        if let Some(level) = brace_stack.get_mut(k) {
+                            if let Some((ol, oc, od)) = level.pop() {
+                                // pop 恒执行（防空栈/budget 会计），追加仅在未截断时。
+                                unclosed = unclosed.saturating_sub(1);
+                                if !truncated {
+                                    out.chars.push(BracketChar { line: line_ix, col, depth: od });
+                                    nest_depth = nest_depth.saturating_sub(1);
+                                    if line_ix > ol {
+                                        // 竖线列 = 开括号行的缩进宽（块首缩进，兼容字段）。
+                                        let guide_units = leading_indent(line(ol).as_ref()).units();
+                                        out.pairs.push(BracketPair {
+                                            open_line: ol,
+                                            open_col: oc,
+                                            close_line: line_ix,
+                                            close_col: col,
+                                            guide_units,
+                                            guide_body_min_units: compute_guide_body_min_units(&line, ol, line_ix),
+                                            depth: od,
+                                        });
+                                    }
+                                }
                             }
-                            break;
+                        }
+                    } else {
+                        let want = if ch == ')' { '(' } else { '[' };
+                        while let Some((ol, oc, och, od)) = paren_stack.pop() {
+                            unclosed = unclosed.saturating_sub(1);
+                            if och == want {
+                                if !truncated {
+                                    out.chars.push(BracketChar { line: line_ix, col, depth: od });
+                                    nest_depth = nest_depth.saturating_sub(1);
+                                    if line_ix > ol {
+                                        let guide_units = leading_indent(line(ol).as_ref()).units();
+                                        out.pairs.push(BracketPair {
+                                            open_line: ol,
+                                            open_col: oc,
+                                            close_line: line_ix,
+                                            close_col: col,
+                                            guide_units,
+                                            guide_body_min_units: compute_guide_body_min_units(&line, ol, line_ix),
+                                            depth: od,
+                                        });
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
                     col += ch.len_utf8();
@@ -207,8 +574,23 @@ where
                 }
             }
         }
-        if stack.is_empty() && !in_block_comment {
-            // 栈清空 + 不在块注释内 = 安全断点（此后从空栈继续与整篇扫描一致）。
+        if truncated {
+            // 预算耗尽 → 截断报告（上层据此整体返回空表）。
+            out.stop = line_ix;
+            out.truncated = true;
+            return out;
+        }
+        if snap_stop {
+            // 汇聚检查点命中：入口态 == 旧快照态 → 本行产出照常落入，尾部平移等价
+            // （K160）。快照行不一定是空栈边界，不必 push boundaries。
+            out.stop = line_ix;
+            return out;
+        }
+        let stack_empty = paren_stack.is_empty()
+            && brace_stack.iter().all(|level| level.is_empty());
+        if stack_empty && !in_block_comment {
+            // 各层花括号栈 + 括号栈全空 + 不在块注释内 = 安全断点（C4 断点语义：
+            // 从该行以全新状态续扫与整篇扫描在 `≥ 该行` 逐位一致）。
             out.boundaries.push(line_ix);
             if let Some(m) = stop_after {
                 if line_ix >= m {
@@ -220,6 +602,7 @@ where
         line_ix += 1;
     }
     out.stop = row_count;
+    out.truncated = truncated;
     out
 }
 
@@ -228,7 +611,13 @@ pub fn scan_bracket_pairs<F>(line: F, row_count: usize) -> Vec<BracketPair>
 where
     F: Fn(usize) -> SharedString,
 {
-    scan_bracket_segment(line, row_count, 0, None).pairs
+    let r = scan_bracket_segment(line, row_count, 0, None, None, &[]);
+    // 预算耗尽（安全护栏）→ 空表（消费者空表 → 无竖线/无着色，宁缺毋残）。
+    if r.truncated {
+        Vec::new()
+    } else {
+        r.pairs
+    }
 }
 
 /// 折叠候选的**段扫描**结果。
@@ -241,6 +630,9 @@ pub struct FoldScanReport {
     pub boundaries: Vec<usize>,
     /// 实际扫描停止行（`stop_after` 命中首个边界后的行；未命中 = `row_count`）。
     pub stop: usize,
+    /// 段内「对齐行」记录的**入口栈状态快照**（升序；行 → 处理前行状态，见
+    /// [`SNAPSHOT_SPACING`] / ⑦ 打字卡顿修复），语义同 [`BracketScanReport::snapshots`]。
+    pub snapshots: Vec<(usize, FoldSnapshot)>,
 }
 
 /// 扫描全文/受影响段的「可折叠候选」（缩进 + 闭记号启发式，与视图层解耦，可在
@@ -257,11 +649,17 @@ pub struct FoldScanReport {
 /// 下一行也仅由 r 决定 → 从 r 以全新状态开始与从 0 整篇扫描在 `≥ r` 逐位一致。
 /// `stop_after = Some(m)` 时在**首个「行号 ≥ m 且处理后栈空」的行**停止
 /// （增量重算用它圈定受影响包络尾；未命中则扫到文末）。
+///
+/// 2026-11-14（打字卡顿 ⑦）：另支持两种「栈永不清空」文档的断点——`init = Some(快照)`
+/// 以快照（某行处理前状态）为起始态续扫、`merge_snaps` 为「入口态 == 期待旧态」即停的
+/// 汇聚检查点（语义同 [`scan_bracket_segment`]）。
 pub(crate) fn scan_fold_segment<F>(
     line: F,
     row_count: usize,
     from: usize,
     stop_after: Option<usize>,
+    init: Option<FoldSnapshot>,
+    merge_snaps: &[(usize, &FoldSnapshot)],
 ) -> FoldScanReport
 where
     F: Fn(usize) -> SharedString,
@@ -272,10 +670,31 @@ where
     }
     let from = from.min(row_count);
     // 栈：挂起的块 `(start, indent)`。pending 记录上一非空行；下次看到更深行才入栈。
-    let mut stack: Vec<(usize, usize)> = Vec::new();
-    let mut pending: Option<(usize, usize)> = None;
+    let (mut stack, mut pending) = match init {
+        Some(s) => (s.stack, s.pending),
+        None => (Vec::new(), None),
+    };
+    // 快照落点预算（⑦）：全部快照栈项合计 ≤ `SNAPSHOT_STATE_ITEMS_BUDGET`（有界上界）。
+    let mut snap_items_budget = SNAPSHOT_STATE_ITEMS_BUDGET;
+    let mut merge_cur = 0usize;
     let mut r = from;
     while r < row_count {
+        // ——— 处理本行之前：快照落点 + 汇聚检查点（都看「入口态」；含空行——下次非空
+        // 行由该态决定）———
+        let snap_items = stack.len() + usize::from(pending.is_some());
+        if r % SNAPSHOT_SPACING == 0 && snap_items <= snap_items_budget {
+            out.snapshots.push((r, FoldSnapshot { stack: stack.clone(), pending }));
+            snap_items_budget -= snap_items;
+        }
+        let mut snap_stop = false;
+        if merge_cur < merge_snaps.len() && merge_snaps[merge_cur].0 == r {
+            let exp = &merge_snaps[merge_cur].1;
+            if exp.stack == stack && exp.pending == pending {
+                // 受影响段对折叠栈的影响已在本行完全消解 → 处理完本行后在此停。
+                snap_stop = true;
+            }
+            merge_cur += 1;
+        }
         let text = line(r);
         let trimmed = text.trim_start();
         if !trimmed.is_empty() {
@@ -313,6 +732,12 @@ where
                 }
             }
         }
+        if snap_stop {
+            // 汇聚检查点命中（含空行断点）：入口态 == 旧快照态 → 本行产出照常落入、
+            // 尾部平移与整篇等价（K160）。快照行不一定是空栈边界，不必 push boundaries。
+            out.stop = r;
+            return out;
+        }
         r += 1;
     }
     // EOF：关闭仍开着的块（延伸到最后一行）。
@@ -333,30 +758,61 @@ pub fn scan_fold_candidates<F>(line: F, row_count: usize) -> Vec<Fold>
 where
     F: Fn(usize) -> SharedString,
 {
-    scan_fold_segment(line, row_count, 0, None).folds
+    scan_fold_segment(line, row_count, 0, None, None, &[]).folds
 }
 
-/// 整篇扫描折叠候选 + 括号配对 + 各自「栈清空边界」（打开/整篇替换路径用，
-/// 一次性把四份结果全部落地）。
+/// 整篇扫描折叠候选 + 括号配对 + 括号字符 + 各自「栈清空边界」+ 各自**入口栈快照网格**
+/// （打开/整篇替换路径用，一次性把七份结果全部落地；快照见 [`SNAPSHOT_SPACING`] /
+/// ⑦ 打字卡顿修复，供后续编辑的增量起点/汇聚复用）。
 /// 可见性：`editor`（视图层）的 `editing.rs` 跨 crate 消费 → 转 pub。
 pub fn full_fold_brackets<F>(
     line: F,
     row_count: usize,
-) -> (Vec<Fold>, Vec<BracketPair>, Vec<usize>, Vec<usize>)
+) -> (
+    Vec<Fold>,
+    Vec<BracketPair>,
+    Vec<BracketChar>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<(usize, FoldSnapshot)>,
+    Vec<(usize, BracketSnapshot)>,
+)
 where
     F: Fn(usize) -> SharedString + Copy,
 {
-    let fr = scan_fold_segment(line, row_count, 0, None);
-    let br = scan_bracket_segment(line, row_count, 0, None);
-    (fr.folds, br.pairs, fr.boundaries, br.boundaries)
+    let fr = scan_fold_segment(line, row_count, 0, None, None, &[]);
+    let br = scan_bracket_segment(line, row_count, 0, None, None, &[]);
+    // 括号扫描预算耗尽（安全护栏）→ 括对/字符/括对边界整体返回空表（消费者 partition_point
+    // 空表 → None → 该文件不渲染括对/高亮，宁缺毋残）；折叠候选（缩进启发式、有界）不受影响。
+    if br.truncated {
+        return (
+            fr.folds,
+            Vec::new(),
+            Vec::new(),
+            fr.boundaries,
+            Vec::new(),
+            fr.snapshots,
+            Vec::new(),
+        );
+    }
+    (
+        fr.folds,
+        br.pairs,
+        br.chars,
+        fr.boundaries,
+        br.boundaries,
+        fr.snapshots,
+        br.snapshots,
+    )
 }
 
 /// 单个受影响行段的**增量重算**（整篇扫描的等价替代，纯函数、可在后台线程跑，
 /// 对拍契约：对同一文档同一次编辑，输出与整篇扫描**逐位一致**）。
 ///
 /// 前提（调用方保证，见本仓库 view 层 `scan_pending_edit` / `scan_multi_edit`）：
-/// - `prev_folds` / `prev_pairs` / `prev_fb` / `prev_pb` 是**上次落地**的扫描结果，
-///   对应「编辑前」文档；
+/// - `prev_folds` / `prev_pairs` / `prev_chars` / `prev_fb` / `prev_pb` 是**上次落地**
+///   的扫描结果，对应「编辑前」文档；`prev_fsnaps` / `prev_bsnaps` 是同次落地的
+///   「入口栈快照网格」（⑦ 打字卡顿修复，栈永不清空文档的断点）；
 /// - 自上落地后只累积了**一个**受影响行段 `edit = Some((line_a, min_stop, delta))`：
 ///   `line_a` = 编辑首行（编辑前坐标），`min_stop` = 新坐标下「首个未受影响行」的
 ///   边界下限，`delta` = 净行增量（新行数 − 旧行数）；
@@ -364,59 +820,145 @@ where
 ///   本函数退化为整篇扫描（正确性兜底）。
 ///
 /// 机制（fold 候选与括号配对各自独立）：
-/// 1. `B` = 上次边界中最大的 `≤ line_a` 的栈清空边界（无则 0）；
-/// 2. 在「受影响包络 `[B, stop)`」上局部重扫（`stop` = 首个 `≥ min_stop` 的边界）；
-/// 3. 合并：`start < B` 的旧项保留、`start ∈ [B, stop_old)` 的旧项被重扫结果替换、
+/// 1. `B` = `≤ line_a` 中「栈清空边界」与「入口栈快照」较靠后的一者（[`pick_start`]）；
+///    快照起点还原真态重扫、无需等栈空 → 根治「栈永不清空」文档的包络退化（⑦）；
+/// 2. 在「受影响包络 `[B, stop)`」上局部重扫：`stop` = 首个 `≥ min_stop` 的**空栈边界**
+///   或首个「新态 == 旧态」的**快照汇聚点**（⑦：栈影响已消解 → 尾部平移与整篇等价），
+///    未命中则扫到文末；
+/// 3. 合并（快照起点下存在「开在 B 前、闭/end 在包络内或尾段」的跨包络项，由
+///    「闭号/end > stop_old → 平移保留、否则重扫重发」规则精确兜住 → 与整篇逐位一致，
+///    K160）：`start < B` 的旧项保留、`start ∈ [B, stop_old)` 的旧项被重扫结果替换、
 ///    `start ≥ stop_old`（`stop_old = stop − delta`）的旧项按 `delta` **平移**
-///    （未变段尾部行号平移）；边界列表同款合并（尾部平移）。
+///    （未变段尾部行号平移）；边界/快照网格同款合并（尾部平移）。括号字符 `chars` 按
+///    `line < bb` 原样保留、`[bb, stop_old_b)` 替换、`line ≥ stop_old_b` 尾部 `+delta`。
 ///
-/// 返回 `(fold_candidates, bracket_pairs, fold_boundaries, bracket_boundaries)`，
-/// 与整篇扫描等价（调用方可再按 `start` / `open_line` 排序）。
+/// 返回 `(fold_candidates, bracket_pairs, bracket_chars, fold_boundaries,
+/// bracket_boundaries, fold_snapshots, bracket_snapshots)`，与整篇扫描等价
+/// （调用方可再按 `start` / `open_line` / `line` 排序）。
+///
+/// 从「栈清空边界」与「入口栈快照」各取最近 `≤ line_a` 者，返回更靠后的那一个及其
+/// 是否为快照（并列取快照——入口态含残差开口、可重扫被编辑行，严格不弱于空栈边界；
+/// 两者皆无 → `(0, false)`，从 0 整段重扫）。
+fn pick_start<L>(
+    boundaries: &[usize],
+    snaps: &[(usize, L)],
+    line_a: usize,
+) -> (usize, bool) {
+    let b = boundaries.partition_point(|&b| b <= line_a).checked_sub(1);
+    let s = snaps.partition_point(|(l, _)| *l <= line_a).checked_sub(1);
+    match (b, s) {
+        (Some(bi), Some(si)) if snaps[si].0 >= boundaries[bi] => (snaps[si].0, true),
+        (Some(bi), _) => (boundaries[bi], false),
+        (None, Some(si)) => (snaps[si].0, true),
+        (None, None) => (0, false),
+    }
+}
+
 pub(crate) fn incremental_fold_brackets<F>(
     line: F,
     row_count: usize,
     full_limit: usize,
     prev_folds: &[Fold],
     prev_pairs: &[BracketPair],
+    prev_chars: &[BracketChar],
     prev_fb: &[usize],
     prev_pb: &[usize],
+    prev_fsnaps: &[(usize, FoldSnapshot)],
+    prev_bsnaps: &[(usize, BracketSnapshot)],
     edit: Option<(usize, usize, i64)>,
     multi: bool,
-) -> (Vec<Fold>, Vec<BracketPair>, Vec<usize>, Vec<usize>)
+) -> (
+    Vec<Fold>,
+    Vec<BracketPair>,
+    Vec<BracketChar>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<(usize, FoldSnapshot)>,
+    Vec<(usize, BracketSnapshot)>,
+)
 where
     F: Fn(usize) -> SharedString + Copy,
 {
-    // 超大文档（行数 > full_limit）保持「按需折叠」语义：候选/配对/边界一并清空，
+    // 超大文档（行数 > full_limit）保持「按需折叠」语义：候选/配对/字符/边界/快照一并清空，
     // 由手动折叠/点击按需提供（避免病理文档的 O(全文) 后台扫描与增量兜底退化）。
     if row_count > full_limit {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        #[cfg(test)]
+        LAST_INCREMENTAL_SPANS.with(|c| c.set([0, 0, 0, 0]));
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
-    // 增量前提不满足（多编辑段累积 / 无编辑描述）→ 整篇扫描兜底。
+    // 增量前提不满足（多编辑段累积 / 无编辑描述）→ 整篇扫描兜底（输出=整篇口径，含快照）。
     let Some((line_a, min_stop, delta)) = edit.filter(|_| !multi) else {
+        #[cfg(test)]
+        LAST_INCREMENTAL_SPANS.with(|c| c.set([0, row_count, 0, row_count]));
         return full_fold_brackets(line, row_count);
     };
 
     // —— fold 候选 ——
-    // 最大边界 ≤ line_a（无则从 0 整段重扫；从边界以全新状态开始即逐位正确）。
-    let bf = match prev_fb.partition_point(|&b| b <= line_a) {
-        0 => 0,
-        n => prev_fb[n - 1],
+    // 起点 = 最近「栈清空边界」与最近「入口栈快照」较靠后的一者（见 `pick_start`）；
+    // 快照起点还原真态重扫、无需等栈空 → 根治「栈永不清空」文档的包络退化（⑦）。
+    let (bf, bf_is_snapshot) = pick_start(prev_fb, prev_fsnaps, line_a);
+    let fr_init = if bf_is_snapshot {
+        prev_fsnaps
+            .iter()
+            .rev()
+            .find(|(l, _)| *l == bf)
+            .map(|(_, s)| s.clone())
+    } else {
+        None
     };
-    let fr = scan_fold_segment(line, row_count, bf, Some(min_stop));
+    // 汇聚检查点：受影响段（≥ min_stop 新坐标）之后的旧快照行映射到新坐标 → 重扫到
+    // 该行若「新态 == 旧态」即停（⑦：栈影响已消解，尾部平移与整篇等价）。
+    let merge_fs: Vec<(usize, &FoldSnapshot)> = prev_fsnaps
+        .iter()
+        .filter(|(l, _)| (*l as i64 + delta) >= min_stop as i64)
+        .map(|(l, s)| ((*l as i64 + delta) as usize, s))
+        .collect();
+    let fr = scan_fold_segment(line, row_count, bf, Some(min_stop), fr_init, &merge_fs);
     let stop_old_f = (fr.stop as i64 - delta).max(0) as usize;
     let mut folds: Vec<Fold> = Vec::with_capacity(prev_folds.len());
-    for &f in prev_folds {
-        if f.start < bf {
-            folds.push(f); // 完全在编辑之前：原样保留
-        } else if f.start >= stop_old_f {
-            // 完全在受影响段之后：尾部行号平移
-            let ns = (f.start as i64 + delta).max(0) as usize;
-            let ne = ((f.end as i64 + delta) as usize).min(row_count);
-            if ns < row_count && ne > ns + 1 {
-                folds.push(Fold { start: ns, end: ne });
+    if bf_is_snapshot {
+        // 快照起点（入口态非空）：存在「start 在 B 前/内、end 在 B 后」的**跨包络项**。
+        // end 在尾段（> stop_old）→ 平移保留（start 未变：有效停点下块必在编辑前开启）；
+        // end ≤ stop_old 的由重扫以受影响段口径重发（含 start < B 的旧块——重扫首态已还原）。
+        for &f in prev_folds {
+            if f.end > stop_old_f {
+                let ns = if f.start >= stop_old_f {
+                    (f.start as i64 + delta).max(0) as usize
+                } else {
+                    f.start
+                };
+                let ne = ((f.end as i64 + delta) as usize).min(row_count);
+                if ns < row_count && ne > ns + 1 {
+                    folds.push(Fold { start: ns, end: ne });
+                }
+            } else if f.end < bf {
+                folds.push(f); // 完全在编辑前解析：原样保留
             }
+            // 其余（end ∈ [bf, stop_old]）由重扫重发。
         }
-        // [bf, stop_old_f) 内的旧项被重扫结果替换（下面并入）。
+    } else {
+        // 空栈边界起点：无跨包络项（start < bf 的块必在 bf 前解析）→ 既有语义。
+        for &f in prev_folds {
+            if f.start < bf {
+                folds.push(f); // 完全在编辑之前：原样保留
+            } else if f.start >= stop_old_f {
+                // 完全在受影响段之后：尾部行号平移
+                let ns = (f.start as i64 + delta).max(0) as usize;
+                let ne = ((f.end as i64 + delta) as usize).min(row_count);
+                if ns < row_count && ne > ns + 1 {
+                    folds.push(Fold { start: ns, end: ne });
+                }
+            }
+            // [bf, stop_old_f) 内的旧项被重扫结果替换（下面并入）。
+        }
     }
     folds.extend_from_slice(&fr.folds);
     let mut new_fb: Vec<usize> = Vec::with_capacity(prev_fb.len());
@@ -432,31 +974,109 @@ where
             .map(|b| (b as i64 + delta).max(0) as usize)
             .filter(|&b| b < row_count),
     );
+    // fold 快照网格：起点前保留、受影响段由重扫补记、尾段平移（同边界合并口径）。
+    let mut new_fsnaps: Vec<(usize, FoldSnapshot)> = Vec::with_capacity(prev_fsnaps.len());
+    new_fsnaps.extend(prev_fsnaps.iter().filter(|(l, _)| *l < bf).cloned());
+    new_fsnaps.extend(fr.snapshots);
+    new_fsnaps.extend(
+        prev_fsnaps
+            .iter()
+            .filter(|(l, _)| *l > stop_old_f)
+            .map(|(l, s)| ((*l as i64 + delta).max(0) as usize, s.clone())),
+    );
 
     // —— 括号配对 ——
-    let bb = match prev_pb.partition_point(|&b| b <= line_a) {
-        0 => 0,
-        n => prev_pb[n - 1],
+    let (mut bb, bb_is_snapshot) = pick_start(prev_pb, prev_bsnaps, line_a);
+    // 编辑恰落在**空栈边界**行（bb == line_a，K160 修复回归）：边界行自身承担「闭合
+    // bb 之前残差开口」的闭号，从 bb 空栈重扫**造不出** → 回退前一边界（既有行为）。
+    // 起点若已是**快照**（入口态含残差开口）→ 无需回退：直接从 bb 重扫被编辑行。
+    if !bb_is_snapshot && bb == line_a && bb > 0 {
+        let n = prev_pb.partition_point(|&b| b < line_a);
+        bb = if n > 0 { prev_pb[n - 1] } else { 0 };
+    }
+    let br_init = if bb_is_snapshot {
+        prev_bsnaps
+            .iter()
+            .rev()
+            .find(|(l, _)| *l == bb)
+            .map(|(_, s)| s.clone())
+    } else {
+        None
     };
-    let br = scan_bracket_segment(line, row_count, bb, Some(min_stop));
+    let merge_bs: Vec<(usize, &BracketSnapshot)> = prev_bsnaps
+        .iter()
+        .filter(|(l, _)| (*l as i64 + delta) >= min_stop as i64)
+        .map(|(l, s)| ((*l as i64 + delta) as usize, s))
+        .collect();
+    let br = scan_bracket_segment(line, row_count, bb, Some(min_stop), br_init, &merge_bs);
+    if br.truncated {
+        // 括号扫描预算耗尽（安全护栏）→ 整体返回空括对/字符/边界（消费者 partition_point
+        // 空表 → None → 无高亮，宁缺毋残）；折叠候选不受括对截断影响。
+        #[cfg(test)]
+        LAST_INCREMENTAL_SPANS.with(|c| c.set([bf, fr.stop, bb, br.stop]));
+        return (
+            folds,
+            Vec::new(),
+            Vec::new(),
+            new_fb,
+            Vec::new(),
+            new_fsnaps,
+            Vec::new(),
+        );
+    }
     let stop_old_b = (br.stop as i64 - delta).max(0) as usize;
     let mut pairs: Vec<BracketPair> = Vec::with_capacity(prev_pairs.len());
-    for &p in prev_pairs {
-        if p.open_line < bb {
-            pairs.push(p); // 完全在编辑之前：原样保留
-        } else if p.open_line >= stop_old_b {
-            // 完全在受影响段之后：尾部行号平移（开/闭行一起移）
-            let no = (p.open_line as i64 + delta).max(0) as usize;
-            let nc = ((p.close_line as i64 + delta) as usize).min(row_count);
-            if no < row_count && nc > no {
-                pairs.push(BracketPair {
-                    open_line: no,
-                    close_line: nc,
-                    ..p
-                });
+    if bb_is_snapshot {
+        // 快照起点（入口态非空）：同 folds——按闭号落点精确合并（K160）。
+        for &p in prev_pairs {
+            if p.close_line > stop_old_b {
+                // 闭号在尾段：整对在尾（open ≥ stop_old → 开/闭都平移）或自包络跨入尾段
+                // （open < stop_old → 开行不变：有效停点下该 open 必在编辑前开启）。
+                let no = if p.open_line >= stop_old_b {
+                    (p.open_line as i64 + delta).max(0) as usize
+                } else {
+                    p.open_line
+                };
+                let nc = ((p.close_line as i64 + delta) as usize).min(row_count);
+                if no < row_count && nc > no {
+                    let mut np = BracketPair {
+                        open_line: no,
+                        close_line: nc,
+                        ..p
+                    };
+                    // 跨包络平移（open < stop_old、开行未变、闭行平移）：体内行含受影响段、
+                    // 内容已受编辑影响 → `guide_body_min_units` 旧值可能陈旧，须用**新文档**
+                    // 行内容重算（与整篇扫描对新增字段逐位一致，K160；其余字段只依赖开/闭
+                    // 行内容与列、平移下不变，无需重算）。空栈起点无跨包络项（§上文），不涉及。
+                    if p.open_line < stop_old_b {
+                        np.guide_body_min_units = compute_guide_body_min_units(&line, no, nc);
+                    }
+                    pairs.push(np);
+                }
+            } else if p.close_line < bb {
+                pairs.push(p); // 完全在编辑前解析（重扫首态不含其闭号）→ 原样保留
             }
+            // 其余（闭 ∈ [bb, stop_old]）由重扫重发。
         }
-        // [bb, stop_old_b) 内的旧项被重扫结果替换（下面并入）。
+    } else {
+        // 空栈边界起点：无跨包络括对 → 既有语义。
+        for &p in prev_pairs {
+            if p.open_line < bb {
+                pairs.push(p); // 完全在编辑之前：原样保留
+            } else if p.open_line >= stop_old_b {
+                // 完全在受影响段之后：尾部行号平移（开/闭行一起移）
+                let no = (p.open_line as i64 + delta).max(0) as usize;
+                let nc = ((p.close_line as i64 + delta) as usize).min(row_count);
+                if no < row_count && nc > no {
+                    pairs.push(BracketPair {
+                        open_line: no,
+                        close_line: nc,
+                        ..p
+                    });
+                }
+            }
+            // [bb, stop_old_b) 内的旧项被重扫结果替换（下面并入）。
+        }
     }
     pairs.extend_from_slice(&br.pairs);
     let mut new_pb: Vec<usize> = Vec::with_capacity(prev_pb.len());
@@ -472,14 +1092,64 @@ where
             .map(|b| (b as i64 + delta).max(0) as usize)
             .filter(|&b| b < row_count),
     );
+    // 括号快照网格：同 new_fsnaps 口径。
+    let mut new_bsnaps: Vec<(usize, BracketSnapshot)> = Vec::with_capacity(prev_bsnaps.len());
+    new_bsnaps.extend(prev_bsnaps.iter().filter(|(l, _)| *l < bb).cloned());
+    new_bsnaps.extend(br.snapshots);
+    new_bsnaps.extend(
+        prev_bsnaps
+            .iter()
+            .filter(|(l, _)| *l > stop_old_b)
+            .map(|(l, s)| ((*l as i64 + delta).max(0) as usize, s.clone())),
+    );
 
-    (folds, pairs, new_fb, new_pb)
+    // —— 括号字符（按 line 仿 pairs 三段连续有序合并）——
+    // 起点行的特殊性：`bb` = 首个「栈空」边界行，其**前**可能仍有未闭开口跨入 bb 行
+    // （如 `fn x() {` + 下一行 `}`：`}` 在 bb 行闭合了 bb 之前的 `{`）。从 bb 以全新
+    // 状态重扫**造不出**这些闭合字符（栈空 ⇒ 视为不匹配跳过），且 bb 行自身的开口深度
+    // 也依赖既有残差栈 → bb 行字符不可由重扫复现。对策：编辑行**严格在 bb 之后**
+    // （`bb < line_a`）时，bb 行内容取自上次落地（prev，即整篇口径），重扫的 bb 行
+    // 字符丢弃；编辑恰好在 bb 行（`bb == line_a`）时 bb 行已被编辑 → 用重扫结果。
+    // 字符是**单行物理标点**（深浅只由行前状态决定、不构成跨包络项）→ 起点为快照时
+    // 三条分支同边界口径（快照入口态已还原、重扫能复现起点行，但起点行未受编辑时
+    // prev 即真值 → 保留 prev、滤重扫消重复；起点行受编辑 [bb==line_a] 时用重扫）。
+    let mut chars: Vec<BracketChar> = Vec::with_capacity(prev_chars.len() + br.chars.len());
+    let keep_bb_line = bb < line_a;
+    for &c in prev_chars {
+        if c.line < bb || (keep_bb_line && c.line == bb) {
+            chars.push(c); // 完全在编辑之前 / 未受编辑的起点行：原样保留
+        } else if c.line > stop_old_b {
+            // 完全在受影响段之后：尾部行号平移（与 pairs 同口径），越界剔除。
+            // 注意**严格 > stop_old_b**：`== stop_old_b` 的旧行内容平移后落在
+            // `stop_old_b + delta = stop`，恰被重扫的 stop 行覆盖（重扫该行 =
+            // 权威，且深度的旧值可能因编辑陈旧）——丢弃交由重扫补齐，否则与新行
+            // stop 重复。
+            let nl = (c.line as i64 + delta).max(0) as usize;
+            if nl < row_count {
+                chars.push(BracketChar { line: nl, ..c });
+            }
+        }
+        // [bb, stop_old_b) 内的旧项被重扫结果替换（下面并入；bb 行在 keep_bb_line 时
+        // 上面已保留、重扫 bb 行字符在下面过滤掉；== stop_old_b 的旧行同样由重扫
+        // 的 stop 行补齐）。
+    }
+    chars.extend(
+        br.chars
+            .iter()
+            .copied()
+            .filter(|c| !keep_bb_line || c.line > bb),
+    );
+
+    #[cfg(test)]
+    LAST_INCREMENTAL_SPANS.with(|c| c.set([bf, fr.stop, bb, br.stop]));
+    (folds, pairs, chars, new_fb, new_pb, new_fsnaps, new_bsnaps)
 }
 
-/// 单轮「折叠候选 + 括号配对」重算的**统一计算入口**（供后台刷新与测试同步落地共用，
-/// 避免两处口径漂移）：返回 `(folds, pairs, fold_boundaries, bracket_boundaries,
-/// was_incremental)`。`was_incremental` = 本次是否走了增量路径（受影响段局部重扫 +
-/// 尾部平移），`false` 表示整篇扫描兜底（多编辑段累积 / 无编辑描述 / 超行数清空）。
+/// 单轮「折叠候选 + 括号配对 + 括号字符」重算的**统一计算入口**（供后台刷新与测试同步
+/// 落地共用，避免两处口径漂移）：返回 `(folds, pairs, chars, fold_boundaries,
+/// bracket_boundaries, fold_snapshots, bracket_snapshots, was_incremental)`。
+/// `was_incremental` = 本次是否走了增量路径（受影响段局部重扫 + 尾部平移），`false`
+/// 表示整篇扫描兜底（多编辑段累积 / 无编辑描述 / 超行数清空）。
 /// 可见性：`editor`（视图层）的 `document.rs`/`editing.rs` 跨 crate 消费 → 转 pub。
 pub fn compute_fold_brackets<F>(
     line: F,
@@ -487,18 +1157,42 @@ pub fn compute_fold_brackets<F>(
     full_limit: usize,
     prev_folds: &[Fold],
     prev_pairs: &[BracketPair],
+    prev_chars: &[BracketChar],
     prev_fb: &[usize],
     prev_pb: &[usize],
+    prev_fsnaps: &[(usize, FoldSnapshot)],
+    prev_bsnaps: &[(usize, BracketSnapshot)],
     pending: Option<(usize, usize, i64)>,
     multi: bool,
-) -> (Vec<Fold>, Vec<BracketPair>, Vec<usize>, Vec<usize>, bool)
+) -> (
+    Vec<Fold>,
+    Vec<BracketPair>,
+    Vec<BracketChar>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<(usize, FoldSnapshot)>,
+    Vec<(usize, BracketSnapshot)>,
+    bool,
+)
 where
     F: Fn(usize) -> SharedString + Copy,
 {
     let was_incremental = pending.is_some() && !multi && row_count <= full_limit;
-    let (folds, pairs, fb, pb) =
-        incremental_fold_brackets(line, row_count, full_limit, prev_folds, prev_pairs, prev_fb, prev_pb, pending, multi);
-    (folds, pairs, fb, pb, was_incremental)
+    let (folds, pairs, chars, fb, pb, fsnaps, bsnaps) = incremental_fold_brackets(
+        line,
+        row_count,
+        full_limit,
+        prev_folds,
+        prev_pairs,
+        prev_chars,
+        prev_fb,
+        prev_pb,
+        prev_fsnaps,
+        prev_bsnaps,
+        pending,
+        multi,
+    );
+    (folds, pairs, chars, fb, pb, fsnaps, bsnaps, was_incremental)
 }
 
 /// 平坦（互不相交、按 `start` 升序）折叠集合 + 视觉↔逻辑映射。
@@ -754,6 +1448,26 @@ mod tests {
         assert!(m.folds().is_empty());
     }
 
+    /// 落地期预存字段 `guide_body_min_units: Option<u32>` 的内存量级硬护栏（K82 姿势）：
+    /// `BracketPair` 48B→56B（+8B/对）、`BracketPairLite` 40B→48B。上界估算：预算
+    /// `BRACKET_CHAR_MAX`＝2^20 对全程驻留增量 = 2^20 × 8B = 8 MiB（相对既有 ~48 MiB
+    /// → +16.7%，同数量级内、不膨胀还款）。改字段类型先改此护栏。
+    #[test]
+    fn bracket_pair_size_guarded() {
+        assert_eq!(
+            std::mem::size_of::<BracketPair>(),
+            56,
+            "BracketPair 应 48B→56B（+8B/对 = Option<u32>）；实测 {}",
+            std::mem::size_of::<BracketPair>()
+        );
+        assert_eq!(
+            std::mem::size_of::<BracketPairLite>(),
+            48,
+            "BracketPairLite 应 40B→48B（+8B = Option<u32>）；实测 {}",
+            std::mem::size_of::<BracketPairLite>()
+        );
+    }
+
     #[test]
     fn toggle_removes_overlaps() {
         let mut m = fm(20, &[(2, 8), (10, 15)]);
@@ -870,7 +1584,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// 按行号返回行文本的闭包（越界给空行）。
-    fn line_fn<'a>(lines: &'a [&'a str]) -> impl Fn(usize) -> SharedString + 'a {
+    fn line_fn<'a>(lines: &'a [&'a str]) -> impl Fn(usize) -> SharedString + Copy + 'a {
         move |i: usize| {
             lines
                 .get(i)
@@ -892,13 +1606,13 @@ mod tests {
         ];
         let pairs = scan_bracket_pairs(line_fn(&lines), lines.len());
         // 只记跨行：内层 Self{, 中 fn{, 外层 impl{ 各一条；
-        // 竖线列 = 块首行缩进宽（0/4/8 单位）。
+        // 竖线列 = 块首行缩进宽（0/4/8 单位）；depth = 嵌套 DFS 深度（0 起）。
         assert_eq!(
             pairs,
             vec![
-                BracketPair { open_line: 2, open_col: 13, close_line: 4, guide_units: 8 },
-                BracketPair { open_line: 1, open_col: 23, close_line: 5, guide_units: 4 },
-                BracketPair { open_line: 0, open_col: 13, close_line: 6, guide_units: 0 },
+                BracketPair { open_line: 2, open_col: 13, close_line: 4, close_col: 8, guide_units: 8, guide_body_min_units: Some(12), depth: 2 },
+                BracketPair { open_line: 1, open_col: 23, close_line: 5, close_col: 4, guide_units: 4, guide_body_min_units: Some(8), depth: 1 },
+                BracketPair { open_line: 0, open_col: 13, close_line: 6, close_col: 0, guide_units: 0, guide_body_min_units: Some(4), depth: 0 },
             ]
         );
         // 单行配对不产竖线。
@@ -917,10 +1631,10 @@ mod tests {
             "}",
         ];
         let pairs = scan_bracket_pairs(line_fn(&lines), lines.len());
-        // 开行 `fn ok() {` 缩进 0 → 竖线列 0（块注释内的 `}` 已被跳过）。
+        // 开行 `fn ok() {` 缩进 0 → 竖线列 0（块注释内的 `}` 已被跳过）；depth = 0（首个开括号）。
         assert_eq!(
             pairs,
-            vec![BracketPair { open_line: 3, open_col: 8, close_line: 5, guide_units: 0 }]
+            vec![BracketPair { open_line: 3, open_col: 8, close_line: 5, close_col: 0, guide_units: 0, guide_body_min_units: Some(0), depth: 0 }]
         );
         // 转义字符串 `"a\"{b"` 内部花括号忽略；块体 `    x();` → 竖线列 4。
         let esc = ["let s = \"a\\\"{b\";\nfn f() {\n    x();\n}"];
@@ -928,7 +1642,7 @@ mod tests {
         let pairs = scan_bracket_pairs(line_fn(&el), el.len());
         assert_eq!(
             pairs,
-            vec![BracketPair { open_line: 1, open_col: 7, close_line: 3, guide_units: 0 }],
+            vec![BracketPair { open_line: 1, open_col: 7, close_line: 3, close_col: 0, guide_units: 0, guide_body_min_units: Some(4), depth: 0 }],
             "字符串内转义花括号应被跳过"
         );
     }
@@ -937,11 +1651,229 @@ mod tests {
     fn bracket_scan_lifetime_does_not_break() {
         let lines = ["fn max<'a>(x: &'a str, y: &'a str) &'a str {", "    x", "}"];
         let pairs = scan_bracket_pairs(line_fn(&lines), lines.len());
-        // 生命周期撇号不当作字符字面量：`{` 在 ( ) 之后仍配对；开行缩进 0。
+        // 生命周期撇号不当作字符字面量：`{` 在 ( ) 之后仍配对；开行缩进 0；depth = 0。
         assert_eq!(
             pairs,
-            vec![BracketPair { open_line: 0, open_col: 43, close_line: 2, guide_units: 0 }]
+            vec![BracketPair { open_line: 0, open_col: 43, close_line: 2, close_col: 0, guide_units: 0, guide_body_min_units: Some(4), depth: 0 }]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 括号字符层级表（括号文本着色，对齐 VS Code bracketPairColorization）
+    // ------------------------------------------------------------------
+
+    /// 逐字符：单行配对（`{}`/`()`）与跨行配对的开/闭括号**都**记入 `chars`，按
+    /// `(line,col)` 升序；depth = 开括号压栈前 nest_depth、闭括号 = 对应开口的 depth。
+    ///
+    /// 字节列演算（一行一算，col 皆字节下标）：
+    /// - 行 0 `fn f() {`：`(`4、`)`5、`{`7；
+    /// - 行 1 `    let x = { a: {b}, };`：`{`12、`{`17、`}`19、`}`22（`"    let x = { a: {b}, };"`：4 空格后 let=4..7, x=8, =10, {12, {17, }19, }22）；
+    /// - 行 2 `    g();`：`(`5、`)`6；行 3 `}`0。
+    #[test]
+    fn scan_bracket_chars_single_and_cross_line_ordered() {
+        let lines = [
+            "fn f() {",                   // 行 0：`(` `)` 单行配对 d0；`{`(7) d0 开块
+            "    let x = { a: {b}, };",   // 行 1：`{`(12) d1、`{`(17) d2、`}`(19) d2、`}`(22) d1
+            "    g();",                   // 行 2：`(`(5) d1、`)`(6) d1
+            "}",                          // 行 3：`}`(0) d0 闭块
+        ];
+        let report = scan_bracket_segment(line_fn(&lines), lines.len(), 0, None, None, &[]);
+        assert_eq!(
+            report.chars,
+            vec![
+                BracketChar { line: 0, col: 4, depth: 0 },
+                BracketChar { line: 0, col: 5, depth: 0 },
+                BracketChar { line: 0, col: 7, depth: 0 },
+                BracketChar { line: 1, col: 12, depth: 1 },
+                BracketChar { line: 1, col: 17, depth: 2 },
+                BracketChar { line: 1, col: 19, depth: 2 },
+                BracketChar { line: 1, col: 22, depth: 1 },
+                BracketChar { line: 2, col: 5, depth: 1 },
+                BracketChar { line: 2, col: 6, depth: 1 },
+                BracketChar { line: 3, col: 0, depth: 0 },
+            ],
+            "单行+跨行开闭均逐字符记录且按 (line,col) 升序: {:?}",
+            report.chars
+        );
+        // 跨行配对（竖线）与字符表互补：字符数 > 配对数的 2×（单行配对两端只进字符表）。
+        assert!(report.chars.len() > report.pairs.len() * 2, "字符表应含单行配对项");
+    }
+
+    /// 字符串/注释内的括号字符**不**进入字符表（与配对扫描同一词法兜底）。
+    /// 字节列演算：`fn ok() {` → `(`5、`)`6、`{`8。
+    #[test]
+    fn scan_bracket_chars_skips_strings_and_comments() {
+        let lines = [
+            "let s = \"{ not(open }\";", // 字符串里的括号忽略
+            "// { comment bracket }",    // 行注释忽略
+            "/* block { ( */",           // 块注释开始
+            "fn ok() {",                 // 真正的开括号
+            "/* } still comment */",     // 注释内闭括号忽略
+            "}",
+        ];
+        let report = scan_bracket_segment(line_fn(&lines), lines.len(), 0, None, None, &[]);
+        // 只应有 `fn ok() {` 的 `(` `)` `{`（行 3）与行 5 的 `}`：字符串/注释内一律无。
+        assert_eq!(
+            report.chars,
+            vec![
+                BracketChar { line: 3, col: 5, depth: 0 }, // (
+                BracketChar { line: 3, col: 6, depth: 0 }, // )
+                BracketChar { line: 3, col: 8, depth: 0 }, // {
+                BracketChar { line: 5, col: 0, depth: 0 }, // } 配 fn ok 的 {
+            ]
+        );
+        // 转义字符串 `"a\"{b"` 内部花括号同样忽略。
+        let esc = "let s = \"a\\\"{b\";\nfn f() {\n    x();\n}";
+        let el: Vec<&str> = esc.split('\n').collect();
+        let er = scan_bracket_segment(line_fn(&el), el.len(), 0, None, None, &[]);
+        assert!(
+            er.chars.iter().all(|c| c.line != 0),
+            "字符串内转义花括号不应进字符表: {:?}",
+            er.chars
+        );
+    }
+
+    /// 不匹配的闭括号（栈空/层空）**跳过**——只记成功配对的闭括号。
+    /// 深度演算：行 2 `{`(d0) 开后被行 4 `}`(d0) 闭合 → nest 归 0 → 行 5 `fn g() {` 的
+    /// `(`4、`)`5、`{`7 全为 d0（"fn g() {"：f0 n1 ' '2 g3 '('4 ')'5 ' '6 '{'7），
+    /// 行 6 `}`(0) 配它。
+    #[test]
+    fn scan_bracket_chars_unmatched_close_skipped() {
+        let lines = [
+            "}",          // 行 0：孤立 `}`（各栈空）→ 不记
+            "x = ]",      // 行 1：孤立 `]`（括号栈空）→ 不记
+            "{",          // 行 2：永不匹配的开口 `{` → 记（depth0）
+            "",           // 行 3
+            "}",          // 行 4：`}` 配行 2 的 `{` → 记（depth0）
+            "fn g() {",   // 行 5
+            "}",          // 行 6：`}` 配 fn g 的 `{` → 记
+        ];
+        let report = scan_bracket_segment(line_fn(&lines), lines.len(), 0, None, None, &[]);
+        assert_eq!(
+            report.chars,
+            vec![
+                BracketChar { line: 2, col: 0, depth: 0 },
+                BracketChar { line: 4, col: 0, depth: 0 },
+                BracketChar { line: 5, col: 4, depth: 0 }, // fn g 内 `(`
+                BracketChar { line: 5, col: 5, depth: 0 }, // `)`
+                BracketChar { line: 5, col: 7, depth: 0 }, // `{`
+                BracketChar { line: 6, col: 0, depth: 0 }, // `}` 配 fn g 的 `{`
+            ],
+            "孤立闭括号跳过、永不匹配开口保留: {:?}",
+            report.chars
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // C4 缩进感知配对（`}` 只匹配本缩进层最近未配 `{`；每层独立 LIFO；层空丢弃）
+    // ------------------------------------------------------------------
+
+    /// C4 配对：fixture（`target/guidefix.rs` 前 16 行）恰好 3 对——fn a、if x==1、if x1==1；
+    /// mega 行 8 个 `{`（缩进 8 层）永不配对。预期为 LIFO 收栈序。
+    #[test]
+    fn scan_indent_aware_pairing_three_pairs() {
+        let lines = [
+            "fn a() {",
+            "    let x = 1;",
+            "    if x1 == 1 {",
+            "        t1();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {",
+            "    let x2 = 1;",
+            "    if x == 1 {",
+            "        y();",
+            "        z();",
+            "    }",
+            "    w();",
+            "}",
+            "",
+            "        z1();",
+            "    }",
+            "    t2();",
+            "}",
+        ];
+        let pairs = scan_bracket_pairs(line_fn(&lines), lines.len());
+        assert_eq!(pairs.len(), 3, "mega 8 开永不配对，应恰好 3 对: {pairs:?}");
+        // LIFO 收栈序：行 8 先收 if x==1，行 10 收 fn a，行 13 收 if x1==1。
+        // depth：mega 8 开（永不闭）把纯 DFS 计数器顶到 nest=10 → if x==1 的 { 记 depth 10；
+        // fn a / if x1 分别在 nest=0 / 1 时压入 → 0 / 1（坏代码下计数器偏差，竖线纯视觉）。
+        assert_eq!(
+            pairs,
+            vec![
+                BracketPair { open_line: 5, open_col: 14, close_line: 8, close_col: 4, guide_units: 4, guide_body_min_units: Some(8), depth: 10 },
+                BracketPair { open_line: 0, open_col: 7, close_line: 10, close_col: 0, guide_units: 0, guide_body_min_units: Some(4), depth: 0 },
+                BracketPair { open_line: 2, open_col: 15, close_line: 13, close_col: 4, guide_units: 4, guide_body_min_units: Some(4), depth: 1 },
+            ],
+            "期待 ifx==1 / fn a / ifx1 三对（顺序为 LIFO 收栈序）"
+        );
+        // 未配对/孤立：mega 8 开、行 15 的 `}`（缩进 0 层空）均不落配对。
+        assert!(!pairs.iter().any(|p| p.open_line == 3), "mega 行不得被配对: {pairs:?}");
+        assert!(!pairs.iter().any(|p| p.close_line == 15), "行 15 的右花括号层空应丢弃: {pairs:?}");
+    }
+
+    /// C4 鲁棒：mega 单行 8 个 `{` 各成栈项（同层 LIFO），但只可能被**同缩进层**的 `}`
+    /// 关闭；indent-4 的 `}` 层空即丢弃——绝不跨层偷配。另附同层 LIFO 对照。
+    #[test]
+    fn scan_mega_single_line_braces_no_steal() {
+        // mega（缩进 8）8 开 + indent-4 闭：层空丢弃，只有 fn a 配对。
+        let lines = [
+            "fn a() {",
+            "        t1();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {y();fn a() {",
+            "    }",
+            "}",
+        ];
+        let pairs = scan_bracket_pairs(line_fn(&lines), lines.len());
+        assert_eq!(
+            pairs,
+            vec![BracketPair { open_line: 0, open_col: 7, close_line: 3, close_col: 0, guide_units: 0, guide_body_min_units: Some(8), depth: 0 }],
+            "缩进 8 的 mega 8 开不得被缩进 4 的右花括号偷配: {pairs:?}"
+        );
+        // 同层 LIFO 对照：mega 与 `}` 同在缩进 4 层 → 最近一个 `{` 被关闭（同层正常配对一次）。
+        let same = [
+            "fn a() {",
+            "    t1();fn a() {y();fn a() {y();fn a() {",
+            "    }",
+            "}",
+        ];
+        let sp = scan_bracket_pairs(line_fn(&same), same.len());
+        assert_eq!(sp.len(), 2, "同层 3 开 + 1 闭 = 1 对 + fn a 对: {sp:?}");
+        assert!(
+            sp.iter().any(|p| p.open_line == 1 && p.close_line == 2),
+            "同层最近一个左花括号被右花括号关闭: {sp:?}"
+        );
+    }
+
+    /// C4 边界：断点 = 各缩进层花括号栈全空 && 括号栈空 && 不在块注释。三层嵌套全部配平后
+    /// 抛边界；从该边界以全新状态续扫 ≡ 整篇扫描（增量断点契约）。
+    #[test]
+    fn boundary_check_all_indent_levels_empty() {
+        let lines = [
+            "fn a() {", // stack[0]
+            "    {",    // stack[4]
+            "        {", // stack[8]
+            "        }", // 缩进 8 → pop
+            "    }",    // 缩进 4 → pop
+            "}",        // 缩进 0 → pop → 各层全空 → 边界
+            "fn b() {",
+            "    x();",
+            "}",
+        ];
+        let full = scan_bracket_segment(line_fn(&lines), lines.len(), 0, None, None, &[]);
+        assert!(
+            full.boundaries.contains(&5),
+            "三层嵌套配平后应抛边界: {:?}",
+            full.boundaries
+        );
+        assert!(full.boundaries.contains(&8), "fn b 关闭后再抛边界: {:?}", full.boundaries);
+        assert!(!full.boundaries.contains(&2), "stack[4] 未空 → 行 2 不是边界");
+        // 从每个边界续扫 ≡ 整篇扫描（增量重算的断点前提）。
+        for &b in &full.boundaries {
+            let seg = scan_bracket_segment(line_fn(&lines), lines.len(), b, None, None, &[]);
+            let expect_pairs: Vec<BracketPair> =
+                full.pairs.iter().filter(|p| p.open_line >= b).copied().collect();
+            assert_eq!(seg.pairs, expect_pairs, "边界 {b} 起段扫描的配对应与整篇一致");
+            let expect_bnd: Vec<usize> =
+                full.boundaries.iter().copied().filter(|&x| x >= b).collect();
+            assert_eq!(seg.boundaries, expect_bnd, "边界 {b} 起的边界列表应一致");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -984,6 +1916,49 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // §8 缩进引导线纯函数（`indent_guide_level` / `blank_guide_level`）
+    // ------------------------------------------------------------------
+
+    /// §8.1 主源级数：`level = (indent=0) ? 0 : ceil(cols/is)`。is=4 时 0/3/4/5/8/9 →
+    /// 0/1/1/2/2/3；Tab 混合 units（空格=1、Tab=4）与纯空格同式（
+    /// `leading_indent(" \tX").units()` = 1+4 = 5 → 2）。
+    #[test]
+    fn indent_guide_level_table() {
+        use super::indent_guide_level;
+        assert_eq!(indent_guide_level(0, 4), 0);
+        assert_eq!(indent_guide_level(3, 4), 1);
+        assert_eq!(indent_guide_level(4, 4), 1);
+        assert_eq!(indent_guide_level(5, 4), 2);
+        assert_eq!(indent_guide_level(8, 4), 2);
+        assert_eq!(indent_guide_level(9, 4), 3);
+        // Tab 混合前导空白：units = 1空格 + 1Tab×4 = 5 → ceil(5/4)=2。
+        assert_eq!(indent_guide_level(leading_indent(" \tX").units(), 4), 2);
+        // is 非常量（2）仍按 ceil。
+        assert_eq!(indent_guide_level(5, 2), 3);
+    }
+
+    /// §8.1 空行续线级数：A/B 任一缺 → 0；A<B → 1+⌊A/is⌋；A==B → ⌈B/is⌉；A>B → 1+⌊B/is⌋。
+    #[test]
+    fn blank_guide_level_four_branches() {
+        use super::blank_guide_level;
+        // A/B 任一缺 → 0（首行空行 / 文档尾空行）。
+        assert_eq!(blank_guide_level(None, Some(8), 4), 0);
+        assert_eq!(blank_guide_level(Some(4), None, 4), 0);
+        assert_eq!(blank_guide_level(None, None, 4), 0);
+        // A<B → 1+⌊A/is⌋（§8.2 空行 L12：A=0,B=8 → 1；A=4,B=8 → 2）。
+        assert_eq!(blank_guide_level(Some(0), Some(8), 4), 1);
+        assert_eq!(blank_guide_level(Some(3), Some(8), 4), 1);
+        assert_eq!(blank_guide_level(Some(4), Some(8), 4), 2);
+        // A==B → ⌈B/is⌉（均等缩进 → 按本级续；均 0 → 0 无线）。
+        assert_eq!(blank_guide_level(Some(4), Some(4), 4), 1);
+        assert_eq!(blank_guide_level(Some(8), Some(8), 4), 2);
+        assert_eq!(blank_guide_level(Some(0), Some(0), 4), 0);
+        // A>B → 1+⌊B/is⌋。
+        assert_eq!(blank_guide_level(Some(8), Some(4), 4), 2);
+        assert_eq!(blank_guide_level(Some(8), Some(0), 4), 1);
+    }
+
+    // ------------------------------------------------------------------
     // 段扫描断点 + 增量重算 × 整篇扫描对拍（Wave2-S1）
     // ------------------------------------------------------------------
 
@@ -1006,10 +1981,10 @@ mod tests {
             "    y();",
             "}",
         ];
-        let full = scan_fold_segment(line_fn(&lines), lines.len(), 0, None);
+        let full = scan_fold_segment(line_fn(&lines), lines.len(), 0, None, None, &[]);
         assert!(full.boundaries.len() >= 2, "文本应产生多个边界 {full:?}");
         for &b in &full.boundaries {
-            let seg = scan_fold_segment(line_fn(&lines), lines.len(), b, None);
+            let seg = scan_fold_segment(line_fn(&lines), lines.len(), b, None, None, &[]);
             let expect_folds: Vec<Fold> =
                 full.folds.iter().filter(|f| f.start >= b).copied().collect();
             assert_eq!(
@@ -1036,13 +2011,19 @@ mod tests {
             "    b();",
             "}",
         ];
-        let full = scan_bracket_segment(line_fn(&lines), lines.len(), 0, None);
+        let full = scan_bracket_segment(line_fn(&lines), lines.len(), 0, None, None, &[]);
         assert!(full.boundaries.len() >= 2, "应有多个括号边界 {full:?}");
         for &b in &full.boundaries {
-            let seg = scan_bracket_segment(line_fn(&lines), lines.len(), b, None);
+            let seg = scan_bracket_segment(line_fn(&lines), lines.len(), b, None, None, &[]);
             let expect_pairs: Vec<BracketPair> =
                 full.pairs.iter().filter(|p| p.open_line >= b).copied().collect();
             assert_eq!(seg.pairs, expect_pairs, "边界 {b} 起段扫描的配对应一致");
+            // 字符表只保「边界行**之后**」：边界行 b 自身可能承载闭合「b 之前开口」的
+            // 闭括号（fresh 重扫栈空 ⇒ 视为不匹配跳过，且行内开口深度依赖既有残差栈）——
+            // 该行字符不可由重扫复现（由增量合并的 prev 保留承担，见 incremental 拆行）。
+            let expect_chars: Vec<BracketChar> =
+                full.chars.iter().filter(|c| c.line > b).copied().collect();
+            assert_eq!(seg.chars, expect_chars, "边界 {b} 起段扫描的括号字符应一致");
             let expect_bnd: Vec<usize> =
                 full.boundaries.iter().copied().filter(|&x| x >= b).collect();
             assert_eq!(seg.boundaries, expect_bnd, "边界 {b} 起的边界列表应一致");
@@ -1060,21 +2041,38 @@ mod tests {
         }
     }
 
-    /// 对拍核心：`prev`（上次落地结果）经一次「受影响行段描述 (line_a,min_stop,delta)」
-    /// 的增量重算，四份输出必须与对该时点文本的**整篇扫描**逐位一致（fold/配对按
-    /// start / open_line 排序后比较——两者本就是同一候选集合，仅内部次序约定不同）。
+    /// 对拍核心：`prev`（上次落地结果，含快照网格）经一次「受影响行段描述
+    /// (line_a,min_stop,delta)」的增量重算，五份输出必须与对该时点文本的**整篇扫描**
+    /// 逐位一致（fold/配对/字符按 start / open_line / (line,col) 排序后比较——三者本就
+    /// 是同一候选集合，仅内部次序约定不同）；快照网格随结果透传（供连续编辑续用）。
     fn assert_incremental_matches_full(
-        prev: &(Vec<Fold>, Vec<BracketPair>, Vec<usize>, Vec<usize>),
+        prev: &(
+            Vec<Fold>,
+            Vec<BracketPair>,
+            Vec<BracketChar>,
+            Vec<usize>,
+            Vec<usize>,
+            Vec<(usize, FoldSnapshot)>,
+            Vec<(usize, BracketSnapshot)>,
+        ),
         text: &str,
         line_a: usize,
         min_stop: usize,
         delta: i64,
         multi: bool,
         full_limit: usize,
-    ) -> (Vec<Fold>, Vec<BracketPair>, Vec<usize>, Vec<usize>) {
+    ) -> (
+        Vec<Fold>,
+        Vec<BracketPair>,
+        Vec<BracketChar>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<(usize, FoldSnapshot)>,
+        Vec<(usize, BracketSnapshot)>,
+    ) {
         let line = text_line_fn(text);
         let n = text.split('\n').count();
-        let (nf, np, nfb, npb) = incremental_fold_brackets(
+        let (nf, np, nc, nfb, npb, nfs, nbs) = incremental_fold_brackets(
             line,
             n,
             full_limit,
@@ -1082,10 +2080,13 @@ mod tests {
             &prev.1,
             &prev.2,
             &prev.3,
+            &prev.4,
+            &prev.5,
+            &prev.6,
             Some((line_a, min_stop, delta)),
             multi,
         );
-        let (ef, ep, efb, epb) = full_fold_brackets(line, n);
+        let (ef, ep, ec, efb, epb, ..) = full_fold_brackets(line, n);
         let mut nf_sorted = nf.clone();
         nf_sorted.sort_by_key(|f| f.start);
         let mut ef_sorted = ef.clone();
@@ -1096,13 +2097,89 @@ mod tests {
         let mut ep_sorted = ep.clone();
         ep_sorted.sort_by_key(|p| p.open_line);
         assert_eq!(np_sorted, ep_sorted, "括号配对与整篇扫描不一致（text={text:?}）");
+        let mut nc_sorted = nc.clone();
+        nc_sorted.sort_by_key(|c| (c.line, c.col));
+        let mut ec_sorted = ec.clone();
+        ec_sorted.sort_by_key(|c| (c.line, c.col));
+        assert_eq!(nc_sorted, ec_sorted, "括号字符与整篇扫描不一致（text={text:?}）");
         assert_eq!(nfb, efb, "fold 边界与整篇扫描不一致（text={text:?}）");
         assert_eq!(npb, epb, "括号边界与整篇扫描不一致（text={text:?}）");
-        (nf, np, nfb, npb)
+        (nf, np, nc, nfb, npb, nfs, nbs)
+    }
+
+    /// **快照起点「跨包络平移」括对的 `guide_body_min_units` 重算回归**（预存字段新增，
+    /// K160 对拍）：`bb` 为快照起点时，跨包络项（`open < bb`、`close > stop_old`）由旧值
+    /// 平移保留——其体内行含受影响段、内容已受编辑 → 新字段旧值陈旧，必须用**新文档**
+    /// 重算，否则与整篇扫描逐位不一致（本测试钉死这条路径）。
+    ///
+    /// 构造：行 0 永久栈底 `{`（直到 1102 才闭 → 全部行无空栈边界，逼起点走快照）；
+    /// 行 500 层-4 `{` 开口、行 1101 层-4 `}` 闭合（跨行括对）；行 521 埋锚（缩进 8）。
+    /// 编辑 = 行 521 锚行内容 `xxMARKxx();` → `xxMARKxx() { }`（行内自平衡，delta=0）：
+    /// 起点 `pick_start(521)` 无边界可用 → 取快照 512（`bb_is_snapshot`）；因为括号自平衡、
+    /// 新态在 1024（下一个快照检查点）与旧态一致 → 重扫在 1024 停 → 括对 (500,1101) 的
+    /// `close=1101 > stop_old=1024`、`open=500 < 1024` = **跨包络平移项**，且体内行 521 缩进
+    /// 由 8→4 改变了最小非闭缩进（8→4）——若不平移处重算，增量 8 ≠ 整篇 4，对拍必红。
+    #[test]
+    fn snapshot_crossing_pair_guide_body_min_units_recomputed() {
+        fn fixture() -> String {
+            let mut s = String::new();
+            s.push_str("{\n"); // 0：永久栈底（未闭直到 1102 → 无空栈边界）
+            for _ in 1..500 {
+                s.push_str("  filler();\n");
+            }
+            s.push_str("    fn g() {\n"); // 500：层-4 开口
+            for i in 501..1101 {
+                if i == 521 {
+                    s.push_str("        xxMARKxx();\n"); // 521：锚（缩进 8，与体内一致）
+                } else {
+                    s.push_str("        filler();\n");
+                }
+            }
+            s.push_str("    }\n"); // 1101：层-4 闭（(500,1101) 括对）
+            s.push_str("}\n"); // 1102：层-0 闭（(0,1102) 括对 + 边界）
+            s
+        }
+        let old = fixture();
+        let n = old.split('\n').count();
+        let line = text_line_fn(&old);
+        let prev = full_fold_brackets(line, n);
+        // 前置：正是「栈永不清空」型（无空栈边界 ≤ 编辑行）、含跨行括对。
+        assert!(
+            prev.4.iter().all(|&b| b > 521),
+            "前置：编辑行前不应有空栈边界（bb 必须走快照），boundaries={:?}",
+            prev.4
+        );
+        assert!(
+            prev.1.iter().any(|p| p.open_line == 500 && p.close_line == 1101),
+            "前置：应有层-4 尾段跨行括对 (500,1101)"
+        );
+        // 旧值：体内最小非闭缩进本为 8（锚行缩进 8；`    fn g() {` / `}` 的 500/1101 不在体内）。
+        let big = prev.1.iter().find(|p| p.open_line == 500).unwrap();
+        assert_eq!(big.guide_body_min_units, Some(8), "旧值应为 8");
+
+        // 编辑：锚行内容改缩进 8→4 且行内自平衡（净行数增量 0）。
+        let mut new = old.clone();
+        let pos = new.find("        xxMARKxx();").unwrap();
+        new.replace_range(
+            pos..pos + "        xxMARKxx();".len(),
+            "    xxMARKxx() { }",
+        );
+        // 行 521 内容替换（无换行）→ delta=0、min_stop=522。
+        let line_a = new[..pos].matches('\n').count();
+        assert_eq!(line_a, 521, "锚行 0idx 应为 521，实际 {line_a}");
+        let state = assert_incremental_matches_full(&prev, &new, 521, 522, 0, false, usize::MAX);
+        // 显式钉新值：跨包络平移的 (500,1101) 重算后 = 体内最小缩进 4（锚行由 8 降 4）。
+        let np = state.1;
+        let crossing = np.iter().find(|p| p.open_line == 500 && p.close_line == 1101);
+        assert_eq!(
+            crossing.map(|p| p.guide_body_min_units),
+            Some(Some(4)),
+            "跨包络平移的括对须用新文档重算（8→4）：{crossing:?}"
+        );
     }
 
     /// 结构编辑序列上的对拍：每一步的增量重算输出 == 该时点整篇扫描（fold 候选 /
-    /// 括号配对 / 边界四份全比），覆盖行内插换行、多行删除、注释内加花括号、
+    /// 括号配对 / 括号字符 / 边界五份全比），覆盖行内插换行、多行删除、注释内加花括号、
     /// 整函数结构重写、删整个内层块等编辑形态。
     #[test]
     fn incremental_edits_match_full_scan() {
@@ -1169,6 +2246,253 @@ fn after() {
         }
     }
 
+    /// 边界行残差闭号增量对拍（2026-11-14 修复回归，K160）：编辑**恰落在边界行**
+    /// （`bb == line_a`，如 `fn f() {\n    x();\n}` 的 `}` 行）时，该行承担的「闭合
+    /// bb 之前残差开口」的 `}` 字符从 bb 以空栈重扫**造不出**（栈空视为不匹配跳过，
+    /// 见 _incremental_fold_brackets 注释的边界特殊性）→ 必须回退到前一边界重扫，
+    /// 增量五份输出方与整篇扫描逐位一致（否则该残差 `}` 及其字符表项丢失）。
+    /// 此处把 line 2 的 `}` 编辑为 `} // tail`（净 0 行、行号不动），编辑点恰在边界行。
+    #[test]
+    fn incremental_on_boundary_line_keeps_residual_close_char() {
+        let src = "fn f() {\n    x();\n}\nfn g() {\n    y();\n}";
+        let line = text_line_fn(src);
+        let n = src.split('\n').count();
+        let prev = full_fold_brackets(line, n);
+        assert!(
+            prev.4.contains(&2),
+            "fixture 的行 2（`}}`）应是括号边界: {:?}",
+            prev.4
+        );
+        // 编辑恰在边界行 line_a==bb==2：`}` → `} // tail`（净 0 行）。
+        assert_incremental_matches_full(
+            &prev,
+            "fn f() {\n    x();\n} // tail\nfn g() {\n    y();\n}",
+            2, // line_a
+            3, // min_stop
+            0, // delta
+            false,
+            usize::MAX,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 打字卡顿（⑦）：栈永不清空文档的增量包络退化回归（TDD 先红后绿）
+    // ------------------------------------------------------------------
+
+    /// 深嵌套「栈永不清空」夹具（打字卡顿 ⑦）：首行缩进 0 的未闭 `{` 作**永久栈底**——
+    /// 之后所有行缩进 ≥1 且不以闭记号开头 → fold 栈底 `(0,0)` 永不被弹、括号层-0 栈
+    /// 永非空 → 两者「栈空边界」全部消失（退化用例：旧实现每次敲括号 0..EOF 整篇重扫，
+    /// 20k 深嵌套 debug 85-135ms）。行 `anchor_row` 埋唯一锚 `// [[TA]]` 供测试定位编辑点
+    /// （内存构造、禁写盘）。
+    fn pathological_fixture(total: usize, anchor_row: usize) -> String {
+        let mut s = String::with_capacity(total * 40);
+        s.push_str("{\n"); // 行 0：缩进 0 未闭 → 永久栈底
+        for i in 1..total {
+            if i == anchor_row {
+                s.push_str("  c(); // [[TA]]\n");
+                continue;
+            }
+            match i % 6 {
+                1 => s.push_str("  a();\n"),                 // 缩进 2
+                2 => s.push_str("  {\n"),                    // 缩进 2 块开（跨行括对）
+                3 => s.push_str("    b();\n"),               // 缩进 4
+                4 => s.push_str("  }\n"),                    // 缩进 2 块闭（跨行括对）
+                5 => s.push_str("  c();\n"),                 // 缩进 2
+                _ => s.push_str("  fn g() { d(); }\n"),      // 行内平衡（不产跨行括对）
+            }
+        }
+        s
+    }
+
+    /// 单次行内编辑的增量对拍 + 包络探针（打字卡顿 ⑦）：把 `old` 中的锚位
+    /// `// [[TA]]`（`old` 坐标 `pos`）替换为 `piece`（含新括号、无换行 → 行数不变、
+    /// delta=0）。返回 `(fold_span, bracket_span, 五份逐字节一致)`。
+    /// span = 本次增量实际重扫包络 `stop - from`（**确定性结构量**，禁纯墙钟）。
+    fn probe_envelope(
+        prev: &(
+            Vec<Fold>,
+            Vec<BracketPair>,
+            Vec<BracketChar>,
+            Vec<usize>,
+            Vec<usize>,
+            Vec<(usize, FoldSnapshot)>,
+            Vec<(usize, BracketSnapshot)>,
+        ),
+        old: &str,
+        piece: &str,
+        pos: usize,
+    ) -> (usize, usize, bool) {
+        let mut new = old.to_string();
+        new.replace_range(pos..pos + "// [[TA]]".len(), piece);
+        let line_a = old[..pos].matches('\n').count();
+        let min_stop = line_a + 1; // 行内替换（无换行）：受影响段 = 编辑行下一行
+        let delta = 0i64;
+        let (nf, np, nc, nfb, npb, _nfs, _nbs) = incremental_fold_brackets(
+            text_line_fn(&new),
+            new.split('\n').count(),
+            usize::MAX,
+            &prev.0,
+            &prev.1,
+            &prev.2,
+            &prev.3,
+            &prev.4,
+            &prev.5,
+            &prev.6,
+            Some((line_a, min_stop, delta)),
+            false,
+        );
+        let [ff, fstop, bf, bstop] = last_incremental_spans();
+        let (ef, ep, ec, efb, epb, _efs, _ebs) =
+            full_fold_brackets(text_line_fn(&new), new.split('\n').count());
+        let mut nf2 = nf.clone();
+        nf2.sort_by_key(|f| f.start);
+        let mut ef2 = ef.clone();
+        ef2.sort_by_key(|f| f.start);
+        let mut np2 = np.clone();
+        np2.sort_by_key(|p| p.open_line);
+        let mut ep2 = ep.clone();
+        ep2.sort_by_key(|p| p.open_line);
+        let mut nc2 = nc.clone();
+        let mut ec2 = ec.clone();
+        nc2.sort_by_key(|c| (c.line, c.col));
+        ec2.sort_by_key(|c| (c.line, c.col));
+        let exact = nf2 == ef2 && np2 == ep2 && nc2 == ec2 && nfb == efb && npb == epb;
+        (fstop.saturating_sub(ff), bstop.saturating_sub(bf), exact)
+    }
+
+    /// 打字卡顿回归（⑦）：深嵌套「栈永不清空」文档上，结构编辑的增量重扫包络必须**有界**
+    /// —— 稳定编辑（打字常态：行内插入自平衡 `{ }`）应收成小块（≲ 档距量级，杜绝退化
+    /// EOF）；破坏性编辑（打字瞬态：行内插入未闭 `{` → 影响面顺移至 EOF）至少受起点断点
+    /// 约束、包络 < 总行数（不再 0..EOF）。两例增量五份输出均须与整篇扫描**逐字节一致**
+    /// （K160：不许用正确性换速度）。TDD：先红（旧实现包络 0..EOF 双双败）后绿。
+    #[test]
+    fn incremental_envelope_bounded_when_stack_never_empties() {
+        const TOTAL: usize = 12_001;
+        const ANCHOR: usize = 6_000;
+        let old = pathological_fixture(TOTAL, ANCHOR);
+        let n = old.split('\n').count();
+        assert!(n > 11_000, "夹具应 ≈8-20k 行量级：n={n}");
+        // 前置（病理）：至少一侧空栈边界退化（代表「包络退化」场景），否则用例不相关。
+        let prev = full_fold_brackets(text_line_fn(&old), n);
+        assert!(
+            prev.3.is_empty() || prev.4.is_empty(),
+            "病理夹具应使空栈边界退化（fb={} pb={}）",
+            prev.3.len(),
+            prev.4.len()
+        );
+        let pos = old.find("// [[TA]]").unwrap();
+
+        // —— 稳定编辑（打字常态：行内插入自平衡 `{ }`）——
+        let (fs, bs, exact) = probe_envelope(&prev, &old, "{ } // [[TA]]", pos);
+        assert!(exact, "稳定编辑增量五份输出必须与整篇扫描逐字节一致（K160）");
+        assert!(
+            fs < n / 20 && bs < n / 20,
+            "稳定编辑包络应收成小块（打字不整篇重扫）：fold={fs}/{n} bracket={bs}/{n}"
+        );
+
+        // —— 破坏性编辑（打字瞬态：行内插入未闭 `{`）——
+        let (fs2, bs2, exact2) = probe_envelope(&prev, &old, "{ // [[TA]]", pos);
+        assert!(exact2, "破坏性编辑增量五份输出必须与整篇扫描逐字节一致（K160）");
+        assert!(
+            fs2 < n && bs2 < n,
+            "破坏性编辑包络受起点断点约束，不得退化 0..EOF：fold={fs2}/{n} bracket={bs2}/{n}"
+        );
+    }
+
+    /// 深嵌套「栈永不清空」夹具上与 `bench_full_vs_incremental_scan` 平行的**打字耗时旁证**
+    /// （仅打印、不落断言；`#[ignore]`，本机定位用）。先量「old 基线 = 整篇双扫」（旧实现
+    /// 在该文档等效于每次整篇重扫），再量修复后同一稳定编辑的**增量**重扫耗时，目标是量级
+    /// 级下降（>10×）。跑法：`cargo test --release --bin gpui-editor fold::bench_deep_nest_typing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_deep_nest_typing() {
+        const TOTAL: usize = 20_001;
+        const ANCHOR: usize = 10_000;
+        let old = pathological_fixture(TOTAL, ANCHOR);
+        // 与生产同款 ropey Rope + line_shared（O(log n)/行；不用 text_line_fn——
+        // `split('\n').nth(i)` 是 O(i)/行 → O(n²)，会虚高两侧耗时）。
+        use crate::editor::rope_ext::RopeExt as _;
+        let rope = ropey::Rope::from_str(&old);
+        let n = rope.lines_len();
+        let line = |r: usize| crate::editor::buffer::line_shared(&rope, r);
+        let prev = full_fold_brackets(line, n);
+        // 基线 = 整篇双扫（旧实现增量在该夹具退化为此量级）。
+        let mut t_full = Vec::new();
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let r = full_fold_brackets(line, n);
+            std::hint::black_box(&r);
+            t_full.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        // 稳定编辑：行内插入自平衡 `{ }`（编辑点 = 锚行 ANCHOR，行数不变、delta=0）。
+        let new_text = old.replacen("// [[TA]]", "{ } // [[TA]]", 1);
+        let line_a = ANCHOR; // 锚行（0-based 编辑行，旧坐标）
+        let new_rope = ropey::Rope::from_str(&new_text);
+        let new_line = |r: usize| crate::editor::buffer::line_shared(&new_rope, r);
+        let mut t_inc = Vec::new();
+        for _ in 0..7 {
+            let t0 = std::time::Instant::now();
+            let r = incremental_fold_brackets(
+                new_line,
+                new_rope.lines_len(),
+                usize::MAX,
+                &prev.0,
+                &prev.1,
+                &prev.2,
+                &prev.3,
+                &prev.4,
+                &prev.5,
+                &prev.6,
+                Some((line_a, line_a + 1, 0)),
+                false,
+            );
+            std::hint::black_box(&r);
+            t_inc.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        t_full.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        t_inc.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med_full = t_full[t_full.len() / 2];
+        let med_inc = t_inc[t_inc.len() / 2];
+        eprintln!(
+            "[BENCH ⑦] rows={n} 稳定编辑增量包络=[{:?}]（总行 {n}，包络/总行= {:.2}）",
+            last_incremental_spans(),
+            (last_incremental_spans()[1] - last_incremental_spans()[0]) as f64 / n as f64,
+        );
+        eprintln!(
+            "[BENCH ⑦] before(整篇双扫=旧增量退化量级) med: {:.2} ms | after(增量) med: {:.2} ms | 加速 {:.0}x",
+            med_full, med_inc, med_full / med_inc.max(1e-6),
+        );
+    }
+
+    /// 安全护栏（K142）：单行超预算密括号（1 行 > `BRACKET_CHAR_MAX` 个括字符，row_count=1
+    /// 可绕开 limits.rs 200k 行守卫）不得 OOM / 无界增长——扫描必须停在一处上界内、置
+    /// `truncated` 且不 panic；上层 `full_fold_brackets` 返回空括对/字符/括对边界表（该文件
+    /// 整体不渲染括对/高亮，视觉降级可接受），折叠候选不受影响。纯内存构造、无文件 IO。
+    #[test]
+    fn dense_bracket_input_bounded() {
+        let opens = "(".repeat(BRACKET_CHAR_MAX + 1000);
+        let closes = ")".repeat(BRACKET_CHAR_MAX + 1000);
+        let lines: &[&str] = &[opens.as_str(), closes.as_str()];
+        let lf = line_fn(lines);
+        let (folds, pairs, chars, fb, pb, _fs, _bs) = full_fold_brackets(lf, lines.len());
+        assert!(pairs.is_empty(), "截断后配对应为空: len={}", pairs.len());
+        assert!(chars.len() <= BRACKET_CHAR_MAX, "chars 必须 ≤ 预算: {}", chars.len());
+        assert!(pb.is_empty(), "截断后括对边界应为空: {:?}", pb);
+        assert!(!folds.is_empty() || !fb.is_empty(), "折叠候选/边界不受括对截断影响");
+        // 报告级：直接扫描也置 truncated；截断中途不产出任何配对。
+        let report = scan_bracket_segment(lf, lines.len(), 0, None, None, &[]);
+        assert!(report.truncated, "超预算输入必须置 truncated");
+        assert!(report.chars.len() <= BRACKET_CHAR_MAX);
+        assert!(report.pairs.is_empty(), "截断中途的配对同样不应流出");
+        // 单行 `{`（缩进 0，花括号栈同层爆长度）同样受未闭预算约束。
+        let braces = "{".repeat(BRACKET_CHAR_MAX + 1000);
+        let blines: &[&str] = &[braces.as_str()];
+        let blf = line_fn(blines);
+        let breport = scan_bracket_segment(blf, blines.len(), 0, None, None, &[]);
+        assert!(breport.truncated, "单行密 `{{` 也应置 truncated");
+        assert!(breport.chars.len() <= BRACKET_CHAR_MAX);
+    }
+
     /// 增量前提缺失的兜底路径：`multi` / 无编辑描述 → 整篇扫描；超行数阈值 →
     /// 候选/配对/边界全部清空（按需折叠语义）。
     #[test]
@@ -1176,28 +2500,39 @@ fn after() {
         let src = "fn a() {\n    x();\n}\n";
         let line = text_line_fn(src);
         let prev = full_fold_brackets(line, src.split('\n').count());
-        // multi=true → 整篇兜底（输出=整篇，边界更新）。
+        // multi=true → 整篇兜底（输出=整篇含快照，边界更新）。
         let r = incremental_fold_brackets(
             line, src.split('\n').count(), usize::MAX,
-            &prev.0, &prev.1, &prev.2, &prev.3, Some((0, 4, 0)), true,
+            &prev.0, &prev.1, &prev.2, &prev.3, &prev.4, &prev.5, &prev.6, Some((0, 4, 0)), true,
         );
         let full = full_fold_brackets(line, src.split('\n').count());
         assert_eq!(r.0, full.0);
         assert_eq!(r.1, full.1);
         assert_eq!(r.2, full.2);
         assert_eq!(r.3, full.3);
+        assert_eq!(r.4, full.4);
+        assert_eq!(r.5, full.5, "multi 兜底的 fold 快照网格应=整篇");
+        assert_eq!(r.6, full.6, "multi 兜底的括号快照网格应=整篇");
         // edit=None → 整篇兜底。
         let r2 = incremental_fold_brackets(
             line, src.split('\n').count(), usize::MAX,
-            &prev.0, &prev.1, &prev.2, &prev.3, None, false,
+            &prev.0, &prev.1, &prev.2, &prev.3, &prev.4, &prev.5, &prev.6, None, false,
         );
         assert_eq!(r2.0, full.0);
-        // row_count > full_limit → 全部清空（按需折叠/配对）。
+        // row_count > full_limit → 全部清空（按需折叠/配对/字符/快照）。
         let r3 = incremental_fold_brackets(
             line, src.split('\n').count(), 2,
-            &prev.0, &prev.1, &prev.2, &prev.3, Some((0, 4, 0)), false,
+            &prev.0, &prev.1, &prev.2, &prev.3, &prev.4, &prev.5, &prev.6, Some((0, 4, 0)), false,
         );
-        assert!(r3.0.is_empty() && r3.1.is_empty() && r3.2.is_empty() && r3.3.is_empty());
+        assert!(
+            r3.0.is_empty()
+                && r3.1.is_empty()
+                && r3.2.is_empty()
+                && r3.3.is_empty()
+                && r3.4.is_empty()
+                && r3.5.is_empty()
+                && r3.6.is_empty()
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1239,7 +2574,8 @@ fn after() {
             t_full.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         // 以第一次全扫结果作为增量对拍基 + 基线。
-        let (prev_folds, prev_pairs, prev_fb, prev_pb) = full_fold_brackets(line, n);
+        let (prev_folds, prev_pairs, prev_chars, prev_fb, prev_pb, prev_fsnaps, prev_bsnaps) =
+            full_fold_brackets(line, n);
 
         // 新：文档中部一次结构编辑（函数 k 体内插入 2 行更深缩进 → 净 +2）的增量重算。
         let k = funcs / 2; // 中段
@@ -1249,13 +2585,15 @@ fn after() {
         let mut t_inc = Vec::new();
         for _ in 0..7 {
             let t0 = std::time::Instant::now();
-            let (f, b, fb, pb) = incremental_fold_brackets(
+            let (f, b, c, fb, pb, _fs, _bs) = incremental_fold_brackets(
                 line, n + delta as usize, usize::MAX,
-                &prev_folds, &prev_pairs, &prev_fb, &prev_pb,
+                &prev_folds, &prev_pairs, &prev_chars, &prev_fb, &prev_pb,
+                &prev_fsnaps, &prev_bsnaps,
                 Some((line_a, min_stop, delta)), false,
             );
             std::hint::black_box(&f);
             std::hint::black_box(&b);
+            std::hint::black_box(&c);
             std::hint::black_box(&fb);
             std::hint::black_box(&pb);
             t_inc.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -1304,9 +2642,10 @@ fn after() {
         let mut t = Vec::new();
         for _ in 0..5 {
             let t0 = std::time::Instant::now();
-            let (folds, pairs, fb, pb) = full_fold_brackets(line, n);
+            let (folds, pairs, chars, fb, pb, _fs, _bs) = full_fold_brackets(line, n);
             std::hint::black_box(&folds);
             std::hint::black_box(&pairs);
+            std::hint::black_box(&chars);
             std::hint::black_box(&fb);
             std::hint::black_box(&pb);
             t.push(t0.elapsed().as_secs_f64() * 1000.0);

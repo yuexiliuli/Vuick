@@ -19,15 +19,18 @@ use crate::actions::{
     Redo, SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart,
     SelectToStart, SelectToStartOfLine, Undo,
 };
+use crate::editor::fold::BracketChar;
 use ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
 use config::layout::{
-    BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_WIDTH, EDITOR_RULER_COLUMNS,
+    BracketGuidesMode, BRACKET_GUIDES_MODE, BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_WIDTH,
+    EDITOR_RULER_COLUMNS,
 };
 use super::{
     CARET_WIDTH_PX, CodeEditor, EditorEvent, FindBtn, FOLD_ARROW_SLOT_PX, GUTTER_LEFT_PAD_PX,
     GUTTER_RIGHT_PAD_PX, MIN_VISIBLE_ROWS, RowData, RowView,
 };
+use super::editing::bracket_guide_color;
 
 // -------------------------------------------------------------------------
 // Render / Focusable / 事件
@@ -105,9 +108,27 @@ impl Render for CodeEditor {
         // 垂直标尺（margin guide）：纯视觉覆盖层（见 `ruler_overlay`）。
         let ruler = self.ruler_overlay(avail_w);
 
-        // 括号标尺（bracket guides）：跨行括号配对竖线叠层（见 `bracket_guide_overlay`）。
+        // 缩进引导线（indentation guides，§8 视觉主源）：逐可视行缩进级竖线叠层
+        // （见 `indentation_guide_overlay`；默认开，VS Code 同款）。
         let guides = self
-            .bracket_guide_overlay(vis_top, vis_off, lh, harea_w, view_h, window.scale_factor());
+            .indentation_guide_overlay(vis_top, vis_off, lh, harea_w, view_h, window.scale_factor());
+
+        // 括号竖线（bracket guides）：竖线层按模式挂载（Off = 不画括对彩线，只留钩线；
+        // Active/All 见 config/layout.rs:94 `BRACKET_GUIDES_MODE`（默认 Off，翻转常量即
+        // 还原））。钩线层独立恒挂（`bracket_guide_hooks_layer`，Off 模式也保留，
+        // bracketPairsHorizontal='active' 口径）。
+        let hooks = self.bracket_guide_hooks_layer(vis_top, vis_off, lh, window.scale_factor());
+        let bracket_guides = (BRACKET_GUIDES_MODE != BracketGuidesMode::Off).then(|| {
+            self.bracket_guide_overlay(
+                vis_top,
+                vis_off,
+                lh,
+                harea_w,
+                view_h,
+                window.scale_factor(),
+                BRACKET_GUIDES_MODE,
+            )
+        });
 
         let core = div()
             .id("code-editor")
@@ -122,11 +143,19 @@ impl Render for CodeEditor {
         let core = core
             // 垂直标尺叠层：第一个子元素 → 位于文本/选区/滚动条之下（经典后台参考线）。
             .child(ruler)
-            // 折叠/光标行整行底色叠层：标尺之上、括号竖线之下（拆出行元素，见
+            // 折叠/光标行整行底色叠层：标尺之上、引导竖线之下（拆出行元素，见
             // `row_bg_overlay`；竖线在折叠/光标行上清晰可见且保持原色）。
             .child(row_bg)
-            // 括号标尺竖线叠层：盖在行底色叠层之上、文字/选区之下（不挡文本）。
+            // 缩进引导线叠层：盖在行底色叠层之上、文字/选区之下（不挡文本）。
             .child(guides)
+            // 括号横钩线：恒挂（bracketPairsHorizontal='active'，仅严格含光标的 active
+            // 括对；Off 模式也保留），盖在缩进线之上（同列/同行交接处清晰）。
+            .child(hooks)
+            // 括号竖线可选叠加：按模式挂载（Off = 不挂载）；开启时盖在缩进线之上（同列压过，
+            // 历史规范见 docs/bracket-guide-redesign.md §8.4）。
+            .when(bracket_guides.is_some(), |this| {
+                this.child(bracket_guides.expect("已判 Some"))
+            })
             .child(harea)
             // 行号列叠层（同一绝对滚动顶）：盖在横向滚动文本区左缘，不随内容横移，
             // 竖向滚动与文本逐行一致。
@@ -287,7 +316,7 @@ impl CodeEditor {
     fn snap_guide_extent(y: f32, h: f32, lh: f32, scale_factor: f32) -> (f32, f32) {
         let sf = scale_factor.max(1e-6);
         // 每行真实渲染设备像素（rhtz 正值变体：ceil(lh·sf−0.5)，实证 = taffy 预吸附）。
-        let pitch_dev = ((lh * sf - 0.5).ceil()).max(1.0);
+        let pitch_dev = super::layout::pitch_for_line_height(lh * sf);
         // 顶：就近吸附到设备像素。
         let top_dev = (y * sf).round();
         // 段占整行数（head/tail=0 时 h=n·pitch_log 恰整行；就地近取整）。分母用吸附行距
@@ -297,10 +326,15 @@ impl CodeEditor {
         (top_dev / sf, (bottom_dev - top_dev).max(0.0) / sf)
     }
 
-    /// 括号标尺（bracket guides）：每个跨行括号配对一条竖线，从开括号列画到闭行。
-    /// 坐标在**文本区本地**（x 含横向滚动换算、y 含纵向滚动换算），随内容滚动；
-    /// 与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。点击代码区域点亮的
-    /// 最内层块竖线（`active_guide_open`）用强调蓝加宽。
+    /// 括号标尺（bracket guides，对齐 VSCode bracket guides）：每个跨行括号配对一条
+    /// 竖线，从开括号列画到闭行。坐标在**文本区本地**（x 含横向滚动换算、y 含纵向滚动
+    /// 换算），随内容滚动；与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。
+    /// **按括对 `depth % 3` 循环池上色**（`theme colors.bracket_guide_palette`）：active
+    /// 段（= 活动括对 [`active_pair`] 的段，由光标行**块体模型**派生、随光标移动跟随）
+    /// alpha 1.0、inactive 段 alpha 0.3（VSCode 同口径）；宽度两态一致（1px，VSCode
+    /// 不加宽）。
+    /// `mode` = [`BracketGuidesMode`]（Off 默认：本竖线层不挂载、只留钩线，见
+    /// [`Self::bracket_guide_hooks_layer`]；Active = 仅活动括对、All = 全部产段）。
     /// `sf` = `window.scale_factor()`，用于把段端点吸附到物理像素网格（见 `snap_guide_extent`）。
     fn bracket_guide_overlay(
         &self,
@@ -310,12 +344,19 @@ impl CodeEditor {
         harea_w: f32,
         view_h: f32,
         sf: f32,
+        mode: BracketGuidesMode,
     ) -> gpui::Stateful<gpui::Div> {
-        let guide_segments = self.bracket_guide_segments_flagged(
-            vis_top, vis_off, lh, sf, harea_w, view_h, self.active_guide_open,
-        );
-        let guide_color = self.guide_color;
-        let active_guide_color = self.active_guide_color;
+        let active_pair = self.active_pair();
+        // Off → 不产竖线（只留钩线层；Active = 仅活动括对、All = 全部产段，见
+        // `bracket_guide_segments_flagged`）。Off 由调用方守卫一般不到达，防御兜底。
+        let guide_segments = if mode == BracketGuidesMode::Off {
+            Vec::new()
+        } else {
+            self.bracket_guide_segments_flagged(
+                vis_top, vis_off, lh, sf, harea_w, view_h, active_pair, mode,
+            )
+        };
+        let palette = self.bracket_guide_palette;
         div()
             .id("ce-bracket-guides")
             .debug_selector(|| "ce-bracket-guides".into())
@@ -325,14 +366,188 @@ impl CodeEditor {
             .left(self.gutter_width_px)
             .right(px(0.))
             .overflow_hidden()
-            .children(guide_segments.into_iter().map(|(x, y, h, active)| {
+            .children(guide_segments.into_iter().map(|(x, y, h, depth, active)| {
                 // 端点吸附**渲染行网格**：底 = 行顶 + 整行数×吸附行距（rhtz，与 taffy
                 // 同式）——恰贴「下一行顶」、绝不越过渲染行界（见 `snap_guide_extent`）。
                 // x 不动（横向 1px 竖线，无需 snap）。
                 let (gy, gh) = Self::snap_guide_extent(y, h, lh, sf);
+                // 括对色取色单源：`bracket_guide_color(palette, depth, active)`（E3 封口，
+                // palette[depth%3] + active → alpha 1.0 / 否则 0.3，见 editing.rs）。
+                let col = bracket_guide_color(&palette, depth, active);
                 div()
                     .absolute()
                     .debug_selector(|| "ce-bracket-guide".into())
+                    .left(px(x))
+                    .top(px(gy))
+                    .w(px(BRACKET_GUIDE_WIDTH))
+                    .h(px(gh))
+                    .bg(col)
+            }))
+    }
+
+    /// 括号**横向钩线**层（bracketPairsHorizontal='active'，仅 active 括对、须**严格含光标**，
+    /// 2026-11-14 第 4 片）：开行/闭行端点连到引导列。端点 x = 真实宽度单位列 × cw − hscroll
+    /// （与竖线段同坐标空间 = 文本区本地）；行边界 y 用吸附行距 pitch（横线落在渲染行网格的
+    /// 行界上）。**独立恒挂**（与 `BRACKET_GUIDES_MODE` 无关：用户真机口径下 Off 模式也保留
+    /// 钩线，见 `bracket_guide_overlay`）。三分支：
+    /// - 开行：开列 > 引导列 → **底边**横段（y = 开行下沿），否则不画；
+    /// - 闭行前有文本（`} else` / `x }`，`hasTextBeforeClosingBracket`）→ **底边**横段
+    ///   + 竖线段已含闭行；
+    /// - 闭行独占 `}` → **顶边**横段 + 竖线段不含闭行。
+    /// 横段厚 1 物理 px（÷sf），色 = active 括对色（palette[depth%3] 100%）。
+    fn bracket_guide_hooks_layer(
+        &self,
+        vis_top: usize,
+        vis_off: f32,
+        lh: f32,
+        sf: f32,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut hooks: Vec<(f32, f32, f32, f32, &'static str, Hsla)> = Vec::new();
+        if let Some(ap) = self.active_pair() {
+            let pitch = super::layout::pitch_for_line_height(lh * sf) / sf;
+            let snap = |v: f32| (v * sf).round() / sf;
+            let row_edge = |r: usize, top: bool| {
+                // 行 r 的上/下沿（编辑器本地 y，相对叠层顶）：上沿 = (r−top)·pitch − off，
+                // 下沿 = 上沿 + pitch。
+                let y = (r as f32 - vis_top as f32) * pitch - vis_off;
+                if top {
+                    y
+                } else {
+                    y + pitch
+                }
+            };
+            // col→px 走 `col_to_px`（d2 单源；下方再叠设备像素 snap，保留现状口径）。
+            let guide_x = self.col_to_px(self.guide_pair_column_lite(&ap));
+            let open_x = self.col_to_px(self.guide_col_prefix_units(ap.open_line, ap.open_col));
+            let close_x =
+                self.col_to_px(self.guide_col_prefix_units(ap.close_line, ap.close_col));
+            let vo = self.folds.visual_row(ap.open_line);
+            let vc = self.folds.visual_row(ap.close_line);
+            let hairline = 1.0 / sf;
+            let active_col = bracket_guide_color(&self.bracket_guide_palette, ap.depth, true);
+            // 开行：开列 > 引导列 → 底边横段（y = 开行下沿）。
+            if open_x > guide_x {
+                let y_top = row_edge(vo, false) - hairline;
+                hooks.push((
+                    snap(guide_x),
+                    snap(y_top),
+                    (snap(open_x) - snap(guide_x)).max(0.0),
+                    hairline,
+                    "ce-bracket-hook-open",
+                    active_col,
+                ));
+            }
+            // 闭行：闭列 > 引导列才画；前置文本 → 底边（含闭行）、独占 → 顶边。
+            if close_x > guide_x {
+                let top_edge = !self.has_text_before_close(ap.close_line, ap.close_col);
+                let y_top = row_edge(vc, top_edge) - if top_edge { 0.0 } else { hairline };
+                hooks.push((
+                    snap(guide_x),
+                    snap(y_top),
+                    (snap(close_x) - snap(guide_x)).max(0.0),
+                    hairline,
+                    "ce-bracket-hook-close",
+                    active_col,
+                ));
+            }
+        }
+        div()
+            .id("ce-bracket-hooks")
+            .debug_selector(|| "ce-bracket-hooks".into())
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(self.gutter_width_px)
+            .right(px(0.))
+            .overflow_hidden()
+            .children(hooks.into_iter().map(|(x, y, w, h, sel, col)| {
+                div()
+                    .absolute()
+                    .debug_selector(move || sel.into())
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .h(px(h))
+                    .bg(col)
+            }))
+    }
+
+    /// 缩进引导线（indentation guides，§8 视觉主源）：逐可视行按缩进级画竖线（折叠感知：
+    /// 折叠体内不产线、头行照常画）。普通引导线用 `guide_color`、active 高亮行用
+    /// [`Self::active_guide_highlight_color`]（active 视觉**块体模型**：高亮
+    /// [`CodeEditor::active_guide_group`] 返回列在**块体区间** `[体首, 体末+1)` 内的**全部
+    /// 连续段**，整块体点亮；2026-11-14 用户实测唯一真值——hl 色随「关联括对」括对色，
+    /// 无关联括对则 VSCode 灰）。
+    /// 坐标在**文本区本地**，随内容滚动；放在行底色之上、文本之下。端点同样经
+    /// `snap_guide_extent` 吸附渲染行网格。
+    fn indentation_guide_overlay(
+        &self,
+        vis_top: usize,
+        vis_off: f32,
+        lh: f32,
+        harea_w: f32,
+        view_h: f32,
+        sf: f32,
+    ) -> gpui::Stateful<gpui::Div> {
+        // active 高亮 = `active_guide_group()` 块体模型（2026-11-14 用户实测唯一真值，统一
+        // headless getter 与渲染路径）：(active_col, 体首可视, 体末可视+1) → `active` =
+        // (col, 体首, 体末+1, 光标可视行)，半开区间 `[体首, 体末+1)` 与
+        // `indentation_guide_segments_flagged` 的段化规则对齐（块体内全部连续段点亮，不只
+        // 光标行）；方向键/点击/折叠均跟随（终稿块体口径见 editing.rs
+        // active_pair / active_guide_group doc，2026-11-14 用户实测）。
+        let active = self
+            .active_guide_group()
+            .map(|(col, first_vis, last_vis_excl)| {
+                let caret = self.selection.head().min(self.buffer.len());
+                let logical = self.buffer.line_of_offset(caret);
+                let vmax = self.folds.visual_line_count().saturating_sub(1);
+                (
+                    col,
+                    first_vis,
+                    last_vis_excl,
+                    self.folds.visual_row(logical).min(vmax),
+                )
+            });
+        // C3 让位（2026-11-14 第 4 片）：仅 **All** 模式（全部括对彩色竖线接管画面）传让位表
+        // 压掉缩进灰线/active 高亮；缺省 Off 与 Active 用空表 → 灰缩进与 active 全量回显、
+        // 不受任何括对抑制（用户真机口径：彩线默认关掉后，缩进引导线是唯一竖线主源，须完整）。
+        // 表由 `bracket_guide_suppress` 生成、与缩进段化同源（空表 → 行为与旧实现逐位一致）。
+        let suppress = if BRACKET_GUIDES_MODE == BracketGuidesMode::All {
+            self.bracket_guide_suppress(vis_top, view_h, lh, BRACKET_GUIDES_MODE)
+        } else {
+            Vec::new()
+        };
+        let guide_segments = self.indentation_guide_segments_flagged(
+            vis_top,
+            vis_off,
+            lh,
+            sf,
+            harea_w,
+            view_h,
+            active,
+            &suppress,
+        );
+        let guide_color = self.guide_color;
+        // active 高亮色：光标行关联括对（`active_pair`，块体模型）→ 该括对色
+        // （`bracket_guide_palette[depth % 3]`）；否则 VSCode 默认灰 `active_guide_color`
+        // （2026-11-14 用户实测口径「active 高亮随关联括对」）。
+        let active_color = self.active_guide_highlight_color();
+        div()
+            .id("ce-indent-guides")
+            .debug_selector(|| "ce-indent-guides".into())
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(self.gutter_width_px)
+            .right(px(0.))
+            .overflow_hidden()
+            .children(guide_segments.into_iter().map(|(x, y, h, active)| {
+                // 端点吸附**渲染行网格**（与 bracket 段同式 `snap_guide_extent`）——
+                // 底 = 行顶 + 整行数×吸附行距，恰贴「下一行顶」、绝不越过渲染行界。
+                let (gy, gh) = Self::snap_guide_extent(y, h, lh, sf);
+                div()
+                    .absolute()
+                    .debug_selector(|| "ce-indent-guide".into())
                     .left(px(x))
                     .top(px(gy))
                     .w(px(if active {
@@ -341,7 +556,7 @@ impl CodeEditor {
                         BRACKET_GUIDE_WIDTH
                     }))
                     .h(px(gh))
-                    .bg(if active { active_guide_color } else { guide_color })
+                    .bg(if active { active_color } else { guide_color })
             }))
     }
 
@@ -1420,6 +1635,72 @@ pub(crate) fn merge_multi_highlights(
             && let Some(bg) = os.background_color
         {
             style.background_color = Some(bg);
+        }
+        if style != HighlightStyle::default() {
+            out.push((a..b, style));
+        }
+    }
+    out
+}
+
+/// 括号字符**前景色**叠层（括号文本着色，对齐 VS Code bracketPairColorization）：
+/// 与 [`merge_multi_highlights`] 同构，但 overlay 是**单字节**字符 span（`col..col+1`）
+/// 且只覆 `color`（`palette[depth % 3]`，与括号引导线同色池），bg/weight/italic/其余
+/// span 保持 `base` 原样。输入 `base`（非重叠、升序，含语法/选区合并结果）与 `chars`
+/// （按 line 内的 col 升序）均按字节区间切单元，产出严格递增、不重叠、每段都在行内。
+///
+/// find/选区叠层只改 bg → 不吞括号前景色（VSCode 口径：颜色与选中底色正交）。
+pub(crate) fn merge_color_overrides(
+    base: &[(Range<usize>, HighlightStyle)],
+    chars: &[BracketChar],
+    palette: &[Hsla; 3],
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    if chars.is_empty() {
+        return base.to_vec();
+    }
+    // 收集所有切分边界：样式段边界 ∪ 括号字符 span 边界。
+    let mut bounds: Vec<usize> = Vec::with_capacity(base.len() * 2 + chars.len() * 2 + 2);
+    for (r, _) in base {
+        let s = r.start.min(r.end);
+        let e = r.end.max(r.start);
+        if e <= s {
+            continue;
+        }
+        bounds.push(s);
+        bounds.push(e);
+    }
+    for c in chars {
+        bounds.push(c.col);
+        bounds.push(c.col + 1);
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut bi = 0usize;
+    let mut ci = 0usize;
+    for (i, a) in bounds.iter().copied().enumerate() {
+        let Some(&b) = bounds.get(i + 1) else { break };
+        if b <= a {
+            continue;
+        }
+        while bi < base.len() && base[bi].0.end <= a {
+            bi += 1;
+        }
+        while ci < chars.len() && chars[ci].col + 1 <= a {
+            ci += 1;
+        }
+        let mut style = HighlightStyle::default();
+        if let Some((r, s)) = base.get(bi)
+            && r.start < b {
+                style = *s;
+            }
+        // chars 互不重叠（单字节升序）：首个 `col+1 > a` 者即唯一可能覆盖本单元的字符。
+        if let Some(c) = chars.get(ci)
+            && c.col < b
+            && c.col + 1 > a
+        {
+            style.color = Some(palette[c.depth % 3]);
         }
         if style != HighlightStyle::default() {
             out.push((a..b, style));

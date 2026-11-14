@@ -150,6 +150,19 @@ pub struct ColorScheme {
     /// 编辑器「查找」**当前命中**（导航所指）的字符底色（明 #FFB703 / 暗 #FFB703 同
     /// 一饱和橙黄，比非当前更醒目，与选区/折叠底都可辨）。
     pub editor_find_current_bg: Rgba,
+    /// 缩进引导线（indentation guides）**非 active** 竖线色 = VSCode 默认灰（Light+
+    /// #D3D3D3 / Dark+ #404040，2026-11-14「完全对齐 VSCode 默认主题」；替代旧
+    /// `fg_muted.opacity(0.4)` 淡灰）。
+    pub guide_inactive: Rgba,
+    /// 缩进引导线 **active**（光标所在纯缩进组）点亮竖线色 = VSCode 默认灰（Light+
+    /// #939393 / Dark+ #707070；替代旧 `accent.opacity(0.9)` 强调蓝；`active_line_marker_overlay`
+    /// 顶部 L 形横线已删，仅剩竖线灰系高亮）。
+    pub guide_active: Rgba,
+    /// 括号引导线（bracket guides）**3 色循环池** = VSCode `editorBracketGuide.background`
+    /// 取色（Light+：#0431FA 蓝 / #319331 绿 / #7B3814 棕；Dark+：#FFD700 金 / #DA70D6
+    /// 紫 / #179FFF 青，按序循环）。消费方按 `depth % 3` 取色，与缩进引导线的灰系竖线
+    /// 在视觉上区分「结构缩进」与「括号配对」两条线系。
+    pub bracket_guide_palette: [Rgba; 3],
     /// **文档选区底色**（半透明补偿蓝叠加，markdown 预览 / WYSIWYG / PDF 阅读器共用；
     /// 暗 `rgba(0x4d6bfe61)` / 亮 `rgba(0x4d6bfe42)` = 各消费方收编前原值，零观感变化）。
     /// 与 `editor_selection_bg`（代码编辑器选区补偿色）语义区分：本 token 管**文档预览/纸面**
@@ -204,6 +217,11 @@ impl ColorScheme {
             editor_active_line_bg: rgb(0xe6eff8),
             editor_find_match_bg: rgb(0xffe497),
             editor_find_current_bg: rgb(0xffb703),
+            // VSCode Light+ 默认缩进引导线（灰系；与 active 档 #939393 区分）。
+            guide_inactive: rgb(0xd3d3d3),
+            guide_active: rgb(0x939393),
+            // VSCode Light+ 括号引导线 3 色循环池（#0431FA / #319331 / #7B3814）。
+            bracket_guide_palette: [rgb(0x0431fa), rgb(0x319331), rgb(0x7b3814)],
             doc_selection_bg: rgba(0x4d6bfe42),
         }
     }
@@ -256,6 +274,11 @@ impl ColorScheme {
             editor_active_line_bg: rgb(0x242525),
             editor_find_match_bg: rgb(0x4a3f16),
             editor_find_current_bg: rgb(0xffb703),
+            // VSCode Dark+ 默认缩进引导线（灰系；与 active 档 #707070 区分）。
+            guide_inactive: rgb(0x404040),
+            guide_active: rgb(0x707070),
+            // VSCode Dark+ 括号引导线 3 色循环池（#FFD700 / #DA70D6 / #179FFF）。
+            bracket_guide_palette: [rgb(0xffd700), rgb(0xda70d6), rgb(0x179fff)],
             doc_selection_bg: rgba(0x4d6bfe61),
         }
     }

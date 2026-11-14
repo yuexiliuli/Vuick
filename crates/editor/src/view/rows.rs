@@ -7,6 +7,7 @@ use super::{
 };
 
 use std::{
+    borrow::Cow,
     ops::Range,
     rc::Rc,
     time::{Duration},
@@ -313,7 +314,24 @@ impl CodeEditor {
         let mut out: Vec<RowData> = Vec::with_capacity(hi - lo + 1);
         for v in lo..=hi {
             let logical = self.folds.logical_row(v);
-            let styles: &[(Range<usize>, HighlightStyle)] = &hl_lines[logical - lo_l];
+            let base_styles: &[(Range<usize>, HighlightStyle)] = &hl_lines[logical - lo_l];
+            // 括号字符前景注入：本行有括号字符 → 对 `col..col+1` span 覆
+            // `bracket_guide_palette[depth % 3]`（与引导线同色池）；无 → 原样 Borrowed
+            // 零分配。覆色后的 styles 即行缓存 `hl_styles`（probe 逐位比对自洽：缓存键
+            // 只含 version+行号，括号表随后台扫描落地变化 → 与新鲜覆色比对 miss → 重物化，
+            // 正确性由比对兜底，不额外失效）。
+            let styles: Cow<[(Range<usize>, HighlightStyle)]> = {
+                let chars = self.bracket_chars_on_line(logical);
+                if chars.is_empty() {
+                    Cow::Borrowed(base_styles)
+                } else {
+                    Cow::Owned(render::merge_color_overrides(
+                        base_styles,
+                        &self.bracket_char_depths[chars],
+                        &self.bracket_guide_palette,
+                    ))
+                }
+            };
             let active = focused
                 && head_selection_collapsed
                 && head >= self.buffer.line_start(logical)
@@ -325,16 +343,20 @@ impl CodeEditor {
             // `(buffer.version(), 逻辑行)`，折叠/选区/光标是下面动态层，不影响命中。
             let cacheable = colored_range.is_some_and(|(cf, ch)| logical >= cf && logical <= ch);
             let content = if cacheable {
-                match self.row_cache.probe(version, logical, styles) {
+                match self.row_cache.probe(version, logical, styles.as_ref()) {
                     Some(c) => c,
                     None => {
-                        let c = Rc::new(RowContent::materialize(&self.buffer, logical, styles));
+                        let c = Rc::new(RowContent::materialize(
+                            &self.buffer,
+                            logical,
+                            styles.as_ref(),
+                        ));
                         self.row_cache.put(version, logical, c.clone());
                         c
                     }
                 }
             } else {
-                Rc::new(RowContent::materialize(&self.buffer, logical, styles))
+                Rc::new(RowContent::materialize(&self.buffer, logical, styles.as_ref()))
             };
             // 选区合并层 + 查找高亮层：选区动态合并（`row_highlight_override`）之上再叠
             // find 匹配底色（当前命中/其余匹配）。find 已关闭或无本行命中 → 不分配。

@@ -119,10 +119,6 @@ impl CodeEditor {
             }
         }
         let offset = self.offset_at_point(local, window);
-        // 标尺点亮：代码区点击 → 该行所属最内层括号块的标尺竖线点亮；非块内行 → 清除。
-        // （此处已越过 gutter 分支，标尺本身不可点选，只响应代码区。）
-        let caret_row = self.buffer.line_of_offset(offset);
-        self.active_guide_open = self.guide_pair_for_logical_row(caret_row);
         if event.modifiers.shift {
             self.selection.set_head(offset);
             self.selection.remember_column(self.buffer.char_column(offset));

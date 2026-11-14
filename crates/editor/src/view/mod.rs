@@ -36,6 +36,10 @@ pub(crate) use render::merge_highlights;
 // unused 警告 → 按测试门控（render.rs 内在用法直接引用同模块函数，不受影响）。
 #[cfg(test)]
 pub(crate) use render::char_align_highlights;
+// `bracket_guide_color` 单源取色（E3 封口）：生产消费方经 `editing` 同模块/兄弟模块直接
+// 调用；仅测试封口经此路径消费 → 按测试门控（防非测试构建 unused 警告）。
+#[cfg(test)]
+pub(crate) use editing::bracket_guide_color;
 
 use std::{
     cell::Cell,
@@ -60,6 +64,7 @@ use gpui::{
 
 use crate::editor::markdown::MarkdownDecor;
 use crate::editor::fold::{
+    BracketChar,
     BracketPair,
     Fold,
     FoldMap,
@@ -72,6 +77,8 @@ use crate::editor::{
     Buffer,
     Selection,
 };
+
+use config::layout::BracketGuidesMode;
 
 /// 代码行高亮回看行数（多行注释/字符串上下文不错位）。
 const HL_LOOKBACK_LINES: usize = 16;
@@ -483,12 +490,24 @@ pub struct CodeEditor {
     /// 跨行括号配对（括号标尺竖线）：`{()}`/`[]`/`()` 每条跨行配对一根竖线，
     /// 从开括号列画到闭括号行。≤ 200k 行整篇扫描，随编辑/行数变化增量维护。
     bracket_pairs: Vec<BracketPair>,
+    /// 括号**字符**嵌套层级表（括号文本着色，对齐 VS Code bracketPairColorization）：
+    /// 与 `bracket_pairs` 同一次扫描落地（≤ 200k 行整篇维护、随编辑增量平移），按
+    /// `(line, col)` 升序。`build_rows` 按行二分取出该行括号字符、用
+    /// `bracket_guide_palette[depth % 3]` 覆前景色（与引导线同色池）。
+    bracket_char_depths: Vec<BracketChar>,
     /// （增量用）本次落地扫描时 fold 扫描器的「栈清空边界」行（升序）。从任一
     /// 边界以全新状态续扫与整篇扫描逐位一致，是增量重算的断点来源（见
     /// [`crate::editor::fold::scan_fold_segment`]）。
     fold_boundaries: Vec<usize>,
     /// （增量用）括号扫描器的「栈空 + 不在块注释内」边界行（升序），用途同上。
     bracket_boundaries: Vec<usize>,
+    /// （增量用）fold 扫描器的「入口栈快照」网格（行 → 处理前行状态）：**栈永不清空**
+    /// 文档（深嵌套/未闭括号）的替代断点，供增量起点还原 / 汇聚校验，不透明透传
+    /// （见 `crate::editor::fold::FoldSnapshot` 与 ⑦ 打字卡顿修复）。
+    fold_snapshots: Vec<(usize, crate::editor::fold::FoldSnapshot)>,
+    /// （增量用）括号扫描器的「入口栈快照」网格，用途同上（见
+    /// `crate::editor::fold::BracketSnapshot`）。
+    bracket_snapshots: Vec<(usize, crate::editor::fold::BracketSnapshot)>,
     /// 折叠候选 / 括号配对的**后台刷新**版本号：每次请求 +1；后台任务回来时若
     /// 版本已过期（期间又编辑/又请求）则丢弃旧结果、用最新快照重跑一轮。
     scan_epoch: u64,
@@ -508,21 +527,18 @@ pub struct CodeEditor {
     ruler_color: Hsla,
     /// 括号标尺竖线颜色（更淡的次要前景）。
     guide_color: Hsla,
-    /// 点击代码区域点亮的最内层括号块（`open_line`；`None` = 未点亮/已清除）。
-    /// 编辑（`apply_edit_synced`）与整篇替换（`reset_document`）会复位为 `None`。
-    active_guide_open: Option<usize>,
-    /// 点亮竖线颜色：主题强调蓝 `colors.accent.opacity(0.9)`（`refresh_metrics` 设置；
+    /// 点亮竖线颜色 = VSCode 默认 active 灰 `guide_active`（`refresh_metrics` 设置；
     /// **勿抽进 config**——用户已明确回滚过颜色抽取）。
     active_guide_color: Hsla,
+    /// 括号引导线 **3 色循环池**（bracket guides，VSCode 口径）：`refresh_metrics` 从
+    /// `theme colors.bracket_guide_palette` 拷贝；bracket 叠加层按 `depth % 3` 取色、
+    /// active 段 alpha 1.0 / inactive 0.3。与缩进引导线灰系（`guide_color`）区分两条线系。
+    bracket_guide_palette: [Hsla; 3],
     /// （仅测试）`apply_live_replay`（方案2 op 重放主路径）成功调用次数——每个测试的
     /// `CodeEditor` 都是新实例、字段从 0 起，比进程级静态计数在串行/并行测试下都确定。
     live_replay_calls: Cell<usize>,
     /// （仅测试）`apply_replaces`（行级 diff 兜底）非空调用次数——同上，实例级确定性。
     apply_replaces_calls: Cell<usize>,
-    /// （仅测试）`guide_pair_for_logical_row` 二分后回扫**实际检查**的配对步数（每次
-    /// 调用前清零）——证明「点击块内不再整表线性扫」，典型块内命中应为 O(1) 步。
-    #[cfg(test)]
-    guide_scan_steps: Cell<usize>,
     /// （仅测试）后台折叠候选/括号配对落地的**增量**次数（增量前提成立的刷新轮次）。
     #[cfg(test)]
     scan_inc_landings: Cell<usize>,
@@ -586,13 +602,34 @@ impl CodeEditor {
         &self.bracket_pairs
     }
 
-    /// 测试用：清空折叠候选与括号配对（验证后台刷新会重新落地）。
+    /// 测试用：括号字符层级表（只读）。
+    pub fn test_bracket_chars(&self) -> &[BracketChar] {
+        &self.bracket_char_depths
+    }
+
+    /// 测试用：括号引导线 3 色循环池（只读；行着色与引导线同池断言用）。
+    pub fn test_bracket_guide_palette(&self) -> [Hsla; 3] {
+        self.bracket_guide_palette
+    }
+
+    /// 逻辑行 `logical` 的括号字符在 [`Self::bracket_char_depths`] 中的下标段
+    /// `[start, end)`（表按 `(line, col)` 升序 ⇒ 同行字符连续一段）。无 → 空 range。
+    /// `build_rows` 用它按行 O(log n) 二分取出该行括号字符做前景覆色；无括号行零分配。
+    fn bracket_chars_on_line(&self, logical: usize) -> std::ops::Range<usize> {
+        let start = self.bracket_char_depths.partition_point(|c| c.line < logical);
+        let end = self.bracket_char_depths.partition_point(|c| c.line <= logical);
+        start..end
+    }
+
+    /// 测试用：清空折叠候选与括号配对/字符（验证后台刷新会重新落地）。
     pub fn test_clear_fold_brackets(&mut self) {
         self.fold_candidates.clear();
         self.bracket_pairs.clear();
+        self.bracket_char_depths.clear();
     }
 
     /// 测试用：括号标尺在当前视口的竖线段 `(x, y_rel, h)`（文本区本地坐标）。
+    /// `mode` = [`BracketGuidesMode`]（Active = 仅活动括对；All = 全部括对）。
     pub fn test_bracket_guide_segments(
         &self,
         top_vis: usize,
@@ -601,24 +638,74 @@ impl CodeEditor {
         sf: f32,
         harea_w: f32,
         view_h: f32,
+        mode: BracketGuidesMode,
     ) -> Vec<(f32, f32, f32)> {
-        self.bracket_guide_segments(top_vis, off, lh, sf, harea_w, view_h)
+        self.bracket_guide_segments(top_vis, off, lh, sf, harea_w, view_h, mode)
     }
 
-    /// 测试用：当前点亮的标尺块（`open_line`，`None` = 未点亮）。
-    pub fn test_active_guide(&self) -> Option<usize> {
-        self.active_guide_open
+    /// 测试用：缩进引导线在当前视口的竖线段 `(x, y_rel, h)`（§8 视觉主源）。
+    pub fn test_indent_guide_segments(
+        &self,
+        top_vis: usize,
+        off: f32,
+        lh: f32,
+        sf: f32,
+        harea_w: f32,
+        view_h: f32,
+    ) -> Vec<(f32, f32, f32)> {
+        self.indentation_guide_segments(top_vis, off, lh, sf, harea_w, view_h)
     }
 
-    /// 测试用：逻辑行 `logical` 应命中的最内层括号块（`open_line`）。
-    pub fn test_guide_for_logical_row(&self, logical: usize) -> Option<usize> {
-        self.guide_pair_for_logical_row(logical)
+    /// 测试用：缩进引导线带 active 高亮位的竖线段 `(x, y_rel, h, is_active)`。
+    /// `active` = Option<(active_col, 块区间可视开行, 块区间可视闭行, 光标可视行)>
+    /// （§8.3：active 列在块区间内含光标可视行的连续段整段点亮）。无 bracket 让位。
+    pub fn test_indent_guide_segments_flagged(
+        &self,
+        top_vis: usize,
+        off: f32,
+        lh: f32,
+        sf: f32,
+        harea_w: f32,
+        view_h: f32,
+        active: Option<(usize, usize, usize, usize)>,
+    ) -> Vec<(f32, f32, f32, bool)> {
+        self.indentation_guide_segments_flagged(top_vis, off, lh, sf, harea_w, view_h, active, &[])
     }
 
-    /// 测试用：最近一次 `guide_pair_for_logical_row` 二分后回扫**实际检查**的配对步数。
-    #[cfg(test)]
-    pub fn test_guide_scan_steps(&self) -> usize {
-        self.guide_scan_steps.get()
+    /// 测试用：缩进引导线带 active + bracket 让位表 `suppress: &[(可视行, 引导列)]`
+    /// （括对行不点亮 active、括对引导列不画灰线；见 `bracket_guide_suppress`）。
+    pub fn test_indent_guide_segments_flagged_suppressed(
+        &self,
+        top_vis: usize,
+        off: f32,
+        lh: f32,
+        sf: f32,
+        harea_w: f32,
+        view_h: f32,
+        active: Option<(usize, usize, usize, usize)>,
+        suppress: &[(usize, usize)],
+    ) -> Vec<(f32, f32, f32, bool)> {
+        self.indentation_guide_segments_flagged(
+            top_vis, off, lh, sf, harea_w, view_h, active, suppress,
+        )
+    }
+
+    /// 测试用：可视窗口括号（按模式）→ 缩进让位表 `(可视行, 引导列)`（C3，见
+    /// `bracket_guide_suppress`；渲染 overlay 与缩进段化同源）。`mode` = [`BracketGuidesMode`]。
+    pub fn test_bracket_guide_suppress(
+        &self,
+        top_vis: usize,
+        view_h: f32,
+        lh: f32,
+        mode: BracketGuidesMode,
+    ) -> Vec<(usize, usize)> {
+        self.bracket_guide_suppress(top_vis, view_h, lh, mode)
+    }
+
+    /// 测试用：直接设横向滚动（格），供 hscroll 平移/裁剪断言（生产同一条
+    /// `set_hscroll` → `hscroll_px()` 路径）。
+    pub fn test_set_hscroll(&mut self, cols: usize) {
+        self.set_hscroll(cols);
     }
 
     /// 测试用：`line` 是否起始一个可折叠候选/激活折叠（gutter 指示器口径）。

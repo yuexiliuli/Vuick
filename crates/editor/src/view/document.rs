@@ -116,21 +116,25 @@ impl CodeEditor {
             folds: FoldMap::new(),
             fold_candidates: Vec::new(),
             bracket_pairs: Vec::new(),
+            bracket_char_depths: Vec::new(),
             fold_boundaries: Vec::new(),
             bracket_boundaries: Vec::new(),
+            fold_snapshots: Vec::new(),
+            bracket_snapshots: Vec::new(),
             scan_epoch: 0,
             scan_inflight: false,
             scan_dirty_edit: false,
             scan_pending_edit: None,
             scan_multi_edit: false,
             ruler_color: ui::theme::Theme::light().colors.fg_muted.opacity(0.55).into(),
-            guide_color: ui::theme::Theme::light().colors.fg_muted.opacity(0.4).into(),
-            active_guide_open: None,
-            active_guide_color: ui::theme::Theme::light().colors.accent.opacity(0.9).into(),
+            guide_color: ui::theme::Theme::light().colors.guide_inactive.into(),
+            active_guide_color: ui::theme::Theme::light().colors.guide_active.into(),
+            bracket_guide_palette: ui::theme::Theme::light()
+                .colors
+                .bracket_guide_palette
+                .map(|c| c.into()),
             live_replay_calls: Cell::new(0),
             apply_replaces_calls: Cell::new(0),
-            #[cfg(test)]
-            guide_scan_steps: Cell::new(0),
             #[cfg(test)]
             scan_inc_landings: Cell::new(0),
             #[cfg(test)]
@@ -289,8 +293,6 @@ impl CodeEditor {
         // O(1)）+ version，`Buffer::new` 后 version 归零、id 必新，也不会命中上一份
         // 文档的样式区间，`scan_window` 首扫即身份 miss → 按新文档自愈（M0.3；勿再手加
         // `md_decor.clear()` 兜底；命中帧零重哈希）。
-        // 整篇替换：点亮标尺清除（内容已变，旧“所属块”提示无意义）。
-        self.active_guide_open = None;
         // 滚动目标回零（新文档从头开始；分帧增长中的深跳占位也随之复位）。
         self.desired_scroll.set(0.);
         // 整篇替换 = 新文档：就绪前暂存的旧滚动目标逻辑行失效，一并清位。
@@ -433,15 +435,18 @@ impl CodeEditor {
         }
         self.scan_dirty_edit = false;
         let rope = self.buffer.text();
-        let (folds, brackets, nfb, npb, was_incremental) =
+        let (folds, brackets, bracket_chars, nfb, npb, nfsnaps, nbsnaps, was_incremental) =
             crate::editor::fold::compute_fold_brackets(
                 |r| crate::editor::buffer::line_shared(rope, r),
                 self.row_count,
                 SCAN_LIMIT,
                 &self.fold_candidates,
                 &self.bracket_pairs,
+                &self.bracket_char_depths,
                 &self.fold_boundaries,
                 &self.bracket_boundaries,
+                &self.fold_snapshots,
+                &self.bracket_snapshots,
                 self.scan_pending_edit,
                 self.scan_multi_edit,
             );
@@ -449,8 +454,12 @@ impl CodeEditor {
         self.fold_candidates.sort_by_key(|f| f.start);
         self.bracket_pairs = brackets;
         self.bracket_pairs.sort_by_key(|p| p.open_line);
+        self.bracket_char_depths = bracket_chars;
+        self.bracket_char_depths.sort_by_key(|c| (c.line, c.col));
         self.fold_boundaries = nfb;
         self.bracket_boundaries = npb;
+        self.fold_snapshots = nfsnaps;
+        self.bracket_snapshots = nbsnaps;
         self.scan_pending_edit = None;
         self.scan_multi_edit = false;
         if was_incremental {
@@ -575,8 +584,6 @@ impl CodeEditor {
     pub(super) fn apply_edit_synced(&mut self, range: Range<usize>, text: &str) -> crate::editor::buffer::Edit {
         // WY_TRACE breakdown：编辑主链「缓冲应用」段（O(log n) Rope 编辑 + 高亮增量登记）。
         let _t_apply = crate::prof::begin();
-        // 编辑会改变块结构/跨度：清除熄灭点亮标尺（语义见 guide click highlight）。
-        self.active_guide_open = None;
         // 先取被替换区间的**编辑前**行跨度（折叠区间同步需要，编辑后行号已变）。
         let prev_rows = self.row_count;
         let line_a = self.buffer.line_of_offset(range.start);

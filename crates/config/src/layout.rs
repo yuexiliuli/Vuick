@@ -55,9 +55,43 @@ pub const BRACKET_GUIDE_OPEN_HEAD_LINES: f32 = 0.0;
 /// 括号标尺竖线宽度（px）：普通（未点亮）竖线。
 pub const BRACKET_GUIDE_WIDTH: f32 = 1.0;
 
-/// 括号标尺**点亮**竖线宽度（px）：点击代码区域后高亮的最内层块竖线。
+/// 括号标尺**当前块**竖线宽度（px）：光标（selection.head）实时派生所在最内层括号块
+/// 的体并高亮该块竖线（2026-11-14 块体模型，非点击写路径）。
 /// 与普通竖线等宽（1px），高亮仅靠强调色区分，不额外加粗、不喧宾夺主。
 pub const BRACKET_GUIDE_ACTIVE_WIDTH: f32 = 1.0;
 
 /// 底部状态栏高度（px）。
 pub const STATUS_BAR_H: f32 = 23.0;
+
+// ---------------------------------------------------------------------------
+// 缩进引导线（indentation guides，§8 视觉主源）/ 括号竖线可选叠加开关
+// ---------------------------------------------------------------------------
+
+/// 缩进引导线（VS Code indentation guides）的 indentSize：`level = ceil(缩进units/is)`，
+/// 竖线画在 0,is,2is,…（1-based c1、c1+is、…）0-based 列。单源常量，未来按
+/// buffer/settings 配置时只换此一处（换算公式不变）。行首空格=1、Tab=4 与
+/// tabSize=4 一致（`leading_indent().units()`），换算零歧义。
+pub const INDENT_GUIDE_INDENT_SIZE: usize = 4;
+
+/// 括号竖线（bracket guides）渲染模式，对齐 VS Code `editor.guides.bracketPairs`：
+/// - [`BracketGuidesMode::Off`]（默认）= **不画括对彩色竖线**，只保留横向钩线
+///   （`ce-bracket-hook-open/-close`，`bracketPairsHorizontal:'active'` 口径、仅严格含
+///   光标的活动括对）；缩进引导线（灰/active）全量回显、不受括对抑制。用户真机口径
+///   （2026-11-14）：彩色「全部括对竖线」（且跨度含开行）盖在缩进 active 高亮之上是
+///   错乱之源，默认关闭；
+/// - [`BracketGuidesMode::Active`] = **仅活动括对**产彩色竖线 + 钩线，其余括对不产线、
+///   其所在列灰缩进线正常显示/共存（VSCode `bracketPairs:'active'`，可留作中间态比较）；
+/// - [`BracketGuidesMode::All`] = 全部括对产线（VSCode `bracketPairs:'always'`，对比用）。
+/// 括号配对段扫描与纯函数测试全部保留（历史规范见 docs/bracket-guide-redesign.md §8.4；
+/// 终稿块体口径见 editor 侧 active_pair / active_guide_group doc，2026-11-14 用户实测）。
+/// 常量翻转即还原，行为零丢。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BracketGuidesMode {
+    /// 不画括对彩色竖线（只留横向钩线与全量灰/active 缩进引导线）。
+    Off,
+    /// 仅活动括对渲染（VSCode `bracketPairs:'active'` 口径，中间态）。
+    Active,
+    /// 所有括对渲染（VSCode `bracketPairs:'always'`，对比用）。
+    All,
+}
+pub const BRACKET_GUIDES_MODE: BracketGuidesMode = BracketGuidesMode::Off;

@@ -28,6 +28,15 @@ use super::{
     LIST_WINDOW_ROWS,
 };
 
+/// 渲染行吸附行距（pitch）：`ceil(lh − 0.5)` 夹低到 ≥1.0——rhtz 正值变体
+/// （`ceil(lh·sf−0.5)`，实证 = taffy 预吸附）。入参为**已按 `sf` 缩放**的行高：
+/// 逻辑行距 = `pitch_for_line_height(lh * sf) / sf`；设备像素行距 =
+/// `pitch_for_line_height(lh * sf)`（见 `snap_guide_extent`）。段几何四方共用，
+/// 防同一吸附公式逐处复制再漂移。
+pub(crate) fn pitch_for_line_height(lh: f32) -> f32 {
+    ((lh - 0.5).ceil()).max(1.0)
+}
+
 impl CodeEditor {
 
     /// 列表视口高（px，测试断言用：List 必须撑满容器，否则可见行数为 0）。
@@ -213,10 +222,15 @@ impl CodeEditor {
         // 垂直标尺线：次要前景（与行号同源、已验证明暗主题都可见；不用 `border`——
         // 主题默认可能为透明）。细微参考线不刺眼。
         self.ruler_color = colors.fg_muted.opacity(0.55).into();
-        // 括号标尺竖线：更淡，纯视觉参考不干扰阅读。
-        self.guide_color = colors.fg_muted.opacity(0.4).into();
-        // 点亮竖线（guide click highlight）：主题强调蓝 `colors.accent`（用户口径，勿抽 config）。
-        self.active_guide_color = colors.accent.opacity(0.9).into();
+        // 缩进引导线竖线：VSCode 默认灰（非 active 档，走 ui::theme `guide_inactive`，
+        // 2026-11-14「完全对齐 VSCode 默认主题」）。
+        self.guide_color = colors.guide_inactive.into();
+        // 点亮竖线（active 纯缩进组高亮）= VSCode 默认 active 灰 `guide_active`（用户口径
+        // 「完全对齐 VSCode 默认主题」；曾经的强调蓝 accent × alpha 与顶部 L 形横线均已去除）。
+        self.active_guide_color = colors.guide_active.into();
+        // 括号引导线 3 色循环池（bracket guides，VSCode 口径）：`[Rgba; 3]` → `[Hsla; 3]`
+        // 拷贝，bracket 叠加层按 `depth % 3` 取色（见 `bracket_guide_palette` 字段）。
+        self.bracket_guide_palette = colors.bracket_guide_palette.map(|c| c.into());
         // 光标不能用 colors.accent：Light 主题 accent = #005fb8 蓝，白底上对比足够，
         // 但沿用既有口径用前景墨色，明/暗主题下都一定可见。
         self.caret_color = colors.fg.into();
@@ -585,6 +599,14 @@ impl CodeEditor {
         (-self.h_handle.offset().x.as_f32()).max(0.)
     }
 
+    /// 列（宽度单位）→ **逻辑 px**（`col × char_width − hscroll_px`，editor 本地 x；不带
+    /// 行号列偏移——调用方传给文本区本地叠层）。取整口径分层——竖线/缩进线上层自做
+    /// `.round()`、钩线上层再叠设备像素 snap（render.rs:412）——本函数只出逻辑 px 不改
+    /// 取整；竖线/缩进线/钩线三处 col→px 共用，防换算式再漂移（数值逐位不变）。
+    pub(super) fn col_to_px(&self, col: usize) -> f32 {
+        col as f32 * self.char_width.as_f32().max(1.) - self.hscroll_px()
+    }
+
     /// 垂直标尺第 `col`（宽度单位列）列在**editor 本地 x**（px）。标尺随内容横向
     /// 滚动（方案 A）；移出文本区右缘或左滚出文本区（< 行号列右缘）→ `None`（被
     /// 裁掉/不可见）。`avail_w` = 编辑区可视宽（文本区右界）。
@@ -597,7 +619,8 @@ impl CodeEditor {
         if view_w <= 0. {
             return None;
         }
-        let x = gutter + col as f32 * self.char_width.as_f32() - self.hscroll_px();
+        // col→px 复用 `col_to_px`（`col·cw − hscroll`，取整口径同源），gutter 偏移单独加。
+        let x = gutter + self.col_to_px(col);
         if x >= gutter && x < gutter + view_w {
             Some(x.round().max(gutter))
         } else {
