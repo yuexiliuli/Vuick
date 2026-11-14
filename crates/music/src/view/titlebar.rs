@@ -86,7 +86,7 @@ fn ctrl_button(window: &mut Window, cx: &mut App, kind: Ctl) -> AnyElement {
     // `title_ctrl_fg`；注意 IconView/ui 显式 `text_color` 会覆盖父级级联，必须在分支里定）。
     let icon_color = if hovered || pressed {
         if kind.is_close() {
-            gpui::white()
+            theme::text()
         } else {
             theme::text()
         }
@@ -194,7 +194,7 @@ pub fn render(window: &mut Window, cx: &mut App) -> AnyElement {
                 .child(
                     Icon::new(IconName::Disc)
                         .size(px(10.))
-                        .text_color(gpui::white()),
+                        .text_color(theme::text()),
                 ),
         )
         .child(

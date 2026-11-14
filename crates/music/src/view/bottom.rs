@@ -242,7 +242,7 @@ impl BottomBarView {
                     .child(
                         Icon::new(IconName::Note)
                             .size(px(22.))
-                            .text_color(gpui::white().opacity(0.4)),
+                            .text_color(theme::white_fade_40()),
                     )
                     .into_any_element(),
             ]
@@ -456,7 +456,7 @@ impl BottomBarView {
                     self.tip_cells.get("bb-play").cloned().unwrap_or_default(),
                 ),
             )
-            .child(IconView::new(icon).size(px(20.)).text_color(gpui::white()))
+            .child(IconView::new(icon).size(px(20.)).text_color(theme::text()))
             .into_any_element()
     }
 

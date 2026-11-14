@@ -158,9 +158,9 @@ impl super::MusicView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::white().opacity(if hovered { 0.12 } else { 0.06 }))
+            .bg(if hovered { theme::white_fade_12() } else { theme::white_fade_06() })
             .border_1()
-            .border_color(gpui::white().opacity(0.08))
+            .border_color(theme::white_fade_08())
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
             .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
@@ -194,15 +194,15 @@ impl super::MusicView {
             .items_center()
             .justify_center()
             .bg(if hovered {
-                gpui::hsla(5., 0.6, 0.55, 0.22)
+                theme::danger_close_bg()
             } else {
-                gpui::white().opacity(0.08)
+                theme::white_fade_08()
             })
             .border_1()
             .border_color(if hovered {
-                gpui::hsla(5., 0.6, 0.6, 0.3)
+                theme::danger_close_border()
             } else {
-                gpui::white().opacity(0.12)
+                theme::white_fade_12()
             })
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
@@ -214,7 +214,7 @@ impl super::MusicView {
                 Icon::new(IconName::FullscreenExit)
                     .size(px(20.))
                     .text_color(if hovered {
-                        gpui::hsla(5., 0.7, 0.7, 1.)
+                        theme::danger_close_icon()
                     } else {
                         theme::text2()
                     }),
@@ -299,7 +299,7 @@ impl super::MusicView {
                         .child(
                             Icon::new(IconName::Note)
                                 .size(px(80.))
-                                .text_color(gpui::white().opacity(0.12)),
+                                .text_color(theme::white_fade_12()),
                         ),
                 )
                 .into_any_element(),
@@ -428,7 +428,7 @@ impl super::MusicView {
             .thumb(Some(SliderThumb {
                 base: 0.0,
                 hover: 6.0,
-                color: gpui::white(),
+                color: theme::text(),
                 glow: Some(theme::accent()),
                 opacity_base: 0.0,
                 opacity_hover: 1.0,
@@ -610,7 +610,7 @@ impl super::MusicView {
             .child(
                 IconView::new(icon)
                     .size(px(28.))
-                    .text_color(gpui::white()),
+                    .text_color(theme::text()),
             )
             .into_any_element()
     }

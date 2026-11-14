@@ -366,19 +366,19 @@ impl LyricsView {
         let (size, color, bg, weight) = match state {
             LyricState::Active => (
                 px(17.),
-                gpui::white(),
+                theme::text(),
                 theme::accent().opacity(0.10),
                 Some(gpui::FontWeight::BOLD),
             ),
             LyricState::Past => (
                 px(15.),
-                gpui::white().opacity(0.13),
+                theme::white_fade_13(),
                 gpui::transparent_black(),
                 None,
             ),
             LyricState::Future => (
                 px(15.),
-                gpui::white().opacity(0.24),
+                theme::white_fade_24(),
                 gpui::transparent_black(),
                 None,
             ),

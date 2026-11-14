@@ -94,7 +94,7 @@ pub fn vinyl_ring_at(
         .w(px(diameter))
         .h(px(diameter))
         .path(mark)
-        .text_color(gpui::white().opacity(0.06));
+        .text_color(theme::white_fade_06());
     if playing {
         ring.with_animation(
             prefix,

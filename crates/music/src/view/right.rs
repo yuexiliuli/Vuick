@@ -97,7 +97,7 @@ impl super::MusicView {
                             .cursor(CursorStyle::PointingHand)
                             .bg(if active { theme::accent() } else { theme::bg_secondary() })
                             .text_size(px(12.))
-                            .text_color(if active { gpui::white() } else { theme::text2() })
+                            .text_color(if active { theme::text() } else { theme::text2() })
                             .on_click(cl)
                             .on_hover(self.hover_tip_listener(cx, key, label))
                             .child(theme::bounds_canvas(self.tip_box_cell(key)))
@@ -152,6 +152,7 @@ impl super::MusicView {
                         .child(
                             Icon::new(IconName::Note)
                                 .size(px(64.))
+                                // 合法保留：压渐变/封面底上的白低透明（0.15），压底需裸白不换 token。
                                 .text_color(gpui::white().opacity(0.15)),
                         ),
                 )
@@ -281,7 +282,7 @@ impl super::MusicView {
             .child(
                 IconView::new(icon)
                     .size(px(26.))
-                    .text_color(gpui::white()),
+                    .text_color(theme::text()),
             )
             .into_any_element()
     }
@@ -395,7 +396,7 @@ impl super::MusicView {
                                     .child(
                                         Icon::new(IconName::Note)
                                             .size(px(17.))
-                                            .text_color(gpui::white().opacity(0.4)),
+                                            .text_color(theme::white_fade_40()),
                                     ),
                             ),
                     )
@@ -495,7 +496,7 @@ impl super::MusicView {
                                     .child(
                                         Icon::new(IconName::Note)
                                             .size(px(15.))
-                                            .text_color(gpui::white().opacity(0.4)),
+                                            .text_color(theme::white_fade_40()),
                                     ),
                             ),
                     )

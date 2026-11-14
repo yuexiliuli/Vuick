@@ -10,6 +10,8 @@ use gpui::{
     LayoutId, Pixels, Style, Window, px,
 };
 
+use super::theme;
+
 /// 音乐播放器 UI 用到的本地图标全集（Slice2 后仅剩未迁 ui 的 8 项；其余已迁
 /// `ui::IconName`，走 `ui::icon::Icon`）。按需扩充，Feather/Material 混合路径。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -83,7 +85,7 @@ impl IconView {
         Self {
             name,
             size: px(16.),
-            color: gpui::white(),
+            color: theme::text(),
         }
     }
 

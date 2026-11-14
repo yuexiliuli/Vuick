@@ -75,7 +75,7 @@ impl super::MusicView {
                     .child(
                         Icon::new(IconName::Disc)
                             .size(px(20.))
-                            .text_color(gpui::white()),
+                            .text_color(theme::text()),
                     ),
             )
             .child(
@@ -271,7 +271,7 @@ impl super::MusicView {
                             )),
                     )
                     .child(div().text_size(px(14.)).font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(gpui::white()).child("K")),
+                        .text_color(theme::text()).child("K")),
             )
             .child(
                 div()

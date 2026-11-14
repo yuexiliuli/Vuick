@@ -118,6 +118,54 @@ pub fn blue() -> Hsla {
     c(BLUE)
 }
 
+// ---- 白弱化 token（2026-11-14 收编：生产视图裸 `white().opacity(x)` 迁移） ----
+// 与 text2/text3 的关系：text2/text3 是「不透明灰紫」，与「白 × 透明度」各档位色值
+// 不严格相等，直接替换会引入观感偏移；故逐档收编为固定 token，值与原裸白完全相同
+// （零观感变化是硬约束）。
+
+/// 白 × 6%（全屏控制钮常态底 / 唱片环线）。
+pub fn white_fade_06() -> Hsla {
+    gpui::white().opacity(0.06)
+}
+/// 白 × 8%（全屏控制钮描边 / 关闭钮常态底）。
+pub fn white_fade_08() -> Hsla {
+    gpui::white().opacity(0.08)
+}
+/// 白 × 12%（全屏控制钮 hover 底 / 封面占位音符）。
+pub fn white_fade_12() -> Hsla {
+    gpui::white().opacity(0.12)
+}
+/// 白 × 13%（歌词已播句）。
+pub fn white_fade_13() -> Hsla {
+    gpui::white().opacity(0.13)
+}
+/// 白 × 24%（歌词未来句）。
+pub fn white_fade_24() -> Hsla {
+    gpui::white().opacity(0.24)
+}
+/// 白 × 40%（歌曲封面占位音符）。
+pub fn white_fade_40() -> Hsla {
+    gpui::white().opacity(0.4)
+}
+/// 白 × 50%（列表缩略图占位音符）。
+pub fn white_fade_50() -> Hsla {
+    gpui::white().opacity(0.5)
+}
+
+// ---- 全屏关闭钮危险红（2026-11-14 收编：裸 `hsla(5,…)` 迁移，值相同） ----
+/// 关闭钮 hover 底：`hsla(5, 0.6, 0.55, 0.22)`。
+pub fn danger_close_bg() -> Hsla {
+    gpui::hsla(5., 0.6, 0.55, 0.22)
+}
+/// 关闭钮 hover 描边：`hsla(5, 0.6, 0.6, 0.3)`。
+pub fn danger_close_border() -> Hsla {
+    gpui::hsla(5., 0.6, 0.6, 0.3)
+}
+/// 关闭钮 hover 图标：`hsla(5, 0.7, 0.7, 1.)`（不透明危险红）。
+pub fn danger_close_icon() -> Hsla {
+    gpui::hsla(5., 0.7, 0.7, 1.)
+}
+
 /// 深紫玻璃遮罩（toast 底）：原型 `.toast { background: rgba(20,17,50,0.92) }`
 /// → 0.92×255≈235=0xeb，编码 `0x141132eb`。
 pub fn glass() -> Hsla {
@@ -309,5 +357,36 @@ mod tests {
             pressed.r < hover.r && pressed.g < hover.g && pressed.b < hover.b,
             "关闭按压红应比 hover 红深一档"
         );
+    }
+
+    #[test]
+    fn white_fade_tokens_keep_exact_alpha() {
+        // 收编硬约束：白弱化 token 必须与迁移前的裸 `white().opacity(x)` 逐档同值
+        //（零观感变化）；此处钉死透明度，防后续重建 token 时漂移。
+        let cases = [
+            (white_fade_06(), 0.06),
+            (white_fade_08(), 0.08),
+            (white_fade_12(), 0.12),
+            (white_fade_13(), 0.13),
+            (white_fade_24(), 0.24),
+            (white_fade_40(), 0.4),
+            (white_fade_50(), 0.5),
+        ];
+        for (hsla, a) in cases {
+            assert_eq!(hsla.a, a, "透明度应精确等于 {a}");
+        }
+    }
+
+    #[test]
+    fn danger_close_tokens_keep_claimed_hsl() {
+        // 全屏关闭钮危险红三件套：钉死迁移前裸 `hsla(5,…)` 的**解析后实际值**。
+        // 注：gpui `hsla()` 的 hue 取 [0,1] 并 clamp（`color.rs:424`），原字面 `5.`
+        // 即被 clamp 成 1.0（红）；token 与原字面逐位相同，故断言 1.0（红）而非 5.0。
+        let bg = danger_close_bg();
+        assert_eq!((bg.h, bg.s, bg.l, bg.a), (1.0, 0.6, 0.55, 0.22), "bg {bg:?}");
+        let border = danger_close_border();
+        assert_eq!((border.h, border.s, border.l, border.a), (1.0, 0.6, 0.6, 0.3), "border {border:?}");
+        let icon = danger_close_icon();
+        assert_eq!((icon.h, icon.s, icon.l, icon.a), (1.0, 0.7, 0.7, 1.0), "icon {icon:?}");
     }
 }

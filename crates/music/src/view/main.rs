@@ -193,7 +193,7 @@ fn song_thumb_div(cover: Option<Arc<RenderImage>>, (light, dark): (gpui::Hsla, g
                     .child(
                         Icon::new(IconName::Note)
                             .size(px(18.))
-                            .text_color(gpui::white().opacity(0.5)),
+                            .text_color(theme::white_fade_50()),
                     ),
             )
             .into_any_element(),
@@ -605,7 +605,7 @@ impl super::MusicView {
                         .child(
                             Icon::new(IconName::Note)
                                 .size(px(44.))
-                                .text_color(gpui::white().opacity(0.4)),
+                                .text_color(theme::white_fade_40()),
                         ),
                 )
                 .into_any_element(),
@@ -635,7 +635,7 @@ impl super::MusicView {
                     .child(
                         IconView::new(MusicIcon::Play)
                             .size(px(20.))
-                            .text_color(gpui::white()),
+                            .text_color(theme::text()),
                     ),
             );
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
