@@ -40,8 +40,8 @@ const QUOTE_TEXT_INDENT_PX: f32 = 15.0;
 /// [`crate::paint::paint_text_row`] 在 paint 阶段按像素几何自绘，与预览 [`TextTrack::paint_code_ranges`]
 /// 同式；`code_inline_*` 单一源 [`crate::theme::WyTheme`] ← [`StyleParams`]）。
 /// 收敛自 `layout::text_runs` 单一 run 构造核心（字体/颜色/划线经 `TextRunDeco` 参数化；
-/// 本调用点传完整视觉装饰，`layout::font_runs` 只传字形维度——两处对拍由
-/// `layout::tests` parity 钉死，见 [`crate::layout::tests::parity_shard_height_sum_matches_shape_docrow`]）。
+/// 本调用点传完整视觉装饰，`layout::font_runs` 只传字形维度——两处几何对拍由
+/// `markdown_wysiwyg` 的 `layout_tests::parity_shard_height_sum_matches_shape_docrow` 保障）。
 #[allow(clippy::too_many_arguments)]
 pub fn runs_to_text_runs(
     text: &str,

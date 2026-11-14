@@ -4,11 +4,13 @@
 //! 宽/高/左缩进/行高系数，以及渲染身份：显示文本/runs/code_ranges/byte_map 段），
 //! 作为 Phase 2「两引擎共用单一几何真值」的第一个家。
 //!
-//! **本里程碑不改任何现有调用方**：WYSIWYG `wysiwyg::shape::shape_docrow` 与预览
-//! `view::row::render_*` 原样不动；本模块是新增面。落地方式 = 独立实现 + 逐值对拍：
-//! - 与 WYSIWYG：`Σ shard.h == shape_docrow(...).height`（`tests::parity_*` 钉死，逐块）；
-//! - 与预览：`shared_shard_height_matches_preview_row`（真实渲染 harness 实测对照，
-//!   放在 `markdown::view::tests`——见 `view/tests/layout_shared.rs`）。
+//! **dormancy 状态（P4-2/b4e614d 后）**：原第二消费方 MarkdownPreview 引擎已删除，本分片面
+//! **当前无生产消费者**，仅作 `shape_docrow` 的几何对拍护栏与 Phase-2 脚手架保留；
+//! `shape_docrow`（shape.rs）是唯一生产几何真值，勿改走本面（K24 dormancy）。
+//! **本里程碑不改任何现有调用方**：WYSIWYG `wysiwyg::shape::shape_docrow` 原样不动；
+//! 落地方式 = 独立实现 + 逐值对拍：
+//! - 与 WYSIWYG：`Σ shard.h == shape_docrow(...).height`（测试钉死，逐块）；
+//! - （原「与预览」对照 harness 已随预览引擎删除。）
 //!
 //! ## 语义口径（写死，供 Phase 2 对齐）
 //! - **高度** = WYSIWYG `shape/*` 的确定性公式（行高系数 × 折行段数 / 块公式），
