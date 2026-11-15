@@ -1,8 +1,8 @@
 <!--
 REFACTORED: 2026-10-18
 STYLE: LLM Protocol Body (v3)
-LAST_AUDIT_PATCH: 2026-11-13-001
-AUDIT_PATCH: 2026-11-14-004 (沉淀 K155-K160：视觉交付前置逐行期望表 / 用户实测数据>外部源码转写 / 大视觉功能默认低干扰+显式开关 / 子agent半途式返回按三合一核实 / 视觉分歧派确定性渲染取证test / 多夹具拟合唯一模型再一次性重写+zip对拍；本线交接收敛=括号块体模型，见 docs/bracket-pair-guides-parity-handover.md)
+LAST_AUDIT_PATCH: 2026-11-14-004
+AUDIT_PATCH: 2026-11-15-001 (沉淀 K167-K172：阻塞原生模态禁入持 App RefCell 事件帧 + async 回传姿势 / RefCell panic 取证 / 低置信模式派裁决 agent / 纯函数共享几何先测绘 / per-crate cfg 门留调用侧 / 整树 fmt 事故恢复模板；本线收交=UI 去重战役，见 docs/handover-2026-11-15-ui-dedup.md)
 -->
 
 # AGENTS.md（LLM 执行协议 v3）
@@ -399,6 +399,16 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | K164 | **只读映射（FIT/COUPLED 决策表）是「去重/收敛」类任务最高 ROI 前置**（2026-11-15 两批）：几何/交互去重先派 explore 逐站点出「结构 + 依赖 + 干净可迁/耦合」判定表，实现期零「强制迁移=行为回归」（P4 行 / P8 钮 / P5 滚动壳 / P2 hover / 2.4 状态轨迹 全受益）；报告里「看似重复」的站点大半是耦合的,先映射再动手省掉整轮返工。 |
 | K165 | **「刻意不互斥」的标记状态，先做组合态/状态轨迹分析再动,禁止直接收敛成互斥枚举**（2026-11-15 2.4）：md_wy_install 的 pending/pending_full/early 是「is_loaded ∧ 在装 ∧ 严格前缀」正交三轴（enum 必坏时序）；同理 loading_lock/md_restore_pending 属别实体/别语义。先按「一条开文件序列」画状态迁移 + 组合表，能证正交就别碰，只收敛真正单轴的部分（seq/在途/错误）。 |
 | K166 | **预存环境失败白名单在会话开头就进 brief/调度**（2026-11-15 batch-2）：`cargo check --workspace --tests` 因 `sum_tree` dev-deps（proptest/rand/ctor/log）解析失败不可用 → 一律逐 crate `-p X --tests` 门；pdf 全量套件有 poisoned-pdfium-lock 既有失败 → 只信 `view::tests` 子集；config 一条既有 unreachable-statement 告警。白名单列头，子 agent 遇之勿刑侦（K56 强化）。 |
+
+| K167 | **阻塞原生模态禁入持 gpui App RefCell 的事件帧**（2026-11-15 PDF 自定义背景色闪退）：`ChooseColorW` 类阻塞对话框在 `Context<EditorApp>`/listener 栈上同步弹 = 事件帧持 `App` RefCell（app.rs:164）＋模态消息泵同线程重入窗程（gpui_windows events.rs handle_msg：WM_TIMER→execute_runnable / 输入）→ 异步续体 `AsyncApp::update_entity` 二次 `app.borrow_mut()` → `async_context.rs:66` panic。标准姿势 = 后台线程弹框 + `futures::channel::oneshot` + `window.spawn(...).detach()` 回传主线程再落地（镜像 `file_tree_ops.rs` 的 window.prompt 与 gpui `show_dialog`；零新依赖）。git 证为**预存 bug**（首发 `4a97e03`，`ModuleSlot` 争句 `f93922d` 未触该链）。 |
+| K168 | **「RefCell already borrowed @ async_context.rs:60-67」取证路径**：= 主线程持有 App RefCell 期间同线程重入 `update_entity`。先查「持 borrow 的帧（事件/渲染）里有无阻塞调用（原生对话框/同步 File IO/长任务）」+「模态泵会排空 gpui 任务的窗程路径」；再 `git blame` 判预存/回归（禁猜）。诊断 agent 先给借用链 + 既有非阻塞参照（window.prompt），才派修复；headless 无法复现（cfg(not(test)) no-op）→ 真机复验收口（K26）。 |
+| K169 | **低置信/「先核实」模式 → 派裁决型 read-only agent，不派实现 agent**（2026-11-15 D/P16）：报告标「低-中/先确认」的候选（bind_local_keymaps 5 份、IME 薄壳）实现前先给「裁决 brief」：读实情 → 逐字节/逐语义判同 → 「真收敛 / 保持原样 + 证据」。D 与 P16 均以零改动正确收场（非真重复、已共享、唯一手写点是超集），省 2 个可能空返/负收益的实现轮。 |
+| K170 | **纯函数共享几何先「测绘 agent」逐行映射再实现**（K134 强化，P3/P6/P9 实证）：9+6+3 函数 / toc-files 整块 / pan 三人组的收敛 = 先出「逐行平行度映射表 + 真分支识别 + 不合并面 + 回归测试名单」→ 实现期零返工、评审直接对表；回归名单（测试名）进 brief、实现后逐名跑绿。 |
+| K171 | **per-crate `cfg(not(test))` 语义不可塞进共享 helper**（P4 实证）：门进 base → 依赖方 test 构建被隐式改变（后台定时器「复活」）。门留在调用侧；helper 只提公共骨架（weak_entity 升级 + 静默丢弃）。此类改动提交前主 agent 复核门的位置。 |
+| K172 | **整树 `cargo fmt` 污染事故恢复模板**（P4/P7 两次）：子 agent `cargo fmt -- <paths>` 实为整仓格式化（400+ 文件）。恢复：①先 `Copy-Item` 保存预期新文件 + `git diff` 存 patch；②`git checkout -- .` 全量还原；③主 agent 亲手重放预期文件；④提交前 `git status` === 预期集合。预防：fmt 禁令放 brief 第一行 ⚠️（本批后续 0 事故）。 |
+
+> **batch-2/3 时段账（2026-11-15，UI 去重战役续，转为交接 docs/handover-2026-11-15-ui-dedup.md）**：分析 5 explore 并行（值）；P1-P7 首批（P1/C/E 配评审抓「语义差异未被抹平」，值）；B/A/P5/D3 机械小批（低空返、零返工）；D/P16 两个「保持原样」裁决 agent（省 2 负收益轮）；P3 战役测绘→3 slice→评审零返工（K170）；PDF 自定义色闪退 = 预存 bug → 诊断钉借用链 → 后台线程回传修复。可避免 ≈2 轮：P4 的 cfg 门错位（→K171）、P7 的 fmt 未自恢复（→K172）。评审配比端到端执行到位（K146/K42），14 commits 全独立可编译、未推送。
+
 
 ## 6.5 复盘附录（2026-11-13 阅读进度/WYSIWYG 战役时段账）
 
