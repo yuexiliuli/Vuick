@@ -23,8 +23,7 @@ impl super::VideoViewer {
 
     /// 阅读画布底色（同 ImageViewer：亮 #F5F5F5 / 暗 #202020，中性灰阶、与外壳 `window_bg` 同源）。
     pub(super) fn default_canvas(cx: &App) -> Hsla {
-        let dark = ui::theme::Theme::global(cx).is_dark();
-        ui::theme::ChromeColors::for_mode(dark).window_bg.into()
+        ui::theme::window_bg(cx)
     }
 
 

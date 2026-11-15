@@ -567,6 +567,13 @@ impl Theme {
     }
 }
 
+/// 查看器画布默认底色：亮 #F5F5F5 / 暗 #202020（与外壳 `window_bg` 同源）。
+/// 收敛自 image_viewer / video / pdf 三处逐字一致的 `default_canvas`（下一批 P5）。
+pub fn window_bg(cx: &App) -> Hsla {
+    let dark = Theme::global(cx).is_dark();
+    ChromeColors::for_mode(dark).window_bg.into()
+}
+
 /// 状态栏语言徽标的「徽记色点」色相（VS Code 式按语言类别分类着色）。
 /// 只存色相（0..=1 圈，见 [`gpui::Hsla::h`]），饱和度/亮度由
 /// [`language_badge_color`] 统一派生，避免在状态栏组件里散落硬编码 `rgba`。
@@ -634,6 +641,18 @@ mod tests {
         cx.update(|cx| Theme::set(ThemeMode::Light, cx));
         cx.update(|cx| {
             assert!(!Theme::global(cx).is_dark());
+        });
+    }
+
+    #[gpui::test]
+    fn window_bg_follows_theme_mode(cx: &mut TestAppContext) {
+        // 查看器画布默认底色访问器：亮 = 外壳 window_bg 亮档 #F5F5F5、暗 = 暗档 #202020，
+        // 与 `default_canvas` 收编前逐字同源（image_viewer / video / pdf 共用）。
+        cx.update(|cx| {
+            Theme::set(ThemeMode::Light, cx);
+            assert_eq!(window_bg(cx), ChromeColors::for_mode(false).window_bg.into());
+            Theme::set(ThemeMode::Dark, cx);
+            assert_eq!(window_bg(cx), ChromeColors::for_mode(true).window_bg.into());
         });
     }
 
