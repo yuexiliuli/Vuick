@@ -37,7 +37,7 @@ impl ImeTextHost for WyEditor {
         self.caret = range.end.min(self.len());
         self.sel_anchor = Some(range.start.min(self.len()));
         // IME/平台改选区 → 静止期常亮（对齐 editor/ui 的 `set_selection_bytes` kick）。
-        self.kick_caret();
+        self.caret_phase.kick();
         *self.rd.borrow_mut().frame.borrow_mut() = None;
     }
 
@@ -69,7 +69,7 @@ impl ImeTextHost for WyEditor {
         self.caret = caret.min(self.len());
         // 组合内光标移动 → 静止期常亮（editor/ui 的默认实现经 `set_selection_bytes`
         // 间接 kick，这里与主支座直接对齐）。
-        self.kick_caret();
+        self.caret_phase.kick();
     }
 
     /// 落地编辑：`replace_range` 承载全部意图（undo 事务粒度按 `removed/text`

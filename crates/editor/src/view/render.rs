@@ -63,8 +63,8 @@ impl Render for CodeEditor {
         let lo = vis_top.saturating_sub(nrows);
         let last_v = self.folds.visual_line_count().saturating_sub(1);
         let hi = vis_top.saturating_add(nrows * 2).min(last_v);
-        let show_caret = self.caret_shown_now();
-        let rows = self.build_rows(window, lo, hi, vis_top, show_caret, self.focused);
+        let show_caret = self.caret.caret_shown_now();
+        let rows = self.build_rows(window, lo, hi, vis_top, show_caret, self.caret.focused);
 
         let (content_w_px, harea_w) = self.compute_content_width(avail_w);
 
@@ -572,10 +572,10 @@ impl CodeEditor {
         }
         // 补同步：应用启动时 window.focus() 发生在 on_focus 注册之前 → 事件丢失，
         // `focused` 永远是 false → 光标不显示但也无法输入。这里按当前焦点态对齐。
-        if self.focus_handle.is_focused(window) && !self.focused {
-            self.focused = true;
-            self.kick_caret();
-            if !self.blink_running {
+        if self.focus_handle.is_focused(window) && !self.caret.focused {
+            self.caret.focused = true;
+            self.caret.kick();
+            if !self.caret.blink_running {
                 self.start_blink(cx);
             }
             cx.notify();

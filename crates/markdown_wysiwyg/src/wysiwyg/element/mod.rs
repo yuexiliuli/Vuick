@@ -543,7 +543,7 @@ impl Element for WyEditorElement {
             let e = self.editor.read(cx);
             caret_bar_height(e, f)
         };
-        let caret_shown = self.editor.read(cx).caret_shown_now();
+        let caret_shown = self.editor.read(cx).caret_phase.caret_shown_now();
         if self.editor.read(cx).is_editable() && caret_on && caret_shown {
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(

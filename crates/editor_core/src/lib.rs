@@ -15,6 +15,7 @@
 #![allow(dead_code)] // 组件库公共 API：跨 crate 重导出面，未直接使用项不误报 dead_code
 
 pub mod buffer;
+pub mod caret;
 pub mod find;
 pub mod fold;
 pub mod goto;

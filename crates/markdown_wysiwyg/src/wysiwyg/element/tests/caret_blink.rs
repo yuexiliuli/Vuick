@@ -21,7 +21,7 @@ async fn caret_blinks_with_timer(cx: &mut TestAppContext) {
     let vcx: &mut VisualTestContext = vcx;
     let ed = host.read_with(vcx, |h, _| h.ed.clone());
     // 未聚焦：光标不画
-    let shown0 = vcx.update(|_, cx| ed.read(cx).caret_shown_now());
+    let shown0 = vcx.update(|_, cx| ed.read(cx).caret_phase.caret_shown_now());
     assert!(!shown0, "未聚焦 WYSIWYG 光标应不可见");
     // 聚焦 → 光标可见（静止期开始）、blink 循环启动。gpui 测试环境不派发真实
     // focus/blur 事件：`window.focus` 只置窗口焦点态，由 `sync_focus`（生产每帧
@@ -32,7 +32,11 @@ async fn caret_blinks_with_timer(cx: &mut TestAppContext) {
     });
     let (shown, running, visible) = vcx.update(|_, cx| {
         let e = ed.read(cx);
-        (e.caret_shown_now(), e.blink_running, e.caret_visible)
+        (
+            e.caret_phase.caret_shown_now(),
+            e.caret_phase.blink_running,
+            e.caret_phase.caret_visible,
+        )
     });
     assert!(shown, "聚焦后光标应可见");
     assert!(running, "聚焦后应启动 blink 循环");
@@ -43,20 +47,20 @@ async fn caret_blinks_with_timer(cx: &mut TestAppContext) {
     // 绕过静止期：`caret_pause_until` 基于真实墙钟 `Instant`，测试虚拟时钟推进
     // 不会让它流逝——置 None 让循环下一次 tick 直接翻转（对齐 ui/input.rs）。
     ed.update(cx, |e, _| {
-        e.caret_pause_until = None;
+        e.caret_phase.caret_pause_until = None;
     });
     cx.executor()
         .advance_clock(Duration::from_millis(500 + 10));
     cx.run_until_parked();
     let win = cx.windows()[0];
     let mut vcx2 = VisualTestContext::from_window(win, cx);
-    let after = vcx2.update(|_, cx| ed.read(cx).caret_visible);
+    let after = vcx2.update(|_, cx| ed.read(cx).caret_phase.caret_visible);
     assert!(!after, "光标可见性应随 blink 计时翻转（闪烁）");
     // 交互静止期：kick_caret 后短暂常亮（暂停期内不翻转）。
     vcx2.update(|_, cx| {
-        ed.update(cx, |e, _| e.kick_caret());
+        ed.update(cx, |e, _| e.caret_phase.kick());
     });
-    let paused_shown = vcx2.update(|_, cx| ed.read(cx).caret_shown_now());
+    let paused_shown = vcx2.update(|_, cx| ed.read(cx).caret_phase.caret_shown_now());
     assert!(paused_shown, "kick_caret 后静止期内光标应常亮");
     // 失焦：真正 blur 窗口焦点态 + sync_focus（对齐 ui/input.rs 的 on_blur 直测）。
     vcx2.update(|window, cx| {
@@ -74,7 +78,7 @@ async fn caret_blinks_with_timer(cx: &mut TestAppContext) {
     let mut vcx3 = VisualTestContext::from_window(win, cx);
     let (running2, shown2) = vcx3.update(|_, cx| {
         let e = ed.read(cx);
-        (e.blink_running, e.caret_shown_now())
+        (e.caret_phase.blink_running, e.caret_phase.caret_shown_now())
     });
     assert!(!running2, "失焦后 blink 循环应退出");
     assert!(!shown2, "失焦后光标应不可见");

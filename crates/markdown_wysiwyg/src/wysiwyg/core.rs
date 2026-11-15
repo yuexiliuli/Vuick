@@ -1,12 +1,18 @@
 use super::*;
 
-use std::time::Duration;
-
 use gpui::Pixels;
 use ime::ImeTextHost;
 use ropey::Rope;
 
 use crate::markdown::view::style::StyleParams;
+
+/// 本批 Pattern 1：`WyEditor` 以 `caret_phase` 字段作为光标闪烁相位状态机宿主，
+/// 供 `editor_core::caret::spawn_blink_loop` 的循环体经 `Entity` 更新访问。
+impl editor_core::caret::CaretOwner for WyEditor {
+    fn caret(&mut self) -> &mut editor_core::caret::CaretPhase {
+        &mut self.caret_phase
+    }
+}
 
 /// WyEditor 核心生命周期 / 文本 API / 选区 / 剪贴板 / IME 直输（M2.1 自 mod.rs 拆出）。
 impl WyEditor {
@@ -17,11 +23,8 @@ impl WyEditor {
         Self {
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),
-            focused: false,
-            caret_visible: false,
-            caret_pause_until: None,
-            blink_epoch: 0,
-            blink_running: false,
+            // 光标闪烁相位状态机（`flip_when_blurred=true`：失焦仍按定时器翻转，见 core.rs 策略）。
+            caret_phase: editor_core::caret::CaretPhase::new(true),
             focus_registered: false,
             caret: 0,
             loaded: false,
@@ -172,7 +175,7 @@ impl WyEditor {
 
     /// 当前是否聚焦（`track_focus` 事件态，paint 门控与 shell 测试共用）。
     pub fn is_focused(&self) -> bool {
-        self.focused
+        self.caret_phase.focused
     }
 
     /// 切 EPUB 阅读模式（EPUB 只读宿主）：标题默认居中（对齐 A 侧
@@ -711,7 +714,7 @@ impl WyEditor {
         self.last_edit = None;
         self.last_edit_at = None;
         // 光标移动 → 静止期常亮（blink 暂停，先亮住再继续闪）。
-        self.kick_caret();
+        self.caret_phase.kick();
         *self.rd.borrow_mut().frame.borrow_mut() = None;
     }
 
@@ -750,7 +753,7 @@ impl WyEditor {
         self.caret = off;
         self.sel_anchor = Some(off);
         // 点击落光标 → 静止期常亮（对齐 editor `on_mouse_down` 的 kick）。
-        self.kick_caret();
+        self.caret_phase.kick();
         self.dragging = true;
         *self.rd.borrow_mut().frame.borrow_mut() = None;
     }
@@ -763,7 +766,7 @@ impl WyEditor {
         let off = off.min(self.len());
         self.caret = off;
         // 拖选移动光标 → 静止期常亮（对齐 editor `on_mouse_move` 拖选期实时 kick）。
-        self.kick_caret();
+        self.caret_phase.kick();
         if self.sel_anchor.is_none() {
             self.sel_anchor = Some(off);
         }
@@ -778,7 +781,7 @@ impl WyEditor {
             self.sel_anchor = None;
         }
         // 拖选结束 → 静止期常亮。
-        self.kick_caret();
+        self.caret_phase.kick();
         *self.rd.borrow_mut().frame.borrow_mut() = None;
     }
 
@@ -786,79 +789,38 @@ impl WyEditor {
     pub(crate) fn select_all(&mut self) {
         self.sel_anchor = Some(0);
         self.caret = self.len();
-        self.kick_caret();
+        self.caret_phase.kick();
         *self.rd.borrow_mut().frame.borrow_mut() = None;
     }
 
     /* ---------- 光标闪烁（对齐编辑器 `CodeEditor` / ui 输入框同一模式） ---------- */
-
-    /// 当前帧光标是否应绘制：失焦不画；交互静止期内常亮；否则跟随闪烁翻转。
-    /// paint 的唯一光标相位（`caret_visible` 翻转由 blink 定时器驱动，非每帧计算）。
-    pub(crate) fn caret_shown_now(&self) -> bool {
-        if !self.focused {
-            return false;
-        }
-        let paused = self
-            .caret_pause_until
-            .is_some_and(|p| p.elapsed() < Duration::from_millis(BLINK_PAUSE_MS));
-        paused || self.caret_visible
-    }
-
-    /// 光标交互后常亮静止期（点击/键移/输入后先亮住再继续闪）。
-    pub(crate) fn kick_caret(&mut self) {
-        self.caret_visible = true;
-        self.caret_pause_until = Some(Instant::now());
-    }
+    // 本批 Pattern 1：状态字段 + 常量 + 循环 + kick + caret_shown_now + 翻转/keep
+    // 判定全部下沉 `editor_core::caret::CaretPhase`（收敛自 editor/interaction.rs 与
+    // 本文件两份同构实现）。这里只留薄调用 + 两处语义差异策略行。
 
     fn on_focus(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.focused = true;
-        self.kick_caret();
-        if !self.blink_running {
+        self.caret_phase.focused = true;
+        self.caret_phase.kick();
+        if !self.caret_phase.blink_running {
             self.start_blink(cx);
         }
         cx.notify();
     }
 
     fn on_blur(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.focused = false;
-        self.caret_visible = true;
+        self.caret_phase.focused = false;
+        // 语义差异 2（见 editor_core::caret 模块头）：wysiwyg 失焦显式让光标常亮
+        // （editor on_blur 不清 caret_visible）——该策略行留在此处，不并入状态机。
+        self.caret_phase.caret_visible = true;
         cx.notify();
     }
 
+    /// 薄调用：这里只在 `&mut self` 上下文**同步**置位 + 起循环（`begin_blink`
+    /// 返回本拍代号给循环体做 keep 判定；异步循环本体在 `editor_core::caret`）。
     fn start_blink(&mut self, cx: &mut Context<Self>) {
-        if self.blink_running {
-            return;
+        if let Some(epoch) = self.caret_phase.begin_blink() {
+            editor_core::caret::spawn_blink_loop::<Self>(epoch, cx);
         }
-        self.blink_running = true;
-        self.blink_epoch = self.blink_epoch.wrapping_add(1);
-        let epoch = self.blink_epoch;
-        cx.spawn(async move |this, cx| loop {
-            let elapsed = this
-                .update(cx, |this, _| {
-                    this.caret_pause_until
-                        .map_or(u128::MAX, |p| p.elapsed().as_millis())
-                })
-                .unwrap_or(u128::MAX);
-            if elapsed >= BLINK_PAUSE_MS as u128 {
-                // 定时器驱动翻转（500ms 一拍，非每帧重绘）；实体 notify → gpui 按
-                // 访问追踪作废宿主窗口（WyEditorElement 每帧 read 本实体已注册追踪）。
-                let _ = this.update(cx, |this, cx| {
-                    this.caret_visible = !this.caret_visible;
-                    cx.notify();
-                });
-            }
-            cx.background_executor()
-                .timer(Duration::from_millis(BLINK_MS))
-                .await;
-            let keep = this
-                .update(cx, |this, _| this.focused && epoch == this.blink_epoch)
-                .unwrap_or(false);
-            if !keep {
-                this.update(cx, |this, _| this.blink_running = false).ok();
-                break;
-            }
-        })
-        .detach();
     }
 
     /// 首次渲染注册焦点事件 + 每帧按窗口焦点态对齐（补应用启动时焦点先于注册的
@@ -871,9 +833,9 @@ impl WyEditor {
             self.focus_registered = true;
         }
         let focused = self.focus.is_focused(window);
-        if focused && !self.focused {
+        if focused && !self.caret_phase.focused {
             self.on_focus(window, cx);
-        } else if !focused && self.focused {
+        } else if !focused && self.caret_phase.focused {
             self.on_blur(window, cx);
         }
     }

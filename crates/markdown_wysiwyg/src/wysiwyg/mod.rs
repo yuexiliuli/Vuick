@@ -141,16 +141,10 @@ pub use crate::markdown::parse::recognition::LinkHit;
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Instant;
 
 use gpui::{Context, FocusHandle, Focusable, Hsla, Pixels, SharedString, Window, point, px};
 
 use super::doc::Doc;
-
-/// 光标闪烁周期（ms；对齐编辑器 `CodeEditor` / ui 输入框同款常量）。
-const BLINK_MS: u64 = 500;
-/// 光标交互后的常亮静止期（ms）：点击/键移/输入后先亮住再继续闪。
-const BLINK_PAUSE_MS: u64 = 300;
 
 /// 编辑卡片锚点（图片卡 / 数学卡共用一套 scaffold，收敛 image.rs 与 math_edit.rs 的
 /// 两份同构实现）：
@@ -247,11 +241,10 @@ pub struct WyEditor {
     focus: FocusHandle,
     /// —— 光标闪烁（对齐编辑器 `CodeEditor` / ui 输入框同一模式：聚焦启动、失焦
     /// 退出、epoch 防重、交互静止期常亮；定时器驱动翻转，非每帧重绘）——
-    focused: bool,
-    caret_visible: bool,
-    caret_pause_until: Option<Instant>,
-    blink_epoch: u64,
-    blink_running: bool,
+    /// 相位状态机收敛自 editor/interaction.rs 与 wysiwyg/core.rs 两份同构实现，
+    /// 全部下沉 `editor_core::caret::CaretPhase`（`flip_when_blurred=true`；字段名
+    /// `caret_phase` 规避与下方 `caret: usize` 源字节偏移同名的既有字段）。
+    caret_phase: editor_core::caret::CaretPhase,
     focus_registered: bool,
     caret: usize,
     /// 是否已装入过完整源（`set_source_text`/`install_open` 置真）。App 大文档 load 走

@@ -1,10 +1,8 @@
 //! 焦点 / 闪烁 / 鼠标事件。`CodeEditor` 的 focus/blur 钩子、光标闪烁
-//! （`start_blink` / `kick_caret`）与鼠标按下/移动/抬起/松开离场的事件分发
-//! （含拖选态生命周期 `cancel_mouse_drag`）。
+//! （`start_blink` / `caret.kick()`，收敛至 `editor_core::caret`）与鼠标
+//! 按下/移动/抬起/松开离场的事件分发（含拖选态生命周期 `cancel_mouse_drag`）。
 
-use std::{
-    time::{Duration, Instant},
-};
+use std::time::Instant;
 
 use gpui::{
     px,
@@ -19,17 +17,23 @@ use gpui::{
 use super::{
     CodeEditor,
     EditorEvent,
-    BLINK_MS,
-    BLINK_PAUSE_MS,
 };
+
+/// 本批 Pattern 1：`CodeEditor` 以 `caret` 字段作为光标闪烁相位状态机宿主，
+/// 供 `editor_core::caret::spawn_blink_loop` 的循环体经 `Entity` 更新访问。
+impl editor_core::caret::CaretOwner for CodeEditor {
+    fn caret(&mut self) -> &mut editor_core::caret::CaretPhase {
+        &mut self.caret
+    }
+}
 
 impl CodeEditor {
     pub(super) fn on_focus(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.focused = true;
-        self.caret_visible = true;
-        self.caret_pause_until = Some(Instant::now());
+        self.caret.focused = true;
+        self.caret.caret_visible = true;
+        self.caret.caret_pause_until = Some(Instant::now());
         cx.emit(EditorEvent::Focus);
-        if !self.blink_running {
+        if !self.caret.blink_running {
             self.start_blink(cx);
         }
     }
@@ -38,7 +42,7 @@ impl CodeEditor {
         // 失焦前把最后未落地的拖点先落地（等价旧「逐事件同步更新」的选区结果），
         // 再走统一拖选复位（见 [`Self::cancel_mouse_drag`]）。
         self.flush_pending_drag(window, cx);
-        self.focused = false;
+        self.caret.focused = false;
         // 失焦 = 编辑器离开活动态：进行中的鼠标拖选失去意义，随生命周期一并复位。
         // 拖选只依赖「按下 → 移动」；松开/失焦/切走任一中断拖拽闭环都不能留
         // `dragging` 残留（收敛到统一生命周期钩子，见 [`Self::cancel_mouse_drag`]）。
@@ -48,49 +52,13 @@ impl CodeEditor {
         cx.emit(EditorEvent::Blur);
     }
 
+    /// 薄调用：本批 Pattern 1 收敛后，`blink_running`/`blink_epoch` 的置位与异步循环
+    /// （翻转/keep/停）全部下沉 [`editor_core::caret`]；这里只在 `&mut self` 上下文
+    /// **同步**置位 + 起循环（`begin_blink` 返回本拍代号给循环体做 keep 判定）。
     pub(super) fn start_blink(&mut self, cx: &mut Context<Self>) {
-        if self.blink_running {
-            return;
+        if let Some(epoch) = self.caret.begin_blink() {
+            editor_core::caret::spawn_blink_loop::<Self>(epoch, cx);
         }
-        self.blink_running = true;
-        self.blink_epoch = self.blink_epoch.wrapping_add(1);
-        let epoch = self.blink_epoch;
-        cx.spawn(async move |this, cx| loop {
-            let elapsed = this
-                .update(cx, |this, _| {
-                    this.caret_pause_until
-                        .map_or(u128::MAX, |p| p.elapsed().as_millis())
-                })
-                .unwrap_or(u128::MAX);
-            if elapsed >= BLINK_PAUSE_MS as u128 {
-                let _ = this.update(cx, |this, cx| {
-                    // 失焦时光标本就不渲染（`caret_shown_now` 恒 false）→ 翻转不可见，
-                    // 跳过翻转与 notify（否则 500ms 一帧整树重建白耗，且拖选/悬停也不
-                    // 受影响）。重获焦点时 `on_focus` 已重置 `caret_visible=true`。
-                    if !this.focused {
-                        return;
-                    }
-                    this.caret_visible = !this.caret_visible;
-                    cx.notify();
-                });
-            }
-            cx.background_executor()
-                .timer(Duration::from_millis(BLINK_MS))
-                .await;
-            let keep = this
-                .update(cx, |this, _| this.focused && epoch == this.blink_epoch)
-                .unwrap_or(false);
-            if !keep {
-                this.update(cx, |this, _| this.blink_running = false).ok();
-                break;
-            }
-        })
-        .detach();
-    }
-
-    pub(super) fn kick_caret(&mut self) {
-        self.caret_visible = true;
-        self.caret_pause_until = Some(Instant::now());
     }
 
     pub(super) fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -128,7 +96,7 @@ impl CodeEditor {
         }
         self.dragging = true;
         self.pending_drag = None;
-        self.kick_caret();
+        self.caret.kick();
         self.reveal_caret_vertical();
         // 鼠标点击移动光标（宿主刷新状态栏光标行列等派生数据）。
         cx.emit(EditorEvent::SelectionChanged);
@@ -165,7 +133,7 @@ impl CodeEditor {
         let offset = self.offset_at_point(local, window);
         self.selection.set_head(offset);
         self.selection.remember_column(self.buffer.char_column(offset));
-        self.kick_caret();
+        self.caret.kick();
         self.reveal_caret_vertical();
         // 拖拽扩选过程实时刷新（状态栏选区头跟随鼠标）。
         cx.emit(EditorEvent::SelectionChanged);

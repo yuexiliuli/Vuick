@@ -23,6 +23,9 @@ base = { path = "../base" }
 ime = { path = "../ime" }
 ui = { path = "../ui" }
 editor = { path = "../editor" }
+# 光标相位状态机（`caret::CaretPhase`）：本批 Pattern 1 把光标闪烁字段/循环/常量
+# 下沉到 editor_core::caret（此前经 editor 传递依赖，现改为直接依赖；叶子无环）。
+editor_core = { path = "../editor_core" }
 syntax = { path = "../syntax" }
 # 向上依赖：共享 parse/doc/ir/view 解析与文档层。
 markdown = { path = "../markdown" }

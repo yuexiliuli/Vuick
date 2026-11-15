@@ -130,7 +130,7 @@ impl CodeEditor {
         } else {
             self.selection.move_cursor(new_head, preferred);
         }
-        self.kick_caret();
+        self.caret.kick();
         self.reveal_caret();
         // 方向键/Home/End/翻页等移动光标（宿主刷新状态栏光标行列等派生数据）。
         cx.emit(EditorEvent::SelectionChanged);
@@ -1204,7 +1204,7 @@ impl CodeEditor {
             EditIntent::Atomic => false,
             _ => !text.contains(['\n', '\r']),
         });
-        self.kick_caret();
+        self.caret.kick();
         self.reveal_caret();
         // 文本变更：查找匹配表按 buffer 版本失效重算（防抖同一条路径，见 `find_edit_invalidate`）。
         self.find_edit_invalidate(cx);
@@ -1355,7 +1355,7 @@ impl CodeEditor {
         self.selection.anchor = new_anchor.min(self.buffer.len());
         self.selection.head = new_head.min(self.buffer.len());
         self.selection.preferred_column = None;
-        self.kick_caret();
+        self.caret.kick();
         cx.notify();
     }
 
@@ -1392,7 +1392,7 @@ impl CodeEditor {
     pub(super) fn select_all(&mut self, cx: &mut Context<Self>) {
         self.undo.set_cooperative(false);
         self.selection = Selection::from_range(0, self.buffer.len());
-        self.kick_caret();
+        self.caret.kick();
         cx.notify();
     }
 
@@ -1467,7 +1467,7 @@ impl CodeEditor {
         self.mark_scan_dirty_incremental(line_a, min_stop, delta);
         self.selection = Selection::from_range(tx.before.0, tx.before.1);
         self.resync_list(true);
-        self.kick_caret();
+        self.caret.kick();
         self.reveal_caret();
         // 撤销 = 文本变更：查找匹配表失效重算。
         self.find_edit_invalidate(cx);
@@ -1525,7 +1525,7 @@ impl CodeEditor {
         self.mark_scan_dirty_incremental(line_a, min_stop, delta);
         self.selection = Selection::from_range(tx.after.0, tx.after.1);
         self.resync_list(true);
-        self.kick_caret();
+        self.caret.kick();
         self.reveal_caret();
         // 重做 = 文本变更：查找匹配表失效重算。
         self.find_edit_invalidate(cx);

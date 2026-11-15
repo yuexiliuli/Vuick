@@ -46,7 +46,6 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     rc::Rc,
-    time::{Instant},
 };
 
 use gpui::{
@@ -92,10 +91,6 @@ const HL_LOOKBACK_LINES: usize = 16;
 /// 滚动停住后由 `settle_pending` 一次有界重锚补齐整窗（含上方过扫）、清 pending，
 /// 全窗总耗落回 ~200-300ms 级（不再 1s 级死白）。
 const HL_FILL_BUDGET_ROWS: usize = 32;
-/// 光标闪烁半周期（ms）。
-const BLINK_MS: u64 = 500;
-/// 输入后光标暂停闪烁（实心显示，ms）。
-const BLINK_PAUSE_MS: u64 = 300;
 /// 光标条宽（px）。
 const CARET_WIDTH_PX: f32 = 2.;
 /// 可见行数下限（首帧视口未知时也至少预取这么多）。
@@ -440,11 +435,10 @@ pub struct CodeEditor {
 
     // —— 交互状态 ——
     dragging: bool,
-    focused: bool,
-    caret_visible: bool,
-    caret_pause_until: Option<Instant>,
-    blink_epoch: u64,
-    blink_running: bool,
+    /// 光标闪烁相位状态机（本批 Pattern 1：收敛自 editor/interaction.rs 与
+    /// wysiwyg/core.rs 两份同构实现，字段/常量/循环/kick/caret_shown_now/翻转/keep
+    /// 判定全部下沉 `editor_core::caret::CaretPhase`；`flip_when_blurred=false`）。
+    caret: editor_core::caret::CaretPhase,
     focus_registered: bool,
     element_bounds: Bounds<Pixels>,
     /// 拖选帧级合并（B2）：`on_mouse_move` 只记**最新拖点**（编辑区本地点），下一帧

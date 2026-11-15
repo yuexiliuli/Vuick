@@ -96,11 +96,8 @@ impl CodeEditor {
             last_edit: None,
             font_override: None,
             dragging: false,
-            focused: false,
-            caret_visible: false,
-            caret_pause_until: None,
-            blink_epoch: 0,
-            blink_running: false,
+            // 光标闪烁相位状态机（`flip_when_blurred=false`：失焦不翻转，见 interaction.rs 策略）。
+            caret: editor_core::caret::CaretPhase::new(false),
             focus_registered: false,
             element_bounds: Bounds::default(),
             pending_drag: None,
@@ -523,7 +520,7 @@ impl CodeEditor {
         let e = self.buffer.clip(range.end);
         self.selection = Selection::from_range(s, e);
         self.undo.set_cooperative(false);
-        self.kick_caret();
+        self.caret.kick();
         self.reveal_caret();
         // 程序化定位（搜索跳转/侧边栏目录）也发光标变化事件，状态栏跟随。
         cx.emit(EditorEvent::SelectionChanged);

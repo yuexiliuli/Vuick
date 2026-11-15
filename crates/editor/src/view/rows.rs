@@ -1,5 +1,6 @@
-//! 行级物化 / 语法分片补色。`build_rows` 行数据窗口构建、行样式覆盖（`row_*`）、
-//! syntect 分片补色（`syntect_fill_deferred` / `fill_place`）与光标可见性（`caret_shown_now`）。
+//! 行级物化 / 语法分片补色。`build_rows` 行数据窗口构建、行样式覆盖（`row_*`）与
+//! syntect 分片补色（`syntect_fill_deferred` / `fill_place`）。（光标可见性已下沉
+//! `editor_core::caret`，本批 Pattern 1。）
 
 use super::{
     merge_highlights,
@@ -10,7 +11,6 @@ use std::{
     borrow::Cow,
     ops::Range,
     rc::Rc,
-    time::{Duration},
 };
 
 use gpui::{
@@ -24,7 +24,6 @@ use super::{
     HlFill,
     RowContent,
     RowData,
-    BLINK_PAUSE_MS,
     HL_FILL_BUDGET_ROWS,
     HL_LOOKBACK_LINES,
 };
@@ -521,19 +520,5 @@ impl CodeEditor {
     ) -> ((usize, usize), bool) {
         let (_, range, done) = self.syntect_fill_deferred(lo_l, hi_l, vis_top_l);
         (range.unwrap_or((0, 0)), done)
-    }
-
-    // -----------------------------------------------------------------
-    // 光标可见性
-    // -----------------------------------------------------------------
-
-    pub(super) fn caret_shown_now(&self) -> bool {
-        if !self.focused {
-            return false;
-        }
-        let paused = self
-            .caret_pause_until
-            .is_some_and(|p| p.elapsed() < Duration::from_millis(BLINK_PAUSE_MS));
-        paused || self.caret_visible
     }
 }

@@ -2684,6 +2684,7 @@ dependencies = [
  "base",
  "config",
  "editor",
+ "editor_core",
  "gpui",
  "ime",
  "kimg",

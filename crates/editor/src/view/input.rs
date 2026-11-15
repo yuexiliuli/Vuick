@@ -58,7 +58,7 @@ impl ImeTextHost for CodeEditor {
 
     fn set_selection_bytes(&mut self, range: Range<usize>) {
         self.selection = Selection::from_range(range.start, range.end);
-        self.kick_caret();
+        self.caret.kick();
     }
 
     fn marked_bytes(&self) -> Option<Range<usize>> {
