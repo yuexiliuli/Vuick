@@ -25,10 +25,11 @@ const INSTALL_CORR_WIN_MS: f64 = 100.0;
 /// 「滚动期」窗口（ms）：最后一次 `switch()` 后该窗口内的 render 计入帧间隔统计。
 const SCROLL_ACTIVE_MS: u64 = 2000;
 
+/// 门控是否开启：收敛自 `base::diag::env_flag`（进程级 per-env 缓存；本批 Pattern 7）。
+/// 原实现 `env::var(ENV_VAR).is_ok_and(|v| v == "1")` 与 `matches!(as_deref(), Ok("1"))`
+/// 逐语义等价（默认只认 `"1"`，其余值/缺失 → 关）。
 fn enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var(ENV_VAR).is_ok_and(|v| v == "1"))
+    base::diag::env_flag(ENV_VAR)
 }
 
 /// 时延统计（decode_ms / paint_lag 共用）。

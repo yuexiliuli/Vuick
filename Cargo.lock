@@ -2157,6 +2157,7 @@ dependencies = [
 name = "image_viewer"
 version = "0.1.0"
 dependencies = [
+ "base",
  "config",
  "gpui",
  "kimg",

@@ -9,6 +9,7 @@ description = "gpui-editor 图片查看器 crate（后台解码 + 文件夹轮�
 gpui = { workspace = true }
 kimg = { workspace = true }
 rayon = { workspace = true }
+base = { path = "../base" }
 config = { path = "../config" }
 ui = { path = "../ui" }
 viewer = { path = "../viewer" }
