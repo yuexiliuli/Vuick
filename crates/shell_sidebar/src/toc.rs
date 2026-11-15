@@ -16,7 +16,7 @@ use ui::motion::hover_spring;
 use crate::chrome::Sidebar;
 use crate::host::SidebarHost;
 use crate::prompt::FileTreePromptHost;
-use crate::state::{SidebarChromeState, toc_collapse};
+use crate::state::{SidebarChromeState, toc_collapse, FILE_TREE_INDENT};
 use ::toc; // 显式导入外部 crate `toc`（本子模块名与之同名，需显式绑定避免 glob 遮蔽）
 
 /// 目录条目总数超过此值才启用列表虚拟化（普通小文档仍全量渲染，行为不变）。
@@ -92,7 +92,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     fn toc_row_width(level: usize, title: &str, font_px: f32) -> f32 {
         Self::toc_text_width(title, font_px)
             + 6.0              // pl 起始缩进
-            + level as f32 * 14.0
+            + level as f32 * FILE_TREE_INDENT
             + 16.0             // 箭头列（无箭头也占位对齐）
             + 6.0 + 5.0 + 6.0  // gap + 圆点 + gap
             + 8.0              // pr
@@ -307,32 +307,17 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                                 let total = visible.len();
                                 // 虚拟化：只物化可视带 + 上下 M 行缓冲；带外以等高 spacer 占位
                                 //（总高恒为 visible × 行高，滚动量程/命中稳定）。普通小文档全量。
-                                let (start, end) = if total <= TOC_VIRTUALIZE_MIN {
-                                    (0usize, total)
-                                } else {
-                                    let vhand = &sb.toc_vscroll;
-                                    let offset = (-vhand.offset().y).max(px(0.)).as_f32();
-                                    let viewport_h = vhand.bounds().size.height.as_f32();
-                                    // 首帧容器尚未布局（高度 0）→ 退化为固定视口估计（只多物化几行）。
-                                    let vh = if viewport_h > 0.0 {
-                                        viewport_h
-                                    } else {
-                                        700.0
-                                    };
-                                    let first = (offset / toc::TOC_ROW_H) as usize;
-                                    let last = ((offset + vh) / toc::TOC_ROW_H) as usize + 1;
-                                    let start = first.saturating_sub(TOC_BAND_BUFFER);
-                                    let end = (last + TOC_BAND_BUFFER).min(total);
-                                    // 折叠后条目大减时偏移可能越界：钳制空带。
-                                    (start.min(end), end.max(start))
-                                };
+                                let vhand = &sb.toc_vscroll;
+                                let offset = (-vhand.offset().y).max(px(0.)).as_f32();
+                                let viewport_h = vhand.bounds().size.height.as_f32();
+                                let (start, end, top_h, bottom_h) =
+                                    crate::virtualize::virtualized_band(
+                                        total, offset, viewport_h, toc::TOC_ROW_H,
+                                        TOC_VIRTUALIZE_MIN, TOC_BAND_BUFFER,
+                                    );
                                 let rows = self.sidebar_toc_md_rows(
                                     window, entries, &visible[start..end], &collapsed, fg, muted,
                                     active_bg, accent, scroll.clone(), cx,
-                                );
-                                let (top_h, bottom_h) = (
-                                    start as f32 * toc::TOC_ROW_H,
-                                    (total - end) as f32 * toc::TOC_ROW_H,
                                 );
                                 div()
                                     .flex()

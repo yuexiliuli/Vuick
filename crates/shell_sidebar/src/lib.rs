@@ -41,6 +41,7 @@ pub mod prompt;
 pub mod search;
 pub mod state;
 pub mod toc;
+mod virtualize;
 
 pub use chrome::Sidebar;
 pub use host::SidebarHost;

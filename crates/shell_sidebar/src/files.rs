@@ -128,31 +128,16 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             let total = layout_rows.len();
             // 虚拟化：只物化可视带 + 上下 M 行缓冲（同目录视图 render_sidebar_toc 口径），
             // 行等高 `FILE_TREE_ROW_H` → divisor 精确；带外以等高 spacer 占位，滚动量程稳定。
-            let (start, end) = if total <= TOC_VIRTUALIZE_MIN {
-                (0usize, total)
-            } else {
-                let vhand = &sb.files_vscroll;
-                let offset = (-vhand.offset().y).max(px(0.)).as_f32();
-                let viewport_h = vhand.bounds().size.height.as_f32();
-                let vh = if viewport_h > 0.0 {
-                    viewport_h
-                } else {
-                    700.0
-                };
-                let first = (offset / FILE_TREE_ROW_H) as usize;
-                let last = ((offset + vh) / FILE_TREE_ROW_H) as usize + 1;
-                let start = first.saturating_sub(TOC_BAND_BUFFER);
-                let end = (last + TOC_BAND_BUFFER).min(total);
-                (start.min(end), end.max(start))
-            };
+            let vhand = &sb.files_vscroll;
+            let offset = (-vhand.offset().y).max(px(0.)).as_f32();
+            let viewport_h = vhand.bounds().size.height.as_f32();
+            let (start, end, top_h, bottom_h) = crate::virtualize::virtualized_band(
+                total, offset, viewport_h, FILE_TREE_ROW_H, TOC_VIRTUALIZE_MIN, TOC_BAND_BUFFER,
+            );
             let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(end - start);
             for (i, row) in layout_rows.iter().enumerate().skip(start).take(end - start) {
                 rows.push(self.sidebar_files_row(window, i, row, fg, muted, active_bg, sb, cx));
             }
-            let (top_h, bottom_h) = (
-                start as f32 * FILE_TREE_ROW_H,
-                (total - end) as f32 * FILE_TREE_ROW_H,
-            );
             div()
                 .flex()
                 .flex_col()
