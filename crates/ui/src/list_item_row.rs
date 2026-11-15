@@ -29,6 +29,15 @@ pub struct ListItemRow {
     is_selected: bool,
     /// 选中/悬停背景 target 色（调用方从 theme 取；透明度由弹簧 0..1 调制）。
     accent: Hsla,
+    /// 行最小高度（px）覆盖：默认 `None` → 30.0（palette 条目行）。recent_panel 传
+    /// ITEM_H=26.0 保持与 PopupMenu 项同款 26px 观感（见 `session_store/recent_panel.rs`
+    /// 的 ITEM_H 注释），行壳复用后不因默认 30px 每行 +4px 破坏高度 UX。
+    row_height: Option<f32>,
+    /// debug_selector 覆盖：默认由 id 派生（`element_id_label`）。既有行壳迁移时
+    /// ElementId 与调试名可能需各走独立名（如 recent_panel：ElementId 保持
+    /// `recent-line-{index}`、调试名保留 `recent-folder-row-{i}`，shell 测试
+    /// `debug_bounds` 依赖该名）。
+    debug_selector: Option<Rc<dyn Fn() -> String>>,
     on_hover_select: Option<Rc<dyn Fn(bool, &mut Window, &mut App)>>,
     on_activate: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
 }
@@ -41,6 +50,8 @@ impl ListItemRow {
             content: div().into_any_element(),
             is_selected: false,
             accent: gpui::transparent_black(),
+            row_height: None,
+            debug_selector: None,
             on_hover_select: None,
             on_activate: None,
         }
@@ -61,6 +72,21 @@ impl ListItemRow {
     /// 选中/悬停背景 target 色（theme 语义色；透明度由 spring 调制）。
     pub fn accent(mut self, accent: Hsla) -> Self {
         self.accent = accent;
+        self
+    }
+
+    /// 行最小高度覆盖（px）。默认 `None` → 30.0（palette 条目行）。recent_panel 传
+    /// ITEM_H=26.0，与 PopupMenu 项同款 26px 观感（`session_store/recent_panel.rs` 的
+    /// ITEM_H 注释），复用行壳也不破坏默认 30px 的高度 UX。
+    pub fn row_height(mut self, height: f32) -> Self {
+        self.row_height = Some(height);
+        self
+    }
+
+    /// debug_selector 覆盖：默认由 id 派生。需 ElementId 与调试名解耦时传入
+    /// （如 recent_panel 行 ElementId=`recent-line-{index}`、调试名保留原行名）。
+    pub fn debug_selector(mut self, selector: impl Fn() -> String + 'static) -> Self {
+        self.debug_selector = Some(Rc::new(selector));
         self
     }
 
@@ -90,17 +116,22 @@ impl RenderOnce for ListItemRow {
         let spring_key = format!("{label}-bg");
         let accent = self.accent;
         let is_selected = self.is_selected;
+        let row_height = self.row_height;
+        let debug_selector_override = self.debug_selector;
         let on_hover_select = self.on_hover_select;
         let on_activate = self.on_activate;
         let mut root = div()
             .id(id)
-            .debug_selector(move || label.clone())
+            .debug_selector(move || match &debug_selector_override {
+                Some(sel) => sel(),
+                None => label.clone(),
+            })
             .flex()
             .items_center()
             .gap_2()
             .px_3()
             .mx_1()
-            .min_h(px(30.))
+            .min_h(px(row_height.unwrap_or(30.)))
             .rounded_md()
             .cursor(CursorStyle::PointingHand);
         // 悬停上抛（组件只转发；宿主做 selected + notify，不在此处 notify）。

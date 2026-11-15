@@ -38,9 +38,9 @@ use std::path::PathBuf;
 use gpui::{
     AnimationExt, App, Context, DismissEvent, ElementId, EventEmitter, FocusHandle, Focusable,
     Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled as _, WeakEntity, Window, div,
-    px,
+    ScrollHandle, SharedString, Styled as _, WeakEntity, Window, div, px,
 };
+use ui::ListItemRow;
 use ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 use ui::icon::{Icon, IconName};
 use ui::motion::hover_spring;
@@ -373,16 +373,13 @@ impl<H: RecentPanelHost> RecentPanel<H> {
         let selected_bg: Hsla = chrome.menu_highlight.into();
 
         let debug = line.debug().to_string();
-        let mut base = div()
-            .id(ElementId::from(format!("recent-line-{index}")))
-            .debug_selector(move || debug.clone())
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .mx_1()
-            .min_h(px(ITEM_H))
-            .rounded_md();
+        // 行壳复用 ui::ListItemRow + row_height 参数（本批 Pattern 10）：可导航行
+        // （Item / More / 返回 / Clear）用 `ui::ListItemRow` 组装行壳（flex + items_center
+        // + gap_2 + px_3 + mx_1 + min_h(26) + rounded_md + 弹簧选中背景 + 手型光标；
+        // hover→`on_hover_select` 上抛、点击→`on_activate`，与 palette 模板逐语义等价）。
+        // ElementId 保持 `recent-line-{index}`；debug_selector 经 override 保持
+        // `line.debug()` 原行名；spring 键改走派生态 `{id}-bg`——原 `recent-item-bg-{index}`
+        // 键差异无测试锁定，可接受。空态 / 分割线仍为静态绘制。
 
         match line {
             Line::Divider { .. } => {
@@ -399,41 +396,42 @@ impl<H: RecentPanelHost> RecentPanel<H> {
             }
             Line::Empty { text, .. } => {
                 let t: &'static str = text;
-                base = base.text_size(px(12.)).text_color(fg_muted).child(t);
-                base.into_any_element()
+                div()
+                    .id(ElementId::from(format!("recent-line-{index}")))
+                    .debug_selector(move || debug.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .mx_1()
+                    .min_h(px(ITEM_H))
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .text_color(fg_muted)
+                    .child(t)
+                    .into_any_element()
             }
             Line::Item { is_folder, path, name, .. } => {
                 let is_folder = *is_folder;
                 let icon = if is_folder { IconName::Folder } else { IconName::File };
                 let path = path.clone();
                 let name = name.clone();
-                let row = base
-                    .cursor_pointer()
-                    .text_color(fg)
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        if *hovered {
-                            this.selected = Some(index);
-                        } else if this.selected == Some(index) {
-                            this.selected = None;
-                        }
-                        cx.notify();
-                    }))
-                    .on_click(cx.listener(move |this, _ev, window, cx| {
-                        this.activate_line(index, window, cx);
-                    }))
-                    .with_spring(
-                        format!("recent-item-bg-{index}"),
-                        hover_spring(if selected { 1.0 } else { 0.0 }),
-                        move |d, v| d.bg(selected_bg.opacity(v)),
-                    )
-                    .child(Icon::new(icon).size(px(16.)).text_color(fg))
-                    .child(
+                let row_debug = debug.clone();
+                let weak_hover = cx.weak_entity();
+                let weak_activate = cx.weak_entity();
+                ListItemRow::new(ElementId::from(format!("recent-line-{index}")))
+                    .row_height(ITEM_H)
+                    .selected(selected)
+                    .accent(selected_bg)
+                    .debug_selector(move || row_debug.clone())
+                    .content(
                         div()
-                            .flex_1()
-                            .min_w(px(0.))
                             .flex()
                             .items_center()
                             .gap_2()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(Icon::new(icon).size(px(16.)).text_color(fg))
                             .child(
                                 div()
                                     .flex_1()
@@ -441,6 +439,7 @@ impl<H: RecentPanelHost> RecentPanel<H> {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                                    .text_color(fg)
                                     .child(SharedString::from(name)),
                             )
                             .child(
@@ -453,8 +452,24 @@ impl<H: RecentPanelHost> RecentPanel<H> {
                                     .text_color(fg_muted)
                                     .child(SharedString::from(path)),
                             ),
-                    );
-                row.into_any_element()
+                    )
+                    .on_hover_select(move |hovered, _window, cx| {
+                        let _ = weak_hover.update(cx, |this, cx| {
+                            if hovered {
+                                this.selected = Some(index);
+                            } else if this.selected == Some(index) {
+                                this.selected = None;
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .on_activate(move |_event, window, cx| {
+                        let _ = weak_activate.update(cx, |this, cx| {
+                            this.selected = Some(index);
+                            this.activate_line(index, window, cx);
+                        });
+                    })
+                    .into_any_element()
             }
             Line::More | Line::Back | Line::Clear => {
                 let label: &'static str = match line {
@@ -463,27 +478,32 @@ impl<H: RecentPanelHost> RecentPanel<H> {
                     Line::Clear => "Clear Recently Opened...",
                     _ => unreachable!(),
                 };
-                let row = base
-                    .cursor_pointer()
-                    .text_color(fg)
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        if *hovered {
+                let row_debug = debug.clone();
+                let weak_hover = cx.weak_entity();
+                let weak_activate = cx.weak_entity();
+                ListItemRow::new(ElementId::from(format!("recent-line-{index}")))
+                    .row_height(ITEM_H)
+                    .selected(selected)
+                    .accent(selected_bg)
+                    .debug_selector(move || row_debug.clone())
+                    .content(div().text_color(fg).child(label))
+                    .on_hover_select(move |hovered, _window, cx| {
+                        let _ = weak_hover.update(cx, |this, cx| {
+                            if hovered {
+                                this.selected = Some(index);
+                            } else if this.selected == Some(index) {
+                                this.selected = None;
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .on_activate(move |_event, window, cx| {
+                        let _ = weak_activate.update(cx, |this, cx| {
                             this.selected = Some(index);
-                        } else if this.selected == Some(index) {
-                            this.selected = None;
-                        }
-                        cx.notify();
-                    }))
-                    .on_click(cx.listener(move |this, _ev, window, cx| {
-                        this.activate_line(index, window, cx);
-                    }))
-                    .with_spring(
-                        format!("recent-item-bg-{index}"),
-                        hover_spring(if selected { 1.0 } else { 0.0 }),
-                        move |d, v| d.bg(selected_bg.opacity(v)),
-                    )
-                    .child(label);
-                row.into_any_element()
+                            this.activate_line(index, window, cx);
+                        });
+                    })
+                    .into_any_element()
             }
         }
     }
