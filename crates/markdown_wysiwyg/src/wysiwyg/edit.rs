@@ -487,20 +487,36 @@ impl WyEditor {
         } else {
             EditKind::Atomic
         };
-        // I1 时间窗合并：与上一编辑停顿 ≥ UNDO_GROUP_MS（300ms）→ 视为新事务（持续打字
-        // 合并、停顿打断，同 editor/undo.rs）。std 单调钟纯时间判定，无定时器副作用。
-        let within_window = self.last_edit_at.is_none_or(|t| t.elapsed() < UNDO_GROUP_MS);
-        let merges = within_window
-            && match self.last_edit {
-                Some((k, s, _e)) if k == intent => match intent {
-                    // 纯插入区间零宽：上一编辑的**插入终点** = 其起点 + 插入长。
-                    EditKind::Typing => r.start == s + inserted_len,
-                    EditKind::Backspace => r.end == s, // 向后退格首尾相接
-                    EditKind::Delete => r.start == s,  // 同起点延伸
-                    EditKind::Atomic => false,
-                },
-                _ => false,
-            };
+        // 邻接几何（wysiwyg 私有语义；Typing 用**当前插入长**、editor 用**上一插入长**，
+        // 差异及 cooperative/换行门差异见 `editor_core::undo::should_merge_undo` 注解，
+        // Batch E / P13 不强行统一）：「同意图 + 位置」。
+        let adjacent = match self.last_edit {
+            Some((k, s, _e)) if k == intent => match intent {
+                // 纯插入区间零宽：上一编辑的**插入终点** = 其起点 + 插入（当前）长。
+                EditKind::Typing => r.start == s + inserted_len,
+                EditKind::Backspace => r.end == s, // 向后退格首尾相接
+                EditKind::Delete => r.start == s,  // 同起点延伸
+                EditKind::Atomic => false,
+            },
+            _ => false,
+        };
+        // I1 时间窗 + Atomic 门 + cooperative 门收敛到 `editor_core::undo::should_merge_undo`
+        // （Batch E / P13，与 editor/undo.rs 共用；std 单调钟纯时间判定，无定时器副作用）。wysiwyg 无
+        // cooperative 标志：光标移动已置空 `last_edit`/`last_edit_at` 等效断层
+        // （editor/undo.rs 的 `set_cooperative(false)`）→ cooperative 恒传 true。
+        let merges = editor_core::undo::should_merge_undo(
+            match intent {
+                EditKind::Typing => editor_core::EditIntent::Typing,
+                EditKind::Backspace => editor_core::EditIntent::Backspace,
+                EditKind::Delete => editor_core::EditIntent::Delete,
+                EditKind::Atomic => editor_core::EditIntent::Atomic,
+            },
+            adjacent,
+            self.last_edit_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0),
+            true,
+        );
         if merges {
             // 并入打开单元：净区间/文本按意图累积（逆操作坐标不变形，见 UndoUnit）。
             let u = self.open_unit.as_mut().expect("能合并必已有打开的单元");

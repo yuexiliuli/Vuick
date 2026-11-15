@@ -23,6 +23,39 @@ pub const UNDO_GROUP_MS: Duration = Duration::from_millis(300);
 /// 两个耦合环），此处 re-export 保持 `crate::editor::EditIntent` 兼容。
 pub use base::EditIntent;
 
+/// 撤销单元合并判定（editor `UndoManager::push_edit` 与 wysiwyg
+/// `edit.rs::record_undo_unit` 共用；收敛自两处各自内联的判定，Batch E / P13）。
+///
+/// 纯判定、无状态、无存储：返回 `true` = 并入当前打开的撤销单元（调用方按
+/// true/false 走各自存储分支）。
+///
+/// 两处判定逐行对照（Batch E / P13）确认的**公共子集**仅此组合，参数即分量：
+/// - `intent`：`Atomic` 永不合并（两处同一规则）。
+/// - `adjacent`：调用方按**各自语义**预判的「同意图 + 邻接几何」；意图守恒两处同真
+///   （editor pending 事务内意图锁定；wysiwyg 判 `k == intent`），邻接量则不同（见下）
+///   → 由调用方算好传 bool，本函数不再重判。
+/// - `since_last_ms`：I1 时间窗，距上次编辑 < [`UNDO_GROUP_MS`]（300ms）才并入；
+///   无上一编辑时传 0（此时 `adjacent` 必为 false，本值不影响结论）。
+/// - `cooperative`：editor 持久标志（光标移动 `set_cooperative(false)` 断层）；
+///   wysiwyg 无此标志、光标移动直接置空 `last_edit` 等效断层 → 恒传 `true`。
+///
+/// **已知差异（不强行统一，各自保留）**：
+/// - cooperative 载体：editor 标志；wysiwyg 无标志（置空 `last_edit` 等效断层）。
+/// - Typing 邻接量：editor `next.start == last.start + last.new_text.len()`（**上一插入长**）；
+///   wysiwyg `r.start == s + inserted_len`（**当前插入长**）。多字节字符 / 粘贴等
+///   变长插入下两者不等价。
+/// - 纯插入无换行门：editor 经 `Edit::inserts_newline()` 拒 `\n`/`\r`；wysiwyg 分类只查
+///   `!text.contains('\n')`（孤 `\r` 插段会被 wysiwyg 判为续打）。
+/// - Backspace / Delete 邻接量逐字节等价（当前删段 `end==prev.start` / `start==prev.start`）。
+pub fn should_merge_undo(intent: EditIntent, adjacent: bool, since_last_ms: u64, cooperative: bool) -> bool {
+    if intent == EditIntent::Atomic {
+        return false;
+    }
+    cooperative
+        && adjacent
+        && since_last_ms < UNDO_GROUP_MS.as_millis() as u64
+}
+
 /// 一个已提交的撤销/重做单元。
 #[derive(Clone, Debug)]
 pub struct Transaction {
@@ -99,23 +132,30 @@ impl UndoManager {
             });
         }
 
-        // 尝试合并（同意图 + 时间窗 + 邻接性，见 `try_merge`；克隆末条以避免与可变借用
-        // 冲突；合并频率低、Edit 很小）
-        if self.cooperative {
-            let intent = self.pending.as_ref().unwrap().intent;
-            let last_clone = self.pending.as_ref().and_then(|p| p.edits.last().cloned());
-            if let Some(last) = last_clone
-                && let Some(merged) = self.try_merge(intent, &last, &edit)
-                    && let Some(p) = self.pending.as_mut()
-                        && let Some(slot) = p.edits.last_mut() {
-                            *slot = merged;
-                            self.last_edit_at = Some(Instant::now());
-                            return;
-                        }
-        }
+        // 合并判定（Batch E / P13 收敛至 `should_merge_undo`，与 wysiwyg edit.rs 共用）：
+        // editor 侧 pending 事务内的编辑恒定同意图（intent 在 tx 建立时锁定）→ 邻接仅剩
+        // 几何判定（`try_merge`）；cooperative 门 / I1 时间窗由共享判定统一裁决。
+        // 克隆末条以避免与可变借用冲突；合并频率低、Edit 很小。
+        let intent = self.pending.as_ref().unwrap().intent;
+        let last_clone = self.pending.as_ref().and_then(|p| p.edits.last().cloned());
+        let merge_ready =
+            last_clone.as_ref().and_then(|last| self.try_merge(intent, last, &edit));
+        let can_merge = should_merge_undo(
+            intent,
+            merge_ready.is_some(),
+            self.last_edit_at.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0),
+            self.cooperative,
+        );
+        if can_merge
+            && let Some(merged) = merge_ready
+            && let Some(p) = self.pending.as_mut()
+            && let Some(slot) = p.edits.last_mut() {
+                *slot = merged;
+                self.last_edit_at = Some(Instant::now());
+                return;
+            }
 
         // 不合并 → 刷新旧事务，新事务沿用同意图（连续删除/粘贴的下一段），把本条放入。
-        let intent = self.pending.as_ref().unwrap().intent;
         let before = self.pending.as_ref().unwrap().before;
         self.commit_pending(None);
         self.pending = Some(PendingTx {
@@ -126,12 +166,9 @@ impl UndoManager {
         self.last_edit_at = Some(Instant::now());
     }
 
-    /// 尝试把 `next` 并入 `last`；可并入返回合并后的 `last`。
+    /// 按意图尝试把 `next` 并入 `last`（纯几何判定）：可并入返回合并后的 `last`。
+    /// cooperative 门 / I1 时间窗由调用方 `should_merge_undo` 统一裁决（Batch E / P13）。
     fn try_merge(&self, intent: EditIntent, last: &Edit, next: &Edit) -> Option<Edit> {
-        // I1 时间窗：与上一编辑停顿 ≥ UNDO_GROUP_MS → 不并入（超窗断事务）。
-        if self.last_edit_at.is_none_or(|t| t.elapsed() >= UNDO_GROUP_MS) {
-            return None;
-        }
         match intent {
             EditIntent::Typing => {
                 // 连续打字：两侧纯插入、无换行、且紧邻（next 起点 = last 插入后终点）。
