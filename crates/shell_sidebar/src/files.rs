@@ -66,11 +66,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             .cursor(gpui::CursorStyle::PointingHand)
             .on_click(cx.listener(
                 |this: &mut Self, _: &gpui::ClickEvent, window, cx| {
-                    if let Some(h) = this.host_weak().upgrade() {
-                        let _ = h.update(cx, |app, cx| {
-                            app.sidebar_open_folder_dialog(window, cx)
-                        });
-                    }
+                    this.host_call(cx, |app, cx| {
+                        app.sidebar_open_folder_dialog(window, cx)
+                    });
                 },
             ))
             .child("打开文件夹…");
@@ -378,13 +376,11 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             })
             .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                 if is_dir {
-                    if let Some(h) = this.host_weak().upgrade() {
-                        let _ = h.update(cx, |app, cx| {
-                            app.sidebar_file_tree_toggle(path.clone(), window, cx)
-                        });
-                    }
-                } else if let Some(h) = this.host_weak().upgrade() {
-                    let _ = h.update(cx, |app, cx| {
+                    this.host_call(cx, |app, cx| {
+                        app.sidebar_file_tree_toggle(path.clone(), window, cx)
+                    });
+                } else {
+                    this.host_call(cx, |app, cx| {
                         app.sidebar_open_path_or_activate(&path, window, cx)
                     });
                 }
@@ -489,11 +485,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     this.model.borrow_mut().files_filter = pending;
                     // `sb.files.layout_gen` 在宿主（域实体不持侧栏状态）→ 经宿主服务
                     // 提交 + notify（实体上下文此时可安全反调宿主：定时器到点）。
-                    if let Some(h) = this.host_weak().upgrade() {
-                        let _ = h.update(app, |host, cx| {
-                            host.sidebar_files_filter_commit(cx);
-                        });
-                    }
+                    this.host_call(app, |host, cx| host.sidebar_files_filter_commit(cx));
                 }
             },
         );

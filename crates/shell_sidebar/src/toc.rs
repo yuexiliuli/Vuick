@@ -78,9 +78,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 域内算 `has_child` → 经宿主 `sidebar_toc_collapse` 落地状态迁移。
     fn toc_collapse_click(&mut self, idx: usize, cx: &mut App) {
         let has_child = self.toc_has_child(idx, cx);
-        if let Some(h) = self.host_weak() .upgrade() {
-            let _ = h.update(cx, |app, cx| app.sidebar_toc_collapse(idx, has_child, cx));
-        }
+        self.host_call(cx, |app, cx| app.sidebar_toc_collapse(idx, has_child, cx));
     }
 
     /// 估算目录文字宽度（px）：CJK 取全宽、ASCII 取 0.6 倍字号。
@@ -507,11 +505,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 .on_click(cx.listener(
                     move |this: &mut Self, _ev: &gpui::ClickEvent, _w, cx| {
                         cx.stop_propagation();
-                        if let Some(h) = this.host_weak() .upgrade() {
-                            let _ = h.update(cx, |app, cx| {
-                                app.sidebar_remove_pdf_bookmark(&del_path, i, cx)
-                            });
-                        }
+                        this.host_call(cx, |app, cx| {
+                            app.sidebar_remove_pdf_bookmark(&del_path, i, cx)
+                        });
                     },
                 ))
                 .child("×");

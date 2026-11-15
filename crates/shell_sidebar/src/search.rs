@@ -704,9 +704,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             cx.notify();
             return;
         }
-        if let Some(h) = self.host_weak().upgrade() {
-            let _ = h.update(cx, |app, cx| app.sidebar_open_path_or_activate(path, window, cx));
-        }
+        self.host_call(cx, |app, cx| app.sidebar_open_path_or_activate(path, window, cx));
         let Some(ti) = self.model.borrow().tabs.iter().position(|t| t.payload.file_path.as_deref() == Some(path))
         else {
             return;
@@ -792,9 +790,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                         .child(nm),
                 )
                 .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
-                    if let Some(h) = this.host_weak().upgrade() {
-                        let _ = h.update(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
-                    }
+                    this.host_call(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
                     cx.notify();
                 }));
             file_rows.push(r.into_any_element());
@@ -837,9 +833,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                         .child(format!("L{}  {}", li + 1, snippet)),
                 )
                 .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
-                    if let Some(h) = this.host_weak().upgrade() {
-                        let _ = h.update(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
-                    }
+                    this.host_call(cx, |app, cx| app.sidebar_activate_tab(ti, window, cx));
                     this.jump_tab_to_hit(ti, li, match_range.clone(), &q_owned, cx);
                     cx.notify();
                 }));

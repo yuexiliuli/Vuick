@@ -165,18 +165,14 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     this.file_tree_menu_entity = None;
                     this.file_tree_menu_pos = None;
                     this.file_tree_menu_sub = None;
-                    if let Some(h) = this.host_weak().upgrade() {
-                        let _ = h.update(cx, |app, cx| app.sidebar_set_file_tree_menu(None, cx));
-                    }
+                    this.host_call(cx, |app, cx| app.sidebar_set_file_tree_menu(None, cx));
                 }
             },
         );
         self.file_tree_menu_pos = Some(ev.position);
         self.file_tree_menu_entity = Some(menu.clone());
         self.file_tree_menu_sub = Some(sub);
-        if let Some(h) = self.host_weak().upgrade() {
-            let _ = h.update(cx, |app, cx| app.sidebar_set_file_tree_menu(Some(menu), cx));
-        }
+        self.host_call(cx, |app, cx| app.sidebar_set_file_tree_menu(Some(menu), cx));
     }
 
     /// 文件树右键菜单 Overlay（光标处弹出，同选项卡栏右键菜单定位姿势）。
@@ -226,9 +222,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let sub = cx.subscribe(&prompt, |this, _e, _: &DismissEvent, cx| {
             this.file_tree_prompt = None;
             this.file_tree_prompt_sub = None;
-            if let Some(h) = this.host_weak().upgrade() {
-                let _ = h.update(cx, |app, cx| app.sidebar_set_file_tree_prompt(None, cx));
-            }
+            this.host_call(cx, |app, cx| app.sidebar_set_file_tree_prompt(None, cx));
         });
         let handle = prompt.read(cx).input_focus(cx);
         window.focus(&handle, cx);

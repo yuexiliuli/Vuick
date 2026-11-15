@@ -86,6 +86,23 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         self.host.clone()
     }
 
+    /// 单向下行宿主回调收口：`host_weak().upgrade()` → 存活则 `h.update(cx, f)` → 失败静默
+    /// （宿主已销毁或 update 失败均丢弃，与逐站点原行为一致）。`C: AppContext` 兼容
+    /// `&mut App` 与 `&mut Context<Self>` 两类调用点上下文；闭包体从原 `if let Some…` 站点
+    /// 逐字搬入。纯机械收敛，不改变任何调用语义。`pub(crate)`：`toc`/`files`/`files_ops`/
+    /// `search` 拆分模块的`Sidebar<H>` impl 需调用。
+    pub(crate) fn host_call<C, R>(
+        &mut self,
+        cx: &mut C,
+        f: impl FnOnce(&mut H, &mut Context<H>) -> R,
+    ) where
+        C: gpui::AppContext,
+    {
+        if let Some(h) = self.host_weak().upgrade() {
+            let _ = h.update(cx, f);
+        }
+    }
+
     /// 搜索输入实体句柄（宿主 `schedule_search_debounce` forwarder / 测试 `search_state(cx)`
     /// 读取器经它取输入实体；实体对宿主只外借只读句柄，状态本体仍在实体自有字段）。
     pub fn search_input_handle(&self) -> Entity<InputState> {
@@ -236,19 +253,15 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 .cursor(CursorStyle::ResizeColumn)
                 .on_hover(cx.listener(
                     |this: &mut Self, hovered: &bool, _w, cx| {
-                        if let Some(h) = this.host_weak() .upgrade() {
-                            let _ = h.update(cx, |app, cx| app.sidebar_set_resize_hovered(*hovered, cx));
-                        }
+                        this.host_call(cx, |app, cx| app.sidebar_set_resize_hovered(*hovered, cx));
                     },
                 ))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this: &mut Self, ev: &gpui::MouseDownEvent, _w, cx| {
-                        if let Some(h) = this.host_weak() .upgrade() {
-                            let _ = h.update(cx, |app, cx| {
-                                app.sidebar_resize_start(ev.position.x.as_f32(), cx)
-                            });
-                        }
+                        this.host_call(cx, |app, cx| {
+                            app.sidebar_resize_start(ev.position.x.as_f32(), cx)
+                        });
                     }),
                 )
                 .child(
@@ -349,9 +362,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                         .opacity(if is_active { 1.0 } else { 0.0 }),
                 )
                 .on_click(cx.listener(move |this: &mut Self, _ev, _w, cx| {
-                    if let Some(h) = this.host_weak() .upgrade() {
-                        let _ = h.update(cx, |app, cx| app.sidebar_toggle_view(view, cx));
-                    }
+                    this.host_call(cx, |app, cx| app.sidebar_toggle_view(view, cx));
                 }))
                 .on_hover({
                     let st = btn_hover.clone();
