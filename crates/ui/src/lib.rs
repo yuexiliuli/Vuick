@@ -49,6 +49,9 @@ pub mod async_state;
 pub mod button;
 /// 卡片壳体绘制底层（`float_card` / B02b `glass_card` 共用底座，纯壳绘制、零裸色）。
 pub mod card_shell;
+/// 内容渲染层颜色令牌（PDF/WYSIWYG/shell_pdf 硬编码内容色字面量集中为命名常量，
+/// 与 `theme::ColorScheme` 语义字段互补；钉值测试守护逐字节一致）。
+pub mod content_colors;
 pub mod empty_state;
 pub mod float_card;
 pub mod focus;

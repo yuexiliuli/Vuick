@@ -4366,6 +4366,7 @@ dependencies = [
  "serde_json",
  "session_store",
  "shell_core",
+ "ui",
 ]
 
 [[package]]

@@ -19,6 +19,8 @@ shell_core = { path = "../shell_core" }
 session_store = { path = "../session_store" }
 # PDF 栅格化视图实体（PdfViewer / RecolorParams / is_writeback_busy_error）。
 pdf = { path = "../pdf" }
+# 共享内容渲染层颜色令牌（`ui::content_colors`：画布预设字节 / 墨迹色）。
+ui = { path = "../ui" }
 # 书签存储 / 背景偏好 JSON 读写（手写 serde_json::Value，不引入 serde derive）。
 serde_json = { workspace = true }
 # 「提取页面为 PDF」另存为对话框（原 shell pdf_menu 同款）。

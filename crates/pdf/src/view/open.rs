@@ -504,14 +504,20 @@ impl PdfViewer {
     }
 
     /// 页面“卡片”配色：纸面白 / 深色纸面，配中性边框（只动 chrome 边框，纸面不改）。
-    /// 未收编：PDF 纸面专属表面色（读纸偏好评级，属 config 非 chrome——与 `bg.rs`
-    /// 用户 PDF 背景偏好同源，随处现观感自然存在；暗 `0x1f2937`/`0x484848`、亮
-    /// 白/`0xe0e0e0` 均非既有 theme token 同值，单消费方，需真机观感裁决再收编）。
+    /// 已收编：`ui::content_colors::PDF_PAPER_*`（读纸偏好评级，属 config 非 chrome——
+    /// 与 `shell_pdf::bg` 用户 PDF 背景偏好同源，随处现观感自然存在；暗
+    /// `0x1f2937`/`0x484848`、亮白/`0xe0e0e0` 均非既有 theme token 同值）。
     pub(super) fn page_card_colors(cx: &App) -> (Hsla, Hsla) {
         if ui::theme::Theme::global(cx).is_dark() {
-            (rgb(0x1f2937).into(), rgb(0x484848).into())
+            (
+                ui::content_colors::PDF_PAPER_BG_DARK,
+                ui::content_colors::PDF_PAPER_BORDER_DARK,
+            )
         } else {
-            (gpui::white(), rgb(0xe0e0e0).into())
+            (
+                ui::content_colors::PDF_PAPER_BG_LIGHT,
+                ui::content_colors::PDF_PAPER_BORDER_LIGHT,
+            )
         }
     }
 

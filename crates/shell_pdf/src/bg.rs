@@ -19,6 +19,9 @@ use config::user::PdfBgPref;
 use gpui::App;
 use pdf::{PdfViewer, RecolorParams};
 use shell_core::{AppModel, MediaReader};
+use ui::content_colors::{
+    CANVAS_DARK_INK, CANVAS_PRESET_EYE, CANVAS_PRESET_NIGHT, CANVAS_PRESET_PARCHMENT,
+};
 
 /// 解析 `#rrggbb`（去空白/前缀，6 位十六进制）→ `[u8;3]`（R,G,B）。非法 → `None`。
 pub fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
@@ -30,11 +33,12 @@ pub fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
     Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
 }
 
-/// 深色档墨迹色（浅灰，R/G/B）：夜间/自定义深色画布下文字提亮至此——略柔的浅灰，
-/// 在 #202020 类深底上对比充足（≈11:1）又不刺眼（如需改白字，只动此常量）。
-const DARK_INK: [u8; 3] = [0xD8, 0xD8, 0xD8];
+/// RGB 字节三元组 → `Hsla`（与 `gpui::rgb(hex).into()` 同值；画布预设与自定义共用）。
+fn rgb_bytes_to_hsla([r, g, b]: [u8; 3]) -> gpui::Hsla {
+    gpui::rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into()
+}
 
-/// 画布色「深色」判定（感知亮度 < 0.5 → 深色）：深色画布配浅墨迹（`DARK_INK`）保证
+/// 画布色「深色」判定（感知亮度 < 0.5 → 深色）：深色画布配浅墨迹（`CANVAS_DARK_INK`）保证
 /// 文字可读；浅色画布（护眼/羊皮纸/浅色自定义）只染纸面、内容直通。
 fn is_dark_bg(rgb: [u8; 3]) -> bool {
     let [r, g, b] = rgb;
@@ -45,7 +49,7 @@ fn is_dark_bg(rgb: [u8; 3]) -> bool {
 /// hex 语法，double 兜底。
 pub fn parse_hex_hsla(s: &str) -> Option<gpui::Hsla> {
     let [r, g, b] = parse_hex_rgb(s)?;
-    Some(gpui::rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into())
+    Some(rgb_bytes_to_hsla([r, g, b]))
 }
 
 /// 当前 PDF 画布底色映射（读 `&AppModel`）：`None` = 跟随主题（viewer 回落
@@ -53,9 +57,9 @@ pub fn parse_hex_hsla(s: &str) -> Option<gpui::Hsla> {
 pub fn canvas_bg(m: &AppModel) -> Option<gpui::Hsla> {
     match m.pdf_bg {
         PdfBgPref::Default => None,
-        PdfBgPref::Night => Some(gpui::rgb(0x20_20_20).into()),
-        PdfBgPref::Eye => Some(gpui::rgb(0xC7_ED_CC).into()),
-        PdfBgPref::Parchment => Some(gpui::rgb(0xFB_F0_D9).into()),
+        PdfBgPref::Night => Some(rgb_bytes_to_hsla(CANVAS_PRESET_NIGHT)),
+        PdfBgPref::Eye => Some(rgb_bytes_to_hsla(CANVAS_PRESET_EYE)),
+        PdfBgPref::Parchment => Some(rgb_bytes_to_hsla(CANVAS_PRESET_PARCHMENT)),
         PdfBgPref::Custom => m.pdf_bg_custom.as_deref().and_then(parse_hex_hsla),
     }
 }
@@ -69,14 +73,16 @@ pub fn canvas_recolor(m: &AppModel) -> Option<RecolorParams> {
     let dark_ink = is_dark_bg;
     match m.pdf_bg {
         PdfBgPref::Default => None,
-        PdfBgPref::Night => Some(RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some(DARK_INK) }),
-        PdfBgPref::Eye => Some(RecolorParams { bg: [0xC7, 0xED, 0xCC], ink: None }),
-        PdfBgPref::Parchment => Some(RecolorParams { bg: [0xFB, 0xF0, 0xD9], ink: None }),
+        PdfBgPref::Night => {
+            Some(RecolorParams { bg: CANVAS_PRESET_NIGHT, ink: Some(CANVAS_DARK_INK) })
+        }
+        PdfBgPref::Eye => Some(RecolorParams { bg: CANVAS_PRESET_EYE, ink: None }),
+        PdfBgPref::Parchment => Some(RecolorParams { bg: CANVAS_PRESET_PARCHMENT, ink: None }),
         PdfBgPref::Custom => m
             .pdf_bg_custom
             .as_deref()
             .and_then(parse_hex_rgb)
-            .map(|bg| RecolorParams { bg, ink: dark_ink(bg).then_some(DARK_INK) }),
+            .map(|bg| RecolorParams { bg, ink: dark_ink(bg).then_some(CANVAS_DARK_INK) }),
     }
 }
 

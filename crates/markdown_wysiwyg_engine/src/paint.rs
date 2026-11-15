@@ -350,10 +350,11 @@ pub fn paint_image_row(
         window.paint_quad(gpui::PaintQuad {
             bounds: hb,
             corner_radii: gpui::Corners::all(px(3.)),
-            // 图片缩放柄 = 黑玻璃 × 白细边（浮在图上、专属控件色，不升 token）
-            background: gpui::hsla(0., 0., 0.9, 0.65).into(),
+            // 图片缩放柄 = 黑玻璃 × 白细边（浮在图上、专属控件色；token 见
+            // `ui::content_colors::WY_GLASS_*`）
+            background: ui::content_colors::WY_GLASS_HANDLE_BG.into(),
             border_widths: gpui::Edges::all(px(1.)),
-            border_color: gpui::hsla(0., 0., 1., 0.55),
+            border_color: ui::content_colors::WY_GLASS_BORDER,
             border_style: gpui::BorderStyle::Solid,
         });
     }
@@ -378,10 +379,10 @@ fn paint_image_edit_button(
     window.paint_quad(gpui::PaintQuad {
         bounds: btn,
         corner_radii: gpui::Corners::all(px((f32::from(btn.size.width) * 0.25).min(6.))),
-        // 图片编辑钮 = 黑玻璃 × 白细边（专属控件色，不升 token）
-        background: gpui::hsla(0., 0., 0.9, 0.6).into(),
+        // 图片编辑钮 = 黑玻璃 × 白细边（专属控件色；token 见 `ui::content_colors::WY_GLASS_*`）
+        background: ui::content_colors::WY_GLASS_BTN_BG.into(),
         border_widths: gpui::Edges::all(px(1.)),
-        border_color: gpui::hsla(0., 0., 1., 0.55),
+        border_color: ui::content_colors::WY_GLASS_BORDER,
         border_style: gpui::BorderStyle::Solid,
     });
     let dot_size: f32 = 3.;
@@ -397,8 +398,8 @@ fn paint_image_edit_button(
         window.paint_quad(gpui::PaintQuad {
             bounds: Bounds::new(point(dot_x, dot_y0 + px(k as f32 * step)), dot),
             corner_radii: gpui::Corners::all(px(dot_size / 2.)),
-            // 编辑钮三点 = 纯黑不透明（专属控件色，不升 token）
-            background: gpui::hsla(0., 0., 0.22, 1.).into(),
+            // 编辑钮三点 = 纯黑不透明（专属控件色；token 见 `ui::content_colors::WY_GLASS_DOT`）
+            background: ui::content_colors::WY_GLASS_DOT.into(),
             border_widths: gpui::Edges::default(),
             border_color: gpui::Hsla::default(),
             border_style: gpui::BorderStyle::Solid,
@@ -564,13 +565,14 @@ pub fn paint_quote_band(
 
 /// 每个警报（callout）对应的条色（明/暗主题微调，区分五类警报）。
 pub fn alert_color(theme: &WyTheme, kind: AlertKind) -> Hsla {
-    // 5 类警报条专属 accent（表单内容色、仅 callout 条消费；WyTheme 无此栏，值≠既有 token，不升 token）
+    // 5 类警报条 base 色（表单内容色、仅 callout 条消费；WyTheme 无此栏，base 值与既有
+    // theme token 不同 —— token 集中在 `ui::content_colors::WY_ALERT_*_BASE`）
     let mut c: Hsla = match kind {
-        AlertKind::Note => gpui::rgb(0x3b82f6).into(),
-        AlertKind::Tip => gpui::rgb(0x10b981).into(),
-        AlertKind::Important => gpui::rgb(0x8b5cf6).into(),
-        AlertKind::Warning => gpui::rgb(0xf59e0b).into(),
-        AlertKind::Caution => gpui::rgb(0xef4444).into(),
+        AlertKind::Note => ui::content_colors::WY_ALERT_NOTE_BASE,
+        AlertKind::Tip => ui::content_colors::WY_ALERT_TIP_BASE,
+        AlertKind::Important => ui::content_colors::WY_ALERT_IMPORTANT_BASE,
+        AlertKind::Warning => ui::content_colors::WY_ALERT_WARNING_BASE,
+        AlertKind::Caution => ui::content_colors::WY_ALERT_CAUTION_BASE,
     };
     if theme.is_dark {
         c.l = (c.l + 0.12).clamp(0., 1.);
@@ -1397,11 +1399,12 @@ pub fn paint_note_marker_highlight(
     window: &mut Window,
     cx: &mut App,
 ) {
-    // 注记跳转加亮 = 蓝系 accent 淡色半透明（仅预览引擎消费；doc_selection_bg 值不同，非 A/B）
+    // 注记跳转加亮 = 蓝系 accent 淡色半透明（仅预览引擎消费；token 见
+    // `ui::content_colors::WY_NOTE_JUMP_HL_{DARK,LIGHT}`，与 doc_selection_bg 值不同，非 A/B）
     let hl: Hsla = if ui::theme::Theme::global(cx).is_dark() {
-        gpui::rgba(0x58a6ff59).into()
+        ui::content_colors::WY_NOTE_JUMP_HL_DARK
     } else {
-        gpui::rgba(0x9ec9ff88).into()
+        ui::content_colors::WY_NOTE_JUMP_HL_LIGHT
     };
     let range = rd.borrow().marker_hl.get().and_then(|(src_line, n, is_def)| {
         note_marker_src_range(rd, host, f, src_line, n, is_def)
@@ -1424,11 +1427,12 @@ pub fn paint_search_highlight(
     let Some(range) = host.search_highlight_range() else {
         return;
     };
-    // 预览搜索命中 = 淡黄半透明（仅本引擎消费；editor_find_* 值不同，非 A/B）
+    // 预览搜索命中 = 淡黄半透明（仅本引擎消费；token 见
+    // `ui::content_colors::WY_SEARCH_HIT_HL_{DARK,LIGHT}`，与 editor_find_* 值不同，非 A/B）
     let hl: Hsla = if ui::theme::Theme::global(cx).is_dark() {
-        gpui::rgba(0xf59e0b47).into()
+        ui::content_colors::WY_SEARCH_HIT_HL_DARK
     } else {
-        gpui::rgba(0xfef08a8c).into()
+        ui::content_colors::WY_SEARCH_HIT_HL_LIGHT
     };
     paint_selection(rd, host, origin, theme, f, &range, hl, window, cx);
 }
