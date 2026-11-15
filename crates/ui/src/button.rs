@@ -45,7 +45,6 @@ pub enum ButtonVariant {
     #[allow(dead_code)] // 同上：公开变体待后续调用点
     Link,
     /// 纯文本按钮（透明、无边框，悬浮轻微着染）。
-    #[allow(dead_code)] // 同上：公开变体待后续调用点
     Text,
 }
 
@@ -106,7 +105,6 @@ pub trait ButtonVariants: Sized {
         self.with_variant(ButtonVariant::Link)
     }
 
-    #[allow(dead_code)]
     fn text(self) -> Self {
         self.with_variant(ButtonVariant::Text)
     }
@@ -158,7 +156,6 @@ impl Button {
     }
 
     /// 注册点击回调（指针 + 聚焦后的 Enter/Space）。
-    #[allow(dead_code)] // 公开 API：测试使用；App 菜单栏按钮现经下拉菜单触发，后续调用点接入
     pub fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,

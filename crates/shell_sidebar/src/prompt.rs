@@ -11,10 +11,10 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, px, AnimationExt, App, AppContext, Context, CursorStyle, DismissEvent, EventEmitter,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, px, AnimationExt, App, AppContext, Context, DismissEvent, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, ParentElement, Render, Styled, WeakEntity, Window,
 };
+use ui::button::ButtonVariants as _;
 use ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 use ui::input::{Input, InputEvent, InputState};
 use ui::motion::hover_spring;
@@ -222,33 +222,36 @@ impl<H: FileTreePromptHost> Render for FileTreePrompt<H> {
         let border_color = ui::focus_border_color(window, &input_focus, colors.border.into(), cx);
         // 按钮：取消 = 次要灰字；确定 = 强调色字（主题色，无硬编码）。
         // 点击确定 → 提交（与回车同语义）；点击取消 → 关闭（与 Esc 同语义）。
-        let ok_btn = div()
-            .id("file-tree-prompt-ok")
+        // 复用 ui::Button::Text 变体：`px_3/py_1/rounded_md/text_size(12)` 走 Styled 链保留
+        // 现状几何；`text_color` 沿用 accent/muted 覆盖 Text 默认 fg；`tab_stop(false)` 保持
+        // 旧裸 div 的「不可 Tab 聚焦/无键盘激活」焦点语义（焦点在输入框，回车直达提交）。
+        let ok_btn = ui::button::Button::new("file-tree-prompt-ok")
             .debug_selector(|| "file-tree-prompt-ok".into())
+            .text()
+            .label("确定")
             .px_3()
             .py_1()
             .rounded_md()
             .text_size(px(12.))
             .text_color(accent)
-            .cursor(CursorStyle::PointingHand)
+            .tab_stop(false)
             .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                 this.submit(window, cx);
             }))
-            .child("确定")
             .into_any_element();
-        let cancel_btn = div()
-            .id("file-tree-prompt-cancel")
+        let cancel_btn = ui::button::Button::new("file-tree-prompt-cancel")
             .debug_selector(|| "file-tree-prompt-cancel".into())
+            .text()
+            .label("取消")
             .px_3()
             .py_1()
             .rounded_md()
             .text_size(px(12.))
             .text_color(muted)
-            .cursor(CursorStyle::PointingHand)
+            .tab_stop(false)
             .on_click(cx.listener(move |this: &mut Self, _ev, window, cx| {
                 this.close(window, cx);
             }))
-            .child("取消")
             .into_any_element();
         let card = ui::float_card(
             &colors,
