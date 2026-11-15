@@ -11,7 +11,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, DefiniteLength, Entity, InteractiveElement as _,
@@ -21,6 +21,7 @@ use gpui::{
 
 use crate::model::RepeatMode;
 use crate::player::MusicPlayer;
+use crate::scrub::ScrubState;
 
 use super::icon::{IconView, MusicIcon};
 use super::{IntoIconElement, MusicView, RightTab, theme};
@@ -33,9 +34,6 @@ pub(super) const BOTTOM_H: f32 = 80.0;
 /// 进度心跳周期（ms，目标 ~8Hz）：播放中每拍自 notify 刷新进度/时间文本。
 /// 暂停/空闲不 notify——进度心跳不与父 250ms tick 重复刷（父 tick 仍是结构/歌词的 4Hz 基准）。
 const HEARTBEAT_MS: u64 = 120;
-
-/// 进度条拖拽真实 seek 节流（ms）：与父 `SCRUB_RETARGET_MS` 同量级（密集 move 防刷爆 worker）。
-const SCRUB_RETARGET_MS: u64 = 60;
 
 /// 底栏全部可悬停提示钮的 id：其窗口盒写入父 `tip_boxes` 同名 cell（tooltip 锚定按钮盒，
 /// 全局浮层由父 `render_tooltip` 绘制——保证「父对全局 tooltip 层保持」且 T 系列回归不破）。
@@ -65,11 +63,9 @@ pub(super) struct BottomBarView {
     bb_vol: Rc<Cell<Bounds<Pixels>>>,
     /// 各悬停钮的窗口盒（写入父 tip_boxes 同名 cell；tooltip 锚定经父全局层渲染）。
     tip_cells: HashMap<&'static str, Rc<Cell<Bounds<Pixels>>>>,
-    // 进度条拖拽交互态（本视图自管；np/fs 条的拖拽态仍在父——二者不同时共存于单指针）
-    scrubbing: bool,
-    scrub_target: f64,
-    scrub_seeked: Option<f64>,
-    last_scrub_retarget: Option<Instant>,
+    // 进度条拖拽交互态（本视图自管；np/fs 条的拖拽态仍在父——二者不同时共存于单指针；
+    // 收敛自 scrub 节流状态机，见 scrub.rs 本批 Pattern 2）。
+    scrub: ScrubState,
     /// 进度心跳循环句柄（view 销毁即取消）。
     _heartbeat: Option<gpui::Task<()>>,
 }
@@ -103,10 +99,7 @@ impl BottomBarView {
             bb_progress: Rc::new(Cell::new(Bounds::default())),
             bb_vol: Rc::new(Cell::new(Bounds::default())),
             tip_cells,
-            scrubbing: false,
-            scrub_target: 0.0,
-            scrub_seeked: None,
-            last_scrub_retarget: None,
+            scrub: ScrubState::new(),
             _heartbeat: Some(heartbeat),
         }
     }
@@ -703,31 +696,27 @@ impl BottomBarView {
         }
     }
 
-    /// seek 点按进拖拽态 + 立即真实 seek（Slider `on_change`；原 `on_strip_down` seek 分支）。
+    /// seek 点按进拖拽态 + 立即真实 seek（Slider `on_change`；原 `on_strip_down` seek 分支；
+    /// 委托 `ScrubState::begin`，scrub.rs 本批 Pattern 2）。
     fn begin_scrub(&mut self, f: f32, window: &mut Window, cx: &mut Context<Self>) {
-        // 补回根聚焦（Slider 拦了冒泡；点按即把焦点交回根）。
-        self.focus_music_root(window, cx);
-        self.scrubbing = true;
-        self.last_scrub_retarget = Some(Instant::now());
-        // 拖拽中 position() 钉在 seek_base（显示跟手指、不随时钟漂移）。
-        self.player.update(cx, |p, cx| p.set_scrubbing(true, cx));
-        self.seek_to_fraction(f, true, cx);
+        // 根聚焦闭包不捕获整个 self（`&mut self.scrub` 与 `&self.player` 需共存）：克隆父弱柄取走。
+        let parent = self.parent.clone();
+        self.scrub.begin(f, window, cx, &self.player, move |w, cx| {
+            // 补回根聚焦（Slider 拦了冒泡；点按即把焦点交回根）。
+            if let Some(root) = parent.upgrade() {
+                cx.focus_view(&root, w);
+            }
+        });
     }
 
-    /// seek 拖拽 move：节流真实 seek、节流窗内 set_seek_base 跟手（Slider
-    /// `on_change_during_drag`；原 `on_strip_drag` seek 分支——「松手但 move 未达」由 Slider
-    /// 自有 MouseUp 兜底，不再需要旧 `ev.dragging()` 探针）。
+    /// seek 拖拽 move：节流真实 seek（Slider `on_change_during_drag`；委托 `ScrubState::drag`）。
     fn drag_scrub(&mut self, f: f32, cx: &mut Context<Self>) {
-        self.seek_to_fraction(f, false, cx);
+        self.scrub.drag(f, cx, &self.player);
     }
 
-    /// seek 松手精提交：按松手点精确分数更新落点（窗外沿用最后锁定落点——Slider 把 f 算成
-    /// 精确/锁定分数），再补发末次精提交（Slider `on_commit`；原 `on_strip_up` +
-    /// `end_strip_scrub`）。
+    /// seek 松手精提交（Slider `on_commit`；委托 `ScrubState::end`）。
     fn end_scrub(&mut self, f: f32, cx: &mut Context<Self>) {
-        let dur = self.player.read(cx).duration();
-        self.scrub_target = dur * f as f64;
-        self.end_strip_scrub(cx);
+        self.scrub.end(f, cx, &self.player);
     }
 
     /// vol 即时应用：`set_volume` + 本视图 notify（Slider `on_change`/`on_change_during_drag`
@@ -737,50 +726,6 @@ impl BottomBarView {
         self.focus_music_root(window, cx);
         self.player.update(cx, |p, cx| p.set_volume(f, cx));
         // 音量视觉同进度：本视图自身 notify，点/拖即时刷新、不寄生动画/tick 帧。
-        cx.notify();
-    }
-
-    /// 拖拽收尾：若最终落点尚未真实 seek（节流窗口内直接松手）→ 补发最后一次精确提交。
-    fn end_strip_scrub(&mut self, cx: &mut Context<Self>) {
-        if !self.scrubbing {
-            return;
-        }
-        let target = self.scrub_target;
-        self.scrubbing = false;
-        // 先解锁播放器显示基准（拖拽钉扎解除），再按最终落点提交真实 seek。
-        self.player.update(cx, |p, cx| p.set_scrubbing(false, cx));
-        if self.scrub_seeked != Some(target) {
-            self.scrub_seeked = Some(target);
-            self.player.update(cx, |p, cx| p.seek(target, cx));
-        }
-        cx.notify();
-    }
-
-    /// 把进度条分数应用为 seek 落点：`force=true` 无条件真实 seek；`false` 走节流——
-    /// 节流窗口内只更新显示基准（`set_seek_base`，显示由 seek_base 即时跟手）。
-    fn seek_to_fraction(&mut self, f: f32, force: bool, cx: &mut Context<Self>) {
-        let dur = self.player.read(cx).duration();
-        let target = dur * f as f64;
-        self.scrub_target = target;
-        if force {
-            self.last_scrub_retarget = Some(Instant::now());
-            self.scrub_seeked = Some(target);
-            self.player.update(cx, |p, cx| p.seek(target, cx));
-        } else {
-            let due = match self.last_scrub_retarget {
-                Some(t) => t.elapsed() >= Duration::from_millis(SCRUB_RETARGET_MS),
-                None => true,
-            };
-            if due {
-                self.last_scrub_retarget = Some(Instant::now());
-                self.scrub_seeked = Some(target);
-                self.player.update(cx, |p, cx| p.seek(target, cx));
-            } else {
-                // 节流窗口内：显示仍逐 move 实时跟手（仅更新显示基准，不发 worker seek）。
-                self.player.update(cx, |p, cx| p.set_seek_base(target, cx));
-            }
-        }
-        // 拖动/点按跟手不寄生动画/tick：由本视图自己 notify 驱动重绘。
         cx.notify();
     }
 }

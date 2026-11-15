@@ -17,6 +17,7 @@ pub mod player;
 pub mod view;
 mod cover;  // 私有：封面图像解码（同名 .jpg/.png/.webp → RenderImage）
 mod decode; // 私有：media_io 桥音频子集包装（START_CAP/reserve/-1 扩容保留在 music）
+mod scrub;  // 私有：进度条 seek/scrub 节流状态机（bottom/npbar 共用，本批 Pattern 2）
 mod sink;   // 私有：media_io AudioSink 复用（err "[music]"）
 
 pub use library::{AUDIO_EXTENSIONS, is_audio_extension};
