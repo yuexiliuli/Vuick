@@ -2,6 +2,148 @@ use super::*;
 
 use crate::markdown::parse::recognition::{self, LinkHit};
 
+/// 三段横向滚动条（代码块 / 表格 / 数学卡）的统一 kind。P3 / Slice B 收敛：
+/// `mouse.rs` 的跳转 / 拖拽 / 按下 / 移动 / 松开接线按 kind 分发，行为与拆分前逐字节等价。
+#[derive(Clone, Copy, PartialEq)]
+enum HScrollKind {
+    Code,
+    Table,
+    Math,
+}
+
+impl HScrollKind {
+    /// 全部 kind（拖拽轮询 / 松开清槽按序使用，次序 = 拆分前三段 if 顺序）。
+    const ALL: [HScrollKind; 3] = [Self::Code, Self::Table, Self::Math];
+
+    /// 行定位谓词（**保留各侧既有单条件语义**，勿换 engine hit 侧双条件 `wrapped`）：
+    /// code 有多段偏移、table 有表格、math 卡为 Math 卡。
+    fn row_matches(self, r: &ShapedRow) -> bool {
+        match self {
+            HScrollKind::Code => !r.multi_offsets.is_empty(),
+            HScrollKind::Table => r.table.is_some(),
+            HScrollKind::Math => matches!(&r.extra.card, Some(element::BlockCard::Math { .. })),
+        }
+    }
+
+    /// 滚动条几何（engine Slice A 仍为元组 `(bar_x, bar_w, _, thumb_w, max_scroll)`，消费端不动）。
+    fn geo(self, this: &WyEditor, f: &Frame, r: &ShapedRow) -> Option<(f32, f32, f32, f32, f32)> {
+        match self {
+            HScrollKind::Code => element::code_hscroll_geo(this, f, r),
+            HScrollKind::Table => element::table_hscroll_geo(this, f, r),
+            HScrollKind::Math => element::math_hscroll_geo(this, f, r),
+        }
+    }
+
+    /// 写滚动偏移（view `set_*_h_scroll`）；跳转由 `h_scroll_bar_down` 外层 notify、
+    /// 拖拽由 `h_scroll_drag_apply` 内部 notify。
+    fn set_scroll(self, this: &WyEditor, blk: usize, v: f32) {
+        match self {
+            HScrollKind::Code => this.set_code_h_scroll(blk, v),
+            HScrollKind::Table => this.set_table_h_scroll(blk, v),
+            HScrollKind::Math => this.set_math_h_scroll(blk, v),
+        }
+    }
+
+    /// 读拖拽槽（`rd.*_h_drag`，`Option<(块首源码行, 抓取点偏移)>`）。
+    fn drag_get(self, this: &WyEditor) -> Option<(usize, f32)> {
+        let rd = this.rd.borrow();
+        match self {
+            HScrollKind::Code => *rd.code_h_drag.borrow(),
+            HScrollKind::Table => *rd.table_h_drag.borrow(),
+            HScrollKind::Math => *rd.math_h_drag.borrow(),
+        }
+    }
+
+    /// 写 / 清拖拽槽。
+    fn drag_set(self, this: &WyEditor, v: Option<(usize, f32)>) {
+        let rd = this.rd.borrow_mut();
+        match self {
+            HScrollKind::Code => *rd.code_h_drag.borrow_mut() = v,
+            HScrollKind::Table => *rd.table_h_drag.borrow_mut() = v,
+            HScrollKind::Math => *rd.math_h_drag.borrow_mut() = v,
+        }
+    }
+}
+
+/// 行定位 + 几何 + p_local + rel(clamp) → `Some(rel*max_scroll)`。
+/// `grab=None`=轨道跳转（滑块中心对准点击点）；`Some(grab)`=拖拽（抓取点相对滑块左缘 1:1 跟随）。
+/// P3 / Slice B 收敛：三段 `*_bar_jump_to` 与三段 `*_h_drag_apply` 的公共几何/换算提炼。
+fn h_scroll_rel(
+    this: &WyEditor,
+    kind: HScrollKind,
+    blk: usize,
+    pos: gpui::Point<Pixels>,
+    grab: Option<f32>,
+) -> Option<f32> {
+    let marker = this.rd.borrow().frame.borrow().clone();
+    let f = marker.as_ref().map(|r| &**r)?;
+    let r = f
+        .rows
+        .iter()
+        .find(|r| r.src_line == blk && kind.row_matches(r))?;
+    let (bar_x, bar_w, _, thumb_w, max_scroll) = kind.geo(this, f, r)?;
+    let origin_x = this
+        .last_bounds()
+        .map(|b| f32::from(b.origin.x))
+        .unwrap_or(0.);
+    let elem_w = this
+        .last_bounds()
+        .map(|b| f32::from(b.size.width))
+        .unwrap_or(0.);
+    // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
+    let p_local = f32::from(pos.x) - origin_x - this.reading_col_shift(elem_w);
+    let travel = (bar_w - thumb_w).max(1.);
+    // 中心对齐跳转：thumb_x = px − thumb_w/2；抓点跟随：thumb_x = px − grab。
+    let anchor = grab.unwrap_or(thumb_w / 2.0);
+    let rel = ((p_local - bar_x - anchor) / travel).clamp(0., 1.);
+    Some(rel * max_scroll)
+}
+
+/// 把指针位置应用到正在拖动的横向滚动条（抓取点相对滑块左缘 1:1 跟随）。
+/// P3 / Slice B 收敛：三段 `*_h_drag_apply` 合并；**notify 在内部**（on_mouse_move /
+/// on_mouse_down 的 on_thumb 路径均无外层 notify，与拆分前逐字节一致）。
+fn h_scroll_drag_apply(
+    this: &WyEditor,
+    kind: HScrollKind,
+    pos: gpui::Point<Pixels>,
+    cx: &mut Context<WyEditor>,
+) {
+    let Some((blk, grab)) = kind.drag_get(this) else {
+        return;
+    };
+    let Some(v) = h_scroll_rel(this, kind, blk, pos, Some(grab)) else {
+        return;
+    };
+    kind.set_scroll(this, blk, v);
+    cx.notify();
+}
+
+/// on_mouse_down 三分支（code/table/math）合并单路径：命中 → `on_thumb`? 记槽 + 拖拽应用
+/// （内部 notify） : 跳转（**外层 notify**，即本函数末尾，调用方不重复 notify）。
+/// P3 / Slice B 收敛。notify 时序与拆分前一致：拖拽内层 / 跳转外层。
+fn h_scroll_bar_down(
+    this: &WyEditor,
+    kind: HScrollKind,
+    blk: usize,
+    on_thumb: bool,
+    grab: f32,
+    pos: gpui::Point<Pixels>,
+    window: &mut Window,
+    cx: &mut Context<WyEditor>,
+) {
+    this.focus.focus(window, cx);
+    if on_thumb {
+        kind.drag_set(this, Some((blk, grab)));
+        h_scroll_drag_apply(this, kind, pos, cx);
+    } else {
+        // 跳转：滑块中心对准点击点（`rel = (px − bar_x − thumb_w/2)/travel`）。
+        if let Some(v) = h_scroll_rel(this, kind, blk, pos, None) {
+            kind.set_scroll(this, blk, v);
+        }
+        cx.notify();
+    }
+}
+
 /// WyEditor 鼠标输入 / 命中 / 叙事条与图卡横向滚动条交互（M2.1 自 mod.rs 拆出）。
 impl WyEditor {
     /* ---------- 点击 / 鼠标 ---------- */
@@ -136,33 +278,37 @@ impl WyEditor {
             }
             // 表格横向滚动条（内容超宽的表格底部轨道）：点在**滑块**上 → 拖动；
             // 点在**轨道**上 → 滑块直接跳到点击处（view 的 gpui-component 语义）。
+            // P3 / Slice B 收敛：三分支合并为按 kind 分发（notify 时序同前：拖拽内层 / 跳转外层）。
             if let Some((blk, on_thumb, grab)) = element::table_hscrollbar_hit(self, f, ev.position)
             {
                 drop(marker);
-                self.focus.focus(window, cx);
-                if on_thumb {
-                    *self.rd.borrow_mut().table_h_drag.borrow_mut() = Some((blk, grab));
-                    self.table_h_drag_apply(ev.position, cx);
-                } else {
-                    self.table_bar_jump_to(blk, ev.position);
-                    cx.notify();
-                }
+                h_scroll_bar_down(
+                    self,
+                    HScrollKind::Table,
+                    blk,
+                    on_thumb,
+                    grab,
+                    ev.position,
+                    window,
+                    cx,
+                );
                 return;
             }
-            // 代码块横向滚动条（内容超宽的块底部轨道）：点在**滑块**上 → 拖动；
-            // 点在**轨道**上 → 滑块直接跳到点击处（view 的 gpui-component 语义）。
+            // 代码块横向滚动条（内容超宽的块底部轨道）：滑块 → 拖；轨道 → 跳转
+            // （与表格/数学卡同语义，统一 helper）。
             if let Some((blk, on_thumb, grab)) = element::code_hscrollbar_hit(self, f, ev.position)
             {
                 drop(marker);
-                self.focus.focus(window, cx);
-                if on_thumb {
-                    *self.rd.borrow_mut().code_h_drag.borrow_mut() = Some((blk, grab));
-                    self.code_h_drag_apply(ev.position, cx);
-                } else {
-                    // 跳转：滑块中心对准点击点（·`rel = (px − bar_x − thumb_w/2)/travel`）。
-                    self.code_bar_jump_to(blk, ev.position);
-                    cx.notify();
-                }
+                h_scroll_bar_down(
+                    self,
+                    HScrollKind::Code,
+                    blk,
+                    on_thumb,
+                    grab,
+                    ev.position,
+                    window,
+                    cx,
+                );
                 return;
             }
             // 数学卡横向滚动条（超宽公式卡的底部轨道）：滑块 → 拖；轨道 → 跳转
@@ -170,14 +316,16 @@ impl WyEditor {
             if let Some((blk, on_thumb, grab)) = element::math_hscrollbar_hit(self, f, ev.position)
             {
                 drop(marker);
-                self.focus.focus(window, cx);
-                if on_thumb {
-                    *self.rd.borrow_mut().math_h_drag.borrow_mut() = Some((blk, grab));
-                    self.math_h_drag_apply(ev.position, cx);
-                } else {
-                    self.math_bar_jump_to(blk, ev.position);
-                    cx.notify();
-                }
+                h_scroll_bar_down(
+                    self,
+                    HScrollKind::Math,
+                    blk,
+                    on_thumb,
+                    grab,
+                    ev.position,
+                    window,
+                    cx,
+                );
                 return;
             }
             // C1: 点击任务框 → 翻转 `[ ]` ↔ `[x]`（写源码，走撤销栈）。
@@ -330,18 +478,13 @@ impl WyEditor {
             self.apply_image_resize(ev.position.x, cx);
             return;
         }
-        // 代码/表格/数学卡横向滚动条拖动优先（不参与选区拖选）。
-        if self.rd.borrow().code_h_drag.borrow().is_some() {
-            self.code_h_drag_apply(ev.position, cx);
-            return;
-        }
-        if self.rd.borrow().table_h_drag.borrow().is_some() {
-            self.table_h_drag_apply(ev.position, cx);
-            return;
-        }
-        if self.rd.borrow().math_h_drag.borrow().is_some() {
-            self.math_h_drag_apply(ev.position, cx);
-            return;
+        // 代码/表格/数学卡横向滚动条拖动优先（不参与选区拖选）。P3 / Slice B 收敛：
+        // 三连 if 合为按 kind 轮询（Code → Table → Math 次序不变，命中即 apply + 内部 notify 后 return）。
+        for kind in HScrollKind::ALL {
+            if kind.drag_get(self).is_some() {
+                h_scroll_drag_apply(self, kind, ev.position, cx);
+                return;
+            }
         }
         // 未拖选：更新图片悬浮态（命中图片盒 → 该图右上角浮现编辑按钮）。
         // 拖选中不更新（指针离开图片也不应隐藏按钮，避免拖到别处时误闪烁）。
@@ -483,217 +626,15 @@ impl WyEditor {
             .and_then(|f| element::image_resize_handle_hit_at(self, f, pos))
             .is_some()
     }
-    /// 代码块滚动条**轨道点击跳转**：滑块中心对准点击点（view 语义：不在滑块上
-    /// 按轨道即跳转，而不是像旧实现那样点空白处无反应）。
-    fn code_bar_jump_to(&self, blk: usize, pos: gpui::Point<Pixels>) {
-                let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
-            return;
-        };
-        let Some(r) = f
-            .rows
-            .iter()
-            .find(|r| r.src_line == blk && !r.multi_offsets.is_empty())
-        else {
-            return;
-        };
-        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::code_hscroll_geo(self, f, r)
-        else {
-            return;
-        };
-        let origin_x = self
-            .last_bounds()
-            .map(|b| f32::from(b.origin.x))
-            .unwrap_or(0.);
-        let elem_w = self
-            .last_bounds()
-            .map(|b| f32::from(b.size.width))
-            .unwrap_or(0.);
-        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
-        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
-        let travel = (bar_w - thumb_w).max(1.);
-        // 滑块中心对准点击点：center = p_local → thumb_x = p_local − thumb_w/2。
-        let rel = ((p_local - bar_x - thumb_w / 2.0) / travel).clamp(0., 1.);
-        drop(marker);
-        self.set_code_h_scroll(blk, rel * max_scroll);
-    }
-    /// 把指针位置应用到正在拖动的代码块横向滚动条（保持**抓取点相对滑块左缘**：
-    /// `thumb_x = px - grab`，按下瞬间 scroll 不变、拖动时滑块钉住抓取点 1:1 跟随）。
-    fn code_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some((blk, grab)) = *self.rd.borrow().code_h_drag.borrow() else {
-            return;
-        };
-                let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
-            return;
-        };
-        let Some(r) = f
-            .rows
-            .iter()
-            .find(|r| r.src_line == blk && !r.multi_offsets.is_empty())
-        else {
-            return;
-        };
-        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::code_hscroll_geo(self, f, r)
-        else {
-            return;
-        };
-        let origin_x = self
-            .last_bounds()
-            .map(|b| f32::from(b.origin.x))
-            .unwrap_or(0.);
-        let elem_w = self
-            .last_bounds()
-            .map(|b| f32::from(b.size.width))
-            .unwrap_or(0.);
-        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
-        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
-        let travel = (bar_w - thumb_w).max(1.);
-        let rel = ((p_local - bar_x - grab) / travel).clamp(0., 1.);
-        drop(marker);
-        self.set_code_h_scroll(blk, rel * max_scroll);
-        cx.notify();
-    }
-    /// 表格滚动条**轨道点击跳转**：滑块中心对准点击点（与 [`Self::code_bar_jump_to`] 同语义）。
-    fn table_bar_jump_to(&self, blk: usize, pos: gpui::Point<Pixels>) {
-                let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
-            return;
-        };
-        let Some(r) = f
-            .rows
-            .iter()
-            .find(|r| r.src_line == blk && r.table.is_some())
-        else {
-            return;
-        };
-        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::table_hscroll_geo(self, f, r)
-        else {
-            return;
-        };
-        let origin_x = self
-            .last_bounds()
-            .map(|b| f32::from(b.origin.x))
-            .unwrap_or(0.);
-        let elem_w = self
-            .last_bounds()
-            .map(|b| f32::from(b.size.width))
-            .unwrap_or(0.);
-        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
-        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
-        let travel = (bar_w - thumb_w).max(1.);
-        let rel = ((p_local - bar_x - thumb_w / 2.0) / travel).clamp(0., 1.);
-        drop(marker);
-        self.set_table_h_scroll(blk, rel * max_scroll);
-    }
-    /// 把指针位置应用到正在拖动的表格横向滚动条（抓取点相对滑块左缘，1:1 跟随）。
-    fn table_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some((blk, grab)) = *self.rd.borrow().table_h_drag.borrow() else {
-            return;
-        };
-                let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
-            return;
-        };
-        let Some(r) = f
-            .rows
-            .iter()
-            .find(|r| r.src_line == blk && r.table.is_some())
-        else {
-            return;
-        };
-        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::table_hscroll_geo(self, f, r)
-        else {
-            return;
-        };
-        let origin_x = self
-            .last_bounds()
-            .map(|b| f32::from(b.origin.x))
-            .unwrap_or(0.);
-        let elem_w = self
-            .last_bounds()
-            .map(|b| f32::from(b.size.width))
-            .unwrap_or(0.);
-        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
-        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
-        let travel = (bar_w - thumb_w).max(1.);
-        let rel = ((p_local - bar_x - grab) / travel).clamp(0., 1.);
-        drop(marker);
-        self.set_table_h_scroll(blk, rel * max_scroll);
-        cx.notify();
-    }
-    /// 数学卡滚动条**轨道点击跳转**：滑块中心对准点击点（与 [`Self::code_bar_jump_to`] 同语义）。
-    fn math_bar_jump_to(&self, blk: usize, pos: gpui::Point<Pixels>) {
-                let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
-            return;
-        };
-        let Some(r) = f.rows.iter().find(|r| {
-            r.src_line == blk && matches!(&r.extra.card, Some(element::BlockCard::Math { .. }))
-        }) else {
-            return;
-        };
-        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::math_hscroll_geo(self, f, r)
-        else {
-            return;
-        };
-        let origin_x = self
-            .last_bounds()
-            .map(|b| f32::from(b.origin.x))
-            .unwrap_or(0.);
-        let elem_w = self
-            .last_bounds()
-            .map(|b| f32::from(b.size.width))
-            .unwrap_or(0.);
-        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
-        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
-        let travel = (bar_w - thumb_w).max(1.);
-        let rel = ((p_local - bar_x - thumb_w / 2.0) / travel).clamp(0., 1.);
-        drop(marker);
-        self.set_math_h_scroll(blk, rel * max_scroll);
-    }
-    /// 把指针位置应用到正在拖动的数学卡横向滚动条（抓取点相对滑块左缘，1:1 跟随）。
-    fn math_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some((blk, grab)) = *self.rd.borrow().math_h_drag.borrow() else {
-            return;
-        };
-                let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
-            return;
-        };
-        let Some(r) = f.rows.iter().find(|r| {
-            r.src_line == blk && matches!(&r.extra.card, Some(element::BlockCard::Math { .. }))
-        }) else {
-            return;
-        };
-        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::math_hscroll_geo(self, f, r)
-        else {
-            return;
-        };
-        let origin_x = self
-            .last_bounds()
-            .map(|b| f32::from(b.origin.x))
-            .unwrap_or(0.);
-        let elem_w = self
-            .last_bounds()
-            .map(|b| f32::from(b.size.width))
-            .unwrap_or(0.);
-        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
-        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
-        let travel = (bar_w - thumb_w).max(1.);
-        let rel = ((p_local - bar_x - grab) / travel).clamp(0., 1.);
-        drop(marker);
-        self.set_math_h_scroll(blk, rel * max_scroll);
-        cx.notify();
-    }
     /// 鼠标松开：结束拖选 / 图片调整条 / 代码块 & 表格 & 数学卡横向滚动条拖动 /
     /// 数学编辑卡片拖拽把手。
     pub(crate) fn on_mouse_up(&mut self, _: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
         self.end_selection();
         self.end_image_resize();
-        *self.rd.borrow_mut().code_h_drag.borrow_mut() = None;
-        *self.rd.borrow_mut().table_h_drag.borrow_mut() = None;
-        *self.rd.borrow_mut().math_h_drag.borrow_mut() = None;
+        // P3 / Slice B 收敛：三段拖拽槽一次清（循环内按 kind 分发写清）。
+        for kind in HScrollKind::ALL {
+            kind.drag_set(self, None);
+        }
         self.end_math_edit_drag();
         cx.notify();
     }
