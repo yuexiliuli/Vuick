@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use gpui::App;
+use gpui::{App, Context, WeakEntity};
 
 /// 把字节位置**向前进位**钳到最近的 **UTF-8 字符边界**：先钳入 `text` 长度，再从 `p`
 /// 起向后扫描到 `is_char_boundary` 为真的位置（`p` 已在边界上则原样返回）。
@@ -88,6 +88,31 @@ impl SeqAfter {
             });
         })
         .detach();
+    }
+
+    /// 触发一次延迟动作，经**实体弱句柄**升级后执行：`delay` 后若期间无更新触发，把 `weak`
+    /// 升级为强句柄并在实体仍存活时执行 `action`（实体已释放 → 升级失败 → 静默丢弃，不 panic）。
+    ///
+    /// 这是「`cfg(not(test))` 门 + `weak_entity` 升级 + 静默丢弃」手抄骨架（session 落盘 /
+    /// reading_progress / media_size / sidebar 过滤 / tooltip 防抖）的收敛形式：调用方持
+    /// `SeqAfter` 槽位、给一个 `cx.weak_entity()` 与 `action`（= 原回调里 `weak.update(app, …)`
+    /// 的内层闭包原样搬入），即可把防抖接线收敛成一行。
+    ///
+    /// `H` 为宿主实体类型（`weak` 的来源实体）；`action` 签名 `(&mut H, &mut Context<H>)` 与原
+    /// `weak.update(app, |this, cx| …)` 内层闭包逐参数等价。动作经 `AsyncApp::update` 送回
+    /// **主线程**执行（`Send + 'static`），代序作废语义同 [`Self::after`]。
+    /// `cfg(not(test))` 门**由调用方各自负责**：`test` 语义属 per-crate（各 crate 按「测试
+    /// 进程是否残留定时任务」自己决定是否把调度块关进非测试构建），本方法不做内部门控。
+    pub fn after_weak<H: 'static>(
+        &self,
+        cx: &mut App,
+        delay: Duration,
+        weak: WeakEntity<H>,
+        action: impl FnOnce(&mut H, &mut Context<H>) + Send + 'static,
+    ) {
+        self.after(cx, delay, move |app| {
+            let _ = weak.update(app, action);
+        });
     }
 }
 

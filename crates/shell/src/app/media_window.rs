@@ -62,21 +62,23 @@ impl EditorApp {
 
     /// 把媒体窗口尺寸记录的落盘安排成防抖任务（可重入、代序作废，仿会话防抖姿势）：
     /// 停顿 [`shell_media::media_window::MEDIA_SIZE_FLUSH_DEBOUNCE_MS`] 后写一次
-    /// config.json；期间再 resize → 旧单作废。测试构建不注册定时任务（防残留），内存
-    /// 字段已由 [`Self::record_media_window_size`] 更新。
+    /// config.json；期间再 resize → 旧单作废。调度骨架收敛到 [`base::util::SeqAfter::after_weak`]
+    /// （弱句柄升级 + 静默丢弃）；内存字段已由 [`Self::record_media_window_size`] 更新
+    /// （测试直接驱动，断言内存字段即可）。
     fn schedule_media_size_flush(&self, _cx: &mut Context<Self>) {
+        // 防抖只挂在非测试构建（不残留定时任务）。弱句柄先单独绑定（同一表达式里 `_cx`
+        // 可变实参与 `_cx.weak_entity()` 不可变借用冲突）。
         #[cfg(not(test))]
         {
             let weak = _cx.weak_entity();
-            self.model.borrow().media_size_flush_debounce.after(
+            self.model.borrow().media_size_flush_debounce.after_weak(
                 _cx,
                 std::time::Duration::from_millis(
                     shell_media::media_window::MEDIA_SIZE_FLUSH_DEBOUNCE_MS,
                 ),
-                move |app| {
-                    let _ = weak.update(app, |this, _| {
-                        this.persist_prefs();
-                    });
+                weak,
+                move |this, _| {
+                    this.persist_prefs();
                 },
             );
         }

@@ -47,7 +47,8 @@ use syntax::{prewarm_done, prewarm_started};
 
 /// 会话持久化防抖窗口（ms）：内容变化后停顿该时长才写盘一次，压缩打字期间的高频重写。
 /// 结构变化（新建/关闭/切换选项卡、打开文件、保存）不经防抖，立即落盘。
-/// 仅在非测试构建的防抖定时器里被引用（测试构建该分支整体编译掉）→ `#[cfg(not(test))]`
+/// 经 [`SeqAfter::after_weak`] 调度调用；该调度块由 `cfg(not(test))` 门关进非测试构建
+/// （测试直接驱动 `persist_session` 纯逻辑，不残留定时任务）→ 本常量随之 `#[cfg(not(test))]`
 /// 归位，不再退化 `allow(dead_code)`。
 #[cfg(not(test))]
 const SESSION_FLUSH_DEBOUNCE_MS: u64 = 300;
@@ -55,6 +56,7 @@ const SESSION_FLUSH_DEBOUNCE_MS: u64 = 300;
 /// 「阅读进度」落盘防抖窗口（ms）：活动选项卡阅读位置变化后停顿该时长才写盘一次。
 /// 镜像 `SESSION_FLUSH_DEBOUNCE_MS`（关 tab / 退出兜底是立即写，这里只覆盖「滚动停止」
 /// 的连续落盘——本平台最后窗口关闭不回调 `on_app_quit`，只挂关闭/退出必然丢进度）。
+/// 同 `SESSION_FLUSH_DEBOUNCE_MS`：调度块被 `cfg(not(test))` 门关入非测试构建 → 常量归位。
 #[cfg(not(test))]
 const READING_PROGRESS_DEBOUNCE_MS: u64 = 300;
 
@@ -252,17 +254,18 @@ impl EditorApp {
             self.persist_session(cx);
             return;
         }
-        // 防抖只挂在非测试构建：测试直接驱动纯逻辑函数验证，不在测试进程残留定时任务。
+        // 防抖只挂在非测试构建：测试直接驱动 `persist_session` 纯逻辑验证，不残留定时任务。
+        // 调度骨架收敛到 `SeqAfter::after_weak`（弱句柄升级 + 静默丢弃见 util.rs）。
         #[cfg(not(test))]
         {
+            // 弱句柄先单独绑定（同一表达式里 `cx` 可变实参与 `cx.weak_entity()` 不可变借用冲突）。
             let weak = cx.weak_entity();
-            self.model.borrow().session_flush_debounce.after(
+            self.model.borrow().session_flush_debounce.after_weak(
                 cx,
                 std::time::Duration::from_millis(SESSION_FLUSH_DEBOUNCE_MS),
-                move |app| {
-                    let _ = weak.update(app, |this, cx| {
-                        this.persist_session(cx);
-                    });
+                weak,
+                move |this, cx| {
+                    this.persist_session(cx);
                 },
             );
         }
@@ -343,16 +346,17 @@ impl EditorApp {
             return;
         }
         // 防抖只挂在非测试构建（测试直接驱动纯逻辑，不在测试进程残留定时任务）。
+        // 调度骨架收敛到 `SeqAfter::after_weak`（弱句柄升级 + 静默丢弃见 util.rs）。
         #[cfg(not(test))]
         {
+            // 弱句柄先单独绑定（同一表达式里 `cx` 可变实参与 `cx.weak_entity()` 不可变借用冲突）。
             let weak = cx.weak_entity();
-            self.model.borrow().reading_progress_debounce.after(
+            self.model.borrow().reading_progress_debounce.after_weak(
                 cx,
                 std::time::Duration::from_millis(READING_PROGRESS_DEBOUNCE_MS),
-                move |app| {
-                    let _ = weak.update(app, |this, cx| {
-                        this.flush_reading_progress(cx);
-                    });
+                weak,
+                move |this, cx| {
+                    this.flush_reading_progress(cx);
                 },
             );
         }

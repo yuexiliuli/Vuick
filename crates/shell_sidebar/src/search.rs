@@ -1085,21 +1085,22 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// （写共享模型，不回流宿主）。
     pub fn schedule_search_debounce(&mut self, value: String, cx: &mut Context<Self>) {
         self.model.borrow_mut().search_pending = normalize_search_query(&value);
+        // 弱句柄先单独绑定：同一表达式里 `cx` 作可变实参、又与 `cx.weak_entity()` 的
+        // 不可变借用冲突（E0502）。
         let weak = cx.weak_entity();
-        self.model.borrow().search_debounce.after(
+        self.model.borrow().search_debounce.after_weak(
             cx,
             std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS),
-            move |app| {
-                let _ = weak.update(app, |this, cx| {
-                    // 期间有新输入 → 代序已前进，本定时器作废（防抖可重入）。
-                    // 先提纯 owned 再比较（if 条件里的 borrow 临时 Ref 存活整分支）。
-                    let pending = std::mem::take(&mut this.model.borrow_mut().search_pending);
-                    let search_committed = this.model.borrow().search_committed.clone();
-                    if search_committed != pending {
-                        this.model.borrow_mut().search_committed = pending;
-                        cx.notify();
-                    }
-                });
+            weak,
+            move |this, cx| {
+                // 期间有新输入 → 代序已前进，本定时器作废（防抖可重入）。
+                // 先提纯 owned 再比较（if 条件里的 borrow 临时 Ref 存活整分支）。
+                let pending = std::mem::take(&mut this.model.borrow_mut().search_pending);
+                let search_committed = this.model.borrow().search_committed.clone();
+                if search_committed != pending {
+                    this.model.borrow_mut().search_committed = pending;
+                    cx.notify();
+                }
             },
         );
     }

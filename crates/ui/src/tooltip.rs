@@ -85,17 +85,16 @@ fn tooltip_enter(state: &Entity<TooltipState>, cx: &mut App) {
     }
     let weak = state.downgrade();
     state.update(cx, |s, cx| {
-        s.debounce.after(
+        s.debounce.after_weak(
             cx,
             Duration::from_millis(TOOLTIP_DELAY_MS),
-            move |app| {
+            weak,
+            move |s, cx| {
                 // 到点仍悬停才真正显示；移出已清 `hanging` → 自动作废不误显。
-                let _ = weak.update(app, |s, cx| {
-                    if s.hanging {
-                        s.visible = true;
-                        cx.notify();
-                    }
-                });
+                if s.hanging {
+                    s.visible = true;
+                    cx.notify();
+                }
             },
         );
     });

@@ -473,27 +473,28 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         cx: &mut Context<Self>,
     ) {
         self.model.borrow_mut().files_filter_pending = value.trim().to_lowercase();
-        let weak_self = cx.weak_entity();
-        self.model.borrow().files_filter_debounce.after(
+        // 弱句柄先单独绑定：同一表达式里 `cx` 作可变实参、又与 `cx.weak_entity()` 的
+        // 不可变借用冲突（E0502）。
+        let weak = cx.weak_entity();
+        self.model.borrow().files_filter_debounce.after_weak(
             cx,
             std::time::Duration::from_millis(FILES_FILTER_DEBOUNCE_MS),
-            move |app| {
-                let _ = weak_self.update(app, |this, app| {
-                    // 先提纯 owned 再比较（`if` 条件里的 borrow 临时 Ref 会存活
-                    // 整个分支块 → 块内 borrow_mut 运行期双借 panic）。
-                    let pending = std::mem::take(&mut this.model.borrow_mut().files_filter_pending);
-                    let files_filter = this.model.borrow().files_filter.clone();
-                    if files_filter != pending {
-                        this.model.borrow_mut().files_filter = pending;
-                        // `sb.files.layout_gen` 在宿主（域实体不持侧栏状态）→ 经宿主服务
-                        // 提交 + notify（实体上下文此时可安全反调宿主：定时器到点）。
-                        if let Some(h) = this.host_weak().upgrade() {
-                            let _ = h.update(app, |host, cx| {
-                                host.sidebar_files_filter_commit(cx);
-                            });
-                        }
+            weak,
+            move |this, app| {
+                // 先提纯 owned 再比较（`if` 条件里的 borrow 临时 Ref 会存活
+                // 整个分支块 → 块内 borrow_mut 运行期双借 panic）。
+                let pending = std::mem::take(&mut this.model.borrow_mut().files_filter_pending);
+                let files_filter = this.model.borrow().files_filter.clone();
+                if files_filter != pending {
+                    this.model.borrow_mut().files_filter = pending;
+                    // `sb.files.layout_gen` 在宿主（域实体不持侧栏状态）→ 经宿主服务
+                    // 提交 + notify（实体上下文此时可安全反调宿主：定时器到点）。
+                    if let Some(h) = this.host_weak().upgrade() {
+                        let _ = h.update(app, |host, cx| {
+                            host.sidebar_files_filter_commit(cx);
+                        });
                     }
-                });
+                }
             },
         );
     }
