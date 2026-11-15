@@ -28,7 +28,8 @@
         }
         let probe = cx.update(|_w, cx| {
             app.read(cx)
-                .tab_bar_menu_entity
+                .tab_bar_menu
+                .entity
                 .as_ref()
                 .expect("选项卡菜单应打开")
                 .read(cx)

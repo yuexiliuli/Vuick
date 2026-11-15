@@ -261,7 +261,7 @@ impl shell_sidebar::FileTreePromptHost for EditorApp {
 
 // PDF 域宿主服务面（shell_pdf）。PDF 页操作动作对宿主的交互收敛到此：
 // toast 通知（宿主通知容器 + `PdfToast` 去重标记）与右键新弹前弹窗互关（清宿主
-// `tab_bar_menu_*` / `media_lock_menu_*` / `pdf_menu_*` 槽位）。域逻辑在 shell_pdf，
+// `tab_bar_menu` / `media_lock_menu` / `pdf_menu` 槽位）。域逻辑在 shell_pdf，
 // 宿主实现零业务逻辑。
 impl shell_pdf::PdfHost for EditorApp {
     fn pdf_host_toast(&mut self, title: &str, msg: String) {
@@ -529,7 +529,7 @@ impl shell_tabs::TabsHost for EditorApp {
         self.poke_tab_hscroll(cx);
     }
 
-    /// 右键菜单落地（测试直读宿主 `tab_bar_menu_*` 槽位 + media/pdf 前置弹窗互关直清，
+    /// 右键菜单落地（测试直读宿主 `tab_bar_menu` 槽位 + media/pdf 前置弹窗互关直清，
     /// 故槽位留宿主）。
     fn tabs_host_open_tab_bar_menu(
         &mut self,
@@ -538,9 +538,9 @@ impl shell_tabs::TabsHost for EditorApp {
         sub: Subscription,
         cx: &mut Context<Self>,
     ) {
-        self.tab_bar_menu_pos = Some(pos);
-        self.tab_bar_menu_entity = Some(menu);
-        self.tab_bar_menu_sub = Some(sub);
+        self.tab_bar_menu.pos = Some(pos);
+        self.tab_bar_menu.entity = Some(menu);
+        self.tab_bar_menu.sub = Some(sub);
         cx.notify();
     }
 
@@ -550,9 +550,8 @@ impl shell_tabs::TabsHost for EditorApp {
         menu: &gpui::Entity<PopupMenu>,
         cx: &mut Context<Self>,
     ) {
-        if self.tab_bar_menu_entity.as_ref() == Some(menu) {
-            self.tab_bar_menu_entity = None;
-            self.tab_bar_menu_pos = None;
+        if self.tab_bar_menu.entity.as_ref() == Some(menu) {
+            self.tab_bar_menu.clear();
         }
         cx.notify();
     }

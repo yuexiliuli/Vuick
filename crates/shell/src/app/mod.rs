@@ -80,8 +80,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    anchored, deferred, div, px, white, Anchor, AnyWindowHandle, App,
-    AppContext, Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, Edges, EntityId,
+    div, px, white, AnyWindowHandle, App,
+    AppContext, Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, EntityId,
     ExternalPaths, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render, SharedString, Size,
     StatefulInteractiveElement, Styled, Subscription, VisualContext, WeakEntity, Window,
@@ -260,29 +260,19 @@ pub struct EditorApp {
     /// `make_tab` 的即时落盘 → 下次启动主窗口会话被视频选项卡顶替丢失）。见 session.rs
     /// `persist_session` 门控与 init.rs `new_impl`。
     session_persist: bool,
-    /// 图片/视频右键「锁定/解锁」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
-    media_lock_menu_pos: Option<Point<Pixels>>,
-    /// 已打开的媒体右键菜单实体（随位置同生同灭）。
-    media_lock_menu_entity: Option<gpui::Entity<ui::menu::PopupMenu>>,
-    /// 媒体右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
-    media_lock_menu_sub: Option<Subscription>,
-    /// PDF 右键「添加书签/插入页面/删除页面/提取页面」上下文菜单：弹出位置（窗口坐标）。
-    pdf_menu_pos: Option<Point<Pixels>>,
-    /// 已打开的 PDF 右键菜单实体（随位置同生同灭）。
-    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 菜单项禁用判定（§8.6 外提清单）。
+    /// 图片/视频右键「锁定/解锁」上下文菜单槽位（位置/实体/订阅三件套，
+    /// [`ui::menu::MenuSlot`]）。None = 未打开。
+    media_lock_menu: ui::menu::MenuSlot,
+    /// PDF 右键「添加书签/插入页面/删除页面/提取页面」上下文菜单槽位。
+    /// `#[doc(hidden)] pub`：`tests/pdf.rs` 菜单项禁用判定经 `.pdf_menu.entity`
+    /// （§8.6 外提清单）。
     #[doc(hidden)]
-    pub pdf_menu_entity: Option<gpui::Entity<PopupMenu>>,
-    /// PDF 右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
-    pdf_menu_sub: Option<Subscription>,
-    /// 选项卡栏右键「新建/打开」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
+    pub pdf_menu: ui::menu::MenuSlot,
+    /// 选项卡栏右键「新建/打开」上下文菜单槽位。
     /// （菜单**构建与交互**在 shell_tabs `TabBar` 实体，槽位仍留宿主——
     /// `app/tests/{tabs_actions,tabs_context}.rs` 直读、media/pdf 前置弹窗互关直清；实体
     /// 经 `TabsHost` 落地。）
-    tab_bar_menu_pos: Option<Point<Pixels>>,
-    /// 已打开的选项卡栏右键菜单实体（随位置同生同灭）。
-    tab_bar_menu_entity: Option<gpui::Entity<PopupMenu>>,
-    /// 选项卡栏右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
-    tab_bar_menu_sub: Option<Subscription>,
+    tab_bar_menu: ui::menu::MenuSlot,
     /// 文件树右键上下文菜单**测试兼容镜像**：实体（`shell_sidebar::files_ops`）自持
     /// pos/菜单实体/订阅，宿主只镜像菜单实体供 `app::tests` 直接字段断言
     /// （实体在 shell_sidebar，宿主留薄兼容镜像）。

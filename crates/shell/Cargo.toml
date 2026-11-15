@@ -72,7 +72,7 @@ shell_preview = { path = "../shell_preview" }
 shell_media = { path = "../shell_media" }
 # 选项卡栏域 crate（自 shell 的 app/tabs 拆出：TabBar 实体渲染 + 选项卡右键菜单项构建 +
 # TabsHost 宿主服务面；纯结构移动，shell 保留 tab_drag 相关入口与宿主字段
-# tab_bounds/tab_bar_hscroll/tab_bar_menu_*，经 `tab_bar_view: Entity<TabBar<EditorApp>>`
+# tab_bounds/tab_bar_hscroll/tab_bar_menu（MenuSlot），经 `tab_bar_view: Entity<TabBar<EditorApp>>`
 # 实体接线，宿主副作用经 TabsHost 反调落宿主）。
 shell_tabs = { path = "../shell_tabs" }
 # 音乐播放器（Phase A 引擎 + Phase B UI 已提交）：shell 集成（整窗音乐模式 /

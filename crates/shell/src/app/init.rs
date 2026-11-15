@@ -170,15 +170,9 @@ impl EditorApp {
             // 会话持久化责任：仅首个主窗口（`startup` 仅 `new` 传 true；new_media_window /
             // new_detached 传 false）——会话清单单份全局，非主窗口参与写会顶替主窗口会话。
             session_persist: startup,
-            media_lock_menu_pos: None,
-            media_lock_menu_entity: None,
-            media_lock_menu_sub: None,
-            pdf_menu_pos: None,
-            pdf_menu_entity: None,
-            pdf_menu_sub: None,
-            tab_bar_menu_pos: None,
-            tab_bar_menu_entity: None,
-            tab_bar_menu_sub: None,
+            media_lock_menu: Default::default(),
+            pdf_menu: Default::default(),
+            tab_bar_menu: Default::default(),
             file_tree_menu_entity: None,
             file_tree_prompt: None,
             files_filter_state: files_filter,

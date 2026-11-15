@@ -1115,7 +1115,8 @@ fn pdf_right_click(app: &Entity<EditorApp>, cx: &mut VisualTestContext) -> gpui:
 fn menu_item_disabled(app: &Entity<EditorApp>, cx: &mut VisualTestContext, ix: usize) -> bool {
     cx.update(|_w, cx| {
         app.read(cx)
-            .pdf_menu_entity
+            .pdf_menu
+            .entity
             .as_ref()
             .map(|m| m.read(cx).is_item_disabled(ix))
             .unwrap_or(true)

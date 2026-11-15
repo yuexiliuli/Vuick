@@ -8,8 +8,8 @@
 //! 镜像菜单实体与弹层实体（测试断言用）。
 
 use gpui::{
-    anchored, deferred, div, px, Anchor, AppContext, Context, DismissEvent, Edges, Entity,
-    InteractiveElement, IntoElement, MouseDownEvent, ParentElement, Window,
+    div, AppContext, Context, DismissEvent, Entity, InteractiveElement, IntoElement,
+    MouseDownEvent, ParentElement, Window,
 };
 use ui::menu::label_menu_item;
 
@@ -35,9 +35,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         cx.stop_propagation();
         // 生命周期：菜单构建闭包是 'static，borrow 的 `path` 参数需先物化为 owned 再移动。
         let path = path.to_path_buf();
-        self.file_tree_menu_entity = None;
-        self.file_tree_menu_pos = None;
-        self.file_tree_menu_sub = None;
+        self.file_tree_menu.clear();
         let weak = self.host_weak();
         let (menu, sub) = ui::menu::spawn_context_menu(
             window,
@@ -161,17 +159,15 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             |this, emitter, cx| {
                 // 身份校验（与实体侧同款）：只有被关的菜单仍是当前菜单才清字段 + 同步宿主
                 // 测试镜像——旧菜单的关闭不得误清新菜单的镜像（同选项卡栏右键姿势）。
-                if this.file_tree_menu_entity.as_ref() == Some(&emitter) {
-                    this.file_tree_menu_entity = None;
-                    this.file_tree_menu_pos = None;
-                    this.file_tree_menu_sub = None;
+                if this.file_tree_menu.entity.as_ref() == Some(&emitter) {
+                    this.file_tree_menu.clear();
                     this.host_call(cx, |app, cx| app.sidebar_set_file_tree_menu(None, cx));
                 }
             },
         );
-        self.file_tree_menu_pos = Some(ev.position);
-        self.file_tree_menu_entity = Some(menu.clone());
-        self.file_tree_menu_sub = Some(sub);
+        self.file_tree_menu.pos = Some(ev.position);
+        self.file_tree_menu.entity = Some(menu.clone());
+        self.file_tree_menu.sub = Some(sub);
         self.host_call(cx, |app, cx| app.sidebar_set_file_tree_menu(Some(menu), cx));
     }
 
@@ -179,26 +175,16 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 无窗口/上下文依赖（pos/菜单实体在实体自有字段），宿主渲染期经 `sidebar_view.read`
     /// 直调。
     pub fn render_file_tree_menu(&self) -> gpui::AnyElement {
-        let Some(pos) = self.file_tree_menu_pos else {
+        let Some(pos) = self.file_tree_menu.pos else {
             return div().into_any_element();
         };
-        let Some(menu) = self.file_tree_menu_entity.clone() else {
+        let Some(menu) = self.file_tree_menu.entity.clone() else {
             return div().into_any_element();
         };
         div()
             .id("file-tree-menu")
             .debug_selector(|| "file-tree-menu".into())
-            .child(
-                deferred(
-                    anchored()
-                        .position_mode(gpui::AnchoredPositionMode::Window)
-                        .anchor(Anchor::TopLeft)
-                        .position(pos)
-                        .snap_to_window_with_margin(Edges::all(px(8.)))
-                        .child(menu),
-                )
-                .with_priority(100),
-            )
+            .child(ui::menu::popup_overlay(pos, menu, ui::menu::MENU_EDGE_MARGIN))
             .into_any_element()
     }
 

@@ -1067,6 +1067,57 @@ impl Render for PopupMenu {
     }
 }
 
+/// 宿主右键菜单槽位「三件套」（pos/entity/sub）收敛：shell pdf / 媒体锁定 / 选项卡栏 /
+/// 侧栏文件树各处原本各持三个 `Option` 字段（位置 / 菜单实体 / 关闭订阅），收成本
+/// struct 一块管理，`clear()` 一次关净、`is_open()` 判开。
+/// 实体类型各站点统一为 `Entity<PopupMenu>`，故不用泛型。
+#[derive(Default)]
+pub struct MenuSlot {
+    /// 菜单弹出位置（窗口坐标）；与 `entity` 同生同灭。
+    pub pos: Option<Point<Pixels>>,
+    /// 已打开的菜单实体（`None` = 未打开）。
+    pub entity: Option<Entity<PopupMenu>>,
+    /// 菜单关闭订阅（选择/Esc/点击外 → 宿主清槽位）。
+    pub sub: Option<Subscription>,
+}
+
+impl MenuSlot {
+    /// 关闭：置空位置/实体/订阅（订阅随 drop 取消，宿主不再收到后续关闭回调）。
+    /// 与「关闭时逐字段置 `None`」行为一致，一处收口。
+    pub fn clear(&mut self) {
+        self.pos = None;
+        self.entity = None;
+        self.sub = None;
+    }
+
+    /// 是否已打开菜单（以实体在场为准；`pos` 与 `entity` 同生同灭）。
+    pub fn is_open(&self) -> bool {
+        self.entity.is_some()
+    }
+}
+
+/// 右键菜单 Overlay 助手：封装各宿主（shell pdf / 媒体锁定 / 选项卡栏 / 侧栏文件树）
+/// 复用的 `deferred(anchored(Window)).position(pos).snap_to_window_with_margin(margin)
+/// .with_priority(100)` 骨架——`position()` 才是 gpui 语义里的「窗口坐标」入参
+/// （`offset()` 会被当相对锚定元素静态布局位置的偏移）；`margin` 传
+/// [`MENU_EDGE_MARGIN`]（与 PopupMenu 自夹持同一常量，父面板顶/左估算逐像素一致）。
+/// 调用方需要附加 `id`/`debug_selector` 外壳时自行包装（如选项卡栏/文件树菜单）。
+pub fn popup_overlay(
+    pos: Point<Pixels>,
+    menu: Entity<PopupMenu>,
+    margin: Pixels,
+) -> impl IntoElement {
+    deferred(
+        anchored()
+            .position_mode(gpui::AnchoredPositionMode::Window)
+            .anchor(Anchor::TopLeft)
+            .position(pos)
+            .snap_to_window_with_margin(Edges::all(margin))
+            .child(menu),
+    )
+    .with_priority(100)
+}
+
 /// 右键上下文菜单助手：一处收敛「建 `PopupMenu` + `set_previous_focus` + `focus` +
 /// `subscribe(DismissEvent)` + 宿主写好状态」近 30 行×2 同构样板（shell tab 栏右键 /
 /// 媒体锁定右键）。
@@ -1254,7 +1305,7 @@ impl DropdownMenu for crate::ui::button::Button {
 mod tests {
     use super::*;
     use crate::ui::button::{Button, ButtonVariants as _};
-    use gpui::{Context, Modifiers, Point, Render, TestAppContext, VisualTestContext, point, px};
+    use gpui::{Context, Modifiers, Render, TestAppContext, VisualTestContext, point, px};
     use std::{cell::Cell, rc::Rc};
 
     struct Harness {
@@ -1294,17 +1345,11 @@ mod tests {
                 .id("anchored-host")
                 .w(px(600.))
                 .h(px(500.))
-                .child(
-                    deferred(
-                        anchored()
-                            .position_mode(gpui::AnchoredPositionMode::Window)
-                            .anchor(Anchor::TopLeft)
-                            .position(point(px(50.), px(50.)))
-                            .snap_to_window_with_margin(Edges::all(px(8.)))
-                            .child(self.menu.clone()),
-                    )
-                    .with_priority(100),
-                )
+                .child(popup_overlay(
+                    point(px(50.), px(50.)),
+                    self.menu.clone(),
+                    MENU_EDGE_MARGIN,
+                ))
         }
     }
 
@@ -1460,17 +1505,15 @@ mod tests {
     // `spawn_context_menu`：右键菜单生命周期闭环（焦点管理 + dismiss 身份校验清槽位）。
     // ---------------------------------------------------------------------
 
-    /// 右键菜单宿主：放 mimic shell 的「entity / pos / sub」三槽位，作
+    /// 右键菜单宿主：持 [`MenuSlot`]（mimic shell 的「entity / pos / sub」三槽位），作
     /// `spawn_context_menu` 生命周期载体。
     struct ContextMenuHost {
-        menu_entity: Option<Entity<PopupMenu>>,
-        menu_pos: Option<Point<Pixels>>,
-        menu_sub: Option<Subscription>,
+        menu: MenuSlot,
     }
 
     impl Render for ContextMenuHost {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let content = match &self.menu_entity {
+            let content = match &self.menu.entity {
                 Some(menu) => div()
                     .id("ctx-menu-host")
                     .size_full()
@@ -1489,9 +1532,7 @@ mod tests {
         cx.update(crate::test_support::bind_local_keymaps);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let mut host = ContextMenuHost {
-                menu_entity: None,
-                menu_pos: None,
-                menu_sub: None,
+                menu: MenuSlot::default(),
             };
             let (menu, sub) = spawn_context_menu(
                 window,
@@ -1506,22 +1547,24 @@ mod tests {
                 |this: &mut ContextMenuHost,
                  emitter: &Entity<PopupMenu>,
                  cx: &mut Context<ContextMenuHost>| {
-                    if this.menu_entity.as_ref() == Some(&emitter) {
-                        this.menu_entity = None;
-                        this.menu_pos = None;
+                    if this.menu.entity.as_ref() == Some(&emitter) {
+                        this.menu.clear();
                     }
                     cx.notify();
                 },
             );
-            host.menu_pos = Some(point(px(10.), px(10.)));
-            host.menu_entity = Some(menu);
-            host.menu_sub = Some(sub);
+            host.menu.pos = Some(point(px(10.), px(10.)));
+            host.menu.entity = Some(menu);
+            host.menu.sub = Some(sub);
             host
         });
         // 打开态：菜单已聚焦且槽位写满。
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let (open_entity, open_pos) = cx.update(|_, cx| {
-            (view.read(cx).menu_entity.is_some(), view.read(cx).menu_pos.is_some())
+            (
+                view.read(cx).menu.entity.is_some(),
+                view.read(cx).menu.pos.is_some(),
+            )
         });
         assert!(open_entity, "打开后实体槽位应有菜单");
         assert!(open_pos, "打开后位置槽位应有坐标");
@@ -1529,7 +1572,10 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         let (gone_entity, gone_pos) = cx.update(|_, cx| {
-            (view.read(cx).menu_entity.is_none(), view.read(cx).menu_pos.is_none())
+            (
+                view.read(cx).menu.entity.is_none(),
+                view.read(cx).menu.pos.is_none(),
+            )
         });
         assert!(gone_entity, "dismiss 后实体槽位应被清理");
         assert!(gone_pos, "dismiss 后位置槽位应被清理");

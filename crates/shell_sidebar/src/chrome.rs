@@ -18,8 +18,8 @@ use std::rc::Rc;
 
 use gpui::{
     div, px, AnimationExt, AnyElement, Context, CursorStyle, Entity, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Pixels, Point, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, WeakEntity, Window,
+    IntoElement, MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, WeakEntity, Window,
 };
 use shell_core::AppModel;
 use ui::icon::{Icon, IconName};
@@ -48,13 +48,9 @@ pub struct Sidebar<H: SidebarHost + FileTreePromptHost> {
     /// 把输入实体也收进域内）。`#[doc(hidden)] pub`：`search.rs` 拆分模块需直读。
     #[doc(hidden)]
     pub search_input: Entity<InputState>,
-    /// 文件树右键上下文菜单：弹出位置（窗口坐标）。实体自有（`files_ops.rs` 读写）；
-    /// 宿主仅镜像 `menu_entity` 供测试断言。
-    pub(crate) file_tree_menu_pos: Option<Point<Pixels>>,
-    /// 已打开的文件树右键菜单实体（随位置同生同灭）。
-    pub(crate) file_tree_menu_entity: Option<Entity<ui::menu::PopupMenu>>,
-    /// 文件树右键菜单的关闭订阅（选择/Esc/点击外 → 清位置与实体）。
-    pub(crate) file_tree_menu_sub: Option<Subscription>,
+    /// 文件树右键上下文菜单槽位（位置/实体/订阅三件套，`ui::menu::MenuSlot`）。实体自有
+    /// （`files_ops.rs` 读写）；宿主仅镜像 `entity` 供测试断言。
+    pub(crate) file_tree_menu: ui::menu::MenuSlot,
     /// 文件树「新建/重命名」输入弹层实体（泛型宿主 `H`）。实体自有（`files_ops.rs`
     /// 读写）；宿主仅镜像供测试。
     pub(crate) file_tree_prompt: Option<Entity<crate::prompt::FileTreePrompt<H>>>,
@@ -73,9 +69,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             model,
             host,
             search_input,
-            file_tree_menu_pos: None,
-            file_tree_menu_entity: None,
-            file_tree_menu_sub: None,
+            file_tree_menu: Default::default(),
             file_tree_prompt: None,
             file_tree_prompt_sub: None,
         }

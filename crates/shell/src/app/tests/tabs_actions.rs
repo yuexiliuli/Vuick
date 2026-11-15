@@ -65,7 +65,7 @@
         cx.simulate_mouse_down(menu_at, MouseButton::Right, Default::default());
         cx.run_until_parked();
         assert!(
-            cx.update(|_w, cx| app.read(cx).media_lock_menu_pos.is_some()),
+            cx.update(|_w, cx| app.read(cx).media_lock_menu.is_open()),
             "图片右键应在光标处弹出锁定菜单"
         );
         // 位置回归：菜单项应出现在右键点附近（非沉底）。若被 clamp 回窗口底部，dy 会接近
@@ -101,7 +101,7 @@
             let a = app.read(cx);
             (
                 a.active_media_locked(cx),
-                a.media_lock_menu_pos.is_none(),
+                !a.media_lock_menu.is_open(),
                 tab_image(&a.model.borrow().tabs[a.model.borrow().active_tab])
                     .map(|v| v.read(cx).is_locked())
                     .unwrap_or(false),
@@ -118,7 +118,7 @@
         }
         let unlocked = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.active_media_locked(cx), a.media_lock_menu_pos.is_none())
+            (a.active_media_locked(cx), !a.media_lock_menu.is_open())
         });
         assert!(unlocked.1, "再次点菜单后仍应关闭");
         assert!(!unlocked.0, "再次点「锁定」应解锁回归");
@@ -158,7 +158,7 @@
         cx.simulate_mouse_down(menu_at, MouseButton::Right, Default::default());
         cx.run_until_parked();
         assert!(
-            cx.update(|_w, cx| app.read(cx).media_lock_menu_pos.is_some()),
+            cx.update(|_w, cx| app.read(cx).media_lock_menu.is_open()),
             "视频右键应在光标处弹出锁定菜单"
         );
         // 位置回归：菜单项应出现在右键点附近（非沉底）。若被 clamp 回窗口底部，dy 会接近
@@ -194,7 +194,7 @@
             let a = app.read(cx);
             (
                 a.active_media_locked(cx),
-                a.media_lock_menu_pos.is_none(),
+                !a.media_lock_menu.is_open(),
                 tab_video(&a.model.borrow().tabs[a.model.borrow().active_tab])
                     .map(|v| v.read(cx).is_locked())
                     .unwrap_or(false),
@@ -211,7 +211,7 @@
         }
         let unlocked = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.active_media_locked(cx), a.media_lock_menu_pos.is_none())
+            (a.active_media_locked(cx), !a.media_lock_menu.is_open())
         });
         assert!(unlocked.1, "再次点菜单后仍应关闭");
         assert!(!unlocked.0, "再次点「锁定」应解锁回归");
@@ -994,7 +994,7 @@
         cx.simulate_mouse_down(right_click_at, MouseButton::Right, Default::default());
         settle_frames(cx, 3);
         assert!(
-            cx.update(|_w, cx| app.read(cx).tab_bar_menu_pos.is_some()),
+            cx.update(|_w, cx| app.read(cx).tab_bar_menu.is_open()),
             "右键选项卡栏应弹出上下文菜单"
         );
         assert!(
@@ -1017,7 +1017,7 @@
         settle_frames(cx, 3);
         let (tabs1, menu_closed) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.model.borrow().tabs.len(), a.tab_bar_menu_pos.is_none())
+            (a.model.borrow().tabs.len(), !a.tab_bar_menu.is_open())
         });
         assert_eq!(tabs1, tabs0 + 1, "点「新建文件」应新建 1 个选项卡");
         assert!(menu_closed, "点菜单项后菜单应关闭");
@@ -1034,7 +1034,7 @@
         cx.simulate_mouse_down(right_click_at2, MouseButton::Right, Default::default());
         settle_frames(cx, 3);
         assert!(
-            cx.update(|_w, cx| app.read(cx).tab_bar_menu_pos.is_some()),
+            cx.update(|_w, cx| app.read(cx).tab_bar_menu.is_open()),
             "再次右键应重新弹出菜单"
         );
         let item_open2 = cx
@@ -1044,7 +1044,7 @@
         settle_frames(cx, 3);
         let (calls, menu_closed2) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.open_dialog_calls, a.tab_bar_menu_pos.is_none())
+            (a.open_dialog_calls, !a.tab_bar_menu.is_open())
         });
         assert_eq!(calls, 1, "点「打开文件」应触发一次 open_dialog");
         assert!(menu_closed2, "点「打开文件」后菜单应关闭");
@@ -1071,7 +1071,7 @@
         cx.simulate_mouse_down(right_click_at, MouseButton::Right, Default::default());
         settle_frames(cx, 3);
         assert!(
-            cx.update(|_w, cx| app.read(cx).tab_bar_menu_pos.is_some()),
+            cx.update(|_w, cx| app.read(cx).tab_bar_menu.is_open()),
             "右键选项卡栏应弹出上下文菜单"
         );
         let item_new = cx

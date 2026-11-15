@@ -4,10 +4,10 @@
 //!
 //! - **书签 / 背景 / 失败 toast**：模型读数/写数转发 `shell_pdf` 域函数，宿主落地
 //!   `notify` / `persist_prefs` / 通知容器（toast）。
-//! - **右键菜单**：`ui::menu` 弹出结构、`pdf_menu_*` 宿主字段与浮层渲染依赖 EditorApp
+//! - **右键菜单**：`ui::menu` 弹出结构、`pdf_menu` 宿主槽位与浮层渲染依赖 EditorApp
 //!   菜单槽位/弹窗结构，留宿主（挂载适配）；菜单项 on_click 的动作逻辑经薄适配转发
 //!   `shell_pdf::menu`（插入/删除/提取/删除注释/书签）。
-//! - **弹窗互关**：右键新弹前清 `tab_bar_menu_*` / `media_lock_menu_*` / `pdf_menu_*`
+//! - **弹窗互关**：右键新弹前清 `tab_bar_menu` / `media_lock_menu` / `pdf_menu`
 //!   槽位收敛到 [`EditorApp::close_pdf_popups_predecessors`]，供
 //!   `shell_pdf::PdfHost::pdf_host_close_all_popups`（宿主实现，`host_impl.rs`）与
 //!   [`EditorApp::on_pdf_right_click`] 共用。
@@ -162,15 +162,9 @@ impl EditorApp {
     /// `pub(super)`：`host_impl.rs` 的 `PdfHost::pdf_host_close_all_popups` 与
     /// [`EditorApp::on_pdf_right_click`] 共用同一清理语义。
     pub(super) fn close_pdf_popups_predecessors(&mut self) {
-        self.tab_bar_menu_entity = None;
-        self.tab_bar_menu_pos = None;
-        self.tab_bar_menu_sub = None;
-        self.media_lock_menu_entity = None;
-        self.media_lock_menu_pos = None;
-        self.media_lock_menu_sub = None;
-        self.pdf_menu_entity = None;
-        self.pdf_menu_pos = None;
-        self.pdf_menu_sub = None;
+        self.tab_bar_menu.clear();
+        self.media_lock_menu.clear();
+        self.pdf_menu.clear();
     }
 
     /// PDF 右键 → 弹「添加书签 / 插入页面 / 删除页面 / 提取页面」上下文菜单。
@@ -346,18 +340,17 @@ impl EditorApp {
             },
             |this, emitter, cx| {
                 // 关闭（选择/Esc/点击外）→ 按 emitter 身份校验清理本菜单槽位。
-                if this.pdf_menu_entity.as_ref() == Some(&emitter) {
-                    this.pdf_menu_entity = None;
-                    this.pdf_menu_pos = None;
+                if this.pdf_menu.entity.as_ref() == Some(&emitter) {
+                    this.pdf_menu.clear();
                 }
                 cx.notify();
             },
         );
-        self.pdf_menu_pos = Some(ev.position);
+        self.pdf_menu.pos = Some(ev.position);
         // 写入父菜单窗口锚点：flyout 据此做窗口边缘空间适配（翻左/翻上、自夹持、逐帧恒定）。
         menu.update(cx, |m, _| m.set_parent_pos(ev.position));
-        self.pdf_menu_entity = Some(menu);
-        self.pdf_menu_sub = Some(sub);
+        self.pdf_menu.entity = Some(menu);
+        self.pdf_menu.sub = Some(sub);
         cx.notify();
     }
 
@@ -375,26 +368,15 @@ impl EditorApp {
             .map(|t| matches!(t.payload.reader, MediaReader::Pdf(_)))
             .unwrap_or(false);
         if !still_pdf {
-            self.pdf_menu_entity = None;
-            self.pdf_menu_pos = None;
+            self.pdf_menu.clear();
         }
-        let Some(pos) = self.pdf_menu_pos else {
+        let Some(pos) = self.pdf_menu.pos else {
             return div().into_any_element();
         };
-        let Some(menu) = self.pdf_menu_entity.clone() else {
+        let Some(menu) = self.pdf_menu.entity.clone() else {
             return div().into_any_element();
         };
-        deferred(
-            anchored()
-                .position_mode(gpui::AnchoredPositionMode::Window)
-                .anchor(Anchor::TopLeft)
-                .position(pos)
-                // 边缘留白与 PopupMenu 自夹持使用同一常量 → 父面板顶/左估算逐像素一致。
-                .snap_to_window_with_margin(Edges::all(ui::menu::MENU_EDGE_MARGIN))
-                .child(menu),
-        )
-        .with_priority(100)
-        .into_any_element()
+        ui::menu::popup_overlay(pos, menu, ui::menu::MENU_EDGE_MARGIN).into_any_element()
     }
 
     /// 「删除注释」动作：删除右键命中的那条**待存**注释。域逻辑

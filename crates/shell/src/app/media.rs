@@ -2,7 +2,7 @@
 //! 判定与元数据同步（标签标题 / 状态栏跟随）、右键「锁定/解锁」上下文菜单及其浮层渲染
 //! 的**逻辑段**在独立 crate `shell_media`（`sync_active_media_meta` /
 //! `active_media_viewer` / `active_media_locked` / `lock_menu_item` / `lock_menu_overlay`）；
-//! 本模块保留**菜单挂载**与宿主 `media_lock_menu_*` 槽位：
+//! 本模块保留**菜单挂载**与宿主 `media_lock_menu` 槽位（[`ui::menu::MenuSlot`]）：
 //!
 //! - `on_media_right_click`：PDF 分支分派 `on_pdf_right_click`（PDF 无锁定语义）；
 //!   图片/视频分支经 `shell_media::media::lock_menu_item` 建「锁定/解锁」菜单项。
@@ -65,34 +65,29 @@ impl EditorApp {
         };
         // 先收掉选项卡栏右键菜单与上一份媒体菜单（若有），再在光标处新建
         // （旧订阅带 emitter 身份校验，不会误清新菜单）
-        self.tab_bar_menu_entity = None;
-        self.tab_bar_menu_pos = None;
-        self.tab_bar_menu_sub = None;
-        self.media_lock_menu_entity = None;
-        self.media_lock_menu_pos = None;
-        self.media_lock_menu_sub = None;
+        self.tab_bar_menu.clear();
+        self.media_lock_menu.clear();
         let (menu, sub) = ui::menu::spawn_context_menu(
             window,
             cx,
             move |menu, _window, _cx| menu.item(shell_media::media::lock_menu_item(media.clone())),
             |this, emitter, cx| {
                 // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
-                if this.media_lock_menu_entity.as_ref() == Some(&emitter) {
-                    this.media_lock_menu_entity = None;
-                    this.media_lock_menu_pos = None;
+                if this.media_lock_menu.entity.as_ref() == Some(&emitter) {
+                    this.media_lock_menu.clear();
                 }
                 cx.notify();
             },
         );
-        self.media_lock_menu_pos = Some(ev.position);
-        self.media_lock_menu_entity = Some(menu);
-        self.media_lock_menu_sub = Some(sub);
+        self.media_lock_menu.pos = Some(ev.position);
+        self.media_lock_menu.entity = Some(menu);
+        self.media_lock_menu.sub = Some(sub);
         cx.notify();
     }
 
     /// 图片/视频「锁定」右键菜单 Overlay：按右键时记录的**窗口坐标**定位。浮层元素
     /// 构建在 [`shell_media::media::lock_menu_overlay`]，这里只清退/透传宿主
-    /// `media_lock_menu_*` 槽位（切走/关闭媒体选项卡 → 一并收起）。
+    /// `media_lock_menu` 槽位（切走/关闭媒体选项卡 → 一并收起）。
     pub(super) fn render_media_lock_menu(
         &mut self,
         _window: &mut Window,
@@ -101,13 +96,12 @@ impl EditorApp {
         let still_media = self.active_media_viewer().is_some();
         if !still_media {
             // 切走/关闭了媒体选项卡 → 一并收起右键菜单
-            self.media_lock_menu_entity = None;
-            self.media_lock_menu_pos = None;
+            self.media_lock_menu.clear();
         }
-        let Some(pos) = self.media_lock_menu_pos else {
+        let Some(pos) = self.media_lock_menu.pos else {
             return div().into_any_element();
         };
-        let Some(menu) = self.media_lock_menu_entity.clone() else {
+        let Some(menu) = self.media_lock_menu.entity.clone() else {
             return div().into_any_element();
         };
         shell_media::media::lock_menu_overlay(pos, menu).into_any_element()

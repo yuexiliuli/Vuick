@@ -3,12 +3,11 @@
 //! 活动选项卡的媒体判定与元数据同步（标签标题 / 状态栏跟随）、右键「锁定/解锁」菜单的
 //! **逻辑段**：图片/视频/PDF 三指针已收敛成单一 [`MediaReader`]，此处读取经
 //! [`MediaReader`] + `match` 去重。**菜单的视图/挂载**（`ui::menu` 弹出结构 + 宿主
-//! `media_lock_menu_*` 槽位 + 浮层渲染）留 shell 薄适配；本模块收敛查看器拼接 /
+//! `media_lock_menu` 槽位 + 浮层渲染）留 shell 薄适配；本模块收敛查看器拼接 /
 //! 元数据同步 / 锁定判定 / 锁定菜单项与浮层元素构建。
 
 use gpui::{
-    div, px, Anchor, Edges, Entity, InteractiveElement, IntoElement, ParentElement, Pixels,
-    Point, Styled,
+    div, px, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, Point, Styled,
 };
 use shell_core::{AppModel, MediaReader};
 use ui::menu::{PopupMenu, PopupMenuItem};
@@ -135,23 +134,11 @@ pub fn lock_menu_item(media: MediaReader) -> PopupMenuItem {
 }
 
 /// 图片/视频「锁定」右键菜单 Overlay 元素构建（按右键时记录的**窗口坐标**定位）：
-/// `AnchoredPositionMode::Window` + `position(pos)`——`position()` 才是 gpui 语义里
-/// 「窗口坐标」入参；旧的 `offset(pos)` 缺 `position()` 时会被当作「相对锚定元素自身
-/// 静态布局位置的偏移」，而本菜单当前是外壳 flex 直子、静态位恰为 (0,0) 才幸免。
-/// 与选项卡栏菜单同法改用 `.position(pos)` 加固，防将来被包进盒子后锚定点被加成非零
-/// 静态原点而沉底。菜单是否仍该展示（切走/关闭媒体选项卡即收起）是宿主
+/// 收口到 [`ui::menu::popup_overlay`]（`AnchoredPositionMode::Window` + `position(pos)` +
+/// `MENU_EDGE_MARGIN` 边缘留白）。菜单是否仍该展示（切走/关闭媒体选项卡即收起）是宿主
 /// `media_lock_menu_*` 槽位职责，宿主传入已清理后的 `(pos, menu)`。
 pub fn lock_menu_overlay(pos: Point<Pixels>, menu: Entity<PopupMenu>) -> impl IntoElement {
-    gpui::deferred(
-        gpui::anchored()
-            .position_mode(gpui::AnchoredPositionMode::Window)
-            .anchor(Anchor::TopLeft)
-            .position(pos)
-            .snap_to_window_with_margin(Edges::all(px(8.)))
-            .child(menu),
-    )
-    .with_priority(100)
-    .into_any_element()
+    ui::menu::popup_overlay(pos, menu, ui::menu::MENU_EDGE_MARGIN).into_any_element()
 }
 
 #[cfg(test)]

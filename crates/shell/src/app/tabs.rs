@@ -14,7 +14,7 @@
 //! - **横向滚动条宿主面**：`poke_tab_hscroll`（宿主字段 `tab_bar_hscroll` + 计时
 //!   `tab_hscroll_delay`）。
 //! - **渲染 facade**：`render_tab_bar` 经 `tab_bar_view` 实体渲染（宿主预取派生数据传入）；
-//!   `render_tab_bar_menu` 读宿主 `tab_bar_menu_*` 槽位（槽位仍属宿主：测试直读 +
+//!   `render_tab_bar_menu` 读宿主 `tab_bar_menu` 槽位（槽位仍属宿主：测试直读 +
 //!   media/pdf 前置弹窗互关直清，实体经 `TabsHost` 落地）。
 
 use super::*;
@@ -304,26 +304,16 @@ impl EditorApp {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let Some(pos) = self.tab_bar_menu_pos else {
+        let Some(pos) = self.tab_bar_menu.pos else {
             return div().into_any_element();
         };
-        let Some(menu) = self.tab_bar_menu_entity.clone() else {
+        let Some(menu) = self.tab_bar_menu.entity.clone() else {
             return div().into_any_element();
         };
         div()
             .id("tab-bar-menu")
             .debug_selector(|| "tab-bar-menu".into())
-            .child(
-                deferred(
-                    anchored()
-                        .position_mode(gpui::AnchoredPositionMode::Window)
-                        .anchor(Anchor::TopLeft)
-                        .position(pos)
-                        .snap_to_window_with_margin(Edges::all(px(8.)))
-                        .child(menu),
-                )
-                .with_priority(100),
-            )
+            .child(ui::menu::popup_overlay(pos, menu, ui::menu::MENU_EDGE_MARGIN))
             .into_any_element()
     }
 
