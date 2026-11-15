@@ -284,10 +284,10 @@ impl EditorApp {
         }
     }
 
-    /// B3：作废右栏 `md_wy` 的在途后台整篇装配（装配代号 +1、清 pending）。域逻辑
+    /// B3：作废右栏 `md_wy` 的在途后台整篇装配（装配代号 +1、清在途）。域逻辑
     /// [`shell_preview::mdwy::md_wy_invalidate_async`]。
-    pub(super) fn md_wy_invalidate_async(&mut self, idx: usize) {
-        shell_preview::mdwy::md_wy_invalidate_async(&self.model, idx);
+    pub(super) fn md_wy_invalidate_async(&mut self, idx: usize, cx: &mut Context<Self>) {
+        shell_preview::mdwy::md_wy_invalidate_async(&self.model, idx, cx);
     }
 
     /// Step2/3：大文档 md「打开即提前整篇解析」——返回本次装配代号（供 prefix 首装共用）。
@@ -311,9 +311,10 @@ impl EditorApp {
         idx: usize,
         wy: &gpui::Entity<WyEditor>,
         result: markdown_wysiwyg::WyOpenResult,
+        seq: usize,
         cx: &mut Context<Self>,
     ) {
-        shell_preview::mdwy::md_wy_install_full_swap(&self.model, idx, wy, result, cx);
+        shell_preview::mdwy::md_wy_install_full_swap(&self.model, idx, wy, result, seq, cx);
     }
 
     /// Step3：大文档 md「首块 prefix 首装」（`app/tests/preview.rs` 直接调用，兼容面保留）。

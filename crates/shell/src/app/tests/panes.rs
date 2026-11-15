@@ -938,7 +938,7 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                !a.model.borrow().tabs[i].payload.editor_pending
+                a.model.borrow().tabs.get(i).is_some()
             });
             if ready {
                 break;
@@ -1023,12 +1023,11 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                !a.model.borrow().tabs[i].payload.editor_pending
-                    && a.model.borrow().tabs[i]
-                        .payload.md_wy
-                        .as_ref()
-                        .map(|w| w.read(cx).is_loaded())
-                        .unwrap_or(false)
+                a.model.borrow().tabs[i]
+                    .payload.md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).is_loaded())
+                    .unwrap_or(false)
             });
             if ready {
                 break;
@@ -1133,7 +1132,10 @@
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                !a.model.borrow().tabs[a.model.borrow().tabs.len().saturating_sub(1)].payload.editor_pending
+                a.model
+                    .borrow().tabs
+                    .get(a.model.borrow().tabs.len().saturating_sub(1))
+                    .is_some()
             });
             if ready {
                 break;
@@ -1295,7 +1297,10 @@
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                !a.model.borrow().tabs[a.model.borrow().tabs.len().saturating_sub(1)].payload.editor_pending
+                a.model
+                    .borrow().tabs
+                    .get(a.model.borrow().tabs.len().saturating_sub(1))
+                    .is_some()
             });
             if ready {
                 break;

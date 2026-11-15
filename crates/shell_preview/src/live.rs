@@ -53,7 +53,7 @@ pub fn enter_live<H: PreviewHost>(
     let reuse = model.borrow().tabs[idx].payload.md_wy.as_ref().filter(|w| {
         async_load
             && w.read(cx).is_loaded()
-            && model.borrow().tabs[idx].payload.md_wy_install.pending.is_none()
+            && !w.read(cx).is_loading()
             && model.borrow().tabs[idx].payload.md_wy_install.pending_full.is_none()
             && !matches!(
                 model.borrow().tabs[idx].payload.md_wy_install.early,

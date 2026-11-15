@@ -311,7 +311,7 @@ pub fn md_wy_host_children<H: PreviewHost>(
         .child(zoom_overlay)
         .into_any_element()
 }/// Step2：右栏 `md_wy` 未就绪（大文档后台整篇解析在途）时的「正在排版」占位。
-/// 布局对齐 shell `render_editor_pending`（flex 居中 + 主题 muted 文字）；**容器**形态
+/// 布局对齐旧 shell `render_editor_pending`（flex 居中 + 主题 muted 文字）；**容器**形态
 /// 对齐 [`md_wy_host_children`] 外层（同一 `preview-md-wy` / `fullscreen-preview` 容器 id
 /// 与 `flex_grow/shrink/basis/min_w` 参数），占位→内容切换不改变窗口列宽布局。样式全走
 /// 主题 token（`panel_bg` / `text_minor`），禁止散落 rgba。

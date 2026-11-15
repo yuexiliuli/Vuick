@@ -40,7 +40,7 @@ use shell::app::EditorAppRegistry;
         println!("【md 异步打开：open_file 同步返回】(拖入不卡 UI) {} ms", sync_ms);
         // 两段式打开：D=编辑区**内容**即时就绪（快段，≈几十 ms），A=预览就绪（慢段
         // 后台并行统计+scan_blocks 完成后）。B 语义沿用「编辑区挂载完成」。
-        // 用「行数 + !editor_pending」作廉价就绪判据（大文档必然远超；不用每帧 value()
+        // 用「行数」作廉价就绪判据（大文档必然远超；不用每帧 value()
         // 物化 6MB，那会污染墙钟）。
         let mut d_ready = false;
         let mut a_ready = false;
@@ -51,7 +51,7 @@ use shell::app::EditorAppRegistry;
         loop {
             frames += 1;
             cx.run_until_parked();
-            let (wy_loaded, editor_pending, editor_lines) = cx.update(|_, cx| {
+            let (wy_loaded, editor_lines) = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
@@ -59,11 +59,10 @@ use shell::app::EditorAppRegistry;
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false),
-                    a.model.borrow().tabs[i].payload.editor_pending,
                     a.model.borrow().tabs[i].payload.editor.read(cx).line_count(),
                 )
             });
-            if !d_ready && !editor_pending && editor_lines > 1000 {
+            if !d_ready && editor_lines > 1000 {
                 d_ready = true;
                 d_ready_ms = t0.elapsed().as_millis() as usize;
             }
@@ -132,19 +131,18 @@ use shell::app::EditorAppRegistry;
         loop {
             frames += 1;
             cx.run_until_parked();
-            let (editor_lines, pending, wy_loaded) = cx.update(|_, cx| {
+            let (editor_lines, wy_loaded) = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
                     a.model.borrow().tabs[i].payload.editor.read(cx).line_count(),
-                    a.model.borrow().tabs[i].payload.editor_pending,
                     a.model.borrow().tabs[i].payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false),
                 )
             });
-            if !d_ready && !pending && editor_lines > 1000 {
+            if !d_ready && editor_lines > 1000 {
                 d_ready = true;
                 d_ms = t0.elapsed().as_millis() as usize;
             }
@@ -415,16 +413,12 @@ use shell::app::EditorAppRegistry;
             cx.update(|window, cx| {
                 app.update(cx, |app, cx| app.open_file(path, window, cx));
             });
-            // 2) 等待编辑器挂载完成（editor_pending 复位 = 编辑区已升起）
+            // 2) 等待选项卡就绪（`open_file` 已同步建 tab；编辑器内容随首块/整篇即时可见）。
             let t_open = std::time::Instant::now();
             let mut frames = 0;
             loop {
                 cx.run_until_parked();
-                let pending = cx.update(|_, cx| {
-                    let a = app.read(cx);
-                    a.model.borrow().tabs.last().map(|t| t.payload.editor_pending).unwrap_or(true)
-                });
-                if !pending {
+                if cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().is_some()) {
                     break;
                 }
                 frames += 1;
@@ -756,9 +750,7 @@ use shell::app::EditorAppRegistry;
         let mut frames = 0;
         loop {
             cx.run_until_parked();
-            let pending =
-                cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().map(|t| t.payload.editor_pending).unwrap_or(true));
-            if !pending {
+            if cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().is_some()) {
                 break;
             }
             frames += 1;
@@ -856,9 +848,9 @@ use shell::app::EditorAppRegistry;
         let mut frames = 0;
         loop {
             cx.run_until_parked();
-            let pending = cx
-                .update(|_, cx| app.read(cx).model.borrow().tabs.last().map(|t| t.payload.editor_pending).unwrap_or(true));
-            if !pending {
+            if cx
+                .update(|_, cx| app.read(cx).model.borrow().tabs.last().is_some())
+            {
                 break;
             }
             frames += 1;
@@ -1003,16 +995,12 @@ use shell::app::EditorAppRegistry;
             cx.update(|window, cx| {
                 app.update(cx, |app, cx| app.open_file(path, window, cx));
             });
-            // 2) 等待编辑器挂载完成（editor_pending 复位 = 编辑区已升起）
+            // 2) 等待选项卡就绪（`open_file` 已同步建 tab；编辑器内容随首块/整篇即时可见）。
             let t_open = std::time::Instant::now();
             let mut frames = 0;
             loop {
                 cx.run_until_parked();
-                let pending = cx.update(|_, cx| {
-                    let a = app.read(cx);
-                    a.model.borrow().tabs.last().map(|t| t.payload.editor_pending).unwrap_or(true)
-                });
-                if !pending {
+                if cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().is_some()) {
                     break;
                 }
                 frames += 1;
@@ -1362,15 +1350,12 @@ fn new_style_scan(content: &str, q: &str) -> usize {
         loop {
             frames += 1;
             cx.run_until_parked();
-            let (pending, lines) = cx.update(|_w, cx| {
+            let lines = cx.update(|_w, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                (
-                    a.model.borrow().tabs[i].payload.editor_pending,
-                    a.model.borrow().tabs[i].payload.editor.read(cx).line_count(),
-                )
+                a.model.borrow().tabs[i].payload.editor.read(cx).line_count()
             });
-            if !pending && lines > 1000 {
+            if lines > 1000 {
                 break;
             }
             if frames > 400 {

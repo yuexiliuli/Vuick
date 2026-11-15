@@ -557,7 +557,7 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let tab = &a.model.borrow().tabs[a.model.borrow().active_tab];
-                !tab.payload.editor_pending && tab.payload.editor.read(cx).value() == content
+                tab.payload.editor.read(cx).value() == content
             });
             if ready {
                 break;
@@ -619,8 +619,7 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let tab = &a.model.borrow().tabs[i];
-                !tab.payload.editor_pending
-                    && tab.payload.editor.read(cx).value() == content
+                tab.payload.editor.read(cx).value() == content
                     && tab.payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
@@ -727,7 +726,7 @@
     }
 
     /// 回归：大文档「分块读盘·渐进装配」——打开期间编辑器内容**渐进**出现（读多少
-    /// 显示多少），首块挂载即可视（`editor_pending`=false），全部读完后内容字节级一致。
+    /// 显示多少），首块挂载即可视，全部读完后内容字节级一致。
     /// 逐 tick 驱动协作式调度器，断言在某个中间时刻行数落在 (0, 全文行数) 之间——
     /// 证明内容不是「整篇读完一次性原子挂载」，而是逐块推送上屏。
     #[gpui::test]
@@ -770,15 +769,15 @@
                 break;
             }
             ticks += 1;
-            let (lc, pending, ready_full) = cx.update(|_w, cx| {
+            let (lc, ready_full) = cx.update(|_w, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let tab = &a.model.borrow().tabs[i];
                 let ed = tab.payload.editor.read(cx);
                 let outf_block = a.model.borrow().status_ok && ed.value() == content;
-                (ed.line_count(), tab.payload.editor_pending, outf_block)
+                (ed.line_count(), outf_block)
             });
-            if !pending && lc > 0 && lc < 60_000 {
+            if lc > 0 && lc < 60_000 {
                 saw_partial = true;
             }
             if ready_full {
@@ -790,17 +789,15 @@
             saw_partial,
             "应观察到「部分内容先行上屏」的中间态（{ticks} ticks；若缺 256KB 首块下限/逐块外推则为整篇原子挂载）"
         );
-        let (dlc, pending, final_ok) = cx.update(|_w, cx| {
+        let (dlc, final_ok) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             let tab = &a.model.borrow().tabs[i];
             (
                 tab.payload.editor.read(cx).display_line_count(),
-                tab.payload.editor_pending,
                 tab.payload.editor.read(cx).value() == content,
             )
         });
-        assert!(!pending, "装配完成后 editor_pending 应复位");
         assert!(final_ok, "最终内容应与文件字节级一致");
         assert_eq!(dlc, 60_000, "最终显示行数应为全文行数");
         let _ = std::fs::remove_file(&dir);
@@ -855,8 +852,7 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                !a.model.borrow().tabs[i].payload.editor_pending
-                    && !a.model.borrow().tabs[i].payload.loading_lock
+                !a.model.borrow().tabs[i].payload.loading_lock
                     && a.model.borrow().tabs[i].payload.editor.read(cx).value() == content
                     && a.open_finish_count >= 1
             });
@@ -948,20 +944,20 @@
                 break;
             }
             steps += 1;
-            let (cc, pending, lock) = cx.update(|_w, cx| {
+            let (cc, lock) = cx.update(|_w, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let tab = &a.model.borrow().tabs[i];
-                (tab.payload.char_count, tab.payload.editor_pending, tab.payload.loading_lock)
+                (tab.payload.char_count, tab.payload.loading_lock)
             });
             if cc < prev_char {
                 monotonic = false; // 计数回退 = 抖动/跳变，数字跳动不得回退
             }
             prev_char = cc;
-            if !done && !pending && cc > 0 && cc < full_chars {
+            if !done && cc > 0 && cc < full_chars {
                 saw_intermediate = true; // 中间态：正从某块计数往全文计数跳
             }
-            if !pending && !lock && cc == full_chars {
+            if !lock && cc == full_chars {
                 done = true;
             }
         }
@@ -1041,7 +1037,7 @@
                 (
                     a.model.borrow().tabs[i].payload.loading_lock,
                     !a.model.borrow().status_ok,
-                    ed.value().len() > 0 && !a.model.borrow().tabs[i].payload.editor_pending,
+                    ed.value().len() > 0,
                 )
             });
             if failed && mounted && !lock {
@@ -1052,13 +1048,12 @@
                 panic!("中途读盘失败未解锁 loading_lock（frames={frames}）");
             }
         }
-        // 已读首块内容保留、可继续查看（editor_pending 已复位、存在内容）。
-        let (content_len, pending) = cx.update(|_w, cx| {
+        // 已读首块内容保留、可继续查看（编辑区有内容）。
+        let content_len = cx.update(|_w, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            (a.model.borrow().tabs[i].payload.editor.read(cx).value().len(), a.model.borrow().tabs[i].payload.editor_pending)
+            a.model.borrow().tabs[i].payload.editor.read(cx).value().len()
         });
-        assert_eq!(pending, false, "中途失败后 editor 应可查看（pending 复位）");
         assert!(content_len > 0, "首块内容应保留：{content_len} 字节");
         let _ = std::fs::remove_file(&dir);
     }
@@ -1108,8 +1103,7 @@
                 let t = &a.model.borrow().tabs[i];
                 // Step2：提前整篇解析可能先于编辑区收尾装好预览 → 就绪必须等**编辑区也
                 // 全文落定**（预览全文 = 编辑区全文的唯一判据在两者都完成之后成立）。
-                !t.payload.editor_pending
-                    && t.payload.editor.read(cx).value() == content
+                t.payload.editor.read(cx).value() == content
                     && t.payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
@@ -1180,8 +1174,7 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let t = &a.model.borrow().tabs[i];
-                !t.payload.editor_pending
-                    && t.payload.editor.read(cx).value() == content
+                t.payload.editor.read(cx).value() == content
                     && a.open_finish_count >= 1
                     && t.payload.md_wy
                         .as_ref()
@@ -1269,7 +1262,7 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let t = &a.model.borrow().tabs[i];
-                !t.payload.editor_pending && t.payload.editor.read(cx).value().len() > 0
+                t.payload.editor.read(cx).value().len() > 0
             });
             if first {
                 break;
@@ -1954,8 +1947,7 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                !a.model.borrow().tabs[i].payload.editor_pending
-                    && !a.model.borrow().tabs[i].payload.loading_lock
+                !a.model.borrow().tabs[i].payload.loading_lock
                     && a.model.borrow().tabs[i].payload.source_encoding == None
                     && a.model.borrow().tabs[i].payload.editor.read(cx).value() == content
             });

@@ -1,7 +1,7 @@
 ﻿//! panes（预览渲染半在 `shell_preview`）。
 //!
 //! 本模块只保留**编辑区 / 分割条**宿主半：`render_editor_pane`（编辑区 + WYSIWYG 活区
-//! 左面板接入）、`render_plain_editor` / `render_editor_pending`（大文档占位与冻结）、
+//! 左面板接入）、`render_plain_editor`（大文档占位与冻结）、
 //! `render_splitter`（分屏分割线拖拽）。预览渲染半（`render_preview_pane` /
 //! `render_fullscreen_preview` 的 md_wy 分支、`md_wy_host_children` / `preview_element` /
 //! `render_live_area` / `zoom_overlay` 元素构建）在 `shell_preview`，宿主经薄适配调用；
@@ -33,18 +33,9 @@ impl EditorApp {
         if readonly {
             return div().id("editor-area").size_full().into_any_element();
         }
-        // 大文档异步打开：编辑器内容已就绪，但让预览先把内容画出来。
-        // 这一帧渲染轻量占位（不含 16 万行编辑器 → 布局轻快），并复位标记请求
-        // 下一帧挂载编辑器；编辑器的首帧 DisplayMap 布局（可能冻结一两秒）
-        // 因此排在用户看到预览内容之后，而不是挡在最前面。
-        let active = self.model.borrow().active_tab;
-        if self.model.borrow().tabs[active].payload.editor_pending {
-            self.model.borrow_mut().tabs[active].payload.editor_pending = false;
-            cx.notify();
-            return self.render_editor_pending(grow);
-        }
         // P1 大文档整篇仍在后台装配：编辑区已有首块内容但**锁输入**（全区域透明拦截，
         // 防「打开期间编辑」与 EOF 整篇换装竞态）；`finish_file_text` 换装后同帧解锁。
+        let active = self.model.borrow().active_tab;
         if self.model.borrow().tabs[active].payload.loading_lock {
             return self.render_plain_editor(grow, true, cx);
         }
@@ -63,33 +54,6 @@ impl EditorApp {
             return self.render_live_area(&ed, window, grow, cx);
         }
         self.render_plain_editor(grow, false, cx)
-    }
-
-    /// 大文档异步打开中的编辑区轻量占位（与正式编辑区**同一套 flex 布局参数**——
-    /// `flex_1/grow/min_w(0)/overflow_hidden`，否则 `.size_full()` 在分屏 flex 行里会占满
-    /// 整行，把预览顶出窗口）。
-    fn render_editor_pending(&self, grow: f32) -> gpui::AnyElement {
-        let panel_bg = self.panel_bg();
-        let muted = self.text_minor();
-        div()
-            .id("editor-area")
-            .debug_selector(|| "editor-area".into())
-            .flex_1()
-            .flex_grow(grow)
-            .min_w(px(0.))
-            .min_h(px(0.))
-            .overflow_hidden()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(panel_bg)
-            .child(
-                div()
-                    .text_color(muted)
-                    .text_size(px(13.))
-                    .child("正在载入编辑区…（预览已就绪）"),
-            )
-            .into_any_element()
     }
 
     /// WYSIWYG（live2）左面板宿主接入（元素构建在 `shell_preview::render::render_live_area`；

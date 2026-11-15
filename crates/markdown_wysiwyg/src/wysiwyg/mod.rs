@@ -220,6 +220,27 @@ pub enum WyEvent {
     /// 点击内部链接（wiki/tag/block-ref，`[[…]]`/`#tag`/`((id))`）→ 宿主打开对应页面。
     OpenPage(String),
 }
+
+/// 「整篇装配」的**纯安装轴**状态（从宿主 `MdWyInstall` 的 `seq` + `pending` + error 收敛
+/// 进 WyEditor）：装配代号（[`Self::seq`] 单调递增）/ 在途标志（[`Self::loading`]）/
+/// 最近一次失败信息（[`Self::install_error`]）。
+///
+/// 宿主 async 装配完成回调经 [`WyEditor::begin_install`] / [`WyEditor::finish_install`] /
+/// [`WyEditor::fail_install`] 按代号判「是否仍是最新的一代装配」——陈旧（`seq < 当前`）
+/// 回调被丢弃，语义 = 原宿主 `md_wy_install.seq == seq` 比对。`MdWyEarly`（early 守卫）与
+/// `pending_full`（整篇在途/增量桥收敛标记）这类**收敛标记**仍留宿主，本状态只收纯安装轴。
+#[derive(Debug, Default, Clone)]
+pub struct WyInstallState {
+    /// 后台整篇装配在途：`true` = 已发起异步 `open_from_*` 解析、尚未落地/失败/作废。
+    loading: bool,
+    /// 最近一次装配失败的宿主可读信息（[`WyEditor::fail_install`] 写入；新装配/成功清除）。
+    install_error: Option<String>,
+    /// 装配代号（单调计数器）：每次发起整篇装配 / 作废在途递增，结束在途旧装配
+    /// （代号不匹配的回调查 [`WyEditor::begin_install`]/[`finish_install`]/[`fail_install`]
+    /// 即丢弃，语义 = 原宿主 `md_wy_install.seq`）。
+    seq: usize,
+}
+
 /// 项目管线的所见即所得编辑器：`Doc`（内部 rope）为唯一数据源，`caret` 是**源字节偏移**。
 pub struct WyEditor {
     doc: Doc,
@@ -237,6 +258,12 @@ pub struct WyEditor {
     /// 后台解析时，`new()` 产生**空**编辑器——在 `install_open` 完成前该编辑器没有内容，
     /// 宿主读取 `text()` 写回必须回退到源码编辑区（否则加载窗口内保存/退出会丢内容）。
     loaded: bool,
+    /// 整篇装配的**纯安装轴**（装配代号 seq + 在途 loading + 失败 error）收敛自宿主的
+    /// `md_wy_install`（`early`/`pending_full` 等收敛标记仍留宿主）。宿主 async 装配
+    /// 回调经 [`Self::begin_install`]/[`Self::finish_install`]/[`Self::fail_install`]
+    /// 判陈旧世序 + 记录在途/错误；[`Self::is_loading`] 供宿主「是否整篇装配在途」门控
+    /// （替代原宿主 `md_wy_install.pending.is_some()`）。
+    install_state: WyInstallState,
     /// 是否可编辑。默认 true（编辑核心用途）；`set_editable(false)` 切**只读预览**门控：
     /// 输入/IME/删除/撤销/粘贴短路（`replace_range` 硬门控）、不画光标；保留光标移动、
     /// 点选/复制、链接点击、折叠、搜索高亮、表格/代码纵向滚动条拖动。

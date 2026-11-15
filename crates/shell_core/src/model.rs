@@ -673,7 +673,6 @@ pub struct TabPayload {
     pub preview_on: bool,
     pub preview_fullscreen: bool,
     pub readonly_preview: bool,
-    pub editor_pending: bool,
     /// 大文档 P1 后台装配在途（整篇 rope 尚在生产端）：编辑区已显示首块但**锁输入**
     /// （渲染层全区域透明拦截，见 panes.rs）——避免「打开期间编辑」与 EOF 整篇换装
     /// 竞态；`finish_file_text` 换装成功后置 false。
@@ -746,23 +745,15 @@ pub enum MdWyEarly {
     Failed,
 }
 
-/// 右栏 `md_wy`「在途装配」状态的单字段状态包：收敛 B3（`pending` + `seq`）、Step2
-/// （`early`）、Step3（`pending_full`）三代叠加态，EditorTab ⇄ DetachedTab 搬迁时作为
+/// 右栏 `md_wy`「在途装配」状态的**收敛标记**单字段状态包（纯安装轴 `pending`+`seq` 已
+/// 收敛进 WyEditor `install_state`，见 `markdown_wysiwyg::WyInstallState`）：Step2
+/// （`early`）、Step3（`pending_full`）叠加态，EditorTab ⇄ DetachedTab 搬迁时作为
 /// **一个字段**整包搬移（不再逐带双份复制进 DetachedTab）。
 ///
-/// 四个子项各自独立置位/清位（非互斥枚举）：`pending` 与 `seq` 可共存（`feed_full`
-/// 同时登记后台整篇在途与代号）；`early` 与 `pending_full` 亦可在多阶段协作时同时
-/// 置位——故收敛为**状态包**而非互斥枚举，保持「各标记独立置位/清位」的时序语义。
+/// 两子项各自独立置位/清位（非互斥枚举）：`early` 与 `pending_full` 亦可在多阶段协作时
+/// 同时置位——故收敛为**状态包**而非互斥枚举，保持「各标记独立置位/清位」的时序语义。
 #[derive(Default)]
 pub struct MdWyInstall {
-    /// 后台整篇装配在途：`Some((装配代号, 目标内容))` = 已登记
-    /// 后台 `open_from_str` 解析、尚未 `install_open`；`None` = 无在途。异步完成回调按
-    /// 代号与 `seq` 匹配才装配（不装错、不泄漏）。
-    pub pending: Option<(usize, SharedString)>,
-    /// 装配代号单调计数器：每次发起后台整篇装配 / 任何同步
-    /// 改源（增量重放、同步喂源、换源 install_open、预览关闭）递增，结束在途旧装配
-    /// （代号不匹配即丢弃其完成回调，防陈旧整篇覆盖刚改好的内容）。
-    pub seq: usize,
     /// Step2 提前整篇解析在途状态（见 [`MdWyEarly`]）。
     pub early: Option<MdWyEarly>,
     /// Step3「整篇在途」标记：`Some((装配代号, prefix 字节

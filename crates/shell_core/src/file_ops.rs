@@ -92,7 +92,6 @@ impl AppModel {
             // 未命名选项卡无文件 → 不设语言（保持纯文本高亮缺省）。
             ed.set_language(None);
         });
-        tab.payload.editor_pending = false;
         // 未命名选项卡正文以编辑器 Rope 为准，不整份镜像到 content（同 load_file_text）。
         tab.payload.content = gpui::SharedString::default();
         tab.payload.line_count = lines;

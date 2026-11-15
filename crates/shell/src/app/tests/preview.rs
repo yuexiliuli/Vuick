@@ -2260,12 +2260,12 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
-        // 不泵后台，立即断言：异步已登记、右栏仍是旧内容（未同步解析）、探针 +1。
-        let (pending, wy_now) = cx.update(|_w, cx| {
+        // 不泵后台，立即断言：异步已登记（在途）、右栏仍是旧内容（未同步解析）、探针 +1。
+        let (loading, wy_now) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
-                t.payload.md_wy_install.pending.clone(),
+                t.payload.md_wy.as_ref().map(|w| w.read(cx).is_loading()).unwrap_or(false),
                 t.payload.md_wy.clone().map(|w| w.read(cx).text().to_string()),
             )
         });
@@ -2276,27 +2276,24 @@
             async_before + 1,
             "大段切回应恰发起 1 次后台异步装配（探针）"
         );
-        assert!(
-            pending.as_ref().is_some_and(|(_, c)| c.as_ref() == expected),
-            "OFF 后右栏应登记待装配目标 = live2 全文"
-        );
+        assert!(loading, "OFF 后右栏应处于在途装配（is_loading=true）");
         assert_eq!(wy_now.as_deref(), Some(src.as_str()), "OFF 瞬间右栏仍是旧内容（未同步解析）");
-        // 泵后台到完成：右栏最终内容 == live2 全文，pending 清空。
+        // 泵后台到完成：右栏最终内容 == live2 全文，在途标志清空。
         let mut done = false;
         for _ in 0..200 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             done = cx.update(|_w, cx| {
-                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
-                    .payload.md_wy_install.pending
-                    .is_none()
+                let a = app.read(cx);
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
+                !t.payload.md_wy.as_ref().map(|w| w.read(cx).is_loading()).unwrap_or(false)
             });
             if done {
                 break;
             }
         }
-        assert!(done, "后台装配应在 200 帧内完成（pending 清空）");
+        assert!(done, "后台装配应在 200 帧内完成（在途标志清空）");
         let (wy_final, committed) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let w = a.model.borrow().tabs[a.model.borrow().active_tab]
@@ -2480,16 +2477,18 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
-        // 尚未泵后台：异步装配在途（pending 挂着 CX）。
-        let (pending, wy) = cx.update(|_w, cx| {
+        // 尚未泵后台：异步装配在途（WyEditor `is_loading()`=true，替代「pending 挂着 CX」）。
+        let wy = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-            (
-                t.payload.md_wy_install.pending.clone(),
-                t.payload.md_wy.clone().expect("md_wy 应在"),
-            )
+            t.payload.md_wy.clone().expect("md_wy 应在")
         });
-        let cx_snapshot = pending.clone().expect("在途装配应有 pending").1;
+        assert!(
+            cx.update(|_, cx| { wy.read(cx).is_loading() }),
+            "OFF 后异步整篇装配应处于在途"
+        );
+        // 在途装配的目标内容 = 此刻编辑区全文（CX 基线；用于下方「CX ≠ CY」测试前提）。
+        let cx_snapshot = cx.update(|_w, cx| editor.read(cx).value().to_string());
         // 在途窗口内：源码编辑区改成 CY（≠ CX），再同步喂源右栏 → 装配代号换代。
         let cy = format!("CY 全文基线\n{src}");
         cx.update(|_w, cx| {
@@ -2683,7 +2682,7 @@
             ready = cx.update(|_w, cx| {
                 let a = app.read(cx);
                 let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-                !t.payload.editor_pending && t.payload.editor.read(cx).line_count() > 1000
+                t.payload.editor.read(cx).line_count() > 1000
             });
             if ready {
                 break;
@@ -2742,9 +2741,9 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
             done = cx.update(|_w, cx| {
-                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
-                    .payload.md_wy_install.pending
-                    .is_none()
+                let a = app.read(cx);
+                let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
+                !t.payload.md_wy.as_ref().map(|w| w.read(cx).is_loading()).unwrap_or(false)
             });
             if done {
                 break;
@@ -2807,7 +2806,7 @@
             ready = cx.update(|_w, cx| {
                 let a = app.read(cx);
                 let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-                !t.payload.editor_pending && t.payload.editor.read(cx).line_count() > 1000
+                t.payload.editor.read(cx).line_count() > 1000
             });
             if ready {
                 break;
@@ -3033,7 +3032,8 @@
             app.update(cx, |app, cx| {
                 let idx = app.model.borrow().active_tab;
                 let wy = app.model.borrow().tabs[idx].payload.md_wy.clone().unwrap();
-                app.md_wy_install_full_swap(idx, &wy, wy_open, cx);
+                // seq=1：`ensure_md_wy(false)` → invalidate 即代号 1（等价早装启动代号）。
+                app.md_wy_install_full_swap(idx, &wy, wy_open, 1, cx);
             });
         });
         let mut after: Option<usize> = None;

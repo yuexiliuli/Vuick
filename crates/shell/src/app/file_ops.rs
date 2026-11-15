@@ -433,7 +433,7 @@ impl EditorApp {
     /// `prep`：读盘→归一化→Rope→行宽统计 的产物。同步小文档在 UI 线程现算
     /// （`defer_preview`=false，预览直接全量解析）；大文档由
     /// [`Self::spawn_background_open`] 走**两段式**：先快速挂载编辑器
-    /// （`defer_preview`=true，统计为占位、预览延迟、`editor_pending`=false），
+    /// （`defer_preview`=true，统计为占位、预览延迟），
     /// **内容瞬时可见**；行宽统计与预览索引由后台完成后 `finish_file_text` O(1) 补齐。
     fn load_file_text(
         &mut self,
@@ -479,7 +479,6 @@ impl EditorApp {
             ed.set_language(Some(lang));
         });
         // 编辑器即刻挂载（大文档不再是「预览优先」：内容瞬时可见优先于预览/滚动条精度）。
-        tab.payload.editor_pending = false;
         // P4-2：MD 预览统一走 WyEditor（`ensure_md_wy` 下方喂源）——不再为
         // MarkdownPreview 喂源（该后端已删除，M5-B5 P4-2）。txt 无预览，不建。
         tab.payload.file_path = Some(p.to_path_buf());
@@ -590,7 +589,7 @@ impl EditorApp {
                     )
                 });
         if Self::is_markdown_path(p) && !early_live {
-            self.md_wy_invalidate_async(idx);
+            self.md_wy_invalidate_async(idx, cx);
         }
         let mut model = self.model.borrow_mut();
         let Some(tab) = model.tabs.get_mut(idx) else {
@@ -853,7 +852,7 @@ impl EditorApp {
                 }
                 if first {
                     // 从未挂过首块（如空文件走漏进来的兜底）：挂一个空文档，
-                    // 使 editor_pending 复位、编辑器可正常显示/保存。
+                    // 使编辑器可正常显示/保存。
                     let p_emp = p.clone();
                     let _ = cx.update_window_entity(&entity, move |this, window, cx| {
                         let prep = prepare_text(String::new());
@@ -980,7 +979,7 @@ impl EditorApp {
     /// 把后台读到的第 `first` 块（首块）挂上 / 后续块防御忽略。
     ///
     /// - 首块：走 [`Self::load_file_text`](defer=true) 快速挂载（`open_fast_count` +1、
-    ///   `editor_pending`=false → **几十 KB 即出内容**），并设 `loading_lock`（长文档
+    ///   编辑区即出内容），并设 `loading_lock`（长文档
     ///   整篇仍在后台装配：挂载期锁输入 + 透明拦截，避免「打开期间编辑」与换装竞态）；
     ///   返回打开瞬间的编辑版本号作为收尾的「未编辑」守卫；
     /// - P1 起生产端**只发首块**（整篇在后台一次建好、EOF 换装）——非首块分支仅留防御：

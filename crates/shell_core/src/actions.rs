@@ -56,7 +56,6 @@ impl AppModel {
                 preview_on: false,
                 preview_fullscreen: false,
                 readonly_preview: false,
-                editor_pending: false,
                 loading_lock: false,
                 edit_version: 0,
                 reading_restore: None,

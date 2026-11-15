@@ -25,6 +25,7 @@ impl WyEditor {
             focus_registered: false,
             caret: 0,
             loaded: false,
+            install_state: WyInstallState::default(),
             editable: true,
             epub: false,
             // 渲染模型状态全部收敛进 `WyRenderModel`（字段初值与迁移前逐字一致，见引擎
@@ -511,6 +512,73 @@ impl WyEditor {
         }
         self.loaded = true;
     }
+
+    /// 新装配代号（「装配代号」单调计数器收敛进 WyEditor）：任何**发起整篇装配 / 作废
+    /// 在途**的路径经它取新代号并推进 [`Self::install_state`].seq——旧代号的在途回调查
+    /// [`Self::begin_install`]/[`Self::finish_install`]/[`Self::fail_install`] 时按
+    /// `seq < self.seq` 判陈旧丢弃（语义 = 原宿主 `md_wy_install.seq += 1`）。
+    pub fn next_install_seq(&mut self) -> usize {
+        self.install_state.seq = self.install_state.seq.wrapping_add(1);
+        self.install_state.seq
+    }
+
+    /// 占位 / 校验一次整篇装配（宿主 async 装配完成回调先调它做**陈旧世序检查**）。
+    /// 返回 `false` = 本代号已过期（`seq < self.seq`）→ 调用方应丢弃装配结果（不装旧）；
+    /// `true` = 仍是最新代号 → 置「在途」并记录代号，调用方可继续 `install_open` +
+    /// [`Self::finish_install`]。（代号单调前进，`seq == self.seq` 恒为最新；已换代判断
+    /// 只需一次 `<` 比较——见 [`Self::next_install_seq`]。）
+    pub fn begin_install(&mut self, seq: usize) -> bool {
+        if seq < self.install_state.seq {
+            return false; // 已换代：更晚的装配已发起
+        }
+        self.install_state.loading = true;
+        self.install_state.install_error = None;
+        self.install_state.seq = seq;
+        true
+    }
+
+    /// 整篇装配成功收尾：`seq < self.seq`（已换代）→ no-op 丢弃陈旧回调；否则清「在途」+
+    /// 失败信息、置 [`Self::loaded`]（≈ 原宿主同步 `install_open` 后清 `pending`）。
+    pub fn finish_install(&mut self, seq: usize) {
+        if seq < self.install_state.seq {
+            return; // 已换代：陈旧完成回调，丢弃
+        }
+        self.install_state.loading = false;
+        self.loaded = true;
+        self.install_state.install_error = None;
+    }
+
+    /// 整篇装配失败收尾：`seq < self.seq`（已换代）→ no-op 丢弃陈旧回调；否则清「在途」、
+    /// 记失败信息、**保持 [`Self::loaded`] 原样**（失败时保留已装内容/占位，不谎报就绪）。
+    pub fn fail_install(&mut self, seq: usize, err: impl Into<String>) {
+        if seq < self.install_state.seq {
+            return; // 已换代：陈旧失败回调，丢弃
+        }
+        self.install_state.loading = false;
+        self.install_state.install_error = Some(err.into());
+    }
+
+    /// 是否「后台整篇装配在途」（宿主门控用：替代原宿主 `md_wy_install.pending.is_some()`）。
+    pub fn is_loading(&self) -> bool {
+        self.install_state.loading
+    }
+
+    /// 最近一次装配失败的宿主可读信息（[`Self::fail_install`] 写入；成功/新装配清除）。
+    /// 预留的对外可读面（本轮宿主走「早装失败→Rope 即时重喂」路径会把错误染色成一次
+    /// 新装配并清除，故暂无不读轻体现在消费方）；供后续把失败回显到占位层用。
+    pub fn install_error(&self) -> Option<&str> {
+        self.install_state.install_error.as_deref()
+    }
+
+    /// 作废在途装配（宿主任何**同步改写内容**的路径在改动前调用，替代原宿主
+    /// `md_wy_invalidate_async` 的 `seq += 1` + 清 `pending`）：推进代号使旧回调查陈旧，
+    /// 并清「在途」与失败信息——同步 `install_open`/增量重放将接管内容，在途后台任务被丢弃。
+    pub fn invalidate_install(&mut self) {
+        self.install_state.seq = self.install_state.seq.wrapping_add(1);
+        self.install_state.loading = false;
+        self.install_state.install_error = None;
+    }
+
     /// 设置图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
     pub fn set_base_dir(&mut self, dir: Option<std::path::PathBuf>) {
         self.base_dir = dir;

@@ -64,7 +64,7 @@ pub fn toggle_preview_for_tab_state<H: 'static>(
         // 关闭预览：右栏 WyEditor 预览随预览开关释放（整篇解析/测量缓存随之释放，
         // 内存回到基线）。B3：在途后台整篇装配一并作废（实体被丢弃，完成回调按
         // tab 归属/代号不再安装）。
-        crate::mdwy::md_wy_invalidate_async(model, idx);
+        crate::mdwy::md_wy_invalidate_async(model, idx, cx);
         model.borrow_mut().tabs[idx].payload.md_wy = None;
         model.borrow_mut().tabs[idx].payload.md_wy_vscroll = gpui::ScrollHandle::new();
     }

@@ -191,7 +191,7 @@ pub fn ensure_md_wy<H: 'static>(
         return;
     }
     // B3：喂源/就地换源前作废在途后台装配（防旧切回的装配把新喂内容覆盖回去）。
-    md_wy_invalidate_async(model, idx);
+    md_wy_invalidate_async(model, idx, cx);
     // 懒创建引导块共用；MD 创建期无专属设置 → 空配置闭包。
     ensure_wy(model, idx, window, cx, |_ed, _cx| {});
     if feed {
@@ -234,7 +234,7 @@ pub fn ensure_epub_wy<H: 'static>(
         return;
     }
     // B3：喂源/就地换源前作废在途后台装配（防旧切回装配覆盖新喂内容）。
-    md_wy_invalidate_async(model, idx);
+    md_wy_invalidate_async(model, idx, cx);
     // 懒创建引导块共用；EPUB 创建期无专属设置 → 空配置闭包。
     ensure_wy(model, idx, window, cx, |_ed, _cx| {});
     let fs = model.borrow().font_size;
@@ -255,14 +255,21 @@ pub fn ensure_epub_wy<H: 'static>(
     }
 }
 
-/// B3：作废右栏 `md_wy` 的在途后台整篇装配（装配代号 +1、清 pending）。任何**同步**
+/// B3：作废右栏 `md_wy` 的在途后台整篇装配（装配代号 +1、清在途）。任何**同步**
 /// 改写 `md_wy` 内容的路径（增量重放 / 同步整篇喂源 / 换源 install_open / 预览关闭）
 /// 都必须在改动前调用——否则旧装配完成后会按旧代号命中、把刚改好的内容覆盖回去
 /// （装错）。shell `file_ops`（打开换源）也调用。
-pub fn md_wy_invalidate_async(model: &Rc<RefCell<AppModel>>, idx: usize) {
+/// 装配代号与「在途」标志已收敛进 WyEditor（[`WyEditor::invalidate_install`]），此处只
+/// 作 shell 域转发 + 清整篇在途标记。
+pub fn md_wy_invalidate_async<H: 'static>(
+    model: &Rc<RefCell<AppModel>>,
+    idx: usize,
+    cx: &mut Context<H>,
+) {
     if let Some(t) = model.borrow_mut().tabs.get_mut(idx) {
-        t.payload.md_wy_install.seq += 1;
-        t.payload.md_wy_install.pending = None;
+        if let Some(wy) = t.payload.md_wy.clone() {
+            wy.update(cx, |w, _| w.invalidate_install());
+        }
         t.payload.md_wy_install.pending_full = None; // Step3：任何同步改写 md_wy 内容 → 整篇在途标记一并作废
     }
 }
@@ -273,7 +280,8 @@ pub fn md_wy_invalidate_async(model: &Rc<RefCell<AppModel>>, idx: usize) {
 /// 小内容 → 同步（几十 KB 级解析极快，无「旧→新」等待）。每次调用递增装配代号——
 /// 本次装配胜出，覆盖在途旧装配。`open_from_str` 在本管线内无失败路径；若守卫不通过
 /// （切走/关闭/更新换代）则完成回调直接丢弃结果，md_wy 保持当前（旧）内容，由后续
-/// 喂源/装配追平，不装错、不泄漏。
+/// 喂源/装配追平，不装错、不泄漏。装配代号与在途标志收进 WyEditor（[`WyEditor::begin_install`]，
+/// 语义 = 原宿主 `md_wy_install.seq` + `pending`）。
 pub fn md_wy_feed_full<H: 'static>(
     model: &Rc<RefCell<AppModel>>,
     idx: usize,
@@ -283,25 +291,24 @@ pub fn md_wy_feed_full<H: 'static>(
     let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return;
     };
-    let seq = {
-        let mut m = model.borrow_mut();
-        let t = &mut m.tabs[idx];
-        t.payload.md_wy_install.seq += 1;
-        t.payload.md_wy_install.seq
-    };
+    // 装配代号 / 在途标志收进 WyEditor：发起即取新代号 + `begin_install`（在途）。
+    let seq = wy.update(cx, |w, _| {
+        let s = w.next_install_seq();
+        w.begin_install(s);
+        s
+    });
     if content.len() < MD_WY_ASYNC_INSTALL_MIN_BYTES {
         // 同步小整篇（无「旧→新」等待；`open_from_str` 免 `set_source_text` 的一次
         // 字符串复制，直接共享这份 `content`）。
         wy.update(cx, |w, _| {
-            w.install_open(markdown_wysiwyg::WyEditor::open_from_str(content))
+            w.install_open(markdown_wysiwyg::WyEditor::open_from_str(content));
+            w.finish_install(seq);
         });
         if let Some(t) = model.borrow_mut().tabs.get_mut(idx) {
-            t.payload.md_wy_install.pending = None;
             t.payload.md_wy_install.pending_full = None; // Step3：同步装好即 == 编辑区 → 解除在途标记
         }
         return;
     }
-    model.borrow_mut().tabs[idx].payload.md_wy_install.pending = Some((seq, content.clone()));
     // Step3：异步整篇在途、预览仍为旧内容（<新整篇）→ 置在途标记，增量桥打旧内容会
     // 错位，转为「作废 + 重喂」（见 shell `sync::on_editor_edited`）。
     model.borrow_mut().tabs[idx].payload.md_wy_install.pending_full = Some((seq, 0));
@@ -331,7 +338,7 @@ pub fn md_wy_align_after_ops<H: 'static>(
         .sum();
     if span <= MD_WY_DIFF_MAX_SPAN_BYTES && wy.read(cx).len() == src_len {
         // 增量重放会逐 op 把 md_wy 改成最终态 → 先作废在途后台装配（不装陈旧整篇）。
-        md_wy_invalidate_async(model, idx);
+        md_wy_invalidate_async(model, idx, cx);
         for (r, t) in ops {
             wy.update(cx, |w, cx| w.preview_apply_edit(r.clone(), t.as_ref(), cx));
         }
@@ -364,7 +371,7 @@ pub fn md_wy_align_after_diff<H: 'static>(
         && span <= MD_WY_DIFF_MAX_SPAN_BYTES
         && wy.read(cx).text().as_ref() == base;
     if use_diff {
-        md_wy_invalidate_async(model, idx);
+        md_wy_invalidate_async(model, idx, cx);
         for (r, t) in replaces.iter().rev() {
             wy.update(cx, |w, cx| w.preview_apply_edit(r.clone(), t, cx));
         }
@@ -384,7 +391,8 @@ pub fn md_wy_align_after_diff<H: 'static>(
 ///
 /// 完成回调守卫，任一不满足即丢弃（不装错、不泄漏）：
 ///   1) **tab 归属**：该 tab 的 `md_wy` 仍指向 `wy`（未关闭 / 未重建 / 未切走）；
-///   2) **装配代号**：`md_wy_install_seq == seq`（期间换源/重喂/编辑在途作废）；
+///   2) **装配代号**：`wy.install_state.seq` 仍 == 本代号（期间换源/重喂/编辑在途作废；
+///      代号检查收敛进 WyEditor [`WyEditor::begin_install`]，语义 = 原宿主 `seq == seq`）；
 ///   3) **未编辑**：`edit_version == 启动时版本`（用户已编辑 → 丢弃在途整篇，避免
 ///      把「装旧」覆盖用户对编辑器做的改动；该场景由 shell `sync.rs` 的重喂/增量链路
 ///      接管）。
@@ -401,12 +409,13 @@ pub fn md_wy_spawn_early_install<H: 'static>(
     let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return 0;
     };
-    let (seq, ver) = {
-        let mut m = model.borrow_mut();
-        let t = &mut m.tabs[idx];
-        t.payload.md_wy_install.seq += 1;
-        (t.payload.md_wy_install.seq, t.payload.edit_version)
-    };
+    // 装配代号 / 在途标志收进 WyEditor：发起即取新代号 + `begin_install`（在途）。
+    let seq = wy.update(cx, |w, _| {
+        let s = w.next_install_seq();
+        w.begin_install(s);
+        s
+    });
+    let ver = model.borrow().tabs[idx].payload.edit_version;
     model.borrow_mut().tabs[idx].payload.md_wy_install.early =
         Some(MdWyEarly::Pending { seq, edit_version: ver });
     let model2 = model.clone();
@@ -427,11 +436,12 @@ pub fn md_wy_spawn_early_install<H: 'static>(
             })
             .await;
         let _ = this.update(cx, |_this, cx| {
-            // 守卫 1/2（短借用）：tab 归属 + 装配代号。
-            let ok = model2.borrow().tabs.get(idx).is_some_and(|t| {
-                t.payload.md_wy.as_ref() == Some(&wy) && t.payload.md_wy_install.seq == seq
+            // 守卫 1/2（短借用）：tab 归属（保持原样）+ 装配代号（→ WyEditor 侧陈旧检查）。
+            let owned = model2.borrow().tabs.get(idx).is_some_and(|t| {
+                t.payload.md_wy.as_ref() == Some(&wy)
             });
-            if !ok {
+            let current = owned && wy.update(cx, |w, _| w.begin_install(seq));
+            if !current {
                 // 代号已换代 / 实体已易主（换源、重喂、切走重建）→ 本结果作废；清掉
                 // 本代号的在途标记（不误标 Failed——新装配会接管）。
                 if let Some(t) = model2.borrow_mut().tabs.get_mut(idx)
@@ -446,15 +456,20 @@ pub fn md_wy_spawn_early_install<H: 'static>(
             match result {
                 // 守卫 3：未编辑 → 带滚动锚换入全文。
                 Ok(result) if model2.borrow().tabs[idx].payload.edit_version == ver => {
-                    md_wy_install_full_swap(&model2, idx, &wy, result, cx);
+                    md_wy_install_full_swap(&model2, idx, &wy, result, seq, cx);
                 }
                 Ok(_) => {
                     // 已编辑：丢弃整篇结果（sync 自愈/重喂链路接管），复位在途标记
-                    //（EOF 收尾不再指望它，走既有收尾兜底）。
+                    //（EOF 收尾不再指望它，走既有收尾兜底）。整体装配已收尾 → 清在途。
                     let mut m = model2.borrow_mut();
                     let t = &mut m.tabs[idx];
                     t.payload.md_wy_install.early = None;
                     t.payload.md_wy_install.pending_full = None;
+                    drop(m);
+                    // 已编辑分支：`finish_install(seq)` 顺带置 `loaded=true` 属良性放宽——
+                    // 早装 prefix 已把内容挂上（loaded 本已 true），此处只清「在途」；即
+                    // 便无 prefix，后续 `feed_full_rope` 即时重喂会真正装上，不再重复置位。
+                    wy.update(cx, |w, _| w.finish_install(seq));
                 }
                 Err(_) => {
                     // 读盘/解析失败：置 Failed，EOF 收尾回退走既有整篇装配兜底——*前提是
@@ -471,6 +486,8 @@ pub fn md_wy_spawn_early_install<H: 'static>(
                         t.payload.md_wy_install.early = Some(MdWyEarly::Failed);
                         t.payload.md_wy_install.pending_full = None;
                     }
+                    // 失败信息收进 WyEditor（error 轴；随后重喂换代+清在途接管）。
+                    wy.update(cx, |w, _| w.fail_install(seq, String::from("提前整篇解析失败")));
                     let rope = model2.borrow().tabs[idx].payload.editor.read(cx).rope().clone();
                     md_wy_feed_full_rope(&model2, idx, rope, cx);
                 }
@@ -485,16 +502,21 @@ pub fn md_wy_spawn_early_install<H: 'static>(
 /// 回调与测试共用）。换入前抓当前顶行 `src_line`（prefix 帧；帧未就绪则 `None` 跳过），
 /// `install_open` 后经 `set_scroll_target` 由元素 prepaint（`advance_pending_scroll`）
 /// 逐帧重钉宿主偏移——prefix→全文**视觉不跳**；随后置 `md_wy_early = Done`、清
-/// `md_wy_pending_full`（整篇已装 → 增量桥恢复逐键）。
+/// `md_wy_pending_full`（整篇已装 → 增量桥恢复逐键）。`seq` = 本次整篇装配代号，
+/// 收尾时 [`WyEditor::finish_install`]（清在途/失败 + 置 loaded）。
 pub fn md_wy_install_full_swap<H: 'static>(
     model: &Rc<RefCell<AppModel>>,
     idx: usize,
     wy: &Entity<WyEditor>,
     result: WyOpenResult,
+    seq: usize,
     cx: &mut Context<H>,
 ) {
     let anchor = wy.read(cx).top_source_line();
-    wy.update(cx, |ed, _| ed.install_open(result));
+    wy.update(cx, |ed, _| {
+        ed.install_open(result);
+        ed.finish_install(seq);
+    });
     if let Some(sl) = anchor {
         wy.update(cx, |ed, _| ed.set_scroll_target(sl));
     }
@@ -516,8 +538,9 @@ pub fn md_wy_install_full_swap<H: 'static>(
 ///
 /// 完成守卫（任一不满足即丢弃，不装错、不降级）：
 ///   1) tab 归属：`md_wy` 仍指向 `wy`；
-///   2) 装配代号：`md_wy_install_seq == full_seq`（与整篇**同代号**，两者互不废对方；
-///      期间换源/重喂/编辑 → 代号换代皆弃）；
+///   2) 装配代号：`wy.install_state.seq` 仍 == `full_seq`（与整篇**同代号**，两者互不废
+///      对方；期间换源/重喂/编辑 → 代号换代皆弃；代号检查收敛进
+///      [`WyEditor::begin_install`]，语义 = 原宿主 `seq == full_seq`）；
 ///   3) **整篇未先装**：`md_wy_early` 非 `Done`（整篇若已先到，prefix 再装会把全文
 ///      退回首屏——严禁降级）；
 ///   4) **未编辑**：`edit_version == 启动时版本`（已编辑 → prefix 快照已过期，交给
@@ -545,8 +568,11 @@ pub fn md_wy_spawn_prefix_install<H: 'static>(
             let Some(tab) = m.tabs.get_mut(idx) else {
                 return;
             };
-            if tab.payload.md_wy.as_ref() != Some(&wy) || tab.payload.md_wy_install.seq != full_seq {
-                return; // 归属/代号换代 → 丢弃（新装配接管）
+            // 守卫 1：归属换代 → 丢弃（新装配接管）；守卫 3/4 为纯读，先于代号检查——
+            // 与原实现「代号先查」在可观测结果上等价（任一返回即不装机），且避免
+            // 在整篇已装/已编辑时无谓触碰 WyEditor 在途标志。
+            if tab.payload.md_wy.as_ref() != Some(&wy) {
+                return; // 归属换代 → 丢弃（新装配接管）
             }
             if matches!(tab.payload.md_wy_install.early, Some(MdWyEarly::Done)) {
                 return; // 整篇已先装：不降级回 prefix
@@ -554,9 +580,21 @@ pub fn md_wy_spawn_prefix_install<H: 'static>(
             if tab.payload.edit_version != ver {
                 return; // 已编辑：prefix 快照已过期，sync 重喂接管
             }
-            wy.update(cx, |ed, _| ed.install_open(result));
-            tab.payload.md_wy_install.pending_full = Some((full_seq, prefix_len));
-            cx.notify();
+            drop(m);
+            // 守卫 2：装配代号陈旧世序（→ WyEditor 侧）。陈旧 → 丢弃（新装配接管）。
+            let current = wy.update(cx, |w, _| w.begin_install(full_seq));
+            if !current {
+                return;
+            }
+            wy.update(cx, |ed, _| {
+                ed.install_open(result);
+                ed.finish_install(full_seq);
+            });
+            let mut m = model2.borrow_mut();
+            if let Some(tab) = m.tabs.get_mut(idx) {
+                tab.payload.md_wy_install.pending_full = Some((full_seq, prefix_len));
+                cx.notify();
+            }
         });
     })
     .detach();
@@ -566,7 +604,8 @@ pub fn md_wy_spawn_prefix_install<H: 'static>(
 /// （O(1) COW 快照）异步重喂全文——pending_full 期间（预览=prefix ≠ 编辑区）用户编辑
 /// 时增量桥坐标会错位，由 shell `sync::on_editor_edited` 调用本函数把预览重拉回「== 编辑
 /// 区」，随后退化逐键增量。小 rope 同步装、大 rope 后台 parse，均带装配代号守卫；
-/// 异步在途期间置 `md_wy_pending_full`（禁止对旧内容增量）。
+/// 异步在途期间置 `md_wy_pending_full`（禁止对旧内容增量）。装配代号与在途标志收进
+/// WyEditor（[`WyEditor::begin_install`]）。
 pub fn md_wy_feed_full_rope<H: 'static>(
     model: &Rc<RefCell<AppModel>>,
     idx: usize,
@@ -576,24 +615,22 @@ pub fn md_wy_feed_full_rope<H: 'static>(
     let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return;
     };
-    let seq = {
-        let mut m = model.borrow_mut();
-        let t = &mut m.tabs[idx];
-        t.payload.md_wy_install.seq += 1;
-        t.payload.md_wy_install.seq
-    };
+    let seq = wy.update(cx, |w, _| {
+        let s = w.next_install_seq();
+        w.begin_install(s);
+        s
+    });
     if rope.len() < MD_WY_ASYNC_INSTALL_MIN_BYTES {
         // 同步小整篇：装好后预览 == 编辑区 → 解除在途标记。
         wy.update(cx, |w, _| {
-            w.install_open(markdown_wysiwyg::WyEditor::open_from_rope(rope))
+            w.install_open(markdown_wysiwyg::WyEditor::open_from_rope(rope));
+            w.finish_install(seq);
         });
         if let Some(t) = model.borrow_mut().tabs.get_mut(idx) {
-            t.payload.md_wy_install.pending = None;
             t.payload.md_wy_install.pending_full = None;
         }
         return;
     }
-    model.borrow_mut().tabs[idx].payload.md_wy_install.pending = None;
     model.borrow_mut().tabs[idx].payload.md_wy_install.pending_full = Some((seq, 0));
     md_wy_spawn_async_install_rope(model, idx, wy, rope, seq, cx);
 }
@@ -601,11 +638,11 @@ pub fn md_wy_feed_full_rope<H: 'static>(
 /// Step3：`md_wy_feed_full` 的后台装配（Str 版）。完成回调两层守卫，任一不满足即丢弃
 /// 结果（不装错、不泄漏）：
 ///   1) **tab 归属**：该 tab 的 `md_wy` 仍指向 `wy`（未关闭 / 未重建实体 / 未切走）；
-///   2) **装配代号**：`md_wy_install_seq == seq`（期间又有新装配 / 同步喂源 / 换源 →
-///      旧装配作废，不装陈旧整篇）。
-/// 满足才 `install_open` 并清 pending / pending_full。整篇 O(n) 解析（`Doc::open` +
-/// 派生标记计数）在 `background_executor`，UI 只做 O(1) 快照 + 完成回调里的
-/// `install_open`（对齐 toggle ON 的既有异步通道）。
+///   2) **装配代号**：`wy.install_state.seq` 仍 == `seq`（期间又有新装配 / 同步喂源 /
+///      换源 → 旧装配作废，不装陈旧整篇；代号检查收敛进 [`WyEditor::begin_install`]）。
+/// 满足才 `install_open` 并 [`WyEditor::finish_install`] 清在途。整篇 O(n) 解析
+/// （`Doc::open` + 派生标记计数）在 `background_executor`，UI 只做 O(1) 快照 + 完成
+/// 回调里的 `install_open`（对齐 toggle ON 的既有异步通道）。
 fn md_wy_spawn_async_install<H: 'static>(
     model: &Rc<RefCell<AppModel>>,
     tab_idx: usize,
@@ -624,24 +661,38 @@ fn md_wy_spawn_async_install<H: 'static>(
             })
             .await;
         let _ = this.update(cx, |_this, cx| {
-            if model2.borrow().tabs.get(tab_idx).is_some_and(|t| {
-                t.payload.md_wy.as_ref() == Some(&wy_install) && t.payload.md_wy_install.seq == seq
-            }) {
-                wy_install.update(cx, |ed, _| ed.install_open(result));
+            // 1) tab 归属守卫（保持原样）：md_wy 仍指向本实体（未关闭/未重建/未切走）。
+            let owned = model2.borrow().tabs.get(tab_idx).is_some_and(|t| {
+                t.payload.md_wy.as_ref() == Some(&wy_install)
+            });
+            if !owned {
+                // 守卫不通过（切走/关闭/重建）→ 若 pending_full 仍挂本代号则清悬空标记
+                //（已换新代号则保留新标记）。在途标志收在 WyEditor，随换代自清，不动。
+                if let Some(tab) = model2.borrow_mut().tabs.get_mut(tab_idx)
+                    && tab.payload.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq)
+                {
+                    tab.payload.md_wy_install.pending_full = None;
+                }
+                return;
+            }
+            // 2) 装配代号陈旧世序（→ WyEditor 侧）：仍是最新代号才落盘。
+            let current = wy_install.update(cx, |w, _| w.begin_install(seq));
+            if current {
+                wy_install.update(cx, |ed, _| {
+                    ed.install_open(result);
+                    ed.finish_install(seq);
+                });
                 let mut m = model2.borrow_mut();
                 if let Some(tab) = m.tabs.get_mut(tab_idx) {
-                    tab.payload.md_wy_install.pending = None;
                     // Step3：异步整篇落地 → 预览已 == 目标，解除在途标记（增量桥恢复）。
                     tab.payload.md_wy_install.pending_full = None;
                 }
                 cx.notify();
             } else if let Some(tab) = model2.borrow_mut().tabs.get_mut(tab_idx)
-                && (tab.payload.md_wy_install.pending.as_ref().is_some_and(|(s, _)| *s == seq)
-                    || tab.payload.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq))
+                && tab.payload.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq)
             {
-                // 守卫不通过（切走/关闭/更新换代后结果被丢弃）：若 pending / pending_full
-                // 仍挂本代号（期间无更新装配）则清掉悬空标记；已换新代号则保留新标记。
-                tab.payload.md_wy_install.pending = None;
+                // 守卫不通过（换代后结果被丢弃）：若 pending_full 仍挂本代号则清掉悬空
+                // 标记；已换新代号则保留新标记。
                 tab.payload.md_wy_install.pending_full = None;
             }
         });
@@ -650,7 +701,7 @@ fn md_wy_spawn_async_install<H: 'static>(
 }
 
 /// Step3：`md_wy_feed_full_rope` 的后台装配（Rope 版，守卫/落地同
-/// [`md_wy_spawn_async_install`]；成功后清 pending / pending_full）。
+/// [`md_wy_spawn_async_install`]；成功后清 pending_full 与在途）。
 fn md_wy_spawn_async_install_rope<H: 'static>(
     model: &Rc<RefCell<AppModel>>,
     tab_idx: usize,
@@ -669,13 +720,28 @@ fn md_wy_spawn_async_install_rope<H: 'static>(
             })
             .await;
         let _ = this.update(cx, |_this, cx| {
-            if model2.borrow().tabs.get(tab_idx).is_some_and(|t| {
-                t.payload.md_wy.as_ref() == Some(&wy_install) && t.payload.md_wy_install.seq == seq
-            }) {
-                wy_install.update(cx, |ed, _| ed.install_open(result));
+            // 1) tab 归属守卫（保持原样）：md_wy 仍指向本实体（未关闭/未重建/未切走）。
+            let owned = model2.borrow().tabs.get(tab_idx).is_some_and(|t| {
+                t.payload.md_wy.as_ref() == Some(&wy_install)
+            });
+            if !owned {
+                if let Some(tab) = model2.borrow_mut().tabs.get_mut(tab_idx)
+                    && tab.payload.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq)
+                {
+                    // 守卫不通过（切走/关闭/换代）→ 若仍挂本代号则清悬空标记；已换新代号保留。
+                    tab.payload.md_wy_install.pending_full = None;
+                }
+                return;
+            }
+            // 2) 装配代号陈旧世序（→ WyEditor 侧）：仍是最新代号才落盘。
+            let current = wy_install.update(cx, |w, _| w.begin_install(seq));
+            if current {
+                wy_install.update(cx, |ed, _| {
+                    ed.install_open(result);
+                    ed.finish_install(seq);
+                });
                 let mut m = model2.borrow_mut();
                 if let Some(tab) = m.tabs.get_mut(tab_idx) {
-                    tab.payload.md_wy_install.pending = None;
                     tab.payload.md_wy_install.pending_full = None;
                 }
                 cx.notify();
