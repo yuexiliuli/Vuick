@@ -46,6 +46,41 @@ use crate::state::{
     effective_search_scope, normalize_search_query, SidebarChromeState, SEARCH_DEBOUNCE_MS,
 };
 
+/// 截断纯函数（Pattern 5.5 低成本护栏）：给定原始条数 `count` 与渲染上限 `cap`，
+/// 返回 `(渲染行数, 是否截断)`。`count <= cap` → 原样（渲染行数 = count，不截断）；
+/// `count > cap` → 渲染前 `cap` 条 + 一条「已显示前 N 条…」指示（truncated = true）。
+fn capped_rows(count: usize, cap: usize) -> (usize, bool) {
+    if count > cap {
+        (cap, true)
+    } else {
+        (count, false)
+    }
+}
+
+/// 「已显示前 N 条，共 M 条以上」截断指示**尾行**：muted 居中纯文本行，**非交互**
+/// （无 `on_click` / `on_hover`，不拦事件、不破坏 hover 与滚动），`family` 决定固定
+/// id（`sidebar-search-truncated-{family}`，如 `-file` / `-line` / `-pdf`）。
+fn truncated_indicator_row(
+    family: &'static str,
+    cap: usize,
+    total: usize,
+    muted: gpui::Hsla,
+) -> gpui::AnyElement {
+    let id = format!("sidebar-search-truncated-{family}");
+    div()
+        .id(SharedString::from(id.clone()))
+        .debug_selector(move || id.clone())
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_3()
+        .py_2()
+        .text_size(px(11.))
+        .text_color(muted)
+        .child(format!("已显示前 {cap} 条，{total} 条以上"))
+        .into_any_element()
+}
+
 impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 「搜索」视图：关键词输入框 + 范围切换（当前文件 / 整个文件夹）+ 匹配结果。
     /// 「当前文件」= 当前文档内容 + 跨打开文件文件名匹配（旧语义）；
@@ -722,7 +757,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
 
     /// 文件名命中（跨所有打开文件）：相当于「打开文件」快速选择器，点击激活选项卡。
     /// 「激活既有选项卡」经宿主服务 [`SidebarHost::sidebar_activate_tab`]（选项卡集合/
-    /// 活动索引是宿主 panes 域能力）。
+    /// 活动索引是宿主 panes 域能力）。渲染行数按 [`config::limits::SEARCH_FILE_RESULTS_CAP`]
+    /// 物化封顶（超限追加一行「…更多」指示，底层 `scan.file_tabs` 不截断）。
     fn sidebar_search_file_rows(
         &self,
         _window: &mut Window,
@@ -732,8 +768,11 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         active_bg: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
+        let cap = config::limits::SEARCH_FILE_RESULTS_CAP;
+        let total = scan.file_tabs.len();
+        let (rows_len, truncated) = capped_rows(total, cap);
         let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
-        for ti in scan.file_tabs.iter().copied() {
+        for ti in scan.file_tabs.iter().copied().take(rows_len) {
             let name = self.model.borrow().tabs[ti]
                 .file_path
                 .as_ref()
@@ -760,12 +799,16 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 }));
             file_rows.push(r.into_any_element());
         }
+        if truncated {
+            file_rows.push(truncated_indicator_row("file", cap, total, muted));
+        }
         file_rows
     }
 
     /// 行内容命中（只在「当前活动文档」内搜索）——若仍扫描所有打开的选项卡，
     /// 在 PDF 预览（无可搜索文本，content 为空）下会冒出别的文件（如 EPUB 完整正文）
     /// 的内容，看起来像搜索到了错误文档。点击：激活文档 + 光标/预览滚到命中行并高亮。
+    /// 渲染行数按 [`config::limits::SEARCH_LINE_RESULTS_CAP`] 物化封顶（同文件行护栏）。
     fn sidebar_search_line_rows(
         &self,
         _window: &mut Window,
@@ -775,8 +818,11 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let ti = self.model.borrow().active_tab;
+        let cap = config::limits::SEARCH_LINE_RESULTS_CAP;
+        let total = scan.line_hits.len();
+        let (rows_len, truncated) = capped_rows(total, cap);
         let mut line_rows: Vec<gpui::AnyElement> = Vec::new();
-        for hit in &scan.line_hits {
+        for hit in scan.line_hits.iter().take(rows_len) {
             let li = hit.line;
             let match_range = hit.range.clone();
             let snippet = hit.snippet.clone();
@@ -798,6 +844,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     cx.notify();
                 }));
             line_rows.push(r.into_any_element());
+        }
+        if truncated {
+            line_rows.push(truncated_indicator_row("line", cap, total, muted));
         }
         line_rows
     }
@@ -983,6 +1032,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
 
     /// PDF 搜索命中行（每个命中一行）：`L N  前5字…目标…后5字`，单行显示、超出省略；
     /// 当前激活命中高亮，点击跳转到该命中页（直接驱动 PdfViewer `focus_match_on_page`）。
+    /// 命中列表（`search_snippets`）无扫描上限 → 渲染行数按
+    /// [`config::limits::SEARCH_PDF_HIT_CAP`] 物化封顶，超限追加一行「…更多」指示
+    /// （`snippets` 本身不截断，计数头仍显示全部命中数）。
     #[allow(clippy::too_many_arguments)] // 三色 + 数据源 + 命中列表，与 render_* 同构
     fn sidebar_pdf_hit_rows(
         &self,
@@ -995,8 +1047,11 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         active_bg: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
+        let cap = config::limits::SEARCH_PDF_HIT_CAP;
+        let total = snippets.len();
+        let (rows_len, truncated) = capped_rows(total, cap);
         let mut hit_rows: Vec<gpui::AnyElement> = Vec::new();
-        for (idx, (page, snippet)) in snippets.iter().enumerate() {
+        for (idx, (page, snippet)) in snippets.iter().take(rows_len).enumerate() {
             let page = *page;
             let color = if idx == active { fg } else { muted };
             let row_pdf = pdf.clone();
@@ -1015,6 +1070,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     cx.notify();
                 }));
             hit_rows.push(r.into_any_element());
+        }
+        if truncated {
+            hit_rows.push(truncated_indicator_row("pdf", cap, total, muted));
         }
         hit_rows
     }
@@ -1109,5 +1167,26 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         });
         self.model.borrow_mut().search_scan = Some(scan.clone());
         scan
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capped_rows;
+
+    /// 边界：条数 ≤ 上限 → 原样渲染（渲染行数 = 条数，不截断、无指示行）。
+    #[test]
+    fn capped_rows_keeps_at_or_below_cap_unchanged() {
+        assert_eq!(capped_rows(0, 200), (0, false));
+        assert_eq!(capped_rows(199, 200), (199, false));
+        assert_eq!(capped_rows(200, 200), (200, false));
+    }
+
+    /// 边界：条数 = 上限 + 1 → 渲染前 cap 条 + 置截断标志（追加一行指示）。
+    #[test]
+    fn capped_rows_truncates_above_cap() {
+        assert_eq!(capped_rows(201, 200), (200, true));
+        assert_eq!(capped_rows(560, 200), (200, true));
+        assert_eq!(capped_rows(2000, 200), (200, true));
     }
 }

@@ -49,6 +49,16 @@ pub const BRACKET_GUIDE_WINDOW_LOOKBACK_LINES: usize = 2048;
 pub const SEARCH_RESULT_CAP: usize = 200;
 /// 文件夹级内容搜索「总命中条数」上限：达到即截断并提示（不无限累积渲染分组）。
 pub const FOLDER_SEARCH_RESULT_CAP: usize = 500;
+/// 侧边栏「当前文件」搜索**文件名命中行**的**渲染**条数上限（Pattern 5.5 低成本护栏）：
+/// 扫描层 [`SEARCH_RESULT_CAP`]（200，文件名 + 行内容共用一个配额）已把命中数 ≤200 封顶，
+/// 本上限在**渲染物化侧**再兜一层——即使未来扫描上限放宽/删除，渲染行数也恒 ≤ 该值；
+/// 超限只渲染前 `cap` 行 + 一行「已显示前 N 条…」指示（不截断底层命中缓存）。
+pub const SEARCH_FILE_RESULTS_CAP: usize = 200;
+/// 侧边栏「当前文件」搜索**行内容命中行**的**渲染**条数上限（同上护栏，配额独立于文件行）。
+pub const SEARCH_LINE_RESULTS_CAP: usize = 200;
+/// 侧边栏 **PDF 全文检索命中行**的**渲染**条数上限：PDF 检索结果（`search_snippets`）
+/// 目前没有任何扫描上限，命中数可无界增长；渲染物化封顶到该值并追加一行「…」指示。
+pub const SEARCH_PDF_HIT_CAP: usize = 200;
 /// WYSIWYG 行整形缓存容量（按**块下标**计）：滚动/带重建复用已整形的块（文本/代码/
 /// 表格），避免每档重建把可视带整批重 shape + 代码块重跑 syntect（对齐 `view` 的
 /// 行虚拟化复用与 `editor` 「只重排变更区」）。超出后按最近最少使用淘汰。
