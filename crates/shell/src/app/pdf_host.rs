@@ -130,9 +130,28 @@ impl EditorApp {
                 owner = win32.hwnd.get();
             }
             let initial = shell_pdf::bg::canvas_bg(&self.model.borrow());
-            if let Some(hex) = shell_pdf::bg::pick_color(initial, owner) {
-                self.set_pdf_bg(PdfBgPref::Custom, Some(hex), cx);
-            }
+            // 自定义色对话框移后台线程 + async 回传（镜像 file_tree_ops window.prompt
+            // 姿势）；修复主线程 borrow 帧内阻塞模态重入 panic（用户真机复报）：
+            // 事件帧持有 gpui App RefCell，`pick_color` 的模态消息泵同线程重入窗程 →
+            // 异步/输入续体二次 `app.borrow_mut()` panic。后台线程弹框不再持主线程
+            // App borrow，取色结果经 oneshot + window.spawn 回传主线程再落地。
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let entity = cx.entity();
+            let _ = std::thread::Builder::new()
+                .name("pdf-color-dialog".into())
+                .spawn(move || {
+                    let r = shell_pdf::bg::pick_color(initial, owner);
+                    let _ = tx.send(r);
+                });
+            window
+                .spawn(cx, async move |cx| {
+                    if let Ok(Some(hex)) = rx.await {
+                        let _ = cx.update_window_entity(&entity, move |this, _window, cx| {
+                            this.set_pdf_bg(PdfBgPref::Custom, Some(hex), cx);
+                        });
+                    }
+                })
+                .detach();
         }
         #[cfg(any(not(windows), test))]
         {
