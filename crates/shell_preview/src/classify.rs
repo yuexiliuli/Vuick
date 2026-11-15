@@ -116,7 +116,7 @@ pub fn language_id(p: &Path) -> &'static str {
 pub fn is_markdown_tab(m: &shell_core::AppModel, idx: usize) -> bool {
     m.tabs
         .get(idx)
-        .and_then(|t| t.file_path.as_ref())
+        .and_then(|t| t.payload.file_path.as_ref())
         .map(|p| is_markdown_path(p))
         .unwrap_or(false)
 }
@@ -125,7 +125,7 @@ pub fn is_markdown_tab(m: &shell_core::AppModel, idx: usize) -> bool {
 pub fn is_epub_tab(m: &shell_core::AppModel, idx: usize) -> bool {
     m.tabs
         .get(idx)
-        .and_then(|t| t.file_path.as_ref())
+        .and_then(|t| t.payload.file_path.as_ref())
         .map(|p| is_epub_path(p))
         .unwrap_or(false)
 }

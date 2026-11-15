@@ -16,7 +16,7 @@
 
     /// 测试辅助：取选项卡的图片查看器实体（经 `MediaReader::Image` 取）。
     fn tab_image(tab: &EditorTab) -> Option<&gpui::Entity<image_viewer::ImageViewer>> {
-        match &tab.reader {
+        match &tab.payload.reader {
             MediaReader::Image(iv) => Some(iv),
             _ => None,
         }
@@ -25,7 +25,7 @@
     /// 测试辅助：取选项卡的视频查看器实体（经 `MediaReader::Video` 取）。
     #[cfg(feature = "video")]
     fn tab_video(tab: &EditorTab) -> Option<&gpui::Entity<video::VideoViewer>> {
-        match &tab.reader {
+        match &tab.payload.reader {
             MediaReader::Video(vv) => Some(vv),
             _ => None,
         }

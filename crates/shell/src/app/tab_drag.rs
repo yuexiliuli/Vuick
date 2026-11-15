@@ -47,8 +47,8 @@ impl EditorApp {
     /// 置为激活并同步预览/PDF 主题与软换行偏好。
     /// `window=None` 用于跨窗口还原（此时不抢焦点，由调用方在目标窗口聚焦）；
     /// `Some(window)` 用于拆出新窗口（直接聚焦新窗口的编辑区）。
-    /// 整结构 move：一次解构 `DetachedTab` 搬回 `EditorTab`（live 态/订阅置目标窗口
-    /// 缺省值），不再逐字段手抄。
+    /// 整结构 move：`EditorTab::from_detached` 把载荷（23 个搬迁字段）与目标窗口重建
+    /// 的 live 态/订阅收束为完整 `EditorTab`，不再逐字段手抄。
     /// `#[doc(hidden)] pub`：`tests/pdf.rs` 多窗口换位回归（§8.6 外提清单）。
     #[doc(hidden)]
     pub fn adopt_tab(
@@ -57,85 +57,35 @@ impl EditorApp {
         mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        let DetachedTab {
-            editor,
-            reader,
-            md_wy,
-            md_wy_vscroll,
-            md_wy_install,
-            epub_images,
-            epub_notes,
-            file_path,
-            dirty,
-            source_encoding,
-            content,
-            line_count,
-            char_count,
-            cursor_row,
-            cursor_col,
-            preview_on,
-            preview_fullscreen,
-            readonly_preview,
-            editor_pending,
-            loading_lock,
-            edit_version,
-            reading_restore,
-            md_restore_pending,
-        } = payload;
-        let edit_sub = self.subscribe_editor(&editor, cx);
-        let is_md = file_path
+        // `_edit_sub` 先在目标窗口重建（编辑器实体自载荷借出），再整包 move 回 EditorTab。
+        let edit_sub = self.subscribe_editor(&payload.editor, cx);
+        let is_md = payload
+            .file_path
             .as_ref()
             .map(|p| Self::is_markdown_path(p))
             .unwrap_or(false);
         let idx = self.model.borrow().tabs.len();
-        self.model.borrow_mut().tabs.push(EditorTab {
-            editor,
-            file_path,
-            dirty,
-            source_encoding,
-            content,
-            line_count,
-            char_count,
-            cursor_row,
-            cursor_col,
-            reader,
-            md_wy,
-            md_wy_vscroll,
-            md_wy_install,
-            epub_images,
-            epub_notes,
-            preview_on,
-            preview_fullscreen,
-            readonly_preview,
-            editor_pending,
-            loading_lock,
-            edit_version,
-            // 阅读进度恢复锚随选项卡搬迁（若打开瞬间的恢复尚未消费、随后被拖走）。
-            reading_restore,
-            // md 恢复在途守卫随选项卡搬迁（同 reading_restore）。
-            md_restore_pending,
-            // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交写回，见 take_tab_payload 调用点）
-            live_edit: false,
-            live2: None,
-            live2_dirty: false,
-            _live2_sub: None,
-            live_vscroll: gpui::ScrollHandle::new(),
-            _edit_sub: edit_sub,
-            // PDF 阅读器订阅随选项卡重建（源窗口的 `_pdf_sub` 已随 take_tab_payload 丢弃）
-            _pdf_sub: None,
-        });
+        self.model.borrow_mut().tabs.push(EditorTab::from_detached(
+            payload,
+            edit_sub,
+            false, // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交写回）
+            None,  // live2
+            false, // live2_dirty
+            // live_vscroll 每次重建新句柄（同 take 前每选项卡独立）
+            gpui::ScrollHandle::new(),
+        ));
         self.model.borrow_mut().active_tab = idx;
         self.model.borrow_mut().search_scan = None;
         // 编辑区软换行与目标窗口偏好对齐（md 默认换行、预览开着强制换行）
-        let wrap = is_md || self.model.borrow().wrap_enabled || self.model.borrow().tabs[idx].preview_on;
-        self.model.borrow().tabs[idx].editor.update(cx, |ed, _cx| {
+        let wrap = is_md || self.model.borrow().wrap_enabled || self.model.borrow().tabs[idx].payload.preview_on;
+        self.model.borrow().tabs[idx].payload.editor.update(cx, |ed, _cx| {
             ed.set_soft_wrap(wrap);
         });
         // 预览/PDF 主题背景刷新 + PDF 订阅重建
         let canvas_bg = self.window_bg();
         // P4-2：MD / EPUB 预览都走统一 WyEditor 只读宿主——实体随选项卡搬迁已带内容，
         // 无需再喂 MarkdownPreview（该后端已删除）。
-        let reader = self.model.borrow().tabs[idx].reader.clone();
+        let reader = self.model.borrow().tabs[idx].payload.reader.clone();
         match reader {
             MediaReader::Pdf(pdf) => {
                 // PDF 画布底色按当前偏好恢复（默认跟随主题；显式档保持冻结色）。
@@ -157,7 +107,7 @@ impl EditorApp {
             self.activate_tab(idx, window, cx);
             self.model.borrow_mut().status = SharedString::from("已拆分为独立窗口");
             // 窗口标题跟随当前文件（拆出的新窗口直接以此命名）
-            if let Some(p) = self.model.borrow().tabs[idx].file_path.as_ref() {
+            if let Some(p) = self.model.borrow().tabs[idx].payload.file_path.as_ref() {
                 window.set_window_title(&p.to_string_lossy());
             } else {
                 window.set_window_title("未命名");
@@ -272,13 +222,14 @@ impl EditorApp {
             return;
         };
         let name: SharedString = tab
+            .payload
             .file_path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "未命名".to_string())
             .into();
-        let dirty = tab.dirty;
+        let dirty = tab.payload.dirty;
         drop(model);
         // 幽灵窗/预览尺寸 = 真实选项卡 laid-out 尺寸（`tabs::TabBoundsRecorder` 每帧写入
         // `drag_size`）；首帧尚无记录时回退到估算。同步给下面创建的窗口 bounds/min_size。

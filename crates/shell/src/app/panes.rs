@@ -28,7 +28,7 @@ impl EditorApp {
         let readonly = self
             .model.borrow().tabs
             .get(self.model.borrow().active_tab)
-            .map(|t| t.readonly_preview)
+            .map(|t| t.payload.readonly_preview)
             .unwrap_or(false);
         if readonly {
             return div().id("editor-area").size_full().into_any_element();
@@ -38,14 +38,14 @@ impl EditorApp {
         // 下一帧挂载编辑器；编辑器的首帧 DisplayMap 布局（可能冻结一两秒）
         // 因此排在用户看到预览内容之后，而不是挡在最前面。
         let active = self.model.borrow().active_tab;
-        if self.model.borrow().tabs[active].editor_pending {
-            self.model.borrow_mut().tabs[active].editor_pending = false;
+        if self.model.borrow().tabs[active].payload.editor_pending {
+            self.model.borrow_mut().tabs[active].payload.editor_pending = false;
             cx.notify();
             return self.render_editor_pending(grow);
         }
         // P1 大文档整篇仍在后台装配：编辑区已有首块内容但**锁输入**（全区域透明拦截，
         // 防「打开期间编辑」与 EOF 整篇换装竞态）；`finish_file_text` 换装后同帧解锁。
-        if self.model.borrow().tabs[active].loading_lock {
+        if self.model.borrow().tabs[active].payload.loading_lock {
             return self.render_plain_editor(grow, true, cx);
         }
         // 所见即所得预览编辑（WYSIWYG）模式：左面板 = 本项目 `WyEditor`
@@ -117,7 +117,7 @@ impl EditorApp {
         freeze_input: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let editor = self.model.borrow().tabs[self.model.borrow().active_tab].editor.clone();
+        let editor = self.model.borrow().tabs[self.model.borrow().active_tab].payload.editor.clone();
         // 字号覆盖（用户 Ctrl+=/- 调节；None=主题默认）。渲染时由 CodeEditor 自身读取。
         let font_size = self.model.borrow().font_size;
         editor.update(cx, |ed, _| ed.set_font_override(Some(font_size)));
@@ -253,7 +253,7 @@ impl EditorApp {
         // 会在 Ctrl+滚轮时**先于阅读器**消费并 `stop_propagation`，媒体自身 Ctrl+滚轮
         // 缩放失效——普通滚轮则被不拦截地透传到阅读器。仅非阅读器占位（无 md_wy 的
         // 文本/纯文本等）保留全局字号入口。
-        if !self.model.borrow().tabs[self.model.borrow().active_tab].reader.is_reader() {
+        if !self.model.borrow().tabs[self.model.borrow().active_tab].payload.reader.is_reader() {
             preview_pane = preview_pane.child(Self::zoom_overlay(cx));
         }
         div()
@@ -312,7 +312,7 @@ impl EditorApp {
         // zoom_overlay（否则 Ctrl+滚轮会被全局字号缩放抢走，媒体缩放失效）。PDF 自身
         // 已有 Ctrl+滚轮缩放 → 与图片/视频同归「媒体自处理」，同样不挂；仅非阅读器占位
         // （无 md_wy 的文本/纯文本等）保留全局字号入口。
-        if !tab.reader.is_reader() {
+        if !tab.payload.reader.is_reader() {
             el = el.child(Self::zoom_overlay(cx));
         }
         el.into_any_element()

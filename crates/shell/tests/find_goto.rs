@@ -61,7 +61,7 @@ async fn find_dispatch_opens_bar_types_and_navigates(cx: &mut TestAppContext) {
     }
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone()
+        a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.clone()
     });
     let (open, _, _, _, _) = cx.update(|_, cx| ed.read(cx).test_find_state());
     assert!(open, "文本选项卡 Ctrl+F 应打开 find 条");
@@ -145,7 +145,7 @@ async fn find_non_text_tab_toasts_not_opens(cx: &mut TestAppContext) {
                 image_viewer::ImageViewer::new(std::path::PathBuf::from("___"), cx)
             });
             let idx = app.model.borrow().active_tab;
-            app.model.borrow_mut().tabs[idx].reader = MediaReader::Image(viewer);
+            app.model.borrow_mut().tabs[idx].payload.reader = MediaReader::Image(viewer);
         });
     });
     for _ in 0..3 {
@@ -164,7 +164,7 @@ async fn find_non_text_tab_toasts_not_opens(cx: &mut TestAppContext) {
     }
     let (open, toast) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
+        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx);
         (
             ed.test_find_state().0,
             a.notifications
@@ -229,7 +229,7 @@ async fn goto_line_dispatches_to_active_editor(cx: &mut TestAppContext) {
     }
     let (open, focused) = cx.update(|window, cx| {
         let a = app.read(cx);
-        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
+        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx);
         let input_focused = ed
             .test_goto_input()
             .map(|i| {
@@ -245,6 +245,7 @@ async fn goto_line_dispatches_to_active_editor(cx: &mut TestAppContext) {
     // 输入 42 + Enter → 立即跳到第 42 行（0 基 41）、卡片保持打开。
     cx.update(|window, cx| {
         let ed = app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
+            .payload
             .editor
             .clone();
         let input = ed.read(cx).test_goto_input().cloned().unwrap();
@@ -259,7 +260,7 @@ async fn goto_line_dispatches_to_active_editor(cx: &mut TestAppContext) {
     }
     let (pos, open2) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
+        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx);
         (ed.cursor_position(), ed.test_goto_state().0)
     });
     assert_eq!(pos, (41, 0), "Enter 应跳到第 42 行");
@@ -286,7 +287,7 @@ async fn goto_line_non_text_tab_toasts(cx: &mut TestAppContext) {
                 image_viewer::ImageViewer::new(std::path::PathBuf::from("___"), cx)
             });
             let idx = app.model.borrow().active_tab;
-            app.model.borrow_mut().tabs[idx].reader = MediaReader::Image(viewer);
+            app.model.borrow_mut().tabs[idx].payload.reader = MediaReader::Image(viewer);
         });
     });
     for _ in 0..3 {
@@ -304,7 +305,7 @@ async fn goto_line_non_text_tab_toasts(cx: &mut TestAppContext) {
     }
     let (open, toast) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
+        let ed = a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx);
         (
             ed.test_goto_state().0,
             a.notifications

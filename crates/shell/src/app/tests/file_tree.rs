@@ -195,14 +195,14 @@
         ft_stabilize(cx);
         let (tabs, active_is_a) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let active = a.model.borrow().tabs.get(a.model.borrow().active_tab).and_then(|t| t.file_path.clone());
+            let active = a.model.borrow().tabs.get(a.model.borrow().active_tab).and_then(|t| t.payload.file_path.clone());
             (a.model.borrow().tabs.len(), active == Some(a_path.clone()))
         });
         assert_eq!(tabs, 2, "点击文件行应打开一个选项卡（初始 1 个空 tab + 1）");
         assert!(active_is_a, "应激活并打开 a.txt");
         let content = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string()
+            a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx).value().to_string()
         });
         assert_eq!(content, "AAA", "应载入 a.txt 内容");
 
@@ -213,7 +213,7 @@
         ft_stabilize(cx);
         let (tabs_after, active2) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let active = a.model.borrow().tabs.get(a.model.borrow().active_tab).and_then(|t| t.file_path.clone());
+            let active = a.model.borrow().tabs.get(a.model.borrow().active_tab).and_then(|t| t.payload.file_path.clone());
             (a.model.borrow().tabs.len(), active == Some(a_path.clone()))
         });
         assert_eq!(tabs_after, 2, "重复点击已打开文件应激活既有，不新建");

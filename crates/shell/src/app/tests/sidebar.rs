@@ -476,7 +476,7 @@
         }
         let vhand = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy_vscroll.clone()
+            a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy_vscroll.clone()
         });
         let before = cx.update(|_w, _cx| (-vhand.offset().y).as_f32());
         assert_eq!(before, 0.0, "初始预览滚动在顶部");
@@ -617,7 +617,7 @@
         // 带内条目点击 → 右栏 WyEditor 预览滚动到对应标题（虚拟化带宽内命中可用）。
         let vhand_wy = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy_vscroll.clone()
+            a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy_vscroll.clone()
         });
         let before = cx.update(|_w, _cx| (-vhand_wy.offset().y).as_f32());
         let row = cx
@@ -1233,15 +1233,15 @@
         );
         // 焦点应落在新编辑区（开箱即输入）。
         let focused = cx.update(|window, cx| {
-            app.read(cx).model.borrow().tabs[0].editor.read(cx).focus_handle().is_focused(window)
+            app.read(cx).model.borrow().tabs[0].payload.editor.read(cx).focus_handle().is_focused(window)
         });
         assert!(focused, "新建后编辑区应获得焦点");
         // 直接键入（真实键入路径）→ 内容写入且欢迎页不回来。
-        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].payload.editor.clone());
         cx.update(|_, cx| editor.update(cx, |ed, cx| ed.insert_text("hi", cx)));
         settle_frames(cx, 3);
         assert_eq!(
-            cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.read(cx).value().to_string()),
+            cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].payload.editor.read(cx).value().to_string()),
             "hi",
             "新建选项卡应可直接键入"
         );
@@ -1309,7 +1309,7 @@
         assert!(cx.debug_bounds("editor-area").is_some(), "空未命名 tab 也直接渲染编辑区");
         assert!(cx.debug_bounds("empty-state").is_none(), "有 tab（哪怕空未命名）就不显示欢迎页");
         // 键入后依旧不显示欢迎页（新模型没有「欢迎页盖在有内容上」的路径）。
-        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].payload.editor.clone());
         cx.update(|_, cx| editor.update(cx, |ed, cx| ed.insert_text("x", cx)));
         settle_frames(cx, 3);
         assert!(cx.debug_bounds("empty-state").is_none(), "输入后仍不显示欢迎页");
@@ -1977,7 +1977,7 @@
         let (tabs_after, ti, pos) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let ti = a.model.borrow().active_tab;
-            let pos = a.model.borrow().tabs[ti].editor.read(cx).cursor_position();
+            let pos = a.model.borrow().tabs[ti].payload.editor.read(cx).cursor_position();
             (a.model.borrow().tabs.len(), ti, pos)
         });
         assert_eq!(
@@ -1986,7 +1986,7 @@
             "点击未打开文件应新建 1 个选项卡"
         );
         let opened = cx.update(|_w, cx| {
-            app.read(cx).model.borrow().tabs[ti].file_path.as_deref() == Some(target.as_path())
+            app.read(cx).model.borrow().tabs[ti].payload.file_path.as_deref() == Some(target.as_path())
         });
         assert!(opened, "点击应打开 jump.txt 并激活");
         assert_eq!(pos.0, 2, "光标应落在命中行（0 基第 2 行）");
@@ -2004,7 +2004,7 @@
         let (tabs_after2, row2) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let ti = a.model.borrow().active_tab;
-            let pos = a.model.borrow().tabs[ti].editor.read(cx).cursor_position();
+            let pos = a.model.borrow().tabs[ti].payload.editor.read(cx).cursor_position();
             (a.model.borrow().tabs.len(), pos.0)
         });
         assert_eq!(tabs_after2, tabs_before2, "再次点击已打开文件不应新建选项卡");
@@ -2516,7 +2516,7 @@
                 app.read(cx)
                     .model.borrow().tabs
                     .iter()
-                    .any(|t| t.file_path.as_deref() == Some(target.as_path()))
+                    .any(|t| t.payload.file_path.as_deref() == Some(target.as_path()))
             }),
             "新建文件应自动打开成选项卡"
         );
@@ -2739,7 +2739,7 @@
                 app.read(cx)
                     .model.borrow().tabs
                     .iter()
-                    .any(|t| t.file_path.as_deref() == Some(old_path.as_path()))
+                    .any(|t| t.payload.file_path.as_deref() == Some(old_path.as_path()))
             }),
             "a.txt 应已打开"
         );
@@ -2787,7 +2787,7 @@
                 app.read(cx)
                     .model.borrow().tabs
                     .iter()
-                    .any(|t| t.file_path.as_deref() == Some(new_path.as_path()))
+                    .any(|t| t.payload.file_path.as_deref() == Some(new_path.as_path()))
             }),
             "已打开选项卡路径应同步为 b.md"
         );
@@ -2906,7 +2906,7 @@
                 let a = app.read(cx);
                 a.model.borrow().tabs
                     .iter()
-                    .any(|t| t.file_path.as_deref() == Some(d_path.as_path()))
+                    .any(|t| t.payload.file_path.as_deref() == Some(d_path.as_path()))
             }),
             "d.txt 已打开"
         );
@@ -2927,7 +2927,7 @@
                 !app.read(cx)
                     .model.borrow().tabs
                     .iter()
-                    .any(|t| t.file_path.as_deref() == Some(d_path.as_path()))
+                    .any(|t| t.payload.file_path.as_deref() == Some(d_path.as_path()))
             }),
             "已打开选项卡应同步关闭"
         );
@@ -2956,9 +2956,9 @@
                 if let Some(t) = app
                     .model.borrow_mut().tabs
                     .iter_mut()
-                    .find(|t| t.file_path.as_deref() == Some(dirty_path.as_path()))
+                    .find(|t| t.payload.file_path.as_deref() == Some(dirty_path.as_path()))
                 {
-                    t.dirty = true;
+                    t.payload.dirty = true;
                 }
             });
         });
@@ -2978,7 +2978,7 @@
                 app.read(cx)
                     .model.borrow().tabs
                     .iter()
-                    .any(|t| t.file_path.as_deref() == Some(dirty_path.as_path()))
+                    .any(|t| t.payload.file_path.as_deref() == Some(dirty_path.as_path()))
             }),
             "有未保存修改的选项卡不应被关闭"
         );

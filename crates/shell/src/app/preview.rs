@@ -188,7 +188,7 @@ impl EditorApp {
         let model = self.model.borrow();
         let Some(p) = model.tabs
             .get(model.active_tab)
-            .and_then(|t| t.file_path.as_ref())
+            .and_then(|t| t.payload.file_path.as_ref())
         else {
             return "纯文本";
         };
@@ -258,6 +258,7 @@ impl EditorApp {
                 let replaces = text_open::line_diff(base.as_str(), content.as_ref());
                 if !replaces.is_empty() {
                     self.model.borrow().tabs[idx]
+                        .payload
                         .editor
                         .update(cx, |ed, _| ed.apply_replaces(&replaces));
                 }

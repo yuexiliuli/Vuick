@@ -121,14 +121,14 @@ impl EditorApp {
         }
         // 已打开选项卡路径同步（文件精确 / 目录下子树整体前缀改写）。
         for tab in self.model.borrow_mut().tabs.iter_mut() {
-            let Some(fp) = tab.file_path.clone() else { continue };
+            let Some(fp) = tab.payload.file_path.clone() else { continue };
             if fp == path {
-                tab.file_path = Some(target.clone());
+                tab.payload.file_path = Some(target.clone());
             } else if is_dir
                 && fp.starts_with(path)
                 && let Ok(rel) = fp.strip_prefix(path)
             {
-                tab.file_path = Some(target.join(rel));
+                tab.payload.file_path = Some(target.join(rel));
             }
         }
         self.schedule_session_flush(cx, true); // 会话清单记录新路径
@@ -187,7 +187,7 @@ impl EditorApp {
             .iter()
             .enumerate()
             .filter(|(_, t)| {
-                t.file_path.as_ref().is_some_and(|p| {
+                t.payload.file_path.as_ref().is_some_and(|p| {
                     if is_dir {
                         p.starts_with(path)
                     } else {
@@ -198,7 +198,7 @@ impl EditorApp {
             .map(|(i, _)| i)
             .collect();
         // 决策：任一受影响选项卡有未保存修改 → 不删磁盘（不可静默丢内容），提示后取消。
-        if affected.iter().any(|&i| self.model.borrow().tabs[i].dirty) {
+        if affected.iter().any(|&i| self.model.borrow().tabs[i].payload.dirty) {
             self.model.borrow_mut().status = SharedString::from(
                 "有未保存修改，未删除：请先保存或关闭相关选项卡，再重试删除",
             );

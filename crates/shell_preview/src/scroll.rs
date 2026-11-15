@@ -57,11 +57,11 @@ pub fn sync_editor_preview_scroll(
     }
     let m = model.borrow();
     let tab = &m.tabs[idx];
-    if tab.readonly_preview || tab.preview_fullscreen || !crate::mdwy::show_preview(&m) || tab.live_edit {
+    if tab.payload.readonly_preview || tab.payload.preview_fullscreen || !crate::mdwy::show_preview(&m) || tab.live_edit {
         return;
     }
-    let Some(md) = tab.md_wy.clone() else { return };
-    let editor = tab.editor.clone();
+    let Some(md) = tab.payload.md_wy.clone() else { return };
+    let editor = tab.payload.editor.clone();
 
     // 读两侧当前块起点键（预览帧未就绪 → None，本帧不动）。
     let preview_block = md.read(cx).top_source_line();
@@ -157,7 +157,7 @@ pub fn sync_editor_preview_scroll(
             || state.scrub_last_cross.elapsed() >= SCRUB_IDLE
         {
             if let Some(t) = state.scrub_target {
-                if tab.md_restore_pending.is_none() {
+                if tab.payload.md_restore_pending.is_none() {
                     editor.update(cx, |ed, _| ed.scroll_to_line(t));
                     state.driven_editor_target = Some(t);
                     state.driven_editor_await = 0;
@@ -198,7 +198,7 @@ pub fn sync_editor_preview_scroll(
         // 权威面，预览首次就绪/装配抖动读到顶部块正是「把恢复行拉回顶部」的触发源
         // （rp_diag 49→2）——守卫期不跟随，由 `advance_md_restore_window` 收敛后归还。
         if let Some(pb) = preview_block {
-            if tab.md_restore_pending.is_none() {
+            if tab.payload.md_restore_pending.is_none() {
                 editor.update(cx, |ed, _| ed.scroll_to_line(pb));
                 // 预置编辑器基线为驱动目标：编辑器下一帧实际到位即与基线一致，不再被误判
                 // 成「编辑器用户主动滚动」而把预览拽回（来回跳动）；预览现为主导，旧等待
@@ -230,7 +230,7 @@ pub fn sync_editor_preview_scroll(
             // 未对齐」，不再依赖原「编辑器→预览」回声把预览拽回（那正是来回跳动/滚不
             // 下去的根因）。md 恢复在途例外（与上方「预览自主跨块跟随」同守卫）：恢复期
             // 「预览稳定在顶 + 编辑器在恢复行」是装配还没跟上，不是用户把编辑器移走。
-            if tab.md_restore_pending.is_none() {
+            if tab.payload.md_restore_pending.is_none() {
                 editor.update(cx, |ed, _| ed.scroll_to_line(pb));
                 state.driven_editor_target = Some(pb);
                 state.driven_editor_await = 0;

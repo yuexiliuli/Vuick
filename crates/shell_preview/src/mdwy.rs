@@ -50,7 +50,7 @@ pub static LIVE_COMMIT_MD_WY_ASYNC: std::sync::atomic::AtomicUsize =
 pub fn tab_file_name(m: &AppModel, idx: usize) -> String {
     m.tabs
         .get(idx)
-        .and_then(|t| t.file_path.as_ref())
+        .and_then(|t| t.payload.file_path.as_ref())
         .and_then(|p| p.file_name())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "未命名.txt".into())
@@ -60,7 +60,7 @@ pub fn tab_file_name(m: &AppModel, idx: usize) -> String {
 pub fn show_preview(m: &AppModel) -> bool {
     m.tabs
         .get(m.active_tab)
-        .map(|t| t.preview_on)
+        .map(|t| t.payload.preview_on)
         .unwrap_or(false)
 }
 
@@ -73,10 +73,10 @@ pub fn md_wy_preview(m: &AppModel) -> Option<Entity<WyEditor>> {
     let active = m.active_tab;
     let tab = m.tabs.get(active)?;
     // PDF/图片/视频用自带阅读器，绝不以 WyEditor 渲染。
-    if tab.reader.is_reader() {
+    if tab.payload.reader.is_reader() {
         return None;
     }
-    tab.md_wy.clone()
+    tab.payload.md_wy.clone()
 }
 
 /// A4：当前激活选项卡的 Markdown TOC 数据源 + 跳转目标（侧边栏目录共用）：
@@ -88,7 +88,7 @@ pub fn md_toc_source(
 ) -> Option<(markdown_wysiwyg::TocEntries, MdTocScroll)> {
     let active = m.active_tab;
     let tab = m.tabs.get(active)?;
-    let wy = tab.md_wy.as_ref()?;
+    let wy = tab.payload.md_wy.as_ref()?;
     Some((wy.read(cx).toc_entries(), MdTocScroll::Unified(wy.clone())))
 }
 
@@ -109,7 +109,7 @@ pub fn epub_page_bounds(
     // 视口高：以窗口内容高估算（容器 ≈ 窗口正文区；误差 ≤ 顶部/底部工具条高，
     // 对「第 x/N 页」展示无碍）。
     let view_h = f32::from(window.viewport_size().height).max(1.);
-    tab.md_wy.as_ref().and_then(|w| w.read(cx).viewport_page_bounds(view_h))
+    tab.payload.md_wy.as_ref().and_then(|w| w.read(cx).viewport_page_bounds(view_h))
 }
 
 /// P4-1：EPUB 章节翻转「上一章/下一章」。章界 = 目录标题条目（每章以标题起始）。
@@ -160,11 +160,11 @@ fn ensure_wy<H: 'static>(
 ) {
     let fs = model.borrow().font_size;
     let base_dir = model.borrow().tabs[idx]
-        .file_path
+        .payload.file_path
         .as_ref()
         .and_then(|p| p.parent())
         .map(|d| d.to_path_buf());
-    if model.borrow().tabs[idx].md_wy.is_none() {
+    if model.borrow().tabs[idx].payload.md_wy.is_none() {
         let ed = cx.new(|cx| WyEditor::new(window, cx));
         ed.update(cx, |ed, cx| {
             ed.set_editable(false); // A1 只读门控：右栏预览不可编辑
@@ -172,7 +172,7 @@ fn ensure_wy<H: 'static>(
             ed.set_base_dir(base_dir);
             configure(ed, cx);
         });
-        model.borrow_mut().tabs[idx].md_wy = Some(ed.clone());
+        model.borrow_mut().tabs[idx].payload.md_wy = Some(ed.clone());
     }
 }
 
@@ -198,16 +198,16 @@ pub fn ensure_md_wy<H: 'static>(
         // 同步喂源：源 = 编辑区规范文本（与预览宿主同口径）。
         let fs = model.borrow().font_size;
         let base_dir = model.borrow().tabs[idx]
-            .file_path
+            .payload.file_path
             .as_ref()
             .and_then(|p| p.parent())
             .map(|d| d.to_path_buf());
         let text = {
             let mut m = model.borrow_mut();
             let tab = &mut m.tabs[idx];
-            tab.editor.read(cx).value().to_string()
+            tab.payload.editor.read(cx).value().to_string()
         };
-        if let Some(ed) = model.borrow().tabs[idx].md_wy.clone() {
+        if let Some(ed) = model.borrow().tabs[idx].payload.md_wy.clone() {
             ed.update(cx, |ed, _| {
                 ed.set_font_size(gpui::px(fs));
                 ed.set_base_dir(base_dir);
@@ -239,11 +239,11 @@ pub fn ensure_epub_wy<H: 'static>(
     ensure_wy(model, idx, window, cx, |_ed, _cx| {});
     let fs = model.borrow().font_size;
     let base_dir = model.borrow().tabs[idx]
-        .file_path
+        .payload.file_path
         .as_ref()
         .and_then(|p| p.parent())
         .map(|d| d.to_path_buf());
-    if let Some(ed) = model.borrow().tabs[idx].md_wy.clone() {
+    if let Some(ed) = model.borrow().tabs[idx].payload.md_wy.clone() {
         ed.update(cx, |ed, _| {
             ed.set_font_size(gpui::px(fs));
             ed.set_base_dir(base_dir);
@@ -261,9 +261,9 @@ pub fn ensure_epub_wy<H: 'static>(
 /// （装错）。shell `file_ops`（打开换源）也调用。
 pub fn md_wy_invalidate_async(model: &Rc<RefCell<AppModel>>, idx: usize) {
     if let Some(t) = model.borrow_mut().tabs.get_mut(idx) {
-        t.md_wy_install.seq += 1;
-        t.md_wy_install.pending = None;
-        t.md_wy_install.pending_full = None; // Step3：任何同步改写 md_wy 内容 → 整篇在途标记一并作废
+        t.payload.md_wy_install.seq += 1;
+        t.payload.md_wy_install.pending = None;
+        t.payload.md_wy_install.pending_full = None; // Step3：任何同步改写 md_wy 内容 → 整篇在途标记一并作废
     }
 }
 
@@ -280,14 +280,14 @@ pub fn md_wy_feed_full<H: 'static>(
     content: SharedString,
     cx: &mut Context<H>,
 ) {
-    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return;
     };
     let seq = {
         let mut m = model.borrow_mut();
         let t = &mut m.tabs[idx];
-        t.md_wy_install.seq += 1;
-        t.md_wy_install.seq
+        t.payload.md_wy_install.seq += 1;
+        t.payload.md_wy_install.seq
     };
     if content.len() < MD_WY_ASYNC_INSTALL_MIN_BYTES {
         // 同步小整篇（无「旧→新」等待；`open_from_str` 免 `set_source_text` 的一次
@@ -296,15 +296,15 @@ pub fn md_wy_feed_full<H: 'static>(
             w.install_open(markdown_wysiwyg::WyEditor::open_from_str(content))
         });
         if let Some(t) = model.borrow_mut().tabs.get_mut(idx) {
-            t.md_wy_install.pending = None;
-            t.md_wy_install.pending_full = None; // Step3：同步装好即 == 编辑区 → 解除在途标记
+            t.payload.md_wy_install.pending = None;
+            t.payload.md_wy_install.pending_full = None; // Step3：同步装好即 == 编辑区 → 解除在途标记
         }
         return;
     }
-    model.borrow_mut().tabs[idx].md_wy_install.pending = Some((seq, content.clone()));
+    model.borrow_mut().tabs[idx].payload.md_wy_install.pending = Some((seq, content.clone()));
     // Step3：异步整篇在途、预览仍为旧内容（<新整篇）→ 置在途标记，增量桥打旧内容会
     // 错位，转为「作废 + 重喂」（见 shell `sync::on_editor_edited`）。
-    model.borrow_mut().tabs[idx].md_wy_install.pending_full = Some((seq, 0));
+    model.borrow_mut().tabs[idx].payload.md_wy_install.pending_full = Some((seq, 0));
     LIVE_COMMIT_MD_WY_ASYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     md_wy_spawn_async_install(model, idx, wy, content, seq, cx);
 }
@@ -322,7 +322,7 @@ pub fn md_wy_align_after_ops<H: 'static>(
     content: SharedString,
     cx: &mut Context<H>,
 ) {
-    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return;
     };
     let span: usize = ops
@@ -356,7 +356,7 @@ pub fn md_wy_align_after_diff<H: 'static>(
     content: SharedString,
     cx: &mut Context<H>,
 ) {
-    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return;
     };
     let span: usize = replaces.iter().map(|(r, _)| r.end - r.start).sum();
@@ -398,16 +398,16 @@ pub fn md_wy_spawn_early_install<H: 'static>(
     p: PathBuf,
     cx: &mut Context<H>,
 ) -> usize {
-    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return 0;
     };
     let (seq, ver) = {
         let mut m = model.borrow_mut();
         let t = &mut m.tabs[idx];
-        t.md_wy_install.seq += 1;
-        (t.md_wy_install.seq, t.edit_version)
+        t.payload.md_wy_install.seq += 1;
+        (t.payload.md_wy_install.seq, t.payload.edit_version)
     };
-    model.borrow_mut().tabs[idx].md_wy_install.early =
+    model.borrow_mut().tabs[idx].payload.md_wy_install.early =
         Some(MdWyEarly::Pending { seq, edit_version: ver });
     let model2 = model.clone();
     cx.spawn(async move |this, cx| {
@@ -429,23 +429,23 @@ pub fn md_wy_spawn_early_install<H: 'static>(
         let _ = this.update(cx, |_this, cx| {
             // 守卫 1/2（短借用）：tab 归属 + 装配代号。
             let ok = model2.borrow().tabs.get(idx).is_some_and(|t| {
-                t.md_wy.as_ref() == Some(&wy) && t.md_wy_install.seq == seq
+                t.payload.md_wy.as_ref() == Some(&wy) && t.payload.md_wy_install.seq == seq
             });
             if !ok {
                 // 代号已换代 / 实体已易主（换源、重喂、切走重建）→ 本结果作废；清掉
                 // 本代号的在途标记（不误标 Failed——新装配会接管）。
                 if let Some(t) = model2.borrow_mut().tabs.get_mut(idx)
-                    && t.md_wy_install.early.as_ref()
+                    && t.payload.md_wy_install.early.as_ref()
                         == Some(&MdWyEarly::Pending { seq, edit_version: ver })
                 {
-                    t.md_wy_install.early = None;
-                    t.md_wy_install.pending_full = None;
+                    t.payload.md_wy_install.early = None;
+                    t.payload.md_wy_install.pending_full = None;
                 }
                 return;
             }
             match result {
                 // 守卫 3：未编辑 → 带滚动锚换入全文。
-                Ok(result) if model2.borrow().tabs[idx].edit_version == ver => {
+                Ok(result) if model2.borrow().tabs[idx].payload.edit_version == ver => {
                     md_wy_install_full_swap(&model2, idx, &wy, result, cx);
                 }
                 Ok(_) => {
@@ -453,8 +453,8 @@ pub fn md_wy_spawn_early_install<H: 'static>(
                     //（EOF 收尾不再指望它，走既有收尾兜底）。
                     let mut m = model2.borrow_mut();
                     let t = &mut m.tabs[idx];
-                    t.md_wy_install.early = None;
-                    t.md_wy_install.pending_full = None;
+                    t.payload.md_wy_install.early = None;
+                    t.payload.md_wy_install.pending_full = None;
                 }
                 Err(_) => {
                     // 读盘/解析失败：置 Failed，EOF 收尾回退走既有整篇装配兜底——*前提是
@@ -468,10 +468,10 @@ pub fn md_wy_spawn_early_install<H: 'static>(
                         let mut m = model2.borrow_mut();
                         let t = &mut m.tabs[idx];
                         // 仅当依旧命中本代号（期间无换代）才接管，否则交新装配。
-                        t.md_wy_install.early = Some(MdWyEarly::Failed);
-                        t.md_wy_install.pending_full = None;
+                        t.payload.md_wy_install.early = Some(MdWyEarly::Failed);
+                        t.payload.md_wy_install.pending_full = None;
                     }
-                    let rope = model2.borrow().tabs[idx].editor.read(cx).rope().clone();
+                    let rope = model2.borrow().tabs[idx].payload.editor.read(cx).rope().clone();
                     md_wy_feed_full_rope(&model2, idx, rope, cx);
                 }
             }
@@ -500,8 +500,8 @@ pub fn md_wy_install_full_swap<H: 'static>(
     }
     let mut m = model.borrow_mut();
     if let Some(tab) = m.tabs.get_mut(idx) {
-        tab.md_wy_install.early = Some(MdWyEarly::Done);
-        tab.md_wy_install.pending_full = None;
+        tab.payload.md_wy_install.early = Some(MdWyEarly::Done);
+        tab.payload.md_wy_install.pending_full = None;
     }
     cx.notify();
 }
@@ -529,10 +529,10 @@ pub fn md_wy_spawn_prefix_install<H: 'static>(
     full_seq: usize,
     cx: &mut Context<H>,
 ) {
-    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return;
     };
-    let ver = model.borrow().tabs[idx].edit_version;
+    let ver = model.borrow().tabs[idx].payload.edit_version;
     let prefix_len = prefix.len();
     let model2 = model.clone();
     cx.spawn(async move |this, cx| {
@@ -545,17 +545,17 @@ pub fn md_wy_spawn_prefix_install<H: 'static>(
             let Some(tab) = m.tabs.get_mut(idx) else {
                 return;
             };
-            if tab.md_wy.as_ref() != Some(&wy) || tab.md_wy_install.seq != full_seq {
+            if tab.payload.md_wy.as_ref() != Some(&wy) || tab.payload.md_wy_install.seq != full_seq {
                 return; // 归属/代号换代 → 丢弃（新装配接管）
             }
-            if matches!(tab.md_wy_install.early, Some(MdWyEarly::Done)) {
+            if matches!(tab.payload.md_wy_install.early, Some(MdWyEarly::Done)) {
                 return; // 整篇已先装：不降级回 prefix
             }
-            if tab.edit_version != ver {
+            if tab.payload.edit_version != ver {
                 return; // 已编辑：prefix 快照已过期，sync 重喂接管
             }
             wy.update(cx, |ed, _| ed.install_open(result));
-            tab.md_wy_install.pending_full = Some((full_seq, prefix_len));
+            tab.payload.md_wy_install.pending_full = Some((full_seq, prefix_len));
             cx.notify();
         });
     })
@@ -573,14 +573,14 @@ pub fn md_wy_feed_full_rope<H: 'static>(
     rope: Rope,
     cx: &mut Context<H>,
 ) {
-    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+    let Some(wy) = model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) else {
         return;
     };
     let seq = {
         let mut m = model.borrow_mut();
         let t = &mut m.tabs[idx];
-        t.md_wy_install.seq += 1;
-        t.md_wy_install.seq
+        t.payload.md_wy_install.seq += 1;
+        t.payload.md_wy_install.seq
     };
     if rope.len() < MD_WY_ASYNC_INSTALL_MIN_BYTES {
         // 同步小整篇：装好后预览 == 编辑区 → 解除在途标记。
@@ -588,13 +588,13 @@ pub fn md_wy_feed_full_rope<H: 'static>(
             w.install_open(markdown_wysiwyg::WyEditor::open_from_rope(rope))
         });
         if let Some(t) = model.borrow_mut().tabs.get_mut(idx) {
-            t.md_wy_install.pending = None;
-            t.md_wy_install.pending_full = None;
+            t.payload.md_wy_install.pending = None;
+            t.payload.md_wy_install.pending_full = None;
         }
         return;
     }
-    model.borrow_mut().tabs[idx].md_wy_install.pending = None;
-    model.borrow_mut().tabs[idx].md_wy_install.pending_full = Some((seq, 0));
+    model.borrow_mut().tabs[idx].payload.md_wy_install.pending = None;
+    model.borrow_mut().tabs[idx].payload.md_wy_install.pending_full = Some((seq, 0));
     md_wy_spawn_async_install_rope(model, idx, wy, rope, seq, cx);
 }
 
@@ -625,24 +625,24 @@ fn md_wy_spawn_async_install<H: 'static>(
             .await;
         let _ = this.update(cx, |_this, cx| {
             if model2.borrow().tabs.get(tab_idx).is_some_and(|t| {
-                t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install.seq == seq
+                t.payload.md_wy.as_ref() == Some(&wy_install) && t.payload.md_wy_install.seq == seq
             }) {
                 wy_install.update(cx, |ed, _| ed.install_open(result));
                 let mut m = model2.borrow_mut();
                 if let Some(tab) = m.tabs.get_mut(tab_idx) {
-                    tab.md_wy_install.pending = None;
+                    tab.payload.md_wy_install.pending = None;
                     // Step3：异步整篇落地 → 预览已 == 目标，解除在途标记（增量桥恢复）。
-                    tab.md_wy_install.pending_full = None;
+                    tab.payload.md_wy_install.pending_full = None;
                 }
                 cx.notify();
             } else if let Some(tab) = model2.borrow_mut().tabs.get_mut(tab_idx)
-                && (tab.md_wy_install.pending.as_ref().is_some_and(|(s, _)| *s == seq)
-                    || tab.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq))
+                && (tab.payload.md_wy_install.pending.as_ref().is_some_and(|(s, _)| *s == seq)
+                    || tab.payload.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq))
             {
                 // 守卫不通过（切走/关闭/更新换代后结果被丢弃）：若 pending / pending_full
                 // 仍挂本代号（期间无更新装配）则清掉悬空标记；已换新代号则保留新标记。
-                tab.md_wy_install.pending = None;
-                tab.md_wy_install.pending_full = None;
+                tab.payload.md_wy_install.pending = None;
+                tab.payload.md_wy_install.pending_full = None;
             }
         });
     })
@@ -670,20 +670,20 @@ fn md_wy_spawn_async_install_rope<H: 'static>(
             .await;
         let _ = this.update(cx, |_this, cx| {
             if model2.borrow().tabs.get(tab_idx).is_some_and(|t| {
-                t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install.seq == seq
+                t.payload.md_wy.as_ref() == Some(&wy_install) && t.payload.md_wy_install.seq == seq
             }) {
                 wy_install.update(cx, |ed, _| ed.install_open(result));
                 let mut m = model2.borrow_mut();
                 if let Some(tab) = m.tabs.get_mut(tab_idx) {
-                    tab.md_wy_install.pending = None;
-                    tab.md_wy_install.pending_full = None;
+                    tab.payload.md_wy_install.pending = None;
+                    tab.payload.md_wy_install.pending_full = None;
                 }
                 cx.notify();
             } else if let Some(tab) = model2.borrow_mut().tabs.get_mut(tab_idx)
-                && tab.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq)
+                && tab.payload.md_wy_install.pending_full.as_ref().is_some_and(|(s, _)| *s == seq)
             {
                 // 守卫不通过（切走/关闭/换代）→ 若仍挂本代号则清悬空标记；已换新代号保留。
-                tab.md_wy_install.pending_full = None;
+                tab.payload.md_wy_install.pending_full = None;
             }
         });
     })

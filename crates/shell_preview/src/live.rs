@@ -40,7 +40,7 @@ pub fn enter_live<H: PreviewHost>(
     // （无「空白→内容」闪烁）。加载完成前 `is_loaded()==false`，宿主读写文本
     // （保存/退出）回退源码编辑区（`tab_effective_text` / `commit_live` 已守卫）。
     const ASYNC_LOAD_MIN_BYTES: usize = 512 * 1024;
-    let rope = model.borrow().tabs[idx].editor.read(cx).text().clone();
+    let rope = model.borrow().tabs[idx].payload.editor.read(cx).text().clone();
     let async_load = rope.len() >= ASYNC_LOAD_MIN_BYTES;
     // —— 共享复用右栏已解析 Doc（消双解析、O(1) 即见）——
     // 守卫沿增量桥不变式：`md_wy` 已 loaded（且与编辑区字节等长 → 内容一致）、无
@@ -50,13 +50,13 @@ pub fn enter_live<H: PreviewHost>(
     // 整篇重解析（原大文档切 live 白屏比解析还久的根因之一）。未命中 → 保留既有
     // 异步 `open_from_rope` 兜底。小文档（`!async_load`）不蹭复用：同步 `with_text`
     // 本就无空白帧、零风险不变行为。
-    let reuse = model.borrow().tabs[idx].md_wy.as_ref().filter(|w| {
+    let reuse = model.borrow().tabs[idx].payload.md_wy.as_ref().filter(|w| {
         async_load
             && w.read(cx).is_loaded()
-            && model.borrow().tabs[idx].md_wy_install.pending.is_none()
-            && model.borrow().tabs[idx].md_wy_install.pending_full.is_none()
+            && model.borrow().tabs[idx].payload.md_wy_install.pending.is_none()
+            && model.borrow().tabs[idx].payload.md_wy_install.pending_full.is_none()
             && !matches!(
-                model.borrow().tabs[idx].md_wy_install.early,
+                model.borrow().tabs[idx].payload.md_wy_install.early,
                 Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Failed)
             )
             && w.read(cx).len() == rope.len()
@@ -84,6 +84,7 @@ pub fn enter_live<H: PreviewHost>(
     ed.update(cx, |ed, _| ed.set_font_size(gpui::px(fs)));
     // 图片相对路径基于文件所在目录解析（与预览一致）
     let base_dir = model.borrow().tabs[idx]
+        .payload
         .file_path
         .as_ref()
         .and_then(|p| p.parent())
@@ -107,14 +108,14 @@ pub fn enter_live<H: PreviewHost>(
                     // Markdown 预览不再做每键/停手整篇镜像（大文档 set_text 级联
                     // 重解析会卡 7-8s）——它们随左面板 WYSIWYG 一起，到退出
                     // `commit_live` 时统一写回。
-                    tab.line_count = emitter.read(cx).line_count();
-                    tab.char_count = emitter.read(cx).char_count();
+                    tab.payload.line_count = emitter.read(cx).line_count();
+                    tab.payload.char_count = emitter.read(cx).char_count();
                     // 本 live 会话有内容编辑（仅当事件来自 live2 实体——订阅
                     // 只挂在 live2、且上方已按 `live2 == emitter` 过滤，md_wy 右栏
                     // 的 Changed 到不了这里）：切回时据此决定是否整篇写回。
                     tab.live2_dirty = true;
-                    if !tab.dirty {
-                        tab.dirty = true;
+                    if !tab.payload.dirty {
+                        tab.payload.dirty = true;
                     }
                     cx.notify();
                     drop(model_sub);
@@ -139,7 +140,7 @@ pub fn enter_live<H: PreviewHost>(
     // 其鼠标拖选态（与 `commit_live` 同用 `cancel_mouse_drag` 统一钩子）。菜单
     // 点击漏进的 MouseDown 恰在切离前把 `dragging` 置位过（见 `commit_live` 注释），
     // 若不在此刻清掉，隐藏期的残留会在切回后仅移动鼠标时把选区从 anchor 拉长。
-    tab.editor.update(cx, |ed, _| ed.cancel_mouse_drag());
+    tab.payload.editor.update(cx, |ed, _| ed.cancel_mouse_drag());
     if let Some((doc_clone, math_dollar, alert_marker)) = reuse {
         let tab_idx = idx;
         let ed_install = ed.clone();
@@ -171,8 +172,8 @@ pub fn enter_live<H: PreviewHost>(
                     ed_install.update(cx, |ed, _| ed.install_open(result));
                     let mut m = model_a.borrow_mut();
                     let tab = &mut m.tabs[tab_idx];
-                    tab.line_count = ed_install.read(cx).line_count();
-                    tab.char_count = ed_install.read(cx).char_count();
+                    tab.payload.line_count = ed_install.read(cx).line_count();
+                    tab.payload.char_count = ed_install.read(cx).char_count();
                     cx.notify();
                 }
             });
@@ -199,8 +200,8 @@ pub fn enter_live<H: PreviewHost>(
                     ed_install.update(cx, |ed, _| ed.install_open(result));
                     let mut m = model_a.borrow_mut();
                     let tab = &mut m.tabs[tab_idx];
-                    tab.line_count = ed_install.read(cx).line_count();
-                    tab.char_count = ed_install.read(cx).char_count();
+                    tab.payload.line_count = ed_install.read(cx).line_count();
+                    tab.payload.char_count = ed_install.read(cx).char_count();
                     cx.notify();
                 }
             });

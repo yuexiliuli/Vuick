@@ -331,7 +331,7 @@ use common::*;
         let (tab_present, panel, focused) = cx.update(|window, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs.get(a.model.borrow().active_tab).map(|t| t.file_path.clone()).flatten().is_some(),
+                a.model.borrow().tabs.get(a.model.borrow().active_tab).map(|t| t.payload.file_path.clone()).flatten().is_some(),
                 a.recent_panel.is_some(),
                 window.focused(cx),
             )

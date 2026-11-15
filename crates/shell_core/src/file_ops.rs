@@ -86,20 +86,20 @@ impl AppModel {
             src_len: _,
         } = prepare_text(text);
         let Some(tab) = self.tabs.get_mut(idx) else { return };
-        tab.editor.update(cx, |ed, _cx| {
+        tab.payload.editor.update(cx, |ed, _cx| {
             // O(1) 装配：与 load_file_text 同款（Rope 共享、统计就地算好）。
             ed.set_rope_with_stats(rope, max_line_chars, line_width_histogram);
             // 未命名选项卡无文件 → 不设语言（保持纯文本高亮缺省）。
             ed.set_language(None);
         });
-        tab.editor_pending = false;
+        tab.payload.editor_pending = false;
         // 未命名选项卡正文以编辑器 Rope 为准，不整份镜像到 content（同 load_file_text）。
-        tab.content = gpui::SharedString::default();
-        tab.line_count = lines;
-        tab.char_count = chars;
-        tab.cursor_row = 0;
-        tab.cursor_col = 0;
-        tab.dirty = false;
+        tab.payload.content = gpui::SharedString::default();
+        tab.payload.line_count = lines;
+        tab.payload.char_count = chars;
+        tab.payload.cursor_row = 0;
+        tab.payload.cursor_col = 0;
+        tab.payload.dirty = false;
         host.notify_host(cx);
     }
 }

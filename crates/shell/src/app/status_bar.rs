@@ -44,22 +44,22 @@ impl EditorApp {
             let model = self.model.borrow();
             let tab = model.tabs.get(model.active_tab);
             let (line_count, char_count) =
-                tab.map(|t| (t.line_count, t.char_count)).unwrap_or((0, 0));
+                tab.map(|t| (t.payload.line_count, t.payload.char_count)).unwrap_or((0, 0));
             let language = self.language_label().to_string();
             // 右侧条件沿用既有判定：
             // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。
-            let preview_on = tab.map(|t| t.preview_on).unwrap_or(false);
-            let readonly_preview = tab.map(|t| t.readonly_preview).unwrap_or(false);
-            let fullscreen = tab.map(|t| t.preview_fullscreen).unwrap_or(false);
+            let preview_on = tab.map(|t| t.payload.preview_on).unwrap_or(false);
+            let readonly_preview = tab.map(|t| t.payload.readonly_preview).unwrap_or(false);
+            let fullscreen = tab.map(|t| t.payload.preview_fullscreen).unwrap_or(false);
             // P4-2：预览统一 WyEditor（页面恒换行，`MarkdownPreview::is_wrap` 已删）；
             // 「换行」按钮显示 = 有统一 WyEditor 预览在场。
-            let wrap_on = tab.map(|t| t.md_wy.is_some()).unwrap_or(false);
+            let wrap_on = tab.map(|t| t.payload.md_wy.is_some()).unwrap_or(false);
             let is_markdown = tab
-                .and_then(|t| t.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
+                .and_then(|t| t.payload.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
                 .unwrap_or(false);
             // 中间区数据源（派生自激活选项卡，无新状态）：只读预览页码 / PDF 页码 / 光标行列。
             let epub_page = tab.map(|_| self.epub_page_bounds(window, cx)).unwrap_or(None);
-            let pdf_page = tab.and_then(|t| match &t.reader {
+            let pdf_page = tab.and_then(|t| match &t.payload.reader {
                 MediaReader::Pdf(pv) => {
                     let v = pv.read(cx);
                     v.current_page()
@@ -70,12 +70,12 @@ impl EditorApp {
             let cursor_pos = tab.and_then(|t| {
                 // 只读预览（EPUB/PDF/图片/视频）编辑区为空，无光标位置可示（EPUB 的
                 // `char_count` 是书目正文统计，不能当「有编辑内容」）。
-                if t.readonly_preview {
+                if t.payload.readonly_preview {
                     return None;
                 }
                 // 「有编辑内容」以字符数为准（空文档 line_count 恒为 1 行空行，不能当内容）。
-                if t.char_count > 0 || t.cursor_row != 0 || t.cursor_col != 0 {
-                    Some((t.cursor_row + 1, t.cursor_col + 1))
+                if t.payload.char_count > 0 || t.payload.cursor_row != 0 || t.payload.cursor_col != 0 {
+                    Some((t.payload.cursor_row + 1, t.payload.cursor_col + 1))
                 } else {
                     None
                 }

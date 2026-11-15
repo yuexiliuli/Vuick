@@ -440,6 +440,7 @@ impl AppModel {
         // 源码编辑区（转前台显示）都不留拖选态。
         l2.update(cx, |ed, _| ed.end_selection());
         self.tabs[idx]
+            .payload
             .editor
             .update(cx, |ed, _| ed.cancel_mouse_drag());
         // 大文档后台解析在途就退出：live2 尚无内容，不能写回（否则源码编辑区被清空）。
@@ -478,17 +479,18 @@ impl AppModel {
             let src_len;
             let ok = {
                 let tab = &mut self.tabs[idx];
-                tab.content = content.clone();
+                tab.payload.content = content.clone();
                 // 行/字符计数直接取 WyEditor 增量维护的 O(1) 值（订阅已随每次编辑更新；
                 // 不再对 6.4MB 全文做 lines()/chars() 线性扫——那是旧路径 ~90ms 的主来源）。
-                tab.line_count = l2.read(cx).line_count();
-                tab.char_count = l2.read(cx).char_count();
+                tab.payload.line_count = l2.read(cx).line_count();
+                tab.payload.char_count = l2.read(cx).char_count();
                 // 重放前的源缓冲区长度（O(1)；右栏 md_wy 逐 op 重放的前提 = 起点与源同长，
                 // 长度不等即空壳/失步 → 整篇喂源兜底，见宿主 `md_wy_align_after_ops`）。
-                src_len = tab.editor.read(cx).text().len();
+                src_len = tab.payload.editor.read(cx).text().len();
                 // 重放到源码编辑区（`apply_live_replay` 内置「干跑 + O(1) 长度栏」护栏）：
                 // 自检失败 → 缓冲区未被改动，落宿主行级 diff 兜底（content 仍是最终态）。
-                tab.editor
+                tab.payload
+                    .editor
                     .update(cx, |ed, _| ed.apply_live_replay(&ops, content.as_ref()))
             };
             if ok {
@@ -504,14 +506,14 @@ impl AppModel {
         // 编辑区应用留在宿主 shell 侧，见 [`CommitLiveAlign::Diff`]）——
         // 模型侧在此只更新 `tab.content` / `line_count` / `char_count`（与旧实现同一位置
         // 一并以 live2 最终文本为权威），`base`（源缓冲区）与 `content`（最终态）交宿主。
-        let base = self.tabs[idx].editor.read(cx).text().to_string();
+        let base = self.tabs[idx].payload.editor.read(cx).text().to_string();
         let content = l2.read(cx).text();
         let tab = &mut self.tabs[idx];
-        tab.content = content.clone();
+        tab.payload.content = content.clone();
         let n_lines = content.as_ref().lines().count().max(1);
         let n_chars = content.as_ref().chars().count();
-        tab.line_count = n_lines;
-        tab.char_count = n_chars;
+        tab.payload.line_count = n_lines;
+        tab.payload.char_count = n_chars;
         // 与 Ops 臂同款收尾（`commit_live` 最后一条即此 status）：
         // diff 兜底写回后状态栏归位「内容已写回编辑区 / 正常」，防残留「关闭中」旧文案。
         self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
@@ -599,45 +601,14 @@ pub enum SearchScopeTab {
 }
 
 /// 一个文件选项卡：独立持有自研编辑器组件状态、文件路径与脏标记。
+/// 23 个随选项卡搬迁的字段收敛进 [`TabPayload`]（`payload` 内嵌，单源）——跨窗口
+/// 搬迁时整体 move、零复制；本结构体只保留窗口本地 live 态（`live_edit` / `live2` /
+/// `live2_dirty` / `live_vscroll`）与订阅（`_edit_sub` / `_pdf_sub` / `_live2_sub`），
+/// 迁入时经 [`EditorTab::from_detached`] 重建。
 pub struct EditorTab {
-    /// 本选项卡的编辑区（[`editor::CodeEditor`]）。
-    pub editor: gpui::Entity<editor::CodeEditor>,
-    /// 当前文件路径（None = 未命名）
-    pub file_path: Option<PathBuf>,
-    /// 本选项卡的**源文本编码**（[`text_open::encoding`]）：`None` = 纯 UTF-8（新建/
-    /// 打开/媒体）；`Some(&'static Encoding)` = 打开时探测出的非 UTF-8 编码（含带 BOM
-    /// 的 UTF-8/UTF-16）。保存（`write_to_path`）按此编码把缓冲 UTF-8 转回字节写盘。
-    /// 随选项卡搬迁（EditorTab ⇄ DetachedTab 整包搬移）、文档编码随文档走。
-    pub source_encoding: Option<&'static encoding_rs::Encoding>,
-    /// 内容自上次打开/保存后是否被修改
-    pub dirty: bool,
-    /// 当前内容的镜像缓存（在 `InputEvent::Change` 时同步，避免每帧克隆 Rope）
-    pub content: SharedString,
-    /// 行数缓存
-    pub line_count: usize,
-    /// 字数缓存
-    pub char_count: usize,
-    /// 光标行（0 基）
-    pub cursor_row: usize,
-    /// 光标列（0 基）
-    pub cursor_col: usize,
-    /// 媒体阅读器（打开 .pdf / 图片 / 视频时创建，一次至多其一）：整页/整图/首帧只读
-    /// 展示；`None` = 非媒体选项卡（文本 / Markdown / EPUB）。
-    pub reader: MediaReader,
-    /// 是否开启 Markdown 预览
-    pub preview_on: bool,
-    /// 预览是否占满整个内容区（EPUB 阅读等场景，不显示编辑区/分割线）
-    pub preview_fullscreen: bool,
-    /// 预览是否只读锁定（EPUB：正文只在预览区，编辑区为空，不能关闭/翻转预览）
-    pub readonly_preview: bool,
-    /// 大文档异步打开：预览先出、编辑器暂缓挂载（首帧显示轻量占位，
-    /// 等用户第一时间看到预览内容后，下一拍再把编辑器挂上——编辑器
-    /// 首次对 16 万行做 DisplayMap 布局会冻结一两秒，不让它挡在首帧前）。
-    pub editor_pending: bool,
-    /// 大文档 P1 后台装配在途（整篇 rope 尚在生产端）：编辑区已显示首块但**锁输入**
-    /// （渲染层全区域透明拦截，见 panes.rs）——避免「打开期间编辑」与 EOF 整篇换装
-    /// 竞态；`finish_file_text` 换装成功后置 false。
-    pub loading_lock: bool,
+    /// 跨窗搬迁载荷：[`TabPayload`] 本体（23 个搬迁字段；[`DetachedTab`] 即其别名）。
+    /// 源窗口专属的 live 态 / 订阅不在此内，跨窗搬迁时重建。
+    pub payload: TabPayload,
     /// 是否处于「所见即所得预览编辑」模式：左面板用 `WyEditor` 代替源码编辑区；
     /// 退出时内容写回。
     pub live_edit: bool,
@@ -650,49 +621,14 @@ pub struct EditorTab {
     /// COW 快照（O(1) 同源），写回纯属 O(n) 浪费（大文档级联 `set_text` 重排卡 7-8s）
     /// → 直接销毁实体切回，不物化全文。
     pub live2_dirty: bool,
-    /// A2：右栏 Markdown 预览统一组件（`WyEditor`，A1 只读门控）。MD 右栏/全屏预览
-    /// 与 EPUB 只读宿主都走它（同一 `Doc` 管线的只读视图）；`None` = 未创建（文本 /
-    /// PDF / 图片选项卡，或预览已关闭）。
-    pub md_wy: Option<gpui::Entity<WyEditor>>,
-    /// P4-1：EPUB 的**内存图片表**（虚拟 `epubimg://…` → 字节，不落盘）。打开时存
-    /// 一份供 WyEditor 宿主（`ensure_epub_wy`）注入；随选项卡搬迁（与 `md_wy` 同）。
-    pub epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
-    /// P4-2：EPUB 的**注记正文表**（`注记号 → 注释文本`）。打开时存一份供 WyEditor
-    /// 宿主（`ensure_epub_wy` → `set_notes`）注入——悬浮卡正文；随选项卡搬迁。
-    pub epub_notes: std::collections::BTreeMap<usize, String>,
-    /// `md_wy` 右栏/全屏宿主的纵向滚动句柄：`#md-wy-scroll`（`overflow_y_scroll`）
-    /// 经 `track_scroll` 跟踪它，右侧自绘 `Scrollbar::vertical` 跟随（与 `live_vscroll`
-    /// 同型：每次渲染重建容器、句柄跨帧稳定）。随选项卡搬迁（与 `md_preview` 同）。
-    pub md_wy_vscroll: gpui::ScrollHandle,
-    /// 右栏 `md_wy`「在途装配」三代叠加态状态包（B3 后台整篇装配在途 / 装配代号 /
-    /// Step2 提前整篇解析在途 / Step3「整篇在途·prefix 已装」收敛为单字段，见
-    /// [`MdWyInstall`]）。随选项卡搬迁（EditorTab ⇄ DetachedTab）作为一个字段整包搬移，
-    /// 不再逐带双份复制。
-    pub md_wy_install: MdWyInstall,
-    /// 编辑版本号：每次内容变更 +1。编辑区⇄预览滚动同步用它判断「画面/内容是否有新
-    /// 编辑需重建同步基线」。
-    pub edit_version: u64,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     pub _edit_sub: Subscription,
-    /// 「阅读进度恢复」目标：打开瞬间从 store 装进、恢复消费后置 None；跨窗搬迁随身
-    /// （文本待首帧后滚动的在途目标经此随 DetachedTab 一起走，不被丢失）。
-    pub reading_restore: Option<ReadingProgress>,
-    /// 「md 阅读进度恢复在途」守卫：`Some((目标源码行, 自谋划起渲染帧计数))` = 重开时
-    /// 编辑区已滚到存档目标行，右栏预览仍在装配 / 未收敛到该块——此期间
-    /// [`shell_preview::scroll::sync_editor_preview_scroll`] 的**预览→编辑区**驱动
-    /// （预览自主跨块立即跟随 / 静态预览回拉编辑器）一律不发，否则真机「重开 md 被拉回
-    /// 顶部」——rp_diag 实证：`apply_text_restore after=49` → 预览首次就绪读到顶部块 2 →
-    /// 编辑区被 `ed.scroll_to_line(2)` 拉回 2（200ms 防抖再把 2 覆写进存档，二次伤害）。
-    /// 预览顶块收敛到 `block_start_of_line(目标)` 即清位归还正常双向同步；预览就绪后帧
-    /// 计数超 [`MD_RESTORE_WAIT_FRAMES`] 也清位（防目标不可达 / 预览装配异常永久锁死
-    /// 「预览→编辑区」驱动）。随选项卡搬迁（`take_tab_payload`/`adopt_tab` 整包移动）。
-    pub md_restore_pending: Option<(usize, u32)>,
     /// 监听 PDF 阅读器 `notify()`（检索结果/加载进度到达）→ 刷新 app（侧边栏计数）。
     /// **随选项卡持有**：多 PDF 选项卡并存时各自独立订阅，避免旧单槽全局
     /// `EditorApp::_pdf_observe` 被后打开者覆盖、先打开 PDF 的 notify 丢失（真 bug）。
-    /// 订阅绑定本窗口 EditorApp；随选项卡搬迁时随源 `EditorTab` 一起丢弃
-    /// （`take_tab_payload` 解构 `..`），目标窗口 `adopt_tab` 重建。关选项卡 / 拔除时
-    /// 随 `EditorTab` drop 自动退订（无幽灵回调 / 泄漏）。
+    /// 订阅绑定本窗口 EditorApp；随选项卡搬迁时随源 `EditorTab` 一起丢弃（取
+    /// [`DetachedTab`] 载荷），目标窗口 `adopt_tab` 重建。关选项卡 / 拔除时随
+    /// `EditorTab` drop 自动退订（无幽灵回调 / 泄漏）。
     pub _pdf_sub: Option<gpui::Subscription>,
     /// `live2`（WyEditor）的变更订阅。
     pub _live2_sub: Option<Subscription>,
@@ -702,10 +638,15 @@ pub struct EditorTab {
     pub live_vscroll: gpui::ScrollHandle,
 }
 
-/// 一个从窗口中「拔出」的选项卡快照：编辑器 / 预览等实体句柄共享（GPUI 实体
-/// 与窗口无关），连同文件元数据一起跨窗口搬迁。`_edit_sub` 是源窗口持有的订阅，
-/// 拔掉时随源 `EditorTab` 一并丢弃，目标窗口重新建立订阅。
-pub struct DetachedTab {
+/// 跨窗搬迁载荷：EditorTab 与 DetachedTab 共用（[`DetachedTab`] 即本类型别名）。
+/// 编辑器 / 预览等实体句柄共享（GPUI 实体与窗口无关），连同文件元数据一起跨窗口搬迁。
+/// `EditorTab` 内嵌本载荷（单源）；搬迁时 `EditorTab` → 载荷走 [`From<EditorTab>`]
+/// 整体搬出 `payload`，源窗口关联的 live 态与订阅（`live_edit` / `live2` /
+/// `live2_dirty` / `_live2_sub` / `live_vscroll` / `_edit_sub` / `_pdf_sub`）随
+/// `EditorTab` drop 一并丢弃，目标窗口经 [`EditorTab::from_detached`] 重建。
+/// `_edit_sub` 是源窗口持有的订阅，拔掉时随源 `EditorTab` 一并丢弃，目标窗口
+/// 重新建立订阅。
+pub struct TabPayload {
     pub editor: gpui::Entity<editor::CodeEditor>,
     /// 媒体阅读器（PDF / 图片 / 视频；与 [`EditorTab::reader`] 同型，跨窗口搬迁）。
     pub reader: MediaReader,
@@ -743,6 +684,48 @@ pub struct DetachedTab {
     /// 「md 阅读进度恢复在途」守卫（与 [`EditorTab::md_restore_pending`] 同语义；
     /// 未消费完就被拖到新窗口时随选项卡搬迁）。
     pub md_restore_pending: Option<(usize, u32)>,
+}
+
+/// 一个从窗口中「拔出」的选项卡快照：即 [`TabPayload`] 本体（保留原名，宿主 / 测试 /
+/// `tabs.rs` 占位字面量继续按其构造）。
+pub type DetachedTab = TabPayload;
+
+/// `EditorTab` → 跨窗载荷：`..` 解构丢弃源窗口专属的 live 态与订阅
+/// （`live_edit` / `live2` / `live2_dirty` / `_live2_sub` / `live_vscroll` /
+/// `_edit_sub` / `_pdf_sub`），与旧 `take_tab_payload` 逐字段手抄语义等价。
+impl From<EditorTab> for DetachedTab {
+    fn from(tab: EditorTab) -> Self {
+        // 搬迁前 live 必须先提交写回（本仓所有 take_tab_payload 调用点均在
+        // `commit_live` 之后）；仅调试断言，release 无行为差异。
+        debug_assert!(!tab.live_edit, "live_edit 选项卡须先 commit_live 再取出载荷");
+        // 内嵌单源：整体 move `payload`，源窗口 live 态 / 订阅随 `tab` drop 丢弃。
+        tab.payload
+    }
+}
+
+impl EditorTab {
+    /// 从跨窗载荷重建完整选项卡：`payload` 承接 23 个搬迁字段；live 态 / 订阅按调用方
+    /// 决策回填——`_edit_sub` 由调用方先建传入、`_pdf_sub`/`_live2_sub` 置 `None`
+    /// （PDF 订阅在 adopt 的 Pdf 分支重建）。
+    pub fn from_detached(
+        payload: DetachedTab,
+        _edit_sub: Subscription,
+        live_edit: bool,
+        live2: Option<gpui::Entity<WyEditor>>,
+        live2_dirty: bool,
+        live_vscroll: gpui::ScrollHandle,
+    ) -> Self {
+        Self {
+            payload,
+            live_edit,
+            live2,
+            live2_dirty,
+            _edit_sub,
+            live_vscroll,
+            _pdf_sub: None,
+            _live2_sub: None,
+        }
+    }
 }
 
 /// Step2/3：大文档 md「打开即提前后台整篇解析」（与分块读盘并行、不等 EOF）在途状态。

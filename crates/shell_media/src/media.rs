@@ -15,14 +15,14 @@ use ui::menu::{PopupMenu, PopupMenuItem};
 
 /// 当前激活选项卡的「可锁定」媒体查看器（图片或视频；PDF 无锁定语义，置 None）。
 pub fn active_media_viewer(m: &AppModel) -> Option<MediaReader> {
-    let reader = m.tabs.get(m.active_tab).map(|t| t.reader.clone())?;
+    let reader = m.tabs.get(m.active_tab).map(|t| t.payload.reader.clone())?;
     reader.is_lockable().then_some(reader)
 }
 
 /// 当前激活选项卡是否在「锁定」干净阅读模式（图片/视频查看器实体状态）。
 /// 与 [`active_media_viewer`] 同口径：图片 / 视频任一锁定即 true，其余 false。
 pub fn active_media_locked(m: &AppModel, cx: &gpui::App) -> bool {
-    match m.tabs.get(m.active_tab).map(|t| &t.reader) {
+    match m.tabs.get(m.active_tab).map(|t| &t.payload.reader) {
         Some(MediaReader::Image(v)) => v.read(cx).is_locked(),
         #[cfg(feature = "video")]
         Some(MediaReader::Video(v)) => v.read(cx).is_locked(),
@@ -35,7 +35,7 @@ pub fn active_media_locked(m: &AppModel, cx: &gpui::App) -> bool {
 /// 一律 false。用于视频 tab 激活时**隐藏底部状态栏与左侧侧边栏**——渲染级守卫、不写状态，
 /// 切到非视频 tab 即恢复（见 shell `render_shell_children`）。
 pub fn active_media_is_video(m: &AppModel) -> bool {
-    match m.tabs.get(m.active_tab).map(|t| &t.reader) {
+    match m.tabs.get(m.active_tab).map(|t| &t.payload.reader) {
         #[cfg(feature = "video")]
         Some(MediaReader::Video(_)) => true,
         _ => false,
@@ -48,7 +48,7 @@ pub fn active_media_is_video(m: &AppModel) -> bool {
 /// 媒体走，状态栏显示「图片/视频 n/m：路径」）。仅在激活选项卡持有图片/视频查看器时
 /// 更新；**幂等**：路径未变返回 false（调用方不 notify，无重绘循环）。
 pub fn sync_active_media_meta(m: &mut AppModel, cx: &mut gpui::App) -> bool {
-    let Some(reader) = m.tabs.get(m.active_tab).map(|t| t.reader.clone()) else {
+    let Some(reader) = m.tabs.get(m.active_tab).map(|t| t.payload.reader.clone()) else {
         return false;
     };
     let (label, cur) = match reader {
@@ -78,10 +78,10 @@ pub fn sync_active_media_meta(m: &mut AppModel, cx: &mut gpui::App) -> bool {
     let Some(tab) = m.tabs.get_mut(m.active_tab) else {
         return false;
     };
-    if tab.file_path.as_deref() == Some(cur.as_path()) {
+    if tab.payload.file_path.as_deref() == Some(cur.as_path()) {
         return false;
     }
-    tab.file_path = Some(cur);
+    tab.payload.file_path = Some(cur);
     m.status = gpui::SharedString::from(label);
     m.status_ok = true;
     true

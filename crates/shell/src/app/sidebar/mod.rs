@@ -84,7 +84,7 @@ impl EditorApp {
     fn active_pdf_bookmarks(&self, cx: &gpui::App) -> Option<Vec<shell_core::PdfBookmark>> {
         let model = self.model.borrow();
         let tab = model.tabs.get(model.active_tab)?;
-        match &tab.reader {
+        match &tab.payload.reader {
             shell_core::MediaReader::Pdf(pdf) => {
                 let p = pdf.read(cx).path().to_path_buf();
                 self.pdf_bookmarks_for(&p)

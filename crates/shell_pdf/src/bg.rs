@@ -109,7 +109,7 @@ pub fn apply_backgrounds(m: &AppModel, cx: &mut App) {
     let pdfs: Vec<gpui::Entity<PdfViewer>> = m
         .tabs
         .iter()
-        .filter_map(|t| match &t.reader {
+        .filter_map(|t| match &t.payload.reader {
             MediaReader::Pdf(pv) => Some(pv.clone()),
             _ => None,
         })

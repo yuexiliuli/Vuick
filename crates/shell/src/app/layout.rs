@@ -50,7 +50,7 @@ impl Render for EditorApp {
                 .borrow()
                 .tabs
                 .get(self.model.borrow().active_tab)
-                .and_then(|t| t.md_wy.clone());
+                .and_then(|t| t.payload.md_wy.clone());
             let app: &gpui::App = &**cx;
             match wy {
                 Some(w) => {
@@ -94,7 +94,7 @@ impl EditorApp {
             .borrow()
             .tabs
             .get(active)
-            .and_then(|t| t.md_restore_pending)
+            .and_then(|t| t.payload.md_restore_pending)
         else {
             return; // 无恢复窗口在途（绝大多数帧）
         };
@@ -104,7 +104,7 @@ impl EditorApp {
             .borrow()
             .tabs
             .get(active)
-            .and_then(|t| t.file_path.as_ref())
+            .and_then(|t| t.payload.file_path.as_ref())
             .map(|p| session_store::reading_progress::normalize_key(p.as_path()))
             .unwrap_or_default();
         // 预览尚未就绪（空壳装配 / 元素未渲染）→ 只保持守卫，不计数（ready 才起算超时）。
@@ -113,12 +113,12 @@ impl EditorApp {
             let Some(tab) = m.tabs.get(active) else {
                 return;
             };
-            tab.md_wy.clone()
+            tab.payload.md_wy.clone()
         }) else {
             // NITS-①：纯 txt / 无预览（`md_wy` 恒 None）时守卫无物可守 → 直接清位归还
             // （防 `md_restore_pending` 悬空 Some 永久占用）。既有行为不变：txt 恢复只滚
             // 编辑区、不建预览，本就无预览可守。
-            self.model.borrow_mut().tabs[active].md_restore_pending = None;
+            self.model.borrow_mut().tabs[active].payload.md_restore_pending = None;
             return;
         };
         let w = wy.read(app);
@@ -127,7 +127,7 @@ impl EditorApp {
             return;
         };
         if top == target_block {
-            self.model.borrow_mut().tabs[active].md_restore_pending = None;
+            self.model.borrow_mut().tabs[active].payload.md_restore_pending = None;
             shell_core::rp_diag::diag(
                 "md_restore",
                 &format!("key={file_key} converged top={top} target_block={target_block}"),
@@ -139,14 +139,14 @@ impl EditorApp {
         // 不写宿主偏移，仍由 WyEditor prepaint 自钉，与渲染期布局复位解耦。
         wy.read(app).set_scroll_target(target);
         if n + 1 >= shell_core::model::MD_RESTORE_WAIT_FRAMES {
-            self.model.borrow_mut().tabs[active].md_restore_pending = None;
+            self.model.borrow_mut().tabs[active].payload.md_restore_pending = None;
             shell_core::rp_diag::diag(
                 "md_restore",
                 &format!("key={file_key} timeout target={target} top={top} n={n}"),
             );
             return;
         }
-        self.model.borrow_mut().tabs[active].md_restore_pending = Some((target, n + 1));
+        self.model.borrow_mut().tabs[active].payload.md_restore_pending = Some((target, n + 1));
     }
 
     /// 内容区三态：有选项卡 → 实时编辑占满 / 预览分屏（EPUB 等全屏预览）/ 纯编辑占满；
@@ -183,7 +183,7 @@ impl EditorApp {
             let fullscreen = self
                 .model.borrow().tabs
                 .get(self.model.borrow().active_tab)
-                .map(|t| t.preview_fullscreen)
+                .map(|t| t.payload.preview_fullscreen)
                 .unwrap_or(false);
             if fullscreen {
                 div()

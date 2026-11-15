@@ -35,16 +35,16 @@ async fn epub_opens_in_wy_readonly_host(cx: &mut TestAppContext) {
         let a = app.read(cx);
         let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
         (
-            t.md_wy.clone(),
-            t.md_wy
+            t.payload.md_wy.clone(),
+            t.payload.md_wy
                 .as_ref()
                 .map(|w| w.read(cx).is_editable())
                 .unwrap_or(true),
-            t.md_wy
+            t.payload.md_wy
                 .as_ref()
                 .map(|w| w.read(cx).text().contains("共产党宣言"))
                 .unwrap_or(false),
-            t.md_wy
+            t.payload.md_wy
                 .as_ref()
                 .map(|w| w.read(cx).toc_entries().len())
                 .unwrap_or(0),
@@ -61,7 +61,7 @@ async fn epub_opens_in_wy_readonly_host(cx: &mut TestAppContext) {
     // 语义（%%ALIGN%%/标题居中）→ 应产出内存图行与对齐行（P4-1 需求 1/2 的渲染回归）。
     let (img_rows, aligned_rows, mem_images) = cx.update(|window, cx| {
         let a = app.read(cx);
-        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().unwrap();
+        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.clone().unwrap();
         let width = window.viewport_size().width.max(px(1.));
         let frame = markdown_wysiwyg::build_frame(
             wy.read(cx),
@@ -106,7 +106,7 @@ async fn epub_flip_chapter_moves_between_headings(cx: &mut TestAppContext) {
     let (moved, target_is_heading) = cx.update(|_w, cx| {
         let moved = app.update(cx, |a, cx| a.epub_flip_chapter(1, cx));
         let idx = app.read(cx).model.borrow().active_tab;
-        let wy = app.read(cx).model.borrow().tabs[idx].md_wy.clone();
+        let wy = app.read(cx).model.borrow().tabs[idx].payload.md_wy.clone();
         let is_heading = wy
             .as_ref()
             .map(|w| {
@@ -124,6 +124,7 @@ async fn epub_flip_chapter_moves_between_headings(cx: &mut TestAppContext) {
     let idx0 = cx.update(|_w, cx| app.read(cx).model.borrow().active_tab);
     let initial_top = cx.update(|_w, cx| {
         app.read(cx).model.borrow().tabs[idx0]
+            .payload
             .md_wy
             .as_ref()
             .and_then(|w| w.read(cx).top_source_line())
@@ -136,6 +137,7 @@ async fn epub_flip_chapter_moves_between_headings(cx: &mut TestAppContext) {
         cx.run_until_parked();
         let top = cx.update(|_w, cx| {
             app.read(cx).model.borrow().tabs[idx0]
+                .payload
                 .md_wy
                 .as_ref()
                 .and_then(|w| w.read(cx).top_source_line())
@@ -179,7 +181,7 @@ async fn md_wy_notes_citation_index_and_navigation_app_level(cx: &mut TestAppCon
     let (cit_ref_line, cit_def_line, note_txt, routed) = cx.update(|_w, cx| {
         let a = app.read(cx);
         let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-        let wy = t.md_wy.clone().expect("MD 打开应建统一 WyEditor 预览");
+        let wy = t.payload.md_wy.clone().expect("MD 打开应建统一 WyEditor 预览");
         let cit = wy.read(cx).citation_index();
         (
             cit.refs.get(&1).map(|(l, _)| *l),
@@ -195,7 +197,7 @@ async fn md_wy_notes_citation_index_and_navigation_app_level(cx: &mut TestAppCon
     // 引用 → 定义 双向跳转（同一 update 内读，scroll_target 下一帧被 prepaint 消费）。
     let (stl, mhl) = cx.update(|_w, cx| {
         let a = app.read(cx);
-        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().unwrap();
+        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.clone().unwrap();
         let hit = markdown_wysiwyg::NoteMarkerHit {
             src_line: 0,
             n: 1,
@@ -243,8 +245,8 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
         cx.run_until_parked();
         ready = cx.update(|_, cx| {
             app.read(cx).model.borrow().tabs.last().map(|t| {
-                t.md_wy.is_some()
-                    && t.md_wy
+                t.payload.md_wy.is_some()
+                    && t.payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).text().len() > 100)
                         .unwrap_or(false)
@@ -260,7 +262,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
     let (n, ref_line, def_line) = cx.update(|_, cx| {
         let a = app.read(cx);
         let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-        let wy = t.md_wy.clone().unwrap();
+        let wy = t.payload.md_wy.clone().unwrap();
         let cit = wy.read(cx).citation_index();
         let best = cit.refs.iter().find_map(|(&n, &(rl, _))| {
             cit.defs.get(&n).map(|&(dl, _)| (n, rl, dl))
@@ -279,7 +281,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
     };
     cx.update(|_, cx| {
         let a = app.read(cx);
-        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().unwrap();
+        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.clone().unwrap();
         wy.update(cx, |w, cx| w.navigate_marker(&hit, cx));
     });
     // 驱动真实重排帧：落在 = scroll_target 已消费且顶行到达定义块起点。
@@ -291,7 +293,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
         let (target_active, top) = cx.update(|_, cx| {
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-            let wy = t.md_wy.clone().unwrap();
+            let wy = t.payload.md_wy.clone().unwrap();
             (
                 wy.read(cx).scroll_target_line().is_some(),
                 wy.read(cx).top_source_line(),
@@ -317,7 +319,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
     let (off_y, target_none) = cx.update(|_, cx| {
         let a = app.read(cx);
         let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-        let wy = t.md_wy.clone().unwrap();
+        let wy = t.payload.md_wy.clone().unwrap();
         (wy.read(cx).host_scroll().map(|(h, _)| h.offset().y.as_f32()), wy.read(cx).scroll_target_line().is_none())
     });
     assert!(target_none, "落位后不应残留滚动目标");
@@ -363,8 +365,8 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
         cx.run_until_parked();
         ready = cx.update(|_, cx| {
             app.read(cx).model.borrow().tabs.last().map(|t| {
-                t.md_wy.is_some()
-                    && t.md_wy
+                t.payload.md_wy.is_some()
+                    && t.payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).text().len() > 100)
                         .unwrap_or(false)
@@ -390,7 +392,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
     let (n, ref_line, def_line) = cx.update(|_, cx| {
         let a = app.read(cx);
         let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-        let wy = t.md_wy.clone().unwrap();
+        let wy = t.payload.md_wy.clone().unwrap();
         let cit = wy.read(cx).citation_index();
         let best = cit.refs.iter().find_map(|(&n, &(rl, _))| {
             cit.defs.get(&n).map(|&(dl, _)| (n, rl, dl))
@@ -409,7 +411,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
     };
     cx.update(|_, cx| {
         let a = app.read(cx);
-        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().unwrap();
+        let wy = a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.clone().unwrap();
         wy.update(cx, |w, cx| w.navigate_marker(&hit, cx));
     });
     // —— 关键：跳转后不 refresh、不发输入；只投递 app 主动请求的下一帧 ——
@@ -423,7 +425,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
         let (target_active, top) = cx.update(|_, cx| {
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-            let wy = t.md_wy.clone().unwrap();
+            let wy = t.payload.md_wy.clone().unwrap();
             (
                 wy.read(cx).scroll_target_line().is_some(),
                 wy.read(cx).top_source_line(),

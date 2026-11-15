@@ -30,7 +30,7 @@ use common::*;
             let tab = model.tabs.get(model.active_tab);
             (
                 a.model.borrow().music_mode,
-                tab.and_then(|t| t.file_path.clone()),
+                tab.and_then(|t| t.payload.file_path.clone()),
                 a.model.borrow().tabs.len(),
             )
         })
@@ -43,7 +43,7 @@ use common::*;
             let a = e.read(cx);
             a.model.borrow().tabs
                 .get(a.model.borrow().active_tab)
-                .map(|t| matches!(t.reader, MediaReader::Video(_)))
+                .map(|t| matches!(t.payload.reader, MediaReader::Video(_)))
                 .unwrap_or(false)
         })
     }

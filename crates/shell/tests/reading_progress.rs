@@ -51,7 +51,7 @@ fn md_wy_of(
     cx: &mut VisualTestContext,
     idx: usize,
 ) -> Option<gpui::Entity<WyEditor>> {
-    cx.update(|_, cx| app.read(cx).model.borrow().tabs[idx].md_wy.clone())
+    cx.update(|_, cx| app.read(cx).model.borrow().tabs[idx].payload.md_wy.clone())
 }
 
 /// 构造一个「逐行独立块」的临时 .md 夹具：每行是一个独立标题（H3）段 →
@@ -83,7 +83,7 @@ async fn restore_md_preview_converges_after_reopen(cx: &mut TestAppContext) {
     let idx = open_file_settled(&app, cx, &p);
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx].editor.clone()
+        a.model.borrow().tabs[idx].payload.editor.clone()
     });
     // 编辑区滚到第 50 节（每行独立块 → 块起点 = 50）。
     cx.update(|_, cx| {
@@ -110,7 +110,7 @@ async fn restore_md_preview_converges_after_reopen(cx: &mut TestAppContext) {
     settle_frames(cx, 6);
     let ed2 = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx2].editor.clone()
+        a.model.borrow().tabs[idx2].payload.editor.clone()
     });
     assert_eq!(
         cx.update(|_, cx| ed2.read(cx).viewport_top_line()),
@@ -151,7 +151,7 @@ async fn restore_md_when_preview_was_reading_surface(cx: &mut TestAppContext) {
     let idx = open_file_settled(&app, cx, &p);
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx].editor.clone()
+        a.model.borrow().tabs[idx].payload.editor.clone()
     });
     let wy = md_wy_of(&app, cx, idx).expect("md tab 应持有 md_wy 预览宿主");
     // 先让两侧都在 50（编辑区主导 → 预览收敛）。
@@ -197,7 +197,7 @@ async fn restore_md_when_preview_was_reading_surface(cx: &mut TestAppContext) {
     settle_frames(cx, 6);
     let ed2 = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx2].editor.clone()
+        a.model.borrow().tabs[idx2].payload.editor.clone()
     });
     assert_eq!(
         cx.update(|_, cx| ed2.read(cx).viewport_top_line()),
@@ -237,7 +237,7 @@ async fn restore_md_top_line_after_reopen_and_off_switch(cx: &mut TestAppContext
     // 打开默认回到顶部。
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx].editor.clone()
+        a.model.borrow().tabs[idx].payload.editor.clone()
     });
     assert_eq!(
         cx.update(|_, cx| ed.read(cx).viewport_top_line()),
@@ -277,7 +277,7 @@ async fn restore_md_top_line_after_reopen_and_off_switch(cx: &mut TestAppContext
     settle_frames(cx, 6);
     let ed2 = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx2].editor.clone()
+        a.model.borrow().tabs[idx2].payload.editor.clone()
     });
     let restored = cx.update(|_, cx| ed2.read(cx).viewport_top_line());
     assert_eq!(restored, 50, "重开应回到上次阅读行（R1）");
@@ -297,7 +297,7 @@ async fn restore_txt_top_line_after_reopen(cx: &mut TestAppContext) {
     let idx = open_file_settled(&app, cx, &p);
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx].editor.clone()
+        a.model.borrow().tabs[idx].payload.editor.clone()
     });
     cx.update(|_, cx| {
         ed.update(cx, |e, _| e.scroll_to_line(40));
@@ -313,7 +313,7 @@ async fn restore_txt_top_line_after_reopen(cx: &mut TestAppContext) {
     settle_frames(cx, 6);
     let ed2 = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx2].editor.clone()
+        a.model.borrow().tabs[idx2].payload.editor.clone()
     });
     assert_eq!(
         cx.update(|_, cx| ed2.read(cx).viewport_top_line()),
@@ -336,7 +336,7 @@ async fn explicit_off_reopens_at_top(cx: &mut TestAppContext) {
     let idx = open_file_settled(&app, cx, &p);
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx].editor.clone()
+        a.model.borrow().tabs[idx].payload.editor.clone()
     });
     cx.update(|_, cx| {
         ed.update(cx, |e, _| e.scroll_to_line(60));
@@ -362,7 +362,7 @@ async fn explicit_off_reopens_at_top(cx: &mut TestAppContext) {
     let idx2 = open_file_settled(&app, cx, &p);
     let ed2 = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx2].editor.clone()
+        a.model.borrow().tabs[idx2].payload.editor.clone()
     });
     assert_eq!(
         cx.update(|_, cx| ed2.read(cx).viewport_top_line()),
@@ -605,7 +605,7 @@ async fn restore_epub_top_line_after_reopen(cx: &mut TestAppContext) {
                 .borrow()
                 .tabs
                 .get(idx)
-                .and_then(|t| t.md_wy.as_ref())
+                .and_then(|t| t.payload.md_wy.as_ref())
                 .and_then(|w| w.read(cx).top_source_line())
                 .is_some()
         });
@@ -615,7 +615,7 @@ async fn restore_epub_top_line_after_reopen(cx: &mut TestAppContext) {
     }
     // 模拟读到某章中层：set_scroll_target 直接钉到目标行（WY 自钉循环）。
     let target_line = 40usize;
-    let wy = cx.update(|_, cx| app.read(cx).model.borrow().tabs[idx].md_wy.clone());
+    let wy = cx.update(|_, cx| app.read(cx).model.borrow().tabs[idx].payload.md_wy.clone());
     let wy = wy.expect("EPUB 选项卡应持有 md_wy 只读宿主");
     cx.update(|_, cx| {
         wy.update(cx, |wy, _| wy.set_scroll_target(target_line));
@@ -625,8 +625,7 @@ async fn restore_epub_top_line_after_reopen(cx: &mut TestAppContext) {
         app.read(cx)
             .model
             .borrow()
-            .tabs[idx]
-            .md_wy
+            .tabs[idx].payload.md_wy
             .as_ref()
             .and_then(|w| w.read(cx).top_source_line())
     });
@@ -646,7 +645,7 @@ async fn restore_epub_top_line_after_reopen(cx: &mut TestAppContext) {
                 .borrow()
                 .tabs
                 .get(idx2)
-                .and_then(|t| t.md_wy.as_ref())
+                .and_then(|t| t.payload.md_wy.as_ref())
                 .and_then(|w| w.read(cx).top_source_line())
                 .is_some()
         });
@@ -659,8 +658,7 @@ async fn restore_epub_top_line_after_reopen(cx: &mut TestAppContext) {
         app.read(cx)
             .model
             .borrow()
-            .tabs[idx2]
-            .md_wy
+            .tabs[idx2].payload.md_wy
             .as_ref()
             .and_then(|w| w.read(cx).top_source_line())
     });
@@ -727,7 +725,7 @@ async fn session_restore_applies_saved_reading_progress(cx: &mut TestAppContext)
     let idx = open_file_settled(&app, cx, &p);
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[idx].editor.clone()
+        a.model.borrow().tabs[idx].payload.editor.clone()
     });
     // 模拟读到行 50（同 R1：滚后视口顶应为目标行）。
     cx.update(|_, cx| {
@@ -758,7 +756,7 @@ async fn session_restore_applies_saved_reading_progress(cx: &mut TestAppContext)
     // 恢复出的 tab（下标 0，连 remove 后零 tab 经恢复重建）应套进度到行 50。
     let ed2 = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[0].editor.clone()
+        a.model.borrow().tabs[0].payload.editor.clone()
     });
     assert_eq!(
         cx.update(|_, cx| ed2.read(cx).viewport_top_line()),
@@ -812,7 +810,7 @@ async fn session_restore_never_clobbers_saved_progress_to_zero(cx: &mut TestAppC
     // (a) 恢复应套进度（R1；同时保证 (b) 的落盘点读到的是恢复后的真实位置而非 0）。
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
-        a.model.borrow().tabs[0].editor.clone()
+        a.model.borrow().tabs[0].payload.editor.clone()
     });
     assert_eq!(
         cx.update(|_, cx| ed.read(cx).viewport_top_line()),

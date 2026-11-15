@@ -322,7 +322,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         // 先取出 reader（owned 克隆）再 `if let`，避免 `if let` 掮获 `borrow()` 临时
         // Ref 跨过块内 `&mut self` / `borrow_mut`（E0502 / 借用约束收窄）。
         let reader =
-            self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.reader.clone());
+            self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.payload.reader.clone());
         if let Some(MediaReader::Pdf(pdf)) = reader {
             let push = self
                 .model.borrow().pdf_search
@@ -707,7 +707,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         if let Some(h) = self.host_weak().upgrade() {
             let _ = h.update(cx, |app, cx| app.sidebar_open_path_or_activate(path, window, cx));
         }
-        let Some(ti) = self.model.borrow().tabs.iter().position(|t| t.file_path.as_deref() == Some(path))
+        let Some(ti) = self.model.borrow().tabs.iter().position(|t| t.payload.file_path.as_deref() == Some(path))
         else {
             return;
         };
@@ -730,8 +730,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let Some(tab) = model.tabs.get(ti) else {
             return;
         };
-        if tab.readonly_preview {
-            if let Some(wy) = tab.md_wy.clone() {
+        if tab.payload.readonly_preview {
+            if let Some(wy) = tab.payload.md_wy.clone() {
                 wy.update(cx, |v, cx| {
                     v.set_scroll_target(li);
                     v.highlight_search(li, q_owned, cx);
@@ -742,10 +742,10 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         if let Some(l2) = tab.live2.clone() {
             l2.update(cx, |v, cx| v.highlight_search(li, q_owned, cx));
         }
-        if let Some(wy) = tab.md_wy.clone() {
+        if let Some(wy) = tab.payload.md_wy.clone() {
             wy.update(cx, |v, cx| v.highlight_search(li, q_owned, cx));
         }
-        let ed = tab.editor.clone();
+        let ed = tab.payload.editor.clone();
         ed.update(cx, |ed, cx| {
             if ed.char_count() == 0 {
                 return; // 大文档后台打开尚未挂载 → 跳过定位（文件回到顶部，随后内容到达）
@@ -773,7 +773,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let (rows_len, truncated) = capped_rows(total, cap);
         let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
         for ti in scan.file_tabs.iter().copied().take(rows_len) {
-            let name = self.model.borrow().tabs[ti]
+            let name = self.model.borrow().tabs[ti].payload
                 .file_path
                 .as_ref()
                 .and_then(|p| p.file_name())
@@ -1128,7 +1128,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             if file_tabs.len() + line_hits.len() >= config::limits::SEARCH_RESULT_CAP {
                 break;
             }
-            let name = tab
+            let name = tab.payload
                 .file_path
                 .as_ref()
                 .and_then(|p| p.file_name())
@@ -1143,9 +1143,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let remaining = config::limits::SEARCH_RESULT_CAP.saturating_sub(file_tabs.len());
         if remaining > 0
             && let Some(tab) = self.model.borrow().tabs.get(self.model.borrow().active_tab) {
-                if tab.readonly_preview {
+                if tab.payload.readonly_preview {
                     // 只读预览：直接借内容镜像（零物化；打开时已 LF 归一化）。
-                    scan_line_hits(tab.content.as_ref(), q, remaining, &mut line_hits);
+                    scan_line_hits(tab.payload.content.as_ref(), q, remaining, &mut line_hits);
                 } else {
                     // 可编辑正文：`value()` 一次性物化（LF 归一化，与预测/命中一致）。
                     // 相比逐行迭代 Rope（`iter_lines` 每行 `slice_line` O(log N)/行 →
@@ -1154,7 +1154,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                     // 防抖后每次只付一次，远快于逐行 Rope 迭代。整篇只物化一次后
                     // 借 `&str` 逐行扫（见 `scan_line_hits`：命中前零分配，唯一每行
                     // 分配是命中片段的 `trim` 副本，≤ remaining 次）。
-                    let content = tab.editor.read(cx).value();
+                    let content = tab.payload.editor.read(cx).value();
                     scan_line_hits(&content, q, remaining, &mut line_hits);
                 }
             }

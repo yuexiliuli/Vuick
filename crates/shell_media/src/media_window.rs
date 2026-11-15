@@ -181,7 +181,7 @@ pub fn media_window_kind(m: &AppModel) -> Option<MediaWindowKind> {
     #[cfg(feature = "video")]
     if m.tabs
         .get(m.active_tab)
-        .map(|t| matches!(t.reader, MediaReader::Video(_)))
+        .map(|t| matches!(t.payload.reader, MediaReader::Video(_)))
         .unwrap_or(false)
     {
         return Some(MediaWindowKind::Video);

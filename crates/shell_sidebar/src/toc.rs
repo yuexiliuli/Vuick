@@ -34,14 +34,14 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let model = self.model.borrow();
         let active = model.active_tab;
         let tab = model.tabs.get(active)?;
-        let wy = tab.md_wy.as_ref()?;
+        let wy = tab.payload.md_wy.as_ref()?;
         Some((wy.read(cx).toc_entries(), MdTocScroll::Unified(wy.clone())))
     }
 
     /// 目录条目 `idx` 是否有下级（可折叠；P4-2：MD/EPUB 目录统一来自 WyEditor 只读宿主）。
     fn toc_has_child(&self, idx: usize, cx: &gpui::App) -> bool {
         match self.model.borrow().tabs.get(self.model.borrow().active_tab) {
-            Some(tab) => match &tab.reader {
+            Some(tab) => match &tab.payload.reader {
                 MediaReader::Pdf(pv) => {
                     let outlines = pv.read(cx).outlines().to_vec();
                     let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
@@ -112,7 +112,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let font_px = 13.0f32;
         // 右侧页码列宽（PDF 书签有页码，Markdown 无）：预留以免标题被截断
         let page_col_w = 34.0f32;
-        let max_row = if let MediaReader::Pdf(pdf) = &tab.reader {
+        let max_row = if let MediaReader::Pdf(pdf) = &tab.payload.reader {
             let outlines = pdf.read(cx).outlines();
             let mut w = outlines
                 .iter()
@@ -182,9 +182,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         if sb.width_auto {
             let model = self.model.borrow();
             let tab = model.tabs.get(active);
-            let ver = tab.map(|t| t.edit_version).unwrap_or(0);
+            let ver = tab.map(|t| t.payload.edit_version).unwrap_or(0);
             let cg = tab
-                .and_then(|t| t.md_wy.as_ref())
+                .and_then(|t| t.payload.md_wy.as_ref())
                 .map(|wy| wy.read(cx).content_gen())
                 .unwrap_or(0);
             let cached = sb
@@ -205,7 +205,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 Some(tab) => {
                     let collapsed = sb.toc_collapsed.clone();
                     // PDF 书签目录 + Phase B3 「书签」区段（阅读位置书签：点击跳页、× 删除）
-                    if let MediaReader::Pdf(pdf) = &tab.reader {
+                    if let MediaReader::Pdf(pdf) = &tab.payload.reader {
                         let outlines = pdf.read(cx).outlines().to_vec();
                         let mut blocks: Vec<gpui::AnyElement> = Vec::new();
                         if outlines.is_empty() {
@@ -268,8 +268,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                         // Markdown 标题（P4-2：MD / EPUB 目录都来自统一 WyEditor 宿主）。
                         let model = self.model.borrow();
                         let tab = model.tabs.get(active);
-                        let ver = tab.map(|t| t.edit_version).unwrap_or(0);
-                        let wy = tab.and_then(|t| t.md_wy.as_ref());
+                        let ver = tab.map(|t| t.payload.edit_version).unwrap_or(0);
+                        let wy = tab.and_then(|t| t.payload.md_wy.as_ref());
                         let cg = wy.map(|wy| wy.read(cx).content_gen()).unwrap_or(0);
                         // 条目 + 可见性 + 跳转目标按 (选项卡, 编辑版本, WyEditor 宿主 + 内容代号)
                         // 缓存：内容/折叠没变逐帧 O(1) 复用，大文档不再每帧全量克隆条目/重扫。

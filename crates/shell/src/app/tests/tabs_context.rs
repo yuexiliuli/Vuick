@@ -142,8 +142,8 @@
         }
         cx.update(|_w, cx| {
             app.update(cx, |a, _cx| {
-                if let Some(t) = a.model.borrow_mut().tabs.iter_mut().find(|t| t.file_path.is_some()) {
-                    t.dirty = true;
+                if let Some(t) = a.model.borrow_mut().tabs.iter_mut().find(|t| t.payload.file_path.is_some()) {
+                    t.payload.dirty = true;
                 }
             });
         });
@@ -228,7 +228,7 @@
                 app.read(cx)
                     .model.borrow().tabs
                     .iter()
-                    .any(|t| t.file_path.as_deref() == Some(mk(2).as_path()))
+                    .any(|t| t.payload.file_path.as_deref() == Some(mk(2).as_path()))
             }),
             "目标 tab(2) 应保留"
         );
@@ -262,7 +262,7 @@
             cx.run_until_parked();
         }
         let paths: Vec<Option<std::path::PathBuf>> = cx.update(|_w, cx| {
-            app.read(cx).model.borrow().tabs.iter().map(|t| t.file_path.clone()).collect()
+            app.read(cx).model.borrow().tabs.iter().map(|t| t.payload.file_path.clone()).collect()
         });
         assert_eq!(paths.len(), 1, "关闭右侧后应剩 1 tab");
         assert_eq!(paths[0].as_deref(), Some(mk(1).as_path()), "目标 1 保留");
@@ -273,9 +273,9 @@
                 if let Some(t) = a
                     .model.borrow_mut().tabs
                     .get_mut(1)
-                    .filter(|t| t.file_path.as_deref() == Some(mk(2).as_path()))
+                    .filter(|t| t.payload.file_path.as_deref() == Some(mk(2).as_path()))
                 {
-                    t.dirty = true;
+                    t.payload.dirty = true;
                 }
             });
         });
@@ -322,7 +322,7 @@
         cx.update(|_w, cx| {
             app.update(cx, |a, _cx| {
                 if let Some(t) = a.model.borrow_mut().tabs.get_mut(1) {
-                    t.dirty = true;
+                    t.payload.dirty = true;
                 }
             });
         });
@@ -339,9 +339,9 @@
             (
                 a.model.borrow().tabs
                     .iter()
-                    .map(|t| t.file_path.as_deref().map(|p| p.to_path_buf()))
+                    .map(|t| t.payload.file_path.as_deref().map(|p| p.to_path_buf()))
                     .collect::<Vec<_>>(),
-                a.model.borrow().tabs.iter().map(|t| t.dirty).collect::<Vec<_>>(),
+                a.model.borrow().tabs.iter().map(|t| t.payload.dirty).collect::<Vec<_>>(),
             )
         });
         assert_eq!(paths.len(), 2, "关闭已保存后应剩未命名 + 脏文件 B(实际只剩下未命名+A)");
@@ -409,7 +409,7 @@
                 let f2_idx = app
                     .model.borrow().tabs
                     .iter()
-                    .position(|t| t.file_path.as_deref() == Some(f2.as_path()))
+                    .position(|t| t.payload.file_path.as_deref() == Some(f2.as_path()))
                     .expect("F2 应在场");
                 app.tab_move_to_new_window(f2_idx, window, cx);
             });
@@ -451,7 +451,7 @@
         let source_before = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[1];
-            (a.model.borrow().tabs.len(), t.dirty, t.editor.read(cx).value().to_string())
+            (a.model.borrow().tabs.len(), t.payload.dirty, t.payload.editor.read(cx).value().to_string())
         });
         assert_eq!(source_before.1, false, "打开文件默认不脏");
         cx.update(|window, cx| {
@@ -476,8 +476,8 @@
             let a = app.read(cx);
             (
                 a.model.borrow().tabs.len(),
-                a.model.borrow().tabs[1].dirty,
-                a.model.borrow().tabs[1].editor.read(cx).value().to_string(),
+                a.model.borrow().tabs[1].payload.dirty,
+                a.model.borrow().tabs[1].payload.editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(source_after.0, source_before.0, "源窗口 tab 数不变");
@@ -497,16 +497,16 @@
         });
         cx.update(|_w, cx| {
             det_entity.update(cx, |app, cx| {
-                let ed = app.model.borrow().tabs[0].editor.clone();
+                let ed = app.model.borrow().tabs[0].payload.editor.clone();
                 ed.update(cx, |ed, _| ed.set_text("UPDATED COPY"));
-                app.model.borrow_mut().tabs[0].dirty = true;
+                app.model.borrow_mut().tabs[0].payload.dirty = true;
             });
         });
         for _ in 0..3 {
             cx.run_until_parked();
         }
         let src_final = cx.update(|_w, cx| {
-            app.read(cx).model.borrow().tabs[1].editor.read(cx).value().to_string()
+            app.read(cx).model.borrow().tabs[1].payload.editor.read(cx).value().to_string()
         });
         assert_eq!(
             src_final,

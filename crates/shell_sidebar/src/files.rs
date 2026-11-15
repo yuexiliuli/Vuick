@@ -420,7 +420,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     fn active_file_path_matches(&self, path: &std::path::Path) -> bool {
         self.model.borrow().tabs
             .get(self.model.borrow().active_tab)
-            .and_then(|t| t.file_path.as_ref())
+            .and_then(|t| t.payload.file_path.as_ref())
             .is_some_and(|p| p == path)
     }
 

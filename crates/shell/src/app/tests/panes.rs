@@ -18,8 +18,8 @@
                         (
                             a.is_detached,
                             a.model.borrow().tabs.len(),
-                            tab.and_then(|t| t.file_path.clone()).is_some(),
-                            tab.map(|t| t.editor.read(c).value()),
+                            tab.and_then(|t| t.payload.file_path.clone()).is_some(),
+                            tab.map(|t| t.payload.editor.read(c).value()),
                         )
                     });
                     Some(snap)
@@ -46,7 +46,7 @@
             cx.run_until_parked();
         }
         // 编辑区输入 → 置脏（insert_text 属真实编辑，经 EditorEvent::Edited 置脏）
-        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[1].editor.clone());
+        let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[1].payload.editor.clone());
         cx.update(|_w, cx| editor.update(cx, |ed, cx| ed.insert_text("初始内容", cx)));
         for _ in 0..2 {
             cx.run_until_parked();
@@ -63,10 +63,10 @@
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
-                t.editor.read(cx).value(),
-                t.dirty,
+                t.payload.editor.read(cx).value(),
+                t.payload.dirty,
                 a.model.borrow().tabs.len(),
-                t.file_path.is_some(),
+                t.payload.file_path.is_some(),
             )
         });
         assert_eq!(
@@ -251,10 +251,10 @@
         let (has_file, content) = cx.update(|_w, cx| {
             let a = primary.read(cx);
             let model = a.model.borrow();
-            let tab = model.tabs.iter().find(|t| t.file_path.is_some());
+            let tab = model.tabs.iter().find(|t| t.payload.file_path.is_some());
             (
                 tab.is_some(),
-                tab.map(|t| t.editor.read(cx).value().to_string()),
+                tab.map(|t| t.payload.editor.read(cx).value().to_string()),
             )
         });
         assert!(has_file, "主窗口应重新持有该文件选项卡");
@@ -339,10 +339,10 @@
         let (has_file, content) = cx.update(|_w, cx| {
             let a = primary.read(cx);
             let model = a.model.borrow();
-            let tab = model.tabs.iter().find(|t| t.file_path.is_some());
+            let tab = model.tabs.iter().find(|t| t.payload.file_path.is_some());
             (
                 tab.is_some(),
-                tab.map(|t| t.editor.read(cx).value().to_string()),
+                tab.map(|t| t.payload.editor.read(cx).value().to_string()),
             )
         });
         assert!(has_file, "主窗口应重新持有该文件选项卡");
@@ -938,7 +938,7 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                !a.model.borrow().tabs[i].editor_pending
+                !a.model.borrow().tabs[i].payload.editor_pending
             });
             if ready {
                 break;
@@ -953,7 +953,7 @@
         let editor = cx.update(|window, cx| {
             let focus = app.read(cx).editor_focus_handle(cx);
             window.focus(&focus, cx);
-            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone()
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone()
         });
 
         // ---------- 编辑器输入（insert_text × 6，拆「insert」与「draw/渲染」） ----------
@@ -1023,9 +1023,9 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                !a.model.borrow().tabs[i].editor_pending
+                !a.model.borrow().tabs[i].payload.editor_pending
                     && a.model.borrow().tabs[i]
-                        .md_wy
+                        .payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false)
@@ -1070,7 +1070,7 @@
         crate::prof::dump("preview_scroll");
 
         // ---------- 预览编辑区输入（md 编辑区 insert_text，拆 ins/draw） ----------
-        let md_editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].editor.clone());
+        let md_editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
         for k in 0..4 {
             let t0 = std::time::Instant::now();
             cx.update(|_, cx| md_editor.update(cx, |e, cx| e.insert_text("y", cx)));
@@ -1133,7 +1133,7 @@
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                !a.model.borrow().tabs[a.model.borrow().tabs.len().saturating_sub(1)].editor_pending
+                !a.model.borrow().tabs[a.model.borrow().tabs.len().saturating_sub(1)].payload.editor_pending
             });
             if ready {
                 break;
@@ -1147,9 +1147,9 @@
             let a = app.read(cx);
             let i = a.model.borrow().active_tab;
             (
-                a.model.borrow().tabs[i].editor.clone(),
-                a.model.borrow().tabs[i].md_wy.clone().expect("预览应在场"),
-                a.model.borrow().tabs[i].md_wy_vscroll.clone(),
+                a.model.borrow().tabs[i].payload.editor.clone(),
+                a.model.borrow().tabs[i].payload.md_wy.clone().expect("预览应在场"),
+                a.model.borrow().tabs[i].payload.md_wy_vscroll.clone(),
             )
         });
         let read = |cx: &mut VisualTestContext| -> (usize, Option<usize>, f32) {
@@ -1295,7 +1295,7 @@
             cx.run_until_parked();
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
-                !a.model.borrow().tabs[a.model.borrow().tabs.len().saturating_sub(1)].editor_pending
+                !a.model.borrow().tabs[a.model.borrow().tabs.len().saturating_sub(1)].payload.editor_pending
             });
             if ready {
                 break;
@@ -1309,9 +1309,9 @@
             let a = app.read(cx);
             let i = a.model.borrow().active_tab;
             (
-                a.model.borrow().tabs[i].editor.clone(),
-                a.model.borrow().tabs[i].md_wy.clone().expect("预览应在场"),
-                a.model.borrow().tabs[i].md_wy_vscroll.clone(),
+                a.model.borrow().tabs[i].payload.editor.clone(),
+                a.model.borrow().tabs[i].payload.md_wy.clone().expect("预览应在场"),
+                a.model.borrow().tabs[i].payload.md_wy_vscroll.clone(),
             )
         });
         let read = |cx: &mut VisualTestContext| -> (usize, Option<usize>, f32) {
@@ -1388,7 +1388,7 @@
                 .model.borrow().tabs
                 .iter()
                 .map(|t| {
-                    t.file_path
+                    t.payload.file_path
                         .as_ref()
                         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
                 })
@@ -1575,7 +1575,7 @@
             let a = app.read(cx);
             (
                 a.model.borrow().active_tab,
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(

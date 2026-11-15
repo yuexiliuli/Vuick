@@ -54,7 +54,7 @@ impl EditorApp {
         let is_pdf = self
             .model.borrow().tabs
             .get(self.model.borrow().active_tab)
-            .map(|t| matches!(t.reader, MediaReader::Pdf(_)))
+            .map(|t| matches!(t.payload.reader, MediaReader::Pdf(_)))
             .unwrap_or(false);
         if is_pdf {
             self.on_pdf_right_click(ev, window, cx);

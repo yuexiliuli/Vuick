@@ -25,27 +25,27 @@ pub fn toggle_preview_for_tab_state<H: 'static>(
     if model.borrow().tabs.get(idx).is_none() {
         return;
     }
-    let readonly = model.borrow().tabs.get(idx).map(|t| t.readonly_preview).unwrap_or(false);
+    let readonly = model.borrow().tabs.get(idx).map(|t| t.payload.readonly_preview).unwrap_or(false);
     let preview_on = {
         let mut m = model.borrow_mut();
         let tab = &mut m.tabs[idx];
         if readonly {
-            tab.preview_on = true;
-            tab.preview_fullscreen = true;
+            tab.payload.preview_on = true;
+            tab.payload.preview_fullscreen = true;
         } else {
-            tab.preview_on = !tab.preview_on;
+            tab.payload.preview_on = !tab.payload.preview_on;
             // 关闭预览时同步退出全屏
-            if !tab.preview_on {
-                tab.preview_fullscreen = false;
+            if !tab.payload.preview_on {
+                tab.payload.preview_fullscreen = false;
             }
         }
-        tab.preview_on
+        tab.payload.preview_on
     };
     // 开启预览 → 编辑区强制换行，方便在分屏里编辑 Markdown；
     // 关闭预览 → 恢复默认：Markdown 文件编辑区仍换行（md 默认），其余按全局偏好。
     let is_md = crate::classify::is_markdown_tab(&model.borrow(), idx);
     let wrap = preview_on || is_md || model.borrow().wrap_enabled;
-    model.borrow().tabs[idx].editor.update(cx, |ed, _cx| {
+    model.borrow().tabs[idx].payload.editor.update(cx, |ed, _cx| {
         ed.set_soft_wrap(wrap);
     });
     if preview_on {
@@ -55,9 +55,9 @@ pub fn toggle_preview_for_tab_state<H: 'static>(
         if !readonly {
             crate::mdwy::ensure_md_wy(model, idx, window, cx, true);
         } else if crate::classify::is_epub_tab(&model.borrow(), idx) {
-            let images = model.borrow().tabs[idx].epub_images.clone();
-            let notes = model.borrow().tabs[idx].epub_notes.clone();
-            let content = model.borrow().tabs[idx].content.clone();
+            let images = model.borrow().tabs[idx].payload.epub_images.clone();
+            let notes = model.borrow().tabs[idx].payload.epub_notes.clone();
+            let content = model.borrow().tabs[idx].payload.content.clone();
             crate::mdwy::ensure_epub_wy(model, idx, window, cx, content.as_ref(), &images, &notes);
         }
     } else {
@@ -65,8 +65,8 @@ pub fn toggle_preview_for_tab_state<H: 'static>(
         // 内存回到基线）。B3：在途后台整篇装配一并作废（实体被丢弃，完成回调按
         // tab 归属/代号不再安装）。
         crate::mdwy::md_wy_invalidate_async(model, idx);
-        model.borrow_mut().tabs[idx].md_wy = None;
-        model.borrow_mut().tabs[idx].md_wy_vscroll = gpui::ScrollHandle::new();
+        model.borrow_mut().tabs[idx].payload.md_wy = None;
+        model.borrow_mut().tabs[idx].payload.md_wy_vscroll = gpui::ScrollHandle::new();
     }
     cx.notify();
 }
@@ -83,9 +83,9 @@ pub fn toggle_preview_fullscreen<H: 'static>(
         let Some(tab) = m.tabs.get_mut(idx) else {
             return;
         };
-        tab.preview_fullscreen = !tab.preview_fullscreen;
-        let fs = tab.preview_fullscreen;
-        (fs, tab.editor.clone())
+        tab.payload.preview_fullscreen = !tab.payload.preview_fullscreen;
+        let fs = tab.payload.preview_fullscreen;
+        (fs, tab.payload.editor.clone())
     };
     // 编辑区软换行：进入全屏阅读 → 编辑区强制换行；退出全屏 → 恢复默认。
     let is_md = crate::classify::is_markdown_tab(&model.borrow(), idx);
@@ -110,10 +110,10 @@ pub fn toggle_wrap<H: 'static>(model: &Rc<RefCell<AppModel>>, cx: &mut Context<H
     if model
         .borrow().tabs
         .get(idx)
-        .map(|t| !t.preview_fullscreen)
+        .map(|t| !t.payload.preview_fullscreen)
         .unwrap_or(true)
         && let Some(tab) = model.borrow().tabs.get(idx) {
-            tab.editor.update(cx, |ed, _cx| {
+            tab.payload.editor.update(cx, |ed, _cx| {
                 ed.set_soft_wrap(wrap_enabled);
             });
         }

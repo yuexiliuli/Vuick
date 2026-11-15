@@ -733,7 +733,7 @@ use common::*;
             let has = a
                 .model.borrow().tabs
                 .iter()
-                .any(|t| t.file_path.as_deref() == Some(base.join("a_top.rs").as_path()));
+                .any(|t| t.payload.file_path.as_deref() == Some(base.join("a_top.rs").as_path()));
             (a.palette.is_none(), has)
         });
         assert!(closed, "回车打开候选后面板应关闭");

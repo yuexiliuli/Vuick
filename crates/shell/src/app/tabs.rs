@@ -72,7 +72,9 @@ impl EditorApp {
         // 未命名选项卡（无论脏与否：空内容同样在盘上有会话槽位）→ 一律弹确认
         // （是=另存为转正、否=删除临时槽位、取消=留在应用）；命名文件仅当脏（有
         // 未落盘修改）才询问，干净直通关闭。
-        if self.model.borrow().tabs[idx].file_path.is_some() && !self.model.borrow().tabs[idx].dirty {
+        if self.model.borrow().tabs[idx].payload.file_path.is_some()
+            && !self.model.borrow().tabs[idx].payload.dirty
+        {
             self.remove_tab(idx, window, cx);
             return;
         }
@@ -97,7 +99,7 @@ impl EditorApp {
                             .update_window_entity(&entity, |this, _w, _cx| {
                                 this.model.borrow().tabs
                                     .get(idx)
-                                    .is_some_and(|t| matches!(t.reader, MediaReader::Pdf(_)))
+                                    .is_some_and(|t| matches!(t.payload.reader, MediaReader::Pdf(_)))
                             })
                             .unwrap_or(false);
                         if is_pdf {
@@ -110,7 +112,7 @@ impl EditorApp {
                                     let p = this
                                         .model.borrow().tabs
                                         .get(idx)
-                                        .and_then(|t| match &t.reader {
+                                        .and_then(|t| match &t.payload.reader {
                                             MediaReader::Pdf(p) => Some(p.clone()),
                                             _ => None,
                                         });
@@ -129,7 +131,7 @@ impl EditorApp {
                                         .update_window_entity(&entity, |this, _w, cx| {
                                             this.model.borrow().tabs
                                                 .get(idx)
-                                                .map(|t| match &t.reader {
+                                                .map(|t| match &t.payload.reader {
                                                     MediaReader::Pdf(p) => {
                                                         !p.read(cx).is_dirty()
                                                     }
@@ -156,7 +158,7 @@ impl EditorApp {
                                     let path = this
                                         .model.borrow().tabs
                                         .get(idx)
-                                        .and_then(|t| t.file_path.clone());
+                                        .and_then(|t| t.payload.file_path.clone());
                                     match path {
                                         Some(p) => {
                                             // 走统一口径：live2 开启时读 WyEditor 实时内容
@@ -273,7 +275,7 @@ impl EditorApp {
             .borrow()
             .tabs
             .get(self.model.borrow().active_tab)
-            .and_then(|t| t.file_path.as_ref())
+            .and_then(|t| t.payload.file_path.as_ref())
             .map(|p| Self::is_markdown_path(p))
             .unwrap_or(false);
         let preview_on = self.show_preview();
@@ -385,8 +387,8 @@ impl EditorApp {
         }
         // 先提纯 reader_none / media_path（owned）再分支，避免 `if` 条件里的 `borrow()`
         // 临时 Ref 跨过块内 `&mut self` 调用（E0502 / 借用约束收窄）。
-        let reader_none = self.model.borrow().tabs[idx].reader.is_none();
-        let media_path = self.model.borrow().tabs[idx].file_path.clone();
+        let reader_none = self.model.borrow().tabs[idx].payload.reader.is_none();
+        let media_path = self.model.borrow().tabs[idx].payload.file_path.clone();
         if reader_none {
             self.tab_copy_text_to_new_window(idx, window, cx);
         } else if let Some(p) = media_path {
@@ -411,15 +413,15 @@ impl EditorApp {
             let t = &model.tabs[idx];
             (
                 model.tab_effective_text(idx, &**cx),
-                t.file_path.clone(),
-                t.dirty,
-                t.preview_on,
-                t.readonly_preview,
-                t.cursor_row,
-                t.cursor_col,
-                t.line_count,
-                t.char_count,
-                t.source_encoding, // 复制 → 编码随文档走（保存回写不丢）
+                t.payload.file_path.clone(),
+                t.payload.dirty,
+                t.payload.preview_on,
+                t.payload.readonly_preview,
+                t.payload.cursor_row,
+                t.payload.cursor_col,
+                t.payload.line_count,
+                t.payload.char_count,
+                t.payload.source_encoding, // 复制 → 编码随文档走（保存回写不丢）
             )
         };
         let lang = path.as_ref().map(|p| Self::language_id(p));
@@ -429,7 +431,7 @@ impl EditorApp {
         let kept_active = self.model.borrow().active_tab;
         let new_idx = self.make_tab(window, cx);
         // ① 先喂独立编辑器（新实体，不共享源缓冲）：内容 / 语言沿用 / 光标保留。
-        self.model.borrow().tabs[new_idx].editor.update(cx, |ed, _cx| {
+        self.model.borrow().tabs[new_idx].payload.editor.update(cx, |ed, _cx| {
             ed.set_text(&text);
             if let Some(l) = lang {
                 ed.set_language(Some(l));
@@ -440,16 +442,16 @@ impl EditorApp {
         {
             let mut model = self.model.borrow_mut();
             let t = &mut model.tabs[new_idx];
-            t.file_path = path.clone();
-            t.source_encoding = src_enc;
-            t.dirty = dirty;
-            t.content = SharedString::default();
-            t.line_count = line_count;
-            t.char_count = char_count;
-            t.cursor_row = cursor_row;
-            t.cursor_col = cursor_col;
-            t.preview_on = preview_on;
-            t.readonly_preview = readonly_preview;
+            t.payload.file_path = path.clone();
+            t.payload.source_encoding = src_enc;
+            t.payload.dirty = dirty;
+            t.payload.content = SharedString::default();
+            t.payload.line_count = line_count;
+            t.payload.char_count = char_count;
+            t.payload.cursor_row = cursor_row;
+            t.payload.cursor_col = cursor_col;
+            t.payload.preview_on = preview_on;
+            t.payload.readonly_preview = readonly_preview;
         }
         let Some(payload) = self.take_tab_payload(new_idx) else {
             return;

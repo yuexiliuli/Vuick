@@ -184,7 +184,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pdf = match self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.reader.clone()) {
+        let pdf = match self.model.borrow().tabs.get(self.model.borrow().active_tab).map(|t| t.payload.reader.clone()) {
             Some(MediaReader::Pdf(pv)) => pv,
             _ => return,
         };
@@ -372,7 +372,7 @@ impl EditorApp {
         let still_pdf = self
             .model.borrow().tabs
             .get(self.model.borrow().active_tab)
-            .map(|t| matches!(t.reader, MediaReader::Pdf(_)))
+            .map(|t| matches!(t.payload.reader, MediaReader::Pdf(_)))
             .unwrap_or(false);
         if !still_pdf {
             self.pdf_menu_entity = None;

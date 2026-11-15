@@ -15,7 +15,7 @@ impl EditorApp {
     ) -> Subscription {
         let ed = editor.clone();
         cx.subscribe(&ed, |this, emitter, ev: &editor::EditorEvent, cx| {
-            let pos = this.model.borrow().tabs.iter().position(|t| t.editor == emitter);
+            let pos = this.model.borrow().tabs.iter().position(|t| t.payload.editor == emitter);
             if let Some(t) = pos {
                 match ev {
                     editor::EditorEvent::Edited => this.on_editor_edited(t, cx),
@@ -72,12 +72,12 @@ impl EditorApp {
         let Some(idx) = self
             .model.borrow().tabs
             .iter()
-            .position(|t| matches!(&t.reader, MediaReader::Pdf(p) if p.entity_id() == pdf.entity_id()))
+            .position(|t| matches!(&t.payload.reader, MediaReader::Pdf(p) if p.entity_id() == pdf.entity_id()))
         else {
             return;
         };
-        if self.model.borrow().tabs[idx].file_path.as_deref() != Some(path) {
-            self.model.borrow_mut().tabs[idx].file_path = Some(path.to_path_buf());
+        if self.model.borrow().tabs[idx].payload.file_path.as_deref() != Some(path) {
+            self.model.borrow_mut().tabs[idx].payload.file_path = Some(path.to_path_buf());
         }
     }
 
@@ -93,12 +93,12 @@ impl EditorApp {
         let Some(idx) = self
             .model.borrow().tabs
             .iter()
-            .position(|t| matches!(&t.reader, MediaReader::Pdf(p) if p.entity_id() == pdf.entity_id()))
+            .position(|t| matches!(&t.payload.reader, MediaReader::Pdf(p) if p.entity_id() == pdf.entity_id()))
         else {
             return;
         };
-        if self.model.borrow().tabs[idx].dirty != dirty {
-            self.model.borrow_mut().tabs[idx].dirty = dirty;
+        if self.model.borrow().tabs[idx].payload.dirty != dirty {
+            self.model.borrow_mut().tabs[idx].payload.dirty = dirty;
         }
     }
 
@@ -109,13 +109,13 @@ impl EditorApp {
     /// 标脏（gpui `mark_view_dirty`，见 on_editor_edited 注解），状态栏同帧读到新值。
     pub(super) fn on_editor_selection_changed(&mut self, tab_ix: usize, cx: &mut Context<Self>) {
         let (row, col) = {
-            let st = self.model.borrow().tabs[tab_ix].editor.read(cx);
+            let st = self.model.borrow().tabs[tab_ix].payload.editor.read(cx);
             st.cursor_position()
         };
         let mut model = self.model.borrow_mut();
         let tab = &mut model.tabs[tab_ix];
-        tab.cursor_row = row;
-        tab.cursor_col = col;
+        tab.payload.cursor_row = row;
+        tab.payload.cursor_col = col;
     }
 
     /// 编辑事件：失效搜索缓存、推进版本，并把同一次编辑经增量桥重放到右栏统一预览
@@ -129,16 +129,16 @@ impl EditorApp {
         let dirty_range = {
             let mut model = self.model.borrow_mut();
             let tab = &mut model.tabs[tab_ix];
-            tab.edit_version = tab.edit_version.wrapping_add(1);
-            tab.editor.update(cx, |ed, _| ed.take_last_edit())
+            tab.payload.edit_version = tab.payload.edit_version.wrapping_add(1);
+            tab.payload.editor.update(cx, |ed, _| ed.take_last_edit())
         };
         if let Some((s, oe, ne)) = dirty_range {
             // A3 逐键增量桥：右栏 WyEditor 预览（若该选项卡有）重放**同一次**编辑
             // （src 字节区间 `[s, oe)` → 编辑后新文本 `[s, ne)`），走 WyEditor 增量管线
             //（Doc::edit + Pass1 + derived），大文档每键 ≈0.4ms——预览恒等于编辑区。
-            let wy = self.model.borrow().tabs[tab_ix].md_wy.clone();
+            let wy = self.model.borrow().tabs[tab_ix].payload.md_wy.clone();
             if let Some(wy) = wy {
-                let ed = self.model.borrow().tabs[tab_ix].editor.clone();
+                let ed = self.model.borrow().tabs[tab_ix].payload.editor.clone();
                 let new_text = ed.read(cx).rope().slice(s..ne).to_string();
                 if wy.read(cx).is_loaded() {
                     // Step3：整篇在途（`md_wy_pending_full`：预览=prefix、编辑区逐块追加中）
@@ -146,7 +146,7 @@ impl EditorApp {
                     // 当前预览；改以当前编辑区 Rope（O(1) COW 快照）**异步整篇重喂**（带装配
                     // 代号守卫，作废在途整篇/prefix），装好后预览 == 编辑区，此后的编辑退化
                     // 逐键增量——编辑过的整篇离散弃，不装旧。
-                    let stale = self.model.borrow().tabs[tab_ix].md_wy_install.pending_full.is_some()
+                    let stale = self.model.borrow().tabs[tab_ix].payload.md_wy_install.pending_full.is_some()
                         || wy.read(cx).len() != ed.read(cx).rope().len();
                     if stale {
                         let rope = ed.read(cx).rope().clone();
@@ -166,7 +166,7 @@ impl EditorApp {
         // 行数用显示语义（`str::lines()` 口径，与文件打开/状态栏一致），
         // 不用含幻影尾行的编辑器模型 `line_count()`。
         let (line_count, char_count, cursor_row, cursor_col) = {
-            let st = self.model.borrow().tabs[tab_ix].editor.read(cx);
+            let st = self.model.borrow().tabs[tab_ix].payload.editor.read(cx);
             let cursor = st.cursor_position();
             (st.display_line_count(), st.char_count(), cursor.0, cursor.1)
         };
@@ -174,16 +174,16 @@ impl EditorApp {
         let tab = &mut model.tabs[tab_ix];
         // 只对 readonly_preview（EPUB/PDF，编辑区为空）镜像全文到 content；
         // 普通文本/Markdown 以编辑器 Rope 为准，不做整份副本（省内存）。
-        if tab.readonly_preview {
-            let content = tab.editor.read(cx).text().to_string();
-            tab.content = SharedString::from(content);
+        if tab.payload.readonly_preview {
+            let content = tab.payload.editor.read(cx).text().to_string();
+            tab.payload.content = SharedString::from(content);
         }
-        tab.line_count = line_count;
-        tab.char_count = char_count;
-        tab.cursor_row = cursor_row;
-        tab.cursor_col = cursor_col;
-        if !tab.dirty {
-            tab.dirty = true;
+        tab.payload.line_count = line_count;
+        tab.payload.char_count = char_count;
+        tab.payload.cursor_row = cursor_row;
+        tab.payload.cursor_col = cursor_col;
+        if !tab.payload.dirty {
+            tab.payload.dirty = true;
         }
         drop(model);
         // 内容变更 → 防抖持久化（300ms 停顿后落盘一次；结构变化则即时，见 session 模块）。

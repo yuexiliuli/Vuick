@@ -199,8 +199,8 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         for tab in self.model.borrow_mut().tabs.iter_mut() {
-            if tab.file_path.as_deref() == Some(p) {
-                tab.loading_lock = false;
+            if tab.payload.file_path.as_deref() == Some(p) {
+                tab.payload.loading_lock = false;
             }
         }
         self.model.borrow_mut().status = SharedString::from(format!("打开失败：{e}"));
@@ -320,7 +320,7 @@ impl EditorApp {
             let Some(tab) = model.tabs.get(idx) else {
                 return;
             };
-            let Some(path) = tab.file_path.clone() else {
+            let Some(path) = tab.payload.file_path.clone() else {
                 return; // 未命名选项卡无进度
             };
             let key = session_store::reading_progress::normalize_key(&path);
@@ -342,25 +342,25 @@ impl EditorApp {
                 shell_core::rp_diag::rp_value(&saved)
             ),
         );
-        self.model.borrow_mut().tabs[idx].reading_restore = Some(saved.clone());
+        self.model.borrow_mut().tabs[idx].payload.reading_restore = Some(saved.clone());
         match saved {
             ReadingProgress::Markdown { top_line } => {
                 shell_core::rp_diag::mark_preview_pending(key);
-                let editor = self.model.borrow().tabs[idx].editor.clone();
+                let editor = self.model.borrow().tabs[idx].payload.editor.clone();
                 // Fix A：编辑区恢复之外，**同时**把右栏预览滚到存档块（对齐 EPUB 姿势）。
                 // 目标写进 WyEditor `scroll_target` 由其 prepaint 自钉（小文档已同步喂源 →
                 // 立即生效）；大文档两段式**空壳装配期**该目标会被 `advance_pending_scroll`
                 // 丢弃（空文档 `scroll_to_line_impl` 返 NAN / 宿主未挂载 → 清 scroll_target，
                 // markdown_wysiwyg view.rs:123-127/150-154，而 `install_open` 不动 target）、
                 // 保底靠下方 Fix B 的 `md_restore_pending` 护栏兜住「预览→编辑区」回拉。
-                if let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone()) {
+                if let Some(wy) = self.model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone()) {
                     wy.update(cx, |wy, _| wy.set_scroll_target(top_line));
                 }
                 // Fix B：进入「md 阅读进度恢复在途」守卫窗口——预览未收敛到存档块前，
                 // sync 的「预览自主跨块跟随 / 静态预览回拉编辑器」（scroll.rs:192-201/215-224）
                 // 一律不发（编辑器恢复位是这段的权威面，真机「49→2 拉回顶部」即此）。
                 // 收敛/超时由宿主每帧 `advance_md_restore_window` 清位归还正常双向同步。
-                self.model.borrow_mut().tabs[idx].md_restore_pending = Some((top_line, 0));
+                self.model.borrow_mut().tabs[idx].payload.md_restore_pending = Some((top_line, 0));
                 // 回调里按**编辑区实体**重新定位选项卡而非记住的下标——next-frame 到达前
                 // 若有其它 tab 被关/开，下标已搬移（回调读旧 idx 会白丢恢复），实体身份
                 // 恒可靠；回调体会在选项卡集合里没找到该实体时安全早退（tab 已关/已搬走）。
@@ -369,16 +369,16 @@ impl EditorApp {
                 });
             }
             ReadingProgress::Epub { top_line } => {
-                let wy = self.model.borrow().tabs.get(idx).and_then(|t| t.md_wy.clone());
+                let wy = self.model.borrow().tabs.get(idx).and_then(|t| t.payload.md_wy.clone());
                 if let Some(wy) = wy {
                     wy.update(cx, |wy, _| wy.set_scroll_target(top_line));
                 }
-                self.model.borrow_mut().tabs[idx].reading_restore = None;
+                self.model.borrow_mut().tabs[idx].payload.reading_restore = None;
             }
             ReadingProgress::Pdf { page_index, in_page_frac, zoom } => {
                 let pv = {
                     let model = self.model.borrow();
-                    match model.tabs.get(idx).map(|t| &t.reader) {
+                    match model.tabs.get(idx).map(|t| &t.payload.reader) {
                         Some(MediaReader::Pdf(pv)) => Some(pv.clone()),
                         _ => None,
                     }
@@ -388,7 +388,7 @@ impl EditorApp {
                         v.set_restore_anchor(page_index, in_page_frac, zoom)
                     });
                 }
-                self.model.borrow_mut().tabs[idx].reading_restore = None;
+                self.model.borrow_mut().tabs[idx].payload.reading_restore = None;
             }
         }
     }
@@ -407,11 +407,11 @@ impl EditorApp {
             let mut model = self.model.borrow_mut();
             // 以编辑区实体重新定位选项卡（关闭/搬移后下标会漂移，实体身份恒可靠）；
             // 已关/被换成其它文件（实体已不在选项卡集合）→ 安全早退。
-            let Some(tab) = model.tabs.iter_mut().find(|t| t.editor == *editor) else {
+            let Some(tab) = model.tabs.iter_mut().find(|t| t.payload.editor == *editor) else {
                 return; // 选项卡已关/被换成其它文件
             };
-            let line = top_line.min(tab.editor.read(cx).line_count().saturating_sub(1));
-            tab.reading_restore = None; // 消费完成
+            let line = top_line.min(tab.payload.editor.read(cx).line_count().saturating_sub(1));
+            tab.payload.reading_restore = None; // 消费完成
             line
         };
         editor.update(cx, |ed, _| {
@@ -458,7 +458,7 @@ impl EditorApp {
         }
         // Markdown 文件编辑区默认软换行（其他文件默认不换行，见 make_tab 的 wrap_enabled）
         let is_md = Self::is_markdown_path(p);
-        tab.editor.update(cx, |ed, _cx| {
+        tab.payload.editor.update(cx, |ed, _cx| {
             // O(1) 装配：行宽统计在后台算好（快速挂载时为占位，finish 再补真值），
             // 不再 UI 线程 recompute_max_line（≈350ms）。
             // 大文档首块（defer_preview=true）：延后折叠/括号扫描到下一帧后台，
@@ -479,26 +479,26 @@ impl EditorApp {
             ed.set_language(Some(lang));
         });
         // 编辑器即刻挂载（大文档不再是「预览优先」：内容瞬时可见优先于预览/滚动条精度）。
-        tab.editor_pending = false;
+        tab.payload.editor_pending = false;
         // P4-2：MD 预览统一走 WyEditor（`ensure_md_wy` 下方喂源）——不再为
         // MarkdownPreview 喂源（该后端已删除，M5-B5 P4-2）。txt 无预览，不建。
-        tab.file_path = Some(p.to_path_buf());
+        tab.payload.file_path = Some(p.to_path_buf());
         // 普通文本/Markdown 选项卡：正文以编辑器 Rope 为准，不再整份镜像到
         // `content`（省一份全文副本，6MB 文件即省 6MB/卡）。EPUB/PDF 这类
         // `readonly_preview`（编辑区为空）才把正文存进 content。
-        tab.content = SharedString::default();
-        tab.line_count = lines;
-        tab.char_count = chars;
-        tab.cursor_row = 0;
-        tab.cursor_col = 0;
-        tab.dirty = false;
+        tab.payload.content = SharedString::default();
+        tab.payload.line_count = lines;
+        tab.payload.char_count = chars;
+        tab.payload.cursor_row = 0;
+        tab.payload.cursor_col = 0;
+        tab.payload.dirty = false;
         // 运行时内存诊断：`MD_MEM_DEBUG=1 cargo run` 打开文件时输出各份文本副本
         // （定位"同样内容，.md 比 .txt 内存高"到底高在哪；预览解析驻留收进统一组件，
         // 用其内部 Doc 尺寸近似，不再单独读 MarkdownPreview——后端已删）。
         if std::env::var_os("MD_MEM_DEBUG").is_some() {
-            let content_len = tab.content.len();
-            let editor_len = tab.editor.read(cx).value().len();
-            let wy_len = tab
+            let content_len = tab.payload.content.len();
+            let editor_len = tab.payload.editor.read(cx).value().len();
+            let wy_len = tab.payload
                 .md_wy
                 .as_ref()
                 .map(|w| w.read(cx).len())
@@ -515,7 +515,7 @@ impl EditorApp {
             );
         }
         if is_md {
-            tab.preview_on = true;
+            tab.payload.preview_on = true;
         }
         drop(model);
         self.model.borrow_mut().status = SharedString::from(if is_md && lines > EDITOR_WRAP_MAX_LINES {
@@ -585,7 +585,7 @@ impl EditorApp {
                 .get(idx)
                 .is_some_and(|t| {
                     matches!(
-                        t.md_wy_install.early,
+                        t.payload.md_wy_install.early,
                         Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Done)
                     )
                 });
@@ -596,13 +596,13 @@ impl EditorApp {
         let Some(tab) = model.tabs.get_mut(idx) else {
             return;
         };
-        if tab.file_path.as_deref() != Some(p) {
+        if tab.payload.file_path.as_deref() != Some(p) {
             return; // 选项卡已被换成其它文件
         }
         self.open_finish_count += 1; // 大文档两段式打开：慢段（整篇换装 + 预览索引补齐）
-        if resume_version.is_some_and(|v| tab.edit_version != v) {
+        if resume_version.is_some_and(|v| tab.payload.edit_version != v) {
             // 打开后已编辑（输入锁下本不应发生，防御）：不换装，保留用户编辑，解锁。
-            tab.loading_lock = false;
+            tab.payload.loading_lock = false;
             return;
         }
         let mut swapped = false;
@@ -617,8 +617,8 @@ impl EditorApp {
             // P4：用 `set_rope_with_stats_keep_highlight` 保留 Buffer id + 高亮缓存——
             // 换装后顶部窗口与挂载首块逐位相同，`tail_append` A0 门控跨版本复用缓存，
             // 大 `.rs` 整窗重解析（debug ~620ms）不再发生（「打开 .rs 会卡一下」根因）。
-            let tail_row = tab.editor.read(cx).line_count(); // 挂载首块行数 = 新内容起点
-            tab.editor.update(cx, |ed, _| {
+            let tail_row = tab.payload.editor.read(cx).line_count(); // 挂载首块行数 = 新内容起点
+            tab.payload.editor.update(cx, |ed, _| {
                 ed.set_rope_with_stats_keep_highlight(
                     full,
                     max_line_chars,
@@ -626,24 +626,24 @@ impl EditorApp {
                     tail_row,
                 );
             });
-            tab.line_count = tab.editor.read(cx).display_line_count();
-            tab.char_count = tab.editor.read(cx).char_count();
+            tab.payload.line_count = tab.payload.editor.read(cx).display_line_count();
+            tab.payload.char_count = tab.payload.editor.read(cx).char_count();
             swapped = true;
         } else {
             // 无整篇（异常兜底）：统计就位（内容已是首块）。
-            tab.editor.update(cx, |ed, _| {
+            tab.payload.editor.update(cx, |ed, _| {
                 ed.apply_stats(max_line_chars, line_width_histogram);
             });
         }
-        tab.loading_lock = false; // 整篇就绪：解锁编辑；同帧 status 由消费者置「已打开」。
+        tab.payload.loading_lock = false; // 整篇就绪：解锁编辑；同帧 status 由消费者置「已打开」。
         // 诊断：EOF 整篇换装前后编辑区视口顶（验证「换装清回顶部」机制 + 修复后回位）。
         if swapped {
             shell_core::rp_diag::diag(
                 "finish_swap",
                 &format!(
                     "after_viewport_top={} line_count={}",
-                    tab.editor.read(cx).viewport_top_line(),
-                    tab.line_count,
+                    tab.payload.editor.read(cx).viewport_top_line(),
+                    tab.payload.line_count,
                 ),
             );
         }
@@ -653,20 +653,20 @@ impl EditorApp {
         // Step2：早期解析在途/已装（early_live）→ 本次 EOF **跳过重复 install**
         //（`md_wy_open` 已按早装让位传 None；早期完成后自会 install）。
         if Self::is_markdown_path(p)
-            && tab.preview_on
+            && tab.payload.preview_on
             && !early_live
-            && let Some(ed) = tab.md_wy.clone()
+            && let Some(ed) = tab.payload.md_wy.clone()
             && let Some(wy) = md_wy_open {
                 ed.update(cx, |ed, _| ed.install_open(wy));
                 // Step3：EOF 兜底整篇装配落地 → 整篇已装，解除「整篇在途」标记。
-                tab.md_wy_install.pending_full = None;
+                tab.payload.md_wy_install.pending_full = None;
             }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             // 诊断“拖到底不到底”：量程就绪后的纵向总高。编辑器精确时应 ≈ 行数×行高；
             // 统一 WyEditor 预览也用确定性量程（`MarkdownPreview` 抽样模型已删，M5-B5
             // P4-2）。值远小于预期 → 对应栏量程坍缩。
-            let editor_total = tab.editor.read(cx).vertical_total_px();
-            let wy_total = tab
+            let editor_total = tab.payload.editor.read(cx).vertical_total_px();
+            let wy_total = tab.payload
                 .md_wy
                 .as_ref()
                 .map(|w| {
@@ -677,7 +677,7 @@ impl EditorApp {
                 .unwrap_or(0.);
             eprintln!(
                 "[MD_SCROLL] finish 后纵向 total——编辑器={editor_total:.0}px ({} 行), WyEditor={wy_total:.0}px",
-                tab.line_count,
+                tab.payload.line_count,
             );
         }
         cx.notify();
@@ -768,10 +768,10 @@ impl EditorApp {
                             progress_gate += 1;
                             let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
                                 if let Some(tab) = this.model.borrow_mut().tabs.get_mut(idx).filter(|t| {
-                                    t.file_path.as_deref() == Some(p_prg.as_path())
+                                    t.payload.file_path.as_deref() == Some(p_prg.as_path())
                                 }) {
-                                    tab.line_count = lines;
-                                    tab.char_count = chars;
+                                    tab.payload.line_count = lines;
+                                    tab.payload.char_count = chars;
                                 }
                                 if do_notify {
                                     cx.notify();
@@ -871,7 +871,7 @@ impl EditorApp {
                         .update_window_entity(&entity, |this, _w, _cx| {
                             this.model.borrow().tabs.get(idx).is_some_and(|t| {
                                 matches!(
-                                    t.md_wy_install.early,
+                                    t.payload.md_wy_install.early,
                                     Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Done)
                                 )
                             })
@@ -908,9 +908,9 @@ impl EditorApp {
                 let _ = cx.update_window_entity(&entity, move |this, window, cx| {
                     // 源编码写回选项卡（保存 `write_to_path` 按此编码回写）。
                     if let Some(tab) = this.model.borrow_mut().tabs.get_mut(idx).filter(|t| {
-                        t.file_path.as_deref() == Some(p_fin.as_path())
+                        t.payload.file_path.as_deref() == Some(p_fin.as_path())
                     }) {
-                        tab.source_encoding = src_enc;
+                        tab.payload.source_encoding = src_enc;
                     }
                     this.finish_file_text(
                         idx,
@@ -939,8 +939,8 @@ impl EditorApp {
                         let m = this.model.borrow();
                         m.tabs
                             .get(idx)
-                            .filter(|t| t.file_path.as_deref() == Some(p_fin.as_path()))
-                            .map(|t| t.line_count)
+                            .filter(|t| t.payload.file_path.as_deref() == Some(p_fin.as_path()))
+                            .map(|t| t.payload.line_count)
                     };
                     if let Some(line_count) = opened_line_count {
                         let mut m = this.model.borrow_mut();
@@ -957,8 +957,8 @@ impl EditorApp {
                     // 折叠候选 / 括号标尺：整篇换装后**后台**重扫一次（打开全程不再每块
                     // 整篇重扫 → 打开 160k 行文档从 ~2s UI 卡顿降到毫秒级装配）。
                     let mut model = this.model.borrow_mut();
-                    if let Some(tab) = model.tabs.get_mut(idx).filter(|t| t.file_path.as_deref() == Some(p_fin.as_path())) {
-                        tab.editor.update(cx, |ed, cx| {
+                    if let Some(tab) = model.tabs.get_mut(idx).filter(|t| t.payload.file_path.as_deref() == Some(p_fin.as_path())) {
+                        tab.payload.editor.update(cx, |ed, cx| {
                             ed.refresh_fold_brackets(cx);
                         });
                     }
@@ -1016,7 +1016,7 @@ impl EditorApp {
             // 后台 `open_from_rope` + install，首屏立刻真内容），再整篇续读/续解析；整篇
             // 就绪后带守卫换入全文。EOF 收尾（`finish_file_text`）据此跳过重复 install。
             if Self::is_markdown_path(p) {
-                let prefix = self.model.borrow().tabs[idx].editor.read(cx).rope().clone();
+                let prefix = self.model.borrow().tabs[idx].payload.editor.read(cx).rope().clone();
                 let full_seq = self.md_wy_spawn_early_install(idx, p.to_path_buf(), cx);
                 self.md_wy_spawn_prefix_install(idx, prefix, full_seq, cx);
             }
@@ -1026,8 +1026,8 @@ impl EditorApp {
             let mounted = {
                 let mut model = self.model.borrow_mut();
                 model.tabs.get_mut(idx).map(|tab| {
-                    tab.loading_lock = true;
-                    ChunkApply::Mounted(tab.edit_version)
+                    tab.payload.loading_lock = true;
+                    ChunkApply::Mounted(tab.payload.edit_version)
                 })
             };
             return match mounted {
@@ -1046,7 +1046,7 @@ impl EditorApp {
         let Some(tab) = model.tabs.get_mut(idx) else {
             return ChunkApply::Stale;
         };
-        if tab.file_path.as_deref() != Some(p) {
+        if tab.payload.file_path.as_deref() != Some(p) {
             return ChunkApply::Stale; // 该下标已被换成其它文件
         }
         // P1 防御：不应再有后续块；有则忽略（整篇在后台，EOF 一次换装）。
@@ -1081,9 +1081,9 @@ impl EditorApp {
             return;
         };
         // P4-1：EPUB 内存图随选项卡持有（供 WyEditor 只读宿主注入；随选项卡搬迁）。
-        tab.epub_images = doc.images.clone();
+        tab.payload.epub_images = doc.images.clone();
         // P4-2：EPUB 注记正文表随选项卡持有（`ensure_epub_wy` → `WyEditor::set_notes`）。
-        tab.epub_notes = doc.notes.clone();
+        tab.payload.epub_notes = doc.notes.clone();
         drop(model);
         // 阅读进度恢复：EPUB 直接 `md_wy.set_scroll_target`（WY 自钉循环，无需 window）。
         self.apply_reading_progress(idx, _window, cx);
@@ -1138,7 +1138,7 @@ impl EditorApp {
             {
                 let mut model = self.model.borrow_mut();
                 let tab = model.tabs.get_mut(idx).expect("PDF 选项卡应已在场");
-                tab.reader = MediaReader::Pdf(viewer);
+                tab.payload.reader = MediaReader::Pdf(viewer);
             }
             // 阅读进度恢复：把恢复锚写入 viewer（`apply_loaded` 装配后按恢复档 zoom 消费）。
             self.apply_reading_progress(idx, _window, cx);
@@ -1152,7 +1152,7 @@ impl EditorApp {
                     // ImageViewer：自包含图片查看器（后台解码 + 同文件夹切换 + Ctrl+滚轮缩放）
                     let viewer = cx.new(|cx| image_viewer::ImageViewer::new(p.to_path_buf(), cx));
                     viewer.update(cx, |view, _| view.set_background(canvas_bg));
-                    tab.reader = MediaReader::Image(viewer);
+                    tab.payload.reader = MediaReader::Image(viewer);
                 }
                 #[cfg(feature = "video")]
                 MediaKind::Video => {
@@ -1162,7 +1162,7 @@ impl EditorApp {
                     // 焦点落到查看器：Space/←/→/滚轮等控制键直达（按键监听挂在查看器焦点句柄上）
                     let fh = viewer.read(cx).focus_handle();
                     _window.focus(&fh, cx);
-                    tab.reader = MediaReader::Video(viewer);
+                    tab.payload.reader = MediaReader::Video(viewer);
                 }
                 _ => unreachable!(),
             }
@@ -1197,21 +1197,21 @@ impl EditorApp {
             return false;
         };
         // 编辑区置为提示文本（只读阅读，不参与文本编辑）
-        tab.editor.update(cx, |ed, _cx| {
+        tab.payload.editor.update(cx, |ed, _cx| {
             ed.set_text("");
             ed.set_language(Some("markdown"));
         });
-        tab.file_path = Some(p.to_path_buf());
-        tab.content = content;
-        tab.line_count = line_count;
-        tab.char_count = char_count;
-        tab.cursor_row = 0;
-        tab.cursor_col = 0;
-        tab.dirty = false;
-        tab.preview_on = true;
-        tab.preview_fullscreen = true;
+        tab.payload.file_path = Some(p.to_path_buf());
+        tab.payload.content = content;
+        tab.payload.line_count = line_count;
+        tab.payload.char_count = char_count;
+        tab.payload.cursor_row = 0;
+        tab.payload.cursor_col = 0;
+        tab.payload.dirty = false;
+        tab.payload.preview_on = true;
+        tab.payload.preview_fullscreen = true;
         // 正文只存在于查看器/预览，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
-        tab.readonly_preview = true;
+        tab.payload.readonly_preview = true;
         drop(model);
         // 媒体/EPUB 文件路径就位（make_tab 时机为未命名）→ 立即持久化记成 File 型。
         self.schedule_session_flush(cx, true);
@@ -1245,7 +1245,7 @@ impl EditorApp {
         let idx = self
             .model.borrow().tabs
             .iter()
-            .position(|t| t.file_path.as_deref() == Some(path));
+            .position(|t| t.payload.file_path.as_deref() == Some(path));
         if let Some(idx) = idx {
             self.activate_tab(idx, window, cx);
         } else {
@@ -1372,7 +1372,7 @@ impl EditorApp {
         // 源编码写回选项卡（保存 `write_to_path` 按此编码回写；None=纯 UTF-8）。
         let mut model = self.model.borrow_mut();
         if let Some(tab) = model.tabs.get_mut(idx) {
-            tab.source_encoding = src_enc;
+            tab.payload.source_encoding = src_enc;
         }
         drop(model);
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
@@ -1514,14 +1514,14 @@ impl EditorApp {
     ) -> bool {
         // 按源编码把缓冲 UTF-8 转回字节写盘（None=纯 UTF-8 现状；GBK/UTF-16 等原编码
         // 回写，含 BOM 还原——文档编码随文档走，「另存为」沿用同一 source_encoding）。
-        let enc = self.model.borrow().tabs.get(idx).and_then(|t| t.source_encoding);
+        let enc = self.model.borrow().tabs.get(idx).and_then(|t| t.payload.source_encoding);
         let bytes = text_open::encode_for_save(&text, enc);
         match fs::write(path, bytes) {
             Ok(()) => {
                 let mut model = self.model.borrow_mut();
                 if let Some(tab) = model.tabs.get_mut(idx) {
-                    tab.file_path = Some(path.to_path_buf());
-                    tab.dirty = false;
+                    tab.payload.file_path = Some(path.to_path_buf());
+                    tab.payload.dirty = false;
                 }
                 drop(model);
                 self.model.borrow_mut().status = SharedString::from(format!("已保存：{}", path.display()));
@@ -1548,7 +1548,7 @@ impl EditorApp {
         // PDF 选项卡（待保存模型）：**绝不允许**走文本 `write_to_path`（编辑区为空，
         // 那会把 PDF 整文件覆写成空文本）。改为触发 `PdfViewer::save`（待存注释合并 +
         // 内存工作副本原子写盘）；无待存 → 视为已保存。
-        if let MediaReader::Pdf(pdf) = &tab.reader {
+        if let MediaReader::Pdf(pdf) = &tab.payload.reader {
             let dirty = pdf.read(cx).is_dirty();
             if !dirty {
                 drop(model);
@@ -1561,7 +1561,7 @@ impl EditorApp {
             // （异步完成时刻不再收口 status，避免留下过期的「正在保存…」文案）。
             return pdf.update(cx, |v, cx| v.save(cx));
         }
-        let Some(p) = tab.file_path.clone() else {
+        let Some(p) = tab.payload.file_path.clone() else {
             drop(model);
             return self.save_tab_as(idx, window, cx);
         };
@@ -1586,7 +1586,7 @@ impl EditorApp {
         let pdf: Option<gpui::Entity<pdf::PdfViewer>> = self
             .model.borrow().tabs
             .get(idx)
-            .and_then(|t| match &t.reader {
+            .and_then(|t| match &t.payload.reader {
                 MediaReader::Pdf(p) => Some(p.clone()),
                 _ => None,
             });
@@ -1700,7 +1700,7 @@ impl EditorApp {
                 return;
             }
         }
-        tab.editor.update(cx, |editor, cx| {
+        tab.payload.editor.update(cx, |editor, cx| {
             editor.paste_text(&text, cx);
         });
     }

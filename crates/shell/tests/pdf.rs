@@ -35,12 +35,12 @@ use config::user::PdfBgPref;
         let (preview_on, content, tabs, status_ok, fullscreen, wrap) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].preview_on,
-                a.model.borrow().tabs[a.model.borrow().active_tab].content.to_string(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.preview_on,
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.content.to_string(),
                 a.model.borrow().tabs.len(),
                 a.model.borrow().status_ok,
-                a.model.borrow().tabs[a.model.borrow().active_tab].preview_fullscreen,
-                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.preview_fullscreen,
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.is_some(),
             )
         });
         assert!(status_ok, "打开 EPUB 应成功");
@@ -69,9 +69,9 @@ use config::user::PdfBgPref;
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
-                t.preview_on,
-                t.preview_fullscreen,
-                t.content.contains("共产党宣言"),
+                t.payload.preview_on,
+                t.payload.preview_fullscreen,
+                t.payload.content.contains("共产党宣言"),
             )
         });
         assert!(
@@ -132,9 +132,9 @@ use config::user::PdfBgPref;
                     a.model.borrow().tabs.len(),
                     a.model.borrow().status.to_string(),
                     a.model.borrow().status_ok,
-                    t.preview_fullscreen,
-                    t.readonly_preview,
-                    t.content.is_empty(),
+                    t.payload.preview_fullscreen,
+                    t.payload.readonly_preview,
+                    t.payload.content.is_empty(),
                 )
             });
         assert!(status_ok, "打开 PDF 应成功，状态={status:?}");
@@ -331,7 +331,7 @@ use config::user::PdfBgPref;
                 let a = app.read(cx);
                 let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
                 // P4-2：统一 WyEditor 只读宿主（`MarkdownPreview` 已删）。
-                t.md_wy
+                t.payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).toc_entries().last().map(|(l, _, _)| *l))
             });
@@ -343,7 +343,7 @@ use config::user::PdfBgPref;
                     let wy = {
                         let a = app.read(cx);
                         let model = a.model.borrow();
-                        model.tabs[model.active_tab].md_wy.clone().expect("统一宿主在场")
+                        model.tabs[model.active_tab].payload.md_wy.clone().expect("统一宿主在场")
                     };
                     wy.update(cx, |v, _| v.set_scroll_target(line));
                 });
@@ -389,7 +389,7 @@ use config::user::PdfBgPref;
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             // P4-2：预览统一 WyEditor 恒换行（`MarkdownPreview::is_wrap` 已删）。
-            (t.preview_fullscreen, t.md_wy.is_some())
+            (t.payload.preview_fullscreen, t.payload.md_wy.is_some())
         });
         assert!(fs0, "初始应是全屏");
         assert!(wrap0, "初始应换行");
@@ -414,7 +414,7 @@ use config::user::PdfBgPref;
         let (fs1, wrap1) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-            (t.preview_fullscreen, t.md_wy.is_some())
+            (t.payload.preview_fullscreen, t.payload.md_wy.is_some())
         });
         assert!(!fs1, "切换后应退出全屏");
         assert!(wrap1, "退出全屏后预览应保持换行（预览始终自动换行）");
@@ -429,7 +429,7 @@ use config::user::PdfBgPref;
         let (wrap2, pref2) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.is_some(),
                 a.model.borrow().wrap_enabled,
             )
         });
@@ -446,7 +446,7 @@ use config::user::PdfBgPref;
         let (wrap3, pref3) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.is_some(),
                 a.model.borrow().wrap_enabled,
             )
         });
@@ -527,17 +527,17 @@ use config::user::PdfBgPref;
                 let a = app.read(cx);
                 let t = &a.model.borrow().tabs[idx];
                 (
-                    t.preview_on,
-                    t.preview_fullscreen,
-                    t.readonly_preview,
-                    t.dirty,
-                    t.cursor_row,
-                    t.cursor_col,
-                    t.content.is_empty(),
-                    t.line_count,
-                    t.char_count,
-                    t.editor.read(cx).value().is_empty(),
-                    t.file_path.clone().expect("装配后应有文件路径"),
+                    t.payload.preview_on,
+                    t.payload.preview_fullscreen,
+                    t.payload.readonly_preview,
+                    t.payload.dirty,
+                    t.payload.cursor_row,
+                    t.payload.cursor_col,
+                    t.payload.content.is_empty(),
+                    t.payload.line_count,
+                    t.payload.char_count,
+                    t.payload.editor.read(cx).value().is_empty(),
+                    t.payload.file_path.clone().expect("装配后应有文件路径"),
                 )
             })
         };
@@ -555,7 +555,7 @@ use config::user::PdfBgPref;
         );
         assert_eq!(c.10, pdf_p, "PDF 应装配文件路径");
         assert!(
-            cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_pdf].reader, MediaReader::Pdf(_))),
+            cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_pdf].payload.reader, MediaReader::Pdf(_))),
             "PDF 应挂 Pdf 阅读器"
         );
 
@@ -569,7 +569,7 @@ use config::user::PdfBgPref;
         );
         assert_eq!(c.10, img_p, "图片应装配文件路径");
         assert!(
-            cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_img].reader, MediaReader::Image(_))),
+            cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_img].payload.reader, MediaReader::Image(_))),
             "图片应挂 Image 查看器"
         );
 
@@ -585,7 +585,7 @@ use config::user::PdfBgPref;
             );
             assert_eq!(c.10, vid_p, "视频应装配文件路径");
             assert!(
-                cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_vid].reader, MediaReader::Video(_))),
+                cx.update(|_w, cx| matches!(&app.read(cx).model.borrow().tabs[i_vid].payload.reader, MediaReader::Video(_))),
                 "视频应挂 Video 查看器"
             );
         }
@@ -608,7 +608,7 @@ use config::user::PdfBgPref;
         assert!(c.7 > 0 && c.8 > 0, "EPUB 应有真实行/字计数（实际 {}/{}）", c.7, c.8);
         let (epub_status_ok, epub_reader_none) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.model.borrow().status_ok, matches!(&a.model.borrow().tabs[i_epub].reader, MediaReader::None))
+            (a.model.borrow().status_ok, matches!(&a.model.borrow().tabs[i_epub].payload.reader, MediaReader::None))
         });
         assert!(epub_status_ok, "EPUB 打开状态应成功");
         assert!(epub_reader_none, "EPUB 不挂媒体阅读器（纯 WyEditor 宿主）");
@@ -652,7 +652,7 @@ use config::user::PdfBgPref;
         let reader_bg = |cx: &mut VisualTestContext, idx: usize| -> Option<gpui::Hsla> {
             cx.update(|_w, cx| {
                 let a = app.read(cx);
-                match &a.model.borrow().tabs[idx].reader {
+                match &a.model.borrow().tabs[idx].payload.reader {
                     MediaReader::Pdf(p) => p.read(cx).background(),
                     MediaReader::Image(i) => i.read(cx).background(),
                     #[cfg(feature = "video")]
@@ -975,7 +975,7 @@ use config::user::PdfBgPref;
             app.read(cx)
                 .model.borrow().tabs
                 .iter()
-                .any(|t| matches!(&t.reader, MediaReader::Pdf(p) if p.entity_id() == first_pdf_entity_id))
+                .any(|t| matches!(&t.payload.reader, MediaReader::Pdf(p) if p.entity_id() == first_pdf_entity_id))
         });
         assert!(still_first, "换位后第一个 PDF 阅读器实体应仍存在（未错位/未泄漏）");
     }
@@ -1535,7 +1535,7 @@ async fn c1_pending_annot_ctrlz_undo_and_tab_dirty(cx: &mut TestAppContext) {
     assert_eq!(std::fs::read(&p).expect("重读磁盘"), disk0, "注释只进内存：磁盘不变");
     // tab.dirty 经 observe 同步置真（工具栏圆点）
     assert!(
-        pump_until(cx, |cx| cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].dirty)),
+        pump_until(cx, |cx| cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.dirty)),
         "加注释后 tab.dirty 应置真（observe 同步）"
     );
 
@@ -1557,7 +1557,7 @@ async fn c1_pending_annot_ctrlz_undo_and_tab_dirty(cx: &mut TestAppContext) {
         "Ctrl+Z 应撤销该条待存注释并清脏"
     );
     assert!(
-        pump_until(cx, |cx| cx.update(|_w, cx| !app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].dirty)),
+        pump_until(cx, |cx| cx.update(|_w, cx| !app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.dirty)),
         "撤销后 tab.dirty 应回落"
     );
     assert_eq!(std::fs::read(&p).expect("重读磁盘"), disk0, "撤销全程磁盘不变（未保存）");
@@ -1684,7 +1684,7 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
             app.read(cx)
                 .model.borrow().tabs
                 .iter()
-                .position(|t| matches!(&t.reader, MediaReader::Pdf(_)))
+                .position(|t| matches!(&t.payload.reader, MediaReader::Pdf(_)))
                 .expect("应有 PDF 选项卡")
         })
     };
@@ -1704,9 +1704,9 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
         let idx = app_ref
             .model.borrow().tabs
             .iter()
-            .position(|t| matches!(&t.reader, MediaReader::Pdf(_)))
+            .position(|t| matches!(&t.payload.reader, MediaReader::Pdf(_)))
             .expect("应有 PDF 选项卡");
-        (app_ref.model.borrow().tabs.len(), app_ref.model.borrow().tabs[idx].dirty)
+        (app_ref.model.borrow().tabs.len(), app_ref.model.borrow().tabs[idx].payload.dirty)
     });
     assert!(n_tabs == 2 && pdf_dirty, "取消后选项卡应保留且 dirty 仍在");
 
@@ -1726,7 +1726,7 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
         cx.run_until_parked();
         std::thread::sleep(std::time::Duration::from_millis(8));
         closed = cx.update(|_w, cx| {
-            !app.read(cx).model.borrow().tabs.iter().any(|t| matches!(&t.reader, MediaReader::Pdf(_)))
+            !app.read(cx).model.borrow().tabs.iter().any(|t| matches!(&t.payload.reader, MediaReader::Pdf(_)))
         });
         if closed {
             break;
@@ -1752,7 +1752,7 @@ async fn c3_pdf_dirty_close_prompt_save_and_discard(cx: &mut TestAppContext) {
     cx.simulate_prompt_answer("不保存");
     let closed2 = pump_until(cx, |cx| {
         cx.update(|_w, cx| {
-            !app.read(cx).model.borrow().tabs.iter().any(|t| matches!(&t.reader, MediaReader::Pdf(_)))
+            !app.read(cx).model.borrow().tabs.iter().any(|t| matches!(&t.payload.reader, MediaReader::Pdf(_)))
         })
     });
     assert!(closed2, "「不保存」应直接关闭");
@@ -1806,9 +1806,9 @@ async fn d1_save_as_updates_tab_path_and_writes_annots(cx: &mut TestAppContext) 
                     .read(cx)
                     .model.borrow().tabs
                     .iter()
-                    .position(|t| matches!(&t.reader, MediaReader::Pdf(_)))
+                    .position(|t| matches!(&t.payload.reader, MediaReader::Pdf(_)))
                     .unwrap();
-                app.read(cx).model.borrow().tabs[idx].file_path.as_deref() == Some(out.as_path())
+                app.read(cx).model.borrow().tabs[idx].payload.file_path.as_deref() == Some(out.as_path())
             })
         }),
         "另存为后选项卡 file_path 应同步为新路径（tab 标题不再显示旧名）"

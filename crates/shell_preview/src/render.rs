@@ -29,13 +29,13 @@ use crate::PreviewHost;
 ///（整页原样），其余（MD / EPUB）用统一 WyEditor 只读宿主（M5-B5 P4-2：
 /// `MarkdownPreview` 已删）。预览未创建 → 空元素兜底。
 pub fn preview_element(tab: &EditorTab) -> gpui::AnyElement {
-    match &tab.reader {
+    match &tab.payload.reader {
         MediaReader::Image(img) => img.clone().into_any_element(),
         #[cfg(feature = "video")]
         MediaReader::Video(vid) => vid.clone().into_any_element(),
         MediaReader::Pdf(pdf) => pdf.clone().into_any_element(),
         MediaReader::None => tab
-            .md_wy
+            .payload.md_wy
             .clone()
             .map(|w| w.into_any_element())
             .unwrap_or_else(|| gpui::div().into_any_element()),
@@ -246,7 +246,7 @@ pub fn md_wy_host_children<H: PreviewHost>(
         return md_wy_pending_placeholder(fullscreen, grow, panel_bg, text_minor);
     }
     let active = model.borrow().active_tab;
-    let vhand = model.borrow().tabs[active].md_wy_vscroll.clone();
+    let vhand = model.borrow().tabs[active].payload.md_wy_vscroll.clone();
     drive_wy_host(model, &ed, &vhand, window, cx);
     let fs = model.borrow().font_size;
     let any = ed.clone().into_any_element();

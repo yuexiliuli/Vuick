@@ -30,7 +30,7 @@
             let a = app.read(cx);
             (
                 a.model.borrow().tabs.len(),
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(tabs, 3, "拖入 2 个文件后应比初始多 2 个选项卡，实际={tabs}");
@@ -109,7 +109,7 @@
                 if a.model.borrow().tabs.is_empty() {
                     None
                 } else {
-                    Some(a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string())
+                    Some(a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx).value().to_string())
                 },
             )
         });
@@ -150,8 +150,8 @@
         let (preview_on, content_lines, tabs) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].preview_on,
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().to_string().lines().count(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.preview_on,
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx).value().to_string().lines().count(),
                 a.model.borrow().tabs.len(),
             )
         });
@@ -198,7 +198,7 @@
             cx.update(|_w, cx| {
                 let a = app.read(cx);
                 a.model.borrow().tabs[a.model.borrow().active_tab]
-                    .md_wy
+                    .payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).text().to_string())
                     .unwrap_or_default()
@@ -221,11 +221,11 @@
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
-                t.md_wy
+                t.payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).text().to_string())
                     .unwrap_or_default(),
-                t.editor.read(cx).value().to_string(),
+                t.payload.editor.read(cx).value().to_string(),
             )
         });
         assert!(
@@ -270,11 +270,11 @@
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
-                t.md_wy
+                t.payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).text().to_string())
                     .unwrap_or_default(),
-                t.editor.read(cx).value().to_string(),
+                t.payload.editor.read(cx).value().to_string(),
             )
         });
         assert!(
@@ -294,10 +294,10 @@
             let (lc, cc, expected_lc, expected_cc) = cx.update(|_w, cx| {
                 let a = app.read(cx);
                 let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
-                let val = t.editor.read(cx).value();
+                let val = t.payload.editor.read(cx).value();
                 (
-                    t.line_count,
-                    t.char_count,
+                    t.payload.line_count,
+                    t.payload.char_count,
                     val.lines().count().max(1),
                     val.chars().count(),
                 )
@@ -435,7 +435,7 @@
         let long_text = "这是一个比较长的段落".repeat(60);
         cx.update(|_, cx| {
             let idx = app.read(cx).model.borrow().active_tab;
-            let ed = app.read(cx).model.borrow().tabs[idx].editor.clone();
+            let ed = app.read(cx).model.borrow().tabs[idx].payload.editor.clone();
             ed.update(cx, |ed, _| ed.set_text(&long_text));
         });
         for _ in 0..5 {
@@ -456,7 +456,7 @@
         let wrap = cx.update(|_w, cx| {
             let a = app.read(cx);
             // P4-2：预览统一 WyEditor 恒换行（`MarkdownPreview::is_wrap` 已删）。
-            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.is_some()
+            a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.is_some()
         });
         assert!(wrap, "编辑内容后首次打开预览应默认唤出统一换行预览宿主");
     }
@@ -498,7 +498,7 @@
         assert_eq!(
             cx.update(|_w, cx| {
                 app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
-                    .editor
+                    .payload.editor
                     .read(cx)
                     .value()
                     .to_string()
@@ -546,7 +546,7 @@
         });
         let empty_after_open = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx).value().is_empty()
+            a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx).value().is_empty()
         });
         assert!(empty_after_open, "大文件应异步打开：open_file 返回时编辑器应为空");
 
@@ -557,7 +557,7 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let tab = &a.model.borrow().tabs[a.model.borrow().active_tab];
-                !tab.editor_pending && tab.editor.read(cx).value() == content
+                !tab.payload.editor_pending && tab.payload.editor.read(cx).value() == content
             });
             if ready {
                 break;
@@ -619,9 +619,9 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let tab = &a.model.borrow().tabs[i];
-                !tab.editor_pending
-                    && tab.editor.read(cx).value() == content
-                    && tab.md_wy
+                !tab.payload.editor_pending
+                    && tab.payload.editor.read(cx).value() == content
+                    && tab.payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false)
@@ -640,7 +640,7 @@
             (
                 a.open_fast_count,
                 a.open_finish_count,
-                a.model.borrow().tabs[i].md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false),
+                a.model.borrow().tabs[i].payload.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false),
                 a.model.borrow().status_ok,
             )
         });
@@ -671,7 +671,7 @@
         let line_count = rope.lines_len();
         assert!(line_count > 4_096, "测试应远超固定窗口（512），实际 {line_count} 行");
 
-        let ed_ent = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.clone());
+        let ed_ent = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].payload.editor.clone());
         // 同步栈内断言两段式：mount 返回时只建了视口小列表（若非两段式，这里
         // item_count 直接等于全文行数）。
         cx.update(|_w, cx| {
@@ -774,9 +774,9 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let tab = &a.model.borrow().tabs[i];
-                let ed = tab.editor.read(cx);
+                let ed = tab.payload.editor.read(cx);
                 let outf_block = a.model.borrow().status_ok && ed.value() == content;
-                (ed.line_count(), tab.editor_pending, outf_block)
+                (ed.line_count(), tab.payload.editor_pending, outf_block)
             });
             if !pending && lc > 0 && lc < 60_000 {
                 saw_partial = true;
@@ -795,9 +795,9 @@
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             let tab = &a.model.borrow().tabs[i];
             (
-                tab.editor.read(cx).display_line_count(),
-                tab.editor_pending,
-                tab.editor.read(cx).value() == content,
+                tab.payload.editor.read(cx).display_line_count(),
+                tab.payload.editor_pending,
+                tab.payload.editor.read(cx).value() == content,
             )
         });
         assert!(!pending, "装配完成后 editor_pending 应复位");
@@ -855,9 +855,9 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                !a.model.borrow().tabs[i].editor_pending
-                    && !a.model.borrow().tabs[i].loading_lock
-                    && a.model.borrow().tabs[i].editor.read(cx).value() == content
+                !a.model.borrow().tabs[i].payload.editor_pending
+                    && !a.model.borrow().tabs[i].payload.loading_lock
+                    && a.model.borrow().tabs[i].payload.editor.read(cx).value() == content
                     && a.open_finish_count >= 1
             });
             if ready {
@@ -891,16 +891,16 @@
         );
         // 语义保真：最终内容字节级一致（整篇换装）已断言；行数对账。
         let lc = cx.update(|_, cx| {
-            app.read(cx).model.borrow().tabs.last().unwrap().editor.read(cx).display_line_count()
+            app.read(cx).model.borrow().tabs.last().unwrap().payload.editor.read(cx).display_line_count()
         });
         assert_eq!(lc, 60_000, "最终行数应为全文行数");
         let _ = std::fs::remove_file(&dir);
     }
 
     /// P2（状态栏「数字跳动」回归）：大文档打开期间状态栏行/字数应**随读随跳**——生产者
-    /// 每块推一次 `OpenMsg::Progress`，消费端 O(1) 更新 `tab.line_count`/`tab.char_count`
+    /// 每块推一次 `OpenMsg::Progress`，消费端 O(1) 更新 `tab.payload.line_count`/`tab.payload.char_count`
     /// 并 notify，而不是「挂载小计数 → 整篇换装瞬间跳到终值」。逐 tick 驱动协作式调度器，
-    /// 断言中间某时刻 `tab.char_count` 严格落在 `(0, 全文字符数)` 之间且单调不减（跳动
+    /// 断言中间某时刻 `tab.payload.char_count` 严格落在 `(0, 全文字符数)` 之间且单调不减（跳动
     /// 而非跳变），收尾后等于全文字符数、内容字节级一致。
     #[gpui::test]
     async fn progressive_open_ticks_status_counts(cx: &mut TestAppContext) {
@@ -952,7 +952,7 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let tab = &a.model.borrow().tabs[i];
-                (tab.char_count, tab.editor_pending, tab.loading_lock)
+                (tab.payload.char_count, tab.payload.editor_pending, tab.payload.loading_lock)
             });
             if cc < prev_char {
                 monotonic = false; // 计数回退 = 抖动/跳变，数字跳动不得回退
@@ -987,9 +987,9 @@
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             let tab = &a.model.borrow().tabs[i];
-            tab.char_count == full_chars
-                && tab.editor.read(cx).value() == content
-                && tab.editor.read(cx).display_line_count() == 60_000
+            tab.payload.char_count == full_chars
+                && tab.payload.editor.read(cx).value() == content
+                && tab.payload.editor.read(cx).display_line_count() == 60_000
         });
         assert!(final_ok, "P2 收尾后全文字符数/内容/行数应对账一致");
         let _ = std::fs::remove_file(&dir);
@@ -1037,11 +1037,11 @@
             let (lock, failed, mounted) = cx.update(|_w, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                let ed = a.model.borrow().tabs[i].editor.read(cx);
+                let ed = a.model.borrow().tabs[i].payload.editor.read(cx);
                 (
-                    a.model.borrow().tabs[i].loading_lock,
+                    a.model.borrow().tabs[i].payload.loading_lock,
                     !a.model.borrow().status_ok,
-                    ed.value().len() > 0 && !a.model.borrow().tabs[i].editor_pending,
+                    ed.value().len() > 0 && !a.model.borrow().tabs[i].payload.editor_pending,
                 )
             });
             if failed && mounted && !lock {
@@ -1056,7 +1056,7 @@
         let (content_len, pending) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            (a.model.borrow().tabs[i].editor.read(cx).value().len(), a.model.borrow().tabs[i].editor_pending)
+            (a.model.borrow().tabs[i].payload.editor.read(cx).value().len(), a.model.borrow().tabs[i].payload.editor_pending)
         });
         assert_eq!(pending, false, "中途失败后 editor 应可查看（pending 复位）");
         assert!(content_len > 0, "首块内容应保留：{content_len} 字节");
@@ -1108,9 +1108,9 @@
                 let t = &a.model.borrow().tabs[i];
                 // Step2：提前整篇解析可能先于编辑区收尾装好预览 → 就绪必须等**编辑区也
                 // 全文落定**（预览全文 = 编辑区全文的唯一判据在两者都完成之后成立）。
-                !t.editor_pending
-                    && t.editor.read(cx).value() == content
-                    && t.md_wy
+                !t.payload.editor_pending
+                    && t.payload.editor.read(cx).value() == content
+                    && t.payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false)
@@ -1128,8 +1128,8 @@
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             (
-                a.model.borrow().tabs[i].md_wy.as_ref().unwrap().read(cx).text().to_string(),
-                a.model.borrow().tabs[i].editor.read(cx).value().to_string(),
+                a.model.borrow().tabs[i].payload.md_wy.as_ref().unwrap().read(cx).text().to_string(),
+                a.model.borrow().tabs[i].payload.editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(wy_text, ed_text, "大 md WyEditor 预览应覆盖完整源（与编辑区一致）");
@@ -1180,10 +1180,10 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let t = &a.model.borrow().tabs[i];
-                !t.editor_pending
-                    && t.editor.read(cx).value() == content
+                !t.payload.editor_pending
+                    && t.payload.editor.read(cx).value() == content
                     && a.open_finish_count >= 1
-                    && t.md_wy
+                    && t.payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false)
@@ -1200,14 +1200,14 @@
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             (
-                a.model.borrow().tabs[i].md_wy_install.early,
+                a.model.borrow().tabs[i].payload.md_wy_install.early,
                 a.open_finish_count,
                 a.model.borrow().tabs[i]
-                    .md_wy
+                    .payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).text().to_string())
                     .unwrap_or_default(),
-                a.model.borrow().tabs[i].editor.read(cx).value().to_string(),
+                a.model.borrow().tabs[i].payload.editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(
@@ -1269,7 +1269,7 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let t = &a.model.borrow().tabs[i];
-                !t.editor_pending && t.editor.read(cx).value().len() > 0
+                !t.payload.editor_pending && t.payload.editor.read(cx).value().len() > 0
             });
             if first {
                 break;
@@ -1297,7 +1297,7 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 let t = &a.model.borrow().tabs[i];
-                a.open_finish_count >= 1 && t.editor.read(cx).value().len() >= content.len() + extra
+                a.open_finish_count >= 1 && t.payload.editor.read(cx).value().len() >= content.len() + extra
             });
             if done {
                 break;
@@ -1308,14 +1308,14 @@
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             (
-                a.model.borrow().tabs[i].md_wy_install.early,
+                a.model.borrow().tabs[i].payload.md_wy_install.early,
                 a.open_finish_count,
                 a.model.borrow().tabs[i]
-                    .md_wy
+                    .payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).text().to_string())
                     .unwrap_or_default(),
-                a.model.borrow().tabs[i].editor.read(cx).value().to_string(),
+                a.model.borrow().tabs[i].payload.editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(finish, 1, "EOF 收尾应仍执行 1 次");
@@ -1357,7 +1357,7 @@
         let rope = ropey::Rope::from(content.as_str());
         let line_count = rope.lines_len();
 
-        let ed_ent = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].editor.clone());
+        let ed_ent = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[0].payload.editor.clone());
         cx.update(|_w, cx| {
             ed_ent.update(cx, |ed, cx| {
                 ed.set_rope_with_stats(rope.clone(), 0, Default::default());
@@ -1444,7 +1444,7 @@
                 let ready = cx.update(|_, cx| {
                     let a = app.read(cx);
                     let i = a.model.borrow().tabs.len().saturating_sub(1);
-                    let ed = a.model.borrow().tabs[i].editor.read(cx);
+                    let ed = a.model.borrow().tabs[i].payload.editor.read(cx);
                     ed.line_count() > 1 && !ed.test_list_is_deferred()
                 });
                 if ready {
@@ -1458,7 +1458,7 @@
             cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                a.model.borrow().tabs[i].editor.clone()
+                a.model.borrow().tabs[i].payload.editor.clone()
             })
         };
         let (lh, pad, row_count, item_count, want_items) = cx.update(|_, cx| {
@@ -1556,7 +1556,7 @@
                 let (line_count, _item_count, deferred) = cx.update(|_, cx| {
                     let a = app.read(cx);
                     let i = a.model.borrow().tabs.len().saturating_sub(1);
-                    let ed = a.model.borrow().tabs[i].editor.read(cx);
+                    let ed = a.model.borrow().tabs[i].payload.editor.read(cx);
                     (
                         ed.line_count(),
                         ed.test_list_state().item_count(),
@@ -1585,7 +1585,7 @@
                 cx.update(|_, cx| {
                     let a = app.read(cx);
                     let i = a.model.borrow().tabs.len().saturating_sub(1);
-                    a.model.borrow().tabs[i].editor.read(cx).line_count()
+                    a.model.borrow().tabs[i].payload.editor.read(cx).line_count()
                 })
             );
         }
@@ -1680,7 +1680,7 @@
         let (lines, lh) = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            let ed = a.model.borrow().tabs[i].editor.read(cx);
+            let ed = a.model.borrow().tabs[i].payload.editor.read(cx);
             (ed.line_count(), ed.test_metrics().1)
         });
         // 量程 = 确定性像素模型（`list_max_offset` = 全文条目数 × 行高 − 视口），与
@@ -1689,7 +1689,7 @@
         let ed_ent = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            a.model.borrow().tabs[i].editor.clone()
+            a.model.borrow().tabs[i].payload.editor.clone()
         });
         cx.update(|_, cx| {
             ed_ent.update(cx, |_, cx| cx.notify());
@@ -1700,7 +1700,7 @@
         let (mo, vh) = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            let ed = a.model.borrow().tabs[i].editor.read(cx);
+            let ed = a.model.borrow().tabs[i].payload.editor.read(cx);
             (ed.list_max_offset(), ed.list_viewport_height())
         });
         let expected = (lines.saturating_sub(1)) as f32 * lh - vh;
@@ -1712,7 +1712,7 @@
         let top0 = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            (-a.model.borrow().tabs[i].md_wy_vscroll.offset().y).as_f32()
+            (-a.model.borrow().tabs[i].payload.md_wy_vscroll.offset().y).as_f32()
         });
         assert!(top0 >= -0.5, "预览初始应在顶部（top0={top0:.0}px）");
         // 编辑器「拖到底」：模拟 VerticalScrollHandle.start_drag 的重铺+冻结+拖底，
@@ -1720,7 +1720,7 @@
         let els = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            a.model.borrow().tabs[i].editor.read(cx).test_list_state()
+            a.model.borrow().tabs[i].payload.editor.read(cx).test_list_state()
         });
         els.reset_with_uniform_height(lines, gpui::px(lh));
         els.scrollbar_drag_started();
@@ -1732,7 +1732,7 @@
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             a.model.borrow().tabs[i]
-                .editor
+                .payload.editor
                 .read(cx)
                 .test_list_state()
                 .logical_scroll_top()
@@ -1748,9 +1748,9 @@
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             let t = &a.model.borrow().tabs[i];
-            let vh = &t.md_wy_vscroll;
+            let vh = &t.payload.md_wy_vscroll;
             (
-                t.md_wy
+                t.payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).is_loaded())
                     .unwrap_or(false),
@@ -1770,7 +1770,7 @@
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
             a.model.borrow().tabs[i]
-                .md_wy_vscroll
+                .payload.md_wy_vscroll
                 .set_offset(gpui::point(gpui::px(0.), gpui::px(-1_000_000.)));
         });
         cx.run_until_parked();
@@ -1779,7 +1779,7 @@
         let bottom_off = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            a.model.borrow().tabs[i].md_wy_vscroll.offset().y.as_f32()
+            a.model.borrow().tabs[i].payload.md_wy_vscroll.offset().y.as_f32()
         });
         assert!(
             bottom_off < -max_off * 0.9,
@@ -1813,8 +1813,8 @@
             let a = app.read(cx);
             let i = a.model.borrow().active_tab;
             (
-                a.model.borrow().tabs[i].editor.read(cx).value().to_string(),
-                a.model.borrow().tabs[i].source_encoding,
+                a.model.borrow().tabs[i].payload.editor.read(cx).value().to_string(),
+                a.model.borrow().tabs[i].payload.source_encoding,
                 a.model.borrow().status_ok,
             )
         });
@@ -1849,7 +1849,7 @@
         let idx = cx.update(|_w, cx| app.read(cx).model.borrow().active_tab);
         cx.update(|_w, cx| {
             app.update(cx, |app, cx| {
-                app.model.borrow().tabs[idx].editor.update(cx, |ed, _| ed.set_text(&edited));
+                app.model.borrow().tabs[idx].payload.editor.update(cx, |ed, _| ed.set_text(&edited));
             });
         });
         for _ in 0..3 {
@@ -1906,8 +1906,8 @@
                 let a = app.read(cx);
                 let i = a.model.borrow().active_tab;
                 (
-                    a.model.borrow().tabs[i].editor.read(cx).value().to_string(),
-                    a.model.borrow().tabs[i].source_encoding,
+                    a.model.borrow().tabs[i].payload.editor.read(cx).value().to_string(),
+                    a.model.borrow().tabs[i].payload.source_encoding,
                     a.model.borrow().status_ok,
                 )
             });
@@ -1954,10 +1954,10 @@
             let ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                !a.model.borrow().tabs[i].editor_pending
-                    && !a.model.borrow().tabs[i].loading_lock
-                    && a.model.borrow().tabs[i].source_encoding == None
-                    && a.model.borrow().tabs[i].editor.read(cx).value() == content
+                !a.model.borrow().tabs[i].payload.editor_pending
+                    && !a.model.borrow().tabs[i].payload.loading_lock
+                    && a.model.borrow().tabs[i].payload.source_encoding == None
+                    && a.model.borrow().tabs[i].payload.editor.read(cx).value() == content
             });
             if ready {
                 break;

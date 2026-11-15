@@ -48,7 +48,7 @@ impl AppHost for EditorApp {
             // 事件回调触发时动作方法的模型借用早已结束：经自身弱句柄再入宿主实体，
             // 执行与 `subscribe_editor` 一致的订阅体。
             let _ = weak.update(cx, |this, cx| {
-                let pos = this.model.borrow().tabs.iter().position(|t| t.editor == emitter);
+                let pos = this.model.borrow().tabs.iter().position(|t| t.payload.editor == emitter);
                 if let Some(t) = pos {
                     match ev {
                         editor::EditorEvent::Edited => this.on_editor_edited(t, cx),

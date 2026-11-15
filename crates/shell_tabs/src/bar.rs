@@ -597,17 +597,17 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 .tabs
                 .iter()
                 .map(|t| {
-                    let name = t
+                    let name = t.payload
                         .file_path
                         .as_ref()
                         .and_then(|p| p.file_name())
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "未命名".to_string());
-                    let path_hint = t
+                    let path_hint = t.payload
                         .file_path
                         .as_ref()
                         .map(|p| p.to_string_lossy().into_owned());
-                    (name, t.dirty, path_hint)
+                    (name, t.payload.dirty, path_hint)
                 })
                 .collect()
         };

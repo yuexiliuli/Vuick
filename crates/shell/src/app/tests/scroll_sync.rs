@@ -29,16 +29,16 @@
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.clone(),
                 a.model.borrow().tabs[a.model.borrow().active_tab]
-                    .md_wy
+                    .payload.md_wy
                     .clone()
                     .expect("MD 打开后 WyEditor 预览应在场"),
             )
         });
         let vhand = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy_vscroll.clone()
+            a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy_vscroll.clone()
         });
         let before = cx.update(|_w, _cx| (-vhand.offset().y).as_f32());
         assert_eq!(before, 0.0, "预览初始在顶部");
@@ -123,9 +123,9 @@
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.clone(),
                 a.model.borrow().tabs[a.model.borrow().active_tab]
-                    .md_wy
+                    .payload.md_wy
                     .clone()
                     .expect("MD 打开后 WyEditor 预览应在场"),
             )
@@ -155,7 +155,7 @@
         }
         let vhand = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy_vscroll.clone()
+            a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy_vscroll.clone()
         });
         let (editor_top, preview_src, s1) = cx.update(|_, cx| {
             let et = editor.read(cx).viewport_top_line();
@@ -263,8 +263,8 @@
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone(),
-                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().expect("预览应在场"),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.clone(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.clone().expect("预览应在场"),
             )
         });
         let overlay = cx
@@ -374,8 +374,8 @@
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone(),
-                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().expect("预览应在场"),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.clone(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.clone().expect("预览应在场"),
             )
         });
         let overlay = cx
@@ -477,13 +477,13 @@
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone(),
-                a.model.borrow().tabs[a.model.borrow().active_tab].md_wy.clone().expect("预览应在场"),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.clone(),
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy.clone().expect("预览应在场"),
             )
         });
         let vhand = cx.update(|_, cx| {
             let a = app.read(cx);
-            a.model.borrow().tabs[a.model.borrow().active_tab].md_wy_vscroll.clone()
+            a.model.borrow().tabs[a.model.borrow().active_tab].payload.md_wy_vscroll.clone()
         });
         let max = cx.update(|_w, _cx| vhand.max_offset().y.as_f32().max(100.0));
 
@@ -660,7 +660,7 @@
             .expect("编辑器纵向滚动条叠层应渲染");
         let (before_top, before_desired) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
+            let ed = a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx);
             (ed.test_text_scroll_top(), ed.test_desired_scroll_px())
         });
         assert_eq!(before_top, (0, 0.0), "初始应在顶部");
@@ -692,7 +692,7 @@
         }
         let mid = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let ed = a.model.borrow().tabs[a.model.borrow().active_tab].editor.read(cx);
+            let ed = a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.read(cx);
             (ed.test_text_scroll_top(), ed.test_desired_scroll_px())
         });
         assert!(

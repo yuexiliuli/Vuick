@@ -66,7 +66,7 @@ pub fn init_test(cx: &mut TestAppContext) {
 /// 测试辅助：取选项卡的 PDF 阅读器实体（`MediaReader` 收敛后经 `MediaReader::Pdf` 取）。
 /// （本批拆出的域尚未消费它，pdf/epub/media 域后拆；按共享夹具契约保留。）
 pub fn tab_pdf(tab: &EditorTab) -> Option<&gpui::Entity<pdf::PdfViewer>> {
-    match &tab.reader {
+    match &tab.payload.reader {
         MediaReader::Pdf(pv) => Some(pv),
         _ => None,
     }
@@ -74,7 +74,7 @@ pub fn tab_pdf(tab: &EditorTab) -> Option<&gpui::Entity<pdf::PdfViewer>> {
 
 /// 测试辅助：取选项卡的图片查看器实体（经 `MediaReader::Image` 取）。
 pub fn tab_image(tab: &EditorTab) -> Option<&gpui::Entity<image_viewer::ImageViewer>> {
-    match &tab.reader {
+    match &tab.payload.reader {
         MediaReader::Image(iv) => Some(iv),
         _ => None,
     }
@@ -83,7 +83,7 @@ pub fn tab_image(tab: &EditorTab) -> Option<&gpui::Entity<image_viewer::ImageVie
 /// 测试辅助：取选项卡的视频查看器实体（经 `MediaReader::Video` 取）。
 #[cfg(feature = "video")]
 pub fn tab_video(tab: &EditorTab) -> Option<&gpui::Entity<video::VideoViewer>> {
-    match &tab.reader {
+    match &tab.payload.reader {
         MediaReader::Video(vv) => Some(vv),
         _ => None,
     }

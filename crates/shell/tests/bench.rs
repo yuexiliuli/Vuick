@@ -55,13 +55,12 @@ use shell::app::EditorAppRegistry;
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
-                    a.model.borrow().tabs[i]
-                        .md_wy
+                    a.model.borrow().tabs[i].payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false),
-                    a.model.borrow().tabs[i].editor_pending,
-                    a.model.borrow().tabs[i].editor.read(cx).line_count(),
+                    a.model.borrow().tabs[i].payload.editor_pending,
+                    a.model.borrow().tabs[i].payload.editor.read(cx).line_count(),
                 )
             });
             if !d_ready && !editor_pending && editor_lines > 1000 {
@@ -137,10 +136,9 @@ use shell::app::EditorAppRegistry;
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
-                    a.model.borrow().tabs[i].editor.read(cx).line_count(),
-                    a.model.borrow().tabs[i].editor_pending,
-                    a.model.borrow().tabs[i]
-                        .md_wy
+                    a.model.borrow().tabs[i].payload.editor.read(cx).line_count(),
+                    a.model.borrow().tabs[i].payload.editor_pending,
+                    a.model.borrow().tabs[i].payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false),
@@ -174,8 +172,7 @@ use shell::app::EditorAppRegistry;
         let wy_blocks = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            a.model.borrow().tabs[i]
-                .md_wy
+            a.model.borrow().tabs[i].payload.md_wy
                 .as_ref()
                 .map(|w| w.read(cx).frame_total().map_or(0., |t| t) as usize)
                 .unwrap_or(0)
@@ -221,8 +218,7 @@ use shell::app::EditorAppRegistry;
             wy_ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
-                a.model.borrow().tabs[i]
-                    .md_wy
+                a.model.borrow().tabs[i].payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).is_loaded())
                     .unwrap_or(false)
@@ -294,8 +290,7 @@ use shell::app::EditorAppRegistry;
                 // Step2：提前整篇解析可先于编辑区收尾装好预览 → 逐键一致性（m==e）必须
                 // 等**打开流水线整体完成**（open_finish_count>=1 ⇒ 编辑区已全文落定）。
                 a.open_finish_count >= 1
-                    && a.model.borrow().tabs[i]
-                        .md_wy
+                    && a.model.borrow().tabs[i].payload.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false)
@@ -325,19 +320,18 @@ use shell::app::EditorAppRegistry;
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
             (
-                t.md_wy
+                t.payload.md_wy
                     .as_ref()
                     .map(|w| w.read(cx).text().to_string())
                     .unwrap_or_default(),
-                t.editor.read(cx).value().to_string(),
+                t.payload.editor.read(cx).value().to_string(),
             )
         });
         assert_eq!(m, e, "{N} 键后预览应仍与编辑区逐字节一致");
         // 隔离测量桥模型成本（独立 WyEditor 副本，绝不污染已对齐的 md_wy）：
         // ⚠️ 循环内不读 `text()`（O(n) 物化）；用 O(1) `len()` 取初始长后自行推进。
         let scratch = cx.update(|window, cx| {
-            let rope = app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
-                .editor
+            let rope = app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor
                 .read(cx)
                 .rope()
                 .clone();
@@ -428,7 +422,7 @@ use shell::app::EditorAppRegistry;
                 cx.run_until_parked();
                 let pending = cx.update(|_, cx| {
                     let a = app.read(cx);
-                    a.model.borrow().tabs.last().map(|t| t.editor_pending).unwrap_or(true)
+                    a.model.borrow().tabs.last().map(|t| t.payload.editor_pending).unwrap_or(true)
                 });
                 if !pending {
                     break;
@@ -445,8 +439,8 @@ use shell::app::EditorAppRegistry;
                 let a = app.read(cx);
                 let idx = a.model.borrow().active_tab;
                 (
-                    a.model.borrow().tabs[idx].editor.clone(),
-                    a.model.borrow().tabs[idx].editor.read(cx).focus_handle(),
+                    a.model.borrow().tabs[idx].payload.editor.clone(),
+                    a.model.borrow().tabs[idx].payload.editor.read(cx).focus_handle(),
                 )
             });
             cx.update(|window, cx| window.focus(&focus, cx));
@@ -622,7 +616,7 @@ use shell::app::EditorAppRegistry;
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
-                    a.model.borrow().tabs[i].editor.read(cx).line_count(),
+                    a.model.borrow().tabs[i].payload.editor.read(cx).line_count(),
                     a.open_finish_count,
                 )
             });
@@ -653,12 +647,12 @@ use shell::app::EditorAppRegistry;
                 .unwrap()
                 .replace("\r\n", "\n")
                 .replace('\r', "\n");
-            a.model.borrow().tabs[i].editor.read(cx).value() == expected
+            a.model.borrow().tabs[i].payload.editor.read(cx).value() == expected
         });
         let last_lc = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.model.borrow().tabs.len().saturating_sub(1);
-            a.model.borrow().tabs[i].editor.read(cx).line_count()
+            a.model.borrow().tabs[i].payload.editor.read(cx).line_count()
         });
         let d_pf = peak_pf.load(Ordering::Relaxed).saturating_sub(base_pf);
         let d_ws = peak_ws.load(Ordering::Relaxed).saturating_sub(base_ws);
@@ -763,7 +757,7 @@ use shell::app::EditorAppRegistry;
         loop {
             cx.run_until_parked();
             let pending =
-                cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().map(|t| t.editor_pending).unwrap_or(true));
+                cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().map(|t| t.payload.editor_pending).unwrap_or(true));
             if !pending {
                 break;
             }
@@ -772,7 +766,7 @@ use shell::app::EditorAppRegistry;
                 panic!("打开超时");
             }
         }
-        let editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().unwrap().editor.clone());
+        let editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().unwrap().payload.editor.clone());
         let sample = "x";
         // 预热：预览窗口物化 + 行高提示收敛
         for _ in 0..3 {
@@ -863,7 +857,7 @@ use shell::app::EditorAppRegistry;
         loop {
             cx.run_until_parked();
             let pending = cx
-                .update(|_, cx| app.read(cx).model.borrow().tabs.last().map(|t| t.editor_pending).unwrap_or(true));
+                .update(|_, cx| app.read(cx).model.borrow().tabs.last().map(|t| t.payload.editor_pending).unwrap_or(true));
             if !pending {
                 break;
             }
@@ -872,7 +866,7 @@ use shell::app::EditorAppRegistry;
                 panic!("打开超时");
             }
         }
-        let editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().unwrap().editor.clone());
+        let editor = cx.update(|_, cx| app.read(cx).model.borrow().tabs.last().unwrap().payload.editor.clone());
         // 预热：预览窗口物化 + 行高提示收敛
         for _ in 0..5 {
             cx.run_until_parked();
@@ -1016,7 +1010,7 @@ use shell::app::EditorAppRegistry;
                 cx.run_until_parked();
                 let pending = cx.update(|_, cx| {
                     let a = app.read(cx);
-                    a.model.borrow().tabs.last().map(|t| t.editor_pending).unwrap_or(true)
+                    a.model.borrow().tabs.last().map(|t| t.payload.editor_pending).unwrap_or(true)
                 });
                 if !pending {
                     break;
@@ -1030,7 +1024,7 @@ use shell::app::EditorAppRegistry;
             // 3) 取编辑器实体；光标放正文中部，向前逐字符删 N 次（每次删 1 字符）。
             let editor = cx.update(|_, cx| {
                 let a = app.read(cx);
-                a.model.borrow().tabs[a.model.borrow().active_tab].editor.clone()
+                a.model.borrow().tabs[a.model.borrow().active_tab].payload.editor.clone()
             });
             let before = cx.update(|_, cx| editor.read(cx).value().len());
             if before < 2 {
@@ -1149,7 +1143,7 @@ fn new_style_scan(content: &str, q: &str) -> usize {
                 app.read(cx)
                     .model.borrow().tabs
                     .last()
-                    .map(|t| t.editor.read(cx).line_count())
+                    .map(|t| t.payload.editor.read(cx).line_count())
                     .unwrap_or(0)
             });
             if n >= LINES {
@@ -1163,7 +1157,7 @@ fn new_style_scan(content: &str, q: &str) -> usize {
 
         // 取正文（可编辑路径的一次 `value()` 整篇物化，内含物化耗时）
         let value_t = std::time::Instant::now();
-        let content = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[ti].editor.read(cx).value());
+        let content = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[ti].payload.editor.read(cx).value());
         let value_ms = value_t.elapsed().as_millis();
         // 多次取均（debug 单次抖动大；两者同轮同 jit/allocator 状态，比值才可信）
         const RUNS: usize = 20;
@@ -1267,7 +1261,7 @@ fn new_style_scan(content: &str, q: &str) -> usize {
             let a = app2.read(cx);
             (
                 a.model.borrow().tabs.len(),
-                a.model.borrow().tabs.iter().filter(|t| t.file_path.is_none()).count(),
+                a.model.borrow().tabs.iter().filter(|t| t.payload.file_path.is_none()).count(),
             )
         });
         assert_eq!(restored, (5, 2), "恢复应得 5 选项卡（3 文件 + 2 未命名）");
@@ -1372,8 +1366,8 @@ fn new_style_scan(content: &str, q: &str) -> usize {
                 let a = app.read(cx);
                 let i = a.model.borrow().tabs.len().saturating_sub(1);
                 (
-                    a.model.borrow().tabs[i].editor_pending,
-                    a.model.borrow().tabs[i].editor.read(cx).line_count(),
+                    a.model.borrow().tabs[i].payload.editor_pending,
+                    a.model.borrow().tabs[i].payload.editor.read(cx).line_count(),
                 )
             });
             if !pending && lines > 1000 {
@@ -1499,7 +1493,7 @@ fn media_win_snap(
         let tab = model.tabs.get(model.active_tab);
         (
             a.model.borrow().music_mode,
-            tab.and_then(|t| t.file_path.clone()),
+            tab.and_then(|t| t.payload.file_path.clone()),
             a.model.borrow().tabs.len(),
         )
     })

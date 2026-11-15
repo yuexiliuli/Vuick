@@ -201,7 +201,7 @@ impl EditorApp {
         for tab in &self.model.borrow().tabs {
             // A2/A4：右栏统一 WyEditor 预览（md_wy）与 WYSIWYG 活区（live2）的调色主题
             //（原先只刷背景，内容色滞后 →"切换黑白后预览不完全重染色/用旧色"）。
-            if let Some(wy) = tab.md_wy.clone() {
+            if let Some(wy) = tab.payload.md_wy.clone() {
                 wy.update(cx, |ed, cx| {
                     ed.rebuild_theme_from_global(cx);
                     cx.notify();
@@ -216,7 +216,7 @@ impl EditorApp {
             // PDF / 图片 / 视频阅读器同样刷新背景（主题色变化后与画布保持一致；否则打开时
             // 记下的 `canvas_bg` 停留在旧主题，切主题后画面底仍旧色——视频曾整窗白底、图片
             // 白板不随暗色）。
-            match &tab.reader {
+            match &tab.payload.reader {
                 MediaReader::Pdf(pdf) => {
                     let pv = pdf.clone();
                     // R6 守卫：PDF 画布背景**显式设置过**（非「默认」）→ 主题切换不得覆盖

@@ -65,7 +65,7 @@ impl EditorApp {
             let Some(tab) = model.tabs.get(active) else {
                 return; // 零选项卡欢迎页 → 静默
             };
-            (tab.reader.is_reader() || tab.readonly_preview, tab.editor.clone())
+            (tab.payload.reader.is_reader() || tab.payload.readonly_preview, tab.payload.editor.clone())
         };
         // 守卫对齐 find 的判定：音乐整窗 / MediaReader / EPUB 只读预览。
         if self.model.borrow().music_mode || is_media {
@@ -111,7 +111,7 @@ impl EditorApp {
             let Some(tab) = model.tabs.get(active) else {
                 return; // 零选项卡欢迎页 → 静默
             };
-            (tab.reader.is_reader() || tab.readonly_preview, tab.editor.clone())
+            (tab.payload.reader.is_reader() || tab.payload.readonly_preview, tab.payload.editor.clone())
         };
         // 守卫对齐 goto_line 的判定：音乐整窗 / MediaReader / EPUB 只读预览。
         if self.model.borrow().music_mode || is_media {
@@ -138,7 +138,7 @@ impl EditorApp {
             let Some(tab) = model.tabs.get(active) else {
                 return;
             };
-            (tab.reader.is_reader() || tab.readonly_preview, tab.editor.clone())
+            (tab.payload.reader.is_reader() || tab.payload.readonly_preview, tab.payload.editor.clone())
         };
         if self.model.borrow().music_mode || is_media {
             return;
@@ -312,13 +312,13 @@ impl EditorApp {
         let mut items: Vec<PaletteItem> = Vec::with_capacity(self.model.borrow().tabs.len());
         for (idx, tab) in self.model.borrow().tabs.iter().enumerate() {
             let name = tab
-                .file_path
+                .payload.file_path
                 .as_ref()
                 .and_then(|p| p.file_name())
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "未命名".to_string());
             let detail = tab
-                .file_path
+                .payload.file_path
                 .as_ref()
                 .map(|p| {
                     p.parent()
@@ -361,7 +361,7 @@ impl EditorApp {
         let opened: std::collections::HashSet<PathBuf> = self
             .model.borrow().tabs
             .iter()
-            .filter_map(|t| t.file_path.clone())
+            .filter_map(|t| t.payload.file_path.clone())
             .collect();
         let mut candidates: Vec<PaletteItem> = Vec::with_capacity(collected.len());
         for (path, rel) in collected.into_iter().take(QUICK_OPEN_MAX_FILES) {

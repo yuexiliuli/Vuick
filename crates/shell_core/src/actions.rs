@@ -23,7 +23,7 @@ use session_store::{
 use config::user::UserPrefs;
 
 use crate::host::AppHost;
-use crate::model::{AppModel, DetachedTab, EditorTab, MediaReader, MdWyInstall};
+use crate::model::{AppModel, DetachedTab, EditorTab, MediaReader, MdWyInstall, TabPayload};
 
 impl AppModel {
     // ---------- tabs 动作半 ----------
@@ -37,36 +37,38 @@ impl AppModel {
         let edit_sub = host.subscribe_editor(&editor, cx);
 
         self.tabs.push(EditorTab {
-            editor,
-            file_path: None,
-            source_encoding: None, // 新建选项卡 = 纯 UTF-8
-            dirty: false,
-            content: gpui::SharedString::default(),
-            line_count: 1,
-            char_count: 0,
-            cursor_row: 0,
-            cursor_col: 0,
-            reader: MediaReader::None,
-            preview_on: false,
-            preview_fullscreen: false,
-            readonly_preview: false,
-            editor_pending: false,
-            loading_lock: false,
+            payload: TabPayload {
+                editor,
+                reader: MediaReader::None,
+                md_wy: None,
+                md_wy_vscroll: gpui::ScrollHandle::new(),
+                md_wy_install: MdWyInstall::default(),
+                epub_images: Default::default(),
+                epub_notes: Default::default(),
+                file_path: None,
+                dirty: false,
+                source_encoding: None, // 新建选项卡 = 纯 UTF-8
+                content: gpui::SharedString::default(),
+                line_count: 1,
+                char_count: 0,
+                cursor_row: 0,
+                cursor_col: 0,
+                preview_on: false,
+                preview_fullscreen: false,
+                readonly_preview: false,
+                editor_pending: false,
+                loading_lock: false,
+                edit_version: 0,
+                reading_restore: None,
+                md_restore_pending: None,
+            },
             live_edit: false,
             live2: None,
             live2_dirty: false,
-            _live2_sub: None,
-            live_vscroll: gpui::ScrollHandle::new(),
-            md_wy: None,
-            md_wy_vscroll: gpui::ScrollHandle::new(),
-            md_wy_install: MdWyInstall::default(),
-            epub_images: Default::default(),
-            epub_notes: Default::default(),
-            edit_version: 0,
             _edit_sub: edit_sub,
             _pdf_sub: None,
-            reading_restore: None,
-            md_restore_pending: None,
+            _live2_sub: None,
+            live_vscroll: gpui::ScrollHandle::new(),
         });
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
@@ -134,7 +136,7 @@ impl AppModel {
         self.persist_session(host, cx);
         // PDF / EPUB 等只读预览文档没有可见编辑区，不把焦点给隐藏的编辑器，
         // 而是给 App 根（让窗口级快捷键仍可用）。
-        let readonly = self.tabs[idx].readonly_preview;
+        let readonly = self.tabs[idx].payload.readonly_preview;
         if readonly {
             let root = host.root_focus_handle(cx);
             window.focus(&root, cx);
@@ -163,7 +165,7 @@ impl AppModel {
         // 释放被移除选项卡持有的重资源（PDF 纹理 / 图片解码），实体随后随之释放。
         // 顺序保持旧行为：先 PDF、再图片；视频无显式 release（随选项卡直接释放）。
         let mut reader = MediaReader::None;
-        std::mem::swap(&mut self.tabs[idx].reader, &mut reader);
+        std::mem::swap(&mut self.tabs[idx].payload.reader, &mut reader);
         match reader {
             MediaReader::Pdf(pdf) => {
                 pdf.update(cx, |view, cx| view.release(window, cx));
@@ -215,7 +217,7 @@ impl AppModel {
             .tabs
             .iter()
             .enumerate()
-            .any(|(i, t)| affected(i) && (t.dirty || t.file_path.is_none()));
+            .any(|(i, t)| affected(i) && (t.payload.dirty || t.payload.file_path.is_none()));
         if any_unsaved {
             self.status = gpui::SharedString::from("有未保存的更改，未关闭");
             self.status_ok = false;
@@ -280,7 +282,7 @@ impl AppModel {
     pub fn tab_close_saved(&mut self, host: &dyn AppHost, window: &mut Window, cx: &mut App) {
         let len = self.tabs.len();
         for i in (0..len).rev() {
-            let saved = self.tabs[i].file_path.is_some() && !self.tabs[i].dirty;
+            let saved = self.tabs[i].payload.file_path.is_some() && !self.tabs[i].payload.dirty;
             if saved {
                 self.remove_tab(host, i, window, cx);
             }
@@ -292,8 +294,8 @@ impl AppModel {
 
     /// 从本窗口「拔出」一个选项卡：移除选项卡（**不**释放 PDF 纹理、不重置编辑器——
     /// 实体与元数据整体移到目标窗口），下标与激活态自动校正。
-    /// 整结构 move：一次解构 `EditorTab` 搬到 `DetachedTab`（`..` 丢弃源窗口专属的
-    /// live 态 / 订阅），不再逐字段手抄。
+    /// 整结构 move：`From<EditorTab> for DetachedTab` 一次解构 23 个搬迁字段
+    /// （`..` 丢弃源窗口专属的 live 态 / 订阅），不再逐字段手抄。
     pub fn take_tab_payload(&mut self, idx: usize) -> Option<DetachedTab> {
         if idx >= self.tabs.len() {
             return None;
@@ -309,57 +311,7 @@ impl AppModel {
             self.active_tab = len.saturating_sub(1);
         }
         self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
-        let EditorTab {
-            editor,
-            reader,
-            md_wy,
-            md_wy_vscroll,
-            md_wy_install,
-            epub_images,
-            epub_notes,
-            file_path,
-            dirty,
-            source_encoding,
-            content,
-            line_count,
-            char_count,
-            cursor_row,
-            cursor_col,
-            preview_on,
-            preview_fullscreen,
-            readonly_preview,
-            editor_pending,
-            loading_lock,
-            edit_version,
-            reading_restore,
-            md_restore_pending,
-            ..
-        } = tab;
-        Some(DetachedTab {
-            editor,
-            reader,
-            md_wy,
-            md_wy_vscroll,
-            md_wy_install,
-            epub_images,
-            epub_notes,
-            file_path,
-            dirty,
-            source_encoding,
-            content,
-            line_count,
-            char_count,
-            cursor_row,
-            cursor_col,
-            preview_on,
-            preview_fullscreen,
-            readonly_preview,
-            editor_pending,
-            loading_lock,
-            edit_version,
-            reading_restore,
-            md_restore_pending,
-        })
+        Some(tab.into())
     }
 
     // ---------- tabs 动作的模型直读 helper ----------
@@ -376,7 +328,7 @@ impl AppModel {
             let h = gpui::Focusable::focus_handle(l2.read(cx), cx);
             return h;
         }
-        tab.editor.read(cx).focus_handle()
+        tab.payload.editor.read(cx).focus_handle()
     }
 
     /// 选项卡的「有效内容」：`live2`（WyEditor，实时）开启时读它，否则读源码编辑区。
@@ -390,10 +342,10 @@ impl AppModel {
                     if l2.read(cx).is_loaded() {
                         l2.read(cx).text().to_string()
                     } else {
-                        t.editor.read(cx).value().to_string()
+                        t.payload.editor.read(cx).value().to_string()
                     }
                 }
-                None => t.editor.read(cx).value().to_string(),
+                None => t.payload.editor.read(cx).value().to_string(),
             },
             None => String::new(),
         }
@@ -435,21 +387,21 @@ impl AppModel {
     /// 经 `model.borrow().tab_reading_position(idx, &*cx)` 复用同一读数。
     pub fn tab_reading_position(&self, idx: usize, cx: &App) -> Option<ReadingProgress> {
         let tab = self.tabs.get(idx)?;
-        if tab.file_path.is_none() {
+        if tab.payload.file_path.is_none() {
             return None; // 未命名选项卡不记进度
         }
         // PDF：页 + 页内比例 + 缩放（阅读器自算）。
-        if let MediaReader::Pdf(pv) = &tab.reader {
+        if let MediaReader::Pdf(pv) = &tab.payload.reader {
             let (page, frac, zoom) = pv.read(cx).reading_progress()?;
             return Some(ReadingProgress::Pdf { page_index: page, in_page_frac: frac, zoom });
         }
         // EPUB：只读预览宿主（WyEditor）的视口顶源码行。
-        if tab.readonly_preview {
-            let line = tab.md_wy.as_ref()?.read(cx).top_source_line()?;
+        if tab.payload.readonly_preview {
+            let line = tab.payload.md_wy.as_ref()?.read(cx).top_source_line()?;
             return Some(ReadingProgress::Epub { top_line: line });
         }
         // md / txt：编辑区视口顶源码行（0 基）。
-        let top_line = tab.editor.read(cx).viewport_top_line();
+        let top_line = tab.payload.editor.read(cx).viewport_top_line();
         Some(ReadingProgress::Markdown { top_line })
     }
 
@@ -473,7 +425,7 @@ impl AppModel {
         let Some(tab) = self.tabs.get(idx) else {
             return;
         };
-        let Some(path) = tab.file_path.clone() else {
+        let Some(path) = tab.payload.file_path.clone() else {
             return;
         };
         let key = reading_progress::normalize_key(&path);
@@ -563,7 +515,7 @@ impl AppModel {
         let mut slots = Vec::new();
         let mut n_slots = 0usize;
         for (idx, tab) in self.tabs.iter().enumerate() {
-            match &tab.file_path {
+            match &tab.payload.file_path {
                 Some(p) => tabs.push(SessionTab::File { path: p.clone() }),
                 None => {
                     let slot = format!("t{n_slots}");
