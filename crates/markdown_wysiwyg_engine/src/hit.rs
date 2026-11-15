@@ -904,13 +904,102 @@ pub fn note_marker_src_range(
     (s1 > s0).then_some(s0..s1)
 }
 
-/// 代码块横向滚动条几何（内容超宽才返回）。
-pub fn code_hscroll_geo(
+// ── P3 / Slice A 收敛：code/table/math 三段横向滚动条纯几何原语 + 薄适配器 ──────
+
+/// 横向滚动条纯几何：条/滑块位置与宽度 + 最大滚动量（px）。
+/// 原为 code/table/math 三份同构内联计算，现收敛为 [`hscroll_geom`] 的产物。
+/// `pub`（非 `pub(crate)`）：引擎 `pub fn paint_hscroll_thumb` 的签名要携带它，
+/// 且宿主 `element/paint.rs` 经 `pub(crate) use` 再导出（可见性不得低于函数）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HScrollGeom {
+    pub bar_x: f32,
+    pub bar_w: f32,
+    pub thumb_x: f32,
+    pub thumb_w: f32,
+    pub max_scroll: f32,
+}
+
+impl HScrollGeom {
+    /// 降级为公开 API 裸元组（`markdown_wysiwyg` 侧 Slice B 消费面，暂保留元组契约）。
+    fn into_tuple(self) -> (f32, f32, f32, f32, f32) {
+        (self.bar_x, self.bar_w, self.thumb_x, self.thumb_w, self.max_scroll)
+    }
+}
+
+/// 纯几何：输入已由调用方按 x_off 三态各自算好的 `bar_x`/`viewport` 与
+/// `content_w`/`scroll`。语义差异原样保留：
+/// - `always_band=false`（code/math）：内容未超宽（`content_w <= viewport + 1.`）→ `None`；
+/// - `always_band=true`（table）：恒返回带，`max_scroll = (content_w - viewport).max(0.)`。
+pub(crate) fn hscroll_geom(
+    bar_x: f32,
+    viewport: f32,
+    content_w: f32,
+    scroll: f32,
+    min_thumb: f32,
+    always_band: bool,
+) -> Option<HScrollGeom> {
+    if !always_band && content_w <= viewport + 1. {
+        return None;
+    }
+    let max_scroll = if always_band {
+        (content_w - viewport).max(0.)
+    } else {
+        content_w - viewport
+    };
+    let scroll = scroll.min(max_scroll).max(0.);
+    let frac = if max_scroll > 0. {
+        scroll / max_scroll
+    } else {
+        0.
+    };
+    let bar_w = viewport.max(1.);
+    let thumb_w = (bar_w * viewport / content_w)
+        .max(min_thumb)
+        .min(bar_w);
+    let thumb_x = bar_x + (bar_w - thumb_w) * frac;
+    Some(HScrollGeom {
+        bar_x,
+        bar_w,
+        thumb_x,
+        thumb_w,
+        max_scroll,
+    })
+}
+
+/// 命中：行 `band` 顶判定（顶 = `row_top + row_height - CODE_HSCROLL_BAND`）+ 在条上
+/// 给 `(on_thumb, grab)`。与行扫描外层按行谓词 + `py in [top, bottom)` 配合使用。
+pub(crate) fn hscroll_hit_row(
+    py: f32,
+    px: f32,
+    row_top: f32,
+    row_height: f32,
+    geo: &HScrollGeom,
+) -> Option<(bool, f32)> {
+    let band_top = row_top + row_height - config::layout::CODE_HSCROLL_BAND;
+    if py < band_top {
+        return None;
+    }
+    if px >= geo.bar_x && px <= geo.bar_x + geo.bar_w {
+        let on_thumb = px >= geo.thumb_x && px <= geo.thumb_x + geo.thumb_w;
+        let grab = px - geo.thumb_x;
+        return Some((on_thumb, grab));
+    }
+    None
+}
+
+/// 按 `max_scroll` 夹取横向滚动值（`min(max).max(0)`，保留原 clamp 语义）。
+pub(crate) fn clamp_scroll(scroll: f32, max_scroll: f32) -> f32 {
+    scroll.min(max_scroll).max(0.)
+}
+
+/// 代码块横向滚动条几何（内部 `HScrollGeom` 版；paint/hit 同 crate 消费走此类，
+/// 公开 API 经 `code_hscroll_geo` 降级为元组——`markdown_wysiwyg` Slice B 消费面）。
+pub(crate) fn code_hscroll_geom_inner(
     rd: &RefCell<WyRenderModel>,
     _host: &dyn WyRenderHost,
     f: &Frame,
     row: &ShapedRow,
-) -> Option<(f32, f32, f32, f32, f32)> {
+) -> Option<HScrollGeom> {
     let panel_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
     let inset = f32::from(row.x_off).max(1.);
     let viewport = (panel_w - inset * 2.).max(1.);
@@ -919,31 +1008,31 @@ pub fn code_hscroll_geo(
         .iter()
         .map(|wl| f32::from(wl.width()))
         .fold(0.0f32, f32::max);
-    if max_w <= viewport + 1. {
-        return None;
-    }
-    let max_scroll = max_w - viewport;
     let scroll = rd
         .borrow()
         .code_h_scroll
         .borrow()
         .get(&row.src_line)
         .copied()
-        .unwrap_or(0.)
-        .min(max_scroll)
-        .max(0.);
-    let frac = if max_scroll > 0. {
-        scroll / max_scroll
-    } else {
-        0.
-    };
-    let bar_x = f32::from(f.padding) + inset;
-    let bar_w = viewport.max(1.);
-    let thumb_w = (bar_w * viewport / max_w)
-        .max(config::layout::CODE_HSCROLL_THUMB_MIN)
-        .min(bar_w);
-    let thumb_x = bar_x + (bar_w - thumb_w) * frac;
-    Some((bar_x, bar_w, thumb_x, thumb_w, max_scroll))
+        .unwrap_or(0.);
+    hscroll_geom(
+        f32::from(f.padding) + inset,
+        viewport,
+        max_w,
+        scroll,
+        config::layout::CODE_HSCROLL_THUMB_MIN,
+        false, // always_band=false：短行不超宽 → None
+    )
+}
+
+/// 代码块横向滚动条几何（内容超宽才返回）。公开 API 保持裸元组 = 既有跨 crate 契约。
+pub fn code_hscroll_geo(
+    rd: &RefCell<WyRenderModel>,
+    host: &dyn WyRenderHost,
+    f: &Frame,
+    row: &ShapedRow,
+) -> Option<(f32, f32, f32, f32, f32)> {
+    code_hscroll_geom_inner(rd, host, f, row).map(HScrollGeom::into_tuple)
 }
 
 /// 代码块当前生效的横向滚动偏移（px）：
@@ -953,16 +1042,16 @@ pub fn code_hscroll_clamped(
     f: &Frame,
     row: &ShapedRow,
 ) -> f32 {
-    match code_hscroll_geo(rd, host, f, row) {
-        Some((_, _, _, _, max_scroll)) => rd
-            .borrow()
-            .code_h_scroll
-            .borrow()
-            .get(&row.src_line)
-            .copied()
-            .unwrap_or(0.)
-            .min(max_scroll)
-            .max(0.),
+    match code_hscroll_geom_inner(rd, host, f, row) {
+        Some(g) => clamp_scroll(
+            rd.borrow()
+                .code_h_scroll
+                .borrow()
+                .get(&row.src_line)
+                .copied()
+                .unwrap_or(0.),
+            g.max_scroll,
+        ),
         None => 0.,
     }
 }
@@ -983,30 +1072,23 @@ pub fn code_hscrollbar_hit(
         if !(py >= top && py < bottom) || r.multi_offsets.is_empty() || r.wrapped.is_empty() {
             continue;
         }
-        let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = code_hscroll_geo(rd, host, frame, r) else {
+        let Some(geo) = code_hscroll_geom_inner(rd, host, frame, r) else {
             continue;
         };
-        let band_top =
-            f32::from(r.top) + f32::from(r.height) - config::layout::CODE_HSCROLL_BAND;
-        if py < band_top {
-            continue;
-        }
-        if px >= bar_x && px <= bar_x + bar_w {
-            let on_thumb = px >= thumb_x && px <= thumb_x + thumb_w;
-            let grab = px - thumb_x;
+        if let Some((on_thumb, grab)) = hscroll_hit_row(py, px, top, f32::from(r.height), &geo) {
             return Some((r.src_line, on_thumb, grab));
         }
     }
     None
 }
 
-/// 表格横向滚动条几何（内容超宽才返回）。
-pub fn table_hscroll_geo(
+/// 表格横向滚动条几何（内部 `HScrollGeom` 版；公开 API 经 `table_hscroll_geo` 降级为元组）。
+pub(crate) fn table_hscroll_geom_inner(
     rd: &RefCell<WyRenderModel>,
     _host: &dyn WyRenderHost,
     f: &Frame,
     row: &ShapedRow,
-) -> Option<(f32, f32, f32, f32, f32)> {
+) -> Option<HScrollGeom> {
     let t = row.table.as_ref()?;
     // 表格内容左缘 = 内容盒左缘 + 行 `x_off`（引号内表格缩进）；视口与滚动条
     // 均以该左缘为准，保证：滚动条对齐表格边缘、max_scroll 含右缘可达、内容
@@ -1014,28 +1096,31 @@ pub fn table_hscroll_geo(
     let x_off = f32::from(row.x_off);
     let viewport = (f32::from(f.width) - f32::from(f.padding) * 2. - x_off).max(1.);
     let max_w = t.total_w.max(1.);
-    let max_scroll = (max_w - viewport).max(0.);
     let scroll = rd
         .borrow()
         .table_h_scroll
         .borrow()
         .get(&row.src_line)
         .copied()
-        .unwrap_or(0.)
-        .min(max_scroll)
-        .max(0.);
-    let frac = if max_scroll > 0. {
-        scroll / max_scroll
-    } else {
-        0.
-    };
-    let bar_x = f32::from(f.padding) + x_off;
-    let bar_w = viewport.max(1.);
-    let thumb_w = (bar_w * viewport / max_w)
-        .max(config::layout::CODE_HSCROLL_THUMB_MIN)
-        .min(bar_w);
-    let thumb_x = bar_x + (bar_w - thumb_w) * frac;
-    Some((bar_x, bar_w, thumb_x, thumb_w, max_scroll))
+        .unwrap_or(0.);
+    hscroll_geom(
+        f32::from(f.padding) + x_off,
+        viewport,
+        max_w,
+        scroll,
+        config::layout::CODE_HSCROLL_THUMB_MIN,
+        true, // always_band=true：表格恒显带（恒 Some）
+    )
+}
+
+/// 表格横向滚动条几何（内容超宽才返回）。公开 API 保持裸元组 = 既有跨 crate 契约。
+pub fn table_hscroll_geo(
+    rd: &RefCell<WyRenderModel>,
+    host: &dyn WyRenderHost,
+    f: &Frame,
+    row: &ShapedRow,
+) -> Option<(f32, f32, f32, f32, f32)> {
+    table_hscroll_geom_inner(rd, host, f, row).map(HScrollGeom::into_tuple)
 }
 
 /// 表格当前生效的横向滚动偏移（px）。
@@ -1045,16 +1130,16 @@ pub fn table_hscroll_clamped(
     f: &Frame,
     row: &ShapedRow,
 ) -> f32 {
-    match table_hscroll_geo(rd, host, f, row) {
-        Some((_, _, _, _, max_scroll)) => rd
-            .borrow()
-            .table_h_scroll
-            .borrow()
-            .get(&row.src_line)
-            .copied()
-            .unwrap_or(0.)
-            .min(max_scroll)
-            .max(0.),
+    match table_hscroll_geom_inner(rd, host, f, row) {
+        Some(g) => clamp_scroll(
+            rd.borrow()
+                .table_h_scroll
+                .borrow()
+                .get(&row.src_line)
+                .copied()
+                .unwrap_or(0.),
+            g.max_scroll,
+        ),
         None => 0.,
     }
 }
@@ -1075,17 +1160,10 @@ pub fn table_hscrollbar_hit(
         if !(py >= top && py < bottom) || r.table.is_none() {
             continue;
         }
-        let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = table_hscroll_geo(rd, host, frame, r) else {
+        let Some(geo) = table_hscroll_geom_inner(rd, host, frame, r) else {
             continue;
         };
-        let band_top =
-            f32::from(r.top) + f32::from(r.height) - config::layout::CODE_HSCROLL_BAND;
-        if py < band_top {
-            continue;
-        }
-        if px >= bar_x && px <= bar_x + bar_w {
-            let on_thumb = px >= thumb_x && px <= thumb_x + thumb_w;
-            let grab = px - thumb_x;
+        if let Some((on_thumb, grab)) = hscroll_hit_row(py, px, top, f32::from(r.height), &geo) {
             return Some((r.src_line, on_thumb, grab));
         }
     }
@@ -1112,43 +1190,43 @@ pub fn math_natural_w(rd: &RefCell<WyRenderModel>, host: &dyn WyRenderHost, row:
     }
 }
 
-/// 数学卡横向滚动条几何（公式自然宽 > 内容盒才返回）。
-pub fn math_hscroll_geo(
+/// 数学卡横向滚动条几何（内部 `HScrollGeom` 版；公开 API 经 `math_hscroll_geo` 降级为元组）。
+pub(crate) fn math_hscroll_geom_inner(
     rd: &RefCell<WyRenderModel>,
     host: &dyn WyRenderHost,
     f: &Frame,
     row: &ShapedRow,
-) -> Option<(f32, f32, f32, f32, f32)> {
+) -> Option<HScrollGeom> {
     if !matches!(&row.extra.card, Some(BlockCard::Math { .. })) {
         return None;
     }
     let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
     let natural_w = math_natural_w(rd, host, row);
-    if natural_w <= viewport + 1. {
-        return None;
-    }
-    let max_scroll = natural_w - viewport;
     let scroll = rd
         .borrow()
         .math_h_scroll
         .borrow()
         .get(&row.src_line)
         .copied()
-        .unwrap_or(0.)
-        .min(max_scroll)
-        .max(0.);
-    let frac = if max_scroll > 0. {
-        scroll / max_scroll
-    } else {
-        0.
-    };
-    let bar_x = f32::from(f.padding);
-    let bar_w = viewport.max(1.);
-    let thumb_w = (bar_w * viewport / natural_w)
-        .max(config::layout::CODE_HSCROLL_THUMB_MIN)
-        .min(bar_w);
-    let thumb_x = bar_x + (bar_w - thumb_w) * frac;
-    Some((bar_x, bar_w, thumb_x, thumb_w, max_scroll))
+        .unwrap_or(0.);
+    hscroll_geom(
+        f32::from(f.padding),
+        viewport,
+        natural_w,
+        scroll,
+        config::layout::CODE_HSCROLL_THUMB_MIN,
+        false, // always_band=false：公式不超宽 → None
+    )
+}
+
+/// 数学卡横向滚动条几何（公式自然宽 > 内容盒才返回）。公开 API 保持裸元组 = 既有跨 crate 契约。
+pub fn math_hscroll_geo(
+    rd: &RefCell<WyRenderModel>,
+    host: &dyn WyRenderHost,
+    f: &Frame,
+    row: &ShapedRow,
+) -> Option<(f32, f32, f32, f32, f32)> {
+    math_hscroll_geom_inner(rd, host, f, row).map(HScrollGeom::into_tuple)
 }
 
 /// 数学卡当前生效的横向滚动偏移（px）。
@@ -1158,16 +1236,16 @@ pub fn math_hscroll_clamped(
     f: &Frame,
     row: &ShapedRow,
 ) -> f32 {
-    match math_hscroll_geo(rd, host, f, row) {
-        Some((_, _, _, _, max_scroll)) => rd
-            .borrow()
-            .math_h_scroll
-            .borrow()
-            .get(&row.src_line)
-            .copied()
-            .unwrap_or(0.)
-            .min(max_scroll)
-            .max(0.),
+    match math_hscroll_geom_inner(rd, host, f, row) {
+        Some(g) => clamp_scroll(
+            rd.borrow()
+                .math_h_scroll
+                .borrow()
+                .get(&row.src_line)
+                .copied()
+                .unwrap_or(0.),
+            g.max_scroll,
+        ),
         None => 0.,
     }
 }
@@ -1188,17 +1266,10 @@ pub fn math_hscrollbar_hit(
         if !(py >= top && py < bottom && matches!(&r.extra.card, Some(BlockCard::Math { .. }))) {
             continue;
         }
-        let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = math_hscroll_geo(rd, host, frame, r) else {
+        let Some(geo) = math_hscroll_geom_inner(rd, host, frame, r) else {
             continue;
         };
-        let band_top =
-            f32::from(r.top) + f32::from(r.height) - config::layout::CODE_HSCROLL_BAND;
-        if py < band_top {
-            continue;
-        }
-        if px >= bar_x && px <= bar_x + bar_w {
-            let on_thumb = px >= thumb_x && px <= thumb_x + thumb_w;
-            let grab = px - thumb_x;
+        if let Some((on_thumb, grab)) = hscroll_hit_row(py, px, top, f32::from(r.height), &geo) {
             return Some((r.src_line, on_thumb, grab));
         }
     }

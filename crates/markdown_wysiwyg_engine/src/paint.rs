@@ -16,10 +16,10 @@ use crate::element::*;
 use crate::element::geom::{first_band_center_y, text_row_shift, text_y_off};
 use crate::frame::{set_image_size, set_math_natural_w, set_math_pin};
 use crate::hit::{
-    code_hscroll_clamped, code_hscroll_geo, image_box_local, image_edit_button_local,
+    code_hscroll_clamped, code_hscroll_geom_inner, image_box_local, image_edit_button_local,
     image_resize_handle_window, inline_image_box_local, inline_image_edit_button_local,
-    math_hscroll_clamped, math_hscroll_geo, math_natural_w, note_marker_src_range,
-    table_hscroll_clamped, table_hscroll_geo,
+    math_hscroll_clamped, math_hscroll_geom_inner, math_natural_w, note_marker_src_range,
+    table_hscroll_clamped, table_hscroll_geom_inner, HScrollGeom,
 };
 use crate::model::WyRenderModel;
 use crate::shape::{math_display_lines, table_block_height};
@@ -73,11 +73,11 @@ pub fn paint_table_row(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let hgeo = table_hscroll_geo(rd, host, f, row);
+    let hgeo = table_hscroll_geom_inner(rd, host, f, row);
     let scroll = table_hscroll_clamped(rd, host, f, row);
     // 网格视口以**表格内容左缘**起算（`padding + x_off`，引号内表格缩进）：遮罩
     // 同步左移并收窄，保证①滚动条对齐表格边缘②内容拖拽不盖引号竖条③右缘可达
-    // （2026-11-13 真机复查 #1/#2/#3，与 `table_hscroll_geo` 同口径）。
+    // （2026-11-13 真机复查 #1/#2/#3，与 `table_hscroll_geom_inner` 同口径）。
     let viewport = (f32::from(f.width) - f32::from(f.padding) * 2. - f32::from(row.x_off)).max(1.);
     let total_w = t.total_w.max(1.);
     let x0 = f32::from(origin.x) + f32::from(f.padding) + f32::from(row.x_off) - scroll;
@@ -193,10 +193,9 @@ pub fn paint_hscroll_thumb(
     origin: Point<Pixels>,
     theme: &WyTheme,
     row: &ShapedRow,
-    geo: (f32, f32, f32, f32, f32),
+    geo: HScrollGeom,
     window: &mut Window,
 ) {
-    let (_bar_x, _bar_w, thumb_x, thumb_w, _) = geo;
     let track_h = config::layout::CODE_HSCROLL_BAND;
     let track_top = f32::from(row.top) + f32::from(row.height) - track_h;
     let inset = 4.;
@@ -206,8 +205,8 @@ pub fn paint_hscroll_thumb(
     thumb.a = 0.6;
     window.paint_quad(gpui::PaintQuad {
         bounds: Bounds::new(
-            point(origin.x + px(thumb_x), origin.y + px(ty)),
-            size(px(thumb_w), px(th)),
+            point(origin.x + px(geo.thumb_x), origin.y + px(ty)),
+            size(px(geo.thumb_w), px(th)),
         ),
         corner_radii: gpui::Corners::all(px(th / 2.)),
         background: thumb.into(),
@@ -245,7 +244,7 @@ pub fn paint_code_row(
         border_style: gpui::BorderStyle::Solid,
     });
     let text_x = panel_x + row.x_off;
-    let hgeo = code_hscroll_geo(rd, host, f, row);
+    let hgeo = code_hscroll_geom_inner(rd, host, f, row);
     let scroll = code_hscroll_clamped(rd, host, f, row);
     window.with_content_mask(Some(gpui::ContentMask { bounds: panel_rect }), |window| {
         let mut sub_top = row.top + theme.code_line();
@@ -1075,7 +1074,7 @@ pub fn paint_card(
                     }
                 },
             );
-            if let Some(geo) = math_hscroll_geo(rd, host, f, row) {
+            if let Some(geo) = math_hscroll_geom_inner(rd, host, f, row) {
                 paint_hscroll_thumb(origin, theme, row, geo, window);
             }
         }
