@@ -393,7 +393,7 @@ impl super::VideoViewer {
         self.pending_seek = None;
         self.zoom = 1.0; // 切文件：缩放复位为适应视口
         self.pan = (0.0, 0.0); // 平移同步归零（拖拽中的惯性也清掉）
-        self.drag = None;
+        self.drag = pan_zoom::PanGesture::default();
         // 切文件：立即清空旧字幕（新字幕由 `start` 后台加载覆盖；避免 switch 窗口期旧
         // 字幕在时间 0 附近残留显示）
         self.subtitles.clear();

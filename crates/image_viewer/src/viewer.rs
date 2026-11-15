@@ -298,8 +298,8 @@ pub struct ImageViewer {
     display_denom: u8,
     /// 平移（px）：放大后拖拽浏览其他区域，以视口中心为基准、每帧 clamp 到图始终覆盖视口。
     pan: (f32, f32),
-    /// 拖拽平移进行中：(左键按下位置, 按下时 pan 起点)。
-    drag: Option<((f32, f32), (f32, f32))>,
+    /// 鼠标左键拖拽平移手势态（down/move/up 三方法收敛于 [`pan_zoom::PanGesture`]）。
+    drag: pan_zoom::PanGesture,
     /// 「锁定」干净看图模式：隐藏全部非图片 UI、图片充满整个窗口（宿主读取决定外壳取舍）。
     locked: bool,
     /// 底部信息条浮层时序：可见位 + 自隐代序号 + 悬停态 + 延时（收敛于
@@ -346,7 +346,7 @@ impl ImageViewer {
             display_need: DISPLAY_NEED_INIT,
             display_denom: 1,
             pan: (0.0, 0.0),
-            drag: None,
+            drag: pan_zoom::PanGesture::default(),
             locked: false,
             info_auto: auto_hide::AutoHide::new(),
             anim_clip: None,
@@ -404,7 +404,7 @@ impl ImageViewer {
     pub fn toggle_lock(&mut self, cx: &mut Context<Self>) {
         self.locked = !self.locked;
         self.pan = (0.0, 0.0);
-        self.drag = None;
+        self.drag = pan_zoom::PanGesture::default();
         if self.locked {
             self.show_locked_info(cx);
         }
@@ -467,7 +467,7 @@ impl ImageViewer {
         self.display_denom = 1;
         self.display_need = DISPLAY_NEED_INIT;
         self.pan = (0.0, 0.0);
-        self.drag = None;
+        self.drag = pan_zoom::PanGesture::default();
     }
 
     /// 视口尺寸：`#image-scroll` 布局后的真实可视区；首帧未布局（bounds 为 0）

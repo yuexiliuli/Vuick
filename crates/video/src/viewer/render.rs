@@ -534,7 +534,7 @@ impl Render for VideoViewer {
                     .relative()
                     .track_scroll(&self.viewport)
                     .track_focus(&self.focus_handle)
-                    .cursor(if self.drag.is_some() {
+                    .cursor(if self.drag.active() {
                         CursorStyle::ClosedHand
                     } else {
                         CursorStyle::OpenHand

@@ -167,7 +167,7 @@ impl Render for ImageViewer {
                             .id("image-wrap")
                             .size_full()
                             .relative()
-                            .cursor(if self.drag.is_some() {
+                            .cursor(if self.drag.active() {
                                 CursorStyle::ClosedHand
                             } else {
                                 CursorStyle::OpenHand

@@ -11,6 +11,9 @@
 //!   一律以**参数与调用方逻辑**承载，绝不统一成某一家行为；
 //! - 所有函数都是无副作用的纯函数（只在调用方就地改写字段），便于单测与行为逐字节保真。
 //!
+//! 两家「左键拖拽平移」的 down/move/up 三方法骨架也收口为 [`PanGesture`]（clamp 仍由
+//! 调用方按其视口/图尺寸以闭包注入），见其自身文档。
+//!
 //! pdf 只复用本模块的「缩放档位与钳位」部分（分页列布局没有单张图的 contain/clamp/拖拽）；
 //! image / video 完整复用全部。
 
@@ -79,6 +82,53 @@ pub fn pan_drag_delta(drag: &PanDrag, pos: (f32, f32)) -> (f32, f32) {
     (pos.0 - drag.0.0, pos.1 - drag.0.1)
 }
 
+/// 鼠标左键拖拽平移手势态（image/video 共用；下一批 P9）。down/move/up 骨架收敛
+/// 自两处逐字拷贝；clamp 由调用方按其视口/图尺寸以闭包注入。
+#[derive(Default)]
+pub struct PanGesture {
+    drag: Option<PanDrag>,
+}
+
+impl PanGesture {
+    /// 左键按下开始拖拽：记录起点鼠标位置 + 当前 `pan`（未放大时 clamp 恒 0，拖动无
+    /// 效果）。返回「是否进入拖拽态」（本实现按下必进入），交由调用方决定是否 `notify`
+    /// ——两家原实现均为「Left 按下即 `cx.notify()`」。
+    pub fn down(&mut self, pos: (f32, f32), pan: (f32, f32)) -> bool {
+        self.drag = Some(pan_drag_begin(pos, pan));
+        true
+    }
+
+    /// 拖拽平移：按「当前鼠标 − 按下位置」增量更新，clamp 由调用方按其视口/图尺寸注入
+    /// （image 用 `last_viewport`+`display_size`、video 用自身视口/控制条高，口径各自保
+    /// 留）。返回 `Some(新 pan)`（已 clamp）；无拖拽 → `None`（调用方早退、不 `notify`，
+    /// 与两家原「`let Some(drag) = self.drag else return`」语义一致）。
+    pub fn move_(
+        &mut self,
+        pos: (f32, f32),
+        clamp: impl FnOnce((f32, f32)) -> (f32, f32),
+    ) -> Option<(f32, f32)> {
+        let drag = self.drag?;
+        let (dx, dy) = pan_drag_delta(&drag, pos);
+        Some(clamp((drag.1.0 + dx, drag.1.1 + dy)))
+    }
+
+    /// 结束拖拽（窗口内/外松开统一清态）：有拖拽则清空，返回「是否清理」——调用方据此
+    /// `notify`，与两家原「`is_some()` 才清 + `cx.notify()`」一致；无可清拖拽返回 `false`。
+    pub fn up(&mut self) -> bool {
+        if self.drag.is_some() {
+            self.drag = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 是否有进行中的拖拽（光标形态 / 测试断言用；等价于旧字段 `Option::is_some()`）。
+    pub fn active(&self) -> bool {
+        self.drag.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +191,31 @@ mod tests {
 
         let drag = pan_drag_begin((10.0, 20.0), (5.0, -5.0));
         assert_eq!(pan_drag_delta(&drag, (130.0, 100.0)), (120.0, 80.0));
+    }
+
+    /// PanGesture 三方法契约（image/video 两家另以 end-to-end 测试覆盖）：
+    /// down 必进入拖拽；move 无拖拽返回 None、有拖拽按 clamp 闭包输出；up 仅在有拖拽时
+    /// 清态并返回 true。
+    #[test]
+    fn pan_gesture_triad_contract() {
+        let mut g = PanGesture::default();
+        assert!(!g.active(), "初始无拖拽");
+        // down：记录按下位置 + pan 起点，进入拖拽态
+        assert!(g.down((10.0, 20.0), (5.0, -5.0)));
+        assert!(g.active());
+        // move：增量 = 当前 − 按下 → clamp(起点 + 增量)
+        let no_op_clamp = |p: (f32, f32)| p;
+        assert_eq!(g.move_((130.0, 100.0), no_op_clamp), Some((125.0, 75.0)));
+        // clamp：注入本家口径（此处用「±(图−视口)/2」，与两家 clamp_pan 一致）
+        let clamped = |p: (f32, f32)| clamp_pan(p, 1000.0, 700.0, 1500.0, 900.0);
+        assert_eq!(g.move_((300.0, 100.0), clamped), Some((250.0, 75.0)));
+        // move 本身不改变拖拽态
+        assert!(g.active());
+        // up：有拖拽 → 清态并返回 true；再 up → false（无可清，不 notify）
+        assert!(g.up());
+        assert!(!g.active());
+        assert!(!g.up());
+        // 无拖拽时 move 返回 None（调用方早退不 notify）
+        assert_eq!(g.move_((1.0, 2.0), no_op_clamp), None);
     }
 }

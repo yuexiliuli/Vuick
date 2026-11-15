@@ -712,8 +712,8 @@ pub struct VideoViewer {
     zoom: f32,
     /// 放大后的拖拽平移偏移（px；以「视口中心 = 图中心」为 0 基准，未放大恒 0）。
     pan: (f32, f32),
-    /// 拖拽平移进行中：`(左键按下位置, 按下时 pan 起点)`。
-    drag: Option<((f32, f32), (f32, f32))>,
+    /// 鼠标左键拖拽平移手势态（down/move/up 三方法收敛于 [`pan_zoom::PanGesture`]）。
+    drag: pan_zoom::PanGesture,
     // --- 纯视频模式（参考纯图片锁定）：控制条为浮层，按需浮现 / 自隐 ---
     /// 是否「纯视频」干净播放模式（宿主据此隐藏全部非视频 UI，视频充满窗口）。
     locked: bool,
@@ -843,7 +843,7 @@ impl VideoViewer {
             speed: 1.0,
             zoom: 1.0,
             pan: (0.0, 0.0),
-            drag: None,
+            drag: pan_zoom::PanGesture::default(),
             locked: false,
             pre_fullscreen_locked: false,
             controls_auto: auto_hide::AutoHide::new(),

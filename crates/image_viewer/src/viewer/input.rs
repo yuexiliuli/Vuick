@@ -155,7 +155,7 @@ impl super::ImageViewer {
         // 切图：缩放复位为适应视口 + 平移/拖拽归零（每张都从初始大小开始）
         self.zoom = 1.0;
         self.pan = (0.0, 0.0);
-        self.drag = None;
+        self.drag = pan_zoom::PanGesture::default();
         self.request_display(cx);
         // 锁定模式：切图 → 底部信息条浮现 1s
         self.show_locked_info(cx);
@@ -190,46 +190,52 @@ impl super::ImageViewer {
     // ---- 放大后拖拽平移（鼠标左键抓图滑动浏览其他区域） ----
 
     /// 按下左键开始拖拽：记录起点鼠标位置 + 当前 `pan`（未放大时 clamp 恒 0，拖动无效果）。
+    /// down 返回「是否进入拖拽态」，据此 notify（左键按下必进入，与既有一致）。
     pub(super) fn on_pan_down(
         &mut self,
         ev: &MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if ev.button == MouseButton::Left {
-            self.drag = Some(pan_zoom::pan_drag_begin(
+        if ev.button == MouseButton::Left
+            && self.drag.down(
                 (ev.position.x.as_f32(), ev.position.y.as_f32()),
                 self.pan,
-            ));
+            )
+        {
             cx.notify();
         }
     }
 
-    /// 拖拽平移：按「当前鼠标 - 起点」增量更新 `pan`，clamp 到图始终覆盖视口。
+    /// 拖拽平移：按「当前鼠标 − 按下位置」增量更新 `pan`，clamp 到图始终覆盖视口
+    /// （clamp 参数按本家口径在闭包注入）。
     pub(super) fn on_pan_move(
         &mut self,
         ev: &MouseMoveEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(drag) = self.drag else {
+        if !self.drag.active() {
             return;
-        };
-        let pos = (ev.position.x.as_f32(), ev.position.y.as_f32());
-        let (dx, dy) = pan_zoom::pan_drag_delta(&drag, pos);
+        }
         let (vw, vh) = self.last_viewport;
         let (dw, dh) = self
             .intrinsic
             .map(|(iw, ih)| self.display_size(iw, ih, vw, vh))
             .unwrap_or((0.0, 0.0));
-        self.pan = Self::clamp_pan((drag.1.0 + dx, drag.1.1 + dy), vw, vh, dw, dh);
-        cx.notify();
+        if let Some(pan) = self.drag.move_(
+            (ev.position.x.as_f32(), ev.position.y.as_f32()),
+            |p| Self::clamp_pan(p, vw, vh, dw, dh),
+        ) {
+            self.pan = pan;
+            cx.notify();
+        }
     }
 
     /// 拖拽结束（窗口内/外松开统一清态；`on_mouse_up` / `on_mouse_up_out` 共用）。
+    /// up 返回「是否清理」，据此 notify（与既有一致）。
     pub(super) fn on_pan_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.drag.is_some() {
-            self.drag = None;
+        if self.drag.up() {
             cx.notify();
         }
     }

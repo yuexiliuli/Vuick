@@ -78,7 +78,7 @@
             speed: 1.0,
             zoom: 1.0,
             pan: (0.0, 0.0),
-            drag: None,
+            drag: pan_zoom::PanGesture::default(),
             locked: false,
             pre_fullscreen_locked: false,
             controls_auto: auto_hide::AutoHide::new(),
@@ -3792,7 +3792,7 @@
         );
         wcx.run_until_parked();
         assert!(
-            wcx.cx.read(|app| viewer.read(app).drag.is_none()),
+            wcx.cx.read(|app| !viewer.read(app).drag.active()),
             "松开后拖拽应结束"
         );
         // 再次按下（起点 pan 沿上一段拖拽结果）+ 小增量拖动 → pan 继续累积（平移跨拖拽保持）
@@ -3947,7 +3947,7 @@
         wcx.run_until_parked();
         let s = wcx.cx.read(|app| {
             let v = viewer.read(app);
-            (v.is_locked(), v.drag.is_some())
+            (v.is_locked(), v.drag.active())
         });
         assert!(!s.0, "单击不应进入锁定");
         assert!(s.1, "单击仍是拖拽起点（drag 已建立），双击全屏未抢单击语义");

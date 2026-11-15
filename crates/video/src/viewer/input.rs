@@ -59,32 +59,35 @@ impl super::VideoViewer {
 
 
     /// 左键按下开始拖拽：记录起点鼠标位置 + 当前 `pan`（未放大时 clamp 恒 0，拖动无效果）。
+    /// down 返回「是否进入拖拽态」，据此 notify（左键按下必进入，与既有一致）。
     pub(super) fn on_pan_down(
         &mut self,
         ev: &MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if ev.button == MouseButton::Left {
-            self.drag = Some(pan_zoom::pan_drag_begin(
+        if ev.button == MouseButton::Left
+            && self.drag.down(
                 (ev.position.x.as_f32(), ev.position.y.as_f32()),
                 self.pan,
-            ));
+            )
+        {
             cx.notify();
         }
     }
 
 
-    /// 拖拽平移：按「当前鼠标 − 起点」增量更新 `pan`，clamp 到图始终覆盖画布区。
+    /// 拖拽平移：按「当前鼠标 − 按下位置」增量更新 `pan`，clamp 到图始终覆盖画布区
+    /// （clamp 参数按本家「视口/控制条高」口径在闭包注入）。
     pub(super) fn on_pan_move(
         &mut self,
         ev: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(drag) = self.drag else {
+        if !self.drag.active() {
             return;
-        };
+        }
         let (vw, vh) = self.viewport_size(window);
         let area_h = if self.locked {
             vh.max(1.0)
@@ -92,17 +95,20 @@ impl super::VideoViewer {
             (vh - CONTROL_BAR_H).max(1.0)
         };
         let (dw, dh) = self.display_size(vw, vh);
-        let pos = (ev.position.x.as_f32(), ev.position.y.as_f32());
-        let (dx, dy) = pan_zoom::pan_drag_delta(&drag, pos);
-        self.pan = Self::clamp_pan((drag.1.0 + dx, drag.1.1 + dy), vw, area_h, dw, dh);
-        cx.notify();
+        if let Some(pan) = self.drag.move_(
+            (ev.position.x.as_f32(), ev.position.y.as_f32()),
+            |p| Self::clamp_pan(p, vw, area_h, dw, dh),
+        ) {
+            self.pan = pan;
+            cx.notify();
+        }
     }
 
 
     /// 拖拽结束（窗口内/外松开统一清态；`on_mouse_up` / `on_mouse_up_out` 共用）。
+    /// up 返回「是否清理」，据此 notify（与既有一致）。
     pub(super) fn on_pan_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.drag.is_some() {
-            self.drag = None;
+        if self.drag.up() {
             cx.notify();
         }
     }
@@ -129,7 +135,7 @@ impl super::VideoViewer {
     pub(super) fn set_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
         self.locked = locked;
         self.pan = (0.0, 0.0);
-        self.drag = None;
+        self.drag = pan_zoom::PanGesture::default();
         // 进/出锁定都让控制条浮现一次（锁定态随即 1s 自隐）
         self.show_controls_temporarily(cx);
         cx.notify();
