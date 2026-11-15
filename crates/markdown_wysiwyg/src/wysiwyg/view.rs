@@ -367,68 +367,47 @@ impl WyEditor {
     }
     /// 代码块横向滚动偏移（键 = 代码块首源码行）。视图本地状态（不写源码）。
     /// 仅供宿主测试消费的旧签名转发（生产无调用）→ allow 压 dead_code 告警。
+    /// P3 / Slice C：读统一走 `HScrollState::scroll_of`。
     #[allow(dead_code)]
     pub(crate) fn code_h_scroll_of(&self, src_line: usize) -> f32 {
-        self.rd
-            .borrow()
-            .code_h_scroll
-            .borrow()
-            .get(&src_line)
-            .copied()
-            .unwrap_or(0.)
+        self.rd.borrow().h_scroll.scroll_of(HScrollKind::Code, src_line)
     }
     /// 设置代码块横向滚动偏移（px；实际交由 paint 侧按内容宽 clamp）。调用方 notify。
+    /// 仅供宿主测试消费的旧签名转发（生产经 `HScrollState::set_scroll` 写）→ allow 压
+    /// dead_code 告警。P3 / Slice C：写统一走 `HScrollState::set_scroll` 单一实现。
+    #[allow(dead_code)]
     pub(crate) fn set_code_h_scroll(&self, src_line: usize, v: f32) {
-        let v = v.max(0.);
-        if v <= 0.01 {
-            self.rd.borrow_mut().code_h_scroll.borrow_mut().remove(&src_line);
-        } else {
-            self.rd.borrow_mut().code_h_scroll.borrow_mut().insert(src_line, v);
-        }
+        self.rd.borrow().h_scroll.set_scroll(HScrollKind::Code, src_line, v);
     }
 
     /// 表格横向滚动偏移（px；键 = 表格块首源码行）。
     /// 仅供宿主测试消费的旧签名转发（生产无调用）→ allow 压 dead_code 告警。
+    /// P3 / Slice C：读统一走 `HScrollState::scroll_of`。
     #[allow(dead_code)]
     pub(crate) fn table_h_scroll_of(&self, src_line: usize) -> f32 {
-        self.rd
-            .borrow()
-            .table_h_scroll
-            .borrow()
-            .get(&src_line)
-            .copied()
-            .unwrap_or(0.)
+        self.rd.borrow().h_scroll.scroll_of(HScrollKind::Table, src_line)
     }
     /// 设置表格横向滚动偏移（px；实际交由 paint 侧按内容宽 clamp）。调用方 notify。
+    /// 仅供宿主测试消费的旧签名转发（生产经 `HScrollState::set_scroll` 写）→ allow 压
+    /// dead_code 告警。P3 / Slice C：写统一走 `HScrollState::set_scroll` 单一实现。
+    #[allow(dead_code)]
     pub(crate) fn set_table_h_scroll(&self, src_line: usize, v: f32) {
-        let v = v.max(0.);
-        if v <= 0.01 {
-            self.rd.borrow_mut().table_h_scroll.borrow_mut().remove(&src_line);
-        } else {
-            self.rd.borrow_mut().table_h_scroll.borrow_mut().insert(src_line, v);
-        }
+        self.rd.borrow().h_scroll.set_scroll(HScrollKind::Table, src_line, v);
     }
 
     /// 数学卡横向滚动偏移（px；键 = 数学块首源码行）。
     /// 仅供宿主测试消费的旧签名转发（生产无调用）→ allow 压 dead_code 告警。
+    /// P3 / Slice C：读统一走 `HScrollState::scroll_of`。
     #[allow(dead_code)]
     pub(crate) fn math_h_scroll_of(&self, src_line: usize) -> f32 {
-        self.rd
-            .borrow()
-            .math_h_scroll
-            .borrow()
-            .get(&src_line)
-            .copied()
-            .unwrap_or(0.)
+        self.rd.borrow().h_scroll.scroll_of(HScrollKind::Math, src_line)
     }
     /// 设置数学卡横向滚动偏移（px；实际交由 paint 侧按内容宽 clamp）。调用方 notify。
+    /// 仅供宿主测试消费的旧签名转发（生产经 `HScrollState::set_scroll` 写）→ allow 压
+    /// dead_code 告警。P3 / Slice C：写统一走 `HScrollState::set_scroll` 单一实现。
+    #[allow(dead_code)]
     pub(crate) fn set_math_h_scroll(&self, src_line: usize, v: f32) {
-        let v = v.max(0.);
-        if v <= 0.01 {
-            self.rd.borrow_mut().math_h_scroll.borrow_mut().remove(&src_line);
-        } else {
-            self.rd.borrow_mut().math_h_scroll.borrow_mut().insert(src_line, v);
-        }
+        self.rd.borrow().h_scroll.set_scroll(HScrollKind::Math, src_line, v);
     }
     /// 数学卡内容**自然宽**侧缓存（px；键 = 数学块首源码行）——paint 每次画卡时更新
     /// （引擎侧实现，宿主转发）。
@@ -459,22 +438,14 @@ impl WyEditor {
     /// `folded_headings` 按**文本键**存、不随行号错位（改标题文本键自然失效，折叠体
     /// 由 derived 平移/重建）→ 无需清理（结构编辑失效机理对照）。
     pub(crate) fn clear_src_line_view_state(&self, edit_line: usize, max_nl: usize) {
+        // P3 / Slice C：三段横向滚动（code/table/math）窗口 retain 收进
+        // `HScrollState::retain_src_line_window`（窗口语义与次序不变）；`math_natural_w` /
+        // `mermaid_zoom` 的 retain 保留在宿主侧。
+        self.rd
+            .borrow()
+            .h_scroll
+            .retain_src_line_window(edit_line, max_nl);
         let end = edit_line.saturating_add(max_nl);
-        self.rd
-            .borrow_mut()
-            .code_h_scroll
-            .borrow_mut()
-            .retain(|&l, _| l < edit_line || l > end);
-        self.rd
-            .borrow_mut()
-            .table_h_scroll
-            .borrow_mut()
-            .retain(|&l, _| l < edit_line || l > end);
-        self.rd
-            .borrow_mut()
-            .math_h_scroll
-            .borrow_mut()
-            .retain(|&l, _| l < edit_line || l > end);
         self.rd
             .borrow_mut()
             .math_natural_w

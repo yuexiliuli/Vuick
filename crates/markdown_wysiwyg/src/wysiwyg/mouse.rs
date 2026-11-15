@@ -2,21 +2,27 @@ use super::*;
 
 use crate::markdown::parse::recognition::{self, LinkHit};
 
-/// 三段横向滚动条（代码块 / 表格 / 数学卡）的统一 kind。P3 / Slice B 收敛：
-/// `mouse.rs` 的跳转 / 拖拽 / 按下 / 移动 / 松开接线按 kind 分发，行为与拆分前逐字节等价。
-#[derive(Clone, Copy, PartialEq)]
-enum HScrollKind {
-    Code,
-    Table,
-    Math,
-}
-
-impl HScrollKind {
-    /// 全部 kind（拖拽轮询 / 松开清槽按序使用，次序 = 拆分前三段 if 顺序）。
-    const ALL: [HScrollKind; 3] = [Self::Code, Self::Table, Self::Math];
-
+/// 三段横向滚动条（代码块 / 表格 / 数学卡）的统一 kind —— P3 / Slice C 收敛：枚举本体
+/// 上移 engine `model.rs`（`markdown_wysiwyg_engine::model::HScrollKind`，含 `pub const ALL`），
+/// 本文件经 `super::*`（mod.rs re-export）引入。类型跨 crate（引擎）不可加 inherent impl，
+/// 故把 mouse 专属接线 helper 改为**扩展 trait**承载；`kind.set_scroll(…)` 等方法调用点
+/// 经 trait 方法语法原样成立（行为与拆分前逐字节等价）。
+trait HScrollKindExt {
     /// 行定位谓词（**保留各侧既有单条件语义**，勿换 engine hit 侧双条件 `wrapped`）：
     /// code 有多段偏移、table 有表格、math 卡为 Math 卡。
+    fn row_matches(self, r: &ShapedRow) -> bool;
+    /// 滚动条几何（engine Slice A 仍为元组 `(bar_x, bar_w, _, thumb_w, max_scroll)`，消费端不动）。
+    fn geo(self, this: &WyEditor, f: &Frame, r: &ShapedRow) -> Option<(f32, f32, f32, f32, f32)>;
+    /// 写滚动偏移（`HScrollState::set_scroll` 单一实现；view setter 已收同款转发）。
+    /// 跳转由 `h_scroll_bar_down` 外层 notify、拖拽由 `h_scroll_drag_apply` 内部 notify。
+    fn set_scroll(self, this: &WyEditor, blk: usize, v: f32);
+    /// 读拖拽槽（`h_scroll.drag_of`，`Option<(块首源码行, 抓取点偏移)>`）。
+    fn drag_get(self, this: &WyEditor) -> Option<(usize, f32)>;
+    /// 写 / 清拖拽槽（`h_scroll.set_drag`）。
+    fn drag_set(self, this: &WyEditor, v: Option<(usize, f32)>);
+}
+
+impl HScrollKindExt for HScrollKind {
     fn row_matches(self, r: &ShapedRow) -> bool {
         match self {
             HScrollKind::Code => !r.multi_offsets.is_empty(),
@@ -25,7 +31,6 @@ impl HScrollKind {
         }
     }
 
-    /// 滚动条几何（engine Slice A 仍为元组 `(bar_x, bar_w, _, thumb_w, max_scroll)`，消费端不动）。
     fn geo(self, this: &WyEditor, f: &Frame, r: &ShapedRow) -> Option<(f32, f32, f32, f32, f32)> {
         match self {
             HScrollKind::Code => element::code_hscroll_geo(this, f, r),
@@ -34,34 +39,16 @@ impl HScrollKind {
         }
     }
 
-    /// 写滚动偏移（view `set_*_h_scroll`）；跳转由 `h_scroll_bar_down` 外层 notify、
-    /// 拖拽由 `h_scroll_drag_apply` 内部 notify。
     fn set_scroll(self, this: &WyEditor, blk: usize, v: f32) {
-        match self {
-            HScrollKind::Code => this.set_code_h_scroll(blk, v),
-            HScrollKind::Table => this.set_table_h_scroll(blk, v),
-            HScrollKind::Math => this.set_math_h_scroll(blk, v),
-        }
+        this.rd.borrow().h_scroll.set_scroll(self, blk, v);
     }
 
-    /// 读拖拽槽（`rd.*_h_drag`，`Option<(块首源码行, 抓取点偏移)>`）。
     fn drag_get(self, this: &WyEditor) -> Option<(usize, f32)> {
-        let rd = this.rd.borrow();
-        match self {
-            HScrollKind::Code => *rd.code_h_drag.borrow(),
-            HScrollKind::Table => *rd.table_h_drag.borrow(),
-            HScrollKind::Math => *rd.math_h_drag.borrow(),
-        }
+        this.rd.borrow().h_scroll.drag_of(self)
     }
 
-    /// 写 / 清拖拽槽。
     fn drag_set(self, this: &WyEditor, v: Option<(usize, f32)>) {
-        let rd = this.rd.borrow_mut();
-        match self {
-            HScrollKind::Code => *rd.code_h_drag.borrow_mut() = v,
-            HScrollKind::Table => *rd.table_h_drag.borrow_mut() = v,
-            HScrollKind::Math => *rd.math_h_drag.borrow_mut() = v,
-        }
+        this.rd.borrow().h_scroll.set_drag(self, v);
     }
 }
 

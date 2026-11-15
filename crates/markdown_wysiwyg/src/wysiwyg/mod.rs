@@ -51,6 +51,10 @@ mod mouse;
 /// 别名 re-export 保持 `wysiwyg::prewarm::{Prewarm, PrewarmSig}` 原路径
 /// （`frame/prewarm_band`、`settle_giant_blocks` 消费）。
 pub(crate) use markdown_wysiwyg_engine::prewarm;
+/// 三段横向滚动条（代码块 / 表格 / 数学卡）的统一 kind —— P3 / Slice C：枚举上移引擎
+/// `markdown_wysiwyg_engine::model`（连同 `HScrollState` 状态桶收敛），本文件 re-export
+/// 供 `view.rs`/`mouse.rs` 经 `super::*` 使用。
+pub(crate) use markdown_wysiwyg_engine::model::HScrollKind;
 /// `theme` 已随「元素引擎纯类型核心」拆为独立 crate `markdown_wysiwyg_engine`
 /// （`git mv` 迁出 `wysiwyg/theme.rs`）：此处以内联 shim 模块**重导出**引擎 `theme::*`，
 /// 下方 `self::theme::WyTheme` / `self::theme::{CaretVis, caret_vis, math_color,
@@ -375,10 +379,11 @@ pub struct WyEditor {
     /// 高亮代序列号：每次发起/清除高亮 +1，定时器只清除同代高亮。
     highlight_seq: u64,
     /// 代码/表格/数学横向滚动 6 态（`code_h_scroll`/`code_h_drag`/`table_h_scroll`/
-    /// `table_h_drag`/`math_h_scroll`/`math_h_drag`）、数学卡自然宽侧缓存
-    /// （`math_natural_w`）、已折叠标题区块（`folded_headings`）已全部迁入 [`Self::rd`]
-    ///（`WyRenderModel`，见引擎 `model.rs` 对应字段注释）；宿主访问
-    /// `self.rd.borrow_mut().code_h_scroll` 等（失效语义不变）。
+    /// `table_h_drag`/`math_h_scroll`/`math_h_drag`）已随 P3 / Slice C 收敛为
+    /// [`markdown_wysiwyg_engine::model::HScrollState`]（`h_scroll` 字段，按 `HScrollKind`
+    /// 分桶）；数学卡自然宽侧缓存（`math_natural_w`）、已折叠标题区块（`folded_headings`）
+    /// 仍为 `WyRenderModel` 直接字段（见引擎 `model.rs` 对应字段注释）。宿主访问
+    /// `self.rd.borrow().h_scroll.set_scroll(...)` 等（失效语义不变）。
     /// 当前文档中每个可编辑块的**区域**（代码内容行/表格表头+数据行）与**围栏行**
     /// （代码 ``` 标记行、表格分隔行，只读）。导航/退格/删除据此避免光标落进
     /// 只读围栏（否则在隐藏围栏上输入会破坏结构）。随文本变更重建。

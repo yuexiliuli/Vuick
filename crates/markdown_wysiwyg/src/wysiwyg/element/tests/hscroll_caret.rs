@@ -71,7 +71,7 @@ fn table_overflow_shows_hscroll_and_track_drag(cx: &mut TestAppContext) {
         assert!(jumped > 0., "点击轨道应立刻跳转：{jumped}");
         assert!(jumped <= max_scroll, "{jumped} ≤ {max_scroll}");
         assert!(
-            ed.read(cx).rd.borrow().table_h_drag.borrow().is_none(),
+            ed.read(cx).rd.borrow().h_scroll.table.drag.borrow().is_none(),
             "轨道跳转不应进入拖动态"
         );
         // 点滑块（滚动后滑块位置）→ 拖到最左 → 偏移归零；松开清态；源码不变。
@@ -92,7 +92,7 @@ fn table_overflow_shows_hscroll_and_track_drag(cx: &mut TestAppContext) {
         };
         ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
         assert!(
-            ed.read(cx).rd.borrow().table_h_drag.borrow().is_some(),
+            ed.read(cx).rd.borrow().h_scroll.table.drag.borrow().is_some(),
             "点滑块应进入拖动态"
         );
         let up_x = bar_x + bar_w * 0.05;
@@ -112,7 +112,7 @@ fn table_overflow_shows_hscroll_and_track_drag(cx: &mut TestAppContext) {
         };
         ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
         assert!(
-            ed.read(cx).rd.borrow().table_h_drag.borrow().is_none(),
+            ed.read(cx).rd.borrow().h_scroll.table.drag.borrow().is_none(),
             "松开应清除拖拽态"
         );
         assert_eq!(
@@ -342,7 +342,7 @@ fn code_block_hscroll_track_click_jumps(cx: &mut TestAppContext) {
         let jumped = ed.read(cx).code_h_scroll_of(blk);
         assert!(jumped > 0., "点击轨道应立刻跳转（不拖也动）：{jumped}");
         assert!(
-            ed.read(cx).rd.borrow().code_h_drag.borrow().is_none(),
+            ed.read(cx).rd.borrow().h_scroll.code.drag.borrow().is_none(),
             "轨道跳转不应进入拖动态"
         );
         assert!(
@@ -376,7 +376,7 @@ fn code_block_hscroll_track_click_jumps(cx: &mut TestAppContext) {
         };
         ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
         assert!(
-            ed.read(cx).rd.borrow().code_h_drag.borrow().is_some(),
+            ed.read(cx).rd.borrow().h_scroll.code.drag.borrow().is_some(),
             "点滑块应进入拖动态"
         );
         let ev_move = MouseMoveEvent {
@@ -394,7 +394,7 @@ fn code_block_hscroll_track_click_jumps(cx: &mut TestAppContext) {
             click_count: 1,
         };
         ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
-        assert!(ed.read(cx).rd.borrow().code_h_drag.borrow().is_none(), "松开应清拖拽态");
+        assert!(ed.read(cx).rd.borrow().h_scroll.code.drag.borrow().is_none(), "松开应清拖拽态");
     });
 }
 
@@ -468,7 +468,7 @@ fn code_block_hscroll_thumb_drag_tracks_pointer_without_jump(cx: &mut TestAppCon
             mid,
             "按下滑块瞬间不应跳档（old grab=中心导致前跳半个滑块宽）"
         );
-        assert!(ed.read(cx).rd.borrow().code_h_drag.borrow().is_some(), "应在拖动态");
+        assert!(ed.read(cx).rd.borrow().h_scroll.code.drag.borrow().is_some(), "应在拖动态");
 
         // 2) 拖动 +Δ：滑块钉住抓取点 1:1 跟随 → thumb_x_new = p − grab（轨内 clamp）。
         let p1_x = p0_x + 60.0;
@@ -510,7 +510,7 @@ fn code_block_hscroll_thumb_drag_tracks_pointer_without_jump(cx: &mut TestAppCon
             click_count: 1,
         };
         ed.update(cx, |e, cx| e.on_mouse_up(&up, cx));
-        assert!(ed.read(cx).rd.borrow().code_h_drag.borrow().is_none(), "松开应清拖拽态");
+        assert!(ed.read(cx).rd.borrow().h_scroll.code.drag.borrow().is_none(), "松开应清拖拽态");
     });
 }
 

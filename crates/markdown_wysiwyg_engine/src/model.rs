@@ -114,6 +114,102 @@ pub struct InlineImageRef {
     pub start: usize,
 }
 
+/// 三段横向滚动条（代码块 / 表格 / 数学卡）的统一 kind。P3 / Slice C 收敛：原定义在
+/// wysiwyg `mouse.rs` 的局部枚举上移为引擎模型类型，连同 [`HScrollState`] 状态桶一起，
+/// 消费面（view/mouse/hit）统一经 kind 索引。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HScrollKind {
+    Code,
+    Table,
+    Math,
+}
+
+impl HScrollKind {
+    /// 全部 kind（拖拽轮询 / 松开清槽按序使用，次序 = 拆分前三段 if 顺序）。
+    pub const ALL: [HScrollKind; 3] = [Self::Code, Self::Table, Self::Math];
+}
+
+/// 单个 kind 的横向滚动状态桶：`scroll` = 滚动偏移表（键 = 块首源码行），`drag` = 拖拽槽
+/// （`Some((块首源码行, 指针相对滑块左缘偏移))`）。纯视图状态，不写源码、不进撤销栈。
+/// P3 / Slice C：由原 `{code,table,math}_h_scroll` / `{code,table,math}_h_drag` 各二字段收敛。
+pub struct HScrollBucket {
+    pub scroll: RefCell<HashMap<usize, f32>>,
+    pub drag: RefCell<Option<(usize, f32)>>,
+}
+
+impl HScrollBucket {
+    fn new() -> Self {
+        Self {
+            scroll: RefCell::new(HashMap::new()),
+            drag: RefCell::new(None),
+        }
+    }
+}
+
+/// 代码/表格/数学三段横向滚动状态（code / table / math 各一桶）。P3 / Slice C 收敛：
+/// setter 阈值（`v=max(0.)`、`<=0.01` 删键）与窗口 retain 语义逐一保留在此单一实现。
+pub struct HScrollState {
+    pub code: HScrollBucket,
+    pub table: HScrollBucket,
+    pub math: HScrollBucket,
+}
+
+impl HScrollState {
+    /// 全新建一份（与迁移前各 `RefCell` 初值逐字一致）。
+    pub fn new() -> Self {
+        Self {
+            code: HScrollBucket::new(),
+            table: HScrollBucket::new(),
+            math: HScrollBucket::new(),
+        }
+    }
+
+    fn bucket(&self, k: HScrollKind) -> &HScrollBucket {
+        match k {
+            HScrollKind::Code => &self.code,
+            HScrollKind::Table => &self.table,
+            HScrollKind::Math => &self.math,
+        }
+    }
+
+    /// 读某 kind 的滚动偏移（缺键 = 0）。
+    pub fn scroll_of(&self, k: HScrollKind, src: usize) -> f32 {
+        self.bucket(k).scroll.borrow().get(&src).copied().unwrap_or(0.)
+    }
+
+    /// 写某 kind 的滚动偏移（**唯一 setter 实现**）：`<0` 归一 0，`<=0.01` 删键否则插键。
+    pub fn set_scroll(&self, k: HScrollKind, src: usize, v: f32) {
+        let v = v.max(0.);
+        let mut m = self.bucket(k).scroll.borrow_mut();
+        if v <= 0.01 {
+            m.remove(&src);
+        } else {
+            m.insert(src, v);
+        }
+    }
+
+    /// 写 / 清某 kind 的拖拽槽。
+    pub fn set_drag(&self, k: HScrollKind, v: Option<(usize, f32)>) {
+        *self.bucket(k).drag.borrow_mut() = v;
+    }
+
+    /// 读某 kind 的拖拽槽。
+    pub fn drag_of(&self, k: HScrollKind) -> Option<(usize, f32)> {
+        *self.bucket(k).drag.borrow()
+    }
+
+    /// 结构编辑后清除「`edit_line..=edit_line+max_nl` 行窗」内以 src 为键的三段横向滚动
+    /// 偏移（窗口 retain 语义与次序同拆分前 `clear_src_line_view_state`；`math_natural_w` /
+    /// `mermaid_zoom` 的 retain 仍在宿主侧同函数保留）。
+    pub fn retain_src_line_window(&self, edit_line: usize, max_nl: usize) {
+        let end = edit_line.saturating_add(max_nl);
+        for k in HScrollKind::ALL {
+            let mut m = self.bucket(k).scroll.borrow_mut();
+            m.retain(|&l, _| l < edit_line || l > end);
+        }
+    }
+}
+
 /// WYSIWYG 宿主 `WyEditor` 的**渲染模型状态**（单一租户：宿主持 `RefCell<WyRenderModel>`
 /// 并迁移全部访问点为 `self.rd.borrow()/.borrow_mut()`）。
 ///
@@ -258,24 +354,11 @@ pub struct WyRenderModel {
     /// 结构编辑/换源/主题色变化清空（行号或颜色失效）；其余时间的钉是 Op(块数) 的有界
     /// 缓存（每块至多一条，位图 `Arc` 与槽共享）。
     pub math_pins: RefCell<HashMap<usize, BlockMathPin>>,
-    /// 代码块横向滚动偏移（px；键 = 代码块首源码行）。长代码行 nowrap 超宽时
-    /// 由横向滚动条/拖动驱动（paint 平移 + 命中/光标/选区反向加回）。纯视图状态，
+    /// 代码/表格/数学三段横向滚动状态（滚动偏移表 + 拖拽槽，按 [`HScrollKind`] 分桶）。
+    /// P3 / Slice C：原 6 个 `{code,table,math}_h_scroll`/`{code,table,math}_h_drag` 字段
+    /// 收敛为 [`HScrollState`]（setter 阈值 / 窗口 retain 语义逐一保留）。纯视图状态，
     /// 不写源码、不进撤销栈。
-    pub code_h_scroll: RefCell<HashMap<usize, f32>>,
-    /// 代码块横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块左缘偏移))`。
-    pub code_h_drag: RefCell<Option<(usize, f32)>>,
-    /// 表格横向滚动偏移（px；键 = 表格块首源码行）。超宽表格（`total_w` > 内容宽）
-    /// 由底部横向滚动条驱动（paint 平移 + 命中/光标反向加回，参考代码块 `code_h_scroll`；
-    /// 对齐 preview `markdown/view` 的表格溢出横向滚动）。纯视图状态，不写源码、不进撤销栈。
-    pub table_h_scroll: RefCell<HashMap<usize, f32>>,
-    /// 表格横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块左缘偏移))`。
-    pub table_h_drag: RefCell<Option<(usize, f32)>>,
-    /// 数学卡横向滚动偏移（px；键 = 数学块首源码行）。公式自然宽 > 内容盒（长公式
-    /// **不缩小**）时由底部横向滚动条/拖动驱动（paint 平移 + 命中反向加回，同
-    /// 代码块 `code_h_scroll`）。纯视图状态，不写源码、不进撤销栈。
-    pub math_h_scroll: RefCell<HashMap<usize, f32>>,
-    /// 数学卡横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块左缘偏移))`。
-    pub math_h_drag: RefCell<Option<(usize, f32)>>,
+    pub h_scroll: HScrollState,
     /// 数学卡内容的**自然宽**侧缓存（px；键 = 数学块首源码行）：paint 每次画卡时
     /// 测好（位图逻辑宽 / Unicode 行最大宽），命中/滚动条几何（宿主 `math_hscroll_geo`）
     /// 读它——避免 hit 期无窗口无法排版 Unicode。与滚动偏移同源 `math_h_scroll`。
@@ -342,12 +425,7 @@ impl WyRenderModel {
             mermaid_zoom: RefCell::new(HashMap::new()),
             mermaid_zoom_gen: Cell::new(0),
             math_pins: RefCell::new(HashMap::new()),
-            code_h_scroll: RefCell::new(HashMap::new()),
-            code_h_drag: RefCell::new(None),
-            table_h_scroll: RefCell::new(HashMap::new()),
-            table_h_drag: RefCell::new(None),
-            math_h_scroll: RefCell::new(HashMap::new()),
-            math_h_drag: RefCell::new(None),
+            h_scroll: HScrollState::new(),
             math_natural_w: RefCell::new(HashMap::new()),
             folded_headings: RefCell::new(HashSet::new()),
             marker_hl: Cell::new(None),

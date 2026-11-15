@@ -276,7 +276,7 @@ fn code_block_overflow_shows_hscroll_and_shifts_hit(cx: &mut TestAppContext) {
         };
         ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
         assert!(
-            ed.read(cx).rd.borrow().code_h_drag.borrow().is_none(),
+            ed.read(cx).rd.borrow().h_scroll.code.drag.borrow().is_none(),
             "松开应清除拖拽态"
         );
         // 视图本地状态：源码未变。

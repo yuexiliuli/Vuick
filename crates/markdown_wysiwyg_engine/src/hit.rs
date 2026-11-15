@@ -12,7 +12,7 @@ use gpui::{Bounds, Pixels, Point, point, px, size};
 use crate::element::*;
 use crate::element::geom::{code_group_at, code_group_top, group_from_rend, group_len, render_point_of, source_to_display, table_cell_at_src, table_cell_index, table_cell_x0, table_row_at, table_row_top, text_band_at, text_row_shift, text_y_off};
 use crate::frame::reading_col_shift;
-use crate::model::WyRenderModel;
+use crate::model::{HScrollKind, WyRenderModel};
 use crate::{WyRenderHost, docutil};
 use crate::paint::{MathCardDisplay, math_card_display};
 use markdown::ir::IrKind;
@@ -1008,13 +1008,7 @@ pub(crate) fn code_hscroll_geom_inner(
         .iter()
         .map(|wl| f32::from(wl.width()))
         .fold(0.0f32, f32::max);
-    let scroll = rd
-        .borrow()
-        .code_h_scroll
-        .borrow()
-        .get(&row.src_line)
-        .copied()
-        .unwrap_or(0.);
+    let scroll = rd.borrow().h_scroll.scroll_of(HScrollKind::Code, row.src_line);
     hscroll_geom(
         f32::from(f.padding) + inset,
         viewport,
@@ -1044,12 +1038,7 @@ pub fn code_hscroll_clamped(
 ) -> f32 {
     match code_hscroll_geom_inner(rd, host, f, row) {
         Some(g) => clamp_scroll(
-            rd.borrow()
-                .code_h_scroll
-                .borrow()
-                .get(&row.src_line)
-                .copied()
-                .unwrap_or(0.),
+            rd.borrow().h_scroll.scroll_of(HScrollKind::Code, row.src_line),
             g.max_scroll,
         ),
         None => 0.,
@@ -1096,13 +1085,7 @@ pub(crate) fn table_hscroll_geom_inner(
     let x_off = f32::from(row.x_off);
     let viewport = (f32::from(f.width) - f32::from(f.padding) * 2. - x_off).max(1.);
     let max_w = t.total_w.max(1.);
-    let scroll = rd
-        .borrow()
-        .table_h_scroll
-        .borrow()
-        .get(&row.src_line)
-        .copied()
-        .unwrap_or(0.);
+    let scroll = rd.borrow().h_scroll.scroll_of(HScrollKind::Table, row.src_line);
     hscroll_geom(
         f32::from(f.padding) + x_off,
         viewport,
@@ -1132,12 +1115,7 @@ pub fn table_hscroll_clamped(
 ) -> f32 {
     match table_hscroll_geom_inner(rd, host, f, row) {
         Some(g) => clamp_scroll(
-            rd.borrow()
-                .table_h_scroll
-                .borrow()
-                .get(&row.src_line)
-                .copied()
-                .unwrap_or(0.),
+            rd.borrow().h_scroll.scroll_of(HScrollKind::Table, row.src_line),
             g.max_scroll,
         ),
         None => 0.,
@@ -1202,13 +1180,7 @@ pub(crate) fn math_hscroll_geom_inner(
     }
     let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
     let natural_w = math_natural_w(rd, host, row);
-    let scroll = rd
-        .borrow()
-        .math_h_scroll
-        .borrow()
-        .get(&row.src_line)
-        .copied()
-        .unwrap_or(0.);
+    let scroll = rd.borrow().h_scroll.scroll_of(HScrollKind::Math, row.src_line);
     hscroll_geom(
         f32::from(f.padding),
         viewport,
@@ -1238,12 +1210,7 @@ pub fn math_hscroll_clamped(
 ) -> f32 {
     match math_hscroll_geom_inner(rd, host, f, row) {
         Some(g) => clamp_scroll(
-            rd.borrow()
-                .math_h_scroll
-                .borrow()
-                .get(&row.src_line)
-                .copied()
-                .unwrap_or(0.),
+            rd.borrow().h_scroll.scroll_of(HScrollKind::Math, row.src_line),
             g.max_scroll,
         ),
         None => 0.,
