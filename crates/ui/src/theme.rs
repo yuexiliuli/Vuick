@@ -396,6 +396,42 @@ pub const TOAST_DOUBLE_HIGH_ALPHA: f32 = 0.18;
 /// 与 NearDouble/PopoverDouble 的近层 α0.12 不同，故独立成档）。
 pub const TOAST_DOUBLE_PEAK_ALPHA: f32 = 0.14;
 
+/// 由 RRGGBBAA 十六进制编译期构造 [`Rgba`]（`gpui::rgba` 非 const fn，这里用结构体
+/// 字面量等价：逐分量 `byte as f32 / 255.0`，与 `rgba(hex)` 逐位一致）。
+const fn const_rgba(hex: u32) -> Rgba {
+    Rgba {
+        r: ((hex >> 24) & 0xff) as f32 / 255.0,
+        g: ((hex >> 16) & 0xff) as f32 / 255.0,
+        b: ((hex >> 8) & 0xff) as f32 / 255.0,
+        a: (hex & 0xff) as f32 / 255.0,
+    }
+}
+
+/// 由 RRGGBB 十六进制编译期构造不透明 [`Rgba`]（同 `gpui::rgb`：忽略高字节、alpha 恒 1）。
+const fn const_rgb(hex: u32) -> Rgba {
+    Rgba {
+        r: ((hex >> 16) & 0xff) as f32 / 255.0,
+        g: ((hex >> 8) & 0xff) as f32 / 255.0,
+        b: (hex & 0xff) as f32 / 255.0,
+        a: 1.0,
+    }
+}
+
+/// 通用悬停填充（亮档，黑 5% `0x0000000d`）：`ChromeColors::light().hover_fill` 单一来源。
+pub const CHROME_HOVER_FILL_LIGHT: Rgba = const_rgba(0x0000000d);
+/// 通用悬停填充（暗档，白 8% `0xffffff14`）：`ChromeColors::dark().hover_fill` 单一来源；
+/// music 窗口控制钮 hover 填充逐字对齐本值。
+pub const CHROME_HOVER_FILL_DARK: Rgba = const_rgba(0xffffff14);
+/// 通用按压填充（亮档，黑 9% `0x00000017`）：`ChromeColors::light().pressed_fill` 单一来源。
+pub const CHROME_PRESSED_FILL_LIGHT: Rgba = const_rgba(0x00000017);
+/// 通用按压填充（暗档，白 14% `0xffffff24`）：`ChromeColors::dark().pressed_fill` 单一来源；
+/// music 窗口控制钮按压填充逐字对齐本值。
+pub const CHROME_PRESSED_FILL_DARK: Rgba = const_rgba(0xffffff24);
+/// 关闭按钮悬停填充（Win11 危险红 `#e81123`，亮暗同值）。
+pub const CHROME_CLOSE_HOVER: Rgba = const_rgb(0xe81123);
+/// 关闭按钮按压填充（危险红深一档 `#a70d1a`，亮暗同值）。
+pub const CHROME_CLOSE_PRESSED: Rgba = const_rgb(0xa70d1a);
+
 impl ChromeColors {
     pub fn light() -> Self {
         let c = ColorScheme::light();
@@ -422,10 +458,10 @@ impl ChromeColors {
             pill_bg: rgb(0xe8e8e8),
             pill_fg: c.fg,
             dirty: c.error,
-            hover_fill: rgba(0x0000000d),
-            pressed_fill: rgba(0x00000017),
-            close_hover: rgb(0xe81123),
-            close_pressed: rgb(0xa70d1a),
+            hover_fill: CHROME_HOVER_FILL_LIGHT,
+            pressed_fill: CHROME_PRESSED_FILL_LIGHT,
+            close_hover: CHROME_CLOSE_HOVER,
+            close_pressed: CHROME_CLOSE_PRESSED,
             drag_ghost_bg: c.accent,
             menu_highlight: rgba(0x00000014),
             // 滚动条滑块 = 半透明中性灰（亮暗同值，原 shell rgba(0x6060604a)）
@@ -462,10 +498,10 @@ impl ChromeColors {
             pill_bg: rgb(0x3a3a3a),
             pill_fg: c.fg,
             dirty: c.error,
-            hover_fill: rgba(0xffffff14),
-            pressed_fill: rgba(0xffffff24),
-            close_hover: rgb(0xe81123),
-            close_pressed: rgb(0xa70d1a),
+            hover_fill: CHROME_HOVER_FILL_DARK,
+            pressed_fill: CHROME_PRESSED_FILL_DARK,
+            close_hover: CHROME_CLOSE_HOVER,
+            close_pressed: CHROME_CLOSE_PRESSED,
             drag_ghost_bg: c.accent,
             menu_highlight: rgba(0xffffff1a),
             // 滚动条滑块 = 半透明中性灰（亮暗同值，原 shell rgba(0x6060604a)）
@@ -477,11 +513,7 @@ impl ChromeColors {
 
     /// 按明暗模式取对应一套（无 App 上下文时的便捷入口）。
     pub fn for_mode(dark: bool) -> Self {
-        if dark {
-            Self::dark()
-        } else {
-            Self::light()
-        }
+        if dark { Self::dark() } else { Self::light() }
     }
 }
 
@@ -558,7 +590,7 @@ fn language_badge_hue(label: &str) -> (f32, bool) {
         "JSON" => (0.22, true),       // 土黄
         "EPUB" => (0.78, true),       // 紫
         "PDF" => (0.02, true),        // 红
-        "图片" => (0.86, true),        // 品红
+        "图片" => (0.86, true),       // 品红
         _ => (0.60, false),           // 纯文本/文本：低饱和中性灰蓝
     }
 }
@@ -613,9 +645,20 @@ mod tests {
         assert_ne!(light.colors.fg, dark.colors.fg, "亮/暗主文字应不同");
         assert_ne!(light.colors.fg, light.colors.fg_muted, "主次文字应不同");
         // Fluent 双套强调色：亮底用深蓝、暗底用亮蓝（微软规范，保证两种底色下对比达标）。
-        assert_ne!(light.colors.accent, dark.colors.accent, "亮/暗强调色不再统一（Fluent 亮深蓝 vs 暗亮蓝）");
-        assert_eq!(light.colors.accent, rgb(0x005fb8), "亮主题强调色=#005FB8（Fluent 亮系默认蓝）");
-        assert_eq!(dark.colors.accent, rgb(0x60cdff), "暗主题强调色=#60CDFF（Win11 暗色亮蓝）");
+        assert_ne!(
+            light.colors.accent, dark.colors.accent,
+            "亮/暗强调色不再统一（Fluent 亮深蓝 vs 暗亮蓝）"
+        );
+        assert_eq!(
+            light.colors.accent,
+            rgb(0x005fb8),
+            "亮主题强调色=#005FB8（Fluent 亮系默认蓝）"
+        );
+        assert_eq!(
+            dark.colors.accent,
+            rgb(0x60cdff),
+            "暗主题强调色=#60CDFF（Win11 暗色亮蓝）"
+        );
         assert_ne!(light.colors.link, dark.colors.link, "链接色随明暗切换");
     }
 
@@ -638,16 +681,31 @@ mod tests {
         assert_eq!(light.colors.editor_code_bg, rgb(0xf2f2f2));
         assert_eq!(dark.colors.editor_code_bg, rgb(0x2e2e2e));
         // 引述底 / 表头底随明暗切换，且同档里互不相同（层次可辨）
-        assert_ne!(light.colors.quote_bg, dark.colors.quote_bg, "引述底色随明暗");
-        assert_ne!(light.colors.table_head_bg, dark.colors.table_head_bg, "表头底色随明暗");
-        assert_ne!(light.colors.quote_bg, light.colors.table_head_bg, "亮引述≠亮表头（#F7F7F7 vs #F2F2F2）");
-        assert_ne!(dark.colors.quote_bg, dark.colors.table_head_bg, "暗引述≠暗表头（#262626 vs #323232）");
+        assert_ne!(
+            light.colors.quote_bg, dark.colors.quote_bg,
+            "引述底色随明暗"
+        );
+        assert_ne!(
+            light.colors.table_head_bg, dark.colors.table_head_bg,
+            "表头底色随明暗"
+        );
+        assert_ne!(
+            light.colors.quote_bg, light.colors.table_head_bg,
+            "亮引述≠亮表头（#F7F7F7 vs #F2F2F2）"
+        );
+        assert_ne!(
+            dark.colors.quote_bg, dark.colors.table_head_bg,
+            "暗引述≠暗表头（#262626 vs #323232）"
+        );
         // 标题/链接/弹层同源蓝系，随明暗切换
         assert_eq!(light.colors.heading, light.colors.link, "亮标题=亮链接同蓝");
         assert_eq!(dark.colors.heading, dark.colors.link, "暗标题=暗链接同蓝");
         assert_ne!(light.colors.heading, dark.colors.heading, "标题色随明暗");
         // 悬浮卡片底随明暗（亮 #FFFFFF / 暗 #333333）
-        assert_ne!(light.colors.popover_bg, dark.colors.popover_bg, "弹层底色随明暗");
+        assert_ne!(
+            light.colors.popover_bg, dark.colors.popover_bg,
+            "弹层底色随明暗"
+        );
     }
 
     #[gpui::test]
@@ -681,7 +739,10 @@ mod tests {
                 );
             }
         }
-        assert_ne!(light.mermaid_border, dark.mermaid_border, "边线色随明暗分流");
+        assert_ne!(
+            light.mermaid_border, dark.mermaid_border,
+            "边线色随明暗分流"
+        );
     }
 
     #[gpui::test]
@@ -691,12 +752,28 @@ mod tests {
         // 竖线穿选区透出），折叠/光标行保持不透明（暗 #172931/#242525、亮 #E6EFF8×2）。
         let light = Theme::light().colors;
         let dark = Theme::dark().colors;
-        assert_eq!(dark.editor_selection_bg, rgba(0x3ab5e973), "暗选区底（半透明补偿色）");
+        assert_eq!(
+            dark.editor_selection_bg,
+            rgba(0x3ab5e973),
+            "暗选区底（半透明补偿色）"
+        );
         assert_eq!(dark.editor_fold_bg, rgb(0x172931), "暗折叠行底色");
-        assert_eq!(dark.editor_active_line_bg, rgb(0x242525), "暗光标行底色（已与折叠行区分）");
-        assert_eq!(light.editor_selection_bg, rgba(0x619bd373), "亮选区底（半透明补偿色）");
+        assert_eq!(
+            dark.editor_active_line_bg,
+            rgb(0x242525),
+            "暗光标行底色（已与折叠行区分）"
+        );
+        assert_eq!(
+            light.editor_selection_bg,
+            rgba(0x619bd373),
+            "亮选区底（半透明补偿色）"
+        );
         assert_eq!(light.editor_fold_bg, rgb(0xe6eff8), "亮折叠行底色");
-        assert_eq!(light.editor_active_line_bg, rgb(0xe6eff8), "亮光标行底色 = 折叠行同色");
+        assert_eq!(
+            light.editor_active_line_bg,
+            rgb(0xe6eff8),
+            "亮光标行底色 = 折叠行同色"
+        );
         // 选区半透明（竖线透出契约）；折叠/光标行不透明不动。
         assert!(dark.editor_selection_bg.a < 1.0, "暗选区底应半透明（a<1）");
         assert!(light.editor_selection_bg.a < 1.0, "亮选区底应半透明（a<1）");
@@ -705,14 +782,32 @@ mod tests {
         // 语义不变式：亮色光标行底色恒等于折叠行底色；暗色三档两两互不相同（折叠冷灰蓝
         // #172931 / 光标行中性灰 #242525 / 选区半透明蓝系另档）。两主题都「折叠/光标
         // 行比选区更贴背景」。
-        assert_ne!(dark.editor_selection_bg, dark.editor_fold_bg, "暗：选区 ≠ 折叠");
-        assert_ne!(dark.editor_selection_bg, dark.editor_active_line_bg, "暗：选区 ≠ 光标行");
-        assert_ne!(dark.editor_fold_bg, dark.editor_active_line_bg, "暗：折叠 ≠ 光标行（两色已区分）");
-        assert_eq!(light.editor_active_line_bg, light.editor_fold_bg, "亮：光标行=折叠行");
+        assert_ne!(
+            dark.editor_selection_bg, dark.editor_fold_bg,
+            "暗：选区 ≠ 折叠"
+        );
+        assert_ne!(
+            dark.editor_selection_bg, dark.editor_active_line_bg,
+            "暗：选区 ≠ 光标行"
+        );
+        assert_ne!(
+            dark.editor_fold_bg, dark.editor_active_line_bg,
+            "暗：折叠 ≠ 光标行（两色已区分）"
+        );
+        assert_eq!(
+            light.editor_active_line_bg, light.editor_fold_bg,
+            "亮：光标行=折叠行"
+        );
         // 同同档值随明暗分离（暗深 / 亮浅）。
-        assert_ne!(dark.editor_selection_bg, light.editor_selection_bg, "选区底色随明暗");
+        assert_ne!(
+            dark.editor_selection_bg, light.editor_selection_bg,
+            "选区底色随明暗"
+        );
         assert_ne!(dark.editor_fold_bg, light.editor_fold_bg, "折叠底色随明暗");
-        assert_ne!(dark.editor_active_line_bg, light.editor_active_line_bg, "光标行底色随明暗");
+        assert_ne!(
+            dark.editor_active_line_bg, light.editor_active_line_bg,
+            "光标行底色随明暗"
+        );
     }
 
     #[gpui::test]
@@ -723,7 +818,11 @@ mod tests {
         let dark = Theme::dark().colors;
         assert_eq!(light.editor_find_match_bg, rgb(0xffe497), "亮非当前=弱黄");
         assert_eq!(light.editor_find_current_bg, rgb(0xffb703), "亮当前=强橙");
-        assert_eq!(dark.editor_find_match_bg, rgb(0x4a3f16), "暗非当前=弱黄暗档");
+        assert_eq!(
+            dark.editor_find_match_bg,
+            rgb(0x4a3f16),
+            "暗非当前=弱黄暗档"
+        );
         assert_eq!(dark.editor_find_current_bg, rgb(0xffb703), "暗当前=强橙");
         assert_ne!(
             light.editor_find_match_bg, light.editor_find_current_bg,
@@ -742,15 +841,38 @@ mod tests {
         // 半透明（a<1）保证叠在纸面/正文上透出下方内容。
         let light = Theme::light().colors;
         let dark = Theme::dark().colors;
-        assert_eq!(light.doc_selection_bg, rgba(0x4d6bfe42), "亮文档选区底=原 rgba(0x4d6bfe42)");
-        assert_eq!(dark.doc_selection_bg, rgba(0x4d6bfe61), "暗文档选区底=原 rgba(0x4d6bfe61)");
-        assert_ne!(light.doc_selection_bg, dark.doc_selection_bg, "文档选区底色随明暗");
-        assert!(light.doc_selection_bg.a < 1.0, "亮文档选区底应半透明（a<1）");
+        assert_eq!(
+            light.doc_selection_bg,
+            rgba(0x4d6bfe42),
+            "亮文档选区底=原 rgba(0x4d6bfe42)"
+        );
+        assert_eq!(
+            dark.doc_selection_bg,
+            rgba(0x4d6bfe61),
+            "暗文档选区底=原 rgba(0x4d6bfe61)"
+        );
+        assert_ne!(
+            light.doc_selection_bg, dark.doc_selection_bg,
+            "文档选区底色随明暗"
+        );
+        assert!(
+            light.doc_selection_bg.a < 1.0,
+            "亮文档选区底应半透明（a<1）"
+        );
         assert!(dark.doc_selection_bg.a < 1.0, "暗文档选区底应半透明（a<1）");
         // 与按钮选中基底 / 编辑器选区补偿色彼此可辨（不同色相/透明度档，不可混用）。
-        assert_ne!(light.doc_selection_bg, light.selected_bg, "亮文档选区 ≠ 按钮选中基底");
-        assert_ne!(dark.doc_selection_bg, dark.selected_bg, "暗文档选区 ≠ 按钮选中基底");
-        assert_ne!(light.doc_selection_bg, light.editor_selection_bg, "亮文档选区 ≠ 编辑器选区");
+        assert_ne!(
+            light.doc_selection_bg, light.selected_bg,
+            "亮文档选区 ≠ 按钮选中基底"
+        );
+        assert_ne!(
+            dark.doc_selection_bg, dark.selected_bg,
+            "暗文档选区 ≠ 按钮选中基底"
+        );
+        assert_ne!(
+            light.doc_selection_bg, light.editor_selection_bg,
+            "亮文档选区 ≠ 编辑器选区"
+        );
     }
 
     #[gpui::test]
@@ -774,7 +896,11 @@ mod tests {
         assert_eq!(light.pill_bg, rgb(0xe8e8e8), "亮 pill 底色=chip 底");
         assert_eq!(dark.window_bg, rgb(0x202020), "暗窗口背景");
         assert_eq!(dark.panel_bg, rgb(0x2b2b2b), "暗面板背景=内容 bg");
-        assert_eq!(dark.bar_border, rgba(0xffffff1a), "暗工具条分隔边框=内容 border");
+        assert_eq!(
+            dark.bar_border,
+            rgba(0xffffff1a),
+            "暗工具条分隔边框=内容 border"
+        );
         // pill 跟随 chip 令牌（不再是旧的主蓝高亮胶囊）
         assert_eq!(light.pill_bg, light.chip_bg, "亮 pill=chip 底");
         assert_eq!(light.pill_fg, light.chip_text, "亮 pill=chip 字");
@@ -810,8 +936,14 @@ mod tests {
         assert_ne!(dc.selected_bg, dc.pressed_bg, "暗选中与按压深浅不同");
         assert_ne!(lc.selected_bg, dc.selected_bg, "选中基底随明暗");
         assert_ne!(lc.pressed_bg, dc.pressed_bg, "按压基底随明暗");
-        assert!(lc.selected_bg.a < lc.pressed_bg.a, "亮按压 alpha 应大于选中");
-        assert!(dc.selected_bg.a < dc.pressed_bg.a, "暗按压 alpha 应大于选中");
+        assert!(
+            lc.selected_bg.a < lc.pressed_bg.a,
+            "亮按压 alpha 应大于选中"
+        );
+        assert!(
+            dc.selected_bg.a < dc.pressed_bg.a,
+            "暗按压 alpha 应大于选中"
+        );
         // 拖拽强调线 = 各档强调色同源。
         assert_eq!(lc.drag_hover_border, lc.accent, "亮拖拽线 = 亮强调色");
         assert_eq!(dc.drag_hover_border, dc.accent, "暗拖拽线 = 暗强调色");
@@ -823,22 +955,25 @@ mod tests {
         // 裸色 rgba(0x6060604a)：亮/暗各自值 = 收编前原值，行为零回归。
         let light = ChromeColors::light();
         let dark = ChromeColors::dark();
-        assert_eq!(light.hairline, rgb(0xd9d9d9), "亮发丝线=原 SEPARATOR_LIGHT #D9D9D9");
-        assert_eq!(dark.hairline, rgb(0x2a2b2c), "暗发丝线=原 SEPARATOR_DARK #2A2B2C");
+        assert_eq!(
+            light.hairline,
+            rgb(0xd9d9d9),
+            "亮发丝线=原 SEPARATOR_LIGHT #D9D9D9"
+        );
+        assert_eq!(
+            dark.hairline,
+            rgb(0x2a2b2c),
+            "暗发丝线=原 SEPARATOR_DARK #2A2B2C"
+        );
         assert_ne!(light.hairline, dark.hairline, "发丝线随明暗切换");
         assert_eq!(
             light.scrollbar_thumb,
             rgba(0x6060604a),
             "滚动条滑块=原 shell rgba(0x6060604a)"
         );
+        assert_eq!(dark.scrollbar_thumb, rgba(0x6060604a), "滚动条滑块亮暗同值");
         assert_eq!(
-            dark.scrollbar_thumb,
-            rgba(0x6060604a),
-            "滚动条滑块亮暗同值"
-        );
-        assert_eq!(
-            light.scrollbar_thumb,
-            dark.scrollbar_thumb,
+            light.scrollbar_thumb, dark.scrollbar_thumb,
             "滚动条滑块亮暗持同值（亮暗同值字段）"
         );
     }
@@ -849,16 +984,37 @@ mod tests {
         let light = ChromeColors::light();
         let dark = ChromeColors::dark();
         assert_eq!(light.close_pressed, rgb(0xa70d1a), "亮关闭按压红");
-        assert_eq!(dark.close_pressed, rgb(0xa70d1a), "暗关闭按压红 = 亮档（危险红同值）");
-        assert_eq!(light.close_pressed, dark.close_pressed, "关闭按压红亮暗同值");
-        assert_ne!(light.close_pressed, light.close_hover, "按压比 hover 深一档");
-        assert_eq!(light.drag_ghost_bg, ColorScheme::light().accent, "亮拖拽幽灵 = 亮强调色");
-        assert_eq!(dark.drag_ghost_bg, ColorScheme::dark().accent, "暗拖拽幽灵 = 暗强调色");
+        assert_eq!(
+            dark.close_pressed,
+            rgb(0xa70d1a),
+            "暗关闭按压红 = 亮档（危险红同值）"
+        );
+        assert_eq!(
+            light.close_pressed, dark.close_pressed,
+            "关闭按压红亮暗同值"
+        );
+        assert_ne!(
+            light.close_pressed, light.close_hover,
+            "按压比 hover 深一档"
+        );
+        assert_eq!(
+            light.drag_ghost_bg,
+            ColorScheme::light().accent,
+            "亮拖拽幽灵 = 亮强调色"
+        );
+        assert_eq!(
+            dark.drag_ghost_bg,
+            ColorScheme::dark().accent,
+            "暗拖拽幽灵 = 暗强调色"
+        );
         assert_ne!(light.drag_ghost_bg, dark.drag_ghost_bg, "拖拽幽灵随明暗");
         // 选项卡拖拽排序插入指示线：纯白、亮暗同值（原 shell_tabs 裸 gpui::white()）。
         assert_eq!(light.tab_reorder_line, rgb(0xffffff), "亮插入指示线=纯白");
         assert_eq!(dark.tab_reorder_line, rgb(0xffffff), "暗插入指示线=纯白");
-        assert_eq!(light.tab_reorder_line, dark.tab_reorder_line, "插入指示线亮暗同值（白色不随外壳底）");
+        assert_eq!(
+            light.tab_reorder_line, dark.tab_reorder_line,
+            "插入指示线亮暗同值（白色不随外壳底）"
+        );
     }
 
     #[gpui::test]
@@ -871,14 +1027,25 @@ mod tests {
         let dark = ChromeColors::dark();
         assert_eq!(light.editor_bg, rgb(0xffffff), "亮编辑区底=白");
         assert_eq!(light.chrome_bg, rgb(0xffffff), "亮外壳底=白");
-        assert_eq!(dark.editor_bg, rgb(0x121314), "暗编辑区底=原 EDITOR_BG_DARK");
+        assert_eq!(
+            dark.editor_bg,
+            rgb(0x121314),
+            "暗编辑区底=原 EDITOR_BG_DARK"
+        );
         assert_eq!(dark.chrome_bg, rgb(0x191a1b), "暗外壳底=原 CHROME_BG_DARK");
         assert_ne!(light.editor_bg, dark.editor_bg, "编辑区底随明暗");
         assert_ne!(light.chrome_bg, dark.chrome_bg, "外壳底随明暗");
         // 与保留的 panel_bg 分道：暗档 editor_bg(#121314) ≠ panel_bg(#2B2B2B)，
         // panel_bg 及其不变式逐字节保留（不互相替代）。
-        assert_eq!(dark.panel_bg, rgb(0x2b2b2b), "暗 panel_bg 原样保留（随 colors.bg）");
-        assert_ne!(dark.editor_bg, dark.panel_bg, "暗编辑区底 ≠ 暗 panel_bg（语义分离）");
+        assert_eq!(
+            dark.panel_bg,
+            rgb(0x2b2b2b),
+            "暗 panel_bg 原样保留（随 colors.bg）"
+        );
+        assert_ne!(
+            dark.editor_bg, dark.panel_bg,
+            "暗编辑区底 ≠ 暗 panel_bg（语义分离）"
+        );
     }
 
     #[gpui::test]
@@ -894,7 +1061,10 @@ mod tests {
             assert_eq!(chrome.text_primary, colors.fg, "外壳主文字=内容主文字");
             assert_eq!(chrome.text_minor, colors.fg_muted, "外壳次文字=内容次文字");
             assert_eq!(chrome.dirty, colors.error, "脏标记=错误色");
-            assert_eq!(colors.surface, colors.popover_bg, "浮动层=升一级表面（surface 同 popover 底）");
+            assert_eq!(
+                colors.surface, colors.popover_bg,
+                "浮动层=升一级表面（surface 同 popover 底）"
+            );
         }
         // 明暗双端各自钉死基座色（防回归到旧 GitHub/slate 蓝灰）。
         let dark = ChromeColors::dark();

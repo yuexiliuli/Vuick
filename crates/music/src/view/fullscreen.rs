@@ -152,9 +152,9 @@ impl super::MusicView {
         div()
             .id(format!("fs-btn-{tip}"))
             .relative()
-            .w(px(40.))
-            .h(px(40.))
-            .rounded(px(20.))
+            .w(px(theme::FS_CTRL_BTN_SIZE))
+            .h(px(theme::FS_CTRL_BTN_SIZE))
+            .rounded(px(theme::FS_CTRL_BTN_RADIUS))
             .flex()
             .items_center()
             .justify_center()
@@ -171,7 +171,7 @@ impl super::MusicView {
             .child(theme::bounds_canvas(self.tip_box_cell(tip)))
             .child(
                 Icon::new(icon)
-                    .size(px(20.))
+                    .size(px(theme::FS_CTRL_BTN_ICON))
                     .text_color(if hovered { theme::text() } else { theme::text2() }),
             )
             .into_any_element()
@@ -187,9 +187,9 @@ impl super::MusicView {
         div()
             .id("fs-close")
             .relative()
-            .w(px(40.))
-            .h(px(40.))
-            .rounded(px(20.))
+            .w(px(theme::FS_CTRL_BTN_SIZE))
+            .h(px(theme::FS_CTRL_BTN_SIZE))
+            .rounded(px(theme::FS_CTRL_BTN_RADIUS))
             .flex()
             .items_center()
             .justify_center()
@@ -212,7 +212,7 @@ impl super::MusicView {
             .child(theme::bounds_canvas(self.tip_box_cell("fs-close")))
             .child(
                 Icon::new(IconName::FullscreenExit)
-                    .size(px(20.))
+                    .size(px(theme::FS_CTRL_BTN_ICON))
                     .text_color(if hovered {
                         theme::danger_close_icon()
                     } else {

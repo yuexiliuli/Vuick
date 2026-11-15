@@ -80,7 +80,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    anchored, deferred, div, px, white, Anchor, AnimationExt, AnyWindowHandle, App,
+    anchored, deferred, div, px, white, Anchor, AnyWindowHandle, App,
     AppContext, Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, Edges, EntityId,
     ExternalPaths, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Render, SharedString, Size,
@@ -90,9 +90,8 @@ use gpui::{
 use ui::input::{InputEvent, InputState};
 use ui::menu::{PopupMenu, PopupMenuItem};
 use ropey::Rope;
-use ui::icon::{Icon, IconName};
+use ui::icon::IconName;
 use ui::theme::ChromeColors;
-use ui::motion::hover_spring;
 use base::util::SeqAfter;
 
 // WYSIWYG 预览编辑——本项目 `markdown_wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。

@@ -56,6 +56,8 @@ pub mod empty_state;
 pub mod float_card;
 pub mod focus;
 pub mod icon;
+/// 图标按钮（`icon_button`）：标题栏/侧栏等 flex-cc + keyed hover/press 图标钮的统一实现。
+pub mod icon_button;
 pub mod input;
 pub mod list_item_row;
 pub mod menu;
@@ -79,15 +81,21 @@ pub use focus::focus_border_color;
 
 /// 浮动卡片壳体 builder + 挂载 helper 的根级 re-export（`ui::float_card(...)` /
 /// `ui::overlay_centered(...)` / `ui::anchor_layer(...)`；枚举档位 `ui::FloatCard*`）。
-pub use float_card::{anchor_layer, float_card, overlay_centered, FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
+pub use float_card::{
+    FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow, anchor_layer, float_card,
+    overlay_centered,
+};
 
 /// B02b 玻璃卡便捷入口 + 档位的根级 re-export（`ui::glass_card(...)`；`ui::GlassCardBg` /
 /// `ui::CardShellShadow` / `ui::CardShellRadius` / `ui::CardShellPad`）。壳体（含
 /// `card_shell_shadows`）仍可经 `ui::card_shell::` 直达。
-pub use card_shell::{glass_card, CardShellPad, CardShellRadius, CardShellShadow, GlassCardBg};
+pub use card_shell::{CardShellPad, CardShellRadius, CardShellShadow, GlassCardBg, glass_card};
 
 /// 横向滑块根级 re-export（`ui::Slider` / `ui::SliderFill` / `ui::SliderThumb` / `ui::CommitMode`）。
 pub use slider::{CommitMode, Slider, SliderFill, SliderThumb};
+
+/// 图标按钮根级 re-export（`ui::icon_button(id, icon)` 起步构建）。
+pub use icon_button::icon_button;
 
 /// 胶囊 chip 根级 re-export（`ui::Pill` / `ui::PillSize` / `ui::PillTone`）。
 pub use pill::{Pill, PillSize, PillTone};

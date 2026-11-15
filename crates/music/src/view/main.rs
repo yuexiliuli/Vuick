@@ -383,9 +383,9 @@ impl super::MusicView {
         });
         div()
             .id(id)
-            .w(px(36.))
-            .h(px(36.))
-            .rounded(px(18.))
+            .w(px(theme::ROUND_ICON_BTN_SIZE))
+            .h(px(theme::ROUND_ICON_BTN_SIZE))
+            .rounded(px(theme::ROUND_ICON_BTN_RADIUS))
             .flex()
             .items_center()
             .justify_center()
@@ -394,7 +394,11 @@ impl super::MusicView {
             .border_color(theme::border())
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
-            .child(Icon::new(icon).size(px(17.)).text_color(theme::text2()))
+            .child(
+                Icon::new(icon)
+                    .size(px(theme::ROUND_ICON_BTN_ICON))
+                    .text_color(theme::text2()),
+            )
             .into_any_element()
     }
 

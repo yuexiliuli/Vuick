@@ -3,6 +3,31 @@
 
 use super::*;
 
+/// 窗口控制钮图标前景（Win11「注入感」）：只换色、粗细/几何不动。
+/// - 关闭：空闲次要灰 → hover/按压 白 ×（红底白×，与 P1-7 `close_pressed` 搭配）
+/// - 最小化/最大化：空闲次要灰 → hover/按压 主前景（灰底对比前景）
+///
+/// 按压态独立于 hover 跟随（`pressed || hovered`），保证压住不放时图标保持注入色。
+/// 纯函数（不依赖 app 实体，供 `ui::icon_button` 的 `icon_color_for` `'static` 闭包复用；
+/// `primary`/`minor` 由调用方在 render 期解析后传入）。
+fn title_ctrl_fg(
+    is_close: bool,
+    hovered: bool,
+    pressed: bool,
+    primary: gpui::Hsla,
+    minor: gpui::Hsla,
+) -> gpui::Hsla {
+    if hovered || pressed {
+        if is_close {
+            white()
+        } else {
+            primary
+        }
+    } else {
+        minor
+    }
+}
+
 impl EditorApp {
     /// 切换侧边栏「展开/收起」。
     /// `#[doc(hidden)] pub`：`tests/palette.rs` 侧栏几何断言（§8.6 外提清单）。
@@ -243,33 +268,18 @@ impl EditorApp {
         let host: &dyn AppHost = self;
         self.model.borrow().persist_prefs(host);
     }
-    /// 窗口控制钮图标前景（Win11「注入感」）：只换色、粗细/几何不动。
-    /// - 关闭：空闲次要灰 → hover/按压 白 ×（红底白×，与 P1-7 `close_pressed` 搭配）
-    /// - 最小化/最大化：空闲次要灰 → hover/按压 主前景（灰底对比前景）
-    ///
-    /// 按压态独立于 hover 跟随（`pressed || hovered`），保证压住不放时图标保持注入色。
-    pub(super) fn title_ctrl_fg(&self, is_close: bool, hovered: bool, pressed: bool) -> gpui::Hsla {
-        if hovered || pressed {
-            if is_close {
-                white()
-            } else {
-                self.text_primary()
-            }
-        } else {
-            self.text_minor()
-        }
-    }
 
     /// 构建单个窗口控制钮（最小化/最大化/关闭共用）：
     /// - 点击/双击/键盘语义由平台原生处理（`window_control_area` → WM_NCHITTEST 返回
     ///   HTMINBUTTON / HTMAXBUTTON / HTCLOSE，系统完成动作，应用层不重复处理）；
     /// - hover 背景淡入（P2-10 统一 spring，关闭钮红、其余灰）；
-    /// - 按压底色 `.active`（P1-7 `pressed_fill` / 关闭钮 `close_pressed`）；按压态另存
-    ///   keyed「press」供图标注入色跟随（测试平台等派发到元素的场景生效）。
+    /// - 按压底色 keyed「press」（P1-7 `pressed_fill` / 关闭钮 `close_pressed`），按下/
+    ///   松开/移出三事件翻转 + `cx.notify(view_id)`（等效旧 CSS `.active` 的「按下即换底、
+    ///   松开还原」模型，由 `ui::icon_button` `.pressed(...)` 接线）。
     ///
     /// 图标色按元素级 hover/pressed 态分支显式传 `Icon::text_color`——parent 的
-    /// `text_color` 不会级联覆盖子元素 Icon 的显式色，必须在分支里决定；
-    /// `cx.notify(view_id)` 触发状态变化后的重绘。
+    /// `text_color` 不会级联覆盖子元素 Icon 的显式色，必须在分支里决定；测试探针
+    /// `last_title_ctrl_fg` 由 `.icon_color_for` 闭包（`.build()` 期同步执行）落盘。
     pub(super) fn title_ctrl_button(
         &mut self,
         window: &mut Window,
@@ -278,69 +288,42 @@ impl EditorApp {
         icon: IconName,
     ) -> gpui::AnyElement {
         let c = self.chrome();
-        let hover_bg = kind.hover_bg(c);
-        let view_id = window.current_view();
-        let hover_key = format!("title-{}-hover", kind.id());
-        let press_key = format!("title-{}-press", kind.id());
-        let hovered_s = window.use_keyed_state(hover_key, cx, |_, _| false);
-        let pressed_s = window.use_keyed_state(press_key, cx, |_, _| false);
-        let hovered = *hovered_s.read(cx);
-        let pressed = *pressed_s.read(cx);
-        let icon_color = self.title_ctrl_fg(kind.is_close(), hovered, pressed);
-        // 测试可读：本帧解析出的图标前景色落盘到 app 实体（断言「注入」走真实渲染路径）。
+        let is_close = kind.is_close();
+        let primary = self.text_primary();
+        let minor = self.text_minor();
+        // 测试可读：本帧解析出的图标前景色在 `icon_color_for` 闭包写入 probe（闭包在
+        // `.build(window, cx)` 同步调用 = render 期），随构建一并落盘 app 实体——
+        // 断言「注入」仍走真实渲染路径。
+        let probe: std::rc::Rc<std::cell::RefCell<TitleCtrlIconFg>> =
+            std::rc::Rc::new(std::cell::RefCell::new(TitleCtrlIconFg::default()));
+        let pb = probe.clone();
+        let el = ui::icon_button(kind.id(), icon)
+            .wh(40., 32.)
+            .icon_size(14.)
+            .icon_color_for(move |hovered, pressed| {
+                let color = title_ctrl_fg(is_close, hovered, pressed, primary, minor);
+                let mut snap = pb.borrow_mut();
+                match kind {
+                    WinCtrlKind::Minimize => snap.minimize = color,
+                    WinCtrlKind::Maximize => snap.maximize = color,
+                    WinCtrlKind::Close => snap.close = color,
+                }
+                color
+            })
+            .hover_fill(Some(kind.hover_bg(c)))
+            .pressed(Some(kind.active_bg(c)))
+            .native(kind.area())
+            .build(window, cx);
+        // 测试可读：按「当前 kind」把解析出的前景色合并写进 `last_title_ctrl_fg`——
+        // 三钮每次只覆盖自己那一字段，保持其余字段（首帧三钮在各自 render 落盘）。
+        let cur = *probe.borrow();
         let snap = self.last_title_ctrl_fg.get_or_insert_with(TitleCtrlIconFg::default);
         match kind {
-            WinCtrlKind::Minimize => snap.minimize = icon_color,
-            WinCtrlKind::Maximize => snap.maximize = icon_color,
-            WinCtrlKind::Close => snap.close = icon_color,
+            WinCtrlKind::Minimize => snap.minimize = cur.minimize,
+            WinCtrlKind::Maximize => snap.maximize = cur.maximize,
+            WinCtrlKind::Close => snap.close = cur.close,
         }
-        div()
-            .id(kind.id())
-            .debug_selector(move || kind.id().to_string())
-            .w(px(40.))
-            .h(px(32.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .active(|style| style.bg(kind.active_bg(c)))
-            .child(Icon::new(icon).size(px(14.)).text_color(icon_color))
-            .on_hover({
-                let st = hovered_s.clone();
-                move |hovered, _window, cx| {
-                    st.update(cx, |h, _| *h = *hovered);
-                    cx.notify(view_id);
-                }
-            })
-            .on_mouse_down(MouseButton::Left, {
-                let st = pressed_s.clone();
-                move |_ev, _window, cx| {
-                    st.update(cx, |p, _| *p = true);
-                    cx.notify(view_id);
-                }
-            })
-            .on_mouse_up(MouseButton::Left, {
-                let st = pressed_s.clone();
-                move |_ev, _window, cx| {
-                    st.update(cx, |p, _| *p = false);
-                    cx.notify(view_id);
-                }
-            })
-            .on_mouse_up_out(MouseButton::Left, {
-                let st = pressed_s.clone();
-                move |_ev, _window, cx| {
-                    st.update(cx, |p, _| *p = false);
-                    cx.notify(view_id);
-                }
-            })
-            .window_control_area(kind.area())
-            // P2-10：hover 背景淡入。
-            .with_spring(
-                format!("title-{}-bg", kind.id()),
-                hover_spring(if hovered { 1.0 } else { 0.0 }),
-                move |this, v| this.bg(hover_bg.opacity(v)),
-            )
-            .into_any_element()
+        el
     }
 
     /// 自绘标题栏：无边框窗口下代替原生标题栏，颜色跟随黑白主题。
@@ -360,51 +343,30 @@ impl EditorApp {
         let text_minor = self.text_minor();
         let c = self.chrome();
         let hover_fill: gpui::Hsla = c.hover_fill.into();
-        // 窗口控制钮跨帧 hover 状态对应的视图 id（元素级状态变更后通知重绘）。
-        let view_id = window.current_view();
-        let icon_style = |icon: IconName| {
-            Icon::new(icon).size(px(14.)).text_color(text_minor)
-        };
-
         // 侧边栏「展开/收起」开关：收拢时显示打开图标（点击展开），展开时显示收起图标。
-        // 用自绘图标按钮（非 window_control_area，普通点击交互）。P2-10：hover 淡入。
-        let sidebar_toggle_hover =
-            window.use_keyed_state("title-sidebar-toggle-hover", cx, |_, _| false);
-        let sidebar_toggle_hovered = *sidebar_toggle_hover.read(cx);
-        let sidebar_toggle = div()
-            .id("title-sidebar-toggle")
-            .debug_selector(|| "title-sidebar-toggle".into())
-            .w(px(30.))
-            .h(px(24.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_color(text_minor)
-            .cursor(CursorStyle::PointingHand)
-            .on_hover({
-                let st = sidebar_toggle_hover.clone();
-                move |hovered, _window, cx| {
-                    st.update(cx, |h, _| *h = *hovered);
-                    cx.notify(view_id);
-                }
-            })
-            .child(icon_style(if self.sidebar.open {
+        // 自绘图标按钮（非 window_control_area，普通点击交互）。P2-10：hover 淡入；
+        // id/调试选择器/圆角（`gpui::rems(0.375)`=gpui `rounded_md`）/hover 弹簧全由
+        // `ui::icon_button` 接管。
+        let sidebar_toggle = ui::icon_button(
+            "title-sidebar-toggle",
+            if self.sidebar.open {
                 IconName::PanelLeftClose
             } else {
                 IconName::PanelLeftOpen
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
-                    this.toggle_sidebar(cx);
-                }),
-            )
-            .with_spring(
-                "title-sidebar-toggle-bg",
-                hover_spring(if sidebar_toggle_hovered { 1.0 } else { 0.0 }),
-                move |this, v| this.bg(hover_fill.opacity(v)),
-            );
+            },
+        )
+        .wh(30., 24.)
+        .radius(gpui::rems(0.375)) // = `rounded_md()`（0.375rem，默认字号下同圆角）
+        .icon_size(14.)
+        .color(text_minor)
+        .hover_fill(Some(hover_fill))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
+                this.toggle_sidebar(cx);
+            }),
+        )
+        .build(window, cx);
 
         let maximize_icon = if window.is_maximized() {
             IconName::WindowRestore

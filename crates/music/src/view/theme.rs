@@ -11,8 +11,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Bounds, Hsla, IntoElement, Pixels, Styled as _, canvas, fill, linear_color_stop,
-    linear_gradient, px,
+    AnyElement, Bounds, Hsla, IntoElement, Pixels, Rgba, Styled as _, canvas, fill,
+    linear_color_stop, linear_gradient, px,
 };
 
 // ---- 原型 `:root` 调色板常量（逐字，十六进制） ----
@@ -174,32 +174,47 @@ pub fn glass() -> Hsla {
 
 // ---- Windows 风格标题栏窗口控制钮取色（对齐项目 shell 标题栏 `ui::theme::ChromeColors`） ----
 
-/// 窗口控制钮 hover 填充（8% 白）：同 `ui::theme::ChromeColors::dark().hover_fill`
-/// `0xffffff14` 与原型 `.win-btn:hover { background: rgba(255,255,255,0.08) }`。
-pub const CTRL_HOVER_FILL: u32 = 0xffffff14;
-/// 窗口控制钮按压填充（约 14% 白）：同 shell `pressed_fill` 暗色档 `0xffffff24`。
-pub const CTRL_PRESSED_FILL: u32 = 0xffffff24;
-/// 关闭钮 hover 底红（Win11 危险红 `#e81123`）：同 shell `close_hover`。
-pub const CLOSE_HOVER: u32 = 0xe81123;
-/// 关闭钮按压底红（深一档 `#a70d1a`）：同 shell `close_pressed`（危险红亮暗同值）。
-pub const CLOSE_PRESSED: u32 = 0xa70d1a;
+/// 窗口控制钮 hover 填充（8% 白）：**别名** `ui::theme::ChromeColors::dark().hover_fill`
+/// `0xffffff14`（与原型 `.win-btn:hover { background: rgba(255,255,255,0.08) }` 同值）。
+pub const CTRL_HOVER_FILL: Rgba = ui::theme::CHROME_HOVER_FILL_DARK;
+/// 窗口控制钮按压填充（约 14% 白）：**别名** shell `pressed_fill` 暗色档 `0xffffff24`。
+pub const CTRL_PRESSED_FILL: Rgba = ui::theme::CHROME_PRESSED_FILL_DARK;
+/// 关闭钮 hover 底红（Win11 危险红 `#e81123`）：**别名** shell `close_hover`。
+pub const CLOSE_HOVER: Rgba = ui::theme::CHROME_CLOSE_HOVER;
+/// 关闭钮按压底红（深一档 `#a70d1a`）：**别名** shell `close_pressed`（危险红亮暗同值）。
+pub const CLOSE_PRESSED: Rgba = ui::theme::CHROME_CLOSE_PRESSED;
 
 /// 窗口控制钮 hover 填充色。
 pub fn ctrl_hover_fill() -> Hsla {
-    c_a(CTRL_HOVER_FILL)
+    CTRL_HOVER_FILL.into()
 }
 /// 窗口控制钮按压填充色。
 pub fn ctrl_pressed_fill() -> Hsla {
-    c_a(CTRL_PRESSED_FILL)
+    CTRL_PRESSED_FILL.into()
 }
 /// 关闭钮 hover 底红。
 pub fn close_hover() -> Hsla {
-    c(CLOSE_HOVER)
+    CLOSE_HOVER.into()
 }
 /// 关闭钮按压底红。
 pub fn close_pressed() -> Hsla {
-    c(CLOSE_PRESSED)
+    CLOSE_PRESSED.into()
 }
+
+// ---- 全屏 / 圆角图标钮几何（消费方逐字使用，防尺寸漂移） ----
+
+/// 全屏工具条图标钮尺寸（px）：40×40。
+pub const FS_CTRL_BTN_SIZE: f32 = 40.0;
+/// 全屏工具条图标钮圆角（px）：20（全圆）。
+pub const FS_CTRL_BTN_RADIUS: f32 = 20.0;
+/// 全屏工具条图标钮图标尺寸（px）：20。
+pub const FS_CTRL_BTN_ICON: f32 = 20.0;
+/// 圆角图标钮（通知/设置）尺寸（px）：36×36。
+pub const ROUND_ICON_BTN_SIZE: f32 = 36.0;
+/// 圆角图标钮圆角（px）：18（全圆）。
+pub const ROUND_ICON_BTN_RADIUS: f32 = 18.0;
+/// 圆角图标钮图标尺寸（px）：17。
+pub const ROUND_ICON_BTN_ICON: f32 = 17.0;
 
 /// 由 model `Track.grad`（主色 `(r,g,b)`）派生渐变双色：主色 + 加深 55% 变体
 /// （与 `model::gradient_pair` 的加深系数一致，保证封面观感同源）。
@@ -344,13 +359,17 @@ mod tests {
 
     #[test]
     fn title_ctrl_colors_match_shell_chrome() {
-        // 逐字钉死项目 shell 标题栏取色源（`ui::theme::ChromeColors`：
-        // hover_fill 暗档 0xffffff14 / pressed_fill 0xffffff24 /
-        // close_hover #e81123 / close_pressed #a70d1a），防抄写漂移。
-        assert_eq!(CTRL_HOVER_FILL, 0xffffff14);
-        assert_eq!(CTRL_PRESSED_FILL, 0xffffff24);
-        assert_eq!(CLOSE_HOVER, 0xe81123);
-        assert_eq!(CLOSE_PRESSED, 0xa70d1a);
+        // CTRL_* 已改为 `ui::theme` 的 `CHROME_*` 常量**别名**：逐个断言「别名 = ui 常量
+        // = 权威十六进制」（hover_fill 暗档 0xffffff14 / pressed_fill 0xffffff24 /
+        // close_hover #e81123 / close_pressed #a70d1a），防漂移。
+        assert_eq!(CTRL_HOVER_FILL, ui::theme::CHROME_HOVER_FILL_DARK);
+        assert_eq!(CTRL_PRESSED_FILL, ui::theme::CHROME_PRESSED_FILL_DARK);
+        assert_eq!(CLOSE_HOVER, ui::theme::CHROME_CLOSE_HOVER);
+        assert_eq!(CLOSE_PRESSED, ui::theme::CHROME_CLOSE_PRESSED);
+        assert_eq!(CTRL_HOVER_FILL, gpui::rgba(0xffffff14));
+        assert_eq!(CTRL_PRESSED_FILL, gpui::rgba(0xffffff24));
+        assert_eq!(CLOSE_HOVER, gpui::rgb(0xe81123));
+        assert_eq!(CLOSE_PRESSED, gpui::rgb(0xa70d1a));
         let hover: gpui::Rgba = close_hover().into();
         let pressed: gpui::Rgba = close_pressed().into();
         assert!(
