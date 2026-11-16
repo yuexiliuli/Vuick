@@ -184,6 +184,11 @@ impl CodeEditor {
                 .timer(Duration::from_millis(FIND_DEBOUNCE_MS))
                 .await;
             let _ = this.update(cx, |ed, cx| {
+                // 关条守卫（镜像 goto_flush）：`close_bar` 不清 `scan_epoch`，Esc/× 关条后
+                // 残留防抖到期若不拦会 `find_scan_land` 重新拉起高亮（幽灵高亮）。
+                if !ed.find.open && !ed.find.visible {
+                    return;
+                }
                 if epoch == ed.find.scan_epoch {
                     ed.find_scan_land(cx);
                 }
@@ -227,7 +232,10 @@ impl CodeEditor {
         self.ensure_find_fresh(cx);
         if let Some((idx, off)) = self.find.step(next) {
             self.find.current = Some(idx);
-            self.set_caret_to(off);
+            // 程序化定位（find 导航）也发光标变化事件：宿主状态栏 `Ln x, Col y` 即时
+            // 跟随（对齐 goto_flush 用 `set_selection_range` 的 emit 姿势；`set_caret_to`
+            // 只改选区不发事件）。
+            self.set_selection_range(off..off, cx);
             self.reveal_current_find();
         }
         cx.notify();

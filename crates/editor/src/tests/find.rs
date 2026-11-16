@@ -618,3 +618,74 @@ fn find_button_hover_tooltip_shows_after_delay_and_hides(cx: &mut TestAppContext
     );
     let _ = input;
 }
+
+/// Esc 关条后残留防抖任务（200ms 未到期的 `schedule_find_debounce`）到期**不得复活
+/// 高亮**（镜像 goto_flush 的 open 守卫；`close_bar` 不清 scan_epoch，真实定时器会触发
+/// 该竞态——fake 执行器测不到，此处用 advance_clock 推进真实 spawn 的 timer）。
+#[gpui::test]
+fn find_debounce_after_esc_does_not_revive_highlight(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "aa bb aa");
+    let ed = ed_of(&host, cx);
+    focus(&host, cx);
+    let input = open_find(&host, cx);
+    // 输入 "aa" → 走**真实防抖**（`schedule_find_debounce`；不手动 `test_find_scan_now`）。
+    cx.update(|window, cx| {
+        input.update(cx, |s, scx| s.set_value("aa", window, scx));
+    });
+    settle(cx);
+    // 防抖（200ms）尚未到期 → Esc 关条。
+    cx.update(|window, cx| {
+        ed.update(cx, |e, ecx| e.close_find(window, ecx));
+    });
+    settle(cx);
+    // 推进时钟到防抖到期 → 残留任务触发（若缺守卫会 `find_scan_land` 复活高亮）。
+    cx.executor().advance_clock(std::time::Duration::from_millis(250));
+    settle(cx);
+    let (open, vis, n, cur, _) = cx.update(|_, cx| ed.read(cx).test_find_state());
+    assert!(
+        !open && !vis && n == 0 && cur.is_none(),
+        "Esc 关条后防抖到期不得复活高亮（open={open} vis={vis} n={n} cur={cur:?}）"
+    );
+    let _ = input;
+}
+
+/// find 导航（F3/Enter/↑↓ 共用 `find_step`）后发出 SelectionChanged：宿主状态栏
+/// `Ln x, Col y` 即时跟随（对齐 goto_flush 用 `set_selection_range` 的 emit 姿势）。
+#[gpui::test]
+fn find_step_emits_selection_changed(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "aa bb aa cc aa");
+    let ed = ed_of(&host, cx);
+    focus(&host, cx);
+    let input = open_find(&host, cx);
+    type_query(&host, cx, "aa", &input);
+    // 订阅编辑器 SelectionChanged 事件计数（订阅后再驱动导航，只数 find_step 触发的一次；
+    // 必须 `.detach()` 保活，否则 Subscription drop 即退订）。
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let seen2 = seen.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&ed, move |_emitter, _ev: &crate::editor::EditorEvent, _cx| {
+            seen2.set(seen2.get() + 1);
+        })
+        .detach();
+    });
+    // Enter（find_next）→ find_step 导航到下一个匹配（emit 可能在效果刷新区间投递）。
+    let head0 = cx.update(|_, cx| ed.read(cx).selection().head());
+    cx.update(|_, cx| ed.update(cx, |e, ecx| e.find_next(ecx)));
+    settle(cx);
+    let head1 = cx.update(|_, cx| ed.read(cx).selection().head());
+    assert_ne!(head0, head1, "find_next 应移动光标（set_selection_range 路径）");
+    let got = seen.get();
+    assert_eq!(
+        got, 1,
+        "find_step 应发出一次 SelectionChanged（got={got}）"
+    );
+    // Shift+Enter（find_prev）→ 再发一次。
+    cx.update(|_, cx| ed.update(cx, |e, ecx| e.find_prev(ecx)));
+    settle(cx);
+    let got = seen.get();
+    assert_eq!(
+        got, 2,
+        "find_prev 也应发 SelectionChanged（got={got}）"
+    );
+    let _ = input;
+}
