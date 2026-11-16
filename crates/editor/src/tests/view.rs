@@ -3117,6 +3117,42 @@ fn empty_new_tab_paste_not_collapsed_to_first_row(cx: &mut TestAppContext) {
     );
 }
 
+/// P1-4 守卫（对齐 `fill_place` 的 checked_sub）：`build_rows` 的 `hl_lines[logical-lo_l]`
+/// 裸下标在折叠映射异常（logical < lo_l → usize 下溢）时会 panic。正常态 `logical_row`
+/// 单调、映射一致，下溢不可触达——本测试用「窗口跨折叠隐藏区 + 窗口顶恰为折叠首行」的
+/// 合法折叠夹具走真实 `build_rows`（markdown 路径规避帧外 RAF），锁「不 panic + 行数
+/// 正确 + 隐藏行不泄漏」，作为该守卫的回归护栏（防未来 `folds` 映射不一致踩裸下标）。
+#[gpui::test]
+fn build_rows_fold_window_no_panic(cx: &mut TestAppContext) {
+    let text = (0..40)
+        .map(|i| format!("line{i:02} fn f{i}() {{  }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (host, cx) = open(cx, &text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    // markdown 路径（md_decor 不经 syntect「分片补色 + RAF」，帧外直调安全）。
+    cx.update(|_, cx| ed.update(cx, |e, _| e.set_language(Some("markdown"))));
+    // 折叠逻辑行 [5,10)：隐藏 6..9，保留首行 5。
+    cx.update(|_, cx| ed.update(cx, |e, _| e.test_set_fold(5, 10)));
+    let vcount = cx.update(|_, cx| ed.read(cx).test_folds().visual_line_count());
+    assert_eq!(vcount, 36, "折叠 [5,10) 隐藏 4 行 → 40-4=36");
+
+    // 窗口跨折叠首行：视觉 4..=13（隐藏区塌缩为折叠首行，逻辑映射跳段）。
+    let rows = cx.update(|window, cx| {
+        ed.update(cx, |e, _| e.test_build_rows_snapshot(window, 4, 13))
+    });
+    assert_eq!(rows.len(), 10, "窗口 4..=13 应输出 10 行");
+    // 折叠首行（视觉 5）= 逻辑行 5 自身。
+    assert_eq!(rows[1].0, "line05 fn f5() {  }", "折叠首行渲染为逻辑行 5");
+    // 隐藏体 6..9 不得泄漏进视觉行输出（塌缩后跳过）。
+    for (t, _) in &rows {
+        for h in 6..=9 {
+            let prefix = format!("line{h:02} ");
+            assert!(!t.starts_with(&prefix), "隐藏行 {h} 不得泄漏：{t}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // M5-B2-3 行级缓存：无编辑滚动多帧后渲染不变 / 编辑后缓存失效
 // ---------------------------------------------------------------------------
@@ -4008,6 +4044,25 @@ fn block_pick_max_pair<'a>(
         }
     }
     best
+}
+
+/// 过期括对列号（编辑后仍指向旧字节位置、非字符边界）喂 `guide_col_prefix_units`
+/// 不得 panic（K143 式渲染帧崩溃保卫）：`byte_col` 落多字节字符内部 → 先夹到字符
+/// 边界再按前缀计宽。
+#[gpui::test]
+fn guide_col_prefix_units_snaps_non_char_boundary_col(cx: &mut TestAppContext) {
+    // 「中文测试」："中"3B/宽2、"文"3B/宽2、"测"3B/宽2、"试"3B/宽2。字节 2 落在
+    // 「中」（0..3）内部 = 非字符边界。
+    let (host, cx) = open(cx, "中文测试");
+    // 非字符边界列（2=「中」第 3 字节中间）→ floor_char_boundary(2)=0 → 行首前缀 0 格。
+    let u = cx.update(|_, cx| host.read(cx).ed.read(cx).test_guide_col_prefix_units(0, 2));
+    assert_eq!(u, 0, "非字符边界列号应夹到前一字符边界（行首）计宽，实际 {u}");
+    // 恰在字符边界（3=「中」尾）→ 前缀宽 = 「中」2 格。
+    let u = cx.update(|_, cx| host.read(cx).ed.read(cx).test_guide_col_prefix_units(0, 3));
+    assert_eq!(u, 2, "「中」前缀宽 2 格，实际 {u}");
+    // 越界列号（> 行字节长）→ 夹到行尾（行尾恒为字符边界）。
+    let u = cx.update(|_, cx| host.read(cx).ed.read(cx).test_guide_col_prefix_units(0, 100));
+    assert_eq!(u, 8, "越界列号夹到行尾（四字各 2 格）总宽 8，实际 {u}");
 }
 
 /// **zip 锚：引擎 `active_guide_group` == `block_active_guide_port`**（2026-11-14 用户 3 夹具
