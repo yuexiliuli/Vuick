@@ -118,7 +118,8 @@ impl InputSize {
 /// 粘贴模式：对剪贴板文本换行的处理策略（默认 Passthrough = 现状）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PasteMode {
-    /// 现状：`\r\n`/`\r` → `\n` 原样插入（多行粘贴整段进框）。
+    /// 现状：`\r\n`/`\r` → `\n` 后进入编辑管线；最终由 `edit_range` 的单行不变式
+    /// 把换行折叠为空格（单行框不保存 `\n`，防 `shape_line` panic）。
     #[default]
     Passthrough,
     /// 折叠：插入文本中每个换行折叠为单个空格（"a\r\nb\nc" → "a b c"）。
@@ -208,8 +209,9 @@ impl InputState {
     }
 
     /// 初始文本。
+    /// 单行不变式：换行折叠为空格（同 `edit_range`，防 `shape_line` panic）。
     pub fn default_value(mut self, value: impl Into<String>) -> Self {
-        self.text = value.into();
+        self.text = value.into().replace('\n', " ");
         let len = self.text.len();
         self.selection = len..len;
         self.selection_head = len;
@@ -253,6 +255,7 @@ impl InputState {
 
     /// 整体替换文本（程序化设置，发 `Change`）。
     /// 测试/程序化调用专用（与 gpui_component `InputState::set_value` 同 API）。
+    /// 单行不变式：换行折叠为空格（同 `edit_range`，防 `shape_line` panic）。
     #[allow(dead_code)]
     pub fn set_value(
         &mut self,
@@ -260,7 +263,7 @@ impl InputState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.text = value.into();
+        self.text = value.into().replace('\n', " ");
         let len = self.text.len();
         self.selection = len..len;
         self.selection_head = len;
@@ -270,8 +273,9 @@ impl InputState {
     }
 
     /// 整体替换文本（粘贴到搜索框路径，发 `Change`）。
+    /// 单行不变式：换行折叠为空格（同 `edit_range`，防 `shape_line` panic）。
     pub fn replace(&mut self, text: impl Into<String>, _window: &mut Window, cx: &mut Context<Self>) {
-        self.text = text.into();
+        self.text = text.into().replace('\n', " ");
         let len = self.text.len();
         self.selection = len..len;
         self.selection_head = len;
@@ -291,11 +295,17 @@ impl InputState {
     /// 在指定字节区间替换文本并收敛光标（IME/编辑共用），发 `Change`。
     /// 任何一次落地都清掉组合态（提交/删除/粘贴都结束组合；组合更新经
     /// [`ime::replace`] 在 apply 之后重新写回 marked，不受影响）。
+    ///
+    /// 单行不变式：本框渲染走 `shape_line`（gpui 对该路径断言文本不含 `\n`，
+    /// `vendor/.../text_system.rs:645`），故**任何**写入入口（粘贴/IME/程序化替换）
+    /// 都把换行折叠为空格再落盘——否则多行粘贴/组合会触发 `shape_line` panic。
+    /// `\n` 与 `' '` 同为 1 字节，折叠不改字节长度，光标/选区算术不受影响。
     fn edit_range(&mut self, range: Range<usize>, new_text: &str, cx: &mut Context<Self>) {
         let start = range.start.min(self.text.len());
         let end = range.end.min(self.text.len());
-        self.text.replace_range(start..end, new_text);
-        let caret = start + new_text.len();
+        let folded = new_text.replace('\n', " ");
+        self.text.replace_range(start..end, &folded);
+        let caret = start + folded.len();
         self.selection = caret..caret;
         self.selection_head = caret;
         self.marked = None;
@@ -1017,7 +1027,8 @@ impl EntityInputHandler for InputState {
             // 统一换行规范化先行：\r\n/\r → \n（现状行为）；后续模式判定/折叠都基于 \n。
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
             let insert: Option<String> = match self.paste_mode {
-                // 现状：规范化后原样插入（既有 Passthrough 语义）。
+                // 现状：规范化后进入编辑管线；`edit_range` 的单行不变式会把换行折叠为
+                // 空格（单行框不保存 `\n`，防 `shape_line` panic）。
                 PasteMode::Passthrough => Some(normalized),
                 // 折叠：每个换行折叠为单个空格（"a\r\nb\nc" → "a b c"）。
                 PasteMode::StripNewlines => Some(normalized.replace('\n', " ")),
@@ -1996,6 +2007,58 @@ mod tests {
             "abxy",
             "默认粘贴应原样插入（现状行为）"
         );
+    }
+
+    /// D1 fix：Passthrough + 含换行粘贴 —— 单行不变式把换行折叠为空格，**不得**让
+    /// `\n` 落进 `text`（否则 render/`shape_line`/`text_width`/`index_at_x` 全链路 panic，
+    /// `vendor/text_system.rs:645` debug_assert）。折叠后继续可渲染、不 panic。
+    #[gpui::test]
+    async fn paste_default_passthrough_folds_newlines_into_single_line(cx: &mut TestAppContext) {
+        let (input, wcx) = add_input_paste(cx, "ab", PasteMode::default());
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.paste(gpui::ClipboardItem::new_string("x\ny\nz".to_string()), window, cx)
+            });
+        });
+        let value = wcx.update(|_, cx| input.read(cx).value().to_string());
+        assert_eq!(value, "abx y z", "含换行粘贴应折叠为空格，实际 {:?}", value);
+        assert!(
+            !value.contains('\n'),
+            "单行不变式：text 不得含换行，实际 {:?}",
+            value
+        );
+        // 折叠不改字节长度 → 光标/选区算术不影响（值为 7 字符）。
+        let (sel, head) = wcx.update(|_, cx| {
+            let s = input.read(cx);
+            (s.selection.clone(), s.selection_head)
+        });
+        assert_eq!(sel, 7..7, "光标应收敛到末尾");
+        assert_eq!(head, 7);
+    }
+
+    /// D1 fix：IME 组合替换路径同样受单行不变式约束（ime::replace → apply_edit →
+    /// edit_range），组合文本带换行也不得落进 text。
+    #[gpui::test]
+    async fn ime_replace_folds_newlines_into_single_line(cx: &mut TestAppContext) {
+        let (input, wcx) = add_input_paste(cx, "a", PasteMode::default());
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.replace_text_in_range(Some(1..1), "b\nc", window, cx);
+            });
+        });
+        let value = wcx.update(|_, cx| input.read(cx).value().to_string());
+        assert_eq!(value, "ab c", "IME 替换含换行应折叠为空格，实际 {:?}", value);
+        assert!(!value.contains('\n'));
+        // 组合标记路径（replace_and_mark_text_in_range）同源，也应折叠：
+        let (input2, wcx2) = add_input_paste(cx, "a", PasteMode::default());
+        wcx2.update(|window, cx| {
+            input2.update(cx, |s, cx| {
+                s.replace_and_mark_text_in_range(Some(1..1), "d\ne", None, window, cx);
+            });
+        });
+        let value2 = wcx2.update(|_, cx| input2.read(cx).value().to_string());
+        assert_eq!(value2, "ad e", "IME 组合含换行应折叠为空格，实际 {:?}", value2);
+        assert!(!value2.contains('\n'));
     }
 
     /// P3/D1 测试校验器：非空才放行。
