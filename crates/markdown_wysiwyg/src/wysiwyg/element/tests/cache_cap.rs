@@ -129,3 +129,68 @@ fn install_open_clears_math_and_code_caches(cx: &mut TestAppContext) {
         assert!(ed.read(cx).code_epoch.get() > c0, "每次换源 code_epoch 应自增");
     });
 }
+
+/// ②′（集成）`install_open` 换源漏清 `image_cache`（gpui `RetainAllImageCache` 是
+/// `HashMap` 无淘汰）→ 旧文档图片 GPU 纹理只涨不降的内存 bug。修复 = 换源置脏
+/// `image_cache_dirty`，下一帧 `flush_image_cache_drop`（`render` 期入口，有 cx/window）
+/// 统一 `clear` 释放。headless 无法在 paint 外调 `load`（`window.current_view()` 仅限
+/// request_layout/prepaint/paint；实测 panic `window.rs:5536`），故回归口径 = 「脏标记在
+/// 换源后置位、下帧 flush 清除 + 缓存清空 / 幂等」。
+#[gpui::test]
+fn install_open_flushes_image_cache_textures(cx: &mut TestAppContext) {
+    use gpui::App;
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 前置：新编辑器缓存空 + 脏标记未置。
+        assert!(
+            ed.read(cx).image_cache.read(cx).is_empty(),
+            "前置：image_cache 应为空"
+        );
+        assert!(
+            !ed.read(cx).image_cache_dirty.get(),
+            "前置：脏标记未置"
+        );
+        // 换源：整篇装配（install_open 语义 = 打开新文档）→ 置位脏标记；install_open
+        // 无 cx/window，纹理延帧由下一帧 flush 统一释放。
+        let r = WyEditor::open_from_str(gpui::SharedString::from("![新图](new.png)\n"));
+        ed.update(cx, |e, _| e.install_open(r));
+        assert!(
+            ed.read(cx).image_cache_dirty.get(),
+            "换源应置位 image_cache 脏标记"
+        );
+        // 下一帧统一 flush（render 期入口的同款调用）：消费脏标记 + 清空缓存。
+        ed.update(cx, |e, ecx| e.flush_image_cache_drop(window, ecx));
+        assert!(
+            !ed.read(cx).image_cache_dirty.get(),
+            "flush 后脏标记应清除"
+        );
+        assert!(
+            ed.read(cx).image_cache.read(cx).is_empty(),
+            "flush 后缓存应清空"
+        );
+        // 再换一篇**不同源**：连续换源每次都重新置脏（换源即作废旧缓存，不残留）。
+        let r2 = WyEditor::open_from_str(gpui::SharedString::from("![再换](b.png)\n"));
+        ed.update(cx, |e, _| e.install_open(r2));
+        assert!(
+            ed.read(cx).image_cache_dirty.get(),
+            "再次换源应再次置脏"
+        );
+        ed.update(cx, |e, ecx| e.flush_image_cache_drop(window, ecx));
+        assert!(
+            !ed.read(cx).image_cache_dirty.get(),
+            "第二次 flush 后脏标记应清除"
+        );
+        // 重复 flush：已无脏且缓存空 → 幂等（clear 空缓存 no-op，不误伤）。
+        ed.update(cx, |e, ecx| e.flush_image_cache_drop(window, ecx));
+        assert!(
+            ed.read(cx).image_cache.read(cx).is_empty(),
+            "重复 flush 幂等（不应报错/残留）"
+        );
+    });
+}

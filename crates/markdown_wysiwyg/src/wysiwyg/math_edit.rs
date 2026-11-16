@@ -357,11 +357,17 @@ impl WyEditor {
         // 锚点**（同 `image_edit_card_element`——render 期现算 frame 会读到 ensure 兜底
         // 800 宽重建的临时帧，卡片横跳一帧）。锚点未就绪才回退到逐帧现算。
         let anchor = self.math_edit_anchor.resolve(|| {
-            let rd = self.rd.borrow();
-            let f = rd.frame.borrow();
-            let f = f.as_ref()?;
+            // ⚠️ 回退闭包内**先把帧 Rc 克隆取出、释放 `self.rd`/帧借用，再算 origin**——
+            // 与 image.rs 锚点回退闭包同款硬化：勿让 `self.rd.borrow()` 的 `Ref` 存活到
+            // `content_origin()`（内部 `reading_col_shift` 再 `self.rd.borrow()` 同帧重借；
+            // 共享×共享当前不 panic，但持 Ref 跨 re-entrant 调用是借用事故温床，同类教训
+            // 见 `prewarm_band_double_borrow`——那处是共享×互斥直接 `RefCell already borrowed`）。
+            let f = {
+                let rd = self.rd.borrow();
+                rd.frame.borrow().as_ref().cloned()?
+            };
             let origin = self.content_origin();
-            self.math_edit_anchor_now(origin, f)
+            self.math_edit_anchor_now(origin, &f)
         })?;
         let (left, top) = (f32::from(anchor.x), f32::from(anchor.y));
         let ed_close = cx.entity();

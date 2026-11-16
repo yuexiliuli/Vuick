@@ -18,6 +18,18 @@ impl WyEditor {
         self.pending_math_drop.borrow_mut().push(img);
     }
 
+    /// 换源脏标记消费：置脏的下一帧经 [`WyEditor::render`]（`impl Render`，宿主每帧
+    /// 重绘入口，带 `window`）到这里统一 `clear` 释放旧文档图片纹理。——`install_open`
+    /// 无 cx/window，gpui `RetainAllImageCache::clear` 需要 `&mut Window`，故延迟到每帧；
+    /// 与 `sync_math` 的 `pending_math_drop` **同款「脏标记 + 每帧统一 flush」姿势**
+    ///（K10 副作用集中注入）。仅消费标志，无脏返回；换源全清正确——此刻新源图片尚未
+    /// load，缓存里全是旧文档图。
+    pub(crate) fn flush_image_cache_drop(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.image_cache_dirty.replace(false) {
+            self.image_cache.update(cx, |c, cx| c.clear(window, cx));
+        }
+    }
+
     /// 公式排版槽（元素 build/paint 只读查询）。
     pub(crate) fn math_slots(&self) -> Rc<RefCell<MathSlotCache>> {
         self.math_slots.clone()
