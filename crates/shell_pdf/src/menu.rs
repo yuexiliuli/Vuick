@@ -84,21 +84,26 @@ pub fn delete_annot_action(pdf: &Entity<PdfViewer>, id: u64, cx: &mut App) {
 
 /// PDF 页操作失败 toast 判定 + 模型去重更新（供宿主 `_pdf_sub` observe 变化时调用；
 /// `last_modify_error` 由 None → Some 才算「变化」，同一错误不重复提示）。
+/// 去重键 = PDF 文档实体（`EntityId → 文案`），每个文档独立去重：A 文档已提示的
+/// 同文案错误不吞 B 文档的首次失败（单槽跨文档共享污染；实体消亡后槽位随文档数缓慢
+/// 增长、entry 极小且对其他文档无害，EntityId 带代际号不复用）。
 /// 返回要 toast 的失败文案（`None` = 无新变化，不加提示）。
 pub fn notify_last_error(m: &mut AppModel, pdf: &Entity<PdfViewer>, cx: &mut App) -> Option<String> {
     let err = pdf.read(cx).last_modify_error().map(|s| s.to_string());
+    let key = pdf.entity_id();
     // 先提纯 owned 再 match（match 分支守卫里的 borrow 临时 Ref 存活整个
     // 分支体 → 块内 borrow_mut 运行期双借 panic）。
-    let seen = m.pdf_last_error_seen.clone();
+    let seen = m.pdf_last_error_seen.get(&key).cloned();
     let changed = err.as_ref().is_some_and(|e| seen.as_deref() != Some(e.as_str()));
     match err {
         Some(e) if changed => {
-            m.pdf_last_error_seen = Some(e.clone());
+            m.pdf_last_error_seen.insert(key, e.clone());
             Some(pdf_modify_error_msg(&e))
         }
         Some(_) => None,
         None => {
-            m.pdf_last_error_seen = None;
+            // 只清该死文档的槽位（保持「无变化不重复提示」语义，不动其它文档）。
+            m.pdf_last_error_seen.remove(&key);
             None
         }
     }
@@ -221,10 +226,14 @@ pub fn extract_page_action<H: PdfHost>(
                 let _ = cx.update_window_entity(&entity, |this, _window, cx| {
                     let p = pdf2.clone();
                     p.update(cx, |v, cx| v.extract_page_to(page_index, out.clone(), cx));
+                    // 只有「同步预检命中」（如目标目录缺失）在这里立即提示失败；**成败主判
+                    // 决移出菜单决策点**——`extract_page_to` 是异步（同步段先清错误、真实
+                    // 结果后台完成才落地），同步臆断会成功 toast 恒假（失败也先弹「已提取
+                    // 页面」再补失败 = 自相矛盾双 toast）。真实成败由异步完成结果驱动：
+                    // 成功经 `last_extract_success` 信号 → `_pdf_sub` observe 弹成功 toast；
+                    // 失败经 `last_modify_error` → 既有 `_pdf_sub` 补发失败提示。
                     if let Some(err) = pdf2.read(cx).last_modify_error() {
                         this.pdf_host_toast("提取页面失败", pdf_modify_error_msg(err));
-                    } else {
-                        this.pdf_host_toast("已提取页面", format!("第 {page1} 页 → {}", out.display()));
                     }
                 });
             })
@@ -235,5 +244,44 @@ pub fn extract_page_action<H: PdfHost>(
     {
         let _ = (window, cx, pdf);
         let _ = (base_name, entity, pdf2, page_index, page1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AppContext as _;
+
+    /// 红测 Bug B：失败 toast 去重单槽 `AppModel.pdf_last_error_seen` 挂在宿主级，**跨 PDF
+    /// 文档共享**（除 `notify_last_error` 外无任何随文档切换重置点，见 model.rs:295/386/571 +
+    /// menu.rs:96/101）。文档 A 首次失败提示后，切到文档 B：B 的首次失败若与 A 的 been 文案
+    /// 相同（越界「页码越界：第 N 页」/「文档尚未加载」/ 同一文件被占用等真实同文案场景），
+    /// 会被误判「已见」而**吞掉 B 的首次提示**。
+    /// 修复方向：去重键含文档身份（按 PdfViewer entity 分槽）或随文档切换清 seen。
+    #[gpui::test]
+    async fn pdf_error_dedup_slot_swallows_other_docs_first_failure(cx: &mut gpui::TestAppContext) {
+        // 两个独立 PDF 文档实体。未加载即可：`extract_page_to(999, …)` 越界错误是同步路径
+        //（open.rs:1233-1236，dims 空 → 999 ≥ 0），无需 pdfium/真实文档。
+        let a = cx.update(|app| app.new(|cx| PdfViewer::new("A.pdf".into(), cx)));
+        let b = cx.update(|app| app.new(|cx| PdfViewer::new("B.pdf".into(), cx)));
+        let mut m = AppModel::default();
+
+        // 文档 A 首次失败（越界提取）→ 应提示一次，seen = A 的错误文案。
+        let toast_a = cx.update(|app| {
+            a.update(app, |v, cx| v.extract_page_to(999, "out-a.pdf".into(), cx));
+            notify_last_error(&mut m, &a, app)
+        });
+        assert!(toast_a.is_some(), "A 首次失败应提示一次");
+
+        // 切到文档 B：B 首次失败（同文案越界错误）→ 独立文档的首次失败也**应**提示。
+        // 当前被 A 的 been 槽污染 → toast 为 None = 红测失败。
+        let toast_b = cx.update(|app| {
+            b.update(app, |v, cx| v.extract_page_to(999, "out-b.pdf".into(), cx));
+            notify_last_error(&mut m, &b, app)
+        });
+        assert!(
+            toast_b.is_some(),
+            "B 首次失败不应被 A 的 been 槽吞掉（单槽跨 PDF 共享污染去重）"
+        );
     }
 }

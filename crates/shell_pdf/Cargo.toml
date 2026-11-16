@@ -25,3 +25,8 @@ ui = { path = "../ui" }
 serde_json = { workspace = true }
 # 「提取页面为 PDF」另存为对话框（原 shell pdf_menu 同款）。
 rfd = { workspace = true }
+
+[dev-dependencies]
+# zed 同款：dev 下给同一 gpui 叠加 test-support feature（仅测试构建，不新增外部包），
+# 供 `#[gpui::test]` 无头驱动 AppModel + PdfViewer 实体（与 pdf crate 同款姿势）。
+gpui = { workspace = true, features = ["test-support"] }

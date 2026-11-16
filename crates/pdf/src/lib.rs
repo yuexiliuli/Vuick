@@ -8832,6 +8832,73 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 
+    /// 红测 Bug A（菜单「提取页面成功 toast」决策点真空）：`shell_pdf::menu::extract_page_action`
+    /// 在 **`extract_page_to` 同步调用后立即**（不等后台完成）读 `last_modify_error` 决定
+    /// 成败 toast（menu.rs:223-228）。而 `extract_page_to` 是异步：同步段先清错误
+    /// （open.rs:1246 `self.last_modify_error = None`），真实写盘失败只在后台完成后才置错
+    /// （open.rs:1258）→ 决策点恒读 None → 无论成败都弹「已提取页面」（成功 toast 恒假，
+    /// 失败也先弹一条错误成功 toast，随后经 observe 再补失败提示）。
+    /// 红测：构造一次**注定失败**的异步提取（输出路径父目录不存在 → worker 写盘必 Err），
+    /// 断言「在菜单决策点（调用后立即读）必须已能观察到失败标记」——当前为 None = FAILED。
+    #[gpui::test]
+    async fn extract_doomed_write_error_is_not_visible_at_menu_decision_point(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        use std::time::Duration;
+        use gpui::AppContext as _;
+
+        let p = temp_pdf_copy("extract-red");
+        let viewer = cx.update(|app| app.new(|cx| crate::pdf::PdfViewer::new(p.clone(), cx)));
+        fn wait(
+            cx: &mut gpui::TestAppContext,
+            pred: &mut dyn FnMut(&mut gpui::TestAppContext) -> bool,
+        ) -> bool {
+            for _ in 0..800 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                if pred(cx) {
+                    return true;
+                }
+            }
+            false
+        }
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).is_loaded())),
+            "夹具应加载完成（进入异步写盘路径）"
+        );
+
+        // 注定失败：目标路径父目录不存在（worker 原子写盘必 Err）。
+        let dir = std::env::temp_dir()
+            .join("vuick-pdf-tests")
+            .join(format!("no-such-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let doomed = dir.join("extracted.pdf");
+
+        cx.update(|app| viewer.update(app, |v, cx| v.extract_page_to(0, doomed.clone(), cx)));
+        // 菜单决策点：同步调用后**立即**（不 pump 后台）读 last_modify_error。
+        let now = cx
+            .update(|app| viewer.read(app).last_modify_error().map(|s| s.to_string()));
+        assert!(
+            now.is_some(),
+            "菜单决策点必须能观察到注定失败的提取的错误标记；当前 None → 成功 toast 被无条件弹出（成功 toast 恒假）"
+        );
+
+        // 收尾证实：预检命中后错误标记**同步已置且持续可见**（不因后续 pump 被清除），
+        // 与「决策点真空」（旧行为 None）相对照。注：预检短路使本 op 不再进后台写盘——
+        // 异步写盘失败链（worker Err → last_modify_error → observe 补发）由既有
+        // `last_modify_error`/`_pdf_sub` 机制覆盖，不在此红测范围内。
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).last_modify_error().is_some())),
+            "预检命中后错误标记应持续可见（父目录不存在 → 同步置错）"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     // ---- 待保存模型（P1）：内存页面操作不写盘 / 镜像恢复 / 保存后才落盘 ----
 
     /// 页面操作**待存**（worker 层）：内存级插入/删除只改 stores 内存工作副本、**磁盘文件

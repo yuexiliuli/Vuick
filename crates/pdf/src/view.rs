@@ -512,6 +512,10 @@ pub struct PdfViewer {
     pub(crate) restore_pending: Option<(usize, f32)>,
     /// 最近一次写回/页操作失败的文案（成功或未操作时为 None）。Phase B 弹卡/提示用。
     pub(crate) last_modify_error: Option<String>,
+    /// 「提取页面」**成功**的提示文案（「第 N 页 → 路径」）：异步成功路径置位 + `notify`，
+    /// 壳层 `_pdf_sub` observe 消费一次（`take` 清空）弹成功 toast——成败提示都收敛到
+    /// 异步完成的确定性结果，菜单不再在同步调用后臆断成败（防成功 toast 恒假 / 双 toast）。
+    pub(crate) last_extract_success: Option<String>,
     /// Phase B1：选中文字后自动弹出的操作卡片（`None` = 未弹出）。
     pub(crate) sel_card: Option<SelCard>,
     // ---- 待保存模型（P1）：内存待存注释 / 撤销栈 / 页面操作待存 / 灰框焦 ----
@@ -685,6 +689,7 @@ mod tests {
                     restore_anchor: None,
                     restore_pending: None,
                     last_modify_error: None,
+                    last_extract_success: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
                     undo_stack: VecDeque::new(),
@@ -924,6 +929,7 @@ mod tests {
                     restore_anchor: None,
                     restore_pending: None,
                     last_modify_error: None,
+                    last_extract_success: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
                     undo_stack: VecDeque::new(),
@@ -1066,6 +1072,7 @@ mod tests {
                     restore_anchor: None,
                     restore_pending: None,
                     last_modify_error: None,
+                    last_extract_success: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
                     undo_stack: VecDeque::new(),
@@ -1194,6 +1201,7 @@ mod tests {
             restore_anchor: None,
             restore_pending: None,
             last_modify_error: None,
+            last_extract_success: None,
             sel_card: None,
             pending_annots: Vec::new(),
             undo_stack: VecDeque::new(),

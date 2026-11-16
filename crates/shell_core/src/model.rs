@@ -291,8 +291,11 @@ pub struct AppModel {
     pub pdf_bg: PdfBgPref,
     /// PDF 自定义画布底色（config `pdf_bg_custom`）。
     pub pdf_bg_custom: Option<String>,
-    /// 最近一次对 PDF 页操作失败已提示过的错误文案（toast 去重）。
-    pub pdf_last_error_seen: Option<String>,
+    /// 最近一次对 PDF 页操作失败已提示过的错误文案（toast 去重）——**按 PDF 文档实体分槽**
+    /// （`EntityId → 文案`）：每个文档独立去重，避免单槽跨文档共享污染（A 文档 seen 吞掉
+    /// B 文档首次同文案失败提示）。实体消亡后槽位只随文档数缓慢增长（entry 极小、对其他
+    /// 文档无害，EntityId 带代际号不复用），不逐关闭点清理。
+    pub pdf_last_error_seen: HashMap<gpui::EntityId, String>,
     /// PDF 阅读位置书签（规范化路径 → 列表）。
     pub pdf_bookmarks: HashMap<String, Vec<PdfBookmark>>,
     /// 文件树过滤词（防抖后提交、已归一化小写）。
@@ -383,7 +386,7 @@ impl AppModel {
             tab_reorder_target: None,
             pdf_bg,
             pdf_bg_custom,
-            pdf_last_error_seen: None,
+            pdf_last_error_seen: HashMap::new(),
             pdf_bookmarks,
             files_filter: String::new(),
             files_filter_pending: String::new(),
@@ -568,7 +571,7 @@ impl Default for AppModel {
             tab_reorder_target: None,
             pdf_bg: PdfBgPref::default(),
             pdf_bg_custom: None,
-            pdf_last_error_seen: None,
+            pdf_last_error_seen: HashMap::new(),
             pdf_bookmarks: HashMap::new(),
             files_filter: String::new(),
             files_filter_pending: String::new(),

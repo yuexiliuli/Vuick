@@ -324,6 +324,12 @@ impl WyEditor {
     /// 大文档（App load）不直接走这里：整篇 O(n) 解析挪到后台（[`Self::open_from_rope`]），
     /// 完成后再 [`Self::install_open`] 装配——本函数只保留给同步路径（小文档/测试）。
     pub fn set_source_text(&mut self, text: &str) {
+        // 换源即装机：同步路径就地装好内容 → **先作废在途后台整篇装配**（推进装配代号 +
+        // 清「在途」）。否则在途 async 装配（begin_install→install_open→finish_install）的
+        // 旧完成回调稍后按旧代号命中，把刚同步换上的内容覆盖回去，且 `is_loading` 卡 true。
+        // `invalidate_install` 文档明示只给同步改写路径：async 装配完成路径（install_open
+        // 直调）从不经本函数 → 零自伤；prefix/full 两阶段共用的 old_seq 由同步换源作废。
+        self.invalidate_install();
         let ss = SharedString::from(text);
         self.install_open(Self::open_from_str(ss));
     }
@@ -1160,6 +1166,21 @@ impl WyEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
+
+    /// RED 复现宿主（镜像 `block_height_snapshot.rs` 惯例）：封装 `WyEditor` 为根元素。
+    struct ReproHost {
+        ed: gpui::Entity<WyEditor>,
+    }
+    impl gpui::Render for ReproHost {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            self.ed.clone()
+        }
+    }
 
     /// `count_marks`（rope 字节流滑窗）与字符串口径（`bytes().filter('$')` /
     /// `matches("[!")`）逐值对拍——冷开替换旧 `open_from_str` 的全篇串扫描后，
@@ -1191,5 +1212,89 @@ mod tests {
         let (d, a) = WyEditor::count_marks(&rope);
         assert_eq!(d, long.bytes().filter(|&b| b == b'$').count());
         assert_eq!(a, long.matches("[!").count());
+    }
+
+    /// RED（复现 agent，2026-11-16）：在途 async 整篇装配期间同步 `set_source_text`，
+    /// `is_loading` 卡 `true`。
+    ///
+    /// 机理：`set_source_text` → `install_open` 同步就地装好内容，但**不调用
+    /// `invalidate_install`**（不推进 seq / 不清 loading）→ 本已同步就位的内容仍被
+    /// 标记为「后台整篇装配在途」。宿主 `is_loading` 门控（替代原宿主
+    /// `md_wy_install.pending`）据此拒绝增量桥/重复重喂，形成卡在途。
+    ///
+    /// 期望（修复后）：同步换源即装机 → `invalidate_install` 清在途 → `is_loading()==false`。
+    #[gpui::test]
+    fn sync_install_inflight_async_clears_loading(cx: &mut gpui::TestAppContext) {
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            ReproHost { ed }
+        });
+        let vcx: &mut gpui::VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut gpui::App| {
+            let ed = host.read(cx).ed.clone();
+            // 宿主 async 装配入口：取新代号 + 置「在途」。
+            ed.update(cx, |w, _| {
+                let s = w.next_install_seq();
+                assert!(w.begin_install(s), "发起代号必为最新");
+            });
+            assert!(ed.read(cx).is_loading(), "发起后在途");
+            // 在途期间同步换源（小文档/测试/自愈路径的同步入口）。
+            ed.update(cx, |w, _| w.set_source_text("# 新文档\n新正文"));
+            // RED：同步换源已就地装好内容，不应再「后台整篇装配在途」。
+            assert!(
+                !ed.read(cx).is_loading(),
+                "RED: 同步换源后 is_loading 应 false，实际卡 true（set_source_text 未 invalidate）"
+            );
+        });
+    }
+
+    /// RED（复现 agent，2026-11-16）：在途 async 整篇装配期间同步 `set_source_text`，
+    /// 旧 async 完成回调把内容**覆盖回旧文档**。
+    ///
+    /// 机理：`set_source_text`/`install_open` 不推进 seq（不留 invalidate 痕迹）→ 旧代号
+    /// 仍是「最新」→ 旧完成回调的 `begin_install(old_seq)` 判当前、宿主随后
+    /// `install_open(旧结果)` 把新文覆盖回旧文档（对应宿主 `md_wy_spawn_async_install`
+    /// 完成路径的 `begin_install → install_open → finish_install` 序列）。
+    ///
+    /// 期望（修复后）：同步换源推进 seq → 旧回调 `begin_install(old_seq)` 返回 false 被丢弃。
+    #[gpui::test]
+    fn sync_install_inflight_async_stale_callback_does_not_overwrite(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            ReproHost { ed }
+        });
+        let vcx: &mut gpui::VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut gpui::App| {
+            let ed = host.read(cx).ed.clone();
+            const NEW: &str = "# 新文档\n新正文";
+            let seq = ed.update(cx, |w, _| {
+                let s = w.next_install_seq();
+                assert!(w.begin_install(s), "发起代号必为最新");
+                s
+            });
+            assert!(ed.read(cx).is_loading(), "发起后在途");
+            // 在途期间同步换源。
+            ed.update(cx, |w, _| w.set_source_text(NEW));
+            assert_eq!(ed.read(cx).text().to_string(), NEW, "同步换源后立即是本文");
+            // 旧 async 完成回调（宿主完成路径）：先判陈旧世序。
+            let current = ed.update(cx, |w, _| w.begin_install(seq));
+            if current {
+                // 当前实现：同步换源未 invalidate → 旧代号仍「最新」→ 旧结果被装上新文。
+                let stale =
+                    WyEditor::open_from_str(gpui::SharedString::from("# 旧文档\n旧正文"));
+                ed.update(cx, |w, _| {
+                    w.install_open(stale);
+                    w.finish_install(seq);
+                });
+            }
+            // 期望：同步换源后旧 async 完成绝不覆盖新文。
+            assert_eq!(
+                ed.read(cx).text().to_string(),
+                NEW,
+                "RED: 旧 async 完成覆盖新文（旧回调把内容装回旧文档）"
+            );
+        });
     }
 }

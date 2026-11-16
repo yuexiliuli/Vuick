@@ -56,6 +56,9 @@ impl EditorApp {
             // 仍显示旧文件名，与实际保存位置不符）。
             this.sync_pdf_path(&pdf2, cx);
             this.pdf_notify_last_error(&pdf2, cx);
+            // 提取成功信号：viewer 异步完成置 last_extract_success 并 notify → observe
+            // 消费一次弹「已提取页面」成功 toast（成败都收敛到异步完成的确定性结果）。
+            this.pdf_notify_last_extract_success(&pdf2, cx);
             cx.notify();
         }));
     }
@@ -157,6 +160,9 @@ impl EditorApp {
                 } else {
                     // 自愈：异步装配尚未完成用户已编辑 → 一次性从当前编辑区全文补齐
                     //（O(n) 仅此一次），此后退化到逐键增量（防空壳上重放错位）。
+                    // B3：喂源/就地换源前作废在途后台装配（与 ensure_md_wy/ensure_epub_wy
+                    // 同口径，双保险——set_source_text 内部也有 invalidate_install）。
+                    self.md_wy_invalidate_async(tab_ix, cx);
                     let full = ed.read(cx).value().to_string();
                     wy.update(cx, |w, _cx| w.set_source_text(&full));
                 }
