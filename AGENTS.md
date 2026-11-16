@@ -1,8 +1,8 @@
 <!--
 REFACTORED: 2026-10-18
 STYLE: LLM Protocol Body (v3)
-LAST_AUDIT_PATCH: 2026-11-16-001
-AUDIT_PATCH: 2026-11-15-001 (沉淀 K167-K172：阻塞原生模态禁入持 App RefCell 事件帧 + async 回传姿势 / RefCell panic 取证 / 低置信模式派裁决 agent / 纯函数共享几何先测绘 / per-crate cfg 门留调用侧 / 整树 fmt 事故恢复模板；本线收交=UI 去重战役，见 docs/handover-2026-11-15-ui-dedup.md) ; 2026-11-16-001 (沉淀 K173-K176：安全/攻击面测试证明「测到真正防御路径」防假绿 / 报告「已修复」标注须 git log+红测证伪 / 主 agent 亲为实现过度→上下文透支，实现下放子 agent / 改源码禁走跨行 `-replace`；本线收交=4 bug 修复战役，见 docs/code-review-2026-11-16.md)
+LAST_AUDIT_PATCH: 2026-11-16-002
+AUDIT_PATCH: 2026-11-15-001 (沉淀 K167-K172：阻塞原生模态禁入持 App RefCell 事件帧 + async 回传姿势 / RefCell panic 取证 / 低置信模式派裁决 agent / 纯函数共享几何先测绘 / per-crate cfg 门留调用侧 / 整树 fmt 事故恢复模板；本线收交=UI 去重战役，见 docs/handover-2026-11-15-ui-dedup.md) ; 2026-11-16-001 (沉淀 K173-K176：安全/攻击面测试证明「测到真正防御路径」防假绿 / 报告「已修复」标注须 git log+红测证伪 / 主 agent 亲为实现过度→上下文透支，实现下放子 agent / 改源码禁走跨行 `-replace`；本线收交=4 bug 修复战役，见 docs/code-review-2026-11-16.md) ; 2026-11-16-002 (沉淀 K177-K182：复现断言期望值须源于真实几何推导 / 并行子 agent 工作树预声明他人改动 / 修复规模分级定 agent 层数 / cpal 假警报型错误诊断法 / 批量流水线正效复盘；本线收交=items 4-14 批量修复，见 docs/handover-2026-11-16-code-review-fixes.md)
 -->
 
 # AGENTS.md（LLM 执行协议 v3）
@@ -410,9 +410,16 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | K173 | **安全/攻击面测试必须证明「测到了真正防御路径」，防 K153 假绿**（2026-11-16 epub zip bomb 评审 NIT#1 实证）：`entry_declared_small_actual_large_peaks_bounded` 用 `Stored` 压缩造 zip → 声明==实际→只走「声明预检」，#2 take 限长 / #3 读后复核**从未执行**，测试却报绿。评审抓出后改用 `Deflated`+手工 patch 中央目录/本地头 `uncompressed_size` 造真「声明小实大」+**对照分支**（同一输入放宽上限→应解析成功，证明拒绝确因目标防御而非解析器/CRC 其它错误）。凡 DoS/越界/几何不变式测试，签发前问「用绕过方式构造输入会不会红」——测不到目标的绿 = 假绿。 |
 | K174 | **报告「已修复」标注不可信，修复前必 `git log -- file` + 红测取证**（2026-11-16 三 bug 实证）：`docs/code-review-2026-11-16.md` 的 shell#1（atomic write）、virtualize、epub 三条「已修复 2026-11-16」**全部未落地**（git 史无对应 commit，代码仍是缺陷原样）——文档记录与会话内实现了「另一批」易混，标注真实性必须用 `git log -- 涉事文件` 与红测亲自证伪，不能「报告说修了就跳过」（K144 强化）。 |
 | K175 | **主 agent 亲为实现工程过度 → 上下文透支**（2026-11-16 4 bug 战役复盘）：多个独立 bug + 大重构（epub 300 行 + 后台化）主 agent 全亲为，加上改名 121 文件，主上下文被大量占用，后续被迫在脑内反复模拟工具调用（无意义叙述循环）——典型「上下文远超水位」征兆。对策：几何/并发/安全类修复默认走「实现子 agent + 独立评审」（K48/K50/K124/K134），主 agent 只做「复现派发 + 编译器收口 + 评审收口 + 提交」；「先复现 → 实现 → 独立评审」整链下放，主上下文留给现场交互与判决。 |
-| K176 | **改源码禁走带跨行匹配的 PowerShell `-replace`**（2026-11-16 virtualize 红测事故）：`-replace` 做跨行 oldString 时把字面 `\`n` 混进文件（`let start=…;`n        let end=…` 损坏源码），且不报错难察觉。改源码只用 edit/write 工具；脚本只做无跨行模式的整文件纯字符串替换（`[IO.File]::ReadAllText/WriteAllText` + UTF-8 无 BOM）。 |
+| K177 | **复现/断言代码期望值必须从真实几何或公式推导，不能拍脑袋假设**（2026-11-16 scrollbar 红测实证）：复现 agent 断言点击轨道中点落点假设 `geom.thumb_len=裸100`，但 `geom.thumb_len` 实为 `hit_len`=裸长扣 `2×THUMB_INSET`（92）→ 期望值错，实现 agent 被迫重演手算改期望浪费一轮。结论：凡几何/字节/数值类红测断言，brief 必须要求「先精读常量/公式，手写算式再落期望值」，评审再对一次。 |
+| K178 | **并行子 agent 工作树扰动需派活时预声明基线**（2026-11-16 items 4-14 实证）：并行下手动归类 `git status` 改动易误判（复现 agent 曾把「并行其他会话的红测/实现改动」当成「既有预存改动」报告，靠主 agent 核对才消歧）。对策：多 agent 并行派活时，brief 写明「工作树预期含 N 个并行的未提交改动（列出文件或说明并发会话），git status 里非你阶段的文件请勿触碰/勿当基线」；主 agent 提交前按 K149 三连收口时统一核对。 |
+| K179 | **修复流水线按任务规模分级定 agent 层数**（2026-11-16 items 4-14 复盘）：三 agent 层（复现+实现+评审）只留给**多文件/跨 crate/安全/并发/交互观测**类；单文件单行机械修复（如 `\` 转义 `i+=2→i+=1+char_len`）用「红测 + 实现 + 提交前收口」两层 + 关键断言即可，省一层 agent 轮；纯常量/文案主 agent 亲为（K1/K57）。评审只做 delta + 定向（K42）。 |
+| K180 | **主 agent 每波只做轻收口，重验证集中提交前一次**（2026-11-16 items 4-14 复盘）：每波中间若已跑过 delta 测试 + K149 三连，主 agent 不必每波全量重测——实现/评审侧的输出（测试计数 + build Finished + git status 边界）是可信收口信号，主 agent 只在**提交前**做一次跨 crate 聚合验证。省掉 N 波×重复编译。 |
+| K181 | **二叉诊断环境性假警报：先证伪再派活**（2026-11-16 cpal `StreamInvalidated` 实证）：运行时库错误回调（cpal WASAPI 等）可能上报「必重建/设备变化」类**良性假警报**——cpal `StreamInvalidated` 裸文本只源自 `default_device_change_error`（默认输出设备变化广播），且原端点仍播放、声音正常。判定三步：①读库源码确认该文本的**唯一 emit 路径**②核对我们调用面是否可能自身触发（sink 是否首开一次复用、flush/pause 走 command channel 不触 err_fn）③用户听感/计数探针复核。确认为假警报 → 「不修」也是合格交付，**禁止按字面误派重建流实现**（K29/K43 呼应）。 |
+| K182 | **修复先复现+红测的组织闭环是批量战役的最高 ROI 动作**（2026-11-16 items 4-14 复盘，正效）：每波「先派复现 agent 落红测 → 实现修绿 → 独立评审反证」共 24 子 agent 轮、8 crate、0 次「实现→用户否→返工」；复现阶段 9 个 agent 全部产出真红测（0 空返），评审全部做剔除式反证（临剔修复→RED→还原）防假绿。加严：复现期发现 review 建议与代码实际不符（item 10 建议 install_open 首行 invalidate 实会自伤 prefix/full 两阶段）要如实上报改接缝——**review 的修复建议是起点不是结论**，实现前必须复合接缝论证。 |
 
 > **batch-2/3 时段账（2026-11-15，UI 去重战役续，转为交接 docs/handover-2026-11-15-ui-dedup.md）**：分析 5 explore 并行（值）；P1-P7 首批（P1/C/E 配评审抓「语义差异未被抹平」，值）；B/A/P5/D3 机械小批（低空返、零返工）；D/P16 两个「保持原样」裁决 agent（省 2 负收益轮）；P3 战役测绘→3 slice→评审零返工（K170）；PDF 自定义色闪退 = 预存 bug → 诊断钉借用链 → 后台线程回传修复。可避免 ≈2 轮：P4 的 cfg 门错位（→K171）、P7 的 fmt 未自恢复（→K172）。评审配比端到端执行到位（K146/K42），14 commits 全独立可编译、未推送。
+
+> **items 4-14 批量修复时段账（2026-11-16，11 bug + 1 诊断，8 crate）**：三波修复全部走「复现红测 → 实现修绿 → 独立评审反证」闭环，24 子 agent 轮、0 用户返工（K182）；3 批 6 commits（pdf_core×1、editor_core×1、music+media_io×1、pdf+shell+md_wy×1、md_wy 安全×1、ui×1）全独立可编译。跨 crate 并行按 K7 分 family 生效（pdf_core / editor_core / music+media_io / md_wy+shell / ui 各并行）。沉淀 K177-K182：复现断言源于真实几何（scrollbar K177）、并行预声明工作树基线（K178）、规模分级定层数（K179）、主 agent 提交前一次聚合验证（K180）、环境假警报先证伪再派活（K181 cpal）。正效复盘完结：本批最值的是「复现先行零误修 + 评审剔除法反证防假绿」，最该修的三件事 = 规模分级降层、断言真实几何、验证收口提交前。音频 `StreamInvalidated` 诊断 = 良性假警报（K181 样板，零代码产出但避免白改重建）。
 
 
 ## 6.5 复盘附录（2026-11-13 阅读进度/WYSIWYG 战役时段账）

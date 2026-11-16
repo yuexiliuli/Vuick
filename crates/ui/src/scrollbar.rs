@@ -713,7 +713,7 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
                         })
                         / denom)
                         .clamp(0., 1.);
-                    let target = (-(scroll_area * pct)).max(safe_min);
+                    let target = (-((scroll_area - container) * pct)).max(safe_min);
                     if is_v {
                         handle.set_offset(point(offset.x, px(target)));
                     } else {
@@ -1512,5 +1512,101 @@ mod tests {
         wcx.executor().advance_clock(Duration::from_millis(3000));
         wcx.run_until_parked();
         assert!(!shown.get(), "距上次活动精确 3.0s 应已隐藏（证明非轮询边界延迟）");
+    }
+
+    // —— 复现：点击轨道跳转（`scrollbar.rs:707-716`）目标错乘 `scroll_area` 而非
+    // `(scroll_area - container)`（= max_scroll），thumb 落点系统性偏（K144 复现先行）——
+    //
+    // 视觉坐标链（vp=200x400、content=200x1600）：
+    //   scroll_area=1600, container=400 → max_scroll=1200, safe_min=-1200（geom :442/:501）
+    //   raw thumb_len=100, hit_len=100-2·4=92（geom.thumb_len，含两端 THUMB_INSET 内缩）
+    //   denom=400-92=308, track 竖直 x∈[184,200]
+    //   点击 y → pct=(y - hit_len/2 - 0)/308=(y-46)/308（滑块中心对准点击位）
+    //   期望 target = -(max_scroll × pct)；当前实现 = -(scroll_area × pct)（错，:716）
+    //   ① y=200 → pct=(200-46)/308=0.5 → 期望 -600；当前 -(1600×0.5)=-800（偏大 200）
+    //   ② y=320 → pct=274/308≈0.8896 → 期望 -1200×274/308≈-1067.53；
+    //     当前 -(1600×0.8896)≈-1423 被夹到 safe_min=-1200（整体到顶）
+
+    /// 记录 `set_offset` 落点的句柄：几何只读，把点击跳转写回的目标 offset 存进 Rc<Cell>。
+    #[derive(Clone)]
+    struct ClickProbeHandle {
+        viewport: Bounds<Pixels>,
+        offset: Point<Pixels>,
+        content: Size<Pixels>,
+        recorded: Rc<Cell<Option<Point<Pixels>>>>,
+    }
+
+    impl ScrollbarHandle for ClickProbeHandle {
+        fn viewport_bounds(&self) -> Bounds<Pixels> {
+            self.viewport
+        }
+        fn offset(&self) -> Point<Pixels> {
+            self.offset
+        }
+        fn set_offset(&self, offset: Point<Pixels>) {
+            self.recorded.set(Some(offset));
+        }
+        fn content_size(&self) -> Size<Pixels> {
+            self.content
+        }
+    }
+
+    /// 承载 Scrollbar 的宿主：Always 模式（不掺 Auto 自隐定时器），渲染供 paint 注册点击监听。
+    struct ClickProbeHost {
+        handle: ClickProbeHandle,
+    }
+
+    impl gpui::Render for ClickProbeHost {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            Scrollbar::vertical(&self.handle).mode(ScrollbarMode::Always)
+        }
+    }
+
+    #[gpui::test]
+    async fn click_track_jump_uses_max_scroll_not_scroll_area(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseButton};
+
+        let recorded = Rc::new(Cell::new(None));
+        let (_, wcx) = cx.add_window_view({
+            let recorded = recorded.clone();
+            let handle = ClickProbeHandle {
+                viewport: vp(),
+                offset: point(px(0.), px(0.)),
+                content: size(px(200.), px(1600.)), // scroll_area=1600 > container=400
+                recorded,
+            };
+            move |_, _| ClickProbeHost { handle }
+        });
+        let mut wcx = wcx;
+        wcx.update(|window, cx| window.draw(cx).clear(cx)); // 首帧：prepaint 几何 + paint 注册点击监听
+        wcx.run_until_parked();
+
+        // 轨道中线 x=192（轨道 x∈[184,200]），y 定 pct。
+        let track_x = px(192.0);
+        let click = |wcx: &mut gpui::VisualTestContext, y: f32| {
+            recorded.set(None);
+            wcx.simulate_mouse_move(point(track_x, px(y)), MouseButton::Left, Modifiers::default());
+            wcx.simulate_mouse_down(point(track_x, px(y)), MouseButton::Left, Modifiers::default());
+            wcx.run_until_parked();
+            recorded.get().map(|p| p.y.as_f32()).expect("点击轨道应触发 set_offset")
+        };
+
+        // ① 中点（pct=0.5）：期望 -(1200×0.5)=-600；当前 -(1600×0.5)=-800。
+        let y = click(&mut wcx, 200.0);
+        assert!(
+            (y + 600.0).abs() < 1.0,
+            "点击轨道中点（pct=0.5）落点应=-(max_scroll×0.5)=-600，实际 {y}（当前实现错乘 scroll_area=-800）"
+        );
+
+        // ② 近底（y=320）：pct=(320−thumb_hit/2)/denom=(320−46)/(400−92)=274/308≈0.8896
+        //   （geom.thumb_len=hit_len=92，含两端 THUMB_INSET 内缩；非裸 thumb_len=100）。
+        //   期望 -(1200×274/308)≈-1067.53；旧实现错乘 scroll_area=-(1600×0.8896)≈-1423
+        //   被夹到 safe_min=-1200（整体到顶）。
+        let y = click(&mut wcx, 320.0);
+        let expect = -(1200.0 * 274.0 / 308.0);
+        assert!(
+            (y - expect).abs() < 1.0,
+            "点击轨道近底（pct=274/308≈0.8896）落点应=-(max_scroll×pct)≈-1067.53，实际 {y}（当前实现越界被夹到 -1200=整体到顶）"
+        );
     }
 }
