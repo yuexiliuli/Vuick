@@ -3196,6 +3196,7 @@ dependencies = [
  "gpui",
  "kimg",
  "pdfium-render",
+ "sha2 0.10.9",
  "zstd",
 ]
 

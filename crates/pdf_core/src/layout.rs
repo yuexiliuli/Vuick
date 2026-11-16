@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use config::pdf::{CACHE_MAX_PAGES, MARGIN, MAX_BITMAP_SCALE, MAX_RENDER_SCALE, PAGE_GAP, PAGE_PAD_Y, PAGE_WIDTH};
+use config::pdf::{CACHE_MAX_PAGES, COVER_AREA_BUDGET, MARGIN, MAX_BITMAP_SCALE, MAX_RENDER_SCALE, PAGE_GAP, PAGE_PAD_Y, PAGE_WIDTH};
 use crate::pdf::PageText;
 
 /// 页槽：某页的渲染状态（内存态）。
@@ -256,6 +256,61 @@ fn snapped_bitmap_len(v: f32) -> u32 {
 /// 与显示矩形（设备像素取整）逐纹素对齐，瓦片/封面/高亮几何零漂移。
 pub fn page_bitmap_size((pw, ph): (f32, f32), scale: f32) -> (u32, u32) {
     (snapped_bitmap_len(pw * scale), snapped_bitmap_len(ph * scale))
+}
+
+/// 位图像素面积是否在硬上限内（对齐 [`config::pdf::COVER_AREA_BUDGET`]，px）。
+///
+/// `render_page` 整页位图与 `extract_image_pixels` 复制位图**共用同一常量口径**：
+/// A4@4.0 ≈ 8M px（`page_bitmap_size` 实测 2380×3368）恰在预算（12M px）内**不误杀**，
+/// 只拦病理性天文尺寸（否则 `w×h×4` 字节分配直接撑爆内存）。saturating 防 32 位环绕。
+#[inline]
+pub fn pixel_area_ok(w: u32, h: u32) -> bool {
+    (w as u64).saturating_mul(h as u64) <= COVER_AREA_BUDGET
+}
+
+/// 面积闸「+1 行/列松弛」变体（`extract_image_pixels` 第二闸对**实际渲染尺寸**专用）。
+///
+/// 预算精确边界上的合法大图（如 4000×3000 = 12M px 恰打满），pdfium 双渲 +1 漂移
+/// （4000×3001 > 12M）不应被精确闸误伤为 None——松弛量 = `max(w,h)`（等效多一行面积），
+/// 兜住单轴 +1；请求侧第一闸（`budget_clamped_dims`）保持精确预算不变。松弛只放大
+/// 一行，病态天文尺寸（10^10 px）即使 +1 行也照拒，内存仍被预算量级有界（最坏
+/// 超宽缩档态 ≈ 2× 预算 = 96MB，不构成内存爆炸）。saturating 防 32 位环绕。
+#[inline]
+pub fn pixel_area_ok_with_row_slack(w: u32, h: u32) -> bool {
+    let area = (w as u64).saturating_mul(h as u64);
+    area <= COVER_AREA_BUDGET + (w.max(h) as u64)
+}
+
+/// 把请求尺寸按面积预算**反算到闸内的成比例尺寸**（保持宽高比，两轴同比缩小）。
+///
+/// - 面积本就 ≤ 预算 → 原样返回（正常 A4/大图复制路径尺寸稳定，不扰 1:1 语义）；
+/// - 病理性天文尺寸 → 按 `sqrt(预算/面积)` 等比缩到闸内，返回缩档尺寸（优雅降级）；
+/// - 任一边为 0 → `None`（无法缩档成有意义位图，调用方直接拒绝）。
+///
+/// 与 [`pixel_area_ok`] 双闸一致：缩档后面积必然 ≤ 预算（短轴触底时按预算反算长轴兜底）。
+pub fn budget_clamped_dims(w: u32, h: u32) -> Option<(u32, u32)> {
+    let area = (w as u64).saturating_mul(h as u64);
+    if area == 0 {
+        return None;
+    }
+    if area <= COVER_AREA_BUDGET {
+        return Some((w, h));
+    }
+    // 反算缩放因子：factor = sqrt(预算/area)，两轴同缩保持比例（f64 免 u64 无开方）。
+    let factor = (COVER_AREA_BUDGET as f64 / area as f64).sqrt();
+    let mut nw = ((w as f64) * factor).floor().max(1.0) as u64;
+    let mut nh = ((h as f64) * factor).floor().max(1.0) as u64;
+    // 短轴钉 1 时比例缩放无法到闸内（超宽/超扁病态，√ 缩放至短轴触底仍超预算）：
+    // 直接按预算反算长轴（保持短轴不变，乘积必 ≤ 预算）；浮点取整残留的 ±1 超预算同样
+    // 在此归零。O(1) 有界，无逐像素循环。
+    if nw.saturating_mul(nh) > COVER_AREA_BUDGET {
+        if nw >= nh {
+            nw = (COVER_AREA_BUDGET / nh.max(1)).max(1);
+        } else {
+            nh = (COVER_AREA_BUDGET / nw.max(1)).max(1);
+        }
+    }
+    Some((nw as u32, nh as u32))
 }
 
 /// 页位图 → 卡片显示像素的分轴缩放（宽/高各自独立，吸收两轴 ceil 取整差异）。
@@ -1714,5 +1769,83 @@ mod tests {
         assert!(!tile_range_all_in_slot(&tiles, 0, 0, 1, 1), "仍缺一格应不完整");
         tiles.insert((1, 1), mk());
         assert!(tile_range_all_in_slot(&tiles, 0, 0, 1, 1), "2×2 齐备应完整");
+    }
+
+    /// 面积闸（render_page 口径）：A4 各档（1.0/2.0/3.0/4.0）均在预算内不误杀；
+    /// 超 cap（5.0）才越闸。A4@4.0 = 2380×3368 ≈ 8M px < 12M px 预算。
+    #[test]
+    fn area_gate_keeps_a4_at_normal_scales() {
+        for s in [1.0f32, 2.0, 3.0, 4.0] {
+            let (w, h) = page_bitmap_size(a4(), s);
+            assert!(pixel_area_ok(w, h), "A4@{s} {w}×{h} 应恰在闸内");
+        }
+        let (w, h) = page_bitmap_size(a4(), 5.0);
+        assert!(!pixel_area_ok(w, h), "A4@5.0 {w}×{h} 应越闸");
+    }
+
+    /// 面积闸边界与病态：预算 12M px 的边界（3464×3464 内、3465×3465 外）；
+    /// u32 天文尺寸走 saturating 不 panic；0 面积在预算内（0 尺寸位图由调用方各自拒绝——
+    /// render 恒 ≥1px、extract 先 `bw<=0||bh<=0` 返回 None，闸只管面积上限）。
+    #[test]
+    fn area_gate_rejects_pathological_and_zero_dims() {
+        assert!(pixel_area_ok(3464, 3464), "3464² = 11,999,296 ≤ 预算");
+        assert!(!pixel_area_ok(3465, 3465), "3465² = 12,006,225 > 预算");
+        assert!(!pixel_area_ok(100_000, 100_000), "10^10 px 病态尺寸应拒");
+        assert!(!pixel_area_ok(u32::MAX, u32::MAX), "u32 天文尺寸应拒且不 panic");
+        assert!(pixel_area_ok(0, 100), "0 面积在预算内");
+        assert!(pixel_area_ok(100, 0), "0 面积在预算内");
+    }
+
+    /// 面积闸「+1 行/列松弛」（extract 第二闸对实际渲染尺寸，评审 NIT#2）：
+    /// 恰打满预算的合法大图（4000×3000 = 12M）pdfium 双渲 +1 行（4000×3001）时精确闸
+    /// 会误伤为 None，松弛变体放行；单轴 +1 均覆盖；两轴同 +1 或病态天文仍拒。
+    #[test]
+    fn area_gate_with_row_slack_tolerates_boundary_plus_one() {
+        assert!(pixel_area_ok(4000, 3000), "4000×3000 = 12,000,000 恰打满预算");
+        assert!(!pixel_area_ok(4000, 3001), "精确闸应拒 4000×3001（12,004,000 > 12M）");
+        assert!(
+            pixel_area_ok_with_row_slack(4000, 3001),
+            "+1 行松弛应放行 4000×3001（≤ 预算 + max 轴）"
+        );
+        // 单轴 +1（行或列）都在松弛内；两轴同 +1 超出松弛（回归边界，注明）。
+        assert!(pixel_area_ok_with_row_slack(3465, 3464), "3465×3464 单轴 +1 应放行");
+        assert!(pixel_area_ok_with_row_slack(3464, 3465), "3464×3465 单轴 +1 应放行");
+        assert!(!pixel_area_ok_with_row_slack(3465, 3465), "两轴同 +1 超出松弛");
+        assert!(pixel_area_ok_with_row_slack(2380, 3369), "A4@4.0 +1 行应在松弛内");
+        // 病态天文尺寸即使 +1 松弛也照拒（松弛只有一行，防内存爆炸目的不变）。
+        assert!(!pixel_area_ok_with_row_slack(100_000, 100_000), "10^10 px 仍应拒");
+        assert!(!pixel_area_ok_with_row_slack(3465, 10_000_000), "极端宽仍应拒");
+        assert!(!pixel_area_ok_with_row_slack(u32::MAX, u32::MAX), "u32 天文仍应拒且不 panic");
+    }
+
+    /// 缩档口径（extract 请求侧）：正常尺寸原样返回（尺寸稳定，不扰 1:1 复制语义）。
+    #[test]
+    fn budget_clamped_keeps_normal_sizes_unchanged() {
+        assert_eq!(budget_clamped_dims(595, 842), Some((595, 842)));
+        let (w, h) = page_bitmap_size(a4(), 4.0);
+        assert_eq!(budget_clamped_dims(w, h), Some((w, h)), "A4@4.0 应原样");
+        // 边界内大图（3464²）也原样。
+        assert_eq!(budget_clamped_dims(3464, 3464), Some((3464, 3464)));
+        // 0 尺寸 → None（调用方拒绝）。
+        assert_eq!(budget_clamped_dims(0, 0), None);
+        assert_eq!(budget_clamped_dims(100, 0), None);
+    }
+
+    /// 缩档口径：病态天文尺寸被缩到闸内，且与 `pixel_area_ok` 双点口径一致。
+    #[test]
+    fn budget_clamped_downscales_pathological_into_budget() {
+        // 方图病态：等比缩后面积 ≤ 预算、比例保持、不 panic。
+        let (w, h) = budget_clamped_dims(100_000, 100_000).expect("方图病态应缩档而非拒");
+        assert!(pixel_area_ok(w, h), "缩档后 {w}×{h} 应 ≤ 预算");
+        assert!(w >= 1 && h >= 1);
+        let ratio = w as f64 / h as f64;
+        assert!((ratio - 1.0).abs() < 0.02, "方图缩档应保持比例: {w}×{h}");
+        // 超扁病态（宽 10^8 × 1）：短轴触底时按预算反算长轴，乘积 ≤ 预算、有界。
+        let (w2, h2) = budget_clamped_dims(100_000_000, 1).expect("超扁病态应缩档");
+        assert!(pixel_area_ok(w2, h2), "缩档后 {w2}×{h2} 应 ≤ 预算");
+        assert!(w2 <= COVER_AREA_BUDGET as u32 && h2 >= 1);
+        // u32 天文尺寸走 saturating，不 panic 且结果在闸内。
+        let (w3, h3) = budget_clamped_dims(u32::MAX, u32::MAX).expect("u32 天文应缩档");
+        assert!(pixel_area_ok(w3, h3), "缩档后 {w3}×{h3} 应 ≤ 预算");
     }
 }
