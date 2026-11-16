@@ -1057,6 +1057,38 @@ mod dt {
         }
     }
 
+    /// P1-12 补充红测：`floor_char_boundary` 防御路径真触发（K173 去假绿）。
+    ///
+    /// 既有 `incremental_rope_multibyte_edits_stay_char_boundary` 只喂真实字符边界
+    /// dirty，`region_end` 恒对齐，删掉 `blocks_scan::scan_blocks_incremental_rope_impl`
+    /// 的 floor 仍全绿 = 假绿。本测亲手喂「dirty 终点落多字节字符中间」的重灾区输入，
+    /// 使内部 `region_end` 落多字节字符中间：删 floor → ropey `slice` 在非字符边界
+    /// panic → 真红。
+    ///
+    /// 字节演算（K177 先注释演算再落值）：
+    /// - prev = 40 × "行\n" = 160B；行 i 行首字节 = 4i（"行"=3B + "\n"=1B）。
+    /// - new = prev 在旧行 25 行首（字节 100）处插入 "中文😀"（=3+3+4=10B）→ 170B；delta=+10。
+    /// - dirty = 2..2（空区间，终点字节 2 = 行 0 的"行"第 3 字节，mid-char）。
+    /// - 内部：tail_old = 2-10 = -8 → pi=0；lo=(0+16)=16 < len →
+    ///   region_end = blocks[16].byte(64) + 10 - delta 越前插点错映射 → 74；
+    ///   新文档行 18 从字节 72（"行\n."）起，字节 74 恰在该"行"第 3 字节 → mid-char。
+    /// - floor(74)=72（行 18 行首）→ 切片合法；对齐不命中 → 全量兜底，blocks/toc 与全量一致。
+    #[test]
+    fn incremental_rope_dirty_end_midchar_needs_floor() {
+        let prev_src = String::from("行\n".repeat(40));
+        let prev_rope = Rope::from(prev_src.as_str());
+        let prev = scan_blocks_rope(&prev_rope);
+        let mut new_src = prev_src.clone();
+        new_src.insert_str(100, "中文😀");
+        let new_rope = Rope::from(new_src.as_str());
+        let full = scan_blocks_rope(&new_rope);
+        let inc = scan_blocks_incremental_rope(&prev_rope, &prev, &new_rope, Some(2..2));
+        assert_eq!(prev_src.len(), 160, "prev 40×行\\n = 160B");
+        assert_eq!(new_src.len(), 170, "new 160+10B 中文😀");
+        assert_eq!(inc.blocks, full.blocks, "mid-char dirty 下增量≠全量");
+        assert_eq!(inc.toc, full.toc, "mid-char dirty 下增量≠全量 toc");
+    }
+
     /// P1-13 GFM 语义锁定：表头与分隔行**列数必须一致**才识别为表格（spec Example
     /// 203：不一致 → 整表不识别，渲染为段落）；正文行可参差——少列补空、多列截断
     /// （Example 204）。当前实现两处均已符合 GFM，锁死防回归。

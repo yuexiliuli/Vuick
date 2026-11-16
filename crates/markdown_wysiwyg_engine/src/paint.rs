@@ -290,8 +290,14 @@ fn inline_image_placeholder_bounds(
 ///
 /// P1-9 修复前：`Some(None)`（一次加载已失败）被短路 → 失败「一次性、永不复测」。
 /// 修复后：**任何状态都不跳过**——失败标记只用于布局占位高（`image_row_height` 走
-/// 占位分支），paint 每帧都会重新尝试加载（对已成功的图依旧重画、对失败的图重试；
-/// 图片缓存幂等，失败也能逐帧探测恢复）。这是给将来「节流重试」预留的策略集中点。
+/// 占位分支），paint 每帧都会重新走 `AnyImageCache::load`（成功图命中缓存重画、
+/// 失败图重试）。
+///
+/// **现状修正（2026-11-16 评审 K173 口径）**：「每帧重试」当下**不可达**——`load`
+/// 的失败结果被 gpui `CachedLoad`（vendor asset_cache.rs「只完成一次」的状态机）
+/// **永久缓存**，且 wysiwyg 侧无 `cache.remove`/`clear` 失效路径 → 失败后每帧 `load`
+/// 均同步返回缓存 Err、从不真正重取。本函数保留为将来「节流/重试」的策略集中点
+/// （要节流时在此返回 true 并画占位；失效路径打开后此处即成恢复探测开关）。
 fn image_should_skip_reload(_state: Option<Option<(f32, f32)>>) -> bool {
     false
 }
@@ -299,6 +305,10 @@ fn image_should_skip_reload(_state: Option<Option<(f32, f32)>>) -> bool {
 /// 画图片行：经 `AnyImageCache` 异步加载已就绪的 `RenderImage` 后画出；
 /// 加载中/失败画占位框。加载成功即把真实宽高比尺寸写回 `rd`（`images_gen` 自增 →
 /// 下帧重建帧以真实行高布局）。
+///
+/// 失败路径现状（K173 口径）：`CachedLoad` 永久缓存 Err（见 [`image_should_skip_reload`]
+/// 文档），失败后每帧 `load` 同步返回缓存 Err，直接画占位、不真正重取；成功图每帧
+/// `load` 命中缓存重画，开销可忽略。
 #[allow(clippy::too_many_arguments)]
 pub fn paint_image_row(
     rd: &RefCell<WyRenderModel>,
@@ -346,6 +356,13 @@ pub fn paint_image_row(
                 if iw > 0. && ih > 0. {
                     let w = img.w.max(1.);
                     let h = (w * ih / iw).max(1.);
+                    // 仅在「从未写大小」时回写（`Some(None)` 失败标记/`Some(Some(..))`
+                    // 已知尺寸均跳过，防每帧重复写 `images_gen` 自增）。
+                    // ⚠️ 潜伏隐患留档：当且仅当未来失效路径打开、先前失败（`Some(None)`）
+                    // 的图恢复加载成功时，此处 `state.is_none()` 为 false → 不回写真实
+                    // 尺寸 → 行高滞留占位高/旧失败高（`gently` 下无自愈）。当前失败被
+                    // `CachedLoad` 永久缓存、不会恢复成功（见 [`image_should_skip_reload`]
+                    // 文档），故不实现恢复逻辑（K174 口径：实现前须先开失效路径 + 红测）。
                     if state.is_none() {
                         set_image_size(rd, host.doc(), img.src.clone(), Some((w, h)));
                     }
@@ -1486,8 +1503,10 @@ mod tests {
     use super::*;
 
     /// P1-9 状态机红测：`image_should_skip_reload` 对**任何**状态（含失败标记 `Some(None)`）
-    /// 都必须返回 false——失败不再被 paint 短路跳过，每帧仍可重试。
+    /// 都必须返回 false——失败不再被 paint 短路跳过（每帧仍会走 `load`、画占位可重试）。
     /// 修复前短路判断是 `matches!(state, Some(None))`（失败恒跳过、永不复测）。
+    /// 注：因 `CachedLoad` 永久缓存失败结果（见 `image_should_skip_reload` 文档），当前
+    /// 每帧 `load` 实际同步返回缓存 Err 不真正重取；本红测只锁「paint 不短路跳过」这层。
     #[test]
     fn image_failed_state_never_skips_reload() {
         let cases: [Option<Option<(f32, f32)>>; 3] = [
