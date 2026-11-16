@@ -318,6 +318,12 @@ pub struct WyEditor {
     /// 宿主访问点统一 `self.rd.borrow()/.borrow_mut()`（失效语义逐字保持）。
     /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
     image_cache: gpui::Entity<gpui::RetainAllImageCache>,
+    /// 换源（`install_open`）置脏 → 下一帧 [`Self::render`] 的 `flush_image_cache_drop`
+    /// 统一 `clear` 释放旧文档图片纹理。`install_open` 无 cx/window，释放延迟到每帧；
+    /// gpui `RetainAllImageCache` 是 `HashMap` **无淘汰**，漏清 → 同一 WyEditor 反复
+    /// 打开不同含图文档时 GPU 纹理只涨不降（内存 bug 根因）。
+    /// `sync_math`/`pending_math_drop` 同款「脏标记 + 每帧统一 flush」姿势（K10）。
+    image_cache_dirty: Cell<bool>,
     /// 进行中的图片调整条拖拽（右中边缘）。`Some` = 按住拖动中（随鼠标改宽，不改源码）。
     image_resize_drag: RefCell<Option<ImageResizeDrag>>,
     /// LaTeX → 排版结果缓存（参考 zorite `<MathStore>` 按公式源码做键）。
@@ -582,6 +588,10 @@ impl gpui::EventEmitter<WyEvent> for WyEditor {}
 impl gpui::Render for WyEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         use gpui::{CursorStyle, InteractiveElement, ParentElement, Styled};
+        // 换源脏标记消费：本帧（宿主重绘入口）统一 `clear` 释放旧文档图片纹理
+        //（`install_open` 置脏、无 cx/window，延迟到每帧 render 这里；见
+        // `flush_image_cache_drop`。与 `sync_math` 的 `pending_math_drop` 同款每帧 flush）。
+        self.flush_image_cache_drop(window, cx);
         // 图片编辑卡片浮层：在元素树根上**最后**叠加（最后绘制、命中最靠前），
         // 锚定在目标图片旁渲染（打开时才有）。卡片几何取自 paint 期缓存的
         // `image_edit_anchor`（同代 origin+frame），不在此现算帧（避免读到 ensure

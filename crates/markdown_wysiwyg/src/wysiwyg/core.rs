@@ -46,6 +46,7 @@ impl WyEditor {
             zoom_applies: Cell::new(0),
             host_scroll: RefCell::new(None),
             image_cache: gpui::RetainAllImageCache::new(cx),
+            image_cache_dirty: Cell::new(false),
             image_resize_drag: RefCell::new(None),
             math_slots: Rc::new(RefCell::new(MathSlotCache::new(
                 config::limits::MATH_SLOTS_CACHE_CAP,
@@ -477,6 +478,12 @@ impl WyEditor {
         self.code_parse.lock().unwrap().clear();
         self.code_epoch.set(self.code_epoch.get().wrapping_add(1));
         self.code_parse_need.borrow_mut().clear();
+        // 换源：图片加载缓存（`paint.rs` 经 `host.image_cache().load` 所得旧文档 GPU
+        // 纹理）整批作废——`RetainAllImageCache` 是 HashMap 无淘汰，漏清 → 同一标签页
+        // 反复打开不同含图文档时纹理只涨不降（内存 bug 根因）。置脏即可：
+        // `install_open` 无 cx/window，下一帧 `render` 的 `flush_image_cache_drop`
+        // 统一 `clear`（换源全清正确：此刻新源图片尚未 load，缓存里全是旧文档图）。
+        self.image_cache_dirty.set(true);
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.rd.borrow_mut().block_layout.borrow_mut() = None;
         self.rd.borrow_mut().shape_rows.borrow_mut().clear();

@@ -595,6 +595,56 @@ fn image_edit_card_anchor_ignores_transient_frame_rebuild(cx: &mut TestAppContex
     );
 }
 
+/// 覆盖「回退锚点现算闭包」路径：卡片打开、当前帧存在但 `image_edit_anchor` 缓存为空
+/// （如 `end_selection`/`install_open` 清帧后 paint 尚未来得及重刷锚点的首帧 render）→
+/// `image_edit_card_element` 走 `resolve` 回退闭包现算锚点。修复把这个闭包改为**先把帧
+/// `Rc` 克隆取出、释放 `self.rd`/帧借用，再算 `content_origin()`**（不再让 `Ref` 存活
+/// 跨 re-entrant 借用）。headless 下共享×共享不 panic（实测），故本测为**行为守卫**：
+/// 锚点清空回退路径仍能算出锚点摆卡片、不 panic；若未来有人在 `content_origin` 链上
+/// 引入互斥借用，此闭包将立即 red（同 `prewarm_band_double_borrow` 事故类）。
+#[gpui::test]
+fn image_edit_card_anchor_fallback_no_double_borrow(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    // 有帧（真实窗口宽建帧并注入；理想复现 = paint 尚未来得及重刷锚点的首帧 render）。
+    let (frame, _width) = image_harness(vcx, &ed);
+    assert!(
+        frame.rows.iter().any(|r| r.kind == IrKind::Image),
+        "夹具应含独立图片行"
+    );
+    // 打开编辑卡片 → open 首填锚点。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            e.open_image_edit(
+                crate::markdown::wysiwyg::ImageEditTarget::Block { src_line: 0 },
+                window,
+                cx,
+            )
+        });
+    });
+    assert!(ed.read_with(vcx, |e, _| e.image_edit_open()), "卡片应打开");
+    // 构造「锚点缓存为空」：清掉 open 首填的锚点，模拟清帧后尚未重刷锚点的首帧 render。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, _| e.image_edit_anchor.clear());
+    });
+    // 触发 resolve 回退闭包现算锚点（守卫：短路借用事故类改动）。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            let el = e.image_edit_card_element(window, cx);
+            assert!(
+                el.is_some(),
+                "帧在 + 卡片开 + 锚点清 → 回退应能算出锚点摆卡片"
+            );
+        });
+    });
+}
+
 /// 点**卡片外**任意处 → 关闭卡片（对齐 `ui::menu` 的 on_mouse_down_out 语义）。
 #[gpui::test]
 fn image_edit_card_click_outside_closes(cx: &mut TestAppContext) {
