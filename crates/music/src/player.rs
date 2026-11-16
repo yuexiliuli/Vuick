@@ -598,6 +598,9 @@ impl MusicPlayer {
                 Ok(s) => {
                     self.spawn_worker(&s);
                     let rate = s.sample_rate();
+                    // 新 sink 应用已恢复/已设置的音量：AudioSink 新建默认 1.0，
+                    // set_volume 内 clamp 0..1（Bug B：恢复音量不应用到新 sink → 首播 100%）。
+                    s.set_volume(self.volume);
                     self.sink = Some(s);
                     rate
                 }
@@ -839,6 +842,10 @@ impl MusicPlayer {
             let _ = s.pause();
             s.flush();
         }
+        // 换代（对照 play_track 每次换代）：停止后 worker 已排队的 Finished/Opened/Error
+        //（gen_id == 旧代）被 on_event 陈旧弃掉，不再触发 auto_advance 自动重播第一首
+        //（Bug A：停止后滞留 Finished 被消费 → queue 空且 library 非空 → play_track(0)）。
+        self.generation += 1;
         if self.current.is_some() {
             self.progress_pref = Some(pos);
             self.prefs_dirty = true;
@@ -2132,6 +2139,51 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d1);
         let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// 红测（Bug A）：stop() 不换代 → 停止后已排队的 `Finished`（gen_id == 当前 generation）
+    /// 仍被消费并触发 auto_advance 自动重播第一首。机理：`stop()`（player.rs:833-859）只发
+    /// `WorkerCmd::Stop`/pause/flush/清状态、**不递增** `self.generation`；`on_event`
+    /// Finished 分支（238-244）以 `gen_id != self.generation` 才丢陈旧——停止后 gen_id 仍
+    /// == 当前代，陈旧事件放行 → `auto_advance`（966-982）queue 空且 library 非空 →
+    /// `play_track(0)` 自动重播。对照 `play_track`（611）每次换代；正确行为：`stop()` 也应
+    /// 换代，陈旧 Finished 被丢弃、停留止态。当前应 RED。
+    #[gpui::test]
+    async fn bug_a_stop_does_not_consume_stale_finished(cx: &mut TestAppContext) {
+        let (dir, _p0, _p1, player) = two_track_library(cx, "bug-a-stop");
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        // 模拟「一首正在播放、worker 已随该曲发出 Finished{gen_id=当前代} 未消费」
+        // —— test_start_playing 不换代，这里显式置代=7（真 play_track 会把 generation 增到 7）。
+        cx.update(|app| {
+            player.update(app, |p, _| {
+                p.test_start_playing(0);
+                p.generation = 7;
+            });
+        });
+        // 注入通道：换入测试持 send 端的事件通道，模拟 worker 已排队的 Finished。
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        cx.update(|app| player.update(app, |p, _| p.evt_rx = rx));
+        let gen_before = cx.read(|app| player.read(app).generation);
+        tx.send(Event::Finished {
+            gen_id: gen_before,
+        })
+        .unwrap();
+        // 用户 stop：清播放状态（stop 不清事件通道、也不换代 = Bug A 根因）。
+        cx.update(|app| player.update(app, |p, cx| p.stop(cx)));
+        // 下一拍 tick：正确实现应因换代把陈旧 Finished 丢弃（停留止态）；现 bug：
+        // gen_id(7) == generation(7) → 放行 → auto_advance → play_track(0) 自动重播。
+        cx.update(|app| player.update(app, |p, cx| p.tick(cx)));
+        let (cur, playing) = cx.read(|app| {
+            let p = player.read(app);
+            (p.current, p.playing)
+        });
+        assert_eq!(
+            cur, None,
+            "Bug A: stop 后陈旧 Finished 不得触发自动重播第一首（stop 应换代丢弃陈旧事件）"
+        );
+        assert!(!playing, "Bug A: stop 后应停留在停止态");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
