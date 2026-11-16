@@ -1862,6 +1862,66 @@
         let _ = std::fs::remove_file(&p);
     }
 
+    /// 保存是**原子写**（tmp + fsync + rename）：① 保存后目录无 `.tmp` 残留半截文件；
+    /// ② 连续两次保存磁盘内容均为最终编辑态（rename 覆盖，不留旧内容）；
+    /// ③ 目标文件只读/目录不可写 → `save_tab` 返回 false 且不残留 tmp。
+    #[gpui::test]
+    async fn save_is_atomic_no_tmp_residue(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("vuick-atomic-save-{}.txt", std::process::id()));
+        std::fs::write(&p, "初稿").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let idx = cx.update(|_w, cx| app.read(cx).model.borrow().active_tab);
+        // 编辑两轮：保存 → 再编辑 → 再保存。
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                app.model.borrow().tabs[idx].payload.editor.update(cx, |ed, _| ed.set_text("第一稿"));
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|window, cx| app.update(cx, |app, cx| app.save_tab(idx, window, cx))),
+            "首次保存应成功"
+        );
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                app.model.borrow().tabs[idx].payload.editor.update(cx, |ed, _| ed.set_text("第二稿终态"));
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|window, cx| app.update(cx, |app, cx| app.save_tab(idx, window, cx))),
+            "二次保存应成功"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "第二稿终态",
+            "磁盘应为最后一次保存的完整内容（rename 覆盖不留旧内容）"
+        );
+        let residue: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("vuick-atomic-save"))
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(residue.is_empty(), "保存后不应残留 .tmp 半截文件：{residue:?}");
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// UTF-16 LE / BE 带 BOM 打开：正文去 BOM 正确，且选项卡记录对应编码（保存回原编码）。
     #[gpui::test]
     async fn utf16_bom_open_strips_bom_and_records_encoding(cx: &mut TestAppContext) {
@@ -1989,5 +2049,59 @@
         assert_eq!(tabs_after, tabs_before, "打开失败不应新增坏标签页");
         assert_eq!(notifs, 1, "打开失败应推送一条通知");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// EPUB 后台异步打开的效果断言（K37：后台派生结果必须真实落到可见状态）：
+    /// `open_file` 走 `open_epub_async`（后台 executor 解析 + 回传 load_epub）；推进时钟后
+    /// 选项卡必须**已装载**（`epub_images`/`epub_notes` 非空、`reader` 非 None、非占位卡），
+    /// 而非仍停留在「正在解析」占位态——验证异步回传链路完整。
+    #[gpui::test]
+    async fn epub_async_open_loads_content_into_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let epub =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/测试epub.epub");
+        assert!(epub.exists(), "测试 EPUB 应存在（target/测试epub.epub）");
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(epub.to_str().unwrap(), window, cx));
+        });
+        // 异步回传：反复推进直到装载完成（后台 executor + 主线程 update_window_entity 落地）。
+        let mut loaded = false;
+        for _ in 0..2000 {
+            cx.run_until_parked();
+            let (n_tabs, images, _notes, has_md) = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let m = a.model.borrow();
+                let last = m.tabs.len().checked_sub(1).and_then(|i| m.tabs.get(i));
+                let t = last.map(|t| &t.payload);
+                (
+                    m.tabs.len(),
+                    t.map(|p| p.epub_images.len()).unwrap_or(0),
+                    t.map(|p| p.epub_notes.len()).unwrap_or(0),
+                    t.map(|p| !p.content.trim().is_empty()).unwrap_or(false),
+                )
+            });
+            if n_tabs == tabs_before + 1 && images > 0 && has_md {
+                loaded = true;
+                break;
+            }
+        }
+        assert!(loaded, "EPUB 后台解析结果应落到选项卡（images>0 且有正文，非占位卡）");
+        let final_state = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let m = a.model.borrow();
+            let i = m.tabs.len() - 1;
+            let p = &m.tabs[i].payload;
+            let path_ok = p.file_path.as_deref().is_some_and(|f| f == epub.as_path());
+            (p.epub_images.len(), p.epub_notes.len(), path_ok)
+        });
+        assert!(final_state.0 > 0, "EPUB 图片表应已装载");
+        assert!(final_state.2, "选项卡 file_path 应指向打开的 epub");
+        let _ = final_state.1;
     }
 

@@ -1,8 +1,8 @@
 <!--
 REFACTORED: 2026-10-18
 STYLE: LLM Protocol Body (v3)
-LAST_AUDIT_PATCH: 2026-11-14-004
-AUDIT_PATCH: 2026-11-15-001 (沉淀 K167-K172：阻塞原生模态禁入持 App RefCell 事件帧 + async 回传姿势 / RefCell panic 取证 / 低置信模式派裁决 agent / 纯函数共享几何先测绘 / per-crate cfg 门留调用侧 / 整树 fmt 事故恢复模板；本线收交=UI 去重战役，见 docs/handover-2026-11-15-ui-dedup.md)
+LAST_AUDIT_PATCH: 2026-11-16-001
+AUDIT_PATCH: 2026-11-15-001 (沉淀 K167-K172：阻塞原生模态禁入持 App RefCell 事件帧 + async 回传姿势 / RefCell panic 取证 / 低置信模式派裁决 agent / 纯函数共享几何先测绘 / per-crate cfg 门留调用侧 / 整树 fmt 事故恢复模板；本线收交=UI 去重战役，见 docs/handover-2026-11-15-ui-dedup.md) ; 2026-11-16-001 (沉淀 K173-K176：安全/攻击面测试证明「测到真正防御路径」防假绿 / 报告「已修复」标注须 git log+红测证伪 / 主 agent 亲为实现过度→上下文透支，实现下放子 agent / 改源码禁走跨行 `-replace`；本线收交=4 bug 修复战役，见 docs/code-review-2026-11-16.md)
 -->
 
 # AGENTS.md（LLM 执行协议 v3）
@@ -406,6 +406,11 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | K170 | **纯函数共享几何先「测绘 agent」逐行映射再实现**（K134 强化，P3/P6/P9 实证）：9+6+3 函数 / toc-files 整块 / pan 三人组的收敛 = 先出「逐行平行度映射表 + 真分支识别 + 不合并面 + 回归测试名单」→ 实现期零返工、评审直接对表；回归名单（测试名）进 brief、实现后逐名跑绿。 |
 | K171 | **per-crate `cfg(not(test))` 语义不可塞进共享 helper**（P4 实证）：门进 base → 依赖方 test 构建被隐式改变（后台定时器「复活」）。门留在调用侧；helper 只提公共骨架（weak_entity 升级 + 静默丢弃）。此类改动提交前主 agent 复核门的位置。 |
 | K172 | **整树 `cargo fmt` 污染事故恢复模板**（P4/P7 两次）：子 agent `cargo fmt -- <paths>` 实为整仓格式化（400+ 文件）。恢复：①先 `Copy-Item` 保存预期新文件 + `git diff` 存 patch；②`git checkout -- .` 全量还原；③主 agent 亲手重放预期文件；④提交前 `git status` === 预期集合。预防：fmt 禁令放 brief 第一行 ⚠️（本批后续 0 事故）。 |
+
+| K173 | **安全/攻击面测试必须证明「测到了真正防御路径」，防 K153 假绿**（2026-11-16 epub zip bomb 评审 NIT#1 实证）：`entry_declared_small_actual_large_peaks_bounded` 用 `Stored` 压缩造 zip → 声明==实际→只走「声明预检」，#2 take 限长 / #3 读后复核**从未执行**，测试却报绿。评审抓出后改用 `Deflated`+手工 patch 中央目录/本地头 `uncompressed_size` 造真「声明小实大」+**对照分支**（同一输入放宽上限→应解析成功，证明拒绝确因目标防御而非解析器/CRC 其它错误）。凡 DoS/越界/几何不变式测试，签发前问「用绕过方式构造输入会不会红」——测不到目标的绿 = 假绿。 |
+| K174 | **报告「已修复」标注不可信，修复前必 `git log -- file` + 红测取证**（2026-11-16 三 bug 实证）：`docs/code-review-2026-11-16.md` 的 shell#1（atomic write）、virtualize、epub 三条「已修复 2026-11-16」**全部未落地**（git 史无对应 commit，代码仍是缺陷原样）——文档记录与会话内实现了「另一批」易混，标注真实性必须用 `git log -- 涉事文件` 与红测亲自证伪，不能「报告说修了就跳过」（K144 强化）。 |
+| K175 | **主 agent 亲为实现工程过度 → 上下文透支**（2026-11-16 4 bug 战役复盘）：多个独立 bug + 大重构（epub 300 行 + 后台化）主 agent 全亲为，加上改名 121 文件，主上下文被大量占用，后续被迫在脑内反复模拟工具调用（无意义叙述循环）——典型「上下文远超水位」征兆。对策：几何/并发/安全类修复默认走「实现子 agent + 独立评审」（K48/K50/K124/K134），主 agent 只做「复现派发 + 编译器收口 + 评审收口 + 提交」；「先复现 → 实现 → 独立评审」整链下放，主上下文留给现场交互与判决。 |
+| K176 | **改源码禁走带跨行匹配的 PowerShell `-replace`**（2026-11-16 virtualize 红测事故）：`-replace` 做跨行 oldString 时把字面 `\`n` 混进文件（`let start=…;`n        let end=…` 损坏源码），且不报错难察觉。改源码只用 edit/write 工具；脚本只做无跨行模式的整文件纯字符串替换（`[IO.File]::ReadAllText/WriteAllText` + UTF-8 无 BOM）。 |
 
 > **batch-2/3 时段账（2026-11-15，UI 去重战役续，转为交接 docs/handover-2026-11-15-ui-dedup.md）**：分析 5 explore 并行（值）；P1-P7 首批（P1/C/E 配评审抓「语义差异未被抹平」，值）；B/A/P5/D3 机械小批（低空返、零返工）；D/P16 两个「保持原样」裁决 agent（省 2 负收益轮）；P3 战役测绘→3 slice→评审零返工（K170）；PDF 自定义色闪退 = 预存 bug → 诊断钉借用链 → 后台线程回传修复。可避免 ≈2 轮：P4 的 cfg 门错位（→K171）、P7 的 fmt 未自恢复（→K172）。评审配比端到端执行到位（K146/K42），14 commits 全独立可编译、未推送。
 

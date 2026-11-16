@@ -75,7 +75,6 @@ mod tests;
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 

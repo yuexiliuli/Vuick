@@ -178,6 +178,9 @@ fn config_meta(path: &Path) -> (Option<SystemTime>, u64) {
 
 /// 递归复制目录内容（不含正在写的文件锁占用问题：仅复制后读，源保持只读不删）。
 /// 迁移专用：源目录仅作「一次性搬家」，复制失败静默忽略（下次启动重试）。
+/// `test-mode`（shell 等消费方测试构建把 config 以该 feature 编译）下迁移不触发、
+/// 单测又不编 → 允许 dead_code（生产 + 纯 cfg(test) 均真实使用）。
+#[cfg_attr(any(test, feature = "test-mode"), allow(dead_code))]
 fn copy_dir(src: &Path, dst: &Path) {
     let entries = match std::fs::read_dir(src) {
         Ok(e) => e,
@@ -199,6 +202,8 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 /// 旧目录 → 新目录一次性迁移（判定 + 递归复制；独立于 `cfg` 门控，可单测）。
 /// 旧目录不存在或新目录已存在 → 无操作；否则整目录递归复制、保留源。
+/// `test-mode` 下同 [`copy_dir`] 一样可能 dead（见其 cfg_attr 注释）。
+#[cfg_attr(any(test, feature = "test-mode"), allow(dead_code))]
 fn migrate_legacy_dir(old: &Path, new: &Path) {
     if old.is_dir() && !new.exists() {
         copy_dir(old, new);
