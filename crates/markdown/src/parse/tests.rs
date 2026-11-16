@@ -1008,6 +1008,91 @@ mod dt {
         );
     }
 
+    /// P1-12 回归守卫：多字节（中文/emoji）插入/删除走增量路径后，region 切片端点
+    /// 必须始终落在字符边界（`region_end` 需 floor_char_boundary 后再 slice，与
+    /// [`blocks_scan::try_code_block_inplace_scan`] 同姿势）——逐编辑与全量扫描
+    /// 逐字节一致且不 panic。覆盖精确 dirty / 膨胀 dirty / 快照 diff 三条通道。
+    #[test]
+    fn incremental_rope_multibyte_edits_stay_char_boundary() {
+        let base = String::from(
+            "# 标题内容\n> 引用中文行\n- 列表项甲\n\n```rust\nfn 中文(参数) {}\n```\n\n| 列A | 列B |\n|---|---|\n| 值一 | 值二 |\n\n普通段落与 😀 emoji 🚀 结尾\n",
+        );
+        let mut cases: Vec<(String, String)> = Vec::new();
+        // 逐「多字节字符」删除（净字节差为多字节——区域对齐的考验场景）。
+        for (pos, c) in base.char_indices() {
+            if c.len_utf8() > 1 {
+                let mut v = base.clone();
+                v.replace_range(pos..pos + c.len_utf8(), "");
+                cases.push((base.clone(), v));
+            }
+        }
+        // 每处字符边界插入多字节串。
+        for (pos, _) in base.char_indices() {
+            let mut v = base.clone();
+            v.insert_str(pos, "中文😀");
+            cases.push((base.clone(), v));
+        }
+
+        for (i, (prev_src, new_src)) in cases.iter().enumerate() {
+            let prev_rope = Rope::from(prev_src.as_str());
+            let prev = scan_blocks_rope(&prev_rope);
+            let new_rope = Rope::from(new_src.as_str());
+            let cp = common_prefix_bytes(prev_src, new_src);
+            let cs = common_suffix_bytes(prev_src, new_src);
+            let exact = cp..(new_src.len() - cs);
+            // 膨胀 dirty 的起点左移 7 字节可能落入多字节字符内部（贪心覆盖）。
+            let bloated = exact.start.saturating_sub(7)..(exact.end + 7).min(new_src.len());
+            for (tag, dirty) in [
+                ("精确", Some(exact.clone())),
+                ("膨胀", Some(bloated)),
+                ("快照diff", None),
+            ] {
+                let inc = scan_blocks_incremental_rope(&prev_rope, &prev, &new_rope, dirty);
+                let full = scan_blocks_rope(&new_rope);
+                assert!(
+                    inc.blocks == full.blocks && inc.toc == full.toc,
+                    "case#{i}/{tag}: 增量≠全量 prev={prev_src:?} new={new_src:?}"
+                );
+            }
+        }
+    }
+
+    /// P1-13 GFM 语义锁定：表头与分隔行**列数必须一致**才识别为表格（spec Example
+    /// 203：不一致 → 整表不识别，渲染为段落）；正文行可参差——少列补空、多列截断
+    /// （Example 204）。当前实现两处均已符合 GFM，锁死防回归。
+    #[test]
+    fn table_delimiter_column_count_is_gfm_semantics() {
+        // 表头 2 列 / 分隔行 1 列 → 不识别（GFM Example 203）。
+        let lines: Vec<&str> = vec!["| abc | def |", "| --- |", "| bar |"];
+        assert!(
+            try_parse_table(&lines, 0).is_none(),
+            "分隔行列数少于表头应整表不识别"
+        );
+        // 表头 1 列 / 分隔行 2 列 → 同样不识别。
+        let lines2: Vec<&str> = vec!["| abc |", "| --- | --- |", "| bar |"];
+        assert!(
+            try_parse_table(&lines2, 0).is_none(),
+            "分隔行列数多于表头应整表不识别"
+        );
+
+        // 正文行参差（GFM Example 204）：少列补空、多列截断，整表保留。
+        let lines3: Vec<&str> = vec![
+            "| abc | def |",
+            "| --- | --- |",
+            "| bar |",
+            "| bar | baz | boo |",
+        ];
+        let (table, consumed) = try_parse_table(&lines3, 0).expect("列数一致应识别为表格");
+        assert_eq!(consumed, 4);
+        assert_eq!(table.header.len(), 2);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0].len(), 2);
+        assert_eq!(table.rows[0][0].as_ref(), "bar");
+        assert_eq!(table.rows[0][1].as_ref(), "", "短行应补空列");
+        assert_eq!(table.rows[1][0].as_ref(), "bar");
+        assert_eq!(table.rows[1][1].as_ref(), "baz", "超列应被截断");
+    }
+
     /// 基准（--ignored）：rope 化「打字同步每轮」成本对比——旧 str 路径（`value()`
     /// 物化 6.4MB + 增量扫描对全串 split）vs 新 rope 路径（Rope::clone O(1) + 按 dirty
     /// 区域切片）。与 handoff 3.1 同量级的大文档（≈6MB/14 万行），打印不断言。

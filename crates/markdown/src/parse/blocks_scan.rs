@@ -351,6 +351,9 @@ fn scan_blocks_incremental_rope_impl(
         // 尾部没有可用块边界 → 扫到文末（不复用，等价全量重扫）
         new_len
     };
+    // 尾部对齐点先 floor 到字符边界再切片（真实 dirty 通道恒为字符边界，但膨胀/兜底
+    // 路径可能落入多字节字符中间；与 `try_code_block_inplace_scan` 同姿势，P1-12）。
+    let region_end = new_src.floor_char_boundary(region_end);
     let region = if region_end > anchor_byte {
         new_src.slice(anchor_byte..region_end).to_string()
     } else {
