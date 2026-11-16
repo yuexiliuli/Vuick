@@ -49,35 +49,69 @@ impl super::VideoViewer {
             None
         };
         let mut latest: Option<FrameItem> = None;
+        // P1-24：落点等待期的预滚帧暂存（pts<落点）——**不提前落屏**。软解 seek「预滚保底帧
+        //（≤落点）」先行时，tick 若把它当 `latest` 上屏并**无条件**清 `pending_seek`，泵会因
+        // `pump_wanted()`（playing=false + pending 空 + 非拖拽）停转，随后到达的落点帧滞留
+        // 通道 → 暂停点击进度条停在落点前 1 帧永久冻结（worker 送帧与 pump 排空分属两拍时的
+        // 竞态，真机 pause→seek 复现）。预滚帧只在此处暂存：落点帧到达即弃；仅当「命令确已
+        // 结束」（帧通道发送端已弃 = EOF/解码错误，下无落点帧）才回退上屏防黑屏。
+        let mut pre_roll: Option<FrameItem> = None;
+        // 落点等待期「命令结束」信号：`rx.try_recv()` 返回 `Disconnected` = 当前 worker 命令
+        // 的 `cmd.tx` 已 drop（命令以 EOF/错误/换代结束）。据此才能把「解码已完成、落点不可达」
+        // 与「仍在途（`Empty`，落点帧随后才到）」区分开——否则无法判定何时该清 `pending_seek`。
+        let mut cmd_done = false;
         loop {
             let item: Option<FrameItem> = if let Some(o) = self.overflow.take() {
                 Some(o)
             } else {
                 match &self.rx {
-                    Some(rx) => rx.try_recv().ok(),
+                    Some(rx) => match rx.try_recv() {
+                        Ok(it) => Some(it),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            cmd_done = true;
+                            None
+                        }
+                    },
                     None => None,
                 }
             };
-            match item {
-                Some(item) if item.pts() <= self.playhead => {
-                    // 先到的帧被更新的帧顶掉：旧帧直接弃（软帧无资源；GPU 帧共享槽回池）
-                    if let Some(prev) = latest.replace(item) {
-                        self.drop_frame_item(prev);
+            if land_seek.is_some() {
+                // 落点等待期：只认首个「≥ 落点」帧为落点帧（即时落地）；「< 落点」的预滚帧
+                // 一律暂存不落屏（仅作 EOF 回退）。通道空且命令已结束 → 出循环走回退。
+                match item {
+                    Some(item) if item.pts() >= land_seek.unwrap() => {
+                        land_seek = None;
+                        // 落点已到：预滚暂存清空（GPU 帧共享槽须回收，不能裸 drop）
+                        if let Some(prev) = pre_roll.take() {
+                            self.drop_frame_item(prev);
+                        }
+                        if let Some(prev) = latest.replace(item) {
+                            self.drop_frame_item(prev);
+                        }
                     }
-                }
-                Some(item) if land_seek.is_some() && item.pts() >= land_seek.unwrap() => {
-                    // 暂停/拖拽落点帧：只认首个「≥ 落点」帧，收下即落地；随后解除本分支，
-                    // 后续帧恢复正常 overflow 规则（不整段快进到最新帧）。
-                    land_seek = None;
-                    if let Some(prev) = latest.replace(item) {
-                        self.drop_frame_item(prev);
+                    Some(item) => {
+                        if let Some(prev) = pre_roll.replace(item) {
+                            self.drop_frame_item(prev);
+                        }
                     }
+                    None => break,
                 }
-                Some(item) => {
-                    self.overflow = Some(item);
-                    break;
+            } else {
+                // 正常播放 / 无在途落点：原判据逐字节不变。
+                match item {
+                    Some(item) if item.pts() <= self.playhead => {
+                        // 先到的帧被更新的帧顶掉：旧帧直接弃（软帧无资源；GPU 帧共享槽回池）
+                        if let Some(prev) = latest.replace(item) {
+                            self.drop_frame_item(prev);
+                        }
+                    }
+                    Some(item) => {
+                        self.overflow = Some(item);
+                        break;
+                    }
+                    None => break,
                 }
-                None => break,
             }
         }
         let new_frame = if let Some(item) = latest {
@@ -101,7 +135,41 @@ impl super::VideoViewer {
             }
             self.pending_seek = None; // 落点已上屏（首个可用帧）
             true
+        } else if cmd_done {
+            // 命令已结束（EOF/解码错误）且始终无落点帧：回退最后预滚帧，不黑屏/不挂泵。
+            // `cmd_done` 门禁保证只在「解码确已完成」时落预滚帧——在途（Empty）时不提前落屏。
+            if let Some(item) = pre_roll.take() {
+                match item {
+                    FrameItem::Soft(f) => {
+                        self.install_bgra(f.w, f.h, f.bgra, cx);
+                        #[cfg(test)]
+                        {
+                            self.last_frame_pts = Some(f.pts);
+                        }
+                    }
+                    FrameItem::Gpu(f) => {
+                        #[cfg(test)]
+                        let gpts = f.pts;
+                        self.install_gpu(f, cx);
+                        #[cfg(test)]
+                        {
+                            self.last_frame_pts = Some(gpts);
+                        }
+                    }
+                }
+                self.pending_seek = None; // 解码已完成、落点不可达：清 pending 防挂泵
+                true
+            } else {
+                // 命令已结束却无任何可上屏帧（空流/首帧即错）：仍清 pending 防 pump 永久自续
+                //（P1-24），画面保持最近一帧。
+                self.pending_seek = None;
+                false
+            }
         } else {
+            // 在途（落点帧未到）本拍结束：预滚暂存不落屏、回收 GPU 槽位（软帧 no-op）
+            if let Some(item) = pre_roll.take() {
+                self.drop_frame_item(item);
+            }
             false
         };
         // seek 全链路探针聚合（`VUICK_VIDEO_SEEK_DIAG=1` 打印；test 构建无条件把
@@ -545,12 +613,40 @@ impl super::VideoViewer {
         }
         let path_check = self.path.clone();
         let cap_check = self.decode_cap;
+        // P1-25：代际检查随任务克隆一份；在途计数 +1（被取代/结束/超时会 -1，防堆积锚）
+        let gen_check = self.hover_generation.clone();
+        let inflight = self.hover_inflight.clone();
+        inflight.fetch_add(1, Ordering::SeqCst);
         cx.spawn(async move |weak, cx| {
-            // 后台线程等 worker 单次回传（真解码耗时由 worker 占，不在主线程）
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { frx.recv_timeout(std::time::Duration::from_secs(15)) })
-                .await;
+            // 后台线程等 worker 单次回传（真解码耗时由 worker 占，不在主线程）。P1-25：
+            // 旧实现裸 `recv_timeout(15s)`——被新落点/换代取代的命令 worker 不再回传 → 每个
+            // 废弃任务白等整 15s 堆在后台池。改为「≤200ms 代际轮询窗」：被取代即提前退出；
+            // 15s 仍无结果按超时处理（点击走正常 seek 兜底）。
+            let outcome = cx.background_executor().spawn(async move {
+                const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let result = loop {
+                    if gen_check.load(Ordering::SeqCst) != hgen {
+                        break None; // 已被更新悬停/换文件/seek 取代：放弃（防过期任务堆积）
+                    }
+                    let now = std::time::Instant::now();
+                    if deadline <= now {
+                        break None; // 15s 超时
+                    }
+                    let slice = std::cmp::min(POLL, deadline - now);
+                    match frx.recv_timeout(slice) {
+                        Ok(res) => break Some(res),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+                    }
+                };
+                // 在途计数扣减放内层（后台线程）统一完成：等待结束（结果/超时/被取代/断连）即
+                // -1，主线程直接读 Atomic 即可观测——不依赖「后台完成 → 唤醒主协程」的跨线程
+                // 唤醒（gpui 测试 fake 调度器拒绝外来唤醒，主协程 resumption 不可靠；K14 同族）。
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                result
+            })
+            .await;
             let _ = weak.update(cx, |this, cx| {
                 // 只落地「仍是悬停的那个目标、仍在同文件同 cap」的最新代：过期/换文件丢弃
                 if this.hover_generation.load(Ordering::SeqCst) != hgen
@@ -559,7 +655,7 @@ impl super::VideoViewer {
                 {
                     return;
                 }
-                if let Ok(Ok(frame)) = outcome {
+                if let Some(Ok(frame)) = outcome {
                     this.hover_cache = Some(frame);
                     cx.notify();
                 }
