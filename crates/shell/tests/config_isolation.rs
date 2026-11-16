@@ -1,6 +1,6 @@
 //! 配置/会话路径测试隔离（K8 根因探针，首拆样板）：纯断言、零 helper 依赖，验证
-//! 不设 `GPUI_EDITOR_CONFIG` 时 config/session 路径落隔离临时目录、`load()` 回退全默认。
-//! **R3**：本目标不建应用、无持久化，`GPUI_EDITOR_TEST` 由 `common::init_test` 注入
+//! 不设 `VUICK_CONFIG` 时 config/session 路径落隔离临时目录、`load()` 回退全默认。
+//! **R3**：本目标不建应用、无持久化，`VUICK_TEST` 由 `common::init_test` 注入
 //! （此处虽未调用，隔离语义仍由 config dev-dep `test-mode` 保证）。
 //! 断言内部与 lib 单测 `src/app/tests/config_isolation.rs` 逐字一致（P1 测试域化迁移）。
 
@@ -9,30 +9,30 @@ mod common;
     // ---- K8 根因探针：配置/会话路径测试隔离 ----
     // 历史坑（K8）：config crate 作依赖被 shell 测试编译时，其自身 `cfg!(test)` 不生效
     // （编译期仅对「被测试的 crate」置位）→ `UserPrefs::load()` 直读真实
-    // `%APPDATA%\gpui-editor\config.json`，font_size / opened_folder / session_restore /
-    // recent_* 泄漏进 shell 测试，成批预存失败。根因修复后：不设 `GPUI_EDITOR_CONFIG` 时
+    // `%APPDATA%\vuick\config.json`，font_size / opened_folder / session_restore /
+    // recent_* 泄漏进 shell 测试，成批预存失败。根因修复后：不设 `VUICK_CONFIG` 时
     // 配置路径必须落在隔离临时目录，load() 回退全默认。
 
-    /// 探针：不设 `GPUI_EDITOR_CONFIG` 时，`config_path()`/`session_dir()` 落隔离临时目录
-    /// 而非真实 `%APPDATA%\gpui-editor`；`load()` 回退全默认（真实配置字段不得泄漏）。
-    /// 显式设置 `GPUI_EDITOR_CONFIG`（既有测试靠它定向隔离）仍优先，不受本探针影响。
+    /// 探针：不设 `VUICK_CONFIG` 时，`config_path()`/`session_dir()` 落隔离临时目录
+    /// 而非真实 `%APPDATA%\vuick`；`load()` 回退全默认（真实配置字段不得泄漏）。
+    /// 显式设置 `VUICK_CONFIG`（既有测试靠它定向隔离）仍优先，不受本探针影响。
     #[test]
     fn config_path_isolated_to_temp_dir_in_tests() {
-        unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+        unsafe { std::env::remove_var("VUICK_CONFIG") };
         let cfg = config::user::UserPrefs::config_path();
         let sess = config::user::UserPrefs::session_dir();
         let real_root = std::env::var("APPDATA")
-            .map(|a| std::path::PathBuf::from(a).join("gpui-editor"))
+            .map(|a| std::path::PathBuf::from(a).join("vuick"))
             .unwrap_or_default();
         assert_eq!(
             cfg.starts_with(&real_root),
             false,
-            "config_path 不得触碰真实 %APPDATA%\\gpui-editor：{cfg:?}"
+            "config_path 不得触碰真实 %APPDATA%\\vuick：{cfg:?}"
         );
         assert_eq!(
             sess.starts_with(&real_root),
             false,
-            "session_dir 不得触碰真实 %APPDATA%\\gpui-editor：{sess:?}"
+            "session_dir 不得触碰真实 %APPDATA%\\vuick：{sess:?}"
         );
         assert!(
             cfg.starts_with(std::env::temp_dir()),

@@ -111,7 +111,7 @@ impl EditorApp {
             recent_files,
             // A4：PDF 书签进程级读盘一次（`load_cached`；每窗构造都读盘是浪费）。
             shell_pdf::bookmarks::load_cached(),
-            // 阅读进度进程级读盘一次（路径守卫缓存；`GPUI_EDITOR_TEST` 下 .tmp 隔离目录）。
+            // 阅读进度进程级读盘一次（路径守卫缓存；`VUICK_TEST` 下 .tmp 隔离目录）。
             session_store::reading_progress::load_cached(&AppModel::reading_progress_path()),
         )));
         // 侧边栏渲染/事件实体（shell_sidebar 域 crate）：经共享 model + 宿主弱引用
@@ -313,7 +313,7 @@ impl EditorApp {
                 app.toggle_live_test(window, cx);
             }
         }
-        // 启动首帧墙钟（GPUI_EDITOR_STARTUP_DIAG=1 门控，默认零开销零行为）：
+        // 启动首帧墙钟（VUICK_STARTUP_DIAG=1 门控，默认零开销零行为）：
         // A1 后本段 ≈ `EditorApp::new` 结束段——`restore_session` 只完成「读清单 +
         // 登记首帧后渐进恢复」，**首帧前不做任何逐选项卡打开**（恢复在首帧 render
         // 之后按帧逐个进行，见 session.rs `schedule_restore`／`restore_step`）。

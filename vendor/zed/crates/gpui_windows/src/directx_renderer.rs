@@ -530,9 +530,9 @@ impl DirectXRenderer {
         if self.width == width && self.height == height {
             return Ok(());
         }
-        // C2 真机探针（GPUI_EDITOR_DIAG 守卫）：正常应每个拖拽只在 EXITSIZEMOVE 收口时
+        // C2 真机探针（VUICK_DIAG 守卫）：正常应每个拖拽只在 EXITSIZEMOVE 收口时
         // 打到一行（拖拽中 WM_SIZE 不再触发 `resize()`）；若无 C2，拖拽过程会每 WM_SIZE 一行。
-        if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+        if std::env::var_os("VUICK_DIAG").is_some() {
             eprintln!("[RENDERER] resize {width}x{height}");
         }
         self.width = width;
@@ -1152,11 +1152,11 @@ fn gpu_recolor_diag_gate() -> bool {
 
 impl DirectXRenderPipelines {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
-        // C1 墙钟探针（GPUI_EDITOR_DIAG 守卫，平时零开销）：首窗全 miss（~18 次
+        // C1 墙钟探针（VUICK_DIAG 守卫，平时零开销）：首窗全 miss（~18 次
         // D3DCompileFromFile 现编译），第二个新窗口起全 hit（近似 0ms），证明 shader
         // 字节码已被 process 级缓存复用、不再逐窗重编译。
         #[cfg(debug_assertions)]
-        let diag_t0 = std::env::var_os("GPUI_EDITOR_DIAG").is_some().then(std::time::Instant::now);
+        let diag_t0 = std::env::var_os("VUICK_DIAG").is_some().then(std::time::Instant::now);
         let shadow_pipeline = PipelineState::new(
             device,
             "shadow_pipeline",
@@ -2300,7 +2300,7 @@ pub(crate) mod shader_resources {
 }
 
 mod nvidia {
-// [gpui-editor fork] Modified from upstream zed
+// [vuick fork] Modified from upstream zed
 // (https://github.com/zed-industries/zed, rev 93d7456). See vendor/zed/README.md
 // for the per-crate change list. License: Apache-2.0 (see vendor/zed/LICENSE-APACHE).
 

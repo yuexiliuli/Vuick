@@ -3,7 +3,7 @@ name = "shell_commands"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 公共命令表叶子 crate（菜单 / 命令面板 / 根级快捷键共享的 label 与快捷键常量 + 根级键位推导，纯命令表零视图依赖）"
+description = "vuick 公共命令表叶子 crate（菜单 / 命令面板 / 根级快捷键共享的 label 与快捷键常量 + 根级键位推导，纯命令表零视图依赖）"
 
 [dependencies]
 # 根级快捷键的 KeyBinding 构造（gpui 平台 API）。

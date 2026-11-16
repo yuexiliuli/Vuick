@@ -646,7 +646,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let dir = std::env::temp_dir().join("gpui-editor-sidebar-toc.md");
+        let dir = std::env::temp_dir().join("vuick-sidebar-toc.md");
         std::fs::write(
             &dir,
             "# 第一章 这是一个特别长的标题用于验证目录自适应宽度\n正文\n## 第一节\n小节\n# 第二章\n结尾\n",
@@ -1715,7 +1715,7 @@
         );
     }
 
-    /// 测试隔离：开发者真实 `%APPDATA%\gpui-editor\config.json` 可能带「已打开文件夹」
+    /// 测试隔离：开发者真实 `%APPDATA%\vuick\config.json` 可能带「已打开文件夹」
     /// 且 `config` crate 未做 `cfg(test)` 门控（AGENTS K8）——会使「默认整个文件夹」
     /// 意外生效。搜索侧测试前置清空根，保证在「未打开文件夹」环境下运行。
     fn fs_clear_restored_folder(app: &gpui::Entity<EditorApp>, cx: &mut VisualTestContext) {

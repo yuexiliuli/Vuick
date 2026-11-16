@@ -12,9 +12,9 @@ impl super::VideoViewer {
             .then(|| self.audio.as_ref().map(|s| s.position()).unwrap_or(0.0));
         let hit_end = self.advance_playhead(audio_pos);
 
-        // 音频健康诊断：仅 `GPUI_EDITOR_VIDEO_AUDIO_DIAG=1` 时每 ~1s 打一行喂送统计
+        // 音频健康诊断：仅 `VUICK_VIDEO_AUDIO_DIAG=1` 时每 ~1s 打一行喂送统计
         //（欠载/锁竞争是滋滋声的根源形态；默认静默）
-        const DIAG_ENV: &str = "GPUI_EDITOR_VIDEO_AUDIO_DIAG";
+        const DIAG_ENV: &str = "VUICK_VIDEO_AUDIO_DIAG";
         if self.audio.is_some()
             && std::env::var_os(DIAG_ENV).is_some()
         {
@@ -104,7 +104,7 @@ impl super::VideoViewer {
         } else {
             false
         };
-        // seek 全链路探针聚合（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 打印；test 构建无条件把
+        // seek 全链路探针聚合（`VUICK_VIDEO_SEEK_DIAG=1` 打印；test 构建无条件把
         // 8 字段快照沉淀给基准对表）：首帧上屏那刻打一条 [SEEK]。
         // total = seek 提交 → 首帧上屏；seek2first = worker 内 seek→首帧≥target 入队；
         // frame2screen = 入队 → tick install（泵一拍最坏等待）；打完清槽，不重复刷。

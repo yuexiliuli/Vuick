@@ -34,7 +34,7 @@ macro_rules! fixture_or_skip {
 #[test]
 fn open_watchdog_interrupts_corrupt_file() {
     let dir = std::env::temp_dir().join(format!(
-        "gpui-editor-mff-corrupt-{}",
+        "vuick-mff-corrupt-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1476,7 +1476,7 @@ fn ffi_last_error_str() -> String {
 /// 不入库，PID 后缀防并行测试撞目录）。
 fn corrupt_fixture_path() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "gpui-editor-mff-classify-{}",
+        "vuick-mff-classify-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1607,7 +1607,7 @@ fn ffi_open_failure_classification_distinct() {
     );
 
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!(
-        "gpui-editor-mff-classify-{}",
+        "vuick-mff-classify-{}",
         std::process::id()
     )));
 }

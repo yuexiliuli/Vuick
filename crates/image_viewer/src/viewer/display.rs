@@ -14,11 +14,11 @@ use gpui::{
 
 use super::ImageViewer;
 
-/// C6 预上传默认张数（R4B）：默认 1；env `GPUI_EDITOR_IMG_PREHEAT=N` 可覆盖（A/B 对表
+/// C6 预上传默认张数（R4B）：默认 1；env `VUICK_IMG_PREHEAT=N` 可覆盖（A/B 对表
 /// 用 `=3` 强制旧 3 张）。进程内只读一次后缓存，每帧零开销。
 const PREHEAT_UPGRADE_N_DEFAULT: i64 = 1;
-/// `GPUI_EDITOR_IMG_PREHEAT` env 名（R4B A/B 门控）。
-const PREHEAT_ENV_VAR: &str = "GPUI_EDITOR_IMG_PREHEAT";
+/// `VUICK_IMG_PREHEAT` env 名（R4B A/B 门控）。
+const PREHEAT_ENV_VAR: &str = "VUICK_IMG_PREHEAT";
 
 /// C6 预上传张数：首调读一次 env（默认 1），此后缓存结果不再查 env（门控需重启生效）。
 fn preheat_upgrade_n() -> i64 {
@@ -41,7 +41,7 @@ impl ImageViewer {
     ///
     /// R4B（重绘收口）：预上传张数默认 1（`PREHEAT_UPGRADE_N_DEFAULT`）——每帧只多画 1 张
     /// 全屏纹理；快滚每格都整窗重绘时，旧 3 张 = 每帧 4 张全屏纹理（预上传 3 + 当前 1）是
-    /// 渲染服务时间的头号成本。可用 env `GPUI_EDITOR_IMG_PREHEAT=3` 强制旧 3 张做 A/B 对表
+    /// 渲染服务时间的头号成本。可用 env `VUICK_IMG_PREHEAT=3` 强制旧 3 张做 A/B 对表
     /// （进程内只读一次，改门控需重启应用）。
     fn peek_upgrade_elements(&self) -> Vec<gpui::AnyElement> {
         let n = self.nav.len() as i64;

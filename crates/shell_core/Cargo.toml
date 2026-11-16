@@ -3,7 +3,7 @@ name = "shell_core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 外壳宿主模型类型 crate（自 shell 的 app/mod.rs 拆分：EditorTab / DetachedTab / MediaReader / MdWyInstall / 拖拽 / 标题栏等纯模型类型；纯结构移动，只重分配既有依赖，不新增外部包）"
+description = "vuick 外壳宿主模型类型 crate（自 shell 的 app/mod.rs 拆分：EditorTab / DetachedTab / MediaReader / MdWyInstall / 拖拽 / 标题栏等纯模型类型；纯结构移动，只重分配既有依赖，不新增外部包）"
 
 [dependencies]
 # 模型类型直接持有的 GPUI 句柄 / 值类型（Entity / SharedString / ScrollHandle / Subscription /

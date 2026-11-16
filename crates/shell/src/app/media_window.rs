@@ -50,7 +50,7 @@ impl EditorApp {
         // `&mut self.model.borrow_mut()` 的 guard 在语句结束已 drop，
         // 此处 `&self` 路径（schedule / 诊断）不再持有模型借用（防 RefCell 双借 panic）。
         self.schedule_media_size_flush(cx);
-        if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+        if std::env::var_os("VUICK_DIAG").is_some() {
             eprintln!(
                 "[MEDIAWNDSZ] record kind={kind:?} size={}x{}",
                 size.width.as_f32().round() as i64,
@@ -96,9 +96,9 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let p = PathBuf::from(path.trim());
-        // 打开墙钟诊断（GPUI_EDITOR_DIAG 守卫，平时零开销零行为）：记录「触发 open_file
+        // 打开墙钟诊断（VUICK_DIAG 守卫，平时零开销零行为）：记录「触发 open_file
         // 分流 → 决策 / 新窗口就绪」的墙钟，供轨 D 基线（headless 基准同口径对表）。
-        let diag_t0 = if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+        let diag_t0 = if std::env::var_os("VUICK_DIAG").is_some() {
             Some(std::time::Instant::now())
         } else {
             None
@@ -121,7 +121,7 @@ impl EditorApp {
             // `self_has_tabs` 语义见 shell_media::media_window::resolve_media_open_target）。
             !self.model.borrow().tabs.is_empty(),
         );
-        // K39 姿势诊断探针：真机冒烟取证用（GPUI_EDITOR_DIAG 守卫，平时零开销）。
+        // K39 姿势诊断探针：真机冒烟取证用（VUICK_DIAG 守卫，平时零开销）。
         let windows_n = cx
             .try_global::<EditorAppRegistry>()
             .map(|r| r.windows.len())

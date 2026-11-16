@@ -1,6 +1,6 @@
 # kimg
 
-纯 Rust 图像解码/编码 crate，`image 0.25.10` 的 API 兼容镜像，供 gpui-editor 全仓泛用解码路径（`ImageReader→decode→to_rgba8`）直接替换 crates.io `image`。许可 Apache-2.0 自持，不引入 AGPL 等传染性依赖。
+纯 Rust 图像解码/编码 crate，`image 0.25.10` 的 API 兼容镜像，供 vuick 全仓泛用解码路径（`ImageReader→decode→to_rgba8`）直接替换 crates.io `image`。许可 Apache-2.0 自持，不引入 AGPL 等传染性依赖。
 
 与 `image` 的关系：**PNG、WebP、GIF 为仓内自研核心**（PNG 全链路 pngsimd + png_encoder；WebP container + VP8L + VP8 + ALPH；GIF 容器 + LZW 解/编 + 画布帧合成）；JPEG/TIFF 复用既有第三方纯 Rust 后端（JPEG 为 `zune-jpeg`，与 image 同源保证字节级一致性）；BMP/ICO/PNM 为仓内手写实现，补齐 image 自带的解析能力。JPEG 曾自研 8-bit baseline（与 zune 逐字节一致）但 release 慢 2.13×，按「无效即回滚」未并入，维持 zune（见 docs 交接）。
 

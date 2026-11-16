@@ -4112,7 +4112,7 @@ mod tests {
     /// 强化自动测试：把整份文档当“翻书”自动翻页（前向 + 不规整回翻 + 跨区），每停一页
     /// 都要求**渲染到位**——停稳（在途瓦片/封面清零、泵停、退出快速态）且**真正可见页**
     /// 全部已有内容（封面或瓦片，非仅占位）。任一页停不稳/不清晰都直接断言失败，并打印
-    /// 带时间戳（`timing_ms`）的巡检行，与 `GPUI_EDITOR_PDF_TIMING=1` 的控制台日志对位。
+    /// 带时间戳（`timing_ms`）的巡检行，与 `VUICK_PDF_TIMING=1` 的控制台日志对位。
     #[gpui::test]
     async fn auto_flip_renders_every_stop_page(cx: &mut gpui::TestAppContext) {
         skip_if_missing_pdf_fixture!();
@@ -8598,7 +8598,7 @@ mod tests {
     fn temp_pdf_copy(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+        let dir = std::env::temp_dir().join("vuick-pdf-tests");
         let _ = std::fs::create_dir_all(&dir);
         let dst = dir.join(format!(
             "{name}-{}-{}.pdf",
@@ -8776,7 +8776,7 @@ mod tests {
 
         // 单页文档：提取第 0 页成单页文件后删除 → Err「仅剩 1 页」
         let single = {
-            let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+            let dir = std::env::temp_dir().join("vuick-pdf-tests");
             let _ = std::fs::create_dir_all(&dir);
             let p = dir.join(format!("single-{}.pdf", std::process::id()));
             let _ = std::fs::remove_file(&p);
@@ -8804,7 +8804,7 @@ mod tests {
         let _guard = pdf_lock().lock().unwrap();
         let path = temp_pdf_copy("extract");
         let out = {
-            let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+            let dir = std::env::temp_dir().join("vuick-pdf-tests");
             let _ = std::fs::create_dir_all(&dir);
             let p = dir.join(format!("extracted-{}.pdf", std::process::id()));
             let _ = std::fs::remove_file(&p);
@@ -8897,7 +8897,7 @@ mod tests {
         use std::time::Duration;
 
         let src = test_util::test_pdf_paths()[0].clone();
-        let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+        let dir = std::env::temp_dir().join("vuick-pdf-tests");
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join(format!("pending-op-{}.pdf", std::process::id()));
         let _ =         std::fs::remove_file(&p);

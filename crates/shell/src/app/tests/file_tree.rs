@@ -376,13 +376,13 @@
             format!(r#"{{"opened_folder": "{folder_json}", "session_restore": false}}"#),
         )
         .unwrap();
-        unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+        unsafe { std::env::set_var("VUICK_CONFIG", &cfg) };
         let (app_off, cx) = add_app(cx);
         for _ in 0..3 {
             cx.run_until_parked();
         }
         let root_off = cx.update(|_w, cx| app_off.read(cx).sidebar.files.root.clone());
-        unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+        unsafe { std::env::remove_var("VUICK_CONFIG") };
         assert_eq!(
             root_off,
             None,
@@ -395,7 +395,7 @@
             format!(r#"{{"opened_folder": "{folder_json}", "session_restore": true}}"#),
         )
         .unwrap();
-        unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+        unsafe { std::env::set_var("VUICK_CONFIG", &cfg) };
         let (app_on, cx) = add_app(cx);
         for _ in 0..3 {
             cx.run_until_parked();
@@ -404,7 +404,7 @@
             let a = app_on.read(cx);
             (a.sidebar.files.root.clone(), a.sidebar.view)
         });
-        unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+        unsafe { std::env::remove_var("VUICK_CONFIG") };
         let _ = std::fs::remove_file(&cfg);
         let _ = std::fs::remove_dir_all(&base);
 

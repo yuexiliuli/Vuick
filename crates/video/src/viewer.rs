@@ -193,14 +193,14 @@ thread_local! {
     };
 }
 
-/// seek 全链路性能探针开关（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1`）：用户开 env 后自点
+/// seek 全链路性能探针开关（`VUICK_VIDEO_SEEK_DIAG=1`）：用户开 env 后自点
 /// 进度条，stderr 每个 seek 打一行 `[SEEK]` 聚合（total/reuse/regress/skipped/
 /// seek2first/frame2screen/target/firstpts）。默认关闭：`OnceLock` 缓存 env 判定，
 /// 关闭时每条 seek 命令只多一次 `result_tx.is_none()` 判断与一次 u64 槽位写，
 /// 不在逐帧热路径加分支。
 fn seek_diag_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GPUI_EDITOR_VIDEO_SEEK_DIAG").is_some())
+    *ON.get_or_init(|| std::env::var_os("VUICK_VIDEO_SEEK_DIAG").is_some())
 }
 
 /// 探针「采集」是否开启：运行态只在 [`seek_diag_enabled`]（env）为真时采集，关态零热路径
@@ -512,7 +512,7 @@ struct DecodeCmd {
     cap: u32,
     tx: std::sync::mpsc::SyncSender<FrameItem>,
     result_tx: Option<std::sync::mpsc::Sender<Result<super::decode::VideoParams, String>>>,
-    /// 本命令对应的 seek 诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 worker
+    /// 本命令对应的 seek 诊断会话号（`VUICK_VIDEO_SEEK_DIAG=1` 时 worker
     /// 据此把解码阶段数据写进共享槽，tick 首帧落地时聚合打印；普通运行只传递值）。
     seek_session: u64,
     /// 帧就绪通知发送端（P1 事件驱动泵）：worker 每次成功入队一帧后 `try_send(())` 唤醒
@@ -680,7 +680,7 @@ pub struct VideoViewer {
     audio_err: bool,
     /// 音频健康诊断节拍（每 ~60 tick ≈1s 打一行 stats；播放无音频时不用）。
     diag_ticks: u32,
-    /// 最近一次 seek 命令的诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 tick 据此
+    /// 最近一次 seek 命令的诊断会话号（`VUICK_VIDEO_SEEK_DIAG=1` 时 tick 据此
     /// 匹配共享槽并聚合打印一条 `[SEEK]`；普通运行恒为递增 u64，不读不写槽）。
     diag_session: u64,
     /// 常驻视频解码线程的命令通道。worker 一生一个，切换/seek 全投命令；新文件在
@@ -823,7 +823,7 @@ impl VideoViewer {
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
-            // 最近一次 seek 命令的诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 tick
+            // 最近一次 seek 命令的诊断会话号（`VUICK_VIDEO_SEEK_DIAG=1` 时 tick
             // 据此匹配共享槽并聚合打印；普通运行恒 0/新值）。
             diag_session: 0,
             decode_cmd: None,

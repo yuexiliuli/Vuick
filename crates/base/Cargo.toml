@@ -3,7 +3,7 @@ name = "base"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 叶子基础 crate（EditIntent / 动作类型与输入键位 / warm emoji / util / prof）"
+description = "vuick 叶子基础 crate（EditIntent / 动作类型与输入键位 / warm emoji / util / prof）"
 
 [dependencies]
 gpui = { workspace = true }

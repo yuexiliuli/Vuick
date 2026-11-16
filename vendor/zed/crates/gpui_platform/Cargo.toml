@@ -1,4 +1,4 @@
-# [gpui-editor fork] Modified from upstream zed
+# [vuick fork] Modified from upstream zed
 # (https://github.com/zed-industries/zed, rev 93d7456). See vendor/zed/README.md
 # for the per-crate change list. License: Apache-2.0 (see vendor/zed/LICENSE-APACHE).
 
@@ -13,8 +13,8 @@ license = "Apache-2.0"
 path = "src/gpui_platform.rs"
 doctest = false
 
-# Vendored/trimmed for gpui-editor: Windows-only. Feature names kept so
-# consumer manifests (gpui-editor root: features=["font-kit"]) still parse.
+# Vendored/trimmed for vuick: Windows-only. Feature names kept so
+# consumer manifests (vuick root: features=["font-kit"]) still parse.
 [features]
 default = []
 font-kit = []

@@ -85,7 +85,7 @@ use ::viewer::pan_zoom;
 mod input;   // input/hit：滚轮缩放/切图、放大态平移、拖拽平移、切图复位
 mod decode;  // decode：并行解码池 / LRU 缓存 / 级联预取 / 动图时钟 / EXIF 即时首帧
 mod display; // display/placeholder：Render 上屏、C6 预上传垫底、占位文本
-mod diag;    // diag：env 门控诊断探针（GPUI_EDITOR_IMG_DIAG=1，帧间隔/切换时延）
+mod diag;    // diag：env 门控诊断探针（VUICK_IMG_DIAG=1，帧间隔/切换时延）
 
 /// 一张已解码可立即上屏的图片（LRU 缓存条目）。
 #[derive(Clone)]
@@ -1316,7 +1316,7 @@ mod tests {
     /// 每测试独立的临时目录（按进程 id + 标签隔离，避免并行测试互相踩）。
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-img-test-{}-{tag}",
+            "vuick-img-test-{}-{tag}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();

@@ -371,7 +371,7 @@ impl AppModel {
     // ---------- 阅读进度编排纯逻辑 ----------
 
     /// 阅读进度文件的**默认路径** = 配置文件父目录 / `reading_progress.json`
-    /// （`%APPDATA%\gpui-editor\`；测试构建经 config `test-mode` 落隔离临时目录）。
+    /// （`%APPDATA%\vuick\`；测试构建经 config `test-mode` 落隔离临时目录）。
     /// `pub`：shell 宿主与集成测试经 `shell::app` 重导出访问（§8.6 外提清单）。
     pub fn reading_progress_path() -> PathBuf {
         match UserPrefs::config_path().parent() {
@@ -602,7 +602,7 @@ impl AppModel {
     /// 侧栏宽度只在用户手动拖过（`width_auto == false`）时才持久化，
     /// 否则下次启动仍保持随内容自适应。
     /// **测试构建不写盘**（config crate 是依赖编译、不受其自身 `cfg!(test)` 门控，
-    /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`）。
+    /// 若这里写盘会污染真实 `%APPDATA%\vuick\config.json`）。
     pub fn persist_prefs(&self, host: &dyn AppHost) {
         // 测试构建恒跳过（cfg!(test) 经 host 回传）：避免污染真实/隔离配置。
         if host.is_test_build() {

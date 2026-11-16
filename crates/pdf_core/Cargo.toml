@@ -3,7 +3,7 @@ name = "pdf_core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor PDF 栅格化核心 crate（pdfium 定位/单例工作线程/瓦片栅格化 + 页列纯布局几何 + 纸墨重着色；无视图依赖）"
+description = "vuick PDF 栅格化核心 crate（pdfium 定位/单例工作线程/瓦片栅格化 + 页列纯布局几何 + 纸墨重着色；无视图依赖）"
 build = "build.rs"
 
 [dependencies]

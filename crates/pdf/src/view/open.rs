@@ -821,7 +821,7 @@ impl PdfViewer {
             // 本探针在「糊住不动」的静态帧门控早退前（keep_window 可见窗，含 MARGIN
             // 缓冲）逐可见页打印 LOD 账：各档底图（cover/prev/pref/mid/thumb/tiles）
             // 在位情况 + 是否有当前档 cover 在途 + 期望 cover 档，供锁定是哪一档低密
-            // 底图在服务、为何无当前档 cover 补渲。GPUI_EDITOR_DIAG 未设时零开销。
+            // 底图在服务、为何无当前档 cover 补渲。VUICK_DIAG 未设时零开销。
             if diag_enabled() {
                 let (dstart, dend) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
                 if !self.dims.is_empty() && dstart <= dend {

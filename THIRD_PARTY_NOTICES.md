@@ -1,6 +1,6 @@
 # 第三方许可声明（THIRD-PARTY NOTICES）
 
-本文件是 gpui-editor 分发/源码的第三方组件合规说明。**本体代码一律 Apache-2.0**（见`LICENSE-APACHE`），下列为随分发捆绑或引用到的第三方组件。
+本文件是 vuick 分发/源码的第三方组件合规说明。**本体代码一律 Apache-2.0**（见`LICENSE-APACHE`），下列为随分发捆绑或引用到的第三方组件。
 
 `scripts/package.ps1` 会把本文件与 `third_party/`（许可原文）随包复制到发布目录，满足「随
 分发提供许可证文本」义务。

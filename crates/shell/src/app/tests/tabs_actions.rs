@@ -48,7 +48,7 @@
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-img-{}",
+            "vuick-app-img-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -141,7 +141,7 @@
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-{}",
+            "vuick-app-vid-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -505,7 +505,7 @@
         }
 
         // 打开一个真实文件，内容进入编辑区，再渲染（覆盖 open_file 路径）
-        let dir = std::env::temp_dir().join("gpui-editor-test.md");
+        let dir = std::env::temp_dir().join("vuick-test.md");
         std::fs::write(&dir, "# 标题\n\n**加粗** 正文 `code`\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -880,7 +880,7 @@
         }
 
         // 打开 .md 文件（自动新建选项卡并选中它）：选项卡栏最右侧应显示眼睛，并自动开启预览
-        let dir = std::env::temp_dir().join("gpui-editor-eye-test.md");
+        let dir = std::env::temp_dir().join("vuick-eye-test.md");
         std::fs::write(&dir, "# 标题\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -923,7 +923,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let dir2 = std::env::temp_dir().join("gpui-editor-eye-test.txt");
+        let dir2 = std::env::temp_dir().join("vuick-eye-test.txt");
         std::fs::write(&dir2, "plain").unwrap();
         cx.update(|window, cx| {
             if let Ok(app) = view.read(cx).view().clone().downcast::<EditorApp>() {
@@ -1137,7 +1137,7 @@
         }
         // 把视频载入 tab 0（**非活动**）→ 两栏应照常渲染
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-{}",
+            "vuick-app-vid-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1254,7 +1254,7 @@
         }
         // 把视频载入当前活动 tab（tab 1）→ 打开文件即生效
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-open-{}",
+            "vuick-app-vid-open-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1332,7 +1332,7 @@
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-tg-{}",
+            "vuick-app-vid-tg-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1488,7 +1488,7 @@
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-close-{}",
+            "vuick-app-vid-close-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();

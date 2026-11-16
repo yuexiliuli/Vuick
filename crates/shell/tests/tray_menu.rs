@@ -1,7 +1,7 @@
 //! 托盘菜单域（close_tray）：开关翻转 + tray 全局状态联动 + 菜单标签复选标记。
 //! 断言内部与 lib 单测 `src/app/tests/close_tray.rs` 逐字一致（P1 测试域化）。
 //! ⚠ 集成目标下 shell lib 非 test 编译：`toggle_close_to_tray` / `close_to_tray_label`
-//! 经 §8.6 外提清单 pub 化访问；`common::init_test` 注入 `GPUI_EDITOR_TEST`。
+//! 经 §8.6 外提清单 pub 化访问；`common::init_test` 注入 `VUICK_TEST`。
 
 mod common;
 

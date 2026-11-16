@@ -1,7 +1,7 @@
 //! 媒体/音乐域（media_window + music 合并 target，§8.3）：媒体打开重定向决策/尺寸记录、
 //! 音乐模式。断言内部与 lib 单测相应 `.rs` 逐字一致（P1 测试域化）；`MediaOpenTarget`/
 //! `MediaWindowKind`/`resolve_*` 经 §8.6 外提 pub 化、`MediaReader` 经 `common::*` 重导出、
-//! 开关/尺寸/音乐方法经外提 pub 化访问；`common::init_test` 注入 `GPUI_EDITOR_TEST`。
+//! 开关/尺寸/音乐方法经外提 pub 化访问；`common::init_test` 注入 `VUICK_TEST`。
 //! R7：`#[cfg(feature = "video")]` 门控保留原样（integration 目标随 package features 编译，
 //! `--no-default-features` 下视频半边被排除）。
 
@@ -870,7 +870,7 @@ use common::*;
         d
     }
 
-    /// 把 `GPUI_EDITOR_CONFIG` 指向「复制现有配置 + `music_dir`→空目录」的临时配置，隔离
+    /// 把 `VUICK_CONFIG` 指向「复制现有配置 + `music_dir`→空目录」的临时配置，隔离
     /// `MusicView::load_default_dir` 的目录来源；返回临时配置文件路径（测试结束恢复并删除）。
     /// 现有配置损坏/不存在 → 以仅含 music_dir 的对象兜底。
     fn music_isolate_config() -> std::path::PathBuf {
@@ -886,17 +886,17 @@ use common::*;
             );
         }
         let cfg = std::env::temp_dir().join(format!(
-            "gpui-music-config-{}.json",
+            "vuick-music-config-{}.json",
             music_tmp_suffix()
         ));
         std::fs::write(&cfg, value.to_string()).unwrap();
-        unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+        unsafe { std::env::set_var("VUICK_CONFIG", &cfg) };
         cfg
     }
 
     /// 恢复并清理（测试收尾 best-effort；target-only 运行无并行干扰）。
     fn music_restore_config(cfg: &std::path::Path) {
-        unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+        unsafe { std::env::remove_var("VUICK_CONFIG") };
         let _ = std::fs::remove_file(cfg);
     }
 

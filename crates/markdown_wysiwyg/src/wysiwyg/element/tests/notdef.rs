@@ -257,7 +257,7 @@ fn bench_doc_open_internal_distribution(cx: &mut TestAppContext) {
     // 二次 line_starts / Rope / 字符计数+UTF-16；set_source_text 的 marker_cnt / regions）。
     // 并测新后台 load 路径的 **UI 线程成本**（`install_open` 装配，O(块) 级别）——
     // 证明整篇 O(n) 解析已挪出 UI 线程。
-    // 跑法：cargo test --release --bin gpui-editor bench_doc_open_internal_distribution -- --ignored --nocapture，KILO_PROF=1 环境变量。
+    // 跑法：cargo test --release --bin vuick bench_doc_open_internal_distribution -- --ignored --nocapture，KILO_PROF=1 环境变量。
     let path = "fixtures/大文档测试2.md";
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,

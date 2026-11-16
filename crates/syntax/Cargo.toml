@@ -3,7 +3,7 @@ name = "syntax"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 代码块语法高亮 crate（syntect 默认语法集 + GitHub 明/暗配色）"
+description = "vuick 代码块语法高亮 crate（syntect 默认语法集 + GitHub 明/暗配色）"
 
 [dependencies]
 gpui = { workspace = true }

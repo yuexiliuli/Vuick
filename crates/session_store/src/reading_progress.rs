@@ -1,5 +1,5 @@
 //! 「阅读进度恢复」持久化存储层：`{ 规范化文件路径 → ReadingProgress }`，独立 JSON 文件
-//! （文件名由调用方注入：默认 `%APPDATA%\gpui-editor\reading_progress.json`，测试走隔离
+//! （文件名由调用方注入：默认 `%APPDATA%\vuick\reading_progress.json`，测试走隔离
 //! 临时目录），原子落盘。2026-11 新增（用户感知线：关 tab / 崩溃后重开回到上次阅读位置）。
 //!
 //! - **按文件路径关联**：不同文件各自一套进度，重开同一路径即恢复（镜像
@@ -154,7 +154,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("gpui-editor-rp-test-{tag}-{nanos}.json"))
+        std::env::temp_dir().join(format!("vuick-rp-test-{tag}-{nanos}.json"))
     }
 
     #[test]

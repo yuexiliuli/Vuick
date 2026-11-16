@@ -57,7 +57,7 @@ pub use editor_core::{
 
 mod view;
 
-// 编辑器滚动诊断（`GPUI_EDITOR_RP_DIAG=1` 开启追查「编辑区被拉回顶端」来源；默认关）。
+// 编辑器滚动诊断（`VUICK_RP_DIAG=1` 开启追查「编辑区被拉回顶端」来源；默认关）。
 mod diag;
 
 #[cfg(test)]

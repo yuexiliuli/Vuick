@@ -15,7 +15,7 @@
 //! - 所有解码操作在本库内部串行化（`decode::FFMPEG_LOCK`），与旧版同一纪律。
 //!
 //! 导出函数均为 `unsafe extern "C"`：跨 DLL 边界的 C ABI 约定由调用方（主程序）遵守，
-//! 具体前置条件见 `gpui-editor/src/video/decode.rs` 加载器——此处统一豁免逐条 `# Safety`。
+//! 具体前置条件见 `vuick/src/video/decode.rs` 加载器——此处统一豁免逐条 `# Safety`。
 #![allow(clippy::missing_safety_doc)]
 
 mod decode;

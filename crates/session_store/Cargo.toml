@@ -3,7 +3,7 @@ name = "session_store"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 会话持久化存储 / 设置导出序列化 / 「打开最近」面板实体 crate（自 shell 的 app/session + app/settings_xfer + app/recent_panel 拆出的叶子 crate；纯结构移动，只重分配既有依赖，不新增外部包）"
+description = "vuick 会话持久化存储 / 设置导出序列化 / 「打开最近」面板实体 crate（自 shell 的 app/session + app/settings_xfer + app/recent_panel 拆出的叶子 crate；纯结构移动，只重分配既有依赖，不新增外部包）"
 
 [dependencies]
 # 最近面板实体（Render / Focusable / gpui::DismissEvent / Entity/WeakEntity 句柄）。

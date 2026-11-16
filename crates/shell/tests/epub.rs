@@ -1,7 +1,7 @@
 //! EPUB 域（epub_wy 单源 target，§8.3）：EPUB 迁 WyEditor 只读宿主 + 章节翻转 + 注记/引文
 //! 统一宿主 + 远跳自驱动。断言内部与 lib 单测 `src/app/tests/epub_wy.rs` 逐字一致
 //! （P1 测试域化）；`epub_flip_chapter` 经 §8.6 外提 pub 化访问；`common::init_test` 注入
-//! `GPUI_EDITOR_TEST`。
+//! `VUICK_TEST`。
 
 mod common;
 

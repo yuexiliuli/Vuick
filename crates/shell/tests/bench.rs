@@ -535,7 +535,7 @@ use shell::app::EditorAppRegistry;
     ///   新：EOF 后即刻）。
     /// - 内存峰值 = 打开窗口内进程私有提交字节增量（1ms 采样；旧路径读盘期有
     ///   「读盘 String + 归一化 String + Rope」≈2× 文件，新路径峰值≈1× 文件）。
-    /// 运行：`cargo test --release --bin gpui-editor bench_open_large_txt_progressive -- \
+    /// 运行：`cargo test --release --bin vuick bench_open_large_txt_progressive -- \
     ///        --ignored --nocapture`（debug 亦可，比值一致、绝对值放大）。
     #[gpui::test]
     #[ignore]
@@ -688,7 +688,7 @@ use shell::app::EditorAppRegistry;
 
     /// 基准：ropey 全文构建「一次性 `Rope::from`」 vs「1MB 分块末尾 `insert`」——
     /// 量化新管线把构建搬到逐块追加（<主线程每块 O(块)>）相对旧一次性构建的开销。
-    /// 运行：`cargo test --release --bin gpui-editor bench_rope_grow_strategies -- \
+    /// 运行：`cargo test --release --bin vuick bench_rope_grow_strategies -- \
     ///        --ignored --nocapture`
     #[gpui::test]
     #[ignore]
@@ -1177,7 +1177,7 @@ fn new_style_scan(content: &str, q: &str) -> usize {
     /// 行为）。分段：① 窗口构造（EditorApp::new 真实启动路径 + Root）+ 首帧 render（refresh
     /// 真实布局/paint）② 会话恢复段（`restore_session_from` 显式临时目录，含逐选项卡同步
     /// open_file / 建未命名选项卡灌槽位）＝轨 A 改造前首帧成本基线。
-    /// 生产完整 `[STARTUP]` 直读：`GPUI_EDITOR_STARTUP_DIAG=1 target\debug\gpui-editor.exe`
+    /// 生产完整 `[STARTUP]` 直读：`VUICK_STARTUP_DIAG=1 target\debug\vuick.exe`
     /// 的 stderr 首行。运行：
     /// `cargo test -p shell bench_startup_to_first_frame -- --ignored --nocapture`
     #[gpui::test]
@@ -1254,7 +1254,7 @@ fn new_style_scan(content: &str, q: &str) -> usize {
         });
         assert_eq!(restored, (5, 2), "恢复应得 5 选项卡（3 文件 + 2 未命名）");
         let _ = std::fs::remove_dir_all(&dir);
-        println!("==== 启动→首帧墙钟基准（debug，headless；真机以 GPUI_EDITOR_STARTUP_DIAG=1 的 [STARTUP] 行为准） ====");
+        println!("==== 启动→首帧墙钟基准（debug，headless；真机以 VUICK_STARTUP_DIAG=1 的 [STARTUP] 行为准） ====");
         println!("  窗口构造 + 首帧 render(refresh 真实布局): {construct_frame_ms:.1} ms");
         println!("  会话恢复段(3 文件 + 2 未命名):            {restore_ms:.1} ms");
         println!(

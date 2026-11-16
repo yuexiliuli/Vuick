@@ -1,7 +1,7 @@
 //! 命令面板域（palette 单源 target，§8.3）：命令/文件模式、quick open 模糊检索、几何。
 //! 断言内部与 lib 单测 `src/app/tests/palette.rs` 逐字一致（P1 测试域化）；
 //! `quick_open_collect`/`QUICK_OPEN_MAX_*` 经 §8.6 外提 pub 化、`SidebarView::Toc` 经
-//! `shell::app` 访问；`common::init_test` 注入 `GPUI_EDITOR_TEST`。
+//! `shell::app` 访问；`common::init_test` 注入 `VUICK_TEST`。
 
 mod common;
 

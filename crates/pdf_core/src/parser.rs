@@ -67,11 +67,11 @@ static PDFIUM_RAW_SIZE: std::sync::LazyLock<usize> =
 
 /// 在临时目录解出内嵌的 pdfium 并返回其路径。
 ///
-/// 文件命名为 `gpui-editor/pdfium-<版本>.dll`（仅首次写入；内容与 `include_bytes!`
+/// 文件命名为 `vuick/pdfium-<版本>.dll`（仅首次写入；内容与 `include_bytes!`
 /// 解压后一致时直接复用，退出后由临时目录清理，不污染项目目录）。
 #[cfg(embed_pdfium)]
 fn extract_embedded_pdfium() -> PathBuf {
-    let dir = std::env::temp_dir().join("gpui-editor");
+    let dir = std::env::temp_dir().join("vuick");
     let path = dir.join(PDFIUM_VERSIONED_NAME);
     // 已存在且长度等于原始 dll 大小 → 直接复用（避免每次启动重解压 ~3MB writes；跨版本名唯一）
     let reuse = path.is_file()
@@ -87,12 +87,12 @@ fn extract_embedded_pdfium() -> PathBuf {
 }
 
 /// 定位 pdfium 动态库（按优先级，**只用带版本号的文件**，不退回裸 `pdfium.dll`）：
-/// 1. 环境变量 `GPUI_EDITOR_PDFIUM`：绝对路径直接指定（最优先，逃生口；支持任意文件名）
+/// 1. 环境变量 `VUICK_PDFIUM`：绝对路径直接指定（最优先，逃生口；支持任意文件名）
 /// 2. 可执行文件同目录：`<版本号>.dll`（旁置分发/就地升级，可覆盖内嵌版）
 /// 3. 项目 `resources/pdfium/`：`<版本号>.dll`（开发树自带）
 /// 4. 内嵌到 exe 的 pdfium（`embed_pdfium` cfg）：解出到临时目录（单文件分发兜底）
 fn locate_dll() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("GPUI_EDITOR_PDFIUM") {
+    if let Ok(p) = std::env::var("VUICK_PDFIUM") {
         let pb = PathBuf::from(&p);
         if pb.is_file() {
             return Ok(pb);
@@ -127,7 +127,7 @@ fn locate_dll() -> Result<PathBuf> {
         .find(|c| c.is_file())
         .ok_or_else(|| anyhow::anyhow!(
             "无法找到 pdfium 动态库 {PDFIUM_VERSIONED_NAME}：\
-             请把它放在可执行文件旁或 resources/pdfium/，或用 GPUI_EDITOR_PDFIUM=<路径> 指定"
+             请把它放在可执行文件旁或 resources/pdfium/，或用 VUICK_PDFIUM=<路径> 指定"
         ))
 }
 
@@ -2108,12 +2108,12 @@ fn extract_outline(doc: &PdfDocument<'_>) -> Vec<PdfOutlineEntry> {
 /// `w*4`——见 `PdfBitmap::preferred_stride_bytes` 对 4 通道格式从不补对齐），
 /// 直接 `as_raw_bytes()` 拷出即可，**零像素循环、零字节重排**。旧的
 /// `as_image()` → `into_rgba8()` 会对每像素做 BGRA→RGBA 再一次 RGBA→BGRA 的浪费。
-/// 是否开启 worker 渲染计时日志（`GPUI_EDITOR_PDF_TIMING=1`）：打印每次瓦片/整页渲染的
+/// 是否开启 worker 渲染计时日志（`VUICK_PDF_TIMING=1`）：打印每次瓦片/整页渲染的
 /// get_page 与 pdfium 光栅化耗时，便于在真实慢 PDF 上定位瓶颈（worker 侧）。
 fn timing() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var_os("GPUI_EDITOR_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
+        std::env::var_os("VUICK_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
     })
 }
 

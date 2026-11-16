@@ -1713,7 +1713,7 @@ fn guidefix2_fixture_text() -> &'static str {
     r#"impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 启动首帧墙钟：首次 render 时补记 firstframe 段并打印 [STARTUP] 汇总
-        // （GPUI_EDITOR_STARTUP_DIAG=1 门控；未开启单次 var_os 检查即返回）。
+        // （VUICK_STARTUP_DIAG=1 门控；未开启单次 var_os 检查即返回）。
         base::startup::summarize();
         let theme = Theme::global(cx);
         // 与原组件库 Root 一致：以正文缺省字号为 rem 基准（本项目视图全走 px，供保险）。

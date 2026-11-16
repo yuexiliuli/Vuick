@@ -166,20 +166,20 @@ use crate::pdf::{
     QuadPt, RecolorEntry, RenderRequest, RenderResult, TileRequest, TileResult,
 };
 use viewer::pan_zoom;
-/// 是否开启视图侧计时日志（`GPUI_EDITOR_PDF_TIMING=1`，进程内缓存一次）。
+/// 是否开启视图侧计时日志（`VUICK_PDF_TIMING=1`，进程内缓存一次）。
 fn timing_view() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var_os("GPUI_EDITOR_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
+        std::env::var_os("VUICK_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
     })
 }
 
-/// 是否开启**真机取证探针**（`GPUI_EDITOR_DIAG`，进程内缓存一次；未设零开销——
+/// 是否开启**真机取证探针**（`VUICK_DIAG`，进程内缓存一次；未设零开销——
 /// 仅有缓存到位的 O(1) 布尔查，无任何打印/行为影响）。供静态帧门控早退分支等
 /// 只读观测点使用，只加日志不改任何调度语义。
 fn diag_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("GPUI_EDITOR_DIAG").is_some())
+    *EN.get_or_init(|| std::env::var_os("VUICK_DIAG").is_some())
 }
 
 /// 滚动速度分带（F3「滚动即清晰」三速状态机）：把原 `prev_fast: bool` 升级为四态枚举。

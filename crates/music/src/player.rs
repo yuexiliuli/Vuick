@@ -187,7 +187,7 @@ impl MusicPlayer {
 
     /// 读用户偏好：music 自身测试构建（`cargo test -p music`）下 `config` 是依赖编译、
     /// 不受其自身 `cfg!(test)` 门控 → 这里按本 crate 测试态屏蔽，防读真实
-    /// `%APPDATA%\gpui-editor\config.json` 污染测试（K8）。
+    /// `%APPDATA%\vuick\config.json` 污染测试（K8）。
     #[cfg(test)]
     fn prefs() -> config::user::UserPrefs {
         config::user::UserPrefs::default()

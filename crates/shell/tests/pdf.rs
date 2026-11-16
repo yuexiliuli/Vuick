@@ -3,7 +3,7 @@
 //! PDF 背景色次级菜单、右键点击后移动不误拖选回归。
 //! 四份断言内部与 lib 单测相应 `.rs` 逐字一致（P1 测试域化）；`pdf_bookmarks::{load,
 //! normalize_key}` 经 `common::pdf_bookmarks` 别名、`SidebarView` 经 `shell::app`、
-//! `PdfBgPref` 显式引入；`common::init_test` 注入 `GPUI_EDITOR_TEST`。
+//! `PdfBgPref` 显式引入；`common::init_test` 注入 `VUICK_TEST`。
 //! ⚠ 已知环境失败指纹（K56）：`pdf::test_util::lock()` 锁毒化级联（根毒源 panic 后连锁
 //! PoisonError），逐条单跑全绿——遇之当预存、勿复现勿当回归。
 
@@ -473,7 +473,7 @@ use config::user::PdfBgPref;
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-reader-{}",
+            "vuick-app-reader-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -997,7 +997,7 @@ fn missing_pdf() -> bool {
 
 /// 夹具副本（每用例唯一 tag）：测试隔离，不污染共享 `target/pdf测试.pdf`。
 fn temp_pdf_copy(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+    let dir = std::env::temp_dir().join("vuick-pdf-tests");
     let _ = std::fs::create_dir_all(&dir);
     let p = dir.join(format!("{tag}-{}.pdf", std::process::id()));
     let _ = std::fs::remove_file(&p);
@@ -1474,7 +1474,7 @@ async fn b2_extract_creates_single_page_and_delete_disabled(cx: &mut TestAppCont
 
     // 提取第 1 页到独立文件（生产路径经 cfg(not(test)) 走另存为对话框；测试直接驱动 API）
     let out = std::env::temp_dir()
-        .join("gpui-editor-pdf-tests")
+        .join("vuick-pdf-tests")
         .join(format!("b2out-{}.pdf", std::process::id()));
     let _ = std::fs::remove_file(&out);
     cx.update(|_w, cx| {

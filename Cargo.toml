@@ -1,9 +1,8 @@
 [package]
-name = "gpui-editor"
+name = "vuick"
 version = "0.1.0"
 license = "Apache-2.0"
 description = "基于 GPUI 的文本 / 代码 / Markdown 编辑器"
-# 2024：随 zorite 移植的 WYSIWYG 编辑器（src/markdown/live）使用 edition-2024 的 let-chain。
 edition = "2024"
 
 [dependencies]

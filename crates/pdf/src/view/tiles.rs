@@ -101,7 +101,7 @@ impl PdfViewer {
         false
     }
 
-    /// 渲染驻留内存水位（计时日志，`GPUI_EDITOR_PDF_TIMING=1` 时每 ~30 帧打一行）：
+    /// 渲染驻留内存水位（计时日志，`VUICK_PDF_TIMING=1` 时每 ~30 帧打一行）：
     /// 瓦片字节 + 封面（整页位图，按当前密度估算字节）+ 中清/缩略计数，便于实时看
     /// “内存到底是谁占的”（瓦片 vs 封面 vs 中清 vs pdfium 内部未计入部分）。
     pub(super) fn log_memory_waterline(&self, scale_factor: f32) {

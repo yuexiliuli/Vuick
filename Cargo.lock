@@ -1807,22 +1807,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-editor"
-version = "0.1.0"
-dependencies = [
- "base",
- "config",
- "gpui",
- "gpui_platform",
- "music",
- "shell",
- "syntax",
- "tray",
- "ui",
- "video",
-]
-
-[[package]]
 name = "gpui_macros"
 version = "0.1.0"
 dependencies = [
@@ -5209,6 +5193,22 @@ checksum = "fb067e4cbd1ff067d1df46c9194b5de0e98efd2810bbc95c5d5e5f25a3231150"
 dependencies = [
  "cc",
  "libc",
+]
+
+[[package]]
+name = "vuick"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "config",
+ "gpui",
+ "gpui_platform",
+ "music",
+ "shell",
+ "syntax",
+ "tray",
+ "ui",
+ "video",
 ]
 
 [[package]]

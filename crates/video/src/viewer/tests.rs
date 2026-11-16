@@ -58,7 +58,7 @@
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
-            // 最近一次 seek 命令的诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 tick
+            // 最近一次 seek 命令的诊断会话号（`VUICK_VIDEO_SEEK_DIAG=1` 时 tick
             // 据此匹配共享槽并聚合打印；普通运行恒 0/新值）。
             diag_session: 0,
             decode_cmd: None,

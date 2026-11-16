@@ -49,7 +49,7 @@ impl Root {
     }
 
     fn on_action_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
-        // 真机诊断（GPUI_EDITOR_TAB_DIAG=1）：Root 的 Tab 抢到事件（=焦点不在编辑区
+        // 真机诊断（VUICK_TAB_DIAG=1）：Root 的 Tab 抢到事件（=焦点不在编辑区
         // Input / WY wy-editor 上下文）→ focus_next 触发（H1 判别行）。
         base::tab_diag::diag("root-focus_next", || "fired".into());
         window.focus_next(cx);
@@ -63,7 +63,7 @@ impl Root {
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 启动首帧墙钟：首次 render 时补记 firstframe 段并打印 [STARTUP] 汇总
-        // （GPUI_EDITOR_STARTUP_DIAG=1 门控；未开启单次 var_os 检查即返回）。
+        // （VUICK_STARTUP_DIAG=1 门控；未开启单次 var_os 检查即返回）。
         base::startup::summarize();
         let theme = Theme::global(cx);
         // 与原组件库 Root 一致：以正文缺省字号为 rem 基准（本项目视图全走 px，供保险）。

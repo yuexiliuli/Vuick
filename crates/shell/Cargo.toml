@@ -3,7 +3,7 @@ name = "shell"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 应用外壳 crate（EditorApp 主视图 + 自绘滚动条 + 本地键位组合）"
+description = "vuick 应用外壳 crate（EditorApp 主视图 + 自绘滚动条 + 本地键位组合）"
 
 [dependencies]
 gpui = { workspace = true }
@@ -97,5 +97,5 @@ gpui = { workspace = true, features = ["test-support"] }
 # K8 根因：config 作依赖编译不带自身 cfg(test) → 其 load() 在 shell 测试里直读真实
 # %APPDATA% 配置。此处 dev 下显式打开 test-mode，让 config_path()/session_dir()/load()/save()
 # 全部落在隔离临时目录，杜绝真实配置/会话泄漏进测试（dev-dep 仅测试构建启用，不影响
-# `cargo build --bin gpui-editor` 的生产路径）。
+# `cargo build --bin vuick` 的生产路径）。
 config = { path = "../config", features = ["test-mode"] }

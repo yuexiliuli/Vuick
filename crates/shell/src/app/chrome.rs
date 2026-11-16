@@ -262,7 +262,7 @@ impl EditorApp {
     /// 侧栏宽度只在用户手动拖过（`width_auto == false`）时才持久化，
     /// 否则下次启动仍保持随内容自适应。
     /// **测试构建不写盘**（config crate 是依赖编译、不受其自身 `cfg!(test)` 门控，
-    /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
+    /// 若这里写盘会污染真实 `%APPDATA%\vuick\config.json`，见 K8）。
     /// 逻辑在 [`AppModel::persist_prefs`]；此处 glue。
     pub(super) fn persist_prefs(&self) {
         let host: &dyn AppHost = self;

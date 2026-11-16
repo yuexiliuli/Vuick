@@ -21,7 +21,7 @@ switch ($Mode) {
   # $env:CARGO_TARGET_DIR，防同一 shell 会话切 run 后 build 误入 target\testmode。
   'run'   {
     Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
-    & cargo build --bin gpui-editor @cargoArgsOnly
+    & cargo build --bin vuick @cargoArgsOnly
   }
   'test'  {
     $env:CARGO_TARGET_DIR = $targetTestDir
