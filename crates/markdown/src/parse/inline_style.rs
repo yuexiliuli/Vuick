@@ -419,18 +419,41 @@ pub fn inline_image_spans(line: &str) -> Vec<(Range<usize>, Range<usize>)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 1 < b.len() {
-        if b[i] == b'!'
-            && b[i + 1] == b'['
-            && let Some(rb) = line[i + 2..].find(']')
-            && line[i + 2 + rb + 1..].starts_with('(')
-            && let Some(rp) = line[i + 2 + rb + 2..].find(')')
-        {
-            let src = (i + 2 + rb + 2)..(i + 2 + rb + 2 + rp);
-            out.push((i..(src.end + 1), src.clone()));
-            i = src.end + 1;
-        } else {
-            i += 1;
+        if b[i] == b'!' && b[i + 1] == b'[' {
+            // alt 结束：第一个**未被反斜杠转义**的 `]`（`\]` 是字面 `]`，对应保存侧
+            // `apply_inline_image_edit` 对 alt 内 `]` 的转义 → 不误切 alt，P1-8）。
+            let mut rb = None;
+            let mut k = i + 2;
+            while k < b.len() {
+                if b[k] == b']' && !is_backslash_escaped(b, k) {
+                    rb = Some(k - i - 2);
+                    break;
+                }
+                k += 1;
+            }
+            if let Some(rb) = rb
+                && b.get(i + 2 + rb + 1) == Some(&b'(')
+            {
+                // src 结束：第一个**未被转义**的 `)`（`\)` 是字面 `)`，对应保存侧对
+                // src 内 `(`/`)` 的 `\(`/`\)` 转义 → 不把 `a(b)` 截断成 `a(b`，P1-8）。
+                let mut rp = None;
+                let mut k = i + 2 + rb + 2;
+                while k < b.len() {
+                    if b[k] == b')' && !is_backslash_escaped(b, k) {
+                        rp = Some(k - (i + 2 + rb + 2));
+                        break;
+                    }
+                    k += 1;
+                }
+                if let Some(rp) = rp {
+                    let src = (i + 2 + rb + 2)..(i + 2 + rb + 2 + rp);
+                    out.push((i..(src.end + 1), src.clone()));
+                    i = src.end + 1;
+                    continue;
+                }
+            }
         }
+        i += 1;
     }
     out
 }

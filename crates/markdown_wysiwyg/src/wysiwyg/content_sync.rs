@@ -106,6 +106,13 @@ impl WyEditor {
         if !need.iter().any(|(k, s)| k == &key && *s == src_line) {
             need.push((key, src_line));
         }
+        // 捕获请求时刻该块的**内容指纹**（`block_content_id`：kind+跨度+首末行文本）——
+        // 不随块下标/行号位移。`on_code_parse_ready` 完成回调按此钉作废整形缓存，替代
+        // 「当刻 `src_line → block`」反查：增量编辑行平移后旧 src_line 反查会作废同一
+        // 位置的无关块、漏作废真正的内容块（P1-7 编辑错位）。同块重复请求以最新一次
+        // 内容为准（覆盖钉即可）。
+        let cid = frame::block_content_id(&self.doc, self.doc.block_index_for_line(src_line));
+        self.code_parse_pins.borrow_mut().insert(src_line, cid);
     }
 
     /// 消费本帧登记的代码块后台解析请求（paint 期调用，对齐 `sync_math` 的可见带
@@ -169,25 +176,63 @@ impl WyEditor {
     /// 换高亮——带外完成只删缓存、不打断帧（对齐 `on_math_ready` 的带内门控，消除多块
     /// 并发完成时的重建 churn）。
     pub(crate) fn on_code_parse_ready(&mut self, src_lines: &[usize], cx: &mut Context<Self>) {
-        let block_indices: Vec<usize> = src_lines
-            .iter()
-            .map(|&s| self.doc.block_index_for_line(s))
-            .collect();
-        let ids: Vec<u64> = block_indices
-            .iter()
-            .map(|&b| frame::block_content_id(&self.doc, b))
-            .collect();
-        self.rd.borrow_mut().shape_rows.borrow_mut().invalidate_ids(&ids);
+        // 用「请求时刻捕获的块内容指纹」作废整形缓存，不用当刻 `src_line → block` 反查：
+        // 增量编辑行平移后旧 src_line 反查会作废同一位置的无关块、漏作废真正的内容块
+        // （P1-7 编辑错位）。指纹不随块下标/行号位移；块内容已变则旧指纹自然不匹配、
+        // 作废无害（新内容早已按新指纹另排）。未登记钉（测试直接模拟就绪 / 换源后
+        // 残留）回退当刻反查兜底——内容未变的块指纹等价，作废目标一致。
+        let mut used: Vec<(usize, u64)> = Vec::new();
+        let mut ids: Vec<u64> = Vec::new();
+        {
+            let pins = self.code_parse_pins.borrow();
+            for &s in src_lines {
+                match pins.get(&s) {
+                    Some(&cid) => {
+                        ids.push(cid);
+                        used.push((s, cid));
+                    }
+                    None => ids.push(frame::block_content_id(
+                        &self.doc,
+                        self.doc.block_index_for_line(s),
+                    )),
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        self.rd
+            .borrow_mut()
+            .shape_rows
+            .borrow_mut()
+            .invalidate_ids(&ids);
         let in_band = self
             .rd
             .borrow()
             .frame
             .borrow()
             .as_ref()
-            .is_some_and(|f| f.rows.iter().any(|r| src_lines.contains(&r.src_line)));
+            .is_some_and(|f| {
+                f.rows.iter().any(|r| {
+                    let cid = frame::block_content_id(
+                        &self.doc,
+                        self.doc.block_index_for_line(r.src_line),
+                    );
+                    ids.contains(&cid)
+                })
+            });
         if in_band {
             *self.rd.borrow_mut().frame.borrow_mut() = None;
             cx.notify();
+        }
+        // 消费钉（一次性）：仅当钉仍等于本次所用指纹才删（期间同 src_line 有新请求
+        // 覆盖为更新指纹 → 留给新任务的完成回调用）。
+        {
+            let mut pins = self.code_parse_pins.borrow_mut();
+            for (s, cid) in used {
+                if pins.get(&s) == Some(&cid) {
+                    pins.remove(&s);
+                }
+            }
         }
     }
     /// 对**当前带内可见**公式发起离屏排版——按「只渲染窗口可见区域」原则（对齐
@@ -261,12 +306,16 @@ impl WyEditor {
             }
         }
         for (key, is_inline, pad, latex, src_line) in sources {
-            // 行内公式登记「所在行」→ 完成时定向作废该行整形缓存（见 `inline_math_rows`）。
+            // 行内公式登记「所在行 + 块内容指纹」→ 完成时按指纹定向作废该行整形缓存
+            // （见 `inline_math_rows` 注释）。指纹在注册时刻捕获、随行平移稳定——
+            // `on_math_ready` 不再用当刻 `src_line → block` 反查（P1-7）。
             if is_inline {
                 let mut rows = self.inline_math_rows.borrow_mut();
                 let v = rows.entry(key.clone()).or_default();
-                if !v.contains(&src_line) {
-                    v.push(src_line);
+                if !v.iter().any(|(s, _)| *s == src_line) {
+                    let cid =
+                        frame::block_content_id(&self.doc, self.doc.block_index_for_line(src_line));
+                    v.push((src_line, cid));
                 }
                 drop(rows);
             }
@@ -391,28 +440,30 @@ impl WyEditor {
     /// 完成不再各自打断一帧（消除数学密集段的滚动/空转卡顿）。在带内才立即失效（本帧换真图）。
     pub(crate) fn on_math_ready(&mut self, key: &str, cx: &mut Context<Self>) {
         if key.starts_with("inline:") {
-            let mut lines: Vec<usize> = Vec::new();
+            // 用「claim 时捕获的块内容指纹」作废（P1-7，见 `inline_math_rows` 注释）——
+            // 不用当刻 `src_line → block` 反查：增量编辑行平移后旧 src_line 反查会作废
+            // 同一位置的无关块、漏作废真正含该公式的块。带内行再按其**内容**（键相等）
+            // 找到当前帧中仍含该公式的块补钉（行平移后注册时 src_line 已旧，但帧内行
+            // 按内容匹配帧行块指纹仍精确覆盖）。
+            let mut pinned: Vec<(usize, u64)> = Vec::new();
             if let Some(v) = self.inline_math_rows.borrow().get(key) {
-                lines.extend(v.iter().copied());
+                pinned.extend(v.iter().copied());
             }
             if let Some(f) = self.rd.borrow().frame.borrow().as_ref() {
                 for r in &f.rows {
                     if r.extra.inline_maths.iter().any(|m| m.key.as_ref() == key) {
-                        lines.push(r.src_line);
+                        let cid = frame::block_content_id(
+                            &self.doc,
+                            self.doc.block_index_for_line(r.src_line),
+                        );
+                        pinned.push((r.src_line, cid));
                     }
                 }
             }
-            if !lines.is_empty() {
-                lines.sort_unstable();
-                lines.dedup();
-                let blocks: Vec<usize> = lines
-                    .into_iter()
-                    .map(|s| self.doc.block_index_for_line(s))
-                    .collect();
-                let ids: Vec<u64> = blocks
-                    .iter()
-                    .map(|&b| frame::block_content_id(&self.doc, b))
-                    .collect();
+            if !pinned.is_empty() {
+                let mut ids: Vec<u64> = pinned.iter().map(|&(_, c)| c).collect();
+                ids.sort_unstable();
+                ids.dedup();
                 self.rd
                     .borrow_mut()
                     .shape_rows

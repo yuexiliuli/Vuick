@@ -56,6 +56,7 @@ impl WyEditor {
                 config::limits::CODE_PARSE_CACHE_CAP,
             ))),
             code_parse_need: RefCell::new(Vec::new()),
+            code_parse_pins: RefCell::new(std::collections::HashMap::new()),
             pending_math_drop: RefCell::new(Vec::new()),
             math_epoch: Cell::new(0),
             code_epoch: Cell::new(0),
@@ -483,6 +484,9 @@ impl WyEditor {
         self.code_parse.lock().unwrap().clear();
         self.code_epoch.set(self.code_epoch.get().wrapping_add(1));
         self.code_parse_need.borrow_mut().clear();
+        // 换源：代码块内容指纹钉随行号/内容整体作废（旧文档已完成/在途回调按旧钉作废
+        // 会落到新文档无关块上；未登记的 src_line 由 `on_code_parse_ready` 兜底反查）。
+        self.code_parse_pins.borrow_mut().clear();
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.rd.borrow_mut().block_layout.borrow_mut() = None;
         self.rd.borrow_mut().shape_rows.borrow_mut().clear();

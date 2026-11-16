@@ -106,7 +106,13 @@ impl WyEditor {
     /// 非独立图片行返回 `None`。
     fn image_line_alt_src(&self, src_line: usize) -> Option<(String, String)> {
         let raw = self.line_text(src_line);
-        crate::markdown::parse::parse_image_line(raw.trim())
+        let (alt, src) = crate::markdown::parse::parse_image_line(raw.trim())?;
+        // alt 经 `parse_image_line` 保持源码原样（含 `\]` 转义，供 byte_map 字节精确）——
+        // 卡片/预填要**字面值**（再保存不二次转义），故此处反解（P1-8）。
+        Some((
+            crate::markdown::parse::unescape_image_value(&alt),
+            src,
+        ))
     }
 
     /// 编辑卡目标的当前 `(alt, src)`：独立图片行反解整行 `![…](…)`；行内图解析该图
@@ -124,11 +130,16 @@ impl WyEditor {
                     crate::markdown::parse::inline_style::inline_image_spans(tail)
                         .into_iter()
                         .next()?;
-                // alt 在 `![` 与 `]` 之间。
-                let rb = tail.as_bytes()[2..].iter().position(|&b| b == b']')?;
-                let alt = tail[2..2 + rb].to_string();
-                let src = tail[srcr].to_string();
-                Some((alt, src))
+                // alt 在 `![` 与闭合 `]` 之间；闭合 `]` 在 src 起点前 2 字节（`](`）。
+                // alt 结束由 `inline_image_spans` 的**未转义**扫描决定（`\]` 是字面 `]`，
+                // 不会把 `a\]b` 误切成 `a\`，P1-8）。卡片/预填要字面值 → 反解转义。
+                let alt_end = srcr.start.saturating_sub(2);
+                let alt = &tail[2..alt_end.max(2)];
+                let src = &tail[srcr];
+                Some((
+                    crate::markdown::parse::unescape_image_value(alt),
+                    crate::markdown::parse::unescape_image_value(src),
+                ))
             }
         }
     }
@@ -382,7 +393,12 @@ impl WyEditor {
         // 用 `line_start` 归位同式）——这里把行内相对偏移落到**全局**字节（`refd.start`
         // 是行内偏移；仅第 0 行两者相等，非首行会删错字节，M6 回归测试锁过）。
         let ls = self.line_start(refd.src_line);
-        Some((ls + span.start..ls + span.end, tail[srcr].to_string()))
+        // old_src 反解字面值（`\(`/`\)`/`\]` → 字面）——空链接保留原 src 时若原样带
+        // 转义再保存会二次转义（P1-8）。
+        Some((
+            ls + span.start..ls + span.end,
+            crate::markdown::parse::unescape_image_value(&tail[srcr]),
+        ))
     }
 
     /// 删除选中的整段行内 `![…](…)`（保留行内其它文本，含换行归位；撤销栈统一）。

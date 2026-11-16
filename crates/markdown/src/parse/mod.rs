@@ -26,6 +26,8 @@ pub use rows::{
 };
 #[allow(unused_imports)] // 兼容重导出：ImgRef/parse_ref 走类型推断；split_table_cells 供 markdown::parity 测试消费
 pub use rows::{parse_image_line, parse_ref, split_table_cells_mapped, text_segment};
+/// 图片 alt/src 的保存侧转义反解（`\]`/`\(`/`\)`/`\\`）；跨 crate（wysiwyg/引擎）消费。
+pub use rows::unescape_image_value;
 #[allow(unused_imports)] // 兼容重导出：ImgRef/parse_ref 走类型推断、inline_style_mapped/split_table_cells 供 markdown 测试消费
 pub(crate) use rows::{ImgRef, inline_style_mapped, split_table_cells};
 #[allow(unused_imports)] // 兼容重导出：citation_index_from_rows 在 preview 迁移到 PreviewRow 后仅 parse 测试消费
