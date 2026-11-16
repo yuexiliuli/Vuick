@@ -152,6 +152,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
     /// `bounds_cell` = 每帧真实 laid-out 边界写入点（宿主 `tab_bounds` 槽位，排序命中用）。
     /// `host` = 宿主弱引用（回调反调宿主动作）。
     fn render_tab_bar_item(
+        tab_id: gpui::EntityId,
         name: &str,
         dirty: bool,
         path_hint: Option<String>,
@@ -168,15 +169,17 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
 
         // 元素级 hover 状态：跨帧记住「该 tab 是否被悬停」，关闭 × 因此在
         // 激活项恒定可见、非激活项悬停显现（VS Code 观感）。
+        // P2-① 唯一性：hover 键按稳定身份（编辑器实体 id）键控——关 tab/重排后实时下标
+        // 漂移，按下标键控会把上一 tab 的 hover 态错挂到新的 tab。
         let view_id = window.current_view();
-        let tab_hover = window.use_keyed_state(("tab", idx), cx, |_, _| false);
+        let tab_hover = window.use_keyed_state(("tab", tab_id), cx, |_, _| false);
         let hovered = *tab_hover.read(cx);
 
         // P2-9 鼠标跟随（2026-11-10）：记录下方路径 tooltip 的**窗口坐标锚点**（水平 = 鼠标
         // 窗口 x，垂直 = tab 底缘 y）。锚点在 `on_mouse_move`（事件期）算——此刻 `bounds_cell`
         // 才持有上一帧 laid-out 边界；render 期 `render_tab_bar` 每帧重建 cell（宽恒 0）不可用。
-        // key 与既有 ("tab", idx) hover 态区分，互不冲突。
-        let tab_mx = window.use_keyed_state(("tab-mx", idx), cx, |_, _| None::<gpui::Point<Pixels>>);
+        // key 与既有 ("tab", tab_id) hover 态区分，互不冲突。
+        let tab_mx = window.use_keyed_state(("tab-mx", tab_id), cx, |_, _| None::<gpui::Point<Pixels>>);
         let anchor = *tab_mx.read(cx);
 
         // P2-9 tooltip（2026-11-10 由状态栏文件名迁移）：每个 tab 独立 id 键控；悬停
@@ -184,7 +187,11 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         let path_hint = path_hint.unwrap_or_default();
         let has_path = !path_hint.is_empty();
         let tip_id = format!("tab-tip-{idx}");
-        let tip = ui::tooltip::tooltip_state(&tip_id, window, cx);
+        // P2-① 唯一性：tooltip **状态**按稳定身份键控（`tab-tip-{entity_id}`），浮层
+        // id（`tip_id`）仍按下标，供 `debug_bounds("tooltip-tab-tip-N")` 测试定位——
+        // 关 tab/重排后状态跟随 tab 实体、不错挂到别的 tab。
+        let tip_state_id = format!("tab-tip-{}", tab_id);
+        let tip = ui::tooltip::tooltip_state(&tip_state_id, window, cx);
         let tip_on = ui::tooltip::tooltip_visible(&tip, cx);
 
         // 浮层锚在 tab 下方、水平中心随鼠标 x 移动（`tooltip_layer_placed` Window 定位，锚=
@@ -253,7 +260,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
             )
             // P2-10：仅视觉的 × 悬停显现淡入（激活项恒定、非激活项随行 hover）。
             .with_spring(
-                format!("tab-close-op-{idx}"),
+                format!("tab-close-op-{tab_id}"),
                 hover_spring(if is_active || hovered { 1.0 } else { 0.0 }),
                 move |this, v| this.opacity(v),
             );
@@ -440,7 +447,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         };
         let el: gpui::AnyElement = el
             .with_spring(
-                format!("tab-bg-{idx}"),
+                format!("tab-bg-{tab_id}"),
                 hover_spring(if is_active || hovered { 1.0 } else { 0.0 }),
                 move |this, v| this.bg(card.opacity(v)),
             )
@@ -588,15 +595,18 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         } else {
             None
         };
-        // 借用约束：先一次 borrow 快照每个选项卡渲染所需的廉价字段（显示名 +
+        // 借用约束：先一次 borrow 快照每个选项卡渲染所需的廉价字段（稳定身份 + 显示名 +
         // 脏标记 + 完整路径），guard 随即释放——构造期不再持 `tabs` 长借用。
-        // `render_tab_bar_item` 只消费这三项派生数据，改动零渲染差异（未命名路径为 None）。
-        let tab_meta: Vec<(String, bool, Option<String>)> = {
+        // `render_tab_bar_item` 只消费这些派生数据，改动零渲染差异（未命名路径为 None）。
+        // P2-① 唯一性：身份 = 编辑器实体 id（每 tab 独立实体、跨窗口搬迁保留），供
+        // hover/tooltip 状态按稳定身份键控（关/重排后下标漂移）。
+        let tab_meta: Vec<(gpui::EntityId, String, bool, Option<String>)> = {
             let model = self.model.borrow();
             model
                 .tabs
                 .iter()
                 .map(|t| {
+                    let tab_id = t.payload.editor.entity_id();
                     let name = t.payload
                         .file_path
                         .as_ref()
@@ -607,20 +617,21 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                         .file_path
                         .as_ref()
                         .map(|p| p.to_string_lossy().into_owned());
-                    (name, t.payload.dirty, path_hint)
+                    (tab_id, name, t.payload.dirty, path_hint)
                 })
                 .collect()
         };
         let tabs_len = tab_meta.len();
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
         let host = self.host_weak();
-        for (i, (name, dirty, path_hint)) in tab_meta.into_iter().enumerate() {
+        for (i, (tab_id, name, dirty, path_hint)) in tab_meta.into_iter().enumerate() {
             let line = match reorder_target {
                 Some(t) if i == t => Some(ReorderSide::Left),
                 Some(t) if t == tabs_len && i + 1 == tabs_len => Some(ReorderSide::Right),
                 _ => None,
             };
             tabs.push(Self::render_tab_bar_item(
+                tab_id,
                 &name,
                 dirty,
                 path_hint,

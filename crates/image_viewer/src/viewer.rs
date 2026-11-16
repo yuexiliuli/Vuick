@@ -2861,6 +2861,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P2-① 唯一性：缩放真实生效后 `scroll_accum` 残留清零（切滚轮语义，防放大态残留
+    /// 立即误触发一次平移/切图）；缩放未生效（已钳满，`apply_zoom` 拒绝）时不动。
+    #[gpui::test]
+    async fn adjust_zoom_clears_scroll_accum_residue(cx: &mut TestAppContext) {
+        let dir = tmp_dir("zoom_accum");
+        // 图片无需真实存在（display_denom==1 时 escalate 早退，不派解码）。
+        let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
+                v.intrinsic = Some((200.0, 100.0));
+                v.last_viewport = (800.0, 600.0);
+                v.scroll_accum = 12.5; // 残留亚步长
+                v.zoom = ZOOM_MAX; // 已钳满：再放大不生效 → 不应清零
+                v
+            })
+        });
+        // zoom 已满 → apply_zoom 拒绝 → 残留保留。
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.adjust_zoom(pan_zoom::zoom_factor(1.0, ZOOM_STEP), cx);
+            })
+        });
+        assert_eq!(
+            cx.update(|app| viewer.read(app).scroll_accum),
+            12.5,
+            "缩放未生效（已钳满）不应清零残留"
+        );
+        // 缩一档真实生效 → 清零。
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.adjust_zoom(pan_zoom::zoom_factor(-1.0, ZOOM_STEP), cx);
+            })
+        });
+        assert_eq!(
+            cx.update(|app| viewer.read(app).scroll_accum),
+            0.0,
+            "缩放真实生效后 scroll_accum 残留应清零"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 放大态滚轮语义：先在图片内纵向平移，滚到边缘且继续同向外滚才切下一张；切图时
     /// 缩放复位为适应视口（1.0）、平移归零。（直接构造状态，绕过真实解码/布局。）
     #[gpui::test]
@@ -3921,8 +3962,8 @@ mod tests {
             backs.last().copied().unwrap_or(0.0)
         );
         if generated {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     }
 
     /// R2 快滚节流闸 · 确定性单测：快速模式下解码并发必须收敛到

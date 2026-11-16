@@ -321,3 +321,67 @@ fn scale_layout_zooms_flow_geometries() {
         _ => panic!("应为 Flow"),
     }
 }
+
+/// `scale_mm_layout`：NaN / ±Inf / ≤0 的 zoom 必须原样返回（不把坐标污染成 NaN/Inf）。
+#[test]
+fn scale_layout_ignores_non_finite_or_nonpositive_zoom() {
+    let flow = MmFlowLayout {
+        placed: vec![MmPlaced {
+            id: "A".into(), label: "A".into(), shape: MmShape::Rect,
+            x: 100., y: 20., w: 40., h: 30., fill: None, stroke: None, stroke_width: None, accent_idx: None, virtual_node: false,
+        }],
+        edges: vec![MmPolylineEdge {
+            a: 0, b: 0, kind: MmEdgeKind::Arrow,
+            points: vec![(0., 0.), (10., 10.)], smoothed: None, arrow_dir: (0., 1.), label: Some((5., 2.)), label_text: Some("x".into()),
+        }],
+        subgraphs: vec![MmSubgraphBox { title: "g".into(), x: 80., y: 10., w: 80., h: 60. }],
+        content_w: 0., content_h: 0., zoom: 1.,
+    };
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -2.0] {
+        let mut layout = MmLayout::Flow(MmFlowLayout {
+            placed: vec![MmPlaced {
+                id: "A".into(), label: "A".into(), shape: MmShape::Rect,
+                x: 100., y: 20., w: 40., h: 30., fill: None, stroke: None, stroke_width: None, accent_idx: None, virtual_node: false,
+            }],
+            edges: vec![MmPolylineEdge {
+                a: 0, b: 0, kind: MmEdgeKind::Arrow,
+                points: vec![(0., 0.), (10., 10.)], smoothed: None, arrow_dir: (0., 1.), label: Some((5., 2.)), label_text: Some("x".into()),
+            }],
+            subgraphs: vec![MmSubgraphBox { title: "g".into(), x: 80., y: 10., w: 80., h: 60. }],
+            content_w: 0., content_h: 0., zoom: 1.,
+        });
+        scale_mm_layout(&mut layout, bad, 200.);
+        match &layout {
+            MmLayout::Flow(f) => {
+                assert_eq!(f.zoom, 1.0, "非法 zoom {bad:?} 不应改 zoom");
+                assert_eq!(f.placed[0].x, 100.);
+                assert_eq!(f.placed[0].y, 20.);
+                assert_eq!(f.placed[0].w, 40.);
+                assert_eq!(f.placed[0].h, 30.);
+                assert!(
+                    f.edges[0].points.iter().all(|p| p.0.is_finite() && p.1.is_finite()),
+                    "坐标不得被污染成 NaN/Inf（zoom={bad:?}）"
+                );
+            }
+            _ => panic!("应为 Flow"),
+        }
+    }
+    // 对照：合法 zoom=1（恒等）也不改坐标。
+    let mut ident = layout_flow_clone(&flow);
+    scale_mm_layout(&mut ident, 1.0, 200.);
+    if let MmLayout::Flow(f) = &ident {
+        assert_eq!(f.placed[0].x, 100.);
+        assert_eq!(f.placed[0].y, 20.);
+    }
+}
+
+fn layout_flow_clone(flow: &MmFlowLayout) -> MmLayout {
+    MmLayout::Flow(MmFlowLayout {
+        placed: flow.placed.clone(),
+        edges: flow.edges.clone(),
+        subgraphs: flow.subgraphs.clone(),
+        content_w: flow.content_w,
+        content_h: flow.content_h,
+        zoom: flow.zoom,
+    })
+}

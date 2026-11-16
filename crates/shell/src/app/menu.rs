@@ -508,9 +508,12 @@ impl EditorApp {
             "",
             weak,
             |this, _window, cx| {
-                this.model.borrow_mut().status = SharedString::from(
-                    "已剪贴板生效：文件更改已复制到剪贴板",
-                );
+                // P2-① 唯一性：修正错位文案（原为「剪贴板生效」的复制提示）——关于 =
+                // 应用名 + 版本。
+                this.model.borrow_mut().status = SharedString::from(format!(
+                    "Vuick {}：基于 GPUI 的文本 / 代码 / Markdown 编辑器",
+                    env!("CARGO_PKG_VERSION")
+                ));
                 this.model.borrow_mut().status_ok = true;
                 cx.notify();
             },

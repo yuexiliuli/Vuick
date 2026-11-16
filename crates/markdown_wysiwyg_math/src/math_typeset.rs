@@ -37,23 +37,32 @@ pub fn render_latex_with_pad(
         (c.g * 255.0).round() as u8,
         (c.b * 255.0).round() as u8,
     ];
-    let (bgra, w, h) = rasterize(latex, font_size, dpr, rgb, padding)?;
+    // P2-① 唯一性：保留 Hsla 自带的 alpha（不再丢弃）；不透明色（alpha=1）字节恒等。
+    let (bgra, w, h) = rasterize(latex, font_size, dpr, rgb, padding, c.a)?;
     let buf = RgbaImage::from_raw(w, h, bgra)?;
     Some(Rendered {
         image: Arc::new(RenderImage::new(vec![Frame::new(buf)])),
+        // dpr 已由 rasterize 防御（≤0/NaN/Inf → None），此处除零/NaN 不可达。
         width: w as f32 / dpr,
         height: h as f32 / dpr,
     })
 }
 
 /// 与 gpui 无关的一半：LaTeX → BGRA 像素 + 像素尺寸。拆开以便无 gpui 上下文单测。
+/// `alpha` ∈ [0,1]：字形透明度（= 颜色 alpha；1 = 不透明，与旧行为字节恒等）。
 fn rasterize(
     latex: &str,
     font_size: f32,
     dpr: f32,
     rgb: [u8; 3],
     padding: f32,
+    alpha: f32,
 ) -> Option<(Vec<u8>, u32, u32)> {
+    // P2-① 唯一性：dpr ≤0 / NaN / ±Inf 直接失败（`device_pixel_ratio` 与像素换算不可用），
+    // 防除零/NaN 尺寸污染下游布局。
+    if !dpr.is_finite() || dpr <= 0.0 {
+        return None;
+    }
     let nodes = parse(latex).ok()?;
     let lbox = layout(&nodes, &LayoutOptions::default());
     let dl = to_display_list(&lbox);
@@ -76,7 +85,8 @@ fn rasterize(
         px[0] = b;
         px[1] = g;
         px[2] = r;
-        px[3] = a;
+        // P2-① 唯一性：字形 alpha 乘颜色 alpha（透明主题色生效；alpha=1 时恒等）。
+        px[3] = ((a as f32) * alpha).round() as u8;
     }
     Some((bytes, w, h))
 }
@@ -90,7 +100,7 @@ mod tests {
     fn rasterizes_to_nonempty_bgra() {
         // 与 zorite `ratex-gpui::render::rasterizes_to_nonempty_bgra` 同款：
         // 纯 CPU 光栅，无需 GPU/窗口，测试环境可直接跑。
-        let (bytes, w, h) = rasterize(r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}", 22.0, 2.0, [0, 0, 0], PAD)
+        let (bytes, w, h) = rasterize(r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}", 22.0, 2.0, [0, 0, 0], PAD, 1.0)
             .expect("renders integral");
         assert!(w > 0 && h > 0, "non-empty dims, got {w}x{h}");
         assert_eq!(bytes.len(), w as usize * h as usize * 4, "BGRA buffer matches dims");
@@ -104,8 +114,8 @@ mod tests {
         // 行内小 PAD 是真收益：`x^2` 在 PAD=8（≈22px 排 16px 边距）下高 ~35px，
         // 收紧到 INLINE_PAD=1.5 后 ≈24px 逻辑高 —— 正文 16px 字号缩放后贴住行高，
         // 不再把行撑高；超高算子（`\int`）另由 textstyle + 高度上限压制。
-        let (_, _, h_big) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], PAD).unwrap();
-        let (_, _, h_tight) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+        let (_, _, h_big) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], PAD, 1.0).unwrap();
+        let (_, _, h_tight) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD, 1.0).unwrap();
         assert!(
             h_tight < h_big,
             "行内小 PAD 应显著降高：{h_tight} < {h_big}"
@@ -121,13 +131,14 @@ mod tests {
         // 正解 = 行内用 `\textstyle …` 排版：`\int` 极限转上下标、算子变小（h 58→34），
         // `x^2 dx` 等正文字体原样（宽 126→118 只是算子收紧，非整体缩）。
         let (_, w_plain, h_plain) =
-            rasterize(r"\int_0^1 x^2 dx = \tfrac{1}{3}", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+            rasterize(r"\int_0^1 x^2 dx = \tfrac{1}{3}", 22.0, 2.0, [0, 0, 0], INLINE_PAD, 1.0).unwrap();
         let (_, w_ts, h_ts) = rasterize(
             r"\textstyle \int_0^1 x^2 dx = \tfrac{1}{3}",
             22.0,
             2.0,
             [0, 0, 0],
             INLINE_PAD,
+            1.0,
         )
         .unwrap();
         assert!(
@@ -140,9 +151,9 @@ mod tests {
             "宽度不应大幅缩小（那才是整图缩放）：{w_plain} → {w_ts}"
         );
         // 无算子公式包 textstyle 高度几乎不变（小公式不被改；±3 逻辑 px 容差内）。
-        let (_, _, h_x) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+        let (_, _, h_x) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD, 1.0).unwrap();
         let (_, _, h_tsx) =
-            rasterize(r"\textstyle x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+            rasterize(r"\textstyle x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD, 1.0).unwrap();
         assert!(
             (h_tsx as i32 - h_x as i32).abs() <= 6,
             "`x^2` 包 textstyle 高度应基本不变：{h_x} → {h_tsx}"
@@ -151,14 +162,48 @@ mod tests {
 
     #[test]
     fn dpr_scales_pixels() {
-        let (_, w1, _) = rasterize("x", 22.0, 1.0, [0, 0, 0], INLINE_PAD).unwrap();
-        let (_, w2, _) = rasterize("x", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+        let (_, w1, _) = rasterize("x", 22.0, 1.0, [0, 0, 0], INLINE_PAD, 1.0).unwrap();
+        let (_, w2, _) = rasterize("x", 22.0, 2.0, [0, 0, 0], INLINE_PAD, 1.0).unwrap();
         assert!(w2 > w1, "2x DPR yields more pixels ({w2} vs {w1})");
+    }
+
+    #[test]
+    fn zero_or_non_finite_dpr_returns_none() {
+        // P2-① 唯一性：dpr ≤0 / NaN / ±Inf 必须快速失败（防除零 / NaN 尺寸污染下游布局）。
+        assert!(rasterize("x", 22.0, 0.0, [0, 0, 0], INLINE_PAD, 1.0).is_none());
+        assert!(rasterize("x", 22.0, -1.0, [0, 0, 0], INLINE_PAD, 1.0).is_none());
+        assert!(rasterize("x", 22.0, f32::NAN, [0, 0, 0], INLINE_PAD, 1.0).is_none());
+        assert!(rasterize("x", 22.0, f32::INFINITY, [0, 0, 0], INLINE_PAD, 1.0).is_none());
+        assert!(rasterize("x", 22.0, f32::NEG_INFINITY, [0, 0, 0], INLINE_PAD, 1.0).is_none());
+    }
+
+    #[test]
+    fn alpha_scales_glyph_opacity_preserving_opaque() {
+        // P2-① 唯一性：颜色 alpha 保留到字形透明度；alpha=1 与旧行为字节恒等。
+        let (full, _, _) = rasterize("x", 22.0, 2.0, [0, 0, 0], INLINE_PAD, 1.0).unwrap();
+        let (half, _, _) = rasterize("x", 22.0, 2.0, [0, 0, 0], INLINE_PAD, 0.5).unwrap();
+        assert_eq!(full.len(), half.len(), "两遍光栅同尺寸");
+        let fp = full.as_chunks::<4>().0;
+        let hp = half.as_chunks::<4>().0;
+        assert!(fp.iter().any(|px| px[3] > 0), "应有字形像素");
+        for (f, h) in fp.iter().zip(hp.iter()) {
+            if f[3] == 0 {
+                assert_eq!(h[3], 0, "透明像素保持透明");
+            } else {
+                let expect = (f[3] as f32 * 0.5).round() as i32;
+                assert!(
+                    (h[3] as i32 - expect).abs() <= 1,
+                    "alpha 应减半（±1 舍入）：{} → {}（期望 ≈ {expect}）",
+                    f[3],
+                    h[3]
+                );
+            }
+        }
     }
 
     #[test]
     fn failed_latex_is_none() {
         // `\frac` 缺分母 → 布局失败，返回 None（调用方回退 Unicode 排版）。
-        assert!(rasterize(r"\frac{1}", 22.0, 2.0, [0, 0, 0], INLINE_PAD).is_none());
+        assert!(rasterize(r"\frac{1}", 22.0, 2.0, [0, 0, 0], INLINE_PAD, 1.0).is_none());
     }
 }
