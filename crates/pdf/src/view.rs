@@ -1791,6 +1791,44 @@ mod tests {
         v
     }
 
+    /// P1-16：`clear_stale_pending` 清掉「世代 < 当前 nav_gen」的在途条目时，必须一并复位
+    /// 对应页槽的 `mid_loading`/`thumb_loading` 标志（对齐 `invalidate_page_bitmaps_for_r8_flip`
+    /// 的复位姿势）——否则大跳后该页占位链永久失能（结果永不回、标志永不复位，页卡永远停
+    /// 「加载中」；对照清世代的 `pending_mid`/`pending_thumb` 只保证预算释放，不修槽标志）。
+    #[gpui::test]
+    async fn clear_stale_pending_resets_mid_and_thumb_loading_flags(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        let v: gpui::Entity<PdfViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = multi_page_viewer(cx, 4);
+                // 模拟大跳后：nav_gen 已推进到 5，页 1/2 持有世代 3（旧）的在途中清/缩略请求
+                v.nav_gen = 5;
+                let (_tx_mid, rx_mid) = mpsc::channel::<Option<RenderResult>>();
+                v.slots[1].mid_loading = true;
+                v.pending_mid.insert(1, (3, rx_mid));
+                let (_tx_thumb, rx_thumb) = mpsc::channel::<Option<RenderResult>>();
+                v.slots[2].thumb_loading = true;
+                v.pending_thumb.insert(2, (3, rx_thumb));
+                v
+            })
+        });
+        cx.update(|app| {
+            v.update(app, |v, _cx| {
+                v.clear_stale_pending();
+                // 旧世代在途条目按世代被清（既有语义）
+                assert!(
+                    !v.pending_mid.contains_key(&1) && !v.pending_thumb.contains_key(&2),
+                    "旧世代在途条目应按世代被清"
+                );
+                // P1-16：被清条目对应的槽 loading 标志必须复位（大跳后占位链不永久失能）
+                assert!(
+                    !v.slots[1].mid_loading && !v.slots[2].thumb_loading,
+                    "被清条目对应槽的 loading 标志应复位"
+                );
+            });
+        });
+    }
+
     /// L1.3 **停稳快进（纯状态机）**：连续 K=3 帧 |Δy|<[`STOP_DETECT_PX`] → 速度直落 Slow
     /// （绕过 0.7ⁿ EMA 衰减）；单帧小位移 / 中途 ≥2px 位移帧清零计数不误触；非快速态（Slow/
     /// Idle）直落无副作用（保持原档）。

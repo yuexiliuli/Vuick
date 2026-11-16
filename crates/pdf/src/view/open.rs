@@ -336,6 +336,12 @@ impl PdfViewer {
         &self.path
     }
 
+    /// 重命名同步：文件被外部改名后更新阅读器内部路径（标题 / 保存写回目标随之正确）。
+    /// 文件内容未变，`worker`/`doc_id` 保持有效，无需重载。
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
     /// 当前第一张可见页（1 基）与总页数（状态栏滚动位置显示用）。
     /// 仅派生自既有滚动状态（`scroll` 偏移 + 页列布局 [`first_visible_page`]），不新增
     /// 状态；文档未加载完成（`dims` 为空）时返回 `None`。与 EPUB 页码口径一致：
@@ -1310,8 +1316,10 @@ impl PdfViewer {
     }
 
     /// 另存为：把**当前内容**（内存工作副本 + 待存注释合并）写到 `new_path`，成功后当前
-    /// 阅读器重指新路径并清 dirty（原文件保持原样）。失败记 [`Self::last_modify_error`]，
-    /// 当前文档/待存状态不变。异步 fire-and-forget（壳层「另存为」对话框后调用）。
+    /// 阅读器重指新路径并清 dirty（原文件保持原样）；有注释待存时顺带把 live 文档重载为
+    /// 「含已写注释」的新文件副本（对齐 save 路径，防叠加层清掉后高亮从视图消失，P1-18）。
+    /// 失败记 [`Self::last_modify_error`]，当前文档/待存状态不变。异步 fire-and-forget
+    /// （壳层「另存为」对话框后调用）。
     pub fn save_as(&mut self, new_path: PathBuf, cx: &mut Context<Self>) {
         let Some(worker) = self.worker.clone() else {
             self.last_modify_error = Some("文档尚未加载".into());
@@ -1335,14 +1343,19 @@ impl PdfViewer {
                 .background_executor()
                 .spawn(async move {
                     if has_annots {
-                        worker.annotate(doc_id, items, new_path.clone()).map(|_| ())
+                        // 注释合并写盘成功后，顺带读回已写文件 bytes 供 live 文档重载——
+                        // 否则另存后叠加层清掉、基础文档并不含注释，高亮会在视图中消失
+                        // 直到重开（对齐 save 路径的 read-back + open_from_bytes，P1-18）。
+                        worker
+                            .annotate(doc_id, items, new_path.clone())
+                            .map(|_| std::fs::read(&new_path).ok())
                     } else {
-                        worker.save(doc_id, new_path.clone())
+                        worker.save(doc_id, new_path.clone()).map(|_| None)
                     }
                 })
                 .await;
             let _ = this.update(cx, move |v, cx| match res {
-                Ok(_) => {
+                Ok(annotated_bytes) => {
                     v.last_modify_error = None;
                     v.path = new_path_set;
                     // 另存后：内容已（合并待存/含页操作后）写入新路径 → 一律清待存
@@ -1352,6 +1365,12 @@ impl PdfViewer {
                     v.pending_page_ops = 0;
                     v.focused_annot = None;
                     v.sel_card = None;
+                    // 有注释待存 → live 文档重载为「含已写注释」的新文件并保持当前页，
+                    // 叠加层清空后注释仍在基础文档里上图（对齐 save 路径语义）。
+                    if let Some(bytes) = annotated_bytes {
+                        let anchor = v.current_page().map(|(pg, _)| pg.saturating_sub(1));
+                        v.open_from_bytes(bytes, anchor, cx);
+                    }
                     cx.notify();
                 }
                 Err(e) => {
@@ -1482,9 +1501,31 @@ impl PdfViewer {
     /// 读回某一页已**写盘**的注释（类型 + quad 几何）。需要已加载文档；走 worker 读回。
     /// 待保存模型下只反映 save() 之后落盘的内容；待存注释以 [`Self::pending_annots`]
     /// 叠加层渲染呈现。
-    pub fn annotations_for_page(&self, page_index: usize) -> Option<Vec<AnnotationInfo>> {
-        let worker = self.worker.as_ref()?;
-        worker.annotations_for_page(self.doc_id, page_index).ok()
+    ///
+    /// P1-17：**非阻塞版**——worker 读回已下放后台执行器执行，本方法只发起并返回事件
+    /// 结果通道（`None` = 无 worker / 文档未加载）。调用方稍后用 `try_recv`/`recv_timeout`
+    /// 轮询结果，**绝不在调用线程（主线程）同步 `rx.recv()` 等 pdfium worker**——worker
+    /// 忙时主线程等数百 ms 会冻结 UI（对齐 K167 异步回传姿势）。
+    pub fn annotations_for_page(
+        &self,
+        page_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<mpsc::Receiver<Option<Vec<AnnotationInfo>>>> {
+        let worker = self.worker.clone()?;
+        if self.doc_id == 0 {
+            return None;
+        }
+        let doc_id = self.doc_id;
+        let (tx, rx) = mpsc::channel();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { worker.annotations_for_page(doc_id, page_index).ok() })
+                .await;
+            let _ = tx.send(res);
+        })
+        .detach();
+        Some(rx)
     }
 
     /// 从**内存字节**（非磁盘）重开文档：worker 侧 Close 旧文档 → 失效渲染派生缓存 →

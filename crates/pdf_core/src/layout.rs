@@ -636,6 +636,11 @@ pub fn hit_char(text: &PageText, px: f32, py: f32) -> Option<usize> {
 /// 行为与 Edge/pdf.js 的“整行高亮”一致；synthetic 的零宽盒不产生子矩形。
 pub fn selection_spans_pt(text: &PageText, lo: usize, hi: usize) -> Vec<(f32, f32, f32, f32)> {
     const ROW_BUCKET_PT: f32 = 2.0;
+    // P1-15：空字符集下无选中区间——提前返回空（`chars.len()-1` 饱和为 0 会把 hi 钳成 0，
+    // `lo=hi=0` 仍会进 `chars[0]` 越界 panic）。全越界区间本就走空循环，语义不变。
+    if text.chars.is_empty() {
+        return Vec::new();
+    }
     let hi = hi.min(text.chars.len().saturating_sub(1));
     let mut rows: Vec<(f32, (f32, f32, f32, f32))> = Vec::new();
     for i in lo..=hi {
@@ -666,6 +671,10 @@ pub fn selection_spans_pt(text: &PageText, lo: usize, hi: usize) -> Vec<(f32, f3
 pub fn page_segment_text(text: &PageText, lo: usize, hi: usize) -> String {
     const LINE_EPS_PT: f32 = 3.0;
     const SPACE_GAP_RATIO: f32 = 1.5;
+    // P1-15：空字符集下无可提取文本——提前返回空（防 `chars[0]` 越界 panic）。
+    if text.chars.is_empty() {
+        return String::new();
+    }
     let hi = hi.min(text.chars.len().saturating_sub(1));
     if lo > hi {
         return String::new();
@@ -701,6 +710,10 @@ pub fn page_segment_text(text: &PageText, lo: usize, hi: usize) -> String {
 /// 原始字符下标区间 → 拼接字符串（跳过 NUL；与 [`search_page_text`] 的"可见序列"一致）。
 /// P3 用于校验检索命中文本 == 关键字，及展示命中预览。
 pub fn page_char_substring(text: &PageText, lo: usize, hi: usize) -> String {
+    // P1-15：空字符集下无可拼接原文——提前返回空（防 `chars[0]` 越界 panic）。
+    if text.chars.is_empty() {
+        return String::new();
+    }
     let hi = hi.min(text.chars.len().saturating_sub(1));
     let mut s = String::new();
     for i in lo..=hi {
@@ -1534,6 +1547,35 @@ mod tests {
         assert_eq!(page_char_substring(&text, 0, 2), "ac", "NUL 应被跳过");
         assert_eq!(page_char_substring(&text, 0, 99), "ac", "越界 hi 应钳制");
         assert_eq!(page_char_substring(&text, 5, 9), "", "全越界应为空");
+    }
+
+    /// P1-15：空字符集下文本提取三函数不得越界 panic——空 chars 时 `chars[0]` 直接越界
+    /// （`chars.len().saturating_sub(1)` 把 hi 钳成 0，`lo=hi=0` 仍进 `chars[0]`）。回归锚：
+    /// 空输入一律返回安全空结果（选区空矩形 / 空串），与「全越界区间为空」既有语义一致。
+    #[test]
+    fn empty_chars_text_extractors_return_empty_without_panic() {
+        let empty = page_text_of(vec![], 0);
+        assert_eq!(
+            selection_spans_pt(&empty, 0, 0),
+            Vec::<(f32, f32, f32, f32)>::new(),
+            "空 chars 选区矩形应为空（不得越界 panic）"
+        );
+        assert_eq!(
+            page_segment_text(&empty, 0, 0),
+            "",
+            "空 chars 段文本应为空串（不得越界 panic）"
+        );
+        assert_eq!(
+            page_char_substring(&empty, 0, 0),
+            "",
+            "空 chars 原文子串应为空串（不得越界 panic）"
+        );
+        // 全越界区间同样安全（既有「全越界为空」语义保持）
+        assert_eq!(
+            page_segment_text(&empty, 3, 9),
+            "",
+            "空 chars 越界区间段文本应为空串"
+        );
     }
 
     /// 检索命中上下文片段：目标前/后各含至多 ctx 字（页首/页尾一侧不足即取不足）。

@@ -1968,13 +1968,36 @@ impl PdfViewer {
     /// 封面能立刻被派发；到达结果若对应 pending 已不存在则丢弃（rx drop 后 worker 的
     /// `let _ = tx.send(...)` 静默失败）。只清世代标记：**不清** `cover_failures`/`cover_blacklist`
     /// （W2 语义：封面失败按 recolor 世代判定、黑名单随封面窗滚动复位，与导航世代正交）。
-    fn clear_stale_pending(&mut self) {
+    pub(super) fn clear_stale_pending(&mut self) {
         let n_gen = self.nav_gen;
+        // P1-16：先收集「世代 < 当前 nav_gen」被清在途条目的页集（中清/缩略各一份；封面/瓦片/
+        // 走廊无槽级 loading 标志、其"在途"语义 = pending map 成员本身，不需复位）。
+        let stale_pages: Vec<usize> = self
+            .pending_mid
+            .iter()
+            .filter(|(_, e)| e.0 < n_gen)
+            .map(|(&p, _)| p)
+            .chain(
+                self.pending_thumb
+                    .iter()
+                    .filter(|(_, e)| e.0 < n_gen)
+                    .map(|(&p, _)| p),
+            )
+            .collect();
         self.pending_cover.retain(|_, e| e.2 >= n_gen);
         self.pending_tiles.retain(|_, e| e.1 >= n_gen);
         self.pending_mid.retain(|_, e| e.0 >= n_gen);
         self.pending_thumb.retain(|_, e| e.0 >= n_gen);
         self.pending_prefetch_cover.retain(|_, e| e.1 >= n_gen);
+        // 被清条目对应的槽 loading 标志一并复位（对齐 `invalidate_page_bitmaps_for_r8_flip`）
+        // ——否则结果永不回（rx 随条目丢弃、worker send 静默失败）、标志永不复位，
+        // 该页占位链永久失能（永远停「加载中」，大跳后无法再派发）。
+        for page in stale_pages {
+            if let Some(slot) = self.slots.get_mut(page) {
+                slot.mid_loading = false;
+                slot.thumb_loading = false;
+            }
+        }
     }
 
     /// L1.2 **VeryFast 落点直达派发**：`jump_armed` 时以 `jump_target`（落点中心）为窗、
