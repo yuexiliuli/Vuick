@@ -344,7 +344,11 @@ impl WyEditor {
                     LinkHit::Url(u) if recognition::is_safe_external_url(&u) => {
                         cx.open_url(&u);
                     }
-                    LinkHit::Url(u) | LinkHit::Page(u) => {
+                    // 不安全外部 URL（`javascript:`/`file:`/相对路径等，allowlist 判否）：
+                    // 显式丢弃——不 open_url、也不当页面 OpenPage 广播给宿主（宿主
+                    // shell_preview/live.rs 原样收 OpenPage）。
+                    LinkHit::Url(_) => {}
+                    LinkHit::Page(u) => {
                         cx.emit(WyEvent::OpenPage(u));
                     }
                     LinkHit::BlockRef(id) => {

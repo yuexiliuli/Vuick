@@ -604,16 +604,37 @@ impl WyEditor {
         *self.rd.borrow_mut().block_layout.borrow_mut() = None;
         self.rd.borrow_mut().pending_image_srcs.borrow_mut().clear();
     }
-    /// 解析图片源：URL / Windows 盘符绝对路径 / 已绝对路径原样返回，其余基于
-    /// 基准目录拼成绝对路径（与预览 `view::MarkdownPreview::resolve_image_src` 一致）。
-    /// `pub(crate)`：`host_impl` 的 `WyRenderHost::image_intrinsic_size`（只读探测）经它复用。
+    /// 解析图片源：http/https URL、Windows 盘符绝对路径、已绝对路径原样返回；相对
+    /// src 基于基准目录拼成绝对路径（与预览 `view::MarkdownPreview::resolve_image_src`
+    /// 一致，但补两条安全收敛，2026-11-16 B 类红测锁）：
+    ///
+    /// ① **`../` 词法逃逸**：相对 src 先 `base_dir.join(src)` 再词法归一（折 `.`/`..`），
+    ///    归一态落在 `base_dir` 子树外 → 拒绝（返回 `base_dir` 目录哨兵，加载必失败，
+    ///    且不指到 base 之外）。
+    /// ② **`file://` 不再原样放行**：剥 `file://`（含 `file://localhost`）前缀转本机
+    ///    路径，与相对 src 同走 base 子树关；无 `base_dir` 保持原样（逃逸面小，
+    ///    仍经 `image_load_resource` 的 Uri 分支，旧行为）。
+    ///
+    /// `pub(crate)`：`host_impl` 的 `WyRenderHost::image_intrinsic_size`（只读探测）
+    /// 经它复用。
     pub(crate) fn resolve_image_src(&self, src: &str) -> String {
         let lower = src.to_lowercase();
-        if lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || lower.starts_with("file://")
-        {
+        if lower.starts_with("http://") || lower.starts_with("https://") {
             return src.to_string();
+        }
+        // `file://`：剥前缀转路径（`file:///C:/x` → `C:/x`、`file://localhost/C:/x` →
+        // `C:/x`），过 base 子树关；无 base_dir 保持原样（旧行为，逃逸面小）。
+        if lower.starts_with("file://") {
+            let rest = if lower.starts_with("file://localhost") {
+                &src["file://localhost".len()..]
+            } else {
+                &src["file://".len()..]
+            };
+            let path = std::path::PathBuf::from(rest.trim_start_matches('/'));
+            return match &self.base_dir {
+                Some(base) => Self::confine_to_base(base, path),
+                None => src.to_string(),
+            };
         }
         if src.len() >= 2 && src.as_bytes()[1] == b':' {
             return src.to_string();
@@ -622,9 +643,41 @@ impl WyEditor {
             return src.to_string();
         }
         match &self.base_dir {
-            Some(base) => base.join(src).to_string_lossy().to_string(),
+            Some(base) => Self::confine_to_base(base, std::path::PathBuf::from(src)),
             None => src.to_string(),
         }
+    }
+
+    /// 把候选路径 `p` 收进 `base` 子树：相对则 `base.join`；绝对路径必须已在 base
+    /// 子树内。词法归一（折 `.`/`..`）后前缀判定——越界一律返回 `base` 目录哨兵
+    /// （必然加载失败，且不指到 base 之外，杜绝「拒绝却没拒干净」）。
+    fn confine_to_base(base: &std::path::Path, p: std::path::PathBuf) -> String {
+        let joined = if p.is_absolute() { p } else { base.join(p) };
+        let norm = Self::lex_normalize_path(joined);
+        if norm.starts_with(&Self::lex_normalize_path(base.to_path_buf())) {
+            norm.to_string_lossy().to_string()
+        } else {
+            base.to_string_lossy().to_string()
+        }
+    }
+
+    /// 词法归一：折叠 `.` 组件、`..` 弹出上一级 Normal（根/盘符之上不可再越）。
+    /// `starts_with` 前缀判定用（同测试 `lex_normalize` 口径）。
+    fn lex_normalize_path(p: std::path::PathBuf) -> std::path::PathBuf {
+        use std::path::Component;
+        let mut out: Vec<Component> = Vec::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if let Some(Component::Normal(_)) = out.last() {
+                        out.pop();
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out.iter().collect()
     }
 
     /// 图片加载资源（解析后的路径/URL → gpui 加载器资源）。

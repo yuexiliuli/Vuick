@@ -339,3 +339,132 @@ fn runs_gap_and_tail_carry_base_text_color() {
     assert_eq!(out[0].color, fg, "纯文本 run 必须带正文色");
 }
 
+#[gpui::test]
+fn unsafe_url_click_discards_not_fail_open_to_open_page(cx: &mut TestAppContext) {
+    use crate::markdown::parse::recognition::LinkHit;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use super::{Frame, link_hit_at, text_row_shift};
+    // Bug A 红测（mouse.rs:344-349）：点「不安全」URL 链接（`is_safe_external_url=false`，
+    // 如 `javascript:…`）现状 **fail-open** 落入 `LinkHit::Url(u) | LinkHit::Page(u)` 并列臂
+    // → 把不安全 url 当页面广播 `WyEvent::OpenPage` 给宿主。修复方向 = Url 且不安全显式
+    // 丢弃（不 open_url 也不 OpenPage），Page 才 OpenPage。本测试同时锁「不安全 Url 被
+    // discard」与「Page 正常 OpenPage」两态，能区分二者。
+    cx.update(crate::test_support::bind_local_keymaps);
+    // `[[内页]]` → LinkHit::Page("内页")（正常应 OpenPage）；`[x](javascript:evil)`
+    // → LinkHit::Url("javascript:evil")（is_safe_external_url=false，应丢弃）。
+    let text = "wiki[[内页]] 危险 [x](javascript:evil) 尾\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let captured = Rc::new(RefCell::new(Vec::<String>::new()));
+    // 订阅（`App::subscribe` 激活是 defer 延后；detach 保活句柄，监听保留到实体释放）。
+    // 注意：`cx.emit` 入 pending_effects，在本次 `App::update` 收尾才 flush——断言必须放
+    // 在 `vcx.update` **之外**（flush 之后），否则 closure 内永远读到空。
+    let mut frame_rc = None;
+    vcx.update(|window, cx| {
+        let captured_c = captured.clone();
+        window
+            .subscribe::<WyEditor, crate::markdown::wysiwyg::WyEvent>(
+                &ed,
+                cx,
+                move |_em: Entity<WyEditor>,
+                      ev: &crate::markdown::wysiwyg::WyEvent,
+                      _w: &mut Window,
+                      _cx: &mut gpui::App| {
+                    if let crate::markdown::wysiwyg::WyEvent::OpenPage(p) = ev {
+                        captured_c.borrow_mut().push(p.clone());
+                    }
+                },
+            )
+            .detach();
+        // 建帧注入 + last_bounds 置原点（窗口坐标 == 帧局部坐标，reading_col_shift=0）。
+        let width = f32::from(window.viewport_size().width).max(1.);
+        let frame = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+        let bounds_h = f32::from(frame.total).max(600.);
+        let rc = Rc::new(frame);
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(width), px(bounds_h)),
+            )));
+            *e.rd.borrow_mut().frame.borrow_mut() = Some(rc.clone());
+        });
+        frame_rc = Some(rc);
+    });
+    let rc = frame_rc.expect("帧应已注入");
+    // 命中点 helper：按 `row.extra.links` 目标找链接显示区几何中点——与
+    // `element::link_hit_grips`（element/mod.rs ~646）同式（origin=0 时即窗口坐标）。
+    let hit_at = |f: &Frame, pred: &dyn Fn(&LinkHit) -> bool| -> Option<(f32, f32)> {
+        let r = f
+            .rows
+            .iter()
+            .find(|r| r.extra.links.iter().any(|l| pred(&l.target)))?;
+        let lk = r.extra.links.iter().find(|l| pred(&l.target))?;
+        let w0 = r.wrapped.first()?;
+        let p0 = w0.position_for_index(lk.disp.start, r.lh)?;
+        let p1 = w0.position_for_index(lk.disp.end, r.lh)?;
+        let ox = f32::from(f.padding)
+            + f32::from(r.x_off)
+            + f32::from(r.align_offsets.first().copied().unwrap_or(px(0.)));
+        let oy = f32::from(r.top) + text_row_shift(r);
+        let cx_ = ox + f32::from(p0.x) + (f32::from(p1.x) - f32::from(p0.x)) / 2.;
+        let cy = oy + f32::from(p0.y) + f32::from(r.lh) / 2.;
+        Some((cx_, cy))
+    };
+    let (wxi, wyi) = hit_at(&rc, &|t| matches!(t, LinkHit::Page(p) if p == "内页"))
+        .expect("文档应含 wiki 链接 [[内页]]");
+    let (ux, uy) = hit_at(&rc, &|t| matches!(t, LinkHit::Url(u) if u == "javascript:evil"))
+        .expect("应命中不安全 url 链接");
+    // 点击（真实 handler 同步路径：`on_mouse_down` C5 分支 → emit OpenPage，收尾 flush）。
+    vcx.update(|window, cx| {
+        // ① 正向对照：wiki 页链接命中点准确（几何预检）。
+        let probe_w = link_hit_at(ed.read(cx), &rc, point(px(wxi), px(wyi)));
+        assert!(
+            matches!(probe_w, Some(LinkHit::Page(ref p)) if p == "内页"),
+            "wiki 点击点应命中（几何预检）：{probe_w:?}"
+        );
+        let down = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(wxi), px(wyi)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx));
+        // ② 不安全 url 命中点准确（几何预检）。
+        let probe = link_hit_at(ed.read(cx), &rc, point(px(ux), px(uy)));
+        let probe_hits_unsafe =
+            matches!(probe, Some(LinkHit::Url(ref u)) if u == "javascript:evil");
+        assert!(
+            probe_hits_unsafe,
+            "点击点应命中不安全链接（几何预检）：{probe:?}"
+        );
+        let down2 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(ux), px(uy)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&down2, window, cx));
+    });
+    // —— flush 完成后才在进程外断言 ——
+    // ① wiki 页链接 → OpenPage("内页")（Page 语义必须保留，验证事件管线确能收到）。
+    assert!(
+        captured.borrow().contains(&"内页".to_string()),
+        "wiki 页链接 [[内页]] 应正常 OpenPage（锚定事件管线可用）：{:?}",
+        captured.borrow()
+    );
+    // ② 断言：不安全 URL 点击不得再产生 OpenPage 广播（当前 fail-open → 收到
+    // "javascript:evil" → RED；修复后 discard → 不再追加 → GREEN）。
+    assert!(
+        !captured.borrow().iter().any(|p| p == "javascript:evil"),
+        "点击不安全 URL 不应广播 OpenPage（fail-open），实际收到：{:?}",
+        captured.borrow()
+    );
+}
+
