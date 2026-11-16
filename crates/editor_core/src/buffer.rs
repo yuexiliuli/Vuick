@@ -27,7 +27,7 @@ use gpui::SharedString;
 use ropey::Rope;
 use ropey::LineType;
 
-use super::rope_ext::RopeExt;
+use super::rope_ext::{Bias, RopeExt};
 
 /// `Buffer` 实例唯一 id 发号器（1 起，永不回退）。
 ///
@@ -589,9 +589,13 @@ impl Buffer {
         offset.min(self.text.len())
     }
 
-    /// 应用一次替换（返回可逆记录）。`range` 需在字符边界上。
+    /// 应用一次替换（返回可逆记录）。`range` 需在字符边界上；调用方可能传入落
+    /// 在多字节字符中间的偏移（IME 组合/外部坐标换算），先 `clip_offset` 把两端裁到
+    /// 字符边界（start 下取整、end 上取整），避免 `text.slice` 非边界 panic。
     pub fn apply_edit(&mut self, range: Range<usize>, new_text: &str) -> Edit {
-        let range = self.clip(range.start).min(self.clip(range.end))..self.clip(range.end);
+        let lo = self.clip(range.start).min(self.clip(range.end));
+        let hi = self.clip(range.end);
+        let range = self.text.clip_offset(lo, Bias::Left)..self.text.clip_offset(hi, Bias::Right);
         self.replace_region(range, new_text)
     }
 
@@ -641,6 +645,36 @@ impl fmt::Display for Buffer {
 /// `tests/logic.rs` 跨 crate 复用。拆 crate 后 `#[cfg(test)]` 不能再保留——依赖方
 /// 的测试构建里本 crate 以普通依赖编译（cfg(test) 关闭），故改为常编译的
 /// `#[doc(hidden)] pub`（沿用仓库「测试支撑跨 crate 用 doc(hidden) pub」姿势）。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1 回归：`apply_edit` 的 clip 只夹长度不裁字符边界（buffer.rs:594），传入落在
+    /// 多字节字符中间的区间会让 `text.slice` 非字符边界 panic（IME 中文历史真实发生）。
+    /// 修复后 start 下取整、end 上取整到字符边界，正常替换 + undo 往返恢复。
+    #[test]
+    fn apply_edit_clips_non_char_boundary_range() {
+        // "ab中文" 字节布局：a=0..1 b=1..2 中=2..5 文=5..8。
+        let mut b = Buffer::new("ab中文");
+        // 区间端点 3/7 分别落在「中」「文」中间（非字符边界）——修复前 slice panic。
+        let e = b.apply_edit(3..7, "-");
+        assert_eq!(b.to_string(), "ab-", "start 下取整、end 上取整到字符边界");
+        b.undo_edit(&e);
+        assert_eq!(b.to_string(), "ab中文", "undo 应还原");
+        // 合法边界区间不受影响。
+        let e2 = b.apply_edit(2..5, "X");
+        assert_eq!(b.to_string(), "abX文");
+        b.undo_edit(&e2);
+        // 反向区间（start>end）不得 panic：保持「空区间插入」旧语义。
+        let e3 = b.apply_edit(5..2, "!");
+        assert_eq!(b.to_string(), "ab!中文");
+        b.undo_edit(&e3);
+        // 越界区间钳到文本尾（字符边界）。
+        let _ = b.apply_edit(3..100, "!");
+        assert_eq!(b.to_string(), "ab!");
+    }
+}
+
 #[doc(hidden)]
 pub mod test_support {
     use super::*;
