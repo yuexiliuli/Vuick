@@ -109,8 +109,10 @@ pub type FnSupportsShaderBoundTextures = unsafe extern "C" fn(usize, usize) -> C
 // ---------------- 字幕 FFI 类型与符号签名 ----------------
 
 /// 字幕顶层参数 FFI（布局定义；实际用独立函数取字幕）。
+/// dormancy 休眠保留（K24）：全仓无消费方——实际取值在 `media_ffmpeg` 内自带同名
+/// `SubtitleParamsFFI` 逐项读取，本布局声明无人引用。
 #[repr(C)]
-#[allow(dead_code)] // FFI 布局定义（消费方逐项读取）
+#[allow(dead_code)] // dormancy 休眠保留（K24）
 pub struct SubtitleParamsFFI {
     pub stream_count: u32,
     pub format: u32,

@@ -778,6 +778,9 @@ mod imp {
                 let fmt = RegisterClipboardFormatW(PCWSTR::from_raw(w!("Preferred DropEffect").as_ptr()));
                 if fmt != 0 {
                     let hfx = GetClipboardData(fmt).ok()?;
+                    // 恒真死守卫（dormancy 休眠保留，K24）：`GetClipboardData` 失败返回
+                    // Err 已被 `?` 提前短路，成功句柄必非空 → `hfx.0.is_null()` 恒不成立；
+                    // 保留作防御式检查，不删。
                     if !hfx.0.is_null() {
                         let hg2 = HGLOBAL(hfx.0);
                         let px = GlobalLock(hg2);

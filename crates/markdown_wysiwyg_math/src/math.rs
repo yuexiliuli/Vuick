@@ -191,12 +191,16 @@ pub fn splice_math_text(
                 let disp_w = (wnat * fit).min(avail_w).max(1.);
                 let disp_h = f32::from(lh);
                 let n = spacer_count(disp_w, space_w, avail_w);
+                // 不可达守卫（dormancy 休眠保留，K24）：`spacer_count` 内部
+                // `clamp(1, ..)` 保证返回值 >=1，此处 `n == 0` 恒不成立（历史防御）。
                 if n == 0 {
                     continue;
                 }
                 (n, disp_w, disp_h, fit, None)
             }
         };
+        // 不可达守卫（dormancy 休眠保留，K24）：两个分支的 `spacer_count` 都
+        // `clamp(1, ..)` 保证 >=1，故 `n > 0` 恒真、`n.max(1)` 恒为 no-op。
         if n > 0 {
             let n = n.max(1);
             // `splice_inline_math` 的契约：`formulas` 是**源坐标**区间（byte_map 查显示

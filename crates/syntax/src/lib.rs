@@ -159,7 +159,11 @@ pub fn semantic_name(scope: Scope) -> Option<&'static str> {
         "constant"
     } else if scope.starts_with("punctuation") {
         "punctuation"
-    } else if scope.starts_with("entity.name.namespace") || scope.starts_with("keyword.control.import") {
+    } else if scope.starts_with("entity.name.namespace")
+        // `keyword.control.import` 分支不可达（dormancy 休眠保留，K24）：前面泛 `keyword`
+        // 前缀已把一切 `keyword.*` 匹配掉；若需精确 control.import 语义须先改泛 keyword 分支。
+        || scope.starts_with("keyword.control.import")
+    {
         "preproc"
     } else {
         return None;

@@ -42,8 +42,6 @@
 //! - 行数变更用 `ListState::splice` 增量对齐（大文档避免整树重建）；
 //!   打开/整篇替换/撤销重做仍是单次 O(n)（API 所限）。
 
-#![allow(dead_code)] // 组件库公共 API：作为 lib crate 前 bin crate 会对未使用项误报 dead_code
-
 // ---------------------------------------------------------------------------
 // 核心模型层全量重导出（`editor_core` 为拆出 crate；glob 带出全部 pub 模块与根级类型，
 // 显式 `pub use` 保目录路径语义，既有 `editor::buffer::*` / `editor::movement::*` 等

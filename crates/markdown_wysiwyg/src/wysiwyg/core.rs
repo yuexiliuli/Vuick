@@ -711,7 +711,8 @@ impl WyEditor {
     /// 膨胀）。`image_sizes` 是持久缓存 → 之后进带 O(1)；HTTP/已达尺寸/读取失败均短路，
     /// paint 的异步 asset 加载照常（带内图尺寸已知后只画、不重复校正）。
     /// 仅供宿主测试消费的旧签名转发（生产无调用，EPUB 真机路径经引擎侧承担）→ allow 压
-    /// dead_code 告警。
+    /// dead_code 告警。dormancy 休眠保留（K24）：生产图片懒装载尺寸已被引擎侧
+    /// `frame::lazy_ensure_image_size` 承担，本方法只留作宿主测试入口（`epub.rs` 复用）。
     #[allow(dead_code)]
     pub(crate) fn lazy_ensure_image_size(&self, src: &str) {
         if self.rd.borrow().image_sizes.borrow().get(src).is_some() {
