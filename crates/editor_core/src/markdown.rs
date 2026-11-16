@@ -283,9 +283,9 @@ fn scan_inline(text: &str, from: usize, out: &mut Vec<(Range<usize>, Deco)>) {
     let mut i = from;
     while i < n {
         let ch = b[i];
-        // 转义：`\X` 视为纯文本（跳过两字节）
+        // 转义：`\X` 视为纯文本（跳过反斜杠与其后一个完整字符，多字节安全）
         if ch == b'\\' && i + 1 < n {
-            i += 2;
+            i += 1 + char_len(text, i + 1);
             continue;
         }
         // 行内代码 `code`
@@ -899,6 +899,71 @@ mod tests {
         assert!(
             rows[0].iter().any(|(_, s)| s.font_weight == Some(FontWeight::BOLD)),
             "编辑后重扫仍出加粗（内容没动粗体）"
+        );
+    }
+
+    #[test]
+    fn utf8_escape_no_panic_scan_line() {
+        // 红测（复现）：`\`+多字节 UTF-8（`\你` `\…` `\🍎`）是合法转义输入，禁崩。
+        // `scan_inline` 转义分支（markdown.rs:287）固定 `i += 2` 把 i 落进多字节字符
+        // 中间（非边界），循环尾 `i += char_len(text, i)`（markdown.rs:374）对
+        // `text[i..]` 按字节切片 → `byte index ... is not a char boundary`（markdown.rs:67）。
+        let cases = [r"\你", r"\…", r"\🍎"];
+        for line in cases {
+            let names = scan_line(line);
+            assert!(
+                names
+                    .iter()
+                    .all(|(r, _)| line.is_char_boundary(r.start) && line.is_char_boundary(r.end)),
+                "转义多字节后不得产生非边界 run: {line:?} -> {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_escape_no_panic_then_inline() {
+        // 红测（复现续）：`\`+多字节后再接词法扫描（`**` / 行内代码），i 停在多字节中间
+        // 的状态无法自愈，后续 `char_len`/`find_run_from`（markdown.rs:97 亦经 char_len）
+        // 仍在非边界切片 → 同样 panic。
+        let cases = [r"\你**加粗**", r"- 我们\🍎 后面还有", r"a\… `code` b"];
+        for line in cases {
+            let _ = scan_line(line);
+        }
+    }
+
+    #[test]
+    fn utf8_escape_no_panic_via_window() {
+        // 红测（真实用户路径）：编辑器扫 `.md` 缓冲窗口（scan_window → scan_line →
+        // scan_inline），含 `\`+多字节的行即崩。
+        let src = "# 标题\n\\你\n- \\🍎 列表\n";
+        let b = Buffer::new(src);
+        let mut dec = MarkdownDecor::new();
+        let _ = dec.scan_window(&b, 0, 2, 16);
+    }
+
+    #[test]
+    fn utf8_escape_multibyte_then_inline_parses() {
+        // 正例：`\你` 整体视为纯文本（不产生装饰），且不吞掉后续结构——
+        // `\你**加粗**` 尾部 `**加粗**` 照常解析成粗体。
+        let line = r"\你**加粗**";
+        let kinds = kinds_of(line);
+        // `\你` 4 字节（`\` + 3 字节 `你`）必须在所有 run 之外 = 纯文本。
+        assert!(
+            kinds.iter().all(|(r, _)| r.start >= 4 || r.end <= 1),
+            "转义段 `\\你` 不得被装饰：{kinds:?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|(r, d)| *d == Deco::Bold && &line[r.clone()] == "加粗"),
+            "`\\你` 后的 **加粗** 应正常解析：{kinds:?}"
+        );
+        // 边界安全：转义段起止与各 run 均落在字符边界。
+        assert!(
+            kinds
+                .iter()
+                .all(|(r, _)| line.is_char_boundary(r.start) && line.is_char_boundary(r.end)),
+            "转义多字节后不得产生非边界 run: {kinds:?}"
         );
     }
 }
