@@ -224,8 +224,14 @@ pub async fn folder_scan_collect(
                 }
                 stack.push(path);
             } else {
-                // 文件（含指向文件的符号链接）：跟随元数据取真实类型 / 大小；指向目录的
-                // 符号链接 / 其它特殊文件 → 跳过（一律不递归，防循环）。
+                // 符号链接条目（无论指向文件还是目录）一律不跟随、不读取：`ft` 来自
+                // `entry.file_type()`（非跟随），若不在此拦下，文件符号链接会在下面的
+                // `fs::metadata`/`fs::read`（都跟随链接）处把指向**根外**文件的内容读进
+                // 结果（跨信任边界泄露，P0-B4）；对齐 rg 默认（不跟随符号链接索引）。
+                if ft.is_symlink() {
+                    continue;
+                }
+                // 普通文件：跟随元数据取真实类型 / 大小；其它特殊文件 → 跳过（防循环）。
                 let Ok(meta) = std::fs::metadata(&path) else {
                     continue; // 单条目元数据失败 → 跳过
                 };
@@ -531,5 +537,95 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0 回归：`folder_scan_collect` 的**文件分支**用 `fs::metadata`（跟随符号链接）+ `fs::read`
+    /// 把指向**扫描根外**文件的内容读入并索引进结果（目录分支用 `entry.file_type()` 不跟随防环，
+    /// 但文件分支 227-240 一带注释自称刻意跟随）→ 扫描含「→ ~/.ssh/config」这类文件链接的仓库时，
+    /// 查询命中把根外文件内容显示进搜索面板（跨信任边界泄露）。
+    /// 本测试断言：根外哨兵文本**不出现**在任何命中片段里——修复前会命中 → 红测。
+    #[test]
+    fn folder_scan_does_not_follow_file_symlink_outside_root() {
+        use futures::executor::block_on;
+        let base = unique_temp_dir("fs_symlink_outside");
+        std::fs::create_dir_all(&base).unwrap();
+        // 扫描根 R + 根外目录（各自独立）。
+        let root = base.join("R");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // 根外文件 V：唯一哨兵文本（查询词取其中 ASCII 子串，大小写不敏感命中）。
+        let sentinel = "OUTSIDE_SENTINEL_XYZ";
+        let v = outside.join("v.txt");
+        std::fs::write(&v, format!("secret {sentinel} leaked\n")).unwrap();
+        // R 内建指向 V 的**文件符号链接**：修复前文件分支 `metadata`+`read` 会跟随读入 V 内容。
+        let link = root.join("link.txt");
+        if !create_file_link(&link, &v) {
+            // 环境不支持建文件符号链接（Windows 无权限/无开发者模式）→ 跳过；Unix / 支持平台才真跑。
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let session =
+            std::env::temp_dir().join(format!("shell_scan_session_{}", std::process::id()));
+        let (tx, mut rx) = futures::channel::mpsc::channel::<FolderScanUpdate>(8);
+        let mut total = 0usize;
+        let _truncated = block_on(folder_scan_collect(
+            &root,
+            "outside_sentinel",
+            tx,
+            &session,
+            &mut total,
+            100,
+        ));
+        let mut snippets: Vec<String> = Vec::new();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(upd) => {
+                    if let FolderScanUpdate::File(f) = upd {
+                        paths.push(f.path.clone());
+                        for h in &f.hits {
+                            snippets.push(h.snippet.clone());
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        for (i, s) in snippets.iter().enumerate() {
+            assert!(
+                !s.contains(sentinel),
+                "根外哨兵不应出现在命中片段 #{}（{}）：{s:?}",
+                i,
+                paths.iter().next().map(|p| p.display().to_string()).unwrap_or_default()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Windows：建**文件**符号链接。先试 `std::os::windows::fs::symlink_file`（开发者模式 /
+    /// 管理员可建），失败再退 `cmd /C mklink <link> <target>`（文件符号链接，非 /J 联接）；
+    /// 两者都失败返回 false（无权限 → 上层跳过）。
+    #[cfg(windows)]
+    fn create_file_link(link: &std::path::Path, target: &std::path::Path) -> bool {
+        if std::os::windows::fs::symlink_file(target, link).is_ok() {
+            return true;
+        }
+        std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Unix：文件符号链接；失败返回 false。
+    #[cfg(not(windows))]
+    fn create_file_link(link: &std::path::Path, target: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
     }
 }
