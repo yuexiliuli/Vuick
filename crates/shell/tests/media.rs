@@ -502,6 +502,113 @@ use common::*;
         let _ = std::fs::remove_file(&s);
     }
 
+    /// P1-C7：音乐窗口被当作视频的复用目标 → 视频静默不上屏（music_mode 整窗 MusicView
+    /// 隐藏视频）。先开音频 → 音乐窗口 B；再从主窗口开视频 → **不得投进音乐窗口** → 应
+    /// 新开视频窗口（窗口 +1），音乐窗口保持音乐模式、新窗口活动选项卡为所开视频。
+    /// 修复前：视频被路由进音乐窗口静默不上屏（窗口数不变）→ 本测试红。
+    #[cfg(feature = "video")]
+    #[gpui::test]
+    async fn media_window_video_after_music_opens_new_win_not_music(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 先开音频 → 音乐窗口 B（媒体重定向默认开 + 复用开）。
+        let s = placeholder_audio("c7song");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(s.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        assert_eq!(registry_window_count(cx), 2, "前置：音频应拆出 1 个音乐窗口");
+        let others = other_app_entity(cx, &app);
+        assert_eq!(others.len(), 1);
+        let music_win = others[0].clone();
+        assert!(
+            cx.update(|_w, cx| music_win.read(cx).model.borrow().music_mode),
+            "前置：B 应为音乐模式窗口"
+        );
+        // 再从主窗口开视频 → 不得复用音乐窗口 → 新开视频窗口（窗口 +1）。
+        let v = placeholder_video("c7vid");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(v.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        assert_eq!(registry_window_count(cx), 3, "视频不得复用音乐窗口：应新开 1 个窗口");
+        assert!(
+            cx.update(|_w, cx| music_win.read(cx).model.borrow().music_mode),
+            "音乐窗口应保持音乐模式（视频未投进去）"
+        );
+        // 新出的非音乐窗口应为视频窗口（活动选项卡即该视频）。
+        let others2 = other_app_entity(cx, &app);
+        assert_eq!(others2.len(), 2, "两个媒体窗口：音乐 B + 视频 C");
+        let video_new = others2
+            .iter()
+            .find(|e| !cx.update(|_w, cx| e.read(cx).model.borrow().music_mode))
+            .cloned()
+            .expect("应有一个非音乐模式的新窗口（视频窗口 C）");
+        assert!(active_is_video(cx, &video_new), "新窗口活动选项卡应为该视频");
+        assert_eq!(
+            media_win_snap(cx, &video_new).1.as_deref(),
+            Some(v.as_path()),
+            "新窗口活动选项卡应即所开视频"
+        );
+        let _ = std::fs::remove_file(&s);
+        let _ = std::fs::remove_file(&v);
+    }
+
+    /// P1-C7 空窗短路：**音乐窗口自身**（music_mode 无文本 tab，只有 MusicView 内容）开
+    /// 视频 → 不得按「空窗」就地打开（视频进 MusicView 整窗即静默不上屏）→ 应新开窗口
+    /// （窗口 +1），音乐窗口保持音乐模式。
+    #[cfg(feature = "video")]
+    #[gpui::test]
+    async fn media_window_music_window_opens_video_opens_new_win(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 先开音频 → 音乐窗口 B（music_mode、无文本 tab）。
+        let s = placeholder_audio("c7song2");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(s.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        let others = other_app_entity(cx, &app);
+        assert_eq!(others.len(), 1);
+        let music_win = others[0].clone();
+        let (music_mode, _, tabs) = media_win_snap(cx, &music_win);
+        assert!(music_mode, "前置：B 应为音乐模式窗口");
+        assert_eq!(tabs, 0, "前置：音乐窗口无文本选项卡（只有 MusicView 内容）");
+        // 由音乐窗口自身开视频 → 不得就地（音乐窗承接视频 = 静默不上屏）→ 新开窗口。
+        let v = placeholder_video("c7sel");
+        cx.update(|window, cx| {
+            music_win.update(cx, |app, cx| app.open_file(v.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        assert_eq!(registry_window_count(cx), 3, "音乐窗开视频：应新开 1 个窗口（不得就地）");
+        assert!(
+            cx.update(|_w, cx| music_win.read(cx).model.borrow().music_mode),
+            "音乐窗口应保持音乐模式（视频未就地打开）"
+        );
+        let _ = std::fs::remove_file(&s);
+        let _ = std::fs::remove_file(&v);
+    }
+
     /// 菜单翻转：media_new_window 关时 reuse 翻转被拒绝（置灰双保险）；开时正常翻转。
     #[gpui::test]
     async fn media_window_media_switch_toggles_update_fields(cx: &mut TestAppContext) {

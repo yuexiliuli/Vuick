@@ -279,11 +279,13 @@ impl shell_pdf::PdfHost for EditorApp {
 // `shell_media::media_window`，宿主编排（`maybe_redirect_media_open` 等）据此分发执行。
 impl shell_media::MediaHost for EditorApp {
     /// 「最近其它媒体窗口」查询：`EditorAppRegistry` 依赖收敛到宿主实现（域不直读注册表）。
-    /// 列表逆序首个媒体窗口 = 最近创建的媒体窗口；排除自身（按实体 id 比对）。
+    /// 列表逆序首个媒体窗口 = 最近创建的媒体窗口；排除自身（按实体 id 比对）。返回窗口
+    /// 句柄 + 角色（`MediaWindowKind`）——P1-C7 角色维度：决策层据此判「音乐窗口承接
+    /// 视频不可复用」，扫描本身不做角色过滤（角色策略收敛在域决策单一事实源）。
     fn media_host_nearest_other_media_window(
         &self,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyWindowHandle> {
+    ) -> Option<(gpui::AnyWindowHandle, MediaWindowKind)> {
         if !cx.has_global::<EditorAppRegistry>() {
             return None;
         }
@@ -294,10 +296,10 @@ impl shell_media::MediaHost for EditorApp {
             if entity.entity_id() == self_id {
                 return None;
             }
-            let is_media = entity.read_with(cx, |app, _| {
-                shell_media::media_window::media_window_kind(&app.model.borrow()).is_some()
-            });
-            is_media.then_some(*wh)
+            let kind = entity.read_with(cx, |app, _| {
+                shell_media::media_window::media_window_kind(&app.model.borrow())
+            })?;
+            Some((*wh, kind))
         })
     }
 

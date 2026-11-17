@@ -16,16 +16,20 @@ use std::path::Path;
 
 use gpui::{AnyWindowHandle, Context, Window};
 
+use crate::media_window::MediaWindowKind;
+
 /// 媒体域**宿主服务面**：把媒体路由对宿主的执行/查询收敛为最小接口，使本 crate 不依赖
 /// shell 的具体宿主类型。shell 侧 `impl MediaHost for EditorApp` 在 `host_impl.rs`。
 pub trait MediaHost: 'static {
     /// 「最近其它媒体窗口」查询：`EditorAppRegistry` 依赖收敛到宿主实现（域不直读注册表）；
-    /// 返回**最近创建的其它媒体窗口**句柄（注册序最新 = 列表逆序首个，排除自身）。路由
-    /// 决策「是否有其它媒体窗口可复用」据此判定（行为表 ReuseExisting 行）。
+    /// 返回**最近创建的其它媒体窗口**句柄及其角色（注册序最新 = 列表逆序首个，排除自身）。
+    /// 角色与「媒体窗口」判定同源（`media_window_kind`，`kind.is_some()` 即可复用候选）。
+    /// 路由决策据此判「候选窗口角色能否承接目标媒体」（P1-C7：音乐窗口承接视频会整窗
+    /// MusicView 隐藏视频 → 决策层拒绝复用，见 `resolve_media_open_action`）。
     fn media_host_nearest_other_media_window(
         &self,
         cx: &mut Context<Self>,
-    ) -> Option<AnyWindowHandle>
+    ) -> Option<(AnyWindowHandle, MediaWindowKind)>
     where
         Self: Sized;
 

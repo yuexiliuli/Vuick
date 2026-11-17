@@ -8,7 +8,8 @@
 //!
 //! 本模块收敛**决策与决策所需输入**：`MediaOpenTarget` / `MediaWindowKind` /
 //! `resolve_media_open_target` / `resolve_recorded_size` / `media_window_kind` /
-//! `is_media_path` / `resolve_media_open_action` / `record_media_window_size` 模型段 /
+//! `is_media_path` / `resolve_media_open_action`（含 P1-C7 角色维度：
+//! `media_window_hosts_target` + `target_kind`）/ `record_media_window_size` 模型段 /
 //! `open_target_kind`。路由的「真正执行」（开新窗、`open_file_here`）经 [`crate::MediaHost`]
 //! 宿主服务分发；`EditorAppRegistry` 依赖 → `MediaHost::media_host_nearest_other_media_window`
 //! 宿主返回，本模块不直读 registry。
@@ -118,21 +119,52 @@ pub enum MediaOpenAction {
     OpenIn(AnyWindowHandle),
 }
 
+/// 角色能否承接目标媒体（P1-C7 角色维度核心策略）：非媒体窗口（`None`）可承接任意媒体
+/// （文本/空窗会变成对应媒体窗）；**音乐窗口承接视频 = 不可**——`music_mode` 整窗只渲染
+/// MusicView，视频选项卡会静默不上屏（静默打开 → 整窗仍是音乐界面）；其余组合可承接
+/// （视频窗接视频 = 就地切 tab；任意窗接音频 = 走音乐模式，视频窗可切）。音频目标不设
+/// 角色墙，保持既有复用行为。
+pub(crate) fn media_window_hosts_target(
+    kind: Option<MediaWindowKind>,
+    target: MediaWindowKind,
+) -> bool {
+    match kind {
+        None => true,
+        Some(k) => k == target || target == MediaWindowKind::Music,
+    }
+}
+
 /// 由开关 / 窗口角色 / 候选媒体窗口句柄决议 [`MediaOpenAction`]（`open_file` 分流一次性
 /// 决策：`resolve_media_open_target` + 竞态兜底的合并层）。
+///
+/// 角色维度（P1-C7）：`self_kind` / `other_kind` 是发起窗口与「最近其它媒体窗口」的当前
+/// 角色，`target_kind` 是本次打开的媒体种类（由 `open_target_kind` 按扩展名给出）——把
+/// 「音乐窗口承接视频」从候选里剔除：自身为音乐窗 + 视频目标 → 不就地打开（降级为
+/// 「非媒体 + 有内容」参与布尔决策）；候选其它窗口为音乐窗 + 视频目标 → 不复用
+/// （走 NewWindow）。音频目标不设墙（任意窗口可承接，既有复用行为不变）。
 pub fn resolve_media_open_action(
     media_new_window: bool,
     reuse: bool,
     self_is_media: bool,
     other: Option<AnyWindowHandle>,
     self_has_tabs: bool,
+    self_kind: Option<MediaWindowKind>,
+    other_kind: Option<MediaWindowKind>,
+    target_kind: MediaWindowKind,
 ) -> MediaOpenAction {
+    let self_hosts = media_window_hosts_target(self_kind, target_kind);
+    let other_hosts = media_window_hosts_target(other_kind, target_kind);
+    // 自身不能承接目标媒体：不得按「自身是媒体窗」就地打开、也不得按「空窗」短路就地
+    // 打开——把自身降级为「非媒体 + 有内容」参与布尔决策（随后落到 ReuseExisting /
+    // NewWindow）。
+    let eff_self_is_media = self_is_media && self_hosts;
+    let eff_self_has_tabs = self_has_tabs || !self_hosts;
     match resolve_media_open_target(
         media_new_window,
         reuse,
-        self_is_media,
-        other.is_some(),
-        self_has_tabs,
+        eff_self_is_media,
+        other.is_some() && other_hosts,
+        eff_self_has_tabs,
     ) {
         MediaOpenTarget::Here => MediaOpenAction::Here,
         MediaOpenTarget::NewWindow => MediaOpenAction::NewWindow,
@@ -275,35 +307,96 @@ mod tests {
 
     /// `resolve_media_open_action` 把 `resolve_media_open_target` 落地成动作（无句柄的
     /// 纯布尔决策面全覆盖；`OpenIn` 臂只差句柄装订，由集成测试经真实窗口句柄覆盖）。
+    /// 角色维度（P1-C7）：`self_kind`/`other_kind`/`target_kind` 按「兼容承接」给默认值
+    /// （兼容角色不改变布尔决策面；不兼容场景见
+    /// `resolve_media_open_action_role_dimension`）。
     #[test]
     fn resolve_media_open_action_decision() {
+        use MediaWindowKind::*;
         // 空窗口（无任何文件选项卡）→ Here（就地打开，不新开/不复用媒体窗口）
         assert_eq!(
-            resolve_media_open_action(true, true, false, None, false),
+            resolve_media_open_action(true, true, false, None, false, None, None, Video),
             MediaOpenAction::Here
         );
         // 配置关 → Here
         assert_eq!(
-            resolve_media_open_action(false, true, false, None, true),
+            resolve_media_open_action(false, true, false, None, true, None, None, Video),
             MediaOpenAction::Here
         );
         // 开 + 复用关 → NewWindow
         assert_eq!(
-            resolve_media_open_action(true, false, false, None, true),
+            resolve_media_open_action(true, false, false, None, true, None, None, Video),
             MediaOpenAction::NewWindow
         );
-        // 开 + 复用开 + 自身是媒体 → Here
+        // 开 + 复用开 + 自身是媒体（视频角色承接视频目标）→ Here
         assert_eq!(
-            resolve_media_open_action(true, true, true, None, true),
+            resolve_media_open_action(
+                true, true, true, None, true,
+                Some(Video), None, Video,
+            ),
             MediaOpenAction::Here
         );
         // 开 + 复用开 + 无其它媒体窗口 → NewWindow
         assert_eq!(
-            resolve_media_open_action(true, true, false, None, true),
+            resolve_media_open_action(true, true, false, None, true, None, None, Video),
             MediaOpenAction::NewWindow
         );
         // 开 + 复用开 + 由宿主给句柄：本函数只透传（不作为候选判定——None 与 Some 语义
         // 分界由宿主扫描负责；此处保证无句柄不进入 OpenIn）。
+    }
+
+    /// P1-C7 角色维度：`media_window_hosts_target` 策略表——非媒体窗口承接任意；
+    /// 音乐窗口承接视频 = 不可；其余组合可。
+    #[test]
+    fn media_window_hosts_target_policy() {
+        use MediaWindowKind::*;
+        // 非媒体窗口（None）：承接任意媒体。
+        assert!(media_window_hosts_target(None, Music), "非媒体窗承接音频");
+        assert!(media_window_hosts_target(None, Video), "非媒体窗承接视频");
+        // 音乐窗口：承接音频（自身即音乐模式），**不可承接视频**（整窗 MusicView 隐藏视频）。
+        assert!(media_window_hosts_target(Some(Music), Music), "音乐窗承接音频");
+        assert!(
+            !media_window_hosts_target(Some(Music), Video),
+            "音乐窗不可承接视频（P1-C7 核心）"
+        );
+        // 视频窗口：承接视频（就地切 tab）；承接音频（可切音乐模式）。
+        assert!(media_window_hosts_target(Some(Video), Video), "视频窗承接视频");
+        assert!(media_window_hosts_target(Some(Video), Music), "视频窗承接音频");
+    }
+
+    /// P1-C7 角色维度落进动作决议（无需真实句柄的自身玻）：自身为音乐窗 + 视频目标
+    /// → 不得就地打开 / 不得按空窗短路（应落 ReuseExisting / NewWindow）；音频目标与
+    /// 非媒体空窗的既有就地行为保持。
+    #[test]
+    fn resolve_media_open_action_role_dimension() {
+        use MediaWindowKind::*;
+        // 自身是音乐空窗（music_mode 无文本 tab）+ 视频目标（default 开+复用开、无其它
+        // 媒体窗）→ 不得 Here（旧逻辑 `!self_has_tabs` 会就地打开视频进 MusicView 整窗
+        // → 静默不上屏）→ NewWindow。
+        assert_eq!(
+            resolve_media_open_action(true, true, true, None, false, Some(Music), None, Video),
+            MediaOpenAction::NewWindow,
+            "音乐空窗 + 视频目标：不得就地打开"
+        );
+        // 自身是音乐窗（有 tab）+ 视频目标、无其它媒体窗 → 不得按「自身是媒体」就地打开
+        // → NewWindow。
+        assert_eq!(
+            resolve_media_open_action(true, true, true, None, true, Some(Music), None, Video),
+            MediaOpenAction::NewWindow,
+            "音乐窗（有内容）+ 视频目标：不得就地打开"
+        );
+        // 自身是音乐窗 + 音频目标 → 仍就地打开（音乐窗承接音频，既有行为）。
+        assert_eq!(
+            resolve_media_open_action(true, true, true, None, false, Some(Music), None, Music),
+            MediaOpenAction::Here,
+            "音乐窗承接音频：仍就地"
+        );
+        // 非媒体空窗 + 视频目标 → 仍就地打开（既有行为，非 P1-C7 场景）。
+        assert_eq!(
+            resolve_media_open_action(true, true, false, None, false, None, None, Video),
+            MediaOpenAction::Here,
+            "非媒体空窗 + 视频目标：仍就地"
+        );
     }
 
     /// `media_window_kind` 按模型判定：空/文本窗口 None；music_mode → Music。

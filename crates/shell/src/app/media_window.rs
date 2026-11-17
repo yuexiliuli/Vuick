@@ -110,16 +110,28 @@ impl EditorApp {
             return false;
         }
         let self_is_media = self.is_media_window();
-        // 「最近其它媒体窗口」查询收敛到宿主服务（域不直读 EditorAppRegistry）。
+        let self_kind = self.media_window_kind();
+        // 「最近其它媒体窗口」查询收敛到宿主服务（域不直读 EditorAppRegistry）；返回句柄 +
+        // 角色（P1-C7 角色维度：决策据此拒绝「音乐窗口承接视频」）。
         let other = self.media_host_nearest_other_media_window(cx);
+        let (other_handle, other_kind) = match other {
+            Some((wh, k)) => (Some(wh), Some(k)),
+            None => (None, None),
+        };
+        // 目标媒体种类：按扩展名（音频 → Music / 视频 → Video，域决策 `open_target_kind`；
+        // 角色维度的「目标」半边）。
+        let target_kind = shell_media::media_window::open_target_kind(&p);
         let action = shell_media::media_window::resolve_media_open_action(
             self.model.borrow().media_new_window,
             self.model.borrow().reuse_media_window,
             self_is_media,
-            other,
+            other_handle,
             // 发起窗口无任何文件选项卡（空窗/欢迎页）→ 媒体就地打开（域决策
             // `self_has_tabs` 语义见 shell_media::media_window::resolve_media_open_target）。
             !self.model.borrow().tabs.is_empty(),
+            self_kind,
+            other_kind,
+            target_kind,
         );
         // K39 姿势诊断探针：真机冒烟取证用（VUICK_DIAG 守卫，平时零开销）。
         let windows_n = cx
