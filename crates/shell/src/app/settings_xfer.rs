@@ -120,9 +120,27 @@ impl EditorApp {
                         return; // 取消：静默（对齐既有对话框取消语义）
                     };
                     let path = file.path().to_path_buf();
-                    let text = std::fs::read_to_string(&path).ok();
-                    let parsed = text.as_deref().and_then(|t| parse_export_bundle(t).ok());
+                    // 读取前 size 闸（read_import_file 内含上限检查）：超上限 / 读失败 →
+                    // 走既有 toast 链（settings_toast 同一入口）；超大/读错单独给更准文案，
+                    // 其余解析失败仍走 apply_import_bundle(None) 的「不是有效…」错误链。
+                    let (parsed, early_toast) = match read_import_file(&path) {
+                        Ok(text) => (parse_export_bundle(&text).ok(), None),
+                        Err(ImportReadError::TooLarge) => (
+                            None,
+                            Some(format!(
+                                "导入失败：文件超过大小上限（上限 {} 字节）",
+                                session_store::MAX_IMPORT_SLOT_BYTES
+                            )),
+                        ),
+                        Err(ImportReadError::Io(e)) => {
+                            (None, Some(format!("导入失败：读取文件出错（{e}）")))
+                        }
+                    };
                     let _ = cx.update_window_entity(&entity, |this, window, cx| {
+                        if let Some(msg) = early_toast {
+                            this.settings_toast(msg, cx);
+                            return;
+                        }
                         let session_dir = config::user::UserPrefs::session_dir();
                         this.apply_import_bundle(parsed, &session_dir, window, cx);
                     });
@@ -173,6 +191,11 @@ impl EditorApp {
             // 会话恢复 / 关闭到托盘开关：以导入值为准（诚实跟随，含显式 false）。
             self.model.borrow_mut().session_restore = prefs.session_restore.unwrap_or(true);
             self.model.borrow_mut().close_to_tray = prefs.close_to_tray.unwrap_or(false);
+            // 镜像同步托盘 crate 的决策 flag（同 close_tray.rs:toggle_close_to_tray 三件套）：
+            // 真实 on_window_should_close 读 `tray::should_close_to_tray()`（init.rs），只写
+            // model 字段会让导入后「点 × 隐藏到托盘」按旧 flag 判定（行为分叉直至重启），
+            // 违约「配置即时生效」。测试构建 `set_close_to_tray` 为纯 flag 翻转（不碰 Win32）。
+            tray::set_close_to_tray(prefs.close_to_tray.unwrap_or(false));
             // 「记住阅读进度」开关：以导入值为准（诚实跟随，含显式 false），即时生效。
             self.model.borrow_mut().restore_reading_progress =
                 prefs.restore_reading_progress.unwrap_or(true);
@@ -266,6 +289,32 @@ impl EditorApp {
         );
         cx.notify();
     }
+}
+
+/// 「导入设置」文件读取：**读取前**先做文件大小上限闸（≤
+/// [`session_store::MAX_IMPORT_SLOT_BYTES`] = 64 MiB；与 `session_store` 解析期的总包上限
+/// `IMPORT_MAX_BYTES`（settings_xfer.rs，与单槽上限同值）同口径对齐）——超限直接
+/// `TooLarge` 拒绝，不做 `read_to_string` 整读超大文件进内存（`read_to_string` 前按
+/// metadata 判，零大分配）。前台同步读：设置包远小于上限、读盘 ~ms 级且仅用户主动
+/// 导入触发（非热路径）；若将来需放开任意超大文件再按 K167 oneshot 姿势后台化。
+/// `#[cfg(not(test))]`：仅对话框入口 `import_settings` 消费（与 `local_yyyymmdd` 同款
+/// 构建门控，测试构建无调用 → 避免未用告警；将来要直测本 helper 时去掉门控即可）。
+#[cfg(not(test))]
+fn read_import_file(path: &std::path::Path) -> Result<String, ImportReadError> {
+    let meta = std::fs::metadata(path).map_err(ImportReadError::Io)?;
+    if meta.len() >= session_store::MAX_IMPORT_SLOT_BYTES as u64 {
+        return Err(ImportReadError::TooLarge);
+    }
+    std::fs::read_to_string(path).map_err(ImportReadError::Io)
+}
+
+/// [`read_import_file`] 的错误分类：超大文件与普通读失败分开，入口给不同 toast。
+#[cfg(not(test))]
+enum ImportReadError {
+    /// 文件大小 ≥ 总包上限（读取前已拒，不读盘）。
+    TooLarge,
+    /// 读盘 / 非 UTF-8 解码失败（`read_to_string` 出错）。
+    Io(std::io::Error),
 }
 
 /// 本地日期 `YYYYMMDD`（仅导出对话框默认文件名；无日期库依赖，纯算术）。

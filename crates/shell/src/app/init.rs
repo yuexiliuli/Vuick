@@ -162,6 +162,10 @@ impl EditorApp {
             open_finish_count: 0,
             open_dialog_calls: 0,
             last_title_ctrl_fg: None,
+            title_ctrl_fg_probe: std::rc::Rc::new(std::cell::RefCell::new(
+                TitleCtrlIconFg::default(),
+            )),
+            material_layer_cache: None,
             tab_bounds: Vec::new(),
             drag_ghost: None,
             constructing: false,

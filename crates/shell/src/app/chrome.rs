@@ -88,33 +88,34 @@ impl EditorApp {
 
     /// 自绘 Mica 材质层：窗口基底用 N 段半透明色带叠出柔和垂向渐变（纯应用内绘制，
     /// 不调用系统 Mica/acrylic/DWM）。放在最底层，chrome 半透明表面叠其上形成玻璃感。
-    pub(super) fn render_material_layer(&self, window: &Window) -> impl IntoElement {
+    ///
+    /// 每帧调用；段参数（64 段：顶边/高/颜色）只取决于「窗口高度桶 + 明暗主题」——
+    /// 已算好的段数组缓存于 `material_layer_cache`（`(高度桶, dark_mode) → Rc<Vec<MaterialBand>>`），
+    /// 缓存命中时每帧只 clone 一次 `Rc`、由 [`MaterialLayer`] 元素直接画 64 个 quad，
+    /// **不再重建 64 个 band Div / 重算插值**；只有高度桶或明暗主题变化才重算段数组。
+    /// 失效面枚举：窗口高度（桶）变化 / 明暗主题切换 两维 → 重算，其余（滚动、内容变化、
+    /// 鼠标移动、桶内小幅 resize）一律复用。
+    pub(super) fn render_material_layer(&mut self, window: &Window) -> impl IntoElement {
+        let dark = self.model.borrow().dark_mode;
         let chrome = self.chrome();
         let top: gpui::Hsla = chrome.material_top.into();
         let bottom: gpui::Hsla = chrome.material_bottom.into();
         let h = window.bounds().size.height.as_f32();
-        // 分带数取 64：每根带跳变 <0.5/255 灰度，肉眼不可辨；
-        // 若段数太少（如 8），明暗阶梯会透过半透明侧栏/工具条显现为横向分带。
-        const N: usize = 64;
-        let band_h = h / N as f32;
-        let mut layer = div().absolute().top_0().left_0().right_0().bottom_0();
-        for i in 0..N {
-            let t = i as f32 / (N - 1) as f32;
-            // 材质色是近中性灰（h/s≈0），直接对 lightness 插值即可
-            let lum = top.l + (bottom.l - top.l) * t;
-            let band = gpui::hsla(0.0, 0.0, lum, 1.0);
-            let mut b = div().absolute().left_0().right_0().bg(band);
-            if i == N - 1 {
-                // 最后一根锚到底，保证渐变终点精确等于 bottom 色
-                b = b.top(px(i as f32 * band_h)).bottom_0();
-            } else {
-                // 每根向下多叠 1px：N 段取整会在带间留 0~1px 缝透出底色成细线，
-                // 多叠 1px 且后画者在上一层，彻底消除缝隙。
-                b = b.top(px(i as f32 * band_h)).h(px(band_h + 1.0));
+        // 高度桶：按 8px 量化——连续拖拽 resize 时不必每 1px 重算 64 段；桶内高度差
+        //（≤±4px）由最后一段锚底部自适应，肉眼不可辨。
+        const BUCKET_PX: f32 = 8.0;
+        let h_bucket = (h / BUCKET_PX).round() * BUCKET_PX;
+        // 取（或重算）段数组：命中缓存只 clone `Rc`，跨越桶/主题才进 build_material_bands。
+        let bands = match &self.material_layer_cache {
+            Some((kh, kd, cached)) if *kh == h_bucket && *kd == dark => cached.clone(),
+            _ => {
+                let bands = build_material_bands(h_bucket, top, bottom);
+                self.material_layer_cache = Some((h_bucket, dark, bands.clone()));
+                bands
             }
-            layer = layer.child(b);
-        }
-        layer
+        };
+        // 外层保持 absolute 铺底（与旧结构一致）；渐变段由 `MaterialLayer` 一次直画。
+        div().absolute().top_0().left_0().right_0().bottom_0().child(MaterialLayer { bands })
     }
 
     /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景。
@@ -294,8 +295,11 @@ impl EditorApp {
         // 测试可读：本帧解析出的图标前景色在 `icon_color_for` 闭包写入 probe（闭包在
         // `.build(window, cx)` 同步调用 = render 期），随构建一并落盘 app 实体——
         // 断言「注入」仍走真实渲染路径。
-        let probe: std::rc::Rc<std::cell::RefCell<TitleCtrlIconFg>> =
-            std::rc::Rc::new(std::cell::RefCell::new(TitleCtrlIconFg::default()));
+        // 复用宿主持有的共享探针（`title_ctrl_fg_probe`）：最小化/最大化/关闭三钮每帧
+        // 只 clone（Rc 原子计数、零分配），不再各自新建 `Rc<RefCell>`。渲染路径不变：
+        // 闭包在 `.build()` 期同步写入本 kind 字段 → 构建后按当前 kind 合并进
+        // `last_title_ctrl_fg`。
+        let probe = self.title_ctrl_fg_probe.clone();
         let pb = probe.clone();
         let el = ui::icon_button(kind.id(), icon)
             .wh(40., 32.)
@@ -459,5 +463,132 @@ impl EditorApp {
         }
         // 不用 .with_priority(100)（菜单已用 100）：toast 恒在最上
         gpui::deferred(layer).with_priority(200).into_any_element()
+    }
+}
+
+/// 计算 64 段材质带（构建期一次性；仅「尺寸桶 / 明暗主题」变化时才被调用）：
+/// 颜色直接对 lightness 插值（材质色 h/s≈0），几何与旧的 64-Div 版逐项一致——
+/// 末段锚到底（`last=true`，paint 期随实际窗高拉伸），其余每段向下多叠 1px
+/// （N 段取整会在带间留 0~1px 缝透出底色成细线，多叠 1px 且后画者在上一层消除缝隙）。
+fn build_material_bands(
+    h_bucket: f32,
+    top: gpui::Hsla,
+    bottom: gpui::Hsla,
+) -> std::rc::Rc<Vec<MaterialBand>> {
+    // 分带数取 64：每根带跳变 <0.5/255 灰度，肉眼不可辨；
+    // 若段数太少（如 8），明暗阶梯会透过半透明侧栏/工具条显现为横向分带。
+    const N: usize = 64;
+    let band_h = h_bucket / N as f32;
+    let mut bands = Vec::with_capacity(N);
+    for i in 0..N {
+        let t = i as f32 / (N - 1) as f32;
+        let lum = top.l + (bottom.l - top.l) * t;
+        let top_px = i as f32 * band_h;
+        if i == N - 1 {
+            bands.push(MaterialBand {
+                top: top_px,
+                height: 0.0,
+                color: gpui::hsla(0.0, 0.0, lum, 1.0),
+                last: true,
+            });
+        } else {
+            bands.push(MaterialBand {
+                top: top_px,
+                height: band_h + 1.0,
+                color: gpui::hsla(0.0, 0.0, lum, 1.0),
+                last: false,
+            });
+        }
+    }
+    std::rc::Rc::new(bands)
+}
+
+/// Mica 材质层绘制元素：paint 期把缓存的段数组直接画成 64 个 quad（`window.paint_quad`），
+/// 不构造 64 个 Div 子元素——段参数在构建期一次性算好（`Rc` 共享、见
+/// [`EditorApp::render_material_layer`] 的 `material_layer_cache`），每帧零段级分配，
+/// 只克隆一次 `Rc`。几何与旧 64-Div 版逐项一致。
+struct MaterialLayer {
+    bands: std::rc::Rc<Vec<MaterialBand>>,
+}
+
+impl gpui::IntoElement for MaterialLayer {
+    type Element = MaterialLayer;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for MaterialLayer {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        base::util::source_location()
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        // 填满外层 absolute 铺底容器（父尺寸的 100%，见外层 div.absolute() 定位）。
+        let mut style = gpui::Style::default();
+        style.size = gpui::Size::new(
+            gpui::Length::Definite(gpui::relative(1.0)),
+            gpui::Length::Definite(gpui::relative(1.0)),
+        );
+        (window.request_layout(style, None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut gpui::Window,
+        _: &mut gpui::App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut gpui::Window,
+        _: &mut gpui::App,
+    ) {
+        // 顺序画 0..N：后画者在上一层（对齐旧的 Div 兄弟压叠 → 段边界取下方段颜色）。
+        let x = bounds.origin.x.as_f32();
+        let width = bounds.size.width.as_f32();
+        let top_y = bounds.origin.y.as_f32();
+        let bottom_y = top_y + bounds.size.height.as_f32();
+        for band in self.bands.iter() {
+            let y = top_y + band.top;
+            let height = if band.last {
+                // 末段锚到底：随实际窗高拉伸（桶内 resize 无需重算段数组）。
+                bottom_y - y
+            } else {
+                band.height
+            };
+            window.paint_quad(gpui::quad(
+                gpui::Bounds::new(gpui::point(px(x), px(y)), gpui::Size::new(px(width), px(height))),
+                gpui::Corners::default(),
+                band.color,
+                gpui::Edges::<gpui::Pixels>::default(),
+                gpui::transparent_black(),
+                gpui::BorderStyle::default(),
+            ));
+        }
     }
 }

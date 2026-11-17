@@ -986,6 +986,50 @@ async fn import_applies_prefs_immediately(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M（settings_xfer.rs:175）「导入后托盘镜像未同步」红测：导入内含
+/// `close_to_tray: true` 的设置包后，**tray 侧决策 flag**（`tray::should_close_to_tray`）
+/// 必须随 apply 即时同步——真实 `on_window_should_close` 读的是 tray 全局 flag
+/// （`tray::should_close_to_tray`，init.rs:372），只写 `model.close_to_tray` 会让
+/// 「点 × → 隐藏到托盘」在导入后仍按旧 flag 判定（行为分叉直至重启，违约「配置即时生效」）。
+///
+/// 现状缺陷可观测面：`apply_import_bundle`（settings_xfer.rs:175）只写
+/// `model.borrow_mut().close_to_tray`、从不调 `tray::set_close_to_tray`；对照组
+/// `toggle_close_to_tray`（close_tray.rs:14-19）是三件套（字段 + tray flag + persist）。
+/// 断言前先归零 tray 全局 + 模拟「主窗口已知 / 图标已挂载」（mirror tray_menu.rs），
+/// 使 `should_close_to_tray()` 退化为只读 `CLOSE_TO_TRAY` flag→归零后保持 false → 红。
+#[gpui::test]
+async fn import_must_sync_tray_close_flag(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (app, cx) = add_app(cx);
+    let body = session_store::build_export_bundle(
+        &serde_json::json!({ "close_to_tray": true }),
+        &session_store::SessionManifest { version: 1, active_tab: 0, tabs: vec![] },
+        &[],
+    );
+    let parsed = session_store::parse_export_bundle(&body).unwrap();
+    let dir = xfer_temp_dir("import_tray_sync");
+    cx.update(|_w, cx| {
+        app.update(cx, |app, cx| {
+            // K8：与真实 %APPDATA% config 解耦（显式归零）＋模拟「主窗口已知/图标已挂载」
+            // 前置（对齐 tray_menu.rs:28-29 姿势）——此时 tray 判定只剩 CLOSE_TO_TRAY 一个输入。
+            tray::set_close_to_tray(false);
+            tray::set_main_hwnd(12345);
+            tray::set_tray_icon_registered(true);
+            app.apply_import_bundle(Some(parsed), &dir, _w, cx);
+            assert!(app.model.borrow_mut().close_to_tray, "模型字段随导入更新");
+            assert!(
+                tray::should_close_to_tray(),
+                "托盘侧必须随 apply 即时同步（当前 apply_import_bundle 未 set_close_to_tray → 红）"
+            );
+            // 收尾清托盘全局，防污染同进程其它 shell 测试（同 tray_menu.rs 收尾姿势）。
+            tray::set_main_hwnd(0);
+            tray::set_close_to_tray(false);
+            tray::set_tray_icon_registered(false);
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 「恢复上次会话」在导入 prefs 里显式 false → 诚实跟随：开关关闭、会话不写（清盘面），
 /// toast 如实说明（不回写、不整体回滚）。
 #[gpui::test]

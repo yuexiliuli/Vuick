@@ -9,3 +9,7 @@ description = "vuick L0 纯 UI 组件叶子 crate（自绘横向滚动条 TableS
 # 纯 UI 组件零 EditorApp 依赖：只用 gpui 平台元素 API + config::layout 常量（只重分配、不加新）。
 gpui = { workspace = true }
 config = { path = "../config" }
+
+[dev-dependencies]
+# 红测交互（simulate_mouse_* / debug_bounds）：dev 下给同一 gpui 叠加 test-support（同根/zed 姿势）。
+gpui = { workspace = true, features = ["test-support"] }

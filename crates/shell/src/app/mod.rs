@@ -171,6 +171,21 @@ impl gpui::Global for EditorAppRegistry {}
 /// 故用模块私有 `use` 引入。
 use shell_core::MdScrollSync;
 
+/// Mica 材质层单段（`render_material_layer` 构建期一次算好、`material_layer_cache` 缓存
+/// 的段参数）：像素顶边 / 像素高 / 颜色；`last=true` 最后一段时 `height` 忽略（paint 期
+/// 锚到实际窗底、随窗口高度拉伸，桶内 resize 无需重算）。`pub(super)`：EditorApp 字段
+/// 与 chrome.rs（`use super::*`）共同消费。
+pub(super) struct MaterialBand {
+    /// 段顶边距窗口顶的像素。
+    pub(super) top: f32,
+    /// 段像素高（`last` 时忽略）。
+    pub(super) height: f32,
+    /// 段颜色（lightness 插值）。
+    pub(super) color: gpui::Hsla,
+    /// 是否最后一段（锚到底，随实际窗高拉伸）。
+    pub(super) last: bool,
+}
+
 pub struct EditorApp {
     /// 模型半状态统一容器：`tabs` / `active_tab` 等文件/会话/搜索/偏好模型态在
     /// `shell_core::AppModel`；UI 半状态（窗口 / 布局 / 聚焦 / 主题 glue / registry）
@@ -238,6 +253,16 @@ pub struct EditorApp {
     /// 断言「hover/按压注入色」确实经过真实渲染路径（由 hover/press keyed 态驱动）。
     /// `None` = 标题栏尚未渲染过。
     pub(crate) last_title_ctrl_fg: Option<TitleCtrlIconFg>,
+    /// 窗口控制钮图标前景色探针（`icon_color_for` 闭包同步写入的共享 `Rc`）：构建期
+    /// **一次创建、宿主长期持有**，最小化/最大化/关闭三钮每帧复用同一份——避免每钮
+    /// 每帧新建 `Rc<RefCell>` 的分配噪音（标题栏每帧重建 ×3）。渲染路径与原先相同：
+    /// 闭包写入 → 构建后按当前 kind 合并进 `last_title_ctrl_fg`。
+    pub(crate) title_ctrl_fg_probe: std::rc::Rc<std::cell::RefCell<TitleCtrlIconFg>>,
+    /// Mica 材质层缓存：`(高度桶, dark_mode)` → 已算好的 64 段材质带（`Rc` 共享）。
+    /// 根渲染每帧调 `render_material_layer`，桶/主题不变时只 clone `Rc` 复用段数组、
+    /// 由 `MaterialLayer` 元素直接画 64 个 quad——不再每帧重建 64 个 band Div；
+    /// 仅尺寸桶 / 明暗主题变化才重算段数组。`None` = 尚未渲染过。
+    material_layer_cache: Option<(f32, bool, Rc<Vec<MaterialBand>>)>,
     /// 拖出窗外时跟随鼠标的「幽灵胶囊」置顶透明小窗句柄（见 [`Self::update_drag_ghost`]）：
     /// 让被拖选项卡在窗外**仍跟手可见**（gpui 拖拽幽灵只画在窗内，窗外被裁剪）；
     /// 回到窗内 / 松开 / 取消即销毁。None = 未建 / 已销毁。
