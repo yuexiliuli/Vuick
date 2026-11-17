@@ -4,7 +4,7 @@
 //! （IME/文本输入）+ 自定义 [`InputElement`]（paint 期挂 `window.handle_input`、画文本/
 //! 占位符/光标）。键盘（Backspace/Delete/方向/Home/End/Ctrl 组合）走本地 `crate::actions`
 //! 的 "Input" keymap（#10 自绑）：元素 `key_context("Input")` + `on_action` 接线；
-//! 未实现的组合（如 Undo/Redo）按 gpui 分发语义静默不处理即可。
+//! Undo/Redo 已实现（内联栈，`UNDO_LIMIT` 深度 + 内嵌合并）。
 //!
 //! IME 状态机本体已收敛到 `ime`（M2.5 双份合一）：本文件只实现
 //! [`ImeTextHost`] 适配层（byte 语义、`&str` 遍历的 UTF-16 换算、经 `edit_range`
@@ -26,10 +26,10 @@ use gpui::{
 };
 
 use crate::actions::{
-    Backspace, Copy, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart, MoveEnd, MoveHome,
-    MoveLeft, MoveRight, MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, SelectAll,
-    SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart, SelectToStart,
-    SelectToStartOfLine,
+    Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart, MoveEnd,
+    MoveHome, MoveLeft, MoveRight, MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart,
+    PasteNormalized, Redo, SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd,
+    SelectToPreviousWordStart, SelectToStart, SelectToStartOfLine, Undo,
 };
 use config::layout::DEFAULT_FONT_SIZE;
 // P3a 断环关键点：EditIntent 已下沉 base，本 crate 不再经 editor 引用（editor↔ui 环断开）。
@@ -57,6 +57,13 @@ const CARET_PX: f32 = 1.0;
 const CARET_BLINK_MS: u64 = 500;
 /// 光标交互后的静止期（ms，期间光标常亮不闪，对齐编辑器 `BLINK_PAUSE_MS`）。
 const CARET_BLINK_PAUSE_MS: u64 = 300;
+/// 撤销/重做栈深度上限（超出丢最旧；对齐 wysiwyg `UNDO_LIMIT`=200）。
+const UNDO_LIMIT: usize = 200;
+/// 内嵌编辑合并时间窗（ms）：两次连续内嵌编辑间隔 ≥ 此值即新起撤销单元
+/// （对齐 Zed `History::group_interval` / editor_core `UNDO_GROUP_MS` = 300ms）。
+const UNDO_GROUP_MS: u64 = 300;
+/// 显式 `text_color` 注入时占位符的低不透明度系数（在其上派生「次要文字」观感）。
+const PLACEHOLDER_ALPHA: f32 = 0.5;
 
 // -------------------------------------------------------------------------
 // P3/D1 声明式参数面：尺寸档 / 粘贴模式 / 提交校验（全部默认 = 现状行为，
@@ -136,6 +143,29 @@ pub enum Validation {
     Err(Option<String>),
 }
 
+/// 写入分类（撤销记录粒度）：`edit_range` 是组件唯一文本写入口，所有文本变更按此登记
+/// 撤销历史（R4 单点登记，防漏记/重记）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UndoClass {
+    /// IME 组合更新（组合键按下中）：不产生撤销单元；组合首键锚定「组合起点快照」，
+    /// 组合提交时整体作为一组入栈。
+    ImeCompose,
+    /// 内嵌直输/退格/删除/词删除：与同一段连续内嵌编辑（<300ms 且无光标移动）合并为
+    /// 一个撤销单元。
+    Inline,
+    /// 独立一个撤销单元：粘贴 / IME 组合提交 / 剪切（不合并）。
+    Atomic,
+}
+
+/// 进行中的内嵌撤销合并单元（仿 wysiwyg `open_unit` / editor_core `pending`）：
+/// 记录组起始的全文+选区快照与上次编辑时刻，供 300ms 时间窗合并判定。
+/// 合并只延伸「组终点」，`text_before`/`sel_before` 保持组起始态（= 撤销目标）。
+struct UndoOpen {
+    text_before: String,
+    sel_before: Range<usize>,
+    last_edit_at: Instant,
+}
+
 /// 单行输入框状态（实体）：文本 + 占位符 + 焦点 + 光标（字节区间）+ 元素边界。
 pub struct InputState {
     text: String,
@@ -174,6 +204,21 @@ pub struct InputState {
     validate: Option<fn(&str, &Window) -> Validation>,
     /// 提交需确认：`true` 时仅校验通过才 emit `Submit`；默认 `false` = 现状。
     confirm_required: bool,
+    /// 显式文字色（None = 沿用 `Theme::global` 的 fg/fg_muted）。供消费方在**固定深色面**
+    /// （如 music 深紫 pill）注入不随全局深浅翻转的文字色；占位符在其低不透明度派生。
+    text_color: Option<Hsla>,
+    /// 撤销栈：每个条目 = 该组起始的全文 + 字节选区快照（撤销目标）；深度上限
+    /// [`UNDO_LIMIT`]，超出丢最旧。各 InputState 实体各自独立。
+    undo_stack: Vec<(String, Range<usize>)>,
+    /// 重做栈：条目 = 撤销瞬间被回退的当前态（重做目标）；新编辑后整棵作废（历史分叉）。
+    redo_stack: Vec<(String, Range<usize>)>,
+    /// 进行中的内嵌合并单元（None = 无）；Enter 提交/粘贴/撤销等动作封口入栈。
+    undo_open: Option<UndoOpen>,
+    /// 是否允许后续内嵌编辑并入当前组：**纯光标移动（方向/点按/拖选/全选）置 false 断层**
+    /// （对齐 Zed `set_cooperative`）；文本编辑落地置 true。
+    cooperative: bool,
+    /// IME 组合起点快照（组合首键锚定；组合提交时作撤销单元「编辑前」态；非组合编辑清掉）。
+    composition_anchor: Option<(String, Range<usize>)>,
 }
 
 impl InputState {
@@ -199,6 +244,12 @@ impl InputState {
             paste_mode: PasteMode::default(),
             validate: None,
             confirm_required: false,
+            text_color: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_open: None,
+            cooperative: true,
+            composition_anchor: None,
         }
     }
 
@@ -248,6 +299,13 @@ impl InputState {
         self
     }
 
+    /// 显式文字色（None = 沿用主题 fg/fg_muted；占位符按其低不透明度派生）。
+    /// 用于固定深色面上的输入框（如 music 深紫 pill）——文字不随全局深浅翻转。
+    pub fn text_color(mut self, color: Hsla) -> Self {
+        self.text_color = Some(color);
+        self
+    }
+
     /// 当前文本。
     pub fn value(&self) -> SharedString {
         SharedString::from(self.text.clone())
@@ -268,6 +326,8 @@ impl InputState {
         self.selection = len..len;
         self.selection_head = len;
         self.marked = None;
+        // 整体替换 = 整框内容换锚：清空撤销/重做历史（旧堆栈相对新内容无意义）。
+        self.clear_undo_history();
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -280,6 +340,8 @@ impl InputState {
         self.selection = len..len;
         self.selection_head = len;
         self.marked = None;
+        // 整体替换 = 整框内容换锚：清空撤销/重做历史。
+        self.clear_undo_history();
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -296,14 +358,38 @@ impl InputState {
     /// 任何一次落地都清掉组合态（提交/删除/粘贴都结束组合；组合更新经
     /// [`ime::replace`] 在 apply 之后重新写回 marked，不受影响）。
     ///
+    /// 唯一文本写入口：所有文本变更（字符/退格/删除/粘贴/剪切/IME）都经此登记
+    /// 撤销历史（R4）。`class` = 撤销分类（见 [`UndoClass`]）。
+    ///
     /// 单行不变式：本框渲染走 `shape_line`（gpui 对该路径断言文本不含 `\n`，
     /// `vendor/.../text_system.rs:645`），故**任何**写入入口（粘贴/IME/程序化替换）
     /// 都把换行折叠为空格再落盘——否则多行粘贴/组合会触发 `shape_line` panic。
     /// `\n` 与 `' '` 同为 1 字节，折叠不改字节长度，光标/选区算术不受影响。
-    fn edit_range(&mut self, range: Range<usize>, new_text: &str, cx: &mut Context<Self>) {
+    fn edit_range(
+        &mut self,
+        range: Range<usize>,
+        new_text: &str,
+        class: UndoClass,
+        cx: &mut Context<Self>,
+    ) {
         let start = range.start.min(self.text.len());
         let end = range.end.min(self.text.len());
         let folded = new_text.replace('\n', " ");
+        // 无实际变更（边界空删 / 空粘贴 / 空组合替换）→ 全链路 no-op：不登记撤销、不发
+        // Change——空剪贴板/空文本粘贴与删到无可删都不应产生副作用（R6）。
+        if start == end && folded.is_empty() {
+            return;
+        }
+        match class {
+            // 组合更新：不产生撤销单元；组合首键（尚无 marked）锚定组合起点快照，
+            // 组合提交时（Atomic）整体作一组（见 record_undo）。
+            UndoClass::ImeCompose => {
+                if self.marked.is_none() {
+                    self.composition_anchor = Some((self.text.clone(), self.selection.clone()));
+                }
+            }
+            UndoClass::Inline | UndoClass::Atomic => self.record_undo(class),
+        }
         self.text.replace_range(start..end, &folded);
         let caret = start + folded.len();
         self.selection = caret..caret;
@@ -311,6 +397,127 @@ impl InputState {
         self.marked = None;
         cx.emit(InputEvent::Change);
         cx.notify();
+    }
+
+    // ---------------------------------------------------------------------
+    // 撤销/重做（内联轻量栈）
+    //
+    // 撤销历史只记组件内文本状态（值 + 选区快照），各 InputState 实体各自独立。
+    // 语义与 editor_core::undo::UndoManager / Zed text.rs `History.group` 同构
+    // （事务=一组编辑、300ms 时间窗合并、redo 分叉作废、上限丢最旧），但按
+    // 「全文快照」存储（单行框文本短、编辑密度低，快照成本可忽略）。
+    //
+    // ⚠️ 不直接复用 editor_core 的 UndoManager：editor_core 依赖 ui
+    // （crates/editor_core/Cargo.toml 的 `ui = { path = "../ui" }`），ui 反向依赖会
+    // 成环；故在 ui 内内联同构轻量栈（对齐 `markdown_wysiwyg` types.rs:207 的
+    // `Vec<(String, Range)> + UNDO_LIMIT` 模式）。若 editor_core 未来解除对 ui 的
+    // 依赖，可改为直接复用 UndoManager。
+    //
+    // 合并边界（对齐 Zed）：
+    // - 连续内嵌输入（字符/退格/删除/词删除）：无光标移动（cooperative）且距上次编辑
+    //   <UNDO_GROUP_MS → 并入当前组。
+    // - 粘贴 / IME 组合提交 / 剪切：各自独立一组（永不合并）。
+    // - Enter 提交（Submit）封口本单元（仿 `finalize_last_transaction`）。
+    // - 新编辑（set_value/replace）清空历史：整框内容已换锚。
+    // - Redo 分叉作废：撤销后新编辑清空 redo 栈。
+    // ---------------------------------------------------------------------
+
+    /// 封口进行中的内嵌合并组入撤销栈（组起始态 = 撤销目标）。
+    fn flush_undo_open(&mut self) {
+        if let Some(open) = self.undo_open.take() {
+            self.push_undo((open.text_before, open.sel_before));
+        }
+    }
+
+    /// 入撤销栈（深度上限 [`UNDO_LIMIT`]，超出丢最旧）。
+    fn push_undo(&mut self, state: (String, Range<usize>)) {
+        if self.undo_stack.len() >= UNDO_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(state);
+    }
+
+    /// 清空撤销/重做历史（整体替换/程序化写：整框内容已换锚，旧堆栈无意义）。
+    fn clear_undo_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_open = None;
+        self.composition_anchor = None;
+        self.cooperative = true;
+    }
+
+    /// **单点撤销登记**（文本变更落地前调用，此时 `self.text`/`self.selection` 仍是
+    /// 编辑前状态）：所有文本变更经 `edit_range` 汇到这里，防漏记/重记。
+    ///
+    /// - `Atomic`（粘贴/IME 提交/剪切）：永不合并——封口当前进行中内嵌组，本编辑自身
+    ///   作为一组（before = 编辑前状态；IME 组合提交用组合起点快照）。
+    /// - `Inline`（直输/退格/删除/词删除）：无光标移动且距上次内嵌编辑 <[`UNDO_GROUP_MS`]
+    ///   则并入开放组（合并只延伸 after，不动 before）；否则封口旧组、开新组。
+    fn record_undo(&mut self, class: UndoClass) {
+        // 任何真实编辑都作废重做分支：撤销后新编辑 = 历史分叉，防 Ctrl+Y 以旧态重放。
+        self.redo_stack.clear();
+        let anchor = self.composition_anchor.take();
+        if class == UndoClass::Atomic {
+            self.flush_undo_open();
+            let before = anchor.unwrap_or_else(|| (self.text.clone(), self.selection.clone()));
+            self.push_undo(before);
+            self.cooperative = true;
+            return;
+        }
+        let merge = self.cooperative
+            && self.undo_open.as_ref().is_some_and(|o| {
+                o.last_edit_at.elapsed().as_millis() < UNDO_GROUP_MS as u128
+            });
+        if merge {
+            if let Some(o) = self.undo_open.as_mut() {
+                o.last_edit_at = Instant::now();
+            }
+            self.cooperative = true;
+            return;
+        }
+        self.flush_undo_open();
+        self.undo_open = Some(UndoOpen {
+            text_before: self.text.clone(),
+            sel_before: self.selection.clone(),
+            last_edit_at: Instant::now(),
+        });
+        self.cooperative = true;
+    }
+
+    /// 恢复某撤销/重做目标态（全文 + 字节选区），发 Change（撤销/重做改变文本内容）。
+    fn restore_state(&mut self, text: String, sel: Range<usize>, cx: &mut Context<Self>) {
+        self.text = text;
+        let len = self.text.len();
+        let start = sel.start.min(len);
+        let end = sel.end.min(len).max(start);
+        self.selection = start..end;
+        self.selection_head = end;
+        self.marked = None;
+        self.composition_anchor = None;
+        self.kick_caret();
+        cx.emit(InputEvent::Change);
+        cx.notify();
+    }
+
+    fn on_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        self.flush_undo_open();
+        if let Some((text, sel)) = self.undo_stack.pop() {
+            // 被撤销的当前态进重做栈（供 Ctrl+Y 回推）。
+            self.redo_stack.push((self.text.clone(), self.selection.clone()));
+            self.restore_state(text, sel, cx);
+        }
+        // 撤销后光标运动断层（对齐 Zed undo 后 `set_cooperative(false)`）。
+        self.cooperative = false;
+    }
+
+    fn on_redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        self.flush_undo_open();
+        if let Some((text, sel)) = self.redo_stack.pop() {
+            self.push_undo((self.text.clone(), self.selection.clone()));
+            self.restore_state(text, sel, cx);
+        }
+        // 重做后光标运动断层（对齐 Zed redo 后 `set_cooperative(false)`）。
+        self.cooperative = false;
     }
 
     // -- 光标/编辑原语（字节区间，始终落在 char 边界）--
@@ -339,6 +546,8 @@ impl InputState {
         let index = index.min(self.text.len());
         self.selection = index..index;
         self.selection_head = index;
+        // 纯光标移动 → 撤销合并断层（对齐 Zed `set_cooperative(false)`）。
+        self.cooperative = false;
         self.kick_caret();
         cx.notify();
     }
@@ -359,6 +568,8 @@ impl InputState {
             self.selection = index..anchor;
         }
         self.selection_head = index;
+        // 纯选区变更 → 撤销合并断层（对齐 Zed `set_cooperative(false)`）。
+        self.cooperative = false;
         self.kick_caret();
         cx.notify();
     }
@@ -411,6 +622,8 @@ impl InputState {
         let len = self.text.len();
         self.selection = 0..len;
         self.selection_head = len;
+        // 纯选区变更 → 撤销合并断层。
+        self.cooperative = false;
         self.kick_caret();
         cx.notify();
     }
@@ -423,30 +636,84 @@ impl InputState {
         }
     }
 
+    /// 剪贴板文本 → 按 paste_mode 折叠/拒绝后的可插入串（None = 整段拒绝，不修改）。
+    ///
+    /// 与 Zed「保留 `\n` 显示 ⋯」的差异：我方单行框渲染走 `shape_line`（gpui 对
+    /// 该路径断言文本不含 `\n`），任何写入都把换行折叠为空格（`Passthrough` 也折叠），
+    /// 防单行崩溃——`PasteMode` 只在「折叠成空格」与「整段拒绝」之间选择，做不到保留
+    /// 换行显示。
+    fn fold_paste(&self, raw: &str) -> Option<String> {
+        let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+        match self.paste_mode {
+            PasteMode::Passthrough => Some(normalized),
+            PasteMode::StripNewlines => Some(normalized.replace('\n', " ")),
+            PasteMode::RejectMultiline => {
+                if normalized.contains('\n') {
+                    None
+                } else {
+                    Some(normalized)
+                }
+            }
+        }
+    }
+
+    /// 粘贴落地：选区替换 + 一次 Atomic 撤销组。平台原生 `paste`（EntityInputHandler）
+    /// 与 Ctrl+V（`PasteNormalized`）共用同一路径。
+    fn do_paste(&mut self, raw: &str, cx: &mut Context<Self>) {
+        if let Some(insert) = self.fold_paste(raw) {
+            self.edit_range(self.selection.clone(), &insert, UndoClass::Atomic, cx);
+        }
+    }
+
+    /// R1：Ctrl+V 粘贴收口（`PasteNormalized` action handler）。
+    /// 空剪贴板不动作；多行处理按当前 PasteMode（`RejectMultiline` 时整段拒绝）。
+    fn on_paste(&mut self, _: &PasteNormalized, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(item) = cx.read_from_clipboard()
+            && let Some(text) = item.text()
+        {
+            self.do_paste(&text, cx);
+        }
+    }
+
+    /// R2：Ctrl+X 剪切收口（`Cut` action handler）。
+    /// 非空选区：写剪贴板 + 删选区 + 一次 Atomic 撤销组。
+    /// 空选区剪切 = 无动作：不采纳编辑器「空选区复制整行」惯例（Zed `cut_common` 的
+    /// 单行延伸）——单行输入无「整行」语义，切割空选区只能清空文本，与用户预期不符。
+    fn on_cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        let sel = self.selection.clone();
+        if sel.start >= sel.end {
+            return;
+        }
+        if let Some(text) = self.text.get(sel.clone()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        }
+        self.edit_range(sel, "", UndoClass::Atomic, cx);
+    }
+
     /// 删除：`backward` 退格 / `forward` 删除；有选区则删选区。
     fn delete(&mut self, backward: bool, cx: &mut Context<Self>) {
         let sel = self.selection.clone();
         if sel.start < sel.end {
-            self.edit_range(sel, "", cx);
+            self.edit_range(sel, "", UndoClass::Inline, cx);
         } else if backward {
             let start = self.prev_char(sel.start);
-            self.edit_range(start..sel.start, "", cx);
+            self.edit_range(start..sel.start, "", UndoClass::Inline, cx);
         } else {
             let end = self.next_char(sel.end);
-            self.edit_range(sel.end..end, "", cx);
+            self.edit_range(sel.end..end, "", UndoClass::Inline, cx);
         }
     }
 
     fn delete_word(&mut self, backward: bool, cx: &mut Context<Self>) {
         let sel = self.selection.clone();
         if sel.start < sel.end {
-            self.edit_range(sel, "", cx);
+            self.edit_range(sel, "", UndoClass::Inline, cx);
         } else if backward {
             let start = self.prev_word(sel.start);
-            self.edit_range(start..sel.start, "", cx);
+            self.edit_range(start..sel.start, "", UndoClass::Inline, cx);
         } else {
             let end = self.next_word(sel.end);
-            self.edit_range(sel.end..end, "", cx);
+            self.edit_range(sel.end..end, "", UndoClass::Inline, cx);
         }
     }
 
@@ -657,15 +924,20 @@ impl InputState {
         // 祖先的 key_down 处理。
         // 本批 4 个消费方（prompt/find/goto/palette）祖先链均无 `on_action(Enter/Escape)`
         //（全仓核实），所以「key_down 层 stop_propagation 即不冒泡」语义成立。
-        // 已知遗留：WYSIWYG 根挂 `on_action(Enter→newline)` + CONTEXT keybinding
-        //（markdown_wysiwyg/src/wysiwyg/mod.rs:519），且 deferred 浮层经
-        // `set_active_node(prepaint_deferred_draws, window.rs:3931)` 挂回 WyEditor
+        // 已知遗留边界：Enter/Esc 走 action 层分发（先于 key_down 层）——祖先链若注册
+        // `on_action(Enter/Esc)` 会在本层 key_down stop 之前被接管（既有已知边界，
+        // 机制详述见上「机制边界」）；当前实例：WYSIWYG 根挂 `on_action(Enter→newline)`
+        // + CONTEXT keybinding（markdown_wysiwyg/src/wysiwyg/mod.rs:519），且 deferred
+        // 浮层经 `set_active_node(prepaint_deferred_draws, window.rs:3931)` 挂回 WyEditor
         // dispatch 路径 → 图片编辑卡输入框内按 Enter 会泄漏触发文档换行：**既有 bug，
         // 本批不动，下一批专项修**。
         match event.keystroke.key.to_ascii_lowercase().as_str() {
             "enter" => {
                 cx.stop_propagation();
                 window.prevent_default();
+                // Enter 提交封口当前撤销单元（仿 `finalize_last_transaction`）：后续
+                // 编辑从提交后状态起新组，避免与提交前输入混入同一撤销单元。
+                self.flush_undo_open();
                 // confirm_required + validate：Err → 拦截提交（不 emit Submit），
                 // 其余键行为不变。默认（confirm_required=false）= 现状恒 Submit。
                 if !self.blocked_submit(window, cx) {
@@ -909,10 +1181,18 @@ impl ImeTextHost for InputState {
         &mut self,
         range: Range<usize>,
         text: &str,
-        _intent: EditIntent,
+        intent: EditIntent,
         cx: &mut Context<Self>,
     ) {
-        self.edit_range(range, text, cx);
+        // 撤销分类：ime「组合更新」= Atomic（apply_edit 里 host 不产生撤销单元，见
+        // edit_range 的 ImeCompose 分支）；「组合提交/直输」= Typing，其中**组合中提交**
+        // （marked 还在组合里）独立一组（Atomic），普通直输可内嵌合并。
+        let class = match intent {
+            EditIntent::Atomic => UndoClass::ImeCompose,
+            EditIntent::Typing if self.marked.is_some() => UndoClass::Atomic,
+            _ => UndoClass::Inline,
+        };
+        self.edit_range(range, text, class, cx);
     }
 }
 
@@ -1019,31 +1299,14 @@ impl EntityInputHandler for InputState {
         cx: &mut Context<Self>,
     ) {
         ime::set_selected_text_range(self, range_utf16);
+        // 平台层落定选区 = 用户光标/选区变更 → 撤销合并断层。
+        self.cooperative = false;
         cx.notify();
     }
 
     fn paste(&mut self, item: ClipboardItem, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = item.text() {
-            // 统一换行规范化先行：\r\n/\r → \n（现状行为）；后续模式判定/折叠都基于 \n。
-            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            let insert: Option<String> = match self.paste_mode {
-                // 现状：规范化后进入编辑管线；`edit_range` 的单行不变式会把换行折叠为
-                // 空格（单行框不保存 `\n`，防 `shape_line` panic）。
-                PasteMode::Passthrough => Some(normalized),
-                // 折叠：每个换行折叠为单个空格（"a\r\nb\nc" → "a b c"）。
-                PasteMode::StripNewlines => Some(normalized.replace('\n', " ")),
-                // 拒绝：含换行的粘贴整段不插入。
-                PasteMode::RejectMultiline => {
-                    if normalized.contains('\n') {
-                        None
-                    } else {
-                        Some(normalized)
-                    }
-                }
-            };
-            if let Some(insert) = insert {
-                self.edit_range(self.selection.clone(), &insert, cx);
-            }
+            self.do_paste(&text, cx);
         }
     }
 
@@ -1115,6 +1378,10 @@ impl Render for InputState {
             .on_action(cx.listener(Self::on_select_to_start_of_line))
             .on_action(cx.listener(Self::on_select_to_end_of_line))
             .on_action(cx.listener(Self::on_copy))
+            .on_action(cx.listener(Self::on_cut))
+            .on_action(cx.listener(Self::on_paste))
+            .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1216,10 +1483,14 @@ impl Element for InputElement {
         } else {
             text.as_str()
         };
+        let injected = self.entity.read(cx).text_color;
+        let fg: Hsla = injected.unwrap_or(theme.colors.fg.into());
         let color: Hsla = if show_placeholder {
-            theme.colors.fg_muted.into()
+            injected
+                .map(|c| c.opacity(PLACEHOLDER_ALPHA))
+                .unwrap_or(theme.colors.fg_muted.into())
         } else {
-            theme.colors.fg.into()
+            fg
         };
         let fs = px(self.entity.read(cx).size.font_size_px());
         let run = TextRun {
@@ -1306,9 +1577,9 @@ impl Element for InputElement {
                             size(px(CARET_PX), line_h),
                         ),
                         corner_radii: gpui::Corners::default(),
-                        background: theme.colors.fg.into(),
+                        background: fg.into(),
                         border_widths: gpui::Edges::default(),
-                        border_color: theme.colors.fg.into(),
+                        border_color: fg,
                         border_style: gpui::BorderStyle::Solid,
                     });
                 }
@@ -2158,6 +2429,474 @@ mod tests {
             events.borrow().1,
             1,
             "confirm_required=false 时 invalid 也应 emit Submit"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // R1-R4：粘贴 / 剪切 / 撤销 / 重做
+    // ---------------------------------------------------------------------
+
+    /// 绑定 ui 本地键位（含 ctrl-x/z/y，见 `test_support`）+ 聚焦输入框，返回窗口句柄
+    /// （供 `dispatch_keystroke` 走真实 按键→action 路径）。
+    fn focus_input_for_keys(
+        input: &Entity<InputState>,
+        wcx: &mut VisualTestContext,
+    ) -> gpui::AnyWindowHandle {
+        let w = wcx.windows().first().copied().expect("有测试窗口");
+        wcx.update(|window, cx| {
+            let fh = input.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        });
+        wcx.run_until_parked();
+        w
+    }
+
+    /// 与 main.rs 同序：`bind_local_keymaps`（含 ctrl-x/z/y）**之后**补 `ctrl-v →
+    /// PasteNormalized` 覆盖绑定（Input 键上下文），供粘贴测试走真实键链（与
+    /// `shell/app/tests/preview.rs` 同款姿势）。
+    fn bind_paste_normalized(cx: &TestAppContext) {
+        cx.update(|cx| {
+            crate::test_support::bind_local_keymaps(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-v",
+                PasteNormalized,
+                Some("Input"),
+            )]);
+        });
+    }
+
+    /// 直调内嵌输入路径（`replace_text_in_range` = 真实键盘直输的 EntityInputHandler
+    /// 入口，ASCII 下字节==UTF-16，测试样本全 ASCII）。每次在收拢光标处插入一段。
+    fn type_text(input: &Entity<InputState>, text: &str, wcx: &mut VisualTestContext) {
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                let sel = s.selection.clone();
+                s.replace_text_in_range(Some(sel.start..sel.start), text, window, cx);
+            });
+        });
+    }
+
+    /// R1：Ctrl+V 粘贴收口——真实键链：选区替换 + 粘贴整体一次撤销/重做。
+    /// 期望推导：hello world 选区 6..11（"world"，字节 h0 e1 l2 l3 o4 空格5 w6…）
+    /// 被 "X"（1 字节）替换 → "hello X"，光标 = 6 + 1 = 7。
+    #[gpui::test]
+    async fn paste_via_ctrl_v_replaces_selection_and_undoes_as_one_group(cx: &mut TestAppContext) {
+        bind_paste_normalized(cx);
+        let (input, wcx, changes) = add_input(cx, "hello world");
+        settle_window(wcx);
+        wcx.update(|_, cx| {
+            input.update(cx, |s, _| {
+                s.selection = 6..11;
+                s.selection_head = 11;
+            });
+        });
+        wcx.write_to_clipboard(gpui::ClipboardItem::new_string("X".to_string()));
+        let w = focus_input_for_keys(&input, wcx);
+        let before = changes.borrow().0;
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-v").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "hello X",
+            "粘贴应替换选区 6..11（world）→ hello X"
+        );
+        let sel = wcx.update(|_, cx| input.read(cx).selection.clone());
+        assert_eq!(sel, 7..7, "粘贴后光标收敛到新文本末尾（6+1=7）");
+        assert_eq!(changes.borrow().0, before + 1, "粘贴应发一次 Change");
+        // Ctrl+Z：整段粘贴作一次撤销单元整体回退。
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "hello world",
+            "粘贴应作为一次撤销单元整体撤销"
+        );
+        // Ctrl+Y 回推。
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-y").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "hello X",
+            "重做应恢复粘贴结果"
+        );
+    }
+
+    /// R1：无选区粘贴 = 光标处插入；空剪贴板（无文本条目）不动作、不发 Change。
+    /// 期望推导：a|b（光标 1）粘 "XY" → "aXYb"（1+2+1=4 字节）。
+    #[gpui::test]
+    async fn paste_inserts_at_caret_and_empty_clipboard_is_noop(cx: &mut TestAppContext) {
+        bind_paste_normalized(cx);
+        let (input, wcx, changes) = add_input(cx, "ab");
+        settle_window(wcx);
+        wcx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".to_string()));
+        let w = focus_input_for_keys(&input, wcx);
+        wcx.update(|_, cx| {
+            input.update(cx, |s, _| {
+                s.selection = 1..1;
+                s.selection_head = 1;
+            });
+        });
+        let before = changes.borrow().0;
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-v").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "aXYb",
+            "无选区粘贴应在光标 1 处插入"
+        );
+        assert_eq!(changes.borrow().0, before + 1, "粘贴应发一次 Change");
+        // 真正「空剪贴板」：无任何条目的 ClipboardItem（`text()` == None）。
+        wcx.write_to_clipboard(gpui::ClipboardItem { entries: vec![] });
+        let before2 = changes.borrow().0;
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-v").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "aXYb",
+            "空剪贴板（无文本）粘贴应无副作用"
+        );
+        assert_eq!(changes.borrow().0, before2, "空剪贴板粘贴不应发 Change");
+    }
+
+    /// R1+R5：PasteMode 经 Ctrl+V 路径同样生效——StripNewlines 折叠、RejectMultiline 整段
+    /// 拒绝。期望推导：strip：base(4) + "a b c"(5) = "basea b c"（9 字节）。
+    #[gpui::test]
+    async fn paste_via_ctrl_v_applies_paste_mode(cx: &mut TestAppContext) {
+        bind_paste_normalized(cx);
+        // StripNewlines：a\r\nb\nc → 折叠为 a b c。
+        let (strip, wcx) = add_input_paste(cx, "base", PasteMode::StripNewlines);
+        settle_window(wcx);
+        wcx.write_to_clipboard(gpui::ClipboardItem::new_string("a\r\nb\nc".to_string()));
+        let w = focus_input_for_keys(&strip, wcx);
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-v").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| strip.read(cx).value().to_string()),
+            "basea b c",
+            "StripNewlines 应折叠换行为单个空格（4+5=9 字节）"
+        );
+        // RejectMultiline：含换行整段拒绝（文本保持原样、不修改）。
+        let (rej, wcx2) = add_input_paste(cx, "ab", PasteMode::RejectMultiline);
+        settle_window(wcx2);
+        wcx2.write_to_clipboard(gpui::ClipboardItem::new_string("x\ny".to_string()));
+        let w2 = focus_input_for_keys(&rej, wcx2);
+        wcx2.dispatch_keystroke(w2, gpui::Keystroke::parse("ctrl-v").unwrap());
+        assert_eq!(
+            wcx2.update(|_, cx| rej.read(cx).value().to_string()),
+            "ab",
+            "RejectMultiline 含换行粘贴应整段拒绝（不修改）"
+        );
+    }
+
+    /// R2：Ctrl+X 剪切收口——非空选区：写剪贴板 + 删选区 + 一次撤销可复原。
+    /// 期望推导：hello world 选区 0..5（"hello"，h0 e1 l2 l3 o4）→ 剪贴板 "hello"，
+    /// 文本剩 " world"（下标 5 的空格保留，5..11 共 6 字节）。
+    #[gpui::test]
+    async fn cut_via_ctrl_x_writes_clipboard_and_undoes(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, changes) = add_input(cx, "hello world");
+        settle_window(wcx);
+        wcx.update(|_, cx| {
+            input.update(cx, |s, _| {
+                s.selection = 0..5;
+                s.selection_head = 5;
+            });
+        });
+        let w = focus_input_for_keys(&input, wcx);
+        let before = changes.borrow().0;
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-x").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            " world",
+            "剪切应删除选区 0..5（hello）"
+        );
+        assert_eq!(
+            wcx.read_from_clipboard().and_then(|i| i.text()),
+            Some("hello".to_string()),
+            "剪贴板应写入被剪切的文本"
+        );
+        assert_eq!(changes.borrow().0, before + 1, "剪切应发一次 Change");
+        // Ctrl+Z：剪切一次撤销复原。
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "hello world",
+            "剪切应可一次撤销复原"
+        );
+    }
+
+    /// R2：空选区剪切 = 无动作（不采纳编辑器「空选区复制整行」惯例）——文本不变、
+    /// 剪贴板不被改写、不发 Change。
+    #[gpui::test]
+    async fn cut_empty_selection_is_noop(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, changes) = add_input(cx, "ab");
+        settle_window(wcx);
+        // 预置剪贴板为已知值，断言空选区剪切不会改写它。
+        wcx.write_to_clipboard(gpui::ClipboardItem::new_string("KEEP".to_string()));
+        let w = focus_input_for_keys(&input, wcx);
+        let before = changes.borrow().0;
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-x").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "ab",
+            "空选区剪切文本应不变"
+        );
+        assert_eq!(
+            wcx.read_from_clipboard().and_then(|i| i.text()),
+            Some("KEEP".to_string()),
+            "空选区剪切不应改写剪贴板"
+        );
+        assert_eq!(changes.borrow().0, before, "空选区剪切不应发 Change");
+    }
+
+    /// R3：连续内嵌输入（字符，间隔 <300ms、无光标移动）合并为一个撤销单元——一次
+    /// Ctrl+Z 撤掉整段 "abc"，Ctrl+Y 回推。
+    #[gpui::test]
+    async fn continuous_typing_merges_into_one_undo_group(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, _) = add_input(cx, "");
+        settle_window(wcx);
+        type_text(&input, "a", wcx);
+        type_text(&input, "b", wcx);
+        type_text(&input, "c", wcx);
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "abc"
+        );
+        let w = focus_input_for_keys(&input, wcx);
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "",
+            "连续输入应合并为一个撤销单元，一次撤销回空"
+        );
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-y").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "abc",
+            "重做应回推整段连续输入"
+        );
+    }
+
+    /// R3：超过 300ms 停顿（时间窗）→ 新起撤销单元：两次输入各成一组，两次撤销逐段回退。
+    #[gpui::test]
+    async fn time_break_splits_undo_group(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, _) = add_input(cx, "");
+        settle_window(wcx);
+        type_text(&input, "a", wcx);
+        // 伪造时间窗过期：把开放组上次编辑时刻拨回 400ms 前（> UNDO_GROUP_MS=300）。
+        wcx.update(|_, cx| {
+            input.update(cx, |s, _| {
+                if let Some(o) = s.undo_open.as_mut() {
+                    o.last_edit_at = Instant::now() - Duration::from_millis(400);
+                }
+            });
+        });
+        type_text(&input, "b", wcx);
+        assert_eq!(wcx.update(|_, cx| input.read(cx).value().to_string()), "ab");
+        let w = focus_input_for_keys(&input, wcx);
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "a",
+            "停顿 ≥300ms 应新起撤销单元，第一次撤销只回退 b"
+        );
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "",
+            "第二次撤销回退 a"
+        );
+    }
+
+    /// R3：光标移动断层撤销合并——"ab" 后移光标到行首再输入 "X"：第一次撤销只回退 X、
+    /// 第二次才回退 ab。
+    #[gpui::test]
+    async fn cursor_move_breaks_merge_and_input_lands_new_group(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, _) = add_input(cx, "");
+        settle_window(wcx);
+        type_text(&input, "ab", wcx); // 合并为一组
+        let w = focus_input_for_keys(&input, wcx);
+        // 光标移动（Ctrl+← 到行首）→ 断层。
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-left").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            0..0,
+            "Ctrl+← 应把光标移到行首"
+        );
+        type_text(&input, "X", wcx); // 行首插入
+        assert_eq!(wcx.update(|_, cx| input.read(cx).value().to_string()), "Xab");
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "ab",
+            "光标移动后新输入应独立成组，撤销只回退 X"
+        );
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "",
+            "再撤销回退整段 ab（其自身一组）"
+        );
+    }
+
+    /// R3+R1：粘贴永不与前后内嵌输入合并——输入 "a"（一组）后粘贴 "z"（独一组）：
+    /// 第一次撤销回 "a"、第二次回 ""。
+    #[gpui::test]
+    async fn paste_is_separate_undo_group(cx: &mut TestAppContext) {
+        bind_paste_normalized(cx);
+        let (input, wcx, _) = add_input(cx, "");
+        settle_window(wcx);
+        type_text(&input, "a", wcx);
+        wcx.write_to_clipboard(gpui::ClipboardItem::new_string("z".to_string()));
+        let w = focus_input_for_keys(&input, wcx);
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-v").unwrap());
+        assert_eq!(wcx.update(|_, cx| input.read(cx).value().to_string()), "az");
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "a",
+            "粘贴应独立成组，第一次撤销只回退粘贴 z"
+        );
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "",
+            "第二次撤销回退输入 a"
+        );
+    }
+
+    /// R3：重做分叉作废——撤销后新编辑 → Ctrl+Y 无动作（旧重做分支整棵作废）。
+    #[gpui::test]
+    async fn redo_branch_invalidated_by_new_edit(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, _) = add_input(cx, "");
+        settle_window(wcx);
+        type_text(&input, "ab", wcx);
+        let w = focus_input_for_keys(&input, wcx);
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(wcx.update(|_, cx| input.read(cx).value().to_string()), "");
+        // 撤销后新输入 → 重做分支作废。
+        type_text(&input, "x", wcx);
+        assert_eq!(wcx.update(|_, cx| input.read(cx).value().to_string()), "x");
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-y").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "x",
+            "撤销后新编辑应作废重做分支，Ctrl+Y 无动作"
+        );
+        // 但撤销仍可用：回退新输入 x。
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "",
+            "新输入 x 仍可单独撤销"
+        );
+    }
+
+    /// R3：撤销栈深度上限 [`UNDO_LIMIT`]=200——210 次 Atomic（粘贴）各成一单元，栈被
+    /// 压到上限、丢最旧；文本全部落地（210 个 x）。
+    #[gpui::test]
+    async fn undo_stack_respects_limit(cx: &mut TestAppContext) {
+        let (input, wcx, _) = add_input(cx, "");
+        settle_window(wcx);
+        wcx.update(|_window, cx| {
+            input.update(cx, |s, cx| {
+                for _ in 0..210 {
+                    s.do_paste("x", cx);
+                }
+            });
+        });
+        let len = wcx.update(|_, cx| input.read(cx).undo_stack.len());
+        assert_eq!(
+            len,
+            UNDO_LIMIT,
+            "撤销栈应被压到上限 {}（丢最旧），实际 {len}",
+            UNDO_LIMIT
+        );
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "x".repeat(210),
+            "210 次粘贴都落地（文本 = 210 个 x）"
+        );
+    }
+
+    /// R3：Enter 提交封口本单元——"ab" 输入后 Enter（Submit 计数+1），再输入 "c"：
+    /// 第一次撤销只回退 c，第二次才回退整段 ab。
+    #[gpui::test]
+    async fn enter_submit_seals_undo_group(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, events) = add_input(cx, "");
+        settle_window(wcx);
+        type_text(&input, "ab", wcx);
+        let w = focus_input_for_keys(&input, wcx);
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("enter").unwrap());
+        assert_eq!(events.borrow().1, 1, "Enter 应发一次 Submit");
+        type_text(&input, "c", wcx); // 封口后再输入 → 独立成组
+        assert_eq!(wcx.update(|_, cx| input.read(cx).value().to_string()), "abc");
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "ab",
+            "第一次撤销只回退 Enter 后输入 c"
+        );
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "",
+            "第二次撤销回退已封口的 ab 组"
+        );
+    }
+
+    /// R3：整体替换（`set_value`）清空撤销历史——替换后 Ctrl+Z 无动作。
+    #[gpui::test]
+    async fn set_value_clears_undo_history(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, _) = add_input(cx, "");
+        settle_window(wcx);
+        type_text(&input, "ab", wcx);
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| s.set_value("xy", window, cx));
+        });
+        assert_eq!(wcx.update(|_, cx| input.read(cx).value().to_string()), "xy");
+        let (u, r) = wcx.update(|_, cx| {
+            let s = input.read(cx);
+            (s.undo_stack.len(), s.redo_stack.len())
+        });
+        assert_eq!((u, r), (0, 0), "set_value 应清空撤销/重做栈");
+        let w = focus_input_for_keys(&input, wcx);
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "xy",
+            "set_value 清空历史后 Ctrl+Z 无动作"
+        );
+    }
+
+    /// R3：IME 组合提交独立一组——组合更新不产生撤销单元（不逐键记栈），提交整体作为
+    /// 一次撤销：ab → 组合 "中" → 提交 → ab中；一次 Ctrl+Z 回到 ab。
+    #[gpui::test]
+    async fn ime_commit_is_single_undo_group(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, _) = add_input(cx, "ab");
+        settle_window(wcx);
+        // Windows IME：组合更新（None → 替换 marked/选区）→ 提交（None，Typing 意图）。
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.replace_and_mark_text_in_range(None, "中", None, window, cx);
+                s.replace_text_in_range(None, "中", window, cx);
+            });
+        });
+        assert_eq!(wcx.update(|_, cx| input.read(cx).value().to_string()), "ab中");
+        // 组合更新不应在栈里留下中间态：一份撤销 = 移除整个组合。
+        let (u, r) = wcx.update(|_, cx| {
+            let s = input.read(cx);
+            (s.undo_stack.len(), s.redo_stack.len())
+        });
+        assert_eq!((u, r), (1, 0), "组合提交应是一个独立撤销单元");
+        let w = focus_input_for_keys(&input, wcx);
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-z").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).value().to_string()),
+            "ab",
+            "一次 Ctrl+Z 应整体撤销 IME 组合提交"
         );
     }
 }
