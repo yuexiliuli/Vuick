@@ -3564,7 +3564,7 @@
             live.read(cx).image_edit_link_input().expect("应有链接输入框")
         });
         // 与 main.rs 同序：在 `bind_local_keymaps` **之后**补 `PasteNormalized` 覆盖
-        // 绑定（更高优先级 → 真实 app 链路：Ctrl+V → PasteNormalized → app 根路由）。
+        // 绑定（更高优先级 → 真实 app 链路：Ctrl+V → PasteNormalized → InputState 自收口）。
         cx.update(|_w, cx: &mut App| {
             cx.bind_keys([KeyBinding::new("ctrl-v", PasteNormalized, Some("Input"))]);
         });

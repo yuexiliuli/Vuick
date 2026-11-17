@@ -1737,31 +1737,21 @@ impl EditorApp {
             return;
         };
         let text = shell_scan::normalize_newlines(&text);
-        // 若侧边栏搜索框持有焦点 → 粘贴到搜索框（其不处理应用级 PasteNormalized）
-        let search_focused = window
-            .focused(cx)
-            .is_some_and(|fh| fh == self.search_state(cx).read(cx).focus_handle(cx));
-        if search_focused {
-            let search = self.search_state(cx);
-            search.update(cx, |s, cx| {
-                s.replace(text, window, cx);
-            });
-            return;
-        }
+        // Ctrl+V 走 app 根 `PasteNormalized` 只可能在**非 `ui::InputState` 聚焦**时到达：
+        // 侧栏搜索框 / 文件树过滤框 / 命令面板 / find·goto 条与图片编辑卡链接·文本框
+        // 均为 `ui::InputState`，Ctrl+V 已由输入框自身消费（Input 键上下文 `PasteNormalized`
+        // 覆盖绑定，见 main.rs），app 根收不到——原「粘贴到搜索框」（整体替换 `replace`）
+        // 分支已被 InputState 自收口取代而删除；图片卡同源（`paste_into_focused_image_edit`
+        // 方法仍由 WYSIWYG 自身 `paste` 使用，见 markdown_wysiwyg/core.rs:1146，非死代码）。
         let active = self.model.borrow().active_tab;
         let model = self.model.borrow();
         let Some(tab) = model.tabs.get(active) else {
             return;
         };
-        // 图片编辑卡（链接/文本输入框）聚焦（live2 WYSIWYG 的卡片输入框）：Ctrl+V
-        // （app 根 `PasteNormalized`）必须把剪贴板路由进卡内输入框，而不是误粘进源码
-        // 编辑区（与数学编辑卡同款路由；图片卡保存前不改源码，输入框暂存待「保存」）。
+        // 数学编辑卡（内嵌 `CodeEditor`，**非** InputState）聚焦：Ctrl+V 落到 app 根后
+        // 必须把剪贴板路由进卡内输入区，而不是误粘进源码编辑区（与 live2 WYSIWYG 自身
+        // `paste` 同口径；换行归一化由 CodeEditor `paste_text` 承担）。
         if let Some(live) = tab.live2.as_ref() {
-            let routed =
-                live.update(cx, |w, cx| w.paste_into_focused_image_edit(window, &text, cx));
-            if routed {
-                return;
-            }
             let routed = live.update(cx, |w, cx| w.paste_into_focused_math_edit(window, &text, cx));
             if routed {
                 return;
