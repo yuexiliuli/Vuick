@@ -27,6 +27,175 @@ use config::limits::{
 use config::markdown::EPUB_IMG_SCHEME;
 use markdown::RowAlign;
 
+/// XML 解析的节点数硬上界（P0-B2）：roxmltree 默认 u32::MAX，恶意放大 XML
+/// 可把 16MiB 章节放大成数百 MiB 节点树；1M 节点对正常 EPUB 章节绰绰有余。
+const MAX_XML_NODES: u32 = 1_000_000;
+
+/// 递归遍历 XHTML 树的显式深度上限（P0-B2）：正文 `walk_body` 与文本提取
+/// `node_text_epub`/`walk_text_lines` 两个遍历族各自独立封顶，防恶意深层嵌套
+/// 撑爆调用栈 / 无界展开。正常排版嵌套 <50 层，256 绰绰有余；合法书籍输出
+/// 在限内保持逐字节一致（超限子树截断、不产出）。
+const MAX_TREE_DEPTH: usize = 256;
+
+/// 带安全上限解析 XML（节点数硬上界 + 禁 DTD + 元素深度预扫描）：
+/// 三处 `Document::parse` 统一入口。
+///
+/// P0-B2：`roxmltree::Document::parse` 对深层嵌套元素会**递归**（2 万层即栈溢出
+/// abort），`nodes_limit` 只限**节点数**、不限**深度**——所以解析前先做一次
+/// **元素嵌套深度预扫描**，超 [`MAX_TREE_DEPTH`] 即视为不可信深层结构直接拒绝，
+/// 不让 roxmltree 解析（否则 16MiB 恶意章节可先炸掉调用栈）。
+fn parse_xml(text: &str) -> anyhow::Result<roxmltree::Document<'_>> {
+    if max_xml_element_depth(text) > MAX_TREE_DEPTH {
+        bail!("XML 元素嵌套深度超上限（>{MAX_TREE_DEPTH} 层），拒绝解析");
+    }
+    roxmltree::Document::parse_with_options(
+        text,
+        roxmltree::ParsingOptions {
+            nodes_limit: MAX_XML_NODES,
+            allow_dtd: false,
+            ..roxmltree::ParsingOptions::default()
+        },
+    )
+    .map_err(Into::into)
+}
+
+/// 预扫描 XML 的**元素嵌套最大深度**（迭代、O(n)、不建树）。
+///
+/// 只统计真实元素开/闭标签，其余一律跳过（这些结构内部可能含会误导计数的
+/// `<`/`>`）：注释 `<!--…-->`、`<![CDATA[…]]>`、`<?…?>`、`<!…>` 声明（含
+/// DOCTYPE 内部子集）整体跳过；元素标签内部按引号跳过属性值。
+///
+/// 安全前提：对 **well-formed XML** 计深精确（开 `+1`/闭 `-1`/自闭合 `/>` 不变）；
+/// 名字起始判定必须含非 ASCII 首字节（XML 1.0 `NameStartChar` 允许 Unicode 字母，
+/// 见 [`is_xml_name_start`]）——只认 ASCII 会让 `<α>`（U+03B1 首字节 0xCE）这类
+/// **合法名**落入裸 `<` 分支，深 Unicode 名树零计数放行、绕过预扫描直入 roxmltree
+/// 递归（300+ 层即 0xC00000FD 栈溢出）。
+/// 对非法裸 `<`（ASCII 非名起始）只多跳一个字节——这类输入 roxmltree 本就拒绝
+/// （不会走到深树），故不存在「漏判后真去解析深树」的路径。
+fn max_xml_element_depth(xml: &str) -> usize {
+    let bytes = xml.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        match *bytes.get(i + 1).unwrap_or(&0) {
+            // `<!`：注释 / CDATA / DOCTYPE 等声明，整体跳过
+            b'!' => {
+                if bytes.get(i + 2) == Some(&b'-') && bytes.get(i + 3) == Some(&b'-') {
+                    match find_bytes(bytes, i + 4, b"-->") {
+                        Some(end) => i = end + 3,
+                        None => return max_depth,
+                    }
+                } else if bytes.get(i + 2) == Some(&b'[') {
+                    match find_bytes(bytes, i + 9, b"]]>") {
+                        Some(end) => i = end + 3,
+                        None => return max_depth,
+                    }
+                } else {
+                    i = skip_declaration(bytes, i);
+                }
+            }
+            // `<?`：处理指令
+            b'?' => match find_bytes(bytes, i + 2, b"?>") {
+                Some(end) => i = end + 2,
+                None => return max_depth,
+            },
+            // `</`：结束标签
+            b'/' => {
+                depth = depth.saturating_sub(1);
+                i = skip_to_tag_end(bytes, i).saturating_add(1);
+            }
+            c if is_xml_name_start(c) => {
+                // 开始标签：判断是否自闭合（`/>`）再计深
+                let end = skip_to_tag_end(bytes, i);
+                let self_closing = end > i && bytes[end.saturating_sub(1)] == b'/';
+                if !self_closing {
+                    depth += 1;
+                    max_depth = max_depth.max(depth);
+                }
+                i = end.saturating_add(1);
+            }
+            // 裸 `<`（非法 XML，roxmltree 会拒绝）：跳过
+            _ => i += 1,
+        }
+    }
+    max_depth
+}
+
+/// 在 `bytes[start..]` 里找第一个子串 `pat`，返回其起始索引（找不到返回 `None`）。
+fn find_bytes(bytes: &[u8], start: usize, pat: &[u8]) -> Option<usize> {
+    if start >= bytes.len() || pat.is_empty() {
+        return None;
+    }
+    let mut i = start;
+    while i + pat.len() <= bytes.len() {
+        if &bytes[i..i + pat.len()] == pat {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 跳过 `<!…>` 声明（DOCTYPE/ENTITY 等）：尊重引号与内部子集 `[…]`，
+/// 返回收尾 `>` 之后的下标（找不到则返回 `bytes.len()`）。
+fn skip_declaration(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    let mut bracket = 0i32;
+    let mut quote = 0u8;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if quote != 0 {
+            if c == quote {
+                quote = 0;
+            }
+        } else if c == b'"' || c == b'\'' {
+            quote = c;
+        } else if c == b'[' {
+            bracket += 1;
+        } else if c == b']' {
+            bracket -= 1;
+        } else if c == b'>' && bracket <= 0 {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// 跳过标签体的收尾 `>`（元素开始/结束标签共用），尊重引号；返回 `>` 下标。
+fn skip_to_tag_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    let mut quote = 0u8;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if quote != 0 {
+            if c == quote {
+                quote = 0;
+            }
+        } else if c == b'"' || c == b'\'' {
+            quote = c;
+        } else if c == b'>' {
+            return i;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// XML 名字起始字符（宽松判据）。well-formed 名字必以字母/`_`/`:` 开头；
+/// 且 XML 1.0 `NameStartChar` 允许**非 ASCII** 起始（Unicode 字母如 `α`=U+03B1，
+/// UTF-8 首字节 ≥ 0x80）——非 ASCII 首字节一律视为名字起始即可：多算只朝更安全偏
+/// （把非名起始当成名字开标签计深只会多计、不会漏计；真正非法名 roxmltree 本会
+/// 拒绝，不会走到深树）。
+fn is_xml_name_start(c: u8) -> bool {
+    c >= 0x80 || c.is_ascii_alphabetic() || c == b'_' || c == b':'
+}
+
 /// EPUB 解析的安全硬上限（依赖注入式，可测）：压缩炸弹 / 图片数 / 总量 DoS 护栏。
 /// 生产用 [`EpubLimits::default`]（对齐 `config::limits` 常量）；测试注入小值，
 /// 用 KB 级内存造微型恶意 epub 验证各闸（K124：构造期内所有分配都有独立硬上界）。
@@ -279,7 +448,7 @@ fn read_zip_entry<R: Read + std::io::Seek>(
 
 /// 从 container.xml 里解析 OPF 路径（rootfile full-path 属性）。
 fn find_opf_path(container_xml: &str) -> Result<String> {
-    let doc = roxmltree::Document::parse(container_xml).context("解析 container.xml 失败")?;
+    let doc = parse_xml(container_xml).context("解析 container.xml 失败")?;
     for node in doc.descendants() {
         if node.has_tag_name("rootfile")
             && let Some(full) = node.attribute("full-path")
@@ -295,7 +464,7 @@ fn find_opf_path(container_xml: &str) -> Result<String> {
 /// spine 里每个 itemref 的 idref 指向 manifest 的 id；通过 manifest 映射到 href。
 /// OPF 英寸 XML 命名空间无关紧要，按 tag 名（local name）匹配即可。
 fn parse_opf(opf_xml: &str, opf_path: &str) -> Result<(String, String, Vec<String>)> {
-    let doc = roxmltree::Document::parse(opf_xml).context("解析 OPF 失败")?;
+    let doc = parse_xml(opf_xml).context("解析 OPF 失败")?;
 
     // 元数据
     let mut title = String::new();
@@ -362,12 +531,12 @@ fn xhtml_to_markdown(
     // PUBLIC "…//DTD XHTML…dtd">`，直接解析会整章失败（"XML with DTD detected"）
     // → 每章输出空 → 整书空文档（打开黑屏无字）。解析前先剥离 DOCTYPE。
     let html = strip_doctype(html);
-    let doc = match roxmltree::Document::parse(&html) {
+    let doc = match parse_xml(&html) {
         Ok(d) => d,
         Err(_) => return String::new(),
     };
     let mut out = String::new();
-    walk_body(&doc.root_element(), &mut out, 0, None, notes, on_img);
+    walk_body(&doc.root_element(), &mut out, 0, 0, None, notes, on_img);
     // 修整：多个空行合并、去掉行尾空格
     let mut result = String::with_capacity(out.len());
     let mut blank = 0usize;
@@ -423,11 +592,16 @@ fn strip_doctype(html: &str) -> String {
 fn walk_body(
     node: &roxmltree::Node,
     out: &mut String,
+    depth: usize,
     quoted: usize,
     align: Option<RowAlign>,
     notes: &mut std::collections::BTreeMap<usize, String>,
     on_img: &mut dyn FnMut(&str, &str) -> Option<String>,
 ) {
+    // P0-B2：递归深度硬上限——超限即截断（该子树不再下行），不 panic/不 abort/不无限递归。
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
     match node.tag_name().name() {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => return emit_heading(node, out),
         "p" => return emit_paragraph(node, out, quoted, align, notes),
@@ -466,7 +640,7 @@ fn walk_body(
     };
     for child in node.children() {
         if child.is_element() || child.is_text() {
-            walk_body(&child, out, child_quoted, child_align, notes, on_img);
+            walk_body(&child, out, depth + 1, child_quoted, child_align, notes, on_img);
         }
     }
 }
@@ -474,7 +648,7 @@ fn walk_body(
 /// `h1..h6` → markdown 标题行。
 fn emit_heading(node: &roxmltree::Node, out: &mut String) {
     let level = node.tag_name().name()[1..].parse::<u8>().unwrap_or(1);
-    let text = node_text_epub(node);
+    let text = node_text_epub(node, 0);
     out.push('\n');
     out.push_str(&"#".repeat(level as usize));
     out.push(' ');
@@ -564,7 +738,7 @@ fn emit_list_item(
     quoted: usize,
     align: Option<RowAlign>,
 ) {
-    let t = node_text_epub(node);
+    let t = node_text_epub(node, 0);
     let t = t.trim().to_string();
     if !t.is_empty() {
         let line = match align {
@@ -687,7 +861,11 @@ fn node_text(node: &roxmltree::Node) -> String {
 /// 取段落等**正文容器**的文本，但把正文脚注锚
 /// （`<a id="noteN" href="...#footnoteN"><sup>[N]</sup></a>`）替换成 `[^N]` 标记
 /// （渲染层据此做悬浮注释卡片）。普通链接/注释章锚（`id="footnoteN"`）按文本走。
-fn node_text_epub(node: &roxmltree::Node) -> String {
+fn node_text_epub(node: &roxmltree::Node, depth: usize) -> String {
+    // P0-B2：文本递归同走深度上限，超限截断（不再下钻），防恶意 `<p>` 内深嵌套撑栈。
+    if depth > MAX_TREE_DEPTH {
+        return String::new();
+    }
     let mut s = String::new();
     for child in node.children() {
         if child.is_text() {
@@ -700,7 +878,7 @@ fn node_text_epub(node: &roxmltree::Node) -> String {
                     s.push_str(&format!(" [^{n}] "));
                     continue; // 跳过其 `<sup>[N]</sup>` 子节点
                 }
-            s.push_str(&node_text_epub(&child));
+            s.push_str(&node_text_epub(&child, depth + 1));
         }
     }
     s
@@ -711,11 +889,15 @@ fn node_text_epub(node: &roxmltree::Node) -> String {
 /// 应分别成行，而不是挤在同一行）。
 fn node_text_epub_lines(node: &roxmltree::Node) -> Vec<String> {
     let mut segs = vec![String::new()];
-    walk_text_lines(node, &mut segs);
+    walk_text_lines(node, 0, &mut segs);
     segs
 }
 
-fn walk_text_lines(node: &roxmltree::Node, segs: &mut Vec<String>) {
+fn walk_text_lines(node: &roxmltree::Node, depth: usize, segs: &mut Vec<String>) {
+    // P0-B2：文本递归同走深度上限，超限截断（不再下钻）。
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
     for child in node.children() {
         if child.is_text() {
             if let Some(t) = child.text() {
@@ -734,7 +916,7 @@ fn walk_text_lines(node: &roxmltree::Node, segs: &mut Vec<String>) {
                     segs.last_mut().unwrap().push_str(&format!(" [^{n}] "));
                     continue;
                 }
-            walk_text_lines(&child, segs);
+            walk_text_lines(&child, depth + 1, segs);
         }
     }
 }
@@ -994,6 +1176,117 @@ mod tests {
         assert!(!s.contains("<!DOCTYPE"), "DOCTYPE 应整体移除：{s:?}");
         assert!(s.starts_with("<html>"), "内部子集后的 <html> 应保留：{s:?}");
         assert!(s.contains("正文"), "声明前后的内容都应保留：{s:?}");
+    }
+
+    #[test]
+    fn deep_nested_html_does_not_overflow_stack() {
+        // 复现 P0：walk_body 递归遍历（lib.rs:423+）无深度上限 → 几万层嵌套 `<div>`
+        // 撑爆测试线程栈（栈溢出 → 进程 abort / 0xC00000FD）。章节大小仅 ~6×N 字节，
+        // 就在 16MiB 章节上限内，恶意章节可轻松触发。
+        //
+        // ⚠️ 修复前本测试会让测试二进制**栈溢出 abort**（整进程退出、同文件其它测试
+        // 一并中止）——这是修复前真实崩溃的证据，接受；修复后遍历应在有界深度下
+        // 优雅截断（不崩、不把深层子树全量展开），本测试恢复为普通 PASS。
+        let n = 20000usize;
+        let mut html = String::with_capacity(6 * n + 16);
+        html.push_str("<html><body>");
+        for _ in 0..n {
+            html.push_str("<div>");
+        }
+        html.push('x');
+        for _ in 0..n {
+            html.push_str("</div>");
+        }
+        html.push_str("</body></html>");
+
+        let no: Option<String> = None;
+        let mut notes = std::collections::BTreeMap::new();
+        // 固定入口：章节文本提取（章节 XHTML → Markdown）。
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
+        // 断言 1：应能正常返回（栈溢出即 abort，走不到这里——红测证据）。
+        // 断言 2：输出有界，不得把深层子树全量展开。
+        assert!(
+            md.len() < html.len(),
+            "深层嵌套输出应有界：md={}B html={}B",
+            md.len(),
+            html.len()
+        );
+        assert!(
+            md.len() < 1024,
+            "深层嵌套正文只含一个字符，输出应远小于 1KiB：{}B",
+            md.len()
+        );
+    }
+
+    #[test]
+    fn deep_nested_spans_in_paragraph_does_not_overflow_stack() {
+        // 复现 P0 第二条递归面：`<p>` 内的深嵌套 `<span>` → emit_paragraph →
+        // node_text_epub（lib.rs:690+）对子元素递归无深度上限，同样把测试线程栈
+        // 打爆 → abort（0xC00000FD）。修复前即红；修复后应在有界深度下优雅截断。
+        let n = 20000usize;
+        let mut html = String::with_capacity(6 * n + 20);
+        html.push_str("<html><body><p>");
+        for _ in 0..n {
+            html.push_str("<span>");
+        }
+        html.push('x');
+        for _ in 0..n {
+            html.push_str("</span>");
+        }
+        html.push_str("</p></body></html>");
+
+        let no: Option<String> = None;
+        let mut notes = std::collections::BTreeMap::new();
+        // 同上：栈溢出即 abort（红测证据）；能走到这里说明没有炸栈。
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
+        assert!(
+            md.len() < html.len() && md.len() < 1024,
+            "段落深嵌套输出应有界：md={}B html={}B",
+            md.len(),
+            html.len()
+        );
+    }
+
+    #[test]
+    fn deep_nested_unicode_name_does_not_overflow_stack() {
+        // 复现评审 BLOCK（K173）：`max_xml_element_depth` 的名字起始判据
+        // `is_xml_name_start` 只认 ASCII 字母/`_`/`:`，而非 ASCII 起始字节
+        // （如 `α`=U+03B1 首字节 0xCE）不进谓词 → 落入裸 `<` 分支只跳 1 字节 →
+        // 深树**零计数放行** → 绕过深度预扫描后 roxmltree 自身递归解析
+        // 300+ 层 Unicode 名嵌套即 0xC00000FD 栈溢出。
+        //
+        // ⚠️ 修复前本测试会让测试二进制**栈溢出 abort**（整进程退出、同文件
+        // 其它测试一并中止）——这是修复前真实崩溃的证据，接受；修复后深度
+        // 预扫描在解析前拒掉（bail），走不到 roxmltree，输出为空。
+        let n = 2000usize;
+        let mut html = String::with_capacity(5 * n + 20);
+        html.push_str("<html><body>");
+        for _ in 0..n {
+            html.push_str("<α>");
+        }
+        html.push('x');
+        for _ in 0..n {
+            html.push_str("</α>");
+        }
+        html.push_str("</body></html>");
+
+        let no: Option<String> = None;
+        let mut notes = std::collections::BTreeMap::new();
+        // 防御路径必须触发：深度预扫描得看见 Unicode 名嵌套（修复前这里只数到
+        // html/body 两层 → 断言失败即红，且不依赖运行环境的线程栈大小）。
+        assert!(
+            max_xml_element_depth(&html) > MAX_TREE_DEPTH,
+            "深度预扫描应识别 Unicode 元素名嵌套：depth={}",
+            max_xml_element_depth(&html)
+        );
+        // 栈溢出即 abort（红测证据）；能走到这里说明 pre-scan 已拒掉了深树。
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
+        assert!(
+            md.len() < html.len() && md.len() < 1024,
+            "Unicode 名深嵌套输出应有界：md={}B html={}B",
+            md.len(),
+            html.len()
+        );
     }
 
     // ===== 解析安全上限（注入式小值，KB 级内存下验证各 DoS 闸）=====
