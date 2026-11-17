@@ -1,4 +1,4 @@
-//! 环境变量门控诊断探针（`GPUI_EDITOR_IMG_DIAG=1` 启用），零生产语义。
+//! 环境变量门控诊断探针（`VUICK_IMG_DIAG=1` 启用），零生产语义。
 //!
 //! 采集（全部在主线程回调内；门控关闭 = 一次静态读 + 分支短路，无 `Instant` 计时、无分配）：
 //! - **帧间隔分布**：`render()` 入口两帧间隔 ms 入桶（<8 / 8-16 / 16-33 / 33-66 / >66ms），
@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Instant;
 
 /// 门控起效的 env 变量值。
-const ENV_VAR: &str = "GPUI_EDITOR_IMG_DIAG";
+const ENV_VAR: &str = "VUICK_IMG_DIAG";
 /// 摘要打印间隔（累计多少帧打一次直方图，避免刷屏）。
 const REPORT_EVERY: u64 = 25;
 /// 离群帧阈值（ms）：帧间隔超过即认为主线程 render/上传/布局有阻塞。

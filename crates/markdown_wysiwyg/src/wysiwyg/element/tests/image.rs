@@ -2250,3 +2250,126 @@ fn image_edit_enter_in_card_does_not_insert_newline_into_doc(cx: &mut gpui::Test
     );
 }
 
+#[gpui::test]
+fn resolve_image_src_confines_parent_dir_escape(cx: &mut TestAppContext) {
+    // Bug B 红测①（core.rs:610-628）：相对图片 src 含 `../`（如 `../../escape.png`）
+    // → `base_dir.join(src)` **不归一**，`..` 折叠后逃逸 base_dir 子树读任意路径。
+    // 修复方向 = 限制在 base_dir 子树（归一后前缀判定，越界拒绝）。现状 =
+    // `C:\…\Temp\wy_resolve_base\..\..\escape.png`，词法归一后落在 base 之外 → RED。
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(""));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let base = std::env::temp_dir().join("wy_resolve_base");
+    ed.update(vcx, |e, _| e.set_base_dir(Some(base.clone())));
+    let resolved = ed.read_with(vcx, |e, _| e.resolve_image_src("../../escape.png"));
+    // 词法归一（折叠 `.`，`..` 弹回上一级 Normal；根/盘符前缀之上不可再越）。
+    fn lex_normalize(p: std::path::PathBuf) -> std::path::PathBuf {
+        use std::path::Component;
+        let mut out: Vec<Component> = Vec::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if let Some(Component::Normal(_)) = out.last() {
+                        out.pop();
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out.iter().collect()
+    }
+    let base_n = lex_normalize(base.clone());
+    let resolved_n = lex_normalize(std::path::PathBuf::from(&resolved));
+    assert!(
+        resolved_n.starts_with(&base_n),
+        "相对 src `../../escape.png` 逃逸 base_dir 子树：解析 {resolved:?}，归一 \
+         {resolved_n:?}，应限制在 {base_n:?} 子树内或拒绝"
+    );
+}
+
+#[gpui::test]
+fn resolve_image_src_rejects_external_file_url(cx: &mut TestAppContext) {
+    // Bug B 红测②（core.rs:613-614）：`file://` 前缀**原样放行** → 任意 `file://`
+    // URL（含 `file:///C:/…`）绕过 base_dir 子树限制被当资源读取。修复方向 = 限制或
+    // 重构掉 file://。现状 `file:///C:/Windows/win.ini` 原样返回 → RED。
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(""));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let base = std::env::temp_dir().join("wy_resolve_base");
+    ed.update(vcx, |e, _| e.set_base_dir(Some(base.clone())));
+    let resolved = ed.read_with(vcx, |e, _| {
+        e.resolve_image_src("file:///C:/Windows/win.ini")
+    });
+    // 词法归一（与同模块 `resolve_image_src_confines_parent_dir_escape` 同口径）。
+    fn lex_normalize(p: std::path::PathBuf) -> std::path::PathBuf {
+        use std::path::Component;
+        let mut out: Vec<Component> = Vec::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if let Some(Component::Normal(_)) = out.last() {
+                        out.pop();
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out.iter().collect()
+    }
+    let base_n = lex_normalize(base.clone());
+    let resolved_n = lex_normalize(std::path::PathBuf::from(&resolved));
+    assert!(
+        resolved_n.starts_with(&base_n),
+        "`file://` URL 必须被收进 base_dir 子树或拒绝（真实防御路径），解析 {resolved:?}，\
+         归一 {resolved_n:?}，应限制在 {base_n:?} 子树内"
+    );
+    assert!(
+        !resolved.starts_with("file://"),
+        "`file://` URL 不得原样透出：{resolved:?}"
+    );
+}
+
+#[gpui::test]
+fn resolve_image_src_keeps_normal_relative_inside_base(cx: &mut TestAppContext) {
+    // B.4 正向回归：**无 `..` 的正常相对 src 必须仍解析到 base_dir 内正确路径**——
+    // 防修复误伤（如把全部相对路径一刀切）。含 `img/../` 的 src 折回 base 内仍放行。
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(""));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let base = std::env::temp_dir().join("wy_resolve_base");
+    ed.update(vcx, |e, _| e.set_base_dir(Some(base.clone())));
+    let normal = ed.read_with(vcx, |e, _| e.resolve_image_src("images/photo.png"));
+    let folded = ed.read_with(vcx, |e, _| e.resolve_image_src("img/../photo.png"));
+    let base_s = base.to_string_lossy().replace('\\', "/");
+    let normal_s = normal.replace('\\', "/");
+    let folded_s = folded.replace('\\', "/");
+    assert_eq!(
+        normal_s,
+        format!("{base_s}/images/photo.png"),
+        "正常相对 src 必须拼进 base_dir 子树内原路径"
+    );
+    assert_eq!(
+        folded_s,
+        format!("{base_s}/photo.png"),
+        "`img/../` 词法折入 base 内应保留放行（不误伤）"
+    );
+    assert!(
+        std::path::Path::new(&normal).starts_with(&base),
+        "正常相对 src 归一后必须仍在 base 子树内：{normal:?}"
+    );
+}
+

@@ -3,7 +3,7 @@ name = "image_viewer"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 图片查看器 crate（后台解码 + 文件夹轮播 + 缩放平移）"
+description = "vuick 图片查看器 crate（后台解码 + 文件夹轮播 + 缩放平移）"
 
 [dependencies]
 gpui = { workspace = true }

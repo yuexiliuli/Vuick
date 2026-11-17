@@ -108,7 +108,9 @@ pub fn mermaid_card_height(source: &str) -> Pixels {
 /// paint 用同 `zoom` 缩放字号保持比例（节点/边/分组/序列列坐标统一走此变换）。
 /// 由 `shape_code_row` 在 `mm_layout` 之后调用；`zoom == 1` 直接原样返回。
 pub fn scale_mm_layout(mm: &mut MmLayout, zoom: f32, area_w: f32) {
-    if zoom <= 0. || (zoom - 1.).abs() < 1e-4 {
+    // P2-① 唯一性：不拒 NaN/±Inf（NaN 比较恒假放行 → 全坐标 NaN 污染；Inf 同理）——
+    // 加 `is_finite` 保持既有有限正 zoom 行为逐字不变。
+    if !zoom.is_finite() || zoom <= 0. || (zoom - 1.).abs() < 1e-4 {
         return;
     }
     let cx = area_w / 2.;

@@ -376,13 +376,13 @@
             format!(r#"{{"opened_folder": "{folder_json}", "session_restore": false}}"#),
         )
         .unwrap();
-        unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+        unsafe { std::env::set_var("VUICK_CONFIG", &cfg) };
         let (app_off, cx) = add_app(cx);
         for _ in 0..3 {
             cx.run_until_parked();
         }
         let root_off = cx.update(|_w, cx| app_off.read(cx).sidebar.files.root.clone());
-        unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+        unsafe { std::env::remove_var("VUICK_CONFIG") };
         assert_eq!(
             root_off,
             None,
@@ -395,7 +395,7 @@
             format!(r#"{{"opened_folder": "{folder_json}", "session_restore": true}}"#),
         )
         .unwrap();
-        unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+        unsafe { std::env::set_var("VUICK_CONFIG", &cfg) };
         let (app_on, cx) = add_app(cx);
         for _ in 0..3 {
             cx.run_until_parked();
@@ -404,7 +404,7 @@
             let a = app_on.read(cx);
             (a.sidebar.files.root.clone(), a.sidebar.view)
         });
-        unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+        unsafe { std::env::remove_var("VUICK_CONFIG") };
         let _ = std::fs::remove_file(&cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -499,4 +499,68 @@
             "折叠根后根行仍渲染（树根恒可见）"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P1-34 回归：重命名文件后，已打开选项卡**查看器内部路径**须随 `payload.file_path`
+    /// 同步到新名——图片查看器 `current_path()`（PDF 同径 `path()`）不再残留旧名
+    /// （否则 PDF 后续保存写回旧名、图片同文件夹导航/预取指到已不存在的旧文件）。
+    #[gpui::test]
+    async fn rename_syncs_viewer_internal_path(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir =
+            std::env::temp_dir().join(format!("vuick-app-rename-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("a.jpg");
+        std::fs::write(&old, b"not really a jpeg").unwrap();
+        // 图片查看器装到 add_app 的初始空选项卡 0：load_media 立即建 viewer，当前显示
+        // 路径可同步断言（不依赖真实解码成功）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.load_media(0, &old, MediaKind::Image, window, cx);
+            });
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let img_entity = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            match &a.model.borrow().tabs[0].payload.reader {
+                MediaReader::Image(iv) => iv.clone(),
+                _ => panic!("选项卡 0 应为图片查看器"),
+            }
+        });
+        let before = cx.update(|_w, cx| img_entity.read(cx).current_path());
+        assert_eq!(before, Some(old.clone()), "打开后查看器内部路径应为旧名");
+        // 重命名 a.jpg → b.jpg（走弹层提交入口 = 生产路径）。
+        let new = dir.join("b.jpg");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let kind = crate::app::file_tree_prompt::FileTreePromptKind::Rename {
+                    path: old.clone(),
+                    is_dir: false,
+                };
+                let r = app.file_tree_submit_prompt(&kind, "b.jpg", window, cx);
+                assert!(r.is_ok(), "重命名应成功");
+            });
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(!old.exists() && new.is_file(), "磁盘应改名 a.jpg → b.jpg");
+        let after = cx.update(|_w, cx| img_entity.read(cx).current_path());
+        assert_eq!(
+            after,
+            Some(new.clone()),
+            "重命名后查看器内部路径应同步为新名（P1-34）"
+        );
+        let payload_path = cx.update(|_w, cx| {
+            app.read(cx).model.borrow().tabs[0].payload.file_path.clone()
+        });
+        assert_eq!(payload_path, Some(new.clone()), "选项卡 payload 路径应同步");
+        let _ = std::fs::remove_dir_all(&dir);
     }

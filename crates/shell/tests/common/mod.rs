@@ -55,11 +55,11 @@ pub(crate) mod pdf_bookmarks {
 /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
 ///
 /// **R3**：integration 目标下 shell lib `cfg!(test)` 恒 false；此处先于 gpui App 启动
-/// 设 `GPUI_EDITOR_TEST=1`，`AppHost::is_test_build()`（runtime env 判定）为真 →
+/// 设 `VUICK_TEST=1`，`AppHost::is_test_build()`（runtime env 判定）为真 →
 /// `persist_session` / `persist_prefs` 恒短路不写盘（不污染真实/隔离目录）。
 pub fn init_test(cx: &mut TestAppContext) {
     // 复用生产键位组合（`test_support` 双份已删，见 lib.rs）。
-    unsafe { std::env::set_var("GPUI_EDITOR_TEST", "1") };
+    unsafe { std::env::set_var("VUICK_TEST", "1") };
     cx.update(bind_local_keymaps);
 }
 

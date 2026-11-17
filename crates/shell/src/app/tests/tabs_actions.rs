@@ -48,7 +48,7 @@
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-img-{}",
+            "vuick-app-img-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -141,7 +141,7 @@
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-{}",
+            "vuick-app-vid-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -505,7 +505,7 @@
         }
 
         // 打开一个真实文件，内容进入编辑区，再渲染（覆盖 open_file 路径）
-        let dir = std::env::temp_dir().join("gpui-editor-test.md");
+        let dir = std::env::temp_dir().join("vuick-test.md");
         std::fs::write(&dir, "# 标题\n\n**加粗** 正文 `code`\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -880,7 +880,7 @@
         }
 
         // 打开 .md 文件（自动新建选项卡并选中它）：选项卡栏最右侧应显示眼睛，并自动开启预览
-        let dir = std::env::temp_dir().join("gpui-editor-eye-test.md");
+        let dir = std::env::temp_dir().join("vuick-eye-test.md");
         std::fs::write(&dir, "# 标题\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -923,7 +923,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let dir2 = std::env::temp_dir().join("gpui-editor-eye-test.txt");
+        let dir2 = std::env::temp_dir().join("vuick-eye-test.txt");
         std::fs::write(&dir2, "plain").unwrap();
         cx.update(|window, cx| {
             if let Ok(app) = view.read(cx).view().clone().downcast::<EditorApp>() {
@@ -1137,7 +1137,7 @@
         }
         // 把视频载入 tab 0（**非活动**）→ 两栏应照常渲染
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-{}",
+            "vuick-app-vid-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1254,7 +1254,7 @@
         }
         // 把视频载入当前活动 tab（tab 1）→ 打开文件即生效
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-open-{}",
+            "vuick-app-vid-open-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1332,7 +1332,7 @@
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-tg-{}",
+            "vuick-app-vid-tg-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1488,7 +1488,7 @@
             cx.run_until_parked();
         }
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-app-vid-close-{}",
+            "vuick-app-vid-close-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1558,5 +1558,65 @@
             "切回文本：按 open=true 恢复侧边栏"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-33 回归：关闭弹「未保存」确认框的异步 await 期间用户拖拽重排选项卡 → 应答后
+    /// 必须按「发起时的选项卡身份」关闭正确选项卡，不得按下标误关移位的其它选项卡。
+    /// （修复前：`remove_tab(发起时 idx)` 直接把重排后落在该下标的 B 关掉、真正的 A 还开着。）
+    #[gpui::test]
+    async fn close_tab_prompt_answer_revalidates_identity_after_reorder(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 三个未命名选项卡（未命名关闭恒弹确认框）：A=tabs[0]（目标）、B、C。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.new_tab(window, cx));
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.new_tab(window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let target_id = cx.update(|_w, cx| {
+            app.read(cx).model.borrow().tabs[0].payload.editor.entity_id()
+        });
+        // 对 A 发起关闭 → 弹「未保存的更改」确认框（不立即应答）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.close_tab(0, window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(cx.has_pending_prompt(), "未命名关闭应弹确认框");
+        // await 期间拖拽重排：A 由 0 移到末尾 → [B, C, A]。
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| app.reorder_tab(0, 3, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 应答「不保存」：应关闭发起时身份对应的 A（现下标 2），而非现 tabs[0]=B。
+        cx.simulate_prompt_answer("不保存");
+        let mut target_closed = false;
+        for _ in 0..120 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            target_closed = cx.update(|_w, cx| {
+                !app.read(cx).model.borrow().tabs
+                    .iter()
+                    .any(|t| t.payload.editor.entity_id() == target_id)
+            });
+            if target_closed {
+                break;
+            }
+        }
+        assert!(target_closed, "应答后应关闭发起时身份对应的选项卡（而非重排后的下标位）");
+        let len = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
+        assert_eq!(len, 2, "3 个未命名选项卡关闭 1 个后应剩 2");
     }
 

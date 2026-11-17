@@ -1,22 +1,22 @@
 //! 阅读进度诊断探针（真机追查「md 用【打开最近】重开不复位」的证据通道，K46）。
 //!
-//! - 默认关闭：`GPUI_EDITOR_RP_DIAG=1` 才启用；开关/测试判定/路径收敛自 `base::diag`
+//! - 默认关闭：`VUICK_RP_DIAG=1` 才启用；开关/测试判定/路径收敛自 `base::diag`
 //!   （本批 Pattern 7），不进入热路径。
 //! - 只在**事件点**调用（save / apply / apply_text_restore / check 置脏 / 预览收敛），
 //!   不逐帧刷屏。
-//! - 追加写 `%APPDATA%\gpui-editor\rp_diag.log`（测试构建写 `%TEMP%\gpui-rp-diag.log`，
+//! - 追加写 `%APPDATA%\vuick\rp_diag.log`（测试构建写 `%TEMP%\vuick-rp-diag.log`，
 //!   不污染真实 APPDATA；`reading_progress` 测试同款隔离姿势）。旧实现生产侧曾取
-//!   `UserPrefs::config_path().parent()`（`GPUI_EDITOR_CONFIG` 覆盖时 ≠ APPDATA）；收敛到
+//!   `UserPrefs::config_path().parent()`（`VUICK_CONFIG` 覆盖时 ≠ APPDATA）；收敛到
 //!   `base::diag::diag_log_path` 的统一 APPDATA 口径后与 `editor::diag` 同址、行可交错归因。
 //! - 结束运行**不清理**，保留供主 agent 读取；`.gitignore` 收 `rp_diag.log` 不入库。
 //! - 与 `AppHost::is_test_build` 同口径判定测试构建（本模块无 host，运行时判 env）。
 
 use session_store::ReadingProgress;
 
-/// 探针是否开启（进程级缓存一次判读）：`GPUI_EDITOR_RP_DIAG=1`；其余值 / 缺失 → 关。
+/// 探针是否开启（进程级缓存一次判读）：`VUICK_RP_DIAG=1`；其余值 / 缺失 → 关。
 /// 开关/测试判定/路径收敛自 `base::diag`（本批 Pattern 7）。
 pub fn enabled() -> bool {
-    base::diag::env_flag("GPUI_EDITOR_RP_DIAG")
+    base::diag::env_flag("VUICK_RP_DIAG")
 }
 
 /// 紧凑描述一份阅读进度值（`key=<k>` 后的值段，区分 md / epub / pdf）。

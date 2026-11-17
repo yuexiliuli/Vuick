@@ -1566,15 +1566,20 @@ pub fn block_span(
     } else {
         0
     };
+    // 末块（k+1 不存在）：下一源行取**文档末尾显示行数**（`line_count` 去幻影尾行，
+    // 与 Pass2 的 `srcl_next` 同口径）→ 行跨度覆盖到文档尾；仅回退 `s0+1` 会恒给 1，
+    // 使末块巨型代码块的行跨度永远不超阈值（P1-10）。
     let s1 = if k + 1 < base_ref.n() {
         base_ref.src_line(k + 1) as usize
     } else {
-        s0 + 1
+        doc.line_count().max(s0 + 1)
     };
-    let span_bytes = doc
-        .block_meta(k)
-        .and_then(|m| doc.block_meta(k + 1).map(|n| n.byte as i64 - m.byte as i64))
-        .unwrap_or(0);
+    let m_bytes = doc.block_meta(k).map(|m| m.byte as i64).unwrap_or(0);
+    let span_bytes = match doc.block_meta(k + 1) {
+        Some(n) => n.byte as i64 - m_bytes,
+        // 末块：字节跨度取「块首字节 → 文档尾」，替代 `unwrap_or(0)` 的恒 0（P1-10）。
+        None => (doc.len() as i64) - m_bytes,
+    };
     (s1.saturating_sub(s0), span_bytes)
 }
 
@@ -2154,5 +2159,53 @@ mod tests {
         assert_eq!(super::folded_body_at(&b, 1, 16).cloned(), Some(2..20));
         assert_eq!(super::folded_body_at(&b, 1, 2).cloned(), None, "标题行本身不折叠");
         assert_eq!(super::folded_body_at(&b, 1, 20).cloned(), None);
+    }
+
+    /// P1-10 回归：文末巨型代码块的 `block_span` 必须覆盖其**真实**跨度（到文档尾），
+    /// GIANT 快速路径才命中——修复前末块 `s0+1` / `unwrap_or(0)` 恒给 (1, 0)，
+    /// 滚到底整块同步 shape 卡顿。期望值由推导式给出（`line_count` 去幻影尾行，
+    /// 与 Pass2 `srcl_next` 同口径），不拍脑袋。
+    #[test]
+    fn block_span_of_last_code_block_covers_to_doc_end() {
+        // 文末巨型代码块：81 行围栏 > GIANT_SPAN_LINES=64；围栏以无换行收尾，
+        // 使「代码块」就是文档最后一块（否则尾部幻影空行块会让 k+1 存在、不触末块分支）。
+        let mut src = String::from("# 标题\n\n```rust\n");
+        for i in 0..80 {
+            src.push_str(&format!("let x{i} = {i};\n"));
+        }
+        src.push_str("```");
+        let doc = markdown::doc::Doc::open(src.into());
+        let n = {
+            let mut i = 0usize;
+            while doc.block_meta(i).is_some() {
+                i += 1;
+            }
+            i
+        };
+        assert!(n >= 2, "夹具应含标题块+代码块, 实得 {n}");
+        let src_lines: Vec<u32> =
+            (0..n).map(|i| doc.block_meta(i).unwrap().src_line).collect();
+        let base = Rc::new(RefCell::new(BlockLayout::new(vec![100.0; n], src_lines)));
+        let last = n - 1;
+        assert_eq!(
+            doc.block_meta(last).map(|m| m.kind),
+            Some(RowKind::Code),
+            "夹具末块应为代码块"
+        );
+        let (lines, bytes) = block_span(&doc, &base, last);
+        // 期望值推导：末块下一源行 = 文档显示行数；字节到文档尾。
+        let m = doc.block_meta(last).unwrap();
+        let expect_lines = doc.line_count().saturating_sub(m.src_line as usize);
+        let expect_bytes = (doc.len() as i64) - (m.byte as i64);
+        assert_eq!(lines, expect_lines, "末块行跨度须=文档剩余行数");
+        assert_eq!(bytes, expect_bytes, "末块字节跨度须=块首字节到文档尾");
+        assert!(
+            lines > GIANT_SPAN_LINES,
+            "文末大代码块行跨度须超 GIANT 阈值, 实得 {lines}"
+        );
+        assert!(
+            is_giant_code_block(&doc, &base, last),
+            "文末巨型代码块应命中 GIANT 快速路径"
+        );
     }
 }

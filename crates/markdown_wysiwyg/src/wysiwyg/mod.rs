@@ -345,6 +345,12 @@ pub struct WyEditor {
     /// 本帧登记的待后台解析队列 `((语言, 代码), 块 src_line)`（`sync_code_parse` 每帧
     /// 清空消费）。`src_line` 用于完成时的**带内门控**（块还在带内才立即重建帧上色）。
     code_parse_need: RefCell<Vec<(CodeParseKey, usize)>>,
+    /// 代码块高亮请求的「块内容指纹」钉（`request_code_parse` 时 `src_line →
+    /// `frame::block_content_id` 快照）。`on_code_parse_ready` 完成回调按此钉作废整形
+    /// 缓存、替代「当刻 `src_line → block`」反查——增量编辑行平移后旧 src_line 反查会
+    /// 作废同一位置的无关块、漏作废真正的内容块（P1-7 编辑错位）；内容指纹不随块
+    /// 下标/行号位移，`src_line` 值经请求队列传到完成回调时仍可反查回对的快照。
+    code_parse_pins: RefCell<std::collections::HashMap<usize, u64>>,
     /// 换源（`install_open`）清 `math_slots` 时收拢的旧文档 Ready 位图纹理：
     /// `install_open` 无 `cx`，纹理释放推迟到下一帧 `sync_math` 用 `cx.drop_image`
     /// 统一释放（Arc 未 drop 前字节仍在、可重传，不丢渲染）。有界：每次换源一批、
@@ -356,11 +362,13 @@ pub struct WyEditor {
     /// 代码高亮解析任务的「换源代」：同 [`Self::math_epoch`]——旧文档解析完成后不写
     /// 新文档缓存、不按旧 `src_line` 作废新文档的块。
     code_epoch: Cell<u64>,
-    /// 行内公式键（`"inline:…"`）→ 包含它的行 src_line（`sync_math` claim 时登记）。
-    /// `on_math_ready` 完成时**定向作废**这些行整形缓存条目——替代 mgen 进全局 shape_key
-    /// 的整带 miss（`$$` 显示块在 Pass2 被 blocked、不入 `shape_rows`，无需作废）。
-    /// 换源清空（行号随源失效）；轻微过期只多作废一两个无关块（无害，正确性不受影响）。
-    inline_math_rows: RefCell<std::collections::HashMap<SharedString, Vec<usize>>>,
+    /// 行内公式键（`"inline:…"`）→ 包含它的 `(行 src_line, 块内容指纹)` 对（`sync_math`
+    /// claim 时登记）。`on_math_ready` 完成时按**注册时捕获的块内容指纹**定向作废这些行
+    /// 整形缓存条目——替代 mgen 进全局 shape_key 的整带 miss（`$$` 显示块在 Pass2 被
+    /// blocked、不入 `shape_rows`，无需作废）；指纹随行平移稳定，避免完成回调按当刻
+    /// `src_line → block` 反查在增量编辑行平移后作废错块（P1-7）。
+    /// 换源清空（行号随源失效）。
+    inline_math_rows: RefCell<std::collections::HashMap<SharedString, Vec<(usize, u64)>>>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
     base_dir: Option<std::path::PathBuf>,
     /// 内存图片注册表：虚拟 src（`epubimg://…`）→ 图片字节（EPUB 不落盘）。

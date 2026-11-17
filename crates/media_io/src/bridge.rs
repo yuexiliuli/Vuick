@@ -82,7 +82,10 @@ pub type FnSkipToBgra = unsafe extern "C" fn(
     *mut u64,
 ) -> CInt;
 pub type FnOpenAudio = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
-pub type FnParams = unsafe extern "C" fn(Handle, *mut ParamFFI);
+/// 参数读取（`vff_video_params` / `vff_audio_params`）：C 侧为 `void`（输出经预分配的 `out`
+/// 回传），非 `-> CInt`。显式写成 `-> ()` 防误加返回值造成 ABI 违例（Win64 忘读 RAX 类 UB）；
+/// 消费方均忽略返回值、直接读 `ParamFFI` 字段。
+pub type FnParams = unsafe extern "C" fn(Handle, *mut ParamFFI) -> ();
 pub type FnSeek = unsafe extern "C" fn(Handle, f64) -> CInt;
 pub type FnFrame = unsafe extern "C" fn(Handle, *mut u8, usize, *mut f64, *mut u32, *mut u32) -> CInt;
 pub type FnPcm = unsafe extern "C" fn(Handle, *mut f32, usize, *mut f64, *mut usize) -> CInt;
@@ -106,8 +109,10 @@ pub type FnSupportsShaderBoundTextures = unsafe extern "C" fn(usize, usize) -> C
 // ---------------- 字幕 FFI 类型与符号签名 ----------------
 
 /// 字幕顶层参数 FFI（布局定义；实际用独立函数取字幕）。
+/// dormancy 休眠保留（K24）：全仓无消费方——实际取值在 `media_ffmpeg` 内自带同名
+/// `SubtitleParamsFFI` 逐项读取，本布局声明无人引用。
 #[repr(C)]
-#[allow(dead_code)] // FFI 布局定义（消费方逐项读取）
+#[allow(dead_code)] // dormancy 休眠保留（K24）
 pub struct SubtitleParamsFFI {
     pub stream_count: u32,
     pub format: u32,
@@ -325,5 +330,28 @@ mod tests {
         assert_eq!(ap.sample_rate, 48_000);
         assert_eq!(ap.channels, 2);
         assert_eq!(ap.duration, 12.5);
+    }
+
+    /// ABI 签名一致性守卫：`FnParams` 必须与 dll `vff_video_params` / `vff_audio_params` 的
+    /// C `void` 签名一致（无返回值）。若有人误把声明改回 `-> CInt`，此处 void mock 函数将无法
+    /// 赋给 `FnParams`，编译即失败——把 headless 无法触发的 ABI/UB 违例前移到编译期。
+    #[test]
+    fn params_ffi_type_matches_void_c_signature() {
+        // 与 C `void` 对齐的 mock 签名（输出经 `out` 裸指针回传，无返回值）
+        unsafe extern "C" fn void_like(_h: Handle, _out: *mut ParamFFI) {}
+        // 赋值约束 FnParams 恰为 void 返回；改回 `-> CInt` 则此处类型不匹配、编译失败
+        let f: FnParams = void_like;
+        let mut ffi = ParamFFI {
+            width: 0,
+            height: 0,
+            duration: 0.0,
+            frame_rate_num: 0,
+            frame_rate_den: 0,
+            has_audio: 0,
+            sample_rate: 0,
+            channels: 0,
+        };
+        // 调用结果为 `()`（void），可作 `let _: ()` 绑定；`-> CInt` 时本行亦类型不匹配
+        let _: () = unsafe { f(std::ptr::null_mut(), &mut ffi) };
     }
 }

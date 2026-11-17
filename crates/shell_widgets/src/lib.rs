@@ -1,4 +1,4 @@
-//! gpui-editor 的 **L0 纯 UI 组件叶子 crate**。
+//! vuick 的 **L0 纯 UI 组件叶子 crate**。
 //!
 //! 只放「不依赖 EditorApp / 外壳编排」的纯 UI 组件，供 shell 各域复用：
 //!

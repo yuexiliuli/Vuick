@@ -1,5 +1,5 @@
 <#
-一键打包可分发的 gpui-editor（release 二进制 + media_ffmpeg.dll + FFmpeg 运行库）。
+一键打包可分发的 vuick（release 二进制 + media_ffmpeg.dll + FFmpeg 运行库）。
 
 背景：视频解码内核已拆成独立 cdylib（工作区成员 media_ffmpeg，产物 media_ffmpeg.dll），
 主 exe 只经 libloading 在打开视频时才「运行时」加载它（PE 导入表里没有 FFmpeg dll）。
@@ -7,8 +7,8 @@
   - exe 缺 FFmpeg 也能正常启动，只在用视频时于窗口内报「缺少视频运行库」；
   - 要让视频功能可用，分发时 exe 必须与 media_ffmpeg.dll 及 FFmpeg 运行库同目录。
 
-本脚本产出 dist\gpui-editor-win64\：
-  - gpui-editor.exe（release，非 debug：debug 还依赖 vcruntime140d/ucrtbased 调试 CRT）
+本脚本产出 dist\vuick-win64\：
+  - vuick.exe（release，非 debug：debug 还依赖 vcruntime140d/ucrtbased 调试 CRT）
   - media_ffmpeg.dll（视频解码内核，本仓库 cdylib 构建产物）
   - media_ffmpeg.dll **实际导入**的 FFmpeg dll（导入表驱动自动随必需集；media_ffmpeg
     Cargo.toml 已剪 device/filter feature → 只带 avcodec/avformat/avutil/swresample/swscale，
@@ -111,7 +111,7 @@ if ($Simulate) {
 
 # ---------- 1) release 构建（exe 与 media_ffmpeg 分开构建，确保 cdylib 一定产出） ----------
 Write-Host "[1/3] cargo build --release（exe + media_ffmpeg cdylib）..."
-cargo build --release -p gpui-editor
+cargo build --release -p vuick
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[错误] release exe 构建失败。"
     exit 1
@@ -121,7 +121,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "[错误] media_ffmpeg（cdylib）构建失败。"
     exit 1
 }
-$exe = Join-Path (Get-Location) 'target\release\gpui-editor.exe'
+$exe = Join-Path (Get-Location) 'target\release\vuick.exe'
 $kernel = Join-Path (Get-Location) 'target\release\media_ffmpeg.dll'
 if (-not (Test-Path $exe)) {
     Write-Host "[错误] 产物不存在：$exe"
@@ -133,11 +133,11 @@ if (-not (Test-Path $kernel)) {
 }
 
 # ---------- 2) 组装 dist 目录 ----------
-$outDir = if ($OutDir) { $OutDir } else { Join-Path (Get-Location) 'dist\gpui-editor-win64' }
+$outDir = if ($OutDir) { $OutDir } else { Join-Path (Get-Location) 'dist\vuick-win64' }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 Write-Host "[2/3] 复制 exe + media_ffmpeg.dll + FFmpeg 运行库 -> $outDir"
-Copy-Item $exe (Join-Path $outDir 'gpui-editor.exe') -Force
+Copy-Item $exe (Join-Path $outDir 'vuick.exe') -Force
 Copy-Item $kernel (Join-Path $outDir 'media_ffmpeg.dll') -Force
 
 # 2b) FFmpeg 运行库：三态判定（Get-FfmpegDecision）按 media_ffmpeg.dll 的实际导入表驱动，只带必需件。
@@ -198,7 +198,7 @@ if (-not $objdump) {
     Write-Host "[警告] 未找到 llvm-objdump，跳过 exe/内核导入校验。"
 } else {
     # 3a) exe 应【不再】导入任何 FFmpeg dll —— 保证缺 FFmpeg 也能启动
-    $exeImports = @(& $objdump -p (Join-Path $outDir 'gpui-editor.exe') 2>$null |
+    $exeImports = @(& $objdump -p (Join-Path $outDir 'vuick.exe') 2>$null |
         Select-String -Pattern 'DLL Name: avcodec-.*\.dll|DLL Name: avformat-.*\.dll|DLL Name: swscale-.*\.dll|DLL Name: swresample-.*\.dll|DLL Name: avutil-.*\.dll')
     if ($exeImports) {
         Write-Host "[警告] exe 仍静态导入 FFmpeg：$($exeImports.Line -join ', ')。缺库时 exe 无法启动，未达预期。"

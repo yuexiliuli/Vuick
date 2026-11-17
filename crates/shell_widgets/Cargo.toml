@@ -3,7 +3,7 @@ name = "shell_widgets"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor L0 纯 UI 组件叶子 crate（自绘横向滚动条 TableScrollState/horizontal_scrollbar + TabBoundsRecorder 选项卡边界记录器，供 shell 各域复用）"
+description = "vuick L0 纯 UI 组件叶子 crate（自绘横向滚动条 TableScrollState/horizontal_scrollbar + TabBoundsRecorder 选项卡边界记录器，供 shell 各域复用）"
 
 [dependencies]
 # 纯 UI 组件零 EditorApp 依赖：只用 gpui 平台元素 API + config::layout 常量（只重分配、不加新）。

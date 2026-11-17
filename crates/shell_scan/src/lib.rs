@@ -56,6 +56,44 @@ pub struct FolderFileHit {
     pub path: PathBuf,
     /// 组内命中行（行号 / LF 归一化全文字节区间 / trim 片段）。
     pub hits: Vec<SearchLineHit>,
+    /// 扫描时刻的文件指纹（大小 + 修改时间），供陈旧判定：文件被编辑/落盘后
+    /// 指纹与磁盘实态不符 → 该组命中行号/字节区间相对编辑缓冲已失效（P1-37）。
+    /// 扫描无元数据（理论上不发生，见 `folder_scan_collect` 传参）→ `None`。
+    pub fingerprint: Option<FileFingerprint>,
+}
+
+/// 文件扫描时刻指纹：`(size, mtime)`，`FolderSearchScan` 陈旧检测的最小取证单元
+/// （轻量 `std::fs::metadata`，无内容哈希，命中文件数有 `FOLDER_SEARCH_RESULT_CAP`
+/// 上限；mtime 仅作辅助信号，主判据是 size——内容变更尺寸必变、跨时钟粒度也稳）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileFingerprint {
+    /// 文件字节长度（内容改变 → 长度变化 → 必被检出）。
+    pub size: u64,
+    /// 最后修改时间（辅助信号；`metadata().modified()` 失败 → `None`，退化为仅比 size）。
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+impl FileFingerprint {
+    /// 取一个路径当前的指纹；文件不存在 / 非文件 / 元数据失败 → `None`（视为「已失效」）。
+    pub fn now(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        Some(Self {
+            size: meta.len(),
+            mtime: meta.modified().ok(),
+        })
+    }
+
+    /// 该指纹是否仍与 `path` 当前磁盘实态一致（size 或 mtime 任一变化即不一致）。
+    pub fn matches_current(&self, path: &std::path::Path) -> bool {
+        match Self::now(path) {
+            Some(cur) => cur.size == self.size && cur.mtime == self.mtime,
+            // 文件被删/改名/不可读 → 指纹无从比对 → 陈旧。
+            None => false,
+        }
+    }
 }
 
 /// 文件夹级搜索的（后台增量装配的）扫描结果缓存。
@@ -75,6 +113,35 @@ pub struct FolderSearchScan {
     pub generation: u64,
     /// 累计命中条数（词频与截断判定依据）。
     pub total_hits: usize,
+}
+
+impl FolderSearchScan {
+    /// 命中文件相对扫描时刻**任一致已陈旧**（编辑/落盘/删除/改名）→ 结果不可再用于跳转。
+    /// 宿主调用点建议：`folder_search_open_hit` 点击跳转前判一次（最紧、一次 stat/文件），
+    /// 或 `folder_search_scan` 复用缓存键命中后判一次（每次渲染面板时，命中文件数受
+    /// `FOLDER_SEARCH_RESULT_CAP` 约束，stat 级成本可接受）。陈旧即重扫/提示，杜绝
+    /// 「编辑后仍按旧行号/旧字节区间跳转错位」（P1-37）。
+    pub fn any_stale(&self) -> bool {
+        self.files.iter().any(|f| {
+            f.fingerprint
+                .map(|fp| !fp.matches_current(&f.path))
+                // 无指纹（理论不发生）→ 保守按陈旧处理。
+                .unwrap_or(true)
+        })
+    }
+
+    /// 与 [`Self::any_stale`] 同判据，返回**已陈旧文件路径列表**（供宿主提示/定向重扫）。
+    pub fn stale_paths(&self) -> Vec<PathBuf> {
+        self.files
+            .iter()
+            .filter(|f| {
+                f.fingerprint
+                    .map(|fp| !fp.matches_current(&f.path))
+                    .unwrap_or(true)
+            })
+            .map(|f| f.path.clone())
+            .collect()
+    }
 }
 
 /// 后台扫描 → 主线程的一块增量更新（有界 channel，见宿主 `start_folder_scan`）。
@@ -194,7 +261,12 @@ pub async fn folder_scan_collect(
                     continue;
                 }
                 *total += hits.len();
-                let f = FolderFileHit { path, hits };
+                // 指纹取自本次读盘前已取到的 `meta`（同一份元数据，大小/类型已验过）。
+                let fingerprint = Some(FileFingerprint {
+                    size: meta.len(),
+                    mtime: meta.modified().ok(),
+                });
+                let f = FolderFileHit { path, hits, fingerprint };
                 let _ = tx.send(FolderScanUpdate::File(f)).await;
             }
         }
@@ -229,8 +301,11 @@ pub fn find_ci(haystack: &str, needle: &str) -> Option<std::ops::Range<usize>> {
             let at = pos + rel;
             if at + n.len() <= h.len() {
                 let mut ok = true;
+                // 尾字节也要折 needle：仅折 haystack 时，needle 含大写尾字节（如 "aB"）
+                // 对任何混合大小写正文都永不命中（首字节已双形、尾字节漏折，P1-36）。
+                // needle 全 ASCII，`to_ascii_lowercase` 安全且长度不变。
                 for (j, &nb) in n.iter().enumerate().skip(1) {
-                    if h[at + j].to_ascii_lowercase() != nb {
+                    if h[at + j].to_ascii_lowercase() != nb.to_ascii_lowercase() {
                         ok = false;
                         break;
                     }
@@ -308,16 +383,19 @@ pub fn scan_line_hits(content: &str, q: &str, remaining: usize, out: &mut Vec<Se
     }
     let mut doc_offset = 0usize;
     if q.is_ascii() {
-        // 一次性小写全文副本（std `to_ascii_lowercase`：仅折 ASCII 字母，长度不变）。
+        // 一次性小写全文副本（std `to_ascii_lowercase`：仅折 ASCII 字母，长度不变）；
+        // 查询词同样折叠（P1-36 复查项）：未归一化含大写的 q 也能大小写不敏感命中，
+        // ASCII 折叠长度不变 → 命中字节区间仍按原 q 长度直映回原文。
         let lower = content.to_ascii_lowercase();
+        let lower_q = q.to_ascii_lowercase();
         for (li, (line, lower_line)) in content.split('\n').zip(lower.split('\n')).enumerate() {
             if out.len() >= remaining {
                 break;
             }
-            if let Some(pos) = lower_line.find(q) {
+            if let Some(pos) = lower_line.find(&lower_q) {
                 out.push(SearchLineHit {
                     line: li,
-                    range: (doc_offset + pos)..(doc_offset + pos + q.len()),
+                    range: (doc_offset + pos)..(doc_offset + pos + lower_q.len()),
                     snippet: line.trim().to_string(),
                 });
             }
@@ -337,5 +415,121 @@ pub fn scan_line_hits(content: &str, q: &str, remaining: usize, out: &mut Vec<Se
             }
             doc_offset += line.len() + 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-36 回归：`find_ci` ASCII 分支对**尾字节含大写**的 needle（如 "aB"）也应
+    /// 大小写不敏感命中——修前只折 haystack 不折 needle，`"aB"` 对任何混合大小写正文
+    /// 都永无命中（首字节已双形、尾字节漏折）。
+    #[test]
+    fn find_ci_folds_needle_tail_bytes() {
+        // 尾字节大写 needle × 四种大小写组合正文全部应命中 0..2。
+        for h in ["ab", "aB", "Ab", "AB"] {
+            assert_eq!(find_ci(h, "aB"), Some(0..2), "haystack={h:?}");
+            assert_eq!(find_ci(h, "Ab"), Some(0..2), "haystack={h:?}");
+        }
+        // 首字节大小写双形保持（修前已支持）。
+        assert_eq!(find_ci("aB", "ab"), Some(0..2));
+        assert_eq!(find_ci("xX aB trailing", "ab"), Some(3..5));
+        // 全大写 needle 命中小写/混合正文。
+        assert_eq!(find_ci("i say hello world", "HELLO"), Some(6..11));
+        assert_eq!(find_ci("i say HELLO world", "hello"), Some(6..11));
+        // 不命中：无对应大小写簇。
+        assert_eq!(find_ci("hello", "aB"), None);
+        assert_eq!(find_ci("xyz", "abC"), None);
+    }
+
+    /// P1-36 回归（复查项）：`scan_line_hits` ASCII 分支对**未归一化（含大写）**的查询词
+    /// 也应大小写不敏感命中（修前建小写全文副本后直接用原 q 匹配，`"HELLO"` 永不命中）。
+    #[test]
+    fn scan_line_hits_folds_ascii_query() {
+        let mut out = Vec::new();
+        scan_line_hits("alpha\nHello World\nbeta Hello\n", "HELLO", usize::MAX, &mut out);
+        // 行号 + 文档字节区间 = 行首偏移 + 行内命中位（ASCII 折叠长度不变，区间直映原文）。
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].line, 1);
+        assert_eq!(out[0].range, 6..11, "line1 行首偏移 6 + 命中位 0..5");
+        assert_eq!(out[1].line, 2);
+        assert_eq!(out[1].range, 23..28, "line2 行首偏移 23(6+11+1+5) + 命中位 0..5");
+        // 混合大小写 needle 命中混合大小写正文。
+        let mut out = Vec::new();
+        scan_line_hits("only one WiRd Token line\n", "wIrD", usize::MAX, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].range, 9..13);
+        // 空白语义保持。
+        let mut out = Vec::new();
+        scan_line_hits("A\nB\n", "b", usize::MAX, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line, 1);
+    }
+
+    /// 测试临时目录：进程 + 名字 + 自增序号唯一（std 自造，不加依赖）。
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("shell_scan_{}_{}_{}", std::process::id(), name, n))
+    }
+
+    /// P1-37 回归：`folder_scan_collect` 产出的文件命中携带**扫描时刻指纹**（大小 + mtime），
+    /// 文件被编辑/落盘后 `FolderSearchScan::any_stale` / `stale_paths` 可检出陈旧——修前
+    /// 结果不含任何指纹，陈旧命中无从判别，点击跳转沿用旧行号/旧字节区间 → 错位。
+    #[test]
+    fn folder_search_scan_stale_detected_after_edit() {
+        use futures::executor::block_on;
+        use futures::StreamExt as _;
+        let dir = unique_temp_dir("folder_scan_stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("a.txt");
+        let other = dir.join("b.txt");
+        std::fs::write(&target, "alpha query beta\n").unwrap();
+        std::fs::write(&other, "query elsewhere\n").unwrap();
+        let session =
+            std::env::temp_dir().join(format!("shell_scan_session_{}", std::process::id()));
+
+        // 真实扫描：命中两文件，产生指纹（session 目录非本测试目录，不跳过）。
+        let (tx, mut rx) = futures::channel::mpsc::channel::<FolderScanUpdate>(8);
+        let mut total = 0usize;
+        let _truncated = block_on(folder_scan_collect(&dir, "query", tx, &session, &mut total, 100));
+        let mut scan = FolderSearchScan {
+            query: "query".to_string(),
+            root: Some(dir.clone()),
+            files: Vec::new(),
+            truncated: false,
+            running: false,
+            generation: 0,
+            total_hits: total,
+        };
+        while let Ok(Some(upd)) = rx.try_next() {
+            if let FolderScanUpdate::File(f) = upd {
+                scan.files.push(f);
+            }
+        }
+        assert_eq!(scan.files.len(), 2, "两文件都应命中");
+        // 扫描后（未编辑）：不陈旧 + 每个命中文件都有指纹。
+        assert!(!scan.any_stale(), "扫描后无编辑 → 不应陈旧");
+        assert!(scan.stale_paths().is_empty());
+        for f in &scan.files {
+            assert!(f.fingerprint.is_some(), "{} 应有扫描时刻指纹", f.path.display());
+        }
+
+        // 编辑 target（追加变长 → 大小必变，mtime 亦变）→ 陈旧可检出，且只标 target。
+        std::fs::write(&target, "alpha query beta\nsecond line query more\n").unwrap();
+        assert!(scan.any_stale(), "编辑后应陈旧");
+        let stale = scan.stale_paths();
+        assert!(
+            stale.iter().any(|p| p == &target),
+            "stale_paths 应含 target，实得 {stale:?}"
+        );
+        assert!(
+            !stale.iter().any(|p| p == &other),
+            "未编辑的 other 不应陈旧，实得 {stale:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

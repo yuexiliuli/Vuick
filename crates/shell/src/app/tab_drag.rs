@@ -456,7 +456,7 @@ impl EditorApp {
                             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE
                                 | SWP_NOZORDER | SWP_NOACTIVATE,
                         );
-                        if std::env::var_os("GPUI_EDITOR_DIAG").is_some() {
+                        if std::env::var_os("VUICK_DIAG").is_some() {
                             let mut wr = Rect { left: 0, top: 0, right: 0, bottom: 0 };
                             let mut cr = Rect { left: 0, top: 0, right: 0, bottom: 0 };
                             GetWindowRect(hwnd, &mut wr);

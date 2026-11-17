@@ -28,7 +28,7 @@ public static class WP {
 }
 "@
 
-$exe = "E:\Rust\gpui-editor\target\debug\gpui-editor.exe"
+$exe = "E:\Rust\vuick\target\debug\vuick.exe"
 $p = Start-Process -FilePath $exe -ArgumentList @("`"$Image`"") -PassThru
 try {
     $hwnd = [IntPtr]::Zero

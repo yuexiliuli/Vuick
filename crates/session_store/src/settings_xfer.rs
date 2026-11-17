@@ -6,7 +6,7 @@
 //!
 //! 打包格式（单个 `.json`）：
 //! ```json
-//! { "app": "gpui-editor", "export_version": 1,
+//! { "app": "vuick", "export_version": 1,
 //!   "prefs": { ...UserPrefs 全字段... },
 //!   "session": { "manifest": { "version":1, "active_tab":N, "tabs":[...] },
 //!                "slots": { "t0": "<正文>", ... } } }
@@ -20,7 +20,10 @@ use serde_json::{json, Map, Value};
 use crate::SessionManifest;
 
 /// 导出包魔力头（非本应用文件 → 拒绝导入）。
-const EXPORT_MAGIC: &str = "gpui-editor";
+const EXPORT_MAGIC: &str = "vuick";
+/// 兼容旧版（gpui-editor 时代）导出的魔力头：仅导入放行，导出永远写 [`EXPORT_MAGIC`]
+/// 新名——旧文件「搬到别处导入也还在」不因改名失效。
+const LEGACY_EXPORT_MAGIC: &str = "gpui-editor";
 /// 导出包格式版本（自含版本可校验；未来格式演进用版本号迁移）。
 const EXPORT_VERSION: u64 = 1;
 
@@ -65,7 +68,9 @@ pub fn parse_export_bundle(text: &str) -> Result<ParsedExportBundle, ()> {
     let Some(obj) = v.as_object() else {
         return Err(());
     };
-    if obj.get("app").and_then(|x| x.as_str()) != Some(EXPORT_MAGIC) {
+    // 新名 + 旧名双放行（改名兼容：VUICK 时代新旧导出文件都能导入）。
+    let app = obj.get("app").and_then(|x| x.as_str());
+    if app != Some(EXPORT_MAGIC) && app != Some(LEGACY_EXPORT_MAGIC) {
         return Err(());
     }
     if obj.get("export_version").and_then(|x| x.as_u64()) != Some(EXPORT_VERSION) {

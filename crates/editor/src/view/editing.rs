@@ -449,6 +449,10 @@ impl CodeEditor {
         let s = crate::editor::buffer::line_shared(self.buffer.text(), line);
         let s = s.as_ref();
         let upto = byte_col.min(s.len());
+        // 过期括对列号（编辑后仍指向旧字节位置、落在多字节字符中间）先夹到字符边界
+        // 再切片：否则 `s[..upto]` 非字符边界切片 panic（渲染帧崩溃）。夹到前一边界
+        // 与该前缀「宽度单位」语义一致（本列之前的字符才属前缀）。
+        let upto = s.floor_char_boundary(upto);
         s[..upto]
             .chars()
             .map(crate::editor::buffer::char_width_units)
@@ -819,6 +823,12 @@ impl CodeEditor {
     #[cfg(test)]
     pub fn test_active_guide_highlight_color(&self) -> gpui::Hsla {
         self.active_guide_highlight_color()
+    }
+
+    /// （测试）`guide_col_prefix_units` 只读暴露（非字符边界列号的字符边界安全断言用）。
+    #[cfg(test)]
+    pub fn test_guide_col_prefix_units(&self, line: usize, byte_col: usize) -> usize {
+        self.guide_col_prefix_units(line, byte_col)
     }
 
     /// （测试）`test_bracket_guide_segments_flagged` 用的 active pair（活动括对）。

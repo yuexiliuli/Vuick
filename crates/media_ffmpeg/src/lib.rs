@@ -15,7 +15,7 @@
 //! - 所有解码操作在本库内部串行化（`decode::FFMPEG_LOCK`），与旧版同一纪律。
 //!
 //! 导出函数均为 `unsafe extern "C"`：跨 DLL 边界的 C ABI 约定由调用方（主程序）遵守，
-//! 具体前置条件见 `gpui-editor/src/video/decode.rs` 加载器——此处统一豁免逐条 `# Safety`。
+//! 具体前置条件见 `vuick/src/video/decode.rs` 加载器——此处统一豁免逐条 `# Safety`。
 #![allow(clippy::missing_safety_doc)]
 
 mod decode;
@@ -53,6 +53,22 @@ fn path_from<'a>(p: *const c_char) -> Option<&'a std::path::Path> {
 #[inline]
 fn reader<'a, T>(h: Handle) -> &'a mut T {
     unsafe { &mut *(h as *mut T) }
+}
+
+/// FFI 导出统一 panic 护栏：Rust panic 若跨 `extern "C"` 边界 unwind 会 **abort 整个进程**
+///（宿主 loadlibrary 侧 / FFmpeg 回调无法 catch）。每个导出函数体都经此 helper 包一层
+/// `std::panic::catch_unwind`——内部 `expect`/slice 越界/解码逻辑 panic 时按该函数返回
+/// 语义给安全默认值（`c_int` 类返 -1、指针类返空/哨兵、`usize` 返 0、void 直接吞掉），
+/// 杜绝「解码中途 panic → 连同宿主 exe 一起崩」。
+///
+/// `AssertUnwindSafe`：闭包捕获原始指针等非 unwind-safe 类型，属 FFI 边界上的预期——
+/// panic 发生后我们只放弃继续执行返回默认值，不依赖已被捕获状态的完整恢复。
+fn catch_unwind_ffi<R>(default: R, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        // panic 已捕获：返回安全默认值，panic payload 丢弃（只保证不 unwind 过 FFI 边界）
+        Err(_) => default,
+    }
 }
 
 // ---------------- 打开失败错误分类（R2-4：可观测化） ----------------
@@ -96,7 +112,9 @@ fn clear_last_open_error() {
 /// 后读取。符号缺失 = 旧 dll → 主侧桥可选解析、回退通用文案（ABI 向后兼容）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_last_error_message() -> *const c_char {
-    LAST_OPEN_ERROR.with(|c| c.borrow().as_ptr() as *const c_char)
+    catch_unwind_ffi(std::ptr::null(), || {
+        LAST_OPEN_ERROR.with(|c| c.borrow().as_ptr() as *const c_char)
+    })
 }
 
 // ---------------- 视频 ----------------
@@ -110,22 +128,24 @@ pub unsafe extern "C" fn vff_open_video(
     max_dim: u32,
     out: *mut Handle,
 ) -> c_int {
-    if out.is_null() {
-        return -1;
-    }
-    let Some(p) = path_from(path) else {
-        return -1;
-    };
-    let r = match VideoReader::open_scaled(p, max_dim) {
-        Ok(r) => r,
-        Err(e) => {
-            record_last_open_error(&e);
+    catch_unwind_ffi(-1, || {
+        if out.is_null() {
             return -1;
         }
-    };
-    clear_last_open_error();
-    unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
-    0
+        let Some(p) = path_from(path) else {
+            return -1;
+        };
+        let r = match VideoReader::open_scaled(p, max_dim) {
+            Ok(r) => r,
+            Err(e) => {
+                record_last_open_error(&e);
+                return -1;
+            }
+        };
+        clear_last_open_error();
+        unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
+        0
+    })
 }
 
 /// 打开视频（**硬件优先**：FFmpeg 自有 D3D11VA/DXVA2 设备，无调用方设备注入、无共享
@@ -139,35 +159,39 @@ pub unsafe extern "C" fn vff_open_video_hw_prefer(
     max_dim: u32,
     out: *mut Handle,
 ) -> c_int {
-    if out.is_null() {
-        return -1;
-    }
-    let Some(p) = path_from(path) else {
-        return -1;
-    };
-    let r = match VideoReader::open_scaled_hw(p, max_dim) {
-        Ok(r) => r,
-        Err(e) => {
-            record_last_open_error(&e);
+    catch_unwind_ffi(-1, || {
+        if out.is_null() {
             return -1;
         }
-    };
-    clear_last_open_error();
-    unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
-    0
+        let Some(p) = path_from(path) else {
+            return -1;
+        };
+        let r = match VideoReader::open_scaled_hw(p, max_dim) {
+            Ok(r) => r,
+            Err(e) => {
+                record_last_open_error(&e);
+                return -1;
+            }
+        };
+        clear_last_open_error();
+        unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
+        0
+    })
 }
 
 /// 当前 reader 是否为硬件解码（D3D11VA/DXVA2）。1 = HW；0 = 软解。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_video_is_hw(h: Handle) -> c_int {
-    reader::<VideoReader>(h).is_hw() as c_int
+    catch_unwind_ffi(0, || reader::<VideoReader>(h).is_hw() as c_int)
 }
 
 /// 拖拽快扫预览模式：1 = `skip_frame=NONKEY`（解码器只解关键帧，Video Decode 引擎每轮
 /// seek 从「关键帧→落点整段 P/B"」降到「1 个 I 帧」）；0 = 全帧精确（seek/播放）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_video_set_skip_nonkey(h: Handle, nonkey: c_int) {
-    reader::<VideoReader>(h).set_skip_nonkey(nonkey != 0)
+    catch_unwind_ffi((), || {
+        reader::<VideoReader>(h).set_skip_nonkey(nonkey != 0)
+    })
 }
 
 /// 诊断/测试用能力探测：驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」。1 = 支持；
@@ -183,8 +207,10 @@ pub unsafe extern "C" fn vff_d3d11_supports_shader_bound_textures(
     // 本函数是**独立成组**的 FFmpeg 入口（门控在 worker 开媒体时调，可能与 hover/音频
     // worker 的解码并发跑）：所有 FFI 调用必须过 FFMPEG_LOCK 串行（decode.rs 注释同款
     // 纪律）——否则并发的 av_hwdevice/frame ctx init 与解码互卡（72.MP4 实测卡死同源）。
-    let _g = decode::FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    decode::d3d11_supports_shader_bound_textures(device, device_context) as c_int
+    catch_unwind_ffi(0, || {
+        let _g = decode::FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        decode::d3d11_supports_shader_bound_textures(device, device_context) as c_int
+    })
 }
 
 /// **seek 预滚**：`seek(target)` 后逐帧解码，落点前帧**只解码不转换**（硬件 ≈0.5ms/帧、
@@ -202,46 +228,55 @@ pub unsafe extern "C" fn vff_video_skip_to_bgra(
     hh: *mut u32,
     skipped: *mut u64,
 ) -> c_int {
-    if out_buf.is_null() {
-        return -1;
-    }
-    let r = reader::<VideoReader>(h);
-    let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
-    match r.skip_to_bgra_into(target, out) {
-        Ok(Some((p, ww, hhh, sk))) => {
-            unsafe {
-                *pts = p;
-                *w = ww;
-                *hh = hhh;
-                *skipped = sk;
-            }
-            1
+    catch_unwind_ffi(-1, || {
+        if out_buf.is_null() {
+            return -1;
         }
-        Ok(None) => 0,
-        Err(_) => -1,
-    }
+        let r = reader::<VideoReader>(h);
+        let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
+        match r.skip_to_bgra_into(target, out) {
+            Ok(Some((p, ww, hhh, sk))) => {
+                unsafe {
+                    *pts = p;
+                    *w = ww;
+                    *hh = hhh;
+                    *skipped = sk;
+                }
+                1
+            }
+            Ok(None) => 0,
+            Err(_) => -1,
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_video_params(h: Handle, out: *mut ParamFFI) {
-    let p = reader::<VideoReader>(h).params();
-    unsafe {
-        *out = ParamFFI {
-            width: p.width,
-            height: p.height,
-            duration: p.duration,
-            frame_rate_num: p.frame_rate.map(|r| r.0).unwrap_or(0),
-            frame_rate_den: p.frame_rate.map(|r| r.1).unwrap_or(0),
-            has_audio: p.has_audio as u8,
-            sample_rate: 0,
-            channels: 0,
-        };
-    }
+    catch_unwind_ffi((), || {
+        let p = reader::<VideoReader>(h).params();
+        unsafe {
+            *out = ParamFFI {
+                width: p.width,
+                height: p.height,
+                duration: p.duration,
+                frame_rate_num: p.frame_rate.map(|r| r.0).unwrap_or(0),
+                frame_rate_den: p.frame_rate.map(|r| r.1).unwrap_or(0),
+                has_audio: p.has_audio as u8,
+                sample_rate: 0,
+                channels: 0,
+            };
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_video_seek(h: Handle, seconds: f64) -> c_int {
-    reader::<VideoReader>(h).seek(seconds).map(|_| 0).unwrap_or(-1)
+    catch_unwind_ffi(-1, || {
+        reader::<VideoReader>(h)
+            .seek(seconds)
+            .map(|_| 0)
+            .unwrap_or(-1)
+    })
 }
 
 /// 取下一帧 BGRA。返回：1 = 有帧（已拷入 `out_buf`，`*pts/*w/*hh` 已写）；
@@ -255,31 +290,35 @@ pub unsafe extern "C" fn vff_video_frame(
     w: *mut u32,
     hh: *mut u32,
 ) -> c_int {
-    if out_buf.is_null() {
-        return -1;
-    }
-    let r = reader::<VideoReader>(h);
-    // 直接写进调用方预分配缓冲（`next_frame_bgra_into` 内部不再 to_vec，省一次整帧分配+拷贝）
-    let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
-    match r.next_frame_bgra_into(out) {
-        Ok(Some((p, ww, hhh))) => {
-            unsafe {
-                *pts = p;
-                *w = ww;
-                *hh = hhh;
-            }
-            1
+    catch_unwind_ffi(-1, || {
+        if out_buf.is_null() {
+            return -1;
         }
-        Ok(None) => 0,
-        Err(_) => -1,
-    }
+        let r = reader::<VideoReader>(h);
+        // 直接写进调用方预分配缓冲（`next_frame_bgra_into` 内部不再 to_vec，省一次整帧分配+拷贝）
+        let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
+        match r.next_frame_bgra_into(out) {
+            Ok(Some((p, ww, hhh))) => {
+                unsafe {
+                    *pts = p;
+                    *w = ww;
+                    *hh = hhh;
+                }
+                1
+            }
+            Ok(None) => 0,
+            Err(_) => -1,
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_close_video(h: Handle) {
-    if !h.is_null() {
-        drop(unsafe { Box::from_raw(h as *mut VideoReader) });
-    }
+    catch_unwind_ffi((), || {
+        if !h.is_null() {
+            drop(unsafe { Box::from_raw(h as *mut VideoReader) });
+        }
+    })
 }
 
 /// 打开视频（**外部 D3D11 设备注入**，零回读 GPU 直通）：`device_ptr` = `ID3D11Device*`
@@ -297,22 +336,24 @@ pub unsafe extern "C" fn vff_open_video_hw(
     device_ctx_ptr: *mut c_void,
     out: *mut Handle,
 ) -> c_int {
-    if out.is_null() || device_ptr.is_null() {
-        return -1;
-    }
-    let Some(p) = path_from(path) else {
-        return -1;
-    };
-    let r = match VideoReader::open_external_hw(p, max_dim, device_ptr, device_ctx_ptr) {
-        Ok(r) => r,
-        Err(e) => {
-            record_last_open_error(&e);
+    catch_unwind_ffi(-1, || {
+        if out.is_null() || device_ptr.is_null() {
             return -1;
         }
-    };
-    clear_last_open_error();
-    unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
-    0
+        let Some(p) = path_from(path) else {
+            return -1;
+        };
+        let r = match VideoReader::open_external_hw(p, max_dim, device_ptr, device_ctx_ptr) {
+            Ok(r) => r,
+            Err(e) => {
+                record_last_open_error(&e);
+                return -1;
+            }
+        };
+        clear_last_open_error();
+        unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
+        0
+    })
 }
 
 /// 取下一帧 GPU 纹理句柄（零回读）。状态由**返回值指针**编码（句柄本身非空即帧，无法用
@@ -333,21 +374,24 @@ pub unsafe extern "C" fn vff_video_frame_hw(
     out_tex: *mut usize,
     out_idx: *mut u32,
 ) -> *mut c_void {
-    let r = reader::<VideoReader>(h);
-    match r.next_frame_hw() {
-        Ok(Some(frame)) => {
-            unsafe {
-                *out_pts = frame.pts_seconds;
-                *out_w = frame.width;
-                *out_h = frame.height;
-                *out_tex = frame.tex;
-                *out_idx = frame.array_index;
+    // 默认返回错误哨兵（解码错误语义）：panic 时无法写输出字段，如实上报而非装成 EOF
+    catch_unwind_ffi(usize::MAX as *mut c_void, || {
+        let r = reader::<VideoReader>(h);
+        match r.next_frame_hw() {
+            Ok(Some(frame)) => {
+                unsafe {
+                    *out_pts = frame.pts_seconds;
+                    *out_w = frame.width;
+                    *out_h = frame.height;
+                    *out_tex = frame.tex;
+                    *out_idx = frame.array_index;
+                }
+                Box::into_raw(Box::new(frame)) as *mut c_void
             }
-            Box::into_raw(Box::new(frame)) as *mut c_void
+            Ok(None) => 0x1 as *mut c_void,
+            Err(_) => usize::MAX as *mut c_void,
         }
-        Ok(None) => 0x1 as *mut c_void,
-        Err(_) => usize::MAX as *mut c_void,
-    }
+    })
 }
 
 /// 释放 [`vff_video_frame_hw`] 返回的帧句柄（Drop AVBufferRef 引用 → 帧池槽位回归解码器
@@ -355,10 +399,12 @@ pub unsafe extern "C" fn vff_video_frame_hw(
 /// 调用是安全的 no-op；传其它任意非法/未对齐指针是未定义行为（与其余 FFI 句柄同契约）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_video_frame_release(frame_ptr: *mut c_void) {
-    let p = frame_ptr as usize;
-    if !frame_ptr.is_null() && p != 0x1 && p != usize::MAX {
-        drop(unsafe { Box::from_raw(frame_ptr as *mut decode::HwFrame) });
-    }
+    catch_unwind_ffi((), || {
+        let p = frame_ptr as usize;
+        if !frame_ptr.is_null() && p != 0x1 && p != usize::MAX {
+            drop(unsafe { Box::from_raw(frame_ptr as *mut decode::HwFrame) });
+        }
+    })
 }
 
 // ---------------- 音频 ----------------
@@ -372,44 +418,53 @@ pub unsafe extern "C" fn vff_open_audio(
     sample_rate: u32,
     out: *mut Handle,
 ) -> c_int {
-    if out.is_null() {
-        return -1;
-    }
-    let Some(p) = path_from(path) else {
-        return -1;
-    };
-    let r = match AudioReader::open_pcm_f32(p, sample_rate) {
-        Ok(r) => r,
-        Err(e) => {
-            record_last_open_error(&e);
+    catch_unwind_ffi(-1, || {
+        if out.is_null() {
             return -1;
         }
-    };
-    clear_last_open_error();
-    unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
-    0
+        let Some(p) = path_from(path) else {
+            return -1;
+        };
+        let r = match AudioReader::open_pcm_f32(p, sample_rate) {
+            Ok(r) => r,
+            Err(e) => {
+                record_last_open_error(&e);
+                return -1;
+            }
+        };
+        clear_last_open_error();
+        unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
+        0
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_audio_params(h: Handle, out: *mut ParamFFI) {
-    let p = reader::<AudioReader>(h).params();
-    unsafe {
-        *out = ParamFFI {
-            width: 0,
-            height: 0,
-            duration: p.duration,
-            frame_rate_num: 0,
-            frame_rate_den: 0,
-            has_audio: 1,
-            sample_rate: p.sample_rate,
-            channels: p.channels,
-        };
-    }
+    catch_unwind_ffi((), || {
+        let p = reader::<AudioReader>(h).params();
+        unsafe {
+            *out = ParamFFI {
+                width: 0,
+                height: 0,
+                duration: p.duration,
+                frame_rate_num: 0,
+                frame_rate_den: 0,
+                has_audio: 1,
+                sample_rate: p.sample_rate,
+                channels: p.channels,
+            };
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_audio_seek(h: Handle, seconds: f64) -> c_int {
-    reader::<AudioReader>(h).seek(seconds).map(|_| 0).unwrap_or(-1)
+    catch_unwind_ffi(-1, || {
+        reader::<AudioReader>(h)
+            .seek(seconds)
+            .map(|_| 0)
+            .unwrap_or(-1)
+    })
 }
 
 /// 取下一块 F32 交错样本。返回：1 = 有数据（`*pts/*written` 已写，样本拷入 `out_buf`）；
@@ -422,31 +477,35 @@ pub unsafe extern "C" fn vff_audio_pcm(
     pts: *mut f64,
     written: *mut usize,
 ) -> c_int {
-    if out_buf.is_null() {
-        return -1;
-    }
-    let r = reader::<AudioReader>(h);
-    // R2-2：样本直接写进调用方预分配缓冲（`next_pcm_f32_into` 内部复用常驻输出帧，
-    // 不再每块新建 out 帧 + `to_vec` 中间分配）——采样字节与旧路径逐字一致。
-    let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
-    match r.next_pcm_f32_into(out) {
-        Ok(Some((p, n))) => {
-            unsafe {
-                *pts = p;
-                *written = n;
-            }
-            1
+    catch_unwind_ffi(-1, || {
+        if out_buf.is_null() {
+            return -1;
         }
-        Ok(None) => 0,
-        Err(_) => -1,
-    }
+        let r = reader::<AudioReader>(h);
+        // R2-2：样本直接写进调用方预分配缓冲（`next_pcm_f32_into` 内部复用常驻输出帧，
+        // 不再每块新建 out 帧 + `to_vec` 中间分配）——采样字节与旧路径逐字一致。
+        let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
+        match r.next_pcm_f32_into(out) {
+            Ok(Some((p, n))) => {
+                unsafe {
+                    *pts = p;
+                    *written = n;
+                }
+                1
+            }
+            Ok(None) => 0,
+            Err(_) => -1,
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_close_audio(h: Handle) {
-    if !h.is_null() {
-        drop(unsafe { Box::from_raw(h as *mut AudioReader) });
-    }
+    catch_unwind_ffi((), || {
+        if !h.is_null() {
+            drop(unsafe { Box::from_raw(h as *mut AudioReader) });
+        }
+    })
 }
 
 // ---------------- 字幕 ----------------
@@ -474,40 +533,44 @@ pub unsafe extern "C" fn vff_open_subtitle(
     path: *const c_char,
     out: *mut *mut c_void,
 ) -> c_int {
-    if out.is_null() {
-        return -1;
-    }
-    let Some(p) = path_from(path) else {
-        return -1;
-    };
-    let r = match SubtitleReader::open(p) {
-        Ok(r) => r,
-        Err(e) => {
-            record_last_open_error(&e);
+    catch_unwind_ffi(-1, || {
+        if out.is_null() {
             return -1;
         }
-    };
-    clear_last_open_error();
-    unsafe { *out = Box::into_raw(Box::new(r)) as *mut c_void }
-    0
+        let Some(p) = path_from(path) else {
+            return -1;
+        };
+        let r = match SubtitleReader::open(p) {
+            Ok(r) => r,
+            Err(e) => {
+                record_last_open_error(&e);
+                return -1;
+            }
+        };
+        clear_last_open_error();
+        unsafe { *out = Box::into_raw(Box::new(r)) as *mut c_void }
+        0
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_subtitle_params(h: *mut c_void, out: *mut SubtitleParamsFFI) {
-    let r = reader::<SubtitleReader>(h);
-    let p = r.params();
-    let format_ffi = match p.format {
-        decode::SubtitleFormat::ASS => SubtitleFormatFFI::ASS,
-        decode::SubtitleFormat::SSA => SubtitleFormatFFI::SSA,
-        decode::SubtitleFormat::SRT => SubtitleFormatFFI::SRT,
-        decode::SubtitleFormat::Unknown => SubtitleFormatFFI::Unknown,
-    };
-    unsafe {
-        *out = SubtitleParamsFFI {
-            stream_count: p.stream_count,
-            format: format_ffi,
+    catch_unwind_ffi((), || {
+        let r = reader::<SubtitleReader>(h);
+        let p = r.params();
+        let format_ffi = match p.format {
+            decode::SubtitleFormat::ASS => SubtitleFormatFFI::ASS,
+            decode::SubtitleFormat::SSA => SubtitleFormatFFI::SSA,
+            decode::SubtitleFormat::SRT => SubtitleFormatFFI::SRT,
+            decode::SubtitleFormat::Unknown => SubtitleFormatFFI::Unknown,
         };
-    }
+        unsafe {
+            *out = SubtitleParamsFFI {
+                stream_count: p.stream_count,
+                format: format_ffi,
+            };
+        }
+    })
 }
 
 /// 字幕条目 FFI 结构（文本由调用方预分配缓冲）。
@@ -522,8 +585,7 @@ pub struct SubtitleEntryFFI {
 /// 获取字幕清单数量。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_subtitle_count(h: *mut c_void) -> usize {
-    let r = reader::<SubtitleReader>(h);
-    r.subtitles().len()
+    catch_unwind_ffi(0, || reader::<SubtitleReader>(h).subtitles().len())
 }
 
 /// 获取指定索引的字幕条目信息（返回文本长度，调用方据此分配缓冲）。
@@ -533,18 +595,20 @@ pub unsafe extern "C" fn vff_subtitle_get_info(
     index: usize,
     out: *mut SubtitleEntryFFI,
 ) -> c_int {
-    let r = reader::<SubtitleReader>(h);
-    let Some(entry) = r.subtitles().get(index) else {
-        return -1;
-    };
-    unsafe {
-        *out = SubtitleEntryFFI {
-            start_pts: entry.start_pts,
-            end_pts: entry.end_pts,
-            text_len: entry.text.len(),
+    catch_unwind_ffi(-1, || {
+        let r = reader::<SubtitleReader>(h);
+        let Some(entry) = r.subtitles().get(index) else {
+            return -1;
         };
-    }
-    0
+        unsafe {
+            *out = SubtitleEntryFFI {
+                start_pts: entry.start_pts,
+                end_pts: entry.end_pts,
+                text_len: entry.text.len(),
+            };
+        }
+        0
+    })
 }
 
 /// 获取指定索引的字幕文本（调用方预分配 `text_buf`，容量≥`text_len`）。
@@ -555,17 +619,19 @@ pub unsafe extern "C" fn vff_subtitle_get_text(
     text_buf: *mut u8,
     text_cap: usize,
 ) -> c_int {
-    let r = reader::<SubtitleReader>(h);
-    let Some(entry) = r.subtitles().get(index) else {
-        return -1;
-    };
-    if text_buf.is_null() || entry.text.len() > text_cap {
-        return -1;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(entry.text.as_ptr(), text_buf, entry.text.len());
-    }
-    0
+    catch_unwind_ffi(-1, || {
+        let r = reader::<SubtitleReader>(h);
+        let Some(entry) = r.subtitles().get(index) else {
+            return -1;
+        };
+        if text_buf.is_null() || entry.text.len() > text_cap {
+            return -1;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(entry.text.as_ptr(), text_buf, entry.text.len());
+        }
+        0
+    })
 }
 
 /// **R2-5 死导出清理**：`vff_subtitle_at` / `vff_subtitle_seek` 为生产零调用哑导出，
@@ -577,7 +643,9 @@ pub unsafe extern "C" fn vff_subtitle_get_text(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_close_subtitle(h: *mut c_void) {
-    if !h.is_null() {
-        drop(unsafe { Box::from_raw(h as *mut SubtitleReader) });
-    }
+    catch_unwind_ffi((), || {
+        if !h.is_null() {
+            drop(unsafe { Box::from_raw(h as *mut SubtitleReader) });
+        }
+    })
 }

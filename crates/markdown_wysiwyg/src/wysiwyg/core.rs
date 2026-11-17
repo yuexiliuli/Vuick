@@ -57,6 +57,7 @@ impl WyEditor {
                 config::limits::CODE_PARSE_CACHE_CAP,
             ))),
             code_parse_need: RefCell::new(Vec::new()),
+            code_parse_pins: RefCell::new(std::collections::HashMap::new()),
             pending_math_drop: RefCell::new(Vec::new()),
             math_epoch: Cell::new(0),
             code_epoch: Cell::new(0),
@@ -325,6 +326,12 @@ impl WyEditor {
     /// 大文档（App load）不直接走这里：整篇 O(n) 解析挪到后台（[`Self::open_from_rope`]），
     /// 完成后再 [`Self::install_open`] 装配——本函数只保留给同步路径（小文档/测试）。
     pub fn set_source_text(&mut self, text: &str) {
+        // 换源即装机：同步路径就地装好内容 → **先作废在途后台整篇装配**（推进装配代号 +
+        // 清「在途」）。否则在途 async 装配（begin_install→install_open→finish_install）的
+        // 旧完成回调稍后按旧代号命中，把刚同步换上的内容覆盖回去，且 `is_loading` 卡 true。
+        // `invalidate_install` 文档明示只给同步改写路径：async 装配完成路径（install_open
+        // 直调）从不经本函数 → 零自伤；prefix/full 两阶段共用的 old_seq 由同步换源作废。
+        self.invalidate_install();
         let ss = SharedString::from(text);
         self.install_open(Self::open_from_str(ss));
     }
@@ -478,6 +485,9 @@ impl WyEditor {
         self.code_parse.lock().unwrap().clear();
         self.code_epoch.set(self.code_epoch.get().wrapping_add(1));
         self.code_parse_need.borrow_mut().clear();
+        // 换源：代码块内容指纹钉随行号/内容整体作废（旧文档已完成/在途回调按旧钉作废
+        // 会落到新文档无关块上；未登记的 src_line 由 `on_code_parse_ready` 兜底反查）。
+        self.code_parse_pins.borrow_mut().clear();
         // 换源：图片加载缓存（`paint.rs` 经 `host.image_cache().load` 所得旧文档 GPU
         // 纹理）整批作废——`RetainAllImageCache` 是 HashMap 无淘汰，漏清 → 同一标签页
         // 反复打开不同含图文档时纹理只涨不降（内存 bug 根因）。置脏即可：
@@ -605,16 +615,37 @@ impl WyEditor {
         *self.rd.borrow_mut().block_layout.borrow_mut() = None;
         self.rd.borrow_mut().pending_image_srcs.borrow_mut().clear();
     }
-    /// 解析图片源：URL / Windows 盘符绝对路径 / 已绝对路径原样返回，其余基于
-    /// 基准目录拼成绝对路径（与预览 `view::MarkdownPreview::resolve_image_src` 一致）。
-    /// `pub(crate)`：`host_impl` 的 `WyRenderHost::image_intrinsic_size`（只读探测）经它复用。
+    /// 解析图片源：http/https URL、Windows 盘符绝对路径、已绝对路径原样返回；相对
+    /// src 基于基准目录拼成绝对路径（与预览 `view::MarkdownPreview::resolve_image_src`
+    /// 一致，但补两条安全收敛，2026-11-16 B 类红测锁）：
+    ///
+    /// ① **`../` 词法逃逸**：相对 src 先 `base_dir.join(src)` 再词法归一（折 `.`/`..`），
+    ///    归一态落在 `base_dir` 子树外 → 拒绝（返回 `base_dir` 目录哨兵，加载必失败，
+    ///    且不指到 base 之外）。
+    /// ② **`file://` 不再原样放行**：剥 `file://`（含 `file://localhost`）前缀转本机
+    ///    路径，与相对 src 同走 base 子树关；无 `base_dir` 保持原样（逃逸面小，
+    ///    仍经 `image_load_resource` 的 Uri 分支，旧行为）。
+    ///
+    /// `pub(crate)`：`host_impl` 的 `WyRenderHost::image_intrinsic_size`（只读探测）
+    /// 经它复用。
     pub(crate) fn resolve_image_src(&self, src: &str) -> String {
         let lower = src.to_lowercase();
-        if lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || lower.starts_with("file://")
-        {
+        if lower.starts_with("http://") || lower.starts_with("https://") {
             return src.to_string();
+        }
+        // `file://`：剥前缀转路径（`file:///C:/x` → `C:/x`、`file://localhost/C:/x` →
+        // `C:/x`），过 base 子树关；无 base_dir 保持原样（旧行为，逃逸面小）。
+        if lower.starts_with("file://") {
+            let rest = if lower.starts_with("file://localhost") {
+                &src["file://localhost".len()..]
+            } else {
+                &src["file://".len()..]
+            };
+            let path = std::path::PathBuf::from(rest.trim_start_matches('/'));
+            return match &self.base_dir {
+                Some(base) => Self::confine_to_base(base, path),
+                None => src.to_string(),
+            };
         }
         if src.len() >= 2 && src.as_bytes()[1] == b':' {
             return src.to_string();
@@ -623,9 +654,41 @@ impl WyEditor {
             return src.to_string();
         }
         match &self.base_dir {
-            Some(base) => base.join(src).to_string_lossy().to_string(),
+            Some(base) => Self::confine_to_base(base, std::path::PathBuf::from(src)),
             None => src.to_string(),
         }
+    }
+
+    /// 把候选路径 `p` 收进 `base` 子树：相对则 `base.join`；绝对路径必须已在 base
+    /// 子树内。词法归一（折 `.`/`..`）后前缀判定——越界一律返回 `base` 目录哨兵
+    /// （必然加载失败，且不指到 base 之外，杜绝「拒绝却没拒干净」）。
+    fn confine_to_base(base: &std::path::Path, p: std::path::PathBuf) -> String {
+        let joined = if p.is_absolute() { p } else { base.join(p) };
+        let norm = Self::lex_normalize_path(joined);
+        if norm.starts_with(&Self::lex_normalize_path(base.to_path_buf())) {
+            norm.to_string_lossy().to_string()
+        } else {
+            base.to_string_lossy().to_string()
+        }
+    }
+
+    /// 词法归一：折叠 `.` 组件、`..` 弹出上一级 Normal（根/盘符之上不可再越）。
+    /// `starts_with` 前缀判定用（同测试 `lex_normalize` 口径）。
+    fn lex_normalize_path(p: std::path::PathBuf) -> std::path::PathBuf {
+        use std::path::Component;
+        let mut out: Vec<Component> = Vec::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if let Some(Component::Normal(_)) = out.last() {
+                        out.pop();
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out.iter().collect()
     }
 
     /// 图片加载资源（解析后的路径/URL → gpui 加载器资源）。
@@ -655,7 +718,8 @@ impl WyEditor {
     /// 膨胀）。`image_sizes` 是持久缓存 → 之后进带 O(1)；HTTP/已达尺寸/读取失败均短路，
     /// paint 的异步 asset 加载照常（带内图尺寸已知后只画、不重复校正）。
     /// 仅供宿主测试消费的旧签名转发（生产无调用，EPUB 真机路径经引擎侧承担）→ allow 压
-    /// dead_code 告警。
+    /// dead_code 告警。dormancy 休眠保留（K24）：生产图片懒装载尺寸已被引擎侧
+    /// `frame::lazy_ensure_image_size` 承担，本方法只留作宿主测试入口（`epub.rs` 复用）。
     #[allow(dead_code)]
     pub(crate) fn lazy_ensure_image_size(&self, src: &str) {
         if self.rd.borrow().image_sizes.borrow().get(src).is_some() {
@@ -1167,6 +1231,21 @@ impl WyEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
+
+    /// RED 复现宿主（镜像 `block_height_snapshot.rs` 惯例）：封装 `WyEditor` 为根元素。
+    struct ReproHost {
+        ed: gpui::Entity<WyEditor>,
+    }
+    impl gpui::Render for ReproHost {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            self.ed.clone()
+        }
+    }
 
     /// `count_marks`（rope 字节流滑窗）与字符串口径（`bytes().filter('$')` /
     /// `matches("[!")`）逐值对拍——冷开替换旧 `open_from_str` 的全篇串扫描后，
@@ -1198,5 +1277,89 @@ mod tests {
         let (d, a) = WyEditor::count_marks(&rope);
         assert_eq!(d, long.bytes().filter(|&b| b == b'$').count());
         assert_eq!(a, long.matches("[!").count());
+    }
+
+    /// RED（复现 agent，2026-11-16）：在途 async 整篇装配期间同步 `set_source_text`，
+    /// `is_loading` 卡 `true`。
+    ///
+    /// 机理：`set_source_text` → `install_open` 同步就地装好内容，但**不调用
+    /// `invalidate_install`**（不推进 seq / 不清 loading）→ 本已同步就位的内容仍被
+    /// 标记为「后台整篇装配在途」。宿主 `is_loading` 门控（替代原宿主
+    /// `md_wy_install.pending`）据此拒绝增量桥/重复重喂，形成卡在途。
+    ///
+    /// 期望（修复后）：同步换源即装机 → `invalidate_install` 清在途 → `is_loading()==false`。
+    #[gpui::test]
+    fn sync_install_inflight_async_clears_loading(cx: &mut gpui::TestAppContext) {
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            ReproHost { ed }
+        });
+        let vcx: &mut gpui::VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut gpui::App| {
+            let ed = host.read(cx).ed.clone();
+            // 宿主 async 装配入口：取新代号 + 置「在途」。
+            ed.update(cx, |w, _| {
+                let s = w.next_install_seq();
+                assert!(w.begin_install(s), "发起代号必为最新");
+            });
+            assert!(ed.read(cx).is_loading(), "发起后在途");
+            // 在途期间同步换源（小文档/测试/自愈路径的同步入口）。
+            ed.update(cx, |w, _| w.set_source_text("# 新文档\n新正文"));
+            // RED：同步换源已就地装好内容，不应再「后台整篇装配在途」。
+            assert!(
+                !ed.read(cx).is_loading(),
+                "RED: 同步换源后 is_loading 应 false，实际卡 true（set_source_text 未 invalidate）"
+            );
+        });
+    }
+
+    /// RED（复现 agent，2026-11-16）：在途 async 整篇装配期间同步 `set_source_text`，
+    /// 旧 async 完成回调把内容**覆盖回旧文档**。
+    ///
+    /// 机理：`set_source_text`/`install_open` 不推进 seq（不留 invalidate 痕迹）→ 旧代号
+    /// 仍是「最新」→ 旧完成回调的 `begin_install(old_seq)` 判当前、宿主随后
+    /// `install_open(旧结果)` 把新文覆盖回旧文档（对应宿主 `md_wy_spawn_async_install`
+    /// 完成路径的 `begin_install → install_open → finish_install` 序列）。
+    ///
+    /// 期望（修复后）：同步换源推进 seq → 旧回调 `begin_install(old_seq)` 返回 false 被丢弃。
+    #[gpui::test]
+    fn sync_install_inflight_async_stale_callback_does_not_overwrite(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            ReproHost { ed }
+        });
+        let vcx: &mut gpui::VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut gpui::App| {
+            let ed = host.read(cx).ed.clone();
+            const NEW: &str = "# 新文档\n新正文";
+            let seq = ed.update(cx, |w, _| {
+                let s = w.next_install_seq();
+                assert!(w.begin_install(s), "发起代号必为最新");
+                s
+            });
+            assert!(ed.read(cx).is_loading(), "发起后在途");
+            // 在途期间同步换源。
+            ed.update(cx, |w, _| w.set_source_text(NEW));
+            assert_eq!(ed.read(cx).text().to_string(), NEW, "同步换源后立即是本文");
+            // 旧 async 完成回调（宿主完成路径）：先判陈旧世序。
+            let current = ed.update(cx, |w, _| w.begin_install(seq));
+            if current {
+                // 当前实现：同步换源未 invalidate → 旧代号仍「最新」→ 旧结果被装上新文。
+                let stale =
+                    WyEditor::open_from_str(gpui::SharedString::from("# 旧文档\n旧正文"));
+                ed.update(cx, |w, _| {
+                    w.install_open(stale);
+                    w.finish_install(seq);
+                });
+            }
+            // 期望：同步换源后旧 async 完成绝不覆盖新文。
+            assert_eq!(
+                ed.read(cx).text().to_string(),
+                NEW,
+                "RED: 旧 async 完成覆盖新文（旧回调把内容装回旧文档）"
+            );
+        });
     }
 }

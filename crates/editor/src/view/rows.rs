@@ -313,7 +313,16 @@ impl CodeEditor {
         let mut out: Vec<RowData> = Vec::with_capacity(hi - lo + 1);
         for v in lo..=hi {
             let logical = self.folds.logical_row(v);
-            let base_styles: &[(Range<usize>, HighlightStyle)] = &hl_lines[logical - lo_l];
+            // 防御：`logical - lo_l` 在折叠映射异常时可能下溢（logical < lo_l → usize
+            // 下溢）或上溢（logical > hi_l → idx ≥ hl_lines.len() 越界索引 panic）；
+            // 对齐 `fill_place` 的双侧守卫（checked_sub + idx < len）——正常单调映射下
+            // 恒等于 lo_l 行槽位索引（逻辑行 ≡ lo_l 时取 0），映射不一致时以空样式兜底
+            // （不崩、此行不高亮），不改行内容。
+            let base_styles: &[(Range<usize>, HighlightStyle)] = logical
+                .checked_sub(lo_l)
+                .and_then(|i| hl_lines.get(i))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             // 括号字符前景注入：本行有括号字符 → 对 `col..col+1` span 覆
             // `bracket_guide_palette[depth % 3]`（与引导线同色池）；无 → 原样 Borrowed
             // 零分配。覆色后的 styles 即行缓存 `hl_styles`（probe 逐位比对自洽：缓存键

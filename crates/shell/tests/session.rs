@@ -3,7 +3,7 @@
 //! - `settings_xfer.rs`：导出/导入打包 roundtrip、即时生效、零副作用、路径穿越/超上限护栏。
 //! 两份断言内部与 lib 单测相应 `.rs` 逐字一致（P1 测试域化；settings_xfer 原单独 include，
 //! 现并入本目标）。`session::save_session_to/restore_session_from` 经 `common::session`
-//! 别名访问（`shell::app::session` 私有模块 pub 面，§8.6）；`GPUI_EDITOR_TEST` 由
+//! 别名访问（`shell::app::session` 私有模块 pub 面，§8.6）；`VUICK_TEST` 由
 //! `common::init_test` 注入，持久化恒短路不落 %APPDATA%。
 
 mod common;
@@ -883,7 +883,7 @@ fn export_bundle_structure_and_roundtrip() {
     let body = session_store::build_export_bundle(&prefs, &manifest, &slots);
     // 结构断言：魔力头 + 版本自含 + prefs/session 就位。
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["app"], serde_json::json!("gpui-editor"));
+    assert_eq!(v["app"], serde_json::json!("vuick"));
     assert_eq!(v["export_version"], serde_json::json!(1));
     assert_eq!(v["prefs"], prefs);
     assert_eq!(v["session"]["manifest"]["active_tab"], serde_json::json!(1));
@@ -1216,7 +1216,7 @@ async fn apply_invalid_bundle_is_zero_side_effect(cx: &mut TestAppContext) {
                 .last()
                 .map(|n| n.message_str().to_string())
                 .expect("应有 toast");
-            assert_eq!(toast, "不是有效的 gpui-editor 设置文件");
+            assert_eq!(toast, "不是有效的 vuick 设置文件");
         });
     });
     assert!(!dir.join("session.json").exists(), "非法包不写会话");

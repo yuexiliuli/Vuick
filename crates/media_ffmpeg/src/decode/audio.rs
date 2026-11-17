@@ -220,6 +220,50 @@ impl AudioReader {
         out.len() - start
     }
 
+    /// EOF 后把解码器缓冲内剩余帧取完、逐帧重采样兑入 `tail`：`send_eof()` 只是给解码器
+    /// 一个**排空信号**——带 lookahead/滤波延迟的解码器（AAC/WMA 等）缓冲里仍有末段几帧，
+    /// 若不继续 `receive_frame` 取完，末段半帧/整段尾段直接被丢弃（轨尾截断）。取完
+    /// 解码器缓冲后再由调用方 `flush_resampler_into` 冲重采样器残留。
+    ///
+    /// 与普通块路径同口径：seek 窗口内（[`Self::skip_until`] ≥ 0）仍丢弃落点前帧；
+    /// 真实解码错误（`receive_frame` 返回非 EAGAIN/EOF 负码）**上报**而非静默当「取完」。
+    fn drain_decoder_tail(&mut self, tail: &mut Vec<f32>) -> Result<()> {
+        let mut decoded = ffmpeg::frame::Audio::empty();
+        loop {
+            match super::classify_receive(self.decoder.receive_frame(&mut decoded)) {
+                super::ReceiveStatus::Ok => {
+                    let pts = pts_to_seconds(decoded.pts().unwrap_or(0), self.time_base);
+                    self.last_pts = pts;
+                    if self.skip_until >= 0.0 && pts < self.skip_until {
+                        continue; // seek 窗口：仍丢弃落点前帧（同普通块路径）
+                    }
+                    // 上采样容量修复 + 重采样（同普通块路径）
+                    let d = self.resampler.output();
+                    let in_rate = decoded.rate().max(1);
+                    let in_nb = decoded.samples() as u64;
+                    let out_nb = ((in_nb * u64::from(d.rate) + u64::from(in_rate) - 1)
+                        / u64::from(in_rate)) as usize
+                        + 64;
+                    self.ensure_resample_capacity(out_nb);
+                    let out_frame = self.resample_out.as_deref_mut().expect("已确保容量");
+                    self.resampler
+                        .run(&decoded, out_frame)
+                        .context("音频重采样失败")?;
+                    let n = out_frame.plane::<f32>(0).len();
+                    if n > 0 {
+                        let plane = out_frame.plane::<f32>(0);
+                        tail.extend_from_slice(&plane[..n]);
+                    }
+                }
+                super::ReceiveStatus::Eof | super::ReceiveStatus::Eagain => break, // 缓冲取完
+                super::ReceiveStatus::Error(e) => {
+                    return Err(anyhow!("音频解码 drain 中途失败（真实错误）: {e}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 确保常驻重采样输出帧容量（`nb_samples`）≥ `nb`，不足时重建（旧帧 av_frame_free）。
     /// R2-2：稳态每次只分配一次（块容量 ≤ 上界，排空 1s 帧后 cap 固定为 max），
     /// 消除每块 `ffmpeg::frame::Audio::new` 的分配 + 清零抖动。
@@ -291,8 +335,11 @@ impl AudioReader {
                         self.decoder.send_eof().ok();
                         self.drained = true;
                     }
-                    // 冲掉重采样器内部剩余样本（同 seek 排残留的收尾姿势，见 flush_resampler）
-                    let samples = self.flush_resampler();
+                    // P1-22：先取完解码器缓冲里的末段帧（见 drain_decoder_tail），再冲重
+                    // 采样器残留——只冲 resampler 会让带 lookahead 解码器的末段半帧丢失（轨尾截断）
+                    let mut samples = Vec::new();
+                    self.drain_decoder_tail(&mut samples)?;
+                    self.flush_resampler_into(&mut samples);
                     if !samples.is_empty() {
                         return Ok(Some((self.last_pts, samples)));
                     }
@@ -366,7 +413,10 @@ impl AudioReader {
                         self.decoder.send_eof().ok();
                         self.drained = true;
                     }
+                    // P1-22：先取完解码器缓冲里的末段帧（见 drain_decoder_tail），再冲重
+                    // 采样器残余——只冲 resampler 会让带 lookahead 解码器的末段半帧丢失（轨尾截断）
                     let mut tail = Vec::new();
+                    self.drain_decoder_tail(&mut tail)?;
                     self.flush_resampler_into(&mut tail);
                     if !tail.is_empty() {
                         if tail.len() > out.len() {

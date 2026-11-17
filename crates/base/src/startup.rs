@@ -1,4 +1,4 @@
-//! 启动 → 首帧墙钟诊断（`GPUI_EDITOR_STARTUP_DIAG=1` 开启；默认关闭零开销、零行为变化）。
+//! 启动 → 首帧墙钟诊断（`VUICK_STARTUP_DIAG=1` 开启；默认关闭零开销、零行为变化）。
 //!
 //! 为「轨 A 改造前基线」量主线程关键段墙钟：进程入口 [`boot`] 锚定起点，
 //! `open_window` 回调 / `EditorApp::new` 结束（= `restore_session` 段）各 [`mark`] 一次，
@@ -12,7 +12,7 @@ use std::time::Instant;
 /// 诊断门控（每个函数入口一次 `var_os`；平时零开销）。
 #[inline]
 fn diag_on() -> bool {
-    std::env::var_os("GPUI_EDITOR_STARTUP_DIAG").is_some()
+    std::env::var_os("VUICK_STARTUP_DIAG").is_some()
 }
 
 struct Slot {

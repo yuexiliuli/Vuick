@@ -105,6 +105,39 @@ mod tests {
         test_util::test_pdf_paths()
     }
 
+    /// P1-17 配套：轮询「第 0 页 live 文档异步读回含 Highlight」直到命中/超时。
+    /// `annotations_for_page` 已改非阻塞（后台执行器 + 结果通道，K167 姿势）：本函数
+    /// 派发一次读回后**持同一结果通道跨轮询 `try_recv`**（每次派发后先 advance 时钟给
+    /// 后台任务落定的时间再取，K37 效果断言）。重载窗口内 `annotations_for_page` 返回
+    /// `None`（无 worker）或读回为空列表（live 文档尚未重载成含注释副本）→ 作废重派，
+    /// 直到 save/save_as 的重载完成、读到已写注释。
+    fn wait_pending_highlight_readback(
+        cx: &mut gpui::TestAppContext,
+        vid: &gpui::Entity<crate::pdf::PdfViewer>,
+    ) -> bool {
+        use std::time::Duration;
+        let mut rx: Option<std::sync::mpsc::Receiver<Option<Vec<crate::pdf::AnnotationInfo>>>> =
+            None;
+        for _ in 0..800 {
+            if rx.is_none() {
+                rx = cx.update(|app| vid.update(app, |v, cx| v.annotations_for_page(0, cx)));
+            }
+            if let Some(r) = &rx
+                && let Ok(Some(a)) = r.try_recv()
+            {
+                if a.iter().any(|x| x.kind == AnnotKind::Highlight) {
+                    return true;
+                }
+                // 读回成功但无高亮：live 文档还没重载成含注释副本 → 作废重派
+                rx = None;
+            }
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    }
+
     /// **A-P2-2（瓦片记账按 bpp）**：`TileSlot::bytes()` 对 R8 luma 瓦片按 1BPP 记账、
     /// BGRA 瓦片按 4BPP——字节账本与动态预算（`nominal_per_tile` 同源 bpp）一致，
     /// 「字节 /4 而预算仍按 4BPP 估」的 4× 预算语义错误被钉死。
@@ -4112,7 +4145,7 @@ mod tests {
     /// 强化自动测试：把整份文档当“翻书”自动翻页（前向 + 不规整回翻 + 跨区），每停一页
     /// 都要求**渲染到位**——停稳（在途瓦片/封面清零、泵停、退出快速态）且**真正可见页**
     /// 全部已有内容（封面或瓦片，非仅占位）。任一页停不稳/不清晰都直接断言失败，并打印
-    /// 带时间戳（`timing_ms`）的巡检行，与 `GPUI_EDITOR_PDF_TIMING=1` 的控制台日志对位。
+    /// 带时间戳（`timing_ms`）的巡检行，与 `VUICK_PDF_TIMING=1` 的控制台日志对位。
     #[gpui::test]
     async fn auto_flip_renders_every_stop_page(cx: &mut gpui::TestAppContext) {
         skip_if_missing_pdf_fixture!();
@@ -8598,7 +8631,7 @@ mod tests {
     fn temp_pdf_copy(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+        let dir = std::env::temp_dir().join("vuick-pdf-tests");
         let _ = std::fs::create_dir_all(&dir);
         let dst = dir.join(format!(
             "{name}-{}-{}.pdf",
@@ -8776,7 +8809,7 @@ mod tests {
 
         // 单页文档：提取第 0 页成单页文件后删除 → Err「仅剩 1 页」
         let single = {
-            let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+            let dir = std::env::temp_dir().join("vuick-pdf-tests");
             let _ = std::fs::create_dir_all(&dir);
             let p = dir.join(format!("single-{}.pdf", std::process::id()));
             let _ = std::fs::remove_file(&p);
@@ -8804,7 +8837,7 @@ mod tests {
         let _guard = pdf_lock().lock().unwrap();
         let path = temp_pdf_copy("extract");
         let out = {
-            let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+            let dir = std::env::temp_dir().join("vuick-pdf-tests");
             let _ = std::fs::create_dir_all(&dir);
             let p = dir.join(format!("extracted-{}.pdf", std::process::id()));
             let _ = std::fs::remove_file(&p);
@@ -8830,6 +8863,73 @@ mod tests {
         w2.close(d2);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// 红测 Bug A（菜单「提取页面成功 toast」决策点真空）：`shell_pdf::menu::extract_page_action`
+    /// 在 **`extract_page_to` 同步调用后立即**（不等后台完成）读 `last_modify_error` 决定
+    /// 成败 toast（menu.rs:223-228）。而 `extract_page_to` 是异步：同步段先清错误
+    /// （open.rs:1246 `self.last_modify_error = None`），真实写盘失败只在后台完成后才置错
+    /// （open.rs:1258）→ 决策点恒读 None → 无论成败都弹「已提取页面」（成功 toast 恒假，
+    /// 失败也先弹一条错误成功 toast，随后经 observe 再补失败提示）。
+    /// 红测：构造一次**注定失败**的异步提取（输出路径父目录不存在 → worker 写盘必 Err），
+    /// 断言「在菜单决策点（调用后立即读）必须已能观察到失败标记」——当前为 None = FAILED。
+    #[gpui::test]
+    async fn extract_doomed_write_error_is_not_visible_at_menu_decision_point(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = pdf_lock().lock().unwrap();
+        use std::time::Duration;
+        use gpui::AppContext as _;
+
+        let p = temp_pdf_copy("extract-red");
+        let viewer = cx.update(|app| app.new(|cx| crate::pdf::PdfViewer::new(p.clone(), cx)));
+        fn wait(
+            cx: &mut gpui::TestAppContext,
+            pred: &mut dyn FnMut(&mut gpui::TestAppContext) -> bool,
+        ) -> bool {
+            for _ in 0..800 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                if pred(cx) {
+                    return true;
+                }
+            }
+            false
+        }
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).is_loaded())),
+            "夹具应加载完成（进入异步写盘路径）"
+        );
+
+        // 注定失败：目标路径父目录不存在（worker 原子写盘必 Err）。
+        let dir = std::env::temp_dir()
+            .join("vuick-pdf-tests")
+            .join(format!("no-such-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let doomed = dir.join("extracted.pdf");
+
+        cx.update(|app| viewer.update(app, |v, cx| v.extract_page_to(0, doomed.clone(), cx)));
+        // 菜单决策点：同步调用后**立即**（不 pump 后台）读 last_modify_error。
+        let now = cx
+            .update(|app| viewer.read(app).last_modify_error().map(|s| s.to_string()));
+        assert!(
+            now.is_some(),
+            "菜单决策点必须能观察到注定失败的提取的错误标记；当前 None → 成功 toast 被无条件弹出（成功 toast 恒假）"
+        );
+
+        // 收尾证实：预检命中后错误标记**同步已置且持续可见**（不因后续 pump 被清除），
+        // 与「决策点真空」（旧行为 None）相对照。注：预检短路使本 op 不再进后台写盘——
+        // 异步写盘失败链（worker Err → last_modify_error → observe 补发）由既有
+        // `last_modify_error`/`_pdf_sub` 机制覆盖，不在此红测范围内。
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).last_modify_error().is_some())),
+            "预检命中后错误标记应持续可见（父目录不存在 → 同步置错）"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     // ---- 待保存模型（P1）：内存页面操作不写盘 / 镜像恢复 / 保存后才落盘 ----
@@ -8897,7 +8997,7 @@ mod tests {
         use std::time::Duration;
 
         let src = test_util::test_pdf_paths()[0].clone();
-        let dir = std::env::temp_dir().join("gpui-editor-pdf-tests");
+        let dir = std::env::temp_dir().join("vuick-pdf-tests");
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join(format!("pending-op-{}.pdf", std::process::id()));
         let _ =         std::fs::remove_file(&p);
@@ -8998,15 +9098,9 @@ mod tests {
         );
         // ⑤ save 后 live 文档应重载为「含已写注释」：叠加层虽清，基础文档必须带上已写
         // 注释，否则高亮在 save 后从视图中消失直到重开（评审 D1 回归：不重开也能读回）。
-        let vid = viewer.clone();
+        // P1-17：annotations_for_page 已非阻塞（结果通道 + try_recv 轮询异步完成）。
         assert!(
-            wait(cx, &mut |cx| cx.update(|app| {
-                let v = vid.read(app);
-                v.is_loaded()
-                    && v.annotations_for_page(0)
-                        .map(|a| a.iter().any(|x| x.kind == AnnotKind::Highlight))
-                        .unwrap_or(false)
-            })),
+            wait_pending_highlight_readback(cx, &viewer.clone()),
             "save 后 live 文档应含高亮（保存触发重载，注释不过期上图）"
         );
         let saved = std::fs::read(&p).expect("保存后重读");
@@ -9020,6 +9114,167 @@ mod tests {
         w2.close(d2);
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// P1-18：`save_as` 另存为后 live 文档应重载为「含已写注释」的新文件副本（对齐 save 路径
+    /// 的 read-back + `open_from_bytes`）——否则叠加层清掉后高亮从视图立即消失（worker 的
+    /// `ReadAnnotations` 读 live `docs` 而非 `stores`/磁盘，不重载就永远读不到已写注释；save
+    /// 同缺陷已修、save_as 漏同步）。效果断言：另存完成后 live 文档能异步读回 Highlight；
+    /// 原文件保持原样、新路径落盘含注释。
+    #[gpui::test]
+    async fn save_as_reloads_live_doc_so_annotations_survive(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = test_util::lock().lock().unwrap();
+        use gpui::AppContext as _;
+        use std::time::Duration;
+
+        let src = test_util::test_pdf_paths()[0].clone();
+        let dir = std::env::temp_dir().join("vuick-pdf-tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let pid = std::process::id();
+        let p = dir.join(format!("save-as-src-{pid}.pdf"));
+        let q = dir.join(format!("save-as-dst-{pid}.pdf"));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&q);
+        test_util::copy_fixture_writable(&src, &p).expect("拷贝夹具");
+        let disk0 = std::fs::read(&p).expect("读初始磁盘");
+
+        let viewer = cx.update(|app| app.new(|cx| crate::pdf::PdfViewer::new(p.clone(), cx)));
+        fn wait(
+            cx: &mut gpui::TestAppContext,
+            pred: &mut dyn FnMut(&mut gpui::TestAppContext) -> bool,
+        ) -> bool {
+            for _ in 0..800 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                if pred(cx) {
+                    return true;
+                }
+            }
+            false
+        }
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).is_loaded())),
+            "应加载完成"
+        );
+
+        // 预置一条待存高亮注释
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.add_annotation(0, AnnotKind::Highlight, vec![[60.0, 300.0, 200.0, 330.0]], cx)
+            })
+        });
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).pending_annot_count() == 1)),
+            "加注释后 pending=1"
+        );
+        assert_eq!(
+            std::fs::read(&p).expect("重读磁盘"),
+            disk0,
+            "注释只进内存：磁盘 bytes 必须不变"
+        );
+
+        // 另存为 → 成功后应清 pending/dirty 并重指新路径
+        cx.update(|app| viewer.update(app, |v, cx| v.save_as(q.clone(), cx)));
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| {
+                let v = vid.read(app);
+                !v.is_dirty() && v.path == q
+            })),
+            "另存完成后应清 pending/dirty 并重指新路径"
+        );
+
+        // 效果断言：live 文档应重载为「含已写注释」的副本——异步读回 Highlight（P1-18；
+        // P1-17 非阻塞 + try_recv 轮询异步完成）。
+        assert!(
+            wait_pending_highlight_readback(cx, &viewer.clone()),
+            "另存后 live 文档应含高亮（保存触发重载，注释不过期上图）"
+        );
+
+        // 原文件保持原样；新路径落盘含注释（重开读回）
+        assert_eq!(
+            std::fs::read(&p).expect("重读原路径"),
+            disk0,
+            "另存为不得改动原文件"
+        );
+        let saved = std::fs::read(&q).expect("读另存产物");
+        assert_ne!(saved, disk0, "另存产物理应变化（注释合并写盘）");
+        let (w2, d2, _) = PdfWorker::open_and_dims(saved).expect("重开另存文件");
+        let anns = w2.annotations_for_page(d2, 0).expect("读回注释");
+        assert!(
+            anns.iter().any(|a| a.kind == AnnotKind::Highlight),
+            "重开另存文件应读回 Highlight（效果断言）"
+        );
+        w2.close(d2);
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&q);
+    }
+
+    /// P1-17：`annotations_for_page` 非阻塞异步完成（K37 效果断言）——不再主线程同步
+    /// `rx.recv()` 等 pdfium worker：调用**立即**返回结果通道（不阻塞），轮询 `try_recv`
+    /// 最终异步取得正确结果（无注释页 = 空列表，读回管线真完成）。
+    /// 「save/save_as 后轮询已写注释高亮」的完整异步路径由 `wait_pending_highlight_readback`
+    /// 覆盖（见 save / P1-18 测试）。
+    #[gpui::test]
+    async fn annotations_for_page_is_nonblocking_and_completes(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = test_util::lock().lock().unwrap();
+        use gpui::AppContext as _;
+        use std::time::Duration;
+
+        let src = test_util::test_pdf_paths()[0].clone();
+        let viewer: gpui::Entity<crate::pdf::PdfViewer> =
+            cx.update(|app| app.new(|cx| crate::pdf::PdfViewer::new(src, cx)));
+        fn wait(
+            cx: &mut gpui::TestAppContext,
+            pred: &mut dyn FnMut(&mut gpui::TestAppContext) -> bool,
+        ) -> bool {
+            for _ in 0..800 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(2));
+                if pred(cx) {
+                    return true;
+                }
+            }
+            false
+        }
+        let vid = viewer.clone();
+        assert!(
+            wait(cx, &mut |cx| cx.update(|app| vid.read(app).is_loaded())),
+            "应加载完成"
+        );
+
+        // 调用立即返回 Some(结果通道)——不在调用线程同步等 worker（P1-17）
+        let rx = cx
+            .update(|app| viewer.update(app, |v, cx| v.annotations_for_page(0, cx)))
+            .expect("已加载文档应返回结果通道");
+        // 轮询直到异步读回完成（worker 后台处理；无注释页 = Ok(Some([]))）
+        let mut completed = false;
+        for _ in 0..800 {
+            match rx.try_recv() {
+                Ok(res) => {
+                    assert!(res.is_some(), "worker 读回应成功（无注释页为空列表）");
+                    completed = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    cx.executor().advance_clock(Duration::from_millis(16));
+                    cx.run_until_parked();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert!(
+            completed,
+            "异步读回应最终完成（K37 效果断言：后台真执行、结果真到达）"
+        );
     }
 
     /// 图片盒懒提取（worker 层）：真实夹具前若干页抽取页图片盒——几何夹在页内、

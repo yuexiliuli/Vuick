@@ -120,7 +120,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("gpui-editor-pjson-test-{tag}-{nanos}.json"))
+        std::env::temp_dir().join(format!("vuick-pjson-test-{tag}-{nanos}.json"))
     }
 
     fn store(path: &Path) -> PathKeyJsonStore<JsonMap> {

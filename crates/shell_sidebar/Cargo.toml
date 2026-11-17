@@ -3,7 +3,7 @@ name = "shell_sidebar"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 侧边栏域 crate（自 shell 的 app/sidebar 拆出：SidebarChromeState / SidebarView 状态 + chrome 外壳渲染 + toc 目录视图 + FileTreePrompt 输入弹层；纯结构移动，只重分配既有依赖，不新增外部包，经 SidebarHost / FileTreePromptHost 宿主服务面与 shell 解耦）"
+description = "vuick 侧边栏域 crate（自 shell 的 app/sidebar 拆出：SidebarChromeState / SidebarView 状态 + chrome 外壳渲染 + toc 目录视图 + FileTreePrompt 输入弹层；纯结构移动，只重分配既有依赖，不新增外部包，经 SidebarHost / FileTreePromptHost 宿主服务面与 shell 解耦）"
 
 [dependencies]
 # 侧栏实体 / 事件监听 / 元素渲染 / ScrollHandle / Hsla 等。

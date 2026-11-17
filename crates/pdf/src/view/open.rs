@@ -12,6 +12,26 @@
 
 use super::*;
 
+/// 提取输出路径的**同步可写性预检**：原子写盘先在同目录建临时文件（`save_raw_doc_to_file`
+/// → `File::create(tmp)`，`tmp = 父目录.join(..)`），故父目录缺失 / 目标是现有目录必然
+/// 失败——在菜单决策点（异步提取发起前）即置错，杜绝「成功 toast 恒假 + 失败双 toast」。
+/// 空父路径（裸文件名）回退系统临时目录，放行。返回 `Some(错误文案)` = 注定失败。
+fn extract_target_precheck(out: &PathBuf) -> Option<String> {
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return Some(format!(
+                "无法提取到 {}：目标目录不存在（{}）",
+                out.display(),
+                parent.display()
+            ));
+        }
+    }
+    if out.is_dir() {
+        return Some(format!("无法提取到 {}：目标路径是现有目录", out.display()));
+    }
+    None
+}
+
 impl PdfViewer {
     /// 创建阅读器并异步加载 `path`（读文件 + 解析 + 量页在后台，UI 不阻塞）。
     pub fn new(path: PathBuf, cx: &mut Context<Self>) -> Self {
@@ -98,6 +118,7 @@ impl PdfViewer {
             restore_anchor: None,
             restore_pending: None,
             last_modify_error: None,
+            last_extract_success: None,
             sel_card: None,
             pending_annots: Vec::new(),
             undo_stack: VecDeque::new(),
@@ -313,6 +334,12 @@ impl PdfViewer {
     /// 当前文档路径（Phase B 书签按路径关联持久化用）。
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// 重命名同步：文件被外部改名后更新阅读器内部路径（标题 / 保存写回目标随之正确）。
+    /// 文件内容未变，`worker`/`doc_id` 保持有效，无需重载。
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = path;
     }
 
     /// 当前第一张可见页（1 基）与总页数（状态栏滚动位置显示用）。
@@ -821,7 +848,7 @@ impl PdfViewer {
             // 本探针在「糊住不动」的静态帧门控早退前（keep_window 可见窗，含 MARGIN
             // 缓冲）逐可见页打印 LOD 账：各档底图（cover/prev/pref/mid/thumb/tiles）
             // 在位情况 + 是否有当前档 cover 在途 + 期望 cover 档，供锁定是哪一档低密
-            // 底图在服务、为何无当前档 cover 补渲。GPUI_EDITOR_DIAG 未设时零开销。
+            // 底图在服务、为何无当前档 cover 补渲。VUICK_DIAG 未设时零开销。
             if diag_enabled() {
                 let (dstart, dend) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
                 if !self.dims.is_empty() && dstart <= dend {
@@ -1228,7 +1255,8 @@ impl PdfViewer {
     }
 
     /// 把 `page_index` 页提取成独立 PDF 文件并原子写盘（源文档不变，**即时生效、不影响
-    /// 当前 dirty**——提取本质是「另存为新文件」）。
+    /// 当前 dirty**——提取本质是「另存为新文件」）。失败记 [`Self::last_modify_error`]，
+    /// 成功置 [`Self::last_extract_success`]（壳层 `_pdf_sub` observe 消费弹成功 toast）。
     pub fn extract_page_to(&mut self, page_index: usize, out_path: PathBuf, cx: &mut Context<Self>) {
         if page_index >= self.dims.len() {
             self.last_modify_error = Some(format!("页码越界：第 {page_index} 页"));
@@ -1242,8 +1270,16 @@ impl PdfViewer {
             self.last_modify_error = Some("文档尚未加载".into());
             return;
         }
+        // 同步预检输出路径可写性：注定失败的提取（目标目录缺失 / 目标为现有目录）在
+        // **菜单决策点即置错**，不复现「成功 toast 恒假」——否则异步写盘失败也先弹
+        // 「已提取页面」、随后 observe 再补失败（自相矛盾双 toast）。预检通过才异步。
+        if let Some(msg) = extract_target_precheck(&out_path) {
+            self.last_modify_error = Some(msg);
+            return;
+        }
         let doc_id = self.doc_id;
         self.last_modify_error = None;
+        let success_msg = format!("第 {} 页 → {}", page_index + 1, out_path.display());
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -1252,6 +1288,9 @@ impl PdfViewer {
             let _ = this.update(cx, move |v, cx| match res {
                 Ok(_) => {
                     v.last_modify_error = None;
+                    // 成功结果信号：置位 + notify → 壳层 `_pdf_sub` observe 消费一次弹
+                    // 成功 toast（成败提示都收敛到异步完成的确定性结果）。
+                    v.last_extract_success = Some(success_msg);
                     cx.notify();
                 }
                 Err(e) => {
@@ -1263,6 +1302,12 @@ impl PdfViewer {
         .detach();
     }
 
+    /// 取走最近一次「提取页面」**成功**提示文案（消费后清空，供壳层 observe 一次性弹
+    /// 成功 toast；`None` = 无待提示成功）。
+    pub fn take_last_extract_success(&mut self) -> Option<String> {
+        self.last_extract_success.take()
+    }
+
     /// 显式保存（Ctrl+S / 保存菜单）：把待存注释合并 + 内存工作副本原子写盘。无待存 →
     /// 直接返回 false（已是干净态）；发起异步保存返回 true——成功清 pending/undo/dirty
     /// 并 notify，失败记 [`Self::last_modify_error`]（壳层经 `_pdf_sub` toast 透出）。
@@ -1271,8 +1316,10 @@ impl PdfViewer {
     }
 
     /// 另存为：把**当前内容**（内存工作副本 + 待存注释合并）写到 `new_path`，成功后当前
-    /// 阅读器重指新路径并清 dirty（原文件保持原样）。失败记 [`Self::last_modify_error`]，
-    /// 当前文档/待存状态不变。异步 fire-and-forget（壳层「另存为」对话框后调用）。
+    /// 阅读器重指新路径并清 dirty（原文件保持原样）；有注释待存时顺带把 live 文档重载为
+    /// 「含已写注释」的新文件副本（对齐 save 路径，防叠加层清掉后高亮从视图消失，P1-18）。
+    /// 失败记 [`Self::last_modify_error`]，当前文档/待存状态不变。异步 fire-and-forget
+    /// （壳层「另存为」对话框后调用）。
     pub fn save_as(&mut self, new_path: PathBuf, cx: &mut Context<Self>) {
         let Some(worker) = self.worker.clone() else {
             self.last_modify_error = Some("文档尚未加载".into());
@@ -1296,14 +1343,19 @@ impl PdfViewer {
                 .background_executor()
                 .spawn(async move {
                     if has_annots {
-                        worker.annotate(doc_id, items, new_path.clone()).map(|_| ())
+                        // 注释合并写盘成功后，顺带读回已写文件 bytes 供 live 文档重载——
+                        // 否则另存后叠加层清掉、基础文档并不含注释，高亮会在视图中消失
+                        // 直到重开（对齐 save 路径的 read-back + open_from_bytes，P1-18）。
+                        worker
+                            .annotate(doc_id, items, new_path.clone())
+                            .map(|_| std::fs::read(&new_path).ok())
                     } else {
-                        worker.save(doc_id, new_path.clone())
+                        worker.save(doc_id, new_path.clone()).map(|_| None)
                     }
                 })
                 .await;
             let _ = this.update(cx, move |v, cx| match res {
-                Ok(_) => {
+                Ok(annotated_bytes) => {
                     v.last_modify_error = None;
                     v.path = new_path_set;
                     // 另存后：内容已（合并待存/含页操作后）写入新路径 → 一律清待存
@@ -1313,6 +1365,12 @@ impl PdfViewer {
                     v.pending_page_ops = 0;
                     v.focused_annot = None;
                     v.sel_card = None;
+                    // 有注释待存 → live 文档重载为「含已写注释」的新文件并保持当前页，
+                    // 叠加层清空后注释仍在基础文档里上图（对齐 save 路径语义）。
+                    if let Some(bytes) = annotated_bytes {
+                        let anchor = v.current_page().map(|(pg, _)| pg.saturating_sub(1));
+                        v.open_from_bytes(bytes, anchor, cx);
+                    }
                     cx.notify();
                 }
                 Err(e) => {
@@ -1443,9 +1501,31 @@ impl PdfViewer {
     /// 读回某一页已**写盘**的注释（类型 + quad 几何）。需要已加载文档；走 worker 读回。
     /// 待保存模型下只反映 save() 之后落盘的内容；待存注释以 [`Self::pending_annots`]
     /// 叠加层渲染呈现。
-    pub fn annotations_for_page(&self, page_index: usize) -> Option<Vec<AnnotationInfo>> {
-        let worker = self.worker.as_ref()?;
-        worker.annotations_for_page(self.doc_id, page_index).ok()
+    ///
+    /// P1-17：**非阻塞版**——worker 读回已下放后台执行器执行，本方法只发起并返回事件
+    /// 结果通道（`None` = 无 worker / 文档未加载）。调用方稍后用 `try_recv`/`recv_timeout`
+    /// 轮询结果，**绝不在调用线程（主线程）同步 `rx.recv()` 等 pdfium worker**——worker
+    /// 忙时主线程等数百 ms 会冻结 UI（对齐 K167 异步回传姿势）。
+    pub fn annotations_for_page(
+        &self,
+        page_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<mpsc::Receiver<Option<Vec<AnnotationInfo>>>> {
+        let worker = self.worker.clone()?;
+        if self.doc_id == 0 {
+            return None;
+        }
+        let doc_id = self.doc_id;
+        let (tx, rx) = mpsc::channel();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { worker.annotations_for_page(doc_id, page_index).ok() })
+                .await;
+            let _ = tx.send(res);
+        })
+        .detach();
+        Some(rx)
     }
 
     /// 从**内存字节**（非磁盘）重开文档：worker 侧 Close 旧文档 → 失效渲染派生缓存 →

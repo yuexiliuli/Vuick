@@ -119,16 +119,46 @@ impl EditorApp {
         } else {
             self.file_tree_invalidate(path, window, cx);
         }
-        // 已打开选项卡路径同步（文件精确 / 目录下子树整体前缀改写）。
-        for tab in self.model.borrow_mut().tabs.iter_mut() {
-            let Some(fp) = tab.payload.file_path.clone() else { continue };
-            if fp == path {
-                tab.payload.file_path = Some(target.clone());
-            } else if is_dir
-                && fp.starts_with(path)
-                && let Ok(rel) = fp.strip_prefix(path)
-            {
-                tab.payload.file_path = Some(target.join(rel));
+        // 已打开选项卡路径同步（文件精确 / 目录下子树整体前缀改写）。媒体查看器
+        // （PDF/图片）**自持内部路径**（`self.path` 在查看器实体里）——只改
+        // `tab.payload.file_path` 会让后续保存写回旧名 / 内部路径陈旧（P1-34），
+        // 故视图层路径一律随新路径改指，且对齐同一前缀改写口径。
+        let mut viewer_updates: Vec<(MediaReader, PathBuf)> = Vec::new();
+        {
+            let mut model = self.model.borrow_mut();
+            for tab in model.tabs.iter_mut() {
+                let Some(fp) = tab.payload.file_path.clone() else { continue };
+                let new_fp = if fp == path {
+                    Some(target.clone())
+                } else if is_dir
+                    && fp.starts_with(path)
+                    && let Ok(rel) = fp.strip_prefix(path)
+                {
+                    Some(target.join(rel))
+                } else {
+                    None
+                };
+                if let Some(new_fp) = new_fp {
+                    tab.payload.file_path = Some(new_fp.clone());
+                    match &tab.payload.reader {
+                        MediaReader::Pdf(_) | MediaReader::Image(_) => {
+                            viewer_updates.push((tab.payload.reader.clone(), new_fp));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // 收起 model 借用后再改指查看器内部路径（P1-34）。
+        for (reader, new_fp) in viewer_updates {
+            match reader {
+                MediaReader::Pdf(p) => {
+                    p.update(cx, |v, _cx| v.set_path(new_fp.clone()));
+                }
+                MediaReader::Image(i) => {
+                    i.update(cx, |v, _cx| v.set_path(new_fp.clone()));
+                }
+                _ => {}
             }
         }
         self.schedule_session_flush(cx, true); // 会话清单记录新路径

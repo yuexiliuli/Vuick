@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn scan_filters_sorts_and_locates_current_with_fallback() {
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-folder-nav-test-{}",
+            "vuick-folder-nav-test-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn scan_uses_name_sort_in_natural_order() {
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-folder-nav-name-{}",
+            "vuick-folder-nav-name-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();

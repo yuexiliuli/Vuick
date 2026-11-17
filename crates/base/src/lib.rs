@@ -1,4 +1,4 @@
-//! gpui-editor 的**叶子基础 crate**（仅依赖 gpui，无任何项目内依赖）。
+//! vuick 的**叶子基础 crate**（仅依赖 gpui，无任何项目内依赖）。
 //!
 //! 承载各耦合环断点所需的最小共享件：
 //! - [`EditIntent`]：编辑撤销分组的纯类型（editor↔ui/ime 环的下沉载体）；

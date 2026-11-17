@@ -17,6 +17,8 @@
 
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 /// 与 `src/parser.rs` 的 `PDFIUM_VERSIONED_NAME` 保持一致。
 const PDFIUM_VERSIONED_NAME: &str = "pdfium-154.0.8035.0.dll";
 
@@ -37,15 +39,21 @@ fn main() {
         println!("cargo:rerun-if-changed={}", dll.display());
         // 读取原 dll 并 zstd 压缩，产物放 OUT_DIR（cargo 构建产出目录，不污染仓库）。
         let raw = std::fs::read(&dll).expect("读取 pdfium dll 失败");
+        // 原始字节的 sha256（hex）：注入编译环境，运行期 `extract_embedded_pdfium` 复用
+        // 临时 dll 前比对磁盘 sha256，防「同长但内容被种植」的 DLL 投毒。
+        let digest = Sha256::digest(&raw);
+        let raw_sha256_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         let compressed = zstd::bulk::compress(&raw, ZSTD_LEVEL)
             .expect("zstd 压缩 pdfium dll 失败");
         let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR 应有值");
         let zst_path = Path::new(&out_dir).join(format!("{PDFIUM_VERSIONED_NAME}.zst"));
         std::fs::write(&zst_path, &compressed).expect("写入压缩中间文件失败");
-        // 把压缩字节路径与原大小注入编译环境：源码用
-        // `include_bytes!(env!("PDFIUM_ZST_PATH"))` 嵌入，运行期按 `PDFIUM_RAW_SIZE` 解压。
+        // 把压缩字节路径、原大小与原 sha256 注入编译环境：源码用
+        // `include_bytes!(env!("PDFIUM_ZST_PATH"))` 嵌入，运行期按 `PDFIUM_RAW_SIZE` 解压、
+        // 按 `PDFIUM_RAW_SHA256` 校验复用。
         println!("cargo:rustc-env=PDFIUM_ZST_PATH={}", zst_path.display());
         println!("cargo:rustc-env=PDFIUM_RAW_SIZE={}", raw.len());
+        println!("cargo:rustc-env=PDFIUM_RAW_SHA256={raw_sha256_hex}");
         println!("cargo:rustc-cfg=embed_pdfium");
     }
 }

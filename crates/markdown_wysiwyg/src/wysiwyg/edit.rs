@@ -1084,8 +1084,21 @@ impl WyEditor {
             return;
         }
         // 上一字符起点（rope char boundary 回溯，O(chars)，不复制前缀整串）。
-        let prev = self.doc.rope().floor_char_boundary(at - 1);
-        self.replace_range(prev..at, "", cx);
+        let prev0 = self.doc.rope().floor_char_boundary(at - 1);
+        // CRLF：`\r\n` 当一个换行单元——退格删跨行换行不得只删一半（删 `\n` 留孤立
+        // `\r` 污染源文本，或光标落 `\r` 后删 `\r` 留 `\n`）。只在被删字符确实属于
+        // 换行单元时归并（删单行内文本不受影响，LF 文档逐字节不变）。
+        let (prev, del_end) = {
+            let rope = self.doc.rope();
+            if prev0 > 0 && rope.byte(prev0) == b'\n' && rope.byte(prev0 - 1) == b'\r' {
+                (prev0 - 1, at) // 删的是 `\r\n` 的 `\n` → 前导 `\r` 一并纳入
+            } else if rope.byte(prev0) == b'\r' && at < self.len() && rope.byte(at) == b'\n' {
+                (prev0, at + 1) // 删的是 `\r\n` 的 `\r`（光标落两者之间）→ 跟随的 `\n` 一并纳入
+            } else {
+                (prev0, at)
+            }
+        };
+        self.replace_range(prev..del_end, "", cx);
     }
 
     /// 退格是否被边界守卫拦截（代码首内容行行首 / 表格单元格内容起点 / 图片 alt 起点）。
@@ -1133,7 +1146,17 @@ impl WyEditor {
         }
         // 下一字符尾（rope char boundary，O(chars)）。
         let end = self.doc.rope().ceil_char_boundary(at + 1);
-        self.replace_range(at..end, "", cx);
+        // CRLF：删 `\n`（行尾换行、`at` 落在 CRLF 的 `\n` 上）→ 前导 `\r` 一并纳入删除
+        // 区间（`\r\n` 当一个换行单元），不留孤立 `\r` 污染源文本。单行内文本无此形态。
+        let start = if at > 0
+            && self.doc.rope().byte(at) == b'\n'
+            && self.doc.rope().byte(at - 1) == b'\r'
+        {
+            at - 1
+        } else {
+            at
+        };
+        self.replace_range(start..end, "", cx);
     }
 
     /// 删除是否被边界守卫拦截（代码末内容行行尾 / 表格单元格内容尾 / 图片 alt 尾）。
@@ -1515,6 +1538,12 @@ impl WyEditor {
         // 方向键移动 → 打断撤销合并组。
         self.last_edit = None;
         self.last_edit_at = None;
+        // 键盘光标移动 → 图片对象选中态作废（块图 + 行内图）：选中态只由鼠标点选/换源
+        // 建立并保持，光标一旦被键盘移走，后续 Backspace/Delete 不得再命中残留的
+        // `selected_image` 误删整张图片行。鼠标 `select_image` 内部置位后**不**走
+        // `moved()`，本清除不回踩其置位时序（与鼠标 on_mouse_down / 换源清选同口径）。
+        self.selected_image.set(None);
+        self.selected_inline_image.set(None);
         // 方向键移动 → 静止期常亮（blink 暂停，先亮住再继续闪）。
         self.caret_phase.kick();
         // 表格内容行内：光标钳到最近单元格内容区间（不落在管道/空白上，避免输入破坏表）。

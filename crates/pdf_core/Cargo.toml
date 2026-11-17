@@ -3,22 +3,25 @@ name = "pdf_core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor PDF 栅格化核心 crate（pdfium 定位/单例工作线程/瓦片栅格化 + 页列纯布局几何 + 纸墨重着色；无视图依赖）"
+description = "vuick PDF 栅格化核心 crate（pdfium 定位/单例工作线程/瓦片栅格化 + 页列纯布局几何 + 纸墨重着色；无视图依赖）"
 build = "build.rs"
 
 [dependencies]
 # 栅格化核心：parser 直接持有 pdfium-render（pdfium 单例工作线程）+ 运行时 zstd 解压内嵌 dll；
 # gpui 提供 RenderImage/ImageRecolor 等与视图层共享的类型；kimg 供根门面重建 RenderImage 用；
 # anyhow 为错误面；config::pdf 是布局/密度/预算常量的单一来源。
+# sha2：内嵌 pdfium 临时 dll 复用的 sha256 校验（防 DLL 种植，同长不同内容 → 重解压覆盖）。
 gpui = { workspace = true }
 pdfium-render = { workspace = true }
 kimg = { workspace = true }
 anyhow = { workspace = true }
 zstd = { workspace = true }
+sha2 = { workspace = true }
 config = { path = "../config" }
 
 [build-dependencies]
 zstd = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（本 crate 与主 crate 共用同一 gpui）。

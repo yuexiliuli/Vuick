@@ -177,7 +177,12 @@ pub fn atomic_write<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(err);
     }
-    fs::rename(&tmp, path)?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        // rename 失败（如目标被占用/目标是目录/权限）同样清理 tmp，避免残留
+        // （审查 base#1：此前 `?` 直接返回，失败路径遗留半截临时文件）。
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -343,5 +348,46 @@ mod tests {
         assert_eq!(a.load(AtomicOrdering::SeqCst), 0, "旧代序动作永不执行");
         assert_eq!(b.load(AtomicOrdering::SeqCst), 1, "最新代的 B 到点执行一次");
         assert_eq!(debounce.seq(), 2, "两次触发代序推进到 2");
+    }
+
+    /// atomic_write 失败不毁目标：目标是已存在**目录**（非文件）→ rename 覆盖失败 → 返回
+    /// `Err`，目录原样保留（内容不毁），且目录内不残留 `.tmp` 半截文件（写失败路径清理）。
+    /// 判别「裸 fs::write / 先删后写」会毁目标的场景：此处只关心原子基元自身语义。
+    #[test]
+    fn atomic_write_failure_preserves_target_and_no_tmp() {
+        let base = std::env::temp_dir().join(format!("vuick-atomic-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("target-dir")).unwrap();
+        let target = base.join("target-dir");
+        // 目标本身是目录：写 tmp（同目录）成功但 rename(tmp → 目录) 失败 → Err，
+        // 目录仍是目录、未被毁，且无 tmp 残留。
+        let res = atomic_write(&target, b"data");
+        assert!(res.is_err(), "目标为目录时应写失败（rename 覆盖目录失败）");
+        assert!(target.is_dir(), "失败后目标目录必须仍存在（不毁原内容）");
+        let residue: Vec<_> = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(residue.is_empty(), "失败路径应清理 tmp：{residue:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// atomic_write 正常路径：目标文件写入后内容逐字节一致，且无 tmp 残留。
+    #[test]
+    fn atomic_write_writes_content_no_tmp() {
+        let p = std::env::temp_dir().join(format!("vuick-atomic-ok-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        atomic_write(&p, "内容乙\n".as_bytes()).unwrap();
+        let content = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(content, "内容乙\n", "目标文件内容应逐字一致");
+        let parent = p.parent().unwrap();
+        let residue: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("vuick-atomic-ok"))
+            .collect();
+        assert!(residue.len() == 1, "应仅剩目标文件本身，无 tmp：{residue:?}");
+        let _ = std::fs::remove_file(&p);
     }
 }

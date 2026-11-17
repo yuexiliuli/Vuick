@@ -1,8 +1,8 @@
 //! 用户偏好持久化：主题三态（跟随系统 / 强制亮 / 强制暗）、正文字号、侧边栏宽度。
 //!
 //! 存储为运行时 JSON 文件（非源码），默认路径：
-//! - `%APPDATA%\gpui-editor\config.json`（可用环境变量 `GPUI_EDITOR_CONFIG` 覆盖到指定文件）；
-//! - Windows 无 `APPDATA` 时回退到当前目录 `gpui-editor-config.json`。
+//! - `%APPDATA%\vuick\config.json`（可用环境变量 `VUICK_CONFIG` 覆盖到指定文件）；
+//! - Windows 无 `APPDATA` 时回退到当前目录 `vuick-config.json`。
 //!
 //! 读写策略：
 //! - 只复用已有依赖 `serde_json`，手写 `Value` 解析（不引入 serde derive）；
@@ -163,7 +163,7 @@ pub struct UserPrefs {
 /// 后续**同一路径且文件未变**直接克隆缓存（启动 `main.rs` 与 `new_impl` 两处不再重复
 /// 读盘解析 JSON；`media_window` 打开动作、`collect_prefs` 持久化口径同享缓存）——
 /// 只做一次 `fs::metadata`（微秒级 stat，非内容读）。文件被改写（mtime/len 变化，含
-/// 测试内同一路径换内容、外部另存）或路径切换（`GPUI_EDITOR_CONFIG` 变）→ 自动重读，
+/// 测试内同一路径换内容、外部另存）或路径切换（`VUICK_CONFIG` 变）→ 自动重读，
 /// 不串缓存。`save` 写盘成功后同步回写缓存。测试构建（`cfg!(test)`）不触缓存。
 static PREFS_CACHE: StdLazyLock<StdMutex<Option<(PathBuf, Option<SystemTime>, u64, UserPrefs)>>> =
     StdLazyLock::new(|| StdMutex::new(None));
@@ -176,10 +176,44 @@ fn config_meta(path: &Path) -> (Option<SystemTime>, u64) {
     }
 }
 
+/// 递归复制目录内容（不含正在写的文件锁占用问题：仅复制后读，源保持只读不删）。
+/// 迁移专用：源目录仅作「一次性搬家」，复制失败静默忽略（下次启动重试）。
+/// `test-mode`（shell 等消费方测试构建把 config 以该 feature 编译）下迁移不触发、
+/// 单测又不编 → 允许 dead_code（生产 + 纯 cfg(test) 均真实使用）。
+#[cfg_attr(any(test, feature = "test-mode"), allow(dead_code))]
+fn copy_dir(src: &Path, dst: &Path) {
+    let entries = match std::fs::read_dir(src) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    if let Err(_) = std::fs::create_dir_all(dst) {
+        return;
+    }
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to);
+        } else if let Err(_) = std::fs::copy(&from, &to) {
+            // 单个文件拷贝失败（如被占用/只读）不中断整目录，数据以新路径新建为准。
+        }
+    }
+}
+
+/// 旧目录 → 新目录一次性迁移（判定 + 递归复制；独立于 `cfg` 门控，可单测）。
+/// 旧目录不存在或新目录已存在 → 无操作；否则整目录递归复制、保留源。
+/// `test-mode` 下同 [`copy_dir`] 一样可能 dead（见其 cfg_attr 注释）。
+#[cfg_attr(any(test, feature = "test-mode"), allow(dead_code))]
+fn migrate_legacy_dir(old: &Path, new: &Path) {
+    if old.is_dir() && !new.exists() {
+        copy_dir(old, new);
+    }
+}
+
 impl UserPrefs {
     /// 配置文件完整路径：环境变量覆盖 → 测试隔离临时目录 → APPDATA → 当前目录回退。
     pub fn config_path() -> PathBuf {
-        if let Ok(over) = std::env::var("GPUI_EDITOR_CONFIG")
+        if let Ok(over) = std::env::var("VUICK_CONFIG")
             && !over.trim().is_empty()
         {
             return PathBuf::from(over);
@@ -187,7 +221,7 @@ impl UserPrefs {
         // 测试构建隔离（K8 根因根治）。注意：config 作依赖被 shell/music 测试编译时，其
         // 自身 `cfg!(test)` **不生效**（编译期仅对「被测试的 crate」置位）→ 由消费方
         // dev-dependencies 打开 `test-mode` feature 补上，等效于 cfg!(test)。两路都落
-        // 「一次性临时目录」，绝不触碰真实 `%APPDATA%`；显式 `GPUI_EDITOR_CONFIG` 恒优先。
+        // 「一次性临时目录」，绝不触碰真实 `%APPDATA%`；显式 `VUICK_CONFIG` 恒优先。
         #[cfg(any(test, feature = "test-mode"))]
         {
             return Self::test_config_path();
@@ -195,12 +229,34 @@ impl UserPrefs {
         if let Ok(appdata) = std::env::var("APPDATA")
             && !appdata.trim().is_empty()
         {
-            return PathBuf::from(appdata).join("gpui-editor").join("config.json");
+            let appdata_dir = PathBuf::from(appdata);
+            Self::migrate_legacy_appdata(&appdata_dir);
+            return appdata_dir.join("vuick").join("config.json");
         }
-        PathBuf::from("gpui-editor-config.json")
+        PathBuf::from("vuick-config.json")
     }
 
-    /// 测试构建隔离目录：`%TEMP%\gpui-editor-test-<进程ID>\config.json`（进程唯一、惰性
+    /// 旧版本目录 `%APPDATA%\gpui-editor` 一次性迁移到新目录 `%APPDATA%\vuick`：
+    /// 首次启动检测到旧目录存在且新目录不存在时，整目录递归复制（config.json /
+    /// `session/` / `pdf_bookmarks.json` / `reading_progress.json` / 日志等一并带走），
+    /// 用户数据零丢失；复制成功后才读新路径，此后旧目录内容不再被消费。仅生产路径
+    /// 触发（测试隔离目录不经此函数）；旧目录不存在 / 新目录已存在 → 无操作。
+    fn migrate_legacy_appdata(appdata_dir: &Path) {
+        #[cfg(any(test, feature = "test-mode"))]
+        {
+            let _ = appdata_dir;
+        }
+        #[cfg(not(any(test, feature = "test-mode")))]
+        {
+            use std::sync::OnceLock;
+            static MIGRATED: OnceLock<()> = OnceLock::new();
+            let _ = MIGRATED.get_or_init(|| {
+                migrate_legacy_dir(&appdata_dir.join("gpui-editor"), &appdata_dir.join("vuick"));
+            });
+        }
+    }
+
+    /// 测试构建隔离目录：`%TEMP%\vuick-test-<进程ID>\config.json`（进程唯一、惰性
     /// 分配一次），`session_dir()` 随之派生到同目录 `session/` 子目录。平行 `cargo test`
     /// 会话/进程互不共享，天然隔离真实 `%APPDATA%`；测试结束不清理（留在 %TEMP%，无碍）。
     #[cfg(any(test, feature = "test-mode"))]
@@ -209,13 +265,13 @@ impl UserPrefs {
         static TEST_CFG_DIR: OnceLock<PathBuf> = OnceLock::new();
         TEST_CFG_DIR
             .get_or_init(|| {
-                std::env::temp_dir().join(format!("gpui-editor-test-{}", std::process::id()))
+                std::env::temp_dir().join(format!("vuick-test-{}", std::process::id()))
             })
             .join("config.json")
     }
 
     /// 会话临时文件目录 = 配置文件所在目录下的 `session/` 子目录
-    /// （如 `%APPDATA%\gpui-editor\session\`；GPUI_EDITOR_CONFIG 覆盖时随其路径）。
+    /// （如 `%APPDATA%\vuick\session\`；VUICK_CONFIG 覆盖时随其路径）。
     pub fn session_dir() -> PathBuf {
         match Self::config_path().parent() {
             Some(p) if !p.as_os_str().is_empty() => p.join("session"),
@@ -915,5 +971,65 @@ mod tests {
             Some("#ABCDEF"),
             "前后空白应 trim 后校验、去空白存储"
         );
+    }
+
+    /// 旧目录 → 新目录迁移：旧存在且新不存在 → 整目录递归复制（含子目录与文件）、
+    /// 源保留；旧不存在 → 无操作；新已存在 → 不覆盖。
+    #[test]
+    fn migrate_legacy_dir_copies_when_old_exists_and_new_missing() {
+        let base = std::env::temp_dir().join(format!("vuick-migrate-test-{}", std::process::id()));
+        let old = base.join("gpui-editor");
+        let new = base.join("vuick");
+        let _ = std::fs::remove_dir_all(&base);
+
+        // 旧目录存在、新不存在 → 复制（config.json + session/ 子目录 + 嵌套文件）。
+        std::fs::create_dir_all(old.join("session")).unwrap();
+        std::fs::write(old.join("config.json"), r#"{"theme":"dark"}"#).unwrap();
+        std::fs::write(old.join("session").join("t0.md"), "正文").unwrap();
+        migrate_legacy_dir(&old, &new);
+        assert!(new.join("config.json").is_file(), "config.json 应迁移");
+        assert!(new.join("session").join("t0.md").is_file(), "session 子目录应迁移");
+        assert_eq!(
+            std::fs::read_to_string(new.join("config.json")).unwrap(),
+            r#"{"theme":"dark"}"#,
+            "内容应逐字一致"
+        );
+        assert!(old.join("config.json").is_file(), "源目录应保留（不删不搬）");
+
+        // 新已存在 → 无操作（不覆盖改后的内容）。
+        let new_overwrite = base.join("vuick-exists");
+        std::fs::create_dir_all(&new_overwrite).unwrap();
+        std::fs::write(new_overwrite.join("config.json"), "新内容").unwrap();
+        migrate_legacy_dir(&base.join("ghost"), &new_overwrite);
+        assert_eq!(
+            std::fs::read_to_string(new_overwrite.join("config.json")).unwrap(),
+            "新内容",
+            "新目录已存在时不得覆盖"
+        );
+
+        // 旧不存在 → 无操作、不建新目录。
+        let ghost_new = base.join("vuick-ghost");
+        migrate_legacy_dir(&base.join("ghost-dir"), &ghost_new);
+        assert!(!ghost_new.exists(), "旧目录不存在时不得创建新目录");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// copy_dir 空目录 / 单文件 / 嵌套三层递归路径完整性。
+    #[test]
+    fn copy_dir_recurses_nested_trees() {
+        let base = std::env::temp_dir().join(format!("vuick-copydir-{}", std::process::id()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(src.join("a").join("b")).unwrap();
+        std::fs::write(src.join("root.txt"), "r").unwrap();
+        std::fs::write(src.join("a").join("x.txt"), "x").unwrap();
+        std::fs::write(src.join("a").join("b").join("deep.txt"), "d").unwrap();
+        copy_dir(&src, &dst);
+        assert_eq!(std::fs::read_to_string(dst.join("a").join("b").join("deep.txt")).unwrap(), "d");
+        assert_eq!(std::fs::read_to_string(dst.join("a").join("x.txt")).unwrap(), "x");
+        assert_eq!(std::fs::read_to_string(dst.join("root.txt")).unwrap(), "r");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1,8 +1,8 @@
 <!--
 REFACTORED: 2026-10-18
 STYLE: LLM Protocol Body (v3)
-LAST_AUDIT_PATCH: 2026-11-14-004
-AUDIT_PATCH: 2026-11-15-001 (沉淀 K167-K172：阻塞原生模态禁入持 App RefCell 事件帧 + async 回传姿势 / RefCell panic 取证 / 低置信模式派裁决 agent / 纯函数共享几何先测绘 / per-crate cfg 门留调用侧 / 整树 fmt 事故恢复模板；本线收交=UI 去重战役，见 docs/handover-2026-11-15-ui-dedup.md)
+LAST_AUDIT_PATCH: 2026-11-16-003
+AUDIT_PATCH: 2026-11-15-001 (沉淀 K167-K172：阻塞原生模态禁入持 App RefCell 事件帧 + async 回传姿势 / RefCell panic 取证 / 低置信模式派裁决 agent / 纯函数共享几何先测绘 / per-crate cfg 门留调用侧 / 整树 fmt 事故恢复模板；本线收交=UI 去重战役，见 docs/handover-2026-11-15-ui-dedup.md) ; 2026-11-16-001 (沉淀 K173-K176：安全/攻击面测试证明「测到真正防御路径」防假绿 / 报告「已修复」标注须 git log+红测证伪 / 主 agent 亲为实现过度→上下文透支，实现下放子 agent / 改源码禁走跨行 `-replace`；本线收交=4 bug 修复战役，见 docs/code-review-2026-11-16.md) ; 2026-11-16-002 (沉淀 K177-K182：复现断言期望值须源于真实几何推导 / 并行子 agent 工作树预声明他人改动 / 修复规模分级定 agent 层数 / cpal 假警报型错误诊断法 / 批量流水线正效复盘；本线收交=items 4-14 批量修复，见 docs/handover-2026-11-16-code-review-fixes.md) ; 2026-11-16-003 (沉淀 K183：并行 agent 剔除法 `git checkout <rev> -- <path>` 污染共享 index → 主 agent 每次提交必 `git commit -o <显式 paths>` + `git diff --cached --name-only` 核对、评审剔除法禁把 index 留中间态；战役「复现→实现→独立评审」全链下放、主 agent 只调度+收口 + NO-FIX 证据闭环被证高效；本线收交=P1+P2 批量修复战役：P1 37 项 + P2 两类 20 commits 全收口，见 docs/code-review-2026-11-16.md 修复记录)
 -->
 
 # AGENTS.md（LLM 执行协议 v3）
@@ -167,9 +167,9 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | 验证范围 | 只做改动部分；全量仅当用户明确要求/特性定型 |
 | stash 基线 | 行为功能不跑（回归由评审兜底）；仅两类允许：① 性能对比 becore/after（pop 后逐文件核对还原）② 疑似预存失败硬定性（先存 diff 指纹精确还原） |
 | 边界测试 | 边界清单逐项打勾（非行 0、同行多元素、折行续行、文档结尾、空文档等），实现侧勾完才算完成 |
-| 视觉/渲染完成 | `cargo build --bin gpui-editor` + 测试代码验证（`#[gpui::test]` 交互/渲染断言；金标准 `bench_click_seek_land_frame_wall` 类真夹具墙钟）；真机 GUI 冒烟仅在用户明示要开 GUI 时执行（截图/pixel，复用 `feature-delivery`/`gpui-open-scroll` 探针）；未授权开 GUI / 未冒烟 → 报告写「已实现+单测过、未冒烟」；无可靠取证/人工不在场时可降级为「单测覆盖交互」，报告注明降级原因 |
-| 位置/命中/覆盖/坐标类（tooltip 浮层、覆盖穿透、几何重叠命中） | headless 绿 = 机制成立，**≠ 交付关闭**；验收三选一：① 真机/用户给可观测基线后对表；② 内置 stderr 探针（`GPUI_EDITOR_DIAG` 守卫）走查一次；③ 已确认的几何重叠夹具用例。连续 2 轮真机未过 → 停止新方案，先回传诊断 / 用现场观测钉死根因再改（K39） |
-| 用户负面报告 | 第一回应先取证：exe 时间戳（`Get-Item target\debug\gpui-editor.exe` 比源文件新）、真机复现/探针/像素定位，再下结论 |
+| 视觉/渲染完成 | `cargo build --bin vuick` + 测试代码验证（`#[gpui::test]` 交互/渲染断言；金标准 `bench_click_seek_land_frame_wall` 类真夹具墙钟）；真机 GUI 冒烟仅在用户明示要开 GUI 时执行（截图/pixel，复用 `feature-delivery`/`gpui-open-scroll` 探针）；未授权开 GUI / 未冒烟 → 报告写「已实现+单测过、未冒烟」；无可靠取证/人工不在场时可降级为「单测覆盖交互」，报告注明降级原因 |
+| 位置/命中/覆盖/坐标类（tooltip 浮层、覆盖穿透、几何重叠命中） | headless 绿 = 机制成立，**≠ 交付关闭**；验收三选一：① 真机/用户给可观测基线后对表；② 内置 stderr 探针（`VUICK_DIAG` 守卫）走查一次；③ 已确认的几何重叠夹具用例。连续 2 轮真机未过 → 停止新方案，先回传诊断 / 用现场观测钉死根因再改（K39） |
+| 用户负面报告 | 第一回应先取证：exe 时间戳（`Get-Item target\debug\vuick.exe` 比源文件新）、真机复现/探针/像素定位，再下结论 |
 | 亲为不变式 | 亲为改动涉及纯函数化/参数语义/调用点 → 逐参对照函数签名（形参语义「X=true 表示…」逐个写死）+ 一条运行断言；否则计入常规「实现+评审」流 |
 | 长命令后台化 | 预计 >2min → `background_process start` + `schedule_wakeup` 轮询；logs 只取尾部 ≤20 行（**主 agent 自己**的后台姿势；**子 agent 相反**，见下一条） |
 | 子 agent 长命令 | 派测量/回归类子 agent 时 brief 必写「长命令前台阻塞到结束，禁止后台化 + 提前返回」（bgp/wakeup 随子会话结束即消失=任务白跑，K86）；全量回归只在最终提交前跑一次 |
@@ -184,7 +184,7 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | 替换依赖纪律（2026-11-08，K121/K122/K124） | 自研替换三方依赖：step0 先立「被替换者」同语料计时基准（K121）；实现以**与参照严格一致**为默认、偏差显式声明（K122）；评审必带安全攻击面检查——构造期内分配须有文件界/limits 独立硬上界（K124）；还须显式告知任务量级跃迁（K123） |
 | 运行时冒烟采样 | 窗口生命周期/对话框/持久化类 brief 必含测试代码验证项；真机冒烟项仅用户明示要开 GUI 时含（复用 feature-delivery 探针，新探针沉淀回技能）；平台钩子（`on_app_quit`/`on_window_should_close` 等）先实测再采信 |
 | GUI 冒烟取证终止 | 真机取证（截图/像素/OCR 任一路）连续失败 2 次即停：交互已有单测兜底 → 报告写「已实现+单测过、未冒烟」并立即返回；OCR 仅人工辅助，禁止当作子 agent 自动验证通道 |
-| 被中止子 Agent 恢复 | 子 agent 任务现值 abort/超时返回：主 agent 先 `cargo build --bin gpui-editor` + 定向测试复证残余交付立于可编译态；改型/逻辑类改动无论是否人工确认过，均补一次独立评审后才准提交 |
+| 被中止子 Agent 恢复 | 子 agent 任务现值 abort/超时返回：主 agent 先 `cargo build --bin vuick` + 定向测试复证残余交付立于可编译态；改型/逻辑类改动无论是否人工确认过，均补一次独立评审后才准提交 |
 | 后台派生/副作用任务（spawn/future/worker 预取等） | 验收必须含「**效果断言**」：测试证明派生结果真的产生（缓存被填充 / 计数变化 / 事件被消费），仅编译+渲染构造通过 = 未验收（错误后果：Task 未 `.detach()` 在 drop 即取消，34 测试绿仍整面无封面；对照 `probe_durations` 的 detach 姿势） |
 | 性能红线 | 用户动作同步路径不得引入大主线程 IO/大内容重读；持久化/派生状态写盘按复杂度上限评估（hash 跳过、粒度合并）；把 N ms 级主线程停顿当候选热点列明 |
 | 性能基准先读戏法 | 跑格式基准前必核 bench 源码三项：**语料路径**（源码树 `target/imgbench-corpus`，非 .cargo target-dir 的 F: 路径）、**后端 env**（如 `KIMG_WEBP_BACKEND=ours`，默认 AUTO→明文参照关，别把参照测成自己）、**通道口径**（to_rgba8 + 字节哨兵 宽*高*4）——缺一不跑（K66/K67） |
@@ -233,7 +233,7 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | K5 | 视觉断言：徽标调用点 `is_none()` 双重取反致永不挂出、被误判 stale exe 白耗一轮 → 完成前 build+冒烟、负面报告先取证 |
 | K6 | 长命令：filter-branch 首跑 600s 超时被杀、换后台重跑白耗 ~10min → 后台化 + 进度截断 |
 | K7 | 并行测试污染：两实现 agent 并行，shell 测试反复被「预存失败 + 中途编译态」污染 → 共享测试套件的 crate 家族一律串行 |
-| K8 | 测试噪声：真实 `%APPDATA%\gpui-editor\config.json` 与 `fixtures/测试.md` CRLF 泄漏进测试 → 先 stash 基线硬定性非回归，勿当新回归（**2026-10 根治**：config 新增 `test-mode` feature，shell/music 测试默认落 `%TEMP%` 隔离目录、显式 `GPUI_EDITOR_CONFIG` 仍优先；shell 探针 `config_path_isolated_to_temp_dir_in_tests` 守护，无需再逐任务刑侦） |
+| K8 | 测试噪声：真实 `%APPDATA%\vuick\config.json` 与 `fixtures/测试.md` CRLF 泄漏进测试 → 先 stash 基线硬定性非回归，勿当新回归（**2026-10 根治**：config 新增 `test-mode` feature，shell/music 测试默认落 `%TEMP%` 隔离目录、显式 `VUICK_CONFIG` 仍优先；shell 探针 `config_path_isolated_to_temp_dir_in_tests` 守护，无需再逐任务刑侦） |
 | K9 | 平台钩子：本平台最后一个窗口关闭退出不回调 `on_app_quit` → 退出/关闭类钩子先实测再采信 |
 | K10 | 副作用集中注入：会话/缓存更新散点直调 → 逐次切换全量重读/重写槽位（27–58ms 热点）→ 一处脏标记 + 统一 flush |
 | K11 | 磁盘 IO：持久化/日志写盘用 hash 跳过 + 粒度合并，别每次全量重写 |
@@ -264,7 +264,7 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | K36 | 破坏性 git 复核：`reset`/`checkout --`/批量回退等**破坏性或大范围** git 操作前，一律一次 `question` 复核**精确范围**（用户「撤销音频失真的 git」≠ 撤销全部提交；错误后果：软重置撤掉整段功能，用户澄清后才恢复） |
 | K37 | 异步副作用效果断言：凡 `cx.spawn`/后台任务，句柄必须 `.detach()`，测试必须断言「效果落在可见状态」（缓存填充/计数变化/事件消费）；**drop 未 detach 的 Task 即取消 future**，编译+渲染构造通过 ≠ 任务真的执行了（错误后果：`spawn_cover_decode` 漏 detach，34 测试绿却整面无封面，用户真机复报） |
 | K38 | 会话水位派活前自查：每次派活前核实现/评审会话报告尾「承载功能数」，超限即强制新会话；被中断/爆上下文一律新会话 + brief 首行预告工作树现状（错误后果：单实现会话连乘 5 功能、单评审会话跨 17 轮仍续跑，上下文逼近上限作业） |
-| K39 | E2E 位置类验收：用户可观测的坐标/覆盖/命中类缺陷，headless 绿不能当关闭；先给真机探针（`GPUI_EDITOR_DIAG` 守卫）或用户可观测基线再轮改，连续 2 轮未过先回传诊断（错误后果：tooltip 位置「机制修复+待复验」连打 3 轮仍错位，白耗用户复报） |
+| K39 | E2E 位置类验收：用户可观测的坐标/覆盖/命中类缺陷，headless 绿不能当关闭；先给真机探针（`VUICK_DIAG` 守卫）或用户可观测基线再轮改，连续 2 轮未过先回传诊断（错误后果：tooltip 位置「机制修复+待复验」连打 3 轮仍错位，白耗用户复报） |
 | K40 | 评审会话续跑上限：同一评审会话累计评审 ≥5 次即转新评审会话，派评审先核会话水位（错误后果：单评审会话跨 17 轮评审，上下文逼近上限，判定风险随会话膨胀） |
 | K41 | 会话效率（2026-10 复盘）：主耗时 = 串行双 agent × 大 crate 编译 × 重复全量验证 × 冷会话重读大文件。对策：评审只跑 delta 断言 + 定向、全量由主 agent 提交前一次收口；同文件同区域连续微调强制 `task_id` 续跑（≤3），防冷重读 3000+ 行文件；阶段性问题一次 question 收齐（含提交策略）；常量/文案类微任务主 agent 亲为不外派；每线时间盒 ≤1.5h 超时拆包（错误后果：本会话 D+E 两条 UI 线 ~5.8h、A/B 事后拆分提交手术 ~20min，均属可避免） |
 | K42 | 评审验证黑洞（2026-10 复盘2）：评审为「复核全量计数」跑裸 `cargo test -p shell`，撞既有挂起 25min 零信息；全量 shell 套件既有挂起 = 结构性逐线税（同 K8 性质，须 P0-A 根除或 `#[ignore]` 兜底）。对策：评审禁裸全量（硬护栏），只跑模块前缀 + 失败断言 + 定向，计数不可复现时注明 + 抽查子集；不可信输入类任务 brief 必带「输入安全清单」（路径穿越/大小上限/名字与版本校验/写入前整体预检），把安全缺陷从「评审兜底」前移到「实现一次做对」（错误后果：导出导入线评审 25min 黑洞；路径穿越任意写盘靠评审才拦住） |
@@ -371,7 +371,7 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | K139 | **每批交付即建议提交，防 10+ crate 大树（2026-11-13）**：批次真机确认后立即建议提交该批（可 1 批 1 commit）；需要攒批时用暂存分区/明确边界保持批间清晰。未提交树越大，评审面与混淆风险越涨，收口分组越难。（实证：B3/B4/B5 三批悬置未提交，横跨 10+ crate，最终才这么分组；反例 K31 提交权在主 agent、须用户明确「提交git」。） |
 
 | K140 | **实现子 agent 空返率控制 → canary 粒度切片**（2026-11-13 引号内嵌套战役）：general 实现子 agent 对「大而全 brief」在本环境**空返率 100%（3/3）**，而「单字段机械改」canary 一次成功——断病灶在喂法（任务规模）不在能力。**连续空返 ≥2 即停，改派「一函数一测试」级机械切片**（canary 模式：先探针可用性→再逐片）；或用 explore 钉死落点后派极小 slice。空返的每轮都是 `研究→派单→空返→核查` 无产出白耗（本次≈10% 总时长）。只读/分析/评审类子 agent 仍 100% 可靠，勿因实现侧空返而全盘弃用子 agent。（反例：Phase A 大 brief 连派 3 次空返才切 canary，白耗 3 轮） |
-| K141 | **交付硬闸 = `cargo build --bin <app>` 真 `Finished`，check/test 绿不算交付**（2026-11-13）：exe 被运行中 app 占用时 build 报 `拒绝访问`（os error 5）——**修复根本没进二进制，用户测的是旧版**，会白吃一整轮「问题都没解决」假返工。凡交付前必确认 build 输出 `Finished … target(s)`；`拒绝访问` → **强行关闭对应 exe 进程再重编**（`Stop-Process -Name gpui-editor -Force` / `taskkill /F /IM gpui-editor.exe`；仅杀本应用的 exe，勿动无关进程），关闭失败或用户明确要求保留窗口才提示人工关，**禁止在旧二进制上上报「已交付」**。（实证：引号表格滚动条几何修复 build 被锁失败，用户按旧二进制误判三连 bug 未解决，实际新版已修；2026-11-13 用户确认：exe 被占即强杀重编） |
+| K141 | **交付硬闸 = `cargo build --bin <app>` 真 `Finished`，check/test 绿不算交付**（2026-11-13）：exe 被运行中 app 占用时 build 报 `拒绝访问`（os error 5）——**修复根本没进二进制，用户测的是旧版**，会白吃一整轮「问题都没解决」假返工。凡交付前必确认 build 输出 `Finished … target(s)`；`拒绝访问` → **强行关闭对应 exe 进程再重编**（`Stop-Process -Name vuick -Force` / `taskkill /F /IM vuick.exe`；仅杀本应用的 exe，勿动无关进程），关闭失败或用户明确要求保留窗口才提示人工关，**禁止在旧二进制上上报「已交付」**。（实证：引号表格滚动条几何修复 build 被锁失败，用户按旧二进制误判三连 bug 未解决，实际新版已修；2026-11-13 用户确认：exe 被占即强杀重编） |
 | K142 | **对「锚定内容盒原点」的既有几何机制做偏移 = 全链审计清单**（2026-11-13 引号表格真机三连）：给表格（滚动条/内容遮罩/滚动上限/命中/绘制全套锚死 `padding` 原点）加 `x_off` 缩进，只改部分 → 滚动条贴竖线、拖拽表头遮竖线、右缘被裁三个真机 bug。对策：此类改动要么全链（shape/hit/paint/hscroll/mask/scroll-range）一次性成套，要么默认「不偏移既有机制、用带/条叠加层表达」（引用带走 paint 层即可零几何风险）。呼应 K113「改一处联动全链」。（实证：三 bug → 全链统一「表格内容左缘 = padding+x_off、视口 = width−2pad−x_off」一处口径修齐） |
 | K143 | **几何/字节数学断言先注释演算再落值**（2026-11-13）：跨大文件亲为 + 脑内算字节偏移，低级错频发（parity 测试被插进 `for` 循环体变 inner item ×2、误加尾随 `}`、`列A`=4B 错算 3B、表格首格 src 3..6 vs 4..8）。对策：断言值前先写一行注释演算（字节→区间），值由演算推得非脑补；大段编辑后先 `cargo test` 编译再续。呼应 K50「主会话浑浊」。（实证：5 次断言/花括号错各吃 1 轮编译往返） |
 | K144 | **修复先复现、禁行号假设派单**（2026-11-14 UI 统一战役滚动崩溃复盘）：bug 修复第一板斧 = 落「复现测试」；主 agent 凭 panic 行号猜根因直接派修复 → 实现侧红测**不 panic**、如实回报但已白耗 1 轮 + 1 个回滚脏改（误修 shape.rs `lazy_ensure_image_size`，真根因是 `prewarm_band` 把 `&rd.borrow().theme` 直写实参、临时 Ref 跨 image 懒装载 `borrow_mut`——靠后台 diagnosis headless 复现+完整栈才钉死）。对策：**行号假设 ≠ 根因**；5 分钟复现不了 → 派「只加失败测试」的 diagnosis（红），复现红 → 才派修复（绿）；「先问用户 backtrace」优先级低于「先派复现 agent」（headless 更快）。（实证：两轮浪费 ≈10% 子 agent 轮次；诊断 agent 一条栈帧 `prewarm_band 持有外层借用者` 直接指向真因） |
@@ -407,7 +407,22 @@ N. 范围门（必填）：一次 question 钉死本次场景族（如 lossy/los
 | K171 | **per-crate `cfg(not(test))` 语义不可塞进共享 helper**（P4 实证）：门进 base → 依赖方 test 构建被隐式改变（后台定时器「复活」）。门留在调用侧；helper 只提公共骨架（weak_entity 升级 + 静默丢弃）。此类改动提交前主 agent 复核门的位置。 |
 | K172 | **整树 `cargo fmt` 污染事故恢复模板**（P4/P7 两次）：子 agent `cargo fmt -- <paths>` 实为整仓格式化（400+ 文件）。恢复：①先 `Copy-Item` 保存预期新文件 + `git diff` 存 patch；②`git checkout -- .` 全量还原；③主 agent 亲手重放预期文件；④提交前 `git status` === 预期集合。预防：fmt 禁令放 brief 第一行 ⚠️（本批后续 0 事故）。 |
 
+| K173 | **安全/攻击面测试必须证明「测到了真正防御路径」，防 K153 假绿**（2026-11-16 epub zip bomb 评审 NIT#1 实证）：`entry_declared_small_actual_large_peaks_bounded` 用 `Stored` 压缩造 zip → 声明==实际→只走「声明预检」，#2 take 限长 / #3 读后复核**从未执行**，测试却报绿。评审抓出后改用 `Deflated`+手工 patch 中央目录/本地头 `uncompressed_size` 造真「声明小实大」+**对照分支**（同一输入放宽上限→应解析成功，证明拒绝确因目标防御而非解析器/CRC 其它错误）。凡 DoS/越界/几何不变式测试，签发前问「用绕过方式构造输入会不会红」——测不到目标的绿 = 假绿。 |
+| K174 | **报告「已修复」标注不可信，修复前必 `git log -- file` + 红测取证**（2026-11-16 三 bug 实证）：`docs/code-review-2026-11-16.md` 的 shell#1（atomic write）、virtualize、epub 三条「已修复 2026-11-16」**全部未落地**（git 史无对应 commit，代码仍是缺陷原样）——文档记录与会话内实现了「另一批」易混，标注真实性必须用 `git log -- 涉事文件` 与红测亲自证伪，不能「报告说修了就跳过」（K144 强化）。 |
+| K175 | **主 agent 亲为实现工程过度 → 上下文透支**（2026-11-16 4 bug 战役复盘）：多个独立 bug + 大重构（epub 300 行 + 后台化）主 agent 全亲为，加上改名 121 文件，主上下文被大量占用，后续被迫在脑内反复模拟工具调用（无意义叙述循环）——典型「上下文远超水位」征兆。对策：几何/并发/安全类修复默认走「实现子 agent + 独立评审」（K48/K50/K124/K134），主 agent 只做「复现派发 + 编译器收口 + 评审收口 + 提交」；「先复现 → 实现 → 独立评审」整链下放，主上下文留给现场交互与判决。 |
+| K177 | **复现/断言代码期望值必须从真实几何或公式推导，不能拍脑袋假设**（2026-11-16 scrollbar 红测实证）：复现 agent 断言点击轨道中点落点假设 `geom.thumb_len=裸100`，但 `geom.thumb_len` 实为 `hit_len`=裸长扣 `2×THUMB_INSET`（92）→ 期望值错，实现 agent 被迫重演手算改期望浪费一轮。结论：凡几何/字节/数值类红测断言，brief 必须要求「先精读常量/公式，手写算式再落期望值」，评审再对一次。 |
+| K178 | **并行子 agent 工作树扰动需派活时预声明基线**（2026-11-16 items 4-14 实证）：并行下手动归类 `git status` 改动易误判（复现 agent 曾把「并行其他会话的红测/实现改动」当成「既有预存改动」报告，靠主 agent 核对才消歧）。对策：多 agent 并行派活时，brief 写明「工作树预期含 N 个并行的未提交改动（列出文件或说明并发会话），git status 里非你阶段的文件请勿触碰/勿当基线」；主 agent 提交前按 K149 三连收口时统一核对。 |
+| K179 | **修复流水线按任务规模分级定 agent 层数**（2026-11-16 items 4-14 复盘）：三 agent 层（复现+实现+评审）只留给**多文件/跨 crate/安全/并发/交互观测**类；单文件单行机械修复（如 `\` 转义 `i+=2→i+=1+char_len`）用「红测 + 实现 + 提交前收口」两层 + 关键断言即可，省一层 agent 轮；纯常量/文案主 agent 亲为（K1/K57）。评审只做 delta + 定向（K42）。 |
+| K180 | **主 agent 每波只做轻收口，重验证集中提交前一次**（2026-11-16 items 4-14 复盘）：每波中间若已跑过 delta 测试 + K149 三连，主 agent 不必每波全量重测——实现/评审侧的输出（测试计数 + build Finished + git status 边界）是可信收口信号，主 agent 只在**提交前**做一次跨 crate 聚合验证。省掉 N 波×重复编译。 |
+| K181 | **二叉诊断环境性假警报：先证伪再派活**（2026-11-16 cpal `StreamInvalidated` 实证）：运行时库错误回调（cpal WASAPI 等）可能上报「必重建/设备变化」类**良性假警报**——cpal `StreamInvalidated` 裸文本只源自 `default_device_change_error`（默认输出设备变化广播），且原端点仍播放、声音正常。判定三步：①读库源码确认该文本的**唯一 emit 路径**②核对我们调用面是否可能自身触发（sink 是否首开一次复用、flush/pause 走 command channel 不触 err_fn）③用户听感/计数探针复核。确认为假警报 → 「不修」也是合格交付，**禁止按字面误派重建流实现**（K29/K43 呼应）。 |
+| K182 | **修复先复现+红测的组织闭环是批量战役的最高 ROI 动作**（2026-11-16 items 4-14 复盘，正效）：每波「先派复现 agent 落红测 → 实现修绿 → 独立评审反证」共 24 子 agent 轮、8 crate、0 次「实现→用户否→返工」；复现阶段 9 个 agent 全部产出真红测（0 空返），评审全部做剔除式反证（临剔修复→RED→还原）防假绿。加严：复现期发现 review 建议与代码实际不符（item 10 建议 install_open 首行 invalidate 实会自伤 prefix/full 两阶段）要如实上报改接缝——**review 的修复建议是起点不是结论**，实现前必须复合接缝论证。 |
+| K183 | **并行工作树 git index 污染：剔除法 `git checkout <rev> -- <path>` 会把该 path 写进共享 index（staging）**，主 agent 后续 `git add <paths>` + `git commit`（不带 `-o`）会因 `git commit` 提交「整个 index」而把 index 里**任何其它已 staged 内容**——他批在途改动、被临时回退的旧内容——一并扫进 commit（2026-11-16 P1/P2 战役实证：并行的 markdown 评审 agent 剔除法后把 doc.rs/blocks_scan.rs 的 index 留在「回退 P1-14/P1-12 修复」态，P2-① agent 的 add+主 agent commit 无 -o → 2380a1b 声称 10 files（实只应 8）静默回退了已提交的修复，靠评审 `git show` 抓回 + 主 agent 从 a2143a6 重放恢复 c673fab）。对策三件套（战役已验证）：① 主 agent 每次提交**必** `git commit -o <显式 paths>`（--only）+ 提交前/后 `git diff --cached --name-only` 核对 staged==预期清单——`-o` 杜绝竞态（verify 与 commit 之间其它进程再 stage 也无所谓）；② 评审/子 agent 剔除法临时 checkout 后必须把 index 还原（恢复到目标 commit 或 `git reset HEAD -- <path>` 清 staged），**禁把 index 留在中间态**；③ 剔除法落地的文件与该批其它 agent 的提交目标文件必须隔离（评审排在与实现 agent 不重叠的文件上，或评审做只读 diff + 不落 index 的验证姿势）。 |
+
 > **batch-2/3 时段账（2026-11-15，UI 去重战役续，转为交接 docs/handover-2026-11-15-ui-dedup.md）**：分析 5 explore 并行（值）；P1-P7 首批（P1/C/E 配评审抓「语义差异未被抹平」，值）；B/A/P5/D3 机械小批（低空返、零返工）；D/P16 两个「保持原样」裁决 agent（省 2 负收益轮）；P3 战役测绘→3 slice→评审零返工（K170）；PDF 自定义色闪退 = 预存 bug → 诊断钉借用链 → 后台线程回传修复。可避免 ≈2 轮：P4 的 cfg 门错位（→K171）、P7 的 fmt 未自恢复（→K172）。评审配比端到端执行到位（K146/K42），14 commits 全独立可编译、未推送。
+
+> **items 4-14 批量修复时段账（2026-11-16，11 bug + 1 诊断，8 crate）**：三波修复全部走「复现红测 → 实现修绿 → 独立评审反证」闭环，24 子 agent 轮、0 用户返工（K182）；3 批 6 commits（pdf_core×1、editor_core×1、music+media_io×1、pdf+shell+md_wy×1、md_wy 安全×1、ui×1）全独立可编译。跨 crate 并行按 K7 分 family 生效（pdf_core / editor_core / music+media_io / md_wy+shell / ui 各并行）。沉淀 K177-K182：复现断言源于真实几何（scrollbar K177）、并行预声明工作树基线（K178）、规模分级定层数（K179）、主 agent 提交前一次聚合验证（K180）、环境假警报先证伪再派活（K181 cpal）。正效复盘完结：本批最值的是「复现先行零误修 + 评审剔除法反证防假绿」，最该修的三件事 = 规模分级降层、断言真实几何、验证收口提交前。音频 `StreamInvalidated` 诊断 = 良性假警报（K181 样板，零代码产出但避免白改重建）。
+
+> **P1+P2 批量修复战役时段账（2026-11-16，无人值守，20 commits：9f7e35e→9fc654f）**：P1 37 项 + P2 两类全收口。形态：21 个「复现红测→实现修绿」实现/host agent 分 crate family 并行（K7，w1 5 并行/w2 6 并行/video 串 media_ffmpeg/w3 2 并行/P2② 1/nits 1），5 个独立评审 agent 剔除式反证 + 全 CONFIRMED，0 用户返工；主 agent 只调度+git 收口+提交（K175/K180），全程零亲为实现。NO-FIX 裁决三例均以证据闭环代替盲改（P1-13 表格 GFM 语义独立复核 CONFIRMED、P1-35 FnParams ABI HEAD 实无违例、P2-① tooltip 真实几何证伪）；评审剔除式反证抓到并主 agent 恢复 P1-14/P1-12 被 2380a1b 并行 index 污染静默回退（K174 实录 + 新 K183 沉淀）。成本项：1 次 index 污染修复（c673fab）+ P2-② core.rs 被并行回滚 1 次重落。可避免 ≈ 0.5 轮：并行评审剔除法与主 agent 提交的 index 竞态（→K183 已成纪律，后续战役提交必 `-o`）。遗留真机项：P1-23 真 SPS 突增视频、P1-29 VRAM 观感、P1-24/25 泵时序、P1-9 真失败重试（需先开 cache 失效路径）——均已实现+单测过、未冒烟标注。
 
 
 ## 6.5 复盘附录（2026-11-13 阅读进度/WYSIWYG 战役时段账）

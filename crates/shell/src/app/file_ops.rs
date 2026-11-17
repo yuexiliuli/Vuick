@@ -1231,6 +1231,63 @@ impl EditorApp {
         self.load_media(idx, &p, MediaKind::Pdf, window, cx);
     }
 
+    /// EPUB 后台解析（对齐 `open_pdf_async`，避免大书/恶意书主线程同步阻塞卡首帧）：
+    /// 先建选项卡 + 状态「正在解析 EPUB…」立即返回；`background_executor`（阻塞线程池）
+    /// 按 [`epub::EpubLimits::default`] 安全上限后台解析（zip 炸弹/图片数/总量均在后台
+    /// 被钳）；完成后 `update_window_entity` 回主线程 `load_epub` 装载；失败 → 状态报错 +
+    /// 移除占位卡（解析失败不该留空白卡）。
+    fn open_epub_async(
+        &mut self,
+        idx: usize,
+        p: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.model.borrow_mut().status =
+            SharedString::from(format!("正在解析 EPUB：{}…", p.display()));
+        self.model.borrow_mut().status_ok = true;
+        let entity = cx.entity();
+        // 后台解析线程与主线程落地各持一份路径克隆（互不 move 同一 PathBuf）。
+        let bg_path = p.clone();
+        let win_path = p.clone();
+        let bg = cx
+            .background_executor()
+            .spawn(async move { epub::parse_epub_file(&bg_path) });
+        window.spawn(cx, async move |cx| {
+            let p = win_path;
+            let doc = match bg.await {
+                Ok(doc) => doc,
+                Err(e) => {
+                    let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                        this.model.borrow_mut().status =
+                            SharedString::from(format!("打开失败：{e}"));
+                        this.model.borrow_mut().status_ok = false;
+                        // 解析失败：若占位卡仍在（本 spawn 建的、尚未被用户关/换）→ 移除，
+                        // 不留空白卡。竞态：idx 已越界或已被换成别的文件 → index 守卫静默跳过。
+                        if this.model.borrow().tabs.get(idx).is_some()
+                            && this.model.borrow().tabs[idx].payload.file_path.is_none()
+                        {
+                            this.remove_tab(idx, window, cx);
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                // 目标占位卡仍在（我们 make_tab 的、未换文件）→ 装载；已被关闭/替换 → 丢弃。
+                let alive = this.model.borrow().tabs.get(idx).is_some_and(|t| {
+                    t.payload.file_path.is_none()
+                        || t.payload.file_path.as_deref() == Some(p.as_path())
+                });
+                if alive {
+                    this.load_epub(idx, &p, doc, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 打开文件行：已打开 → 激活既有选项卡（**不新建**）；未打开 → 复用 `open_file`
     /// 完整打开语义（内部已分流 PDF / EPUB / 图 / 视频 / 文本）。
     /// （文件树域 crate 经 `SidebarHost::sidebar_open_path_or_activate` 反调本方法，
@@ -1282,23 +1339,13 @@ impl EditorApp {
             self.open_music_path(p, window, cx);
             return;
         }
-        // EPUB / PDF：先生成解析结果，失败则仅提示、不建空标签页
+        // EPUB：先建选项卡 + 立即返回，解析放后台线程（对比 PDF 同款），避免大书卡首帧。
         if Self::is_epub_path(&p) {
-            match epub::parse_epub_file(&p) {
-                Ok(doc) => {
-                    let idx = self.make_tab(window, cx);
-                    self.load_epub(idx, &p, doc, window, cx);
-                    let focus = self.tab_focus_handle(idx, cx);
-                    window.focus(&focus, cx);
-                    // 打开成功才记录最近（失败早退分支不记录）。
-                    self.record_recent_file(&p);
-                }
-                Err(e) => {
-                    self.model.borrow_mut().status = SharedString::from(format!("打开失败：{e}"));
-                    self.model.borrow_mut().status_ok = false;
-                    cx.notify();
-                }
-            }
+            let idx = self.make_tab(window, cx);
+            self.open_epub_async(idx, p.clone(), window, cx);
+            let focus = self.tab_focus_handle(idx, cx);
+            window.focus(&focus, cx);
+            self.record_recent_file(&p);
             return;
         }
         if Self::is_pdf_path(&p) {
@@ -1515,7 +1562,10 @@ impl EditorApp {
         // 回写，含 BOM 还原——文档编码随文档走，「另存为」沿用同一 source_encoding）。
         let enc = self.model.borrow().tabs.get(idx).and_then(|t| t.payload.source_encoding);
         let bytes = text_open::encode_for_save(&text, enc);
-        match fs::write(path, bytes) {
+        // 原子写（同目录临时文件 + fsync + rename 覆盖，K42/K47）：写中途失败/掉电时
+        // 原文件保持完整，绝不留半截损坏文档——会话/设置/PDF 均已收敛至此，用户文档
+        // 此前漏走裸 fs::write（审查 shell#1，修复 2026-11-16）。
+        match base::util::atomic_write(path, &bytes) {
             Ok(()) => {
                 let mut model = self.model.borrow_mut();
                 if let Some(tab) = model.tabs.get_mut(idx) {

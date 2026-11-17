@@ -159,7 +159,11 @@ pub fn semantic_name(scope: Scope) -> Option<&'static str> {
         "constant"
     } else if scope.starts_with("punctuation") {
         "punctuation"
-    } else if scope.starts_with("entity.name.namespace") || scope.starts_with("keyword.control.import") {
+    } else if scope.starts_with("entity.name.namespace")
+        // `keyword.control.import` 分支不可达（dormancy 休眠保留，K24）：前面泛 `keyword`
+        // 前缀已把一切 `keyword.*` 匹配掉；若需精确 control.import 语义须先改泛 keyword 分支。
+        || scope.starts_with("keyword.control.import")
+    {
         "preproc"
     } else {
         return None;
@@ -517,8 +521,12 @@ fn scan_toml_line(line: &str, incoming: Option<TomlStr>) -> (Vec<(Range<usize>, 
         }
     }
 
-    // 行尾仍开着字符串 → 跨行状态交给下一行（含空行续接多行字符串的情况）
-    let outgoing = cur.map(|(kind, _)| kind);
+    // 行尾仍开着字符串 → 仅多行型（三引号 Basic3/Literal3）才跨行续接；
+    // 单行型未闭合是 TOML 非法，不透出 outgoing，否则下一行被误染成字符串续行（P1-32）。
+    let outgoing = match cur {
+        Some((kind, _)) if kind.multiline() => Some(kind),
+        _ => None,
+    };
     (runs, outgoing)
 }
 
@@ -593,17 +601,24 @@ fn find_string_close(line: &str, from: usize, kind: TomlStr) -> Option<usize> {
 }
 
 /// 把 `[start,end)` 内 basic 型字符串的 `\x` 转义切成 string.escape run。
+/// 反斜杠字节 0x5C 不是 UTF-8 续字节/首字节，故逐字节步进只会命中真实反斜杠；
+/// 转义目标按整字符长度推进，防 `\你` 用 `pos+2` 切中多字节 → 非边界 range。
 fn escape_runs(
     line: &str,
     start: usize,
     end: usize,
     runs: &mut Vec<(Range<usize>, &'static str)>,
 ) {
-    let bytes = line.as_bytes();
     let mut pos = start;
     while pos + 1 < end {
-        if bytes[pos] == b'\\' {
-            let esc_end = (pos + 2).min(end);
+        if line.as_bytes()[pos] == b'\\' {
+            // 转义吃进下一整字符（按字符边界），`\x` 覆盖 1 字节反斜杠 + 整字符
+            let nxt = line[pos + 1..end]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            let esc_end = (pos + 1 + nxt).min(end);
             runs.push((pos..esc_end, "string.escape"));
             pos = esc_end;
         } else {
@@ -613,13 +628,15 @@ fn escape_runs(
 }
 
 /// 扫描数值 token：数字开头（或 ± 后跟数字）。吃进 [0-9A-Fa-fxob_+.eE]，外加 ±。
+/// 用 char 判定而非 `c as u8` 截断：多字节字符低字节命中 hexdigit 时（如
+/// `1ı`，U+0131 低字节 0x31=‘1’），截断判法会 `e+=1` 越字符边界 → `line[e..]`
+/// 非边界切片 panic（P1-31）。
 fn scan_number(line: &str, start: usize, vis: usize) -> (usize, usize) {
     let mut e = start;
     while e < vis {
         let c = line[e..].chars().next().unwrap();
-        let c = c as u8; // 数值/符号均为 ASCII
-        if c.is_ascii_hexdigit() || b"_+.eExob".contains(&c) {
-            e += 1;
+        if c.is_ascii_hexdigit() || (c.is_ascii() && b"_+.eExob".contains(&(c as u8))) {
+            e += c.len_utf8();
         } else {
             break;
         }
@@ -874,6 +891,27 @@ mod tests {
         assert!(runs2.iter().any(|(_, n)| *n == "string"), "续接段也着色");
     }
 
+    /// P1-32 红测：TOML 单行字符串不允许跨行——本行 `s = \"abc` 未闭合，
+    /// outgoing 必须透 None，下一行不能被染成字符串续行。
+    #[test]
+    fn toml_unclosed_single_line_string_does_not_leak_to_next_line() {
+        let (runs1, out1) = scan_toml_line("s = \"abc", None);
+        assert!(
+            runs1.iter().any(|(_, n)| *n == "string"),
+            "本行未闭合处仍染 string（本行恢复着色）"
+        );
+        assert_eq!(out1, None, "单行字符串未闭合 → 不透出 outgoing（不跨行）");
+        let (runs2, _) = scan_toml_line("x = 5", out1);
+        assert!(
+            !runs2.iter().any(|(_, n)| *n == "string"),
+            "下一行不应被当字符串续行"
+        );
+        assert!(
+            runs2.iter().any(|(_, n)| *n == "number"),
+            "下一行照常是 键=数值"
+        );
+    }
+
     #[test]
     fn toml_scanner_multibyte_and_empty_boundaries_do_not_panic() {
         // 多字节字符在数字/标识符后：停在字符边界、绝无越界 panic
@@ -886,6 +924,38 @@ mod tests {
         assert!(scan_toml_line("\r\n", None).0.is_empty(), "换行不落入着色");
         let (runs, _) = scan_toml_line("tail = 1", None); // 无尾换行
         assert!(runs.iter().any(|(_, n)| *n == "number"));
+    }
+
+    /// P1-31 红测：数值扫描不得用 `c as u8` 截断判 hexdigit——`ı`(U+0131) 低字节
+    /// 0x31=`'1'` 旧码会 `e+=1` 越字符边界，下一轮 `line[e..]` 切片 panic。
+    #[test]
+    fn toml_number_truncation_low_byte_hexdigit_does_not_panic() {
+        assert_eq!(scan_number("1ı", 0, 3), (0, 1), "1ı：U+0131 低字节 0x31 命中 hexdigit，必须停在字符边界");
+        assert_eq!(scan_number("1代", 0, 4), (0, 1), "数字后接多字节 → 停在边界");
+        // 顶层 TOML 解析也不 panic，且 `ı` 不被染成 number（仅 `1` 是 number）
+        let runs = toml_code_runs("x = 1ı");
+        assert_eq!(runs.len(), 1, "单行输出");
+        let names: Vec<&str> = runs[0].iter().map(|(_, n)| *n).collect();
+        assert_eq!(names, vec!["property", "operator", "number"], "1ı 中仅 1 认作 number");
+    }
+
+    /// P1-31 附带防御：basic 串内 `\你` 的转义 run 必须以整字符边界终止，
+    /// 防 `pos+2` 切中多字节 → 下游按 range 切片 panic。
+    #[test]
+    fn toml_escape_run_boundary_survives_multibyte_target() {
+        let line = "s = \"\\你\"";
+        let (runs, out) = scan_toml_line(line, None);
+        assert!(out.is_none(), "转义串应在本行闭合");
+        // 全部 run 起止均须在字符边界上（下游按 range 切片不 panic）
+        for (r, _) in &runs {
+            assert!(line.get(r.clone()).is_some(), "run {r:?} 必须在字符边界上");
+        }
+        let esc: Vec<Range<usize>> = runs
+            .iter()
+            .filter(|(_, n)| *n == "string.escape")
+            .map(|(r, _)| r.clone())
+            .collect();
+        assert_eq!(esc, vec![5..9], "\\你 转义 run 覆盖 \\ 与整个 你（4 字节）");
     }
 
     #[test]

@@ -456,6 +456,17 @@ impl EditorApp {
         }
     }
 
+    /// PDF「提取页面」**成功** toast（供 `_pdf_sub` observe 调用）：viewer 异步成功路径
+    /// 置 `last_extract_success` 并 notify → 此处**消费一次**（`take` 清空）弹成功 toast。
+    /// 与失败提示（`pdf_notify_last_error`）对称，成败都由异步完成的确定性结果驱动——
+    /// 菜单不再在提取未完成时同步臆断（防「已提取页面」恒假 / 失败先弹成功再补失败）。
+    pub(crate) fn pdf_notify_last_extract_success(&mut self, pdf: &gpui::Entity<pdf::PdfViewer>, cx: &mut Context<Self>) {
+        let msg = pdf.update(cx, |v, _| v.take_last_extract_success());
+        if let Some(msg) = msg {
+            self.pdf_toast("已提取页面", msg);
+        }
+    }
+
     /// 「复制图片」动作：经 pdf view 按**自然分辨率**取回 BGRA 像素（异步 worker）→
     /// `tray::set_clipboard_image_bgra` 写系统剪贴板 CF_DIB。成功 toast 尺寸；取图失败
     /// （文档已关闭 / 对象失效 / worker 超时）或剪贴板被占用 → toast 失败文案。

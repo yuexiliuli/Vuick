@@ -48,7 +48,9 @@ impl super::ImageViewer {
                 // 像素滚轮（触控板）：累计像素，超过一步门限才动作（未放大切图时合并
                 // 洪水事件；放大态按步进平移，可连续跟随）。
                 ScrollDelta::Pixels(_) => {
-                    self.scroll_accum += delta_y;
+                    // P1-28：累计用 **负向** delta（`-=`），使「向下滚（delta.y<0）→ 正累计 →
+                    // 下一张」与 Lines 分支同方向——旧 `+=` 让同一物理滚轮在 Pixels 模式反向。
+                    self.scroll_accum -= delta_y;
                     let step = config::image::WHEEL_PIXEL_STEP;
                     let pan_step = step * WHEEL_PIXEL_PAN_MULT;
                     while self.scroll_accum >= step {
@@ -112,6 +114,11 @@ impl super::ImageViewer {
         if !pan_zoom::apply_zoom(&mut self.zoom, factor, ZOOM_MIN, ZOOM_MAX) {
             return;
         }
+        // P2-① 唯一性：缩放切换滚轮语义（切图 ↔ 平移/切图）→ 清零 Pixels 累计残留，
+        // 防缩放前积累的亚步长在放大态立即误触发一次平移/切图。仅此处清零：`switch()`
+        // 会被 Pixels 累计的 `while` 环内调用，若在 switch 内清零会破坏环内 `-=step`
+        // 记账（归零后变负 → 反向误触发），故切图路径保持既有行为。
+        self.scroll_accum = 0.0;
         self.update_display_need();
         cx.notify();
         self.escalate_display_denom(cx);

@@ -166,20 +166,20 @@ use crate::pdf::{
     QuadPt, RecolorEntry, RenderRequest, RenderResult, TileRequest, TileResult,
 };
 use viewer::pan_zoom;
-/// 是否开启视图侧计时日志（`GPUI_EDITOR_PDF_TIMING=1`，进程内缓存一次）。
+/// 是否开启视图侧计时日志（`VUICK_PDF_TIMING=1`，进程内缓存一次）。
 fn timing_view() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var_os("GPUI_EDITOR_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
+        std::env::var_os("VUICK_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
     })
 }
 
-/// 是否开启**真机取证探针**（`GPUI_EDITOR_DIAG`，进程内缓存一次；未设零开销——
+/// 是否开启**真机取证探针**（`VUICK_DIAG`，进程内缓存一次；未设零开销——
 /// 仅有缓存到位的 O(1) 布尔查，无任何打印/行为影响）。供静态帧门控早退分支等
 /// 只读观测点使用，只加日志不改任何调度语义。
 fn diag_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var_os("GPUI_EDITOR_DIAG").is_some())
+    *EN.get_or_init(|| std::env::var_os("VUICK_DIAG").is_some())
 }
 
 /// 滚动速度分带（F3「滚动即清晰」三速状态机）：把原 `prev_fast: bool` 升级为四态枚举。
@@ -512,6 +512,10 @@ pub struct PdfViewer {
     pub(crate) restore_pending: Option<(usize, f32)>,
     /// 最近一次写回/页操作失败的文案（成功或未操作时为 None）。Phase B 弹卡/提示用。
     pub(crate) last_modify_error: Option<String>,
+    /// 「提取页面」**成功**的提示文案（「第 N 页 → 路径」）：异步成功路径置位 + `notify`，
+    /// 壳层 `_pdf_sub` observe 消费一次（`take` 清空）弹成功 toast——成败提示都收敛到
+    /// 异步完成的确定性结果，菜单不再在同步调用后臆断成败（防成功 toast 恒假 / 双 toast）。
+    pub(crate) last_extract_success: Option<String>,
     /// Phase B1：选中文字后自动弹出的操作卡片（`None` = 未弹出）。
     pub(crate) sel_card: Option<SelCard>,
     // ---- 待保存模型（P1）：内存待存注释 / 撤销栈 / 页面操作待存 / 灰框焦 ----
@@ -685,6 +689,7 @@ mod tests {
                     restore_anchor: None,
                     restore_pending: None,
                     last_modify_error: None,
+                    last_extract_success: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
                     undo_stack: VecDeque::new(),
@@ -924,6 +929,7 @@ mod tests {
                     restore_anchor: None,
                     restore_pending: None,
                     last_modify_error: None,
+                    last_extract_success: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
                     undo_stack: VecDeque::new(),
@@ -1066,6 +1072,7 @@ mod tests {
                     restore_anchor: None,
                     restore_pending: None,
                     last_modify_error: None,
+                    last_extract_success: None,
                     sel_card: None,
                     pending_annots: Vec::new(),
                     undo_stack: VecDeque::new(),
@@ -1194,6 +1201,7 @@ mod tests {
             restore_anchor: None,
             restore_pending: None,
             last_modify_error: None,
+            last_extract_success: None,
             sel_card: None,
             pending_annots: Vec::new(),
             undo_stack: VecDeque::new(),
@@ -1781,6 +1789,44 @@ mod tests {
         v.slots = vec![Slot::default(); n.max(1)];
         v.scroll_dir = 0;
         v
+    }
+
+    /// P1-16：`clear_stale_pending` 清掉「世代 < 当前 nav_gen」的在途条目时，必须一并复位
+    /// 对应页槽的 `mid_loading`/`thumb_loading` 标志（对齐 `invalidate_page_bitmaps_for_r8_flip`
+    /// 的复位姿势）——否则大跳后该页占位链永久失能（结果永不回、标志永不复位，页卡永远停
+    /// 「加载中」；对照清世代的 `pending_mid`/`pending_thumb` 只保证预算释放，不修槽标志）。
+    #[gpui::test]
+    async fn clear_stale_pending_resets_mid_and_thumb_loading_flags(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+        let v: gpui::Entity<PdfViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = multi_page_viewer(cx, 4);
+                // 模拟大跳后：nav_gen 已推进到 5，页 1/2 持有世代 3（旧）的在途中清/缩略请求
+                v.nav_gen = 5;
+                let (_tx_mid, rx_mid) = mpsc::channel::<Option<RenderResult>>();
+                v.slots[1].mid_loading = true;
+                v.pending_mid.insert(1, (3, rx_mid));
+                let (_tx_thumb, rx_thumb) = mpsc::channel::<Option<RenderResult>>();
+                v.slots[2].thumb_loading = true;
+                v.pending_thumb.insert(2, (3, rx_thumb));
+                v
+            })
+        });
+        cx.update(|app| {
+            v.update(app, |v, _cx| {
+                v.clear_stale_pending();
+                // 旧世代在途条目按世代被清（既有语义）
+                assert!(
+                    !v.pending_mid.contains_key(&1) && !v.pending_thumb.contains_key(&2),
+                    "旧世代在途条目应按世代被清"
+                );
+                // P1-16：被清条目对应的槽 loading 标志必须复位（大跳后占位链不永久失能）
+                assert!(
+                    !v.slots[1].mid_loading && !v.slots[2].thumb_loading,
+                    "被清条目对应槽的 loading 标志应复位"
+                );
+            });
+        });
     }
 
     /// L1.3 **停稳快进（纯状态机）**：连续 K=3 帧 |Δy|<[`STOP_DETECT_PX`] → 速度直落 Slow

@@ -3,7 +3,7 @@ name = "editor_core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 自研编辑器的核心模型层（buffer/selection/undo/movement/rope_ext/highlight/fold/markdown/find/goto 纯状态与纯函数；颜色标记单一来源走 ui::theme，见依赖注释）"
+description = "vuick 自研编辑器的核心模型层（buffer/selection/undo/movement/rope_ext/highlight/fold/markdown/find/goto 纯状态与纯函数；颜色标记单一来源走 ui::theme，见依赖注释）"
 
 [dependencies]
 # 文本存储：ropey 直接持有的缓冲（workspace 同版本，仅从根包重分配）；gpui 提供

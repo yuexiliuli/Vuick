@@ -247,9 +247,12 @@ pub struct VideoReader {
     ictx: std::mem::ManuallyDrop<ffmpeg::format::context::Input>,
     stream_index: usize,
     decoder: std::mem::ManuallyDrop<ffmpeg::codec::decoder::Video>,
-    /// sws 缩放器（sws 输入 → BGRA 输出）；首帧后按**实际帧格式**惰性创建：
-    /// 硬件路径回读帧的软件格式（如 NV12/P010）到首个解码帧才确定，软件路径用解码器输出格式。
-    scaler: Option<std::mem::ManuallyDrop<ffmpeg::software::scaling::Context>>,
+    /// sws 缩放器缓存（sws 输入 → BGRA 输出），含**构建时的输入几何缓存键**：首帧后按
+    /// **实际帧格式**惰性创建（硬件路径回读帧的软件格式如 NV12/P010 到首个解码帧才确定，
+    /// 软件路径用解码器输出格式）。流中途分辨率/像素格式变化（部分容器/流型支持
+    /// mid-stream 属性变更）时按当前帧几何校验、变化即重建——否则按旧几何读新帧会
+    /// 越界读/错画（UB）。
+    scaler: Option<ScalerCache>,
     params: VideoParams,
     /// sws 输出宽（decode-to-display 下采样目标；`params.width` 为源宽）。
     out_width: u32,
@@ -276,7 +279,7 @@ impl Drop for VideoReader {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             if let Some(scaler) = &mut self.scaler {
-                std::mem::ManuallyDrop::drop(scaler);
+                std::mem::ManuallyDrop::drop(&mut scaler.ctx);
             }
             std::mem::ManuallyDrop::drop(&mut self.decoder);
             std::mem::ManuallyDrop::drop(&mut self.ictx);
@@ -285,13 +288,18 @@ impl Drop for VideoReader {
 }
 
 /// `decoder.receive_frame` 返回分类（F5）：`Ok` = 产出一帧；`Eof` = `AVERROR_EOF` 优雅
-/// 结束（解码器已把缓冲排空，这是正常的流末尾，语义保持 `Ok(None)`）；`Error` = 真实
-/// 解码/分配失败（如 GFP 帧分配失败、解码器内部错误），**必须上报**而不得静默当成
-/// EOF 结束——否则视频中途解码失败会表现为「干净播完」的静默停播，无法诊断。
+/// 结束（解码器已把缓冲排空，这是正常的流末尾，语义保持 `Ok(None)`）；`Eagain` =
+/// `AVERROR(EAGAIN)`——解码器需要更多输入（包喂送循环里「本包产完」的正常结束信号、
+/// drain 循环里「缓冲取完」的正常结束信号）；`Error` = 真实解码/分配失败（如 GFP 帧
+/// 分配失败、解码器内部错误），**必须上报**而不得静默当成「无帧可收」吞掉——否则视频
+/// 中途解码失败会表现为「干净播完」的静默停播，无法诊断。
 #[derive(Debug)]
 enum ReceiveStatus {
     Ok,
     Eof,
+    /// `AVERROR(EAGAIN)`：解码器需要更多输入。这是**正常**的非产出信号（与“真实错误”
+    /// 语义不同）——包循环里遇之喂下一个包、drain 循环里遇之作取完缓冲结束。
+    Eagain,
     Error(ffmpeg::Error),
 }
 
@@ -300,6 +308,9 @@ fn classify_receive(r: Result<(), ffmpeg::Error>) -> ReceiveStatus {
     match r {
         Ok(()) => ReceiveStatus::Ok,
         Err(ffmpeg::Error::Eof) => ReceiveStatus::Eof,
+        Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
+            ReceiveStatus::Eagain
+        }
         Err(e) => ReceiveStatus::Error(e),
     }
 }
@@ -637,7 +648,7 @@ impl VideoReader {
                                     return Ok(Some(v));
                                 }
                             }
-                            ReceiveStatus::Eof => break, // 优雅结束：缓冲 drain 完
+                            ReceiveStatus::Eof | ReceiveStatus::Eagain => break, // 优雅结束：缓冲 drain 完
                             ReceiveStatus::Error(e) => {
                                 return Err(anyhow!(
                                     "视频解码 drain 中途失败（非 EOF 的真实错误，不再静默当播完）: {e}"
@@ -651,11 +662,25 @@ impl VideoReader {
             self.decoder
                 .send_packet(&packet)
                 .context("decoder send_packet 失败")?;
-            // 一个包可能产出 0~多帧（B 帧）；全部消耗到 EAGAIN 再喂下个包
+            // 一个包可能产出 0~多帧（B 帧）；全部消耗到 EAGAIN 再喂下个包。F5：不得用
+            // `.is_ok()` 把**真实解码错误**（GFP 帧分配失败 / 解码器内部错误等非
+            // EAGAIN/EOF 负码）当「本包产完」吞掉——否则持久错误静默播到 EOF、表现为
+            // 「干净播完」停播。口径与下方 drain 段一致：只有 EAGAIN（本包产完）与
+            // EOF 才继续/结束，真实错误立即上报。
             let mut f = ffmpeg::frame::Video::empty();
-            while self.decoder.receive_frame(&mut f).is_ok() {
-                if let Some(v) = accept(self, &f)? {
-                    return Ok(Some(v));
+            loop {
+                match classify_receive(self.decoder.receive_frame(&mut f)) {
+                    ReceiveStatus::Ok => {
+                        if let Some(v) = accept(self, &f)? {
+                            return Ok(Some(v));
+                        }
+                    }
+                    ReceiveStatus::Eof | ReceiveStatus::Eagain => break, // 本包产完：喂下个包
+                    ReceiveStatus::Error(e) => {
+                        return Err(anyhow!(
+                            "视频解码中途失败（非 EAGAIN/EOF 的真实错误，不再静默当播完）: {e}"
+                        ));
+                    }
                 }
             }
         }
@@ -781,34 +806,77 @@ impl VideoReader {
     }
 }
 
-/// 取（或惰性创建）sws 缩放器：输入 = `src_format` 的 `src_w×src_h`，输出 =
-/// `out_width×out_height` BGRA。首个解码帧调用时建一次，之后复用。
+/// sws 缩放器缓存项：`ctx` 是构建时的 sws；`src_format/src_w/src_h` 是**构建时的输入
+/// 几何**（缓存键）。输出几何 `out_width/out_height` 在 reader 生命周期内固定，不入键。
+struct ScalerCache {
+    src_format: ffmpeg::format::Pixel,
+    src_w: u32,
+    src_h: u32,
+    ctx: std::mem::ManuallyDrop<ffmpeg::software::scaling::Context>,
+}
+
+/// 纯判定：sws 缓存键（`cache_format/cache_w/cache_h`）与当前帧输入几何
+/// （`src_format/src_w/src_h`）是否一致——**一致才复用**，任一维（格式/宽/高）变化即
+/// 重建（无 FFmpeg 实例的纯函数，可单测；P1-20 回归：旧实现键只有「是否已建」，
+/// 流中途几何变化按旧 sws 读新帧会越界读/错画）。
+#[inline]
+fn scaler_key_matches(
+    cache_format: ffmpeg::format::Pixel,
+    cache_w: u32,
+    cache_h: u32,
+    src_format: ffmpeg::format::Pixel,
+    src_w: u32,
+    src_h: u32,
+) -> bool {
+    cache_format == src_format && cache_w == src_w && cache_h == src_h
+}
+
+/// 取（或按当前帧几何重建）sws 缩放器：输入 = `src_format` 的 `src_w×src_h`，输出 =
+/// `out_width×out_height` BGRA。首个解码帧调用时建一次，之后**按当前帧几何校验复用**：
+/// 输入格式/宽高与缓存键一致才复用；流中途分辨率/像素格式变化（部分容器/流型支持
+/// mid-stream 属性变更）时旧 sws 立即释放、按新几何重建——按旧几何读新帧会越界读/
+/// 错画（UB）。
 ///
 /// 实现为**自由函数**（非方法）：调用方 [`VideoReader::convert_bgra_into`] 需同时可变借用
 /// `self.scaler` 与 `self.bgra_out` 两个不同字段，方法的 `&mut self` 接收器会整体
 /// 借用冲突（E0502）。
 fn scaler_for(
-    scaler: &mut Option<std::mem::ManuallyDrop<ffmpeg::software::scaling::Context>>,
+    scaler: &mut Option<ScalerCache>,
     src_format: ffmpeg::format::Pixel,
     src_w: u32,
     src_h: u32,
     out_width: u32,
     out_height: u32,
 ) -> Result<&mut ffmpeg::software::scaling::Context> {
-    if scaler.is_none() {
-        let ctx = ffmpeg::software::scaling::Context::get(
-            src_format,
-            src_w,
-            src_h,
-            ffmpeg::format::Pixel::BGRA,
-            out_width,
-            out_height,
-            ffmpeg::software::scaling::Flags::BILINEAR,
-        )
-        .context("初始化 sws 缩放失败")?;
-        *scaler = Some(std::mem::ManuallyDrop::new(ctx));
+    // 输入几何与缓存键一致 → 直接复用
+    if scaler.as_ref().is_some_and(|c| {
+        scaler_key_matches(c.src_format, c.src_w, c.src_h, src_format, src_w, src_h)
+    }) {
+        return Ok(&mut scaler.as_mut().expect("scaler 已就绪").ctx);
     }
-    Ok(scaler.as_mut().expect("scaler 已就绪"))
+    // 几何不匹配（或首次）：丢弃旧 sws（显式释放），按当前帧几何重建
+    if scaler.is_some() {
+        let cache = scaler.as_mut().expect("scaler 已就绪");
+        unsafe { std::mem::ManuallyDrop::drop(&mut cache.ctx) };
+    }
+    *scaler = None;
+    let ctx = ffmpeg::software::scaling::Context::get(
+        src_format,
+        src_w,
+        src_h,
+        ffmpeg::format::Pixel::BGRA,
+        out_width,
+        out_height,
+        ffmpeg::software::scaling::Flags::BILINEAR,
+    )
+    .context("初始化 sws 缩放失败")?;
+    *scaler = Some(ScalerCache {
+        src_format,
+        src_w,
+        src_h,
+        ctx: std::mem::ManuallyDrop::new(ctx),
+    });
+    Ok(&mut scaler.as_mut().expect("scaler 已就绪").ctx)
 }
 
 impl VideoReader {

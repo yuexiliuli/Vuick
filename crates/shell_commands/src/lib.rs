@@ -38,6 +38,8 @@ pub enum BindingCtx {
 /// 全部集中在本行——改快捷键只动本表一处。
 pub struct Command {
     /// 稳定动作标识（测试 / 对齐用；不参与展示）。
+    /// 半死字段（dormancy 休眠保留，K24）：本 crate 内仅测试消费（`root_commands_shortcut_and_key_are_paired`
+    /// 读 `c.id`），生产路径不读——保留是因为每个 `Command` 常量都构造它，属稳定标识真值。
     pub id: &'static str,
     /// 命令面板展示 label。
     pub label: &'static str,

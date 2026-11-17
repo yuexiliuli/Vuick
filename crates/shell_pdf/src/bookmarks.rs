@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use session_store::path_key_json_store::{Cache, PathKeyJsonStore};
 use shell_core::{AppModel, PdfBookmark};
 
-/// 书签存储文件路径 = 配置父目录 / `pdf_bookmarks.json`（`%APPDATA%\gpui-editor\`）。
+/// 书签存储文件路径 = 配置父目录 / `pdf_bookmarks.json`（`%APPDATA%\vuick\`）。
 pub fn bookmarks_path() -> PathBuf {
     match UserPrefs::config_path().parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join("pdf_bookmarks.json"),

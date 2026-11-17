@@ -670,7 +670,7 @@ async fn restore_epub_top_line_after_reopen(cx: &mut TestAppContext) {
 }
 
 /// 会话恢复测试用临时会话目录（唯一 tag + 进程号，先清后建；**禁止**触碰真实
-/// `%APPDATA%\gpui-editor\session`——与 `tests/session.rs` 同类隔离姿势）。
+/// `%APPDATA%\vuick\session`——与 `tests/session.rs` 同类隔离姿势）。
 fn rp_session_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("gpui-rp-session-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);

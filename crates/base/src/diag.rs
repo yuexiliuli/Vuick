@@ -3,7 +3,7 @@
 //! 零分配零 IO。
 //!
 //! Pattern 7 收敛站点：`tab_diag` / `editor::diag` / `shell_core::rp_diag` / `image_viewer::diag`。
-//! （`shell_preview::wheel_probe` / `pdf::view` 的 `GPUI_EDITOR_PDF_TIMING` + `GPUI_EDITOR_DIAG` /
+//! （`shell_preview::wheel_probe` / `pdf::view` 的 `VUICK_PDF_TIMING` + `VUICK_DIAG` /
 //! `video::seek_diag` 判断谓词 ≠ 本模块严格「`"1"`」口径——`"1"`||`"true"` / 存在即开，未收敛。）
 
 use std::collections::HashMap;
@@ -24,19 +24,19 @@ pub fn env_flag(name: &'static str) -> bool {
         .or_insert_with(|| matches!(std::env::var(name).as_deref(), Ok("1")))
 }
 
-/// 测试构建判定（与原各站点同口径：`cfg!(test)` 或 env `GPUI_EDITOR_TEST=1`）。
+/// 测试构建判定（与原各站点同口径：`cfg!(test)` 或 env `VUICK_TEST=1`）。
 pub fn is_test_build() -> bool {
-    cfg!(test) || matches!(std::env::var("GPUI_EDITOR_TEST").as_deref(), Ok("1"))
+    cfg!(test) || matches!(std::env::var("VUICK_TEST").as_deref(), Ok("1"))
 }
 
-/// 诊断日志路径：测试构建 → `%TEMP%\{filename}`；生产 → `%APPDATA%\gpui-editor\{filename}`。
+/// 诊断日志路径：测试构建 → `%TEMP%\{filename}`；生产 → `%APPDATA%\vuick\{filename}`。
 /// 与原 `tab_diag::log_path` / `editor::diag::log_path` 逐字等价（文件名换参）。
 pub fn diag_log_path(filename: &str) -> PathBuf {
     if is_test_build() {
         return std::env::temp_dir().join(filename);
     }
     match std::env::var_os("APPDATA").map(PathBuf::from) {
-        Some(base) => base.join("gpui-editor").join(filename),
+        Some(base) => base.join("vuick").join(filename),
         _ => PathBuf::from(filename),
     }
 }

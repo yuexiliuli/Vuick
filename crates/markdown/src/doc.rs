@@ -718,9 +718,11 @@ impl Doc {
     }
 
     /// 字节偏移 → 前累计 UTF-16 单元数（IME 协议层换算；O(log n + 行长)：行表二分
-    /// + 行内切片计数，不触碰全文）。
+    /// + 行内切片计数，不触碰全文）。非字符边界入参先 floor 到所在字符起始——
+    /// IME 协议层可能传入任意 byte（如多字节删除后位移不齐），`rope.slice` 要求
+    /// 边界对齐否则 panic（P1-14）。
     pub fn byte_to_utf16(&self, byte: usize) -> usize {
-        let byte = byte.min(self.len());
+        let byte = self.rope.floor_char_boundary(byte.min(self.len()));
         let i = self
             .line_starts
             .partition_point(|&s| s <= byte)
@@ -1454,6 +1456,43 @@ mod tests {
             let str_doc = Doc::open(SharedString::from(multi_leaf_src.as_str()));
             let rope_doc = Doc::open_rope(multi_leaf_rope);
             check(&str_doc, &rope_doc, "cross-chunk multi-leaf");
+        }
+    }
+
+    /// P1-14 回归守卫：`byte_to_utf16` 对非字符边界入参必须收敛到字符边界而非
+    /// panic（IME 协议层可能传入任意 byte，`rope.slice` 要求边界对齐）；`utf16_to_byte`
+    /// 对落在代理对中间的 UTF-16 位置也应返回字符边界、越界钳到文末。
+    #[test]
+    fn utf16_conversions_never_panic_on_off_boundary_input() {
+        let s = "a\n中文文档 🎉 emoji\ncode line";
+        let doc = Doc::open(SharedString::from(s));
+        let rope_doc = Doc::open_rope(ropey::Rope::from(s));
+
+        for d in [&doc, &rope_doc] {
+            // ① 逐字节喂 byte_to_utf16：任一非边界 byte 应 floor 到所在字符起始，
+            //    换算值与「该字符起始」一致，且不得 panic。
+            for b in 0..=s.len() {
+                let floor = s.floor_char_boundary(b);
+                let want = d.byte_to_utf16(floor);
+                assert_eq!(
+                    d.byte_to_utf16(b),
+                    want,
+                    "byte_to_utf16({b}) 应等于 floor({floor}) 的换算值"
+                );
+            }
+            // ② 代理对中间（UTF-16 位置落在 🎉 的 2 单元之间）：不 panic 且落字符边界。
+            let mid = d.byte_to_utf16(s.find("🎉").unwrap()) + 1;
+            let b = d.utf16_to_byte(mid);
+            assert!(
+                s.is_char_boundary(b),
+                "utf16_to_byte({mid})={b} 应落字符边界"
+            );
+            // ③ 越界 utf16 应钳到文末（既有语义不变）。
+            assert_eq!(
+                d.utf16_to_byte(usize::MAX),
+                s.len(),
+                "越界 utf16 应钳到文末"
+            );
         }
     }
 }

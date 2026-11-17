@@ -449,6 +449,13 @@ impl super::ImageViewer {
         {
             return;
         }
+        // P1-29 资源回收：替换显示前先记下「旧显示渲染 + 旧动图片段」——替换后它们脱离
+        // `state.data`/`anim_clip`；若已不在缓存（升级重解顶掉旧档 / 逐出-翻页循环时被 LRU
+        // 逐出、但因「当前显示」在 `drop_evicted_images` 里被 guard 跳过），则显式
+        // `drop_image` 下线 GPU 纹理，防 VRAM 图集孤儿累积（尤其 50MP 全解档）。仍在缓存
+        // → 由 LRU 淘汰 / `release` 兜底，绝不提前释放。
+        let old_display = self.state.data.clone();
+        let old_clip = self.anim_clip.clone();
         self.path = path.to_path_buf();
         self.state.set_ready(entry.render.clone());
         self.intrinsic = Some(entry.intrinsic);
@@ -463,6 +470,20 @@ impl super::ImageViewer {
             && !cx.reduce_motion();
         self.anim_clip = if anim { entry.gif.clone() } else { None };
         self.anim_index = 0;
+        // P1-29：释放「已不在缓存中」的旧显示渲染 / 旧动图片段（去重：动图首帧与显示
+        // 是同一 Arc；`retire_render` 内再对缓存持有做一次守卫过滤）。
+        let mut to_retire: Vec<Arc<RenderImage>> = Vec::new();
+        if let Some(old) = old_display {
+            to_retire.push(old);
+        }
+        for f in old_clip.iter().flat_map(|(frames, _)| frames.iter()) {
+            if !to_retire.iter().any(|x| Arc::ptr_eq(x, f)) {
+                to_retire.push(f.clone());
+            }
+        }
+        for r in to_retire {
+            self.retire_render(&r, cx);
+        }
         self.update_display_need();
         cx.notify();
         cx.refresh_windows();
@@ -556,6 +577,35 @@ impl super::ImageViewer {
                 None => cx.drop_image(entry.render, None),
             }
         }
+    }
+
+    /// 缓存是否仍引用某渲染（静态 `render` 或 GIF 帧切片）：仍在缓存 → 回看/重现依赖它、
+    /// 绝不能提前 `drop_image`；已不在缓存 → 可安全下线 GPU 纹理。
+    fn cache_holds_render(&self, render: &Arc<RenderImage>) -> bool {
+        self.cache.iter().any(|e| {
+            Arc::ptr_eq(&e.render, render)
+                || e.gif
+                    .as_ref()
+                    .is_some_and(|(frames, _)| frames.iter().any(|f| Arc::ptr_eq(f, render)))
+        })
+    }
+
+    /// 下线「已不在缓存中的旧显示渲染」的 GPU 纹理（P1-29：显示替换/翻页时旧渲染不再被
+    /// 任何缓存条目引用即显式 `drop_image` 回收，防图集孤儿 / VRAM 缓慢累积；对齐 K14）。
+    /// `App::drop_image(image, None)` 只遍历 `App.windows` 里**未被正在更新取走**的窗口——
+    /// 窗口自身的 key/button 回调（如滚动切图触发的缓存命中替换）当场 drop 会漏掉当前
+    /// 窗口，故一律经 `cx.defer` 延迟到本拍更新末尾 flush（同 video `drop_old_frame` /
+    /// content_sync `pending_math_drop` 姿势）。仍在缓存中的渲染由调用方先过滤，绝不提前释放。
+    fn retire_render(&mut self, old: &Arc<RenderImage>, cx: &mut Context<Self>) {
+        if self.cache_holds_render(old) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.test_render_drops += 1;
+        }
+        let img = old.clone();
+        cx.defer(move |app| app.drop_image(img, None));
     }
 
     /// 字节缓存查询并移到队尾（MRU），返回 Arc 克隆（保留在缓存里供解码/重解码复用）。

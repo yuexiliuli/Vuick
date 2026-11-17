@@ -147,7 +147,15 @@ impl super::VideoViewer {
     pub(super) fn install_bgra(&mut self, w: u32, h: u32, bgra: Vec<u8>, cx: &mut Context<Self>) {
         let t0 = Instant::now();
         // 帧字节移入 RenderImage（零拷贝）即持有时；截图在点击时经 `frame.as_bytes` 取回
-        let buf = RgbaImage::from_raw(w, h, bgra).expect("解码帧长度恒为 w*h*4");
+        // P1-26：FFI 尺寸异常（`len != w*h*4`）时安全降级——不 `expect` 崩主线程；丢弃脏帧、
+        // 保持最近一帧并打诊断行（缓冲曾过小 / 几何突增的帧数据已不可信）。
+        let Some(buf) = RgbaImage::from_raw(w, h, bgra) else {
+            eprintln!(
+                "[video] 装帧尺寸异常，跳过本帧: {w}×{h} 需要 {}B",
+                (w as u64) * (h as u64) * 4
+            );
+            return;
+        };
         let new = Arc::new(RenderImage::new(vec![Frame::new(buf)]));
         // 旧帧被新帧替换的唯一点：显式释放被换下的旧图集 tile（P0 资源泄漏——视频每帧新建
         // `RenderImage` → 全局自增 `ImageId`，图集 key 必 miss → 新 tile 只进不出，长会话

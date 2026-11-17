@@ -3,7 +3,7 @@ name = "text_open"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "gpui-editor 文本打开/编码/差异核心 crate（大文档分块读盘归一 + 文本编码探测与按原编码保存 + WYSIWYG 写回增量行级 diff，纯库零视图依赖）"
+description = "vuick 文本打开/编码/差异核心 crate（大文档分块读盘归一 + 文本编码探测与按原编码保存 + WYSIWYG 写回增量行级 diff，纯库零视图依赖）"
 
 [dependencies]
 # 大文档分块打开的分块阈值 / 读缓冲常量（config::limits）。

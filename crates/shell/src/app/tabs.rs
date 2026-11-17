@@ -61,6 +61,18 @@ impl EditorApp {
         self.model.borrow_mut().activate_tab(host, idx, window, &mut **cx);
     }
 
+    /// 对话框 await 返回后的下标复验：按「发起时的选项卡身份（CodeEditor 实体 id）」
+    /// 在当前 `tabs` 里找其当前下标。await 期间用户可能拖拽重排 / 经其它路径关闭
+    /// 选项卡，`idx` 已不可靠——按下标操作会误关/误存错选项卡（P1-33）。
+    /// 返回 `None` = 该身份已不在（已被其它路径关闭），调用方应放弃。
+    fn tab_index_for_editor_id(&self, editor_id: gpui::EntityId) -> Option<usize> {
+        self.model
+            .borrow()
+            .tabs
+            .iter()
+            .position(|t| t.payload.editor.entity_id() == editor_id)
+    }
+
     /// 关闭选项卡：干净命名文件夹闭直通 `remove_tab`；脏 / 未命名（空内容同样在盘上有
     /// 会话槽位）→ 弹原生任务对话框异步等待用户选择（是=另存为转正 / 否=删临时槽位 /
     /// 取消=留在应用）。宿主文件保存副作用收在此（PDF 走待保存模型 save 流程）。
@@ -69,6 +81,9 @@ impl EditorApp {
         if idx >= self.model.borrow().tabs.len() {
             return;
         }
+        // 发起时记录选项卡身份：确认框异步等待期间用户可能拖拽重排 / 另路关闭选项卡，
+        // 下标不可靠，await 返回后须按身份复验再操作（P1-33）。
+        let tab_id = self.model.borrow().tabs[idx].payload.editor.entity_id();
         // 未命名选项卡（无论脏与否：空内容同样在盘上有会话槽位）→ 一律弹确认
         // （是=另存为转正、否=删除临时槽位、取消=留在应用）；命名文件仅当脏（有
         // 未落盘修改）才询问，干净直通关闭。
@@ -91,6 +106,17 @@ impl EditorApp {
             .spawn(cx, async move |cx| {
                 // oneshot 通道被取消视为"取消"
                 let idx_ans = answer.await.unwrap_or(2);
+                // P1-33：await 期间用户可能拖拽重排 / 经其它路径关闭选项卡，原 `idx`
+                // 已不可靠。按「发起时的选项卡身份（CodeEditor 实体 id）」复验当前下标；
+                // 已不在（被其它路径关闭）→ 放弃本次关闭（不误删/误存错选项卡）。
+                let Some(idx) = cx
+                    .update_window_entity(&entity, |this, _w, _cx| {
+                        this.tab_index_for_editor_id(tab_id)
+                    })
+                    .unwrap_or(None)
+                else {
+                    return;
+                };
                 let should_close = match idx_ans {
                     0 => {
                         // PDF 选项卡：走待保存模型——触发 PdfViewer::save，等完成信号；
@@ -199,6 +225,9 @@ impl EditorApp {
         if idx >= self.model.borrow().tabs.len() {
             return;
         }
+        // 记录发起时选项卡身份：另存为对话框异步等待期间同样可能拖拽重排/另路关闭，
+        // await 返回后须按身份复验再操作（P1-33）。
+        let tab_id = self.model.borrow().tabs[idx].payload.editor.entity_id();
         let file_name = self.tab_file_name(idx);
         // live2 开启时读 WyEditor 实时内容（防关闭保存丢编辑）。
         let text = self.model.borrow().tab_effective_text(idx, cx);
@@ -214,6 +243,16 @@ impl EditorApp {
                     return;
                 };
                 let file = file.path().to_path_buf();
+                // P1-33：对话框 await 返回后按身份复验当前下标；已不在（被其它路径
+                // 关闭）→ 放弃（不把写到/关闭错选项卡）。仍在 → 用复验后的下标。
+                let Some(idx) = cx
+                    .update_window_entity(&entity, |this, _w, _cx| {
+                        this.tab_index_for_editor_id(tab_id)
+                    })
+                    .unwrap_or(None)
+                else {
+                    return;
+                };
                 let saved = cx
                     .update_window_entity(&entity, |this, _window, cx| {
                         this.write_to_path(idx, &file, text.clone(), cx)

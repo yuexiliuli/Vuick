@@ -1,5 +1,5 @@
 //! 会话临时文件 / 状态恢复：退出时把**主窗口**的选项卡集合落盘到
-//! `UserPrefs::session_dir()`（默认 `%APPDATA%\gpui-editor\session\`），下次启动
+//! `UserPrefs::session_dir()`（默认 `%APPDATA%\vuick\session\`），下次启动
 //! 按清单复原选项卡数量/顺序、未命名内容与活动选项卡。
 //!
 //! 储存格式：

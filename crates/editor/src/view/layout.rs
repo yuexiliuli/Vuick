@@ -420,6 +420,9 @@ impl CodeEditor {
     }
 
     /// 像素 → ListOffset（统一行高模型，窗口内相对坐标由调用方套 `window_base`）。
+    /// 全 crate 无调用点（滚动/命中均直接走 `apply_desired_to_window` 的取整逻辑），
+    /// dormancy 休眠保留（K24）。
+    #[allow(dead_code)]
     fn px_to_offset(px: f32, lh: f32) -> ListOffset {
         let item_ix = (px / lh).floor().max(0.) as usize;
         let offset = px - item_ix as f32 * lh;

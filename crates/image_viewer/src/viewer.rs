@@ -85,7 +85,7 @@ use ::viewer::pan_zoom;
 mod input;   // input/hit：滚轮缩放/切图、放大态平移、拖拽平移、切图复位
 mod decode;  // decode：并行解码池 / LRU 缓存 / 级联预取 / 动图时钟 / EXIF 即时首帧
 mod display; // display/placeholder：Render 上屏、C6 预上传垫底、占位文本
-mod diag;    // diag：env 门控诊断探针（GPUI_EDITOR_IMG_DIAG=1，帧间隔/切换时延）
+mod diag;    // diag：env 门控诊断探针（VUICK_IMG_DIAG=1，帧间隔/切换时延）
 
 /// 一张已解码可立即上屏的图片（LRU 缓存条目）。
 #[derive(Clone)]
@@ -313,6 +313,11 @@ pub struct ImageViewer {
     anim_gen: u64,
     /// 当前动图帧下标（0 = 首帧；配合 `self.state.data` 落盘当前帧切片）。
     anim_index: usize,
+    /// 测试探针：`drop_image` 下线渲染图累计计数（仅 test 编译）。headless 无真实图集、
+    /// `drop_image` 对零窗口为空操作、无法直接观测「GPU 释放本身」——以计数代理「效果断言」
+    /// （K37），供 P1-29 回归断言「显示替换/翻页时旧渲染被 retire 下线」。
+    #[cfg(test)]
+    test_render_drops: usize,
 }
 
 impl ImageViewer {
@@ -352,6 +357,8 @@ impl ImageViewer {
             anim_clip: None,
             anim_gen: 0,
             anim_index: 0,
+            #[cfg(test)]
+            test_render_drops: 0,
         };
         let scan_at = path.clone();
         cx.spawn(async move |weak, cx| {
@@ -376,6 +383,21 @@ impl ImageViewer {
     /// 当前图片路径（宿主 `EditorApp` 同步标签标题 / 状态栏用）。
     pub fn current_path(&self) -> Option<PathBuf> {
         Some(self.nav.current_path().to_path_buf())
+    }
+
+    /// 重命名同步：当前显示文件被外部改名后更新内部 `path` + 同文件夹导航清单里同路径
+    /// 条目（当前项下标不变、仅路径改名，前/后键与预取不再指到已不存在的旧名）。
+    /// 文件内容未变，已解码渲染/缩放/平移保持不变。
+    pub fn set_path(&mut self, path: PathBuf) {
+        let old = std::mem::replace(&mut self.path, path.clone());
+        let current = self.nav.current();
+        let items: Vec<PathBuf> = self
+            .nav
+            .items()
+            .iter()
+            .map(|p| if *p == old { path.clone() } else { p.clone() })
+            .collect();
+        self.nav = FolderNav::new(items, current);
     }
 
     /// 当前图片在同文件夹清单中的下标（0 基）。
@@ -455,8 +477,24 @@ impl ImageViewer {
             cx.drop_image(img, Some(window));
         }
         for entry in std::mem::take(&mut self.cache).into_iter() {
-            cx.drop_image(entry.render, Some(window));
+            // 静态图释放首帧 `render`；动图释放**全部帧切片**（对齐 LRU 逐出的
+            // `drop_evicted_images` 口径——P1-30：旧实现只 drop 首帧 `render`，GIF 其余帧
+            // 切片在此漏放，成为图集孤儿）。
+            match entry.gif {
+                Some((frames, _)) => {
+                    for f in frames {
+                        cx.drop_image(f, Some(window));
+                    }
+                }
+                None => cx.drop_image(entry.render, Some(window)),
+            }
         }
+        // P1-30：动图时钟自停 + 释放动图片段引用。`anim_clip` 是帧切片的独立持有者，
+        // 清缓存不覆盖它；且不递增 `anim_gen` 的话，release 后旧动画任务下个 tick 仍会把
+        // 帧重新写回 `state.data`（空翻页/重挂 GPU 帧、纹理不释放）。先代序号自停再清引用。
+        self.anim_gen = self.anim_gen.wrapping_add(1);
+        self.anim_clip = None;
+        self.anim_index = 0;
         self.byte_cache.clear();
         self.in_flight.clear();
         self.byte_flight.clear();
@@ -730,9 +768,10 @@ fn decode_jpeg_display(
     Ok((bgra, w, h, den))
 }
 
-/// JPEG 缩放输出分配硬上界（≤ `kimg::Limits::default()` 的 `max_alloc` = 512MiB）
-/// ——不可信头尺寸不得触发超出预算的单次分配（K124；见 [`try_decode_jpeg_scaled`]）。
-const JPEG_SCALED_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// 解码展示分配硬上界（≤ `kimg::Limits::default()` 的 `max_alloc` = 512MiB）——不可信头
+/// 尺寸（JPEG SOF / PNG IHDR）不得触发超出预算的单次分配（K124）。JPEG scaled 输出与
+/// PNG display 缓冲共用同一预算。
+const DECODE_DISPLAY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// JPEG **DCT 缩放**直解尝试：成功返回 `(BGRA, w, h, den)`（与 box 网格同构
 /// `ceil(iw/den)×ceil(ih/den)`，顶左对齐，den∈{2,4,8}）；任何失败/不支持/非
@@ -759,7 +798,7 @@ fn try_decode_jpeg_scaled(bytes: &[u8], need: (f32, f32)) -> Option<(Vec<u8>, u3
     // 全解兜底（全解路径在 limits 内正确拒绝炸弹头）。`checked` 乘法防中间溢出（16-bit
     // SOF 极端 65535×65535 亦被本界拦下：scaled 32768×32768×3 ≈ 3.0GB > 512MiB）。
     let n = u64::from(sw).checked_mul(u64::from(sh))?.checked_mul(ch)?;
-    if n > JPEG_SCALED_MAX_BYTES {
+    if n > DECODE_DISPLAY_MAX_BYTES {
         return None;
     }
     let mut buf = vec![0u8; n as usize];
@@ -1016,6 +1055,13 @@ fn expand_png_to_rgba8(buf: &[u8], w: u32, h: u32, color: kimg::ColorType) -> Op
     Some(out)
 }
 
+/// PNG 展示解码**分配预算判定**（K124）：IHDR 声明尺寸驱动的像素字节数（`total_bytes`）
+/// 超过 [`DECODE_DISPLAY_MAX_BYTES`] → 分配前拒绝（对齐 JPEG scaled 预检姿势）。纯函数，
+/// 便于单测「预检触发」。
+fn png_decode_within_budget(nbytes: u64) -> bool {
+    nbytes <= DECODE_DISPLAY_MAX_BYTES
+}
+
 /// PNG 按展示需要**降档解码**（`kimg::codecs::png::PngDecoder` 解全量位图，非 RGBA8 先
 /// 展开，再对全量做盒式降采样到展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。
 /// 选档复用 [`pick_den`]（与格式无关的「解码 ≥ 显示」语义）。
@@ -1035,6 +1081,12 @@ fn decode_png_display(
     let den = pick_den(iw, ih, need.0, need.1);
     let color = dec.color_type();
     let nbytes = usize::try_from(dec.total_bytes()).map_err(|_| "PNG 解码尺寸过大".to_string())?;
+    // K124 分配前硬上界（对齐 JPEG scaled 预检姿势）：IHDR 声明尺寸驱动的 `total_bytes`
+    // 超预算 → 不分配、返回 `Err`（解码池回退 `image` 全解，其内部同样套默认 `Limits`、
+    // 对超大声明干净拒绝，绝不 OOM/GB 级分配）。
+    if !png_decode_within_budget(nbytes as u64) {
+        return Err("PNG 解码尺寸超过预算".to_string());
+    }
     let mut raw = vec![0u8; nbytes];
     dec.read_image(&mut raw)
         .map_err(|e| format!("PNG 解码失败：{e}"))?;
@@ -1316,7 +1368,7 @@ mod tests {
     /// 每测试独立的临时目录（按进程 id + 标签隔离，避免并行测试互相踩）。
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "gpui-editor-img-test-{}-{tag}",
+            "vuick-img-test-{}-{tag}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2657,7 +2709,7 @@ mod tests {
 
     /// K124 安全反例：SOF 声明 16-bit 上限 65535×65535 的小文件——`try_decode_jpeg_scaled`
     /// 必须在**分配前**因「scaled 输出 > 512MiB 硬上界」返回 `None`，不得做 GB 级分配
-    /// （受 `JPEG_SCALED_MAX_BYTES` 拦下；`set_limits(default)` 使 codec 侧
+    /// （受 `DECODE_DISPLAY_MAX_BYTES` 拦下；`set_limits(default)` 使 codec 侧
     /// `read_image_scaled` 的 `max_alloc` reserve 同口径生效）。
     #[test]
     fn try_decode_jpeg_scaled_rejects_huge_header_without_alloc() {
@@ -2676,6 +2728,59 @@ mod tests {
             try_decode_jpeg_scaled(&jpeg, (30000.0, 30000.0)).is_none(),
             "超大 SOF 必须在分配前拒绝"
         );
+    }
+
+    /// 手写「IHDR 声明超大尺寸」的最小 PNG（P1-27 夹具）：幅面伪造为 `w×h`，IDAT 给足
+    /// `idat_len` 字节（零填充）——kimg 解析期「防炸弹预检」按 `压缩量×1032` 是否盖得住
+    /// 声明像素字节数判断（chunk.rs `MAX_INFLATE_RATIO`），故 IDAT 长度不足会直接在 `new()`
+    /// 被拒、根本走不到预算预检。要构造「能到 `total_bytes`/`vec!` 段、但总字节超预算」的真
+    /// 炸弹夹具，IDAT 必须 ≥ 声明像素字节/1032（K173：测试要命中真防御路径）。
+    fn oversized_declared_png(w: u32, h: u32, idat_len: usize) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8bit RGBA
+        out.extend_from_slice(&png_chunk_byte(b"IHDR", &ihdr));
+        out.extend_from_slice(&png_chunk_byte(b"IDAT", &vec![0u8; idat_len]));
+        out.extend_from_slice(&png_chunk_byte(b"IEND", &[]));
+        out
+    }
+
+    /// K124 安全反例（PNG 侧，P1-27）：IHDR 声明 11600×11600 RGBA（≈513MiB，**刚好超过**
+    /// 512MiB 分配预算上限）的小文件——若把预算预检去掉，`vec![0u8; total]` 会先做出
+    /// >512MiB 的单次分配（1GB 级备选尺寸更糟），再等解码限流。断言 [`decode_png_display`]
+    /// 在分配前因「`total_bytes` > 硬上界」返回 `Err`，且错误文案钉死「预算」（排除解码器
+    /// 其它随机错误，K173）。
+    #[test]
+    fn decode_png_display_rejects_oversized_ihdr_without_alloc() {
+        // 11600×11600×4 ≈ 513.3MiB > 512MiB；IDAT 给足 560KB（≥ 513MiB/1032）以通过 kimg
+        // 解析期防炸弹预检 → 真能走到 decode_png_display 的 total_bytes / vec! 段。
+        let png = oversized_declared_png(11600, 11600, 560_000);
+        let dec = kimg::codecs::png::PngDecoder::new(Cursor::new(&png)).expect("头应可解析");
+        assert_eq!(dec.dimensions(), (11600, 11600), "声明尺寸应被解析");
+        assert!(
+            dec.total_bytes() > DECODE_DISPLAY_MAX_BYTES,
+            "夹具 total_bytes 必须超过预算（{} > {})",
+            dec.total_bytes(),
+            DECODE_DISPLAY_MAX_BYTES
+        );
+        // K173：拒绝必须来自「预算预检」——文案钉死「预算」，且发生在 vec! 分配之前
+        let err = decode_png_display(&png, DISPLAY_NEED_INIT)
+            .expect_err("超大声明尺寸应被预算预检拒绝，而非触发达分配");
+        assert!(err.contains("预算"), "拒绝文案应指明预算预检：{err}");
+    }
+
+    /// 预算判定纯函数（P1-27/K124）：≤512MiB 放行、超限拒绝；65535×65535×4 RGBA ≈17GB
+    /// 必须拒绝。单测直接钉预检逻辑（decode 级集成测试见上，K173 防假绿）。
+    #[test]
+    fn png_decode_within_budget_rejects_oversized_pixel_bytes() {
+        assert!(png_decode_within_budget(DECODE_DISPLAY_MAX_BYTES), "预算边界内应放行");
+        assert!(
+            !png_decode_within_budget(65535u64 * 65535 * 4),
+            "65535×65535×4 ≈17GB 必须拒绝"
+        );
+        assert!(png_decode_within_budget(1), "极小图放行");
     }
 
     /// 定位 JPEG SOF0（`FF C0`）并原地 patch 高/宽（段布局 `FF C0 <len:2> <prec:1> <h:2> <w:2>`）。
@@ -2756,6 +2861,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P2-① 唯一性：缩放真实生效后 `scroll_accum` 残留清零（切滚轮语义，防放大态残留
+    /// 立即误触发一次平移/切图）；缩放未生效（已钳满，`apply_zoom` 拒绝）时不动。
+    #[gpui::test]
+    async fn adjust_zoom_clears_scroll_accum_residue(cx: &mut TestAppContext) {
+        let dir = tmp_dir("zoom_accum");
+        // 图片无需真实存在（display_denom==1 时 escalate 早退，不派解码）。
+        let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
+                v.intrinsic = Some((200.0, 100.0));
+                v.last_viewport = (800.0, 600.0);
+                v.scroll_accum = 12.5; // 残留亚步长
+                v.zoom = ZOOM_MAX; // 已钳满：再放大不生效 → 不应清零
+                v
+            })
+        });
+        // zoom 已满 → apply_zoom 拒绝 → 残留保留。
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.adjust_zoom(pan_zoom::zoom_factor(1.0, ZOOM_STEP), cx);
+            })
+        });
+        assert_eq!(
+            cx.update(|app| viewer.read(app).scroll_accum),
+            12.5,
+            "缩放未生效（已钳满）不应清零残留"
+        );
+        // 缩一档真实生效 → 清零。
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.adjust_zoom(pan_zoom::zoom_factor(-1.0, ZOOM_STEP), cx);
+            })
+        });
+        assert_eq!(
+            cx.update(|app| viewer.read(app).scroll_accum),
+            0.0,
+            "缩放真实生效后 scroll_accum 残留应清零"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 放大态滚轮语义：先在图片内纵向平移，滚到边缘且继续同向外滚才切下一张；切图时
     /// 缩放复位为适应视口（1.0）、平移归零。（直接构造状态，绕过真实解码/布局。）
     #[gpui::test]
@@ -2819,6 +2965,68 @@ mod tests {
                 assert_eq!(v.nav.current(), 1, "未放大：滚轮仍直接切下一张");
                 assert_eq!(v.zoom, 1.0);
             })
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-28 滚轮方向一致性：同一物理滚轮（向下滚 = delta.y<0 → 下一张，向上滚 → 上一张）
+    /// 在 `Lines`（鼠标）与 `Pixels`（触控板）两种模式必须切换方向一致——旧实现 Pixels
+    /// 分支 `+= delta_y` 让向下滚变「上一张」，与 Lines 相反（同机两外设方向打架）。走真实
+    /// `on_scroll_wheel` 事件分发（覆盖 `scroll_accum` 累计路径；依赖窗口上下文取事件）。
+    #[gpui::test]
+    async fn wheel_lines_and_pixels_switch_same_direction(cx: &mut TestAppContext) {
+        use gpui::{point, px};
+        let dir = tmp_dir("wheel_dir");
+        for n in ["a.png", "b.png", "c.png"] {
+            write_png(&dir.join(n), 8, 8);
+        }
+        let (viewer, wcx) = cx.add_window_view(|_window, cx| {
+            let mut v = ImageViewer::new(dir.join("a.png"), cx);
+            v.last_viewport = (800.0, 600.0);
+            v.intrinsic = Some((100.0, 50.0)); // 1× 适配视口，未放大 → 直接切图
+            v.zoom = 1.0;
+            v
+        });
+        let vcx: &mut VisualTestContext = wcx;
+        vcx.run_until_parked(); // 等后台扫描落定后统一覆盖 nav，避免竞态
+        vcx.update(|window, cx| {
+            viewer.update(cx, |v, c| {
+                v.nav = FolderNav::new(
+                    vec![dir.join("a.png"), dir.join("b.png"), dir.join("c.png")],
+                    0,
+                );
+                // 行滚轮（鼠标）：向下滚（delta.y<0）→ 下一张（基线语义）
+                v.on_scroll_wheel(
+                    &gpui::ScrollWheelEvent {
+                        position: point(px(200.), px(200.)),
+                        delta: gpui::ScrollDelta::Lines(point(0.0f32, -1.0f32)),
+                        modifiers: gpui::Modifiers::default(),
+                        ..Default::default()
+                    },
+                    window,
+                    c,
+                );
+                assert_eq!(v.nav.current(), 1, "行滚轮向下滚应切下一张");
+                // 像素滚轮（触控板）：同一物理向下滚（delta.y<0）→ 必须同样切下一张
+                v.on_scroll_wheel(
+                    &gpui::ScrollWheelEvent {
+                        position: point(px(200.), px(200.)),
+                        delta: gpui::ScrollDelta::Pixels(point(
+                            px(0.),
+                            px(-config::image::WHEEL_PIXEL_STEP),
+                        )),
+                        modifiers: gpui::Modifiers::default(),
+                        ..Default::default()
+                    },
+                    window,
+                    c,
+                );
+                assert_eq!(
+                    v.nav.current(),
+                    2,
+                    "像素滚轮向下滚应切下一张（与行滚轮同方向）"
+                );
+            });
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3754,8 +3962,8 @@ mod tests {
             backs.last().copied().unwrap_or(0.0)
         );
         if generated {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     }
 
     /// R2 快滚节流闸 · 确定性单测：快速模式下解码并发必须收敛到
@@ -4006,6 +4214,170 @@ mod tests {
             "最终应显示 01 真图降档解码（缩略图占位恒 den=1），实为 den={den}"
         );
         assert!(thumb_gone, "真图落盘后 thumb_pending 应清空");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-30：`release()` 必须自停动图时钟并释放动图片段引用——旧实现只 drop 上屏/缓存
+    /// 纹理，不动 `anim_gen`/`anim_clip`/`anim_index`：release 后旧动画任务下个 tick 把帧
+    /// 重新写回 `state.data`、且 `anim_clip` 持有的全部帧 Arc 不释放 → VRAM 不回收。断言
+    /// release 后 `anim_gen` 递增（在飞时钟自停）、`anim_clip` 清空、`anim_index` 归零。
+    #[gpui::test]
+    async fn release_stops_anim_clock_and_clears_clip(cx: &mut TestAppContext) {
+        let dir = tmp_dir("animrel");
+        write_png(&dir.join("a.png"), 4, 4);
+        let p = dir.join("a.png");
+        let mk = |c: [u8; 3]| -> Arc<RenderImage> {
+            Arc::new(RenderImage::new(vec![kimg::Frame::new(kimg::RgbaImage::from_pixel(
+                2,
+                2,
+                kimg::Rgba([c[0], c[1], c[2], 255]),
+            ))]))
+        };
+        let f0 = mk([1, 2, 3]);
+        let f1 = mk([4, 5, 6]);
+        let (viewer, wcx) = cx.add_window_view(|_window, cx| ImageViewer::new(p.clone(), cx));
+        let vcx: &mut VisualTestContext = wcx;
+        vcx.run_until_parked(); // 完成初始首帧解码（静态 PNG → anim_clip=None 基线）
+        // 挂起动图状态（模拟 GIF 播放中）
+        vcx.update(|_, cx| {
+            viewer.update(cx, |v, _c| {
+                v.state.data = Some(f0.clone());
+                v.anim_clip = Some((
+                    vec![f0.clone(), f1],
+                    vec![
+                        std::time::Duration::from_millis(50),
+                        std::time::Duration::from_millis(50),
+                    ],
+                ));
+                v.anim_gen = 7;
+                v.anim_index = 1;
+            });
+        });
+        let (gen_before, clip_before, idx_before, data_before) = vcx.update(|_, cx| {
+            let v = viewer.read(cx);
+            (v.anim_gen, v.anim_clip.is_some(), v.anim_index, v.state.data.is_some())
+        });
+        assert_eq!(gen_before, 7, "前提：anim_gen 基线");
+        assert_eq!(idx_before, 1, "前提：动画帧下标基线");
+        assert!(clip_before && data_before, "前提：已挂动画片段与上屏帧");
+        // release：应自停时钟 + 清动画引用 + 清上屏帧
+        vcx.update(|window, cx| {
+            viewer.update(cx, |v, c| v.release(window, c));
+        });
+        let (gen_after, clip_after, idx_after, data_after) = vcx.update(|_, cx| {
+            let v = viewer.read(cx);
+            (v.anim_gen, v.anim_clip.is_some(), v.anim_index, v.state.data.is_some())
+        });
+        assert_ne!(gen_after, gen_before, "release 应递增 anim_gen（旧动画时钟自停）");
+        assert!(!clip_after, "release 应清空 anim_clip（帧 Arc 引用释放）");
+        assert_eq!(idx_after, 0, "release 应重置 anim_index");
+        assert!(!data_after, "release 应清空上屏帧");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-29：显示「升级替换/翻页」时，**已不在缓存**的旧显示渲染必须被 `drop_image` 下线
+    /// （headless 无法观测 GPU 释放本身，以测试计数 [`Self::test_render_drops`] 代理「效果
+    /// 断言」K37）。场景：旧渲染已被替换/逐出（不残留缓存）→ 安装新渲染替换显示 → 旧渲染
+    /// 应 retire（drop 计数 +1）。
+    #[gpui::test]
+    async fn install_replace_retires_display_render_no_longer_in_cache(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tmp_dir("retire");
+        let p = dir.join("a.png");
+        write_png(&p, 8, 8);
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        wait_idle(cx, &viewer);
+        let mk = |c: [u8; 3]| -> Arc<RenderImage> {
+            Arc::new(RenderImage::new(vec![kimg::Frame::new(kimg::RgbaImage::from_pixel(
+                2,
+                2,
+                kimg::Rgba([c[0], c[1], c[2], 255]),
+            ))]))
+        };
+        let old = mk([10, 20, 30]);
+        let new = mk([40, 50, 60]);
+        let entry = CacheEntry {
+            path: p.clone(),
+            render: new.clone(),
+            intrinsic: (2.0, 2.0),
+            bytes: 16,
+            denom: 1,
+            gif: None,
+        };
+        cx.update(|app| {
+            viewer.update(app, |v, c| {
+                // 旧显示渲染上屏中，但缓存已不含它（升级 `put` 顶掉 / LRU 逐出跳过当前）
+                v.state.data = Some(old.clone());
+                v.cache.clear();
+                v.install_current(entry, &p, c);
+                assert!(
+                    Arc::ptr_eq(v.state.data.as_ref().unwrap(), &new),
+                    "新渲染应上屏"
+                );
+            })
+        });
+        cx.run_until_parked();
+        let drops = cx.update(|app| viewer.read(app).test_render_drops);
+        assert!(drops >= 1, "已不在缓存的旧显示渲染应被 drop_image 下线（实为 {drops}）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-29 回看保活：旧显示渲染**仍在缓存**（翻页回看场景）→ 替换显示时绝不能提前
+    /// `drop_image`（缓存 Arc 保留，回看不重解）。
+    #[gpui::test]
+    async fn install_switch_keeps_cached_display_render_alive(cx: &mut TestAppContext) {
+        let dir = tmp_dir("keep");
+        for n in ["a.png", "b.png"] {
+            write_png(&dir.join(n), 4, 4);
+        }
+        let pa = dir.join("a.png");
+        let pb = dir.join("b.png");
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(pa.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        wait_idle(cx, &viewer);
+        let mk = |c: [u8; 3]| -> Arc<RenderImage> {
+            Arc::new(RenderImage::new(vec![kimg::Frame::new(kimg::RgbaImage::from_pixel(
+                2,
+                2,
+                kimg::Rgba([c[0], c[1], c[2], 255]),
+            ))]))
+        };
+        let ra = mk([1, 2, 3]);
+        let rb = mk([4, 5, 6]);
+        let entry_a = CacheEntry {
+            path: pa.clone(),
+            render: ra.clone(),
+            intrinsic: (2.0, 2.0),
+            bytes: 16,
+            denom: 1,
+            gif: None,
+        };
+        let entry_b = CacheEntry {
+            path: pb.clone(),
+            render: rb.clone(),
+            intrinsic: (2.0, 2.0),
+            bytes: 16,
+            denom: 1,
+            gif: None,
+        };
+        cx.update(|app| {
+            viewer.update(app, |v, c| {
+                v.cache_put(pa.clone(), entry_a, c); // a 入缓存
+                v.state.data = Some(ra.clone()); // a 显示
+                v.install_current(entry_b, &pb, c); // 切到 b（a 仍在缓存 → 不得 retire）
+            })
+        });
+        cx.run_until_parked();
+        let (drops, cached_a) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.test_render_drops, v.cache_contains(&pa))
+        });
+        assert_eq!(drops, 0, "仍在缓存的旧显示渲染不得提前 drop_image");
+        assert!(cached_a, "a 应仍在缓存供回看复用");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

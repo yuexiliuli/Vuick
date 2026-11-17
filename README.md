@@ -1,4 +1,4 @@
-# gpui-editor
+# Vuick
 
 基于 **Rust + GPUI 0.2.2** 原生实现的文本 / 代码 / Markdown 编辑器（多文件选项卡）。
 界面为「菜单栏 + 选项卡栏 + 编辑区 + 侧栏 + 可选 Markdown 实时预览区 + 状态栏」布局。
@@ -149,7 +149,7 @@ cargo run
 # 发布（Release profile 已配 opt-level=z / LTO / strip / panic=abort）
 cargo build --release
 
-# 分发打包（release exe + media_ffmpeg.dll + FFmpeg 运行库 → dist\gpui-editor-win64\）
+# 分发打包（release exe + media_ffmpeg.dll + FFmpeg 运行库 → dist\vuick-win64\）
 pwsh scripts/package.ps1
 
 # 全量测试
@@ -181,7 +181,7 @@ PDF / EPUB / 图片 / 大文档测试的 fixture **已提交至仓库**（`fixtu
 - 要让视频功能可用，分发时必须把 `media_ffmpeg.dll` 与全部 FFmpeg dll 和 exe **放到同一目录**（清单见下方「视频组件所需 DLL」）。一键打包：
 
 ```bash
-# 构建 release 并导出「exe + media_ffmpeg.dll + 全部 FFmpeg 运行库」到 dist\gpui-editor-win64\
+# 构建 release 并导出「exe + media_ffmpeg.dll + 全部 FFmpeg 运行库」到 dist\vuick-win64\
 # 脚本自动校验：exe 无 FFmpeg 静态导入、media_ffmpeg.dll 所需的 FFmpeg dll 全部在包内
 pwsh scripts/package.ps1
 ```
@@ -204,7 +204,7 @@ pwsh scripts/package.ps1
 手工分发请以**与编译期同一 FFmpeg 构建**（版本号一致，防 ABI 错位）为准补全。
 
 - **必须用 release**：debug 版还依赖 `vcruntime140d.dll` / `ucrtbased.dll` 等调试 CRT，他人机器也没有；
-- 把 `dist\gpui-editor-win64\` 整个目录（或打成 zip）发给对方，**exe 必须与这些 dll 同目录**；
+- 把 `dist\vuick-win64\` 整个目录（或打成 zip）发给对方，**exe 必须与这些 dll 同目录**；
 - 其余依赖（`VCRUNTIME140.dll`、`api-ms-win-crt-*`、`d3dcompiler_47.dll`、`icuuc.dll`）均为
   Windows 10/11 系统自带，无需打包；对方是精简版 / 旧版系统缺 `VCRUNTIME140.dll` 时，安装
   「Microsoft Visual C++ 2015–2022 Redistributable (x64)」即可；
@@ -215,8 +215,8 @@ pwsh scripts/package.ps1
 
 应用的**用户偏好**（主题 / 字号 / 侧栏宽度）会在运行时持久化成一份 JSON 配置文件（代码：`src/config/user.rs`）：
 
-- **位置**（Windows）：`%APPDATA%\gpui-editor\config.json`
-  - 可用环境变量 `GPUI_EDITOR_CONFIG` 指定其它路径（绝对值）；无 `APPDATA` 时回退到当前目录 `gpui-editor-config.json`。
+- **位置**（Windows）：`%APPDATA%\vuick\config.json`
+  - 可用环境变量 `VUICK_CONFIG` 指定其它路径（绝对值）；无 `APPDATA` 时回退到当前目录 `vuick-config.json`。
   - 它在用户目录、**不在仓库里**，不会随 git 提交。
 - **作用**：退出 / 下次重启时保持这些个性化设置：
   | 字段 | 取值 | 说明 |
@@ -241,7 +241,7 @@ pwsh scripts/package.ps1
 - **关闭未命名选项卡（点其 ×）会弹确认框**：「保存」= 弹出另存为对话框把内容转正为真实文件后关闭；「不保存」= 直接关闭并**删除该临时文件**（`session\` 里对应槽位清掉，下次启动不残留）；「取消」= 留在应用。
 - **已保存（有路径）的选项卡**：干净时直接关闭；有未落盘修改时才弹「保存 / 不保存 / 取消」（保存写回原路径，不保存丢弃，取消留在应用）。
 - **临时文件位置**（与配置文件同目录，随配置文件路径走）：
-  - 前提：`配置文件` 在哪里，`session\` 就在它同目录下（默认 `%APPDATA%\gpui-editor\`）。
+  - 前提：`配置文件` 在哪里，`session\` 就在它同目录下（默认 `%APPDATA%\vuick\`）。
   - `session\session.json`：会话清单（版本、活动选项卡下标、按顺序的选项卡列表；未命名选项卡记「槽位名」，已打开文件记绝对路径）。
   - `session\t0`、`t1`…：未命名选项卡的内容槽位文件（LF 规范化，空内容也写空文件；文件型选项卡**不保存正文**，只记路径）。
   - 它在用户目录、**不在仓库里**，不会随 git 提交。

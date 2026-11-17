@@ -214,7 +214,20 @@ impl super::VideoViewer {
         // `video_worker` 的 `reap_releases`；Arc<Mutex<Receiver>> 供内层帧循环逐帧拉取）
         let (rel_tx, rel_rx) = std::sync::mpsc::channel::<usize>();
         let rel_rx = Arc::new(std::sync::Mutex::new(rel_rx));
-        std::thread::spawn(move || Self::video_worker(rx, gen_arc, rel_rx));
+        std::thread::spawn(move || {
+            // P1-23：worker 顶层兜底 catch_unwind——任何未预期 panic（如曾经的无界切片）上报
+            // 而非静默杀线程、让主线程 pump 永久等画面；上报后线程才退出（不 abort 不吞）。
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    Self::video_worker(rx, gen_arc, rel_rx)
+                }))
+            {
+                eprintln!(
+                    "[video] 解码 worker panic（已兜底上报，线程退出）: {}",
+                    panic_msg(&payload)
+                );
+            }
+        });
         self.decode_cmd = Some(tx);
         self.release_cmd = Some(rel_tx);
     }
@@ -229,7 +242,19 @@ impl super::VideoViewer {
         }
         let (tx, rx) = std::sync::mpsc::channel::<HoverCmd>();
         let hgen = self.hover_generation.clone();
-        std::thread::spawn(move || Self::hover_worker(rx, hgen));
+        std::thread::spawn(move || {
+            // P1-23：hover worker 顶层兜底（同视频 worker，防无界切片类 panic 静默死）
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    Self::hover_worker(rx, hgen)
+                }))
+            {
+                eprintln!(
+                    "[video] hover 预解码 worker panic（已兜底上报，线程退出）: {}",
+                    panic_msg(&payload)
+                );
+            }
+        });
         self.hover_cmd = Some(tx);
     }
 
@@ -544,12 +569,22 @@ impl super::VideoViewer {
                                     seek_skipped = skipped.min(u32::MAX as u64) as u32;
                                 }
                                 let need = (w as usize) * (h as usize) * 4;
-                                Ok(Some(FrameItem::Soft(SoftFrame {
-                                    pts,
-                                    w,
-                                    h,
-                                    bgra: buf[..need].to_vec(),
-                                })))
+                                // P1-23：源几何中途突增（need>buf.len()，如 AVC mid-stream SPS
+                                // 分辨率变化）时经 `take_soft_frame_bytes` 安全降级（扩容后返回
+                                // None → 本命令按解码失败断代、预滚保底帧兜底），不再 `buf[..need]`
+                                // 无界切片 panic 静默杀 worker。
+                                match take_soft_frame_bytes(&mut buf, need) {
+                                    Some(bgra) => Ok(Some(FrameItem::Soft(SoftFrame {
+                                        pts,
+                                        w,
+                                        h,
+                                        bgra,
+                                    }))),
+                                    None => Err(anyhow::anyhow!(
+                                        "输出几何突增、缓冲过小（need={need} > {len}），本命令断代，预滚帧兜底",
+                                        len = buf.len()
+                                    )),
+                                }
                             }
                             Ok(None) => Ok(None),
                             Err(e) => Err(e),
@@ -574,12 +609,20 @@ impl super::VideoViewer {
                                 // 反而把下次 `_into` 的上界从恒安全的 src_cap 缩成上一帧 need——
                                 // 若解码输出尺寸变化（未来/其它源）会拿到过小的 slice（cdylib 报错
                                 // 断代）。保持 len=src_cap，need 只用于本帧 to_vec 切片。
-                                Ok(Some(FrameItem::Soft(SoftFrame {
-                                    pts,
-                                    w,
-                                    h,
-                                    bgra: buf[..need].to_vec(),
-                                })))
+                                // P1-23：need>buf.len()（几何中途突增）时经守卫安全降级、按解码
+                                // 失败断代，不再 `buf[..need]` 无界切片 panic 杀 worker。
+                                match take_soft_frame_bytes(&mut buf, need) {
+                                    Some(bgra) => Ok(Some(FrameItem::Soft(SoftFrame {
+                                        pts,
+                                        w,
+                                        h,
+                                        bgra,
+                                    }))),
+                                    None => Err(anyhow::anyhow!(
+                                        "输出几何突增、缓冲过小（need={need} > {len}），本帧跳过",
+                                        len = buf.len()
+                                    )),
+                                }
                             }
                             Ok(None) => Ok(None),
                             Err(e) => Err(e),
@@ -971,12 +1014,15 @@ impl super::VideoViewer {
                         if hgen.load(Ordering::SeqCst) == cmd.generation =>
                     {
                         let need = (w as usize) * (h as usize) * 4;
-                        let _ = cmd.tx.send(Ok(HoverFrame {
-                            pts,
-                            w,
-                            h,
-                            bgra: buf[..need].to_vec(),
-                        }));
+                        // P1-23：need>buf.len() 时守卫安全降级（不发送，按无可用帧丢弃）
+                        if let Some(bgra) = take_soft_frame_bytes(&mut buf, need) {
+                            let _ = cmd.tx.send(Ok(HoverFrame {
+                                pts,
+                                w,
+                                h,
+                                bgra,
+                            }));
+                        }
                     }
                     Ok(_) | Err(_) => {} // EOF/失败/中途换代：无可用帧，按失败丢弃
                 }
@@ -991,13 +1037,20 @@ impl super::VideoViewer {
                 match reader.next_frame_bgra_into(&mut buf[..]) {
                     Ok(Some((pts, w, h))) if pts >= cmd.target => {
                         let need = (w as usize) * (h as usize) * 4;
-                        let _ = cmd.tx.send(Ok(HoverFrame {
-                            pts,
-                            w,
-                            h,
-                            bgra: buf[..need].to_vec(),
-                        }));
-                        break;
+                        // P1-23：need>buf.len()（几何中途突增）时守卫安全降级——跳过本帧继续解，
+                        // 下帧复用扩容后的缓冲；不发送，不再 `buf[..need]` 无界切片 panic。
+                        match take_soft_frame_bytes(&mut buf, need) {
+                            Some(bgra) => {
+                                let _ = cmd.tx.send(Ok(HoverFrame {
+                                    pts,
+                                    w,
+                                    h,
+                                    bgra,
+                                }));
+                                break;
+                            }
+                            None => {} // 几何突增：跳过本帧，继续解（缓冲已按新几何扩容）
+                        }
                     }
                     Ok(Some(_)) => {} // 预滚帧（pts<落点）：继续解下一帧
                     Ok(None) | Err(_) => break, // EOF / 解码错误：无可用帧，按失败丢弃
@@ -1066,7 +1119,19 @@ impl super::VideoViewer {
         }
         let (tx, rx) = std::sync::mpsc::channel::<AudioCmd>();
         let gen_arc = self.audio_gen.clone();
-        std::thread::spawn(move || Self::audio_worker(rx, gen_arc));
+        std::thread::spawn(move || {
+            // P1-23：音频 worker 顶层兜底（同视频/hover worker，防 panic 静默死）
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    Self::audio_worker(rx, gen_arc)
+                }))
+            {
+                eprintln!(
+                    "[video] 音频 worker panic（已兜底上报，线程退出）: {}",
+                    panic_msg(&payload)
+                );
+            }
+        });
         self.audio_cmd = Some(tx);
     }
 

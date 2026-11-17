@@ -42,13 +42,13 @@ pub fn preview_element(tab: &EditorTab) -> gpui::AnyElement {
     }
 }
 
-/// 是否开启本覆盖层滚轮的诊断探针（`GPUI_EDITOR_WHEEL=1`，进程内缓存一次）：与 PDF
-/// 侧 `[VIEW-WHEEL]` 探针（`GPUI_EDITOR_PDF_TIMING=1`）对位，两处日志确认 Ctrl+滚轮
+/// 是否开启本覆盖层滚轮的诊断探针（`VUICK_WHEEL=1`，进程内缓存一次）：与 PDF
+/// 侧 `[VIEW-WHEEL]` 探针（`VUICK_PDF_TIMING=1`）对位，两处日志确认 Ctrl+滚轮
 /// 的修饰键命中（ev_ctrl / win_ctrl）与事件是否到达查看器。
 fn wheel_probe() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var_os("GPUI_EDITOR_WHEEL").is_some_and(|v| v == "1" || v == "true")
+        std::env::var_os("VUICK_WHEEL").is_some_and(|v| v == "1" || v == "true")
     })
 }
 

@@ -20,8 +20,44 @@ use std::sync::Arc;
 use anyhow::{bail, Context as _, Result};
 use gpui::{Image, ImageFormat};
 
+use config::limits::{
+    EPUB_MAX_CHAPTER_BYTES, EPUB_MAX_CHAPTER_COUNT, EPUB_MAX_IMAGE_BYTES,
+    EPUB_MAX_IMAGE_COUNT, EPUB_MAX_IMAGE_TOTAL_BYTES, EPUB_MAX_MARKDOWN_BYTES,
+};
 use config::markdown::EPUB_IMG_SCHEME;
 use markdown::RowAlign;
+
+/// EPUB 解析的安全硬上限（依赖注入式，可测）：压缩炸弹 / 图片数 / 总量 DoS 护栏。
+/// 生产用 [`EpubLimits::default`]（对齐 `config::limits` 常量）；测试注入小值，
+/// 用 KB 级内存造微型恶意 epub 验证各闸（K124：构造期内所有分配都有独立硬上界）。
+#[derive(Clone, Copy, Debug)]
+pub struct EpubLimits {
+    /// 单 zip 条目解压输出上限（容器/OPF/章节/图片共用）。
+    pub max_entry_bytes: usize,
+    /// 单张图片解压字节上限。
+    pub max_image_bytes: usize,
+    /// 全书记住的最大图片张数。
+    pub max_image_count: usize,
+    /// 全部图片常驻内存总字节上限。
+    pub max_image_total_bytes: usize,
+    /// 整书拼接 Markdown 总字节上限。
+    pub max_markdown_bytes: usize,
+    /// spine 章节数上限。
+    pub max_chapter_count: usize,
+}
+
+impl Default for EpubLimits {
+    fn default() -> Self {
+        Self {
+            max_entry_bytes: EPUB_MAX_CHAPTER_BYTES,
+            max_image_bytes: EPUB_MAX_IMAGE_BYTES,
+            max_image_count: EPUB_MAX_IMAGE_COUNT,
+            max_image_total_bytes: EPUB_MAX_IMAGE_TOTAL_BYTES,
+            max_markdown_bytes: EPUB_MAX_MARKDOWN_BYTES,
+            max_chapter_count: EPUB_MAX_CHAPTER_COUNT,
+        }
+    }
+}
 
 /// 解析后的 EPUB 文档：元数据 + 按 spine 顺序的章节 Markdown 文本 + 内存图片。
 #[derive(Debug, Clone, Default)]
@@ -41,26 +77,42 @@ pub struct EpubDocument {
     pub notes: std::collections::BTreeMap<usize, String>,
 }
 
-/// 从 `.epub` 文件路径解析文档。
+/// 从 `.epub` 文件路径解析文档（用 [`EpubLimits::default`] 安全上限）。
 pub fn parse_epub_file(path: &Path) -> Result<EpubDocument> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("无法打开 EPUB 文件：{}", path.display()))?;
     parse_epub_reader(file)
 }
 
-/// 从任意 `Read + Seek` 读取器解析 EPUB（zip 需要 seek）。
+/// 从任意 `Read + Seek` 读取器解析 EPUB（zip 需要 seek），用默认安全上限。
 pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocument> {
+    parse_epub_reader_limited(reader, EpubLimits::default())
+}
+
+/// 带注入上限地解析（生产默认 [`EpubLimits::default`]；测试注入小值验证各闸）。
+/// 全部 DoS 面在此收敛：单条目 take 限长、图片数、图片总量、整书 markdown、章节数。
+fn parse_epub_reader_limited<R: Read + std::io::Seek>(
+    reader: R,
+    limits: EpubLimits,
+) -> Result<EpubDocument> {
     let mut archive = zip::ZipArchive::new(reader).context("无效的 EPUB（zip 容器读取失败）")?;
 
     // 1) 定位 OPF：读 META-INF/container.xml
-    let container_xml = read_zip_entry(&mut archive, "META-INF/container.xml")
+    let container_xml = read_zip_entry(&mut archive, "META-INF/container.xml", limits.max_entry_bytes)
         .context("EPUB 缺少 META-INF/container.xml")?;
     let opf_path = find_opf_path(&container_xml)?;
 
     // 2) 读取 OPF：解析 metadata + manifest + spine
-    let opf_xml = read_zip_entry(&mut archive, &opf_path)
+    let opf_xml = read_zip_entry(&mut archive, &opf_path, limits.max_entry_bytes)
         .with_context(|| format!("读取 OPF 失败：{opf_path}"))?;
     let (title, author, spine_hrefs) = parse_opf(&opf_xml, &opf_path)?;
+    if spine_hrefs.len() > limits.max_chapter_count {
+        bail!(
+            "EPUB 章节数超上限（{} > {}），拒绝解析",
+            spine_hrefs.len(),
+            limits.max_chapter_count
+        );
+    }
 
     // 3) 按 spine 顺序逐章读取 XHTML → 转 Markdown；图片保留在内存（不落盘）
     let mut markdown = String::new();
@@ -70,9 +122,10 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
     // 虚拟 src → 字段/条目的去重（同一 zip 内路径只解码一次进内存）
     let mut img_cache: HashMap<String, String> = HashMap::new();
     let mut img_counter = 0usize;
+    let mut img_total_bytes = 0usize;
     for href in &spine_hrefs {
         let entry_path = join_zip_path(&base_dir, href);
-        let chapter_html = read_zip_entry(&mut archive, &entry_path)
+        let chapter_html = read_zip_entry(&mut archive, &entry_path, limits.max_entry_bytes)
             .with_context(|| format!("读取章节失败：{entry_path}"))?;
         let chapter_dir = {
             let s = href.rsplit_once('/').map(|x| x.0).unwrap_or("").to_string();
@@ -89,14 +142,27 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
             if let Some(vsrc) = img_cache.get(src) {
                 return Some(vsrc.clone());
             }
+            if img_counter >= limits.max_image_count {
+                return None; // 图片数超限：不再收进内存（渲染以 alt 占位兜底）
+            }
             let full = join_zip_path(&chapter_dir, src);
-            let mut file = archive.by_name(&full).ok()?;
+            let file = archive.by_name(&full).ok()?;
             let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).ok()?;
+            // 单张图片解压限长（take 钳峰值，防压缩炸弹把单张解到几百 MiB 先分配）。
+            file.take(limits.max_image_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
             if bytes.is_empty() {
                 return None;
             }
+            if bytes.len() > limits.max_image_bytes {
+                return None; // 声明小实大（超 take 哨兵）：拒绝
+            }
+            if img_total_bytes.saturating_add(bytes.len()) > limits.max_image_total_bytes {
+                return None; // 图片总字节超限：拒绝后续图片（已有图片保留，渲染部分可见）
+            }
             img_counter += 1;
+            img_total_bytes += bytes.len();
             // 以文件真实签名推断格式（扩展名可能误导：如 00001.jpeg 实为 PNG）
             let format = image_format_for_bytes(&bytes)?;
             let ext = format_ext(format);
@@ -109,6 +175,12 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
         let chapter_md = xhtml_to_markdown(&chapter_html, &mut on_img, &mut notes);
         if chapter_md.trim().is_empty() {
             continue;
+        }
+        if markdown.len().saturating_add(chapter_md.len()) > limits.max_markdown_bytes {
+            bail!(
+                "EPUB 整书 Markdown 超上限（>{max} 字节），拒绝继续拼接",
+                max = limits.max_markdown_bytes
+            );
         }
         markdown.push_str(&chapter_md);
         markdown.push('\n');
@@ -168,16 +240,37 @@ fn format_ext(f: ImageFormat) -> String {
     }
 }
 
-/// 从 zip 读取单个条目为 UTF-8 字符串。
+/// 从 zip 读取单个条目为 UTF-8 字符串（带解压上限，防 zip 炸弹）。
+///
+/// 三防（K124：构造期内分配必须与文件界有独立硬上界）：
+/// 1. **读前声明预检**：`ZipFile::size()`（未压缩大小）超限 → 零分配快速 Err；
+/// 2. **读中 `take(max+1)` 限长**：把解压峰值钳到 ~max+1，即使声明小实大（压缩炸弹）
+///    也最多物化 max+1 字节即被打断——只读后复核会先全量物化几百 MiB 才 Err；
+/// 3. **读后实际长度复核**：超过 max 即 Err（超 take 哨兵说明声明与实解压不符）。
 fn read_zip_entry<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
+    max_bytes: usize,
 ) -> Result<String> {
-    let mut file = archive
+    let file = archive
         .by_name(name)
         .with_context(|| format!("zip 中不存在 {name}"))?;
+    if file.size() > max_bytes as u64 {
+        bail!(
+            "zip 条目 {name} 声明大小 {declared} 超上限 {max}",
+            declared = file.size(),
+            max = max_bytes
+        );
+    }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    file.take(max_bytes as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > max_bytes {
+        bail!(
+            "zip 条目 {name} 解压后大小 {actual} 超上限 {max}",
+            actual = buf.len(),
+            max = max_bytes
+        );
+    }
     // 去除 UTF-8 BOM
     let bytes = buf.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&buf);
     let text = String::from_utf8_lossy(bytes);
@@ -901,5 +994,304 @@ mod tests {
         assert!(!s.contains("<!DOCTYPE"), "DOCTYPE 应整体移除：{s:?}");
         assert!(s.starts_with("<html>"), "内部子集后的 <html> 应保留：{s:?}");
         assert!(s.contains("正文"), "声明前后的内容都应保留：{s:?}");
+    }
+
+    // ===== 解析安全上限（注入式小值，KB 级内存下验证各 DoS 闸）=====
+    mod limits {
+        use super::*;
+        use std::io::{Seek, Write};
+        use zip::write::SimpleFileOptions;
+
+        /// 造一个最小合法 EPUB（container.xml + content.opf + 章节 + 可选图片），
+        /// 返回可 Seek 的内存 zip 字节。`chapter` 为章节 XHTML 正文；
+        /// `images` 为 `(zip 内路径, 字节)` 列表，正文引用它们（每张 `<img src=...>`）。
+        fn make_epub(
+            chapter: &str,
+            images: &[(&str, &[u8])],
+        ) -> std::io::Cursor<Vec<u8>> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut buf);
+                let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+                let add = |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
+                    w.start_file(name, opts).unwrap();
+                    w.write_all(data).unwrap();
+                };
+                add(
+                    &mut w,
+                    "META-INF/container.xml",
+                    br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+                );
+                let mut manifest = String::from(
+                    r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">测试书</dc:title></metadata>
+  <manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>"#,
+                );
+                for (i, (img_path, _)) in images.iter().enumerate() {
+                    manifest.push_str(&format!(
+                        r#"<item id="img{i}" href="{img_path}" media-type="image/png"/>"#
+                    ));
+                }
+                manifest.push_str("</manifest><spine><itemref idref=\"ch1\"/></spine></package>");
+                add(&mut w, "OEBPS/content.opf", manifest.as_bytes());
+                add(&mut w, "OEBPS/ch1.xhtml", chapter.as_bytes());
+                for (img_path, data) in images {
+                    add(&mut w, &format!("OEBPS/{img_path}"), data);
+                }
+                w.finish().unwrap();
+            }
+            buf.set_position(0);
+            buf
+        }
+
+        /// 与 [`make_epub`] 同构造、但章节用 **Deflated 压缩**（高重复字节 → 压缩后极小）：
+        /// 配合 [`patch_zip_uncompressed_size`] 造「声明小实大」zip bomb 测试夹具。
+        fn make_epub_deflated(
+            chapter: &str,
+            images: &[(&str, &[u8])],
+        ) -> std::io::Cursor<Vec<u8>> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut buf);
+                let opts =
+                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+                let add =
+                    |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
+                        w.start_file(name, opts).unwrap();
+                        w.write_all(data).unwrap();
+                    };
+                add(
+                    &mut w,
+                    "META-INF/container.xml",
+                    br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+                );
+                let mut manifest = String::from(
+                    r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">测试书</dc:title></metadata>
+  <manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>"#,
+                );
+                for (i, (img_path, _)) in images.iter().enumerate() {
+                    manifest.push_str(&format!(
+                        r#"<item id="img{i}" href="{img_path}" media-type="image/png"/>"#
+                    ));
+                }
+                manifest.push_str("</manifest><spine><itemref idref=\"ch1\"/></spine></package>");
+                add(&mut w, "OEBPS/content.opf", manifest.as_bytes());
+                add(&mut w, "OEBPS/ch1.xhtml", chapter.as_bytes());
+                for (img_path, data) in images {
+                    add(&mut w, &format!("OEBPS/{img_path}"), data);
+                }
+                w.finish().unwrap();
+            }
+            buf.set_position(0);
+            buf
+        }
+
+        /// 二进制把 zip 里某条目的 `uncompressed_size`（本地头 + 中央目录两处 4 字节）
+        /// 改成 `fake`——制造「声明小、实解压大」的压缩炸弹条目。zip 格式：
+        /// - 本地文件头：sig(4)+ver(2)+flag(2)+method(2)+time(2)+date(2)+crc(4)+
+        ///   compressed(4)+**uncompressed(4，偏移 18..22)**+name_len(2)+extra_len(2)+name
+        /// - 中央目录头：sig(4)+made(2)+ver(2)+flag(2)+method(2)+time(2)+date(2)+crc(4)+
+        ///   compressed(4)+**uncompressed(4，偏移 24..28)**+name_len(2)+extra_len(2)+comment_len(2)
+        fn patch_zip_uncompressed_size(zip: &mut [u8], name: &str, fake: u32) {
+            let fake_le = fake.to_le_bytes();
+            // 本地文件头（PK\x03\x04）：uncompressed 在偏移 18。
+            let mut i = 0usize;
+            while i + 30 <= zip.len() {
+                if zip[i..i + 4] == [0x50, 0x4b, 0x03, 0x04] {
+                    let name_len =
+                        u16::from_le_bytes([zip[i + 26], zip[i + 27]]) as usize;
+                    let extra_len =
+                        u16::from_le_bytes([zip[i + 28], zip[i + 29]]) as usize;
+                    if i + 30 + name_len <= zip.len()
+                        && &zip[i + 30..i + 30 + name_len] == name.as_bytes()
+                    {
+                        zip[i + 18..i + 22].copy_from_slice(&fake_le);
+                    }
+                    i += 30 + name_len + extra_len;
+                } else {
+                    i += 1;
+                }
+            }
+            // 中央目录头（PK\x01\x02）：uncompressed 在偏移 24。
+            let mut i = 0usize;
+            while i + 46 <= zip.len() {
+                if zip[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] {
+                    let name_len =
+                        u16::from_le_bytes([zip[i + 28], zip[i + 29]]) as usize;
+                    let extra_len =
+                        u16::from_le_bytes([zip[i + 30], zip[i + 31]]) as usize;
+                    let comment_len =
+                        u16::from_le_bytes([zip[i + 32], zip[i + 33]]) as usize;
+                    if i + 46 + name_len <= zip.len()
+                        && &zip[i + 46..i + 46 + name_len] == name.as_bytes()
+                    {
+                        zip[i + 24..i + 28].copy_from_slice(&fake_le);
+                    }
+                    i += 46 + name_len + extra_len + comment_len;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        /// 章节声明大小 5B、实际内容 700B（压缩炸弹特征：声明小实大）。
+        /// `read_zip_entry` 的「读中 take 限长」必须把解压峰值钳到 ~max+1 快速 Err，
+        /// 而非先物化 700B 再复核（此处 max=20，700B 超 take 哨兵）。
+        ///
+        /// ⚠️ 真炸弹用 `Deflated` 高压缩比写 700B 高重复字节，再手工把中央目录 +
+        /// 本地头的 `uncompressed_size` patch 成 5——这样 `file.size()`（声明）过预检、
+        /// 解压实得 700B 才触 take 哨兵。旧实现误用 `Stored`（声明==实际 30B）导致
+        /// 只走声明预检、从未命中 take/读后复核路径（K153 假绿，评审 NIT#1）。
+        #[test]
+        fn entry_declared_small_actual_large_peaks_bounded() {
+            // Deflated 压缩大章节（"A"×700 高重复 → 压缩后 ~15B），patch 声明为 5。
+            let chapter = "A".repeat(700);
+            let mut zip = make_epub_deflated(&chapter, &[]).into_inner();
+            // 声明小（5）≠ 实际 700，且小于 max=100。
+            patch_zip_uncompressed_size(&mut zip, "OEBPS/ch1.xhtml", 5);
+            let mut limits = EpubLimits::default();
+            limits.max_entry_bytes = 100; // 声明(5) ≤ 100 过预检；实解压 700 > 100 触发 take
+            let res = parse_epub_reader_limited(std::io::Cursor::new(zip.clone()), limits);
+            assert!(
+                res.is_err(),
+                "声明小实大（zip bomb）应被 take 限长/读后复核拒绝"
+            );
+            // 对照：同一炸弹、上限放宽到 1000（>实解压 700）→ 不再拒绝（证明上面的
+            // Err 确因 take/上限触发，而非解析器/CRC 等其它错误——K153 判别力）。
+            let mut wide = EpubLimits::default();
+            wide.max_entry_bytes = 1000;
+            let wide_res = parse_epub_reader_limited(std::io::Cursor::new(zip), wide);
+            assert!(
+                wide_res.is_ok(),
+                "上限放开后同一炸弹应解析成功（空文档），证明拒绝确因 take 限长触发"
+            );
+        }
+
+        /// 单张图片解压字节上限：恶意大图拒绝，不进入内存。
+        #[test]
+        fn image_exceeds_single_max_rejected() {
+            // 合法 PNG 头 + 大量填充（真实图片内容在此不重要——read 先到 max+1 即哨兵断）。
+            let chapter = "<html><body><img src=\"images/big.png\"/></body></html>";
+            let png = {
+                let mut v = vec![0u8; 300];
+                v[0..8].copy_from_slice(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']);
+                v
+            };
+            let zip = make_epub(chapter, &[("images/big.png", &png)]);
+            let mut limits = EpubLimits::default();
+            limits.max_image_bytes = 64; // 300B 图 > 64
+            let res = parse_epub_reader_limited(zip, limits);
+            // 图片超限：on_img 返回 None → 章内有占位而非图片 src；整书仍可解析。
+            let doc = res.expect("图片超限应降级（占位）而非整书失败");
+            assert!(
+                doc.images.is_empty(),
+                "超限图片不得进内存图片表"
+            );
+            assert!(
+                doc.markdown.contains("[图片"),
+                "超限图片应降级为 alt 占位，实际：{markdown}",
+                markdown = doc.markdown
+            );
+        }
+
+        /// 图片**张数**上限：超过 N 张后后续图片不进内存。
+        #[test]
+        fn image_count_cap_stops_collecting() {
+            let mut chapter = String::from("<html><body>");
+            for i in 0..3 {
+                chapter.push_str(&format!(r#"<img src="images/p{i}.png"/>"#));
+            }
+            chapter.push_str("</body></html>");
+            let png = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 0];
+            let zip = make_epub(&chapter, &[
+                ("images/p0.png", &png),
+                ("images/p1.png", &png),
+                ("images/p2.png", &png),
+            ]);
+            let mut limits = EpubLimits::default();
+            limits.max_image_count = 2; // 只收前 2 张
+            limits.max_image_bytes = 1 << 20;
+            let doc = parse_epub_reader_limited(zip, limits).expect("解析应成功");
+            assert!(
+                doc.images.len() <= 2,
+                "图片张数超限后不得再收：{}",
+                doc.images.len()
+            );
+        }
+
+        /// 全图**总字节**上限：累计超限后不再收后续图片。
+        #[test]
+        fn image_total_bytes_cap_stops_collecting() {
+            let mut chapter = String::from("<html><body>");
+            for i in 0..3 {
+                chapter.push_str(&format!(r#"<img src="images/p{i}.png"/>"#));
+            }
+            chapter.push_str("</body></html>");
+            let png8 = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+            // 每张 8B（真实图片数据任意，read 到点位即融）——总量闸只需字节和。
+            let zip = make_epub(&chapter, &[
+                ("images/p0.png", &png8),
+                ("images/p1.png", &png8),
+                ("images/p2.png", &png8),
+            ]);
+            let mut limits = EpubLimits::default();
+            limits.max_image_bytes = 1 << 20;
+            limits.max_image_total_bytes = 16; // 3×8=24 > 16 → 收 2 张后第 3 张拒
+            let doc = parse_epub_reader_limited(zip, limits).expect("解析应成功");
+            assert!(
+                doc.images.len() <= 2,
+                "总量超限后不得再收：{}",
+                doc.images.len()
+            );
+        }
+
+        /// spine **章节数**上限：超过 max 章直接整书 Err。
+        #[test]
+        fn chapter_count_cap_rejects_huge_spine() {
+            // 造 3 章 epub（同一内容多份 manifest/spine 条目）。
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut buf);
+                let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+                w.start_file("META-INF/container.xml", opts).unwrap();
+                w.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+                let manifest = r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title></metadata><manifest><item id="c0" href="c0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
+                w.start_file("OEBPS/content.opf", opts).unwrap();
+                w.write_all(manifest.as_bytes()).unwrap();
+                for i in 0..3 {
+                    w.start_file(&format!("OEBPS/c{i}.xhtml"), opts).unwrap();
+                    w.write_all(b"<html><body><p>x</p></body></html>").unwrap();
+                }
+                w.finish().unwrap();
+            }
+            buf.set_position(0);
+            let mut limits = EpubLimits::default();
+            limits.max_chapter_count = 2; // spine 3 章 > 2
+            let res = parse_epub_reader_limited(buf, limits);
+            assert!(res.is_err(), "章节数超限应整书拒绝");
+        }
+
+        /// 整书 Markdown 总量上限：拼接超限 → 显式 Err。
+        #[test]
+        fn markdown_total_cap_rejects_with_error() {
+            let chapter = "<html><body><p>这是正文。</p></body></html>";
+            let zip = make_epub(chapter, &[]);
+            let mut limits = EpubLimits::default();
+            limits.max_markdown_bytes = 2; // 章正文远大于 2B
+            let res = parse_epub_reader_limited(zip, limits);
+            assert!(
+                res.is_err(),
+                "整书 markdown 超限应显式 Err"
+            );
+        }
     }
 }

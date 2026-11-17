@@ -117,6 +117,8 @@ fn collect_corpus() -> Vec<(Scenario, String, Vec<u8>)> {
         }
         for (name, bytes) in files {
             let kimg_ok = kimg_decode(scen, &bytes).is_some();
+            // 恒真死变量（dormancy 休眠保留，K24）：turbo 侧探测已移除，`!(kimg_ok && turbo_ok)`
+            // 等效 `!kimg_ok`；保留占位避免改动门控语义，仅日志里仍显式输出两个字段。
             let turbo_ok = true;
             if !(kimg_ok && turbo_ok) {
                 println!(

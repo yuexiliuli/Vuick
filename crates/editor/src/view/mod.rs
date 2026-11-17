@@ -27,6 +27,11 @@ mod layout;
 mod rows;
 mod interaction;
 mod editing;
+// 模块级 allow（替代已删的 crate 级 `#![allow(dead_code)]`）：`find_goto.rs` 内唯一
+// 真死符号 = `test_find_tip_state`（pub(crate)，lib 非测试构建无消费点，仅
+// `editor::tests::find` 消费）。该文件是并行评审 agent 在途文件，不逐项改 → dormancy
+// 保留（K24），允许项收敛到此模块待文件落定后按需细化。
+#[allow(dead_code)]
 mod find_goto;
 
 pub(crate) use find_goto::{FindBtn, FindTipState};

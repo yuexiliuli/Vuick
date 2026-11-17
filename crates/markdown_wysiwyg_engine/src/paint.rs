@@ -276,9 +276,39 @@ pub fn paint_image_fallback(theme: &WyTheme, bounds: Bounds<Pixels>, window: &mu
     });
 }
 
+/// 行内图「加载中/失败」的占位框（**窗口坐标**）：把行内图显示盒 `b`（元素局部）平移到
+/// 窗口坐标、尺寸不变（与独立图 [`paint_image_fallback`] 同视觉；P1-9 修复前失败静默
+/// 不画占位）。
+fn inline_image_placeholder_bounds(
+    b: Bounds<Pixels>,
+    origin: Point<Pixels>,
+) -> Bounds<Pixels> {
+    Bounds::new(point(origin.x + b.left(), origin.y + b.top()), b.size)
+}
+
+/// 图片 `image_sizes` 状态 → 是否**跳过**重新加载（直接画占位、不碰 cache）。
+///
+/// P1-9 修复前：`Some(None)`（一次加载已失败）被短路 → 失败「一次性、永不复测」。
+/// 修复后：**任何状态都不跳过**——失败标记只用于布局占位高（`image_row_height` 走
+/// 占位分支），paint 每帧都会重新走 `AnyImageCache::load`（成功图命中缓存重画、
+/// 失败图重试）。
+///
+/// **现状修正（2026-11-16 评审 K173 口径）**：「每帧重试」当下**不可达**——`load`
+/// 的失败结果被 gpui `CachedLoad`（vendor asset_cache.rs「只完成一次」的状态机）
+/// **永久缓存**，且 wysiwyg 侧无 `cache.remove`/`clear` 失效路径 → 失败后每帧 `load`
+/// 均同步返回缓存 Err、从不真正重取。本函数保留为将来「节流/重试」的策略集中点
+/// （要节流时在此返回 true 并画占位；失效路径打开后此处即成恢复探测开关）。
+fn image_should_skip_reload(_state: Option<Option<(f32, f32)>>) -> bool {
+    false
+}
+
 /// 画图片行：经 `AnyImageCache` 异步加载已就绪的 `RenderImage` 后画出；
 /// 加载中/失败画占位框。加载成功即把真实宽高比尺寸写回 `rd`（`images_gen` 自增 →
 /// 下帧重建帧以真实行高布局）。
+///
+/// 失败路径现状（K173 口径）：`CachedLoad` 永久缓存 Err（见 [`image_should_skip_reload`]
+/// 文档），失败后每帧 `load` 同步返回缓存 Err，直接画占位、不真正重取；成功图每帧
+/// `load` 命中缓存重画，开销可忽略。
 #[allow(clippy::too_many_arguments)]
 pub fn paint_image_row(
     rd: &RefCell<WyRenderModel>,
@@ -296,7 +326,7 @@ pub fn paint_image_row(
     let top0 = f32::from(origin.y) + f32::from(row.top);
     let bounds = Bounds::new(point(px(x0), px(top0)), size(px(img.w), px(img.h)));
     let state = rd.borrow().image_sizes.borrow().get(img.src.as_ref()).copied();
-    if matches!(state, Some(None)) {
+    if image_should_skip_reload(state) {
         paint_image_fallback(theme, bounds, window);
     } else {
         let loaded: Option<std::sync::Arc<gpui::RenderImage>> = {
@@ -326,6 +356,13 @@ pub fn paint_image_row(
                 if iw > 0. && ih > 0. {
                     let w = img.w.max(1.);
                     let h = (w * ih / iw).max(1.);
+                    // 仅在「从未写大小」时回写（`Some(None)` 失败标记/`Some(Some(..))`
+                    // 已知尺寸均跳过，防每帧重复写 `images_gen` 自增）。
+                    // ⚠️ 潜伏隐患留档：当且仅当未来失效路径打开、先前失败（`Some(None)`）
+                    // 的图恢复加载成功时，此处 `state.is_none()` 为 false → 不回写真实
+                    // 尺寸 → 行高滞留占位高/旧失败高（`gently` 下无自愈）。当前失败被
+                    // `CachedLoad` 永久缓存、不会恢复成功（见 [`image_should_skip_reload`]
+                    // 文档），故不实现恢复逻辑（K174 口径：实现前须先开失效路径 + 红测）。
                     if state.is_none() {
                         set_image_size(rd, host.doc(), img.src.clone(), Some((w, h)));
                     }
@@ -847,6 +884,13 @@ pub fn paint_inline_images(
                 let b = Bounds::new(point(px(x2), px(y2)), size(px(w), px(h)));
                 let _ = window.paint_image(b, b, Corners::all(px(3.)), data, 0, false);
             }
+        } else {
+            // 行内图失败/未就绪也画占位框（P1-9：修复前静默不画，用户看不到行内图位置）。
+            paint_image_fallback(
+                theme,
+                inline_image_placeholder_bounds(b, origin),
+                window,
+            );
         }
         let hovered_or_selected = {
             let h = host.hover_inline_image();
@@ -1150,6 +1194,21 @@ pub fn paint_selection(
     }
 }
 
+/// 表格选区高亮矩形的 x（**元素局部**，未含 `origin.x`）：内容左缘 = 帧内衬 `padding`
+/// + 行 `x_off`（引号内表格缩进）+ 单元格列起点 + 格内文本缩进 + 选区字形偏移 − 水平
+/// 滚动偏移。与 `paint_table_row`/`hit.rs` 的表格内容左缘口径一致——修复前缺 `x_off`，
+/// 引号内表格选区整体左偏 15px 且盖引号竖条（P1-11）。
+fn table_selection_hl_x(
+    padding: f32,
+    x_off: f32,
+    cell_x0: f32,
+    text_x: f32,
+    p0: f32,
+    scroll: f32,
+) -> f32 {
+    padding + x_off + cell_x0 + text_x + p0 - scroll
+}
+
 /// 表格行选区高亮：逐可见行 × 逐格与选区求交 → 格内字形几何背景。
 #[allow(clippy::too_many_arguments)]
 fn paint_table_selection_hl(
@@ -1170,10 +1229,10 @@ fn paint_table_selection_hl(
         return;
     }
     let scroll = table_hscroll_clamped(rd, host, f, r);
-    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2. - f32::from(r.x_off)).max(1.);
     let grid_h = f32::from(table_block_height(theme, t.rows_texts.len()));
     let content_rect = Bounds::new(
-        point(origin.x + f.padding, origin.y + r.top),
+        point(origin.x + f.padding + r.x_off, origin.y + r.top),
         size(px(viewport), px(grid_h)),
     );
     let text_lh = f32::from(theme.para_line());
@@ -1200,11 +1259,14 @@ fn paint_table_selection_hl(
                     let p0 = cell.line.x_for_index(d0);
                     let p1 = cell.line.x_for_index(d1);
                     let x = f32::from(origin.x)
-                        + f32::from(f.padding)
-                        + table_cell_x0(&t.widths, cell_ix)
-                        + cell.text_x
-                        + f32::from(p0)
-                        - scroll;
+                        + table_selection_hl_x(
+                            f32::from(f.padding),
+                            f32::from(r.x_off),
+                            table_cell_x0(&t.widths, cell_ix),
+                            cell.text_x,
+                            f32::from(p0),
+                            scroll,
+                        );
                     let w = (f32::from(p1) - f32::from(p0)).max(2.);
                     window.paint_quad(gpui::PaintQuad {
                         bounds: Bounds::new(
@@ -1434,4 +1496,56 @@ pub fn paint_search_highlight(
         ui::content_colors::WY_SEARCH_HIT_HL_LIGHT
     };
     paint_selection(rd, host, origin, theme, f, &range, hl, window, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-9 状态机红测：`image_should_skip_reload` 对**任何**状态（含失败标记 `Some(None)`）
+    /// 都必须返回 false——失败不再被 paint 短路跳过（每帧仍会走 `load`、画占位可重试）。
+    /// 修复前短路判断是 `matches!(state, Some(None))`（失败恒跳过、永不复测）。
+    /// 注：因 `CachedLoad` 永久缓存失败结果（见 `image_should_skip_reload` 文档），当前
+    /// 每帧 `load` 实际同步返回缓存 Err 不真正重取；本红测只锁「paint 不短路跳过」这层。
+    #[test]
+    fn image_failed_state_never_skips_reload() {
+        let cases: [Option<Option<(f32, f32)>>; 3] = [
+            None,                     // 未知（未试 / 失败未写标记）
+            Some(None),               // 失败标记（P1-9 关键：不得被短路）
+            Some(Some((200., 150.))), // 已成功
+        ];
+        for s in cases {
+            assert!(
+                !image_should_skip_reload(s),
+                "状态 {s:?} 不应跳过重新加载（失败可重试）"
+            );
+        }
+    }
+
+    /// P1-9 行内图占位几何：占位框 = 行内图显示盒 `b` 平移到窗口坐标、尺寸不变
+    /// （与独立图 `paint_image_fallback` 同视觉，锁真实对位量）。
+    #[test]
+    fn inline_image_placeholder_bounds_aligns_to_display_box() {
+        let origin = point(px(10.), px(24.));
+        let b = Bounds::new(point(px(3.), px(5.)), size(px(60.), px(18.)));
+        let ph = inline_image_placeholder_bounds(b, origin);
+        assert_eq!(ph.left(), origin.x + b.left());
+        assert_eq!(ph.top(), origin.y + b.top());
+        assert_eq!(ph.size, b.size);
+    }
+
+    /// P1-11 几何：表格选区高亮矩形 x 必须纳入行 `x_off`（引号内表格缩进）——期望由
+    /// `paint_table_row` 的内容左缘口径推导（padding + x_off + 单元格 + 文本 + 字形 − 滚动）。
+    #[test]
+    fn table_selection_hl_x_includes_row_x_off() {
+        let padding = 12.0f32;
+        let x_off = 15.0f32;
+        let cell_x0 = 3.0f32;
+        let text_x = 2.0f32;
+        let p0 = 5.0f32;
+        let scroll = 4.0f32;
+        let x = table_selection_hl_x(padding, x_off, cell_x0, text_x, p0, scroll);
+        assert_eq!(x, padding + x_off + cell_x0 + text_x + p0 - scroll);
+        assert!(x >= padding + x_off, "引号内表格选区左缘不能左偏盖竖条, 实得 {x}");
+    }
 }

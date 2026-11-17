@@ -303,8 +303,13 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         let is_active = !row.is_dir && self.active_file_path_matches(&row.path);
         let row_fg = if is_active { fg } else { muted };
         // P2-10：hover 状态跨帧记录 → 行背景淡入（与搜索行同款）。
-        let hover =
-            window.use_keyed_state(format!("sidebar-file-row-{key}-hover"), cx, |_, _| false);
+        // P2-① 唯一性：hover 键用稳定身份（`row.path`）——虚拟化滚动/目录展开折叠/过滤
+        // 后同一全局行号 `key` 会落到另一个文件，按下标键控会把上一个文件的 hover 错挂过来。
+        let hover = window.use_keyed_state(
+            format!("sidebar-file-row-{}-hover", row.path.display()),
+            cx,
+            |_, _| false,
+        );
         let hovered = *hover.read(cx);
         let view_id = window.current_view();
         let chevron = if row.is_dir {

@@ -12,6 +12,7 @@ use gpui::{Image, SharedString};
 use regex::Regex;
 
 use super::cells;
+use super::cells::is_backslash_escaped;
 use super::inline_style::blockquote_prefix;
 
 /// 样式段列表：`(字节区间, 样式类别)`（行内解析的通用产物）。
@@ -844,14 +845,33 @@ pub struct ImgRef<'a> {
     pub close_alt_rel: usize,
 }
 
-/// 从行首解析 `![alt](src)`：要求 `![` 后第一个 `](` 成对、`(` 后有 `)`、src 非空。
+/// 从行首解析 `![alt](src)`：要求 `![` 后第一个 **未被反斜杠转义** 的 `](` 成对、
+/// `(` 后有**未被转义**的 `)`、src 非空。
 /// 只做前缀匹配；整行 / `{width=N}` / 列表前缀等策略由各调用方决定。
+/// 返回的 alt/src 保持**源码原样**（含转义反斜杠，供字节精确的编辑映射消费；
+/// 显示/加载值另经 [`unescape_image_value`]）。
 pub fn parse_ref(line: &str) -> Option<ImgRef<'_>> {
     let rest = line.strip_prefix("![")?;
-    let close_alt = rest.find("](")?;
+    let b = rest.as_bytes();
+    // alt 结束（`](` 的 `]`）：第一个未转义 `]` 且紧跟 `(`。`\]` 是字面 `]`（保存侧
+    // `apply_*_image_edit` 对 alt 内 `]` 的转义做出，须跳过，否则 `![a\]b](c)` 被
+    // 首 `]` 误切 → P1-8 往返不自洽）。
+    let mut close_alt = None;
+    let mut k = 0;
+    while k + 1 < b.len() {
+        if b[k] == b']' && b[k + 1] == b'(' && !is_backslash_escaped(b, k) {
+            close_alt = Some(k);
+            break;
+        }
+        k += 1;
+    }
+    let close_alt = close_alt?;
     let alt = &rest[..close_alt];
     let after = &rest[close_alt + 2..];
-    let close_src = after.find(')')?;
+    // src 结束：第一个未被转义 `)`（`\)` 是字面 `)`，对应保存侧对 src 内 `(`/`)` 的
+    // `\(`/`\)` 转义；否则 `a(b)` 会被首个 `)` 截断成 `a(b` → P1-8）。
+    let ab = after.as_bytes();
+    let close_src = (0..ab.len()).find(|&m| ab[m] == b')' && !is_backslash_escaped(ab, m))?;
     let src = after[..close_src].trim();
     let tail = &after[close_src + 1..];
     (!src.is_empty()).then_some(ImgRef {
@@ -862,21 +882,52 @@ pub fn parse_ref(line: &str) -> Option<ImgRef<'_>> {
     })
 }
 
-/// 识别独立图片行 `![alt](src)`（可带尾部空白）。返回 (alt, src)。
+/// 反解图片 alt/src 里的**保存侧转义**（`\]`/`\(`/`\)`/`\\`）为字面值——与
+/// `apply_*_image_edit` 的转义对称，保证「保存 → 重解析」往返自洽（P1-8；图片
+/// 卡片预填、引擎按 src 加载、重复保存不再二次转义都消费字面值）。其余 `\x`
+/// 原样保留。
+pub fn unescape_image_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.peek() {
+                Some(&n @ ('\\' | ']' | '(' | ')')) => {
+                    out.push(n);
+                    it.next();
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 识别独立图片行 `![alt](src)`（可带尾部空白）。返回 (alt, src)：
+/// **alt 保持源码原样**（供 `DocRow` 图片题注的 1:1 byte_map 编辑映射；字节精确，
+/// 含转义反斜杠），**src 反解字面值**（供加载/显示/重复保存）。
 /// 前缀识别复用共享核心 [`parse_ref`]，这里叠加「整行」策略：
 /// `]` 后必须紧跟 `(`，且 `)` 后只能剩空白。
 pub fn parse_image_line(t: &str) -> Option<(String, String)> {
     let r = parse_ref(t)?;
-    // 历史语义：alt 由「第一个 `]`」界定且必须紧跟 `(`。`parse_ref` 取的是第一处
-    // `](`；仅当 `]` 出现在 `](` 之前时二者不同（如 `![a]b](c)`）→ 既有实现返回 None。
+    // 历史语义：alt 由「第一个（未转义的）`]`」界定且必须紧跟 `(`。`parse_ref` 取的是
+    // 第一处「未转义 `](`」；仅当有**未转义** `]` 出现在 `](` 之前时二者不同（如
+    // `![a]b](c)`）→ 既有实现返回 None。转义的 `\]` 是字面 `]`，不计作 stray（P1-8）。
     let close_pos = 2 + r.close_alt_rel; // `](` 的 `]` 在 `t` 中的字节偏移
-    if t.as_bytes()[..close_pos].contains(&b']') {
+    let tb = t.as_bytes();
+    let stray = (0..close_pos).any(|m| tb[m] == b']' && !is_backslash_escaped(tb, m));
+    if stray {
         return None;
     }
     if !r.tail.trim().is_empty() {
         return None;
     }
-    Some((r.alt.to_string(), r.src.to_string()))
+    Some((
+        r.alt.to_string(),
+        unescape_image_value(r.src),
+    ))
 }
 
 /// 引号区：从 `region`（首个元素是 `>` 开头行）收集连续 `>` 行成引号区，

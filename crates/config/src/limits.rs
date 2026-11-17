@@ -79,3 +79,24 @@ pub const CODE_PARSE_CACHE_CAP: usize = 512;
 /// 的性能路径）。上限防长期编辑会话里「互异公式源只增不减、不随编辑回收」把缓存撑成
 /// 内存无底洞。撞线即打一次 warn（见 content_sync::math_height_estimate）。
 pub const MATH_LINE_MAP_CAP: usize = 10_000;
+
+// ===== EPUB 解析安全上限（审查 epub#1 zip 炸弹 / 图片数 / 总量 DoS 面）=====
+
+/// EPUB `read_zip_entry_bytes` 单条目**解压输出**上限（含容器/OPF/章节/图片等全部 zip 条目）；
+/// 作用：压缩炸弹（zip bomb）从「解压无限内存」钳到 ~16MiB/条目。
+pub const EPUB_MAX_CHAPTER_BYTES: usize = 16 * 1024 * 1024;
+
+/// 单张图片**解压字节**上限（对齐 pdf COVER_SIZE_BUDGET 口径）：防单图超大分配。
+pub const EPUB_MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// 全书记住的最大图片**张数**上限（对齐 image 解码 MAX_GIF_FRAMES 同量级，512 ≈ 2×）。
+pub const EPUB_MAX_IMAGE_COUNT: usize = 512;
+
+/// 全部图片**常驻内存总字节**上限：图片张数×单张上限仍可到 16GiB，需总量再闸一道。
+pub const EPUB_MAX_IMAGE_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+
+/// 整书拼接后的 Markdown 文本**总字节**上限：spine 章节再小，章数×内容也能撑爆内存。
+pub const EPUB_MAX_MARKDOWN_BYTES: usize = 256 * 1024 * 1024;
+
+/// spine **章节数**上限：防「数千章节各读 16MiB」的分散型总量攻击。
+pub const EPUB_MAX_CHAPTER_COUNT: usize = 10_000;

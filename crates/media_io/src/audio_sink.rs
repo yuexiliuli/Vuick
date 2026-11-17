@@ -16,10 +16,14 @@ use anyhow::{Context as _, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, I24, U24};
 
-/// 环形缓冲上限（样本数）：约 2 秒 × 声道。**必须显著大于解码线程的回压阈值
-///（1s）**——否则队列一满 backpressure 还没触发，`push` 就先丢最旧样本 = 持续
-/// 丢音频（卡顿/碎裂声）。
-const QUEUE_MAX_SAMPLES: usize = 48_000 * 2 * 2;
+/// 按设备采样率推导的环形缓冲上限（样本数，F32 交错）：约 2 秒 × 2 声道。
+/// **必须显著大于解码线程的回压阈值（1s = `rate*2` 样本）**——否则队列一满
+/// backpressure 还没触发，`push` 就先丢最旧样本 = 持续丢音频（卡顿/碎裂声）。
+/// 固定 48k 基数常量在 96k/192k 设备率下违反该不变量（96k 恰等于回压、192k 小于
+/// 回压），故容量改为 open 期按真实 `sample_rate` 推导（Bug C）。可纯测。
+fn queue_capacity_for(rate: u32) -> usize {
+    (rate.max(1) as usize) * 2 * 2
+}
 
 /// 音频输出流句柄（可跨线程引用内部缓冲/计数）。
 #[derive(Clone)]
@@ -34,6 +38,8 @@ struct SinkInner {
     /// 已交给设备播放的**帧数**（= 样本数 / 声道）。
     played_frames: Arc<AtomicU64>,
     sample_rate: u32,
+    /// 环形缓冲上限（样本数）：open 期按真实设备采样率推导（≥2s 且 > 回压阈值 rate*2）。
+    queue_capacity: usize,
     /// 音量（0..=1 的 f32 位模式；静音=0）。回调线程无锁直读。
     volume: Arc<AtomicU32>,
     /// 回调累计次数。
@@ -66,6 +72,7 @@ impl AudioSink {
             .default_output_config()
             .context("读取输出配置失败")?;
         let sample_rate = supported.sample_rate();
+        let queue_capacity = queue_capacity_for(sample_rate);
         let mut config: cpal::StreamConfig = supported.into();
         config.channels = 2; // 与解码输出（立体声交错）一致；绝大多数设备支持 2ch
         // 显式给足设备缓冲（约 2048 帧 ≈ 40ms+）：默认值在某些 WASAPI 端点上极小，
@@ -104,6 +111,7 @@ impl AudioSink {
                 queue,
                 played_frames: played,
                 sample_rate,
+                queue_capacity,
                 volume,
                 cb_calls,
                 cb_underrun,
@@ -140,7 +148,12 @@ impl AudioSink {
     /// `dropped_samples` 计数队头丢弃量——**正常回压（worker 阻塞等队列下降）下恒 0**；
     /// 解码过快且不守回压时飙升（内容前跳 = 快进 + 硬切杂音，设备侧 underrun 数不到）。
     pub fn push(&self, samples: &[f32]) {
-        push_samples(&self.inner.queue, &self.inner.dropped_samples, samples);
+        push_samples(
+            &self.inner.queue,
+            &self.inner.dropped_samples,
+            samples,
+            self.inner.queue_capacity,
+        );
     }
 
     /// seek 时清空缓冲 + 播放位置归零。
@@ -187,10 +200,11 @@ fn push_samples(
     queue: &Arc<Mutex<VecDeque<f32>>>,
     dropped: &Arc<AtomicU64>,
     samples: &[f32],
+    cap: usize,
 ) {
     let mut q = queue.lock().unwrap();
-    if q.len() + samples.len() > QUEUE_MAX_SAMPLES {
-        let drop = q.len() + samples.len() - QUEUE_MAX_SAMPLES;
+    if q.len() + samples.len() > cap {
+        let drop = q.len() + samples.len() - cap;
         for _ in 0..drop {
             q.pop_front();
         }
@@ -352,22 +366,85 @@ mod tests {
     fn push_samples_drops_oldest_on_overflow_and_counts() {
         let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
         let dropped = Arc::new(AtomicU64::new(0));
+        // 按率推导容量（48k 设备率默认）：2s×2ch
+        let cap = queue_capacity_for(48_000);
 
         // 先填满上限（队头标记 7.0 为最旧样本）
-        let mut big = vec![1.0f32; QUEUE_MAX_SAMPLES];
+        let mut big = vec![1.0f32; cap];
         big[0] = 7.0;
-        push_samples(&queue, &dropped, &big);
-        assert_eq!(queue.lock().unwrap().len(), QUEUE_MAX_SAMPLES);
+        push_samples(&queue, &dropped, &big, cap);
+        assert_eq!(queue.lock().unwrap().len(), cap);
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
         assert_eq!(*queue.lock().unwrap().front().unwrap(), 7.0);
 
         // 再推 1 个 → 丢 1 个最旧（7.0 弹出）、队尾入 2.0
-        push_samples(&queue, &dropped, &[2.0]);
+        push_samples(&queue, &dropped, &[2.0], cap);
         let q = queue.lock().unwrap();
-        assert_eq!(q.len(), QUEUE_MAX_SAMPLES);
+        assert_eq!(q.len(), cap);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(*q.front().unwrap(), 1.0);
         assert_eq!(*q.back().unwrap(), 2.0);
+    }
+
+    /// 回归（红测转绿）：队列容量必须按设备采样率推导，恒满足「≥ 2 秒」且「> 解码线程
+    /// 回压阈值 `rate*2`（1s 交错样本）」——源注释（audio_sink.rs 19-21）自证这是设计
+    /// 不变量。旧固定 48k 基数常量在 96k/192k 设备率下违反该不变量（96k 容量恰 = 回压
+    /// 阈值 → worker 门 `queued_len() > bp` 永假 → 队头丢最旧 = 快进+硬切杂音；192k 容量
+    /// < 回压 → 回压永不可达、全量丢）。按率推导 `queue_capacity_for` 后恒满足。
+    #[test]
+    fn queue_capacity_invariant_across_device_rates() {
+        let rates = [48_000u32, 96_000, 192_000];
+        let mut ok = true;
+        let mut lines = Vec::new();
+        for &rate in &rates {
+            let cap = queue_capacity_for(rate);
+            // 2s × 2 声道交错样本 = 2 * rate * 2
+            let two_secs_samples = rate as usize * 2 * 2;
+            // 1s 交错样本（music::player.rs:1176 `backpressure = rate as usize * 2` 同款）
+            let backpressure = rate as usize * 2;
+            let secs = cap as f64 / (rate as f64 * 2.0);
+            let good = cap >= two_secs_samples && cap > backpressure;
+            ok &= good;
+            lines.push(format!(
+                "  rate={rate}: queue_capacity_for({rate})={cap} = {secs:.2}s 容量 | 不变量要求 ≥2s({two_secs_samples} 样本) 且 > 回压({backpressure}) | {}",
+                if good { "OK" } else { "违反不变量" }
+            ));
+        }
+        assert!(
+            ok,
+            "按设备率推导的容量须满足「≥2s 且 > rate*2 回压」不变量：\n{}",
+            lines.join("\n")
+        );
+    }
+
+    /// 回归（红测转绿，机理侧，96k）：按率推导容量（= 2×rate*2 = 384000）> 回压阈值
+    /// （= rate*2 = 192000）→ 积压 192k 时 worker 的 `queued_len() > backpressure` 门仍为
+    /// 假（不会在 <容量 处提前阻塞），容量未满 → `push_samples` **不**从队头丢最旧，全部
+    /// 保留（旧固定常量 96k 下容量恰 == 回压 → push 丢队头 = 内容前跳）。
+    #[test]
+    fn push_keeps_head_when_at_backpressure_at_96k() {
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let dropped = Arc::new(AtomicU64::new(0));
+        // 96k 设备率：回压阈值 = rate*2 = 192000；按率推导容量 = 384000 > 回压阈值
+        let bp_96k = 96_000usize * 2;
+        let cap = queue_capacity_for(96_000);
+        assert!(cap > bp_96k, "按率推导容量应大于回压阈值：cap={cap} bp={bp_96k}");
+
+        let mut fill = vec![1.0f32; bp_96k];
+        fill[0] = 7.0; // 队头标记：若被丢则是最旧样本
+        push_samples(&queue, &dropped, &fill, cap);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+        // worker 门 `queued_len() > backpressure` 此时为假（==192000，不 >），本不该丢；
+        // 容量(384k) > 当前积压(192k+1) → push 正常入队、队头最旧保留。
+        assert_eq!(queue.lock().unwrap().len(), bp_96k);
+        push_samples(&queue, &dropped, &[2.0], cap);
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "96k 下按率推导容量(> 回压阈值)应保证 worker `>bp` 门先于队头丢弃触发"
+        );
+        assert_eq!(*queue.lock().unwrap().front().unwrap(), 7.0);
     }
 
     /// 音量钳制 `[0,1]`（`set_volume` 内部语义；超界收敛、界内原值）。

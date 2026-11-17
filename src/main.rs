@@ -16,7 +16,7 @@ use ui::theme::{Theme, ThemeMode};
 use config::user::UserPrefs;
 
 fn main() {
-    // 启动首帧墙钟诊断（GPUI_EDITOR_STARTUP_DIAG=1 开启，默认零开销零行为）：锚定
+    // 启动首帧墙钟诊断（VUICK_STARTUP_DIAG=1 开启，默认零开销零行为）：锚定
     // 进程入口起点；后续 open_window 回调 / EditorApp::new 结束（restore 段）/ 首次
     // render 依次 mark，首次 render 时汇总打一行。轨 A 改动前基线。
     base::startup::boot();

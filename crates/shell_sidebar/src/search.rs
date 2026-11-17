@@ -594,6 +594,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         if let Some(s) = &self.model.borrow().folder_search
             && s.query == q
             && s.root.as_deref() == Some(root.as_path())
+            // P1-37：命中文件被编辑/落盘后指纹陈旧 → 旧行号/字节区间不可再信，
+            // 缓存键再命中即失效，下帧重扫新结果（stat 级成本，命中数受 CAP 约束）。
+            && !s.any_stale()
         {
             return Some(s.clone());
         }
@@ -700,6 +703,23 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         if !path.is_file() {
             self.model.borrow_mut().status =
                 SharedString::from(format!("命中文件已不存在：{}", path.display()));
+            self.model.borrow_mut().status_ok = false;
+            cx.notify();
+            return;
+        }
+        // 错误分类：扫描命中文件已被编辑/落盘 → 指纹陈旧 → 旧行号/字节区间不再可信
+        // （P1-37）。不跳到错位位置：提示 + notify（下帧渲染经 `folder_search_scan`
+        // 复用键新增的 `!any_stale()` 判定自动失效重扫新结果）。
+        let stale = self
+            .model
+            .borrow()
+            .folder_search
+            .as_ref()
+            .map(|s| s.any_stale())
+            .unwrap_or(false);
+        if stale {
+            self.model.borrow_mut().status =
+                SharedString::from("搜索结果已过期（部分文件已修改），正在重新搜索…");
             self.model.borrow_mut().status_ok = false;
             cx.notify();
             return;

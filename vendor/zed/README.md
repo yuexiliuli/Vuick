@@ -14,7 +14,7 @@
 
 ## 相对上游的改动（按 crate）
 
-凡源/构建/配置文件被改动者，文件头部均有 `[gpui-editor fork]` 显著标注（满足 Apache-2.0 §4(b)）。
+凡源/构建/配置文件被改动者，文件头部均有 `[vuick fork]` 显著标注（满足 Apache-2.0 §4(b)）。
 
 | crate | 改动文件 | 改动内容 |
 |---|---|---|
@@ -29,5 +29,5 @@
 ## 对本目录做改动时的纪律
 
 - 若从上游同步更新，请整目录对比 `git diff --no-index <checkout>/crates/<x> <vendor>/crates/<x>`，把改动合并进对应文件并在 README 本表登记。
-- 新增改动的文件，务必追加/保留头部 `[gpui-editor fork]` 标注。
+- 新增改动的文件，务必追加/保留头部 `[vuick fork]` 标注。
 - 许可证：保持 Apache-2.0；不得删除 `LICENSE-APACHE`（各 crate 内的 `LICENSE-APACHE` 是指针，指向本目录 `LICENSE-APACHE`）。

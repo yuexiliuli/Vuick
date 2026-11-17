@@ -36,3 +36,5 @@ include!("tests/p0_p1.rs");
 include!("tests/quote_blocks.rs");
 include!("tests/prewarm_band_double_borrow.rs");
 include!("tests/math_edit_enter_diag.rs");
+include!("tests/edit_red.rs");
+include!("tests/p1_7_8_shift_escape.rs");

@@ -3,7 +3,7 @@
 //!
 //! 打包格式（单个 `.json`）：
 //! ```json
-//! { "app": "gpui-editor", "export_version": 1,
+//! { "app": "vuick", "export_version": 1,
 //!   "prefs": { ...UserPrefs 全字段... },
 //!   "session": { "manifest": { "version":1, "active_tab":N, "tabs":[...] },
 //!                "slots": { "t0": "<正文>", ... } } }
@@ -22,7 +22,7 @@
 //! 启动仍保持）；会话写回当前 session 目录、**下一启动** [`restore_session_from`] 恢复
 //! （不立即重排当前窗口，避免打断未保存编辑）。部分可解析：prefs 有效但 session 损坏 →
 //! 配置照常应用 + toast 说明跳过；反向同理，不整体回滚。损坏/版本不符/非本应用文件 →
-//! toast「不是有效的 gpui-editor 设置文件」，零副作用零误应用。
+//! toast「不是有效的 vuick 设置文件」，零副作用零误应用。
 
 use super::*;
 use super::session::{collect_session_data};
@@ -56,7 +56,7 @@ enum SessionOutcome {
 }
 
 impl EditorApp {
-    /// 「导出设置…」（文件菜单）：系统保存对话框（默认名 `gpui-editor-设置-YYYYMMDD.json`、
+    /// 「导出设置…」（文件菜单）：系统保存对话框（默认名 `vuick-设置-YYYYMMDD.json`、
     /// `.json` 过滤）→ 从**当前交互态**生成导出包 → 原子写盘 → toast 结果。
     /// 测试构建不真弹原生对话框（同 `open_dialog` 姿势）；取消 → 静默不动作。
     pub(super) fn export_settings(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -65,7 +65,7 @@ impl EditorApp {
             let window = _window;
             let cx = _cx;
             let entity = cx.entity();
-            let default_name = format!("gpui-editor-设置-{}.json", local_yyyymmdd());
+            let default_name = format!("vuick-设置-{}.json", local_yyyymmdd());
             window
                 .spawn(cx, async move |cx| {
                     let Some(file) = rfd::AsyncFileDialog::new()
@@ -147,7 +147,7 @@ impl EditorApp {
     ) {
         let Some(bundle) = parsed else {
             // 非本应用 / 损坏 / 版本不符：toast，不应用任何东西（零副作用零误应用）。
-            self.settings_toast("不是有效的 gpui-editor 设置文件".to_string(), cx);
+            self.settings_toast("不是有效的 vuick 设置文件".to_string(), cx);
             return;
         };
         let mut ok_prefs = false;

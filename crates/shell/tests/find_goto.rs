@@ -3,7 +3,7 @@
 //! - `goto.rs`：编辑区内跳转行（Ctrl+G）。
 //! 两份断言内部与 lib 单测相应 `.rs` 逐字一致（P1 测试域化）；`Find/FindNext/FindPrev/
 //! GoToLine` 动作改经 `common::*` 重导出的 `shell::actions` 面访问；`common::init_test`
-//! 注入 `GPUI_EDITOR_TEST`。
+//! 注入 `VUICK_TEST`。
 
 mod common;
 
@@ -16,16 +16,16 @@ use common::*;
 
 use shell::actions::{Find, FindNext, FindPrev};
 
-/// 把 `GPUI_EDITOR_CONFIG` 指向空配置的临时文件，隔离真实 `%APPDATA%\gpui-editor\
+/// 把 `VUICK_CONFIG` 指向空配置的临时文件，隔离真实 `%APPDATA%\vuick\
 /// config.json` 泄漏（K8）；返回路径，测试收尾恢复并删除。
 fn find_config_isolate() -> std::path::PathBuf {
-    let cfg = std::env::temp_dir().join(format!("gpui-find-cfg-{}.json", std::process::id()));
+    let cfg = std::env::temp_dir().join(format!("vuick-find-cfg-{}.json", std::process::id()));
     std::fs::write(&cfg, "{}").unwrap();
-    unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+    unsafe { std::env::set_var("VUICK_CONFIG", &cfg) };
     cfg
 }
 fn find_config_restore(cfg: &std::path::Path) {
-    unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+    unsafe { std::env::remove_var("VUICK_CONFIG") };
     let _ = std::fs::remove_file(cfg);
 }
 
@@ -183,16 +183,16 @@ async fn find_non_text_tab_toasts_not_opens(cx: &mut TestAppContext) {
 
 use shell::actions::GoToLine;
 
-/// 把 `GPUI_EDITOR_CONFIG` 指向空配置的临时文件，隔离真实 `%APPDATA%\gpui-editor\
+/// 把 `VUICK_CONFIG` 指向空配置的临时文件，隔离真实 `%APPDATA%\vuick\
 /// config.json` 泄漏（K8）；返回路径，测试收尾恢复并删除。
 fn goto_config_isolate() -> std::path::PathBuf {
-    let cfg = std::env::temp_dir().join(format!("gpui-goto-cfg-{}.json", std::process::id()));
+    let cfg = std::env::temp_dir().join(format!("vuick-goto-cfg-{}.json", std::process::id()));
     std::fs::write(&cfg, "{}").unwrap();
-    unsafe { std::env::set_var("GPUI_EDITOR_CONFIG", &cfg) };
+    unsafe { std::env::set_var("VUICK_CONFIG", &cfg) };
     cfg
 }
 fn goto_config_restore(cfg: &std::path::Path) {
-    unsafe { std::env::remove_var("GPUI_EDITOR_CONFIG") };
+    unsafe { std::env::remove_var("VUICK_CONFIG") };
     let _ = std::fs::remove_file(cfg);
 }
 

@@ -1,4 +1,4 @@
-//! gpui-editor 的**应用外壳 crate**。
+//! vuick 的**应用外壳 crate**。
 //!
 //! 承载 `EditorApp` 主视图
 //! （自绘标题栏 + 菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览 + 状态栏）。
@@ -14,7 +14,7 @@
 //!   WYSIWYG wy-editor 三套键上下文）
 //!
 //! 每个窗口根视图为 `ui::root::Root`（自研，替代 gpui-component `Root`），由
-//! 二进制壳 `gpui-editor` 的 `main` 装配；本 crate 只提供视图与键位。
+//! 二进制壳 `vuick` 的 `main` 装配；本 crate 只提供视图与键位。
 //!
 //! 依赖关系：本 crate 依赖全部功能 crate（config/base/syntax/ui/editor/markdown/
 //! toc/pdf/image/video(feature)/epub），是**唯一「依赖所有人」的顶层**；二进制只挂在本 crate 之上。

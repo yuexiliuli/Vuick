@@ -10,7 +10,7 @@
         }
 
         let long_line = "f".repeat(500);
-        let dir = std::env::temp_dir().join("gpui-editor-hscroll-test.md");
+        let dir = std::env::temp_dir().join("vuick-hscroll-test.md");
         std::fs::write(&dir, format!("```rs\n{long_line}\n```\n")).unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
@@ -226,7 +226,7 @@
         // 真实大文档（存在才跑，锁定用户实测路径）：同几何补跑，标题行最右字右缘
         // 不贴宿主右缘。
         let big = std::path::Path::new(
-            r"D:\WorkSpace\1\rust\gpui\gpui-editor\target\大文档测试2.md",
+            r"D:\WorkSpace\1\rust\gpui\vuick\target\大文档测试2.md",
         );
         if big.exists() {
             let dst = std::env::temp_dir().join(format!(
@@ -686,7 +686,7 @@
         }
 
         // md 文件：应隐藏换行按钮
-        let md = std::env::temp_dir().join("gpui-editor-wrap-test.md");
+        let md = std::env::temp_dir().join("vuick-wrap-test.md");
         std::fs::write(&md, "# 标题\n正文\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
@@ -707,7 +707,7 @@
         let _ = std::fs::remove_file(&md);
 
         // 普通文本文件：应保留换行按钮
-        let txt = std::env::temp_dir().join("gpui-editor-wrap-test.txt");
+        let txt = std::env::temp_dir().join("vuick-wrap-test.txt");
         std::fs::write(&txt, "hello world\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(txt.to_str().unwrap(), window, cx));
@@ -733,7 +733,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let md = std::env::temp_dir().join("gpui-editor-wrap-toggle.md");
+        let md = std::env::temp_dir().join("vuick-wrap-toggle.md");
         std::fs::write(&md, "# 标题\n正文\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
@@ -2644,7 +2644,7 @@
     /// 大段插入 + OFF，逐段打点：① OFF 同步路径（op 重放 + 最终态物化 + 登记后台装配，
     /// 不再含整篇同步 `Doc::open`）；② 后台 `open_from_str` 完成（右栏 md_wy 追平）墙钟。
     /// 旧实现该大段切回同步 ≈2.3s（其中整篇 `set_source_text` 同步 Doc::open ~1.5s）。
-    /// 运行：`cargo test --bin gpui-editor app::tests::bench_b3_big_span_switch_async -- --ignored --nocapture`
+    /// 运行：`cargo test --bin vuick app::tests::bench_b3_big_span_switch_async -- --ignored --nocapture`
     #[gpui::test]
     #[ignore]
     async fn bench_b3_big_span_switch_async(cx: &mut TestAppContext) {
@@ -2769,7 +2769,7 @@
     /// 的分项实测——① `commit_live` 最终态物化（`text_shared` 冷一次，= A1 剩余下限
     ///  ~20ms）；② WyEditor 实体**级联 Drop**（= A2 已移出点击路径的 ~36ms），用它
     /// 还原「改动前」预估值 = 本测试的 OFF 耗时 + ②。运行：
-    /// `cargo test --bin gpui-editor app::tests::bench_wysiwyg_switch_fixed_overhead -- --ignored --nocapture`
+    /// `cargo test --bin vuick app::tests::bench_wysiwyg_switch_fixed_overhead -- --ignored --nocapture`
     #[gpui::test]
     #[ignore]
     async fn bench_wysiwyg_switch_fixed_overhead(cx: &mut TestAppContext) {

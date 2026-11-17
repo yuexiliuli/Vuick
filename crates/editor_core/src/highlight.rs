@@ -553,6 +553,12 @@ impl Highlighter {
         };
         let version = buffer.version();
         let line_count = buffer.line_count();
+        // 防御：pending 窗口可能在「Buffer 已被换成更小文档」后仍用陈旧 hi 重锚 → 重解析
+        // 会把缓存撑到超出当前行数的占位行（缓存宣称覆盖不存在的行）。与
+        // `highlight_window` 同款 clamp 到当前 buffer 行数（line_count ≥ 1，saturating 兜底）。
+        let last = line_count.saturating_sub(1);
+        let lo = lo.min(last);
+        let hi = hi.min(last);
         // 回跳 settle（上移出缓存）优先试快照半程续栈，命中则不用整段重解析。
         self.reparse_or_restore(buffer, lo, hi, lookback, version, line_count);
         self.covered(lo, hi)
@@ -1163,6 +1169,40 @@ mod tests {
         // txt（无语法）恒同步（填空==0ms）。
         let mut txt = Highlighter::new();
         assert!(txt.accept_deferred(0, 199, 16), "txt 无语法应同步");
+    }
+
+    /// P1 回归：`settle_pending` 未 clamp hi（highlight.rs:550-558）——大文档滚动登记
+    /// 的 pending 窗口在 Buffer 被换成小文档后仍按陈旧 hi 重锚，把缓存撑到远超当前
+    /// line_count 的占位行（base+lines 越出 buffer 行数）。修复后 clamp 到当前 buffer
+    /// 行数，缓存不再越界。
+    #[test]
+    fn settle_pending_clamps_stale_window_to_shrunk_buffer() {
+        let big = Buffer::new(
+            (0..2000)
+                .map(|i| format!("fn f_{i}() {{ /* c{i} */ }}\n"))
+                .collect::<String>(),
+        );
+        let mut hl = Highlighter::new();
+        hl.set_language(Some("rust"));
+        // 先给大文档建缓存（顶部 0..100），再登记一个缓存外大缺口的 pending。
+        let _ = hl.highlight_window(&big, 0, 100, 16).to_vec();
+        assert!(
+            !hl.accept_deferred(0, 1999, 16),
+            "缓存外大缺口应登记 pending（延后有界重锚）"
+        );
+        // Buffer 换成只有 4 行的小文档（行数远小于 pending 的 hi=1999）。
+        let small = Buffer::new("fn a() {}\nfn b() {}\nfn c() {}\n");
+        assert!(
+            hl.settle_pending(&small),
+            "settle 应补齐（clamp 到当前 buffer 行数后）"
+        );
+        assert!(
+            hl.base().saturating_add(hl.test_cache_len()) <= small.line_count(),
+            "settle 后缓存不得超出当前 buffer 行数（base={} len={} line_count={}）",
+            hl.base(),
+            hl.test_cache_len(),
+            small.line_count()
+        );
     }
 
     /// 单源色板对拍：编辑器 `name_color` 必须与 syntax GitHubTheme 同 scope 色完全一致

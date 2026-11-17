@@ -31,6 +31,7 @@ use std::sync::{mpsc, OnceLock};
 
 use anyhow::{anyhow, Context as _, Result};
 use pdfium_render::prelude::*;
+use sha2::{Digest, Sha256};
 
 use crate::recolor::{RecolorParams, apply_recolor};
 
@@ -65,34 +66,81 @@ const EMBEDDED_PDFIUM: &[u8] = include_bytes!(env!("PDFIUM_ZST_PATH"));
 static PDFIUM_RAW_SIZE: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| env!("PDFIUM_RAW_SIZE").parse::<usize>().unwrap());
 
+/// 原始 dll 的 sha256（hex，64 字符），由 `build.rs` 注入（构建期对 resources/ 内原 dll
+/// 计算）：复用临时 dll 前比对磁盘 sha256，防「同长但内容被种植」的 DLL 投毒（长度
+/// 快拒之外的第二道闸，见 [`extract_embedded_pdfium`]）。
+#[cfg(embed_pdfium)]
+const PDFIUM_RAW_SHA256_HEX: &str = env!("PDFIUM_RAW_SHA256");
+
+/// 计算字节集的 sha256（hex 小写）。纯函数供单测：同字节集恒等、异字节集必异。
+#[cfg_attr(not(embed_pdfium), allow(dead_code))]
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 临时 dll 是否可复用（纯函数，裁决 = 「复用 / 走重解压覆盖」）：
+/// **先比长度**（明显不同 size 免做全量 hash 读），同长**再比 sha256** 防「同长不同内容」
+/// 的种植。供 [`extract_embedded_pdfium`] 复用判据与单测直接调用（不依赖 embed cfg/磁盘）。
+#[cfg_attr(not(embed_pdfium), allow(dead_code))]
+fn pdfium_reuse_decision(
+    disk_len: u64,
+    disk_sha256_hex: &str,
+    expected_len: u64,
+    expected_sha256_hex: &str,
+) -> bool {
+    disk_len == expected_len && disk_sha256_hex == expected_sha256_hex
+}
+
 /// 在临时目录解出内嵌的 pdfium 并返回其路径。
 ///
-/// 文件命名为 `gpui-editor/pdfium-<版本>.dll`（仅首次写入；内容与 `include_bytes!`
+/// 文件命名为 `vuick/pdfium-<版本>.dll`（仅首次写入；内容与 `include_bytes!`
 /// 解压后一致时直接复用，退出后由临时目录清理，不污染项目目录）。
+/// 复用前除**长度快拒**外还比对 **sha256**：磁盘文件被「同长不同内容」种植时判定不复用，
+/// 落到下方重解压覆盖路径（覆盖被种植文件）。
+/// 返回 `None` = 无法提供**已校验**的 dll（复用 hash 不匹配且覆盖写失败，如种植文件被
+/// 设只读/占用）：此时**绝不返回**可能被种植的旧文件路径——宁可让 locate_dll 走其它
+/// 候选或报「找不到 pdfium」，也不把 hash 校验不过的文件落回加载面（评审 NIT#1）。
 #[cfg(embed_pdfium)]
-fn extract_embedded_pdfium() -> PathBuf {
-    let dir = std::env::temp_dir().join("gpui-editor");
+fn extract_embedded_pdfium() -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join("vuick");
     let path = dir.join(PDFIUM_VERSIONED_NAME);
-    // 已存在且长度等于原始 dll 大小 → 直接复用（避免每次启动重解压 ~3MB writes；跨版本名唯一）
+    // 已存在且长度等于原始 dll 大小 → 再比 sha256 才复用（避免每次启动重解压 ~3MB writes；
+    // 长度快拒在前，明显不同 size 的文件不做全量 hash 读）。
     let reuse = path.is_file()
-        && path.metadata().map(|m| m.len() as usize).unwrap_or(0) == *PDFIUM_RAW_SIZE;
+        && {
+            let len = path.metadata().map(|m| m.len()).unwrap_or(0);
+            len == *PDFIUM_RAW_SIZE as u64
+                && std::fs::read(&path)
+                    .map(|disk| {
+                        pdfium_reuse_decision(
+                            len,
+                            &sha256_hex(&disk),
+                            *PDFIUM_RAW_SIZE as u64,
+                            PDFIUM_RAW_SHA256_HEX,
+                        )
+                    })
+                    .unwrap_or(false)
+        };
     if reuse {
-        return path;
+        return Some(path);
     }
     let _ = std::fs::create_dir_all(&dir);
     let raw = zstd::bulk::decompress(EMBEDDED_PDFIUM, *PDFIUM_RAW_SIZE)
         .expect("解压内嵌 pdfium 失败");
-    let _ = std::fs::write(&path, raw);
-    path
+    // 覆盖写失败（含被种植文件被设只读/占用）→ 返回 None：被种植的旧 dll 既不可复用、
+    // 也不再被返回，绝不落回加载面（宁可报错/走其它候选，不当沉默误装载）。
+    std::fs::write(&path, raw).ok()?;
+    Some(path)
 }
 
 /// 定位 pdfium 动态库（按优先级，**只用带版本号的文件**，不退回裸 `pdfium.dll`）：
-/// 1. 环境变量 `GPUI_EDITOR_PDFIUM`：绝对路径直接指定（最优先，逃生口；支持任意文件名）
+/// 1. 环境变量 `VUICK_PDFIUM`：绝对路径直接指定（最优先，逃生口；支持任意文件名）
 /// 2. 可执行文件同目录：`<版本号>.dll`（旁置分发/就地升级，可覆盖内嵌版）
 /// 3. 项目 `resources/pdfium/`：`<版本号>.dll`（开发树自带）
 /// 4. 内嵌到 exe 的 pdfium（`embed_pdfium` cfg）：解出到临时目录（单文件分发兜底）
 fn locate_dll() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("GPUI_EDITOR_PDFIUM") {
+    if let Ok(p) = std::env::var("VUICK_PDFIUM") {
         let pb = PathBuf::from(&p);
         if pb.is_file() {
             return Ok(pb);
@@ -118,7 +166,9 @@ fn locate_dll() -> Result<PathBuf> {
             .join(PDFIUM_VERSIONED_NAME),
     );
     #[cfg(embed_pdfium)]
-    candidates.push(extract_embedded_pdfium());
+    if let Some(p) = extract_embedded_pdfium() {
+        candidates.push(p);
+    }
     #[cfg(not(embed_pdfium))]
     let _ = &candidates; // 无内嵌：candidates 仅磁盘候选
 
@@ -127,7 +177,7 @@ fn locate_dll() -> Result<PathBuf> {
         .find(|c| c.is_file())
         .ok_or_else(|| anyhow::anyhow!(
             "无法找到 pdfium 动态库 {PDFIUM_VERSIONED_NAME}：\
-             请把它放在可执行文件旁或 resources/pdfium/，或用 GPUI_EDITOR_PDFIUM=<路径> 指定"
+             请把它放在可执行文件旁或 resources/pdfium/，或用 VUICK_PDFIUM=<路径> 指定"
         ))
 }
 
@@ -2108,12 +2158,12 @@ fn extract_outline(doc: &PdfDocument<'_>) -> Vec<PdfOutlineEntry> {
 /// `w*4`——见 `PdfBitmap::preferred_stride_bytes` 对 4 通道格式从不补对齐），
 /// 直接 `as_raw_bytes()` 拷出即可，**零像素循环、零字节重排**。旧的
 /// `as_image()` → `into_rgba8()` 会对每像素做 BGRA→RGBA 再一次 RGBA→BGRA 的浪费。
-/// 是否开启 worker 渲染计时日志（`GPUI_EDITOR_PDF_TIMING=1`）：打印每次瓦片/整页渲染的
+/// 是否开启 worker 渲染计时日志（`VUICK_PDF_TIMING=1`）：打印每次瓦片/整页渲染的
 /// get_page 与 pdfium 光栅化耗时，便于在真实慢 PDF 上定位瓶颈（worker 侧）。
 fn timing() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var_os("GPUI_EDITOR_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
+        std::env::var_os("VUICK_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
     })
 }
 
@@ -2387,6 +2437,11 @@ fn render_page(
     // 与 view 侧 `layout::page_bitmap_size` 共用同一套取整（含 1:1 稳定化）：位图宽必须
     // 与显示矩形（设备像素取整）逐纹素一致，否则 GPU 双线性重采样发糊。
     let (bw, bh) = crate::pdf::layout::page_bitmap_size((pw, ph), req.scale);
+    // 面积闸（安全护栏）：病理性天文尺寸（w×h×4 字节 → 整页位图分配撑爆内存）直接拒绝；
+    // A4@4.0 ≈ 8M px 恰在预算（12M px）内不受影响（纯函数口径见 layout::pixel_area_ok）。
+    if !crate::pdf::layout::pixel_area_ok(bw, bh) {
+        return None;
+    }
     let (w, h) = (bw as i32, bh as i32);
     let t1 = std::time::Instant::now();
     let bmp = page.render(w, h, None).ok()?;
@@ -2708,8 +2763,17 @@ fn extract_image_pixels(
     let obj = page.objects().get(obj_index).ok()?;
     let img = obj.as_image_object()?;
     // 目标尺寸夹到 i32 正整数域（Pixels=i32；真正图片嵌入尺寸都在合理范围内，仅防病态）。
-    let w = req_w.clamp(1, i32::MAX as u32) as i32;
-    let h = req_h.clamp(1, i32::MAX as u32) as i32;
+    let req_w = req_w.clamp(1, i32::MAX as u32);
+    let req_h = req_h.clamp(1, i32::MAX as u32);
+    // 面积闸（安全护栏，双点之一）：复制大图默认按自然分辨率语义**原样**（节奏稳定，
+    // 见下方 1:1 稳定性注释），仅病理性天文尺寸按比例缩到预算内（防 req_w×req_h×4 字节
+    // 分配撑爆内存）；正常 A4/大图复制路径尺寸稳定不受影响。口径与 layout::pixel_area_ok 一致。
+    let (req_w, req_h) = match crate::pdf::layout::budget_clamped_dims(req_w, req_h) {
+        Some(dims) => dims,
+        None => return None,
+    };
+    let w = req_w as i32;
+    let h = req_h as i32;
     // —— 尺寸稳定性（2026-11-10，修复「复制图片」剪贴板 DIB 尺寸漂移）——
     // pdfium-render `get_processed_bitmap_with_size` 的缩放收敛 loop 对**首次**渲染会给出
     // 与请求差 ±1 行/列的位图（实证：请求 953×213 → 首次 953×212、第二次及以后 953×213，
@@ -2729,10 +2793,16 @@ fn extract_image_pixels(
         return None;
     }
     let (bw, bh) = (bw as u32, bh as u32);
+    // 面积闸兜底（双点之二）：实际渲染尺寸（±1 漂移后）仍须在预算内，防 `with_capacity`
+    // 天文分配；用「+1 行松弛」变体——恰打满预算的合法大图（4000×3000=12M）双渲 +1 行
+    // 不被误伤（精确闸 <见上一改动> 会拒 4000×3001，属评审 NIT#2 修正）；saturating 防环绕。
+    if !crate::pdf::layout::pixel_area_ok_with_row_slack(bw, bh) {
+        return None;
+    }
     // `as_rgba_bytes()` 归一化为紧凑 RGBA；Gray 格式返回原始单通道字节（`w*h`）。
     let rgba = bmp.as_rgba_bytes();
-    let px_count = (bw as usize) * (bh as usize);
-    let mut bgra = Vec::with_capacity(px_count * 4);
+    let px_count = (bw as usize).saturating_mul(bh as usize);
+    let mut bgra = Vec::with_capacity(px_count.saturating_mul(4));
     if rgba.len() == px_count * 4 {
         // RGBA → BGRA：交换 R/B 一次（退化为逐 4 字节 flat_map，零分配）。
         bgra.extend(rgba.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], px[3]]));
@@ -3033,7 +3103,7 @@ mod tests {
     #[cfg(embed_pdfium)]
     #[test]
     fn embedded_pdfium_extracts_to_temp_dir() {
-        let path = extract_embedded_pdfium();
+        let path = extract_embedded_pdfium().expect("解出内嵌 pdfium 应成功");
         assert!(path.is_file(), "解出的 dll 文件应存在: {}", path.display());
         let written = std::fs::read(&path).expect("应能读回解出的 dll");
         assert_eq!(written.len(), *PDFIUM_RAW_SIZE, "解出内容长度应等于原始 dll 大小");
@@ -3499,5 +3569,36 @@ mod tests {
             "后到的瓦片随后出队"
         );
         assert_eq!(mid_q.len() + thumb_q.len() + rest_q.len(), 0, "其余桶应空");
+    }
+
+    /// DLL 校验（防种植，纯函数）：sha256 对同一字节集恒等、异字节集必异，
+    /// 且与公开向量一致（sha256("abc") = ba78...15ad）。
+    #[test]
+    fn sha256_hex_is_stable_and_distinguishes_content() {
+        let a = b"pdfium binary bytes";
+        let b = b"pdfium binary bytex";
+        assert_eq!(sha256_hex(a), sha256_hex(a), "同字节集 hex 应恒等");
+        assert_ne!(sha256_hex(a), sha256_hex(b), "异字节集 hex 必异");
+        assert_eq!(sha256_hex(a).len(), 64, "sha256 hex 恒 64 字符");
+        // 已知公开向量（FIPS 180-4）：sha256("abc")
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// DLL 复用裁决（纯函数）：「同长不同内容 → 判不复用」「同内容 → 复用」「长度不同 → 快拒」。
+    #[test]
+    fn pdfium_reuse_decision_gates_on_len_then_hash() {
+        let good = sha256_hex(b"real pdfium");
+        let planted = sha256_hex(b"planted evil dll");
+        let len = 13u64; // b"real pdfium".len()
+        // 同内容 → 复用。
+        assert!(pdfium_reuse_decision(len, &good, len, &good));
+        // 同长但内容不同（DLL 种植）→ 判不复用（走重解压覆盖）。
+        assert!(!pdfium_reuse_decision(len, &planted, len, &good), "同长异内容应不复用");
+        // 长度不同 → 快拒（即使 hash 意外相同也不复用；明显不同 size 免做全量 hash 读）。
+        assert!(!pdfium_reuse_decision(len + 1, &good, len, &good), "长度不同应快拒");
+        assert!(!pdfium_reuse_decision(1, &good, len, &good), "长度不同应快拒");
     }
 }

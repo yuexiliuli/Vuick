@@ -1,4 +1,4 @@
-# run_cpu_baseline.ps1 — gpui-editor 图片查看器「滚轮逐张切图」真机 CPU 探针
+# run_cpu_baseline.ps1 — vuick 图片查看器「滚轮逐张切图」真机 CPU 探针
 #
 # 用法:
 #   pwsh -File Benchmarks\image\scripts\run_cpu_baseline.ps1
@@ -47,9 +47,9 @@ public static class Win32 {
 "@
 
 if (-not $Exe) {
-    $Exe = "E:\Rust\gpui-editor\target\debug\gpui-editor.exe"
+    $Exe = "E:\Rust\vuick\target\debug\vuick.exe"
 }
-if (-not (Test-Path -LiteralPath $Exe)) { throw "exe 不存在（先 cargo build --bin gpui-editor）: $Exe" }
+if (-not (Test-Path -LiteralPath $Exe)) { throw "exe 不存在（先 cargo build --bin vuick）: $Exe" }
 
 $p = Start-Process -FilePath $exe -ArgumentList @("`"$Image`"") -PassThru
 try {

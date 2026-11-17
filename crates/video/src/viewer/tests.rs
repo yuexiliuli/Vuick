@@ -41,6 +41,7 @@
             hover_x: None,
             hover_cmd: None,
             hover_generation: Arc::new(AtomicU64::new(0)),
+            hover_inflight: Arc::new(AtomicUsize::new(0)),
             hover_cache: None,
             served_hover_target: None,
             last_tick: None,
@@ -58,7 +59,7 @@
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
-            // 最近一次 seek 命令的诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 tick
+            // 最近一次 seek 命令的诊断会话号（`VUICK_VIDEO_SEEK_DIAG=1` 时 tick
             // 据此匹配共享槽并聚合打印；普通运行恒 0/新值）。
             diag_session: 0,
             decode_cmd: None,
@@ -5188,5 +5189,175 @@
             sorted[sorted.len() / 2],
             sorted[sorted.len() - 1],
         );
+        cx.run_until_parked();
+    }
+
+    // ---- P1 审查批次：4 个缺陷回归（2026-11-16）----
+
+    /// P1-23 回归：解码输出几何中途突增（`need > buf.len()`，如 AVC mid-stream SPS 分辨率
+    /// 变化）时，帧切片必须安全降级（不 panic、`buf` 按新几何扩容、返回 `None` 跳过本帧），
+    /// 而非 `buf[..need]` 无界切片 panic 静默杀 worker 线程、主线程 pump 永等画面。
+    #[gpui::test]
+    fn geometry_growth_frame_slice_is_safe_not_unbounded(cx: &mut TestAppContext) {
+        // 修复前机制复现：无界切片在 need>len 时必 panic（旧 worker 静默死根因）
+        let raw = vec![0u8; 8];
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let need = 4096usize;
+            let _ = raw[..need].to_vec();
+        }))
+        .is_err();
+        assert!(panicked, "无界切片 need>len 必 panic（修复前 worker 死因）");
+
+        // 修复后：经 `take_soft_frame_bytes` 安全降级——need≤len 正常取拷贝、need>len
+        // 不 panic、返回 None、buf 按新几何扩容（下帧复用）
+        let mut buf = vec![0u8; 8];
+        buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let got = take_soft_frame_bytes(&mut buf, 8).expect("need≤len 应取回拷贝");
+        assert_eq!(got, vec![1, 2, 3, 4, 5, 6, 7, 8], "正常切片语义逐字节不变");
+        assert_eq!(buf.len(), 8, "need≤len 时 buf 不宜扩容");
+        let none = take_soft_frame_bytes(&mut buf, 4096);
+        assert!(none.is_none(), "need>len 应返回 None（drop 本帧）且不 panic");
+        assert_eq!(buf.len(), 4096, "buf 应按新几何扩容（下帧复用）");
+        let again = take_soft_frame_bytes(&mut buf, 4096);
+        assert_eq!(again.expect("扩容后同 need 应可切片").len(), 4096, "扩容后新几何可正常切片");
+        cx.run_until_parked();
+    }
+
+    /// P1-24 回归：暂停态软解 seek——预滚帧（pts<落点）先行入队、落点帧尚未解出时分属两次
+    /// send、泵分两拍排空。修复前 `tick` 把预滚帧当 `latest` 提前上屏 + **无条件**清
+    /// `pending_seek` → 泵停、落点帧滞留通道 → 暂停点击进度条停在落点前 1 帧永久冻结。
+    /// 断言：预滚帧不得提前落屏/清 pending；落点帧随后到达才落屏并清 pending。
+    #[gpui::test]
+    async fn paused_seek_preroll_not_landed_then_landing_lands(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playing = false; // 暂停态：seek 后 playhead 冻结在落点
+                v.duration = 1000.0;
+                let target = 400.0;
+                v.playhead = target; // `seek()` 已把 playhead 落到落点
+                v.pending_seek = Some(target);
+                v
+            })
+        });
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FrameItem>(4);
+        let tx2 = tx.clone();
+        // 软解预滚帧（pts<落点）先行入队，落点帧尚未解出（worker 两帧分属两次 send）
+        let _ = tx.try_send(frame_of(399.96, 1));
+        ent.update(cx, |v, cx| {
+            v.rx = Some(rx);
+            let _ = v.tick(cx);
+            assert!(
+                v.pending_seek.is_some(),
+                "预滚帧（<落点）在途期间 pending_seek 不得提前清空（P1-24）"
+            );
+            assert_ne!(v.last_frame_pts, Some(399.96), "预滚帧不得提前上屏（P1-24）");
+        });
+        // 落点帧随后到达
+        let _ = tx2.try_send(frame_of(400.04, 2));
+        ent.update(cx, |v, cx| {
+            let _ = v.tick(cx);
+            assert_eq!(v.pending_seek, None, "落点帧（≥落点）上屏即清 pending");
+            assert_eq!(
+                v.last_frame_pts, Some(400.04),
+                "画面必须落在落点帧（不得停在落点前帧）"
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    /// P1-24 补充：暂停态 seek 遇 EOF（命令结束、发送端弃、此后无落点帧）——回退最后预滚帧
+    /// 上屏并清 pending_seek（不黑屏、不挂泵）；该回退只在「命令确已结束」时发生，在途
+    ///（Empty、发送端仍在）时不得提前落屏。
+    #[gpui::test]
+    async fn paused_seek_eof_falls_back_to_preroll_and_clears_pending(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playing = false;
+                v.duration = 1000.0;
+                let target = 400.0;
+                v.playhead = target;
+                v.pending_seek = Some(target);
+                v
+            })
+        });
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FrameItem>(4);
+        // 预滚帧入队后，发送端被弃（drop(tx)）＝ worker 命令已结束（EOF/解码错误）
+        let _ = tx.try_send(frame_of(399.96, 1));
+        drop(tx);
+        ent.update(cx, |v, cx| {
+            v.rx = Some(rx);
+            let _ = v.tick(cx);
+            assert_eq!(v.pending_seek, None, "命令已结束：清 pending_seek 防挂泵");
+            assert_eq!(v.last_frame_pts, Some(399.96), "EOF 回退预滚帧上屏（不黑屏）");
+        });
+        cx.run_until_parked();
+    }
+
+    /// P1-25 回归：hover 预解码任务在「换代（新落点/换文件/seek——`hover_generation` 递增）」后
+    /// 成为废弃任务，其命令永不再回传（waiting on 结果通道）——修复前裸 `recv_timeout(15s)`
+    /// 白等整 15s、堆积挤占后台池；修复后代际轮询窗（≤200ms）使被取代任务**提前退出**。
+    /// 断言：换代后单个在途任务（结果通道幸存、不投新命令）在 ≤5s 内退出（在途计数归零）；
+    /// 修复前该任务空等 15s、计数不归零 → 红。不启动真 worker / 不碰 FFI，确定性。
+    #[gpui::test]
+    async fn superseded_hover_predecode_exits_early_not_pile_up(cx: &mut TestAppContext) {
+        // 幸存命令通道（接收端存活到测试结束、无人消费）：kick 的命令入队即滞留 → 任务的结果
+        // 通道永不回传、也永不断连——它只能靠「代际轮询」提前退出（P1-25 判定面）。
+        let (tx, rx) = std::sync::mpsc::channel::<HoverCmd>();
+        let _keep_rx_alive = rx;
+        let ent = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.hover_cmd = Some(tx);
+                v
+            })
+        });
+        // kick：任务 A（generation 1）进入等待（计数在 kick 内同步 +1）
+        ent.update(cx, |v, cx| v.kick_hover_predecode(10.0, cx));
+        let inflight = cx.update(|app| ent.read(app).hover_inflight.load(Ordering::SeqCst));
+        assert_eq!(inflight, 1, "任务 A 应已入池等待");
+        // 换代（模拟 seek/换文件/新悬停造成 `hover_generation` 递增——`pending_seek` 等场景下
+        // 不立即投新命令，旧任务即成为废弃任务）
+        ent.update(cx, |v, _| {
+            v.hover_generation.fetch_add(1, Ordering::SeqCst);
+        });
+        // 代际轮询窗 ≤200ms：被取代的 A 应提前退出（计数 1→0，不空等整 15s）
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            cx.run_until_parked();
+            let inf = cx.update(|app| ent.read(app).hover_inflight.load(Ordering::SeqCst));
+            if inf == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "被取代的旧任务未提前退出（仍在堆积）");
+        }
+        assert_eq!(
+            cx.update(|app| ent.read(app).hover_inflight.load(Ordering::SeqCst)),
+            0,
+            "被取代的 hover 预解码任务应已全部退出"
+        );
+        cx.run_until_parked();
+    }
+
+    /// P1-26 回归：`install_bgra` 在 FFI 尺寸异常（`len != w*h*4`）时必须安全降级（不 panic、
+    /// 保持最近帧），而非 `RgbaImage::from_raw(...).expect(...)` 在主线程崩掉整个 app。
+    #[gpui::test]
+    async fn install_bgra_len_mismatch_is_safe(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| blank(fixture(), cx)));
+        // 基线：正确长度正常上屏
+        let (w, h) = (64u32, 48u32);
+        ent.update(cx, |v, cx| v.install_bgra(w, h, vec![7u8; (w * h * 4) as usize], cx));
+        let first = cx.update(|app| ent.read(app).frame.clone().expect("正长帧应上屏"));
+        // 异常长度（len != w*h*4）：不得 panic，保持最近帧（不替换不破坏）
+        ent.update(cx, |v, cx| v.install_bgra(w, h, vec![9u8; 64], cx));
+        cx.run_until_parked();
+        let (current, dropped) = cx.update(|app| {
+            let v = ent.read(app);
+            (v.frame.clone(), v.dropped_frame)
+        });
+        assert_eq!(current.map(|f| f.id.0), Some(first.id.0), "尺寸异常帧不得替换已上屏帧");
+        assert_eq!(dropped, None, "尺寸异常帧不得触发旧帧释放");
         cx.run_until_parked();
     }

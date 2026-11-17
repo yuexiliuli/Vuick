@@ -25,6 +25,7 @@ use markdown::ir::IrKind;
 use markdown::parse::inline_style::{self, MathRegion};
 use markdown::parse::recognition;
 use markdown::parse::{BlockMeta, RowAlign, RowKind, RunKind, TableAlign};
+use markdown::parse::unescape_image_value;
 use markdown_wysiwyg_math::{MathSlot, splice_math_text, visual_block_line_for_index};
 use markdown_wysiwyg_mermaid::{MmTheme, mermaid_card_height, mm_layout, scale_mm_layout};
 use syntax::{CodeLineRuns, github_theme_cached, parse_code_lines, resolve_line_styles_with};
@@ -614,7 +615,9 @@ pub fn inline_image_hits(r: &DocRow, srow: &ShapedRow, raw: &str) -> Vec<InlineI
             continue;
         };
         let _ = full;
-        let src = tail[srcr].to_string();
+        // 行内图 src 反解字面值再交付给图片加载（保存侧 `\(`/`\)` 转义在此解回）；
+        // 否则带转义的 src 加载即失败（P1-8 往返失图）。
+        let src = unescape_image_value(&tail[srcr]);
         let alt_len = rg.end.saturating_sub(rg.start);
         let d0 = source_to_display(post, alt_src);
         let d1 = source_to_display(post, (alt_src + alt_len).min(raw.len()));

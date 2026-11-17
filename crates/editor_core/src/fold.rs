@@ -2402,7 +2402,7 @@ fn after() {
     /// 深嵌套「栈永不清空」夹具上与 `bench_full_vs_incremental_scan` 平行的**打字耗时旁证**
     /// （仅打印、不落断言；`#[ignore]`，本机定位用）。先量「old 基线 = 整篇双扫」（旧实现
     /// 在该文档等效于每次整篇重扫），再量修复后同一稳定编辑的**增量**重扫耗时，目标是量级
-    /// 级下降（>10×）。跑法：`cargo test --release --bin gpui-editor fold::bench_deep_nest_typing -- --ignored --nocapture`
+    /// 级下降（>10×）。跑法：`cargo test --release --bin vuick fold::bench_deep_nest_typing -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn bench_deep_nest_typing() {
@@ -2549,7 +2549,7 @@ fn after() {
         s
     }
 
-    /// release 跑法：`cargo test --release --bin gpui-editor fold:: -- --ignored --nocapture`。
+    /// release 跑法：`cargo test --release --bin vuick fold:: -- --ignored --nocapture`。
     /// 测量同一份 16 万行文档上：
     /// - `before` = 整篇双扫（fold 候选 + 括号配对，即旧实现的每次结构编辑代价）；
     /// - `after`  = 文档中部一次结构编辑的**增量**重算（受影响段局部重扫 + 尾部平移）。

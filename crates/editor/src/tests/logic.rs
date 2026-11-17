@@ -1342,7 +1342,7 @@ fn highlight_cache_reuses_window_across_append_chunks() {
 // P1a before/after 基准（有门控 vs 无门控）
 // ---------------------------------------------------------------------------
 
-/// 运行：`cargo test --release --bin gpui-editor bench_progressive_append_highlight_reuse -- \
+/// 运行：`cargo test --release --bin vuick bench_progressive_append_highlight_reuse -- \
 ///        --ignored --nocapture`（debug 亦可，比值不变、绝对值放大）。
 #[test]
 #[ignore]
@@ -1408,7 +1408,7 @@ fn bench_progressive_append_highlight_reuse() {
 /// ~500 行 ≈ 40ms+ release / 百 ms 级 debug）→ 滑块跟不上鼠标；
 /// 本改动（> `EXTEND_SYNC_BUDGET_ROWS` 一律延后 + settle 有界重锚一屏）：拖动帧≈0
 /// syntect（延后帧空样式渲染）、settle 帧≈一屏（O(窗口+回看)）。
-/// 运行：`cargo test --bin gpui-editor bench_medium_gap_scroll_frames -- --ignored --nocapture`
+/// 运行：`cargo test --bin vuick bench_medium_gap_scroll_frames -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn bench_medium_gap_scroll_frames() {
@@ -1463,7 +1463,7 @@ fn bench_medium_gap_scroll_frames() {
 /// 记录刷新墙钟 → 打 min/median/p95 + 掉帧计数（单帧 >16.7ms 记掉帧）。
 /// 复用 [`bench_medium_gap_scroll_frames`] 同款帧循环与大文档（120k 行 / 缺口 500 行），
 /// 纯高亮帧路径（syntect 段）＝编辑区滚动帧成本的构成主体。
-/// 运行：`cargo test --bin gpui-editor bench_scroll_frame_histogram -- --ignored --nocapture`
+/// 运行：`cargo test --bin vuick bench_scroll_frame_histogram -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn bench_scroll_frame_histogram() {
@@ -1520,7 +1520,7 @@ fn bench_scroll_frame_histogram() {
 ///   （**2 帧到位**）——即「先纯文本、随后才补色」的观感死区。
 /// 基准实测当前代码实际路径；before/after 各跑 ≥3 次取中位数对比（`first_quick` + 帧数
 /// + µs 中位数），bench 代码两份 HEAD 相同。
-/// 运行：`cargo test --bin gpui-editor bench_first_frame_coloring -- --ignored --nocapture`
+/// 运行：`cargo test --bin vuick bench_first_frame_coloring -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn bench_first_frame_coloring() {

@@ -34,7 +34,7 @@ macro_rules! fixture_or_skip {
 #[test]
 fn open_watchdog_interrupts_corrupt_file() {
     let dir = std::env::temp_dir().join(format!(
-        "gpui-editor-mff-corrupt-{}",
+        "vuick-mff-corrupt-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1416,6 +1416,36 @@ fn classify_receive_distinguishes_eof_from_real_errors() {
     }
 }
 
+/// P1-19 回归：serve 段（包喂送循环）与 drain 段现在共用 [`classify_receive`]——
+/// `AVERROR(EAGAIN)` 是「本包产完 / 缓冲取完」的**正常**信号（分类 `Eagain`，循环
+/// 继续/结束）；非 EAGAIN/EOF 的真实错误（ENOMEM=errno 12、InvalidData…）恒分类
+/// `Error`，serve 段遇之**上报**而非旧 `.is_ok()` 一律当「无帧可收」静默吞掉——持久
+/// 解码错误不得表现为「干净播完」停播到 EOF。无需 FFmpeg 实例，直接对假返回值测各分支。
+#[test]
+fn serve_loop_classifies_eagain_vs_real_errors() {
+    // EAGAIN → Eagain：包喂送循环遇之「本包产完」喂下个包（正常结束，不报错）
+    match classify_receive(Err(ffmpeg::Error::Other {
+        errno: ffmpeg::error::EAGAIN,
+    })) {
+        ReceiveStatus::Eagain => {}
+        other => panic!("AVERROR(EAGAIN) 应分类为 Eagain，实得 {other:?}"),
+    }
+    // 真实错误 → Error：serve 段必须上报（对齐 drain 段口径），不得静默吞
+    match classify_receive(Err(ffmpeg::Error::Other { errno: 12 })) {
+        ReceiveStatus::Error(_) => {}
+        other => panic!("ENOMEM 应分类为 Error（serve 段上报），实得 {other:?}"),
+    }
+    match classify_receive(Err(ffmpeg::Error::InvalidData)) {
+        ReceiveStatus::Error(_) => {}
+        other => panic!("InvalidData 应分类为 Error（serve 段上报），实得 {other:?}"),
+    }
+    // 出帧 → Ok
+    match classify_receive(Ok(())) {
+        ReceiveStatus::Ok => {}
+        other => panic!("出帧应分类为 Ok，实得 {other:?}"),
+    }
+}
+
 /// F6 回归：字幕文本 UTF-8 BOM（\u{FEFF}）剥除。带 BOM 的 SRT/ASS 包 → 首字符无 BOM；
 /// 旧式 ASS `Dialogue:` 整行带 BOM 也能被识别（走行内时间解析，而非错误地落包 PTS 分支
 /// 导致时间错位）；MKV 新块格式带 BOM 同样取正文无 BOM。
@@ -1476,7 +1506,7 @@ fn ffi_last_error_str() -> String {
 /// 不入库，PID 后缀防并行测试撞目录）。
 fn corrupt_fixture_path() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "gpui-editor-mff-classify-{}",
+        "vuick-mff-classify-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1607,7 +1637,7 @@ fn ffi_open_failure_classification_distinct() {
     );
 
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!(
-        "gpui-editor-mff-classify-{}",
+        "vuick-mff-classify-{}",
         std::process::id()
     )));
 }
@@ -1678,4 +1708,144 @@ fn probe_heif_decode_ab() {
     if ran == 0 {
         eprintln!("SKIP: 无 HEIF 语料（Benchmarks/corpus/heif 缺失）");
     }
+}
+
+// ---------------- P1-20：sws 缩放器缓存键含输入几何 ----------------
+
+/// P1-20 回归（纯逻辑层）：sws 缓存复用判定 = 输入几何（格式/宽/高）逐维一致才复用，
+/// 任一维变化必须重建。旧实现键只有「是否已建」→ 流中途几何变化按旧 sws 读新帧会
+/// 越界读/错画（UB）。无需 FFmpeg 实例。
+#[test]
+fn scaler_key_matches_requires_full_input_geometry() {
+    use ffmpeg::format::Pixel;
+
+    // 同几何 → 复用
+    assert!(scaler_key_matches(Pixel::YUV420P, 320, 240, Pixel::YUV420P, 320, 240));
+    // 宽变化 → 重建
+    assert!(!scaler_key_matches(Pixel::YUV420P, 320, 240, Pixel::YUV420P, 640, 480));
+    // 高变化 → 重建
+    assert!(!scaler_key_matches(Pixel::YUV420P, 320, 240, Pixel::YUV420P, 320, 720));
+    // 像素格式变化 → 重建
+    assert!(!scaler_key_matches(Pixel::YUV420P, 320, 240, Pixel::NV12, 320, 240));
+}
+
+/// P1-20 回归（真 sws 集成层，需 FFmpeg）：同几何两次取到**同一个** ctx（复用、不重建）；
+/// 几何变化后「缓存键被更新为新几何」（重建的可观测面，不依赖分配器地址复用）。
+#[test]
+fn scaler_rebuilds_on_input_geometry_change() {
+    use ffmpeg::format::Pixel;
+
+    let _g = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ffmpeg::init().unwrap();
+
+    let ptr_of = |c: &ffmpeg::software::scaling::Context| c as *const _ as usize;
+    let mut cache: Option<ScalerCache> = None;
+
+    // 首帧建一次
+    let first = scaler_for(&mut cache, Pixel::YUV420P, 320, 240, 320, 240).unwrap();
+    let first_ptr = ptr_of(first);
+
+    // 同几何：复用同一 ctx（不重建——重建会换地址）
+    let same = scaler_for(&mut cache, Pixel::YUV420P, 320, 240, 320, 240).unwrap();
+    assert_eq!(
+        ptr_of(same),
+        first_ptr,
+        "同输入几何应复用已建 sws（不重建）"
+    );
+
+    // 分辨率变化：重建 → 缓存键更新为新几何
+    scaler_for(&mut cache, Pixel::YUV420P, 640, 480, 320, 240).unwrap();
+    let c = cache.as_ref().expect("重建后缓存非空");
+    assert_eq!(
+        (c.src_format, c.src_w, c.src_h),
+        (Pixel::YUV420P, 640, 480),
+        "分辨率变化后缓存键应更新为新几何"
+    );
+
+    // 像素格式变化：重建 → 缓存键更新
+    scaler_for(&mut cache, Pixel::NV12, 640, 480, 320, 240).unwrap();
+    let c = cache.as_ref().expect("重建后缓存非空");
+    assert_eq!(
+        (c.src_format, c.src_w, c.src_h),
+        (Pixel::NV12, 640, 480),
+        "像素格式变化后缓存键应更新为新几何"
+    );
+}
+
+// ---------------- P1-21：FFI 导出 panic 护栏 ----------------
+
+/// P1-21 守卫：FFI 导出统一包 [`crate::catch_unwind_ffi`]——跨 `extern "C"` 边界的 panic
+/// 会被捕获并按返回语义给安全默认值，而不是 unwind 越界 abort 进程。无法 headless 真
+/// 触发 extern-C 回调 panic，故直接验证护栏本体的「panic → 默认值 / 正常路径 → 闭包值」
+/// 语义。25 个 `pub unsafe extern "C"` 导出逐一包接的完整性靠编译期（每条导出都过
+/// 护栏）与人工枚举核对。
+#[test]
+fn ffi_catch_unwind_returns_safe_default_on_panic() {
+    use std::ffi::{c_int, c_void};
+
+    // 有返回值 c_int 类：panic → 默认 -1
+    assert_eq!(
+        crate::catch_unwind_ffi(-1, || -> c_int { panic!("模拟解码 panic") }),
+        -1
+    );
+    // 指针/句柄类：panic → 错误哨兵 usize::MAX（对齐 vff_video_frame_hw 的错误语义）
+    assert_eq!(
+        crate::catch_unwind_ffi(usize::MAX as *mut c_void, || {
+            panic!("模拟取帧 panic")
+        }) as usize,
+        usize::MAX
+    );
+    // void 类：panic 被吞掉，调用方后续正常
+    crate::catch_unwind_ffi((), || panic!("模拟 void panic"));
+    assert!(true, "void 导出 panic 后应继续（未 abort）");
+    // 正常路径不受影响：返回闭包真实值
+    assert_eq!(crate::catch_unwind_ffi(-1, || 0), 0);
+}
+
+// ---------------- P1-22：音频 EOF 排空解码器缓冲（轨尾截断） ----------------
+
+/// P1-22 回归（需真 FFmpeg + 夹具）：EOF 后必须**先排空解码器缓冲**（send_eof 后的
+/// lookahead 末段帧再逐帧重采样）再冲重采样器残留，不得只冲 resampler（轨尾截断）。
+/// headless 无法 oracle「末段半帧差值」（无真实解码器实例），故落结构性不变式并
+/// 真机路径实跑新 drain 代码：读到 EOF、块 pts 单调、末块带样本、总解码时长覆盖流尾
+/// （粗判不丢尾段）。夹具 `target/video测试有声.mp4`（§5 手动装配；缺 → SKIP）。
+#[test]
+fn audio_eof_drains_decoder_tail_real_decode() {
+    let f = audio_fixture();
+    if !f.exists() {
+        eprintln!("SKIP: missing target/video测试有声.mp4（媒体夹具不入库，手动装配）");
+        return;
+    }
+    // 不手动持 FFMPEG_LOCK、不重复 ffmpeg::init——open_pcm_f32 内部统一加锁 + init
+    //（std Mutex 不可重入，先持锁再 open 会死锁）
+    let mut r = AudioReader::open_pcm_f32(&f, 48000).expect("应可打开音轨");
+    let dur = r.params().duration;
+    assert!(dur >= 1.0, "夹具时长应 ≥1s（实测 {dur:.3}s）");
+
+    let mut out = vec![0f32; 48000 * 2 * 2]; // 2s 立体声上界
+    let mut last = 0f64;
+    let mut total = 0usize;
+    let mut blocks = 0usize;
+    // 循环只能经 Ok(None)（EOF）退出；Err 或 panic 都令本测试 FAIL——走到循环尾即证明
+    // EOF 排空路径（drain_decoder_tail + flush_resampler_into）被真解码触发且未报错。
+    loop {
+        match r.next_pcm_f32_into(&mut out) {
+            Ok(Some((pts, n))) => {
+                assert!(pts >= last - 1e-6, "pts 应单调（{pts:.4} < {last:.4}）");
+                last = pts;
+                total += n;
+                blocks += 1;
+            }
+            Ok(None) => break,
+            Err(e) => panic!("读到 EOF 前解码失败: {e:#}"),
+        }
+    }
+    assert!(blocks > 1, "应收到多个音频块（实测 {blocks}）");
+    assert!(total > 0, "应有样本输出");
+    // 每声道样本 = total/2（立体声交错）；解码时长应覆盖到接近容器时长（不丢轨尾）
+    let secs = total as f64 / 2.0 / 48000.0;
+    assert!(
+        secs >= dur * 0.9,
+        "解码总时长 {secs:.3}s 应覆盖流尾（容器 {dur:.3}s），疑似轨尾截断"
+    );
 }
