@@ -76,6 +76,12 @@ const DISPLAY_NEED_INIT: (f32, f32) = (1920.0, 1080.0);
 /// 把内存/上传预算打爆（超大文件另有 LRU 字节预算如实兜底）。
 const MAX_GIF_FRAMES: usize = 256;
 
+/// GIF 动图全帧物化**汇总像素字节预算**：逐帧解码累加 `w*h*4`，累计将超预算即停止继续
+/// 物化（保留已解帧、丢弃后续帧，至少保 1 帧；动画仍循环）——防不可信动图按帧数上限
+/// （[`MAX_GIF_FRAMES`]）把 N 帧全画布 RGBA 一次性物化也能 OOM（`Limits` 512MB 单帧
+/// 分配上限只挡单帧、不挡 N 帧汇总总量，极端 8000×8000×4×256≈65GB 级峰值）。
+const MAX_GIF_TOTAL_BYTES: u64 = 8_000_000;
+
 use ::viewer::auto_hide;
 use ::viewer::folder::FolderNav;
 use ::viewer::pan_zoom;
@@ -1229,8 +1235,12 @@ fn decode_static_first_frame_or(
 ///    `Limits::no_limits()`，直接 `into_frames` 会在首个帧前就按逻辑屏画布预分配无上限
 ///    的 RGBA 画布（荒谬超大逻辑屏描述符可瞬间吃爆内存）；limits 在 reserve 阶段用
 ///    512MB 单分配预算拦下，超额以 `ImageResult` 报错，不 panic；
-/// 2. 帧尺寸与逻辑屏不一致（异常文件）→ 整体回退「首帧静态」；
-/// 3. 全帧解码失败 → [`decode_static_first_frame_or`] 回退「首帧静态」，绝不硬失败。
+/// 2. **汇总像素字节预算**[`MAX_GIF_TOTAL_BYTES`]：逐帧解码累加 `w*h*4`，累计将超预算
+///    即停止继续物化（保留已解帧、丢弃后续帧，至少保 1 帧；动画仍循环）——防止「每帧都
+///    在 512MB 单分配上限内、但 N 帧汇总总量无界」的不可信动图 OOM（与帧数闸
+///    [`MAX_GIF_FRAMES`] 并列取最严）；
+/// 3. 帧尺寸与逻辑屏不一致（异常文件）→ 整体回退「首帧静态」；
+/// 4. 全帧解码失败 → [`decode_static_first_frame_or`] 回退「首帧静态」，绝不硬失败。
 fn decode_gif_frames(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
     let mut decoder = kimg::codecs::gif::GifDecoder::new(Cursor::new(bytes))
         .map_err(|e| format!("无法解码图片：{e}"))?;
@@ -1242,27 +1252,37 @@ fn decode_gif_frames(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
         .set_limits(kimg::Limits::default())
         .map_err(|e| format!("无法解码图片：{e}"))?;
     let (w, h) = decoder.dimensions();
-    let frames = match decoder
-        .into_frames()
-        .take(MAX_GIF_FRAMES)
-        .collect::<kimg::ImageResult<Vec<_>>>()
-    {
-        Ok(frames) => frames,
-        Err(e) => return decode_static_first_frame_or(bytes, e),
-    };
-    if frames.is_empty() {
-        return Err("无法解码图片：GIF 无帧".into());
-    }
-    let mut out = Vec::with_capacity(frames.len());
-    for frame in frames {
-        let (fw, fh) = frame.buffer().dimensions();
-        if fw != w || fh != h {
-            return decode_static_first_frame(bytes);
+    // 每帧全画布 RGBA/BGRA 的固定字节数（解码产物统一逻辑屏尺寸）。
+    let frame_bytes = w as u64 * h as u64 * 4;
+    // 资源护栏②：汇总像素字节预算——逐帧解码并累加，累计将超预算即停（至少保 1 帧），
+    // 防不可信动图按 MAX_GIF_FRAMES 上限把 N 帧全画布一次性物化而 OOM。帧数闸
+    // MAX_GIF_FRAMES 与之并列取最严，两闸都在「解码并物化该帧」之前裁决，不产生浪费。
+    let mut out = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for frame in decoder.into_frames() {
+        if out.len() >= MAX_GIF_FRAMES {
+            break;
         }
-        let delay = frame.delay();
-        let mut buf = frame.into_buffer();
-        swap_rb_in_place(buf.as_mut());
-        out.push(Frame::from_parts(buf, 0, 0, delay));
+        if !out.is_empty() && total_bytes + frame_bytes > MAX_GIF_TOTAL_BYTES {
+            break;
+        }
+        match frame {
+            Ok(frame) => {
+                let (fw, fh) = frame.buffer().dimensions();
+                if fw != w || fh != h {
+                    return decode_static_first_frame(bytes);
+                }
+                let delay = frame.delay();
+                let mut buf = frame.into_buffer();
+                swap_rb_in_place(buf.as_mut());
+                out.push(Frame::from_parts(buf, 0, 0, delay));
+                total_bytes += frame_bytes;
+            }
+            Err(e) => return decode_static_first_frame_or(bytes, e),
+        }
+    }
+    if out.is_empty() {
+        return Err("无法解码图片：GIF 无帧".into());
     }
     Ok((out, w, h))
 }
@@ -2212,6 +2232,23 @@ mod tests {
         out
     }
 
+    /// 编码一张指定逻辑屏尺寸的 N 帧测试 GIF（每帧统一 `w×h` 全画布；(0,0) 像素为 `color`、
+    /// 帧 delay 为 `ms`）——大画布动图测试用：画布越大，相同帧数下「全帧全画布 RGBA 物化」
+    /// 的汇总字节越可观。GIF 编码 delay 精度 10ms（写盘时除 10 取整），测试参数须用 10 的
+    /// 倍数才能精确往返。
+    fn encode_test_gif_dims(frames: &[(kimg::Rgba<u8>, u32)], w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = kimg::codecs::gif::GifEncoder::new(&mut out);
+        for (color, ms) in frames {
+            let mut buf = kimg::RgbaImage::from_pixel(w, h, kimg::Rgba([0, 0, 0, 0]));
+            buf.put_pixel(0, 0, *color);
+            let frame = Frame::from_parts(buf, 0, 0, kimg::Delay::from_numer_denom_ms(*ms, 1));
+            enc.encode_frame(frame).expect("测试自产 GIF 应能编码");
+        }
+        drop(enc);
+        out
+    }
+
     #[test]
     fn gif_anim_decodes_frames_preserves_delay_and_bgra() {
         // 帧0：(0,0) 红 delay 100ms；帧1：(0,0) 蓝 delay 200ms
@@ -2275,6 +2312,31 @@ mod tests {
             got.len(),
             MAX_GIF_FRAMES,
             "超 MAX_GIF_FRAMES 应截断到前 N 帧"
+        );
+    }
+
+    /// RED 复现测试（P0：不可信动图 OOM）。[`decode_gif_frames`] 对最多 [`MAX_GIF_FRAMES`] 帧
+    /// 逐一**全画布 RGBA 一次性物化**并全部保留；`Limits::default()`（512MB 单分配上限）只挡
+    /// 单帧、不挡 N 帧汇总总量 → 极端（8000×8000×4×256 ≈ 65.5GB）可达 ~64GB 级峰值。
+    /// 本测试用 128×128 画布 × MAX_GIF_FRAMES(256) 帧锁定不变式「汇总像素必须有界」：
+    /// `frames.len()*w*h*4 <= 8_000_000`（8MB 汇总上界）。修复后解码必须被截到满足此界
+    /// （按汇总预算截断帧数）；修复前帧数=合成帧数 → 16.8MB > 8MB → 红。
+    #[test]
+    fn gif_frames_total_pixels_bounded() {
+        // 128*128*4 = 65,536 = 64KiB/帧；×256 = 16,777,216 ≈ 16MiB > 8MB → 修复前必红
+        let (w, h) = (128u32, 128u32);
+        let frames = (0..MAX_GIF_FRAMES)
+            .map(|i| (kimg::Rgba([(i % 256) as u8, 0, 0, 255]), 10u32))
+            .collect::<Vec<_>>();
+        let bytes = encode_test_gif_dims(&frames, w, h);
+        let (got, gw, gh) =
+            decode_generic(&bytes).expect("自产 GIF 应能解码（修复后应截帧以满足汇总上界）");
+        assert_eq!((gw, gh), (w, h), "逻辑屏尺寸");
+        // 8MB 汇总上界：修复必须截帧（按汇总预算截断），不复现全帧全画布 N 帧物化 OOM
+        let total = got.len() as u64 * gw as u64 * gh as u64 * 4;
+        assert!(
+            total <= 8_000_000,
+            "GIF 全帧汇总字节 {total} 超出 8MB 上界：不可信动图按 MAX_GIF_FRAMES 全画布物化会 OOM"
         );
     }
 
