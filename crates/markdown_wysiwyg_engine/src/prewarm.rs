@@ -41,6 +41,17 @@ pub struct Prewarm {
     /// 键入」中稳定 → 旧钉继续可见（全内容指纹会让每击换键 → 巨块闪回占位板）。按粗指纹
     /// 键 → 结构编辑/换源后旧条目自然失效（不触碰 edit.rs）。
     pub giant_pin: std::collections::HashMap<u64, std::rc::Rc<crate::element::ShapedRow>>,
+    /// 巨块钉**插入序**（FIFO，先 pin 先逐出）：`giant_pin` 超出 [`Self::GIANT_PIN_CAP`]
+    /// 时 `pop_front` 最旧 pid 并从 map `remove`（HashMap 无序，逐出次序由本队列
+    /// 保证）。只在新 pid 首次 pin 时入队，与 map 同步增删（见 [`Self::pin_giant`]）。
+    pub pin_order: std::collections::VecDeque<u64>,
+    /// 巨块全内容键 memo（性能，`giant_fast_row` 每帧消费）：`block_index → (content_gen,
+    /// key)`——内容代（[`crate::frame::content_gen`]）未变直接复用，滚动/光标/宽窄变化
+    /// 不改代 → 巨块每帧免 O(块) 全内容重 hash（`block_content_id` 逐 chunk 折叠大块）；
+    /// 内容编辑才换代重算（跨帧引用状态）；换源重建后内容代必自增 → 条目自然判旧
+    /// 重算，无需显式清空（真值以 content_gen 判定，见 [`Self::memo_giant_content_key`]）。
+    pub giant_key_memo:
+        std::collections::HashMap<usize, (u64, u64)>,
     /// I4 待「静止权威整形」的巨型代码块下标（去重；`settle_giant_blocks` 消费）。
     pub pending_giant: Vec<usize>,
     /// I4 静止权威整形驱动：连续「签名无变化」帧计数（语义同 [`Self::idle`]，独立于
@@ -92,6 +103,8 @@ impl Default for Prewarm {
             sig: None,
             cold_topup: 0,
             giant_pin: std::collections::HashMap::new(),
+            pin_order: std::collections::VecDeque::new(),
+            giant_key_memo: std::collections::HashMap::new(),
             pending_giant: Vec::new(),
             giant_idle: 0,
             giant_sig: None,
@@ -111,6 +124,11 @@ impl Prewarm {
     /// 单帧秒级冻结；8 帧 ≈ 0.27s@30fps，足够识别真正的停顿。
     pub const GIANT_SETTLE_IDLE_FRAMES: u8 = 8;
 
+    /// I4 巨块钉上界：`giant_pin` 最多保留 [`Self::GIANT_PIN_CAP`] 个巨块钉（防长会话
+    /// 巨块钉只涨不降、孤儿条目永不回收）；超限逐出**最先 pin** 的 pid（先 pin 先逐出，
+    /// 次序由 [`Self::pin_order`] FIFO 保证）。
+    pub const GIANT_PIN_CAP: usize = 16;
+
     /// I4 登记「待静止权威整形」的巨块（去重；`settle_giant_blocks` 消费）。
     pub fn register_giant(&mut self, block: usize) {
         if !self.pending_giant.contains(&block) {
@@ -121,9 +139,39 @@ impl Prewarm {
     pub fn giant_stale(&self, cid: u64) -> Option<std::rc::Rc<crate::element::ShapedRow>> {
         self.giant_pin.get(&cid).cloned()
     }
-    /// I4 更新钉住行（`settle_giant_blocks` 权威整形落盘）。
+    /// I4 更新钉住行（`settle_giant_blocks` 权威整形落盘）。超上限逐出**最先 pin** 的
+    /// pid（先 pin 先逐出，`giant_pin.len()` 恒 ≤ [`Self::GIANT_PIN_CAP`]）。
     pub fn pin_giant(&mut self, cid: u64, row: std::rc::Rc<crate::element::ShapedRow>) {
+        let is_new = !self.giant_pin.contains_key(&cid);
         self.giant_pin.insert(cid, row);
+        if is_new {
+            self.pin_order.push_back(cid);
+        }
+        while self.giant_pin.len() > Self::GIANT_PIN_CAP {
+            let Some(oldest) = self.pin_order.pop_front() else {
+                break;
+            };
+            self.giant_pin.remove(&oldest);
+        }
+    }
+    /// 巨块全内容键 memo（性能，消费方 `giant_fast_row`）：`content_gen` 与记忆一致直接
+    /// 复用；否则现算 [`crate::frame::block_content_id`] 并记忆。内容代 = 帧级内容版本
+    /// （[`crate::frame::content_gen`]），滚动/光标/宽窄变化不改代 → 巨块每帧免 O(块)
+    /// 全内容重 hash；内容编辑换代才重算。换源重建内容代自增 → 条目自然判旧，无需清空。
+    pub fn memo_giant_content_key(
+        &mut self,
+        content_gen: u64,
+        doc: &markdown::doc::Doc,
+        k: usize,
+    ) -> u64 {
+        if let Some(&(g, key)) = self.giant_key_memo.get(&k) {
+            if g == content_gen {
+                return key;
+            }
+        }
+        let key = crate::frame::block_content_id(doc, k);
+        self.giant_key_memo.insert(k, (content_gen, key));
+        key
     }
 
     /// 装源后冷开反门控：置 `cold_topup` 并让方向/登记簿全新（首帧重登记当前带），

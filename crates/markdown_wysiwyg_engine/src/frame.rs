@@ -1235,7 +1235,7 @@ fn pass2_shape_band(
                 let mut srow = if let Some(rc) = hit_map.remove(&k) {
                     (*rc).clone()
                 } else if is_giant_code_block(doc, base, k) {
-                    giant_fast_row(rd, doc, base, k, shape_key)
+                    giant_fast_row(rd, doc, base, k, shape_key, content_gen(rd))
                 } else if let Some(last) = cooling_row(rd, k) {
                     window.refresh();
                     #[cfg(feature = "test-mode")]
@@ -1397,10 +1397,18 @@ fn giant_fast_row(
     base: &Rc<RefCell<BlockLayout>>,
     k: usize,
     shape_key: u64,
+    cur_gen: u64,
 ) -> ShapedRow {
-    // 权威行：内容寻址（全内容指纹）。settle 后 `shape_rows` 即存本键（宿主
-    // `shape_rows_has` 与正常行缓存同键读回）；巨块内**中段键入** → 全内容键换键 → miss。
-    let cid = block_content_id(doc, k);
+    // 权威行：内容寻址（全内容指纹，经 prewarm `giant_key_memo` memo 化——巨块全内容
+    // 逐 chunk 折叠 hash 是 O(块) 级成本，滚动/光标/宽窄不动内容时代不换代 → 本帧每取
+    // 直接复用键，免每帧整块重 hash；内容编辑换代才重算，见 `memo_giant_content_key`）。
+    // settle 后 `shape_rows` 即存本键（宿主 `shape_rows_has` 与正常行缓存同键读回）；
+    // 巨块内**中段键入** → 全内容键换键 → miss。
+    let cid = {
+        let rdg = rd.borrow_mut();
+        let mut pw = rdg.prewarm.borrow_mut();
+        pw.memo_giant_content_key(cur_gen, doc, k)
+    };
     if let Some(rc) = rd.borrow_mut().shape_rows.borrow_mut().get(cid, shape_key) {
         return (*rc).clone();
     }
@@ -2525,7 +2533,7 @@ mod tests {
             .borrow_mut()
             .put(cid0, sk, fake_code_row(s0_row));
         // 巨块 1 快速路径：不得以巨块 0 的权威行满足。
-        let row1 = giant_fast_row(&rd, &doc, &base, b1, sk);
+        let row1 = giant_fast_row(&rd, &doc, &base, b1, sk, content_gen(&rd));
         assert_ne!(
             row1.src_line, s0_row,
             "不同内容同 aux 巨块快速路径不得复用他块 settle 权威行（P1-C1 退化：>4KB as_str=None 两巨块 cid 相同→串行）"
@@ -2595,6 +2603,91 @@ mod tests {
             is_dark: false,
         };
         WyTheme::from_style(&sp, gpui::font(gpui::SharedString::from("monospace")), gpui::px(16.))
+    }
+
+    /// M 复现（红测）：`giant_pin` 无上限无逐出。
+    /// 期望语义（实现将落地）：pin 总数**硬上界 = 16**（`GIANT_PIN_CAP`），超限**逐出最旧**
+    /// （先 pin 先逐出）；被逐 pid 的 `giant_stale` 返回 None、保留 pid 仍可取。当前实现
+    /// `pin_giant` 只是 `insert`（无 cap 无逐出），17 个不同 pid 连续钉全留在 map（长会话
+    /// 巨块钉只涨不降、孤儿条目永不回收）→ 三个断言全失败 = 红。
+    #[test]
+    fn giant_pin_has_cap_and_evicts_oldest() {
+        const CAP: usize = 16; // 实现将加常量 GIANT_PIN_CAP = 16（测试侧硬编码，K133）
+        let rd = RefCell::new(WyRenderModel::new(test_theme()));
+        // 连续 pin 17 个不同 pid（行用占位行，仅作身份/复用标记）。
+        {
+            let rdg = rd.borrow_mut();
+            let mut pw = rdg.prewarm.borrow_mut();
+            for i in 0..CAP + 1 {
+                pw.pin_giant(i as u64, std::rc::Rc::new(fake_code_row(i)));
+            }
+        }
+        let rdg = rd.borrow();
+        let pw = rdg.prewarm.borrow();
+        assert!(
+            pw.giant_pin.len() <= CAP,
+            "pin 总数须不超过 {CAP}，实得 {}（M：当前实现无 cap 无逐出，17 全留 map）",
+            pw.giant_pin.len()
+        );
+        assert!(
+            pw.giant_stale(0).is_none(),
+            "超限后最早 pin 的 pid=0 应被逐出（先 pin 先逐出），实得 Some"
+        );
+        assert!(
+            pw.giant_stale(CAP as u64).is_some(),
+            "最晚 pin 的 pid={CAP} 应仍可取，实得 None"
+        );
+    }
+
+    /// 性能 memo（TDD 红测→转绿）：巨块全内容键 memo 与 `block_content_id` 新鲜值一致；
+    /// 同 `content_gen` 复用、内容编辑换代后**必须失效**重算（滚动/光标动每帧免 O(块)
+    /// 全内容重 hash，只在内容编辑换代后重算——生产消费方 `giant_fast_row` 每帧取本 memo）。
+    #[test]
+    fn giant_content_key_memo_matches_fresh_and_invalidates_after_edit() {
+        let (mut doc, _base, b0, _b1) = two_giant_code_blocks_fixture();
+        let rd = RefCell::new(WyRenderModel::new(test_theme()));
+        let gen0 = content_gen(&rd);
+        // ① memo 首取 == 新鲜 block_content_id。
+        let fresh0 = block_content_id(&doc, b0);
+        let key0 = {
+            let rdg = rd.borrow_mut();
+            let mut pw = rdg.prewarm.borrow_mut();
+            pw.memo_giant_content_key(gen0, &doc, b0)
+        };
+        assert_eq!(key0, fresh0, "memo 首取必须等于 block_content_id 新鲜值");
+        // 同代再取 → 命中 memo（值仍等于新鲜值，命中路径不重算也正确）。
+        let key0b = {
+            let rdg = rd.borrow_mut();
+            let mut pw = rdg.prewarm.borrow_mut();
+            pw.memo_giant_content_key(gen0, &doc, b0)
+        };
+        assert_eq!(key0b, fresh0, "同 content_gen 再取应命中 memo 返回同键");
+        // ② 对该巨块中段一行 doc.edit 改内容（同长 ASCII、不动围栏/行数）→ 换代后键必变。
+        let m = doc.block_meta(b0).unwrap();
+        let src0 = m.src_line as usize;
+        let own = m.aux as usize + 2; // Code 多行块 = aux + 2（含开/闭围栏），与 block_content_id 同口径
+        let ls = doc.line_starts();
+        let mid = (src0 + own / 2).min(doc.line_count().saturating_sub(1));
+        let ls_mid = ls.get(mid).unwrap_or(m.byte as usize);
+        let le_mid = ls.get(mid + 1).unwrap_or(doc.len());
+        let old_line = doc.rope().slice(ls_mid..le_mid).to_string();
+        let new_line = old_line.replacen("let var_a_", "let xyz_a_", 1);
+        assert_ne!(old_line, new_line, "夹具中段须可构造内容变化");
+        doc.edit(ls_mid..le_mid, &new_line);
+        // 换代：宿主在真实流里文档编辑后自增 content_gen（引擎只消费 helper `content_gen`）。
+        let next_gen = rd.borrow().content_gen.get().wrapping_add(1);
+        rd.borrow_mut().content_gen.set(next_gen);
+        let gen1 = content_gen(&rd);
+        assert_ne!(gen0, gen1, "换代自增须生效");
+        let fresh1 = block_content_id(&doc, b0);
+        assert_ne!(fresh1, fresh0, "内容编辑必须改变全内容指纹");
+        let key1 = {
+            let rdg = rd.borrow_mut();
+            let mut pw = rdg.prewarm.borrow_mut();
+            pw.memo_giant_content_key(gen1, &doc, b0)
+        };
+        assert_eq!(key1, fresh1, "换代后 memo 必须重算并等于新新鲜值");
+        assert_ne!(key1, key0, "内容编辑失效后 memo 键必须变化");
     }
 
     /// 一块「已整形」代码块的占位行：src_line 标记其为某块的正文（测试只用它作身份标记，

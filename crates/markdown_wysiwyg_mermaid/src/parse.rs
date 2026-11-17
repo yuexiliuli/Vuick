@@ -124,9 +124,11 @@ fn mm_node(s: &str) -> (String, Option<String>, MmShape) {
             };
         }
     }
-    // 不对称旗形 `> … ]`。
+    // 不对称旗形 `> … ]`。仅当 `>` 前不含括号开符（`[`/`{`/`(`）才成立——
+    // 否则该 `>` 在标签/文本里（如 `A[开始 --> 处理]` 的 `-->`），不算旗形（C13）。
     if let Some(oi) = s.find('>')
-        && oi > 0 {
+        && oi > 0
+        && !s[..oi].contains(['[', '{', '(']) {
             let id = s[..oi].trim().to_string();
             let rest = &s[oi + 1..];
             return match rest.find(']') {
@@ -238,36 +240,141 @@ const EDGE_SPECS: &[(&str, &str, MmEdgeKind)] = &[
     ("--x", "--", MmEdgeKind::CrossEnd),
 ];
 
-/// 从文本中找最早出现的边结束标记。
-fn earliest_op(s: &str) -> Option<(usize, &'static str, &'static str, MmEdgeKind)> {
-    let mut best: Option<(usize, &'static str, &'static str, MmEdgeKind)> = None;
-    for (end, start, kind) in EDGE_SPECS {
-        if let Some(i) = s.find(end)
-            && best.is_none_or(|(bi, _, _, _)| i < bi) {
-                best = Some((i, end, start, *kind));
+/// 在 `s` 中找第一个**括号围栏（`[]`/`{}`）与引号外**的边结束标记，
+/// 返回 (字节偏移, end, start, 边型)。围栏/引号内的「长得像箭头」是标签/文本，不算分隔 op（C13）。
+fn find_edge_op(s: &str) -> Option<(usize, &'static str, &'static str, MmEdgeKind)> {
+    let b = s.as_bytes();
+    let mut sq = 0i32; // `[]` 深度
+    let mut br = 0i32; // `{}` 深度
+    let mut in_q: Option<u8> = None;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = in_q {
+            if c == q {
+                in_q = None;
             }
-    }
-    best
-}
-
-/// `rhs` 中 to 节点结束的位置（下一个边结束标记），无则到串尾。
-fn split_to_node(rhs: &str) -> (&str, &str) {
-    let mut m: Option<usize> = None;
-    for (e2, _, _) in EDGE_SPECS {
-        if let Some(j) = rhs.find(e2) {
-            m = Some(m.map_or(j, |mm: usize| mm.min(j)));
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => {
+                in_q = Some(c);
+                i += 1;
+            }
+            b'[' => {
+                sq += 1;
+                i += 1;
+            }
+            b']' => {
+                if sq > 0 {
+                    sq -= 1;
+                }
+                i += 1;
+            }
+            b'{' => {
+                br += 1;
+                i += 1;
+            }
+            b'}' => {
+                if br > 0 {
+                    br -= 1;
+                }
+                i += 1;
+            }
+            _ => {
+                if sq == 0 && br == 0 {
+                    if let Some((end, start, kind)) =
+                        EDGE_SPECS.iter().find(|(e, _, _)| b[i..].starts_with(e.as_bytes()))
+                    {
+                        return Some((i, end, start, *kind));
+                    }
+                }
+                i += 1;
+            }
         }
     }
-    match m {
-        Some(j) => (&rhs[..j], &rhs[j..]),
+    None
+}
+
+/// 在 `s` 中找**括号围栏（`[]`/`{}`）与引号外**出现的 `marker` 的**最后一个**字节偏移（无则 None）。
+/// 用于边标签起始标记定位 `A -- 文字 --> B`（`A[开始 --> 处理]` 这类围栏内的 `--` 不算，C13）。
+fn rfind_start_outside_fence(s: &str, marker: &str) -> Option<usize> {
+    let mb = marker.as_bytes();
+    if mb.is_empty() {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut sq = 0i32; // `[]` 深度
+    let mut br = 0i32; // `{}` 深度
+    let mut in_q: Option<u8> = None;
+    let mut last: Option<usize> = None;
+    let mut i = 0usize;
+    while i + mb.len() <= b.len() {
+        let c = b[i];
+        if let Some(q) = in_q {
+            if c == q {
+                in_q = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => {
+                in_q = Some(c);
+                i += 1;
+            }
+            b'[' => {
+                sq += 1;
+                i += 1;
+            }
+            b']' => {
+                if sq > 0 {
+                    sq -= 1;
+                }
+                i += 1;
+            }
+            b'{' => {
+                br += 1;
+                i += 1;
+            }
+            b'}' => {
+                if br > 0 {
+                    br -= 1;
+                }
+                i += 1;
+            }
+            _ => {
+                if sq == 0 && br == 0 && b[i..].starts_with(mb) {
+                    last = Some(i);
+                    i += mb.len();
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    last
+}
+
+/// 从文本中找最早出现的边结束标记（围栏/引号内的不算，C13）。
+fn earliest_op(s: &str) -> Option<(usize, &'static str, &'static str, MmEdgeKind)> {
+    find_edge_op(s)
+}
+
+/// `rhs` 中 to 节点结束的位置（下一个围栏外边结束标记），无则到串尾。
+fn split_to_node(rhs: &str) -> (&str, &str) {
+    match find_edge_op(rhs) {
+        Some((j, _, _, _)) => (&rhs[..j], &rhs[j..]),
         None => (rhs, ""),
     }
 }
 
-/// 按括号外的 `&` 拆分：`A --> B & C --> D` → 两条链路。
+/// 按括号（`[]`/`{}`）与引号外的 `&` 拆分：`A --> B & C --> D` → 两条链路。
 fn split_amp(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
-    let mut depth = 0i32;
+    let mut sq = 0i32; // `[]` 深度
+    let mut br = 0i32; // `{}` 深度
     let mut start = 0usize;
     let mut in_q: Option<char> = None;
     for (i, c) in s.char_indices() {
@@ -278,10 +385,18 @@ fn split_amp(s: &str) -> Vec<&str> {
         } else if c == '"' || c == '\'' {
             in_q = Some(c);
         } else if c == '[' {
-            depth += 1;
+            sq += 1;
         } else if c == ']' {
-            depth -= 1;
-        } else if c == '&' && depth == 0 {
+            if sq > 0 {
+                sq -= 1;
+            }
+        } else if c == '{' {
+            br += 1;
+        } else if c == '}' {
+            if br > 0 {
+                br -= 1;
+            }
+        } else if c == '&' && sq == 0 && br == 0 {
             parts.push(&s[start..i]);
             start = i + 1;
         }
@@ -367,7 +482,7 @@ fn parse_single_chain(
         let mut rhs_raw = &s[i + end.len()..];
         let (lhs, label_at) = match lhs_all.strip_suffix(start) {
             Some(x) => (x.trim(), None),
-            None => match lhs_all.rfind(start) {
+            None => match rfind_start_outside_fence(lhs_all, start) {
                 Some(k) => (lhs_all[..k].trim(), Some(lhs_all[k + start.len()..].trim().to_string())),
                 None => (lhs_all.trim(), None),
             },
@@ -597,9 +712,11 @@ fn parse_subgraph_open(rest: &str, subgraphs: &mut Vec<MmSubgraph>, open_sub: &m
 // 序列图解析
 // ---------------------------------------------------------------------------
 
-/// 消息箭头（长先）：返回 (匹配处索引, 箭头, 该箭头字符长度)。
+/// 消息箭头（长先）：返回 (最早出现处索引, 箭头, 该箭头字符长度)。
+/// 取**出现位置最早**的箭头（同一位置按表序取长先）；`:` 冒号后消息文本里更晚出现的
+/// `-->` 等不会被当成消息箭头（C13）。
 fn parse_seq_arrow(t: &str) -> Option<(usize, MmSeqArrow, usize)> {
-    for (pat, arrow) in [
+    let pats = [
         ("-->>", MmSeqArrow::Dotted),
         ("-->", MmSeqArrow::DottedOpen),
         ("->>", MmSeqArrow::Solid),
@@ -608,12 +725,15 @@ fn parse_seq_arrow(t: &str) -> Option<(usize, MmSeqArrow, usize)> {
         ("-x", MmSeqArrow::SolidCross),
         ("->", MmSeqArrow::SolidOpen),
         ("-)", MmSeqArrow::SolidOpen),
-    ] {
-        if let Some(i) = t.find(pat) {
-            return Some((i, arrow, pat.len()));
-        }
+    ];
+    let mut best: Option<(usize, MmSeqArrow, usize)> = None;
+    for (pat, arrow) in pats {
+        if let Some(i) = t.find(pat)
+            && best.is_none_or(|(bi, _, _)| i < bi) {
+                best = Some((i, arrow, pat.len()));
+            }
     }
-    None
+    best
 }
 
 /// 解析 `participant/actor` 行 → (id, label, is_actor)。

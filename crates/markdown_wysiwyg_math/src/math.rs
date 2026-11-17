@@ -472,11 +472,27 @@ pub struct MathSeg {
     pub pos: MathPos,
 }
 
+/// 递归嵌套深度上限：超过该层数的 `^`/`_`/`\frac` 等组内嵌不再向更深展开（超限截断），
+/// 防深嵌套输入（如数千个 `^{`）在 shape/字符串展开期递归爆栈或无限膨胀（C12，对齐红测 64）。
+const MAX_MATH_NEST: usize = 64;
+/// 单个输入的字符数硬上限：超限只处理前缀（截断），进一步约束整体展开上界（C12 防御性护栏）。
+const MAX_MATH_INPUT_LEN: usize = 4096;
+
 /// 同 `math_to_unicode` 的扫描，但把顶层 `^{…}`/`_{…}` 拆成独立段（Sup/Sub）。
 /// 普通文本兜底进 Normal 段，`\frac/\sqrt/\text` 等命令整体仍按 math_to_unicode 转进
 /// Normal 段（组内嵌套的 `^`/`_` 在递归里转成 Unicode 码位即可，不再细分）。
 pub fn math_to_segments(src: &str) -> Vec<MathSeg> {
-    let cs: Vec<char> = src.chars().collect();
+    math_to_segments_at(src, 0)
+}
+
+/// 带递归深度/输入长度护栏的实现；`depth` = 已进入的组嵌套层数（C12）。
+fn math_to_segments_at(src: &str, depth: usize) -> Vec<MathSeg> {
+    // 超深嵌套：不再向内展开（截断），防递归爆栈/无限膨胀。
+    if depth >= MAX_MATH_NEST {
+        return Vec::new();
+    }
+    // 超长输入：只展开前缀（截断），约束整体展开上界。
+    let cs: Vec<char> = src.chars().take(MAX_MATH_INPUT_LEN).collect();
     let mut segs: Vec<MathSeg> = Vec::new();
     let mut buf = String::with_capacity(src.len());
     let mut i = 0;
@@ -494,7 +510,7 @@ pub fn math_to_segments(src: &str) -> Vec<MathSeg> {
             '^' => {
                 flush(&mut segs, &mut buf);
                 let (g, ni) = read_group(&cs, i + 1);
-                let g = math_to_unicode(&g);
+                let g = math_to_unicode_at(&g, depth + 1);
                 let mut t = String::new();
                 for c in g.chars() {
                     t.push(sup_map(c).unwrap_or(c));
@@ -508,7 +524,7 @@ pub fn math_to_segments(src: &str) -> Vec<MathSeg> {
             '_' => {
                 flush(&mut segs, &mut buf);
                 let (g, ni) = read_group(&cs, i + 1);
-                let g = math_to_unicode(&g);
+                let g = math_to_unicode_at(&g, depth + 1);
                 let mut t = String::new();
                 for c in g.chars() {
                     t.push(sub_map(c).unwrap_or(c));
@@ -549,11 +565,11 @@ pub fn math_to_segments(src: &str) -> Vec<MathSeg> {
                             None => (None, j),
                         };
                         if let Some(a) = &a {
-                            buf.push_str(&math_to_unicode(a));
+                            buf.push_str(&math_to_unicode_at(a, depth + 1));
                         }
                         buf.push('/');
                         if let Some(b) = &b {
-                            buf.push_str(&math_to_unicode(b));
+                            buf.push_str(&math_to_unicode_at(b, depth + 1));
                         }
                         i = nj;
                     }
@@ -563,10 +579,10 @@ pub fn math_to_segments(src: &str) -> Vec<MathSeg> {
                         if let Some(g) = g {
                             if g.chars().count() > 1 {
                                 buf.push('(');
-                                buf.push_str(&math_to_unicode(&g));
+                                buf.push_str(&math_to_unicode_at(&g, depth + 1));
                                 buf.push(')');
                             } else {
-                                buf.push_str(&math_to_unicode(&g));
+                                buf.push_str(&math_to_unicode_at(&g, depth + 1));
                             }
                         }
                         i = ni;
@@ -574,7 +590,7 @@ pub fn math_to_segments(src: &str) -> Vec<MathSeg> {
                     "text" | "mathrm" | "mathit" | "operatorname" | "mbox" => {
                         let (g, ni) = read_group_opt(&cs, j);
                         if let Some(g) = g {
-                            buf.push_str(&math_to_unicode(&g));
+                            buf.push_str(&math_to_unicode_at(&g, depth + 1));
                         }
                         i = ni;
                     }
@@ -606,5 +622,10 @@ pub fn math_to_segments(src: &str) -> Vec<MathSeg> {
 /// 处理上下标（`^`/`_`，含 `{…}` 组）、`\frac`/`\sqrt`/`\text` 等、希腊字母与常用符号。
 /// 行内数学继续用这个扁平字符串版；**卡片**走 `math_to_segments`（细分段、可缩小+偏移）。
 pub fn math_to_unicode(src: &str) -> String {
-    math_to_segments(src).into_iter().map(|s| s.text).collect()
+    math_to_unicode_at(src, 0)
+}
+
+/// 带递归深度护栏的字符串版（复用 `math_to_segments_at` 的扫描与兜底，C12）。
+fn math_to_unicode_at(src: &str, depth: usize) -> String {
+    math_to_segments_at(src, depth).into_iter().map(|s| s.text).collect()
 }

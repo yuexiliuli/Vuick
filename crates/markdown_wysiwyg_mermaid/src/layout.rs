@@ -315,6 +315,12 @@ struct FlowElements {
     n_layers: usize,
 }
 
+/// 长边插桩虚节点总数硬上界：超过则跳过剩余长边插桩（该边直接连实边，安全降级），
+/// 防超大图在 shape 期 UI 线程 OOM/卡死（C13，对齐红测 10000）。
+/// 注：`layer_map` 的最长路径环数已有 `nodes.len()` 上界（含环图也有限），故本体
+/// 只防「虚节点总量 O(n·e) 爆炸」，不再引入死循环。
+const MAX_VIRTUAL_NODES: usize = 10_000;
+
 /// 元素装配：实节点 + 长边插桩虚节点，产出链、分层与索引。
 fn flow_elements(g: &MmGraph) -> FlowElements {
     let layer_of = layer_map(g);
@@ -323,12 +329,19 @@ fn flow_elements(g: &MmGraph) -> FlowElements {
     let real_index: HashMap<String, usize> = g.nodes.iter().enumerate().map(|(i, n)| (n.id.clone(), i)).collect();
     let mut virtual_layers: Vec<Option<usize>> = vec![None; elements.len()];
     let mut chain: Vec<(usize, usize, MmEdgeKind, Option<String>)> = Vec::new();
+    let mut virtual_count = 0usize;
     for e in &g.edges {
         let a = real_index[&e.from];
         let b = real_index[&e.to];
         let la = layer_of[&e.from];
         let lb = layer_of[&e.to];
         if lb >= la + 2 {
+            // 需插 lb-la-1 个虚节点；加上会超护栏 → 跳过本边插桩，直接连实边（安全降级）。
+            let need = lb - la - 1;
+            if virtual_count + need > MAX_VIRTUAL_NODES {
+                chain.push((a, b, e.kind, e.label.clone()));
+                continue;
+            }
             let mut cur = a;
             for l in la + 1..lb {
                 elements.push((format!("~v{}", elements.len()), String::new(), MmShape::Circle));
@@ -336,6 +349,7 @@ fn flow_elements(g: &MmGraph) -> FlowElements {
                 chain.push((cur, elements.len() - 1, MmEdgeKind::Line, None));
                 cur = elements.len() - 1;
             }
+            virtual_count += need;
             chain.push((cur, b, e.kind, e.label.clone()));
         } else {
             chain.push((a, b, e.kind, e.label.clone()));

@@ -758,7 +758,6 @@ pub fn link_hit_at(
         let Some(w0) = r.wrapped.first() else {
             continue;
         };
-        let ox = f32::from(frame.padding) + f32::from(r.x_off);
         for lk in &r.extra.links {
             let (Some(p0), Some(p1)) = (
                 w0.position_for_index(lk.disp.start, r.lh),
@@ -766,11 +765,26 @@ pub fn link_hit_at(
             ) else {
                 continue;
             };
+            // 逐可视带水平对齐移量（与 paint_text_row 逐带 `align_offsets[k]` 一致）：
+            // head/tail 各按其所在带取，避免「跨带链接 + 标题对齐」时上下两段各错位。
+            // band 查找姿势同本文件 `source_offset_at_local`（`text_band_at` 吃块首相对 y）。
+            let a0 = r
+                .align_offsets
+                .get(text_band_at(r, f32::from(p0.y).max(0.)))
+                .copied()
+                .unwrap_or(px(0.));
+            let a1 = r
+                .align_offsets
+                .get(text_band_at(r, f32::from(p1.y).max(0.)))
+                .copied()
+                .unwrap_or(px(0.));
+            let ox0 = f32::from(frame.padding) + f32::from(r.x_off) + f32::from(a0);
+            let ox1 = f32::from(frame.padding) + f32::from(r.x_off) + f32::from(a1);
             let p0y = top + text_row_shift(r) + f32::from(p0.y);
             let p1y = top + text_row_shift(r) + f32::from(p1.y);
             let contains = if f32::from(p0.y) == f32::from(p1.y) {
-                let x0 = ox + f32::from(p0.x);
-                let x1 = ox + f32::from(p1.x);
+                let x0 = ox0 + f32::from(p0.x);
+                let x1 = ox1 + f32::from(p1.x);
                 py >= p0y
                     && py < p0y + f32::from(r.lh)
                     && f32::from(p.x) >= x0
@@ -778,12 +792,12 @@ pub fn link_hit_at(
             } else {
                 let head_ok = py >= p0y
                     && py < p0y + f32::from(r.lh)
-                    && f32::from(p.x) >= ox + f32::from(p0.x)
-                    && f32::from(p.x) <= ox + f32::from(w0.width());
+                    && f32::from(p.x) >= ox0 + f32::from(p0.x)
+                    && f32::from(p.x) <= ox0 + f32::from(w0.width());
                 let tail_ok = py >= p1y
                     && py < p1y + f32::from(r.lh)
-                    && f32::from(p.x) >= ox
-                    && f32::from(p.x) <= ox + f32::from(p1.x);
+                    && f32::from(p.x) >= ox1
+                    && f32::from(p.x) <= ox1 + f32::from(p1.x);
                 head_ok || tail_ok
             };
             if contains {
@@ -1241,4 +1255,230 @@ pub fn math_hscrollbar_hit(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::TestAppContext;
+    use crate::theme::WyTheme;
+
+    /// C6 复现（红测）：`link_hit_at` 漏 `align_offsets`。
+    /// 对照正确姿势（hit.rs `source_offset_at_local` / `caret_geometry` 逐带取
+    /// `r.align_offsets[text_band_at(...)]`）：命中判定必须加行的水平对齐移量，否则
+    /// paint 侧画链接带 align 偏移（EPUB 标题 `%%ALIGN:CENTER%%` 等）而命中侧不偏移 →
+    /// 水平错位、标题内链接点不中。当前 `ox = padding + x_off`（漏 align）→ 对齐带内的
+    /// 点击 None = 红。
+    ///
+    /// 测试夹具：headless `#[gpui::test]` 用独立 `WindowTextSystem`（与真实
+    /// `Window::text_system()` 同构：`WindowTextSystem::new(Arc<TextSystem>)`）在测试平台
+    /// 上 shape 一行真实链接文本；手动装配 `ShapedRow`（`align_offsets=[100px]`、
+    /// `x_off=0`）与 `Frame`，`StubHost::last_bounds` 置窗口原点 → 元素局部 == 窗口坐标。
+    #[gpui::test]
+    fn link_hit_at_considers_align_offsets(cx: &mut TestAppContext) {
+        let wts = gpui::WindowTextSystem::new(cx.text_system().clone());
+        let row = aligned_link_row(&wts);
+        // 几何推导（K177/K143）：shape 期行宽（Noop 文本 0.6em/字符，16px × 6 字符 ≈
+        // 57.6px）——夹具必须 < align(100px)（对齐带内点才在新命中区且旧命中区之外）。
+        let link_w = f32::from(row.wrapped.first().unwrap().width());
+        assert!(
+            link_w > 12. && link_w < 100.,
+            "夹具行宽须落在可区分区间（>12 使旧区左缘点可命中、<100 使对齐点区分得开），实得 {link_w}"
+        );
+        let frame = Frame {
+            padding: px(12.),
+            line_h: px(20.),
+            rows: vec![row],
+            base: Rc::new(RefCell::new(BlockLayout::new(vec![20.], vec![0u32]))),
+            deltas: Rc::new([]),
+            total: px(20.),
+            band: (0., 1000.),
+            width: px(600.),
+            rgen: 0,
+            igen: 0,
+            mgen: 0,
+            zgen: 0,
+        };
+        let rd = RefCell::new(WyRenderModel::new(test_theme()));
+        let stub = StubHost::new();
+        let py = 10.0f32;
+        // 修复后命中区 = [padding + x_off + align, +align+行宽] = [112, 112+link_w]。
+        // 取带内一点（padding + 112）：修复前忽略 align → 旧命中区 [12, 12+link_w] →
+        // None = 红。
+        let hit = link_hit_at(
+            &rd,
+            &stub,
+            &frame,
+            point(px(f32::from(frame.padding) + 112.0), px(py)),
+        );
+        assert!(
+            hit.is_some(),
+            "对齐带内的链接点击须命中（paint 已画在 align 偏移处），修复前漏 align_offsets → None = 红"
+        );
+        // 语义自洽：不含 align 的原位置（padding + 1 < align，链接已被右移）不应命中。
+        let unshifted = link_hit_at(
+            &rd,
+            &stub,
+            &frame,
+            point(px(f32::from(frame.padding) + 1.0), px(py)),
+        );
+        assert!(
+            unshifted.is_none(),
+            "未偏移的原位置不应命中（链接被 align=100 右移后不在该处），实得 {unshifted:?}"
+        );
+    }
+
+    /// 一条「整行是链接 + 逐可视行水平对齐移量 = 100px」的单行（段落）行。
+    fn aligned_link_row(wts: &gpui::WindowTextSystem) -> ShapedRow {
+        let text = "ABCDEF";
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font("monospace"),
+            color: gpui::Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let wrapped: Vec<gpui::WrappedLine> = wts
+            .shape_text(text.into(), px(16.), std::slice::from_ref(&run), None, None)
+            .unwrap()
+            .into_vec();
+        assert!(!wrapped.is_empty(), "shape_text 须产出至少一行");
+        ShapedRow {
+            src_line: 0,
+            src_lines: 0..1,
+            wrapped: Rc::new(wrapped),
+            has_non_ascii: false,
+            sub_heights: vec![px(20.)],
+            byte_map: Rc::new(vec![0; text.len() + 1]),
+            editable: true,
+            multi_offsets: Vec::new(),
+            code_ranges: Vec::new(),
+            lh: px(20.),
+            x_off: px(0.),
+            align_offsets: vec![px(100.)],
+            height: px(20.),
+            top: px(0.),
+            kind: IrKind::Paragraph,
+            quoted: false,
+            table: None,
+            table_edit: None,
+            image: None,
+            mm: None,
+            extra: RowExtra {
+                links: vec![RowLink {
+                    disp: 0..text.len(),
+                    target: LinkHit::Url("https://example.com".into()),
+                }],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// 最小 `WyRenderHost` 桩：本红测路径（`link_hit_at` → `to_local`）只消费
+    /// `last_bounds`（窗口坐标 → 元素局部换算）；其余方法给合理默认、路径内不被调用。
+    /// `image_cache` 无 `&App` 不可构造实体 → 用 `unimplemented!`（绝不被本路径触达）。
+    struct StubHost {
+        doc: markdown::doc::Doc,
+        bounds: Bounds<Pixels>,
+    }
+    impl StubHost {
+        fn new() -> Self {
+            Self {
+                doc: markdown::doc::Doc::open("行1\n行2\n".into()),
+                bounds: Bounds::new(point(px(0.), px(0.)), size(px(600.), px(200.))),
+            }
+        }
+    }
+    impl WyRenderHost for StubHost {
+        fn doc(&self) -> &markdown::doc::Doc {
+            &self.doc
+        }
+        fn caret(&self) -> usize {
+            0
+        }
+        fn is_editable(&self) -> bool {
+            true
+        }
+        fn is_epub(&self) -> bool {
+            false
+        }
+        fn last_bounds(&self) -> Option<Bounds<Pixels>> {
+            Some(self.bounds)
+        }
+        fn memory_image(&self, _src: &str) -> Option<std::sync::Arc<gpui::Image>> {
+            None
+        }
+        fn image_load_resource(&self, _src: &str) -> gpui::Resource {
+            gpui::Resource::Path(std::sync::Arc::from(std::path::PathBuf::from("stub.png")))
+        }
+        fn image_cache(&self) -> gpui::Entity<gpui::RetainAllImageCache> {
+            unimplemented!("本红测路径（link_hit_at）不消费图片缓存")
+        }
+        fn image_intrinsic_size(&self, _src: &str) -> Option<(f32, f32)> {
+            None
+        }
+        fn math_slot(&self, _key: &str) -> Option<markdown_wysiwyg_math::MathSlot> {
+            None
+        }
+        fn code_parse_lookup(
+            &self,
+            _lang: &str,
+            _code: &str,
+        ) -> crate::code_parse::CodeParseLookup {
+            crate::code_parse::CodeParseLookup::NotReady
+        }
+        fn request_code_parse(&self, _lang: &str, _code: &str, _src_line: usize) {}
+        fn focused_mermaid(&self) -> Option<usize> {
+            None
+        }
+        fn hover_image(&self) -> Option<usize> {
+            None
+        }
+        fn selected_image(&self) -> Option<usize> {
+            None
+        }
+        fn hover_inline_image(&self) -> Option<crate::model::InlineImageRef> {
+            None
+        }
+        fn selected_inline_image(&self) -> Option<crate::model::InlineImageRef> {
+            None
+        }
+        fn selection(&self) -> Option<Range<usize>> {
+            None
+        }
+        fn search_highlight_range(&self) -> Option<Range<usize>> {
+            None
+        }
+    }
+
+    /// 最小主题（复刻 frame.rs 测试 `test_theme`）：本红测只需一个 `WyRenderModel`；
+    /// `link_hit_at` 路径不读主题，仅构造用。
+    fn test_theme() -> WyTheme {
+        use markdown::view::style::StyleParams;
+        let sp = StyleParams {
+            mono: "monospace".into(),
+            fg: gpui::Hsla::default(),
+            muted_fg: gpui::Hsla::default(),
+            code_bg: gpui::Hsla::default(),
+            code_inline_fg: gpui::Hsla::default(),
+            code_inline_bg: gpui::Hsla::default(),
+            divider: gpui::Hsla::default(),
+            accent: gpui::Hsla::default(),
+            link: gpui::Hsla::default(),
+            quote_bg: gpui::Hsla::default(),
+            table_head_bg: gpui::Hsla::default(),
+            mermaid_accents: [gpui::Hsla::default(); 6],
+            mermaid_border: gpui::Hsla::default(),
+            para_size: gpui::px(16.),
+            para_line: gpui::px(23.2),
+            code_size: gpui::px(14.),
+            code_line: gpui::px(20.8),
+            is_dark: false,
+        };
+        WyTheme::from_style(&sp, gpui::font("monospace"), gpui::px(16.))
+    }
 }
