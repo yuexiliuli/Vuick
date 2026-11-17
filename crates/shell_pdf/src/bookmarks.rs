@@ -128,21 +128,32 @@ pub fn bookmarks_for(m: &AppModel, path: &Path) -> Option<Vec<PdfBookmark>> {
 
 /// 添加/覆盖一条书签（同页去重）：更新内存 + 原子落盘。宿主在模型借用结束后自行
 /// notify（`EditorApp::add_pdf_bookmark` 的模型 + save 部分）。
+///
+/// **A4 多窗口安全**：不基于窗口本地快照 `m.pdf_bookmarks` 整份落盘——两窗并存时每窗
+/// 启动各持一份 `load_cached()` 克隆（`shell/app/init.rs`），旧快照整份覆盖会抹掉对端
+/// 窗口新增的书签。改为：以**最新盘面**（`store().load()` 直读磁盘、绕过窗口旧快照）
+/// 为底，应用本次增量后整体落盘 + 回写缓存，再同步窗口内存态（模型读数一致）。
+/// 单窗口语义不变：盘面 = 模型 = 缓存恒等。
 pub fn add_bookmark(m: &mut AppModel, path: &Path, page_index: usize, title: String) {
     let key = normalize_key(path);
-    let list = m.pdf_bookmarks.entry(key.clone()).or_default();
+    let mut map = store().load();
+    let list = map.entry(key.clone()).or_default();
     if let Some(existing) = list.iter_mut().find(|b| b.page_index == page_index) {
         existing.title = title;
     } else {
         list.push(PdfBookmark { page_index, title });
     }
-    save(&m.pdf_bookmarks);
+    save(&map);
+    m.pdf_bookmarks = map;
 }
 
 /// 移除某路径书签列表中第 `idx` 条（列表空 → 整键删除）+ 落盘；返回是否移除。
+/// A4 多窗口安全同 [`add_bookmark`]：以最新盘面为底做增量，避免旧快照把对端已删书签
+/// 「复活」回盘。
 pub fn remove_bookmark(m: &mut AppModel, path: &Path, idx: usize) -> bool {
     let key = normalize_key(path);
-    let Some(list) = m.pdf_bookmarks.get_mut(&key) else {
+    let mut map = store().load();
+    let Some(list) = map.get_mut(&key) else {
         return false;
     };
     if idx >= list.len() {
@@ -150,9 +161,10 @@ pub fn remove_bookmark(m: &mut AppModel, path: &Path, idx: usize) -> bool {
     }
     list.remove(idx);
     if list.is_empty() {
-        m.pdf_bookmarks.remove(&key);
+        map.remove(&key);
     }
-    save(&m.pdf_bookmarks);
+    save(&map);
+    m.pdf_bookmarks = map;
     true
 }
 
@@ -192,5 +204,87 @@ mod tests {
         // 空 / 非对象 → 空 map。
         assert!(from_json(&Value::Null).is_empty());
         assert!(from_json(&json!([])).is_empty());
+    }
+
+    /// 复现 P1「两窗并发写书签互相覆盖」：每窗 `AppModel` 启动各持一份 `load_cached()`
+    /// 克隆快照（`shell/app/init.rs` `AppModel::new(::bookmarks::load_cached(), ...)`），
+    /// 窗口 A 加书签 X 落盘后，窗口 B 若再增删书签，会用**不含 X 的旧快照整份覆盖**
+    /// 落盘 —— `save(&m.pdf_bookmarks)` 落的是整份 map，X 被静默抹掉
+    /// （注明「单进程无外部改写安全」只对单窗成立，两窗并存即破）。
+    ///
+    /// 预期（修复后）：B 用旧快照落盘不得抹掉 A 的书签 X，X 应仍在盘上。
+    /// 当前实现（修复前）：B 的整体覆盖把 X 抹掉 → 本断言红。
+    #[test]
+    fn two_windows_add_bookmarks_with_stale_snapshot_does_not_lose_peer() {
+        // 盘面与进程缓存复位到空 = 确定初态（同「全新安装/首次启动」）；config test-mode
+        // 隔离目录，不触碰真实 %APPDATA%。
+        save(&HashMap::new());
+
+        // 两个窗口同时开着：各自构造时 `load_cached()` 得到同一份**空快照**（B 不重读盘面）。
+        let mut window_a = AppModel::default();
+        window_a.pdf_bookmarks = load_cached();
+        let mut window_b = AppModel::default();
+        window_b.pdf_bookmarks = load_cached();
+
+        let pdf_a = Path::new("D:\\docs\\a.pdf");
+        let pdf_b = Path::new("D:\\docs\\b.pdf");
+
+        // 窗口 A 加书签 X → A 的整份 map 落盘（盘面含 X）。
+        add_bookmark(&mut window_a, pdf_a, 3, "窗口A的书签X".to_string());
+        // 窗口 B（旧快照不含 X）加书签 Y → B 的整份 map 覆盖落盘 → 修复前 X 被抹掉。
+        add_bookmark(&mut window_b, pdf_b, 5, "窗口B的书签Y".to_string());
+
+        // 断言 X 仍在盘上（盘面直读 `load()`，进程内缓存 `load_cached()` 应镜像一致）。
+        let key_a = normalize_key(pdf_a);
+        let disk = load();
+        assert!(
+            disk.get(&key_a).is_some(),
+            "窗口 B（旧快照）整份覆盖落盘后，窗口 A 的书签 X 不应丢失；盘面 = {:?}",
+            disk,
+        );
+        assert!(
+            load_cached().get(&key_a).is_some(),
+            "进程内缓存也应保留窗口 A 的书签 X（缓存镜像盘面）",
+        );
+    }
+
+    /// remove 变体：`remove_bookmark` 同样 `save(&m.pdf_bookmarks)` 整份 map。—— 盘面预置
+    /// A 的书签 X 后，两窗共享同快照；A 移除 X 落盘，B 再用**仍含 X 的旧快照**往另一 PDF
+    /// 加书签 Y → B 的整份覆盖把已移除的 X「复活」回盘面（A 的移除被静默撤销）。
+    ///
+    /// 预期（修复后）：A 的移除生效，X 不应回到盘上。
+    /// 当前实现（修复前）：X 被 B 的旧快照整体带回 → 本断言红。
+    #[test]
+    fn two_windows_remove_bookmark_with_stale_snapshot_does_not_undo_peer_delete() {
+        // 确定初态：盘面预置 A 的书签 X（同「旧会话已读过 a.pdf 且点赞了第 3 页」）。
+        let key_a = normalize_key(Path::new("D:\\docs\\a.pdf"));
+        let key_b = normalize_key(Path::new("D:\\docs\\b.pdf"));
+        save(&HashMap::from([(
+            key_a.clone(),
+            vec![PdfBookmark { page_index: 3, title: "X书签".to_string() }],
+        )]));
+
+        // 两窗同时开着：各自启动快照都含 X（缓存命中同一盘面）。
+        let mut window_a = AppModel::default();
+        window_a.pdf_bookmarks = load_cached();
+        let mut window_b = AppModel::default();
+        window_b.pdf_bookmarks = load_cached();
+
+        // 窗口 A 移除 X 并落盘（盘面应已无 X）。
+        assert!(
+            remove_bookmark(&mut window_a, Path::new("D:\\docs\\a.pdf"), 0),
+            "A 窗口应能移除自己的书签 X",
+        );
+        // 窗口 B（旧快照仍含 X）给另一 PDF 加书签 Y → B 的整份 map 覆盖落盘。
+        add_bookmark(&mut window_b, Path::new("D:\\docs\\b.pdf"), 5, "Y书签".to_string());
+
+        // 断言：A 已移除的 X 不应被 B 的整份覆盖「复活」回盘上。
+        let disk = load();
+        assert!(
+            disk.get(&key_a).is_none(),
+            "窗口 B（旧快照仍含 X）整份覆盖后，A 已移除的书签 X 不应复活回盘；盘面 = {:?}，B 的新增 = {:?}",
+            disk,
+            disk.get(&key_b),
+        );
     }
 }

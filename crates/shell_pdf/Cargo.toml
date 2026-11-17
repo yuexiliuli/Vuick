@@ -30,3 +30,8 @@ rfd = { workspace = true }
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（仅测试构建，不新增外部包），
 # 供 `#[gpui::test]` 无头驱动 AppModel + PdfViewer 实体（与 pdf crate 同款姿势）。
 gpui = { workspace = true, features = ["test-support"] }
+# K8 根因同款（对齐 shell/music）：config 作依赖编译不带自身 cfg(test) → 书签持久化
+# 走 UserPrefs::config_path() 在测试里会直读/直写真实 %APPDATA% 的 pdf_bookmarks.json。
+# 此处 dev 下显式打开 test-mode，让 config_path() 落在 %TEMP%\vuick-test-<pid> 隔离目录
+# （dev-dep 仅测试构建启用，不影响生产路径 `cargo build --bin vuick`）。
+config = { path = "../config", features = ["test-mode"] }
