@@ -41,8 +41,8 @@ impl super::VideoViewer {
                     out_rx.recv_timeout(std::time::Duration::from_secs(8))
                 })
                 .await;
-            match outcome {
-                Ok(Ok(p)) => {
+            match handshake_decision(outcome) {
+                HandshakeDecision::Open(p) => {
                     let _ = weak.update(cx, |this, cx| {
                         // 开成功：只关 loading（AsyncState 的 `data` 不承载"已加载结果"——视频的
                         // 已加载=帧/元数据各字段上屏，故保留字面写而非 set_ready(())，避免伪造
@@ -88,17 +88,19 @@ impl super::VideoViewer {
                         cx.notify();
                     });
                 }
-                Ok(Err(e)) => {
+                HandshakeDecision::Failed(e) => {
                     let _ = weak.update(cx, |this, cx| {
                         this.state.set_error(e);
                         this.stop_pump_on_failure();
                         cx.notify();
                     });
                 }
-                Err(_) => {
-                    // 超时：至少把 loading 关掉（画面静态，不卡佔位）
+                HandshakeDecision::Timeout => {
+                    // 8s 握手超时（或 worker 通道断开）：不再静默关 loading——报可感知错误
+                    // 上屏（render 把 load_error 渲染成「无法打开视频：…」占位），用户明确
+                    // 看到失败，而非「转圈消失、视频永远不出来」的静默死局。
                     let _ = weak.update(cx, |this, cx| {
-                        this.state.loading = false;
+                        this.state.set_error("视频打开超时（首次握手 8 秒未完成），请稍后重试。");
                         this.stop_pump_on_failure();
                         cx.notify();
                     });
@@ -1435,5 +1437,83 @@ impl super::VideoViewer {
             });
         })
         .detach();
+    }
+}
+
+/// 首开握手（`start` 里 `recv_timeout` 等 `outcome` 的参数通道）的结果决策——把内嵌
+/// `match outcome` 的语义抽成纯函数（无 IO、无副作用），供 TDD 直接断言。
+///
+/// [评审 M：8s 超时静默死局] 旧实现 `Err(_)` 分支只把 `loading` 关掉、画面静态——用户看到
+/// 的是「转圈消失但视频永远不出来」，没有任何可感知报错（静默死局）。抽出决策后，
+/// [`HandshakeDecision::Timeout`] 由 `start` 侧改报**可感知错误**（加载态错误信息上屏）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum HandshakeDecision {
+    /// worker 打开成功并回送参数 → 填元数据/时长/尺寸、关 loading。
+    Open(super::decode::VideoParams),
+    /// worker 打开失败（带错误文本）→ 报错。
+    Failed(String),
+    /// 8s 内无结果（超时或 worker 通道断开）→ 报可感知错误（不再静默关 loading）。
+    Timeout,
+}
+
+/// 把 `recv_timeout` 的原始返回值映射为握手决策（纯函数）：`Ok(Ok(p))` → [`HandshakeDecision::Open`]；
+/// `Ok(Err(e))` → [`HandshakeDecision::Failed`]；`Err(_)`（8s 超时或通道断开）→
+/// [`HandshakeDecision::Timeout`]。
+fn handshake_decision(
+    outcome: Result<
+        Result<super::decode::VideoParams, String>,
+        std::sync::mpsc::RecvTimeoutError,
+    >,
+) -> HandshakeDecision {
+    match outcome {
+        Ok(Ok(p)) => HandshakeDecision::Open(p),
+        Ok(Err(e)) => HandshakeDecision::Failed(e),
+        Err(_) => HandshakeDecision::Timeout,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [评审 M：首开握手 8s 超时静默死局] `handshake_decision` 纯函数 TDD——`start` 的
+    /// outcome 分支抽成无 IO 纯函数后可直接断言：`Err(RecvTimeoutError::Timeout)`（8s 无
+    /// 结果）必须决策为 [`HandshakeDecision::Timeout`]（`start` 侧据此**报可感知错误**，
+    /// 不再是静默关 loading 死局）；`Failed` / `Open` 等价映射一并覆盖。
+    #[test]
+    fn handshake_timeout_reports_error_not_silent() {
+        // 8s 握手超时 → 决策 Timeout（start 侧报可感知错误，不再静默）
+        assert!(
+            matches!(
+                handshake_decision(Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                HandshakeDecision::Timeout
+            ),
+            "8s 握手超时必须决策为 Timeout（start 侧报可感知错误，不再静默）"
+        );
+        // worker 通道断开同样不可静默 → Timeout（start 侧统一报可感知错误）
+        assert!(
+            matches!(
+                handshake_decision(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)),
+                HandshakeDecision::Timeout
+            ),
+            "worker 通道断开必须决策为 Timeout（同样报可感知错误）"
+        );
+        // worker 报错 → Failed（原错误文本带出）
+        assert!(matches!(
+            handshake_decision(Ok(Err("打开失败".to_string()))),
+            HandshakeDecision::Failed(e) if e == "打开失败"
+        ));
+        // 打开成功 → Open（参数原样带出）
+        let p = crate::decode::VideoParams {
+            width: 1280,
+            height: 720,
+            duration: 3.5,
+            frame_rate: Some((30, 1)),
+            has_audio: false,
+        };
+        assert!(matches!(
+            handshake_decision(Ok(Ok(p.clone()))),
+            HandshakeDecision::Open(q) if q == p
+        ));
     }
 }

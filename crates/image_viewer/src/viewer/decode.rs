@@ -25,6 +25,11 @@ use super::{
 /// ≤64KB），读头即可提取，不必全量读盘。
 const EXIF_PROBE_BYTES: usize = 256 * 1024;
 
+/// 动图单帧**最小显示间隔**（ms）：GIF 时钟不得以短于此间隔推进——GIF 帧 delay=0ms
+///（无 GCE 时解析器默认 0ms）若按 `timer(0)` 立即就绪会被瞬间跳过，形成 60fps 级
+/// 重绘风暴。任何帧延迟（含 0ms）都先夹到该下界再计时（[`Self::anim_wait`]）。
+const ANIM_FRAME_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 impl super::ImageViewer {
 
     /// P1b：EXIF 嵌入缩略图「即时首帧」（零依赖；school 等手机照片在 APP1-Exif 的 IFD1 常嵌
@@ -496,6 +501,15 @@ impl super::ImageViewer {
         self.pump_prefetch(cx);
     }
 
+    /// 动图时钟帧等待：对帧 `delay` 施加**最小显示间隔下界**（`max`，只抬不压）。
+    /// GIF 帧 delay 无上界语义、但可有 0ms（无 GCE 时解析器默认 0ms）——若
+    /// `timer(0)` 立即就绪，0ms 帧会被瞬间跳过，形成 60fps 级重绘风暴（每帧白白
+    /// notify+refresh 整窗）。任何帧延迟（含 0ms）都先夹到 [`ANIM_FRAME_MIN_INTERVAL`]
+    /// 再计时；正常 ≥20ms 的帧延迟原样走。
+    fn anim_wait(delay: std::time::Duration) -> std::time::Duration {
+        delay.max(ANIM_FRAME_MIN_INTERVAL)
+    }
+
     /// 后台动画时钟：按各帧时长逐帧推进当前动图（`self.state.data` = 当前帧单帧
     /// `RenderImage`），并 `notify`+`refresh_windows` 触发重绘——由本查看器驱动，**不依赖
     /// 窗口焦点**（gpui `img()` 自动动画只在窗口聚焦时推进，失焦即冻结，故绕开它）。
@@ -513,10 +527,11 @@ impl super::ImageViewer {
         cx.spawn(async move |this, cx| {
             let mut idx = 0usize;
             loop {
-                let wait = delays
+                let delay = delays
                     .get(idx)
                     .copied()
                     .unwrap_or(std::time::Duration::from_millis(100));
+                let wait = Self::anim_wait(delay);
                 cx.background_executor().timer(wait).await;
                 let alive = this.update(cx, |this, cx| {
                     if this.anim_gen != clock_gen {

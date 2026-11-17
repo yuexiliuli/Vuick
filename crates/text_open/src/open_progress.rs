@@ -64,9 +64,16 @@ fn decode_stream(
     Ok(if dst.is_empty() { None } else { Some(dst) })
 }
 
-/// 首块级「编码探针」上限 = 首个分块目标字节数：读满首块量字节（或到文件尾）才决定
-/// 编码，随后进入流式解码——第一个分块本就要攒到该量才发出，探针不额外延迟首屏。
+/// 首块级「编码探针」**首判点** = 首个分块目标字节数：读满首块量字节（或到文件尾）才做
+/// 首判，随后进入流式解码——第一个分块本就要攒到该量才发出，探针不额外延迟首屏。
+/// 首判点若「歧义」（本块全合法 UTF-8 但文件未结束 / 块尾截断多字节）→ 扩窗续读，
+/// 见 [`ChunkReader::probe_is_ambiguous`] 与 [`PROBE_MAX_BYTES`]。
 const PROBE_CEIL_BYTES: usize = OPEN_FIRST_CHUNK_BYTES;
+
+/// 探针**硬上限**（扩窗上限）= 次块目标字节数（1MB）：首判点歧义时扩窗读到「首个坏字节」
+/// 定编码，但**至多**读到该量——防把 >256KB 的纯 UTF-8 大文件整读到文件尾（内存与读盘
+/// 都有界：probe 至多 1MB）。达上限仍全合法 → 按纯 UTF-8 处理（流式解码继续严格校验）。
+const PROBE_MAX_BYTES: usize = OPEN_CHUNK_TARGET_BYTES;
 
 /// 一块已归一化（LF）文本增量：`text` 只含完整行（除文件末尾可能不含换行的最后一行
 /// 外，均以 `\n` 结尾），`hist` / `max_line_chars` 是这些完整行的精确行宽统计。
@@ -184,10 +191,14 @@ impl ChunkReader {
             // `&mut self` 方法调用与 `&self.buf` 的不可变借冲突。
             let bytes = self.buf[..n].to_vec();
             if !self.decided {
-                // 编码决定前：累积探针（首块级），攒够或 EOF 才决定（不做逐块喂、不
-                // 把可能被 GB18030 重新解码的前缀先喂进 rope）。
+                // 编码决定前：累积探针（首块级），攒够 / EOF / 可定才决定（不做逐块喂、
+                // 不把可能被 GB18030 重新解码的前缀先喂进 rope）。首块量已满但「歧义」
+                // （见 probe_is_ambiguous：本块全合法 UTF-8 但文件未结束 / 块尾截断
+                // 多字节）→ 扩窗续读至首个坏字节（或 PROBE_MAX_BYTES）再定——窗口边界处
+                // 的跨块多字节序列不被误切块截断导致错判（GB18030 双字节与 UTF-8 共有
+                // 头字节 0xC6 被劈开、260KB ASCII 前缀后接 GB18030 两类均由此捕获）。
                 self.probe.extend_from_slice(&bytes);
-                if self.probe.len() >= PROBE_CEIL_BYTES {
+                if self.probe.len() >= PROBE_CEIL_BYTES && !self.probe_is_ambiguous() {
                     self.finish_decide()?;
                 }
                 return Ok(());
@@ -244,6 +255,33 @@ impl ChunkReader {
             });
         }
         Ok(())
+    }
+
+    /// 探针当前是否「不足以定编码」、需扩窗续读：
+    /// - 已见**确定坏字节**（`from_utf8` 报 `error_len==Some`）或 BOM → **可定**（false，
+    ///   按 GB18030 / BOM 直定）；
+    /// - 本块（或扩窗后）仍是**合法 UTF-8**（`Ok`）或**合法前缀 + 截断尾**（`error_len==None`），
+    ///   且文件未结束 → **歧义**（true）：块内全合法不代表后续块没有 GB18030 字节（如
+    ///   260KB ASCII 前缀后接 GB18030 4 字节），块尾截断也可能是 GB18030 双字节与 UTF-8
+    ///   共有的头字节（0xC6，见 `probe_boundary_split_gb18030_char_not_misdetected`）。
+    ///
+    /// 达到 [`PROBE_MAX_BYTES`] 硬上限后歧义也按「可定」处理——纯 UTF-8 大文件占多数，
+    /// 但限定读盘/内存上界 1MB（不整读、不无限扩）。
+    fn probe_is_ambiguous(&self) -> bool {
+        if self.probe.len() >= PROBE_MAX_BYTES {
+            return false;
+        }
+        // BOM 已见即一锤定音（doc 契约「…或 BOM → 可定」）：UTF-16 BOM（FF FE / FE FF）
+        // 本因 0xFF/0xFE 非法 UTF-8 走 `error_len==Some` 归为可定；此处补 UTF-8 BOM
+        // （EF BB BF）——否则带 UTF-8 BOM 的纯合法内容文件被当歧义一直扩窗到 1MB/EOF
+        // 才定，≥256KB 带 BOM 文件首屏延迟无谓扩大（扩窗不会带来不同编码结论）。
+        if self.probe.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            return false;
+        }
+        match std::str::from_utf8(&self.probe) {
+            Ok(_) => true,
+            Err(e) => e.error_len().is_none(),
+        }
     }
 
     /// 探针就绪（攒够首块量或文件尾）→ 按 [`detect_source_encoding`] 决定编码并把探针
@@ -837,6 +875,176 @@ mod tests {
             assert_eq!(got, raw, "极小读缓冲下合法多字节应逐块完整拼接");
             let (got2, ..) = collect(p, 128 * 1024); // 生产量级读缓冲
             assert_eq!(got2, raw, "生产读缓冲下合法多字节应完整读出");
+        });
+    }
+
+    /// 复现 RED（B6，docs/code-review-2026-11-17/08-text_open.md H）：
+    /// 探针式编码探测**只读首块**（`PROBE_CEIL_BYTES` = 256KB，open_progress.rs:69,186-193,254）。
+    /// 构造 >256KB 的 GB18030 大文件：**首块（256KB 探针窗口）全是合法 UTF-8（ASCII 行）**、
+    /// GB18030 4 字节字符落在窗口之后的后续块 → 现行判纯 UTF-8（None）→ 后续块走严格 UTF-8
+    /// 路径遇坏字节 InvalidData **打开失败**；而 ≤128KB 同步路径 `decode_bytes` 全文件扫描同一
+    /// 文件能开（shell_core/file_ops.rs:64-68）——异步/同步按文件大小分叉。
+    /// 期望：探测读到首个坏字节并回溯/扩窗 → 判 GB18030 → 正常打开（本测试当前应为 RED）。
+    #[test]
+    fn large_gb18030_with_utf8_probe_prefix_opens_with_gb18030() {
+        // 全 ASCII 行填充 260KB（> 探针窗口 256KB，窗口内必为合法 UTF-8），末尾接一个真实
+        // GB18030 4 字节字符→整文件真实编码 = GB18030。
+        let template = "abcdefghijklmnopqrstuvwxyz0123456789\n"; // 全 ASCII 行模板
+        let mut filler = String::with_capacity(260 * 1024);
+        while filler.len() < 260 * 1024 {
+            filler.push_str(template);
+        }
+        filler.truncate(260 * 1024); // ASCII 区严格 260KB（truncate 在 ASCII 上按字节安全）
+        let expected = format!("{filler}😀"); // 期望解码文本（末尾为 GB18030 4 字节字符）
+        let file_bytes = GB18030.encode(&expected).0.into_owned();
+        // 前置：整文件真实编码确为 GB18030（排除构造错误——此处若红不是目标缺陷）。
+        assert_eq!(
+            detect_source_encoding(&file_bytes),
+            (Some(GB18030), 0),
+            "整文件真实编码应为 GB18030"
+        );
+        with_temp_bytes(&file_bytes, |p| {
+            // 生产路径 ChunkReader 直接驱动（128KB 读缓冲，与生产同量级）。
+            let mut reader = ChunkReader::open_with_buf(p, 128 * 1024).unwrap();
+            let mut text = String::new();
+            while let Some(c) = reader.next_chunk().unwrap() {
+                text.push_str(&c.text);
+            }
+            assert_eq!(
+                reader.source_encoding(),
+                Some(GB18030),
+                "长 GB18030 文件应判 GB18030（当前只读首块→判 UTF-8→打开失败）"
+            );
+            assert_eq!(text, expected, "GB18030 全文应正确解码还原");
+        });
+    }
+
+    /// 复现 RED（B6，同 H 的第二触发）：GB18030 双字节字符「七」（U+4E03，GB18030 字节
+    /// `0xC6 0xDF`）恰被探针窗口边界劈开——首字节 `0xC6` 正好是合法 UTF-8 二字节首字节、落到
+    /// 窗口尾部 → 窗口像「截断的 UTF-8 尾」→ 现行 `finish_decide` 走 `is_truncated_utf8_tail`
+    /// (open_progress.rs:261-276) 误判纯 UTF-8 + carry → 后续块把 `0xDF` 并进 carry →
+    /// `[0xC6,0xDF]` 非法 → InvalidData 打开失败。期望：跨块多字节序列不被误切块截断导致
+    /// 错判 → 判 GB18030 正常打开（本测试当前应为 RED）。
+    #[test]
+    fn probe_boundary_split_gb18030_char_not_misdetected() {
+        // ASCII 填充到「探针窗口 - 1」字节，让「七」的首字节恰落在窗口 (probe) 末尾。
+        let template = "abcdefghijklmnopqrstuvwxyz0123456789\n";
+        let mut filler = String::new();
+        while filler.len() < PROBE_CEIL_BYTES - 1 {
+            filler.push_str(template);
+        }
+        filler.truncate(PROBE_CEIL_BYTES - 1);
+        let expected = format!("{filler}七");
+        let file_bytes = GB18030.encode(&expected).0.into_owned();
+        // 前置：「七」编码 2 字节、文件恰跨窗口边界，整文件真实编码确为 GB18030。
+        assert_eq!(
+            file_bytes.len(),
+            PROBE_CEIL_BYTES + 1,
+            "「七」应编码 2 字节、恰跨探针窗口"
+        );
+        assert_eq!(
+            detect_source_encoding(&file_bytes),
+            (Some(GB18030), 0),
+            "整文件真实编码应为 GB18030"
+        );
+        with_temp_bytes(&file_bytes, |p| {
+            // 逐字节读缓冲(1) → 探针绝不越窗吞掉 0xDF，跨块截断稳定复现。
+            let mut reader = ChunkReader::open_with_buf(p, 1).unwrap();
+            let mut text = String::new();
+            while let Some(c) = reader.next_chunk().unwrap() {
+                text.push_str(&c.text);
+            }
+            assert_eq!(
+                reader.source_encoding(),
+                Some(GB18030),
+                "跨块截断的 GB18030 双字节应判 GB18030（当前误判 UTF-8→打开失败）"
+            );
+            assert_eq!(text, expected, "跨块 GB18030 双字节应完整解码还原");
+        });
+    }
+
+    /// 绿测：普通 GB18030 文本（坏字节在首块窗口内、无需扩窗）经 ChunkReader 端到端应判
+    /// GB18030 并正确解码——锁「窗口内即见坏字节 → 直定 GB18030」的快路径不回归。
+    #[test]
+    fn gb18030_with_early_bad_byte_decides_gb18030() {
+        let expected = format!("普通中文文件内容第{}行：你好世界", 42);
+        let file_bytes = GB18030.encode(&expected).0.into_owned();
+        assert_eq!(
+            detect_source_encoding(&file_bytes),
+            (Some(GB18030), 0),
+            "前置：整文件真实编码应为 GB18030"
+        );
+        with_temp_bytes(&file_bytes, |p| {
+            let mut reader = ChunkReader::open_with_buf(p, 128 * 1024).unwrap();
+            let mut text = String::new();
+            while let Some(c) = reader.next_chunk().unwrap() {
+                text.push_str(&c.text);
+            }
+            assert_eq!(
+                reader.source_encoding(),
+                Some(GB18030),
+                "窗口内即见坏字节 → 应直判 GB18030（不扩窗、不误判 UTF-8）"
+            );
+            assert_eq!(text, expected, "GB18030 文件应完整解码还原");
+        });
+    }
+
+    /// 绿测：> 1MB 的纯 UTF-8 文件（含多字节中文/emoji）走「扩窗至硬上限 → 判纯 UTF-8 →
+    /// 流式续解」路径——锁「扩窗不能误伤长 UTF-8 大文件」：编码判定仍为纯 UTF-8、且跨
+    /// 256KB/1MB 边界劈开的 3/4 字节序列在扩窗与后续流式解码中仍完整还原（回归守卫：
+    /// B6 扩窗只补歧义判定，不以整读或改判为代价）。
+    #[test]
+    fn large_pure_utf8_file_stays_utf8_with_probe_expansion() {
+        let template = "中文宽行 abcdefghijklmnopqrstuvwxyz 0123456789 😀\n";
+        let mut expected = String::new();
+        while expected.len() < 1_100 * 1024 {
+            expected.push_str(template);
+        }
+        with_temp(&expected, |p| {
+            let mut reader = ChunkReader::open_with_buf(p, 128 * 1024).unwrap();
+            let mut text = String::new();
+            while let Some(c) = reader.next_chunk().unwrap() {
+                text.push_str(&c.text);
+            }
+            assert_eq!(
+                reader.source_encoding(),
+                None,
+                ">1MB 纯 UTF-8 文件应判纯 UTF-8（扩窗至上限不误改判）"
+            );
+            assert_eq!(text, expected, "长 UTF-8 文件应完整还原（边界劈开多字节不损失）");
+        });
+    }
+
+    /// 绿测（评审补，B6 扩窗批）：带 UTF-8 BOM（EF BB BF）的纯 UTF-8 大文本经 `ChunkReader`
+    /// 端到端应判 `Some(UTF_8)`（去 BOM）并完整还原正文——锁「BOM 一锤定音」快路径：BOM 已见
+    /// 即直定，不因文内全合法 UTF-8 被当歧义扩窗到 1MB/EOF（≥256KB 带 BOM 文件首屏延迟回归
+    /// 守卫；`probe_is_ambiguous` 的 doc 契约「或 BOM → 可定」应被实现兑现）。
+    #[test]
+    fn utf8_bom_large_file_decides_utf8_without_probe_expansion() {
+        let template = "带 BOM 的中文内容行 abcdefghijklmnopqrstuvwxyz 0123456789 😀\n";
+        let mut body = String::new();
+        while body.len() < 300 * 1024 {
+            body.push_str(template);
+        }
+        let mut file_bytes = vec![0xEF, 0xBB, 0xBF];
+        file_bytes.extend_from_slice(body.as_bytes());
+        assert_eq!(
+            detect_source_encoding(&file_bytes),
+            (Some(encoding_rs::UTF_8), 3),
+            "前置：带 BOM 文件应识别为 UTF-8(BOM)"
+        );
+        with_temp_bytes(&file_bytes, |p| {
+            let mut reader = ChunkReader::open_with_buf(p, 7).unwrap();
+            let mut text = String::new();
+            while let Some(c) = reader.next_chunk().unwrap() {
+                text.push_str(&c.text);
+            }
+            assert_eq!(
+                reader.source_encoding(),
+                Some(encoding_rs::UTF_8),
+                "带 BOM 大文本应判 UTF-8(BOM)，不因纯合法内容被扩窗/改判"
+            );
+            assert_eq!(text, body, "去 BOM 后应完整还原正文（多字节跨块不损失）");
         });
     }
 }

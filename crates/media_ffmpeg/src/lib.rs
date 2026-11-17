@@ -190,6 +190,11 @@ pub unsafe extern "C" fn vff_video_is_hw(h: Handle) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_video_set_skip_nonkey(h: Handle, nonkey: c_int) {
     catch_unwind_ffi((), || {
+        // 写解码器 skip 状态（`AVCodecContext::skip_frame`）与 seek/取帧共享 FFmpeg 串行闸：
+        // `decode::VideoReader::set_skip_nonkey` 内部不持锁（decode.rs:597 直调点也不持锁——
+        // worker 线程归属调用方、单线程），抢在此 FFI 边界补锁（对照 line:210-212 同姿势），
+        // 杜绝与并发 FFmpeg 操作的 skip_frame 数据竞争。锁随本作用域结束即释放。
+        let _g = decode::FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reader::<VideoReader>(h).set_skip_nonkey(nonkey != 0)
     })
 }
@@ -229,7 +234,8 @@ pub unsafe extern "C" fn vff_video_skip_to_bgra(
     skipped: *mut u64,
 ) -> c_int {
     catch_unwind_ffi(-1, || {
-        if out_buf.is_null() {
+        // 出参判空：任一 null 直接返 -1（错误码），杜绝解引用 null 写崩（SEH AV）
+        if out_buf.is_null() || pts.is_null() || w.is_null() || hh.is_null() || skipped.is_null() {
             return -1;
         }
         let r = reader::<VideoReader>(h);
@@ -291,7 +297,8 @@ pub unsafe extern "C" fn vff_video_frame(
     hh: *mut u32,
 ) -> c_int {
     catch_unwind_ffi(-1, || {
-        if out_buf.is_null() {
+        // 出参判空：任一 null 直接返 -1（错误码），杜绝解引用 null 写崩（SEH AV）
+        if out_buf.is_null() || pts.is_null() || w.is_null() || hh.is_null() {
             return -1;
         }
         let r = reader::<VideoReader>(h);
@@ -376,6 +383,16 @@ pub unsafe extern "C" fn vff_video_frame_hw(
 ) -> *mut c_void {
     // 默认返回错误哨兵（解码错误语义）：panic 时无法写输出字段，如实上报而非装成 EOF
     catch_unwind_ffi(usize::MAX as *mut c_void, || {
+        // 出参判空：任一 null 直接回错误哨兵（usize::MAX），杜绝解引用 null 写崩（SEH AV；
+        // 本函数以返回值指针哨兵编码错误，勿用 c_int -1）
+        if out_pts.is_null()
+            || out_w.is_null()
+            || out_h.is_null()
+            || out_tex.is_null()
+            || out_idx.is_null()
+        {
+            return usize::MAX as *mut c_void;
+        }
         let r = reader::<VideoReader>(h);
         match r.next_frame_hw() {
             Ok(Some(frame)) => {
@@ -478,7 +495,8 @@ pub unsafe extern "C" fn vff_audio_pcm(
     written: *mut usize,
 ) -> c_int {
     catch_unwind_ffi(-1, || {
-        if out_buf.is_null() {
+        // 出参判空（防御性，红测不可 headless）：任一 null 直接返 -1，杜绝解引用 null 写崩
+        if out_buf.is_null() || pts.is_null() || written.is_null() {
             return -1;
         }
         let r = reader::<AudioReader>(h);
@@ -596,6 +614,10 @@ pub unsafe extern "C" fn vff_subtitle_get_info(
     out: *mut SubtitleEntryFFI,
 ) -> c_int {
     catch_unwind_ffi(-1, || {
+        // 出参判空：`out` 为 null 直接返 -1（错误码），杜绝解引用 null 写崩（SEH AV）
+        if out.is_null() {
+            return -1;
+        }
         let r = reader::<SubtitleReader>(h);
         let Some(entry) = r.subtitles().get(index) else {
             return -1;

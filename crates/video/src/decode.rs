@@ -628,6 +628,30 @@ impl Drop for SubtitleReader {
     }
 }
 
+/// 字幕 FFI 单文件条目数硬上界：`subtitle_count` 直接来自 DLL（内容不可信），
+/// `Vec::with_capacity(count)` 对 10^9 级值会尝试天文数字分配（可 OOM/卡死）。
+const MAX_SUBTITLE_COUNT: usize = 100_000;
+/// 单条字幕文本字节硬上界：`text_len` 来自 FFI，`vec![0u8; text_len]` 对越界值无界分配。
+const MAX_SUBTITLE_TEXT_LEN: usize = 64 * 1024;
+
+/// 字幕 FFI 分配硬上界预检（纯函数，TDD）：两个正交维度各用**与文件数据无关**的独立
+/// 常量上界——`count`（单文件条目数）与 `text_len`（一条文本字节数）任一越界即 `Err`
+/// （安全拒绝，不分配）。调用方须在 `Vec::with_capacity(count)` / `vec![0u8; text_len]`
+/// **之前**调用，绝不把不可信 FFI 值送进分配器。
+fn check_subtitle_alloc_bounds(count: usize, text_len: usize) -> Result<(), anyhow::Error> {
+    if count > MAX_SUBTITLE_COUNT {
+        return Err(anyhow::anyhow!(
+            "字幕条目数越界: count={count}（上限 {MAX_SUBTITLE_COUNT}）"
+        ));
+    }
+    if text_len > MAX_SUBTITLE_TEXT_LEN {
+        return Err(anyhow::anyhow!(
+            "单条字幕文本长度越界: text_len={text_len}（上限 {MAX_SUBTITLE_TEXT_LEN}）"
+        ));
+    }
+    Ok(())
+}
+
 impl SubtitleReader {
     /// 打开媒体并提取字幕流。
     pub fn open(path: &Path) -> Result<Self> {
@@ -641,6 +665,13 @@ impl SubtitleReader {
         
         // 读取所有字幕
         let count = unsafe { (b.subtitle_count)(handle) };
+        // 条目数硬上界预检（越界值会被 `Vec::with_capacity` 变成天文数字分配）：在分配前
+        // 拒绝，超限整支打开失败（安全拒绝，不分配）。拒绝路径须先归还已打开的 FFI 句柄
+        // ——直接 `?` 会把 `handle` 漏在 DLL 侧（不可信字幕每次重开都漏一块）。
+        if let Err(e) = check_subtitle_alloc_bounds(count, 0) {
+            unsafe { (b.close_subtitle)(handle) };
+            return Err(e);
+        }
         let mut subtitles = Vec::with_capacity(count);
         
         for i in 0..count {
@@ -653,6 +684,12 @@ impl SubtitleReader {
                 continue;
             }
             
+            // 单条文本长度硬上界预检（`vec![0u8; text_len]` 对越界值无界分配，OOM 风险）：
+            // 在分配前拒绝，超限整支打开失败（同样先归还 FFI 句柄再返回，防句柄泄漏）
+            if let Err(e) = check_subtitle_alloc_bounds(0, info.text_len) {
+                unsafe { (b.close_subtitle)(handle) };
+                return Err(e);
+            }
             let mut text_buf = vec![0u8; info.text_len];
             if unsafe { (b.subtitle_get_text)(handle, i, text_buf.as_mut_ptr(), text_buf.len()) } != 0 {
                 continue;
@@ -779,6 +816,37 @@ mod tests {
         assert!(
             r.subtitle_at(22.04).is_none(),
             "22.04s 应不命中（超出首条窗口）"
+        );
+    }
+
+    /// [评审 M：字幕 FFI 无界分配] `check_subtitle_alloc_bounds` 纯函数 TDD——FFI 报告的
+    /// `count` / `text_len` 来自不可信文件，越界值会被 `Vec::with_capacity(count)` /
+    /// `vec![0u8; text_len]` 变成天文数字分配（可 OOM/卡死）。断言：任一维度超独立常量
+    /// 上界即 `Err`（在分配**之前**拒绝），边界与常规小值放行（`Ok`）。
+    #[test]
+    fn subtitle_alloc_bounds_reject_oversized() {
+        // 合法：上限边界与最小合法值放行
+        assert!(
+            check_subtitle_alloc_bounds(100_000, 64 * 1024).is_ok(),
+            "count/text_len 恰在上限（100_000 / 64KiB）应放行"
+        );
+        assert!(check_subtitle_alloc_bounds(0, 0).is_ok(), "最小合法值应放行");
+        // 越界：任一维度超上限即 Err（10^9 级 = 天文数字分配，须在构造前拒绝）
+        assert!(
+            check_subtitle_alloc_bounds(1_000_000_000, 0).is_err(),
+            "count=10^9 应 Err（Vec::with_capacity 前拒绝）"
+        );
+        assert!(
+            check_subtitle_alloc_bounds(0, 1_000_000_000).is_err(),
+            "text_len=10^9 应 Err（vec![0;n] 前拒绝）"
+        );
+        assert!(
+            check_subtitle_alloc_bounds(100_001, 0).is_err(),
+            "count 超上限 1 应 Err"
+        );
+        assert!(
+            check_subtitle_alloc_bounds(0, 64 * 1024 + 1).is_err(),
+            "text_len 超上限 1 应 Err"
         );
     }
 

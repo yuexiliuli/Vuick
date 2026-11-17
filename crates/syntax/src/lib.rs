@@ -290,8 +290,14 @@ pub fn resolve_styles(
 
         let start = highlight_range.start.max(range.start);
         let end = highlight_range.end.min(range.end);
-        if start >= end || end <= cursor {
+        if start >= end {
             continue;
+        }
+        if start < cursor {
+            // 段与已发射区域重叠 = 嵌套段（TOML basic 字符串的 escape run 嵌套在
+            // string run 内，见 escape_runs）；旧 `end <= cursor` 会整体丢弃子段 →
+            // escape 配色永不生效。转到按切点分区的嵌套兜底路径（每行段数 <20，O(k²)）。
+            return resolve_styles_nested(highlights, range, resolver);
         }
         if cursor < start {
             runs.push((cursor..start, HighlightStyle::default()));
@@ -302,6 +308,57 @@ pub fn resolve_styles(
 
     if cursor < range.end {
         runs.push((cursor..range.end, HighlightStyle::default()));
+    }
+    runs
+}
+
+/// [`resolve_styles`] 的嵌套 / 重叠兜底：把区间内所有段的起止点收集为切点，对相邻切点
+/// 间的每个子区间取「覆盖它的最内层段（区间最短者）」样式，未覆盖取默认——支持
+/// TOML basic 字符串里「string run 内含嵌套 escape run」这类重叠输入。仅被
+/// [`resolve_styles`] 在检测到段重叠时调用，每行段数通常 <20，O(k²) 成本可忽略。
+fn resolve_styles_nested(
+    highlights: &[(Range<usize>, &'static str)],
+    range: &Range<usize>,
+    resolver: &dyn SemanticStyleResolver,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut points: Vec<usize> = Vec::with_capacity(highlights.len().saturating_mul(2) + 2);
+    points.push(range.start);
+    points.push(range.end);
+    for (h, _) in highlights {
+        let s = h.start.max(range.start);
+        let e = h.end.min(range.end);
+        if s < e {
+            points.push(s);
+            points.push(e);
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+
+    let mut runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for w in points.windows(2) {
+        let a = w[0];
+        let b = w[1];
+        if a >= b {
+            continue;
+        }
+        // 覆盖 [a,b) 的最内层段 = 包含它的所有段中「区间最短」者（严格嵌套时即子段）。
+        let mut best: Option<(&'static str, usize)> = None;
+        for (h, name) in highlights {
+            let s = h.start.max(range.start);
+            let e = h.end.min(range.end);
+            if s <= a && b <= e {
+                let span = e - s;
+                if best.map_or(true, |(_, bspan)| span < bspan) {
+                    best = Some((*name, span));
+                }
+            }
+        }
+        let style = match best {
+            Some((name, _)) => resolver.style(name).unwrap_or_default(),
+            None => HighlightStyle::default(),
+        };
+        runs.push((a..b, style));
     }
     runs
 }
@@ -331,7 +388,31 @@ pub type CodeLineRuns = Vec<Vec<(Range<usize>, &'static str)>>;
 ///
 /// TOML 不在 syntect 内置语法集里（syntect 5.3 的 default_newlines 无 TOML），
 /// 走内置的轻量扫描器 [`toml_code_runs`]（与 GitHub 配色同一套语义名）。
+///
+/// 代码块整块解析的行数 / 字节硬上限：超限输入（超大粘贴、巨型围栏、构造输入）
+/// **不参与高亮**，按纯文本降级——避免在 UI 线程同步全量 parse（debug 实测 200k 行
+/// ≈194s 冻结）。上限依据：正常代码块 / 围栏为「几行～数百行」量级，行上限 2 万、
+/// 字节上限 4 MiB 对正常输入零误伤；红测红线 200k 行远超两上限，保证走降级。
+const MAX_PARSE_LINES: usize = 20_000;
+const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// 超限降级：返回与 [`build_line_starts`] 同语义行数的「每行空 run」（整行默认色、
+/// 零高亮、零解析成本）。行数 = `\n` 计数 + 1，与 build_line_starts 的
+/// `[0, 每 \n 后一字节]` 产出一致，下游按 `.get(i)` 索引不错位。
+fn degraded_code_line_runs(code: &str) -> CodeLineRuns {
+    let line_count = code.bytes().filter(|&b| b == b'\n').count() + 1;
+    vec![Vec::new(); line_count]
+}
+
 pub fn parse_code_lines(language: &str, code: &str) -> Option<CodeLineRuns> {
+    // 降级守卫必须先于 toml_code_runs（:405）与 build_line_starts——避免先物化大块再被拦。
+    if code.len() > MAX_PARSE_BYTES {
+        return Some(degraded_code_line_runs(code));
+    }
+    let line_count = code.bytes().filter(|&b| b == b'\n').count() + 1;
+    if line_count > MAX_PARSE_LINES {
+        return Some(degraded_code_line_runs(code));
+    }
     if normalize_language(language).eq_ignore_ascii_case("toml") {
         return Some(toml_code_runs(code));
     }
@@ -980,5 +1061,73 @@ mod tests {
         assert_eq!(detect_string_kind("\"\"\"x", 0).0, TomlStr::Basic3);
         assert_eq!(detect_string_kind("'x", 0).0, TomlStr::Literal);
         assert_eq!(detect_string_kind("'''x", 0).0, TomlStr::Literal3);
+    }
+
+    /// H 级红测（B10）：`parse_code_lines` 无大输入守卫——超大代码块（超大粘贴/巨型
+    /// 围栏）在 UI 线程**同步全量 parse**，无行数/字节上限 → 主线程冻结。
+    /// 期望语义：超行数/字节上限（实现将加 `MAX_PARSE_LINES`/`MAX_PARSE_BYTES`）即按
+    /// 纯文本降级——返回**无任何高亮**的 run（每行空 run → 全默认色），不阻塞。
+    /// 本测试契约为「任何合理上限（数千行级）都须让 200k 行输入走降级路径」；
+    /// 当前无守卫 → 输入被全量高亮（逐行 keyword 等）→ 断言失败 = 红。
+    #[test]
+    fn parse_code_lines_degrades_oversized_input_without_highlight() {
+        let oversized = "let x = 1;\n".repeat(200_000);
+        let runs = parse_code_lines("rust", &oversized).expect("rust 解析应成功");
+        let total_runs: usize = runs.iter().map(|line| line.len()).sum();
+        assert_eq!(
+            total_runs, 0,
+            "超限输入应全程按纯文本降级（每行空 run、零高亮）；当前被全量高亮 = 红（缺护栏）"
+        );
+        // 对照：小输入必须正常产出高亮（护栏只应拦截超限，不得全局关闭高亮）
+        let small = parse_code_lines("rust", "let x = 1;\n").expect("rust 解析应成功");
+        assert!(
+            small.iter().flatten().any(|(_, n)| *n == "keyword"),
+            "小输入应正常产出 keyword 高亮"
+        );
+    }
+
+    /// M 级红测：TOML `string.escape` 的**嵌套 run**在样式解析层被丢弃。
+    /// `scan_toml_line` 产出「外层 `string` run 内含嵌套 `string.escape` run」的重叠
+    /// 序列，违反 [`resolve_styles`]「有序且互不重叠」前置（lib.rs:275-276）；
+    /// `resolve_line_styles_with` 的 `end <= cursor` 守卫（lib.rs:293）把嵌套 escape 段
+    /// 整体丢弃 → TOML 字符串内 `\n`/`\u0041`/`\"` 的独立配色永不生效（现仅直测扫描器
+    /// 的单测「绿」，无集成断言）。期望语义：escape 区在样式层带独立 `string.escape`
+    /// 配色（light = 0x116329），且普通字符串字节仍为 `string` 色（0x0a3069）。
+    #[test]
+    fn toml_string_escape_survives_style_resolution() {
+        // `s = "a\"b\n\u0041"`：(ASCII) 字节 4 开引号，17 闭引号（vis=18）；
+        // 转义区 = `\"`(6..8)、`\n`(9..11)、`\u0041`(11..13)
+        let line = r#"s = "a\"b\n\u0041""#;
+        let runs = parse_code_lines("toml", line).expect("toml 解析应成功");
+        assert_eq!(runs.len(), 1, "单行输入");
+        let raw = &runs[0];
+        // 前置（直测即绿，作对照基线）：扫描器确实拆出嵌套 escape run
+        let esc: Vec<Range<usize>> = raw
+            .iter()
+            .filter(|(_, n)| *n == "string.escape")
+            .map(|(r, _)| r.clone())
+            .collect();
+        assert_eq!(esc, vec![6..8, 9..11, 11..13], "扫描器应拆出嵌套 escape run");
+        let resolver = github_theme(false);
+        let line_len = line.trim_end_matches(['\n', '\r']).len();
+        let styles = resolve_line_styles_with(raw, line_len, &resolver);
+        let escape_color = resolver.style("string.escape").unwrap().color;
+        let string_color = resolver.style("string").unwrap().color;
+        // 转义区（取 `\n` 的反斜杠字节 9）应带独立 escape 配色；当前被 end<=cursor
+        // 丢弃 → 落入 string 单一色（0x0a3069）→ 断言失败 = 红
+        let (_, s_esc) = styles
+            .iter()
+            .find(|(r, _)| r.contains(&9))
+            .expect("字节 9 应有样式段");
+        assert_eq!(
+            s_esc.color, escape_color,
+            "转义区应解析出独立的 string.escape 配色（当前被丢 = 红）"
+        );
+        // 对照：普通字符串字节 5（'a'）仍须为 string 色——修复应「拆分/支持嵌套」而非全局不亮
+        let (_, s_plain) = styles
+            .iter()
+            .find(|(r, _)| r.contains(&5))
+            .expect("字节 5 应有样式段");
+        assert_eq!(s_plain.color, string_color, "普通字符串字节仍应为 string 配色");
     }
 }

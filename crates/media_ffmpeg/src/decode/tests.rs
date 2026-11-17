@@ -1849,3 +1849,179 @@ fn audio_eof_drains_decoder_tail_real_decode() {
         "解码总时长 {secs:.3}s 应覆盖流尾（容器 {dur:.3}s），疑似轨尾截断"
     );
 }
+
+// ---------------- 复现红测：FFI 出参判空缺失（docs/code-review-2026-11-17/20-media_ffmpeg.md） ----------------
+
+// 审查 HH 级缺陷：lib.rs 的 FFI 标量出参族 5 处（`vff_video_frame` / `vff_video_skip_to_bgra` /
+// `vff_audio_pcm` / `vff_subtitle_get_info` / `vff_video_frame_hw`）在写 `*out` 出参前不判
+// null——主程序（C ABI 侧）传 null 出参 → 空指针写 = Windows SEH 访问违例（**不是** Rust panic），
+// `catch_unwind_ffi` 兜不住 → 直接打穿宿主进程。
+//
+// 期望语义（评审口径）：任一关键出参为 null 即返回 Err（既定错误码 -1），不崩。
+// 红测姿势：本机无 `target/video测试.mp4` 等成对夹具 → 用**程序内合成的最小媒体**
+// （Y4M 原始视频 / SRT 字幕）构造**合法句柄**，仅把 FFI 出参置 null——隔离出「出参判空
+// 缺失」这一缺陷（句柄合法避免「空句柄先崩」掩盖缺陷）。
+// 修复前：`*出参 = 值` 命中 null → 测试进程 SEH AV 崩溃 = RED 证据（验收以「进程崩溃/TIMEOUT」
+// 为准）；修复后：返回 -1 → 断言通过。
+//
+// 覆盖口径（review 5 处）：
+// - 可 headless 红测：`vff_video_frame` / `vff_video_skip_to_bgra`（Y4M 合成）/ 
+//   `vff_subtitle_get_info`（SRT 合成）。
+// - 不可 headless 红测：
+//   `vff_audio_pcm`——合成音频容器（WAV/raw）无 native 声道布局（`AV_CHANNEL_ORDER_UNSPEC`，
+//   探针实证 predco 与帧同构仍被 swr `Input changed` 拒，WAV 无布局字段），无法在 headless
+//   造出能产出样本块的真实音轨；真音频夹具在场时按同款姿势红测即可。
+//   `vff_video_frame_hw`——需真实 D3D11 硬件解码器（本机/headless 不可靠），另经 `hw_external`
+//   既有 SKIP 约定。
+// 锁纪律项（decode.rs:597-605 `set_skip_nonkey` 未过 FFMPEG_LOCK）= 数据竞争无确定性失败
+// 表现，headless 不可红测，交实现侧按 K28 加锁 + 评审把关。
+//
+// 运行（禁裸全量）：`cargo test -p media_ffmpeg ffi_red -- --test-threads=1`
+//（修复前每个红测用 `--exact` 单独跑更清晰：崩溃即本测试进程整体终止）。
+
+/// 临时媒体文件看护：进程唯一目录（防并行 agent / 残留互踩），Drop 时整目录清理。
+struct FfiRedTempMedia {
+    dir: std::path::PathBuf,
+}
+
+impl FfiRedTempMedia {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "vuick-mff-red-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        FfiRedTempMedia { dir }
+    }
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.dir.join(name)
+    }
+}
+
+impl Drop for FfiRedTempMedia {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// 写一条最小合法 SRT（FFmpeg `srt` demuxer 按扩展名 + 文本签名探测识别）。
+fn ffi_red_write_srt(dir: &FfiRedTempMedia) -> std::path::PathBuf {
+    let p = dir.path("sub.srt");
+    std::fs::write(&p, b"1\n00:00:01,000 --> 00:00:03,000\nhello subtitle\n").unwrap();
+    p
+}
+
+/// 手写 YUV4MPEG2 最小视频（320×240、2 帧、4:2:0）：FFmpeg `yuv4mpegpipe` demuxer 识别。
+/// Y4M 为 rawvideo，无法硬解 → 恒走软件解码路径，本机行为确定。
+fn ffi_red_write_y4m(dir: &FfiRedTempMedia) -> std::path::PathBuf {
+    let p = dir.path("frames.y4m");
+    let (w, h) = (320usize, 240usize);
+    let frame = w * h + 2 * (w / 2) * (h / 2); // Y + U + V
+    let mut data = Vec::new();
+    data.extend_from_slice(b"YUV4MPEG2 W320 H240 F30:1 Ip A1:1 C420jpeg\n");
+    for f in 0..2u32 {
+        data.extend_from_slice(b"FRAME\n");
+        for y in 0..h {
+            for x in 0..w {
+                data.push(((x + f as usize) & 0xff) as u8); // 亮度渐变（非全 0）
+            }
+            let _ = y;
+        }
+        data.extend(std::iter::repeat(128u8).take(frame - w * h)); // 色度中性
+    }
+    std::fs::write(&p, data).unwrap();
+    p
+}
+
+/// **前置 sanity（非红测）**：合成 Y4M 必须能打开并解出首帧——证明下面红测的
+/// `vff_video_frame` 调用能真正走到出参写（否则「解码失败返回 -1」会假绿）。
+#[test]
+fn ffi_red_sanity_video_media_yields_frame() {
+    let t = FfiRedTempMedia::new("video-sanity");
+    let p = ffi_red_write_y4m(&t);
+    let mut r = VideoReader::open(&p).unwrap();
+    let (pts, w, h, bgra) = r.next_frame_bgra().unwrap().expect("合成 Y4M 应解出首帧");
+    assert!(pts >= 0.0);
+    assert_eq!((w, h), (320, 240));
+    assert_eq!(bgra.len(), (320 * 240 * 4) as usize);
+}
+
+/// **前置 sanity（非红测）**：合成 SRT 必须解析出 ≥1 条字幕。
+#[test]
+fn ffi_red_sanity_subtitle_media_yields_entries() {
+    let t = FfiRedTempMedia::new("subtitle-sanity");
+    let p = ffi_red_write_srt(&t);
+    let r = SubtitleReader::open(&p).unwrap();
+    assert!(
+        !r.subtitles().is_empty(),
+        "SRT 应解析出 ≥1 条字幕（否则红测取 get(0) 为空 → 提前返 -1 假绿）"
+    );
+}
+
+/// **RED**：`vff_video_frame` 的 `*pts/*w/*hh` 出参置 null。
+/// 修复前：解码成功写 `*pts`（null）→ SEH AV 进程崩溃；修复后（判空 → -1）断言通过。
+#[test]
+fn ffi_red_video_frame_null_out_params_should_err() {
+    let t = FfiRedTempMedia::new("video-frame");
+    let p = ffi_red_write_y4m(&t);
+    let r = VideoReader::open(&p).unwrap();
+    let h = Box::into_raw(Box::new(r)) as *mut std::ffi::c_void;
+    let mut buf = vec![0u8; 320 * 240 * 4];
+    let ret = unsafe {
+        crate::vff_video_frame(
+            h,
+            buf.as_mut_ptr(),
+            buf.len(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { crate::vff_close_video(h) };
+    assert_eq!(
+        ret, -1,
+        "null 出参应返回 -1（错误码）而非空指针写崩（RED 证据 = SEH AV 崩溃）"
+    );
+}
+
+/// **RED**：`vff_video_skip_to_bgra` 的 `*pts/*w/*hh/*skipped` 出参置 null。
+#[test]
+fn ffi_red_video_skip_to_bgra_null_out_params_should_err() {
+    let t = FfiRedTempMedia::new("video-skip");
+    let p = ffi_red_write_y4m(&t);
+    let r = VideoReader::open(&p).unwrap();
+    let h = Box::into_raw(Box::new(r)) as *mut std::ffi::c_void;
+    let mut buf = vec![0u8; 320 * 240 * 4];
+    let ret = unsafe {
+        crate::vff_video_skip_to_bgra(
+            h,
+            0.0,
+            buf.as_mut_ptr(),
+            buf.len(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { crate::vff_close_video(h) };
+    assert_eq!(
+        ret, -1,
+        "null 出参应返回 -1（错误码）而非空指针写崩（RED 证据 = SEH AV 崩溃）"
+    );
+}
+
+/// **RED**：`vff_subtitle_get_info` 的 `*out`（`SubtitleEntryFFI`）出参置 null。
+#[test]
+fn ffi_red_subtitle_get_info_null_out_should_err() {
+    let t = FfiRedTempMedia::new("subtitle-info");
+    let p = ffi_red_write_srt(&t);
+    let r = SubtitleReader::open(&p).unwrap();
+    let h = Box::into_raw(Box::new(r)) as *mut std::ffi::c_void;
+    let ret = unsafe { crate::vff_subtitle_get_info(h, 0, std::ptr::null_mut()) };
+    unsafe { crate::vff_close_subtitle(h) };
+    assert_eq!(
+        ret, -1,
+        "null 出参应返回 -1（错误码）而非空指针写崩（RED 证据 = SEH AV 崩溃）"
+    );
+}

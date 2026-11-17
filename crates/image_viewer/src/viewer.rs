@@ -762,6 +762,12 @@ fn decode_jpeg_display(
     }
     let img = kimg::load_from_memory(bytes).map_err(|e| format!("JPEG 解码失败：{e}"))?;
     let (iw, ih) = img.dimensions();
+    // K124：全解兜底路径（try_decode_jpeg_scaled 已因 scaled 输出超预算回退到本路径）在
+    // `to_rgba8` 分配前同款预检——SOF 声明超大尺寸 → 分配前拒绝（Err → decode_background
+    // 回退 decode_generic 全解，其中 decode_static_first_frame 同款预检继续拦，绝不 OOM）。
+    if !decode_display_within_budget(iw, ih) {
+        return Err("JPEG 解码尺寸超过预算".to_string());
+    }
     let den = pick_den(iw, ih, need.0, need.1);
     let mut rgba = img.to_rgba8();
     if den == 1 {
@@ -805,6 +811,13 @@ fn try_decode_jpeg_scaled(bytes: &[u8], need: (f32, f32)) -> Option<(Vec<u8>, u3
     // SOF 极端 65535×65535 亦被本界拦下：scaled 32768×32768×3 ≈ 3.0GB > 512MiB）。
     let n = u64::from(sw).checked_mul(u64::from(sh))?.checked_mul(ch)?;
     if n > DECODE_DISPLAY_MAX_BYTES {
+        return None;
+    }
+    // K124 补口（评审）：`sw×sh×ch` 界只含自然通道——非 RGBA8（灰度 L8/LA8/RGB8 等）展开
+    // 到 RGBA 为 `sw×sh×4`（与 `to_rgba8` 同形），gray ch=1 可放大 4×（scaled 缓冲贴界
+    // 512MiB 时展开达 2GiB）。展开尺寸另行同款预算预检：超界回退（`decode_jpeg_display`
+    // 全解兜底路径自会预算拒绝），绝不做 GB 级 `vec![0; n]` 分配。
+    if color != kimg::ColorType::Rgba8 && !decode_display_within_budget(sw, sh) {
         return None;
     }
     let mut buf = vec![0u8; n as usize];
@@ -1068,6 +1081,19 @@ fn png_decode_within_budget(nbytes: u64) -> bool {
     nbytes <= DECODE_DISPLAY_MAX_BYTES
 }
 
+/// 展示解码**像素字节预算判定**（K124，HEIF/JPEG 全解兜底/通用/首帧静态共用）：未降档的
+/// `to_rgba8`（RGBA 4 通道）按原图尺寸 `w×h×4` 算出的字节数 > [`DECODE_DISPLAY_MAX_BYTES`]
+/// → 分配前拒绝，绝不做 GB 级 `vec![0; n]` 分配。预算取值对齐
+/// [`DECODE_DISPLAY_MAX_BYTES`] = 512MiB（≤ `kimg::Limits::default()` 的 `max_alloc`），
+/// 与 PNG display / JPEG scaled 预检同一硬上界口径。纯函数便于单测「预检触发」；
+/// `saturating_mul` 防中间溢出（16-bit 极端宽高亦然，20000×20000×4 ≈1.6GB 直接拦下）。
+fn decode_display_within_budget(w: u32, h: u32) -> bool {
+    let nbytes = u64::from(w)
+        .saturating_mul(u64::from(h))
+        .saturating_mul(4);
+    nbytes <= DECODE_DISPLAY_MAX_BYTES
+}
+
 /// PNG 按展示需要**降档解码**（`kimg::codecs::png::PngDecoder` 解全量位图，非 RGBA8 先
 /// 展开，再对全量做盒式降采样到展示档）：返回 BGRA 字节 + 输出尺寸 + 实际降档分母。
 /// 选档复用 [`pick_den`]（与格式无关的「解码 ≥ 显示」语义）。
@@ -1126,6 +1152,11 @@ fn decode_heif_display(
 ) -> Result<(Vec<u8>, u32, u32, u8), String> {
     let img = kimg::load_from_memory(bytes).map_err(|e| format!("HEIF 解码失败：{e}"))?;
     let (iw, ih) = img.dimensions();
+    // K124：`to_rgba8` 前预算预检——HEIF 声明超大尺寸 → 分配前拒绝（Err → 外层回退
+    // decode_generic 全解，其中 decode_static_first_frame 同款预检继续拦，绝不 GB 级分配）。
+    if !decode_display_within_budget(iw, ih) {
+        return Err("HEIF 解码尺寸超过预算".to_string());
+    }
     let den = pick_den(iw, ih, need.0, need.1);
     let mut rgba = img.to_rgba8();
     if den == 1 {
@@ -1158,6 +1189,9 @@ fn decode_generic_display(
     let (iw, ih) = img.dimensions();
     if is_ico_magic(bytes) {
         // ICO 亚 ms 尺寸无关紧要 → 全尺寸 den=1（与 [decode_static_first_frame] 逐像素一致）
+        if !decode_display_within_budget(iw, ih) {
+            return Err("ICO 解码尺寸超过预算".to_string());
+        }
         let mut rgba = img.to_rgba8();
         swap_rb_in_place(rgba.as_mut());
         return Ok((rgba.into_raw(), iw, ih, 1));
@@ -1165,6 +1199,9 @@ fn decode_generic_display(
     let den = pick_den(iw, ih, need.0, need.1);
     if den == 1 {
         // den=1：全解直出（RGBA→BGRA 交换，尺寸=原始；与 decode_static_first_frame 逐像素一致）
+        if !decode_display_within_budget(iw, ih) {
+            return Err("解码尺寸超过预算".to_string());
+        }
         let mut rgba = img.to_rgba8();
         swap_rb_in_place(rgba.as_mut());
         return Ok((rgba.into_raw(), iw, ih, 1));
@@ -1180,8 +1217,13 @@ fn decode_generic_display(
             swap_rb_in_place(bgra.as_mut());
             Ok((bgra, w, h, den))
         }
-        // 其它通道（L8/La8/16bit 等，如灰度 TIFF）：先展开 RGBA8 再走 4 通道盒式
+        // 其它通道（L8/La8/16bit 等，如灰度 TIFF）：先展开 RGBA8 再走 4 通道盒式——
+        // `expand_png_to_rgba8` = 对 `w×h×4` 的全尺寸分配（同 `to_rgba8` 语义）：灰度/16bit
+        // 超大图全解缓冲虽在 kimg 512MiB 界内，展开却可放大到 GB 级，须同款预算预检。
         _ => {
+            if !decode_display_within_budget(iw, ih) {
+                return Err("解码尺寸超过预算".to_string());
+            }
             let rgba = expand_png_to_rgba8(img.as_bytes(), iw, ih, img.color())
                 .ok_or("非 8bit 色彩展开失败")?;
             let (mut bgra, w, h) = box_downsample_bgra_or_rgba_rayon(&rgba, iw, ih, den);
@@ -1208,6 +1250,14 @@ fn bgra_single_frame(bgra: Vec<u8>, w: u32, h: u32) -> Option<Frame> {
 /// 不递归 GifDecoder）。
 fn decode_static_first_frame(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
     let img = kimg::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
+    let (w, h) = img.dimensions();
+    // K124：`to_rgba8` 前预算预检——全解兜底路径最后一关，超大声明必须在此拒绝，不得
+    // 落到 `to_rgba8` 的 `w×h×4` 分配（20000×20000 ≈1.6GB）。Err 沿 decode_background
+    // 冒泡为干净「解码尺寸超过预算」错误，绝不 OOM/panic（kimg 默认 Limits 仅兜 codec
+    // 侧分配，`to_rgba8` 展开缓冲仍需本层独立硬上界）。
+    if !decode_display_within_budget(w, h) {
+        return Err("解码尺寸超过预算".to_string());
+    }
     let mut rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     swap_rb_in_place(rgba.as_mut());
@@ -2369,6 +2419,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// RED 复现测试（帧 delay=0ms 时钟无最小间隔）。[`ImageViewer::spawn_anim_clock`] 的等待
+    /// 计算 `delays.get(idx).copied().unwrap_or(100ms)` 无下界：GIF 帧 delay=0ms（无 GCE 时
+    /// 解析器默认 0ms）→ `timer(0)` 立即就绪 → 首帧被瞬间跳过、形成 60fps 级重绘风暴。
+    /// 期望语义：两帧最小间隔下界约 20ms（`wait.max(20ms)`），0ms 帧也必须停留 ≥20ms。
+    ///
+    /// 用「帧0 delay=0ms + 帧1 delay=100ms」双延迟，避免全 0 延迟让时钟自旋（`timer(0)`
+    /// 就绪 → 单次 poll 内同步空转）。修复前：首帧（0ms）立即跳过 → t≈0 时 `anim_index` 已
+    /// =1；修复后 `wait.max(20ms)` → 首帧停留 20ms（fake 时钟未推进超过 20ms 前皆=0）。
+    /// 断言即锁「0ms 帧不得在 <20ms 内被跳过」。
+    #[gpui::test]
+    async fn gif_clock_zero_delay_frame_enforces_min_interval(cx: &mut TestAppContext) {
+        let dir = tmp_dir("gif_clock_min0");
+        let p = dir.join("anim0.gif");
+        let bytes = encode_test_gif(&[
+            (kimg::Rgba([255, 0, 0, 255]), 0),
+            (kimg::Rgba([0, 0, 255, 255]), 100),
+        ]);
+        std::fs::write(&p, &bytes).unwrap();
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        // 就绪后自驱时钟已挂上（install_current 同步 spawn）；排空执行器让时钟跑满一轮——
+        // 修复前这一轮已把 0ms 首帧跳过（anim_index=1），修复后停在首帧（=0）。
+        flush(cx);
+        let idx = cx.update(|app| viewer.read(app).anim_index);
+        assert_eq!(
+            idx, 0,
+            "帧 delay=0ms 也须有 ≥20ms 最小显示间隔：t≈0 不得立即跳过第 0 帧（当前 wait=0ms → 红）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 真实 GIF 动图实测（`--ignored --nocapture` 运行；缺夹具 SKIP，同 pdf 夹具姿势）：
     /// 对 [`MAX_GIF_FRAMES`] 内的全帧解码，验证（1）每帧都是逻辑屏全画布
     /// （image 0.25 已按 disposal/偏移合成、统一尺寸）；（2）相邻采样帧字节内容确有差异
@@ -2843,6 +2925,34 @@ mod tests {
             "65535×65535×4 ≈17GB 必须拒绝"
         );
         assert!(png_decode_within_budget(1), "极小图放行");
+    }
+
+    /// 展示解码预算判定纯函数（K124，HEIF/JPEG 兜底/通用/首帧静态共用）：
+    /// `w×h×4`（RGBA 4 通道）未降档 `to_rgba8` 字节数 > [`DECODE_DISPLAY_MAX_BYTES`]
+    /// （512MiB）→ 分配前拒绝。对照 `png_decode_within_budget_rejects_oversized_pixel_bytes`
+    /// （PNG 侧同口径）；本函数是全吃 `to_rgba8` 路径（HEIF/JPEG 全解兜底/通用/首帧）的
+    /// 统一预检。TDD：先落本测试（函数未实现 → 编译 RED）→ 实现转绿。
+    #[test]
+    fn decode_display_within_budget_rejects_oversized() {
+        assert!(
+            decode_display_within_budget(1920, 1080),
+            "合法 1080p（1920×1080×4 ≈8.3MB）应放行"
+        );
+        assert!(
+            !decode_display_within_budget(20000, 20000),
+            "20000×20000×4 ≈1.6GB > 512MiB 必须拒绝（分配前预检）"
+        );
+        // 边界自查：536870912/4 = 2^27 = 134217728 像素预算。11585²=134212225 ≤ 界
+        // （×4=536848900 ≤ 536870912）放行；11585×11586=134223810 > 界（×4=536895240 >
+        // 536870912，超 24328B）即拒绝——无 off-by-one。
+        assert!(
+            decode_display_within_budget(11585, 11585),
+            "预算边界内（≤512MiB）应放行"
+        );
+        assert!(
+            !decode_display_within_budget(11585, 11586),
+            "超界即拒绝（11585×11586×4=536895240 > 536870912）"
+        );
     }
 
     /// 定位 JPEG SOF0（`FF C0`）并原地 patch 高/宽（段布局 `FF C0 <len:2> <prec:1> <h:2> <w:2>`）。

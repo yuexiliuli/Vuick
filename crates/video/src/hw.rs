@@ -240,6 +240,13 @@ impl SharedCopier {
                 return Err(CopyError::Unsupported);
             }
         }
+        // 空源守卫（先于任何 COM 解引用）：`from_raw(0)` 构造的纹理对 null vtable 调
+        // `GetDesc` 是解引用崩溃（debug 由 null 检查 panic、release 裸 UB/0xC0000005，
+        // 都**不是**安全拒绝）。无效源按「该帧/文件不走 GPU 直通」上报（worker 侧按设备
+        // 丢失计数 → 黑名单 + 软重开恢复），且不为其建槽/取互斥。
+        if src_tex == 0 {
+            return Err(CopyError::Unsupported);
+        }
         let idx = self.ensure_slot(w, h)?;
         let out: Result<SharedFrame, CopyError> = (|| {
             let slot = &self.pool[idx];
@@ -261,11 +268,15 @@ impl SharedCopier {
                     let _ = slot.mutex.ReleaseSync(0);
                     return Err(CopyError::Unsupported);
                 }
-                debug_assert!(
-                    array_index < src_desc.ArraySize,
-                    "D3D11VA 帧数组下标越界: idx={array_index} ArraySize={}",
-                    src_desc.ArraySize
-                );
+                // 越界阵元下标守卫（release 同样生效）：`debug_assert` 在 release 被移除
+                // **不是守卫**——越界下标以前被驱动**静默别名**拷到邻近阵元（映射错帧，
+                // 早年实测「1 阵元读到号 0 数据」）；显式 `if` 拒绝 → 按「该帧/文件不走
+                // GPU 直通」上报（worker 侧按设备丢失计数 → 软重开恢复）。
+                if array_index >= src_desc.ArraySize {
+                    std::mem::forget(src);
+                    let _ = slot.mutex.ReleaseSync(0);
+                    return Err(CopyError::Unsupported);
+                }
 
                 // NV12 数组阵元 = **单一子资源**（D3D11CalcSubresource 无平面项；MipLevels=1 时
                 // SrcSubresource 即 ArraySlice）——一次 `CopySubresourceRegion` 拷一**整**阵元的
@@ -814,6 +825,91 @@ mod tests {
             assert_eq!(y, py, "阵元 {i} 的 Y 平面应原样到达共享槽");
             assert_eq!(uv, puv, "阵元 {i} 的 UV 平面应原样到达共享槽");
             copier.recycle(frame.shared_handle);
+        }
+    }
+
+    /// [评审 M（B8）：hw.rs:254-256,264-268 缺空指针/OOB 守卫] 硬件拷贝路径把「源纹理判空」缺失、
+    /// 把「array_index < ArraySize」只用 `debug_assert`（release 被移除）当守卫：
+    /// ① `ID3D11Texture2D::from_raw(src_tex=0)` 后直接 `src.GetDesc` = 对 null vtable 解引用——
+    ///    debug 下由 `windows-core`/编译器 null 检查触发「null pointer dereference」panic（已实测），
+    ///    release 下是裸 UB/AV（0xC0000005）；两种模式**都不是安全拒绝**（应为 `Err`）；
+    /// ② `array_index ≥ ArraySize` 在 release 无调试层时被驱动**静默别名/未定义**拷贝（OOB 读到
+    ///    邻近阵元，此前实测过「1 阵元读到号 0 数据」）。
+    /// 期望语义：与 debug 无关的显式 `if` 守卫——null 源 / OOB 下标 → 返回 [`CopyError`]（安全
+    /// 拒绝，绝不进入解引用/越界拷贝）。
+    ///
+    /// 红测①（OOB array_index）：源数组 ArraySize=1 却用越界下标 7 → 当前实现 debug_assert
+    /// 直接 panic（RED）；修复后应返回 `Err`。
+    #[test]
+    fn test_copy_oob_array_index_returns_err_not_panic() {
+        let Some(worker) = create_worker_d3d11_device() else {
+            eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用");
+            return;
+        };
+        let device = &worker.device;
+        let ctx = &worker.context;
+        // 数组尺寸固定为 1（ArraySize=1）的单切片 NV12 源——常规单阵元解码帧情形
+        let src = make_nv12(device, D3D11_USAGE_DEFAULT, 0, 1);
+        let src_raw = src.as_raw() as usize;
+        let mut copier = SharedCopier::new(WorkerD3D {
+            device: device.clone(),
+            context: ctx.clone(),
+            kind: worker.kind,
+        });
+        // 源只有 1 个阵元却用下标 7：当前实现 `debug_assert!(7 < 1)` → panic 崩溃；期望「if 守卫
+        // → Err(CopyError::…)」。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copier.copy(W, H, src_raw, 7)
+        }));
+        match result {
+            Ok(Err(e)) => eprintln!("[红测通过条件] OOB array_index 被安全拒绝 → Err({e:?})"),
+            Ok(Ok(_)) => panic!("OOB array_index 不应拷贝成功（应 return Err 而非越界拷贝）"),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&'static str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                panic!("OOB array_index 应被显式守卫拒绝为 Err，当前却是 panic 崩溃: {msg}")
+            }
+        }
+    }
+
+    /// 红测②（null 源）：`src_tex=0` 传入 → 当前实现无判空、`GetDesc` 对 null vtable 解引用
+    /// → debug 即 panic「null pointer dereference occurred」（release 为裸 UB/0xC0000005）=
+    /// RED；修复后应返回 `Err`。
+    #[test]
+    fn test_copy_null_source_returns_err_not_crash() {
+        let Some(worker) = create_worker_d3d11_device() else {
+            eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用");
+            return;
+        };
+        let device = &worker.device;
+        let ctx = &worker.context;
+        let mut copier = SharedCopier::new(WorkerD3D {
+            device: device.clone(),
+            context: ctx.clone(),
+            kind: worker.kind,
+        });
+        // src_tex = 0（null 源纹理句柄）：期望显式 if 守卫 → Err(CopyError)；当前实现无判空、
+        // `src.GetDesc` 对 null vtable 解引用 → panic/崩溃（debug 可被 catch_unwind 兜住）。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copier.copy(W, H, 0, 0)
+        }));
+        match result {
+            Ok(Err(e)) => eprintln!("[红测通过条件] null 源被安全拒绝 → Err({e:?})"),
+            Ok(Ok(f)) => panic!(
+                "null 源不应拷贝成功（应 return Err 而非 write 进 0 句柄槽）: 共享句柄=0x{:x}",
+                f.shared_handle
+            ),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&'static str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                panic!("null 源应被显式守卫拒绝为 Err，当前却是 panic 崩溃: {msg}")
+            }
         }
     }
 }
