@@ -35,19 +35,18 @@ mod widgets;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Anchor, App, AnyElement, Bounds, ClipboardItem, Context, Edges,
-    Entity, EntityInputHandler, EventEmitter, Focusable, FocusHandle, InteractiveElement as _,
+    Anchor, App, AnyElement, Bounds, Context, Edges,
+    Entity, EventEmitter, Focusable, FocusHandle, InteractiveElement as _,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit,
-    ParentElement as _, Point, Pixels, Render, RenderImage, ScrollHandle, SharedString, Styled as _,
-    StyledImage, TextInputConfiguration, UTF16Selection, Window,
-    anchored, deferred, div, img, point, px, size,
+    ParentElement as _, Pixels, Render, RenderImage, ScrollHandle, SharedString, Styled as _,
+    StyledImage, Subscription, Window,
+    anchored, deferred, div, img, point, px,
 };
 use gpui::AppContext as _;
 
@@ -165,10 +164,13 @@ pub struct MusicView {
     /// 视图本地状态。
     pub state: ViewState,
     focus_handle: FocusHandle,
-    /// 主区搜索框焦点（输入键让路/IME 注册用）。
-    search_focus: FocusHandle,
-    /// 主区搜索 IME 组合中（marked）区间（utf16）；None = 无组合。
-    search_marked: Option<Range<usize>>,
+    /// 主区搜索输入框（`ui::InputState` 实体）。懒初始化：`InputState::new` 需
+    /// `&mut Window` 而 `MusicView::new` 无 window，故首个 render 期在
+    /// [`main::render_search_box`] 建立并订阅（见 `_search_sub`）。
+    search_input: Option<Entity<ui::input::InputState>>,
+    /// 搜索输入框事件订阅（`Change` → 同步 `state.search` 过滤主表；`Cancel`(Esc) →
+    /// 清空搜索词；`Submit`(Enter) → 无既有提交语义）。
+    _search_sub: Option<Subscription>,
     /// 中央 toast：`(文案, 出现时刻)`，超时由 tick/render 清理。
     toast: Option<(SharedString, Instant)>,
     /// 上次已向用户浮现的播放错误（防每次 tick 重复弹 toast）。
@@ -267,8 +269,8 @@ impl MusicView {
             player,
             state: ViewState::default(),
             focus_handle: cx.focus_handle(),
-            search_focus: cx.focus_handle(),
-            search_marked: None,
+            search_input: None,
+            _search_sub: None,
             toast: None,
             last_error: None,
             _tick: Some(task),
@@ -598,8 +600,12 @@ impl MusicView {
     /// 全局快捷键（root `on_key_down`；搜索框持焦时让路）。`stop_propagation` 防漏给
     /// 下层（编辑器等外部）。
     fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_focus.is_focused(window) {
-            return; // 输入框持焦：全局快捷键放行（输入键由搜索框自处理）
+        if self
+            .search_input
+            .as_ref()
+            .is_some_and(|i| i.read(cx).focus_handle(cx).is_focused(window))
+        {
+            return; // 输入框持焦：全局快捷键放行（输入键由 InputState 自处理）
         }
         match e.keystroke.key.as_str() {
             "space" => self.toggle_play(cx),
@@ -896,178 +902,13 @@ impl Render for MusicView {
     }
 }
 
-/// 搜索框 IME（中文）输入落点：替换 `range`（None = 替换 marked/光标处）文本。
-/// `mark=true` 记下组合区间（Windows 组合更新以 None 区间替换它，防「拼音历史拼接」）。
-impl MusicView {
-    fn ime_replace(
-        &mut self,
-        range: Option<Range<usize>>,
-        text: &str,
-        mark: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let s = &self.state.search;
-        let total = s.encode_utf16().count();
-        let (start, end) = match &range {
-            Some(r) => (r.start.min(total), r.end.min(total)),
-            None => match &self.search_marked {
-                Some(m) => (m.start.min(total), m.end.min(total)),
-                None => (total, total),
-            },
-        };
-        let bs = utf16_to_byte(s, start);
-        let be = utf16_to_byte(s, end).max(bs);
-        let mut new = String::with_capacity(s.len() + text.len());
-        new.push_str(&s[..bs]);
-        new.push_str(text);
-        new.push_str(&s[be..]);
-        self.state.search = new;
-        if mark {
-            let bs_u16 = byte_to_utf16(&self.state.search, bs);
-            let len = text.encode_utf16().count();
-            self.search_marked = Some(bs_u16..bs_u16 + len);
-        } else {
-            self.search_marked = None;
-        }
-        cx.notify();
-    }
-}
-
-/// utf16 下标 → 字节下标（char 边界）。
-fn utf16_to_byte(s: &str, u16_idx: usize) -> usize {
-    let mut n = 0usize;
-    for (bi, ch) in s.char_indices() {
-        if n >= u16_idx {
-            return bi;
-        }
-        n += ch.len_utf16();
-    }
-    s.len()
-}
-
-/// 字节下标 → utf16 下标（`byte_idx` 必须是字符边界）。
-fn byte_to_utf16(s: &str, byte_idx: usize) -> usize {
-    s.get(..byte_idx.min(s.len()))
-        .map(|x| x.encode_utf16().count())
-        .unwrap_or(0)
-}
-
-/// 搜索框 IME/文本输入：`main.rs` 的 canvas 在**搜索持焦**时经 `ElementInputHandler`
-/// 注册本实现（组合文本直接落 `state.search`，与 ASCII 直插同一数据源）。
-impl EntityInputHandler for MusicView {
-    fn accepts_text_input(&self, _w: &mut Window, _cx: &mut Context<Self>) -> bool {
-        true
-    }
-
-    fn text_length_utf16(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
-        Some(self.state.search.encode_utf16().count())
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _ignore_disabled_input: bool,
-        _w: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let len = self.state.search.encode_utf16().count();
-        Some(UTF16Selection {
-            range: len..len,
-            reversed: false,
-        })
-    }
-
-    fn marked_text_range(&self, _w: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
-        self.search_marked.clone()
-    }
-
-    fn text_for_range(
-        &mut self,
-        range: Range<usize>,
-        _adjusted_range: &mut Option<Range<usize>>,
-        _w: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let s = &self.state.search;
-        let b0 = utf16_to_byte(s, range.start);
-        let b1 = utf16_to_byte(s, range.end);
-        if b0 <= b1 && b1 <= s.len() {
-            Some(s[b0..b1].to_string())
-        } else {
-            None
-        }
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        text: &str,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.ime_replace(range, text, false, cx);
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.ime_replace(range, new_text, true, cx);
-    }
-
-    fn unmark_text(&mut self, _w: &mut Window, _cx: &mut Context<Self>) {
-        self.search_marked = None;
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _range_utf16: Range<usize>,
-        element_bounds: Bounds<Pixels>,
-        _w: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        // 简化：光标列 = 元素左缘 + 3px（中文 IME 候选窗跟随近似）。
-        Some(Bounds::new(
-            point(element_bounds.origin.x + px(3.), element_bounds.origin.y + px(2.)),
-            size(px(2.), element_bounds.size.height - px(4.)),
-        ))
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        _point: Point<Pixels>,
-        _w: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        // 简化：单行框光标恒在末尾（不做点击摆光标）。
-        Some(self.state.search.encode_utf16().count())
-    }
-
-    fn set_selected_text_range(
-        &mut self,
-        _range_utf16: Range<usize>,
-        _w: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-    }
-
-    fn paste(&mut self, item: ClipboardItem, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = item.text() {
-            self.ime_replace(None, &text, false, cx);
-        }
-    }
-
-    fn text_input_configuration(
-        &mut self,
-        _w: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> TextInputConfiguration {
-        TextInputConfiguration::default()
-    }
-}
+// ⚠️ 旧自绘搜索输入机制（IME 落点 `ime_replace`、utf16 换算辅助、`impl
+// EntityInputHandler for MusicView`、`main.rs` 的 `on_search_key`/`canvas_ime_handler`）
+// **已整体删除**：已被 `ui::input::InputState` 取代（R1 迁移，2026-11-17）。删除理由：
+// ① 功能被 InputState 完全覆盖（IME 由 `InputElement` paint 期挂 `window.handle_input`
+// + `ImeTextHost` 适配层收口，中文组合更新天然替换旧 marked 不追加）；② 旧实现
+// `selected_text_range` 恒返回末尾、`paste` 键盘不可达，属缺陷路径；③ 保留会连带维持
+// `search_focus`/`search_marked` 陈旧字段与不可达代码。若需回退请从 git 历史恢复。
 
 /// 主区搜索过滤纯函数：标题/艺术家大小写不敏感任一命中；空查询返回全部。
 /// 拆出便于单测（`main.rs::tests`）。

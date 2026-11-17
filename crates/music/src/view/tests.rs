@@ -2710,6 +2710,170 @@ async fn search_filters_main_list_rows(cx: &mut TestAppContext) {
     assert_eq!(cached, Some(8), "搜索模型缓存应含 8 首命中，实得 {cached:?}");
 }
 
+// ---- 搜索框迁移到 ui::InputState（R1/R4）：set_value / Ctrl+V 粘贴 / Esc 清空 ----
+
+/// 绑定搜索输入需要的「Input」键位：`base::actions::bind_input_keys`（Ctrl+A/C/X/Z/Y、
+/// 方向、退格等）+ `src/main.rs` 同款的 `ctrl-v → PasteNormalized` 覆盖绑定（Input 键
+/// 上下文），供粘贴/Esc 测试走真实 按键→action 链（对齐 `ui/src/input.rs` 测试的
+/// `bind_paste_normalized` 姿势；本 crate 无 test_support，绑本测试最小面）。
+fn bind_search_keys(cx: &TestAppContext) {
+    cx.update(|cx| {
+        base::actions::bind_input_keys(cx);
+        cx.bind_keys([gpui::KeyBinding::new(
+            "ctrl-v",
+            base::actions::PasteNormalized,
+            Some("Input"),
+        )]);
+    });
+}
+
+/// 聚焦搜索输入框（InputState 内部 `focus_handle`，真实键盘派发起点）。
+fn focus_search_input(wcx: &mut VisualTestContext, view: &Entity<MusicView>) {
+    wcx.update(|window, cx| {
+        if let Some(i) = view.read(cx).search_input.clone() {
+            let fh = i.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        }
+    });
+    wcx.run_until_parked();
+}
+
+/// 迁移 R4-A：搜索输入框 `set_value`（程序化写入，发 `Change`）→ `state.search` 镜像 +
+/// 主表过滤生效。行为级验证：搜索词改由 ui::InputState 文本驱动，不再直改 `state.search`。
+///
+/// 注：`library_with_n(40)` 入库后按文件名排序——同艺术家「艺人X」8 首连续占一组下标
+/// （艺人0 → idx0..7、艺人1 → idx8..15…）。故 q="艺人0" 命中的正是 idx0..7，
+/// 判据用 `song-row-0/7` 在（艺人0 组）、`song-row-8` 不在（艺人1 组）。
+#[gpui::test]
+async fn search_input_set_value_filters_main_list(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 40);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    // 首帧渲染：懒初始化搜索输入实体（MusicView::new 无 window）。
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.cx.read(|app| view.read(app).search_input.is_some()),
+        "首帧渲染应已懒初始化搜索输入实体"
+    );
+    // set_value("艺人0") → Change → 订阅镜像 state.search → 过滤（艺人0 组 8 首）。
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| {
+            let input = v.search_input.clone().expect("已初始化");
+            input.update(cx, |s, scx| s.set_value("艺人0", window, scx));
+        });
+    });
+    let synced = wcx.cx.read(|app| view.read(app).state.search.clone());
+    assert_eq!(synced, "艺人0", "Change 应把输入框文本镜像进 state.search");
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("song-row-0").is_some(), "命中行应物化（艺人0 首行）");
+    assert!(wcx.debug_bounds("song-row-7").is_some(), "艺人0 组内行应物化");
+    assert!(
+        wcx.debug_bounds("song-row-8").is_none(),
+        "艺人1 组行（idx8）不应物化（set_value 路径过滤生效）"
+    );
+    let cached = wcx.cx.read(|app| {
+        view.read(app)
+            .main_list_cache
+            .get(&(MainSection::Home, "艺人0".to_string()))
+            .map(|(_rev, l)| l.total)
+    });
+    assert_eq!(cached, Some(8), "过滤模型缓存应含 8 首命中，实得 {cached:?}");
+}
+
+/// 迁移 R4-B：Ctrl+V 真实键链粘贴 → 搜索词进入 InputState 文本 + Change 同步过滤
+/// （模拟「复制歌词名 → 粘贴进搜索框即滤」的既有用户路径）。
+#[gpui::test]
+async fn search_input_ctrl_v_pastes_into_search(cx: &mut TestAppContext) {
+    bind_search_keys(cx);
+    let player = library_with_n(cx, 40);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 剪贴板放入待粘贴词（「艺人1」→ 艺人1 组 8 首 = idx8..15）+ 聚焦搜索框。
+    let pasted = "艺人1";
+    wcx.write_to_clipboard(gpui::ClipboardItem::new_string(pasted.to_string()));
+    focus_search_input(wcx, &view);
+    let w = wcx.windows().first().copied().expect("测试窗口");
+    wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-v").unwrap());
+    wcx.run_until_parked();
+    // 断言：InputState 文本 == 粘贴词；Change → state.search 同步；列表过滤生效。
+    let (input_text, search) = wcx.cx.read(|app| {
+        let v = view.read(app);
+        let text = v
+            .search_input
+            .clone()
+            .map(|i| i.read(app).value().to_string())
+            .unwrap_or_default();
+        (text, v.state.search.clone())
+    });
+    assert_eq!(input_text, pasted, "粘贴文本应进入搜索输入框");
+    assert_eq!(search, pasted, "Change 应把粘贴文本镜像进 state.search");
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("song-row-8").is_some(), "命中行应物化（艺人1 组 idx8）");
+    assert!(
+        wcx.debug_bounds("song-row-0").is_none(),
+        "艺人0 行不应物化（Ctrl+V 粘贴驱动过滤生效）"
+    );
+}
+
+/// 迁移 R4-C：Esc 真实键链 → Cancel → 清空搜索词 + 输入框文本，且**不**触发
+/// `MusicEvent::ExitRequested`（Root 全局 Esc 退出语义在搜索框持焦时让路——
+/// InputState 对 Esc `stop_propagation`，root `on_key` 收不到）。
+#[gpui::test]
+async fn search_input_escape_clears_query_without_exit(cx: &mut TestAppContext) {
+    bind_search_keys(cx);
+    let player = library_with_n(cx, 40);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    let exits = Rc::new(Cell::new(0usize));
+    wcx.update(|window, app| {
+        let e = exits.clone();
+        window
+            .subscribe(&view, app, move |_, _: &MusicEvent, _, _| e.set(e.get() + 1))
+            .detach();
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 先经 set_value 置入搜索词（走实体路径）。
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| {
+            if let Some(i) = v.search_input.clone() {
+                i.update(cx, |s, scx| s.set_value("艺人0", window, scx));
+            }
+        });
+    });
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).state.search.clone()),
+        "艺人0",
+        "前置：set_value 已同步 state.search"
+    );
+    focus_search_input(wcx, &view);
+    let w = wcx.windows().first().copied().expect("测试窗口");
+    wcx.dispatch_keystroke(w, gpui::Keystroke::parse("escape").unwrap());
+    wcx.run_until_parked();
+    let (input_text, search) = wcx.cx.read(|app| {
+        let v = view.read(app);
+        let text = v
+            .search_input
+            .clone()
+            .map(|i| i.read(app).value().to_string())
+            .unwrap_or_default();
+        (text, v.state.search.clone())
+    });
+    assert_eq!(input_text, "", "Esc 应清空输入框文本");
+    assert_eq!(search, "", "Esc 应清空 state.search");
+    assert_eq!(exits.get(), 0, "搜索框持焦时 Esc 不应触发退出音乐模式");
+}
+
 /// 用例 V6（Liked + 收藏变更失效缓存）：无收藏 → 空态；收藏 1 首 → 该行物化（mutation 升，
 /// 显示模型缓存失效重建）。
 #[gpui::test]

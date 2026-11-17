@@ -20,6 +20,7 @@ use gpui::{
     ParentElement as _, RenderImage, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _,
     StyledImage, Window, div, img, px,
 };
+use gpui::AppContext as _;
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -31,6 +32,7 @@ use crate::model::Track;
 use super::icon::{IconView, MusicIcon};
 use super::{MainSection, MusicView, theme};
 use ui::icon::{Icon, IconName};
+use ui::input::{Input as UiInput, InputEvent, InputState};
 use ui::scrollbar::{Scrollbar as UiScrollbar, ScrollbarMode};
 
 /// 主区横向内边距（px，左右同值）：`#music-main` 内容区留白；overlay 滚动条用
@@ -271,23 +273,62 @@ impl super::MusicView {
             .into_any_element()
     }
 
-    /// 搜索框：输入即过滤（`state.search` 驱动主表）。ASCII 可打印键直落
-    /// （`key_char` 已带 shift）；中文 IME 由 view 的 `EntityInputHandler` 落地。
+    /// 搜索框：输入即过滤（`ui::InputState` 实体驱动主表）。输入实体**懒初始化**
+    /// （`InputState::new` 需 `&mut Window`、`MusicView::new` 无 window → 首个 render
+    /// 期建立并订阅）。全键盘能力（Ctrl+A/C/V/X/Z/Y、方向键编辑、IME）由
+    /// `ui::InputState` 收口：
+    /// - `Change` → 把文本镜像进 `state.search`（主表过滤模型缓存以它为键）即滤；
+    /// - `Submit`(Enter) → 无既有提交语义（原自绘实现 Enter 同样吞掉，保持现状）；
+    /// - `Cancel`(Esc) → 清空搜索词（不退出音乐模式）；文本与 `state.search` 一并清，
+    ///   防镜像失同步（回调带 `&mut Window`，可直接 `set_value("")`）。
     fn render_search_box(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let focused = self.search_focus.is_focused(window);
+        // 首次渲染懒建输入实体 + 订阅。`window.subscribe` 回调带 `&mut Window`（Esc
+        // 清空用）；订阅经 `new_subscription` 的 `defer` 延迟激活，render 期注册安全。
+        if self.search_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("搜索歌曲、歌手、专辑…")
+                    // 搜索 pill 为存量固定深紫（`theme::bg_secondary` 0x1a1738），不随全局
+                    // 深浅翻转 → 注入音乐浅色文字 `theme::text()`（0xf0edff）保证深面上可读。
+                    .text_color(theme::text())
+            });
+            let weak = cx.weak_entity();
+            let sub = window.subscribe(&input, cx, move |_input, ev, window, app| {
+                let _ = weak.update(app, |this, cx| match ev {
+                    InputEvent::Change => {
+                        // 输入即过滤：镜像进 `state.search`。
+                        if let Some(i) = this.search_input.clone() {
+                            this.state.search = i.read(cx).value().to_string();
+                        }
+                        cx.notify();
+                    }
+                    InputEvent::Submit { .. } => {
+                        // 既有语义：搜索框 Enter 无「提交」动作。
+                    }
+                    InputEvent::Cancel => {
+                        // 既有行为 = 清空搜索词（不退出音乐模式）。
+                        if let Some(i) = this.search_input.clone() {
+                            i.update(cx, |s, scx| s.set_value("", window, scx));
+                        }
+                        this.state.search.clear();
+                        cx.notify();
+                    }
+                });
+            });
+            self._search_sub = Some(sub);
+            self.search_input = Some(input);
+        }
+        let input = self.search_input.clone().expect("搜索输入已初始化");
+        let focused = input.read(cx).focus_handle(cx).is_focused(window);
         let border = if focused {
             theme::accent()
         } else {
             theme::border()
         };
-        let text = self.state.search.clone();
-        let placeholder = !focused && text.is_empty();
-        let entity = cx.entity();
-        let search_focus = self.search_focus.clone();
         div()
             .id("music-search")
             .debug_selector(|| "music-search".into())
@@ -301,73 +342,26 @@ impl super::MusicView {
             .border_1()
             .border_color(border)
             .rounded(px(18.))
-            .track_focus(&self.search_focus)
+            // 整颗 pill 可点（含图标/留白区）聚焦搜索框；输入区点按摆光标由 InputState
+            // 自处理（事件先到深层输入元素再冒泡到本层，重复聚焦同一句柄无害）。
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this: &mut MusicView, _ev, window, cx| {
-                    this.search_focus.focus(window, cx);
+                    if let Some(i) = this.search_input.clone() {
+                        let fh = i.read(cx).focus_handle(cx);
+                        window.focus(&fh, cx);
+                    }
                     cx.stop_propagation();
                 }),
             )
-            .on_key_down(cx.listener(Self::on_search_key))
             .child(Icon::new(IconName::Search).size(px(16.)).text_color(theme::text3()))
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .child(if placeholder {
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme::text3())
-                            .child("搜索歌曲、歌手、专辑…")
-                            .into_any_element()
-                    } else {
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme::text())
-                            .child(text)
-                            .into_any_element()
-                    }),
-            )
-            .child(
-                // 注册 IME 输入句柄（仅搜索持焦时）：把组合文本直接落 `state.search`。
-                canvas_ime_handler(entity, search_focus),
+                    .child(UiInput::new(&input)),
             )
             .into_any_element()
-    }
-
-    /// 搜索框按键：可打印字符（key_char）直插；backspace 退格；escape 清空。
-    /// 全部吞掉，不冒泡到根的全局快捷键。
-    fn on_search_key(
-        &mut self,
-        e: &gpui::KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let k = &e.keystroke;
-        let m = k.modifiers;
-        match k.key.as_str() {
-            "backspace" => {
-                self.state.search.pop();
-                cx.notify();
-            }
-            "escape" => {
-                self.state.search.clear();
-                cx.notify();
-            }
-            _ => {
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = &k.key_char {
-                        self.state.search.push_str(ch);
-                        cx.notify();
-                    } else if k.key == "space" {
-                        self.state.search.push(' ');
-                        cx.notify();
-                    }
-                }
-            }
-        }
-        cx.stop_propagation();
     }
 
     /// 圆角图标钮（通知/设置）：点击 toast。
@@ -1180,22 +1174,6 @@ fn chrono_now_hour() -> u32 {
     (((now + 8 * 3600) % 86400) / 3600) as u32
 }
 
-/// 搜索框 canvas：注册 IME 输入句柄（仅搜索持焦时）到 view 的 `EntityInputHandler`。
-/// 必须在**paint 期**调用 `window.handle_input`（gpui `debug_assert_paint` 校验）；canvas
-/// 的 paint 回调刚好位于 paint 阶段，故把注册放 paint、prepaint 留空。
-fn canvas_ime_handler(
-    entity: gpui::Entity<MusicView>,
-    search_focus: gpui::FocusHandle,
-) -> AnyElement {
-    use gpui::{ElementInputHandler, canvas};
-    canvas(
-        |_, _, _| {},
-        move |bounds, _t, window, app| {
-            if search_focus.is_focused(window) {
-                let handler = ElementInputHandler::new(bounds, entity.clone());
-                window.handle_input(&search_focus, handler, app);
-            }
-        },
-    )
-    .into_any_element()
-}
+// ⚠️ 旧自绘搜索输入 canvas（`canvas_ime_handler`）**已删除**：已被
+// `ui::input::InputState` 取代（`InputElement` paint 期自身挂 `window.handle_input`，
+// 无需再于搜索框内嵌 canvas 手动注册 `EntityInputHandler`；见 `mod.rs` 删除说明）。
