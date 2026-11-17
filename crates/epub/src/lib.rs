@@ -31,6 +31,12 @@ use markdown::RowAlign;
 /// 可把 16MiB 章节放大成数百 MiB 节点树；1M 节点对正常 EPUB 章节绰绰有余。
 const MAX_XML_NODES: u32 = 1_000_000;
 
+/// zip **条目总数**硬上界（P0 三件套末条）：`ZipArchive::new` 会**全量物化整份
+/// 中央目录**，恶意 EPUB 可塞海量条目撑大分配；正常书籍条目数（容器 + OPF +
+/// HTML 章节 + 图片 + 杂项）通常数百内，65536 已是经典 zip 工具单档硬上限
+/// （ZIP64 之前的 0xFFFF 条目 / 单卷），对齐该经典上限做安全余量。
+const EPUB_MAX_ZIP_ENTRIES: usize = 65_536;
+
 /// 递归遍历 XHTML 树的显式深度上限（P0-B2）：正文 `walk_body` 与文本提取
 /// `node_text_epub`/`walk_text_lines` 两个遍历族各自独立封顶，防恶意深层嵌套
 /// 撑爆调用栈 / 无界展开。正常排版嵌套 <50 层，256 绰绰有余；合法书籍输出
@@ -266,6 +272,15 @@ fn parse_epub_reader_limited<R: Read + std::io::Seek>(
 ) -> Result<EpubDocument> {
     let mut archive = zip::ZipArchive::new(reader).context("无效的 EPUB（zip 容器读取失败）")?;
 
+    // zip 条目总数硬上界：`ZipArchive::new` 已全量物化中央目录，超限即整档拒绝
+    // （结构条目三件套 + 海量垃圾条目都在 `len()` 内，一并计入）。
+    if archive.len() > EPUB_MAX_ZIP_ENTRIES {
+        bail!(
+            "zip 条目总数超上限（{} > {EPUB_MAX_ZIP_ENTRIES}），拒绝解析",
+            archive.len()
+        );
+    }
+
     // 1) 定位 OPF：读 META-INF/container.xml
     let container_xml = read_zip_entry(&mut archive, "META-INF/container.xml", limits.max_entry_bytes)
         .context("EPUB 缺少 META-INF/container.xml")?;
@@ -308,13 +323,16 @@ fn parse_epub_reader_limited<R: Read + std::io::Seek>(
             if src.is_empty() {
                 return None;
             }
-            if let Some(vsrc) = img_cache.get(src) {
+            // 去重键 = 解析后的 zip **完整路径**，而非原始 src：不同目录章节共用同名
+            // `src`（如 `images/p.png`）会指向 zip 内**不同**文件，按 src 去重会让
+            // 后章命中首章条目 → 渲染出首章字节（错图）。
+            let full = join_zip_path(&chapter_dir, src);
+            if let Some(vsrc) = img_cache.get(&full) {
                 return Some(vsrc.clone());
             }
             if img_counter >= limits.max_image_count {
                 return None; // 图片数超限：不再收进内存（渲染以 alt 占位兜底）
             }
-            let full = join_zip_path(&chapter_dir, src);
             let file = archive.by_name(&full).ok()?;
             let mut bytes = Vec::new();
             // 单张图片解压限长（take 钳峰值，防压缩炸弹把单张解到几百 MiB 先分配）。
@@ -338,7 +356,7 @@ fn parse_epub_reader_limited<R: Read + std::io::Seek>(
             let vsrc = format!("{EPUB_IMG_SCHEME}{img_counter}.{ext}");
             // 内存持有字节：Image::from_bytes(format, bytes)
             images.insert(vsrc.clone(), Arc::new(Image::from_bytes(format, bytes)));
-            img_cache.insert(src.to_string(), vsrc.clone());
+            img_cache.insert(full, vsrc.clone());
             Some(vsrc)
         };
         let chapter_md = xhtml_to_markdown(&chapter_html, &mut on_img, &mut notes);
@@ -511,6 +529,102 @@ fn parse_opf(opf_xml: &str, opf_path: &str) -> Result<(String, String, Vec<Strin
     Ok((title, author, spine_hrefs))
 }
 
+/// 常见 HTML 命名实体 → Unicode 字面字符（供章节 XHTML 解析前预解码）。
+///
+/// roxmltree 只认 XML 预定义实体（`amp`/`lt`/`gt`/`quot`/`apos`）与数字字符引用
+/// （`&#NNN;`/`&#xHH;`），真实 EPUB 正文常用 `&nbsp;`/`&mdash;`/`&ldquo;` 等 HTML
+/// 命名实体，直接解析会整章 `Err` → 内容静默丢空。
+///
+/// 表**刻意不含**五个 XML 预定义实体与数字引用：它们交给 roxmltree 原地处理——
+/// `&amp;nbsp;` 的 `&amp;` 保持原样 → roxmltree 解码为字面 `&nbsp;`，不会在预解码
+/// 阶段被二次展开，杜绝「先解 `&amp;`→`&`、再把 `nbsp;` 当实体重解」的双重解码。
+fn html_entity_value(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "nbsp" => "\u{00A0}",   // 不换行空格
+        "ensp" => "\u{2002}",   // 半角空格
+        "emsp" => "\u{2003}",   // 全角空格
+        "thinsp" => "\u{2009}", // 窄空格
+        "mdash" => "\u{2014}",  // 破折号
+        "ndash" => "\u{2013}",  // 短破折号
+        "hellip" => "\u{2026}", // 省略号
+        "ldquo" => "\u{201C}",
+        "rdquo" => "\u{201D}",
+        "lsquo" => "\u{2018}",
+        "rsquo" => "\u{2019}",
+        "bull" => "\u{2022}",
+        "middot" => "\u{00B7}",
+        "copy" => "\u{00A9}",
+        "reg" => "\u{00AE}",
+        "trade" => "\u{2122}",
+        "sect" => "\u{00A7}",
+        "para" => "\u{00B6}",
+        "laquo" => "\u{00AB}",
+        "raquo" => "\u{00BB}",
+        "times" => "\u{00D7}",
+        "divide" => "\u{00F7}",
+        "plusmn" => "\u{00B1}",
+        "micro" => "\u{00B5}",
+        "deg" => "\u{00B0}",
+        "ne" => "\u{2260}",
+        "le" => "\u{2264}",
+        "ge" => "\u{2265}",
+        "frac12" => "\u{00BD}",
+        "frac14" => "\u{00BC}",
+        "frac34" => "\u{00BE}",
+        "eacute" => "\u{00E9}",
+        "egrave" => "\u{00E8}",
+        "euml" => "\u{00EB}",
+        "ocirc" => "\u{00F4}",
+        "uuml" => "\u{00FC}",
+        "aacute" => "\u{00E1}",
+        "agrave" => "\u{00E0}",
+        "ccedil" => "\u{00E7}",
+        _ => return None,
+    })
+}
+
+/// 一次性从左到右扫描，把章节 XHTML 里表中命中的 `&name;` 预解码为字面字符。
+///
+/// - 命中（表内，如 `&nbsp;`）→ 替换为对应字符，扫描从 `;` 之后继续；
+/// - 未命中（`&amp;`/`&lt;`/`&gt;`/`&quot;`/`&apos;`、数字字符引用、未知实体）→
+///   `&` 原样保留、只推进 1 字节，其后的字面字符不再当实体序列处理。
+///
+/// 因替换只发生在「完整 `&name;`」，且未命中时按单字符推进，`&amp;nbsp;` 的
+/// `&amp;` 不会先变 `&` 再触发二次替换（`&amp;` 原样保留，`nbsp;` 只是后继字面）；
+/// 输出中不会**新引入** `&`/`<`/`>`/`"`/`'`，不会破坏 XML 良构。
+fn decode_html_named_entities(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // 找下一个 `&`：其前逐段原样拷贝；没有则剩余全部原样拷出。
+        let amp = bytes[i..].iter().position(|&b| b == b'&').map(|p| i + p);
+        let Some(a) = amp else {
+            out.push_str(&text[i..]);
+            break;
+        };
+        out.push_str(&text[i..a]);
+        // 尝试匹配 `&name;`：名字为 ASCII 字母数字；数字引用（`&#…`）不匹配 → 保留。
+        let mut name_end = a + 1;
+        while name_end < bytes.len() && bytes[name_end].is_ascii_alphanumeric() {
+            name_end += 1;
+        }
+        if name_end > a + 1
+            && name_end < bytes.len()
+            && bytes[name_end] == b';'
+            && let Some(repl) = html_entity_value(&text[a + 1..name_end])
+        {
+            out.push_str(repl);
+            i = name_end + 1; // 跳过 `;`，后继内容从字面继续
+        } else {
+            // 未命中：`&` 原样保留，推进 1 字节（防漏字符）
+            out.push('&');
+            i = a + 1;
+        }
+    }
+    out
+}
+
 /// 把一棵 XHTML 章节转成 Markdown。
 ///
 /// 支持：标题(h1..h6)、段落(p)、引述(blockquote)、列表(ul/ol/li)、
@@ -531,6 +645,9 @@ fn xhtml_to_markdown(
     // PUBLIC "…//DTD XHTML…dtd">`，直接解析会整章失败（"XML with DTD detected"）
     // → 每章输出空 → 整书空文档（打开黑屏无字）。解析前先剥离 DOCTYPE。
     let html = strip_doctype(html);
+    // roxmltree 只认 5 个 XML 预定义实体 + 数字字符引用；正文的 HTML 命名实体
+    // （`&nbsp;`/`&mdash;`/`&ldquo;` 等）预解码为字面字符，防整章解析 Err 静默丢空。
+    let html = decode_html_named_entities(&html);
     let doc = match parse_xml(&html) {
         Ok(d) => d,
         Err(_) => return String::new(),
@@ -1584,6 +1701,197 @@ mod tests {
             assert!(
                 res.is_err(),
                 "整书 markdown 超限应显式 Err"
+            );
+        }
+    }
+
+    // ===== 2026-11-17 复现红测（docs/code-review-2026-11-17/25-epub.md M 级三条）=====
+    // 本批只写失败断言、禁改生产码：全部应 RED，待实现流修绿。
+    mod regression_2026_11_17 {
+        use super::*;
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        /// 造一个两章节各在不同目录、且共用同一 `src="images/p.png"` 但指向 **不同**
+        /// zip 内图片路径的最小合法 EPUB：`OEBPS/a/images/p.png` 与 `OEBPS/b/images/p.png`
+        /// 字节不同（分别以 0xAA / 0xBB 结尾做标记）。
+        ///
+        /// 复现缺陷 1（lib.rs img_cache 按原始 src 而非解析后 zip 路径去重）：
+        /// 两章 `src` 相同 → 后章被去重到首章条目 → 章节 b 渲染出章节 a 的字节（错图）。
+        fn make_epub_same_src_diff_paths(
+            img_a: &[u8],
+            img_b: &[u8],
+        ) -> std::io::Cursor<Vec<u8>> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut buf);
+                let opts = SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                let add =
+                    |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
+                        w.start_file(name, opts).unwrap();
+                        w.write_all(data).unwrap();
+                    };
+                add(
+                    &mut w,
+                    "META-INF/container.xml",
+                    br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+                );
+                let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">测试书</dc:title></metadata>
+  <manifest>
+    <item id="c1" href="a/ch.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c2" href="b/ch.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="c1"/><itemref idref="c2"/></spine>
+</package>"#;
+                add(&mut w, "OEBPS/content.opf", opf.as_bytes());
+                add(
+                    &mut w,
+                    "OEBPS/a/ch.xhtml",
+                    "<html><body><p class=\"text\">章节甲</p><img src=\"images/p.png\" alt=\"图甲\"/></body></html>"
+                        .as_bytes(),
+                );
+                add(
+                    &mut w,
+                    "OEBPS/b/ch.xhtml",
+                    "<html><body><p class=\"text\">章节乙</p><img src=\"images/p.png\" alt=\"图乙\"/></body></html>"
+                        .as_bytes(),
+                );
+                add(&mut w, "OEBPS/a/images/p.png", img_a);
+                add(&mut w, "OEBPS/b/images/p.png", img_b);
+                w.finish().unwrap();
+            }
+            buf.set_position(0);
+            buf
+        }
+
+        /// 缺陷 1 红测：`src` 相同但 zip 内完整路径不同 → 必须各自成条目、各回读各自字节。
+        #[test]
+        fn img_cache_keys_by_zip_path_not_src() {
+            // 两张 12B 图：PNG 魔数 + 区分标记（0xAA / 0xBB）。
+            let img_a = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0xAA, 0xAA, 0xAA, 0xAA];
+            let img_b = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0xBB, 0xBB, 0xBB, 0xBB];
+            let zip = make_epub_same_src_diff_paths(&img_a, &img_b);
+            let doc = parse_epub_reader(zip).expect("解析应成功");
+            // 断言 1（红）：两个不同 zip 路径的图应分属两个内存条目。
+            assert_eq!(
+                doc.images.len(),
+                2,
+                "src 相同但 zip 路径不同的两张图应各自成条目，实际：{}",
+                doc.images.len()
+            );
+            // 断言 2（红）：两章 markdown 应引用两个**不同**的虚拟 src。
+            let img_lines: Vec<&str> = doc.markdown.lines().filter(|l| l.starts_with("![")).collect();
+            assert_eq!(img_lines.len(), 2, "两章各应有一张图，实际 markdown：{doc:?}");
+            let vsrcs: std::collections::HashSet<&str> = img_lines
+                .iter()
+                .filter_map(|l| {
+                    let s = l.find("](")?;
+                    let e = l.rfind(')')?;
+                    Some(&l[s + 2..e])
+                })
+                .collect();
+            assert_eq!(
+                vsrcs.len(),
+                2,
+                "两章引用的虚拟 src 应不同（按 zip 路径区分），实际：{vsrcs:?}"
+            );
+            // 断言 3（红）：各虚拟 src 应回读各自 zip 路径的真实字节（去重错图即在此不匹配）。
+            let mut markers: Vec<u8> = doc
+                .images
+                .values()
+                .map(|img| img.bytes.last().copied().unwrap())
+                .collect();
+            markers.sort_unstable();
+            assert_eq!(markers, vec![0xAA, 0xBB], "两图字节应分别保留，实际标记：{markers:?}");
+        }
+
+        /// 缺陷 2 红测：`&nbsp;`（XML 未预定义**命名**实体）→ roxmltree parse Err →
+        /// `xhtml_to_markdown` 的 `Err(_) => return String::new()` → 整章静默丢空。
+        /// 期望：实体正常解码为空格、章不空、实体前后文本保留。
+        #[test]
+        fn chapter_with_nbsp_entity_not_emptied() {
+            let html = "<html><body><p class=\"text\">第一句&nbsp;第二句</p></body></html>";
+            let no: Option<String> = None;
+            let mut notes = std::collections::BTreeMap::new();
+            let md = xhtml_to_markdown(html, &mut |_s, _a| no.clone(), &mut notes);
+            assert!(
+                !md.trim().is_empty(),
+                "含命名实体（&nbsp;）的章节不应被整章置空，实际输出：{md:?}"
+            );
+            assert!(
+                md.contains("第一句") && md.contains("第二句"),
+                "实体前后的文本都应保留，实际：{md:?}"
+            );
+            // 对照（判别力，K173）：数字字符引用 `&#160;` 是 XML 预定义 → 本应正常解码。
+            // 该断言现为绿，证明「章不空」机制本身可用，红只源于命名实体 `&nbsp;`。
+            let md_numeric = xhtml_to_markdown(
+                "<html><body><p class=\"text\">第一句&#160;第二句</p></body></html>",
+                &mut |_s, _a| no.clone(),
+                &mut notes,
+            );
+            assert!(
+                md_numeric.contains("第一句") && md_numeric.contains("第二句"),
+                "数字字符引用（&#160;）不应影响章节文本，实际：{md_numeric:?}"
+            );
+        }
+
+        /// 造一个条目总数远超上限（65536）的最小合法 EPUB：容器三件套 + `junk_count` 条
+        /// Stored 空条目（不影响解析路径，仅撑大 zip 中央目录）。zip writer 对 >65535 条目
+        /// 自动写 ZIP64 尾记录（zip write.rs:1539），读取端同样支持。
+        fn make_epub_many_entries(junk_count: usize) -> std::io::Cursor<Vec<u8>> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut buf);
+                let opts = SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                let add =
+                    |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
+                        w.start_file(name, opts).unwrap();
+                        w.write_all(data).unwrap();
+                    };
+                add(
+                    &mut w,
+                    "META-INF/container.xml",
+                    br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+                );
+                let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">测试书</dc:title></metadata>
+  <manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+                add(&mut w, "OEBPS/content.opf", opf.as_bytes());
+                add(&mut w, "OEBPS/ch1.xhtml", b"<html><body><p>x</p></body></html>");
+                for i in 0..junk_count {
+                    add(&mut w, &format!("junk/junk{i:05}.bin"), b"");
+                }
+                w.finish().unwrap();
+            }
+            buf.set_position(0);
+            buf
+        }
+
+        /// 缺陷 3 红测：zip 条目总数无上限（各量独立硬上界唯独漏条目数）→
+        /// `ZipArchive::new` 全量物化中央目录 → 恶意海量条目大分配。
+        /// 期望语义：条目总数硬上界（如 ≤ 65536，建议常量 `EPUB_MAX_ZIP_ENTRIES`），超限拒绝。
+        #[test]
+        fn zip_entry_count_cap_rejects_huge_archive() {
+            const JUNK: usize = 65_536; // 65536 垃圾 + 3 结构条目 = 65539 > 65536（建议上限）
+            let zip = make_epub_many_entries(JUNK);
+            let res = parse_epub_reader(zip);
+            assert!(
+                res.is_err(),
+                "条目总数超上限（{} 条 > 65536）应整档拒绝，实际解析通过",
+                JUNK + 3
             );
         }
     }

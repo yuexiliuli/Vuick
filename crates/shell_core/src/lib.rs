@@ -22,6 +22,10 @@ pub mod host;
 pub mod model;
 pub mod rp_diag;
 
+// 阅读进度两缺陷复现红测（只测不改生产源码；gpui test-support 仅在 dev 生效）。
+#[cfg(test)]
+mod reading_progress_red_tests;
+
 pub use host::AppHost;
 pub use model::{
     AppModel, CommitLiveAlign, DetachedTab, EditorTab, LIVE_BODY_PAD_Y, LIVE_COMMIT_OPS_COUNT,

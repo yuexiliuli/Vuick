@@ -36,6 +36,11 @@ session_store = { path = "../session_store" }
 # Rope 为 workspace 既有的文本存储类型（shell 同款）。
 ropey = { workspace = true }
 
+# 复现红测（reading_progress_red_tests）：`#[gpui::test]` / TestAppContext 需 test-support。
+# zed 同款：dev 下给同一 gpui 依赖叠加 test-support feature（同一包一个名字，features 相加）。
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [features]
 default = []
 # video：与 shell 同名 feature 一致——shell 经 `shell_core/video` 显式转发开启。

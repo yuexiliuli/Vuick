@@ -399,8 +399,17 @@ impl AppModel {
             let line = tab.payload.md_wy.as_ref()?.read(cx).top_source_line()?;
             return Some(ReadingProgress::Epub { top_line: line });
         }
-        // md / txt：编辑区视口顶源码行（0 基）。
-        let top_line = tab.payload.editor.read(cx).viewport_top_line();
+        // md / txt：编辑区视口顶源码行（0 基）。live_edit（WYSIWYG）期间用户实际在
+        // live2 滚动阅读，源码编辑区被隐藏、顶行停在进入 live 时的陈旧值 → 改读 live2
+        // 视口顶源码行（帧未就绪 `None` 时回退源码编辑区），与 `tab_effective_text`
+        // 的 live2 口径对齐。
+        let top_line = if tab.live_edit && let Some(l2) = &tab.live2 {
+            l2.read(cx)
+                .top_source_line()
+                .unwrap_or_else(|| tab.payload.editor.read(cx).viewport_top_line())
+        } else {
+            tab.payload.editor.read(cx).viewport_top_line()
+        };
         Some(ReadingProgress::Markdown { top_line })
     }
 
@@ -411,11 +420,11 @@ impl AppModel {
     /// `pub`：shell 宿主 glue（`schedule_reading_progress_flush`）与集成测试经
     /// `shell::app` 重导出访问（§8.6 外提清单）。
     pub fn save_reading_progress(&mut self, host: &dyn AppHost, idx: usize, cx: &App) {
-        if !host.is_session_persist()
-            || host.is_detached()
-            || !self.restore_reading_progress
-            || self.session_restoring
-        {
+        // reading_progress 是**文件级**全局存储（按文件路径做键，多窗口同路径无冲突），
+        // 不随「会话责任窗口」（is_session_persist / is_detached）门控跳过——detached
+        // 窗口 `session_persist=false` + `is_detached=true` 会被同时误杀。仅保留
+        // 「开关关闭」与「恢复期间抑制」两道守卫。
+        if !self.restore_reading_progress || self.session_restoring {
             return;
         }
         let Some(progress) = self.tab_reading_position(idx, cx) else {
