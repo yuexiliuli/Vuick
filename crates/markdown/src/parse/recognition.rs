@@ -175,12 +175,41 @@ pub fn url_end(line: &str, start: usize) -> usize {
     j
 }
 
-fn find1(b: &[u8], from: usize, end: usize, c: u8) -> Option<usize> {
-    (from..end).find(|&i| b[i] == c)
+/// O(1) 摊还的「下一个出现位置」游标：把 closer 的「每次从候选点全段重扫」换成
+/// 「只前移的单调查找」。每个位置至多被同一游标扫一次、整段分摊 O(n)——消除
+/// 未闭合定界符（无数 `[`/`((`/反引号对收盘）触发的 O(n²) DoS（P0-B1，2026-11-17）。
+///
+/// 前提：对**同一个** `pred` 的查询 `from` 必须单调不减（各扫描循环的主游标 `i`
+/// 只增不减，天然满足；个别 footnote→inline 连续两段同型查询虽 from 回退一位，
+/// 游标也只前移、返回「>=from 的最小命中」，与该回退位语义一致，见各调用处注释）。
+pub(crate) struct Seek<F>
+where
+    F: Fn(usize) -> bool,
+{
+    len: usize,
+    pos: usize,
+    pred: F,
 }
 
-fn find2(b: &[u8], from: usize, end: usize, c1: u8, c2: u8) -> Option<usize> {
-    (from..end.saturating_sub(1)).find(|&i| b[i] == c1 && b[i + 1] == c2)
+impl<F> Seek<F>
+where
+    F: Fn(usize) -> bool,
+{
+    pub(crate) fn new(len: usize, pred: F) -> Self {
+        Self { len, pos: 0, pred }
+    }
+
+    /// 第一个 `>= from` 且满足 `pred` 的位置；没有则 `None`。
+    /// 语义与旧 `find1`/`find2` 的「范围内第一个命中」完全一致。
+    pub(crate) fn closer(&mut self, from: usize) -> Option<usize> {
+        if from > self.pos {
+            self.pos = from;
+        }
+        while self.pos < self.len && !(self.pred)(self.pos) {
+            self.pos += 1;
+        }
+        (self.pos < self.len).then_some(self.pos)
+    }
 }
 
 /// Every clickable link in `line`, as `(source byte range, target)`.
@@ -194,11 +223,25 @@ pub fn links(line: &str) -> Vec<(std::ops::Range<usize>, LinkHit)> {
     let end = line.len();
     let mut out = Vec::new();
     let mut i = 0;
+    // P0-B1（2026-11-17）：未闭合定界符（无数 `[`/`((`/反引号对收盘）时旧实现每候选
+    // 都对尾部整段 `find1`/`find2` 重扫、失败仅 `i += 1` → O(n²) DoS。closer 查找
+    // 全部换成 O(1) 摊还的 [`Seek`] 游标（next-occurrence 记忆化），语义与旧 finds 一致。
+    let mut nxt_bt = Seek::new(end, |p: usize| b[p] == b'`');
+    let mut nxt_rb = Seek::new(end, |p: usize| b[p] == b']');
+    let mut nxt_rb2 = Seek::new(
+        end,
+        |p: usize| p + 1 < end && b[p] == b']' && b[p + 1] == b']',
+    );
+    let mut nxt_rp = Seek::new(end, |p: usize| b[p] == b')');
+    let mut nxt_rp2 = Seek::new(
+        end,
+        |p: usize| p + 1 < end && b[p] == b')' && b[p + 1] == b')',
+    );
     while i < end {
         let c = b[i];
         // Inline code: the span is opaque (a URL inside backticks is verbatim).
         if c == b'`'
-            && let Some(close) = find1(b, i + 1, end, b'`')
+            && let Some(close) = nxt_bt.closer(i + 1)
         {
             i = close + 1;
             continue;
@@ -207,7 +250,7 @@ pub fn links(line: &str) -> Vec<(std::ops::Range<usize>, LinkHit)> {
         if c == b'['
             && i + 1 < end
             && b[i + 1] == b'['
-            && let Some(close) = find2(b, i + 2, end, b']', b']')
+            && let Some(close) = nxt_rb2.closer(i + 2)
         {
             let (target, _) = wiki_target_display(&line[i + 2..close]);
             if !target.is_empty() {
@@ -220,7 +263,7 @@ pub fn links(line: &str) -> Vec<(std::ops::Range<usize>, LinkHit)> {
         if c == b'('
             && i + 1 < end
             && b[i + 1] == b'('
-            && let Some(close) = find2(b, i + 2, end, b')', b')')
+            && let Some(close) = nxt_rp2.closer(i + 2)
         {
             let id = &line[i + 2..close];
             if !id.is_empty()
@@ -237,7 +280,7 @@ pub fn links(line: &str) -> Vec<(std::ops::Range<usize>, LinkHit)> {
         if c == b'['
             && i + 1 < end
             && b[i + 1] == b'^'
-            && let Some(rb) = find1(b, i + 2, end, b']')
+            && let Some(rb) = nxt_rb.closer(i + 2)
             && rb > i + 2
         {
             i = rb + 1;
@@ -245,11 +288,14 @@ pub fn links(line: &str) -> Vec<(std::ops::Range<usize>, LinkHit)> {
         }
         // Inline link [text](url) — or an image ![alt](src), which is NOT a
         // link click (images render as widgets / have their own machinery).
+        // 注：footnote 分支（b[i+1]=='^'）先查询过 nxt_rb（from=i+2）；此处 from=i+1
+        // 回退一位，但游标只前移、必然返回「>=i+1 的第一个 `]`」且 b[i+1]=='^'≠`]`，
+        // 与该情形原 find1 结果一致。
         if c == b'['
-            && let Some(rb) = find1(b, i + 1, end, b']')
+            && let Some(rb) = nxt_rb.closer(i + 1)
             && rb + 1 < end
             && b[rb + 1] == b'('
-            && let Some(rp) = find1(b, rb + 2, end, b')')
+            && let Some(rp) = nxt_rp.closer(rb + 2)
         {
             let is_image = i > 0 && b[i - 1] == b'!';
             let url = line[rb + 2..rp].trim();
@@ -347,5 +393,25 @@ mod tests {
         // byte-wise walk (it once str-sliced at a continuation byte).
         let hits = links("shrug ¯\\_(ツ)_/¯ then https://a.io done");
         assert_eq!(hits.len(), 1);
+    }
+
+    /// P0 红测（2026-11-17，修复前必须红）：`"[".repeat(n)`（n 个未闭合 `[`，无任何 `]`）
+    /// 时，每个 `[` 位置都会先对尾部整段跑 `find2` 找 `]]`（wiki 分支）、再跑 `find1`
+    /// 找 `]`（inline 分支），全部失败后才 `i += 1` → 修复前整体 O(n²) 重复全行重扫。
+    /// n 拍到「修复前 debug 约 1–3 秒」（下面按实测调参记录证据）；1s 阈值取「明显小于
+    /// 修复前耗时、明显大于修复后线性扫描预期（<1ms）」，红线只求「病态输入有界返回」。
+    #[test]
+    fn links_unclosed_brackets_bounded_time() {
+        let n = 10_000;
+        let line = "[".repeat(n);
+        let t = std::time::Instant::now();
+        let hits = links(&line);
+        let ms = t.elapsed().as_millis();
+        assert!(hits.is_empty());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "links 对 {} 个未闭合 `[` 耗时 {ms}ms（O(n²) 病态，红测）",
+            n
+        );
     }
 }

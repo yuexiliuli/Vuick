@@ -10,6 +10,7 @@ use gpui::TextRun;
 use super::cells::is_backslash_escaped;
 #[cfg(test)]
 use super::cells::split_unescaped_pipes;
+use super::recognition::Seek;
 
 /// ATX heading depth (1–6) if `line` is a heading: 1–6 leading `#` followed by
 /// a space or end-of-line. `None` otherwise.
@@ -416,37 +417,26 @@ pub fn one_line_math(line: &str) -> Option<&str> {
 /// Images inside inline code aren't matched.
 pub fn inline_image_spans(line: &str) -> Vec<(Range<usize>, Range<usize>)> {
     let b = line.as_bytes();
+    let len = b.len();
     let mut out = Vec::new();
     let mut i = 0;
-    while i + 1 < b.len() {
+    // P0-B1（2026-11-17）：未闭合 `![`（alt 无 `]` / src 无 `)`）时旧实现对每个 opener
+    // 内层整段重扫 → O(n²) DoS。`]`/`)` closer 查找换成 O(1) 摊还的 [`Seek`] 游标
+    // （只认**未被反斜杠转义**的收盘，语义不变）；查询 from 随 `i`/`rb_pos` 单调不减。
+    let mut nxt_rb = Seek::new(len, |k: usize| b[k] == b']' && !is_backslash_escaped(b, k));
+    let mut nxt_rp = Seek::new(len, |k: usize| b[k] == b')' && !is_backslash_escaped(b, k));
+    while i + 1 < len {
         if b[i] == b'!' && b[i + 1] == b'[' {
             // alt 结束：第一个**未被反斜杠转义**的 `]`（`\]` 是字面 `]`，对应保存侧
             // `apply_inline_image_edit` 对 alt 内 `]` 的转义 → 不误切 alt，P1-8）。
-            let mut rb = None;
-            let mut k = i + 2;
-            while k < b.len() {
-                if b[k] == b']' && !is_backslash_escaped(b, k) {
-                    rb = Some(k - i - 2);
-                    break;
-                }
-                k += 1;
-            }
-            if let Some(rb) = rb
-                && b.get(i + 2 + rb + 1) == Some(&b'(')
+            if let Some(rb_pos) = nxt_rb.closer(i + 2)
+                && b.get(rb_pos + 1) == Some(&b'(')
             {
                 // src 结束：第一个**未被转义**的 `)`（`\)` 是字面 `)`，对应保存侧对
                 // src 内 `(`/`)` 的 `\(`/`\)` 转义 → 不把 `a(b)` 截断成 `a(b`，P1-8）。
-                let mut rp = None;
-                let mut k = i + 2 + rb + 2;
-                while k < b.len() {
-                    if b[k] == b')' && !is_backslash_escaped(b, k) {
-                        rp = Some(k - (i + 2 + rb + 2));
-                        break;
-                    }
-                    k += 1;
-                }
-                if let Some(rp) = rp {
-                    let src = (i + 2 + rb + 2)..(i + 2 + rb + 2 + rp);
+                if let Some(rp_pos) = nxt_rp.closer(rb_pos + 2) {
+                    let rp = rp_pos - (rb_pos + 2);
+                    let src = (rb_pos + 2)..(rb_pos + 2 + rp);
                     out.push((i..(src.end + 1), src.clone()));
                     i = src.end + 1;
                     continue;
@@ -471,9 +461,25 @@ pub fn inline_math_latex<'a>(line: &'a str, span: &Range<usize>) -> &'a str {
 
 pub fn inline_math_spans(line: &str) -> Vec<Range<usize>> {
     let bytes = line.as_bytes();
+    let len = bytes.len();
     let mut out = Vec::new();
     let mut i = 0;
-    while i < bytes.len() {
+    // P0-B1（2026-11-17）：未闭合 `$`（后续 `$` 因 pandoc「`$` 前导空格规则」全部
+    // 不能当收盘符、一路扫到尾）时旧实现对每个 opener 内层整段重扫 → O(n²) DoS。
+    // 两处 closer 查找换成 O(1) 摊还的 [`Seek`] 游标，语义不变：
+    //   nxt_d2 = 下一个**未转义**的 `$$` 对（同一行 display math 收盘）；
+    //   nxt_d1 = 下一个**未转义 + 前非空格 + 后非数字**的 `$`（inline 收盘，即下边
+    //            注释的 pandoc 规则——「`$` 前导空格规则」保留在此注释防误伤）。
+    let mut nxt_d2 = Seek::new(len, |p: usize| {
+        p + 1 < len && bytes[p] == b'$' && bytes[p + 1] == b'$' && !is_backslash_escaped(bytes, p)
+    });
+    let mut nxt_d1 = Seek::new(len, |p: usize| {
+        bytes[p] == b'$'
+            && !is_backslash_escaped(bytes, p)
+            && !bytes[p - 1].is_ascii_whitespace()
+            && !bytes.get(p + 1).is_some_and(|c| c.is_ascii_digit())
+    });
+    while i < len {
         if bytes[i] != b'$' || is_backslash_escaped(bytes, i) {
             i += 1;
             continue;
@@ -483,16 +489,7 @@ pub fn inline_math_spans(line: &str) -> Vec<Range<usize>> {
         // `$…$` there are no space rules — pandoc display math allows them —
         // but the pair must close on this line around non-space content.
         if bytes.get(i + 1) == Some(&b'$') {
-            let mut j = i + 2;
-            let mut close = None;
-            while j + 1 < bytes.len() {
-                if bytes[j] == b'$' && bytes[j + 1] == b'$' && !is_backslash_escaped(bytes, j) {
-                    close = Some(j);
-                    break;
-                }
-                j += 1;
-            }
-            match close {
+            match nxt_d2.closer(i + 2) {
                 Some(c) if line[i + 2..c].trim().is_empty() => {}
                 Some(c) => {
                     out.push(i..c + 2);
@@ -519,20 +516,7 @@ pub fn inline_math_spans(line: &str) -> Vec<Range<usize>> {
         // Scan for a valid closing `$`: unescaped, non-space before, not a digit after. A `$`
         // that can't close (space before, e.g. the second `$` in "$5 and $10") is skipped and
         // the scan continues for a later valid one, as pandoc does.
-        let mut j = i + 1;
-        let mut close = None;
-        while j < bytes.len() {
-            if bytes[j] == b'$' && !is_backslash_escaped(bytes, j) {
-                let space_before = bytes[j - 1].is_ascii_whitespace();
-                let digit_after = bytes.get(j + 1).is_some_and(|c| c.is_ascii_digit());
-                if !space_before && !digit_after {
-                    close = Some(j);
-                    break;
-                }
-            }
-            j += 1;
-        }
-        match close {
+        match nxt_d1.closer(i + 1) {
             Some(c) => {
                 out.push(i..c + 1);
                 i = c + 1;
@@ -1102,5 +1086,40 @@ mod tests {
         let src = "* ### Notes: ^abc\n  - one\n\n  - two\n* sibling\n# After";
         let folded: std::collections::HashSet<String> = ["* ### Notes: ^abc".to_string()].into();
         assert_eq!(heading_fold_regions(src, &folded), vec![0..4]);
+    }
+
+    /// P0 红测（2026-11-17，修复前必须红）：`"![".repeat(n)`（每个 `![` 的 alt 都无 `]`
+    /// 收盘）时，每遇一个 `![` opener 就内层 `while k < b.len()` 扫尾部找**未转义**的 `]`，
+    /// 失败仅 `i += 1`，下一组又重扫 → 修复前 O(n²)。
+    /// n 拍到「修复前 debug 约 1–3 秒」（按实测调参记录证据）；阈值同理取 1s。
+    #[test]
+    fn inline_image_spans_unclosed_bounded_time() {
+        let n = 18_000;
+        let line = "![".repeat(n);
+        let t = std::time::Instant::now();
+        let spans = inline_image_spans(&line);
+        let ms = t.elapsed().as_millis();
+        assert!(spans.is_empty());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "inline_image_spans 对 {n} 个未闭合 `![` 耗时 {ms}ms（O(n²) 病态，红测）"
+        );
+    }
+
+    /// P0 红测（2026-11-17，修复前必须红）：`"$a ".repeat(n)` 的每个 `$` 都当 inline
+    /// opener（后跟 `a` 非空格）；后续每个 `$` 前都是空格 → pandoc 规则拒绝它们当关闭符，
+    /// 收盘扫描（`while j < bytes.len()`）一路扫到尾失败才 `i += 1` → 修复前 O(n²)。
+    #[test]
+    fn inline_math_spans_unclosed_bounded_time() {
+        let n = 10_000;
+        let line = "$a ".repeat(n);
+        let t = std::time::Instant::now();
+        let spans = inline_math_spans(&line);
+        let ms = t.elapsed().as_millis();
+        assert!(spans.is_empty());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "inline_math_spans 对 {n} 组未闭合 `$a ` 耗时 {ms}ms（O(n²) 病态，红测）"
+        );
     }
 }
