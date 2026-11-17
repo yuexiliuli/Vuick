@@ -7,7 +7,10 @@
 //! - `Shell_NotifyIconW` 创建/移除托盘图标（幂等）：左键（单击/双击）恢复主窗口置前、
 //!   右键 `TrackPopupMenu` 弹「恢复主窗口 / 退出」菜单；
 //! - `should_close_to_tray()` 供主窗口 `on_window_should_close` 回调判定：开关开、主窗口
-//!   已知、且无「强制真退出」标记 → 隐藏到托盘（返回 false 拦下关闭）；否则放行。
+//!   已知、**托盘图标确实已挂载**、且无「强制真退出」标记 → 隐藏到托盘（返回 false 拦下
+//!   关闭）；否则放行（图标未挂载时放行真关窗，避免「窗口消失 + 托盘无入口」，P1-C8）。
+//! - 隐藏窗口 wndproc 监听 `TaskbarCreated`（Explorer 重启广播）→ 重挂托盘图标，防
+//!   Explorer 崩溃/重启后图标永失。
 //!
 //! 非 `windows` 目标一律编译为 no-op（不破坏跨平台构建）。
 //!
@@ -32,6 +35,10 @@ static CLOSE_TO_TRAY: AtomicBool = AtomicBool::new(false);
 /// 「强制真退出」一次性标记：托盘菜单「退出」置位后经 `WM_CLOSE` 关闭主窗口；
 /// [`should_close_to_tray`] 读到该位返回 false 并**消费**它（下一次按开关状态判定）。
 static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+/// 托盘图标是否**确实已挂载**（`add_tray_icon` 的 `NIM_ADD` 成功才置位；`remove_tray_icon`/
+/// `shutdown`/Explorer 重启重挂失败时清位）。`should_close_to_tray` 要求置位才允许隐藏——
+/// 防止「窗口消失 + 托盘无入口」（P1-C8）。
+static TRAY_ICON_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// 记录主窗口 HWND（`isize` 承载的 HWND；0 = 未知）。线程安全。
 pub fn set_main_hwnd(hwnd: isize) {
@@ -45,6 +52,14 @@ pub fn set_close_to_tray(enabled: bool) {
     CLOSE_TO_TRAY.store(enabled, Ordering::SeqCst);
 }
 
+/// 测试辅助（跨 crate 集成测试模拟「托盘图标已挂载」态，见 `shell/tests/tray_menu.rs`）。
+/// 生产路径的挂载位由实现侧 `add_tray_icon` 成功后置位、`remove_tray_icon`/`shutdown`/
+/// Explorer 重启重挂时清位，应用代码不应手动调用。
+#[doc(hidden)]
+pub fn set_tray_icon_registered(registered: bool) {
+    TRAY_ICON_REGISTERED.store(registered, Ordering::SeqCst);
+}
+
 /// 确保应用托盘图标常驻（启动时调用，幂等）：图标**始终显示**（不随「关闭到系统
 /// 托盘」开关消失，开关只决定点 × 是否隐藏窗口）。测试构建不真建托盘图标/窗口。
 pub fn ensure_tray_icon() {
@@ -55,13 +70,17 @@ pub fn ensure_tray_icon() {
 }
 
 /// 判定「点 × / Alt+F4 是否应隐藏到托盘」（纯 flag 逻辑，可单测 R2）：
-/// 开关开 **且** 主窗口已知 **且** 无强制退出标记 → true；否则 false。
+/// 开关开 **且** 主窗口已知 **且** 托盘图标已挂载 **且** 无强制退出标记 → true；否则 false。
+/// 图标未挂载时**拒绝**隐藏（放行真关窗），避免「窗口消失 + 托盘无入口」（P1-C8）。
 /// 读取时**消费** `FORCE_QUIT` 一次性标记（托盘「退出」后放行一次真正关闭）。
 pub fn should_close_to_tray() -> bool {
     if !CLOSE_TO_TRAY.load(Ordering::SeqCst) {
         return false;
     }
     if MAIN_HWND.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    if !TRAY_ICON_REGISTERED.load(Ordering::SeqCst) {
         return false;
     }
     !FORCE_QUIT.swap(false, Ordering::SeqCst)
@@ -346,9 +365,30 @@ mod imp {
     static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
     /// 托盘右键菜单 HMENU（非 `Send`/`Sync` → 以 `isize` 承载，0 = 未建）。
     static TRAY_MENU: AtomicIsize = AtomicIsize::new(0);
+    /// `RegisterWindowMessageW("TaskbarCreated")` 的系统广播消息号（0 = 未注册/注册失败）。
+    /// Explorer 崩溃/重启后向全部顶层窗口广播该消息；隐藏窗口收到后重挂托盘图标。
+    static TASKBAR_CREATED_MSG: AtomicIsize = AtomicIsize::new(0);
 
     fn hidden_hwnd() -> HWND {
         HWND(HIDDEN_HWND.load(Ordering::SeqCst) as *mut core::ffi::c_void)
+    }
+
+    /// 注册（幂等）并返回 `TaskbarCreated` 消息号（Explorer 重启广播；失败返回 0 不 panic）。
+    /// UI 线程调用（经 [`ensure_hidden_window`]）；进程内重复注册返回同一 id，可缓存。
+    fn taskbar_created_msg() -> u32 {
+        use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
+        let cached = TASKBAR_CREATED_MSG.load(Ordering::SeqCst);
+        if cached != 0 {
+            return cached as u32;
+        }
+        // SAFETY：`RegisterWindowMessageW` 把「TaskbarCreated」注册进系统级 0xC000-0xFFFF
+        // 消息区间，Explorer 重启时向顶层窗口广播；进程内幂等（重复注册返回同一 id）。
+        let id = unsafe { RegisterWindowMessageW(PCWSTR::from_raw(w!("TaskbarCreated").as_ptr())) };
+        if id == 0 {
+            return 0;
+        }
+        TASKBAR_CREATED_MSG.store(id as isize, Ordering::SeqCst);
+        id
     }
 
     /// 确保隐藏消息窗口已注册并创建（幂等）；UI 线程调用（`set_close_to_tray` 触发，
@@ -396,6 +436,8 @@ mod imp {
         };
         HIDDEN_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
         ensure_menu();
+        // 注册 Explorer 重启广播（TaskbarCreated）：隐藏窗口 wndproc 收到后重挂托盘图标。
+        let _ = taskbar_created_msg();
         Ok(hwnd)
     }
 
@@ -574,8 +616,12 @@ mod imp {
     }
 
     /// 创建托盘图标（`NIM_ADD`，幂等：已建隐藏窗口则重复创建会失败，静默返回 false）。
+    /// 成功时置位 [`super::TRAY_ICON_REGISTERED`]（允许隐藏到托盘）；`NIM_ADD` 失败**不清位**
+    /// ——失败可能是「图标已存在」（幂等重入/恢复流程）或 Explorer 未就绪，此时保留既有
+    /// 挂载判定，清位只发生在 `remove_tray_icon`/`shutdown`/Explorer 重启重挂路径。
     pub(super) fn add_tray_icon() -> bool {
         let Ok(hwnd) = ensure_hidden_window() else {
+            super::TRAY_ICON_REGISTERED.store(false, Ordering::SeqCst);
             return false;
         };
         // 优先用程序图标（内嵌 ICO 变色龙）；创建失败回退系统默认图标（保底，不 panic）。
@@ -583,6 +629,7 @@ mod imp {
             Ok(raw) => HICON(raw as *mut core::ffi::c_void),
             Err(()) => {
                 let Ok(ic) = (unsafe { LoadIconW(None, IDI_APPLICATION) }) else {
+                    super::TRAY_ICON_REGISTERED.store(false, Ordering::SeqCst);
                     return false;
                 };
                 ic
@@ -596,11 +643,16 @@ mod imp {
         data.uCallbackMessage = TRAY_MSG;
         data.hIcon = hicon;
         fill_tip(&mut data.szTip);
-        unsafe { Shell_NotifyIconW(NIM_ADD, &data).as_bool() }
+        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data).as_bool() };
+        if added {
+            super::TRAY_ICON_REGISTERED.store(true, Ordering::SeqCst);
+        }
+        added
     }
 
-    /// 移除托盘图标（`NIM_DELETE`，幂等：从未创建也返回 true）。
+    /// 移除托盘图标（`NIM_DELETE`，幂等：从未创建也返回 true）。同时清挂载位。
     pub(super) fn remove_tray_icon() -> bool {
+        super::TRAY_ICON_REGISTERED.store(false, Ordering::SeqCst);
         if HIDDEN_HWND.load(Ordering::SeqCst) == 0 {
             return true;
         }
@@ -609,6 +661,14 @@ mod imp {
         data.hWnd = hidden_hwnd();
         data.uID = TRAY_ICON_ID;
         unsafe { Shell_NotifyIconW(NIM_DELETE, &data).as_bool() }
+    }
+
+    /// Explorer 重启（隐藏窗口收到 `TaskbarCreated`）→ 旧图标随旧任务栏销毁：先清挂载位
+    /// （当前任务栏上确实没有该图标），再 `NIM_ADD` 重挂；重挂失败（Explorer 尚未就绪）→
+    /// 保持「未挂载」语义（拒绝隐藏到托盘，点 × 真关窗）。
+    pub(super) fn rerack_tray_icon_after_taskbar_restart() {
+        super::TRAY_ICON_REGISTERED.store(false, Ordering::SeqCst);
+        add_tray_icon();
     }
 
     /// 隐藏主窗口（`MAIN_HWND` 为 0 时 no-op）。测试构建不真投递窗口消息。
@@ -642,7 +702,8 @@ mod imp {
 
     /// 优雅清理：移除图标 + 销毁隐藏窗口 + 销毁菜单 + 释放程序图标（幂等）。
     pub(super) fn shutdown() {
-        let _ = remove_tray_icon();
+        let _ = remove_tray_icon(); // 同时清 TRAY_ICON_REGISTERED
+        super::MAIN_HWND.store(0, Ordering::SeqCst);
         let h = HIDDEN_HWND.swap(0, Ordering::SeqCst);
         if h != 0 {
             let _ = unsafe { DestroyWindow(HWND(h as *mut core::ffi::c_void)) };
@@ -954,7 +1015,17 @@ mod imp {
                 }
                 LRESULT(0)
             }
-            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            // Explorer 崩溃/重启广播（TaskbarCreated）：旧托盘图标随旧任务栏销毁 → 重挂
+            // （未注册该消息时 `TASKBAR_CREATED_MSG == 0`，不会误匹配任何系统消息）。
+            _ => {
+                let taskbar_created = TASKBAR_CREATED_MSG.load(Ordering::SeqCst);
+                if taskbar_created != 0 && msg == taskbar_created as u32 {
+                    rerack_tray_icon_after_taskbar_restart();
+                    LRESULT(0)
+                } else {
+                    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                }
+            }
         }
     }
 
@@ -1013,6 +1084,7 @@ mod tests {
         set_main_hwnd(0);
         CLOSE_TO_TRAY.store(false, Ordering::SeqCst);
         FORCE_QUIT.store(false, Ordering::SeqCst);
+        set_tray_icon_registered(false);
     }
 
     #[test]
@@ -1033,9 +1105,10 @@ mod tests {
         reset();
         set_main_hwnd(12345);
         set_close_to_tray(true);
+        set_tray_icon_registered(true); // 测试环境不真挂图标，模拟「已挂载」态（P1-C8）
         assert!(
             should_close_to_tray(),
-            "开关开且主窗口已知 → 点 × 应隐藏到托盘"
+            "开关开且主窗口已知且图标已挂载 → 点 × 应隐藏到托盘"
         );
     }
 
@@ -1057,6 +1130,7 @@ mod tests {
         reset();
         set_main_hwnd(12345);
         set_close_to_tray(true);
+        set_tray_icon_registered(true); // 模拟「已挂载」态：FORCE_QUIT 消费后才回到 true
         // 托盘「退出」→ 强制真退出标记置位。
         request_quit();
         assert!(
@@ -1067,6 +1141,36 @@ mod tests {
         assert!(
             should_close_to_tray(),
             "FORCE_QUIT 消费后回到按 CLOSE_TO_TRAY 判定"
+        );
+    }
+
+    /// P1 红测：托盘图标**未挂载**时必须拒绝「关闭到托盘」（否则退化为真关窗）。
+    ///
+    /// 现状缺陷可观测面：`should_close_to_tray()`（lib.rs:60-68）只查
+    /// `CLOSE_TO_TRAY && MAIN_HWND != 0 && !FORCE_QUIT` 三个 flag，**完全不核实
+    /// 托盘图标是否真的挂载成功**——`add_tray_icon` 的 `NIM_ADD` 返回 false 被静默吞
+    /// （lib.rs:577-600），也没有 `TaskbarCreated` 重挂监听。于是「开关开 + 主窗口已
+    /// 知」时**即使没有任何托盘图标**，点 × 也会把窗口从任务栏藏掉（托盘无入口，
+    /// 只能杀进程）。
+    ///
+    /// 修复后语义：「关闭到托盘」只应在图标**确实挂载成功**时才被允许；未挂载时点 ×
+    /// 应放行真关窗。本测试断言「图标未挂载 → 隐藏决策必须为 false」；修复前恒
+    /// true（只看 MAIN_HWND）→ 红。
+    ///
+    /// 说明：当前代码尚无可测的「图标是否挂载」入口（决定函数输入面只有上述三 flag）
+    /// → 本红测以修复后形态为真值；实现侧需随修复加可测钩子（如 `TRAY_ICON_REGISTERED`
+    /// 标志 + `#[cfg(test)]` 置位辅助），否则「图标已挂载→允许隐藏」的正向断言无法表达。
+    /// 测试环境从不真实挂载图标（K21：测试构建不真建图标/窗口）→ 此处天然处于
+    /// 「未挂载」状态。
+    #[test]
+    fn unmounted_tray_icon_must_refuse_hide_to_tray() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        set_main_hwnd(12345);
+        set_close_to_tray(true);
+        assert!(
+            !should_close_to_tray(),
+            "托盘图标未挂载时不得隐藏到托盘（应允许真关窗，避免「窗口消失 + 托盘无入口」）"
         );
     }
 

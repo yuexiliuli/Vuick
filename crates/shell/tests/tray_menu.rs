@@ -24,15 +24,17 @@ use common::*;
                 app.model.borrow_mut().close_to_tray = false;
                 app.toggle_close_to_tray(window, cx);
                 assert!(app.model.borrow_mut().close_to_tray, "点击一次 → 开");
-                // tray crate 状态联动：开关已翻、主窗口已知 → 应判定「点 × 隐藏到托盘」。
+                // tray crate 状态联动：开关已翻、主窗口已知、图标已挂载 → 应判定「点 × 隐藏到托盘」。
                 tray::set_main_hwnd(12345);
-                assert!(tray::should_close_to_tray(), "开关开且主窗口已知 → 进托盘");
+                tray::set_tray_icon_registered(true); // 测试环境不真挂图标，模拟「已挂载」态（P1-C8）
+                assert!(tray::should_close_to_tray(), "开关开且主窗口已知且图标已挂载 → 进托盘");
                 app.toggle_close_to_tray(window, cx);
                 assert!(!app.model.borrow_mut().close_to_tray, "再点 → 关");
                 assert!(!tray::should_close_to_tray(), "开关关 → 点 × 真退出");
                 // 收尾清掉测试进程内的托盘全局状态，避免污染其它 shell 测试。
                 tray::set_main_hwnd(0);
                 tray::set_close_to_tray(false);
+                tray::set_tray_icon_registered(false);
             });
         });
     }
