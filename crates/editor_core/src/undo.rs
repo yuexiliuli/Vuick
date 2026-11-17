@@ -6,7 +6,8 @@
 //!   首尾相接合并；Delete 同点延伸合并；Atomic/换行永远独立）；**I1 时间窗**：与上一编辑
 //!   停顿 ≥[`UNDO_GROUP_MS`]（300ms）即新起撤销单元（对齐 zed `History.group_interval`，
 //!   std 单调钟纯时间判定、无定时器副作用）。光标移动即 `set_cooperative(false)` 断层。
-//! - 上限 [`MAX_UNDO_TXS`] 个事务，超出丢最早。
+//! - 上限 [`MAX_UNDO_TXS`] 个事务 + [`UNDO_BYTE_CAP`] 字节（`Edit` 的 old+new 全量
+//!   拷贝累计），双双超出丢最早；单条超限大事务至少保留一条（防空栈失守）。
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -14,6 +15,10 @@ use std::time::{Duration, Instant};
 use crate::editor::buffer::Edit;
 
 pub const MAX_UNDO_TXS: usize = 1000;
+
+/// 撤销栈字节上限：栈内每条 `Edit` 的 `old_text.len() + new_text.len()` 全量拷贝累计
+/// 超此上限（等价 64KiB）即从最旧逐出（与事务数上限并列的硬编码期望）。
+pub const UNDO_BYTE_CAP: usize = 64 * 1024;
 
 /// 撤销合并时间窗：两次编辑间隔 < 300ms 才并入同一事务；停顿 ≥ 该值即新起撤销单元
 /// （zed/VS Code 式分组直觉：持续打字合并、停顿后打断）。
@@ -262,6 +267,25 @@ impl UndoManager {
             // 丢最早：VecDeque 删头 O(1)（原 Vec::remove(0) 是 O(cap) 整段搬移）。
             self.undo_stack.pop_front();
         }
+        // 字节上限（累计每条 Edit 的 old+new 全量拷贝）：与事务数 cap 同口径，
+        // 超限从最旧逐出；单条超限大事务至少保留一条（防空栈失守）。
+        let mut total: usize = self
+            .undo_stack
+            .iter()
+            .flat_map(|t| t.edits.iter())
+            .map(|e| e.old_text.len() + e.new_text.len())
+            .sum();
+        while total > UNDO_BYTE_CAP && self.undo_stack.len() > 1 {
+            if let Some(evicted) = self.undo_stack.pop_front() {
+                total = total.saturating_sub(
+                    evicted
+                        .edits
+                        .iter()
+                        .map(|e| e.old_text.len() + e.new_text.len())
+                        .sum(),
+                );
+            }
+        }
         self.redo_stack.clear();
     }
 
@@ -350,6 +374,42 @@ mod tests {
         assert!(
             mgr.redo().is_none(),
             "撤销后新编辑应作废重做分支，实测 redo 仍弹回旧事务 A"
+        );
+    }
+
+    /// M 红测：undo 栈只限事务数（[`MAX_UNDO_TXS`]）不限字节——每条 `Edit` 持有 old+new
+    /// 全量拷贝，连续大块插入（反复粘贴大段文本）驻留近 N× 文档大小，内存无界。
+    ///
+    /// 期望语义：undo 栈累计字节受字节上限约束（与事务数 cap 同口径），超限从最旧逐出。
+    /// 当前无字节上限 → 20 事务累计远超下限 → 红。
+    #[test]
+    fn undo_stack_caps_total_bytes() {
+        // 字节上限口径：与既有事务数 cap 并列的硬编码期望（实现将落同名常量）。
+        const UNDO_BYTE_CAP: usize = 64 * 1024;
+        // 每事务插入 20KB（纯插入，old_text 为空）；20 个原子事务各成独立撤销单元。
+        let chunk: String = "x".repeat(20 * 1024);
+        let mut buf = Buffer::new("");
+        let mut mgr = UndoManager::new();
+        for _ in 0..20usize {
+            let start = buf.len();
+            mgr.start_tx(EditIntent::Atomic, (start, start));
+            mgr.push_edit(buf.apply_edit(start..start, &chunk));
+            mgr.commit((start + chunk.len(), start + chunk.len()));
+        }
+        assert_eq!(buf.len(), 20 * chunk.len());
+
+        // undo 栈累计字节（每条 Edit 的 old+new 全量拷贝之和）。
+        let total: usize = mgr
+            .undo_stack
+            .iter()
+            .flat_map(|tx| tx.edits.iter())
+            .map(|e| e.old_text.len() + e.new_text.len())
+            .sum();
+        assert!(
+            total <= UNDO_BYTE_CAP,
+            "undo 栈累计 {} 字节超出字节上限 {}，内存无界（应超限从最旧逐出）",
+            total,
+            UNDO_BYTE_CAP
         );
     }
 }

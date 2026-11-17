@@ -516,8 +516,15 @@ impl Doc {
     pub fn edit(&mut self, range: Range<usize>, text: &str) {
         let _t_doc = crate::prof::begin();
         let old_len = self.len();
-        let start = range.start.min(old_len);
-        let end = range.end.min(old_len);
+        // M7（2026-11-17）：range 可能落在多字节字符中间（IME/跨层删除后位移不齐），
+        // ropey `slice`/`remove`/`insert` 对非字符边界直接 panic。钳位后先把 start/end
+        // floor 到各自字符起始边界（同 [`Self::byte_to_utf16`] 的 `floor_char_boundary`
+        // 防卫姿势），并保证 `end >= start`——整区间落单字符内收敛为「在该字符前插入」，
+        // 不 panic、不切坏 UTF-8。
+        let mut start = range.start.min(old_len);
+        let mut end = range.end.min(old_len);
+        start = self.rope.floor_char_boundary(start);
+        end = self.rope.floor_char_boundary(end.max(start));
         let inserted_len = text.len();
         // 原子符数（标量口径）增量：被删段 / 插入串都是小编辑，O(范围长)。
         let removed_chars = if end > start {
@@ -584,7 +591,7 @@ impl Doc {
                 &self.line_utf16_starts,
                 &new_rope,
                 old_len,
-                range.clone(),
+                start..end,
                 delta_bytes,
                 delta_u16,
             );
@@ -918,12 +925,21 @@ impl Doc {
     }
 
     /// 字节区间切片（O(区间长)；边界钳到 [0, len]，rope 单切一次）。
+    /// M7 同族（2026-11-17）：与 [`Self::edit`] 同款字符边界护栏——入参可能落
+    /// 多字节字符中间（IME/跨层删除位移不齐），ropey `slice` 对非字符边界直接
+    /// panic；WYSIWYG `replace_range` 用**同一 range** 先 `slice_str` 取
+    /// `removed` 再 `edit`（edit.rs:414→443），不护栏则 panic 在此处先发。
+    /// 先 floor 到各自字符起始（同 `byte_to_utf16`/`edit` 防卫姿势），并保证
+    /// `end >= start`（倒置区间收敛为字符前空切），不 panic、不切坏 UTF-8。
     pub fn slice_str(&self, range: Range<usize>) -> String {
-        let r = range.start.min(self.len())..range.end.min(self.len());
-        if r.end <= r.start {
+        let mut s = range.start.min(self.len());
+        let mut e = range.end.min(self.len());
+        s = self.rope.floor_char_boundary(s);
+        e = self.rope.floor_char_boundary(e.max(s));
+        if e <= s {
             return String::new();
         }
-        self.rope.slice(r).to_string()
+        self.rope.slice(s..e).to_string()
     }
 }
 
@@ -1051,8 +1067,18 @@ pub(crate) fn assemble_docrow<V: DocLineView>(
             // 独立图片行 `![alt](src)`：alt 文本与源字节 1:1 连续（`!`/`[`
             // 各占 1 字节，alt 自字节 2 起；末项哨兵 = 闭合 `]` 前 = 2+alt.len()）。
             // 引号内图片行：另加 `quoted` 前缀偏移（评审 NIT-D，2026-11-13）。
+            // H2（2026-11-17）：顶层行无 `offs` 记录，行首前导空白会漏进字节区间 →
+            // byte_map 从 `prefix+lead+2` 起步（`lead` = 源行前导空白字节数），与 WYSIWYG
+            // 编辑侧 `edit.rs:image_alt_segment` 的 `lead+2` 口径对齐；否则光标/命中经
+            // byte_map 错位、输入/删除落进 `![` 标记。引号行首字符 `>` 非空白，
+            // `trim_start` 不剥它 → `lead=0`，其内容起点偏移已含在 `prefix`（quoted
+            // 前缀）内，不重复计入。
             let prefix = r.quoted.as_ref().and_then(|q| q.first()).copied().unwrap_or(0);
-            (0..=r.text.len()).map(|i| prefix + 2 + i).collect()
+            let lead = {
+                let line = view.line_str(r.src_line);
+                line.len() - line.trim_start().len()
+            };
+            (0..=r.text.len()).map(|i| prefix + lead + 2 + i).collect()
         }
         _ => Vec::new(),
     };
@@ -1494,5 +1520,98 @@ mod tests {
                 "越界 utf16 应钳到文末"
             );
         }
+    }
+
+    /// 复现红测（docs/code-review-2026-11-17/09-markdown.md H2）：独立图片行
+    /// `RowKind::Image` 的 `byte_map` 把「行首前导空白」计入图片字节区间——
+    /// doc.rs:1055 `(0..=r.text.len()).map(|i| prefix + 2 + i)` 用 `prefix+2` 起步，
+    /// 只加了 quoted 前缀偏移、**漏了前导空白** `lead`。对照 WYSIWYG 编辑侧
+    /// `edit.rs:image_alt_segment`（`lead = raw.len() - raw.trim_start().len()`；
+    /// `lo = lead + 2`）：期望图片 byte_map 的 alt 字节区间**不含前导空白**
+    /// （`[lead+2, lead+2+alt.len()]`，与 `image_alt_segment` 的 lead 语义对齐），
+    /// 否则光标/命中经 byte_map 错位、输入/删除落进 `![` 标记。当前红。
+    #[test]
+    fn image_byte_map_excludes_leading_whitespace() {
+        // 带两个前导空格的独立图片行：` ` ` ` `!` `[` `图`(3 字节) `]` ...
+        let src = "  ![图](u.png)";
+        let doc = Doc::open(SharedString::from(src));
+        let rows = doc.rows_in_line_window(0, 1);
+        let img = rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("缩进图片行应被解析为 Image 行");
+        // 两路径对拍：按 `image_alt_segment` 的 lead 语义重算期望 byte_map——
+        // alt 首字节 = 前导空白 + `![`（2 字节）= lead+2。
+        let raw = doc.line_str(0);
+        let lead = raw.len() - raw.trim_start().len();
+        assert_eq!(lead, 2, "夹具前导空白应为 2（缩进两空格）");
+        let r =
+            crate::markdown::parse::parse_ref(raw.trim_start()).expect("应为 `![alt](src)` 图片行");
+        let want: Vec<usize> = (0..=r.alt.len()).map(|i| lead + 2 + i).collect();
+        // 当前 doc.rs 给出 [2,3,4,5]（漏 lead=2），期望 [4,5,6,7]。
+        assert_eq!(img.byte_map, want, "图片 byte_map 应排除前导空白（与 image_alt_segment 的 lead 语义对齐）");
+    }
+
+    /// 复现红测（docs/code-review-2026-11-17/09-markdown.md M7）：`Doc::edit`
+    /// 无字符边界护栏（doc.rs:516-519），只做 `min(old_len)` 钳位；range 落在
+    /// 多字节字符中间（非 char 边界）时 ropey `slice`/`remove`/`insert` 直接
+    /// panic（rope.rs 文档：非边界即 panic）。期望语义：**拒绝或对齐到最近字符
+    /// 边界**——不 panic、不切坏 UTF-8。当前红（会 panic）。
+    #[test]
+    fn doc_edit_off_char_boundary_never_panics() {
+        let src = "a中文 emoji 🎉 tail";
+        // 「文」是 3 字节 UTF-8；其中间字节（起始 +1）即非字符边界编辑点。
+        let mid = src.find("文").unwrap() + 1;
+        assert!(!src.is_char_boundary(mid), "夹具应把编辑点落在字符内部（非 char 边界）");
+        // ① 非边界**插入**：当前 ropey `insert` panic（在 new_rope.insert 处）。
+        let mut doc = Doc::open(SharedString::from(src));
+        let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.edit(mid..mid, "x");
+        }));
+        assert!(
+            r1.is_ok(),
+            "非字符边界插入不得 panic（应拒绝或对齐到最近 char 边界），mid={mid}"
+        );
+        // ② 非边界**删除** `[mid, mid+1)`：当前 ropey `slice`/`remove` panic。
+        let mut doc2 = Doc::open(SharedString::from(src));
+        let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc2.edit(mid..mid + 1, "");
+        }));
+        assert!(
+            r2.is_ok(),
+            "非字符边界删除不得 panic（应拒绝或对齐到最近 char 边界），mid={mid}"
+        );
+        // ③ 任何成功路径都必须保持「全文长度与 rope 一致」（防「切坏 UTF-8」类实现）。
+        assert_eq!(doc.text_shared().len(), doc.len(), "插入后全文字节长与 rope 应一致");
+        assert_eq!(doc2.text_shared().len(), doc2.len(), "删除后全文字节长与 rope 应一致");
+    }
+
+    /// M7 同族护栏（2026-11-17，评审补）：`Doc::slice_str` 与 `edit` 同路径——
+    /// WYSIWYG `replace_range` 用**同一 range** 先 `slice_str` 取 `removed` 再
+    /// `edit`（edit.rs:414→443），只护栏 `edit` 则 panic 先发在 `slice_str`。
+    /// 与 `doc_edit_off_char_boundary_never_panics` 同纹：非边界入参不 panic、
+    /// 不切坏 UTF-8（收敛为「字符前空切」或「整字符内扩展」）。
+    #[test]
+    fn slice_str_off_char_boundary_never_panics() {
+        let src = "a中文 emoji 🎉 tail";
+        // 「文」= 4..7（3 字节）；其中间字节 5/6 即非字符边界切片点。
+        let mid = src.find("文").unwrap() + 1; // = 5
+        assert!(!src.is_char_boundary(mid), "夹具应把切片点落在字符内部");
+        let doc = Doc::open(SharedString::from(src));
+        // ① 非边界切片 `[mid, mid+1)`：不 panic；floor 后 s=e=「文」起始(4) → 空切。
+        let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.slice_str(mid..mid + 1)
+        }));
+        let got = r1.expect("非字符边界切片不得 panic，mid={mid}");
+        assert_eq!(got, "", "整区间落单字符内应收敛为字符前空切");
+        // ② 非边界起点 + 字符尾边界终点 `[mid, 7)`：floor 后含整 `文`——不 panic、不切坏。
+        let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.slice_str(mid..mid + 2)
+        }));
+        let got2 = r2.expect("跨字符非边界切片不得 panic，mid={mid}");
+        assert_eq!(got2, "文", "floor 起点后应返回完整字符（不切坏 UTF-8）");
+        // ③ 对合法边界入参，floor 为 no-op（既有语义不变）：与旧实现逐位一致。
+        assert_eq!(doc.slice_str(4..7), "文");
+        assert_eq!(doc.slice_str(7..9), " e");
     }
 }

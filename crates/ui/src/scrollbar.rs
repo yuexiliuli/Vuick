@@ -607,7 +607,9 @@ pub struct PrepaintState<H> {
     hidden: bool,
     /// 本帧悬停/拖拽插值（0..1）。
     present: f32,
-    track_hitbox: Hitbox,
+    /// 视口命中区（手型光标载体）；仅「有几何且未隐藏」才安装（隐藏/无几何时连命中区
+    /// 都不装，避免整块视口挂手型光标或遮挡下层内容）。
+    track_hitbox: Option<Hitbox>,
     handle: H,
     axis: ScrollbarAxis,
     mode: ScrollbarMode,
@@ -903,10 +905,6 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let viewport = self.resolved_viewport(bounds);
-        let track_hitbox = window.with_content_mask(
-            Some(ContentMask { bounds: viewport }),
-            |window| window.insert_hitbox(viewport, HitboxBehavior::Normal),
-        );
 
         // 元素级状态：按本滚动条 id 隔离，跨帧保持拖拽/悬停。
         let state = window.use_keyed_state(self.id.clone(), cx, |_, _| UiState::default());
@@ -989,6 +987,18 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
         }
 
         let geom = self.geom(viewport, present);
+        // 命中区/手型光标仅在「有几何且未隐藏」（`show`）时安装：隐藏或无几何时连视口
+        // 命中区都不装——不遮挡下层内容、也不给整块视口挂手型光标。光标经
+        // `window.set_cursor_style` 内部路径，headless 不可观测，真机才可验证（K49/K52）。
+        let show = geom.is_some() && !hidden;
+        let track_hitbox = if show {
+            Some(window.with_content_mask(
+                Some(ContentMask { bounds: viewport }),
+                |window| window.insert_hitbox(viewport, HitboxBehavior::Normal),
+            ))
+        } else {
+            None
+        };
         if flushed {
             cx.notify(view_id);
         }
@@ -1076,7 +1086,9 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
             let radius = geom.thumb_fill.size.width.min(geom.thumb_fill.size.height) / 2.;
             window.paint_quad(fill(geom.thumb_fill, bg).corner_radii(radius.max(px(0.))));
         }
-        window.set_cursor_style(CursorStyle::PointingHand, &prepaint.track_hitbox);
+        if let Some(hitbox) = &prepaint.track_hitbox {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
     }
 }
 

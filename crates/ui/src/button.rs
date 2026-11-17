@@ -155,7 +155,8 @@ impl Button {
         self.id.clone()
     }
 
-    /// 注册点击回调（指针 + 聚焦后的 Enter/Space）。
+    /// 注册点击回调（指针 + 聚焦后的 Enter/Space；键盘激活由 gpui `Stateful<Div>` 内建
+    /// `ClickEvent::Keyboard` 提供，见 `keyboard_activation_on_focused_button_fires_click` 护栏测试）。
     pub fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -399,5 +400,47 @@ mod tests {
         cx.simulate_click(point(px(50.), px(20.)), Modifiers::default());
         assert_eq!(clicks.get(), 0, "禁用按钮不应触发 on_click");
         assert_eq!(parent_clicks.get(), 0, "禁用按钮应阻断事件外传父级");
+    }
+
+    /// 红测：`on_click` 文档（button.rs:158）承诺「聚焦后的 Enter/Space」也触发 click。
+    /// 实现没有手写键盘激活逻辑——但 gpui `Stateful<Div>` 在聚焦态已内建 Enter/Space → click
+    /// （div.rs paint `is_focused` 分支注册，KeyUp 时合成 `ClickEvent::Keyboard`）：
+    /// - 本测试绿 → 缺陷证伪（gpui 已内建键盘激活，文档承诺成立，无需实现侧改动）；
+    /// - 本测试红 → 缺陷属实（聚焦按钮上 Enter 不触发 on_click）。
+    /// 注：`simulate_keystrokes("enter")` 只派 KeyDown（dispatch_keystroke 不派 KeyUp），
+    /// 而键盘点击在 KeyUp 合成——必须显式派发 KeyDown + KeyUp（同 gpui div.rs 自身测试姿势）。
+    #[gpui::test]
+    fn keyboard_activation_on_focused_button_fires_click(cx: &mut TestAppContext) {
+        use gpui::{Keystroke, KeyDownEvent, KeyUpEvent, PlatformInput};
+
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (cx, clicks, _) = harness(cx, false);
+
+        // 指针点击按钮：既触发一次 on_click，也经 track_focus 的 mousedown 监听把焦点移到按钮。
+        cx.simulate_click(point(px(50.), px(20.)), Modifiers::default());
+        assert_eq!(clicks.get(), 1, "前置：指针点击应触发一次 on_click");
+
+        // 重绘一帧：gpui 只在元素聚焦态（paint `is_focused`）才注册 Enter/Space 键盘点击监听。
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // 确认焦点确在按钮（父级无其它可聚焦元素，聚焦者必为按钮）。
+        let focused = cx.update(|window, cx| window.focused(cx).is_some());
+        assert!(focused, "前置：点击后按钮应持有焦点");
+
+        // 聚焦按钮上按下再松开 Enter → 应触发第二次 click（文档承诺的键盘激活）。
+        cx.update(|window, cx| {
+            let stroke = Keystroke::parse("enter").unwrap();
+            window.dispatch_event(
+                PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: stroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(PlatformInput::KeyUp(KeyUpEvent { keystroke: stroke }), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(clicks.get(), 2, "聚焦按钮上 Enter 应触发 on_click（键盘激活）");
     }
 }

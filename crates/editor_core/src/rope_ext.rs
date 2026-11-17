@@ -142,7 +142,12 @@ impl RopeExt for Rope {
         }
 
         let line_start = self.line_to_byte_idx(point.row, LineType::LF);
-        line_start + point.column
+        // 行尾偏移 = 行首 + 行内容长度（`slice_line` 含 `\r`、不含 `\n`），与
+        // `line_end_offset` 同口径；但不得调用 `line_end_offset`（它经 `line_start_offset`
+        // 回指本函数 → 递归）。列超行尾夹到行尾（与 `offset_to_point` 逆映射口径一致），
+        // 行首加列用 saturating 防 `usize::MAX` 列 debug 溢出 panic。
+        let line_end = line_start + self.line_len(point.row);
+        line_start.saturating_add(point.column).min(line_end)
     }
 
     fn line_end_offset(&self, row: usize) -> usize {
@@ -230,5 +235,36 @@ mod tests {
         // 逐行迭代
         let lines: Vec<_> = rope.iter_lines().map(|r| r.to_string()).collect();
         assert_eq!(lines, vec!["Hello 中文🎉 test", "Rope"]);
+    }
+
+    /// M 红测：`point_to_offset` 对超出行长的列不夹取、不截断——`line_start + column`
+    /// 可能越到下一行/越出 rope（错位）。
+    ///
+    /// 期望语义：列超行尾 → 夹到行尾（offset 等价于该行 `line_end_offset`，与
+    /// `offset_to_point` 逆映射口径一致），不越界。当前返回越界偏移 → 红。
+    #[test]
+    fn point_to_offset_clamps_column_at_line_end() {
+        let rope = Rope::from("ab\nlong line here\nx");
+        // 行 1 = "long line here"（14B），行首偏移 3，行尾偏移 = 3+14 = 17。
+        let line_end = rope.line_end_offset(1);
+        assert_eq!(line_end, 17, "行尾偏移先验（夹具演算）");
+        // 超出行尾大列：应夹到行尾，不得越到下一行/越出 rope。
+        let col = rope.line_len(1) + 1000;
+        let got = rope.point_to_offset(Point::new(1, col));
+        assert_eq!(
+            got, line_end,
+            "列 {} 超出行尾应夹取到行尾 {}，实测 {}",
+            col, line_end, got
+        );
+    }
+
+    /// M 红测（极限列）：`usize::MAX` 列当前 `line_start + column` 直接 debug 溢出 panic。
+    /// 期望：不 panic 并把列夹取到行尾。
+    #[test]
+    fn point_to_offset_no_panic_on_max_column() {
+        let rope = Rope::from("ab\nlong line here\nx");
+        let line_end = rope.line_end_offset(1);
+        let got = rope.point_to_offset(Point::new(1, usize::MAX));
+        assert_eq!(got, line_end, "usize::MAX 列不得溢出，应夹取到行尾");
     }
 }

@@ -4,9 +4,12 @@
 //! 用 gpui 自带的 SVG 光栅（`Window::paint_svg`，**零新增依赖**）按 `.text_color(...)` 统一
 //! 上色、按 `.size(...)` 缩放。标记复用 Feather 风格路径。
 
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
 use gpui::{
     App, Bounds, Element, ElementId, GlobalElementId, Hsla, InspectorElementId, IntoElement,
-    LayoutId, Pixels, Style, Window, px,
+    LayoutId, Pixels, SharedString, Style, Window, px,
 };
 
 /// 图标名：本应用实际用到的图标全集（按需扩充）。
@@ -102,11 +105,22 @@ impl IconName {
     /// 单一来源的 SVG 标记（24×24 viewBox、2px 安全边距，`currentColor` 上色；单色精灵由
     /// `paint_svg` 的 color 参数统一替换，stroke 图标统一 Fluent 规范：光学线宽 1.5、
     /// 端点/拐角圆形、路径坐标整格对齐——活动栏与标题栏按钮共用同一套线性描边风格）。
-    fn svg_markup(self) -> String {
+    /// 每名只构建一次、跨调用共享同一分配（消除 `Icon::paint` 每帧重建热路径）；返回
+    /// `Arc<str>`：同 name 相邻两次调用 `as_str()` 指向同一底层缓冲（`ptr::eq` 红测保证）。
+    fn svg_markup(self) -> Arc<str> {
         const H: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" \
             viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" \
             stroke-linecap=\"round\" stroke-linejoin=\"round\">";
         const T: &str = "</svg>";
+        // 惰性缓存：首个调用按 `format!("{H}{inner}{T}")` 拼装并收进全局 map，之后调用
+        // 克隆同一 `Arc<str>`（同一底层分配，`ptr::eq` 成立）。静态 map 无法可变借用，
+        // 故用 `Mutex` 包一层（热路径开销 = 一次 lock + hash 查 + refcount clone，远低于
+        // 每帧重建 String 拷贝）。
+        static CACHE: LazyLock<Mutex<HashMap<IconName, Arc<str>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        if let Some(v) = CACHE.lock().unwrap().get(&self) {
+            return v.clone();
+        }
         let inner = match self {
             IconName::PanelLeftClose => {
                 "<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\"/><line x1=\"9\" y1=\"3\" x2=\"9\" y2=\"21\"/><path d=\"m13 15-3-3 3-3\"/>"
@@ -245,7 +259,20 @@ impl IconName {
                 "<line x1=\"4\" y1=\"21\" x2=\"4\" y2=\"14\"/><line x1=\"4\" y1=\"10\" x2=\"4\" y2=\"3\"/><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"12\"/><line x1=\"12\" y1=\"8\" x2=\"12\" y2=\"3\"/><line x1=\"20\" y1=\"21\" x2=\"20\" y2=\"16\"/><line x1=\"20\" y1=\"12\" x2=\"20\" y2=\"3\"/><line x1=\"1\" y1=\"14\" x2=\"7\" y2=\"14\"/><line x1=\"9\" y1=\"8\" x2=\"15\" y2=\"8\"/><line x1=\"17\" y1=\"16\" x2=\"23\" y2=\"16\"/>"
             }
         };
-        format!("{H}{inner}{T}")
+        let built: Arc<str> = format!("{H}{inner}{T}").into();
+        CACHE.lock().unwrap().entry(self).or_insert(built).clone()
+    }
+
+    /// 每 name 一次的 SVG 缓存键（作为 `paint_svg` 的路径标识）：静态化 `format!`，
+    /// 避免 `Icon::paint` 每帧重建 String→SharedString。
+    fn svg_cache_key(self) -> SharedString {
+        static KEYS: LazyLock<Mutex<HashMap<IconName, SharedString>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        KEYS.lock()
+            .unwrap()
+            .entry(self)
+            .or_insert_with(|| format!("__ui_icon__{:?}", self).into())
+            .clone()
     }
 }
 
@@ -333,7 +360,7 @@ impl Element for Icon {
         cx: &mut App,
     ) {
         let markup = self.name.svg_markup();
-        let key = format!("__ui_icon__{:?}", self.name).into();
+        let key = self.name.svg_cache_key();
         window
             .paint_svg(
                 bounds,
@@ -424,6 +451,23 @@ mod tests {
             );
             assert!(m.ends_with("</svg>"), "{:?} 应为闭合 svg", name);
         }
+    }
+
+    /// 结构性省写（针对 `Icon::paint` 每帧重建 `svg_markup()`+key 热路径浪费，见
+    /// `paint` 内两处静态缓存注释）：
+    /// 同一 name 的 markup 应为同一静态/缓存分配（`LazyLock`/`const`/memo），而非每次调用
+    /// 重建新 `String`。断言「两次调用返回同一分配」：当前实现每调用 `format!` 新建 String
+    /// → 指针不同 → 红；实现侧静态化后同分配 → 绿。
+    #[test]
+    fn same_name_markup_is_single_shared_allocation() {
+        // svg_markup 改返 `Arc<str>` 后 `a.as_str()` 会解析到不稳定 `str::as_str`，
+        // 故改为绑定 `&str` 借用（同一 Arc 克隆 → 同一底层缓冲），断言语义不变。
+        let a: &str = &IconName::Search.svg_markup();
+        let b: &str = &IconName::Search.svg_markup();
+        assert!(
+            std::ptr::eq(a, b),
+            "同一 name 的 markup 应命中缓存/常量（两次调用同一分配），当前每调用重建 String → RED"
+        );
     }
 
     /// 核心（活动栏 / 标题栏）图标绘制满足 Fluent 网格规范：所有路径/属性坐标都是
