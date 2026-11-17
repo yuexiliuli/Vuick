@@ -460,6 +460,12 @@ impl WyEditor {
 
         self.caret = (r.start + inserted_len).min(self.len());
         self.sel_anchor = None;
+        // IME 组合与普通编辑共用本入口：非 IME 编辑（粘贴/退格/删除/折叠写回等）落地即清
+        // marked，防 Windows IME 下一次以 range=None 把陈旧区间当组合再次替换（重插入/错位/
+        // 重复串）。IME 自身组合更新（mark=true）由 `ime::replace` 在 apply_edit 之后重建
+        // marked、组合提交（mark=false）随后亦清 marked——此处清空不改变最终组合态，与
+        // `apply_raw_edit` 的同款清空姿势对齐（P1-C3）。
+        self.marked = None;
         // 输入/删除/粘贴 → 静止期常亮（blink 暂停，先亮住再继续闪）。
         self.caret_phase.kick();
         *self.rd.borrow_mut().frame.borrow_mut() = None;

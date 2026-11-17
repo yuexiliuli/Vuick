@@ -179,3 +179,130 @@ fn selected_inline_image_cleared_after_keyboard_move(cx: &mut TestAppContext) {
         );
     });
 }
+
+/* ---------- Bug C3：非 IME 普通编辑不清空 IME 组合 marked ---------- */
+
+/// 红测（C3-主）：进入 IME 组合态（`marked` 已占位）后做一次**范围替换**（`replace_range`
+/// 路径——粘贴/快捷键插入/折叠写回等一切非 IME 编辑都从它过，edit.rs:401）→ 组合态必须
+/// 被清空。现状：`replace_range` **不清** `self.marked`（同管线 `apply_raw_edit`:1047 显式清），
+/// 组合中途任意普通编辑后 `marked` 留陈旧区间 → Windows IME 下一次 `range=None` 经
+/// `ime::byte_range`（crates/ime/lib.rs:136）把陈旧区间当组合再次替换 → 重插入/错位/重复串。
+#[gpui::test]
+fn replace_range_during_composition_clears_marked(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("你好"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.set_caret("你好".len());
+            // 组合进行中：marked 占位「ni」（组合文本落在光标后，源区间 6..8）。
+            e.replace_and_mark_utf16(None, "ni", None, cx);
+            assert!(e.marked.is_some(), "前置：组合进行中应有 marked 占位");
+            // 普通编辑（非 IME）：光标处插入一个字符。
+            e.replace_range(e.caret()..e.caret(), "X", cx);
+            assert!(
+                e.marked.is_none(),
+                "组合中途范围替换必须清空 marked（否则 Windows IME 下一步以 range=None 替换陈旧区间）"
+            );
+        });
+    });
+}
+
+/// 红测（C3-退格）：组合中途按退格（`backspace` → `replace_range`，用户真实触发的
+/// 非 IME 编辑路径）→ 同款必须清 marked。
+#[gpui::test]
+fn backspace_during_composition_clears_marked(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("你好"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.set_caret("你好".len());
+            e.replace_and_mark_utf16(None, "ni", None, cx);
+            assert!(e.marked.is_some(), "前置：组合进行中应有 marked 占位");
+            e.backspace(cx);
+            assert!(
+                e.marked.is_none(),
+                "组合中途退格必须清空 marked（否则 Windows IME 下一步以 range=None 替换陈旧区间）"
+            );
+        });
+    });
+}
+
+/* ---------- Bug C5：sync_math 在 paint 期直接 drop_image(None) 漏删当前窗口纹理 ---------- */
+
+/// 红测（C5）：`sync_math`（content_sync.rs:260，paint 期调用，见 element/mod.rs:481）对
+/// `pending_math_drop` / 主题切换整清 / LRU 淘汰的 `Ready` 位图直接 `cx.drop_image(img, None)`
+/// （content_sync.rs:266/278/355）。而当前窗口回调跑在 gpui `update_window_erased`
+/// （vendor gpui app.rs:3146）里——当前窗口被临时移出 `App.windows`，`App::drop_image(None)`
+/// 只遍历 `App.windows`（app.rs:3103）→ 当前窗口 sprite atlas 条目漏删（K14：当前窗口纹理
+/// 只涨不降）。复现：注入公式 Ready 位图并真实绘制（入当前窗口图集）→ 收进
+/// `pending_math_drop`（install_open 换源同款「脏标记延帧释放」）→ 当前窗口 update
+/// （= paint 期同构：`App.windows` 不含当前窗口）走一次 `sync_math` → 修复前当前窗口
+/// 图集条目残留 → 红。
+#[gpui::test]
+fn sync_math_drop_releases_current_window_atlas(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("$$\na = b\n$$\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let buf = kimg::RgbaImage::from_raw(8, 8, vec![0u8; 8 * 8 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![kimg::Frame::new(buf)]));
+    // ① 注入公式 Ready 位图并真实绘制 → 当前窗口 sprite atlas 持有该图条目。
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 光标放块外 → 折叠成卡片（非 reveal）才会出 `BlockCard::Math` / 走 Ready 位图绘制。
+        let end = ed.read(cx).content().len();
+        ed.update(cx, |e, _| e.set_caret(end));
+        let f = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
+        let key = f
+            .rows
+            .iter()
+            .find_map(|r| match &r.extra.card {
+                Some(super::BlockCard::Math { latex, .. }) => Some(latex.trim().to_string()),
+                _ => None,
+            })
+            .expect("$$ 卡");
+        ed.update(cx, |e, _| {
+            e.math_slots().borrow_mut().insert(
+                key.into(),
+                super::super::MathSlot::Ready(img.clone(), 8., 8.),
+            );
+        });
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        vcx.update(|window, _| window.has_image_atlas_entry(&img)),
+        "前置：真实绘制后当前窗口图集应持有该位图条目"
+    );
+    // ② 位图回收（install_open 换源同款「脏标记延帧释放」）：收进 pending_math_drop。
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.pending_math_drop.borrow_mut().push(img.clone());
+        });
+    });
+    // ③ 当前窗口 update（= paint 期同构：App.windows 不含当前窗口）走 sync_math：
+    //    drain pending_math_drop → cx.drop_image(img, None)。修复后当前窗口图集条目应已被释放，
+    //    修复前 drop(None) 遍历不到当前窗口 → 条目残留 → 红。
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let f = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
+        ed.update(cx, |e, ecx| e.sync_math(ecx, &f));
+    });
+    assert!(
+        !vcx.update(|window, _| window.has_image_atlas_entry(&img)),
+        "sync_math 释放位图后当前窗口图集不得残留该条目（paint 期直接 drop_image(None) 漏删当前窗口）"
+    );
+}

@@ -18,6 +18,18 @@ impl WyEditor {
         self.pending_math_drop.borrow_mut().push(img);
     }
 
+    /// K14 窗口感知释放：`sync_math` 在 paint（窗口回调）期被调，当前窗口被 gpui 临时移出
+    /// `App.windows`（vendor app.rs:3146 `update_window_erased` take）。此时直接
+    /// `App::drop_image(None)` 只遍历 `App.windows`（app.rs:3103）→ 当前窗口 sprite atlas
+    /// 条目漏删（纹理只涨不降）。统一 `cx.defer` 延后到本帧效果循环末尾——`trail` 已把窗口
+    /// 复位回 `App.windows`（app.rs:3190）→ `drop_image(None)` 全窗口遍历即覆盖当前窗口。
+    /// 与 `install_open` 换源「脏标记延帧释放」同款「帧末统一释放」姿势（K10/K14，P1-C5）。
+    fn defer_math_atlas_drop(&self, cx: &mut Context<Self>, img: Arc<RenderImage>) {
+        cx.defer(move |cx| {
+            cx.drop_image(img, None);
+        });
+    }
+
     /// 换源脏标记消费：置脏的下一帧经 [`WyEditor::render`]（`impl Render`，宿主每帧
     /// 重绘入口，带 `window`）到这里统一 `clear` 释放旧文档图片纹理。——`install_open`
     /// 无 cx/window，gpui `RetainAllImageCache::clear` 需要 `&mut Window`，故延迟到每帧；
@@ -263,7 +275,8 @@ impl WyEditor {
         // 字节仍在、可重传，不丢渲染）。
         let pending = std::mem::take(&mut *self.pending_math_drop.borrow_mut());
         for img in pending {
-            cx.drop_image(img, None);
+            // K14：paint 期当前窗口不在 `App.windows` → defer 到帧末窗口复位后再 drop。
+            self.defer_math_atlas_drop(cx, img);
         }
         let color = math_color(&self.rd.borrow().theme);
         let color_changed = self.math_color.borrow().as_ref() != Some(&color);
@@ -275,7 +288,8 @@ impl WyEditor {
             let old = self.math_slots.borrow_mut().drain_all();
             for s in old {
                 if let MathSlot::Ready(img, _, _) = s {
-                    cx.drop_image(img, None);
+                    // K14：同上——paint 期当前窗口漏删，帧末统一释放再 drop。
+                    self.defer_math_atlas_drop(cx, img);
                 }
             }
             // 主题色变化：旧位图颜色失效 → 钉一并清空（否则 Loading 期会画旧色）。
@@ -349,10 +363,12 @@ impl WyEditor {
                 None => {}
             }
             // claim Loading：容量满且键不在场 → LRU 淘汰最久未用条目，其 Ready 位图
-            // 纹理当场 `drop_image` 释放（防纹理只涨不降）。
+            // 纹理 defer 帧末 `drop_image` 释放（防纹理只涨不降；paint 期窗口感知见
+            // `defer_math_atlas_drop`）。
             let write = slots.insert(key.clone(), MathSlot::Loading);
             if let Some(MathSlot::Ready(img, _, _)) = write.evicted {
-                cx.drop_image(img, None);
+                // K14：同上——LRU 淘汰位图同为 paint 期释放，帧末统一 drop。
+                self.defer_math_atlas_drop(cx, img);
             }
             drop(slots);
             // 离屏排版（纯 CPU；与 zorite `ensure_math_loaded` 同构）。
