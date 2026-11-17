@@ -2105,3 +2105,132 @@
         let _ = final_state.1;
     }
 
+    /// P0 复现：对**图片选项卡**执行保存（`save_tab`，即 Ctrl+S 同路径）→ 原始图片文件
+    /// 被原子覆写成 **0 字节空文件**。
+    ///
+    /// 根因：图片/视频/EPUB 类选项卡经 `reset_common_tab_fields` 置 `readonly_preview=true`
+    /// + 编辑区文本置空（file_ops.rs:1199-1213）；`save_tab` 只对 `MediaReader::Pdf` 设了
+    /// 保护分支（file_ops.rs:1600-1612），其余媒体卡落入 `tab_effective_text` = "" →
+    /// `write_to_path(idx, p, "", cx)` **原子覆写原始文件为空**（file_ops.rs:1620-1621）。
+    ///
+    /// 断言：保存后磁盘上的原始图片文件字节必须与打开前完全一致（非空、未被文本保存覆写）。
+    #[gpui::test]
+    async fn saving_image_tab_does_not_truncate_source_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 1×1 RGB PNG（70 字节，合法小图）：签名 + IHDR(1×1/8bit/RGB) + IDAT + IEND。
+        // 字节由 base64 `iVBORw0KGgo…` 解码得到，实为合法 PNG（image 可直接解码）。
+        const PNG_1X1: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207,
+            192, 80, 15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+            96, 130,
+        ];
+        let dir = std::env::temp_dir().join(format!(
+            "vuick-app-img-save-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.png");
+        std::fs::write(&p, PNG_1X1).unwrap();
+        // 走真实打开路径（open_file → is_image_path → make_tab + load_media(Image)），
+        // 端到端锁定「用户对图片卡按 Ctrl+S 会破坏原始文件」这一可观测事实。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let idx = cx.update(|_w, cx| app.read(cx).model.borrow().active_tab);
+        cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.model.borrow().tabs[idx];
+            assert!(t.payload.readonly_preview, "图片选项卡应为 readonly_preview");
+            assert!(
+                matches!(t.payload.reader, MediaReader::Image(_)),
+                "活动选项卡应是图片查看器"
+            );
+            assert_eq!(
+                t.payload.editor.read(cx).value().to_string(),
+                "",
+                "图片卡编辑区应为空（readonly_preview 语义）"
+            );
+        });
+        // 用户按 Ctrl+S：`save` → `save_tab(idx)`（与保存菜单/快捷键同一条生产路径）。
+        let _saved = cx.update(|window, cx| app.update(cx, |app, cx| app.save_tab(idx, window, cx)));
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let disk = std::fs::read(&p).unwrap_or_default();
+        assert!(
+            !disk.is_empty(),
+            "保存图片选项卡不得把原始图片文件覆写为空（文件被写成了 0 字节）"
+        );
+        assert_eq!(
+            disk, PNG_1X1,
+            "保存图片选项卡后原始图片文件字节必须保持不变（不得被文本保存覆写）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-A1 守卫泛化：只读预览（图片/视频/EPUB）的「保存」一律不落盘——三种媒体形态的
+    /// 共同标记只有 `readonly_preview`（`reset_common_tab_fields` 同源置位），不依赖真实
+    /// 媒体夹具。本测试在普通文本卡上**强制**置该标志模拟统一只读形态：`save_tab` 返回
+    /// true（视为已保存）且源文件与编辑区文本字节不变；`save_tab_as` 返回 false（封口，
+    /// 不弹另存为对话框、不写盘）。
+    #[gpui::test]
+    async fn saving_readonly_preview_tab_never_truncates(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "vuick-app-ro-save-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("doc.txt");
+        std::fs::write(&p, "原文内容\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let idx = cx.update(|_w, cx| app.read(cx).model.borrow().active_tab);
+        // 强制置只读预览标志，模拟图片/视频/EPUB 的统一只读形态（编辑区皆空、仅此标志区分）。
+        cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let mut m = a.model.borrow_mut();
+            m.tabs[idx].payload.readonly_preview = true;
+        });
+        // 编辑区填一段文本：若守卫缺失将被 `write_to_path` 覆写成该文本（文本卡非空更易证伪）。
+        cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let ed = a.model.borrow().tabs[idx].payload.editor.clone();
+            ed.update(cx, |ed, _| ed.set_text("若被保存会覆写源文件\n"));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let saved = cx.update(|window, cx| app.update(cx, |app, cx| app.save_tab(idx, window, cx)));
+        assert!(saved, "只读预览保存应视为已保存（返回 true，不落盘）");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let disk = std::fs::read(&p).unwrap_or_default();
+        assert_eq!(disk, "原文内容\n".as_bytes(), "只读预览保存不得覆写源文件");
+        // 另存为封口：同步返回 false（先于任何对话框/写盘）。
+        let saved_as = cx.update(|window, cx| app.update(cx, |app, cx| app.save_tab_as(idx, window, cx)));
+        assert!(!saved_as, "只读预览另存为应封口返回 false（不写盘）");
+        let disk2 = std::fs::read(&p).unwrap_or_default();
+        assert_eq!(disk2, "原文内容\n".as_bytes(), "只读预览另存为后源文件也不得变化");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+

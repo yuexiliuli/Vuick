@@ -1610,6 +1610,15 @@ impl EditorApp {
             // （异步完成时刻不再收口 status，避免留下过期的「正在保存…」文案）。
             return pdf.update(cx, |v, cx| v.save(cx));
         }
+        // 只读预览（图片/视频/EPUB；`reset_common_tab_fields` 同源置位）无「保存模型」：
+        // 视为已保存（仿 PDF 无待存语义），**绝不**走文本 `write_to_path`——编辑区为空，
+        // 那会把原始媒体文件原子覆写成 0 字节（P0-A1 数据丢失）。
+        if tab.payload.readonly_preview {
+            drop(model);
+            self.model.borrow_mut().status = SharedString::from("已保存（只读预览无保存模型）");
+            self.model.borrow_mut().status_ok = true;
+            return true;
+        }
         let Some(p) = tab.payload.file_path.clone() else {
             drop(model);
             return self.save_tab_as(idx, window, cx);
@@ -1677,6 +1686,15 @@ impl EditorApp {
                 let _ = (window, cx, pdf, base_name, entity);
             }
             return true;
+        }
+        // 只读预览（图片/视频/EPUB）无保存模型：另存为封口，不把空文本写到用户新选路径。
+        if self
+            .model.borrow().tabs
+            .get(idx)
+            .map(|t| t.payload.readonly_preview)
+            .unwrap_or(false)
+        {
+            return false;
         }
         let file_name = self.tab_file_name(idx);
         // 同 `save_tab`：WYSIWYG 开启时读 WyEditor 实时内容，而非陈旧的编辑区。
