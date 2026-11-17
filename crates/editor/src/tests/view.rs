@@ -421,6 +421,34 @@ fn typing_then_undo_redo(cx: &mut TestAppContext) {
     assert_eq!(editor_text(&host, cx), "abc");
 }
 
+/// P0 红测：撤销后再编辑 → Ctrl+Y 重做必须失效（重做分支作废）。
+/// 修复前：撤销后输入 "x" 时 `UndoManager::start_tx` 因 pending=None 早退、未清
+/// redo_stack，Ctrl+Y 仍把旧事务 "abc" 以旧坐标重放到已含 "x" 的缓冲区 → 文本变
+/// "abcx" 而非保持 "x"。
+#[gpui::test]
+fn undo_then_edit_invalidates_redo(cx: &mut TestAppContext) {
+    let (host, cx) = open(cx, "");
+    focus(&host, cx);
+    let w = window_handle(cx);
+    cx.simulate_keystrokes("abc");
+    settle(cx);
+    assert_eq!(editor_text(&host, cx), "abc");
+
+    cx.dispatch_keystroke(w, Keystroke::parse("ctrl-z").unwrap());
+    settle(cx);
+    assert_eq!(editor_text(&host, cx), "");
+
+    // 撤销后再编辑：重做分支应作废。
+    cx.simulate_keystrokes("x");
+    settle(cx);
+    assert_eq!(editor_text(&host, cx), "x");
+
+    // Ctrl+Y 不得把旧 "abc" 重放回来：文本必须仍为 "x"。
+    cx.dispatch_keystroke(w, Keystroke::parse("ctrl-y").unwrap());
+    settle(cx);
+    assert_eq!(editor_text(&host, cx), "x", "撤销后新编辑应清空 redo，文本仍为 x");
+}
+
 #[gpui::test]
 fn caret_and_backspace(cx: &mut TestAppContext) {
     let (host, cx) = open(cx, "ab");

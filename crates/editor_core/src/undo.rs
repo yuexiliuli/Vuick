@@ -113,6 +113,11 @@ impl UndoManager {
             return true;
         }
         self.commit_pending(None);
+        // P0：撤销后再编辑 = 编辑历史分叉，重做分支整棵作废。此处开启全新事务
+        // （pending 由 None→Some）→ 清空 redo_stack，防 Ctrl+Y 把旧事务以旧坐标
+        // 重放到已含新编辑的缓冲区（`commit_pending` 只在其内真实提交时清，直接
+        // start_tx 且 pending=None / 空 pending 时靠这里清）。
+        self.redo_stack.clear();
         self.pending = Some(PendingTx {
             intent,
             edits: Vec::new(),
@@ -125,6 +130,8 @@ impl UndoManager {
     pub fn push_edit(&mut self, edit: Edit) {
         // 兜底：未 start_tx 直接 push → 原子事务
         if self.pending.is_none() {
+            // P0：未走 start_tx 的新编辑同样作废重做分支（pending 由 None→Some）。
+            self.redo_stack.clear();
             self.pending = Some(PendingTx {
                 intent: EditIntent::Atomic,
                 edits: Vec::new(),
@@ -158,6 +165,9 @@ impl UndoManager {
         // 不合并 → 刷新旧事务，新事务沿用同意图（连续删除/粘贴的下一段），把本条放入。
         let before = self.pending.as_ref().unwrap().before;
         self.commit_pending(None);
+        // P0：刷新后开启的新事务 = 新用户编辑，同样作废重做分支（`commit_pending`
+        // 只在其内真实提交时清 redo；此处对「空 pending 早退」情形补一刀，语义完备）。
+        self.redo_stack.clear();
         self.pending = Some(PendingTx {
             intent,
             edits: vec![edit],
@@ -266,6 +276,11 @@ impl UndoManager {
 
     /// 重做一步。返回该事务（供调用方回放 & 恢复 `after` 选区）。
     pub fn redo(&mut self) -> Option<Transaction> {
+        // P0 防御：先提交遗留 pending（含空 pending 早退）再弹 redo——不丢 pending、
+        // 也防旧事务以旧坐标重放到未提交的新改动上。正常路径下新编辑已把 redo_stack
+        // 清空（见 start_tx/push_edit），此处 pop 返回 None；撤销后未编辑直接 Ctrl+Y
+        // 时 pending 为 None，行为不变。
+        self.commit_pending(None);
         self.cooperative = false;
         let tx = self.redo_stack.pop()?;
         self.undo_stack.push_back(tx.clone());
@@ -288,5 +303,53 @@ impl UndoManager {
         self.pending = None;
         self.cooperative = false;
         self.last_edit_at = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::buffer::Buffer;
+
+    /// P0 红测：撤销后开始新编辑（事务 B 未 commit）→ redo 必须已失效（返回 None）。
+    ///
+    /// 语义（浏览器/编辑器通例）：撤销后再编辑 = 重做分支整棵作废。复现路径：
+    /// 输入 abc（合并为事务 A）→ commit → undo（此刻 undo_stack=[], redo_stack=[A],
+    /// pending=None）→ 再输入 x 开启新事务 B——`start_tx` 因 pending=None 走
+    /// `commit_pending(None)` 早退，**不清 redo_stack**，于是 `redo()` 仍从 redo_stack
+    /// 弹回旧事务 A，以旧坐标 A 重放到已含 "x" 的缓冲区 → 文本损坏/选区错乱。
+    ///
+    /// 断言：新事务 B 开启后 `redo()` 返回 None。修复前返回 Some(A) → 红。
+    #[test]
+    fn redo_invalidated_by_new_edit_after_undo() {
+        let mut buf = Buffer::default();
+        let mut mgr = UndoManager::new();
+        // 输入 abc（合并成事务 A）。
+        for (i, ch) in "abc".chars().enumerate() {
+            mgr.start_tx(EditIntent::Typing, (i, i));
+            mgr.push_edit(buf.apply_edit(i..i, &ch.to_string()));
+            mgr.set_cooperative(true);
+        }
+        assert_eq!(buf.to_string(), "abc");
+        mgr.commit((3, 3));
+
+        // 撤销 A → undo_stack=[], redo_stack=[A], pending=None。
+        let tx = mgr.undo().expect("撤销返回事务 A");
+        assert_eq!(tx.edits.len(), 1);
+        for e in tx.edits.iter().rev() {
+            buf.undo_edit(e);
+        }
+        assert_eq!(buf.to_string(), "");
+        assert!(mgr.can_redo(), "撤销后此刻应可重做（修前基线，redo_stack=[A]）");
+
+        // 撤销后开始新编辑 x：开启事务 B，此刻重做分支应整个作废。
+        mgr.start_tx(EditIntent::Typing, (0, 0));
+        mgr.push_edit(buf.apply_edit(0..0, "x"));
+
+        // 目标语义：redo() 必须为 None。修复前 start_tx 未清 redo_stack → 返回 Some(A) → 红。
+        assert!(
+            mgr.redo().is_none(),
+            "撤销后新编辑应作废重做分支，实测 redo 仍弹回旧事务 A"
+        );
     }
 }
