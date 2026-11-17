@@ -349,9 +349,11 @@ impl UserPrefs {
         prefs.video_window_size = Self::read_size_tuple(map, "video_window_size");
         // 最近打开（文件夹 / 文件）：读取字符串数组，非数组 / 缺省 → 空；
         // 元素非字符串跳过；截断至 RECENT_MAX（安全护栏，防手改配置超长）。
-        prefs.recent_folders = Self::read_string_array(map, "recent_folders");
-        prefs.recent_files = Self::read_string_array(map, "recent_files");
-        prefs.music_liked = Self::read_string_array(map, "music_liked");
+        prefs.recent_folders = Self::read_string_array(map, "recent_folders", RECENT_MAX);
+        prefs.recent_files = Self::read_string_array(map, "recent_files", RECENT_MAX);
+        // 音乐收藏：播放器 liked_order 无上限（仅去重置顶、不挤旧收藏），解析**不截断**，
+        // 与写回口径一致（否则运行中 shell persist 把截断快照写回盘 = 第 51+ 首永久丢失）。
+        prefs.music_liked = Self::read_string_array(map, "music_liked", usize::MAX);
         prefs
     }
 
@@ -373,13 +375,16 @@ impl UserPrefs {
     }
 
     /// 从 JSON 对象里读一个「字符串数组」字段（见 [`UserPrefs::from_json_value`]）。
-    fn read_string_array(map: &Map<String, Value>, key: &str) -> Vec<String> {
+    /// `cap` 为该字段的截断上限：
+    /// - `recent_folders` / `recent_files`（「最近打开」语义）传 [`RECENT_MAX`]，防手改配置超长；
+    /// - `music_liked`（收藏列表，播放器 no-cap 语义）传 `usize::MAX`，解析不截断，全量 roundtrip。
+    fn read_string_array(map: &Map<String, Value>, key: &str, cap: usize) -> Vec<String> {
         let Some(Value::Array(arr)) = map.get(key) else {
             return Vec::new();
         };
         arr.iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .take(RECENT_MAX)
+            .take(cap)
             .collect()
     }
 
@@ -899,6 +904,42 @@ mod tests {
         let back = UserPrefs::from_json_value(&Value::Null);
         assert_eq!(back.music_dir, None);
         assert!(back.music_liked.is_empty());
+    }
+
+    /// P1 复现红测：`music_liked` 收藏列表**无截断上限**——播放器 `liked_order` 可无限增长
+    /// （无 RECENT_MAX 语义），但 `read_string_array` 对全部字段统一 `take(RECENT_MAX)` 截断
+    /// 到 50（该上限本专指 folders/files「最近打开」）。修复前：配置含 60 首收藏时解析被截成
+    /// 前 50，且运行中任意 shell persist 把已截断快照写回盘 → 第 51+ 首收藏永久覆盖丢失。
+    /// 本红测断言 >50 首**全量保留**（数量 + 末位内容双判，防仅数量对而内容丢）。
+    #[test]
+    fn music_liked_preserves_over_50_entries() {
+        // 构造 60 首收藏（路径含下标以区分内容，验证全量保留而非仅数量）。
+        let liked: Vec<String> = (0..60)
+            .map(|i| format!("D:\\music\\music\\song-{i:02}.mp3"))
+            .collect();
+        let v = serde_json::json!({ "music_liked": liked });
+        let back = UserPrefs::from_json_value(&v);
+        // 修复前被 read_string_array 统一 take(RECENT_MAX=50) 截断 → len==60 失败（红）。
+        assert_eq!(
+            back.music_liked.len(),
+            60,
+            "music_liked 超过 50 首必须全量保留（现状被 recent 上限截断 = 数据丢失）"
+        );
+        assert_eq!(
+            back.music_liked[59].as_str(),
+            "D:\\music\\music\\song-59.mp3",
+            "第 60 首（下标 59）必须保留，不能只留前 50 首"
+        );
+
+        // 共享 helper 改按字段取限后：folders/files「最近打开」仍截断至 RECENT_MAX（回归护栏，
+        // 与 recent_arrays_json_roundtrip 双保险，防 helper 参数化把 recent 上限顺带放掉）。
+        let mixed = serde_json::json!({
+            "music_liked": liked,
+            "recent_files": (0..80).map(|i| format!("C:\\Data\\f{i}")).collect::<Vec<_>>(),
+        });
+        let back = UserPrefs::from_json_value(&mixed);
+        assert_eq!(back.music_liked.len(), 60, "music_liked 不受 recent 上限影响");
+        assert_eq!(back.recent_files.len(), RECENT_MAX, "recent_files 仍截断到 50");
     }
 
     /// PDF 画布背景两字段 roundtrip：pdf_bg（default 缺省；预设/自定义 roundtrip 保留，
