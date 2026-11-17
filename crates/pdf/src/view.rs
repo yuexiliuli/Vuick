@@ -2050,5 +2050,101 @@ mod tests {
             });
         });
     }
+
+    /// H2 红测（P1 worker 泄漏 / 僵尸泵，无 pdfium 的纯调度/状态断言）：
+    /// **快速滚动中关闭标签页（release）后，自刷新泵必须停止**。
+    ///
+    /// 根因链：`ensure_tile_pump`（tiles.rs）spawn 的循环只按 `pump_still_needed()` 判活，而
+    /// `pump_still_needed()` 对「已 release 视图」无防——`release()`（open.rs:551）清掉了
+    /// pending/zoom_armed 却**不复位** `prev_fast`/`speed_state`；滚动置 fast 态后
+    /// `prev_fast==true` 使 `pump_still_needed()` 恒真 → 泵以 16ms 周期继续 `refresh_windows` +
+    /// 强 `this: Entity` 永不 drop（僵尸泵）。
+    ///
+    /// 断言：已打开视图置于 fast 态后 `pump_still_needed()` 为 true（泵应出帧）；调用
+    /// `release()`（shell 关标签页的等价关闭路径）后 `pump_still_needed()` 必须回落 false。
+    /// 修复前 release 未复位 fast 态 → 仍 true → 红。
+    #[gpui::test]
+    async fn release_stops_fast_state_pump(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // 窗口宿主：把（不触碰 pdfium 的）minimal viewer 渲染进真实布局窗口，令
+        // `scroll.bounds()` 拿到真实视口（>0）——否则 `pump_still_needed` 的「已加载且
+        // 视口 0」分支恒真，会污染本用例隔离出的 `prev_fast` 因子。
+        struct PumpProbe {
+            pdf: gpui::Entity<PdfViewer>,
+        }
+        impl Render for PumpProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<gpui::Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| minimal_viewer(cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PumpProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
+        // 让页列（含 track_scroll 容器）完成一次真实布局，scroll.bounds 落到视口尺寸。
+        for _ in 0..3 {
+            let _ = cx.update(|w, _| w.refresh());
+            cx.run_until_parked();
+        }
+        // 前提 1：视口已布局（>0），加载分支不把 pump_still_needed 永久拉真。
+        let vh = cx.update(|_, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .scroll
+                .bounds()
+                .size
+                .height
+                .as_f32()
+        });
+        assert!(vh > 0.0, "视口应已布局：vh={vh}");
+
+        // 模拟快速滚动：置 fast 态（`update_fast_flag` 的等价终态：speed_state=Fast +
+        // prev_fast=true 两者恒同步）。
+        cx.update(|_, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, _c| {
+                    v.speed_state = SpeedState::Fast;
+                    v.prev_fast = true;
+                });
+        });
+        // 前提 2：release 前泵应仍需运行（快速滚动中持续出帧清尾）。
+        let before = cx
+            .update(|_, cx| holder.borrow().as_ref().unwrap().read(cx).pump_still_needed());
+        assert!(before, "快速滚动中 pump_still_needed 应为 true");
+
+        // 关闭标签页等价路径：release()
+        cx.update(|window, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, c| v.release(window, c));
+        });
+        // 断言：release 后 pump_still_needed() 必须为 false（泵应停）。
+        // 修复前 release 未复位 prev_fast、pump_still_needed 又未防「已 release 视图」→ 仍 true → 红。
+        let after = cx
+            .update(|_, cx| holder.borrow().as_ref().unwrap().read(cx).pump_still_needed());
+        assert!(
+            !after,
+            "release 后 pump_still_needed 应为 false（僵尸泵：release 未复位 prev_fast 且 \
+             pump_still_needed 未防已释放视图）"
+        );
+    }
 }
 

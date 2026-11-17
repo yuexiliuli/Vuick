@@ -148,18 +148,30 @@ impl PdfViewer {
                     Ok::<_, String>((worker, doc_id, dims, outlines))
                 })
                 .await;
-            let _ = weak.update(cx, |this, cx| {
-                match result {
-                    Ok((worker, doc_id, dims, outlines)) => {
-                        this.apply_loaded(worker, doc_id, dims, outlines, cx);
+            match result {
+                Ok((worker, doc_id, dims, outlines)) => {
+                    // 打开成功：worker 侧此刻已登记 `doc_id`（`docs`/`stores` 插表）。若实体在
+                    // 加载中已被释放（关标签页 / 丢弃视图），`weak.update` 返回 Err → 无人落地
+                    // `apply_loaded` → 也无人 close → 每次加载中关 tab 泄漏整份 pdfium 句柄 +
+                    // 字节附件（`PdfWorker` 无 Drop 钩子，泄漏只能靠显式 Close 消息回收，H1）。
+                    // 失败分支补上 close，防 worker 文档表残留。
+                    if weak
+                        .update(cx, |this, cx| {
+                            this.apply_loaded(worker.clone(), doc_id, dims, outlines, cx);
+                        })
+                        .is_err()
+                    {
+                        worker.close(doc_id);
                     }
-                    Err(e) => {
+                }
+                Err(e) => {
+                    let _ = weak.update(cx, |this, cx| {
                         this.state.set_error(e);
                         cx.refresh_windows();
                         cx.notify();
-                    }
+                    });
                 }
-            });
+            }
         })
         .detach();
     }
@@ -610,6 +622,13 @@ impl PdfViewer {
         self.recolor_scope.clear();
         self.recolor_received.clear();
         self.tile_bytes = 0;
+        // 快速态随文档释放复位：若 release 前处于 fast 态（`update_fast_flag` 置位、滚动骤停
+        // 未及 EMA 衰减），不自清 `prev_fast`/`speed_state` 会让 `pump_still_needed` 的
+        // `prev_fast` 分支恒真 → 自刷新泵 16ms 周期持续 `refresh_windows` + 强 `this: Entity`
+        // 永不 drop（关闭标签页后的僵尸泵，P1-C10 H2）。复位到 Idle 同时保全
+        // 「`prev_fast` ≡ `speed_state.is_fast()`」的派生布尔不变式（见 `update_fast_flag`）。
+        self.prev_fast = false;
+        self.speed_state = SpeedState::Idle;
         self.tile_pump_running = false;
         self.mid_lru.clear();
         self.sel_anchor = None;
@@ -1579,16 +1598,27 @@ impl PdfViewer {
                         .map_err(|e| format!("无法启动 pdfium：{e}"))
                 })
                 .await;
-            let _ = weak.update(cx, |this, cx| match result {
+            // 与 `start_load` 同款 H1 防泄漏：打开成功即已登记 worker 文档，实体若在加载中
+            // 被释放（`weak.update` Err）须补 `close(doc_id)`，否则 pdfium 句柄 + 字节附件残留。
+            match result {
                 Ok((worker, doc_id, dims, outlines)) => {
-                    this.apply_loaded(worker, doc_id, dims, outlines, cx);
+                    if weak
+                        .update(cx, |this, cx| {
+                            this.apply_loaded(worker.clone(), doc_id, dims, outlines, cx);
+                        })
+                        .is_err()
+                    {
+                        worker.close(doc_id);
+                    }
                 }
                 Err(e) => {
-                    this.state.set_error(e);
-                    cx.refresh_windows();
-                    cx.notify();
+                    let _ = weak.update(cx, |this, cx| {
+                        this.state.set_error(e);
+                        cx.refresh_windows();
+                        cx.notify();
+                    });
                 }
-            });
+            }
         })
         .detach();
     }
