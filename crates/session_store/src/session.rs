@@ -154,17 +154,30 @@ pub fn write_slot(dir: &Path, slot: &str, content: &str) -> bool {
 }
 
 /// 读槽位内容（缺失 → None）。`pub`：shell 编排与测试直接驱动。
+///
+/// 安全：槽位名过 [`safe_slot_name`] 校验——清单是**不可信输入**，若被篡改为
+/// `..\victim.txt` 等越界名，`dir.join(slot)` 会读到会话目录之外的文件；非合法槽位名
+/// 一律视为缺失（None），杜绝穿越读取。
 pub fn read_slot(dir: &Path, slot: &str) -> Option<String> {
+    if !safe_slot_name(slot) {
+        return None;
+    }
     fs::read_to_string(slot_path(dir, slot)).ok()
 }
 
 /// 清会话：删清单 + 尽量清掉清单引用的槽位文件（幂等；单项失败不影响其余）。
 /// `pub`：开关关闭与恢复完成共用，测试直接驱动。
+///
+/// 安全：清单引用槽位时先过 [`safe_slot_name`] 校验——清单是**不可信输入**，篡改的
+/// 槽位名若不校验就 `remove_file` 会删除会话目录之外的任意文件（穿越删除）；非法槽位
+/// 名跳过（幂等），只清合法槽位与清单本体。
 pub fn clear_session(dir: &Path) -> bool {
     if let Some(m) = read_manifest(dir) {
         for tab in &m.tabs {
             if let SessionTab::New { slot, .. } = tab {
-                let _ = fs::remove_file(slot_path(dir, slot));
+                if safe_slot_name(slot) {
+                    let _ = fs::remove_file(slot_path(dir, slot));
+                }
             }
         }
     }
@@ -255,4 +268,70 @@ pub fn prune_unreferenced_slots(dir: &Path, manifest: &SessionManifest) -> bool 
         let _ = fs::remove_file(entry.path());
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 进程内唯一临时父目录（每次用例独立盘面，互不串扰；同批用例也不互踩）。
+    fn tmp_parent(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vuick-session-test-{tag}-{nanos}"))
+    }
+
+    #[test]
+    fn clear_session_must_not_delete_outside_via_manifest_slot_traversal() {
+        // 布局：父目录 P 内含「会话目录 P/session」与「受害者 P/victim.txt」（会话目录之外）。
+        let parent = tmp_parent("clear");
+        let s = parent.join("session");
+        std::fs::create_dir_all(&s).unwrap();
+        let victim = parent.join("victim.txt");
+        std::fs::write(&victim, "VICTIM-CONTENT").unwrap();
+
+        // 篡改清单：未命名选项卡槽位名写成「上一级目录穿越」。read_manifest 读的是不可信
+        // session.json，修复前 clear_session 对 `dir.join("..\\victim.txt")` 直接
+        // remove_file —— 会删掉会话目录之外的受害者文件。
+        let crafted = SessionManifest {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![SessionTab::New {
+                slot: "..\\victim.txt".into(),
+                name: "x".into(),
+            }],
+        };
+        assert!(write_manifest(&s, &crafted), "应能写入篡改清单");
+
+        clear_session(&s);
+
+        assert!(
+            victim.exists(),
+            "越界槽位名不得删除会话目录之外的任何文件（穿越删除）"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn read_slot_must_not_read_via_slot_traversal() {
+        let parent = tmp_parent("read");
+        let s = parent.join("session");
+        std::fs::create_dir_all(&s).unwrap();
+        let victim = parent.join("victim.txt");
+        std::fs::write(&victim, "VICTIM-CONTENT").unwrap();
+
+        // 越界槽位名（上一级目录穿越）。read_slot 的语义是「缺失 → None」；修复前
+        // `dir.join("..\\victim.txt")` 会真读到会话目录之外的受害者内容 —— 必须视为缺失。
+        assert_eq!(
+            read_slot(&s, "..\\victim.txt"),
+            None,
+            "越界槽位名必须视为缺失（None），不得读取会话目录之外的任何文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 }
