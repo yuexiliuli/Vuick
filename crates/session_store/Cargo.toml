@@ -14,3 +14,8 @@ ui = { path = "../ui" }
 base = { path = "../base" }
 # 会话清单 / 设置导出包的 JSON 序列化（手写 serde_json::Value，不引入 serde derive）。
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
+# recent_panel 行为级回归（mousedown 焦点闪烁）需 `#[gpui::test]` / TestAppContext。
+gpui = { workspace = true, features = ["test-support"] }

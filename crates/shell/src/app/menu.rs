@@ -141,11 +141,12 @@ impl EditorApp {
     const RECENT_FLYOUT_REGION_MAX: usize = 10;
 
     /// 「打开最近…」的 flyout 次级菜单项装配：最近文件夹（≤[`RECENT_FLYOUT_REGION_MAX`]）
-    /// → 分隔线 → 最近文件（≤上限）→ 分隔线 → 「清空最近记录」。
+    /// → 分隔线 → 最近文件（≤上限）→ 分隔线 → 「更多...」（打开最近大面板，清空前的
+    /// 固定动作项）→ 分隔线 → 「清空最近记录」。
     /// `folders`/`files` 是**打开菜单时**的最近列表快照（每次打开取最新）。
-    /// 两类全空 → 单个禁用占位项「暂无最近记录」（不可点）。
+    /// 两类全空 → 单个禁用占位项「暂无最近记录」（不可点，不出现「更多...」/清空）。
     /// 所有子项都不 `keep_open` → 点击后**整链关闭**（次级 + 父菜单，组件
-    /// `activate_flyout` 的非 keep_open 路径——与「打开某路径/清空」动作一起生效）。
+    /// `activate_flyout` 的非 keep_open 路径——与「打开某路径/清空/更多...」动作一致）。
     fn recent_flyout_items(
         weak: &gpui::WeakEntity<Self>,
         folders: Vec<String>,
@@ -188,6 +189,10 @@ impl EditorApp {
         if !files.is_empty() {
             children.push(PopupMenuItem::separator());
         }
+        // 「更多...」：打开最近大面板（`open_recent_panel`，All 模式 = 搜索框 + 两组）。
+        // 与「清空最近记录」同为底部固定动作项，二者以分隔线隔开。
+        children.push(Self::recent_more_item(weak.clone()));
+        children.push(PopupMenuItem::separator());
         children.push(Self::recent_clear_item(weak.clone()));
         children
     }
@@ -289,6 +294,23 @@ impl EditorApp {
                 app.model.borrow_mut().recent_files.clear();
                 app.persist_prefs();
                 cx.notify();
+            });
+        })
+    }
+
+    /// 「更多...」：打开最近大面板（[`Self::open_recent_panel`]，全量两组 + 搜索框）。
+    /// 非 keep_open → 点击后**整链关闭**（次级 + 父菜单）：点「更多...」→ 菜单链关 +
+    /// 面板开。两类全空时不在 flyout 装配（走「暂无最近记录」占位分支）。
+    fn recent_more_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        PopupMenuItem::element(|_, _| {
+            div()
+                .w_full()
+                .debug_selector(|| "recent-menu-more".into())
+                .child("更多...")
+        })
+        .on_click(move |_click, window, cx| {
+            let _ = weak.update(cx, |app, cx| {
+                app.open_recent_panel(window, cx);
             });
         })
     }
@@ -729,15 +751,16 @@ impl EditorApp {
             .child(make("menu-btn-help", "帮助", Self::help_items, weak))
     }
 
-    /// 「打开最近」居中大面板入口（**Dormancy：已被 [`Self::file_items`] 的 flyout 悬浮
-    /// 次级菜单取代**——文件菜单「打开最近…」现为悬停展开的右侧子菜单，子项点击即整链
-    /// 关闭，不再打开此居中面板）。保留源码 + 测试（recent.rs 经 [`session_store::RecentPanel`] /
-    /// `open_recent_panel` 直连面板实体做 dormancy 回归）；仅测试引用故标 dead_code。
-    /// 历史行为：`RecentPanel` 是 Ctrl+P 命令面板同款 Acrylic 居中卡片，打开即聚焦、
+    /// 「打开最近」居中大面板入口：文件菜单「打开最近…」flyout 的「更多...」项点击
+    /// （[`Self::recent_more_item`]）调用；打开即全量两组 + 搜索框（[`session_store::RecentPanel`]
+    /// All 模式）。面板是 Ctrl+P 命令面板同款 Acrylic 居中卡片，打开即聚焦搜索框、
     /// 订阅 `DismissEvent`（择项/Esc/点击外 → 清引用释放实体）。
-    #[allow(dead_code)]
+    /// 面板已开 → 直接复用既有单槽（`self.recent_panel`），不叠多层。
     #[doc(hidden)]
     pub fn open_recent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.recent_panel.is_some() {
+            return;
+        }
         // 最近列表快照：面板打开期间被别处更新 → 下次打开才反映最新（面板实体不
         // 在渲染路径反读宿主演变状态，避免 re-entrant borrow；记录逻辑仍走 file_ops）。
         let folders = self.model.borrow().recent_folders.clone();

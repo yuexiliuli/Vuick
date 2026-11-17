@@ -1,12 +1,19 @@
-//! 「打开最近」居中大面板实体（反馈 2）：把「打开最近…」的浮层改为 Ctrl+P 命令面板
-//! 同款样式——更大（600px 宽、窗口 2/3 高）、Acrylic 圆角浮动卡片、**出现在窗口
-//! 中间**（水平居中）、带滚动条与弹簧淡入，而不是旧的小弹层。
+//! 「打开最近」居中大面板实体（2026-11-17 改版）：**顶部搜索框 + 全量两组分组列表**。
+//! （面板内「清空最近记录」行已于 2026-11-17 移除，改由文件菜单 flyout「清空最近记录」
+//! 承担；flyout 在 `crates/shell/src/app/menu.rs` 的 `recent_clear_item`。）
+//! Ctrl+P 命令面板同款 Acrylic 居中大卡片（600px 宽、窗口 2/3 高、带滚动
+//! 条与弹簧淡入），横居中出现于窗口中间。**默认模式即全量 [`RecentMode::All`]**：
+//! 打开即显示全部历史 + 搜索框；搜索框按「名称 / 父路径」大小写不敏感子串即时过滤
+//! （不重排、保持 MRU 序）；点击 / 回车打开；保留失效路径移除 + 状态栏提示、键盘 ↑↓
+//! （搜索框聚焦时在候选间移动高亮，抄 `ui::palette::CommandPalette` 姿势）/
+//! Enter / Esc、外点关闭。
 //!
-//! # Dormancy：已被 shell 的 flyout 悬浮次级菜单取代
-//! shell 文件菜单「打开最近…」现走 `ui::menu` 的 flyout 语义（悬停展开到右侧），
-//! 本面板保留源码 + 既有测试作 dormancy 回归（K24）：shell 的
-//! `EditorApp::open_recent_panel` 仍可直连打开面板实体、recent.rs 的相关用例保持绿色；
-//! 不参与「打开最近」的生产路径。
+//! # Dormancy：Regions 四区域（≤10 + More / 返回 + Clear）已被「文件菜单『更多...』入口」取代
+//! shell 文件菜单「打开最近…」现走 `ui::menu` 的 flyout 语义（悬停展开到右侧）；本面板
+//! 是「打开最近…」flyout 新增「更多...」入口（另一批接线）打开的搜索大面板。旧四区域
+//! 形态（[`RecentMode::Regions`] 分支 / More / 返回 / Clear 行逻辑）**保留源码 + 既有
+//! 测试作 dormancy 回归（K24）**，不再作为可见形态；shell 的 `EditorApp::open_recent_panel`
+//! 仍可直连打开面板实体。
 //!
 //! # 结构与隔离子 crate 的原因
 //! 本组件是**独立实体**（`mode` / 选中 / 最近列表快照自持），由宿主
@@ -36,13 +43,15 @@
 use std::path::PathBuf;
 
 use gpui::{
-    AnimationExt, App, Context, DismissEvent, ElementId, EventEmitter, FocusHandle, Focusable,
-    Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
-    ScrollHandle, SharedString, Styled as _, WeakEntity, Window, div, px,
+    AnimationExt, App, AppContext, Context, DismissEvent, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement as _, Render, ScrollHandle, SharedString, Styled as _, Subscription, WeakEntity,
+    Window, div, px,
 };
 use ui::ListItemRow;
 use ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
 use ui::icon::{Icon, IconName};
+use ui::input::{Input, InputEvent, InputState};
 use ui::motion::hover_spring;
 use ui::scroll_panel::ScrollPanelBuilder;
 
@@ -70,7 +79,7 @@ pub trait RecentPanelHost: 'static {
     fn remove_recent_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>)
     where
         Self: Sized;
-    /// 清空最近文件夹 / 文件两类列表并落盘 + notify（面板「Clear Recently Opened...」行）。
+    /// 清空最近文件夹 / 文件两类列表并落盘 + notify（文件菜单 flyout「清空最近记录」项）。
     fn clear_recents(&mut self, cx: &mut Context<Self>)
     where
         Self: Sized;
@@ -93,11 +102,21 @@ enum Line {
     Empty { text: &'static str, debug: &'static str },
     /// 文件夹 / 文件行。
     Item { is_folder: bool, path: String, name: String, debug: String },
+    /// 分组头「最近文件夹」「最近文件」（含条数；不可导航）。
+    Header { is_folder: bool, count: usize },
     /// 「More...」：切到完整列表模式（不关闭面板）。
     More,
     /// 「返回」：完整列表切回四区域（不关闭面板）。
+    ///
+    /// Dormancy：默认模式已为全量（`RecentMode::All`）且全量形态不再渲染返回行，
+    /// 本变体保留源码（`activate_line` 的 More/返回 分支仍接好）作回归，不再被构造。
+    #[allow(dead_code)]
     Back,
     /// 「Clear Recently Opened...」：清两类 + 落盘 + 关闭面板。
+    ///
+    /// Dormancy：全量（All）面板可见行已不含清空行（2026-11-17 用户要求：面板内
+    /// 清空功能多余，已由文件菜单 flyout「清空最近记录」承担）；本变体仍被
+    /// [`Self::build_regions_lines`]（dormancy 回归形态）引用，故保留源码与激活分支。
     Clear,
 }
 
@@ -113,6 +132,13 @@ impl Line {
             Line::Divider { debug } => debug,
             Line::Empty { debug, .. } => debug,
             Line::Item { debug, .. } => debug,
+            Line::Header { is_folder, .. } => {
+                if *is_folder {
+                    "recent-folder-header"
+                } else {
+                    "recent-file-header"
+                }
+            }
             Line::More => "recent-more",
             Line::Back => "recent-back",
             Line::Clear => "recent-clear",
@@ -139,11 +165,55 @@ pub struct RecentPanel<H: RecentPanelHost> {
     selected: Option<usize>,
     /// 可导航行下标（每帧渲染重建，键盘 ↑↓ 用它移动/环绕）。
     navigable: Vec<usize>,
+    /// 顶部搜索框实体（`ui::input::InputState`；懒初始化于首次 render，见
+    /// [`RecentPanel::ensure_input`]——`RecentPanel::new` 无 `&mut Window` 参数，
+    /// 而 `InputState::new` 需 window）。
+    input: Option<Entity<InputState>>,
+    /// 搜索框事件订阅（Change → 重算过滤；Submit → 打开高亮 / 首个候选；Cancel → 关闭）。
+    _input_sub: Option<Subscription>,
+    /// 最近一次搜索词（输入框文本镜像，`build_lines` 按其过滤；Change 时更新）。
+    query: String,
 }
 
 /// 面板常规行高（与 PopupMenu 项同款 26px；四区域默认视图在窗口 2/3 高内容区内
 /// 容纳 More/Clear，无需滚动即可点）。
 const ITEM_H: f32 = 26.;
+
+/// 搜索命中谓词（R4）：`query` 为空 → 全命中；否则对「名称（basename）+ 父路径
+/// （完整路径）」做**大小写不敏感子串**匹配（中英文均可）。命中**不重排**、保持 MRU
+/// 相对顺序。与 `ui::palette::fuzzy_score` 的「名称优先、路径也能命中、大小写不敏感」
+/// 语义同源，但本处按 R4 定为子串匹配（不做前缀 / 子序列打分）。
+fn matches_query(query: &str, path: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name.contains(q.as_str()) || path.to_lowercase().contains(q.as_str())
+}
+
+/// 按 `query` 过滤并分组（保留 MRU 相对顺序）：返回 (可见文件夹, 可见文件)。
+/// 供 [`RecentPanel::build_all_lines`] 与纯函数单测共用（R8：过滤 / 分组计算）。
+fn filtered_groups<'a>(
+    folders: &'a [String],
+    files: &'a [String],
+    query: &str,
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let visible_folders: Vec<&str> = folders
+        .iter()
+        .map(String::as_str)
+        .filter(|p| matches_query(query, p))
+        .collect();
+    let visible_files: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|p| matches_query(query, p))
+        .collect();
+    (visible_folders, visible_files)
+}
 
 impl<H: RecentPanelHost> RecentPanel<H> {
     /// 宿主打开时创建：最近列表快照 + 打开前的焦点句柄 + 宿主弱引用。
@@ -155,7 +225,9 @@ impl<H: RecentPanelHost> RecentPanel<H> {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            mode: RecentMode::Regions,
+            // 默认模式 = 全量（R2）：打开即显示全部历史 + 搜索框；Regions 四区域 /
+            // More 返回只保留 dormancy（不再作为可见形态）。
+            mode: RecentMode::All,
             folders,
             files,
             previous_focus,
@@ -164,19 +236,55 @@ impl<H: RecentPanelHost> RecentPanel<H> {
             host,
             selected: None,
             navigable: Vec::new(),
+            input: None,
+            _input_sub: None,
+            query: String::new(),
         }
     }
 
-    /// 行装配：区域行（文件夹 ≤10/全量、文件 ≤10/全量）+ More/返回/Clear，区域间以
-    /// 分割线隔开（不设文字区域头——四区域靠分割线 + 行图标区分）。空区显示「暂无」。
+    /// 行装配：默认（All）= 搜索过滤 + 两组分组（无底部清空，2026-11-17 移除至 flyout）；Regions
+    /// （dormancy）保留旧四区域形态（见 [`Self::build_regions_lines`]）。
     fn build_lines(&self) -> Vec<Line> {
-        let mut lines = Vec::new();
-        let all = self.mode == RecentMode::All;
-        if all {
-            lines.push(Line::Back);
+        if self.mode == RecentMode::All {
+            self.build_all_lines()
+        } else {
+            self.build_regions_lines()
         }
-        // 区域 1：最近打开的文件夹（图标 Folder）
-        let folder_count = if all { self.folders.len() } else { self.folders.len().min(10) };
+    }
+
+    /// 全量 + 搜索分组形态：按 `query` 过滤后组装「最近文件夹」「最近文件」两组
+    /// （组头含条数、组内保 MRU 序不重排、0 命中组整体隐藏）；两组全 0（含搜索后
+    /// 全 0 命中）→ 单一空态「暂无」。不再含清空行（2026-11-17 用户要求：面板内
+    /// 「清空最近记录」行多余，交回文件菜单 flyout）。
+    fn build_all_lines(&self) -> Vec<Line> {
+        let mut lines = Vec::new();
+        let (visible_folders, visible_files) = filtered_groups(&self.folders, &self.files, &self.query);
+        if visible_folders.is_empty() && visible_files.is_empty() {
+            lines.push(Line::Empty { text: "暂无", debug: "recent-file-empty" });
+        } else {
+            if !visible_folders.is_empty() {
+                lines.push(Line::Header { is_folder: true, count: visible_folders.len() });
+                for (i, p) in visible_folders.iter().enumerate() {
+                    lines.push(Self::item_line(true, p, i));
+                }
+            }
+            if !visible_files.is_empty() {
+                lines.push(Line::Header { is_folder: false, count: visible_files.len() });
+                for (i, p) in visible_files.iter().enumerate() {
+                    lines.push(Self::item_line(false, p, i));
+                }
+            }
+        }
+        lines
+    }
+
+    /// Dormancy：旧「四区域」形态（文件夹 ≤10 → 分割线 → 文件 ≤10 → 分割线 →
+    /// More → 分割线 → Clear；空区「暂无」）。已被文件菜单「更多...」入口取代，
+    /// 默认模式恒为 All，本分支不再可见（保留源码 + 旧测试作 dormancy 回归，K24）。
+    fn build_regions_lines(&self) -> Vec<Line> {
+        let mut lines = Vec::new();
+        // 区域 1：最近打开的文件夹（图标 Folder，≤10）
+        let folder_count = self.folders.len().min(10);
         if folder_count == 0 {
             lines.push(Line::Empty { text: "暂无", debug: "recent-folder-empty" });
         } else {
@@ -185,8 +293,8 @@ impl<H: RecentPanelHost> RecentPanel<H> {
             }
         }
         lines.push(Line::Divider { debug: "recent-divider-1" });
-        // 区域 2：最近打开的文件（图标 File）
-        let file_count = if all { self.files.len() } else { self.files.len().min(10) };
+        // 区域 2：最近打开的文件（图标 File，≤10）
+        let file_count = self.files.len().min(10);
         if file_count == 0 {
             lines.push(Line::Empty { text: "暂无", debug: "recent-file-empty" });
         } else {
@@ -194,13 +302,11 @@ impl<H: RecentPanelHost> RecentPanel<H> {
                 lines.push(Self::item_line(false, &self.files[i], i));
             }
         }
-        // 区域 3 / 4（仅四区域）：More 与 Clear，均以分割线与上方隔开
-        if !all {
-            lines.push(Line::Divider { debug: "recent-divider-2" });
-            lines.push(Line::More);
-            lines.push(Line::Divider { debug: "recent-divider-3" });
-            lines.push(Line::Clear);
-        }
+        // 区域 3 / 4：More 与 Clear，均以分割线与上方隔开
+        lines.push(Line::Divider { debug: "recent-divider-2" });
+        lines.push(Line::More);
+        lines.push(Line::Divider { debug: "recent-divider-3" });
+        lines.push(Line::Clear);
         lines
     }
 
@@ -217,6 +323,59 @@ impl<H: RecentPanelHost> RecentPanel<H> {
             name,
             debug: format!("{prefix}{idx}"),
         }
+    }
+
+    /// 懒创建顶部搜索框实体 + 订阅事件（首次 render 调用）：
+    /// `RecentPanel::new` 无 `&mut Window` 参数，而 `InputState::new` 需 window → 移到
+    /// 首次 render（有 window）再建。Change → 更新 `query` + 复位选中（Enter 无高亮时
+    /// 走「第一个候选」）；Submit → 打开选中 / 无选中则打开第一个候选；Cancel → 关闭
+    /// 面板。订阅姿势（输入框聚焦时 ↑↓ 移动高亮 / Enter 接受 / Esc 关闭）与
+    /// `ui::palette::CommandPalette::new` 完全一致。
+    fn ensure_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input.is_some() {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索历史…"));
+        let input_entity = input.clone();
+        let weak_self = cx.weak_entity();
+        let sub = window.subscribe(&input, cx, move |_, ev: &InputEvent, window, cx| {
+            let Some(this) = weak_self.upgrade() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| match ev {
+                InputEvent::Change => {
+                    this.query = input_entity.read(cx).value().to_string();
+                    this.selected = None;
+                    cx.notify();
+                }
+                InputEvent::Submit { .. } => {
+                    if let Some(idx) = this.selected {
+                        this.activate_line(idx, window, cx);
+                    } else if let Some(idx) = this.first_candidate() {
+                        this.activate_line(idx, window, cx);
+                    }
+                }
+                InputEvent::Cancel => this.dismiss(window, cx),
+            });
+        });
+        self.input = Some(input);
+        self._input_sub = Some(sub);
+        // 一次性把焦点拨给顶部搜索框（对齐 palette 姿势：宿主 `open_palette` 打开时直接
+        // `window.focus(&input_handle)`，见 shell/app/palette.rs；本面板宿主
+        // `open_recent_panel` 只聚焦面板根 `focus_handle`（menu.rs:780-781），故在首次
+        // 创建搜索框后补一次 focus）。**只此一次**：之后不再逐帧拉回——旧逐帧
+        // `sync_search_focus` 会在「mousedown 落行 → 面板根 `track_focus` 抢走输入框焦点
+        //（gpui div.rs：可聚焦元素 mousedown bubble 自动转移焦点；本面板根挂
+        // `.track_focus(&self.focus_handle)`) → 当帧 render 又把焦点拨回输入框」的路径上
+        // 反复抢焦点（搜索框闪烁一瞬再打开）；palette 无此逐帧循环故不闪。经
+        // `window.defer` 推迟到本帧 effect 末尾再 focus，避免渲染中途改焦点。
+        let handle = self.input.as_ref().expect("搜索框已创建").read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| handle.focus(window, cx));
+    }
+
+    /// 第一个可导航候选行下标（Enter 无高亮时打开它；0 命中 → None）。
+    fn first_candidate(&self) -> Option<usize> {
+        self.build_lines().iter().position(|l| l.is_navigable())
     }
 
     /// 键盘 ↑↓ 在可导航行内移动（环绕）。
@@ -297,11 +456,17 @@ impl<H: RecentPanelHost> RecentPanel<H> {
     }
 
     /// 焦点是否已离开面板（动作 —— 如打开文件聚焦新编辑器 —— 已带走焦点）。
+    /// 面板根与顶部搜索框任一持焦都算「焦点仍在面板内」（对齐 palette 的
+    /// `focus_left`：两 handle 都检查，打开时焦点落在搜索框上）。
     fn focus_left(&self, window: &Window, cx: &App) -> bool {
         let Some(f) = window.focused(cx) else {
             return false;
         };
-        f != self.focus_handle
+        let input_focused = self
+            .input
+            .as_ref()
+            .is_some_and(|i| i.read(cx).focus_handle(cx) == f);
+        !(f == self.focus_handle || input_focused)
     }
 
     /// 关闭面板（择项 / Esc / 点击外）：发 `DismissEvent` → 宿主清引用释放实体；
@@ -411,6 +576,27 @@ impl<H: RecentPanelHost> RecentPanel<H> {
                     .child(t)
                     .into_any_element()
             }
+            Line::Header { is_folder, count } => {
+                let title = if *is_folder {
+                    format!("最近文件夹 ({count})")
+                } else {
+                    format!("最近文件 ({count})")
+                };
+                div()
+                    .id(ElementId::from(format!("recent-line-{index}")))
+                    .debug_selector(move || debug.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .mx_1()
+                    .min_h(px(ITEM_H))
+                    .rounded_md()
+                    .text_size(px(11.))
+                    .text_color(fg_muted)
+                    .child(title)
+                    .into_any_element()
+            }
             Line::Item { is_folder, path, name, .. } => {
                 let is_folder = *is_folder;
                 let icon = if is_folder { IconName::Folder } else { IconName::File };
@@ -509,7 +695,7 @@ impl<H: RecentPanelHost> RecentPanel<H> {
     }
 
     // -- 测试可见性 --
-    // `pub`：shell 的 `app::tests` 跨 crate 断言用（mode 切换 / 滚动句柄）。
+    // `pub`：shell 的 `app::tests` 跨 crate 断言用（mode 切换 / 滚动句柄 / 搜索框驱动）。
 
     pub fn mode(&self) -> RecentMode {
         self.mode
@@ -517,6 +703,19 @@ impl<H: RecentPanelHost> RecentPanel<H> {
 
     pub fn scroll_handle(&self) -> ScrollHandle {
         self.scroll_handle.clone()
+    }
+
+    /// 顶部搜索框实体（测试驱动过滤：`set_value` 发 `Change` → 面板重算；对齐
+    /// `ui::palette::CommandPalette::input_entity`）。
+    #[allow(dead_code)] // 测试驱动入口（shell app::tests 用）
+    pub fn input_entity(&self) -> Option<Entity<InputState>> {
+        self.input.clone()
+    }
+
+    /// 当前搜索词（测试断言过滤状态用）。
+    #[allow(dead_code)] // 测试断言用（shell app::tests）
+    pub fn query(&self) -> &str {
+        &self.query
     }
 }
 
@@ -535,6 +734,11 @@ impl<H: RecentPanelHost> Render for RecentPanel<H> {
         // 包裹（非 flex absolute）居中 + `with_spring` 弹簧淡入 + 键盘/点外关闭。
         let theme = ui::theme::Theme::global(cx);
         let (colors, is_dark) = (theme.colors, theme.is_dark());
+
+        // 懒建顶部搜索框 + 订阅（首次 render；创建后一次性把焦点拨给搜索框——palette 姿势，
+        // 见 `ensure_input` 尾部注释。无逐帧焦点同步：避免 mousedown 落行被面板根抢焦点后
+        // 又被拉回搜索框的闪烁路径）。
+        self.ensure_input(window, cx);
 
         // 面板高度 = 窗口 2/3：完整列表（≤50+50 行）超高时列表区内部滚动。
         let panel_h = window.bounds().size.height.as_f32() * (2.0 / 3.0);
@@ -564,7 +768,27 @@ impl<H: RecentPanelHost> Render for RecentPanel<H> {
             .map(|(i, line)| self.render_line(i, line, selected == Some(i), cx))
             .collect();
 
-        // 顶部不设「打开最近」标题（反馈：不用文字标题标识四区域，直接列表 + 分割线）。
+        // 顶部搜索框：聚焦时边框点亮为主题 focus_ring（对齐 palette 的 query_box 做法，`#recent-search-input`）。
+        let input_handle = self.input.as_ref().map(|i| i.read(cx).focus_handle(cx));
+        let input_border: Hsla = match &input_handle {
+            Some(h) => ui::focus_border_color(window, h, colors.border.into(), cx),
+            None => colors.border.into(),
+        };
+        let query_box = div()
+            .id("recent-search-input")
+            .debug_selector(|| "recent-search-input".into())
+            .px_3()
+            .py_2()
+            .mx_3()
+            .mt_2()
+            .mb_1()
+            .rounded_md()
+            .border_1()
+            .border_color(input_border)
+            .child(Input::new(
+                self.input.as_ref().expect("搜索框已在 ensure_input 懒建"),
+            ));
+
         let panel = ui::float_card(
             &colors,
             is_dark,
@@ -588,6 +812,7 @@ impl<H: RecentPanelHost> Render for RecentPanel<H> {
                 hover_spring(1.0).from(0.0),
                 |this, v| this.opacity(v),
             )
+            .child(query_box)
             .child(
                 ScrollPanelBuilder::new("recent-panel-scroll", scroll_handle)
                     .wrap_id("recent-panel-list")
@@ -603,5 +828,173 @@ impl<H: RecentPanelHost> Render for RecentPanel<H> {
         //    继续命中下层编辑器/仍展开的文件菜单的 hitbox。
         let win_w = window.bounds().size.width.as_f32();
         ui::float_card::overlay_centered(panel.into_any_element(), win_w, 600., 96., 210)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Modifiers, MouseButton, TestAppContext};
+    use std::{cell::{Cell, RefCell}, rc::Rc};
+
+    /// 过滤谓词（R4）：大小写不敏感子串（含名称与父路径命中）、空串 / 纯空白 = 全量、
+    /// 中英文均可、不命中剔除。
+    #[test]
+    fn matches_query_rules() {
+        // 名称命中（子串、大小写不敏感）
+        assert!(matches_query("read", r"C:\Docs\readme.md"));
+        assert!(matches_query("README", r"C:\Docs\readme.md"));
+        // 父路径命中（大小写不敏感子串）
+        assert!(matches_query("docs", r"C:\Docs\readme.md"));
+        assert!(matches_query("c:\\docs", r"C:\Docs\readme.md"));
+        // 中文命中（名称 / 父路径）
+        assert!(matches_query("说明", r"C:\Docs\项目说明.md"));
+        assert!(matches_query("项目", r"C:\Docs\项目说明.md"));
+        // 空串 / 纯空白 → 全命中
+        assert!(matches_query("", r"C:\anything.txt"));
+        assert!(matches_query("   ", r"C:\anything.txt"));
+        // 不命中
+        assert!(!matches_query("nope", r"C:\Docs\readme.md"));
+        assert!(!matches_query("readme.md2", r"C:\Docs\readme.md"));
+    }
+
+    /// 分组计算（R4/R3）：空串 → 全量两组保 MRU 序；搜索 → 0 命中组整体隐藏；
+    /// 路径子串命中保序；大小写不敏感。
+    #[test]
+    fn filtered_groups_preserve_order_and_hide_miss_groups() {
+        let folders = vec!["C:\\a\\dirA".to_string(), "C:\\b\\dirB".to_string()];
+        let files = vec![
+            "C:\\x\\alpha.txt".to_string(),
+            "C:\\y\\beta.md".to_string(),
+        ];
+        let (fs, fls) = filtered_groups(&folders, &files, "");
+        assert_eq!(fs, vec!["C:\\a\\dirA", "C:\\b\\dirB"], "全量文件夹保 MRU 序");
+        assert_eq!(fls, vec!["C:\\x\\alpha.txt", "C:\\y\\beta.md"], "全量文件保 MRU 序");
+
+        // 仅文件组命中 → 文件夹组空（R4：0 命中组隐藏）
+        let (fs, fls) = filtered_groups(&folders, &files, "beta");
+        assert!(fs.is_empty(), "0 命中文件夹组应隐藏");
+        assert_eq!(fls, vec!["C:\\y\\beta.md"]);
+
+        // 名称子串命中、命中组内保相对序
+        let (fs, fls) = filtered_groups(&folders, &files, "dir");
+        assert_eq!(fs, vec!["C:\\a\\dirA", "C:\\b\\dirB"], "组内保 MRU 相对顺序");
+        assert!(fls.is_empty());
+
+        // 路径（父路径）子串命中
+        let (fs, _) = filtered_groups(&folders, &files, "dirb");
+        assert_eq!(fs, vec!["C:\\b\\dirB"], "父路径子串命中");
+
+        // 大小写不敏感
+        let (fs, _) = filtered_groups(&folders, &files, "DIRA");
+        assert_eq!(fs, vec!["C:\\a\\dirA"]);
+    }
+
+    // ------------------------------------------------------------------
+    // 行为级回归：mousedown 落行「搜索框闪烁」（宿主 open_recent_panel 只聚焦面板根，
+    // 旧逐帧 sync_search_focus 在 mousedown 抢焦点路径上把焦点拨回输入框）。
+    // 期望值推导（K177）：mousedown 落可聚焦元素 → gpui div.rs 的 track_focus mousedown
+    // bubble handler 自动把焦点转移到该元素（面板根）→ 输入框失焦；旧实现当帧 render 的
+    // sync_search_focus 又 defer 拨回输入框 = 闪烁。修复后只在打开时一次性聚焦搜索框，
+    // 此后不再拉回 → mousedown 落行期间输入框应保持「未聚焦」。
+    // ------------------------------------------------------------------
+
+    /// 行为级测试宿主（mirror shell 里 `impl RecentPanelHost` 最小面）：记录打开调用 +
+    /// DismissEvent 订阅计数（面板「关闭」= close 发 DismissEvent，实体由窗口根持有不释放）。
+    #[derive(Default)]
+    struct TestHost {
+        opened: Rc<RefCell<Vec<String>>>,
+        dismissed: Rc<Cell<bool>>,
+    }
+
+    impl RecentPanelHost for TestHost {
+        fn open_folder_path(
+            &mut self,
+            path: PathBuf,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+            self.opened.borrow_mut().push(format!("d:{}", path.display()));
+        }
+
+        fn remove_recent_folder(&mut self, _path: &str, _w: &mut Window, _c: &mut Context<Self>) {}
+
+        fn open_file(&mut self, path: &str, _window: &mut Window, _cx: &mut Context<Self>) {
+            self.opened.borrow_mut().push(format!("f:{path}"));
+        }
+
+        fn remove_recent_file(&mut self, _path: &str, _w: &mut Window, _c: &mut Context<Self>) {}
+
+        fn clear_recents(&mut self, _cx: &mut Context<Self>) {}
+    }
+
+    /// 泵一帧：draw + flush 所有 effect（defer 落点 / 弹簧 / 焦点变化）。
+    fn pump_frame(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+    }
+
+    /// R1 复现路径行为测试：面板开→搜索框聚焦→mousedown 落文件行→泵帧，「输入框不再
+    /// 被重新聚焦」；mouseup → 打开文件 + 关闭（DismissEvent）。
+    #[gpui::test]
+    fn mousedown_on_row_does_not_refocus_search_input(cx: &mut TestAppContext) {
+        // 真实文件：run_item 的 `is_file()` 分支命中（打开成功才记录）。
+        let f = std::env::temp_dir().join(format!("recent-panel-flicker-{}.txt", std::process::id()));
+        std::fs::write(&f, "data").unwrap();
+        let fs = f.to_string_lossy().into_owned();
+
+        let host = cx.new(|_| TestHost::default());
+        let fs_for_panel = fs.clone();
+        let (panel, cx) = cx.add_window_view({
+            let host = host.clone();
+            move |_window, cx| {
+                RecentPanel::new(host.downgrade(), Vec::new(), vec![fs_for_panel], None, cx)
+            }
+        });
+        // 订阅 DismissEvent（关闭信号）；Subscription 存 `_sub` 保持存活到测试结束。
+        let _sub = cx.update(|_window, cx| {
+            host.update(cx, |_, cx| {
+                cx.subscribe(&panel, move |h, _entity, _: &DismissEvent, _| {
+                    h.dismissed.set(true)
+                })
+            })
+        });
+
+        // R2 保留：打开后搜索框应自动持焦（面板创建后的首次 render 懒建搜索框 + 一次性
+        // 聚焦；与 palette 宿主直接聚焦 input_handle 同源）。泵一帧让 defer 落点。
+        pump_frame(cx);
+        let focused_on_open = cx.update(|window, cx| {
+            let input = panel.read(cx).input_entity().expect("搜索框应已懒建");
+            input.read(cx).focus_handle(cx).is_focused(window)
+        });
+        assert!(focused_on_open, "打开面板后搜索框应自动持焦（R2）");
+
+        // R1：mousedown 落行 → 泵帧 → 输入框**不再**被重新聚焦（旧逐帧 sync_search_focus
+        // 会在此 defer 拨回 = 闪烁路径；修复后一次性聚焦已消费，不再拉回）。
+        let row = cx
+            .debug_bounds("recent-file-row-0")
+            .expect("文件行应渲染")
+            .center();
+        cx.simulate_mouse_down(row, MouseButton::Left, Modifiers::default());
+        pump_frame(cx);
+        let focused_after_mdown = cx.update(|window, cx| {
+            let input = panel.read(cx).input_entity().expect("搜索框应在场");
+            input.read(cx).focus_handle(cx).is_focused(window)
+        });
+        assert!(
+            !focused_after_mdown,
+            "mousedown 落行期间输入框不应被重新聚焦（闪烁路径已除）"
+        );
+
+        // mouseup → on_activate → activate_line → run_item 打开文件 + close（DismissEvent）。
+        cx.simulate_mouse_up(row, MouseButton::Left, Modifiers::default());
+        pump_frame(cx);
+        let (opened, dismissed) = cx.update(|_w, cx| {
+            (host.read(cx).opened.borrow().clone(), host.read(cx).dismissed.get())
+        });
+        assert_eq!(opened, vec![format!("f:{fs}")], "mouseup 应打开文件行");
+        assert!(dismissed, "打开后面板应关闭（DismissEvent 发出）");
+
+        let _ = std::fs::remove_file(&f);
     }
 }

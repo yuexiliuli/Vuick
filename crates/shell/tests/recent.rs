@@ -167,6 +167,17 @@ use common::*;
         pump_panel(cx);
     }
 
+    /// 经面板驱动入口写入搜索词（`input_entity().set_value` → Change → 面板重算过滤 +
+    /// 复位选中；对齐 palette 测试姿势）。写完泵帧让过滤落位。
+    fn type_recent_query(app: &Entity<EditorApp>, cx: &mut VisualTestContext, query: &str) {
+        cx.update(|window, cx| {
+            let panel = app.read(cx).recent_panel.as_ref().cloned().expect("面板应在场");
+            let input = panel.read(cx).input_entity().expect("搜索框应已懒建");
+            input.update(cx, |s, cx| s.set_value(query, window, cx));
+        });
+        pump_panel(cx);
+    }
+
     /// 「打开最近」面板是**居中大面板**实体（反馈 2）：面板实体就位、根「recent-panel」
     /// 渲染、列表滚动容器存在（Ctrl+P 同款外壳）。
     #[gpui::test]
@@ -204,16 +215,18 @@ use common::*;
         assert!(cx.debug_bounds("recent-panel-scroll").is_some(), "应有滚动容器");
     }
 
-    /// 「打开最近」面板四区域渲染：区域头 + 各 ≤10 行 / 空态「暂无」+ More + Clear。
+    /// 「打开最近」面板新形态（All 模式）：顶部搜索框 + 「最近文件夹」「最近文件」两组
+    /// （组头含条数）+ 无清空行（2026-11-17 面板内清空行移除，flyout 保留「清空最近记录」）；
+    /// 全量展示（不截断到 10）、无 More/Back 行。
     #[gpui::test]
-    async fn recent_panel_renders_four_regions(cx: &mut TestAppContext) {
+    async fn recent_panel_renders_search_and_two_groups(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        // 预置最近记录：12 个文件夹（四区域只展示前 10）+ 2 个文件。
+        // 预置最近记录：12 个文件夹（全量展示，不受旧 ≤10 上限）+ 2 个文件。
         let folders: Vec<String> = (0..12)
             .map(|i| std::env::temp_dir().join(format!("recent-rf{i}")).to_string_lossy().into_owned())
             .collect();
@@ -227,22 +240,22 @@ use common::*;
             });
         });
         open_panel(&app, cx);
-        assert!(cx.debug_bounds("recent-divider-1").is_some(), "文件夹区与文件区之间应有分割线");
-        assert!(cx.debug_bounds("recent-divider-2").is_some(), "文件区与 More 之间应有分割线");
-        assert!(cx.debug_bounds("recent-divider-3").is_some(), "More 与 Clear 之间应有分割线");
+        // 搜索框 + 两组（组头 + 全部行）；无清空 / More/Back。
+        assert!(cx.debug_bounds("recent-search-input").is_some(), "应有顶部搜索框");
+        assert!(cx.debug_bounds("recent-folder-header").is_some(), "应有文件夹组头");
+        assert!(cx.debug_bounds("recent-file-header").is_some(), "应有文件组头");
         assert!(cx.debug_bounds("recent-folder-row-0").is_some(), "文件夹首行应渲染");
-        assert!(cx.debug_bounds("recent-folder-row-9").is_some(), "文件夹第 10 行应渲染");
-        assert!(cx.debug_bounds("recent-folder-row-10").is_none(), "四区域最多展示 10 条文件夹");
+        assert!(cx.debug_bounds("recent-folder-row-11").is_some(), "全量展示第 12 条文件夹（不截断）");
         assert!(cx.debug_bounds("recent-file-row-0").is_some(), "文件首行应渲染");
         assert!(cx.debug_bounds("recent-file-row-1").is_some(), "文件第 2 行应渲染");
-        assert!(cx.debug_bounds("recent-more").is_some(), "More 行应渲染");
-        assert!(cx.debug_bounds("recent-clear").is_some(), "Clear 行应渲染");
+        assert!(cx.debug_bounds("recent-clear").is_none(), "面板内不再有清空行（移至文件菜单 flyout）");
+        assert!(cx.debug_bounds("recent-more").is_none(), "全量形态无 More 行");
+        assert!(cx.debug_bounds("recent-back").is_none(), "全量形态无返回行");
         assert!(cx.debug_bounds("recent-folder-empty").is_none(), "文件夹非空不显示暂无");
         assert!(cx.debug_bounds("recent-file-empty").is_none(), "文件非空不显示暂无");
-        assert!(cx.debug_bounds("recent-back").is_none(), "四区域无返回行");
     }
 
-    /// 空类别 → 无文字区域头、保留分割线 + 各行「暂无」灰字（Clear/More 仍显示）。
+    /// 全空 → 单一空态「暂无」（`recent-file-empty`）+ 搜索框；无清空行/行/组头/More。
     #[gpui::test]
     async fn recent_panel_empty_sections_show_none(cx: &mut TestAppContext) {
         init_test(cx);
@@ -259,13 +272,15 @@ use common::*;
             });
         });
         open_panel(&app, cx);
-        assert!(cx.debug_bounds("recent-folder-empty").is_some(), "空文件夹区显示「暂无」");
-        assert!(cx.debug_bounds("recent-file-empty").is_some(), "空文件区显示「暂无」");
-        assert!(cx.debug_bounds("recent-divider-1").is_some(), "空分区之间仍有分割线");
-        assert!(cx.debug_bounds("recent-divider-2").is_some(), "空文件区与 More 之间仍有分割线");
-        assert!(cx.debug_bounds("recent-divider-3").is_some(), "More 与 Clear 之间仍有分割线");
-        assert!(cx.debug_bounds("recent-more").is_some(), "空列表下 More 行仍显示");
-        assert!(cx.debug_bounds("recent-clear").is_some(), "空列表下 Clear 行仍显示");
+        assert!(cx.debug_bounds("recent-search-input").is_some(), "空态下搜索框仍渲染");
+        assert!(cx.debug_bounds("recent-file-empty").is_some(), "全空显示单一空态「暂无」");
+        assert!(cx.debug_bounds("recent-clear").is_none(), "面板内不再有清空行（移至文件菜单 flyout）");
+        assert!(cx.debug_bounds("recent-folder-header").is_none(), "全空无文件夹组头");
+        assert!(cx.debug_bounds("recent-file-header").is_none(), "全空无文件组头");
+        assert!(cx.debug_bounds("recent-folder-row-0").is_none(), "全空无文件夹行");
+        assert!(cx.debug_bounds("recent-file-row-0").is_none(), "全空无文件行");
+        assert!(cx.debug_bounds("recent-more").is_none(), "全空无 More 行");
+        assert!(cx.debug_bounds("recent-back").is_none(), "全空无返回行");
     }
 
     /// 点文件行（有效）→ `open_file` 建 tab + 面板关闭 + 记录去重置顶。
@@ -406,7 +421,8 @@ use common::*;
         let _ = std::fs::remove_file(&f);
     }
 
-    /// 键盘：面板聚焦后 ↓ 选中文件首行 → Enter 打开文件（↑↓ 在可导航行内移动）。
+    /// 键盘（新面板姿态）：面板打开 → 焦点落顶部搜索框；↓ 把高亮移到首个可导航行
+    /// （文件行）；Enter（搜索框 Submit）→ 打开选中的文件行 + 面板关闭。
     #[gpui::test]
     async fn keyboard_selects_and_enter_opens_file(cx: &mut TestAppContext) {
         init_test(cx);
@@ -423,19 +439,18 @@ use common::*;
             app.update(cx, |app, _| app.model.borrow_mut().recent_files = vec![s.clone()]);
         });
         open_panel(&app, cx);
-        // 面板打开即聚焦自身 → ↓ 选中第一个可导航行（文件行）→ Enter 执行。
-        let panel_handle = cx.update(|_w, cx| {
-            app.read(cx)
-                .recent_panel
-                .as_ref()
-                .unwrap()
-                .read(cx)
-                .focus_handle(cx)
+        // 焦点先落搜索框（面板根获焦 → `sync_search_focus` 拨给输入框）。
+        let (focused, input_handle) = cx.update(|window, cx| {
+            let panel = app.read(cx).recent_panel.as_ref().unwrap();
+            let input = panel.read(cx).input_entity().expect("搜索框应已懒建");
+            (window.focused(cx), input.read(cx).focus_handle(cx))
         });
-        assert!(
-            cx.update(|window, cx| window.focused(cx).as_ref() == Some(&panel_handle)),
-            "打开后焦点应落在面板 focus_handle"
+        assert_eq!(
+            focused.as_ref(),
+            Some(&input_handle),
+            "打开后焦点应落在搜索框"
         );
+        // ↓ → 选中首个可导航行（文件行）→ Enter 打开。
         cx.simulate_keystrokes("down");
         cx.simulate_keystrokes("enter");
         for _ in 0..5 {
@@ -447,6 +462,119 @@ use common::*;
         });
         assert_eq!(tabs, tabs_before + 1, "↓+Enter 应打开选中的文件行");
         assert!(!panel, "Enter 后面板应关闭");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 搜索过滤（面板驱动入口 `input_entity().set_value` → Change → 即时重算）：按
+    /// 「名称/父路径」大小写不敏感子串过滤、0 命中组整体隐藏、命中组内保 MRU 相对序
+    /// （不重排）；清空输入 → 恢复全量两组。
+    #[gpui::test]
+    async fn recent_panel_search_filters_groups(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let base = std::env::temp_dir();
+        // 文件夹：f0/f1 共享父路径含 "AlphaDir"；f2 名称含 "ProjectAlpha"。
+        let f0 = base.join("AlphaDir").join("ProjectAlpha").to_string_lossy().into_owned();
+        let f1 = base.join("AlphaDir").join("ProjectBeta").to_string_lossy().into_owned();
+        let f2 = base.join("OmegaDir").join("ProjectAlpha").to_string_lossy().into_owned();
+        let folders = vec![f0, f1, f2];
+        // 文件：l0/l1 名称含 "report"（大小写不一）；l2 名称含 "alpha"（不含 "report"）。
+        let l0 = base.join("Docs").join("Report.txt").to_string_lossy().into_owned();
+        let l1 = base.join("Docs").join("report-final.txt").to_string_lossy().into_owned();
+        let l2 = base.join("Mix").join("AlphaNotes.md").to_string_lossy().into_owned();
+        let files = vec![l0, l1, l2];
+        cx.update(|_w, cx| {
+            app.update(cx, |app, _| {
+                app.model.borrow_mut().recent_folders = folders.clone();
+                app.model.borrow_mut().recent_files = files.clone();
+            });
+        });
+        open_panel(&app, cx);
+        // 无输入 → 全量两组（3 文件夹 + 3 文件，行下标从 0 连续）。
+        assert!(cx.debug_bounds("recent-folder-header").is_some(), "全量含文件夹组头");
+        assert!(cx.debug_bounds("recent-folder-row-2").is_some(), "全量含第 3 文件夹行");
+        assert!(cx.debug_bounds("recent-file-row-2").is_some(), "全量含第 3 文件行");
+        // 组头数字（评审 P2-1，K177 推导）：组头文本「最近文件夹 (N)」的 N = 过滤后组内
+        // 条数（`Line::Header.count` = `visible_*.len()`，recent_panel.rs:258-266），与行集合
+        // 同源（同一 `filtered_groups` 输出）→ 用真实渲染行下标闭区间钉死 N：
+        // 全量 = 全集条数（文件夹/文件各 3：row-2 在场、row-3 缺席）。
+        assert!(cx.debug_bounds("recent-file-header").is_some(), "全量含文件组头");
+        assert!(cx.debug_bounds("recent-folder-row-3").is_none(), "全量文件夹恰 3 条（组头数字=3）");
+        assert!(cx.debug_bounds("recent-file-row-3").is_none(), "全量文件恰 3 条（组头数字=3）");
+
+        // 查询 "alpha"：f0/f1（父路径 AlphaDir）/f2（名称）+ l2（名称）命中；l0/l1 不命中。
+        type_recent_query(&app, cx, "alpha");
+        assert!(cx.debug_bounds("recent-folder-header").is_some(), "alpha 命中文件夹组");
+        assert!(cx.debug_bounds("recent-folder-row-0").is_some(), "f0 命中（父路径）");
+        assert!(cx.debug_bounds("recent-folder-row-1").is_some(), "f1 命中（父路径，大小写不敏感）");
+        assert!(cx.debug_bounds("recent-folder-row-2").is_some(), "f2 命中（名称）");
+        assert!(cx.debug_bounds("recent-folder-row-3").is_none(), "文件夹仅 3 条命中");
+        assert!(cx.debug_bounds("recent-file-row-0").is_some(), "l2 命中（名称）");
+        assert!(cx.debug_bounds("recent-file-row-1").is_none(), "文件组仅 1 条命中（l0/l1 不含 alpha）");
+        // 过滤后条数（K177）：文件夹 3（f0/f1/f2）、文件 1（l2）——组头数字应显示过滤后条数
+        //（「最近文件夹 (3)」「最近文件 (1)」），与上面行闭合区间一致。
+        assert!(cx.debug_bounds("recent-file-header").is_some(), "过滤后文件组头应仍在（N=1）");
+
+        // 查询 "report"：仅文件组命中（l0/l1），文件夹组 0 命中整体隐藏。
+        type_recent_query(&app, cx, "report");
+        assert!(cx.debug_bounds("recent-file-header").is_some(), "report 命中文件组");
+        assert!(cx.debug_bounds("recent-file-row-0").is_some(), "l0 命中");
+        assert!(cx.debug_bounds("recent-file-row-1").is_some(), "l1 命中（大小写不敏感）");
+        assert!(cx.debug_bounds("recent-file-row-2").is_none(), "文件仅 2 条命中");
+        assert!(cx.debug_bounds("recent-folder-header").is_none(), "0 命中文件夹组整体隐藏");
+        assert!(cx.debug_bounds("recent-folder-row-0").is_none(), "文件夹行不可见");
+        // 命中组内保 MRU 相对序（不重排）：row-0 在 row-1 上方。
+        let (r0, r1) = (
+            cx.debug_bounds("recent-file-row-0").expect("row-0 应在场").center(),
+            cx.debug_bounds("recent-file-row-1").expect("row-1 应在场").center(),
+        );
+        assert!(r0.y < r1.y, "命中组内应保 MRU 相对顺序（不重排）");
+
+        // 清空输入 → 恢复全量两组。
+        type_recent_query(&app, cx, "");
+        assert!(cx.debug_bounds("recent-folder-header").is_some(), "清空后文件夹组头恢复");
+        assert!(cx.debug_bounds("recent-folder-row-2").is_some(), "清空后全量文件夹恢复");
+        assert!(cx.debug_bounds("recent-file-header").is_some(), "清空后文件组头恢复");
+        assert!(cx.debug_bounds("recent-file-row-2").is_some(), "清空后全量文件恢复");
+    }
+
+    /// 搜索态下回车：键入命中关键词 → 过滤后候选唯一 → Enter（搜索框 Submit，Change 已
+    /// 复位选中、无显式高亮 → 打开「第一个候选」）→ 打开目标文件 + 面板关闭。
+    #[gpui::test]
+    async fn recent_panel_enter_opens_file_from_search(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join("recent-search-kbd.txt");
+        std::fs::write(&f, "data").unwrap();
+        let s = f.to_string_lossy().into_owned();
+        let tabs_before = cx.update(|_w, cx| app.read(cx).model.borrow().tabs.len());
+        cx.update(|_w, cx| {
+            app.update(cx, |app, _| app.model.borrow_mut().recent_files = vec![s.clone()]);
+        });
+        open_panel(&app, cx);
+        // 键入命中关键词 → 单个候选可见（行下标 0）。
+        type_recent_query(&app, cx, "recent-search-kbd");
+        assert!(cx.debug_bounds("recent-file-row-0").is_some(), "过滤后首行命中");
+        assert!(cx.debug_bounds("recent-file-row-1").is_none(), "过滤后仅 1 条");
+        // Enter（搜索框持焦）→ 打开第一个候选。
+        cx.simulate_keystrokes("enter");
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (tabs, panel) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.model.borrow().tabs.len(), a.recent_panel.is_some())
+        });
+        assert_eq!(tabs, tabs_before + 1, "搜索态回车应打开首个候选文件");
+        assert!(!panel, "打开后面板应关闭");
         let _ = std::fs::remove_file(&f);
     }
 
@@ -530,10 +658,10 @@ use common::*;
         assert!(!panel, "点失效文件夹行后面板应关闭");
     }
 
-    /// More → 完整列表（同一面板实体 mode 切换：返回行 + 全部 ≤50 行 + 滚动）；
-    /// 返回 → 切回四区域。不重建面板实体、不关闭。
+    /// 面板入口新形态：打开即全量两组（不再有 More/Back 切换）——12 个文件夹全展示、
+    /// 组头 + 搜索框都在（无清空行）；mode 恒 All（单实体）。
     #[gpui::test]
-    async fn more_switches_full_list_and_back(cx: &mut TestAppContext) {
+    async fn open_panel_shows_full_groups(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
@@ -555,71 +683,85 @@ use common::*;
         open_panel(&app, cx);
         let panel_entity = cx.update(|_w, cx| app.read(cx).recent_panel.clone());
         assert!(panel_entity.is_some(), "面板实体应存在");
-        assert!(cx.debug_bounds("recent-folder-row-11").is_none(), "四区域不展示第 12 条文件夹");
-        let more = cx
-            .debug_bounds("recent-more")
-            .expect("More 行应渲染")
-            .center();
-        cx.simulate_click(more, Default::default());
-        pump_panel(cx);
-        // 同实体 mode 切换：实体不变、mode=All。
         let mode = cx.update(|_w, cx| app.read(cx).recent_panel.clone().unwrap().read(cx).mode());
-        assert_eq!(mode, session_store::RecentMode::All, "More 应切到完整列表模式");
-        assert!(
-            cx.update(|_w, cx| app.read(cx).recent_panel.as_ref() == panel_entity.as_ref()),
-            "More 不应重开/重建面板实体（同实体切换）"
-        );
-        assert!(cx.debug_bounds("recent-back").is_some(), "完整列表应有返回行");
-        assert!(cx.debug_bounds("recent-folder-row-11").is_some(), "完整列表展示全部文件夹");
-        assert!(cx.debug_bounds("recent-folder-row-0").is_some(), "完整列表仍从首行起");
-        assert!(cx.debug_bounds("recent-more").is_none(), "完整列表不再有 More 行");
-        assert!(cx.debug_bounds("recent-panel-scroll").is_some(), "完整列表应有滚动容器");
-
-        let back = cx
-            .debug_bounds("recent-back")
-            .expect("返回行应渲染")
-            .center();
-        cx.simulate_click(back, Default::default());
-        pump_panel(cx);
-        let mode = cx.update(|_w, cx| app.read(cx).recent_panel.clone().unwrap().read(cx).mode());
-        assert_eq!(mode, session_store::RecentMode::Regions, "返回应切回四区域");
-        assert!(cx.debug_bounds("recent-more").is_some(), "返回后回到四区域（More 行出现）");
-        assert!(cx.debug_bounds("recent-back").is_none(), "四区域无返回行");
-        assert!(cx.debug_bounds("recent-folder-row-11").is_none(), "四区域只展示前 10 条");
+        assert_eq!(mode, session_store::RecentMode::All, "打开即全量模式");
+        assert!(cx.debug_bounds("recent-search-input").is_some(), "打开即含搜索框");
+        assert!(cx.debug_bounds("recent-folder-header").is_some(), "打开即含文件夹组头");
+        assert!(cx.debug_bounds("recent-file-header").is_some(), "打开即含文件组头");
+        assert!(cx.debug_bounds("recent-folder-row-0").is_some(), "首行仍在");
+        assert!(cx.debug_bounds("recent-folder-row-11").is_some(), "打开即展示全部文件夹（12）");
+        assert!(cx.debug_bounds("recent-file-row-0").is_some(), "文件首行应在");
+        assert!(cx.debug_bounds("recent-clear").is_none(), "面板内不再有清空行（移至文件菜单 flyout）");
+        assert!(cx.debug_bounds("recent-more").is_none(), "无 More 行");
+        assert!(cx.debug_bounds("recent-back").is_none(), "无返回行");
+        assert!(cx.debug_bounds("recent-panel-scroll").is_some(), "列表应有滚动容器");
     }
 
-    /// Clear Recently Opened... → 清空两类 + 面板关闭。
+    /// 「更多...」真实菜单链路：文件菜单「打开最近…」flyout 点击 `recent-menu-more`
+    /// → 打开最近大面板（`app.recent_panel` 实体出现）+ **整链关闭**（次级 + 父菜单）
+    /// + 面板渲染：搜索框 + 两组头/行（面板已无清空行，见 2026-11-17 移除）。
     #[gpui::test]
-    async fn clear_recent_empties_and_closes(cx: &mut TestAppContext) {
+    async fn click_file_menu_recent_more_opens_panel(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let f = std::env::temp_dir().join("clear-file.txt").to_string_lossy().into_owned();
-        let d = std::env::temp_dir().join("clear-dir").to_string_lossy().into_owned();
+        let dir = std::env::temp_dir().join("recent-more-dir");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = std::env::temp_dir().join("recent-more-file.txt");
+        std::fs::write(&f, "data").unwrap();
+        let (fd, fs) = (dir.to_string_lossy().into_owned(), f.to_string_lossy().into_owned());
         cx.update(|_w, cx| {
             app.update(cx, |app, _| {
-                app.model.borrow_mut().recent_folders = vec![d.clone()];
-                app.model.borrow_mut().recent_files = vec![f.clone()];
+                app.model.borrow_mut().recent_folders = vec![fd.clone()];
+                app.model.borrow_mut().recent_files = vec![fs.clone()];
             });
         });
-        open_panel(&app, cx);
-        let clear = cx
-            .debug_bounds("recent-clear")
-            .expect("Clear 行应渲染")
+        assert!(
+            cx.update(|_w, cx| app.read(cx).recent_panel.is_none()),
+            "起点面板未开"
+        );
+        // 打开文件菜单 → 悬停「打开最近…」→ flyout 次级含「更多...」。
+        cx.simulate_click(gpui::Point::new(px(36.), px(16.)), Default::default());
+        pump_panel(cx);
+        let root = cx
+            .debug_bounds("recent-menu-open")
+            .expect("「打开最近…」应在场")
             .center();
-        cx.simulate_click(clear, Default::default());
-        for _ in 0..5 {
-            cx.run_until_parked();
-        }
-        let (folders, files, panel) = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            (a.model.borrow().recent_folders.clone(), a.model.borrow().recent_files.clone(), a.recent_panel.is_some())
-        });
-        assert!(folders.is_empty() && files.is_empty(), "Clear 应清空两类最近记录");
-        assert!(!panel, "Clear 后面板应关闭");
+        cx.simulate_mouse_move(root, None, Default::default());
+        pump_panel(cx);
+        assert!(cx.debug_bounds("recent-menu-more").is_some(), "flyout 次级应含「更多...」");
+        assert!(cx.debug_bounds("recent-clear").is_some(), "「更多...」后仍应有清空行");
+        let more = cx
+            .debug_bounds("recent-menu-more")
+            .expect("「更多...」应在场")
+            .center();
+        // 先移入次级再点（悬停守卫新鲜：点次级面板不会被父面板 capture 的
+        // on_mouse_down_out 当「面板外」误关整链——真实用户路径鼠标必然先悬停再点）。
+        cx.simulate_mouse_move(more, None, Default::default());
+        pump_panel(cx);
+        cx.simulate_click(more, Default::default());
+        pump_panel(cx);
+        let (panel_open, fly_gone, menu_gone) = (
+            cx.update(|_w, cx| app.read(cx).recent_panel.is_some()),
+            cx.debug_bounds("menu-flyout").is_none(),
+            cx.debug_bounds("recent-menu-open").is_none(),
+        );
+        assert!(panel_open, "点「更多...」应打开最近大面板");
+        assert!(fly_gone, "点「更多...」后次级菜单应关闭");
+        assert!(menu_gone, "点「更多...」后父菜单应整链关闭");
+        // 面板渲染：搜索框 + 两组头/行（面板已无清空行，flyout 已保留「清空最近记录」）。
+        assert!(cx.debug_bounds("recent-panel").is_some(), "面板根应渲染");
+        assert!(cx.debug_bounds("recent-search-input").is_some(), "面板应含搜索框");
+        assert!(cx.debug_bounds("recent-folder-header").is_some(), "面板应含文件夹组头");
+        assert!(cx.debug_bounds("recent-folder-row-0").is_some(), "面板应含文件夹行");
+        assert!(cx.debug_bounds("recent-file-header").is_some(), "面板应含文件组头");
+        assert!(cx.debug_bounds("recent-file-row-0").is_some(), "面板应含文件行");
+        assert!(cx.debug_bounds("recent-clear").is_none(), "面板不再含清空行（移至文件菜单 flyout）");
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 反馈 1/2 新形态（真实菜单链路）：文件菜单「打开最近…」改为 **flyout 悬浮次级菜单**
@@ -657,6 +799,7 @@ use common::*;
         assert!(cx.debug_bounds("recent-folder-row-0").is_none(), "空列表无文件夹行");
         assert!(cx.debug_bounds("recent-file-row-0").is_none(), "空列表无文件行");
         assert!(cx.debug_bounds("recent-clear").is_none(), "空列表不显示清空行");
+        assert!(cx.debug_bounds("recent-menu-more").is_none(), "空列表不显示「更多...」（评审 P2-2 对称断言）");
         assert!(cx.debug_bounds("recent-menu-open").is_some(), "悬停后父项「打开最近…」保持可见");
         assert!(cx.debug_bounds("menu-item-0").is_some(), "悬停后父项「新建文件」保持可见");
         // 点占位项 → 不可点（不打开新 tab、菜单保持展开）。先移入占位项（触发次级面板
