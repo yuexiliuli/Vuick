@@ -1232,7 +1232,6 @@ fn pass2_shape_band(
             let mut rows_map = band_parse_rows(doc, &need_row);
             let _t_shape = crate::prof::begin();
             for k in lo..hi {
-                let cid = block_content_id(doc, k);
                 let mut srow = if let Some(rc) = hit_map.remove(&k) {
                     (*rc).clone()
                 } else if is_giant_code_block(doc, base, k) {
@@ -1243,6 +1242,9 @@ fn pass2_shape_band(
                     bump_coolings(rd);
                     (*last).clone()
                 } else {
+                    // cid（全内容指纹）只在真正 shape 的块上算（P1-C1：指纹含整块字节，
+                    // 命中/巨块/cooling 分支不消费它——提前算会让带内巨块每帧整块重 hash）。
+                    let cid = block_content_id(doc, k);
                     let r = rows_map.remove(&k).expect("未命中 / caret 行应已被物化");
                     let is_caret = !matches!(r.kind, IrKind::Code | IrKind::Table | IrKind::Image)
                         && caret_line == r.src_line;
@@ -1396,14 +1398,19 @@ fn giant_fast_row(
     k: usize,
     shape_key: u64,
 ) -> ShapedRow {
+    // 权威行：内容寻址（全内容指纹）。settle 后 `shape_rows` 即存本键（宿主
+    // `shape_rows_has` 与正常行缓存同键读回）；巨块内**中段键入** → 全内容键换键 → miss。
     let cid = block_content_id(doc, k);
     if let Some(rc) = rd.borrow_mut().shape_rows.borrow_mut().get(cid, shape_key) {
         return (*rc).clone();
     }
+    // 陈旧钉：粗指纹（首+次末行）在「中段键入」中稳定 → 旧权威行继续可见（内容滞后至
+    // settle），不闪回占位板；形态终态由 settle 以全内容键重放权威行。
+    let pid = giant_block_id(doc, k);
     let stale = {
         let rdg = rd.borrow();
         let pw = rdg.prewarm.borrow();
-        pw.giant_stale(cid)
+        pw.giant_stale(pid)
     };
     if let Some(rc) = stale {
         rd.borrow_mut().prewarm.borrow_mut().register_giant(k);
@@ -1522,13 +1529,88 @@ fn pass3_assemble_rows(
 }
 
 /// 构建一帧：**窗口化**——仅 `band` 内的块被物化 + shape，带外估算占位。
+///
+/// 块**内容指纹**（RowShapeCache 内容寻址键）：`kind + aux + 块自身全部源码字节`。
+/// 修复前（P1-C1）仅 `kind + aux + 首行[+aux>1 时次末行]`——围栏代码块「中段 / 单行正文」
+/// 不进指纹 → 同首/次末行、中段不同的两块同 cid → RowShapeCache 内容寻址后块错误复用
+/// 前块整形行（正文 + byte_map 全错串，点击/光标/选区映射错）。修复后指纹覆盖块的全部
+/// 自身源码行：Code/Table = `aux+2` 行（含开/闭围栏、表头分隔；未闭合越界钳到文末），
+/// 其余 = 1 行；**不含块间空隙（尾随空行）** → 「位移但内容未变」仍同 cid（命中旧行免
+/// 整带重排），内容任一字节变必然变（正确失效）。
 pub fn block_content_id(doc: &Doc, block: usize) -> u64 {
     let Some(m) = doc.block_meta(block) else {
         return block as u64;
     };
     use std::hash::Hasher as _;
     let mut h = rustc_hash::FxHasher::default();
-    let kind = match m.kind {
+    h.write_u64(row_kind_fingerprint_code(m.kind));
+    h.write_u64(m.aux as u64);
+    let src0 = m.src_line as usize;
+    let ls = doc.line_starts();
+    // 块自身源码行数（Code/Table 多行块 = `aux + 2`；其余单行）。字节区间 = 块自身内容，
+    // 不含块间尾随空行——否则同内容块会因后继空行/带外间距变化而 cid 分叉（破坏内容寻址
+    // 共享 + 位移稳定性）。`line_str` 逐行 hash 会按行分配 String；`as_str()` 单切片在
+    // ropey 2.0.0-beta.1 对跨 chunk（> MAX_TEXT_SIZE=1024B）返回 None → 大块内容整块丢弃
+    // （P1-C1 退化，见下）→ 指纹必须覆盖逐 chunk 内容（实现见下）。
+    let own = match m.kind {
+        RowKind::Code | RowKind::Table => m.aux as usize + 2,
+        _ => 1,
+    };
+    let a = ls.get(src0).unwrap_or(m.byte as usize);
+    let e_line = (src0 + own).min(doc.line_count());
+    let b = ls.get(e_line).unwrap_or(doc.len());
+    // 内容指纹逐 chunk 折叠：ropey 2.0.0-beta.1 对跨 chunk 切片 `as_str()` 返回 None
+    // （`MAX_TEXT_SIZE=1024B`/叶；root 越界即内部节点）→ `unwrap_or_default()` 会把
+    // >1024B 块内容整块丢弃 → 指纹退化为 hash(kind, aux, "") → 大块（>1KB 码块 + 全部
+    // 巨块 >4096B）上 P1 错串原样复现且比旧粗配方更糟（旧至少含首+次末行）。评审亲测
+    // 1358B 两块（中段/首内容行全不同）得到相同 cid。
+    // 注意不能把每个 chunk 直接 `h.write(ch.as_bytes())`：rustc-hash `FxHasher::write`
+    // 按**每次调用**独立 `hash_bytes` 折叠（非跨调用流式）→ 同内容块落不同的 chunk 切法
+    // （切点由**绝对字节位移**决定，约 1024B/叶）会 hash 分叉 → 破坏「同内容共享 cid」。
+    // 故：单 chunk（<1024B，绝大多数块）直写一次（与旧 `as_str` 等效、零分配）；多 chunk
+    // 才并入缓冲整块写一次（一次内容大小分配，跨位置稳定）。
+    let sl = doc.rope().slice(a..b);
+    if sl.chunks().count() <= 1 {
+        if let Some(ch) = sl.chunks().next() {
+            h.write(ch.as_bytes());
+        }
+    } else {
+        let mut buf = Vec::with_capacity(sl.len());
+        for ch in sl.chunks() {
+            buf.extend_from_slice(ch.as_bytes());
+        }
+        h.write(&buf);
+    }
+    h.finish()
+}
+
+/// 巨型代码块「钉住行」键（巨块快速路径/静止权威整形专用）：**保留旧首+次末行指纹**
+/// （旧 `block_content_id` 配方）。与 [`block_content_id`]（全内容）分道：巨块钉的语义是
+/// 「编辑中内容滞后、静止后再补」——巨型码块内键入只改中段、首/次末行不变 → 本键稳定 →
+/// 旧钉继续可见（内容滞后至下次 `settle_giant_blocks`）；若并入全内容指纹，键入每击
+/// cid 变 → 旧钉自然 miss → 巨块闪回占位板（巨大码块编辑 UX 回归，prewarm::giant_pin
+/// 注释明示）。全内容指纹不安全的消费方**仅此一例**：`shape_rows` 内容寻址一律用
+/// [`block_content_id`]（该路径的「同首/次末行不同中段」碰撞已被全内容指纹修复）。
+pub fn giant_block_id(doc: &Doc, block: usize) -> u64 {
+    let Some(m) = doc.block_meta(block) else {
+        return block as u64;
+    };
+    use std::hash::Hasher as _;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write_u64(row_kind_fingerprint_code(m.kind));
+    h.write_u64(m.aux as u64);
+    let src0 = m.src_line as usize;
+    h.write(doc.line_str(src0).as_bytes());
+    if m.aux > 1 {
+        let srcn = (src0 + m.aux as usize - 1).min(doc.line_starts().len().saturating_sub(1));
+        h.write(doc.line_str(srcn).as_bytes());
+    }
+    h.finish()
+}
+
+/// `RowKind` → 指纹 kind 段（两个指纹函数共用，保持既有 1..=9 编码，勿改）。
+fn row_kind_fingerprint_code(kind: RowKind) -> u64 {
+    match kind {
         RowKind::Paragraph => 1u64,
         RowKind::Heading(_) => 2u64,
         RowKind::Code => 3u64,
@@ -1538,16 +1620,7 @@ pub fn block_content_id(doc: &Doc, block: usize) -> u64 {
         RowKind::Table => 7u64,
         RowKind::Image => 8u64,
         RowKind::Blank => 9u64,
-    };
-    h.write_u64(kind);
-    h.write_u64(m.aux as u64);
-    let src0 = m.src_line as usize;
-    h.write(doc.line_str(src0).as_bytes());
-    if m.aux > 1 {
-        let srcn = (src0 + m.aux as usize - 1).min(doc.line_starts().len().saturating_sub(1));
-        h.write(doc.line_str(srcn).as_bytes());
     }
-    h.finish()
 }
 
 // ═══ I4 巨型代码块「整形跳过 → 静止权威整形」闸门 ═══
@@ -1921,38 +1994,42 @@ pub fn prewarm_band(
             }
             None => false,
         };
-        let cache_miss = {
-            let rdg = rd.borrow_mut();
-            let mut rc = rdg.shape_rows.borrow_mut();
-            rc.get(block_content_id(doc, k), sk).is_none()
-        };
-        if !blocked && !big && caret_line != srcline && cache_miss {
-            if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
-                #[cfg(feature = "test-mode")]
-                bump_prewarm_shapes(rd);
-                // 先 clone 落局部：`&rd.borrow().theme` 直写实参时临时 `Ref` 活到整条调用
-                // 语句结束，会跨 image 行 shape 内 `lazy_ensure_image_size` 的
-                // `rd.borrow_mut()` → `RefCell already borrowed` panic。
-                let theme = rd.borrow().theme.clone();
-                let base_font = rd.borrow().theme.font.clone();
-                let row = crate::shape::shape_docrow(
-                    r,
-                    rd,
-                    host,
-                    window,
-                    frame.width,
-                    avail,
-                    &theme,
-                    &base_font,
-                );
-                if !shaped_row_has_notdef(&row) {
-                    rd.borrow_mut()
-                        .shape_rows
-                        .borrow_mut()
-                        .put(block_content_id(doc, k), sk, row);
+        // P1-C1：全内容指纹较重——先把廉价门（blocked/big/caret）判完才查缓存（查缓存要
+        // 算整块字节 hash），大块/巨块的 `cache_miss` 结果反正被 `!big` 丢弃，不必白算。
+        if !blocked && !big && caret_line != srcline {
+            let cache_miss = {
+                let rdg = rd.borrow_mut();
+                let mut rc = rdg.shape_rows.borrow_mut();
+                rc.get(block_content_id(doc, k), sk).is_none()
+            };
+            if cache_miss {
+                if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
+                    #[cfg(feature = "test-mode")]
+                    bump_prewarm_shapes(rd);
+                    // 先 clone 落局部：`&rd.borrow().theme` 直写实参时临时 `Ref` 活到整条调用
+                    // 语句结束，会跨 image 行 shape 内 `lazy_ensure_image_size` 的
+                    // `rd.borrow_mut()` → `RefCell already borrowed` panic。
+                    let theme = rd.borrow().theme.clone();
+                    let base_font = rd.borrow().theme.font.clone();
+                    let row = crate::shape::shape_docrow(
+                        r,
+                        rd,
+                        host,
+                        window,
+                        frame.width,
+                        avail,
+                        &theme,
+                        &base_font,
+                    );
+                    if !shaped_row_has_notdef(&row) {
+                        rd.borrow_mut()
+                            .shape_rows
+                            .borrow_mut()
+                            .put(block_content_id(doc, k), sk, row);
+                    }
                 }
+                done += 1;
             }
-            done += 1;
         }
         k += 1;
         if k >= i1 {
@@ -2025,12 +2102,16 @@ pub fn settle_giant_blocks(
             &theme,
             &base_font,
         );
-        let cid = block_content_id(doc, k);
+        // settle 权威行：以**全内容指纹**入 `shape_rows`（宿主 `shape_rows_has` 与正常内容寻址
+        // 缓存同键读回，快路径 `giant_fast_row` 也按它命中权威行），另以粗指纹钉住
+        // （`giant_pin`）供巨块内键入期间「陈旧可见」复用。
+        let full = block_content_id(doc, k);
+        let pid = giant_block_id(doc, k);
         if let Ok(mut b) = frame.base.try_borrow_mut() {
             b.set(k, f32::from(row.height));
         }
-        let rc = rd.borrow_mut().shape_rows.borrow_mut().put(cid, sk, row);
-        rd.borrow_mut().prewarm.borrow_mut().pin_giant(cid, rc);
+        let rc = rd.borrow_mut().shape_rows.borrow_mut().put(full, sk, row);
+        rd.borrow_mut().prewarm.borrow_mut().pin_giant(pid, rc);
         *rd.borrow_mut().frame.borrow_mut() = None;
         #[cfg(not(feature = "test-mode"))]
         window.request_animation_frame();
@@ -2207,5 +2288,340 @@ mod tests {
             is_giant_code_block(&doc, &base, last),
             "文末巨型代码块应命中 GIANT 快速路径"
         );
+    }
+
+    /// P1 复现（指纹层）：`block_content_id` 必须区分「同语言同跨度、首行/末行相同但中段
+    /// 不同」的两块围栏代码。修复前指纹仅 `kind+aux+首行[+m.aux>1 时末行]`（frame.rs:1525），
+    /// 围栏块 `src_line` 指向开门行、`aux`=两围栏间代码行数 → 中段内容不进指纹 → 两块 cid
+    /// 相同 → RowShapeCache 内容寻址后块错误复用前块整形行（正文 + byte_map 全错串，
+    /// 点击/光标/选区映射错）。修复后指纹应含中段 → cid 不同。
+    #[test]
+    fn block_content_id_distinguishes_same_fence_blocks_with_different_middle() {
+        // 两块同语言同跨度围栏：```rust + 3 内容行，首内容行不同、其余行相同。
+        let src = "```rust\nlet a = 1;\nlet shared = 0;\nlet tail = 0;\n```\n\n```rust\nlet b = 2;\nlet shared = 0;\nlet tail = 0;\n```\n";
+        let doc = markdown::doc::Doc::open(src.into());
+        let code: Vec<usize> = (0..doc.block_count())
+            .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
+            .collect();
+        assert_eq!(code.len(), 2, "夹具需恰好两块围栏代码块, 实得 {}", code.len());
+        let (b0, b1) = (code[0], code[1]);
+        let m0 = doc.block_meta(b0).unwrap();
+        let m1 = doc.block_meta(b1).unwrap();
+        let s0 = m0.src_line as usize;
+        let s1 = m1.src_line as usize;
+        // 前置校验：指纹输入（kind/aux/首行/末行）完全相同、仅中段不同——若指纹仍相等，
+        // 唯一解释 = 「中段不进指纹」缺陷（K133：期望值源自实际指纹构成逐项推导）。
+        assert_eq!(m0.kind, RowKind::Code);
+        assert_eq!(m1.kind, RowKind::Code);
+        assert_eq!(m0.aux, m1.aux, "两块须同跨度");
+        assert!(m0.aux > 1, "夹具须为多行代码块才体现「中段」");
+        assert_eq!(doc.line_str(s0), doc.line_str(s1), "两开门围栏行应相同（同语言）");
+        let last0 = s0 + m0.aux as usize - 1;
+        let last1 = s1 + m1.aux as usize - 1;
+        assert_eq!(doc.line_str(last0), doc.line_str(last1), "指纹末行应相同");
+        assert_ne!(doc.line_str(s0 + 1), doc.line_str(s1 + 1), "夹具中段须不同");
+        let cid0 = block_content_id(&doc, b0);
+        let cid1 = block_content_id(&doc, b1);
+        assert_ne!(
+            cid0, cid1,
+            "同首末行/跨度、中段不同的两块围栏指纹必须不同（P1 复现：修复前相等 {cid0:#x}）"
+        );
+    }
+
+    /// P1 复现（指纹层·单内容行）：`aux==1` 时指纹只含「开门围栏行」，整块正文不进指纹——
+    /// ```rust\nA\n``` 与 ```rust\nB\n``` 同 cid，后块正文整体错串。修复后须区分。
+    #[test]
+    fn block_content_id_distinguishes_same_fence_blocks_with_different_body() {
+        let src = "```rust\nlet a = 1;\n```\n\n```rust\nlet b = 2;\n```\n";
+        let doc = markdown::doc::Doc::open(src.into());
+        let code: Vec<usize> = (0..doc.block_count())
+            .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
+            .collect();
+        assert_eq!(code.len(), 2, "夹具需恰好两块围栏代码块");
+        let cid0 = block_content_id(&doc, code[0]);
+        let cid1 = block_content_id(&doc, code[1]);
+        assert_ne!(
+            cid0, cid1,
+            "同语言单内容行围栏正文不同也必须区分（P1 复现：修复前相等 {cid0:#x}）"
+        );
+    }
+
+    /// P1 复现（端到端·band 命中层）：`band_hit_test` 按 cid 内容寻址 RowShapeCache——修复前
+    /// 两块「同围栏/中段不同」的代码块 cid 相同 → 块 1 的带内命中复用块 0 的缓存整形行
+    /// （正文 + byte_map 头错乱）。红测断言：块 1 不得被块 0 的缓存行满足。
+    #[test]
+    fn band_hit_same_fence_blocks_do_not_cross_ref_rows() {
+        let src = "```rust\nlet a = 1;\nlet shared = 0;\nlet tail = 0;\n```\n\n```rust\nlet b = 2;\nlet shared = 0;\nlet tail = 0;\n```\n";
+        let doc = markdown::doc::Doc::open(src.into());
+        let code: Vec<usize> = (0..doc.block_count())
+            .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
+            .collect();
+        assert_eq!(code.len(), 2, "夹具需恰好两块围栏代码块");
+        let (b0, b1) = (code[0], code[1]);
+        let cid0 = block_content_id(&doc, b0);
+        let b0_src = doc.block_meta(b0).unwrap().src_line as usize;
+        // 渲染模型 + 块布局（小夹具，不触 GIANT 快速路径）。
+        let rd = std::cell::RefCell::new(WyRenderModel::new(test_theme()));
+        let n = doc.block_count();
+        let src_lines: Vec<u32> = (0..n).map(|i| doc.block_meta(i).unwrap().src_line).collect();
+        let base = std::rc::Rc::new(std::cell::RefCell::new(BlockLayout::new(
+            vec![100.0; n],
+            src_lines,
+        )));
+        let shape_key = 7u64;
+        // 块 0 已按真实内容整形入缓存（行 src_line 标记 = 块 0 首源码行）。
+        rd.borrow_mut()
+            .shape_rows
+            .borrow_mut()
+            .put(cid0, shape_key, fake_code_row(b0_src));
+        // 整带命中判定；caret 置为不落入任何代码块首行（不强制 need_row）。
+        let (_need, hit) = band_hit_test(&rd, &doc, &base, 0, n, usize::MAX, shape_key);
+        let served_by_b0 = hit
+            .get(&b1)
+            .is_some_and(|r| r.src_line == b0_src);
+        assert!(
+            !served_by_b0,
+            "块 1 不得以块 0 的整形行满足（P1 复现：修复前 cid 相同 → 命中块 0 行，src_line={b0_src}）"
+        );
+    }
+
+    /// P1 正向（防修过头，验证命令 `same_text_rows`）：内容**完全相同**（含中段）的两块
+    /// 围栏，指纹仍须**相同**——全内容指纹下「内容真实相同才共享」：两块共用整形缓存行
+    /// （行整形缓存内容寻址的共享前提，K5），不能因块下标/源码位置不同而 cid 分叉。
+    #[test]
+    fn same_text_rows_share_cid_fingerprint() {
+        let src = "```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```\n\n```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```\n";
+        let doc = markdown::doc::Doc::open(src.into());
+        let code: Vec<usize> = (0..doc.block_count())
+            .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
+            .collect();
+        assert_eq!(code.len(), 2, "夹具需恰好两块同内容围栏代码块");
+        let cid0 = block_content_id(&doc, code[0]);
+        let cid1 = block_content_id(&doc, code[1]);
+        assert_eq!(
+            cid0, cid1,
+            "同内容（含中段）两块指纹须共享整形缓存: {cid0:#x} vs {cid1:#x}"
+        );
+    }
+
+    // ---- P1-C1 退化回归（多 chunk / 巨块）：ropey 2.0.0-beta.1 跨 chunk 切片 `as_str()` 返回 None ----
+
+    /// P1-C1 退化回归（fingerprint 层·多 chunk）：ropey 2.0.0-beta.1 对跨 chunk 切片
+    /// `as_str()` 返回 None（`MAX_TEXT_SIZE=1024B`/叶；root 越 1024B 即内部节点）→ 修复前
+    /// `as_str().unwrap_or_default()` 把 >1024B 块内容**整块丢弃** → 指纹退化为
+    /// `hash(kind, aux, "")` → 大块（>1KB 码块）「中段/首内容行不同」两块同 cid、P1 错串
+    /// 原样复现（且比旧粗配方更糟：旧至少含首+次末行）。本测试 = 评审 1358B 探针落成
+    /// 正式回归（K27 证据入仓）：两块 >1024B 多 chunk、首内容行/中段全不同 → cid 必不同。
+    #[test]
+    fn block_content_id_distinguishes_multichunk_blocks_with_different_middle() {
+        // 两块同语言同跨度围栏，各 30 内容行（~47B/行 → 单块 ~1440B > 1024B 多 chunk）。
+        let a = 30usize;
+        let mut s0 = String::from("```rust\n");
+        let mut s1 = String::from("```rust\n");
+        for i in 0..a {
+            s0.push_str(&format!("let val_a_{i} = {i}; // 内容甲 中段行 {i}\n"));
+            s1.push_str(&format!("let val_b_{i} = {i}; // 内容乙 中段行 {i}\n"));
+        }
+        s0.push_str("```\n\n");
+        s1.push_str("```\n");
+        let doc = markdown::doc::Doc::open(format!("{s0}{s1}").into());
+        let code: Vec<usize> = (0..doc.block_count())
+            .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
+            .collect();
+        assert_eq!(code.len(), 2, "夹具需恰好两块围栏代码块, 实得 {}", code.len());
+        let (b0, b1) = (code[0], code[1]);
+        let m0 = doc.block_meta(b0).unwrap();
+        let m1 = doc.block_meta(b1).unwrap();
+        let (s0u, s1u) = (m0.src_line as usize, m1.src_line as usize);
+        // 指纹构成逐项推导（K133/K177）：同语言 → 开门围栏行相同；同 aux（30 行）→ 同跨度。
+        assert_eq!(m0.kind, RowKind::Code);
+        assert_eq!(m1.kind, RowKind::Code);
+        assert_eq!(m0.aux, m1.aux, "两块须同跨度");
+        assert_eq!(m0.aux as usize, a, "夹具须为多行代码块");
+        assert_eq!(doc.line_str(s0u), doc.line_str(s1u), "同语言开门围栏行应相同");
+        assert_ne!(doc.line_str(s0u + 1), doc.line_str(s1u + 1), "夹具首内容行须不同");
+        // 字节跨度 > 1024B：确保触发 ropey 跨 chunk 路径（修复前 `as_str()`=None → 内容全丢）。
+        let own = m0.aux as usize + 2;
+        let ls = doc.line_starts();
+        let av = ls.get(s0u).unwrap_or(m0.byte as usize);
+        let ev = (s0u + own).min(doc.line_count());
+        let bv = ls.get(ev).unwrap_or(doc.len());
+        assert!(bv.saturating_sub(av) > 1024, "夹具单块须 >1024B 多 chunk, 实得 {}", bv.saturating_sub(av));
+        // 跨 chunk 内容必须进指纹 → 两块 cid 必不同。
+        let cid0 = block_content_id(&doc, b0);
+        let cid1 = block_content_id(&doc, b1);
+        assert_ne!(
+            cid0, cid1,
+            ">1024B 多 chunk「首内容行/中段全不同」两块指纹必须不同（P1-C1 退化：修复前 as_str=None 内容整块丢弃→相同 {cid0:#x}）"
+        );
+    }
+
+    /// P1-C1 退化回归·正向（多 chunk 同内容仍共享）：修复后逐 chunk 折叠须对「>1024B 完全
+    /// 相同」的两块给同 cid（行整形缓存内容寻址共享前提），防修过头把同内容也分叉。
+    #[test]
+    fn same_text_rows_multichunk_blocks_share_cid() {
+        let a = 30usize;
+        let mut canonical = String::from("```rust\n");
+        for i in 0..a {
+            canonical.push_str(&format!("let same_{i} = {i}; // 共享内容 中段行 {i}\n"));
+        }
+        canonical.push_str("```");
+        let src = format!("{canonical}\n\n{canonical}\n");
+        let doc = markdown::doc::Doc::open(src.into());
+        let code: Vec<usize> = (0..doc.block_count())
+            .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
+            .collect();
+        assert_eq!(code.len(), 2, "夹具需恰好两块同内容围栏代码块, 实得 {}", code.len());
+        let cid0 = block_content_id(&doc, code[0]);
+        let cid1 = block_content_id(&doc, code[1]);
+        assert_eq!(
+            cid0, cid1,
+            ">1024B 完全相同的两块指纹须共享整形缓存: {cid0:#x} vs {cid1:#x}"
+        );
+    }
+
+    /// P1-C1 退化回归·巨块键（推进 GIANT_SPAN_BYTES=4096 路径）：两个**同行数（同 aux）**
+    /// 巨型代码块（各 >4096B 多 chunk）内容不同 → 修复前 `as_str()`=None → 内容整块丢弃 →
+    /// 两巨块 `block_content_id`（settle 权威行键）相同 → 巨块 1 串用巨块 0 的 settle 权威行
+    /// （P1 错串在巨块上原样复现）。断言 = 「两巨块经 settle 的权威行键（full-content 键）
+    /// 不同」；两 fixture 均须真命中 GIANT 路径。
+    #[test]
+    fn giant_blocks_full_content_keys_differ_between_different_giants() {
+        let (doc, base, b0, b1) = two_giant_code_blocks_fixture();
+        for kb in [b0, b1] {
+            assert!(
+                is_giant_code_block(&doc, &base, kb),
+                "夹具巨块 {kb} 须命中 GIANT 快速路径"
+            );
+        }
+        let m0 = doc.block_meta(b0).unwrap();
+        let m1 = doc.block_meta(b1).unwrap();
+        assert_eq!(m0.aux, m1.aux, "两巨块须同行数（同 aux）才体现「仅内容不同」");
+        let cid0 = block_content_id(&doc, b0);
+        let cid1 = block_content_id(&doc, b1);
+        assert_ne!(
+            cid0, cid1,
+            "不同内容同 aux 巨块的权威行键（full-content 键）必须不同（P1-C1 退化：>4KB as_str=None 内容整块丢弃→相同 {cid0:#x}）"
+        );
+    }
+
+    /// P1-C1 退化回归·巨块快速路径（headless 机制 e2e）：模拟 `settle_giant_blocks` 把
+    /// 巨块 0 权威行以**全内容键**入 `shape_rows`（settle_giant_blocks 落盘姿势），再走
+    /// 巨块 1 的 `giant_fast_row` 快速路径（生产链路 `row_for_block` → `giant_fast_row`）。
+    /// 不同内容两巨块 cid 必不同 → 巨块 1 不得命中巨块 0 的 settle 权威行（各归各正文/行）。
+    /// 完整 `settle_giant_blocks` e2e 需真实 `Window`/`WyRenderHost`（双巨块静止帧内难 headless
+    /// 驱动），此处以「settle 落盘键 + 快速路径读回」的机制链路等价覆盖（见报告取舍）。
+    #[test]
+    fn giant_fast_row_does_not_cross_serve_between_different_giants() {
+        let (doc, base, b0, b1) = two_giant_code_blocks_fixture();
+        let rd = RefCell::new(WyRenderModel::new(test_theme()));
+        let sk = 7u64;
+        let s0_row = doc.block_meta(b0).unwrap().src_line as usize;
+        let s1_row = doc.block_meta(b1).unwrap().src_line as usize;
+        // 巨块 0 settle 落盘：权威行挂全内容键（与 settle_giant_blocks 同键读回）。
+        let cid0 = block_content_id(&doc, b0);
+        rd.borrow_mut()
+            .shape_rows
+            .borrow_mut()
+            .put(cid0, sk, fake_code_row(s0_row));
+        // 巨块 1 快速路径：不得以巨块 0 的权威行满足。
+        let row1 = giant_fast_row(&rd, &doc, &base, b1, sk);
+        assert_ne!(
+            row1.src_line, s0_row,
+            "不同内容同 aux 巨块快速路径不得复用他块 settle 权威行（P1-C1 退化：>4KB as_str=None 两巨块 cid 相同→串行）"
+        );
+        // 正向对照：巨块 1 真实内容路径应返回其自身占位/权威行（src_line = 巨块 1 首源码行，非巨块 0）。
+        assert_eq!(
+            row1.src_line, s1_row,
+            "巨块 1 快速路径应回自身 src_line（占位/权威），实得 {} 期望 {}",
+            row1.src_line, s1_row
+        );
+    }
+
+    /// 两个**同行数（同 aux）** 巨型代码块夹具：各 80 内容行（~72B/行 → 单块 >4KB）、
+    /// 内容互不相同（首行与中段全异），返回 `(doc, base, b0, b1)`。
+    fn two_giant_code_blocks_fixture() -> (markdown::doc::Doc, Rc<RefCell<BlockLayout>>, usize, usize) {
+        let mut first = String::from("```rust\n");
+        let mut second = String::from("```rust\n");
+        for i in 0..80 {
+            first.push_str(&format!("// 巨块甲 第 {i:02} 行: let var_a_{i:03} = {i:04} & 0xFF; // 填充使单块超 4KB\n"));
+            second.push_str(&format!("// 巨块乙 第 {i:02} 行: let var_b_{i:03} = {i:04} & 0xFF; // 填充使单块超 4KB\n"));
+        }
+        first.push_str("```\n\n");
+        second.push_str("```\n");
+        let doc = markdown::doc::Doc::open(format!("{first}{second}").into());
+        let code: Vec<usize> = (0..doc.block_count())
+            .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
+            .collect();
+        assert_eq!(code.len(), 2, "夹具需恰好两块巨码块, 实得 {}", code.len());
+        let (b0, b1) = (code[0], code[1]);
+        // 单块内容 > 4096B（GIANT_SPAN_BYTES），且两巨块字节跨度分别 > 4096 → 触发 GIANT 路径。
+        let m0 = doc.block_meta(b0).unwrap();
+        let ls = doc.line_starts();
+        let own = m0.aux as usize + 2;
+        let src0 = m0.src_line as usize;
+        let av = ls.get(src0).unwrap_or(m0.byte as usize);
+        let ev = (src0 + own).min(doc.line_count());
+        let bv = ls.get(ev).unwrap_or(doc.len());
+        assert!(bv.saturating_sub(av) > 4096, "夹具单巨块须 >4096B, 实得 {}", bv.saturating_sub(av));
+        let n = doc.block_count();
+        let src_lines: Vec<u32> = (0..n).map(|i| doc.block_meta(i).unwrap().src_line).collect();
+        let base = Rc::new(RefCell::new(BlockLayout::new(vec![100.0; n], src_lines)));
+        (doc, base, b0, b1)
+    }
+
+    // ---- P1 复现夹具：最小 WyTheme / 行（不触窗口/不真排版） ----
+
+    fn test_theme() -> WyTheme {
+        use markdown::view::style::StyleParams;
+        let sp = StyleParams {
+            mono: "monospace".into(),
+            fg: gpui::Hsla::default(),
+            muted_fg: gpui::Hsla::default(),
+            code_bg: gpui::Hsla::default(),
+            code_inline_fg: gpui::Hsla::default(),
+            code_inline_bg: gpui::Hsla::default(),
+            divider: gpui::Hsla::default(),
+            accent: gpui::Hsla::default(),
+            link: gpui::Hsla::default(),
+            quote_bg: gpui::Hsla::default(),
+            table_head_bg: gpui::Hsla::default(),
+            mermaid_accents: [gpui::Hsla::default(); 6],
+            mermaid_border: gpui::Hsla::default(),
+            para_size: gpui::px(16.),
+            para_line: gpui::px(23.2),
+            code_size: gpui::px(14.),
+            code_line: gpui::px(20.8),
+            is_dark: false,
+        };
+        WyTheme::from_style(&sp, gpui::font(gpui::SharedString::from("monospace")), gpui::px(16.))
+    }
+
+    /// 一块「已整形」代码块的占位行：src_line 标记其为某块的正文（测试只用它作身份标记，
+    /// 不真排版）。has_non_ascii=false → 命中时不走 notdef 复排分支。
+    fn fake_code_row(src_line: usize) -> ShapedRow {
+        ShapedRow {
+            src_line,
+            src_lines: src_line..src_line + 1,
+            wrapped: std::rc::Rc::new(Vec::new()),
+            has_non_ascii: false,
+            sub_heights: Vec::new(),
+            byte_map: std::rc::Rc::new(Vec::new()),
+            editable: false,
+            multi_offsets: Vec::new(),
+            code_ranges: Vec::new(),
+            lh: gpui::px(20.8),
+            x_off: gpui::px(0.),
+            align_offsets: Vec::new(),
+            height: gpui::px(20.8),
+            top: gpui::px(0.),
+            kind: IrKind::Code,
+            quoted: false,
+            table: None,
+            table_edit: None,
+            image: None,
+            mm: None,
+            extra: RowExtra::default(),
+        }
     }
 }

@@ -34,10 +34,12 @@ pub struct Prewarm {
     /// 门控会在滚动前就把预热门关掉 → 用户首次滚动落点带冷、Pass2 突发回归）。
     /// 任何滚动/内容/宽度变化（签名变）立即清零 → 回归正常门控（0746946 不破坏）。
     pub cold_topup: u8,
-    /// I4 巨块**钉住行**（键 = 块内容指纹 [`super::frame::block_content_id`]）：最后一次
-    /// 权威整形的巨型代码块行。编辑作废 `shape_rows` 后仍钉住复用——巨块内键入期间
-    /// 文本/光标/点击继续可用（内容滞后至上次 settle，静止后由 `settle_giant_blocks`
-    /// 更新为新内容）。按内容指纹键 → 结构编辑/换源后旧条目自然失效（不触碰 edit.rs）。
+    /// I4 巨块**钉住行**（键 = 巨块专属粗指纹 [`super::frame::giant_block_id`]，非全内容
+    /// [`super::frame::block_content_id`]）：最后一次权威整形的巨型代码块行。编辑作废
+    /// `shape_rows` 后仍钉住复用——巨块内键入期间文本/光标/点击继续可用（内容滞后至上次
+    /// settle，静止后由 `settle_giant_blocks` 更新为新内容）。粗指纹首/次末行在「中段
+    /// 键入」中稳定 → 旧钉继续可见（全内容指纹会让每击换键 → 巨块闪回占位板）。按粗指纹
+    /// 键 → 结构编辑/换源后旧条目自然失效（不触碰 edit.rs）。
     pub giant_pin: std::collections::HashMap<u64, std::rc::Rc<crate::element::ShapedRow>>,
     /// I4 待「静止权威整形」的巨型代码块下标（去重；`settle_giant_blocks` 消费）。
     pub pending_giant: Vec<usize>,
