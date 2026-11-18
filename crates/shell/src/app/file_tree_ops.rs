@@ -317,6 +317,56 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 「Reveal in Explorer View」：打开/切到侧边栏 **Files** 视图，在文件树中展开到
+    /// 目标文件、高亮并滚动可见（VSCode 资源管理器 reveal 语义）。
+    /// 1. 守卫：未开文件夹（`files.root` None）→ no-op（菜单已禁，兜底）。
+    /// 2. 置 Files 视图 + 打开侧边栏（仿 `open_folder_path` 姿势）。
+    /// 3. 展开全部祖先目录（含根，幂等插入）；未扫过的层 `spawn_file_tree_scan` 异步补扫
+    ///    （spawn 内部已按缓存/在途去重）。
+    /// 4. `selected = Some(target)`（目标须在根之下，否则不进文件树不设选中）+
+    ///    置「待滚」瞬态标记 + `layout_gen`+1 作废行表缓存。
+    /// 5. 滚动在**渲染期**对当前可见行表定位目标行实施（见 files.rs）：行表只含已扫描的
+    ///    已展开子项 → 目标行可枚举即祖先全扫完，scan_complete 令 layout_gen+1 → 缓存
+    ///    失效重收行表后再滚，「先扫后滚」由此保证，不因首扫前 layout_gen 未变而滚错。
+    pub(crate) fn file_tree_reveal_in_explorer_view(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.sidebar.files.root.clone() else {
+            return;
+        };
+        self.sidebar.view = sidebar::SidebarView::Files;
+        self.sidebar.open = true;
+        self.sidebar.panel_open = true;
+        // 展开祖先（根→目标父逐级，补扫未扫层）。
+        let mut dir = path.parent();
+        let mut ancestors: Vec<std::path::PathBuf> = Vec::new();
+        while let Some(d) = dir {
+            if d == root {
+                ancestors.push(d.to_path_buf());
+                break;
+            }
+            if d.starts_with(&root) {
+                ancestors.push(d.to_path_buf());
+            }
+            dir = d.parent();
+        }
+        ancestors.reverse();
+        for d in ancestors {
+            self.sidebar.files.expanded.insert(d.clone());
+            self.spawn_file_tree_scan(d, window, cx);
+        }
+        // 目标在根下才设瞬态选中 + 待滚（根外文件不进本树，设了只会永久悬置待滚）。
+        if path.starts_with(&root) {
+            self.sidebar.files.selected = Some(path.to_path_buf());
+            self.sidebar.files.scroll_to_selected = true;
+        }
+        self.sidebar.files.layout_gen = self.sidebar.files.layout_gen.wrapping_add(1);
+        cx.notify();
+    }
+
     /// 「复制路径」：把**绝对路径**写入文本剪贴板（不带引号）。
     pub(crate) fn file_tree_copy_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         let p = path.to_string_lossy().into_owned();

@@ -82,6 +82,39 @@ pub trait TabsHost: 'static {
     ) where
         Self: Sized;
 
+    /// 菜单「复制路径」→ 宿主 `file_tree_copy_path`：把当前 tab 的**绝对路径**写入文本
+    /// 剪贴板（不带引号）。untitled（无路径）由菜单禁用兜底；被误调时宿主侧 no-op。
+    fn tabs_host_copy_path(&mut self, idx: usize, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 菜单「复制相对路径」→ 宿主 `file_tree_copy_relative_path`：相对已打开文件夹根
+    /// 的相对路径（原生分隔符、无引号）；根缺失 / 前缀失败 → 退化复制绝对路径。
+    fn tabs_host_copy_relative_path(&mut self, idx: usize, cx: &mut Context<Self>)
+    where
+        Self: Sized;
+
+    /// 菜单「在资源管理器中显示」→ 宿主 `file_tree_reveal_in_explorer`：构造
+    /// `explorer /select,<绝对路径>` 并 spawn（不阻塞 UI；失败状态栏提示）。
+    fn tabs_host_reveal_in_explorer(
+        &mut self,
+        idx: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        Self: Sized;
+
+    /// 菜单「Reveal in Explorer View」→ 宿主 `file_tree_reveal_in_explorer_view`：打开/切到
+    /// 侧边栏 Files 视图，在文件树中**展开到目标文件、高亮并滚动可见**（VSCode 资源管理器
+    /// reveal 语义）。untitled（无路径）/ 未开文件夹由菜单禁用兜底；被误调时宿主侧 no-op。
+    fn tabs_host_reveal_in_explorer_view(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        Self: Sized;
+
     /// 「新建文件」菜单项 → 宿主 `new_tab`（建空 tab + 聚焦 + 持久化）。
     fn tabs_host_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>)
     where

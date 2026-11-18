@@ -2,9 +2,10 @@
     // 选项卡右键管理菜单（关闭组 / 移入·复制新窗口）+ 空白区右键分离 回归
     // ---------------------------------------------------------------------------
 
-    /// 右键选项卡 → 选项卡管理菜单：7 项 + 1 分割线（layout_probe (8,1)），全部新
-    /// debug_selector 存在；**不**弹出栏级「新建/打开」菜单（stop_propagation + 复用
-    /// 同一 overlay/菜单槽位、以条目区分）。
+    /// 右键选项卡 → 选项卡管理菜单：11 项 + 3 分割线（layout_probe (14,3)），全部新
+    /// debug_selector 存在（未命名 tab 下「复制路径/复制相对路径/在资源管理器中显示/
+    /// Reveal in Explorer View」四项禁用）；**不**弹出栏级「新建/打开」菜单
+    /// （stop_propagation + 复用同一 overlay/菜单槽位、以条目区分）。
     #[gpui::test]
     async fn tab_right_click_menu_structure_and_no_bar_menu(cx: &mut TestAppContext) {
         init_test(cx);
@@ -26,19 +27,25 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let probe = cx.update(|_w, cx| {
-            app.read(cx)
+        let (probe, d_copy_path, d_copy_rel, d_reveal, d_reveal_view) = cx.update(|_w, cx| {
+            let e = app
+                .read(cx)
                 .tab_bar_menu
                 .entity
                 .as_ref()
-                .expect("选项卡菜单应打开")
-                .read(cx)
-                .layout_probe()
+                .expect("选项卡菜单应打开");
+            (
+                e.read(cx).layout_probe(),
+                e.read(cx).is_item_disabled(9),
+                e.read(cx).is_item_disabled(10),
+                e.read(cx).is_item_disabled(12),
+                e.read(cx).is_item_disabled(13),
+            )
         });
         assert_eq!(
             probe,
-            (8, 1),
-            "选项卡菜单 = 7 项 + 1 分割线（总条目 8），实际={probe:?}"
+            (14, 3),
+            "选项卡菜单 = 11 项 + 3 分割线（总条目 14），实际={probe:?}"
         );
         for sel in [
             "tab-menu-close",
@@ -48,9 +55,19 @@
             "tab-menu-close-all",
             "tab-menu-move-new-window",
             "tab-menu-copy-new-window",
+            "tab-menu-copy-path",
+            "tab-menu-copy-rel-path",
+            "tab-menu-reveal-explorer",
+            "tab-menu-reveal-explorer-view",
         ] {
             assert!(cx.debug_bounds(sel).is_some(), "选项卡菜单应含 {sel}");
         }
+        // 初始 tab 未命名（无路径）→ 复制/定位四项禁用（is_item_disabled 下标含分割线：
+        // 9=复制路径、10=复制相对路径、12=在资源管理器中显示、13=Reveal in Explorer View）。
+        assert!(
+            d_copy_path && d_copy_rel && d_reveal && d_reveal_view,
+            "未命名 tab：复制/定位四项应禁用，实际=({d_copy_path},{d_copy_rel},{d_reveal},{d_reveal_view})"
+        );
         // 分隔线分组内的关闭与窗口组都呈现；栏级「新建/打开」**不**出现。
         assert!(
             cx.debug_bounds("tab-bar-menu-item-new").is_none()
@@ -88,6 +105,396 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
+    }
+
+    /// 「复制路径 / 复制相对路径」：右键文件 tab → 点菜单项 → 剪贴板断言（绝对路径 /
+    /// 相对已打开文件夹根、原生分隔符、无引号），与文件树右键同口径（宿主复用
+    /// `file_tree_copy_path/relative`）；点后菜单关闭（`tab_bar_menu` 槽位清空）。
+    #[gpui::test]
+    async fn tab_menu_copy_path_and_relative_path(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!("gpui-tab-cp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("b.txt");
+        std::fs::write(&target, "B").unwrap();
+        // 预置文件夹根 + 打开文件：tabs = [未命名(0), b.txt(1)]，相对根 = dir。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, _cx| {
+                a.sidebar.files.set_root(Some(dir.clone()));
+            });
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(target.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 备份原文本剪贴板（复制路径会覆盖真实剪贴板），测试末还原避免污染用户剪贴板。
+        let orig_clip: Option<String> = cx.update(|_w, cx| {
+            cx.read_from_clipboard()
+                .and_then(|i| i.text().map(|s| s.to_string()))
+        });
+
+        // 右键文件 tab（tab-1）→ 点「复制路径」→ 剪贴板 = 绝对路径（无引号）。
+        let file_tab = cx.debug_bounds("tab-1").expect("文件 tab 应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: file_tab.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let abs_item = cx.debug_bounds("tab-menu-copy-path").expect("复制路径项应存在");
+        cx.simulate_click(abs_item.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let text: Option<String> = cx.update(|_w, cx| {
+            cx.read_from_clipboard()
+                .map(|i| i.text().unwrap_or_default())
+        });
+        assert_eq!(
+            text.as_deref(),
+            Some(target.to_string_lossy().as_ref()),
+            "复制路径应为绝对路径且不带引号"
+        );
+        assert!(
+            !cx.update(|_w, cx| app.read(cx).tab_bar_menu.is_open()),
+            "点菜单项后选项卡菜单应关闭"
+        );
+
+        // 重新右键 → 点「复制相对路径」→ 相对根 = b.txt。
+        let file_tab2 = cx.debug_bounds("tab-1").expect("文件 tab 仍在");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: file_tab2.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let rel_item = cx
+            .debug_bounds("tab-menu-copy-rel-path")
+            .expect("复制相对路径项应存在");
+        cx.simulate_click(rel_item.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let rel: Option<String> = cx.update(|_w, cx| {
+            cx.read_from_clipboard()
+                .map(|i| i.text().unwrap_or_default())
+        });
+        assert_eq!(
+            rel.as_deref(),
+            Some("b.txt"),
+            "复制相对路径应相对已打开文件夹根（原生分隔符、无引号）"
+        );
+        // 无 root 时退化绝对路径：清根 → 重开菜单 → 点「复制相对路径」→ 绝对路径。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, _cx| a.sidebar.files.set_root(None));
+        });
+        let file_tab3 = cx.debug_bounds("tab-1").expect("文件 tab 仍在");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: file_tab3.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let rel_item2 = cx
+            .debug_bounds("tab-menu-copy-rel-path")
+            .expect("复制相对路径项应存在");
+        cx.simulate_click(rel_item2.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let rel_no_root: Option<String> = cx.update(|_w, cx| {
+            cx.read_from_clipboard()
+                .map(|i| i.text().unwrap_or_default())
+        });
+        assert_eq!(
+            rel_no_root.as_deref(),
+            Some(target.to_string_lossy().as_ref()),
+            "无根时复制相对路径应退化复制绝对路径"
+        );
+        // 还原测试前剪贴板文本（有原内容才写回）。
+        if let Some(text) = orig_clip {
+            cx.update(|_w, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「在资源管理器中显示」：右键**文件** tab → 点菜单项 → 宿主
+    /// `file_tree_reveal_in_explorer` 被调（headless 只能断言到「菜单关闭 = 回调经 activate
+    /// 执行」+ 不 panic；真实 explorer 进程无法 headless 断言）；**未命名** tab 下点禁用项
+    /// 「复制路径」→ 菜单保持打开（禁用不响应点击）。「Reveal in Explorer View」：文件 tab
+    /// 有路径但**未打开文件夹**（root None）→ 该项仍禁用（无树可定位）。
+    #[gpui::test]
+    async fn tab_menu_reveal_explorer_and_untitled_disabled(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 未命名 tab（tab-0）→ 四项禁用：点禁用「复制路径」不加事件、菜单保持打开。
+        let untitled_tab = cx.debug_bounds("tab-0").expect("未命名 tab 应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: untitled_tab.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let disabled = cx.update(|_w, cx| {
+            let e = app
+                .read(cx)
+                .tab_bar_menu
+                .entity
+                .as_ref()
+                .expect("选项卡菜单应打开");
+            (
+                e.read(cx).is_item_disabled(9),
+                e.read(cx).is_item_disabled(10),
+                e.read(cx).is_item_disabled(12),
+                e.read(cx).is_item_disabled(13),
+            )
+        });
+        assert!(
+            disabled.0 && disabled.1 && disabled.2 && disabled.3,
+            "未命名 tab 复制/定位四项应禁用，实际={disabled:?}"
+        );
+        let disabled_item = cx.debug_bounds("tab-menu-copy-path").expect("禁用项仍在场");
+        cx.simulate_click(disabled_item.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| app.read(cx).tab_bar_menu.is_open()),
+            "点禁用项不应关闭菜单（禁用不响应点击）"
+        );
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // 打开文件 tab-1（**未开文件夹/root None**）：复制/资源管理器定位三项启用；
+        // 「Reveal in Explorer View」仍禁用（root None）；点「在资源管理器中显示」→ 菜单
+        // 关闭（host 被调、不 panic）。
+        let f = std::env::temp_dir().join("gpui-tab-rev.txt");
+        std::fs::write(&f, "R").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let file_tab = cx.debug_bounds("tab-1").expect("文件 tab 应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: file_tab.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let enabled = cx.update(|_w, cx| {
+            let e = app
+                .read(cx)
+                .tab_bar_menu
+                .entity
+                .as_ref()
+                .expect("选项卡菜单应打开");
+            (
+                e.read(cx).is_item_disabled(9),
+                e.read(cx).is_item_disabled(10),
+                e.read(cx).is_item_disabled(12),
+                e.read(cx).is_item_disabled(13),
+            )
+        });
+        assert!(
+            !enabled.0 && !enabled.1 && !enabled.2 && enabled.3,
+            "文件 tab（root None）：复制三项启用、Reveal in Explorer View 禁用，实际={enabled:?}"
+        );
+        let reveal = cx
+            .debug_bounds("tab-menu-reveal-explorer")
+            .expect("在资源管理器中显示项应存在");
+        cx.simulate_click(reveal.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            !cx.update(|_w, cx| app.read(cx).tab_bar_menu.is_open()),
+            "点「在资源管理器中显示」后菜单应关闭（回调经 activate 执行、不 panic）"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 「Reveal in Explorer View」E2E：打开嵌套文件夹 + 文件 tab → 右键文件 tab →
+    /// 点菜单项 → 侧边栏切到 Files 视图并打开、目标全部祖先目录展开（含异步补扫）、
+    /// 瞬态选中 = 目标文件、滚动定位到目标行（offset ≈ min(idx×ROW_H, max_offset)，
+    /// 期望值从真实行序 + 最终 max_offset 推导，K177）。
+    #[gpui::test]
+    async fn tab_menu_reveal_in_explorer_view_opens_tree_highlights_scrolls(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 嵌套树根（多层 root/a/b/target.md）：a 下旁加 50 兄弟文件撑高使滚动真实发生；
+        // a/b 下 target 之后再放 z00..z19 使 target 非末行、其行顶远小于「内容高−视口高」。
+        let dir = std::env::temp_dir().join(format!("gpui-tab-rev-view-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/target.md"), "T").unwrap();
+        for i in 0..50 {
+            std::fs::write(dir.join(format!("a/fill{i:02}.txt")), "F").unwrap();
+        }
+        for i in 0..20 {
+            std::fs::write(dir.join(format!("a/b/z{i:02}.md")), "Z").unwrap();
+        }
+        // 开文件夹（root 扫描 + 展开根）+ 开目标文件成 tab-1。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_folder_path(dir.clone(), window, cx);
+                app.open_file(dir.join("a/b/target.md").to_str().unwrap(), window, cx);
+            });
+        });
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let a_ready =
+                cx.update(|_w, cx| app.read(cx).sidebar.files.children.contains_key(&dir.join("a")));
+            if a_ready {
+                break;
+            }
+        }
+        // 右键文件 tab → 点「Reveal in Explorer View」。
+        let tab = cx.debug_bounds("tab-1").expect("target tab 应渲染");
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position: tab.center(),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let item = cx
+            .debug_bounds("tab-menu-reveal-explorer-view")
+            .expect("Reveal in Explorer View 项应存在");
+        cx.simulate_click(item.center(), Default::default());
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            !cx.update(|_w, cx| app.read(cx).tab_bar_menu.is_open()),
+            "点「Reveal in Explorer View」后菜单应关闭"
+        );
+        // 泵到全部在途扫描完成 + 目标行进入可见行表（异步「先扫后滚」由行表即真相保证）。
+        let target = dir.join("a/b/target.md");
+        let mut target_idx = None;
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let probe = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                if !a.sidebar.files.pending.is_empty() {
+                    return None;
+                }
+                a.sidebar.files_layout
+                    .as_ref()
+                    .and_then(|(_, rows)| rows.iter().position(|r| r.path == target))
+            });
+            if let Some(i) = probe {
+                target_idx = Some(i);
+                break;
+            }
+        }
+        let idx = target_idx.expect("扫描完成后目标行应进入可见行表");
+        // 断言：Files 视图打开 + 祖先展开 + 瞬态选中 + 待滚已消费。
+        let (view, open, panel, expanded_a, expanded_ab, selected, scroll_pending) =
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                (
+                    a.sidebar.view,
+                    a.sidebar.open,
+                    a.sidebar.panel_open,
+                    a.sidebar.files.expanded.contains(&dir.join("a")),
+                    a.sidebar.files.expanded.contains(&dir.join("a/b")),
+                    a.sidebar.files.selected.clone(),
+                    a.sidebar.files.scroll_to_selected,
+                )
+            });
+        assert_eq!(
+            view,
+            crate::app::sidebar::SidebarView::Files,
+            "应切到 Files 视图"
+        );
+        assert!(open && panel, "侧边栏与 Files 面板应打开");
+        assert!(expanded_a && expanded_ab, "目标全部祖先目录应展开");
+        assert_eq!(
+            selected.as_deref(),
+            Some(target.as_path()),
+            "瞬态选中应为目标文件"
+        );
+        assert!(!scroll_pending, "目标行可枚举后待滚标记应被消费");
+        // 断言：滚动偏移 ≈ 目标行顶（idx×ROW_H）取 clamp 到最终 max_offset（容差 2px）。
+        let (off_y, max_y) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar.files_vscroll.offset().y, a.sidebar.files_vscroll.max_offset().y)
+        });
+        let expected = (idx as f32 * shell_sidebar::state::FILE_TREE_ROW_H).min(max_y.as_f32());
+        assert!(
+            (off_y.as_f32() + expected).abs() < 2.0,
+            "滚动偏移应 ≈ 目标行顶 clamp：idx={idx} expected=-{expected} 实际={off_y:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 「关闭全部」：全干净 → 批量关干净（零选项卡欢迎页）；任一脏/未命名 → 中止

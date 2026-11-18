@@ -318,12 +318,16 @@ impl EditorApp {
             .map(|p| Self::is_markdown_path(p))
             .unwrap_or(false);
         let preview_on = self.show_preview();
+        // 渲染期预取派生布尔：已打开文件夹（`files.root` 非空）→ 菜单「Reveal in
+        // Explorer View」启用判定（未开文件夹 → 文件树无可定位目标，禁用）。
+        let files_root_open = self.sidebar.files.root.is_some();
         self.tab_bar_view.update(cx, |tb, cx| {
             tb.render_tab_bar(
                 &mut self.tab_bounds,
                 &self.tab_bar_hscroll,
                 active_is_md,
                 preview_on,
+                files_root_open,
                 window,
                 cx,
             )

@@ -121,7 +121,25 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 None => false,
             };
             if !cached {
-                let rows = self.sidebar_files_collect(sb);
+                let mut rows = self.sidebar_files_collect(sb);
+                // 瞬态选中滚动（Reveal in Explorer View）：在**当前可见行表**定位 selected
+                // 并写滚动偏移。行表只含已扫描的已展开子项 → 目标行可枚举即祖先全扫完
+                // （「先扫后滚」由「行表即真相」保证；扫描完成令 layout_gen+1 → 缓存
+                // 失效重收行表时再施，不在首扫前按错误行序乱滚）。目标 = 行顶
+                // （idx×ROW_H），clamp 到 [0, 内容高−视口高]（gpui 布局期还会再钳一次）。
+                if sb.files.scroll_to_selected {
+                    if let Some(selected) = sb.files.selected.clone()
+                        && let Some(idx) = rows.iter().position(|r| r.path == selected)
+                    {
+                        let viewport_h = sb.files_vscroll.bounds().size.height.as_f32().max(0.0);
+                        let total_h = rows.len() as f32 * FILE_TREE_ROW_H;
+                        let max_scroll = (total_h - viewport_h).max(0.0);
+                        let target = (idx as f32 * FILE_TREE_ROW_H).clamp(0.0, max_scroll);
+                        sb.files_vscroll
+                            .set_offset(gpui::point(gpui::px(0.), gpui::px(-target)));
+                        sb.files.scroll_to_selected = false;
+                    }
+                }
                 sb.files_layout = Some((layout_gen, rows));
             }
             let layout_rows = &sb.files_layout.as_ref().unwrap().1;
@@ -300,7 +318,11 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 .into_any_element();
         }
         let is_expanded = row.is_dir && sb.files.expanded.contains(&row.path);
-        let is_active = !row.is_dir && self.active_file_path_matches(&row.path);
+        // 行高亮 = 当前激活选项卡文件（is_active）∪ **瞬态选中**（Reveal in Explorer View
+        // 定位目标，非持久、见 FileTreeState::selected）——二者合并后同为 active_bg。
+        let is_active = !row.is_dir
+            && (self.active_file_path_matches(&row.path)
+                || sb.files.selected.as_deref() == Some(row.path.as_path()));
         let row_fg = if is_active { fg } else { muted };
         // P2-10：hover 状态跨帧记录 → 行背景淡入（与搜索行同款）。
         // P2-① 唯一性：hover 键用稳定身份（`row.path`）——虚拟化滚动/目录展开折叠/过滤

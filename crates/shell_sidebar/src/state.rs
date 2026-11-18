@@ -73,6 +73,18 @@ pub struct FileTreeState {
     /// （[`SidebarChromeState::files_layout`]）以此失效重建。
     /// `pub`：宿主/测试直写可见（files.rs 失效缓存递增）。
     pub layout_gen: u64,
+    /// **瞬态选中**（「Reveal in Explorer View」定位目标）：目标文件完整路径。
+    /// 非持久选中——**禁止**把它当树单选语义用（不参与激活/打开）：再次 reveal 覆盖；
+    /// 用户点击其它行（文件树行打开/激活）或从文件树视图切走时清空
+    /// （回传 [`SidebarHost::sidebar_open_path_or_activate`] / [`Self::toggle_view`] 清理）。
+    /// `pub`：宿主/测试直写可见（file_tree_ops.rs reveal + files.rs 高亮合并）。
+    pub selected: Option<PathBuf>,
+    /// **瞬态滚动待施**（reveal 定位目标行）：为 `true` 时渲染期在**当前可见行表**
+    /// 定位 `selected` 并写 `files_vscroll` 偏移（行表只含已扫描的已展开子项 →
+    /// 目标行可枚举即祖先全扫完 =「先扫后滚」由行表即真相保证，扫描完成令
+    /// `layout_gen`+1 → 缓存失效重收行表后再定位，不因首扫前 layout_gen 未变而滚错）。
+    /// `pub`：宿主/测试直写可见（files.rs 渲染期消费 + reveal 置位）。
+    pub scroll_to_selected: bool,
 }
 
 impl FileTreeState {
@@ -232,6 +244,8 @@ pub struct SidebarChromeState {
 impl SidebarChromeState {
     /// 切换视图：未在该面板 → 展开并切到；已在该面板再点 → 只收起面板。
     /// （折叠/展开逻辑此前栖身在 `toggle_sidebar_view`，随状态一起收编。）
+    /// 切到**非文件树**视图 → 清文件树瞬态选中与待滚（避免切回文件树时残留
+    /// reveal 高亮/待滚标记）。
     /// `#[doc(hidden)] pub`：`tests/pdf.rs` TOC 面板展开断言（§8.6 外提清单）。
     #[doc(hidden)]
     pub fn toggle_view(&mut self, view: SidebarView) {
@@ -240,6 +254,10 @@ impl SidebarChromeState {
         } else {
             self.open = true;
             self.panel_open = true;
+            if view != SidebarView::Files {
+                self.files.selected = None;
+                self.files.scroll_to_selected = false;
+            }
             self.view = view;
         }
     }

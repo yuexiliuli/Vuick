@@ -123,12 +123,16 @@ impl shell_sidebar::SidebarHost for EditorApp {
     }
 
     /// 打开/激活文件：宿主 `open_file`/`activate_tab` 能力（file_ops.rs 的既有实现）。
+    /// 文件树行点击即「用户注意力离开 reveal 定位」→ 清文件树**瞬态选中**与待滚
+    /// （选中文件打开后成为激活 tab，仍经 `is_active` 高亮，语义不丢）。
     fn sidebar_open_path_or_activate(
         &mut self,
         path: &std::path::Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sidebar.files.selected = None;
+        self.sidebar.files.scroll_to_selected = false;
         self.open_path_or_activate(path, window, cx);
     }
 
@@ -508,6 +512,72 @@ impl shell_tabs::TabsHost for EditorApp {
         cx: &mut Context<Self>,
     ) {
         self.tab_copy_to_new_window(idx, window, cx);
+    }
+
+    /// 菜单「复制路径」→ 取当前 tab 路径后转发 `file_tree_copy_path`（绝对路径写剪贴板）。
+    /// untitled（无路径）被误调 → no-op 不提示（菜单禁用兜底）。
+    fn tabs_host_copy_path(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let path = self
+            .model
+            .borrow()
+            .tabs
+            .get(idx)
+            .and_then(|t| t.payload.file_path.clone());
+        if let Some(path) = path {
+            self.file_tree_copy_path(&path, cx);
+        }
+    }
+
+    /// 菜单「复制相对路径」→ 转发 `file_tree_copy_relative_path`（相对已打开文件夹根，
+    /// 无根退化绝对）。untitled 被误调 → no-op。
+    fn tabs_host_copy_relative_path(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let path = self
+            .model
+            .borrow()
+            .tabs
+            .get(idx)
+            .and_then(|t| t.payload.file_path.clone());
+        if let Some(path) = path {
+            self.file_tree_copy_relative_path(&path, cx);
+        }
+    }
+
+    /// 菜单「在资源管理器中显示」→ 转发 `file_tree_reveal_in_explorer`（spawn explorer）。
+    /// untitled 被误调 → no-op。
+    fn tabs_host_reveal_in_explorer(
+        &mut self,
+        idx: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .model
+            .borrow()
+            .tabs
+            .get(idx)
+            .and_then(|t| t.payload.file_path.clone());
+        if let Some(path) = path {
+            self.file_tree_reveal_in_explorer(&path, cx);
+        }
+    }
+
+    /// 菜单「Reveal in Explorer View」→ 转发 `file_tree_reveal_in_explorer_view`（侧边栏
+    /// Files 视图展开/高亮/滚动定位目标）。untitled 被误调 → no-op。
+    fn tabs_host_reveal_in_explorer_view(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .model
+            .borrow()
+            .tabs
+            .get(idx)
+            .and_then(|t| t.payload.file_path.clone());
+        if let Some(path) = path {
+            self.file_tree_reveal_in_explorer_view(&path, window, cx);
+        }
     }
 
     fn tabs_host_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {

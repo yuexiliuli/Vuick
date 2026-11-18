@@ -162,6 +162,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         bounds_cell: Rc<Cell<Bounds<Pixels>>>,
         colors: &TabBarColors,
         host: WeakEntity<H>,
+        files_root_open: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -423,7 +424,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this: &mut Self, ev, window, cx| {
-                this.on_tab_right_click(idx, ev, window, cx);
+                this.on_tab_right_click(idx, files_root_open, ev, window, cx);
             }),
         );
         // 拖拽排序：本次拖拽光标落在「插入到本选项卡左/右边界」→ 在本选项卡边界画白色
@@ -575,6 +576,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         hscroll: &TableScrollState,
         active_is_md: bool,
         preview_on: bool,
+        files_root_open: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -641,6 +643,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 tab_bounds[i].clone(),
                 &colors,
                 host.clone(),
+                files_root_open,
                 window,
                 cx,
             ));
@@ -778,17 +781,29 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
     /// 选项卡右键 → 在光标处弹**选项卡管理菜单**（复用宿主 `tab_bar_menu_*` 槽位与
     /// `render_tab_bar_menu` Overlay，同一时刻只开一个）。菜单分组：
     /// 关闭 / 关闭其他 / 关闭右侧 / 关闭已保存 / 关闭全部 ── 分割线 ──
-    /// 移入新窗口 / 复制到新窗口。
+    /// 移入新窗口 / 复制到新窗口 ── 分割线 ── 复制路径 / 复制相对路径 ── 分割线 ──
+    /// 在资源管理器中显示 / Reveal in Explorer View（同组不再加分隔线）。
+    /// `files_root_open` = 宿主渲染期预取「已打开文件夹」（`files.root` 非空）布尔，
+    /// 供「Reveal in Explorer View」禁用判定（未打开文件夹 → 无树可定位）。
     /// `stop_propagation`：不冒泡到选项卡栏空白区右键（新建/打开），也不触发媒体右键菜单。
     pub fn on_tab_right_click(
         &mut self,
         idx: usize,
+        files_root_open: bool,
         ev: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
         let weak = self.host_weak();
+        // untitled（无路径）→ 「复制路径 / 复制相对路径 / 在资源管理器中显示」三项禁用
+        // （菜单构建期定禁用态；host 侧被误调时 no-op 兜底）。
+        let has_path = self
+            .model
+            .borrow()
+            .tabs
+            .get(idx)
+            .is_some_and(|t| t.payload.file_path.is_some());
         let (menu, sub) = ui::menu::spawn_context_menu(
             window,
             cx,
@@ -856,6 +871,51 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                                 this.tabs_host_copy_to_new_window(idx, window, cx);
                             });
                         })
+                })
+                .separator()
+                .item({
+                    let weak = weak.clone();
+                    ui::menu::label_menu_item("复制路径", "tab-menu-copy-path")
+                        .disabled(!has_path)
+                        .on_click(move |_, _window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_copy_path(idx, cx);
+                            });
+                        })
+                })
+                .item({
+                    let weak = weak.clone();
+                    ui::menu::label_menu_item("复制相对路径", "tab-menu-copy-rel-path")
+                        .disabled(!has_path)
+                        .on_click(move |_, _window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_copy_relative_path(idx, cx);
+                            });
+                        })
+                })
+                .separator()
+                .item({
+                    let weak = weak.clone();
+                    ui::menu::label_menu_item("在资源管理器中显示", "tab-menu-reveal-explorer")
+                        .disabled(!has_path)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.tabs_host_reveal_in_explorer(idx, window, cx);
+                            });
+                        })
+                })
+                .item({
+                    let weak = weak.clone();
+                    ui::menu::label_menu_item(
+                        "Reveal in Explorer View",
+                        "tab-menu-reveal-explorer-view",
+                    )
+                    .disabled(!has_path || !files_root_open)
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.tabs_host_reveal_in_explorer_view(idx, window, cx);
+                        });
+                    })
                 })
             },
             |this, emitter, cx| {
