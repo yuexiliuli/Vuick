@@ -45,6 +45,16 @@ fn open_file_settled(
     })
 }
 
+/// md 打开默认进入 WYSIWYG（所见即所得）：退出到「源码编辑区 + 右栏预览」分屏态，令
+/// 阅读进度存/取都作用在源码编辑区（`tab_reading_position` 在 live 态读 live2、恢复却
+/// 只写隐藏的源码编辑区/右栏 md_wy → 二者不在同一读数面，本域测试按源码态语义跑）。
+fn exit_live(app: &Entity<EditorApp>, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.preview_toggle_live_test(window, cx));
+    });
+    settle_frames(cx, 4);
+}
+
 /// 取选项卡的右栏 md 预览（WyEditor）实体（该 md tab 建有 `md_wy` 时）。
 fn md_wy_of(
     app: &Entity<EditorApp>,
@@ -81,6 +91,7 @@ async fn restore_md_preview_converges_after_reopen(cx: &mut TestAppContext) {
     }
     let p = rp_md_block_fixture("pv1");
     let idx = open_file_settled(&app, cx, &p);
+    exit_live(&app, cx);
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
         a.model.borrow().tabs[idx].payload.editor.clone()
@@ -104,6 +115,7 @@ async fn restore_md_preview_converges_after_reopen(cx: &mut TestAppContext) {
 
     // 重开 → 编辑区恢复行 50（R1 口径：需投递 next-frame 才触发 apply_text_restore）。
     let idx2 = open_file_settled(&app, cx, &p);
+    exit_live(&app, cx);
     cx.update(|window, cx| {
         window.simulate_next_frame(cx);
     });
@@ -149,6 +161,7 @@ async fn restore_md_when_preview_was_reading_surface(cx: &mut TestAppContext) {
     }
     let p = rp_md_block_fixture("pv2");
     let idx = open_file_settled(&app, cx, &p);
+    exit_live(&app, cx);
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
         a.model.borrow().tabs[idx].payload.editor.clone()
@@ -191,6 +204,7 @@ async fn restore_md_when_preview_was_reading_surface(cx: &mut TestAppContext) {
         "关 tab 应把行 90 存进 map"
     );
     let idx2 = open_file_settled(&app, cx, &p);
+    exit_live(&app, cx);
     cx.update(|window, cx| {
         window.simulate_next_frame(cx);
     });
@@ -233,6 +247,7 @@ async fn restore_md_top_line_after_reopen_and_off_switch(cx: &mut TestAppContext
     }
     let p = rp_md_fixture("md1");
     let idx = open_file_settled(&app, cx, &p);
+    exit_live(&app, cx);
 
     // 打开默认回到顶部。
     let ed = cx.update(|_, cx| {
@@ -271,6 +286,7 @@ async fn restore_md_top_line_after_reopen_and_off_switch(cx: &mut TestAppContext
 
     // 重开 → 恢复到同一源码行（首帧后滚动：需投递 next-frame 才触发 apply_text_restore）。
     let idx2 = open_file_settled(&app, cx, &p);
+    exit_live(&app, cx);
     cx.update(|window, cx| {
         window.simulate_next_frame(cx);
     });
@@ -319,6 +335,88 @@ async fn restore_txt_top_line_after_reopen(cx: &mut TestAppContext) {
         cx.update(|_, cx| ed2.read(cx).viewport_top_line()),
         40,
         "txt 重开应回到上次阅读行"
+    );
+    let _ = std::fs::remove_file(&p);
+}
+
+/// R3（live 默认态恢复主路径）：md 打开默认进入 WYSIWYG，可见面 = live2 左面板——
+/// 阅读进度存档取自 live2 视口顶源码行（`tab_reading_position` 的 live 口径），重开
+/// 必须恢复到**同一可见面**。修复前 `apply_reading_progress` 只写（默认隐藏的）源码
+/// 编辑区 + 右栏 md_wy → WYSIWYG 下重开不回位（真机「WYSIWYG 阅读进度没作用」）。
+/// 逐行独立块夹具（H3/行）→ `block_start_of_line(i)==i`，`live2.top_source_line()`
+/// 无歧义断言（K177：期望值 50 从「滚到第 50 块起点」的真实几何推导，非拍脑袋）。
+#[gpui::test]
+async fn restore_live_wysiwyg_visible_surface_after_reopen(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (app, cx) = add_app(cx);
+    cx.simulate_resize(gpui::size(px(980.), px(720.)));
+    for _ in 0..3 {
+        cx.run_until_parked();
+    }
+    let p = rp_md_block_fixture("live1");
+    // 打开默认进入 WYSIWYG：live2 就绪可用（无 exit_live / toggle 步骤）。
+    let idx = open_file_settled(&app, cx, &p);
+    let live2_of = |cx: &mut VisualTestContext, i: usize| -> gpui::Entity<WyEditor> {
+        cx.update(|_, cx| {
+            app.read(cx)
+                .model
+                .borrow()
+                .tabs[i]
+                .live2
+                .clone()
+                .expect("md 默认 live 态应持有 live2")
+        })
+    };
+    let live2 = live2_of(&mut *cx, idx);
+    assert!(
+        cx.update(|_, cx| live2.read(cx).is_loaded()),
+        "小文档 live2 应同步装配完成"
+    );
+    // 模拟在 WYSIWYG 可见面读到第 51 行（第 50 块）：`set_scroll_target` 钉到块起点 50。
+    cx.update(|_, cx| {
+        live2.update(cx, |w, _| w.set_scroll_target(50));
+    });
+    for _ in 0..15 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+        let _ = cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+    }
+    let saved_line = cx.update(|_, cx| live2.read(cx).top_source_line());
+    assert_eq!(saved_line, Some(50), "钉定后 live2 视口顶应为目标块起点 50");
+
+    // 关 tab → save_reading_progress（内存 map；live 口径读 live2 顶行）。
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.remove_tab(idx, window, cx));
+    });
+    let saved = cx.update(|_, cx| app.read(cx).model.borrow().reading_progress.clone());
+    assert!(
+        saved.values().any(|rp| matches!(rp, shell::app::ReadingProgress::Markdown { top_line } if *top_line == 50)),
+        "关 tab 应把 live 态读到的行 50 存进 map"
+    );
+
+    // 重开 → 默认 live → live2 可见面恢复行 50（`apply_reading_progress` 记 target、
+    // `advance_live2_restore` 装配钩子钉定、WyEditor prepaint 自钉收敛）。
+    let idx2 = open_file_settled(&app, cx, &p);
+    let live2b = live2_of(&mut *cx, idx2);
+    assert!(cx.update(|_, cx| live2b.read(cx).is_loaded()), "重开 live2 应装配完成");
+    let mut restored = None;
+    for _ in 0..30 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+        let _ = cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        restored = cx.update(|_, cx| live2b.read(cx).top_source_line());
+        if restored == Some(50) {
+            break;
+        }
+    }
+    assert_eq!(
+        restored,
+        Some(50),
+        "R3：重开 WYSIWYG 可见面应恢复到上次阅读块起点 50"
     );
     let _ = std::fs::remove_file(&p);
 }
@@ -723,6 +821,7 @@ async fn session_restore_applies_saved_reading_progress(cx: &mut TestAppContext)
     }
     let p = rp_md_fixture("sess-restore");
     let idx = open_file_settled(&app, cx, &p);
+    exit_live(&app, cx);
     let ed = cx.update(|_, cx| {
         let a = app.read(cx);
         a.model.borrow().tabs[idx].payload.editor.clone()
@@ -752,6 +851,7 @@ async fn session_restore_applies_saved_reading_progress(cx: &mut TestAppContext)
     };
     assert!(session_store::write_manifest(&dir, &m), "清单应写入");
     run_session_restore(&app, cx, &dir);
+    exit_live(&app, cx);
 
     // 恢复出的 tab（下标 0，连 remove 后零 tab 经恢复重建）应套进度到行 50。
     let ed2 = cx.update(|_, cx| {
@@ -806,6 +906,7 @@ async fn session_restore_never_clobbers_saved_progress_to_zero(cx: &mut TestAppC
     };
     assert!(session_store::write_manifest(&dir, &m), "清单应写入");
     run_session_restore(&app, cx, &dir);
+    exit_live(&app, cx);
 
     // (a) 恢复应套进度（R1；同时保证 (b) 的落盘点读到的是恢复后的真实位置而非 0）。
     let ed = cx.update(|_, cx| {

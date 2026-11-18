@@ -194,6 +194,14 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到源码态（本用例聚焦源码编辑区粘贴、验证预览随
+        // 源码编辑增量跟随；WYSIWYG 模式下 `editor_focus_handle` 指向 live2、预预览已隐藏）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
         let preview_text = |cx: &mut VisualTestContext| {
             cx.update(|_w, cx| {
                 let a = app.read(cx);
@@ -250,6 +258,14 @@
         std::fs::write(&p, "A\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 打开即默认进入 WYSIWYG：退出到源码态（本用例聚焦源码编辑区连贴两次、验证预览
+        // 逐键跟随；WYSIWYG 模式下 `editor_focus_handle` 指向 live2）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
         for _ in 0..5 {
             cx.run_until_parked();
@@ -1269,6 +1285,15 @@
             }
         }
         assert!(first, "首块应在 200 帧内挂载");
+        // 打开即默认进入 WYSIWYG（大文档异步路径在 finish 内 enter_live）：退出到源码态
+        // ——本用例聚焦**源码编辑区**粘贴（`editor_focus_handle` 在 live 态指向 live2，
+        // 会遇到编辑进 WYSIWYG 而源码不变）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+        }
         // 真实编辑路径：聚焦编辑区 + 粘贴（走 `EditorEvent::Edited` → edit_version +1）。
         cx.update(|window, cx| {
             let focus = app.read(cx).editor_focus_handle(cx);
@@ -1669,6 +1694,16 @@
             if frames > 120 {
                 break;
             }
+        }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例断言编辑
+        // 区与右栏预览纵向量程健康；WYSIWYG 所见即所得模式下右栏预览不渲染、量程不计）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
         }
         let (lines, lh) = cx.update(|_, cx| {
             let a = app.read(cx);

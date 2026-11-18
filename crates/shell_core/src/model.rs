@@ -686,6 +686,12 @@ pub struct TabPayload {
     /// 「md 阅读进度恢复在途」守卫（与 [`EditorTab::md_restore_pending`] 同语义；
     /// 未消费完就被拖到新窗口时随选项卡搬迁）。
     pub md_restore_pending: Option<(usize, u32)>,
+    /// live（WYSIWYG）可见面阅读进度恢复目标：存档源码行。默认打开即 WYSIWYG 时，
+    /// `apply_reading_progress` 同时记下它，宿主逐帧（`advance_live2_restore`）等在途
+    /// live2 装配完成（`is_loaded()`）后 `set_scroll_target` 钉到该行并清位——弥补
+    /// 恢复只写（隐藏的）源码编辑区/右栏 md_wy、live 可见面不回位的缺口。随选项卡搬迁；
+    /// 非 live 打开/退出 live 后不消费（源码态恢复走 `reading_restore`）。
+    pub live2_restore: Option<usize>,
 }
 
 /// 一个从窗口中「拔出」的选项卡快照：即 [`TabPayload`] 本体（保留原名，宿主 / 测试 /

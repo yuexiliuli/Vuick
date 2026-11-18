@@ -20,6 +20,16 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例断言右栏
+        // 右栏预览宿主渲染；WYSIWYG 所见即所得模式下右栏预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
 
         // 宿主三件套：分屏外框 + 滚动容器 + 自绘竖滚动条叠层。
         assert!(
@@ -168,6 +178,16 @@
                     if frames > 160 {
                         break;
                     }
+                }
+                // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例断言
+                // 右栏预览宿主几何；WYSIWYG 所见即所得模式下右栏预览不渲染）。
+                vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+                });
+                for _ in 0..8 {
+                    vcx.run_until_parked();
+                    let _ = vcx.cx.refresh();
+                    vcx.run_until_parked();
                 }
                 let body = vcx
                     .debug_bounds("md-wy-body")
@@ -352,6 +372,16 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例断言右栏
+        // 预览外框几何；WYSIWYG 所见即所得模式下右栏预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
         let (pv, sc, tb, st) = {
             let pv = cx
                 .debug_bounds("preview-md-wy")
@@ -519,6 +549,16 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态——本用例验证的是
+        // **源码编辑 → 预览的增量桥**（`editor_focus_handle` 在 live 态指向 live2）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
         let par = |cx: &mut VisualTestContext| {
             cx.update(|_w, cx| {
                 let a = app.read(cx);
@@ -573,6 +613,16 @@
         std::fs::write(&p, "一行\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例验证源码
+        // 编辑的撤销/重做随增量桥同步到预览；`editor_focus_handle` 在 live 态指向 live2）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
         for _ in 0..8 {
             cx.run_until_parked();
@@ -638,6 +688,16 @@
         std::fs::write(&p, "- 项目 A\n- 项目 B\n").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例验证源码
+        // 混合编辑随增量桥同步到预览；`editor_focus_handle` 在 live 态指向 live2）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
         for _ in 0..8 {
             cx.run_until_parked();
@@ -741,6 +801,14 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例断言切换
+        // 自动换行不改变右栏预览宿主渲染；WYSIWYG 所见即所得模式下右栏预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
         // 初始：全局编辑区换行偏好默认关闭（仅 md 编辑区默认换行）；MD 预览走统一组件。
         let (wy0, pref0) = cx.update(|_w, cx| {
             let a = app.read(cx);
@@ -805,14 +873,7 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        // 打开前：非 live 模式无该滚动条。
-        assert!(
-            cx.debug_bounds("live-vscrollbar-overlay").is_none(),
-            "源码编辑模式不应有 WYSIWYG 滚动条"
-        );
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
+        // 打开即默认进入 WYSIWYG（live）模式：宿主与滚动条直接渲染（无 toggle 进入步骤）。
         for _ in 0..8 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
@@ -858,15 +919,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        // ON：进入 WYSIWYG（live2）实时编辑模式。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 在 WYSIWYG 文档开头插入一行含 CJK/emoji/行内样式的文本（编辑后的多字节内容）。
         let inserted = "# 切换后新增❗🍎 **测试**\n";
         cx.update(|_w, cx| {
@@ -965,6 +1018,20 @@
             cx.run_until_parked();
         }
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
+        // 打开即默认进入 WYSIWYG（live2）→ 先切回源码编辑态（commit_live，空编辑走跳过
+        // 写回路径），让 code-editor 重新在树上、可接收 MouseDown。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("code-editor").is_some(),
+            "切回源码编辑态后编辑区应渲染"
+        );
         // 编辑区首格内按下：模拟菜单项 MouseDown 漏进编辑区。不派发 MouseUp，对应真实
         // 场景里 MouseUp 被菜单项 `activate` 的 stop_propagation 截断、到不了编辑器。
         let top_left = cx.debug_bounds("code-editor").expect("编辑区应渲染").origin;
@@ -1069,15 +1136,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        // ON：进入 WYSIWYG（live2）实时编辑模式。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 在 WYSIWYG 文档里按同一偏移删掉该 `#`（标题 → 普通段落）。
         let live = cx.update(|_w, cx| {
             app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
@@ -1174,15 +1233,7 @@
             )
         });
         assert_eq!(src_before, src, "源码编辑区应已装载文件原文");
-        // ON：进入 WYSIWYG（live2），期间不做任何编辑。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2），期间不做任何编辑（无 toggle 进入步骤）。
         // OFF：未编辑 → 应走 O(1) 跳过写回路径。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
@@ -1267,15 +1318,7 @@
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
         let wb_before = shell_core::LIVE_COMMIT_WRITEBACK
             .load(std::sync::atomic::Ordering::Relaxed);
-        // ON：进入 WYSIWYG（live2）。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 在 WYSIWYG 文档开头插入一行（编辑路径 → live2_dirty 置位）。
         let inserted = "# 切换后新增\n";
         cx.update(|_w, cx| {
@@ -1360,15 +1403,7 @@
             cx.run_until_parked();
         }
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
-        // ON：进入 WYSIWYG（live2），等加载完成。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..12 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 在 WYSIWYG 里做多行编辑：文档开头插入一行 + 中部替换一行。
         cx.update(|_w, cx| {
             let live = app
@@ -1502,14 +1537,7 @@
             cx.run_until_parked();
         }
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..12 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 单字符编辑：把文档中间的「段」改成「更」。
         cx.update(|_w, cx| {
             let live = app
@@ -1595,15 +1623,7 @@
             cx.run_until_parked();
         }
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
-        // ON：进入 WYSIWYG（live2）。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..12 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         let live = cx.update(|_w, cx| {
             app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
@@ -1700,14 +1720,7 @@
             cx.run_until_parked();
         }
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..12 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 大段粘贴：单条 replace_range 插入约 30KB（远大于单键 op，仍远低于 md_wy 整篇
         // 兜底阈值 64KB → 右栏应走逐 op 增量对齐路径）。
         let big = format!("## 大段\n{}\n", "粘贴内容行示例，中文与 ASCII 混排。\n".repeat(1000));
@@ -1794,14 +1807,7 @@
             cx.run_until_parked();
         }
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..12 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 在 WYSIWYG 里做一笔开头插入（缴存 1 条 op）。
         cx.update(|_w, cx| {
             let live = app
@@ -1890,6 +1896,16 @@
         std::fs::write(&md, format!("{}\n", "# 标题\n正文段落。\n\n".repeat(600))).unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例拖右栏
+        // 预览滚动条；WYSIWYG 所见即所得模式下预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
         for _ in 0..8 {
             cx.run_until_parked();
@@ -2005,14 +2021,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..12 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 编辑一字（切回走 op 重放主路径）。
         cx.update(|_w, cx| {
             let live = app
@@ -2090,14 +2099,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..12 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2，无 toggle 进入步骤）：直接切 OFF 即 commit_live。
         // ON → OFF：实体进 `retired_live2`，此时尚未到下一帧 on_next_frame，队列应暂存 1
         //（app 侧不立即放行、不同步 Drop——销毁被延迟出点击路径）。
         cx.update(|window, cx| {
@@ -2207,10 +2209,7 @@
                 .to_string()
         });
         assert_eq!(wy_old, src, "切回前右栏应显示原文档全文");
-        // ON：进入 WYSIWYG（live2），等加载完成。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
+        // 打开即默认进入 WYSIWYG（live2，大文档异步路径），等装配完成。
         let mut l2_loaded = false;
         for _ in 0..200 {
             cx.run_until_parked();
@@ -2336,14 +2335,7 @@
             cx.run_until_parked();
         }
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..12 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接编辑实时文档（无 toggle 进入步骤）。
         // 单字符编辑（小跨度 → 右栏逐 op 增量对齐）。
         cx.update(|_w, cx| {
             let live = app
@@ -2436,9 +2428,7 @@
         }
         assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
+        // 打开即默认进入 WYSIWYG（live2，大文档异步路径），等装配完成。
         let mut l2_loaded = false;
         for _ in 0..200 {
             cx.run_until_parked();
@@ -2456,7 +2446,6 @@
             }
         }
         assert!(l2_loaded, "live2 应在 200 帧内加载完大文档");
-        // 大段插入 X（切回登记后台装配 CX）。
         let big_x = format!("## 大段 X\n{}\n", "X 内容，构成大跨度。\n".repeat(3000));
         cx.update(|_w, cx| {
             let live2 = app
@@ -2554,9 +2543,7 @@
         }
         assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
         let editor = cx.update(|_w, cx| app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab].payload.editor.clone());
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
+        // 打开即默认进入 WYSIWYG（live2，大文档异步路径），等装配完成。
         let mut l2_loaded = false;
         for _ in 0..200 {
             cx.run_until_parked();
@@ -2689,9 +2676,7 @@
             }
         }
         assert!(ready, "大文档编辑区应在 200 帧内就绪");
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
+        // 打开即默认进入 WYSIWYG（live2，大文档异步路径），等装配完成。
         let mut l2_loaded = false;
         for _ in 0..200 {
             cx.run_until_parked();
@@ -2813,10 +2798,7 @@
             }
         }
         assert!(ready, "大文档编辑区应在 200 帧内就绪");
-        // ON，等 live2 后台解析就绪。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
+        // 打开即默认进入 WYSIWYG（live2，大文档异步路径），等 live2 后台解析就绪。
         let mut l2_loaded = false;
         for _ in 0..200 {
             cx.run_until_parked();
@@ -3285,6 +3267,7 @@
         let src = block.repeat((600 * 1024) / block.len());
         assert!(src.len() >= 512 * 1024, "大文档应 ≥512KB，实际 {}", src.len());
         std::fs::write(&md, &src).unwrap();
+        // 打开即默认进入 WYSIWYG（大文档异步路径在 `finish_file_text` 内 enter_live）。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
         });
@@ -3304,32 +3287,7 @@
             }
         }
         assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
-        let md_old = cx.update(|_w, cx| {
-            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
-                .payload.md_wy
-                .clone()
-                .expect("md_wy 应存在")
-                .read(cx)
-                .text()
-                .to_string()
-        });
-        assert_eq!(md_old, src, "toggle 前右栏应为原文档全文");
-        // ON：守卫该命中共享复用路径（探针 +1）。
-        let reuse_before = crate::app::preview::LIVE_ON_MD_WY_REUSE
-            .load(std::sync::atomic::Ordering::Relaxed);
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        let reuse_after = crate::app::preview::LIVE_ON_MD_WY_REUSE
-            .load(std::sync::atomic::Ordering::Relaxed);
-        // 全局复用探针：并行的其它大文档 toggle ON 用例（同一 ≥512KB + md_wy 已 loaded
-        // 同源布置）也走同一复用路径、可能并发推进计数 → 用 ≥（本用例至少一次），与
-        // 既有 `LIVE_COMMIT_*` 全局探针判据同款（见 1207/1314 注释）。「本次 toggle 真的
-        // 复用」的确定性判据是下方 live2 len/text == 编辑区全文、右栏 md_wy 不被改动。
-        assert!(
-            reuse_after > reuse_before,
-            "大文档 toggle ON 且右栏 md_wy 已 loaded 应命中共享复用路径"
-        );
+        // 等 live2（打开即进入）装配完成。
         let mut l2_loaded = false;
         for _ in 0..200 {
             cx.run_until_parked();
@@ -3346,7 +3304,59 @@
                 break;
             }
         }
-        assert!(l2_loaded, "live2 应在 200 帧内装配完（复用路径 = 克隆 + 预建）");
+        assert!(l2_loaded, "live2 应在 200 帧内装配完（打开即进入）");
+        let md_old = cx.update(|_w, cx| {
+            app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
+                .payload.md_wy
+                .clone()
+                .expect("md_wy 应存在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        assert_eq!(md_old, src, "右栏应为原文档全文");
+        // 打开即进入发生在右栏 md_wy 后台装配完成的**之前**（`finish_file_text` 的 early_live
+        // 让位 → 打开路径走 open_from_rope 兜底、不复用）。复用路径只在「md_wy 已 loaded 后
+        // 再进入」命中 → 先切回源码态（commit_live，未编辑走跳过写回）再切回 ON。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let reuse_before = crate::app::preview::LIVE_ON_MD_WY_REUSE
+            .load(std::sync::atomic::Ordering::Relaxed);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        let mut l2_loaded2 = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            l2_loaded2 = cx.update(|_w, cx| {
+                app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
+                    .live2
+                    .as_ref()
+                    .map(|l| l.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if l2_loaded2 {
+                break;
+            }
+        }
+        assert!(l2_loaded2, "再进入后 live2 应在 200 帧内装配完（复用路径 = 克隆 + 预建）");
+        let reuse_after = crate::app::preview::LIVE_ON_MD_WY_REUSE
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // 全局复用探针：并行的其它大文档进入用例（同一 ≥512KB + md_wy 已 loaded 同源布置）
+        // 也走同一复用路径、可能并发推进计数 → 用 >（本用例至少一次）。「本次进入真的
+        // 复用」的确定性判据是下方 live2 len/text == 编辑区全文、右栏 md_wy 不被改动。
+        assert!(
+            reuse_after > reuse_before,
+            "大文档右栏 md_wy 已 loaded 时机再进入 WYSIWYG 应命中共享复用路径（探针 +1）"
+        );
         let (l2_len, l2_text, md_now) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
@@ -3423,15 +3433,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        // ON：进入 WYSIWYG（live2）实时编辑模式。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接使用实时文档（无 toggle 进入步骤）。
         let live = cx.update(|_w, cx| {
             app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
@@ -3528,15 +3530,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        // ON：进入 WYSIWYG（live2）实时编辑模式。
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接使用实时文档（无 toggle 进入步骤）。
         let live = cx.update(|_w, cx| {
             app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]
                 .live2
@@ -3630,14 +3624,7 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
+        // 打开即默认进入 WYSIWYG（live2）：直接使用实时文档（无 toggle 进入步骤）。
         // 取 live2 + 其元素底部（paint 期 last_bounds），点击点须在元素底之下、编辑区内。
         let live2_ent = cx.update(|_w, cx| {
             app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab]

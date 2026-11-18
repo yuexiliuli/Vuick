@@ -363,3 +363,15 @@ impl Focusable for EditorApp {
     }
 }
 
+impl EditorApp {
+    /// `#[doc(hidden)] pub`：`tests/reading_progress.rs` / `tests/splitter.rs` 等 md 集成
+    /// 测试在「md 打开默认进入 WYSIWYG（所见即所得）」之后显式**退出/重入** WYSIWYG
+    /// （转发 [`Self::toggle_live_test`] 的守卫/收尾，测试构建与生产同一真源），以恢复
+    /// 「源码编辑区 + 右栏预览」分屏态语义（§8.6 外提清单；生产菜单仍走
+    /// [`Self::toggle_live_test`]，本公开转发仅供集成测试）。
+    #[doc(hidden)]
+    pub fn preview_toggle_live_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_live_test(window, cx);
+    }
+}
+

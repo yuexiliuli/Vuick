@@ -26,6 +26,16 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例走编辑区
+        // 驱动右栏预览的滚动同步；WYSIWYG 所见即所得模式下预览不渲染、无此同步）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
@@ -114,6 +124,16 @@
         std::fs::write(&md, &doc).unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例拖右栏
+        // 预览滚动条驱动编辑区；WYSIWYG 所见即所得模式下预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
         for _ in 0..8 {
             cx.run_until_parked();
@@ -260,6 +280,16 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例拖右栏
+        // 预览滚动条、测预览→编辑区延迟跟随；WYSIWYG 模式下预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
@@ -371,6 +401,16 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例拖右栏
+        // 预览滚动条、测预览→编辑区延迟跟随；WYSIWYG 模式下预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
@@ -474,6 +514,16 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例滚右栏
+        // 预览、测预览→编辑区立即跟随；WYSIWYG 模式下预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
         let (editor, mdw) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
@@ -535,9 +585,7 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
+        // 打开即默认进入 WYSIWYG（live 模式）：滚动条叠层直接渲染（无 toggle 进入步骤）。
         for _ in 0..8 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
@@ -735,9 +783,7 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
-        });
+        // 打开即默认进入 WYSIWYG（live 模式）：live2 就绪即可用（无 toggle 进入步骤）。
         for _ in 0..8 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();

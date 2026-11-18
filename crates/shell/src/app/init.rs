@@ -308,14 +308,11 @@ impl EditorApp {
                     app.restore_session(window, cx);
                 }
             }
-            // 自动化测试钩子（与 MD_OPEN_DEBUG 一类调试入口同款）：仅当显式用 CLI
-            // 打开文件后立即开启「本项目 WYSIWYG（预览编辑测试）」左面板，便于截图/识图验证。
-            if opened_cli_file
-                && std::env::var_os("WY_AUTOTEST").is_some()
-                && app.is_markdown_tab(app.model.borrow().active_tab)
-            {
-                app.toggle_live_test(window, cx);
-            }
+            // 原「WY_AUTOTEST：CLI 打开后立即开启 WYSIWYG」自动化测试钩子已随
+            // 「md 打开默认进入 WYSIWYG」移除（2026-11-18）：小文档在 `open_file_here`
+            // 同步进入、大文档在 `finish_file_text` 异步进入（同一真源 `enter_live_for_tab`），
+            // 无需 env 门控；留着会在已进入的 tab 上再走 `toggle_live_test` 的 OFF 分支
+            // （live2.is_some() → commit_live）反而退出——语义反向，故整段删除。
         }
         // 启动首帧墙钟（VUICK_STARTUP_DIAG=1 门控，默认零开销零行为）：
         // A1 后本段 ≈ `EditorApp::new` 结束段——`restore_session` 只完成「读清单 +

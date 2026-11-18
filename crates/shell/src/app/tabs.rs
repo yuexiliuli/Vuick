@@ -534,6 +534,7 @@ impl EditorApp {
             edit_version: 0,
             reading_restore: None,
             md_restore_pending: None,
+            live2_restore: None,
         };
         self.split_tab_to_new_window(placeholder, Point::new(px(24.), px(24.)), window, cx);
         // ② 找到刚注册的 detached 新窗口实体（不在 before）→ 占位让位、按原路径重开。

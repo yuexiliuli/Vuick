@@ -463,6 +463,16 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例点目录
+        // 驱动右栏预览跳转；WYSIWYG 所见即所得模式下右栏预览不渲染、无跳转）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
         cx.update(|_w, cx| {
             app.update(
                 cx,
@@ -521,6 +531,16 @@
             app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
         });
         for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（本用例末段点击
+        // 目录驱动右栏预览跳转；WYSIWYG 模式下右栏预览不渲染）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..5 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
             cx.run_until_parked();

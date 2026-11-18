@@ -55,6 +55,16 @@ async fn splitter_and_sidebar_resize_handles_render(cx: &mut TestAppContext) {
         let _ = cx.cx.refresh();
         cx.run_until_parked();
     }
+    // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（分割条只在
+    // 源码+预览分屏态渲染；WYSIWYG 所见即所得模式占满整块、无分割条）。
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.preview_toggle_live_test(window, cx));
+    });
+    for _ in 0..4 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+    }
     assert!(
         cx.debug_bounds("splitter").is_some(),
         "md 预览分屏应渲染分割条"
@@ -83,6 +93,15 @@ async fn splitter_grip_drag_still_resizes(cx: &mut TestAppContext) {
         app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
     });
     for _ in 0..8 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+    }
+    // 打开即默认进入 WYSIWYG：退出到「源码编辑区 + 右栏预览」分屏态（分割条只在此态渲染）。
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.preview_toggle_live_test(window, cx));
+    });
+    for _ in 0..4 {
         cx.run_until_parked();
         let _ = cx.cx.refresh();
         cx.run_until_parked();

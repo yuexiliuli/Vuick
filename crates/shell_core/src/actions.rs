@@ -60,6 +60,7 @@ impl AppModel {
                 edit_version: 0,
                 reading_restore: None,
                 md_restore_pending: None,
+                live2_restore: None,
             },
             live_edit: false,
             live2: None,

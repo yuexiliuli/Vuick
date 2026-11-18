@@ -42,6 +42,11 @@ impl Render for EditorApp {
         // 放在 sync 之后执行：本帧 sync 仍见守卫开启（预览即便刚就绪也不会把编辑区拉回），
         // 清位后下一帧起恢复正常的「预览主导→回拉编辑区」语义。
         self.advance_md_restore_window(cx);
+        // live（WYSIWYG）可见面阅读进度恢复的逐帧推进（`advance_md_restore_window` 之后）：
+        // live2 装配完成才一次 `set_scroll_target` 钉到存档行并清位——不逐帧重钉，
+        // live2 加载即渲染，WyEditor prepaint 自钉收敛；目标超行数等被
+        // `advance_pending_scroll` 丢弃即为不可达、保持顶部（与 md_wy 恢复同口径）。
+        self.advance_live2_restore(cx);
         // 阅读进度诊断：apply 命中 markdown 后 2 帧，上报右栏预览顶源码行（验证预览
         // 是否随编辑区恢复收敛——真机「重开停在顶部」候选 b 的证据通道）。
         if let Some(key) = shell_core::rp_diag::preview_pending_due() {
@@ -147,6 +152,38 @@ impl EditorApp {
             return;
         }
         self.model.borrow_mut().tabs[active].payload.md_restore_pending = Some((target, n + 1));
+    }
+
+    /// live（WYSIWYG）态可见面阅读进度恢复的逐帧推进：`apply_reading_progress` 命中
+    /// Markdown 时把存档源码行记入 [`shell_core::model::TabPayload::live2_restore`]；此处
+    /// 逐帧等在途 live2（大文档异步 `install_open` 装配 / 空壳期）**装配完成**（`is_loaded()`）
+    /// 后对其 `set_scroll_target(top)` 一次并清位。前置在 `render_body` 之前 → 本帧 WyEditor
+    /// 元素 prepaint 的 `advance_pending_scroll` 即拾起钉定，无需宿主反复驱动。
+    /// 非 live / live2 未就绪 / 无待恢复目标 → no-op（绝大多数帧）。
+    fn advance_live2_restore(&mut self, cx: &mut Context<Self>) {
+        let app: &gpui::App = &**cx;
+        let active = self.model.borrow().active_tab;
+        let live2 = {
+            let m = self.model.borrow();
+            let Some(tab) = m.tabs.get(active) else {
+                return;
+            };
+            if !tab.live_edit || tab.payload.live2_restore.is_none() {
+                return;
+            }
+            match tab.live2.clone() {
+                Some(l2) => l2,
+                None => return,
+            }
+        };
+        if !live2.read(app).is_loaded() {
+            return; // 大文档两段式空壳装配在途：等 install_open 完成再钉
+        }
+        let Some(top) = self.model.borrow_mut().tabs[active].payload.live2_restore.take() else {
+            return;
+        };
+        live2.read(app).set_scroll_target(top);
+        shell_core::rp_diag::diag("apply_live2", &format!("top={top} loaded=1"));
     }
 
     /// 内容区三态：有选项卡 → 实时编辑占满 / 预览分屏（EPUB 等全屏预览）/ 纯编辑占满；

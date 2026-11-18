@@ -361,6 +361,12 @@ impl EditorApp {
                 // 一律不发（编辑器恢复位是这段的权威面，真机「49→2 拉回顶部」即此）。
                 // 收敛/超时由宿主每帧 `advance_md_restore_window` 清位归还正常双向同步。
                 self.model.borrow_mut().tabs[idx].payload.md_restore_pending = Some((top_line, 0));
+                // live（WYSIWYG）可见面恢复：默认打开即 WYSIWYG 时，源码编辑区与右栏
+                // `md_wy` 均不可见，存档进度只落隐藏面 = 真机「重开不清位」缺口。目标行
+                // 记入 `payload.live2_restore`，宿主逐帧 `advance_live2_restore` 等 live2
+                // 装配完成（`is_loaded()`，大文档两段式空壳期 `set_scroll_target` 会被
+                // `advance_pending_scroll` 丢弃）后一次钉到该行并清位。
+                self.model.borrow_mut().tabs[idx].payload.live2_restore = Some(top_line);
                 // 回调里按**编辑区实体**重新定位选项卡而非记住的下标——next-frame 到达前
                 // 若有其它 tab 被关/开，下标已搬移（回调读旧 idx 会白丢恢复），实体身份
                 // 恒可靠；回调体会在选项卡集合里没找到该实体时安全早退（tab 已关/已搬走）。
@@ -922,14 +928,18 @@ impl EditorApp {
                         window,
                         cx,
                     );
-                    // 自动化测试钩子：大文档异步打开补齐完成后启动 WYSIWYG 左面板
-                    // （`new_impl` 的同步检查跑在 `tab.file_path` 就位之前，这里补齐；
-                    // 小文档走 `load_file_text` 同步挂载，由 `new_impl` 直接开启）。
-                    if std::env::var_os("WY_AUTOTEST").is_some()
+                    // md 大文档异步打开补齐完成后**默认进入** WYSIWYG 左面板（打开即所见
+                    // 即所得）：小文档由 `open_file_here` 同步进入（同一真源
+                    // `shell_preview::live::enter_live`，经 [`Self::enter_live_for_tab`]）。
+                    // 此处只补大文档异步路径的进入点（原 `WY_AUTOTEST` env 门控已随「默认
+                    // 进入」移除，自动化测试语义由「md 打开即进」直接覆盖——见 init.rs 钩子
+                    // 删除注释）。防御：只进目标 tab（idx==active_tab，防用户期间切换）且
+                    // 尚未进入（live2.is_none()，防重复；含大文档首块 `apply_open_chunk` 不触发）。
+                    if is_md
                         && idx == this.model.borrow().active_tab
                         && this.model.borrow().tabs.get(idx).is_some_and(|t| t.live2.is_none())
                     {
-                        this.toggle_live_test(window, cx);
+                        this.enter_live_for_tab(idx, window, cx);
                     }
                     // 最终状态：内容就绪，恢复「已打开」（含大文档关闭软换行的提示）。
                     // 先提纯 owned line_count 再写——避免 `if let` 掮获的共享 Ref
@@ -1445,6 +1455,21 @@ impl EditorApp {
                     t_focus.elapsed().as_millis()
                 );
             }
+        }
+        // md 打开默认进入 WYSIWYG（所见即所得）：小文档同步路径在此进入（与 toggle 同一
+        // 真源 `shell_preview::live::enter_live`，经 [`Self::enter_live_for_tab`]）。置于
+        // 源码编辑区 focus 之后：`enter_live` 内部会把焦点转到 WYSIWYG 活区（打开即可直接
+        // 编辑）。防御 `live2.is_none()` 防重复进入；大文档异步路径的默认进入在
+        // `finish_file_text`（`spawn_progressive_open` 收尾钩子，见该处注释）。
+        if Self::is_markdown_path(&p)
+            && self
+                .model
+                .borrow()
+                .tabs
+                .get(idx)
+                .is_some_and(|t| t.live2.is_none())
+        {
+            self.enter_live_for_tab(idx, window, cx);
         }
     }
 

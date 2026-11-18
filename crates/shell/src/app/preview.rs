@@ -349,8 +349,22 @@ impl EditorApp {
         if self.model.borrow().tabs[idx].live2.is_some() {
             self.commit_live(idx, window, cx);
         } else {
-            shell_preview::live::enter_live(&self.model, idx, window, cx);
+            self.enter_live_for_tab(idx, window, cx);
         }
+        cx.notify();
+    }
+
+    /// 「仅进入」WYSIWYG 活区（toggle ON 那半）：对**已知 md** 的目标下标直接进入，不带
+    /// `is_markdown` 守卫——守卫交给调用者决定（toggle 保留其守卫；打开路径已知是 md，
+    /// 免守卫）。与 toggle 用**同一真源**（域 [`shell_preview::live::enter_live`]，不必在
+    /// 别处手抄 `live2 = Some(...)`），供「md 打开默认进入 WYSIWYG」复用。
+    pub(super) fn enter_live_for_tab(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        shell_preview::live::enter_live(&self.model, idx, window, cx);
         cx.notify();
     }
 }
