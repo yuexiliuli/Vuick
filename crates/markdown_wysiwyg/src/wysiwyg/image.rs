@@ -205,11 +205,36 @@ impl WyEditor {
         cx.notify();
     }
 
-    /// 图片编辑卡片的**窗口锚点现算**（卡片 TopLeft，window 坐标）：复用
-    /// [`CardAnchor::at`] 的内容区水平居中 + 顶对齐换算，独有部分只剩目标行查找与兜底。
-    /// 帧行坐标是**文档局部**（`row.top` 含整篇偏移），窗口坐标 = 元素屏幕原点（`origin`）
-    /// + 帧局部。`origin` 必须与 `f` 同代（paint 期用 `bounds.origin` + 本帧 frame，
-    /// open 期用 `last_bounds` + 保持的帧），否则换帧就闪。缺卡片/找不到图片行 → `None`。
+    /// 图片编辑卡片的**窗口锚点现算**（卡片 TopLeft，window 坐标）：锚在【编辑图片】
+    /// 按钮窗口矩形的**左缘**，纵向**下方优先、放不下翻上**——下方 = 按钮底缘 +
+    /// `IMAGE_EDIT_CARD_GAP`；下方装不下（整卡会越编辑可视区下缘）→ 翻到按钮上方
+    /// （按钮顶缘 − gap − `IMAGE_EDIT_CARD_H`），不盖按钮、不越编辑可视区下缘
+    /// （状态栏之上）。
+    /// 按钮几何在**元素局部**（`image_box_local`/`inline_image_box_local` +
+    /// `image_edit_button_local`/`inline_image_edit_button_local`），窗口坐标 = 元素屏幕
+    /// 原点（`origin`）+ 按钮局部矩形——与现有渲染/命中「paint/hit 同源同一套按钮几何」
+    /// 天然对齐（点哪颗按钮 → 卡片贴哪颗按钮）。`origin` 必须与 `f` 同代（paint 期用
+    /// `bounds.origin` + 本帧 frame，open 期用 `last_bounds` + 保持的帧），否则换帧就闪。
+    /// 可视区上下缘：有宿主滚动句柄 → 用宿主滚动容器**视口 bounds**（`ScrollHandle::bounds()`，
+    /// 由 `clamp_scroll_position` 在 paint 期写入的滚动容器窗口 bounds）：安全下缘 = 编辑区
+    /// 真可视底（状态栏之上）、安全上缘 = 可视区顶。无句柄（独立测试/未注入 live）→ 回退
+    /// `last_bounds()`（元素窗口 bounds）：安全下缘 = 元素屏幕原点 + 元素高（短文档/末尾图时
+    /// 内容底 ≈ 可视区底）、安全上缘 = 元素屏幕原点；缺 `last_bounds`（从未 paint，无从判
+    /// 可视区）→ 保守回退旧「下方」行为（snap 兜底）。⚠️ 旧实现安全下缘恒用 `last_bounds`
+    /// 内容底，滚动后与 paint origin 抵消成**文档内容底**（滚动期间静止）——文档中部、按钮
+    /// 下方还有内容时被误判「下方放得下」→ 卡片越可视区 → snap 兜底盖状态栏（P1，评审发现）；
+    /// 改从宿主视口取真可视下缘后，图中部按钮恰近视口底即正确翻上。判定用估计高
+    /// `IMAGE_EDIT_CARD_H`（保守偏大 → 偏早翻、安全优先）；`anchor_layer` 的
+    /// `snap_to_window_with_margin(8)` 保留作**最后兜底**。
+    /// 缺卡片 → `None`；目标行带外/未物化（找不到按钮）→ 回退 `CardAnchor::at` 的
+    /// 内容区水平居中 + 顶对齐块顶（旧语义，卡片不至于飞出内容列）。
+    ///
+    /// 锚点几何演算（块图；行内图同构只换尺寸常量）：
+    /// `image_edit_button_local_with(box, IMAGE_EDIT_BTN_SIZE=24, IMAGE_EDIT_BTN_MARGIN=6)`
+    /// → 按钮左上 = (box.right − 30, box.top + 6)，边长 24 → 按钮左下 = (box.right − 30,
+    /// box.top + 30)。下方锚 y0 = box.top + 30 + GAP，当 y0 + CARD_H ≤ 安全下缘 → 用 y0；
+    /// 否则翻上 y1 = (box.top + 6) − GAP − CARD_H，且 y1 ≥ 安全上缘（上方也不够则夹回
+    /// 安全上缘，snap 兜底最后）。
     pub(crate) fn image_edit_anchor_now(
         &self,
         origin: gpui::Point<Pixels>,
@@ -217,15 +242,14 @@ impl WyEditor {
     ) -> Option<gpui::Point<Pixels>> {
         let popup = self.image_edit.as_ref()?;
         let src_line = popup.target.src_line();
-        // 行内目标：锚到该行内图的**实际顶部**（行内图可能在折行段落中部，用行顶会让
-        // 卡片远离图片）；块目标：锚到图片行顶。都带「块顶」兜底（带外/未物化行）。
-        let row_top = match popup.target {
+        // 目标【编辑图片】按钮在元素局部的矩形（块图 24×24 / 行内图 16×16，钉图片右上角）。
+        let btn_local = match popup.target {
             ImageEditTarget::Block { .. } => f
                 .rows
                 .iter()
                 .find(|r| r.src_line == src_line && r.kind == crate::markdown::ir::IrKind::Image)
-                .map(|r| f32::from(r.top))
-                .unwrap_or_else(|| f.block_top(f.block_index_for_src_line(src_line).unwrap_or(0))),
+                .and_then(|r| element::image_box_local(f, r))
+                .map(|b| element::image_edit_button_local(&b)),
             ImageEditTarget::Inline(refd) => f
                 .rows
                 .iter()
@@ -244,11 +268,48 @@ impl WyEditor {
                         .iter()
                         .find(|ii| ii.display_off == refd.display_off)
                         .and_then(|ii| element::inline_image_box_local(f, r, ii))
-                        .map(|b| f32::from(b.top()))
-                })
-                .unwrap_or_else(|| f.block_top(f.block_index_for_src_line(src_line).unwrap_or(0))),
+                        .map(|b| element::inline_image_edit_button_local(&b))
+                }),
         };
-        Some(self.image_edit_anchor.at(origin, f, row_top))
+        // 按钮在帧内物化 → 下方优先放不下翻上；带外/未物化行 → 回退旧语义居中顶对齐。
+        let Some(btn) = btn_local else {
+            let row_top = f.block_top(f.block_index_for_src_line(src_line).unwrap_or(0));
+            return Some(self.image_edit_anchor.at(origin, f, row_top));
+        };
+        let gap = px(element::IMAGE_EDIT_CARD_GAP);
+        let card_h = px(element::IMAGE_EDIT_CARD_H);
+        // 可视区上下缘（window 坐标）：优先**宿主滚动容器视口 bounds**（`ScrollHandle::bounds()`，
+        // paint 期 `clamp_scroll_position` 写入滚动容器窗口 bounds；随滚动静止，是编辑区真可视
+        // 下/上缘、状态栏之上）。viewport 有效（高 > 0）才用；句柄缺失或从未被滚动容器 paint
+        // （bounds 仍默认 0×0）→ 回退 `last_bounds` 内容底（短文档/末尾图场景仍成立）；缺
+        // `last_bounds`（从未 paint）→ 保守回退旧「下方」行为（snap 兜底），不猜。`RefCell` 借用
+        // 立即释放（clone 后即丢），不会跨 re-entrant 持 Ref（参照借用硬化姿势）。
+        let viewport = self
+            .host_scroll
+            .borrow()
+            .clone()
+            .and_then(|(vh, _)| {
+                let b = vh.bounds();
+                (f32::from(b.size.height) > 0.).then_some(b)
+            });
+        let (safe_top, safe_bottom) = match viewport {
+            Some(b) => (b.top(), b.bottom()),
+            None => match self.last_bounds() {
+                Some(b) => (origin.y, b.origin.y + b.size.height),
+                None => {
+                    return Some(gpui::point(origin.x + btn.left(), origin.y + btn.bottom() + gap))
+                }
+            },
+        };
+        // 下方放得下（整卡 ≤ 安全下缘）→ 用下方；否则翻上并夹到安全上缘（不越编辑区顶，
+        // snap 最后兜底）。
+        let below_y = origin.y + btn.bottom() + gap;
+        let y = if f32::from(below_y) + element::IMAGE_EDIT_CARD_H <= f32::from(safe_bottom) {
+            below_y
+        } else {
+            (origin.y + btn.top() - gap - card_h).max(safe_top)
+        };
+        Some(gpui::point(origin.x + btn.left(), y))
     }
 
     /// 关闭图片编辑卡片（不写源码）。

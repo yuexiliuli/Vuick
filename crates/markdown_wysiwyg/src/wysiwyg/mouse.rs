@@ -651,10 +651,11 @@ impl WyEditor {
         }
     }
 
-    /// 滚轮：**仅在光标悬停在 mermaid 卡片上时**拦截（普通滚轮 = 整卡缩放），其余位置
-    /// 返回 `false` 放行给宿主滚动/`zoom_overlay`。由元素 paint 期 `window.on_mouse_event`
-    /// （bubble）驱动——元素在宿主 `zoom_overlay`（顶层兄弟）之下，元素级 `.on_scroll_wheel`
-    /// 会被兄弟遮罩吞掉，必须走窗口级事件监听。
+    /// 滚轮：**仅在光标悬停在 mermaid 卡片上时**拦截（普通滚轮 = 整卡缩放），或**图片
+    /// 编辑卡片打开期间**整体拦截（普通滚轮不得让宿主滚动、卡片随内容上下跑），其余
+    /// 位置返回 `false` 放行给宿主滚动/`zoom_overlay`。由元素 paint 期
+    /// `window.on_mouse_event`（bubble）驱动——元素在宿主 `zoom_overlay`（顶层兄弟）之下，
+    /// 元素级 `.on_scroll_wheel` 会被兄弟遮罩吞掉，必须走窗口级事件监听。
     ///
     /// 缩放走 `zoom_mermaid_at`：先捕捉视口锚点、重排后再写回宿主 `ScrollHandle`——页面
     /// **不同步滚动**（缩放改的是卡高，内容随锚点原地钉住）。
@@ -666,6 +667,12 @@ impl WyEditor {
     ) -> bool {
         if ev.modifiers.control {
             return false; // Ctrl 放行给宿主 zoom_overlay（全局字号缩放）。
+        }
+        // 图片编辑卡片打开 → 普通滚轮**整体拦截**：卡片是悬浮表单（内衬输入框，无独立
+        // 滚动区），放行会让宿主滚动、卡片随内容上下跑（锚点还逐帧刷新追赶，观感撕裂）。
+        // Ctrl 已在上方放行（zoom_overlay 全局字号缩放保留）。
+        if self.image_edit.is_some() {
+            return true;
         }
         let Some(b) = self.last_bounds() else {
             return false;

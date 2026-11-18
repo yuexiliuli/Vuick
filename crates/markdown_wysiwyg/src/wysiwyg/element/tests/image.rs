@@ -483,9 +483,16 @@ fn image_edit_card_survives_mouse_up(cx: &mut TestAppContext) {
     let card = vcx
         .debug_bounds("wy-image-edit-card")
         .expect("抬起后卡片仍应被绘制（不得因帧被清而消失/落角）");
+    // 新锚点：卡片 TopLeft =【编辑图片】按钮左下角正下方——x=按钮左缘（盒右缘 −
+    // BTN_SIZE − BTN_MARGIN）、y=按钮底缘 + CARD_GAP（行顶 + BTN_MARGIN + BTN_SIZE + GAP）。
+    let expect_x = cx0 + w - super::IMAGE_EDIT_BTN_SIZE - super::IMAGE_EDIT_BTN_MARGIN;
+    let expect_y =
+        top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE + super::IMAGE_EDIT_CARD_GAP;
     assert!(
-        (f32::from(card.origin.y) - top).abs() < 8.,
-        "抬起后卡片 y {} 仍应贴图片行屏幕位 {top}",
+        (f32::from(card.origin.x) - expect_x).abs() < 8.
+            && (f32::from(card.origin.y) - expect_y).abs() < 8.,
+        "抬起后卡片应仍锚在按钮左下角正下方（({:.1},{:.1}) 应≈({expect_x:.1},{expect_y:.1})）",
+        f32::from(card.origin.x),
         f32::from(card.origin.y)
     );
 }
@@ -563,14 +570,19 @@ fn image_edit_card_anchor_ignores_transient_frame_rebuild(cx: &mut TestAppContex
             e.on_mouse_down(&img_down(btn_x, btn_y), window, c)
         });
     });
-    let expected_l = f32::from(frame.padding)
-        + (((width - 2.0 * f32::from(frame.padding)) - super::IMAGE_EDIT_CARD_W) / 2.).max(0.);
+    // 新锚点 = 按钮左下角正下方，期望值从真实帧几何推导（K177，非拍脑袋）：
+    // 图片盒左缘 `cx0` = padding + (content_w − w)/2；按钮左 = 盒右缘 − BTN_SIZE −
+    // BTN_MARGIN；按钮底 y = 行顶 + BTN_MARGIN + BTN_SIZE；锚 y = 按钮底 + CARD_GAP。
+    let expected_l = cx0 + w - super::IMAGE_EDIT_BTN_SIZE - super::IMAGE_EDIT_BTN_MARGIN;
+    let expected_t = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE
+        + super::IMAGE_EDIT_CARD_GAP;
     let anchor0 = ed
         .read_with(vcx, |e, _| e.image_edit_anchor.get())
         .expect("打开即缓存锚点");
     assert!(
-        (f32::from(anchor0.x) - expected_l).abs() < 1. && (f32::from(anchor0.y) - top).abs() < 1.,
-        "打开锚点应贴图（x={:.1} 应≈{expected_l:.1}，y={:.1} 应≈{top:.1}）",
+        (f32::from(anchor0.x) - expected_l).abs() < 1.
+            && (f32::from(anchor0.y) - expected_t).abs() < 1.,
+        "打开锚点应贴按钮左下角正下方（x={:.1} 应≈{expected_l:.1}，y={:.1} 应≈{expected_t:.1}）",
         f32::from(anchor0.x),
         f32::from(anchor0.y)
     );
@@ -593,6 +605,381 @@ fn image_edit_card_anchor_ignores_transient_frame_rebuild(cx: &mut TestAppContex
         f32::from(anchor1.x),
         f32::from(anchor1.y)
     );
+}
+
+/// 下方放不下 → 卡片翻到按钮上方（不盖按钮、不越编辑可视区下缘）。构造法：多段正文 +
+/// **末行行内图**把【编辑图片】按钮推到编辑区底部附近（行内图所在行是文档最后一行，
+/// 行下内容 ≈ 行高 ≪ `GAP+CARD_H`，即「下方放不下」）；打开卡片并重绘 → 卡片应锚在
+/// `btn.top − GAP − CARD_H`（翻上），且不越编辑可视区下缘、不盖按钮。期望值全部从真实
+/// 几何推导（K177/K143：按钮行位置、按钮局部常量逐项手算，非拍脑袋）。
+#[gpui::test]
+fn image_edit_card_flips_above_when_near_bottom(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..10 {
+        text.push_str(&format!("第 {i} 段正文内容，用于把行内图按钮推向编辑区底部。\n"));
+    }
+    // 末行行内图（无尾随换行 → 该行即文档末行，行下无内容，只有行高 < CARD_H → 翻上）。
+    text.push_str("末行内嵌图![结尾图](img测试.png)");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    // 先缩窗口宽到 600px（< 阅读栏 72ch≈921）→ 居中阅读栏不触发、元素局部 == 窗口坐标，
+    // 断言面干净（横向不掺 reading_col_shift）。高先给足，随后再压矮触发翻上。
+    vcx.simulate_resize(size(px(600.), px(800.)));
+    vcx.run_until_parked();
+    // 行内图专用夹具（image_harness 断言「含独立图片行」，此处只有行内图）：按窗口宽建帧
+    // + last_bounds 置原点（宽=帧宽 → reading_col_shift 恒 0）。
+    let (frame, width) = vcx.update(|window, cx| {
+        let width = f32::from(window.viewport_size().width).max(1.);
+        let f = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+        assert!(
+            f.rows.iter().any(|r| !r.extra.inline_images.is_empty()),
+            "夹具应含行内图"
+        );
+        let bounds_h = f32::from(f.total).max(600.);
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(width), px(bounds_h)),
+            )));
+        });
+        let rc = std::rc::Rc::new(f);
+        ed.update(cx, |e, _| *e.rd.borrow_mut().frame.borrow_mut() = Some(rc.clone()));
+        (rc, width)
+    });
+    let row = frame
+        .rows
+        .iter()
+        .find(|r| !r.extra.inline_images.is_empty())
+        .expect("夹具应含行内图")
+        .clone();
+    let ii = row.extra.inline_images[0].clone();
+    // 几何推导（K177，源于真实帧）：
+    // 行内图显示盒 = inline_image_box_local（行顶 + 字形偏移）；按钮 =
+    // inline_image_edit_button_local（INLINE_BTN_SIZE=16 / INLINE_BTN_MARGIN=2），
+    // 顶 = 盒顶 + 2、底 = 顶 + 16。下方放不下 → 翻上期望 y = 按钮顶 − GAP − CARD_H。
+    let box_b = super::inline_image_box_local(&frame, &row, &ii).expect("行内图显示盒应可求");
+    let btn = super::inline_image_edit_button_local(&box_b);
+    let gap = super::IMAGE_EDIT_CARD_GAP;
+    let card_h = super::IMAGE_EDIT_CARD_H;
+    let btn_top = f32::from(btn.top());
+    let btn_bottom = f32::from(btn.bottom());
+    // 前提断言（夹具有效）：按钮确实推进到底部 → 下方放不下（btn_bottom+GAP+CARD_H > 可视
+    // 区底 ≈ 元素高），且上方装得下（btn_top ≥ GAP+CARD_H，翻上不触上夹）。
+    let content_bottom = f32::from(frame.total);
+    assert!(
+        btn_top >= gap + card_h,
+        "夹具须把按钮推到编辑区底部（btn_top={btn_top:.1} ≥ GAP+CARD_H={:.0}），否则翻上会触上夹",
+        gap + card_h
+    );
+    assert!(
+        btn_bottom + gap + card_h > content_bottom,
+        "夹具须让「下方放不下」（btn_bottom={btn_bottom:.1} + GAP + CARD_H > 内容底 {content_bottom:.1}）"
+    );
+    // 缩窗口到高 H：元素作为测试窗口根 = max(内容高, 窗口高)——取 H 使元素高 = H
+    // （H ≥ 内容高）且 H < btn_bottom + GAP + CARD_H（下方装不下 → 翻上）。
+    let win_h = (btn_bottom + gap + card_h - 1.).max(content_bottom + 1.);
+    let expect_x = f32::from(btn.left());
+    let expect_y = btn_top - gap - card_h;
+    let btn_x = f32::from(btn.left()) + super::INLINE_IMAGE_EDIT_BTN_SIZE / 2.;
+    let btn_y = btn_top + super::INLINE_IMAGE_EDIT_BTN_SIZE / 2.;
+    // 先开卡（用已注入的 harness 帧命中按钮 → 锚点缓存），再压窗口高、重绘：paint
+    // （window.draw）用缩小后的元素高（= win_h）现算锚点 → 下方放不下 → 翻上。
+    vcx.update(|window, cx| {
+        let ev = img_move(btn_x, btn_y);
+        ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
+        ed.update(cx, |e, c| {
+            e.on_mouse_down(&img_down(btn_x, btn_y), window, c)
+        });
+        assert!(ed.read(cx).image_edit_open(), "点击行内图按钮应打开卡片");
+    });
+    vcx.simulate_resize(size(px(width), px(win_h)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let card = vcx
+        .debug_bounds("wy-image-edit-card")
+        .expect("下方放不下时卡片应被绘制（翻到按钮上方）");
+    let card_top = f32::from(card.origin.y);
+    let card_bottom = card_top + f32::from(card.size.height);
+    // 期望值推导：下方 y0 = btn_bottom + GAP（不满足：y0 + CARD_H = win_h + 1 > win_h）；
+    // 翻上期望 y1 = btn_top − GAP − CARD_H（≥ 0，不触上夹）。可视区底 = 元素高 = win_h。
+    assert!(
+        (card_top - expect_y).abs() < 1.0,
+        "矮编辑区卡片应翻到按钮上方：卡片顶 {card_top:.1} 应≈{expect_y:.1}（btn_top {btn_top:.1} − GAP − CARD_H）"
+    );
+    assert!(
+        (f32::from(card.origin.x) - expect_x).abs() < 1.0,
+        "横向保持按钮左缘：{:.1} 应≈{expect_x:.1}",
+        f32::from(card.origin.x)
+    );
+    assert!(
+        card_bottom <= win_h + 0.5,
+        "卡片底 {card_bottom:.1} 不得越编辑可视区下缘（{win_h:.1}）"
+    );
+    assert!(
+        card_bottom <= btn_top + 0.5,
+        "卡片底 {card_bottom:.1} 不得盖住按钮（btn_top={btn_top:.1}）"
+    );
+}
+
+/// 滚动宿主：把 WyEditor 放进 track 宿主 `ScrollHandle` 的纵向滚动容器（等价
+/// `#live-body` 入 `#live-scroll`，只是无 py 内衬）——`ScrollHandle::bounds()`
+/// 才会在 paint 期被 `clamp_scroll_position` 写入滚动容器窗口 bounds，供
+/// `image_edit_anchor_now` 取「真可视区下/上缘」。
+struct WyScrollHost {
+    ed: Entity<WyEditor>,
+    vhand: gpui::ScrollHandle,
+}
+impl Render for WyScrollHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        use gpui::{
+            InteractiveElement as _, ParentElement as _, StatefulInteractiveElement as _,
+            Styled as _,
+        };
+        gpui::div()
+            .id("wy-scroll-host")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.vhand)
+            .child(self.ed.clone())
+    }
+}
+
+/// P1 中部场景回归：文档**中部**放一个块图、图下仍有充足内容（≥ `GAP+CARD_H`）。
+/// 滚动宿主视口（如 300 高）使图片编辑按钮**恰近视口底、下方还有内容**——旧实现
+/// 安全下缘 = `last_bounds` **文档内容底**（滚动偏移与 paint origin 抵消 → 随滚动静止），
+/// 中部「下方还有内容」被误判「下方放得下」→ 卡片锚在下越可视区 → snap 兜底盖按钮/状态栏；
+/// 新实现安全下缘 = 宿主视口底 → 判定翻上。断言：锚点 y = 按钮顶 − GAP − CARD_H（翻上）、
+/// 卡片底 ≤ 按钮顶、卡片底 ≤ 视口底、卡片顶 ≥ 视口顶。期望值全部从真实几何推导（K177）。
+#[gpui::test]
+fn image_edit_card_flips_above_when_mid_doc_near_host_viewport_bottom(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::test_support::bind_local_keymaps);
+    // 中部块图 + 图下 ≥ 16 段（内容 ≫ GAP+CARD_H）：旧 safe_bottom = 文档内容底必判下方。
+    let mut text = String::new();
+    for i in 0..12 {
+        text.push_str(&format!("前置段落 {i} 用于把图片推向文档中部。\n"));
+    }
+    text.push_str("![中部图](img测试.png)\n");
+    for i in 0..16 {
+        text.push_str(&format!("图下段落 {i}：图下方还有大量内容，旧逻辑必判「下方放得下」。\n"));
+    }
+    let vhand = gpui::ScrollHandle::new();
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        ed.update(cx, |e, _| e.set_host_scroll(Some(vhand.clone()), 0.));
+        WyScrollHost {
+            ed,
+            vhand: vhand.clone(),
+        }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    // 视口 = 滚动容器 actual paint bounds（window 坐标）；窗口 600×300（< 72ch：无阅读栏移位）
+    vcx.simulate_resize(size(px(600.), px(300.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    // 首帧后读块图按钮局部矩形（`image_box_local`+`image_edit_button_local`，与 paint/hit
+    // 同源），推导滚动偏移使「按钮底 ≈ 视口底 − 40px」：元素窗口 origin.y = 视口底 − 40 −
+    // `btn.bottom()`（local）→ scroll = btn.bottom() − (视口底 − 40)。
+    let (btn_local, vp) = vcx.update(|_window, cx| {
+        let f = ed.read(cx).rd.borrow().frame.borrow().clone();
+        let f = f.expect("首帧应已建帧");
+        let row = f
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("夹具应含块图");
+        let box_b = super::image_box_local(&f, row).expect("块图盒应可求");
+        (super::image_edit_button_local(&box_b), vhand.bounds())
+    });
+    let vp_bottom = f32::from(vp.bottom());
+    assert!(vp_bottom > 200., "视口底应≈窗口高（实际 {vp_bottom:.0}）");
+    let scroll = (f32::from(btn_local.bottom()) - (vp_bottom - 40.)).max(0.);
+    vhand.set_offset(gpui::point(gpui::px(0.), gpui::px(-scroll)));
+    // 重绘让 paint 以新滚动偏移刷新元素原点（last_bounds）+ 视口 bounds。
+    vcx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    // 重读与帧同代的元素原点 / 按钮 / 视口 / 文档内容底，推导夹具前提与断言值（K177）。
+    let (origin, btn_l, vp, doc_bottom) = vcx.update(|_window, cx| {
+        let o = ed.read(cx).content_origin();
+        let f = ed.read(cx).rd.borrow().frame.borrow().clone();
+        let f = f.expect("滚动后帧应在");
+        let row = f
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("应含块图");
+        let box_b = super::image_box_local(&f, row).expect("块图盒应可求");
+        let lb = ed.read(cx).last_bounds().expect("滚动后应有 last_bounds");
+        (
+            o,
+            super::image_edit_button_local(&box_b),
+            vhand.bounds(),
+            lb.origin.y + lb.size.height,
+        )
+    });
+    let gap = super::IMAGE_EDIT_CARD_GAP;
+    let card_h = super::IMAGE_EDIT_CARD_H;
+    let btn_win_bottom = f32::from(origin.y) + f32::from(btn_l.bottom());
+    let below_y = f32::from(origin.y) + f32::from(btn_l.bottom()) + gap;
+    // 夹具前提①：图下仍有 ≥ GAP+CARD_H 内容（旧 safe_bottom=文档内容底 → 判「下方」= 复现旧 bug）。
+    assert!(
+        f32::from(doc_bottom) - btn_win_bottom >= gap + card_h - 0.5,
+        "图下内容 {:.0} 应 ≥ GAP+CARD_H={gap}+{card_h}（否则旧逻辑也不判下方、夹具无效）",
+        f32::from(doc_bottom) - btn_win_bottom
+    );
+    // 夹具前提②：按钮恰近视口底（below_y + CARD_H > 视口底 → 新逻辑翻上）。
+    assert!(
+        below_y + card_h > f32::from(vp.bottom()),
+        "按钮应恰近视口底（below_y+card_h={below_y:.0}+{card_h} > 视口底 {:.0}）",
+        f32::from(vp.bottom())
+    );
+    // 打开卡片：按钮窗口中心 = 元素窗口原点 + 按钮局部中心（同一 update 内取几何与帧同代）。
+    vcx.update(|window, cx| {
+        let o = ed.read(cx).content_origin();
+        let f = ed.read(cx).rd.borrow().frame.borrow().clone();
+        let f = f.expect("点击时帧应在");
+        let row = f
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("应含块图");
+        let box_b = super::image_box_local(&f, row).expect("块图盒应可求");
+        let btn = super::image_edit_button_local(&box_b);
+        let btn_x = f32::from(o.x) + f32::from(btn.left()) + super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let btn_y = f32::from(o.y) + f32::from(btn.top()) + super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let ev = img_move(btn_x, btn_y);
+        ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(btn_x, btn_y), window, c));
+        assert!(ed.read(cx).image_edit_open(), "点击中部图片编辑按钮应打开卡片");
+    });
+    // paint 每帧用「本帧 origin + 当前帧」刷新锚点：真实绘制一帧 → 卡片按翻上锚点摆放。
+    vcx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    // 断言（期望值全部来自真实几何推导；origin2/btn2 为最终绘制帧的同代几何）。
+    let (anchor, origin2, btn2, vp2) = vcx.update(|_window, cx| {
+        let o = ed.read(cx).content_origin();
+        let f = ed.read(cx).rd.borrow().frame.borrow().clone();
+        let f = f.expect("绘制后帧应在");
+        let row = f
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("应含块图");
+        let box_b = super::image_box_local(&f, row).expect("块图盒应可求");
+        (
+            ed.read(cx).image_edit_anchor.get(),
+            o,
+            super::image_edit_button_local(&box_b),
+            vhand.bounds(),
+        )
+    });
+    let exp_flip_y = f32::from(origin2.y) + f32::from(btn2.top()) - gap - card_h;
+    let anchor_y = f32::from(anchor.expect("打开后应有缓存锚点").y);
+    assert!(
+        (anchor_y - exp_flip_y).abs() < 1.5,
+        "中部近视口底锚点应翻上：y {anchor_y:.1} 应≈按钮顶 − GAP − CARD_H（{exp_flip_y:.1}）"
+    );
+    let card = vcx
+        .debug_bounds("wy-image-edit-card")
+        .expect("卡片应被绘制（翻上）");
+    let card_top = f32::from(card.origin.y);
+    let card_bottom = card_top + f32::from(card.size.height);
+    let btn_win_top = f32::from(origin2.y) + f32::from(btn2.top());
+    let vp2_bottom = f32::from(vp2.bottom());
+    let vp2_top = f32::from(vp2.top());
+    assert!(
+        card_bottom <= btn_win_top + 0.5,
+        "卡片底 {card_bottom:.1} 应 ≤ 按钮顶 {btn_win_top:.1}（翻上不盖按钮）"
+    );
+    assert!(
+        card_bottom <= vp2_bottom + 0.5,
+        "卡片底 {card_bottom:.1} 不得越可视区下缘（{vp2_bottom:.1}）"
+    );
+    assert!(
+        card_top >= vp2_top - 0.5,
+        "卡片顶 {card_top:.1} 不得越可视区上缘（{vp2_top:.1}）"
+    );
+}
+
+/// 卡片打开期间**普通滚轮被拦截**（不让宿主滚动、卡片不随内容上下跑）；关闭后恢复
+/// 放行；Ctrl 滚轮始终放行（宿主 `zoom_overlay` 全局字号缩放保留）。直线调用
+/// `on_scroll_wheel` 断言返回值（对齐 `search_features` 的 mermaid 滚轮测试姿势；
+/// gpui 测试基建无真实滚轮命中链，返回值即拦截/放行信号，调用方据此
+/// `stop_propagation`）。
+#[gpui::test]
+fn image_edit_open_blocks_scroll_wheel(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx
+            .new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n正文\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .unwrap();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let cx0 =
+        f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
+    // 任意位置滚轮事件（卡片打开拦截 = 不依赖光标命中）；touch_phase 取 Moved（真滚轮）。
+    let wheel = |ctrl: bool| gpui::ScrollWheelEvent {
+        position: gpui::point(gpui::px(300.), gpui::px(300.)),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(120.))),
+        modifiers: gpui::Modifiers {
+            control: ctrl,
+            ..Default::default()
+        },
+        touch_phase: gpui::TouchPhase::Moved,
+        ..Default::default()
+    };
+    // 1) 未打开：滚轮放行（宿主正常滚动）。
+    vcx.update(|window, cx| {
+        let consumed = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+        assert!(!consumed, "卡片未打开 → 滚轮放行");
+    });
+    // 2) 打开：普通滚轮拦截；Ctrl 仍放行。
+    vcx.update(|window, cx| {
+        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let ev = img_move(cx0 + w / 2., top + h / 2.);
+        ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(btn_x, btn_y), window, c));
+        assert!(ed.read(cx).image_edit_open(), "点按钮应打开卡片");
+        let consumed = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+        assert!(consumed, "卡片打开 → 普通滚轮应拦截");
+        let consumed_ctrl = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(true), window, c));
+        assert!(!consumed_ctrl, "卡片打开 → Ctrl 滚轮仍放行（zoom_overlay）");
+    });
+    // 3) 关闭：恢复放行。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, c| e.close_image_edit(c));
+        assert!(!ed.read(cx).image_edit_open(), "卡片应已关闭");
+    });
+    vcx.update(|window, cx| {
+        let consumed = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+        assert!(!consumed, "卡片关闭 → 滚轮恢复放行");
+    });
 }
 
 /// 覆盖「回退锚点现算闭包」路径：卡片打开、当前帧存在但 `image_edit_anchor` 缓存为空

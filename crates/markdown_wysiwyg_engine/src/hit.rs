@@ -27,8 +27,30 @@ pub const IMAGE_EDIT_BTN_MARGIN: f32 = 6.;
 pub const INLINE_IMAGE_EDIT_BTN_SIZE: f32 = 16.;
 /// 行内图编辑按钮距图片右上角的边距（px）。
 pub const INLINE_IMAGE_EDIT_BTN_MARGIN: f32 = 2.;
-/// 图片编辑卡片的宽（px；卡片水平居中于内容区）。
+/// 图片编辑卡片的宽（px；卡片锚在【编辑图片】按钮左缘，
+/// 仅带外/未物化行的回退路径才水平居中于内容区）。
 pub const IMAGE_EDIT_CARD_W: f32 = 320.;
+/// 图片编辑卡片相对【编辑图片】按钮的**间距**（px）：卡片 TopLeft 锚在按钮左缘，
+/// **下方优先**（y = 按钮底缘 + 该 gap），放不下翻到上方（y = 按钮顶 − 该 gap −
+/// `IMAGE_EDIT_CARD_H`）。下方/上方纵向二选一在 `image_edit_anchor_now` 内完成——
+/// 把「不盖按钮 / 不越编辑可视区下缘」算进去，不依赖 `anchor_layer` 的 snap 8px；
+/// `snap_to_window_with_margin` 仅保留作横向与极端情况的最后兜底。
+pub const IMAGE_EDIT_CARD_GAP: f32 = 6.;
+/// 图片编辑卡片的**估计高**（px；`image_edit_anchor_now` 判定「下方放不放得下」用）。
+/// 保守**偏大**（实际 ≈ 194 → 取 220，含 26 缓冲）：偏大 → 判定偏早翻上方、安全优先
+/// （宁可少用一次下方，也不盖按钮 / 越编辑可视区下缘）。真机观感若发现「下方明明有
+/// 空间却已翻上」，可把缓冲收小，但不得小于实际组合高。
+///
+/// 由 `WyEditor::image_edit_card_element`（`markdown_wysiwyg/src/wysiwyg/image.rs`）的
+/// 实际布局逐项求和推导：
+/// - 根内边距 `p(12px)` 上下各 1 → 12×2 = 24；
+/// - 根纵向 gap `gap_y(8px)` × 3（标题 / 链接组 / 文本组 / 按钮行 4 子项） → 24；
+/// - 标题「编辑图片」`text_size(13px)`：一行行高按 gpui 文本默认 ≈1.5em → 20；
+/// - 链接组：标签「链接」`text_size(12px)` 行高 ≈18 + 组内 gap `gap_y(4px)` +
+///   输入框 `h(28px)` → 50；文本组同构 → 50；
+/// - 按钮行：取消 / 保存按钮 `h(26px)` → 26。
+/// 合计 ≈ 24 + 24 + 20 + 50 + 50 + 26 = 194。
+pub const IMAGE_EDIT_CARD_H: f32 = 220.;
 /// 数学编辑卡片的宽（px；卡片水平居中于内容区，锚定覆盖在目标公式卡顶部）。
 pub const MATH_EDIT_CARD_W: f32 = 520.;
 /// 数学编辑卡片的估计高（px；标题栏 + 多行编辑器区 + 内边距，点外关闭的**保守**

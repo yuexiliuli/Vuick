@@ -14,13 +14,14 @@ use super::WyEditor;
 /// 纯几何常量 / 类型 / 纯函数（无 editor 依赖）直接 re-export（路径面；部分名仅测试消费）。
 #[allow(unused_imports)]
 pub use markdown_wysiwyg_engine::hit::{
-    IMAGE_EDIT_BTN_MARGIN, IMAGE_EDIT_BTN_SIZE, IMAGE_EDIT_CARD_W, IMAGE_RESIZE_HANDLE_H,
-    IMAGE_RESIZE_HANDLE_MARGIN_R, IMAGE_RESIZE_HANDLE_W, INLINE_IMAGE_EDIT_BTN_MARGIN,
-    INLINE_IMAGE_EDIT_BTN_SIZE, MATH_EDIT_CARD_H, MATH_EDIT_CARD_W, MATH_EDIT_EDITOR_H,
-    MATH_EDIT_EDITOR_W, MATH_EDIT_TAIL_GAP_PX, NoteMarkerHit, heading_chevron_box,
-    image_edit_button_local, image_edit_button_local_with, image_box_local,
-    image_resize_handle_local, image_resize_handle_window, inline_image_box_local,
-    inline_image_edit_button_local, inline_image_ref_of,
+    IMAGE_EDIT_BTN_MARGIN, IMAGE_EDIT_BTN_SIZE, IMAGE_EDIT_CARD_GAP, IMAGE_EDIT_CARD_H,
+    IMAGE_EDIT_CARD_W, IMAGE_RESIZE_HANDLE_H, IMAGE_RESIZE_HANDLE_MARGIN_R,
+    IMAGE_RESIZE_HANDLE_W, INLINE_IMAGE_EDIT_BTN_MARGIN, INLINE_IMAGE_EDIT_BTN_SIZE,
+    MATH_EDIT_CARD_H, MATH_EDIT_CARD_W, MATH_EDIT_EDITOR_H, MATH_EDIT_EDITOR_W,
+    MATH_EDIT_TAIL_GAP_PX, NoteMarkerHit, heading_chevron_box, image_edit_button_local,
+    image_edit_button_local_with, image_box_local, image_resize_handle_local,
+    image_resize_handle_window, inline_image_box_local, inline_image_edit_button_local,
+    inline_image_ref_of,
 };
 
 /// 源 caret → 光标条几何。
