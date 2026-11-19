@@ -48,14 +48,15 @@
 #![allow(unused_imports)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
 use gpui::{
-    div, img, px, rgba, rgb, App, ClipboardItem, Context, FocusHandle, Hsla, ImageSource,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Point, Pixels, Render, RenderImage, ScrollHandle, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    div, img, px, rgba, rgb, App, AppContext, ClipboardItem, Context, DragMoveEvent, FocusHandle,
+    Hsla, ImageSource, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Point, Pixels, PromptLevel, Render,
+    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    Window,
 };
 use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
@@ -156,10 +157,11 @@ use config::pdf::{
 };
 use crate::pdf::layout::{
     advance_match_index, bitmap_display_scales, column_left, compute_layout, content_to_local,
-    cover_affordable, cover_scale, display_height, first_visible_page, hit_char, keep_window,
-    local_to_pt, page_bitmap_size, page_segment_text, pt_to_local, render_scale,
-    selection_spans_pt, visible_tile_range_axis, zoom_rescroll_anchor, Slot, TileSlot,
+    cover_affordable, cover_scale, display_height, first_visible_page, grid_layout, hit_char,
+    keep_window, local_to_pt, page_bitmap_size, page_segment_text, pt_to_local, render_scale,
+    selection_spans_pt, visible_tile_range_axis, zoom_rescroll_anchor, GridLayout, Slot, TileSlot,
 };
+use crate::pdf::parser::PDF_MERGE_MAX_SRC_BYTES;
 use crate::pdf::{
     render_image_from_bgra, AnnotKind, AnnotateItem, AnnotationInfo, DocId, PageText,
     PdfImageBox, PdfImagePixels, PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfWorker,
@@ -250,6 +252,151 @@ pub(crate) struct TileBudgetState {
     pub(crate) center: usize,
     pub(crate) pinned: std::collections::HashSet<(usize, u32, u32)>,
     pub(crate) mid_rows: std::collections::HashMap<usize, u32>,
+}
+
+// ---- 网格视图（Grid）常量（wave3；推导见各条注释）----
+/// 网格缩略图**请求卡宽**（逻辑 px）：A4（595×842pt，纵横比 ≈1.41）在 280px 宽下卡高
+/// ≈396px，一屏 ~5 列可辨标题/段落结构；与阅读器 L0 缩略图同量级栅格带宽。请求目标宽经
+/// worker 按 [`config::pdf::GRID_BUCKET_PX`] 分桶缓存（相邻宽落同桶复用，不重栅）。
+pub(crate) const GRID_CARD_WIDTH: f32 = 280.0;
+/// 网格卡片行内/行间间距（px）。取 12：与页列视图 [`PAGE_GAP`]（卡片间距）同量级；过大
+/// 切碎整屏卡数、过小卡卡粘连难区分。
+pub(crate) const GRID_GAP: f32 = 12.0;
+/// 网格四周外留白（px）。取 16：常见内容区 8-16px 边距，网格四边不贴死、留统一画布衬底。
+pub(crate) const GRID_PADDING: f32 = 16.0;
+/// 网格行带虚拟化的上下外扩缓冲行数：可视行之外各多物化 [`Self::grid_visible_range`]
+/// 一行的页卡，滚动/惯性时新行提前就位——对齐页列视图 `keep_window` 的 MARGIN 页缓冲语义。
+pub(crate) const GRID_ROW_BUFFER: usize = 1;
+/// 网格顶栏（wave5 工具栏）高度（px）：贴网格滚动容器顶部，滚动条随之下移对齐（见
+/// `render.rs` 的滚动条 overlay 顶偏）。选 40：一行胶囊按钮 + 上下留白够点，不侵占卡区。
+pub(crate) const GRID_TOOLBAR_H: f32 = 40.0;
+
+/// 网格可视页区间（纯函数，含行带上下缓冲）：`layout` 为当帧 [`grid_layout`] 结果，
+/// `offset` = 内容已滚动 px（≥0），`viewport_h` = 滚动容器可视高。取首/末可视行外侧各扩
+/// [`GRID_ROW_BUFFER`] 行后，返回该行带内页下标的闭区间 `[start, end]`（物化集合）；0 行
+/// 布局 / 视口完全落在内容之外（[`GridLayout::first_visible_grid_row`] = None）→ `None`
+/// （本帧不物化任何卡）。渲染与调度都走本函数，保证「物化的 = 派发的 = 保留的」同一几何。
+fn grid_visible_range(layout: &GridLayout, offset: f32, viewport_h: f32) -> Option<(usize, usize)> {
+    let (r0, r1) = layout.first_visible_grid_row(offset, viewport_h)?;
+    let r0 = r0.saturating_sub(GRID_ROW_BUFFER);
+    let r1 = (r1 + GRID_ROW_BUFFER).min(layout.rows.saturating_sub(1));
+    let start = layout.row_page_start[r0];
+    let end = layout.row_page_start[r1 + 1].saturating_sub(1);
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+// ---- 网格拖拽重组（wave6）：纯命中 / 纯重排 / 拖拽态载荷类型 ----
+
+/// 网格卡拖拽载荷（`on_drag` 的 value 类型）：只记被按下的页下标；选中组在拖拽开始
+/// （[`PdfViewer::grid_drag_begin`]）自选中集快照读取。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GridDragData {
+    /// 按下的页（原页序下标）。
+    pub page: usize,
+}
+
+/// 网格「按下」待决单击（wave6）：卡 `on_mouse_down` 记录，`on_mouse_up` 时若**未**进入
+/// 拖拽（位移未超阈值）则按 wave5 语义消费；一旦进入拖拽即作废——拖拽与单击用位移阈值
+/// 互斥（按下即触发会误触勾选/跳页）。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GridPress {
+    /// 按下的页（原页序下标）。
+    pub page: usize,
+    /// 按下修饰键（决定单击是 Ctrl 切换 / Shift 范围 / 普通选中）。
+    pub modifiers: Modifiers,
+    /// 按下时的点击计数（1 = 单击、≥2 = 双击/多击）。gpui 双击序列：第一击 count=1 先执行
+    /// 「选中」（留在网格），随后第二击 count=2 才「退出网格 + 跳页」——与文件管理器
+    /// 「先选定再打开」一致。
+    pub click_count: usize,
+}
+
+/// 网格拖拽重组状态（wave6）：`Some` = 正在拖拽页组。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GridDrag {
+    /// 被拖页组：原页序下标，升序去重（拖拽开始时的选中集快照）。
+    pub dragging: Vec<usize>,
+    /// 当前插入目标线性位（0..=页数；`None` = 指针不在网格内容内 → 松手放弃不提交）。
+    pub insert: Option<usize>,
+    /// 指针当前**网格内容**坐标（ghost 随指针定位）。
+    pub pointer: gpui::Point<f32>,
+}
+
+/// 计算指针（网格内容坐标）对应的**线性插入位**（0..=页数；网格外 → `None`）。
+///
+/// 返回「插入到哪个原序下标之前」的线性位（0 = 最前、n = 末尾），插入指示线即画在该位
+/// 目标卡左缘 / 末卡右缘。**网格内容矩形** `(0, 0, vw, total_height)` 之外 → `None`
+/// （松手在网格外 = 放弃，不提交）。内部映射（不依赖逐卡命中，与 GridLayout 同源几何）：
+/// - 行：y ∈ `[padding, total_height − padding)` 内按 `row_index_at_y`（行二分原语）定位行
+///   `r`；顶部/底部外留白 → 0 / n（末行底 = `total_height − padding`，grid_layout 推导）；
+/// - 列：`col_slot_at_x`（列槽原语）= 卡左半/右半、列间 gap 与右留白都归到最近整数槽
+///   （对齐 tab 拖拽「卡左半前、右半后」语义，且 gap 中点即阈值）；
+/// - 线性位 = `row_page_start[r] + clamp(col_slot, 0, row_len)`；**垂直行间 gap**（y 在行底
+///   `row_top[r+1] − gap` 之下、非末行）→ 直接 = `row_page_start[r+1]`（本行末 = 下一行首，
+///   同一线性位）。列槽越行尾 → 行内最后（下一行首 / 整档末尾）。
+/// 手写算式样例见测试 [`tests::compute_insert_index_hand_cases`]（K177：期望值先演算后落）。
+pub(crate) fn compute_insert_index(
+    layout: &GridLayout,
+    vw: f32,
+    x: f32,
+    y: f32,
+) -> Option<usize> {
+    let n = layout.row_page_start.last().copied().unwrap_or(0);
+    if n == 0 || layout.rows == 0 {
+        return None;
+    }
+    if x < 0.0 || x > vw || y < 0.0 || y > layout.total_height {
+        return None; // 网格外
+    }
+    if y < layout.padding {
+        return Some(0); // 顶部 padding → 插入最前
+    }
+    if y >= layout.total_height - layout.padding {
+        return Some(n); // 底部 padding / 末行之下 → 插入末尾
+    }
+    // 行：grid_layout 行二分原语「最后一个行顶 ≤ y 的行」（顶部 padding 已在上层排除）。
+    let r = layout.row_index_at_y(y);
+    // 垂直行间 gap（非末行）：y 已在行 `r` 底缘之下、下一行顶之上 → 该位 = 本行末 =
+    // 下一行首（`row_page_start[r+1]`，同一线性位）；行底 = `row_top[r+1] − gap`。
+    if r + 1 < layout.rows && y >= layout.row_top[r + 1] - layout.gap {
+        return Some(layout.row_page_start[r + 1]);
+    }
+    let base = layout.row_page_start[r];
+    let row_len = layout.row_page_start[r + 1] - base;
+    // 列：grid_layout 列槽原语（最近整数槽，gap 中点即阈值）。
+    let col_slot = layout.col_slot_at_x(x);
+    Some((base + col_slot.min(row_len)).min(n))
+}
+
+/// 由「原长度 + 被拖页组（升序去重原下标）+ 插入线性位」计算新的**全排列**（页序）。
+///
+/// 语义：被拖组从原序移除后，以整块插到「原序线性位 `insert` 所指槽」（0 = 最前、
+/// n = 末尾）——拖拽期间网格按**原序**展示、指示线即原序 gap，故 `insert` 在原序空间。
+/// 插入位（rest 内下标）算式：`pos = insert − count(dragging < insert)`——原序前 `insert`
+/// 个元素去掉被拖组后恰为 rest 的前 `insert −（被拖组中下标 < insert 的个数）` 个。随后
+/// 把被拖块（升序 = 原相对顺序）整体 splice 进 `pos`。
+/// 边界：连续被拖组在自身跨度内松手（insert ∈ (lo, hi]）→ 该删除位即块边缘 → 序不变；
+/// insert 越界夹到 `[0, n]`；空组 → 恒等；全选 → 整体平移（序不变）。
+/// 手写算式样例见测试 [`tests::apply_reorder_hand_cases`]。
+pub(crate) fn apply_reorder(
+    orig_len: usize,
+    dragging: &[usize],
+    insert: usize,
+) -> Vec<usize> {
+    let insert = insert.min(orig_len);
+    let mut in_drag = vec![false; orig_len];
+    for &d in dragging {
+        if d < orig_len {
+            in_drag[d] = true;
+        }
+    }
+    let mut rest: Vec<usize> = (0..orig_len).filter(|&i| !in_drag[i]).collect();
+    let before = dragging.iter().filter(|&&d| d < insert).count();
+    let pos = insert.saturating_sub(before).min(rest.len());
+    rest.splice(pos..pos, dragging.iter().copied());
+    rest
 }
 
 /// PDF 阅读器：自包含的瓦片级虚拟化视图。
@@ -539,6 +686,51 @@ pub struct PdfViewer {
     pub(crate) pan_origin: gpui::Point<Pixels>,
     /// 按下瞬间的滚动偏移快照（用于平移减法）。
     pub(crate) pan_offset0: gpui::Point<Pixels>,
+    // ---- 网格视图（Grid）状态（wave3）：页卡网格模式的独立滚动 + 缩略图槽 ----
+    /// 网格模式是否激活（false = 单列阅读；true = 页卡网格视图）。
+    /// 独立于单列 `scroll`/`page_tops` 全套状态——两模式各自持有滚动偏移，切模式互不干扰。
+    pub(crate) grid_mode: bool,
+    /// 网格卡**独立缩放**倍数（网格 Ctrl+滚轮可调；[`Self::grid_card_width`] =
+    /// `GRID_CARD_WIDTH × grid_zoom`）。**独立于单列阅读缩放 [`Self::zoom`]**：网格里
+    /// Ctrl+滚轮只改卡大小，退出网格回到阅读保持用户阅读缩放；阅读 Ctrl+滚轮/`set_zoom`
+    /// 也不影响网格卡宽。clamp 于 [ZOOM_MIN, ZOOM_MAX] ⇒ 卡宽 ∈ [140, 1120]。网格会话
+    /// 语义：文档 `release`/切换复位 1.0，同文档内存重载（页操作 reload）期间保持。
+    pub(crate) grid_zoom: f32,
+    /// 网格模式独立滚动句柄（`pdf-grid-scroll` 容器；与单列 `scroll` 完全隔离）。
+    pub(crate) grid_scroll: ScrollHandle,
+    /// 网格缩略图：页 → 已就绪卡位图（经 [`super::PdfWorker::request_grid`] 拉取；独立于
+    /// `slots` 的 LOD 槽——网格卡图只存这里，不碰 thumb/mid/cover 预算）。
+    pub(crate) grid_thumbs: HashMap<usize, Arc<RenderImage>>,
+    /// 在途网格缩略图请求：页 → (导航世代 nav_gen, 结果通道)。世代守卫对齐
+    /// [`Self::pending_thumb`]（大跳/切档时按 nav_gen/zoom_epoch 由 worker drop 旧请求）。
+    pub(crate) pending_grid: HashMap<usize, (u64, mpsc::Receiver<Option<RenderResult>>)>,
+    /// 网格 render 帧观测：上帧实际物化/绘制的页区间（含行带 ±1 缓冲）——headless
+    /// 虚拟化断言用（对齐 `last_frame_tiles_drawn` 既有观测姿势；非网格帧 = (0,0)）。
+    pub(crate) grid_last_range: std::cell::Cell<(usize, usize)>,
+    /// 网格 render 帧观测：上帧实际物化的页卡总数（= `grid_last_range` 覆盖页数）。
+    pub(crate) grid_last_drawn: std::cell::Cell<usize>,
+    // ---- 网格多选（wave5）：选中集模型 + Shift 范围锚点 ----
+    /// 当前网格**选中页下标集**（`HashSet` 提供 O(1) 存在查询；页数为千级时全选集内存
+    /// ~几十 KB，量级可接受）。**一次网格会话语义**：进入网格、退出网格（含点卡跳页、
+    /// toggle 退出）与文档页数变化（重载/页操作后）都清空——选中的是「本次浏览快照」，
+    /// 不跨会话/跨页码集合串场（详见 `view/open.rs` 的 `set_grid_mode`/`apply_loaded`）。
+    pub(crate) grid_selected: HashSet<usize>,
+    /// Shift 范围选**锚点页**：上次「单选 / Ctrl 切换 / checkbox 勾选」更新的页下标；
+    /// Shift+单击以其为闭区间起点选中（其它已选页保持）。无锚点时 Shift 退化单选。
+    pub(crate) grid_anchor: Option<usize>,
+    // ---- 网格拖拽重组（wave6）：按下待决单击 + 拖拽态 + 每帧布局快照 ----
+    /// 网格「按下」待决单击（wave6）：卡按下记录，松手时若未进入拖拽按 wave5 语义消费；
+    /// 进入拖拽即作废（拖拽与单击用位移阈值互斥见 [`GridPress`]）。
+    pub(crate) grid_press: Option<GridPress>,
+    /// 网格拖拽重组状态（wave6）：`Some` = 正在拖拽页组（见 [`GridDrag`]）。
+    pub(crate) grid_drag: Option<GridDrag>,
+    /// 网格布局每帧快照（wave6）：「渲染期写、事件期读」对齐 TabBoundsRecorder 姿势——
+    /// render 每帧把 [`GridLayout`] 抄入，`on_drag_move` 事件期读上一帧布局算插入命中。
+    pub(crate) grid_layout_cell: std::cell::RefCell<Option<GridLayout>>,
+    /// 拖拽重排后的 reload 保持网格模式（wave6）：`grid_drag_release` 提交前置位，
+    /// [`PdfViewer::apply_loaded`] 消费后清——拖拽重组是网格内操作，reload 不应把用户踢
+    /// 回单列（默认 reload 复位到单列语义仅适用非拖拽的普通重载）。
+    pub(crate) grid_hold_on_reload: bool,
 }
 
 impl PdfViewer {
@@ -596,6 +788,12 @@ mod tests {
     use super::*;
     use gpui::AppContext as _;
     use gpui::TestAppContext;
+    use crate::pdf::test_util;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use gpui::Entity;
+    use gpui::VisualTestContext;
+    use crate::pdf::parser::grid_bucket_width;
 
     /// 纯逻辑复现 minimal `PdfViewer`（**不触碰 pdfium**：不走 [`Self::new`]，无真实 PDF）。
     /// 只喂一页占位 dims + 初始滚动偏移，验证 `adjust_zoom` 的四件事：
@@ -699,6 +897,19 @@ mod tests {
                     panning: false,
                     pan_origin: gpui::point(px(0.), px(0.)),
                     pan_offset0: gpui::point(px(0.), px(0.)),
+                    grid_mode: false,
+                    grid_zoom: 1.0,
+                    grid_scroll: ScrollHandle::new(),
+                    grid_thumbs: HashMap::new(),
+                    pending_grid: HashMap::new(),
+                    grid_last_range: std::cell::Cell::new((0, 0)),
+                    grid_last_drawn: std::cell::Cell::new(0),
+                    grid_selected: HashSet::new(),
+                    grid_anchor: None,
+                    grid_press: None,
+                    grid_drag: None,
+                    grid_layout_cell: std::cell::RefCell::new(None),
+                    grid_hold_on_reload: false,
                 };
                 // 先滚到文档中段（纵向负偏移），作为缩放重锚的基准。⚠️ 须落在新布局
                 // max_offset 内（600 < 放大一档后的 `total_new−viewport` ≈ 1249）——越界
@@ -939,6 +1150,19 @@ mod tests {
                     panning: false,
                     pan_origin: gpui::point(px(0.), px(0.)),
                     pan_offset0: gpui::point(px(0.), px(0.)),
+                    grid_mode: false,
+                    grid_zoom: 1.0,
+                    grid_scroll: ScrollHandle::new(),
+                    grid_thumbs: HashMap::new(),
+                    pending_grid: HashMap::new(),
+                    grid_last_range: std::cell::Cell::new((0, 0)),
+                    grid_last_drawn: std::cell::Cell::new(0),
+                    grid_selected: HashSet::new(),
+                    grid_anchor: None,
+                    grid_press: None,
+                    grid_drag: None,
+                    grid_layout_cell: std::cell::RefCell::new(None),
+                    grid_hold_on_reload: false,
                 }
             })
         });
@@ -1082,6 +1306,19 @@ mod tests {
                     panning: false,
                     pan_origin: gpui::point(px(0.), px(0.)),
                     pan_offset0: gpui::point(px(0.), px(0.)),
+                    grid_mode: false,
+                    grid_zoom: 1.0,
+                    grid_scroll: ScrollHandle::new(),
+                    grid_thumbs: HashMap::new(),
+                    pending_grid: HashMap::new(),
+                    grid_last_range: std::cell::Cell::new((0, 0)),
+                    grid_last_drawn: std::cell::Cell::new(0),
+                    grid_selected: HashSet::new(),
+                    grid_anchor: None,
+                    grid_press: None,
+                    grid_drag: None,
+                    grid_layout_cell: std::cell::RefCell::new(None),
+                    grid_hold_on_reload: false,
                 };
                 // 先给出「静置已确认」状态，验证变更会复位它（触发一帧收集重着色结果并重绘），
                 // 而**不**清缓存/不停泵（切档不重栅：泵里在途瓦片结果仍有效、须继续收集）。
@@ -1211,6 +1448,19 @@ mod tests {
             panning: false,
             pan_origin: gpui::point(px(0.), px(0.)),
             pan_offset0: gpui::point(px(0.), px(0.)),
+            grid_mode: false,
+            grid_zoom: 1.0,
+            grid_scroll: ScrollHandle::new(),
+            grid_thumbs: HashMap::new(),
+            pending_grid: HashMap::new(),
+            grid_last_range: std::cell::Cell::new((0, 0)),
+            grid_last_drawn: std::cell::Cell::new(0),
+            grid_selected: HashSet::new(),
+            grid_anchor: None,
+            grid_press: None,
+            grid_drag: None,
+            grid_layout_cell: std::cell::RefCell::new(None),
+            grid_hold_on_reload: false,
         }
     }
 
@@ -2144,6 +2394,2132 @@ mod tests {
             !after,
             "release 后 pump_still_needed 应为 false（僵尸泵：release 未复位 prev_fast 且 \
              pump_still_needed 未防已释放视图）"
+        );
+    }
+
+    // ---- 网格视图（Grid，wave3）集成测试：真实 PDF 夹具（多页）+ pdfium worker ----
+
+    /// 网格测试的窗口宿主：整窗渲染一个 PdfViewer（同「瓦片管线端到端」测试的 PageProbe 姿势）。
+    struct GridHost {
+        pdf: Entity<PdfViewer>,
+    }
+    impl Render for GridHost {
+        fn render(
+            &mut self,
+            _w: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            gpui::div().size_full().child(self.pdf.clone())
+        }
+    }
+
+    /// 网格测试公共开窗 + 等待加载（含 pdfium 串行锁守卫约定由调用方先取）。
+    /// 随后进入网格并渲染足够帧使 `grid_last_range`/`grid_last_drawn` 探针落地。
+    fn enter_grid(holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>, cx: &mut VisualTestContext) {
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_grid_mode(true, cx);
+            });
+        });
+        // 网格 mode 切换后需真实渲染帧（render 内布 `grid_last_*` 探针）；refresh 无条件
+        // 要求重绘 + run_until_parked 推进虚拟帧（对齐既有静态帧驱动姿势）。
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+    }
+
+    /// 进入网格后，按「渲染同口径」（网格滚动容器真实 bounds + 同套常量/纯函数）手算
+    /// 期望物化区间与卡数，供断言对表（期望源自真实几何推导，K177）。
+    fn expected_grid_band(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        offset: f32,
+    ) -> ((usize, usize), usize, usize) {
+        let (vw, vh, dims) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            (
+                b.size.width.as_f32(),
+                b.size.height.as_f32(),
+                v.dims.clone(),
+            )
+        });
+        let layout = grid_layout(&dims, GRID_CARD_WIDTH, GRID_GAP, GRID_PADDING, vw);
+        let band = grid_visible_range(&layout, offset, vh).expect("网格首屏应存在可见带");
+        let count = band.1 - band.0 + 1;
+        (band, count, dims.len())
+    }
+
+    /// 向网格卡派发一次**真实双击**（第一击 `click_count=1` + 第二击 `click_count=2`）：
+    /// 还原 gpui 双击序列——第一击先执行「单击选中」、第二击才「退出网格 + 跳页」（见
+    /// `grid_click_commit` 的点击计数分发；与文件管理器「先选定再打开」一致）。
+    /// `simulate_click` 恒为 click_count=1，无法覆盖双击。
+    fn simulate_grid_double_click(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+        for count in [1usize, 2] {
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position: at,
+                modifiers: gpui::Modifiers::default(),
+                click_count: count,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                button: gpui::MouseButton::Left,
+                position: at,
+                modifiers: gpui::Modifiers::default(),
+                click_count: count,
+            });
+        }
+    }
+
+    /// Ctrl+滚轮缩放事件构造（同 lib.rs `zoom_wheel`，供网格交互分支测试派发真实事件）：
+    /// vertical pixel delta，向上 >0 放大、向下 <0 缩小；`control` 控制修饰键。gpui 测试
+    /// 平台经 `simulate_event` 可派发带修饰键的**真实** `ScrollWheelEvent`（同单列
+    /// `pdf_ctrl_wheel_zooms_in_out` 与 markdown_wysiwyg 姿势）。
+    fn grid_zoom_wheel(control: bool, delta_y: f32) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(400.), gpui::px(450.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    async fn grid_enter_renders_container_with_derived_virtualized_cards(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone(); // pdf测试2.pdf：长文多页
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应在 600 帧内加载完成");
+        enter_grid(&holder, cx);
+
+        // 手算期望（渲染同口径）：网格滚动容器布局 bounds + 同常量 + 同纯函数
+        let ((start, end), expect_count, n) =
+            { expected_grid_band(&holder, cx, 0.0) };
+        assert!(n > 120, "夹具应足量页（pdf测试2.pdf），实际 {n}");
+        assert!(
+            expect_count < n,
+            "行带虚拟化：物化卡数应远小于总页数（{expect_count} < {n}）"
+        );
+
+        // 容器在 DOM，物化区间/卡数 == GridLayout 派生值
+        assert!(cx.debug_bounds("pdf-grid").is_some(), "网格容器应渲染");
+        assert!(cx.debug_bounds("pdf-grid-scroll").is_some(), "网格滚动容器应渲染");
+        let (range, drawn) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_last_range.get(), v.grid_last_drawn.get())
+        });
+        assert_eq!(range, (start, end), "可视带应等于 GridLayout 派生区间 {start}..={end}");
+        assert_eq!(
+            drawn, expect_count,
+            "物化卡数应等于 GridLayout 派生数（首屏可视行 +±1 缓冲）"
+        );
+        // 带内卡在 DOM、可视带外页不物化（静态选择器：页 100 恒在带外）
+        assert!(cx.debug_bounds("pdf-grid-item-0").is_some(), "带内首卡应在场");
+        assert!(
+            cx.debug_bounds("pdf-grid-item-100").is_none(),
+            "可视带外页（100）不应物化任何 DOM（虚拟化）"
+        );
+    }
+
+    #[gpui::test]
+    async fn grid_double_click_card_exits_and_jumps_to_page(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.len());
+
+        // 双击「第 2 张卡」（页下标 1）中心 → 退出网格 + 单列跳转到该页（wave3 跳页语义迁到双击）
+        let c1 = cx
+            .debug_bounds("pdf-grid-item-1")
+            .expect("带内第 2 卡应在场")
+            .center();
+        simulate_grid_double_click(cx, c1);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (mode, cur) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_mode(), v.current_page())
+        });
+        assert!(!mode, "双击卡应退出网格模式");
+        assert_eq!(
+            cur,
+            Some((2, n)),
+            "双击第 2 张卡（0 基 1）后单列首见页应为 1 基 2，实际 {cur:?}"
+        );
+        // 退出网格后网格缩略图槽应已清空（切模式不残留引用）
+        let (thumbs, pending) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_thumbs.len(), v.pending_grid.len())
+        });
+        assert_eq!(thumbs, 0, "退出网格应清空网格缩略图槽");
+        assert_eq!(pending, 0, "退出网格应清空在途网格请求");
+    }
+
+    /// 普通**单击**卡（无修饰、click_count==1）→ 切换该页选中态且**留在网格**（不退出、
+    /// 不跳页）；再单击同卡 → 取消选中（toggle）。对应「单击选中」交互契约。
+    #[gpui::test]
+    async fn grid_single_click_selects_card_stays_in_grid(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        // 普通单击卡 1（0 基）中心 → 选中该页 + 仍网格模式（不退出、不跳页）
+        let c1 = cx
+            .debug_bounds("pdf-grid-item-1")
+            .expect("带内卡应在场")
+            .center();
+        cx.simulate_click(c1, gpui::Modifiers::default());
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (selected, count, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected(1), v.grid_selected_count(), v.grid_mode())
+        });
+        assert!(selected, "普通单击应选中页 1");
+        assert_eq!(count, 1, "选中计数应为 1");
+        assert!(mode, "普通单击不应退出网格（留在网格）");
+        // 再普通单击同卡 → 取消选中（toggle），仍网格模式
+        cx.simulate_click(c1, gpui::Modifiers::default());
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (selected, count, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected(1), v.grid_selected_count(), v.grid_mode())
+        });
+        assert!(!selected, "再次普通单击应取消选中（toggle）");
+        assert_eq!(count, 0, "取消后计数为 0");
+        assert!(mode, "取消选中后仍应在网格模式");
+    }
+
+    /// item 3：网格缩放——卡宽由**独立网格缩放 `grid_zoom`** 派生（`GRID_CARD_WIDTH ×
+    /// grid_zoom`），**与阅读 `self.zoom` 互不影响**。程序化 `set_grid_zoom(×2)` → 卡宽/列数
+    /// 按新 grid_zoom 变化、`self.zoom` **不变**、仍停留网格模式、可视页集合随新布局更新、
+    /// 旧分桶缩略图失效后按新卡宽重取回槽。反向：网格内 `set_zoom`（阅读缩放）不联动卡宽
+    /// （卡宽仍按 grid_zoom）。期望值用「渲染同口径」手算（K177）：目标布局 =
+    /// `grid_layout(dims, GRID_CARD_WIDTH×grid_zoom, …)` 同公式推导（放大 ⇒ 列数减少），
+    /// 不自揣测。
+    #[gpui::test]
+    async fn grid_zoom_resizes_cards_and_refetches_thumbnails(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        let (vw, vh, n, dims) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            (
+                b.size.width.as_f32(),
+                b.size.height.as_f32(),
+                v.dims.len(),
+                v.dims.clone(),
+            )
+        });
+        assert!(n > 120, "夹具应足量页（pdf测试2.pdf），实际 {n}");
+        // 前置：初始卡宽 = 280×grid_zoom（grid_zoom 默认 1.0），阅读 self.zoom 独立为 1.0。
+        let (gz0, rz0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_zoom, v.zoom)
+        });
+        assert!(
+            (gz0 - 1.0).abs() < 1e-6 && (rz0 - 1.0).abs() < 1e-6,
+            "前置：grid_zoom/阅读 zoom 初始均 1.0：grid={gz0} read={rz0}"
+        );
+        // 手算目标几何（K177）：grid_zoom=2.0 ⇒ 卡宽 560，列数 = floor((vw-2·pad+gap)/(560+gap)) < 基线列数。
+        let grid_zoom = 2.0f32;
+        let target_w = GRID_CARD_WIDTH * grid_zoom;
+        let layout_before = grid_layout(&dims, GRID_CARD_WIDTH, GRID_GAP, GRID_PADDING, vw);
+        let layout_after = grid_layout(&dims, target_w, GRID_GAP, GRID_PADDING, vw);
+        assert_ne!(layout_after.cols, layout_before.cols, "×2 缩放后列数应变化");
+        assert!(layout_after.cols < layout_before.cols, "放大后列数应变少（卡变宽）");
+        let band_after = grid_visible_range(&layout_after, 0.0, vh).expect("缩放后首屏应有可视带");
+
+        // 网格模式程序化缩放：set_grid_zoom(×2)（doc(hidden) 测试面）→ 卡宽派生 + 跨桶
+        // 清旧缩略图（下一帧 ensure_window_grid 按新卡宽重取）；阅读 self.zoom 不变。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_grid_zoom(grid_zoom, cx);
+            });
+        });
+        // 等渲染带收敛：headless 重绘经 park 异步落到 render 帧（`grid_last_range` 由
+        // render_pdf_grid 每帧按当前卡宽写），轮询至数值稳定 = 新布局真正接管。
+        let mut got_band = false;
+        for _ in 0..60 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            let band = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).grid_last_range.get()
+            });
+            if band == band_after {
+                got_band = true;
+                break;
+            }
+        }
+        assert!(got_band, "缩放后网格渲染带应收敛到新布局派生区间 {band_after:?}");
+        let (card_w, mode, vis_range, gz1, rz1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.grid_card_width(),
+                v.grid_mode(),
+                v.grid_last_range.get(),
+                v.grid_zoom,
+                v.zoom,
+            )
+        });
+        assert!(
+            (card_w - target_w).abs() < 1e-3,
+            "缩放后卡宽应 = 280×2=560，实际 {card_w}"
+        );
+        assert!(mode, "网格缩放应停留网格模式（不退出、不跳页）");
+        assert_eq!(vis_range, band_after, "缩放后可视页集合 = 新布局派生区间");
+        assert!(
+            (gz1 - grid_zoom).abs() < 1e-4,
+            "set_grid_zoom 应改 grid_zoom：{gz1}"
+        );
+        assert!(
+            (rz1 - 1.0).abs() < 1e-6,
+            "网格 set_grid_zoom 不得改阅读 zoom（独立缩放）：{rz1}"
+        );
+        // 效果断言：缩放已清空旧分桶缩略图 → 下一帧按新卡宽重取入 `grid_thumbs`（不确定
+        // worker 时序 → 推进虚拟时钟 + 少量真实等待轮询，与既有缩略图测试同姿势）。
+        let mut got = false;
+        for _ in 0..600 {
+            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            got = cx.update(|_w, cx| {
+                !holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.is_empty()
+            });
+            if got {
+                break;
+            }
+        }
+        assert!(got, "缩放后缩略图应按新卡宽重取入 grid_thumbs");
+
+        // 反向独立性：网格内程序化改**阅读** zoom（set_zoom）×1.5 → 卡宽仍按 grid_zoom
+        // （不变）、仅 self.zoom 变化、仍停留网格（卡宽不被阅读缩放联动）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.set_zoom(1.5);
+            });
+        });
+        let (card_after_read, read_after, mode2) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_card_width(), v.zoom, v.grid_mode())
+        });
+        assert!(
+            (read_after - 1.5).abs() < 1e-3,
+            "set_zoom 应改阅读 zoom：{read_after}"
+        );
+        assert!(
+            (card_after_read - target_w).abs() < 1e-3,
+            "阅读 set_zoom 不应联动网格卡宽（仍按 grid_zoom）：{card_after_read}"
+        );
+        assert!(mode2, "阅读 set_zoom 不应退出网格");
+    }
+
+    /// item 3b：网格 **Ctrl+滚轮** 交互分支（input.rs `on_scroll_wheel` 网格臂）——真实
+    /// 输入路径（非程序化 `set_grid_zoom`）。gpui 测试平台可派发真实 `ScrollWheelEvent`（带 ctrl
+    /// 修饰键，同单列 `pdf_ctrl_wheel_zooms_in_out`）。断五件事：
+    /// 1) 卡宽按 **grid_zoom** 步进派生（`GRID_CARD_WIDTH × grid_zoom`，280×1.12 手算）；
+    /// 2) **独立性**：`self.zoom`（阅读缩放）**不变**——网格缩放与阅读缩放解耦；
+    /// 3) `grid_scroll` 偏移按 `ratio = new_card/old_card` **同比重锚**（offset×ratio）；
+    /// 4) 网格模式保持（不退出、不跳页）；
+    /// 5) 普通（无 ctrl）滚轮不缩放（grid_zoom/阅读 zoom/卡宽都不变）且照常垂直滚动（未被拦截）。
+    #[gpui::test]
+    async fn grid_ctrl_wheel_zooms_cards_reanchors_scroll_and_keeps_mode(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 前置：给网格一个非零滚动偏移（滚到第 3 行顶），供缩放重锚断言（offset × ratio 同比）。
+        let off_target = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let layout = grid_layout(
+                &v.dims,
+                v.grid_card_width(),
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            layout.row_top[2]
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.grid_scroll.set_offset(gpui::point(px(0.), px(-off_target)));
+            });
+        });
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (gz0, read0, card0, off0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_zoom, v.zoom, v.grid_card_width(), v.grid_scroll.offset())
+        });
+        let sy0 = f32::from(-off0.y);
+        assert!(sy0 > 0.0, "前置：网格应处于非零滚动（滚到第 3 行顶），实际 {sy0}");
+        assert!((gz0 - 1.0).abs() < 1e-6, "前置：grid_zoom 初始应为 1.0，实际 {gz0}");
+        assert!((read0 - 1.0).abs() < 1e-6, "前置：阅读 zoom 初始应为 1.0，实际 {read0}");
+
+        // Ctrl+向上滚一档（delta_y=240 → factor=1+ZOOM_STEP=1.12）→ grid_zoom 步进衍生卡宽、
+        // 滚动同比重锚；阅读 zoom **保持不变**（独立性）。
+        cx.simulate_event(grid_zoom_wheel(true, 240.0));
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (gz1, read1, card1, off1, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.grid_zoom,
+                v.zoom,
+                v.grid_card_width(),
+                v.grid_scroll.offset(),
+                v.grid_mode(),
+            )
+        });
+        let ratio = card1 / card0;
+        assert!(gz1 > gz0, "Ctrl+向上滚应放大 grid_zoom：{gz0} → {gz1}");
+        assert!(
+            (card1 - GRID_CARD_WIDTH * gz1).abs() < 1e-3,
+            "缩放后卡宽应 = 280×grid_zoom，实际 {card1}"
+        );
+        assert!(
+            (read1 - read0).abs() < 1e-6,
+            "网格 Ctrl+滚轮不得改阅读 zoom（独立缩放）：{read0} → {read1}"
+        );
+        let exp_sy = sy0 * ratio;
+        let got_sy = f32::from(-off1.y);
+        assert!(
+            (got_sy - exp_sy).abs() < 2.0,
+            "Ctrl 缩放后网格滚动应同比重锚（offset×ratio）：{sy0}×{ratio:.3}={exp_sy:.1}，实际 {got_sy:.1}"
+        );
+        assert!(mode, "Ctrl 缩放应停留网格模式（不退出、不跳页）");
+
+        // 普通滚轮（无 Ctrl）→ 不缩放（grid_zoom/阅读 zoom/卡宽都不变），且照常垂直滚动（不拦截）。
+        let (gz_before, read_before, card_before) = (gz1, read1, card1);
+        let off_before = f32::from(-off1.y);
+        cx.simulate_event(grid_zoom_wheel(false, -120.0));
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (gz2, read2, card2, off2) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_zoom, v.zoom, v.grid_card_width(), v.grid_scroll.offset())
+        });
+        assert!(
+            (gz2 - gz_before).abs() < 1e-6,
+            "普通滚轮不应缩放 grid_zoom：{gz_before} → {gz2}"
+        );
+        assert!(
+            (read2 - read_before).abs() < 1e-6,
+            "普通滚轮不应改阅读 zoom：{read_before} → {read2}"
+        );
+        assert!(
+            (card2 - card_before).abs() < 1e-3,
+            "普通滚轮不应改卡宽：{card_before} → {card2}"
+        );
+        assert!(
+            f32::from(-off2.y) > off_before,
+            "普通滚轮应垂直下滚（未被缩放拦截）：{off_before} → {}",
+            f32::from(-off2.y)
+        );
+    }
+
+    /// item 3c：**阅读缩放与网格卡宽双向独立**——起始在单列阅读模式 `set_zoom(1.5)`
+    /// （程序化阅读缩放）→ `self.zoom=1.5`；随后进入网格 → `grid_card_width()` 仍按
+    /// **独立 grid_zoom**（默认 1.0）= 280（**不是** 280×1.5），`self.zoom` 保持 1.5；
+    /// 退出网格回单列阅读 → `self.zoom` 仍 1.5（网格缩放不串读阅读）。
+    #[gpui::test]
+    async fn reading_zoom_independent_of_grid_card_width(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        // 不用 open_grid_host_fixture（它会自动进网格）；先留在单列阅读模式改阅读 zoom。
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        assert!(
+            !cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_mode()),
+            "前置：应在单列阅读模式"
+        );
+        // 单列阅读缩放到 1.5（程序化 set_zoom，等同阅读 Ctrl+滚轮改 self.zoom）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.set_zoom(1.5);
+            });
+        });
+        let (read_z0, card_reading) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.zoom, v.grid_card_width())
+        });
+        assert!((read_z0 - 1.5).abs() < 1e-3, "set_zoom 应改阅读 zoom：{read_z0}");
+        assert!(
+            (card_reading - GRID_CARD_WIDTH).abs() < 1e-3,
+            "阅读 set_zoom 不应改网格卡宽（grid_zoom 默认 1.0）：{card_reading}"
+        );
+        // 进入网格：卡宽应仍按独立 grid_zoom（默认 1.0）= 280，而非 280×1.5=420。
+        enter_grid(&holder, cx);
+        let (card, grid_z, read_z1, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_card_width(), v.grid_zoom, v.zoom, v.grid_mode())
+        });
+        assert!(
+            (card - GRID_CARD_WIDTH).abs() < 1e-3,
+            "阅读缩放后进网格，卡宽应仍按 grid_zoom（默认 1.0）=280，实际 {card}（不是 280×阅读zoom）"
+        );
+        assert!((grid_z - 1.0).abs() < 1e-6, "grid_zoom 初始应为 1.0：{grid_z}");
+        assert!(
+            (read_z1 - 1.5).abs() < 1e-3,
+            "进网格不改阅读 zoom：{read_z1}"
+        );
+        assert!(mode, "应在网格模式");
+        // 退出网格回阅读：self.zoom 仍 1.5（网格缩放不串读阅读）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_grid_mode(false, cx);
+            });
+        });
+        let read_z2 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).zoom);
+        assert!(
+            (read_z2 - 1.5).abs() < 1e-3,
+            "退出网格后阅读 zoom 应保持 1.5：{read_z2}"
+        );
+    }
+
+    /// item 3（同桶复用裁决）：网格缩放**仅跨分桶才清**缩略图/在途请求（worker 按
+    /// `grid_bucket_width` GRID_BUCKET_PX=32 量化分桶缓存）。断言两翼：
+    /// ① **同桶内**缩放（factor=1.012 → 卡宽 280→283.36，手算 283.36/32=8.855→round 9→288，
+    ///    与 280 同 288 桶）→ 已入槽缩略图**保留**（不清、不闪占位）；
+    /// ② **跨桶**缩放（factor=1.12 → 卡宽 313.6 → 320 桶 ≠ 288）→ 旧分桶缩略图与在途
+    ///    请求**清空**，随后按新分桶重取回槽。
+    #[gpui::test]
+    async fn grid_ctrl_wheel_same_bucket_reuses_thumbs_cross_bucket_clears(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 前置：等待至少一张缩略图入槽（worker 真实栅格返回，K37 效果断言；同桶复用断言
+        // 需有「已入槽缓存」可观察）。
+        let mut primed = false;
+        for _ in 0..600 {
+            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            primed = cx.update(|_w, cx| {
+                !holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.is_empty()
+            });
+            if primed {
+                break;
+            }
+        }
+        assert!(primed, "前置：网格缩略图应已入槽（同桶复用断言需有缓存可观察）");
+        let bucket0 = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            grid_bucket_width(v.grid_card_width())
+        });
+        assert_eq!(bucket0, 288, "前置：卡宽 280 应落 288 桶（280/32=8.75→round 9）");
+
+        // ① 同桶内缩放：delta_y=0.10 → factor=1+0.10×0.12=1.012 → 卡宽 283.36，仍在 288 桶
+        //    → 缩略图缓存与在途请求保留（不清）。
+        cx.simulate_event(grid_zoom_wheel(true, 0.10));
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (card_mid, bucket_mid, thumbs_mid) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.grid_card_width(),
+                grid_bucket_width(v.grid_card_width()),
+                !v.grid_thumbs.is_empty(),
+            )
+        });
+        assert_eq!(bucket_mid, bucket0, "小步缩放应仍落在同一分桶（{bucket0}）");
+        assert!(
+            (card_mid - GRID_CARD_WIDTH * (1.0 + 0.10 * ZOOM_STEP)).abs() < 1e-3,
+            "同桶缩放卡宽应 = 280×(1+0.10×ZOOM_STEP)，实际 {card_mid}"
+        );
+        assert!(thumbs_mid, "同桶缩放不应清空已入槽缩略图（同桶复用）");
+
+        // ② 跨桶缩放：delta_y=240 → factor=1.12 → 卡宽 313.6 → 320 桶 ≠ 288 → 清空旧缓存。
+        cx.simulate_event(grid_zoom_wheel(true, 240.0));
+        // 紧接事件后的同步窗口：旧分桶缩略图应即时清空（clear 生效；下一帧 schedule 按
+        // 新分桶重派在途请求是预期重取行为，不在此断言）。
+        let (empty_thumbs, bucket_after) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.grid_thumbs.is_empty(),
+                grid_bucket_width(v.grid_card_width()),
+            )
+        });
+        assert_ne!(bucket_after, bucket_mid, "跨桶缩放应换桶：{bucket_mid} → {bucket_after}");
+        assert!(empty_thumbs, "跨桶缩放应清空旧分桶缩略图（换桶失效）");
+        // 随后按新分桶重取回槽（worker 真实栅格，同既有缩略图测试轮询姿势）。
+        let mut refetched = false;
+        for _ in 0..600 {
+            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            refetched = cx.update(|_w, cx| {
+                !holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.is_empty()
+            });
+            if refetched {
+                break;
+            }
+        }
+        assert!(refetched, "跨桶缩放后缩略图应按新分桶重取回槽");
+    }
+
+    #[gpui::test]
+    async fn grid_scroll_moves_band_and_releases_old_cards(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        let ((old_start, _old_end), _, _) = expected_grid_band(&holder, cx, 0.0);
+        // 滚到第 6 行顶（内容坐标系 y = row_top[5]）并推进渲染帧
+        let offset = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let layout = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            layout.row_top[5]
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.grid_scroll.set_offset(gpui::point(px(0.), px(-offset)));
+            });
+        });
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+
+        // 新可视带 = 同口径派生的第 6 行带；断言明显下移
+        let ((new_start, new_end), new_count, _) = expected_grid_band(&holder, cx, offset);
+        assert!(
+            new_start >= old_start + 4,
+            "滚到第 6 行后可视带应明显下移：{old_start} → {new_start}"
+        );
+        let (range, drawn) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_last_range.get(), v.grid_last_drawn.get())
+        });
+        assert_eq!(range, (new_start, new_end), "滚动后可视带应跟随网格滚动偏移");
+        assert_eq!(drawn, new_count, "滚动后物化卡数仍应等于派生带宽");
+
+        // 旧卡释放：grid_thumbs / pending_grid 不得残留新带之外的页（确定性，不依赖 worker 时序）
+        let (thumbs_keys, pending_keys) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.grid_thumbs.keys().copied().collect::<Vec<usize>>(),
+                v.pending_grid.keys().copied().collect::<Vec<usize>>(),
+            )
+        });
+        for p in thumbs_keys.iter().chain(pending_keys.iter()) {
+            assert!(
+                *p >= new_start && *p <= new_end,
+                "滚动后旧带页 {p} 应被释放（新带 [{new_start},{new_end}]）"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn grid_thumbnails_fetched_into_slots(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+
+        // 效果断言：网格缩略图经 request_grid（背景信道，每帧 ≤GRID_PREFETCH_INFLIGHT）
+        // 真实拉取入槽——推进虚拟时钟驱动 16ms 泵 + 少量真实等待给 pdfium worker。
+        let mut got = false;
+        for _ in 0..600 {
+            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            got = cx.update(|_w, cx| {
+                !holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.is_empty()
+            });
+            if got {
+                break;
+            }
+        }
+        assert!(got, "网格缩略图应经 request_grid 拉取入 grid_thumbs（带内首屏）");
+    }
+
+    // ---- 网格多选（wave5）：选中集 / checkbox / Ctrl+Shift / 工具栏 ----
+
+    /// wave5：勾选卡右上角 checkbox → 该页进入选中集 + 选中视觉（角标）出现；**不退出网格**
+    /// （checkbox 子元素 `stop_propagation` 独占，卡的本底单击「退出网格」不应触发）。
+    /// 期望由交互路径推导：checkbox 是卡内子元素，命中栈先于卡触发且拦截冒泡（K15）。
+    #[gpui::test]
+    async fn grid_checkbox_toggles_selection_with_visual(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        // 进入网格应清空选中集（一次会话语义）
+        assert_eq!(
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()),
+            0,
+            "进入网格应清空选中集"
+        );
+        assert!(
+            cx.debug_bounds("pdf-grid-badge-0").is_none(),
+            "未选中时不应有选中角标"
+        );
+        // 勾选第 1 张卡（页 0）checkbox
+        let c0 = cx
+            .debug_bounds("pdf-grid-check-0")
+            .expect("带内首卡 checkbox 应在场")
+            .center();
+        cx.simulate_click(c0, gpui::Modifiers::default());
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (selected, count, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected(0), v.grid_selected_count(), v.grid_mode())
+        });
+        assert!(selected, "勾选该卡后页 0 应进入选中集");
+        assert_eq!(count, 1, "选中计数应为 1");
+        assert!(mode, "勾选 checkbox 不应退出网格");
+        assert!(
+            cx.debug_bounds("pdf-grid-badge-0").is_some(),
+            "选中后应出现选中角标（选中视觉）"
+        );
+        // 再勾选一次 → 取消选中
+        let c0 = cx.debug_bounds("pdf-grid-check-0").unwrap().center();
+        cx.simulate_click(c0, gpui::Modifiers::default());
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (selected, count) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected(0), v.grid_selected_count())
+        });
+        assert!(!selected, "再次勾选应取消选中");
+        assert_eq!(count, 0, "取消后计数为 0");
+    }
+
+    /// wave5：Ctrl+单击卡 → 切换选中态（select→unselect）且**不退出网格**（Ctrl 分支不调
+    /// `set_grid_mode(false)`，行为表明文）。期望 = Ctrl 修饰键到达卡的 `on_mouse_down`。
+    #[gpui::test]
+    async fn grid_ctrl_click_toggles_selection_without_exit(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        // 第 1 张卡（页 0）Ctrl+单击 → 选中且不退出网格
+        let c0 = cx.debug_bounds("pdf-grid-item-0").unwrap().center();
+        cx.simulate_click(c0, ctrl);
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (selected, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected(0), v.grid_mode())
+        });
+        assert!(selected, "Ctrl+单击应选中页 0");
+        assert!(mode, "Ctrl+单击不应退出网格");
+        // 同一位置再次 Ctrl+单击 → 取消选中且仍不退出网格
+        cx.simulate_click(c0, ctrl);
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (selected, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected(0), v.grid_mode())
+        });
+        assert!(!selected, "再次 Ctrl+单击应取消选中");
+        assert!(mode, "取消选中后仍应在网格模式");
+    }
+
+    /// wave5：Shift+单击 → 从「锚点页」（上次 Ctrl 单选）到当前页**闭区间**选中（3 页断言
+    /// 具体集合），其它已选保持、锚点更新为该页，且不退出网格。锚点由 Ctrl+单击先建立。
+    #[gpui::test]
+    async fn grid_shift_click_selects_closed_range(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        // 锚点源：Ctrl+单击页 0（单选 → 锚点=0）
+        let anchor_click = cx.debug_bounds("pdf-grid-item-0").unwrap().center();
+        cx.simulate_click(
+            anchor_click,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_selection_anchor()),
+            Some(0),
+            "Ctrl+单击后锚点应为页 0"
+        );
+        // Shift+单击页 2 → 闭区间 [0,2] 全部选中（含锚点与当前页）
+        let range_click = cx.debug_bounds("pdf-grid-item-2").unwrap().center();
+        cx.simulate_click(
+            range_click,
+            gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (actual, anchor, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected.clone(), v.grid_selection_anchor(), v.grid_mode())
+        });
+        let expected: HashSet<usize> = [0usize, 1, 2].into_iter().collect();
+        assert_eq!(actual, expected, "Shift 范围应闭区间选中 {{0,1,2}}");
+        assert_eq!(anchor, Some(2), "Shift+单击后锚点应更新为当前页 2");
+        assert!(mode, "Shift+单击不应退出网格");
+    }
+
+    /// wave5：工具栏「全选」→ 选中计数 == 总页数；「清空选择」→ 计数 0（真实点击驱动，
+    /// 非直接调方法——验证按钮接线）。点击发生在可用态（-on 标记在场）。
+    #[gpui::test]
+    async fn grid_toolbar_select_all_and_clear(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.len());
+        // 点「全选」→ 全部选中
+        let sa = cx
+            .debug_bounds("pdf-grid-tool-select-all-on")
+            .expect("全选按钮应在场")
+            .center();
+        cx.simulate_click(sa, gpui::Modifiers::default());
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let count = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()
+        });
+        assert_eq!(count, n, "全选应选中全部页 N={n}");
+        // 点「清空选择」→ 计数 0
+        let clr = cx
+            .debug_bounds("pdf-grid-tool-clear-on")
+            .expect("清空选择按钮应在场")
+            .center();
+        cx.simulate_click(clr, gpui::Modifiers::default());
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let count = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()
+        });
+        assert_eq!(count, 0, "清空选择后应为 0");
+    }
+
+    /// wave5：工具栏「退出网格」→ `grid_mode=false` 且选中集/锚点清空（一次会话语义）。
+    #[gpui::test]
+    async fn grid_toolbar_exit_clears_selection(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        // 先选中页 1（Ctrl）
+        let sel1 = cx.debug_bounds("pdf-grid-item-1").unwrap().center();
+        cx.simulate_click(
+            sel1,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (sel, count, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected(1), v.grid_selected_count(), v.grid_mode())
+        });
+        assert!(sel && count == 1 && mode, "前置：应处于选中 1 页的网格态");
+        // 工具栏「退出网格」→ 退出且清选
+        let exit = cx
+            .debug_bounds("pdf-grid-tool-exit-on")
+            .expect("退出网格按钮应在场")
+            .center();
+        cx.simulate_click(exit, gpui::Modifiers::default());
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (mode, count, anchor) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_mode(), v.grid_selected_count(), v.grid_selection_anchor())
+        });
+        assert!(!mode, "工具栏退出网格应生效");
+        assert_eq!(count, 0, "退出网格应清空选中集");
+        assert_eq!(anchor, None, "退出网格应清空 Shift 锚点");
+    }
+
+    /// wave5：**双击**卡退出（跳页语义迁到双击后）+ 退出后选中集清空；再进入网格选中集仍空。
+    /// 与 `grid_double_click_card_exits_and_jumps_to_page` 互补：后者断「双击退出 + 跳页」，
+    /// 本条断「退出路径同样清选」（双击卡与 toggle 都经 `set_grid_mode(false)`）。
+    #[gpui::test]
+    async fn grid_click_card_exit_clears_selection(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        // 先选中页 0（Ctrl，带内可点）；随后**双击**卡 1 退出
+        let sel0 = cx.debug_bounds("pdf-grid-item-0").unwrap().center();
+        cx.simulate_click(
+            sel0,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 双击卡 1 中心（checkbox 在右上角不干扰）→ 退出网格
+        let plain1 = cx.debug_bounds("pdf-grid-item-1").unwrap().center();
+        simulate_grid_double_click(cx, plain1);
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (mode, count) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_mode(), v.grid_selected_count())
+        });
+        assert!(!mode, "双击卡应退出网格");
+        assert_eq!(count, 0, "双击卡退出路径同样清空选中集");
+        // 再进入网格：仍为空（一次会话语义）
+        enter_grid(&holder, cx);
+        let count = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()
+        });
+        assert_eq!(count, 0, "再进入网格应从头开始（选中集空）");
+    }
+
+    /// wave5：工具栏页操作按钮 UI 呈现——无选中时 删除/拆分/提取/合并 **禁用**（`-off`
+    /// 标记在场、`-on` 不在），有选中时含计数变为**可用**（`-on` 在场）。只断 UI 呈现，
+    /// 不断 handler 行为（wave8 才接线）；计数 badge 文案由 `grid_selected_count` 派生。
+    #[gpui::test]
+    async fn grid_toolbar_action_buttons_state(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            GridHost { pdf }
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(&holder, cx);
+        assert!(
+            cx.debug_bounds("pdf-grid-toolbar").is_some(),
+            "网格顶栏应在场"
+        );
+        // 无选中：全部禁用（off 在场、on 不在）
+        for (off, on) in [
+            ("pdf-grid-tool-delete-off", "pdf-grid-tool-delete-on"),
+            ("pdf-grid-tool-split-off", "pdf-grid-tool-split-on"),
+            ("pdf-grid-tool-extract-off", "pdf-grid-tool-extract-on"),
+            ("pdf-grid-tool-merge-off", "pdf-grid-tool-merge-on"),
+        ] {
+            assert!(cx.debug_bounds(off).is_some(), "{off} 应在场（无选中禁用）");
+            assert!(cx.debug_bounds(on).is_none(), "{on} 不应对场（无选中禁用）");
+        }
+        // Ctrl+单击页 0 → 有选中
+        let sel0 = cx.debug_bounds("pdf-grid-item-0").unwrap().center();
+        cx.simulate_click(
+            sel0,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 有选中：全部可用（on 在场、off 不在）；计数 badge 由计数派生
+        for (off, on) in [
+            ("pdf-grid-tool-delete-off", "pdf-grid-tool-delete-on"),
+            ("pdf-grid-tool-split-off", "pdf-grid-tool-split-on"),
+            ("pdf-grid-tool-extract-off", "pdf-grid-tool-extract-on"),
+            ("pdf-grid-tool-merge-off", "pdf-grid-tool-merge-on"),
+        ] {
+            assert!(cx.debug_bounds(off).is_none(), "{off} 不应在场（有选中可用）");
+            assert!(cx.debug_bounds(on).is_some(), "{on} 应在场（有选中可用）");
+        }
+    }
+
+    /// wave8：四操作按钮的 **handler 存在性静态核验**——有选中时逐个 `simulate_click`，
+    /// 断言 listener 已挂载、点击不 panic、模型不变（headless 无法真机弹对话框/文件框，
+    /// 测试构建下手 handler 是 no-op 桩；真实行为由 `grid_apply_*` seam 测试覆盖——把
+    /// 「接线存在」与「动作正确」分层验证，wave5 的 `grid_toolbar_action_buttons_state`
+    /// 只断 UI 呈现、本测试补「点击确实命中 handler」）。
+    #[gpui::test]
+    async fn grid_toolbar_action_buttons_handler_wired(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 0);
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.len());
+        assert!(n >= 2, "夹具页数需 ≥2，实际 {n}");
+        // 勾选两页 → 四按钮全部可用（on）。
+        let sel0 = cx.debug_bounds("pdf-grid-item-0").unwrap().center();
+        cx.simulate_click(
+            sel0,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        let sel1 = cx.debug_bounds("pdf-grid-item-1").unwrap().center();
+        cx.simulate_click(
+            sel1,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 逐个点击可用操作按钮：handler 命中（挂载 + 不 panic）；测试桩不改模型。
+        for selector in [
+            "pdf-grid-tool-delete-on",
+            "pdf-grid-tool-split-on",
+            "pdf-grid-tool-extract-on",
+            "pdf-grid-tool-merge-on",
+        ] {
+            let c = cx.debug_bounds(selector).unwrap().center();
+            cx.simulate_click(c, gpui::Modifiers::default());
+            for _ in 0..3 {
+                let _ = cx.refresh();
+                cx.run_until_parked();
+            }
+            let (count, mode) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.dims.len(), v.grid_mode())
+            });
+            assert_eq!(count, n, "点击 {selector}（测试桩）不应改变页数");
+            assert!(mode, "点击 {selector}（测试桩）不应退出网格");
+        }
+    }
+
+    // ---- wave6：网格拖拽重组——纯函数手算用例（K177：期望值先演算后落）----
+
+    /// `compute_insert_index` 手算用例：6 页 A4、vw=1500 → cols=5、cell_w=280（新语义跟随
+    /// 请求卡宽，不再按填满反算 284）、cell_h=280×792/612≈362.353、gap=12、padding=16 →
+    /// row_top=[16, 16+362.353+12≈390.353]、total≈16+362.353+12+362.353+16≈768.706。
+    /// 期望插入位全部手写算式推导。
+    #[gpui::test]
+    fn compute_insert_index_hand_cases(_cx: &mut TestAppContext) {
+        let dims: Vec<(f32, f32)> = vec![(612.0, 792.0); 6];
+        let layout = grid_layout(&dims, 280.0, 12.0, 16.0, 1500.0);
+        assert_eq!(layout.cols, 5, "6 页 1500 宽应 5 列");
+        let (x0, y0, w0, h0) = layout.cell_rect(0).unwrap();
+        let (x1, _, _, _) = layout.cell_rect(1).unwrap();
+        let (x4, _, _, _) = layout.cell_rect(4).unwrap();
+        let (_, y5, _, _) = layout.cell_rect(5).unwrap();
+        // 卡 0 左上角（x 取左缘+4、y 取卡 0 内）：插到最前 → 线性位 0
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, x0 + 4.0, y0 + 4.0),
+            Some(0),
+            "卡 0 左上角 → 线性位 0（最前）"
+        );
+        // 卡 1 右半：col_slot = round(1 + 0.8·280/292) ≈ round(1.7671) = 2 → 线性位 2（卡间）
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, x1 + w0 * 0.8, y0 + 2.0),
+            Some(2),
+            "卡 1 右半 → 线性位 2（卡 1 之后 / 卡 2 之前）"
+        );
+        // 卡 4（行 0 末卡）右半：col_slot = round(4.7671) = 5 → min(row_len=5) → 线性位 5
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, x4 + w0 * 0.8, y0 + 2.0),
+            Some(5),
+            "行 0 末卡右半 → 线性位 5（行 1 首）"
+        );
+        // 行 1（卡 5）左半：行 r=1、col_slot=round((x−16)/292)=0 → base=row_page_start[1]=5 → 5
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, x0 + 4.0, y5 + 4.0),
+            Some(5),
+            "卡 5 左半 → 线性位 5（行 1 首前）"
+        );
+        // 行间垂直 gap（y = 行 0 底与行 1 顶之中点）：r=0、y ≥ row_top[1]−gap →
+        //   直接 = row_page_start[1] = 5（本行末 = 下一行首）
+        let gap_y = (y0 + h0 + layout.row_top[1]) / 2.0;
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, x0 + 4.0, gap_y),
+            Some(5),
+            "行间 gap → 线性位 5（行 1 首）"
+        );
+        // 顶 padding → 0；底 padding（y ≥ total − padding = 末行底）→ n=6
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, 500.0, 5.0),
+            Some(0),
+            "顶部 padding → 线性位 0"
+        );
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, 500.0, layout.total_height - 5.0),
+            Some(6),
+            "底部 padding → 线性位 n=6（末尾）"
+        );
+        // 网格外：x 超出 vw / y 超出 total_height → None（松手即放弃）
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, 1505.0, y0 + 4.0),
+            None,
+            "x 超出内容宽 → None"
+        );
+        assert_eq!(
+            compute_insert_index(&layout, 1500.0, x0 + 4.0, layout.total_height + 5.0),
+            None,
+            "y 超出总高 → None"
+        );
+    }
+
+    /// `apply_reorder` 手算用例：语义 = 移除被拖组（升序原下标）整体插到「原序线性位
+    /// insert 所指槽」；插入位（rest 内下标）`pos = insert − count(dragging < insert)`。
+    #[gpui::test]
+    fn apply_reorder_hand_cases(_cx: &mut TestAppContext) {
+        // 单卡前移：D=[0]、insert=3 → rest=[1,2,3,4,5]、pos=3−1=2 → [1,2,0,3,4,5]
+        assert_eq!(apply_reorder(6, &[0], 3), vec![1, 2, 0, 3, 4, 5]);
+        // 单卡后移到末尾：D=[1]、insert=6 → rest=[0,2,3,4,5]、pos=6−1=5 → [0,2,3,4,5,1]
+        assert_eq!(apply_reorder(6, &[1], 6), vec![0, 2, 3, 4, 5, 1]);
+        // 连续块后移：D=[1,2]、insert=5 → rest=[0,3,4,5]、pos=5−2=3 → [0,3,4,1,2,5]
+        //   （块「1,2」移到原序位 5 所指槽 = 页 5 之前）
+        assert_eq!(apply_reorder(6, &[1, 2], 5), vec![0, 3, 4, 1, 2, 5]);
+        // 拖回原位（insert ∈ 块自身跨度）→ 序不变：D=[1,2]、insert=2 → rest=[0,3,4,5]、
+        //   pos=2−2=0 → [1,2,0,3,4,5] = 原序（块又插回自身原位置，连续块 = 不变）
+        assert_eq!(apply_reorder(6, &[1, 2], 2), vec![0, 1, 2, 3, 4, 5]);
+        // 非连续组：D=[1,3]、insert=0（最前）→ rest=[0,2,4,5]、pos=0 → [1,3,0,2,4,5]
+        assert_eq!(apply_reorder(6, &[1, 3], 0), vec![1, 3, 0, 2, 4, 5]);
+        // 越界 insert 夹到 n：D=[0]、insert=99 → 等价 insert=6 → [1,2,3,4,5,0]
+        assert_eq!(apply_reorder(6, &[0], 99), vec![1, 2, 3, 4, 5, 0]);
+        // 空组 → 恒等；全选 → 恒等（整体平移）
+        assert_eq!(apply_reorder(4, &[], 2), vec![0, 1, 2, 3]);
+        assert_eq!(
+            apply_reorder(4, &[0, 1, 2, 3], 2),
+            vec![0, 1, 2, 3],
+            "全选拖拽 = 整体平移 = 序不变"
+        );
+    }
+
+    // ---- wave6：网格拖拽重组——交互集成（真实鼠标事件驱动）----
+
+    /// 等待模型条件成立（最多 600 帧；加载/重排后的 reload 均以 `is_loaded` + dims 收敛）。
+    fn wait_grid_until(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        mut cond: impl FnMut(&PdfViewer) -> bool,
+    ) {
+        for _ in 0..600 {
+            if cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                cond(v)
+            }) {
+                return;
+            }
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        panic!("等待 600 帧内模型条件未满足（重排未落地？）");
+    }
+
+    /// 网格拖拽测试公共开窗：`GridHost` 整窗渲染 + 等待加载 + 进网格。
+    fn open_grid_host<'a>(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &'a mut TestAppContext,
+    ) -> (gpui::Entity<GridHost>, &'a mut VisualTestContext) {
+        open_grid_host_fixture(holder, cx, 1)
+    }
+
+    /// 按夹具索引开网格宿主（wave8 seam 测试用 `fixture_idx=0` 的文本型 pdf测试.pdf 控探针
+    /// 渲染成本；拖拽测试仍默认索引 1 的长文多页）。其余与 `open_grid_host` 完全同构。
+    fn open_grid_host_fixture<'a>(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &'a mut TestAppContext,
+        fixture_idx: usize,
+    ) -> (gpui::Entity<GridHost>, &'a mut VisualTestContext) {
+        let pdf_path = test_util::test_pdf_paths()[fixture_idx].clone();
+        let (root, vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            holder.borrow_mut().replace(pdf.clone());
+            GridHost { pdf }
+        });
+        vcx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            vcx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            vcx.run_until_parked();
+            loaded = vcx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(holder, vcx);
+        (root, vcx)
+    }
+
+    /// wave6：拖已选卡（Ctrl 预选）→ 位移超阈值进入拖拽 → drop 到行 1 卡 5 前 →
+    /// 调 `reorder_pages`（模型尺寸序列 = `apply_reorder` 预期、页数不变）；整链**不退出**
+    /// 网格（拖拽与点卡跳页互斥）；重排成功后 ghost/指示线撤下、选中清空。
+    #[gpui::test]
+    async fn grid_drag_drop_reorders_page_order(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, mut cx) = open_grid_host(&holder, cx);
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.len());
+        assert!(n > 8, "夹具页数需 >8，实际 {n}");
+        // Ctrl+单击卡 0 预选（wave5 路径，此刻仍是网格内）
+        let p0 = cx.debug_bounds("pdf-grid-item-0").unwrap().center();
+        cx.simulate_click(
+            p0,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()),
+            1,
+            "前置：应选择页 0"
+        );
+        // 拖拽：按下卡 0 → 位移 6px（>2px 阈值）建立拖拽 → 移动指针到卡 5 中心
+        // （行 1 左半 → 线性位 5）→ 松手提交。
+        let target = cx.debug_bounds("pdf-grid-item-5").unwrap().center();
+        cx.simulate_mouse_down(p0, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            gpui::point(p0.x + px(0.), p0.y + px(6.)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 拖拽建立：ghost 在场；模型已进入拖拽态（且未触发跳页/仍网格）。插入指示线须
+        // 待首个 on_drag_move（指针进网格算出 insert）后才在场——此处移动尚为阈值越界，
+        // insert 仍 None，故不 assert 指示线（见下方目标移动后断言）。
+        assert!(
+            cx.debug_bounds("pdf-grid-ghost").is_some(),
+            "拖拽中 ghost 应在场"
+        );
+        let dragging = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).grid_drag.as_ref().map(|d| d.dragging.clone())
+        });
+        assert_eq!(dragging, Some(vec![0]), "拖已选卡 0 被拖组应为 [0]");
+        assert!(
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_mode()),
+            "拖拽中不应退出网格（拖拽/点卡互斥）"
+        );
+        // 移动到目标（卡 5 中心）→ 插入位 5；插入指示线随之在场；再松手提交
+        cx.simulate_mouse_move(target, Some(MouseButton::Left), gpui::Modifiers::default());
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("pdf-grid-reorder-line").is_some(),
+            "指针进入网格（insert 已算）后插入指示线应在场"
+        );
+        let insert = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).grid_drag.as_ref().and_then(|d| d.insert)
+        });
+        assert_eq!(insert, Some(5), "指针在行 1 卡 5 左半 → 插入线性位 5");
+        cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::default());
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 期望：原尺寸序列做 apply_reorder(n, [0], 5) → 页 0 移到页 5 前。
+        let orig_dims = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.clone());
+        let expect: Vec<(f32, f32)> = {
+            let order = apply_reorder(n, &[0], 5);
+            assert_eq!(order.len(), n, "重排应返回全排列");
+            order.iter().map(|&i| orig_dims[i]).collect()
+        };
+        wait_grid_until(&holder, &mut cx, move |v| {
+            v.is_loaded() && v.dims.len() == n && v.dims == expect
+        });
+        // 重排后：页数不变、仍网格（拖拽不跳页）、选中已清（reload 语义）、拖拽态已清。
+        let (count, mode, drag_state) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.grid_mode(), v.grid_drag.is_some())
+        });
+        assert_eq!(count, n, "重排后页数不变");
+        assert!(mode, "拖拽重排后应保持网格模式（不跳页）");
+        assert!(!drag_state, "drop 后拖拽态应清");
+        let sel = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            v.grid_selected_count()
+        });
+        assert_eq!(sel, 0, "重排成功经 reload 清选中（wave5 契约）");
+    }
+
+    /// wave6：拖**未选**卡 → 先清空既有选择改为单卡选中（整组拖 = 单卡）；drop 提交
+    /// 该单卡的重排。顺带断言拖拽中不触发勾选（原选中集被替换为单卡，非叠加）。
+    #[gpui::test]
+    async fn grid_drag_unselected_card_replaces_selection_then_drags(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, mut cx) = open_grid_host(&holder, cx);
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.len());
+        // 先选中页 0（Ctrl），再拖**未选**的页 3 → 应替换为 {3}
+        let s0 = cx.debug_bounds("pdf-grid-item-0").unwrap().center();
+        cx.simulate_click(
+            s0,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let p3 = cx.debug_bounds("pdf-grid-item-3").unwrap().center();
+        cx.simulate_mouse_down(p3, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            gpui::point(p3.x + px(0.), p3.y + px(6.)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (dragging, sel) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.grid_drag.as_ref().map(|d| d.dragging.clone()),
+                v.grid_selected.clone(),
+            )
+        });
+        assert_eq!(dragging, Some(vec![3]), "拖未选卡被拖组应为 [3]");
+        let expect_sel: HashSet<usize> = HashSet::from([3usize]);
+        assert_eq!(sel, expect_sel, "未选卡开拖 → 选中集替换为单卡 [3]");
+        // 拉到卡 5 前提交 → 期望 = apply_reorder(n, [3], 5)。
+        let target = cx.debug_bounds("pdf-grid-item-5").unwrap().center();
+        cx.simulate_mouse_move(target, Some(MouseButton::Left), gpui::Modifiers::default());
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::default());
+        let orig_dims = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.clone());
+        let expect: Vec<(f32, f32)> = {
+            let order = apply_reorder(n, &[3], 5);
+            order.iter().map(|&i| orig_dims[i]).collect()
+        };
+        wait_grid_until(&holder, &mut cx, move |v| {
+            v.is_loaded() && v.dims.len() == n && v.dims == expect
+        });
+        let mode = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_mode());
+        assert!(mode, "拖未选卡重排后仍应网格模式");
+    }
+
+    /// wave6：drop 在网格外（指针移出内容容器，如工具条区域）→ 不提交（模型维度不变）、
+    /// 选中保持原样、拖拽态清。
+    #[gpui::test]
+    async fn grid_drag_drop_outside_abandons_keeping_selection(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host(&holder, cx);
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.len());
+        // 预选 {0}
+        let s0 = cx.debug_bounds("pdf-grid-item-0").unwrap().center();
+        cx.simulate_click(
+            s0,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 拖起卡 0，移到网格内容之外（工具条区内，内容坐标 y<0 → insert None），松手。
+        cx.simulate_mouse_down(s0, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            gpui::point(s0.x + px(0.), s0.y + px(6.)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let outside = gpui::point(px(400.), px(10.)); // 工具条区：在网格根内、内容容器外
+        cx.simulate_mouse_move(outside, Some(MouseButton::Left), gpui::Modifiers::default());
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let insert = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).grid_drag.as_ref().and_then(|d| d.insert)
+        });
+        assert_eq!(insert, None, "指针移出内容容器 → 插入位 None");
+        cx.simulate_mouse_up(outside, MouseButton::Left, gpui::Modifiers::default());
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (count, sel, mode, drag_some) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.dims.len(),
+                v.grid_selected_count(),
+                v.grid_mode(),
+                v.grid_drag.is_some(),
+            )
+        });
+        assert_eq!(count, n, "drop 网格外不应改变模型（页数不变）");
+        assert_eq!(sel, 1, "drop 网格外应保持选中（不提交不清选）");
+        assert!(mode, "drop 网格外应在网格模式（不跳页）");
+        assert!(!drag_some, "drop 后拖拽态应清");
+    }
+
+    // ---- wave8：网格工具栏页操作 seam——「确认框 / 文件选择之后」的可测锚点 ----
+    // 按钮 handler 只做「确认/弹框 → 调 seam」的接线（headless 无法真机弹对话框/文件框），
+    // 故行为断言全部落在 `grid_apply_*` seam 上（此层已含真实 view 状态副作用：保持网格、
+    // 清选中、页操作异步链路），与 wave7 的 fixture/oracle 姿势一致（K177：期望值先演算）。
+
+    /// 页操作 seam 异步链路等待：带时钟前进 + 真实睡眠（页操作后台 round-trip 与新镜象
+    /// `open_from_bytes` 解析在后台执行器，快循环连抽空帧会错过完成窗口——对齐既有
+    /// thumb-wait 的 advance_clock + sleep 姿势）。
+    fn wait_seam_until(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        mut cond: impl FnMut(&PdfViewer) -> bool,
+    ) {
+        for _ in 0..800 {
+            if cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                cond(v)
+            }) {
+                return;
+            }
+            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("等待 800 轮内模型条件未满足（页操作/重载未落地？）");
+    }
+
+    /// 渲染第 `page` 页（scale=1.0 全密度）并返回 (宽, 高, FNV-1a 内容哈希)——内容 oracle，
+    /// 与 pdf_core `render_page_probe` 同口径。页操作成功重载后 viewer 的 worker/doc 已被
+    /// `open_from_bytes` **替换**（新 doc 新句柄）→ 调用方须在 op 完成后重读 `v.worker`/
+    /// `v.doc_id` 再探（K37：效果断言须落在重载后的真实文档上）。
+    fn page_probe(worker: &PdfWorker, doc_id: DocId, page: usize) -> (u32, u32, u64) {
+        let rx = worker.request_render(doc_id, RenderRequest { page, scale: 1.0 }, 0, 0);
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到渲染结果")
+            .expect("渲染应成功");
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in &r.bgra {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (r.width, r.height, h)
+    }
+
+    /// 对当前 viewer 的 worker/doc 探一页渲染哈希。
+    fn live_page_probe(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        page: usize,
+    ) -> (u32, u32, u64) {
+        let (worker, doc_id) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.worker.clone(), v.doc_id)
+        });
+        page_probe(&worker.expect("文档已加载应有 worker"), doc_id, page)
+    }
+
+    /// 网格工具栏 seam 测试的临时输出路径（pid + 序号唯一，落系统 temp，勿污染仓库）。
+    fn grid_tool_output(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("vpic-grid-{name}-{}-{seq}.pdf", std::process::id()))
+    }
+
+    /// wave8：删除 seam `grid_apply_delete` —— 整批删 {1,3}：页数 n-2、幸存尺寸序列 =
+    /// 原剔除 {1,3}、残留渲染哈希（首/次/末）对齐原页、成功重载后仍网格模式且选中清空。
+    #[gpui::test]
+    async fn grid_apply_delete_removes_pages_and_keeps_grid(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, mut cx) = open_grid_host_fixture(&holder, cx, 0);
+        let (n, orig_dims) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.dims.clone())
+        });
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        // 算式（K177）：删除 {1,3}（k=2）→ 剩 n-2 页；幸存原序 = 0,2,4..n-1。
+        // 原图 oracle：幸存页 0 / 2 / 末页 n-1 在**原 worker/doc** 上探渲染哈希。
+        let orig0 = live_page_probe(&holder, &mut cx, 0);
+        let orig2 = live_page_probe(&holder, &mut cx, 2);
+        let orig_last = live_page_probe(&holder, &mut cx, n - 1);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.grid_apply_delete(vec![1, 3], cx);
+            });
+        });
+        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n - 2);
+        let expect_dims: Vec<(f32, f32)> = orig_dims
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 3)
+            .map(|(_, d)| *d)
+            .collect();
+        let (count, mode, dims_after, sel) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.dims.len(),
+                v.grid_mode(),
+                v.dims.clone(),
+                v.grid_selected_count(),
+            )
+        });
+        assert_eq!(count, n - 2, "删除后页数 = n-2");
+        assert_eq!(dims_after, expect_dims, "幸存尺寸序列 = 原剔除 {{1,3}}");
+        assert!(mode, "删除重载后应保持网格模式（grid_hold_on_reload 姿势）");
+        assert_eq!(sel, 0, "删除成功经重载清选中");
+        // 残留渲染哈希：新文档 0/1/末页 = 原页 0/2/n-1（删页重排后内容不搬动）。
+        let new0 = live_page_probe(&holder, &mut cx, 0);
+        let new1 = live_page_probe(&holder, &mut cx, 1);
+        let new_last = live_page_probe(&holder, &mut cx, n - 3);
+        assert_eq!(new0, orig0, "残留首页渲染 = 原页 0");
+        assert_eq!(new1, orig2, "残留次要页渲染 = 原页 2");
+        assert_eq!(new_last, orig_last, "残留末页渲染 = 原末页 n-1");
+    }
+
+    /// wave8：拆分 seam `grid_apply_split` —— 拆 [1,3]：新文件 3 页（尺寸/渲染对齐源区间
+    /// 原序）、当前 n-3 页（幸存序）、保持网格模式；`undo_last` 可撤销回 n 页（新文件仍在）。
+    #[gpui::test]
+    async fn grid_apply_split_writes_range_trims_and_undo(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, mut cx) = open_grid_host_fixture(&holder, cx, 0);
+        let (n, orig_dims) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.dims.clone())
+        });
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        // 原图 oracle：区间页 1..3 + 幸存首页 0。
+        let orig0 = live_page_probe(&holder, &mut cx, 0);
+        let orig1 = live_page_probe(&holder, &mut cx, 1);
+        let orig2 = live_page_probe(&holder, &mut cx, 2);
+        let orig3 = live_page_probe(&holder, &mut cx, 3);
+        let out = grid_tool_output("split-range");
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.grid_apply_split((1, 3), out.clone(), cx);
+            });
+        });
+        // 算式（K177）：区间 [1,3] 长 = 3-1+1 = 3 → 新文件 3 页、当前剩余 n-3 页。
+        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n - 3);
+        assert!(out.exists(), "拆分应先写新文件再移除区间: {}", out.display());
+        // ① 新文件：页数 3、尺寸 = 原 dims[1..=3]、渲染逐页 = 原页 1..3。
+        let new_bytes = std::fs::read(&out).expect("新文件应可读");
+        let (w_new, d_new, dims_new) = PdfWorker::open_and_dims(new_bytes).expect("新文件应可打开");
+        assert_eq!(dims_new, orig_dims[1..4].to_vec(), "新文件尺寸 = 源区间原序");
+        assert_eq!(
+            (0..3).map(|i| page_probe(&w_new, d_new, i)).collect::<Vec<_>>(),
+            vec![orig1, orig2, orig3],
+            "新文件逐页渲染 = 源区间页"
+        );
+        w_new.close(d_new);
+        // ② 当前文档：n-3 页、幸存尺寸 = 原剔除 {1,2,3}、首页渲染仍 = 原页 0、保持网格。
+        let expect_dims: Vec<(f32, f32)> = orig_dims
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 2 && *i != 3)
+            .map(|(_, d)| *d)
+            .collect();
+        let (count, mode, dims_after, sel) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.dims.len(),
+                v.grid_mode(),
+                v.dims.clone(),
+                v.grid_selected_count(),
+            )
+        });
+        assert_eq!(count, n - 3, "拆分后当前页数 = n-3");
+        assert_eq!(dims_after, expect_dims, "当前幸存尺寸 = 原剔除 {{1,2,3}}");
+        assert!(mode, "拆分重载后应保持网格模式");
+        assert_eq!(sel, 0, "拆分成功经重载清选中");
+        // 当前首页渲染 = 原页 0（在重载后的新 worker/doc 上探）。
+        let cur0_probe = live_page_probe(&holder, &mut cx, 0);
+        assert_eq!(cur0_probe, orig0, "当前首页渲染 = 原页 0");
+        // ③ 可撤销：undo_last 回 n 页（新文件仍在）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.undo_last(cx);
+            });
+        });
+        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n);
+        let restored_dims = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).dims.clone()
+        });
+        assert_eq!(restored_dims, orig_dims, "撤销后页尺寸序列还原");
+        assert!(out.exists(), "撤销后新文件仍存在: {}", out.display());
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// wave8：提取 seam `grid_apply_extract` —— 勾选 {0,2}（升序）：新文件 2 页（尺寸/渲染
+    /// 对齐源页）、当前页数/尺寸/网格不变、选中同步清空（副本语义）。
+    #[gpui::test]
+    async fn grid_apply_extract_writes_checked_pages_current_unchanged(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, mut cx) = open_grid_host_fixture(&holder, cx, 0);
+        let (n, orig_dims) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.dims.clone())
+        });
+        assert!(n >= 3, "夹具页数需 ≥3，实际 {n}");
+        let orig0 = live_page_probe(&holder, &mut cx, 0);
+        let orig2 = live_page_probe(&holder, &mut cx, 2);
+        let out = grid_tool_output("extract");
+        // 用**非排序**勾选快照 {2,0} 直接调 seam（HashSet 快照插入序本就不保证；按钮 handler
+        // 经 `grid_extract_clicked` 归序，这里以非排序入参断言 seam `grid_apply_extract` **自身**
+        // 归序后导出产物页序 = 勾选页升序 [0,2]）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.grid_selected.extend([2usize, 0]);
+                v.grid_apply_extract(vec![2, 0], out.clone(), cx);
+            });
+        });
+        // 副本语义：导出**异步成功**后选中集才消费清空（失败不清选可重试）→ 先等文件落盘
+        // 成功，再断言选中清空。
+        let out_clone = out.clone();
+        wait_seam_until(&holder, &mut cx, move |_v| out_clone.exists());
+        let (sel, mode) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected_count(), v.grid_mode())
+        });
+        assert_eq!(sel, 0, "提取异步成功后选中清空（副本语义）");
+        assert!(mode, "提取后仍在网格模式（不重载不退出）");
+        // 新文件：2 页、尺寸 = [dims[0], dims[2]]（**升序**——非排序入参也须归序）、
+        // 渲染 = [orig0, orig2]。
+        let new_bytes = std::fs::read(&out).expect("新文件应可读");
+        let (w_new, d_new, dims_new) = PdfWorker::open_and_dims(new_bytes).expect("新文件应可打开");
+        assert_eq!(dims_new, vec![orig_dims[0], orig_dims[2]], "提取产物尺寸 = 勾选升序");
+        assert_eq!(
+            (0..2).map(|i| page_probe(&w_new, d_new, i)).collect::<Vec<_>>(),
+            vec![orig0, orig2],
+            "提取产物逐页渲染 = 源勾选页"
+        );
+        w_new.close(d_new);
+        // 当前不变：页数/尺寸原样。
+        let (count, dims_after) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.dims.clone())
+        });
+        assert_eq!(count, n, "提取后当前页数不变");
+        assert_eq!(dims_after, orig_dims, "提取后当前尺寸不变");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// wave8：提取 seam `grid_apply_extract` **失败不清选** —— 同步预检失败（目标 == 当前
+    /// 文档路径 P1 防护）→ `last_modify_error` 置位、**选中集保留**（可重试）；成功分支
+    /// 的「异步成功后清选」见 `grid_apply_extract_writes_checked_pages_current_unchanged`。
+    #[gpui::test]
+    async fn grid_apply_extract_failure_keeps_selection(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 0);
+        let (n, cur_path) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.path.clone())
+        });
+        assert!(n >= 2, "夹具页数需 ≥2，实际 {n}");
+        // 勾选 {0,1}，然后提取到**当前文档路径** → `extract_target_precheck` 同步拒 → 不
+        // 发起异步、`last_modify_error` 置位、选中保留（可重试）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.grid_selected.extend([0usize, 1]);
+                v.grid_apply_extract(vec![0, 1], cur_path, cx);
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (sel, err) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_selected_count(), v.last_modify_error().map(String::from))
+        });
+        assert!(
+            err.as_deref().is_some_and(|m| m.contains("不能覆盖当前打开的文档")),
+            "应报 P1 防护文案：{err:?}"
+        );
+        assert_eq!(sel, 2, "提取失败不清选（保持可重试）");
+        assert_eq!(
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.len()),
+            n,
+            "预检失败不改变模型页数"
+        );
+    }
+
+    /// wave8：合并 seam `grid_apply_merge` —— 当前 pdf测试.pdf (n) + 源 pdf测试2.pdf (m)：
+    /// 总页 n+m、前 n 页尺寸 = 原、尾部 m 页尺寸 = 源、尾部头 2 页渲染 = 源 0/1、
+    /// 保持网格模式且选中清空。
+    #[gpui::test]
+    async fn grid_apply_merge_appends_source_and_keeps_grid(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, mut cx) = open_grid_host_fixture(&holder, cx, 0);
+        let (n, orig_dims) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.dims.clone())
+        });
+        assert!(n >= 1, "夹具页数需 ≥1，实际 {n}");
+        // 源度量：临时 worker 开 pdf测试2.pdf 拿 m 与源头 2 页渲染基准。
+        let src_p = test_util::test_pdf_paths()[1].clone();
+        let (w_src, d_src, src_dims) = PdfWorker::open_and_dims(
+            std::fs::read(&src_p).expect("读取合并源应成功"),
+        )
+        .expect("合并源应可打开");
+        let m = src_dims.len();
+        assert!(m >= 2, "合并源页数需 ≥2（尾部 2 页断言），实际 {m}");
+        let src0 = page_probe(&w_src, d_src, 0);
+        let src1 = page_probe(&w_src, d_src, 1);
+        w_src.close(d_src);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.grid_apply_merge(src_p, cx);
+            });
+        });
+        // 算式（K177）：合并后总页数 = n（当前）+ m（源全页）。
+        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n + m);
+        let (count, mode, sel, dims_all) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.grid_mode(), v.grid_selected_count(), v.dims.clone())
+        });
+        assert_eq!(count, n + m, "合并后总页数 = n+m");
+        assert!(mode, "合并重载后应保持网格模式");
+        assert_eq!(sel, 0, "合并成功经重载清选中");
+        assert_eq!(dims_all[..n].to_vec(), orig_dims, "合并后前 n 页尺寸 = 原");
+        assert_eq!(dims_all[n..].to_vec(), src_dims, "合并后尾部 m 页 = 源各页");
+        // 尾部 2 页渲染 = 源 0/1（在重载后的新 worker/doc 上探）。
+        let tail0 = live_page_probe(&holder, &mut cx, n);
+        let tail1 = live_page_probe(&holder, &mut cx, n + 1);
+        assert_eq!(tail0, src0, "合并后尾部第 1 页渲染 = 源首页");
+        assert_eq!(tail1, src1, "合并后尾部第 2 页渲染 = 源第 2 页");
+    }
+
+    /// item 5：网格模式下插入空白页 → 插入后**保持网格模式**（`grid_hold_on_reload` 姿势）
+    /// 且**不滚动到新页**（anchor 抑制——网格不消费阅读滚动，退出网格仍回原阅读位置）；
+    /// 页数 +1、`pdf-grid` 容器在场（已回网格渲染）、新页出现在网格可视数据（页数已 +1）。
+    /// 单列模式插入保持 index 定位由既有 lib.rs mem op 测试覆盖，此处不重复。
+    #[gpui::test]
+    async fn grid_mode_insert_blank_page_stays_in_grid(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, mut cx) = open_grid_host_fixture(&holder, cx, 0);
+        let (n, scroll_y0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), f32::from(-v.scroll.offset().y))
+        });
+        assert!(n >= 2, "夹具页数需 ≥2，实际 {n}");
+        assert!(cx.debug_bounds("pdf-grid").is_some(), "插入前应处于网格视图");
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.insert_blank_page_after(0, cx);
+            });
+        });
+        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n + 1);
+        let (count, mode, scroll_y) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.dims.len(), v.grid_mode(), f32::from(-v.scroll.offset().y))
+        });
+        assert_eq!(count, n + 1, "插入后页数 +1");
+        assert!(mode, "网格模式插入空白页应保持网格模式（grid_hold_on_reload）");
+        assert!(
+            cx.debug_bounds("pdf-grid").is_some(),
+            "插入重载后 `pdf-grid` 容器应在场（仍在网格视图）"
+        );
+        assert!(
+            (scroll_y - scroll_y0).abs() < 1.0,
+            "插入后单列滚动应保持原位（grid 下 anchor 被抑制、不跳新页），{scroll_y0} → {scroll_y}"
         );
     }
 }

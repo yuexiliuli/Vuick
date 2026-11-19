@@ -83,6 +83,11 @@ impl PdfViewer {
         if !self.pending_mid.is_empty() || !self.pending_thumb.is_empty() {
             return true;
         }
+        // 网格缩略图在途：继续出帧收集（网格模式无输入时唯一驱动重绘的来源——派发后若无
+        // 泵，grid 卡图永远停留在占位）。
+        if !self.pending_grid.is_empty() {
+            return true;
+        }
         // F4 走廊封面在途：继续出帧收集空闲预取结果（idle 分支派发后自启动泵的延续）。
         if !self.pending_prefetch_cover.is_empty() {
             return true;
@@ -1002,6 +1007,117 @@ impl PdfViewer {
                 tb -= 1;
             }
         }
+    }
+
+    // ---- 网格视图（Grid）缩略图通道（wave3）：独立缓存 + 行带虚拟化调度 ----
+
+    /// 网格模式在途缩略图派发：仅对**可视行带 ±1 行**（与渲染 `grid_visible_range` 同一
+    /// 几何）内「既无就绪图、又无在途」的页派发，每帧上限 [`config::pdf::GRID_PREFETCH_INFLIGHT`]
+    /// 枚（背景信道，≤thumb 优先级，不洪起 worker 队列、不抢阅读器栅格化带宽）。卡宽 =
+    /// `grid_card_width()`（derived from `grid_zoom`，独立于阅读缩放；与渲染同一口径；worker 按
+    /// [`config::pdf::GRID_BUCKET_PX`] 分桶缓存，同桶复用不重栅）。
+    /// `nav_gen`/`zoom_epoch` 打戳同既有占位请求（L2.2/Z2 enqueue 姿势）。
+    pub(super) fn schedule_grid_thumbs(&mut self, window: &Window) {
+        if self.dims.is_empty() {
+            return;
+        }
+        let Some(worker) = self.worker.clone() else {
+            return;
+        };
+        let (vw, vh) = self.grid_viewport(window);
+        let layout = grid_layout(&self.dims, self.grid_card_width(), GRID_GAP, GRID_PADDING, vw);
+        let offset = f32::from(-self.grid_scroll.offset().y);
+        let Some((start, end)) = grid_visible_range(&layout, offset, vh) else {
+            return;
+        };
+        let mut budget = config::pdf::GRID_PREFETCH_INFLIGHT;
+        for i in start..=end {
+            if budget == 0 {
+                break;
+            }
+            if self.grid_thumbs.contains_key(&i) || self.pending_grid.contains_key(&i) {
+                continue;
+            }
+            let rx = worker.request_grid(
+                self.doc_id,
+                i,
+                self.grid_card_width(),
+                self.scale_factor,
+                self.nav_gen,
+                self.zoom_epoch,
+            );
+            self.pending_grid.insert(i, (self.nav_gen, rx));
+            budget -= 1;
+        }
+    }
+
+    /// 网格在途缩略图回收：worker 回传 BGRA → `grid_thumbs[i]` 入槽（同『缩略图』包装姿势，
+    /// `wrap_render_image` 按 `luma` 选 BGRA/R8 路径）。替换旧图时旧纹理经 `pending_drops`
+    /// 显式下线。失败（`None`）不拉黑——后续帧预算内自然重派。返回是否有新卡图入槽。
+    pub(super) fn collect_grid_results(&mut self) -> bool {
+        let finished = collect_finished(&mut self.pending_grid, |(_, rx)| rx.try_recv());
+        let mut any = false;
+        for (i, res) in finished {
+            self.pending_grid.remove(&i);
+            match res {
+                Some(res) => {
+                    if let Ok(img) =
+                        crate::pdf::wrap_render_image(res.bgra, res.width, res.height, res.luma)
+                    {
+                        if let Some(old) = self.grid_thumbs.insert(i, img) {
+                            self.pending_drops.push(old);
+                        }
+                        any = true;
+                    }
+                }
+                None => {}
+            }
+        }
+        any
+    }
+
+    /// 网格缩略图淘汰（行带外回收）：保留仅在**可视行带 ±1 行**内的页，带外在途请求连同
+    /// 结果通道一并丢弃（worker 回传 send 静默失败，无泄漏）、就绪卡图转 `pending_drops`
+    /// 下帧 `drop_image` 下线——滚动后旧卡图立即释放，驻留内存随视口收缩（对齐页列瓦片
+    /// 淘汰语义）。无可见带（视口在内容外 / 空文档）→ 全部回收。
+    pub(super) fn evict_grid_thumbs(&mut self, window: &Window) {
+        if self.dims.is_empty() {
+            self.clear_grid_resources();
+            return;
+        }
+        let (vw, vh) = self.grid_viewport(window);
+        let layout = grid_layout(&self.dims, self.grid_card_width(), GRID_GAP, GRID_PADDING, vw);
+        let offset = f32::from(-self.grid_scroll.offset().y);
+        let band = grid_visible_range(&layout, offset, vh);
+        let Some((start, end)) = band else {
+            self.clear_grid_resources();
+            return;
+        };
+        self.pending_grid.retain(|&p, _| p >= start && p <= end);
+        if !self.grid_thumbs.is_empty() {
+            let stale: Vec<usize> = self
+                .grid_thumbs
+                .keys()
+                .copied()
+                .filter(|&p| p < start || p > end)
+                .collect();
+            for p in stale {
+                if let Some(arc) = self.grid_thumbs.remove(&p) {
+                    self.pending_drops.push(arc);
+                }
+            }
+        }
+    }
+
+    /// 清空全部网格缩略图与在途请求（退出网格 / 文档重载 / 释放共用）：卡图全部转
+    /// `pending_drops` 下帧集中 `drop_image` 下线，在途通道丢弃。
+    pub(super) fn clear_grid_resources(&mut self) {
+        if !self.grid_thumbs.is_empty() {
+            let thumbs: Vec<Arc<RenderImage>> =
+                self.grid_thumbs.drain().map(|(_, img)| img).collect();
+            self.pending_drops.extend(thumbs);
+        }
+        self.pending_grid.clear();
     }
 
     // ---- 在途结果回收 ----

@@ -11,12 +11,34 @@
 //!   淘汰超预算缓存。调度细节在各职责子模块（`tiles` / `search`）。
 
 use super::*;
+use crate::pdf::parser::grid_bucket_width;
+
+/// 两路径是否指向**同一文件**（P1 数据丢失防护用）：先各自 `canonicalize` 对拍（把盘上
+/// 已存在文件归一化成绝对路径，`.`/`..`、大小写、分隔符差异都能消除）；`out` 目标尚未
+/// 创建时 `canonicalize` 失败 → 退化回字面路径相等比较（防漏纯拼写同路径）。
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
 
 /// 提取输出路径的**同步可写性预检**：原子写盘先在同目录建临时文件（`save_raw_doc_to_file`
 /// → `File::create(tmp)`，`tmp = 父目录.join(..)`），故父目录缺失 / 目标是现有目录必然
 /// 失败——在菜单决策点（异步提取发起前）即置错，杜绝「成功 toast 恒假 + 失败双 toast」。
 /// 空父路径（裸文件名）回退系统临时目录，放行。返回 `Some(错误文案)` = 注定失败。
-fn extract_target_precheck(out: &PathBuf) -> Option<String> {
+/// wave8 评审 P1：目标 == 当前打开的文档路径也要拒——导出/拆分原子写盘会把盘上源文件
+/// **覆盖成子集**（内存镜像不变、dirty 不置），原文件丢失且无撤销保护。
+fn extract_target_precheck(cur_path: &Path, out: &Path) -> Option<String> {
+    if same_file_path(cur_path, out) {
+        return Some(format!(
+            "无法导出/拆分到 {}：不能覆盖当前打开的文档",
+            out.display()
+        ));
+    }
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() && !parent.is_dir() {
             return Some(format!(
@@ -30,6 +52,78 @@ fn extract_target_precheck(out: &PathBuf) -> Option<String> {
         return Some(format!("无法提取到 {}：目标路径是现有目录", out.display()));
     }
     None
+}
+
+/// 合并源的**读端有界读盘**（wave8 评审 R7/P2-A2：把「元数据预检 + 整档读盘」从 pdfium
+/// worker 线程挪到 view 侧后台线程，worker 只收字节消息——绝不让合并源读盘阻塞全局
+/// pdfium 渲染/页操作队列）：
+/// 1. **元数据预检**：`len > PDF_MERGE_MAX_SRC_BYTES` → 快拒（零分配）；
+/// 2. **真边界读**：`Read::take(上限 + 1)` 兜住「元数据之后文件被外部追加」的 TOCTOU，
+///    读满即判超限 Err——是 check-then-read 的真边界、非 `metadata` 一次 check-then-use。
+/// 返回 `Err` 时绝无字节进 worker。超限/读失败统走 `last_modify_error` 既有错误面。
+fn read_merge_source_bounded(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let meta = std::fs::metadata(path).map_err(|e| {
+        anyhow::Error::msg(format!("无法读取合并源 {}：{e}", path.display()))
+    })?;
+    if meta.len() > PDF_MERGE_MAX_SRC_BYTES {
+        return Err(anyhow::Error::msg(format!(
+            "合并源过大（{} 字节，上限 {}）：{}",
+            meta.len(),
+            PDF_MERGE_MAX_SRC_BYTES,
+            path.display()
+        )));
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        anyhow::Error::msg(format!("无法读取合并源 {}：{e}", path.display()))
+    })?;
+    // 有界读：最多读 `上限 + 1` 字节（再多也截断返回），读满判超限——超大源不会一次性
+    // 整档进内存（未满上限的正常源自然读到 EOF 得完整内容）。
+    let mut buf = Vec::new();
+    file.by_ref().take(PDF_MERGE_MAX_SRC_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > PDF_MERGE_MAX_SRC_BYTES {
+        return Err(anyhow::Error::msg(format!(
+            "合并源过大（实际读取 {} 字节，上限 {}）：{}",
+            buf.len(),
+            PDF_MERGE_MAX_SRC_BYTES,
+            path.display()
+        )));
+    }
+    Ok(buf)
+}
+
+/// 撤销栈「整档快照」条目预算（wave8 评审 R6）：连续页面操作在撤销栈里各持一份整档
+/// `Vec<u8>` 镜像（内存 ~ 全档大小），无界增长会随操作数线性吃内存（N 次操作 = N × 档大
+/// 小）。预算 = 最多保留 [`UNDO_MAX_MEM_ENTRIES`] 条 `RestoreMemory`，超出淘汰最旧一条
+/// （`RemoveAnnot`/`AddAnnotBack` 注释逆操作大小恒定、不含整档镜像，不受此限）。
+/// 推导：32 条对正常文档（<50MB）≈ 1.6GB 最坏上限、可回滚最近一轮批量操作；512MB 巨型
+/// 档 × 32 = 16GB 理论最坏，仍比「无界随操作数增长」可控（save/另存时 `undo_stack.clear()`
+/// 既有语义会整栈清空）。
+const UNDO_MAX_MEM_ENTRIES: usize = 32;
+
+/// 撤销栈预算裁剪（**纯逻辑，便于单测**，所有 `RestoreMemory` 入栈点唯一入口的底层）：
+/// `RestoreMemory` 条目数 > [`UNDO_MAX_MEM_ENTRIES`] → 从最前**循环**淘汰最旧一条
+/// RestoreMemory（其余类型条目保留原位置），直到条目数 ≤ 预算——幂等归位（生产按每次
+/// push 调用，一次至多淘汰 1 条；测试可一次灌入多条目后单次归位）。保证栈内整档快照恒
+/// ≤ 预算。
+fn enforce_undo_mem_budget(stack: &mut VecDeque<UndoEntry>) {
+    loop {
+        let mem_count = stack
+            .iter()
+            .filter(|e| matches!(e, UndoEntry::RestoreMemory { .. }))
+            .count();
+        if mem_count <= UNDO_MAX_MEM_ENTRIES {
+            break;
+        }
+        if let Some(pos) = stack
+            .iter()
+            .position(|e| matches!(e, UndoEntry::RestoreMemory { .. }))
+        {
+            stack.remove(pos);
+        } else {
+            break;
+        }
+    }
 }
 
 impl PdfViewer {
@@ -128,6 +222,22 @@ impl PdfViewer {
             panning: false,
             pan_origin: gpui::point(px(0.), px(0.)),
             pan_offset0: gpui::point(px(0.), px(0.)),
+            // ---- 网格视图（Grid）状态（wave3）：见 view.rs 结构字段注释 ----
+            grid_mode: false,
+            grid_zoom: 1.0,
+            grid_scroll: ScrollHandle::new(),
+            grid_thumbs: HashMap::new(),
+            pending_grid: HashMap::new(),
+            grid_last_range: std::cell::Cell::new((0, 0)),
+            grid_last_drawn: std::cell::Cell::new(0),
+            // wave5 网格多选：进入/退出网格时清空，见 `set_grid_mode`
+            grid_selected: HashSet::new(),
+            grid_anchor: None,
+            // wave6 网格拖拽重组：无拖拽（残留安全默认），布局快照空（尚未渲染）
+            grid_press: None,
+            grid_drag: None,
+            grid_layout_cell: std::cell::RefCell::new(None),
+            grid_hold_on_reload: false,
         };
         this.start_load(cx);
         this
@@ -234,6 +344,21 @@ impl PdfViewer {
         }
         self.pending_drops.extend(old_images);
         self.slots = vec![Slot::default(); self.dims.len()];
+        // 文档重载/重开：网格模式复位到单列，旧网格缩略图与在途请求清空（旧 doc 尺寸
+        // 已不适用，卡图与行带全作废）。
+        self.grid_mode = false;
+        self.clear_grid_resources();
+        // wave5：页数已变 → 选中集/锚点按新页码集合作废（选中集是页码下标语义）。
+        self.grid_selected.clear();
+        self.grid_anchor = None;
+        // wave6：拖拽态随文档作废；拖拽重排后的 reload 保持网格模式（见
+        // `grid_hold_on_reload` 字段注释——拖拽重组应在网格内继续，不丢回单列）。
+        self.grid_drag = None;
+        self.grid_press = None;
+        if self.grid_hold_on_reload {
+            self.grid_hold_on_reload = false;
+            self.grid_mode = true;
+        }
         self.state.loading = false;
         // 重载锚点：恢复滚动到目标页（越界夹取到末页；None 保持首帧原位）
         if let Some(anchor) = self.reload_anchor.take() {
@@ -307,10 +432,11 @@ impl PdfViewer {
         ));
     }
 
-    /// 程序化设置缩放倍数（clamp 到 [ZOOM_MIN, ZOOM_MAX]），并按 [`layout::zoom_rescroll_anchor`]
-    /// 把当前滚动重锚到**页内显示比例不变**（页顶线性缩放 + 页内偏移同比）。`#[doc(hidden)]`：
-    /// 供 headless 集成测试「跨 zoom 校验阅读比例语义」用；真实交互缩放走 `adjust_zoom`
-    /// （含 worker 世代 / 调度状态机 / notify）。
+    /// 程序化设置**阅读缩放**倍数（clamp 到 [ZOOM_MIN, ZOOM_MAX]），并按
+    /// [`layout::zoom_rescroll_anchor`] 把当前滚动重锚到**页内显示比例不变**（页顶线性缩放 +
+    /// 页内偏移同比）。`#[doc(hidden)]`：供 headless 集成测试「跨 zoom 校验阅读比例语义」用；
+    /// 真实交互缩放走 `adjust_zoom`（含 worker 世代 / 调度状态机 / notify）。**只改阅读缩放，
+    /// 不联动网格卡宽**（网格卡宽独立由 `grid_zoom` 派生，见 [`Self::grid_card_width`]）。
     #[doc(hidden)]
     pub fn set_zoom(&mut self, zoom: f32) {
         if self.dims.is_empty() {
@@ -336,6 +462,8 @@ impl PdfViewer {
             .clamp(0.0, max_sy.max(self.total_height.max(0.0)));
         self.scroll.set_offset(gpui::point(px(-f32::from(self.scroll.offset().x)), px(-new_y)));
         self.last_scroll_y = new_y;
+        // 网格卡宽独立于阅读缩放（`grid_card_width() = GRID_CARD_WIDTH × grid_zoom`），
+        // 故 `set_zoom` **不再联动网格**——网格卡宽只由 `set_grid_zoom`/网格 Ctrl+滚轮改。
     }
 
     /// 页数（文档尚未加载完时为 0）。P4 拆 crate 后根包 app::tests 亦消费，取消 `cfg(test)`。
@@ -366,6 +494,297 @@ impl PdfViewer {
         let scroll_y = f32::from(-self.scroll.offset().y);
         let first = first_visible_page(&self.dims, &self.page_tops, self.page_width(), scroll_y);
         Some((first + 1, self.dims.len()))
+    }
+
+    /// 网格模式滚动容器可视区 `(宽, 高)`：容器已布局回真实 bounds；首帧 bounds=0 回退
+    /// 窗口尺寸（与 `wrap_width` 首帧口径一致），两轴夹 ≥1 防退化布局。
+    pub(super) fn grid_viewport(&self, window: &Window) -> (f32, f32) {
+        let bw = f32::from(self.grid_scroll.bounds().size.width);
+        let bh = f32::from(self.grid_scroll.bounds().size.height);
+        let w = if bw > 0.0 {
+            bw
+        } else {
+            window.bounds().size.width.as_f32()
+        };
+        let h = if bh > 0.0 {
+            bh
+        } else {
+            window.bounds().size.height.as_f32()
+        };
+        (w.max(1.0), h.max(1.0))
+    }
+
+    /// 网格**请求卡宽**（逻辑 px）：由**独立网格缩放 `grid_zoom`** 派生（`GRID_CARD_WIDTH ×
+    /// grid_zoom`），**独立于单列阅读缩放 `self.zoom`**——网格 Ctrl+滚轮只改 `grid_zoom`
+    /// （卡宽/列数变化 + 缩略图按新分桶重取，view/input.rs `on_scroll_wheel` 网格臂），
+    /// 不碰阅读 `zoom`；阅读 Ctrl+滚轮 / `set_zoom` 也不再联动网格卡宽。render 布局 /
+    /// tiles 调度 / evict 三处都走本口径，保证「物化 = 派发 = 保留」同一几何。grid_zoom
+    /// clamp 于 [ZOOM_MIN, ZOOM_MAX] ⇒ 卡宽 ∈ [140, 1120]。
+    pub(crate) fn grid_card_width(&self) -> f32 {
+        GRID_CARD_WIDTH * self.grid_zoom
+    }
+
+    /// 程序化设置**网格独立缩放** `grid_zoom`（clamp 到 [ZOOM_MIN, ZOOM_MAX]），同比重锚
+    /// `grid_scroll`（保位）+ **仅跨分桶**清缩略图（同 input.rs 网格 Ctrl+滚轮臂口径）+
+    /// `notify`。`#[doc(hidden)]`：供 headless 网格缩放独立性测试用；真实交互走网格
+    /// Ctrl+滚轮（input.rs `on_scroll_wheel` 网格臂），只改 `grid_zoom`、不碰阅读 `self.zoom`。
+    #[doc(hidden)]
+    pub fn set_grid_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let old_card = self.grid_card_width();
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (self.grid_zoom - zoom).abs() < 1e-4 {
+            return;
+        }
+        self.grid_zoom = zoom;
+        let new_card = self.grid_card_width();
+        if (new_card - old_card).abs() > 1e-3 {
+            let ratio = new_card / old_card;
+            let sy = f32::from(-self.grid_scroll.offset().y) * ratio;
+            self.grid_scroll.set_offset(gpui::point(px(0.), px(-sy)));
+            if grid_bucket_width(new_card) != grid_bucket_width(old_card) {
+                self.clear_grid_resources();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 是否处于网格模式（页卡缩略图视图；shell 状态栏/粘贴面板与测试消费）。
+    pub fn grid_mode(&self) -> bool {
+        self.grid_mode
+    }
+
+    /// 进入/退出网格模式（供电层 wave4 与测试直接调用）。
+    /// - **进入**：网格独立滚动归零（从顶部开始，简单确定；后续 wave 若需可改为「滚动到
+    ///   当前页所在行」——非本次范围）。卡宽由 `Self::grid_card_width()`（= GRID_CARD_WIDTH ×
+    ///   grid_zoom，独立缩放字段，与阅读 `self.zoom` 无关）派生，进入时不另存固定宽度。
+    /// - **退出**：全部网格缩略图与在途请求清理（旧卡图转 `pending_drops` 下帧集中
+    ///   `drop_image` 下线 GPU 纹理，不留残留引用；与 `release`/`apply_loaded` 同姿势）。
+    /// 单列 `scroll` 偏移保持原样——切模式互不干扰，读者退出网格后回到离开时的阅读位置。
+    pub fn set_grid_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.grid_mode == enabled {
+            return;
+        }
+        self.grid_mode = enabled;
+        if enabled {
+            self.grid_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        } else {
+            self.clear_grid_resources();
+        }
+        // wave5：选中集 = **一次网格会话语义**——进入清空（上一会话残留不串场）、退出清空
+        // （本会话选中作废）都在模式翻转时复位，Shift 锚点一并清（点卡跳页经
+        // `set_grid_mode(false)` 走同一条，故点卡退出也自动清选）。
+        self.grid_selected.clear();
+        self.grid_anchor = None;
+        // wave6：拖拽态/待决单击随模式翻转作废（进入 = 无残留拖拽；退出 = 拖拽不可能
+        // 跨模式存活）。
+        self.grid_drag = None;
+        self.grid_press = None;
+        // wave8 评审 R1：模式翻转（进入/退出）都清「保持网格」待办位——该位只该存活于
+        // 「页操作在途 → reload 消费」的瞬时窗口；任意网格翻转（如退出后手动操作）都取
+        // 消它，防「页操作预检失败后 hold 残留 → 下一文档意外以网格模式打开」。
+        self.grid_hold_on_reload = false;
+        cx.notify();
+    }
+
+    /// 切换网格模式（供 shell 快捷键/工具栏与测试调用）。
+    pub fn toggle_grid(&mut self, cx: &mut Context<Self>) {
+        self.set_grid_mode(!self.grid_mode, cx);
+    }
+
+    // ---- 网格多选（wave5）：选中集模型 / Shift 范围选 / 全选清空 ----
+
+    /// 切换第 `i` 页在网格多选中的选中态（Ctrl+单击卡 / 卡 checkbox 勾选共用）：选中集
+    /// 含该页 ⇄ 不含，并把 Shift 范围锚点更新为该页（锚点 = 最近一次「单选 / 切换 / 勾选」）。
+    /// 页下标越界忽略；`notify` 驱动重绘。仅在网格模式语义下调用（网格外空转无副作用）。
+    pub(crate) fn grid_toggle_select(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i >= self.dims.len() {
+            return;
+        }
+        if !self.grid_selected.remove(&i) {
+            self.grid_selected.insert(i);
+        }
+        self.grid_anchor = Some(i);
+        cx.notify();
+    }
+
+    /// Shift+单击范围选：从锚点页到第 `i` 页的**闭区间**（含端点；锚点 > 当前页也正向覆盖）
+    /// 全部选中，**其它已选页保持不变**（不重算成仅该区间）——语义即「把锚点→当前页之间的
+    /// 页加入选中集」；锚点随后更新为该页。无锚点时退化为单选第 `i` 页（等价 toggle 置位）。
+    /// 页下标越界忽略；`notify` 驱动重绘。
+    pub(crate) fn grid_select_range(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i >= self.dims.len() {
+            return;
+        }
+        match self.grid_anchor {
+            Some(a) => {
+                let (lo, hi) = if a <= i { (a, i) } else { (i, a) };
+                for p in lo..=hi {
+                    if p < self.dims.len() {
+                        self.grid_selected.insert(p);
+                    }
+                }
+            }
+            None => {
+                self.grid_selected.insert(i);
+            }
+        }
+        self.grid_anchor = Some(i);
+        cx.notify();
+    }
+
+    /// 全选：把全部页加入选中集（工具栏「全选」）。锚点保持（批量操作不属「单选」）。
+    pub(crate) fn grid_select_all(&mut self, cx: &mut Context<Self>) {
+        self.grid_selected.extend(0..self.dims.len());
+        cx.notify();
+    }
+
+    /// 清空选中集（工具栏「清空选择」）。锚点保持。
+    pub(crate) fn grid_clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.grid_selected.clear();
+        cx.notify();
+    }
+
+    /// 第 `i` 页是否在网格选中集（O(1) 存在查询）。
+    pub(crate) fn grid_selected(&self, i: usize) -> bool {
+        self.grid_selected.contains(&i)
+    }
+
+    /// 当前选中页数（工具栏操作按钮计数 badge 与可用/禁用判定用）。
+    pub(crate) fn grid_selected_count(&self) -> usize {
+        self.grid_selected.len()
+    }
+
+    /// Shift 范围选锚点页（`None` = 尚无锚点）。唯一消费方是测试断言 → `#[cfg(test)]`
+    /// 收窄，消除生产构建 dead-code 告警（wave8 评审 R3；禁删，网格 Shift 选测试依赖）。
+    #[cfg(test)]
+    pub(crate) fn grid_selection_anchor(&self) -> Option<usize> {
+        self.grid_anchor
+    }
+
+    // ---- 网格拖拽重组（wave6）：on_drag 建立 / on_drag_move 更新 / on_mouse_up 收尾 ----
+
+    /// 拖拽开始（卡 `on_drag` 构造器内调用）：若被按页未选中 → **清空既有选择改为单卡选中**
+    /// （契约：拖未选卡先选中再整组拖）；被拖组 = 当前选中集快照（升序）。拖拽态单例
+    /// （覆盖可能残留的旧拖拽态）；`grid_press` 作废（转入拖拽不再当单击）。越界忽略。
+    pub(crate) fn grid_drag_begin(&mut self, page: usize) {
+        if page >= self.dims.len() {
+            return;
+        }
+        if !self.grid_selected.contains(&page) {
+            self.grid_selected.clear();
+            self.grid_selected.insert(page);
+            self.grid_anchor = Some(page);
+        }
+        let mut dragging: Vec<usize> = self.grid_selected.iter().copied().collect();
+        dragging.sort_unstable();
+        self.grid_press = None;
+        // ghost 起始位 = 被按卡中心（内容坐标；首帧即有合理位置，on_drag_move 后随指针）。
+        let pointer = self
+            .grid_layout_cell
+            .borrow()
+            .as_ref()
+            .and_then(|l| l.cell_rect(page).map(|(x, y, w, h)| gpui::point(x + w / 2.0, y + h / 2.0)))
+            .unwrap_or_else(|| gpui::point(0.0, 0.0));
+        self.grid_drag = Some(GridDrag {
+            dragging,
+            insert: None,
+            pointer,
+        });
+    }
+
+    /// 拖拽移动（`pdf-grid` 内容容器 `on_drag_move`）：把指针**窗口**坐标折成**网格内容**
+    /// 坐标（`ev.bounds` = 内容容器本帧 laid-out 边界、含滚动平移 → 内容坐标 = 指针 − 原点），
+    /// 读上一帧布局快照（[`Self::grid_layout_cell`]）算线性插入位并写回拖拽态（ghost 随
+    /// 指针、插入指示线随 `insert` 更新）。无拖拽态早退（幂等）。
+    pub(crate) fn grid_drag_move(&mut self, ev: &DragMoveEvent<GridDragData>) {
+        let Some(drag) = self.grid_drag.as_mut() else {
+            return;
+        };
+        let x = ev.event.position.x.as_f32() - ev.bounds.origin.x.as_f32();
+        let y = ev.event.position.y.as_f32() - ev.bounds.origin.y.as_f32();
+        let vw = ev.bounds.size.width.as_f32();
+        drag.pointer = gpui::point(x, y);
+        drag.insert = self
+            .grid_layout_cell
+            .borrow()
+            .as_ref()
+            .and_then(|layout| compute_insert_index(layout, vw, x, y));
+    }
+
+    /// 网格内松手（网格根 `on_mouse_up(Left)`，指针在网格根内即达）：
+    /// - 有拖拽态 → 消费：`insert` Some → 提交重排（`reorder_pages` 成功路径 reload，
+    ///   选中集由 `apply_loaded` 清空，拖拽态在此前已清；无变化 = 拖回原位，不提交但清选）；
+    ///   `insert` None（指针在内容外/工具条/尚未有移动事件）→ 放弃不提交、**选中保持**。
+    /// - 无拖拽态 → 按「待决单击」消费 wave5 语义（见 [`Self::grid_click_commit`]）。
+    pub(crate) fn grid_drag_release(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.grid_drag.take() else {
+            self.grid_click_commit(cx);
+            return;
+        };
+        self.grid_press = None;
+        let n = self.dims.len();
+        let Some(insert) = drag.insert.filter(|&p| p <= n) else {
+            // 网格外松手：放弃提交，选中保持原样（契约）。
+            cx.notify();
+            return;
+        };
+        let new_order = apply_reorder(n, &drag.dragging, insert);
+        if new_order != (0..n).collect::<Vec<_>>() {
+            // 拖拽重排是网格内操作：reload 后保持网格模式（apply_loaded 消费该位）。
+            if self.grid_mode {
+                self.grid_hold_on_reload = true;
+            }
+            self.reorder_pages(new_order, cx);
+        } else {
+            // 拖回原位 / 序列无变化：不提交，但拖拽已结束 → 清选中（一次拖拽会话完结）。
+            self.grid_selected.clear();
+            self.grid_anchor = None;
+            cx.notify();
+        }
+    }
+
+    /// 网格外松手（网格根 `on_mouse_up_out(Left)`）：与「取消」同语义——放弃提交、
+    /// 拖拽态复位、选中保持原样。无拖拽态幂等。
+    pub(crate) fn grid_drag_release_outside(&mut self, cx: &mut Context<Self>) {
+        self.grid_drag_cancel(cx);
+    }
+
+    /// 取消拖拽（Esc → `on_key_down`；网格外松手；测试直调）：放弃提交、拖拽态复位、
+    /// **选中保持原样**（契约）。`notify` 驱动 ghost/指示线撤下。
+    pub(crate) fn grid_drag_cancel(&mut self, cx: &mut Context<Self>) {
+        if self.grid_drag.take().is_none() {
+            return;
+        }
+        self.grid_press = None;
+        cx.notify();
+    }
+
+    /// 待决单击消费（未进入拖拽的松手）：按按下时修饰键 + 点击计数分发——
+    /// Ctrl = 切换选中（不退出网格）、Shift = 范围选中（不退出）、**双击**（click_count ≥ 2）
+    /// = 退出网格 + 跳页、普通单击（click_count == 1）= 切换选中且**留在网格**。
+    /// 「按下即触发」改为「松手判定」是拖拽互斥的必然（位移超阈值转拖拽后不得再误触）。
+    /// gpui 双击序列：第一击 count=1 先「选中」（文件管理器「先选定」）、随后第二击 count=2
+    /// 才「退出跳页」——两语义同卡依次成立，与文件管理器一致。
+    fn grid_click_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(press) = self.grid_press.take() else {
+            return;
+        };
+        if press.page >= self.dims.len() {
+            return;
+        }
+        if press.modifiers.control {
+            self.grid_toggle_select(press.page, cx);
+        } else if press.modifiers.shift {
+            self.grid_select_range(press.page, cx);
+        } else if press.click_count >= 2 {
+            // 双击：退出网格 + 单列滚动到该页（wave3 跳页语义迁到双击）。
+            self.set_grid_mode(false, cx);
+            self.scroll_to_page(press.page);
+            cx.notify();
+        } else {
+            // 普通单击：切换该页选中态，**留在网格**（不退出、不跳页）。
+            self.grid_toggle_select(press.page, cx);
+        }
     }
 
     /// 是否已加载完成。P4 拆 crate 后根包 app::tests 亦消费，取消 `cfg(test)`。
@@ -605,6 +1024,15 @@ impl PdfViewer {
         self.pending_tiles.clear();
         self.pending_cover.clear();
         self.pending_prefetch_cover.clear();
+        // 网格模式随文档释放复位到单列 + 清空网格缩略图/在途（防关闭后残留卡图引用）。
+        self.grid_mode = false;
+        self.clear_grid_resources();
+        // wave5：文档已释放 → 选中集随网格会话一并清空（防反向复用旧页码集合）。
+        self.grid_selected.clear();
+        self.grid_anchor = None;
+        // wave8 评审 R1：关闭/释放时清「保持网格」待办位——防上一文档页操作残留的
+        // `grid_hold_on_reload` 让**下一文档**加载时意外进入网格模式。
+        self.grid_hold_on_reload = false;
         // L1/L2：大跳/停稳状态随文档释放复位（worker 侧 navigate_gen 已在 `worker.close` 内
         // 清掉，nav_gen 单调递增不碍复用——worker 采纳 max，旧世代永不误 drop 新请求）。
         self.jump_armed = false;
@@ -614,6 +1042,8 @@ impl PdfViewer {
         // S1/S3：缩放手势状态随文档释放复位（`adjust_zoom` 置位、防抖到期清零）。
         self.zoom_armed = false;
         self.zoom_idle_frames = 0;
+        // 网格**独立缩放**随文档释放复位（网格会话语义；同文档内存重载 `apply_loaded` 期间保持）。
+        self.grid_zoom = 1.0;
         // Z2：缩放世代随文档释放复位（worker 镜像侧重置到 0，新档从 0 起）。
         self.zoom_epoch = 0;
         self.prefetch_reqs = 0;
@@ -702,6 +1132,12 @@ impl PdfViewer {
             cx.notify();
         }
         if self.dims.is_empty() || self.worker.is_none() {
+            return;
+        }
+        // ---- 网格模式：独立管线（缩略图调度/收集/行带淘汰），单列 keep_window/schedule/
+        // evict/门控 全部跳过——网格用独立 `grid_scroll` 偏移，不干扰单列阅读状态。----
+        if self.grid_mode {
+            self.ensure_window_grid(window, cx);
             return;
         }
         // **自适应窗口宽**：页宽基线 = 滚动容器可视宽 − 两侧页边距（容器首帧未布局宽为
@@ -1097,6 +1533,18 @@ impl PdfViewer {
         self.ensure_tile_pump(cx);
     }
 
+    /// 网格模式的每帧管线（`ensure_window` 的 `grid_mode` 分支）：网格缩略图在途收集 →
+    /// 可视化带派发（限 [`config::pdf::GRID_PREFETCH_INFLIGHT`]/帧）→ 行带外回收。静态帧
+    /// 门控 / keep_window / 瓦片调度概不参与——网格自带独立滚动偏移与独立缩略图槽。
+    pub(super) fn ensure_window_grid(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.collect_grid_results() {
+            cx.notify();
+        }
+        self.schedule_grid_thumbs(window);
+        self.evict_grid_thumbs(window);
+        self.ensure_tile_pump(cx);
+    }
+
     // ---- 待保存模型（P1）：注释只进内存叠加层 + 页面操作内存级 + save() 才写盘 ----
 
     /// 追加一条**待保存**注释（只进内存叠加层 + 置脏；**零磁盘零重载**，`save()` 时才由
@@ -1168,10 +1616,11 @@ impl PdfViewer {
 
 /// 待保存页面操作的种类（[`PdfViewer::submit_mem_op`]）：只改 worker 内存工作副本。
 enum MemOpKind {
-    /// 在 `at_index` 处插入一页空白页（0 基；= 当前页数即末尾追加）。
-    Insert { at_index: usize, w: f32, h: f32, anchor: usize },
-    /// 删除第 `index` 页。
-    Delete { index: usize, anchor: usize },
+    /// 在 `at_index` 处插入一页空白页（0 基；= 当前页数即末尾追加）。`anchor` = 重载后要
+    /// 定位的阅读页（`Some` 单列跳页）；网格模式插入 → `None`（留在网格、不滚动阅读）。
+    Insert { at_index: usize, w: f32, h: f32, anchor: Option<usize> },
+    /// 删除第 `index` 页。`anchor` = 重载后定位页（删除保位）。
+    Delete { index: usize, anchor: Option<usize> },
 }
 
 impl PdfViewer {
@@ -1227,19 +1676,19 @@ impl PdfViewer {
                 Ok(mem) => {
                     v.last_modify_error = None;
                     // 撤销条目：恢复操作前的内存镜像 + 操作前待存注释快照
-                    v.undo_stack.push_back(UndoEntry::RestoreMemory {
-                        bytes: mem.before,
-                        annots_before: v.pending_annots.clone(),
-                    });
+                    v.push_undo_restore(mem.before, v.pending_annots.clone());
                     v.pending_page_ops += 1;
                     shift(&mut v.pending_annots);
                     // 结构变了 → 灰框几何可能漂移，清空最稳
                     v.focused_annot = None;
-                    v.open_from_bytes(mem.after, Some(anchor), cx);
+                    v.open_from_bytes(mem.after, anchor, cx);
                     cx.notify();
                 }
                 Err(e) => {
                     v.last_modify_error = Some(format!("{e:#}"));
+                    // R2（对齐 reorder/batch_delete/split/merge 的 Err 分支）：失败无 reload →
+                    // 显式复位「保持网格」待办位，防残留波及后续无关重载意外回网格。
+                    v.grid_hold_on_reload = false;
                     cx.notify();
                 }
             });
@@ -1248,14 +1697,25 @@ impl PdfViewer {
     }
 
     /// 在 `page_index` 之后插入一页空白页（**内存级**：只改 worker 内存工作副本并重载，
-    /// **不写盘**；`save()` 时才落盘）。（新页尺寸 = 当前页；插入后滚动到新页。）
+    /// **不写盘**；`save()` 时才落盘）。（新页尺寸 = 当前页。）
+    /// 网格模式下插入：置 `grid_hold_on_reload` 保持网格 + anchor = `None`（留在网格、
+    /// 不滚动到新页——网格不消费阅读滚动，退出网格仍回原阅读位置）；单列插入保持
+    /// anchor 滚动到新页的既有行为。
     pub fn insert_blank_page_after(&mut self, page_index: usize, cx: &mut Context<Self>) {
         let Some(&(w, h)) = self.dims.get(page_index) else {
             self.last_modify_error = Some(format!("页码越界：第 {page_index} 页"));
             return;
         };
+        if self.grid_mode {
+            self.grid_hold_on_reload = true;
+        }
+        let anchor = if self.grid_mode {
+            None
+        } else {
+            Some(page_index + 1)
+        };
         self.submit_mem_op(
-            MemOpKind::Insert { at_index: page_index + 1, w, h, anchor: page_index + 1 },
+            MemOpKind::Insert { at_index: page_index + 1, w, h, anchor },
             cx,
         );
     }
@@ -1270,7 +1730,159 @@ impl PdfViewer {
             self.last_modify_error = Some("不能删除仅剩的 1 页".into());
             return;
         }
-        self.submit_mem_op(MemOpKind::Delete { index: page_index, anchor: page_index }, cx);
+        self.submit_mem_op(
+            MemOpKind::Delete { index: page_index, anchor: Some(page_index) },
+            cx,
+        );
+    }
+
+    /// **内存级重排页序**（wave7a 页操作原语；不写盘）：`new_order` 为 0 基**全排列**
+    /// （长度=当前页数、0..n 各恰一次；非法 → worker 严格校验 Err，文档不变、无副作用）。
+    /// 成功按既有 mem op 链路重载并 notify；待存注释页号按新序反查表平移；失败记
+    /// [`Self::last_modify_error`]（不吞）。撤销 = 恢复操作前字节镜像（`UndoEntry::RestoreMemory`）。
+    pub fn reorder_pages(&mut self, new_order: Vec<usize>, cx: &mut Context<Self>) {
+        let Some(worker) = self.worker.clone() else {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        };
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        }
+        let n = self.dims.len();
+        // view 侧轻预检（worker 仍做权威校验）：长度不匹配先给中文文案。
+        if new_order.len() != n {
+            self.last_modify_error = Some(format!("重排页序长度应为 {n}（当前页数），实际 {}", new_order.len()));
+            return;
+        }
+        // P2-A2 identity 早退：`new_order == 恒等序（0..n）` → 无实际变化，不提交 worker
+        // （不整档重编码）、不置脏（pending_page_ops 不动）、不撤销快照——与 wave6「拖回
+        // 原位不提交」同语义，顺带避免无谓的 reload。
+        if new_order.iter().copied().eq(0..n) {
+            return;
+        }
+        let doc_id = self.doc_id;
+        self.last_modify_error = None;
+        // 反查表：新位置 → 原页（inv[old] = old 页落到的新位置；待存注释按此平移）。
+        let mut inv = vec![0usize; n];
+        for (pos, &old) in new_order.iter().enumerate() {
+            if old < n {
+                inv[old] = pos;
+            }
+        }
+        // ⚠️ 必须 `.detach()`（K37）：不 detach 句柄在 drop 即取消，重排静默不执行。
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { worker.mem_reorder_pages(doc_id, new_order) })
+                .await;
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok(mem) => {
+                    v.last_modify_error = None;
+                    // 撤销条目：恢复操作前的内存镜像 + 操作前待存注释快照
+                    v.push_undo_restore(mem.before, v.pending_annots.clone());
+                    v.pending_page_ops += 1;
+                    // 待存注释按反查表平移（页随重排落到新位置）。
+                    for a in v.pending_annots.iter_mut() {
+                        if let Some(&np) = inv.get(a.page) {
+                            a.page = np;
+                        }
+                    }
+                    // 结构变了 → 灰框几何可能漂移，清空最稳。
+                    v.focused_annot = None;
+                    v.open_from_bytes(mem.after, None, cx);
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    // wave6：重排失败不会有 reload → 显式复位「保持网格」位，防残留波及
+                    // 后续无关重载意外回网格。
+                    v.grid_hold_on_reload = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// **内存级批量删除页面**（wave7a 页操作原语；不写盘）：`pages` 为 0 基待删页数组
+    /// （逐页 < 当前页数、重复去重、保留至少 1 页；非法 → worker 校验 Err，文档不变）。
+    /// worker 按索引**降序**循环删除（升序删会因下标位移错删），成功返回删除后页数并按
+    /// mem op 链路重载；待存注释对删除页丢弃、其后的页号顺移；失败记 [`Self::last_modify_error`]
+    /// （不吞）。撤销 = 一次恢复操作前字节镜像（整批可撤）。
+    pub fn batch_delete_pages(&mut self, pages: Vec<usize>, cx: &mut Context<Self>) {
+        let Some(worker) = self.worker.clone() else {
+            self.last_modify_error = Some("文档尚未加载".into());
+            // R2：失败无 reload → 复位「保持网格」待办位（防残留波及后续无关重载）。
+            self.grid_hold_on_reload = false;
+            return;
+        };
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        let n = self.dims.len();
+        self.last_modify_error = None;
+        if pages.is_empty() {
+            // 空清单 = no-op：不发消息、不重载（避免无谓的重新编码）。
+            return;
+        }
+        // 预计算待存注释平移（与 worker 同口径：每页 < n、去重后全有效才发）。
+        // 删除集：升序排序用于「页号顺移」计数；并发 worker 仍做权威校验。
+        let mut deleted: Vec<usize> = pages.iter().copied().collect();
+        deleted.sort_unstable();
+        deleted.dedup();
+        // view 侧轻预检（worker 仍做权威校验）：越界 / 删光全部页先给中文文案。
+        if deleted.iter().any(|&p| p >= n) {
+            self.last_modify_error = Some("批量删除页码越界（应逐页 < 当前页数）".into());
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        if deleted.len() >= n {
+            self.last_modify_error = Some("批量删除将删光全部页面（须保留至少 1 页）".into());
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        let doc_id = self.doc_id;
+        // 归一化注释页号：删除页丢弃；其后页号减去「<= 该页的删除数」。
+        let shift: Box<dyn Fn(&mut Vec<PendingAnnot>) + Send> = {
+            let deleted = deleted.clone();
+            Box::new(move |annots| {
+                annots.retain(|a| !deleted.binary_search(&a.page).is_ok());
+                for a in annots.iter_mut() {
+                    let removed = deleted.iter().filter(|&&d| d < a.page).count();
+                    a.page -= removed;
+                }
+            })
+        };
+        // ⚠️ 必须 `.detach()`（K37）：不 detach 句柄在 drop 即取消，批删静默不执行。
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { worker.mem_batch_delete_pages(doc_id, pages) })
+                .await;
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok(mem) => {
+                    v.last_modify_error = None;
+                    // 撤销条目：恢复操作前的内存镜像 + 操作前待存注释快照（整批一次可撤）。
+                    v.push_undo_restore(mem.before, v.pending_annots.clone());
+                    v.pending_page_ops += 1;
+                    shift(&mut v.pending_annots);
+                    // 结构变了 → 灰框几何可能漂移，清空最稳。
+                    v.focused_annot = None;
+                    v.open_from_bytes(mem.after, None, cx);
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    // R2（对齐 reorder_pages Err 分支）：失败无 reload → 复位保持网格待办位。
+                    v.grid_hold_on_reload = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// 把 `page_index` 页提取成独立 PDF 文件并原子写盘（源文档不变，**即时生效、不影响
@@ -1289,10 +1901,10 @@ impl PdfViewer {
             self.last_modify_error = Some("文档尚未加载".into());
             return;
         }
-        // 同步预检输出路径可写性：注定失败的提取（目标目录缺失 / 目标为现有目录）在
-        // **菜单决策点即置错**，不复现「成功 toast 恒假」——否则异步写盘失败也先弹
-        // 「已提取页面」、随后 observe 再补失败（自相矛盾双 toast）。预检通过才异步。
-        if let Some(msg) = extract_target_precheck(&out_path) {
+        // 同步预检输出路径可写性：注定失败的提取（目标目录缺失 / 目标为现有目录 /
+        // 目标 == 当前文档路径 P1）在**菜单决策点即置错**，不复现「成功 toast 恒假」——
+        // 否则异步写盘失败也先弹「已提取页面」、随后 observe 再补失败（自相矛盾双 toast）。
+        if let Some(msg) = extract_target_precheck(&self.path, &out_path) {
             self.last_modify_error = Some(msg);
             return;
         }
@@ -1325,6 +1937,464 @@ impl PdfViewer {
     /// 成功 toast；`None` = 无待提示成功）。
     pub fn take_last_extract_success(&mut self) -> Option<String> {
         self.last_extract_success.take()
+    }
+
+    /// **提取多页到新文件**（wave7b；副本语义）：`pages` 为 0 基待提取页数组（**可任意
+    /// 顺序/非连续**、可少于全页；worker 严格校验 + 去重，非法 → Err）。成功后**源文档
+    /// 不变**——不重载、不入撤销栈（提取=另存），实际写入的（去重后）页数经
+    /// [`Self::last_extract_success`] 供壳层弹成功 toast。失败记 [`Self::last_modify_error`]（不吞）。
+    pub fn export_pages_to(&mut self, pages: Vec<usize>, out_path: PathBuf, cx: &mut Context<Self>) {
+        let Some(worker) = self.worker.clone() else {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        };
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            return;
+        }
+        let n = self.dims.len();
+        // view 侧轻预检（worker 仍做权威校验）：空清单 / 越界先给中文文案。
+        if pages.is_empty() {
+            self.last_modify_error = Some("提取页清单为空（须至少 1 页）".into());
+            return;
+        }
+        if pages.iter().any(|&p| p >= n) {
+            self.last_modify_error = Some(format!("提取页码越界（应逐页 < 当前页数 {n}）"));
+            return;
+        }
+        // 同步预检输出路径可写性（对齐 extract_page_to：注定失败的提取在决策点即置错，
+        // 含目标 == 当前文档路径的 P1 覆盖防护）。
+        if let Some(msg) = extract_target_precheck(&self.path, &out_path) {
+            self.last_modify_error = Some(msg);
+            return;
+        }
+        let doc_id = self.doc_id;
+        let out_display = out_path.display().to_string();
+        self.last_modify_error = None;
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { worker.export_pages_to(doc_id, pages, out_path) })
+                .await;
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok(written) => {
+                    v.last_modify_error = None;
+                    // 副本语义：不改变当前文档、不重载、不入撤销栈；成功信号供壳层 toast。
+                    // 网格提取的选中集消费清空**只在异步成功后**执行——失败（含同步预检失败）
+                    // 不清选保持可重试（本函数唯一生产调用方 = `grid_apply_extract` 网格提取；
+                    // 其它调用方网格选中集为空，本清选无副作用）。
+                    v.grid_selected.clear();
+                    v.last_extract_success = Some(format!("已导出 {written} 页 → {out_display}"));
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// **拆分区间到新文件并移除**（wave7b）：`range = (start, end)` 含端点的 0 基区间。
+    /// worker 把区间页按**原序**提取落盘 `out_path`（先写文件，失败则整个操作失败）+ 从
+    /// 当前 stores 镜像**移除**该区间（降序删 + 撤销快照）。成功后当前文档重载为移除后
+    /// 镜像（页数降）、入撤销栈（一次性可撤：当前回 N 页、新文件仍在）；待存注释对区间内
+    /// 丢弃、其后页号顺移；成功信号经 [`Self::last_extract_success`]。失败记
+    /// [`Self::last_modify_error`]（不吞）。
+    pub fn split_pages_to(
+        &mut self,
+        range: (usize, usize),
+        out_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(worker) = self.worker.clone() else {
+            self.last_modify_error = Some("文档尚未加载".into());
+            self.grid_hold_on_reload = false;
+            return;
+        };
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        let n = self.dims.len();
+        let (start, end) = range;
+        // view 侧轻预检（worker 仍做权威校验）。
+        if start > end {
+            self.last_modify_error = Some(format!("拆分区间起点 {start} 不能大于终点 {end}"));
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        if end >= n {
+            self.last_modify_error = Some(format!("拆分页码越界：{start}..={end}（共 {n} 页）"));
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        if end - start + 1 >= n {
+            self.last_modify_error = Some("拆分将移除全部页面（须保留至少 1 页）".into());
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        if let Some(msg) = extract_target_precheck(&self.path, &out_path) {
+            self.last_modify_error = Some(msg);
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        let span = end - start + 1;
+        let doc_id = self.doc_id;
+        let out_display = out_path.display().to_string();
+        let success_msg = format!("已将第 {}..{} 页拆分到 {out_display}", start + 1, end + 1);
+        // 待存注释页号归一化：区间内丢弃；其后页号减去区间长（worker 已权威移除区间）。
+        // 保留的注释页 > end ≥ span-1 → 减法不潜溢。
+        let shift: Box<dyn Fn(&mut Vec<PendingAnnot>) + Send> = Box::new(move |annots| {
+            annots.retain(|a| a.page < start || a.page > end);
+            for a in annots.iter_mut() {
+                if a.page > end {
+                    a.page -= span;
+                }
+            }
+        });
+        self.last_modify_error = None;
+        // ⚠️ 必须 `.detach()`（K37）：不 detach 句柄在 drop 即取消，拆分静默不执行。
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { worker.split_to_file(doc_id, (start, end), out_path) })
+                .await;
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok((_written, mem)) => {
+                    v.last_modify_error = None;
+                    v.push_undo_restore(mem.before, v.pending_annots.clone());
+                    v.pending_page_ops += 1;
+                    shift(&mut v.pending_annots);
+                    v.focused_annot = None;
+                    v.last_extract_success = Some(success_msg);
+                    v.open_from_bytes(mem.after, None, cx);
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    // R2：失败无 reload → 复位保持网格待办位（防残留波及后续无关重载）。
+                    v.grid_hold_on_reload = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// **合并另一 PDF 到当前（追加）**（wave7b）：**读端**（本函数 background_executor 线程）
+    /// 对 `src_path` 做「元数据预检 + `Read::take(上限+1)` 真边界」的有界读盘（超限即
+    /// Err，见 [`read_merge_source_bounded`]），把其字节发 pdfium worker 追加到当前文档尾部
+    /// （index = 当前页数）——worker 不再同步读盘、不再因合并源阻塞网格/渲染队列。成功后
+    /// 当前文档重载为合并后镜像（页数升）、入撤销栈（一次性可撤：回 N 页且待存注释快照
+    /// 还原）；失败记 [`Self::last_modify_error`] 且当前文档/待存状态不变。
+    /// 追加不搬移既有页 → 待存注释页号无需平移。
+    pub fn merge_pdf_file(&mut self, src_path: PathBuf, cx: &mut Context<Self>) {
+        let Some(worker) = self.worker.clone() else {
+            self.last_modify_error = Some("文档尚未加载".into());
+            self.grid_hold_on_reload = false;
+            return;
+        };
+        if self.doc_id == 0 {
+            self.last_modify_error = Some("文档尚未加载".into());
+            self.grid_hold_on_reload = false;
+            return;
+        }
+        let doc_id = self.doc_id;
+        self.last_modify_error = None;
+        // ⚠️ 必须 `.detach()`（K37）：不 detach 句柄在 drop 即取消，合并静默不执行。
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    // 读端：元数据预检 + 有界读盘（真边界，超限不送字节进 worker）→ 字节消息。
+                    let src_bytes = read_merge_source_bounded(&src_path)?;
+                    worker.merge_from_bytes(doc_id, src_bytes)
+                })
+                .await;
+            let _ = this.update(cx, move |v, cx| match res {
+                Ok(mem) => {
+                    v.last_modify_error = None;
+                    v.push_undo_restore(mem.before, v.pending_annots.clone());
+                    v.pending_page_ops += 1;
+                    v.focused_annot = None;
+                    v.open_from_bytes(mem.after, None, cx);
+                    cx.notify();
+                }
+                Err(e) => {
+                    v.last_modify_error = Some(format!("{e:#}"));
+                    // R2：失败无 reload → 复位保持网格待办位（防残留波及后续无关重载）。
+                    v.grid_hold_on_reload = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    // ---- 网格工具栏页操作执行 seam（wave8）：确认框/文件选择**之后**的动作，测试直调 ----
+
+    /// 网格工具栏「删除(n)」确认后的执行 seam：整批删除 `pages`（按钮 handler 从选中集
+    /// 快照传入）。页数变化重载前先置 `grid_hold_on_reload`，令 `apply_loaded` 保持网格
+    /// 模式（不退出到阅读视图）；删除成功经重载自动清空选中集。失败走 `batch_delete_pages`
+    /// 既有错误面（`last_modify_error` 中文报错），不清选、不吞错。
+    pub(crate) fn grid_apply_delete(&mut self, pages: Vec<usize>, cx: &mut Context<Self>) {
+        if pages.is_empty() {
+            return;
+        }
+        if self.grid_mode {
+            self.grid_hold_on_reload = true;
+        }
+        self.batch_delete_pages(pages, cx);
+    }
+
+    /// 网格工具栏「拆分(n)」确认后的执行 seam：按 `[min,max]` 闭区间把区间页拆分到
+    /// `out_path` 并从当前移除。页数变化重载前先置 `grid_hold_on_reload` 保持网格模式；
+    /// 成功重载后选中集自动清。失败走 `split_pages_to` 既有错误面（不吞错）。
+    pub(crate) fn grid_apply_split(
+        &mut self,
+        range: (usize, usize),
+        out_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self.grid_mode {
+            self.grid_hold_on_reload = true;
+        }
+        self.split_pages_to(range, out_path, cx);
+    }
+
+    /// 网格工具栏「提取(n)」确认后的执行 seam：按 `pages`（**保持勾选升序**——本 seam 是
+    /// 唯一权威排序点，按钮 handler 从 HashSet 选中集快照传入的无序数组在此归序）导出副本
+    /// 到 `out_path`——源文档不变、不重载、不入撤销栈（`export_pages_to` 副本语义）。导出
+    /// **异步成功**后选中集消费清空（本操作无重载、选中不会自动清；清选落在成功回调，
+    /// 异步写盘失败不清选保持可重试）；同步预检失败（如目标目录缺失）已由 `export_pages_to`
+    /// 置 `last_modify_error` → 不清选保持可重试，不吞错。
+    pub(crate) fn grid_apply_extract(
+        &mut self,
+        mut pages: Vec<usize>,
+        out_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if pages.is_empty() {
+            return;
+        }
+        // 勾选页按升序导出（HashSet 快照无序；worker 按给定序逐段 import，故先归序才能
+        // 保证产物页序 = 源页序升序；页下标天然无重复——来自勾选集快照）。
+        pages.sort_unstable();
+        self.export_pages_to(pages, out_path, cx);
+    }
+
+    /// 网格工具栏「合并」确认后的执行 seam：把 `src_path` 全部页追加到当前文档尾部。
+    /// 页数变化重载前先置 `grid_hold_on_reload` 保持网格模式；成功重载后选中集自动清。
+    /// 失败走 `merge_pdf_file` 既有错误面（不吞错）。
+    pub(crate) fn grid_apply_merge(&mut self, src_path: PathBuf, cx: &mut Context<Self>) {
+        if self.grid_mode {
+            self.grid_hold_on_reload = true;
+        }
+        self.merge_pdf_file(src_path, cx);
+    }
+
+    // ---- 网格工具栏按钮点击（wave8 接线）：确认框 / 文件选择 → 上述 seam ----
+    // 全部经 `window.prompt` + `rfd::AsyncFileDialog` 异步流程（K167：原生对话框/文件框
+    // 一律后台 spawn，禁在持 gpui App RefCell 的事件帧内同步弹；headless 测试构建
+    // `#[cfg(test)]` 下走 no-op 桩，行为只经 seam 单测覆盖——对话框真机观感留人工）。
+
+    /// 网格工具栏「删除(n)」点击：快照选中集 → 破坏性确认框 → `grid_apply_delete`。
+    /// 空选中早退（按钮禁用态兜底，不触发）。文案对齐既有删除确认风格 + 可撤销提示。
+    pub(crate) fn grid_delete_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(not(test))]
+        {
+            let pages: Vec<usize> = self.grid_selected.iter().copied().collect();
+            if pages.is_empty() {
+                return;
+            }
+            let n = pages.len();
+            let entity = cx.entity();
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                "删除页面",
+                Some(&format!(
+                    "确定删除选中的 {n} 页？（尚未保存，保存时方写回原文件，可用 Ctrl+Z 撤销）"
+                )),
+                &["删除", "取消"],
+                cx,
+            );
+            window
+                .spawn(cx, async move |cx| {
+                    if !matches!(answer.await, Ok(0)) {
+                        return;
+                    }
+                    let _ = cx
+                        .update_entity(&entity, |v, cx| v.grid_apply_delete(pages, cx));
+                })
+                .detach();
+        }
+        #[cfg(test)]
+        {
+            let _ = (window, cx);
+        }
+    }
+
+    /// 网格工具栏「拆分(n)」点击：另存为选目标路径（默认 `原文件名-拆分.pdf`）→ 确认
+    /// [min,max] 闭区间（选中页视为区间端点；非连续时提示按闭区间拆分、含未选中页）
+    /// → `grid_apply_split`。任一步取消不动作。
+    pub(crate) fn grid_split_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(not(test))]
+        {
+            let selected: Vec<usize> = self.grid_selected.iter().copied().collect();
+            if selected.is_empty() {
+                return;
+            }
+            let n = self.dims.len();
+            let (min, max) = (
+                selected.iter().copied().min().unwrap_or(0),
+                selected.iter().copied().max().unwrap_or(0),
+            );
+            // 越界兜底（选中集应在页数内；万一越界由 split_pages_to 错误面报错）。
+            if min >= n || max >= n {
+                return;
+            }
+            let orientation = if max - min + 1 == selected.len() {
+                format!("将第 {}..{} 页拆分到新文件并从当前移除", min + 1, max + 1)
+            } else {
+                format!(
+                    "选中页不连续，将按第 {}..{} 页闭区间拆分（含区间内未选中页）并从当前移除",
+                    min + 1,
+                    max + 1
+                )
+            };
+            let base_name = self
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "拆分".to_string());
+            let entity = cx.entity();
+            window
+                .spawn(cx, async move |cx| {
+                    let Some(file) = rfd::AsyncFileDialog::new()
+                        .set_title("拆分页面")
+                        .set_file_name(format!("{base_name}-拆分.pdf"))
+                        .save_file()
+                        .await
+                    else {
+                        return;
+                    };
+                    let out = file.path().to_path_buf();
+                    // 目标路径已定，再确认区间（防误触；取消任一步不动作）。
+                    let answer = cx.prompt(
+                        PromptLevel::Warning,
+                        "拆分页面",
+                        Some(&format!(
+                            "{orientation}？（尚未保存，保存时方写回原文件，可用 Ctrl+Z 撤销）"
+                        )),
+                        &["拆分", "取消"],
+                    );
+                    if !matches!(answer.await, Ok(0)) {
+                        return;
+                    }
+                    let _ = cx.update_entity(&entity, |v, cx| {
+                        v.grid_apply_split((min, max), out, cx)
+                    });
+                })
+                .detach();
+        }
+        #[cfg(test)]
+        {
+            let _ = (window, cx);
+        }
+    }
+
+    /// 网格工具栏「提取(n)」点击：另存为选目标路径（默认 `原文件名-提取.pdf`）→ 确认
+    /// 勾选页 → `grid_apply_extract`（保持勾选升序，副本语义、源文档不变）。取消不动作。
+    pub(crate) fn grid_extract_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(not(test))]
+        {
+            let mut pages: Vec<usize> = self.grid_selected.iter().copied().collect();
+            // HashSet 快照无序 → 先按页升序（seam `grid_apply_extract` 亦归序，双保险，
+            // 保证提取产物页序 = 勾选页升序、注释「保持勾选升序」成立）。
+            pages.sort_unstable();
+            if pages.is_empty() {
+                return;
+            }
+            let n = pages.len();
+            let base_name = self
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "提取".to_string());
+            let entity = cx.entity();
+            window
+                .spawn(cx, async move |cx| {
+                    let Some(file) = rfd::AsyncFileDialog::new()
+                        .set_title("提取页面")
+                        .set_file_name(format!("{base_name}-提取.pdf"))
+                        .save_file()
+                        .await
+                    else {
+                        return;
+                    };
+                    let out = file.path().to_path_buf();
+                    let answer = cx.prompt(
+                        PromptLevel::Warning,
+                        "提取页面",
+                        Some(&format!(
+                            "将选中的 {n} 页导出为新文件（源文档不变）？"
+                        )),
+                        &["提取", "取消"],
+                    );
+                    if !matches!(answer.await, Ok(0)) {
+                        return;
+                    }
+                    let _ = cx
+                        .update_entity(&entity, |v, cx| v.grid_apply_extract(pages, out, cx));
+                })
+                .detach();
+        }
+        #[cfg(test)]
+        {
+            let _ = (window, cx);
+        }
+    }
+
+    /// 网格工具栏「合并」点击：选源 PDF（`rfd` 过滤 pdf）→ 确认追加全部页 → `grid_apply_merge`。
+    /// 取消任一步不动作。
+    pub(crate) fn grid_merge_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(not(test))]
+        {
+            let entity = cx.entity();
+            window
+                .spawn(cx, async move |cx| {
+                    let Some(file) = rfd::AsyncFileDialog::new()
+                        .set_title("合并 PDF")
+                        .add_filter("PDF", &["pdf"])
+                        .pick_file()
+                        .await
+                    else {
+                        return;
+                    };
+                    let src = file.path().to_path_buf();
+                    let answer = cx.prompt(
+                        PromptLevel::Warning,
+                        "合并 PDF",
+                        Some(&format!(
+                            "将 {} 的全部页面追加到当前文档末尾？（尚未保存，保存时方写回原文件，可用 Ctrl+Z 撤销）",
+                            file.file_name()
+                        )),
+                        &["合并", "取消"],
+                    );
+                    if !matches!(answer.await, Ok(0)) {
+                        return;
+                    }
+                    let _ = cx.update_entity(&entity, |v, cx| v.grid_apply_merge(src, cx));
+                })
+                .detach();
+        }
+        #[cfg(test)]
+        {
+            let _ = (window, cx);
+        }
     }
 
     /// 显式保存（Ctrl+S / 保存菜单）：把待存注释合并 + 内存工作副本原子写盘。无待存 →
@@ -1473,6 +2543,15 @@ impl PdfViewer {
         })
         .detach();
         Some(rx)
+    }
+
+    /// 推进一条「整档内存快照」撤销条目并裁剪预算（所有 `RestoreMemory` 入栈点的唯一入口，
+    /// 见 [`enforce_undo_mem_budget`]；`RemoveAnnot`/`AddAnnotBack` 这类不含整档镜像的条目
+    /// 仍走 `undo_stack.push_back` 直推）。预算只在一处执行，杜绝各操作各写各推漏约束。
+    fn push_undo_restore(&mut self, bytes: Vec<u8>, annots_before: Vec<PendingAnnot>) {
+        self.undo_stack
+            .push_back(UndoEntry::RestoreMemory { bytes, annots_before });
+        enforce_undo_mem_budget(&mut self.undo_stack);
     }
 
     /// 撤销上一条 PDF 编辑（Ctrl+Z）：注释逐条撤（加/删互逆）；页面插入/删除按**操作前
@@ -1624,3 +2703,640 @@ impl PdfViewer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use crate::pdf::test_util;
+
+    /// 页操作集成测试的窗口宿主：整窗渲染一个 PdfViewer（同 view.rs 的 GridHost 姿势）。
+    struct PageOpHost {
+        pdf: Entity<PdfViewer>,
+    }
+    impl gpui::Render for PageOpHost {
+        fn render(
+            &mut self,
+            _w: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div().size_full().child(self.pdf.clone())
+        }
+    }
+
+    /// 等待 PDF 加载完成（`is_loaded`；pdfium 串行锁守卫约定由调用方先取）。宿主与实体
+    /// 已由调用方在 `add_window_view` 内就位，本函数只泵帧到加载完成。
+    fn wait_loaded(cx: &mut VisualTestContext, holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>) {
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..1200 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应在 1200 帧内加载完成");
+    }
+
+    /// 「内存级页面操作 + 内存级重载」异步链路的达成谓词：`is_loaded` 在重载期间短暂
+    /// 变 false（`open_from_bytes` 先关旧档再异步重开），泵帧直到重新 true 且 `cond` 成立。
+    fn wait_until(
+        cx: &mut VisualTestContext,
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cond: impl Fn(&PdfViewer) -> bool,
+    ) {
+        for _ in 0..1200 {
+            cx.run_until_parked();
+            let ok = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.is_loaded() && cond(v)
+            });
+            if ok {
+                return;
+            }
+        }
+        panic!("等待条件超时（1200 帧）");
+    }
+
+    /// 逐页尺寸序列（页面模型看待存工作副本当前页序的客观透镜）。
+    fn dims_of(cx: &mut VisualTestContext, holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>) -> Vec<(f32, f32)> {
+        cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.clone())
+    }
+
+    /// wave8 评审 R6：撤销栈**整档快照条目预算** —— 连续 >[`UNDO_MAX_MEM_ENTRIES`] 个
+    /// mem 操作后栈内 `RestoreMemory` 条目数封顶 = 预算、**最旧被淘汰**、最近一条仍可撤
+    /// （`pop_back` 取到最新镜像）、非 RestoreMemory 类型条目不被淘汰。直接测预算裁剪纯
+    /// 函数（5 个 `RestoreMemory` 入栈点唯一入口 `enforce_undo_mem_budget` 的底层，不依赖
+    /// PDF/worker；真实操作链路由既有 mem op/undo 集成测试覆盖）。
+    #[test]
+    fn undo_mem_budget_caps_restore_memory_entries() {
+        let mut stack: VecDeque<UndoEntry> = VecDeque::new();
+        // 栈底（最旧）先放一条注释逆操作（非 mem 类型，应被预算保留、不被淘汰）。
+        stack.push_back(UndoEntry::RemoveAnnot { id: 99 });
+        // 连续 N+2 条 RestoreMemory（bytes 以 i 递增区分新旧）→ 总量 > 预算 → 应淘汰最旧 2 条。
+        for i in 0..(UNDO_MAX_MEM_ENTRIES + 2) {
+            stack.push_back(UndoEntry::RestoreMemory {
+                bytes: vec![i as u8],
+                annots_before: Vec::new(),
+            });
+        }
+        enforce_undo_mem_budget(&mut stack);
+        // 断言 1：RestoreMemory 条目数 == 预算 N。
+        let mem_count = stack
+            .iter()
+            .filter(|e| matches!(e, UndoEntry::RestoreMemory { .. }))
+            .count();
+        assert_eq!(
+            mem_count,
+            UNDO_MAX_MEM_ENTRIES,
+            "RestoreMemory 条目数应封顶 = 预算 {UNDO_MAX_MEM_ENTRIES}"
+        );
+        // 断言 2：最旧 mem（bytes=0/1）被淘汰 → 栈内最旧留存 mem 的 bytes[0] == 2。
+        let oldest_mem = stack.iter().find_map(|e| match e {
+            UndoEntry::RestoreMemory { bytes, .. } => Some(bytes[0]),
+            _ => None,
+        });
+        assert_eq!(
+            oldest_mem,
+            Some(2),
+            "最旧 2 条 mem（bytes=0/1）应被淘汰，最旧留存应=2: {oldest_mem:?}"
+        );
+        // 断言 3：非 RestoreMemory 类型不被预算淘汰（RemoveAnnot 仍在栈内）。
+        assert!(
+            stack.iter().any(|e| matches!(e, UndoEntry::RemoveAnnot { id: 99 })),
+            "注释型条目不应被预算淘汰"
+        );
+        // 断言 4：最近一条仍可撤 —— pop_back 取到最后推的 mem 镜像（bytes = N+1）。
+        match stack.pop_back() {
+            Some(UndoEntry::RestoreMemory { bytes, .. }) => {
+                assert_eq!(bytes[0], (UNDO_MAX_MEM_ENTRIES + 1) as u8, "栈顶应为最新 mem 条目")
+            }
+            other => panic!("栈顶应是最新 mem 条目，实际 {other:?}"),
+        }
+    }
+
+    /// wave7a：`reorder_pages`（整体反转）后页面模型反映新页序（页数不变、尺寸序列 = 原逆序）。
+    #[gpui::test]
+    async fn reorder_pages_reverses_page_model(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone(); // pdf测试2.pdf：长文多页
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let dims = dims_of(&mut vcx, &holder);
+        let n = dims.len();
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        // 期望 = 原尺寸序列逆序（位置 i 处为原 n-1-i）。
+        let expect: Vec<(f32, f32)> = dims.iter().rev().cloned().collect();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.reverse();
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.reorder_pages(order, cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.dims.len() == n);
+        let dims2 = dims_of(&mut vcx, &holder);
+        assert_eq!(dims2.len(), n, "重排后页数不变");
+        assert_eq!(dims2, expect, "重排后页面模型页尺寸序列应为原逆序");
+        assert!(
+            vcx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).last_modify_error().is_none()),
+            "重排成功不应有错误"
+        );
+    }
+
+    /// wave7a：`batch_delete_pages` 删 [0,1] 后页面模型页数 n-2；`undo_last` 撤销后页数/
+    /// 尺寸序列还原（整批一次可撤）。
+    #[gpui::test]
+    async fn batch_delete_updates_model_and_undo_restores(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let dims = dims_of(&mut vcx, &holder);
+        let n = dims.len();
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        // 删最前 2 页 → 期望新序列 = 原 [2..n]。
+        let expect_after: Vec<(f32, f32)> = dims[2..].to_vec();
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.batch_delete_pages(vec![0, 1], cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.page_count() == n - 2);
+        let dims2 = dims_of(&mut vcx, &holder);
+        assert_eq!(dims2, expect_after, "批删 [0,1] 后页面模型 = 原 [2..]");
+        // 撤销（Ctrl+Z 语义的字典链路）→ 页数/尺寸序列还原。
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.undo_last(cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.page_count() == n);
+        let dims3 = dims_of(&mut vcx, &holder);
+        assert_eq!(dims3, dims, "批删撤销后页面模型应还原为删前");
+        assert_eq!(dims3.len(), n, "撤销后页数还原");
+    }
+
+    /// wave7a：`batch_delete_pages` 越界页 → `last_modify_error` 置位、页面模型不变。
+    #[gpui::test]
+    async fn batch_delete_rejects_out_of_range_in_view(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let n = dims_of(&mut vcx, &holder).len();
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.batch_delete_pages(vec![0, n], cx); // n 越界
+            });
+        });
+        for _ in 0..5 {
+            vcx.run_until_parked();
+        }
+        // 页面模型不变（越界被预先拒，不起异步加载）。
+        assert_eq!(dims_of(&mut vcx, &holder).len(), n, "越界批删后页数不变");
+        let err = vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).last_modify_error().map(String::from)
+        });
+        assert!(err.is_some(), "越界批删应置 last_modify_error");
+    }
+
+    /// wave7a：`reorder_pages` 长度不匹配 → `last_modify_error` 置位、页面模型不变。
+    #[gpui::test]
+    async fn reorder_rejects_length_mismatch_in_view(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let n = dims_of(&mut vcx, &holder).len();
+        let short: Vec<usize> = (0..n.saturating_sub(1)).collect();
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.reorder_pages(short, cx);
+            });
+        });
+        for _ in 0..5 {
+            vcx.run_until_parked();
+        }
+        assert_eq!(dims_of(&mut vcx, &holder).len(), n, "长度不匹配重排后页数不变");
+        let has_err = vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).last_modify_error().is_some()
+        });
+        assert!(has_err, "长度不匹配重排应置 last_modify_error");
+    }
+
+    // ---- 页面网格视图 wave7b：提取多页（副本）/ 拆分区间 / 合并另一 PDF ----
+    //
+    // 夹具实测：pdf测试.pdf = 18 页（横向 792×612，本批改写源）、pdf测试2.pdf = 259 页
+    // （纵向，本批当前文档）。期望序列均为手工推导（K177/K143）。
+
+    /// wave7b 临时输出路径（pid + 纳秒戳唯一，落系统 temp，勿污染仓库）。
+    fn wave7b_out(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "pdf-view-wave7b-{name}-{}-{nanos}.pdf",
+            std::process::id()
+        ))
+    }
+
+    /// wave7b：`export_pages_to`（副本语义）成功后当前模型页数/尺寸不变，且成功信号
+    /// （`last_extract_success`）置位供壳层 toast。
+    #[gpui::test]
+    async fn export_pages_keeps_model_and_reports_success(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let dims = dims_of(&mut vcx, &holder);
+        let n = dims.len();
+        assert!(n >= 3, "夹具页数需 ≥3，实际 {n}");
+        let out = wave7b_out("export");
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.export_pages_to(vec![0, 2], out.clone(), cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.last_extract_success.is_some());
+        // 副本语义：模型页数/尺寸不变、无错误。
+        assert_eq!(dims_of(&mut vcx, &holder), dims, "导出后当前模型不变（副本语义）");
+        assert!(
+            vcx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).last_modify_error().is_none()),
+            "导出成功不应有错误"
+        );
+        // 成功信号可被 `take` 一次消费。
+        let msg = vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| v.take_last_extract_success())
+        });
+        assert!(msg.is_some() && msg.unwrap().contains("已导出"), "应弹成功 toast 文案");
+    }
+
+    /// wave7b：`split_pages_to`（1,2）移除区间后模型页数 n-2、尺寸 = 源删 {1,2} 幸存序；
+    /// `undo_last` 撤销后回 N 页（区间移除部分回位）。
+    #[gpui::test]
+    async fn split_pages_updates_model_and_undo_restores(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let dims = dims_of(&mut vcx, &holder);
+        let n = dims.len();
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        // 期望（算式）：拆分区间 (1,2) 长 2 → 幸存序 = 原 [0, 3..]。
+        let expect_after: Vec<(f32, f32)> = dims
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 2)
+            .map(|(_, d)| *d)
+            .collect();
+        let out = wave7b_out("split");
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.split_pages_to((1, 2), out.clone(), cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.page_count() == n - 2);
+        let dims2 = dims_of(&mut vcx, &holder);
+        assert_eq!(dims2, expect_after, "拆分 (1,2) 后模型 = 原删 {{1,2}} 幸存序");
+        // 拆分写文件 → 成功 toast 信号置位。
+        assert!(
+            vcx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).last_extract_success.is_some()),
+            "拆分成功应置成功信号"
+        );
+        // 撤销（Ctrl+Z 语义）→ 回 N 页、尺寸还原。
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.undo_last(cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.page_count() == n);
+        let dims3 = dims_of(&mut vcx, &holder);
+        assert_eq!(dims3, dims, "拆分撤销后模型应还原");
+    }
+
+    /// wave7b：`merge_pdf_file` 追加后模型页数 n+m、撤销后回 N 页（整合并一次可撤）。
+    #[gpui::test]
+    async fn merge_pdf_file_updates_model_and_undo_restores(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone(); // 当前 = pdf测试2.pdf (259 页)
+        let src_path = test_util::test_pdf_paths()[0].clone(); // 合并源 = pdf测试.pdf (18 页)
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let dims = dims_of(&mut vcx, &holder);
+        let n = dims.len();
+        assert!(n >= 1, "当前文档页数需 ≥1，实际 {n}");
+        // 合并源页数（打开一次复用计数，pdfium 串行锁已持）。
+        let m = {
+            let src_bytes = std::fs::read(&src_path).expect("读取合并源应成功");
+            let (_, _, src_dims) = PdfWorker::open_and_dims(src_bytes).expect("合并源应可打开");
+            let m = src_dims.len();
+            assert!(m >= 1, "合并源页数需 ≥1，实际 {m}");
+            m
+        };
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.merge_pdf_file(src_path, cx);
+            });
+        });
+        // 期望（算式）：合并后总页数 = n + m。
+        wait_until(&mut vcx, &holder, |v| v.page_count() == n + m);
+        assert!(
+            vcx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).last_modify_error().is_none()),
+            "合并成功不应有错误"
+        );
+        // 撤销 → 回 N 页（尺寸序列还原）。
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.undo_last(cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.page_count() == n);
+        let dims2 = dims_of(&mut vcx, &holder);
+        assert_eq!(dims2, dims, "合并撤销后模型应还原");
+    }
+
+    /// wave7b：`split_pages_to` 越界区间（终点 >= 页数）→ `last_modify_error` 置位、页面模型不变。
+    #[gpui::test]
+    async fn split_pages_rejects_out_of_range_in_view(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let n = dims_of(&mut vcx, &holder).len();
+        let out = wave7b_out("split-invalid");
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.split_pages_to((0, n), out.clone(), cx); // 终点 n 越界
+            });
+        });
+        for _ in 0..5 {
+            vcx.run_until_parked();
+        }
+        assert_eq!(dims_of(&mut vcx, &holder).len(), n, "越界拆分后页数不变");
+        let err = vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).last_modify_error().map(String::from)
+        });
+        assert!(err.is_some(), "越界拆分应置 last_modify_error");
+    }
+
+    /// wave7b：`merge_pdf_file` src 不存在 → `last_modify_error` 置位、页面模型不变。
+    #[gpui::test]
+    async fn merge_pdf_file_rejects_bad_source_in_view(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let n = dims_of(&mut vcx, &holder).len();
+        let missing = wave7b_out("merge-missing");
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.merge_pdf_file(missing, cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.last_modify_error().is_some());
+        assert_eq!(dims_of(&mut vcx, &holder).len(), n, "src 不存在合并后页数不变");
+    }
+
+    /// wave8 评审 R7：`merge_pdf_file` 读端**真边界** —— 合并源超过
+    /// [`PDF_MERGE_MAX_SRC_BYTES`]（稀疏文件，只 `set_len` 拉长不占实际磁盘）→ 读端元数据
+    /// 预检快拒 → `last_modify_error` 报「合并源过大」、「当前文档页数不变」（绝不把超限
+    /// 字节送进 pdfium worker）。校验的是读端有界拦截的真实执行，非桩。
+    #[gpui::test]
+    async fn merge_pdf_file_rejects_oversized_source(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let n = dims_of(&mut vcx, &holder).len();
+        // 稀疏超限源：文件长度 = 上限 + 1（NTFS 惰性分配，不占实际磁盘、秒建）；读端预检
+        // 按元数据长度快拒，不会真正读 512MB。
+        let dir = std::env::temp_dir().join("vuick-pdf-tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let oversize = dir.join(format!("merge-oversize-{}.pdf", std::process::id()));
+        let _ = std::fs::remove_file(&oversize);
+        {
+            let f = std::fs::File::create(&oversize).expect("创建超限源应成功");
+            f.set_len(PDF_MERGE_MAX_SRC_BYTES + 1).expect("拉长超限源应成功");
+        }
+        let ov2 = oversize.clone();
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.merge_pdf_file(ov2, cx);
+            });
+        });
+        wait_until(&mut vcx, &holder, |v| v.last_modify_error().is_some());
+        let msg = vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).last_modify_error().map(String::from)
+        });
+        assert!(
+            msg.as_deref().is_some_and(|m| m.contains("合并源过大")),
+            "超限源应报「合并源过大」：{msg:?}"
+        );
+        assert_eq!(dims_of(&mut vcx, &holder).len(), n, "超限合并后页数不变");
+        let _ = std::fs::remove_file(&oversize);
+    }
+
+    /// wave8 评审 P1：导出到**当前打开的文档路径** → 预检**同步**置错（Err）且盘上源
+    /// 文件**未被覆盖**（字节不变）。滥用场景：导出/拆分把盘上源文件原子替换成子集，
+    /// 而内存镜像未变、dirty 不置 → 原文件丢失且无撤销保护；故预检在菜单决策点拦截。
+    /// 用可写临时副本跑（源夹具可能带 ReadOnly），断言「Err 置位 + 盘上字节原样」真实
+    /// 执行（非 SKIP、非假绿）。
+    #[gpui::test]
+    async fn export_to_current_doc_path_rejected_and_disk_untouched(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let dir = std::env::temp_dir().join("vuick-pdf-tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let cur = dir.join(format!("p1-self-{}.pdf", std::process::id()));
+        let _ = std::fs::remove_file(&cur);
+        // 可写重建（fs::copy 会继承源只读属性 → 用 read+write，K47）。
+        test_util::copy_fixture_writable(&test_util::test_pdf_paths()[0], &cur)
+            .expect("工作副本应可写");
+        let disk0 = std::fs::read(&cur).expect("读副本应成功");
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let cur2 = cur.clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(cur2, cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let n = dims_of(&mut vcx, &holder).len();
+        // out == 当前文档路径 → 预检同步置错；不起异步、不重编码。
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.export_pages_to(vec![0, 1], cur.clone(), cx);
+            });
+        });
+        for _ in 0..5 {
+            vcx.run_until_parked();
+        }
+        let err = vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).last_modify_error().map(String::from)
+        });
+        assert!(err.is_some(), "导出到当前文档路径应被预检拒绝");
+        let msg = err.unwrap();
+        assert!(
+            msg.contains("不能覆盖当前打开的文档"),
+            "错误文案应命中 P1 防护：{msg}"
+        );
+        assert_eq!(
+            dims_of(&mut vcx, &holder).len(),
+            n,
+            "预检拦截不改变模型页数"
+        );
+        // 盘上源文件未被覆盖（字节原样）——被拒绝的导出绝不能原子替换成子集。
+        let disk1 = std::fs::read(&cur).expect("重读副本应成功");
+        assert_eq!(disk1, disk0, "导出被拒后盘上源文件不得被覆盖");
+        let _ = std::fs::remove_file(&cur);
+    }
+
+    /// wave8 评审 P2-A2：`reorder_pages` 传恒等序（0..n）→ 早退 no-op——不提交 worker
+    /// （不整档重编码）、不置脏（pending_page_ops 不变）、不入撤销快照（undo_stack 空）、
+    /// 页面序不变、不置错。
+    #[gpui::test]
+    async fn reorder_identity_is_noop_without_dirty(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let pdf_path = test_util::test_pdf_paths()[1].clone();
+        let (_root, mut vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageOpHost { pdf }
+        });
+        wait_loaded(&mut vcx, &holder);
+        let dims = dims_of(&mut vcx, &holder);
+        let n = dims.len();
+        let (ops0, undo0) = vcx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.pending_page_ops, v.undo_stack.len())
+        });
+        let identity: Vec<usize> = (0..n).collect();
+        vcx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.reorder_pages(identity, cx);
+            });
+        });
+        // identity 早退是同步 no-op（不 spawn/不 reload）→ 泵若干帧后状态应原样。
+        for _ in 0..10 {
+            vcx.run_until_parked();
+        }
+        let (ops1, undo1, dims1, err) = vcx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.pending_page_ops,
+                v.undo_stack.len(),
+                v.dims.clone(),
+                v.last_modify_error().is_some(),
+            )
+        });
+        assert_eq!(ops1, ops0, "identity 重排不置脏（pending_page_ops 不变）");
+        assert_eq!(undo1, undo0, "identity 重排不入撤销快照");
+        assert_eq!(dims1, dims, "identity 重排页面序不变");
+        assert!(!err, "identity 重排不应置错");
+    }
+}

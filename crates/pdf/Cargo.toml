@@ -17,6 +17,9 @@ config = { path = "../config" }
 base = { path = "../base" }
 ui = { path = "../ui" }
 viewer = { path = "../viewer" }
+# 网格工具栏 拆分/提取/合并 的另存为 / 选源文件对话框（wave8；复用 workspace 既有依赖
+# 版本与 Cargo.lock 锁定，shell/shell_pdf 同款 0.17，非新增外部包）。
+rfd = { workspace = true }
 
 [build-dependencies]
 zstd = { workspace = true }

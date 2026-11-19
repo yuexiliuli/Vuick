@@ -3181,6 +3181,7 @@ dependencies = [
  "kimg",
  "pdf_core",
  "pdfium-render",
+ "rfd",
  "ui",
  "viewer",
  "windows-sys 0.61.2",

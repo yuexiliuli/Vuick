@@ -691,11 +691,13 @@ impl Render for PdfViewer {
         let (page_bg, page_border) = Self::page_card_colors(cx);
         let page_width = self.page_width();
 
-        // 错误 / 加载中 / 已加载三种状态
+        // 错误 / 加载中 / 已加载三种状态（已加载再按 grid_mode 分派：网格视图 vs 单列阅读）
         let body: gpui::AnyElement = if let Some(err) = &self.state.load_error {
             Self::pdf_placeholder_body(&format!("无法打开 PDF：{err}"), page_border)
         } else if self.state.loading || self.dims.is_empty() {
             Self::pdf_placeholder_body("正在解析 PDF…", page_border)
+        } else if self.grid_mode {
+            self.render_pdf_grid(window, cx)
         } else {
             self.render_pdf_pages(window, cx, page_width, page_bg, page_border)
         };
@@ -729,18 +731,29 @@ impl Render for PdfViewer {
                             .debug_selector(|| "pdf-scrollbar-overlay".into())
                             .absolute()
                             .inset_0()
+                            // wave5：网格顶栏贴网格滚动容器顶端——overlay 顶偏工具栏高，滚动条
+                            // 轨道与滚动容器可视区对齐（否则条长多出工具栏高一段，观感错位）。
+                            .when(self.grid_mode, |this| this.top(px(GRID_TOOLBAR_H)))
+                            // 滚动条绑定**当前活动滚动句柄**：单列跑 `scroll`、网格跑独立
+                            // `grid_scroll`（两者状态互不干扰；网格无横向溢出故无横向条）。
                             .child(
-                                Scrollbar::vertical(&self.scroll)
-                                    .mode(ScrollbarMode::Always)
-                                    .viewport_from_layout(),
+                                Scrollbar::vertical(if self.grid_mode {
+                                    &self.grid_scroll
+                                } else {
+                                    &self.scroll
+                                })
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
                             )
-                            // 横向滚动条：窗口过窄/放大超宽时 scroll 容器内容宽于视口，
-                            // 横向溢出可滚；轴 Always 常驻可见（与原实现一致）。
-                            .child(
-                                Scrollbar::horizontal(&self.scroll)
-                                    .mode(ScrollbarMode::Always)
-                                    .viewport_from_layout(),
-                            ),
+                            // 横向滚动条：仅单列（窗口过窄/放大超宽时 scroll 容器内容宽于
+                            // 视口，横向溢出可滚；网格卡长按视口排布无横向溢出）。
+                            .when(!self.grid_mode, |this| {
+                                this.child(
+                                    Scrollbar::horizontal(&self.scroll)
+                                        .mode(ScrollbarMode::Always)
+                                        .viewport_from_layout(),
+                                )
+                            }),
                     ),
             )
             .when_some(sel_overlay, |this, o| this.child(o))
@@ -987,6 +1000,526 @@ impl PdfViewer {
                     .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                     .child(content),
             )
+            .into_any_element()
+    }
+
+    /// 已加载正文的**网格视图**（`grid_mode` 时）：顶部一条 wave5 工具栏（全选/清空/退出 +
+    /// 删除·拆分·提取·合并计数按钮），其下是独立 `grid_scroll` 滚动容器（`flex_1` 占满
+    /// 剩余高；工具栏为 out-of-flow 固定头，卡区视口从工具栏底开始），滚动容器里放一个
+    /// 「全文档网格总高」的定位容器，只把 **第一可见行 ±1 行缓冲** 内的页卡以绝对定位
+    /// 铺进 DOM（`grid_visible_range`），远行不物化（行带虚拟化）。卡宽 = `grid_card_width()`
+    /// （derived from zoom）；Ctrl+滚轮缩放 → 卡宽/列数变化（`on_scroll_wheel` 挂在内容元素，
+    /// 见下）。每卡 = 页缩略图（`grid_thumbs`，经 `request_grid` 异步拉取；未就绪显示占位
+    /// 底色 + 页码）＋ 页码徽标 + wave5 选中视觉（checkbox 勾选 / Ctrl 切换 / Shift 范围选，
+    /// 见 `build_grid_cards`）；普通单击卡 → 切换该页选中态（**留在网格**）、双击 →
+    /// 退出网格 + `scroll_to_page(该页)`（wave3 跳页语义迁到双击）。滚动偏移、缩略图槽
+    /// 均独立于单列状态，切模式互不干扰。
+    fn render_pdf_grid(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
+        let (page_bg, page_border) = Self::page_card_colors(cx);
+        let (vw, vh) = self.grid_viewport(window);
+        let layout = grid_layout(&self.dims, self.grid_card_width(), GRID_GAP, GRID_PADDING, vw);
+        // wave6：**仅拖拽态**把布局快照抄入拖拽命中槽——未拖拽时消费者为空（`grid_drag_move`
+        // 只在拖拽中读上一帧布局算插入位），避免每帧全量 `clone` 一份 GridLayout；
+        // 进入拖拽后下一帧自会重新写入（on_drag 建立拖拽态 → 本帧/下帧写快照）。
+        if self.grid_drag.is_some() {
+            *self.grid_layout_cell.borrow_mut() = Some(layout.clone());
+        }
+        let offset = f32::from(-self.grid_scroll.offset().y);
+        // 行带虚拟化：仅物化「可视行 ±1 行」的页卡，其余不建 DOM（对齐页列虚拟化口径）。
+        // 观测探针（headless 断言虚拟化的确定性证据）：记录本帧实际物化区间与卡数。
+        let mut cards: Vec<gpui::AnyElement> = match grid_visible_range(&layout, offset, vh) {
+            Some((start, end)) => {
+                self.grid_last_range.set((start, end));
+                self.grid_last_drawn.set(end - start + 1);
+                self.build_grid_cards(cx, &layout, start, end, page_bg, page_border)
+            }
+            None => {
+                self.grid_last_range.set((0, 0));
+                self.grid_last_drawn.set(0);
+                Vec::new()
+            }
+        };
+        // wave6：拖拽中 → 在网格内容容器内叠加 ghost（半透明卡随指针）+ 插入指示线。
+        if self.grid_drag.is_some() {
+            cards.extend(self.grid_reorder_overlays(cx, &layout));
+        }
+        let content = div()
+            .id("pdf-grid")
+            .debug_selector(|| "pdf-grid".into())
+            .relative()
+            .w(px(vw))
+            .h(px(layout.total_height))
+            .bg(canvas)
+            // wave6 拖拽移动：`pdf-grid`（内容容器）的 laid-out bounds 含滚动平移 →
+            // 指针窗口坐标 − bounds 原点即内容坐标（无需额外滚动换算）。
+            .on_drag_move(cx.listener(
+                |this, ev: &DragMoveEvent<GridDragData>, _window, _cx| {
+                    this.grid_drag_move(ev);
+                },
+            ))
+            // Ctrl+滚轮缩放：挂在**网格内容元素**上（`pdf-grid-scroll` 的子元素），bubble 期
+            // 先于滚动容器的内置滚动处理 → Ctrl 时 `on_scroll_wheel` 内 stop_propagation 阻止
+            // 滚动、按 zoom 改卡宽（列数变化 + 缩略图按新分桶重取）；普通滚轮不拦截，仍交
+            // 滚动容器垂直滚动。与单列 `pdf-column-wrap` 的挂载姿势一致。
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .children(cards);
+        div()
+            .id("pdf-grid-root")
+            .debug_selector(|| "pdf-grid-root".into())
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_stretch()
+            // wave6：网格根聚焦本视图焦点句柄 → 拖拽中 Esc 可达 `on_key_down` 取消拖拽。
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            // wave6 松手收尾：网格根任一松手（卡/内容/padding/工具条）都结算拖拽或单击；
+            // 网格外松手（窗口外 / 根之外）→ 放弃（`on_mouse_up_out`）。
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| {
+                    this.grid_drag_release(cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| {
+                    this.grid_drag_release_outside(cx);
+                }),
+            )
+            // wave5 工具栏：固定头在滚动容器之上（flex 行内先渲染），贴顶不高过卡区。
+            .child(self.render_grid_toolbar(cx))
+            .child(
+                div()
+                    .id("pdf-grid-scroll")
+                    .debug_selector(|| "pdf-grid-scroll".into())
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.grid_scroll)
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    /// wave6 网格拖拽覆盖层（拖拽中每帧构建，装进网格内容容器、绝对定位=内容坐标）：
+    /// 半透明 ghost（随 `GridDrag::pointer` 居中）+ 插入指示线（[`Self::grid_insert_line_rect`]，
+    /// `tab_reorder_line` 纯白语义色——与选项卡拖拽插入线同源颜色）。无拖拽组 → 空。
+    fn grid_reorder_overlays(&self, cx: &Context<Self>, layout: &GridLayout) -> Vec<gpui::AnyElement> {
+        let Some(drag) = self.grid_drag.as_ref() else {
+            return Vec::new();
+        };
+        if drag.dragging.is_empty() {
+            return Vec::new();
+        }
+        let theme = ui::theme::Theme::global(cx);
+        let colors = theme.colors;
+        let chrome = ui::theme::ChromeColors::for_mode(theme.is_dark());
+        let accent: gpui::Hsla = colors.accent.into();
+        let line_color: gpui::Hsla = chrome.tab_reorder_line.into();
+        // ghost 尺寸取被拖组首卡的实际卡矩形（无卡矩形时退 cell_w × 120 兜底）。
+        let (w, h) = layout
+            .cell_rect(drag.dragging[0])
+            .map(|(_, _, w, h)| (w, h))
+            .unwrap_or((layout.cell_w, 120.0));
+        let mut out = Vec::with_capacity(2);
+        out.push(
+            div()
+                .id("pdf-grid-ghost")
+                .debug_selector(|| "pdf-grid-ghost".into())
+                .absolute()
+                .left(px((drag.pointer.x - w / 2.0).max(0.0)))
+                .top(px((drag.pointer.y - h / 2.0).max(0.0)))
+                .w(px(w))
+                .h(px(h))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(accent)
+                .bg(accent.opacity(0.22))
+                .into_any_element(),
+        );
+        out.push(
+            drag
+                .insert
+                .and_then(|p| Self::grid_insert_line_rect(layout, p))
+                .map(|(x, y, lw, lh)| {
+                    div()
+                        .id("pdf-grid-reorder-line")
+                        .debug_selector(|| "pdf-grid-reorder-line".into())
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(lw))
+                        .h(px(lh))
+                        .rounded_full()
+                        .bg(line_color)
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| div().size_0().into_any_element()),
+        );
+        out
+    }
+
+    /// 插入指示线矩形（网格内容坐标）：线性位 `insert`（0..=页数）→ 目标格间隙的竖条。
+    /// `insert < n` → 目标卡（原序 `insert`）**左缘**（gap 中线）；`insert == n` → 末卡
+    /// **右缘**（gap 中线）。宽 3px、高 = 该卡高。行间垂直 gap 的插入位落在「下一行首」
+    /// （= `row_page_start[r]`），线画在该行首卡左缘 = 插入到该行首（可视位对齐线性位）。
+    ///
+    /// 演算：线中心 `c`；`insert < n` = 目标卡 `x − gap/2`，`insert == n` = 末卡 `x + w + gap/2`；
+    /// 矩形 = `(c − 1.5, 卡y, 3, 卡高)`。
+    fn grid_insert_line_rect(layout: &GridLayout, insert: usize) -> Option<(f32, f32, f32, f32)> {
+        let n = layout.row_page_start.last().copied().unwrap_or(0);
+        if layout.rows == 0 || n == 0 {
+            return None;
+        }
+        if insert >= n {
+            let (x, y, w, h) = layout.cell_rect(n - 1)?;
+            let c = x + w + layout.gap / 2.0;
+            Some((c - 1.5, y, 3.0, h.max(1.0)))
+        } else {
+            let (x, y, _w, h) = layout.cell_rect(insert)?;
+            let c = x - layout.gap / 2.0;
+            Some((c - 1.5, y, 3.0, h.max(1.0)))
+        }
+    }
+
+    /// 网格页卡构建（[`PdfViewer::render_pdf_grid`] 的可视带内卡片）：绝对定位在 `cell_rect`
+    /// 处，卡内 = 缩略图（`ImageSource::Render`）或「第 N 页 加载中…」占位底色，右下角叠
+    /// 页码徽标。wave5 起叠加网格多选：
+    /// - 右上角 **checkbox**（`pdf-grid-check-<i>`）：单击切换该页选中态，并 `stop_propagation`
+    ///   独占（不落到卡的「本底单击」）；
+    /// - **普通**左键点卡（无修饰键）= 维持 wave3：退出网格 + `scroll_to_page`（不改选中态）；
+    /// - **Ctrl**+左键点卡 = 切换选中态（不退出网格）；
+    /// - **Shift**+左键点卡 = 范围选中（锚点→当前闭区间加入选中集，其它保持；不退出网格）；
+    /// 选中态视觉 = 强调色边框 + 全卡强调淡底 + 左上角「✓ 计数」角标（`pdf-grid-badge-<i>`，
+    /// 测试经 `debug_bounds` 断言有无）。
+    /// wave6：按下不再即时触发勾选/跳页（改记 `grid_press` 待决单击，松手未拖拽才消费——
+    /// 与拖拽经位移阈值互斥）；整卡可 `on_drag` 拖拽重组。
+    #[allow(clippy::too_many_arguments)]
+    fn build_grid_cards(
+        &self,
+        cx: &mut Context<Self>,
+        layout: &GridLayout,
+        start: usize,
+        end: usize,
+        page_bg: Hsla,
+        page_border: Hsla,
+    ) -> Vec<gpui::AnyElement> {
+        let colors = ui::theme::Theme::global(cx).colors;
+        let fg: gpui::Hsla = colors.fg.into();
+        let accent: gpui::Hsla = colors.accent.into();
+        let border: gpui::Hsla = colors.border.into();
+        let bg: gpui::Hsla = colors.bg.into();
+        let selected_count = self.grid_selected_count();
+        let mut cards = Vec::with_capacity(end - start + 1);
+        for i in start..=end {
+            let Some((x, y, w, h)) = layout.cell_rect(i) else {
+                continue;
+            };
+            let selected = self.grid_selected(i);
+            let inner: gpui::AnyElement = match self.grid_thumbs.get(&i).cloned() {
+                Some(thumb_img) => img(ImageSource::Render(thumb_img))
+                    .w(px(w))
+                    .h(px(h))
+                    .into_any_element(),
+                None => div()
+                    .size_full()
+                    .bg(page_bg)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(page_border)
+                            .child(format!("第 {} 页", i + 1)),
+                    )
+                    .into_any_element(),
+            };
+            let mut card = div()
+                .id(SharedString::from(format!("pdf-grid-item-{i}")))
+                .debug_selector(move || format!("pdf-grid-item-{i}"))
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(w))
+                .h(px(h))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(if selected { accent } else { page_border })
+                .overflow_hidden()
+                .cursor(gpui::CursorStyle::PointingHand)
+                .child(inner);
+            // wave5 选中底：强调色淡底整卡覆盖（非交互层，无 handler 不拦截命中——K15）。
+            if selected {
+                card = card.child(div().absolute().inset_0().bg(accent.opacity(0.16)));
+            }
+            // wave5 checkbox：右上角勾选钮。单击只切选中态并 stop_propagation 独占，
+            // 不落到卡本底（本底单击 = 退出网格）。无独立 handler 时选中视觉走卡边框/底。
+            card = card.child(
+                div()
+                    .id(SharedString::from(format!("pdf-grid-check-{i}")))
+                    .debug_selector(move || format!("pdf-grid-check-{i}"))
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(6.))
+                    .w(px(18.))
+                    .h(px(18.))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(if selected { accent } else { border })
+                    .bg(if selected { accent } else { page_bg.opacity(0.7) })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .when(selected, |this| {
+                        this.child(div().text_size(px(12.)).text_color(bg).child("✓"))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                            this.grid_toggle_select(i, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+            // wave5 选中角标：左上角「✓ 计数」（选中态标记；headless 测试经 debug_bounds
+            // 断言其出现/消失，是「选中视觉」的确定性证据）。
+            if selected {
+                card = card.child(
+                    div()
+                        .id(SharedString::from(format!("pdf-grid-badge-{i}")))
+                        .debug_selector(move || format!("pdf-grid-badge-{i}"))
+                        .absolute()
+                        .top(px(6.))
+                        .left(px(6.))
+                        .px_1()
+                        .rounded_sm()
+                        .bg(accent)
+                        .text_size(px(10.))
+                        .text_color(bg)
+                        .child(format!("✓ {selected_count}")),
+                );
+            }
+            // 页码徽标：贴卡右下缘（半透明底，叠加在缩略图/占位之上）。
+            card = card.child(
+                div()
+                    .absolute()
+                    .bottom(px(3.))
+                    .right(px(3.))
+                    .px_1()
+                    .rounded_sm()
+                    .bg(page_bg.opacity(0.75))
+                    .text_size(px(11.))
+                    .text_color(fg)
+                    .child(format!("{}", i + 1)),
+            );
+            // 卡交互（wave6 重写）：按下只记录「待决单击」（`grid_press`）——松手时若**未**
+            // 进入拖拽（位移未超阈值）才按 wave5/wave3 语义消费（Ctrl 切换 / Shift 范围 /
+            // 单击选中 / 双击跳页，见 `grid_click_commit`）；整卡可 `on_drag` 拖拽重组（位移
+            // 超阈值即接管，拖拽中不触发勾选/跳页）。拖拽载荷只记页下标（选中组在拖拽开始快照）。
+            let weak = cx.weak_entity();
+            card = card
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _w, _cx| {
+                        this.grid_press = Some(GridPress {
+                            page: i,
+                            modifiers: ev.modifiers,
+                            // 点击计数随后 `grid_click_commit` 用：1 = 单击（选中）、≥2 = 双击（跳页）。
+                            click_count: ev.click_count,
+                        });
+                    }),
+                )
+                .on_drag(
+                    GridDragData { page: i },
+                    move |_value: &GridDragData, _offset, _window, cx| {
+                        if let Some(w) = weak.upgrade() {
+                            let _ = w.update(cx, |this, _cx| {
+                                this.grid_drag_begin(_value.page);
+                            });
+                        }
+                        // gpui 拖拽 picture 置空（ghost/指示线由本视图渲染，避免双影）。
+                        cx.new(|_| gpui::EmptyView)
+                    },
+                );
+            cards.push(card.into_any_element());
+        }
+        cards
+    }
+
+    /// wave5 网格顶栏（`pdf-grid-toolbar`）：左组「全选 / 清空选择 / 退出网格」始终可用；
+    /// 右组「删除 / 拆分 / 提取 / 合并」带选中计数 badge（如 `删除(3)`），无选中时置灰禁用。
+    /// wave8：四个操作按钮已接线（确认框/文件选择 → `grid_apply_*` seam）。颜色全部走
+    /// theme 语义（内容色 `ColorScheme` + 外壳 `ChromeColors`，禁裸色）。
+    fn render_grid_toolbar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = ui::theme::Theme::global(cx);
+        let colors = theme.colors;
+        let chrome = ui::theme::ChromeColors::for_mode(theme.is_dark());
+        let fg: gpui::Hsla = colors.fg.into();
+        let fg_disabled: gpui::Hsla = colors.fg_disabled.into();
+        let hover_bg: gpui::Hsla = colors.selected_bg.into();
+        let bar_bg: gpui::Hsla = chrome.bar_bg.into();
+        let hairline: gpui::Hsla = chrome.hairline.into();
+        let count = self.grid_selected_count();
+        let has_sel = count > 0;
+
+        div()
+            .id("pdf-grid-toolbar")
+            .debug_selector(|| "pdf-grid-toolbar".into())
+            .h(px(GRID_TOOLBAR_H))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .px(px(10.))
+            .bg(bar_bg)
+            .border_b_1()
+            .border_color(hairline)
+            // 左组：全选 / 清空选择（始终可用；清空对空集幂等）。
+            .child(Self::grid_tool_button(
+                "pdf-grid-tool-select-all",
+                "全选".into(),
+                true,
+                fg,
+                fg_disabled,
+                hover_bg,
+                cx,
+                Some(Box::new(|this: &mut PdfViewer, _w: &mut Window, cx| {
+                    this.grid_select_all(cx);
+                })),
+            ))
+            .child(Self::grid_tool_button(
+                "pdf-grid-tool-clear",
+                "清空选择".into(),
+                true,
+                fg,
+                fg_disabled,
+                hover_bg,
+                cx,
+                Some(Box::new(|this: &mut PdfViewer, _w: &mut Window, cx| {
+                    this.grid_clear_selection(cx);
+                })),
+            ))
+            // 分隔 + 退出网格（= toggle 退出：回单列阅读、不定位）。
+            .child(Self::grid_tool_divider(hairline))
+            .child(Self::grid_tool_button(
+                "pdf-grid-tool-exit",
+                "退出网格".into(),
+                true,
+                fg,
+                fg_disabled,
+                hover_bg,
+                cx,
+                Some(Box::new(|this: &mut PdfViewer, _w: &mut Window, cx| {
+                    this.set_grid_mode(false, cx);
+                })),
+            ))
+            // 右推第二组：页操作（wave8 已接线：确认框/文件选择 → grid_apply_* seam；
+            // 无选中禁用，handler 内再兜底空选中早退）。
+            .child(div().flex_1())
+            .child(Self::grid_tool_button(
+                "pdf-grid-tool-delete",
+                format!("删除({count})"),
+                has_sel,
+                fg,
+                fg_disabled,
+                hover_bg,
+                cx,
+                Some(Box::new(|this: &mut PdfViewer, window, cx| {
+                    this.grid_delete_clicked(window, cx);
+                })),
+            ))
+            .child(Self::grid_tool_button(
+                "pdf-grid-tool-split",
+                format!("拆分({count})"),
+                has_sel,
+                fg,
+                fg_disabled,
+                hover_bg,
+                cx,
+                Some(Box::new(|this: &mut PdfViewer, window, cx| {
+                    this.grid_split_clicked(window, cx);
+                })),
+            ))
+            .child(Self::grid_tool_button(
+                "pdf-grid-tool-extract",
+                format!("提取({count})"),
+                has_sel,
+                fg,
+                fg_disabled,
+                hover_bg,
+                cx,
+                Some(Box::new(|this: &mut PdfViewer, window, cx| {
+                    this.grid_extract_clicked(window, cx);
+                })),
+            ))
+            .child(Self::grid_tool_button(
+                "pdf-grid-tool-merge",
+                format!("合并({count})"),
+                has_sel,
+                fg,
+                fg_disabled,
+                hover_bg,
+                cx,
+                Some(Box::new(|this: &mut PdfViewer, window, cx| {
+                    this.grid_merge_clicked(window, cx);
+                })),
+            ))
+            .into_any_element()
+    }
+
+    /// 单个网格顶栏按钮：可用态挂 hover 基底 + 点击回调，禁用态只呈现置灰（不发事件、不
+    /// hover）。`on_click` 携带 `&mut Window`（wave8 接线需弹原生确认框/文件框）。
+    /// `debug_selector` 带可用态后缀（`-on`/`-off`），供 headless 测试断 UI 呈现。
+    fn grid_tool_button(
+        selector: &'static str,
+        label: String,
+        enabled: bool,
+        fg: Hsla,
+        fg_disabled: Hsla,
+        hover_bg: Hsla,
+        cx: &mut Context<Self>,
+        on_click: Option<Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>>,
+    ) -> gpui::AnyElement {
+        let state = if enabled { "on" } else { "off" };
+        div()
+            .id(selector)
+            .debug_selector(move || format!("{selector}-{state}"))
+            .h(px(24.))
+            .px_2()
+            .rounded_md()
+            .cursor(gpui::CursorStyle::PointingHand)
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .text_size(px(13.))
+            .text_color(if enabled { fg } else { fg_disabled })
+            .when(enabled, |this| this.hover(|this| this.bg(hover_bg)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    if !enabled {
+                        return;
+                    }
+                    if let Some(f) = &on_click {
+                        f(this, window, cx);
+                    }
+                }),
+            )
+            .child(label)
+            .into_any_element()
+    }
+
+    /// 顶栏竖向分隔发丝线。
+    fn grid_tool_divider(hairline: Hsla) -> gpui::AnyElement {
+        div()
+            .mx_1()
+            .w(px(1.))
+            .h(px(16.))
+            .bg(hairline)
             .into_any_element()
     }
 }

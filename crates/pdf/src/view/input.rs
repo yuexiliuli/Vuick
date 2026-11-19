@@ -12,6 +12,7 @@
 //! `` `pub(super)` ``（视图子树内可见）互调。
 
 use super::*;
+use crate::pdf::parser::grid_bucket_width;
 
 /// Windows 实时硬件态 Ctrl 探测：gpui 事件/window 修饰键在真机恒 false（GetKeyState
 /// 线程消息队列态带不出），以 `GetAsyncKeyState(VK_CONTROL)` 读实时硬件态兜底——
@@ -92,8 +93,32 @@ impl PdfViewer {
             );
         }
         let delta_y = pan_zoom::wheel_delta_y(event);
-        // 实测本平台：向上滚动 delta.y>0 → 放大；向下 <0 → 缩小（与编辑器字号缩放一致）
-        self.adjust_zoom(pan_zoom::zoom_factor(delta_y, ZOOM_STEP), cx);
+        let factor = pan_zoom::zoom_factor(delta_y, ZOOM_STEP);
+        if self.grid_mode {
+            // 网格**独立缩放**：只改 `grid_zoom` → 卡宽/列数变化（`grid_card_width()` 派生），
+            // **不碰单列阅读 `self.zoom`**（退出网格回阅读保持用户阅读缩放）。不复用
+            // `adjust_zoom`（那会改 `self.zoom` + 重排单列布局 + 步进 zoom_epoch）；这里只
+            // 步进 grid_zoom 并同比重锚 grid_scroll。缩略图**仅跨分桶才失效**——worker 按
+            // `grid_bucket_width`（GRID_BUCKET_PX=32 量化）分桶缓存，同一桶内缩放只改卡宽/
+            // 列数/滚动重锚，缩略图与在途请求**复用**（连续 Ctrl+滚轮跨多桶时每档全清会
+            // 闪占位 + 逐档重栅）；同桶复用、跨桶失效（下一帧按新分桶重取）。
+            let old_card = self.grid_card_width();
+            if pan_zoom::apply_zoom(&mut self.grid_zoom, factor, ZOOM_MIN, ZOOM_MAX) {
+                let new_card = self.grid_card_width();
+                if (new_card - old_card).abs() > 1e-3 {
+                    let ratio = new_card / old_card;
+                    let sy = f32::from(-self.grid_scroll.offset().y) * ratio;
+                    self.grid_scroll.set_offset(gpui::point(px(0.), px(-sy)));
+                    if grid_bucket_width(new_card) != grid_bucket_width(old_card) {
+                        self.clear_grid_resources();
+                    }
+                    cx.notify();
+                }
+            }
+        } else {
+            self.adjust_zoom(factor, cx);
+        }
+        cx.stop_propagation();
         if timing_view() {
             eprintln!(
                 "[{:.1}ms] [VIEW-WHEEL] adjust_zoom 后 zoom={:.2} page_width={:.0}",
@@ -102,7 +127,6 @@ impl PdfViewer {
                 self.page_width(),
             );
         }
-        cx.stop_propagation();
     }
 
     /// 应用缩放因子并维护其后的一致性：锚定滚动偏移、重算页列布局。钳位/无变化短路走
@@ -451,6 +475,12 @@ impl PdfViewer {
         }
         if event.keystroke.key == "escape" && self.sel_card.is_some() {
             self.sel_card = None;
+        }
+        // wave6：网格拖拽中 Esc → 取消拖拽（放弃提交、选中保持原样），并 stop_propagation
+        // 不冒泡给全局（避免其它 Escape 消费方误处理）。
+        if event.keystroke.key == "escape" && self.grid_drag.is_some() {
+            self.grid_drag_cancel(cx);
+            cx.stop_propagation();
         }
         cx.notify();
     }
