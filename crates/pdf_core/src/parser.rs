@@ -563,6 +563,19 @@ enum WorkerMsg {
     /// L0 缩略图渲染（低清晰度、~1ms/张）。优先级从高到低：Render/RenderTile > Mid >
     /// Thumb > Text——拖动期间先铺中清/缩略占位，瓦片随后补齐。
     Thumb(DocId, usize, mpsc::Sender<Option<RenderResult>>),
+    /// 网格视图（Grid 档）缩略图渲染：按目标卡宽（逻辑 px）× DPI 的目标像素宽渲染，
+    /// 结果与 [`WorkerMsg::Thumb`] 同构（`RenderResult`，view 直接可画）。
+    /// **独立网格缓存**（预算 LRU，绝不与 THUMB/MID/raw/cover 互扰）＋**背景信道**
+    /// 调度（**最低优先级**：render > mid > thumb > rest > grid，只在 render/mid/thumb/
+    /// rest 均空时才出队，见 run 循环 3.5）——网格模式下绝不阻塞/饿死阅读器任何既有
+    /// 请求（含 Open/Close/Text/Search 等 rest 类）。worker 内实现见 [`render_grid`]。
+    Grid(
+        DocId,
+        usize,
+        f32,
+        f32,
+        mpsc::Sender<Option<RenderResult>>,
+    ),
     Close(DocId),
     /// 请求某页文本层数据（懒加载：仅选中/复制/搜索时调用）。**低优先级**：
     /// worker 调度保证绝不排在栅格化（Render）之后执行。
@@ -606,6 +619,43 @@ enum WorkerMsg {
     /// **内存级**删除页面（待保存模型）：守卫同磁盘版（越界 / 仅剩 1 页 → Err），
     /// 只改 stores、不碰磁盘。成功回传 [`MemOpResult`]。
     MemOpDelete(DocId, usize, mpsc::Sender<Result<MemOpResult>>),
+    /// **内存级**重排页序（待保存模型）：`new_order` 为 0 基**全排列**（长度 = 当前页数、
+    /// 0..n 每值恰一次；任何不合法 → 立即 Err 且文档不变、无副作用）。生效机制 =
+    /// `FPDF_CreateNewDocument` + 按新序「值连续的升序段」逐段 `FPDF_ImportPages`（pagerange
+    /// 只能表达升序连续段；任意排列按段序多次 import 追加成目标序，对齐既有页操作
+    /// [`WorkerMsg::ExtractPage`] 的 fps 精度/保真口径，不做字节级保真）。重排后总页数不变。
+    /// 只改 stores、不碰磁盘。成功回传 [`MemOpResult`]。
+    MemOpReorder(DocId, Vec<usize>, mpsc::Sender<Result<MemOpResult>>),
+    /// **内存级**批量删除页面（待保存模型）：`pages` 为 0 基待删页数组；逐页校验
+    /// （每页 < 当前页数、去重后全有效；非法 → Err）+ 保留至少 1 页（对齐单页删除
+    /// 「不能删除仅剩的 1 页」不变式），随后按索引**降序**循环走既有单页内存删除
+    /// （升序删会因下标位移错删）。只改 stores、不碰磁盘。成功回传 [`MemOpResult`]。
+    MemOpBatchDelete(DocId, Vec<usize>, mpsc::Sender<Result<MemOpResult>>),
+    /// **提取多页到新文件**（wave7b）：`pages` 为 0 基待提取页数组，**可为任意顺序/非连续**、
+    /// 允许少于全页（副本语义：按给定序逐段 `FPDF_ImportPages` 追加成新文档并落盘
+    /// `out_path`，**不改变当前文档 / 不更新 stores**）。严格校验（K122/K124）：每页
+    /// < 当前页数、去重后均有效、非空；非法 → 立即 Err 零副作用（不产生任何文件）。
+    /// 成功回传写入文件的页数。
+    ExportPages(DocId, Vec<usize>, PathBuf, mpsc::Sender<Result<usize>>),
+    /// **拆分区间到新文件并移除**（wave7b）：`(start, end)` 含端点的 0 基区间。行为 =
+    /// ① 区间页按**原序**提取为新文档落盘 `out_path` + ② 从当前 stores 镜像**移除**该区间
+    /// （降序删，对齐批量删除姿势）。严格校验：区间合法（start ≤ end、end < 页数）、
+    /// 剩余 ≥1 页（防 0 页文档）；非法 → Err 零副作用（不产生文件、当前文档不变）。
+    /// 成功回传 `(新文件页数, MemOpResult)`——`MemOpResult.count` = 移除区间后的当前页数，
+    /// `before/after` 供撤销与重载。
+    SplitToFile(
+        DocId,
+        (usize, usize),
+        PathBuf,
+        mpsc::Sender<Result<(usize, MemOpResult)>>,
+    ),
+    /// **合并另一 PDF 到当前（追加）**（wave7b）：`src_bytes` 为**已由 view 侧读端走过大小
+    /// 上界（[`PDF_MERGE_MAX_SRC_BYTES`]）**的合并源字节（view 侧元数据预检 + 有界读盘后才
+    /// 发字节消息——本消息**不再读文件**，pdfium worker 绝不因合并源读盘而阻塞）。把
+    /// `src_bytes` 全部页 `FPDF_ImportPages` 追加到当前文档**尾部**（index = 当前页数）。
+    /// 严格校验：页数 > 0；失败 → Err 且当前文档不变。替换 stores 镜像（撤销 = 恢复操作前
+    /// 镜像）。成功回传 [`MemOpResult`]（count = 新总页数）。
+    MergeFromBytes(DocId, Vec<u8>, mpsc::Sender<Result<MemOpResult>>),
     /// 用给定 bytes 直接替换 stores 镜像（待保存模型撤销「页面操作」用；本消息不做任何
     /// pdfium 操作、零开销）。回传替换后镜像长度（存在性校验）。
     MemRestoreBytes(DocId, Vec<u8>, mpsc::Sender<Result<usize>>),
@@ -785,6 +835,31 @@ impl PdfWorker {
             nav_gen,
             zoom_epoch,
             WorkerMsg::Mid(doc_id, page, scale_factor, tx),
+        ));
+        rx
+    }
+
+    /// 请求某页的**网格视图缩略图**（异步）。`card_width` = 目标卡宽（逻辑 px），
+    /// `scale_factor` = 显示 DPI——目标像素宽 = `card_width × DPI`（同 `render_mid` 的
+    /// den 换算姿势），worker 先向 [`GRID_BUCKET_PX`](config::pdf::GRID_BUCKET_PX) 量化
+    /// 分桶再按桶渲染：相邻自然宽度落同桶 → 命中独立网格缓存复用、不重栅。结果与缩略图
+    /// 同构（`RenderResult`，view 直接可画、按页落槽）。**独立网格缓存 + 背景信道**：
+    /// 不抢/不逐出阅读器 THUMB/MID/raw/cover 驻留。`nav_gen` 同 [`Self::request_render`]
+    /// （L2.2 enqueue-n_gen 打戳）。
+    pub fn request_grid(
+        &self,
+        doc_id: DocId,
+        page: usize,
+        card_width: f32,
+        scale_factor: f32,
+        nav_gen: u64,
+        zoom_epoch: u64,
+    ) -> mpsc::Receiver<Option<RenderResult>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send((
+            nav_gen,
+            zoom_epoch,
+            WorkerMsg::Grid(doc_id, page, card_width, scale_factor, tx),
         ));
         rx
     }
@@ -1012,6 +1087,70 @@ impl PdfWorker {
         rx.recv().context("pdfium 工作线程已退出")?
     }
 
+    /// **内存级**重排页序（`new_order` 为 0 基**全排列**；不合法 → Err 且文档不变、无副作用）。
+    /// 只改 stores、不写盘。成功回传 [`MemOpResult`]（count = 重排后页数，不变）。
+    pub fn mem_reorder_pages(&self, doc_id: DocId, new_order: Vec<usize>) -> Result<MemOpResult> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send((0, 0, WorkerMsg::MemOpReorder(doc_id, new_order, tx)))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// **内存级**批量删除页面（`pages` 为 0 基待删页数组；逐页校验 + 去重 + 保留至少 1 页，
+    /// 非法 → Err）。只改 stores、不写盘。成功回传 [`MemOpResult`]（count = 删除后页数）。
+    pub fn mem_batch_delete_pages(&self, doc_id: DocId, pages: Vec<usize>) -> Result<MemOpResult> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send((0, 0, WorkerMsg::MemOpBatchDelete(doc_id, pages, tx)))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// **提取多页到新文件**（`pages` 为 0 基待提取页数组，可任意顺序/非连续；非法 →
+    /// Err 零副作用）。**不改变当前文档**（副本语义）。成功回传写入文件的页数。
+    pub fn export_pages_to(
+        &self,
+        doc_id: DocId,
+        pages: Vec<usize>,
+        out_path: PathBuf,
+    ) -> Result<usize> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send((0, 0, WorkerMsg::ExportPages(doc_id, pages, out_path, tx)))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// **拆分区间到新文件并移除**（`range = (start, end)` 含端点 0 基；非法 → Err 零副作用）。
+    /// 成功回传 `(新文件页数, MemOpResult)`（`mem.count` = 移除区间后的当前页数）。
+    pub fn split_to_file(
+        &self,
+        doc_id: DocId,
+        range: (usize, usize),
+        out_path: PathBuf,
+    ) -> Result<(usize, MemOpResult)> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send((0, 0, WorkerMsg::SplitToFile(doc_id, range, out_path, tx)))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
+    /// **合并另一 PDF 到当前（追加）**（`src_bytes` 为已走读端大小上界的合并源字节，
+    /// 非法/失败 → Err 且当前文档不变）。成功回传 [`MemOpResult`]（`count` = 新总页数）。
+    pub fn merge_from_bytes(
+        &self,
+        doc_id: DocId,
+        src_bytes: Vec<u8>,
+    ) -> Result<MemOpResult> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send((0, 0, WorkerMsg::MergeFromBytes(doc_id, src_bytes, tx)))
+            .context("pdfium 工作线程已退出")?;
+        rx.recv().context("pdfium 工作线程已退出")?
+    }
+
     /// 用给定 bytes 直接替换 stores 内存镜像（撤销「页面操作」用；零 pdfium 操作）。
     pub fn mem_restore_bytes(&self, doc_id: DocId, bytes: Vec<u8>) -> Result<usize> {
         let (tx, rx) = mpsc::channel();
@@ -1070,6 +1209,7 @@ impl PdfWorker {
         let mut render_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         let mut mid_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         let mut thumb_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut grid_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         let mut rest_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         // 在途的全文档检索（分片续跑）：worker 无渲染/占位积压时每轮扫一片（几页/几 ms），
         // 保证检索期间到达的 Render/RenderTile 可以插队先跑——否则一次全量扫描会冻结所有
@@ -1107,6 +1247,16 @@ impl PdfWorker {
         // 槽、不重置门控、不重调 pdfium 栅格（根治「夜间档加载慢」）。与 recolor 同生命周期，
         // 关闭文档时一并清理（防 doc_id 复用残留旧原图）。
         let mut raw_cache: HashMap<DocId, Vec<RawEntry>> = HashMap::new();
+        // 网格视图缩略图缓存（**按文档**键控、独立预算 LRU，见 [`GridEntry`]）：与
+        // raw_cache（封面/瓦片原图）、阅读器 THUMB/MID/cover 缓存**完全隔离**——网格是
+        // 桌面背景信道，budget 独立、逐出只动本方条目，绝不挤占/污染阅读器驻留。条目 =
+        // **最终着色** BGRA（`render_grid` 复用 thumb 的着色出口；**仅 CPU 模式**——GPU
+        // 门控下 `finalize_render` 直传 raw/luma、着色在绘制时现算，缓存存的是原图/luma）；
+        // `SetRecolor`/`Close` 时随文档清空（CPU 模式保缓存按当前离线着色、不残留旧色，
+        // 格卡廉价可秒级重渲；GPU 模式清亦无害）。
+        // `last_used` = 全局单调序列号（LRU 裁决只在本文档缓存内比较，全局递增即可）。
+        let mut grid_cache: HashMap<DocId, Vec<GridEntry>> = HashMap::new();
+        let mut grid_seq: u64 = 0;
         // 在途的重着色刷新分帧状态（见 [`PendingRefresh`]）：切档只刷可见集、逐批回传。
         let mut pending_refresh: Option<PendingRefresh> = None;
         // 各文档最近一次**已完成**刷新所用的参数：worker 端同参短路基准（同参不再重复回传）。
@@ -1126,6 +1276,10 @@ impl PdfWorker {
                         let cur = recolor_epoch.get(&doc_id).copied().unwrap_or(0);
                         recolor_epoch.insert(doc_id, cur.max(epoch));
                         recolor.insert(doc_id, params);
+                        // 网格缓存存的是「最终着色」位图（仅 CPU 回退模式；GPU 门控下存
+                        // raw/luma、着色在绘制时现算）：切档即旧色失效 → 整文档清空（格卡
+                        // 廉价可秒级重渲，避免夜/日档切换残留旧色卡；GPU 模式清亦无害）。
+                        grid_cache.remove(&doc_id);
                     }
                     WorkerMsg::RecolorRefresh(doc_id, keys, tx) => {
                         // 圈定可见集 → 挂分帧状态（首轮循环的 4.5 步开始逐批回传）。
@@ -1151,7 +1305,14 @@ impl PdfWorker {
                         zoom_epoch_mirror.insert(doc_id, cur.max(zoom));
                     }
                     other => {
-                        enqueue_msg((n_gen, z_gen, other), &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q)
+                        enqueue_msg(
+                            (n_gen, z_gen, other),
+                            &mut render_q,
+                            &mut mid_q,
+                            &mut thumb_q,
+                            &mut grid_q,
+                            &mut rest_q,
+                        )
                     }
                 }
             }
@@ -1350,6 +1511,8 @@ impl PdfWorker {
                         last_refreshed.remove(&doc_id);
                         // 未着色原图缓存随文档一起清理（释放 CPU 内存，防跨文档残留）。
                         raw_cache.remove(&doc_id);
+                        // 网格视图缩略图缓存随文档一起清理（释放内存、防 doc_id 复用残留）。
+                        grid_cache.remove(&doc_id);
                         // 关闭本应在途的重着色刷新（残留分帧状态会在空 raw 上空转）。
                         if pending_refresh.as_ref().is_some_and(|pr| pr.doc_id == doc_id) {
                             pending_refresh = None;
@@ -1499,6 +1662,126 @@ impl PdfWorker {
                         });
                         let _ = tx.send(result);
                     }
+                    WorkerMsg::MemOpReorder(doc_id, new_order, tx) => {
+                        let result = reorder_edit_mem(&mut stores, fpdf, doc_id, new_order);
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::MemOpBatchDelete(doc_id, pages, tx) => {
+                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                            let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                            // 逐页校验 + 去重（重复项只删一次，不视作错误）。
+                            let mut to_delete: Vec<usize> = Vec::with_capacity(pages.len());
+                            for &p in pages.iter() {
+                                if p >= count {
+                                    return Err(anyhow!("页码越界：批量删除第 {p} 页（共 {count} 页）"));
+                                }
+                                if !to_delete.contains(&p) {
+                                    to_delete.push(p);
+                                }
+                            }
+                            // 保留至少 1 页（对齐单页删除「不能删除仅剩的 1 页」不变式，
+                            // 防产出 0 页文档）。
+                            if to_delete.len() >= count {
+                                return Err(anyhow!("批量删除将删光全部 {count} 页（须保留至少 1 页）"));
+                            }
+                            // 按索引降序循环删除：先删高位，低位下标不受已删高位位移影响
+                            // （升序删会因下标位移错删）。
+                            to_delete.sort_unstable_by(|a, b| b.cmp(a));
+                            for &p in to_delete.iter() {
+                                unsafe { b.FPDFPage_Delete(raw, p as c_int) };
+                            }
+                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                        });
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::ExportPages(doc_id, pages, out, tx) => {
+                        let result = export_pages_to_file(&mut stores, fpdf, doc_id, &pages, &out);
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::SplitToFile(doc_id, (start, end), out, tx) => {
+                        // 拆分 = ① 区间提取落盘 + ② 从当前移除（降序删）。整体复用
+                        // `writeback_edit_mem` 骨架（before/after/count + stores 更新）：
+                        // `written` 由闭包在文件落盘成功后回填，随 `MemOpResult` 一并返回。
+                        let mut written: usize = 0;
+                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                            let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                            // 严格校验：区间有序、端点 < 页数、剩余 ≥1 页（防 0 页文档）。
+                            if start > end {
+                                return Err(anyhow!("拆分区间起点 {start} 不能大于终点 {end}"));
+                            }
+                            if end >= count {
+                                return Err(
+                                    anyhow!("拆分区间越界：{start}..={end}（共 {count} 页）")
+                                );
+                            }
+                            let len = end - start + 1;
+                            if len >= count {
+                                return Err(anyhow!(
+                                    "拆分将移除全部 {count} 页（须保留至少 1 页）"
+                                ));
+                            }
+                            // ① 区间页按原序（升序连续段）提取落盘——先写文件，失败则整个
+                            //    操作失败、当前文档不变（原子写盘，目标文件不受影响）。
+                            let seq: Vec<usize> = (start..=end).collect();
+                            let dst = new_doc_importing_seq(b, raw, &seq)?;
+                            match unsafe { save_raw_doc_to_file(b, dst, &out) } {
+                                Ok(()) => written = seq.len(),
+                                Err(e) => {
+                                    unsafe { b.FPDF_CloseDocument(dst) };
+                                    return Err(e);
+                                }
+                            }
+                            unsafe { b.FPDF_CloseDocument(dst) };
+                            // ② 从当前文档移除该区间：降序删（先删高位，低位下标不受已删
+                            //    高位位移影响——升序删会因下标位移错删）。
+                            let mut idx = end as c_int;
+                            loop {
+                                unsafe { b.FPDFPage_Delete(raw, idx) };
+                                if idx == start as c_int {
+                                    break;
+                                }
+                                idx -= 1;
+                            }
+                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                        });
+                        let _ = tx.send(result.map(|mem| (written, mem)));
+                    }
+                    WorkerMsg::MergeFromBytes(doc_id, src_bytes, tx) => {
+                        // 追加合并复用 `writeback_edit_mem` 骨架（before/after/count + stores
+                        // 更新）：闭包内从**字节消息**解析（view 侧读端已走过大小上界
+                        // `PDF_MERGE_MAX_SRC_BYTES` 与「合并源过大」文案——worker 不再读文件、
+                        // 不再阻塞 pdfium 单工作线程；字节经通道切边，view 侧元数据预检 +
+                        // 有界读盘后才发此消息）+ `FPDF_ImportPages` 追加。解析失败快速 Err 护栏
+                        // （坏字节 → pdfium 快速失败，不 OOM）。
+                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                            let src_raw = unsafe { load_raw_doc(b, &src_bytes)? };
+                            let src_count = unsafe { b.FPDF_GetPageCount(src_raw) } as usize;
+                            if src_count == 0 {
+                                unsafe { b.FPDF_CloseDocument(src_raw) };
+                                return Err(anyhow!("合并源不含任何页面"));
+                            }
+                            let dst_count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                            // 追加：`FPDF_ImportPages` 的 index 是**插入位置**，必须传
+                            // 「目标文档当前页数」才能追加到尾部（传 0 = 插到开头）。
+                            let range = if src_count == 1 {
+                                "1".to_string()
+                            } else {
+                                format!("1-{src_count}")
+                            };
+                            let ok = unsafe {
+                                b.FPDF_ImportPages(raw, src_raw, &range, dst_count as c_int)
+                            };
+                            unsafe { b.FPDF_CloseDocument(src_raw) };
+                            if !b.is_true(ok) {
+                                return Err(anyhow!(
+                                    "合并导入失败（FPDF_GetLastError={}）",
+                                    fpdf_last_error(b)
+                                ));
+                            }
+                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                        });
+                        let _ = tx.send(result);
+                    }
                     WorkerMsg::MemRestoreBytes(doc_id, bytes, tx) => {
                         let result = if stores.contains_key(&doc_id) {
                             stores.insert(doc_id, bytes);
@@ -1507,8 +1790,7 @@ impl PdfWorker {
                             Err(anyhow!("文档 {doc_id} 不存在（无法恢复镜像）"))
                         };
                         let _ = tx.send(result);
-                    }
-                    WorkerMsg::MemGetBytes(doc_id, tx) => {
+                    }                    WorkerMsg::MemGetBytes(doc_id, tx) => {
                         let r = stores.get(&doc_id).cloned();
                         let _ = tx.send(r);
                     }
@@ -1529,6 +1811,53 @@ impl PdfWorker {
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("rest_q 只入 Open/Close/Text/PageImages/ImagePixels/Search/写回/页操作/注释读回"),
+                }
+                continue;
+            }
+            // 3.5) Grid 网格缩略图（背景信道，**最低优先级**）：排序 render > mid > thumb >
+            //      rest > grid——仅当 render/mid/thumb 与 rest 类（Open/Close/Text/Search/
+            //      写回…）均空时才出队，网格洪流绝不阻塞/饿死阅读器任何既有请求（含文档
+            //      开关与文本/检索——rest 类恒先于 grid 出队）。桶内 FIFO + L2.3/Z2 世代
+            //      drop（同 Thumb）。
+            if let Some((n_gen, z_gen, msg)) = grid_q.pop_front() {
+                let doc = match &msg {
+                    WorkerMsg::Grid(d, ..) => Some(*d),
+                    _ => unreachable!("grid_q 只入 Grid"),
+                };
+                // L2.3 + Z2：同 Thumb 的世代/缩放 drop（旧世代网格卡不渲）。
+                if let Some(d) = doc {
+                    let cur = navigate_gen.get(&d).copied().unwrap_or(0);
+                    if n_gen < cur {
+                        continue;
+                    }
+                    let zcur = zoom_epoch_mirror.get(&d).copied().unwrap_or(0);
+                    if z_gen < zcur {
+                        continue;
+                    }
+                }
+                match msg {
+                    WorkerMsg::Grid(doc_id, page, card_width, scale_factor, tx) => {
+                        let p = recolor.get(&doc_id).copied().flatten();
+                        let epoch = recolor_epoch.get(&doc_id).copied().unwrap_or(0); // W1
+                        let gpu = crate::recolor::gpu_recolor_gate();
+                        let doc_grid_cache = grid_cache.entry(doc_id).or_default();
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| {
+                                render_grid(
+                                    doc,
+                                    page,
+                                    card_width * scale_factor.max(1.0),
+                                    p,
+                                    doc_grid_cache,
+                                    &mut grid_seq,
+                                    gpu,
+                                )
+                            })
+                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
+                        let _ = tx.send(result);
+                    }
+                    _ => unreachable!("grid_q 只入 Grid"),
                 }
                 continue;
             }
@@ -1606,6 +1935,8 @@ impl PdfWorker {
                     let cur = recolor_epoch.get(&doc_id).copied().unwrap_or(0);
                     recolor_epoch.insert(doc_id, cur.max(epoch));
                     recolor.insert(doc_id, params);
+                    // 同 sweep：网格缓存存最终着色位图，切档即旧色失效 → 整套清空。
+                    grid_cache.remove(&doc_id);
                 }
                 Ok((_gen, _z, WorkerMsg::RecolorRefresh(doc_id, keys, tx))) => {
                     start_recolor_refresh(
@@ -1628,7 +1959,14 @@ impl PdfWorker {
                     zoom_epoch_mirror.insert(doc_id, cur.max(zoom));
                 }
                 Ok((n_gen, z_gen, msg)) => {
-                    enqueue_msg((n_gen, z_gen, msg), &mut render_q, &mut mid_q, &mut thumb_q, &mut rest_q);
+                    enqueue_msg(
+                        (n_gen, z_gen, msg),
+                        &mut render_q,
+                        &mut mid_q,
+                        &mut thumb_q,
+                        &mut grid_q,
+                        &mut rest_q,
+                    );
                 }
                 Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
             }
@@ -1636,15 +1974,19 @@ impl PdfWorker {
     }
 }
 
-/// 把工作消息按优先级类分桶（render > mid > thumb > rest），桶内保持到达顺序（FIFO）。
-/// 分桶后各桶互不交错：严格类优先级 + 同类 FIFO 与原「单队 + position/remove 扫描」的
-/// 调度语义完全一致，只是每轮取舍从 O(n) 扫描降为 O(1) 取桶头。
+/// 把工作消息按优先级类分桶（render > mid > thumb > rest > grid），桶内保持到达顺序（FIFO）。
+/// 分桶后各桶互不交错：Render/Mid/Thumb/rest 的严格类优先级 + 同类 FIFO 与原「单队 +
+/// position/remove 扫描」的调度语义一致，只是每轮取舍从 O(n) 扫描降为 O(1) 取桶头；
+/// **Grid（网格缩略图）为新增的最低背景信道**（在 rest 之下，仅当 render/mid/thumb/rest
+/// 均空时才被出队，见 run 循环 3.5）——rest 类（Open/Close/Text/Search/写回）的调度
+/// 语义不因 Grid 而改变、恒先于网格卡执行。
 /// `(n_gen, msg)` = L2.2 通道包装（view 发送时打戳 enqueue-n_gen；出队时 render 类按世代 drop）。
 fn enqueue_msg(
     (n_gen, z_gen, msg): (u64, u64, WorkerMsg),
     render_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
     mid_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
     thumb_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
+    grid_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
     rest_q: &mut VecDeque<(u64, u64, WorkerMsg)>,
 ) {
     match msg {
@@ -1653,6 +1995,8 @@ fn enqueue_msg(
         }
         WorkerMsg::Mid(..) => mid_q.push_back((n_gen, z_gen, msg)),
         WorkerMsg::Thumb(..) => thumb_q.push_back((n_gen, z_gen, msg)),
+        // Grid 网格缩略图是**背景信道**：独立桶（优先级 ≤ Thumb），只在更高优先桶空时出队。
+        WorkerMsg::Grid(..) => grid_q.push_back((n_gen, z_gen, msg)),
         _ => rest_q.push_back((n_gen, z_gen, msg)),
     }
 }
@@ -1886,6 +2230,190 @@ fn writeback_edit_mem(
         bindings.FPDF_CloseDocument(raw);
         stores.insert(doc_id, after.clone());
         Ok(MemOpResult { before, after, count })
+    }
+}
+
+/// worker 内「重排页序」专用骨架（[`WorkerMsg::MemOpReorder`]）：新建 raw 文档 → 按新序
+/// 逐段 `FPDF_ImportPages` → 产出新镜像 → 更新 stores。与 [`writeback_edit_mem`] 的区别：
+/// 重排要把「新文档」写回（非原地编辑 `raw`），故走独立函数而非 edit 闭包。
+///
+/// 严格校验（K122/K124）：`new_order` 必须为 0 基**全排列**（长度 == 当前页数、每值 < n、
+/// 0..n 各恰一次）；任何不合法 → 立即 Err，文档不变、无副作用，不提供任何自造超集便利/
+/// 静默容错。生效机制：`FPDF_CreateNewDocument` + 按新序「值连续的升序段」分组、逐段
+/// `FPDF_ImportPages`（pagerange 只能表达升序连续段；任意排列按段序多次 import 追加成
+/// 目标序，例如 0 基 [2,4,1,3] → 1 基段 "3","5","2","4" 逐段 import 成 [2,4,1,3]）——
+/// 与 [`WorkerMsg::ExtractPage`] 同 fps 精度/保真口径（pdfium 重新编码，不做字节级保真）。
+fn reorder_edit_mem(
+    stores: &mut HashMap<DocId, Vec<u8>>,
+    bindings: &dyn PdfiumLibraryBindings,
+    doc_id: DocId,
+    new_order: Vec<usize>,
+) -> Result<MemOpResult> {
+    let before = stores
+        .get(&doc_id)
+        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法内存操作）"))?
+        .clone();
+    unsafe {
+        let raw = load_raw_doc(bindings, &before)?;
+        let count = bindings.FPDF_GetPageCount(raw) as usize;
+        let fail = |bindings: &dyn PdfiumLibraryBindings, raw: FPDF_DOCUMENT, e: anyhow::Error| {
+            bindings.FPDF_CloseDocument(raw);
+            Err(e)
+        };
+        // ① 长度校验
+        if new_order.len() != count {
+            return fail(
+                bindings,
+                raw,
+                anyhow!("重排页序长度应为 {count}（当前页数），实际 {}", new_order.len()),
+            );
+        }
+        // ② 每值 < n 且 0..n 各恰一次（全排列校验：重复或缺失都拒绝）
+        let mut seen = vec![false; count];
+        for &p in new_order.iter() {
+            if p >= count {
+                return fail(
+                    bindings,
+                    raw,
+                    anyhow!("重排页序含越界页 {p}（共 {count} 页）"),
+                );
+            }
+            if seen[p] {
+                return fail(
+                    bindings,
+                    raw,
+                    anyhow!("重排页序含重复页 {p}（须为全排列，0..{count} 各恰一次）"),
+                );
+            }
+            seen[p] = true;
+        }
+        // ③ 建新文档，把校验后的 `new_order` 当目标序交给 `new_doc_importing_seq`（与拆分/
+        // 提取共用同一段「值连续升序段 → 1 基 pagerange → 逐段 append」导入循环，消除重复）。
+        //    `FPDF_ImportPages` 的 `index` 是**插入位置**：导入循环内部传「目标文档当前页数」
+        //    逐段追加（传 0 = 每次插到开头，会把最后一段 prepend 到最前，等于没重排）。
+        let dst = match new_doc_importing_seq(bindings, raw, &new_order) {
+            Ok(d) => d,
+            // `new_doc_importing_seq` 失败时已自行 `FPDF_CloseDocument(dst)` → 只需关闭 raw。
+            Err(e) => return fail(bindings, raw, e),
+        };
+        let after = match save_raw_doc_to_bytes(bindings, dst) {
+            Ok(b) => b,
+            Err(e) => {
+                bindings.FPDF_CloseDocument(dst);
+                return fail(bindings, raw, e);
+            }
+        };
+        bindings.FPDF_CloseDocument(dst);
+        bindings.FPDF_CloseDocument(raw);
+        // 重排只改变页序，总页数不变。
+        let new_count = count;
+        stores.insert(doc_id, after.clone());
+        Ok(MemOpResult { before, after, count: new_count })
+    }
+}
+
+/// 合并源文件的**大小硬上界**（wave7b 输入护栏，K42/K124）：`pub` 供 view 侧
+/// `merge_pdf_file` 读端做「元数据预检 + `Read::take` 真边界」的有界读盘（超限在**读端**
+/// 拦截，绝不把超限字节送进 pdfium worker）；本文件不再在 worker 侧按路径读盘防 `fs::read`
+/// 一次性 OOM。量级对齐同仓图片浏览器的 `DECODE_DISPLAY_MAX_BYTES`（512MB）。
+pub const PDF_MERGE_MAX_SRC_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 按「0 基页数组 `seq`（目标输出序）」把 `raw_src` 的页逐「值连续的升序段」import 追加进
+/// **新建** raw 文档，成功回传新文档句柄（调用方负责 `FPDF_CloseDocument`；失败分支内部已
+/// 关闭）。`seq` 须已校验（逐值 < src 页数、去重、非空）。`FPDF_ImportPages` 的 `index` 是
+/// **插入位置**：必须传「目标文档当前页数」才能逐段追加（传 0 = 每次插到开头，会把最后
+/// 一段 prepend 到最前）——对齐 [`reorder_edit_mem`] 的重排分段姿势。
+fn new_doc_importing_seq(
+    bindings: &dyn PdfiumLibraryBindings,
+    raw_src: FPDF_DOCUMENT,
+    seq: &[usize],
+) -> Result<FPDF_DOCUMENT> {
+    unsafe {
+        let dst = bindings.FPDF_CreateNewDocument();
+        if dst.is_null() {
+            return Err(anyhow!("FPDF_CreateNewDocument 失败"));
+        }
+        let mut ok = true;
+        let mut i = 0usize;
+        let mut dest_count: c_int = 0;
+        while i < seq.len() {
+            let start = seq[i];
+            let mut j = i;
+            while j + 1 < seq.len() && seq[j + 1] == seq[j] + 1 {
+                j += 1;
+            }
+            // pagerange 为 1 基页码串：单页段 "a"，多页连续段 "a-b"（升序连续段，符合
+            // FPDF_ImportPages 的 pagerange 语法）。
+            let start1 = start + 1;
+            let end1 = seq[j] + 1;
+            let range = if start1 == end1 {
+                format!("{start1}")
+            } else {
+                format!("{start1}-{end1}")
+            };
+            let r = bindings.FPDF_ImportPages(dst, raw_src, &range, dest_count);
+            if !bindings.is_true(r) {
+                ok = false;
+                break;
+            }
+            // 段长 = j - i + 1（值连续升序段），已 append 进目标文档。
+            dest_count += (j - i + 1) as c_int;
+            i = j + 1;
+        }
+        if !ok {
+            bindings.FPDF_CloseDocument(dst);
+            return Err(anyhow!("提取导入失败（FPDF_GetLastError={}）", fpdf_last_error(bindings)));
+        }
+        Ok(dst)
+    }
+}
+
+/// worker 内「多页提取到新文件」（[`WorkerMsg::ExportPages`]）：严格校验（每页 < 当前页数、
+/// 去重、非空；非法 → Err）→ 新建 raw 文档按给定序逐段 import → 落盘 `out_path`。
+/// **不改变当前文档 / 不更新 stores**（副本语义）。成功回传写入文件的页数（= 去重后页数）。
+fn export_pages_to_file(
+    stores: &mut HashMap<DocId, Vec<u8>>,
+    bindings: &dyn PdfiumLibraryBindings,
+    doc_id: DocId,
+    pages: &[usize],
+    out: &Path,
+) -> Result<usize> {
+    let bytes = stores
+        .get(&doc_id)
+        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法导出）"))?
+        .clone();
+    unsafe {
+        let raw = load_raw_doc(bindings, &bytes)?;
+        let count = bindings.FPDF_GetPageCount(raw) as usize;
+        let fail = |bindings: &dyn PdfiumLibraryBindings, raw: FPDF_DOCUMENT, e: anyhow::Error| {
+            bindings.FPDF_CloseDocument(raw);
+            Err(e)
+        };
+        // 严格校验（K122/K124）：逐页 < 当前页数、去重（保留首次出现序）、非空。
+        let mut seq: Vec<usize> = Vec::with_capacity(pages.len());
+        for &p in pages.iter() {
+            if p >= count {
+                return fail(
+                    bindings,
+                    raw,
+                    anyhow!("提取页码越界：第 {p} 页（共 {count} 页）"),
+                );
+            }
+            if !seq.contains(&p) {
+                seq.push(p);
+            }
+        }
+        if seq.is_empty() {
+            return fail(bindings, raw, anyhow!("提取页清单为空（须至少 1 页）"));
+        }
+        let dst = match new_doc_importing_seq(bindings, raw, &seq) {
+            Ok(d) => d,
+            Err(e) => return fail(bindings, raw, e),
+        };
+        let res = save_raw_doc_to_file(bindings, dst, out);
+        bindings.FPDF_CloseDocument(dst);
+        bindings.FPDF_CloseDocument(raw);
+        res.map(|()| seq.len())
     }
 }
 
@@ -2629,6 +3157,160 @@ fn render_mid(
         RawKind::Mid,
         gpu,
     )
+}
+
+// ---- 网格视图（Grid 档）缩略图通道（wave2）：按卡宽渲染的独立后台缩略链路 ----
+// 与阅读器 THUMB/MID/raw/cover 缓存**完全隔离**：独立预算 LRU（config::pdf::GRID_CACHE_BYTES）
+// + 背景信道调度（优先级 ≤ Thumb，见 enqueue_msg 与 run 循环 grid_q 段）→ 网格模式绝不
+// 抢/不逐出阅读器驻留。产物与 Thumb 同构（RenderResult，view 直接可画、按页落槽）。
+
+/// 网格缩略图渲染计数探针（测试用）：每次「未命中缓存 → 真调 pdfium 栅格」自增，
+/// 供「同页同分桶二次请求不重栅」的红测断言（命中路径不触碰本计数）。
+static GRID_RENDERS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+fn grid_render_count() -> u64 {
+    GRID_RENDERS.load(Ordering::Relaxed)
+}
+
+/// 网格缩略图缓存条目（**最终着色** BGRA；切档由 run 循环清整文档缓存，见 SetRecolor）。
+/// key = `(page, bucket_px)`；`last_used` 为全局单调序列号（LRU 裁决在本文档缓存内比较）。
+struct GridEntry {
+    page: usize,
+    /// 量化后目标宽（缓存 key 维度；`render_grid` 入口先分桶再查/渲）。
+    bucket_px: u32,
+    /// 实际位图宽（scale clamp 到 ≤1.0 后可能略小于 bucket_px；回落显示用宽）。
+    width: u32,
+    /// 实际位图高（按页纵横比）。
+    height: u32,
+    /// 是否 R8 单通道 luma（同 [`RenderResult::luma`]；view 侧按此选包装路径）。
+    luma: bool,
+    bgra: Vec<u8>,
+    last_used: u64,
+}
+
+impl GridEntry {
+    fn bytes(&self) -> u64 {
+        self.bgra.len() as u64
+    }
+}
+
+/// 目标宽量化分桶：向 [`config::pdf::GRID_BUCKET_PX`] 取整（round，≥1 桶）。同一桶内
+/// 相邻自然宽度共用同一缓存项（resize 抖动/DPI 微差复用），保证 → 渲染/缓存 key 稳定。
+/// 与 `render_scale`/`page_bitmap_size` 的「px = pt × scale」姿势一致——分桶落在 px 侧。
+/// 乘法用 saturating（防御病态超大输入在 debug 整数溢出 panic；`q` 有 f32 round 上限，
+/// 极端 f32 值 cast 后 saturating 兜底到 `u32::MAX`，不会 wrap 成小桶）。
+pub fn grid_bucket_width(target_px: f32) -> u32 {
+    let bucket = config::pdf::GRID_BUCKET_PX.max(1);
+    let b = bucket as f32;
+    let q = (target_px / b).round().max(1.0) as u32;
+    q.saturating_mul(bucket)
+}
+
+/// 网格缓存写入 + 预算逐出（纯函数，渲染与测试共用）：同 key（页 + 分桶宽）已有 →
+/// 更新内容并 bump last_used（返回 `false`，调用方仍用本轮结果作出口）；否则插入并返回
+/// `true`。超预算时回收「最久未用」（最小 last_used）——LRU 天然贴近「距视口中心近的
+/// 先被请求 → 最近被用」的 PREFETCH_COVER 距离语义（远端卡久不用先被逐出）。
+fn grid_cache_insert(cache: &mut Vec<GridEntry>, entry: GridEntry, budget: u64) -> bool {
+    if let Some(e) = cache
+        .iter_mut()
+        .find(|e| e.page == entry.page && e.bucket_px == entry.bucket_px)
+    {
+        *e = entry;
+        grid_cache_evict(cache, budget);
+        return false;
+    }
+    cache.push(entry);
+    grid_cache_evict(cache, budget);
+    true
+}
+
+/// 预算收敛（LRU）：超支时移除最久未用条目，直到回落到预算内；**至少保留 1 条**
+/// （刚写入/最近用者随取随用）。**单条超预算口径**：`bytes > budget` 的单条（病态超大
+/// 卡位图）不逐出自己——预算语义实为「budget 内尽量多驻留 + 恒保 1 条」，单条超预算
+/// 时缓存退化为「该单条独占」而非空缓存（避免「写入即逐出 → 每次请求都重栅」的抖动）。
+/// 网格卡宽有 `scale ≤ 1.0` 与 [`pixel_area_ok`] 面积闸兜底，单条尺寸天然有界，
+/// 无需额外 per-entry 加帽。
+fn grid_cache_evict(cache: &mut Vec<GridEntry>, budget: u64) {
+    let mut over: i64 = cache.iter().map(GridEntry::bytes).sum::<u64>() as i64 - budget as i64;
+    while over > 0 && cache.len() > 1 {
+        let oldest = cache
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(i, _)| i)
+            .expect("cache.len() > 1 保证非空");
+        over -= cache.remove(oldest).bytes() as i64;
+    }
+}
+
+/// 当前网格缓存预算（字节）：生产 = [`config::pdf::GRID_CACHE_BYTES`]（独立于 raw/阅读器
+/// 预算；无需测试覆盖——逐出逻辑由 `grid_cache_insert/evict` 纯函数极小预算直接测）。
+fn grid_cache_budget() -> u64 {
+    config::pdf::GRID_CACHE_BYTES
+}
+
+/// 在工作线程内：按目标卡宽渲染某页的**网格缩略图**（独立缓存 + 背景信道）。
+///
+/// - `target_px` = 目标像素宽（= 目标卡宽逻辑 px × DPI，调用方先乘好）。
+/// - 先量化分桶，命中独立缓存 → 直接回（**不重栅**、只 bump LRU 时间戳）；未命中 →
+///   复用 [`render_page`] 姿势按 `bucket_px / 页宽` 缩放渲染（不同页纵横比 → 高按比例），
+///  产物为与 Thumb 同类型的 `RenderResult`（着色出口 = `RawKind::Thumb` 语义：**不入 raw
+///   缓存**、仅 CPU 模式应用当前重着色；GPU 门控直传 raw/luma、着色在绘制时现算），
+///   随后入独立网格缓存（预算 LRU，切档已清整文档）。
+fn render_grid(
+    doc: &PdfDocument<'_>,
+    page_index: usize,
+    target_px: f32,
+    recolor: Option<RecolorParams>,
+    cache: &mut Vec<GridEntry>,
+    seq: &mut u64,
+    gpu: bool,
+) -> Option<RenderResult> {
+    let bucket_px = grid_bucket_width(target_px);
+    // 命中：返回缓存（最终着色）副本，不触碰 pdfium、不计渲染。
+    if let Some(e) = cache
+        .iter_mut()
+        .find(|e| e.page == page_index && e.bucket_px == bucket_px)
+    {
+        e.last_used = *seq;
+        *seq += 1;
+        return Some(RenderResult {
+            bgra: e.bgra.clone(),
+            width: e.width,
+            height: e.height,
+            recolor_epoch: 0, // W1：由 run 循环按 doc 世代回填
+            luma: e.luma,
+        });
+    }
+    // 未命中：按桶渲染（`&mut vec![]` = 临时空 raw 缓存——`render_page` 对 Thumb 语义
+    // 不入 raw 缓存、不触碰该实参，仅占位口径一致）。
+    let page = doc.pages().get(page_index as i32).ok()?;
+    let pw = page.width().value.max(1.0);
+    let scale = (bucket_px as f32 / pw).clamp(0.1, 1.0);
+    let result = render_page(
+        doc,
+        RenderRequest {
+            page: page_index,
+            scale,
+        },
+        recolor,
+        &mut vec![],
+        RawKind::Thumb,
+        gpu,
+    )?;
+    GRID_RENDERS.fetch_add(1, Ordering::Relaxed);
+    let entry = GridEntry {
+        page: page_index,
+        bucket_px,
+        width: result.width,
+        height: result.height,
+        luma: result.luma,
+        bgra: result.bgra.clone(),
+        last_used: *seq,
+    };
+    *seq += 1;
+    grid_cache_insert(cache, entry, grid_cache_budget());
+    Some(result)
 }
 
 /// 打开文档并取每页 (宽, 高)（PDF 点单位）。dll 路径自动定位（进程级缓存）。
@@ -3539,6 +4221,7 @@ mod tests {
         let mut render_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         let mut mid_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         let mut thumb_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut grid_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         let mut rest_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
         let (tx, _rx) = mpsc::channel::<Option<RenderResult>>();
         let (ttx, _trx) = mpsc::channel::<Option<TileResult>>();
@@ -3549,6 +4232,7 @@ mod tests {
             &mut render_q,
             &mut mid_q,
             &mut thumb_q,
+            &mut grid_q,
             &mut rest_q,
         );
         enqueue_msg(
@@ -3556,6 +4240,7 @@ mod tests {
             &mut render_q,
             &mut mid_q,
             &mut thumb_q,
+            &mut grid_q,
             &mut rest_q,
         );
         assert_eq!(render_q.len(), 2, "Render 与 RenderTile 应同居 render_q");
@@ -3569,6 +4254,200 @@ mod tests {
             "后到的瓦片随后出队"
         );
         assert_eq!(mid_q.len() + thumb_q.len() + rest_q.len(), 0, "其余桶应空");
+    }
+
+    /// 队列分桶断言：Grid 网格缩略图进**独立 grid_q**（背景信道，**最低优先级**）——
+    /// 路由互不交混：render/mid/thumb/rest 各归其桶，grid 在上层全空后才被出队（run 循环
+    /// 3.5 位于 rest 块之后）→ 网格洪流绝不阻塞/饿死阅读器既有请求（含 rest 类文本/检索）。
+    #[test]
+    fn enqueue_msg_keeps_grid_under_rest_in_its_own_background_bucket() {
+        let mut render_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut mid_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut thumb_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut grid_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let mut rest_q: VecDeque<(u64, u64, WorkerMsg)> = VecDeque::new();
+        let (tx, _rx) = mpsc::channel::<Option<RenderResult>>();
+        let (ttx, _trx) = mpsc::channel::<Option<PageText>>();
+        enqueue_msg(
+            (0, 0, WorkerMsg::Grid(1, 3, 280.0, 1.0, tx.clone())),
+            &mut render_q,
+            &mut mid_q,
+            &mut thumb_q,
+            &mut grid_q,
+            &mut rest_q,
+        );
+        enqueue_msg(
+            (0, 0, WorkerMsg::Thumb(1, 4, tx.clone())),
+            &mut render_q,
+            &mut mid_q,
+            &mut thumb_q,
+            &mut grid_q,
+            &mut rest_q,
+        );
+        enqueue_msg(
+            (0, 0, WorkerMsg::Text(1, 5, ttx)),
+            &mut render_q,
+            &mut mid_q,
+            &mut thumb_q,
+            &mut grid_q,
+            &mut rest_q,
+        );
+        assert_eq!(grid_q.len(), 1, "Grid 应入独立 grid_q");
+        assert!(
+            matches!(grid_q.front(), Some((_, _, WorkerMsg::Grid(..)))),
+            "grid_q 应只装 Grid"
+        );
+        assert_eq!(rest_q.len(), 1, "Text(rest) 应入 rest_q 而非 grid_q");
+        assert!(
+            matches!(rest_q.front(), Some((_, _, WorkerMsg::Text(..)))),
+            "rest_q 装 rest 类消息"
+        );
+        assert_eq!(render_q.len() + mid_q.len(), 0, "render/mid 桶应空");
+        // 优先级序 render > mid > thumb > rest > grid：rest 与 grid 分居两桶，run 循环
+        // 恒先出队 rest_q（3.5 网格块位于 rest 块之后）——Text/Search/Open/Close/写回
+        // 永远先于网格卡执行；thumb 独立桶在前。
+        assert!(
+            matches!(thumb_q.pop_front(), Some((_, _, WorkerMsg::Thumb(..)))),
+            "thumb 独立桶 FIFO"
+        );
+        assert!(
+            matches!(rest_q.pop_front(), Some((_, _, WorkerMsg::Text(..)))),
+            "rest 类（Text）应先于网格出队"
+        );
+        assert!(
+            matches!(grid_q.pop_front(), Some((_, _, WorkerMsg::Grid(..)))),
+            "grid 最后出队（最低优先级）"
+        );
+    }
+
+    /// 分桶纯逻辑：相邻目标宽落同一桶（280/300 → 288 命中同项），跨桶边界分桶（310 → 320）。
+    #[test]
+    fn grid_bucket_width_quantizes_adjacent_to_same_bucket() {
+        // GRID_BUCKET_PX=32：280/32=8.75→round=9→288；300/32=9.375→round=9→288 —— 同桶。
+        assert_eq!(grid_bucket_width(280.0), 288);
+        assert_eq!(grid_bucket_width(300.0), 288);
+        // 310/32=9.6875→round=10→320 —— 跨桶边界。
+        assert_eq!(grid_bucket_width(310.0), 320);
+        // 极小目标宽兜底 ≥1 桶（不落 0）。
+        assert_eq!(grid_bucket_width(1.0), 32);
+        // DPI 折现：卡宽 260 × DPI1.5 = 390 → 384（390/32=12.1875→12→384）。
+        assert_eq!(grid_bucket_width(260.0 * 1.5), 384);
+    }
+
+    /// 网格缓存纯逻辑（预算 LRU + key 复用）：同 key（页+分桶宽）写入更新不新增条目；
+    /// 超预算后「最久未用」被逐出、最近用的存活（极小预算直接钉死逐出语义）。
+    #[test]
+    fn grid_cache_insert_budgets_lru_and_reuses_key() {
+        let mut seq = 0u64;
+        let mut cache: Vec<GridEntry> = Vec::new();
+        let mut entry = |page: usize, bucket: u32, w: u32, byte: u8| {
+            seq += 1;
+            GridEntry {
+                page,
+                bucket_px: bucket,
+                width: w,
+                height: w, // 简化为方形（bytes = w*w*4）
+                luma: false,
+                bgra: vec![byte; (w * w * 4) as usize],
+                last_used: seq,
+            }
+        };
+        // 预算 = 3 条（每条约 4 字节：1×1×4）→ 第 4 条写入即超支，LRU 逐出最旧的 0 号。
+        let budget = 12u64;
+        assert!(grid_cache_insert(&mut cache, entry(0, 1, 1, 10), budget));
+        assert!(grid_cache_insert(&mut cache, entry(1, 1, 1, 20), budget));
+        assert!(grid_cache_insert(&mut cache, entry(2, 1, 1, 30), budget));
+        assert!(grid_cache_insert(&mut cache, entry(3, 1, 1, 40), budget));
+        assert_eq!(cache.len(), 3, "超预算应变回 3 条");
+        assert!(
+            !cache.iter().any(|e| e.page == 0),
+            "最久未用（最先写入的 0 号）应被 LRU 逐出"
+        );
+        assert!(
+            cache.iter().any(|e| e.page == 3),
+            "最近写入（3 号）应存活"
+        );
+        // 同 key（页+桶）更新：不新增条目、bump last_used（content 更新）。
+        let before = cache.len();
+        assert!(!grid_cache_insert(&mut cache, entry(3, 1, 1, 99), budget));
+        assert_eq!(cache.len(), before, "同 key 更新不应新增条目");
+        assert!(cache.iter().all(|e| e.page != 0), "0 号已被逐出不复活");
+    }
+
+    /// Grid 档对已知页按目标宽 → 位图宽 == 量化后目标（像素宽由 scale=bucket/pw 推导，
+    /// 位图宽恒等于 bucket_px，见 snapped_bitmap_len 稳定化）、高 == 按页纵横比（±1px 内，
+    /// 期望值由目标页码真实 pt 尺寸推导，非拍脑袋，K177）。
+    #[test]
+    fn grid_render_matches_quantized_width_and_aspect() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let before = grid_render_count();
+        // 页 0 真实 pt 尺寸（PDF 点），目标卡宽 280 逻辑 px、DPI 1.0 → 288 桶。
+        let (pw, ph) = dims[0];
+        assert!(pw > 0.0 && ph > 0.0, "页 0 尺寸应为正");
+        let card_width = 280.0f32;
+        let target_bucket = grid_bucket_width(card_width);
+        let rx = worker.request_grid(doc_id, 0, card_width, 1.0, 0, 0);
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到网格缩略图")
+            .expect("网格渲染应成功");
+        // 宽 == 量化桶（scale=bucket/pw 且 pw*scale==bucket → snapped=round=bucket，精确相等）。
+        assert_eq!(res.width, target_bucket, "位图宽应等于量化后目标宽");
+        // 高 == 按纵横比：ph/pw × bucket，±1px（page_bitmap_size 的 ceil 稳定化误差界）。
+        let expect_h = (ph as f64 / pw as f64) * target_bucket as f64;
+        let diff = (res.height as f64 - expect_h).abs();
+        assert!(diff <= 1.0, "高度应按页纵横比（期望 ~{expect_h:.1}，实际 {}）", res.height);
+        // 像素缓冲尺寸闭合（w*h*4 或 R8 w*h）。
+        let expected_len = if res.luma {
+            (res.width * res.height) as usize
+        } else {
+            (res.width * res.height * 4) as usize
+        };
+        assert_eq!(res.bgra.len(), expected_len, "像素缓冲应按 luma 口径闭合");
+        assert_eq!(grid_render_count(), before + 1, "单次请求应恰好一次栅格");
+    }
+
+    /// 缓存命中：同页**同分桶宽**二次请求不重栅（渲染计数不再 +1，返回相同尺寸项）；
+    /// 相邻目标宽落同桶 → 命中同项；换桶 → 重栅（计数再 +1，缓存 key 含分桶宽）。
+    #[test]
+    fn grid_cache_hits_same_page_bucket_and_rerenders_on_width_change() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let before = grid_render_count();
+        // 第一次：280 → 渲染一次。
+        let rx1 = worker.request_grid(doc_id, 0, 280.0, 1.0, 0, 0);
+        let r1 = rx1.recv_timeout(std::time::Duration::from_secs(30)).expect("第一次应收到").expect("渲染应成功");
+        assert_eq!(grid_render_count(), before + 1, "首次未命中应栅格一次");
+        // 第二次同宽：命中缓存，不重栅。
+        let rx2 = worker.request_grid(doc_id, 0, 280.0, 1.0, 0, 0);
+        let r2 = rx2.recv_timeout(std::time::Duration::from_secs(30)).expect("第二次应收到").expect("渲染应成功");
+        assert_eq!(grid_render_count(), before + 1, "同页同分桶宽二次请求不应重栅");
+        assert_eq!((r2.width, r2.height), (r1.width, r1.height), "命中项尺寸与首渲一致");
+        // 相邻宽落同桶（300 → 288 桶）：仍命中同项，不重栅。
+        let rx3 = worker.request_grid(doc_id, 0, 300.0, 1.0, 0, 0);
+        let r3 = rx3.recv_timeout(std::time::Duration::from_secs(30)).expect("相邻宽应收到").expect("渲染应成功");
+        assert_eq!(grid_render_count(), before + 1, "相邻目标宽落同桶应命中不重栅");
+        assert_eq!((r3.width, r3.height), (r1.width, r1.height), "同桶项尺寸一致");
+        // 换桶（520 → 512 桶）：新桶未缓存 → 重栅一次；尺寸随新桶变。
+        let rx4 = worker.request_grid(doc_id, 0, 520.0, 1.0, 0, 0);
+        let r4 = rx4.recv_timeout(std::time::Duration::from_secs(30)).expect("换桶应收到").expect("渲染应成功");
+        assert_eq!(grid_render_count(), before + 2, "换桶未命中应再栅格一次");
+        assert_eq!(r4.width, grid_bucket_width(520.0), "换桶位图宽应等于新量化桶");
     }
 
     /// DLL 校验（防种植，纯函数）：sha256 对同一字节集恒等、异字节集必异，
@@ -3600,5 +4479,525 @@ mod tests {
         // 长度不同 → 快拒（即使 hash 意外相同也不复用；明显不同 size 免做全量 hash 读）。
         assert!(!pdfium_reuse_decision(len + 1, &good, len, &good), "长度不同应快拒");
         assert!(!pdfium_reuse_decision(1, &good, len, &good), "长度不同应快拒");
+    }
+
+    // ---- 页面网格视图 wave7a：重排 + 批量删除（内存级原语）----
+    //
+    // 客观 oracle（K177：期望值由真实测量推导，非拍脑袋）：
+    // ①「页尺寸序列」：`open_and_dims` 的 dims 即 worker 经 `FPDF_GetPageSizeByIndexF`
+    //    （页树 MediaBox，不加载页对象）量得的各页 (w, h)——重排/批删后新镜像重开再量，
+    //    断言序列等于「原序列按操作映射」后的期望；
+    // ②「逐页渲染像素哈希」：对去 stride 的紧凑 BGRA 缓冲算 FNV-1a，同一内容 → 同哈希、
+    //    异内容 → 异哈希（不同页码内容各异，页数不变 ≠ 重排正确，哈希能抓错序）。
+    // 期望映射均为手工推导（反转 → 位置 i 处为原 n-1-i；删 2/4 → 幸存序 [0,1,3,5,6,7]）。
+
+    /// 渲染第 `page` 页（scale=1.0 全密度）并返回 (宽, 高, FNV-1a 哈希) —— 内容 oracle。
+    fn render_page_probe(worker: &PdfWorker, doc_id: DocId, page: usize) -> (u32, u32, u64) {
+        let rx = worker.request_render(doc_id, RenderRequest { page, scale: 1.0 }, 0, 0);
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到渲染结果")
+            .expect("渲染应成功");
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in &r.bgra {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (r.width, r.height, h)
+    }
+
+    /// 逐页探针：`page..page+count`（不越界 n）的顺序哈希。
+    fn render_page_probes(worker: &PdfWorker, doc_id: DocId, page: usize, n: usize) -> Vec<(u32, u32, u64)> {
+        (0..n).map(|i| render_page_probe(worker, doc_id, page + i)).collect()
+    }
+
+    /// 重排：整体反转后（1）页尺寸序列 = 原逆序（2）最前/最后 2 页渲染哈希 = 原末/首 2 页
+    /// 逆序——「页数不变 ≠ 重排正确」，用双 oracle 抓错序。
+    #[test]
+    fn mem_reorder_reverses_page_sequence_and_content() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[1].clone(); // pdf测试2.pdf：长文多页
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        // 探明原图（FPDF_GetPageSizeByIndexF 量得的 dims 已在 open 回传）。
+        let first2 = render_page_probes(&worker, doc_id, 0, 2);
+        let last2 = render_page_probes(&worker, doc_id, n - 2, 2);
+        // 整体反转排列（0 基全排列）。
+        let mut order: Vec<usize> = (0..n).collect();
+        order.reverse();
+        // 期望：新序列位置 i = 原 n-1-i。
+        let expect_dims: Vec<(f32, f32)> = dims.iter().rev().cloned().collect();
+        let mem = worker.mem_reorder_pages(doc_id, order).expect("重排应成功");
+        assert_eq!(mem.count, n, "重排后页数不变");
+        // 新镜像重开 → 页尺寸序列 oracle。
+        let (_, d2, dims2) = PdfWorker::open_and_dims(mem.after).expect("重排后镜像可打开");
+        assert_eq!(dims2, expect_dims, "重排后页尺寸序列应为原逆序");
+        // 逐页渲染哈希 oracle：新文档最前 2 页 == 原末 2 页逆序；最后 2 页 == 原首 2 页逆序。
+        let new_first2 = render_page_probes(&worker, d2, 0, 2);
+        assert_eq!(new_first2, last2.iter().rev().cloned().collect::<Vec<_>>());
+        let new_last2 = render_page_probes(&worker, d2, n - 2, 2);
+        assert_eq!(new_last2, first2.iter().rev().cloned().collect::<Vec<_>>());
+    }
+
+    /// 重排「整块搬移」（两段值连续的升序段）：后半块整体搬到最前——段式 import 追加的
+    /// 可见断言（若 `FPDF_ImportPages` 的 index 用 0=prepend，结果会变回原序被此断言抓住）。
+    #[test]
+    fn mem_reorder_moves_contiguous_block() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[1].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 6, "夹具页数需 ≥6，实际 {n}");
+        let half = n / 2;
+        // 新序 = [half..n] 块 + [0..half] 块：两段「值连续的升序段」，逐段 import 追加。
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        order.extend(half..n);
+        order.extend(0..half);
+        // 期望 dims = 原 dims 的后半块 + 前半块。
+        let expect_dims: Vec<(f32, f32)> = dims[half..]
+            .iter()
+            .chain(dims[..half].iter())
+            .cloned()
+            .collect();
+        let mem = worker.mem_reorder_pages(doc_id, order).expect("块搬移重排应成功");
+        assert_eq!(mem.count, n, "重排后页数不变");
+        let (_, d2, dims2) = PdfWorker::open_and_dims(mem.after).expect("重排后镜像可打开");
+        assert_eq!(dims2, expect_dims, "块搬移后页尺寸序列 = 原后半块 + 原前半块");
+        // 逐页渲染哈希：新文档最前 2 页 == 原后半块最前 2 页（= 原 half、half+1 页）。
+        let new_first2 = render_page_probes(&worker, d2, 0, 2);
+        let orig_half2 = render_page_probes(&worker, doc_id, half, 2);
+        assert_eq!(new_first2, orig_half2, "块搬移后最前 2 页 = 原后半块最前 2 页");
+    }
+
+    /// 重排 round-trip：X → 反序 → 反序（即原序）后，页尺寸序列 + 逐页渲染哈希 == 原图
+    /// （证重排可逆、无内容损——两次反转回到原序）。
+    #[test]
+    fn mem_reorder_round_trip_restores_content() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[1].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_a, dims_a) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims_a.len();
+        assert!(n >= 3, "夹具页数需 ≥3，实际 {n}");
+        let first3 = render_page_probes(&worker, doc_a, 0, 3);
+        let mut rev: Vec<usize> = (0..n).collect();
+        rev.reverse();
+        // 第一次反转 → 新镜像重开。
+        let m1 = worker.mem_reorder_pages(doc_a, rev.clone()).expect("第一次重排应成功");
+        assert_eq!(m1.count, n);
+        let (_, doc_b, dims_b) = PdfWorker::open_and_dims(m1.after).expect("第一次镜像可打开");
+        assert_eq!(dims_b, dims_a.iter().rev().cloned().collect::<Vec<_>>(), "中间态 = 逆序");
+        // 第二次反转（再反一次 = 回原序）。
+        let m2 = worker.mem_reorder_pages(doc_b, rev.clone()).expect("第二次重排应成功");
+        assert_eq!(m2.count, n);
+        let (_, doc_c, dims_c) = PdfWorker::open_and_dims(m2.after).expect("第二次镜像可打开");
+        assert_eq!(dims_c, dims_a, "两次反转后页尺寸序列应还原原序");
+        // 逐页渲染哈希还原（最前 3 页）。
+        let c_first3 = render_page_probes(&worker, doc_c, 0, 3);
+        assert_eq!(c_first3, first3, "两次反转后最前 3 页渲染哈希应还原为原图");
+    }
+
+    /// 重排非法输入（缺页/超长/越界/重复）→ 立即 Err 且文档不变（stores 镜像原样、无副作用）。
+    #[test]
+    fn mem_reorder_rejects_invalid_permutations() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[1].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 2, "夹具页数需 ≥2，实际 {n}");
+        let before = worker.mem_bytes(doc_id).expect("应取回操作前镜像");
+        // 缺页：长度 < n。
+        let short: Vec<usize> = (0..n - 1).collect();
+        assert!(worker.mem_reorder_pages(doc_id, short).is_err(), "缺页排列应 Err");
+        // 超长：长度 > n。
+        let long: Vec<usize> = (0..=n).collect();
+        assert!(worker.mem_reorder_pages(doc_id, long).is_err(), "超长排列应 Err");
+        // 越界：某值 >= n。
+        let mut oob: Vec<usize> = (0..n).collect();
+        oob[n - 1] = n;
+        assert!(worker.mem_reorder_pages(doc_id, oob).is_err(), "越界页应 Err");
+        // 重复：某值出现两次。
+        let mut dup: Vec<usize> = (0..n).collect();
+        dup[n - 1] = 0;
+        assert!(worker.mem_reorder_pages(doc_id, dup).is_err(), "重复页应 Err");
+        // 全部非法输入后文档不变（stores 镜像未被污染，页数/渲染随之不变）。
+        let after = worker.mem_bytes(doc_id).expect("应取回操作后镜像");
+        assert_eq!(after, before, "非法重排后镜像应原样（文档不变、无副作用）");
+    }
+
+    /// 批量删除 [2,4]（含去重：传 [2,4,2]）→ 页数 n-2、页尺寸序列与渲染哈希 = 原图去
+    /// {2,4} 幸存序（[0,1,3,5,6,7]——降序删防下标位移错删的可见断言）。
+    #[test]
+    fn mem_batch_delete_removes_pages_and_content() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[1].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 8, "夹具页数需 ≥8，实际 {n}");
+        let orig_probes = render_page_probes(&worker, doc_id, 0, 8);
+        // 手工推导期望：删除 0 基 {2,4}（重复 2 应去重只删一次），幸存序 = [0,1,3,5,6,7,...]。
+        let mem = worker
+            .mem_batch_delete_pages(doc_id, vec![2, 4, 2])
+            .expect("批量删除应成功");
+        assert_eq!(mem.count, n - 2, "删除 2 页后页数 = n-2（重复页去重）");
+        let (_, d2, dims2) = PdfWorker::open_and_dims(mem.after).expect("批删后镜像可打开");
+        let expect_dims: Vec<(f32, f32)> = dims
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 2 && *i != 4)
+            .map(|(_, d)| *d)
+            .collect();
+        assert_eq!(dims2, expect_dims, "批删后页尺寸序列应去掉 {{2,4}}");
+        // 渲染哈希：新文档前 6 页 == 原图幸存序 [0,1,3,5,6,7] 的探针。
+        let new_first6 = render_page_probes(&worker, d2, 0, 6);
+        let expect_probes: Vec<(u32, u32, u64)> =
+            [0usize, 1, 3, 5, 6, 7].iter().map(|&i| orig_probes[i]).collect();
+        assert_eq!(new_first6, expect_probes, "批删后前 6 页渲染哈希 = 原图去 {{2,4}} 幸存序");
+    }
+
+    /// 批量删除非法输入（越界 / 删光全部页）→ Err 且文档不变；撤销（`mem_restore_bytes`
+    /// 操作前镜像）→ 页尺寸 + 渲染哈希还原（走既有 undo 链路 —— worker 侧＝快照恢复）。
+    #[test]
+    fn mem_batch_delete_rejects_invalid_and_undo_restores() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[1].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        let first3 = render_page_probes(&worker, doc_id, 0, 3);
+        let before = worker.mem_bytes(doc_id).expect("应取回操作前镜像");
+        // 越界页 → Err。
+        assert!(worker.mem_batch_delete_pages(doc_id, vec![n]).is_err(), "越界页应 Err");
+        // 含越界的混合数组 → Err。
+        assert!(worker.mem_batch_delete_pages(doc_id, vec![0, n, 2]).is_err(), "含越界应 Err");
+        // 删光全部页（去重后 = 全部）→ Err（保留至少 1 页，防 0 页文档）。
+        let all: Vec<usize> = (0..n).collect();
+        assert!(worker.mem_batch_delete_pages(doc_id, all).is_err(), "删光全部页应 Err");
+        assert_eq!(worker.mem_bytes(doc_id), Some(before.clone()), "非法批删后镜像应原样");
+        // 合法批删（删最前 2 页）→ 撤销恢复镜像 → 页尺寸 + 渲染哈希还原。
+        let mem = worker
+            .mem_batch_delete_pages(doc_id, vec![0, 1])
+            .expect("批删应成功");
+        assert_eq!(mem.count, n - 2, "删 2 页后页数 = n-2");
+        worker.mem_restore_bytes(doc_id, mem.before).expect("撤销恢复镜像应成功");
+        let restored = worker.mem_bytes(doc_id).expect("应取回恢复后镜像");
+        let (_, d2, dims2) = PdfWorker::open_and_dims(restored).expect("恢复后镜像可打开");
+        assert_eq!(dims2, dims, "撤销后页尺寸序列应还原");
+        let r_first3 = render_page_probes(&worker, d2, 0, 3);
+        assert_eq!(r_first3, first3, "撤销后前 3 页渲染哈希应还原为原图");
+    }
+
+    // ---- 页面网格视图 wave7b：提取多页 / 拆分区间 / 合并另一 PDF ----
+    //
+    // 客观 oracle（同 wave7a）：「页尺寸序列」（`open_and_dims` 的 dims）+「逐页渲染像素
+    // 哈希」（`render_page_probe`）。期望映射均为手工推导（K177/K143：先写算式再落断言）。
+    // 夹具实测：pdf测试.pdf = 18 页（横向 792×612），pdf测试2.pdf = 259 页（纵向 595.3×841.9）。
+
+    /// wave7b 临时输出路径（pid + 纳秒戳唯一，落系统 temp，勿污染仓库；对齐
+    /// `view::open::tests::wave7b_out` 纳秒戳姿势，消除 pid 复用跨进程撞名的极小概率）。
+    fn wave7b_output(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("pdf-wave7b-{name}-{}-{nanos}.pdf", std::process::id()))
+    }
+
+    /// 提取任意序 + 去重：[2,0,2] → 去重保留首次出现 = [2,0] → 新文件 2 页且尺寸/渲染
+    /// 按 0 基新序对齐源页；原文档不变（副本语义）。
+    #[test]
+    fn export_pages_writes_arbitrary_order_and_dedup() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 3, "夹具页数需 ≥3，实际 {n}");
+        // 原图 oracle：页 0、页 2 渲染哈希（提取结果逐页对齐源页）。
+        let orig0 = render_page_probe(&worker, doc_id, 0);
+        let orig2 = render_page_probe(&worker, doc_id, 2);
+        let out = wave7b_output("export-order");
+        // 期望（算式）：[2,0,2] 去重（保留首次出现序）= [2,0] →
+        //   新文件页数 2、尺寸序列 [dims[2], dims[0]]、渲染 [orig2, orig0]。
+        let written = worker
+            .export_pages_to(doc_id, vec![2, 0, 2], out.clone())
+            .expect("提取应成功");
+        assert_eq!(written, 2, "去重后应写 2 页");
+        let new_bytes = std::fs::read(&out).expect("新文件应存在且可读");
+        let (_, d_new, dims_new) = PdfWorker::open_and_dims(new_bytes).expect("新文件应可打开");
+        let expect_dims = vec![dims[2], dims[0]];
+        assert_eq!(dims_new, expect_dims, "提取后尺寸序列 = 按 0 基新序对齐源页");
+        let probes = render_page_probes(&worker, d_new, 0, 2);
+        assert_eq!(probes, vec![orig2, orig0], "提取后逐页渲染哈希 = 源页按新序对齐");
+        // 副本语义：原文档不变（首页渲染哈希仍一致）。
+        let again0 = render_page_probe(&worker, doc_id, 0);
+        assert_eq!(again0, orig0, "提取不改变当前文档（副本语义）");
+    }
+
+    /// 提取末页：[n-1] → 新文件 1 页且尺寸/渲染 = 源末页。
+    #[test]
+    fn export_pages_single_last_page_matches_source() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 1, "夹具页数需 ≥1，实际 {n}");
+        let last = render_page_probe(&worker, doc_id, n - 1);
+        let out = wave7b_output("export-last");
+        let written = worker
+            .export_pages_to(doc_id, vec![n - 1], out.clone())
+            .expect("提取末页应成功");
+        assert_eq!(written, 1, "单页提取应写 1 页");
+        let new_bytes = std::fs::read(&out).expect("新文件应存在且可读");
+        let (_, d_new, dims_new) = PdfWorker::open_and_dims(new_bytes).expect("新文件应可打开");
+        assert_eq!(dims_new, vec![dims[n - 1]], "末页提取尺寸 = 源末页");
+        let probes = render_page_probes(&worker, d_new, 0, 1);
+        assert_eq!(probes, vec![last], "末页提取渲染 = 源末页");
+    }
+
+    /// 提取非法输入（越界 / 含越界混合 / 空清单）→ Err 且零副作用（不产生文件、当前不变）。
+    #[test]
+    fn export_pages_rejects_invalid_without_side_effect() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 1, "夹具页数需 ≥1，实际 {n}");
+        let before = worker.mem_bytes(doc_id).expect("应取回操作前镜像");
+        let out = wave7b_output("export-invalid");
+        assert!(
+            worker.export_pages_to(doc_id, vec![n], out.clone()).is_err(),
+            "越界提取应 Err"
+        );
+        assert!(
+            worker.export_pages_to(doc_id, vec![0, n], out.clone()).is_err(),
+            "含越界的混合数组应 Err"
+        );
+        assert!(
+            worker.export_pages_to(doc_id, vec![], out.clone()).is_err(),
+            "空清单应 Err"
+        );
+        assert!(!out.exists(), "非法提取不应产生文件: {}", out.display());
+        let after = worker.mem_bytes(doc_id).expect("应取回操作后镜像");
+        assert_eq!(after, before, "非法提取后当前镜像原样（无副作用）");
+    }
+
+    /// 拆分 [1,3] 区间：新文件 = 源区间页原序（3 页）；当前 = 源删 {1,2,3} 幸存序（n-3 页）；
+    /// 撤销恢复操作前镜像 → 回 N 页（新文件仍在）。
+    #[test]
+    fn split_to_file_extracts_range_and_trims_document() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        // 原图 oracle：页 0..3（区间页 + 幸存首页）。
+        let orig0 = render_page_probe(&worker, doc_id, 0);
+        let orig1 = render_page_probe(&worker, doc_id, 1);
+        let orig2 = render_page_probe(&worker, doc_id, 2);
+        let orig3 = render_page_probe(&worker, doc_id, 3);
+        let out = wave7b_output("split-range");
+        let before = worker.mem_bytes(doc_id).expect("应取回操作前镜像");
+        let res = worker.split_to_file(doc_id, (1, 3), out.clone()).expect("拆分应成功");
+        // 算式：区间长 = 3 - 1 + 1 = 3 → 新文件 3 页；剩余 = n - 3 页。
+        assert_eq!(res.0, 3, "新文件页数 = 区间长");
+        assert_eq!(res.1.count, n - 3, "当前剩余页数 = n-3");
+        // ① 新文件：区间页按原序（0 基 1..3），尺寸 + 渲染逐页对齐源。
+        let new_bytes = std::fs::read(&out).expect("新文件应存在且可读");
+        let (_, d_new, dims_new) = PdfWorker::open_and_dims(new_bytes).expect("新文件应可打开");
+        let expect_dims_new: Vec<(f32, f32)> = dims[1..=3].to_vec();
+        assert_eq!(dims_new, expect_dims_new, "新文件尺寸 = 源区间原序");
+        let new_probes = render_page_probes(&worker, d_new, 0, 3);
+        assert_eq!(new_probes, vec![orig1, orig2, orig3], "新文件逐页渲染 = 源区间页");
+        // ② 当前文档：尺寸 = 源删 {1,2,3} 幸存序；首页渲染仍为源页 0。
+        let (_, d_cur, dims_cur) = PdfWorker::open_and_dims(res.1.after.clone()).expect("当前镜像可打开");
+        let expect_dims_cur: Vec<(f32, f32)> = dims
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 2 && *i != 3)
+            .map(|(_, d)| *d)
+            .collect();
+        assert_eq!(dims_cur, expect_dims_cur, "当前页尺寸 = 源删 {{1,2,3}} 幸存序");
+        let cur0 = render_page_probe(&worker, d_cur, 0);
+        assert_eq!(cur0, orig0, "当前首页渲染 = 源页 0");
+        // 撤销拆分：恢复操作前镜像 → 当前回 N 页（区间移除部分回位），新文件仍在。
+        worker.mem_restore_bytes(doc_id, res.1.before).expect("撤销恢复应成功");
+        let restored = worker.mem_bytes(doc_id).expect("应取回恢复后镜像");
+        let (_, _d_r, dims_r) =
+            PdfWorker::open_and_dims(restored.clone()).expect("恢复后镜像可打开");
+        assert_eq!(dims_r, dims, "撤销后页尺寸序列还原");
+        assert_eq!(restored, before, "撤销后镜像 == 拆分前");
+        assert!(out.exists(), "撤销后新文件仍存在: {}", out.display());
+    }
+
+    /// 拆分非法输入（start>end / 终点越界 / 覆盖全部页）→ Err 且零副作用（不产生文件、当前不变）。
+    #[test]
+    fn split_to_file_rejects_invalid_without_side_effect() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 2, "夹具页数需 ≥2，实际 {n}");
+        let before = worker.mem_bytes(doc_id).expect("应取回操作前镜像");
+        let out = wave7b_output("split-invalid");
+        assert!(
+            worker.split_to_file(doc_id, (2, 1), out.clone()).is_err(),
+            "start>end 应 Err"
+        );
+        assert!(
+            worker.split_to_file(doc_id, (0, n), out.clone()).is_err(),
+            "终点越界应 Err"
+        );
+        // 覆盖全部页（剩余 0 页）→ Err（防 0 页文档，对齐批删保留 ≥1 页不变式）。
+        assert!(
+            worker.split_to_file(doc_id, (0, n - 1), out.clone()).is_err(),
+            "删光全部页应 Err"
+        );
+        assert!(!out.exists(), "非法拆分不应产生文件: {}", out.display());
+        let after = worker.mem_bytes(doc_id).expect("应取回操作后镜像");
+        assert_eq!(after, before, "非法拆分后当前镜像原样（无副作用）");
+    }
+
+    /// 合并：当前 N 页 + 合并源（pdf测试2.pdf，m 页）→ 总页 N+m、前 N 页尺寸 = 原、
+    /// 合并字节（读端已走大小上界）追加：合并后总页数 = n+m、前 n 页尺寸 = 原、
+    /// 尾部 m 页尺寸 = 合并源、尾部前 2 页渲染哈希 = 源2 各页；撤销 → 回 N 页且镜像还原。
+    #[test]
+    fn merge_from_bytes_appends_and_undo_restores() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let cur_p = target_pdf_paths()[0].clone(); // pdf测试.pdf：当前文档
+        let src_p = target_pdf_paths()[1].clone(); // pdf测试2.pdf：合并源
+        assert!(cur_p.exists() && src_p.exists(), "两夹具应存在");
+        let bytes = std::fs::read(&cur_p).expect("读取当前 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 1, "夹具页数需 ≥1，实际 {n}");
+        let orig_first2 = render_page_probes(&worker, doc_id, 0, 2);
+        let before = worker.mem_bytes(doc_id).expect("应取回操作前镜像");
+        // 合并源：打开一次复用（d_src 供渲染基准、src_dims 供尺寸断言）。
+        let (_, d_src, src_dims) = {
+            let src_bytes = std::fs::read(&src_p).expect("读取合并源应成功");
+            PdfWorker::open_and_dims(src_bytes).expect("合并源应可打开")
+        };
+        let m = src_dims.len();
+        assert!(m >= 2, "合并源页数需 ≥2（尾部 2 页断言），实际 {m}");
+        let src_first2 = render_page_probes(&worker, d_src, 0, 2);
+        // 新消息形状：view 侧读字节 → `merge_from_bytes`（worker 不再读文件）。
+        let src_bytes = std::fs::read(&src_p).expect("读取合并源字节应成功");
+        let mem = worker
+            .merge_from_bytes(doc_id, src_bytes)
+            .expect("合并应成功");
+        // 算式：合并后总页数 = n（当前）+ m（源全页）。
+        assert_eq!(mem.count, n + m, "合并后总页数 = n+m");
+        let (_, d_merged, all_dims) =
+            PdfWorker::open_and_dims(mem.after.clone()).expect("合并后镜像可打开");
+        assert_eq!(all_dims[..n].to_vec(), dims, "合并后前 n 页尺寸 = 原");
+        assert_eq!(all_dims[n..].to_vec(), src_dims, "合并后尾部 m 页 = 源2 各页");
+        let merged_tail2 = render_page_probes(&worker, d_merged, n, 2);
+        assert_eq!(merged_tail2, src_first2, "合并后尾部 2 页渲染 = 源2 各页");
+        // 撤销：恢复操作前镜像 → 回 n 页、前 2 页渲染还原、镜像 == 合并前。
+        worker.mem_restore_bytes(doc_id, mem.before).expect("撤销应成功");
+        let restored = worker.mem_bytes(doc_id).expect("应取回恢复后镜像");
+        let (_, d_r, dims_r) =
+            PdfWorker::open_and_dims(restored.clone()).expect("恢复后镜像可打开");
+        assert_eq!(dims_r, dims, "撤销后页尺寸还原");
+        let r_first2 = render_page_probes(&worker, d_r, 0, 2);
+        assert_eq!(r_first2, orig_first2, "撤销后前 2 页渲染还原");
+        assert_eq!(restored, before, "撤销后镜像 == 合并前");
+    }
+
+    /// 合并**坏字节**（损坏非 PDF / 空字节）→ Err 且当前文档不变（零副作用）。「合并源
+    /// 不存在」的路径已在 view 侧（读端 `File::open` → `last_modify_error`）拦截，worker
+    /// 只收「已走读端大小上界的字节」，故本侧不再测路径缺失。
+    #[test]
+    fn merge_from_bytes_rejects_bad_bytes_and_keeps_doc() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 1, "夹具页数需 ≥1，实际 {n}");
+        let before = worker.mem_bytes(doc_id).expect("应取回操作前镜像");
+        // 损坏字节（非 PDF，解析护栏快速 Err）→ Err。
+        assert!(
+            worker.merge_from_bytes(doc_id, b"this is not a pdf at all".to_vec()).is_err(),
+            "损坏字节应 Err"
+        );
+        // 空字节（无页面）→ Err（0 页拒绝 / 解析失败）。
+        assert!(
+            worker.merge_from_bytes(doc_id, Vec::new()).is_err(),
+            "空字节源应 Err"
+        );
+        // 当前文档不变（stores 镜像原样）。
+        let after = worker.mem_bytes(doc_id).expect("应取回操作后镜像");
+        assert_eq!(after, before, "非法合并后当前镜像原样（无副作用）");
     }
 }

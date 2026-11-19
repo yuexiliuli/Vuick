@@ -155,6 +155,23 @@ pub const PRE_FETCH_COVER_INFLIGHT: usize = 2;
 pub const PREFETCH_COVER_BUDGET_BYTES: u64 = 40 * 1024 * 1024;
 /// 走廊窗口：可见页两侧各外扩的页数（idle 期间预取 [vis±2]，覆盖高速平移一两次大跳）。
 pub const PREFETCH_COVER_MARGIN: usize = 2;
+// ---- 网格视图（Grid 档）缩略图通道（wave2）：按卡宽渲染的独立后台缩略链路。
+// 与 L0/L0.5（THUMB/MID）、raw、封面、瓦片缓存**完全隔离**：预算 LRU 独立、调度为
+// 背景信道（优先级 ≤ thumb）→ 网格模式绝不抢/不逐出阅读器驻留（见 parser 的 Grid 档）----
+/// 网格缩略图目标宽量化分桶（px）：请求卡宽（逻辑 px）× DPI 得到的目标像素宽向本值
+/// 取整成桶，同一桶共用同一缓存项——网格卡 resize/滚动重排出的相邻自然宽度落同桶 →
+/// 缓存命中复用、不重栅。取 32：网格卡宽 ~150-600px、±16px 粒度视觉无差，又避免每
+/// px 一档把缓存 key 打散（32× 减少 resize 抖动，对应「px = pt × scale」中 px 侧量化）。
+pub const GRID_BUCKET_PX: u32 = 32;
+/// 网格缩略图缓存字节预算（worker 侧独立预算 LRU）：每张 ~0.3-1.5MB RGBA（卡宽
+/// 200-600px、A4 纵横比），32MB ≈ 20-100 张卡 = 覆盖 4K 网格视口一屏到两屏。网格卡
+/// 滚动重用率高（同页同桶命中不重栅），预算不长驻、滚出后旧卡 LRU 逐出；与阅读器
+/// THUMB/MID/raw/cover 缓存互不共享、互不逐出（后台信道独立护栏，绝不干扰阅读器驻留）。
+pub const GRID_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// 网格缩略图**每帧**最多新派发数（view 侧跨帧预算，对齐 [`PRE_FETCH_COVER_INFLIGHT`]=2）：
+/// 网格是背景信道（优先级 ≤ thumb），单帧只派少量、空闲期消化，不洪起 worker 队列、
+/// 不抢阅读器栅格化带宽（本任务只落地常量；view 侧 wave3 消费按本值限量派发）。
+pub const GRID_PREFETCH_INFLIGHT: usize = 2;
 // ---- L1 滚动条快速跨页跳（直接送达落点，消灭拖完等救援的空白窗）----
 /// 大跳判定阈值（页数，L1.1）：`ensure_window` 每帧比较当前可见中心页与上帧可见中心页，
 /// 位移超过本值（MARGIN=3 + 走廊 ±2 已够不到的 6-8 页量级）即判定「大跳」→ 置 `jump_armed`

@@ -556,6 +556,212 @@ pub fn column_left(wrap_w: f32, page_width: f32) -> f32 {
     ((wrap_w - page_width) / 2.0).max(0.0)
 }
 
+// ---- 网格视图（Grid）几何：页卡网格布局的纯函数（与页列视图同源数学，便于单测）----
+
+/// 网格视图的页卡布局结果（不可变纯数据，与页列视图的 `tops` 缓存姿态一致）。
+///
+/// 坐标系与页列视图一致：内容原点 = 左上角、Y 轴向下为正；`padding` 为网格四周外留白。
+/// `row_top`/`row_page_start`/`cell_h` 为一次性算好的直读缓存，命中/可见行/卡片矩形
+/// 全靠本结构推导，不与 DOM/view 再各算一遍——保证滚动位置、命中判定与卡片实际放置
+/// 严格一致（`row_index_at_y`/`col_slot_at_x` 原语与 `cell_rect` 用同一套加法，view 侧插入
+/// 位 `compute_insert_index` 也基于这两个原语，不再重复手写二分/pitch 几何）。
+#[derive(Clone, Debug)]
+pub struct GridLayout {
+    /// 列数（`cols = max(1, floor((viewport_width − 2·padding + gap) / (card_width + gap)))`）。
+    pub cols: usize,
+    /// 行数（`ceil(pages.len()/cols)`；0 页时 = 0）。
+    pub rows: usize,
+    /// 实际卡宽（**跟随请求卡宽**，缩放精调连续感知）：正常 = 请求卡宽 `card_width`
+    /// （cols≥2 时 floor 已保证整行放得下 `cols·card_w + (cols−1)·g ≤ vw − 2p`，行尾
+    /// 余量右侧留白）；唯一例外 = 单列且请求卡宽超内容区（`viewport_width − 2·padding`）
+    /// 时夹到内容区宽，防横向溢出。
+    pub cell_w: f32,
+    /// 卡间距（行内列间与行间共用）。
+    pub gap: f32,
+    /// 网格四周外留白。
+    pub padding: f32,
+    /// 每行顶 y（含外 `padding`；`len = rows`，严格递增）。行高 = 该行内最大 `cell_h`。
+    pub row_top: Vec<f32>,
+    /// 每行起始页下标（`len = rows + 1`，末项 = 总页数）。
+    pub row_page_start: Vec<usize>,
+    /// 每页卡高（保持页纵横比，`cell_h[i] = cell_w·(页高/页宽)`；`len = pages`）。
+    pub cell_h: Vec<f32>,
+    /// 网格总高（上/下外 `padding` + 各行高与行间 `gap`）。
+    pub total_height: f32,
+}
+
+/// 计算网格视图布局（纯函数，与 [`compute_layout`] 同姿势）：`pages` 为每页 `(宽, 高)` pt
+/// 尺寸，`card_width` 为请求卡宽。**新语义「卡宽跟随请求」**：实际 `cell_w` = 请求卡宽
+/// （不再按填满视口反推）——Ctrl+滚轮缩放精调时，卡宽每步都连续变化、缩放逐档可感知，
+/// 同列数区间内卡大小不再被冻结；行尾放不下时右侧留白（多余空间不再摊给卡）。
+///
+/// - 列数 = 能并排几列：`cols = max(1, floor((vw − 2·padding + gap) / (card_width + gap)))`；
+/// - `cell_w` = `card_width`，唯一例外 = 单列且 `card_width` > 内容区（`vw − 2·padding`）
+///   时夹到内容区宽（单卡填视口、防横向溢出）；窄视口（内容区 < 0）夹到 ≥0 防负宽退化；
+/// - `cell_h` 保持各页纵横比（`宽 ≤ 0` 时按比例 1 处理，与 [`display_height`] 同源）；
+/// - 行内页从左到右填满 `cols` 后换行，最后一行可不填满（部分行）；行高 = 该行最大卡高；
+/// - 0 页 → `rows = 0`、`row_top`/`row_page_start` 空、`total_height = 0`（调用方按空布局处理）。
+pub fn grid_layout(
+    pages: &[(f32, f32)],
+    card_width: f32,
+    gap: f32,
+    padding: f32,
+    viewport_width: f32,
+) -> GridLayout {
+    // cols：能并排几列（分子 +gap 是「末列之后不留 gap」的放置会计，分母 = 卡宽 + 列间 gap）。
+    let denom = card_width + gap;
+    let cols = if denom > 0.0 {
+        (((viewport_width - 2.0 * padding + gap) / denom).floor()).max(1.0) as usize
+    } else {
+        1
+    };
+    // cell_w：新语义 = 跟随请求卡宽 `card_width`（floor 已在 cols ≥ 1 时保证
+    // `cols·card_w + (cols−1)·g ≤ vw − 2p`，整行放得下、行尾余量留白）；唯一例外 =
+    // cols 被夹到 1 且请求卡宽超内容区（vw − 2p）→ 单卡填视口防横向溢出；窄视口
+    // （vw − 2p < 0）夹到 ≥0 防负宽退化、无除零。
+    let content_w = (viewport_width - 2.0 * padding).max(0.0);
+    let cell_w = if cols <= 1 {
+        card_width.min(content_w).max(0.0)
+    } else {
+        card_width.max(0.0)
+    };
+    let n = pages.len();
+    let rows = n.div_ceil(cols);
+
+    // 每页卡高：保持纵横比（`cell_h[i] = cell_w × (高/宽)`；宽 ≤ 0 按比例 1）。
+    let cell_h: Vec<f32> = pages
+        .iter()
+        .map(|(w, h)| if *w > 0.0 { cell_w * (h / w) } else { cell_w })
+        .collect();
+
+    // row_page_start[r] = 第 r 行首张页下标（r = rows 时为总页数 n）。
+    let row_page_start: Vec<usize> = (0..=rows).map(|r| (r * cols).min(n)).collect();
+
+    // row_top：从 padding 起逐行累加「行高 + gap」（行高 = 该行内最大 cell_h）。
+    let mut row_top = Vec::with_capacity(rows);
+    let mut y = padding;
+    for r in 0..rows {
+        row_top.push(y);
+        let s = row_page_start[r];
+        let e = row_page_start[r + 1];
+        let row_h = cell_h[s..e].iter().copied().fold(0.0f32, f32::max);
+        y += row_h + gap;
+    }
+    // total_height = padding + Σ行高 + (rows−1)·gap + padding（去掉循环尾部多计的 gap）。
+    let total_height = if rows == 0 { 0.0 } else { y - gap + padding };
+
+    GridLayout {
+        cols,
+        rows,
+        cell_w,
+        gap,
+        padding,
+        row_top,
+        row_page_start,
+        cell_h,
+        total_height,
+    }
+}
+
+impl GridLayout {
+    /// 第 `r` 行的行高 = 该行内最大卡高（派生值，不入字段保持结构最小）。
+    fn row_height(&self, r: usize) -> f32 {
+        let s = self.row_page_start[r];
+        let e = self.row_page_start[r + 1];
+        self.cell_h[s..e].iter().copied().fold(0.0f32, f32::max)
+    }
+
+    /// 第 `i` 页卡的放置矩形 `(x, y, w, h)`（内容坐标系，见 [`GridLayout`]）；越界 → `None`。
+    /// `x = padding + (i % cols)·(cell_w + gap)`，`y = row_top[i / cols]`，宽 `cell_w`、高 `cell_h[i]`。
+    pub fn cell_rect(&self, i: usize) -> Option<(f32, f32, f32, f32)> {
+        if i >= self.cell_h.len() || self.cols == 0 {
+            return None;
+        }
+        let r = i / self.cols;
+        if r >= self.rows {
+            return None;
+        }
+        let c = i % self.cols;
+        let x = self.padding + c as f32 * (self.cell_w + self.gap);
+        let y = self.row_top[r];
+        Some((x, y, self.cell_w, self.cell_h[i]))
+    }
+
+    /// 可见行区间（含端点，闭区间）：视口 `[offset, offset + viewport_h]` 命中的所有行，
+    /// 二分行顶直读缓存 O(log rows)，与 [`keep_window`] 同姿势；0 行或视口完全落在内容
+    /// 之外（上/下/悬在行间 gap 里）→ `None`。`viewport_h ≤ 1` 回退默认 720（首帧前口径）。
+    pub fn first_visible_grid_row(&self, offset: f32, viewport_h: f32) -> Option<(usize, usize)> {
+        if self.rows == 0 {
+            return None;
+        }
+        let vh = if viewport_h > 1.0 { viewport_h } else { 720.0 };
+        let top = offset.max(0.0);
+        let bottom = top + vh;
+
+        // 首行 = 第一个「行底 > 视口顶」的行（`row_top` 严格递增 → 行底单调，可二分）。
+        let mut lo = 0usize;
+        let mut hi = self.rows;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.row_top[mid] + self.row_height(mid) <= top {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == self.rows {
+            return None; // 已滚过末行：视口完全在内容之下
+        }
+        let first = lo;
+
+        // 末行 = 最后一个「行顶 < 视口底」的行。
+        let mut lo = 0usize;
+        let mut hi = self.rows;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.row_top[mid] < bottom {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 || lo - 1 < first {
+            return None; // 视口完全在内容之上，或仅悬在行间 gap 里（无任何行相交）
+        }
+        Some((first, lo - 1))
+    }
+
+    /// **行二分原语**：最后一个「行顶 ≤ y」的行下标（`row_top` 严格递增可二分；0 行 → 0）。
+    /// 供 2D 命中 / 插入位实现共用同一套行几何（view 侧 `compute_insert_index` 与既有
+    /// 命中语义都基于本原语，不再在 view 侧重复手写行二分）。调用方按需自行判定
+    /// padding / 行间 gap 的语义（本原语只回答「y 属于哪一行」）。
+    pub fn row_index_at_y(&self, y: f32) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.rows;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.row_top[mid] <= y {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo.saturating_sub(1)
+    }
+
+    /// **列槽原语**：由内容 x 算整数列槽 `round((x − padding) / (cell_w + gap))`（≥0；
+    /// 退化视口 pitch ≤ 0 → 0）。`round` 语义 = 卡左半/右半、列间 gap、右留白都归到最近
+    /// 整数槽（gap 中点即阈值）。供 2D 命中 / 插入位实现共用同一套列 pitch 几何（view 侧
+    /// `compute_insert_index` 与既有命中语义都基于本原语）。
+    pub fn col_slot_at_x(&self, x: f32) -> usize {
+        let pitch = self.cell_w + self.gap;
+        if pitch <= 0.0 {
+            return 0; // 退化视口（卡宽 0）无法按列定位
+        }
+        (((x - self.padding) / pitch).round().max(0.0)) as usize
+    }
+}
+
 /// 内容列坐标 (cx, cy) → (页号, 页内局部 x, 页内局部 y)。
 ///
 /// - `cx/cy` 为**页列空间**坐标（wrap 内减去 [`column_left`] 后的列偏移；无需关心滚动
@@ -1889,5 +2095,272 @@ mod tests {
         // u32 天文尺寸走 saturating，不 panic 且结果在闸内。
         let (w3, h3) = budget_clamped_dims(u32::MAX, u32::MAX).expect("u32 天文应缩档");
         assert!(pixel_area_ok(w3, h3), "缩档后 {w3}×{h3} 应 ≤ 预算");
+    }
+
+    // ---- 网格视图（GridLayout）测试 ----
+
+    const GRID_SQRT2: f32 = 1.414_213_56; // √2 ≈ 1.41421356（测试用竖版页纵横比）
+
+    /// 测试用固定参数：卡宽 40、gap 8、padding 8、viewport 140（见 grid_layout 手算注释）。
+    fn grid_3pages() -> GridLayout {
+        grid_layout(&[(1.0, GRID_SQRT2); 3], 40.0, 8.0, 8.0, 140.0)
+    }
+
+    /// 用例 A：3 页全竖版（1×√2）、卡宽 40、gap 8、padding 8、viewport 140。
+    ///
+    /// 手算（新语义「卡宽跟随请求」）：
+    /// - cols = floor((140 − 2×8 + 8) / (40 + 8)) = floor(132/48) = 2；
+    /// - rows = ceil(3/2) = 2；
+    /// - cell_w = 请求卡宽 40（不再按填满反算 58）；
+    /// - cell_h[i] = 40 × √2 ≈ 56.569；行 0/1 各含页，行高 = max = 56.569；
+    /// - row_top = [8, 8 + 56.569 + 8 = 72.569]；
+    /// - total = 8 + 56.569 + 56.569 + (2−1)×8 + 8 = 137.137。
+    #[test]
+    fn grid_layout_multiple_rows_hand_computed() {
+        let g = grid_3pages();
+        assert_eq!(g.cols, 2, "cols 手算应 2");
+        assert_eq!(g.rows, 2, "rows 手算应 2");
+        assert!((g.cell_w - 40.0).abs() < 0.01, "cell_w 手算应 40（跟随请求）: {}", g.cell_w);
+        assert_eq!(g.row_page_start, vec![0, 2, 3], "行起始页表 = [0,2,3]");
+        assert_eq!(g.row_top.len(), 2);
+        assert!((g.row_top[0] - 8.0).abs() < 0.01, "行 0 顶 = padding 8");
+        // 行 1 顶 = 8 + 56.569 + 8 = 72.569
+        assert!(
+            (g.row_top[1] - 72.569).abs() < 0.01,
+            "行 1 顶手算 ≈72.569: {}",
+            g.row_top[1]
+        );
+        // total = 8 + 56.569×2 + (2−1)×8 + 8 = 137.137
+        assert!(
+            (g.total_height - 137.137).abs() < 0.01,
+            "总高手算 ≈137.137: {}",
+            g.total_height
+        );
+        // cell_h 保持纵横比：= 40 × √2 ≈ 56.569
+        for (i, h) in g.cell_h.iter().enumerate() {
+            assert!((h - 56.569).abs() < 0.01, "页 {} 卡高 ≈56.569: {}", i, h);
+        }
+    }
+
+    /// 用例 B：`cell_rect` 对每页手算 x/y/w/h 精确断言。
+    ///
+    /// 手算（同用例 A 布局，pitch = cell_w + gap = 48）：
+    /// - 页 0：x = 8 + 0×48 = 8，y = row_top[0] = 8，w = 40，h ≈ 56.569；
+    /// - 页 1：x = 8 + 1×48 = 56，y = 8，w = 40，h ≈ 56.569；
+    /// - 页 2：x = 8（第 2 行第 0 列），y = 8 + 56.569 + 8 = 72.569，w = 40，h ≈ 56.569。
+    #[test]
+    fn grid_cell_rect_per_page_hand_computed() {
+        let g = grid_3pages();
+        let (x0, y0, w0, h0) = g.cell_rect(0).expect("页 0 应有卡");
+        assert!((x0 - 8.0).abs() < 0.01 && (y0 - 8.0).abs() < 0.01, "页 0 左上 = (padding, padding) = (8,8)");
+        assert!((w0 - 40.0).abs() < 0.01 && (h0 - 56.569).abs() < 0.01, "页 0 宽高 = (40, ≈56.569)");
+        let (x1, y1, w1, h1) = g.cell_rect(1).expect("页 1 应有卡");
+        // 卡 i=1：x = 8 + 1×(40+8) = 56
+        assert!((x1 - 56.0).abs() < 0.01 && (y1 - 8.0).abs() < 0.01, "页 1 左上 = (56, 8)");
+        assert!((w1 - 40.0).abs() < 0.01 && (h1 - 56.569).abs() < 0.01, "页 1 宽高 = (40, ≈56.569)");
+        let (x2, y2, _w2, h2) = g.cell_rect(2).expect("页 2 应有卡");
+        // 卡 i=2：x = 8 + 0×48 = 8，y = row_top[1] = 72.569
+        assert!((x2 - 8.0).abs() < 0.01 && (y2 - 72.569).abs() < 0.01, "页 2 左上 = (8, ≈72.569)");
+        assert!((h2 - 56.569).abs() < 0.01, "页 2 卡高 ≈56.569");
+        // 越界：i ≥ pages → None
+        assert!(g.cell_rect(3).is_none(), "页 3 越界应 None");
+    }
+
+    /// 用例 C：`first_visible_grid_row` 具体 offset/viewport 手算断言（行 0 中途 / 整行 /
+    /// 完全在总高外 / 完全在内容之上 / 悬在行间 gap）。
+    ///
+    /// 手算（同用例 A 布局）：行 0 纵跨 [8, 64.569]、行 1 纵跨 [72.569, 129.137]、总高 137.137。
+    #[test]
+    fn grid_first_visible_row_cases() {
+        let g = grid_3pages();
+        // 从行 0 中途：offset = 8 + 40 = 48（行 0 中部）、viewport 100 → 视口 [48, 148] 同时
+        // 压住行 0（底 64.569 > 48）与行 1（顶 72.569 < 148）→ (0, 1)。
+        assert_eq!(
+            g.first_visible_grid_row(8.0 + 40.0, 100.0),
+            Some((0, 1)),
+            "行 0 中途 + 100 高视口应命中两行"
+        );
+        // 只命中行 1：offset = 72.569（行 1 顶）、viewport 50 → 视口 [72.569, 122.569]
+        // 首行为行 1（行 0 底 64.569 ≤ 72.569）、末行为行 1 → (1, 1)。
+        assert_eq!(
+            g.first_visible_grid_row(g.row_top[1], 50.0),
+            Some((1, 1)),
+            "贴行 1 顶应只命中行 1"
+        );
+        // 完全在总高外（下方）：offset = 137.137 + 10 = 147.137 → 无行底 > 视口顶 → None。
+        assert_eq!(
+            g.first_visible_grid_row(g.total_height + 10.0, 100.0),
+            None,
+            "视口完全在内容之下应 None"
+        );
+        // 完全在内容之上：offset = −500、viewport 4（>1 不走默认回退）→ 视口 [0, 4] < 行 0 顶 8 → None。
+        assert_eq!(
+            g.first_visible_grid_row(-500.0, 4.0),
+            None,
+            "视口完全在内容之上应 None"
+        );
+        // 悬在行间 gap：offset = 68（行 0 底 64.569 与行 1 顶 72.569 之间）、viewport 2 →
+        // 视口 [68, 70] 不与任何行相交 → None。
+        assert_eq!(
+            g.first_visible_grid_row(68.0, 2.0),
+            None,
+            "视口悬在行间 gap 应 None"
+        );
+    }
+
+    /// 用例 D（重写：`page_index_at` 已删 —— 生产零调用，几何统一走
+    /// `row_index_at_y`/`col_slot_at_x` 原语，view 侧 `compute_insert_index` 与命中语义基于
+    /// 同一套原语）：行二分 / 列槽原语的 gap / padding / 末行 / 退化视口语义。
+    ///
+    /// 手算（同用例 A 布局，pitch = cell_w + gap = 40 + 8 = 48；卡 0 = [8, 48]、卡 1 = [56, 96]）：
+    /// - 行 0 顶 = 8、行 1 顶 = 72.569 → `row_index_at_y(49) = 0`、`row_index_at_y(72.569) = 1`；
+    /// - `col_slot_at_x(28) = round((28−8)/48) = round(0.4167) = 0`（卡 0 中心）；
+    ///   `col_slot_at_x(76) = round(1.4167) = 1`（卡 1 中心）；`col_slot_at_x(52) = round(0.9167) = 1`
+    ///   （列间 gap [48,56] 中点 → 槽 1，插入位语义 gap 归最近槽）；
+    /// - 顶部 padding（y=2 < 行 0 顶 8）→ 原语退化为行 0（上层调用方按其 padding 语义处理）；
+    /// - 左侧 padding（x=4）→ 负槽归 0（上层调用方按其 padding 语义处理）；
+    /// - 末行底外（y 远超 total）→ 原语仍返回末行下标（末行）；
+    /// - 右 padding（x=120 > 末列右缘 96、视口 140 内）→ 最近槽 2（gap/padding 都归最近槽）。
+    #[test]
+    fn grid_row_col_primitives_edge_cases() {
+        let g = grid_3pages();
+        assert_eq!(g.row_index_at_y(49.0), 0, "行 0 中部 → 行 0");
+        // 贴行 1 顶：用 `row_top[1]` 真实缓存值（浮点 `72.569` 字面量 < 实际 72.568542…，
+        // 会落在行 0 —— K177：期望值须从真实几何取值，不拍脑袋）。
+        assert_eq!(g.row_index_at_y(g.row_top[1]), 1, "贴行 1 顶 → 行 1");
+        assert_eq!(g.row_index_at_y(2.0), 0, "顶部 padding（行 0 顶之上）退化 → 行 0");
+        assert_eq!(g.row_index_at_y(9999.0), 1, "末行底外 → 末行");
+        assert_eq!(g.col_slot_at_x(28.0), 0, "卡 0 中心 x = 8 + 40/2 = 28 → 槽 0");
+        assert_eq!(g.col_slot_at_x(76.0), 1, "卡 1 中心 x = 56 + 40/2 = 76 → 槽 1");
+        assert_eq!(g.col_slot_at_x(52.0), 1, "列间 gap（[48,56]）中点 → 最近槽 1（gap 归最近槽）");
+        assert_eq!(g.col_slot_at_x(4.0), 0, "左侧 padding → 负槽归 0");
+        assert_eq!(g.col_slot_at_x(120.0), 2, "右 padding（末列右缘 96 外）→ 最近槽 2");
+        // 退化视口：极窄 viewport 把 cell_w 夹到 0 → pitch ≤ 0 → 列槽 0（无法按列定位）。
+        let degenerate = grid_layout(&[(1.0, GRID_SQRT2); 1], 40.0, 0.0, 40.0, 20.0);
+        assert_eq!(degenerate.cell_w, 0.0, "极窄视口 cell_w 夹到 0");
+        assert_eq!(degenerate.col_slot_at_x(3.0), 0, "退化视口列槽 → 0");
+        // 0 行布局：两个原语安全返回 0（不 panic；新 pitch=48 下 x=20 落在首槽）。
+        let empty = grid_layout(&[], 40.0, 8.0, 8.0, 140.0);
+        assert_eq!(empty.row_index_at_y(49.0), 0, "空布局行原语安全返回 0");
+        assert_eq!(empty.col_slot_at_x(20.0), 0, "空布局列槽返回 0");
+    }
+
+    /// 用例 E 边界：0 页 / view 宽 < 卡宽（cols 必须 = 1）/ 1 页 / 平页（宽>高）与竖页（高>宽）
+    /// 混排时行高 = 该行最高卡。
+    #[test]
+    fn grid_layout_edge_cases() {
+        // 0 页：rows=0、total_height=0；row_top 空、row_page_start 仅留端点 [0]（len=rows+1）；
+        // 几何方法一律 None。
+        let empty = grid_layout(&[], 40.0, 8.0, 8.0, 140.0);
+        assert_eq!(empty.rows, 0);
+        assert!((empty.total_height - 0.0).abs() < 0.01);
+        assert!(empty.row_top.is_empty());
+        assert_eq!(empty.row_page_start, vec![0], "空布局预留端点 [0]（len = rows+1）");
+        assert_eq!(empty.cell_rect(0), None);
+        assert_eq!(empty.first_visible_grid_row(0.0, 500.0), None);
+
+        // view 宽 < 卡宽：卡宽 100、gap 8、padding 8、viewport 60 →
+        // cols = max(1, floor((60−16+8)/108)) = max(1, floor(52/108)) = 1；
+        // cols 夹到 1 且卡宽 100 > 内容区 44 → cell_w 夹到内容区 44（唯一夹取例外）；
+        // 竖页卡高 = 44×√2 ≈ 62.2。
+        let narrow = grid_layout(&[(1.0, GRID_SQRT2)], 100.0, 8.0, 8.0, 60.0);
+        assert_eq!(narrow.cols, 1, "view 宽 < 卡宽时 cols 必须 = 1");
+        assert!((narrow.cell_w - 44.0).abs() < 0.01, "cell_w 夹到内容区 44（单卡填视口）");
+        assert_eq!(narrow.rows, 1);
+        let (x, y, w, h) = narrow.cell_rect(0).expect("单卡应有矩形");
+        // 卡 0：x = 8 + 0×52 = 8，y = padding = 8，w = 44，h = 44×√2 ≈ 62.225
+        assert!((x - 8.0).abs() < 0.01 && (y - 8.0).abs() < 0.01);
+        assert!((w - 44.0).abs() < 0.01 && (h - 62.225).abs() < 0.01, "h 手算 ≈62.225: {h}");
+
+        // 1 页：正常视口下 cols=2、rows=1、row_page_start=[0,1]、total = 8 + 56.569 + 8。
+        let one = grid_layout(&[(1.0, GRID_SQRT2)], 40.0, 8.0, 8.0, 140.0);
+        assert_eq!(one.cols, 2);
+        assert_eq!(one.rows, 1);
+        assert_eq!(one.row_page_start, vec![0, 1]);
+        assert!((one.total_height - (8.0 + 56.569 + 8.0)).abs() < 0.01, "单行总高 ≈72.569");
+
+        // 平页（宽>高）与竖页（高>宽）混排：pages = [(2,1),(1,3),(1,2)]、卡宽 60、gap 8、
+        // padding 8、viewport 160 → cols = floor((160−16+8)/68) = floor(2.235) = 2；
+        // cell_w = 请求卡宽 60（新语义，不反推填充）；cell_h = [60×½, 60×3, 60×2] = [30, 180, 120]；
+        // 行 0 含页 0/1 → 行高 = max(30, 180) = 180；行 1 含页 2 → 行高 = 120；
+        // row_top = [8, 8+180+8 = 196]；total = 8+180+120+8+8 = 324。
+        let mixed = grid_layout(&[(2.0, 1.0), (1.0, 3.0), (1.0, 2.0)], 60.0, 8.0, 8.0, 160.0);
+        assert_eq!(mixed.cols, 2, "混排 cols 手算应 2");
+        assert_eq!(mixed.rows, 2);
+        let (_, _, _, h0) = mixed.cell_rect(0).expect("平页卡应有矩形");
+        assert!((h0 - 30.0).abs() < 0.01, "平页 0 卡高应保持纵横比 30: {h0}");
+        // 卡 1：x = 8 + 1×(60+8) = 76，h = 60×3 = 180（行高被竖页顶起）
+        let (x1, y1, w1, h1) = mixed.cell_rect(1).expect("竖页卡应有矩形");
+        assert!((x1 - 76.0).abs() < 0.01 && (y1 - 8.0).abs() < 0.01);
+        assert!((w1 - 60.0).abs() < 0.01);
+        assert!((h1 - 180.0).abs() < 0.01, "竖页卡高 180（行高 = 该行最高卡）");
+        // 卡 2：x = 8（第 2 行第 0 列），y = 8+180+8 = 196，h = 120
+        let (x2, y2, _, h2) = mixed.cell_rect(2).expect("页 2 卡应有矩形");
+        assert!((x2 - 8.0).abs() < 0.01);
+        assert!((y2 - 196.0).abs() < 0.01, "行 1 顶 = 196: {y2}");
+        assert!((h2 - 120.0).abs() < 0.01, "页 2 卡高 120");
+        assert!((mixed.row_top[1] - 196.0).abs() < 0.01, "行 1 顶 = 196");
+        assert!((mixed.total_height - 324.0).abs() < 0.01, "混排总高 = 324: {}", mixed.total_height);
+    }
+
+    /// 用例 F（新语义核心，Ctrl+滚轮缩放跳变根治）：**cell_w 跟随请求卡宽**——同 viewport
+    /// 下请求卡宽连续变化时，卡大小每步都变（不再被「填满反算」冻结在列数不变区间）。
+    /// 逐档断言：
+    /// - 非夹取区（cols>1，或 cols=1 且卡宽 ≤ 内容区）`cell_w == card_w`；
+    /// - 夹取区（cols=1 且卡宽 > 内容区 `vw − 2p`）`cell_w == 内容区宽`（单卡填视口）；
+    /// - `cols` 随卡宽单调不增（更大卡 → 更少列），且只在阈值处变化（每次至多 -1）；
+    /// - `cell_w` 相邻两步差值恒 = 卡宽步长（缩放连续可感知；夹取区内按设计钉在内容区宽）。
+    #[test]
+    fn grid_layout_cell_w_follows_card_width_continuously() {
+        let pages = vec![(1.0, GRID_SQRT2); 3];
+        let (gap, padding, viewport) = (8.0f32, 8.0f32, 140.0f32);
+        let content_w = viewport - 2.0 * padding; // 124
+        let step = 4.0f32;
+        let mut prev_cell_w: Option<f32> = None;
+        let mut prev_cols: Option<usize> = None;
+        let mut card = 40.0f32;
+        while card <= 200.0 {
+            let g = grid_layout(&pages, card, gap, padding, viewport);
+            if g.cols == 1 {
+                // cols=1（夹取或恰一列）：cell_w = 请求卡宽 ∩ 内容区（防横向溢出）
+                assert!(
+                    (g.cell_w - card.min(content_w)).abs() < 1e-3,
+                    "cols=1 时 cell_w 应 = min(卡宽, 内容区)={}: 卡宽 {card} → {}",
+                    card.min(content_w),
+                    g.cell_w
+                );
+            } else {
+                assert!(
+                    (g.cell_w - card).abs() < 1e-3,
+                    "cols>1 时 cell_w 应跟随请求卡宽 {card}: {}",
+                    g.cell_w
+                );
+            }
+            // cols 单调不增、不跳档（更大卡 → 列数只减不增，且在阈值处才变）。
+            if let Some(pc) = prev_cols {
+                assert!(
+                    g.cols <= pc,
+                    "cols 随卡宽增大不应增加: 卡 {card}(cols {}) 之前 {pc}",
+                    g.cols
+                );
+                assert!(
+                    g.cols + 1 >= pc,
+                    "cols 应只在阈值处变化（每次至多 -1）：{pc} → {}",
+                    g.cols
+                );
+            }
+            // cell_w 连续：夹取区外相邻步差恒 = 步长（缩放每步都变大小）。
+            if let (Some(pw), true) = (prev_cell_w, card <= content_w) {
+                let diff = g.cell_w - pw;
+                assert!(
+                    (diff - step).abs() < 1e-2,
+                    "cell_w 应每步精确变 step={step}（缩放连续可感知）：卡 {card} 前 {pw} → {} (差 {diff})",
+                    g.cell_w,
+                );
+            }
+            prev_cell_w = Some(g.cell_w);
+            prev_cols = Some(g.cols);
+            card += step;
+        }
     }
 }
