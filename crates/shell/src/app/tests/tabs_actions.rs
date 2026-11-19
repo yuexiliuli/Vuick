@@ -743,6 +743,257 @@
         let _ = std::fs::remove_file(&txt);
     }
 
+    /// 打开 `target/pdf测试.pdf` 并泵到 `is_loaded()`（夹具缺时由调用方先判
+    /// `pdf::test_util::missing_pdf_fixture`）；返回激活选项卡的 PdfViewer 实体
+    /// （供 page_mode / zoom / grid_mode 断言）。
+    fn open_pdf_loaded(
+        app: &gpui::Entity<EditorApp>,
+        cx: &mut VisualTestContext,
+    ) -> gpui::Entity<pdf::PdfViewer> {
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试.pdf");
+        assert!(pdf.exists(), "测试 PDF 应存在");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(pdf.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..400 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let loaded = cx.update(|_w, cx| {
+                tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
+            tab_pdf(t).expect("PDF 选项卡应在场").clone()
+        })
+    }
+
+    /// 状态栏 PDF 页排模式钮（单页/双页/网格三钮互斥选中）：pdf 打开 → 三钮都渲染、
+    /// 初始连续（三钮均不选中）；点单页 → page_mode==Single；再点单页 → 弹起回
+    /// Continuous；点双页 → Facing；点网格 → grid_mode==true 且 page_mode 保留（网格
+    /// 与页排正交）；退网格 → 回阅读、page_mode 原样。选中高亮 = `selected_bg` 主题色
+    /// 差（headless 不可断底色，同网格钮先例留真机确认），headless 断言状态翻转即可。
+    #[gpui::test]
+    async fn status_bar_pdf_single_facing_buttons_toggle_page_mode(cx: &mut TestAppContext) {
+        if pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = pdf::test_util::lock().lock().unwrap();
+        init_test(cx);
+        let (app, mut cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 非 PDF 幕：页排钮不渲染。
+        assert!(
+            cx.debug_bounds("status-pdf-single-btn").is_none()
+                && cx.debug_bounds("status-pdf-facing-btn").is_none(),
+            "非 PDF 选项卡不应显示页排按钮"
+        );
+        // 打开 PDF → 三钮渲染、初始连续。
+        let pv = open_pdf_loaded(&app, &mut cx);
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-pdf-single-btn").is_some(),
+            "PDF 选项卡应显示单页钮"
+        );
+        assert!(
+            cx.debug_bounds("status-pdf-facing-btn").is_some(),
+            "PDF 选项卡应显示双页钮"
+        );
+        assert!(
+            cx.debug_bounds("status-pdf-grid-btn").is_some(),
+            "PDF 选项卡应显示网格钮"
+        );
+        assert_eq!(
+            cx.update(|_w, cx| pv.read(cx).page_mode()),
+            pdf::view::PageMode::Continuous,
+            "新开 PDF 默认连续阅读（三钮均不选中）"
+        );
+        // 点单页 → Single。
+        let single = cx.debug_bounds("status-pdf-single-btn").expect("单页钮应在场");
+        cx.simulate_click(single.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| pv.read(cx).page_mode()),
+            pdf::view::PageMode::Single,
+            "点单页后应为单页"
+        );
+        // 再点单页 → 弹起回 Continuous。
+        let single = cx.debug_bounds("status-pdf-single-btn").expect("单页钮应仍在场");
+        cx.simulate_click(single.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| pv.read(cx).page_mode()),
+            pdf::view::PageMode::Continuous,
+            "再点单页应弹起回连续"
+        );
+        // 点双页 → Facing。
+        let facing = cx
+            .debug_bounds("status-pdf-facing-btn")
+            .expect("双页钮应在场");
+        cx.simulate_click(facing.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            cx.update(|_w, cx| pv.read(cx).page_mode()),
+            pdf::view::PageMode::Facing,
+            "点双页后应为双页对开"
+        );
+        // 点网格 → grid_mode==true 且 page_mode 保留（网格与页排正交）。
+        let grid = cx.debug_bounds("status-pdf-grid-btn").expect("网格钮应在场");
+        cx.simulate_click(grid.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let (gm, pm) = cx.update(|_w, cx| (pv.read(cx).grid_mode(), pv.read(cx).page_mode()));
+        assert!(gm, "点网格后 grid_mode 应为 true");
+        assert_eq!(pm, pdf::view::PageMode::Facing, "进网格不应清 page_mode");
+        // 退网格 → 回阅读、page_mode 原样。
+        let grid = cx
+            .debug_bounds("status-pdf-grid-btn")
+            .expect("网格钮应仍在场");
+        cx.simulate_click(grid.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let (gm, pm) = cx.update(|_w, cx| (pv.read(cx).grid_mode(), pv.read(cx).page_mode()));
+        assert!(!gm, "退网格后 grid_mode 应为 false");
+        assert_eq!(pm, pdf::view::PageMode::Facing, "退网格后 page_mode 应保留");
+    }
+
+    /// 状态栏 PDF「显示比例」滑条显隐：阅读（单列、非网格）模式可见；进网格 → 隐藏
+    /// （网格有独立 grid_zoom，滑条只控单列阅读缩放）；退网格回到阅读 → 复现。
+    #[gpui::test]
+    async fn status_bar_pdf_zoom_slider_hidden_in_grid_shown_in_reading(cx: &mut TestAppContext) {
+        if pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = pdf::test_util::lock().lock().unwrap();
+        init_test(cx);
+        let (app, mut cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pv = open_pdf_loaded(&app, &mut cx);
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-pdf-zoom-slider").is_some(),
+            "阅读（单列非网格）模式应显示显示比例滑条"
+        );
+        // 点网格 → 滑条隐藏。
+        let grid = cx.debug_bounds("status-pdf-grid-btn").expect("网格钮应在场");
+        cx.simulate_click(grid.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| pv.read(cx).grid_mode()),
+            "进网格后 grid_mode 应为 true"
+        );
+        assert!(
+            cx.debug_bounds("status-pdf-zoom-slider").is_none(),
+            "网格模式应隐藏显示比例滑条"
+        );
+        // 退网格 → 滑条复现。
+        let grid = cx
+            .debug_bounds("status-pdf-grid-btn")
+            .expect("网格钮应仍在场");
+        cx.simulate_click(grid.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert!(
+            !cx.update(|_w, cx| pv.read(cx).grid_mode()),
+            "退网格后 grid_mode 应为 false"
+        );
+        assert!(
+            cx.debug_bounds("status-pdf-zoom-slider").is_some(),
+            "退网格回到阅读应复现显示比例滑条"
+        );
+    }
+
+    /// 状态栏 PDF「显示比例」滑条交互：命中盒内按下/拖拽按 x 映射分数 → `set_zoom_abs`，
+    /// pdf.zoom 实时变化（按下 50% ≈ 2.25、拖到 75% ≈ 3.125），中间区 zoom% 文本同源
+    /// （均派生自 `zoom_factor`）；松手保持末值。
+    #[gpui::test]
+    async fn status_bar_pdf_zoom_slider_drag_updates_zoom(cx: &mut TestAppContext) {
+        if pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = pdf::test_util::lock().lock().unwrap();
+        init_test(cx);
+        let (app, mut cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pv = open_pdf_loaded(&app, &mut cx);
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let slider = cx
+            .debug_bounds("status-pdf-zoom-slider")
+            .expect("阅读模式应有显示比例滑条");
+        let w = slider.size.width.as_f32();
+        let cy = slider.center().y;
+        // 按下 50% → on_change(0.5) → set_zoom_abs(0.5+0.5×3.5=2.25)。
+        let p_half = gpui::Point::new(slider.left() + gpui::px(0.5 * w), cy);
+        cx.simulate_mouse_move(p_half, None, Default::default());
+        cx.simulate_mouse_down(p_half, MouseButton::Left, Default::default());
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let zoom_half = cx.update(|_w, cx| pv.read(cx).zoom_factor());
+        assert!(
+            (zoom_half - 2.25).abs() < 0.1,
+            "按下 50% 应 set_zoom_abs≈2.25，got {zoom_half}"
+        );
+        // 拖到 75% → on_change_during_drag(0.75) → set_zoom_abs(0.5+0.75×3.5=3.125)。
+        let p_75 = gpui::Point::new(slider.left() + gpui::px(0.75 * w), cy);
+        cx.simulate_mouse_move(p_75, Some(MouseButton::Left), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let zoom_75 = cx.update(|_w, cx| pv.read(cx).zoom_factor());
+        assert!(
+            (zoom_75 - 3.125).abs() < 0.1,
+            "拖到 75% 应 set_zoom_abs≈3.125，got {zoom_75}"
+        );
+        // 中间区 zoom% 文本在场（同源：`{:.0}%` 由 zoom_factor 派生，与滑条双向同步）。
+        assert!(
+            cx.debug_bounds("status-pdf-page").is_some(),
+            "中间区页码/缩放文本应渲染"
+        );
+        // 松手 → 末值保持（Immediate 模式 up 不再补发，zoom 保留拖拽末值）。
+        cx.simulate_mouse_up(p_75, MouseButton::Left, Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let zoom_final = cx.update(|_w, cx| pv.read(cx).zoom_factor());
+        assert_eq!(zoom_final, zoom_75, "松手后 zoom 应保持拖拽末值");
+    }
+
     /// P2-11 状态栏分区化：三区布局 + 分隔线 + 语言徽标（含徽记色点 pill）。
     /// - 未命名空选项卡：语言徽标（占位）显示、中间区（光标位置）省略、右侧主题/编码状态项恒在。
     /// - `.md`：自动预览 → 右侧出现「预览」状态项；有内容 → 中间区出现 `status-cursor`。

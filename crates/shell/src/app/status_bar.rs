@@ -13,6 +13,8 @@
 
 use super::*;
 
+use pdf::view::PageMode;
+
 /// 分区间的细竖线：1px × 14px，取 `bar_border`（＝`colors.border` 系）色，垂直居中。
 fn status_section_divider(color: gpui::Hsla) -> gpui::Div {
     let owned = "status-bar-divider".to_string();
@@ -40,11 +42,28 @@ impl EditorApp {
         // 借用约束：一次 borrow 取出激活选项卡的全部廉价字段（Scalar/String/实体引用
         // 读数）即释放 guard——杜绝「长借用 model.borrow() 构造子元素」后子元素继续借用的
         // 隐患；后续 `status_bar_left/right` 等自身再 borrow，互不嵌套。
-        let (line_count, char_count, language, preview_on, readonly_preview, fullscreen, wrap_on, is_markdown, epub_page, pdf_page, cursor_pos, pdf_active, pdf_grid_on) = {
+        let (
+            line_count,
+            char_count,
+            language,
+            preview_on,
+            readonly_preview,
+            fullscreen,
+            wrap_on,
+            is_markdown,
+            epub_page,
+            pdf_page,
+            cursor_pos,
+            pdf_active,
+            pdf_grid_on,
+            pdf_page_mode,
+            pdf_zoom,
+        ) = {
             let model = self.model.borrow();
             let tab = model.tabs.get(model.active_tab);
-            let (line_count, char_count) =
-                tab.map(|t| (t.payload.line_count, t.payload.char_count)).unwrap_or((0, 0));
+            let (line_count, char_count) = tab
+                .map(|t| (t.payload.line_count, t.payload.char_count))
+                .unwrap_or((0, 0));
             let language = self.language_label().to_string();
             // 右侧条件沿用既有判定：
             // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。
@@ -55,10 +74,17 @@ impl EditorApp {
             // 「换行」按钮显示 = 有统一 WyEditor 预览在场。
             let wrap_on = tab.map(|t| t.payload.md_wy.is_some()).unwrap_or(false);
             let is_markdown = tab
-                .and_then(|t| t.payload.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
+                .and_then(|t| {
+                    t.payload
+                        .file_path
+                        .as_ref()
+                        .map(|p| Self::is_markdown_path(p.as_path()))
+                })
                 .unwrap_or(false);
             // 中间区数据源（派生自激活选项卡，无新状态）：只读预览页码 / PDF 页码 / 光标行列。
-            let epub_page = tab.map(|_| self.epub_page_bounds(window, cx)).unwrap_or(None);
+            let epub_page = tab
+                .map(|_| self.epub_page_bounds(window, cx))
+                .unwrap_or(None);
             let pdf_page = tab.and_then(|t| match &t.payload.reader {
                 MediaReader::Pdf(pv) => {
                     let v = pv.read(cx);
@@ -74,7 +100,10 @@ impl EditorApp {
                     return None;
                 }
                 // 「有编辑内容」以字符数为准（空文档 line_count 恒为 1 行空行，不能当内容）。
-                if t.payload.char_count > 0 || t.payload.cursor_row != 0 || t.payload.cursor_col != 0 {
+                if t.payload.char_count > 0
+                    || t.payload.cursor_row != 0
+                    || t.payload.cursor_col != 0
+                {
                     Some((t.payload.cursor_row + 1, t.payload.cursor_col + 1))
                 } else {
                     None
@@ -91,6 +120,20 @@ impl EditorApp {
                     _ => None,
                 })
                 .unwrap_or(false);
+            // 阅读页排模式（连续/单页/双页；与网格总览正交，非 PDF 缺省连续）与阅读缩放
+            // （Ctrl+滚轮 / 显示比例滑条共享同一 zoom 源）。供右区页排钮选中态与滑条 render 读。
+            let pdf_page_mode = tab
+                .and_then(|t| match &t.payload.reader {
+                    MediaReader::Pdf(pv) => Some(pv.read(cx).page_mode()),
+                    _ => None,
+                })
+                .unwrap_or(PageMode::Continuous);
+            let pdf_zoom = tab
+                .and_then(|t| match &t.payload.reader {
+                    MediaReader::Pdf(pv) => Some(pv.read(cx).zoom_factor()),
+                    _ => None,
+                })
+                .unwrap_or(1.0);
             (
                 line_count,
                 char_count,
@@ -105,6 +148,8 @@ impl EditorApp {
                 cursor_pos,
                 pdf_active,
                 pdf_grid_on,
+                pdf_page_mode,
+                pdf_zoom,
             )
         };
         let bar_border = self.bar_border();
@@ -133,26 +178,24 @@ impl EditorApp {
 
         // 中间区存在才挂分隔线（省略时不给「光秃秃一条竖线」的孤立分隔）。
         if let Some(middle) = middle {
-            root = root
-                .child(middle)
-                .child(status_section_divider(bar_border));
+            root = root.child(middle).child(status_section_divider(bar_border));
         }
 
         // 弹性留白把右侧区推到底端；右侧区：状态 → 统计 → 按钮。
-        root = root
-            .child(div().flex_1())
-            .child(self.status_bar_right(
-                line_count,
-                char_count,
-                preview_on,
-                readonly_preview,
-                fullscreen,
-                wrap_on,
-                is_markdown,
-                pdf_active,
-                pdf_grid_on,
-                cx,
-            ));
+        root = root.child(div().flex_1()).child(self.status_bar_right(
+            line_count,
+            char_count,
+            preview_on,
+            readonly_preview,
+            fullscreen,
+            wrap_on,
+            is_markdown,
+            pdf_active,
+            pdf_grid_on,
+            pdf_page_mode,
+            pdf_zoom,
+            cx,
+        ));
 
         root
     }
@@ -232,6 +275,8 @@ impl EditorApp {
         is_markdown: bool,
         pdf_active: bool,
         pdf_grid_on: bool,
+        pdf_page_mode: PageMode,
+        pdf_zoom: f32,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let text_minor = self.text_minor();
@@ -248,11 +293,36 @@ impl EditorApp {
         if preview_on && !readonly_preview {
             right = right.child(self.status_item("status-mode-preview", "预览", chip_text));
         }
-        // PDF 页面网格视图开关：紧跟「预览」、置于「只读」左侧（用户验收项：
-        // 网格按钮不放最右边）；仅激活选项卡为 PDF 阅读器时显示（PDF 恒只读全屏
-        // 预览、无「全屏/还原」冲突）；高亮随 viewer.grid_mode。
+        // PDF 页面视图控制组：紧跟「预览」、置于「只读」左侧（用户验收项：不放最右边）；
+        // 仅激活选项卡为 PDF 阅读器时显示（PDF 恒只读全屏预览、无「全屏/还原」冲突）。
         if pdf_active {
-            right = right.child(self.status_pdf_grid_btn(pdf_grid_on, cx));
+            // 页排三钮：单页 / 双页（互斥选中，选中=高亮 pill）/ 网格（独立于 page_mode、
+            // 保留既有 `toggle_grid` 语义）；连续阅读 = 三钮均不选中。
+            // 显示比例滑条仅阅读模式（非网格）挂载——网格有独立 grid_zoom，滑条只控
+            // 单列阅读缩放（与 Ctrl+滚轮共享同一 zoom 源 → 滑块与中间区 zoom% 双向同步）。
+            right = right
+                .child(self.status_pdf_mode_btn(
+                    "status-pdf-single-btn",
+                    "单页",
+                    pdf_page_mode == PageMode::Single,
+                    pdf_grid_on,
+                    pdf_page_mode,
+                    PageMode::Single,
+                    cx,
+                ))
+                .child(self.status_pdf_mode_btn(
+                    "status-pdf-facing-btn",
+                    "双页",
+                    pdf_page_mode == PageMode::Facing,
+                    pdf_grid_on,
+                    pdf_page_mode,
+                    PageMode::Facing,
+                    cx,
+                ))
+                .child(self.status_pdf_grid_btn(pdf_grid_on, cx));
+            if !pdf_grid_on {
+                right = right.child(self.status_pdf_zoom_slider(pdf_zoom, cx));
+            }
         }
         if readonly_preview {
             right = right.child(self.status_item("status-mode-readonly", "只读", chip_text));
@@ -303,10 +373,7 @@ impl EditorApp {
         if !self.model.borrow().music_mode {
             let music_hint = self.music.as_ref().map(|mv| {
                 let pl = mv.read(cx).player.read(cx);
-                (
-                    pl.current_track().map(|t| t.title.clone()),
-                    pl.playing(),
-                )
+                (pl.current_track().map(|t| t.title.clone()), pl.playing())
             });
             if let Some((Some(title), playing)) = music_hint
                 && !title.is_empty()
@@ -341,13 +408,11 @@ impl EditorApp {
                     .child(if playing { "⏸ " } else { "▶ " })
                     .child(format!("♪ {title}")),
             )
-            .on_mouse_down(
-                cx.listener(|this: &mut EditorApp, _ev, _w, cx| {
-                    if let Some(mv) = &this.music {
-                        mv.update(cx, |v, cx| v.toggle_play(cx));
-                    }
-                }),
-            )
+            .on_mouse_down(cx.listener(|this: &mut EditorApp, _ev, _w, cx| {
+                if let Some(mv) = &this.music {
+                    mv.update(cx, |v, cx| v.toggle_play(cx));
+                }
+            }))
     }
 
     /// 状态栏上的小状态项：muted 文字 + 恰当间距（无 hover/点击）。
@@ -370,11 +435,9 @@ impl EditorApp {
             .h(px(status_pill_h()))
             .rounded_sm()
             .label(if fullscreen { "还原" } else { "全屏" })
-            .on_mouse_down(
-                cx.listener(|this: &mut EditorApp, _ev, window, cx| {
-                    this.toggle_preview_fullscreen(window, cx);
-                }),
-            )
+            .on_mouse_down(cx.listener(|this: &mut EditorApp, _ev, window, cx| {
+                this.toggle_preview_fullscreen(window, cx);
+            }))
     }
 
     /// 状态栏右侧「换行/不换行」切换按钮（仅非只读预览且非 Markdown 时挂载）；按下即切换。
@@ -386,11 +449,9 @@ impl EditorApp {
             .h(px(status_pill_h()))
             .rounded_sm()
             .label(if wrap_on { "换行" } else { "不换行" })
-            .on_mouse_down(
-                cx.listener(|this: &mut EditorApp, _ev, window, cx| {
-                    this.toggle_wrap(window, cx);
-                }),
-            )
+            .on_mouse_down(cx.listener(|this: &mut EditorApp, _ev, window, cx| {
+                this.toggle_wrap(window, cx);
+            }))
     }
 
     /// 状态栏右侧「页面网格视图」切换按钮（wave4，仅激活选项卡为 PDF 阅读器时挂载，
@@ -450,5 +511,133 @@ impl EditorApp {
             };
             viewer.update(cx, |v, cx| v.toggle_grid(cx));
         })
+    }
+
+    /// 状态栏右侧「单页/双页」页排模式切换按钮（仅激活选项卡为 PDF 阅读器时挂载，
+    /// 置于「网格」钮左侧）：两态视觉复刻 `status_pdf_grid_btn`——未选中 = 纯文字可点
+    /// （`chip_text`、无底色），选中 = 高亮 pill（`selected_bg` 选中底色）。选中态 =
+    /// 当前阅读页排模式 `page_mode` 与目标一致（页排与网格总览正交：网格进出保留
+    /// `page_mode`，故网格里选中态依然成立）。按下取激活选项卡 PdfViewer 实体调
+    /// `set_page_mode`（内部已处理「网格中先退出网格再落新模式」）。
+    fn status_pdf_mode_btn(
+        &self,
+        sel: &'static str,
+        label: &'static str,
+        selected: bool,
+        grid_on: bool,
+        current: PageMode,
+        target: PageMode,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let active_bg: gpui::Hsla = ui::theme::Theme::global(cx).colors.selected_bg.into();
+        let on_click = self.status_pdf_mode_toggle(grid_on, current, target, cx);
+
+        if !selected {
+            // 未选中：纯文字（同 status_item 的 12px/chip_text，多出可点 + 悬停手型），无底色。
+            let owned = sel.to_string();
+            return div()
+                .debug_selector(move || owned.clone())
+                .flex_shrink_0()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(self.chip_text())
+                .child(label)
+                .on_mouse_down(gpui::MouseButton::Left, on_click)
+                .into_any_element();
+        }
+
+        // 选中：高亮 pill（Chip 壳底色换成 selected_bg 选中底色）。
+        ui::Pill::new(sel)
+            .size(ui::PillSize::Md)
+            .tone(ui::PillTone::Chip)
+            // Md 默认 22px 高/圆角 md 与状态栏壳不匹配，覆写回 19px + 圆角 sm（1:1 保留原壳）。
+            .h(px(status_pill_h()))
+            .rounded_sm()
+            .bg(active_bg)
+            .label(label)
+            .on_mouse_down(on_click)
+            .into_any_element()
+    }
+
+    /// 「单页/双页」按钮点击闭包：从激活选项卡取 PdfViewer 实体，落页排模式或弹起回连续。
+    /// （闭包内 short borrow 即释放；选项卡已被关闭 → 取不到 → 直接返回。）
+    fn status_pdf_mode_toggle(
+        &self,
+        grid_on: bool,
+        current: PageMode,
+        target: PageMode,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static {
+        cx.listener(
+            move |this: &mut EditorApp, _ev: &gpui::MouseDownEvent, _w, cx| {
+                let Some(viewer) = (|| {
+                    let model = this.model.borrow();
+                    let tab = model.tabs.get(model.active_tab)?;
+                    match &tab.payload.reader {
+                        MediaReader::Pdf(pv) => Some(pv.clone()),
+                        _ => None,
+                    }
+                })() else {
+                    return;
+                };
+                // 当前已是目标模式且非网格 → 弹起回连续；否则落新页排模式（`set_page_mode`
+                // 内部已处理「网格中先退出网格再落新模式」）。
+                let next = if !grid_on && current == target {
+                    PageMode::Continuous
+                } else {
+                    target
+                };
+                viewer.update(cx, |v, cx| v.set_page_mode(next, cx));
+            },
+        )
+    }
+
+    /// 状态栏右侧「显示比例」滑条（PDF 阅读模式，`ui::Slider`）：以
+    /// `[config::pdf::ZOOM_MIN, ZOOM_MAX]` 把当前缩放 `zoom` 归一化为显示值（与
+    /// Ctrl+滚轮共享同一 zoom 源 → 天然双向同步、中间区 zoom% 同源），`Immediate`
+    /// 每档 `set_zoom_abs`（viewer worker 防抖自担）。仅阅读模式挂载（网格总览隐藏：
+    /// 网格有独立 grid_zoom，滑条只控单列阅读缩放）。颜色一律走 `ui::theme`（Slider
+    /// 默认轨道 border / 填充 accent，禁硬编码）。
+    fn status_pdf_zoom_slider(&self, zoom: f32, cx: &mut Context<Self>) -> gpui::Div {
+        let frac = ((zoom - config::pdf::ZOOM_MIN)
+            / (config::pdf::ZOOM_MAX - config::pdf::ZOOM_MIN))
+            .clamp(0.0, 1.0);
+        let owned = "status-pdf-zoom-slider".to_string();
+        div()
+            .debug_selector(move || owned.clone())
+            .w(px(72.))
+            .h(px(16.))
+            .child(
+                ui::Slider::new("status-pdf-zoom-slider")
+                    .value(frac)
+                    .commit_mode(ui::CommitMode::Immediate)
+                    .track_height(px(4.))
+                    .on_change(self.status_pdf_zoom_setter(cx))
+                    .on_change_during_drag(self.status_pdf_zoom_setter(cx)),
+            )
+    }
+
+    /// 「显示比例」滑条值变更闭包：滑条分数 → `[ZOOM_MIN, ZOOM_MAX]` 绝对缩放并
+    /// `set_zoom_abs`（同目标早退由 viewer 内部兜底）。经 `cx.entity()` 捕获宿主实体，
+    /// 每次取值从激活选项卡现取 PdfViewer（随选项卡搬迁即随动）。
+    fn status_pdf_zoom_setter(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(f32, &mut gpui::Window, &mut gpui::App) + 'static {
+        let entity = cx.entity();
+        move |f, _w, app| {
+            let Some(viewer) = (|| {
+                let model = entity.read(app).model.borrow();
+                let tab = model.tabs.get(model.active_tab)?;
+                match &tab.payload.reader {
+                    MediaReader::Pdf(pv) => Some(pv.clone()),
+                    _ => None,
+                }
+            })() else {
+                return;
+            };
+            let zoom = config::pdf::ZOOM_MIN + f * (config::pdf::ZOOM_MAX - config::pdf::ZOOM_MIN);
+            viewer.update(app, |v, cx| v.set_zoom_abs(zoom, cx));
+        }
     }
 }

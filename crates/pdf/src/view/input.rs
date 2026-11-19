@@ -69,6 +69,7 @@ impl PdfViewer {
         let win_ctrl = window.modifiers().control;
         let os_ctrl = os_ctrl_down();
         let ctrl = event_ctrl || win_ctrl || os_ctrl;
+        let delta_y = pan_zoom::wheel_delta_y(event);
         if !ctrl {
             if timing_view() {
                 eprintln!(
@@ -78,6 +79,13 @@ impl PdfViewer {
                     win_ctrl,
                     os_ctrl,
                 );
+            }
+            // 分页页拍（Single/Facing）：普通滚轮接管为**步进翻页**（R4）——不再自由滚动，
+            // 目标行 = 当前吸附行 ±1 的行顶（`row_top × zoom`），`stop_propagation` 阻止容器
+            // 自由滚动（连续模式仍不拦截，交给滚动容器）。
+            if self.paged_mode_active() {
+                self.paged_step_wheel(delta_y, cx);
+                cx.stop_propagation();
             }
             return;
         }
@@ -92,7 +100,6 @@ impl PdfViewer {
                 self.zoom,
             );
         }
-        let delta_y = pan_zoom::wheel_delta_y(event);
         let factor = pan_zoom::zoom_factor(delta_y, ZOOM_STEP);
         if self.grid_mode {
             // 网格**独立缩放**：只改 `grid_zoom` → 卡宽/列数变化（`grid_card_width()` 派生），
@@ -101,16 +108,31 @@ impl PdfViewer {
             // 步进 grid_zoom 并同比重锚 grid_scroll。缩略图**仅跨分桶才失效**——worker 按
             // `grid_bucket_width`（GRID_BUCKET_PX=32 量化）分桶缓存，同一桶内缩放只改卡宽/
             // 列数/滚动重锚，缩略图与在途请求**复用**（连续 Ctrl+滚轮跨多桶时每档全清会
-            // 闪占位 + 逐档重栅）；同桶复用、跨桶失效（下一帧按新分桶重取）。
+            // 闪占位 + 逐档重栅）；同桶复用、**跨桶保图清在途**（旧桶缩略图保留作桥——渲染
+            // 拉伸顶住新卡盒防整屏白闪，只丢旧桶在途请求，下一帧按新分桶重取替换桥）。
             let old_card = self.grid_card_width();
-            if pan_zoom::apply_zoom(&mut self.grid_zoom, factor, ZOOM_MIN, ZOOM_MAX) {
+            // 网格**列数钳制**（K167 本线）：随当前视口宽动态钳到 2/9 列（GRID_MAX_COLS /
+            // GRID_MIN_COLS，见 `grid_zoom_limits_for_cols`）——不再用阅读共享的
+            // [ZOOM_MIN, ZOOM_MAX]。钳界与 `set_grid_zoom`（scroll bounds 口径）同源，
+            // 与 render 每帧归一化同一列数契约。
+            let (z_min, z_max) = grid_zoom_limits_for_cols(
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                self.grid_viewport(window).0,
+                GRID_MAX_COLS,
+                GRID_MIN_COLS,
+            );
+            if pan_zoom::apply_zoom(&mut self.grid_zoom, factor, z_min, z_max) {
                 let new_card = self.grid_card_width();
                 if (new_card - old_card).abs() > 1e-3 {
                     let ratio = new_card / old_card;
                     let sy = f32::from(-self.grid_scroll.offset().y) * ratio;
                     self.grid_scroll.set_offset(gpui::point(px(0.), px(-sy)));
                     if grid_bucket_width(new_card) != grid_bucket_width(old_card) {
-                        self.clear_grid_resources();
+                        // 跨分桶：保图清在途——旧桶缩略图保留作桥（渲染拉伸顶住，防整屏
+                        // 占位白闪），只丢弃旧桶在途请求；新桶图异步到达后替换桥。
+                        self.reset_grid_dispatch_for_zoom_bucket();
                     }
                     cx.notify();
                 }
@@ -129,66 +151,49 @@ impl PdfViewer {
         }
     }
 
-    /// 应用缩放因子并维护其后的一致性：锚定滚动偏移、重算页列布局。钳位/无变化短路走
-    /// [`pan_zoom::apply_zoom`]（区间 [ZOOM_MIN..=ZOOM_MAX] 来自 [`config::pdf`]）。
-    pub(super) fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
-        if self.dims.is_empty() {
+    /// 分页页拍（Single/Facing）**步进翻页**（R4，`on_scroll_wheel` 的普通滚轮分页分支）：
+    /// `delta_y<0`（向下滚）→ 目标 `row_top[r+1]×zoom`，`delta_y>0`（向上滚）→
+    /// `row_top[r−1]×zoom`，其中 `r` = 当前吸附行（[`super::PdfViewer::paged_snap_target`]
+    /// 同源的 `snap_target` 行界，R5 会话吸附同一行界源）；首页之上向上滚 → 0（顶）。
+    /// 直接 `scroll.set_offset`，由调用方 `stop_propagation`（防容器自由滚动）。
+    fn paged_step_wheel(&mut self, delta_y: f32, cx: &mut Context<Self>) {
+        let Some(layout) = self.paged_layout_cell.borrow().clone() else {
+            return;
+        };
+        if layout.rows == 0 {
             return;
         }
-        let old_w = self.page_width();
-        if !pan_zoom::apply_zoom(&mut self.zoom, factor, ZOOM_MIN, ZOOM_MAX) {
-            return;
-        }
-        let new_w = self.page_width();
-        let ratio = new_w / old_w;
-        // Z2 缩放世代步进（view 唯一真源）→ 推送 worker 采纳镜像。渲染请求随后 stamp 新世代；
-        // 停在 worker 队列的缩放**中间档** cover/瓦片/preview 出队时 `stamp < mirror` → 直接
-        // drop 不渲（旧档不再排队空耗 pdfium 时隙；最终档必达、无中间档堆叠）。
-        self.zoom_epoch += 1;
-        if let Some(w) = self.worker.clone() {
-            w.set_zoom_epoch(self.doc_id, self.zoom_epoch);
-        }
-        // Z1 锚点重锚：页列布局随 page_width 线性缩放但 `PAGE_PAD_Y`/`PAGE_GAP` 常量不缩放
-        // → 旧实现「整个 offset × ratio」把常量区也当线性量乘，每档漂移
-        // `-(ratio-1)×(PAD+K×GAP)`（K=锚点页号，深页可跳 2-3 行高，放大上跳/缩小下跳离散跳）。
-        // 改为「锚定 scroll 落在的页 K：页顶线性缩放 + 页内相对偏移同比缩放」（纯函数
-        // [`layout::zoom_rescroll_anchor`] 锁死公式）。横向量列居中同款同比缩放。
-        let sx = f32::from(-self.scroll.offset().x);
-        let sy = f32::from(-self.scroll.offset().y);
-        let old_tops = std::mem::take(&mut self.page_tops);
-        let (new_tops, total) = compute_layout(&self.dims, new_w);
-        self.page_tops = new_tops;
-        self.total_height = total;
-        let new_y = zoom_rescroll_anchor(&self.dims, &old_tops, &self.page_tops, old_w, ratio, sy);
-        // #2 停底锚点回拉修正：Z1 公式对页尾/文档底附近给出的 `new_y` 可能超出新布局的
-        // `[0, max_offset]` ——gpui 只在**布局**时才 clamp（div.rs `clamp_scroll_position`），
-        // 本帧读到的是未夹值：视觉已停底、`last_scroll_y` 却记了越界假值 → 下一帧
-        // `ensure_window` 算 jump≈「max−越界」假速度（S1 复核期失真）+ 再放大反向补一跳。
-        // 这里按新布局量程先 clamp，并把 `last_scroll_y` 回写为 clamp 后值（防 S1 假速度），
-        // 横向量程同款（内容宽 = 可视宽与页宽+边距的较大者，`zoom==1` 适配宽时恒 0）。
-        let viewport_h = f32::from(self.scroll.bounds().size.height);
-        let max_sy = (self.total_height - viewport_h).max(0.0);
-        let new_y = new_y.clamp(0.0, max_sy);
-        let viewport_w = f32::from(self.scroll.bounds().size.width);
-        let content_w = viewport_w.max(new_w + 2.0 * PAGE_PAD_X);
-        let max_sx = (content_w - viewport_w).max(0.0);
-        let new_x = (sx * ratio).clamp(0.0, max_sx);
+        let zoom = self.zoom.max(0.01);
+        let content_top = f32::from(-self.scroll.offset().y).max(0.0);
+        // 布局（zoom=1）负偏移口径：内容显示 = 布局 × zoom → 布局滚动偏移 = 显示偏移 / zoom。
+        let scroll_y_fit = -(content_top / zoom);
+        let (r, _) = layout.snap_target(scroll_y_fit);
+        let r_next = if delta_y < 0.0 {
+            (r + 1).min(layout.rows - 1)
+        } else {
+            r.saturating_sub(1)
+        };
+        // 首页之上（r==0 且向上滚）→ 顶（0）；否则目标行顶 × zoom。未行顶 + 视口可能超出
+        // 文档底 → 按分页纵向量程夹（末行滚到「末行底对齐视口底」，gpui 布局同口径）。
+        let target = if r == 0 && delta_y > 0.0 {
+            0.0
+        } else {
+            (layout.row_top[r_next] * zoom).clamp(0.0, self.paged_max_scroll())
+        };
         self.scroll
-            .set_offset(gpui::point(px(-new_x), px(-new_y)));
-        // S1 缩放源头治理：重锚把 scroll offset 同比缩放后，滚动速度「账面」与滚动锚点立即
-        // 同步——下一帧 `ensure_window` 的 `jump = scroll_y - last_scroll_y ≈ 0`，不再把缩放
-        // 重锚误判为滚动（旧实现：同帧 offset 突变 → velocity 飙 → VeryFast → 手势期零派发
-        // + 2-4 帧「加载中」空白 + 屏显恒为手势前旧封面 1.12^k 复利拉伸）。
-        // 强制 Slow 保证该缩放事件帧不被高速带缠住；`zoom_armed` 置位令缩放防抖窗内调度
-        // 只派当前档 preview（绝不满密 cover/tile 逐档抢渲被弃空转），防抖到期才满密收口。
-        // `last_scroll_y` = clamp 后的 `new_y`（#2：与写入 scroll 的 offset 一致，防 S1 假速度）。
-        self.last_scroll_y = new_y;
-        self.scroll_velocity = 0.0;
-        self.speed_state = SpeedState::Slow;
-        self.prev_fast = false;
-        self.zoom_armed = true;
-        self.zoom_idle_frames = 0;
+            .set_offset(gpui::point(self.scroll.offset().x, px(-target)));
+        // 回写 last_scroll_y：保下一帧 ensure_window 的速度估计不把步进当成滚动（→ 无假速度）。
+        self.last_scroll_y = target;
         cx.notify();
+    }
+
+    /// 应用缩放因子并维护其后的一致性：锚定滚动偏移、重算页列布局。经
+    /// [`super::PdfViewer::zoom_target`] 落地——target = 当前 `zoom × factor`，钳位
+    /// [ZOOM_MIN..=ZOOM_MAX]（来自 [`config::pdf`]）+ 1e-4 无变化短路 全在 zoom_target
+    /// 内部（语义与 [`pan_zoom::apply_zoom`] 一致）。与状态栏滑条的绝对目标
+    /// `set_zoom_abs` 共用同一实现，避免两套逻辑分叉（K32）。
+    pub(super) fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
+        self.zoom_target(self.zoom * factor, cx);
     }
 
     /// 页列 wrap 宽度 = 滚动容器实际可视宽。⚠️ 不用 `window.bounds()`（那是全窗口宽）：
@@ -237,13 +242,48 @@ impl PdfViewer {
         let off = self.scroll.offset();
         let wx = mx - off.x.as_f32();
         let wy = my - off.y.as_f32();
+        // 分页页拍（R3）：内容坐标 (wx,wy)（显示 px）。y 轴 = row_top×zoom 均匀缩放 → 由
+        // `wy/zoom` 定行；对该行每页用**唯一显示矩形源** `paged_display_rect` 做包含性复核
+        // （水平已按视口重算居中、非均匀缩放，不能再 ÷zoom 走 `page_at`）。命中 → 页内局部
+        // 显示坐标 → 按卡显示宽（rect.w）还原 PDF pt。间隙/留白/越界 → None（同连续语义）。
+        if self.paged_mode_active() {
+            let Some(layout) = self.paged_layout_cell.borrow().clone() else {
+                return None;
+            };
+            if layout.rows == 0 {
+                return None;
+            }
+            let zoom = self.zoom.max(0.01);
+            let r = layout.row_index_at_y(wy / zoom)?;
+            let s = layout.row_page_start[r];
+            let e = layout.row_page_start[r + 1].min(self.dims.len());
+            for i in s..e {
+                let Some(rect) = self.paged_display_rect(i) else {
+                    continue;
+                };
+                if wx >= rect.x && wx < rect.x + rect.w && wy >= rect.y && wy < rect.y + rect.h {
+                    let dim = self.dims[i];
+                    let pw = rect.w; // 显示宽 = 卡宽（= page_cell_width(i)，同口径）
+                    let scale = render_scale(pw, window.scale_factor(), dim.0);
+                    let (px_, py_) = local_to_pt(wx - rect.x, wy - rect.y, dim.0, dim.1, pw, scale);
+                    return Some((i, px_, py_));
+                }
+            }
+            return None;
+        }
         let page_width = self.page_width();
         let wrap_w = self.wrap_width(window, page_width);
         let cx = wx - column_left(wrap_w, page_width);
         let (page, lx, ly) = content_to_local(&self.dims, &self.page_tops, page_width, cx, wy)?;
         let scale = render_scale(page_width, window.scale_factor(), self.dims[page].0);
-        let (px_, py_) =
-            local_to_pt(lx, ly, self.dims[page].0, self.dims[page].1, page_width, scale);
+        let (px_, py_) = local_to_pt(
+            lx,
+            ly,
+            self.dims[page].0,
+            self.dims[page].1,
+            page_width,
+            scale,
+        );
         Some((page, px_, py_))
     }
 
@@ -289,18 +329,18 @@ impl PdfViewer {
         if page >= self.dims.len() {
             return None;
         }
-        let b = self.image_pages.get(&page)?.iter().find(|b| b.obj_index == obj_index)?;
+        let b = self
+            .image_pages
+            .get(&page)?
+            .iter()
+            .find(|b| b.obj_index == obj_index)?;
         let dim = self.dims[page];
-        let page_width = self.page_width();
+        // 每页真实显示宽（连续 = page_width；分页 = cell 宽 × zoom），与 char_window_pos 同口径。
+        let page_width = self.page_cell_width(page);
         let scale = render_scale(page_width, window.scale_factor(), dim.0);
         let (lx0, ly0) = pt_to_local(b.x0, b.y1, dim.0, dim.1, page_width, scale); // (left, top → 小 y)
         let (lx1, ly1) = pt_to_local(b.x1, b.y0, dim.0, dim.1, page_width, scale); // (right, bottom → 大 y)
-        Some(self.page_local_to_window(
-            window,
-            page,
-            (lx0 + lx1) / 2.0,
-            (ly0 + ly1) / 2.0,
-        ))
+        Some(self.page_local_to_window(window, page, (lx0 + lx1) / 2.0, (ly0 + ly1) / 2.0))
     }
 
     /// 页图片盒访问器（shell 测试/定位用）：页未缓存（预取未落地）→ `None`；
@@ -395,7 +435,12 @@ impl PdfViewer {
     /// 按住左键拖拽 → 活动端随鼠标更新（选区实时扩展/收缩）。
     /// 平移模式（超宽）：滚动偏移 = 按下时快照 + 指针位移（页面跟手，`window.mouse_position`
     /// 比拖拽事件 position 即时——gpui 移动事件可被上层消费，mouse_position 是真实光标）。
-    pub(super) fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.panning {
             let delta = window.mouse_position() - self.pan_origin;
             self.scroll.set_offset(self.pan_offset0 + delta);
@@ -416,10 +461,11 @@ impl PdfViewer {
         }
         let pos = window.mouse_position();
         if let Some(cur) = self.hit_test(window, pos)
-            && self.sel_active != Some(cur) {
-                self.sel_active = Some(cur);
-                cx.notify();
-            }
+            && self.sel_active != Some(cur)
+        {
+            self.sel_active = Some(cur);
+            cx.notify();
+        }
     }
 
     /// 松开：拖拽结束（`selecting` 复位），**选区保留**（anchor + active 都在，可 Ctrl+C）。
@@ -427,7 +473,12 @@ impl PdfViewer {
     /// 弹操作菜单（复制/高亮/删除线/下划线，同右键菜单定位在点击处），并清「灰框」焦
     /// （选区高亮接管）；单击（锚==活动）不弹卡 → **灰框命中**：点在待存注释 quads 内 →
     /// 框住该注释文字（点非注释文字 → 清灰框）。
-    pub(super) fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // 平移模式松手：结束平移、不弹选中菜单。放最前（先于 `if !self.selecting`）。
         if self.panning {
             self.panning = false;
@@ -462,12 +513,20 @@ impl PdfViewer {
 
     /// 快捷键：`Ctrl/Cmd+C` 复制选区；`Ctrl/Cmd+Z` 撤销上一条待存编辑（注释/页面操作）
     /// 且 stop_propagation 不再冒泡给全局编辑器 Undo；`Esc` 关闭选中弹卡。
-    pub(super) fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let m = event.keystroke.modifiers;
         if (m.control || m.platform) && !m.alt && !m.shift && event.keystroke.key == "c" {
             self.copy_selection(window, cx);
         }
-        if (m.control || m.platform) && !m.alt && !m.shift && event.keystroke.key == "z"
+        if (m.control || m.platform)
+            && !m.alt
+            && !m.shift
+            && event.keystroke.key == "z"
             && !self.undo_stack.is_empty()
         {
             self.undo_last(cx);
@@ -541,10 +600,22 @@ impl PdfViewer {
         lx: f32,
         ly: f32,
     ) -> gpui::Point<Pixels> {
-        let page_width = self.page_width();
-        let wrap_w = self.wrap_width(window, page_width);
         let bounds = self.scroll.bounds();
         let off = self.scroll.offset();
+        // 分页页拍（R4）：页内容原点 = `paged_display_rect(page).origin`（唯一显示矩形源，
+        // 水平按视口居中，与渲染定位同源），页内局部坐标加在其上、再加滚动偏移 → 窗口坐标。
+        if self.paged_mode_active() {
+            if let Some(rect) = self.paged_display_rect(page) {
+                let cx = rect.x + lx;
+                let cy = rect.y + ly;
+                return gpui::point(
+                    px(bounds.left().as_f32() + cx + off.x.as_f32()),
+                    px(bounds.top().as_f32() + cy + off.y.as_f32()),
+                );
+            }
+        }
+        let page_width = self.page_width();
+        let wrap_w = self.wrap_width(window, page_width);
         let cx = column_left(wrap_w, page_width) + lx;
         let cy = self.page_tops.get(page).copied().unwrap_or(0.0) + ly;
         gpui::point(
@@ -570,26 +641,18 @@ impl PdfViewer {
             return None;
         }
         let dim = self.dims[page];
-        let page_width = self.page_width();
+        // 每页真实显示宽（连续 = page_width；分页 = cell 宽 × zoom，R3 反向命中同口径）。
+        let page_width = self.page_cell_width(page);
         let scale = render_scale(page_width, window.scale_factor(), dim.0);
         let (lx0, ly0) = pt_to_local(c.left, c.top, dim.0, dim.1, page_width, scale);
         let (lx1, ly1) = pt_to_local(c.right, c.bottom, dim.0, dim.1, page_width, scale);
-        Some(self.page_local_to_window(
-            window,
-            page,
-            (lx0 + lx1) / 2.0,
-            (ly0 + ly1) / 2.0,
-        ))
+        Some(self.page_local_to_window(window, page, (lx0 + lx1) / 2.0, (ly0 + ly1) / 2.0))
     }
 
     /// 选区包围盒（**窗口坐标**）：逐页把 [`selection_spans_pt`] 的 span 转窗口坐标取并集。
     /// 缺文本页跳过（与 `selected_text` 尽力而为口径一致）；无任何 span → `None`。
-    fn selection_window_bounds(
-        &self,
-        window: &Window,
-    ) -> Option<((f32, f32), (f32, f32))> {
+    fn selection_window_bounds(&self, window: &Window) -> Option<((f32, f32), (f32, f32))> {
         let ((ap, ac), (bp, bc)) = self.selection()?;
-        let page_width = self.page_width();
         let scale_factor = window.scale_factor();
         let mut min_x = f32::INFINITY;
         let mut min_y = f32::INFINITY;
@@ -609,6 +672,8 @@ impl PdfViewer {
             if lo > hi {
                 continue;
             }
+            // 每页真实显示宽（连续 = page_width；分页 = cell 宽 × zoom，与命中同口径）。
+            let page_width = self.page_cell_width(page);
             let scale = render_scale(page_width, scale_factor, dim.0);
             for (l, b, r, t) in selection_spans_pt(text, lo, hi) {
                 let (x0, y_top) = pt_to_local(l, t, dim.0, dim.1, page_width, scale);
@@ -629,10 +694,7 @@ impl PdfViewer {
     /// 取不到包围盒 → `None`。
     pub(super) fn selection_card_anchor(&self, window: &Window) -> Option<gpui::Point<Pixels>> {
         let ((min_x, min_y), (max_x, _)) = self.selection_window_bounds(window)?;
-        Some(gpui::point(
-            px((min_x + max_x) / 2.0),
-            px(min_y - 8.0),
-        ))
+        Some(gpui::point(px((min_x + max_x) / 2.0), px(min_y - 8.0)))
     }
 
     /// 关闭选中弹卡（点卡片外 / 重新拖选 / 滚动 / Esc 均走此收敛）。
@@ -668,7 +730,12 @@ impl PdfViewer {
             }
             let quads: Vec<QuadPt> = selection_spans_pt(&text, lo, hi)
                 .into_iter()
-                .map(|(l, b, r, t)| QuadPt { x0: l, y0: b, x1: r, y1: t })
+                .map(|(l, b, r, t)| QuadPt {
+                    x0: l,
+                    y0: b,
+                    x1: r,
+                    y1: t,
+                })
                 .collect();
             if quads.is_empty() {
                 continue;
@@ -701,8 +768,10 @@ impl PdfViewer {
                 a.quads_pt.iter().any(|q| {
                     let (x0, y0) = (q.x0.min(q.x1), q.y0.min(q.y1));
                     let (x1, y1) = (q.x0.max(q.x1), q.y0.max(q.y1));
-                    px >= x0 - ANNOT_HIT_TOL_PT && px <= x1 + ANNOT_HIT_TOL_PT
-                        && py >= y0 - ANNOT_HIT_TOL_PT && py <= y1 + ANNOT_HIT_TOL_PT
+                    px >= x0 - ANNOT_HIT_TOL_PT
+                        && px <= x1 + ANNOT_HIT_TOL_PT
+                        && py >= y0 - ANNOT_HIT_TOL_PT
+                        && py <= y1 + ANNOT_HIT_TOL_PT
                 })
             })
             .map(|a| a.id)

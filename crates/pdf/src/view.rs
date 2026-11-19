@@ -49,19 +49,19 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
 use gpui::{
-    div, img, px, rgba, rgb, App, AppContext, ClipboardItem, Context, DragMoveEvent, FocusHandle,
-    Hsla, ImageSource, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Point, Pixels, PromptLevel, Render,
-    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
-    Window,
+    App, AppContext, ClipboardItem, Context, DragMoveEvent, FocusHandle, Hsla, ImageSource,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, PromptLevel, Render, RenderImage,
+    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    img, px, rgb, rgba,
 };
 use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
-use crate::recolor::RecolorParams;
 use crate::pdf::parser::{RawKind, RecolorKey};
+use crate::recolor::RecolorParams;
 
 /// 在途瓦片请求记录：`(派发时密度 scale, 导航世代 nav_gen, 结果通道)`。
 /// `nav_gen` 用于 L2.4：大跳（`nav_gen++`）当帧清掉世代 < 新 gen 的在途条目，预算立即释放。
@@ -88,6 +88,15 @@ pub(crate) struct WindowSig {
     viewport_h: u32,
     /// 页数兜底：加载完成建槽 / 任何布局重算潜在的侧通道变化。
     pages: usize,
+    /// 分页模式几何特征（R6）：分页时 = 首行页显示宽 `page_cell_width(0)`（f32 位型，
+    /// 即 `cell_w_per_row[0] × zoom`）——缩放变化必进 sig，防静态帧门误判分页模式稳定
+    /// （分页缩放时 `page_width` 维虽也变，但显式纳入 cell_w 更贴近分页几何真源，
+    /// 且模式切换 cell_w 从 0↔非 0 跳变亦被捕获）；非分页 = 0。
+    paged_cell_w: u32,
+    /// 页排模式位（R6）：0=连续/网格、1=Single、2=Facing——模式切换必进 sig
+    /// （连续↔分页切换时 cell_w 0↔非 0 已捕获，但 Single↔Facing 切换 cell_w 可能同值
+    /// 而列数变，加此位兜底）。
+    page_mode: u8,
 }
 
 impl WindowSig {
@@ -98,6 +107,15 @@ impl WindowSig {
         scale_factor: f32,
         viewport_h: f32,
     ) -> Self {
+        // R6：分页模式几何特征——cell_w（首行页显示宽）+ 模式位。非分页 = 0/0。
+        let (paged_cell_w, page_mode) = if v.paged_mode_active() {
+            (
+                v.page_cell_width(0).to_bits(),
+                1u8 + (v.page_mode == PageMode::Facing) as u8,
+            )
+        } else {
+            (0u32, 0u8)
+        };
         Self {
             scroll_top: scroll_y.to_bits(),
             scroll_x: f32::from(-v.scroll.offset().x).to_bits(),
@@ -106,6 +124,8 @@ impl WindowSig {
             viewport_w: f32::from(v.scroll.bounds().size.width).to_bits(),
             viewport_h: viewport_h.to_bits(),
             pages: v.dims.len(),
+            paged_cell_w,
+            page_mode,
         }
     }
 }
@@ -144,28 +164,33 @@ pub(crate) enum UndoEntry {
     AddAnnotBack { annot: PendingAnnot },
     /// 撤销「插入/删除页面」：恢复页面操作前的内存工作副本字节 + 操作前待存注释快照，
     /// 并把页操作计数回退（渲染由 worker 内存级重载完成）。
-    RestoreMemory { bytes: Vec<u8>, annots_before: Vec<PendingAnnot> },
+    RestoreMemory {
+        bytes: Vec<u8>,
+        annots_before: Vec<PendingAnnot>,
+    },
 }
 
-use config::pdf::{
-    COVER_INFLIGHT, IMAGE_CACHE_PAGES, IMAGE_INFLIGHT, PREFETCH_COVER_MARGIN,
-    PREFETCH_COVER_MARGIN_MAX, PREFETCH_RETURN_SIDE_BONUS, JUMP_PAGES_THRESHOLD,
-    MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO,
-    MOVE_THRESHOLD_PX, MOVE_THRESHOLD_VERY_RATIO, PAGE_PAD_X, PAGE_WIDTH, STOP_DETECT_FRAMES,
-    STOP_DETECT_PX, TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES,
-    TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
-};
 use crate::pdf::layout::{
-    advance_match_index, bitmap_display_scales, column_left, compute_layout, content_to_local,
-    cover_affordable, cover_scale, display_height, first_visible_page, grid_layout, hit_char,
-    keep_window, local_to_pt, page_bitmap_size, page_segment_text, pt_to_local, render_scale,
-    selection_spans_pt, visible_tile_range_axis, zoom_rescroll_anchor, GridLayout, Slot, TileSlot,
+    GridLayout, PagedLayout, Slot, TileSlot, advance_match_index, bitmap_display_scales,
+    column_left, compute_layout, content_to_local, cover_affordable, cover_scale, display_height,
+    first_visible_page, grid_layout, grid_zoom_limits_for_cols, hit_char, keep_window, local_to_pt,
+    page_bitmap_size, page_segment_text, paged_layout, paged_layout_scaled, pt_to_local,
+    render_scale, selection_spans_pt, visible_tile_range_axis, zoom_rescroll_anchor,
+    zoom_rescroll_anchor_paged,
 };
 use crate::pdf::parser::PDF_MERGE_MAX_SRC_BYTES;
 use crate::pdf::{
-    render_image_from_bgra, AnnotKind, AnnotateItem, AnnotationInfo, DocId, PageText,
-    PdfImageBox, PdfImagePixels, PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfWorker,
-    QuadPt, RecolorEntry, RenderRequest, RenderResult, TileRequest, TileResult,
+    AnnotKind, AnnotateItem, AnnotationInfo, DocId, PageText, PdfImageBox, PdfImagePixels,
+    PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfWorker, QuadPt, RecolorEntry,
+    RenderRequest, RenderResult, TileRequest, TileResult, render_image_from_bgra,
+};
+use config::pdf::{
+    COVER_INFLIGHT, IMAGE_CACHE_PAGES, IMAGE_INFLIGHT, JUMP_PAGES_THRESHOLD, MAX_MID_INFLIGHT,
+    MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX,
+    MOVE_THRESHOLD_VERY_RATIO, PAGE_PAD_X, PAGE_WIDTH, PREFETCH_COVER_MARGIN,
+    PREFETCH_COVER_MARGIN_MAX, PREFETCH_RETURN_SIDE_BONUS, STOP_DETECT_FRAMES, STOP_DETECT_PX,
+    TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT,
+    TILE_MARGIN, TILE_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
 };
 use viewer::pan_zoom;
 /// 是否开启视图侧计时日志（`VUICK_PDF_TIMING=1`，进程内缓存一次）。
@@ -232,11 +257,11 @@ where
 
 // 职责子模块（2026-10 由单文件 `view.rs` 拆出，纯 move；私有方法经 `pub(super)`
 // 保持视图子树内可见，公共 API / 可见性语义不变，见各模块头部文档）。
-mod open;
 mod input;
-mod tiles;
-mod search;
+mod open;
 mod render;
+mod search;
+mod tiles;
 
 /// R1-R3 动态瓦片预算与钉住集的**本帧快照**（由 `update_tile_budget_and_degrade` 计算、
 /// `evict_tiles` 消费——同一帧两处共用同一几何，杜绝「预算算一套、淘汰用另一套」漂移）：
@@ -264,6 +289,14 @@ pub(crate) const GRID_CARD_WIDTH: f32 = 280.0;
 pub(crate) const GRID_GAP: f32 = 12.0;
 /// 网格四周外留白（px）。取 16：常见内容区 8-16px 边距，网格四边不贴死、留统一画布衬底。
 pub(crate) const GRID_PADDING: f32 = 16.0;
+/// 网格缩放**列数钳**（K167 本线）：网格 Ctrl+滚轮 / `set_grid_zoom` 不再用阅读共享的
+/// [ZOOM_MIN, ZOOM_MAX] 钳网格，改按当前视口宽经 [`crate::pdf::layout::grid_zoom_limits_for_cols`]
+/// 动态钳到 `[GRID_MAX_COLS, GRID_MIN_COLS]` 列：
+/// - `GRID_MAX_COLS` = 放大上限的**最少**列数（2：最大只能放大到 2 列，不可能到 1 列）；
+/// - `GRID_MIN_COLS` = 缩小下限的**最多**列数（9：最大只能缩小到 9 列，不可能到 10+ 列）。
+/// 任意钳内 `grid_zoom` ⇒ 恒有 `GRID_MAX_COLS ≤ cols ≤ GRID_MIN_COLS`（推导见该函数注释）。
+pub(crate) const GRID_MAX_COLS: f32 = 2.0;
+pub(crate) const GRID_MIN_COLS: f32 = 9.0;
 /// 网格行带虚拟化的上下外扩缓冲行数：可视行之外各多物化 [`Self::grid_visible_range`]
 /// 一行的页卡，滚动/惯性时新行提前就位——对齐页列视图 `keep_window` 的 MARGIN 页缓冲语义。
 pub(crate) const GRID_ROW_BUFFER: usize = 1;
@@ -337,12 +370,7 @@ pub(crate) struct GridDrag {
 ///   `row_top[r+1] − gap` 之下、非末行）→ 直接 = `row_page_start[r+1]`（本行末 = 下一行首，
 ///   同一线性位）。列槽越行尾 → 行内最后（下一行首 / 整档末尾）。
 /// 手写算式样例见测试 [`tests::compute_insert_index_hand_cases`]（K177：期望值先演算后落）。
-pub(crate) fn compute_insert_index(
-    layout: &GridLayout,
-    vw: f32,
-    x: f32,
-    y: f32,
-) -> Option<usize> {
+pub(crate) fn compute_insert_index(layout: &GridLayout, vw: f32, x: f32, y: f32) -> Option<usize> {
     let n = layout.row_page_start.last().copied().unwrap_or(0);
     if n == 0 || layout.rows == 0 {
         return None;
@@ -380,11 +408,7 @@ pub(crate) fn compute_insert_index(
 /// 边界：连续被拖组在自身跨度内松手（insert ∈ (lo, hi]）→ 该删除位即块边缘 → 序不变；
 /// insert 越界夹到 `[0, n]`；空组 → 恒等；全选 → 整体平移（序不变）。
 /// 手写算式样例见测试 [`tests::apply_reorder_hand_cases`]。
-pub(crate) fn apply_reorder(
-    orig_len: usize,
-    dragging: &[usize],
-    insert: usize,
-) -> Vec<usize> {
+pub(crate) fn apply_reorder(orig_len: usize, dragging: &[usize], insert: usize) -> Vec<usize> {
     let insert = insert.min(orig_len);
     let mut in_drag = vec![false; orig_len];
     for &d in dragging {
@@ -397,6 +421,34 @@ pub(crate) fn apply_reorder(
     let pos = insert.saturating_sub(before).min(rest.len());
     rest.splice(pos..pos, dragging.iter().copied());
     rest
+}
+
+/// 网格缩略图缓存条目：页卡位图 + 其**所属分桶**（`grid_bucket_width` GRID_BUCKET_PX=32
+/// 量化，见 `pdf_core/parser.rs`）。跨桶缩放时旧桶条目**保留作桥**（渲染时 CSS 拉伸铺满
+/// 新卡盒，杜绝整屏占位白闪），仅新桶结果回填时替换；`bucket == 当前桶` 才是「就绪」
+/// 图，否则视为 stale（调度重派、渲染回退桥）。`bucket` 为 0 不可能出现（分桶 ≥32）。
+#[derive(Clone)]
+pub(crate) struct GridThumb {
+    /// 该位图栅格化时的分桶宽（px）。
+    pub(crate) bucket: u32,
+    /// 已就绪的页卡位图。
+    pub(crate) image: Arc<RenderImage>,
+}
+
+/// 阅读页排模式（状态层打桩：本切片**只存状态**，渲染三路分派/滚动锚点恢复由后续切片接）：
+/// - [`Continuous`]：连续滚动（单列全文，默认）
+/// - [`Single`]：单页模式（一次一页）
+/// - [`Facing`]：双页对开（一次两页）
+/// 与网格总览（[`PdfViewer::grid_mode`]）**正交**：网格进出保留本值，`set_grid_mode`
+/// 不改 page_mode（网格只是一时总览，读写它不清阅读页排模式）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PageMode {
+    /// 连续滚动（默认）。
+    Continuous,
+    /// 单页模式。
+    Single,
+    /// 双页对开模式。
+    Facing,
 }
 
 /// PDF 阅读器：自包含的瓦片级虚拟化视图。
@@ -431,18 +483,13 @@ pub struct PdfViewer {
     /// 在途**封面**（首屏整页锐化）请求：`页` → (密度 scale, **请求时 recolor 世代**,
     /// **导航世代 nav_gen**, 结果通道)。recolor 世代用于 `collect_cover_results` 的失败计数
     /// 语义（旧世代请求的失败不拉黑，评审 NIT）；`nav_gen` 用于 L2.4 大跳世代推进清旧条目。
-    pub(crate) pending_cover: HashMap<
-        usize,
-        (f32, u64, u64, mpsc::Receiver<Option<RenderResult>>),
-    >,
+    pub(crate) pending_cover: HashMap<usize, (f32, u64, u64, mpsc::Receiver<Option<RenderResult>>)>,
     /// F4 空闲预取走廊在途请求：`页` → (半密度 scale, 导航世代 nav_gen, 结果通道)。独立于
     /// [`Self::pending_cover`]（密度守卫不同：0.5× 封面、低优先级、仅空闲期消化），见
     /// `tiles::collect_prefetch_cover_results` 与 `tiles::prefetch_corridor`。非空期间自刷新泵
     /// 继续出帧以收集走廊结果。`nav_gen` 用于 L2.4 大跳世代推进清旧条目。
-    pub(crate) pending_prefetch_cover: HashMap<
-        usize,
-        (f32, u64, mpsc::Receiver<Option<RenderResult>>),
-    >,
+    pub(crate) pending_prefetch_cover:
+        HashMap<usize, (f32, u64, mpsc::Receiver<Option<RenderResult>>)>,
     /// F4 观测计数：累计向 worker 派发的**走廊封面**栅格请求数（回归断言 idle 预取确实
     /// 发生、且窗口移动后不再增长用；纯观测，无副作用）。
     pub(crate) prefetch_reqs: u64,
@@ -690,17 +737,29 @@ pub struct PdfViewer {
     /// 网格模式是否激活（false = 单列阅读；true = 页卡网格视图）。
     /// 独立于单列 `scroll`/`page_tops` 全套状态——两模式各自持有滚动偏移，切模式互不干扰。
     pub(crate) grid_mode: bool,
+    /// 阅读页排模式：连续/单页/双页；与网格总览**正交**——网格进出保留本值（读写网格
+    /// 不清 page_mode）。本切片只存状态 + 通知，渲染三路分派/滚动锚点恢复由后续切片接
+    /// （见 `view/open.rs` 的 `set_page_mode`）。
+    pub(crate) page_mode: PageMode,
     /// 网格卡**独立缩放**倍数（网格 Ctrl+滚轮可调；[`Self::grid_card_width`] =
     /// `GRID_CARD_WIDTH × grid_zoom`）。**独立于单列阅读缩放 [`Self::zoom`]**：网格里
     /// Ctrl+滚轮只改卡大小，退出网格回到阅读保持用户阅读缩放；阅读 Ctrl+滚轮/`set_zoom`
-    /// 也不影响网格卡宽。clamp 于 [ZOOM_MIN, ZOOM_MAX] ⇒ 卡宽 ∈ [140, 1120]。网格会话
-    /// 语义：文档 `release`/切换复位 1.0，同文档内存重载（页操作 reload）期间保持。
+    /// 也不影响网格卡宽。**列数钳制**：缩放区间按当前视口宽经
+    /// [`crate::pdf::layout::grid_zoom_limits_for_cols`] 动态钳到 2/9 列（见 [`GRID_MAX_COLS`]/
+    /// [`GRID_MIN_COLS`]）——不再是阅读共享的 [ZOOM_MIN, ZOOM_MAX]。网格会话语义：文档
+    /// `release`/切换复位 1.0，同文档内存重载（页操作 reload）期间保持。
     pub(crate) grid_zoom: f32,
+    /// 最近一次网格 render 已知的**视口宽**（CSS px，来自 [`Self::grid_viewport`] 宽轴）：
+    /// 供无 window 句柄的 [`PdfViewer::set_grid_zoom`] 算动态列数钳用（`grid_scroll`
+    /// bounds 未布局时回退本值；非网格/未渲染过 = 0）。仅网格 render 帧更新。
+    pub(crate) last_grid_viewport_w: f32,
     /// 网格模式独立滚动句柄（`pdf-grid-scroll` 容器；与单列 `scroll` 完全隔离）。
     pub(crate) grid_scroll: ScrollHandle,
-    /// 网格缩略图：页 → 已就绪卡位图（经 [`super::PdfWorker::request_grid`] 拉取；独立于
-    /// `slots` 的 LOD 槽——网格卡图只存这里，不碰 thumb/mid/cover 预算）。
-    pub(crate) grid_thumbs: HashMap<usize, Arc<RenderImage>>,
+    /// 网格缩略图：页 → 已就绪卡位图 + 所属分桶（经 [`super::PdfWorker::request_grid`] 拉取；
+    /// 独立于 `slots` 的 LOD 槽——网格卡图只存这里，不碰 thumb/mid/cover 预算）。跨桶缩放
+    /// **保留**旧桶条目作桥（`reset_grid_dispatch_for_zoom_bucket` 只清在途不清图），bucket
+    /// 判断 stale：调度对有 stale 图照常重派、渲染回退画桥（见 `GridThumb`）。
+    pub(crate) grid_thumbs: HashMap<usize, GridThumb>,
     /// 在途网格缩略图请求：页 → (导航世代 nav_gen, 结果通道)。世代守卫对齐
     /// [`Self::pending_thumb`]（大跳/切档时按 nav_gen/zoom_epoch 由 worker drop 旧请求）。
     pub(crate) pending_grid: HashMap<usize, (u64, mpsc::Receiver<Option<RenderResult>>)>,
@@ -709,6 +768,11 @@ pub struct PdfViewer {
     pub(crate) grid_last_range: std::cell::Cell<(usize, usize)>,
     /// 网格 render 帧观测：上帧实际物化的页卡总数（= `grid_last_range` 覆盖页数）。
     pub(crate) grid_last_drawn: std::cell::Cell<usize>,
+    /// 网格占位命中计数：网格卡**完全无缩略图**（无当前桶、也无旧桶桥图）才画占位时分支
+    /// 自增（`render::build_grid_cards` 的 None 分支；与单列 `loading_placeholder_hits` 对称，
+    /// 二者不共享——单列计数不覆盖网格卡路径）。回归断言网格 Ctrl+滚轮跨桶缩放期间桥图
+    /// 生效、占位不增长而新增；`release` 时归零。
+    pub(crate) grid_placeholder_hits: std::cell::Cell<u64>,
     // ---- 网格多选（wave5）：选中集模型 + Shift 范围锚点 ----
     /// 当前网格**选中页下标集**（`HashSet` 提供 O(1) 存在查询；页数为千级时全选集内存
     /// ~几十 KB，量级可接受）。**一次网格会话语义**：进入网格、退出网格（含点卡跳页、
@@ -727,6 +791,11 @@ pub struct PdfViewer {
     /// 网格布局每帧快照（wave6）：「渲染期写、事件期读」对齐 TabBoundsRecorder 姿势——
     /// render 每帧把 [`GridLayout`] 抄入，`on_drag_move` 事件期读上一帧布局算插入命中。
     pub(crate) grid_layout_cell: std::cell::RefCell<Option<GridLayout>>,
+    /// 分页页排（Single/Facing）布局每帧快照：`ensure_window` 每帧以 zoom=1（fit）口径、
+    /// 真实阅读视口重算 [`PagedLayout`] 并抄入，render 期读上一帧布局做分页定位（同
+    /// `grid_layout_cell`「渲染期写、render 期读」姿势，下一页排命中/吸附沿用本快照）。
+    /// 连续模式 / 网格 / 空文档 → `None`（渲染走连续或网格分支，不读它）。
+    pub(crate) paged_layout_cell: std::cell::RefCell<Option<PagedLayout>>,
     /// 拖拽重排后的 reload 保持网格模式（wave6）：`grid_drag_release` 提交前置位，
     /// [`PdfViewer::apply_loaded`] 消费后清——拖拽重组是网格内操作，reload 不应把用户踢
     /// 回单列（默认 reload 复位到单列语义仅适用非拖拽的普通重载）。
@@ -734,6 +803,12 @@ pub struct PdfViewer {
 }
 
 impl PdfViewer {
+    /// 当前阅读页排模式（连续/单页/双页；与网格总览正交，进出网格保留）。
+    /// shell 状态栏页排钮选中态读取；渲染三路分派由后续切片接。
+    pub fn page_mode(&self) -> PageMode {
+        self.page_mode
+    }
+
     /// A1 收敛十字门辅助（仅测试）：逐可见页返回 `(page, missing, total)`……
     #[cfg(test)]
     pub(crate) fn visible_tile_presence(
@@ -786,14 +861,14 @@ impl PdfViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::AppContext as _;
-    use gpui::TestAppContext;
+    use crate::pdf::parser::grid_bucket_width;
     use crate::pdf::test_util;
+    use gpui::AppContext as _;
+    use gpui::Entity;
+    use gpui::TestAppContext;
+    use gpui::VisualTestContext;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use gpui::Entity;
-    use gpui::VisualTestContext;
-    use crate::pdf::parser::grid_bucket_width;
 
     /// 纯逻辑复现 minimal `PdfViewer`（**不触碰 pdfium**：不走 [`Self::new`]，无真实 PDF）。
     /// 只喂一页占位 dims + 初始滚动偏移，验证 `adjust_zoom` 的四件事：
@@ -898,17 +973,21 @@ mod tests {
                     pan_origin: gpui::point(px(0.), px(0.)),
                     pan_offset0: gpui::point(px(0.), px(0.)),
                     grid_mode: false,
+                    page_mode: PageMode::Continuous,
                     grid_zoom: 1.0,
+                    last_grid_viewport_w: 0.0,
                     grid_scroll: ScrollHandle::new(),
                     grid_thumbs: HashMap::new(),
                     pending_grid: HashMap::new(),
                     grid_last_range: std::cell::Cell::new((0, 0)),
                     grid_last_drawn: std::cell::Cell::new(0),
+                    grid_placeholder_hits: std::cell::Cell::new(0),
                     grid_selected: HashSet::new(),
                     grid_anchor: None,
                     grid_press: None,
                     grid_drag: None,
                     grid_layout_cell: std::cell::RefCell::new(None),
+                    paged_layout_cell: std::cell::RefCell::new(None),
                     grid_hold_on_reload: false,
                 };
                 // 先滚到文档中段（纵向负偏移），作为缩放重锚的基准。⚠️ 须落在新布局
@@ -916,7 +995,10 @@ mod tests {
                 // 起点的 B 场景由 #2 clamp 处理（见 lib.rs `zoom_bottom_clamp_*` 专测），
                 // 这里锁的是「锚点页重锚分毫不差」的 Z1 公式（clamp 后公式不再可见）。
                 v.scroll.set_offset(gpui::point(px(-40.0), px(-600.0)));
-                assert!((v.total_height - total).abs() < 1e-3, "build 完 total_height");
+                assert!(
+                    (v.total_height - total).abs() < 1e-3,
+                    "build 完 total_height"
+                );
                 v
             })
         });
@@ -1004,13 +1086,8 @@ mod tests {
         let thumb = mk(0x50);
 
         // 缩放过渡中：新密度封面还没回来（cover_now=None）→ 底图 = 旧封面，而非 None。
-        let base = super::render::page_base_image(
-            None,
-            Some(&old_cover),
-            None,
-            Some(&mid),
-            Some(&thumb),
-        );
+        let base =
+            super::render::page_base_image(None, Some(&old_cover), None, Some(&mid), Some(&thumb));
         let base = base.expect("缩放过渡期只要有旧资产就不能落「加载中」");
         assert!(
             std::sync::Arc::ptr_eq(&base, &old_cover),
@@ -1151,17 +1228,21 @@ mod tests {
                     pan_origin: gpui::point(px(0.), px(0.)),
                     pan_offset0: gpui::point(px(0.), px(0.)),
                     grid_mode: false,
+                    page_mode: PageMode::Continuous,
                     grid_zoom: 1.0,
+                    last_grid_viewport_w: 0.0,
                     grid_scroll: ScrollHandle::new(),
                     grid_thumbs: HashMap::new(),
                     pending_grid: HashMap::new(),
                     grid_last_range: std::cell::Cell::new((0, 0)),
                     grid_last_drawn: std::cell::Cell::new(0),
+                    grid_placeholder_hits: std::cell::Cell::new(0),
                     grid_selected: HashSet::new(),
                     grid_anchor: None,
                     grid_press: None,
                     grid_drag: None,
                     grid_layout_cell: std::cell::RefCell::new(None),
+                    paged_layout_cell: std::cell::RefCell::new(None),
                     grid_hold_on_reload: false,
                 }
             })
@@ -1307,17 +1388,21 @@ mod tests {
                     pan_origin: gpui::point(px(0.), px(0.)),
                     pan_offset0: gpui::point(px(0.), px(0.)),
                     grid_mode: false,
+                    page_mode: PageMode::Continuous,
                     grid_zoom: 1.0,
+                    last_grid_viewport_w: 0.0,
                     grid_scroll: ScrollHandle::new(),
                     grid_thumbs: HashMap::new(),
                     pending_grid: HashMap::new(),
                     grid_last_range: std::cell::Cell::new((0, 0)),
                     grid_last_drawn: std::cell::Cell::new(0),
+                    grid_placeholder_hits: std::cell::Cell::new(0),
                     grid_selected: HashSet::new(),
                     grid_anchor: None,
                     grid_press: None,
                     grid_drag: None,
                     grid_layout_cell: std::cell::RefCell::new(None),
+                    paged_layout_cell: std::cell::RefCell::new(None),
                     grid_hold_on_reload: false,
                 };
                 // 先给出「静置已确认」状态，验证变更会复位它（触发一帧收集重着色结果并重绘），
@@ -1326,19 +1411,32 @@ mod tests {
                 v.window_settled = true;
                 v.tile_pump_running = true;
 
-                let p = RecolorParams { bg: [0x20, 0x20, 0x20], ink: None };
+                let p = RecolorParams {
+                    bg: [0x20, 0x20, 0x20],
+                    ink: None,
+                };
                 v.set_recolor(Some(p), cx);
                 assert_eq!(v.recolor, Some(p), "重着色状态应更新（存到 view 侧）");
                 assert_eq!(v.window_sig, None, "变更应复位门控（触发一帧收集+重绘）");
                 assert!(!v.window_settled, "变更应复位静置确认");
-                assert!(v.tile_pump_running, "切档不重栅：不应停泵（在途瓦片结果仍有效）");
-                assert!(v.pending_recolor.is_none(), "无 worker 时不发刷新请求、不 panic");
+                assert!(
+                    v.tile_pump_running,
+                    "切档不重栅：不应停泵（在途瓦片结果仍有效）"
+                );
+                assert!(
+                    v.pending_recolor.is_none(),
+                    "无 worker 时不发刷新请求、不 panic"
+                );
 
                 // 同参短值：不动已确认门控（避免重复刷新）。
                 v.window_sig = Some(WindowSig::default());
                 v.window_settled = true;
                 v.set_recolor(Some(p), cx);
-                assert_eq!(v.window_sig, Some(WindowSig::default()), "同参应短路、不失效");
+                assert_eq!(
+                    v.window_sig,
+                    Some(WindowSig::default()),
+                    "同参应短路、不失效"
+                );
                 assert!(v.window_settled, "同参应短路、不重置静置");
 
                 // 回 None（默认直通）→ 清状态 + 复位门控（同样不重栅、不停泵）。
@@ -1449,19 +1547,69 @@ mod tests {
             pan_origin: gpui::point(px(0.), px(0.)),
             pan_offset0: gpui::point(px(0.), px(0.)),
             grid_mode: false,
+            page_mode: PageMode::Continuous,
             grid_zoom: 1.0,
+            last_grid_viewport_w: 0.0,
             grid_scroll: ScrollHandle::new(),
             grid_thumbs: HashMap::new(),
             pending_grid: HashMap::new(),
             grid_last_range: std::cell::Cell::new((0, 0)),
             grid_last_drawn: std::cell::Cell::new(0),
+            grid_placeholder_hits: std::cell::Cell::new(0),
             grid_selected: HashSet::new(),
             grid_anchor: None,
             grid_press: None,
             grid_drag: None,
             grid_layout_cell: std::cell::RefCell::new(None),
+            paged_layout_cell: std::cell::RefCell::new(None),
             grid_hold_on_reload: false,
         }
+    }
+
+    /// 状态栏滑条（绝对缩放目标 [`PdfViewer::set_zoom_abs`]）：设值 + 上下钳位。
+    /// 纯状态夹具 `minimal_viewer`（不触碰 pdfium）验证 `zoom_target` 的 clamp 兜底。
+    #[gpui::test]
+    async fn set_zoom_abs_sets_and_clamps(cx: &mut TestAppContext) {
+        let viewer: gpui::Entity<PdfViewer> = cx.update(|app| app.new(|cx| minimal_viewer(cx)));
+        // 2.0 直接生效
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_zoom_abs(2.0, cx));
+            assert!(
+                (viewer.read(app).zoom - 2.0).abs() < 1e-4,
+                "set_zoom_abs(2.0) 直设"
+            );
+        });
+        // 10.0 → 钳到上限 ZOOM_MAX（4.0）
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_zoom_abs(10.0, cx));
+            assert!(
+                (viewer.read(app).zoom - ZOOM_MAX).abs() < 1e-4,
+                "clamp 上限"
+            );
+        });
+        // 0.1 → 钳到下限 ZOOM_MIN（0.5）
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_zoom_abs(0.1, cx));
+            assert!(
+                (viewer.read(app).zoom - ZOOM_MIN).abs() < 1e-4,
+                "clamp 下限"
+            );
+        });
+    }
+
+    /// 状态栏滑条（绝对缩放目标 [`PdfViewer::set_zoom_abs`]）：同目标早退——zoom 不变、
+    /// worker 缩放世代 `zoom_epoch` 不增（zoom_target 内 1e-4 无变化短路生效）。
+    #[gpui::test]
+    async fn set_zoom_abs_same_target_noop(cx: &mut TestAppContext) {
+        let viewer: gpui::Entity<PdfViewer> = cx.update(|app| app.new(|cx| minimal_viewer(cx)));
+        let (zoom, epoch_before, epoch_after) = cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_zoom_abs(2.0, cx));
+            let before = viewer.read(app).zoom_epoch;
+            viewer.update(app, |v, cx| v.set_zoom_abs(2.0, cx));
+            (viewer.read(app).zoom, before, viewer.read(app).zoom_epoch)
+        });
+        assert!((zoom - 2.0).abs() < 1e-4, "同目标 zoom 保持 2.0");
+        assert_eq!(epoch_after, epoch_before, "同目标早退，zoom_epoch 不增");
     }
 
     /// W1 回归：**CPU 回退路径切档后，旧世代在途渲染结果到达被丢弃、新世代结果被采纳**。
@@ -1478,9 +1626,7 @@ mod tests {
         use gpui::AppContext as _;
         let zooms = [1.0f32, 1.12, 1.2544, 1.404928, 1.57351936, 0.75, 2.0];
         let sfs = [1.0f32, 1.5, 2.0];
-        let viewer: gpui::Entity<PdfViewer> = cx.update(|app| {
-            app.new(|cx| minimal_viewer(cx))
-        });
+        let viewer: gpui::Entity<PdfViewer> = cx.update(|app| app.new(|cx| minimal_viewer(cx)));
         for &sf in &sfs {
             for &z in &zooms {
                 let (raw, pw) = cx.update(|app| {
@@ -1495,7 +1641,11 @@ mod tests {
                     (pw * sf - (pw * sf).round()).abs() < 1e-3,
                     "page_width·sf 应为设备整数：base_w*zoom={raw} sf={sf} pw={pw}"
                 );
-                assert_eq!(pw, crate::pdf::layout::snap_to_device(raw, sf), "与量化定义一致");
+                assert_eq!(
+                    pw,
+                    crate::pdf::layout::snap_to_device(raw, sf),
+                    "与量化定义一致"
+                );
                 assert!(
                     (pw - raw).abs() * sf <= 0.5 + 1e-3,
                     "量化偏移应 ≤0.5 设备 px：raw={raw} pw={pw} sf={sf}"
@@ -1510,7 +1660,10 @@ mod tests {
     #[gpui::test]
     async fn w1_stale_recolor_epoch_results_dropped_in_cpu_path(cx: &mut TestAppContext) {
         use gpui::AppContext as _;
-        let rec = RecolorParams { bg: [0x20, 0x20, 0x20], ink: Some([0xD8, 0xD8, 0xD8]) };
+        let rec = RecolorParams {
+            bg: [0x20, 0x20, 0x20],
+            ink: Some([0xD8, 0xD8, 0xD8]),
+        };
         let viewer: gpui::Entity<PdfViewer> = cx.update(|app| {
             app.new(|cx| {
                 let mut v = minimal_viewer(cx);
@@ -1572,7 +1725,10 @@ mod tests {
                 v.pending_tiles.insert((0, 0, 0), (scale, 0, rx));
                 let any = v.collect_tile_results(1.0);
                 assert!(any, "当前世代瓦片应被采纳");
-                assert!(v.slots[0].tiles.contains_key(&(0, 0)), "槽位应装入新世代瓦片");
+                assert!(
+                    v.slots[0].tiles.contains_key(&(0, 0)),
+                    "槽位应装入新世代瓦片"
+                );
             });
         });
 
@@ -1682,8 +1838,7 @@ mod tests {
             cover_scale(v.dims[0], v.page_width(), 1.0)
         });
         let drive_failure = |holder: &Rc<RefCell<Option<gpui::Entity<PdfViewer>>>>,
-                             cx: &mut gpui::VisualTestContext|
-         {
+                             cx: &mut gpui::VisualTestContext| {
             cx.update(|_w, app| {
                 holder.borrow().as_ref().unwrap().update(app, |v, _cx| {
                     let (tx, rx) = mpsc::channel();
@@ -1716,7 +1871,8 @@ mod tests {
 
         // skip_covered 翻转：拉黑前该页（封面 affordable 同密度）不派瓦片；拉黑后回退瓦片。
         // 「拉黑前」对照用**独立新鲜 viewer**（同一几何，未污染黑名单）。
-        let fresh: gpui::Entity<PdfViewer> = cx.update(|_window, app| app.new(|cx| minimal_viewer(cx)));
+        let fresh: gpui::Entity<PdfViewer> =
+            cx.update(|_window, app| app.new(|cx| minimal_viewer(cx)));
         let (need_before, need_after) = cx.update(|window, cx| {
             let before = {
                 let v = fresh.read(cx);
@@ -1783,11 +1939,7 @@ mod tests {
                 let vv = holder.borrow().as_ref().unwrap().read(app);
                 let dim = vv.dims[0];
                 let pw = vv.page_width();
-                (
-                    cover_scale(dim, pw, 1.0),
-                    dim,
-                    render_scale(pw, 1.0, dim.0),
-                )
+                (cover_scale(dim, pw, 1.0), dim, render_scale(pw, 1.0, dim.0))
             };
             assert!(
                 cover_affordable(dim, cscale)
@@ -1823,8 +1975,7 @@ mod tests {
             // 2b-在槽：封面在槽且 cover_scale≈cscale → 仍走 skip。
             holder.borrow().as_ref().unwrap().update(app, |vv, _| {
                 vv.pending_cover.clear();
-                vv.slots[0].cover =
-                    crate::render_image_from_bgra(vec![0u8; 4 * 8 * 8], 8, 8).ok();
+                vv.slots[0].cover = crate::render_image_from_bgra(vec![0u8; 4 * 8 * 8], 8, 8).ok();
                 vv.slots[0].cover_scale = cscale;
             });
             let in_slot = {
@@ -1910,7 +2061,10 @@ mod tests {
             let bmp = page_bitmap_size(dim, scale);
             let disp_h = display_height(dim, pw);
             let viewport_h = f32::from(v.scroll.bounds().size.height);
-            assert!(viewport_h > 0.0, "滚动容器应在渲染后布局完成：viewport_h={viewport_h}");
+            assert!(
+                viewport_h > 0.0,
+                "滚动容器应在渲染后布局完成：viewport_h={viewport_h}"
+            );
             let scroll_y = f32::from(-v.scroll.offset().y);
             let wrap_w = v.wrap_width(window, pw);
             let rect = v
@@ -1964,7 +2118,11 @@ mod tests {
             ent.read(cx).loading_placeholder_hits.get()
         });
         cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().update(cx, |_v, cx| cx.notify());
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |_v, cx| cx.notify());
         });
         for _ in 0..3 {
             cx.run_until_parked();
@@ -1982,8 +2140,7 @@ mod tests {
             "应存在部分瓦片（缺一格）：partial={partial} total={total}"
         );
         assert_eq!(
-            drawn1,
-            0,
+            drawn1, 0,
             "部分新密度瓦片在场时本帧不得绘制任何瓦片元素（同帧不混叠，宁糊不混）：partial={partial}"
         );
         assert_eq!(hits1, hits0, "底图链恒非空，过渡期不得落「加载中」（R4）");
@@ -2117,7 +2274,11 @@ mod tests {
                 );
                 // 连续 K 帧小位移 → 直落 Slow
                 v.update_stop_detection(0.0);
-                assert_eq!(v.speed_state, SpeedState::Slow, "连续 K 帧小位移应直落 Slow");
+                assert_eq!(
+                    v.speed_state,
+                    SpeedState::Slow,
+                    "连续 K 帧小位移应直落 Slow"
+                );
                 assert!(!v.prev_fast, "直落 Slow 后 prev_fast 派生同步 false");
                 // 已 Slow/Idle 再小帧 → 无副作用（保持原档，不误伤既有状态机）
                 v.speed_state = SpeedState::Idle;
@@ -2246,7 +2407,11 @@ mod tests {
         let (cscale, scale, bmp) = cx.update(|app| {
             let v = v.read(app);
             let s = render_scale(v.page_width(), 1.0, v.dims[0].0);
-            (cover_scale(v.dims[0], v.page_width(), 1.0), s, page_bitmap_size(v.dims[0], s))
+            (
+                cover_scale(v.dims[0], v.page_width(), 1.0),
+                s,
+                page_bitmap_size(v.dims[0], s),
+            )
         });
         cx.update(|app| {
             v.update(app, |v, _cx| {
@@ -2277,7 +2442,10 @@ mod tests {
                     v.slots[0].cover.is_some(),
                     "换档期间 cover 不得被 collect_tile_results 清除"
                 );
-                assert!(v.slots[0].tiles.is_empty(), "该页瓦片不应入槽（封面已供给）");
+                assert!(
+                    v.slots[0].tiles.is_empty(),
+                    "该页瓦片不应入槽（封面已供给）"
+                );
                 // ② evict_tiles：同密度封面冗余清扫只清瓦片、绝不清 cover。
                 v.slots[0].tiles.insert(
                     (0, 0),
@@ -2364,18 +2532,20 @@ mod tests {
         // 模拟快速滚动：置 fast 态（`update_fast_flag` 的等价终态：speed_state=Fast +
         // prev_fast=true 两者恒同步）。
         cx.update(|_, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _c| {
+                v.speed_state = SpeedState::Fast;
+                v.prev_fast = true;
+            });
+        });
+        // 前提 2：release 前泵应仍需运行（快速滚动中持续出帧清尾）。
+        let before = cx.update(|_, cx| {
             holder
                 .borrow()
                 .as_ref()
                 .unwrap()
-                .update(cx, |v, _c| {
-                    v.speed_state = SpeedState::Fast;
-                    v.prev_fast = true;
-                });
+                .read(cx)
+                .pump_still_needed()
         });
-        // 前提 2：release 前泵应仍需运行（快速滚动中持续出帧清尾）。
-        let before = cx
-            .update(|_, cx| holder.borrow().as_ref().unwrap().read(cx).pump_still_needed());
         assert!(before, "快速滚动中 pump_still_needed 应为 true");
 
         // 关闭标签页等价路径：release()
@@ -2388,8 +2558,14 @@ mod tests {
         });
         // 断言：release 后 pump_still_needed() 必须为 false（泵应停）。
         // 修复前 release 未复位 prev_fast、pump_still_needed 又未防「已 release 视图」→ 仍 true → 红。
-        let after = cx
-            .update(|_, cx| holder.borrow().as_ref().unwrap().read(cx).pump_still_needed());
+        let after = cx.update(|_, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .pump_still_needed()
+        });
         assert!(
             !after,
             "release 后 pump_still_needed 应为 false（僵尸泵：release 未复位 prev_fast 且 \
@@ -2489,6 +2665,1188 @@ mod tests {
         }
     }
 
+    // ---- 阅读页排模式（page_mode）状态层：只存状态 + 通知，渲染分派/锚点恢复未接 -----
+    // （状态断言复用既有 `minimal_viewer`：不触碰 pdfium 的 1 页最小 PdfViewer）
+
+    /// 默认 Continuous；`set_page_mode` 三态可换；重设同值幂等（不抖动）。
+    #[gpui::test]
+    async fn page_mode_defaults_continuous_and_setter_changes(cx: &mut TestAppContext) {
+        let viewer = cx.update(|app| app.new(|cx| minimal_viewer(cx)));
+        let mode = cx.update(|app| viewer.read(app).page_mode());
+        assert_eq!(mode, PageMode::Continuous, "默认页排模式应为连续滚动");
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        let mode = cx.update(|app| viewer.read(app).page_mode());
+        assert_eq!(mode, PageMode::Single, "set_page_mode(Single) 后应为单页");
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        let mode = cx.update(|app| viewer.read(app).page_mode());
+        assert_eq!(
+            mode,
+            PageMode::Single,
+            "重复 set_page_mode(Single) 幂等不变"
+        );
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        let mode = cx.update(|app| viewer.read(app).page_mode());
+        assert_eq!(
+            mode,
+            PageMode::Facing,
+            "set_page_mode(Facing) 后应为双页对开"
+        );
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_page_mode(PageMode::Continuous, cx));
+        });
+        let mode = cx.update(|app| viewer.read(app).page_mode());
+        assert_eq!(
+            mode,
+            PageMode::Continuous,
+            "set_page_mode(Continuous) 后应回连续"
+        );
+    }
+
+    /// page_mode 与网格总览正交：进入网格（grid_mode=true）与退出网格（grid_mode=false）
+    /// 都保留 page_mode——读写网格不清阅读页排模式。
+    #[gpui::test]
+    async fn page_mode_survives_grid_toggle(cx: &mut TestAppContext) {
+        let viewer = cx.update(|app| app.new(|cx| minimal_viewer(cx)));
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_grid_mode(true, cx));
+        });
+        let (gm, pm) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.grid_mode(), v.page_mode())
+        });
+        assert!(gm, "进入网格后 grid_mode 应为 true");
+        assert_eq!(pm, PageMode::Single, "进入网格不应清 page_mode");
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_grid_mode(false, cx));
+        });
+        let (gm, pm) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.grid_mode(), v.page_mode())
+        });
+        assert!(!gm, "退出网格后 grid_mode 应为 false");
+        assert_eq!(pm, PageMode::Single, "退出网格仍保留 page_mode");
+    }
+
+    /// 网格总览中直接 set_page_mode → 先退出网格再落新页排模式（网格只是一时总览）。
+    #[gpui::test]
+    async fn set_page_mode_from_grid_exits_grid(cx: &mut TestAppContext) {
+        let viewer = cx.update(|app| app.new(|cx| minimal_viewer(cx)));
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_grid_mode(true, cx));
+        });
+        cx.update(|app| {
+            viewer.update(app, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        let (gm, pm) = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.grid_mode(), v.page_mode())
+        });
+        assert!(!gm, "网格中 set_page_mode 应先退出网格");
+        assert_eq!(pm, PageMode::Facing, "退出网格后 page_mode 应落为新模式");
+    }
+
+    // ---- 分页页排（page_mode ∈ {Single, Facing}，非网格）渲染集成测试 ----
+
+    /// 分页测试夹具：构造不触碰 pdfium 的**已加载**多页 PdfViewer（worker=None），
+    /// dims/slots 按传入页数铺齐（`minimal_viewer` 同姿态，仅补多页槽）。
+    fn paged_viewer(cx: &mut gpui::Context<PdfViewer>, dims: Vec<(f32, f32)>) -> PdfViewer {
+        let (tops, total) = compute_layout(&dims, PAGE_WIDTH);
+        let mut v = minimal_viewer(cx);
+        v.dims = dims.clone();
+        v.page_tops = tops;
+        v.total_height = total;
+        v.slots = (0..dims.len()).map(|_| Slot::default()).collect();
+        v
+    }
+
+    /// 分页测试的窗口宿主：整窗渲染一个 PdfViewer（无 pdfium，打开即已加载）。
+    struct PagedHost {
+        pdf: Entity<PdfViewer>,
+    }
+    impl Render for PagedHost {
+        fn render(
+            &mut self,
+            _w: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            gpui::div().size_full().child(self.pdf.clone())
+        }
+    }
+
+    /// 分页测试公共开窗：3 页 A4（793×1123 pt，与 layout.rs paged 手算同口径）+ 整窗
+    /// 宿主 + 真实容器 ≈1000×700（K185：注入真实宿主结构，scroll.bounds() 为真实视口）。
+    fn open_paged_host<'a>(
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        &'a mut VisualTestContext,
+    ) {
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| paged_viewer(cx, vec![(793.0, 1123.0); 3]));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PagedHost { pdf }
+        });
+        vcx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(700.)));
+        for _ in 0..6 {
+            let _ = vcx.refresh();
+            vcx.run_until_parked();
+        }
+        (holder, vcx)
+    }
+
+    /// 分页期望（K177）：真实阅读视口 + 同套常量/纯函数手算显示矩形。
+    /// 口径统一到 [`expected_display_rect`]（水平按视口重算居中，任意 zoom 正确）；
+    /// zoom=1 时与旧 `cell_rect(i) × zoom` 代数恒等，既有 zoom=1 断言值不变。
+    fn expected_paged_cell(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        cols: usize,
+        page: usize,
+    ) -> Option<(f32, f32, f32, f32)> {
+        expected_display_rect(holder, cx, cols, page)
+    }
+
+    /// 单页模式（Single）：每行 1 页按 contain-fit 铺（页高 ≤ 视口），行堆叠；首屏只见
+    /// 第 1 行（页高恰一屏 → 第 2 行顶在视口下）。渲染卡位置 = `cell_rect(0)`（zoom=1）。
+    #[gpui::test]
+    async fn paged_single_renders_one_per_row_at_fit_positions(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        // 进入单页模式（切模式后刷新，ensure_window 按 Single 布局每帧重算）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(PageMode::Single, cx);
+            });
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 真实容器 ≈1000×700（K185：真实宿主结构，非「元素=窗口根」简化模型）。
+        let (vw, vh) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.scroll.bounds();
+            (f32::from(b.size.width), f32::from(b.size.height))
+        });
+        assert!(
+            (vw - 1000.0).abs() < 4.0 && (vh - 700.0).abs() < 4.0,
+            "滚动容器应≈1000×700，实际 {vw}×{vh}"
+        );
+        // 手算（K177，对齐 layout.rs paged_single_col_a4_hand_computed）：cols=1 →
+        // content_w = vw−2·PAGE_PAD_X、fit_w = vh·(793/1123) ≈ 494.30、cell_w = 494.30、
+        // cell_h ≈ 700（恰一屏）、left_pad = (content_w − cell_w)/2 ≈ 232.85 →
+        // cell_rect(0) = (PAGE_PAD_X + left_pad ≈252.85, PAGE_PAD_X=20, 494.30, 700)。
+        let r0 = expected_paged_cell(&holder, cx, 1, 0).expect("页 0 应在分页布局内");
+        let sc = cx.debug_bounds("pdf-scroll").expect("滚动容器应在场");
+        let b0 = cx.debug_bounds("pdf-page-0").expect("首卡应在场");
+        let left = b0.left().as_f32() - sc.left().as_f32();
+        let top = b0.top().as_f32() - sc.top().as_f32();
+        assert!(
+            (left - r0.0).abs() < 0.5,
+            "卡 0 左缘应≈{}，实际 {left:.2}",
+            r0.0
+        );
+        assert!(
+            (top - r0.1).abs() < 0.5,
+            "卡 0 顶应≈{}，实际 {top:.2}",
+            r0.1
+        );
+        assert!(
+            (b0.size.width.as_f32() - r0.2).abs() < 0.5,
+            "卡 0 宽应≈{}",
+            r0.2
+        );
+        assert!(
+            (b0.size.height.as_f32() - r0.3).abs() < 0.5,
+            "卡 0 高应≈{}",
+            r0.3
+        );
+        // 页高 ≈ 视口高 → 第 2 行顶在视口下 → 首屏只物化页 0。
+        assert!(
+            cx.debug_bounds("pdf-page-1").is_none(),
+            "单页模式首屏应只物化第 1 行（下一行在视口之下）"
+        );
+    }
+
+    /// 双页模式（Facing）：首行并排 2 页（y 相同、x 相邻 = 卡 0 左 + 卡 0 宽 + gap）；
+    /// 第二行只 1 卡（或视口未及则不物化，`.is_some() == 行 1 顶 < 视口底`）。
+    #[gpui::test]
+    async fn paged_facing_renders_two_per_row(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(PageMode::Facing, cx);
+            });
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let r0 = expected_paged_cell(&holder, cx, 2, 0).expect("页 0");
+        let r1 = expected_paged_cell(&holder, cx, 2, 1).expect("页 1");
+        let (vh,) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (f32::from(v.scroll.bounds().size.height),)
+        });
+        let sc = cx.debug_bounds("pdf-scroll").expect("滚动容器应在场");
+        let b0 = cx.debug_bounds("pdf-page-0").expect("首行卡 0 应在场");
+        let b1 = cx.debug_bounds("pdf-page-1").expect("首行卡 1 应在场");
+        let (x0, y0, w0) = (
+            b0.left().as_f32() - sc.left().as_f32(),
+            b0.top().as_f32() - sc.top().as_f32(),
+            b0.size.width.as_f32(),
+        );
+        let (x1, y1) = (
+            b1.left().as_f32() - sc.left().as_f32(),
+            b1.top().as_f32() - sc.top().as_f32(),
+        );
+        assert!(
+            (x0 - r0.0).abs() < 0.5 && (y0 - r0.1).abs() < 0.5,
+            "卡 0 应按 cell_rect(0)"
+        );
+        assert!(
+            (x1 - r1.0).abs() < 0.5 && (y1 - r1.1).abs() < 0.5,
+            "卡 1 应按 cell_rect(1)"
+        );
+        assert!((y1 - y0).abs() < 0.5, "首行两卡 y 应相同（同行并排）");
+        // 卡 1 左 = 卡 0 左 + 卡 0 宽 + gap（GRID_GAP × zoom=1）。
+        assert!(
+            (x1 - (x0 + w0) - GRID_GAP).abs() < 0.5,
+            "首行两卡相邻：卡1.x − (卡0.x+卡0.w) 应≈GRID_GAP({GRID_GAP})，实际 {}",
+            x1 - (x0 + w0)
+        );
+        // 第二行只 1 卡：行 1 顶 < 视口底 → 页 2 物化（在 cell_rect(2)），否则不物化。
+        let row1_visible = cx.debug_bounds("pdf-page-2").is_some();
+        assert_eq!(
+            row1_visible,
+            {
+                let r2 = expected_paged_cell(&holder, cx, 2, 2).expect("页 2");
+                r2.1 < vh - 0.5
+            },
+            "页 2 物化与否应与「行 1 顶 < 视口底」一致（第二行只 1 卡或为空）"
+        );
+        if row1_visible {
+            let r2 = expected_paged_cell(&holder, cx, 2, 2).expect("页 2");
+            let b2 = cx.debug_bounds("pdf-page-2").expect("页 2 应在场");
+            assert!(
+                (b2.left().as_f32() - sc.left().as_f32() - r2.0).abs() < 0.5
+                    && (b2.top().as_f32() - sc.top().as_f32() - r2.1).abs() < 0.5,
+                "第二行单页应在 cell_rect(2)"
+            );
+        }
+    }
+
+    /// 连续模式回归：page_mode=Continuous → 走既有 `render_pdf_pages`（每页左 0、宽
+    /// page_width、top = compute_layout）不回归，卡 debug_bounds 与连续布局一致。
+    #[gpui::test]
+    async fn paged_mode_off_uses_continuous_layout(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        // page_mode 默认 Continuous：保持连续渲染（不改任何模式）。
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let (page_width, tops, disp_h0, vw) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            (
+                pw,
+                v.page_tops.clone(),
+                display_height((793.0, 1123.0), pw),
+                f32::from(v.scroll.bounds().size.width),
+            )
+        });
+        let sc = cx.debug_bounds("pdf-scroll").expect("滚动容器应在场");
+        let b0 = cx.debug_bounds("pdf-page-0").expect("连续首卡应在场");
+        // 连续页列：卡 0 左 = 居中偏移（容器宽 − 页宽)/2、顶 = PAGE_PAD_Y、宽 = page_width、
+        // 高 = display_height（page_tops[0] 即 compute_layout 首行顶 = PAGE_PAD_Y）。
+        let cx0 = (vw - page_width) / 2.0;
+        let left0 = b0.left().as_f32() - sc.left().as_f32();
+        let top0 = b0.top().as_f32() - sc.top().as_f32();
+        assert!(
+            (left0 - cx0).abs() < 1.0,
+            "连续卡 0 应居中（左≈{cx0}），实际 {left0:.2}"
+        );
+        assert!(
+            (top0 - tops[0]).abs() < 0.5,
+            "连续卡 0 顶应≈PAGE_PAD_Y={}",
+            tops[0]
+        );
+        assert!(
+            (b0.size.width.as_f32() - page_width).abs() < 0.5,
+            "连续卡 0 宽应=page_width"
+        );
+        assert!(
+            (b0.size.height.as_f32() - disp_h0).abs() < 0.5,
+            "连续卡 0 高应=display_height"
+        );
+        // 第 2 张连续卡：顶 = tops[1]（前缀页高 + PAGE_GAP），还在 DOM（MARGIN 缓冲）。
+        let b1 = cx.debug_bounds("pdf-page-1").expect("连续第 2 卡应在场");
+        let top1 = b1.top().as_f32() - sc.top().as_f32();
+        assert!(
+            (top1 - tops[1]).abs() < 0.5,
+            "连续卡 1 顶应≈tops[1]={}",
+            tops[1]
+        );
+    }
+
+    // ---- 分页页拍交互片（R3-R6）：滚轮步进 / 停稳吸附 / scroll_to_page / 命中 ----
+
+    /// 当前分页滚动位：内容顶 = `−scroll.offset().y`（显示 px，≥0）。
+    fn paged_content_top(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+    ) -> f32 {
+        cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            f32::from(-v.scroll.offset().y)
+        })
+    }
+
+    /// 分页窗口坐标：内容 `(cx, cy)`（显示 px）→ 窗口坐标（滚动容器原点 + 内容位 + 偏移 0）。
+    fn paged_window_pos(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        cx_: f32,
+        cy: f32,
+    ) -> gpui::Point<gpui::Pixels> {
+        let (bl, bt) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.scroll.bounds();
+            (b.left().as_f32(), b.top().as_f32())
+        });
+        gpui::point(px(bl + cx_), px(bt + cy))
+    }
+
+    /// R4：单页模式普通滚轮 = 步进翻页（非 Ctrl）——向下滚一档到下一行顶（row_top[1]）、
+    /// 向上滚回 row_top[0]；不再自由滚动（stop_propagation）。期望 = 真实布局 `cell_rect` 行顶
+    /// （K177：Single 每行 1 页，页高 ≈ 视口高 → 一行顶 = 下一页顶）。
+    #[gpui::test]
+    async fn paged_single_wheel_steps_one_page(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let row0_top = expected_paged_cell(&holder, cx, 1, 0).expect("页 0").1;
+        let row1_top = expected_paged_cell(&holder, cx, 1, 1).expect("页 1").1;
+        assert!(
+            (row0_top - row1_top).abs() > 200.0,
+            "前置：单页两行顶应明显不同（页高≈视口高），row0={row0_top:.1} row1={row1_top:.1}"
+        );
+        assert!(
+            (paged_content_top(&holder, cx) - 0.0).abs() < 1e-3,
+            "前置：初始滚动顶应为 0"
+        );
+
+        // 向下滚一档（非 Ctrl）→ 到 row_top[1]（下一行顶）。
+        cx.simulate_event(grid_zoom_wheel(false, -120.0));
+        let t = paged_content_top(&holder, cx);
+        assert!(
+            (t - row1_top).abs() < 0.5,
+            "单页向下滚应步进到 row_top[1]，got {t:.1} want {row1_top:.1}"
+        );
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 向上滚 → 回 row_top[0]（首页顶）。
+        cx.simulate_event(grid_zoom_wheel(false, 120.0));
+        let t0 = paged_content_top(&holder, cx);
+        assert!(
+            (t0 - row0_top).abs() < 0.5,
+            "单页向上滚应回 row_top[0]，got {t0:.1} want {row0_top:.1}"
+        );
+    }
+
+    /// R4：双页模式普通滚轮 = 步进翻页——每行 2 页，一行一步 = 跨 2 页（向下滚到 row_top[1]
+    /// 即页 2 所在行顶）、向上滚回 row_top[0]。
+    #[gpui::test]
+    async fn paged_facing_wheel_steps_two_pages(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let row0_top = expected_paged_cell(&holder, cx, 2, 0).expect("页 0").1;
+        // 页 2 与页 0 同列、在行 1 → 行顶 = cell_rect(2).y = row_top[1]。
+        let row1_top = expected_paged_cell(&holder, cx, 2, 2)
+            .expect("页 2 应在行 1")
+            .1;
+        assert!(
+            (row1_top - row0_top).abs() > 200.0,
+            "前置：双页行 1 顶应在行 0 顶之下"
+        );
+        // 末行顶 + 视口高可能超出文档底 → 向下滚目标按分页量程夹（末行底对齐视口底）。
+        let max_scroll = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.scroll.bounds();
+            let l = paged_layout(
+                &v.dims,
+                b.size.width.as_f32(),
+                b.size.height.as_f32(),
+                2,
+                GRID_GAP,
+                PAGE_PAD_X,
+            );
+            (l.total_height - b.size.height.as_f32()).max(0.0)
+        });
+        let want_down = row1_top.min(max_scroll);
+
+        cx.simulate_event(grid_zoom_wheel(false, -120.0));
+        let t = paged_content_top(&holder, cx);
+        assert!(
+            (t - want_down).abs() < 0.5,
+            "双页一行一步=2 页：向下滚应到 row_top[1]（末行按量程夹到 {want_down:.1}），got {t:.1}"
+        );
+        cx.simulate_event(grid_zoom_wheel(false, 120.0));
+        let t0 = paged_content_top(&holder, cx);
+        assert!(
+            (t0 - row0_top).abs() < 0.5,
+            "双页向上滚应回 row_top[0]，got {t0:.1} want {row0_top:.1}"
+        );
+    }
+
+    /// R5：分页停稳吸附——滚动位停在行间（行 1 顶上方半个 gap）→ 停稳后吸附到最近行顶
+    /// （row_top[1]）；贴近行 0 顶 → 吸附到 row_top[0]。测试宿主逐帧泵到吸附收敛
+    /// （set_offset 的落地在测试框架与下一帧铺设间有一次时序差，见 snap 实现注释）。
+    #[gpui::test]
+    async fn paged_scroll_snap_to_nearest_row(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let row0_top = expected_paged_cell(&holder, cx, 1, 0).expect("页 0").1;
+        let row1_top = expected_paged_cell(&holder, cx, 1, 1).expect("页 1").1;
+
+        // 设置行间滚动位 + 停稳基线 → 逐帧泵到吸附收敛（≤ 12 帧）。
+        let snap_until = |holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+                          cx: &mut VisualTestContext,
+                          expect: f32| {
+            let mut t = paged_content_top(holder, cx);
+            for _ in 0..12 {
+                if (t - expect).abs() < 0.5 {
+                    break;
+                }
+                let _ = cx.refresh();
+                cx.run_until_parked();
+                t = paged_content_top(holder, cx);
+            }
+            t
+        };
+        // 停在行 0 底 / 行 1 顶的页间沟槽中点（行 1 顶 − gap/2）→ 吸附到最近的 row_top[1]。
+        let mid = row1_top - GRID_GAP / 2.0;
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.last_scroll_y = mid;
+                v.scroll.set_offset(gpui::point(px(0.), px(-mid)));
+            });
+        });
+        let t = snap_until(&holder, &mut *cx, row1_top);
+        assert!(
+            (t - row1_top).abs() < 0.5,
+            "行间停稳应吸附到最近行顶 row_top[1]，got {t:.1} want {row1_top:.1}"
+        );
+
+        // 贴近行 0 顶（行 0 顶 + 30）→ 吸附到 row_top[0]。
+        let mid0 = row0_top + 30.0;
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.last_scroll_y = mid0;
+                v.scroll.set_offset(gpui::point(px(0.), px(-mid0)));
+            });
+        });
+        let t0 = snap_until(&holder, &mut *cx, row0_top);
+        assert!(
+            (t0 - row0_top).abs() < 0.5,
+            "贴近首行顶应吸附到 row_top[0]，got {t0:.1} want {row0_top:.1}"
+        );
+    }
+
+    /// R6：`scroll_to_page(2)`（Facing）→ `r = 2/2 = 1` → 偏移 = `−row_top[1]×zoom`（行 1 顶
+    /// 对齐视口顶 = 页 2 所在行）；期望 = `cell_rect(2).y`。
+    #[gpui::test]
+    async fn paged_scroll_to_page_jumps_to_row(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let want_unclamped = expected_paged_cell(&holder, cx, 2, 2).expect("页 2").1;
+        // 末行（行 1）顶 + 视口 700 超出文档底 → scroll_to_page 按分页量程夹（末行底对底）。
+        let max_scroll = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.scroll.bounds();
+            let l = paged_layout(
+                &v.dims,
+                b.size.width.as_f32(),
+                b.size.height.as_f32(),
+                2,
+                GRID_GAP,
+                PAGE_PAD_X,
+            );
+            (l.total_height - b.size.height.as_f32()).max(0.0)
+        });
+        let want = want_unclamped.min(max_scroll);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, _| v.scroll_to_page(2));
+        });
+        let t = paged_content_top(&holder, cx);
+        assert!(
+            (t - want).abs() < 0.5,
+            "scroll_to_page(2)（Facing）应把行 1 顶对齐视口顶，got {t:.1} want {want:.1}"
+        );
+    }
+
+    /// R3：Facing 命中——点左页（页 0）中心 → 页 0；点右页（页 1）中心 → 页 1；点行间沟槽
+    /// （纵向 gap 中点）→ None（无命中/无选区）。`window_to_pt` 直接取命中的页号（probe 取页，
+    /// 无需文本层）。
+    #[gpui::test]
+    async fn paged_hit_clicks_facing_right_page(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let r0 = expected_paged_cell(&holder, cx, 2, 0).expect("页 0（左页）");
+        let r1 = expected_paged_cell(&holder, cx, 2, 1).expect("页 1（右页）");
+        let c0 = paged_window_pos(&holder, cx, r0.0 + r0.2 / 2.0, r0.1 + r0.3 / 2.0);
+        let c1 = paged_window_pos(&holder, cx, r1.0 + r1.2 / 2.0, r1.1 + r1.3 / 2.0);
+        // 行间沟槽中点（纵向 gap）：列 0 中心 x，y = 行 0 底 + gap/2。
+        let gap_y = r0.1 + r0.3 + GRID_GAP / 2.0;
+        let cgap = paged_window_pos(&holder, cx, r0.0 + r0.2 / 2.0, gap_y);
+
+        let hit0 = cx.update(|w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .window_to_pt(w, c0)
+        });
+        let hit1 = cx.update(|w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .window_to_pt(w, c1)
+        });
+        let hitgap = cx.update(|w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .window_to_pt(w, cgap)
+        });
+        assert_eq!(hit0.map(|(p, _, _)| p), Some(0), "点左页中心应命中页 0");
+        assert_eq!(hit1.map(|(p, _, _)| p), Some(1), "点右页中心应命中页 1");
+        assert!(hitgap.is_none(), "点行间沟槽应 None（无命中/无选区）");
+    }
+
+    // ---- R7：分页精确锚 / 阅读进度往返 / WindowSig 分页维度（S6 收口片） ----
+
+    /// 取分页 viewer 当前 zoom=1 布局快照（zoom=1 口径，与 render 同源）。
+    fn paged_fit_layout(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+    ) -> PagedLayout {
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .paged_layout_cell
+                .borrow()
+                .clone()
+                .expect("分页快照应存在")
+        })
+    }
+
+    /// R5：单页模式滚到行 1 → zoom 2 档 → 首可见行仍 r0==1（不因缩放跳行）。
+    /// 期望（K177 演算）：zoom=1 布局 Single 3 页 A4：row_top=[20,732,1444]、cell_h=700；
+    /// 滚到行 1 顶（内容顶 = row_top[1]×zoom = 732）→ first_visible_row 首行 = 1；
+    /// zoom→2.0 后精确锚 `zoom_rescroll_anchor_paged` 保持行内相对位置（行顶 0%）→
+    /// 新内容顶 = row_top[1]×2 = 1464 → 首可见行仍 1（行号不随 zoom 变）。
+    #[gpui::test]
+    async fn paged_zoom_keeps_anchored_row_on_screen(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let l1 = paged_fit_layout(&holder, cx);
+        assert_eq!(l1.rows, 3, "Single 3 页 → 3 行");
+        // 滚到行 1 顶（内容顶 = row_top[1]）。
+        let row1_top = l1.row_top[1];
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                v.scroll.set_offset(gpui::point(px(0.), px(-row1_top)));
+            });
+        });
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 缩放前首可见行 = 1。
+        let (r0_before, _) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let l = v.paged_layout_cell.borrow();
+            let l = l.as_ref().unwrap();
+            let zoom = v.zoom.max(0.01);
+            let top = f32::from(-v.scroll.offset().y).max(0.0);
+            let vh = f32::from(v.scroll.bounds().size.height) / zoom;
+            l.first_visible_row(-(top / zoom), vh).unwrap()
+        });
+        assert_eq!(r0_before, 1, "缩放前首可见行应为 1");
+        // zoom → 2.0（精确锚重锚）。
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_zoom_abs(2.0, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 缩放后首可见行仍 = 1。
+        let (r0_after, content_top_after) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let l = v.paged_layout_cell.borrow();
+            let l = l.as_ref().unwrap();
+            let zoom = v.zoom.max(0.01);
+            let top = f32::from(-v.scroll.offset().y).max(0.0);
+            let vh = f32::from(v.scroll.bounds().size.height) / zoom;
+            (l.first_visible_row(-(top / zoom), vh).unwrap().0, top)
+        });
+        assert_eq!(
+            r0_after, 1,
+            "缩放后首可见行仍应为 1（精确锚不跳行），实际 {r0_after}"
+        );
+        // 内容顶应 ≈ row_top[1]×2 = 1464（行内 0% 锚）。
+        let l2 = paged_fit_layout(&holder, cx);
+        let want_top = l2.row_top[1] * 2.0;
+        assert!(
+            (content_top_after - want_top).abs() < 2.0,
+            "缩放后内容顶应≈{want_top}（行 1 顶×2），实际 {content_top_after}"
+        );
+    }
+
+    /// R2/R3：分页阅读进度往返——滚到某 (page,frac) → reading_progress 读 →
+    /// set_restore_anchor + restore_pending 应用 → 重新 reading_progress ≈ 原值。
+    /// Single/Facing 各一轮。
+    #[gpui::test]
+    async fn paged_reading_progress_restore_roundtrip(cx: &mut TestAppContext) {
+        for (cols, mode) in [(1usize, PageMode::Single), (2usize, PageMode::Facing)] {
+            let (holder, cx) = open_paged_host(cx);
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |v, cx| v.set_page_mode(mode, cx));
+            });
+            for _ in 0..6 {
+                let _ = cx.refresh();
+                cx.run_until_parked();
+            }
+            let l = paged_fit_layout(&holder, cx);
+            // 滚到某行中部（frac=0.5）：Single 用行 1（3 行，行 1 中部不超 scroll）；
+            // Facing 用行 0（2 行，行 1 是末行、中部会超 paged_max_scroll → 夹失真）。
+            let test_row = if cols == 1 { 1 } else { 0 };
+            let frac_target = 0.5f32;
+            let sy = l.row_top[test_row] + l.row_height(test_row) * frac_target;
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                    v.scroll.set_offset(gpui::point(px(0.), px(-sy)));
+                });
+            });
+            for _ in 0..3 {
+                let _ = cx.refresh();
+                cx.run_until_parked();
+            }
+            // 读阅读进度（分页分支）。
+            let (page, frac_read, zoom) = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .reading_progress()
+                    .expect("应读到进度")
+            });
+            // 演算（K177）：行 test_row 首页 = row_page_start[test_row] = test_row×cols；frac ≈ 0.5。
+            assert_eq!(
+                page,
+                test_row * cols,
+                "cols={cols} 行 {test_row} 首页应 = {}, 实际 {page}",
+                test_row * cols
+            );
+            assert!(
+                (frac_read - frac_target).abs() < 0.01,
+                "frac 应≈0.5，实际 {frac_read}"
+            );
+            // 恢复：set_restore_anchor + 手动塞 restore_pending（测试夹具不走 apply_loaded）。
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                    v.set_restore_anchor(page, frac_read, zoom);
+                    v.restore_pending = Some((page, frac_read));
+                    v.zoom = zoom;
+                });
+            });
+            for _ in 0..6 {
+                let _ = cx.refresh();
+                cx.run_until_parked();
+            }
+            // 重新读 → 应 ≈ 原值（往返误差小）。
+            let (page2, frac2, _) = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .reading_progress()
+                    .expect("恢复后应读到进度")
+            });
+            assert_eq!(page2, page, "恢复后 page 应不变：{page} vs {page2}");
+            assert!(
+                (frac2 - frac_read).abs() < 0.01,
+                "恢复后 frac 应≈原值：{frac_read} vs {frac2}"
+            );
+        }
+    }
+
+    /// R6：分页缩放使 cell_w 变 → WindowSig 变化（静态帧门不早退）。
+    #[gpui::test]
+    async fn paged_window_sig_changes_on_cell_width(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let sig_before = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let vh = f32::from(v.scroll.bounds().size.height);
+            WindowSig::of(v, f32::from(-v.scroll.offset().y), pw, 1.0, vh)
+        });
+        // 缩放 → cell_w 变 → sig 变。
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_zoom_abs(2.0, cx));
+        });
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let sig_after = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let vh = f32::from(v.scroll.bounds().size.height);
+            WindowSig::of(v, f32::from(-v.scroll.offset().y), pw, 1.0, vh)
+        });
+        assert_ne!(
+            sig_before, sig_after,
+            "缩放使 cell_w 变 → WindowSig 必变（静态帧门不早退）"
+        );
+        // 额外：paged_cell_w 维非 0（分页激活）。
+        assert!(
+            sig_after.paged_cell_w != 0,
+            "分页激活时 paged_cell_w 应非 0"
+        );
+    }
+
+    // ---- 显示矩形单一真源（R1 paged_display_rect）+ 缩小居 / 不露邻页（bug1/bug2） ----
+
+    /// 分页显示矩形期望（K177 手算，**独立重算**布局 → 按视口水平居中、垂直 ×zoom）：
+    /// 与生产 `paged_display_rect` 同公式，但从 `paged_layout(dims, viewport)` 独立推导，
+    /// 用于封口「渲染卡/命中确用居中几何」（zoom≠1 时旧的 `cell_rect×zoom` 已不成立）。
+    fn expected_display_rect(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        cols: usize,
+        page: usize,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let (vw, vh, dims, zoom) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.scroll.bounds();
+            (
+                f32::from(b.size.width),
+                f32::from(b.size.height),
+                v.dims.clone(),
+                v.zoom.max(0.01),
+            )
+        });
+        let l = paged_layout(&dims, vw, vh, cols, GRID_GAP, PAGE_PAD_X);
+        let r = l.cell_rect(page)?;
+        let cw = r.w * zoom;
+        let ch = r.h * zoom;
+        let cols_f = cols as f32;
+        let gap = GRID_GAP * zoom;
+        let spread = cols_f * cw + (cols_f - 1.0) * gap;
+        let left_pad = ((vw - spread) / 2.0).max(0.0);
+        let c = (page % cols) as f32;
+        Some((left_pad + c * (cw + gap), r.y * zoom, cw, ch))
+    }
+
+    /// 卡 `page` 的**内容坐标**矩形 `(x, y, w, h)`（= 窗口 debug_bounds 减滚动容器原点再减
+    /// 滚动偏移），与 `expected_display_rect`（内容坐标）同口径可直接对表。
+    fn paged_card_content_rect(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        page: usize,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let id: &'static str = match page {
+            0 => "pdf-page-0",
+            1 => "pdf-page-1",
+            _ => return None,
+        };
+        let b = cx.debug_bounds(id)?;
+        let (sl, st, offx, offy) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sb = v.scroll.bounds();
+            (
+                sb.left().as_f32(),
+                sb.top().as_f32(),
+                f32::from(v.scroll.offset().x),
+                f32::from(v.scroll.offset().y),
+            )
+        });
+        Some((
+            b.left().as_f32() - sl - offx,
+            b.top().as_f32() - st - offy,
+            b.size.width.as_f32(),
+            b.size.height.as_f32(),
+        ))
+    }
+
+    /// R7-bug2：单页模式缩小（zoom 0.5）后页面仍应在视口内水平居中、不左偏；zoom 1.0/2.0
+    /// 同样居中。逐档断言：卡内容矩形 = `expected_display_rect`（居中几何），且卡中心 x ≈ 视口中心。
+    #[gpui::test]
+    async fn paged_single_zoom_out_stays_centered(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        for zoom in [0.5f32, 1.0, 2.0] {
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |v, cx| v.set_zoom_abs(zoom, cx));
+            });
+            for _ in 0..6 {
+                let _ = cx.refresh();
+                cx.run_until_parked();
+            }
+            let vw = cx.update(|_w, cx| {
+                f32::from(
+                    holder
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .scroll
+                        .bounds()
+                        .size
+                        .width,
+                )
+            });
+            let exp = expected_display_rect(&holder, cx, 1, 0).expect("页 0 期望矩形");
+            let got = paged_card_content_rect(&holder, cx, 0).expect("卡 0 应物化");
+            assert!(
+                (got.0 - exp.0).abs() < 0.6 && (got.1 - exp.1).abs() < 0.6,
+                "zoom={zoom} 卡 0 内容位应≈期望 ({:.2},{:.2})，实际 ({:.2},{:.2})",
+                exp.0,
+                exp.1,
+                got.0,
+                got.1
+            );
+            assert!(
+                (got.2 - exp.2).abs() < 0.6 && (got.3 - exp.3).abs() < 0.6,
+                "zoom={zoom} 卡 0 尺寸应≈期望 ({:.2}x{:.2})，实际 ({:.2}x{:.2})",
+                exp.2,
+                exp.3,
+                got.2,
+                got.3
+            );
+            // 水平居中：卡中心 x ≈ 视口中心（缩小只留白、不左偏）。
+            let center = got.0 + got.2 / 2.0;
+            assert!(
+                (center - vw / 2.0).abs() < 1.0,
+                "zoom={zoom} 卡中心 x 应≈视口中心 {:.1}，实际 {:.2}",
+                vw / 2.0,
+                center
+            );
+        }
+    }
+
+    /// R7-bug1：单页模式缩小到 zoom 0.5 时视口纵向可容多行，但仍只渲染当前页——绝不露下一页；
+    /// 双页模式缩小到 0.5 只渲染当前行两页，不露下一行。
+    #[gpui::test]
+    async fn paged_single_no_neighbor_peek_when_zoomed_out(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Single, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_zoom_abs(0.5, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("pdf-page-0").is_some(),
+            "单页 zoom0.5 应物化页 0"
+        );
+        assert!(
+            cx.debug_bounds("pdf-page-1").is_none(),
+            "单页 zoom0.5 绝不露下一页（页 1 不物化）"
+        );
+
+        // 双页 + zoom 0.5：只物化当前行两页（0、1），不露下一行（页 2）。
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("pdf-page-0").is_some(),
+            "双页 zoom0.5 应物化页 0"
+        );
+        assert!(
+            cx.debug_bounds("pdf-page-1").is_some(),
+            "双页 zoom0.5 应物化同行页 1"
+        );
+        assert!(
+            cx.debug_bounds("pdf-page-2").is_none(),
+            "双页 zoom0.5 不露下一行（页 2 不物化）"
+        );
+    }
+
+    /// R7-bug2：双页模式缩小到 zoom 0.5，整行两页应在视口内水平居中（spread 中心 ≈ 视口中心）。
+    #[gpui::test]
+    async fn paged_facing_zoom_out_centered(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_zoom_abs(0.5, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let vw = cx.update(|_w, cx| {
+            f32::from(
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .scroll
+                    .bounds()
+                    .size
+                    .width,
+            )
+        });
+        let e0 = expected_display_rect(&holder, cx, 2, 0).expect("页 0");
+        let e1 = expected_display_rect(&holder, cx, 2, 1).expect("页 1");
+        let g0 = paged_card_content_rect(&holder, cx, 0).expect("卡 0");
+        let g1 = paged_card_content_rect(&holder, cx, 1).expect("卡 1");
+        assert!(
+            (g0.0 - e0.0).abs() < 0.6 && (g1.0 - e1.0).abs() < 0.6,
+            "双页 zoom0.5 卡位应≈期望"
+        );
+        // 整行 spread 中心 = (左卡左 + 右卡右)/2 ≈ 视口中心。
+        let spread_center = (g0.0 + (g1.0 + g1.2)) / 2.0;
+        assert!(
+            (spread_center - vw / 2.0).abs() < 1.0,
+            "双页 zoom0.5 整行应水平居中 {:.1}，实际 {:.2}",
+            vw / 2.0,
+            spread_center
+        );
+    }
+
+    /// R7-K153 封口：分页下渲染卡 debug_bounds 与 `paged_display_rect`（经 `expected_display_rect`
+    /// 独立重算）一致；且对该卡中心 simulate 命中 → 命中同页（render/hit 同源，防两路径分叉）。
+    #[gpui::test]
+    async fn paged_display_rect_matches_render_and_hit(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host(cx);
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 缩小到 0.5 使几何与 zoom=1 明显不同（封口非平凡）。
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_zoom_abs(0.5, cx));
+        });
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        for page in 0usize..2 {
+            let exp = expected_display_rect(&holder, cx, 2, page).expect("期望矩形");
+            let got = paged_card_content_rect(&holder, cx, page).expect("卡应物化");
+            assert!(
+                (got.0 - exp.0).abs() < 0.6
+                    && (got.1 - exp.1).abs() < 0.6
+                    && (got.2 - exp.2).abs() < 0.6
+                    && (got.3 - exp.3).abs() < 0.6,
+                "页 {page} 渲染卡应 = paged_display_rect 期望 {exp:?}，实际 {got:?}"
+            );
+            // 卡中心（内容坐标）→ 窗口坐标（逆 window_to_pt：加滚动容器原点与偏移）→ 命中。
+            let center_cx = exp.0 + exp.2 / 2.0;
+            let center_cy = exp.1 + exp.3 / 2.0;
+            let (bl, bt, offx, offy) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.scroll.bounds();
+                (
+                    b.left().as_f32(),
+                    b.top().as_f32(),
+                    f32::from(v.scroll.offset().x),
+                    f32::from(v.scroll.offset().y),
+                )
+            });
+            let click = gpui::point(px(bl + center_cx + offx), px(bt + center_cy + offy));
+            let hit = cx.update(|w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .window_to_pt(w, click)
+            });
+            assert_eq!(
+                hit.map(|(p, _, _)| p),
+                Some(page),
+                "页 {page} 卡中心命中应为该页（render/hit 同源）"
+            );
+        }
+    }
+
     #[gpui::test]
     async fn grid_enter_renders_container_with_derived_virtualized_cards(cx: &mut TestAppContext) {
         if test_util::missing_pdf_fixture() {
@@ -2519,8 +3877,7 @@ mod tests {
         enter_grid(&holder, cx);
 
         // 手算期望（渲染同口径）：网格滚动容器布局 bounds + 同常量 + 同纯函数
-        let ((start, end), expect_count, n) =
-            { expected_grid_band(&holder, cx, 0.0) };
+        let ((start, end), expect_count, n) = { expected_grid_band(&holder, cx, 0.0) };
         assert!(n > 120, "夹具应足量页（pdf测试2.pdf），实际 {n}");
         assert!(
             expect_count < n,
@@ -2529,18 +3886,28 @@ mod tests {
 
         // 容器在 DOM，物化区间/卡数 == GridLayout 派生值
         assert!(cx.debug_bounds("pdf-grid").is_some(), "网格容器应渲染");
-        assert!(cx.debug_bounds("pdf-grid-scroll").is_some(), "网格滚动容器应渲染");
+        assert!(
+            cx.debug_bounds("pdf-grid-scroll").is_some(),
+            "网格滚动容器应渲染"
+        );
         let (range, drawn) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (v.grid_last_range.get(), v.grid_last_drawn.get())
         });
-        assert_eq!(range, (start, end), "可视带应等于 GridLayout 派生区间 {start}..={end}");
+        assert_eq!(
+            range,
+            (start, end),
+            "可视带应等于 GridLayout 派生区间 {start}..={end}"
+        );
         assert_eq!(
             drawn, expect_count,
             "物化卡数应等于 GridLayout 派生数（首屏可视行 +±1 缓冲）"
         );
         // 带内卡在 DOM、可视带外页不物化（静态选择器：页 100 恒在带外）
-        assert!(cx.debug_bounds("pdf-grid-item-0").is_some(), "带内首卡应在场");
+        assert!(
+            cx.debug_bounds("pdf-grid-item-0").is_some(),
+            "带内首卡应在场"
+        );
         assert!(
             cx.debug_bounds("pdf-grid-item-100").is_none(),
             "可视带外页（100）不应物化任何 DOM（虚拟化）"
@@ -2670,8 +4037,8 @@ mod tests {
     /// item 3：网格缩放——卡宽由**独立网格缩放 `grid_zoom`** 派生（`GRID_CARD_WIDTH ×
     /// grid_zoom`），**与阅读 `self.zoom` 互不影响**。程序化 `set_grid_zoom(×2)` → 卡宽/列数
     /// 按新 grid_zoom 变化、`self.zoom` **不变**、仍停留网格模式、可视页集合随新布局更新、
-    /// 旧分桶缩略图失效后按新卡宽重取回槽。反向：网格内 `set_zoom`（阅读缩放）不联动卡宽
-    /// （卡宽仍按 grid_zoom）。期望值用「渲染同口径」手算（K177）：目标布局 =
+    /// 旧分桶缩略图保留作桥、按新分桶重取替换（R-C）。反向：网格内 `set_zoom`（阅读缩放）
+    /// 不联动卡宽（卡宽仍按 grid_zoom）。期望值用「渲染同口径」手算（K177）：目标布局 =
     /// `grid_layout(dims, GRID_CARD_WIDTH×grid_zoom, …)` 同公式推导（放大 ⇒ 列数减少），
     /// 不自揣测。
     #[gpui::test]
@@ -2709,7 +4076,10 @@ mod tests {
         let layout_before = grid_layout(&dims, GRID_CARD_WIDTH, GRID_GAP, GRID_PADDING, vw);
         let layout_after = grid_layout(&dims, target_w, GRID_GAP, GRID_PADDING, vw);
         assert_ne!(layout_after.cols, layout_before.cols, "×2 缩放后列数应变化");
-        assert!(layout_after.cols < layout_before.cols, "放大后列数应变少（卡变宽）");
+        assert!(
+            layout_after.cols < layout_before.cols,
+            "放大后列数应变少（卡变宽）"
+        );
         let band_after = grid_visible_range(&layout_after, 0.0, vh).expect("缩放后首屏应有可视带");
 
         // 网格模式程序化缩放：set_grid_zoom(×2)（doc(hidden) 测试面）→ 卡宽派生 + 跨桶
@@ -2726,14 +4096,23 @@ mod tests {
             let _ = cx.refresh();
             cx.run_until_parked();
             let band = cx.update(|_w, cx| {
-                holder.borrow().as_ref().unwrap().read(cx).grid_last_range.get()
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .grid_last_range
+                    .get()
             });
             if band == band_after {
                 got_band = true;
                 break;
             }
         }
-        assert!(got_band, "缩放后网格渲染带应收敛到新布局派生区间 {band_after:?}");
+        assert!(
+            got_band,
+            "缩放后网格渲染带应收敛到新布局派生区间 {band_after:?}"
+        );
         let (card_w, mode, vis_range, gz1, rz1) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (
@@ -2758,21 +4137,34 @@ mod tests {
             (rz1 - 1.0).abs() < 1e-6,
             "网格 set_grid_zoom 不得改阅读 zoom（独立缩放）：{rz1}"
         );
-        // 效果断言：缩放已清空旧分桶缩略图 → 下一帧按新卡宽重取入 `grid_thumbs`（不确定
-        // worker 时序 → 推进虚拟时钟 + 少量真实等待轮询，与既有缩略图测试同姿势）。
+        // 效果断言：跨桶缩放**保留旧桶缩略图作桥**（不清空），下一帧按新分桶重取
+        // **替换**桥——轮询直到出现当前桶图（bucket == grid_bucket_width(560) = 576）。
+        // 不确定 worker 时序 → 推进虚拟时钟 + 少量真实等待轮询，与既有缩略图测试同姿势。
+        let bucket_new = grid_bucket_width(target_w);
         let mut got = false;
         for _ in 0..600 {
-            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
             cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(2));
             got = cx.update(|_w, cx| {
-                !holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.is_empty()
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .grid_thumbs
+                    .values()
+                    .any(|t| t.bucket == bucket_new)
             });
             if got {
                 break;
             }
         }
-        assert!(got, "缩放后缩略图应按新卡宽重取入 grid_thumbs");
+        assert!(
+            got,
+            "缩放后缩略图应按新分桶重取替换桥（bucket == {bucket_new}）"
+        );
 
         // 反向独立性：网格内程序化改**阅读** zoom（set_zoom）×1.5 → 卡宽仍按 grid_zoom
         // （不变）、仅 self.zoom 变化、仍停留网格（卡宽不被阅读缩放联动）。
@@ -2828,7 +4220,8 @@ mod tests {
         });
         cx.update(|_w, cx| {
             holder.borrow().as_ref().unwrap().update(cx, |v, _| {
-                v.grid_scroll.set_offset(gpui::point(px(0.), px(-off_target)));
+                v.grid_scroll
+                    .set_offset(gpui::point(px(0.), px(-off_target)));
             });
         });
         for _ in 0..5 {
@@ -2837,12 +4230,26 @@ mod tests {
         }
         let (gz0, read0, card0, off0) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
-            (v.grid_zoom, v.zoom, v.grid_card_width(), v.grid_scroll.offset())
+            (
+                v.grid_zoom,
+                v.zoom,
+                v.grid_card_width(),
+                v.grid_scroll.offset(),
+            )
         });
         let sy0 = f32::from(-off0.y);
-        assert!(sy0 > 0.0, "前置：网格应处于非零滚动（滚到第 3 行顶），实际 {sy0}");
-        assert!((gz0 - 1.0).abs() < 1e-6, "前置：grid_zoom 初始应为 1.0，实际 {gz0}");
-        assert!((read0 - 1.0).abs() < 1e-6, "前置：阅读 zoom 初始应为 1.0，实际 {read0}");
+        assert!(
+            sy0 > 0.0,
+            "前置：网格应处于非零滚动（滚到第 3 行顶），实际 {sy0}"
+        );
+        assert!(
+            (gz0 - 1.0).abs() < 1e-6,
+            "前置：grid_zoom 初始应为 1.0，实际 {gz0}"
+        );
+        assert!(
+            (read0 - 1.0).abs() < 1e-6,
+            "前置：阅读 zoom 初始应为 1.0，实际 {read0}"
+        );
 
         // Ctrl+向上滚一档（delta_y=240 → factor=1+ZOOM_STEP=1.12）→ grid_zoom 步进衍生卡宽、
         // 滚动同比重锚；阅读 zoom **保持不变**（独立性）。
@@ -2889,7 +4296,12 @@ mod tests {
         }
         let (gz2, read2, card2, off2) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
-            (v.grid_zoom, v.zoom, v.grid_card_width(), v.grid_scroll.offset())
+            (
+                v.grid_zoom,
+                v.zoom,
+                v.grid_card_width(),
+                v.grid_scroll.offset(),
+            )
         });
         assert!(
             (gz2 - gz_before).abs() < 1e-6,
@@ -2908,6 +4320,212 @@ mod tests {
             "普通滚轮应垂直下滚（未被缩放拦截）：{off_before} → {}",
             f32::from(-off2.y)
         );
+    }
+
+    /// item 3b'：**网格缩放列数钳制**（K167 本线）——Ctrl+滚轮把 `grid_zoom` 推到当前视口
+    /// 宽的钳界（[z_min, z_max]，见 `grid_zoom_limits_for_cols`）即**停止**：放大极限恒 2 列
+    /// （不可能到 1）、缩小极限恒 9 列（不可能到 10+）。期望列数用「渲染同口径」公式自洽
+    /// 推导（K177：钳界来自同口径纯函数；列数 = `grid_layout` 同公式）。
+    #[gpui::test]
+    async fn grid_ctrl_wheel_clamps_columns_to_two_and_nine(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 前置：渲染同口径 vw（与 render/tiles/set_grid_zoom 同一来源 = grid_scroll bounds 宽）。
+        let (vw, gz0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.grid_scroll.bounds().size.width.as_f32(), v.grid_zoom)
+        });
+        assert!(vw > 100.0, "前置：网格视口宽应有效：{vw}");
+        let (z_min, z_max) = grid_zoom_limits_for_cols(
+            GRID_CARD_WIDTH,
+            GRID_GAP,
+            GRID_PADDING,
+            vw,
+            GRID_MAX_COLS,
+            GRID_MIN_COLS,
+        );
+        assert!(z_min < z_max, "前置：钳区间应有效：[{z_min}, {z_max}]");
+        assert!(
+            (gz0 - 1.0).abs() < 1e-6,
+            "前置：grid_zoom 初始应为 1.0：{gz0}"
+        );
+
+        // ① 放大：连滚大档（factor=1+ZOOM_STEP=1.12）直到 grid_zoom 不再增长（钳到 z_max）。
+        let wheel_until_stable = |cx: &mut VisualTestContext, delta: f32| {
+            let mut prev = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_zoom);
+            let mut gz = prev;
+            for _ in 0..200 {
+                cx.simulate_event(grid_zoom_wheel(true, delta));
+                for _ in 0..3 {
+                    let _ = cx.refresh();
+                    cx.run_until_parked();
+                }
+                let next = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_zoom);
+                gz = next;
+                if (next - prev).abs() < 1e-6 {
+                    break;
+                }
+                prev = next;
+            }
+            gz
+        };
+        let gz_up = wheel_until_stable(cx, 240.0);
+        assert!(
+            (gz_up - z_max).abs() < 1e-3,
+            "放大应钳到 z_max={z_max}，实际 {gz_up}"
+        );
+        // 列数按「渲染同口径」= 2（不可能到 1 列）。
+        let cols_up = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            grid_layout(&v.dims, v.grid_card_width(), GRID_GAP, GRID_PADDING, vw).cols
+        });
+        assert_eq!(cols_up, 2, "放大极限应恒 2 列（不可能到 1 列）：{cols_up}");
+        // 再滚一档放大也不应变化（已钉在上限）。
+        let before = gz_up;
+        cx.simulate_event(grid_zoom_wheel(true, 240.0));
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let after = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_zoom);
+        assert!(
+            (after - before).abs() < 1e-6,
+            "钉上限后放大不应变化：{before} → {after}"
+        );
+
+        // ② 缩小：连滚小档（factor=1/(1+ZOOM_STEP)）直到 grid_zoom 不再减少（钳到 z_min）。
+        let gz_down = wheel_until_stable(cx, -240.0);
+        assert!(
+            (gz_down - z_min).abs() < 1e-3,
+            "缩小应钳到 z_min={z_min}，实际 {gz_down}"
+        );
+        let cols_down = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            grid_layout(&v.dims, v.grid_card_width(), GRID_GAP, GRID_PADDING, vw).cols
+        });
+        assert_eq!(
+            cols_down, 9,
+            "缩小极限应恒 9 列（不可能到 10 列）：{cols_down}"
+        );
+        // 再滚一档缩小也不应变化（已钉在下限）。
+        let before = gz_down;
+        cx.simulate_event(grid_zoom_wheel(true, -240.0));
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let after = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_zoom);
+        assert!(
+            (after - before).abs() < 1e-6,
+            "钉下限后缩小不应变化：{before} → {after}"
+        );
+
+        // 全程未退出网格 / 未跳页。
+        let mode = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_mode());
+        assert!(mode, "列数钳缩放应停留网格模式");
+    }
+
+    /// item 3b''：**视口宽变化归一化**（R4）——宽视口把网格缩放到放大上限后拉窄窗口
+    /// （新列数钳界收窄）→ `grid_zoom` 超标，下一帧经 `set_grid_zoom` 归一化回新界内
+    /// （同比重锚/跨桶桥随路生效），列数随新视口重收为 2。走真实 resize → render 路径。
+    #[gpui::test]
+    async fn grid_viewport_shrink_normalizes_zoom_to_new_column_bounds(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 前置：宽视口（≈1500）下把 grid_zoom 推到列数钳上限 z_max(wide)=2.6。
+        let vw_wide = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_scroll
+                .bounds()
+                .size
+                .width
+                .as_f32()
+        });
+        let (_, z_max_wide) = grid_zoom_limits_for_cols(
+            GRID_CARD_WIDTH,
+            GRID_GAP,
+            GRID_PADDING,
+            vw_wide,
+            GRID_MAX_COLS,
+            GRID_MIN_COLS,
+        );
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_grid_zoom(100.0, cx); // 100 超上限 → 钳到 z_max(wide)
+            });
+        });
+        let gz_before = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_zoom);
+        assert!(
+            (gz_before - z_max_wide).abs() < 1e-3,
+            "前置：宽视口 set_grid_zoom(100) 应钳到 z_max(wide)={z_max_wide}，实际 {gz_before}"
+        );
+        // 拉窄窗口（800×900）：新列数钳界收窄（z_max(narrow) < z_max(wide)）。
+        cx.simulate_resize(gpui::size(px(800.), px(900.)));
+        // 轮询直到归一化 settle：resize → render(narrow) → set_grid_zoom → notify →
+        // 下一帧 render 的链在 headless 需多拍收敛（每次轮询多刷几帧）。
+        let mut vw_narrow = 1500.0;
+        let mut gz_after = gz_before;
+        let mut z_max_narrow = z_max_wide;
+        for _ in 0..30 {
+            for _ in 0..3 {
+                let _ = cx.refresh();
+                cx.run_until_parked();
+            }
+            (vw_narrow, gz_after) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.grid_scroll.bounds().size.width.as_f32(), v.grid_zoom)
+            });
+            let (_, z_max) = grid_zoom_limits_for_cols(
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                vw_narrow,
+                GRID_MAX_COLS,
+                GRID_MIN_COLS,
+            );
+            z_max_narrow = z_max;
+            if (gz_after - z_max).abs() < 1e-3 {
+                break;
+            }
+        }
+        assert!(
+            z_max_narrow < gz_before - 1e-3,
+            "前置：拉窄后钳上限应收窄：z_max(narrow)={z_max_narrow} < 原 grid_zoom={gz_before}"
+        );
+        assert!(
+            (gz_after - z_max_narrow).abs() < 1e-3,
+            "视口拉窄后 grid_zoom 应归一化到新 z_max(narrow)={z_max_narrow}，实际 {gz_after}"
+        );
+        // 列数随新视口重收为 2（不可能到 1）。
+        let cols = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            grid_layout(
+                &v.dims,
+                v.grid_card_width(),
+                GRID_GAP,
+                GRID_PADDING,
+                vw_narrow,
+            )
+            .cols
+        });
+        assert_eq!(cols, 2, "视口拉窄归一化后列数应 2：{cols}");
+        // 网格模式保持（归一化不退出网格）。
+        let mode = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_mode());
+        assert!(mode, "视口拉窄归一化应停留网格模式");
     }
 
     /// item 3c：**阅读缩放与网格卡宽双向独立**——起始在单列阅读模式 `set_zoom(1.5)`
@@ -2956,7 +4574,10 @@ mod tests {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (v.zoom, v.grid_card_width())
         });
-        assert!((read_z0 - 1.5).abs() < 1e-3, "set_zoom 应改阅读 zoom：{read_z0}");
+        assert!(
+            (read_z0 - 1.5).abs() < 1e-3,
+            "set_zoom 应改阅读 zoom：{read_z0}"
+        );
         assert!(
             (card_reading - GRID_CARD_WIDTH).abs() < 1e-3,
             "阅读 set_zoom 不应改网格卡宽（grid_zoom 默认 1.0）：{card_reading}"
@@ -2971,7 +4592,10 @@ mod tests {
             (card - GRID_CARD_WIDTH).abs() < 1e-3,
             "阅读缩放后进网格，卡宽应仍按 grid_zoom（默认 1.0）=280，实际 {card}（不是 280×阅读zoom）"
         );
-        assert!((grid_z - 1.0).abs() < 1e-6, "grid_zoom 初始应为 1.0：{grid_z}");
+        assert!(
+            (grid_z - 1.0).abs() < 1e-6,
+            "grid_zoom 初始应为 1.0：{grid_z}"
+        );
         assert!(
             (read_z1 - 1.5).abs() < 1e-3,
             "进网格不改阅读 zoom：{read_z1}"
@@ -2990,14 +4614,16 @@ mod tests {
         );
     }
 
-    /// item 3（同桶复用裁决）：网格缩放**仅跨分桶才清**缩略图/在途请求（worker 按
-    /// `grid_bucket_width` GRID_BUCKET_PX=32 量化分桶缓存）。断言两翼：
+    /// item 3（同桶复用裁决 + 跨桶保桥）：网格缩放按 `grid_bucket_width` GRID_BUCKET_PX=32
+    /// 量化分桶缓存。断言两翼：
     /// ① **同桶内**缩放（factor=1.012 → 卡宽 280→283.36，手算 283.36/32=8.855→round 9→288，
     ///    与 280 同 288 桶）→ 已入槽缩略图**保留**（不清、不闪占位）；
-    /// ② **跨桶**缩放（factor=1.12 → 卡宽 313.6 → 320 桶 ≠ 288）→ 旧分桶缩略图与在途
-    ///    请求**清空**，随后按新分桶重取回槽。
+    /// ② **跨桶**缩放（factor=1.12 → 卡宽 313.6 → 320 桶 ≠ 288）→ 旧分桶缩略图**保留作桥**
+    ///   （清在途不清图，整屏不落占位白闪；R-A），随后按新分桶重取**替换**桥（R-C/R-D）。
     #[gpui::test]
-    async fn grid_ctrl_wheel_same_bucket_reuses_thumbs_cross_bucket_clears(cx: &mut TestAppContext) {
+    async fn grid_ctrl_wheel_same_bucket_reuses_thumbs_cross_bucket_keeps_bridge(
+        cx: &mut TestAppContext,
+    ) {
         if test_util::missing_pdf_fixture() {
             eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
             return;
@@ -3009,22 +4635,35 @@ mod tests {
         // 需有「已入槽缓存」可观察）。
         let mut primed = false;
         for _ in 0..600 {
-            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
             cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(2));
             primed = cx.update(|_w, cx| {
-                !holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.is_empty()
+                !holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .grid_thumbs
+                    .is_empty()
             });
             if primed {
                 break;
             }
         }
-        assert!(primed, "前置：网格缩略图应已入槽（同桶复用断言需有缓存可观察）");
+        assert!(
+            primed,
+            "前置：网格缩略图应已入槽（同桶复用断言需有缓存可观察）"
+        );
         let bucket0 = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             grid_bucket_width(v.grid_card_width())
         });
-        assert_eq!(bucket0, 288, "前置：卡宽 280 应落 288 桶（280/32=8.75→round 9）");
+        assert_eq!(
+            bucket0, 288,
+            "前置：卡宽 280 应落 288 桶（280/32=8.75→round 9）"
+        );
 
         // ① 同桶内缩放：delta_y=0.10 → factor=1+0.10×0.12=1.012 → 卡宽 283.36，仍在 288 桶
         //    → 缩略图缓存与在途请求保留（不清）。
@@ -3048,33 +4687,135 @@ mod tests {
         );
         assert!(thumbs_mid, "同桶缩放不应清空已入槽缩略图（同桶复用）");
 
-        // ② 跨桶缩放：delta_y=240 → factor=1.12 → 卡宽 313.6 → 320 桶 ≠ 288 → 清空旧缓存。
+        // ② 跨桶缩放：delta_y=240 → factor=1.12 → 卡宽 313.6 → 320 桶 ≠ 288。
         cx.simulate_event(grid_zoom_wheel(true, 240.0));
-        // 紧接事件后的同步窗口：旧分桶缩略图应即时清空（clear 生效；下一帧 schedule 按
-        // 新分桶重派在途请求是预期重取行为，不在此断言）。
-        let (empty_thumbs, bucket_after) = cx.update(|_w, cx| {
+        // 紧接事件后的同步窗口：旧分桶缩略图**保留作桥**（R-A；不再即时清空——旧图拉伸
+        // 顶住新卡盒防整屏占位白闪）；此刻调度重派尚未发生，已入槽图应仍属旧桶 288（全
+        // 部 stale）。
+        let (thumbs_kept, all_stale, bucket_after) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
-            (
-                v.grid_thumbs.is_empty(),
-                grid_bucket_width(v.grid_card_width()),
-            )
+            let bucket = grid_bucket_width(v.grid_card_width());
+            let buckets: Vec<u32> = v.grid_thumbs.values().map(|t| t.bucket).collect();
+            let all_stale = !buckets.is_empty() && buckets.iter().all(|&b| b != bucket);
+            (!v.grid_thumbs.is_empty(), all_stale, bucket)
         });
-        assert_ne!(bucket_after, bucket_mid, "跨桶缩放应换桶：{bucket_mid} → {bucket_after}");
-        assert!(empty_thumbs, "跨桶缩放应清空旧分桶缩略图（换桶失效）");
-        // 随后按新分桶重取回槽（worker 真实栅格，同既有缩略图测试轮询姿势）。
-        let mut refetched = false;
+        assert_ne!(
+            bucket_after, bucket_mid,
+            "跨桶缩放应换桶：{bucket_mid} → {bucket_after}"
+        );
+        assert!(thumbs_kept, "跨桶缩放应保留旧分桶缩略图作桥（不清空，R-A）");
+        assert!(
+            all_stale,
+            "跨桶缩放后旧桶缩略图应全部 stale（bucket != 当前桶）"
+        );
+        // 随后按新分桶重取**替换桥**（R-D：调度对 stale 页照常重派；R-C：新桶图回填后
+        // bucket == 当前桶）。worker 真实栅格，同既有缩略图测试轮询姿势。
+        let mut replaced = false;
         for _ in 0..600 {
-            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
             cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(2));
-            refetched = cx.update(|_w, cx| {
-                !holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.is_empty()
+            replaced = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .grid_thumbs
+                    .values()
+                    .any(|t| t.bucket == bucket_after)
             });
-            if refetched {
+            if replaced {
                 break;
             }
         }
-        assert!(refetched, "跨桶缩放后缩略图应按新分桶重取回槽");
+        assert!(
+            replaced,
+            "跨桶缩放后应重取当前桶缩略图替换桥（bucket == {bucket_after}）"
+        );
+    }
+
+    /// R-B「跨桶缩放无占位增长」：跨桶后旧分桶缩略图保留作桥 → 可见带卡**不再落占位**。
+    /// 前置把**当前可视带**全部页缩略图打满（调度每帧 ≤[`config::pdf::GRID_PREFETCH_INFLIGHT`]
+    /// 枚，600 帧内可达）；记录 `grid_placeholder_hits` 基线 → 跨桶缩放 → 直到某张新桶图
+    /// 替换桥为止，**逐帧渲染断言占位计数不增长**——桥图顶上；缩放后卡变大带收敛为旧带
+    /// 子集，无「新入带无图页」混入。K173：断言的是「画的是桥/图而非占位」的真实机制
+    /// （渲染路径计数），非宽松 is_empty 断言。
+    #[gpui::test]
+    async fn grid_ctrl_wheel_cross_bucket_no_placeholder_growth(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 前置：把当前可视带逐页缩略图全部打满（调度每帧 ≤2 枚）。带内页全部就位后跨桶
+        // 缩放才不会因「带内新增无图页」误计入占位。
+        let (band, _, _) = expected_grid_band(&holder, cx, 0.0);
+        let (band_start, band_end) = band;
+        let mut band_primed = false;
+        for _ in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            band_primed = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (band_start..=band_end).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if band_primed {
+                break;
+            }
+        }
+        assert!(
+            band_primed,
+            "前置：可视带全部页缩略图应打满（{band_start}..={band_end}）"
+        );
+        // 跨桶缩放基线：跨桶事件前最后一次渲染已把带内页就位图渲染为图/桥，计数已稳定。
+        let baseline = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        cx.simulate_event(grid_zoom_wheel(true, 240.0));
+        let bucket_after = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            grid_bucket_width(v.grid_card_width())
+        });
+        // 跨桶事件到新桶图替换桥为止：逐帧渲染，占位计数必须不增长（桥图顶上，R-B）。
+        let mut replaced = false;
+        for _ in 0..600 {
+            let _ = cx.refresh();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let (hits, now_replaced) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.grid_placeholder_hits.get(),
+                    v.grid_thumbs.values().any(|t| t.bucket == bucket_after),
+                )
+            });
+            assert!(
+                hits <= baseline,
+                "跨桶缩放后占位计数不应增长（桥图顶上）：baseline={baseline} got={hits}"
+            );
+            if now_replaced {
+                replaced = true;
+                break;
+            }
+        }
+        assert!(
+            replaced,
+            "跨桶缩放后新桶缩略图应替换桥（bucket == {bucket_after}）"
+        );
     }
 
     #[gpui::test]
@@ -3139,7 +4880,11 @@ mod tests {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (v.grid_last_range.get(), v.grid_last_drawn.get())
         });
-        assert_eq!(range, (new_start, new_end), "滚动后可视带应跟随网格滚动偏移");
+        assert_eq!(
+            range,
+            (new_start, new_end),
+            "滚动后可视带应跟随网格滚动偏移"
+        );
         assert_eq!(drawn, new_count, "滚动后物化卡数仍应等于派生带宽");
 
         // 旧卡释放：grid_thumbs / pending_grid 不得残留新带之外的页（确定性，不依赖 worker 时序）
@@ -3191,17 +4936,27 @@ mod tests {
         // 真实拉取入槽——推进虚拟时钟驱动 16ms 泵 + 少量真实等待给 pdfium worker。
         let mut got = false;
         for _ in 0..600 {
-            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
             cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(2));
             got = cx.update(|_w, cx| {
-                !holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.is_empty()
+                !holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .grid_thumbs
+                    .is_empty()
             });
             if got {
                 break;
             }
         }
-        assert!(got, "网格缩略图应经 request_grid 拉取入 grid_thumbs（带内首屏）");
+        assert!(
+            got,
+            "网格缩略图应经 request_grid 拉取入 grid_thumbs（带内首屏）"
+        );
     }
 
     // ---- 网格多选（wave5）：选中集 / checkbox / Ctrl+Shift / 工具栏 ----
@@ -3239,7 +4994,12 @@ mod tests {
         enter_grid(&holder, cx);
         // 进入网格应清空选中集（一次会话语义）
         assert_eq!(
-            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()),
+            cx.update(|_w, cx| holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_selected_count()),
             0,
             "进入网格应清空选中集"
         );
@@ -3388,7 +5148,12 @@ mod tests {
             cx.run_until_parked();
         }
         assert_eq!(
-            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_selection_anchor()),
+            cx.update(|_w, cx| holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_selection_anchor()),
             Some(0),
             "Ctrl+单击后锚点应为页 0"
         );
@@ -3407,7 +5172,11 @@ mod tests {
         }
         let (actual, anchor, mode) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
-            (v.grid_selected.clone(), v.grid_selection_anchor(), v.grid_mode())
+            (
+                v.grid_selected.clone(),
+                v.grid_selection_anchor(),
+                v.grid_mode(),
+            )
         });
         let expected: HashSet<usize> = [0usize, 1, 2].into_iter().collect();
         assert_eq!(actual, expected, "Shift 范围应闭区间选中 {{0,1,2}}");
@@ -3457,7 +5226,12 @@ mod tests {
             cx.run_until_parked();
         }
         let count = cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_selected_count()
         });
         assert_eq!(count, n, "全选应选中全部页 N={n}");
         // 点「清空选择」→ 计数 0
@@ -3471,7 +5245,12 @@ mod tests {
             cx.run_until_parked();
         }
         let count = cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_selected_count()
         });
         assert_eq!(count, 0, "清空选择后应为 0");
     }
@@ -3535,7 +5314,11 @@ mod tests {
         }
         let (mode, count, anchor) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
-            (v.grid_mode(), v.grid_selected_count(), v.grid_selection_anchor())
+            (
+                v.grid_mode(),
+                v.grid_selected_count(),
+                v.grid_selection_anchor(),
+            )
         });
         assert!(!mode, "工具栏退出网格应生效");
         assert_eq!(count, 0, "退出网格应清空选中集");
@@ -3602,7 +5385,12 @@ mod tests {
         // 再进入网格：仍为空（一次会话语义）
         enter_grid(&holder, cx);
         let count = cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_selected_count()
         });
         assert_eq!(count, 0, "再进入网格应从头开始（选中集空）");
     }
@@ -3672,7 +5460,10 @@ mod tests {
             ("pdf-grid-tool-extract-off", "pdf-grid-tool-extract-on"),
             ("pdf-grid-tool-merge-off", "pdf-grid-tool-merge-on"),
         ] {
-            assert!(cx.debug_bounds(off).is_none(), "{off} 不应在场（有选中可用）");
+            assert!(
+                cx.debug_bounds(off).is_none(),
+                "{off} 不应在场（有选中可用）"
+            );
             assert!(cx.debug_bounds(on).is_some(), "{on} 应在场（有选中可用）");
         }
     }
@@ -3739,7 +5530,9 @@ mod tests {
     // ---- wave6：网格拖拽重组——纯函数手算用例（K177：期望值先演算后落）----
 
     /// `compute_insert_index` 手算用例：6 页 A4、vw=1500 → cols=5、cell_w=280（新语义跟随
-    /// 请求卡宽，不再按填满反算 284）、cell_h=280×792/612≈362.353、gap=12、padding=16 →
+    /// 请求卡宽，不再按填满反算 284）、cell_h=280×792/612≈362.353、gap=12（纵向行距）、
+    /// padding=16、col_gap=17（C=1468、needed=(1468−5·280)/4=17 ≤ 36 不封顶 → 填满、left_pad=0）→
+    /// pitch=280+17=297、cell_rect x = 16 + c·297（卡 0=[16,296]、卡 1=313、卡 4=1204）、
     /// row_top=[16, 16+362.353+12≈390.353]、total≈16+362.353+12+362.353+16≈768.706。
     /// 期望插入位全部手写算式推导。
     #[gpui::test]
@@ -3757,19 +5550,21 @@ mod tests {
             Some(0),
             "卡 0 左上角 → 线性位 0（最前）"
         );
-        // 卡 1 右半：col_slot = round(1 + 0.8·280/292) ≈ round(1.7671) = 2 → 线性位 2（卡间）
+        // 卡 1 右半：x = 313 + 0.8·280 = 537 → round((537−16)/297) = round(521/297) ≈ round(1.7542)
+        //   = 2 → 线性位 2（卡间）
         assert_eq!(
             compute_insert_index(&layout, 1500.0, x1 + w0 * 0.8, y0 + 2.0),
             Some(2),
             "卡 1 右半 → 线性位 2（卡 1 之后 / 卡 2 之前）"
         );
-        // 卡 4（行 0 末卡）右半：col_slot = round(4.7671) = 5 → min(row_len=5) → 线性位 5
+        // 卡 4（行 0 末卡）右半：x = 1204 + 224 = 1428 → round((1428−16)/297) = round(1412/297) ≈
+        //   round(4.7542) = 5 → min(row_len=5) → 线性位 5
         assert_eq!(
             compute_insert_index(&layout, 1500.0, x4 + w0 * 0.8, y0 + 2.0),
             Some(5),
             "行 0 末卡右半 → 线性位 5（行 1 首）"
         );
-        // 行 1（卡 5）左半：行 r=1、col_slot=round((x−16)/292)=0 → base=row_page_start[1]=5 → 5
+        // 行 1（卡 5）左半：行 r=1、col_slot=round((x−16)/297)=0 → base=row_page_start[1]=5 → 5
         assert_eq!(
             compute_insert_index(&layout, 1500.0, x0 + 4.0, y5 + 4.0),
             Some(5),
@@ -3921,7 +5716,12 @@ mod tests {
             cx.run_until_parked();
         }
         assert_eq!(
-            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).grid_selected_count()),
+            cx.update(|_w, cx| holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_selected_count()),
             1,
             "前置：应选择页 0"
         );
@@ -3946,7 +5746,14 @@ mod tests {
             "拖拽中 ghost 应在场"
         );
         let dragging = cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().read(cx).grid_drag.as_ref().map(|d| d.dragging.clone())
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_drag
+                .as_ref()
+                .map(|d| d.dragging.clone())
         });
         assert_eq!(dragging, Some(vec![0]), "拖已选卡 0 被拖组应为 [0]");
         assert!(
@@ -3964,7 +5771,14 @@ mod tests {
             "指针进入网格（insert 已算）后插入指示线应在场"
         );
         let insert = cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().read(cx).grid_drag.as_ref().and_then(|d| d.insert)
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_drag
+                .as_ref()
+                .and_then(|d| d.insert)
         });
         assert_eq!(insert, Some(5), "指针在行 1 卡 5 左半 → 插入线性位 5");
         cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::default());
@@ -4106,7 +5920,14 @@ mod tests {
             cx.run_until_parked();
         }
         let insert = cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().read(cx).grid_drag.as_ref().and_then(|d| d.insert)
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_drag
+                .as_ref()
+                .and_then(|d| d.insert)
         });
         assert_eq!(insert, None, "指针移出内容容器 → 插入位 None");
         cx.simulate_mouse_up(outside, MouseButton::Left, gpui::Modifiers::default());
@@ -4149,7 +5970,8 @@ mod tests {
             }) {
                 return;
             }
-            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
             cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -4221,7 +6043,9 @@ mod tests {
                 v.grid_apply_delete(vec![1, 3], cx);
             });
         });
-        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n - 2);
+        wait_seam_until(&holder, &mut cx, move |v| {
+            v.is_loaded() && v.dims.len() == n - 2
+        });
         let expect_dims: Vec<(f32, f32)> = orig_dims
             .iter()
             .enumerate()
@@ -4278,14 +6102,26 @@ mod tests {
             });
         });
         // 算式（K177）：区间 [1,3] 长 = 3-1+1 = 3 → 新文件 3 页、当前剩余 n-3 页。
-        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n - 3);
-        assert!(out.exists(), "拆分应先写新文件再移除区间: {}", out.display());
+        wait_seam_until(&holder, &mut cx, move |v| {
+            v.is_loaded() && v.dims.len() == n - 3
+        });
+        assert!(
+            out.exists(),
+            "拆分应先写新文件再移除区间: {}",
+            out.display()
+        );
         // ① 新文件：页数 3、尺寸 = 原 dims[1..=3]、渲染逐页 = 原页 1..3。
         let new_bytes = std::fs::read(&out).expect("新文件应可读");
         let (w_new, d_new, dims_new) = PdfWorker::open_and_dims(new_bytes).expect("新文件应可打开");
-        assert_eq!(dims_new, orig_dims[1..4].to_vec(), "新文件尺寸 = 源区间原序");
         assert_eq!(
-            (0..3).map(|i| page_probe(&w_new, d_new, i)).collect::<Vec<_>>(),
+            dims_new,
+            orig_dims[1..4].to_vec(),
+            "新文件尺寸 = 源区间原序"
+        );
+        assert_eq!(
+            (0..3)
+                .map(|i| page_probe(&w_new, d_new, i))
+                .collect::<Vec<_>>(),
             vec![orig1, orig2, orig3],
             "新文件逐页渲染 = 源区间页"
         );
@@ -4319,10 +6155,11 @@ mod tests {
                 v.undo_last(cx);
             });
         });
-        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n);
-        let restored_dims = cx.update(|_w, cx| {
-            holder.borrow().as_ref().unwrap().read(cx).dims.clone()
+        wait_seam_until(&holder, &mut cx, move |v| {
+            v.is_loaded() && v.dims.len() == n
         });
+        let restored_dims =
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).dims.clone());
         assert_eq!(restored_dims, orig_dims, "撤销后页尺寸序列还原");
         assert!(out.exists(), "撤销后新文件仍存在: {}", out.display());
         let _ = std::fs::remove_file(&out);
@@ -4370,9 +6207,15 @@ mod tests {
         // 渲染 = [orig0, orig2]。
         let new_bytes = std::fs::read(&out).expect("新文件应可读");
         let (w_new, d_new, dims_new) = PdfWorker::open_and_dims(new_bytes).expect("新文件应可打开");
-        assert_eq!(dims_new, vec![orig_dims[0], orig_dims[2]], "提取产物尺寸 = 勾选升序");
         assert_eq!(
-            (0..2).map(|i| page_probe(&w_new, d_new, i)).collect::<Vec<_>>(),
+            dims_new,
+            vec![orig_dims[0], orig_dims[2]],
+            "提取产物尺寸 = 勾选升序"
+        );
+        assert_eq!(
+            (0..2)
+                .map(|i| page_probe(&w_new, d_new, i))
+                .collect::<Vec<_>>(),
             vec![orig0, orig2],
             "提取产物逐页渲染 = 源勾选页"
         );
@@ -4417,10 +6260,14 @@ mod tests {
         }
         let (sel, err) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
-            (v.grid_selected_count(), v.last_modify_error().map(String::from))
+            (
+                v.grid_selected_count(),
+                v.last_modify_error().map(String::from),
+            )
         });
         assert!(
-            err.as_deref().is_some_and(|m| m.contains("不能覆盖当前打开的文档")),
+            err.as_deref()
+                .is_some_and(|m| m.contains("不能覆盖当前打开的文档")),
             "应报 P1 防护文案：{err:?}"
         );
         assert_eq!(sel, 2, "提取失败不清选（保持可重试）");
@@ -4450,10 +6297,9 @@ mod tests {
         assert!(n >= 1, "夹具页数需 ≥1，实际 {n}");
         // 源度量：临时 worker 开 pdf测试2.pdf 拿 m 与源头 2 页渲染基准。
         let src_p = test_util::test_pdf_paths()[1].clone();
-        let (w_src, d_src, src_dims) = PdfWorker::open_and_dims(
-            std::fs::read(&src_p).expect("读取合并源应成功"),
-        )
-        .expect("合并源应可打开");
+        let (w_src, d_src, src_dims) =
+            PdfWorker::open_and_dims(std::fs::read(&src_p).expect("读取合并源应成功"))
+                .expect("合并源应可打开");
         let m = src_dims.len();
         assert!(m >= 2, "合并源页数需 ≥2（尾部 2 页断言），实际 {m}");
         let src0 = page_probe(&w_src, d_src, 0);
@@ -4465,10 +6311,17 @@ mod tests {
             });
         });
         // 算式（K177）：合并后总页数 = n（当前）+ m（源全页）。
-        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n + m);
+        wait_seam_until(&holder, &mut cx, move |v| {
+            v.is_loaded() && v.dims.len() == n + m
+        });
         let (count, mode, sel, dims_all) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
-            (v.dims.len(), v.grid_mode(), v.grid_selected_count(), v.dims.clone())
+            (
+                v.dims.len(),
+                v.grid_mode(),
+                v.grid_selected_count(),
+                v.dims.clone(),
+            )
         });
         assert_eq!(count, n + m, "合并后总页数 = n+m");
         assert!(mode, "合并重载后应保持网格模式");
@@ -4500,19 +6353,27 @@ mod tests {
             (v.dims.len(), f32::from(-v.scroll.offset().y))
         });
         assert!(n >= 2, "夹具页数需 ≥2，实际 {n}");
-        assert!(cx.debug_bounds("pdf-grid").is_some(), "插入前应处于网格视图");
+        assert!(
+            cx.debug_bounds("pdf-grid").is_some(),
+            "插入前应处于网格视图"
+        );
         cx.update(|_w, cx| {
             holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
                 v.insert_blank_page_after(0, cx);
             });
         });
-        wait_seam_until(&holder, &mut cx, move |v| v.is_loaded() && v.dims.len() == n + 1);
+        wait_seam_until(&holder, &mut cx, move |v| {
+            v.is_loaded() && v.dims.len() == n + 1
+        });
         let (count, mode, scroll_y) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (v.dims.len(), v.grid_mode(), f32::from(-v.scroll.offset().y))
         });
         assert_eq!(count, n + 1, "插入后页数 +1");
-        assert!(mode, "网格模式插入空白页应保持网格模式（grid_hold_on_reload）");
+        assert!(
+            mode,
+            "网格模式插入空白页应保持网格模式（grid_hold_on_reload）"
+        );
         assert!(
             cx.debug_bounds("pdf-grid").is_some(),
             "插入重载后 `pdf-grid` 容器应在场（仍在网格视图）"
@@ -4523,4 +6384,3 @@ mod tests {
         );
     }
 }
-

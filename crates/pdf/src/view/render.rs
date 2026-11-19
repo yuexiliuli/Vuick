@@ -7,8 +7,8 @@
 //! 叠加函数（`selection_overlays_for_page` / `search_overlays_for_page`）亦在本模块。
 
 use super::*;
-use gpui::prelude::FluentBuilder as _;
 use gpui::StyledImage as _;
+use gpui::prelude::FluentBuilder as _;
 
 /// 选区背景色（半透蓝；深浅两版，与 markdown 预览同一套色值，视觉统一）。
 /// 已收编：读 `ui::theme::ColorScheme::doc_selection_bg`（明暗两值 = 本函数收编前原值）。
@@ -311,7 +311,11 @@ fn search_overlays_for_page(
         if lo > hi {
             continue;
         }
-        let color = if idx == active { active_color } else { hit_color };
+        let color = if idx == active {
+            active_color
+        } else {
+            hit_color
+        };
         for (l, b, r, t) in selection_spans_pt(text, lo, hi) {
             let (x0, y_top) = pt_to_local(l, t, dim.0, dim.1, display_w, scale);
             let (x1, y_bottom) = pt_to_local(r, b, dim.0, dim.1, display_w, scale);
@@ -363,7 +367,12 @@ pub(super) fn page_base_image(
     mid: Option<&Arc<RenderImage>>,
     thumb: Option<&Arc<RenderImage>>,
 ) -> Option<Arc<RenderImage>> {
-    cover_now.or(cover_stale).or(prefetch).or(mid).or(thumb).cloned()
+    cover_now
+        .or(cover_stale)
+        .or(prefetch)
+        .or(mid)
+        .or(thumb)
+        .cloned()
 }
 
 impl PdfViewer {
@@ -374,6 +383,10 @@ impl PdfViewer {
     /// 瓦片与文本高亮逐像素对齐）；三层合成——底图（封面→中清→缩略图，先瞬时锐化
     /// 铺满首屏、占位兜底）→ 瓦片（逐片绝对定位、opaque 覆盖底图）→ 选区/检索高亮。
     /// 卡片自身保持 `absolute` 定位（页列虚拟化的根基，⚠️ 不可改 `.relative()`）。
+    ///
+    /// `paged` 为分页页排快照时（非空）：卡片定位/尺寸改由 `cell_rect(page) × zoom`
+    /// 提供（单页=每行 1 页、双页=每行并排 2 页，行内 contain-fit），位图密度/瓦片
+    /// 调度仍按既有 `page_width`（连续口径）——本切片先粗后精，S5b 再按行宽精修密度。
     #[allow(clippy::too_many_arguments)] // 页卡片上下文互为正交
     fn build_visible_page_cards(
         &self,
@@ -391,6 +404,7 @@ impl PdfViewer {
         img_color: Hsla,
         page_bg: Hsla,
         page_border: Hsla,
+        paged: Option<&PagedLayout>,
     ) -> Vec<gpui::AnyElement> {
         let mut cards: Vec<gpui::AnyElement> = Vec::with_capacity(end - start + 1);
         // 观测探针：整次页列渲染前清零，pass 内逐页累加（本帧挂入的瓦片 img 元素总数，
@@ -404,22 +418,43 @@ impl PdfViewer {
         // 同一放置网格，映射差归零（或 ≤0.5 设备 px）。只对齐放置矩形，不动 scroll、
         // 不动布局账（`page_tops`/命中链不变，测试读数不受影响）。
         let scroll_y = f32::from(-self.scroll.offset().y);
-        for (i, &top_unsnapped) in self
-            .page_tops
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(end - start + 1)
-        {
-            let top = crate::pdf::layout::snap_to_device(top_unsnapped + scroll_y, scale_factor)
-                - scroll_y;
+        for i in start..=end {
             let dim = self.dims[i];
+            // 分页页排：卡位/尺寸由唯一显示矩形源 `paged_display_rect` 提供（水平按视口重算
+            // 居中、垂直 r.y×zoom）；连续页列沿用 page_tops 定位、卡宽 = page_width。
+            let (card_left, card_top_base, card_w, card_h) = if paged.is_some() {
+                // 分页页拍：唯一显示矩形源 `paged_display_rect`（水平按视口重算居中——修复
+                // zoom<1 时把居中坐标 `r.x` 也乘 zoom 导致的越缩越左偏；垂直沿用 r.y×zoom）。
+                match self.paged_display_rect(i) {
+                    Some(rect) => (rect.x, rect.y, rect.w, rect.h),
+                    None => (
+                        0.0,
+                        self.page_tops[i],
+                        page_width,
+                        display_height(dim, page_width),
+                    ),
+                }
+            } else {
+                // 连续页列：page_tops 定位、卡宽 = page_width、卡高 = display_height。
+                (
+                    0.0,
+                    self.page_tops[i],
+                    page_width,
+                    display_height(dim, page_width),
+                )
+            };
+            let top = crate::pdf::layout::snap_to_device(card_top_base + scroll_y, scale_factor)
+                - scroll_y;
+            // 显示密度参考高（连续口径）：瓦片/封面按 page_width 密度渲染（本切片分页
+            // 复用既有密度，S5b 再按行宽精修）；声明保持供下面 group_complete 的
+            // 可见瓦片区（调度侧同口径）使用。
             let disp_h = display_height(dim, page_width);
             // 瓦片按显示密度 1:1 渲染；这里算出位图→CSS 的分轴缩放，放置瓦片与
-            // 文本高亮（`pt_to_local` 同源）逐像素对齐。
+            // 文本高亮（`pt_to_local` 同源）逐像素对齐。分页卡按自身宽高（`card_w/h`）
+            // 缩放——连续时 card_w==page_width、card_h==disp_h，行为不变。
             let scale = render_scale(page_width, scale_factor, dim.0);
             let bmp = page_bitmap_size(dim, scale);
-            let (sx, sy) = bitmap_display_scales(bmp, page_width, disp_h);
+            let (sx, sy) = bitmap_display_scales(bmp, card_w, card_h);
 
             // 收集该页在**当前密度**下已就绪的瓦片（Arc 克隆 + 卡片局部定位）。
             let slot = &self.slots[i];
@@ -427,14 +462,12 @@ impl PdfViewer {
             let slot_thumb = slot.thumb.clone();
             let slot_mid = slot.mid.clone();
             // 首屏整页锐化封面（满显示密度；缩放过期时 schedule_tiles 已移入 prev_cover）。
-            let slot_cover = if (slot.cover_scale - cover_scale(dim, page_width, scale_factor))
-                .abs()
-                <= 1e-4
-            {
-                slot.cover.clone()
-            } else {
-                None
-            };
+            let slot_cover =
+                if (slot.cover_scale - cover_scale(dim, page_width, scale_factor)).abs() <= 1e-4 {
+                    slot.cover.clone()
+                } else {
+                    None
+                };
             // 缩放过渡期兜底：旧密度封面（schedule_tiles 从 cover 移入）在新密度封面到位前
             // 按新页宽 CSS 拉伸铺满，防「Ctrl+滚轮缩放期间每档闪一次『加载中』」空白。
             let slot_prev_cover = slot.prev_cover.clone();
@@ -454,21 +487,15 @@ impl PdfViewer {
             // stale cover（`cover_scale≠当前 cscale`，缩放中途旧档）在位时 preview 仍作底图，
             // 屏显从「旧封面复利拉伸」降为「当前档 0.5 密度」——与 `collect_prefetch_cover_results`
             // 的「仅当前密度 cover 才弃」对称，共同让原地连续多档缩放的可见页能吃到 preview。
-            let slot_prefetch = slot
-                .prefetch_cover
-                .clone()
-                .filter(|_| {
-                    slot.cover.is_none()
-                        || (slot.cover_scale - cover_scale(dim, page_width, scale_factor)).abs()
-                            > 1e-4
-                });
+            let slot_prefetch = slot.prefetch_cover.clone().filter(|_| {
+                slot.cover.is_none()
+                    || (slot.cover_scale - cover_scale(dim, page_width, scale_factor)).abs() > 1e-4
+            });
             // 底图选择提前（本帧「同帧不混叠」门控的输入之一）：当前密度封面 → 旧密度封面
             // 拉伸兜底（prev_cover 平移过渡桥 / P1 ③ 低档在位封面）→ 空闲预取走廊封面 → 中清
             // → 缩略图。缩放期不闪白（宁可瞬时模糊也要有底图）；全空（首开/极速拖动）才落
             // 「加载中」占位。
-            let cover_stale = slot_prev_cover
-                .as_ref()
-                .or(slot_cover_stale.as_ref());
+            let cover_stale = slot_prev_cover.as_ref().or(slot_cover_stale.as_ref());
             let base = page_base_image(
                 slot_cover.as_ref(),
                 cover_stale,
@@ -529,7 +556,7 @@ impl PdfViewer {
                 i,
                 selection,
                 dim,
-                page_width,
+                card_w, // 显示宽 = 卡宽（分页 = cell_rect.w×zoom；连续 = page_width，不变）
                 scale,
                 self.text_pages.get(&i),
                 sel_color,
@@ -541,7 +568,7 @@ impl PdfViewer {
                     self.search_active,
                     self.text_pages.get(&i),
                     dim,
-                    page_width,
+                    card_w,
                     scale,
                     hit_color,
                     active_color,
@@ -552,7 +579,7 @@ impl PdfViewer {
                 i,
                 &self.pending_annots,
                 dim,
-                page_width,
+                card_w,
                 scale,
             ));
             // 灰框（点击命中的待存注释包围盒）
@@ -561,7 +588,7 @@ impl PdfViewer {
                 self.focused_annot,
                 &self.pending_annots,
                 dim,
-                page_width,
+                card_w,
                 scale,
             ) {
                 overlays.push(frame);
@@ -572,7 +599,7 @@ impl PdfViewer {
                 self.selected_image,
                 self.image_pages.get(&i),
                 dim,
-                page_width,
+                card_w,
                 scale,
                 img_color,
             ) {
@@ -599,12 +626,13 @@ impl PdfViewer {
             };
             let mut card = div()
                 .id(SharedString::from(format!("pdf-page-{i}")))
+                .debug_selector(move || format!("pdf-page-{i}"))
                 .absolute()
                 .top(px(top))
-                .left(px(0.))
+                .left(px(card_left))
                 .flex_shrink_0()
-                .w(px(page_width))
-                .h(px(disp_h))
+                .w(px(card_w))
+                .h(px(card_h))
                 .rounded(px(4.))
                 .border_1()
                 .border_color(page_border)
@@ -620,8 +648,8 @@ impl PdfViewer {
                 if let Some(base) = base {
                     c = c.child(
                         img(ImageSource::Render(base.clone()))
-                            .w(px(page_width))
-                            .h(px(disp_h))
+                            .w(px(card_w))
+                            .h(px(card_h))
                             .recolor(gpu_params),
                     );
                 }
@@ -633,7 +661,11 @@ impl PdfViewer {
                             .top(px(y))
                             .w(px(w))
                             .h(px(h))
-                            .child(img(ImageSource::Render(tile_img)).size_full().recolor(gpu_params)),
+                            .child(
+                                img(ImageSource::Render(tile_img))
+                                    .size_full()
+                                    .recolor(gpu_params),
+                            ),
                     );
                 }
                 c.into_any_element()
@@ -644,8 +676,8 @@ impl PdfViewer {
                     .relative()
                     .child(
                         img(ImageSource::Render(base))
-                            .w(px(page_width))
-                            .h(px(disp_h))
+                            .w(px(card_w))
+                            .h(px(card_h))
                             .recolor(gpu_params),
                     )
                     .into_any_element()
@@ -671,13 +703,7 @@ impl PdfViewer {
                     .into_any_element()
             };
             // 外挂定位祖先：给选区/检索高亮提供以卡片左上角为原点的坐标系。
-            card = card.child(
-                div()
-                    .size_full()
-                    .relative()
-                    .child(inner)
-                    .children(overlays),
-            );
+            card = card.child(div().size_full().relative().child(inner).children(overlays));
             cards.push(card.into_any_element());
         }
         cards
@@ -691,13 +717,16 @@ impl Render for PdfViewer {
         let (page_bg, page_border) = Self::page_card_colors(cx);
         let page_width = self.page_width();
 
-        // 错误 / 加载中 / 已加载三种状态（已加载再按 grid_mode 分派：网格视图 vs 单列阅读）
+        // 错误 / 加载中 / 已加载三种状态（已加载再按 grid_mode / page_mode 三路分派：
+        // 网格视图 vs 分页页排 vs 单列连续阅读）
         let body: gpui::AnyElement = if let Some(err) = &self.state.load_error {
             Self::pdf_placeholder_body(&format!("无法打开 PDF：{err}"), page_border)
         } else if self.state.loading || self.dims.is_empty() {
             Self::pdf_placeholder_body("正在解析 PDF…", page_border)
         } else if self.grid_mode {
             self.render_pdf_grid(window, cx)
+        } else if self.page_mode != PageMode::Continuous {
+            self.render_pdf_pages_paged(window, cx, page_width, page_bg, page_border)
         } else {
             self.render_pdf_pages(window, cx, page_width, page_bg, page_border)
         };
@@ -906,7 +935,9 @@ impl PdfViewer {
     /// DOM 与旧手写版本逐字一致（size_full flex 居中 + 14px + `page_border` 色），
     /// 改由 [`ui::centered_placeholder`] 承载（Pattern 1.1 收敛）。
     fn pdf_placeholder_body(text: &str, page_border: Hsla) -> gpui::AnyElement {
-        ui::centered_placeholder(text).color(page_border).into_any_element()
+        ui::centered_placeholder(text)
+            .color(page_border)
+            .into_any_element()
     }
 
     /// 已加载正文：**页列 DOM 虚拟化**——scroll 容器里放一个「全文档总高」的定位容器，
@@ -922,7 +953,13 @@ impl PdfViewer {
     ) -> gpui::AnyElement {
         let scroll_y = f32::from(-self.scroll.offset().y);
         let viewport_h = f32::from(self.scroll.bounds().size.height);
-        let (start, end) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
+        let (start, end) = keep_window(
+            &self.dims,
+            &self.page_tops,
+            page_width,
+            scroll_y,
+            viewport_h,
+        );
         // 预取可见窗口文本层（低优先级懒加载）：交互时命中测试/复制/高亮已就绪。
         // 快速拖动时**跳过**——正在飞掠的页文本提取纯属浪费；停止后恢复预取。
         if !self.prev_fast {
@@ -957,6 +994,7 @@ impl PdfViewer {
             img_color,
             page_bg,
             page_border,
+            None, // 连续页列：不用分页布局定位
         );
 
         let content = div()
@@ -1003,6 +1041,121 @@ impl PdfViewer {
             .into_any_element()
     }
 
+    /// 已加载正文的**分页页排**（`!grid_mode && page_mode != Continuous`）：与
+    /// [`Self::render_pdf_pages`] 同构的滚动容器，但卡片按 [`PagedLayout::cell_rect`]×zoom
+    /// 绝对定位——单页 = 每行 1 页（页高 ≤ 视口）、双页 = 每行并排 2 页，行按页高堆叠。
+    /// 布局由 `ensure_window` 每帧以 zoom=1（fit）口径算入 [`Self::paged_layout_cell`]，
+    /// 本函数读上一帧布局并统一乘 `zoom` 显示；可见页区间经
+    /// [`PagedLayout::first_visible_row`]（负偏移，换算回布局坐标 ÷zoom）→
+    /// `row_page_start[r0]..row_page_start[r1+1]` 连续页下标区间。连续阅读专属的
+    /// `page_tops`/`total_height` 在分页模式下**不再用于定位**（存续，仅调度侧 keep_window
+    /// 兜底派图）。`pdf-pages` 容器宽 = `spread_max × zoom`——行内居中由 `cell_rect` 的
+    /// `left_pad` 内建（不再 `justify_center`，防双重居中）；spread > 视口时横向溢出自然出现。
+    fn render_pdf_pages_paged(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        page_width: f32,
+        page_bg: Hsla,
+        page_border: Hsla,
+    ) -> gpui::AnyElement {
+        // 无布局快照（连续模式/尚未装配）→ 安全走连续兜底渲染。
+        let Some(layout) = self.paged_layout_cell.borrow().clone() else {
+            return self.render_pdf_pages(window, cx, page_width, page_bg, page_border);
+        };
+        // PagedLayout 以 zoom=1（fit）口径：显示几何统一乘 zoom（均匀缩放）。
+        let zoom = self.zoom.max(0.01);
+        let total = layout.total_height * zoom;
+        let spread = (layout.spread_max * zoom).max(1.0);
+        let viewport_h = f32::from(self.scroll.bounds().size.height);
+        // 可见行换算回布局坐标：内容显示 = 布局 × zoom → 布局滚动偏移 = 显示偏移 / zoom
+        // （first_visible_row 用「负偏移」，视口顶内容 y = −scroll_y）。
+        let offset = f32::from(-self.scroll.offset().y).max(0.0);
+        let scroll_y_fit = -(offset / zoom);
+        let vh_fit = viewport_h / zoom;
+
+        let mut cards: Vec<gpui::AnyElement> = Vec::new();
+        if layout.rows > 0 {
+            // 只渲染「视口顶所在行」r0（R3）：单页 = 1 页、双页 = 一行 2 页，绝不露下一行/下
+            // 一页。zoom<1 时 vh_fit 变大虽会命中多行，仍只取首行 r0 → 杜绝单页模式在视口底部
+            // 露出下一页（bug 1）。容器高仍按全行总高（滚动量程/吸附不变），仅本帧物化 r0。
+            if let Some((r0, _r1)) = layout.first_visible_row(scroll_y_fit, vh_fit) {
+                let start = layout.row_page_start[r0];
+                let end = layout
+                    .row_page_start[r0 + 1]
+                    .saturating_sub(1)
+                    .min(self.dims.len().saturating_sub(1));
+                if start <= end {
+                    // 预取可见页文本层/图片盒（与连续阅读同节奏懒加载）。
+                    if !self.prev_fast {
+                        self.prefetch_texts(start, end);
+                        self.prefetch_images(start, end);
+                    }
+                    // P2 选区 / P3 检索 / 图片描框：与连续阅读同口径（本切片命中/视觉
+                    // 对齐随 S5b 再精修到 cell_rect_zoom；位图密度暂用既有 page_width）。
+                    let selection = self.selection();
+                    let sel_color = selection_color(cx);
+                    let hit_color = search_hit_color(cx);
+                    let active_color = search_active_color();
+                    let searching = !self.search_query.trim().is_empty();
+                    let img_color = image_select_frame_color(cx);
+                    let scale_factor = window.scale_factor();
+                    cards = self.build_visible_page_cards(
+                        start,
+                        end,
+                        page_width,
+                        scale_factor,
+                        viewport_h,
+                        self.wrap_width(window, page_width),
+                        selection,
+                        sel_color,
+                        searching,
+                        hit_color,
+                        active_color,
+                        img_color,
+                        page_bg,
+                        page_border,
+                        Some(&layout),
+                    );
+                }
+            }
+        }
+
+        let content = div()
+            .id("pdf-pages")
+            .debug_selector(|| "pdf-pages".into())
+            .relative()
+            .w(px(spread))
+            .h(px(total))
+            .children(cards);
+
+        // 与连续阅读同构的滚动容器（分页复用阅读 scroll；本切片滚轮/吸附为下一片）。
+        div()
+            .id("pdf-scroll")
+            .debug_selector(|| "pdf-scroll".into())
+            .size_full()
+            .overflow_y_scroll()
+            .overflow_x_scroll()
+            .track_scroll(&self.scroll)
+            // 文本层交互钩子同连续（P2 命中在 S5b 改分页几何，先保持挂载语义不破坏）。
+            .track_focus(&self.focus_handle)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_key_down(cx.listener(Self::on_key_down))
+            .child(
+                div()
+                    .id("pdf-column-wrap")
+                    .w_full()
+                    .min_w(px(spread))
+                    // 行内居中已由 cell_rect 的 left_pad 内建 → 不 justify_center（防双重居中）；
+                    // spread 超视口时 wrap 宽于视口 → 横向溢出自然出现。
+                    .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
     /// 已加载正文的**网格视图**（`grid_mode` 时）：顶部一条 wave5 工具栏（全选/清空/退出 +
     /// 删除·拆分·提取·合并计数按钮），其下是独立 `grid_scroll` 滚动容器（`flex_1` 占满
     /// 剩余高；工具栏为 out-of-flow 固定头，卡区视口从工具栏底开始），滚动容器里放一个
@@ -1018,7 +1171,32 @@ impl PdfViewer {
         let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
         let (page_bg, page_border) = Self::page_card_colors(cx);
         let (vw, vh) = self.grid_viewport(window);
-        let layout = grid_layout(&self.dims, self.grid_card_width(), GRID_GAP, GRID_PADDING, vw);
+        // 记录本帧视口宽：无 window 句柄的 `set_grid_zoom` 用它作列数钳的 bounds 回退
+        // （grid scroll 未布局时），保证 wheel/programmatic/render 三处钳界同源。
+        self.last_grid_viewport_w = vw;
+        // R4：网格缩放**列数钳归一化** —— `grid_zoom` 若超出当前视口宽的 [z_min, z_max]
+        // （2/9 列钳，见 `grid_zoom_limits_for_cols`）就归回界内，**走 `set_grid_zoom`**
+        // 路径以触发同比重锚 / 跨桶桥 / 管派刷新，不直接写字段。进入网格（首帧）与视口宽
+        // 变化（拉宽/拉窄）都在这里收敛（wheel/programmatic 已按同范围钳，此处只管外部
+        // 状态变化——如先前较窄视口遗留的越界 grid_zoom；resize 后 1-2 帧内 settle）。
+        let (z_min, z_max) = grid_zoom_limits_for_cols(
+            GRID_CARD_WIDTH,
+            GRID_GAP,
+            GRID_PADDING,
+            vw,
+            GRID_MAX_COLS,
+            GRID_MIN_COLS,
+        );
+        if self.grid_zoom < z_min - 1e-4 || self.grid_zoom > z_max + 1e-4 {
+            self.set_grid_zoom(self.grid_zoom.clamp(z_min, z_max), cx);
+        }
+        let layout = grid_layout(
+            &self.dims,
+            self.grid_card_width(),
+            GRID_GAP,
+            GRID_PADDING,
+            vw,
+        );
         // wave6：**仅拖拽态**把布局快照抄入拖拽命中槽——未拖拽时消费者为空（`grid_drag_move`
         // 只在拖拽中读上一帧布局算插入位），避免每帧全量 `clone` 一份 GridLayout；
         // 进入拖拽后下一帧自会重新写入（on_drag 建立拖拽态 → 本帧/下帧写快照）。
@@ -1053,11 +1231,11 @@ impl PdfViewer {
             .bg(canvas)
             // wave6 拖拽移动：`pdf-grid`（内容容器）的 laid-out bounds 含滚动平移 →
             // 指针窗口坐标 − bounds 原点即内容坐标（无需额外滚动换算）。
-            .on_drag_move(cx.listener(
-                |this, ev: &DragMoveEvent<GridDragData>, _window, _cx| {
+            .on_drag_move(
+                cx.listener(|this, ev: &DragMoveEvent<GridDragData>, _window, _cx| {
                     this.grid_drag_move(ev);
-                },
-            ))
+                }),
+            )
             // Ctrl+滚轮缩放：挂在**网格内容元素**上（`pdf-grid-scroll` 的子元素），bubble 期
             // 先于滚动容器的内置滚动处理 → Ctrl 时 `on_scroll_wheel` 内 stop_propagation 阻止
             // 滚动、按 zoom 改卡宽（列数变化 + 缩略图按新分桶重取）；普通滚轮不拦截，仍交
@@ -1106,7 +1284,11 @@ impl PdfViewer {
     /// wave6 网格拖拽覆盖层（拖拽中每帧构建，装进网格内容容器、绝对定位=内容坐标）：
     /// 半透明 ghost（随 `GridDrag::pointer` 居中）+ 插入指示线（[`Self::grid_insert_line_rect`]，
     /// `tab_reorder_line` 纯白语义色——与选项卡拖拽插入线同源颜色）。无拖拽组 → 空。
-    fn grid_reorder_overlays(&self, cx: &Context<Self>, layout: &GridLayout) -> Vec<gpui::AnyElement> {
+    fn grid_reorder_overlays(
+        &self,
+        cx: &Context<Self>,
+        layout: &GridLayout,
+    ) -> Vec<gpui::AnyElement> {
         let Some(drag) = self.grid_drag.as_ref() else {
             return Vec::new();
         };
@@ -1140,8 +1322,7 @@ impl PdfViewer {
                 .into_any_element(),
         );
         out.push(
-            drag
-                .insert
+            drag.insert
                 .and_then(|p| Self::grid_insert_line_rect(layout, p))
                 .map(|(x, y, lw, lh)| {
                     div()
@@ -1162,12 +1343,13 @@ impl PdfViewer {
     }
 
     /// 插入指示线矩形（网格内容坐标）：线性位 `insert`（0..=页数）→ 目标格间隙的竖条。
-    /// `insert < n` → 目标卡（原序 `insert`）**左缘**（gap 中线）；`insert == n` → 末卡
-    /// **右缘**（gap 中线）。宽 3px、高 = 该卡高。行间垂直 gap 的插入位落在「下一行首」
+    /// `insert < n` → 目标卡（原序 `insert`）**左缘**（col_gap 中线）；`insert == n` → 末卡
+    /// **右缘**（col_gap 中线）。宽 3px、高 = 该卡高。行间垂直 gap 的插入位落在「下一行首」
     /// （= `row_page_start[r]`），线画在该行首卡左缘 = 插入到该行首（可视位对齐线性位）。
     ///
-    /// 演算：线中心 `c`；`insert < n` = 目标卡 `x − gap/2`，`insert == n` = 末卡 `x + w + gap/2`；
-    /// 矩形 = `(c − 1.5, 卡y, 3, 卡高)`。
+    /// 演算：线中心 `c`；`insert < n` = 目标卡 `x − col_gap/2`，`insert == n` = 末卡
+    /// `x + w + col_gap/2`；矩形 = `(c − 1.5, 卡y, 3, 卡高)`。禁止读 `GRID_GAP`——列距由
+    /// `col_gap`（渲染列间距，可能被拉伸/封顶）负责，插入线必须对应用户**看到的**列缝隙。
     fn grid_insert_line_rect(layout: &GridLayout, insert: usize) -> Option<(f32, f32, f32, f32)> {
         let n = layout.row_page_start.last().copied().unwrap_or(0);
         if layout.rows == 0 || n == 0 {
@@ -1175,11 +1357,11 @@ impl PdfViewer {
         }
         if insert >= n {
             let (x, y, w, h) = layout.cell_rect(n - 1)?;
-            let c = x + w + layout.gap / 2.0;
+            let c = x + w + layout.col_gap / 2.0;
             Some((c - 1.5, y, 3.0, h.max(1.0)))
         } else {
             let (x, y, _w, h) = layout.cell_rect(insert)?;
-            let c = x - layout.gap / 2.0;
+            let c = x - layout.col_gap / 2.0;
             Some((c - 1.5, y, 3.0, h.max(1.0)))
         }
     }
@@ -1219,23 +1401,34 @@ impl PdfViewer {
             };
             let selected = self.grid_selected(i);
             let inner: gpui::AnyElement = match self.grid_thumbs.get(&i).cloned() {
-                Some(thumb_img) => img(ImageSource::Render(thumb_img))
-                    .w(px(w))
-                    .h(px(h))
-                    .into_any_element(),
-                None => div()
-                    .size_full()
-                    .bg(page_bg)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(page_border)
-                            .child(format!("第 {} 页", i + 1)),
-                    )
-                    .into_any_element(),
+                Some(thumb) => {
+                    // 有缩略图就画（当前桶 = 就绪图；旧桶 = 跨桶缩小/放大时的**桥**）：
+                    // CSS 拉伸铺满卡盒。新桶图异步到达前由旧桶桥顶上，杜绝跨桶缩放整屏
+                    // 占位白闪；桥与就绪图渲染同构（卡盒几何不变，命中/拖拽不依赖此分支）。
+                    img(ImageSource::Render(thumb.image))
+                        .w(px(w))
+                        .h(px(h))
+                        .into_any_element()
+                }
+                None => {
+                    // 完全无图（无当前桶、也无旧桶桥）才画占位——网格占位计数。与单列
+                    // `loading_placeholder_hits` 对称但独立（单列计数不覆盖网格卡路径）。
+                    self.grid_placeholder_hits
+                        .set(self.grid_placeholder_hits.get() + 1);
+                    div()
+                        .size_full()
+                        .bg(page_bg)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(page_border)
+                                .child(format!("第 {} 页", i + 1)),
+                        )
+                        .into_any_element()
+                }
             };
             let mut card = div()
                 .id(SharedString::from(format!("pdf-grid-item-{i}")))
@@ -1269,7 +1462,11 @@ impl PdfViewer {
                     .rounded_sm()
                     .border_1()
                     .border_color(if selected { accent } else { border })
-                    .bg(if selected { accent } else { page_bg.opacity(0.7) })
+                    .bg(if selected {
+                        accent
+                    } else {
+                        page_bg.opacity(0.7)
+                    })
                     .flex()
                     .items_center()
                     .justify_center()
