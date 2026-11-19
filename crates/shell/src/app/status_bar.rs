@@ -6,7 +6,7 @@
 //!   悬停 200ms 后在其下方浮出自身完整路径 tooltip（见 [`crate::app::tabs`]）；未打开文件时
 //!   徽标显示「纯文本」占位。
 //! - **中间区**：光标位置（编辑区 `Ln x, Col y`）或滚动位置（预览/PDF 页码）；无编辑内容时整段省略。
-//! - **右侧区**：模式/状态（预览 / 只读 / 跟随系统主题 / UTF-8）→ 统计（行/字）→ 阅读控制按钮。
+//! - **右侧区**：模式/状态（预览 / 网格 / 只读 / 跟随系统主题 / UTF-8）→ 统计（行/字）→ 阅读控制按钮。
 //!
 //! 全部数据来自既有状态派生（激活选项卡的 file_path/语言、光标、PDF/EPUB 页码、主题偏好），
 //! 不新造全局状态；渲染为静态派生，无持续轮询。
@@ -40,7 +40,7 @@ impl EditorApp {
         // 借用约束：一次 borrow 取出激活选项卡的全部廉价字段（Scalar/String/实体引用
         // 读数）即释放 guard——杜绝「长借用 model.borrow() 构造子元素」后子元素继续借用的
         // 隐患；后续 `status_bar_left/right` 等自身再 borrow，互不嵌套。
-        let (line_count, char_count, language, preview_on, readonly_preview, fullscreen, wrap_on, is_markdown, epub_page, pdf_page, cursor_pos) = {
+        let (line_count, char_count, language, preview_on, readonly_preview, fullscreen, wrap_on, is_markdown, epub_page, pdf_page, cursor_pos, pdf_active, pdf_grid_on) = {
             let model = self.model.borrow();
             let tab = model.tabs.get(model.active_tab);
             let (line_count, char_count) =
@@ -80,6 +80,17 @@ impl EditorApp {
                     None
                 }
             });
+            // wave4：页面网格视图开关——显隐只依「激活选项卡是否为 PDF 阅读器」（PDF 恒
+            // 只读全屏预览，勿加「非预览」门）；高亮态随 PdfViewer 的 grid_mode 实体状态。
+            let pdf_active = tab
+                .map(|t| matches!(&t.payload.reader, MediaReader::Pdf(_)))
+                .unwrap_or(false);
+            let pdf_grid_on = tab
+                .and_then(|t| match &t.payload.reader {
+                    MediaReader::Pdf(pv) => Some(pv.read(cx).grid_mode()),
+                    _ => None,
+                })
+                .unwrap_or(false);
             (
                 line_count,
                 char_count,
@@ -92,6 +103,8 @@ impl EditorApp {
                 epub_page,
                 pdf_page,
                 cursor_pos,
+                pdf_active,
+                pdf_grid_on,
             )
         };
         let bar_border = self.bar_border();
@@ -136,6 +149,8 @@ impl EditorApp {
                 fullscreen,
                 wrap_on,
                 is_markdown,
+                pdf_active,
+                pdf_grid_on,
                 cx,
             ));
 
@@ -203,7 +218,7 @@ impl EditorApp {
             .child(text)
     }
 
-    /// 右侧区：模式/状态项（预览 / 只读 / 主题 / UTF-8）→ 统计（行/字）→ 阅读控制按钮。
+    /// 右侧区：模式/状态项（预览 / 网格 / 只读 / 主题 / UTF-8）→ 统计（行/字）→ 阅读控制按钮。
     /// 全部来自既有数据源派生，无轮询。
     #[allow(clippy::too_many_arguments)]
     fn status_bar_right(
@@ -215,6 +230,8 @@ impl EditorApp {
         fullscreen: bool,
         wrap_on: bool,
         is_markdown: bool,
+        pdf_active: bool,
+        pdf_grid_on: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let text_minor = self.text_minor();
@@ -230,6 +247,12 @@ impl EditorApp {
         // 模式/状态项。
         if preview_on && !readonly_preview {
             right = right.child(self.status_item("status-mode-preview", "预览", chip_text));
+        }
+        // PDF 页面网格视图开关：紧跟「预览」、置于「只读」左侧（用户验收项：
+        // 网格按钮不放最右边）；仅激活选项卡为 PDF 阅读器时显示（PDF 恒只读全屏
+        // 预览、无「全屏/还原」冲突）；高亮随 viewer.grid_mode。
+        if pdf_active {
+            right = right.child(self.status_pdf_grid_btn(pdf_grid_on, cx));
         }
         if readonly_preview {
             right = right.child(self.status_item("status-mode-readonly", "只读", chip_text));
@@ -368,5 +391,64 @@ impl EditorApp {
                     this.toggle_wrap(window, cx);
                 }),
             )
+    }
+
+    /// 状态栏右侧「页面网格视图」切换按钮（wave4，仅激活选项卡为 PDF 阅读器时挂载，
+    /// 置于「只读」状态项左侧）：在「单列阅读 ↔ 页面网格总览」间切换。两态视觉：
+    /// - 关态（grid_on=false）：纯文字可点（对齐 `status_item` 样式，**无底色高亮**）；
+    /// - 开态（grid_on=true）：高亮 pill（`ui::Pill` Chip 壳 + `selected_bg` 选中底色）。
+    /// 按下即从激活选项卡取出 PdfViewer 实体（随选项卡搬迁即随动，无需 shell 额外状态）
+    /// 调 `toggle_grid`——内部已 `notify`，订阅（`subscribe_pdf`）驱动外壳同帧重绘刷新按钮态。
+    /// 颜色一律走 `ui::theme` 禁裸色：开态底色 `selected_bg` 随亮暗主题，关态文字走 `chip_text`。
+    fn status_pdf_grid_btn(&self, grid_on: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active_bg: gpui::Hsla = ui::theme::Theme::global(cx).colors.selected_bg.into();
+        let toggle = self.status_pdf_grid_toggle(cx);
+
+        if !grid_on {
+            // 关态：纯文字（同 status_item 的 12px/chip_text，多出可点 + 悬停手型），无底色。
+            let owned = "status-pdf-grid-btn".to_string();
+            return div()
+                .debug_selector(move || owned.clone())
+                .flex_shrink_0()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(self.chip_text())
+                .child("▦ 网格")
+                .on_mouse_down(gpui::MouseButton::Left, toggle)
+                .into_any_element();
+        }
+
+        // 开态：高亮 pill（Chip 壳底色换成 selected_bg 选中底色）。
+        ui::Pill::new("status-pdf-grid-btn")
+            .size(ui::PillSize::Md)
+            .tone(ui::PillTone::Chip)
+            // Md 默认 22px 高/圆角 md 与状态栏壳不匹配，覆写回 19px + 圆角 sm（1:1 保留原壳）。
+            .h(px(status_pill_h()))
+            .rounded_sm()
+            .bg(active_bg)
+            .label("▦ 网格")
+            .on_mouse_down(toggle)
+            .into_any_element()
+    }
+
+    /// 「页面网格」按钮的点击闭包：从激活选项卡取 PdfViewer 实体并翻转网格
+    /// （闭包内 short borrow 即释放；选项卡已被关闭 → 取不到 → 直接返回）。
+    fn status_pdf_grid_toggle(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static {
+        cx.listener(|this: &mut EditorApp, _ev: &gpui::MouseDownEvent, _w, cx| {
+            let Some(viewer) = (|| {
+                let model = this.model.borrow();
+                let tab = model.tabs.get(model.active_tab)?;
+                match &tab.payload.reader {
+                    MediaReader::Pdf(pv) => Some(pv.clone()),
+                    _ => None,
+                }
+            })() else {
+                return;
+            };
+            viewer.update(cx, |v, cx| v.toggle_grid(cx));
+        })
     }
 }

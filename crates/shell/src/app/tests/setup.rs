@@ -5,8 +5,9 @@
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
     // 共享夹具与 `crates/shell/tests/common/mod.rs` 同源（init_test/add_app/add_app_zero_tabs/
-    // tab_image/tab_video）：integration 目标独立二进制看不到本文件，改任一共享 helper 须
-    // 同步另侧，防单测 / 集成行为分叉漂移（tab_pdf 已迁 integration 独持，见 common）。
+    // tab_image/tab_video/tab_pdf）：integration 目标独立二进制看不到本文件，改任一共享 helper 须
+    // 同步另侧，防单测 / 集成行为分叉漂移（wave4 状态栏网格钮用例需在库内取 PDF 实体，
+    // `tab_pdf` 自 integration 迁回此处，与 common 同名同构，仍须双端同步）。
 
     /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
     fn init_test(cx: &mut TestAppContext) {
@@ -27,6 +28,15 @@
     fn tab_video(tab: &EditorTab) -> Option<&gpui::Entity<video::VideoViewer>> {
         match &tab.payload.reader {
             MediaReader::Video(vv) => Some(vv),
+            _ => None,
+        }
+    }
+
+    /// 测试辅助：取选项卡的 PDF 阅读器实体（经 `MediaReader::Pdf` 取）。
+    /// wave4 状态栏网格钮用例在库内消费；与 integration 版（tests/common）同名同构。
+    fn tab_pdf(tab: &EditorTab) -> Option<&gpui::Entity<pdf::PdfViewer>> {
+        match &tab.payload.reader {
+            MediaReader::Pdf(pv) => Some(pv),
             _ => None,
         }
     }

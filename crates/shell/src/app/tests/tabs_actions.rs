@@ -629,6 +629,120 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// wave4：PDF 状态栏「页面网格视图」按钮——显隐只随激活选项卡是否为 PDF 阅读器，
+    /// 点击经 `PdfViewer::toggle_grid` 在「单列阅读 ↔ 页面网格」间往返，高亮随 grid_mode。
+    /// （缺夹具 SKIP；shell 侧只断言按钮显隐 + grid_mode 翻转 + 网格容器渲染，
+    /// 网格卡渲染细节已由 wave3 pdf crate 覆盖。）
+    #[gpui::test]
+    async fn status_bar_pdf_grid_btn_shows_for_pdf_and_toggles(cx: &mut TestAppContext) {
+        if pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = pdf::test_util::lock().lock().unwrap();
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 初始未命名空选项卡（非 PDF）→ 不显示网格按钮。
+        assert!(
+            cx.debug_bounds("status-pdf-grid-btn").is_none(),
+            "非 PDF 选项卡不应显示页面网格按钮"
+        );
+        // 打开 PDF → 泵到加载完成 → 按钮出现、初始非网格。
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试.pdf");
+        assert!(pdf.exists(), "测试 PDF 应存在");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(pdf.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..400 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let loaded = cx.update(|_w, cx| {
+                tab_pdf(&app.read(cx).model.borrow().tabs[app.read(cx).model.borrow().active_tab])
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        let btn_initial = cx.debug_bounds("status-pdf-grid-btn").is_some();
+        let grid_initial = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
+            tab_pdf(t).map(|pv| pv.read(cx).grid_mode()).unwrap_or(true)
+        });
+        assert!(btn_initial, "PDF 选项卡应显示页面网格按钮");
+        assert!(!grid_initial, "新开 PDF 初始应为单列阅读（grid_mode=false）");
+        // 顺序断言（用户验收项）：网格按钮应位于「只读」状态项**左侧**（不放最右边）。
+        let grid_bounds = cx.debug_bounds("status-pdf-grid-btn").expect("网格按钮应在场");
+        let readonly_bounds = cx
+            .debug_bounds("status-mode-readonly")
+            .expect("PDF 只读预览应显示只读状态项");
+        assert!(
+            grid_bounds.left() < readonly_bounds.left(),
+            "网格按钮应位于只读状态项左侧（got grid.left={:?} readonly.left={:?}）",
+            grid_bounds.left(),
+            readonly_bounds.left()
+        );
+        // 两态视觉（关=纯文字无底 / 开=高亮 pill）为 `ui::theme` 语义色差，headless 经
+        // debug_bounds 不可断底色，留待真机确认；此处只保证两态共用同一 debug_selector
+        //（点击命中依赖它）且 grid_mode 翻转驱动态切换（下两步断言）。
+        // 点击按钮 → 进入网格：viewer.grid_mode==true 且网格容器渲染。
+        let btn = cx
+            .debug_bounds("status-pdf-grid-btn")
+            .expect("网格按钮应在场");
+        cx.simulate_click(btn.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let grid_on = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
+            tab_pdf(t).map(|pv| pv.read(cx).grid_mode()).unwrap_or(false)
+        });
+        assert!(grid_on, "点击网格按钮后 grid_mode 应为 true");
+        assert!(
+            cx.debug_bounds("pdf-grid").is_some(),
+            "网格模式应渲染 pdf-grid 内容容器"
+        );
+        // 再点 → 退出：grid_mode==false 且网格容器消失。
+        let btn = cx
+            .debug_bounds("status-pdf-grid-btn")
+            .expect("第二次点击前网格按钮应在场");
+        cx.simulate_click(btn.center(), Default::default());
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let grid_off = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.model.borrow().tabs[a.model.borrow().active_tab];
+            tab_pdf(t).map(|pv| pv.read(cx).grid_mode()).unwrap_or(true)
+        });
+        assert!(!grid_off, "再点网格按钮后 grid_mode 应为 false");
+        assert!(
+            cx.debug_bounds("pdf-grid").is_none(),
+            "退出网格后 pdf-grid 容器应消失"
+        );
+        // 切到非 PDF 选项卡（.txt）→ 按钮随 tab 切换隐藏。
+        let txt = std::env::temp_dir().join(format!("gpui-pdfgrid-{}.txt", std::process::id()));
+        std::fs::write(&txt, "hello\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(txt.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-pdf-grid-btn").is_none(),
+            "切到非 PDF 选项卡后网格按钮应隐藏（tab 切换刷新）"
+        );
+        let _ = std::fs::remove_file(&txt);
+    }
+
     /// P2-11 状态栏分区化：三区布局 + 分隔线 + 语言徽标（含徽记色点 pill）。
     /// - 未命名空选项卡：语言徽标（占位）显示、中间区（光标位置）省略、右侧主题/编码状态项恒在。
     /// - `.md`：自动预览 → 右侧出现「预览」状态项；有内容 → 中间区出现 `status-cursor`。
