@@ -2,15 +2,20 @@
 
 /// PDF 页面渲染宽度（px）。
 pub const PAGE_WIDTH: f32 = 840.0;
-/// 相邻页间距（px）。
-pub const PAGE_GAP: f32 = 14.0;
-/// 页面纵向外边距（px）。
-pub const PAGE_PAD_Y: f32 = 16.0;
-/// 页面横向外边距（px）。
+/// 相邻页**垂直**间距（px）：默认（连续）模式行间上页↔下页之间的页间距。
+/// 与双页（Facing）模式行间垂直间距 [`PAGED_GAP_Y`] **取齐**（`PAGE_GAP == PAGED_GAP_Y`），
+/// 两模式的「上下页间距」统一为同一常量源（本仓几何统一口径）。
+pub const PAGE_GAP: f32 = PAGED_GAP_Y;
+/// 页面**纵向**外边距（px）：默认（连续）模式的上下外边距。
+/// 与横向外边距 [`PAGE_PAD_X`] **取齐**（`PAGE_PAD_Y == PAGE_PAD_X`），与双页（Facing）模式
+/// 「四周外白取齐 = `PAGE_PAD_X`」同口径——两模式的「上下外白」统一为同一常量源。
+pub const PAGE_PAD_Y: f32 = PAGE_PAD_X;
+/// 页面横向外边距（px）：默认（连续）模式左右外边距，双页（Facing）模式四周外白同此值。
 pub const PAGE_PAD_X: f32 = 20.0;
 /// 双页（Facing）页排：同行左页↔右页之间的水平页间距（px）。
 pub const PAGED_GAP_X: f32 = 1.0;
 /// 双页（Facing）页排：上页↔下页（行间）的垂直页间距（px）。
+/// 默认（连续）模式行间垂直间距 [`PAGE_GAP`] 与此取齐（唯一取值源）。
 pub const PAGED_GAP_Y: f32 = 6.0;
 /// 渲染缩放上限（相对显示 DPI 的倍率）：实际封顶 = `MAX_RENDER_SCALE × zoom × scale_factor`。
 /// 高 DPI 屏上渲染尺寸必须先够到“显示物理像素”（宽 = `page_width × DPI`），否则 GPU 对
