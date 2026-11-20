@@ -8,6 +8,10 @@ pub const PAGE_GAP: f32 = 14.0;
 pub const PAGE_PAD_Y: f32 = 16.0;
 /// 页面横向外边距（px）。
 pub const PAGE_PAD_X: f32 = 20.0;
+/// 双页（Facing）页排：同行左页↔右页之间的水平页间距（px）。
+pub const PAGED_GAP_X: f32 = 1.0;
+/// 双页（Facing）页排：上页↔下页（行间）的垂直页间距（px）。
+pub const PAGED_GAP_Y: f32 = 6.0;
 /// 渲染缩放上限（相对显示 DPI 的倍率）：实际封顶 = `MAX_RENDER_SCALE × zoom × scale_factor`。
 /// 高 DPI 屏上渲染尺寸必须先够到“显示物理像素”（宽 = `page_width × DPI`），否则 GPU 对
 /// 低分辨率位图上采样拉伸 → 文字/图像发糊；本常量是“自然物理尺寸”上允许的额外余量。
@@ -23,6 +27,11 @@ pub const ZOOM_MAX: f32 = 4.0;
 pub const ZOOM_STEP: f32 = 0.12;
 /// 可见窗口外保留的页数（虚拟化/预取缓冲）。
 pub const MARGIN: usize = 3;
+/// 分页页拍（Facing）调度窗外扩的**行数**：分页每行 ≈ 一屏，±3 行 = 对齐连续
+/// [`MARGIN`]=3 的几屏缓冲；上界 `7×cols` 页远小于在途/驻留预算（封面窗由
+/// `COVER_INFLIGHT`/楼层驻留独立限流，走廊由 `PREFETCH_COVER_BUDGET_BYTES` 兜底）。
+/// A 线消费方 = `open::ensure_window` 的 `paged_schedule_window`（B 线缓冲/渲染分页几何）。
+pub const PAGED_WINDOW_ROWS: usize = 3;
 /// 整页位图内存保留上限（页数）。内容层已瓦片化、不再走整页位图，本常量仅供
 /// [`crate::pdf::layout::plan_page_work`] 的回归测试锚点使用。
 pub const CACHE_MAX_PAGES: usize = 8;

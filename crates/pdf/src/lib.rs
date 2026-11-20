@@ -9519,6 +9519,887 @@ mod tests {
         let sel_img2 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).selected_image);
         assert_eq!(sel_img2, None, "点空白应清除图片选中");
     }
+
+    // ---- A/B 线：分页慢加载根治（2026-11-20，真 pdfium + 真夹具）----
+    // 共用装配：`target/pdf测试2.pdf`（259 页 A4），窗口 1500×900（cell_w = min(1460, 636.4)
+    // = 636.4）；sf=2 测试平台。夹具缺失 → SKIP 常规交付。
+    fn pdf_path_of() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf")
+    }
+
+    /// 装配 + 等加载完成 + 停稳到调度清空（封面/瓦片在途空、非快速态、泵停）。
+    fn paged_settle(
+        cx: &mut gpui::VisualTestContext,
+        holder: &std::rc::Rc<
+            std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>,
+        >,
+    ) {
+        use std::time::Duration;
+        for _ in 0..600 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+            let st = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (
+                    v.pending_cover.is_empty() && v.pending_tiles.is_empty(),
+                    !v.prev_fast && !v.tile_pump_running,
+                )
+            });
+            if st == (true, true) {
+                return;
+            }
+        }
+        panic!("状态应沉降（封面/瓦片在途应清空）");
+    }
+
+    /// T1（A 线红绿）：分页 Facing 模式深跳页 200 → 停稳后**目标页有底图链 + 封面在槽**，
+    /// 且静置期「加载中」计数零增长。
+    ///
+    /// 修复前（A 线未落）：`ensure_window` 按连续 `keep_window` ±MARGIN 选窗，竖排页 + 宽视口
+    /// 下分页可见页漂出连续窗 → 页 200 的 cover/缩略/走廊**全部不被请求** → 停稳后页 200 仍
+    /// 无任何底图、每静置帧都重绘「加载中」占位（计数不断增长）——headless 真 worker 路径可证。
+    #[gpui::test]
+    async fn paged_deep_jump_settles_without_placeholder(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = pdf_path_of();
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_count());
+        assert!(n >= 220, "夹具应 ≥220 页（深跳需远离首屏），实际 {n}");
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        // 切分页模式（Facing）并停稳（分页快照装配 + 首屏分页调度收敛）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        // 几何锚（K177 演算，Facing cols=2、窗口 1500×900、pdf测试2.pdf A4 AR=w/h≈0.7071）：
+        // content_w = 1500−2×20 = 1460、cap_w = (1460−PAGED_GAP_X=1)/2 = 729.5、
+        // fit = 900×(595.28/841.89) ≈ 636.4 → cell_w = min(729.5, 636.4) = 636.4
+        // （与 Single 同值：fit 受限主导，列数/列间距只改 cap_w 不动 min）。
+        let (cw, sf) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.page_cell_width(200), _w.scale_factor())
+        });
+        assert!(
+            (cw - 636.4).abs() <= 0.5,
+            "分页卡宽 page_cell_width(200)≈636.4±0.5（实际 {cw}，sf={sf}）"
+        );
+        // 深跳页 200 → 停稳。
+        let jump = |cx: &mut gpui::VisualTestContext, page: usize| {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                    v.scroll_to_page(page);
+                    cx.notify();
+                });
+            });
+        };
+        jump(&mut *cx, 200);
+        paged_settle(cx, &holder);
+        // 主判据：停稳后目标页 200 已有底图链 + 满密度封面（A 线：调度窗含深页 → 封面被请求）。
+        let (cover_ok, base_ok, hits) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let s = &v.slots[200];
+            (
+                s.cover.is_some(),
+                s.cover.is_some()
+                    || s.prev_cover.is_some()
+                    || s.prefetch_cover.is_some()
+                    || s.mid.is_some()
+                    || s.thumb.is_some(),
+                v.loading_placeholder_hits.get(),
+            )
+        });
+        assert!(base_ok, "页 200 停稳后底图链应非空（A 线修复点）");
+        assert!(cover_ok, "页 200 停稳后满密度封面应在槽");
+        // 静置零增长：停稳后再推 5 帧，「加载中」计数不增长（与既有 `thumb_backdrop_...`
+        // 的「静置零增长」口径一致；跳转期的瞬态占位是 worker 未回首帧的合法最小值，
+        // 故以停稳后为基线）。
+        let read_hits = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .loading_placeholder_hits
+                    .get()
+            })
+        };
+        let h0 = read_hits(cx);
+        for _ in 0..5 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let h1 = read_hits(cx);
+        eprintln!(
+            "[PAGED-T1] cw={cw:.2} sf={sf} cover_ok={cover_ok} base_ok={base_ok} hits {hits}({h0}->{h1})"
+        );
+        assert!(
+            h1 == h0,
+            "停稳后「加载中」计数应零增长：{h0}->{h1}"
+        );
+    }
+
+    /// T2（B 线红绿）：分页 Facing 模式停稳在页 200 后，封面密度 = 分页卡宽口径
+    /// `cover_scale(dims[200], page_cell_width(200), sf)`（不再按连续 page_width ~2.1× 过采样）。
+    /// 演算：zoom_c=(636.4/840).max(1)=1、cap=min(1.5×1×2,16)=3.0、
+    /// raw=636.4×2/595.28≈2.138、cover=min(2.138, 4.0)=2.138。（cell_w 636.4 与 Single 同值，
+    /// 密度只依赖卡宽不依赖列数，锚保持。）
+    #[gpui::test]
+    async fn paged_cover_density_follows_cell_width(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = pdf_path_of();
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(200);
+                cx.notify();
+            });
+        });
+        paged_settle(cx, &holder);
+        let (cw, got, expected, cover_ok) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sf = _w.scale_factor();
+            let cw = v.page_cell_width(200);
+            let expected = crate::pdf::layout::cover_scale(v.dims[200], cw, sf);
+            (cw, v.slots[200].cover_scale, expected, v.slots[200].cover.is_some())
+        });
+        eprintln!("[PAGED-T2] cw={cw:.2} cover_scale={got:.4} expected={expected:.4} cover_ok={cover_ok}");
+        assert!(
+            (got - expected).abs() <= 1e-4,
+            "封面密度应走分页卡宽口径：cover_scale={got:.4} expected={expected:.4}"
+        );
+        assert!(cover_ok, "页 200 封面应在槽");
+    }
+
+    /// T3：切 Facing 跳页 40 → 行 20 = 页 40/41 并排，断言两页底图链非空 + 静置零增长
+    /// （密度/深跳驻留断言由 T1/T2 收口，本测试只守「Facing 行并排两页的调度」）。
+    #[gpui::test]
+    async fn paged_zooms_and_facing_keep_base_and_density(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path = pdf_path_of();
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let set_mode = |cx: &mut gpui::VisualTestContext, mode: crate::pdf::view::PageMode| {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                    v.set_page_mode(mode, cx);
+                });
+            });
+        };
+        let jump = |cx: &mut gpui::VisualTestContext, page: usize| {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                    v.scroll_to_page(page);
+                    cx.notify();
+                });
+            });
+        };
+        let read_hits = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .loading_placeholder_hits
+                    .get()
+            })
+        };
+        set_mode(&mut *cx, crate::pdf::view::PageMode::Facing);
+        paged_settle(cx, &holder);
+        // Facing：行 20 = 页 40/41 并排，断言两页底图链非空 + 静置零增长（无占位）。
+        set_mode(&mut *cx, crate::pdf::view::PageMode::Facing);
+        paged_settle(cx, &holder);
+        jump(&mut *cx, 40);
+        paged_settle(cx, &holder);
+        let (b40, b41) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let base = |p: usize| {
+                let s = &v.slots[p];
+                s.cover.is_some()
+                    || s.prev_cover.is_some()
+                    || s.prefetch_cover.is_some()
+                    || s.mid.is_some()
+                    || s.thumb.is_some()
+            };
+            (base(40), base(41))
+        });
+        let h0 = read_hits(cx);
+        for _ in 0..5 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let h1 = read_hits(cx);
+        eprintln!("[PAGED-T3-facing] base40={b40} base41={b41} hits {h0}->{h1}");
+        assert!(b40, "Facing 页 40 底图链应非空");
+        assert!(b41, "Facing 页 41 底图链应非空");
+        assert!(h1 == h0, "Facing：停稳后计数应零增长 {h0}->{h1}");
+    }
+
+    // ---- 模式切换对齐复现（2026-11-20 诊断红测，K177 几何推导）----
+    // 锚点与 A/B 线共用：target/pdf测试2.pdf（259 页 A4，AR=w/h≈0.7071），窗口 1500×900、
+    // sf=2、zoom=1。用户真机：同一阅读位置，连续显示第 10/28 页，切 Facing 显示 39|40/109|110
+    // （页号 ≈4× 跳变）且内容整体偏上。本组锁定「连续 → Facing 切模式不重锚 scroll」机制。
+    //
+    // 几何（K177 演算，1500×900、A4、zoom=1）：
+    //   连续：page_width = (1500−2×20)×1 = 1460；页高 disp = 1460/0.7071 ≈ 2064.9；
+    //     page_tops[9] = 16 + 9×(2064.9+14) ≈ 18725.8（第 10 页顶对齐视口顶）。
+    //   Facing：content_w = 1460、cap_w = (1460−PAGED_GAP_X=1)/2 = 729.5、fit_w = 900×0.7071
+    //     → cell_w=636.4、cell_h=900、row_top[r] = 20 + r×(900+PAGED_GAP_Y=6) = 20+906r；
+    //     行 4 = 页 9|10（含第 10 页）。
+    //   关键判据：set_page_mode 只翻状态（open.rs:823-832 不动 scroll offset）→ 切模式后
+    //     scroll_y 像素保持。若正确语义是「页对应」，应把连续「当前页 10」换算成 Facing
+    //     行 4 顶（row_top[4]=20+4×906=3644）→ 仍见第 10 页；实况 scroll_y≈18725.8 未换算，
+    //     落到行 20（row_top[20]=18140，页 41|42）→ 页号 ≈41/10≈4.1× 跳变（用户所见「对不上」）。
+    //     页高比 disp/(row/2) ≈ 2064.9/456 ≈ 4.5 → 「≈4×」主要来自几何：分页每行两页按视口高
+    //     适配（高 900），连续单页按视口宽适配（高 ≈2064.9），同一像素位覆盖的内容跨度相差
+    //     ≈4.5×；但「切模式后保持的是像素不是页」这一选择本身是换算 bug——用户期望页对应。
+    // T-A：连续第 10 页顶对齐视口顶 → 切 Facing → current_page() 应仍 ≈10（±2），实况 41 → 红。
+    #[gpui::test]
+    async fn mode_switch_continuous_to_facing_preserves_visible_page(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        // 连续：滚动到第 10 页（index 9）顶对齐视口顶（scroll_to_page 连续口径 = -page_tops[9]）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(9);
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 40);
+        let (_sy0, cont_page, cont_disp_h) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y);
+            let p = v.current_page().map(|(p, _)| p).unwrap_or(0);
+            let dh = v
+                .page_tops
+                .get(1)
+                .zip(v.page_tops.first())
+                .map(|(t1, t0)| t1 - t0 - config::pdf::PAGE_GAP)
+                .unwrap_or(0.0);
+            (sy, p, dh)
+        });
+        assert_eq!(cont_page, 10, "前提：连续模式应显示第 10 页，实况 {cont_page}");
+        assert!(
+            cont_disp_h > 500.0,
+            "前提：连续页高应显著（实况 {cont_disp_h:.1}px）"
+        );
+        // 切换 Facing（真实路径 = shell status_bar.rs:590 的 set_page_mode，不重锚 scroll）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        // 读 Facing 实况 + 页对应期望（行 4 = 页 9|10）。
+        let (facing_page, ..) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let l = v.paged_layout_cell.borrow();
+            let l = l.as_ref().expect("Facing 应有分页快照");
+            let sy = f32::from(-v.scroll.offset().y);
+            let vh = f32::from(v.scroll.bounds().size.height);
+            let (r0, _) = l.first_visible_row(-sy, vh.max(1.0)).expect("应有首可见行");
+            (
+                v.current_page().map(|(p, _)| p).unwrap_or(0),
+                sy,
+                vh,
+                r0,
+                l.row_top[r0],
+                l.row_top[1] - l.row_top[0],
+                l.row_page_start[4] + 1,
+            )
+        });
+        assert!(
+            (facing_page as i64 - 10).abs() <= 2,
+            "连续→Facing 应保持「当前页」：连续第 10 页 → Facing 首可见页应 ≈10（=行 4/页 9|10），实况 {facing_page}（页 41|42 ≈{:.1}× 跳变；scroll_y 未按分页布局换算，纯像素保留）",
+            facing_page as f32 / 10.0
+        );
+    }
+
+    // T-B：连续 → Facing 后「首可见行顶部与视口顶对齐」（无偏上）。期望 = 页对应 + 行顶对齐：
+    // 首可见行 = 行 4（含第 10 页）、sy1 恰好 = row_top[4]（视口顶贴行顶，无半行裁切）。
+    // 实况：sy1 仍为连续 scroll_y0 ≈18725.8 → 首可见行 r0=20，视口顶落在行 20 内
+    //   +465.8px 处（行顶已在视口上缘之上）→ 内容整体偏上/半行裁切（用户「偏上」观测）。
+    #[gpui::test]
+    async fn facing_switch_content_aligned_to_row_top(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(9);
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 40);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        let (sy1, r0, row_top_r0, r0_expect, _row4_top) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let l = v.paged_layout_cell.borrow();
+            let l = l.as_ref().expect("Facing 应有分页快照");
+            let sy = f32::from(-v.scroll.offset().y);
+            let vh = f32::from(v.scroll.bounds().size.height);
+            let (r0, _) = l.first_visible_row(-sy, vh.max(1.0)).expect("应有首可见行");
+            (
+                sy,
+                r0,
+                l.row_top[r0],
+                9 / l.cols,
+                l.row_top[9 / l.cols],
+            )
+        });
+        let delta = (sy1 - row_top_r0).abs();
+        assert_eq!(
+            r0, r0_expect,
+            "Facing 首可见行应为第 10 页所在行（page/cols = 9/2 = 行 4），实况行 {r0}"
+        );
+        assert!(
+            delta <= 1.0,
+            "Facing 首可见行顶部应与视口顶对齐（无偏上）：delta=视口顶−行顶={delta:.1}px（实况 sy1={sy1:.1} 未按行界重锚，行顶已在视口上缘之上，内容整体偏上）"
+        );
+    }
+
+    // T-C（对称红测，K177）：Facing → Continuous 双向页对应——Facing 显第 10 页所在行
+    // （行 4 = 页 9|10，current_page = 行首页 row_page_start[4]+1 = 9）→ 切 Continuous →
+    // 首可见页应仍 ≈ 同一页（9）。修复前只翻状态不动 scroll：Facing 滚动位 sy ≈ row_top[4]
+    // = 3644 px，切 Continuous 后同一像素 (3644−16)/(2064.9+14) ≈ 1.75 行 → 首可见页 2
+    // （≈9 跳变，与 T-A 同根因反向）。
+    //
+    // 期望推导（K177，pdf测试2.pdf A4 AR=w/h≈0.7071、窗口 1500×900、zoom=1）：
+    //   Facing：scroll_to_page(9) → r = 9/2 = 4 → row_top[4] = 20 + 4×(900+6) = 3644；
+    //     current_page = row_page_start[4]+1 = (4×2)+1 = 9；reading_progress 读 (8, 0.0)
+    //     （行首页 index 8 = row_page_start[4]）。
+    //   Continuous（页对应重锚后）：sy = page_tops[8] + 0 = 16 + 8×(2064.9+14) ≈ 16647.2
+    //     → first_visible_page = 8（index）→ 首可见页 8+1 = 9 ＝ Facing 的 9。
+    #[gpui::test]
+    async fn mode_switch_facing_to_continuous_preserves_visible_page(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        // Facing：跳页 9（index 9）→ 行 4 顶（页 9|10 所在行）对齐视口顶。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(9);
+                cx.notify();
+            });
+        });
+        paged_settle(cx, &holder);
+        let (facing_page, sy0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let p = v.current_page().map(|(p, _)| p).unwrap_or(0);
+            let sy = f32::from(-v.scroll.offset().y);
+            (p, sy)
+        });
+        assert_eq!(facing_page, 9, "前提：Facing 行 4 行首页应 = 9（页 9|10 所在行）");
+        // 切 Continuous（真实路径 = set_page_mode，不重锚 scroll）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Continuous, cx);
+            });
+        });
+        zoom_wait_frames(cx, 40);
+        let (cont_page, sy1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let p = v.current_page().map(|(p, _)| p).unwrap_or(0);
+            let sy = f32::from(-v.scroll.offset().y);
+            (p, sy)
+        });
+        eprintln!(
+            "[MODE-TC] facing_page={facing_page} sy0={sy0:.1} | cont_page={cont_page} sy1={sy1:.1} (未重锚={:.1}px)",
+            (sy1 - sy0).abs()
+        );
+        assert!(
+            (cont_page as i64 - facing_page as i64).abs() <= 1,
+            "Facing→Continuous 应保持「当前页」：Facing 首可见页 {facing_page} → Continuous 应 ≈同页，实况 {cont_page}（滚动像素未按连续页列换算，{:.1}px 深向差）",
+            (sy1 - sy0).abs()
+        );
+    }
+
+    // T-D（边界，K177）：末行 ragged——259 页 A4、Facing cols=2 → rows=ceil(259/2)=130；
+    // 行 0..128 各 2 页、末行 129 仅 1 页（页 258）。scroll_to_page(258) 到末行顶 → 切
+    // Continuous → 再切 Facing → 断言不 panic、首可见页 = 末页 259、滚动被夹在合法量程。
+    // 恢复侧边界（open.rs restore_pending 分页分支）：`r = (page/cols).min(rows-1)` 对
+    // page 258 → r = 129（==rows−1，不越界）；`row_page_start[r+1]` 末行取
+    // (130×2).min(259)=259，区间 [258,259) 有效（ragged 无越界）。
+    #[gpui::test]
+    async fn mode_switch_ragged_last_row_preserves_boundary(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_count());
+        assert!(n >= 259, "夹具应 ≥259 页（末行 ragged 需奇数页），实际 {n}");
+        // Facing → scroll_to_page(258)（0 基末页）→ 末行 129 顶对齐视口顶。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(258);
+                cx.notify();
+            });
+        });
+        paged_settle(cx, &holder);
+        let (facing_page, l_ok, sy0, max0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let l = v.paged_layout_cell.borrow();
+            let l = l.as_ref().expect("Facing 应有分页快照");
+            assert_eq!(l.rows, 130, "259 页 Facing → 130 行");
+            let vh = f32::from(v.scroll.bounds().size.height);
+            let max = (l.total_height - vh).max(0.0);
+            // 末行页区间端点：row_page_start[129]=258、row_page_start[130]=min(260,259)=259。
+            let ok = l.row_page_start.len() == l.rows + 1
+                && l.row_page_start[129] == 258
+                && l.row_page_start[130] == 259;
+            (
+                v.current_page().map(|(p, _)| p).unwrap_or(0),
+                ok,
+                sy,
+                max,
+            )
+        });
+        assert!(l_ok, "末行 row_page_start 区间应 [258,259)（ragged 不越界）");
+        assert!(
+            (facing_page as i64 - 259).abs() <= 1,
+            "Facing 末行首可见页应 = 259（末页），实况 {facing_page}"
+        );
+        assert!(
+            sy0 <= max0 + 0.5,
+            "Facing 末行滚动应被夹在分页量程内：sy={sy0:.1} ≤ max={max0:.1}"
+        );
+        // 切 Continuous：restore 连续分支 k = 258（page_tops[258]）→ 首可见页 259。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Continuous, cx);
+            });
+        });
+        zoom_wait_frames(cx, 40);
+        let (cont_page, sy1, total_h) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.current_page().map(|(p, _)| p).unwrap_or(0),
+                f32::from(-v.scroll.offset().y).max(0.0),
+                v.total_height,
+            )
+        });
+        assert!(
+            (cont_page as i64 - 259).abs() <= 1,
+            "Facing→Continuous 末页应保持 259，实况 {cont_page}"
+        );
+        assert!(
+            sy1 <= total_h.max(0.0) + 0.5,
+            "连续末页滚动应被夹在连续量程内：sy={sy1:.1} ≤ total={total_h:.1}"
+        );
+        // 再切回 Facing：r = min(258/2, 130−1) = 129 → row_top[129]（末行顶）→ 首可见页 259。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        let (facing2_page, sy2, max2) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let l = v.paged_layout_cell.borrow();
+            let l = l.as_ref().expect("Facing 应有分页快照");
+            let vh = f32::from(v.scroll.bounds().size.height);
+            (v.current_page().map(|(p, _)| p).unwrap_or(0), sy, (l.total_height - vh).max(0.0))
+        });
+        eprintln!(
+            "[MODE-TD] n={n} facing={facing_page} cont={cont_page} facing2={facing2_page} sy0={sy0:.0} sy1={sy1:.0} sy2={sy2:.0} max0={max0:.0} max2={max2:.0}"
+        );
+        assert!(
+            (facing2_page as i64 - 259).abs() <= 1,
+            "Facing→Continuous→Facing 末页应保持 259，实况 {facing2_page}"
+        );
+        assert!(sy2 <= max2 + 0.5, "二次 Facing 末行滚动应仍在分页量程内");
+    }
+
+    // T-E（边界）：同帧连续两次 set_page_mode（Facing → Continuous，中间无帧泵）→
+    // last-writer-wins：最终 page_mode=Continuous、滚动 = 连续第 10 页位（无残留中间 pending
+    // 把位置带偏）。K177：连续第 10 页（index 9）在位 → 第一次 Facing 捕获 (9,0) 挂 pending；
+    // 第二次 Continuous 因分页快照未装配回落连续口径再捕获 (9,0) **覆写** pending → 下一帧
+    // restore 落地 page_tops[9] → 首可见页 10。若残留第一次的中间位（Facing row_top[4] 类）
+    // 即位置被带偏。
+    #[gpui::test]
+    async fn mode_switch_rapid_double_flip_last_writer_wins(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        // 连续：滚动到第 10 页顶（index 9）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(9);
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 40);
+        let (p0,) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.current_page().map(|(p, _)| p).unwrap_or(0),)
+        });
+        assert_eq!(p0, 10, "前提：连续模式应显示第 10 页");
+        // 同帧双翻转（中间不泵帧）：先 Facing 再 Continuous。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+                v.set_page_mode(crate::pdf::view::PageMode::Continuous, cx);
+            });
+        });
+        zoom_wait_frames(cx, 40);
+        let (pm, p1, sy1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.page_mode(),
+                v.current_page().map(|(p, _)| p).unwrap_or(0),
+                f32::from(-v.scroll.offset().y),
+            )
+        });
+        eprintln!(
+            "[MODE-TE] p0={p0} pm={pm:?} p1={p1} sy1={sy1:.1}（连续第 10 页顶应≈{:.1}）",
+            sy1
+        );
+        assert_eq!(pm, crate::pdf::view::PageMode::Continuous, "双翻转末态应为 Continuous（last-writer-wins）");
+        assert!(
+            (p1 as i64 - 10).abs() <= 1,
+            "双翻转后应停在第 10 页：实况 {p1}（残留中间 pending 会把位置带偏）"
+        );
+    }
+
+    // T-F（边界，K177/K190 frac>0 参数化）：连续第 10 页中部（frac≈0.5）→ 切 Facing →
+    // 目标页 10 仍可见（行 4 含页 9|10，current_page = 行首页 9 ∈ [9,11]），且行内 frac 保留
+    // （sy − row_top[4]×zoom ≈ 0.5×row_h×zoom；距行顶 450px，自由滚动无吸附、不贴顶）→
+    // 切回 Continuous → 回到「Facing 行首页」index 8（1 基页 9）附近、
+    // frac≈0.5 保留。「页对应而非像素对应」在 frac>0 也成立。
+    // 自我证（K177）：sy = page_tops[9] + 0.5·disp_h → reading_progress 连续分支读 (9, ≈0.5)。
+    // 注：Facing→Continuous 的「同页」指 Facing 行首页（reading_progress 分页口径 =
+    // row_page_start[r0]=8），非原 1 基页 10——既有分页口径语义（与 T-C 一致，非回归）。
+    #[gpui::test]
+    async fn mode_switch_mid_page_frac_preserved(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        // 连续：滚到第 10 页中部（frac=0.5），并 self 证 reading_progress 读 (9, ≈0.5)。
+        let sy0 = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let disp_h = v
+                .page_tops
+                .get(1)
+                .zip(v.page_tops.first())
+                .map(|(t1, t0)| t1 - t0 - config::pdf::PAGE_GAP)
+                .unwrap_or(0.0);
+            v.page_tops[9] + 0.5 * disp_h
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                v.scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(-sy0)));
+            });
+        });
+        zoom_wait_frames(cx, 10);
+        let (p0, f0) = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .reading_progress()
+                .map(|(p, f, _)| (p, f))
+                .expect("应读到进度")
+        });
+        assert_eq!(p0, 9, "前提：目标页应为第 10 页（index 9）");
+        assert!(
+            (f0 - 0.5).abs() < 0.01,
+            "前提：第 10 页应停在页内 50%（frac≈0.5），实况 {f0}"
+        );
+        // 切 Facing：restore 分页分支 r=9/2=4、sy = row_top[4]×zoom + frac×row_h×zoom。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        let (facing_page, offset_f, row_h_read, frac_f, page10_visible) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let zoom = v.zoom.max(0.01);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let vh = f32::from(v.scroll.bounds().size.height);
+            let l = v.paged_layout_cell.borrow();
+            let l = l.as_ref().expect("Facing 应有分页快照");
+            let (r0, _) = l.first_visible_row(-(sy / zoom), vh / zoom).unwrap_or((0, 0));
+            let row_top = l.row_top[r0];
+            let row_h = l.row_height(r0).max(f32::EPSILON);
+            // 页 10（index 9）可见 ⇔ 落在首可见行页区间 [row_page_start[r0], row_page_start[r0+1]-1]。
+            let vis_start = l.row_page_start[r0];
+            let vis_end = l.row_page_start[r0 + 1].saturating_sub(1);
+            (
+                v.current_page().map(|(p, _)| p).unwrap_or(0),
+                sy - row_top * zoom,
+                row_h,
+                ((sy / zoom - row_top) / row_h).clamp(0.0, 1.0),
+                vis_start <= 9 && 9 <= vis_end,
+            )
+        });
+        eprintln!(
+            "[MODE-TF] p0={p0} f0={f0:.3} | facing_page={facing_page} offset_f={offset_f:.1} row_h={row_h_read:.1} frac_f={frac_f:.3} page10_visible={page10_visible}"
+        );
+        assert!(
+            (facing_page as i64 - 9).abs() <= 2,
+            "切 Facing 后目标页仍可见：首可见行页应在 9±2，实况 {facing_page}"
+        );
+        assert!(page10_visible, "切 Facing 后第 10 页应在首可见行页区间内");
+        assert!(
+            (offset_f - 0.5 * row_h_read).abs() < 1.0,
+            "行内 frac 应保留（offset≈0.5×行高 {row_h_read:.1}）：实况 offset={offset_f:.1}（页对应而非像素对应）"
+        );
+        assert!((frac_f - 0.5).abs() < 0.01, "Facing 侧 reading_progress frac≈0.5，实况 {frac_f}");
+        // 切回 Continuous：restore 连续分支 k = row_page_start[4] = 8、frac≈0.5 保留。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Continuous, cx);
+            });
+        });
+        zoom_wait_frames(cx, 40);
+        let (pm, p2, f2) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+            (v.page_mode(), v.current_page().map(|(p, _)| p).unwrap_or(0), rp.1)
+        });
+        eprintln!("[MODE-TF-cont] pm={pm:?} p2={p2} f2={f2:.3}");
+        assert_eq!(pm, crate::pdf::view::PageMode::Continuous, "切回后应为 Continuous");
+        assert!(
+            (p2 as i64 - 9).abs() <= 1,
+            "切回 Continuous 应回到 Facing 行首页（1 基页 9≈原页 10 附近）：实况 {p2}"
+        );
+        assert!(
+            (f2 - 0.5).abs() < 0.05,
+            "切回后页内 frac 应≈0.5 保留：实况 {f2}"
+        );
+    }
+
+    /// [回归，纯数学不触 pdfium] Facing=连续自由滚动下，行中位 → 渲染窗 `paged_render_window`
+    /// 必须覆盖全可见行（K177 演算）：视口顶落在行 0 中部、视口底落入行 1 →
+    /// `first_visible_row` 返回 (0, 1)（两行都真可见），渲染窗按全可见行 ± 缓冲推出页区间
+    /// (0, 2)——旧 `paged_visible_pages` 只按**首行 r0** 会漏行 1（自由滚动停在行中间时
+    /// 下一行空白）。本测试锁「渲染窗覆盖全可见行」这一契约。
+    ///
+    /// 演算：Facing cols=2、3 页 A4 (793,1123)、视口 1500×700、h_gap=PAGED_GAP_X=1、
+    /// v_gap=PAGED_GAP_Y=6、padding=20：
+    ///   content_w=1460 → cap_w=(1460−1)/2=729.5；AR=793/1123≈0.70614 →
+    ///   fit_w=700×0.70614≈494.3 → cell_w=min(729.5,494.3)=494.3、cell_h=494.3×(1123/793)=700
+    ///   → row_top=[20, 726]（20+700+6）、row_page_start=[0,2,3]、total=20+700+6+700+20=1446。
+    #[test]
+    fn paged_mid_row_render_window_covers_visible_rows() {
+        let l = crate::layout::paged_layout(
+            &[(793.0, 1123.0); 3],
+            1500.0,
+            700.0,
+            2,
+            config::pdf::PAGED_GAP_X,
+            config::pdf::PAGED_GAP_Y,
+            20.0,
+        );
+        assert_eq!(l.rows, 2, "Facing 3 页 → 2 行");
+        assert!(
+            (l.row_top[1] - 726.0).abs() < 0.5,
+            "row_top[1]≈726，实测 {}",
+            l.row_top[1]
+        );
+        assert!(
+            (l.row_height(0) - 700.0).abs() < 0.5,
+            "行高≈700，实测 {}",
+            l.row_height(0)
+        );
+        // 视口顶贴行 0 顶下 45（自由滚动片段）、视口底（765）落进行 1（726..1426）。
+        let scroll_y = -(20.0 + 45.0);
+        let vis = l.first_visible_row(scroll_y, 700.0);
+        assert_eq!(vis, Some((0, 1)), "行中自由滚动：两行都应真可见，got {vis:?}");
+        // 旧 helper 只取首行 r0 页区间 → 漏行 1 页（2）＝旧渲染窗的下一行空白缺口。
+        let old = crate::layout::paged_visible_pages(&l, scroll_y, 700.0, 3);
+        assert_eq!(old, Some((0, 1)), "paged_visible_pages 只按 r0 返回，got {old:?}");
+        // 新渲染窗 = 全可见行（r0..=r1）± 缓冲：r_lo=0、r_hi=1 →
+        // 页 [row_page_start[0], row_page_start[2]−1] = (0, 2)（全部 3 页）。
+        let win = crate::layout::paged_render_window(&l, scroll_y, 700.0, 3, 1);
+        assert_eq!(win, Some((0, 2)), "新渲染窗应含全部 3 页，got {win:?}");
+        // 行中停稳命中：内容 y=740（行 1 内）→ row_index_at_y=1（命中链已支持任意行中位）。
+        assert_eq!(l.row_index_at_y(740.0), Some(1));
+        // 缩放锚连续语义：zoom_rescroll_anchor_paged 在行中位（行 0 内 45/700）保持行内比例。
+        let pl_old = crate::layout::paged_layout_scaled(&l, 1.0);
+        let pl_new = crate::layout::paged_layout_scaled(&l, 2.0);
+        let sy = 20.0 + 45.0;
+        let sy_new = crate::layout::zoom_rescroll_anchor_paged(&pl_old, &pl_new, 0, 2.0, sy);
+        let frac = (sy - pl_old.row_top[0]) / pl_old.row_height(0);
+        let frac_new = (sy_new - pl_new.row_top[0]) / pl_new.row_height(0);
+        assert!(
+            (frac_new - frac).abs() < 1e-3,
+            "缩放锚应保持行内比例 {frac}，got {frac_new}"
+        );
+    }
 }
 
 

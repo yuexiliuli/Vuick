@@ -13,11 +13,6 @@
 use super::*;
 use crate::pdf::parser::grid_bucket_width;
 
-/// 分页页拍（Single/Facing）停稳吸附的**最大距离**（显示 px）：停稳后滚动位距最近行顶
-/// ≤ 此值才吸附（防每帧跳变——行高数百 px，用户有意停在页中段时不反复被拉）。取 64：
-/// 小于常见行高的 1/5，滚轮步进（误差 ≈0）与滚动条停位（几十 px 内）都能吸住。
-const PAGED_SNAP_MAX_DIST_PX: f32 = 64.0;
-
 /// 两路径是否指向**同一文件**（P1 数据丢失防护用）：先各自 `canonicalize` 对拍（把盘上
 /// 已存在文件归一化成绝对路径，`.`/`..`、大小写、分隔符差异都能消除）；`out` 目标尚未
 /// 创建时 `canonicalize` 失败 → 退化回字面路径相等比较（防漏纯拼写同路径）。
@@ -393,7 +388,7 @@ impl PdfViewer {
 
     /// 滚动到指定页（目录跳转）。页码越界时忽略。
     ///
-    /// 分页页拍（Single/Facing，R6）：目标页所在行 = `page / cols`，让该行**行顶对齐视口顶**
+    /// 分页页拍（Facing，R6）：目标页所在行 = `page / cols`，让该行**行顶对齐视口顶**
     /// （`offset = −row_top[r]×zoom`）；连续 = 既有 `page_tops[page]` 顶对齐。分页快照缺失
     /// （模式刚切、布局未装配）→ 回退连续口径（页列对齐，保证目录跳转永不落空）。
     pub fn scroll_to_page(&mut self, page_index: usize) {
@@ -433,7 +428,7 @@ impl PdfViewer {
     /// zoom/页宽伸缩）——绝不可以用 pt 高（页高 pt 与显示高相差一个 `pw/pt_w` 缩放因子，跨
     /// zoom 会失配）。与 [`Self::set_restore_anchor`] 的恢复公式互逆：同档往返无漂移。
     ///
-    /// **分页模式**（Single/Facing）：返回 `(行首页下标 = row_page_start[r0], 行内纵向比例,
+    /// **分页模式**（Facing）：返回 `(行首页下标 = row_page_start[r0], 行内纵向比例,
     /// zoom)`——`r0` = `first_visible_row` 首行，frac = `(内容顶 − 行顶) / 行高`（行内 0=行顶、
     /// 1=行底，与 zoom 无关：内容顶/行顶/行高同为显示口径，zoom 约掉）。恢复侧
     /// （[`Self::set_restore_anchor`] 消费）按 `r = page/cols` 还原行号。
@@ -650,7 +645,7 @@ impl PdfViewer {
     /// 状态；文档未加载完成（`dims` 为空）时返回 `None`。与 EPUB 页码口径一致：
     /// 「第一张可见页」如实反映视口，不含 `keep_window` 的 MARGIN 缓冲。
     ///
-    /// **分页模式**（Single/Facing）：返回 `(行首页下标 + 1 = row_page_start[r0] + 1, 总页数)`。
+    /// **分页模式**（Facing）：返回 `(行首页下标 + 1 = row_page_start[r0] + 1, 总页数)`。
     pub fn current_page(&self) -> Option<(usize, usize)> {
         if self.dims.is_empty() {
             return None;
@@ -693,7 +688,7 @@ impl PdfViewer {
         (w.max(1.0), h.max(1.0))
     }
 
-    /// 分页页排（Single/Facing）布局视口 `(宽, 高)`：读取**阅读滚动容器**（`scroll`）真实
+    /// 分页页排（Facing）布局视口 `(宽, 高)`：读取**阅读滚动容器**（`scroll`）真实
     /// bounds——分页页排复用阅读 scroll，故视口源与连续阅读一致（不同于网格的
     /// [`grid_viewport`] 读 `grid_scroll`）；首帧 `scroll.bounds()` 为 0 回退窗口尺寸
     /// （同 [`Self::wrap_width`] 首帧口径），两轴夹 ≥1 防退化布局。
@@ -814,15 +809,33 @@ impl PdfViewer {
         self.set_grid_mode(!self.grid_mode, cx);
     }
 
-    /// 设置阅读页排模式（连续/单页/双页；状态层，渲染分派未接——后续切片）。
+    /// 设置阅读页排模式（连续/双页；状态层 + 跨模式**页对应重锚**）。
     /// - **幂等**：模式未变且不在网格态时直接返回（不重复 `notify`）。
     /// - **网格互斥**：若正处于网格总览，先退出网格（`set_grid_mode(false)`——清网格
     ///   选中集/在途资源，单列滚动保持）再落新模式：网格只是一时总览，选新阅读页拍即
     ///   回到阅读主面。
-    /// - 本切片只做状态翻转 + `notify`；**滚动锚点/阅读进度跨模式恢复**由后续切片接。
+    /// - **页对应重锚**（2026-11-20 对齐修复，K30/K49）：模式真的变化（非网格态）时，翻转
+    ///   前用 [`Self::reading_progress`] 现有口径捕获当前 `(页, 页内比例)` 挂进
+    ///   `restore_pending`，下一帧 `ensure_window` 装配新模式分页快照后按既有逆换算
+    ///   （分页 `r = page/cols`、连续 `page_tops[k]`）落地到**同一页**——连续 ↔ Facing 互切
+    ///   不跳页、切后首可见行贴行顶（`frac==0` 时）；`frac>0` 时按页内比例保留偏移，行顶可
+    ///   不贴视口（自由滚动无吸附，停在行中间即保持，勿误判为回归）。此前只
+    ///   翻状态不动 scroll 像素：同一像素跨模式深向差
+    ///   ≈4.5×（连续页高 2079px vs Facing 行高 912px）→ 切到 Facing 页号 ≈4× 跳变 + 内容
+    ///   偏上半个行高（无吸附时代由行内比例保留偏移兜底）。
+    /// - **网格正交守卫**：网格激活时不重锚——网格滚动由 [`Self::grid_scroll`] 独立驱动、
+    ///   不与 page_mode 联动，此时 `reading_progress` 捕到的阅读位是过期值，跳过以免错锚。
     pub fn set_page_mode(&mut self, mode: PageMode, cx: &mut Context<Self>) {
         if self.page_mode == mode && !self.grid_mode {
             return;
+        }
+        // 真实模式翻转（非网格态）→ 页对应重锚：用当前模式既有口径捕获 (页, 页内比例)，
+        // 交给 ensure_window 的 restore_pending 逆换算在下一帧落地（镜像阅读进度恢复时序）。
+        // 文档未加载（reading_progress=None）→ 不设 pending（保持滚动位，等效旧行为）。
+        if self.page_mode != mode && !self.grid_mode
+            && let Some((page, frac, _zoom)) = self.reading_progress()
+        {
+            self.restore_pending = Some((page, frac));
         }
         if self.grid_mode {
             self.set_grid_mode(false, cx);
@@ -1346,8 +1359,8 @@ impl PdfViewer {
         crate::pdf::layout::snap_to_device(self.base_w * self.zoom, self.scale_factor)
     }
 
-    /// 分页页拍（Single/Facing）是否激活：`!grid_mode && page_mode != Continuous && 非空`。
-    /// 与 `ensure_window` 建分页快照的判据同源——命中/滚轮步进/吸附/跳页统一走它，
+    /// 分页页拍（Facing）是否激活：`!grid_mode && page_mode != Continuous && 非空`。
+    /// 与 `ensure_window` 建分页快照的判据同源——命中/滚动/跳页统一走它，
     /// 保证「有分页快照 ⇔ 分页几何生效」两处不漂移（R1-R7 共用的门）。
     pub(super) fn paged_mode_active(&self) -> bool {
         !self.grid_mode && self.page_mode != PageMode::Continuous && !self.dims.is_empty()
@@ -1369,6 +1382,55 @@ impl PdfViewer {
             }
         }
         self.page_width()
+    }
+
+    /// 分页态调度窗口（A 线，闭区间页下标）：换算后经 `layout::paged_schedule_window`，
+    /// `k_rows = PAGED_WINDOW_ROWS`；非分页 / 无快照 / 空 → `None`（`ensure_window` 回落
+    /// 连续 `keep_window` ±MARGIN 窗口）。布局快照以 `Ref` guard 借出 `&PagedLayout` 直读
+    /// （不整表 clone，`ensure_window` 每帧执行路径零分配）。
+    fn paged_schedule_window(&self, scroll_y: f32, viewport_h: f32) -> Option<(usize, usize)> {
+        if !self.paged_mode_active() {
+            return None;
+        }
+        let guard = self.paged_layout_cell.borrow();
+        let Some(layout) = guard.as_ref() else {
+            return None;
+        };
+        if layout.rows == 0 {
+            return None;
+        }
+        let zoom = self.zoom.max(0.01);
+        let scroll_y_fit = -(scroll_y.max(0.0) / zoom);
+        let vh_fit = viewport_h / zoom;
+        crate::pdf::layout::paged_schedule_window(
+            layout,
+            scroll_y_fit,
+            vh_fit,
+            self.dims.len(),
+            config::pdf::PAGED_WINDOW_ROWS,
+        )
+    }
+
+    /// 分页态可见中心页（F4 走廊中心 / `evict_prefetch_covers` 的回收锚）：可见行页区间
+    /// 算术中心。非分页 / 无快照 / 空 → `None`（调用方回落连续 `first_visible_page`）。
+    /// 快照同样以 `Ref` guard 借出直读，不整表 clone。
+    fn paged_vis_center(&self, scroll_y: f32, viewport_h: f32) -> Option<usize> {
+        if !self.paged_mode_active() {
+            return None;
+        }
+        let guard = self.paged_layout_cell.borrow();
+        let Some(layout) = guard.as_ref() else {
+            return None;
+        };
+        if layout.rows == 0 {
+            return None;
+        }
+        let zoom = self.zoom.max(0.01);
+        let scroll_y_fit = -(scroll_y.max(0.0) / zoom);
+        let vh_fit = viewport_h / zoom;
+        let (s, e) =
+            crate::pdf::layout::paged_visible_pages(layout, scroll_y_fit, vh_fit, self.dims.len())?;
+        Some((s + e) / 2)
     }
 
     /// **分页页拍的唯一显示矩形源**（R1，K153 单一真源）：把 zoom=1 fit 口径的
@@ -1393,7 +1455,7 @@ impl PdfViewer {
         let cw = r.w * z;
         let ch = r.h * z;
         let cols = layout.cols as f32;
-        let gap = layout.gap * z;
+        let gap = layout.h_gap * z;
         let spread = cols * cw + (cols - 1.0) * gap;
         // 视口宽 = 阅读滚动容器宽（= 视口宽）；首帧/退化（≤0）回退到「恰容纳整行 + 两侧 padding」。
         let mut viewport_w = f32::from(self.scroll.bounds().size.width);
@@ -1411,31 +1473,33 @@ impl PdfViewer {
         })
     }
 
-    /// 分页吸附目标：`scroll_y`（gpui 负偏移，`scroll.offset().y`）→ 吸附后的**内容顶
-    /// 显示 px**（= `snap_target` 最近行顶 × zoom；首行之上 → 0）。无分页快照/空布局 → `None`。
-    /// 与滚轮步进共用同一 `snap_target` 行界源（R5：步进=行界、吸附=同行界，防双驱动冲突）。
-    fn paged_snap_target(&self) -> Option<f32> {
-        let layout = self.paged_layout_cell.borrow().clone()?;
-        if layout.rows == 0 {
-            return None;
+    /// (**B 线密度真源**) 页卡显示尺寸 `(w, h)`（CSS px）：分页 = `paged_display_rect(page)`
+    /// 的 `(w, h)`（cell 宽 × zoom、卡高按纵横比）；连续 / 网格 / 无分页快照 =
+    /// `(page_width, display_height)`（连续口径，行为逐字节不变）。瓦片/封面密度 +
+    /// `visible_tile_range_axis` 对账 + render 侧封面有效性判定**全部只经本函数**——消除
+    /// 「分页卡按连续 page_width 密度过采样 ~2.3×（线性）/ ~5×（像素面积，本窗口）」（S5b 落地）。
+    pub(crate) fn page_card_display_size(&self, page: usize) -> (f32, f32) {
+        if let Some(rect) = self.paged_display_rect(page) {
+            return (rect.w, rect.h);
         }
-        let zoom = self.zoom.max(0.01);
-        let content_top = f32::from(-self.scroll.offset().y).max(0.0);
-        // 布局（zoom=1）负偏移口径：内容显示 = 布局 × zoom → 布局滚动偏移 = 显示偏移 / zoom。
-        let scroll_y_fit = -(content_top / zoom);
-        let (_r, row_top) = layout.snap_target(scroll_y_fit);
-        // 首行之上（当前内容顶 < 首行顶）→ 0；否则吸附到最近行顶 × zoom。
-        let target = if content_top < layout.row_top[0] * zoom {
-            0.0
-        } else {
-            row_top * zoom
-        };
-        Some(target.min(self.paged_max_scroll()))
+        let pw = self.page_width();
+        let h = self
+            .dims
+            .get(page)
+            .copied()
+            .map_or(pw, |d| display_height(d, pw));
+        (pw, h)
+    }
+
+    /// 页卡显示宽（CSS px，`page_card_display_size` 的宽分量；密度计算最常用）。
+    #[inline]
+    pub(crate) fn page_card_display_w(&self, page: usize) -> f32 {
+        self.page_card_display_size(page).0
     }
 
     /// 分页滚动**纵向量程**（显示 px）：可视内容可滚范围 = `PagedLayout 总高 × zoom − 视口高`
-    /// （≥0）。分页容器内容高 = `total_height×zoom`、与连续 `total_height` 无关——步进/吸附/
-    /// 跳页目标都须按它夹（末行顶 + 视口高可能超出文档底，gpui 布局会把偏移再夹到下界，
+    /// （≥0）。分页容器内容高 = `total_height×zoom`、与连续 `total_height` 无关——跳页/恢复
+    /// 目标都须按它夹（末行顶 + 视口高可能超出文档底，gpui 布局会把偏移再夹到下界，
     /// 这里先夹保证 `last_scroll_y` 记录的也是夹后值 → 无假速度）。无分页快照回落连续量程。
     pub(super) fn paged_max_scroll(&self) -> f32 {
         let guard = self.paged_layout_cell.borrow();
@@ -1444,42 +1508,6 @@ impl PdfViewer {
         };
         let viewport_h = f32::from(self.scroll.bounds().size.height);
         (layout.total_height * self.zoom.max(0.01) - viewport_h).max(0.0)
-    }
-
-    /// 分页**停稳吸附**（R5，`ensure_window` 每帧调用）：分页页拍且停稳（非快速态 ∧
-    /// `|Δy| < STOP_DETECT_PX`，`Δy = |内容顶 − last_scroll_y|`）→ 把滚动位吸附到
-    /// [`Self::paged_snap_target`] 的最近行顶（≤ [`PAGED_SNAP_MAX_DIST_PX`] 才吸，防每帧
-    /// 跳变；首行之上 → 0）。与滚轮步进（input.rs `paged_step_wheel`）共用同一 `snap_target`
-    /// 行界源（步进=行界、吸附=同行界，防双驱动冲突）。吸附后回写 `last_scroll_y`——
-    /// 本帧后半（keep_window/调度）与下一帧速度估计都与吸附位一致（无假速度）。
-    fn paged_maybe_snap(&mut self) {
-        if !self.paged_mode_active() || self.speed_state.is_fast() {
-            return;
-        }
-        let Some(layout) = self.paged_layout_cell.borrow().clone() else {
-            return;
-        };
-        if layout.rows == 0 {
-            return;
-        }
-        let content_top = f32::from(-self.scroll.offset().y);
-        let dy = (content_top - self.last_scroll_y).abs();
-        if dy >= config::pdf::STOP_DETECT_PX {
-            return;
-        }
-        if let Some(snapped) = self.paged_snap_target() {
-            let delta = snapped - content_top;
-            if delta.abs() <= PAGED_SNAP_MAX_DIST_PX {
-                if delta.abs() > 1e-3 {
-                    self.scroll
-                        .set_offset(gpui::point(self.scroll.offset().x, px(-snapped)));
-                }
-                // 吸附（含已贴目标位）：速度估计基线同步到吸附位（无假速度）。
-                self.last_scroll_y = snapped;
-            } else {
-                self.last_scroll_y = content_top;
-            }
-        }
     }
 
     /// 当前缩放倍数（Ctrl+滚轮在 `base_w` 基线上的倍率；1.0 = 适应窗口宽的 100%）。
@@ -1528,33 +1556,26 @@ impl PdfViewer {
             self.sel_card = None;
             cx.notify();
         }
-        // 分页页排（Single/Facing）布局每帧重算：以 zoom=1（fit）口径、**真实阅读视口**算
+        // 分页页排（Facing）布局每帧重算：以 zoom=1（fit）口径、**真实阅读视口**算
         // [`PagedLayout`] 并抄入快照，render 读它做分页定位（显示统一乘 `self.zoom`）。
         // 放在 worker/dims 守卫**之前**：无 worker 的测试夹具/纯态期也保持快照新鲜。
         // 连续阅读（`page_tops`/`compute_layout`）与网格（`GridLayout`）为各自布局，
         // 不建分页快照（渲染按 `page_mode` 走对应分支，读不到残留）。
         if !self.grid_mode && self.page_mode != PageMode::Continuous && !self.dims.is_empty() {
             let (pvw, pvh) = self.paged_viewport(window);
-            let cols = if self.page_mode == PageMode::Facing {
-                2
-            } else {
-                1
-            };
+            // Single 单页模式已删：分页态只剩 Facing（恒 2 列），死支移除。
+            let cols = 2;
             *self.paged_layout_cell.borrow_mut() = Some(paged_layout(
                 &self.dims, pvw, pvh,
-                cols,       // 列数 = 匹配 page_mode（Single=1、Facing=2）
-                GRID_GAP,   // 行/列间距（对齐 layout.rs 的 paged_layout 测试口径）
-                PAGE_PAD_X, // 四周外白（X/Y 取齐 = PAGE_PAD_X，防分页几何不对称）
+                cols,          // 列数 = 恒 2（Facing 双页）
+                PAGED_GAP_X,   // 水平页间距：同行左页↔右页之间（1px）
+                PAGED_GAP_Y,   // 垂直行间距：上页↔下页之间（6px）
+                PAGE_PAD_X,    // 四周外白（X/Y 取齐 = PAGE_PAD_X，防分页几何不对称）
             ));
         } else {
             // 连续/网格/空文档：清掉残留分页快照（模式切换后渲染走连续/网格分支，不读它）。
             *self.paged_layout_cell.borrow_mut() = None;
         }
-        // **R5 分页停稳吸附**（每帧，建快照后 / worker 守卫前）：分页页拍且**停稳**
-        // （非快速态 ∧ |Δy| 小）→ 吸附到最近行顶（≤ [`PAGED_SNAP_MAX_DIST_PX`] 才吸）。
-        // 放 worker 守卫前：测试夹具（worker=None）与生产同一路径；吸附回写
-        // `last_scroll_y`，本帧后半（keep_window/调度）与下一帧速度估计都用吸附位。
-        self.paged_maybe_snap();
         if self.dims.is_empty() || self.worker.is_none() {
             return;
         }
@@ -1692,13 +1713,19 @@ impl PdfViewer {
         self.last_scroll_y = scroll_y;
 
         let viewport_h = f32::from(self.scroll.bounds().size.height);
-        let (start, end) = keep_window(
-            &self.dims,
-            &self.page_tops,
-            page_width,
-            scroll_y,
-            viewport_h,
-        );
+        // A 线：分页页拍（Facing）调度窗改走**分页几何**（`paged_schedule_window`：
+        // 可见行页区间 ±PAGED_WINDOW_ROWS 行）——连续 `keep_window` 按连续页高 ±MARGIN 选页，
+        // 竖排页 + 宽视口下分页行高 ≈ 视口 < 连续页高，可见页会漂出 ±3 连续窗 → 显示页
+        // L0/L0.5/走廊/封面全部不被请求、长驻「加载中」（主因 1/2）。非分页/无快照回落连续。
+        let (start, end) = self.paged_schedule_window(scroll_y, viewport_h).unwrap_or_else(|| {
+            keep_window(
+                &self.dims,
+                &self.page_tops,
+                page_width,
+                scroll_y,
+                viewport_h,
+            )
+        });
 
         // 2.4) **动态瓦片预算 + 钉住集 + R4 均匀降级状态机**（每帧，含静态帧门控早退帧——
         // 门控帧也须推进降级计数/保持钉住状态一致，跳过会让「静态 N 帧」解码停在 0）。
@@ -1746,25 +1773,24 @@ impl PdfViewer {
             // [vis±2] 补 0.5 密度封面——idle 四队列全空（上方已核），把低成本整页底图在
             // 空闲期消化掉；高速平移（VeryFast）切入时新页大概率已有可显示底图。派发在途后
             // 自启一帧收图泵（idle 分支本会早退，不泵则下一帧不会来、走廊结果无人收集）。
-            let vis_first = first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y);
+            // A 线：走廊中心分页下改走分页可见中心（paged_vis_center），否则竖排页深页走
+            // 廊中心错、给「错的页」派邻居封面白耗栅格预算（主因 1 的走廊侧）。
+            let vis_first = self
+                .paged_vis_center(scroll_y, viewport_h)
+                .unwrap_or_else(|| first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y));
             self.maybe_prefetch_corridor(vis_first, page_width, scale_factor);
             self.ensure_tile_pump(cx);
             // 不更新 `window_sig`/`window_settled`：保持同一静置签名与确认状态。
             // --- 真机取证探针（纯只读，不改调度语义，见 view.rs `diag_enabled`）---
             // 用户真机症状：缩放后在固定比例有时整页雾糊（低密度底图在服务），静止不
             // 清晰、只能靠再次缩放恢复；headless 单 worker 时序与真机有别无法复现。
-            // 本探针在「糊住不动」的静态帧门控早退前（keep_window 可见窗，含 MARGIN
-            // 缓冲）逐可见页打印 LOD 账：各档底图（cover/prev/pref/mid/thumb/tiles）
-            // 在位情况 + 是否有当前档 cover 在途 + 期望 cover 档，供锁定是哪一档低密
-            // 底图在服务、为何无当前档 cover 补渲。VUICK_DIAG 未设时零开销。
+            // 本探针在「糊住不动」的静态帧门控早退前（可见调度窗：连续 = keep_window ±MARGIN、
+            // 分页 = paged_schedule_window 窗）逐可见页打印 LOD 账：各档底图
+            // （cover/prev/pref/mid/thumb/tiles）在位情况 + 是否有当前档 cover 在途 + 期望
+            // cover 档，供锁定是哪一档低密底图在服务、为何无当前档 cover 补渲。VUICK_DIAG
+            // 未设时零开销。（A 线：复用已算 `start/end`，不再重复 keep_window 重算。）
             if diag_enabled() {
-                let (dstart, dend) = keep_window(
-                    &self.dims,
-                    &self.page_tops,
-                    page_width,
-                    scroll_y,
-                    viewport_h,
-                );
+                let (dstart, dend) = (start, end);
                 if !self.dims.is_empty() && dstart <= dend {
                     for p in dstart..=dend {
                         if let Some(slot) = self.slots.get(p) {
@@ -1790,7 +1816,11 @@ impl PdfViewer {
                             };
                             let cpend = self.pending_cover.contains_key(&p) as u8;
                             let tpend = self.pending_tiles.keys().any(|(pg, _, _)| *pg == p) as u8;
-                            let want = cover_scale(self.dims[p], page_width, scale_factor);
+                            let want = cover_scale(
+                                self.dims[p],
+                                self.page_card_display_w(p),
+                                scale_factor,
+                            );
                             let line = format!(
                                 "[DIAG-IDLE] p{p} cover={cover} prev={prev} pref={pref} mid={} thumb={} tiles={tiles} cpend={cpend} tpend={tpend} want={want:.2}",
                                 slot.mid.is_some() as u8,
@@ -1989,7 +2019,10 @@ impl PdfViewer {
         }
         // F4/B：非 idle 帧（窗口有移动/调度运行）按当前可见中心收回走廊窗外的旧廊封面
         // （距离 LRU + 字节预算）。idle 静置期的挂在 idle 分支的 `maybe_prefetch_corridor` 内。
-        let vis_first = first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y);
+        // A 线：中心页分页下走分页可见中心（与 idle 分支同口径），防深页「给错的页」派廊封面。
+        let vis_first = self
+            .paged_vis_center(scroll_y, viewport_h)
+            .unwrap_or_else(|| first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y));
         self.evict_prefetch_covers(vis_first);
         self.evict_tiles(start, end, scale_factor);
         // S5 高倍 cover 回收（高倍稳态 1:1 瓦片接管后，cap 截断的 4.0 密度 cover 只是

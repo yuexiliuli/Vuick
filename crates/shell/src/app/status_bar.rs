@@ -296,20 +296,11 @@ impl EditorApp {
         // PDF 页面视图控制组：紧跟「预览」、置于「只读」左侧（用户验收项：不放最右边）；
         // 仅激活选项卡为 PDF 阅读器时显示（PDF 恒只读全屏预览、无「全屏/还原」冲突）。
         if pdf_active {
-            // 页排三钮：单页 / 双页（互斥选中，选中=高亮 pill）/ 网格（独立于 page_mode、
-            // 保留既有 `toggle_grid` 语义）；连续阅读 = 三钮均不选中。
+            // 页排钮：双页（选中=高亮 pill）/ 网格（独立于 page_mode、保留既有
+            // `toggle_grid` 语义）；连续阅读 = 双页钮不选中。
             // 显示比例滑条仅阅读模式（非网格）挂载——网格有独立 grid_zoom，滑条只控
             // 单列阅读缩放（与 Ctrl+滚轮共享同一 zoom 源 → 滑块与中间区 zoom% 双向同步）。
             right = right
-                .child(self.status_pdf_mode_btn(
-                    "status-pdf-single-btn",
-                    "单页",
-                    pdf_page_mode == PageMode::Single,
-                    pdf_grid_on,
-                    pdf_page_mode,
-                    PageMode::Single,
-                    cx,
-                ))
                 .child(self.status_pdf_mode_btn(
                     "status-pdf-facing-btn",
                     "双页",
@@ -513,7 +504,7 @@ impl EditorApp {
         })
     }
 
-    /// 状态栏右侧「单页/双页」页排模式切换按钮（仅激活选项卡为 PDF 阅读器时挂载，
+    /// 状态栏右侧「双页」页排模式切换按钮（仅激活选项卡为 PDF 阅读器时挂载，
     /// 置于「网格」钮左侧）：两态视觉复刻 `status_pdf_grid_btn`——未选中 = 纯文字可点
     /// （`chip_text`、无底色），选中 = 高亮 pill（`selected_bg` 选中底色）。选中态 =
     /// 当前阅读页排模式 `page_mode` 与目标一致（页排与网格总览正交：网格进出保留
@@ -559,7 +550,7 @@ impl EditorApp {
             .into_any_element()
     }
 
-    /// 「单页/双页」按钮点击闭包：从激活选项卡取 PdfViewer 实体，落页排模式或弹起回连续。
+    /// 「双页」按钮点击闭包：从激活选项卡取 PdfViewer 实体，落页排模式或弹起回连续。
     /// （闭包内 short borrow 即释放；选项卡已被关闭 → 取不到 → 直接返回。）
     fn status_pdf_mode_toggle(
         &self,

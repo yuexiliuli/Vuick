@@ -385,8 +385,9 @@ impl PdfViewer {
     /// 卡片自身保持 `absolute` 定位（页列虚拟化的根基，⚠️ 不可改 `.relative()`）。
     ///
     /// `paged` 为分页页排快照时（非空）：卡片定位/尺寸改由 `cell_rect(page) × zoom`
-    /// 提供（单页=每行 1 页、双页=每行并排 2 页，行内 contain-fit），位图密度/瓦片
-    /// 调度仍按既有 `page_width`（连续口径）——本切片先粗后精，S5b 再按行宽精修密度。
+    /// 提供（双页=每行并排 2 页，行内 contain-fit）；位图密度/瓦片调度的**真源 =
+    /// `page_card_display_size` 的卡宽/卡高**（B 线密度已落地：分页 = cell 宽 × zoom 渲染，
+    /// 消除按连续 `page_width` 过采样 ~2.3× 线性 / ~5× 像素面积；见本函数下方密度块）。
     #[allow(clippy::too_many_arguments)] // 页卡片上下文互为正交
     fn build_visible_page_cards(
         &self,
@@ -445,14 +446,15 @@ impl PdfViewer {
             };
             let top = crate::pdf::layout::snap_to_device(card_top_base + scroll_y, scale_factor)
                 - scroll_y;
-            // 显示密度参考高（连续口径）：瓦片/封面按 page_width 密度渲染（本切片分页
-            // 复用既有密度，S5b 再按行宽精修）；声明保持供下面 group_complete 的
-            // 可见瓦片区（调度侧同口径）使用。
-            let disp_h = display_height(dim, page_width);
+            // 显示密度参考高 = 页卡显示高（分页 = paged_display_rect.h、连续 = display_height），
+            // 与调度侧 `visible_tile_range_axis` 对账同口径；**B 线密度真源**：瓦片/封面密度
+            // 改按卡宽（分页 = cell 宽 × zoom）渲染，消除分页按连续 page_width 过采样
+            // ~2.3×（线性）/ ~5×（像素面积，本窗口）。
+            let disp_h = card_h;
             // 瓦片按显示密度 1:1 渲染；这里算出位图→CSS 的分轴缩放，放置瓦片与
             // 文本高亮（`pt_to_local` 同源）逐像素对齐。分页卡按自身宽高（`card_w/h`）
             // 缩放——连续时 card_w==page_width、card_h==disp_h，行为不变。
-            let scale = render_scale(page_width, scale_factor, dim.0);
+            let scale = render_scale(card_w, scale_factor, dim.0);
             let bmp = page_bitmap_size(dim, scale);
             let (sx, sy) = bitmap_display_scales(bmp, card_w, card_h);
 
@@ -463,7 +465,7 @@ impl PdfViewer {
             let slot_mid = slot.mid.clone();
             // 首屏整页锐化封面（满显示密度；缩放过期时 schedule_tiles 已移入 prev_cover）。
             let slot_cover =
-                if (slot.cover_scale - cover_scale(dim, page_width, scale_factor)).abs() <= 1e-4 {
+                if (slot.cover_scale - cover_scale(dim, card_w, scale_factor)).abs() <= 1e-4 {
                     slot.cover.clone()
                 } else {
                     None
@@ -489,7 +491,7 @@ impl PdfViewer {
             // 的「仅当前密度 cover 才弃」对称，共同让原地连续多档缩放的可见页能吃到 preview。
             let slot_prefetch = slot.prefetch_cover.clone().filter(|_| {
                 slot.cover.is_none()
-                    || (slot.cover_scale - cover_scale(dim, page_width, scale_factor)).abs() > 1e-4
+                    || (slot.cover_scale - cover_scale(dim, card_w, scale_factor)).abs() > 1e-4
             });
             // 底图选择提前（本帧「同帧不混叠」门控的输入之一）：当前密度封面 → 旧密度封面
             // 拉伸兜底（prev_cover 平移过渡桥 / P1 ③ 低档在位封面）→ 空闲预取走廊封面 → 中清
@@ -526,7 +528,7 @@ impl PdfViewer {
                     .and_then(|rect| {
                         crate::pdf::layout::visible_tile_range_axis(
                             bmp,
-                            page_width,
+                            card_w,
                             disp_h,
                             rect,
                             TILE_SIZE,
@@ -1043,14 +1045,16 @@ impl PdfViewer {
 
     /// 已加载正文的**分页页排**（`!grid_mode && page_mode != Continuous`）：与
     /// [`Self::render_pdf_pages`] 同构的滚动容器，但卡片按 [`PagedLayout::cell_rect`]×zoom
-    /// 绝对定位——单页 = 每行 1 页（页高 ≤ 视口）、双页 = 每行并排 2 页，行按页高堆叠。
+    /// 绝对定位——双页 = 每行并排 2 页（页高 ≤ 视口），行按页高堆叠。
     /// 布局由 `ensure_window` 每帧以 zoom=1（fit）口径算入 [`Self::paged_layout_cell`]，
     /// 本函数读上一帧布局并统一乘 `zoom` 显示；可见页区间经
-    /// [`PagedLayout::first_visible_row`]（负偏移，换算回布局坐标 ÷zoom）→
-    /// `row_page_start[r0]..row_page_start[r1+1]` 连续页下标区间。连续阅读专属的
-    /// `page_tops`/`total_height` 在分页模式下**不再用于定位**（存续，仅调度侧 keep_window
-    /// 兜底派图）。`pdf-pages` 容器宽 = `spread_max × zoom`——行内居中由 `cell_rect` 的
-    /// `left_pad` 内建（不再 `justify_center`，防双重居中）；spread > 视口时横向溢出自然出现。
+    /// [`crate::pdf::layout::paged_render_window`]（负偏移，换算回布局坐标 ÷zoom）→
+    /// 视口相交的**全可见行**（行中自由滚动可同时看到上下两行）± 1 行缓冲的连续页下标区间。
+    /// **Facing = 连续自由滚动 + 2-up**：滚动语义与连续一致（不再逐行步进/吸附、不再
+    /// 「绝不露下一行」）。连续阅读专属的 `page_tops`/`total_height` 在分页模式下**不再用于
+    /// 定位**（存续，仅调度侧 keep_window 兜底派图）。`pdf-pages` 容器宽 = `spread_max × zoom`
+    /// ——行内居中由 `cell_rect` 的 `left_pad` 内建（不再 `justify_center`，防双重居中）；
+    /// spread > 视口时横向溢出自然出现。
     fn render_pdf_pages_paged(
         &mut self,
         window: &mut Window,
@@ -1076,15 +1080,18 @@ impl PdfViewer {
 
         let mut cards: Vec<gpui::AnyElement> = Vec::new();
         if layout.rows > 0 {
-            // 只渲染「视口顶所在行」r0（R3）：单页 = 1 页、双页 = 一行 2 页，绝不露下一行/下
-            // 一页。zoom<1 时 vh_fit 变大虽会命中多行，仍只取首行 r0 → 杜绝单页模式在视口底部
-            // 露出下一页（bug 1）。容器高仍按全行总高（滚动量程/吸附不变），仅本帧物化 r0。
-            if let Some((r0, _r1)) = layout.first_visible_row(scroll_y_fit, vh_fit) {
-                let start = layout.row_page_start[r0];
-                let end = layout
-                    .row_page_start[r0 + 1]
-                    .saturating_sub(1)
-                    .min(self.dims.len().saturating_sub(1));
+            // 连续自由滚动语义：视口相交的**全可见行**（行中位压到的下一行也算）± 1 行缓冲
+            // 全部物化。行中停位可同时看到上下两行——旧的「只渲首行 r0、绝不露下一行」观感
+            // 被本条取代（bug 1 由全可见行窗消除）。机械 / 底图缓冲由 A 线 ±PAGED_WINDOW_ROWS
+            // 行调度兜底，此处 RENDER_BUF_ROWS=1 仅保「显示行都有卡」。
+            const RENDER_BUF_ROWS: usize = 1;
+            if let Some((start, end)) = crate::pdf::layout::paged_render_window(
+                &layout,
+                scroll_y_fit,
+                vh_fit,
+                self.dims.len(),
+                RENDER_BUF_ROWS,
+            ) {
                 if start <= end {
                     // 预取可见页文本层/图片盒（与连续阅读同节奏懒加载）。
                     if !self.prev_fast {
@@ -1129,7 +1136,7 @@ impl PdfViewer {
             .h(px(total))
             .children(cards);
 
-        // 与连续阅读同构的滚动容器（分页复用阅读 scroll；本切片滚轮/吸附为下一片）。
+        // 与连续阅读同构的滚动容器（分页复用阅读 scroll；滚动语义同连续自由滚动）。
         div()
             .id("pdf-scroll")
             .debug_selector(|| "pdf-scroll".into())

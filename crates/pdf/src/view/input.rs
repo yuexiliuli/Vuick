@@ -80,13 +80,9 @@ impl PdfViewer {
                     os_ctrl,
                 );
             }
-            // 分页页拍（Single/Facing）：普通滚轮接管为**步进翻页**（R4）——不再自由滚动，
-            // 目标行 = 当前吸附行 ±1 的行顶（`row_top × zoom`），`stop_propagation` 阻止容器
-            // 自由滚动（连续模式仍不拦截，交给滚动容器）。
-            if self.paged_mode_active() {
-                self.paged_step_wheel(delta_y, cx);
-                cx.stop_propagation();
-            }
+            // 分页页拍（Facing）= **连续自由滚动 + 2-up**：非 Ctrl 滚轮不拦截
+            // （不调 `stop_propagation`）→ 交给滚动容器自由滚动，可停在行中间看到上下两行
+            // （与连续模式同一语义）。布局由 cell_rect 定位，滚动语义与连续一致。
             return;
         }
         if timing_view() {
@@ -149,42 +145,6 @@ impl PdfViewer {
                 self.page_width(),
             );
         }
-    }
-
-    /// 分页页拍（Single/Facing）**步进翻页**（R4，`on_scroll_wheel` 的普通滚轮分页分支）：
-    /// `delta_y<0`（向下滚）→ 目标 `row_top[r+1]×zoom`，`delta_y>0`（向上滚）→
-    /// `row_top[r−1]×zoom`，其中 `r` = 当前吸附行（[`super::PdfViewer::paged_snap_target`]
-    /// 同源的 `snap_target` 行界，R5 会话吸附同一行界源）；首页之上向上滚 → 0（顶）。
-    /// 直接 `scroll.set_offset`，由调用方 `stop_propagation`（防容器自由滚动）。
-    fn paged_step_wheel(&mut self, delta_y: f32, cx: &mut Context<Self>) {
-        let Some(layout) = self.paged_layout_cell.borrow().clone() else {
-            return;
-        };
-        if layout.rows == 0 {
-            return;
-        }
-        let zoom = self.zoom.max(0.01);
-        let content_top = f32::from(-self.scroll.offset().y).max(0.0);
-        // 布局（zoom=1）负偏移口径：内容显示 = 布局 × zoom → 布局滚动偏移 = 显示偏移 / zoom。
-        let scroll_y_fit = -(content_top / zoom);
-        let (r, _) = layout.snap_target(scroll_y_fit);
-        let r_next = if delta_y < 0.0 {
-            (r + 1).min(layout.rows - 1)
-        } else {
-            r.saturating_sub(1)
-        };
-        // 首页之上（r==0 且向上滚）→ 顶（0）；否则目标行顶 × zoom。未行顶 + 视口可能超出
-        // 文档底 → 按分页纵向量程夹（末行滚到「末行底对齐视口底」，gpui 布局同口径）。
-        let target = if r == 0 && delta_y > 0.0 {
-            0.0
-        } else {
-            (layout.row_top[r_next] * zoom).clamp(0.0, self.paged_max_scroll())
-        };
-        self.scroll
-            .set_offset(gpui::point(self.scroll.offset().x, px(-target)));
-        // 回写 last_scroll_y：保下一帧 ensure_window 的速度估计不把步进当成滚动（→ 无假速度）。
-        self.last_scroll_y = target;
-        cx.notify();
     }
 
     /// 应用缩放因子并维护其后的一致性：锚定滚动偏移、重算页列布局。经

@@ -774,13 +774,13 @@
         })
     }
 
-    /// 状态栏 PDF 页排模式钮（单页/双页/网格三钮互斥选中）：pdf 打开 → 三钮都渲染、
-    /// 初始连续（三钮均不选中）；点单页 → page_mode==Single；再点单页 → 弹起回
-    /// Continuous；点双页 → Facing；点网格 → grid_mode==true 且 page_mode 保留（网格
-    /// 与页排正交）；退网格 → 回阅读、page_mode 原样。选中高亮 = `selected_bg` 主题色
-    /// 差（headless 不可断底色，同网格钮先例留真机确认），headless 断言状态翻转即可。
+    /// 状态栏 PDF 页排模式钮（双页/网格两钮互斥选中）：pdf 打开 → 两钮都渲染、初始连续
+    /// （双页钮不选中）；点双页 → Facing；再点双页 → 弹起回 Continuous；点网格 →
+    /// grid_mode==true 且 page_mode 保留（网格与页排正交）；退网格 → 回阅读、page_mode
+    /// 原样。选中高亮 = `selected_bg` 主题色差（headless 不可断底色，同网格钮先例留真机
+    /// 确认），headless 断言状态翻转即可。
     #[gpui::test]
-    async fn status_bar_pdf_single_facing_buttons_toggle_page_mode(cx: &mut TestAppContext) {
+    async fn status_bar_pdf_facing_buttons_toggle_page_mode(cx: &mut TestAppContext) {
         if pdf::test_util::missing_pdf_fixture() {
             eprintln!("SKIP: missing target/pdf测试.pdf（夹具不入库，本机无真 PDF）");
             return;
@@ -794,19 +794,14 @@
         }
         // 非 PDF 幕：页排钮不渲染。
         assert!(
-            cx.debug_bounds("status-pdf-single-btn").is_none()
-                && cx.debug_bounds("status-pdf-facing-btn").is_none(),
+            cx.debug_bounds("status-pdf-facing-btn").is_none(),
             "非 PDF 选项卡不应显示页排按钮"
         );
-        // 打开 PDF → 三钮渲染、初始连续。
+        // 打开 PDF → 钮渲染、初始连续。
         let pv = open_pdf_loaded(&app, &mut cx);
         for _ in 0..4 {
             cx.run_until_parked();
         }
-        assert!(
-            cx.debug_bounds("status-pdf-single-btn").is_some(),
-            "PDF 选项卡应显示单页钮"
-        );
         assert!(
             cx.debug_bounds("status-pdf-facing-btn").is_some(),
             "PDF 选项卡应显示双页钮"
@@ -818,31 +813,35 @@
         assert_eq!(
             cx.update(|_w, cx| pv.read(cx).page_mode()),
             pdf::view::PageMode::Continuous,
-            "新开 PDF 默认连续阅读（三钮均不选中）"
+            "新开 PDF 默认连续阅读（双页钮不选中）"
         );
-        // 点单页 → Single。
-        let single = cx.debug_bounds("status-pdf-single-btn").expect("单页钮应在场");
-        cx.simulate_click(single.center(), Default::default());
+        // 点双页 → Facing。
+        let facing = cx
+            .debug_bounds("status-pdf-facing-btn")
+            .expect("双页钮应在场");
+        cx.simulate_click(facing.center(), Default::default());
         for _ in 0..6 {
             cx.run_until_parked();
         }
         assert_eq!(
             cx.update(|_w, cx| pv.read(cx).page_mode()),
-            pdf::view::PageMode::Single,
-            "点单页后应为单页"
+            pdf::view::PageMode::Facing,
+            "点双页后应为双页对开"
         );
-        // 再点单页 → 弹起回 Continuous。
-        let single = cx.debug_bounds("status-pdf-single-btn").expect("单页钮应仍在场");
-        cx.simulate_click(single.center(), Default::default());
+        // 再点双页 → 弹起回 Continuous。
+        let facing = cx
+            .debug_bounds("status-pdf-facing-btn")
+            .expect("双页钮应仍在场");
+        cx.simulate_click(facing.center(), Default::default());
         for _ in 0..6 {
             cx.run_until_parked();
         }
         assert_eq!(
             cx.update(|_w, cx| pv.read(cx).page_mode()),
             pdf::view::PageMode::Continuous,
-            "再点单页应弹起回连续"
+            "再点双页应弹起回连续"
         );
-        // 点双页 → Facing。
+        // 点双页 → Facing（为网格正交准备）。
         let facing = cx
             .debug_bounds("status-pdf-facing-btn")
             .expect("双页钮应在场");

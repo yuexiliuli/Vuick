@@ -167,15 +167,16 @@ pub fn zoom_rescroll_anchor_paged(
 }
 
 /// 把 zoom=1 fit 口径的 [`PagedLayout`] 均匀缩放到**显示口径**（所有坐标/尺寸 × `zoom`）：
-/// `row_top`/`cell_w_per_row`/`cell_h`/`left_pad_per_row`/`spread_max`/`total_height`/`gap`/
-/// `padding` 全部乘 `zoom`，`row_page_start`/`cols`/`rows` 不变。产出与渲染口径一致
+/// `row_top`/`cell_w_per_row`/`cell_h`/`left_pad_per_row`/`spread_max`/`total_height`/`h_gap`/
+/// `v_gap`/`padding` 全部乘 `zoom`，`row_page_start`/`cols`/`rows` 不变。产出与渲染口径一致
 /// （`render_pdf_pages_paged` 读 zoom=1 布局的 `cell_rect` 各分量 × zoom），供
 /// [`zoom_rescroll_anchor_paged`] 构造 `pl_old`/`pl_new`（分别乘旧/新 zoom）。
 pub fn paged_layout_scaled(l: &PagedLayout, zoom: f32) -> PagedLayout {
     PagedLayout {
         cols: l.cols,
         rows: l.rows,
-        gap: l.gap * zoom,
+        h_gap: l.h_gap * zoom,
+        v_gap: l.v_gap * zoom,
         padding: l.padding * zoom,
         row_top: l.row_top.iter().map(|&v| v * zoom).collect(),
         row_page_start: l.row_page_start.clone(),
@@ -918,7 +919,8 @@ pub struct Rect {
 /// 单页/双页阅读分页布局（`cols ∈ {1,2}`；每行 contain-fit，页高 ≤ 视口高）。
 ///
 /// 行内页宽 = min(列宽上限 `cap_w`，使「行内最竖页」恰一屏高的宽 `viewport_h·min_ar`)——
-/// 页高永不超视口高；行按页高堆叠，行间 `gap`、上下/左右 `padding`。`row_top` /
+/// 页高永不超视口高；行按页高堆叠，行间 `v_gap`、同行左右页由 `h_gap` 分隔、上下/左右
+/// `padding`。`row_top` /
 /// `row_page_start` / `cell_w_per_row` / `cell_h` / `left_pad_per_row` 为一次性直读缓存，
 /// `cell_rect` / 可见行 / 命中 / 吸附全由本结构推导（与 [`GridLayout`] 同一"结构即几何"姿态）。
 ///
@@ -927,12 +929,14 @@ pub struct Rect {
 /// 用的「正偏移」是同一视口的参数差一正负号（详见 [`PagedLayout::first_visible_row`]）。
 #[derive(Clone, Debug)]
 pub struct PagedLayout {
-    /// 列数（1=单页模式，2=双页模式；构造时 0→1、>2→2 归一）。
+    /// 列数（1=单列（内部/测试用），2=双页（Facing）；构造时 0→1、>2→2 归一）。
     pub cols: usize,
     /// 行数（`ceil(pages.len()/cols)`；0 页时 = 0）。
     pub rows: usize,
-    /// 行间/列间 gap。
-    pub gap: f32,
+    /// 水平页间距（同行左页↔右页之间，×zoom）。
+    pub h_gap: f32,
+    /// 垂直行间距（上页↔下页之间，×zoom）。
+    pub v_gap: f32,
     /// 上下/左右外白。
     pub padding: f32,
     /// 每行顶 y（含外 `padding`；`len = rows`，严格递增）。行高 = 该行内最大 `cell_h`。
@@ -961,7 +965,7 @@ impl PagedLayout {
     }
 
     /// 第 `page` 页的放置矩形 `(x, y, w, h)`（内容坐标系，见 [`PagedLayout`]）；越界/空布局 → `None`。
-    /// `x = padding + left_pad_per_row[r] + c·(cell_w_per_row[r] + gap)`，`y = row_top[r]`，
+    /// `x = padding + left_pad_per_row[r] + c·(cell_w_per_row[r] + h_gap)`，`y = row_top[r]`，
     /// `w = cell_w_per_row[r]`（行内统一页宽）、`h = cell_h[page]`（每页自身纵横比）。
     pub fn cell_rect(&self, page: usize) -> Option<Rect> {
         if self.rows == 0 || self.cols == 0 || page >= self.cell_h.len() {
@@ -970,8 +974,8 @@ impl PagedLayout {
         let r = page / self.cols;
         let c = page % self.cols;
         let w = self.cell_w_per_row[r];
-        // 演算（K177）：列原点 = padding + left_pad[r]；列 c 再平移 c·pitch（pitch = 页宽 + gap）。
-        let x = self.padding + self.left_pad_per_row[r] + c as f32 * (w + self.gap);
+        // 演算（K177）：列原点 = padding + left_pad[r]；列 c 再平移 c·pitch（pitch = 页宽 + h_gap）。
+        let x = self.padding + self.left_pad_per_row[r] + c as f32 * (w + self.h_gap);
         Some(Rect {
             x,
             y: self.row_top[r],
@@ -1050,12 +1054,13 @@ impl PagedLayout {
     /// 命中定位：内容坐标 (x, y) → `(页号, 页内局部 x, 页内局部 y)`；间隙/留白/越界/空布局 → `None`。
     ///
     /// 行由 [`row_index_at_y`] 定位；列用 **floor** 求候选槽
-    /// `c = floor((x − (padding + left_pad_r)) / (cell_w_per_row[r] + gap))` 并在 `[0, cols)`
+    /// `c = floor((x − (padding + left_pad_r)) / (cell_w_per_row[r] + h_gap))` 并在 `[0, cols)`
     /// 且落在本行页区间（`i = r·cols + c < n`）内，随后用 [`cell_rect`] 做**包含性复核**
     /// （点须落 `[0, w)×[0, h)` 内）——间隙/留白/越界点都过不了复核 → `None`。
     ///
     /// 注：**不用 round** —— round 的槽中点 `(c+0.5)·pitch` 会从卡片内部切过
-    /// （如 w=474/g=12 ⇒ 槽界 = x0+243，而真卡右缘 = x0+474），把卡右半的真命中误判到
+    /// （如 w=479.5/h_gap=1（cap_w=(960−1)/2=479.5）⇒ pitch=480.5、round 槽界 = x0+240.25
+    /// （=0.5×pitch），而真卡右缘 = x0+479.5），把卡右半的真命中误判到
     /// 邻列 / 间隙；floor 给出「含卡右缘前」的真列，再经包含性复核即得正确命中。
     /// （对比 [`GridLayout::col_slot_at_x`] 的 round 是"最近插槽"语义，用途不同。）
     pub fn page_at(&self, x: f32, y: f32) -> Option<(usize, f32, f32)> {
@@ -1063,7 +1068,7 @@ impl PagedLayout {
             return None;
         }
         let r = self.row_index_at_y(y)?;
-        let pitch = self.cell_w_per_row[r] + self.gap;
+        let pitch = self.cell_w_per_row[r] + self.h_gap;
         if pitch <= 0.0 {
             return None; // 退化视口（页宽 0）无法按列定位
         }
@@ -1085,6 +1090,9 @@ impl PagedLayout {
     ///
     /// 语义：视口顶内容 y = `−scroll_y`；`r = argmin_r |(−scroll_y) − row_top[r]|`；
     /// 首行之上（或空布局）→ 回落 `(0, 0.0)`；平局取行号小者（确定性）。
+    ///
+    /// 已休眠（K24）：生产 0 消费——Facing 已改连续自由滚动（不吸附行顶），view 层
+    /// `paged_snap_target`/步进在 2026-11-20 连滚战役已删；仅本模块单测保留（行为锚）。
     pub fn snap_target(&self, scroll_y: f32) -> (usize, f32) {
         if self.rows == 0 {
             return (0, 0.0);
@@ -1104,28 +1112,29 @@ impl PagedLayout {
 }
 
 /// 计算阅读分页布局（纯函数，与 [`grid_layout`] 同姿势）：`pages` 为每页 `(宽, 高)` pt
-/// （只用纵横比），`viewport_w/h` 视口、`cols ∈ {1,2}`（0→1、>2→2）、`gap` 行/列间距、
-/// `padding` 四周外白。
+/// （只用纵横比），`viewport_w/h` 视口、`cols ∈ {1,2}`（0→1、>2→2）、`h_gap` 水平页间距
+/// （双页同行左页↔右页之间）、`v_gap` 垂直行间距（上页↔下页之间）、`padding` 四周外白。
 ///
 /// 数学（每行 r，页区间 s..=e；K177 演算）：
-/// 1. 列宽上限 `cap_w = max(0, (max(0, viewport_w − 2·padding) − (cols==2 ? gap : 0)) / cols)`
-///    （防负宽：内容区先夹 ≥0，减列间 gap 后再夹 ≥0）；
+/// 1. 列宽上限 `cap_w = max(0, (max(0, viewport_w − 2·padding) − (cols==2 ? h_gap : 0)) / cols)`
+///    （防负宽：内容区先夹 ≥0，减列间 h_gap 后再夹 ≥0）；
 /// 2. 行内最竖页 `min_ar = min_{i∈s..e}(w_i/h_i)`（跳过 w≤0 ∨ h≤0 退化页，全退化 → 1）；
 ///    `fit_w = viewport_h · min_ar`（恰一屏高）；页宽 `cell_w_r = min(cap_w, fit_w).max(0)`；
 /// 3. 每页高 `cell_h[i] = cell_w_r·(h_i/w_i)`（w≤0 → cell_w_r，与 [`display_height`] 同源兜底）；
-/// 4. 行宽统一按 cols 满行 `spread_r = cols·cell_w_r + (cols−1)·gap`（partial 行页靠列左、
+/// 4. 行宽统一按 cols 满行 `spread_r = cols·cell_w_r + (cols−1)·h_gap`（partial 行页靠列左、
 ///    宽度与满行一致，不重算居中基线），`left_pad_r = max(0, (content_w − spread_r)/2)`；
 ///    `spread_max = max_r(spread_r)`；
-/// 5. `row_top[0] = padding`；`row_top[r+1] = row_top[r] + row_h[r] + gap`，
+/// 5. `row_top[0] = padding`；`row_top[r+1] = row_top[r] + row_h[r] + v_gap`，
 ///    `row_h[r] = max_{i∈s..e} cell_h[i]`；
 /// 6. `total_height = (rows==0) ? 0 : row_top[rows-1] + row_h[rows-1] + padding`
-///    （= padding + Σ(行高+gap) + padding，删循环尾部多计的 gap）。
+///    （= padding + Σ(行高+v_gap) + padding，删循环尾部多计的 v_gap）。
 pub fn paged_layout(
     pages: &[(f32, f32)],
     viewport_w: f32,
     viewport_h: f32,
     cols: usize,
-    gap: f32,
+    h_gap: f32,
+    v_gap: f32,
     padding: f32,
 ) -> PagedLayout {
     let cols = match cols {
@@ -1139,7 +1148,8 @@ pub fn paged_layout(
         return PagedLayout {
             cols,
             rows: 0,
-            gap,
+            h_gap,
+            v_gap,
             padding,
             row_top: Vec::new(),
             row_page_start: vec![0],
@@ -1151,7 +1161,7 @@ pub fn paged_layout(
         };
     }
     let content_w = (viewport_w - 2.0 * padding).max(0.0);
-    let cap_w = ((content_w - if cols == 2 { gap } else { 0.0 }) / cols as f32).max(0.0);
+    let cap_w = ((content_w - if cols == 2 { h_gap } else { 0.0 }) / cols as f32).max(0.0);
     let vh = viewport_h.max(0.0);
 
     let row_page_start: Vec<usize> = (0..=rows).map(|r| (r * cols).min(n)).collect();
@@ -1181,20 +1191,21 @@ pub fn paged_layout(
             };
         }
         let row_h = cell_h[s..e].iter().copied().fold(0.0f32, f32::max);
-        let spread_r = cols as f32 * cell_w_r + (cols - 1) as f32 * gap;
+        let spread_r = cols as f32 * cell_w_r + (cols - 1) as f32 * h_gap;
         spread_max = spread_max.max(spread_r);
         row_top.push(y);
         cell_w_per_row.push(cell_w_r);
         left_pad_per_row.push(((content_w - spread_r) / 2.0).max(0.0));
-        y += row_h + gap;
+        y += row_h + v_gap;
     }
-    // total = padding + Σ行高 + (rows−1)·gap + padding（去循环尾部多计的 gap）。
-    let total_height = y - gap + padding;
+    // total = padding + Σ行高 + (rows−1)·v_gap + padding（去循环尾部多计的 v_gap）。
+    let total_height = y - v_gap + padding;
 
     PagedLayout {
         cols,
         rows,
-        gap,
+        h_gap,
+        v_gap,
         padding,
         row_top,
         row_page_start,
@@ -1204,6 +1215,74 @@ pub fn paged_layout(
         spread_max,
         total_height,
     }
+}
+
+/// 分页**可见行页区间**（未扩）：由 [`PagedLayout::first_visible_row`] 的首行 r0 得
+/// `[row_page_start[r0], row_page_start[r0+1]−1]`——分页模式每行 ≈ 一屏，只物化首行即可
+/// 覆盖当前屏（render_pdf_pages_paged 与 A 线调度共用同一口径）。`scroll_y` 为负偏移
+/// （视口顶内容 y = −scroll_y，见 [`PagedLayout`]）；仍由首行推出闭区间页下标。
+/// 无可见行 / 空布局 → `None`。
+pub fn paged_visible_pages(
+    layout: &PagedLayout,
+    scroll_y: f32,
+    viewport_h: f32,
+    n: usize,
+) -> Option<(usize, usize)> {
+    let (r0, _) = layout.first_visible_row(scroll_y, viewport_h)?;
+    let start = layout.row_page_start[r0];
+    let end = layout.row_page_start[r0 + 1]
+        .saturating_sub(1)
+        .min(n.saturating_sub(1));
+    if start > end || n == 0 {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// 分页**调度窗**（闭区间页下标）：可见行页区间再向两侧扩 `k_rows` 行（× `cols` 页）。
+/// 语义对齐连续 [`keep_window`] 的 ±[`MARGIN`] 页缓冲：分页每行 ≈ 一屏，±`k_rows` 行 =
+/// 保住「显示页必有底图 + 下一行提前暖」；再大由封面驻留窗/走廊预算独立限流。无可见行 /
+/// 空布局 → `None`。
+pub fn paged_schedule_window(
+    layout: &PagedLayout,
+    scroll_y: f32,
+    viewport_h: f32,
+    n: usize,
+    k_rows: usize,
+) -> Option<(usize, usize)> {
+    let (vis_start, vis_end) = paged_visible_pages(layout, scroll_y, viewport_h, n)?;
+    let expand = k_rows.saturating_mul(layout.cols.max(1));
+    let start = vis_start.saturating_sub(expand);
+    let end = (vis_end + expand).min(n.saturating_sub(1));
+    Some((start, end))
+}
+
+/// 分页**渲染窗**（闭区间页下标）：视口相交的**全可见行** `[r0, r1]`（可含行中位自由滚动时
+/// 视口底部压到的下一行 r1）再向两侧各扩 `buf_rows` 行，`clamp [0, rows−1]`，映射回行页区间
+/// `[row_page_start[r_lo], row_page_start[r_hi+1]−1]` clamp `[0, n−1]`。语义对齐连续
+/// `render_pdf_pages` 的 ±[`MARGIN`] 页缓冲：Facing=连续自由滚动，行中停位要同时看到上下
+/// 两行——`paged_visible_pages` 只按首行 r0 会漏掉视口底部的下一行（只物化 r0 = 露底）。
+/// 画面机械化缓冲由 A 线调度窗（±[`PAGED_WINDOW_ROWS`] 行）兜底，本窗只保「本帧显示行
+/// 都有卡」。`scroll_y` 为负偏移（视口顶内容 y = −scroll_y，见 [`PagedLayout`]）；无可见行 /
+/// 空布局 → `None`。
+pub fn paged_render_window(
+    layout: &PagedLayout,
+    scroll_y: f32,
+    viewport_h: f32,
+    n: usize,
+    buf_rows: usize,
+) -> Option<(usize, usize)> {
+    let (r0, r1) = layout.first_visible_row(scroll_y, viewport_h)?;
+    let r_lo = r0.saturating_sub(buf_rows);
+    let r_hi = (r1 + buf_rows).min(layout.rows.saturating_sub(1));
+    let start = layout.row_page_start[r_lo];
+    let end = layout.row_page_start[r_hi + 1]
+        .saturating_sub(1)
+        .min(n.saturating_sub(1));
+    if start > end || n == 0 {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// 内容列坐标 (cx, cy) → (页号, 页内局部 x, 页内局部 y)。
@@ -1472,6 +1551,7 @@ pub fn plan_page_work(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::pdf::{PAGED_GAP_X, PAGED_GAP_Y};
     use crate::pdf::{PageText, PdfTextChar};
 
     /// 测试用：构造一个（非合成）字符盒（PDF 点，左下原点，Y 向上）。
@@ -3246,107 +3326,28 @@ mod tests {
 
     // ---- 分页阅读布局（PagedLayout）测试 ----
 
-    /// 测试用 A4 竖版页（793,1123 pt），视口 1000×700、gap 12、padding 20。
+    /// 测试用 A4 竖版页（793,1123 pt），视口 1000×700、h_gap=PAGED_GAP_X=1、v_gap=PAGED_GAP_Y=6、
+    /// padding 20。
     /// 手算前提（K177）：ar = w/h = 793/1123 ≈ 0.70614、h/w = 1123/793 ≈ 1.41614。
     fn paged_a4_3() -> PagedLayout {
-        paged_layout(&[(793.0, 1123.0); 3], 1000.0, 700.0, 2, 12.0, 20.0)
-    }
-
-    /// 单页模式（cols=1，3 页 A4）：页宽受高限制（fit_w < cap_w）。
-    ///
-    /// 手算：
-    /// - content_w = 1000 − 2×20 = 960、cols=1（不计列 gap）→ cap_w = 960；
-    /// - min_ar = 793/1123 ≈ 0.70614、fit_w = 700×0.70614 ≈ 494.30 → cell_w = min(960, 494.30) = 494.30；
-    /// - cell_h = 494.30×(1123/793) ≈ 700.00（恰一屏高，页高不超视口）；
-    /// - row_top = [20, 20+700+12 = 732, 732+700+12 = 1444]；
-    /// - total = 1444 + 700 + 20 = 2164（= padding 20 + 3×700 + 2×12 + padding 20）；
-    /// - spread = 494.30（单列）、left_pad = (960−494.30)/2 ≈ 232.85；
-    ///   cell_rect(0).x = 20 + 232.85 = 252.85。
-    #[test]
-    fn paged_single_col_a4_hand_computed() {
-        let l = paged_layout(&[(793.0, 1123.0); 3], 1000.0, 700.0, 1, 12.0, 20.0);
-        assert_eq!(l.cols, 1, "单页模式 cols=1");
-        assert_eq!(l.rows, 3);
-        assert_eq!(l.row_page_start, vec![0, 1, 2, 3], "每行一页");
-        assert!(
-            (l.cell_w_per_row[0] - 494.30).abs() < 0.05,
-            "页宽应受高限制 ≈494.30: {}",
-            l.cell_w_per_row[0]
-        );
-        assert!(
-            (l.cell_h[0] - 700.0).abs() < 0.05,
-            "页高应 ≈700（恰一屏）: {}",
-            l.cell_h[0]
-        );
-        for (i, t) in [20.0_f32, 732.0, 1444.0].into_iter().enumerate() {
-            assert!(
-                (l.row_top[i] - t).abs() < 0.05,
-                "行 {i} 顶 ≈{t}: {}",
-                l.row_top[i]
-            );
-        }
-        assert!(
-            (l.total_height - 2164.0).abs() < 0.05,
-            "总高 ≈2164: {}",
-            l.total_height
-        );
-        assert!((l.cell_h[1] - 700.0).abs() < 0.05, "页 1 高 700");
-        assert!(
-            (l.spread_max - 494.30).abs() < 0.05,
-            "spread_max ≈494.30: {}",
-            l.spread_max
-        );
-        let r0 = l.cell_rect(0).expect("页 0 应有矩形");
-        assert!(
-            (r0.x - 252.85).abs() < 0.05,
-            "x = padding+left_pad ≈252.85: {}",
-            r0.x
-        );
-        assert!((r0.y - 20.0).abs() < 1e-3 && (r0.w - 494.30).abs() < 0.05);
-        // 单列命中/吸附（内容坐标，负偏移）：
-        //   scroll_y=0（内容顶）→ Visible 行 0；向下翻 sy=−700 且 vh=20 → 视口 [700, 720]
-        //   恰压行 0 [20, 720)（行 1 顶 732 在 720 之下）→ (0,0)；
-        //   sy=−740 → 视口顶 740 → 最近行 = 行 1（|740−732|=8 < |740−20|=720 < |740−1444|=704）
-        assert_eq!(l.first_visible_row(0.0, 700.0), Some((0, 0)));
-        assert_eq!(
-            l.first_visible_row(-700.0, 20.0),
-            Some((0, 0)),
-            "视口 [700,720] 恰压行 0"
-        );
-        assert_eq!(
-            l.snap_target(-740.0),
-            (1, l.row_top[1]),
-            "sy=−740 应吸附行 1"
-        );
-        assert_eq!(
-            l.snap_target(0.0),
-            (0, l.row_top[0]),
-            "停在内容顶应吸附行 0"
-        );
-        assert_eq!(l.snap_target(50.0), (0, l.row_top[0]), "滚过头顶应回落行 0");
-        // 行 1 顶 732：视口顶 730 → 首行 644? no：行 0 底 720 ≤ 730 → 首行 1（底 1420 > 730）。
-        assert_eq!(
-            l.first_visible_row(-730.0, 700.0),
-            Some((1, 1)),
-            "视口顶 730 应命中行 1"
-        );
-        // 悬在行间 gap [720, 732)：视口顶 725、视口高 2 → 视口 [725, 727] 无行 → None。
-        assert_eq!(
-            l.first_visible_row(-725.0, 2.0),
-            None,
-            "视口悬行间 gap 应 None"
-        );
+        paged_layout(
+            &[(793.0, 1123.0); 3],
+            1000.0,
+            700.0,
+            2,
+            PAGED_GAP_X,
+            PAGED_GAP_Y,
+            20.0,
+        )
     }
 
     /// 双页模式（cols=2，3 页 A4）：行 0 满两页（宽受限 cap），行 1 单页靠列左（宽度同满行）。
     ///
-    /// 手算：
-    /// - content_w = 960、cap_w = (960 − 12)/2 = 474、fit_w = 700×0.70614 ≈ 494.30 → cell_w = 474；
-    /// - cell_h = 474×(1123/793) ≈ 671.25；spread = 2×474+12 = 960 = content_w → left_pad = 0；
-    /// - 页 0 = (20, 20, 474, 671.25)、页 1 = (20+474+12 = 506, 20, 474, 671.25)；
-    /// - row_top = [20, 20+671.25+12 = 703.25]；
-    /// - 页 2（行 1 第 0 列，靠列左非居中）：(20, 703.25, 474, 671.25)；
-    /// - total = 703.25 + 671.25 + 20 = 1394.5。
+    /// 手算（K177）：content_w=960、cap_w=(960−1)/2=479.5、fit_w=700×0.70614≈494.30 →
+    /// cell_w = 479.5；cell_h = 479.5×(1123/793) ≈ 679.04；spread = 2×479.5+1 = 960 =
+    /// content_w → left_pad = 0；页 0 = (20, 20, 479.5, 679.04)、页 1 = (20+479.5+1 = 500.5,
+    /// 20, 479.5, 679.04)；row_top = [20, 20+679.04+6 = 705.04]；页 2（行 1 第 0 列，靠列左非
+    /// 居中）：(20, 705.04, 479.5, 679.04)；total = 705.04 + 679.04 + 20 = 1404.08。
     #[test]
     fn paged_double_col_a4_hand_computed() {
         let l = paged_a4_3();
@@ -3354,19 +3355,19 @@ mod tests {
         assert_eq!(l.rows, 2);
         assert_eq!(l.row_page_start, vec![0, 2, 3], "行起始页表 = [0,2,3]");
         assert!(
-            (l.cell_w_per_row[0] - 474.0).abs() < 0.05,
-            "页宽应受列宽限制 ≈474: {}",
+            (l.cell_w_per_row[0] - 479.5).abs() < 0.05,
+            "页宽应受列宽限制 ≈479.5: {}",
             l.cell_w_per_row[0]
         );
         assert!(
-            (l.cell_h[0] - 671.25).abs() < 0.05,
-            "页高 ≈671.25: {}",
+            (l.cell_h[0] - 679.04).abs() < 0.05,
+            "页高 ≈679.04: {}",
             l.cell_h[0]
         );
         // 行 1 单页宽度与满行一致（统一 cols），left_pad 同 0 → 页 2 靠列左顶格。
         assert!(
-            (l.cell_w_per_row[1] - 474.0).abs() < 0.05,
-            "行 1 单页宽度同满行 474"
+            (l.cell_w_per_row[1] - 479.5).abs() < 0.05,
+            "行 1 单页宽度同满行 479.5"
         );
         assert!(
             (l.left_pad_per_row[0] - 0.0).abs() < 1e-3
@@ -3379,23 +3380,23 @@ mod tests {
             (p0.x - 20.0).abs() < 1e-3 && (p0.y - 20.0).abs() < 1e-3,
             "页 0 左上 = (20,20)"
         );
-        assert!((p0.w - 474.0).abs() < 0.05 && (p0.h - 671.25).abs() < 0.05);
+        assert!((p0.w - 479.5).abs() < 0.05 && (p0.h - 679.04).abs() < 0.05);
         assert!(
-            (p1.x - 506.0).abs() < 0.05 && (p1.y - 20.0).abs() < 1e-3,
-            "页 1 左上 ≈(506,20)"
+            (p1.x - 500.5).abs() < 0.05 && (p1.y - 20.0).abs() < 1e-3,
+            "页 1 左上 ≈(500.5,20)"
         );
-        assert!((p1.w - 474.0).abs() < 0.05);
+        assert!((p1.w - 479.5).abs() < 0.05);
         assert!(
             (p2.x - 20.0).abs() < 1e-3,
             "行 1 单页靠列左：x = padding = 20（非居中）: {}",
             p2.x
         );
-        assert!((p2.y - 703.25).abs() < 0.05, "行 1 顶 ≈703.25: {}", p2.y);
-        assert!((p2.w - 474.0).abs() < 0.05 && (p2.h - 671.25).abs() < 0.05);
-        assert!((l.row_top[1] - 703.25).abs() < 0.05);
+        assert!((p2.y - 705.04).abs() < 0.05, "行 1 顶 ≈705.04: {}", p2.y);
+        assert!((p2.w - 479.5).abs() < 0.05 && (p2.h - 679.04).abs() < 0.05);
+        assert!((l.row_top[1] - 705.04).abs() < 0.05);
         assert!(
-            (l.total_height - 1394.5).abs() < 0.05,
-            "总高 ≈1394.5: {}",
+            (l.total_height - 1404.08).abs() < 0.05,
+            "总高 ≈1404.08: {}",
             l.total_height
         );
         assert!(
@@ -3405,21 +3406,20 @@ mod tests {
         );
         // 越界页 → None。
         assert!(l.cell_rect(3).is_none(), "页 3 越界应 None");
-        // 可见行：视口 [0, 700)（scroll_y=0）→ 行 0 [20, 691.25]；行 1 顶 703.25 > 700 不见。
-        // （brief 样例写 (0,1) 系手算失误：行 1 顶 703.25 > 视口底 700，不满足可见条件。）
+        // 可见行：视口 [0, 700)（scroll_y=0）→ 行 0 [20, 699.04]；行 1 顶 705.04 > 700 不见。
         assert_eq!(
             l.first_visible_row(0.0, 700.0),
             Some((0, 0)),
             "scroll 0 只见行 0"
         );
-        // 视口顶 704（scroll_y=−704）→ 视口 [704, 1404] 压住行 1 [703.25, 1374.5] → (1,1)。
+        // 视口顶 704（scroll_y=−704）→ 视口 [704, 1404] 压住行 1 [705.04, 1384.08] → (1,1)。
         assert_eq!(
             l.first_visible_row(-704.0, 700.0),
             Some((1, 1)),
             "视口顶 704 应命中行 1"
         );
-        // 悬行间 gap：行 0 底 691.25、行 1 顶 703.25；视口 [695, 699] 无行 → None。
-        assert_eq!(l.first_visible_row(-695.0, 4.0), None, "悬行间 gap 应 None");
+        // 悬行间 gap：行 0 底 699.04、行 1 顶 705.04；视口 [700, 702] 无行 → None。
+        assert_eq!(l.first_visible_row(-700.0, 2.0), None, "悬行间 gap 应 None");
         // 完全在总高之下：视口顶 total+10 → 无行底 > 视口顶 → None。
         assert_eq!(
             l.first_visible_row(-(l.total_height + 10.0), 100.0),
@@ -3428,16 +3428,98 @@ mod tests {
         );
     }
 
+    /// 单列（cols=1，内部/测试用）手算几何：A4(793,1123)、视口 1000×700、pad 20 →
+    /// fit 主导、单列居中、行数=页数、row_top 按 v_gap 累加。`paged_schedule_window_deep_page`
+    /// 只断窗口不断几何，本条补 cols=1 的纯函数几何面。
+    ///
+    /// 手算（K177，h_gap=PAGED_GAP_X=1、v_gap=PAGED_GAP_Y=6）：
+    /// - content_w = 960、cap_w = (960−0)/1 = 960（cols=1 不减 h_gap，见 `paged_layout` 公式；
+    ///   fit 主导，cap_w 是否含 h_gap 不影响 min）、fit_w = 700×0.70614 ≈ 494.30 →
+    ///   cell_w = min(960, 494.30) = 494.30；
+    /// - cell_h = 494.30×(1123/793) ≈ 700.00；spread = 1×494.30 + 0×h_gap = 494.30；
+    /// - left_pad = (960−494.30)/2 ≈ 232.85 → 页 0 x = 20 + 232.85 = 252.85（单列居中）；
+    /// - 1 页 → rows=1、row_top=[20]、total = 20 + 700 + 20 = 740；
+    /// - 2 页 → rows=2、row_top=[20, 20+700+6=726]、total = 20+700+6+700+20 = 1446（v_gap 行距）。
+    #[test]
+    fn paged_single_col_a4_hand_computed() {
+        let l = paged_layout(
+            &[(793.0, 1123.0)],
+            1000.0,
+            700.0,
+            1,
+            PAGED_GAP_X,
+            PAGED_GAP_Y,
+            20.0,
+        );
+        assert_eq!(l.cols, 1, "cols=1");
+        assert_eq!(l.rows, 1, "1 页单列 → 1 行");
+        assert!(
+            (l.cell_w_per_row[0] - 494.30).abs() < 0.05,
+            "页宽 fit 主导 ≈494.30: {}",
+            l.cell_w_per_row[0]
+        );
+        assert!(
+            (l.cell_h[0] - 700.0).abs() < 0.05,
+            "页高 ≈700.00: {}",
+            l.cell_h[0]
+        );
+        assert!(
+            (l.left_pad_per_row[0] - 232.85).abs() < 0.05,
+            "单列居中 left_pad ≈232.85: {}",
+            l.left_pad_per_row[0]
+        );
+        assert!(
+            (l.spread_max - 494.30).abs() < 0.05,
+            "spread_max = 单列宽 494.30: {}",
+            l.spread_max
+        );
+        let p0 = l.cell_rect(0).expect("页 0");
+        assert!(
+            (p0.x - 252.85).abs() < 0.05 && (p0.y - 20.0).abs() < 1e-3,
+            "页 0 左上 = (252.85, 20)"
+        );
+        assert!((p0.w - 494.30).abs() < 0.05 && (p0.h - 700.0).abs() < 0.05);
+        assert!((l.row_top[0] - 20.0).abs() < 1e-3);
+        assert!(
+            (l.total_height - 740.0).abs() < 0.05,
+            "单页总高 = 20 + 700 + 20 = 740: {}",
+            l.total_height
+        );
+        assert!(l.cell_rect(1).is_none(), "页 1 越界应 None");
+
+        // 2 页单列：rows=2、row_top 按 v_gap 累加、total 含行距。
+        let l2 = paged_layout(
+            &[(793.0, 1123.0); 2],
+            1000.0,
+            700.0,
+            1,
+            PAGED_GAP_X,
+            PAGED_GAP_Y,
+            20.0,
+        );
+        assert_eq!(l2.rows, 2);
+        assert!(
+            (l2.row_top[1] - 726.0).abs() < 0.05,
+            "行 1 顶 = 20 + 700 + 6 = 726: {}",
+            l2.row_top[1]
+        );
+        assert!(
+            (l2.total_height - 1446.0).abs() < 0.05,
+            "两页总高 = 20+700+6+700+20 = 1446: {}",
+            l2.total_height
+        );
+    }
+
     /// 命中定位（双页）：页内点命中、列间 gap/留白/越界/空 → None。柱槽用 floor（非 round，
     /// 见 [`PagedLayout::page_at`] 注释——round 的槽中点会切进卡片内部造成漏命中）。
     ///
-    /// 手算（页 0 = (20,20,474,671.25)、页 1 = (506,20,474,671.25)、pitch = 486）：
-    /// - (405, 380.1)：r = row_index_at_y(380.1) = 0；c = floor((405−20)/486) = floor(0.792) = 0；
+    /// 手算（页 0 = (20,20,479.5,679.04)、页 1 = (500.5,20,479.5,679.04)、pitch = 480.5）：
+    /// - (405, 380.1)：r = row_index_at_y(380.1) = 0；c = floor((405−20)/480.5) = floor(0.801) = 0；
     ///   页 0 内含点 → (0, 405−20 = 385, 380.1−20 = 360.1)；
-    /// - (520, 100)：c = floor(500/486) = 1 → 页 1 内 → (1, 520−506 = 14, 100−20 = 80)；
-    /// - (500, 100)：c = floor(480/486) = 0，页 0 右缘 494 之外（列间 gap [494,506]）→ None；
+    /// - (520, 100)：c = floor(500/480.5) = 1 → 页 1 内 → (1, 520−500.5 = 19.5, 100−20 = 80)；
+    /// - (500, 100)：c = floor(480/480.5) = 0，页 0 右缘 499.5 之外（列间 gap [499.5,500.5]）→ None；
     /// - (10, 100)：x < padding+left_pad = 20 → c = floor(−0.02) = −1 → None；
-    /// - (405, 700)：y 在行 0 底 691.25 外、行 1 顶 703.25 前（行间 gap）→ None；
+    /// - (405, 700)：y 在行 0 底 699.04 外、行 1 顶 705.04 前（行间 gap）→ None；
     /// - (300, 5)：y < 行 0 顶 20（顶部 padding）→ 页 0 含点复核不过 → None。
     #[test]
     fn paged_page_at_hits_cells_rejects_gaps() {
@@ -3451,8 +3533,8 @@ mod tests {
         let (i, lx, ly) = l.page_at(520.0, 100.0).expect("页 1 应命中");
         assert_eq!(i, 1);
         assert!(
-            (lx - 14.0).abs() < 1e-2 && (ly - 80.0).abs() < 1e-2,
-            "页 1 局部 = (14, 80): ({lx},{ly})"
+            (lx - 19.5).abs() < 1e-2 && (ly - 80.0).abs() < 1e-2,
+            "页 1 局部 = (19.5, 80): ({lx},{ly})"
         );
         assert!(l.page_at(500.0, 100.0).is_none(), "列间 gap 应 None");
         assert!(l.page_at(10.0, 100.0).is_none(), "左留白应 None");
@@ -3467,7 +3549,7 @@ mod tests {
     #[test]
     fn paged_layout_edge_cases_are_bounded() {
         // 空页：rows/total=0、row_top 空、row_page_start 仅端点 [0]、几何方法一律安全空。
-        let empty = paged_layout(&[], 1000.0, 700.0, 2, 12.0, 20.0);
+        let empty = paged_layout(&[], 1000.0, 700.0, 2, PAGED_GAP_X, PAGED_GAP_Y, 20.0);
         assert_eq!(empty.cols, 2, "cols 保留归一值");
         assert_eq!(empty.rows, 0);
         assert!(empty.row_top.is_empty(), "无行");
@@ -3481,23 +3563,34 @@ mod tests {
 
         // cols 归一：0 → 1、5 → 2（>2 按 2）。
         assert_eq!(
-            paged_layout(&[(793.0, 1123.0)], 1000.0, 700.0, 0, 12.0, 20.0).cols,
+            paged_layout(&[(793.0, 1123.0)], 1000.0, 700.0, 0, PAGED_GAP_X, PAGED_GAP_Y, 20.0)
+                .cols,
             1
         );
         assert_eq!(
-            paged_layout(&[(793.0, 1123.0)], 1000.0, 700.0, 5, 12.0, 20.0).cols,
+            paged_layout(&[(793.0, 1123.0)], 1000.0, 700.0, 5, PAGED_GAP_X, PAGED_GAP_Y, 20.0)
+                .cols,
             2
         );
         assert_eq!(
-            paged_layout(&[(793.0, 1123.0)], 1000.0, 700.0, 1, 12.0, 20.0).cols,
+            paged_layout(&[(793.0, 1123.0)], 1000.0, 700.0, 1, PAGED_GAP_X, PAGED_GAP_Y, 20.0)
+                .cols,
             1
         );
 
-        // 窄视口 vw=200（双页）：content_w = 160、cap_w = (160−12)/2 = 74 → cell_w = 74（正宽）。
-        let narrow = paged_layout(&[(793.0, 1123.0); 3], 200.0, 700.0, 2, 12.0, 20.0);
+        // 窄视口 vw=200（双页）：content_w = 160、cap_w = (160−1)/2 = 79.5 → cell_w = 79.5（正宽）。
+        let narrow = paged_layout(
+            &[(793.0, 1123.0); 3],
+            200.0,
+            700.0,
+            2,
+            PAGED_GAP_X,
+            PAGED_GAP_Y,
+            20.0,
+        );
         assert!(
-            (narrow.cell_w_per_row[0] - 74.0).abs() < 0.05,
-            "窄视口页宽 ≈74: {}",
+            (narrow.cell_w_per_row[0] - 79.5).abs() < 0.05,
+            "窄视口页宽 ≈79.5: {}",
             narrow.cell_w_per_row[0]
         );
         let r0 = narrow.cell_rect(0).expect("页 0 应有矩形");
@@ -3506,9 +3599,17 @@ mod tests {
         let _ = narrow.page_at(100.0, 100.0);
         let _ = narrow.first_visible_row(0.0, 700.0);
 
-        // 极窄视口堆叠 padding：content_w 夹 0、cap_w=(0−12)/2 夹 0 → 页宽/高退化为 0，不 panic、
-        // 无负宽、列 pitch 仍 >0（=gap）故 page_at 走包含性复核稳返 None。
-        let degenerate = paged_layout(&[(793.0, 1123.0); 2], 30.0, 700.0, 2, 12.0, 20.0);
+        // 极窄视口堆叠 padding：content_w 夹 0、cap_w=(0−1)/2 夹 0 → 页宽/高退化为 0，不 panic、
+        // 无负宽、列 pitch 仍 >0（=h_gap）故 page_at 走包含性复核稳返 None。
+        let degenerate = paged_layout(
+            &[(793.0, 1123.0); 2],
+            30.0,
+            700.0,
+            2,
+            PAGED_GAP_X,
+            PAGED_GAP_Y,
+            20.0,
+        );
         assert_eq!(degenerate.rows, 1);
         assert!(
             (degenerate.cell_w_per_row[0] - 0.0).abs() < 1e-3,
@@ -3538,29 +3639,30 @@ mod tests {
 
     /// R1 分页缩放锚点纯函数：放大 1.12× 后行内相对位置按 ratio 保持 + 往返零漂移。
     ///
-    /// 演算（K177）：用 `paged_a4_3()`（cols=2, 3 页 A4, 视口 1000×700, gap 12, padding 20）：
-    /// - zoom=1 布局 `l`：row_top=[20, 703.25]、cell_h=671.25、total=1394.5；
+    /// 演算（K177）：用 `paged_a4_3()`（cols=2, 3 页 A4, 视口 1000×700, h_gap=1, v_gap=6,
+    /// padding 20）：
+    /// - zoom=1 布局 `l`：row_top=[20, 705.04]、cell_h=679.04、total=1404.08；
     /// - pl_old = `paged_layout_scaled(l, 1.0)` = l；pl_new = `paged_layout_scaled(l, 1.12)`：
-    ///   row_top=[22.4, 787.64]、row_h[0]=671.25×1.12=751.8；
+    ///   row_top=[22.4, 789.64]、row_h[0]=679.04×1.12=760.52；
     /// - 取行 0、sy_old（显示口径 = 布局口径 @ zoom=1）= row_top[0]+row_h[0]×0.35
-    ///   = 20+234.9375 = 254.9375（行内比例 0.35）；ratio = 1.12；
+    ///   = 20+237.664 = 257.664（行内比例 0.35）；ratio = 1.12；
     /// - 期望 sy_new = pl_new.row_top[0] + (sy_old − pl_old.row_top[0])×ratio
-    ///   = 22.4 + 234.9375×1.12 = 22.4+263.13 = 285.53；
-    ///   行内比例验证：(285.53−22.4)/751.8 = 263.13/751.8 = 0.35 ✓；
+    ///   = 22.4 + 237.664×1.12 = 22.4+266.184 = 288.584；
+    ///   行内比例验证：(288.584−22.4)/760.52 = 266.184/760.52 = 0.35 ✓；
     /// - 回程 ratio'=1/1.12、pl_old'=pl_new、pl_new'=pl_old：
-    ///   sy_back = 20 + (285.53−22.4)/1.12 = 20+234.94 = 254.94 ≈ sy_old ✓。
+    ///   sy_back = 20 + (288.584−22.4)/1.12 = 20+237.66 = 257.66 ≈ sy_old ✓。
     #[test]
     fn zoom_rescroll_anchor_paged_preserves_row_relative_position() {
         let l = paged_a4_3();
         let pl_old = paged_layout_scaled(&l, 1.0);
         let pl_new = paged_layout_scaled(&l, 1.12);
         let row = 0usize;
-        let row_h_old = l.row_height(row); // 671.25
-        let row_h_new = row_h_old * 1.12; // 751.8
-        let sy_old = l.row_top[row] + row_h_old * 0.35; // 254.9375（行内 35%）
+        let row_h_old = l.row_height(row); // 679.04
+        let row_h_new = row_h_old * 1.12; // 760.52
+        let sy_old = l.row_top[row] + row_h_old * 0.35; // 257.664（行内 35%）
         let ratio = 1.12f32;
         let sy_new = zoom_rescroll_anchor_paged(&pl_old, &pl_new, row, ratio, sy_old);
-        // 期望值（演算）：22.4 + 234.9375×1.12 = 285.53。
+        // 期望值（演算）：22.4 + 237.664×1.12 = 288.584。
         let want = pl_new.row_top[row] + (sy_old - pl_old.row_top[row]) * ratio;
         assert!((sy_new - want).abs() < 1e-2, "sy_new={sy_new} want={want}");
         // 行内相对位置保持（0.35）。
@@ -3576,12 +3678,130 @@ mod tests {
             "往返应无漂移：{sy_old} → {sy_new} → {sy_back}"
         );
         // 行 1 同样验证（深页，行顶更大、常量区不影响分页锚）。
-        let sy1_old = l.row_top[1] + row_h_old * 0.5; // 703.25 + 335.625 = 1038.875
+        let sy1_old = l.row_top[1] + row_h_old * 0.5; // 705.04 + 339.52 = 1044.56
         let sy1_new = zoom_rescroll_anchor_paged(&pl_old, &pl_new, 1, ratio, sy1_old);
         let frac1_new = (sy1_new - pl_new.row_top[1]) / row_h_new;
         assert!(
             (frac1_new - 0.5).abs() < 1e-3,
             "行 1 行内比例应保持 0.5，实际 {frac1_new}"
+        );
+    }
+
+    // ---- A 线：分页调度窗（paged_visible_pages / paged_schedule_window）纯函数测试 ----
+    // 夹具 `paged_a4_3()`（见上）：cols=2、rows=2、row_top=[20, 705.04]、cell_h=679.04、
+    // total=1404.08、row_page_start=[0,2,3]。行 0 页区间 [0,1]、行 1 页区间 [2,2]。
+
+    /// 可见行页区间（未扩）：首行 r0 推出的闭区间页下标。
+    #[test]
+    fn paged_visible_pages_from_first_row() {
+        let l = paged_a4_3();
+        // 视口 [0,700]：首行 0 → 页区间 [row_page_start[0]=0, row_page_start[1]−1=1] = (0,1)。
+        assert_eq!(paged_visible_pages(&l, 0.0, 700.0, 3), Some((0, 1)));
+        // 视口 [740,1440]：首行 1 → 页区间 [row_page_start[1]=2, row_page_start[2]−1=2] = (2,2)。
+        assert_eq!(paged_visible_pages(&l, -740.0, 700.0, 3), Some((2, 2)));
+        // 听 0 页文档（rows=0）：first_visible_row → None → 函数 None。
+        let empty = paged_layout(&[], 1000.0, 700.0, 1, PAGED_GAP_X, PAGED_GAP_Y, 20.0);
+        assert_eq!(paged_visible_pages(&empty, 0.0, 700.0, 0), None);
+    }
+
+    /// 调度窗 = 可见行页区间再扩 `k_rows × cols` 页（闭区间、夹到文档内）。
+    #[test]
+    fn paged_schedule_window_expands_and_clamps() {
+        let l = paged_a4_3();
+        // 首行可见：k_rows=3、cols=2 → 扩 6 页；start=0−6→0、end=(1+6)=7→min(n−1=2)=2。
+        assert_eq!(
+            paged_schedule_window(&l, 0.0, 700.0, 3, 3),
+            Some((0, 2)),
+            "3 页文档整窗即全部页（扩后夹回 0..=2）"
+        );
+        // 深行可见（页 2）：k_rows=1 → 扩 2 页；start=2−2=0、end=2+2=4→2 → (0,2)。
+        assert_eq!(
+            paged_schedule_window(&l, -740.0, 700.0, 3, 1),
+            Some((0, 2)),
+            "深页扩窗应覆盖整窗往返"
+        );
+        // 空布局 → None（无可见行）。
+        let empty = paged_layout(&[], 1000.0, 700.0, 1, PAGED_GAP_X, PAGED_GAP_Y, 20.0);
+        assert_eq!(paged_schedule_window(&empty, 0.0, 700.0, 0, 3), None);
+    }
+
+    /// 调度窗在**大文档**深页上保「显示页 + 邻行」：用 200 页 A4 单列布局，视口顶贴页 150
+    /// 所在行 → 可见页 = 单页区间、扩 `k_rows=3` 行（=±3 页，行=页）→ 窗口 [147..153]。
+    #[test]
+    fn paged_schedule_window_deep_page_keeps_target() {
+        let l = paged_layout(
+            &[(793.0, 1123.0); 200],
+            1000.0,
+            700.0,
+            1,
+            PAGED_GAP_X,
+            PAGED_GAP_Y,
+            20.0,
+        );
+        // 单列：rows=200（行 0..199）、row_height=700、row_top[r]=20+r×(700+6)=20+r×706。贴行 150：行顶 = 20+150×706。
+        let p = 150usize;
+        let scroll_y = -(20.0 + p as f32 * 706.0);
+        let expect = paged_schedule_window(&l, scroll_y, 700.0, 200, 3);
+        let Some((s, e)) = expect else {
+            panic!("深页应给出调度窗");
+        };
+        assert!(s <= p && p <= e, "目标页 {p} 应在窗内 [{s},{e}]");
+        assert_eq!((s, e), (147, 153), "扩 PAGED_WINDOW_ROWS=3 行 = ±3 页");
+    }
+
+    // ---- 渲染窗（paged_render_window）：全可见行 ± 缓冲，Facing=连续自由滚动 ----
+    // 同夹具 `paged_a4_3()`：cols=2、rows=2、row_top=[20, 705.04]、row_h=679.04、
+    // row_page_start=[0,2,3]、total=1404.08。行 0 页区间 [0,1]、行 1 页区间 [2,2]。
+
+    /// 行中位自由滚动：视口 [65,765] 同时压行 0（[20,699.04]）与行 1（[705.04,1384.08]）→
+    /// 全可见行 (0,1) ± 1 行缓冲仍夹到 (0,1) → 页 [row_page_start[0]=0, row_page_start[2]−1=2]
+    /// = (0,2)：行中停位上下两行都物化（旧 `paged_visible_pages` 只按 r0 → (0,1) 漏页 2）。
+    #[test]
+    fn paged_render_window_mid_row_covers_all_visible_rows() {
+        let l = paged_a4_3();
+        let scroll_y = -(20.0 + 45.0); // 视口顶 = 行 0 顶下 45
+        assert_eq!(l.first_visible_row(scroll_y, 700.0), Some((0, 1)));
+        assert_eq!(
+            paged_render_window(&l, scroll_y, 700.0, 3, 1),
+            Some((0, 2)),
+            "行中位全可见行(0,1) ± 1 缓冲 → 页 0..=2"
+        );
+        // 同一视口旧 helper 只按首行 r0 → (0,1)：证明渲染窗与调度窗口径之别。
+        assert_eq!(paged_visible_pages(&l, scroll_y, 700.0, 3), Some((0, 1)));
+    }
+
+    /// 视口顶贴行 0 顶：可见行 (0,0)，±1 行缓冲把窗扩到行 1 → 页 (0,2)（首行之上不外扩，
+    /// 向下缓冲保「下一行提前有卡」——与连续 ±MARGIN 同构）。buf=0 时只物化首行页区间。
+    #[test]
+    fn paged_render_window_top_row_expands_and_clamps() {
+        let l = paged_a4_3();
+        // 视口 [0,700]：行 0 可见、行 1 顶（705.04）恰在视口底下方 → 仅 (0,0)。
+        assert_eq!(l.first_visible_row(0.0, 700.0), Some((0, 0)));
+        // buf=0 → 仅可见行页区间 (0,1)。
+        assert_eq!(paged_render_window(&l, 0.0, 700.0, 3, 0), Some((0, 1)));
+        // buf=1 → r_hi = (0+1).min(1) = 1 → 页 [0, row_page_start[2]−1=2] = (0,2)。
+        assert_eq!(paged_render_window(&l, 0.0, 700.0, 3, 1), Some((0, 2)));
+        // 末行/末尾：视口 [740,1440] 压行 1（末行）→ r_hi 夹到 rows−1=1；r_lo = 1−1 = 0
+        // → 页 (0,2)（全部夹回文档内，不越界）。
+        let scroll_y = -740.0;
+        assert_eq!(l.first_visible_row(scroll_y, 700.0), Some((1, 1)));
+        assert_eq!(
+            paged_render_window(&l, scroll_y, 700.0, 3, 1),
+            Some((0, 2)),
+            "末行可见时缓冲向上扩 + 下夹不越界"
+        );
+    }
+
+    /// 空布局 / 已滚过末行 → None（无可见行）。
+    #[test]
+    fn paged_render_window_empty_returns_none() {
+        let empty = paged_layout(&[], 1000.0, 700.0, 1, PAGED_GAP_X, PAGED_GAP_Y, 20.0);
+        assert_eq!(paged_render_window(&empty, 0.0, 700.0, 0, 1), None);
+        let l = paged_a4_3();
+        // 滚过内容底：视口完全在文档之下 → first_visible_row None → 窗 None。
+        assert_eq!(
+            paged_render_window(&l, -(l.total_height + 10.0), 100.0, 3, 1),
+            None
         );
     }
 }
