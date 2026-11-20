@@ -174,7 +174,7 @@ use crate::pdf::layout::{
     GridLayout, PagedLayout, Slot, TileSlot, advance_match_index, bitmap_display_scales,
     column_left, compute_layout, content_to_local, cover_affordable, cover_scale, display_height,
     first_visible_page, grid_layout, grid_zoom_limits_for_cols, hit_char, keep_window, local_to_pt,
-    page_bitmap_size, page_segment_text, paged_layout, paged_layout_scaled, paged_render_window,
+    min_ar, page_bitmap_size, page_segment_text, paged_layout, paged_layout_scaled, paged_render_window,
     pt_to_local, render_scale, selection_spans_pt, visible_tile_range_axis, zoom_rescroll_anchor,
     zoom_rescroll_anchor_paged,
 };
@@ -449,6 +449,22 @@ pub enum PageMode {
     Facing,
 }
 
+/// 鼠标焦点缩放锚（Ctrl+滚轮「以鼠标所指页面点为焦点」）：真实滚轮命中页时捕获
+/// 「鼠标窗口坐标 + 命中页内 PDF 点」——缩放前后让**同一 PDF 内容点**钉在同一屏幕位置。
+/// 命中空白（沟槽/留白/状态栏）→ [`super::view::input::PdfViewer::window_to_pt`] 返 `None`
+/// → 无焦点 → 视口顶锚（既有 Z1/Z1-S6 语义不变）；滑条/程序化缩放不传焦点同样落顶锚。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ZoomMouseFocus {
+    /// 鼠标窗口坐标（缩放锚点要钉住的屏幕位置）。
+    pub(crate) pos: Point<Pixels>,
+    /// 命中页下标。
+    pub(crate) page: usize,
+    /// 命中页内 PDF 点 x（页内原点左下、y 向上坐标系）。
+    pub(crate) px: f32,
+    /// 命中页内 PDF 点 y。
+    pub(crate) py: f32,
+}
+
 /// PDF 阅读器：自包含的瓦片级虚拟化视图。
 pub struct PdfViewer {
     /// 文件路径（含文件名，标题用）。
@@ -568,7 +584,7 @@ pub struct PdfViewer {
     /// L1.3：停稳检测的连续「小位移」帧计数（|Δy| < [`config::pdf::STOP_DETECT_PX`] 时递增、
     /// 否则清零；达 [`config::pdf::STOP_DETECT_FRAMES`] 即直落 Slow 绕过 EMA 衰减）。
     pub(crate) stop_small_frames: u32,
-    /// S1/S3：缩放派发已武装（Ctrl+滚轮 [`super::view::input::PdfViewer::adjust_zoom`] 置位）。
+    /// S1/S3：缩放派发已武装（Ctrl+滚轮 [`super::view::input::PdfViewer::adjust_zoom_mouse`] 置位）。
     /// 为 true 期间（缩放防抖窗内）调度只按**当前 cscale** 派 ≤[`config::pdf::PRE_FETCH_COVER_INFLIGHT`]
     /// 枚 0.5 密度 preview（绝不满密 cover/tile 逐档抢渲被弃空转）；连续
     /// [`config::pdf::ZOOM_DEBOUNCE_FRAMES`] 帧无新缩放事件后清零，落常态满密收口。
@@ -591,6 +607,28 @@ pub struct PdfViewer {
     pub(crate) settle_tile_burst_dispatch: u64,
     /// 竖向滚动句柄（页列外层 scroll 容器）。
     pub(crate) scroll: ScrollHandle,
+    /// **非溢出档水平内容偏移**（Ctrl+滚轮鼠标焦点 x 锚专用，2026-11-20）：页列在视口内
+    /// 居中（居中 = 0，正值 = 页列整体右移、负值 = 左移；单位 CSS px）。仅非横向溢出
+    /// （`zoom_target_impl` 的 `max_sx == 0`，页宽 + 2·PAD ≤ 视口）时由本字段承担横向锚；
+    /// 横向溢出时由 `scroll.offset().x` 承担、本字段强制归 0（见 open.rs）。
+    /// 鼠标缩放（[`super::view::open::PdfViewer::zoom_target_impl`]）把「缩放后同内容点窗口位
+    /// − 鼠标屏位」增量落进本字段，保持鼠标所指内容点同屏；渲染（render.rs wrap 外边距）/
+    /// 命中（`window_to_pt`/`pt_to_window`）/横向量程（tiles page_visible_rect）三处同口径
+    /// 消费（K153）。**复位规则**（归 0 回中）：普通滚动、`scroll_to_page`/跳页、`set_page_mode`、
+    /// 进出网格、`set_zoom_abs`/`set_zoom` 等任何非「鼠标缩放」的水平位移（各守卫处清 0），
+    /// 连续 Ctrl+滚轮鼠标在页上期间保持。
+    pub(crate) x_zoom_offset: f32,
+    /// **上一档 Ctrl+滚轮鼠标命中的页内内容点**（沟槽/留白兜底锚，2026-11-20）：本档
+    /// `window_to_pt` 未命中（鼠标落页外/沟槽）但上一档命中页内时，按本值锚 **y**（该 PDF
+    /// 内容点钉在上一档屏位）防「x 重居中把鼠标推出页缘 → 瞬时回落视口顶锚 → y 整段跳」；
+    /// **x** 交由量程分派维持既有/居中。连续 Ctrl+滚轮期间由 `zoom_target_impl` 写入；普通
+    /// 滚动/跳页/模式切换/平移等非缩放交互时清空（与 `x_zoom_offset` 同批复位）。
+    pub(crate) last_mouse_focus: Option<ZoomMouseFocus>,
+    /// **非缩放滚动检测快照**（评审 nit，2026-11-20）：`ensure_window` 每帧比对
+    /// `scroll.offset()` 与本值，变化且不在缩放防抖（`!zoom_armed`）→ 判定为滚动条拖拽 /
+    /// 键盘滚动等**非「鼠标缩放」滚动** → `reset_x_zoom()`（清水平偏移 + 沟槽兜底锚，回中）。
+    /// 连续 Ctrl+滚轮缩放序列内（`zoom_armed`，offset 每档变化）不触发，保兜底锚。
+    pub(crate) last_ui_scroll: (f32, f32),
     /// 异步文档加载状态（`loading` + `load_error`）。数据本体是多字段的
     /// （worker / doc_id / dims / page_tops / …），故用 `AsyncState<()>` 只复用
     /// 转移 helper 的加载/错误两字段；`data` 槽不标记已加载——「已加载」由
@@ -671,6 +709,12 @@ pub struct PdfViewer {
     /// `PAGE_WIDTH`）。窗口 / 侧边栏拉宽拉窄 → 每帧 [`open`] 的 `ensure_window` 重算
     /// 基线并重排页列，页面随之缩放；Ctrl+滚轮在基线上再乘 `zoom` 倍率。
     pub(crate) base_w: f32,
+    /// **全文档最小纵横比** `min(w_i/h_i)`（跳过退化页，全退化 → 1.0，见 [`layout::min_ar`]）：
+    /// 连续（默认）模式「整页入屏」（contain-fit）用——`base_w = min(content_w,
+    /// viewport_h·min_ar)`，与双页（Facing）模式同 fit 口径 → 同一缩放值（状态栏 zoom%）
+    /// 下两模式页视觉大小一致。`apply_loaded` 由 `self.dims` 一次算出并缓存（避免每帧
+    /// O(n) 全扫 dims）；测试夹具（`paged_viewer`）同步设值防 stale。
+    pub(crate) doc_min_ar: f32,
     /// 当前窗口缩放密度（设备 px / CSS px，f32 位型）：`ensure_window` 每帧从窗口刷新。
     /// `page_width()` 用它把页宽量化到设备像素网格（`round(page_width·sf)/sf`），使
     /// `page_width·sf` 恒为整数 → 位图宽 `ceil(page_width·sf)` 与显示矩形（GPUI 绘制时
@@ -739,6 +783,15 @@ pub struct PdfViewer {
     /// 不清 page_mode）。本切片只存状态 + 通知，渲染三路分派/滚动锚点恢复由后续切片接
     /// （见 `view/open.rs` 的 `set_page_mode`）。
     pub(crate) page_mode: PageMode,
+    /// Facing 分页「sticky 列记忆」（0 = 左/偶页、1 = 右/奇页）：同行两列顶对齐 → y 轴无法
+    /// 区分「读者实际在读哪列」，模式切换/进度捕获必须靠**确定性锚事件**钉列——Facing
+    /// restore（`ensure_window` 按恢复页 `page % cols` 写入）与 Facing `scroll_to_page`
+    /// （按目标页列写入）两处是唯一锚源。
+    /// [`Self::reading_progress`] 分页分支据此解析「真正当前页」（`row_page_start[r0] +
+    /// facing_anchor_col`，末行 ragged 仅 1 页时夹回 0），使连续 ↔ Facing 的 `(page, frac)`
+    /// 互为精确逆（修复「切模式读 spread 右/奇页丢页回退」红测）。默认 0 = 既有行左页语义
+    /// （未锚过列时保持旧行为，不引入默认翻转）。
+    pub(crate) facing_anchor_col: usize,
     /// 网格卡**独立缩放**倍数（网格 Ctrl+滚轮可调；[`Self::grid_card_width`] =
     /// `GRID_CARD_WIDTH × grid_zoom`）。**独立于单列阅读缩放 [`Self::zoom`]**：网格里
     /// Ctrl+滚轮只改卡大小，退出网格回到阅读保持用户阅读缩放；阅读 Ctrl+滚轮/`set_zoom`
@@ -923,6 +976,9 @@ mod tests {
                     zoom_idle_frames: 0,
                     zoom_epoch: 0,
                     scroll: ScrollHandle::new(),
+                    x_zoom_offset: 0.0,
+                    last_mouse_focus: None,
+                    last_ui_scroll: (0.0, 0.0),
                     state: ui::AsyncState::idle(),
                     bg: None,
                     recolor: None,
@@ -952,6 +1008,7 @@ mod tests {
                     search_seq: 0,
                     zoom: 1.0,
                     base_w: PAGE_WIDTH,
+                    doc_min_ar: 1.0,
                     scale_factor: 1.0,
                     window_sig: None,
                     window_settled: false,
@@ -972,6 +1029,7 @@ mod tests {
                     pan_offset0: gpui::point(px(0.), px(0.)),
                     grid_mode: false,
                     page_mode: PageMode::Continuous,
+                    facing_anchor_col: 0,
                     grid_zoom: 1.0,
                     last_grid_viewport_w: 0.0,
                     grid_scroll: ScrollHandle::new(),
@@ -1178,6 +1236,9 @@ mod tests {
                     zoom_idle_frames: 0,
                     zoom_epoch: 0,
                     scroll: ScrollHandle::new(),
+                    x_zoom_offset: 0.0,
+                    last_mouse_focus: None,
+                    last_ui_scroll: (0.0, 0.0),
                     state: ui::AsyncState::idle(),
                     bg: None,
                     recolor: None,
@@ -1207,6 +1268,7 @@ mod tests {
                     search_seq: 0,
                     zoom: 1.0,
                     base_w: PAGE_WIDTH,
+                    doc_min_ar: 1.0,
                     scale_factor: 1.0,
                     window_sig: None,
                     window_settled: false,
@@ -1227,6 +1289,7 @@ mod tests {
                     pan_offset0: gpui::point(px(0.), px(0.)),
                     grid_mode: false,
                     page_mode: PageMode::Continuous,
+                    facing_anchor_col: 0,
                     grid_zoom: 1.0,
                     last_grid_viewport_w: 0.0,
                     grid_scroll: ScrollHandle::new(),
@@ -1338,6 +1401,9 @@ mod tests {
                     zoom_idle_frames: 0,
                     zoom_epoch: 0,
                     scroll: ScrollHandle::new(),
+                    x_zoom_offset: 0.0,
+                    last_mouse_focus: None,
+                    last_ui_scroll: (0.0, 0.0),
                     state: ui::AsyncState::idle(),
                     bg: None,
                     recolor: None,
@@ -1367,6 +1433,7 @@ mod tests {
                     search_seq: 0,
                     zoom: 1.0,
                     base_w: PAGE_WIDTH,
+                    doc_min_ar: 1.0,
                     scale_factor: 1.0,
                     window_sig: None,
                     window_settled: false,
@@ -1387,6 +1454,7 @@ mod tests {
                     pan_offset0: gpui::point(px(0.), px(0.)),
                     grid_mode: false,
                     page_mode: PageMode::Continuous,
+                    facing_anchor_col: 0,
                     grid_zoom: 1.0,
                     last_grid_viewport_w: 0.0,
                     grid_scroll: ScrollHandle::new(),
@@ -1497,6 +1565,9 @@ mod tests {
             zoom_idle_frames: 0,
             zoom_epoch: 0,
             scroll: ScrollHandle::new(),
+            x_zoom_offset: 0.0,
+            last_mouse_focus: None,
+                    last_ui_scroll: (0.0, 0.0),
             state: ui::AsyncState::idle(),
             bg: None,
             recolor: None,
@@ -1526,6 +1597,7 @@ mod tests {
             search_seq: 0,
             zoom: 1.0,
             base_w: PAGE_WIDTH,
+            doc_min_ar: 1.0,
             scale_factor: 1.0,
             window_sig: None,
             window_settled: false,
@@ -1546,6 +1618,7 @@ mod tests {
             pan_offset0: gpui::point(px(0.), px(0.)),
             grid_mode: false,
             page_mode: PageMode::Continuous,
+            facing_anchor_col: 0,
             grid_zoom: 1.0,
             last_grid_viewport_w: 0.0,
             grid_scroll: ScrollHandle::new(),
@@ -2751,6 +2824,8 @@ mod tests {
         let (tops, total) = compute_layout(&dims, PAGE_WIDTH);
         let mut v = minimal_viewer(cx);
         v.dims = dims.clone();
+        // contain-fit 缓存字段同步设（测试建 viewer 不走 apply_loaded，漏设会 stale）。
+        v.doc_min_ar = min_ar(&dims);
         v.page_tops = tops;
         v.total_height = total;
         v.slots = (0..dims.len()).map(|_| Slot::default()).collect();

@@ -1106,20 +1106,29 @@ mod tests {
                 .expect("应有页列（宽=页宽）");
             assert_eq!(scroll.size.width.as_f32(), pane_w, "滚动可视区宽应为 pane 宽");
             let left_pad = (pages.left() - scroll.left()).as_f32();
-            // **自适应窗口宽**（fit-width）：页宽 = 容器宽 − 2·页边距，宽/窄 pane 都收
-            // 进可视区、保持 PAGE_PAD_X 左缘边距并居中，不再横向溢出（窄 pane 收窄页面）。
+            // **整页入屏**（contain-fit，K177 演算）：页宽 = min(容器宽 − 2·页边距, 视口高×
+            // 全文档 min_ar)。窗口高恒 900、pdf测试.pdf A4 595.28×841.89 → fit = 900×0.7071
+            // ≈ 636.4：
+            //   - pane 1200：min(1160, 636.4) = 636.4 → 页列按滚动可视区**居中**、左白
+            //     (1200−636.4)/2 ≈ 281.8（页宽不再拉满容器——本测试的回归主题「可视区基准
+            //     居中」不变，只把「半宽边距」从 PAGE_PAD_X 换成大留白）；
+            //   - pane 600：min(560, 636.4) = 560 → 页宽=内容区宽、左缘 PAGE_PAD_X=20 且不
+            //     横向溢出（窄 pane 收窄页面，边缘仍留 PAGE_PAD_X 边距）。
+            let fit_w = 900.0 * (595.28_f32 / 841.89); // ≈ 636.4
+            let expected_w = (pane_w - 2.0 * config::pdf::PAGE_PAD_X).min(fit_w);
             assert!(
-                (pages.size.width.as_f32() - (pane_w - 2.0 * config::pdf::PAGE_PAD_X)).abs() < 2.0,
-                "页宽应自适应容器宽 {pane_w}：实际={}",
+                (pages.size.width.as_f32() - expected_w).abs() < 2.0,
+                "页宽应整页入屏（min(容器−2pad, 900×0.7071≈636.4)）：pane={pane_w} 实际={}",
                 pages.size.width.as_f32()
             );
             assert!(
-                (left_pad - config::pdf::PAGE_PAD_X).abs() < 1.0,
-                "左缘应保持 PAGE_PAD_X 边距：left_pad={left_pad:.1}"
+                (left_pad - (pane_w - expected_w) / 2.0).abs() < 1.0,
+                "页列应相对滚动可视区居中：left_pad={left_pad:.1} 期望约 {}",
+                (pane_w - expected_w) / 2.0
             );
             assert!(
                 pages.right().as_f32() <= scroll.right().as_f32() + 1.0,
-                "页应完全落入可视区（自适应，不应横向溢出）"
+                "页应完全落入可视区（整页入屏，不应横向溢出）"
             );
             let center_off = (pages.center().x - scroll.center().x).as_f32();
             assert!(
@@ -1149,6 +1158,34 @@ mod tests {
         }
     }
 
+    // ---- 鼠标焦点缩放锚：真实宿主偏移（K185）----
+
+    /// 读物宿主相对窗口原点的偏移（仿真生产壳层的侧边栏/页签/状态栏位移）。
+    /// 全窗容器会让 `scroll.bounds().top/left == 0`，测不出「容器离窗原点 Δ」时
+    /// `window_to_pt` ↔ `pt_to_window` 坐标链的偏移是否早被消掉（K185：视口/命中
+    /// 测试必须用真实宿主结构）。
+    const HOST_OFFSET_TOP: f32 = 48.0;
+    const HOST_OFFSET_LEFT: f32 = 84.0;
+
+    /// 带「容器偏移」的缩放测试宿主：外层 pad 把读物整体推到窗口偏下/偏右——
+    /// `pdf-scroll`（阅读滚动容器）相对窗口原点有非零位移（仿真生产壳层）。
+    struct OffsetZoomProbe {
+        pdf: gpui::Entity<crate::pdf::PdfViewer>,
+    }
+    impl gpui::Render for OffsetZoomProbe {
+        fn render(
+            &mut self,
+            _w: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+                .size_full()
+                .pt(gpui::px(HOST_OFFSET_TOP))
+                .pl(gpui::px(HOST_OFFSET_LEFT))
+                .child(self.pdf.clone())
+        }
+    }
+
     /// 新建一个「缩放雾感」测试的空 viewer 句柄容器（holder 依调用方持有的 Rc 生命周期）。
     fn zoom_holder(
     ) -> std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>> {
@@ -1159,7 +1196,7 @@ mod tests {
     /// **必须在测试体内直接遮蔽**：`let (_root, cx) = zoom_add_window(cx, &holder, name);`
     /// —— `add_window_view` 返回的 `&mut VisualTestContext` 借用自 `cx`（TestAppContext），
     /// 之后的一切 `cx.update`/`cx.simulate_event`/`cx.executor()` 都作用于新绑定 `cx`。
-    /// 容器 1500×900（页宽适配 ≈1160px）。复制 `pdf_ctrl_wheel_zooms_in_out` 的骨架。
+    /// 容器 1500×900（整页入屏 ≈636px，A4）。复制 `pdf_ctrl_wheel_zooms_in_out` 的骨架。
     fn zoom_add_window<'a>(
         cx: &'a mut gpui::TestAppContext,
         holder: &std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>>,
@@ -1199,9 +1236,51 @@ mod tests {
         (root, cx)
     }
 
+    /// **带真实容器偏移**的打开辅助（等价 [`zoom_add_window`]，但用 [`OffsetZoomProbe`]）：
+    /// 读物滚动容器相对窗口原点偏 `(left, top) = (84, 48)`（仿真生产壳层）。其余同
+    /// `zoom_add_window` 的口径与用法说明。
+    fn offset_zoom_add_window<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        holder: &std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>>,
+        pdf_name: &str,
+    ) -> (gpui::Entity<OffsetZoomProbe>, &'a mut gpui::VisualTestContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/{pdf_name}"));
+        assert!(path.exists(), "测试 PDF 应存在: {path:?}");
+        cx.update(crate::test_support::bind_local_keymaps);
+        let h = holder.clone();
+        let (root, cx) = cx.add_window_view(move |_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(path.clone(), cx));
+            *h.borrow_mut() = Some(pdf.clone());
+            OffsetZoomProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "测试 PDF 应加载完成");
+        for _ in 0..6 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+        }
+        (root, cx)
+    }
+
     /// 等「泵停 + 全部在途清空 + 非快速」的完整沉降（jump 测试同款 settle 谓词）。
     /// 仅调试/极端需要全渲染收敛时用；新测试默认用 [`zoom_wait_frames`]（机制断言无需等
-    /// worker 全量渲染——测试平台 2× DPI + debug 高密栅格极慢且时序抖动量级大）。
+    /// worker 全量渲染——测试平台 2× DPI + debug 下高密栅格极慢且时序抖动量级大）。
     #[allow(dead_code)]
     fn zoom_settle(
         cx: &mut gpui::VisualTestContext,
@@ -1281,9 +1360,17 @@ mod tests {
     }
 
     /// Ctrl+滚轮缩放事件构造（vertical pixel delta；向上 >0 放大、向下 <0 缩小）。
+    ///
+    /// **位置选左缘 `(10, 500)`（既有测试刻意钉在待存「视口顶锚」语义）**：真实 Ctrl+滚轮
+    /// 现在带鼠标焦点（`event.position` 进 [`PdfViewer::window_to_pt`]，命中页 → 鼠标锚）。
+    /// 为让这批 Z1/调度联测保持**无鼠标焦点 = 顶锚**原语义，位置须落在「任何 zoom/滚动态
+    /// 下都不可能命中页」的左缘留白：连续页列 `column_left ≥ PAGE_PAD_X(20)`（适配宽居中
+    /// `(view−pw)/2 ≥ pad`；横向溢出 wrap=pw+2pad → 恰 `pad`），`x=10 < 20` 恒在页左缘
+    /// 沟槽 → `window_to_pt → None` → 顶锚（与缩放无关）。鼠标锚语义由独立用例
+    /// (`zoom_mouse_anchor_*`) 用显式命中位置验证。
     fn zoom_wheel(control: bool, delta_y: f32) -> gpui::ScrollWheelEvent {
         gpui::ScrollWheelEvent {
-            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            position: gpui::point(gpui::px(10.), gpui::px(500.)),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
             modifiers: gpui::Modifiers {
                 control,
@@ -1291,6 +1378,37 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// Ctrl+滚轮缩放事件构造（**显式窗口位置**，鼠标锚测试用）：在 `pos` 处派发，验证
+    /// 缩放前后该处页面内容点钉在同一屏幕位置。
+    fn zoom_wheel_at(control: bool, delta_y: f32, pos: gpui::Point<gpui::Pixels>) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            position: pos,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// 页内 PDF 点 → 窗口坐标（测试探针，封装 [`PdfViewer::pt_to_window`]）。
+    fn pdf_pt_to_window(
+        cx: &mut gpui::VisualTestContext,
+        holder: &std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>>,
+        page: usize,
+        px: f32,
+        py: f32,
+    ) -> Option<gpui::Point<gpui::Pixels>> {
+        cx.update(|window, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            if page >= v.dims.len() {
+                return None;
+            }
+            Some(v.pt_to_window(window, page, px, py))
+        })
     }
 
     /// C 探针：**FullBand 仿射不能独立致雾**。合成 1px 高「文本 AA 边缘」灰度条带 → 双线性
@@ -1525,9 +1643,13 @@ mod tests {
         // 中间档请求出队即被 Z2 按世代 drop、不真实渲染（近免费队列入队空转），只抬高计数。
         // 上限 220：仍锁定「不逐档抢派瓦片」（若无节流/突发失控，8 档会随缩放宽高上千），
         // 同时容纳 #5 有意为之的收口突发。
+        // cover 上界（K177 演算，2026-11-20 整页入屏后几何）：连续模式页高 = 视口高（900），
+        // 收口 cover 窗 = 可见页 + 2×MARGIN = 1 + 2×3 = 7 页（旧满宽时 cover_scale 被
+        // COVER_SCALE_CAP=4.0 钉死、档间密度不变少重派 ≤6；contain-fit 后 zoom=1 密度
+        // ≈2.14 < cap，每 settle 重派一次窗量）。8 档仍只 1 次窗量（≈7），若逐档抢派应 ≥56。
         assert!(
-            d_cover <= 6,
-            "cover 不应逐档抢派：8 档净增 {d_cover}（收口一次性应≤窗口页数）"
+            d_cover <= 8,
+            "cover 不应逐档抢派：8 档净增 {d_cover}（收口一次性应≤窗口页数 ≈7）"
         );
         assert!(
             d_tile <= 220,
@@ -2253,6 +2375,883 @@ mod tests {
         );
     }
 
+    // ---- 鼠标焦点缩放锚（Ctrl+滚轮以鼠标所指页面点为焦点）----
+
+    /// **鼠标锚（连续 Continuous）**：Ctrl+滚轮缩放时，鼠标所指**页内 PDF 内容点**缩放
+    /// 前后钉在同一屏幕位置（y 轴 ≤0.5 逻辑 px；K190 参数化 zoom∈{0.5,1,2} ≠ 1 + 页内多
+    /// 取点）。x 轴仅在横向溢出（`max_sx > 0`）的量程内才有滚动空间可保——本参数取的
+    /// zoom≤2 无溢出（页列居中），x 断言由溢出示例（`zoom_mouse_anchor_continuous_overflow_*`）
+    /// 覆盖；页顶/页底边缘 clamp 导致的锚定失效由「软守卫跳过越可视点」规避（只验量程内）。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_continuous_point_stays_on_screen(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 滚到文档中部页（留足上下余量，防缩放触顶/触底 clamp 破坏锚定）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 10);
+
+        let mut failures: Vec<String> = Vec::new();
+        // 参数：初 zoom（0.5/1/2，K190） × 页内取点（宽/高比例；fy 取小值保证 zoom=2 时
+        // 页高 1800 > 视口 900 的可见上带内也有点可验，软守卫兜底）。
+        for &zoom0 in &[0.5f32, 1.0, 2.0] {
+            for &(fx, fy) in &[(0.5f32, 0.2f32), (0.5, 0.4), (0.3, 0.3), (0.7, 0.25)] {
+                // 基座：初 zoom（无焦点绝对缩放 → 顶锚，安全）→ 再滚回目标页位。
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                        v.set_zoom_abs(zoom0, cx);
+                        v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                        cx.notify();
+                    });
+                });
+                zoom_wait_frames(cx, 6);
+                // 取首可见页 + 页内 PDF 点 + 其窗口位。
+                let (page, dim, pos) = cx.update(|w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let sy = f32::from(-v.scroll.offset().y).max(0.0);
+                    let page =
+                        layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), sy);
+                    let dim = v.dims[page];
+                    let px = dim.0 * fx;
+                    let py = dim.1 * (1.0 - fy);
+                    let pos = v.pt_to_window(w, page, px, py);
+                    (page, dim, pos)
+                });
+                let pos_x = pos.x.as_f32();
+                let pos_y = pos.y.as_f32();
+                // 软守卫：锚点须落在可视区内（页可见即应成立；越界 → 边缘 clamp 工况，
+                // 直接跳过——本用例只验「量程内锚定精确」，clamp 语义由既有顶锚用例覆盖）。
+                if pos_x < 30.0 || pos_x > 1470.0 || pos_y < 30.0 || pos_y > 870.0 {
+                    eprintln!(
+                        "[mouse-anchor] skip zoom0={zoom0} ({fx},{fy}) pos=({pos_x:.0},{pos_y:.0}) 越可视"
+                    );
+                    continue;
+                }
+                // 在该处 Ctrl+滚轮放大一档（真实路径带鼠标焦点）。
+                cx.simulate_event(zoom_wheel_at(true, 240.0, pos));
+                zoom_wait_frames(cx, 6);
+                let (z1, after) = cx.update(|w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let after = v.pt_to_window(w, page, dim.0 * fx, dim.1 * (1.0 - fy));
+                    (v.zoom, after)
+                });
+                assert!(z1 > zoom0 + 1e-4, "放大应生效 zoom0={zoom0} → {z1}");
+                // 锚定精确性：缩放前后同 PDF 点应在同屏幕位（y 轴；本参数无横向溢出）。
+                let dy = (after.y.as_f32() - pos_y).abs();
+                if dy > 0.5 {
+                    failures.push(format!(
+                        "zoom0={zoom0} ({fx},{fy}) dy={dy:.3} pos=({pos_x:.1},{pos_y:.1})"
+                    ));
+                }
+                let _ = pos_x;
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "连续模式鼠标锚 y 应 ≤0.5 逻辑 px：{}",
+            failures.join(" | ")
+        );
+    }
+
+    /// **鼠标锚横向溢出（连续）**：zoom 大到横向溢出（`max_sx>0`，页列贴左缘可平移）时，
+    /// 鼠标 x 也须钉在屏幕原位（与 y 同式，缩放前后同点同屏）。放大 + 缩小双向验证（锚点
+    /// 被保持后仍在鼠标下，可连续以同一窗口位派发）。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_continuous_overflow_keeps_both_axes(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, mut cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 前提基座：zoom=3（连续 page_width≈1909 > 视口 → 溢出）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_zoom_abs(3.0, cx);
+                v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 8);
+        // 预置横向滚动（右移 150px）：给缩放双向留横向量程——连续溢出页列贴左缘（column_left
+        // = PAD=20），贴左缘缩小需负 scroll（越界 clamp）会试不出「量程内 x 锚定精确」。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let off = v.scroll.offset();
+                v.scroll
+                    .set_offset(gpui::point(gpui::px(off.x.as_f32() - 150.0), off.y));
+            });
+        });
+        zoom_wait_frames(cx, 4);
+        let (has_over, page, dim, pos) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let over = v.horizontal_overflow();
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let page = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), sy);
+            let dim = v.dims[page];
+            let px = dim.0 * 0.5;
+            let py = dim.1 * (1.0 - 0.3);
+            let pos = v.pt_to_window(w, page, px, py);
+            (over, page, dim, pos)
+        });
+        assert!(has_over, "前提：zoom=3 应横向溢出（max_sx>0）");
+        let mut failures: Vec<String> = Vec::new();
+        // 双向两档：放大 → 缩小回原档 → 再缩（保持 > 溢出阈值）。
+        for &(delta, label) in &[(240.0f32, "放大"), (-240.0, "缩小"), (-240.0, "再缩")] {
+            cx.simulate_event(zoom_wheel_at(true, delta, pos));
+            zoom_wait_frames(cx, 6);
+            let after = pdf_pt_to_window(&mut cx, &holder, page, dim.0 * 0.5, dim.1 * (1.0 - 0.3))
+                .expect("锚点应仍在页");
+            let dx = (after.x.as_f32() - pos.x.as_f32()).abs();
+            let dy = (after.y.as_f32() - pos.y.as_f32()).abs();
+            if dx > 0.5 || dy > 0.5 {
+                failures.push(format!("{label} dx={dx:.3} dy={dy:.3}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "连续溢出鼠标锚 dx/dy 应各 ≤0.5 逻辑 px：{}",
+            failures.join(" | ")
+        );
+    }
+
+    /// **鼠标锚（双页 Facing）**：分页页拍下 Ctrl+滚轮缩放，鼠标所指页内内容点缩放前后
+    /// 钉同屏（y ≤0.5px）。zoom≤2 无横向溢出量程 → 仅断 y；分页溢出 x 由
+    /// `zoom_mouse_anchor_facing_overflow_*` 验证。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_facing_point_stays_on_screen(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 切 Facing（真实路径 set_page_mode，等分页布局快照装配后再滚页——分页快照未就绪时
+        // scroll_to_page 回落连续 tops 会被后续分页布局打乱，须先 pump 建快照）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 12);
+        let mut failures: Vec<String> = Vec::new();
+        for &zoom0 in &[0.5f32, 1.0, 2.0] {
+            for &(fx, fy) in &[(0.5f32, 0.2f32), (0.5, 0.4), (0.3, 0.3)] {
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                        v.set_zoom_abs(zoom0, cx);
+                        v.scroll_to_page(50.min(v.page_count().saturating_sub(2)));
+                        cx.notify();
+                    });
+                });
+                zoom_wait_frames(cx, 6);
+                // 分页取「首可见行的行首页」作锚（页顶在视口内）。
+                let (page, dim, pos) = cx.update(|w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let guard = v.paged_layout_cell.borrow();
+                    let layout = guard.as_ref().expect("Facing 应有分页快照");
+                    let zoom = v.zoom.max(0.01);
+                    let content_top = f32::from(-v.scroll.offset().y).max(0.0);
+                    let vh = f32::from(v.scroll.bounds().size.height) / zoom;
+                    let sy_fit = -(content_top / zoom);
+                    let (r0, _) = layout
+                        .first_visible_row(sy_fit, vh)
+                        .expect("应有首可见行");
+                    let page = layout.row_page_start[r0];
+                    let dim = v.dims[page];
+                    let px = dim.0 * fx;
+                    let py = dim.1 * (1.0 - fy);
+                    let pos = v.pt_to_window(w, page, px, py);
+                    (page, dim, pos)
+                });
+                let pos_x = pos.x.as_f32();
+                let pos_y = pos.y.as_f32();
+                if pos_x < 30.0 || pos_x > 1470.0 || pos_y < 30.0 || pos_y > 870.0 {
+                    eprintln!(
+                        "[face-anchor] skip zoom0={zoom0} ({fx},{fy}) pos=({pos_x:.0},{pos_y:.0}) 越可视"
+                    );
+                    continue;
+                }
+                cx.simulate_event(zoom_wheel_at(true, 240.0, pos));
+                zoom_wait_frames(cx, 6);
+                let (z1, after) = cx.update(|w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let after = v.pt_to_window(w, page, dim.0 * fx, dim.1 * (1.0 - fy));
+                    (v.zoom, after)
+                });
+                assert!(z1 > zoom0 + 1e-4, "Facing 放大应生效 zoom0={zoom0} → {z1}");
+                let dy = (after.y.as_f32() - pos_y).abs();
+                if dy > 0.5 {
+                    failures.push(format!("zoom0={zoom0} ({fx},{fy}) dy={dy:.3}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Facing 鼠标锚 y 应 ≤0.5 逻辑 px：{}",
+            failures.join(" | ")
+        );
+    }
+
+    /// **鼠标锚横向溢出（双页 Facing）**：分页 spread > 视口（zoom 大）时，鼠标 x 也须
+    /// 钉在屏幕原位（与 y 同式）。放大 + 缩小双向，页码在文档中部保上下量程。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_facing_overflow_keeps_both_axes(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, mut cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+                v.set_zoom_abs(2.5, cx);
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 10);
+        // 两相：先等分页快照装配，再滚到中部行（快照缺位时 scroll_to_page 回落连续 tops
+        // 会被后续分页布局打乱 → 停在文档顶，缩小时贴顶 clamp 破坏本用例的锚定验证）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(50.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 6);
+        // 预置横向滚动（右移 150px）：分页同左缘贴边风险（见连续溢出用例注释）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                let off = v.scroll.offset();
+                v.scroll
+                    .set_offset(gpui::point(gpui::px(off.x.as_f32() - 150.0), off.y));
+            });
+        });
+        zoom_wait_frames(cx, 4);
+        let (page, dim, pos) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            // 前提：分页 spread > 视口（横向溢出）。
+            let guard = v.paged_layout_cell.borrow();
+            let layout = guard.as_ref().expect("Facing 应有分页快照");
+            let spread = layout.spread_max * v.zoom.max(0.01);
+            let viewport_w = f32::from(v.scroll.bounds().size.width);
+            assert!(spread > viewport_w, "前提：Facing spread={spread:.0} 应 > 视口 {viewport_w:.0}");
+            // 锁定 max_sx 修正（评审 nit）：分页横向滚动量程 = `spread_max×zoom − 视口`
+            // （行右缘可达）——若按连续口径 `page_width+2·PAD` 会把量程算小，分页横向
+            // 缩放锚被错误早钳（鼠标 x 失守）。DOM 内容宽 = spread_max×zoom（同 render）。
+            let max_sx_got = v.scroll.max_offset().x.as_f32();
+            let max_sx_expect = (spread - viewport_w).max(0.0);
+            assert!(
+                (max_sx_got - max_sx_expect).abs() < 1.0,
+                "Facing 横向滚动量程应 ≈ spread−视口={max_sx_expect:.0}，实际 max_offset.x={max_sx_got:.0}"
+            );
+            let zoom = v.zoom.max(0.01);
+            let content_top = f32::from(-v.scroll.offset().y).max(0.0);
+            let vh = f32::from(v.scroll.bounds().size.height) / zoom;
+            let sy_fit = -(content_top / zoom);
+            let (r0, _) = layout.first_visible_row(sy_fit, vh).expect("应有首可见行");
+            let page = layout.row_page_start[r0];
+            let dim = v.dims[page];
+            let px = dim.0 * 0.5;
+            let py = dim.1 * (1.0 - 0.3);
+            let pos = v.pt_to_window(w, page, px, py);
+            (page, dim, pos)
+        });
+        let mut failures: Vec<String> = Vec::new();
+        for &(delta, label) in &[(240.0f32, "放大"), (-240.0, "缩小"), (-240.0, "再缩")] {
+            cx.simulate_event(zoom_wheel_at(true, delta, pos));
+            zoom_wait_frames(cx, 6);
+            let after = pdf_pt_to_window(&mut cx, &holder, page, dim.0 * 0.5, dim.1 * (1.0 - 0.3))
+                .expect("锚点应仍在页");
+            let dx = (after.x.as_f32() - pos.x.as_f32()).abs();
+            let dy = (after.y.as_f32() - pos.y.as_f32()).abs();
+            if dx > 0.5 || dy > 0.5 {
+                failures.push(format!("{label} dx={dx:.3} dy={dy:.3}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Facing 溢出鼠标锚 dx/dy 应各 ≤0.5 逻辑 px：{}",
+            failures.join(" | ")
+        );
+    }
+
+    /// **鼠标锚回落（沟槽 → 顶锚）**：鼠标点不在页上（左缘沟槽 → `window_to_pt` None）→
+    /// Ctrl 滚轮缩放与「无焦点顶锚」完全一致（既有 Z1 公式）。断言：新滚动 y ==
+    /// `zoom_rescroll_anchor`（缩前 tops/sy/ratio 推导，深页常量区累计有区分度）。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_gutter_falls_back_to_top_anchor(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 深页（第 20 页）：PAGE_PAD_Y/GAP 常量区累计大、Z1 与「整段 ×ratio」差值显著。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(20.min(v.page_count().saturating_sub(1)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 8);
+        let (tops0, w0, sy0, dims0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.page_tops.clone(),
+                v.page_width(),
+                f32::from(-v.scroll.offset().y).max(0.0),
+                v.dims.clone(),
+            )
+        });
+        // 左缘沟槽（x=10 < column_left≥20，`window_to_pt` 必 None）派发 Ctrl 放大。
+        cx.simulate_event(zoom_wheel_at(
+            true,
+            240.0,
+            gpui::point(gpui::px(10.), gpui::px(400.)),
+        ));
+        zoom_wait_frames(cx, 6);
+        let (tops1, w1, sy1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.page_tops.clone(),
+                v.page_width(),
+                f32::from(-v.scroll.offset().y).max(0.0),
+            )
+        });
+        let ratio = w1 / w0;
+        let k = layout::first_visible_page(&dims0, &tops0, w0, sy0);
+        let expect = tops1[k] + (sy0 - tops0[k]) * ratio;
+        assert!(
+            (sy1 - expect).abs() < 1.0,
+            "沟槽鼠标应回落顶锚（zoom_rescroll_anchor）：expect={expect:.2} actual={sy1:.2}（K={k} ratio={ratio:.4}）"
+        );
+    }
+
+    // ---- 鼠标焦点缩放锚：真实宿主偏移查证 + 非溢出红测（2026-11-20 诊断线）----
+    //
+    // 一线：x 锚在**非溢出（fit、页宽<视口、页列居中）**下被 `max_sx=0` 夹回 0 →
+    // 页列重居中，鼠标 x 下的内容点横向漂移（用户报「①横向回中不跟鼠标」）。
+    // 二线：缩小时鼠标若在页内近边（off-center），x 重居中（一线缺陷）会把鼠标从
+    // 页内推到侧沟槽 → 下一档 `window_to_pt → None` → 回落**视口顶锚** → 鼠标 y
+    // 所指内容整段跳（用户报「②纵向不准」）。坐标空间（容器离窗原点 Δ）自洽性
+    // 由 `*_offset_host_*` 用例先取证（roundtrip 恒等 → 候选 a 不含常量偏移）。
+
+    /// 红测 ①：连续**非溢出**（fit，页宽<视口、页列居中）下鼠标在页内**偏离中心**处
+    /// Ctrl+滚轮放大一档 → 断言「该内容点缩放前后同屏 x」。
+    /// **现实现红**：`zoom_target_impl` 的 `new_x.clamp(0, max_sx)` 在非溢出时
+    /// `max_sx=0` → 0 → 页列回到居中，鼠标 x 下的内容点漂移 `(w2−w1)·(fx−0.5)`。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_nonoverflow_x_recentered_broken(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        // 基座：深页 + zoom=1（fit 非溢出：页宽≈636 < 视口 1500、页列居中、无横向滚动量程）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_zoom_abs(1.0, cx);
+                v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 8);
+        const FX: f32 = 0.7; // 页内偏右（偏离中心），放大后重居中 → x 漂移 (w2-w1)(FX-0.5)
+        const FY: f32 = 0.45;
+        let (page, dim, pos, w0, max_sx0, over0) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let page = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), sy);
+            let dim = v.dims[page];
+            let px_ = dim.0 * FX;
+            let py_ = dim.1 * (1.0 - FY);
+            let pos = v.pt_to_window(w, page, px_, py_);
+            (
+                page,
+                dim,
+                pos,
+                v.page_width(),
+                v.scroll.max_offset().x.as_f32(),
+                v.horizontal_overflow(),
+            )
+        });
+        assert!(!over0, "前提：zoom=1 应非横向溢出（max_sx={max_sx0:.1}）");
+        eprintln!(
+            "[x-red] 前提 page={page} w0={w0:.1} max_sx={max_sx0:.1} m=({:.1},{:.1})",
+            pos.x.as_f32(),
+            pos.y.as_f32()
+        );
+        // 放大一档（真实路径带鼠标焦点）。
+        cx.simulate_event(zoom_wheel_at(true, 240.0, pos));
+        zoom_wait_frames(cx, 6);
+        let (z1, w1, after, over1) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let after = v.pt_to_window(w, page, dim.0 * FX, dim.1 * (1.0 - FY));
+            (v.zoom, v.page_width(), after, v.horizontal_overflow())
+        });
+        assert!(z1 > 1.0 + 1e-4, "放大应生效 zoom0=1 → {z1}");
+        assert!(!over1, "前提：放大一档后应仍非溢出（页宽 {w1:.1} < 视口）");
+        let dx = (after.x.as_f32() - pos.x.as_f32()).abs();
+        let dy = (after.y.as_f32() - pos.y.as_f32()).abs();
+        eprintln!(
+            "[x-red] after zoom={z1:.3} w={w1:.1} m=({:.1},{:.1}) after=({:.1},{:.1}) dx={dx:.2} dy={dy:.2}（期望 dx≈{:.1}）",
+            pos.x.as_f32(),
+            pos.y.as_f32(),
+            after.x.as_f32(),
+            after.y.as_f32(),
+            (w1 - w0) * (FX - 0.5)
+        );
+        // 断言前先释放全局 pdfium 锁：红测在大批量中 panic 时不能毒化共享锁（K166）。
+        drop(_guard);
+        assert!(
+            dx <= 0.5,
+            "非溢出下鼠标 x 所指内容点缩放前后应同屏：dx={dx:.2}（现实现页列被夹回居中，红因=① 横向回中）"
+        );
+    }
+
+    /// 取证：**坐标空间自洽**（候选 a 排查）。读物容器相对窗口原点偏 Δ=(84,48)
+    /// （OffsetZoomProbe → `scroll.bounds().top/left ≠ 0`，仿真生产壳层）时：
+    /// 1) `window_to_pt(pt_to_window(p))` 往返应恒等——两相都用同一 `scroll.bounds()`，
+    ///    偏移早被消掉 → 若不成立即坐标空间/边界处理（候选 a）坐实；
+    /// 2) 单档放大 y 锚仍 ≤0.5 逻辑 px（偏移容器下现实现仍应精确）。
+    /// 若本条绿 → 候选 a（常量偏移）被证伪：真因在「非溢出 x 重居中 → 沟槽回落」线
+    /// （见 `zoom_mouse_anchor_nonoverflow_zoomout_mouse_into_gutter_y_jumps`）。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_offset_host_coord_roundtrip_and_y(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = offset_zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 30);
+        let (bounds, sf) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.scroll.bounds(), w.scale_factor())
+        });
+        eprintln!(
+            "[offset] 滚动容器 bounds=({:.1},{:.1})..({:.1},{:.1})（宿主偏移期望 Δ=({HOST_OFFSET_LEFT},{HOST_OFFSET_TOP})）sf={sf}",
+            bounds.left().as_f32(),
+            bounds.top().as_f32(),
+            bounds.right().as_f32(),
+            bounds.bottom().as_f32()
+        );
+        assert!(
+            (bounds.left().as_f32() - HOST_OFFSET_LEFT).abs() < 1.0
+                && (bounds.top().as_f32() - HOST_OFFSET_TOP).abs() < 1.0,
+            "偏移宿主应让滚动容器离窗原点 Δ=(84,48)：实际 left={:.1} top={:.1}",
+            bounds.left().as_f32(),
+            bounds.top().as_f32()
+        );
+        // 首可见页内取点 p → 窗口位 m（含容器偏移的真实窗口位）。
+        let (page, dim, m) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let page = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), sy);
+            let dim = v.dims[page];
+            let px_ = dim.0 * 0.5;
+            let py_ = dim.1 * (1.0 - 0.35);
+            let m = v.pt_to_window(w, page, px_, py_);
+            (page, dim, m)
+        });
+        assert!(
+            m.y.as_f32() > HOST_OFFSET_TOP + 5.0 && m.y.as_f32() < 870.0,
+            "锚点应在可视区：m.y={:.1}",
+            m.y.as_f32()
+        );
+        // 单档放大：y 锚仍精确（偏移容器下——若这里红即为候选 a「坐标空间/边界未消偏移」）。
+        cx.simulate_event(zoom_wheel_at(true, 240.0, m));
+        zoom_wait_frames(cx, 6);
+        let (after, z1) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let a = v.pt_to_window(w, page, dim.0 * 0.5, dim.1 * (1.0 - 0.35));
+            (a, v.zoom)
+        });
+        let dy = (after.y.as_f32() - m.y.as_f32()).abs();
+        let dx = (after.x.as_f32() - m.x.as_f32()).abs();
+        eprintln!(
+            "[offset] 放大一档 zoom={z1:.3} dx={dx:.2} dy={dy:.2}（y 应 ≤0.5；x 非溢出被居中→漂移，属 ① 缺陷）"
+        );
+        assert!(
+            dy <= 0.5,
+            "偏移容器下单档放大 y 锚应 ≤0.5 逻辑 px：dy={dy:.3}（若红 → 候选 a 坐标空间成立）"
+        );
+    }
+
+    /// 红测 ②：连续 fit 下鼠标在页内**近右缘**（fx=0.88），固定屏位连续**缩小**：
+    /// 页列因 x 重居中（① 缺陷）不断把鼠标位置推向页缘 → 某档 `window_to_pt` 失命中
+    /// （鼠标落进右侧沟槽，`focus → None`）→ 回落**视口顶锚**（`zoom_rescroll_anchor`，
+    /// 与鼠标无关）→ 鼠标 y 所指内容点整段跳（用户报「②纵向不准」）。
+    /// **现实现红**（第 3 档）：focus 变 None → dy 从 ≤0.5 跳到数十 px。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_nonoverflow_zoomout_mouse_into_gutter_y_jumps(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_zoom_abs(1.0, cx);
+                v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 8);
+        const FX: f32 = 0.88; // 近右缘：缩小重居中后最终落进右侧沟槽
+        const FY: f32 = 0.3;
+        let (page, dim, m) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let page = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), sy);
+            let dim = v.dims[page];
+            let px_ = dim.0 * FX;
+            let py_ = dim.1 * (1.0 - FY);
+            let m = v.pt_to_window(w, page, px_, py_);
+            (page, dim, m)
+        });
+        let (px_, py_) = (dim.0 * FX, dim.1 * (1.0 - FY));
+        eprintln!(
+            "[y-jump] 前提 page={page} fx={FX} m=({:.1},{:.1})",
+            m.x.as_f32(),
+            m.y.as_f32()
+        );
+        let mut failures: Vec<String> = Vec::new();
+        let mut seen_off_page: Option<usize> = None;
+        for notch in 0..5usize {
+            // 每档派发前先自查「鼠标屏位 m 是否仍在页内」——用**公开状态**复刻
+            // `window_to_pt` 的命中门（连续模式）：m 须落在「页 x-span（bounds.left +
+            // column_left(wrap, page_width)，非溢出下 scroll.x=0）」与「页 y-band
+            // （bounds.top + page_tops[page] − sy .. +display_height）」内。缩小重居中后
+            // 页窄 → m.x 掉出 x-span = 落进侧沟槽 → `window_to_pt → None` → 回落顶锚。
+            let (sy_before, w_before, on_page) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let pw = v.page_width();
+                let wrap = v
+                    .scroll
+                    .bounds()
+                    .size
+                    .width
+                    .as_f32()
+                    .max(pw + 2.0 * config::pdf::PAGE_PAD_X);
+                let span_l = v.scroll.bounds().left().as_f32()
+                    + layout::column_left(wrap, pw);
+                let span_r = span_l + pw;
+                let sy = f32::from(-v.scroll.offset().y).max(0.0);
+                let page_top_win = v.scroll.bounds().top().as_f32() + v.page_tops[page] - sy;
+                let page_bottom_win = page_top_win + layout::display_height(v.dims[page], pw);
+                let mx = m.x.as_f32();
+                let my = m.y.as_f32();
+                let on = mx >= span_l - 0.5
+                    && mx < span_r + 0.5
+                    && my >= page_top_win - 0.5
+                    && my < page_bottom_win + 0.5;
+                (sy, pw, on)
+            });
+            cx.simulate_event(zoom_wheel_at(true, -240.0, m));
+            zoom_wait_frames(cx, 6);
+            let (z1, sy_after, w_after, after) = cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let a = v.pt_to_window(w, page, px_, py_);
+                (
+                    v.zoom,
+                    f32::from(-v.scroll.offset().y).max(0.0),
+                    v.page_width(),
+                    a,
+                )
+            });
+            let dy = (after.y.as_f32() - m.y.as_f32()).abs();
+            let dx = (after.x.as_f32() - m.x.as_f32()).abs();
+            let focus_tag = if on_page { "on-page" } else { "沟槽(None)" };
+            if !on_page && seen_off_page.is_none() {
+                seen_off_page = Some(notch);
+            }
+            eprintln!(
+                "[y-jump] 档{notch} focus={focus_tag} zoom={z1:.3} w={w_before:.1}→{w_after:.1} sy={sy_before:.1}→{sy_after:.1} dx={dx:.1} dy={dy:.1}"
+            );
+            if dy > 1.0 {
+                failures.push(format!("档{notch} focus={focus_tag} dy={dy:.1}"));
+            }
+        }
+        if let Some(n) = seen_off_page {
+            eprintln!(
+                "[y-jump] ❗ 第 {n} 档起鼠标屏位已落进侧沟槽（x-span 外 → window_to_pt None）→ 回落视口顶锚"
+            );
+        }
+        // 断言前先释放全局 pdfium 锁：红测在大批量中 panic 时不能毒化共享锁（K166）。
+        drop(_guard);
+        assert!(
+            failures.is_empty(),
+            "鼠标 y 所指内容点每档都应钉在 m.y（≤1px）：{}；红因=② 纵向不准（x 重居中把鼠标推出页缘→顶锚回跳）",
+            failures.join(" | ")
+        );
+    }
+
+    /// 回归（2026-11-20，**沟槽兜底锚**，brief 修复向 #3）：连续 Ctrl+滚轮页内缩放一档
+    /// （刷新 `last_mouse_focus`）后，把鼠标移进**左缘沟槽**（x=10 < column_left ≥ PAD →
+    /// 本档 `window_to_pt` 必 None）再缩放一档——应沿用**上一档页内内容点**锚 **y**（该 PDF
+    /// 点钉在上一档屏位 m.y），不瞬回落视口顶锚整段跳。断言该内容点缩放后同屏 y（±1）；
+    /// 若走旧顶锚，深页顶锚与页内点锚差数十 px 必红（测得到真正防御路径，K173）。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_gutter_falls_back_to_last_inpage_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_zoom_abs(1.0, cx);
+                v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 8);
+        // 页内偏中点（fx=0.5：放大净 x 偏移 ≈0 → 兜底断言只盯 y）。
+        let (page, px_, py_, m) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let page = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), sy);
+            let dim = v.dims[page];
+            let px_ = dim.0 * 0.5;
+            let py_ = dim.1 * (1.0 - 0.35);
+            let m = v.pt_to_window(w, page, px_, py_);
+            (page, px_, py_, m)
+        });
+        eprintln!(
+            "[fallback] 前提 page={page} fx=0.5 m=({:.1},{:.1})",
+            m.x.as_f32(),
+            m.y.as_f32()
+        );
+        // 第 1 档：鼠标在页内 → 真实 focus（刷新 last_mouse_focus）。
+        cx.simulate_event(zoom_wheel_at(true, 240.0, m));
+        zoom_wait_frames(cx, 6);
+        // 第 2 档：鼠标移到左缘沟槽（x=10 < column_left ≥ PAD）→ 本档 None → 上一档兜底 y 锚。
+        cx.simulate_event(zoom_wheel_at(true, 240.0, gpui::point(gpui::px(10.), m.y)));
+        zoom_wait_frames(cx, 6);
+        let (after, z2) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.pt_to_window(w, page, px_, py_), v.zoom)
+        });
+        let dy = (after.y.as_f32() - m.y.as_f32()).abs();
+        let dx = (after.x.as_f32() - m.x.as_f32()).abs();
+        eprintln!("[fallback] 沟槽第2档后 zoom={z2:.3} dy={dy:.2} dx={dx:.2}");
+        drop(_guard);
+        assert!(
+            dy <= 1.0,
+            "沟槽兜底应沿用上一档页内内容点锚 y（防整段跳）：dy={dy:.2}（旧顶锚会跳数十 px）"
+        );
+    }
+
+    /// 回归（2026-11-20，brief #4：**Facing 非溢出同样生效**）：双页页拍（spread ≤ 视口，
+    /// zoom=1 fit）下 Ctrl+滚轮放大一档，鼠标所指页内内容点缩放前后同屏 x+y——经
+    /// `paged_display_rect` **唯一显示矩形**的 `x_zoom_offset` 叠加（与连续列同构，K153）。
+    /// 若偏移只在连续列生效，Facing 非溢出页会像红测①一样重居中 → dx 数十 px 必红。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_facing_nonoverflow_x_stays(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+                v.set_zoom_abs(1.0, cx);
+                v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 12);
+        let (page, dim, m) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let guard = v.paged_layout_cell.borrow();
+            let l = guard.as_ref().expect("Facing 应有分页快照");
+            let spread = l.spread_max * v.zoom.max(0.01);
+            let viewport_w = f32::from(v.scroll.bounds().size.width);
+            assert!(
+                spread <= viewport_w,
+                "前提：Facing zoom=1 spread={spread:.0} 应 ≤ 视口 {viewport_w:.0}（本用例测非溢出档）"
+            );
+            let zoom = v.zoom.max(0.01);
+            let content_top = f32::from(-v.scroll.offset().y).max(0.0);
+            let vh = f32::from(v.scroll.bounds().size.height) / zoom;
+            let sy_fit = -(content_top / zoom);
+            let (r0, _) = l.first_visible_row(sy_fit, vh).expect("应有首可见行");
+            let page = l.row_page_start[r0];
+            let dim = v.dims[page];
+            let px_ = dim.0 * 0.7;
+            let py_ = dim.1 * (1.0 - 0.35);
+            let m = v.pt_to_window(w, page, px_, py_);
+            (page, dim, m)
+        });
+        eprintln!(
+            "[facing-x] 前提 page={page} m=({:.1},{:.1})",
+            m.x.as_f32(),
+            m.y.as_f32()
+        );
+        cx.simulate_event(zoom_wheel_at(true, 240.0, m));
+        zoom_wait_frames(cx, 6);
+        let (after, z1) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.pt_to_window(w, page, dim.0 * 0.7, dim.1 * (1.0 - 0.35)), v.zoom)
+        });
+        let dx = (after.x.as_f32() - m.x.as_f32()).abs();
+        let dy = (after.y.as_f32() - m.y.as_f32()).abs();
+        eprintln!("[facing-x] 放大一档 zoom={z1:.3} dx={dx:.2} dy={dy:.2}");
+        drop(_guard);
+        assert!(
+            dx <= 0.5 && dy <= 0.5,
+            "Facing 非溢出下鼠标所指内容点缩放前后应同屏：dx={dx:.2} dy={dy:.2}"
+        );
+    }
+
+    /// 回归（评审 **D1，滑条不复位**）：页内 Ctrl+滚轮一档（非溢出，`last_mouse_focus=Some`
+    /// + 水平偏移生效）后，状态栏滑条 `set_zoom_abs`（**程序化，`window=None`**）应复位
+    /// 水平偏移归 0、`last_mouse_focus=None`（回中，与 `set_zoom` 一致）。此前 `zoom_target_impl`
+    /// 只判 `last_mouse_focus.is_none()` 会因上一档页内缩放留下的 `Some` 而不清 → 页列保持
+    /// 水平偏移不回中（违反复位契约）。用 pub(crate) 状态直读锁「归 0 / 清锚」两个对位量。
+    #[gpui::test]
+    async fn zoom_slider_set_zoom_abs_resets_nonoverflow_x_offset(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_zoom_abs(1.0, cx);
+                v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 8);
+        // 页内 fx=0.7 鼠标缩放一档（非溢出）→ 水平偏移生效 + 兜底锚置位。
+        let m = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let page = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), sy);
+            let dim = v.dims[page];
+            v.pt_to_window(w, page, dim.0 * 0.7, dim.1 * (1.0 - 0.45))
+        });
+        cx.simulate_event(zoom_wheel_at(true, 240.0, m));
+        zoom_wait_frames(cx, 6);
+        let (off_before, last_before, z) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.x_zoom_offset, v.last_mouse_focus.is_some(), v.zoom)
+        });
+        eprintln!(
+            "[D1] 鼠标缩放后 zoom={z:.3} off={off_before:.2} last={last_before}（前提：off≠0）"
+        );
+        assert!(
+            off_before.abs() > 0.5 && last_before,
+            "前提：页内鼠标缩放应置非溢出水平偏移 + 兜底锚：off={off_before:.2}"
+        );
+        // 滑条程序化绝对缩放（window=None）→ 应复位归中。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_zoom_abs(z * 1.25, cx);
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 4);
+        let (off_after, last_after) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.x_zoom_offset, v.last_mouse_focus)
+        });
+        eprintln!(
+            "[D1] 滑条 set_zoom_abs({:.3}) 后 off={:.2} last={}",
+            z * 1.25,
+            off_after,
+            last_after.is_some()
+        );
+        drop(_guard);
+        assert!(
+            off_after.abs() <= 1e-3 && last_after.is_none(),
+            "滑条 set_zoom_abs 应复位水平偏移归 0 + 清兜底锚：off={off_after:.3}（违反复位契约）"
+        );
+    }
+
+    /// 回归（评审 **D2，溢出↔非溢出跨档 x 跳**）：连续 Ctrl+滚轮**放大越过非溢出→溢出阈值**
+    /// （zoom=1 fit → 页宽+2·PAD 越过视口宽 ≈1460px）时，鼠标所指内容点**当档**仍须同屏 x
+    /// （≤0.5）——跨档增量要**扣除被移除通道（offset↔scroll）的旧值**：进溢出 `new_sx = sx +
+    /// delta − xoff_old`、回非溢出 `new_xoff = old_xoff − sx − delta`；否则当档鼠标 x 带
+    /// xoff_old/sx_old 失守几十 px。取 **fx=0.51**（近中）：非溢出段理想偏移 `−(w−w0)·0.01` ≤
+    /// 居中边距（全程不触夹），跨档前 offset ≈ −6.7px —— 旧实现进溢出档差这 ~7px → dx≈7 必红；
+    /// 修后每档 dx→0。
+    #[gpui::test]
+    async fn zoom_mouse_anchor_nonoverflow_overflow_cross_notch_x_stays(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        zoom_wait_frames(cx, 40);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_zoom_abs(1.0, cx);
+                v.scroll_to_page(40.min(v.page_count().saturating_sub(2)));
+                cx.notify();
+            });
+        });
+        zoom_wait_frames(cx, 8);
+        const FX: f32 = 0.51;
+        const FY: f32 = 0.3;
+        let (page, dim, m) = cx.update(|w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let page = layout::first_visible_page(&v.dims, &v.page_tops, v.page_width(), sy);
+            let dim = v.dims[page];
+            let m = v.pt_to_window(w, page, dim.0 * FX, dim.1 * (1.0 - FY));
+            (page, dim, m)
+        });
+        let (px_, py_) = (dim.0 * FX, dim.1 * (1.0 - FY));
+        eprintln!(
+            "[D2-cross] 前提 page={page} fx={FX} m=({:.1},{:.1})",
+            m.x.as_f32(),
+            m.y.as_f32()
+        );
+        let mut crossed = false;
+        let mut failures: Vec<String> = Vec::new();
+        // 固定屏位连续放大：非溢出多档（偏移逐档累加）→ 第 ~9 档新 `max_sx>0` 越阈值。
+        for notch in 0..12usize {
+            cx.simulate_event(zoom_wheel_at(true, 240.0, m));
+            zoom_wait_frames(cx, 6);
+            let (z, over, w, after) = cx.update(|w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.zoom, v.horizontal_overflow(), v.page_width(), v.pt_to_window(w, page, px_, py_))
+            });
+            if over {
+                crossed = true;
+            }
+            let dx = (after.x.as_f32() - m.x.as_f32()).abs();
+            let dy = (after.y.as_f32() - m.y.as_f32()).abs();
+            if dx > 0.5 || dy > 0.5 {
+                failures.push(format!("档{notch} over={over} zoom={z:.3} w={w:.0} dx={dx:.2} dy={dy:.2}"));
+            }
+        }
+        eprintln!("[D2-cross] crossed={crossed} failures={}", failures.len());
+        drop(_guard);
+        assert!(
+            crossed,
+            "前提：12 档放大应已跨过非溢出→溢出阈值（否则本用例未测到 D2 跨档路径）"
+        );
+        assert!(
+            failures.is_empty(),
+            "跨档缩放下鼠标所指内容点每档应同屏 xy（≤0.5）：{}",
+            failures.join(" | ")
+        );
+    }
+
     /// Z2.1 回归：缩放 armed 首帧把「缩放中间档」在途 cover 直接清除（预算即释、不占
     /// COVER_INFLIGHT），防抖收口后只派最终档 cover（队列不被旧档占死 → 时锐时糊根治）。
     /// 注入 3 枚过期档 pending_cover（scale≠当前 cscale）→ armed 首帧 `drop_stale_scale_pending`
@@ -2550,8 +3549,20 @@ mod tests {
         eprintln!("[#3rev] center={center} cscale={cscale:.2} have_base={have_base}");
         assert!(have_base, "armed 应持有手势前那张高密底图（cover 或 prev_cover 桥）");
         // —— 阶段 A：armed 期（防抖计时会清 armed，每帧 run 前回钉保持 armed 观测）——
-        // 断言：**无新中心满密 cover 派发**（pending_cover 无当前档条目——中心 cover 派发
-        // 已从 open.rs armed 块撤除；drop_stale 逐帧清旧档）且底基保持（cover/prev_cover 驻留）。
+        // 断言：**armed 期中心页不再新增满密 cover 派发**且**底基驻留**（cover/prev_cover）。
+        //
+        // 2026-11-20 整页入屏（contain-fit）后几何变化（K177 演算）：zoom=1 cover 密度由
+        // 旧满宽 1460 的 cap 截断 4.0 降至 ≈2.14（未截断）→ 缩放手势边界（1.0→1.12）档间
+        // 密度改变 → 手势起步的首个非 armed 帧会合法派出一枚**当前档**满密 cover 在途（到达
+        // 即被 `collect_cover_results` 的 armed 守卫丢弃、不入槽，不换底——视觉「零满密换底」
+        // 契约仍在，只多一次手势边界档渲染）。故把「armed 观察窗起点已在途的该档 cover」当
+        // 基线，**只抓「armed 期间新增/换档的派发」**（逐档抢派以新档 scale 出现 ≠ 基线）；
+        // 基线条目被掷弃/入槽移除（pending 变 None）属合法消耗，不算新派发。`pending_cover`
+        // 同页守卫保证不会重复派同一档 → 无漏判。
+        let baseline_inflight = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            v.pending_cover.get(&center).map(|(sc, _, _, _)| *sc)
+        });
         let mut no_dispatch = false;
         for _ in 0..6 {
             cx.executor().advance_clock(Duration::from_millis(16));
@@ -2568,15 +3579,13 @@ mod tests {
                 if !v.zoom_armed {
                     return false;
                 }
-                // 无「当前档满密 cover」在途：不是「刚派的新满密」（旧档已被 drop_stale 清掉）。
-                let no_inflight = !v
-                    .pending_cover
-                    .get(&center)
-                    .is_some_and(|(sc, _, _, _)| (sc - cscale).abs() <= 1e-3);
+                // 中心页在途满密 = 基线那枚（或已被消耗→None）；出现新/换档 scale = 逐档抢派。
+                let inflight = v.pending_cover.get(&center).map(|(sc, _, _, _)| *sc);
+                let no_new = inflight.is_none() || inflight == baseline_inflight;
                 // 底基仍驻留（手势前那张，未被置换/清空）。
                 let base_held = v.slots[center].cover.is_some()
                     || v.slots[center].prev_cover.is_some();
-                no_inflight && base_held
+                no_new && base_held
             });
             if no_dispatch {
                 break;
@@ -2584,7 +3593,7 @@ mod tests {
         }
         assert!(
             no_dispatch,
-            "armed 手势期中心页不得有新满密 cover 派发（在途无当前档）且底基必须驻留——零满密换底新契约：center={center}"
+            "armed 手势期中心页不得新增满密 cover 派发（在途仅限手势边界基线档）且底基必须驻留——零满密换底新契约：center={center}"
         );
         // —— 阶段 B：settle（防抖到期清 armed）→ 常态收口按最终 cscale 派满密 cover ——
         // 确定性断言「派发已发生」（计入 pending_cover，不依赖 worker 渲染完成）。
@@ -3523,13 +4532,26 @@ mod tests {
         for _ in 0..3 {
             cx.run_until_parked();
         }
+        // 强制重绘 + 泵：测试平台假时钟不自动重绘 → 滚动容器在无 refresh 时保持未布局态
+        // （bounds=0 → ensure_window 回退窗口默认 1920×1080）。显式 refresh 驱动容器布局到
+        // 真实 1200×900（同 `pdf_resize_refits_page_width` 的 pump / `pdf_column_centers` 口径），
+        // 使 contain-fit 基线按真实容器尺寸算（否则读回退值 764，非本测试意图的几何）。
+        for _ in 0..10 {
+            let _ = cx.update(|w, _| w.refresh());
+            cx.run_until_parked();
+        }
         let (w0, total0) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (v.page_width(), v.total_height)
         });
+        // 整页入屏（contain-fit，K177 演算）：宿主容器 1200×900（ZoomProbe w=1200、h_full）、
+        // pdf测试.pdf A4 (595.28, 841.89) → doc_min_ar ≈ 0.707087、content_w = 1200−2×20
+        // = 1160、fit = 900×0.707087 ≈ 636.38 → base_w = min(1160, 636.38) ≈ 636.38
+        // （不再是旧满宽 1160；与 Facing 同窗 cell_w=636.4 同口径）。
+        let fit_w = 900.0 * (595.28_f32 / 841.89); // ≈ 636.38
         assert!(
-            (w0 - (1200.0 - 2.0 * config::pdf::PAGE_PAD_X)).abs() < 2.0,
-            "初始页宽应适应宿主容器宽（1200 − 2·pad）：{w0}"
+            (w0 - (1200.0 - 2.0 * config::pdf::PAGE_PAD_X).min(fit_w)).abs() < 2.0,
+            "初始页宽应整页入屏（min(内容宽 1160, 视口高×min_ar≈636.4)）：{w0}"
         );
         // 先滚到第 5 页，留出纵向滚动余量；布局稳定后记录滚动偏移作为缩放锚点
         cx.update(|_w, cx| {
@@ -3556,7 +4578,9 @@ mod tests {
         });
 
         let wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
-            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            // 左缘沟槽（x=10 < column_left≥20）：本 Z1「顶锚不滚」语义测试不喂鼠标焦点
+            // （命中页会变鼠标锚；鼠标锚语义由 `zoom_mouse_anchor_*` 独立覆盖）。
+            position: gpui::point(gpui::px(10.), gpui::px(500.)),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
             modifiers: gpui::Modifiers {
                 control,
@@ -3704,6 +4728,12 @@ mod tests {
         for _ in 0..3 {
             cx.run_until_parked();
         }
+        // 强制重绘 + 泵（同 pdf_ctrl_wheel_zooms_in_out）：驱动滚动容器布局到真实 1200×900，
+        // 使整页入屏基线按真实容器尺寸（min(1160, 900×0.7071≈636.4)=636.4）计算。
+        for _ in 0..10 {
+            let _ = cx.update(|w, _| w.refresh());
+            cx.run_until_parked();
+        }
 
         // ---- 阶段 1（适配宽）：真实拖选命中文本 → 选中 + 弹卡，panning 必须为 false ----
         // 同步预热文本层（`load_text_for_test` 阻塞等 worker），再扫字符盒定位**视口内**
@@ -3769,7 +4799,9 @@ mod tests {
             cx.run_until_parked();
         }
         let wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
-            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            // 左缘沟槽（x=10 < column_left≥20）：本 Z1「顶锚不滚」语义测试不喂鼠标焦点
+            // （命中页会变鼠标锚；鼠标锚语义由 `zoom_mouse_anchor_*` 独立覆盖）。
+            position: gpui::point(gpui::px(10.), gpui::px(500.)),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
             modifiers: gpui::Modifiers {
                 control,
@@ -3777,7 +4809,9 @@ mod tests {
             },
             ..Default::default()
         };
-        for _ in 0..2 {
+        // 6 档（×1.12^6 ≈ 1.974，K177）：连续基线已整页入屏 base_w≈636.4（Pod 容器 1200），
+        // 需放大到 636.4×1.974 ≈ 1256 > 1200 容器宽才横向溢出（旧满宽 1160 仅 2 档即溢出）。
+        for _ in 0..6 {
             cx.simulate_event(wheel(true, 240.0));
             for _ in 0..4 {
                 cx.run_until_parked();
@@ -3787,7 +4821,7 @@ mod tests {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (v.scroll.max_offset().x.as_f32() > 1.0, v.scroll.offset())
         });
-        assert!(overflow, "Ctrl+滚轮放大 2 档后应横向溢出");
+        assert!(overflow, "Ctrl+滚轮放大 6 档后应横向溢出");
 
         // 在页内按下 → 进入平移 → **向左拖 120px** → 松手。「跟手」语义：页面随光标移动，
         // 左缘（offset.x=0）时向右拖无内容可露（precise clamp 到 0），向左拖即露出被截断
@@ -3885,18 +4919,22 @@ mod tests {
             })
         };
 
-        // ① 宽窗：页宽 = 容器宽 − 2·页边距（自适应窗口宽），zoom 保持 1.0。
+        // ① 宽窗 1500×900：整页入屏（contain-fit，K177 演算）——页宽 = min(容器−2·pad,
+        //   视口高×min_ar) = min(1460, 900×595.28/841.89≈636.4) = 636.4（zoom 保持 1.0；
+        //   容器再宽也只到「整页入屏」宽，不再满宽跟随）。与 Facing 同窗 cell_w 同口径。
         pump(cx);
         let (w_wide, z0, total_wide, container_wide) = read(cx);
+        let doc_ar = 595.28_f32 / 841.89; // pdf测试.pdf A4 min(w/h) ≈ 0.7071
         assert!(
-            (w_wide - (container_wide - 2.0 * pad)).abs() < 2.0,
-            "宽窗应适应容器宽 {container_wide}：期望 {}，实际={w_wide}",
-            container_wide - 2.0 * pad
+            (w_wide - (container_wide - 2.0 * pad).min(900.0 * doc_ar)).abs() < 2.0,
+            "宽窗应整页入屏（min(容器−2pad, 900×0.7071≈636.4)）：期望 {}，实际={w_wide}",
+            (container_wide - 2.0 * pad).min(900.0 * doc_ar)
         );
         assert!(w_wide > 200.0, "页宽应明显非零：{w_wide}");
         assert!((z0 - 1.0).abs() < 1e-4, "起始 zoom 应保持 1.0：{z0}");
 
-        // ② 拉窄窗口 → 页宽跟容器变小（自适应重排），zoom 倍率不变，整列高缩小。
+        // ② 拉窄窗口 900×700 → 页宽 = min(860, 700×0.7071≈495.0) = 495.0（zoom 倍率不变，
+        // 整列高缩小——仍与容器宽联动，只是高度轴限幅主导）。
         cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
         pump(cx);
         let (w_narrow, z1, total_narrow, container_narrow) = read(cx);
@@ -3905,9 +4943,9 @@ mod tests {
             "容器应变窄：{container_wide} → {container_narrow}"
         );
         assert!(
-            (w_narrow - (container_narrow - 2.0 * pad)).abs() < 2.0,
-            "窄窗应自适应到容器宽 {container_narrow}：期望 {}，实际={w_narrow}",
-            container_narrow - 2.0 * pad
+            (w_narrow - (container_narrow - 2.0 * pad).min(700.0 * doc_ar)).abs() < 2.0,
+            "窄窗应整页入屏（min(容器−2pad, 700×0.7071≈495.0)）：期望 {}，实际={w_narrow}",
+            (container_narrow - 2.0 * pad).min(700.0 * doc_ar)
         );
         assert!(w_narrow < w_wide, "页宽应变小：{w_wide} → {w_narrow}");
         assert!((z1 - z0).abs() < 1e-4, "resize 不应改 zoom 倍率：{z0}→{z1}");
@@ -3916,13 +4954,13 @@ mod tests {
             "页宽收窄后整列高应随之减小：{total_wide} → {total_narrow}"
         );
 
-        // ③ 拉回宽窗 → 页宽弹回适配宽度（zoom 仍保持）。
+        // ③ 拉回宽窗 1500×900 → 页宽弹回整页入屏宽（zoom 仍保持）。
         cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
         pump(cx);
         let (w_back, z2, _, container_back) = read(cx);
         assert!(
-            (w_back - (container_back - 2.0 * pad)).abs() < 2.0,
-            "拉回宽窗应恢复适配宽 {container_back}：实际={w_back}"
+            (w_back - (container_back - 2.0 * pad).min(900.0 * doc_ar)).abs() < 2.0,
+            "拉回宽窗应恢复整页入屏宽（min(容器−2pad, 900×0.7071≈636.4)）：实际={w_back}"
         );
         assert!(w_back > w_narrow, "拉宽后页宽应更大：{w_narrow} → {w_back}");
         assert!((z2 - z0).abs() < 1e-4, "全程不应改 zoom 倍率：{z0}→{z2}");
@@ -5034,7 +6072,9 @@ mod tests {
         // ⚠️ 必须走真实滚轮事件触发 `on_scroll_wheel` 的重排（直接改 `v.zoom` 会让布局/滚动
         // 锚点失配 → 可见区间虚增 → 封面/瓦片翻倍，测不出真实数）。
         let zoom_wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
-            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            // 左缘沟槽（x=10 < column_left≥20）：不喂鼠标焦点 → 顶锚，保既有调度/内存
+            // 语义（鼠标锚由独立 `zoom_mouse_anchor_*` 用例覆盖）。
+            position: gpui::point(gpui::px(10.), gpui::px(500.)),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
             modifiers: gpui::Modifiers {
                 control,
@@ -5215,7 +6255,9 @@ mod tests {
         }
         // Ctrl+滚轮推到 zoom≈2.4（12%/档 × ~9 档）。
         let zoom_wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
-            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            // 左缘沟槽（x=10 < column_left≥20）：不喂鼠标焦点 → 顶锚，保既有调度/内存
+            // 语义（鼠标锚由独立 `zoom_mouse_anchor_*` 用例覆盖）。
+            position: gpui::point(gpui::px(10.), gpui::px(500.)),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
             modifiers: gpui::Modifiers {
                 control,
@@ -7421,7 +8463,9 @@ mod tests {
 
         // Ctrl+滚轮放大到 ~2.48 渲染密度（用户实测档）
         let zoom_wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
-            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            // 左缘沟槽（x=10 < column_left≥20）：不喂鼠标焦点 → 顶锚，保既有调度/内存
+            // 语义（鼠标锚由独立 `zoom_mouse_anchor_*` 用例覆盖）。
+            position: gpui::point(gpui::px(10.), gpui::px(500.)),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
             modifiers: gpui::Modifiers {
                 control,
@@ -10341,6 +11385,445 @@ mod tests {
             "切回后页内 frac 应≈0.5 保留：实况 {f2}"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // 诊断红测（K144/K177/K182）：Facing 读「一行 spread 的右页（奇页）」→ 切 Continuous
+    // 丢失读者实际页（整页回退），进提示的「跳到不同页」。
+    // 根因（file:line 见报告）：reading_progress() 分页分支（open.rs:453-458）恒返回
+    // `page = row_page_start[r0]`——**行的左/偶页**，r0 行的右/奇页即使正被阅读也不进
+    // `(page, frac)`；ensure_window 连续分支（open.rs:1727-1733）按 `k = page` 落地
+    // → 锚到行左页顶 + frac×左页高 → 视口整体回退一页（右页读者所见「内容跳走」）。
+    //
+    // 红测形态 = 往返零漂移（确定性能钉「读者实际在读的页」，无需猜测在哪一列）：
+    //   连续定位「第 10 页（index 9，Facing 行的右列）中部 frac≈0.5，current_page=10」
+    //   → 切 Facing（restore 分页分支 r=9/2=4 → 行 4 = 页 9|10，页 10 在右列，
+    //     reading_progress 实况却捕获行左页 index 8、frac≈0.5）
+    //   → 切回 Continuous → 应仍第 10 页 (index 9, frac 0.5)、current_page=10。
+    //   实况（bug）：回落后 first_visible_page = index 8 → current_page=9，整页回退。
+    //
+    // 演算（K177，pdf测试2.pdf 全 A4 793×1123 AR≈0.70614、窗口 1500×900、zoom=1）：
+    //   连续：base_w = min(1460, 900×AR≈635.5) = 635.5 → disp_h≈900；page_tops[9] =
+    //     PAGE_PAD_Y + 9×(900+6) = 20+8154 = 8174；sy = page_tops[9] + 0.5×disp_h
+    //     → first_visible_page = index 9（1 基页 10）、reading_progress (9, 0.5)。
+    //   Facing：cell_w = min((1460−1)/2=729.5, 900×AR≈635.5)=635.5 → cell_h≈900；
+    //     row_top[4] = 20+4×906 = 3644。restore 分页分支 sy = 3644 + 0.5×900 = 4094
+    //     → first_visible_row = 4（页区间 [8,9] 含页 10）；reading_progress 分页分支
+    //     捕获 page = row_page_start[4] = 8（左页，**丢失右页 9**）、frac = (4094−3644)/900
+    //     ≈ 0.5。current_page（分页）= row_page_start[4]+1 = 9。
+    //   Facing→Continuous：restore 连续分支 k = 8 → sy = page_tops[8] + 0.5×900
+    //    → first_visible_page = 8 → current_page = 9（期望 10）→ 红。
+    // 命名带 `zoom`（z 排后）：红测 panic 会毒化共享 pdfium 锁（test_util::lock）级联后续
+    // 同进程测试——排在既有 mode_switch_* 之后，保证全量 filter 跑时既有 3 条通过仍先绿。
+    #[gpui::test]
+    async fn mode_switch_zoom_facing_right_page_to_continuous_preserves_odd_focused_page(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        // 红测毒化共享 pdfium 锁后仍要跑自己断言：锁容错获取（本进程串行、无并发 pdfium）。
+        let _guard = crate::pdf::test_util::lock().lock().unwrap_or_else(|e| e.into_inner());
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                v.set_zoom(1.0);
+            });
+        });
+        zoom_wait_frames(cx, 4);
+        // 连续：定位第 10 页（index 9）中部 frac=0.5（live page_tops 手算，K177 演算）。
+        let sy0 = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            assert!(v.page_count() >= 10, "夹具应 ≥10 页，实际 {}", v.page_count());
+            let disp_h = v
+                .page_tops
+                .get(1)
+                .zip(v.page_tops.first())
+                .map(|(t1, t0)| t1 - t0 - config::pdf::PAGE_GAP)
+                .expect("应有连续页高");
+            v.page_tops[9] + 0.5 * disp_h
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                v.scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(-sy0)));
+            });
+        });
+        zoom_wait_frames(cx, 8);
+        let (p0, f0, cp0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let rp = v.reading_progress().map(|(p, f, _)| (p, f)).expect("应读到进度");
+            (rp.0, rp.1, v.current_page().map(|(p, _)| p).unwrap_or(0))
+        });
+        assert_eq!(p0, 9, "前提：连续应定位第 10 页（index 9），实况 {p0}");
+        assert_eq!(cp0, 10, "前提：连续 current_page 应为 10，实况 {cp0}");
+        assert!(
+            (f0 - 0.5).abs() < 0.02,
+            "前提：连续页内 frac≈0.5，实况 {f0}"
+        );
+        // 切 Facing：restore 分页分支 r=9/2=4 → 行 4（页 9|10）顶 + 0.5×行高。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        paged_settle(cx, &holder);
+        // Facing 实况取证（bug 证据）：首可见行应含页 10；reading_progress 却捕获行左页 index 8。
+        let (facing_page, capt_page, capt_frac, row_has_10) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let l = v.paged_layout_cell.borrow();
+            let l = l.as_ref().expect("Facing 应有分页快照");
+            let zoom = v.zoom.max(0.01);
+            let sy = f32::from(-v.scroll.offset().y).max(0.0);
+            let vh = f32::from(v.scroll.bounds().size.height);
+            let (r0, _) = l
+                .first_visible_row(-(sy / zoom), vh / zoom)
+                .expect("应有首可见行");
+            let vis_start = l.row_page_start[r0];
+            let vis_end = l.row_page_start[r0 + 1].saturating_sub(1);
+            let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+            (
+                v.current_page().map(|(p, _)| p).unwrap_or(0),
+                rp.0,
+                rp.1,
+                vis_start <= 9 && 9 <= vis_end,
+            )
+        });
+        assert!(
+            row_has_10,
+            "前提：Facing 首可见行应含第 10 页（index 9），实况 facing_page={facing_page}"
+        );
+        eprintln!(
+            "[DIAG] 切 Facing 后：current_page={facing_page}（行左页），reading_progress 捕获 (page={capt_page}, frac={capt_frac:.3})——捕获的竟是行左偶页 index {capt_page}，右列奇页 index 9 已丢失"
+        );
+        // 切回 Continuous：应回到读者实际在读的页——第 10 页（index 9、frac 0.5）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Continuous, cx);
+            });
+        });
+        zoom_wait_frames(cx, 10);
+        let (pm, cp1, p1, f1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+            (
+                v.page_mode(),
+                v.current_page().map(|(p, _)| p).unwrap_or(0),
+                rp.0,
+                rp.1,
+            )
+        });
+        eprintln!(
+            "[DIAG] 切回 Continuous：pm={pm:?} current_page={cp1} reading_progress=(page={p1}, frac={f1:.3})——期望 current_page=10=(index 9)、frac 0.5"
+        );
+        assert_eq!(
+            pm,
+            crate::pdf::view::PageMode::Continuous,
+            "切回应为 Continuous"
+        );
+        // 红测断言（用户可感知）：往返后应仍在第 10 页（index 9）、frac≈0.5 保留。
+        assert!(
+            cp1 == 10,
+            "Facing→Continuous 往返应仍回到切前读的第 10 页（current_page=10）：实况 {cp1}——Facing 侧把读者实际在读的右列奇页(index 9)捕获成行左页(index 8)，连续侧按 index 8 锚定，整页回退（用户所见「跳到不同页」）"
+        );
+        assert!(
+            p1 == 9,
+            "往返后 reading_progress 页应为第 10 页（index 9）：实况 {p1}（=index {p1} 第 {} 页）",
+            p1 + 1
+        );
+        assert!(
+            (f1 - 0.5).abs() < 0.05,
+            "往返后页内 frac 应≈0.5 保留：实况 {f1}"
+        );
+    }
+
+    /// 诊断红测（K190 参数化，同根因）：同一 Facing 右列奇页→连续 丢页 bug 在
+    /// **zoom≠1**（0.75 / 1.5）同样成立。frac 是无量纲比例（Facing 行高 × zoom 与连续
+    /// 页高 × zoom 同比伸缩），page 选择根本不依赖 zoom——只依赖「行左页 vs 行右页」的
+    /// 二分/整除（r=page/cols），故 off-by-one 页回退随 zoom 不变。往返零漂移契约同
+    /// 上：连续第 10 页（index 9）中部 → Facing → 切回 Continuous 应仍第 10 页。
+    /// 命名带 `zoom`（z 排后）：红测 panic 毒化共享 pdfium 锁，排后避免干扰既有绿测。
+    #[gpui::test]
+    async fn mode_switch_zoom_facing_right_page_roundtrip_preserves_odd_page_any_zoom(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        // 红测毒化共享 pdfium 锁后仍要跑自己断言：锁容错获取（本进程串行、无并发 pdfium）。
+        let _guard = crate::pdf::test_util::lock().lock().unwrap_or_else(|e| e.into_inner());
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        for zoom in [0.75f32, 1.5] {
+            // 连续：绝对缩放 → 定位第 10 页（index 9）中部 frac=0.5（live page_tops 手算）。
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                    v.set_zoom(zoom);
+                });
+            });
+            zoom_wait_frames(cx, 4);
+            let sy0 = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let disp_h = v
+                    .page_tops
+                    .get(1)
+                    .zip(v.page_tops.first())
+                    .map(|(t1, t0)| t1 - t0 - config::pdf::PAGE_GAP)
+                    .expect("应有连续页高");
+                v.page_tops[9] + 0.5 * disp_h
+            });
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                    v.scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(-sy0)));
+                });
+            });
+            zoom_wait_frames(cx, 6);
+            let (p0, f0, cp0) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let rp = v.reading_progress().map(|(p, f, _)| (p, f)).expect("应读到进度");
+                (rp.0, rp.1, v.current_page().map(|(p, _)| p).unwrap_or(0))
+            });
+            assert_eq!(p0, 9, "zoom={zoom} 前提：连续应定位第 10 页（index 9），实况 {p0}");
+            assert_eq!(cp0, 10, "zoom={zoom} 前提：current_page 应为 10，实况 {cp0}");
+            assert!(
+                (f0 - 0.5).abs() < 0.02,
+                "zoom={zoom} 前提：页内 frac≈0.5，实况 {f0}"
+            );
+            // → Facing（r=9/2=4）→ 切回 Continuous。
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                    v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+                });
+            });
+            paged_settle(cx, &holder);
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                    v.set_page_mode(crate::pdf::view::PageMode::Continuous, cx);
+                });
+            });
+            zoom_wait_frames(cx, 10);
+            let (cp1, p1, f1) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+                (
+                    v.current_page().map(|(p, _)| p).unwrap_or(0),
+                    rp.0,
+                    rp.1,
+                )
+            });
+            eprintln!(
+                "[DIAG-zoom] zoom={zoom} 往返后 current_page={cp1} reading_progress=(page={p1}, frac={f1:.3})——期望 (10, index 9, 0.5)"
+            );
+            assert!(
+                cp1 == 10 && p1 == 9,
+                "zoom={zoom} 往返应仍回到第 10 页（current_page=10, page index=9）：实况 current_page={cp1}, page={p1}——Facing 侧按行左页(index 8)回退一页"
+            );
+            assert!(
+                (f1 - 0.5).abs() < 0.05,
+                "zoom={zoom} 往返后页内 frac 应≈0.5 保留：实况 {f1}"
+            );
+        }
+    }
+
+    /// 等价覆盖红测（K190 参数化：奇偶双列 + 多 zoom）+ 既有红测 2 钉奇页（右列）：本测试
+    /// 补齐**偶页（左列）对称面** + zoom∈{1.2, 2.0} 档——连续→Facing→连续 往返零漂移
+    /// 对两列都成立。机制（sticky 列记忆 → 精确换算，open.rs `facing_anchor_col`）：
+    /// Facing restore 按恢复页 `page % cols` 钉列，`reading_progress` 分页分支按同列解析
+    /// prop `page = row_page_start[r0] + facing_anchor_col`、frac 分母用 `cell_h[page]`
+    /// （页内比例）→ 偶页（index 8, col 0）与奇页（index 9, col 1）往返互为精确逆。
+    /// K190：zoom 是纯倍数，页/列选择是整除/取模（`r = page/cols`、`col = page % cols`）→
+    /// 往返结果随 zoom 不变（与既有红测 0.75/1.5 结论同源）。
+    #[gpui::test]
+    async fn mode_switch_facing_roundtrip_preserves_odd_and_even_page_any_zoom(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        // 红测毒化共享 pdfium 锁后仍要跑自己断言：锁容错获取（本进程串行、无并发 pdfium）。
+        let _guard = crate::pdf::test_util::lock().lock().unwrap_or_else(|e| e.into_inner());
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        for zoom in [0.75f32, 1.2, 2.0] {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                    v.set_zoom(zoom);
+                });
+            });
+            zoom_wait_frames(cx, 4);
+            for target in [8usize, 9] {
+                // 连续：定位目标页中部 frac=0.5（live page_tops 手算，K177 演算）。
+                let sy0 = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    assert!(v.page_count() > target, "夹具应 >{target} 页，实际 {}", v.page_count());
+                    let disp_h = v
+                        .page_tops
+                        .get(1)
+                        .zip(v.page_tops.first())
+                        .map(|(t1, t0)| t1 - t0 - config::pdf::PAGE_GAP)
+                        .expect("应有连续页高");
+                    v.page_tops[target] + 0.5 * disp_h
+                });
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                        v.scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(-sy0)));
+                    });
+                });
+                zoom_wait_frames(cx, 6);
+                let (p0, f0, cp0) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let rp = v.reading_progress().map(|(p, f, _)| (p, f)).expect("应读到进度");
+                    (rp.0, rp.1, v.current_page().map(|(p, _)| p).unwrap_or(0))
+                });
+                assert_eq!(p0, target, "zoom={zoom} 前提：连续定位第 {} 页(index {target})，实况 {p0}", target + 1);
+                assert_eq!(cp0, target + 1, "zoom={zoom} 前提：current_page 应为 {}(index {target})，实况 {cp0}", target + 1);
+                assert!(
+                    (f0 - 0.5).abs() < 0.02,
+                    "zoom={zoom} 前提：页内 frac≈0.5，实况 {f0}"
+                );
+                // → Facing：restore 按 page%cols 钉 sticky 列 → 读 reading_progress 应仍目标页。
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                        v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+                    });
+                });
+                paged_settle(cx, &holder);
+                let (fp, ff, row_has_target) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let l = v.paged_layout_cell.borrow();
+                    let l = l.as_ref().expect("Facing 应有分页快照");
+                    let zoom_l = v.zoom.max(0.01);
+                    let sy = f32::from(-v.scroll.offset().y).max(0.0);
+                    let vh = f32::from(v.scroll.bounds().size.height);
+                    let (r0, _) = l
+                        .first_visible_row(-(sy / zoom_l), vh / zoom_l)
+                        .expect("应有首可见行");
+                    let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+                    (
+                        rp.0,
+                        rp.1,
+                        l.row_page_start[r0] <= target && target <= l.row_page_start[r0 + 1].saturating_sub(1),
+                    )
+                });
+                assert!(row_has_target, "zoom={zoom} 前提：Facing 首可见行应含目标页(index {target})");
+                assert_eq!(
+                    fp, target,
+                    "zoom={zoom} Facing 侧应解析到目标页(index {target})：实况 {fp}——sticky 列未按 page%cols 钉"
+                );
+                assert!(
+                    (ff - 0.5).abs() < 0.05,
+                    "zoom={zoom} Facing 侧页内 frac 应≈0.5（cell_h[page] 分母）：实况 {ff}"
+                );
+                // → 切回 Continuous：应仍回目标页/frac≈0.5（偶页往返对称于奇页）。
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                        v.set_page_mode(crate::pdf::view::PageMode::Continuous, cx);
+                    });
+                });
+                zoom_wait_frames(cx, 10);
+                let (p1, f1, cp1) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+                    (rp.0, rp.1, v.current_page().map(|(p, _)| p).unwrap_or(0))
+                });
+                eprintln!(
+                    "[MODE-EQ] zoom={zoom} target={target} 往返后 current_page={cp1} reading_progress=(page={p1}, frac={f1:.3})——期望 (index {target}, 0.5)"
+                );
+                assert_eq!(
+                    p1, target,
+                    "zoom={zoom} 切回 Continuous 应仍回目标页(index {target})：实况 {p1}"
+                );
+                assert_eq!(
+                    cp1,
+                    target + 1,
+                    "zoom={zoom} 切回 current_page 应为 {}(index {target})：实况 {cp1}",
+                    target + 1
+                );
+                assert!(
+                    (f1 - 0.5).abs() < 0.05,
+                    "zoom={zoom} 切回页内 frac 应≈0.5 保留：实况 {f1}"
+                );
+            }
+        }
+    }
+
+    /// 等价覆盖（sticky 列的第二确定性锚源 = Facing 内 `scroll_to_page` 导航钉列）：
+    /// Facing 里 `scroll_to_page(奇页 9 / 偶页 8)` → `scroll_to_page` 按 `target % cols` 写
+    /// `facing_anchor_col` → `reading_progress` 分页分支按同列解析到目标页；切 Continuous
+    /// （`k = target` 顶）再切回 Facing（restore 按 `page % cols` 重钉）仍保持目标页——
+    /// 「Facing 内翻到右/奇页再切走」的路径不丢列（用户实测场景，open.rs scroll_to_page）。
+    /// K190：zoom∈{0.75, 1.2, 2.0} 参数化（列选择是 `page % cols`，随 zoom 不变）。
+    #[gpui::test]
+    async fn mode_switch_facing_origin_navigation_anchors_column_any_zoom(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        let _guard = crate::pdf::test_util::lock().lock().unwrap_or_else(|e| e.into_inner());
+        let holder = zoom_holder();
+        let (_root, cx) = zoom_add_window(cx, &holder, "pdf测试2.pdf");
+        for zoom in [0.75f32, 1.2, 2.0] {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                    v.set_zoom(zoom);
+                });
+            });
+            zoom_wait_frames(cx, 4);
+            for target in [8usize, 9] {
+                // 进 Facing → scroll_to_page 跳页（导航锚事件：钉 target % cols）。
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                        v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+                    });
+                });
+                paged_settle(cx, &holder);
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, _cx| {
+                        v.scroll_to_page(target);
+                    });
+                });
+                paged_settle(cx, &holder);
+                let (fp0, ff0) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+                    (rp.0, rp.1)
+                });
+                assert_eq!(
+                    fp0, target,
+                    "zoom={zoom} Facing scroll_to_page({target}) 后应解析到该页：实况 {fp0}——scroll_to_page 未按 target%cols 钉列"
+                );
+                assert!(
+                    ff0.abs() < 0.02,
+                    "zoom={zoom} 跳页行顶对齐 frac≈0：实况 {ff0}"
+                );
+                // → 切 Continuous（k = target 顶）→ 应保持目标页。
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                        v.set_page_mode(crate::pdf::view::PageMode::Continuous, cx);
+                    });
+                });
+                zoom_wait_frames(cx, 10);
+                let (pc, _fc) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+                    (rp.0, rp.1)
+                });
+                assert_eq!(
+                    pc, target,
+                    "zoom={zoom} Facing→Continuous 应保持目标页(index {target})：实况 {pc}"
+                );
+                // → 切回 Facing：restore 按 page%cols 重钉 → 仍目标页。
+                cx.update(|_w, cx| {
+                    holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                        v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+                    });
+                });
+                paged_settle(cx, &holder);
+                let (fp1, _ff1) = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let rp = v.reading_progress().map(|(p, f, _)| (p, f)).unwrap_or((0, 0.0));
+                    (rp.0, rp.1)
+                });
+                assert_eq!(
+                    fp1, target,
+                    "zoom={zoom} Continuous→Facing 往返应仍目标页(index {target})：实况 {fp1}"
+                );
+            }
+        }
+    }
+
 
     /// [回归，纯数学不触 pdfium] Facing=连续自由滚动下，行中位 → 渲染窗 `paged_render_window`
     /// 必须覆盖全可见行（K177 演算）：视口顶落在行 0 中部、视口底落入行 1 →

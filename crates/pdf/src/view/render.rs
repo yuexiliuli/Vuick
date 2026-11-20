@@ -999,12 +999,22 @@ impl PdfViewer {
             None, // 连续页列：不用分页布局定位
         );
 
+        // 非溢出档鼠标缩放水平偏移：行 justify_center 居中的是「外边距盒」→ 在内容上加
+        // 不对称外边距 `ml=2·max(off,0)` / `mr=2·max(−off,0)` 即把内容列平移 `off`
+        // （演算 K177：`内容左 = (wrap−页宽−ml−mr)/2 + ml = (wrap−页宽)/2 + off`，与命中链
+        // `column_left + x_zoom_offset` 逐值同源；taffy 0.13 `used_space` 含 margin，
+        // justify_center 按外边距盒居中）。off=0 时的 ml=mr=0 → 与旧 justify_center 逐字节一致。
+        let x_off = self.x_zoom_offset;
+        let ml = (2.0 * x_off).max(0.0);
+        let mr = (2.0 * -x_off).max(0.0);
         let content = div()
             .id("pdf-pages")
             .debug_selector(|| "pdf-pages".into())
             .relative()
             .w(px(page_width))
             .h(px(total))
+            .ml(px(ml))
+            .mr(px(mr))
             .children(cards);
 
         // 横向+竖向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）

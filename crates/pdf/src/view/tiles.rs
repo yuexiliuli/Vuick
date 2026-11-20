@@ -787,7 +787,8 @@ impl PdfViewer {
         if vy1 <= vy0 {
             return None;
         }
-        let col_left = column_left(wrap_w, page_width);
+        // 连续列水平原点 = `column_left + x_zoom_offset`（非溢出鼠标缩放偏移，与渲染/命中同口径）。
+        let col_left = column_left(wrap_w, page_width) + self.x_zoom_offset;
         let off_x = f32::from(-self.scroll.offset().x);
         let viewport_w = f32::from(self.scroll.bounds().size.width);
         let vx0 = (off_x - col_left).clamp(0.0, page_width);

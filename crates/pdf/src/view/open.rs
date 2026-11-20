@@ -174,6 +174,9 @@ impl PdfViewer {
             zoom_idle_frames: 0,
             zoom_epoch: 0,
             scroll: ScrollHandle::new(),
+            x_zoom_offset: 0.0,
+            last_mouse_focus: None,
+            last_ui_scroll: (0.0, 0.0),
             state: ui::AsyncState::loading(),
             bg: None,
             recolor: None,
@@ -204,6 +207,7 @@ impl PdfViewer {
             search_seq: 0,
             zoom: 1.0,
             base_w: PAGE_WIDTH,
+            doc_min_ar: 1.0,
             scale_factor: 1.0,
             window_sig: None,
             window_settled: false,
@@ -225,6 +229,7 @@ impl PdfViewer {
             // ---- 网格视图（Grid）状态（wave3）：见 view.rs 结构字段注释 ----
             grid_mode: false,
             page_mode: PageMode::Continuous,
+            facing_anchor_col: 0,
             grid_zoom: 1.0,
             last_grid_viewport_w: 0.0,
             grid_scroll: ScrollHandle::new(),
@@ -302,6 +307,8 @@ impl PdfViewer {
         self.worker = Some(worker);
         self.doc_id = doc_id;
         self.dims = dims;
+        // 缓存全文档最小纵横比（contain-fit 用；读缓存字段，勿每帧 O(n) 全扫 dims）。
+        self.doc_min_ar = min_ar(&self.dims);
         self.outlines = outlines;
         // 重着色补推：打开/重载时 worker 在 set_recolor 时刻可能尚未就绪，这里在 worker
         // 就位后**总是**把本阅读器的重着色状态按**本文档**推给它（worker 侧按 DocId 键控，
@@ -395,9 +402,18 @@ impl PdfViewer {
         if page_index >= self.dims.len() {
             return;
         }
+        // 跳页 = 确定性锚事件：复位非溢出水平偏移/沟槽兜底锚（回中，见复位规则）。
+        self.reset_x_zoom();
         if self.paged_mode_active() {
             if let Some(layout) = self.paged_layout_cell.borrow().clone() {
                 if layout.rows > 0 {
+                    // 目录/导航跳页 = 确定性锚事件：把 sticky 列钉到所跳之页所在的列
+                    // （`page % cols`），供 `reading_progress` 分页分支按同列解析「真正
+                    // 当前页」——右/奇页跳页不丢列（K177：`col = page % cols`，row_page_start
+                    // = r×cols 同源）。
+                    if layout.cols > 0 {
+                        self.facing_anchor_col = page_index % layout.cols;
+                    }
                     let r = (page_index / layout.cols).min(layout.rows - 1);
                     let mag = (layout.row_top[r] * self.zoom.max(0.01))
                         .clamp(0.0, self.paged_max_scroll());
@@ -428,16 +444,20 @@ impl PdfViewer {
     /// zoom/页宽伸缩）——绝不可以用 pt 高（页高 pt 与显示高相差一个 `pw/pt_w` 缩放因子，跨
     /// zoom 会失配）。与 [`Self::set_restore_anchor`] 的恢复公式互逆：同档往返无漂移。
     ///
-    /// **分页模式**（Facing）：返回 `(行首页下标 = row_page_start[r0], 行内纵向比例,
-    /// zoom)`——`r0` = `first_visible_row` 首行，frac = `(内容顶 − 行顶) / 行高`（行内 0=行顶、
-    /// 1=行底，与 zoom 无关：内容顶/行顶/行高同为显示口径，zoom 约掉）。恢复侧
-    /// （[`Self::set_restore_anchor`] 消费）按 `r = page/cols` 还原行号。
+    /// **分页模式**（Facing）：返回 `(真正当前页, 该页页内比例, zoom)`——`r0` =
+    /// `first_visible_row` 首行，当前页 = `row_page_start[r0] + facing_anchor_col`
+    /// （**sticky 列记忆**，0=左/偶、1=右/奇；末行 ragged 仅 1 页时夹回 0）。同行两列
+    /// 顶对齐 → y 轴无法区分「在哪一列」，必须靠确定性锚事件（[`Self::set_page_mode`]
+    /// restore / Facing `scroll_to_page`）把列钉进 `facing_anchor_col` 再解析。frac =
+    /// `(内容顶 − 行顶) / cell_h[page]`（**页内比例**，分母用该页自身高，非行高——与
+    /// `ensure_window` 分页 restore 同分母互逆，连续 ↔ Facing 的 `(page, frac)` 互为精确逆；
+    /// 与 zoom 无关：内容顶/行顶/页高同为显示口径，zoom 约掉）。
     pub fn reading_progress(&self) -> Option<(usize, f32, f32)> {
         if self.dims.is_empty() || self.page_tops.len() != self.dims.len() {
             return None;
         }
         let scroll_y = f32::from(-self.scroll.offset().y);
-        // 分页分支：首可见行 → (行首页, 行内比例)。快照缺失/空布局回落连续口径。
+        // 分页分支：首可见行 → (真正当前页, 页内比例)。快照缺失/空布局回落连续口径。
         if self.paged_mode_active()
             && let Some(layout) = self.paged_layout_cell.borrow().as_ref()
             && layout.rows > 0
@@ -449,9 +469,15 @@ impl PdfViewer {
             let scroll_y_fit = -(content_top / zoom);
             if let Some((r0, _)) = layout.first_visible_row(scroll_y_fit, vh) {
                 let row_top = layout.row_top[r0];
-                let row_h = layout.row_height(r0).max(f32::EPSILON);
-                let frac = ((content_top / zoom - row_top) / row_h).clamp(0.0, 1.0);
-                let page = layout.row_page_start[r0];
+                // 页解析（K177 演算）：行页区间 `[row_page_start[r0], row_page_start[r0+1])`，
+                // 列 = sticky `facing_anchor_col`（0/1），末行 ragged 仅 1 页 → 夹回列 0。
+                let pages_in_row = layout.row_page_start[r0 + 1] - layout.row_page_start[r0];
+                let col = self.facing_anchor_col.min(pages_in_row.saturating_sub(1));
+                let page = layout.row_page_start[r0] + col;
+                // 页内比例：分母 = 该页自身高 `cell_h[page]`（非行高）——与 ensure_window
+                // 分页 restore 同分母，行内两页不等高时把「页内»行内」换算收进该页自身。
+                let cell_h = layout.cell_h.get(page).copied().unwrap_or(1.0).max(f32::EPSILON);
+                let frac = ((content_top / zoom - row_top) / cell_h).clamp(0.0, 1.0);
                 return Some((page, frac, self.zoom));
             }
         }
@@ -488,6 +514,8 @@ impl PdfViewer {
         if (self.zoom - zoom).abs() < 1e-4 {
             return;
         }
+        // 程序化绝对缩放（非鼠标焦点）→ 复位非溢出水平偏移（回中）。
+        self.reset_x_zoom();
         let old_w = self.page_width();
         self.zoom = zoom;
         let new_w = self.page_width();
@@ -511,14 +539,42 @@ impl PdfViewer {
         // 故 `set_zoom` **不再联动网格**——网格卡宽只由 `set_grid_zoom`/网格 Ctrl+滚轮改。
     }
 
-    /// 应用**绝对**阅读缩放目标（`target` 直接入参，clamp 到 [ZOOM_MIN, ZOOM_MAX]）并
-    /// 维护其后的一致性——滚轮缩放 [`super::view::input::PdfViewer::adjust_zoom`] 与此
-    /// **共用同一实现**，避免两套逻辑分叉（K32）：Z2 worker 缩放世代步进、Z1 锚点重锚、
-    /// S1 缩放源头治理（防抖武装 + 强制 Slow）、notify 全在这里。行为与 adjust_zoom
-    /// **逐行一致**，仅把「target 来自 factor×当前 zoom」改为「target 直接入参」；
-    /// clamp 后与当前 zoom 差 < 1e-4 早退（同 [`pan_zoom::apply_zoom`] 语义）。
+    /// 应用**绝对**阅读缩放目标（`target` 直接入参，clamp 到 [ZOOM_MIN, ZOOM_MAX]）：
+    /// **无鼠标焦点**（状态栏「显示比例」滑条 / 程序化）→ 视口顶锚（Z1 / Z1-S6 语义）；
+    /// 真实 Ctrl+滚轮带鼠标焦点走 [`Self::zoom_target_mouse`]。两者落地共用
+    /// [`Self::zoom_target_impl`]（同一实现，避免逻辑分叉，K32）。
     /// `pub`：外壳状态栏「显示比例」滑条经 entity update 调用（滑条先 clamp，这里再兜底）。
     pub fn zoom_target(&mut self, target: f32, cx: &mut Context<Self>) {
+        self.zoom_target_impl(target, None, None, cx);
+    }
+
+    /// 鼠标焦点缩放落地（真实 Ctrl+滚轮专属，见
+    /// [`super::view::input::PdfViewer::adjust_zoom_mouse`]）：`focus = None`（鼠标在沟槽/
+    /// 留白/状态栏 → [`super::view::input::PdfViewer::window_to_pt`] 未命中）→ 与无焦点
+    /// [`Self::zoom_target`] 完全一致（视口顶锚）。鼠标锚演算见 [`Self::zoom_target_impl`]。
+    pub(super) fn zoom_target_mouse(
+        &mut self,
+        target: f32,
+        focus: Option<ZoomMouseFocus>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_target_impl(target, focus, Some(window), cx);
+    }
+
+    /// 缩放落地共享实现（`zoom_target` / `zoom_target_mouse` 二合一）——维护缩放后一致性：
+    /// Z2 worker 缩放世代步进、Z1 锚点重锚、S1 缩放源头治理（防抖武装 + 强制 Slow）、
+    /// notify 全在这里。行为与 adjust_zoom **逐行一致**，仅把「target 来自 factor×当前
+    /// zoom」改为「target 直接入参」；clamp 后与当前 zoom 差 < 1e-4 早退（同
+    /// [`pan_zoom::apply_zoom`] 语义）。`mouse_focus` = `Some((焦点, window))` 时缩放宽
+    /// 锚改为「鼠标所指页面点」（缩放前后同内容点同屏），`None` 时维持视口顶锚。
+    fn zoom_target_impl(
+        &mut self,
+        target: f32,
+        mouse_focus: Option<ZoomMouseFocus>,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) {
         if self.dims.is_empty() {
             return;
         }
@@ -526,6 +582,15 @@ impl PdfViewer {
         let target = target.clamp(ZOOM_MIN, ZOOM_MAX);
         if (target - self.zoom).abs() < 1e-4 {
             return;
+        }
+        // **D1（评审）程序化/滑条绝对缩放**：`window == None` ⇔ 无鼠标焦点（`set_zoom_abs`
+        // 状态栏滑条 / `adjust_zoom` 测试驱动）。滑条 = 非「鼠标缩放」水平位移 → 复位非溢出
+        // 水平偏移与沟槽兜底锚（回中，与 [`Self::set_zoom`] 一致）。此前只判
+        // `last_mouse_focus.is_none()` 会因上一档页内 Ctrl+滚轮留下的 `Some` 而不清 → 页列
+        // 保持水平偏移不回中（fit 下可达 ±居中边距）。`focus Some ⇒ window Some`（生产调用面），
+        // 此守卫不会误伤真实滚轮。
+        if window.is_none() {
+            self.reset_x_zoom();
         }
         // **R5 分页精确锚（S6）**：缩放前捕获「首可见行 r0 + 显示口径滚动 sy_old + zoom=1
         // 布局快照 pl_fit」。分页几何 = PagedLayout × zoom（均匀缩放、无常量区）→ 缩放后行号
@@ -570,14 +635,59 @@ impl PdfViewer {
         self.total_height = total;
         // 分页锚存在性提前探（paged_anchor 随后被 move 进 if-let）。
         let has_paged_anchor = paged_anchor.is_some();
-        let new_y = if let Some((r0, sy_old, pl_fit)) = paged_anchor {
-            // 分页精确锚：pl_old/pl_new = pl_fit × 旧/新 zoom（显示口径），
-            // `zoom_rescroll_anchor_paged` 锁死 `行顶_new + (sy_old − 行顶_old) × ratio`。
-            let pl_old = paged_layout_scaled(&pl_fit, old_zoom);
-            let pl_new = paged_layout_scaled(&pl_fit, self.zoom.max(0.01));
-            zoom_rescroll_anchor_paged(&pl_old, &pl_new, r0, ratio, sy_old)
-        } else {
-            zoom_rescroll_anchor(&self.dims, &old_tops, &self.page_tops, old_w, ratio, sy)
+        // **鼠标焦点锚**（缩放目标 = 鼠标所指页面点，连续 / Facing 两模式同式）：缩放前
+        // `window_to_pt` 已把鼠标定位到页内 PDF 点 `focus`。缩放后先求该点在「新布局 +
+        // 旧滚动」下的窗口位 `after`（[`super::view::input::PdfViewer::pt_to_window`]，与
+        // 命中/渲染共用同一条几何链），再令 `新滚动 = 旧滚动 + (after − 鼠标窗位)`——
+        // 窗口位与 scroll 是 `窗口 = 容器原点 + content − scroll` 的线性关系，由此线性和
+        // 可逆：`after = b + c′ − s_old`，要 `b + c′ − s_new = m` ⇒ `s_new = s_old + (after − m)`，
+        // 两轴同式（K177 演算）。`page_local_to_window` 此刻读的是**尚未 set_offset 的旧
+        // 滚动** → 恰与 `after` 定义吻合。
+        //
+        // **三态锚**（2026-11-20 非溢出 x 锚 + 沟槽兜底）：返回值 = `(new_y 锚, x 增量)`：
+        // ① 本档 `window_to_pt` 命中页内 → 更新 `last_mouse_focus`，y 锚 + `Some(delta)`（x
+        //    delta = `after.x − m.x`，**纯几何增量**——新旧通道值在 `after − m` 中自动相消）；
+        // ② 本档命中空白（鼠标落沟槽/留白）但上一档在页内 → 用上一档页内内容点锚 **y**，
+        //    **x 增量 None**（维持既有通道值，防「x 重居中把鼠标推出页缘 → 瞬时回落视口顶锚」）；
+        // ③ 无任何页内焦点 → `(None, None)`（视口顶锚，既有 Z1/Z1-S6 语义）。
+        // x 的**通道结算**在下方 `max_sx` 分派统一做（容器 = `column_left + xoff − sx`，两模型
+        // 通道值各自归位；跨档须扣除被移除通道的旧值，见 D2）。
+        let (mouse_y, x_delta): (Option<f32>, Option<f32>) = match mouse_focus {
+            Some(focus) => {
+                self.last_mouse_focus = Some(focus);
+                match window.map(|w| {
+                    let after = self.pt_to_window(w, focus.page, focus.px, focus.py);
+                    (
+                        sy + (after.y.as_f32() - focus.pos.y.as_f32()),
+                        after.x.as_f32() - focus.pos.x.as_f32(),
+                    )
+                }) {
+                    Some((ny, dx)) => (Some(ny), Some(dx)),
+                    None => (None, None),
+                }
+            }
+            None => match (self.last_mouse_focus, window) {
+                (Some(prev), Some(w)) => {
+                    let after = self.pt_to_window(w, prev.page, prev.px, prev.py);
+                    // 兜底：y 锚到上一档页内内容点；x 增量 None（维持既有通道值，下方结算）。
+                    (Some(sy + (after.y.as_f32() - prev.pos.y.as_f32())), None)
+                }
+                _ => (None, None),
+            },
+        };
+        let new_y = match mouse_y {
+            Some(ny) => ny,
+            None => {
+                if let Some((r0, sy_old, pl_fit)) = paged_anchor {
+                    // 分页精确锚：pl_old/pl_new = pl_fit × 旧/新 zoom（显示口径），
+                    // `zoom_rescroll_anchor_paged` 锁死 `行顶_new + (sy_old − 行顶_old) × ratio`。
+                    let pl_old = paged_layout_scaled(&pl_fit, old_zoom);
+                    let pl_new = paged_layout_scaled(&pl_fit, self.zoom.max(0.01));
+                    zoom_rescroll_anchor_paged(&pl_old, &pl_new, r0, ratio, sy_old)
+                } else {
+                    zoom_rescroll_anchor(&self.dims, &old_tops, &self.page_tops, old_w, ratio, sy)
+                }
+            }
         };
         // #2 停底锚点回拉修正：Z1 公式对页尾/文档底附近给出的 `new_y` 可能超出新布局的
         // `[0, max_offset]` ——gpui 只在**布局**时才 clamp（div.rs `clamp_scroll_position`），
@@ -598,10 +708,62 @@ impl PdfViewer {
         };
         let new_y = new_y.clamp(0.0, max_sy);
         let viewport_w = f32::from(self.scroll.bounds().size.width);
-        let content_w = viewport_w.max(new_w + 2.0 * PAGE_PAD_X);
+        // 横向内容宽 = 可视宽与内容更宽者的较大者。**分页页拍的容器内容宽 = `spread_max ×
+        // zoom`**（渲染容器 `.w(spread_max*zoom)`，见 render_pdf_pages_paged）——若按连续
+        // 的 `page_width + 2·PAD` 算会把横向量程算小（分页双页 + gap 常远超单页宽）→ 分页
+        // 横向缩放锚被错误早钳（鼠标 x 失守，且 `new_x` clamp 与 DOM 实测范围不符）。
+        let content_w = if self.paged_mode_active() {
+            let spread = self
+                .paged_layout_cell
+                .borrow()
+                .as_ref()
+                .map(|l| l.spread_max * self.zoom.max(0.01))
+                .unwrap_or_else(|| new_w + 2.0 * PAGE_PAD_X);
+            viewport_w.max(spread)
+        } else {
+            viewport_w.max(new_w + 2.0 * PAGE_PAD_X)
+        };
         let max_sx = (content_w - viewport_w).max(0.0);
-        let new_x = (sx * ratio).clamp(0.0, max_sx);
-        self.scroll.set_offset(gpui::point(px(-new_x), px(-new_y)));
+        // **横向量程通道统一结算**（渲染 / 命中 / 横向量程三处同口径，K153；D2：跨档不跳）：
+        // 屏幕 x 恒等式 `m = 容器原点 + column_left + xoff − sx`；要 `column_left(w1)+lx1 +
+        // new_xoff − new_sx = m` ⇒ `new_xoff − new_sx = (old_xoff − old_sx) − delta`（delta =
+        // 几何增量，`after − m` 已把 old 通道值相消，见上）。据此：
+        // - **进溢出**（old 通道是 offset：old_xoff ≠ 0、old_sx = sx）→ scroll 的
+        //   `new_sx = sx + delta − old_xoff`（**扣除被移除的偏移通道旧值**，否则当档鼠标 x
+        //   带 xoff_old 赤 失守几十 px）；
+        // - **回非溢出**（old 通道是 scroll：old_xoff = 0、old_sx = sx ≠ 0）→ offset 的
+        //   `new_xoff = old_xoff − sx − delta`（**扣除被移除的滚动通道旧值**，否则带 sx_old 漂移）。
+        // 稳态（同通道连续缩放）上式退化为「纯 delta / offset −= delta」，与既有行为逐值一致。
+        // 沟槽兜底（x 增量 None 且 y 有锚）维持既有通道值；顶锚（y 无锚）溢出走 `sx × ratio`、
+        // 非溢出归 0 回中。`last_mouse_focus` 在溢出期清空（横向完全由 scroll 承担）、非溢出期
+        // 保留给连续 Ctrl+滚轮序列。
+        let old_xoff = self.x_zoom_offset;
+        let x_top = mouse_y.is_none(); // 顶锚（无任何页内焦点）
+        let x_keep = !x_top && x_delta.is_none(); // 沟槽兜底：维持既有通道值
+        if max_sx > 1e-3 {
+            // 横向溢出：横向锚走既有滚动量程 `[0, max_sx]`，偏移恒 0。
+            self.x_zoom_offset = 0.0;
+            self.last_mouse_focus = None;
+            let new_x = if let Some(delta) = x_delta {
+                (sx + delta - old_xoff).clamp(0.0, max_sx)
+            } else if x_keep {
+                sx.clamp(0.0, max_sx)
+            } else {
+                (sx * ratio).clamp(0.0, max_sx)
+            };
+            self.scroll.set_offset(gpui::point(px(-new_x), px(-new_y)));
+        } else {
+            // 非溢出：横向滚动恒 0，横向由 `x_zoom_offset` 承担（居中 = 0，正值 = 页列右移）。
+            let max_xoff = self.nonoverflow_max_xoff(new_w);
+            self.x_zoom_offset = if let Some(delta) = x_delta {
+                (old_xoff - sx - delta).clamp(-max_xoff, max_xoff)
+            } else if x_keep {
+                old_xoff
+            } else {
+                0.0
+            };
+            self.scroll.set_offset(gpui::point(px(0.), px(-new_y)));
+        }
         // S1 缩放源头治理：重锚把 scroll offset 同比缩放后，滚动速度「账面」与滚动锚点立即
         // 同步——下一帧 `ensure_window` 的 `jump = scroll_y - last_scroll_y ≈ 0`，不再把缩放
         // 重锚误判为滚动（旧实现：同帧 offset 突变 → velocity 飙 → VeryFast → 手势期零派发
@@ -616,6 +778,29 @@ impl PdfViewer {
         self.zoom_armed = true;
         self.zoom_idle_frames = 0;
         cx.notify();
+    }
+
+    /// 复位**非溢出档水平内容偏移**与沟槽兜底锚（归 0 回中）：普通滚动 / 跳页 /
+    /// 模式切换 / 进出网格 / 滑条绝对缩放等任何非「鼠标缩放」的水平位移统一走本函数
+    /// （复位规则见 [`Self::x_zoom_offset`] / [`Self::last_mouse_focus`]）。
+    pub(super) fn reset_x_zoom(&mut self) {
+        self.x_zoom_offset = 0.0;
+        self.last_mouse_focus = None;
+    }
+
+    /// **非溢出档水平内容偏移的上界**（[`Self::x_zoom_offset`] 的夹幅）：= 页列居中边距
+    /// `(视口 − 内容宽)/2`（连续内容宽 = 页宽，分页内容宽 = spread）。非溢出下偏移幅值不许
+    /// 超过它——超过即「页列负 padding / 页出视口」（渲染 padding/margin 与命中 `column_left
+    /// ± offset` 同界，K153/K177）。仅在 `zoom_target_impl` 非溢出分派里调用（此时必 ≥ 0）。
+    fn nonoverflow_max_xoff(&self, new_w: f32) -> f32 {
+        let viewport_w = f32::from(self.scroll.bounds().size.width);
+        if self.paged_mode_active() {
+            if let Some(l) = self.paged_layout_cell.borrow().as_ref() {
+                let spread = l.spread_max * self.zoom.max(0.01);
+                return ((viewport_w - spread) / 2.0).max(0.0);
+            }
+        }
+        ((viewport_w - new_w) / 2.0).max(0.0)
     }
 
     /// 外壳状态栏「显示比例」滑条驱动：以**绝对缩放值**设置阅读缩放。
@@ -782,6 +967,8 @@ impl PdfViewer {
         if self.grid_mode == enabled {
             return;
         }
+        // 进出网格 = 非「鼠标缩放」水平位移 → 复位非溢出水平偏移（回中，见复位规则）。
+        self.reset_x_zoom();
         self.grid_mode = enabled;
         if enabled {
             self.grid_scroll.set_offset(gpui::point(px(0.), px(0.)));
@@ -829,6 +1016,8 @@ impl PdfViewer {
         if self.page_mode == mode && !self.grid_mode {
             return;
         }
+        // 模式切换 = 非「鼠标缩放」水平位移 → 复位非溢出水平偏移（回中，见复位规则）。
+        self.reset_x_zoom();
         // 真实模式翻转（非网格态）→ 页对应重锚：用当前模式既有口径捕获 (页, 页内比例)，
         // 交给 ensure_window 的 restore_pending 逆换算在下一帧落地（镜像阅读进度恢复时序）。
         // 文档未加载（reading_progress=None）→ 不设 pending（保持滚动位，等效旧行为）。
@@ -1464,7 +1653,10 @@ impl PdfViewer {
         }
         let left_pad = ((viewport_w - spread) / 2.0).max(0.0);
         let c = (page % layout.cols) as f32;
-        let x = left_pad + c * (cw + gap);
+        // 非溢出档鼠标缩放水平偏移叠加（语义与连续列 `column_left + x_zoom_offset` 同界，
+        // 2026-11-20；`|x_zoom_offset| ≤ left_pad` 由 `zoom_target_impl` 非溢出分派夹住，
+        // 保证整行仍在视口内）。渲染/命中/瓦片同经本唯一显示矩形源（K153）。
+        let x = left_pad + self.x_zoom_offset + c * (cw + gap);
         Some(crate::pdf::layout::Rect {
             x,
             y: r.y * z,
@@ -1556,6 +1748,20 @@ impl PdfViewer {
             self.sel_card = None;
             cx.notify();
         }
+        // 非「鼠标缩放」滚动检测（评审 nit）：滚动条拖拽 / 键盘滚动等不经过 `on_scroll_wheel`
+        // 的缩放拦截 → 这里每帧比对 offset 快照，变化且**不在缩放防抖窗**（`zoom_armed`，连续
+        // Ctrl+滚轮每档都变 offset，但属缩放勿误清）→ 复位水平偏移 + 沟槽兜底锚（回中，防
+        // 兜底锚到过期页点）。纯平移/缩放同帧不触发（zoom_armed 为真）。
+        let cur = (
+            f32::from(self.scroll.offset().x),
+            f32::from(self.scroll.offset().y),
+        );
+        if cur != self.last_ui_scroll {
+            self.last_ui_scroll = cur;
+            if !self.zoom_armed {
+                self.reset_x_zoom();
+            }
+        }
         // 分页页排（Facing）布局每帧重算：以 zoom=1（fit）口径、**真实阅读视口**算
         // [`PagedLayout`] 并抄入快照，render 读它做分页定位（显示统一乘 `self.zoom`）。
         // 放在 worker/dims 守卫**之前**：无 worker 的测试夹具/纯态期也保持快照新鲜。
@@ -1585,17 +1791,29 @@ impl PdfViewer {
             self.ensure_window_grid(window, cx);
             return;
         }
-        // **自适应窗口宽**：页宽基线 = 滚动容器可视宽 − 两侧页边距（容器首帧未布局宽为
-        // 0 → 回退窗口宽；侧边栏/分屏使可视区窄于窗口时按容器实宽，页列不相对可视区偏）。
-        // 窗口/侧边栏拉宽拉窄 → 基线变 → 重排页列布局（页面随窗口缩放），瓦片按新密度
-        // 由 `schedule_tiles` 惰性重渲；Ctrl+滚轮在基线上再乘 `zoom`（`adjust_zoom` 重排）。
+        // **整页入屏**（contain-fit）：页宽基线 = min(内容宽, 视口高 × 全文档最小纵横比
+        // `doc_min_ar`)——与双页（Facing）模式同 fit 口径（Facing 行内 `fit_w =
+        // viewport_h·min_ar`）→ 同一缩放值（状态栏 zoom%）下两模式页视觉大小一致（用户
+        // 明选「连续也改为整页入屏」方向）。内容宽 = 可视宽 − 两侧页边距（容器首帧未布局
+        // 宽为 0 → 回退窗口宽；侧边栏/分屏使可视区窄于窗口时按容器实宽，页列不相对可视区
+        // 偏）；视口高读滚动容器真实高（首帧 0 回退窗口高，同 [`Self::paged_viewport`] 兜底
+        // 口径）。窗口/侧边栏拉宽拉窄 → 基线变 → 重排页列布局（页面随窗口缩放），瓦片按
+        // 新密度由 `schedule_tiles` 惰性重渲；Ctrl+滚轮在基线上再乘 `zoom`（`adjust_zoom`
+        // 重排）。
         let container_w = f32::from(self.scroll.bounds().size.width);
         let view_w = if container_w > 0.0 {
             container_w
         } else {
             window.bounds().size.width.as_f32()
         };
-        let new_base = (view_w - 2.0 * PAGE_PAD_X).max(1.0);
+        let container_h = f32::from(self.scroll.bounds().size.height);
+        let view_h = if container_h > 0.0 {
+            container_h
+        } else {
+            window.bounds().size.height.as_f32()
+        };
+        let content_w = (view_w - 2.0 * PAGE_PAD_X).max(1.0);
+        let new_base = content_w.min(view_h * self.doc_min_ar).max(1.0);
         if (new_base - self.base_w).abs() > 1e-4 {
             self.base_w = new_base;
             let pw = self.page_width();
@@ -1604,15 +1822,25 @@ impl PdfViewer {
             self.total_height = total;
             if timing_view() {
                 eprintln!(
-                    "[{:.1}ms] [VIEW-REFIT] base_w={:.0} page_width={:.0} view_w={:.0} zoom={:.2}",
+                    "[{:.1}ms] [VIEW-REFIT] base_w={:.0} page_width={:.0} view_w={:.0} view_h={:.0} min_ar={:.4} zoom={:.2}",
                     crate::pdf::timing_ms(),
                     self.base_w,
                     pw,
                     view_w,
+                    view_h,
+                    self.doc_min_ar,
                     self.zoom,
                 );
             }
             cx.notify();
+        }
+        // resize 重夹（评审 nit）：视口变化使非溢出偏移上界（居中边距）变 → 超界重夹，保持
+        // 渲染/命中「页在视口内」口径（渲染 margin 已 `max(0)` 兜底防负边距，此夹归位坐标）。
+        // 布局本帧后容器宽已就位（首帧宽 0 时 `nonoverflow_max_xoff` 回退同口径）；缩放序列内
+        // offset 由 `zoom_target_impl` 以同界夹过，此处为 resize 兜底。
+        let xoff_bound = self.nonoverflow_max_xoff(self.page_width());
+        if self.x_zoom_offset.abs() > xoff_bound {
+            self.x_zoom_offset = self.x_zoom_offset.clamp(-xoff_bound, xoff_bound);
         }
         // 阅读进度恢复**待落地滚动**：base_w 已按真实可视宽 refit、`page_tops` 为本帧
         // 布局值——按保存的 `(页, 页内比例)` 逆公式滚回（分母用**显示高**，与 `reading_progress()`
@@ -1622,17 +1850,32 @@ impl PdfViewer {
             && let Some((page, frac)) = self.restore_pending.take()
         {
             // 分页分支：`(page, frac)` → 行 `r = page/cols`、显示口径 `sy = 行顶×zoom +
-            // frac·行高×zoom`（与 `reading_progress()` 分页保存侧互逆）；受 `paged_max_scroll` 夹。
+            // frac·**该页自身高 cell_h[page]**×zoom`（与 `reading_progress()` 分页保存侧互逆，
+            // 页内 frac 同分母）；并把 sticky 列钉到 `page % cols`——连续→Facing 时连续侧
+            // `page` 已含「读者实际在读的页（含右/奇页）」，其列即 sticky 记忆，此后再切回
+            // 连续按同列解析零漂移。受 `paged_max_scroll` 夹。
             let paged_applied = if self.paged_mode_active()
                 && let Some(layout) = self.paged_layout_cell.borrow().as_ref()
                 && layout.cols > 0
             {
                 let zoom = self.zoom.max(0.01);
-                let r = (page / layout.cols).min(layout.rows.saturating_sub(1));
+                let k = page.min(self.dims.len().saturating_sub(1));
+                // K177：`r = page/cols`（向下取整 = 验证行号），`col = page % cols` 即 sticky。
+                let r = (k / layout.cols).min(layout.rows.saturating_sub(1));
+                if layout.cols > 0 {
+                    self.facing_anchor_col = k % layout.cols;
+                }
                 let row_top = layout.row_top[r] * zoom;
-                let row_h = layout.row_height(r) * zoom;
-                let sy =
-                    (row_top + frac.clamp(0.0, 1.0) * row_h).clamp(0.0, self.paged_max_scroll());
+                // 页内 frac 分母用该页自身高（行内两页不等高时，行高会把 frac 失真放大；
+                // 用 cell_h[page] 与 reading_progress 分页分支同分母，往返精确）。
+                let cell_h = layout
+                    .cell_h
+                    .get(k)
+                    .copied()
+                    .unwrap_or_else(|| layout.row_height(r))
+                    * zoom;
+                let sy = (row_top + frac.clamp(0.0, 1.0) * cell_h)
+                    .clamp(0.0, self.paged_max_scroll());
                 self.scroll.set_offset(gpui::point(px(0.), px(-sy)));
                 self.last_scroll_y = sy;
                 true

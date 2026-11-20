@@ -83,6 +83,8 @@ impl PdfViewer {
             // 分页页拍（Facing）= **连续自由滚动 + 2-up**：非 Ctrl 滚轮不拦截
             // （不调 `stop_propagation`）→ 交给滚动容器自由滚动，可停在行中间看到上下两行
             // （与连续模式同一语义）。布局由 cell_rect 定位，滚动语义与连续一致。
+            // 普通滚动 = 非「鼠标缩放」水平位移 → 复位非溢出水平偏移/沟槽兜底锚（回中）。
+            self.reset_x_zoom();
             return;
         }
         if timing_view() {
@@ -134,7 +136,19 @@ impl PdfViewer {
                 }
             }
         } else {
-            self.adjust_zoom(factor, cx);
+            // 真实 Ctrl+滚轮：以**鼠标所指页面点为焦点**缩放。`window_to_pt` 命中页 →
+            // 捕获 `ZoomMouseFocus`（鼠标窗位 + 页内 PDF 点），缩放前后该内容点钉在鼠标
+            // 屏幕位（连续/Facing 两模式同生）；命中空白（沟槽/留白/状态栏）→ `None` →
+            // 与无焦点 `adjust_zoom` 完全一致（视口顶锚，既有 Z1 语义）。
+            let focus = self.window_to_pt(window, event.position).map(|(page, px, py)| {
+                ZoomMouseFocus {
+                    pos: event.position,
+                    page,
+                    px,
+                    py,
+                }
+            });
+            self.adjust_zoom_mouse(factor, focus, window, cx);
         }
         cx.stop_propagation();
         if timing_view() {
@@ -147,13 +161,29 @@ impl PdfViewer {
         }
     }
 
-    /// 应用缩放因子并维护其后的一致性：锚定滚动偏移、重算页列布局。经
-    /// [`super::PdfViewer::zoom_target`] 落地——target = 当前 `zoom × factor`，钳位
-    /// [ZOOM_MIN..=ZOOM_MAX]（来自 [`config::pdf`]）+ 1e-4 无变化短路 全在 zoom_target
-    /// 内部（语义与 [`pan_zoom::apply_zoom`] 一致）。与状态栏滑条的绝对目标
-    /// `set_zoom_abs` 共用同一实现，避免两套逻辑分叉（K32）。
+    /// 应用缩放因子并维护其后的一致性（**无鼠标焦点**——视口顶锚）：锚定滚动偏移、重算
+    /// 页列布局，经 [`super::PdfViewer::zoom_target`] 落地。⚠️ **仅测试/程序化直接驱动**
+    /// （view.rs `minimal_viewer` 系列直调验证 Z1 顶锚公式）：真实 Ctrl+滚轮已改走带鼠标
+    /// 焦点的 [`Self::adjust_zoom_mouse`]，**生产零调用** → `#[cfg(test)]` 门控防 dead-code
+    /// 告警。共享落地实现 [`super::PdfViewer::zoom_target_impl`]（与 `set_zoom_abs` 同一逻辑，
+    /// K32）。
+    #[cfg(test)]
     pub(super) fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
         self.zoom_target(self.zoom * factor, cx);
+    }
+
+    /// 带**可选鼠标焦点**的滚轮缩放（真实 Ctrl+滚轮专属）：`focus = Some` → 鼠标所指
+    /// 页面内容点缩放前后钉在同一屏幕位置（连续/Facing 两模式同式）；`None`（命中
+    /// 空白）→ 与无焦点缩放完全一致（视口顶锚）。落地在
+    /// [`super::PdfViewer::zoom_target_mouse`]（与绝对缩放共用 [`super::PdfViewer::zoom_target_impl`]）。
+    pub(super) fn adjust_zoom_mouse(
+        &mut self,
+        factor: f32,
+        focus: Option<ZoomMouseFocus>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_target_mouse(self.zoom * factor, focus, window, cx);
     }
 
     /// 页列 wrap 宽度 = 滚动容器实际可视宽。⚠️ 不用 `window.bounds()`（那是全窗口宽）：
@@ -233,7 +263,8 @@ impl PdfViewer {
         }
         let page_width = self.page_width();
         let wrap_w = self.wrap_width(window, page_width);
-        let cx = wx - column_left(wrap_w, page_width);
+        // 连续页列水平原点 = `column_left + x_zoom_offset`（非溢出鼠标缩放偏移，渲染同口径）。
+        let cx = wx - (column_left(wrap_w, page_width) + self.x_zoom_offset);
         let (page, lx, ly) = content_to_local(&self.dims, &self.page_tops, page_width, cx, wy)?;
         let scale = render_scale(page_width, window.scale_factor(), self.dims[page].0);
         let (px_, py_) = local_to_pt(
@@ -245,6 +276,35 @@ impl PdfViewer {
             scale,
         );
         Some((page, px_, py_))
+    }
+
+    /// 页内 PDF 点 `(page, px_pdf, py_pdf)` → **窗口坐标**（[`Self::window_to_pt`] 的纯逆变换，
+    /// 缩放鼠标锚[`super::PdfViewer::zoom_target_impl`]用：求「同一内容点缩放后落在哪」；
+    /// `pub(crate)`：测试探针据此把锚点函数定位到鼠标处）。
+    /// 坐标链与 [`Self::char_window_pos`] **完全同源**：`pt_to_local`（每页真实显示宽
+    /// [`super::PdfViewer::page_cell_width`]，连续=Facing 同口径）→ [`Self::page_local_to_window`]
+    /// ——保证 `test` 中「缩放前 `window_to_pt(m)` 命中、缩放后 `pt_to_window` 钉回」用的是
+    /// 渲染/命中同一条几何链，锚点误差仅剩 fp 舍入与设备网格半像素（≤0.5 逻辑 px）。
+    pub(crate) fn pt_to_window(
+        &self,
+        window: &Window,
+        page: usize,
+        px: f32,
+        py: f32,
+    ) -> gpui::Point<Pixels> {
+        let dim = self.dims[page];
+        // 页宽口径与正向 [`Self::window_to_pt`] 对齐（加 `paged_mode_active()` 门控）：
+        // Facing→Continuous 切换后同帧内 `paged_layout_cell` 快照可能残留 → 若直接走
+        // [`super::PdfViewer::page_cell_width`] 会读到陈旧 Facing `cell_w_per_row`，与下方
+        // `page_local_to_window` 的连续分支（`page_width()`）口径错位 → 鼠标锚 `after` 漂移。
+        let page_width = if self.paged_mode_active() {
+            self.page_cell_width(page)
+        } else {
+            self.page_width()
+        };
+        let scale = render_scale(page_width, window.scale_factor(), dim.0);
+        let (lx, ly) = pt_to_local(px, py, dim.0, dim.1, page_width, scale);
+        self.page_local_to_window(window, page, lx, ly)
     }
 
     /// 窗口坐标 → (页号, 字符索引)。点空白（列外/页间沟槽/无文本页）返回 `None`。
@@ -356,6 +416,8 @@ impl PdfViewer {
         }
         // 超宽平移：左键按下即进入平移（不依赖命中文本），不进选中。
         if self.horizontal_overflow() {
+            // 平移 = 非「鼠标缩放」水平位移 → 复位非溢出水平偏移/沟槽兜底锚（回中）。
+            self.reset_x_zoom();
             self.panning = true;
             self.pan_origin = event.position;
             self.pan_offset0 = self.scroll.offset();
@@ -576,7 +638,8 @@ impl PdfViewer {
         }
         let page_width = self.page_width();
         let wrap_w = self.wrap_width(window, page_width);
-        let cx = column_left(wrap_w, page_width) + lx;
+        // 连续页列水平原点 = `column_left + x_zoom_offset`（非溢出鼠标缩放偏移，命中同口径）。
+        let cx = column_left(wrap_w, page_width) + self.x_zoom_offset + lx;
         let cy = self.page_tops.get(page).copied().unwrap_or(0.0) + ly;
         gpui::point(
             px(bounds.left().as_f32() + cx + off.x.as_f32()),
