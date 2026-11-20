@@ -5,7 +5,8 @@
 //!   文件名与「悬停显示完整路径」提示在选项卡栏：每个有名文件选项卡
 //!   悬停 200ms 后在其下方浮出自身完整路径 tooltip（见 [`crate::app::tabs`]）；未打开文件时
 //!   徽标显示「纯文本」占位。
-//! - **中间区**：光标位置（编辑区 `Ln x, Col y`）或滚动位置（预览/PDF 页码）；无编辑内容时整段省略。
+//! - **中间区**：光标位置（编辑区 `Ln x, Col y`）或滚动位置（预览/PDF 页码与缩放百分比）；
+//!   PDF 模式下缩放滑条紧随「缩放百分比」右侧（用户 2026-11-20 放置）；无编辑内容时整段省略。
 //! - **右侧区**：模式/状态（预览 / 网格 / 只读 / 跟随系统主题 / UTF-8）→ 统计（行/字）→ 阅读控制按钮。
 //!
 //! 全部数据来自既有状态派生（激活选项卡的 file_path/语言、光标、PDF/EPUB 页码、主题偏好），
@@ -121,7 +122,7 @@ impl EditorApp {
                 })
                 .unwrap_or(false);
             // 阅读页排模式（连续/单页/双页；与网格总览正交，非 PDF 缺省连续）与阅读缩放
-            // （Ctrl+滚轮 / 显示比例滑条共享同一 zoom 源）。供右区页排钮选中态与滑条 render 读。
+            // （Ctrl+滚轮 / 显示比例滑条共享同一 zoom 源）。供右区页排钮选中态与左区滑条 render 读。
             let pdf_page_mode = tab
                 .and_then(|t| match &t.payload.reader {
                     MediaReader::Pdf(pv) => Some(pv.read(cx).page_mode()),
@@ -154,9 +155,10 @@ impl EditorApp {
         };
         let bar_border = self.bar_border();
 
-        // 左侧区：语言徽标
+        // 左侧区：仅语言徽标；缩放滑条已移入中间区（紧随「第 N/M 页 100%」百分比右侧，
+        // 见 `status_bar_middle`）。
         let left = self.status_bar_left(language);
-        let middle = self.status_bar_middle(epub_page, pdf_page, cursor_pos);
+        let middle = self.status_bar_middle(epub_page, pdf_page, cursor_pos, pdf_grid_on, pdf_zoom, cx);
 
         let mut root = div()
             .id("status-bar")
@@ -193,7 +195,6 @@ impl EditorApp {
             pdf_active,
             pdf_grid_on,
             pdf_page_mode,
-            pdf_zoom,
             cx,
         ));
 
@@ -201,7 +202,8 @@ impl EditorApp {
     }
 
     /// 左侧区：语言徽标 pill（文件名与「悬停显示完整路径」提示在选项卡栏，
-    /// 见 `shell_tabs::TabBar` 的选项卡元素）。
+    /// 见 `shell_tabs::TabBar` 的选项卡元素）。缩放滑条已移至中间区（紧随「第 N/M 页
+    /// 100%」百分比右侧，见 [`Self::status_bar_middle`]）。
     fn status_bar_left(&self, language: String) -> gpui::Div {
         div()
             .flex()
@@ -224,24 +226,39 @@ impl EditorApp {
     }
 
     /// 中间区：光标位置（编辑区 `Ln x, Col y`）或滚动位置（预览/PDF 页码）。
-    /// 全部输入为 render 期先算好的纯数据（不持 `cx` 引用，避免 Rust2024 impl Trait
-    /// 生命周期捕获造成的借用冲突）；无编辑内容时返回 `None`，整段（含分隔线）省略。
+    /// 输入为 render 期先算好的纯数据；PDF 分支把缩放滑条（[`Self::status_pdf_zoom_slider`]）
+    /// 紧随「缩放百分比」右侧一并挂载（用户 2026-11-20 放置）。无编辑内容时返回 `None`，
+    /// 整段（含分隔线）省略。
     fn status_bar_middle(
         &self,
         epub_page: Option<(usize, usize)>,
         pdf_page: Option<(usize, usize, f32)>,
         cursor_pos: Option<(usize, usize)>,
+        pdf_grid_on: bool,
+        pdf_zoom: f32,
+        cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
         // 只读预览（EPUB）：视口分页页码（滚动位置实时）。
         if let Some((page, total)) = epub_page {
             return Some(self.middle_text("status-epub-page", format!("第 {page} / {total} 页")));
         }
-        // PDF：当前第一张可见页 / 总页数（滚动位置）+ 当前缩放百分比（真机取证 zoom%）。
-        if let Some((page, total, zoom)) = pdf_page {
-            return Some(self.middle_text(
-                "status-pdf-page",
-                format!("第 {page} / {total} 页  {:.0}%", zoom * 100.0),
-            ));
+        // PDF：当前第一张可见页 / 总页数（滚动位置）+ 当前缩放百分比（真机取证 zoom%），
+        // 缩放滑条紧随百分比右侧（2026-11-20 用户要求「滑条放到缩放百分比右边」）；
+        // 网格模式隐藏滑条（网格有独立 grid_zoom）。
+        if let Some((page, total, _)) = pdf_page {
+            let mut m = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(self.middle_text(
+                    "status-pdf-page",
+                    format!("第 {page} / {total} 页  {:.0}%", pdf_zoom * 100.0),
+                ));
+            if !pdf_grid_on {
+                m = m.child(self.status_pdf_zoom_slider(pdf_zoom, cx));
+            }
+            return Some(m);
         }
         // 编辑区：有内容才显示 行:列（未命名空文档省略）。
         if let Some((ln, col)) = cursor_pos {
@@ -276,7 +293,6 @@ impl EditorApp {
         pdf_active: bool,
         pdf_grid_on: bool,
         pdf_page_mode: PageMode,
-        pdf_zoom: f32,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let text_minor = self.text_minor();
@@ -311,9 +327,6 @@ impl EditorApp {
                     cx,
                 ))
                 .child(self.status_pdf_grid_btn(pdf_grid_on, cx));
-            if !pdf_grid_on {
-                right = right.child(self.status_pdf_zoom_slider(pdf_zoom, cx));
-            }
         }
         if readonly_preview {
             right = right.child(self.status_item("status-mode-readonly", "只读", chip_text));
@@ -456,28 +469,21 @@ impl EditorApp {
         let active_bg: gpui::Hsla = ui::theme::Theme::global(cx).colors.selected_bg.into();
         let toggle = self.status_pdf_grid_toggle(cx);
 
-        if !grid_on {
-            // 关态：纯文字（同 status_item 的 12px/chip_text，多出可点 + 悬停手型），无底色。
-            let owned = "status-pdf-grid-btn".to_string();
-            return div()
-                .debug_selector(move || owned.clone())
-                .flex_shrink_0()
-                .cursor_pointer()
-                .text_size(px(12.))
-                .text_color(self.chip_text())
-                .child("▦ 网格")
-                .on_mouse_down(gpui::MouseButton::Left, toggle)
-                .into_any_element();
-        }
-
-        // 开态：高亮 pill（Chip 壳底色换成 selected_bg 选中底色）。
+        // 两态共用**同一 Pill 壳**（同 19px 高 / 同内边距 / 同圆角）→ 几何恒定，仅底色与
+        // 文字色翻转——与「双页」钮同姿势（消除 纯文字 div ↔ Pill 切换的抖动）。
+        let (bg, fg): (gpui::Hsla, gpui::Hsla) = if grid_on {
+            (active_bg, ui::theme::ChromeColors::for_mode(ui::theme::Theme::global(cx).is_dark()).pill_fg.into())
+        } else {
+            (gpui::transparent_black(), self.chip_text())
+        };
         ui::Pill::new("status-pdf-grid-btn")
             .size(ui::PillSize::Md)
             .tone(ui::PillTone::Chip)
             // Md 默认 22px 高/圆角 md 与状态栏壳不匹配，覆写回 19px + 圆角 sm（1:1 保留原壳）。
             .h(px(status_pill_h()))
             .rounded_sm()
-            .bg(active_bg)
+            .bg(bg)
+            .text_color(fg)
             .label("▦ 网格")
             .on_mouse_down(toggle)
             .into_any_element()
@@ -521,31 +527,41 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let active_bg: gpui::Hsla = ui::theme::Theme::global(cx).colors.selected_bg.into();
+        // 图标颜色跟随文字色（未选中 muted chip_text / 选中 pill_fg），两态图标文字同色不跳。
+        let theme = ui::theme::Theme::global(cx);
+        let chrome = ui::theme::ChromeColors::for_mode(theme.is_dark());
+        let pill_fg: gpui::Hsla = chrome.pill_fg.into();
         let on_click = self.status_pdf_mode_toggle(grid_on, current, target, cx);
 
-        if !selected {
-            // 未选中：纯文字（同 status_item 的 12px/chip_text，多出可点 + 悬停手型），无底色。
-            let owned = sel.to_string();
-            return div()
-                .debug_selector(move || owned.clone())
-                .flex_shrink_0()
-                .cursor_pointer()
-                .text_size(px(12.))
-                .text_color(self.chip_text())
-                .child(label)
-                .on_mouse_down(gpui::MouseButton::Left, on_click)
-                .into_any_element();
-        }
-
-        // 选中：高亮 pill（Chip 壳底色换成 selected_bg 选中底色）。
+        // 两态共用**同一 Pill 壳**（同 19px 高 / 同 px_2 内边距 / 同 rounded_sm）→ 几何恒定，
+        // 仅底色与文字色翻转（未选中 = 透明底，选中 = selected_bg 高亮）——消除「纯文字 div
+        // ↔ Pill」切换的高度/内边距差导致的左右抖动（2026-11-20 用户反馈「点击双页会左移」）。
+        // 图标 = 自绘 SVG（`BookOpen` 对开双页，Fluent 线性描边，无字体缺字风险）。
+        let (bg, fg): (gpui::Hsla, gpui::Hsla) = if selected {
+            (active_bg, pill_fg)
+        } else {
+            (gpui::transparent_black(), self.chip_text())
+        };
         ui::Pill::new(sel)
             .size(ui::PillSize::Md)
             .tone(ui::PillTone::Chip)
             // Md 默认 22px 高/圆角 md 与状态栏壳不匹配，覆写回 19px + 圆角 sm（1:1 保留原壳）。
             .h(px(status_pill_h()))
             .rounded_sm()
-            .bg(active_bg)
-            .label(label)
+            .bg(bg)
+            .text_color(fg)
+            .label(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        ui::icon::Icon::new(ui::icon::IconName::BookOpen)
+                            .size(px(13.))
+                            .text_color(fg),
+                    )
+                    .child(label),
+            )
             .on_mouse_down(on_click)
             .into_any_element()
     }
@@ -583,7 +599,7 @@ impl EditorApp {
         )
     }
 
-    /// 状态栏右侧「显示比例」滑条（PDF 阅读模式，`ui::Slider`）：以
+    /// 状态栏左侧「显示比例」滑条（PDF 阅读模式，`ui::Slider`，2026-11-20 从右区移入左区）：以
     /// `[config::pdf::ZOOM_MIN, ZOOM_MAX]` 把当前缩放 `zoom` 归一化为显示值（与
     /// Ctrl+滚轮共享同一 zoom 源 → 天然双向同步、中间区 zoom% 同源），`Immediate`
     /// 每档 `set_zoom_abs`（viewer worker 防抖自担）。仅阅读模式挂载（网格总览隐藏：
