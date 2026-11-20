@@ -110,6 +110,27 @@ pub fn compute_layout(dims: &[(f32, f32)], page_width: f32) -> (Vec<f32>, f32) {
     (tops, total)
 }
 
+/// 全文档最小纵横比 `min_i(w_i/h_i)`（跳过 `w<=0 ∨ h<=0` 退化页；全退化/空 → 1.0）。
+///
+/// 连续（默认）模式「整页入屏」（contain-fit）的包含宽度口径：`base_w =
+/// min(content_w, viewport_h·min_ar)`——与双页（Facing）模式行内同名 `min_ar`（见
+/// [`paged_layout`]）同源姿势，只把「行内页区间」换成「全文档」：取最竖页的宽高比
+/// 限高，保证整页（含最竖页）不超出一屏高。缓存于 view 层（`doc_min_ar`）避免每帧
+/// O(n) 全扫 dims。
+pub fn min_ar(dims: &[(f32, f32)]) -> f32 {
+    let mut min_ar = f32::INFINITY;
+    for &(w, h) in dims {
+        if w > 0.0 && h > 0.0 {
+            min_ar = min_ar.min(w / h);
+        }
+    }
+    if min_ar.is_finite() {
+        min_ar
+    } else {
+        1.0
+    }
+}
+
 /// Z1 缩放锚点重锚（纯函数契约）：返回缩放后应保持「锚点页 K 的页内相对位置」的滚动 y。
 ///
 /// 页列布局 `tops` 随 `page_width` 线性缩放（页高同比、`display_height` 同源），但
@@ -1585,6 +1606,65 @@ mod tests {
 
     fn page_step(page_width: f32) -> f32 {
         display_height(a4(), page_width) + PAGE_GAP
+    }
+
+    #[test]
+    fn min_ar_uniform_multi_page_takes_min_w_over_h() {
+        // 均匀多页：min_ar = 任意页的 w/h（A4 595×842 ≈ 0.70665）。
+        let dims: Vec<(f32, f32)> = vec![a4(); 5];
+        let v = min_ar(&dims);
+        assert!(
+            (v - 595.0 / 842.0).abs() < 1e-5,
+            "均匀 A4 多页 min_ar 应为单页纵横比：{v}"
+        );
+    }
+
+    #[test]
+    fn min_ar_skips_degenerate_and_all_degenerate_falls_back() {
+        // 含退化页（w≤0 ∨ h≤0）：跳过，取其余竖页的最小 w/h。
+        let v = min_ar(&[(595.0, 842.0), (0.0, 100.0), (1.0, 0.0)]);
+        assert!(
+            (v - 595.0 / 842.0).abs() < 1e-5,
+            "退化页应被跳过、取竖页纵横比：{v}"
+        );
+        // 混合尺寸：横页(841.89,595.28) 纵横比 > 竖页 → 竖页受限。
+        let v2 = min_ar(&[(595.28, 841.89), (841.89, 595.28)]);
+        assert!((v2 - 595.28 / 841.89).abs() < 1e-5, "应取最竖页 w/h：{v2}");
+        // 全退化 / 空 → 1.0（与 paged_layout 行内全退化回退同源）。
+        assert_eq!(min_ar(&[(0.0, 1.0), (1.0, 0.0)]), 1.0);
+        assert_eq!(min_ar(&[]), 1.0);
+    }
+
+    #[test]
+    fn min_ar_contain_fit_continuous_matches_facing_fit() {
+        // 连续「整页入屏」基线与 Facing 同 fit 口径（K177 演算，锚 view.rs open_paged_host
+        // 1000×700、A4ish (793,1123)，对照既存 `paged_mid_row_render_window_covers_visible_rows`
+        // Facing 演算 494.3）：
+        //   doc_min_ar = min_ar([(793,1123)]) = 793/1123 ≈ 0.706144；
+        //   continuous: content_w = 1000 − 2×PAGE_PAD_X = 960、
+        //      base = min(960, 700×0.706144 ≈ 494.30) = 494.30（高度轴限幅主导）；
+        //   Facing:     fit_w = 700×0.706144 ≈ 494.30（行内 min_ar 同源数学）→ 两模式同一值。
+        // 2-up 半宽封顶例外（Facing cols=2 cap_w=(960−1)/2=479.5 < 494.3）→ cell_w=479.5，
+        // 两模式差 ≈3% 属预期（brief 明确「也算通过」）。
+        let dims = [(793.0, 1123.0)];
+        let doc_min_ar = min_ar(&dims);
+        assert!(
+            (doc_min_ar - 793.0 / 1123.0).abs() < 1e-5,
+            "doc_min_ar 应为单页纵横比：{doc_min_ar}"
+        );
+        let content_w = (1000.0 - 2.0 * config::pdf::PAGE_PAD_X).max(1.0);
+        let cont_base = content_w.min(700.0 * doc_min_ar);
+        assert!(
+            (cont_base - 494.3).abs() < 0.5,
+            "连续 contain-fit 基线应≈ 494.3（= viewport_h×min_ar）：{cont_base}"
+        );
+        // 与 Facing 同视口高 2 列（无 2-up 封顶时）的 fit_w 逐值一致。
+        let l = paged_layout(&dims, 1500.0, 700.0, 2, PAGED_GAP_X, PAGED_GAP_Y, 20.0);
+        assert!(
+            (l.cell_w_per_row[0] - cont_base).abs() < 0.5,
+            "连续 contain-fit 应与 Facing fit_w 同值（同 min_ar 数学）：cont={cont_base:.2} facing={:.2}",
+            l.cell_w_per_row[0]
+        );
     }
 
     #[test]
