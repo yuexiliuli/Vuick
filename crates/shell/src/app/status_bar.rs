@@ -12,6 +12,9 @@
 //! 全部数据来自既有状态派生（激活选项卡的 file_path/语言、光标、PDF/EPUB 页码、主题偏好），
 //! 不新造全局状态；渲染为静态派生，无持续轮询。
 
+// 状态栏片段构造逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use super::*;
 
 use pdf::view::PageMode;
@@ -462,6 +465,7 @@ impl EditorApp {
     /// 置于「只读」状态项左侧）：在「单列阅读 ↔ 页面网格总览」间切换。两态视觉：
     /// - 关态（grid_on=false）：纯文字可点（对齐 `status_item` 样式，**无底色高亮**）；
     /// - 开态（grid_on=true）：高亮 pill（`ui::Pill` Chip 壳 + `selected_bg` 选中底色）。
+///
     /// 按下即从激活选项卡取出 PdfViewer 实体（随选项卡搬迁即随动，无需 shell 额外状态）
     /// 调 `toggle_grid`——内部已 `notify`，订阅（`subscribe_pdf`）驱动外壳同帧重绘刷新按钮态。
     /// 颜色一律走 `ui::theme` 禁裸色：开态底色 `selected_bg` 随亮暗主题，关态文字走 `chip_text`。

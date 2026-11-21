@@ -15,6 +15,8 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
+// AVX2 IDCT/Resample/Color 内核逐寄存器传参，具名构参破坏字节恒等算术单源性 → 放行。
+#![allow(clippy::too_many_arguments)]
 
 use super::cs::{
     output_count, BIAS, C1, C2, C3, C5, C6, C7, K4, KB, KGB, KGR, KR, R_H2, R_HV2, R_ONE_TO_ONE,
@@ -742,9 +744,9 @@ mod kernels {
             let rlo = _mm_shuffle_epi8(lo_i, m3);
             let rhi = _mm_shuffle_epi8(hi_i, m3);
             _mm_storel_epi64(dst as *mut __m128i, rlo);
-            _mm_storeu_si32(dst.add(8) as *mut u8, _mm_srli_si128(rlo, 8));
+            _mm_storeu_si32(dst.add(8), _mm_srli_si128(rlo, 8));
             _mm_storel_epi64(dst.add(12) as *mut __m128i, rhi);
-            _mm_storeu_si32(dst.add(20) as *mut u8, _mm_srli_si128(rhi, 8));
+            _mm_storeu_si32(dst.add(20), _mm_srli_si128(rhi, 8));
         }
     }
 

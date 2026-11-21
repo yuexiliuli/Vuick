@@ -69,7 +69,7 @@ impl EditorApp {
         if let Some(v) = &self.music {
             return v.clone();
         }
-        let player = cx.new(|cx| music::MusicPlayer::new(cx));
+        let player = cx.new(music::MusicPlayer::new);
         let view = cx.new(|cx| music::MusicView::new(player, cx));
         let sub = cx.subscribe(&view, |this, _view, ev: &music::MusicEvent, cx| {
             match *ev {
@@ -80,7 +80,7 @@ impl EditorApp {
                     // 事件在窗口更新栈内派发（同步 update_window 会空转）→ 延后到主线程
                     // 任务里按实体找所属窗口恢复编辑区焦点。
                     cx.spawn(async move |_weak, cx| {
-                        let _ = cx.update(|app| {
+                        cx.update(|app| {
                             app.with_window(entity.entity_id(), |window, app| {
                                 window.focus(&focus, app);
                             });

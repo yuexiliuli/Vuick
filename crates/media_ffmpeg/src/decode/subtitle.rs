@@ -15,6 +15,8 @@ use ffmpeg::media::Type;
 // ---------------- 字幕（ASS/SSA）----------------
 
 /// 字幕格式枚举。
+/// 变体名沿用 ASS/SSA/SRT 标准缩写 → 放行。
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SubtitleFormat {
     ASS,

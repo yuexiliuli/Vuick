@@ -177,7 +177,7 @@ pub fn highlight_ranges(text: &str, q: &str) -> Vec<std::ops::Range<usize>> {
 }
 
 /// 后台递归扫描文件夹内容（**不在主线程执行**）：跳过黑名单目录 / 会话目录、跳过
-/// >5MB 超大文件与二进制 / 非 UTF-8 文件；对每个候选文本文件 LF 归一化后逐行扫查询词
+/// 5MB 以上超大文件与二进制 / 非 UTF-8 文件；对每个候选文本文件 LF 归一化后逐行扫查询词
 /// （`scan_line_hits`），命中文件作为一个块经有界 `tx` 外推（背压让出）。`total` 为
 /// 累计命中条数，达到 `cap` 即停止扫描（返回截断标记）。单文件读失败 / 单目录读失败 /
 /// 无权限 → 跳过该条目计为已扫描，**不中断**整体扫描。
@@ -311,7 +311,7 @@ pub fn find_ci(haystack: &str, needle: &str) -> Option<std::ops::Range<usize>> {
                 // 对任何混合大小写正文都永不命中（首字节已双形、尾字节漏折，P1-36）。
                 // needle 全 ASCII，`to_ascii_lowercase` 安全且长度不变。
                 for (j, &nb) in n.iter().enumerate().skip(1) {
-                    if h[at + j].to_ascii_lowercase() != nb.to_ascii_lowercase() {
+                    if !h[at + j].eq_ignore_ascii_case(&nb) {
                         ok = false;
                         break;
                     }

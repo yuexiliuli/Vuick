@@ -18,6 +18,9 @@
 //! `new_media_window` 构造（不读 CLI 首参、不恢复会话），避免 CLI 媒体参数在重定向链上
 //! 被反复重读成循环、以及重复恢复全量会话。
 
+// 媒体窗布局逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::path::Path;
 
 use gpui::{px, AnyWindowHandle, Pixels, Size};

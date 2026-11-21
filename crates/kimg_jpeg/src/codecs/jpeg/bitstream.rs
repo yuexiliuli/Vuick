@@ -2,6 +2,9 @@
 //!
 //! u64 缓冲 + 4 字节预读 + marker/字节填充处理 + `overread_by` 语义逐行对齐。
 
+// 解码块内核（decode_mcu_block*/decode_block_inner*）逐表/逐游标传参 → 放行。
+#![allow(clippy::too_many_arguments)]
+
 use core::cmp::min;
 
 use crate::codecs::jpeg::error::DecodeError;
@@ -617,7 +620,7 @@ impl BitStream {
         }
         if self.eob_run > 0 {
             // 仅当块非纯零时处理（EOB 意味着后续块可能全零）
-            if &block[1..] != &[0_i16; 63] {
+            if block[1..] != [0_i16; 63] {
                 self.refill(reader)?;
 
                 while k <= self.spec_end {
@@ -893,7 +896,7 @@ impl BitStream {
                 let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
                 ab <<= len;
                 let rs = ((e >> 11) & 255) as u8;
-                let t = (rs & 15) as u8;
+                let t = rs & 15;
                 let mag = (ab >> (64 - t)) as i32;
                 ab <<= t;
                 bl = bl.saturating_sub(len + t);
@@ -906,7 +909,7 @@ impl BitStream {
                     ac_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
                 decode_huff!(self, symbol, ac_table);
                 let rs = symbol as u8;
-                let size = (rs & 15) as u8;
+                let size = rs & 15;
                 let v = if size != 0 {
                     let r = self.get_bits(size);
                     huff_extend(r, i32::from(size))
@@ -961,7 +964,7 @@ impl BitStream {
     ///     之后——C# 同款「behind k from now on」），跨块 mask 写回供下一 scan 复用；
     ///  4) r 越谱带（run 超出剩余零数）夹到 Se：修正 [k, Se] 全部显著位并在 Se 落新系数——
     ///     与线性游走 `k==spec_end` break 后落位逐位一致（损坏流夹逼语义）。
-    /// 硬闸：csharp parity 广谱 114（含 38 progressive 变体）逐字节恒等。
+    ///     硬闸：csharp parity 广谱 114（含 38 progressive 变体）逐字节恒等。
     #[allow(clippy::too_many_lines)]
     #[inline]
     pub(crate) fn decode_mcu_ac_refine_v<'a>(
@@ -1766,7 +1769,7 @@ impl HotStream {
             let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
             ab <<= len;
             let rs = ((e >> 11) & 255) as u8;
-            let t = (rs & 15) as u8;
+            let t = rs & 15;
             let mag = (ab >> (64 - t)) as i32;
             ab <<= t;
             bl = bl.saturating_sub(len + t);
@@ -1778,7 +1781,7 @@ impl HotStream {
             let mut symbol = ac_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
             decode_huff!(self, symbol, ac_table);
             let rs = symbol as u8;
-            let size = (rs & 15) as u8;
+            let size = rs & 15;
             let v = if size != 0 {
                 let r = self.get_bits(size);
                 huff_extend(r, i32::from(size))
@@ -1925,7 +1928,7 @@ impl HotStream {
                 let len = ((e >> CS_CODELEN_SHIFT) & 15) as u8;
                 ab <<= len;
                 let rs = ((e >> 11) & 255) as u8;
-                let t = (rs & 15) as u8;
+                let t = rs & 15;
                 let mag = (ab >> (64 - t)) as i32;
                 ab <<= t;
                 bl = bl.saturating_sub(len + t);
@@ -1938,7 +1941,7 @@ impl HotStream {
                     ac_table.lookup[(self.aligned_buffer >> (64 - CS_LUT_BITS)) as usize];
                 decode_huff!(self, symbol, ac_table);
                 let rs = symbol as u8;
-                let size = (rs & 15) as u8;
+                let size = rs & 15;
                 let v = if size != 0 {
                     let r = self.get_bits(size);
                     huff_extend(r, i32::from(size))
@@ -1985,8 +1988,8 @@ impl HotStream {
     ///   - FULL 条目（值内嵌表项，消费 ≤11 位）⟹ 恒安全；
     ///   - 码在窗内、幅值出窗 → 精确需 bits_left ≥ len+t；
     ///   - 慢路径（码长 >11）→ 需 bits_left ≥ 31（最多 16+15 位）。
-    /// 判据不满足 → 回退循环顶 = 单符号路径的「refill 检查 + 解符号」（逐位一致；仅
-    /// marker 探测点可延后一个 refill：对有效流收敛、坏流走抛错路径，parity 兜底）。
+    ///     判据不满足 → 回退循环顶 = 单符号路径的「refill 检查 + 解符号」（逐位一致；仅
+    ///     marker 探测点可延后一个 refill：对有效流收敛、坏流走抛错路径，parity 兜底）。
     ///
     /// A′ 对齐（2026-11-07，C1）：把 aligned_buffer/bits_left 提为热环局部 `ab`/`bl`，
     /// 全程寄存器驻留、环内「只算不落盘」；refill 改走 `refill_value`（value-return），

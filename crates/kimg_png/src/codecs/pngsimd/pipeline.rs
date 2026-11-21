@@ -150,12 +150,11 @@ fn inflate_producer(
             h.color_type,
             h.interlace == 1,
         );
-        if let Some(max) = max_alloc {
-            if e > max {
+        if let Some(max) = max_alloc
+            && e > max {
                 *err_slot(shared) = Some("解压尺寸超出限制".to_string());
                 return;
             }
-        }
         match usize::try_from(e) {
             Ok(v) => v,
             Err(_) => {

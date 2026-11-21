@@ -88,6 +88,7 @@ pub fn sync_active_media_meta(m: &mut AppModel, cx: &mut gpui::App) -> bool {
 
 /// 图片/视频「锁定/解锁」右键菜单**单项构建**（锁定时前导 ✓；点击 → 切换查看器锁定态
 /// + 强制重绘——宿主重读媒体查看器锁定态 → 隐藏/恢复外壳 → 媒体自动填满/缩小）。
+///
 /// 调用方按 [`MediaReader`] 分支；PDF/无（[`active_media_viewer`] 已按 `is_lockable`
 /// 过滤）不可达。
 pub fn lock_menu_item(media: MediaReader) -> PopupMenuItem {

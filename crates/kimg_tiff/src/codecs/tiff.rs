@@ -111,7 +111,7 @@ fn parse_ifd<R: BufRead + Seek>(
     ifd0: u64,
     file_len: u64,
 ) -> Result<Vec<IfdEntry>, ImageError> {
-    if ifd0.checked_add(2).map_or(true, |e| e > file_len) {
+    if ifd0.checked_add(2).is_none_or(|e| e > file_len) {
         return Err(decoding("IFD 偏移越界"));
     }
     let count = order.u16(&read_range(r, ifd0, 2)?) as u64;
@@ -138,7 +138,7 @@ fn parse_ifd<R: BufRead + Seek>(
             raw[8..8 + total as usize].to_vec()
         } else {
             let off = u64::from(order.u32(&raw[8..12]));
-            if off.checked_add(total).map_or(true, |e| e > file_len) {
+            if off.checked_add(total).is_none_or(|e| e > file_len) {
                 return Err(decoding("IFD 值偏移越界"));
             }
             read_range(r, off, total as usize)?
@@ -154,13 +154,13 @@ fn int_values(entry: &IfdEntry, order: ByteOrder) -> ImageResult<Vec<u64>> {
     let out = match entry.typ {
         1 | 7 => v.iter().map(|&x| u64::from(x)).collect(),
         3 => {
-            if v.len() % 2 != 0 {
+            if !v.len().is_multiple_of(2) {
                 return Err(decoding("SHORT 值长度不是 2 的倍数"));
             }
             v.chunks_exact(2).map(|c| u64::from(order.u16(c))).collect()
         }
         4 | 13 => {
-            if v.len() % 4 != 0 {
+            if !v.len().is_multiple_of(4) {
                 return Err(decoding("LONG 值长度不是 4 的倍数"));
             }
             v.chunks_exact(4).map(|c| u64::from(order.u32(c))).collect()
@@ -345,7 +345,7 @@ where
 
         // ---- 布局 -> 输出色型 ----
         let photo_u16 = require_uint(262, "PhotometricInterpretation")?;
-        if !matches!(photo_u16, 0 | 1 | 2) {
+        if !matches!(photo_u16, 0..=2) {
             return Err(unsupported(
                 "PhotometricInterpretation 仅支持 WhiteIsZero/BlackIsZero/RGB（Palette/CMYK/YCbCr 放后置）",
             ));
@@ -376,19 +376,19 @@ where
         };
 
         // ---- strip 布局 ----
-        let row_bytes_u64 = width as u64 * samples; // 8bit 采样，每样本 1 字节
+        let row_bytes_u64 = width * samples; // 8bit 采样，每样本 1 字节
         let row_bytes = u32::try_from(row_bytes_u64).map_err(int_err)?;
         let out_channels = match photo_layout {
             PhotoLayout::Gray { .. } => 1u32,
             PhotoLayout::Rgb | PhotoLayout::RgbCompact => 3,
             PhotoLayout::Rgba => 4,
         };
-        let out_row_bytes = u32::try_from(width as u64 * u64::from(out_channels)).map_err(int_err)?;
-        let rps_raw = get_uint(278)?.unwrap_or(height as u64);
+        let out_row_bytes = u32::try_from(width * u64::from(out_channels)).map_err(int_err)?;
+        let rps_raw = get_uint(278)?.unwrap_or(height);
         // RowsPerStrip=0 按 TIFF 规范视为整图高度。
-        let rps = if rps_raw == 0 { height as u64 } else { rps_raw };
+        let rps = if rps_raw == 0 { height } else { rps_raw };
         let rps = u32::try_from(rps).map_err(int_err)?;
-        let strip_count = (height as u64).div_ceil(rps as u64);
+        let strip_count = height.div_ceil(rps as u64);
 
         // 273 长度受文件界约束（IFD 值长度 ≤ 文件），先于任何规模分配做一致性校验；
         // 与 tiff crate 一致：多 strip 时单值数组不复制，长度不符即 Err（消除内存放大面/静默错解）。
@@ -422,7 +422,7 @@ where
                     StripByteCounts::Explicit(bc) => bc[i],
                     StripByteCounts::FullRows => {
                         let start = i as u64 * rps as u64;
-                        let rows = (height as u64 - start).min(rps as u64);
+                        let rows = (height - start).min(rps as u64);
                         rows * row_bytes_u64
                     }
                 };
@@ -434,7 +434,7 @@ where
             if st
                 .offset
                 .checked_add(st.byte_count)
-                .map_or(true, |e| e > file_len)
+                .is_none_or(|e| e > file_len)
             {
                 return Err(decoding("strip 数据越界"));
             }
@@ -716,8 +716,8 @@ fn decode_lzw_fast(src: &[u8], out: &mut [u8]) -> ImageResult<()> {
         oi += take;
 
         // 每个非首码各建一个表项（满表后不再增项/升宽，继续以 12 位解）。
-        if let Some((prev_code, _)) = prev {
-            if prefix.len() < MAX_ENTRIES {
+        if let Some((prev_code, _)) = prev
+            && prefix.len() < MAX_ENTRIES {
                 prefix.push(prev_code as u16);
                 suffix.push(first);
                 // TIFF early-change：表项编号 ≥ 2^bits − 2 即提前升宽。
@@ -726,7 +726,6 @@ fn decode_lzw_fast(src: &[u8], out: &mut [u8]) -> ImageResult<()> {
                 }
                 next_code += 1;
             }
-        }
 
         prev = Some((code, first));
     }
@@ -841,8 +840,8 @@ fn decode_lzw_slow(src: &[u8], out: &mut [u8]) -> ImageResult<()> {
 
         let first = word[0];
         // 每个非首码各建一个表项（满表后不再增项/升宽，继续以 12 位解）。
-        if let Some((prev_code, _)) = prev {
-            if table.len() < MAX_ENTRIES {
+        if let Some((prev_code, _)) = prev
+            && table.len() < MAX_ENTRIES {
                 table.push((prev_code as u16, first));
                 // TIFF early-change：表项编号 ≥ 2^bits − 2 即提前升宽。
                 if next_code >= (1u32 << code_size) - 2 && code_size < 12 {
@@ -850,7 +849,6 @@ fn decode_lzw_slow(src: &[u8], out: &mut [u8]) -> ImageResult<()> {
                 }
                 next_code += 1;
             }
-        }
 
         prev = Some((code, first));
         last_word.clone_from(&word);
@@ -940,6 +938,7 @@ fn apply_horizontal_predictor(buf: &mut [u8], row_bytes: usize, samples: usize) 
 ///   N=2→[2,4,8]；N=3→[3,6,12]；N=4→[4,8]。
 /// - MASK_N[j] = 16-N+(j mod N)（N=3 为 13,14,15 循环——note：非 12,13,14，前导 carry 偏移
 ///   由链长 N 定，16-3=13；首块 prev=0 → carry=0）。
+///
 /// 整除块循环后尾部（非 16 倍数）标量收尾，自然取本块已压解码值作 carry。
 #[cfg(target_arch = "x86_64")]
 mod pred_simd {

@@ -58,9 +58,7 @@ pub fn add_bookmark_action(
     pdf: &Entity<PdfViewer>,
     cx: &mut App,
 ) -> Option<(String, String)> {
-    let Some((page1, _)) = pdf.read(cx).current_page() else {
-        return None;
-    };
+    let (page1, _) = pdf.read(cx).current_page()?;
     let page_index = page1.saturating_sub(1);
     let title = pdf
         .read(cx)

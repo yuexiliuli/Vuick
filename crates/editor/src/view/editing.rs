@@ -2,6 +2,9 @@
 //! 方向/词/行/文档移动与选区扩展、代码折叠切换与括号标尺竖线（`bracket_guide_segments*`）、
 //! 插入/退格/删除/换行/Tab、复制剪切粘贴、撤销与重做。
 
+// 编辑动作内核逐游标/逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     ops::Range,
 };
@@ -529,6 +532,7 @@ impl CodeEditor {
     ///   `depth % 3` 循环取色，深度不同色不同，不能糊成一色；
     /// - `active` = 该段所属括对是否为**活动括对**（[`Self::active_pair`]，由主光标
     ///   严格内含派生、随光标移动跟随）。
+    ///
     /// `mode` = [`BracketGuidesMode`]：**Off = 不产竖线**（只留钩线层，见 render
     /// `bracket_guide_hooks_layer`）；**Active = 仅活动括对产段**（其余括对跳过、不产线，
     /// 其列灰缩进线正常显示/共存，对齐 VSCode `bracketPairs:'active'`）；All = 全部括对产段
@@ -721,11 +725,10 @@ impl CodeEditor {
             if p.open_line >= p.close_line {
                 continue; // 过期配对（编辑后未及时重扫）。
             }
-            if let Some(al) = active_lite {
-                if al != BracketPairLite::from(p) {
+            if let Some(al) = active_lite
+                && al != BracketPairLite::from(p) {
                     continue; // Active：跳过非活动括对，其灰缩进线保留。
                 }
-            }
             let col = self.guide_pair_column(p);
             let vs = self.folds.visual_row(p.open_line);
             let ve = self.folds.visual_row(p.close_line);
@@ -752,6 +755,7 @@ impl CodeEditor {
     ///   3. 否则存在 `close_line == r` 的括对 → P = 其中 depth 最大者（点 `}`：步骤 2
     ///      无外层严格含 r 才到此处——if 的 `}` 在 fn 内 → fn；fn 顶层 `}` → fn）；
     ///   4. 否则 None（无关联块 → 无高亮）。
+    ///
     /// 纯行号派生（不再看光标字符列）。`bracket_pairs` 已按 `open_line` 升序：步骤 1 用
     /// 二分前缀定界（mega 同开行多配对取 depth 最大）；步骤 2/3 只扫 `open_line ≥ r − 回看`
     /// 的窗口（跨 `BRACKET_GUIDE_WINDOW_LOOKBACK_LINES` 长活括对省略 = 竖线窗口同一次已
@@ -932,16 +936,15 @@ impl CodeEditor {
         // 首值 = 视口上方最近非空行（一次定位，与无界扫 `(0..v).rev()` 一致——视口首行即
         // 空行时仍取到上方代码）；下一非空用**惰性预取**（`next_cand` 缓存 + `next_scan_from`
         // 短路），只前进不回头 → 长纯空白段/近全空 buffer 上每空行摊销 O(1)，不逐空行无界扫。
-        let mut prev_indent: Option<i32> = (0..top_vis).rev().find_map(|w| indent_of(w));
+        let mut prev_indent: Option<i32> = (0..top_vis).rev().find_map(&indent_of);
         let mut next_cand: Option<(usize, i32)> = None;
         let mut next_scan_from: usize = top_vis;
         for v in top_vis..bottom_vis {
             // 缓存的下一非空行已被当前行到达/越过 → 作废。
-            if let Some((w, _)) = next_cand {
-                if w <= v {
+            if let Some((w, _)) = next_cand
+                && w <= v {
                     next_cand = None;
                 }
-            }
             let level = match indent_of(v) {
                 Some(i) => {
                     prev_indent = Some(i);
@@ -1019,7 +1022,7 @@ impl CodeEditor {
                 };
                 let row_lit = |r: usize| {
                     active_col == Some(g)
-                        && active_block.map_or(false, |(vo, vc)| r >= vo && r < vc)
+                        && active_block.is_some_and(|(vo, vc)| r >= vo && r < vc)
                         && !supp_rows.contains(&r)
                 };
                 let mut r = gs;
@@ -1064,6 +1067,7 @@ impl CodeEditor {
     ///   经 `folds.visual_row`）；单行配对 / 折叠压缩（体空 `first >= vc`）→ None。
     /// - **列** = [`Self::guide_pair_column_lite`]（`guide_pair_column` 同式，render 竖线 /
     ///   钩线同源，K153 封口）；**色** = `palette[P.depth % 3]`（见 `active_guide_highlight_color`）。
+    ///
     /// 由 `selection.head()` 所在逻辑行派生 → 方向键/点击/横滚/折叠均跟随。
     pub(super) fn active_guide_group(&self) -> Option<(usize, usize, usize)> {
         let p = self.active_pair()?;

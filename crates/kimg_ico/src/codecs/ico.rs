@@ -50,9 +50,8 @@ impl DirEntry {
 }
 
 fn read_entry<R: Read>(r: &mut R) -> ImageResult<DirEntry> {
-    let mut d = DirEntry::default();
-    d.width = read_u8(r)?;
-    d.height = read_u8(r)?;
+    let width = read_u8(r)?;
+    let height = read_u8(r)?;
     let _color_count = read_u8(r)?;
     let _reserved = read_u8(r)?;
     // 若为大热区（CUR）坐标，校验不超过 256；ICO 的 planes 应为 0/1。
@@ -62,15 +61,21 @@ fn read_entry<R: Read>(r: &mut R) -> ImageResult<DirEntry> {
             "ICO image entry has too many color planes or too large hotspot value",
         ));
     }
-    d.bits_per_pixel = read_u16(r)?;
-    if d.bits_per_pixel > 256 {
+    let bits_per_pixel = read_u16(r)?;
+    if bits_per_pixel > 256 {
         return Err(ico_err(
             "ICO image entry has too many bits per pixel or too large hotspot value",
         ));
     }
-    d.image_length = read_u32(r)?;
-    d.image_offset = read_u32(r)?;
-    Ok(d)
+    let image_length = read_u32(r)?;
+    let image_offset = read_u32(r)?;
+    Ok(DirEntry {
+        width,
+        height,
+        bits_per_pixel,
+        image_length,
+        image_offset,
+    })
 }
 
 /// 选出「位深最大，其次面积最大」的条目（与 image 0.25 相同）。

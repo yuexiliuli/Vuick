@@ -87,14 +87,13 @@ fn collect(root: &Path, map: &mut Vec<(String, PathBuf)>) {
                 let p = entry.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if let Some(ext) = ext_of(&p) {
-                    if matches!(
+                } else if let Some(ext) = ext_of(&p)
+                    && matches!(
                         ext.as_str(),
                         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico"
                     ) {
                         map.push((ext, p));
                     }
-                }
             }
         }
     }
@@ -114,7 +113,7 @@ fn main() {
             eprintln!("[imgbench] skip missing corpus dir: {}", r.display());
             continue;
         }
-        collect(&r, &mut items);
+        collect(r, &mut items);
     }
     items.sort_by(|a, b| a.1.cmp(&b.1));
 

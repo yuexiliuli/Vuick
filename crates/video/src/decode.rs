@@ -575,6 +575,8 @@ impl AudioReader {
 // ---------------- 字幕 Reader ----------------
 
 /// 字幕格式枚举。
+/// 变体名沿用 ASS/SSA/SRT 标准缩写 → 放行。
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(dead_code)] // 保留供后续 FFI 扩展用
 pub enum SubtitleFormat {

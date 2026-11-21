@@ -156,6 +156,7 @@ pub fn pick_color(initial: Option<gpui::Hsla>, owner_hwnd: isize) -> Option<Stri
     let g = to8(initial_rgba.g);
     let b = to8(initial_rgba.b);
     #[allow(non_camel_case_types)]
+    #[allow(clippy::upper_case_acronyms)] // 与 Win32 `CHOOSECOLORW` 原生名一致
     #[repr(C)]
     struct CHOOSECOLORW {
         l_struct_size: u32,

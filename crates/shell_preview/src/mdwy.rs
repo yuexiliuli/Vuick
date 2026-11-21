@@ -640,6 +640,7 @@ pub fn md_wy_feed_full_rope<H: 'static>(
 ///   1) **tab 归属**：该 tab 的 `md_wy` 仍指向 `wy`（未关闭 / 未重建实体 / 未切走）；
 ///   2) **装配代号**：`wy.install_state.seq` 仍 == `seq`（期间又有新装配 / 同步喂源 /
 ///      换源 → 旧装配作废，不装陈旧整篇；代号检查收敛进 [`WyEditor::begin_install`]）。
+///
 /// 满足才 `install_open` 并 [`WyEditor::finish_install`] 清在途。整篇 O(n) 解析
 /// （`Doc::open` + 派生标记计数）在 `background_executor`，UI 只做 O(1) 快照 + 完成
 /// 回调里的 `install_open`（对齐 toggle ON 的既有异步通道）。

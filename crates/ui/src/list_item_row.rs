@@ -11,6 +11,9 @@
 //! target）；`on_activate` —— 点击执行（Enter 由宿主键盘路径触发同一处理器）。返回
 //! `ListItemRow` 型组件恒为手型 cursor（对齐 palette 条目行：恒可交互）。
 
+// 列表行控件回调类型较长 → 放行
+#![allow(clippy::type_complexity)]
+
 use std::rc::Rc;
 
 use gpui::{

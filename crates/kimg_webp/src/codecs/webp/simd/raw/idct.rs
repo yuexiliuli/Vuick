@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+// IDCT SIMD 内核逐寄存器传参且带中间向量常量，具名构参会破坏字节恒等的算术单源性 → 放行。
+#![allow(clippy::too_many_arguments)]
 //! 裸 unsafe 叶子子模块 `raw::idct`：VP8 DCT 逆变换（两遍 butterfly / i16±i32 域 pass2）/ DC
 //! 捷径（双块 + 单块）的全部 SSE2 SIMD 内核 + 分派门面整体迁入（原 `simd/idct.rs`）。
 //! 上层 `simd/idct.rs` 以 `#![forbid(unsafe_code)]` + 薄委托显式依赖本模块。算法 / 常量 /
@@ -249,7 +251,6 @@ pub(crate) unsafe fn inverse_dct_add_two_forced(
         unsafe {
             idct_add_two_sse2(coeff_a.as_ptr(), coeff_b.as_ptr(), dst, pitch as isize, i16_en);
         }
-        return;
     }
     // 非 x86_64：x86 intrinsic 不存在，恒走标量全变换兜底（运行时不达：调用方
     // `part_simd_on("dct","sse2")` 在非 x86_64 恒为 false）。
@@ -307,7 +308,6 @@ pub(crate) unsafe fn idct_add_one_forced(
         unsafe {
             idct_add_one_sse2(coeff.as_ptr(), dst, pitch as isize, i16_en);
         }
-        return;
     }
     // 非 x86_64：x86 intrinsic 不存在，恒走标量全变换兜底（运行时不达：调用方
     // `part_simd_on("dct","sse2")` 在非 x86_64 恒为 false）。
@@ -366,7 +366,6 @@ pub(crate) unsafe fn dc_add_two_forced(
         unsafe {
             dc_add_two_sse2(dc_a, dc_b, dst, pitch as isize);
         }
-        return;
     }
     // 非 x86_64：x86 intrinsic 不存在，恒走标量全变换兜底（运行时不达：调用方
     // `part_simd_on("dct","sse2")` 在非 x86_64 恒为 false）。
@@ -443,7 +442,6 @@ pub(crate) unsafe fn dc_add_one_forced(dc: i16, plane: &mut [u8], pitch: usize, 
         unsafe {
             dc_add_one_sse2(dc, dst, pitch as isize);
         }
-        return;
     }
     // 非 x86_64：x86 intrinsic 不存在，恒走标量全变换兜底（运行时不达：调用方
     // `part_simd_on("dct","sse2")` 在非 x86_64 恒为 false）。

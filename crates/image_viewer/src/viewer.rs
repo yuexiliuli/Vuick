@@ -879,10 +879,10 @@ fn downsample_row_4ch(buf: &[u8], iw: u32, ih: u32, den: u32, ow: u32, oy: u32, 
         }
         let di = ox as usize * 4;
         if n > 0 {
-            dst[di] = (acc[0] / n) as u8;
-            dst[di + 1] = (acc[1] / n) as u8;
-            dst[di + 2] = (acc[2] / n) as u8;
-            dst[di + 3] = (acc[3] / n) as u8;
+            dst[di] = (acc[0].checked_div(n).unwrap_or(0)) as u8;
+            dst[di + 1] = (acc[1].checked_div(n).unwrap_or(0)) as u8;
+            dst[di + 2] = (acc[2].checked_div(n).unwrap_or(0)) as u8;
+            dst[di + 3] = (acc[3].checked_div(n).unwrap_or(0)) as u8;
         }
     }
 }
@@ -950,9 +950,9 @@ fn downsample_row_3ch(buf: &[u8], iw: u32, ih: u32, den: u32, ow: u32, oy: u32, 
         }
         let di = ox as usize * 4;
         if n > 0 {
-            dst[di] = (acc[2] / n) as u8; // B ← 源通道 2（蓝；RGB→BGRA 重排 R/B）
-            dst[di + 1] = (acc[1] / n) as u8; // G
-            dst[di + 2] = (acc[0] / n) as u8; // R ← 源通道 0（红）
+            dst[di] = (acc[2].checked_div(n).unwrap_or(0)) as u8; // B ← 源通道 2（蓝；RGB→BGRA 重排 R/B）
+            dst[di + 1] = (acc[1].checked_div(n).unwrap_or(0)) as u8; // G
+            dst[di + 2] = (acc[0].checked_div(n).unwrap_or(0)) as u8; // R ← 源通道 0（红）
             dst[di + 3] = 255;
         }
     }
@@ -1099,6 +1099,7 @@ fn decode_display_within_budget(w: u32, h: u32) -> bool {
 /// 选档复用 [`pick_den`]（与格式无关的「解码 ≥ 显示」语义）。
 /// - den=1 → 与改动前 `image` 全解**逐像素一致**（RGBA swap 成 BGRA，尺寸=原始）；
 /// - den>1 → 只对**缩小后**缓冲区 swap 红蓝（不在 9M 全量上做交换）。
+///
 /// 任何失败均返回 `Err`（由上层回退 `image` 全解），绝不 panic/硬失败。
 fn decode_png_display(
     bytes: &[u8],
@@ -1145,6 +1146,7 @@ fn decode_png_display(
 /// 变换**。
 /// - den=1 → 与改动前 `decode_generic` 全解**逐像素一致**（RGBA swap 成 BGRA，尺寸=原始）；
 /// - den>1 → 只对**缩小后**缓冲区 swap 红蓝（不在大图上做交换）。
+///
 /// 任何失败均返回 `Err`（由上层回退 `decode_generic` 全解 den=1，绝不 panic/硬失败）。
 fn decode_heif_display(
     bytes: &[u8],
@@ -1180,6 +1182,7 @@ fn decode_heif_display(
 /// - den=1 → 与改动前 [`decode_static_first_frame`] 全解**逐像素一致**（RGBA→BGRA swap，
 ///   尺寸=原始）；
 /// - den>1 → 只在**降档后**缓冲上做通道重排（不在大图上做交换）。
+///
 /// 任何失败均返回 `Err`（由上层回退 [`decode_generic`] 全解 den=1，绝不 panic/硬失败）。
 fn decode_generic_display(
     bytes: &[u8],

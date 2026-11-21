@@ -13,6 +13,9 @@
 //! 拖拽动作编排（take/adopt/split/restore/release）、幽灵窗实体创建/销毁与
 //! `SetWindowPos`/DWM 原生调用（经 `TabDragHost` 宿主服务面路由，`app/host_impl.rs`）。
 
+// tab 拖拽命中内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use super::*;
 
 impl EditorApp {
@@ -206,6 +209,7 @@ impl EditorApp {
     /// - 窗内 picture 远离边缘：只见原有 gpui 小胶囊，**没有浮窗/蓝块**（幽灵窗隐藏）；
     /// - 贴边 / 拖出拖入：只是「显示 ⇄ 隐藏 + 定位」（一次 `SetWindowPos`），无创建/销毁
     ///   卡顿、无抓取偏移跳变（窗内 picture 与幽灵窗都画在 `鼠标 - 抓取偏移`）；
+///
     /// 真文件窗口仍然只在 [`Self::release_tab_drag_outside`] 松开时建立。拖拽结束
     /// （松开）由 [`Self::destroy_drag_ghost`] 销毁。
     pub(super) fn update_drag_ghost(
@@ -239,7 +243,7 @@ impl EditorApp {
         } else {
             shell_tabs::drag::tab_preview_size(&name, dirty, window)
         };
-        let grab = self.model.borrow().tab_drag_grab.unwrap_or(Point::default());
+        let grab = self.model.borrow().tab_drag_grab.unwrap_or_default();
         // 幽灵窗布局参数（域纯计算）：屏幕原点 = 源窗口左上角 + (拖拽点 − 抓取偏移)
         // （与 gpui 窗内绘制拖拽 picture 的位置完全一致）；显示条件 = 越出窗口 **或**
         // 窗内 picture 将要被窗口边缘遮断（含 4px 余量）——贴边即提前切同位置同尺寸的
@@ -299,7 +303,7 @@ impl EditorApp {
             // 已有（防御：拖拽结束销毁失败的残留）→ 仅换名/脏点复用。
             let _ = gh.update(cx, |view, _window, cx| {
                 if let Ok(ghost) = view.downcast::<TabDragGhost>() {
-                    let _ = ghost.update(cx, |view, _cx| {
+                    ghost.update(cx, |view, _cx| {
                         view.name = name;
                         view.dirty = dirty;
                     });
@@ -354,10 +358,10 @@ impl EditorApp {
                     );
                     if let Ok(wh) = handle {
                         let gh: AnyWindowHandle = wh.into();
-                        this.drag_ghost = Some(gh.clone());
+                        this.drag_ghost = Some(gh);
                         // 建完立刻剥掉 DWM 的圆角/过渡框线（见 strip 注释），并按创建时
                         // 落定的「是否可见 + 屏幕位置」定位——首帧不偏位、不闪。
-                        Self::strip_ghost_dwm_frame(gh.clone(), cx);
+                        Self::strip_ghost_dwm_frame(gh, cx);
                         Self::place_drag_ghost(gh, origin, visible, cx);
                     }
                 });
@@ -380,8 +384,7 @@ impl EditorApp {
             {
                 use raw_window_handle::HasWindowHandle as _;
                 if let Ok(handle) = ghost_window.window_handle()
-                    && let Ok(raw_window_handle::RawWindowHandle::Win32(win32)) =
-                        raw_window_handle::RawWindowHandle::try_from(handle)
+                    && let raw_window_handle::RawWindowHandle::Win32(win32) = From::from(handle)
                 {
                     let scale = ghost_window.scale_factor();
                     let x = (screen.x.as_f32() * scale).round() as i32;
@@ -421,8 +424,7 @@ impl EditorApp {
             {
                 use raw_window_handle::HasWindowHandle as _;
                 if let Ok(handle) = ghost_window.window_handle()
-                    && let Ok(raw_window_handle::RawWindowHandle::Win32(win32)) =
-                        raw_window_handle::RawWindowHandle::try_from(handle)
+                    && let raw_window_handle::RawWindowHandle::Win32(win32) = From::from(handle)
                 {
                     let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
                     unsafe {

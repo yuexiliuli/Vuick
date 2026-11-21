@@ -342,7 +342,7 @@ impl<H: RecentPanelHost> RecentPanel<H> {
             let Some(this) = weak_self.upgrade() else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| match ev {
+            this.update(cx, |this, cx| match ev {
                 InputEvent::Change => {
                     this.query = input_entity.read(cx).value().to_string();
                     this.selected = None;
@@ -422,7 +422,7 @@ impl<H: RecentPanelHost> RecentPanel<H> {
             }
             Line::Clear => {
                 if let Some(host) = self.host.upgrade() {
-                    let _ = host.update(cx, |app, cx| {
+                    host.update(cx, |app, cx| {
                         app.clear_recents(cx);
                     });
                 }
@@ -441,17 +441,17 @@ impl<H: RecentPanelHost> RecentPanel<H> {
         if is_folder {
             if std::path::Path::new(path).is_dir() {
                 let p = std::path::PathBuf::from(path);
-                let _ = host.update(cx, |app, cx| app.open_folder_path(p, window, cx));
+                host.update(cx, |app, cx| app.open_folder_path(p, window, cx));
             } else {
                 let p = path.to_string();
-                let _ = host.update(cx, |app, cx| app.remove_recent_folder(&p, window, cx));
+                host.update(cx, |app, cx| app.remove_recent_folder(&p, window, cx));
             }
         } else if std::path::Path::new(path).is_file() {
             let p = path.to_string();
-            let _ = host.update(cx, |app, cx| app.open_file(&p, window, cx));
+            host.update(cx, |app, cx| app.open_file(&p, window, cx));
         } else {
             let p = path.to_string();
-            let _ = host.update(cx, |app, cx| app.remove_recent_file(&p, window, cx));
+            host.update(cx, |app, cx| app.remove_recent_file(&p, window, cx));
         }
     }
 

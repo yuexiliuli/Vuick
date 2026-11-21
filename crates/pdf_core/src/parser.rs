@@ -875,13 +875,12 @@ impl PdfWorker {
                         grid_cache.remove(&doc_id);
                         // 缓存已清 → 预熟从新几何中心重扫（旧游标会漏扫；新色按当前带宽窗口
                         // 以新色重熟，窗口内已缓存页跳过）。
-                        if let Some(p) = grid_prewarm.as_mut() {
-                            if p.doc_id == doc_id {
+                        if let Some(p) = grid_prewarm.as_mut()
+                            && p.doc_id == doc_id {
                                 p.reach = 0;
                                 p.dir = -1;
                                 p.done = false;
                             }
-                        }
                     }
                     WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor, geom) => {
                         // 预熟开启/目标/几何更新（「网格在用」显式信号）：进入网格 / 卡宽变化 /
@@ -1426,8 +1425,8 @@ impl PdfWorker {
                         let _ = tx.send(result);
                     }
                     WorkerMsg::MemRestoreBytes(doc_id, bytes, tx) => {
-                        let result = if stores.contains_key(&doc_id) {
-                            stores.insert(doc_id, Arc::new(bytes));
+                        let result = if let std::collections::hash_map::Entry::Occupied(mut e) = stores.entry(doc_id) {
+                            e.insert(Arc::new(bytes));
                             Ok(stores.get(&doc_id).map(|b| b.len()).unwrap_or(0))
                         } else {
                             Err(anyhow!("文档 {doc_id} 不存在（无法恢复镜像）"))
@@ -1709,12 +1708,11 @@ impl PdfWorker {
                             }
                         }
                         // 无论 render 成功与否都推进扫描：失败（页无法渲染）不卡死预熟循环。
-                        if let Some(pre) = grid_prewarm.as_mut() {
-                            if pre.doc_id == pre_doc_id {
+                        if let Some(pre) = grid_prewarm.as_mut()
+                            && pre.doc_id == pre_doc_id {
                                 pre.reach = scan.0;
                                 pre.dir = scan.1;
                             }
-                        }
                         continue; // 回主循环查队列（真实消息到达即抢占）
                     }
                     // 理论不可达（while 循环要么 finish 要么定位 pending）：兜底置 idle。
@@ -1738,13 +1736,12 @@ impl PdfWorker {
                     // 同 sweep：网格缓存存最终着色位图，切档即旧色失效 → 整套清空。
                     grid_cache.remove(&doc_id);
                     // 同 sweep：缓存已清 → 预熟从新几何中心重扫（当前带宽窗口内已缓存页跳过）。
-                    if let Some(p) = grid_prewarm.as_mut() {
-                        if p.doc_id == doc_id {
+                    if let Some(p) = grid_prewarm.as_mut()
+                        && p.doc_id == doc_id {
                             p.reach = 0;
                             p.dir = -1;
                             p.done = false;
                         }
-                    }
                 }
                 Ok((
                     _gen,

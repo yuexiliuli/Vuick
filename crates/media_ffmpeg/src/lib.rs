@@ -405,7 +405,7 @@ pub unsafe extern "C" fn vff_video_frame_hw(
                 }
                 Box::into_raw(Box::new(frame)) as *mut c_void
             }
-            Ok(None) => 0x1 as *mut c_void,
+            Ok(None) => std::ptr::dangling_mut::<c_void>(),
             Err(_) => usize::MAX as *mut c_void,
         }
     })
@@ -662,7 +662,6 @@ pub unsafe extern "C" fn vff_subtitle_get_text(
 /// 走视频端 `find_active_subtitle`（预加载清单二分）；字幕语义单一实现
 /// `SubtitleReader::active_subtitle_index`（`decode::subtitle::active_subtitle_index`
 /// 纯函数）仍被本 crate 单测使用，口径不丢失。
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_close_subtitle(h: *mut c_void) {
     catch_unwind_ffi((), || {

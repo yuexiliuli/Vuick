@@ -373,6 +373,7 @@ pub struct AnnotationInfo {
 /// - **中带**（`window` 内 beyond `near`，= ±(近+中)行）→ 预熟**仅低清**（滚回即显、不占
 ///   全清内存）；
 /// - **更远**（`window` 外）→ 不预熟（首曝按需由 view 派发，风暴低清兜底）。
+///
 /// `center_page` = 当前视口中心行首页（外向扫描的对称中心）。窗口尺寸恒与文档总页数
 /// **无关**（固定行数）→ 长文档预熟有界常驻几十 MB、无整本 LRU 滑动窗抖动/永不完成。
 #[derive(Clone, Copy, Debug, PartialEq)]

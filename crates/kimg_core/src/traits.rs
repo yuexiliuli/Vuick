@@ -34,11 +34,11 @@ impl Primitive for u16 {
 
 impl Primitive for f32 {
     fn narrow8(self) -> u8 {
-        let clamped = if !(self < 1.0) { 1.0 } else { self.max(0.0) };
+        let clamped = if self.is_nan() || self >= 1.0 { 1.0 } else { self.max(0.0) };
         (clamped * 255.0).round() as u8
     }
     fn widen16(self) -> u16 {
-        let clamped = if !(self < 1.0) { 1.0 } else { self.max(0.0) };
+        let clamped = if self.is_nan() || self >= 1.0 { 1.0 } else { self.max(0.0) };
         (clamped * 65535.0).round() as u16
     }
 }

@@ -331,8 +331,8 @@ impl ChunkReader {
             }
             Some(e) => {
                 let mut dec = e.new_decoder_without_bom_handling();
-                if !raw.is_empty() {
-                    if let Some(s) = decode_stream(&mut dec, raw, false)? {
+                if !raw.is_empty()
+                    && let Some(s) = decode_stream(&mut dec, raw, false)? {
                         feed(
                             &mut self.pending_cr,
                             &mut self.s,
@@ -341,7 +341,6 @@ impl ChunkReader {
                             &mut self.pending,
                         );
                     }
-                }
                 self.decoder = Some(dec);
             }
         }

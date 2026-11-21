@@ -88,8 +88,8 @@ pub fn preview_pending_due() -> Option<String> {
         *g = Some((key.clone(), n));
         return None;
     }
-    let key = g.take().map(|(k, _)| k);
-    key
+    
+    g.take().map(|(k, _)| k)
 }
 
 /// 取卡片（debug）形状：当前 pending key 是否仍有未上报的预览收敛登记。

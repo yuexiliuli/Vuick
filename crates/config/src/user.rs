@@ -43,6 +43,7 @@ impl ThemePref {
     }
 
     /// 从字符串解析（未知值 / 缺省回退跟随）。
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "light" => ThemePref::Light,
@@ -94,6 +95,7 @@ impl PdfBgPref {
     }
 
     /// 从字符串解析（未知值 / 缺省回退跟随主题）。
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "night" => PdfBgPref::Night,
@@ -165,6 +167,7 @@ pub struct UserPrefs {
 /// 只做一次 `fs::metadata`（微秒级 stat，非内容读）。文件被改写（mtime/len 变化，含
 /// 测试内同一路径换内容、外部另存）或路径切换（`VUICK_CONFIG` 变）→ 自动重读，
 /// 不串缓存。`save` 写盘成功后同步回写缓存。测试构建（`cfg!(test)`）不触缓存。
+#[allow(clippy::type_complexity)]
 static PREFS_CACHE: StdLazyLock<StdMutex<Option<(PathBuf, Option<SystemTime>, u64, UserPrefs)>>> =
     StdLazyLock::new(|| StdMutex::new(None));
 
@@ -186,7 +189,7 @@ fn copy_dir(src: &Path, dst: &Path) {
         Ok(e) => e,
         Err(_) => return,
     };
-    if let Err(_) = std::fs::create_dir_all(dst) {
+    if std::fs::create_dir_all(dst).is_err() {
         return;
     }
     for entry in entries.flatten() {
@@ -194,7 +197,7 @@ fn copy_dir(src: &Path, dst: &Path) {
         let to = dst.join(entry.file_name());
         if from.is_dir() {
             copy_dir(&from, &to);
-        } else if let Err(_) = std::fs::copy(&from, &to) {
+        } else if std::fs::copy(&from, &to).is_err() {
             // 单个文件拷贝失败（如被占用/只读）不中断整目录，数据以新路径新建为准。
         }
     }
@@ -314,26 +317,23 @@ impl UserPrefs {
         if let Some(Value::Bool(b)) = map.get("reuse_media_window") {
             prefs.reuse_media_window = Some(*b);
         }
-        if let Some(Value::String(s)) = map.get("opened_folder") {
-            if !s.is_empty() {
+        if let Some(Value::String(s)) = map.get("opened_folder")
+            && !s.is_empty() {
                 prefs.opened_folder = Some(s.clone());
             }
-        }
-        if let Some(Value::String(s)) = map.get("music_dir") {
-            if !s.is_empty() {
+        if let Some(Value::String(s)) = map.get("music_dir")
+            && !s.is_empty() {
                 prefs.music_dir = Some(s.clone());
             }
-        }
         if let Some(Value::Number(n)) = map.get("music_volume")
             && let Some(v) = n.as_f64()
         {
             prefs.music_volume = Some(v as f32);
         }
-        if let Some(Value::String(s)) = map.get("music_last_track") {
-            if !s.is_empty() {
+        if let Some(Value::String(s)) = map.get("music_last_track")
+            && !s.is_empty() {
                 prefs.music_last_track = Some(s.clone());
             }
-        }
         if let Some(Value::Number(n)) = map.get("music_progress_secs") {
             prefs.music_progress_secs = n.as_f64();
         }

@@ -1,6 +1,9 @@
 //! 渲染层：`Render`/`Focusable`/`EventEmitter` 实现 + 行/gutter/滚动条/输入包装
 //! 元素等渲染助手（`render()` 从「行数据窗口 → UI 骨架」的全阶段与行级元素构造）。
 
+// 阴影/描边绘制与排版类型 → 放行
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use std::cell::Cell;
 use std::ops::Range;
 
@@ -394,6 +397,7 @@ impl CodeEditor {
     /// - 闭行前有文本（`} else` / `x }`，`hasTextBeforeClosingBracket`）→ **底边**横段
     ///   + 竖线段已含闭行；
     /// - 闭行独占 `}` → **顶边**横段 + 竖线段不含闭行。
+    ///
     /// 横段厚 1 物理 px（÷sf），色 = active 括对色（palette[depth%3] 100%）。
     fn bracket_guide_hooks_layer(
         &self,
@@ -1687,7 +1691,7 @@ pub(crate) fn merge_color_overrides(
         while bi < base.len() && base[bi].0.end <= a {
             bi += 1;
         }
-        while ci < chars.len() && chars[ci].col + 1 <= a {
+        while ci < chars.len() && chars[ci].col < a {
             ci += 1;
         }
         let mut style = HighlightStyle::default();

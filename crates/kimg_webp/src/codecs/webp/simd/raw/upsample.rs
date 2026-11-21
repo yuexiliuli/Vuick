@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+// fancy 上采样内核逐寄存器传参，具名构参破坏字节恒等算术单源性 → 放行。
+#![allow(clippy::too_many_arguments)]
 //! 裸 unsafe 叶子子模块 `raw::upsample`：fancy 上采样（SSE2/SSSE3/AVX2 16-bit lane）的全部
 //! `#[target_feature]` SIMD 内核 + 安全门面整体迁入（原 `simd/upsample.rs`）。上层
 //! `simd/upsample.rs` 以 `#![forbid(unsafe_code)]` + 薄委托显式依赖本模块。算法 / 常量 /

@@ -1,3 +1,6 @@
+// 命中/拖拽内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use super::*;
 
 use crate::markdown::parse::recognition::{self, LinkHit};
@@ -63,7 +66,7 @@ fn h_scroll_rel(
     grab: Option<f32>,
 ) -> Option<f32> {
     let marker = this.rd.borrow().frame.borrow().clone();
-    let f = marker.as_ref().map(|r| &**r)?;
+    let f = marker.as_deref()?;
     let r = f
         .rows
         .iter()
@@ -163,7 +166,7 @@ impl WyEditor {
             return;
         }
                 let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
+        let Some(f) = marker.as_deref() else {
             return;
         };
         // 数学编辑卡打开时：点击落在**卡浮层包围盒内**（但非本卡命中区，如卡片空白/
@@ -489,7 +492,7 @@ impl WyEditor {
             return;
         }
                 let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
+        let Some(f) = marker.as_deref() else {
             return;
         };
         let off = element::source_offset_at(self, f, ev.position);
@@ -503,7 +506,7 @@ impl WyEditor {
     /// 亮起按钮（否则点不中）。未命中（含指针移出元素）置 `None`。
     fn update_hover(&mut self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
                 let marker = self.rd.borrow().frame.borrow().clone();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
+        let Some(f) = marker.as_deref() else {
             return;
         };
         let hovered = element::image_box_hit_at(self, f, pos);

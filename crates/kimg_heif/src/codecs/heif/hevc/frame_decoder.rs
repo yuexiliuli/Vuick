@@ -14,6 +14,9 @@
 //! `unchecked`/`%` 算术按 C# 语义对齐（C# `%` 对非负操作数与 Rust `%` 一致，参数恒非负处直接用 `%`）；
 //! 所有下标先守卫（`get_mut`/`min`/条件短路），不可信输入零 panic；C# `throw` → `Err(HeifError::invalid(中文))`。
 
+// HEVC 熵解码各束（offsets/prev_flags/list/abs_level）按下标循环取位（字节恒等硬约束）→ 放行。
+#![allow(clippy::needless_range_loop)]
+
 use std::sync::LazyLock;
 
 use crate::codecs::heif::error::{HeifError, HeifResult};
@@ -307,7 +310,7 @@ impl HevcFrameDecoder {
             previous = Some(header);
         }
         if decoded_ctbs != self.ctb_slice_addr.len() as i32
-            || self.ctb_slice_addr.iter().any(|&a| a == -1)
+            || self.ctb_slice_addr.contains(&-1)
         {
             return Err(HeifError::invalid("图画的切片没有覆盖每个 CTB。"));
         }
@@ -502,7 +505,7 @@ impl HevcFrameDecoder {
 
         let mut merge_left = false;
         let mut merge_up = false;
-        if rx > 0 && self.ctb_addr_rs - 1 >= slice_addr {
+        if rx > 0 && self.ctb_addr_rs > slice_addr {
             merge_left = cabac.decode_bin(HevcCabacTables::SaoMerge)? == 1;
         }
         if ry > 0 && !merge_left && self.ctb_addr_rs - width >= slice_addr {
@@ -596,8 +599,7 @@ impl HevcFrameDecoder {
         depth: i32,
     ) -> HeifResult<()> {
         let size = 1 << log2_cb_size;
-        let split: bool;
-        if x0 + size <= self.sps.width
+        let split = if x0 + size <= self.sps.width
             && y0 + size <= self.sps.height
             && log2_cb_size > self.sps.min_cb_log2_size_y
         {
@@ -608,10 +610,10 @@ impl HevcFrameDecoder {
             if self.available(x0, y0, x0, y0 - 1) && self.ct_depth[self.block(x0, y0 - 1)] as i32 > depth {
                 ctx_inc += 1;
             }
-            split = cabac.decode_bin(HevcCabacTables::SplitCu + ctx_inc)? == 1;
+            cabac.decode_bin(HevcCabacTables::SplitCu + ctx_inc)? == 1
         } else {
-            split = log2_cb_size > self.sps.min_cb_log2_size_y;
-        }
+            log2_cb_size > self.sps.min_cb_log2_size_y
+        };
 
         if log2_cb_size >= self.log2_min_cu_qp_delta_size {
             self.is_cu_qp_delta_coded = false;
@@ -716,8 +718,7 @@ impl HevcFrameDecoder {
             for i in 0..pb_count {
                 let x_pb = x0 + (i & 1) as i32 * pb_offset;
                 let y_pb = y0 + ((i >> 1) as i32) * pb_offset;
-                let mode: i32;
-                if prev_flags[i] {
+                let mode = if prev_flags[i] {
                     let mpm_idx = if cabac.decode_bypass()? == 0 {
                         0
                     } else if cabac.decode_bypass()? == 0 {
@@ -725,10 +726,10 @@ impl HevcFrameDecoder {
                     } else {
                         2
                     };
-                    mode = self.derive_luma_mode(x_pb, y_pb, mpm_idx, -1);
+                    self.derive_luma_mode(x_pb, y_pb, mpm_idx, -1)
                 } else {
-                    mode = self.derive_luma_mode(x_pb, y_pb, -1, cabac.decode_bypass_bits(5)? as i32);
-                }
+                    self.derive_luma_mode(x_pb, y_pb, -1, cabac.decode_bypass_bits(5)? as i32)
+                };
                 let pb_end_x = (x_pb + pb_offset).min(self.sps.width);
                 let pb_end_y = (y_pb + pb_offset).min(self.sps.height);
                 let mut y = y_pb;
@@ -808,7 +809,7 @@ impl HevcFrameDecoder {
         };
         let mut cand_b = 1;
         let ctb_top = (y_pb >> self.sps.ctb_log2_size_y) << self.sps.ctb_log2_size_y;
-        if y_pb - 1 >= ctb_top && self.available(x_pb, y_pb, x_pb, y_pb - 1) {
+        if y_pb > ctb_top && self.available(x_pb, y_pb, x_pb, y_pb - 1) {
             cand_b = self.intra_mode[self.block(x_pb, y_pb - 1)] as i32;
         }
 
@@ -875,17 +876,15 @@ impl HevcFrameDecoder {
         parent_cbf_cb: bool,
         parent_cbf_cr: bool,
     ) -> HeifResult<()> {
-        let split: bool;
-        if log2_size <= self.sps.max_tb_log2_size_y
+        let split = if log2_size <= self.sps.max_tb_log2_size_y
             && log2_size > self.sps.min_tb_log2_size_y
             && depth < max_trafo_depth
             && !(intra_split && depth == 0)
         {
-            split =
-                cabac.decode_bin(HevcCabacTables::SplitTransform + (5 - log2_size) as usize)? == 1;
+            cabac.decode_bin(HevcCabacTables::SplitTransform + (5 - log2_size) as usize)? == 1
         } else {
-            split = log2_size > self.sps.max_tb_log2_size_y || (intra_split && depth == 0);
-        }
+            log2_size > self.sps.max_tb_log2_size_y || (intra_split && depth == 0)
+        };
 
         let (cbf_cb, cbf_cr): (bool, bool);
         if log2_size > 2 {
@@ -1072,8 +1071,8 @@ impl HevcFrameDecoder {
         }
     }
 
-    /// 亮度样本 (xN, yN) 作为帧内参考的可用性（6.4.1）；见 [`Self::mark_decoded`]。
-    /// 帧内预测（ff：见 `predict_intra` 的内联闭包）直接使用该判定，这里不复用为方法。
+    // 亮度样本 (xN, yN) 作为帧内参考的可用性（6.4.1）；见 [`Self::mark_decoded`]。
+    // 帧内预测（ff：见 `predict_intra` 的内联闭包）直接使用该判定，这里不复用为方法。
 
     /// 预测 cIdx 分量在 (xTb, yTb) 的块（该分量的采样坐标）。
     fn predict_intra(
@@ -1554,12 +1553,11 @@ impl HevcFrameDecoder {
             };
 
             // coeff_abs_level_remaining。
-            let mut num_sig_coeff = 0usize;
             let mut rice_param = 0usize;
             let mut sum_abs = 0i64;
             for k in 0..count {
                 let base_level = abs_level[k];
-                let threshold = if num_sig_coeff < 8 {
+                let threshold = if k < 8 {
                     if k as i32 == first_g1 {
                         3
                     } else {
@@ -1576,7 +1574,6 @@ impl HevcFrameDecoder {
                         rice_param = (rice_param + 1).min(4);
                     }
                 }
-                num_sig_coeff += 1;
 
                 let pos = sig_pos[k];
                 let x_c = (x_s << 2) + (scan4[pos as usize] & 15) as i32;

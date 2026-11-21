@@ -3,7 +3,7 @@
 //! 结构（对照 C# `WebpAnimationDecoder` / `WebpDecoder.DecodeFrameRgba`）：
 //! 1. `decode_animation`：`container::parse` 已产出 ANMF 帧表（x/y/w/h/duration/blend/dispose
 //!    + 帧内 VP8/VP8L/ALPH 载荷绝对范围）→ 各帧**独立**解码成本帧 RGBA（帧间无依赖，可并行；
-//!    静态内核 `vp8::decode_vp8`/`vp8l::decode`/`decode_and_unfilter_alpha` 保证与静态族字节一致）。
+//!      静态内核 `vp8::decode_vp8`/`vp8l::decode`/`decode_and_unfilter_alpha` 保证与静态族字节一致）。
 //! 2. 合成阶段串行：`CanvasCompositor` 维护全画布 RGBA 工作缓冲，按显示序逐帧
 //!    执行 dispose（清上一帧矩形）/ blend / 覆盖，**合成语义逐字节对齐 image-webp**
 //!    （`extended::composite_frame` + `alpha_blending::do_alpha_blending` 的 libwebp 近似非预乘
@@ -143,8 +143,6 @@ fn decode_frames_parallel(
         // 「闭包借局部值可能比函数活更久」的 E0373。
         let next = &AtomicUsize::new(0);
         let merged = &Mutex::new(Vec::<(usize, Option<AnimatedRawFrame>)>::new());
-        let data = data;
-        let frames = frames;
         std::thread::scope(|s| {
             let mut handles = Vec::new();
             for _ in 0..workers {
@@ -257,7 +255,7 @@ fn blend_pixel_nonpremult(src: u32, dst: u32) -> u32 {
         let blend_r = blend_channel_nonpremult(src, src_a, dst, dst_factor_a as u8, scale, 0);
         let blend_g = blend_channel_nonpremult(src, src_a, dst, dst_factor_a as u8, scale, 8);
         let blend_b = blend_channel_nonpremult(src, src_a, dst, dst_factor_a as u8, scale, 16);
-        (u32::from(blend_r) << 0)
+        u32::from(blend_r)
             | (u32::from(blend_g) << 8)
             | (u32::from(blend_b) << 16)
             | (blend_a << 24)

@@ -43,6 +43,12 @@ pub struct Notification {
     kind: NotificationKind,
 }
 
+impl Default for Notification {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Notification {
     pub fn new() -> Self {
         Self {

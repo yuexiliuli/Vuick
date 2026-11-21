@@ -39,8 +39,9 @@ impl GridLayout {
     /// 预检是否可用于并行散贴：
     /// - tile 数恰为 `cols×rows`（缺失尾格 → 画布有洞 → 不能未初始化分配，落回）；
     /// - 所有 tile 输出尺寸相同（均匀栅格，且与 `compose_grid` 的 `(col*tw, row*th)` 落位自洽）；
-    /// - 亮度（shift 0）与色度（shift 1）沿两轴均精确铺满画布平面（无空洞、无重叠、末段达边）。
-    /// 任一不满足 → `None`，调用方落回既有路径（不崩、不改语义）。
+/// - 亮度（shift 0）与色度（shift 1）沿两轴均精确铺满画布平面（无空洞、无重叠、末段达边）。
+///
+/// 任一不满足 → `None`，调用方落回既有路径（不崩、不改语义）。
     pub fn build(
         infos: &[TileInfo],
         cols: i32,
@@ -98,7 +99,7 @@ fn axis_covers(extent: i32, n: i32, canvas: i32, shift: u32) -> bool {
     }
     let mut prev_end: i64 = 0;
     for c in 0..n {
-        let start = ((i64::from(c) * i64::from(extent)) >> shift) as i64;
+        let start = (i64::from(c) * i64::from(extent)) >> shift;
         if start != prev_end {
             return false;
         }

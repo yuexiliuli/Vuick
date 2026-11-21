@@ -50,6 +50,11 @@ impl FolderNav {
         self.items.len()
     }
 
+    /// 清单是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     /// 当前项下标（0 基）。
     pub fn current(&self) -> usize {
         self.current
@@ -175,7 +180,7 @@ fn compare_names(a: &Path, b: &Path) -> std::cmp::Ordering {
 fn name_key(p: &Path) -> &std::ffi::OsStr {
     p.file_name()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| p.as_os_str())
+        .unwrap_or(p.as_os_str())
 }
 
 /// Windows 区域名称排序（资源管理器「名称」视图同款）。

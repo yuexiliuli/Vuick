@@ -186,8 +186,8 @@ impl super::VideoViewer {
         if let Some(tx) = &self.decode_cmd {
             // 探针：先记「投稿完成时刻」再 send——worker 首帧写槽会整块替换 SeekDiag，
             // 若 send 后才补写，竞争窗口内 worker 替换会把它记成 None、[SEEKNODE] 丢行。
-            if seek_diag_collect() && is_seek {
-                if let Some(d) = seek_diag_slot()
+            if seek_diag_collect() && is_seek
+                && let Some(d) = seek_diag_slot()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_mut()
@@ -195,7 +195,6 @@ impl super::VideoViewer {
                 {
                     d.sent = Some(Instant::now());
                 }
-            }
             let _ = tx.send(cmd);
         }
         if restart_audio {
@@ -335,7 +334,7 @@ impl super::VideoViewer {
             // P/B」降到「1 个 I 帧」）；松手/停稳后的精确命令恢复全帧。必在首次 seek 前
             // 重设（复用 reader 也按命令切换，seek 紧跟即 flush）。
             if let Some((_, _, r, _)) = active.as_mut() {
-                let _ = r.set_skip_nonkey(cmd.scrubbing);
+                r.set_skip_nonkey(cmd.scrubbing);
             }
             if !hw_reader || dual {
                 // 软解照旧：seek 后才逐帧过滤预滚。双设备：skip_to_bgra 不做（零回读），
@@ -633,14 +632,12 @@ impl super::VideoViewer {
                 };
                 let t1 = Instant::now();
                 // 回退量：第一个被解码的帧 pts − target（负值越大 = 从越早的关键帧预滚解起）
-                if seek_diag_on {
-                    if let Ok(Some(frame)) = &item {
-                        if seek_first_decoded {
+                if seek_diag_on
+                    && let Ok(Some(frame)) = &item
+                        && seek_first_decoded {
                             seek_first_decoded = false;
                             seek_regress = frame.pts() - cmd.target;
                         }
-                    }
-                }
                 // —— 设备丢失/瞬时错误记账（仅硬解 reader；软解零分支零开销）——
                 // 成功帧 → 清失败计数 + 续播位置前移；错误帧 → 连续失败计数 +1（EOF 不算）。
                 let mut item_err = false;
@@ -686,7 +683,7 @@ impl super::VideoViewer {
                             let mut sslot = seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner());
                             let mine = sslot
                                 .as_ref()
-                                .map_or(true, |s| s.session == cmd.seek_session);
+                                .is_none_or(|s| s.session == cmd.seek_session);
                             if mine {
                                 let worker_start = seek_worker_start;
                                 *sslot = Some(SeekDiag {
@@ -714,7 +711,8 @@ impl super::VideoViewer {
                         // 发送成功（主线程接收）或换代（接收端已换走 = 帧丢弃）；软帧无池资源、
                         // 无需回收；**GPU 帧发送失败=槽无人接收 → 当场回收回池**（防 worker 侧
                         // 槽泄漏：换代窗口每丢一帧都漏一块 in_use 槽，池越用越少）
-                        let sent = if seek_diag_enabled() {
+                        
+                        if seek_diag_enabled() {
                             // seek 探针：wake 投递成功与否也落探针（仅 diag 下才关心 wake 细节）
                             match cmd.tx.send(frame) {
                                 Ok(()) => {
@@ -745,8 +743,7 @@ impl super::VideoViewer {
                                     false
                                 }
                             }
-                        };
-                        sent
+                        }
                     }
                     Ok(Some(frame)) => {
                         // 预滚（pts<落点，仅软解路径）：只记最新一帧，不送
@@ -881,11 +878,10 @@ impl super::VideoViewer {
         frame: FrameItem,
         active: &mut Option<(std::path::PathBuf, ReaderMode, VideoReader, Option<SharedCopier>)>,
     ) {
-        if let FrameItem::Gpu(f) = frame {
-            if let Some((_, _, _, Some(copier))) = active.as_mut() {
+        if let FrameItem::Gpu(f) = frame
+            && let Some((_, _, _, Some(copier))) = active.as_mut() {
                 copier.recycle(f.shared_handle);
             }
-        }
     }
 
 
@@ -912,8 +908,8 @@ impl super::VideoViewer {
                 // 拷贝源只需 USAGE_DEFAULT，BIND_DECODER 同样可作拷贝源）。渲染设备只采样
                 // 共享 NV12 槽（平面 SRV PlaneSlice），从不直接采解码纹理。任一环节失败
                 //（建设备/open_hw）→ 回落 SAFE BGRA 硬解（与旧 auto 行为一致）。
-                if dual_path_allowed() {
-                    if let Some(worker) = create_worker_d3d11_device() {
+                if dual_path_allowed()
+                    && let Some(worker) = create_worker_d3d11_device() {
                         // 预检：仅当 worker 设备真正具备 D3D11VA 解码能力才注入 FFmpeg open_hw——
                         // 无能力适配器上直接注入会在 d3d11.dll 内 AV（见
                         // `crate::hw::worker_d3d11va_supported` 注释；本机 Basic Display 实证）。
@@ -934,7 +930,6 @@ impl super::VideoViewer {
                             }
                         }
                     }
-                }
                 let r = VideoReader::open_scaled_hw(path, *cap)?;
                 #[cfg(test)]
                 HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
@@ -1041,18 +1036,15 @@ impl super::VideoViewer {
                         let need = (w as usize) * (h as usize) * 4;
                         // P1-23：need>buf.len()（几何中途突增）时守卫安全降级——跳过本帧继续解，
                         // 下帧复用扩容后的缓冲；不发送，不再 `buf[..need]` 无界切片 panic。
-                        match take_soft_frame_bytes(&mut buf, need) {
-                            Some(bgra) => {
-                                let _ = cmd.tx.send(Ok(HoverFrame {
-                                    pts,
-                                    w,
-                                    h,
-                                    bgra,
-                                }));
-                                break;
-                            }
-                            None => {} // 几何突增：跳过本帧，继续解（缓冲已按新几何扩容）
-                        }
+                        if let Some(bgra) = take_soft_frame_bytes(&mut buf, need) {
+                            let _ = cmd.tx.send(Ok(HoverFrame {
+                                pts,
+                                w,
+                                h,
+                                bgra,
+                            }));
+                            break;
+                        } // None：几何突增，跳过本帧，继续解（缓冲已按新几何扩容）
                     }
                     Ok(Some(_)) => {} // 预滚帧（pts<落点）：继续解下一帧
                     Ok(None) | Err(_) => break, // EOF / 解码错误：无可用帧，按失败丢弃

@@ -276,11 +276,10 @@ pub(crate) fn parse_dropfiles_bytes(bytes: &[u8]) -> Vec<String> {
             }
             w[0] = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
         }
-        if !units.is_empty() {
-            if let Ok(s) = String::from_utf16(&units) {
+        if !units.is_empty()
+            && let Ok(s) = String::from_utf16(&units) {
                 out.push(s);
             }
-        }
         i += 2; // 跳过本路径结尾 `\0`（若未触及缓冲末尾）
     }
     out
@@ -539,7 +538,7 @@ mod imp {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), dst, stride);
             }
             // AND 掩码：1bpp 全 0，行按 32 位字对齐（ceil(w/32)*4 字节/行）。
-            let mask_len = ((((w as usize) + 31) / 32) * 4) * (h as usize);
+            let mask_len = ((w as usize).div_ceil(32) * 4) * (h as usize);
             let mask: Vec<u8> = vec![0u8; mask_len];
             let hbm_mask = CreateBitmap(
                 w as i32,
@@ -1008,7 +1007,7 @@ mod imp {
             }
             // 托盘右键菜单命令折回本窗口。
             WM_COMMAND => {
-                match (wparam.0 & 0xffff) as usize {
+                match wparam.0 & 0xffff {
                     CMD_RESTORE => restore_main_window(),
                     CMD_QUIT => super::request_quit(),
                     _ => {}

@@ -175,6 +175,7 @@ use super::doc::Doc;
 ///   prepaint 又按真实宽重建，render 期每次读到的帧宽不同 → 卡片横向左右跳一帧；
 /// - [`Self::resolve`]：**缓存命中读、未命中现算回退**（旧 `match get { Some=>a,
 ///   None=>现算? }` 逐字同义，回退触发时机不变）。
+///
 /// 调用方只保留各自的「目标行查找 + 拖拽偏移叠加」差异。
 pub(crate) struct CardAnchor {
     anchor: Cell<Option<gpui::Point<Pixels>>>,

@@ -178,7 +178,7 @@ pub(crate) fn paint_card(
 
 /// 当前选区。
 pub(crate) fn editor_selection(editor: &gpui::Entity<WyEditor>, cx: &App) -> Option<Range<usize>> {
-    let host: &dyn WyRenderHost = &*editor.read(cx);
+    let host: &dyn WyRenderHost = editor.read(cx);
     markdown_wysiwyg_engine::paint::editor_selection(host)
 }
 

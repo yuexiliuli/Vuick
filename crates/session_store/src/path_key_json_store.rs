@@ -82,11 +82,10 @@ impl<V: Clone + 'static> PathKeyJsonStore<V> {
     pub fn save(&self, map: &V) {
         let ok =
             base::util::atomic_write(&self.path, (self.encode)(map).to_string().as_bytes()).is_ok();
-        if ok {
-            if let Ok(mut guard) = self.cache().lock() {
+        if ok
+            && let Ok(mut guard) = self.cache().lock() {
                 *guard = Some((self.path.clone(), map.clone()));
             }
-        }
     }
 }
 

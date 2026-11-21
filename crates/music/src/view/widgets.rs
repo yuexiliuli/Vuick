@@ -83,13 +83,11 @@ pub fn vinyl_ring_at(
     period: Duration,
     reverse: bool,
 ) -> AnyElement {
-    let mark = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+    let mark = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
   fill="none" stroke="currentColor" stroke-width="0.7" stroke-linecap="round">
   <circle cx="12" cy="12" r="11"/>
   <circle cx="12" cy="1.4" r="0.8" fill="currentColor" stroke="currentColor"/>
-</svg>"#
-    );
+</svg>"#.to_string();
     let ring = svg()
         .w(px(diameter))
         .h(px(diameter))

@@ -10,6 +10,9 @@
 //!   局部帧 bbox 外靠先整体 memcpy 画布到输出（全覆帧 bbox=全画布可省）；几何与原 blit 逐字节同构。
 //! - LZW 表/码流/索引缓冲跨帧复用（`Scratch`），不逐帧重建。
 
+// 画布合成内核逐游标传参（blit_keep/blit_disp）→ 放行。
+#![allow(clippy::too_many_arguments)]
+
 use std::io;
 
 use super::container::{clip_rect, Disposal, GifFrame};
@@ -124,7 +127,7 @@ fn copy_canvas_into(out: &mut [u8], canvas: &[u32]) {
 /// 存储行 r（GIF89a Appendix E 隔行）映射到帧内行号。
 #[inline]
 fn interlaced_row(r: usize, h: usize) -> usize {
-    let p1 = (h + 7) / 8;
+    let p1 = h.div_ceil(8);
     if r < p1 {
         return r * 8;
     }
@@ -228,8 +231,10 @@ fn blit_fast_enabled() -> bool {
 ///   out 维持早先 copy_canvas_into 的画布拷贝 → 处理后整画布 out==canvas（透明像素
 ///   idx==trans 取 prev=画布现像，Keep 下画布保持该现像 → 跳过即等价；非透明 lut 直写双路同 cur）；
 /// - R1 全覆是该不变式的特例（x0=0、cw=w、src_col_start=0）。
+///
 /// 故快道只需 u32 1 写/px 推进画布（透明像素跳过=保持画布现像），帧末整画布一次拷贝出输出；
 /// 省掉原 blit 每像素的「prev 画布读 + write_px 4 字节写 + disposal 分支」。输出逐字节与原一致。
+///
 /// 几何与 `blit` 完全同构（同 clip_rect / src_col_start / src_end 截断 / interlaced_row），
 /// 仅省略 out 侧写与 prev 读。Background/Previous 帧不适用（out≠画布，dispatch 层已排除）。
 fn blit_keep(
@@ -280,6 +285,7 @@ fn blit_keep(
 /// - 透明索引（idx==trans）：out = 画布现像（= 原 outp=prev；本行该地址本帧前未写，读到的
 ///   必是块前值；Previous 画布不写、Background 于同轮最后才写 0，顺序保旧值）；
 /// - 非透明：out = LUT 直写（原 cur，alpha 恒 255）。
+///
 /// 画布推进：`clear=true`（Background）→ 同轮 bbox 整 0（原 `Disposal::Background => 0`）；
 /// `clear=false`（Previous）→ 完全不写（原 `Disposal::Previous => prev`，值上=保持块前状态）。
 fn blit_disp(

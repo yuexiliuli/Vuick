@@ -147,12 +147,11 @@ pub fn apply_rgba_par(
     {
         // 并行门：与 color 并行同判据（`force_serial` / 单 tile → 恒串行）；另受
         // `KIMG_HEIF_TRANSFORM_PARALLEL=0`（dev 测开关）兜底。
-        if !super::force_serial() && tiles >= 2 && transform_par_enabled() {
-            if super::transform_simd::apply_simd_par(canvas, canvas_w, canvas_h, map, out)? {
+        if !super::force_serial() && tiles >= 2 && transform_par_enabled()
+            && super::transform_simd::apply_simd_par(canvas, canvas_w, canvas_h, map, out)? {
                 return Ok(());
             }
             // SIMD 并行 miss → 落下方串行 SIMD / 通用循环（与 apply_rgba 相同的既有路径）。
-        }
         if super::transform_simd::apply_simd(canvas, canvas_w, canvas_h, map, out)? {
             return Ok(());
         }

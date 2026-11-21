@@ -351,10 +351,9 @@ impl EditorApp {
                 {
                     use raw_window_handle::HasWindowHandle as _;
                     if let Ok(handle) = window.window_handle()
-                        && let Ok(raw_window_handle::RawWindowHandle::Win32(win32)) =
-                            raw_window_handle::RawWindowHandle::try_from(handle)
+                        && let raw_window_handle::RawWindowHandle::Win32(win32) = From::from(handle)
                     {
-                        tray::set_main_hwnd(win32.hwnd.get() as isize);
+                        tray::set_main_hwnd(win32.hwnd.get());
                     }
                     tray::set_close_to_tray(app.model.borrow().close_to_tray);
                     // A5：托盘图标 / 程序窗口图标 **defer 到首帧后**（窗口先显示、图标随后

@@ -11,6 +11,9 @@
 //! （域不直读宿主 `EditorApp`）；`zoom_overlay` / `on_drop` 的宿主副作用经
 //! [`crate::host::PreviewHost`] 反调。
 
+// 预览渲染逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;

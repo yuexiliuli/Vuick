@@ -417,7 +417,7 @@ impl shell_media::MediaHost for EditorApp {
             if let Ok(root) = root.downcast::<ui::root::Root>() {
                 let view = root.read(cx).view().clone();
                 if let Ok(app) = view.downcast::<EditorApp>() {
-                    let _ = app.update(cx, |app, cx| app.open_file_here(&owned, window, cx));
+                    app.update(cx, |app, cx| app.open_file_here(&owned, window, cx));
                 }
             }
         });

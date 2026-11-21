@@ -3,6 +3,8 @@
 //! 像素计算逐行对齐 C# 标量内核：整数运算、16.16 固定系数（`round(value·2^16)`）、`+2^15 >> 16`
 //! 舍入、`[0,255]` / `[0,65535]` 裁剪。ICC 不处理（直通/忽略）。
 
+// 色空间内核逐寄存器/逐游标传参，具名构参可读性反而变差 → 放行。
+#![allow(clippy::too_many_arguments)]
 use crate::codecs::heif::error::{HeifError, HeifResult};
 
 /// 固定点系数（对应 C# `HeifColor.Coefficients`）。

@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+// 宏块重建内核：参数多 + above_row 逐位下标循环（字节恒等硬约束，改写迭代器会动 codegen）→ 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 //! 裸 unsafe 叶子子模块 `raw::pipeline`：pipeline/mbdec 域的宏块重建整块迁入
 //! （`reconstruct_macroblock` / `reconstruct_i4_mb_ssse3`，原 `vp8/pipeline.rs`）。
 //! 上层 `vp8/pipeline.rs` 以 `#![forbid(unsafe_code)]` + 薄委托显式依赖本模块。

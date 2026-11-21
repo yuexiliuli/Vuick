@@ -373,12 +373,11 @@ impl<'a> ItemContainer<'a> {
             if ty == ItemMime && cursor < entry_end {
                 let start = cursor;
                 let end = self.data[start..entry_end].iter().position(|&b| b == 0);
-                if let Some(end) = end {
-                    if end > 0 {
+                if let Some(end) = end
+                    && end > 0 {
                         let take = end.min(255);
                         content_type = Some(String::from_utf8_lossy(&self.data[start..start + take]).into_owned());
                     }
-                }
             }
 
             if id != 0 && !self.items_by_id.contains_key(&id) {

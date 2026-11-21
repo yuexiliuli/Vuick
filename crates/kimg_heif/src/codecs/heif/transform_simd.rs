@@ -16,6 +16,8 @@
 #![allow(unsafe_code)]
 #![cfg(target_arch = "x86_64")]
 
+// 变换 SIMD 内核逐寄存器传参 + rows/t 按行列下标循环（字节恒等硬约束）→ 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 use std::arch::x86_64::*;
 
 use super::transform::TransformMap;
@@ -46,10 +48,10 @@ struct SrcRect {
 
 /// 由仿射线性部 (a,b,d,e) 判 8 形（带符号置换/正交矩阵）。判据：两行单位且正交 ⇒ 两列亦单位。
 pub(super) fn classify(a: i32, b: i32, d: i32, e: i32) -> Option<Form> {
-    if !matches!(a, -1 | 0 | 1)
-        || !matches!(b, -1 | 0 | 1)
-        || !matches!(d, -1 | 0 | 1)
-        || !matches!(e, -1 | 0 | 1)
+    if !matches!(a, -1..=1)
+        || !matches!(b, -1..=1)
+        || !matches!(d, -1..=1)
+        || !matches!(e, -1..=1)
     {
         return None;
     }
@@ -427,7 +429,7 @@ unsafe fn rot90_kernel(
 #[target_feature(enable = "avx2")]
 unsafe fn rot90_kernel8(src: *const u8, cstride: usize, r: SrcRect, dst: *mut u8, ow: usize, oh: usize) {
     unsafe {
-        debug_assert!(r.x0 % 8 == 0 && r.y0 % 8 == 0 && r.w % 8 == 0 && r.h % 8 == 0);
+        debug_assert!(r.x0.is_multiple_of(8) && r.y0.is_multiple_of(8) && r.w.is_multiple_of(8) && r.h.is_multiple_of(8));
         let mut by = 0usize;
         while by < r.h {
             let bypix = by;
@@ -458,7 +460,7 @@ unsafe fn rot90_kernel8(src: *const u8, cstride: usize, r: SrcRect, dst: *mut u8
 #[target_feature(enable = "avx2")]
 unsafe fn rot90_kernel16(src: *const u8, cstride: usize, r: SrcRect, dst: *mut u8, ow: usize, oh: usize) {
     unsafe {
-        debug_assert!(r.x0 % 16 == 0 && r.y0 % 16 == 0 && r.w % 16 == 0 && r.h % 16 == 0);
+        debug_assert!(r.x0.is_multiple_of(16) && r.y0.is_multiple_of(16) && r.w.is_multiple_of(16) && r.h.is_multiple_of(16));
         let mut by = 0usize;
         while by < r.h {
             let outcol = by;
@@ -521,7 +523,7 @@ unsafe fn rot270_kernel(
 #[target_feature(enable = "avx2")]
 unsafe fn rot270_kernel8(src: *const u8, cstride: usize, r: SrcRect, dst: *mut u8, ow: usize, _oh: usize) {
     unsafe {
-        debug_assert!(r.x0 % 8 == 0 && r.y0 % 8 == 0 && r.w % 8 == 0 && r.h % 8 == 0);
+        debug_assert!(r.x0.is_multiple_of(8) && r.y0.is_multiple_of(8) && r.w.is_multiple_of(8) && r.h.is_multiple_of(8));
         let mut by = 0usize;
         while by < r.h {
             let ybase = (r.y0 + by) * cstride;
@@ -555,7 +557,7 @@ unsafe fn rot270_kernel8(src: *const u8, cstride: usize, r: SrcRect, dst: *mut u
 #[target_feature(enable = "avx2")]
 unsafe fn rot270_kernel16(src: *const u8, cstride: usize, r: SrcRect, dst: *mut u8, ow: usize, _oh: usize) {
     unsafe {
-        debug_assert!(r.x0 % 16 == 0 && r.y0 % 16 == 0 && r.w % 16 == 0 && r.h % 16 == 0);
+        debug_assert!(r.x0.is_multiple_of(16) && r.y0.is_multiple_of(16) && r.w.is_multiple_of(16) && r.h.is_multiple_of(16));
         let mut by = 0usize;
         while by < r.h {
             let ybase = (r.y0 + by) * cstride;
@@ -600,7 +602,7 @@ unsafe fn rot270_kernel16(src: *const u8, cstride: usize, r: SrcRect, dst: *mut 
 #[target_feature(enable = "avx2")]
 unsafe fn rot180_kernel(src: *const u8, cstride: usize, r: SrcRect, dst: *mut u8, ow: usize, oh: usize) {
     unsafe {
-        debug_assert!(r.x0 % 8 == 0 && r.w % 8 == 0);
+        debug_assert!(r.x0.is_multiple_of(8) && r.w.is_multiple_of(8));
         let mut row = 0usize;
         while row < r.h {
             let srcrow = (r.y0 + row) * cstride;
@@ -644,12 +646,12 @@ unsafe fn rot90_kernel8_band(
 ) {
     unsafe {
         debug_assert!(
-            r.x0 % 8 == 0
-                && r.y0 % 8 == 0
-                && r.w % 8 == 0
-                && r.h % 8 == 0
-                && bx0 % 8 == 0
-                && bx1 % 8 == 0
+            r.x0.is_multiple_of(8)
+                && r.y0.is_multiple_of(8)
+                && r.w.is_multiple_of(8)
+                && r.h.is_multiple_of(8)
+                && bx0.is_multiple_of(8)
+                && bx1.is_multiple_of(8)
                 && bx0 < bx1
                 && bx1 <= r.w
         );
@@ -694,12 +696,12 @@ unsafe fn rot90_kernel16_band(
 ) {
     unsafe {
         debug_assert!(
-            r.x0 % 16 == 0
-                && r.y0 % 16 == 0
-                && r.w % 16 == 0
-                && r.h % 16 == 0
-                && bx0 % 16 == 0
-                && bx1 % 16 == 0
+            r.x0.is_multiple_of(16)
+                && r.y0.is_multiple_of(16)
+                && r.w.is_multiple_of(16)
+                && r.h.is_multiple_of(16)
+                && bx0.is_multiple_of(16)
+                && bx1.is_multiple_of(16)
                 && bx0 < bx1
                 && bx1 <= r.w
         );
@@ -755,12 +757,12 @@ unsafe fn rot270_kernel8_band(
 ) {
     unsafe {
         debug_assert!(
-            r.x0 % 8 == 0
-                && r.y0 % 8 == 0
-                && r.w % 8 == 0
-                && r.h % 8 == 0
-                && bx0 % 8 == 0
-                && bx1 % 8 == 0
+            r.x0.is_multiple_of(8)
+                && r.y0.is_multiple_of(8)
+                && r.w.is_multiple_of(8)
+                && r.h.is_multiple_of(8)
+                && bx0.is_multiple_of(8)
+                && bx1.is_multiple_of(8)
                 && bx0 < bx1
                 && bx1 <= r.w
         );
@@ -805,12 +807,12 @@ unsafe fn rot270_kernel16_band(
 ) {
     unsafe {
         debug_assert!(
-            r.x0 % 16 == 0
-                && r.y0 % 16 == 0
-                && r.w % 16 == 0
-                && r.h % 16 == 0
-                && bx0 % 16 == 0
-                && bx1 % 16 == 0
+            r.x0.is_multiple_of(16)
+                && r.y0.is_multiple_of(16)
+                && r.w.is_multiple_of(16)
+                && r.h.is_multiple_of(16)
+                && bx0.is_multiple_of(16)
+                && bx1.is_multiple_of(16)
                 && bx0 < bx1
                 && bx1 <= r.w
         );
@@ -866,7 +868,7 @@ unsafe fn rot180_kernel_band(
     row1: usize,
 ) {
     unsafe {
-        debug_assert!(r.x0 % 8 == 0 && r.w % 8 == 0 && row0 < row1 && row1 <= r.h);
+        debug_assert!(r.x0.is_multiple_of(8) && r.w.is_multiple_of(8) && row0 < row1 && row1 <= r.h);
         let mut row = row0;
         while row < row1 {
             let srcrow = (r.y0 + row) * cstride;

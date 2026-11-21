@@ -2,6 +2,9 @@
 //! syntect 分片补色（`syntect_fill_deferred` / `fill_place`）。（光标可见性已下沉
 //! `editor_core::caret`，本批 Pattern 1。）
 
+// 行折叠类型较长 → 放行
+#![allow(clippy::type_complexity)]
+
 use super::{
     merge_highlights,
     render,

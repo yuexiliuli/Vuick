@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// 预测内核参数多、blocks 按下标循环逐块分派（字节恒等硬约束）→ 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 // 本文件零裸操作：`subblock_above` 的预测行裸读下沉 `simd::raw::unchecked_index`
 // （`#[inline(always)]` 安全门面，内联后与原裸指针对代码生成逐指令一致）。
 
@@ -252,9 +254,7 @@ pub(crate) fn subblock_above(
         for k in 0..4 {
             a[1 + k] = super::simd::raw::unchecked_index(plane, base + col0 + 1 + k);
         }
-        for k in 0..4 {
-            a[5 + k] = above_y[17 + k];
-        }
+        a[5..9].copy_from_slice(&above_y[17..21]);
     }
     a
 }

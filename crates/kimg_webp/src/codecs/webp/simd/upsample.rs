@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// 上采样薄委托逐寄存器传参，具名构参可读性反而变差 → 按既定内核风格放行。
+#![allow(clippy::too_many_arguments)]
 // ---------------------------------------------------------------------------
 // fancy 上采样（SSE2/SSSE3/AVX2 16-bit lane；对标 vp8.rs `upsample_fancy`）安全薄委托
 // （叶子隔离第三波）：全部 `#[target_feature]` SIMD 内核与分派门面已移入同层 `raw::upsample`。

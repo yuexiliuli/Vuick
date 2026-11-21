@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+// 预测内核（predict_large*）逐寄存器传参，具名构参破坏字节恒等算术单源性 → 放行。
+#![allow(clippy::too_many_arguments)]
 //! 裸 unsafe 叶子子模块 `raw::predictor`：VP8 D1 帧内预测（原 `simd/predict.rs`）与 VP8L
 //! 预测器 / 色变换逆变换（原 `simd/predictor.rs`）的全部 `#[target_feature]` SIMD 内核 +
 //! 安全门面整体迁入。上层 `simd/predict.rs` / `simd/predictor.rs` 以 `#![forbid(unsafe_code)]`
@@ -49,7 +51,6 @@ pub(crate) unsafe fn predict_subblock_forced(
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { predict_subblock_ssse3(plane, pitch, row0, col0, mode, above) }
-        return;
     }
     // 非 x86_64：x86 intrinsic 不存在，恒走标量兜底（运行时不达：调用方
     // `part_simd_on("pred","ssse3")` 在非 x86_64 恒为 false）。
@@ -88,7 +89,7 @@ unsafe fn predict_subblock_ssse3(
         // DC：sum=4+Σabove[1..5]+Σleft，/8 落全块。
         let sum = 4u32 + u32::from(a[1]) + u32::from(a[2]) + u32::from(a[3]) + u32::from(a[4])
             + u32::from(l0) + u32::from(l1) + u32::from(l2) + u32::from(l3);
-        let fill = ((sum >> 3) * 0x0101_0101) as u32;
+        let fill = (sum >> 3) * 0x0101_0101;
         let out = base.add(row0 * pitch + 1 + col0);
         std::ptr::write_unaligned(out as *mut u32, fill);
         std::ptr::write_unaligned(out.add(pitch) as *mut u32, fill);
@@ -286,7 +287,7 @@ use std::arch::x86_64::*;
 /// RGBA8 → RGB8 抽条（4→3）：SSSE3 每 4 像素（16B 入 → 12B 出 = 8B 存 + 4B 存），
 /// 尾像素标量（同现有 `chunks_exact` 语义）。无 SSSE3 → 全标量。输入长度须为 4 的倍数。
 pub(in super::super) fn rgba8_to_rgb8(src: &[u8], dst: &mut [u8]) {
-    debug_assert!(src.len() % 4 == 0);
+    debug_assert!(src.len().is_multiple_of(4));
     debug_assert_eq!(dst.len(), src.len() / 4 * 3);
     let n = src.len() / 4;
     let mut i = 0usize;
@@ -353,9 +354,10 @@ unsafe fn rgb8_to_rgba8_avx2_8px(src: &[u8], dst: &mut [u8], start: usize) -> us
 /// - SSSE3：每批 4 像素（12B 读 → 16B 写；12B 读不越界：offset=(n-4)*3 恰 12B ≤ n*3），
 ///   掩码常数提出循环外（修 debug 慢：常数每轮重建是 to_rgba8 热点，K53 测量）。
 /// - 无 AVX2/SSSE3 → 全标量尾兜底。
+///
 /// 与 `Pixel::to_rgba` 的 `[r,g,b,255]` 逐字节一致（纯重排 + OR 常量，不涉算术）。
 pub(in super::super) fn rgb8_to_rgba8(src: &[u8], dst: &mut [u8]) {
-    debug_assert!(src.len() % 3 == 0);
+    debug_assert!(src.len().is_multiple_of(3));
     debug_assert_eq!(dst.len(), src.len() / 3 * 4);
     let n = src.len() / 3;
     let mut i = 0usize;
@@ -809,7 +811,7 @@ unsafe fn predictor_inverse_sse2(
         while x < width - 1 {
             let bx = x >> bitsu;
             let mode = (*data.get_unchecked(yb * block_w + bx) >> 8) & 0xff;
-            let seg_end = (((bx + 1) << bitsu)).min(width);
+            let seg_end = ((bx + 1) << bitsu).min(width);
             let run_end = seg_end.min(width - 1);
             if run_end <= x {
                 break;

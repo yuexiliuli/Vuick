@@ -3,6 +3,8 @@
 //! 后续 `decode_rgba` 集成用。clap/irot/imir 属 transform 阶段，本模块不处理（外部分流）。
 //! 色度按 4:2:0（`shift=1`）子抽样放位；conformance 窗口已在 brightness 采样格里。
 
+// 画布合成内核逐游标传参 + out 按通道循环（字节恒等硬约束）→ 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 use crate::codecs::heif::error::{HeifError, HeifResult};
 
 /// 一个 grid tile 的解码 YUV 平面（对应 `HevcPicture` 相关字段；tile 尺寸即 SPS 尺寸）。

@@ -24,7 +24,7 @@ impl HevcScan {
             while i < size * size {
                 while y >= 0 {
                     if (x as usize) < size && (y as usize) < size {
-                        diag[i] = ((x as u8) | ((y as u8) << 4)) as u8;
+                        diag[i] = (x as u8) | ((y as u8) << 4);
                         i += 1;
                     }
                     y -= 1;
@@ -37,14 +37,14 @@ impl HevcScan {
             i = 0;
             for yy in 0..size as u8 {
                 for xx in 0..size as u8 {
-                    hor[i] = (xx | (yy << 4)) as u8;
+                    hor[i] = xx | (yy << 4);
                     i += 1;
                 }
             }
             i = 0;
             for xx in 0..size as u8 {
                 for yy in 0..size as u8 {
-                    ver[i] = (xx | (yy << 4)) as u8;
+                    ver[i] = xx | (yy << 4);
                     i += 1;
                 }
             }
@@ -103,7 +103,7 @@ impl HevcScalingList {
         let (defaults, default_dc) = Self::create_default_lists();
         let mut lists: Vec<Vec<Vec<u8>>> = Vec::with_capacity(4);
         let mut dc: Vec<Vec<i32>> = Vec::with_capacity(4);
-        for size_id in 0..4usize {
+        for (size_id, default_lists) in defaults.iter().enumerate() {
             // C# 预分配 byte[6][] / int[6]；Rust 用预置 6 槽（size_id==3 时矩阵只写 0、3，
             // 1/2/4/5 由下方补表填），保证下标恒在界内。
             let mut per_matrix = vec![Vec::new(); 6];
@@ -116,7 +116,7 @@ impl HevcScalingList {
                     let max_delta = if size_id == 3 { (matrix_id / 3) as u32 } else { matrix_id as u32 };
                     let delta = r.read_ue_max(max_delta, "scaling_list_pred_matrix_id_delta")?;
                     if delta == 0 {
-                        per_matrix[matrix_id] = defaults[size_id][matrix_id].clone();
+                        per_matrix[matrix_id] = default_lists[matrix_id].clone();
                         per_dc[matrix_id] = default_dc;
                     } else {
                         let ref_matrix_id = matrix_id - (delta as usize) * (if size_id == 3 { 3 } else { 1 });
@@ -130,13 +130,13 @@ impl HevcScalingList {
                         per_dc[matrix_id] = next_coef;
                     }
                     let mut list = vec![0u8; coef_num];
-                    for i in 0..coef_num {
+                    for e in list.iter_mut() {
                         let delta_coef = r.read_se_range(-128, 127, "scaling_list_delta_coef")?;
                         next_coef = (next_coef + delta_coef + 256) % 256;
                         if next_coef == 0 {
                             return Err(HeifError::invalid("缩放表条目为零。"));
                         }
-                        list[i] = next_coef as u8;
+                        *e = next_coef as u8;
                     }
                     per_matrix[matrix_id] = list;
                 }
@@ -453,7 +453,7 @@ impl HevcSps {
     /// Main、Main 10 与 Main Still Picture（A.3.2–A.3.4）：profile_idc 1/2/3，或 profile_idc 0 时
     /// 看兼容标志集。其余（profile_idc ≥ 4 的 range 扩展、SCC、multilayer）用本解码器未实现的工具。
     pub fn is_supported_profile(profile_idc: i32, compatibility: u32) -> bool {
-        if matches!(profile_idc, 1 | 2 | 3) {
+        if matches!(profile_idc, 1..=3) {
             return true;
         }
         if profile_idc != 0 {

@@ -5,6 +5,7 @@
 //! - 颜色统一由 [`c()`]/[`c_a()`] 转成运行期 [`Hsla`] 供 `.bg()`/`.text_color()` 消费；
 //! - 渐变封面不存在 CSS 渐变，用 `canvas` + `window.paint_quad` + [`linear_gradient`]
 //!   自绘（见 [`gradient_cover`]），[`grad_css`] 仅产出原型同款 CSS 字符串供测试/日志。
+//!
 //! 所有视图只从本模块取色，禁止散落裸 hex。
 
 use std::cell::Cell;

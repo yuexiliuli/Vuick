@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+// 宏块熵解码内核（read_tree/tokens 路由）逐游标传参，具名构参破坏字节恒等算术单源性 → 放行。
+#![allow(clippy::too_many_arguments)]
 //! 裸 unsafe 叶子子模块 `raw::mbdec`：pipeline/mbdec 域的宏块熵解码整块迁入
 //! （`parse_residuals*` / `read_macroblock_modes*` 分发器与 BMI 快道内核、`read_tree`/树路由宏，
 //! 原 `vp8/mbdec.rs`）。上层 `vp8/mbdec.rs` 以 `#![forbid(unsafe_code)]` + 薄委托显式依赖

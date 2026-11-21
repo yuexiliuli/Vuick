@@ -1,6 +1,9 @@
 //! PDF 阅读器子模块：待保存模型（内存级页操作 / 保存 / 撤销 / `open_from_bytes`）：
 //! 页操作只改 worker 内存工作副本，成功回传新镜像 → 内存级重载；撤销栈记录逆操作。
 
+// 页操作回调状态类型较长 → 放行
+#![allow(clippy::type_complexity)]
+
 use super::*;
 use super::open::enforce_undo_mem_budget;
 use super::open::extract_target_precheck;
@@ -239,7 +242,7 @@ impl PdfViewer {
         }
         // 预计算待存注释平移（与 worker 同口径：每页 < n、去重后全有效才发）。
         // 删除集：升序排序用于「页号顺移」计数；并发 worker 仍做权威校验。
-        let mut deleted: Vec<usize> = pages.iter().copied().collect();
+        let mut deleted: Vec<usize> = pages.to_vec();
         deleted.sort_unstable();
         deleted.dedup();
         // view 侧轻预检（worker 仍做权威校验）：越界 / 删光全部页先给中文文案。
@@ -258,7 +261,7 @@ impl PdfViewer {
         let shift: Box<dyn Fn(&mut Vec<PendingAnnot>) + Send> = {
             let deleted = deleted.clone();
             Box::new(move |annots| {
-                annots.retain(|a| !deleted.binary_search(&a.page).is_ok());
+                annots.retain(|a| deleted.binary_search(&a.page).is_err());
                 for a in annots.iter_mut() {
                     let removed = deleted.iter().filter(|&&d| d < a.page).count();
                     a.page -= removed;
@@ -645,7 +648,7 @@ impl PdfViewer {
                     if !matches!(answer.await, Ok(0)) {
                         return;
                     }
-                    let _ = cx.update_entity(&entity, |v, cx| v.grid_apply_delete(pages, cx));
+                    cx.update_entity(&entity, |v, cx| v.grid_apply_delete(pages, cx));
                 })
                 .detach();
         }
@@ -712,8 +715,7 @@ impl PdfViewer {
                     if !matches!(answer.await, Ok(0)) {
                         return;
                     }
-                    let _ =
-                        cx.update_entity(&entity, |v, cx| v.grid_apply_split((min, max), out, cx));
+                    cx.update_entity(&entity, |v, cx| v.grid_apply_split((min, max), out, cx));
                 })
                 .detach();
         }
@@ -762,7 +764,7 @@ impl PdfViewer {
                     if !matches!(answer.await, Ok(0)) {
                         return;
                     }
-                    let _ = cx.update_entity(&entity, |v, cx| v.grid_apply_extract(pages, out, cx));
+                    cx.update_entity(&entity, |v, cx| v.grid_apply_extract(pages, out, cx));
                 })
                 .detach();
         }
@@ -801,7 +803,7 @@ impl PdfViewer {
                     if !matches!(answer.await, Ok(0)) {
                         return;
                     }
-                    let _ = cx.update_entity(&entity, |v, cx| v.grid_apply_merge(src, cx));
+                    cx.update_entity(&entity, |v, cx| v.grid_apply_merge(src, cx));
                 })
                 .detach();
         }

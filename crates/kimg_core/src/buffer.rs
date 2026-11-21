@@ -265,6 +265,7 @@ impl<P: Pixel, Container: Deref<Target = [P::Subpixel]>> ImageBuffer<P, Containe
     }
 
     /// 返回底层容器可变引用。
+    #[allow(clippy::should_implement_trait)]
     pub fn as_mut(&mut self) -> &mut Container {
         &mut self.data
     }
@@ -323,7 +324,8 @@ impl<P: Pixel, Container: DerefMut<Target = [P::Subpixel]>> ImageBuffer<P, Conta
             .and_then(|n| n.checked_mul(P::CHANNEL_COUNT as usize))
             .unwrap();
         let mut data = Vec::new();
-        data.try_reserve_exact(len).unwrap_or_else(|_| {});
+        // 预留失败可忽略：后续 resize 会按需扩容，语义与 unwrap_or(()) 等价。
+        let _ = data.try_reserve_exact(len);
         data.resize(len, P::Subpixel::default());
         Self {
             width,

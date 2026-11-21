@@ -1,5 +1,8 @@
 //! MCU 解码主循环（baseline/progressive；数值核心 = C# 逐字节恒等的 `cs.rs`）。
 
+// IDCT 行/块按下标循环（字节恒等硬约束，改写迭代器会动 codegen）→ 放行。
+#![allow(clippy::needless_range_loop)]
+
 use core::cmp::{max, min};
 
 use crate::codecs::jpeg::bitstream::{dual_sym_enabled, BitStream, HotStream};
@@ -101,11 +104,10 @@ impl<'a> Decoder<'a> {
             // 处理“讨厌的 bug”：Y 分量 2x 采样而其它分量非 1x1
             let mut handle_that_annoying_bug = false;
 
-            if let Some(y_component) = self.components.first() {
-                if y_component.horizontal_sample == 2 || y_component.vertical_sample == 2 {
+            if let Some(y_component) = self.components.first()
+                && (y_component.horizontal_sample == 2 || y_component.vertical_sample == 2) {
                     handle_that_annoying_bug = true;
                 }
-            }
             if handle_that_annoying_bug {
                 for (idx, comp) in self.components.iter_mut().enumerate() {
                     if idx != 0 && (comp.horizontal_sample != 1 || comp.vertical_sample != 1) {
@@ -206,7 +208,7 @@ impl<'a> Decoder<'a> {
         self.sample_ratio = SampleRatios::None;
         self.is_interleaved = false;
         self.components[0].vertical_sample = 1;
-        self.components[0].width_stride = ((self.width + 7) / 8) * 8;
+        self.components[0].width_stride = self.width.div_ceil(8) * 8;
         self.components[0].horizontal_sample = 1;
     }
 
@@ -228,16 +230,16 @@ impl<'a> Decoder<'a> {
             mcu_height = self.mcu_y;
         } else {
             // 非交织（1x1 次采样）：MCU 数按 /8 计算
-            mcu_width = (self.width + 7) / 8;
-            mcu_height = (self.height + 7) / 8;
+            mcu_width = self.width.div_ceil(8);
+            mcu_height = self.height.div_ceil(8);
         }
 
         if self.input_colorspace == ColorSpace::Luma && self.is_interleaved {
             // 灰度下采样图像：重置分量为非交织
             self.reset_params();
 
-            mcu_width = (self.width + 7) / 8;
-            mcu_height = (self.height + 7) / 8;
+            mcu_width = self.width.div_ceil(8);
+            mcu_height = self.height.div_ceil(8);
         }
         // scaled：输出宽按 `ceil(w/den)`（overread 128 清行 / post_process 都用它）。
         let width = if let Some(den) = self.scaled_den {
@@ -294,8 +296,7 @@ impl<'a> Decoder<'a> {
         'sos: loop {
             for i in 0..mcu_height {
                 if stream.overread_by > 0 {
-                    pixels.get_mut(self.cs_out_row * width * self.out_bpp()..)
-                        .map(|v| v.fill(128));
+                    if let Some(v) = pixels.get_mut(self.cs_out_row * width * self.out_bpp()..) { v.fill(128) }
                     break;
                 }
 
@@ -342,9 +343,8 @@ impl<'a> Decoder<'a> {
                         }
                     }
                     McuContinuation::Terminate => {
-                        pixels
-                            .get_mut(self.cs_out_row * width * self.out_bpp()..)
-                            .map(|v| v.fill(128));
+                        if let Some(v) = pixels
+                            .get_mut(self.cs_out_row * width * self.out_bpp()..) { v.fill(128) }
                         return Ok(());
                     }
                 }
@@ -376,17 +376,11 @@ impl<'a> Decoder<'a> {
         let width = self.width;
 
         for (pos, comp) in self.components.iter_mut().enumerate() {
-            if min(
+            comp.needed = min(
                 self.out_colorspace.num_components().saturating_sub(1),
                 pos,
             ) == pos
-                || self.input_colorspace == ColorSpace::YCCK
-                || self.input_colorspace == ColorSpace::CMYK
-            {
-                comp.needed = true;
-            } else {
-                comp.needed = false;
-            }
+                || self.input_colorspace == ColorSpace::YCCK || self.input_colorspace == ColorSpace::CMYK;
         }
 
         self.init_cs_tail();
@@ -409,7 +403,7 @@ impl<'a> Decoder<'a> {
                     .iter_mut()
                     .zip(slice.iter())
                 {
-                    *dst = src as u8;
+                    *dst = src;
                 }
             }
 
@@ -482,7 +476,7 @@ impl<'a> Decoder<'a> {
         let mut scan_du_width = if PROGRESSIVE {
             let k = z_scans[0];
             let comp = &self.components[k];
-            (self.width * comp.horizontal_sample + self.h_max * 8 - 1) / (self.h_max * 8)
+            (self.width * comp.horizontal_sample).div_ceil(self.h_max * 8)
         } else {
             mcu_width
         };
@@ -1146,8 +1140,8 @@ impl<'a> Decoder<'a> {
             mcu_width = self.mcu_x;
             mcu_height = self.mcu_y;
         } else {
-            mcu_width = (self.width + 7) / 8;
-            mcu_height = (self.height + 7) / 8;
+            mcu_width = self.width.div_ceil(8);
+            mcu_height = self.height.div_ceil(8);
         }
 
         // 特定图像（交织 YCbCr → 灰）需按采样比例修正 mcu_height
@@ -1191,13 +1185,12 @@ impl<'a> Decoder<'a> {
             None
         };
         let result = self.parse_entropy_coded_data(&mut stream, &mut block, &mut prog_mask);
-        if scan_prof {
-            if let Some(t) = t_e0 {
+        if scan_prof
+            && let Some(t) = t_e0 {
                 let k = scan_kind(self.spec_start, self.succ_high);
                 prof.ms[k] += t.elapsed().as_secs_f64() * 1000.0;
                 prof.n_scans += 1;
             }
-        }
         let first_err = result.is_err();
 
         if !first_err {
@@ -1226,13 +1219,12 @@ impl<'a> Decoder<'a> {
                         };
                         let result =
                             self.parse_entropy_coded_data(&mut stream, &mut block, &mut prog_mask);
-                        if scan_prof {
-                            if let Some(t) = t_es {
+                        if scan_prof
+                            && let Some(t) = t_es {
                                 let k = scan_kind(self.spec_start, self.succ_high);
                                 prof.ms[k] += t.elapsed().as_secs_f64() * 1000.0;
                                 prof.n_scans += 1;
                             }
-                        }
 
                         if result.is_err() {
                             // 非 strict：跳出并收尾
@@ -1647,7 +1639,7 @@ impl<'a> Decoder<'a> {
             self.mcu_y
         } else {
             // 非交织（1x1 采样）：MCU 数以宽高除以 8 计
-            (self.height + 7) / 8
+            self.height.div_ceil(8)
         };
 
         // 输出宽（scaled 时按 den 折算；post_process 用同一口径）。

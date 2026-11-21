@@ -18,7 +18,7 @@ pub fn parse_goto(s: &str) -> Option<(i64, Option<i64>)> {
         Some((r, c)) => (r, Some(c)),
         None => (s, None),
     };
-    if col_s.map_or(false, |c| c.contains(':')) {
+    if col_s.is_some_and(|c| c.contains(':')) {
         return None; // 多个冒号 → 非法
     }
     let row = row_s.trim().parse::<i64>().ok()?;

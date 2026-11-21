@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// 环路滤波标量内核参数多、逐样本坐标传参，具名构整改动签名；row_filters 按下标循环需平移语义 → 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 // 本文件零裸操作：SIMD 熔合路径的指针派点 + 内核调用下沉 `simd::raw::lf_filter_macroblock_safe`
 // （`#[inline(always)]` 安全门面）；标量路径全部安全切片读写。
 
@@ -293,6 +295,7 @@ const MT_MIN_MB_TOTAL: usize = 2304;
 /// - `0` / `1` / `off` / `serial`：强制串行（重建毕→整帧滤波；输出恒与并行逐字节一致）。
 /// - `2` / `on` / `two`：强制 P-B 真重叠管道（重建∥滤波，见 `decode_from_header` 下游）。
 /// - 其余 / 缺省（auto）：宽图（宏块总数≥`MT_MIN_MB_TOTAL`）开管道，窄/小图关（进程开销>收益）。
+///
 /// 每次解码读一次 env（pn gsimd `KIMG_PNG_LEVEL` 同款，测试可翻转）。
 pub(crate) fn filter_mt_enabled(mbw: usize, mbh: usize) -> bool {
     let mode = std::env::var("KIMG_WEBP_THREADS").unwrap_or_default();
@@ -405,7 +408,7 @@ pub(crate) fn extract_tight_rows(
     out_u: &mut [u8],
     out_v: &mut [u8],
 ) {
-    let cwu = (width + 1) / 2;
+    let cwu = width.div_ceil(2);
     if end == 0 {
         return;
     }
@@ -427,6 +430,7 @@ pub(crate) fn extract_tight_rows(
 /// - 滤波/直出/紧密抽取完全复用 `filter_macroblock_row` / `emit_rows_into_rgba` /
 ///   `extract_tight_rows`，行序 m 升序、段序 `[emitted, m*16+8)` 与串行一致 → 逐字节同。
 /// - planes_A 恒未滤波（t2 独占），故 t3 滤波不需要等 t2 的下一步预测 —— 无 1 行滞后约束。
+///
 /// 所有权：本线程独占 planes_B / rgba / out_*，零裸操作，无共享可变内存。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn filter_t3_loop(

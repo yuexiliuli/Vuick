@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+// 环路滤波 SIMD 内核：参数多 + 逐 lane 下标循环（字节恒等硬约束，改写迭代器会动 codegen）→ 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 //! 裸 unsafe 叶子子模块 `raw::loop_filter`：D2 环路滤波全部 SSE2 SIMD 内核 + 安全门面整体迁入
 //! （原 `simd/loop_filter.rs` / `simd/lf_edge.rs`，含 D2v1 弃用休眠集群 / D2v2 libwebp 风格
 //! `lf_edge_*` 内核 / D2v3 宏块熔合 `lf_filter_macroblock`）。上层 `simd/loop_filter.rs` /
@@ -620,8 +622,8 @@ unsafe fn lf_base_delta(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i) -> _
     let q0_p0 = _mm_subs_epi8(q0, p0);
     let s1 = _mm_adds_epi8(p1_q1, q0_p0);
     let s2 = _mm_adds_epi8(q0_p0, s1);
-    let s3 = _mm_adds_epi8(q0_p0, s2);
-    s3
+    
+    _mm_adds_epi8(q0_p0, s2)
 }
 
 /// 翻转符号域饱和加/减（等价标量 [0,255] clamp 后的 p/q 更新）。
@@ -857,11 +859,11 @@ pub(crate) unsafe fn lf_mask_composite(filter: __m128i, max_diff: __m128i, ithre
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 pub(crate) unsafe fn lf_max_diff(p3: __m128i, p2: __m128i, p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, q2: __m128i, q3: __m128i) -> __m128i { unsafe {
-    let m = _mm_max_epu8(
+    
+    _mm_max_epu8(
         _mm_max_epu8(_mm_max_epu8(lf_abs(p3, p2), lf_abs(p2, p1)), lf_abs(p1, p0)),
         _mm_max_epu8(_mm_max_epu8(lf_abs(q0, q1), lf_abs(q1, q2)), lf_abs(q2, q3)),
-    );
-    m
+    )
 }}
 
 /// 竖直边（our vertical=true）16-wide。`pt` 指向 (行 y, 帧列 x-4)（p3 列；simple 只更新 p0/q0）。
@@ -979,14 +981,14 @@ pub(crate) unsafe fn lf_edge_h(
     let p3 = lf_row(pt.offset(-4 * stride), n);
     let p2 = lf_row(pt.offset(-3 * stride), n);
     let p1 = lf_row(pt.offset(-2 * stride), n);
-    let p0 = lf_row(pt.offset(-1 * stride), n);
+    let p0 = lf_row(pt.offset(-stride), n);
     let q0 = lf_row(pt.offset(0), n);
-    let q1 = lf_row(pt.offset(1 * stride), n);
+    let q1 = lf_row(pt.offset(stride), n);
     let q2 = lf_row(pt.offset(2 * stride), n);
     let q3 = lf_row(pt.offset(3 * stride), n);
     if simple {
         let (p0n, q0n) = lf_do_filter2(p1, p0, q0, q1, edge);
-        std::ptr::copy_nonoverlapping(&p0n as *const __m128i as *const u8, pt.offset(-1 * stride), n);
+        std::ptr::copy_nonoverlapping(&p0n as *const __m128i as *const u8, pt.offset(-stride), n);
         std::ptr::copy_nonoverlapping(&q0n as *const __m128i as *const u8, pt.offset(0), n);
         return;
     }
@@ -1142,19 +1144,19 @@ unsafe fn lf_edge_h_pair(
         if simple {
             let (p0n, q0n) = lf_do_filter2(
                 lf_uv_pair_row(u, v, -2 * stride),
-                lf_uv_pair_row(u, v, -1 * stride),
+                lf_uv_pair_row(u, v, -stride),
                 lf_uv_pair_row(u, v, 0),
                 lf_uv_pair_row(u, v, stride),
                 edge,
             );
-            lf_uv_pair_store(u, v, -1 * stride, p0n);
+            lf_uv_pair_store(u, v, -stride, p0n);
             lf_uv_pair_store(u, v, 0, q0n);
             return;
         }
         let p3 = lf_uv_pair_row(u, v, -4 * stride);
         let p2 = lf_uv_pair_row(u, v, -3 * stride);
         let p1 = lf_uv_pair_row(u, v, -2 * stride);
-        let p0 = lf_uv_pair_row(u, v, -1 * stride);
+        let p0 = lf_uv_pair_row(u, v, -stride);
         let q0 = lf_uv_pair_row(u, v, 0);
         let q1 = lf_uv_pair_row(u, v, stride);
         let q2 = lf_uv_pair_row(u, v, 2 * stride);
@@ -1173,14 +1175,14 @@ unsafe fn lf_edge_h_pair(
             let (p2n, p1n, p0n, q0n, q1n, q2n) = lf_do_filter6(p2, p1, p0, q0, q1, q2, mask, hev);
             lf_uv_pair_store(u, v, -3 * stride, p2n);
             lf_uv_pair_store(u, v, -2 * stride, p1n);
-            lf_uv_pair_store(u, v, -1 * stride, p0n);
+            lf_uv_pair_store(u, v, -stride, p0n);
             lf_uv_pair_store(u, v, 0, q0n);
             lf_uv_pair_store(u, v, stride, q1n);
             lf_uv_pair_store(u, v, 2 * stride, q2n);
         } else {
             let (p1n, p0n, q0n, q1n) = lf_do_filter4(p1, p0, q0, q1, mask, hev);
             lf_uv_pair_store(u, v, -2 * stride, p1n);
-            lf_uv_pair_store(u, v, -1 * stride, p0n);
+            lf_uv_pair_store(u, v, -stride, p0n);
             lf_uv_pair_store(u, v, 0, q0n);
             lf_uv_pair_store(u, v, stride, q1n);
         }

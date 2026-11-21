@@ -1,5 +1,8 @@
 //! BMP 解码器（手写实现，行为与 image 0.25 对齐：1/2/4/8bit 调色板、16/24/32bit、RLE、bitfields）。
 
+// 解码内核逐游标传参 + LUT 按索引循环（字节恒等硬约束）→ 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+
 use std::io::{BufRead, Read, Seek, SeekFrom};
 
 use kimg_core::color::ColorType;
@@ -471,9 +474,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
     fn read_palette(&mut self) -> ImageResult<()> {
         const MAX_PALETTE_SIZE: usize = 256;
         let bpc = self.bytes_per_color();
-        let palette_size = match self.bit_count {
-            b => (1usize << b).min(MAX_PALETTE_SIZE),
-        };
+        let palette_size = (1usize << self.bit_count).min(MAX_PALETTE_SIZE);
         let length = palette_size * bpc;
         let mut buf = vec![0u8; bpc * MAX_PALETTE_SIZE];
         let n = length.min(buf.len());
@@ -595,18 +596,10 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
             match bit_count {
                 1 => {
                     for &idx in &indices {
-                        let mut bit = 0x80;
-                        loop {
-                            if let Some(pixel) = pixel_iter.next() {
-                                let rgb = palette[usize::from((idx & bit) != 0)];
-                                pixel[..3].copy_from_slice(&rgb);
-                            } else {
-                                break;
-                            }
-                            bit >>= 1;
-                            if bit == 0 {
-                                break;
-                            }
+                        for (bit_shift, pixel) in pixel_iter.by_ref().take(8).enumerate() {
+                            let bit = 0x80u8 >> bit_shift;
+                            let rgb = palette[usize::from((idx & bit) != 0)];
+                            pixel[..3].copy_from_slice(&rgb);
                         }
                     }
                 }
@@ -748,8 +741,8 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
             self.reader.read_exact(&mut raw)?;
             let mut start = 0usize;
             // 行内核先吃掉宽行主径，剩余 <4 像素交标量尾（字节恒等）。
-            if simd {
-                if let Some(f) = fmt {
+            if simd
+                && let Some(f) = fmt {
                     #[cfg(target_arch = "x86_64")]
                     {
                         start = unsafe { bgr_ops::expand_16bit_simd(&raw, row, width, channels, f) };
@@ -761,7 +754,6 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
                         unreachable!("非 x86_64 上 simd 恒 false，不应进入本分支");
                     }
                 }
-            }
             for (i, pixel) in row.chunks_mut(channels).enumerate().skip(start) {
                 let data = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
                 pixel[0] = rl[((data >> bf.r.shift) & ((1 << bf.r.len) - 1)) as usize];
@@ -844,7 +836,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
 
         for row in self.rows_mut(buf) {
             if !simd {
-                if let Some(_) = drop {
+                if drop.is_some() {
                     // 32bit 无 alpha：读 4 字节按选位出 [R,G,B]（保持不透明语义）。
                     let mut px = [0u8; 4];
                     for pixel in row.chunks_mut(channels) {
@@ -1026,7 +1018,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
                             }
                             if indexed {
                                 render_rle_segments(
-                                    &mut row,
+                                    row,
                                     &idx,
                                     &segs,
                                     is_8bit,
@@ -1053,7 +1045,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
                                 // 当前行在此放弃 → 先展开本行已解码段再换行。
                                 if indexed {
                                     render_rle_segments(
-                                        &mut row,
+                                        row,
                                         &idx,
                                         &segs,
                                         is_8bit,
@@ -1246,7 +1238,7 @@ impl<R: BufRead + Seek> BmpDecoder<R> {
             // 行完成（EOL break）：展开本行已解码段。
             if indexed {
                 render_rle_segments(
-                    &mut row,
+                    row,
                     &idx,
                     &segs,
                     is_8bit,
@@ -1283,12 +1275,11 @@ fn push_seg(segs: &mut Vec<(usize, usize)>, x: usize, len: usize) {
     if len == 0 {
         return;
     }
-    if let Some(last) = segs.last_mut() {
-        if last.0 + last.1 == x {
+    if let Some(last) = segs.last_mut()
+        && last.0 + last.1 == x {
             last.1 += len;
             return;
         }
-    }
     segs.push((x, len));
 }
 
@@ -1380,9 +1371,9 @@ fn bitfield_lut(bf: &Bitfield) -> [u8; 256] {
         lut.fill(0xFF);
         return lut;
     }
-    for i in 0..256usize {
+    for (i, e) in lut.iter_mut().enumerate() {
         let idx = i & ((1 << bf.len) - 1);
-        lut[i] = bf.read((idx as u32) << bf.shift);
+        *e = bf.read((idx as u32) << bf.shift);
     }
     lut
 }

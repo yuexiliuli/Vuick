@@ -164,11 +164,10 @@ impl Prewarm {
         doc: &markdown::doc::Doc,
         k: usize,
     ) -> u64 {
-        if let Some(&(g, key)) = self.giant_key_memo.get(&k) {
-            if g == content_gen {
+        if let Some(&(g, key)) = self.giant_key_memo.get(&k)
+            && g == content_gen {
                 return key;
             }
-        }
         let key = crate::frame::block_content_id(doc, k);
         self.giant_key_memo.insert(k, (content_gen, key));
         key

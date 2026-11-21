@@ -80,8 +80,8 @@ impl HuffmanTable {
         let mut huff_code: [u32; 257] = [0; 257];
         let mut p = 0;
 
-        for l in 1..=16 {
-            let mut i = i32::from(bits[l]);
+        for (l, &bl) in bits.iter().enumerate().take(16 + 1).skip(1) {
+            let mut i = i32::from(bl);
             while i != 0 {
                 huff_size[p] = l as u8;
                 p += 1;
@@ -118,12 +118,12 @@ impl HuffmanTable {
         // 生成位序解码表（图 F.15）
         p = 0;
 
-        for l in 0..=16 {
-            if bits[l] == 0 {
+        for (l, &bl) in bits.iter().enumerate().take(16 + 1) {
+            if bl == 0 {
                 self.maxcode[l] = -1;
             } else {
                 self.offset[l] = (p as i32) - (huff_code[p]) as i32;
-                p += usize::from(bits[l]);
+                p += usize::from(bl);
             }
         }
 
@@ -135,12 +135,10 @@ impl HuffmanTable {
 
         for l in 1..=HUFF_LOOKAHEAD {
             for _ in 1..=i32::from(bits[usize::from(l)]) {
-                let mut look_bits = (huff_code[p] as usize) << (HUFF_LOOKAHEAD - l);
-
-                for _ in 0..1 << (HUFF_LOOKAHEAD - l) {
+                let start = (huff_code[p] as usize) << (HUFF_LOOKAHEAD - l);
+                for look_bits in (start..).take(1usize << (HUFF_LOOKAHEAD - l)) {
                     self.lookup[look_bits] =
                         (i32::from(l) << HUFF_LOOKAHEAD) | i32::from(self.values[p]);
-                    look_bits += 1;
                 }
 
                 p += 1;

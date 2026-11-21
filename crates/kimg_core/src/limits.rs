@@ -45,20 +45,18 @@ impl Limits {
 
     /// 校验宽高是否超过严格限制。
     pub fn check_dimensions(&self, width: u32, height: u32) -> ImageResult<()> {
-        if let Some(max_width) = self.max_image_width {
-            if width > max_width {
+        if let Some(max_width) = self.max_image_width
+            && width > max_width {
                 return Err(ImageError::Limits(LimitError::from_kind(
                     LimitErrorKind::DimensionError,
                 )));
             }
-        }
-        if let Some(max_height) = self.max_image_height {
-            if height > max_height {
+        if let Some(max_height) = self.max_image_height
+            && height > max_height {
                 return Err(ImageError::Limits(LimitError::from_kind(
                     LimitErrorKind::DimensionError,
                 )));
             }
-        }
         Ok(())
     }
 

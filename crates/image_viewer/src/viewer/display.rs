@@ -55,7 +55,7 @@ impl ImageViewer {
             let Some(target) = self.nav.get(ni) else {
                 continue;
             };
-            if *target == self.path || seen.iter().any(|p| *p == target) {
+            if *target == self.path || seen.contains(&target) {
                 continue;
             }
             let Some(entry) = self.cache.iter().find(|e| e.path == *target) else {

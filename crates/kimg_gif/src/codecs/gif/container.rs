@@ -91,7 +91,7 @@ impl GifContainer {
         let mut pos = 13usize;
         let (mut global_offset, mut global_count) = (-1i64, 0usize);
         if packed & 0x80 != 0 {
-            global_count = (2usize << (packed & 7)) as usize;
+            global_count = 2usize << (packed & 7);
             if data.len() - pos < global_count * 3 {
                 return Err(invalid("GIF 在全局色表中途结束"));
             }

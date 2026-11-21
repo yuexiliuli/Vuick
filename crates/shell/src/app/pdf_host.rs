@@ -124,8 +124,7 @@ impl EditorApp {
             // 窗口上；取不到（理论上不该发生）→ 零所有者仍可弹（顶层独立对话框）。
             let mut owner: isize = 0;
             if let Ok(handle) = window.window_handle()
-                && let Ok(raw_window_handle::RawWindowHandle::Win32(win32)) =
-                    raw_window_handle::RawWindowHandle::try_from(handle)
+                && let raw_window_handle::RawWindowHandle::Win32(win32) = From::from(handle)
             {
                 owner = win32.hwnd.get();
             }
@@ -359,7 +358,7 @@ impl EditorApp {
             },
             |this, emitter, cx| {
                 // 关闭（选择/Esc/点击外）→ 按 emitter 身份校验清理本菜单槽位。
-                if this.pdf_menu.entity.as_ref() == Some(&emitter) {
+                if this.pdf_menu.entity.as_ref() == Some(emitter) {
                     this.pdf_menu.clear();
                 }
                 cx.notify();
@@ -411,6 +410,7 @@ impl EditorApp {
 
     /// 「插入页面」动作：确认框（插入页为待存）→ `insert_blank_page_after`（内存级）
     /// + 失败 toast。域逻辑 [`shell_pdf::menu::insert_page_action`]（toast 经宿主
+///
     /// `PdfHost` 再入）。
     pub(crate) fn pdf_insert_page_action(
         &mut self,
@@ -550,7 +550,7 @@ fn pdf_bg_preset_item(
     })
     .keep_open()
     .on_click(move |_, _window, cx| {
-        let _ = app2.update(cx, |this, cx| this.set_pdf_bg(pref, None, cx));
+        app2.update(cx, |this, cx| this.set_pdf_bg(pref, None, cx));
     })
 }
 
@@ -571,7 +571,7 @@ fn pdf_bg_custom_item(app: gpui::Entity<EditorApp>) -> PopupMenuItem {
     })
     .keep_open()
     .on_click(move |_click, window, cx| {
-        let _ = app2.update(cx, |this, cx| this.pick_custom_pdf_bg(window, cx));
+        app2.update(cx, |this, cx| this.pick_custom_pdf_bg(window, cx));
     })
 }
 

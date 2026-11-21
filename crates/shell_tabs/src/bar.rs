@@ -18,6 +18,9 @@
 //! - `on_tab_bar_right_click` / `on_tab_right_click` → 同名实体方法（菜单槽位经
 //!   [`crate::host::TabsHost`] `tabs_host_open_*`/`tabs_host_dismiss_*` 落宿主）。
 
+// tab 条绘制逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -252,7 +255,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 MouseButton::Left,
                 cx.listener(move |_this: &mut Self, _ev, window, cx| {
                     if let Some(h) = host_close.upgrade() {
-                        let _ = h.update(cx, |app, cx| {
+                        h.update(cx, |app, cx| {
                             app.tabs_host_close_tab(idx, window, cx);
                         });
                     }
@@ -381,12 +384,12 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 // 拖拽开始：先记抓取偏移（共享模型，`tab_drag_grab`），再经宿主预建幽灵窗
                 // （`prime_drag_ghost` 内部亦置 `tab_dragging`）——顺序与迁移前逐字一致。
                 if let Some(tb) = tab_weak.upgrade() {
-                    let _ = tb.update(cx, |this, _cx| {
+                    tb.update(cx, |this, _cx| {
                         this.model.borrow_mut().tab_drag_grab = Some(offset);
                     });
                 }
                 if let Some(h) = host_for_drag.upgrade() {
-                    let _ = h.update(cx, |app, cx| {
+                    h.update(cx, |app, cx| {
                         app.tab_drag_host_prime_ghost(
                             _value.idx,
                             _value.name.clone(),
@@ -411,7 +414,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 let host = host.clone();
                 cx.listener(move |_this: &mut Self, _ev, window, cx| {
                     if let Some(h) = host.upgrade() {
-                        let _ = h.update(cx, |app, cx| {
+                        h.update(cx, |app, cx| {
                             app.tabs_host_activate_tab(idx, window, cx);
                         });
                     }
@@ -516,7 +519,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                             let idx = this.model.borrow().active_tab;
                             let host = this.host_weak();
                             if let Some(h) = host.upgrade() {
-                                let _ = h.update(cx, |app, cx| {
+                                h.update(cx, |app, cx| {
                                     app.tabs_host_toggle_preview_for_tab(idx, window, cx);
                                 });
                             }
@@ -706,7 +709,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                                 |this: &mut Self, _ev, _window, cx| {
                                     let host = this.host_weak();
                                     if let Some(h) = host.upgrade() {
-                                        let _ = h.update(cx, |app, cx| {
+                                        h.update(cx, |app, cx| {
                                             app.tabs_host_poke_tab_hscroll(cx);
                                         });
                                     }
@@ -760,7 +763,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 // 旧菜单的关闭误清新菜单。
                 let host = this.host_weak();
                 if let Some(h) = host.upgrade() {
-                    let _ = h.update(cx, |app, cx| {
+                    h.update(cx, |app, cx| {
                         app.tabs_host_dismiss_tab_bar_menu(emitter, cx);
                     });
                 }
@@ -768,7 +771,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         );
         let host = self.host_weak();
         if let Some(h) = host.upgrade() {
-            let _ = h.update(cx, |app, cx| {
+            h.update(cx, |app, cx| {
                 app.tabs_host_open_tab_bar_menu(ev.position, menu, sub, cx);
             });
         }
@@ -922,7 +925,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 // 关闭（选择/Esc/点击外）→ 宿主身份校验 + 清理槽位。
                 let host = this.host_weak();
                 if let Some(h) = host.upgrade() {
-                    let _ = h.update(cx, |app, cx| {
+                    h.update(cx, |app, cx| {
                         app.tabs_host_dismiss_tab_bar_menu(emitter, cx);
                     });
                 }
@@ -930,7 +933,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         );
         let host = self.host_weak();
         if let Some(h) = host.upgrade() {
-            let _ = h.update(cx, |app, cx| {
+            h.update(cx, |app, cx| {
                 app.tabs_host_open_tab_bar_menu(ev.position, menu, sub, cx);
             });
         }

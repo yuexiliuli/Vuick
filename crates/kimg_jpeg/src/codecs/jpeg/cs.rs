@@ -12,6 +12,9 @@
 // 常量（C# 编译期 `(float)double` 的精确位模式，见 CS_ALGORITHM.md §10）
 // ==========================================================================
 
+// 颜色换算/IDCT 内核逐寄存器/逐游标传参，字符 y 按行下标循环（字节恒等硬约束）→ 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+
 /// `1/(2√2)` = 0.35355338
 pub(crate) const K4: f32 = f32::from_bits(0x3eb504f3);
 /// `C1 = cos(π/16)/2` = 0.49039263
@@ -145,7 +148,7 @@ pub(crate) fn idct8x8_dc_only(dc: i16, out: &mut [u8], offset: usize, stride: us
     let v = to_sample((f32::from(dc) * K4) * K4);
     // stride 为 8 的倍数时（本仓调用点各平面行宽均为 8 倍数）每行 8 字节按单个
     // `[u8; 8]` 拷贝（x86 上展开为一次 8 字节写而非逐字节 fill），字节恒等。
-    if stride % 8 == 0 {
+    if stride.is_multiple_of(8) {
         let word = [v; 8];
         for y in 0..8 {
             let o = offset + y * stride;

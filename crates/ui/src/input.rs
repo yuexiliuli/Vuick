@@ -974,11 +974,10 @@ impl InputState {
         if !self.confirm_required {
             return false;
         }
-        if let Some(validate) = self.validate {
-            if let Validation::Err(_) = validate(self.text.as_str(), window) {
+        if let Some(validate) = self.validate
+            && let Validation::Err(_) = validate(self.text.as_str(), window) {
                 return true;
             }
-        }
         false
     }
 

@@ -54,11 +54,10 @@ impl Metadata {
             if reference.ty != RefThmb || !reference.to.contains(&primary_id) {
                 continue;
             }
-            if let Some(idx) = items.find_index(reference.from) {
-                if items.items[idx].ty == ItemHvc1 {
+            if let Some(idx) = items.find_index(reference.from)
+                && items.items[idx].ty == ItemHvc1 {
                     return Some(idx);
                 }
-            }
         }
         None
     }

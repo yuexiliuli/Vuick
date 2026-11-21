@@ -158,13 +158,7 @@ impl fmt::Debug for Vp8BoolDecoder<'_> {
 
 impl Clone for Vp8BoolDecoder<'_> {
     fn clone(&self) -> Self {
-        Vp8BoolDecoder {
-            data: self.data,
-            pos: self.pos,
-            value: self.value,
-            bits: self.bits,
-            range_minus1: self.range_minus1,
-        }
+        *self
     }
 }
 

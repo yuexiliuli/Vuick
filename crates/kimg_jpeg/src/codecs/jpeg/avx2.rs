@@ -177,7 +177,7 @@ mod kernels {
 
         // 载入寄存器（i16→i32 符号扩展，全程扩展精度计算，最后收敛回 i16）
         let rw0 = _mm256_loadu_si256(in_vector[00..].as_ptr().cast());
-        let rw1 = _mm256_loadu_si256(in_vector[08..].as_ptr().cast());
+        let rw1 = _mm256_loadu_si256(in_vector[8..].as_ptr().cast());
         let rw2 = _mm256_loadu_si256(in_vector[16..].as_ptr().cast());
         let rw3 = _mm256_loadu_si256(in_vector[24..].as_ptr().cast());
         let rw4 = _mm256_loadu_si256(in_vector[32..].as_ptr().cast());
@@ -319,7 +319,7 @@ mod kernels {
         stride: usize,
     ) {
         let rw0 = _mm256_loadu_si256(in_vector[00..].as_ptr().cast());
-        let rw1 = _mm256_loadu_si256(in_vector[08..].as_ptr().cast());
+        let rw1 = _mm256_loadu_si256(in_vector[8..].as_ptr().cast());
         let rw2 = _mm256_loadu_si256(in_vector[16..].as_ptr().cast());
         let rw3 = _mm256_loadu_si256(in_vector[24..].as_ptr().cast());
 
@@ -794,17 +794,13 @@ mod kernels {
         }
 
         // 上采样余量（可能与上面有重叠，无妨）
-        if let Some(rest) = input.last_chunk::<16>() {
-            if let Some(rest_near) = in_near.last_chunk::<16>() {
-                if let Some(rest_far) = in_far.last_chunk::<16>() {
-                    if let Some(mut rest_top) = out_top.last_chunk_mut::<16>() {
-                        if let Some(mut rest_bottom) = out_bottom.last_chunk_mut::<16>() {
-                            upsample16(rest, rest_near, rest_far, &mut rest_top, &mut rest_bottom);
+        if let Some(rest) = input.last_chunk::<16>()
+            && let Some(rest_near) = in_near.last_chunk::<16>()
+                && let Some(rest_far) = in_far.last_chunk::<16>()
+                    && let Some(rest_top) = out_top.last_chunk_mut::<16>()
+                        && let Some(rest_bottom) = out_bottom.last_chunk_mut::<16>() {
+                            upsample16(rest, rest_near, rest_far, rest_top, rest_bottom);
                         }
-                    }
-                }
-            }
-        }
     }
 
     /// 4:2:0（HV）2x2 上采样（先垂直后水平）。

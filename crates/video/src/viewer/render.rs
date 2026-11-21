@@ -1,3 +1,6 @@
+// 视频渲染内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use super::*;
 impl super::VideoViewer {
 
@@ -622,8 +625,8 @@ impl Render for VideoViewer {
         // 描边能力（styled/text_system 无 text_stroke），故退化为**半透明深色圆角
         // 底条**保证可读性（颜色走 subtitle_style.outline_color，默认黑，即
         // 「白字黑描边」的落底实现，零新依赖）。
-        if self.subtitle_visible && !self.subtitles.is_empty() {
-            if let Some(subtitle) = find_active_subtitle(&self.subtitles, self.playhead) {
+        if self.subtitle_visible && !self.subtitles.is_empty()
+            && let Some(subtitle) = find_active_subtitle(&self.subtitles, self.playhead) {
                 // 文本已在加载时清洗（见 start());当前在字幕窗口内 → 直接显示
                 let text = subtitle.text.clone();
                 if !text.trim().is_empty() {
@@ -658,7 +661,6 @@ impl Render for VideoViewer {
                     );
                 }
             }
-        }
         root
     }
 }

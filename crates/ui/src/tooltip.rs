@@ -22,6 +22,9 @@
 //! 代序作废——新触发把在途旧单作废；移出不重排，但 `hanging` 转 false 后到点回调
 //! 自检即作废），回调持宿主**弱引用**，实体释放后任务更新自动空操作，不悬挂、不泄露。
 
+// tooltip 布局逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::time::Duration;
 
 use base::util::SeqAfter;

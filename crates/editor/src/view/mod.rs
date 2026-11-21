@@ -19,6 +19,9 @@
 //!
 //! 首版取舍：不放行内折行；光标列按等宽字符近似；无多光标；IME 组合各步为独立撤销单元。
 
+// 视口绘制/命中内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 mod input;
 mod render;
 

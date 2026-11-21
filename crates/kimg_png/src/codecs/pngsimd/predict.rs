@@ -26,7 +26,7 @@ pub(crate) fn prediction_bpp(samples: usize, depth: usize) -> usize {
 /// 行字节数（源布局，含打包位）：`ceil(width * samples * depth / 8)`。
 #[inline(always)]
 pub(crate) fn packed_row_bytes(width: usize, samples: usize, depth: usize) -> usize {
-    (width * samples * depth + 7) / 8
+    (width * samples * depth).div_ceil(8)
 }
 
 /// Paeth 核实验开关（+ 回退保护）：`KIMG_PNG_PAETH_LEGACY=1` 强制走旧 16 位 lane 核

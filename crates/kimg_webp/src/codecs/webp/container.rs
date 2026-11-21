@@ -8,6 +8,7 @@
 //! - 所有切片越界/长度校验在进入解析前完成（`data` 直接切割，所有 `slice` 先验证长度）；
 //! - 尺寸乘法一律 `checked_mul`，超 `MAX_PIXELS`（1<<26）在头部解析即拒绝；
 //! - chunk 声明长度 > 数据包剩余 → 中止（不 OOM、不 panic）。
+//!
 //! 解析失败返回 `ContainerError`（结构化），调用方按「不可接管 → 回 image-webp 兜底」处理。
 
 /// 像素上限（对齐 SimdCodecs `WebpLimits.MaximumPixels = 1<<26`）。
@@ -136,7 +137,7 @@ pub(crate) enum ContainerError {
 }
 
 /// 断言 chunk 载荷在数据包内并切出（输入安全：越界即 Err，不 panic）。
-fn chunk_payload<'a>(data: &'a [u8], offset: usize, end: usize, what: ContainerError) -> Result<(&'a [u8], usize), ContainerError> {
+fn chunk_payload(data: &[u8], offset: usize, end: usize, what: ContainerError) -> Result<(&[u8], usize), ContainerError> {
     if offset + 8 > end {
         return Err(what);
     }
@@ -433,7 +434,7 @@ pub(crate) fn parse(data: &[u8]) -> Result<WebpContainer<'_>, ContainerError> {
 
     let still = if !animated {
         let fmt = if primary_lossless { WebpFormat::Lossless } else { WebpFormat::Lossy };
-        let alpha = alpha_chunk.or_else(|| None);
+        let alpha = alpha_chunk.or(None);
         Some(WebpContainerFrame {
             x: 0,
             y: 0,

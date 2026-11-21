@@ -175,6 +175,7 @@ pub(super) fn angular_avx2(
 /// 越界证明（读下标 max = n + (n-8) + iIdx + 1..+9 与 块末 c=n-8）：
 /// - f≠0 ⇒ product ≤ 32n-1 ⇒ iIdx ≤ n-1 ⇒ 最大读下标 n+(n-8)+(n-1)+9 = 3n（≤ 3n 界内）；
 /// - f==0 只读 a ⇒ 最大读下标 n+(n-8)+iIdx+1 ≤ 3n-7；iIdx=n 仅当 f==0（product=32n）。
+///
 /// 写下标 j·out_stride+c..+8，调用方已证覆盖。
 #[target_feature(enable = "avx2,sse4.1")]
 unsafe fn angular_row_kernel(
@@ -239,7 +240,7 @@ unsafe fn transpose_u16(
     while tj < n {
         let mut ti = 0usize; // src 列块 == dst 行块
         while ti < n {
-            let r0 = _mm_loadu_si128(src.add((tj + 0) * stride_src + ti) as *const __m128i);
+            let r0 = _mm_loadu_si128(src.add(tj * stride_src + ti) as *const __m128i);
             let r1 = _mm_loadu_si128(src.add((tj + 1) * stride_src + ti) as *const __m128i);
             let r2 = _mm_loadu_si128(src.add((tj + 2) * stride_src + ti) as *const __m128i);
             let r3 = _mm_loadu_si128(src.add((tj + 3) * stride_src + ti) as *const __m128i);
@@ -275,7 +276,7 @@ unsafe fn transpose_u16(
             let c6 = _mm_unpacklo_epi64(u3, u7);
             let c7 = _mm_unpackhi_epi64(u3, u7);
 
-            _mm_storeu_si128(dst.add((ti + 0) * stride_dst + tj) as *mut __m128i, c0);
+            _mm_storeu_si128(dst.add(ti * stride_dst + tj) as *mut __m128i, c0);
             _mm_storeu_si128(dst.add((ti + 1) * stride_dst + tj) as *mut __m128i, c1);
             _mm_storeu_si128(dst.add((ti + 2) * stride_dst + tj) as *mut __m128i, c2);
             _mm_storeu_si128(dst.add((ti + 3) * stride_dst + tj) as *mut __m128i, c3);

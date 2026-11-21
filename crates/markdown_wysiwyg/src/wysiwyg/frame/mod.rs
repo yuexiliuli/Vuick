@@ -3,6 +3,9 @@
 //! （`element` 胶水 / shell / 测试）与既有路径（`wysiwyg::frame::*`）无需改动，经
 //! 本 shim 把 `(&editor.rd, editor)` / `doc` 转交给引擎。行为/失效时序逐字保持。
 
+// 帧布局内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::cell::RefCell;
 use std::rc::Rc;
 

@@ -56,7 +56,7 @@ impl Render for EditorApp {
                 .tabs
                 .get(self.model.borrow().active_tab)
                 .and_then(|t| t.payload.md_wy.clone());
-            let app: &gpui::App = &**cx;
+            let app: &gpui::App = cx;
             match wy {
                 Some(w) => {
                     let top = w.read(app).top_source_line();
@@ -92,7 +92,7 @@ impl EditorApp {
     /// [`shell_core::model::MD_RESTORE_WAIT_FRAMES`] → 清位（防目标不可达 / 预览异常永久
     /// 锁死「预览→编辑区」驱动）。清位即归还编辑区⇄预览正常双向同步（含预览主导回拉）。
     fn advance_md_restore_window(&mut self, cx: &mut Context<Self>) {
-        let app: &gpui::App = &**cx;
+        let app: &gpui::App = cx;
         let active = self.model.borrow().active_tab;
         let Some((target, n)) = self
             .model
@@ -161,7 +161,7 @@ impl EditorApp {
     /// 元素 prepaint 的 `advance_pending_scroll` 即拾起钉定，无需宿主反复驱动。
     /// 非 live / live2 未就绪 / 无待恢复目标 → no-op（绝大多数帧）。
     fn advance_live2_restore(&mut self, cx: &mut Context<Self>) {
-        let app: &gpui::App = &**cx;
+        let app: &gpui::App = cx;
         let active = self.model.borrow().active_tab;
         let live2 = {
             let m = self.model.borrow();
@@ -479,7 +479,7 @@ impl EditorApp {
                         .model
                         .borrow()
                         .tab_drag_grab
-                        .unwrap_or(gpui::Point::default());
+                        .unwrap_or_default();
                     // 拖拽状态机单步迁移（域 `shell_tabs::drag`）：已被拔出（idx 越界）→
                     // None 忽略后续移动；否则写 `tab_dragging` / `drag_outside_armed` /
                     // `tab_reorder_target`，返回本次移动 `outside`。栏内排序命中 / 幽灵窗

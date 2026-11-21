@@ -71,7 +71,7 @@ pub fn create_worker_d3d11_device() -> Option<WorkerD3D> {
                 adapter,
                 driver,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_FLAG(D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 as u32),
+                D3D11_CREATE_DEVICE_FLAG(D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0),
                 None, // 全部 feature level
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -122,11 +122,9 @@ pub(crate) fn worker_d3d11va_supported(device: &ID3D11Device) -> bool {
         };
         if let Ok(supported) =
             unsafe { video.CheckVideoDecoderFormat(&profile, DXGI_FORMAT_NV12) }
-        {
-            if supported.as_bool() {
+            && supported.as_bool() {
                 return true;
             }
-        }
     }
     false
 }

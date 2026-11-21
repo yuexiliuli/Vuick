@@ -67,6 +67,7 @@ pub enum FloatCardPad {
 
 /// 浮动卡片壳体 builder：复刻现值「acrylic/solid 底 + 双层阴影或无 + 圆角档 + 内边距档
 /// + `border_1` + `colors.border`」。返回可续挂的 gpui [`Div`]，size / focus / 事件 /
+///
 /// children 由调用方续挂；**只做壳体**（不发 enter/esc、不建房内布局、不做关闭）。
 ///
 /// `colors` / `is_dark` 由调用方从 `Theme::global(cx)` 注入（本 builder 是纯元素构造，

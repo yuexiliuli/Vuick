@@ -178,7 +178,7 @@ impl CommandPalette {
             let Some(this) = weak_self.upgrade() else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| match ev {
+            this.update(cx, |this, cx| match ev {
                 InputEvent::Change => {
                     this.query = input_entity.read(cx).value().to_string();
                     this.recompute_filter();

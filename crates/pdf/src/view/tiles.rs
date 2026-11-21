@@ -8,6 +8,9 @@
 //! [`super::PdfViewer::ensure_window`] 每帧驱动；回收的 `RenderImage` 一律经
 //! `pending_drops` 显式 `drop_image` 下线（防显存/提交内存缓慢累积）。
 
+// tile 调度内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use super::*;
 use crate::pdf::parser::grid_bucket_width;
 
@@ -418,10 +421,10 @@ impl PdfViewer {
             PAGE_WIDTH // 兜底：未知布局时用页宽近似
         };
         let v = self.scroll_velocity;
-        let m = ((v / avg_page_h).round() as isize + 1)
+        
+        ((v / avg_page_h).round() as isize + 1)
             .max(config::pdf::PREFETCH_COVER_MARGIN as isize)
-            .min(config::pdf::PREFETCH_COVER_MARGIN_MAX as isize) as usize;
-        m
+            .min(config::pdf::PREFETCH_COVER_MARGIN_MAX as isize) as usize
     }
 
     /// F4/B：**空闲预取走廊**——在 `ensure_window` 静置早退**之前**为走廊 [vis±2] 的空闲页
@@ -746,8 +749,8 @@ impl PdfViewer {
                 && self.slots[page].cover.is_none()
                 && !self.pending_cover.contains_key(&page)
                 && self.pending_cover.len() < COVER_INFLIGHT
-                && !(self.slots[page].cover_scale.abs() <= 1e-4
-                    && !self.slots[page].tiles.is_empty())
+                && (self.slots[page].cover_scale.abs() > 1e-4
+                    || self.slots[page].tiles.is_empty())
             {
                 if timing_view() {
                     eprintln!(
@@ -1105,6 +1108,7 @@ impl PdfViewer {
     ///   （含旧桶桥）的页快滚期不碰；
     /// - **idle 期**：升级派全清——带内「bucket != 全清桶」的页（含低清图与跨缩放旧桶桥，
     ///   以及完全无图的页）补派全清，预算 [`config::pdf::GRID_PREFETCH_INFLIGHT`]/帧。
+///
     /// 升级期间低清/旧桶图保留作桥，Full 到达由 `collect_grid_results` 替换 + `pending_drops`
     /// 释放（桥语义既有无需改）。卡宽 = `grid_card_width()`（derived from `grid_zoom`）；
     /// worker 按 [`config::pdf::GRID_BUCKET_PX`] 分桶缓存（
@@ -1226,11 +1230,10 @@ impl PdfViewer {
             }
             // 「当前全清桶」就绪图存在 → 复用跳过（同桶不重取，R-D 之外的事）；低清/旧桶
             // 图只作桥回退（渲染照画），**仍要重派**全清替换桥（R-D：不因桥存在而跳过）。
-            if let Some(t) = self.grid_thumbs.get(&i) {
-                if t.bucket == full_bucket {
+            if let Some(t) = self.grid_thumbs.get(&i)
+                && t.bucket == full_bucket {
                     continue;
                 }
-            }
             let rx = worker.request_grid(
                 self.doc_id,
                 i,
@@ -1706,7 +1709,7 @@ impl PdfViewer {
         order.sort_by_key(|&(p, _)| {
             core::cmp::Reverse((p as i64 - center_vis as i64).unsigned_abs())
         });
-        let mut remaining = max_budget as u64;
+        let mut remaining = max_budget;
         let mut sharp: HashSet<usize> = HashSet::new();
         for &(page, pin) in &order {
             if self.degraded.contains(&page) {
@@ -1922,17 +1925,13 @@ impl PdfViewer {
                 // （1.12^k 雾）。最终档封面入槽后见下方既有 `prev_cover.take()` 自动回收。
                 // 缩小（req_scale > cscale）同理。z 过期若该页当前档封面已入槽则不覆盖
                 // （新封面即锐，桥无用）。
-                if self.slots[page].cover.is_none() {
-                    if let Ok(img) =
+                if self.slots[page].cover.is_none()
+                    && let Ok(img) =
                         crate::pdf::wrap_render_image(res.bgra, res.width, res.height, res.luma)
-                    {
-                        if let Some(s) = self.slots.get_mut(page) {
-                            if let Some(prev) = s.prev_cover.replace(img) {
+                        && let Some(s) = self.slots.get_mut(page)
+                            && let Some(prev) = s.prev_cover.replace(img) {
                                 self.pending_drops.push(prev);
                             }
-                        }
-                    }
-                }
                 continue; // 移除 pending（非封面失败，不计数）
             }
             let (w, h) = (res.width, res.height);
@@ -2017,6 +2016,7 @@ impl PdfViewer {
     /// - 瓦片：槽内**已有**同格瓦片才替换（view 侧槽位即「正在显示」的真值；已被淘汰/
     ///   密度失效的格不入新图，避免把过期密度的原图重新塞回），并按新尺寸更新字节账；
     /// - 中清/缩略：槽内已有相应占位才替换。
+///
     /// 通道 drain 到 `Disconnected`（worker 发完）即清 `pending_recolor`（泵随之自停）。
     /// 返回是否有位图被替换（调用方决定重绘）。
     pub(super) fn collect_recolor_results(&mut self, scale_factor: f32) -> bool {
@@ -2164,11 +2164,9 @@ impl PdfViewer {
                 // 刚退位的反向邻居：封面转存为有界过渡底图（prev_cover），不立即下线。
                 if slot.cover.is_some()
                     && let Some(old) = slot.cover.take()
-                {
-                    if let Some(prev) = slot.prev_cover.replace(old) {
+                    && let Some(prev) = slot.prev_cover.replace(old) {
                         drops.push(prev); // 旧过渡图（如缩放陈旧封面）逐出，保持有界 1 张
                     }
-                }
             } else {
                 if slot.cover.is_some()
                     && let Some(old) = slot.cover.take()

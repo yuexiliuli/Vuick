@@ -13,9 +13,9 @@
 //!     shlwapi/shell32，与 feature 分支无关），但 link.exe 对**符号未被引用**
 //!     的导入库直接丢弃。本仓静态 FFmpeg 对象实际引用的系统库只有 3 个
 //!     （B1 共享包导入表 + 静态预案实证）：
-//!       bcrypt ← avutil（random_seed，直调 BCryptGenRandom）
-//!       user32 ← avutil
-//!       ole32  ← avcodec
+//!     bcrypt ← avutil（random_seed，直调 BCryptGenRandom）
+//!     user32 ← avutil
+//!     ole32  ← avcodec
 //!   - 此处仍显式补这三个：防 ffmpeg-sys 上游裁剪/修改后静态链缺系统库
 //!     （防御性冗余；与 ffmpeg-sys 重复发同一导入库无害）。
 //!   - d3d11/dxgi/dxva2 **不需要链**：avutil hwcontext_d3d11va/dxva2
@@ -47,13 +47,13 @@ fn main() {
 
     if let Ok(dir) = env::var("FFMPEG_DIR") {
         let p = Path::new(&dir).join("lib").join("avcodec.lib");
-        if let Ok(md) = std::fs::metadata(&p) {
-            if md.len() < 512 * 1024 {
-                println!(
-                    "cargo:warning=static-link 生效但 FFMPEG_DIR/lib/avcodec.lib 偏小（{}B），疑似 shared 导入库，请指到 --toolchain=msvc 静态包（E:\\Rust\\temp\\ffmpeg-slim-static）",
-                    md.len()
-                );
-            }
+        if let Ok(md) = std::fs::metadata(&p)
+            && md.len() < 512 * 1024
+        {
+            println!(
+                "cargo:warning=static-link 生效但 FFMPEG_DIR/lib/avcodec.lib 偏小（{}B），疑似 shared 导入库，请指到 --toolchain=msvc 静态包（E:\\Rust\\temp\\ffmpeg-slim-static）",
+                md.len()
+            );
         }
     }
 }

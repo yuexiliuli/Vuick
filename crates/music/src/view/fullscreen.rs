@@ -8,6 +8,7 @@
 //! - 全部播放控制并入左列：封面(320)→歌曲信息→进度→控制行→音量+操作；
 //! - 顶栏中心 "NOW PLAYING"；封面双层阴影；黑胶三圈不同周期/转向；进度条悬停 5→7px +
 //!   亮色圆点；暂停时黑胶圈/装饰条变暗。
+//!
 //! GPUI 无 CSS `radial-gradient`/`letter-spacing`：背景光晕用两个大圆半透明层近似、
 //! 文字间距忽略；黑胶圈用 svg 圆环 + 旋转动画（暂停即停）。Esc 关全屏由根 `on_key`
 //! 处理，close 钮也关。
@@ -30,8 +31,8 @@ use ui::{CommitMode, Slider, SliderFill, SliderThumb};
 /// 全屏封面边长（px），黑胶圈按比例派生。
 pub(super) const FS_COVER_PX: f32 = 320.0;
 
-/// 歌词行三态常量已随 `super::lyrics::LyricsView` 迁走（`LYRIC_ROW_H`/
-/// `LYRIC_FOLLOW_RESUME_MS` 在 `view::lyrics`，测试经 `super::lyrics` 引用）。
+// 歌词行三态常量已随 `super::lyrics::LyricsView` 迁走（`LYRIC_ROW_H`/
+// `LYRIC_FOLLOW_RESUME_MS` 在 `view::lyrics`，测试经 `super::lyrics` 引用）。
 
 impl super::MusicView {
     /// 全屏浮层整块（v2：左列封面+控制 / 右列歌词）。

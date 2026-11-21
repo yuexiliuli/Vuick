@@ -24,7 +24,7 @@ pub(crate) fn accent_idx_for(g: &MmGraph) -> HashMap<String, Option<usize>> {
     let mut acc = 0usize;
     for n in &g.nodes {
         let st = g.styles.get(&n.id);
-        let author_colored = st.map_or(false, |s| s.fill.is_some() || s.stroke.is_some());
+        let author_colored = st.is_some_and(|s| s.fill.is_some() || s.stroke.is_some());
         out.insert(
             n.id.clone(),
             if author_colored {
@@ -728,6 +728,7 @@ fn route_edges(
 ///   [弧线](`arc_curve`)（用户 .1「分支边曲线」；单弯肘横/纵偏移必 ≥4 由路由保证）；
 ///   其余每个内角二次贝塞尔圆角（切点 A=Pk−in_u·rk、B=Pk+out_u·rk、控制点=Pk，
 ///   rk=clamp(min(前段,后段)·0.3, 3, 10)，采样 8 点），中间水平段保留。
+///
 /// 每边采样 ≤24 点（骨架恒 ≤4 点 ⇒ 至多 2 个内角）。`base`（Optional）= 箭头基部：
 /// 弧线目标端收短到基部（`None` = 直调单测时退化为原节点边缘，保持旧行为）；圆角肘
 /// 不在此收短（paint 侧按 `arrow_dir` 轴对齐精确回缩，见 [`paint_edge`]）。

@@ -242,7 +242,7 @@ impl super::VideoViewer {
         if x < left || x > right || y < top || y > top + bar_h {
             return None;
         }
-        let f = ((x - left) / (right - left)).clamp(0.0, 1.0) as f32;
+        let f = ((x - left) / (right - left)).clamp(0.0, 1.0);
         Some(self.clamped_scrub_target(f))
     }
 

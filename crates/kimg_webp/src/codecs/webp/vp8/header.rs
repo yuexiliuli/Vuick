@@ -123,8 +123,8 @@ pub(crate) fn parse_frame_header(frame: &[u8]) -> Result<FrameHeader<'_>> {
     Ok(FrameHeader {
         width: coded_width,
         height: coded_height,
-        mb_width: ((coded_width + 15) / 16) as usize,
-        mb_height: ((coded_height + 15) / 16) as usize,
+        mb_width: coded_width.div_ceil(16) as usize,
+        mb_height: coded_height.div_ceil(16) as usize,
         segments,
         filter,
         quantizers,
@@ -246,17 +246,17 @@ fn read_partitions(data: &[u8], count: usize) -> Result<Vec<&[u8]>> {
         return Err(Vp8Error::new("VP8 token 分区尺寸表被截断"));
     }
     let mut sizes = [0usize; 7];
-    for i in 0..size_count {
+    for (i, size) in sizes[..size_count].iter_mut().enumerate() {
         let off = i * 3;
-        sizes[i] = data[off] as usize | (data[off + 1] as usize) << 8 | (data[off + 2] as usize) << 16;
+        *size = data[off] as usize | (data[off + 1] as usize) << 8 | (data[off + 2] as usize) << 16;
     }
     let mut offset = table_length;
     let mut parts = Vec::with_capacity(count);
-    for i in 0..count {
+    for (i, &stored) in sizes[..count].iter().enumerate() {
         let size = if i == size_count {
             data.len() - offset
         } else {
-            sizes[i]
+            stored
         };
         if size > data.len() - offset {
             return Err(Vp8Error::new("VP8 token 分区超出帧"));

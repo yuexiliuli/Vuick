@@ -521,7 +521,7 @@ impl MusicPlayer {
         self.last_prefs_attempt = Some(now);
         if self.current.is_some() {
             let pos = self.position();
-            if self.progress_pref.map_or(true, |p| (p - pos).abs() > 1e-6) {
+            if self.progress_pref.is_none_or(|p| (p - pos).abs() > 1e-6) {
                 self.progress_pref = Some(pos);
                 self.prefs_dirty = true;
             }
@@ -839,7 +839,7 @@ impl MusicPlayer {
             let _ = tx.send(WorkerCmd::Stop);
         }
         if let Some(s) = &self.sink {
-            let _ = s.pause();
+            s.pause();
             s.flush();
         }
         // 换代（对照 play_track 每次换代）：停止后 worker 已排队的 Finished/Opened/Error
@@ -871,6 +871,7 @@ impl MusicPlayer {
     ///   「增量 = clock」直接模式 → 自 T 继续走，不再从 0 重走、也不「冻结再跃升」；
     /// - 拖拽（`scrubbing`）：位置钉在最近预览落点 `seek_base`（跟手指，不随时钟漂移）；
     /// - paused/无 sink：时钟不推进/恒 0 → 位置停在与 seek_base 一致处。
+///
     /// duration<=0（无曲目/未探测）恒 0。
     pub fn position(&self) -> f64 {
         let clock = self.sink.as_ref().map(|s| s.position()).unwrap_or(0.0);
@@ -1030,6 +1031,7 @@ fn shuffle_in_place(q: &mut [usize]) {
 /// - `Off + 非 shuffle` → 顺序下一首，队尾后停（`None`）；
 /// - `All` 或 `Off + shuffle` → 循环回 0（**手动 next 的「洗牌点歌机」语义**：随机序
 ///   已在队列构建时入队，导航阶段不再重掷）。
+///
 /// 注意与 [`advance_on_finish`]（EOF 自动推进，`Off` 一律队尾停）语义刻意不同。
 pub fn next_index(
     queue_len: usize,
@@ -1107,11 +1109,11 @@ fn dispatch(
             ctx.codec = None;
             ctx.active = false;
             ctx.buf.clear();
-            let _ = sink.pause();
+            sink.pause();
             sink.flush();
         }
         WorkerCmd::Pause => {
-            let _ = sink.pause();
+            sink.pause();
         }
         WorkerCmd::Resume => {
             let _ = sink.play();

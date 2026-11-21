@@ -539,11 +539,13 @@ impl gpui::Element for MaterialLayer {
         cx: &mut gpui::App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
         // 填满外层 absolute 铺底容器（父尺寸的 100%，见外层 div.absolute() 定位）。
-        let mut style = gpui::Style::default();
-        style.size = gpui::Size::new(
-            gpui::Length::Definite(gpui::relative(1.0)),
-            gpui::Length::Definite(gpui::relative(1.0)),
-        );
+        let style = gpui::Style {
+            size: gpui::Size::new(
+                gpui::Length::Definite(gpui::relative(1.0)),
+                gpui::Length::Definite(gpui::relative(1.0)),
+            ),
+            ..Default::default()
+        };
         (window.request_layout(style, None, cx), ())
     }
 

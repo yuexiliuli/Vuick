@@ -349,7 +349,7 @@ fn resolve_styles_nested(
             let e = h.end.min(range.end);
             if s <= a && b <= e {
                 let span = e - s;
-                if best.map_or(true, |(_, bspan)| span < bspan) {
+                if best.is_none_or(|(_, bspan)| span < bspan) {
                     best = Some((*name, span));
                 }
             }

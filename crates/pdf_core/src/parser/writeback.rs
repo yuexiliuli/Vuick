@@ -187,15 +187,15 @@ unsafe fn save_raw_doc_to_bytes(
     doc_handle: FPDF_DOCUMENT,
 ) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
-    let mut w = RawFileWriteVec {
-        version: 1,
-        write_block: Some(raw_file_write_vec_block),
-        buf: &mut buf,
-    };
+    // w 持有 `&mut buf`：块作用域收尾即结束借用（回调同步返回后无需显式 drop）。
     let ok = unsafe {
+        let mut w = RawFileWriteVec {
+            version: 1,
+            write_block: Some(raw_file_write_vec_block),
+            buf: &mut buf,
+        };
         bindings.FPDF_SaveAsCopy(doc_handle, (&mut w as *mut RawFileWriteVec).cast(), 0)
     };
-    drop(w); // 结束对 buf 的借用；回调已同步返回
     if !bindings.is_true(ok) {
         return Err(anyhow!("FPDF_SaveAsCopy 失败（err={}）", fpdf_last_error(bindings)));
     }
@@ -218,13 +218,15 @@ pub(crate) unsafe fn save_raw_doc_to_file(
     // 同目录 . 前缀隐藏文件，随进程 id + 序号唯一；同名写回/重载无碰撞风险
     let tmp = dir.join(format!(".{}.{seq}.tmp.pdf", std::process::id()));
     let mut file = std::fs::File::create(&tmp)?;
-    let mut w = RawFileWrite {
-        version: 1,
-        write_block: Some(raw_file_write_block),
-        file: &mut file,
+    // w 持有 `&mut file`：块作用域收尾即结束借用（回调同步返回后无需显式 drop）。
+    let ok = unsafe {
+        let mut w = RawFileWrite {
+            version: 1,
+            write_block: Some(raw_file_write_block),
+            file: &mut file,
+        };
+        bindings.FPDF_SaveAsCopy(doc_handle, (&mut w as *mut RawFileWrite).cast(), 0)
     };
-    let ok = unsafe { bindings.FPDF_SaveAsCopy(doc_handle, (&mut w as *mut RawFileWrite).cast(), 0) };
-    drop(w); // 结束对 file 的借用；回调已同步返回
     file.sync_all().ok();
     drop(file); // 释放句柄后才能 rename（Windows 语义）
     if !bindings.is_true(ok) {
@@ -470,6 +472,7 @@ pub struct MemOpResult {
 /// - 成功路径：`FPDF_SaveAsCopy` 落到 `output_path`（原子替换），然后**更新内存 bytes**
 ///   镜像（后续操作基于新内容）；
 /// - 失败路径：关闭 raw 句柄后原样上抛，目标文件不受影响。
+///
 /// T3：源镜像先经 [`materialize_stores`] 惰性取（缺镜像即从 live doc SaveAsCopy 物化一次）。
 pub(crate) fn writeback_edit(
     stores: &mut HashMap<DocId, Arc<Vec<u8>>>,

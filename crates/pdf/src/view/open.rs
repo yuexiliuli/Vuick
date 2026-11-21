@@ -39,15 +39,14 @@ pub(super) fn extract_target_precheck(cur_path: &Path, out: &Path) -> Option<Str
             out.display()
         ));
     }
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty() && !parent.is_dir() {
             return Some(format!(
                 "无法提取到 {}：目标目录不存在（{}）",
                 out.display(),
                 parent.display()
             ));
         }
-    }
     if out.is_dir() {
         return Some(format!("无法提取到 {}：目标路径是现有目录", out.display()));
     }
@@ -60,6 +59,7 @@ pub(super) fn extract_target_precheck(cur_path: &Path, out: &Path) -> Option<Str
 /// 1. **元数据预检**：`len > PDF_MERGE_MAX_SRC_BYTES` → 快拒（零分配）；
 /// 2. **真边界读**：`Read::take(上限 + 1)` 兜住「元数据之后文件被外部追加」的 TOCTOU，
 ///    读满即判超限 Err——是 check-then-read 的真边界、非 `metadata` 一次 check-then-use。
+///
 /// 返回 `Err` 时绝无字节进 worker。超限/读失败统走 `last_modify_error` 既有错误面。
 pub(super) fn read_merge_source_bounded(path: &Path) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
@@ -412,9 +412,9 @@ impl PdfViewer {
         }
         // 跳页 = 确定性锚事件：复位非溢出水平偏移/沟槽兜底锚（回中，见复位规则）。
         self.reset_x_zoom();
-        if self.paged_mode_active() {
-            if let Some(layout) = self.paged_layout_cell.borrow().clone() {
-                if layout.rows > 0 {
+        if self.paged_mode_active()
+            && let Some(layout) = self.paged_layout_cell.borrow().clone()
+                && layout.rows > 0 {
                     // 目录/导航跳页 = 确定性锚事件：把 sticky 列钉到所跳之页所在的列
                     // （`page % cols`），供 `reading_progress` 分页分支按同列解析「真正
                     // 当前页」——右/奇页跳页不丢列（K177：`col = page % cols`，row_page_start
@@ -428,8 +428,6 @@ impl PdfViewer {
                     self.scroll.set_offset(gpui::point(px(0.), px(-mag)));
                     return;
                 }
-            }
-        }
         let top = self.page_tops.get(page_index).copied().unwrap_or(0.0);
         self.scroll.set_offset(gpui::point(px(0.), px(-top)));
     }
@@ -802,12 +800,11 @@ impl PdfViewer {
     /// ± offset` 同界，K153/K177）。仅在 `zoom_target_impl` 非溢出分派里调用（此时必 ≥ 0）。
     pub(super) fn nonoverflow_max_xoff(&self, new_w: f32) -> f32 {
         let viewport_w = f32::from(self.scroll.bounds().size.width);
-        if self.paged_mode_active() {
-            if let Some(l) = self.paged_layout_cell.borrow().as_ref() {
+        if self.paged_mode_active()
+            && let Some(l) = self.paged_layout_cell.borrow().as_ref() {
                 let spread = l.spread_max * self.zoom.max(0.01);
                 return ((viewport_w - spread) / 2.0).max(0.0);
             }
-        }
         ((viewport_w - new_w) / 2.0).max(0.0)
     }
 
@@ -956,6 +953,7 @@ impl PdfViewer {
     ///   保留窗** GRID_ROW_BUFFER + GRID_KEEP_ROWS = ±4 行——「可视带永不失图」不变式，
     ///   worker 近带保位图、view keep_range 保纹理，回看零重栅）；
     /// - `window` = 中心行 ±(近+中)行的页区间（中带 = window \ near 仅低清）。
+///
     /// 无可见行（视口在内容外 / 空文档 / 未布局）→ `None`（本帧不推，下帧可重算）。
     /// `window` 为 `None` 时用 `grid_scroll` 自身 bounds 口径（进入网格/缩放无 Window 路径）。
     pub(crate) fn grid_prewarm_geom(&self, window: Option<&Window>) -> Option<GridPrewarmGeom> {
@@ -1065,6 +1063,7 @@ impl PdfViewer {
     ///   grid_zoom，独立缩放字段，与阅读 `self.zoom` 无关）派生，进入时不另存固定宽度。
     /// - **退出**：全部网格缩略图与在途请求清理（旧卡图转 `pending_drops` 下帧集中
     ///   `drop_image` 下线 GPU 纹理，不留残留引用；与 `release`/`apply_loaded` 同姿势）。
+///
     /// 单列 `scroll` 偏移保持原样——切模式互不干扰，读者退出网格后回到离开时的阅读位置。
     pub fn set_grid_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.grid_mode == enabled {
@@ -1692,9 +1691,7 @@ impl PdfViewer {
             return None;
         }
         let guard = self.paged_layout_cell.borrow();
-        let Some(layout) = guard.as_ref() else {
-            return None;
-        };
+        let layout = guard.as_ref()?;
         if layout.rows == 0 {
             return None;
         }
@@ -1718,9 +1715,7 @@ impl PdfViewer {
             return None;
         }
         let guard = self.paged_layout_cell.borrow();
-        let Some(layout) = guard.as_ref() else {
-            return None;
-        };
+        let layout = guard.as_ref()?;
         if layout.rows == 0 {
             return None;
         }

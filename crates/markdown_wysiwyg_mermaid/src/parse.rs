@@ -283,13 +283,12 @@ fn find_edge_op(s: &str) -> Option<(usize, &'static str, &'static str, MmEdgeKin
                 i += 1;
             }
             _ => {
-                if sq == 0 && br == 0 {
-                    if let Some((end, start, kind)) =
+                if sq == 0 && br == 0
+                    && let Some((end, start, kind)) =
                         EDGE_SPECS.iter().find(|(e, _, _)| b[i..].starts_with(e.as_bytes()))
                     {
                         return Some((i, end, start, *kind));
                     }
-                }
                 i += 1;
             }
         }

@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// 预测/熵内核参数多、result 按下标循环（字节恒等硬约束，改写迭代器会动 codegen）→ 放行。
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 //! VP8L 静态无损解码器（RFC 9649 §3.5-3.8；移植自 SimdCodecs `Vp8LDecoder.cs`，MIT；**标量正确版**）。
 //!
 //! 覆盖：VP8L 头（字节 0=0x2f + 位缓存维度）、熵编码（简单/普通前缀码 + Huffman 表构建：
@@ -58,7 +60,9 @@ pub(crate) struct DecodedImage {
 ///   所有权由 `Vec<u32>` 持有，归还恒为原 Layout（align 4、size = 4×u32 容量），
 ///   `GlobalAlloc::dealloc` 同 Layout 契约由 Vec 的 Drop 保证（不降 align）。
 /// - `U8`（有损路径）：解码直出的 `Vec<u8>`，沿用既有分配。
+///
 /// `as_bytes()` 只借出不可变 `&[u8]`（U32 臂为按字节只读重借，无写入别名；U32 均为合法位型）。
+///
 /// 不实现 Clone（单一所有权）。
 pub(crate) struct RgbaBytes {
     inner: RgbaBytesKind,
@@ -340,7 +344,7 @@ fn distance(value: u32, width: u32) -> Result<u32> {
     if value > 120 {
         return Ok(value - 120);
     }
-    if value < 1 || value > 120 {
+    if !(1..=120).contains(&value) {
         return Err(Vp8LError::new("VP8L 距离码非法"));
     }
     let (x, y) = DISTANCE_MAP[(value - 1) as usize];
@@ -701,7 +705,7 @@ fn collect_subtable_bits(lengths: &[u32], counts: &[u32; 16], subtable_bits: &mu
         code = (code + counts[length - 1]) << 1;
         next[length] = code;
     }
-    for (_, &length) in lengths.iter().enumerate() {
+    for &length in lengths.iter() {
         if length == 0 {
             continue;
         }
@@ -844,12 +848,11 @@ fn read_huffman_code(
     let mut code_length_table = [0u32; 1 << 7];
     let code_length_mask = fill_huffman_table(&code_length_lengths, &mut code_length_table)?.0;
 
-    let length_n_bits;
-    if reader.read_bit()? == 0 {
-        length_n_bits = 0;
+    let length_n_bits = if reader.read_bit()? == 0 {
+        0
     } else {
-        length_n_bits = 2 + 2 * reader.read_bits(3)?;
-    }
+        2 + 2 * reader.read_bits(3)?
+    };
     let max_symbol = if length_n_bits == 0 {
         alphabet_size
     } else {
@@ -891,7 +894,7 @@ fn read_huffman_code(
         }
     }
 
-    Ok(build_huffman_table(&lengths, tables)?)
+    build_huffman_table(&lengths, tables)
 }
 
 /// 在表池里为 lengths 构建表；返回 (offset, root_mask, single_symbol)。
@@ -1141,9 +1144,8 @@ fn decode_pixels(
         }
         let symbol = read_symbol(tbl, g.green, g.green_mask, &mut buffer, &mut bits);
         if symbol < 256 {
-            let color;
-            if g.trivial_literal {
-                color = g.literal | (symbol << 8);
+            let color = if g.trivial_literal {
+                g.literal | (symbol << 8)
             } else {
                 let red = read_symbol(tbl, g.red, g.red_mask, &mut buffer, &mut bits);
                 if bits < 32 {
@@ -1151,8 +1153,8 @@ fn decode_pixels(
                 }
                 let blue = read_symbol(tbl, g.blue, g.blue_mask, &mut buffer, &mut bits);
                 let alpha = read_symbol(tbl, g.alpha, g.alpha_mask, &mut buffer, &mut bits);
-                color = (alpha << 24) | (red << 16) | (symbol << 8) | blue;
-            }
+                (alpha << 24) | (red << 16) | (symbol << 8) | blue
+            };
             // 写入在 `position < pixel_count` 循环前置下恒界内（无检查写下沉 leaf 门面）。
             super::simd::raw::unchecked_write(result, position, color);
             position += 1;
@@ -1432,7 +1434,7 @@ pub(crate) fn decode_into_rgba8(bitstream: &[u8], out: &mut [u8]) -> Result<()> 
     if out.len() != pixel_count * 4 {
         return Err(Vp8LError::new("VP8L 输出缓冲长度须为 w*h*4"));
     }
-    if out.as_ptr() as usize % std::mem::align_of::<u32>() == 0 {
+    if (out.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u32>()) {
         // 把调用方缓冲重借为 `&mut [u32]`：熵解码/逆变换以 ARGB 直写其中（全覆写不变式见
         // decode_image_into），再原地字节交换为 RGBA8。重借下沉 `simd::raw::bytes_as_mut_u32`
         // （语义等同 bytemuck cast_slice_mut），重借存活期不触碰 `out`；缓冲由调用方持有、

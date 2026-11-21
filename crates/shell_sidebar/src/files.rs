@@ -7,6 +7,9 @@
 //! [`crate::host::SidebarHost`] 反调宿主办状态迁移或文件副作用（打开/激活/对话框），
 //! 与 chrome / toc 姿势一致（渲染期禁再入宿主，见 [`crate::host`]）。
 
+// 文件树项内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use gpui::{
     div, px, AnimationExt, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
     SharedString, StatefulInteractiveElement, Styled, Window,
@@ -99,6 +102,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// - 根 = `sb.files.root`；未打开 / 路径失效 → 空态（可点「打开文件夹…」）。
     /// - 可见行 = 根 + 按 `expanded` 递归展开的子目录（懒加载：只物化已读层）。
     /// - 行样式复用搜索文件名行（active_bg hover、gap icon、单行截断）。
+///
     /// `files_filter_state` = 宿主预取的「过滤文件名」输入框实体（域渲染期禁再入宿主，
     /// 数据以参数传入，同 toc 的 `bookmarks` 姿势）；输入框状态/订阅仍归宿主。
     pub fn render_sidebar_files(
@@ -121,14 +125,14 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 None => false,
             };
             if !cached {
-                let mut rows = self.sidebar_files_collect(sb);
+                let rows = self.sidebar_files_collect(sb);
                 // 瞬态选中滚动（Reveal in Explorer View）：在**当前可见行表**定位 selected
                 // 并写滚动偏移。行表只含已扫描的已展开子项 → 目标行可枚举即祖先全扫完
                 // （「先扫后滚」由「行表即真相」保证；扫描完成令 layout_gen+1 → 缓存
                 // 失效重收行表时再施，不在首扫前按错误行序乱滚）。目标 = 行顶
                 // （idx×ROW_H），clamp 到 [0, 内容高−视口高]（gpui 布局期还会再钳一次）。
-                if sb.files.scroll_to_selected {
-                    if let Some(selected) = sb.files.selected.clone()
+                if sb.files.scroll_to_selected
+                    && let Some(selected) = sb.files.selected.clone()
                         && let Some(idx) = rows.iter().position(|r| r.path == selected)
                     {
                         let viewport_h = sb.files_vscroll.bounds().size.height.as_f32().max(0.0);
@@ -139,7 +143,6 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                             .set_offset(gpui::point(gpui::px(0.), gpui::px(-target)));
                         sb.files.scroll_to_selected = false;
                     }
-                }
                 sb.files_layout = Some((layout_gen, rows));
             }
             let layout_rows = &sb.files_layout.as_ref().unwrap().1;
@@ -284,6 +287,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 点击：目录行展开/折叠（宿主服务 `sidebar_file_tree_toggle`）；文件行打开/激活
     /// （宿主服务 `sidebar_open_path_or_activate`）。当前激活文件行高亮（active_bg 常显
     /// + 主前景文字）。行强制 `FILE_TREE_ROW_H` 等高（虚拟化 divisor 精确）；空目录占位
+///
     /// 行显示「（空）」，无点击语义。右键 → 域内 `on_file_tree_right_click`（files_ops.rs）。
     fn sidebar_files_row(
         &self,

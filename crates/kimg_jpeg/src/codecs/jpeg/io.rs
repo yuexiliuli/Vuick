@@ -137,6 +137,8 @@ impl<'a> ByteReader<'a> {
 }
 
 /// JPEG Marker（zune-jpeg `Marker` 的等价子集）。
+/// 变体名沿用 JPEG 标准段落缩写（SOF/DHT/…），与 `from_u8`/各处 match 的既有命名一致 → 放行。
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Marker {
     /// Start Of Frame（参数为 SOF 序号 0..15）。

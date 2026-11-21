@@ -8,6 +8,9 @@
 //!
 //! 布局照旧：`280px / 1fr / 240px` 三列；可拖拽进度条（bb_progress）与音量条（bb_vol）。
 
+// 进度/控制条绘制逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -37,7 +40,7 @@ const HEARTBEAT_MS: u64 = 120;
 
 /// 底栏全部可悬停提示钮的 id：其窗口盒写入父 `tip_boxes` 同名 cell（tooltip 锚定按钮盒，
 /// 全局浮层由父 `render_tooltip` 绘制——保证「父对全局 tooltip 层保持」且 T 系列回归不破）。
-const BB_TIP_IDS: &[&'static str] = &[
+const BB_TIP_IDS: &[&str] = &[
     "bb-like",
     "bb-shuffle",
     "bb-prev",
@@ -50,8 +53,8 @@ const BB_TIP_IDS: &[&'static str] = &[
     "bb-vol",
 ];
 
-/// 拉取父 `tip_boxes` 的各底栏钮窗口盒 cell——已并入 [`BottomBarView::seed_tip_cells`]
-/// （`new` 期间父已 lease 无法 update，须延迟到首次 render 才拉，见其注释）。
+// 拉取父 `tip_boxes` 的各底栏钮窗口盒 cell——已并入 [`BottomBarView::seed_tip_cells`]
+// （`new` 期间父已 lease 无法 update，须延迟到首次 render 才拉，见其注释）。
 
 pub(super) struct BottomBarView {
     player: Entity<MusicPlayer>,
@@ -211,8 +214,7 @@ impl BottomBarView {
         let cover = self
             .parent
             .upgrade()
-            .map(|p| p.update(cx, |mv, cx| mv.cover_for_current(cx)))
-            .flatten();
+            .and_then(|p| p.update(cx, |mv, cx| mv.cover_for_current(cx)));
         let thumb_children: Vec<gpui::AnyElement> = if let Some(c) = cover {
             vec![div()
                 .size_full()

@@ -150,7 +150,7 @@ impl<K: Clone + Ord + std::hash::Hash + Eq, V: Clone, S: Default + std::hash::Bu
         let mut evicted = None;
         if self.entries.len() >= self.cap
             && !self.entries.contains_key(&key)
-            && let Some(&(_, ref k)) = self.lru.iter().next()
+            && let Some((_, k)) = self.lru.iter().next()
         {
             let k = k.clone();
             let last = self.entries[&k].last_seen;
@@ -202,6 +202,10 @@ impl<K: Clone + Ord + std::hash::Hash + Eq, V: Clone, S: Default + std::hash::Bu
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -323,6 +327,10 @@ impl RowShapeCache {
     }
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

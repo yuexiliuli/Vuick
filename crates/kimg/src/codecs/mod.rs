@@ -54,6 +54,8 @@ use crate::{ImageDecoder, ImageFormatHint};
 ///
 /// 生命周期 `'a` 仅为 PNG/JPEG 零拷贝路径携带（Png/Jpeg 变体可借用外部输入切片）；
 /// 其余格式一律自有输入，`'a` 仅协变透传，不影响使用。
+/// 大变体按设计内联（调用面以枚举值传递，不装箱破坏零拷贝借用面）→ 放行。
+#[allow(clippy::large_enum_variant)]
 pub enum GenericDecoder<'a, R: BufRead + Seek> {
     Png(png::PngDecoder<'a, R>),
     Jpeg(jpeg::JpegDecoder<'a>),

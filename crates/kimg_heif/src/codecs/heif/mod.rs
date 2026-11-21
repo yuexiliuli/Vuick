@@ -131,6 +131,7 @@ fn decode_tiles(data: &[u8], container: &container::HeifContainer<'_>) -> HeifRe
 /// - 错误优先级微差（已接受，有效 grid 不可观测）：病态输入下 payload 长度预检发生在
 ///   任何解码之前，并行路径可能先报**后 tile** 的长度/解析错，而串行先报**前 tile** 的
 ///   解码错；两者都只回传一个 Err，正常输入两者一致。
+///
 /// 串行全链强制开关（dev 测量工具，仿 intra_pred.rs K93 姿势）：`KIMG_HEIF_PARALLEL=0` →
 /// [`decode_tiles_par`] 直接落串行 [`decode_tiles`]，用于「专攻单核」战役的单核基线测量；
 /// 默认空/AUTO → 并行（行为不变）。一次读取缓存到 `OnceLock`，不进每 tile 开销。

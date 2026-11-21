@@ -153,6 +153,7 @@ pub fn set_recolor_curve_for_test(c: RecolorCurve) {
 /// `[pdf] gpu recolor enabled`，非「默认零输出」）。选 stderr 便于 `2>&1 | grep` 过滤。
 /// 每条诊断都是「该环节确实发生」的证据，覆盖全链路 4 点：
 ///   1) 门控激活（本模块）；2) worker 原图直传封面/瓦片（parser 调用）；3) view 首个
+///
 ///   img().recolor 挂参（render 调用）；4) gpui 管线就绪（vendor/directx_renderer）。
 /// headless 测试里打到 stderr 属正常，不改变任何断言语义。
 pub(crate) fn diag_once(fired: &AtomicBool, msg: impl FnOnce()) {

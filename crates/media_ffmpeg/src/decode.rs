@@ -109,7 +109,7 @@ pub(crate) fn open_input_interruptible(
     OPEN_DEADLINE_NS.store(deadline_ns, Ordering::Relaxed);
     OPEN_ABORT.store(false, Ordering::Relaxed);
 
-    let result = ffmpeg::format::input_with_interrupt(path, || watchdog_should_abort());
+    let result = ffmpeg::format::input_with_interrupt(path, watchdog_should_abort);
 
     // 捕获「是否真被中断」（区分超时 vs 普通打开失败），随后清除武装：残留会让后续
     // 该 Input 的解码/seek 意外中断，违背「open 返回后清除」约定。
@@ -611,6 +611,7 @@ impl VideoReader {
     /// 返回 `Some((pts 秒, 宽, 高, 已跳帧数))`；`None` = 到达流末尾仍未到 target（EOF，
     /// 之后可再 seek 复用）。无 pts 的帧一律跳过（不计 skipped）。相比逐帧 `next_frame_bgra_into`
     /// + 上层过滤：省掉每帧 sws/回读（软解 4.6→2.9ms/帧；硬解 4.9→0.5ms/帧），是 seek 墙钟
+    ///
     /// 的主要加速来源（交接文档「seek2first 占 90%+」直指本路径）。
     ///
     /// 线程归属调用方（worker 拉帧），恒持 [`FFMPEG_LOCK`]；`seek_inner` 不再重复加锁。
@@ -772,9 +773,7 @@ impl VideoReader {
     /// 复制进私有帧——帧池槽位被钉住（见 [`HwFramePin`]），局部 `f` 在下一拍被
     /// `receive_frame` 覆写不影响本帧（我们持有的是引用拷贝而非 `f` 本体）。
     fn hw_frame_from(&self, f: &ffmpeg::frame::Video) -> Option<HwFrame> {
-        let Some(pts) = f.pts() else {
-            return None;
-        };
+        let pts = f.pts()?;
         if !is_hw_frame(f) {
             return None; // 防御：外部设备路径下不应产出软件帧
         }

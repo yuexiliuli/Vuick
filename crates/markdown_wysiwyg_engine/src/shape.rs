@@ -10,6 +10,9 @@
 //!
 //! 依赖方向：`types ← math（独立 crate `markdown_wysiwyg_math`）← shape ← frame ← element(胶水)`。
 
+// 形状内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::cell::RefCell;
 use std::ops::Range;
 

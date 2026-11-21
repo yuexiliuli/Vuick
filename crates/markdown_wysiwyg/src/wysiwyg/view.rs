@@ -25,7 +25,7 @@ impl WyEditor {
     /// 预览同步的 `advance_pending_scroll` 复用同一落点，并以返回值逐帧核对是否稳住。
     fn scroll_to_line_impl(&mut self, src_line: usize, window: &mut Window) -> f32 {
         let n = self.doc.block_count();
-        if n == 0 || self.doc.len() == 0 {
+        if n == 0 || self.doc.is_empty() {
             return f32::NAN;
         }
         if src_line >= self.doc.line_count() {

@@ -3,10 +3,14 @@
 //! 行壳固定 `flex_row + gap_1 + px_2 + py_1 + mx4 + rounded_md`（对齐 `shell_sidebar`
 //! 搜索/目录行真实观感），hover 背景经 [`ui::motion::hoverable`] 淡入 `fill`（悬停态键控
 //! + flip-only notify + 弹簧淡入，曲线全站统一，`reduce_motion` 自动尊重）。可选前导
+//!
 //! 元素（图标等）+ 主标题（**文本样式由调用方烘进 title**，本组件不硬编码字号/颜色——
 //! 现调用点散落的 text_size/text_color 迁移时随 title 一并上移）+ 可选点击。
 //!
 //! 交互性**由是否挂 `on_click` 决定**：挂 → 手型 cursor + click 上抛；不挂 → 仅 hover 高亮。
+
+// 侧栏行控件回调类型较长 → 放行
+#![allow(clippy::type_complexity)]
 
 use std::rc::Rc;
 

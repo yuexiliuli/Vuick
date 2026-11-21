@@ -285,6 +285,7 @@ pub(in super::super) fn vec_set_len<T>(v: &mut Vec<T>, need: usize) {
 /// 省去 `vec![0u8; len]` 的全量 memset——主线程关键路径上（P-B 直出已覆盖全部字节），
 /// 与解码前语义逐字节恒等。
 #[inline]
+#[allow(clippy::uninit_vec)]
 pub(in super::super) fn uninit_vec_u8(len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(len);
     // SAFETY: u8 无 Drop glue；调用方保证 len 字节读前全写（decode 发射路径覆盖全部字节）。
@@ -311,7 +312,7 @@ pub(in super::super) fn unchecked_write<T>(dest: &mut [T], idx: usize, value: T)
 /// `idx < options.len() && options[idx].is_some()`（`select_group` 返回前已校验并 Err）。
 /// 与 `get_unchecked + as_ref + unwrap_unchecked` 逐条同指令（内联后零分支）。
 #[inline(always)]
-pub(in super::super) fn option_slice_ref<'a, T>(options: &'a [Option<T>], idx: usize) -> &'a T {
+pub(in super::super) fn option_slice_ref<T>(options: &[Option<T>], idx: usize) -> &T {
     // SAFETY: 调用方证明 idx < len 且 is_some（select_group 已校验，组引用在块边界才解析）。
     unsafe { options.get_unchecked(idx).as_ref().unwrap_unchecked() }
 }
@@ -342,7 +343,7 @@ pub(in super::super) fn u32_slice_as_bytes(src: &[u32]) -> &[u8] {
 /// `out` 已 4 字节对齐（`out.as_ptr() % align_of::<u32>() == 0`）且 `len` 个 u32 全可写
 /// （`out.len() >= len*4`）。重借存活期不触碰原 `out`；缓冲由调用方持有、无 Drop 冲突。
 #[inline(always)]
-pub(in super::super) fn bytes_as_mut_u32<'a>(out: &'a mut [u8], len: usize) -> &'a mut [u32] {
+pub(in super::super) fn bytes_as_mut_u32(out: &mut [u8], len: usize) -> &mut [u32] {
     // SAFETY: 调用方证明对齐与容量（decode_into_rgba8 对齐分支前置）。
     unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u32>(), len) }
 }

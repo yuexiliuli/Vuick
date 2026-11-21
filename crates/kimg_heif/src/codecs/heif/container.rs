@@ -352,7 +352,7 @@ impl<'a> HeifContainer<'a> {
             let property = self.items.properties[index as usize - 1];
             let body = &self.items.data_ref()[property.offset..property.offset + property.length];
             match property.ty {
-                PropIrot if body.len() >= 1 => {
+                PropIrot if !body.is_empty() => {
                     self.transforms.push(Transform {
                         ty: PropIrot,
                         a: i32::from(body[0] & 3),
@@ -360,7 +360,7 @@ impl<'a> HeifContainer<'a> {
                         clap: None,
                     });
                 }
-                PropImir if body.len() >= 1 => {
+                PropImir if !body.is_empty() => {
                     self.transforms.push(Transform {
                         ty: PropImir,
                         a: i32::from(body[0] & 1),

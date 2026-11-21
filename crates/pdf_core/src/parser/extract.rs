@@ -146,10 +146,7 @@ pub(crate) fn extract_image_pixels(
     // 面积闸（安全护栏，双点之一）：复制大图默认按自然分辨率语义**原样**（节奏稳定，
     // 见下方 1:1 稳定性注释），仅病理性天文尺寸按比例缩到预算内（防 req_w×req_h×4 字节
     // 分配撑爆内存）；正常 A4/大图复制路径尺寸稳定不受影响。口径与 layout::pixel_area_ok 一致。
-    let (req_w, req_h) = match crate::pdf::layout::budget_clamped_dims(req_w, req_h) {
-        Some(dims) => dims,
-        None => return None,
-    };
+    let (req_w, req_h) = crate::pdf::layout::budget_clamped_dims(req_w, req_h)?;
     let w = req_w as i32;
     let h = req_h as i32;
     // —— 尺寸稳定性（2026-11-10，修复「复制图片」剪贴板 DIB 尺寸漂移）——
@@ -160,11 +157,10 @@ pub(crate) fn extract_image_pixels(
     let mut bmp = img
         .get_processed_bitmap_with_size(doc, w, h)
         .ok()?;
-    if bmp.width() != w || bmp.height() != h {
-        if let Ok(b2) = img.get_processed_bitmap_with_size(doc, w, h) {
+    if (bmp.width() != w || bmp.height() != h)
+        && let Ok(b2) = img.get_processed_bitmap_with_size(doc, w, h) {
             bmp = b2;
         }
-    }
     let bw = bmp.width();
     let bh = bmp.height();
     if bw <= 0 || bh <= 0 {

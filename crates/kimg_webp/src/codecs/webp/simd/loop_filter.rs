@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// 环路滤波标量/SIMD 内核参数多、逐寄存器传参，具名构参可读性反而变差 → 按既定内核风格放行。
+#![allow(clippy::too_many_arguments)]
 // 下游 re-export 面按「零符号丢失」保留（`simd/mod.rs` 的 `use self::loop_filter::*` 仍消费），
 // 仅供 loopy/对照/测试按名引用；生产调用已在 raw 内部直连，非 test 构建无需按名引用 → 抑制
 // unused_imports（内核本身带休眠标注，另有 `filter_edge` 的 allow(dead_code) 兜底）。

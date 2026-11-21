@@ -28,13 +28,13 @@ impl EditorApp {
         // 保证「每次视频激活都从隐藏开始」。
         self.sidebar.video_hide_override = false;
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().make_tab(host, &mut **cx)
+        self.model.borrow_mut().make_tab(host, cx)
     }
 
     /// 动作体在 `AppModel::new_tab`。glue 转发。
     pub(super) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().new_tab(host, window, &mut **cx);
+        self.model.borrow_mut().new_tab(host, window, cx);
     }
 
     /// 栏内拖拽排序落地：把当前下标 `from` 的选项卡移动到「插入下标」`target`
@@ -44,7 +44,7 @@ impl EditorApp {
     /// 动作体在 `AppModel::reorder_tab`。glue 转发。
     pub(super) fn reorder_tab(&mut self, from: usize, target: usize, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().reorder_tab(host, from, target, &mut **cx);
+        self.model.borrow_mut().reorder_tab(host, from, target, cx);
     }
 
     /// 动作体在 `AppModel::activate_tab`。glue 转发。
@@ -58,7 +58,7 @@ impl EditorApp {
             self.sidebar.video_hide_override = false;
         }
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().activate_tab(host, idx, window, &mut **cx);
+        self.model.borrow_mut().activate_tab(host, idx, window, cx);
     }
 
     /// 对话框 await 返回后的下标复验：按「发起时的选项卡身份（CodeEditor 实体 id）」
@@ -278,7 +278,7 @@ impl EditorApp {
             self.sidebar.video_hide_override = false;
         }
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().remove_tab(host, idx, window, &mut **cx);
+        self.model.borrow_mut().remove_tab(host, idx, window, cx);
     }
 
     /// 标记“选项卡栏最近在滚动”：横向滚动条立即可见，并重启自动隐藏计时
@@ -368,26 +368,26 @@ impl EditorApp {
     /// 「关闭其他」：关闭除 `idx` 外全部；任一受影响脏/未命名 → 中止一个都不关。
     pub(super) fn tab_close_others(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().tab_close_others(host, idx, window, &mut **cx);
+        self.model.borrow_mut().tab_close_others(host, idx, window, cx);
     }
 
     /// 「关闭右侧」：关闭 `idx` 右侧全部；任一受影响脏/未命名 → 中止一个都不关。
     pub(super) fn tab_close_right(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().tab_close_right(host, idx, window, &mut **cx);
+        self.model.borrow_mut().tab_close_right(host, idx, window, cx);
     }
 
     /// 「关闭全部」：关闭全部；任一脏/未命名 → 中止一个都不关。
     pub(super) fn tab_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().tab_close_all(host, window, &mut **cx);
+        self.model.borrow_mut().tab_close_all(host, window, cx);
     }
 
     /// 「关闭已保存」：只关 `有路径 && !dirty` 的选项卡（定义如此，无中止语义）；
     /// 脏 / 未命名 / 无路径空选项卡保留。
     pub(super) fn tab_close_saved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().tab_close_saved(host, window, &mut **cx);
+        self.model.borrow_mut().tab_close_saved(host, window, cx);
     }
 
     /// 「移入新窗口」：取载荷 → 拆进新独立窗口（级联偏移 = 源窗口左上 + (24,24)）。
@@ -445,7 +445,7 @@ impl EditorApp {
             let model = self.model.borrow();
             let t = &model.tabs[idx];
             (
-                model.tab_effective_text(idx, &**cx),
+                model.tab_effective_text(idx, cx),
                 t.payload.file_path.clone(),
                 t.payload.dirty,
                 t.payload.preview_on,

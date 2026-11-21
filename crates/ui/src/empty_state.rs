@@ -21,8 +21,8 @@ use crate::ui::icon::{Icon, IconName};
 use crate::ui::motion::hover_spring;
 use crate::ui::theme::Theme;
 
-/// 变色龙吉祥物图：内嵌 128×128 ICO（PNG 编码）一次性解码成 `gpui::RenderImage`
-/// （见 [`crate::assets::app_icon_render`]），与自绘标题栏最左图标同源同图。
+// 变色龙吉祥物图：内嵌 128×128 ICO（PNG 编码）一次性解码成 `gpui::RenderImage`
+// （见 [`crate::assets::app_icon_render`]），与自绘标题栏最左图标同源同图。
 
 /// 空态插图（固定 160×120）：变色龙吉祥物 App 图标（自含圆角浅蓝渐变底），
 /// 固定品牌色板双主题一致；ICO 解码渲染后 `img()` 上屏。

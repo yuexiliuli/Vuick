@@ -289,14 +289,10 @@ pub(crate) fn build_external_d3d11_device_ctx(
             //（见函数注释），由 [`VideoReader::open_external_hw`] 探测后回退。
             (*hwctx).BindFlags |= 0x2;
         }
-        // 可重入互斥桥（字段类型为 `*mut libc::c_void`，与 std::ffi::c_void 布局一致，经
-        // transmute 贴合 bindgen 生成的函数指针签名；锁本身就是进程级全局静态量）。
-        (*hwctx).lock = Some(std::mem::transmute(
-            d3d11_lock_cb as unsafe extern "C" fn(*mut std::ffi::c_void),
-        ));
-        (*hwctx).unlock = Some(std::mem::transmute(
-            d3d11_unlock_cb as unsafe extern "C" fn(*mut std::ffi::c_void),
-        ));
+        // 可重入互斥桥（字段类型为 `*mut libc::c_void`，与 std::ffi::c_void 布局一致，
+        // 锁本身就是进程级全局静态量）。
+        (*hwctx).lock = Some(d3d11_lock_cb as unsafe extern "C" fn(*mut std::ffi::c_void));
+        (*hwctx).unlock = Some(d3d11_unlock_cb as unsafe extern "C" fn(*mut std::ffi::c_void));
         (*hwctx).lock_ctx = std::ptr::null_mut();
     }
 
@@ -356,10 +352,10 @@ pub(crate) fn device_supports_d3d11va(device_raw: *mut std::ffi::c_void) -> bool
             continue;
         };
         let ok = unsafe { video.CheckVideoDecoderFormat(&profile, DXGI_FORMAT_NV12) };
-        if let Ok(supported) = ok {
-            if supported.as_bool() {
-                return true;
-            }
+        if let Ok(supported) = ok
+            && supported.as_bool()
+        {
+            return true;
         }
     }
     false
@@ -385,12 +381,12 @@ pub(crate) fn d3d11_supports_shader_bound_textures(
     if !device_supports_d3d11va(device) {
         return false;
     }
-    use ffmpeg::ffi::{AVBufferRef, AVD3D11VAFramesContext, AVHWFramesContext};
+    use ffmpeg::ffi::{AVD3D11VAFramesContext, AVHWFramesContext};
     let Ok(dev) = build_external_d3d11_device_ctx(device, device_context, true) else {
         return false;
     };
     let ok = unsafe {
-        let frames =
+        let mut frames =
             ffmpeg::ffi::av_hwframe_ctx_alloc(ffmpeg::ffi::av_buffer_ref(dev.0));
         if frames.is_null() {
             false
@@ -404,7 +400,7 @@ pub(crate) fn d3d11_supports_shader_bound_textures(
             let fhw = (*fc).hwctx as *mut AVD3D11VAFramesContext;
             (*fhw).BindFlags |= 0x20 | 0x2; // DECODER | SHADER_RESOURCE
             let rc = ffmpeg::ffi::av_hwframe_ctx_init(frames);
-            ffmpeg::ffi::av_buffer_unref(&mut (frames as *mut AVBufferRef));
+            ffmpeg::ffi::av_buffer_unref(&mut frames);
             rc >= 0
         }
     };
@@ -430,9 +426,9 @@ pub(crate) fn d3d11_supports_shader_bound_textures(
 /// 另一份引用、用完即 `av_buffer_unref`，不改 `dev` 的引用余额；同线程、同设备类型，符合
 /// K22/K23（各线程独享 context、AVBufferRef 引用计数正确）。
 pub(crate) fn warm_external_d3d11_frames_pool_with(dev: &AvBuf) {
-    use ffmpeg::ffi::{AVBufferRef, AVD3D11VAFramesContext, AVHWFramesContext};
+    use ffmpeg::ffi::{AVD3D11VAFramesContext, AVHWFramesContext};
     unsafe {
-        let frames = ffmpeg::ffi::av_hwframe_ctx_alloc(ffmpeg::ffi::av_buffer_ref(dev.0));
+        let mut frames = ffmpeg::ffi::av_hwframe_ctx_alloc(ffmpeg::ffi::av_buffer_ref(dev.0));
         if frames.is_null() {
             return;
         }
@@ -450,7 +446,7 @@ pub(crate) fn warm_external_d3d11_frames_pool_with(dev: &AvBuf) {
         let fhw = (*fc).hwctx as *mut AVD3D11VAFramesContext;
         (*fhw).BindFlags = 0x20; // DECODER only（必成功）
         let _ = ffmpeg::ffi::av_hwframe_ctx_init(frames);
-        ffmpeg::ffi::av_buffer_unref(&mut (frames as *mut AVBufferRef));
+        ffmpeg::ffi::av_buffer_unref(&mut frames);
     }
 }
 

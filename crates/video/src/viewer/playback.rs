@@ -239,8 +239,7 @@ impl super::VideoViewer {
                         .unwrap_or_else(|e| e.into_inner())
                         .as_ref()
                         .filter(|d| d.session == self.diag_session)
-                    {
-                        if let (Some(tr), Some(s), Some(r), Some(op), Some(ws), Some(ts)) = (
+                        && let (Some(tr), Some(s), Some(r), Some(op), Some(ws), Some(ts)) = (
                             d.trigger,
                             d.sent,
                             d.recv,
@@ -265,7 +264,6 @@ impl super::VideoViewer {
                                 d.target,
                             );
                         }
-                    }
                     *seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
                     self.diag_session = 0;
                 }
@@ -582,11 +580,10 @@ impl super::VideoViewer {
             return;
         }
         // 已缓存「离 target 足够近」的帧（命中窗内点击即可直接上屏）→ 不重复投（省解码带宽）
-        if let Some(f) = &self.hover_cache {
-            if f.pts >= target && f.pts - target <= HOVER_HIT_WINDOW_S {
+        if let Some(f) = &self.hover_cache
+            && f.pts >= target && f.pts - target <= HOVER_HIT_WINDOW_S {
                 return;
             }
-        }
         self.kick_hover_predecode(target, cx);
     }
 
@@ -700,7 +697,7 @@ impl super::VideoViewer {
         self.last_tick = None;
         if let Some(sink) = &self.audio {
             sink.flush(); // 清掉暂停前已入队的旧段（即便 pause 未即时生效也无声）
-            let _ = sink.pause();
+            sink.pause();
         }
         self.last_scrub_retarget = Some(Instant::now());
         // M0：悬停预解码帧命中此落点 → 即时装屏（亚毫秒）+ 跳过本次换代重解（`served_hover_target`

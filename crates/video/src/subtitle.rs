@@ -77,22 +77,17 @@ pub fn parse_ass_text(text: &str) -> String {
 /// O(log N)。窗口可重叠（相同 `start_pts` 或互相包裹）时 end 无序无法按 start 剪枝，
 /// 从该处**往前回扫**找命中——结果与线性同（返回一条活跃窗口）；回扫上限 = 全部，
 /// 511 条量级仍 ≈ 微秒，每拍 render 只在「有活动字幕」时走一次，非热点。
-pub fn find_active_subtitle<'a>(
-    subtitles: &'a [SubtitleEntry],
+pub fn find_active_subtitle(
+    subtitles: &[SubtitleEntry],
     seconds: f64,
-) -> Option<&'a SubtitleEntry> {
+) -> Option<&SubtitleEntry> {
     let i = match subtitles.partition_point(|s| s.start_pts <= seconds) {
         0 => return None,
         n => n - 1,
     };
     // 从最近的（start 最大）往前找：常规情况只有 i（或 i 自身结束后的极少数重叠邻居）
     // 会出现，命中即回；未命中时回扫更早条目取「活跃」的那条。
-    for e in subtitles[..=i].iter().rev() {
-        if e.is_active_at(seconds) {
-            return Some(e);
-        }
-    }
-    None
+    subtitles[..=i].iter().rev().find(|&e| e.is_active_at(seconds)).map(|v| v as _)
 }
 
 #[cfg(test)]

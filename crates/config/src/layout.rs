@@ -82,6 +82,7 @@ pub const INDENT_GUIDE_INDENT_SIZE: usize = 4;
 /// - [`BracketGuidesMode::Active`] = **仅活动括对**产彩色竖线 + 钩线，其余括对不产线、
 ///   其所在列灰缩进线正常显示/共存（VSCode `bracketPairs:'active'`，可留作中间态比较）；
 /// - [`BracketGuidesMode::All`] = 全部括对产线（VSCode `bracketPairs:'always'`，对比用）。
+///
 /// 括号配对段扫描与纯函数测试全部保留（历史规范见 docs/bracket-guide-redesign.md §8.4；
 /// 终稿块体口径见 editor 侧 active_pair / active_guide_group doc，2026-11-14 用户实测）。
 /// 常量翻转即还原，行为零丢。

@@ -5,6 +5,9 @@
 //! `#[cfg(test)]` 的 str 版正确性参照（`common_prefix_bytes` / `scan_blocks_incremental`）
 //! 保留在 `parser`（测试基础设施），本模块只保留生产路径。
 
+// 块扫描内核逐游标传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::ops::Range;
 
 use gpui::{Image, SharedString};
@@ -143,10 +146,7 @@ fn try_code_block_inplace_scan(
     let open_line_no = prev_src.byte_to_line_idx(open_byte, LineType::LF);
     let open_end = prev_src.line_to_byte_idx(open_line_no + 1, LineType::LF);
     let open_text = prev_src.slice(open_byte..open_end).to_string();
-    let (open_char, _) = match fence_len(open_text.trim_end_matches('\r').trim_start()) {
-        Some(x) => x,
-        None => return None, // 锚点块名不符实（非围栏）→ 通用路径
-    };
+    let (open_char, _) = fence_len(open_text.trim_end_matches('\r').trim_start())?;
 
     // 变化字节区间（旧/新坐标系）：前缀/后缀字节相同 ⇒ 区间 [b_first, tail) 精确覆盖
     // 被改内容（删/插/替换统一；`tail_start_new - delta` 把尾部映射回旧坐标）。

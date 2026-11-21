@@ -227,6 +227,7 @@ pub struct EditorApp {
     /// 侧边栏**渲染/事件实体**（承接自 shell_sidebar 域 crate）：
     /// 外壳（活动栏/调宽手柄）+ 目录（TOC）视图 + 搜索（`crate::search`)
     /// + 文件树（files/files_ops）在 `Entity<Sidebar<EditorApp>>` 上构建
+///
     /// （`Context<Sidebar>` 内 `cx.listener` 绑定域实体）；宿主渲染期以 `&mut self.sidebar`
     /// 传入状态、事件回调经 `SidebarHost` 反调本宿主。搜索输入实体亦收进域
     /// （测试经 `sidebar::EditorApp::search_state(cx)` 兼容读取器取句柄）。

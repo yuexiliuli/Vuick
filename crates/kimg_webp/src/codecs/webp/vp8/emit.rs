@@ -148,7 +148,7 @@ pub(crate) fn emit_rows_into_rgba(
             continue;
         }
         let chroma_row = row >> 1;
-        let adjacent = if row % 2 == 0 {
+        let adjacent = if row.is_multiple_of(2) {
             if chroma_row == 0 {
                 0
             } else {
@@ -226,7 +226,7 @@ pub(crate) fn emit_rows_into_rgb3(
             continue;
         }
         let chroma_row = row >> 1;
-        let adjacent = if row % 2 == 0 {
+        let adjacent = if row.is_multiple_of(2) {
             if chroma_row == 0 {
                 0
             } else {

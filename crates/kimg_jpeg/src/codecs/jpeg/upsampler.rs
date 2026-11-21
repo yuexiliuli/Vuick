@@ -229,7 +229,7 @@ pub(crate) fn upsample(
                 let length = component.first_row_upsample_dest.len();
                 component
                     .first_row_upsample_dest
-                    .copy_from_slice(&dest_coeff.rchunks_exact(length).next().unwrap());
+                    .copy_from_slice(dest_coeff.rchunks_exact(length).next().unwrap());
             }
             for (single_row, output_stride) in raw_coeff
                 .chunks_exact(component.width_stride)

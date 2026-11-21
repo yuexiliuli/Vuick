@@ -218,6 +218,9 @@ impl LineStarts {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
@@ -726,6 +729,7 @@ impl Doc {
 
     /// 字节偏移 → 前累计 UTF-16 单元数（IME 协议层换算；O(log n + 行长)：行表二分
     /// + 行内切片计数，不触碰全文）。非字符边界入参先 floor 到所在字符起始——
+///
     /// IME 协议层可能传入任意 byte（如多字节删除后位移不齐），`rope.slice` 要求
     /// 边界对齐否则 panic（P1-14）。
     pub fn byte_to_utf16(&self, byte: usize) -> usize {
@@ -898,6 +902,10 @@ impl Doc {
     /// 全文字节长（编辑/光标边界钳位用；rope 单真源，O(1)）。
     pub fn len(&self) -> usize {
         self.rope.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// 全文（宿主镜像/测试/派生全量扫描用）。Str 源（load 后）O(1) 克隆；rope 源

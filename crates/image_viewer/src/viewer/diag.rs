@@ -83,7 +83,7 @@ struct DiagState {
 }
 
 thread_local! {
-    static DIAG: RefCell<Option<DiagState>> = RefCell::new(None);
+    static DIAG: RefCell<Option<DiagState>> = const { RefCell::new(None) };
 }
 
 /// 门控启用时取可变诊断态执行 `f`；未启用 / 无态时直接短路（零开销）。

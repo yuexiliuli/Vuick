@@ -267,9 +267,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             .child("整个文件夹");
 
         let set_bg = |active: bool, hovered: bool| {
-            if active {
-                active_bg
-            } else if hovered {
+            if active || hovered {
                 active_bg
             } else {
                 active_bg.opacity(0.)

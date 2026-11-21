@@ -14,6 +14,9 @@
 //! - 滚动条 `Scrollbar::vertical(Always)` + `viewport_from_layout()`：内容超出视口才显示
 //!   thumb、轨道点击跳转、thumb 可拖（滚动条自身几何由 `scrollbar` 模块单测覆盖）。
 
+// 滚动面板状态类型较长 → 放行
+#![allow(clippy::type_complexity)]
+
 use gpui::{
     App, ElementId, IntoElement, InteractiveElement as _, MouseButton, MouseDownEvent,
     ParentElement as _, ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, div,

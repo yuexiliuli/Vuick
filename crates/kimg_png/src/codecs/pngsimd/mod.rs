@@ -250,10 +250,7 @@ impl<'a> PngEngine<'a> {
         } else {
             #[cfg(feature = "stage_profile")]
             let t1 = std::time::Instant::now();
-            let inflated = match inflate_idat(h, data, max_alloc) {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            };
+            let inflated = inflate_idat(h, data, max_alloc)?;
             #[cfg(feature = "stage_profile")]
             let t2 = std::time::Instant::now();
             let r = if h.interlace == 1 {
@@ -388,7 +385,7 @@ impl<'a> IdatCursor<'a> {
         let remain = self.chunk_remain();
         let is_last = self.ci + 1 >= self.chunks.len();
         let mut n = remain.min(max);
-        if !is_last && n % 8 != 0 {
+        if !is_last && !n.is_multiple_of(8) {
             n -= n % 8; // 对齐到 8 的倍数（非流尾时否则 fdeflate 无法吞 <8 尾）。
             if n == 0 {
                 // 整块 <8：全部归入 scratch，交给拼贴窗口。
@@ -421,7 +418,7 @@ impl<'a> IdatCursor<'a> {
             self.cpos += take;
         }
         // 补齐到 8 的倍数（若仍有后续输入）。
-        while w.len() % 8 != 0 {
+        while !w.len().is_multiple_of(8) {
             self.skip_done();
             if self.ci >= self.chunks.len() {
                 break;
@@ -453,11 +450,10 @@ fn inflate_idat(h: &FileHeader, data: &[u8], max_alloc: Option<u64>) -> ImageRes
         h.color_type,
         h.interlace == 1,
     );
-    if let Some(max) = max_alloc {
-        if expected > max {
+    if let Some(max) = max_alloc
+        && expected > max {
             return Err(err_limits());
         }
-    }
     let expected = usize::try_from(expected).map_err(|_| err_decode("解压尺寸超出平台表示范围"))?;
 
     let mut dc = fdeflate::Decompressor::new();

@@ -92,11 +92,10 @@ impl<W: Write> GifEncoder<W> {
 impl<W: Write> Drop for GifEncoder<W> {
     /// 末尾写尾块 0x3B（同旧 gif crate `Encoder` 的 Drop 行为；错误静默忽略）。
     fn drop(&mut self) {
-        if self.started {
-            if let Some(w) = self.w.as_mut() {
+        if self.started
+            && let Some(w) = self.w.as_mut() {
                 let _ = w.write_all(&[0x3B]);
             }
-        }
     }
 }
 
@@ -293,7 +292,7 @@ fn build_cell_map(palette: &[Rgb]) -> [u8; 4096] {
         let g0 = ((cell >> 4) & 15) * 16 + 8;
         let b0 = (cell & 15) * 16 + 8;
         let mut best = 0u8;
-        let mut best_d = std::i64::MAX;
+        let mut best_d = i64::MAX;
         for (i, &p) in palette.iter().enumerate() {
             let dr = i64::from(r0) - i64::from((p >> 16) as u8);
             let dg = i64::from(g0) - i64::from((p >> 8) as u8);

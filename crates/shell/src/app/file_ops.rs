@@ -278,7 +278,7 @@ impl EditorApp {
     ) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut()
-            .remove_recent_file(host, path, _window, &mut **cx);
+            .remove_recent_file(host, path, _window, cx);
     }
 
     /// 从最近文件夹列表移除失效路径（同 [`Self::remove_recent_file`]）。
@@ -291,7 +291,7 @@ impl EditorApp {
     ) {
         let host: &dyn AppHost = &*self;
         self.model.borrow_mut()
-            .remove_recent_folder(host, path, _window, &mut **cx);
+            .remove_recent_folder(host, path, _window, cx);
     }
 
     /// 应用某选项卡的「阅读进度恢复」目标：把 store 值装入 `tab.reading_restore`
@@ -301,6 +301,7 @@ impl EditorApp {
     ///   sync 状态机（shell_preview::scroll）自动收敛，**不手动驱动**。
     /// - epub：`md_wy.set_scroll_target`（WY 自钉循环，天生延迟安全、无需 window）。
     /// - pdf：写入 `viewer.restore_anchor`（`apply_loaded` 装配后消费）。
+///
     /// 开关关 / store 无该路径 → 不动作。**会话恢复期间也套进度**：apply 只读 store
     /// 并设滚动/锚点，**不触发任何写盘**（写盘只走 [`Self::check_reading_progress`] /
     /// `remove_tab` / `save_all_reading_progress`），恢复期安全——用户最常见的「读到中途
@@ -557,7 +558,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().set_tab_text(host, idx, text, &mut **cx);
+        self.model.borrow_mut().set_tab_text(host, idx, text, cx);
     }
 
     /// 大文档「先瞬时显示、后台补齐」的收尾段：**P1 起整篇 rope 由生产端在后台建好，
@@ -769,7 +770,7 @@ impl EditorApp {
                             // WARN-1：notify 按 `progress_gate` 节流（每 4 条一跳）。
                             // tab 换成别的文件/已关 → 跳过。
                             let p_prg = p.clone();
-                            let do_notify = progress_gate % 4 == 0;
+                            let do_notify = progress_gate.is_multiple_of(4);
                             progress_gate += 1;
                             let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
                                 if let Some(tab) = this.model.borrow_mut().tabs.get_mut(idx).filter(|t| {

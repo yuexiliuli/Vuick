@@ -81,7 +81,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                             this.sidebar_open_file_tree_prompt(
                                 FileTreePromptKind::Rename {
                                     path: target.clone(),
-                                    is_dir: is_dir,
+                                    is_dir,
                                 },
                                 window,
                                 cx,
@@ -159,7 +159,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             |this, emitter, cx| {
                 // 身份校验（与实体侧同款）：只有被关的菜单仍是当前菜单才清字段 + 同步宿主
                 // 测试镜像——旧菜单的关闭不得误清新菜单的镜像（同选项卡栏右键姿势）。
-                if this.file_tree_menu.entity.as_ref() == Some(&emitter) {
+                if this.file_tree_menu.entity.as_ref() == Some(emitter) {
                     this.file_tree_menu.clear();
                     this.host_call(cx, |app, cx| app.sidebar_set_file_tree_menu(None, cx));
                 }

@@ -205,6 +205,7 @@ impl PdfViewer {
     ///   时页宽基线随容器收敛，哪怕容器临时窄于页宽+边距（窗口回退基线未收敛的瞬时
     ///   ~46px 级溢出），也仍按「选中文本」处理——否则 shell b1 在打开头几帧即拖选会
     ///   被误切进平移（选中路径回归）。
+///
     /// 溢出时左键拖拽语义从「选中文本」切换为「平移页面」（行为表见 [`Self::on_mouse_down`]）。
     pub(crate) fn horizontal_overflow(&self) -> bool {
         self.scroll.max_offset().x > px(1.) && self.zoom > 1.0 + 1e-4
@@ -237,9 +238,7 @@ impl PdfViewer {
         // （水平已按视口重算居中、非均匀缩放，不能再 ÷zoom 走 `page_at`）。命中 → 页内局部
         // 显示坐标 → 按卡显示宽（rect.w）还原 PDF pt。间隙/留白/越界 → None（同连续语义）。
         if self.paged_mode_active() {
-            let Some(layout) = self.paged_layout_cell.borrow().clone() else {
-                return None;
-            };
+            let layout = self.paged_layout_cell.borrow().clone()?;
             if layout.rows == 0 {
                 return None;
             }
@@ -626,8 +625,8 @@ impl PdfViewer {
         let off = self.scroll.offset();
         // 分页页拍（R4）：页内容原点 = `paged_display_rect(page).origin`（唯一显示矩形源，
         // 水平按视口居中，与渲染定位同源），页内局部坐标加在其上、再加滚动偏移 → 窗口坐标。
-        if self.paged_mode_active() {
-            if let Some(rect) = self.paged_display_rect(page) {
+        if self.paged_mode_active()
+            && let Some(rect) = self.paged_display_rect(page) {
                 let cx = rect.x + lx;
                 let cy = rect.y + ly;
                 return gpui::point(
@@ -635,7 +634,6 @@ impl PdfViewer {
                     px(bounds.top().as_f32() + cy + off.y.as_f32()),
                 );
             }
-        }
         let page_width = self.page_width();
         let wrap_w = self.wrap_width(window, page_width);
         // 连续页列水平原点 = `column_left + x_zoom_offset`（非溢出鼠标缩放偏移，命中同口径）。

@@ -352,6 +352,12 @@ impl Toc {
         self.len
     }
 
+    #[allow(dead_code)] // 同上：仅 parse 测试消费
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn iter(&self) -> TocIter<'_> {
         TocIter { toc: self, seg_i: 0, seg_off: 0 }
     }

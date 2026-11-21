@@ -184,7 +184,7 @@ impl RenderOnce for Pill {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::global(cx);
         let chrome = ChromeColors::for_mode(theme.is_dark());
-        let (bg, fg) = self.tone.colors(&theme, &chrome);
+        let (bg, fg) = self.tone.colors(theme, &chrome);
         let (text_size, height) = self.size.profile();
         let on_click = self.on_click;
         let mouse_down = self.on_mouse_down;

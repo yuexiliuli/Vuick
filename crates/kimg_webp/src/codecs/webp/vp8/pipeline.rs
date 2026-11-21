@@ -15,6 +15,7 @@ use super::*;
 /// `reconstruct_macroblock` 按串行同款复用，字节不变）。`Default` 全零 = 未写系数位恒 0。
 /// 字段 `pub(crate)`：`simd::raw::pipeline` 迁入的 `reconstruct_macroblock` 按字段读写本包
 /// （非本模块子孙，须显式打开字段可见性；包级 crate 内可见，不改字节/布局）。
+#[derive(Default)]
 pub(crate) struct MbPacket {
     pub(crate) y_mode: u8,
     pub(crate) uv_mode: u8,
@@ -26,19 +27,6 @@ pub(crate) struct MbPacket {
     pub(crate) mb: [[i16; 16]; 25],
 }
 
-impl Default for MbPacket {
-    fn default() -> Self {
-        MbPacket {
-            y_mode: 0,
-            uv_mode: 0,
-            i16: false,
-            nonzero_mask: 0,
-            ac_mask: 0,
-            b_modes: [0; 16],
-            mb: [[0i16; 16]; 25],
-        }
-    }
-}
 
 /// 单一宏块行的完成包：`mbs[mbx]`（t2 重建输入）+ `filters[mbx]`（t2 滤波输入，原行滤波参数表
 /// `(level, inner)`）。随通道按序交给 t2，t2 依序重建行 r 后滤行 r-1（串行同序）。整包按值
@@ -295,8 +283,8 @@ pub(crate) fn decode_from_header(
         // 紧密平面输出缓冲（真实宽高；仅供测试/兼容 API 消费，生产 rgba 路径弃用 = 纯浪费，
         // 由 `need_tight` 门控跳过以省 1-2 遍整帧写）。L3 未初始化：MT 由 t3 直出、串行由尾段
         // `extract_tight_rows` 写满，返回前不被读，省略 memset 逐字节不变。
-        let cwu = (width + 1) / 2;
-        let chu = (height + 1) / 2;
+        let cwu = width.div_ceil(2);
+        let chu = height.div_ceil(2);
         let (out_y, out_u, out_v) = if need_tight {
             (
                 uninit_vec_u8(width * height),
@@ -308,16 +296,16 @@ pub(crate) fn decode_from_header(
         };
         (planes, rgba, out_y, out_u, out_v)
     });
-    let (mut y, uv_rest) = planes.split_at_mut(y_vec_len);
-    let (mut u, mut v) = uv_rest.split_at_mut(uv_vec_len);
+    let (y, uv_rest) = planes.split_at_mut(y_vec_len);
+    let (u, v) = uv_rest.split_at_mut(uv_vec_len);
 
     // 行定稿直出目标：`out=Some`（调用方缓冲，`decode_vp8_into`/`decode_vp8_with_alpha_into`
     // 直写入口）或内部整帧 `rgba`（既有收缓冲路径）。长度校验先于任何像素写入，直接 Err
     // 而非静默截断——与无损侧 `decode_into_rgba8` 的「输出缓冲长度须为 w*h*4」同口径。
     let dst: &mut [u8] = match out {
         Some(o) => {
-            let expect = (width as usize)
-                .checked_mul(height as usize)
+            let expect = width
+                .checked_mul(height)
                 .and_then(|n| n.checked_mul(channels))
                 .ok_or_else(|| Vp8Error::new("VP8 直写缓冲尺寸溢出"))?;
             if o.len() != expect {
@@ -509,7 +497,7 @@ pub(crate) fn decode_from_header(
                     &mut above_nz[mbx],
                     &mut left_nz,
                     &mut pkt,
-                    &mut y, y_pitch, &mut u, &mut v, uv_pitch,
+                    y, y_pitch, u, v, uv_pitch,
                     &mut above_y, &mut above_u, &mut above_v,
                     mbx, mby, mbw,
                     gates,
@@ -523,7 +511,7 @@ pub(crate) fn decode_from_header(
             // mby 之后（bottom 邻行已重建、非滤波污染），预测读未滤波行的不变式保持。
             if mby >= 1 {
                 emitted = filter_emit_serial_row(
-                    &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw,
+                    y, y_pitch, u, v, uv_pitch, mbw,
                     mby - 1, mbh, &fh.filter, &row_filters[(mby - 1) * mbw..mby * mbw],
                     width, height, dst, &mut scratch, channels, alpha, emitted,
                 );
@@ -535,7 +523,7 @@ pub(crate) fn decode_from_header(
         if mbh > 0 {
             #[allow(unused_assignments)]
             let _emitted = filter_emit_serial_row(
-                &mut y, y_pitch, &mut u, &mut v, uv_pitch, mbw,
+                y, y_pitch, u, v, uv_pitch, mbw,
                 mbh - 1, mbh, &fh.filter, &row_filters[(mbh - 1) * mbw..mbh * mbw],
                 width, height, dst, &mut scratch, channels, alpha, emitted,
             );
@@ -547,7 +535,7 @@ pub(crate) fn decode_from_header(
         if need_tight {
             stage_clock::copy(|| {
                 extract_tight_rows(
-                    &y, y_pitch, &u, &v, uv_pitch,
+                    y, y_pitch, u, v, uv_pitch,
                     0, height, width, &mut out_y, &mut out_u, &mut out_v,
                 );
             });

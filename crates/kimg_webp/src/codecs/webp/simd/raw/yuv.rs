@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+// YUV→RGB 内核逐寄存器传参，具名构参破坏字节恒等算术单源性 → 放行。
+#![allow(clippy::too_many_arguments)]
 //! 裸 unsafe 叶子子模块 `raw::yuv`：YUV→RGB 定点转换的全部 `#[target_feature]` SIMD 内核 +
 //! 安全门面整体迁入（原 `simd/yuv.rs`）。上层 `simd/yuv.rs` 以 `#![forbid(unsafe_code)]` +
 //! 薄委托显式依赖本模块。算法 / 常量 / 调用顺序与隔离前逐字节一致（字节恒等是硬约束）。

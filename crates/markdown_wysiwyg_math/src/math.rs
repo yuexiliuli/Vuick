@@ -21,6 +21,9 @@
 //! `pub use wy_math_render::{…}` 重导出调用，本模块只管「数学」的显示化。
 //! Mermaid 图已先迁出为独立 crate `wy_mermaid`（parse/layout/paint 三分离）。
 
+// 公式渲染布局类型较长 → 放行
+#![allow(clippy::type_complexity)]
+
 use std::ops::Range;
 use std::sync::Arc;
 

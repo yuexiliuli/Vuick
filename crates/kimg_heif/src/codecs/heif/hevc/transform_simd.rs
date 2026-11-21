@@ -17,6 +17,8 @@
 #![allow(unsafe_code)]
 #![cfg(target_arch = "x86_64")]
 
+// 变换 SIMD 内核逐寄存器传参，具名构参破坏字节恒等算术单源性 → 放行。
+#![allow(clippy::too_many_arguments)]
 use crate::codecs::heif::error::{HeifError, HeifResult};
 use std::arch::x86_64::*;
 

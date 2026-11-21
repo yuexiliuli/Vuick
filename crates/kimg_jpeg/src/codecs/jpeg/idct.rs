@@ -40,7 +40,7 @@ pub(crate) fn idct_int(in_vector: &mut [i32; 64], out_vector: &mut [i16], stride
     let mut pos = 0;
     let mut i = 0;
 
-    if &in_vector[1..] == &[0_i32; 63] {
+    if in_vector[1..] == [0_i32; 63] {
         return idct_int_1x1(in_vector, out_vector, stride);
     }
 
@@ -130,7 +130,7 @@ pub(crate) fn idct_int(in_vector: &mut [i32; 64], out_vector: &mut [i16], stride
         let p4 = wa(t1, t3);
         let p1 = wa(t0, t3);
         let p2 = wa(t1, t2);
-        let p5 = wm(wa(p3, p4), f2f(1.175875602));
+        let p5 = wm(wa(p3, p4), f2f(1.175_875_5));
 
         t0 = wm(t0, 1223);
         t1 = wm(t1, 8410);
@@ -245,7 +245,7 @@ pub(crate) fn idct4x4(in_vector: &mut [i32; 64], out_vector: &mut [i16], stride:
         let i3 = in_vector[i + 3];
         let i1 = in_vector[i + 1];
 
-        let p5 = wm(wa(i3, i1), f2f(1.175875602));
+        let p5 = wm(wa(i3, i1), f2f(1.175_875_5));
 
         let p1 = wa(p5, wm(i1, -3685));
         let p2 = wa(p5, wm(i3, -10497));

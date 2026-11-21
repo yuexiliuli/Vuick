@@ -266,6 +266,8 @@ impl StageProfile {
 }
 
 /// 输入/输出颜色空间（zune-core `ColorSpace` 的子集；部分变体仅用于镜像映射）。
+/// 变体名沿用 JPEG/ICC 标准缩写（RGB/RGBA/CMYK/YCCK）→ 放行。
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum ColorSpace {
@@ -452,9 +454,9 @@ impl Component {
         })
     }
 
-    /// 上采样工作缓冲分配已移除（dormancy）：C# 语义换主后 `upsampler::upsample` 不再被
-    /// 管线调用，`row/row_up/first_row_upsample_dest/upsample_dest` 四处分配纯死
-    /// （2026-11-08 删），字段保留为空 Vec 以维持 `upsampler.rs`（休眠模块）编译。
+    // 上采样工作缓冲分配已移除（dormancy）：C# 语义换主后 `upsampler::upsample` 不再被
+    // 管线调用，`row/row_up/first_row_upsample_dest/upsample_dest` 四处分配纯死
+    // （2026-11-08 删），字段保留为空 Vec 以维持 `upsampler.rs`（休眠模块）编译。
 
     /// C# `RingOffset`: 平面行 → 环字节偏移（`row % RingRows * W2`）。
     #[inline]
@@ -737,7 +739,7 @@ pub(crate) struct Decoder<'a> {
         for (dst, src) in self
             .dc_huffman_tables
             .iter_mut()
-            .zip(s.dc_huffman_tables.into_iter())
+            .zip(s.dc_huffman_tables)
         {
             *dst = src.map(|b| *b);
         }
@@ -745,7 +747,7 @@ pub(crate) struct Decoder<'a> {
         for (dst, src) in self
             .ac_huffman_tables
             .iter_mut()
-            .zip(s.ac_huffman_tables.into_iter())
+            .zip(s.ac_huffman_tables)
         {
             *dst = src.map(|b| *b);
         }
@@ -949,8 +951,8 @@ pub(crate) struct Decoder<'a> {
                 }
                 1 => {
                     let mut qt_values = [0_u16; 64];
-                    for i in 0..64 {
-                        qt_values[i] = self.reader.get_u16_be_err()?;
+                    for qt in qt_values.iter_mut() {
+                        *qt = self.reader.get_u16_be_err()?;
                     }
                     qt_length -= (precision_value as u16) + 1;
                     un_zig_zag(&qt_values)
@@ -1337,10 +1339,10 @@ fn unsupported_scheme_desc(int: u8) -> Option<String> {
 pub(crate) fn calculate_padded_width(actual_width: usize, sub_sample: SampleRatios) -> usize {
     match sub_sample {
         SampleRatios::None | SampleRatios::V => {
-            ((actual_width + 7) / 8) * 8
+            actual_width.div_ceil(8) * 8
         }
         SampleRatios::H | SampleRatios::HV => {
-            ((actual_width + 15) / 16) * 16
+            actual_width.div_ceil(16) * 16
         }
         SampleRatios::Generic(h, _) => {
             ((actual_width + ((h * 8).saturating_sub(1))) / (h * 8)) * (h * 8)

@@ -218,7 +218,7 @@ fn parse_pam<R: Read>(r: &mut R) -> ImageResult<(u32, u32, u32, TupleType, PnmSu
             }
             line.push(byte[0]);
         }
-        let line = String::from_utf8(line).map_err(|e| pnm_err(e))?;
+        let line = String::from_utf8(line).map_err(pnm_err)?;
         if line.is_empty() {
             return Err(pnm_err("Unexpected end of PNM header"));
         }
@@ -250,7 +250,7 @@ fn parse_pam<R: Read>(r: &mut R) -> ImageResult<(u32, u32, u32, TupleType, PnmSu
     };
 
     let tuple: TupleType = match (tupltype.as_deref(), m, d) {
-        (_, v, _) if v == 0 => return Err(pnm_err("Image MAXVAL is zero")),
+        (_, 0, _) => return Err(pnm_err("Image MAXVAL is zero")),
         (None, _, 1) => Ok(TupleType::GrayU8),
         (None, _, 2) => Ok(TupleType::GrayAlphaU8),
         (None, _, 3) => Ok(TupleType::RGBU8),

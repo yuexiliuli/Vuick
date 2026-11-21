@@ -106,7 +106,7 @@ impl<H: FileTreePromptHost> FileTreePrompt<H> {
             let Some(this) = weak_self.upgrade() else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| match ev {
+            this.update(cx, |this, cx| match ev {
                 InputEvent::Submit { .. } => this.submit(window, cx),
                 InputEvent::Cancel => this.close(window, cx),
                 InputEvent::Change => {}

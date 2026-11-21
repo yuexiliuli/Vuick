@@ -18,6 +18,9 @@
 //! - `logical_row(visual)`：二分「折叠首行视觉位置」，视觉落在折叠首行 ⇒ 其
 //!   逻辑行，否则 `visual + hidden_prefix`（折叠体在视觉上是「塌缩的一格」）。
 
+// 折叠重排内核与映射类型 → 放行
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use gpui::SharedString;
 
 #[cfg(test)]
@@ -205,6 +208,7 @@ pub fn indent_guide_level(leading_cols: usize, indent_size: usize) -> u32 {
 /// - `A<B` → `1 + ⌊A/is⌋`（从浅层 A 续一段警戒线）；
 /// - `A==B` → `⌈B/is⌉`（均等缩进 → 按本级续）；
 /// - `A>B` → `1 + ⌊B/is⌋`（从浅层 B 续，防竖线直穿闭合行）。
+///
 /// cols 传 `Option<i32>`（None = 缺）；返回应画的级数（0 = 无线）。
 pub fn blank_guide_level(prev: Option<i32>, next: Option<i32>, indent_size: i32) -> u32 {
     let is = indent_size.max(1);
@@ -420,7 +424,7 @@ where
     while line_ix < row_count {
         // ——— 处理本行之前：快照落点 + 汇聚检查点（都看「入口态」）———
         let snap_items = paren_stack.len() + brace_stack.iter().map(|lv| lv.len()).sum::<usize>();
-        if line_ix % SNAPSHOT_SPACING == 0 && snap_items <= snap_items_budget {
+        if line_ix.is_multiple_of(SNAPSHOT_SPACING) && snap_items <= snap_items_budget {
             out.snapshots.push((
                 line_ix,
                 BracketSnapshot {
@@ -519,8 +523,8 @@ where
                     if ch == '}' {
                         // `}` 只查本行缩进层栈；该层空 → 丢弃（不跨层回退、不跨层偷配）。
                         let k = leading_indent(s).units();
-                        if let Some(level) = brace_stack.get_mut(k) {
-                            if let Some((ol, oc, od)) = level.pop() {
+                        if let Some(level) = brace_stack.get_mut(k)
+                            && let Some((ol, oc, od)) = level.pop() {
                                 // pop 恒执行（防空栈/budget 会计），追加仅在未截断时。
                                 unclosed = unclosed.saturating_sub(1);
                                 if !truncated {
@@ -541,7 +545,6 @@ where
                                     }
                                 }
                             }
-                        }
                     } else {
                         let want = if ch == ')' { '(' } else { '[' };
                         while let Some((ol, oc, och, od)) = paren_stack.pop() {
@@ -592,12 +595,11 @@ where
             // 各层花括号栈 + 括号栈全空 + 不在块注释内 = 安全断点（C4 断点语义：
             // 从该行以全新状态续扫与整篇扫描在 `≥ 该行` 逐位一致）。
             out.boundaries.push(line_ix);
-            if let Some(m) = stop_after {
-                if line_ix >= m {
+            if let Some(m) = stop_after
+                && line_ix >= m {
                     out.stop = line_ix;
                     return out;
                 }
-            }
         }
         line_ix += 1;
     }
@@ -682,7 +684,7 @@ where
         // ——— 处理本行之前：快照落点 + 汇聚检查点（都看「入口态」；含空行——下次非空
         // 行由该态决定）———
         let snap_items = stack.len() + usize::from(pending.is_some());
-        if r % SNAPSHOT_SPACING == 0 && snap_items <= snap_items_budget {
+        if r.is_multiple_of(SNAPSHOT_SPACING) && snap_items <= snap_items_budget {
             out.snapshots.push((r, FoldSnapshot { stack: stack.clone(), pending }));
             snap_items_budget -= snap_items;
         }
@@ -724,12 +726,11 @@ where
             if stack.is_empty() {
                 // 栈清空 = 安全断点（此后从空栈继续与整篇扫描逐位一致）。
                 out.boundaries.push(r);
-                if let Some(m) = stop_after {
-                    if r >= m {
+                if let Some(m) = stop_after
+                    && r >= m {
                         out.stop = r;
                         return out;
                     }
-                }
             }
         }
         if snap_stop {
@@ -823,6 +824,7 @@ where
 /// 1. `B` = `≤ line_a` 中「栈清空边界」与「入口栈快照」较靠后的一者（[`pick_start`]）；
 ///    快照起点还原真态重扫、无需等栈空 → 根治「栈永不清空」文档的包络退化（⑦）；
 /// 2. 在「受影响包络 `[B, stop)`」上局部重扫：`stop` = 首个 `≥ min_stop` 的**空栈边界**
+///
 ///   或首个「新态 == 旧态」的**快照汇聚点**（⑦：栈影响已消解 → 尾部平移与整篇等价），
 ///    未命中则扫到文末；
 /// 3. 合并（快照起点下存在「开在 B 前、闭/end 在包络内或尾段」的跨包络项，由

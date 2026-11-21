@@ -6,6 +6,9 @@
 //! 三层合成（底图封面/中清/缩略 → 瓦片 → 选区/检索高亮）。选区与检索命中高亮的纯几何
 //! 叠加函数（`selection_overlays_for_page` / `search_overlays_for_page`）亦在本模块。
 
+// 页渲染内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use super::*;
 use gpui::StyledImage as _;
 use gpui::prelude::FluentBuilder as _;
@@ -169,6 +172,7 @@ fn image_select_frame_overlay_for_page(
 /// - 高亮（Highlight）= 半透明黄整块填充 quad；
 /// - 删除线（Strikeout）= 穿过 quad 垂直中心的细红条；
 /// - 下划线（Underline）= 贴 quad 底缘的细蓝条。
+///
 /// 每条注释可多 quad（跨行选区）。quads 为 PDF 点（y up），经 `pt_to_local` 转卡片局部，
 /// 与选区高亮/瓦片逐像素对齐（同一套几何管道）。
 fn pending_annot_overlays_for_page(
@@ -347,6 +351,7 @@ fn search_overlays_for_page(
 /// - **瓦片整组就位**（`group_complete`，可见矩形 + `TILE_MARGIN` 每格都在槽，见
 ///   [`crate::pdf::layout::tile_range_all_in_slot`]）→ 允许：新密度内容对「已有旧底」的页
 ///   **整页一次换**（旧状 → 整页 sharp 一次跳变，R2 原子换）。
+///
 /// 三者全不满足（底图为旧/低密度 `prev_cover`/`prefetch`/`mid`/`thumb`，瓦片只部分到达）→
 /// **禁止**绘制任何部分瓦片：整页统一显示旧底拉伸（**宁糊不混**），块状混叠从根上杜绝。
 pub(crate) fn tiles_layer_allowed(cover_now: bool, base: bool, group_complete: bool) -> bool {
@@ -1101,8 +1106,8 @@ impl PdfViewer {
                 vh_fit,
                 self.dims.len(),
                 RENDER_BUF_ROWS,
-            ) {
-                if start <= end {
+            )
+                && start <= end {
                     // 预取可见页文本层/图片盒（与连续阅读同节奏懒加载）。
                     if !self.prev_fast {
                         self.prefetch_texts(start, end);
@@ -1135,7 +1140,6 @@ impl PdfViewer {
                         Some(&layout),
                     );
                 }
-            }
         }
 
         let content = div()
@@ -1391,6 +1395,7 @@ impl PdfViewer {
     /// - **普通**左键点卡（无修饰键）= 维持 wave3：退出网格 + `scroll_to_page`（不改选中态）；
     /// - **Ctrl**+左键点卡 = 切换选中态（不退出网格）；
     /// - **Shift**+左键点卡 = 范围选中（锚点→当前闭区间加入选中集，其它保持；不退出网格）；
+///
     /// 选中态视觉 = 强调色边框 + 全卡强调淡底 + 左上角「✓ 计数」角标（`pdf-grid-badge-<i>`，
     /// 测试经 `debug_bounds` 断言有无）。
     /// wave6：按下不再即时触发勾选/跳页（改记 `grid_press` 待决单击，松手未拖拽才消费——
@@ -1558,7 +1563,7 @@ impl PdfViewer {
                     GridDragData { page: i },
                     move |_value: &GridDragData, _offset, _window, cx| {
                         if let Some(w) = weak.upgrade() {
-                            let _ = w.update(cx, |this, _cx| {
+                            w.update(cx, |this, _cx| {
                                 this.grid_drag_begin(_value.page);
                             });
                         }

@@ -323,7 +323,7 @@ impl super::ImageViewer {
             intrinsic: (w as f32, h as f32),
             bytes,
             denom,
-            gif: (per_frame.len() > 1).then(|| (per_frame, delays)),
+            gif: (per_frame.len() > 1).then_some((per_frame, delays)),
         })
     }
 

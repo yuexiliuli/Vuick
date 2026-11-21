@@ -111,7 +111,7 @@ impl CodeEditor {
                 let Some(ed) = weak_ed.upgrade() else {
                     return;
                 };
-                let _ = ed.update(cx, |ed, cx| match ev {
+                ed.update(cx, |ed, cx| match ev {
                     ui::input::InputEvent::Change => {
                         let q = input_entity.read(cx).value().to_string();
                         ed.find_query_changed(q, cx);
@@ -401,7 +401,7 @@ impl CodeEditor {
                 let Some(ed) = weak_ed.upgrade() else {
                     return;
                 };
-                let _ = ed.update(cx, |ed, cx| match ev {
+                ed.update(cx, |ed, cx| match ev {
                     ui::input::InputEvent::Change => {
                         let q = input_entity.read(cx).value().to_string();
                         ed.goto_input_changed(q, cx);

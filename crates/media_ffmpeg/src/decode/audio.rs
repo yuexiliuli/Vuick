@@ -241,8 +241,8 @@ impl AudioReader {
                     let d = self.resampler.output();
                     let in_rate = decoded.rate().max(1);
                     let in_nb = decoded.samples() as u64;
-                    let out_nb = ((in_nb * u64::from(d.rate) + u64::from(in_rate) - 1)
-                        / u64::from(in_rate)) as usize
+                    let out_nb = (in_nb * u64::from(d.rate))
+                        .div_ceil(u64::from(in_rate)) as usize
                         + 64;
                     self.ensure_resample_capacity(out_nb);
                     let out_frame = self.resample_out.as_deref_mut().expect("已确保容量");
@@ -451,8 +451,8 @@ impl AudioReader {
                 let d = self.resampler.output();
                 let in_rate = decoded.rate().max(1);
                 let in_nb = decoded.samples() as u64;
-                let out_nb = ((in_nb * u64::from(d.rate) + u64::from(in_rate) - 1)
-                    / u64::from(in_rate)) as usize
+                let out_nb = (in_nb * u64::from(d.rate))
+                    .div_ceil(u64::from(in_rate)) as usize
                     + 64;
                 self.ensure_resample_capacity(out_nb);
                 let out_frame = self.resample_out.as_deref_mut().expect("已确保容量");
@@ -468,7 +468,7 @@ impl AudioReader {
                     ));
                 }
                 if n > 0 {
-                    out[..n].copy_from_slice(&out_frame.plane::<f32>(0));
+                    out[..n].copy_from_slice(out_frame.plane::<f32>(0));
                     return Ok(Some((pts, n)));
                 }
             }

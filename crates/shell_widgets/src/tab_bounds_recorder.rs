@@ -69,7 +69,7 @@ impl gpui::Element for TabBoundsRecorder {
             self.bounds.set(bounds);
         }
         self.child.prepaint(window, cx);
-        ()
+        
     }
 
     fn paint(

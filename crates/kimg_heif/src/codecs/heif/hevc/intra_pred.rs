@@ -184,8 +184,7 @@ impl IntraPred {
             let mut used_simd_fill = false;
             #[cfg(target_arch = "x86_64")]
             {
-                if n >= 8
-                    && n <= 32
+                if (8..=32).contains(&n)
                     && !dc_force_scalar()
                     && kimg_core::simd::detect("avx2")
                 {
@@ -222,8 +221,7 @@ impl IntraPred {
         // n∈{8,16,32} 且检出 AVX2 → 向量核（8-lane 滑动窗口插值 + horizontal 转置）；
         // n==4 / 无 AVX2 / A/B 开关强制 → 标量。两路逐位一致（golden 守 C# 分层等价）。
         #[cfg(target_arch = "x86_64")]
-        let angular_simd = n >= 8
-            && n <= 32
+        let angular_simd = (8..=32).contains(&n)
             && !angular_force_scalar()
             && kimg_core::simd::detect("avx2")
             && kimg_core::simd::detect("sse4.1");

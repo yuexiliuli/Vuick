@@ -10,6 +10,7 @@
 //!   - [`tiles`]：worker 栅格化调度 / 瓦片与占位缓存 / 内存预算
 //!   - [`search`]：页文本层懒加载缓存 + P3 全文检索
 //!   - [`render`]：上屏渲染（页列 DOM 虚拟化 + 选区/检索高亮叠加）
+//!
 //!   根 `view.rs` 保留骨架：`PdfViewer` 结构体、`WindowSig` 帧门控签名、
 //!   通用 helper（`timing_view` / `collect_finished`）与测试块。
 //!
@@ -45,6 +46,9 @@
 
 // 根文件保持完整导入：`view/` 各子模块 `use super::*` 共享此处全部外部项，
 // 本文件未直接消费的导入（已迁往子模块的职责）由 allow 放行，不做裁剪。
+// PDF 视图状态树类型较长 → 放行
+#![allow(clippy::type_complexity)]
+
 #![allow(unused_imports)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -230,11 +234,10 @@ fn paged_jump_cover_window(
     let zoom = zoom.max(0.01);
     let scroll_y_fit = -(scroll_y.max(0.0) / zoom);
     let vh_fit = viewport_h / zoom;
-    if let Some((s, e)) = paged_render_window(layout, scroll_y_fit, vh_fit, n, 0) {
-        if s <= target && target <= e {
+    if let Some((s, e)) = paged_render_window(layout, scroll_y_fit, vh_fit, n, 0)
+        && s <= target && target <= e {
             return Some((s, e));
         }
-    }
     // 退化为目标页所在行的行页区间（首页/末页由 `row_page_start` 区间 + `min(n−1)` 兜底夹回，
     // 尾部半行自动只剩该行实际页数）。
     let cols = layout.cols.max(1);
@@ -338,6 +341,7 @@ pub(crate) const GRID_PADDING: f32 = 16.0;
 /// 动态钳到 `[GRID_MAX_COLS, GRID_MIN_COLS]` 列：
 /// - `GRID_MAX_COLS` = 放大上限的**最少**列数（2：最大只能放大到 2 列，不可能到 1 列）；
 /// - `GRID_MIN_COLS` = 缩小下限的**最多**列数（9：最大只能缩小到 9 列，不可能到 10+ 列）。
+///
 /// 任意钳内 `grid_zoom` ⇒ 恒有 `GRID_MAX_COLS ≤ cols ≤ GRID_MIN_COLS`（推导见该函数注释）。
 pub(crate) const GRID_MAX_COLS: f32 = 2.0;
 pub(crate) const GRID_MIN_COLS: f32 = 9.0;
@@ -474,6 +478,7 @@ pub(crate) struct GridDrag {
 /// - 线性位 = `row_page_start[r] + clamp(col_slot, 0, row_len)`；**垂直行间 gap**（y 在行底
 ///   `row_top[r+1] − gap` 之下、非末行）→ 直接 = `row_page_start[r+1]`（本行末 = 下一行首，
 ///   同一线性位）。列槽越行尾 → 行内最后（下一行首 / 整档末尾）。
+///
 /// 手写算式样例见测试 [`tests::compute_insert_index_hand_cases`]（K177：期望值先演算后落）。
 pub(crate) fn compute_insert_index(layout: &GridLayout, vw: f32, x: f32, y: f32) -> Option<usize> {
     let n = layout.row_page_start.last().copied().unwrap_or(0);
@@ -546,6 +551,7 @@ pub(crate) struct GridThumb {
 /// 阅读页排模式（状态层打桩：本切片**只存状态**，渲染三路分派/滚动锚点恢复由后续切片接）：
 /// - [`Continuous`]：连续滚动（单列全文，默认）
 /// - [`Facing`]：双页对开（一次两页）
+///
 /// 与网格总览（[`PdfViewer::grid_mode`]）**正交**：网格进出保留本值，`set_grid_mode`
 /// 不改 page_mode（网格只是一时总览，读写它不清阅读页排模式）。分页态 = Facing
 /// （历史 Single 单页模式已删除，`page_mode != Continuous` 即分页的判断式不变）。

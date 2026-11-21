@@ -64,7 +64,7 @@ pub(crate) const ADAM7_PASSES: [(usize, usize, usize, usize); 7] = [
 #[inline]
 pub(crate) fn pass_extent(size: usize, start: usize, step: usize) -> usize {
     if size > start {
-        (size - start + step - 1) / step
+        (size - start).div_ceil(step)
     } else {
         0
     }
@@ -192,7 +192,7 @@ pub(crate) fn parse_png(data: &[u8]) -> ImageResult<FileHeader> {
                 break;
             }
             b"PLTE" => {
-                if len == 0 || len % 3 != 0 {
+                if len == 0 || !len.is_multiple_of(3) {
                     return Err(err_decode(format!(
                         "PLTE 长度必须为正且为 3 的倍数，实际 {len}"
                     )));
@@ -344,7 +344,7 @@ pub(crate) fn inflated_size(
     }
     .samples_per_pixel();
     let bits_per_pixel = samples * bit_depth as usize;
-    let row_bytes_for = |w: usize| -> u64 { ((w as u64 * bits_per_pixel as u64) + 7) / 8 };
+    let row_bytes_for = |w: usize| -> u64 { (w as u64 * bits_per_pixel as u64).div_ceil(8) };
     // 恶意头（如 max×max）会让「每行字节数 × 行数」溢出 u64；此处饱和到 u64::MAX，
     // 后续防炸弹比例检查（`inflated_size > compressed*1032`）必然命中拒绝——不许 panic（K：解压炸弹 CHECKED）。
     if !interlaced {

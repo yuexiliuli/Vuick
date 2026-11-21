@@ -98,7 +98,7 @@ impl EditorApp {
         // 阅读进度全量兜底：各选项卡的滚动防抖已在实际读位置持续落盘，这里补一发收口
         // （防抖到点前强杀 / 边界丢失）。
         let host: &dyn AppHost = self;
-        self.model.borrow_mut().save_all_reading_progress(host, &**cx);
+        self.model.borrow_mut().save_all_reading_progress(host, cx);
     }
 
     /// 启动恢复入口（`new_impl` 里无 CLI 首参时调用）：开关开启且清单存在且有效才恢复。
@@ -242,7 +242,7 @@ impl EditorApp {
     /// 编排逻辑在 `AppModel::persist_session`（shell_core::actions）；此处 glue 转发。
     pub(super) fn persist_session(&mut self, cx: &mut Context<Self>) {
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().persist_session(host, &mut **cx);
+        self.model.borrow_mut().persist_session(host, cx);
     }
 
     /// 安排一次会话持久化：结构变化 `immediate=true` 立即写盘；内容变化 `false` 走
@@ -290,7 +290,7 @@ impl EditorApp {
             self.rp_last = None;
             return;
         }
-        let app: &gpui::App = &**cx;
+        let app: &gpui::App = cx;
         let cur = {
             let m = self.model.borrow();
             let idx = m.active_tab;
@@ -323,7 +323,7 @@ impl EditorApp {
     /// 防抖 300ms 后把已存档真实进度覆写成瞬时位置（0），永久丢失。播种后首帧比对相等
     /// 不落盘；其后真实滚动变化仍按既有防抖落盘。
     fn seed_reading_progress_sentinel(&mut self, cx: &mut Context<Self>) {
-        let app: &gpui::App = &**cx;
+        let app: &gpui::App = cx;
         let cur = {
             let m = self.model.borrow();
             let idx = m.active_tab;
@@ -333,7 +333,7 @@ impl EditorApp {
         // 诊断：恢复完成点的哨兵播种（open-recent 路径不播种 → 无此行，可对照）。
         shell_core::rp_diag::diag(
             "seed",
-            &format!("{}", shell_core::rp_diag::pos_value(&self.rp_last)),
+            &shell_core::rp_diag::pos_value(&self.rp_last).to_string(),
         );
     }
 
@@ -367,7 +367,7 @@ impl EditorApp {
     fn flush_reading_progress(&mut self, cx: &mut Context<Self>) {
         let idx = self.model.borrow().active_tab;
         let host: &dyn AppHost = &*self;
-        self.model.borrow_mut().save_reading_progress(host, idx, &**cx);
+        self.model.borrow_mut().save_reading_progress(host, idx, cx);
     }
 
     /// 「记住阅读进度」开关：翻转 + 立即持久化（不等退出）。关 → 顺带把「恢复期/防抖

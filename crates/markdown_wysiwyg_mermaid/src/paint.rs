@@ -5,6 +5,9 @@
 //! 绘制原语：`paint_quad`（圆角矩形/卡片）、`PathBuilder::fill/stroke`（多边形节点、
 //! 椭圆近似）、虚线用短线段仿制（GPUI 无 native dashed path）。
 
+// mermaid 绘制状态类型较长 → 放行
+#![allow(clippy::type_complexity)]
+
 use super::{MmEdgeKind, MmFlowLayout, MmLayout, MmPlaced, MmSeqArrow, MmSeqColumn, MmSeqFragmentKind, MmSeqLayout, MmSeqNotePos, MmSeqRow, MmShape, SEQ_NOTE_H, ARROW_LEN_PX, arrow_base};
 use crate::MmTheme;
 use gpui::{App, Bounds, Corners, Edges, Hsla, PathBuilder, Pixels, Point, SharedString, TextRun, Window, point, px};

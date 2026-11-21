@@ -387,9 +387,7 @@ impl AppModel {
     /// 经 `model.borrow().tab_reading_position(idx, &*cx)` 复用同一读数。
     pub fn tab_reading_position(&self, idx: usize, cx: &App) -> Option<ReadingProgress> {
         let tab = self.tabs.get(idx)?;
-        if tab.payload.file_path.is_none() {
-            return None; // 未命名选项卡不记进度
-        }
+        tab.payload.file_path.as_ref()?;
         // PDF：页 + 页内比例 + 缩放（阅读器自算）。
         if let MediaReader::Pdf(pv) = &tab.payload.reader {
             let (page, frac, zoom) = pv.read(cx).reading_progress()?;
@@ -497,7 +495,7 @@ impl AppModel {
         self.session_slot_hashes.retain(|slot, _| {
             slot.strip_prefix('t')
                 .and_then(|s| s.parse::<usize>().ok())
-                .map_or(false, |n| n < n_slots)
+                .is_some_and(|n| n < n_slots)
         });
         // 清单是"本次会话可恢复"的原子信号，但写它恰是切选项卡/新建时最贵的原语
         // （本机防病毒下原子写 ~5-25ms）。清单未变（`new_tab` 紧随 `make_tab` 的二次

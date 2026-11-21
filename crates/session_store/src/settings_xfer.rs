@@ -74,6 +74,8 @@ pub fn build_export_bundle(
 /// 校验并解析导出包：JSON 损坏 / 非对象 / 魔力头不符 / 版本不符 → `Err`（调用方必须
 /// 零副作用 toast「不是有效…」）；合法 → prefs（`"prefs"` 须为对象，否则 `None`）、
 /// session（`"session"` 须为含 `"manifest"` 对象的对象，否则 `None`）。
+/// 错误面仅「无效/损坏」一种，`()` 即可表达；保持内部简单 → 放行。
+#[allow(clippy::result_unit_err)]
 pub fn parse_export_bundle(text: &str) -> Result<ParsedExportBundle, ()> {
     // 总量闸：整个导入包（prefs + 会话清单 + 槽位合计）字节数超上限 → 解析期直接拒。
     // 必须放在 serde_json::from_str 物化 Value **之前**按原始字节长度判断——恶意/退化
@@ -121,14 +123,13 @@ pub fn parse_export_bundle(text: &str) -> Result<ParsedExportBundle, ()> {
     // （同 [`crate::write_imported_session`] 的「拒整个会话、零写入」语义）。与总量闸双保险：
     // 总量闸挡「整包超限」，本条挡「总量未超但单槽超限 / 海量小键绕过」的把关，均不改
     // JSON 结构语义（非字符串槽位值仍按既有的 filter_map 跳过）。
-    if let Some((_, slots)) = &session {
-        if slots
+    if let Some((_, slots)) = &session
+        && slots
             .iter()
             .any(|(_, content)| content.len() > crate::MAX_IMPORT_SLOT_BYTES)
         {
             return Err(());
         }
-    }
     Ok(ParsedExportBundle { prefs, session_present, session })
 }
 

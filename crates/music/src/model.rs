@@ -67,8 +67,7 @@ pub fn parse_lrc(content: &str) -> Option<Lyrics> {
         }
         let mut rest = line;
         let mut times: Vec<i64> = Vec::new();
-        loop {
-            let Some(closed) = rest.find(']') else { break };
+        while let Some(closed) = rest.find(']') {
             if !rest.starts_with('[') {
                 break;
             }
@@ -76,11 +75,10 @@ pub fn parse_lrc(content: &str) -> Option<Lyrics> {
             rest = &rest[closed + 1..];
             if let Some(ms) = parse_lrc_time(tag) {
                 times.push(ms);
-            } else if let Some(o) = tag.strip_prefix("offset:") {
-                if let Ok(v) = o.trim().parse::<i64>() {
+            } else if let Some(o) = tag.strip_prefix("offset:")
+                && let Ok(v) = o.trim().parse::<i64>() {
                     offset = v;
                 }
-            }
             // 其它 [..] 元数据标签（ti:/ar:/al:）直接忽略
         }
         let text = rest.trim().to_string();

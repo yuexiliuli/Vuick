@@ -6,6 +6,9 @@
 //! 原 `editor.update(cx, |e,_| e.set_*())` → 直接经 `rd` 内写，语义逐字保持：`images_gen`/
 //! `math_gen` 自增 → 下帧整帧重建）。纯图元函数（`paint_text_row` 等）保留原签名随迁。
 
+// 绘制内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
@@ -1196,6 +1199,7 @@ pub fn paint_selection(
 
 /// 表格选区高亮矩形的 x（**元素局部**，未含 `origin.x`）：内容左缘 = 帧内衬 `padding`
 /// + 行 `x_off`（引号内表格缩进）+ 单元格列起点 + 格内文本缩进 + 选区字形偏移 − 水平
+///
 /// 滚动偏移。与 `paint_table_row`/`hit.rs` 的表格内容左缘口径一致——修复前缺 `x_off`，
 /// 引号内表格选区整体左偏 15px 且盖引号竖条（P1-11）。
 fn table_selection_hl_x(

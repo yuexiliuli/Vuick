@@ -665,7 +665,7 @@ impl WyEditor {
     fn confine_to_base(base: &std::path::Path, p: std::path::PathBuf) -> String {
         let joined = if p.is_absolute() { p } else { base.join(p) };
         let norm = Self::lex_normalize_path(joined);
-        if norm.starts_with(&Self::lex_normalize_path(base.to_path_buf())) {
+        if norm.starts_with(Self::lex_normalize_path(base.to_path_buf())) {
             norm.to_string_lossy().to_string()
         } else {
             base.to_string_lossy().to_string()
@@ -775,6 +775,10 @@ impl WyEditor {
     /// 全文字节长（O(1)，rope 单真源）。
     pub fn len(&self) -> usize {
         self.doc.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.doc.is_empty()
     }
 
     /// 直接放置光标（源字节偏移）。命中/测试/编程式定位共用。

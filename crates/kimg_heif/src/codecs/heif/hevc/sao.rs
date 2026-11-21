@@ -12,6 +12,8 @@
 
 #![forbid(unsafe_code)]
 
+// SAO/DBF 内核逐游标传参，具名构参可读性反而变差 → 放行。
+#![allow(clippy::too_many_arguments)]
 use crate::codecs::heif::error::{HeifError, HeifResult};
 
 /// SAO 行内核向量化的同窗口 A/B 开关（K93）：`KIMG_HEIF_SAO_NO_SIMD=1` 强制走标量基线路，

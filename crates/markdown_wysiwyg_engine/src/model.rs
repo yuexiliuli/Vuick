@@ -62,6 +62,10 @@ impl PrebuildPass1 {
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
 }
 
 /// 单个块的预建估算输入（≈32B/块；160k 块 ≈ 5MB，仅跨一次后台 spawn 后即转
@@ -152,6 +156,12 @@ pub struct HScrollState {
     pub code: HScrollBucket,
     pub table: HScrollBucket,
     pub math: HScrollBucket,
+}
+
+impl Default for HScrollState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HScrollState {

@@ -4,6 +4,7 @@
 //!   + 「热门歌曲」表格；
 //! - Library：按艺术家分组的歌曲列表（组头 + 行）；
 //! - Liked：只列已收藏歌曲。
+//!
 //! 搜索框：ASCII 可打印键直接落文本（`key_char`），中文走 IME（view 的
 //! `EntityInputHandler`）：当前简化实现支持即输即滤。
 //!
@@ -13,6 +14,9 @@
 //! 滚动容器 `track_scroll(&main_scroll)` 按偏移二分反查可视行窗（±缓冲行）只物化可见项，
 //! 上下定高垫片保持内容总高 = 总高（滚轮全范围可滚）。组头/行高固定（[`GROUP_H`]/[`ROW_H`]）
 //! 是前缀反查的前提。曲库越大收益越大（首行窗正确、点击行下标映射不漂移）。
+
+// 音乐主视图状态类型较长 → 放行
+#![allow(clippy::type_complexity)]
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -855,11 +859,10 @@ impl super::MusicView {
         let q = self.state.search.clone();
         let key = (section, q);
         let mutation = self.player.read(cx).mutation();
-        if let Some((rev, cached)) = self.main_list_cache.get(&key) {
-            if *rev == mutation {
+        if let Some((rev, cached)) = self.main_list_cache.get(&key)
+            && *rev == mutation {
                 return cached.clone();
             }
-        }
         let list = {
             let p = self.player.read(cx);
             let liked = if section == MainSection::Liked {
@@ -900,7 +903,7 @@ impl super::MusicView {
                     .when(h == "歌曲", |d| d.flex_grow(2.0).flex_basis(px(0.)))
                     .when(h == "专辑", |d| d.flex_grow(1.0).flex_basis(px(0.)))
                     .when(h == "时长", |d| d.w(px(56.)).text_align(gpui::TextAlign::Right))
-                    .when(h == "", |d| d.w(px(40.)).text_align(gpui::TextAlign::Center))
+                    .when(h.is_empty(), |d| d.w(px(40.)).text_align(gpui::TextAlign::Center))
                     .child(h.to_string())
                     .into_any_element()
             }))

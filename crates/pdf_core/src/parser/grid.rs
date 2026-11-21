@@ -4,6 +4,7 @@
 //!
 //! 与阅读器 THUMB/MID/raw/cover 缓存**完全隔离**：独立预算 LRU（config::pdf::GRID_CACHE_BYTES）
 //! + 背景信道调度（优先级 ≤ Thumb，见 enqueue_msg 与 run 循环 grid_q 段）→ 网格模式绝不
+//!
 //! 抢/不逐出阅读器驻留。产物与 Thumb 同构（RenderResult，view 直接可画、按页落槽）。
 //!
 //! 跨簇可见性（模块重组）：根 `run` 读写 [`GridPrewarm`] / [`GridEntry`] 字段并调用
@@ -154,6 +155,7 @@ fn grid_cache_budget(cache: &[GridEntry], page_count: u64, cur_bytes: u64) -> u6
 /// - `target_px` = 目标像素宽（= 目标卡宽逻辑 px × DPI，调用方先乘好）。
 /// - 先量化分桶，命中独立缓存 → 直接回（**不重栅**、只 bump LRU 时间戳）；未命中 →
 ///   复用 [`render_page`] 姿势按 `bucket_px / 页宽` 缩放渲染（不同页纵横比 → 高按比例），
+///
 /// 产物为与 Thumb 同类型的 `RenderResult`（着色出口 = `RawKind::Thumb` 语义：**不入 raw
 ///   缓存**、仅 CPU 模式应用当前重着色；GPU 门控直传 raw/luma、着色在绘制时现算），
 ///   随后入独立网格缓存（预算 LRU，切档已清整文档）。

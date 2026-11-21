@@ -85,11 +85,7 @@ fn ctrl_button(window: &mut Window, cx: &mut App, kind: Ctl) -> AnyElement {
     // 图标注入色：空闲次要灰 → hover/按压 主前景（关闭钮白 ×，红底白 ×，同 shell
     // `title_ctrl_fg`；注意 IconView/ui 显式 `text_color` 会覆盖父级级联，必须在分支里定）。
     let icon_color = if hovered || pressed {
-        if kind.is_close() {
-            theme::text()
-        } else {
-            theme::text()
-        }
+        theme::text()
     } else {
         theme::text2()
     };

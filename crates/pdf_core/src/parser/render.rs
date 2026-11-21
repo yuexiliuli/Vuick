@@ -7,6 +7,9 @@
 //! `timing`（Open 计时）→ 以上升 `pub(crate)`；`render_page` 亦被 `grid::render_grid` 复用。
 //! `RawEntry`/`cache_raw`/`raw_cache_budget`（`cache` 簇）与交换数据型（`types` 簇）经根重导出。
 
+// 渲染内核逐参数传参 → 放行
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
 
@@ -338,8 +341,8 @@ pub(crate) fn render_tile(
         req.col,
         x0,
         y0,
-        w as u32,
-        h as u32,
+        w,
+        h,
         bmp.0,
         bmp.1,
         req.scale,

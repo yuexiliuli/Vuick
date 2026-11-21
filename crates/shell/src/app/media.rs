@@ -73,7 +73,7 @@ impl EditorApp {
             move |menu, _window, _cx| menu.item(shell_media::media::lock_menu_item(media.clone())),
             |this, emitter, cx| {
                 // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
-                if this.media_lock_menu.entity.as_ref() == Some(&emitter) {
+                if this.media_lock_menu.entity.as_ref() == Some(emitter) {
                     this.media_lock_menu.clear();
                 }
                 cx.notify();

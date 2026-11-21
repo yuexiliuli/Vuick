@@ -12,6 +12,7 @@
 //! **导入安全（K42 输入安全清单）**：[`write_imported_session`] 是导入包的**唯一下盘口**，
 //! 写任何槽位前先整体预检——每个槽位名过 [`safe_slot_name`]（防路径穿越 / 越界任意写盘）
 //! + 正文大小上限 [`MAX_IMPORT_SLOT_BYTES`]；清单引用的槽位名同样受检。任一不合格 →
+//!
 //! 整体拒绝、零写入（不留半个会话）。
 
 use std::collections::HashSet;
@@ -174,11 +175,10 @@ pub fn read_slot(dir: &Path, slot: &str) -> Option<String> {
 pub fn clear_session(dir: &Path) -> bool {
     if let Some(m) = read_manifest(dir) {
         for tab in &m.tabs {
-            if let SessionTab::New { slot, .. } = tab {
-                if safe_slot_name(slot) {
+            if let SessionTab::New { slot, .. } = tab
+                && safe_slot_name(slot) {
                     let _ = fs::remove_file(slot_path(dir, slot));
                 }
-            }
         }
     }
     let _ = fs::remove_file(manifest_path(dir));
