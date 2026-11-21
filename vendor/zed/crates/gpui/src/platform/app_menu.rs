@@ -1,3 +1,5 @@
+#![allow(clippy::single_match)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{Action, App, Platform, SharedString};
 
 /// A menu of the application, either a main menu or a submenu

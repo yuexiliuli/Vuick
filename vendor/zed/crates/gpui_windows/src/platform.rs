@@ -2,6 +2,8 @@
 // (https://github.com/zed-industries/zed, rev 93d7456). See vendor/zed/README.md
 // for the per-crate change list. License: Apache-2.0 (see vendor/zed/LICENSE-APACHE).
 
+#![allow(clippy::type_complexity, clippy::collapsible_if, clippy::redundant_pattern_matching, clippy::needless_borrow)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use std::{
     cell::{Cell, RefCell},
     ffi::{OsStr, OsString},

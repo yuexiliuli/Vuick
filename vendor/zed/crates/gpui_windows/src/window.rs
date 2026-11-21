@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::type_complexity, clippy::too_many_arguments, clippy::let_unit_value, clippy::field_reassign_with_default, clippy::upper_case_acronyms, clippy::nonminimal_bool, clippy::needless_return)] // vendored zed 上游原样，压 style 告警，不改逻辑
 
 use std::{
     cell::{Cell, RefCell},

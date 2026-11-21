@@ -3,6 +3,7 @@
 #![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
 #![allow(clippy::collapsible_else_if)] // False positives in platform specific code
 #![allow(unused_mut)] // False positives in platform specific code
+#![allow(clippy::new_ret_no_self)] // vendored zed 上游原样，压 style 告警，不改逻辑
 
 extern crate self as gpui;
 #[macro_use]

@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{Instant, Priority, RunnableMeta, Scheduler, SessionId, Timer};
 use async_task::Runnable;
 use std::{

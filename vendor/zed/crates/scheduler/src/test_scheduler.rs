@@ -1,3 +1,5 @@
+#![allow(clippy::nonminimal_bool, clippy::unnecessary_map_or)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{
     BackgroundExecutor, Clock, Instant, LocalExecutor, Priority, RunnableMeta, Scheduler,
     SessionId, Task, TestClock, Timer,

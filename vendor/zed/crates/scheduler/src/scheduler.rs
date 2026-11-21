@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 mod clock;
 mod executor;
 mod test_scheduler;

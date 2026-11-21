@@ -1,3 +1,5 @@
+#![allow(clippy::new_without_default, clippy::collapsible_if)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 mod app_menu;
 mod keyboard;
 mod keystroke;

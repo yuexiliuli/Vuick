@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::too_many_arguments, clippy::if_same_then_else)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 //! Div is the central, reusable element that most GPUI trees will be built from.
 //! It functions as a container for other elements, and provides a number of
 //! useful features for laying out and styling its children as well as binding

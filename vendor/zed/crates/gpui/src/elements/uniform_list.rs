@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 //! A scrollable list of elements with uniform height, optimized for large lists.
 //! Rather than use the full taffy layout system, uniform_list simply measures
 //! the first element and then lays out all remaining elements in a line based on that

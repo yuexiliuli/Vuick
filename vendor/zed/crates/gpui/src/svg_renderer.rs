@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{
     AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,

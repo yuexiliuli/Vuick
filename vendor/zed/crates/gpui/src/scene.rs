@@ -4,6 +4,7 @@
 
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
+#![allow(clippy::len_without_is_empty)] // vendored zed 上游原样，压 style 告警，不改逻辑
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

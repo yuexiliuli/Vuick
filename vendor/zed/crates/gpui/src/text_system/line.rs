@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
     SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,

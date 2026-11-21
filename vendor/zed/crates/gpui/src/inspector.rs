@@ -1,3 +1,5 @@
+#![allow(clippy::from_over_into)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 /// A unique identifier for an element that can be inspected.
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct InspectorElementId {

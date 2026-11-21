@@ -24,3 +24,10 @@ test-support = ["proptest"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+ctor = { workspace = true }
+rand = { workspace = true }
+proptest = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

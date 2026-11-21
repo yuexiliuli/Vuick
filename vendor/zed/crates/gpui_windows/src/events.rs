@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::needless_else, clippy::needless_borrow)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
 
 use anyhow::Context as _;

@@ -1,3 +1,5 @@
+#![allow(clippy::needless_borrow, clippy::question_mark)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use std::fmt::Debug;
 
 use ::sum_tree::SumTree;

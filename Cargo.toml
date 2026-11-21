@@ -210,6 +210,7 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 ctor = "1.0.12"
 derive_more = { version = "2.1", features = ["deref", "deref_mut", "from_str"] }
 dunce = "1.0"
+env_logger = "0.11"
 etagere = "0.2"
 flume = { version = "0.12", default-features = false, features = ["async"] }
 futures-concurrency = "7.7.1"

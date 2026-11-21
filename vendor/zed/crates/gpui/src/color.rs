@@ -1,3 +1,5 @@
+#![allow(clippy::excessive_precision)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use anyhow::{Context as _, bail};
 use schemars::{JsonSchema, json_schema};
 use serde::{

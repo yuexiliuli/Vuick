@@ -1,3 +1,5 @@
+#![allow(clippy::redundant_closure)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{PlatformDispatcher, RunnableMeta};
 use async_task::Runnable;
 use chrono::{DateTime, Utc};

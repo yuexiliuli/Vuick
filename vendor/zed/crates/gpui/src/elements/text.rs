@@ -1,3 +1,5 @@
+#![allow(clippy::len_without_is_empty)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,

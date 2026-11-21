@@ -1,3 +1,5 @@
+#![allow(clippy::new_without_default)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use std::time::Duration;

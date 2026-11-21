@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity, clippy::needless_borrows_for_generic_args)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use std::{
     collections::HashMap,
     slice,

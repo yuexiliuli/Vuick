@@ -15,6 +15,11 @@ homepage = "https://gpui.rs"
 readme = "README.md"
 keywords = ["desktop", "gui", "immediate"]
 categories = ["gui"]
+# [vuick fork] disabled examples for the vendored self-contained build: upstream
+# gpui ships 49 example binaries whose dev-deps (unicode-segmentation, lyon, etc.)
+# are not vendored, and cargo auto-discovers examples/*.rs even without [[example]].
+# CI checks the library, not the example UIs.
+autoexamples = false
 
 
 [features]
@@ -169,3 +174,7 @@ ignored-paths = ["src/_ownership_and_data_flow.rs"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+gpui_platform = { workspace = true, features = ["font-kit"] }
+env_logger = { workspace = true }

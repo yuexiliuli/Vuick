@@ -1394,7 +1394,7 @@ mod tests {
 
     #[ctor::ctor(unsafe)]
     fn init_logger() {
-        zlog::init_test();
+        env_logger::init();
     }
 
     #[test]

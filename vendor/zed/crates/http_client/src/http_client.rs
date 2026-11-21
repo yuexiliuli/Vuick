@@ -1,3 +1,5 @@
+#![allow(clippy::new_without_default)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 mod async_body;
 #[cfg(not(target_family = "wasm"))]
 pub mod github;

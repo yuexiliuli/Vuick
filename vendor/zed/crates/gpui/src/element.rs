@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::collapsible_if)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 //! Elements are the workhorses of GPUI. They are responsible for laying out and painting all of
 //! the contents of a window. Elements form a tree and are laid out according to the web layout
 //! standards as implemented by [taffy](https://github.com/DioxusLabs/taffy). Most of the time,

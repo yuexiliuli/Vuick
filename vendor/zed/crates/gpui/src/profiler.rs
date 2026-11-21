@@ -1,3 +1,5 @@
+#![allow(clippy::let_and_return)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 #[cfg(feature = "profiler")]
 use hdrhistogram::Histogram;
 use itertools::Itertools;

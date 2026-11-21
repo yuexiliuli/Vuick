@@ -1,3 +1,5 @@
+#![allow(clippy::needless_borrows_for_generic_args)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 mod font_fallbacks;
 mod font_features;
 mod line;

@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 //! A list element that can be used to render a large number of differently sized elements
 //! efficiently. Clients of this API need to ensure that elements outside of the scrolled
 //! area do not change their height for this element to function correctly. If your elements

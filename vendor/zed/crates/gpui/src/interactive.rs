@@ -1,3 +1,5 @@
+#![allow(clippy::match_like_matches_macro)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{
     Bounds, Capslock, Context, Empty, IntoElement, Keystroke, LongPressEvent, Modifiers, Pixels,
     Point, Render, TouchDragEvent, Window, point, seal::Sealed,

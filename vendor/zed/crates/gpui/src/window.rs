@@ -1,3 +1,5 @@
+#![allow(clippy::let_unit_value, clippy::collapsible_if, clippy::len_zero, clippy::too_many_arguments, clippy::unnecessary_map_or)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]

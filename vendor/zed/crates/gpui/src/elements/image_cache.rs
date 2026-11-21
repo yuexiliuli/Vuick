@@ -1,3 +1,5 @@
+#![allow(clippy::mem_replace_with_default)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use crate::{
     AnyElement, AnyEntity, App, AppContext, Asset, AssetLogger, Bounds, Element, ElementId, Entity,
     GlobalElementId, ImageAssetLoader, ImageCacheError, InspectorElementId, IntoElement, LayoutId,

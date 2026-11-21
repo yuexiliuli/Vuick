@@ -1,3 +1,5 @@
+#![allow(clippy::doc_lazy_continuation, clippy::needless_borrow)] // vendored zed 上游原样，压 style 告警，不改逻辑
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
