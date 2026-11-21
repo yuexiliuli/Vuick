@@ -1072,13 +1072,21 @@ impl PdfViewer {
 
     // ---- 网格视图（Grid）缩略图通道（wave3）：独立缓存 + 行带虚拟化调度 ----
 
-    /// 网格模式在途缩略图派发：仅对**可视行带 ±1 行**（与渲染 `grid_visible_range` 同一
-    /// 几何）内「既无**当前桶**就绪图、又无在途」的页派发，每帧上限
-    /// [`config::pdf::GRID_PREFETCH_INFLIGHT`] 枚（背景信道，≤thumb 优先级，不洪起 worker
-    /// 队列、不抢阅读器栅格化带宽）。卡宽 = `grid_card_width()`（derived from `grid_zoom`，
-    /// 独立于阅读缩放；与渲染同一口径；worker 按 [`config::pdf::GRID_BUCKET_PX`] 分桶缓存，
-    /// 同桶复用不重栅）。stale（旧桶）就绪图**不算就绪**——仍照常重派当前桶以替换桥图
-    /// （跨桶缩放保留旧图作桥，见 `reset_grid_dispatch_for_zoom_bucket`；R-D 语义）。
+    /// 网格模式在途缩略图派发：仅对**可视行带 ±[`GRID_ROW_BUFFER`] 行**（与渲染
+    /// `grid_visible_range` 同一几何）内「无**当前桶**就绪图、又无在途」的页派发，带内按
+    /// **距可视中心行距离近优先**（次 key 页下标）排序。**双档分支**（本线低清快速档）：
+    /// - **风暴期**（[`PdfViewer::grid_storm`]）：只对「**完全无图**（无全清/低清/旧桶桥）
+    ///   且不在途」的页派 **Quick**（`grid_quick_target_px` 钳低栅格宽，面积 ↓4× ⇒ pdfium
+    ///   ≈4× 快），预算 [`config::pdf::GRID_QUICK_PREFETCH_INFLIGHT`]/帧——已有任何图
+    ///   （含旧桶桥）的页快滚期不碰；
+    /// - **idle 期**：升级派全清——带内「bucket != 全清桶」的页（含低清图与跨缩放旧桶桥，
+    ///   以及完全无图的页）补派全清，预算 [`config::pdf::GRID_PREFETCH_INFLIGHT`]/帧。
+    /// 升级期间低清/旧桶图保留作桥，Full 到达由 `collect_grid_results` 替换 + `pending_drops`
+    /// 释放（桥语义既有无需改）。卡宽 = `grid_card_width()`（derived from `grid_zoom`）；
+    /// worker 按 [`config::pdf::GRID_BUCKET_PX`] 分桶缓存（
+    /// `grid_bucket_width(卡宽×scale)` 与 worker 渲染宽同口径），同桶复用不重栅。
+    /// stale（旧桶/低清）就绪图**不算当前桶就绪**——idle 期照常重派全清以替换（跨桶缩放
+    /// 保留旧图作桥，见 `reset_grid_dispatch_for_zoom_bucket`；R-D 语义）。
     /// `nav_gen`/`zoom_epoch` 打戳同既有占位请求（L2.2/Z2 enqueue 姿势）。
     pub(super) fn schedule_grid_thumbs(&mut self, window: &Window) {
         if self.dims.is_empty() {
@@ -1097,34 +1105,118 @@ impl PdfViewer {
         );
         let offset = f32::from(-self.grid_scroll.offset().y);
         let Some((start, end)) = grid_visible_range(&layout, offset, vh) else {
+            self.grid_dispatch_order.clear();
             return;
         };
+        // A′ 中心优先派发：带内页按「距可视中心行距离」由近及远（次 key 页下标升序）——
+        // 正在看的那几行先出图；仍受各档每帧预算限量、仅带内（[`grid_visible_range`] 同一
+        // 几何）。镜像阅读侧 `schedule_tiles` 的 `center = (start + end) / 2` + 距中心排序。
+        // 风暴期额外叠加**方向感知超前**（本批杠杆）：派发中心沿滚动方向外移
+        // [`GRID_STORM_AHEAD_ROWS`] 行——下滚（[`PdfViewer::grid_scroll_dir`]=+1）先补下方
+        // 前向大行号页、上滚先补上方前向小行号页，同方向内仍距超前中心近优先；落后方向
+        // 页被排到最后（随风暴再滚出带，由保留窗保活，不占用前向预取预算）。
+        let center = (start + end) / 2;
+        let mut band_pages: Vec<usize> = (start..=end).collect();
+        if self.grid_storm && self.grid_scroll_dir != 0 {
+            let n = self.dims.len().max(1) as isize;
+            let ahead_span = (layout.cols as isize).saturating_mul(GRID_STORM_AHEAD_ROWS as isize);
+            let ahead_center = (center as isize
+                + (self.grid_scroll_dir as isize).saturating_mul(ahead_span))
+            .clamp(0, n - 1) as usize;
+            band_pages.sort_by_key(|&i| (i.abs_diff(ahead_center), i));
+        } else {
+            band_pages.sort_by_key(|&i| (i.abs_diff(center), i));
+        }
+        self.grid_dispatch_order.clear();
+        // 全清/低清两档的 view 侧分桶统一沿用既有口径 `grid_bucket_width(请求卡宽)`（逻辑
+        // 卡宽、scale-blind，与 worker 内部 `卡宽×scale` 的渲染宽解耦——view 侧 bucket 只是
+        // 「当前全清桶 vs 低清/旧桶桥」的判别标签）。低清档传给 worker 的卡宽 `quick_card`：
+        // worker 内部 ×scale 即渲染 `quick_px = grid_quick_target_px(卡宽×scale)`（面积 ↓4×）。
+        let full_card = self.grid_card_width();
+        let full_bucket = grid_bucket_width(full_card);
+        let scale = self.scale_factor.max(1.0);
+        let full_px = full_card * scale;
+        let quick_px = grid_quick_target_px(full_px);
+        let quick_card = quick_px / scale;
+
+        if self.grid_storm {
+            // ⚡ 风暴分支：只补「完全无图」页的低清图（已有任何图的页不碰），预算抬到
+            // GRID_QUICK_PREFETCH_INFLIGHT（低清栅格便宜，快滚期多落几张无洪起风险）。
+            let mut budget = config::pdf::GRID_QUICK_PREFETCH_INFLIGHT;
+            if grid_bucket_width(quick_card) == full_bucket {
+                // 病态小卡宽退化：低清与全清同桶（无收益）→ 直接派全清。正常网格卡宽
+                // ≥150px 不触发（低清 1/2 档落不同桶）；窄视口 9 列缩小档（卡宽 ~62px）
+                // 或极端 target 过小时两档同桶，退化直派全清即可（不 panic，静默降级）。
+                for i in band_pages {
+                    if budget == 0 {
+                        break;
+                    }
+                    if self.pending_grid.contains_key(&i) || self.grid_thumbs.contains_key(&i) {
+                        continue;
+                    }
+                    let rx = worker.request_grid(
+                        self.doc_id,
+                        i,
+                        full_card,
+                        self.scale_factor,
+                        self.nav_gen,
+                        self.zoom_epoch,
+                    );
+                    self.pending_grid.insert(i, (self.nav_gen, full_card, rx));
+                    self.grid_dispatch_order.push(i);
+                    budget -= 1;
+                }
+            } else {
+                for i in band_pages {
+                    if budget == 0 {
+                        break;
+                    }
+                    if self.pending_grid.contains_key(&i) || self.grid_thumbs.contains_key(&i) {
+                        continue;
+                    }
+                    let rx = worker.request_grid(
+                        self.doc_id,
+                        i,
+                        quick_card,
+                        self.scale_factor,
+                        self.nav_gen,
+                        self.zoom_epoch,
+                    );
+                    self.pending_grid.insert(i, (self.nav_gen, quick_card, rx));
+                    self.grid_dispatch_order.push(i);
+                    budget -= 1;
+                }
+            }
+            return;
+        }
+
+        // 🐢 idle 分支：升级派全清——带内「bucket != 全清桶」的页（含低清/旧桶桥）补派，
+        // 已有当前全清桶图 → 复用跳过；预算 GRID_PREFETCH_INFLIGHT、中心优先。
         let mut budget = config::pdf::GRID_PREFETCH_INFLIGHT;
-        let bucket = grid_bucket_width(self.grid_card_width());
-        for i in start..=end {
+        for i in band_pages {
             if budget == 0 {
                 break;
             }
             if self.pending_grid.contains_key(&i) {
                 continue;
             }
-            // 「当前桶」就绪图存在 → 复用跳过（同桶不重取，R-D 之外的事）；旧桶（stale）
-            // 图只作桥回退（渲染照画），**仍要重派**当前桶——跨桶后每个可见页都补一张
-            // 新桶图替换桥（R-D：不因桥存在而跳过 dispatch）。
+            // 「当前全清桶」就绪图存在 → 复用跳过（同桶不重取，R-D 之外的事）；低清/旧桶
+            // 图只作桥回退（渲染照画），**仍要重派**全清替换桥（R-D：不因桥存在而跳过）。
             if let Some(t) = self.grid_thumbs.get(&i) {
-                if t.bucket == bucket {
+                if t.bucket == full_bucket {
                     continue;
                 }
             }
             let rx = worker.request_grid(
                 self.doc_id,
                 i,
-                self.grid_card_width(),
+                full_card,
                 self.scale_factor,
                 self.nav_gen,
                 self.zoom_epoch,
             );
-            self.pending_grid.insert(i, (self.nav_gen, rx));
+            self.pending_grid.insert(i, (self.nav_gen, full_card, rx));
+            self.grid_dispatch_order.push(i);
             budget -= 1;
         }
     }
@@ -1132,37 +1224,68 @@ impl PdfViewer {
     /// 网格在途缩略图回收：worker 回传 BGRA → `grid_thumbs[i]` 入槽（同『缩略图』包装姿势，
     /// `wrap_render_image` 按 `luma` 选 BGRA/R8 路径）。替换旧图时旧纹理经 `pending_drops`
     /// 显式下线。失败（`None`）不拉黑——后续帧预算内自然重派。返回是否有新卡图入槽。
+    /// **按请求分桶打戳**：低清/全清两档在途并存（`pending_grid` 值带**请求时传的卡宽**，
+    /// 既有 view 侧口径 `grid_bucket_width(卡宽)`），不能像旧单档那样按「当前全清桶」统一
+    /// 打戳——低清在途被错标成全清桶会破坏「桥 + idle 升级」语义（R4 修正，本线低清档）。
     pub(super) fn collect_grid_results(&mut self) -> bool {
-        let finished = collect_finished(&mut self.pending_grid, |(_, rx)| rx.try_recv());
-        // 不变式：能留在 `pending_grid` 里的在途请求必属**当前桶**——跨桶缩放会清
-        // `pending_grid`（旧桶在途连同通道一并丢弃，worker 回传 send 静默失败），故收集
-        // 到槽的结果必然是当前分桶栅格，回填时照抄当前桶号（R4）。
-        let bucket = grid_bucket_width(self.grid_card_width());
-        let mut any = false;
-        for (i, res) in finished {
+        // 逐条收集（保留每条在途请求的请求卡宽以按请求分桶）；跨桶缩放清 `pending_grid`
+        // （含低清在途）后 worker 回传 send 静默失败，无泄漏。
+        let mut finished: Vec<(usize, f32, Option<RenderResult>)> = Vec::new();
+        let mut done: Vec<usize> = Vec::new();
+        for (i, (_, req_card, rx)) in self.pending_grid.iter_mut() {
+            if let Ok(res) = rx.try_recv() {
+                finished.push((*i, *req_card, res));
+                done.push(*i);
+            }
+        }
+        for i in done {
             self.pending_grid.remove(&i);
-            match res {
-                Some(res) => {
-                    if let Ok(img) =
-                        crate::pdf::wrap_render_image(res.bgra, res.width, res.height, res.luma)
-                    {
-                        let thumb = GridThumb { bucket, image: img };
-                        if let Some(old) = self.grid_thumbs.insert(i, thumb) {
-                            self.pending_drops.push(old.image);
-                        }
-                        any = true;
-                    }
+        }
+        let mut any = false;
+        for (i, req_card, res) in finished {
+            let Some(res) = res else {
+                continue;
+            };
+            // 字节账（本批「字节账+预算」杠杆）：按位图 w×h×bpp 派生（BGRA 4BPP / luma R8
+            // 1BPP，与 `RenderResult` 同口径），入槽计加、替换/逐出/清空计减（见
+            // `evict_grid_thumbs`/`clear_grid_resources`）。低清档 1/4 面积 → 计账小，
+            // 与全清档并存的桥图也如实计账（全额驻留的真实内存）。
+            let bytes = (res.width as u64)
+                .saturating_mul(res.height as u64)
+                .saturating_mul(if res.luma { 1 } else { 4 });
+            if let Ok(img) = crate::pdf::wrap_render_image(res.bgra, res.width, res.height, res.luma)
+            {
+                let bucket = grid_bucket_width(req_card);
+                let thumb = GridThumb {
+                    bucket,
+                    image: img,
+                    bytes,
+                };
+                if let Some(old) = self.grid_thumbs.insert(i, thumb) {
+                    self.pending_drops.push(old.image);
+                    // 替换旧图（同页桥→新桶/低清→全清）：先减旧后加新，净差 = 新 − 旧。
+                    self.grid_bytes = self.grid_bytes.saturating_sub(old.bytes);
                 }
-                None => {}
+                self.grid_bytes = self.grid_bytes.saturating_add(bytes);
+                any = true;
             }
         }
         any
     }
 
-    /// 网格缩略图淘汰（行带外回收）：保留仅在**可视行带 ±1 行**内的页，带外在途请求连同
-    /// 结果通道一并丢弃（worker 回传 send 静默失败，无泄漏）、就绪卡图转 `pending_drops`
-    /// 下帧 `drop_image` 下线——滚动后旧卡图立即释放，驻留内存随视口收缩（对齐页列瓦片
-    /// 淘汰语义）。无可见带（视口在内容外 / 空文档）→ 全部回收。
+    /// 网格缩略图淘汰（C 保活 + 字节预算双闸）：**可见行带（[`grid_visible_range`]，可见行
+    /// ±[`GRID_ROW_BUFFER`]）钉住不可逐**；带外在**保留窗**（[`grid_keep_range`]，带外再各
+    /// 扩 [`GRID_KEEP_ROWS`] 行，含上一帧带位）内已就绪卡**保留**——滚动把卡带出可视带后
+    /// 不立即释放，回看直接复用（滚回即显、零重载）。超保留窗的陈旧卡按「距可视中心行
+    /// 距离」由远及近逐「最远者」（转 `pending_drops` 下帧 `drop_image` 下线）；带外在途
+    /// 请求：保留窗内**不弃**（滚回即显），超窗连同结果通道一并丢弃（worker 回传 send
+    /// 静默失败，无泄漏）。无可见带（视口在内容外 / 空文档）→ 全部回收。
+    /// **字节预算第二闸（本批「字节账+预算」杠杆）**：`grid_bytes` 超
+    /// [`config::pdf::GRID_VIEW_BUDGET_BYTES`] 时，在保留窗外再按「距可视中心最远」逐出
+    /// **可视带外**的卡直到回落预算内（可视带永不逐）——与保留窗并存语义合并：保留窗先
+    /// 满足「回看零重载」，字节闸只在超大文档/双桶并存的极端驻留下兜底收紧（对 ~87 页
+    /// 夹具与常规网格预算内不触发，保留窗行为不变）。结构上有界：驻留 = 可视带 + 2 行
+    /// 保留窗 + 96MB 字节闸。
     pub(super) fn evict_grid_thumbs(&mut self, window: &Window) {
         if self.dims.is_empty() {
             self.clear_grid_resources();
@@ -1182,28 +1305,60 @@ impl PdfViewer {
             self.clear_grid_resources();
             return;
         };
-        self.pending_grid.retain(|&p, _| p >= start && p <= end);
+        let keep = grid_keep_range(&layout, offset, vh);
+        let Some((k_start, k_end)) = keep else {
+            self.clear_grid_resources();
+            return;
+        };
+        // 保留窗内在途请求不弃（滚回即显，零重载）；超保留窗的在途一并丢弃（结果作废）。
+        self.pending_grid.retain(|&p, _| p >= k_start && p <= k_end);
         if !self.grid_thumbs.is_empty() {
-            let stale: Vec<usize> = self
+            // 闸 1（保留窗）：超保留窗按「距可视中心行距」从远到近逐出（结构性有界）。
+            let center = (start + end) / 2;
+            let mut stale: Vec<usize> = self
                 .grid_thumbs
                 .keys()
                 .copied()
-                .filter(|&p| p < start || p > end)
+                .filter(|&p| p < k_start || p > k_end)
                 .collect();
+            stale.sort_by_key(|&p| std::cmp::Reverse(p.abs_diff(center)));
             for p in stale {
                 if let Some(t) = self.grid_thumbs.remove(&p) {
                     self.pending_drops.push(t.image);
+                    self.grid_bytes = self.grid_bytes.saturating_sub(t.bytes);
+                }
+            }
+            // 闸 2（字节预算）：仍超预算 → 逐「可视带外距中心最远」直到回落预算内。
+            // 可视带内（[start, end]）永逐不出；保留窗当卡在可视带外但预算紧张时也让位
+            // （超大文档才触发；常规文档整本 <96MB，本闸不动作，保留窗语义不受影响）。
+            if self.grid_bytes > config::pdf::GRID_VIEW_BUDGET_BYTES {
+                let mut candidates: Vec<usize> = self
+                    .grid_thumbs
+                    .keys()
+                    .copied()
+                    .filter(|&p| p < start || p > end)
+                    .collect();
+                candidates.sort_by_key(|&p| std::cmp::Reverse(p.abs_diff(center)));
+                for p in candidates {
+                    if self.grid_bytes <= config::pdf::GRID_VIEW_BUDGET_BYTES {
+                        break;
+                    }
+                    if let Some(t) = self.grid_thumbs.remove(&p) {
+                        self.pending_drops.push(t.image);
+                        self.grid_bytes = self.grid_bytes.saturating_sub(t.bytes);
+                    }
                 }
             }
         }
     }
 
-    /// 网格**跨桶缩放**专用：**保桶清在途**——`grid_thumbs` 旧桶卡图全部**保留**作桥
-    /// （渲染回退以 CSS 拉伸铺满新卡盒，杜绝整屏占位白闪），只丢弃 `pending_grid` 旧桶
-    /// 在途请求（其结果属旧分桶，作废；连同通道一并 drop，worker send 静默失败无泄漏）。
-    /// 与 teardown 的 [`Self::clear_grid_resources`]（真全清 + 纹理下线）语义分离：后者
-    /// 保留给退出网格 / 文档重载 / 关档 / 全退，本入口只在 Ctrl+滚轮跨分桶缩放时调。
-    /// 每页 thumb 只存一条（旧桶图被新桶结果替换，不累积），无记忆涌涨。
+    /// 网格**跨桶缩放**专用：**保桶清在途**——`grid_thumbs` 旧桶卡图（全清/低清/旧桶桥）
+    /// 全部**保留**作桥（渲染回退以 CSS 拉伸铺满新卡盒，杜绝整屏占位白闪），只丢弃
+    /// `pending_grid` 在途请求（全清与低清一并；其结果属旧分桶，作废；连同通道一并 drop，
+    /// worker send 静默失败无泄漏）。与 teardown 的 [`Self::clear_grid_resources`]（真全清 +
+    /// 纹理下线）语义分离：后者保留给退出网格 / 文档重载 / 关档 / 全退，本入口只在
+    /// Ctrl+滚轮跨分桶缩放时调。每页 thumb 只存一条（旧桶图被新桶结果替换，不累积），
+    /// 无记忆涌涨。
     pub(super) fn reset_grid_dispatch_for_zoom_bucket(&mut self) {
         self.pending_grid.clear();
     }
@@ -1217,6 +1372,7 @@ impl PdfViewer {
             self.pending_drops.extend(thumbs);
         }
         self.pending_grid.clear();
+        self.grid_bytes = 0;
     }
 
     // ---- 在途结果回收 ----
@@ -2210,9 +2366,10 @@ impl PdfViewer {
     }
 
     /// L2.4 **预算即释**：清掉世代 < 当前 `nav_gen` 的全部在途条目（含封面/瓦片/中清/缩略/
-    /// 走廊封面）——`nav_gen++` 当帧调用，旧在途条目即刻不再占 `COVER_INFLIGHT`/各额度，目标
-    /// 封面能立刻被派发；到达结果若对应 pending 已不存在则丢弃（rx drop 后 worker 的
-    /// `let _ = tx.send(...)` 静默失败）。只清世代标记：**不清** `cover_failures`/`cover_blacklist`
+    /// 走廊封面/网格缩略图）——`nav_gen++` 当帧调用，旧在途条目即刻不再占 `COVER_INFLIGHT`/
+    /// 各额度，目标封面能立刻被派发；到达结果若对应 pending 已不存在则丢弃（rx drop 后
+    /// worker 的 `let _ = tx.send(...)` 静默失败）。只清世代标记：**不清** `cover_failures`/
+    /// `cover_blacklist`
     /// （W2 语义：封面失败按 recolor 世代判定、黑名单随封面窗滚动复位，与导航世代正交）。
     pub(super) fn clear_stale_pending(&mut self) {
         let n_gen = self.nav_gen;
@@ -2235,6 +2392,14 @@ impl PdfViewer {
         self.pending_mid.retain(|_, e| e.0 >= n_gen);
         self.pending_thumb.retain(|_, e| e.0 >= n_gen);
         self.pending_prefetch_cover.retain(|_, e| e.1 >= n_gen);
+        // 网格在途缩略图按世代一并清理（评审抓出的潜在 bug）：网格请求在 worker 侧对
+        // 旧世代 `continue` 直接跳过不回传（`pdf_core/parser.rs` Grid 分支 `n_gen < cur`）
+        // ⇒ 不清的话旧世代 pending 永远不解析，该页占位链永久失能（永远停「加载中」，
+        // 大跳后无法再派发）。网格的"在途"语义 = pending map 成员本身（无槽级 loading
+        // 标志，对齐上方封面/瓦片/走廊注释），故只须 retain 过滤、无需复位任何标志；
+        // 调度端 `schedule_grid_thumbs` 已打当前 `nav_gen` 戳（L2.3 同姿势），清后下一帧
+        // 自会以新世代重派。
+        self.pending_grid.retain(|_, e| e.0 >= n_gen);
         // 被清条目对应的槽 loading 标志一并复位（对齐 `invalidate_page_bitmaps_for_r8_flip`）
         // ——否则结果永不回（rx 随条目丢弃、worker send 静默失败）、标志永不复位，
         // 该页占位链永久失能（永远停「加载中」，大跳后无法再派发）。

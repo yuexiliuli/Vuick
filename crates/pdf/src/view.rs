@@ -299,10 +299,52 @@ pub(crate) const GRID_MAX_COLS: f32 = 2.0;
 pub(crate) const GRID_MIN_COLS: f32 = 9.0;
 /// 网格行带虚拟化的上下外扩缓冲行数：可视行之外各多物化 [`Self::grid_visible_range`]
 /// 一行的页卡，滚动/惯性时新行提前就位——对齐页列视图 `keep_window` 的 MARGIN 页缓冲语义。
-pub(crate) const GRID_ROW_BUFFER: usize = 1;
+/// 取 2（从 1 加大，本线滚动闪动修复）：可视带上下各提前 2 行，单行滚动/小幅回看时
+/// 旧带卡仍在带内、不触发淘汰重载。渲染与调度共用本值（`grid_visible_range` 同一几何），
+/// 该档卡小（缩略图级），多物化 1-2 行 DOM 成本可接受。
+pub(crate) const GRID_ROW_BUFFER: usize = 2;
+/// 网格缩略图**淘汰保活窗**行数：`evict_grid_thumbs` 在渲染/调度带（`grid_visible_range`，
+/// 可见行 ±[`GRID_ROW_BUFFER`]）之外再按本值外扩行数保留已就绪图——滚动把卡带出可视带
+/// 后**不立即逐出**，回看时直接复用（滚回即显、零重载，C 保活替代硬驱逐）。超保留窗的
+/// 陈旧卡按「距可视中心行距」由远及近逐出（结构性有界；字节账 + 预算常量统一归提交前
+/// 跟进项）。取 2：可视带外再容 2 行（≈ 覆盖单帧滚出二行 + 上一帧带位），回看零重载与
+/// 驻留有界取得平衡。
+pub(crate) const GRID_KEEP_ROWS: usize = 2;
 /// 网格顶栏（wave5 工具栏）高度（px）：贴网格滚动容器顶部，滚动条随之下移对齐（见
 /// `render.rs` 的滚动条 overlay 顶偏）。选 40：一行胶囊按钮 + 上下留白够点，不侵占卡区。
 pub(crate) const GRID_TOOLBAR_H: f32 = 40.0;
+// ---- 网格低清快速档（本线）：快滚期显式钳低栅格宽（面积 ↓4× ⇒ pdfium ~4× 快）----
+/// 低清快速档渲染宽相对全清档的比例：`grid_quick_target_px(t) = t × 本值`（面积 ↓4×，
+/// 快滚期每卡先落一张低清图替代「第 N 页」占位；停滚后用 idle 预算升级全清替换，低清
+/// 图在升级期间作桥保留）。取 0.5：面积 1/4、pdfium 栅格耗时约 1/4，观感仍可辨字形。
+pub(crate) const GRID_QUICK_SCALE: f32 = 0.5;
+/// 低清快速档渲染宽下限（px）：快档宽度不无限缩小（过小糊到不可辨 + 分桶退化），
+/// 取 64：卡宽 200-600 的 25-50%，A4 竖页 64px 宽仍可读页码/段落块。
+pub(crate) const GRID_QUICK_MIN_PX: f32 = 64.0;
+/// 网格**滚动风暴**判定位移阈值（px/帧）：相邻帧滚动偏移差 ≥ 本值即入风暴态（快滚期
+/// 低清派发）。取 1.0：单帧亚像素抖动（<1px）不误触发；滚轮一档/拖拽即超。
+pub(crate) const GRID_STORM_CHANGE_PX: f32 = 1.0;
+/// 网格**滚动风暴**离场判定空闲帧数：连续本帧数帧内偏移差 < [`GRID_STORM_CHANGE_PX`] →
+/// 判定停滚（退出风暴、idle 升级接管）。取 10：10 帧 ≈ 160ms @60fps（8ms 帧周期下 ≈ 80ms）
+/// ——滚轮骤停的 1-2 帧惯性微移不误触退出，又不拖长低清期。
+pub(crate) const GRID_STORM_IDLE_FRAMES: u32 = 10;
+/// 网格**滚动风暴方向感知预取**的超前行数（本批「方向感知派发」杠杆）：风暴期把带内
+/// 派发序的「派发中心」沿滚动方向外移本值行数——下滚先补下方前向页、上滚先补上方前向
+/// 页（同方向内仍距超前中心近优先），落后方向页被推到最后（预算 8/帧先被前向吃光）。
+/// 取 2：与渲染/调度行带缓冲 [`GRID_ROW_BUFFER`] 同量级——风暴滚动一秒能滚 12-20 行，
+/// 前向多预备 2 行即将入屏的页，新入带卡在滚动到达前已落图，直击「新入带卡暴露」。
+pub(crate) const GRID_STORM_AHEAD_ROWS: usize = 2;
+
+/// 网格低清快速档目标渲染宽（纯函数）：`target_px × [`GRID_QUICK_SCALE`]`、下限
+/// [`GRID_QUICK_MIN_PX`]。`target_px` = 全清档目标宽（`grid_card_width() × scale_factor`，
+/// 与 worker `card_width × scale_factor` 同口径）。调用方把 `quick_px` 换算成 `card_width`
+/// 传 worker（`quick_px / scale_factor`），worker 按传入宽分桶 + clamp scale，零改动。
+/// 边界：仅当 `target_px` 病态过小（<~1 桶，正常网格卡宽 ≥150px 不触发）使
+/// `grid_bucket_width(quick_px) == grid_bucket_width(target_px)` 时，低清与全清同桶无收益
+/// → 调用方按该同桶判别（见 `schedule_grid_thumbs` 风暴分支）静默退化直派全清。
+pub(crate) fn grid_quick_target_px(target_px: f32) -> f32 {
+    (target_px * GRID_QUICK_SCALE).max(GRID_QUICK_MIN_PX)
+}
 
 /// 网格可视页区间（纯函数，含行带上下缓冲）：`layout` 为当帧 [`grid_layout`] 结果，
 /// `offset` = 内容已滚动 px（≥0），`viewport_h` = 滚动容器可视高。取首/末可视行外侧各扩
@@ -313,6 +355,25 @@ fn grid_visible_range(layout: &GridLayout, offset: f32, viewport_h: f32) -> Opti
     let (r0, r1) = layout.first_visible_grid_row(offset, viewport_h)?;
     let r0 = r0.saturating_sub(GRID_ROW_BUFFER);
     let r1 = (r1 + GRID_ROW_BUFFER).min(layout.rows.saturating_sub(1));
+    let start = layout.row_page_start[r0];
+    let end = layout.row_page_start[r1 + 1].saturating_sub(1);
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// 网格**淘汰保活窗**页区间（纯函数，供 `evict_grid_thumbs` 用）：与 [`grid_visible_range`]
+/// 完全同构的行带 → 页区间映射，但外扩行数取保留窗阈值 `GRID_ROW_BUFFER + GRID_KEEP_ROWS`
+/// （渲染/调度带外再各留 [`GRID_KEEP_ROWS`] 行）——带外已就绪卡在保留窗内**不逐出**（滚动
+/// 回看即显、零重载，C 保活替代硬驱逐）。语义边界：带内（[`grid_visible_range`] 所得）恒
+/// 钉住；保留窗 = 带 + 2 行，超窗按距可视中心由远及近逐「最远者」。无可见带（视口在内容
+/// 外）→ `None`（调用方按全清处理）。
+fn grid_keep_range(layout: &GridLayout, offset: f32, viewport_h: f32) -> Option<(usize, usize)> {
+    let (r0, r1) = layout.first_visible_grid_row(offset, viewport_h)?;
+    let keep = GRID_ROW_BUFFER + GRID_KEEP_ROWS;
+    let r0 = r0.saturating_sub(keep);
+    let r1 = (r1 + keep).min(layout.rows.saturating_sub(1));
     let start = layout.row_page_start[r0];
     let end = layout.row_page_start[r1 + 1].saturating_sub(1);
     if end < start {
@@ -433,6 +494,9 @@ pub(crate) struct GridThumb {
     pub(crate) bucket: u32,
     /// 已就绪的页卡位图。
     pub(crate) image: Arc<RenderImage>,
+    /// 位图占用的**字节账**（view 侧 `grid_bytes` 总额计账用；写入时按
+    /// `w×h×bpp` 派生——本批「字节账+预算」杠杆，见 [`config::pdf::GRID_VIEW_BUDGET_BYTES`]）。
+    pub(crate) bytes: u64,
 }
 
 /// 阅读页排模式（状态层打桩：本切片**只存状态**，渲染三路分派/滚动锚点恢复由后续切片接）：
@@ -811,9 +875,13 @@ pub struct PdfViewer {
     /// **保留**旧桶条目作桥（`reset_grid_dispatch_for_zoom_bucket` 只清在途不清图），bucket
     /// 判断 stale：调度对有 stale 图照常重派、渲染回退画桥（见 `GridThumb`）。
     pub(crate) grid_thumbs: HashMap<usize, GridThumb>,
-    /// 在途网格缩略图请求：页 → (导航世代 nav_gen, 结果通道)。世代守卫对齐
-    /// [`Self::pending_thumb`]（大跳/切档时按 nav_gen/zoom_epoch 由 worker drop 旧请求）。
-    pub(crate) pending_grid: HashMap<usize, (u64, mpsc::Receiver<Option<RenderResult>>)>,
+    /// 在途网格缩略图请求：页 → (导航世代 nav_gen, **请求时传的卡宽**, 结果通道)。世代守卫
+    /// 对齐 [`Self::pending_thumb`]（大跳/切档时按 nav_gen/zoom_epoch 由 worker drop 旧请求）；
+    /// **请求时卡宽**供 `collect_grid_results` 按请求分桶打戳（既有 view 侧口径
+    /// `grid_bucket_width(卡宽)`）——低清/全清两档在途并存，不能像旧单档那样按「当前全清
+    /// 桶」统一打戳（低清在途被错标成全清桶、破坏「桥 + idle 升级」语义）。
+    pub(crate) pending_grid:
+        HashMap<usize, (u64, f32, mpsc::Receiver<Option<RenderResult>>)>,
     /// 网格 render 帧观测：上帧实际物化/绘制的页区间（含行带 ±1 缓冲）——headless
     /// 虚拟化断言用（对齐 `last_frame_tiles_drawn` 既有观测姿势；非网格帧 = (0,0)）。
     pub(crate) grid_last_range: std::cell::Cell<(usize, usize)>,
@@ -824,6 +892,27 @@ pub struct PdfViewer {
     /// 二者不共享——单列计数不覆盖网格卡路径）。回归断言网格 Ctrl+滚轮跨桶缩放期间桥图
     /// 生效、占位不增长而新增；`release` 时归零。
     pub(crate) grid_placeholder_hits: std::cell::Cell<u64>,
+    /// 网格**滚动风暴**标志：相邻帧滚动偏移差 ≥ [`GRID_STORM_CHANGE_PX`] 进入（快滚期低清
+    /// 派发 + 占位弱化）；连续 [`GRID_STORM_IDLE_FRAMES`] 帧 < 阈值退出（idle 升级接管）。
+    /// 由 `ensure_window_grid` 每帧首行更新（open.rs），`schedule_grid_thumbs`/`build_grid_cards`
+    /// 同帧读取。首帧默认 false（回退旧「第 N 页」占位与全清派发）。
+    pub(crate) grid_storm: bool,
+    /// 网格滚动风暴检测：上一帧的内容滚动偏移 y（px，`-grid_scroll.offset().y`）。
+    pub(crate) grid_last_offset: f32,
+    /// 网格滚动风暴检测：已连续「几乎静止」（偏移差 < [`GRID_STORM_CHANGE_PX`]）的帧数，
+    /// ≥ [`GRID_STORM_IDLE_FRAMES`] 时宣告停滚（退出风暴）。
+    pub(crate) grid_storm_idle_frames: u32,
+    /// 网格**滚动方向**（本批「方向感知预取」）：紧随 `ensure_window_grid` 的滚动偏移差
+    /// 更新——`+1` = 向下滚（内容上移、应超前补下方大行号页）、`-1` = 向上滚、`0` = 静止
+    /// （保持上一方向，避免抖动翻转）。`schedule_grid_thumbs` 风暴分支据此沿方向超前派发。
+    pub(crate) grid_scroll_dir: i8,
+    /// 网格**本帧实际派发页序**（本批方向预取的可观测性，供测试断言派发序；仅风暴分支按
+    /// 方向超前序填充、idle 分支填中心优先序，每帧 `schedule_grid_thumbs` 覆盖写、非累积）。
+    pub(crate) grid_dispatch_order: Vec<usize>,
+    /// 网格缩略图**字节账**（`grid_thumbs` 全部卡位图字节和，本批「字节账+预算」杠杆）：
+    /// 入槽计加、替换/逐出/清空计减；`evict_grid_thumbs` 超
+    /// [`config::pdf::GRID_VIEW_BUDGET_BYTES`] 时按「距可视中心最远」逐出（可视带永不逐）。
+    pub(crate) grid_bytes: u64,
     // ---- 网格多选（wave5）：选中集模型 + Shift 范围锚点 ----
     /// 当前网格**选中页下标集**（`HashSet` 提供 O(1) 存在查询；页数为千级时全选集内存
     /// ~几十 KB，量级可接受）。**一次网格会话语义**：进入网格、退出网格（含点卡跳页、
@@ -1038,6 +1127,12 @@ mod tests {
                     grid_last_range: std::cell::Cell::new((0, 0)),
                     grid_last_drawn: std::cell::Cell::new(0),
                     grid_placeholder_hits: std::cell::Cell::new(0),
+                    grid_storm: false,
+                    grid_last_offset: 0.0,
+                    grid_storm_idle_frames: 0,
+                    grid_scroll_dir: 0,
+                    grid_dispatch_order: Vec::new(),
+                    grid_bytes: 0,
                     grid_selected: HashSet::new(),
                     grid_anchor: None,
                     grid_press: None,
@@ -1298,6 +1393,12 @@ mod tests {
                     grid_last_range: std::cell::Cell::new((0, 0)),
                     grid_last_drawn: std::cell::Cell::new(0),
                     grid_placeholder_hits: std::cell::Cell::new(0),
+                    grid_storm: false,
+                    grid_last_offset: 0.0,
+                    grid_storm_idle_frames: 0,
+                    grid_scroll_dir: 0,
+                    grid_dispatch_order: Vec::new(),
+                    grid_bytes: 0,
                     grid_selected: HashSet::new(),
                     grid_anchor: None,
                     grid_press: None,
@@ -1463,6 +1564,12 @@ mod tests {
                     grid_last_range: std::cell::Cell::new((0, 0)),
                     grid_last_drawn: std::cell::Cell::new(0),
                     grid_placeholder_hits: std::cell::Cell::new(0),
+                    grid_storm: false,
+                    grid_last_offset: 0.0,
+                    grid_storm_idle_frames: 0,
+                    grid_scroll_dir: 0,
+                    grid_dispatch_order: Vec::new(),
+                    grid_bytes: 0,
                     grid_selected: HashSet::new(),
                     grid_anchor: None,
                     grid_press: None,
@@ -1627,6 +1734,12 @@ mod tests {
             grid_last_range: std::cell::Cell::new((0, 0)),
             grid_last_drawn: std::cell::Cell::new(0),
             grid_placeholder_hits: std::cell::Cell::new(0),
+            grid_storm: false,
+            grid_last_offset: 0.0,
+            grid_storm_idle_frames: 0,
+            grid_scroll_dir: 0,
+            grid_dispatch_order: Vec::new(),
+            grid_bytes: 0,
             grid_selected: HashSet::new(),
             grid_anchor: None,
             grid_press: None,
@@ -2696,6 +2809,28 @@ mod tests {
         let band = grid_visible_range(&layout, offset, vh).expect("网格首屏应存在可见带");
         let count = band.1 - band.0 + 1;
         (band, count, dims.len())
+    }
+
+    /// 进入网格后按「渲染同口径」手算**淘汰保活窗**区间（`grid_keep_range`，带外再容
+    /// [`GRID_KEEP_ROWS`] 行）：供滚动回归断言「保留窗内可持有 / 超保持窗逐出」对表
+    /// （期望源自真实几何推导，K177）。
+    fn expected_grid_keep(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        offset: f32,
+    ) -> ((usize, usize), usize) {
+        let (vw, vh, dims) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            (
+                b.size.width.as_f32(),
+                b.size.height.as_f32(),
+                v.dims.clone(),
+            )
+        });
+        let layout = grid_layout(&dims, GRID_CARD_WIDTH, GRID_GAP, GRID_PADDING, vw);
+        let keep = grid_keep_range(&layout, offset, vh).expect("网格首屏应存在保留窗");
+        (keep, keep.1 - keep.0 + 1)
     }
 
     /// 向网格卡派发一次**真实双击**（第一击 `click_count=1` + 第二击 `click_count=2`）：
@@ -4700,7 +4835,27 @@ mod tests {
         }
         assert!(loaded, "PDF 应加载完成");
         enter_grid(&holder, cx);
-        let ((old_start, _old_end), _, _) = expected_grid_band(&holder, cx, 0.0);
+        let ((old_start, old_end), _, _) = expected_grid_band(&holder, cx, 0.0);
+        // 前置：把旧可视带逐页缩略图全部打满（调度每帧 ≤GRID_PREFETCH_INFLIGHT 枚），
+        // 使后面「保活窗内保留 / 超窗逐出」断言可确定性判定（页是否真有图可保留）。
+        let mut old_primed = false;
+        for _ in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            old_primed = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (old_start..=old_end).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if old_primed {
+                break;
+            }
+        }
+        assert!(
+            old_primed,
+            "前置：旧可视带全部页缩略图应打满（{old_start}..={old_end}）"
+        );
         // 滚到第 6 行顶（内容坐标系 y = row_top[5]）并推进渲染帧
         let offset = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
@@ -4741,7 +4896,14 @@ mod tests {
         );
         assert_eq!(drawn, new_count, "滚动后物化卡数仍应等于派生带宽");
 
-        // 旧卡释放：grid_thumbs / pending_grid 不得残留新带之外的页（确定性，不依赖 worker 时序）
+        // C 保活窗：保留窗（= 带再外扩 GRID_KEEP_ROWS 行）内可持有 + 超保留窗逐「最远者」
+        // ——grid_thumbs / pending_grid 不得残留保留窗外的页（确定性，不依赖 worker 时序）；
+        // 带外但在保留窗内（旧行 1..2 的页）应被**保留**（滚回即显，C 替代硬驱逐）。
+        let ((k_start, k_end), _) = expected_grid_keep(&holder, cx, offset);
+        assert!(
+            k_start <= new_start && new_end <= k_end,
+            "保留窗应覆盖可视带：[{k_start},{k_end}] 不包 [{new_start},{new_end}]"
+        );
         let (thumbs_keys, pending_keys) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (
@@ -4751,10 +4913,1675 @@ mod tests {
         });
         for p in thumbs_keys.iter().chain(pending_keys.iter()) {
             assert!(
-                *p >= new_start && *p <= new_end,
-                "滚动后旧带页 {p} 应被释放（新带 [{new_start},{new_end}]）"
+                *p >= k_start && *p <= k_end,
+                "滚动到第 6 行后旧带页 {p} 应被逐出（保留窗 [{k_start},{k_end}] 之外）"
             );
         }
+        // 超保留窗逐「最远者」：旧带首行（行 0，页 {old_start}）已出保留窗 ⇒ 必被逐出。
+        assert!(
+            !thumbs_keys.contains(&old_start),
+            "行 0 页 {old_start} 应在保留窗外被逐出（结构性有界）"
+        );
+        // 保留窗内保活：旧带行 1..2 的页（带外、仍在保留窗内）应被保留——滚动后带外
+        // 卡不再立即释放，回看即显（C 保活替代硬驱逐；K138 锁真实对位量：行 1 首页 =
+        // row_page_start[1] = old 带所在行页）。
+        let boundary_page = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let layout = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            layout.row_page_start[1]
+        });
+        assert!(
+            thumbs_keys.iter().any(|&p| p >= boundary_page && p < new_start),
+            "带外但保留窗内的旧卡（页 {boundary_page}..）应被保留（滚回即显）"
+        );
+    }
+
+    /// 本线滚动闪动回归（7a/7b + 7d 单格口径）：「滚下 1 行再滚回」→ 回看**零重载**——
+    /// 目标页缩略图仍在 `grid_thumbs`（滚回即显）、不再进 `pending_grid`（带宽内已有图
+    /// 不发新请求）、`grid_placeholder_hits` 在**回程**不增长（无占位渲染帧）。下行那一步
+    /// 新入带的行仍会首载（7d：单格滚动只首个新窗涨；回程零涨 = 不闪的可观测信号）。
+    #[gpui::test]
+    async fn grid_scroll_small_round_trip_keeps_thumbs_no_reload(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 前置：把首屏可视带逐页缩略图打满，占位计数基线稳定。
+        let (band, _, _) = expected_grid_band(&holder, cx, 0.0);
+        let (band_start, band_end) = band;
+        let mut primed = false;
+        for _ in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            primed = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (band_start..=band_end).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if primed {
+                break;
+            }
+        }
+        assert!(
+            primed,
+            "前置：首屏可视带全部页应有缩略图（{band_start}..={band_end}）"
+        );
+        // 滚下 1 行（offset = 行 1 顶，内容坐标系 y = row_top[1]）
+        let down_offset = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let layout = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            layout.row_top[1]
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.grid_scroll.set_offset(gpui::point(px(0.), px(-down_offset)));
+            });
+        });
+        // 下行边等新带打成满图（该步新入带的行必然首载，占位计数可涨——7d 口径单格首窗）
+        let (band1, _, _) = expected_grid_band(&holder, cx, down_offset);
+        let (b1_start, b1_end) = band1;
+        let mut down_primed = false;
+        for _ in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            down_primed = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (b1_start..=b1_end).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if down_primed {
+                break;
+            }
+        }
+        assert!(
+            down_primed,
+            "下行后新可视带全部页应有缩略图（{b1_start}..={b1_end}）"
+        );
+        let hits_down = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        // 目标页 = 旧带末页（离开可视 / 仍在带或保留窗内），滚回时应保留不重载
+        let target = band_end;
+        // 滚回顶部（offset 0）
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.grid_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            });
+        });
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // (7a) 回程零重载：占位计数不增长（回看页全有图可画）
+        // (7b) 回看页不在 pending_grid（带宽内已有图不再发请求）
+        let (hits_back, has_target, target_pending) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.grid_placeholder_hits.get(),
+                v.grid_thumbs.get(&target).is_some(),
+                v.pending_grid.contains_key(&target),
+            )
+        });
+        assert!(
+            hits_back == hits_down,
+            "滚回零重载：回程占位计数不应增长（{hits_down} → {hits_back}）"
+        );
+        assert!(
+            has_target,
+            "目标页 {target} 纹理应仍存于 grid_thumbs（滚回即显，零重载）"
+        );
+        assert!(
+            !target_pending,
+            "目标页 {target} 回看不进 pending_grid（带宽内已有图不再发请求，7b）"
+        );
+    }
+
+    /// 本线滚动闪动回归（7c + 7d 连滚口径）：「连滚数屏」（跳到第 7 行顶）后**结构性有界**
+    /// 成立——超保留窗（带 ±[`GRID_ROW_BUFFER`] 再外扩 [`GRID_KEEP_ROWS`] 行）的远卡被逐出、
+    /// `pending_grid` 同步收窄；保留窗内（含带外、上一帧带位）旧卡**保留**（保活替代硬驱逐）。
+    /// 7d：连滚数屏只有每帧新入带的行首载涨占位（远行从不预载，属固有分页语义），有界靠
+    /// `evict_grid_thumbs` 每帧收回、不随文档长度增长。
+    #[gpui::test]
+    async fn grid_scroll_far_evicts_beyond_keep_window(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        let (band, _, _) = expected_grid_band(&holder, cx, 0.0);
+        let (band_start, band_end) = band;
+        let mut primed = false;
+        for _ in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            primed = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (band_start..=band_end).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if primed {
+                break;
+            }
+        }
+        assert!(
+            primed,
+            "前置：首屏可视带全部页应有缩略图（{band_start}..={band_end}）"
+        );
+        // 连滚到第 7 行顶（offset = row_top[6]）：需夹具 ≥8 行（本地 pdf测试2.pdf 数十页级）
+        let jump_offset = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let layout = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            assert!(layout.rows > 7, "夹具需 ≥8 行网格，实际 {}", layout.rows);
+            layout.row_top[6]
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.grid_scroll.set_offset(gpui::point(px(0.), px(-jump_offset)));
+            });
+        });
+        for _ in 0..5 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        // 新保留窗（同口径派生）：所有保留卡/在途必在窗内（结构性有界）
+        let ((k_start, k_end), _) = expected_grid_keep(&holder, cx, jump_offset);
+        let (thumbs_keys, pending_keys) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.grid_thumbs.keys().copied().collect::<Vec<usize>>(),
+                v.pending_grid.keys().copied().collect::<Vec<usize>>(),
+            )
+        });
+        for p in thumbs_keys.iter().chain(pending_keys.iter()) {
+            assert!(
+                *p >= k_start && *p <= k_end,
+                "连滚数屏后残留页 {p} 应被逐出（保留窗 [{k_start},{k_end}] 之外）"
+            );
+        }
+        // 旧带首行（行 0，页 {band_start}）超保留窗 ⇒ 必被逐出；带外在保留窗内的旧卡保留
+        assert!(
+            !thumbs_keys.contains(&band_start),
+            "行 0 页 {band_start} 应超保留窗逐出（结构性有界）"
+        );
+        let boundary_page = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let layout = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            layout.row_page_start[2]
+        });
+        let new_band = expected_grid_band(&holder, cx, jump_offset).0;
+        assert!(
+            thumbs_keys
+                .iter()
+                .any(|&p| p >= boundary_page && p < new_band.0),
+            "带外但保留窗内的旧卡（页 {boundary_page}..）应被保留（保活替代硬驱逐）"
+        );
+    }
+
+    // ---- 网格低清快速档（本线）：快滚风暴期钳低栅格宽、停滚升级全清 ----
+
+    /// 网格当前全清/低清双档分桶（与调度/collect 同口径派生）：全清桶 = 既有 view 侧口径
+    /// `grid_bucket_width(卡宽)`（scale-blind）；低清桶 = `grid_bucket_width(quick_card)`，
+    /// `quick_card = grid_quick_target_px(卡宽×scale) / scale`（传 worker 的卡宽）。
+    /// 低清退化（卡宽病态过小）时两值相等（测试可据此跳过「低清残留」类断言）。
+    fn grid_test_buckets(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+    ) -> (u32, u32) {
+        cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let card = v.grid_card_width();
+            let scale = v.scale_factor.max(1.0);
+            (
+                grid_bucket_width(card),
+                grid_bucket_width(grid_quick_target_px(card * scale) / scale),
+            )
+        })
+    }
+
+    /// 网格快滚风暴序列（K185 真实宿主，不 mock 简化）：从当前位起**每帧**把 `grid_scroll`
+    /// 前进 3 行带（相邻帧偏移差 ≥[`GRID_STORM_CHANGE_PX`] ⇒ 必入风暴态）、共 `frames` 帧，
+    /// 帧间 advance_clock + refresh 推进渲染。返回最后一帧的 `(滚动偏移, 带区间)`；夹具
+    /// 行数不足时提前返回当前位（调用方自行判定）。
+    fn storm_scroll_frames(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        frames: usize,
+    ) -> (f32, (usize, usize)) {
+        let offsets: Vec<f32> = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            let mut out = Vec::new();
+            for k in 0..frames {
+                let r = 1 + 3 * k;
+                if r < l.rows {
+                    out.push(l.row_top[r]);
+                }
+            }
+            out
+        });
+        let mut last = (
+            f32::from(-cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).grid_scroll.offset().y
+            })),
+            (0usize, 0usize),
+        );
+        for off in offsets {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                    v.grid_scroll.set_offset(gpui::point(px(0.), px(-off)));
+                });
+            });
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            last = (
+                off,
+                cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let b = v.grid_scroll.bounds();
+                    let l = grid_layout(
+                        &v.dims,
+                        GRID_CARD_WIDTH,
+                        GRID_GAP,
+                        GRID_PADDING,
+                        b.size.width.as_f32(),
+                    );
+                    grid_visible_range(&l, off, b.size.height.as_f32()).unwrap_or((0, 0))
+                }),
+            );
+        }
+        last
+    }
+
+    /// 停滚后「可见行（first_visible_grid_row 直接行区间，K138 锁真实对位量）全具缩略图」
+    /// 是否成立（低清算纹理即满足；`contains_key` 口径同 DIAG）。
+    fn grid_visible_all_textured(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            let off = f32::from(-v.grid_scroll.offset().y);
+            match l.first_visible_grid_row(off, b.size.height.as_f32()) {
+                None => true,
+                Some((r0, r1)) => {
+                    let s = l.row_page_start[r0];
+                    let e = l.row_page_start[r1 + 1].saturating_sub(1);
+                    (s..=e).all(|p| v.grid_thumbs.contains_key(&p))
+                }
+            }
+        })
+    }
+
+    /// 1/2：低清快速档「快滚落低清 → 停滚升级全清」全链。1) 快滚（每帧 +3 行带 ×5 帧）停滚
+    /// 后 ≤120 帧内**可见行**全部落图（低清算纹理、不再停「第 N 页」占位），bucket ∈
+    /// {低清, 全清}（或低清退化时仅全清）；2) 继续推进至 idle 后**可见带**全部升级
+    /// `bucket == 全清桶`、带内无低清残留（升级复用 idle 预算，不新增）。
+    #[gpui::test]
+    async fn grid_fast_scroll_quick_tier_lands_texture(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        let (fb, qb) = grid_test_buckets(&holder, cx);
+        let qb_distinct = qb != fb;
+        let _ = storm_scroll_frames(&holder, cx, 5);
+        // (1a) 停滚后可见行全落图：循环上限从 120 收紧到 72 帧（本机快档实测 ~42 帧；
+        // 帧数是粗时序界、随 worker 吞吐/口径波动，判别力主闸在 (1b)）。
+        // (1b) 判别力主闸（K173 反假绿）：带内首内容期间须**确实出现过低清桶纹理**——快档
+        // 存在 ⇒ 必现（风暴期只派低清）；撤档 ⇒ 恒无（全清桶直达，等同测试 2/4 判别形态）。
+        let mut frame = 0u32;
+        let mut saw_quick = false;
+        for frame_i in 0..120u32 {
+            frame = frame_i + 1;
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if qb_distinct
+                && cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    let b = v.grid_scroll.bounds();
+                    let l = grid_layout(
+                        &v.dims,
+                        GRID_CARD_WIDTH,
+                        GRID_GAP,
+                        GRID_PADDING,
+                        b.size.width.as_f32(),
+                    );
+                    let off = f32::from(-v.grid_scroll.offset().y);
+                    let (s, e) = grid_visible_range(&l, off, b.size.height.as_f32())
+                        .unwrap_or((0, 0));
+                    (s..=e).any(|p| v.grid_thumbs.get(&p).is_some_and(|t| t.bucket == qb))
+                })
+            {
+                saw_quick = true;
+            }
+            if grid_visible_all_textured(&holder, cx) {
+                break;
+            }
+        }
+        assert!(
+            frame <= 72,
+            "停滚后可见行应在合理帧数内全落图（本机快档实测 ~42 帧，评审更乐观 ~28-33；72 = 宽松时序界，判别力主闸是 saw_quick，见上）"
+        );
+        if qb_distinct {
+            assert!(saw_quick, "带内首内容期间应出现过低清桶纹理（快档生效；撤档后恒无，K173）");
+        }
+        eprintln!("DIAG_GRID|quick_tier_lands frames={frame} saw_quick={saw_quick} qb={qb} fb={fb}");
+        // bucket ∈ {低清, 全清}（低清退化时 qb==fb 仍 ∈ 集合）
+        let non_tier = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            let off = f32::from(-v.grid_scroll.offset().y);
+            let mut n = 0usize;
+            if let Some((s, e)) = grid_visible_range(&l, off, b.size.height.as_f32()) {
+                for p in s..=e {
+                    if let Some(t) = v.grid_thumbs.get(&p) {
+                        if t.bucket != qb && t.bucket != fb {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            n
+        });
+        assert_eq!(
+            non_tier, 0,
+            "落图 bucket 应 ∈ {{低清={qb}, 全清={fb}}}（异常桶 {non_tier} 张）"
+        );
+    }
+
+    /// 2/2：低清快速档「idle 升级到全清」——快滚停滚 idle 后可见带全部 `bucket == 全清桶`
+    /// （低清被升级替换、无低清残留）；升级走 idle 预算 `GRID_PREFETCH_INFLIGHT`=4/帧 +
+    /// 中心优先，不新增预算常量。
+    #[gpui::test]
+    async fn grid_idle_upgrade_reaches_full_bucket(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 前置：确证低清/全清分桶可区分（默认卡宽 280 一定可区分；退化则跳过判别）
+        let (fb, qb) = grid_test_buckets(&holder, cx);
+        let qb_distinct = qb != fb;
+        let _ = storm_scroll_frames(&holder, cx, 5);
+        // 加强：升级到全清期间须**确实出现过低清桶纹理**——快档风暴期只派低清、停滚前后
+        // 低清先落地、idle 才升全清；撤档则带内恒为全清桶、恒无低清（K173 反假绿，判别
+        // 力闸）。与「最后全为全清桶」机制断言并用。
+        let mut all_full = false;
+        let mut saw_quick = false;
+        for _ in 0..240 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let (full_now, quick_now) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let off = f32::from(-v.grid_scroll.offset().y);
+                let fb = grid_bucket_width(v.grid_card_width());
+                let mut all_full = true;
+                let mut quick_now = false;
+                if let Some((s, e)) = grid_visible_range(&l, off, b.size.height.as_f32()) {
+                    for p in s..=e {
+                        match v.grid_thumbs.get(&p) {
+                            Some(t) => {
+                                if t.bucket != fb {
+                                    all_full = false;
+                                }
+                                if t.bucket == qb {
+                                    quick_now = true;
+                                }
+                            }
+                            None => all_full = false,
+                        }
+                    }
+                }
+                (all_full, quick_now)
+            });
+            if qb_distinct && quick_now {
+                saw_quick = true;
+            }
+            if full_now {
+                all_full = true;
+                break;
+            }
+        }
+        assert!(all_full, "停滚 idle 后 240 帧内可见带应全部升级到全清桶（无低清残留）");
+        if qb_distinct {
+            assert!(saw_quick, "升级到全清前带内应出现过低清桶纹理（快档生效；撤档恒无，K173）");
+        }
+    }
+
+    /// 3：低清快速档「风暴占位有界」——`grid_placeholder_hits` 是渲染路径**每帧每无图卡**计
+    /// 一次的脉冲计数（语义不随本线改；风暴泵 notify 会多叠渲染帧 ⇒ 实际 delta ≈ Σ帧×无图
+    /// 卡数，本机 ≈25 卡×~2.7 渲染/帧×5 帧 = 3xx，旧值 213/5 帧同口径）。本测试断有意义的
+    /// 两态 + 一界：① 快滚风暴确置 `grid_storm=true`（分支选择器生效）；② 风暴期 delta
+    /// **线性有界**（`≤ 带卡数×风暴帧数×6`——若风暴把卡反复逐出重载、每帧病态多级渲染无图
+    /// 卡，计数将远超此界）；③ 纹理落地后计数**停止增长**（可见带全有图 → 不再渲染占位 →
+    /// 快滚不再一路闪「第 N 页」，本线真可观测收益）+ 停滚 idle 后 `grid_storm` 复位 false。
+    #[gpui::test]
+    async fn grid_storm_placeholder_delta_bounded(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        let (_, band_count_0, _) = expected_grid_band(&holder, cx, 0.0);
+        let band_count = band_count_0 as u64;
+        let hits_before = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        let _ = storm_scroll_frames(&holder, cx, 5);
+        // ① 风暴态生效：快滚最后一帧后 grid_storm 应为 true（分支选择器走低清派发）。
+        let storm_engaged = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_storm
+        });
+        assert!(storm_engaged, "快滚风暴应置 grid_storm=true（低清分支生效）");
+        let hits_after = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        let delta = hits_after - hits_before;
+        // ② 线性有界（无病态放大）；实际值随 worker 吞吐/渲染帧数波动，故界取 ×6（脉冲
+        // 计数口径：每帧每卡一次 + 泵 notify 叠加渲染），不按旧值 213/5 帧作硬上限。
+        let bound = band_count * 5 * 6;
+        assert!(
+            delta <= bound,
+            "风暴占位 delta {delta} 应线性有界 ≤ {bound}（带卡数 {band_count} ×5 帧 ×6）"
+        );
+        eprintln!("DIAG_GRID|placeholder_bounded storm_delta={delta} band={band_count} bound={bound}");
+        // ③ 尾部收敛：推进到可见带全有纹理（记录帧数）后再采样 5 帧，占位计数不再增长。
+        let mut settle_frames = 0usize;
+        let mut ready = false;
+        for settle_frame in 0..120 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            ready = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let off = f32::from(-v.grid_scroll.offset().y);
+                let (s, e) = grid_visible_range(&l, off, b.size.height.as_f32()).unwrap_or((0, 0));
+                (s..=e).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if ready {
+                settle_frames = settle_frame + 1;
+                break;
+            }
+        }
+        // ④ 收益判别（快档存在才可达）：**停滚后可见带全有纹理 ≤ N 帧**。快档低清图面积
+        // ↓4× 栅格快、先落位 ⇒ 重连帧数明显少于全清-only（评审同夹具实测 ratio 33→41 ≈
+        // +24%；本机快档实测 ~48 帧 ⇒ 全清-only ≈ 59）。界 = 56（快档余量 ~17%、全清-only
+        // 超界），撤档后 settle 全按全清慢栅格重渲、帧数显著超界（判别）；校准自 debug
+        // scale_factor=2 本夹具 + 87 页 pdf测试2.pdf。占位脉冲增量 = Σ帧×无图卡数，与帧数
+        // 强相关（本机快档 settle 脉冲 ≈2360），按帧数断言更稳定、免脉冲 sum 抖动。
+        const QUICK_SETTLE_FRAMES_BOUND: usize = 56;
+        assert!(
+            settle_frames > 0 && settle_frames <= QUICK_SETTLE_FRAMES_BOUND,
+            "停滚后可见带应在 {QUICK_SETTLE_FRAMES_BOUND} 帧内全有纹理（快档收益判别；实测 {settle_frames}）"
+        );
+        eprintln!(
+            "DIAG_GRID|placeholder_settle_frames={settle_frames} bound={QUICK_SETTLE_FRAMES_BOUND}"
+        );
+        assert!(ready, "停滚后可见带应全有纹理（低清/全清顶上）");
+        let storm_after = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_storm
+        });
+        assert!(
+            !storm_after,
+            "停滚 idle（连续 ≥GRID_STORM_IDLE_FRAMES 帧几乎静止）后 grid_storm 应复位 false"
+        );
+        let hits_conv = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        for _ in 0..5 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let hits_tail = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        assert_eq!(
+            hits_tail, hits_conv,
+            "纹理落地后占位计数应停止增长（{hits_conv} → {hits_tail}，低清/全清顶上）"
+        );
+    }
+
+    /// 4：低清快速档「升级保桥」——idle 升级全清在途期间 `grid_thumbs.get(i)` 恒不空窗
+    /// （低清/旧桶桥到全清替换之间从不消失：collect 只在 Full 到达后原子换槽 + 旧图转
+    /// `pending_drops`，`evict` 保留窗内不删）。逐帧断言「上一帧带内有图的页本帧仍有图」，
+    /// 且确实走过「低清桶图被升级」的真实路径（K173 防假绿）。
+    #[gpui::test]
+    async fn grid_upgrade_keeps_thumb_bridge(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        let (fb, qb) = grid_test_buckets(&holder, cx);
+        let _ = storm_scroll_frames(&holder, cx, 5);
+        let band_state = |v: &PdfViewer| -> (std::collections::HashSet<usize>, bool, bool) {
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            let off = f32::from(-v.grid_scroll.offset().y);
+            let mut present = std::collections::HashSet::new();
+            let mut any_quick = false;
+            let mut all_full = true;
+            if let Some((s, e)) = grid_visible_range(&l, off, b.size.height.as_f32()) {
+                for p in s..=e {
+                    match v.grid_thumbs.get(&p) {
+                        Some(t) => {
+                            present.insert(p);
+                            if t.bucket == qb {
+                                any_quick = true;
+                            }
+                            if t.bucket != fb {
+                                all_full = false;
+                            }
+                        }
+                        None => all_full = false,
+                    }
+                }
+            }
+            (present, any_quick, all_full)
+        };
+        let (mut prev, mut saw_quick, _) = cx.update(|_w, cx| {
+            band_state(holder.borrow().as_ref().unwrap().read(cx))
+        });
+        let mut all_full = false;
+        for _ in 0..240 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let (present, any_quick, full_now) = cx.update(|_w, cx| {
+                band_state(holder.borrow().as_ref().unwrap().read(cx))
+            });
+            // 桥不变式：上一帧带内有图的页本帧必须仍有图（升级替换不空窗）。
+            for lost in prev.difference(&present) {
+                assert!(false, "升级期 thumb 空窗：页 {lost} 上一帧有图、本帧消失");
+            }
+            if any_quick {
+                saw_quick = true;
+            }
+            prev = present;
+            if full_now {
+                all_full = true;
+                break;
+            }
+        }
+        assert!(
+            saw_quick,
+            "应先观察到低清桶图被升级（低清桥路径真实被走，非全清直达假绿）"
+        );
+        assert!(all_full, "idle 升级最终应使带内全为全清桶");
+    }
+
+    /// 诊断（只读 + 测试代码，不改生产）：快滚「仍看到加载」绑定约束实测——三路机制
+    /// 贡献分账（①补图时延 = view 派发预算 × worker 串行栅格；②快滚逐出 = 保留窗盖不住；
+    /// ③低桶快速填充）。输出走 `DIAG_GRID|` 前缀 stderr、无硬时序断言（只断言几何前提），
+    /// 供主 agent 核对与四个配置变体（EXP1..EXP4）复用同一条测试。快滚 = 真实
+    /// `grid_scroll` 句柄 `set_offset` 每帧前进 `STEP` 行带（K185 真实宿主，不 mock 简化）；
+    /// 停滚后用 gpui 时钟/墙钟采样「可见行 / 整带」补齐帧数与毫秒。
+    #[gpui::test]
+    async fn grid_fast_scroll_flash_bound_diagnostic(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 几何/布局：真实 grid_scroll bounds → 与渲染/调度同一几何（K177）。
+        let (rows, cols, pages) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            (l.rows, l.cols, v.dims.len())
+        });
+        // 前置：首屏可视带打满（同既有 grid_scroll 骨架）。
+        let (band0, band0_count, _) = expected_grid_band(&holder, cx, 0.0);
+        let (s0, e0) = band0;
+        let mut primed = false;
+        for _ in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            primed = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (s0..=e0).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if primed {
+                break;
+            }
+        }
+        assert!(primed, "前置：首屏可视带应打满（{s0}..={e0}）");
+        // 快滚目标行：行 1, 1+STEP, …（每帧 +STEP 行带），≤ rows-4 留出带外保留窗空间。
+        const STEP: usize = 3;
+        let targets: Vec<f32> = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            let mut t = Vec::new();
+            let mut r = 1usize;
+            while r + 4 < l.rows && t.len() < 8 {
+                t.push(l.row_top[r]);
+                r += STEP;
+            }
+            t
+        });
+        if targets.len() < 3 {
+            eprintln!("DIAG_GRID|SKIP 夹具行数不足做快滚 rows={rows}");
+            return;
+        }
+        let hits_base = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        eprintln!(
+            "DIAG_GRID|CONFIG inflight={} keep_rows={} bucket_px={} | doc_pages={} cols={} rows={} band0=({s0},{e0}) n={band0_count} scroll_frames={}",
+            config::pdf::GRID_PREFETCH_INFLIGHT,
+            GRID_KEEP_ROWS,
+            config::pdf::GRID_BUCKET_PX,
+            pages,
+            cols,
+            rows,
+            targets.len()
+        );
+        // 快滚帧采样：每帧 off → (unloaded_visible, prev_band_kept, prev_band_evicted, hits_cum)。
+        let mut prev_band = (s0, e0);
+        let scroll_t0 = std::time::Instant::now();
+        let mut rows_out: Vec<(f32, usize, usize, usize, u64)> = Vec::new();
+        for off in targets {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                    v.grid_scroll.set_offset(gpui::point(px(0.), px(-off)));
+                });
+            });
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let (unloaded, kept, evicted, hits) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let band = grid_visible_range(&l, off, b.size.height.as_f32()).unwrap_or((0, 0));
+                let unloaded = (band.0..=band.1)
+                    .filter(|p| !v.grid_thumbs.contains_key(p))
+                    .count();
+                let mut kept = 0usize;
+                let mut evicted = 0usize;
+                for p in prev_band.0..=prev_band.1 {
+                    if v.grid_thumbs.contains_key(&p) {
+                        kept += 1;
+                    } else {
+                        evicted += 1;
+                    }
+                }
+                (unloaded, kept, evicted, v.grid_placeholder_hits.get())
+            });
+            rows_out.push((off, unloaded, kept, evicted, hits));
+            prev_band = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                grid_visible_range(&l, off, b.size.height.as_f32()).unwrap_or((0, 0))
+            });
+        }
+        let scroll_wall = scroll_t0.elapsed();
+        let last = rows_out.last().unwrap();
+        let (stop_off, last_unloaded, hits_at_stop) = (last.0, last.1, last.4);
+        eprintln!(
+            "DIAG_GRID|SCROLL wall_ms={:.1} hits_delta={} stop_unloaded={}",
+            scroll_wall.as_secs_f64() * 1000.0,
+            hits_at_stop - hits_base,
+            last_unloaded
+        );
+        for r in &rows_out {
+            eprintln!(
+                "DIAG_GRID|frame off={:.0} unloaded_visible={} prev_band_kept={} prev_band_evicted={} hits_cum={}",
+                r.0, r.1, r.2, r.3, r.4
+            );
+        }
+        // 停滚结算：推进真实帧直到「可见行」/「整带」全部缩略图就绪，记录帧数 + 墙钟，
+        // 并统计每帧新就绪数（= 停滚后 worker 出图吞吐，判定派发独闸 vs worker 串行）。
+        let settle_t0 = std::time::Instant::now();
+        let mut frames_vis: Option<usize> = None;
+        let mut frames_band: Option<usize> = None;
+        let mut ready_per_frame: Vec<usize> = Vec::new();
+        let mut prev_ready = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.len()
+        });
+        for it in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let (vis_ok, band_ok, ready_now) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let vis_ok = match l.first_visible_grid_row(stop_off, b.size.height.as_f32()) {
+                    None => true,
+                    Some((r0, r1)) => {
+                        let s = l.row_page_start[r0];
+                        let e = l.row_page_start[r1 + 1].saturating_sub(1);
+                        (s..=e).all(|p| v.grid_thumbs.contains_key(&p))
+                    }
+                };
+                let band_ok = match grid_visible_range(&l, stop_off, b.size.height.as_f32()) {
+                    None => true,
+                    Some((s, e)) => (s..=e).all(|p| v.grid_thumbs.contains_key(&p)),
+                };
+                (vis_ok, band_ok, v.grid_thumbs.len())
+            });
+            ready_per_frame.push(ready_now.saturating_sub(prev_ready));
+            prev_ready = ready_now;
+            if frames_vis.is_none() && vis_ok {
+                frames_vis = Some(it + 1);
+            }
+            if frames_band.is_none() && band_ok {
+                frames_band = Some(it + 1);
+                break;
+            }
+        }
+        let settle_wall = settle_t0.elapsed();
+        let hits_after = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        eprintln!(
+            "DIAG_GRID|SETTLE vis_frames={:?} band_frames={:?} wall_ms={:.1} hits_growth={} ready/new_per_frame={:?}",
+            frames_vis,
+            frames_band,
+            settle_wall.as_secs_f64() * 1000.0,
+            hits_after - hits_at_stop,
+            ready_per_frame
+        );
+    }
+
+    // ---- 长文档（pdf测试长.pdf）快滚延迟取证探针（只读取证，禁当回归） ----
+    // 回答「长文档（16MB，约 3.2× 87 页）快滚仍延迟显示」：①整本驻留预算盖不住（256MB
+    // 满档装不下 → LRU 逐出远端，新入带重栅）还是 ②worker 串行吞吐物理墙（即使全命中，
+    // 每帧 ≤GRID_PREFETCH_INFLIGHT 派发 + 单 worker 串行，落图速率有上界）。
+    // 口径：进网格 → 空闲预熟整本（计时 + 完成度）→ 快滚逐帧采样 unloaded/hits → 停滚
+    // 结算帧数/墙钟 → worker grid_cache_len 前后对比判逐出。缺长夹具 SKIP（K66 路径口径）。
+
+    /// 按**显式路径**开网格宿主（`open_grid_host_fixture` 只认注册夹具；长文档路径不在
+    /// `test_pdf_paths` 内，本探针单建，同构复制其开窗+等加载+进网格姿势）。
+    fn open_grid_host_path<'a>(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &'a mut TestAppContext,
+        pdf_path: std::path::PathBuf,
+    ) -> (gpui::Entity<GridHost>, &'a mut VisualTestContext) {
+        let (root, vcx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| PdfViewer::new(pdf_path.clone(), cx));
+            holder.borrow_mut().replace(pdf.clone());
+            GridHost { pdf }
+        });
+        vcx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            vcx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..600 {
+            vcx.run_until_parked();
+            loaded = vcx
+                .update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "PDF 应加载完成");
+        enter_grid(holder, vcx);
+        (root, vcx)
+    }
+
+    /// 空闲预熟整本（诊断版）：不 panic，返回完成度 + 墙钟 + 末态缓存条目数。门控同
+    /// `grid_prewarm_full_doc`（条目 ≥ 页数 且连续多轮稳定）；长文档每页两档 ~17ms debug
+    /// 整本 ~5-10s 墙钟，帧预算 16000×2ms ≈ 32s 余量托管（K194 预存白名单：断言动态化）。
+    async fn diag_prewarm_full(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+    ) -> (crate::pdf::PdfWorker, u64, usize, bool, f64, usize) {
+        let (worker, doc_id, page_count) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.worker.clone().expect("已打开文档应已连 worker"),
+                v.doc_id,
+                v.dims.len(),
+            )
+        });
+        let t0 = std::time::Instant::now();
+        let mut prev = 0usize;
+        let mut last = 0usize;
+        let mut steady = 0u32;
+        let mut done = false;
+        for _ in 0..16000 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let n = worker.grid_cache_len(doc_id);
+            last = n;
+            if n >= page_count && n == prev && n > 0 {
+                steady += 1;
+                if steady >= 3 {
+                    done = true;
+                    break;
+                }
+            } else {
+                steady = 0;
+            }
+            prev = n;
+        }
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        (worker, doc_id, page_count, done, wall_ms, last.max(prev))
+    }
+
+    /// 单一夹具快滚诊断主流程（长/短共用）：打印 `DIAG_GRID_LONG|<label>|...` 行。
+    async fn diag_scroll_flow(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+        label: &str,
+    ) {
+        use std::time::Instant;
+        // ① 页数/几何/满档字节估算 → 整本驻留覆盖比（scale_factor=2、默认卡宽）。
+        let (pages, sf, card_px, bucket, aspect) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let full_card = v.grid_card_width();
+            let sf = v.scale_factor.max(1.0);
+            let bucket = grid_bucket_width(full_card * sf);
+            let (pw, ph) = v.dims[0];
+            (
+                v.dims.len(),
+                sf as f64,
+                full_card as f64,
+                bucket as f64,
+                (ph / pw) as f64,
+            )
+        });
+        let w = bucket; // 576（560 → 桶）
+        let h = (w * aspect).round();
+        let bytes_full_card = (w * h * 4.0) as u64;
+        let pages_256mb = (256u64 * 1024 * 1024) as f64 / bytes_full_card as f64;
+        let coverage = pages as f64 / pages_256mb;
+        eprintln!(
+            "DIAG_GRID_LONG|{label}|pages={pages} sf={sf} card_px={card_px} bucket={bucket} bytes/full-card={bytes_mb:.2}MB pages_in_256MB={pages_256mb:.0} coverage_ratio={coverage:.2} (full_doc_est={est_mb:.0}MB vs 256MB cap)",
+            label = label,
+            pages = pages,
+            sf = sf,
+            card_px = card_px,
+            bucket = bucket,
+            bytes_mb = bytes_full_card as f64 / (1024.0 * 1024.0),
+            pages_256mb = pages_256mb,
+            coverage = coverage,
+            est_mb = pages as f64 * bytes_full_card as f64 * 1.25 / (1024.0 * 1024.0),
+        );
+        // ② 空闲预熟整本（计时 + 完成度 + 末态条目）。
+        let (worker, doc_id, page_count, prewarm_done, prewarm_ms, prewarm_len) =
+            diag_prewarm_full(holder, cx).await;
+        eprintln!(
+            "DIAG_GRID_LONG|{label}|prewarm done={prewarm_done} wall_ms={prewarm_ms:.0} cache_len={prewarm_len} (2×pages={two_pages})",
+            label = label,
+            prewarm_done = prewarm_done,
+            prewarm_ms = prewarm_ms,
+            prewarm_len = prewarm_len,
+            two_pages = 2 * page_count,
+        );
+        // ③ 快滚：每帧 +3 行带 × 多帧（跨多屏），采样 (off, unloaded_visible, hits)。
+        let targets: Vec<f32> = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                v.grid_card_width(),
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            let mut t = Vec::new();
+            let mut r = 1usize;
+            while r + 4 < l.rows && t.len() < 8 {
+                t.push(l.row_top[r]);
+                r += 3;
+            }
+            t
+        });
+        let hits_base = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        let cache_before = worker.grid_cache_len(doc_id);
+        let scroll_t0 = Instant::now();
+        let mut prev_band = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                v.grid_card_width(),
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            grid_visible_range(&l, 0.0, b.size.height.as_f32()).unwrap_or((0, 0))
+        });
+        let mut rows_out: Vec<(f32, usize, usize, usize, u64)> = Vec::new();
+        for off in &targets {
+            cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                    v.grid_scroll.set_offset(gpui::point(px(0.), px(-off)));
+                });
+            });
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let (unloaded, kept, evicted, hits) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    v.grid_card_width(),
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let band = grid_visible_range(&l, *off, b.size.height.as_f32()).unwrap_or((0, 0));
+                let unloaded = (band.0..=band.1)
+                    .filter(|p| !v.grid_thumbs.contains_key(p))
+                    .count();
+                let mut kept = 0usize;
+                let mut evicted = 0usize;
+                for p in prev_band.0..=prev_band.1 {
+                    if v.grid_thumbs.contains_key(&p) {
+                        kept += 1;
+                    } else {
+                        evicted += 1;
+                    }
+                }
+                (unloaded, kept, evicted, v.grid_placeholder_hits.get())
+            });
+            rows_out.push((*off, unloaded, kept, evicted, hits));
+            prev_band = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    v.grid_card_width(),
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                grid_visible_range(&l, *off, b.size.height.as_f32()).unwrap_or((0, 0))
+            });
+        }
+        let scroll_wall = scroll_t0.elapsed();
+        let last = rows_out.last().unwrap();
+        let (stop_off, _, hits_at_stop) = (last.0, last.1, last.4);
+        eprintln!(
+            "DIAG_GRID_LONG|{label}|scroll_frames={frames} scroll_wall_ms={wall_ms:.1} hits_delta={hits_delta} stop_unloaded={stop_unloaded}",
+            label = label,
+            frames = rows_out.len(),
+            wall_ms = scroll_wall.as_secs_f64() * 1000.0,
+            hits_delta = hits_at_stop - hits_base,
+            stop_unloaded = last.1,
+        );
+        for r in &rows_out {
+            eprintln!(
+                "DIAG_GRID_LONG|{label}|frame off={off:.0} unloaded_visible={unloaded} prev_band_kept={kept} prev_band_evicted={evicted} hits_cum={hits}",
+                label = label,
+                off = r.0,
+                unloaded = r.1,
+                kept = r.2,
+                evicted = r.3,
+                hits = r.4,
+            );
+        }
+        // ④ 停滚结算：可见带全有纹理需多少帧/ms + 每帧新就绪（worker 串行出图吞吐）。
+        let settle_t0 = Instant::now();
+        let mut frames_vis: Option<usize> = None;
+        let mut frames_band: Option<usize> = None;
+        let mut ready_per_frame: Vec<usize> = Vec::new();
+        let mut prev_ready = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).grid_thumbs.len()
+        });
+        for it in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let (vis_ok, band_ok, ready_now) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    v.grid_card_width(),
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let off = stop_off;
+                let vis_ok = match l.first_visible_grid_row(off, b.size.height.as_f32()) {
+                    None => true,
+                    Some((r0, r1)) => {
+                        let s = l.row_page_start[r0];
+                        let e = l.row_page_start[r1 + 1].saturating_sub(1);
+                        (s..=e).all(|p| v.grid_thumbs.contains_key(&p))
+                    }
+                };
+                let band_ok = match grid_visible_range(&l, off, b.size.height.as_f32()) {
+                    None => true,
+                    Some((s, e)) => (s..=e).all(|p| v.grid_thumbs.contains_key(&p)),
+                };
+                (vis_ok, band_ok, v.grid_thumbs.len())
+            });
+            ready_per_frame.push(ready_now.saturating_sub(prev_ready));
+            prev_ready = ready_now;
+            if frames_vis.is_none() && vis_ok {
+                frames_vis = Some(it + 1);
+            }
+            if frames_band.is_none() && band_ok {
+                frames_band = Some(it + 1);
+                break;
+            }
+        }
+        let settle_wall = settle_t0.elapsed();
+        let hits_after = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        let cache_after = worker.grid_cache_len(doc_id);
+        eprintln!(
+            "DIAG_GRID_LONG|{label}|settle vis_frames={frames_vis:?} band_frames={frames_band:?} wall_ms={wall_ms:.1} hits_growth={hits_growth} ready/new_per_frame={ready_per_frame:?}",
+            label = label,
+            frames_vis = frames_vis,
+            frames_band = frames_band,
+            wall_ms = settle_wall.as_secs_f64() * 1000.0,
+            hits_growth = hits_after - hits_at_stop,
+            ready_per_frame = ready_per_frame,
+        );
+        let dropped = cache_before.saturating_sub(cache_after);
+        eprintln!(
+            "DIAG_GRID_LONG|{label}|evict cache_len_before={cache_before} cache_len_after={cache_after} dropped={dropped} ({cache_after}/2pages={two_pages})",
+            label = label,
+            cache_before = cache_before,
+            cache_after = cache_after,
+            dropped = dropped,
+            two_pages = 2 * page_count,
+        );
+    }
+
+    /// 长文档（`target/pdf测试长.pdf`，16MB）快滚诊断：整本预熟 → 快滚 → 结算 → 逐出判。
+    #[gpui::test]
+    async fn grid_diag_long_doc_fast_scroll(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let long = manifest.join("pdf测试长.pdf");
+        if !long.exists() {
+            eprintln!("SKIP: missing target/pdf测试长.pdf（长文档夹具未装配，本线不判）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_path(&holder, cx, long);
+        diag_scroll_flow(&holder, cx, "long").await;
+    }
+
+    /// 短文档（87 页 pdf测试2.pdf）同场景对照（同一 diag 主流程，供长 vs 短表）。
+    #[gpui::test]
+    async fn grid_diag_short_doc_fast_scroll(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        diag_scroll_flow(&holder, cx, "short87").await;
+    }
+
+    // ---- 本批「空闲预熟整本 + 当前文档永驻留」（杠杆 1/2）验收 ----
+
+    /// 等 worker 把当前文档网格缩略图**空闲预熟**整本补进缓存。门控 = 「条目 ≥ 页数 且
+    /// 连续多轮稳定」：`grid_cache_len` 是同步查询，worker 必在回答前把在飞的那页渲完，
+    /// 故每轮查询都推进一步预熟、任何单页（两档）完成都会把计数 +1/2——连续 3 轮计数不变
+    /// 即预熟完成（游标过末尾、无更多页在飞）。兼容「极窄档快清=同桶」「页已有视图请求
+    /// 条目」等使条目数不精确等于 2×页数的情况（K177：断言源自真实完成语义而非凑整）。
+    /// K194 预存白名单：夹具 87 页、断言用动态 `dims.len()`；栅格真实走 worker（每页两档
+    /// ~10-20ms debug），轮询上限 ~4000 帧 × 2ms ≈ 8s+ 墙钟余量。
+    async fn grid_prewarm_full_doc(
+        holder: &Rc<RefCell<Option<Entity<PdfViewer>>>>,
+        cx: &mut VisualTestContext,
+    ) -> (crate::pdf::PdfWorker, u64, usize) {
+        let (worker, doc_id, page_count) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.worker.clone().expect("已打开文档应已连 worker"),
+                v.doc_id,
+                v.dims.len(),
+            )
+        });
+        assert!(page_count > 8, "夹具需多页，实际 {page_count}");
+        let mut filled = false;
+        let mut prev = 0usize;
+        let mut steady = 0u32;
+        for _ in 0..4000 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let n = worker.grid_cache_len(doc_id);
+            if n >= page_count && n == prev {
+                steady += 1;
+                if steady >= 3 {
+                    filled = true;
+                    break;
+                }
+            } else {
+                steady = 0;
+            }
+            prev = n;
+        }
+        assert!(
+            filled,
+            "空闲预熟应把整本 {page_count} 页补进 worker 网格缓存并停稳（观察末值 {prev}）"
+        );
+        (worker, doc_id, page_count)
+    }
+
+    /// a（本批验收）：进入网格 → 空闲预熟把**整本**补进 worker 网格缓存（`grid_cache_len ==
+    /// 页数`，预算内不逐出）→ 随后整文档快滚（下 + 回），worker 缓存往返前后仍整本驻留、
+    /// 停滚后可见带纹理就绪。直击「之前已加载（远端被 LRU 逐出）被丢弃 → 新入带卡暴露」。
+    #[gpui::test]
+    async fn grid_prewarm_fills_and_scroll_cached(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        let (worker, doc_id, page_count) = grid_prewarm_full_doc(&holder, cx).await;
+        // ① 预熟整本补齐：worker 网格缓存条目 ≥ 页数（每页全清 + 低清两档条目；无风暴时
+        // 预熟两档都入 → 上限可达 2×页数）。
+        let len_before = worker.grid_cache_len(doc_id);
+        assert!(
+            len_before >= page_count,
+            "空闲预熟后缓存条目应 ≥ 页数 {page_count}（整本补齐；实际 {len_before}）"
+        );
+        // ② 整文档快滚「下 → 回」：worker 缓存往返前后仍整本驻留（永驻留，旧 32MB LRU 会
+        //    把远端逐出、回程整本重栅）。
+        let (_deep_off, _) = storm_scroll_frames(&holder, cx, 6);
+        // 停滚：推进到当前可见带全有纹理（缓存命中下的快就绪；K138 锁整带真实几何）。
+        let mut settled = false;
+        for _ in 0..300 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let off = f32::from(-v.grid_scroll.offset().y);
+                let (s, e) = grid_visible_range(&l, off, b.size.height.as_f32()).unwrap_or((0, 0));
+                (s..=e).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if settled {
+                break;
+            }
+        }
+        assert!(settled, "快滚到深部后可见带应有纹理（worker 缓存命中）");
+        assert!(
+            worker.grid_cache_len(doc_id) >= page_count,
+            "滚到深部后 worker 缓存仍整本驻留（不逐出）"
+        );
+        // 回程：回滚到顶部，推进到顶部带全有纹理（worker 缓存命中，零重栅）。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.grid_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            });
+        });
+        let mut back_settled = false;
+        for _ in 0..300 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            back_settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let off = f32::from(-v.grid_scroll.offset().y);
+                let (s, e) = grid_visible_range(&l, off, b.size.height.as_f32()).unwrap_or((0, 0));
+                (s..=e).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if back_settled {
+                break;
+            }
+        }
+        assert!(back_settled, "回程后顶部可见带应全有纹理（缓存命中，零重载）");
+        assert!(
+            worker.grid_cache_len(doc_id) >= page_count,
+            "往返滚动后 worker 缓存仍整本驻留（永驻留）"
+        );
+    }
+
+    /// b（本批验收「永驻留」）：滚到文档深部再滚回来 → `grid_placeholder_hits` 回程 ~0
+    /// （旧行为远端被 LRU 逐出 → 回程整本重渲重传）、worker 缓存往返不逐出。前置 = 预熟整本。
+    #[gpui::test]
+    async fn grid_keep_all_no_reevap_on_far_return(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        let (worker, doc_id, page_count) = grid_prewarm_full_doc(&holder, cx).await;
+        // 快滚到文档深部（风暴序列最多 ~6 帧×3 行 = 18 行，行数不足则提前到末行）。
+        let (_deep_off, _) = storm_scroll_frames(&holder, cx, 6);
+        // 停滚：推进到当前可见带全有纹理（缓存命中的快就绪）。
+        let mut settled = false;
+        for _ in 0..300 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let off = f32::from(-v.grid_scroll.offset().y);
+                let (s, e) = grid_visible_range(&l, off, b.size.height.as_f32()).unwrap_or((0, 0));
+                (s..=e).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if settled {
+                break;
+            }
+        }
+        assert!(settled, "滚到深部后可见带应有纹理");
+        let hits_before = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        // 回程：回滚到顶部，推进到顶部带全有纹理。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.grid_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            });
+        });
+        let mut back_settled = false;
+        for _ in 0..400 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            back_settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let b = v.grid_scroll.bounds();
+                let l = grid_layout(
+                    &v.dims,
+                    GRID_CARD_WIDTH,
+                    GRID_GAP,
+                    GRID_PADDING,
+                    b.size.width.as_f32(),
+                );
+                let off = f32::from(-v.grid_scroll.offset().y);
+                let (s, e) = grid_visible_range(&l, off, b.size.height.as_f32()).unwrap_or((0, 0));
+                (s..=e).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if back_settled {
+                break;
+            }
+        }
+        assert!(back_settled, "回程后顶部可见带应全有纹理");
+        let hits_after = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .grid_placeholder_hits
+                .get()
+        });
+        let return_delta = hits_after - hits_before;
+        eprintln!("DIAG_GRID|far_return placeholder_delta={return_delta}");
+        // 回程占位 ~0：worker 整本驻留 → 每次回滚命中缓存，占位只来自 1-2 帧缓存命中通道
+        // 往返的前缘窗口；旧行为整本重栅会给回程带来数百级脉冲。界取 160（脉冲口径每帧每
+        // 无图卡计一次，含几个风暴帧新入带前缘；远小于重栅量级，K173 不锁假绿：即使 0 也
+        // 是真零重载——因为 worker 缓存整本驻留已单独断言）。
+        assert!(
+            return_delta <= 160,
+            "回程占位 delta {return_delta} 应 ~0（worker 整本驻留 → 缓存命中零重栅）"
+        );
+        // 永驻留硬证：往返后 worker 缓存整本仍在（旧 32MB LRU 会把远端逐出）。
+        assert!(
+            worker.grid_cache_len(doc_id) >= page_count,
+            "往返后 worker 缓存仍应整本驻留（页数 {page_count}，实际 {}）",
+            worker.grid_cache_len(doc_id)
+        );
+        eprintln!("DIAG_GRID|far_return placeholder_delta={return_delta}");
+    }
+
+    /// c（本批验收「方向感知预取」）：下滚风暴时，派发序先覆盖方向前向——用本帧派发序
+    /// 探针 `grid_dispatch_order`（风暴分支按「超前中心 = 中心 + 滚动方向 × 2 行」排序，
+    /// 同方向内仍距超前中心近优先；落后方向页被排到预算外）。上滚为对称镜像（不重复测）。
+    #[gpui::test]
+    async fn grid_storm_direction_prefetch_ahead_first(cx: &mut TestAppContext) {
+        if test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _pdf_guard = test_util::lock().lock().unwrap();
+        let holder: Rc<RefCell<Option<Entity<PdfViewer>>>> = Rc::default();
+        let (_root, cx) = open_grid_host_fixture(&holder, cx, 1);
+        // 前置：首屏带打满（已有图的页风暴不派，纯验证「新入带无图页」的派发序）。
+        let (first_band, _, _) = expected_grid_band(&holder, cx, 0.0);
+        let mut primed = false;
+        for _ in 0..600 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            primed = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (first_band.0..=first_band.1).all(|p| v.grid_thumbs.contains_key(&p))
+            });
+            if primed {
+                break;
+            }
+        }
+        assert!(primed, "前置：首屏带应打满（{first_band:?}）");
+        // 下跳 3 行带到文档中部（row_top[3]；非末部，超前中心有空间）：相邻帧偏移差远超
+        // 风暴阈值 → 下一帧必入风暴态 dir=+1。取中部带保证超前中心（中心 + cols×2 页）
+        // 不越文档末尾（87 页 5 列 ≈18 行，row_top[3] ≈ 页 15-20，超前 ≈ 25-30 < 87）。
+        let jump_off = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            assert!(l.rows > 5, "夹具需 ≥6 行网格，实际 {}", l.rows);
+            l.row_top[3]
+        });
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, _| {
+                v.grid_scroll
+                    .set_offset(gpui::point(px(0.), px(-jump_off)));
+            });
+        });
+        // 下跳后跑 **1** 个风暴帧即读派发序：预熟可能已让新入带 worker 缓存命中，风暴连续
+        // 帧 8/帧把新带快速打满——第 2+ 帧再读序就全已就绪、序是空（无当年帧派发）。首帧
+        // 一定还有「视图无图、缓存在 worker」的页（prewarm 只填 worker 不填 view grid_thumbs）。
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(16));
+        let _ = cx.refresh();
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // 读本帧派发序 + 风暴/方向/新带中心（与 `schedule_grid_thumbs` 同口径 `(s+e)/2`）。
+        let (order, storm, dir, center, band) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let b = v.grid_scroll.bounds();
+            let l = grid_layout(
+                &v.dims,
+                GRID_CARD_WIDTH,
+                GRID_GAP,
+                GRID_PADDING,
+                b.size.width.as_f32(),
+            );
+            let (s, e) = grid_visible_range(&l, jump_off, b.size.height.as_f32()).unwrap_or((0, 0));
+            (
+                v.grid_dispatch_order.clone(),
+                v.grid_storm,
+                v.grid_scroll_dir,
+                (s + e) / 2,
+                (s, e),
+            )
+        });
+        assert!(storm, "下跳后应入风暴态（grid_storm=true）");
+        assert_eq!(dir, 1, "下滚风暴方向应 = +1");
+        assert!(
+            !order.is_empty(),
+            "风暴帧应有派发（新入带无图页）；带 {band:?} 中心 {center}，序 {order:?}"
+        );
+        eprintln!(
+            "DIAG_GRID|storm_direction order={order:?} center={center} dir={dir} band={band:?}"
+        );
+        assert!(
+            order.iter().all(|&p| p >= center),
+            "下滚风暴派发应先覆盖方向前向：全部 {order:?} 应 ≥ 中心页 {center}（超前优先，落后仅保留窗）"
+        );
     }
 
     #[gpui::test]

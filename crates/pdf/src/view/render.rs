@@ -1432,19 +1432,26 @@ impl PdfViewer {
                     // `loading_placeholder_hits` 对称但独立（单列计数不覆盖网格卡路径）。
                     self.grid_placeholder_hits
                         .set(self.grid_placeholder_hits.get() + 1);
-                    div()
+                    // 风暴期（快滚）占位**弱化**：只画中性底色、不画「第 N 页」文本（快滚
+                    // 满屏页码文本闪烁干扰观感、高对比更刺眼）；idle 期保留既有提示语义。
+                    // 计数不变（回归断言口径保持）：仅视觉降噪，不改卡盒布局/颜色来源。
+                    let body = div()
                         .size_full()
                         .bg(page_bg)
                         .flex()
                         .items_center()
-                        .justify_center()
-                        .child(
+                        .justify_center();
+                    if self.grid_storm {
+                        body.into_any_element()
+                    } else {
+                        body.child(
                             div()
                                 .text_size(px(12.))
                                 .text_color(page_border)
                                 .child(format!("第 {} 页", i + 1)),
                         )
                         .into_any_element()
+                    }
                 }
             };
             let mut card = div()

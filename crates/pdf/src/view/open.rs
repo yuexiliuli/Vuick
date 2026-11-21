@@ -238,6 +238,12 @@ impl PdfViewer {
             grid_last_range: std::cell::Cell::new((0, 0)),
             grid_last_drawn: std::cell::Cell::new(0),
             grid_placeholder_hits: std::cell::Cell::new(0),
+            grid_storm: false,
+            grid_last_offset: 0.0,
+            grid_storm_idle_frames: 0,
+            grid_scroll_dir: 0,
+            grid_dispatch_order: Vec::new(),
+            grid_bytes: 0,
             // wave5 网格多选：进入/退出网格时清空，见 `set_grid_mode`
             grid_selected: HashSet::new(),
             grid_anchor: None,
@@ -934,6 +940,14 @@ impl PdfViewer {
                 // 只丢弃旧桶在途请求；新桶图异步到达后替换桥。
                 self.reset_grid_dispatch_for_zoom_bucket();
             }
+            // 本批「空闲预熟」配合：卡宽变化推 worker 更新预熟目标（跨桶 → worker 端按
+            // 桶级比较发现 target bucket 变了、从 0 重熟新桶；同桶小步缩放桶不变不动游标）。
+            if let Some(worker) = self.worker.clone() {
+                let scale = self.scale_factor.max(1.0);
+                let full_card = self.grid_card_width();
+                let quick_card = grid_quick_target_px(full_card * scale) / scale;
+                worker.set_grid_prewarm(self.doc_id, full_card, quick_card, self.scale_factor);
+            }
         }
         cx.notify();
     }
@@ -972,6 +986,16 @@ impl PdfViewer {
         self.grid_mode = enabled;
         if enabled {
             self.grid_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            // 本批「空闲预熟整本」杠杆：进入网格即通知 worker 以**全清 + 低清两档**目标宽
+            // 开启当前文档的空闲整本预熟（worker 只在四桶全空时按页序逐页补渲缓存，优先级
+            // 最低、任何真实消息到达即抢占，绝不耽误阅读模式——见 `WorkerMsg::SetGridPrewarm`；
+            // 两档都预熟才能让风暴低清 / idle 全清两个方向都命中缓存真零闪）。
+            if let Some(worker) = self.worker.clone() {
+                let scale = self.scale_factor.max(1.0);
+                let full_card = self.grid_card_width();
+                let quick_card = grid_quick_target_px(full_card * scale) / scale;
+                worker.set_grid_prewarm(self.doc_id, full_card, quick_card, self.scale_factor);
+            }
         } else {
             self.clear_grid_resources();
         }
@@ -2296,10 +2320,37 @@ impl PdfViewer {
         self.ensure_tile_pump(cx);
     }
 
-    /// 网格模式的每帧管线（`ensure_window` 的 `grid_mode` 分支）：网格缩略图在途收集 →
-    /// 可视化带派发（限 [`config::pdf::GRID_PREFETCH_INFLIGHT`]/帧）→ 行带外回收。静态帧
-    /// 门控 / keep_window / 瓦片调度概不参与——网格自带独立滚动偏移与独立缩略图槽。
+    /// 网格模式的每帧管线（`ensure_window` 的 `grid_mode` 分支）：**滚动风暴检测（首行）→
+    /// 网格缩略图在途收集 → 可视化带派发（低清/全清双档，限各档每帧预算）→ 行带外回收**。
+    /// 静态帧门控 / keep_window / 瓦片调度概不参与——网格自带独立滚动偏移与独立缩略图槽。
     pub(super) fn ensure_window_grid(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 滚动风暴检测（首行）：相邻帧滚动偏移差 ≥ GRID_STORM_CHANGE_PX → 风暴态（快滚期
+        // 低清派发 + 占位弱化）；连续 GRID_STORM_IDLE_FRAMES 帧几乎静止 → 退出（idle 升级
+        // 接管）。风暴标志本帧即被 schedule_grid_thumbs / build_grid_cards 同帧读取。
+        let off = f32::from(-self.grid_scroll.offset().y);
+        if (off - self.grid_last_offset).abs() >= GRID_STORM_CHANGE_PX {
+            self.grid_storm = true;
+            self.grid_storm_idle_frames = 0;
+        } else {
+            self.grid_storm_idle_frames += 1;
+            if self.grid_storm_idle_frames >= GRID_STORM_IDLE_FRAMES {
+                self.grid_storm = false;
+            }
+        }
+        // 滚动方向（本批「方向感知预取」）：偏移显著增大 = 向下滚（dir=+1，超前补下方大行号
+        // 页）、显著减小 = 向上滚（dir=−1）；静止微移保持上一方向（防抖动翻转）。
+        let delta = off - self.grid_last_offset;
+        if delta >= GRID_STORM_CHANGE_PX {
+            self.grid_scroll_dir = 1;
+        } else if delta <= -GRID_STORM_CHANGE_PX {
+            self.grid_scroll_dir = -1;
+        }
+        self.grid_last_offset = off;
+        // 泵保真：风暴期低清请求排空后渲染不再变化、无事件触发下一次重绘 → 强制 notify
+        // 保泵，防「低清排空后缺帧升级全清」的停滞（对齐瓦片自刷新泵的静态帧驱动姿势）。
+        if self.grid_storm {
+            cx.notify();
+        }
         if self.collect_grid_results() {
             cx.notify();
         }

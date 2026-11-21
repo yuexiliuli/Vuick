@@ -576,6 +576,19 @@ enum WorkerMsg {
         f32,
         mpsc::Sender<Option<RenderResult>>,
     ),
+    /// **网格空闲预熟（本线）**：view 进入网格 / 网格卡宽变化时推送，携带**全清档**与
+    /// **低清快速档**两档目标卡宽（逻辑 px）× DPI 的目标像素宽口径（`card_width ×
+    /// scale_factor`，与 `Grid` 消息同构）。worker 侧开启「当前文档空闲整本预熟」：四桶全空
+    /// + 无在途检索/刷新时，把当前文档**尚未栅格**的页按页序逐页经 [`render_grid`] 两档
+    /// （全清 + 低清）直接算好写进 `grid_cache`（不经 view round-trip、不重开 pdfium），每渲
+    /// 1 页回主循环查队列——任何真实消息（含阅读模式请求）到达即被抢占（预熟只在全部队列
+    /// 空时推进，优先级天然最低，绝不耽误阅读）。
+    /// 文档关闭/切换/重着色（recolor）时预熟游标重置（见 run 循环各分支）。
+    /// 语义：这是「网格在用」的显式信号 + 预熟目标宽（可靠的全清/低清桶来源——`Grid` 消息
+    /// 可能只携带其中一档宽，不能当两档预熟目标）。两档都预熟因为**滚动风暴走低清桶、
+    /// idle 升级走全清桶**——任一方向/时刻的滚动命中缓存才能真零闪（低清已在途的页全清
+    /// 升级由 idle 重派；预熟只是把两档都补齐进 cache，滚动只命中不重栅）。
+    SetGridPrewarm(DocId, f32, f32, f32),
     Close(DocId),
     /// 请求某页文本层数据（懒加载：仅选中/复制/搜索时调用）。**低优先级**：
     /// worker 调度保证绝不排在栅格化（Render）之后执行。
@@ -708,6 +721,9 @@ enum WorkerMsg {
     RecolorRefresh(DocId, Vec<RecolorKey>, mpsc::Sender<RecolorEntry>),
     /// 读回某文档 raw 缓存条目数（只读；测试/基准用于「全缓存 vs 可见集」比例证据）。
     RawCacheLen(DocId, mpsc::Sender<usize>),
+    /// 读回某文档**网格缩略图缓存**条目数（只读；预熟/永驻留测试用——断言「整本补齐」与
+    /// 「往返后仍整本（不逐出）」，见 `grid_cache_len`；注意每页预熟可占全清+低清两档条目）。
+    GridCacheLen(DocId, mpsc::Sender<usize>),
     /// 读回某文档当前 `navigate_gen` 镜像（只读；L1/L2 世代同步测试用，见
     /// [`PdfWorker::navigate_gen`]）。文档未打开 / 已关闭 → 0。
     NavigateGen(DocId, mpsc::Sender<u64>),
@@ -864,6 +880,22 @@ impl PdfWorker {
         rx
     }
 
+    /// **网格空闲预熟开启/更新目标（本线）**：view 进入网格或网格卡宽（
+    /// [`PdfViewer::grid_card_width`]）变化时调用，携带全清档卡宽 × DPI。worker 据此开启
+    /// 「四桶全空时把当前文档整本逐页预熟进 `grid_cache`」（最低优先级，任何真实消息
+    /// 到达即被抢占）。低清快档风暴期间 `Grid` 消息携带的是低清卡宽，不能据此设定全清
+    /// 预熟目标——故单设本轻量控制消息（`rest_q` 外单独 sweep 当下应用，不入桶）。
+    /// `quick_card` = 低清快速档目标卡宽（view 已按 [`PdfViewer::grid_quick_target_px`] 换算，
+    /// worker 不再重算 0.5×/64 下限——两档都预熟，滚动风暴（低清桶）与 idle（全清桶）
+    /// 均命中缓存零重栅）。
+    pub fn set_grid_prewarm(&self, doc_id: DocId, full_card: f32, quick_card: f32, scale_factor: f32) {
+        let _ = self.tx.send((
+            0,
+            0,
+            WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor),
+        ));
+    }
+
     /// F4 预取走廊：请求渲染某页的**半密度整页预览**（异步；`scale` = 0.5× `cover_scale`）。
     /// 与普通封面同级优先级（render_q 视口内容优先），但结果**不入 raw 缓存、不参与重着色
     /// 刷新**（瞬态底图，同中清/缩略语义），节省 48MB 预算、不挤占切档刷新的可见原图镜像。
@@ -945,6 +977,15 @@ impl PdfWorker {
     pub fn navigate_gen(&self, doc_id: DocId) -> u64 {
         let (tx, rx) = mpsc::channel();
         let _ = self.tx.send((0, 0, WorkerMsg::NavigateGen(doc_id, tx)));
+        rx.recv().unwrap_or(0)
+    }
+
+    /// 读回 `doc_id` 文档当前**网格缩略图缓存**条目数（同步；只读，本批预熟/永驻留测试用——
+    /// 断言「空闲预熟把整本补进缓存」与「往返滚动后不逐出」）。注意每页预熟可占全清+低清
+    /// 两档条目（条目数随分桶数变，不锁死 == 页数）。文档未打开 / 已关闭 → 0。
+    pub fn grid_cache_len(&self, doc_id: DocId) -> usize {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send((0, 0, WorkerMsg::GridCacheLen(doc_id, tx)));
         rx.recv().unwrap_or(0)
     }
 
@@ -1257,6 +1298,11 @@ impl PdfWorker {
         // `last_used` = 全局单调序列号（LRU 裁决只在本文档缓存内比较，全局递增即可）。
         let mut grid_cache: HashMap<DocId, Vec<GridEntry>> = HashMap::new();
         let mut grid_seq: u64 = 0;
+        // 网格**空闲预熟**状态（本线）：`Some` = 已开启当前文档整本预熟（见
+        // [`WorkerMsg::SetGridPrewarm`]）。只在「四桶全空 + 无在途检索/刷新」时推进（run
+        // 循环 5.5 步），逐页栅格进 `grid_cache`；文档关闭/切换/recolor 时由下方各分支
+        // 重置游标或清除。预熟不经 view round-trip（无 tx 回传），结果只落 worker 缓存。
+        let mut grid_prewarm: Option<GridPrewarm> = None;
         // 在途的重着色刷新分帧状态（见 [`PendingRefresh`]）：切档只刷可见集、逐批回传。
         let mut pending_refresh: Option<PendingRefresh> = None;
         // 各文档最近一次**已完成**刷新所用的参数：worker 端同参短路基准（同参不再重复回传）。
@@ -1280,6 +1326,43 @@ impl PdfWorker {
                         // raw/luma、着色在绘制时现算）：切档即旧色失效 → 整文档清空（格卡
                         // 廉价可秒级重渲，避免夜/日档切换残留旧色卡；GPU 模式清亦无害）。
                         grid_cache.remove(&doc_id);
+                        // 缓存已清 → 预熟游标归 0：以新色从整本开头重熟（旧游标会漏熟开头页）。
+                        if let Some(p) = grid_prewarm.as_mut() {
+                            if p.doc_id == doc_id {
+                                p.cursor = 0;
+                            }
+                        }
+                    }
+                    WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor) => {
+                        // 预熟开启/目标更新（「网格在用」显式信号）：进入网格或卡宽变化时
+                        // view 推送全清 + 低清两档目标宽。同一文档重复推送只更新目标与重置游标
+                        // （目标分桶变化 → 旧桶预熟作废，从 0 重熟新桶；同桶小步缩放不重置游标，
+                        // 避免每个 zoom 步都重扫整本）。
+                        let same_doc = grid_prewarm.as_ref().is_some_and(|p| p.doc_id == doc_id);
+                        let same_bucket = grid_prewarm.as_ref().is_some_and(|p| {
+                            p.doc_id == doc_id
+                                && grid_bucket_width(p.full_card * p.scale_factor.max(1.0))
+                                    == grid_bucket_width(full_card * scale_factor.max(1.0))
+                        });
+                        match grid_prewarm.as_mut() {
+                            Some(p) if same_doc => {
+                                if !same_bucket {
+                                    p.full_card = full_card;
+                                    p.quick_card = quick_card;
+                                    p.scale_factor = scale_factor;
+                                    p.cursor = 0;
+                                }
+                            }
+                            _ => {
+                                grid_prewarm = Some(GridPrewarm {
+                                    doc_id,
+                                    cursor: 0,
+                                    full_card,
+                                    quick_card,
+                                    scale_factor,
+                                });
+                            }
+                        }
                     }
                     WorkerMsg::RecolorRefresh(doc_id, keys, tx) => {
                         // 圈定可见集 → 挂分帧状态（首轮循环的 4.5 步开始逐批回传）。
@@ -1513,6 +1596,10 @@ impl PdfWorker {
                         raw_cache.remove(&doc_id);
                         // 网格视图缩略图缓存随文档一起清理（释放内存、防 doc_id 复用残留）。
                         grid_cache.remove(&doc_id);
+                        // 预熟随文档关闭一并停（防 doc_id 复用残留旧预熟游标）。
+                        if grid_prewarm.as_ref().is_some_and(|p| p.doc_id == doc_id) {
+                            grid_prewarm = None;
+                        }
                         // 关闭本应在途的重着色刷新（残留分帧状态会在空 raw 上空转）。
                         if pending_refresh.as_ref().is_some_and(|pr| pr.doc_id == doc_id) {
                             pending_refresh = None;
@@ -1798,6 +1885,10 @@ impl PdfWorker {
                         let n = raw_cache.get(&doc_id).map_or(0, |v| v.len());
                         let _ = tx.send(n);
                     }
+                    WorkerMsg::GridCacheLen(doc_id, tx) => {
+                        let n = grid_cache.get(&doc_id).map_or(0, |v| v.len());
+                        let _ = tx.send(n);
+                    }
                     WorkerMsg::NavigateGen(doc_id, tx) => {
                         let n = navigate_gen.get(&doc_id).copied().unwrap_or(0);
                         let _ = tx.send(n);
@@ -1926,6 +2017,61 @@ impl PdfWorker {
                 }
                 continue;
             }
+            // 5.5) 网格**空闲预熟整本**（本线）：四桶全空 + 无在途检索/刷新（走到这里即
+            //      证 render/mid/thumb/rest/grid 全空 + pending_search/pending_refresh 无，
+            //      因为任一非空都会在更早步骤 `continue` 走掉）且预熟启用未完成时，把当前
+            //      文档仍未栅格的页按页序逐页 `render_grid` 进缓存（不经 view round-trip、
+            //      不重开 pdfium；结果只落 worker `grid_cache`）。每渲 1 页 `continue` 回主
+            //      循环查队列——任何真实消息（含阅读模式渲染/Open/Close）到达即被抢占，
+            //      预熟只在整机空闲时推进，**绝不耽误阅读模式**（渲染/占位/rest 恒先出队）。
+            //      预设目标宽 = [`WorkerMsg::SetGridPrewarm`] 携带的**全清 + 低清两档**：滚动
+            //      风暴走低清桶、idle 升级走全清桶——任一方向/滚动状态命中缓存才真零闪
+            //      （预熟只补「缓存里还没有对应桶」的页，已缓存跳过，不自重复渲染）。
+            //      先把预熟字段按值取出（避免 `grid_prewarm` 借用跨 render_grid 与状态清/改）。
+            let prewarm_snap = grid_prewarm
+                .as_ref()
+                .map(|p| (p.doc_id, p.full_card, p.quick_card, p.scale_factor));
+            if let Some((pre_doc_id, pre_full, pre_quick, pre_scale)) = prewarm_snap {
+                let Some(page_count) = docs.get(&pre_doc_id).map(|d| d.pages().len() as usize) else {
+                    // 预熟文档已关闭（正常应经 Close 清 prewarm，这里兜底防 race）。
+                    grid_prewarm = None;
+                    continue;
+                };
+                let scale = pre_scale.max(1.0);
+                let full_px = pre_full * scale;
+                let quick_px = pre_quick * scale;
+                let full_bucket = grid_bucket_width(full_px);
+                let quick_bucket = grid_bucket_width(quick_px);
+                // 预熟页两档都已缓存 → 越过它（整本补齐不自重复渲染）。
+                let mut cursor = grid_prewarm.as_ref().map(|p| p.cursor).unwrap_or(0);
+                let cache = grid_cache.entry(pre_doc_id).or_default();
+                while cursor < page_count
+                    && cache.iter().any(|e| e.page == cursor && e.bucket_px == full_bucket)
+                    && cache.iter().any(|e| e.page == cursor && e.bucket_px == quick_bucket)
+                {
+                    cursor += 1;
+                }
+                if cursor < page_count {
+                    let p = recolor.get(&pre_doc_id).copied().flatten();
+                    let gpu = crate::recolor::gpu_recolor_gate();
+                    if let Some(doc) = docs.get(&pre_doc_id) {
+                        // 全清档 + 低清档（若与全清同桶——极窄退化档——第二次命中缓存零成本）
+                        render_grid(doc, cursor, full_px, p, cache, &mut grid_seq, gpu);
+                        render_grid(doc, cursor, quick_px, p, cache, &mut grid_seq, gpu);
+                    }
+                    // 无论 render 成功与否都前进光标：失败（页无法渲染）不卡死预熟循环。
+                    if let Some(pre) = grid_prewarm.as_mut() {
+                        if pre.doc_id == pre_doc_id {
+                            pre.cursor = cursor + 1;
+                        }
+                    }
+                    continue; // 回主循环查队列（真实消息到达即抢占）
+                } else {
+                    // 光标越过末尾（全部页已熟/无法渲）→ 该文档预熟完成，停。
+                    grid_prewarm = None;
+                    continue;
+                }
+            }
             // 5) 真空闲：阻塞等新消息（只有在既无排队消息、无在途检索/刷新时才真阻塞）。
             //    `SetRecolor`/`RecolorRefresh`/`Navigate` 与上方 sweep 走同一拦截：收到当下应用，
             //    不入桶（否则经 enqueue_msg 落到 rest_q 会撞 `_ => unreachable!` 把工作线程打死）。
@@ -1937,6 +2083,40 @@ impl PdfWorker {
                     recolor.insert(doc_id, params);
                     // 同 sweep：网格缓存存最终着色位图，切档即旧色失效 → 整套清空。
                     grid_cache.remove(&doc_id);
+                    // 同 sweep：缓存已清 → 预熟游标归 0（以新色从整本开头重熟）。
+                    if let Some(p) = grid_prewarm.as_mut() {
+                        if p.doc_id == doc_id {
+                            p.cursor = 0;
+                        }
+                    }
+                }
+                Ok((_gen, _z, WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor))) => {
+                    // 与上方 sweep 同一「预熟开启/目标更新」语义（view 唯一真源；桶级比较）。
+                    let same_doc = grid_prewarm.as_ref().is_some_and(|p| p.doc_id == doc_id);
+                    let same_bucket = grid_prewarm.as_ref().is_some_and(|p| {
+                        p.doc_id == doc_id
+                            && grid_bucket_width(p.full_card * p.scale_factor.max(1.0))
+                                == grid_bucket_width(full_card * scale_factor.max(1.0))
+                    });
+                    match grid_prewarm.as_mut() {
+                        Some(p) if same_doc => {
+                            if !same_bucket {
+                                p.full_card = full_card;
+                                p.quick_card = quick_card;
+                                p.scale_factor = scale_factor;
+                                p.cursor = 0;
+                            }
+                        }
+                        _ => {
+                            grid_prewarm = Some(GridPrewarm {
+                                doc_id,
+                                cursor: 0,
+                                full_card,
+                                quick_card,
+                                scale_factor,
+                            });
+                        }
+                    }
                 }
                 Ok((_gen, _z, WorkerMsg::RecolorRefresh(doc_id, keys, tx))) => {
                     start_recolor_refresh(
@@ -3172,6 +3352,23 @@ fn grid_render_count() -> u64 {
     GRID_RENDERS.load(Ordering::Relaxed)
 }
 
+/// 网格**空闲预熟**游标（本线）：`grid_prewarm` 的状态载荷。`cursor` 前进方向 = 页序
+/// （升序整本补齐）；`full_card`/`quick_card`/`scale_factor` = 预熟目标（来自 view 进入网格
+/// /卡宽变化时推送的 [`WorkerMsg::SetGridPrewarm`]，全清 + 低清两档——`render_grid` 前乘成
+/// 目标像素宽）。每页两档都预熟：滚动风暴（低清桶）与 idle（全清桶）均命中缓存零重栅。
+struct GridPrewarm {
+    /// 预熟文档。
+    doc_id: DocId,
+    /// 下一页待预熟下标（升序；已缓存页在推进时跳过）。
+    cursor: usize,
+    /// 全清档目标卡宽（逻辑 px；×`scale_factor` = 目标像素宽，与 `request_grid` 同口径）。
+    full_card: f32,
+    /// 低清快速档目标卡宽（逻辑 px；view 已按 `grid_quick_target_px` 换算出 ≤全清的宽）。
+    quick_card: f32,
+    /// 显示 DPI（≥1.0 口径沿用 `view` 侧 `scale_factor.max(1.0)`）。
+    scale_factor: f32,
+}
+
 /// 网格缩略图缓存条目（**最终着色** BGRA；切档由 run 循环清整文档缓存，见 SetRecolor）。
 /// key = `(page, bucket_px)`；`last_used` 为全局单调序列号（LRU 裁决在本文档缓存内比较）。
 struct GridEntry {
@@ -3243,10 +3440,21 @@ fn grid_cache_evict(cache: &mut Vec<GridEntry>, budget: u64) {
     }
 }
 
-/// 当前网格缓存预算（字节）：生产 = [`config::pdf::GRID_CACHE_BYTES`]（独立于 raw/阅读器
-/// 预算；无需测试覆盖——逐出逻辑由 `grid_cache_insert/evict` 纯函数极小预算直接测）。
-fn grid_cache_budget() -> u64 {
-    config::pdf::GRID_CACHE_BYTES
+/// 网格缓存预算（**动态整本**，本批「当前文档不逐出」杠杆）：= min(整本估算 = `页数 ×
+/// 单卡实际字节 × 5/4`，[`config::pdf::GRID_CACHE_FULL_DOC_MAX`] 256MB 单文档上界)，下限
+/// [`config::pdf::GRID_CACHE_BYTES`]（32MB 既有兜底）。单卡实际字节取「缓存内最大条目」
+/// 与「刚渲染条目」的较大者（同文档同分桶近等尺寸；`scale_factor`>1 时卡面积按平方放大
+/// ——固定 512KB/卡估算会在 DPI2 下低估 4×、把整本误逐出，必须用真实字节）。`×5/4` 给
+/// 「全清 + 低清」两档并存留头：每页 ≈ 全清 1× + 低清 1/4（预熟两档都写缓存，见 5.5 步）。
+/// 效果：常规打开的文档整本（两档）落在预算内 → `grid_cache_insert/evict` 的 LRU **不触发**
+/// （预算内不逐出、滚动任意方向回看零重渲、空闲预熟整本可补齐）；仅超长文档/病态大卡
+/// 超上界时才走既有 LRU 逐最旧。`page_count` = 当前文档页数、`cur_bytes` = 刚渲染单卡字节。
+fn grid_cache_budget(cache: &[GridEntry], page_count: u64, cur_bytes: u64) -> u64 {
+    let per_card = cache.iter().map(GridEntry::bytes).max().unwrap_or(0).max(cur_bytes);
+    let full_doc_estimate = page_count
+        .saturating_mul(per_card.saturating_mul(5) / 4)
+        .min(config::pdf::GRID_CACHE_FULL_DOC_MAX);
+    full_doc_estimate.max(config::pdf::GRID_CACHE_BYTES)
 }
 
 /// 在工作线程内：按目标卡宽渲染某页的**网格缩略图**（独立缓存 + 背景信道）。
@@ -3309,7 +3517,8 @@ fn render_grid(
         last_used: *seq,
     };
     *seq += 1;
-    grid_cache_insert(cache, entry, grid_cache_budget());
+    let budget = grid_cache_budget(cache, doc.pages().len() as u64, entry.bytes());
+    grid_cache_insert(cache, entry, budget);
     Some(result)
 }
 
@@ -4448,6 +4657,133 @@ mod tests {
         let r4 = rx4.recv_timeout(std::time::Duration::from_secs(30)).expect("换桶应收到").expect("渲染应成功");
         assert_eq!(grid_render_count(), before + 2, "换桶未命中应再栅格一次");
         assert_eq!(r4.width, grid_bucket_width(520.0), "换桶位图宽应等于新量化桶");
+    }
+
+    /// DIAG（诊断探针，保留不删、禁当回归）：拆「pdfium 栅格耗时 vs 每卡固定开销」+
+    /// 量 `grid_cache_evict` 的 O(n) 字节求和成本，回答两个问题：
+    /// ①「0.5× 低清快档为何只快 ~20%」——固定开销（doc 查表/recolor 取参/缓存扫描/通道
+    ///    往返）与栅格面积无关；②「批量/并行是否值」——单发 vs 批量发送的每卡总耗时差。
+    /// 只打印数字 + 宽松 sanity 断言（>0/有限/低清 < 全清），不做紧界回归（机器环境波动
+    /// 不作数，K68 噪声机纪律）。
+    #[test]
+    fn grid_diag_fixed_overhead_and_evict_cost() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        // ---- ① grid_cache_evict O(n)：N=512 条真实尺寸合成条目（288 桶 A4 ≈458KB/条），
+        // 拆两档成本：
+        //   a) **字节求和**（预算内每次插入都付）：`o(n)` 单趟 `map(bytes).sum()`——预算足够
+        //      时 over≤0、无逐出，只花这次求和；随缓存变大线性涨。
+        //   b) **超支逐出**（只超预算才付）：额外 O(n) 找最旧 + O(n) remove 移位，到保底 1 条。
+        let n_entries = 512usize;
+        let card_bytes: usize = 288 * ((288.0f32 * 1.414).round() as usize) * 4;
+        let mut cache: Vec<GridEntry> = Vec::with_capacity(n_entries);
+        let mut seq = 0u64;
+        for page in 0..n_entries {
+            seq += 1;
+            let h = ((288.0f32 * 1.414).round() as u32).max(1);
+            cache.push(GridEntry {
+                page,
+                bucket_px: 288,
+                width: 288,
+                height: h,
+                luma: false,
+                bgra: vec![0u8; card_bytes],
+                last_used: seq,
+            });
+        }
+        let t_sum = std::time::Instant::now();
+        let _over = cache.iter().map(GridEntry::bytes).sum::<u64>();
+        let sum_us = t_sum.elapsed().as_secs_f64() * 1e6;
+        let t0 = std::time::Instant::now();
+        grid_cache_evict(&mut cache, 0);
+        let evict_us = t0.elapsed().as_secs_f64() * 1e6;
+        assert_eq!(cache.len(), 1, "budget=0 应逐出到保底 1 条");
+        let total_mb = (n_entries * card_bytes) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "[GRID-DIAG] grid_cache_evict O(n): n={n_entries} 卡({total_mb:.0}MB) → 字节求和(每次插入都付) {sum_us:.1}µs ≈ {:.1}ns/卡；超支全逐出(仅超预算才付) {evict_us:.1}µs ≈ {:.1}ns/卡",
+            sum_us * 1e3 / n_entries as f64,
+            evict_us * 1e3 / n_entries as f64
+        );
+        assert!(evict_us.is_finite() && evict_us > 0.0);
+
+        // ---- ② 全清 vs 低清，worker 往返冷/热分账（批量：先全发再全收，杜绝预熟插空）。
+        //   cold = 冷缓存（pdfium 栅格 + 固定开销）；hot = 同桶缓存命中（只固定开销：
+        //   入队/出队/世代比对/doc 查表/recolor 取参/缓存扫描/通道回传）。
+        //   pdfium 栅格 ≈ cold − hot。低清 0.5× 面积 ↓4× → 栅格 ≈/4；若固定开销占比大，
+        //   整卡总耗时不会按 4× 降（直接回答「0.5× 为何只快 ~20%」）。
+        let p = target_pdf_paths()[1].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n_pages = dims.len().min(48);
+        let pages: Vec<usize> = (0..n_pages).collect();
+        let full_card = 280.0f32; // 288 桶（全清）
+        let quick_card = 140.0f32; // 低清 0.5×（≥64 下限），落 160 桶 ≠ 288
+        assert_ne!(
+            grid_bucket_width(full_card),
+            grid_bucket_width(quick_card),
+            "DIAG 需要两档分桶不同"
+        );
+
+        fn batch_ms(worker: &PdfWorker, doc_id: DocId, pages: &[usize], card: f32) -> f64 {
+            let t0 = std::time::Instant::now();
+            let rxs: Vec<_> = pages
+                .iter()
+                .map(|&p| worker.request_grid(doc_id, p, card, 1.0, 0, 0))
+                .collect();
+            for (i, rx) in rxs.into_iter().enumerate() {
+                let r = rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap_or_else(|_| panic!("第 {i} 页未按时回传"));
+                assert!(r.is_some(), "第 {i} 页渲染应成功");
+            }
+            t0.elapsed().as_secs_f64() * 1e3
+        }
+
+        let full_cold = batch_ms(&worker, doc_id, &pages, full_card) / n_pages as f64;
+        let full_hot = batch_ms(&worker, doc_id, &pages, full_card) / n_pages as f64;
+        let quick_cold = batch_ms(&worker, doc_id, &pages, quick_card) / n_pages as f64;
+        let quick_hot = batch_ms(&worker, doc_id, &pages, quick_card) / n_pages as f64;
+        let full_raster = (full_cold - full_hot).max(0.0);
+        let quick_raster = (quick_cold - quick_hot).max(0.0);
+        eprintln!(
+            "[GRID-DIAG] 批量往返/卡（ms）：全清 cold={full_cold:.3} hot={full_hot:.3} raster≈{full_raster:.3} | 低清 cold={quick_cold:.3} hot={quick_hot:.3} raster≈{quick_raster:.3}"
+        );
+        eprintln!(
+            "[GRID-DIAG] 固定开销占比：全清 {:.0}%、低清 {:.0}%；低清总耗时/全清总耗时 = {:.2}×（若 ≈1 说明固定开销主导）",
+            100.0 * full_hot / full_cold.max(1e-9),
+            100.0 * quick_hot / quick_cold.max(1e-9),
+            quick_cold / full_cold.max(1e-9),
+        );
+
+        // ---- ③ 单发 vs 批量（消息处理/通道往返是否能被批量摊薄）——
+        //   5 页单发逐条的总耗时 vs 同 5 页批量。批量断言用前 5 页（独立分桶、独立缓存）。
+        let sub: Vec<usize> = (0..5).collect();
+        let mut single_total = 0.0f64;
+        for i in 0..5 {
+            let t = std::time::Instant::now();
+            let rx = worker.request_grid(doc_id, sub[i], full_card, 1.0, 0, 0);
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("单发应回传");
+            single_total += t.elapsed().as_secs_f64() * 1e3;
+        }
+        let batch5 = batch_ms(&worker, doc_id, &sub, full_card);
+        eprintln!(
+            "[GRID-DIAG] 单发 vs 批量（5 页全清，缓存内）：单发 {:.3}ms/卡 vs 批量 {:.3}ms/卡 (= {:.2}×)",
+            single_total / 5.0,
+            batch5 / 5.0,
+            single_total / batch5.max(1e-9),
+        );
+        assert!(single_total.is_finite() && batch5.is_finite());
+        // 低清整卡总耗时应 <= 全清（面积 4× 差下的合理方向断言；噪声下不锁紧界）。
+        assert!(
+            quick_cold <= full_cold * 1.5 + 0.05,
+            "低清冷渲不应比全清慢（方向 sanity）"
+        );
+        // 关档清理（含预熟游标），防残留 doc 占用 worker 空闲预熟。
+        worker.close(doc_id);
     }
 
     /// DLL 校验（防种植，纯函数）：sha256 对同一字节集恒等、异字节集必异，
