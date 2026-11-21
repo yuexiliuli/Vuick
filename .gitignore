@@ -1,13 +1,16 @@
 target/
 .kilo
 .code-review-graph/
-assets/
-# 仅放开欢迎页图标资产（其余 assets/ 目录仍忽略）
+assets/*
+# 仅放开欢迎页图标资产与 README 首屏截图（其余 assets/ 内容仍忽略）
 !crates/ui/assets/
+!assets/*.jpg
 kilo.json
 records/
 /resources/
-docs/
+
+# vendor zed fork 下的 docs/ 保持既有无视（原全局 docs/ 规则覆盖，现改为根锚定）
+vendor/zed/crates/gpui/docs/
 
 # exe 打包 dll目录
 /dist
