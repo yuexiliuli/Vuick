@@ -2,11 +2,11 @@
 name = "media_ffmpeg"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 publish = false
 description = "FFmpeg 视频/音频解码内核（cdylib），供 vuick 主程序运行时经 libloading 动态加载"
 
-# 许可：本 crate 自身 Apache-2.0；FFmpeg 为外部 **LGPL v2.1+** 共享库（自建瘦化 decode-only
+# 许可：本 crate 随项目整体为 GPL-3.0-or-later；FFmpeg 为外部 **LGPL v2.1+** 共享库（自建瘦化 decode-only
 # 构建 scripts/build-slim-ffmpeg*.sh，pin n9.0.2、无 GPL/外部库），主 exe 经本 dll 运行
 # 时动态桥接（B1 独立 av*.dll / B2 静态归档可重链）；合规详见根 THIRD_PARTY_NOTICES.md。
 

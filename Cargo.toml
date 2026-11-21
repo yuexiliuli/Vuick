@@ -1,7 +1,7 @@
 [package]
 name = "vuick"
 version = "0.1.0"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "基于 GPUI 的文本 / 代码 / Markdown 编辑器"
 edition = "2024"
 
@@ -65,7 +65,7 @@ default-members = [".", "crates/media_ffmpeg"]
   [workspace.package]
   publish = false
   edition = "2024"
-  license = "Apache-2.0"
+  license = "GPL-3.0-or-later"
 
 [workspace.lints.rust]
 unexpected_cfgs = "allow"

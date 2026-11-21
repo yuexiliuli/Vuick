@@ -2,7 +2,7 @@
 name = "editor"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick 自研文本/代码编辑器 crate（视图层：CodeEditor 渲染/输入/渲染接线；模型层已拆至 editor_core，本 crate 全量重导出）"
 
 [dependencies]

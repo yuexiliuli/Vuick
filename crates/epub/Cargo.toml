@@ -2,7 +2,7 @@
 name = "epub"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick EPUB 解析 crate（OCF 容器 → 平铺 XHTML 文本流 → Markdown + 内存图片）"
 
 [dependencies]

@@ -2,7 +2,7 @@
 name = "pdf"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick PDF 阅读器视图 crate（瓦片虚拟化 + 交互/渲染；栅格化核心在 pdf_core）"
 
 [dependencies]

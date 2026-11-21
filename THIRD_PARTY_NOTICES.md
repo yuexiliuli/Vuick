@@ -1,9 +1,18 @@
 # 第三方许可声明（THIRD-PARTY NOTICES）
 
-本文件是 vuick 分发/源码的第三方组件合规说明。**本体代码一律 Apache-2.0**（见`LICENSE-APACHE`），下列为随分发捆绑或引用到的第三方组件。
+本文件是 vuick 分发/源码的第三方组件合规说明。**本体代码一律 GPL-3.0-or-later**（见 `LICENSE-GPL`；因含 zorite 衍生识别层），下列为随分发捆绑或引用到的第三方组件。
 
 `scripts/package.ps1` 会把本文件与 `third_party/`（许可原文）随包复制到发布目录，满足「随
 分发提供许可证文本」义务。
+
+## zorite（Markdown 识别与数学排版衍生来源）—— GPL-3.0-or-later
+
+- **衍生位置**：`markdown/src/parse/{recognition,cells,inline_style}.rs` 与
+  `markdown_wysiwyg_math`（`math_typeset.rs` / `math.rs` / `content_sync.rs::sync_math`）的识别与
+  数学排版实现衍生自 [packetThrower/zorite]（GitHub，GPL-3.0-or-later）。
+- **义务履行**：整个程序以 GPL-3.0-or-later 发布（`LICENSE-GPL` 全文随包/随源码提供），
+  保留 zorite 作者版权与 GPL 通知；修改部分已在源码注明衍生来源。
+- **许可原文**：`LICENSE-GPL`（GNU GPL v3，与 zorite 同源文本）。
 
 ## FFmpeg（视频/音频解码）—— LGPL v2.1+
 
@@ -39,7 +48,7 @@
 
 ## 其余
 
-- 所有未在此列出的 crates / 代码均为本仓库自研，Apache-2.0。
+- 所有未在此列出的 crates / 代码均为本仓库自研，随本体整体以 GPL-3.0-or-later 授权（Apache-2.0 声明仅存于部分自研模块历史注释，不作为分发许可）。
 
 ---
 

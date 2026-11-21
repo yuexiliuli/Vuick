@@ -3,7 +3,7 @@ name = "kimg_png"
 version = "0.1.0"
 edition = "2024"
 publish = false
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "kimg 拆分的 PNG 编解码 crate（codecs/png + codecs/pngsimd + codecs/png_encoder，自研 IDAT 热路径）。"
 
 [dependencies]

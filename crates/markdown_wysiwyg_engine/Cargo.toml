@@ -2,7 +2,7 @@
 name = "markdown_wysiwyg_engine"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick WYSIWYG 的「元素引擎纯类型核心」：WyTheme 与元素纯类型/几何（Frame/BlockLayout/ShapedRow/FoldPlan/geom 等，自 markdown_wysiwyg 的 wysiwyg/element 纯类型 + theme 拆出的独立 crate，纯结构移动，只重分配既有依赖；不含 WyEditorElement 与 paint/hit/frame/shape）"
 
 [dependencies]

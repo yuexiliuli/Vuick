@@ -2,7 +2,7 @@
 name = "tray"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick 系统托盘 crate（Windows 托盘图标 / 关闭到托盘 / 托盘菜单：unsafe Win32 全部收敛于此）"
 
 [dependencies]

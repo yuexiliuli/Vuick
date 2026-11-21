@@ -3,7 +3,7 @@ name = "kimg_gif"
 version = "0.1.0"
 edition = "2024"
 publish = false
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "kimg 拆分的 GIF 解/编 crate（codecs/gif：容器+LZW+画布+编码器，移植 SimdCodecs）。"
 
 [dependencies]

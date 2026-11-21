@@ -2,7 +2,7 @@
 name = "toc"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick 通用文档目录 crate（树折叠/可见性纯函数 + 单条目录行渲染）"
 
 [dependencies]

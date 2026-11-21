@@ -1,8 +1,7 @@
-<!-- English mirror of README.md -->
-
 # Vuick
 
-<!-- Badge placeholder: CI / release / docs / version badges, to be filled once the public repository address is available. None for now. -->
+![CI](https://github.com/yuexiliuli/Vuick/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
 
 > A text / code / Markdown editor natively built with Rust + GPUI that also reads PDF & EPUB, views images, and plays video & music — no webview: fast, light, and fully offline.
 
@@ -97,8 +96,8 @@ Rust (edition 2024) · GPUI (vendored fork of the Zed repository, `vendor/zed`, 
 
 ## 🤝 Contributing & Feedback
 
-Is Vuick solving a real need for you, or would you like to help polish it? Send corrections and suggestions via [issue / PR](#) (contributing guide: [Contributing](#)), or edit this README directly.
+Is Vuick solving a real need for you, or would you like to help polish it? Send corrections and suggestions via [issue / PR](https://github.com/yuexiliuli/Vuick/issues) (contributing guide: [Contributing](https://github.com/yuexiliuli/Vuick/blob/master/README.md), or just discuss in [issues](https://github.com/yuexiliuli/Vuick/issues)), or edit this README directly.
 
 ## 📄 License
 
-GPL-3.0-or-later (see `LICENSE-GPL-3.0`); compliance details for third-party components (embedded FFmpeg under LGPL loaded at runtime, pdfium, and the zorite-derived recognition layer) can be found in [License & Compliance](docs/licensing.md) and in the `THIRD_PARTY_NOTICES.md` shipped with the distribution.
+GPL-3.0-or-later (see `LICENSE-GPL`); compliance details for third-party components (embedded FFmpeg under LGPL loaded at runtime, pdfium, and the zorite-derived recognition layer) can be found in [License & Compliance](docs/licensing.md) and in the `THIRD_PARTY_NOTICES.md` shipped with the distribution.

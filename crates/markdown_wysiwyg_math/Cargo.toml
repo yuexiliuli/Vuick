@@ -2,7 +2,7 @@
 name = "markdown_wysiwyg_math"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick WYSIWYG 的数学渲染子系统：LaTeX 排版（parse→layout→render 光栅位图）与行内/块公式整形（自 markdown_wysiwyg 的 wysiwyg/math + math_typeset 拆出的独立 crate，纯结构移动，只重分配既有依赖）"
 
 [dependencies]

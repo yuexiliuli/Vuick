@@ -3,7 +3,7 @@ name = "kimg"
 version = "0.1.0"
 edition = "2024"
 publish = false
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "纯 Rust 图像解码/编码兼容层（镜像 image 0.25 的仓库实际使用子集）。第 3 阶段替换 image 的核心 crate。kimg 拆分为门面 crate：共享类型来自 kimg_core，各格式编解码器来自 kimg_png/kimg_gif/kimg_webp/kimg_jpeg/kimg_tiff/kimg_bmp/kimg_ico/kimg_pnm。"
 
 [dependencies]

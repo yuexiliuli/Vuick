@@ -3,7 +3,7 @@ name = "kimg_core"
 version = "0.1.0"
 edition = "2024"
 publish = false
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "kimg 拆分的共享核心 crate：像素/颜色/缓冲/错误/格式/限制/动画等所有格式 codec 公用的纯 Rust 类型（不含任何编解码器）。"
 
 [dependencies]

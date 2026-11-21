@@ -2,7 +2,7 @@
 name = "shell_scan"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick 侧边栏跨文件搜索的纯文件扫描层叶子 crate（文件夹级后台递归扫描 + 行级命中收集 + ASCII 大小写不敏感查找，自 shell 的 app/sidebar/mod.rs 纯扫描部分拆出；纯结构移动，只重分配既有依赖，不新增外部包）"
 
 [dependencies]

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Vuick contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 //! 自 `markdown::live`（已移除）迁至 `markdown` 顶层，与 `wysiwyg`/`view`/`ir`/`parity`
 //! 共用识别层。本文件 = 行内样式/块级区域识别：标题/警报/数学/表格/折叠/图片行等，
 //! 供当前各消费方；曾是 W1 行内扫描引擎主体（`styled_runs`/`hidden_runs` 等）已随

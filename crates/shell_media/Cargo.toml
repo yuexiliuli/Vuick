@@ -2,7 +2,7 @@
 name = "shell_media"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick 媒体/音乐域 crate（自 shell 的 app/media + app/media_window + app/music_player 拆出：查看器元数据同步 / 锁定菜单项构建 / 媒体窗口打开决策与路由决议 / 音乐模式判定；纯结构移动只重分配既有依赖，不新增外部包；经 MediaHost 宿主服务面与 shell 解耦，菜单挂载与窗口/宿主编排留 shell）"
 
 [dependencies]

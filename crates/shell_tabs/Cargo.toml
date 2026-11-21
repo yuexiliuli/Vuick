@@ -2,7 +2,7 @@
 name = "shell_tabs"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick 选项卡栏域 crate（自 shell 的 app/tabs 拆出：TabBar 实体渲染 + 选项卡右键菜单项构建，宿主副作用经 TabsHost 宿主服务面反调；纯结构移动，只重分配既有依赖，不新增外部包）"
 
 [dependencies]

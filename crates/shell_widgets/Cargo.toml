@@ -2,7 +2,7 @@
 name = "shell_widgets"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick L0 纯 UI 组件叶子 crate（自绘横向滚动条 TableScrollState/horizontal_scrollbar + TabBoundsRecorder 选项卡边界记录器，供 shell 各域复用）"
 
 [dependencies]

@@ -2,7 +2,7 @@
 name = "shell_preview"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick 预览域 crate（自 shell 的 app/preview + app/panes 的预览渲染半拆出：md_wy 统一 WyEditor 安装/swap/切换/活区 + 编辑⇄预览滚动同步 + 路径分类 + 预览渲染元素；纯结构移动只重分配既有依赖，不新增外部包；经 PreviewHost 宿主服务面与 shell 解耦，编辑事件订阅/feed 宿主薄适配留 shell）"
 
 [dependencies]

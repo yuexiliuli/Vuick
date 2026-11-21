@@ -3,7 +3,7 @@ name = "kimg_webp"
 version = "0.1.0"
 edition = "2024"
 publish = false
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "kimg 拆分的 WebP 解/编 crate（codecs/webp：容器+VP8L+VP8+ALPH+动画+SIMD，自研热路径）。"
 
 [dependencies]

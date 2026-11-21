@@ -3,7 +3,7 @@ name = "kimg_bmp"
 version = "0.1.0"
 edition = "2024"
 publish = false
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "kimg 拆分的 BMP 解码 crate（codecs/bmp，纯 std）。"
 
 [dependencies]

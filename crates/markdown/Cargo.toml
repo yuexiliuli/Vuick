@@ -2,7 +2,7 @@
 name = "markdown"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "vuick 自研 Markdown 渲染 + 文档管线 crate（Doc+shard 管线；WYSIWYG 编辑已迁至 markdown_wysiwyg）"
 
 [dependencies]

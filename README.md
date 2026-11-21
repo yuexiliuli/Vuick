@@ -1,6 +1,7 @@
 # Vuick
 
-<!-- 徽章占位：CI / release / docs / 版本徽章，待仓库公开地址确定后填入，暂无 -->
+![CI](https://github.com/yuexiliuli/Vuick/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
 
 > Rust + GPUI 原生构建的文本 / 代码 / Markdown 编辑器，兼可阅读 PDF / EPUB、浏览图片、播放视频与音乐——无 webview，快、轻、离线可用。
 
@@ -95,8 +96,8 @@ Rust（edition 2024）· GPUI（Zed 仓库 vendored fork，`vendor/zed`，原生
 
 ## 🤝 贡献与反馈
 
-有这样的编辑器是你的刚需，还是想帮忙打磨它？欢迎以 [issue / PR](#) 提交纠错与建议（贡献指南见 [Contributing](#)），或直接修正本 README。
+有这样的编辑器是你的刚需，还是想帮忙打磨它？欢迎以 [issue / PR](https://github.com/yuexiliuli/Vuick/issues) 提交纠错与建议（贡献指南见 [Contributing](https://github.com/yuexiliuli/Vuick/blob/master/README.md) 或直接在 [issues](https://github.com/yuexiliuli/Vuick/issues) 讨论），或直接修正本 README。
 
 ## 📄 许可
 
-GPL-3.0-or-later（见 `LICENSE-GPL-3.0`）；第三方组件（内置 FFmpeg 的 LGPL 运行时动态加载、pdfium、zorite 衍生识别层等）合规说明见 [许可证与合规](docs/licensing.md) 与发行包内 `THIRD_PARTY_NOTICES.md`。
+GPL-3.0-or-later（见 `LICENSE-GPL`）；第三方组件（内置 FFmpeg 的 LGPL 运行时动态加载、pdfium、zorite 衍生识别层等）合规说明见 [许可证与合规](docs/licensing.md) 与发行包内 `THIRD_PARTY_NOTICES.md`。
