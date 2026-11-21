@@ -152,6 +152,7 @@ impl PdfViewer {
             recolor_received: Vec::new(),
             tile_reqs: 0,
             cover_reqs: 0,
+            cover_re_renders: 0,
             tile_bytes: 0,
             tile_budget_state: None,
             degrade_frames: HashMap::new(),
@@ -244,6 +245,7 @@ impl PdfViewer {
             grid_scroll_dir: 0,
             grid_dispatch_order: Vec::new(),
             grid_bytes: 0,
+            grid_prewarm_pushed: None,
             // wave5 网格多选：进入/退出网格时清空，见 `set_grid_mode`
             grid_selected: HashSet::new(),
             grid_anchor: None,
@@ -940,16 +942,103 @@ impl PdfViewer {
                 // 只丢弃旧桶在途请求；新桶图异步到达后替换桥。
                 self.reset_grid_dispatch_for_zoom_bucket();
             }
-            // 本批「空闲预熟」配合：卡宽变化推 worker 更新预熟目标（跨桶 → worker 端按
-            // 桶级比较发现 target bucket 变了、从 0 重熟新桶；同桶小步缩放桶不变不动游标）。
-            if let Some(worker) = self.worker.clone() {
-                let scale = self.scale_factor.max(1.0);
-                let full_card = self.grid_card_width();
-                let quick_card = grid_quick_target_px(full_card * scale) / scale;
-                worker.set_grid_prewarm(self.doc_id, full_card, quick_card, self.scale_factor);
-            }
+            // 本批「带宽预熟」配合：卡宽变化推 worker 更新预熟目标（跨桶 → worker 端按桶级
+            // 比较发现 target bucket 变了、从新中心重扫新桶；同桶小步缩放桶不变不动扫描）。
+            self.push_grid_prewarm(None);
         }
         cx.notify();
+    }
+
+    /// **带宽预熟几何**（本线）：按「渲染同口径」（[`grid_layout`] + 真实视口/滚动偏移）
+    /// 计算当前视口的
+    /// - `center_page` = 可视行带中心行首页（外向扫描对称中心）；
+    /// - `near` = 中心行 ±[`config::pdf::GRID_NBAND_ROWS`] 行的页区间（**完整覆盖可视带 +
+    ///   保留窗** GRID_ROW_BUFFER + GRID_KEEP_ROWS = ±4 行——「可视带永不失图」不变式，
+    ///   worker 近带保位图、view keep_range 保纹理，回看零重栅）；
+    /// - `window` = 中心行 ±(近+中)行的页区间（中带 = window \ near 仅低清）。
+    /// 无可见行（视口在内容外 / 空文档 / 未布局）→ `None`（本帧不推，下帧可重算）。
+    /// `window` 为 `None` 时用 `grid_scroll` 自身 bounds 口径（进入网格/缩放无 Window 路径）。
+    pub(crate) fn grid_prewarm_geom(&self, window: Option<&Window>) -> Option<GridPrewarmGeom> {
+        if self.dims.is_empty() {
+            return None;
+        }
+        let (vw, vh) = match window {
+            Some(w) => self.grid_viewport(w),
+            None => {
+                let bw = f32::from(self.grid_scroll.bounds().size.width);
+                let bh = f32::from(self.grid_scroll.bounds().size.height);
+                (bw.max(1.0), bh.max(1.0))
+            }
+        };
+        let layout = grid_layout(
+            &self.dims,
+            self.grid_card_width(),
+            GRID_GAP,
+            GRID_PADDING,
+            vw,
+        );
+        if layout.rows == 0 {
+            return None;
+        }
+        let off = f32::from(-self.grid_scroll.offset().y);
+        let (r0, r1) = layout.first_visible_grid_row(off, vh)?;
+        let rows = layout.rows;
+        let center_row = ((r0 + r1) / 2).min(rows.saturating_sub(1));
+        let n = GRID_NBAND_ROWS as isize;
+        let m = (GRID_NBAND_ROWS + GRID_MBAND_ROWS) as isize;
+        let center_row = center_row as isize;
+        let near_lo_row = (center_row - n).max(0) as usize;
+        let near_hi_row = ((center_row + n) as usize).min(rows - 1);
+        let lo_row = (center_row - m).max(0) as usize;
+        let hi_row = ((center_row + m) as usize).min(rows - 1);
+        // 行 → 页闭区间（row_page_start[len]=总页数；闭区间端点 -1 并 min 夹回文档末页）。
+        let last_page = self.dims.len().saturating_sub(1);
+        let near = (
+            layout.row_page_start[near_lo_row],
+            layout.row_page_start[near_hi_row + 1].saturating_sub(1).min(last_page),
+        );
+        let window_interval = (
+            layout.row_page_start[lo_row],
+            layout.row_page_start[hi_row + 1].saturating_sub(1).min(last_page),
+        );
+        let center_page = layout.row_page_start[center_row as usize];
+        Some(GridPrewarmGeom {
+            center_page,
+            window: window_interval,
+            near,
+        })
+    }
+
+    /// **带宽预熟推送（节流）**（本线）：进入网格 / 卡宽变化 / 每帧滚动重定中心共用——
+    /// 计算当前几何并 `set_grid_prewarm` 下发给 worker；**节流** = `(中心页, 窗口, 近带, 全清
+    /// 桶)` 全部未变（同一窗口内微移/静止）→ 幂等跳过（不每帧刷 worker、不打断推进中的
+    /// 预熟）。几何或跨桶变化才推。`window`：`Some` = 有真实 Window（每帧 `ensure_window_grid`），
+    /// `None` = 进入网格/缩放无 Window 路径（用 `grid_scroll` 自身 bounds 口径；首帧未布局
+    /// 几何不可得 → 本帧不推，下帧 `ensure_window_grid` 补推）。
+    pub(crate) fn push_grid_prewarm(&mut self, window: Option<&Window>) {
+        let Some(worker) = self.worker.clone() else {
+            return;
+        };
+        let scale = self.scale_factor.max(1.0);
+        let full_card = self.grid_card_width();
+        let quick_card = grid_quick_target_px(full_card * scale) / scale;
+        let pack_key = |g: &GridPrewarmGeom| {
+            (
+                g.center_page,
+                g.window,
+                g.near,
+                grid_bucket_width(full_card),
+            )
+        };
+        let Some(geom) = self.grid_prewarm_geom(window) else {
+            return;
+        };
+        let key = pack_key(&geom);
+        if self.grid_prewarm_pushed == Some(key) {
+            return; // 同窗口同桶幂等：不重推（不打断推进中的带宽预熟）。
+        }
+        worker.set_grid_prewarm(self.doc_id, full_card, quick_card, self.scale_factor, geom);
+        self.grid_prewarm_pushed = Some(key);
     }
 
     /// 网格列数钳用的**当前视口宽**：优先网格滚动容器 bounds（与 [`Self::grid_viewport`]
@@ -986,16 +1075,13 @@ impl PdfViewer {
         self.grid_mode = enabled;
         if enabled {
             self.grid_scroll.set_offset(gpui::point(px(0.), px(0.)));
-            // 本批「空闲预熟整本」杠杆：进入网格即通知 worker 以**全清 + 低清两档**目标宽
-            // 开启当前文档的空闲整本预熟（worker 只在四桶全空时按页序逐页补渲缓存，优先级
-            // 最低、任何真实消息到达即抢占，绝不耽误阅读模式——见 `WorkerMsg::SetGridPrewarm`；
-            // 两档都预熟才能让风暴低清 / idle 全清两个方向都命中缓存真零闪）。
-            if let Some(worker) = self.worker.clone() {
-                let scale = self.scale_factor.max(1.0);
-                let full_card = self.grid_card_width();
-                let quick_card = grid_quick_target_px(full_card * scale) / scale;
-                worker.set_grid_prewarm(self.doc_id, full_card, quick_card, self.scale_factor);
-            }
+            self.grid_prewarm_pushed = None; // 进入新会话：确保下帧/下推用新几何开启带宽预熟
+            // 本批「带宽预熟」杠杆：进入网格即通知 worker 以**全清 + 低清两档**目标宽 +
+            // 带宽几何开启当前文档的中心带宽预熟（worker 只在四桶全空时空闲补渲近/中带缓存，
+            // 优先级最低、任何真实消息到达即抢占，绝不耽误阅读模式——见
+            // `WorkerMsg::SetGridPrewarm`；近带两档都预熟才能让风暴低清 / idle 全清两个方向
+            // 都命中缓存真零闪，中带仅低清、更远不预熟）。
+            self.push_grid_prewarm(None);
         } else {
             self.clear_grid_resources();
         }
@@ -2270,7 +2356,7 @@ impl PdfViewer {
                 // 平移原本零派发——缩放期 visible 窗仍按当前 cscale 派 preview 顶住，防抖
                 // 到期收口由常态调度接管；滚动大跳仍走 `jump_armed` 优先。
                 if self.jump_armed {
-                    self.maybe_dispatch_jump_covers(page_width, scale_factor);
+                    self.maybe_dispatch_jump_covers(page_width, scale_factor, scroll_y, viewport_h);
                 } else if self.zoom_armed {
                     self.maybe_dispatch_zoom_preview(
                         start,
@@ -2346,6 +2432,13 @@ impl PdfViewer {
             self.grid_scroll_dir = -1;
         }
         self.grid_last_offset = off;
+        // 带宽预熟**滚动重定中心推送（节流）**（本线）：每帧按当前视口计算 `(中心页, 近/中带
+        // 区间, 全清桶)`，与上次推送比较——只有**跨行/跨桶**（几何真正变化）才 `set_grid_prewarm`
+        // 重新定心（同一窗口内静止/微移幂等跳过）。滚动把中心重定 → worker 从新中心重扫
+        // 近/中带（旧窗口已缓存页快速跳过、只渲新入带页）；风暴期不逐帧重启（成本只限新入
+        // 带页，且 gate 后的 5.5 步本就在 view 派发排空后跑）。`push_grid_prewarm` 内部按
+        // `grid_prewarm_pushed` 比较节流，故每帧调用零赘余。
+        self.push_grid_prewarm(Some(window));
         // 泵保真：风暴期低清请求排空后渲染不再变化、无事件触发下一次重绘 → 强制 notify
         // 保泵，防「低清排空后缺帧升级全清」的停滞（对齐瓦片自刷新泵的静态帧驱动姿势）。
         if self.grid_storm {

@@ -679,6 +679,27 @@ impl PdfViewer {
         let cover_worker = self.worker.clone().unwrap();
         let mut cover_order: Vec<usize> = (cover_first..=cover_last).collect();
         cover_order.sort_by_key(|&p| (p as i64 - center_vis as i64).unsigned_abs());
+        // **T1（首屏封面密度收口）**：封面窗页在本帧**全无真可见页**（`page_visible_rect` 全
+        // None）时，整窗跳过封面派发——这是 Facing 冷开生效前与连续冷开首帧共有的「几何未
+        // 就绪」帧（视口尚未排布/分页快照未装配）：照常派发只会落到「邻居降档
+        // min(full, COVER_SCALE_CAP_NEIGHBOR)」档，随后几何就绪同一页转满密度 →
+        // stale→prev_cover→重派双渲（首屏空转 ~2-3 枚栅格，`cover_re_renders` 见证）。
+        // 跳过仅影响本帧封面派发：占位底/瓦片兜底在调度器可见判定下独立运作（首 1-2 帧仍
+        // 铺 L0/L0.5 底），几何就绪后按满密度直接派，不再经历「邻居降档 → 满密度」双渲。
+        // **只在「无任何真可见页」的帧跳过**：连续稳态封面窗恒含真可见页（视口总覆盖某些
+        // 页）永不触发——连续正常封面流不受影响（`cover_retire_bridge`/Fast 封面回归不变）；
+        // 分页/Facing 态同理只在空视口帧跳过，命中 Facing 冷开生效前的连续残余帧（T1
+        // 观测点，见 `t1_facing_cold_open_skips_all_none_cover_window`）。「全 None」为
+        // 天然语义，无帧计数去抖副作用。
+        let window_all_none = !(cover_first..=cover_last).any(|p| {
+            self.page_visible_rect(p, scroll_y, viewport_h, page_width, wrap_w)
+                .is_some()
+        });
+        if window_all_none {
+            // 跳过本帧封面派发；封面驻留窗维护照常（窗外旧封面回收/退位桥，下帧接管）。
+            self.evict_covers(cover_first, cover_last, retire);
+            return;
+        }
         for page in cover_order {
             // R4：已降级/降级候选页不派封面——已降级页显示由均匀 0.5 preview/既有底图链供给
             // （瓦片调度同源跳过）；候选页（预算触顶静态计数中）也不派，避免「candidate 期间
@@ -705,11 +726,14 @@ impl PdfViewer {
             // （不再立即下线：本帧渲染还靠它铺满新页宽，防「Ctrl+滚轮缩放」闪「加载中」）。
             // `cover` 置空 → 下方按新密度重派封面，新封面到位后取代并下线旧封面。
             // 含「可见↔邻居」档间翻转：入视（邻居 2.0 → 满密度）与退位（满密度 → 邻居 2.0）
-            // 都经同一 stale→桥→重派通道，无闪白。
+            // 都经同一 stale→桥→重派通道，无闪白。**T1 重派计数**：stale→桥→重派每触发
+            // 一次 +1（同页双渲见证），Facing 冷开回归断言其 ≤ 既有无守卫基线（见
+            // `t1_facing_cold_open_skips_all_none_cover_window`）。
             if let Some(slot) = self.slots.get_mut(page) {
                 let stale = slot.cover.is_some() && (slot.cover_scale - cscale).abs() > 1e-4;
                 if stale && let Some(old) = slot.cover.take() {
                     slot.prev_cover = Some(old);
+                    self.cover_re_renders += 1;
                 }
             }
             // 整页不超预算 且 无封面 且 未在途 → 派发（W2：封面已拉黑页跳过——不盲目重试，
@@ -2422,7 +2446,13 @@ impl PdfViewer {
     /// 窗内、被整体清掉的旧页），没有「方向翻位刚退位」的邻居要桥接——带上 retire 会把
     /// 落在窗缘外侧的孤立页（如向下跳时 `cf-1`）转存成桥，而该页不会被回翻复用 → 残留过渡桥
     /// 破坏 `cover_retire_bridge` 的「下滚稳态零残留」断言（回归实测命中）。
-    pub(super) fn maybe_dispatch_jump_covers(&mut self, page_width: f32, scale_factor: f32) {
+    pub(super) fn maybe_dispatch_jump_covers(
+        &mut self,
+        page_width: f32,
+        scale_factor: f32,
+        scroll_y: f32,
+        viewport_h: f32,
+    ) {
         if !self.jump_armed {
             return;
         }
@@ -2435,11 +2465,23 @@ impl PdfViewer {
             self.jump_armed = false;
             return;
         }
-        // 落点窗按滚动方向与 normal 封面窗同义（可见页 + 方向前瞻 1）。
-        let (cf, cl) = match self.scroll_dir {
-            1 => (target.min(n - 1), (target + 1).min(n - 1)),
-            -1 => (target.saturating_sub(1), target.min(n - 1)),
-            _ => (target.saturating_sub(1), (target + 1).min(n - 1)),
+        // 落点窗：分页态按「行界」收窄（T2，`buf_rows=0`：目标行 2 列 ≈ 2 页，行中位半行压
+        // 两行时含相邻行 ≤4 页——不缩水下可见页；滚动在途算不出可见行时退化为目标行页区间，
+        // 见 `view::paged_jump_cover_window`）。连续模式保持 [target±1] 不变（layout 分支）。
+        let (cf, cl) = if self.paged_mode_active() {
+            self.paged_layout_cell
+                .borrow()
+                .as_ref()
+                .and_then(|l| {
+                    super::paged_jump_cover_window(l, self.zoom, target, scroll_y, viewport_h, n)
+                })
+                .unwrap_or((target.saturating_sub(1), (target + 1).min(n - 1)))
+        } else {
+            match self.scroll_dir {
+                1 => (target.min(n - 1), (target + 1).min(n - 1)),
+                -1 => (target.saturating_sub(1), target.min(n - 1)),
+                _ => (target.saturating_sub(1), (target + 1).min(n - 1)),
+            }
         };
         // A **两段式底图即显**：跳变突发先把落点整窗以 0.5 密度 RenderPreview 底图**一帧铺满**
         // （~1-6ms/张，替换「第 N 页 加载中…」占位）——目标页「有底图」从 ~11 帧（满密 cover

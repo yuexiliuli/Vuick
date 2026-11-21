@@ -27,7 +27,7 @@ use std::io::Write;
 use std::os::raw::{c_int, c_ulong, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, OnceLock};
+use std::sync::{Arc, mpsc, OnceLock};
 
 use anyhow::{anyhow, Context as _, Result};
 use pdfium_render::prelude::*;
@@ -540,6 +540,27 @@ const FPDFANNOT_COLORTYPE_COLOR: u32 = 0;
 /// 写回落盘临时文件序号（同目录并发写回防撞名；worker 单线程串行本不应并发，兜底）。
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// 网格**带宽预熟几何**（本线 M1+T6）：view 进入网格 / 卡宽变化 / 滚动重定中心时随
+/// [`WorkerMsg::SetGridPrewarm`] 下发 worker——worker 据此做「以视口中心页为核心的水平
+/// 带宽」预熟，任何时候都知道哪些页近/中/远：
+/// - **近带**（`near`，闭区间 = 视图中心行 ±[`config::pdf::GRID_NBAND_ROWS`] 行的页区间，
+///   完整 ⊇ view 可视带 + 保留窗 GRID_ROW_BUFFER+GRID_KEEP_ROWS=±4 行）→ 预熟**全清 + 低清
+///   双档**（近带恒有图、idle 升级全清命中缓存）；
+/// - **中带**（`window` 内 beyond `near`，= ±(近+中)行）→ 预熟**仅低清**（滚回即显、不占
+///   全清内存）；
+/// - **更远**（`window` 外）→ 不预熟（首曝按需由 view 派发，风暴低清兜底）。
+/// `center_page` = 当前视口中心行首页（外向扫描的对称中心）。窗口尺寸恒与文档总页数
+/// **无关**（固定行数）→ 长文档预熟有界常驻几十 MB、无整本 LRU 滑动窗抖动/永不完成。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GridPrewarmGeom {
+    /// 视口中心行首页下标（外向扫描对称中心；0 基）。
+    pub center_page: usize,
+    /// 中带外沿闭区间 `[lo, hi]`（含近+中带全部页；`window.0..=window.1`）。
+    pub window: (usize, usize),
+    /// 近带闭区间 `[lo, hi]`（⊆ `window`；近带页预熟全清+低清）。其余 `window` 内页仅低清。
+    pub near: (usize, usize),
+}
+
 enum WorkerMsg {
     Open(
         DocId,
@@ -576,19 +597,22 @@ enum WorkerMsg {
         f32,
         mpsc::Sender<Option<RenderResult>>,
     ),
-    /// **网格空闲预熟（本线）**：view 进入网格 / 网格卡宽变化时推送，携带**全清档**与
-    /// **低清快速档**两档目标卡宽（逻辑 px）× DPI 的目标像素宽口径（`card_width ×
-    /// scale_factor`，与 `Grid` 消息同构）。worker 侧开启「当前文档空闲整本预熟」：四桶全空
-    /// + 无在途检索/刷新时，把当前文档**尚未栅格**的页按页序逐页经 [`render_grid`] 两档
-    /// （全清 + 低清）直接算好写进 `grid_cache`（不经 view round-trip、不重开 pdfium），每渲
-    /// 1 页回主循环查队列——任何真实消息（含阅读模式请求）到达即被抢占（预熟只在全部队列
-    /// 空时推进，优先级天然最低，绝不耽误阅读）。
+    /// **网格带宽预熟（本线）**：view 进入网格 / 网格卡宽变化 / 滚动重定中心时推送，携带
+    /// **全清档**与**低清快速档**两档目标卡宽（逻辑 px）× DPI 的目标像素宽口径（`card_width ×
+    /// scale_factor`，与 `Grid` 消息同构）+ **带宽几何**（[`GridPrewarmGeom`]：中心页 + 近/中带
+    /// 页区间）。worker 侧开启「以视口中心页为核心的水平带宽」空闲预熟：四桶全空 + 无在途
+    /// 检索/刷新时，把当前文档近带页经 [`render_grid`] **两档**（全清 + 低清）、中带页**仅
+    /// 低清**直接算好写进 `grid_cache`（不经 view round-trip、不重开 pdfium），每渲 1 页回主
+    /// 循环查队列——任何真实消息（含阅读模式请求）到达即被抢占（预熟只在全部队列空时推进，
+    /// 优先级天然最低，绝不耽误阅读）。
     /// 文档关闭/切换/重着色（recolor）时预熟游标重置（见 run 循环各分支）。
-    /// 语义：这是「网格在用」的显式信号 + 预熟目标宽（可靠的全清/低清桶来源——`Grid` 消息
-    /// 可能只携带其中一档宽，不能当两档预熟目标）。两档都预熟因为**滚动风暴走低清桶、
-    /// idle 升级走全清桶**——任一方向/时刻的滚动命中缓存才能真零闪（低清已在途的页全清
-    /// 升级由 idle 重派；预熟只是把两档都补齐进 cache，滚动只命中不重栅）。
-    SetGridPrewarm(DocId, f32, f32, f32),
+    /// 预熟从**中心页起双向交替外扩**（近带全清+低清、中带仅低清、更远不预熟），窗口刷齐即
+    /// 自然 idle 停（**不再整本推进**）——长文档预熟有界常驻几十 MB，整本 242p 超
+    /// GRID_CACHE_FULL_DOC_MAX 256MB 触发的 LRU 滑动窗 / 永不完成负资产根治。滚动把中心重定
+    /// → view 推送新几何 → worker 从新中心重扫（旧窗口已缓存页快速跳过）。两档都预熟因为
+    /// **滚动风暴走低清桶、idle 升级走全清桶**——任一方向/时刻的滚动命中缓存才能真零闪
+    /// （低清已在途的页全清升级由 idle 重派；预熟只是把两档都补齐进 cache，滚动只命中不重栅）。
+    SetGridPrewarm(DocId, f32, f32, f32, GridPrewarmGeom),
     Close(DocId),
     /// 请求某页文本层数据（懒加载：仅选中/复制/搜索时调用）。**低优先级**：
     /// worker 调度保证绝不排在栅格化（Render）之后执行。
@@ -674,6 +698,8 @@ enum WorkerMsg {
     MemRestoreBytes(DocId, Vec<u8>, mpsc::Sender<Result<usize>>),
     /// 读回 stores 当前内存镜像（撤销快照 / 测试 MD5 / shell 另存共用；None=文档不存在）。
     MemGetBytes(DocId, mpsc::Sender<Option<Vec<u8>>>),
+    /// stores 物化状态只读探针（T3 DIAG；**不触发物化**）：None=尚未物化，Some=已物化长度。
+    MemState(DocId, mpsc::Sender<Option<usize>>),
     /// 读回某页注释（only-read，pdfium-render 高层 `page.annotations()`，供测试断言）。
     /// 低优先级，与 Text/Search 同位（不抢栅格化）。
     ReadAnnotations(DocId, usize, mpsc::Sender<Result<Vec<AnnotationInfo>>>),
@@ -721,9 +747,13 @@ enum WorkerMsg {
     RecolorRefresh(DocId, Vec<RecolorKey>, mpsc::Sender<RecolorEntry>),
     /// 读回某文档 raw 缓存条目数（只读；测试/基准用于「全缓存 vs 可见集」比例证据）。
     RawCacheLen(DocId, mpsc::Sender<usize>),
-    /// 读回某文档**网格缩略图缓存**条目数（只读；预熟/永驻留测试用——断言「整本补齐」与
-    /// 「往返后仍整本（不逐出）」，见 `grid_cache_len`；注意每页预熟可占全清+低清两档条目）。
+    /// 读回某文档**网格缩略图缓存**条目数（只读；预熟/常驻测试用——断言「近+中带带宽刷齐
+    /// 与「往返后带宽常驻（不逐出）」，见 `grid_cache_len`；注意每页近带可占全清+低清两档
+    /// 条目、中带仅低清一档——**整本补齐不再是语义**，长文档只保以中心为核心的带宽）。
     GridCacheLen(DocId, mpsc::Sender<usize>),
+    /// 读回某文档**网格缩略图缓存**全部 `(页, 分桶宽)` 条目（只读；带宽驻留测试用——逐页
+    /// 断言近带全清+低清双档 / 中带仅低清 / 远带无预熟缓存，见 `grid_cache_buckets`）。
+    GridCacheBuckets(DocId, mpsc::Sender<Vec<(usize, u32)>>),
     /// 读回某文档当前 `navigate_gen` 镜像（只读；L1/L2 世代同步测试用，见
     /// [`PdfWorker::navigate_gen`]）。文档未打开 / 已关闭 → 0。
     NavigateGen(DocId, mpsc::Sender<u64>),
@@ -880,19 +910,26 @@ impl PdfWorker {
         rx
     }
 
-    /// **网格空闲预熟开启/更新目标（本线）**：view 进入网格或网格卡宽（
-    /// [`PdfViewer::grid_card_width`]）变化时调用，携带全清档卡宽 × DPI。worker 据此开启
-    /// 「四桶全空时把当前文档整本逐页预熟进 `grid_cache`」（最低优先级，任何真实消息
-    /// 到达即被抢占）。低清快档风暴期间 `Grid` 消息携带的是低清卡宽，不能据此设定全清
-    /// 预熟目标——故单设本轻量控制消息（`rest_q` 外单独 sweep 当下应用，不入桶）。
+    /// **网格带宽预熟开启/更新（本线）**：view 进入网格 / 网格卡宽变化 / 滚动重定中心时
+    /// 调用，携带全清档卡宽 × DPI + 带宽几何（[`GridPrewarmGeom`]）。worker 据此开启「四桶
+    /// 全空时以视口中心页为核心做近/中带水平带宽预熟」（最低优先级，任何真实消息到达即被
+    /// 抢占）。低清快档风暴期间 `Grid` 消息携带的是低清卡宽，不能据此设定全清预熟目标——故
+    /// 单设本轻量控制消息（`rest_q` 外单独 sweep 当下应用，不入桶）。
     /// `quick_card` = 低清快速档目标卡宽（view 已按 [`PdfViewer::grid_quick_target_px`] 换算，
-    /// worker 不再重算 0.5×/64 下限——两档都预熟，滚动风暴（低清桶）与 idle（全清桶）
-    /// 均命中缓存零重栅）。
-    pub fn set_grid_prewarm(&self, doc_id: DocId, full_card: f32, quick_card: f32, scale_factor: f32) {
+    /// worker 不再重算 0.5×/64 下限——近带两档（全清 + 低清）、中带仅低清都预熟，滚动风暴
+    /// （低清桶）与 idle（全清桶）均命中缓存零重栅；`geom` 划定近/中带页区间，更远不预熟）。
+    pub fn set_grid_prewarm(
+        &self,
+        doc_id: DocId,
+        full_card: f32,
+        quick_card: f32,
+        scale_factor: f32,
+        geom: GridPrewarmGeom,
+    ) {
         let _ = self.tx.send((
             0,
             0,
-            WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor),
+            WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor, geom),
         ));
     }
 
@@ -980,13 +1017,23 @@ impl PdfWorker {
         rx.recv().unwrap_or(0)
     }
 
-    /// 读回 `doc_id` 文档当前**网格缩略图缓存**条目数（同步；只读，本批预熟/永驻留测试用——
-    /// 断言「空闲预熟把整本补进缓存」与「往返滚动后不逐出」）。注意每页预熟可占全清+低清
-    /// 两档条目（条目数随分桶数变，不锁死 == 页数）。文档未打开 / 已关闭 → 0。
+    /// 读回 `doc_id` 文档当前**网格缩略图缓存**条目数（同步；只读，本批带宽预熟/常驻测试用——
+    /// 断言「近+中带带宽刷齐」与「往返滚动后带宽常驻不逐出」）。注意每页近带可占全清+低清
+    /// 两档条目、中带仅低清一档（条目数随分桶数变，不锁死 == 页数）；**整本补齐不再是语义**，
+    /// 长文档只保以中心为核心的带宽。文档未打开 / 已关闭 → 0。
     pub fn grid_cache_len(&self, doc_id: DocId) -> usize {
         let (tx, rx) = mpsc::channel();
         let _ = self.tx.send((0, 0, WorkerMsg::GridCacheLen(doc_id, tx)));
         rx.recv().unwrap_or(0)
+    }
+
+    /// 读回 `doc_id` 文档当前**网格缩略图缓存**全部 `(页, 分桶宽)` 条目（同步；只读，带宽
+    /// 驻留测试用——逐页断言近带「全清桶 + 低清桶双档」/ 中带「仅低清桶」/ 远带「无预熟
+    /// 缓存」，见 `grid_band_residency_near_full_mid_low_far_none`）。文档未打开 / 已关闭 → 空。
+    pub fn grid_cache_buckets(&self, doc_id: DocId) -> Vec<(usize, u32)> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send((0, 0, WorkerMsg::GridCacheBuckets(doc_id, tx)));
+        rx.recv().unwrap_or_default()
     }
 
     /// 请求某页文本层数据（异步、低优先级）。返回接收结果的通道。
@@ -1208,6 +1255,14 @@ impl PdfWorker {
         rx.recv().ok().flatten()
     }
 
+    /// stores 物化状态探针（T3 DIAG 只读，测试用；**不触发物化**）：`None` = 尚未物化
+    /// （True memory 断言：打开即省一份源字节驻留）；`Some(len)` = 已物化字节长。
+    pub fn mem_state(&self, doc_id: DocId) -> Option<usize> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send((0, 0, WorkerMsg::MemState(doc_id, tx)));
+        rx.recv().ok().flatten()
+    }
+
     /// 读回某页的注释摘要（类型 + quad 点坐标；只读 pdfium-render 高层 API）。
     /// 供测试断言与 Phase B 展示已写回注释。
     pub fn annotations_for_page(
@@ -1240,7 +1295,7 @@ impl PdfWorker {
         // 各文档在内存中的源 bytes（与 `docs` 同生命周期）：写回/提取/另存时把 bytes
         // 载入**自有 raw 句柄**做修改再落盘，不动正在渲染的 PdfDocument；落盘后同步镜像，
         // 保证后续操作基于最新内容（重开显示由 viewer 的 Close→Open 负责）。
-        let mut stores: HashMap<DocId, Vec<u8>> = HashMap::new();
+        let mut stores: HashMap<DocId, Arc<Vec<u8>>> = HashMap::new();
         // 本地优先级队列：按类分桶（render > mid > thumb > 其余），桶内 FIFO——
         // **Render 永不排在 Text 之后**（滚动画帧的栅格化优先于懒加载的文本提取），
         // 同优先级保持到达顺序。替代原「单队 + 每轮 `iter().position()+remove(i)`」的
@@ -1298,10 +1353,15 @@ impl PdfWorker {
         // `last_used` = 全局单调序列号（LRU 裁决只在本文档缓存内比较，全局递增即可）。
         let mut grid_cache: HashMap<DocId, Vec<GridEntry>> = HashMap::new();
         let mut grid_seq: u64 = 0;
-        // 网格**空闲预熟**状态（本线）：`Some` = 已开启当前文档整本预熟（见
-        // [`WorkerMsg::SetGridPrewarm`]）。只在「四桶全空 + 无在途检索/刷新」时推进（run
-        // 循环 5.5 步），逐页栅格进 `grid_cache`；文档关闭/切换/recolor 时由下方各分支
-        // 重置游标或清除。预熟不经 view round-trip（无 tx 回传），结果只落 worker 缓存。
+        // 网格**带宽预熟**状态（本线，M1+T6）：`Some` = 已开启当前文档「以视口中心页为
+        // 核心的水平带宽」预熟（见 [`WorkerMsg::SetGridPrewarm`]）。只在「四桶全空 + 无在途
+        // 检索/刷新」时推进（run 循环 5.5 步），从中心页起双向交替外扩：近带（[`GridPrewarmGeom::near`]）
+        // 全清+低清双档、中带（window 内 beyond near）仅低清、更远不预熟；窗口刷齐即自然
+        // idle（`None`），**不再整本推进**——长文档预熟有界、LRU 滑动窗抖动/永不完成根治。
+        // 文档关闭/切换/recolor 时由下方各分支重置游标或清除；滚动重定中心由 view 推送新
+        // 几何（从新中心重扫，旧窗口已缓存页快速跳过）。预熟不经 view round-trip（无 tx
+        // 回传），结果只落 worker 缓存。近带 ⊆ view 可视带+保留窗不变式见
+        // [`config::pdf::GRID_NBAND_ROWS`] 注释。
         let mut grid_prewarm: Option<GridPrewarm> = None;
         // 在途的重着色刷新分帧状态（见 [`PendingRefresh`]）：切档只刷可见集、逐批回传。
         let mut pending_refresh: Option<PendingRefresh> = None;
@@ -1326,40 +1386,53 @@ impl PdfWorker {
                         // raw/luma、着色在绘制时现算）：切档即旧色失效 → 整文档清空（格卡
                         // 廉价可秒级重渲，避免夜/日档切换残留旧色卡；GPU 模式清亦无害）。
                         grid_cache.remove(&doc_id);
-                        // 缓存已清 → 预熟游标归 0：以新色从整本开头重熟（旧游标会漏熟开头页）。
+                        // 缓存已清 → 预熟从新几何中心重扫（旧游标会漏扫；新色按当前带宽窗口
+                        // 以新色重熟，窗口内已缓存页跳过）。
                         if let Some(p) = grid_prewarm.as_mut() {
                             if p.doc_id == doc_id {
-                                p.cursor = 0;
+                                p.reach = 0;
+                                p.dir = -1;
+                                p.done = false;
                             }
                         }
                     }
-                    WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor) => {
-                        // 预熟开启/目标更新（「网格在用」显式信号）：进入网格或卡宽变化时
-                        // view 推送全清 + 低清两档目标宽。同一文档重复推送只更新目标与重置游标
-                        // （目标分桶变化 → 旧桶预熟作废，从 0 重熟新桶；同桶小步缩放不重置游标，
-                        // 避免每个 zoom 步都重扫整本）。
+                    WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor, geom) => {
+                        // 预熟开启/目标/几何更新（「网格在用」显式信号）：进入网格 / 卡宽变化 /
+                        // 滚动重定中心时 view 推送全清 + 低清两档目标宽 + 带宽几何（center/window/
+                        // near）。分三种：
+                        //  - 跨桶（full 档目标分桶变了）→ 目标作废，从新中心重扫新桶；
+                        //  - 同桶但几何变了（滚动/重定中心）→ 更新几何、扫描从新中心重起（旧窗口
+                        //    已缓存页快速跳过，代价只限新入带页）；
+                        //  - 同桶同几何重复推送 → 幂等：**不重置扫描进度**（推进中的预熟不打断，
+                        //    视口在同窗口内微移时不重扫白耗 idle 片）。
                         let same_doc = grid_prewarm.as_ref().is_some_and(|p| p.doc_id == doc_id);
-                        let same_bucket = grid_prewarm.as_ref().is_some_and(|p| {
-                            p.doc_id == doc_id
-                                && grid_bucket_width(p.full_card * p.scale_factor.max(1.0))
-                                    == grid_bucket_width(full_card * scale_factor.max(1.0))
-                        });
+                        let cur_bucket = grid_prewarm
+                            .as_ref()
+                            .map(|p| grid_bucket_width(p.full_card * p.scale_factor.max(1.0)));
+                        let new_bucket = grid_bucket_width(full_card * scale_factor.max(1.0));
                         match grid_prewarm.as_mut() {
                             Some(p) if same_doc => {
-                                if !same_bucket {
+                                let geom_changed = p.geom != geom;
+                                if cur_bucket != Some(new_bucket) || geom_changed {
                                     p.full_card = full_card;
                                     p.quick_card = quick_card;
                                     p.scale_factor = scale_factor;
-                                    p.cursor = 0;
+                                    p.geom = geom;
+                                    p.reach = 0;
+                                    p.dir = -1;
+                                    p.done = false;
                                 }
                             }
                             _ => {
                                 grid_prewarm = Some(GridPrewarm {
                                     doc_id,
-                                    cursor: 0,
                                     full_card,
                                     quick_card,
                                     scale_factor,
+                                    geom,
+                                    reach: 0,
+                                    dir: -1,
+                                    done: false,
                                 });
                             }
                         }
@@ -1537,8 +1610,9 @@ impl PdfWorker {
                 match msg {
                     WorkerMsg::Open(doc_id, bytes, tx) => {
                         let t0 = std::time::Instant::now();
-                        // 先克隆一份源 bytes 存内存镜像（写回/提取用），原始 bytes 移给渲染 doc
-                        let store_bytes = bytes.clone();
+                        // T3 延迟克隆：打开不再镜像源字节（stores 留空，省一份整本驻留）；
+                        // 首写/首读经 [`materialize_stores`] 从 live 渲染 doc 惰性物化。
+                        // 原始 bytes 移给渲染 doc（pdfium 内部 source_byte_buffer 持有）。
                         let result = match pdfium.load_pdf_from_byte_vec(bytes, None) {
                             Ok(doc) => {
                                 let t1 = std::time::Instant::now();
@@ -1571,7 +1645,6 @@ impl PdfWorker {
                                     );
                                 }
                                 docs.insert(doc_id, doc);
-                                stores.insert(doc_id, store_bytes);
                                 Ok((dims, outlines))
                             }
                             Err(e) => Err(anyhow::anyhow!("PDF 解析失败：{e}")),
@@ -1646,13 +1719,13 @@ impl PdfWorker {
                     }
                     // ---- 写回 / 页操作 / 注释读回（全部 worker 单线程内，见各 handler）----
                     WorkerMsg::Annotate(doc_id, items, out, tx) => {
-                        let result = writeback_edit(&mut stores, fpdf, doc_id, &out, |b, raw| {
+                        let result = writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
                             apply_annotations_raw(b, raw, &items)
                         });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::InsertBlankPage(doc_id, at, w, h, out, tx) => {
-                        let result = writeback_edit(&mut stores, fpdf, doc_id, &out, |b, raw| {
+                        let result = writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
                             let page = unsafe { b.FPDFPage_New(raw, at as c_int, w as f64, h as f64) };
                             if page.is_null() {
                                 return Err(anyhow!("插入空白页失败（at={at} {w:.1}x{h:.1}pt）"));
@@ -1666,7 +1739,7 @@ impl PdfWorker {
                     WorkerMsg::DeletePage(doc_id, index, out, tx) => {
                         // 越界/单页守卫以**实际待写 bytes**（stores←raw 句柄页数）为准，而非
                         // `docs`（渲染文档可能在连环操作中滞后于 stores，旧计数会误判/漏判）。
-                        let result = writeback_edit(&mut stores, fpdf, doc_id, &out, |b, raw| {
+                        let result = writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
                             let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
                             if count <= 1 {
                                 return Err(anyhow!("不能删除仅剩的 1 页（当前 {count} 页）"));
@@ -1681,10 +1754,8 @@ impl PdfWorker {
                     }
                     WorkerMsg::ExtractPage(doc_id, index, out, tx) => {
                         let result = (|| -> Result<()> {
-                            let bytes = stores
-                                .get(&doc_id)
-                                .ok_or_else(|| anyhow!("文档 {doc_id} 不存在"))?
-                                .clone();
+                            // T3：统一走惰性物化（缺失即从 live doc SaveAsCopy 产出并落 stores）
+                            let bytes = materialize_stores(&mut stores, &docs, doc_id)?;
                             unsafe {
                                 let raw_src = load_raw_doc(fpdf, &bytes)?;
                                 let raw_dst = fpdf.FPDF_CreateNewDocument();
@@ -1710,10 +1781,8 @@ impl PdfWorker {
                     }
                     WorkerMsg::Save(doc_id, out, tx) => {
                         let result = (|| -> Result<()> {
-                            let bytes = stores
-                                .get(&doc_id)
-                                .ok_or_else(|| anyhow!("文档 {doc_id} 不存在"))?
-                                .clone();
+                            // T3：统一走惰性物化（缺失即从 live doc SaveAsCopy 产出并落 stores）
+                            let bytes = materialize_stores(&mut stores, &docs, doc_id)?;
                             unsafe {
                                 let raw = load_raw_doc(fpdf, &bytes)?;
                                 let res = save_raw_doc_to_file(fpdf, raw, &out);
@@ -1725,7 +1794,7 @@ impl PdfWorker {
                     }
                     // 待保存模型：内存级页面操作 / 镜像替换——只改 stores，不写盘。
                     WorkerMsg::MemOpInsert(doc_id, at, w, h, tx) => {
-                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
                             let page = unsafe { b.FPDFPage_New(raw, at as c_int, w as f64, h as f64) };
                             if page.is_null() {
                                 return Err(anyhow!("插入空白页失败（at={at} {w:.1}x{h:.1}pt）"));
@@ -1736,7 +1805,7 @@ impl PdfWorker {
                         let _ = tx.send(result);
                     }
                     WorkerMsg::MemOpDelete(doc_id, index, tx) => {
-                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
                             let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
                             if count <= 1 {
                                 return Err(anyhow!("不能删除仅剩的 1 页（当前 {count} 页）"));
@@ -1750,11 +1819,11 @@ impl PdfWorker {
                         let _ = tx.send(result);
                     }
                     WorkerMsg::MemOpReorder(doc_id, new_order, tx) => {
-                        let result = reorder_edit_mem(&mut stores, fpdf, doc_id, new_order);
+                        let result = reorder_edit_mem(&mut stores, &docs, fpdf, doc_id, new_order);
                         let _ = tx.send(result);
                     }
                     WorkerMsg::MemOpBatchDelete(doc_id, pages, tx) => {
-                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
                             let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
                             // 逐页校验 + 去重（重复项只删一次，不视作错误）。
                             let mut to_delete: Vec<usize> = Vec::with_capacity(pages.len());
@@ -1782,7 +1851,7 @@ impl PdfWorker {
                         let _ = tx.send(result);
                     }
                     WorkerMsg::ExportPages(doc_id, pages, out, tx) => {
-                        let result = export_pages_to_file(&mut stores, fpdf, doc_id, &pages, &out);
+                        let result = export_pages_to_file(&mut stores, &docs, fpdf, doc_id, &pages, &out);
                         let _ = tx.send(result);
                     }
                     WorkerMsg::SplitToFile(doc_id, (start, end), out, tx) => {
@@ -1790,7 +1859,7 @@ impl PdfWorker {
                         // `writeback_edit_mem` 骨架（before/after/count + stores 更新）：
                         // `written` 由闭包在文件落盘成功后回填，随 `MemOpResult` 一并返回。
                         let mut written: usize = 0;
-                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
                             let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
                             // 严格校验：区间有序、端点 < 页数、剩余 ≥1 页（防 0 页文档）。
                             if start > end {
@@ -1840,7 +1909,7 @@ impl PdfWorker {
                         // 不再阻塞 pdfium 单工作线程；字节经通道切边，view 侧元数据预检 +
                         // 有界读盘后才发此消息）+ `FPDF_ImportPages` 追加。解析失败快速 Err 护栏
                         // （坏字节 → pdfium 快速失败，不 OOM）。
-                        let result = writeback_edit_mem(&mut stores, fpdf, doc_id, |b, raw| {
+                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
                             let src_raw = unsafe { load_raw_doc(b, &src_bytes)? };
                             let src_count = unsafe { b.FPDF_GetPageCount(src_raw) } as usize;
                             if src_count == 0 {
@@ -1871,14 +1940,24 @@ impl PdfWorker {
                     }
                     WorkerMsg::MemRestoreBytes(doc_id, bytes, tx) => {
                         let result = if stores.contains_key(&doc_id) {
-                            stores.insert(doc_id, bytes);
+                            stores.insert(doc_id, Arc::new(bytes));
                             Ok(stores.get(&doc_id).map(|b| b.len()).unwrap_or(0))
                         } else {
                             Err(anyhow!("文档 {doc_id} 不存在（无法恢复镜像）"))
                         };
                         let _ = tx.send(result);
-                    }                    WorkerMsg::MemGetBytes(doc_id, tx) => {
-                        let r = stores.get(&doc_id).cloned();
+                    }
+                    WorkerMsg::MemGetBytes(doc_id, tx) => {
+                        // T3：惰性物化后读回（None = 文档不存在 / 物化失败）
+                        let r = materialize_stores(&mut stores, &docs, doc_id)
+                            .ok()
+                            .map(|b| b.to_vec());
+                        let _ = tx.send(r);
+                    }
+                    WorkerMsg::MemState(doc_id, tx) => {
+                        // T3 DIAG 只读探针：stores 物化状态（不触发物化）。
+                        // `None` = 尚未物化（打开即省一份源字节）；`Some(len)` = 已物化字节长。
+                        let r = stores.get(&doc_id).map(|b| b.len());
                         let _ = tx.send(r);
                     }
                     WorkerMsg::RawCacheLen(doc_id, tx) => {
@@ -1888,6 +1967,13 @@ impl PdfWorker {
                     WorkerMsg::GridCacheLen(doc_id, tx) => {
                         let n = grid_cache.get(&doc_id).map_or(0, |v| v.len());
                         let _ = tx.send(n);
+                    }
+                    WorkerMsg::GridCacheBuckets(doc_id, tx) => {
+                        let entries = grid_cache
+                            .get(&doc_id)
+                            .map(|v| v.iter().map(|e| (e.page, e.bucket_px)).collect())
+                            .unwrap_or_default();
+                        let _ = tx.send(entries);
                     }
                     WorkerMsg::NavigateGen(doc_id, tx) => {
                         let n = navigate_gen.get(&doc_id).copied().unwrap_or(0);
@@ -2017,57 +2103,138 @@ impl PdfWorker {
                 }
                 continue;
             }
-            // 5.5) 网格**空闲预熟整本**（本线）：四桶全空 + 无在途检索/刷新（走到这里即
+            // 5.5) 网格**带宽预熟**（本线，M1+T6）：四桶全空 + 无在途检索/刷新（走到这里即
             //      证 render/mid/thumb/rest/grid 全空 + pending_search/pending_refresh 无，
-            //      因为任一非空都会在更早步骤 `continue` 走掉）且预熟启用未完成时，把当前
-            //      文档仍未栅格的页按页序逐页 `render_grid` 进缓存（不经 view round-trip、
-            //      不重开 pdfium；结果只落 worker `grid_cache`）。每渲 1 页 `continue` 回主
-            //      循环查队列——任何真实消息（含阅读模式渲染/Open/Close）到达即被抢占，
-            //      预熟只在整机空闲时推进，**绝不耽误阅读模式**（渲染/占位/rest 恒先出队）。
-            //      预设目标宽 = [`WorkerMsg::SetGridPrewarm`] 携带的**全清 + 低清两档**：滚动
-            //      风暴走低清桶、idle 升级走全清桶——任一方向/滚动状态命中缓存才真零闪
-            //      （预熟只补「缓存里还没有对应桶」的页，已缓存跳过，不自重复渲染）。
-            //      先把预熟字段按值取出（避免 `grid_prewarm` 借用跨 render_grid 与状态清/改）。
-            let prewarm_snap = grid_prewarm
-                .as_ref()
-                .map(|p| (p.doc_id, p.full_card, p.quick_card, p.scale_factor));
-            if let Some((pre_doc_id, pre_full, pre_quick, pre_scale)) = prewarm_snap {
+            //      因为任一非空都会在更早步骤 `continue` 走掉）且预熟启用未完成时，推进
+            //      **以视口中心页为核心的水平带宽**预熟：近带（[`GridPrewarmGeom::near`]，
+            //      完整覆盖 view 可视带+保留窗）全清 + 低清双档、中带（[`GridPrewarmGeom::window`]
+            //      内 beyond near）仅低清、更远不预熟——`render_grid` 直接算好写进
+            //      `grid_cache`（不经 view round-trip、不重开 pdfium；结果只落 worker `grid_cache`）。
+            //      扫描**从中心页起双向交替外扩**（`reach`/`dir`），窗口内已缓存页快速跳过、缺失
+            //      桶逐页栅格；每渲 1 页（至多两档）`continue` 回主循环查队列——任何真实消息
+            //      （含阅读模式渲染/Open/Close）到达即被抢占，预熟只在整机空闲时推进，**绝不
+            //      耽误阅读模式**（渲染/占位/rest 恒先出队）。窗口刷齐（额定最大页距扫完）→
+            //      **自然 idle 停**（`grid_prewarm = None`），不再推进「全整本」——长文档预熟
+            //      有界常驻几十 MB，整本淡扫 242p 超 GRID_CACHE_FULL_DOC_MAX 256MB cap 触发的
+            //      LRU 滑动窗/永不完成负资产根治。滚动把中心重定 → view 推送新几何 → 新窗口
+            //      从新中心重扫（旧窗口已缓存页快速跳过）。预设目标宽 = [`WorkerMsg::SetGridPrewarm`]
+            //      携带的**全清 + 低清两档**：滚动风暴走低清桶、idle 升级走全清桶——任一方向/
+            //      滚动状态命中缓存才真零闪（预熟只补「缓存里还没有对应桶」的页，已缓存跳过，
+            //      不自重复渲染）。先把预熟字段按值取出（避免 `grid_prewarm` 借用跨 render_grid
+            //      与状态清/改）。
+            let prewarm_snap = grid_prewarm.as_ref().map(|p| {
+                (
+                    p.doc_id,
+                    p.full_card,
+                    p.quick_card,
+                    p.scale_factor,
+                    p.geom,
+                    p.reach,
+                    p.dir,
+                    p.done,
+                )
+            });
+            if let Some((pre_doc_id, pre_full, pre_quick, pre_scale, geom, reach, dir, done)) =
+                prewarm_snap
+            {
                 let Some(page_count) = docs.get(&pre_doc_id).map(|d| d.pages().len() as usize) else {
                     // 预熟文档已关闭（正常应经 Close 清 prewarm，这里兜底防 race）。
                     grid_prewarm = None;
                     continue;
                 };
-                let scale = pre_scale.max(1.0);
-                let full_px = pre_full * scale;
-                let quick_px = pre_quick * scale;
-                let full_bucket = grid_bucket_width(full_px);
-                let quick_bucket = grid_bucket_width(quick_px);
-                // 预熟页两档都已缓存 → 越过它（整本补齐不自重复渲染）。
-                let mut cursor = grid_prewarm.as_ref().map(|p| p.cursor).unwrap_or(0);
-                let cache = grid_cache.entry(pre_doc_id).or_default();
-                while cursor < page_count
-                    && cache.iter().any(|e| e.page == cursor && e.bucket_px == full_bucket)
-                    && cache.iter().any(|e| e.page == cursor && e.bucket_px == quick_bucket)
-                {
-                    cursor += 1;
-                }
-                if cursor < page_count {
-                    let p = recolor.get(&pre_doc_id).copied().flatten();
-                    let gpu = crate::recolor::gpu_recolor_gate();
-                    if let Some(doc) = docs.get(&pre_doc_id) {
-                        // 全清档 + 低清档（若与全清同桶——极窄退化档——第二次命中缓存零成本）
-                        render_grid(doc, cursor, full_px, p, cache, &mut grid_seq, gpu);
-                        render_grid(doc, cursor, quick_px, p, cache, &mut grid_seq, gpu);
-                    }
-                    // 无论 render 成功与否都前进光标：失败（页无法渲染）不卡死预熟循环。
-                    if let Some(pre) = grid_prewarm.as_mut() {
-                        if pre.doc_id == pre_doc_id {
-                            pre.cursor = cursor + 1;
+                if !done {
+                    let scale = pre_scale.max(1.0);
+                    let full_px = pre_full * scale;
+                    let quick_px = pre_quick * scale;
+                    let full_bucket = grid_bucket_width(full_px);
+                    let quick_bucket = grid_bucket_width(quick_px);
+                    let (lo, hi) = geom.window;
+                    let (near_lo, near_hi) = geom.near;
+                    let center = geom.center_page.min(page_count.saturating_sub(1));
+                    // 额定最大页距：窗口两端到中心最远距离（`reach` 越过即双侧必已扫遍 → 刷齐）。
+                    let max_reach = hi.saturating_sub(center).max(center.saturating_sub(lo));
+                    let cache = grid_cache.entry(pre_doc_id).or_default();
+
+                    // 从当前扫描游标推进：跳过窗口外 / 已刷齐页，定位本 idle 片待渲页（至多一页）。
+                    // `has_full`/`has_quick` 在此页渲染前捕获（本片未渲它；两档都缺失才待渲）。
+                    let mut scan = (reach, dir);
+                    let mut pending: Option<usize> = None;
+                    let mut finish = false;
+                    let mut has_full = false;
+                    let mut has_quick = false;
+                    while pending.is_none() && !finish {
+                        let (r, d) = scan;
+                        if r > max_reach {
+                            finish = true;
+                            break;
                         }
+                        // 候选页 = center ± r（按当前侧）；r=0 = 中心页本身。
+                        let cand = if r == 0 {
+                            center
+                        } else if d >= 0 {
+                            center.saturating_add(r)
+                        } else {
+                            center.saturating_sub(r)
+                        };
+                        // 推进扫描：处理完当前侧翻转方向；回同侧时页距 +1（下、上、下…交替外扩）。
+                        if d >= 0 {
+                            scan = (r, -1);
+                        } else {
+                            scan = (r + 1, 1);
+                        }
+                        if cand < lo || cand > hi {
+                            continue; // 窗口外（一侧越界；另一侧由 max_reach 覆盖继续扫）
+                        }
+                        let in_near = cand >= near_lo && cand <= near_hi;
+                        has_full = cache.iter().any(|e| e.page == cand && e.bucket_px == full_bucket);
+                        has_quick = cache
+                            .iter()
+                            .any(|e| e.page == cand && e.bucket_px == quick_bucket);
+                        // 近带 → 需全清 + 低清双档；中带（window 内 beyond near）→ 仅低清。
+                        let need_full = in_near && !has_full;
+                        let need_quick = !has_quick;
+                        if need_full || need_quick {
+                            pending = Some(cand);
+                            break;
+                        }
+                        // 该页所需桶已齐 → 继续推进扫描。
                     }
-                    continue; // 回主循环查队列（真实消息到达即抢占）
+
+                    if finish {
+                        // 窗口刷齐 → 自然 idle（不再整本推进）。
+                        grid_prewarm = None;
+                        continue;
+                    }
+                    if let Some(cand) = pending {
+                        let p = recolor.get(&pre_doc_id).copied().flatten();
+                        let gpu = crate::recolor::gpu_recolor_gate();
+                        if let Some(doc) = docs.get(&pre_doc_id) {
+                            let in_near = cand >= near_lo && cand <= near_hi;
+                            // 近带 → 全清 + 低清双档；中带 → 仅低清（与 view 风暴/idle 双档
+                            // 同口径：「中带仅低清」保证中带页不占全清内存——内存验证见
+                            // `grid_band_residency_near_full_mid_low_far_none`）。若与全清同桶
+                            // （极窄退化档）第二次 render_grid 命中缓存零成本。
+                            if in_near && !has_full {
+                                render_grid(doc, cand, full_px, p, cache, &mut grid_seq, gpu);
+                            }
+                            if !has_quick {
+                                render_grid(doc, cand, quick_px, p, cache, &mut grid_seq, gpu);
+                            }
+                        }
+                        // 无论 render 成功与否都推进扫描：失败（页无法渲染）不卡死预熟循环。
+                        if let Some(pre) = grid_prewarm.as_mut() {
+                            if pre.doc_id == pre_doc_id {
+                                pre.reach = scan.0;
+                                pre.dir = scan.1;
+                            }
+                        }
+                        continue; // 回主循环查队列（真实消息到达即抢占）
+                    }
+                    // 理论不可达（while 循环要么 finish 要么定位 pending）：兜底置 idle。
+                    grid_prewarm = None;
+                    continue;
                 } else {
-                    // 光标越过末尾（全部页已熟/无法渲）→ 该文档预熟完成，停。
+                    // 已刷齐 → 停（自然 idle；滚动重新定心推新几何时重新开启）。
                     grid_prewarm = None;
                     continue;
                 }
@@ -2083,37 +2250,50 @@ impl PdfWorker {
                     recolor.insert(doc_id, params);
                     // 同 sweep：网格缓存存最终着色位图，切档即旧色失效 → 整套清空。
                     grid_cache.remove(&doc_id);
-                    // 同 sweep：缓存已清 → 预熟游标归 0（以新色从整本开头重熟）。
+                    // 同 sweep：缓存已清 → 预熟从新几何中心重扫（当前带宽窗口内已缓存页跳过）。
                     if let Some(p) = grid_prewarm.as_mut() {
                         if p.doc_id == doc_id {
-                            p.cursor = 0;
+                            p.reach = 0;
+                            p.dir = -1;
+                            p.done = false;
                         }
                     }
                 }
-                Ok((_gen, _z, WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor))) => {
-                    // 与上方 sweep 同一「预熟开启/目标更新」语义（view 唯一真源；桶级比较）。
+                Ok((
+                    _gen,
+                    _z,
+                    WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor, geom),
+                )) => {
+                    // 与上方 sweep 同一「预熟开启/目标/几何更新」语义（view 唯一真源）：
+                    // 跨桶或几何变 → 更新目标 + 从新中心重扫；同桶同几何重复推送幂等不打断。
                     let same_doc = grid_prewarm.as_ref().is_some_and(|p| p.doc_id == doc_id);
-                    let same_bucket = grid_prewarm.as_ref().is_some_and(|p| {
-                        p.doc_id == doc_id
-                            && grid_bucket_width(p.full_card * p.scale_factor.max(1.0))
-                                == grid_bucket_width(full_card * scale_factor.max(1.0))
-                    });
+                    let cur_bucket = grid_prewarm
+                        .as_ref()
+                        .map(|p| grid_bucket_width(p.full_card * p.scale_factor.max(1.0)));
+                    let new_bucket = grid_bucket_width(full_card * scale_factor.max(1.0));
                     match grid_prewarm.as_mut() {
                         Some(p) if same_doc => {
-                            if !same_bucket {
+                            let geom_changed = p.geom != geom;
+                            if cur_bucket != Some(new_bucket) || geom_changed {
                                 p.full_card = full_card;
                                 p.quick_card = quick_card;
                                 p.scale_factor = scale_factor;
-                                p.cursor = 0;
+                                p.geom = geom;
+                                p.reach = 0;
+                                p.dir = -1;
+                                p.done = false;
                             }
                         }
                         _ => {
                             grid_prewarm = Some(GridPrewarm {
                                 doc_id,
-                                cursor: 0,
                                 full_card,
                                 quick_card,
                                 scale_factor,
+                                geom,
+                                reach: 0,
+                                dir: -1,
+                                done: false,
                             });
                         }
                     }
@@ -2320,6 +2500,34 @@ unsafe extern "C" fn raw_file_write_vec_block(
     1
 }
 
+/// T3：**惰性物化 stores 基线**——打开不再镜像源字节（[`WorkerMsg::Open`] stores 留空），
+/// 首个写/存/导出/读回经本 helper 从 live 渲染 doc `SaveAsCopy` 物化一次并落 stores；此后
+/// 命中缓存零重复。语义与现状「Open 即 clone 源字节」的差异：物化产物 = `FPDF_SaveAsCopy`
+/// （重编码），非原始源字节——写回/撤销/另存的 `before` 基线由「源字节」变为「重编码」，页/
+/// 内容级保真不变（既有写路径测试覆盖），字节级不恒等（设计评审已定可接受）。
+///
+/// 仅当 stores 缺失（= 文档刚 Open / 刚经 viewer 重载）时才谈得上物化；此时 `docs` 必为
+/// 最新 live 态（Open 载入 / open_from_bytes 重载后的解析结果），与「stores 本应持有的
+/// 字节」同源，不会物化出陈旧内容。
+fn materialize_stores(
+    stores: &mut HashMap<DocId, Arc<Vec<u8>>>,
+    docs: &HashMap<DocId, PdfDocument<'_>>,
+    doc_id: DocId,
+) -> Result<Arc<Vec<u8>>> {
+    if let Some(b) = stores.get(&doc_id) {
+        return Ok(b.clone());
+    }
+    let doc = docs
+        .get(&doc_id)
+        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法物化 stores）"))?;
+    let bytes = doc
+        .save_to_bytes()
+        .map_err(|e| anyhow!("物化 stores 失败（SaveAsCopy：{e}）"))?;
+    let bytes = Arc::new(bytes);
+    stores.insert(doc_id, bytes.clone());
+    Ok(bytes)
+}
+
 /// 把 raw 句柄文档重新编码成内存 bytes（等效 [`save_raw_doc_to_file`] 但零磁盘）。
 /// 供 worker 内存工作副本（stores）的页面操作产出新镜像，由 viewer 内存级重载。
 unsafe fn save_raw_doc_to_bytes(
@@ -2380,17 +2588,16 @@ unsafe fn save_raw_doc_to_file(
 ///
 /// 待保存模型（P1）的页面操作：只改 worker 内内存工作副本（stores，`FPDF_SaveAsCopy`
 /// 到 `Vec`），**绝不碰磁盘**。`before` = 操作前 stores 快照（撤销恢复用），`after` =
-/// 操作后新镜像，两者都由 viewer 持有/消费。
+/// 操作后新镜像，两者都由 viewer 持有/消费。T3：`before` 先经 [`materialize_stores`]
+/// 惰性取（缺镜像即从 live doc SaveAsCopy 物化一次）。
 fn writeback_edit_mem(
-    stores: &mut HashMap<DocId, Vec<u8>>,
+    stores: &mut HashMap<DocId, Arc<Vec<u8>>>,
+    docs: &HashMap<DocId, PdfDocument<'_>>,
     bindings: &dyn PdfiumLibraryBindings,
     doc_id: DocId,
     edit: impl FnOnce(&dyn PdfiumLibraryBindings, FPDF_DOCUMENT) -> Result<usize>,
 ) -> Result<MemOpResult> {
-    let before = stores
-        .get(&doc_id)
-        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法内存操作）"))?
-        .clone();
+    let before = materialize_stores(stores, docs, doc_id)?.to_vec();
     unsafe {
         let raw = load_raw_doc(bindings, &before)?;
         let count = match edit(bindings, raw) {
@@ -2408,7 +2615,7 @@ fn writeback_edit_mem(
             }
         };
         bindings.FPDF_CloseDocument(raw);
-        stores.insert(doc_id, after.clone());
+        stores.insert(doc_id, Arc::new(after.clone()));
         Ok(MemOpResult { before, after, count })
     }
 }
@@ -2424,15 +2631,13 @@ fn writeback_edit_mem(
 /// 目标序，例如 0 基 [2,4,1,3] → 1 基段 "3","5","2","4" 逐段 import 成 [2,4,1,3]）——
 /// 与 [`WorkerMsg::ExtractPage`] 同 fps 精度/保真口径（pdfium 重新编码，不做字节级保真）。
 fn reorder_edit_mem(
-    stores: &mut HashMap<DocId, Vec<u8>>,
+    stores: &mut HashMap<DocId, Arc<Vec<u8>>>,
+    docs: &HashMap<DocId, PdfDocument<'_>>,
     bindings: &dyn PdfiumLibraryBindings,
     doc_id: DocId,
     new_order: Vec<usize>,
 ) -> Result<MemOpResult> {
-    let before = stores
-        .get(&doc_id)
-        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法内存操作）"))?
-        .clone();
+    let before = materialize_stores(stores, docs, doc_id)?.to_vec();
     unsafe {
         let raw = load_raw_doc(bindings, &before)?;
         let count = bindings.FPDF_GetPageCount(raw) as usize;
@@ -2487,7 +2692,7 @@ fn reorder_edit_mem(
         bindings.FPDF_CloseDocument(raw);
         // 重排只改变页序，总页数不变。
         let new_count = count;
-        stores.insert(doc_id, after.clone());
+        stores.insert(doc_id, Arc::new(after.clone()));
         Ok(MemOpResult { before, after, count: new_count })
     }
 }
@@ -2552,16 +2757,14 @@ fn new_doc_importing_seq(
 /// 去重、非空；非法 → Err）→ 新建 raw 文档按给定序逐段 import → 落盘 `out_path`。
 /// **不改变当前文档 / 不更新 stores**（副本语义）。成功回传写入文件的页数（= 去重后页数）。
 fn export_pages_to_file(
-    stores: &mut HashMap<DocId, Vec<u8>>,
+    stores: &mut HashMap<DocId, Arc<Vec<u8>>>,
+    docs: &HashMap<DocId, PdfDocument<'_>>,
     bindings: &dyn PdfiumLibraryBindings,
     doc_id: DocId,
     pages: &[usize],
     out: &Path,
 ) -> Result<usize> {
-    let bytes = stores
-        .get(&doc_id)
-        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法导出）"))?
-        .clone();
+    let bytes = materialize_stores(stores, docs, doc_id)?;
     unsafe {
         let raw = load_raw_doc(bindings, &bytes)?;
         let count = bindings.FPDF_GetPageCount(raw) as usize;
@@ -2615,17 +2818,16 @@ pub struct MemOpResult {
 /// - 成功路径：`FPDF_SaveAsCopy` 落到 `output_path`（原子替换），然后**更新内存 bytes**
 ///   镜像（后续操作基于新内容）；
 /// - 失败路径：关闭 raw 句柄后原样上抛，目标文件不受影响。
+/// T3：源镜像先经 [`materialize_stores`] 惰性取（缺镜像即从 live doc SaveAsCopy 物化一次）。
 fn writeback_edit(
-    stores: &mut HashMap<DocId, Vec<u8>>,
+    stores: &mut HashMap<DocId, Arc<Vec<u8>>>,
+    docs: &HashMap<DocId, PdfDocument<'_>>,
     bindings: &dyn PdfiumLibraryBindings,
     doc_id: DocId,
     output_path: &Path,
     edit: impl FnOnce(&dyn PdfiumLibraryBindings, FPDF_DOCUMENT) -> Result<usize>,
 ) -> Result<usize> {
-    let bytes = stores
-        .get(&doc_id)
-        .ok_or_else(|| anyhow!("文档 {doc_id} 不存在（无法写回）"))?
-        .clone();
+    let bytes = materialize_stores(stores, docs, doc_id)?;
     unsafe {
         let raw = load_raw_doc(bindings, &bytes)?;
         let result_out = match edit(bindings, raw) {
@@ -2636,7 +2838,7 @@ fn writeback_edit(
                 }
                 // 读回已写入的新文件 bytes 作内存镜像（后续写回/重载基于新内容）
                 if let Ok(new_bytes) = std::fs::read(output_path) {
-                    stores.insert(doc_id, new_bytes);
+                    stores.insert(doc_id, Arc::new(new_bytes));
                 }
                 n
             }
@@ -3352,21 +3554,34 @@ fn grid_render_count() -> u64 {
     GRID_RENDERS.load(Ordering::Relaxed)
 }
 
-/// 网格**空闲预熟**游标（本线）：`grid_prewarm` 的状态载荷。`cursor` 前进方向 = 页序
-/// （升序整本补齐）；`full_card`/`quick_card`/`scale_factor` = 预熟目标（来自 view 进入网格
-/// /卡宽变化时推送的 [`WorkerMsg::SetGridPrewarm`]，全清 + 低清两档——`render_grid` 前乘成
-/// 目标像素宽）。每页两档都预熟：滚动风暴（低清桶）与 idle（全清桶）均命中缓存零重栅。
+/// 网格**带宽预熟**状态载荷（本线）：`grid_prewarm` 的状态载荷。语义 = 「以视口中心页为
+/// 核心的水平带宽」——近带（[`GridPrewarmGeom::near`]，完整覆盖 view 可视带+保留窗）全清 +
+/// 低清双档、中带（[`GridPrewarmGeom::window`] \ near）仅低清、更远不预熟。`reach`/`dir` =
+/// **外向扫描游标**：从 `geom.center_page` 起双向交替外扩（下、上、下、上…），窗口内页
+/// 逐页按近/中选桶栅格；窗口刷齐（额定最大页距 [`Self::max_reach_hint`]（由 5.5 步按
+/// window 计算）扫完）即自然 idle（`grid_prewarm = None`），**不再推进「全整本」**——长
+/// 文档预熟有界常驻几十 MB，整本 LRU 滑动窗抖动/永不完成根治。`full_card`/`quick_card`/
+/// `scale_factor` = 预熟目标（来自 view 进入网格/卡宽变化/滚动重定中心时推送的
+/// [`WorkerMsg::SetGridPrewarm`]，全清 + 低清两档——`render_grid` 前乘成目标像素宽）。
 struct GridPrewarm {
     /// 预熟文档。
     doc_id: DocId,
-    /// 下一页待预熟下标（升序；已缓存页在推进时跳过）。
-    cursor: usize,
     /// 全清档目标卡宽（逻辑 px；×`scale_factor` = 目标像素宽，与 `request_grid` 同口径）。
     full_card: f32,
     /// 低清快速档目标卡宽（逻辑 px；view 已按 `grid_quick_target_px` 换算出 ≤全清的宽）。
     quick_card: f32,
     /// 显示 DPI（≥1.0 口径沿用 `view` 侧 `scale_factor.max(1.0)`）。
     scale_factor: f32,
+    /// 几何窗口 + 中心（view 每次重定中心随 SetGridPrewarm 推送）。
+    geom: GridPrewarmGeom,
+    /// **外向扫描游标**：距 `geom.center_page` 的页距（0 = 中心页本身；每处理完一页按
+    /// [`Self::dir`] 推进）。
+    reach: usize,
+    /// 当前扫描侧：+1 = 向下（center+reach）、−1 = 向上（center−reach）；处理完当前页翻转
+    /// （下、上、下…交替外扩，两侧同步前进）。
+    dir: i64,
+    /// 窗口已刷齐（额定页距扫完、窗口内无可预熟页）→ 停（自然 idle）；新几何推送时复位。
+    done: bool,
 }
 
 /// 网格缩略图缓存条目（**最终着色** BGRA；切档由 run 循环清整文档缓存，见 SetRecolor）。
@@ -4783,6 +4998,181 @@ mod tests {
             "低清冷渲不应比全清慢（方向 sanity）"
         );
         // 关档清理（含预熟游标），防残留 doc 占用 worker 空闲预熟。
+        worker.close(doc_id);
+    }
+
+    /// DIAG（测绘遗留，保留不删、禁当回归）：reader 每号栅格真墙钟 + `cache_raw` O(n) 字节
+    /// 求和/逐出开销。headless 无 pdfium → SKIP（夹具不入库）。
+    #[test]
+    fn reader_raster_cost_and_raw_evict_diag() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[1].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 4, "夹具页数需 ≥4，实际 {n}");
+        let px = 1usize; // 避开首页，取第 1 页（既有 bench 同口径）
+
+        // 每单位光栅耗时（worker 串行 FIFO 往返 = pdfium 栅格 + 固定开销；固定开销 ~0.04ms
+        // 级，见 grid_diag hot≈0.036ms，可忽略）。
+        let ms = |label: &str, f: &mut dyn FnMut() -> (u32, u32)| {
+            let t0 = std::time::Instant::now();
+            let (w, h) = f();
+            let m = t0.elapsed().as_secs_f64() * 1e3;
+            assert!(m.is_finite() && m > 0.0, "{label} 应测到正耗时");
+            eprintln!("[READER-DIAG] {label}: {m:.2}ms -> {w}x{h}px");
+            m
+        };
+        // 整页封面：scale=1.0（≈596px 宽）与 scale=2.0（≈1192px 宽，headless sf=2 实际阅读密度）
+        let cover10 = ms("cover@1.0", &mut || {
+            let rx = worker.request_render(
+                doc_id,
+                RenderRequest {
+                    page: px,
+                    scale: 1.0,
+                },
+                0,
+                0,
+            );
+            let r = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            (r.width, r.height)
+        });
+        let cover20 = ms("cover@2.0", &mut || {
+            let rx = worker.request_render(
+                doc_id,
+                RenderRequest {
+                    page: px,
+                    scale: 2.0,
+                },
+                0,
+                0,
+            );
+            let r = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            (r.width, r.height)
+        });
+        // 512px 瓦片：page@2.0 → 位图 ≈2w×2h，取中心格 (1,1)（非首格，避免边上空瓦片）
+        let tile = ms("tile@512(sf2)", &mut || {
+            let rx = worker.request_tile(
+                doc_id,
+                TileRequest {
+                    page: px,
+                    scale: 2.0,
+                    tile_size: 512,
+                    row: 1,
+                    col: 1,
+                },
+                0,
+                0,
+            );
+            let t = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            (t.w, t.h)
+        });
+        // L0 缩略（260px）与 L0.5 中清（520px，sf=1）
+        let thumb = ms("thumb@260", &mut || {
+            let rx = worker.request_thumb(doc_id, px, 0, 0);
+            let r = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            (r.width, r.height)
+        });
+        let mid = ms("mid@520", &mut || {
+            let rx = worker.request_mid(doc_id, px, 1.0, 0, 0);
+            let r = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            (r.width, r.height)
+        });
+
+        // ---- cache_raw O(n) 字节求和（每次写入都付，超预算才逐出）----
+        // 合成 n=512 条 ~1MB 原图（≈ 切档刷新可见集上界量级），拆求和与逐出两档。
+        let n_raw = 256usize; // 256 条 ×1MB ≈256MB > 48MB 预算若干倍
+        let raw_bytes = 512usize * (512usize * 4usize);
+        let mut raw: Vec<RawEntry> = Vec::with_capacity(n_raw);
+        for i in 0..n_raw {
+            raw.push(RawEntry {
+                kind: RawKind::Tile,
+                page: i,
+                row: 0,
+                col: 0,
+                x0: 0,
+                y0: 0,
+                w: 512,
+                h: 512,
+                full_w: 512,
+                full_h: 512,
+                scale: 1.0,
+                bgra: vec![0u8; raw_bytes],
+            });
+        }
+        let t_sum = std::time::Instant::now();
+        let _over = raw.iter().map(RawEntry::bytes).sum::<u64>();
+        let sum_us = t_sum.elapsed().as_secs_f64() * 1e6;
+        let t0 = std::time::Instant::now();
+        let mut work = raw; // move：从头逐出（budget=0 全逐、至少留 1）
+        let first = work.remove(0);
+        cache_raw(&mut work, first, 0); // budget=0 → 触发全逐出
+        let evict_us = t0.elapsed().as_secs_f64() * 1e6;
+        assert!(work.len() <= 1, "budget=0 应逐出到 ≤1 条");
+        eprintln!(
+            "[READER-DIAG] cache_raw O(n): n={n_raw} 条({}MB) → 字节求和 {sum_us:.1}µs ≈ {:.1}ns/条；超支全逐出 {evict_us:.1}µs（仅超预算才付）",
+            (n_raw * raw_bytes) as f64 / (1024.0 * 1024.0),
+            sum_us * 1e3 / n_raw as f64,
+        );
+        eprintln!(
+            "[READER-DIAG] 汇总: cover@1.0={cover10:.1}ms cover@2.0={cover20:.1}ms tile={tile:.1}ms thumb={thumb:.1}ms mid={mid:.1}ms（同机同二进制交错，噪声 ±30% 只当方向）"
+        );
+        worker.close(doc_id);
+    }
+
+    /// T3 内存探针（DIAG，保留）：打开后 `stores` 未物化（None = 省一份源字节驻留）；
+    /// 首写（内存删页）触发惰性物化后已物化（Some 字节长 > 0）。
+    #[test]
+    fn stores_lazy_materialize_memory_probe_diag() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let src_len = bytes.len();
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len();
+        assert!(n >= 1, "夹具页数需 ≥1，实际 {n}");
+
+        // ① 打开后 stores 尚未物化（None = 未镜像源字节 → 真省一份整本驻留）
+        let before = worker.mem_state(doc_id);
+        assert!(
+            before.is_none(),
+            "打开后 stores 应为空（未物化），实际 {before:?}"
+        );
+
+        // ② 首写操作（内存删除第 0 页）触发惰性物化 → 之后已物化（Some 字节长 > 0）
+        let r = worker.mem_delete_page(doc_id, 0).expect("内存删除应成功");
+        assert_eq!(r.count, n - 1, "删除后页数 -1");
+        let after_len = worker
+            .mem_state(doc_id)
+            .expect("首写后 stores 应已物化（Some 字节）");
+        assert!(after_len > 0, "物化字节长应 > 0，实际 {after_len}B");
+        eprintln!(
+            "[T3-DIAG] stores 延迟克隆：打开后 stores 字节 = 0（源字节 {src_len}B 不再镜像驻留，省一份整本）；首写惰性物化后 = {after_len}B"
+        );
         worker.close(doc_id);
     }
 

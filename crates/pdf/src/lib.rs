@@ -8574,6 +8574,260 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    #[ignore] // 性能/内存基准：依赖真 PDF 夹具且耗时，手动 --ignored 跑
+    async fn diag_facing_cold_open_and_deep_jump_wallclock(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use crate::pdf::view::PageMode;
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        // 立即进入 Facing：状态仅一次 notify，加载完成前安全（set_page_mode 无 worker 依赖）。
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| v.set_page_mode(PageMode::Facing, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        let t0 = Instant::now();
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let open_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_count());
+
+        // Facing 首屏稳定：加载后到「在途全清 + 泵停」的墙钟（首次栅格 + 上传收口）
+        let t1 = Instant::now();
+        let mut settled;
+        let mut ready_iters = 0usize;
+        for _ in 0..800 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            ready_iters += 1;
+            settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty() && v.pending_cover.is_empty() && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+        let ready_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let (tile0, cover0, rast0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.tile_reqs, v.cover_reqs, v.raster_reqs)
+        });
+        let rerend0 =
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).cover_re_renders);
+
+        // Facing 深跳：0 -> n-5（位移 > JUMP_PAGES_THRESHOLD=7 → nav_gen++ + 落点 preview 底图）
+        let target = (n as i64 - 5).max(1) as usize;
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.scroll_to_page(target);
+                cx.notify();
+            });
+        });
+        let t2 = Instant::now();
+        let mut jump_settled = false;
+        let mut jump_iters = 0usize;
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            jump_iters += 1;
+            jump_settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty() && v.pending_cover.is_empty() && !v.tile_pump_running
+            });
+            if jump_settled {
+                break;
+            }
+        }
+        let jump_ms = t2.elapsed().as_secs_f64() * 1e3;
+        // 落点驻留内存构成（封面按 Facing 卡宽 page_card_display_w 估算，与调度同口径）
+        let (tile1, cover1, rast1, covers_held, mids_held, thumbs_held, tile_bytes, cover_bytes) =
+            cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let sf = 1.0f32;
+                let mut covers_held = 0usize;
+                let mut mids_held = 0usize;
+                let mut thumbs_held = 0usize;
+                let mut cover_bytes = 0u64;
+                for (p, s) in v.slots.iter().enumerate() {
+                    if s.cover.is_some() {
+                        covers_held += 1;
+                        let (w, h) = layout::page_bitmap_size(
+                            v.dims[p],
+                            layout::cover_scale(v.dims[p], v.page_card_display_w(p), sf),
+                        );
+                        cover_bytes += (w as u64) * (h as u64) * 4;
+                    }
+                    if s.mid.is_some() {
+                        mids_held += 1;
+                    }
+                    if s.thumb.is_some() {
+                        thumbs_held += 1;
+                    }
+                }
+                (
+                    v.tile_reqs,
+                    v.cover_reqs,
+                    v.raster_reqs,
+                    covers_held,
+                    mids_held,
+                    thumbs_held,
+                    v.tile_bytes,
+                    cover_bytes,
+                )
+            });
+        let est = tile_bytes
+            + cover_bytes
+            + mids_held as u64 * 2 * 1024 * 1024
+            + thumbs_held as u64 * 385 * 1024;
+        eprintln!(
+            "[DIAG-FACING] n={n} open_ms={open_ms:.0} ready_ms={ready_ms:.0} iters={ready_iters} first(t={tile0},c={cover0},r={rast0},rr={rerend0}) jump(0->{target}) settle_ms={jump_ms:.0} iters={jump_iters} reqs(+t={},+c={},+r={}) jump_settled={jump_settled} mem(tiles={}MB covers={}({}MB) mids={} thumbs={} est={}MB)",
+            tile1 - tile0,
+            cover1 - cover0,
+            rast1 - rast0,
+            tile_bytes / 1024 / 1024,
+            covers_held,
+            cover_bytes / 1024 / 1024,
+            mids_held,
+            thumbs_held,
+            est / 1024 / 1024,
+        );
+    }
+
+    /// T1 回归（Facing 冷开「全 None 不派」守卫 + `cover_re_renders` 双渲计数，真实渲染路径
+    /// + 真夹具）：立即进入 Facing 的冷开序列，首屏稳定后断言封面已按满密度派发
+    /// （`cover_reqs > 0`）且**同页双渲计数** `cover_re_renders`（stale→prev_cover→按新密度
+    /// 重派）≤ 1——无守卫基线上可见页 0/1 会经历「邻居降档 2.0 → 满密度 2.138」stale 重派
+    /// （实测 baseline `rr=2`）；守卫把「全 None 帧的邻居降档封面」整窗拦下（首 1-2 帧铺
+    /// L0/L0.5），可见后直接满密度，双渲降至 ≤1（残余 1 属「模式翻转密度沉降」：
+    /// 连续满密 2.565 → 分页满密 2.138，见 `diag_facing_cold_open_and_deep_jump_wallclock`）。
+    /// 断言还锁停稳收敛（`settled`），防守卫把首屏拖成不收敛。
+    #[gpui::test]
+    async fn t1_facing_cold_open_skips_all_none_cover_window(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::test_support::bind_local_keymaps);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        // 立即进入 Facing：与 `diag_facing_cold_open_and_deep_jump_wallclock` 同姿势——冷开
+        // 前若干调度帧 Facing 未生效（`page_visible_rect` 全 None），正是 T1 守卫的触发段。
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(crate::pdf::view::PageMode::Facing, cx);
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        // 首屏稳定：在途全清 + 泵停。
+        let mut settled = false;
+        for _ in 0..800 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            settled = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                v.pending_tiles.is_empty() && v.pending_cover.is_empty() && !v.tile_pump_running
+            });
+            if settled {
+                break;
+            }
+        }
+        let (c1, rr1, r1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.cover_reqs, v.cover_re_renders, v.raster_reqs)
+        });
+        eprintln!(
+            "[T1-FIRST-SCREEN] cover_reqs={c1} cover_re_renders={rr1} raster_reqs={r1} settled={settled}"
+        );
+        assert!(c1 > 0, "首屏应派发封面（cover_reqs={c1}）");
+        assert!(
+            rr1 <= 1,
+            "Facing 冷开同页双渲计数应 ≤1（无守卫基线 rr=2；残余 1 属模式翻转密度沉降）：rr1={rr1}"
+        );
+        assert!(settled, "首屏应停稳收敛（T1 守卫不得拖散尾）");
+    }
+
     /// 回归（**切档不重栅计数**，真实渲染路径 + 真夹具）：切换夜间档/回默认档后，本阅读器
     /// 派发的**栅格类请求**（`Render/RenderTile/Mid/Thumb`，即 worker 收到的栅格命令）必须
     /// 为 0——旧语义清缓存重派导致的 pdfium 全量重栅（夜间档加载慢根因）被根治，只剩下
