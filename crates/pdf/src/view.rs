@@ -299,8 +299,10 @@ where
 
 // 职责子模块（2026-10 由单文件 `view.rs` 拆出，纯 move；私有方法经 `pub(super)`
 // 保持视图子树内可见，公共 API / 可见性语义不变，见各模块头部文档）。
+mod ensure;
 mod input;
 mod open;
+mod ops;
 mod render;
 mod search;
 mod tiles;
