@@ -1628,6 +1628,7 @@ impl Window {
                 window_min_size,
                 app_id: app_id.clone(),
                 icon,
+                window_background,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
             },

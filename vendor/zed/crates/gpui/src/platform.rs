@@ -2637,6 +2637,14 @@ pub struct WindowParams {
 
     pub window_min_size: Option<Size<Pixels>>,
 
+    /// The appearance of the window background at creation time.
+    ///
+    /// [vuick fork] fork 分歧新增字段：上游 93d7456 的 `WindowParams` 不含背景透明度，
+    /// 创建期无法得知窗口是否透明 → x11 后端只能无条件用 ARGB 透明 visual。为让 x11
+    /// 后端「不透明窗口取 opaque visual、仅真透明才取 transparent visual」（修无合成器
+    /// 时 ARGB 窗恒黑），把 `WindowOptions::window_background` 透传到创建参数。
+    pub window_background: WindowBackgroundAppearance,
+
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
 }

@@ -13,13 +13,17 @@ license = "Apache-2.0"
 path = "src/gpui_platform.rs"
 doctest = false
 
-# Vendored/trimmed for vuick: Windows-only. Feature names kept so
+# Vendored/trimmed for vuick. 2026-11 Phase 2: restored the Linux backend
+# branch (gpui_linux + gpui_wgpu, upstream rev 93d7456 as-is) alongside
+# Windows; wayland/x11 features forwarded to gpui_linux. Feature names kept so
 # consumer manifests (vuick root: features=["font-kit"]) still parse.
 [features]
 default = []
 font-kit = []
 inspector = ["gpui/inspector"]
 test-support = ["gpui/test-support", "gpui_windows/test-support"]
+wayland = ["gpui_linux/wayland"]
+x11 = ["gpui_linux/x11"]
 
 [dependencies]
 anyhow.workspace = true
@@ -28,6 +32,12 @@ gpui.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_windows.workspace = true
 gpui = { workspace = true, features = ["windows-manifest"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_linux.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_wgpu = { workspace = true, optional = true }
 
 [lints]
 workspace = true

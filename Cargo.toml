@@ -50,7 +50,7 @@ gpui = { workspace = true, features = ["test-support"] }
 [workspace]
 resolver = "2"
 members = ["crates/media_ffmpeg", "crates/media_io", "crates/config", "crates/base", "crates/ime", "crates/viewer", "crates/syntax", "crates/ui", "crates/editor", "crates/editor_core", "crates/text_open", "crates/markdown", "crates/markdown_wysiwyg", "crates/markdown_wysiwyg_engine", "crates/markdown_wysiwyg_mermaid", "crates/markdown_wysiwyg_math", "crates/toc", "crates/pdf", "crates/pdf_core", "crates/image_viewer", "crates/video", "crates/epub",     "crates/shell", "crates/shell_core", "crates/shell_sidebar", "crates/shell_pdf", "crates/shell_media", "crates/shell_preview", "crates/shell_tabs", "crates/tray", "crates/music", "crates/session_store", "crates/shell_commands", "crates/shell_scan", "crates/shell_widgets", "crates/imgbench", "crates/kimg", "crates/kimg_core", "crates/kimg_png", "crates/kimg_gif", "crates/kimg_webp", "crates/kimg_jpeg", "crates/kimg_tiff", "crates/kimg_bmp",     "crates/kimg_ico", "crates/kimg_pnm", "crates/kimg_heif",
-    "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client"]
+    "vendor/zed/crates/gpui", "vendor/zed/crates/gpui_windows", "vendor/zed/crates/gpui_platform", "vendor/zed/crates/gpui_macros", "vendor/zed/crates/gpui_shared_string", "vendor/zed/crates/gpui_util", "vendor/zed/crates/collections", "vendor/zed/crates/scheduler", "vendor/zed/crates/sum_tree", "vendor/zed/crates/refineable", "vendor/zed/crates/refineable/derive_refineable", "vendor/zed/crates/http_client", "vendor/zed/crates/gpui_linux", "vendor/zed/crates/gpui_wgpu"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`media_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。
@@ -74,7 +74,8 @@ unexpected_cfgs = "allow"
 # gpui：P6 已 vendor 到本仓 vendor/zed（zed rev 93d7456 的 Windows 子集闭包，Apache-2.0）。
 # 不再用 git 依赖——GPU 直通（YUV 着色器/D3D11 设备暴露/外部纹理）需改 gpui/gpui_windows，本仓内 fork 可随意改。
 gpui = { path = "vendor/zed/crates/gpui" }
-gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["font-kit"] }
+gpui_linux = { path = "vendor/zed/crates/gpui_linux", default-features = false }
+gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "x11", "wayland"] }
 serde_json = "1"
 regex = "1"
 memchr = "2"
@@ -190,6 +191,7 @@ derive_refineable = { path = "vendor/zed/crates/refineable/derive_refineable" }
 gpui_macros = { path = "vendor/zed/crates/gpui_macros" }
 gpui_shared_string = { path = "vendor/zed/crates/gpui_shared_string" }
 gpui_util = { path = "vendor/zed/crates/gpui_util" }
+gpui_wgpu = { path = "vendor/zed/crates/gpui_wgpu" }
 gpui_windows = { path = "vendor/zed/crates/gpui_windows", default-features = false }
 http_client = { path = "vendor/zed/crates/http_client" }
 refineable = { path = "vendor/zed/crates/refineable" }
@@ -197,13 +199,22 @@ scheduler = { path = "vendor/zed/crates/scheduler" }
 sum_tree = { path = "vendor/zed/crates/sum_tree" }
 accesskit = { version = "0.24.0", features = ["enumn"] }
 accesskit_windows = "0.34"
+accesskit_unix = "0.22"
 async-channel = { version = "2.5", default-features = false }
 async-compression = { version = "0.4", features = ["bzip2", "gzip", "futures-io"] }
 async-fs = "2.1"
 async-tar = { git = "https://github.com/zed-industries/async-tar", rev = "bd3ad6f89df9a9da7a8535958756d6bf465936a0" }
 async-task = "4.7"
+ashpd = { version = "0.13", default-features = false, features = [
+    "async-io",
+    "inhibit",
+    "open_uri",
+    "file_chooser",
+    "settings",
+] }
 backtrace = "0.3"
 bitflags = "2.6.0"
+bytemuck = "1"
 bytes = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
@@ -213,12 +224,30 @@ dunce = "1.0"
 env_logger = "0.11"
 etagere = "0.2"
 flume = { version = "0.12", default-features = false, features = ["async"] }
+font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", package = "zed-font-kit", version = "0.14.1-zed", default-features = false }
 futures-concurrency = "7.7.1"
 hdrhistogram = { version = "7", default-features = false }
 heapless = "0.9.2"
 heck = "0.5"
 http = "1.1"
 http-body = "1.0"
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "dds",
+    "exr",
+    "ff",
+    "gif",
+    "hdr",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "qoi",
+    "rayon",
+    "tga",
+    "tiff",
+    "webp",
+] }
 indexmap = { version = "2.7.0", features = ["serde"] }
 inventory = "0.3.19"
 itertools = "0.14.0"
@@ -227,6 +256,8 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 objc2 = "0.6"
 objc2-core-foundation = { version = "=0.3.2", default-features = false }
 objc2-core-video = { version = "=0.3.2", default-features = false, features = ["CVBuffer", "CVImageBuffer"] }
+notify-rust = "4"
+oo7 = { version = "0.6", default-features = false }
 parking_lot = "0.12.1"
 postage = { version = "0.5", default-features = false }
 proc-macro2 = "1.0.93"
@@ -250,15 +281,19 @@ serde_urlencoded = "0.7"
 sha2 = "0.10"
 slotmap = "1.0.6"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
+smol = "2.0"
 spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex", "lock_api"] }
 stacksafe = "1.0"
 strum = { version = "0.28", features = ["derive"] }
+swash = "0.2.6"
 syn = { version = "2.0", default-features = false, features = ["proc-macro"] }
 taffy = { version = "=0.13.0", default-features = false }
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 tracing = "0.1.40"
 tracing-subscriber = "0.3"
+unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
+unicode-segmentation = "1.10"
 url = "2.2"
 usvg = { version = "0.46.0", default-features = false }
 uuid = { version = "1.1", features = ["serde"] }
@@ -266,9 +301,11 @@ wasm_thread = { git = "https://github.com/zed-industries/wasm_thread", rev = "0c
 wasm-bindgen = "0.2.120"
 web-sys = "0.3"
 web-time = "1.1.0"
+wgpu = { version = "29.0", default-features = false }
 which = "8"
 windows-core = "0.62"
 windows-registry = "0.6.0"
+xkbcommon = { version = "0.8", default-features = false }
 
 [workspace.dependencies.windows]
 version = "0.62"
