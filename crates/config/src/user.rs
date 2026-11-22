@@ -231,9 +231,11 @@ impl UserPrefs {
         // 「一次性临时目录」，绝不触碰真实 `%APPDATA%`；显式 `VUICK_CONFIG` 恒优先。
         #[cfg(any(test, feature = "test-mode"))]
         {
-            return Self::test_config_path();
+            Self::test_config_path()
         }
-        #[cfg(windows)]
+        // 与上方测试块互斥：测试/测试模式（cfg(test) 或 test-mode feature）下本块同存活
+        // 会让其后语句因 `return` 被判 unreachable（clippy -D warnings 红）。
+        #[cfg(all(windows, not(any(test, feature = "test-mode"))))]
         {
             // Windows：APPDATA 缺省/空 → 当前目录回退（既有语义原样）；旧目录迁移仅此分支。
             if let Ok(appdata) = std::env::var("APPDATA")
@@ -245,7 +247,7 @@ impl UserPrefs {
             }
             PathBuf::from("vuick-config.json")
         }
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(any(test, feature = "test-mode"))))]
         {
             // 非 Windows：XDG 配置目录；无 XDG_CONFIG_HOME/HOME → 回落当前目录（保持既有回退语义）。
             let dir = base::paths::app_config_dir();
@@ -264,6 +266,7 @@ impl UserPrefs {
     /// （非 Windows 无旧目录迁移需求）；生产路径触发（测试隔离目录不经此函数）——
     /// 旧目录不存在 / 新目录已存在 → 无操作。
     #[cfg(windows)]
+    #[cfg_attr(any(test, feature = "test-mode"), allow(dead_code))]
     fn migrate_legacy_appdata(appdata_dir: &Path) {
         #[cfg(any(test, feature = "test-mode"))]
         {
