@@ -1,5 +1,7 @@
 # Vuick
 
+**简体中文 ｜ [English](README.en.md)**
+
 ![CI](https://github.com/yuexiliuli/Vuick/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
 
