@@ -28,6 +28,10 @@
 //! `#[gpui::test]` 在无真实 GUI 时走完整双设备链路（见 viewer 的
 //! `gpu_passthrough_first_frame_paints_shared_handle`）。
 
+// 模块级 Windows 门（Phase 1 Linux 编译解锁）：本文件是纯 D3D11/Dxgi 绑定，只应在
+// Windows 编译；非 Windows 由 lib.rs `#[path = "hw_linux.rs"] mod hw` 提供软解回退桩。
+#![cfg(windows)]
+
 use windows::core::Interface as _;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{

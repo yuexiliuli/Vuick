@@ -892,6 +892,7 @@ impl super::VideoViewer {
         path: &std::path::Path,
         mode: &ReaderMode,
     ) -> anyhow::Result<(ReaderMode, VideoReader, Option<SharedCopier>)> {
+        #[cfg(windows)]
         use windows::core::Interface as _;
         match mode {
             ReaderMode::Auto(cap) => {
@@ -903,33 +904,38 @@ impl super::VideoViewer {
                     return VideoReader::open_scaled(path, *cap)
                         .map(|r| (ReaderMode::Soft(*cap), r, None));
                 }
-                // 双设备 GPU 直通：worker 自有设备（硬件→WARP 兜底）+ 外部设备注入解码——
-                // **无 SHR 门控**：解码池恒 DECODER-only（Intel Arc 拒绝 DECODER|SHR 组合；
-                // 拷贝源只需 USAGE_DEFAULT，BIND_DECODER 同样可作拷贝源）。渲染设备只采样
-                // 共享 NV12 槽（平面 SRV PlaneSlice），从不直接采解码纹理。任一环节失败
-                //（建设备/open_hw）→ 回落 SAFE BGRA 硬解（与旧 auto 行为一致）。
-                if dual_path_allowed()
-                    && let Some(worker) = create_worker_d3d11_device() {
-                        // 预检：仅当 worker 设备真正具备 D3D11VA 解码能力才注入 FFmpeg open_hw——
-                        // 无能力适配器上直接注入会在 d3d11.dll 内 AV（见
-                        // `crate::hw::worker_d3d11va_supported` 注释；本机 Basic Display 实证）。
-                        if crate::hw::worker_d3d11va_supported(&worker.device) {
-                            let raw_dev = worker.device.as_raw() as usize;
-                            let raw_ctx = worker.context.as_raw() as usize;
-                            if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
-                                #[cfg(test)]
-                                {
-                                    DUAL_ENGAGED.store(true, Ordering::Relaxed);
-                                    HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
+                // 双设备 GPU 直通（仅 Windows，Phase 1 Linux 解锁）：worker 自有设备（硬件→
+                // WARP 兜底）+ 外部设备注入解码——**无 SHR 门控**：解码池恒 DECODER-only
+                //（Intel Arc 拒绝 DECODER|SHR 组合；拷贝源只需 USAGE_DEFAULT，BIND_DECODER
+                // 同样可作拷贝源）。渲染设备只采样共享 NV12 槽（平面 SRV PlaneSlice），从不
+                // 直接采解码纹理。任一环节失败（建设备/open_hw）→ 回落 SAFE BGRA 硬解（与
+                // 旧 auto 行为一致）。Linux 无 D3D11（hw 模块为软解回退桩）→ 本分支不编译，
+                // Auto 直接走下方 SAFE `open_scaled_hw` 由 FFmpeg 自有设备处理/软回退。
+                #[cfg(windows)]
+                {
+                    if dual_path_allowed()
+                        && let Some(worker) = create_worker_d3d11_device() {
+                            // 预检：仅当 worker 设备真正具备 D3D11VA 解码能力才注入 FFmpeg
+                            // open_hw——无能力适配器上直接注入会在 d3d11.dll 内 AV（见
+                            // `crate::hw::worker_d3d11va_supported` 注释；本机 Basic Display 实证）。
+                            if crate::hw::worker_d3d11va_supported(&worker.device) {
+                                let raw_dev = worker.device.as_raw() as usize;
+                                let raw_ctx = worker.context.as_raw() as usize;
+                                if let Ok(r) = VideoReader::open_hw(path, raw_dev, raw_ctx) {
+                                    #[cfg(test)]
+                                    {
+                                        DUAL_ENGAGED.store(true, Ordering::Relaxed);
+                                        HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
+                                    }
+                                    return Ok((
+                                        ReaderMode::Auto(*cap),
+                                        r,
+                                        Some(SharedCopier::new(worker)),
+                                    ));
                                 }
-                                return Ok((
-                                    ReaderMode::Auto(*cap),
-                                    r,
-                                    Some(SharedCopier::new(worker)),
-                                ));
                             }
                         }
-                    }
+                }
                 let r = VideoReader::open_scaled_hw(path, *cap)?;
                 #[cfg(test)]
                 HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);

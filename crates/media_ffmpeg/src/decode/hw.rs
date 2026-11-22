@@ -12,6 +12,9 @@ use std::sync::Mutex;
 use anyhow::{Result, anyhow};
 
 use ffmpeg_next as ffmpeg;
+// 仅外部 D3D11 设备注入子项使用（Interface trait 的 cast 方法）；该子项 cfg(windows) 门控，
+// Linux 不编译（Phase 1 Linux 解锁）。
+#[cfg(windows)]
 use windows::core::Interface as _;
 
 // ---------------- 硬件解码（D3D11VA / DXVA2）----------------
@@ -152,6 +155,9 @@ pub(crate) fn is_hw_frame(frame: &ffmpeg::frame::Video) -> bool {
 }
 
 // ---------------- 外部 D3D11 设备注入（零回读 GPU 直通）----------------
+// 本段整块仅 Windows（target 门控依赖 + 各 item cfg(windows)）：引用 windows crate 的
+// COM 类型与 ffmpeg-sys 的 D3D11VA 结构体（AVD3D11VADeviceContext/AVD3D11VAFramesContext，
+// Windows FFmpeg 绑定专属）。Linux 上该注入函数不编译（Phase 1 Linux 解锁）。
 
 /// D3D11VA 设备上下文的进程级互斥桥（可重入）：[`ffmpeg::ffi::AVD3D11VADeviceContext`] 的
 /// `lock`/`unlock` 回调经此互斥量串行化对 `device_context`/`video_context` 的访问。
@@ -160,8 +166,10 @@ pub(crate) fn is_hw_frame(frame: &ffmpeg::frame::Video) -> bool {
 /// 加锁，而 `std::sync::Mutex` 本身**不可**重入，直接用会自我死锁。故用「线程局部深度计数」
 /// 包裹：深度 0→1 时才真正获取互斥量（同线程嵌套只递增深度），不同线程仍互斥
 ///（进程内全部解码操作已被 [`FFMPEG_LOCK`] 串行化，实际单线程触碰设备，此处仅兜底）。
+#[cfg(windows)]
 static D3D11_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(windows)]
 std::thread_local! {
     /// 当前线程进入 D3D11 设备锁的嵌套深度（0 = 未持锁）。
     static D3D11_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -171,6 +179,7 @@ std::thread_local! {
 }
 
 /// D3D11 设备锁回调（extern "C" 内禁止 panic —— unwind 跨 ABI 会 abort，一律取回中毒锁兜底）。
+#[cfg(windows)]
 unsafe extern "C" fn d3d11_lock_cb(_lock_ctx: *mut std::ffi::c_void) {
     D3D11_LOCK_DEPTH.with(|depth| {
         if depth.get() == 0 {
@@ -182,6 +191,7 @@ unsafe extern "C" fn d3d11_lock_cb(_lock_ctx: *mut std::ffi::c_void) {
 }
 
 /// D3D11 设备解锁回调（与 [`d3d11_lock_cb`] 镜像：深度 1→0 时释放互斥量守卫）。
+#[cfg(windows)]
 unsafe extern "C" fn d3d11_unlock_cb(_lock_ctx: *mut std::ffi::c_void) {
     D3D11_LOCK_DEPTH.with(|depth| {
         let d = depth.get();
@@ -199,10 +209,12 @@ unsafe extern "C" fn d3d11_unlock_cb(_lock_ctx: *mut std::ffi::c_void) {
 /// `Release`；[`Self::disarm`] 放弃 Drop 的 Release —— 成功注入 FFmpeg 后接口引用改由
 /// FFmpeg 的 uninit 回调统一 Release（`AVD3D11VADeviceContext` 释放语义：dealloc 时 release
 /// 用户分配的 device/device_context）。
+#[cfg(windows)]
 struct AddRefGuard {
     unk: Option<windows::core::IUnknown>,
 }
 
+#[cfg(windows)]
 impl AddRefGuard {
     /// 对 `raw` 调用一次 AddRef；`raw` 为空 → `None`（无引用需管理）。
     fn new(raw: *mut std::ffi::c_void) -> Option<Self> {
@@ -224,6 +236,7 @@ impl AddRefGuard {
     }
 }
 
+#[cfg(windows)]
 impl Drop for AddRefGuard {
     fn drop(&mut self) {
         if let Some(unk) = self.unk.take() {
@@ -249,6 +262,7 @@ impl Drop for AddRefGuard {
 ///
 /// 返回 `AvBuf` 已持有对设备上下文 `AVBufferRef` 的引用（含 uninit 时的接口释放），
 /// 调用方（[`VideoReader::open_external_hw`]）再 `av_buffer_ref` 一份挂给解码器。
+#[cfg(windows)]
 pub(crate) fn build_external_d3d11_device_ctx(
     device: *mut std::ffi::c_void,
     device_context: *mut std::ffi::c_void,
@@ -328,6 +342,7 @@ pub(crate) fn build_external_d3d11_device_ctx(
 /// 预检只走 D3D11 标准 COM 调用（`ID3D11VideoDevice` 的 profile/format 查询，不碰 FFmpeg、
 /// 不碰解码器、不建帧池），失败即视为无能力；真实 GPU 上预检通过、注入解码行为不变，
 /// 不通过 → 调用方回落到 SAFE BGRA 硬解/软解（本机实证存活）。
+#[cfg(windows)]
 pub(crate) fn device_supports_d3d11va(device_raw: *mut std::ffi::c_void) -> bool {
     use windows::core::Interface as _;
     use windows::Win32::Graphics::Direct3D11::ID3D11VideoDevice;
@@ -372,6 +387,7 @@ pub(crate) fn device_supports_d3d11va(device_raw: *mut std::ffi::c_void) -> bool
 /// `hw_external_tests` 一致性检查与主程序能力自诊断（FFI
 /// [`vff_d3d11_supports_shader_bound_textures`]）使用，结果只反映驱动约束、不影响解码路径。
 /// 纯 device/frames 上下文、**不开解码器** → 失败无副作用。
+#[cfg(windows)]
 pub(crate) fn d3d11_supports_shader_bound_textures(
     device: *mut std::ffi::c_void,
     device_context: *mut std::ffi::c_void,
@@ -425,6 +441,7 @@ pub(crate) fn d3d11_supports_shader_bound_textures(
 /// D3D11 设备/上下文的双重 alloc/init/AddRef/Release 消除。帧池上下文经 `av_buffer_ref` 自持
 /// 另一份引用、用完即 `av_buffer_unref`，不改 `dev` 的引用余额；同线程、同设备类型，符合
 /// K22/K23（各线程独享 context、AVBufferRef 引用计数正确）。
+#[cfg(windows)]
 pub(crate) fn warm_external_d3d11_frames_pool_with(dev: &AvBuf) {
     use ffmpeg::ffi::{AVD3D11VAFramesContext, AVHWFramesContext};
     unsafe {

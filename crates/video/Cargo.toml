@@ -17,9 +17,13 @@ media_io = { path = "../media_io" }
 # video 图标变体（IconName::Play/Pause/Volume/…）由本 crate 的 ui 依赖开启其 `video` feature。
 ui = { path = "../ui", features = ["video"] }
 viewer = { path = "../viewer" }
-# 双设备 GPU 直通（零回读）：worker 自有 D3D11 设备 + 共享 NV12 纹理（shared handle +
-# keyed mutex）跨设备移动。features 取与 media_ffmpeg 同款最小集（Direct3D11 生成的类型内部
-# 引用 Direct3D/Dxgi，三者必须同开才能编译）。
+
+# Windows 专用：双设备 GPU 直通（零回读）D3D11/Dxgi 绑定（src/hw.rs + workers 直通分支）。
+# target 门控（Phase 1 Linux 编译解锁）：非 Windows 目标不编译 windows/windows-future，
+# 改由 src/hw_linux.rs 软解回退桩（create_worker_d3d11_device → None，auto 回落 SAFE/软解）。
+# features 取与 media_ffmpeg 同款最小集（Direct3D11 生成的类型内部引用 Direct3D/Dxgi，
+# 三者必须同开才能编译）。
+[target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

@@ -36,10 +36,16 @@ ffmpeg-next = { version = "9.0", default-features = false, features = [
     "software-resampling",
     "software-scaling",
 ] }
-# 外部 D3D11 设备注入（零回读 GPU 直通）：open_external_hw 用 windows::core::IUnknown 的
-# AddRef/Release 持有调用方设备引用；测试用 D3D11CreateDevice 建设备。features 仅取所需
-# 最小集（版本随 workspace 0.62）：Direct3D11 生成的类型内部引用 Direct3D（D3D_DRIVER_TYPE/
-# D3D_FEATURE_LEVEL）与 Dxgi（DXGI_FORMAT/IDXGIAdapter），三者必须同开才能编译。
+
+# Windows 专用：外部 D3D11 设备注入（零回读 GPU 直通）：open_external_hw 用
+# windows::core::IUnknown 的 AddRef/Release 持有调用方设备引用；测试用 D3D11CreateDevice
+# 建设备。features 仅取所需最小集（版本随 workspace 0.62）：Direct3D11 生成的类型内部
+# 引用 Direct3D（D3D_DRIVER_TYPE/D3D_FEATURE_LEVEL）与 Dxgi（DXGI_FORMAT/IDXGIAdapter），
+# 三者必须同开才能编译。
+# target 门控（Phase 1 Linux 编译解锁）：非 Windows 目标不编译 windows/windows-future；
+# 代码内 windows 使用点（decode/hw.rs 外部设备注入子系统 + hw_external_tests）均已
+# cfg(windows) 门控，Linux 上该注入函数不编译。
+[target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

@@ -204,18 +204,47 @@ pub fn clear_clipboard() {
     {}
 }
 
-/// 构造 `explorer /select,<绝对路径>` 定位命令（**只构造不 spawn**；spawn 由 UI 动作
-/// 路径负责并在失败时提示/静默）。`explorer.exe` 单参数 `"/select,<path>"` 是 Windows
-/// 标准姿势（选中该文件/目录的资源管理器窗口）。
+/// 构造「在文件管理器中显示」定位命令（**只构造不 spawn**；spawn 由 UI 动作路径负责并在
+/// 失败时提示/静默）。平台定制（Windows 行为逐字节不变）：
+/// - Windows：`explorer /select,<绝对路径>`（选中该文件/目录的资源管理器窗口，单参数标准姿势）；
+/// - macOS：`open -R <绝对路径>`（Finder 中选中该文件/目录）；
+/// - Linux/其它 Unix：`xdg-open <所在目录>`（打开所在目录；系统缺 `xdg-open` 时 spawn
+///   失败由消费方状态栏提示，符合既有容错面——不在此处预检）；
+/// - 未知平台：退回 Windows 姿势（仅构造，失败于 spawn 阶段）。
 pub fn reveal_in_explorer_command(path: &std::path::Path) -> std::process::Command {
-    let mut cmd = std::process::Command::new("explorer");
-    cmd.arg(format!("/select,{}", path.to_string_lossy()));
-    cmd
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg(format!("/select,{}", path.to_string_lossy()));
+        cmd
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg("-R").arg(path);
+        cmd
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = path.parent().unwrap_or(path);
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(dir);
+        cmd
+    }
+    #[cfg(not(any(windows, target_os = "macos", unix)))]
+    {
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg(format!("/select,{}", path.to_string_lossy()));
+        cmd
+    }
 }
 
 /// DROPFILES 头（`pFiles = sizeof(DROPFILES) = 20`、`pt = 0`、`fNC = false`、
 /// `fWide = true` —— UTF-16LE 路径）后接 UTF-16 绝对路径（`\0` 分隔）+ 结尾双 `\0`，
 /// 正是 `SetClipboardData(CF_HDROP, …)` 的全局内存布局。纯函数，可单测字节级对拍。
+/// 仅 Windows 使用（DROPFILES/POINT/BOOL 布局取自 windows crate，target 门控依赖）——
+/// 非 Windows 目标不编译（`mod imp` 剪贴板实现同为 cfg(windows)，无其它调用方）。
+#[cfg(windows)]
 pub(crate) fn build_dropfiles_bytes(paths: &[&str]) -> Vec<u8> {
     let header_len = size_of::<windows::Win32::UI::Shell::DROPFILES>();
     let mut out: Vec<u8> = Vec::with_capacity(
@@ -1195,6 +1224,8 @@ mod tests {
     static CLIP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// DROPFILES 字节布局：pFiles=20 / pt=0 / fNC=0 / fWide=1 / UTF-16 路径 / 结尾双 `\0`。
+    /// Windows 专用（build_dropfiles_bytes 为 target 门控）：非 Windows 测试构建不编译。
+    #[cfg(windows)]
     #[test]
     fn dropfiles_bytes_layout_header_and_wide() {
         let b = crate::build_dropfiles_bytes(&[r"D:\a\b.txt"]);
@@ -1234,6 +1265,8 @@ mod tests {
     }
 
     /// 解析回读纯函数 roundtrip：多路径 UTF-16 → 原样还原。
+    /// Windows 专用（build_dropfiles_bytes 为 target 门控）：非 Windows 测试构建不编译。
+    #[cfg(windows)]
     #[test]
     fn dropfiles_bytes_parse_roundtrip() {
         let paths = [r"D:\a\b.txt", r"E:\文件夹\x 空格.md", r"C:\single"];

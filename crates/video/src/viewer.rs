@@ -71,7 +71,12 @@ use ui::theme::{GLASS_PANEL_ALPHA_DARK, GLASS_PANEL_ALPHA_LIGHT};
 
 use media_io::audio_sink::AudioSink;
 use super::decode::{AudioReader, VideoReader};
+// Windows：直通三件套（create_worker_d3d11_device 供 workers 直通分支）；Linux 该函数无
+// 调用方（直通分支 cfg(windows) 门控），只引类型保证生产签名可解析。
+#[cfg(windows)]
 use super::hw::{CopyError, SharedCopier, create_worker_d3d11_device};
+#[cfg(not(windows))]
+use super::hw::{CopyError, SharedCopier};
 use super::subtitle::{SubtitleEntry, SubtitleStyle, find_active_subtitle, parse_ass_text};
 // 拆分子模块后 `super` 变成本 viewer（不再是 crate 根）：给子模块内保留原 `super::decode::…`
 // 路径的调用兜底——重新导出 crate 根 `decode` 模块，正文无需改动。
@@ -302,7 +307,9 @@ fn dual_path_allowed() -> bool {
     DUAL_PATH_ENABLED.load(Ordering::Relaxed)
 }
 
-#[cfg(not(test))]
+// 非测试 + 非 Windows：dual_path_allowed 只被 workers.rs 直通分支（cfg(windows) 门控）调用，
+// Linux 生产构建无调用方 → 整定义门控到 Windows，防 dead_code 噪音（Phase 1 Linux 解锁）。
+#[cfg(all(not(test), windows))]
 fn dual_path_allowed() -> bool {
     true
 }

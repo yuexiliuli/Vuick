@@ -20,7 +20,9 @@
 
 mod decode;
 
-#[cfg(test)]
+// 外部 D3D11 设备注入测试（直接经 windows crate 建 D3D11 设备）：仅 Windows（依赖 target
+// 门控 + hw 子系统 cfg(windows)），Linux 测试构建不编译（Phase 1 Linux 解锁）。
+#[cfg(all(test, windows))]
 mod hw_external_tests;
 
 use decode::{AudioReader, SubtitleReader, VideoReader};
@@ -204,6 +206,8 @@ pub unsafe extern "C" fn vff_video_set_skip_nonkey(h: Handle, nonkey: c_int) {
 /// **NOT 直通门控**：双设备直通恒用 DECODER-only 解码池（渲染端只采样共享 NV12 槽），本
 /// 探测仅供能力自诊断与一致性测试，返回 0 不会、也不应停用直通。纯 device/frames 上下文
 /// 探测、**不开解码器**，无副作用；`device` 为空 → 0。与内部同名函数同源（同一函数）。
+/// 仅 Windows（依赖 target 门控的 decode::d3d11_supports_shader_bound_textures），Linux 不导出。
+#[cfg(windows)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_d3d11_supports_shader_bound_textures(
     device: *mut c_void,
@@ -335,6 +339,8 @@ pub unsafe extern "C" fn vff_close_video(h: Handle) {
 /// 返回 0；-1 = 打开失败 / 设备指针为空 / 解码器不支持。
 ///
 /// 取帧走 [`vff_video_frame_hw`]（返回 `ID3D11Texture2D*`，不回读、不 sws）。
+/// 仅 Windows（依赖 target 门控的 open_external_hw），Linux 不导出（软解/SAFE 路径不受影响）。
+#[cfg(windows)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_open_video_hw(
     path: *const c_char,

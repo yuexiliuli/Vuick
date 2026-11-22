@@ -404,6 +404,8 @@ impl VideoReader {
     /// 双设备架构，帧经 shared handle + keyed mutex 移动，不做共享上下文）。解码器按源全
     /// 尺寸硬解、**不做** sws——帧尺寸即源尺寸（[`HwFrame`] 自带宽高）。`cap` 参数无意义
     /// （仅接口对齐软解 `open_scaled`）；返回 reader 的 `source_cap()` 恒 1（HW 帧不走回读缓冲）。
+    /// Linux 无外部 D3D11 设备注入（`hw_linux` 桩），本条仅 Windows 双设备路径使用。
+    #[cfg(windows)]
     pub fn open_hw(path: &Path, device: usize, device_context: usize) -> Result<Self> {
         let b = bridge().context("视频运行库不可用（缺 media_ffmpeg.dll 或 FFmpeg 运行库）")?;
         let cpath = utf8_cstr(path)?;

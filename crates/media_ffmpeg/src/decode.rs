@@ -31,15 +31,19 @@ mod tests;
 
 // 供视频正文（VideoReader）引用的硬解内部名：裸名直达，正文复用拆分前原样。
 use self::hw::{
-    HardwareDecode, HwFramePin, build_external_d3d11_device_ctx, is_hw_frame, try_open_hw_decoder,
-    warm_external_d3d11_frames_pool_with,
+    HardwareDecode, HwFramePin, is_hw_frame, try_open_hw_decoder,
 };
+// 外部 D3D11 设备注入子项：仅 Windows（target 门控依赖 + 函数 cfg(windows)），Linux 不编译。
+#[cfg(windows)]
+use self::hw::{build_external_d3d11_device_ctx, warm_external_d3d11_frames_pool_with};
 
 // 再导出：让 `decode::{AudioReader, SubtitleReader, VideoReader, HwFrame, FFMPEG_LOCK,
 // d3d11_supports_shader_bound_textures, SubtitleFormat}` 等 lib.rs / crate 内原路径继续可解析
 //（拆分不改任何公共 API / FFI 导出）。
 pub(crate) use audio::AudioReader;
-pub(crate) use hw::{d3d11_supports_shader_bound_textures, HwFrame};
+pub(crate) use hw::HwFrame;
+#[cfg(windows)]
+pub(crate) use hw::d3d11_supports_shader_bound_textures;
 pub(crate) use subtitle::{SubtitleFormat, SubtitleReader};
 // 仅测试消费的再导出（tests.rs 经 `use super::*` 取用；非测试构建无引用，故 cfg(test) 门控）。
 #[cfg(test)]
@@ -158,11 +162,20 @@ fn ffmpeg_log_line_is_benign(line: &str) -> bool {
 /// [`ffmpeg_log_line_is_benign`] 过滤，命中即丢弃（HE-AAC 坏帧 / 硬解回退噪音）；
 /// 未命中则透传给默认回调（格式化/前缀/重复收敛/落盘行为与默认一致）。
 /// 回调内禁止 panic（extern "C" unwind 会 abort）：一律 `unwrap_or` 兜底。
+// C `va_list` 类型随平台不同（bindgen 生成）：MSVC 下 `va_list == *mut c_char`，Linux
+// glibc x86_64 下为 `[__va_list_tag; 1]` 数组、且 av_log_* 形参把数组退化为
+// `*mut __va_list_tag`。`core::ffi::va_list` 在 stable 上仍未稳定（c_variadic 未 GA）、
+// `libc` 亦不导出 `va_list`——按平台用 cfg 对齐 bindgen 的实际形参类型。
+#[cfg(windows)]
+type FfmpegVaList = *mut std::ffi::c_char;
+#[cfg(not(windows))]
+type FfmpegVaList = *mut ffmpeg::ffi::__va_list_tag;
+
 unsafe extern "C" fn ffmpeg_log_filter_cb(
     ptr: *mut std::ffi::c_void,
     level: i32,
     fmt: *const std::ffi::c_char,
-    vl: *mut std::ffi::c_char,
+    vl: FfmpegVaList,
 ) {
     let mut buf = [0i8; 512];
     let mut prefix: i32 = 1;
@@ -173,7 +186,7 @@ unsafe extern "C" fn ffmpeg_log_filter_cb(
             ptr,
             level,
             fmt,
-            vl, // bindgen 把 va_list 摊成 `*mut c_char`
+            vl, // bindgen 的 av_log_format_line 第 4 参: va_list（与回调形参同型）
             buf.as_mut_ptr(),
             buf.len() as i32,
             &mut prefix,
@@ -463,6 +476,8 @@ impl VideoReader {
     ///
     /// **不缩放**：`max_dim` 仅作参数兼容保留——HW 帧不经 sws，输出即源尺寸（`HwFrame`
     /// 自带实际宽高，不受本参数影响）。
+    // 外部 D3D11 设备注入仅 Windows（target 门控依赖 + hw 子系统 cfg(windows)），Linux 不编译。
+    #[cfg(windows)]
     pub fn open_external_hw(
         path: &Path,
         max_dim: u32,

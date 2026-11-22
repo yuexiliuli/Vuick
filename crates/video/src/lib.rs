@@ -16,6 +16,14 @@
 //! - [`viewer`]：`VideoViewer` 视图（后台解码线程 + 帧钟播放 + 控制 + 同文件夹切换）
 
 mod decode;
+// 双设备 GPU 直通（D3D11/Dxgi）仅 Windows：Windows 走真实现 src/hw.rs（#![cfg(windows)]），
+// 非 Windows 走 src/hw_linux.rs 软解回退桩（create_worker_d3d11_device → None，生产 worker
+// auto 模式回落 SAFE BGRA 硬解/软解，见 worker open_reader_for_mode 的 fallback）。模块级
+// 门控保证 Linux 构建图不编译 windows/windows-future（Phase 1 Linux 编译解锁）。
+#[cfg(windows)]
+mod hw;
+#[cfg(not(windows))]
+#[path = "hw_linux.rs"]
 mod hw;
 mod subtitle;
 mod viewer;
