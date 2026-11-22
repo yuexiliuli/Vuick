@@ -12,7 +12,7 @@
 跳过视频功能可 `cargo build --workspace --no-default-features --exclude media_ffmpeg`（不编译
 `src/video/`，也不构建 `media_ffmpeg` cdylib——否则默认 workspace 构建仍需要 FFmpeg 环境）。
 
-PDF 预览依赖 pdfium 动态库：前往 https://github.com/bblanchon/pdfium-binaries/releases 下载，解压得到 `pdfium.dll`，重命名并放于 `resources/pdfium/pdfium-154.0.8035.0.dll`（构建时若探测到会**内嵌进 exe**，分发免带）。
+PDF 预览依赖 pdfium 动态库（**不再内嵌进 exe**）：运行时按磁盘候选路径加载，分发布局优先 exe 的 `bin\pdf\pdfium-154.0.8035.0.dll`，开发树可放 `resources/pdfium/pdfium-154.0.8035.0.dll`（候选顺序与加载逻辑见 `crates/pdf_core/src/parser/pdfium.rs`）。打包时 `scripts/package.ps1` 会自动拷入 `dist\bin\pdf\`（缺则先拷 `resources\pdfium\` 同名 dll，仍缺则从 https://github.com/bblanchon/pdfium-binaries/releases 自动下载）。
 
 ```bash
 # 运行（开发）
@@ -21,7 +21,8 @@ cargo run
 # 发布（Release profile 已配 opt-level=z / LTO / strip / panic=abort）
 cargo build --release
 
-# 分发打包（release exe + media_ffmpeg.dll + FFmpeg 运行库 → dist\vuick-win64\）
+# 分发打包（release exe + media_ffmpeg.dll + FFmpeg 运行库 + pdfium → dist\）
+# 自动供给默认开：FFMPEG_DIR 缺/不完整会自建 FFmpeg 瘦包、pdfium 缺会自动下载，可 -Skip* 关闭
 pwsh scripts/package.ps1
 
 # 全量测试
@@ -50,38 +51,53 @@ PDF / EPUB / 图片 / 大文档测试的 fixture **已提交至仓库**（`fixtu
 主 exe **不静态导入**任何 FFmpeg dll，只在打开视频时经 libloading **运行时**加载它。
 所以：
 - **exe 缺 `media_ffmpeg.dll` / FFmpeg 运行库也能正常启动**——不开视频照常使用全部其它功能，开视频时在窗口内提示「缺少视频运行库」；
-- 要让视频功能可用，分发时必须把 `media_ffmpeg.dll` 与全部 FFmpeg dll 和 exe **放到同一目录**（清单见下方「视频组件所需 DLL」）。一键打包：
+- 要让视频功能可用，分发时必须把 `media_ffmpeg.dll` 与全部 FFmpeg dll 放进 exe 的 `bin\ffmpeg\` 子目录（运行时候选 = exe 旁 → `bin\ffmpeg\`，见 `crates/media_io/src/bridge.rs`）。一键打包：
 
 ```bash
-# 构建 release 并导出「exe + media_ffmpeg.dll + 全部 FFmpeg 运行库」到 dist\vuick-win64\
-# 脚本自动校验：exe 无 FFmpeg 静态导入、media_ffmpeg.dll 所需的 FFmpeg dll 全部在包内
+# 构建 release 并导出「exe + bin\ffmpeg\（media_ffmpeg.dll + FFmpeg 运行库）+ bin\pdf\（pdfium）」到 dist\
+# 自动供给默认开：FFMPEG_DIR 缺/不完整时用 scripts/build-slim-ffmpeg.sh 自建 B1 瘦包（需 MSYS2 UCRT64 bash）；
+#   bin\pdf\ 缺 pdfium 时先拷 resources\pdfium\、仍缺则从 bblanchon/pdfium-binaries 下载。可
+#   -SkipFfmpegProvision / -SkipPdfiumProvision 关闭，-PdfiumUrl / -FfmpegPrefix 覆盖供给参数。
 pwsh scripts/package.ps1
 ```
 
-## 视频组件所需 DLL（与 exe 同目录）
+## 分发布局与 DLL 清单
+
+`scripts/package.ps1` 产出到 `dist\`：
+
+```
+dist\
+├─ vuick.exe                          （dist 根）
+├─ bin\ffmpeg\                        （media_ffmpeg.dll + FFmpeg 运行库）
+│   ├─ media_ffmpeg.dll
+│   ├─ avcodec-63.dll / avformat-63.dll / avutil-61.dll / swresample-7.dll / swscale-10.dll
+├─ bin\pdf\pdfium-154.0.8035.0.dll    （pdfium，不再内嵌 exe，走磁盘分发）
+├─ THIRD_PARTY_NOTICES.md + third_party\
+   （不含任何 *.lib：导入库仅 build 期用，脚本装配后断言防混入）
+```
 
 | 文件 | 来源 | 说明 |
 | --- | --- | --- |
-| `media_ffmpeg.dll` | 本仓库 `target\release\`（cdylib） | 视频解码内核：主 exe 打开视频时经 libloading **运行时**加载它 |
-| `avcodec-63.dll` | `FFMPEG_DIR\bin` | 音视频编解码 |
-| `avformat-63.dll` | `FFMPEG_DIR\bin` | 容器格式（MP4 / MKV / AVI / MOV…）解封装 |
-| `avutil-61.dll` | `FFMPEG_DIR\bin` | 通用工具库（内存 / 数学 / 字典…） |
-| `swscale-10.dll` | `FFMPEG_DIR\bin` | 图像缩放与像素格式转换（→ BGRA 上屏） |
-| `swresample-7.dll` | `FFMPEG_DIR\bin` | 音频重采样（→ F32 立体声） |
-| `avdevice-63.dll` | `FFMPEG_DIR\bin` | 输入设备接入 |
-| `avfilter-12.dll` | `FFMPEG_DIR\bin` | 音视频滤镜（debug 构建需要；release 构建由 LTO 裁掉、缺了也能用） |
+| `vuick.exe` | 本仓库 `target\release\` | 主程序（release；debug 依赖调试 CRT 不入包） |
+| `bin\ffmpeg\media_ffmpeg.dll` | 本仓库 `target\release\`（cdylib） | 视频/音乐解码内核：主 exe 打开视频时经 libloading **运行时**加载它 |
+| `bin\ffmpeg\avcodec-63.dll` | `FFMPEG_DIR\bin` | 音视频编解码（按 media_ffmpeg.dll 实际导入表驱动，只带引用件） |
+| `bin\ffmpeg\avformat-63.dll` | `FFMPEG_DIR\bin` | 容器格式（MP4 / MKV / AVI / MOV…）解封装 |
+| `bin\ffmpeg\avutil-61.dll` | `FFMPEG_DIR\bin` | 通用工具库（内存 / 数学 / 字典…） |
+| `bin\ffmpeg\swscale-10.dll` | `FFMPEG_DIR\bin` | 图像缩放与像素格式转换（→ BGRA 上屏） |
+| `bin\ffmpeg\swresample-7.dll` | `FFMPEG_DIR\bin` | 音频重采样（→ F32 立体声） |
+| `bin\pdf\pdfium-154.0.8035.0.dll` | `resources\pdfium\` 或 bblanchon/pdfium-binaries | PDF 渲染（**不再内嵌 exe**，磁盘分发，运行时按 `bin\pdf\` → exe 旁 → `resources\pdfium\` 顺序候选） |
 
-缺其中任何 / 全部 → **exe 照常启动**，打开视频时窗口内提示「缺少视频运行库」。
-`scripts/package.ps1` 把 `FFMPEG_DIR\bin` 下全部 `*.dll` 一并拷入包内（以上 7 个 FFmpeg dll 全含），
-手工分发请以**与编译期同一 FFmpeg 构建**（版本号一致，防 ABI 错位）为准补全。
+缺其中任何 / 全部 → **exe 照常启动**，打开视频/PDF 时窗口内提示缺库。
+`scripts/package.ps1` 按 media_ffmpeg.dll 的**实际导入表**只拷它引用的 FFmpeg dll（B1 shared 默认 5 件；
+B2 静态链形态仅 `bin\ffmpeg\media_ffmpeg.dll` 一件），手工分发请以**与编译期同一 FFmpeg 构建**
+（版本号一致，防 ABI 错位）为准补全。
 
 - **必须用 release**：debug 版还依赖 `vcruntime140d.dll` / `ucrtbased.dll` 等调试 CRT，他人机器也没有；
-- 把 `dist\vuick-win64\` 整个目录（或打成 zip）发给对方，**exe 必须与这些 dll 同目录**；
+- 把 `dist\` 整个目录（或打成 zip）发给对方，**exe 必须与 `bin\ffmpeg\` / `bin\pdf\` 子目录一起分发**；
 - 其余依赖（`VCRUNTIME140.dll`、`api-ms-win-crt-*`、`d3dcompiler_47.dll`、`icuuc.dll`）均为
   Windows 10/11 系统自带，无需打包；对方是精简版 / 旧版系统缺 `VCRUNTIME140.dll` 时，安装
   「Microsoft Visual C++ 2015–2022 Redistributable (x64)」即可；
-- DLL 须与编译期是**同一个** FFmpeg 构建（脚本直接从 `FFMPEG_DIR\bin` 取，版本号一致，不会 ABI 错位）；
-- **PDF 无需额外分发**：pdfium dll 构建时经 zstd-19 压缩（6.9MiB→~2.9MiB）后内嵌进 exe（`embed_pdfium`），运行时一次性解压到临时目录再自动加载。
+- DLL 须与编译期是**同一个** FFmpeg 构建（脚本直接从 `FFMPEG_DIR\bin` 取，版本号一致，不会 ABI 错位）。
 
 ## 许可证与分发合规
 
