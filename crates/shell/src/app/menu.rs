@@ -450,6 +450,38 @@ impl EditorApp {
         .item(Self::reuse_media_window_menu_item(weak))
     }
 
+    /// ☑/☐ 复选标记字形（U+2611 / U+2610）。真实 Windows 字库对两码点**独立逐字符回退**，
+    /// 若 glyph 与文本合成单 run，两码点会落不同 family → em-box/ascent 不同 → 尺寸/基线
+    /// 不一致；故必须独立元素 + 统一 Segoe UI Symbol 字族（Win7+ 恒在，同时覆盖两码点，
+    /// 同 metrics）。
+    const TOGGLE_ON_MARK: &str = "☑";
+    const TOGGLE_OFF_MARK: &str = "☐";
+
+    /// ☑/☐ 前缀独立元素 + 统一 Segoe UI Symbol 字族：真实 Windows 字库逐字符回退
+    /// 会让两码点落不同 family 导致尺寸/基线不一致，统一字族后同 metrics。
+    /// 注：Segoe UI Symbol 是 Windows 符号字体（Win7+ 恒在）；非 Windows 平台无此族时
+    /// 仍走系统回退（不劣化）。
+    fn toggle_mark(on: bool) -> impl IntoElement {
+        div()
+            .font_family("Segoe UI Symbol")
+            .child(if on {
+                Self::TOGGLE_ON_MARK
+            } else {
+                Self::TOGGLE_OFF_MARK
+            })
+    }
+
+    /// ☑/☐ 切换项行装配：glyph 独立元素（统一 Segoe UI Symbol 字族）+ 文本元素双
+    /// child flex 布局，方块与文字间距对齐现有项。
+    fn toggle_item(on: bool, text: impl Into<SharedString>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(Self::toggle_mark(on))
+            .child(text.into())
+    }
+
     /// 「媒体在新窗口打开」菜单项：动态显示当前开关状态（前导 ☑/☐），点击切换并立即
     /// 持久化（同 [`Self::wrap_menu_item`] 的 ☑/☐ 动态项模式）。
     fn media_new_window_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
@@ -462,14 +494,13 @@ impl EditorApp {
             let chrome = ui::theme::ChromeColors::for_mode(
                 ui::theme::Theme::global(cx).is_dark(),
             );
-            let label = format!("{} {}", if on { "☑" } else { "☐" }, "媒体在新窗口打开");
             div()
                 .w_full()
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .child(label)
+                .child(Self::toggle_item(on, "媒体在新窗口打开"))
                 .child(div().text_color(chrome.text_tertiary).child(""))
         })
         .on_click(move |_, window, cx| {
@@ -494,7 +525,6 @@ impl EditorApp {
             let chrome = ui::theme::ChromeColors::for_mode(
                 ui::theme::Theme::global(cx).is_dark(),
             );
-            let label = format!("{} {}", if on { "☑" } else { "☐" }, "复用已有媒体窗口");
             div()
                 .w_full()
                 .flex()
@@ -510,7 +540,7 @@ impl EditorApp {
                         } else {
                             chrome.text_tertiary
                         })
-                        .child(label),
+                        .child(Self::toggle_item(on, "复用已有媒体窗口")),
                 )
         })
         .on_click(move |_, window, cx| {
@@ -584,18 +614,13 @@ impl EditorApp {
             let chrome = ui::theme::ChromeColors::for_mode(
                 ui::theme::Theme::global(cx).is_dark(),
             );
-            let label = SharedString::from(format!(
-                "{} {}",
-                if on { "☑" } else { "☐" },
-                TOGGLE_WRAP.menu_label,
-            ));
             div()
                 .w_full()
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .child(label)
+                .child(Self::toggle_item(on, TOGGLE_WRAP.menu_label))
                 .child(div().text_color(chrome.text_tertiary).child(TOGGLE_WRAP.shortcut))
         })
         .on_click(move |_, window, cx| {
@@ -618,7 +643,7 @@ impl EditorApp {
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .child(if on { "☑ 恢复上次会话" } else { "☐ 恢复上次会话" })
+                .child(Self::toggle_item(on, "恢复上次会话"))
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_session_restore(window, cx));
@@ -626,7 +651,7 @@ impl EditorApp {
     }
 
     /// 「关闭到系统托盘」菜单标签（动态 ☑/☐ 复选标记，同 `session_restore_menu_item`
-    /// 模式；纯函数供菜单渲染与 R4 回归断言共用）。
+    /// 模式；菜单渲染已改用 `toggle_item`，本函数保留专供 R4 集成断言锁定 ☑/☐ 字面值）。
     #[doc(hidden)]
     pub fn close_to_tray_label(on: bool) -> &'static str {
         if on {
@@ -651,7 +676,7 @@ impl EditorApp {
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .child(Self::close_to_tray_label(on))
+                .child(Self::toggle_item(on, "关闭时最小化到系统托盘"))
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_close_to_tray(window, cx));
@@ -659,7 +684,7 @@ impl EditorApp {
     }
 
     /// 「记住阅读进度」菜单标签（动态 ☑/☐ 复选标记，同 `session_restore_menu_item`
-    /// 模式；纯函数供菜单渲染与 R5 回归断言共用）。
+    /// 模式；菜单渲染已改用 `toggle_item`，本函数保留专供 R5 集成断言锁定 ☑/☐ 字面值）。
     #[doc(hidden)]
     pub fn remember_reading_progress_label(on: bool) -> &'static str {
         if on {
@@ -684,7 +709,7 @@ impl EditorApp {
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .child(Self::remember_reading_progress_label(on))
+                .child(Self::toggle_item(on, "记住阅读进度"))
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_remember_reading_progress(window, cx));
