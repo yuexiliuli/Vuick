@@ -853,6 +853,8 @@ impl CodeEditor {
         let fg_muted: Hsla = colors.fg_muted.into();
         let fg_disabled: Hsla = colors.fg_disabled.into();
         let hover_fill: Hsla = colors.selected_bg.into();
+        // 悬浮阴影底色 = 主题 card_shadow（默认不透明黑，与旧散值 hsla(0,0,0,α) 逐通道同值）。
+        let shadow_base: Hsla = colors.card_shadow.into();
 
         // 卡片：右上角内缘，右缘让出滚动条命中区（沿用既有「right=scrollbar_width+边距」
         // 做法，顶边距 ~8px）。高度自适应内容；宽度紧凑自适（输入框 ≥160px）。
@@ -875,7 +877,7 @@ impl CodeEditor {
             .rounded_lg()
             // 悬浮阴影（弱单层，同 ui::tooltip 卡片）。
             .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.18))
+                gpui::BoxShadow::new(px(0.), px(2.), shadow_base.opacity(0.18))
                     .blur_radius(px(8.)),
             ])
             // 点击卡片任意处不穿透到编辑区（移动光标）；Enter/Esc 已由输入框统一收敛
@@ -1022,6 +1024,8 @@ impl CodeEditor {
         let border: Hsla = colors.border.into();
         let fg_muted: Hsla = colors.fg_muted.into();
         let error: Hsla = colors.error.into();
+        // 悬浮阴影底色 = 主题 card_shadow（默认不透明黑，与旧散值 hsla(0,0,0,α) 逐通道同值）。
+        let shadow_base: Hsla = colors.card_shadow.into();
         // 内联提示文案（owned：`.when` 闭包内 child 需 'static）。
         let hint = self.goto.hint.clone();
         let is_err = self.goto.hint_error;
@@ -1043,7 +1047,7 @@ impl CodeEditor {
             .rounded_lg()
             // 悬浮阴影（弱单层，同 find 卡片）。
             .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.18))
+                gpui::BoxShadow::new(px(0.), px(2.), shadow_base.opacity(0.18))
                     .blur_radius(px(8.)),
             ])
             // 点击卡片任意处不穿透到编辑区（不落光标）；点击卡片外（Capture 阶段按

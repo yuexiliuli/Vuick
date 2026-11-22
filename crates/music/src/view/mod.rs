@@ -478,6 +478,7 @@ impl MusicView {
             .bg(theme::glass())
             .border_1()
             .border_color(theme::border())
+            // B 类保留：音乐皮肤面装饰投影（黑中性，亮暗无分档；③ 已 skin-aware，不随全局 card_shadow）。
             .shadow(vec![
                 gpui::BoxShadow::new(px(0.), px(2.), gpui::black().opacity(0.4))
                     .blur_radius(px(8.)),

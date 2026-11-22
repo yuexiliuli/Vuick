@@ -115,6 +115,8 @@ impl Notification {
         let surface: Hsla = colors.surface.into();
         let fg: Hsla = colors.fg.into();
         let border: Hsla = colors.border.into();
+        // 浮层投影底色 = 主题 card_shadow（默认不透明黑，与旧散值 hsla(0,0,0,α) 逐通道同值）。
+        let shadow_base: Hsla = colors.card_shadow.into();
 
         div()
             .id(self.key.clone())
@@ -129,9 +131,9 @@ impl Notification {
             .border_1()
             .border_color(border)
             .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
+                gpui::BoxShadow::new(px(0.), px(8.), shadow_base.opacity(0.20))
                     .blur_radius(px(14.)),
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
+                gpui::BoxShadow::new(px(0.), px(2.), shadow_base.opacity(0.14))
                     .blur_radius(px(4.)),
             ])
             .bg(surface.opacity(if is_dark {

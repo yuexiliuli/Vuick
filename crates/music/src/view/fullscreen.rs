@@ -312,6 +312,7 @@ impl super::MusicView {
             .relative()
             .overflow_hidden()
             .mb(px(24.))
+            // B 类保留：封面装饰投影（黑中性 + accent 辉光；③ 已 skin-aware，黑投影不随全局 card_shadow）。
             .shadow(vec![
                 gpui::BoxShadow::new(px(0.), px(20.), gpui::hsla(0., 0., 0., 0.5))
                     .blur_radius(px(60.)),

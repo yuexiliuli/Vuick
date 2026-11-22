@@ -888,6 +888,8 @@ impl Render for PopupMenu {
         let (colors, is_dark) = (theme.colors, theme.is_dark());
         let surface: Hsla = colors.surface.into();
         let fg: Hsla = colors.fg.into();
+        // 浮层投影底色 = 主题 card_shadow（默认不透明黑，与旧散值 `hsla(0,0,0,α)` 逐通道同值）。
+        let shadow_base: Hsla = colors.card_shadow.into();
         let items_count = self.menu_items.len();
         let selected = self.selected_index;
 
@@ -944,9 +946,9 @@ impl Render for PopupMenu {
             .border_1()
             .border_color(colors.border)
             .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
+                gpui::BoxShadow::new(px(0.), px(8.), shadow_base.opacity(0.20))
                     .blur_radius(px(14.)),
-                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
+                gpui::BoxShadow::new(px(0.), px(2.), shadow_base.opacity(0.14))
                     .blur_radius(px(4.)),
             ])
             .rounded_lg()
@@ -999,9 +1001,9 @@ impl Render for PopupMenu {
                 .border_1()
                 .border_color(colors.border)
                 .shadow(vec![
-                    gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
+                    gpui::BoxShadow::new(px(0.), px(8.), shadow_base.opacity(0.20))
                         .blur_radius(px(14.)),
-                    gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
+                    gpui::BoxShadow::new(px(0.), px(2.), shadow_base.opacity(0.14))
                         .blur_radius(px(4.)),
                 ])
                 .rounded_lg()

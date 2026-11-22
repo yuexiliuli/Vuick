@@ -234,6 +234,8 @@ fn tooltip_card(id: &str, text: &str, tone: TooltipTone, cx: &App) -> gpui::Div 
     let bg: Hsla = colors.popover_bg.into();
     let border: Hsla = colors.border.into();
     let fg: Hsla = colors.fg_muted.into();
+    // 浮层投影底色 = 主题 card_shadow（默认不透明黑，与旧散值 hsla(0,0,0,α) 逐通道同值）。
+    let shadow_base: Hsla = colors.card_shadow.into();
     let card_sel = format!("tooltip-{id}");
     let card = div()
         .debug_selector(move || card_sel.clone())
@@ -243,7 +245,7 @@ fn tooltip_card(id: &str, text: &str, tone: TooltipTone, cx: &App) -> gpui::Div 
         .rounded_lg()
         // 弱阴影（比菜单双层更轻）：贴图标右侧悬停卡，单层柔和即可。
         .shadow(vec![
-            gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
+            gpui::BoxShadow::new(px(0.), px(2.), shadow_base.opacity(0.14))
                 .blur_radius(px(6.)),
         ]);
     let card = match tone {

@@ -138,6 +138,8 @@ impl super::VideoViewer {
         let muted: Hsla = colors.fg_muted.into();
         let border: Hsla = colors.border.into();
         let accent: Hsla = colors.accent.into();
+        // 浮层投影底色 = 主题 card_shadow（默认不透明黑，与旧散值 hsla(0,0,0,α) 逐通道同值）。
+        let shadow_base: Hsla = colors.card_shadow.into();
         let entity = cx.entity();
 
         let seek_strip = Self::strip_element(
@@ -193,11 +195,11 @@ impl super::VideoViewer {
             .bg(panel)
             .border_1()
             .border_color(border)
-            // 控制条上抛投影 = 黑 hsla 双散值（0.18@16 + 0.14@4），面板专属，theme 无阴影 token
+            // 控制条上抛投影 = 黑 card_shadow 双散值（0.18@16 + 0.14@4），与菜单/卡共底色源。
             .shadow(vec![
-                gpui::BoxShadow::new(px(0.), px(-6.), gpui::hsla(0., 0., 0., 0.18))
+                gpui::BoxShadow::new(px(0.), px(-6.), shadow_base.opacity(0.18))
                     .blur_radius(px(16.)),
-                gpui::BoxShadow::new(px(0.), px(-2.), gpui::hsla(0., 0., 0., 0.14))
+                gpui::BoxShadow::new(px(0.), px(-2.), shadow_base.opacity(0.14))
                     .spread_radius(px(-1.))
                     .blur_radius(px(4.)),
             ])
