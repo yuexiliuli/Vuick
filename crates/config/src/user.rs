@@ -10,6 +10,7 @@
 //! - 写入用「临时文件 + rename」原子替换，避免中途断电/杀进程留下半截配置；
 //! - `cfg!(test)` 下读写为空操作，避免 `cargo test` 污染真实用户配置。
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock as StdLazyLock, Mutex as StdMutex};
@@ -110,7 +111,7 @@ impl PdfBgPref {
 /// 用户偏好（所有字段可缺省，`load` 时逐字段回退）。
 /// 注意：不再派生 `Copy`——`opened_folder` 为 `Option<String>` 非 Copy 类型；
 /// 全仓已核对无代码依赖 `UserPrefs` 的复制语义（只有 `load`/构造/按字段读取）。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct UserPrefs {
     /// 主题三态。
     pub theme: ThemePref,
@@ -164,6 +165,46 @@ pub struct UserPrefs {
     pub pdf_bg: PdfBgPref,
     /// PDF 自定义画布底色（`#rrggbb`；仅 `pdf_bg == Custom` 时消费；非法值应用层回退默认）。
     pub pdf_bg_custom: Option<String>,
+    /// 全站主题预设 id（如 `default` / `music` / `ocean` / `solar` / `rose` / `graphite`）。
+    /// 未知 id 由 UI 层 `PresetSkin` resolve 时兜底回落默认——本 config 层只存 id 字符串、
+    /// 不校验合法性（也不 panic）。
+    pub theme_preset: String,
+    /// 自定义主题色覆盖：token key → `#rrggbb`（如 `"colors.accent"` / `"chrome.window_bg"`）。
+    /// 仅存格式合法的项：非法 hex 值 / 空 key / 超长 key 解析时丢弃（安全护栏，防手改配置）。
+    pub theme_custom: BTreeMap<String, String>,
+    /// 音乐窗口皮肤预设 id（默认 `"music"`；未知 id 同样由 UI 层兜底）。
+    pub music_skin: String,
+}
+
+impl Default for UserPrefs {
+    fn default() -> Self {
+        Self {
+            theme: ThemePref::Follow,
+            font_size: None,
+            sidebar_width: None,
+            session_restore: None,
+            close_to_tray: None,
+            restore_reading_progress: None,
+            media_new_window: None,
+            reuse_media_window: None,
+            music_window_size: None,
+            video_window_size: None,
+            main_window_size: None,
+            opened_folder: None,
+            recent_folders: Vec::new(),
+            recent_files: Vec::new(),
+            music_dir: None,
+            music_liked: Vec::new(),
+            music_volume: None,
+            music_last_track: None,
+            music_progress_secs: None,
+            pdf_bg: PdfBgPref::default(),
+            pdf_bg_custom: None,
+            theme_preset: "default".to_string(),
+            theme_custom: BTreeMap::new(),
+            music_skin: "music".to_string(),
+        }
+    }
 }
 
 /// A3 进程级偏好缓存：键 = 配置路径 + 文件元数据（mtime+len）。`load` 首访读盘并缓存；
@@ -371,6 +412,18 @@ impl UserPrefs {
             prefs.pdf_bg = PdfBgPref::from_str(s);
         }
         prefs.pdf_bg_custom = Self::read_hex_color(map, "pdf_bg_custom");
+        // 全站主题系统：`theme_preset` / `music_skin` 只存 id 字符串（未知 id 由 UI 层 resolve
+        // 兜底，config 层不校验合法性）；非字符串 / 空串 / 缺失 → 回落对应默认，绝不 panic。
+        if let Some(Value::String(s)) = map.get("theme_preset")
+            && !s.is_empty() {
+                prefs.theme_preset = s.clone();
+            }
+        if let Some(Value::String(s)) = map.get("music_skin")
+            && !s.is_empty() {
+                prefs.music_skin = s.clone();
+            }
+        // `theme_custom`：token key → `#rrggbb` 覆盖表；逐项校验（见 [`Self::read_theme_custom`]）。
+        prefs.theme_custom = Self::read_theme_custom(map);
         // 媒体窗口记录尺寸（音乐/视频分开）：数组 `[w, h]`；缺省 / 非数组 / 非两个数 /
         // NaN / 负 / 零 / ∞ 一律回退 None（安全护栏）。
         prefs.music_window_size = Self::read_size_tuple(map, "music_window_size");
@@ -438,6 +491,37 @@ impl UserPrefs {
         s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
     }
 
+    /// 自定义主题色覆盖表的 key 长度上限（token key 如 `colors.accent` 远小于此；超长 key =
+    /// 配置被手改/损坏 → 丢弃，防无界）。
+    const THEME_TOKEN_KEY_MAX_LEN: usize = 128;
+
+    /// 从 JSON 对象里读「自定义主题色覆盖」表（`token key → #rrggbb`，见
+    /// [`UserPrefs::from_json_value`]）：非对象 → 空；value 非字符串 / 格式非法（非 `#`+6 个
+    /// 十六进制位）→ 丢弃该项；key trim 后为空 / 超长 → 丢弃该项。绝不 panic（安全护栏）。
+    /// 特例：字面值 `"default"`（trim 后比较）为「还原默认」标记，专用于覆盖层单 token 还原，
+    /// 属合法保留项（对齐 ui 侧 `merge_spectrum` 语义：`"default"` = 还原该 token 到预设值），
+    /// 不按 hex 校验丢弃。
+    fn read_theme_custom(map: &Map<String, Value>) -> BTreeMap<String, String> {
+        let Some(Value::Object(obj)) = map.get("theme_custom") else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for (raw_key, val) in obj {
+            let Some(s) = val.as_str() else {
+                continue;
+            };
+            let key = raw_key.trim();
+            if key.is_empty() || key.len() > Self::THEME_TOKEN_KEY_MAX_LEN {
+                continue;
+            }
+            let s = s.trim();
+            if Self::is_valid_hex_color(s) || s == "default" {
+                out.insert(key.to_string(), s.to_string());
+            }
+        }
+        out
+    }
+
     /// 序列化成 JSON 对象（纯函数，供 `save`、「导出设置」与测试使用）。
     pub fn to_json_value(&self) -> Value {
         json!({
@@ -462,6 +546,9 @@ impl UserPrefs {
             "music_progress_secs": self.music_progress_secs,
             "pdf_bg": self.pdf_bg.as_str(),
             "pdf_bg_custom": self.pdf_bg_custom,
+            "theme_preset": self.theme_preset,
+            "theme_custom": self.theme_custom,
+            "music_skin": self.music_skin,
         })
     }
 
@@ -573,6 +660,9 @@ mod tests {
             music_progress_secs: None,
             pdf_bg: PdfBgPref::default(),
             pdf_bg_custom: None,
+            theme_preset: "default".to_string(),
+            theme_custom: BTreeMap::new(),
+            music_skin: "music".to_string(),
         };
         let back = UserPrefs::from_json_value(&p.to_json_value());
         assert_eq!(back.session_restore, Some(false));
@@ -1158,5 +1248,186 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dst.join("a").join("x.txt")).unwrap(), "x");
         assert_eq!(std::fs::read_to_string(dst.join("root.txt")).unwrap(), "r");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 全站主题系统三字段 roundtrip：theme_preset / music_skin（id 字符串，未知 id 不校验、原样
+    /// 保留；缺省回落默认）+ theme_custom（token key → `#rrggbb` 覆盖表，合法 hex 大小写均可
+    /// 保留；非法 hex 丢弃该项）。走纯函数，不触碰真实配置路径。
+    #[test]
+    fn theme_system_json_roundtrip() {
+        // 缺省：theme_preset = "default"、music_skin = "music"、theme_custom = {}。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["theme_preset"], serde_json::json!("default"));
+        assert_eq!(v["music_skin"], serde_json::json!("music"));
+        assert_eq!(v["theme_custom"], serde_json::json!({}));
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.theme_preset, "default");
+        assert_eq!(back.music_skin, "music");
+        assert!(back.theme_custom.is_empty());
+
+        // 含值 roundtrip：preset/skin 原样保留（config 层不校验 id 合法性）；custom 合法 hex 保留。
+        let mut custom = BTreeMap::new();
+        custom.insert("colors.accent".to_string(), "#1a2B3c".to_string());
+        custom.insert("chrome.window_bg".to_string(), "#0F0F0F".to_string());
+        let p = UserPrefs {
+            theme_preset: "solar".to_string(),
+            theme_custom: custom,
+            music_skin: "ocean".to_string(),
+            ..UserPrefs::default()
+        };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(back.theme_preset, "solar", "未知预设 id 也应原样保留（UI 层兜底）");
+        assert_eq!(back.music_skin, "ocean");
+        assert_eq!(
+            back.theme_custom.get("colors.accent").map(String::as_str),
+            Some("#1a2B3c"),
+            "合法 hex 值应原样保留（大小写均可）"
+        );
+        assert_eq!(
+            back.theme_custom.get("chrome.window_bg").map(String::as_str),
+            Some("#0F0F0F")
+        );
+        assert_eq!(back.theme, ThemePref::Follow, "其余字段不受影响");
+
+        // 未知但非空 id（config 层不校验合法性）→ 往返不丢。
+        let p2 = UserPrefs { theme_preset: "unknown-id".to_string(), ..UserPrefs::default() };
+        assert_eq!(
+            UserPrefs::from_json_value(&p2.to_json_value()).theme_preset,
+            "unknown-id"
+        );
+
+        // 非法 hex 值 → 该项被丢弃（"#abc" / "#12345" / "red" 均非法），合法项不受影响。
+        let mut dirty = BTreeMap::new();
+        dirty.insert("colors.accent".to_string(), "#abc".to_string());
+        dirty.insert("colors.background".to_string(), "#12345".to_string());
+        dirty.insert("chrome.window_bg".to_string(), "red".to_string());
+        dirty.insert("text.primary".to_string(), "#ABCDEF".to_string());
+        let back3 = UserPrefs::from_json_value(&UserPrefs {
+            theme_custom: dirty,
+            ..UserPrefs::default()
+        }.to_json_value());
+        assert!(!back3.theme_custom.contains_key("colors.accent"), "三/五位 hex 应丢弃");
+        assert!(!back3.theme_custom.contains_key("colors.background"));
+        assert!(!back3.theme_custom.contains_key("chrome.window_bg"), "命名色应丢弃");
+        assert_eq!(
+            back3.theme_custom.get("text.primary").map(String::as_str),
+            Some("#ABCDEF"),
+            "合法项不受非法项影响"
+        );
+        assert_eq!(back3.theme_custom.len(), 1, "非法项全被丢弃、只剩合法项");
+    }
+
+    /// 全站主题三字段「缺字段 / 非法类型 / 损坏 JSON」回退：字段缺失读回默认；类型错 / 损坏
+    /// JSON → 不 panic、回落默认（防手改配置注入；对齐 UserPrefs 既有「损坏回退」护栏）。
+    #[test]
+    fn theme_system_fallback_default_on_missing_or_invalid() {
+        // 缺字段：JSON 中根本没有 theme_custom / theme_preset / music_skin → 读回默认。
+        let v = serde_json::json!({ "theme": "dark" });
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.theme_preset, "default", "缺字段应回落默认");
+        assert_eq!(back.music_skin, "music");
+        assert!(back.theme_custom.is_empty());
+
+        // 类型错：theme_preset / music_skin 非字符串 → 默认；theme_custom 非对象 → 空。
+        let v = serde_json::json!({
+            "theme_preset": 42,
+            "music_skin": false,
+            "theme_custom": "oops",
+        });
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.theme_preset, "default");
+        assert_eq!(back.music_skin, "music");
+        assert!(back.theme_custom.is_empty(), "theme_custom 非对象应回退空");
+
+        // theme_custom 内 value 非字符串 → 丢弃该 key。
+        let v = serde_json::json!({
+            "theme_custom": {
+                "colors.accent": 123,
+                "chrome.window_bg": "#000000",
+            }
+        });
+        let back = UserPrefs::from_json_value(&v);
+        assert!(!back.theme_custom.contains_key("colors.accent"), "非字符串值应丢弃");
+        assert_eq!(
+            back.theme_custom.get("chrome.window_bg").map(String::as_str),
+            Some("#000000")
+        );
+
+        // 空串 id → 回落默认。
+        let v = serde_json::json!({ "theme_preset": "", "music_skin": "" });
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.theme_preset, "default", "空串预设 id 应回退默认");
+        assert_eq!(back.music_skin, "music", "空串音乐皮肤应回退默认");
+
+        // 损坏 JSON 文本（截断）：serde_json 解析失败 → 落到 Null → 全部默认、绝不 panic
+        // （与 load_from_disk「解析失败回退默认」同路径）。
+        let bad_text = r##"{"theme_preset":"solar","theme_custom":{"colors.accent":"#123456""##;
+        let v = serde_json::from_str::<Value>(bad_text).unwrap_or(Value::Null);
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.theme_preset, "default", "损坏 JSON 应回落默认");
+        assert_eq!(back.music_skin, "music");
+        assert!(back.theme_custom.is_empty());
+        assert_eq!(back.theme, ThemePref::Follow, "其余字段同默认");
+
+        // 非对象根（数组 / null / 标量）→ 全默认、不 panic。
+        for bad in [Value::Null, serde_json::json!([1, 2, 3]), serde_json::json!("dark")] {
+            let back = UserPrefs::from_json_value(&bad);
+            assert_eq!(back.theme_preset, "default", "非对象根应回落默认：{bad}");
+            assert_eq!(back.music_skin, "music");
+            assert!(back.theme_custom.is_empty());
+        }
+    }
+
+    /// theme_custom 非法 key（空串 / 纯空白 / 超长）→ 丢弃该项；合法 key 保留（key 前后空白
+    /// 会被 trim 归一化后存储）。
+    #[test]
+    fn theme_custom_drops_invalid_keys() {
+        let too_long = "x".repeat(UserPrefs::THEME_TOKEN_KEY_MAX_LEN + 1);
+        let mut obj = Map::new();
+        obj.insert("".to_string(), json!("#ffffff"));
+        obj.insert("  ".to_string(), json!("#010203"));
+        obj.insert(too_long.clone(), json!("#000000"));
+        obj.insert(" colors.accent ".to_string(), json!("#abcdef"));
+        let v = json!({ "theme_custom": obj });
+        let back = UserPrefs::from_json_value(&v);
+        assert!(!back.theme_custom.contains_key(""), "空 key 应丢弃");
+        assert!(!back.theme_custom.contains_key("  "), "纯空白 key（trim 后空）应丢弃");
+        assert!(!back.theme_custom.contains_key(&too_long), "超长 key 应丢弃");
+        assert_eq!(
+            back.theme_custom.get("colors.accent").map(String::as_str),
+            Some("#abcdef"),
+            "key trim 归一化后保留"
+        );
+        assert_eq!(back.theme_custom.len(), 1, "只剩一条合法项");
+    }
+
+    /// theme_custom value 为字面 `"default"`（还原默认标记，专用于覆盖层单 token 还原）→ 往返
+    /// 保留不被丢；与合法 hex 并存互不影响。
+    #[test]
+    fn theme_custom_keeps_default_restore_marker() {
+        let v = serde_json::json!({
+            "theme_custom": {
+                "colors.accent": "default",
+                "chrome.window_bg": "#0F0F0F",
+            }
+        });
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(
+            back.theme_custom.get("colors.accent").map(String::as_str),
+            Some("default"),
+            "\"default\" 还原标记应往返保留（不被 hex 校验丢弃）"
+        );
+        assert_eq!(
+            back.theme_custom.get("chrome.window_bg").map(String::as_str),
+            Some("#0F0F0F"),
+            "合法 hex 项不受影响"
+        );
+
+        // 再走一遍「写入 → 序列化 → 读回」的完整 roundtrip，证与 to_json_value 组网。
+        let back2 = UserPrefs::from_json_value(&back.to_json_value());
+        assert_eq!(
+            back2.theme_custom.get("colors.accent").map(String::as_str),
+            Some("default")
+        );
     }
 }

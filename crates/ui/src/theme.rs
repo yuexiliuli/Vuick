@@ -11,6 +11,7 @@
 //! `editor/view` 的 typography、`editor/markdown.rs`、`syntax` 深耦合点全部收编，
 //! 见 `docs/ui-migration.md`）。残留的 gpui-component 消费还剩编辑器 Input 本体（#12）。
 
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use gpui::{App, Global, Hsla, Rgba, SharedString, hsla, rgb, rgba};
@@ -77,7 +78,7 @@ fn default_mono_font_family() -> SharedString {
 /// `editor/markdown.rs` 的硬编码 `rgb()` 收编于此，见 `docs/ui-migration.md`）。
 /// P1-7 起又收编状态语义色：`fg_disabled`（禁用）、`focus_ring`（聚焦描边）、
 /// `selected_bg`/`pressed_bg`（选中/按压基底）、`drag_hover_border`（拖拽强调线）。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ColorScheme {
     /// 主背景（画布/正文底色）
     pub bg: Rgba,
@@ -168,6 +169,41 @@ pub struct ColorScheme {
     /// 与 `editor_selection_bg`（代码编辑器选区补偿色）语义区分：本 token 管**文档预览/纸面**
     /// 上的文本选区。
     pub doc_selection_bg: Rgba,
+    // ── 表面对坡 / 强调派生 / 状态色（全站语义色主题系统 · ui 模型层，2026-11-22）──
+    // default 预设的缺省值即「零覆盖 = 现状逐字节不变」的基座：本批新增字段只增加能力，
+    // 不改既有字段任何观感；预设/定制经 `Theme::apply` 合并注入（见 `merge_spectrum`）。
+    /// 表面坡最深层（窗口底 / 最深面板；暗档中性灰 #121314）
+    pub srf_deep: Rgba,
+    /// 表面坡主层（主体表面背景；暗档 #181a22）
+    pub srf_primary: Rgba,
+    /// 表面坡次层（略抬升的表面；暗档 #1d1f26）
+    pub srf_secondary: Rgba,
+    /// 表面坡卡片层（卡片/弹层抬升面；暗档 #22242e）
+    pub srf_card: Rgba,
+    /// 表面坡悬停层（悬浮于卡片之上的表面；暗档 #282a34）
+    pub srf_hover: Rgba,
+    /// 表面分隔线（浮于表面坡上的分隔；暗档 白×6% ≈ rgba(255,255,255,0.06)）
+    pub srf_border: Rgba,
+    /// 强调色提亮一档（派生自 `accent` 同色相提亮度——default 档 hardcode 近似值，
+    /// 预设表须显式列派生色，见 `PRESETS`）
+    pub accent_light: Rgba,
+    /// 覆盖层用的纯白（遮罩底/模糊底，亮暗同值）
+    pub overlay_white: Rgba,
+    /// 成功态语义色（Fluent 绿系：亮档深一档 #107c10 系 / 暗档亮一档，对齐 `error` 模式）
+    pub success: Rgba,
+    /// 警告态语义色（Fluent 橙系）
+    pub warning: Rgba,
+    /// 信息态语义色（Fluent 蓝系）
+    pub info: Rgba,
+    /// 收藏/喜爱态语义色（Fluent 粉系）
+    pub favorite: Rgba,
+}
+
+impl ColorScheme {
+    /// 按明暗模式取对应一套（便捷入口，等价 [`ColorScheme::light`]/[`ColorScheme::dark`]）。
+    pub fn for_mode(dark: bool) -> Self {
+        if dark { Self::dark() } else { Self::light() }
+    }
 }
 
 impl ColorScheme {
@@ -223,6 +259,23 @@ impl ColorScheme {
             // VSCode Light+ 括号引导线 3 色循环池（#0431FA / #319331 / #7B3814）。
             bracket_guide_palette: [rgb(0x0431fa), rgb(0x319331), rgb(0x7b3814)],
             doc_selection_bg: rgba(0x4d6bfe42),
+            // 表面对坡（亮档浅灰坡，中性灰、非紫——紫色由预设注入）。
+            srf_deep: rgb(0xf4f5f7),
+            srf_primary: rgb(0xeceef1),
+            srf_secondary: rgb(0xe5e8ed),
+            srf_card: rgb(0xdfe3e9),
+            srf_hover: rgb(0xd9dde4),
+            // 表面分隔线 = 黑×6%（≈ rgba(0,0,0,0.06)）。
+            srf_border: rgba(0x0000000f),
+            // 强调提亮一档（派生自 accent #005FB8，brightness 抬升近似；预设表显式列派生色）。
+            accent_light: rgb(0x2a7fd6),
+            // 覆盖层纯白（亮暗同值）。
+            overlay_white: rgb(0xffffff),
+            // Fluent 状态语义色：亮档深一档（对齐 error 亮档 #C42B1C 模式）。
+            success: rgb(0x107c10),
+            warning: rgb(0x9d5d00),
+            info: rgb(0x0f6cbd),
+            favorite: rgb(0xd63384),
         }
     }
 
@@ -280,6 +333,23 @@ impl ColorScheme {
             // VSCode Dark+ 括号引导线 3 色循环池（#FFD700 / #DA70D6 / #179FFF）。
             bracket_guide_palette: [rgb(0xffd700), rgb(0xda70d6), rgb(0x179fff)],
             doc_selection_bg: rgba(0x4d6bfe61),
+            // 表面对坡（暗档中性灰坡，非紫——紫色由预设注入）。
+            srf_deep: rgb(0x121314),
+            srf_primary: rgb(0x181a22),
+            srf_secondary: rgb(0x1d1f26),
+            srf_card: rgb(0x22242e),
+            srf_hover: rgb(0x282a34),
+            // 表面分隔线 = 白×6%（≈ rgba(255,255,255,0.06)）。
+            srf_border: rgba(0xffffff0f),
+            // 强调提亮一档（派生自 accent #60CDFF，brightness 抬升近似；预设表显式列派生色）。
+            accent_light: rgb(0xa0e2ff),
+            // 覆盖层纯白（亮暗同值）。
+            overlay_white: rgb(0xffffff),
+            // Fluent 状态语义色：暗档亮一档（对齐 error 暗档 #F16A6A 模式）。
+            success: rgb(0x6ccb5f),
+            warning: rgb(0xffb900),
+            info: rgb(0x4cc2ff),
+            favorite: rgb(0xf57eb6),
         }
     }
 }
@@ -295,7 +365,7 @@ impl ColorScheme {
 /// `text_minor`/`chip_text`/`tab_active_bg`/`tab_active_border`/`pill_fg`/`dirty`）
 /// 直接引用 `ColorScheme` 对应字段，物理同值、不会漂移（见
 /// `chrome_and_color_scheme_share_ramp` 测试）。其余字段是外壳专属层，自定中性灰阶。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ChromeColors {
     /// 编辑区以外的画布背景（＝窗口底色）
     pub window_bg: Rgba,
@@ -515,13 +585,687 @@ impl ChromeColors {
     pub fn for_mode(dark: bool) -> Self {
         if dark { Self::dark() } else { Self::light() }
     }
+
+    /// 从（可能已合并的）`ColorScheme` 重建外壳缺省：chrome 域内**同名字段**（`panel_bg`/
+    /// `bar_border`/`text_primary`/`text_minor`/`chip_text`/`tab_active_bg`/
+    /// `tab_active_border`/`pill_fg`/`dirty`）与 `drag_ghost_bg←accent` 直接引用 scheme
+    /// 对应字段（保持「同名字段物理同值、永不漂移」不变式，见
+    /// `chrome_and_color_scheme_share_ramp`）；其余外壳专属字段（`window_bg`/材质渐变、
+    /// `editor_bg`/`chrome_bg`/悬停按压等）按明暗档取 [`ChromeColors::light`]/[`ChromeColors::dark`]
+    /// 既有常量。纯函数，供 [`Theme::apply`] 在合并 `colors` 之后重建 chrome（杜绝派生
+    /// 漂移），也可供测试；对默认 scheme 与 `for_mode` **逐字段字节相等**（零回归锚）。
+    pub fn from_scheme(scheme: &ColorScheme, mode: ThemeMode) -> Self {
+        let chrome = if matches!(mode, ThemeMode::Dark) { Self::dark() } else { Self::light() };
+        Self {
+            window_bg: chrome.window_bg,
+            material_top: chrome.material_top,
+            material_bottom: chrome.material_bottom,
+            bar_bg: chrome.bar_bg,
+            bar_border: scheme.border,
+            hairline: chrome.hairline,
+            panel_bg: scheme.bg,
+            editor_bg: chrome.editor_bg,
+            chrome_bg: chrome.chrome_bg,
+            text_primary: scheme.fg,
+            text_minor: scheme.fg_muted,
+            text_tertiary: chrome.text_tertiary,
+            chip_bg: chrome.chip_bg,
+            chip_text: scheme.fg,
+            tab_active_bg: scheme.bg,
+            tab_active_border: scheme.border,
+            pill_bg: chrome.pill_bg,
+            pill_fg: scheme.fg,
+            dirty: scheme.error,
+            hover_fill: chrome.hover_fill,
+            pressed_fill: chrome.pressed_fill,
+            close_hover: chrome.close_hover,
+            close_pressed: chrome.close_pressed,
+            drag_ghost_bg: scheme.accent,
+            menu_highlight: chrome.menu_highlight,
+            scrollbar_thumb: chrome.scrollbar_thumb,
+            tab_reorder_line: chrome.tab_reorder_line,
+        }
+    }
 }
 
-/// 全局主题：当前模式 + 对应语义色板 + 排版参数。
+/// 主题令牌：`ColorScheme` + `ChromeColors` 全字段的文本寻址（`"colors.xxx"` /
+/// `"chrome.xxx"`）。
+///
+/// - [`ColorToken::key`]：字段 → 键（如 `"colors.accent"` / `"chrome.window_bg"`）。
+/// - [`ColorToken::from_key`]：键 → 令牌；未知键返回 `None`（调用方兜底，不 panic）。
+/// - [`ColorToken::parse_hex`]：仅接受 `#rrggbb` 6 位十六进制（此处先自立实现、复用
+///   config 校验语义，config slice 再联动）。
+///
+/// 覆盖「全部字段」含数组板（`mermaid_accent_palette`/`bracket_guide_palette`），但数组板
+/// 不可被单个 hex 覆盖，合并时跳过（[`apply_color_token`]/[`apply_chrome_token`] no-op）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorToken {
+    // ── ColorScheme（colors.*）──
+    /// 主背景（画布/正文底色）
+    Bg,
+    /// 面板/状态栏等次级表面
+    Surface,
+    /// 主文字
+    Fg,
+    /// 次要文字
+    FgMuted,
+    /// 分隔线/边框
+    Border,
+    /// 强调色
+    Accent,
+    /// 链接
+    Link,
+    /// 错误/危险色
+    Error,
+    /// 禁用态弱化文字
+    FgDisabled,
+    /// 聚焦控件描边
+    FocusRing,
+    /// 选中/悬停基底
+    SelectedBg,
+    /// 按压/激活基底
+    PressedBg,
+    /// 拖拽/悬停强调线
+    DragHoverBorder,
+    /// 卡片/弹层投影底色
+    CardShadow,
+    /// 代码块背景
+    CodeBlockBg,
+    /// 行内代码文字
+    CodeInlineFg,
+    /// 行内代码 pill 底
+    CodeInlineBg,
+    /// 编辑器滤镜行内代码底
+    EditorCodeBg,
+    /// 引述块背景
+    QuoteBg,
+    /// 表头底色
+    TableHeadBg,
+    /// Markdown 标题文字
+    Heading,
+    /// 悬浮小卡片/弹层背景
+    PopoverBg,
+    /// Mermaid 节点分类板（数组，不可覆盖）
+    MermaidAccentPalette,
+    /// Mermaid 边线/边框
+    MermaidBorder,
+    /// 编辑器选区底（半透明补偿色）
+    EditorSelectionBg,
+    /// 编辑器折叠行底
+    EditorFoldBg,
+    /// 编辑器光标行底
+    EditorActiveLineBg,
+    /// 编辑器查找非当前命中底
+    EditorFindMatchBg,
+    /// 编辑器查找当前命中底
+    EditorFindCurrentBg,
+    /// 缩进引导线非 active 竖线
+    GuideInactive,
+    /// 缩进引导线 active 竖线
+    GuideActive,
+    /// 括号引导线 3 色池（数组，不可覆盖）
+    BracketGuidePalette,
+    /// 文档选区底（半透明补偿蓝）
+    DocSelectionBg,
+    // ── 表面对坡 / 强调派生 / 状态色（全站语义色主题系统新增）──
+    /// 表面坡最深层
+    SrfDeep,
+    /// 表面坡主层
+    SrfPrimary,
+    /// 表面坡次层
+    SrfSecondary,
+    /// 表面坡卡片层
+    SrfCard,
+    /// 表面坡悬停层
+    SrfHover,
+    /// 表面分隔线
+    SrfBorder,
+    /// 强调色提亮一档
+    AccentLight,
+    /// 覆盖层纯白
+    OverlayWhite,
+    /// 成功态语义色
+    Success,
+    /// 警告态语义色
+    Warning,
+    /// 信息态语义色
+    Info,
+    /// 收藏/喜爱态语义色
+    Favorite,
+    // ── ChromeColors（chrome.*）──
+    /// 窗口背景
+    WindowBg,
+    /// 自绘材质渐变顶端
+    MaterialTop,
+    /// 自绘材质渐变底端
+    MaterialBottom,
+    /// 工具条背景
+    BarBg,
+    /// 工具条分隔边框
+    BarBorder,
+    /// 区域分隔发丝线
+    Hairline,
+    /// 面板背景
+    PanelBg,
+    /// 内容区真实渲染底
+    EditorBg,
+    /// 外壳 chrome 区域底色
+    ChromeBg,
+    /// 主要文字
+    TextPrimary,
+    /// 次要文字
+    TextMinor,
+    /// 三级文字
+    TextTertiary,
+    /// 芯片背景
+    ChipBg,
+    /// 芯片文字
+    ChipText,
+    /// 激活选项卡背景
+    TabActiveBg,
+    /// 激活选项卡边框
+    TabActiveBorder,
+    /// pill 底色
+    PillBg,
+    /// pill 前景文字
+    PillFg,
+    /// 文件脏标记点
+    Dirty,
+    /// 通用悬停填充
+    HoverFill,
+    /// 通用按压填充
+    PressedFill,
+    /// 关闭按钮悬停填充
+    CloseHover,
+    /// 关闭按钮按压填充
+    ClosePressed,
+    /// 选项卡拖拽幽灵胶囊底
+    DragGhostBg,
+    /// 菜单项选中/悬停高亮
+    MenuHighlight,
+    /// 横向滚动条滑块
+    ScrollbarThumb,
+    /// 选项卡拖拽插入指示线
+    TabReorderLine,
+}
+
+/// 由 `$(variant => key)` 表一次性生成 `key()`/`from_key()`（单一事实源，防两表漂移）。
+macro_rules! color_token_keys {
+    ($($variant:ident => $key:literal),* $(,)?) => {
+        /// 令牌 → 文本键（如 `"colors.accent"`）。
+        pub fn key(self) -> &'static str {
+            match self {
+                $( Self::$variant => $key, )*
+            }
+        }
+        /// 文本键 → 令牌；未知返回 `None`。
+        pub fn from_key(key: &str) -> Option<Self> {
+            Some(match key {
+                $( $key => Self::$variant, )*
+                _ => return None,
+            })
+        }
+    };
+}
+
+impl ColorToken {
+    color_token_keys! {
+        Bg => "colors.bg",
+        Surface => "colors.surface",
+        Fg => "colors.fg",
+        FgMuted => "colors.fg_muted",
+        Border => "colors.border",
+        Accent => "colors.accent",
+        Link => "colors.link",
+        Error => "colors.error",
+        FgDisabled => "colors.fg_disabled",
+        FocusRing => "colors.focus_ring",
+        SelectedBg => "colors.selected_bg",
+        PressedBg => "colors.pressed_bg",
+        DragHoverBorder => "colors.drag_hover_border",
+        CardShadow => "colors.card_shadow",
+        CodeBlockBg => "colors.code_block_bg",
+        CodeInlineFg => "colors.code_inline_fg",
+        CodeInlineBg => "colors.code_inline_bg",
+        EditorCodeBg => "colors.editor_code_bg",
+        QuoteBg => "colors.quote_bg",
+        TableHeadBg => "colors.table_head_bg",
+        Heading => "colors.heading",
+        PopoverBg => "colors.popover_bg",
+        MermaidAccentPalette => "colors.mermaid_accent_palette",
+        MermaidBorder => "colors.mermaid_border",
+        EditorSelectionBg => "colors.editor_selection_bg",
+        EditorFoldBg => "colors.editor_fold_bg",
+        EditorActiveLineBg => "colors.editor_active_line_bg",
+        EditorFindMatchBg => "colors.editor_find_match_bg",
+        EditorFindCurrentBg => "colors.editor_find_current_bg",
+        GuideInactive => "colors.guide_inactive",
+        GuideActive => "colors.guide_active",
+        BracketGuidePalette => "colors.bracket_guide_palette",
+        DocSelectionBg => "colors.doc_selection_bg",
+        SrfDeep => "colors.srf_deep",
+        SrfPrimary => "colors.srf_primary",
+        SrfSecondary => "colors.srf_secondary",
+        SrfCard => "colors.srf_card",
+        SrfHover => "colors.srf_hover",
+        SrfBorder => "colors.srf_border",
+        AccentLight => "colors.accent_light",
+        OverlayWhite => "colors.overlay_white",
+        Success => "colors.success",
+        Warning => "colors.warning",
+        Info => "colors.info",
+        Favorite => "colors.favorite",
+        WindowBg => "chrome.window_bg",
+        MaterialTop => "chrome.material_top",
+        MaterialBottom => "chrome.material_bottom",
+        BarBg => "chrome.bar_bg",
+        BarBorder => "chrome.bar_border",
+        Hairline => "chrome.hairline",
+        PanelBg => "chrome.panel_bg",
+        EditorBg => "chrome.editor_bg",
+        ChromeBg => "chrome.chrome_bg",
+        TextPrimary => "chrome.text_primary",
+        TextMinor => "chrome.text_minor",
+        TextTertiary => "chrome.text_tertiary",
+        ChipBg => "chrome.chip_bg",
+        ChipText => "chrome.chip_text",
+        TabActiveBg => "chrome.tab_active_bg",
+        TabActiveBorder => "chrome.tab_active_border",
+        PillBg => "chrome.pill_bg",
+        PillFg => "chrome.pill_fg",
+        Dirty => "chrome.dirty",
+        HoverFill => "chrome.hover_fill",
+        PressedFill => "chrome.pressed_fill",
+        CloseHover => "chrome.close_hover",
+        ClosePressed => "chrome.close_pressed",
+        DragGhostBg => "chrome.drag_ghost_bg",
+        MenuHighlight => "chrome.menu_highlight",
+        ScrollbarThumb => "chrome.scrollbar_thumb",
+        TabReorderLine => "chrome.tab_reorder_line",
+    }
+
+    /// 仅解析 `#rrggbb` 6 位十六进制 → 不透明 [`Rgba`]；含 alpha 位 / 缺 `#` / 非法
+    /// 十六进制一律返回 `None`（调用方跳过该 key，不 panic）。
+    pub fn parse_hex(s: &str) -> Option<Rgba> {
+        let b = s.as_bytes();
+        if b.len() != 7 || b[0] != b'#' {
+            return None;
+        }
+        let mut val: u32 = 0;
+        for &c in &b[1..] {
+            val <<= 4;
+            val |= (c as char).to_digit(16)?;
+        }
+        Some(rgb(val))
+    }
+}
+
+/// UI 可暴露子集：config/设置面板允许用户覆写的**人格面 + 基础文字/表面**令牌（防把全
+/// 72 枚令牌面全暴露成 over-engineering；chrome.* / 代码 / Mermaid 等专业令牌不进用户面）。
+pub const UI_EXPOSABLE_TOKENS: &[ColorToken] = &[
+    ColorToken::Accent,
+    ColorToken::AccentLight,
+    ColorToken::SrfDeep,
+    ColorToken::SrfPrimary,
+    ColorToken::SrfSecondary,
+    ColorToken::SrfCard,
+    ColorToken::SrfHover,
+    ColorToken::SrfBorder,
+    ColorToken::Bg,
+    ColorToken::Surface,
+    ColorToken::Fg,
+    ColorToken::FgMuted,
+    ColorToken::FgDisabled,
+    ColorToken::Border,
+    ColorToken::Success,
+    ColorToken::Warning,
+    ColorToken::Info,
+    ColorToken::Favorite,
+    ColorToken::OverlayWhite,
+];
+
+/// 把十六进制解析值写入 `ColorScheme` 对应字段；本域外令牌（chrome.* / 数组板）为 no-op。
+fn apply_color_token(cs: &mut ColorScheme, token: ColorToken, v: Rgba) {
+    match token {
+        ColorToken::Bg => cs.bg = v,
+        ColorToken::Surface => cs.surface = v,
+        ColorToken::Fg => cs.fg = v,
+        ColorToken::FgMuted => cs.fg_muted = v,
+        ColorToken::Border => cs.border = v,
+        ColorToken::Accent => cs.accent = v,
+        ColorToken::Link => cs.link = v,
+        ColorToken::Error => cs.error = v,
+        ColorToken::FgDisabled => cs.fg_disabled = v,
+        ColorToken::FocusRing => cs.focus_ring = v,
+        ColorToken::SelectedBg => cs.selected_bg = v,
+        ColorToken::PressedBg => cs.pressed_bg = v,
+        ColorToken::DragHoverBorder => cs.drag_hover_border = v,
+        ColorToken::CardShadow => cs.card_shadow = v,
+        ColorToken::CodeBlockBg => cs.code_block_bg = v,
+        ColorToken::CodeInlineFg => cs.code_inline_fg = v,
+        ColorToken::CodeInlineBg => cs.code_inline_bg = v,
+        ColorToken::EditorCodeBg => cs.editor_code_bg = v,
+        ColorToken::QuoteBg => cs.quote_bg = v,
+        ColorToken::TableHeadBg => cs.table_head_bg = v,
+        ColorToken::Heading => cs.heading = v,
+        ColorToken::PopoverBg => cs.popover_bg = v,
+        ColorToken::MermaidAccentPalette => {}
+        ColorToken::MermaidBorder => cs.mermaid_border = v,
+        ColorToken::EditorSelectionBg => cs.editor_selection_bg = v,
+        ColorToken::EditorFoldBg => cs.editor_fold_bg = v,
+        ColorToken::EditorActiveLineBg => cs.editor_active_line_bg = v,
+        ColorToken::EditorFindMatchBg => cs.editor_find_match_bg = v,
+        ColorToken::EditorFindCurrentBg => cs.editor_find_current_bg = v,
+        ColorToken::GuideInactive => cs.guide_inactive = v,
+        ColorToken::GuideActive => cs.guide_active = v,
+        ColorToken::BracketGuidePalette => {}
+        ColorToken::DocSelectionBg => cs.doc_selection_bg = v,
+        ColorToken::SrfDeep => cs.srf_deep = v,
+        ColorToken::SrfPrimary => cs.srf_primary = v,
+        ColorToken::SrfSecondary => cs.srf_secondary = v,
+        ColorToken::SrfCard => cs.srf_card = v,
+        ColorToken::SrfHover => cs.srf_hover = v,
+        ColorToken::SrfBorder => cs.srf_border = v,
+        ColorToken::AccentLight => cs.accent_light = v,
+        ColorToken::OverlayWhite => cs.overlay_white = v,
+        ColorToken::Success => cs.success = v,
+        ColorToken::Warning => cs.warning = v,
+        ColorToken::Info => cs.info = v,
+        ColorToken::Favorite => cs.favorite = v,
+        _ => {} // chrome.* / 数组板以外的颜色令牌不存在；本域仅颜色令牌，其余不作用
+    }
+}
+
+/// 把十六进制解析值写入 `ChromeColors` 对应字段；本域外令牌（colors.* / 数组板）为 no-op。
+fn apply_chrome_token(cc: &mut ChromeColors, token: ColorToken, v: Rgba) {
+    match token {
+        ColorToken::WindowBg => cc.window_bg = v,
+        ColorToken::MaterialTop => cc.material_top = v,
+        ColorToken::MaterialBottom => cc.material_bottom = v,
+        ColorToken::BarBg => cc.bar_bg = v,
+        ColorToken::BarBorder => cc.bar_border = v,
+        ColorToken::Hairline => cc.hairline = v,
+        ColorToken::PanelBg => cc.panel_bg = v,
+        ColorToken::EditorBg => cc.editor_bg = v,
+        ColorToken::ChromeBg => cc.chrome_bg = v,
+        ColorToken::TextPrimary => cc.text_primary = v,
+        ColorToken::TextMinor => cc.text_minor = v,
+        ColorToken::TextTertiary => cc.text_tertiary = v,
+        ColorToken::ChipBg => cc.chip_bg = v,
+        ColorToken::ChipText => cc.chip_text = v,
+        ColorToken::TabActiveBg => cc.tab_active_bg = v,
+        ColorToken::TabActiveBorder => cc.tab_active_border = v,
+        ColorToken::PillBg => cc.pill_bg = v,
+        ColorToken::PillFg => cc.pill_fg = v,
+        ColorToken::Dirty => cc.dirty = v,
+        ColorToken::HoverFill => cc.hover_fill = v,
+        ColorToken::PressedFill => cc.pressed_fill = v,
+        ColorToken::CloseHover => cc.close_hover = v,
+        ColorToken::ClosePressed => cc.close_pressed = v,
+        ColorToken::DragGhostBg => cc.drag_ghost_bg = v,
+        ColorToken::MenuHighlight => cc.menu_highlight = v,
+        ColorToken::ScrollbarThumb => cc.scrollbar_thumb = v,
+        ColorToken::TabReorderLine => cc.tab_reorder_line = v,
+        _ => {} // colors.* / 数组板：本域不作用
+    }
+}
+
+/// 表驱动预设：每预设只列**人格令牌**（accent/accent_light/srf_*/状态色偏差，6-10 条）；
+/// base 恒为 [`ColorScheme::light`]/[`ColorScheme::dark`]（零列 = 该档零覆盖 = 现状逐字节
+/// 不变）。`light`/`dark` 两表互不污染，由 [`ThemeSpec::mode`] 择一合并。
+#[derive(Clone, Copy, Debug)]
+pub struct PresetSkin {
+    /// 稳定标识（config 传 id 用，如 `"music"`）。
+    pub id: &'static str,
+    /// 用户可见名（如 `"音乐紫"`）。
+    pub name: &'static str,
+    /// 亮档人格令牌覆盖表（`(ColorToken, "#rrggbb")`）
+    pub light: &'static [(ColorToken, &'static str)],
+    /// 暗档人格令牌覆盖表（`(ColorToken, "#rrggbb")`）
+    pub dark: &'static [(ColorToken, &'static str)],
+}
+
+/// 内置预设集合。首项必为 default（中性，空覆盖）——`Theme::set` 薄包装以它为兜底。
+pub static PRESETS: &[PresetSkin] = &[
+    PresetSkin {
+        id: "default",
+        name: "中性",
+        light: &[],
+        dark: &[],
+    },
+    PresetSkin {
+        id: "music",
+        name: "音乐紫",
+        // 暗档：紫调深坡 + 紫 accent（#7C5CFC / 提亮 #A78BFA）。
+        dark: &[
+            (ColorToken::Accent, "#7c5cfc"),
+            (ColorToken::AccentLight, "#a78bfa"),
+            (ColorToken::SrfDeep, "#0d0b1a"),
+            (ColorToken::SrfPrimary, "#13112a"),
+            (ColorToken::SrfSecondary, "#1a1738"),
+            (ColorToken::SrfCard, "#201d40"),
+            (ColorToken::SrfHover, "#282452"),
+            (ColorToken::SrfBorder, "#ffffff0f"),
+        ],
+        // 亮档：协调的紫调浅坡（浅紫灰在亮底上仍中性可读；accent 亮档深一档保对比）。
+        light: &[
+            (ColorToken::Accent, "#5b3fd1"),
+            (ColorToken::AccentLight, "#a78bfa"),
+            (ColorToken::SrfDeep, "#f7f5ff"),
+            (ColorToken::SrfPrimary, "#efecfc"),
+            (ColorToken::SrfSecondary, "#e7e2f8"),
+            (ColorToken::SrfCard, "#dfd9f4"),
+            (ColorToken::SrfHover, "#d7d0f0"),
+            (ColorToken::SrfBorder, "#0000000f"),
+        ],
+    },
+    PresetSkin {
+        id: "ocean",
+        name: "海青",
+        // 暗档：冷蓝灰坡 + 海青 teal accent（#2DD4BF）。
+        dark: &[
+            (ColorToken::Accent, "#2dd4bf"),
+            (ColorToken::AccentLight, "#5eead4"),
+            (ColorToken::SrfDeep, "#0b111c"),
+            (ColorToken::SrfPrimary, "#0e1826"),
+            (ColorToken::SrfSecondary, "#122033"),
+            (ColorToken::SrfCard, "#15263a"),
+            (ColorToken::SrfHover, "#1a2d44"),
+            (ColorToken::SrfBorder, "#ffffff0f"),
+        ],
+        // 亮档：协调的冷浅蓝灰坡；accent 亮档深一档（#0D9488）保白底对比。
+        light: &[
+            (ColorToken::Accent, "#0d9488"),
+            (ColorToken::AccentLight, "#14b8a6"),
+            (ColorToken::SrfDeep, "#f4faf9"),
+            (ColorToken::SrfPrimary, "#e9f5f3"),
+            (ColorToken::SrfSecondary, "#dfeff0"),
+            (ColorToken::SrfCard, "#d6e9eb"),
+            (ColorToken::SrfHover, "#cde3e6"),
+            (ColorToken::SrfBorder, "#0000000f"),
+        ],
+    },
+    PresetSkin {
+        id: "solar",
+        name: "琥珀",
+        // 暗档：暖灰坡 + 琥珀 accent（#F59E0B）。
+        dark: &[
+            (ColorToken::Accent, "#f59e0b"),
+            (ColorToken::AccentLight, "#fbbf24"),
+            (ColorToken::SrfDeep, "#1a1408"),
+            (ColorToken::SrfPrimary, "#221a0a"),
+            (ColorToken::SrfSecondary, "#2b2010"),
+            (ColorToken::SrfCard, "#332614"),
+            (ColorToken::SrfHover, "#3c2d18"),
+            (ColorToken::SrfBorder, "#ffffff0f"),
+        ],
+        // 亮档：协调的暖浅坡；accent 亮档深一档（#B45309）保白底对比。
+        light: &[
+            (ColorToken::Accent, "#b45309"),
+            (ColorToken::AccentLight, "#d97706"),
+            (ColorToken::SrfDeep, "#fdf8f0"),
+            (ColorToken::SrfPrimary, "#faf1e3"),
+            (ColorToken::SrfSecondary, "#f7ead7"),
+            (ColorToken::SrfCard, "#f4e3ca"),
+            (ColorToken::SrfHover, "#f0dcbe"),
+            (ColorToken::SrfBorder, "#0000000f"),
+        ],
+    },
+    PresetSkin {
+        id: "rose",
+        name: "玫红",
+        // 暗档：暖褐坡 + 玫红 accent（#F472B6）。
+        dark: &[
+            (ColorToken::Accent, "#f472b6"),
+            (ColorToken::AccentLight, "#f9a8d4"),
+            (ColorToken::SrfDeep, "#1c0f16"),
+            (ColorToken::SrfPrimary, "#241220"),
+            (ColorToken::SrfSecondary, "#2d162a"),
+            (ColorToken::SrfCard, "#361a33"),
+            (ColorToken::SrfHover, "#3f1f3d"),
+            (ColorToken::SrfBorder, "#ffffff0f"),
+        ],
+        // 亮档：协调的暖浅玫坡；accent 亮档深一档（#BE185D）保白底对比。
+        light: &[
+            (ColorToken::Accent, "#be185d"),
+            (ColorToken::AccentLight, "#db2777"),
+            (ColorToken::SrfDeep, "#fdf6f9"),
+            (ColorToken::SrfPrimary, "#faedf3"),
+            (ColorToken::SrfSecondary, "#f7e4ed"),
+            (ColorToken::SrfCard, "#f4dbe7"),
+            (ColorToken::SrfHover, "#f1d2e1"),
+            (ColorToken::SrfBorder, "#0000000f"),
+        ],
+    },
+    PresetSkin {
+        id: "graphite",
+        name: "石墨",
+        // 暗档：全中性纯黑灰坡 + 中性钢灰 accent，状态色压饱和（去 Fluent 高饱和彩）。
+        dark: &[
+            (ColorToken::Accent, "#c8ccd2"),
+            (ColorToken::AccentLight, "#e6e9ee"),
+            (ColorToken::SrfDeep, "#101010"),
+            (ColorToken::SrfPrimary, "#161616"),
+            (ColorToken::SrfSecondary, "#1c1c1c"),
+            (ColorToken::SrfCard, "#222222"),
+            (ColorToken::SrfHover, "#2a2a2a"),
+            (ColorToken::SrfBorder, "#ffffff0f"),
+            (ColorToken::Success, "#7fb069"),
+            (ColorToken::Warning, "#c9a25a"),
+            (ColorToken::Info, "#8296b8"),
+            (ColorToken::Favorite, "#c0809b"),
+        ],
+        // 亮档：同样中性纯灰坡；accent 中性深灰保白底对比；状态色同样压饱和。
+        light: &[
+            (ColorToken::Accent, "#5a5f66"),
+            (ColorToken::AccentLight, "#7a8087"),
+            (ColorToken::SrfDeep, "#f6f7f8"),
+            (ColorToken::SrfPrimary, "#edeeef"),
+            (ColorToken::SrfSecondary, "#e4e6e8"),
+            (ColorToken::SrfCard, "#dcdedf"),
+            (ColorToken::SrfHover, "#d3d5d7"),
+            (ColorToken::SrfBorder, "#0000000f"),
+            (ColorToken::Success, "#4d7c3f"),
+            (ColorToken::Warning, "#9a7b2d"),
+            (ColorToken::Info, "#5a6f96"),
+            (ColorToken::Favorite, "#a05f7f"),
+        ],
+    },
+];
+
+/// 主题规格（纯数据，不依赖 config）：config 只传 `id`/`hex` 字符串，ui 内解析。
+///
+/// - `mode`：明暗档。
+/// - `preset`：人格预设（运行时为准；`PRESETS` 内取，未知 id 由调用方兜底 default）。
+/// - `custom`：`"colors.accent" -> "#rrggbb"` 覆写表（`"default"` = 还原到预设值）。
+#[derive(Clone, Debug)]
+pub struct ThemeSpec {
+    pub mode: ThemeMode,
+    pub preset: &'static PresetSkin,
+    pub custom: BTreeMap<&'static str, String>,
+}
+
+impl ThemeSpec {
+    /// 纯默认规格（default 预设 + 空覆写）——`Theme::set` 薄包装与调用方兜底用。
+    pub fn plain(mode: ThemeMode) -> Self {
+        Self {
+            mode,
+            preset: &PRESETS[0],
+            custom: BTreeMap::new(),
+        }
+    }
+}
+
+/// 合并 `ColorScheme`：优先级 `base < preset < custom`；`custom` 值 `"default"`（或不含该
+/// key）＝还原到 preset 值。非法 hex / 未知 key 跳过、不 panic。**只在 apply 时跑一次**
+/// （性能纪律：Token 是字段、非每帧计算，渲染只读本函数产物）。
+pub(crate) fn merge_spectrum(
+    mode: ThemeMode,
+    base: &ColorScheme,
+    preset_skin: &PresetSkin,
+    custom: &BTreeMap<&'static str, String>,
+) -> ColorScheme {
+    let mut out = *base;
+    let table = if matches!(mode, ThemeMode::Dark) {
+        preset_skin.dark
+    } else {
+        preset_skin.light
+    };
+    // 1) base <- preset：整表套用（人格令牌 hex 合法才生效）。
+    for &(token, hex) in table {
+        if let Some(v) = ColorToken::parse_hex(hex) {
+            apply_color_token(&mut out, token, v);
+        }
+    }
+    // 2) preset <- custom：逐个 key 套用。
+    for (key, value) in custom {
+        let Some(token) = ColorToken::from_key(key) else {
+            continue; // 未知 key：跳过
+        };
+        if value == "default" {
+            // 还原到 preset 值（preset 表里该令牌 → 重新套用；不在表里 = 本来就=base，不动）。
+            if let Some(&(_, hex)) = table.iter().find(|(t, _)| *t == token) {
+                if let Some(v) = ColorToken::parse_hex(hex) {
+                    apply_color_token(&mut out, token, v);
+                }
+            }
+            continue;
+        }
+        if let Some(v) = ColorToken::parse_hex(value) {
+            apply_color_token(&mut out, token, v);
+        }
+        // 非法 hex：跳过该 key，不影响其它 token。
+    }
+    out
+}
+
+/// 合并 `ChromeColors`（外壳层）：仅 custom 的 `chrome.*` 键生效；本 slice 预设不列 chrome
+/// 令牌，故不参与。`"default"` 还原到 base 值。非法 hex / 未知 key 跳过、不 panic。
+pub(crate) fn merge_chrome(
+    base: &ChromeColors,
+    custom: &BTreeMap<&'static str, String>,
+) -> ChromeColors {
+    let mut out = *base;
+    for (key, value) in custom {
+        let Some(token) = ColorToken::from_key(key) else {
+            continue;
+        };
+        if value == "default" {
+            continue; // chrome 无 preset 层，「default」= 还原 base（当前已是）。
+        }
+        if let Some(v) = ColorToken::parse_hex(value) {
+            apply_chrome_token(&mut out, token, v);
+        }
+    }
+    out
+}
+
+/// 全局主题：当前模式 + 对应语义色板 + 外壳配色 + 排版参数。
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub mode: ThemeMode,
     pub colors: ColorScheme,
+    pub chrome: ChromeColors,
     pub typography: Typography,
 }
 
@@ -535,6 +1279,7 @@ impl Theme {
         Self {
             mode: ThemeMode::Light,
             colors: ColorScheme::light(),
+            chrome: ChromeColors::light(),
             typography: Typography::default(),
         }
     }
@@ -543,6 +1288,7 @@ impl Theme {
         Self {
             mode: ThemeMode::Dark,
             colors: ColorScheme::dark(),
+            chrome: ChromeColors::dark(),
             typography: Typography::default(),
         }
     }
@@ -556,22 +1302,40 @@ impl Theme {
         cx.try_global::<Theme>().unwrap_or(&DEFAULT_LIGHT)
     }
 
-    /// 切换主题：写本全局 + 刷新窗口。
-    pub fn set(mode: ThemeMode, cx: &mut App) {
-        let theme = match mode {
-            ThemeMode::Light => Self::light(),
-            ThemeMode::Dark => Self::dark(),
+    /// 应用主题规格：合并 preset + custom → 更新 `mode`/`colors`/`chrome`，写全局 + 刷新
+    /// 窗口。**合并只在本次调用跑一次**（性能纪律：合并一次、渲染只读）。
+    ///
+    /// chrome 必须从「合并后 colors」重建（`ChromeColors::from_scheme`）再叠 `chrome.*`
+    /// custom 覆盖——否则 custom/preset 改 `colors.*` 时 chrome 派生字段（`panel_bg`/
+    /// `text_primary`/`tab_active_bg`/`pill_fg`/`dirty` 等同名字段）仍是 base 值，违反
+    /// 「同名字段物理同值」不变式（P1-1 修派生漂移）。
+    pub fn apply(spec: ThemeSpec, cx: &mut App) {
+        let base_colors = ColorScheme::for_mode(matches!(spec.mode, ThemeMode::Dark));
+        let colors = merge_spectrum(spec.mode, &base_colors, spec.preset, &spec.custom);
+        let chrome_base = ChromeColors::from_scheme(&colors, spec.mode);
+        let chrome = merge_chrome(&chrome_base, &spec.custom);
+        let theme = Self {
+            mode: spec.mode,
+            colors,
+            chrome,
+            typography: Typography::default(),
         };
         cx.set_global(theme);
         cx.refresh_windows();
+    }
+
+    /// 切换主题（薄包装 = 应用 default 预设 + 空覆写），所有既有调用方零改动。
+    pub fn set(mode: ThemeMode, cx: &mut App) {
+        Self::apply(ThemeSpec::plain(mode), cx);
     }
 }
 
 /// 查看器画布默认底色：亮 #F5F5F5 / 暗 #202020（与外壳 `window_bg` 同源）。
 /// 收敛自 image_viewer / video / pdf 三处逐字一致的 `default_canvas`（下一批 P5）。
+/// 读**合并后** Theme 的 `chrome.window_bg`（P1-2：不再从 `for_mode` base 现取，
+/// 自定义/预设经 apply 合并后此处直接可见）。
 pub fn window_bg(cx: &App) -> Hsla {
-    let dark = Theme::global(cx).is_dark();
-    ChromeColors::for_mode(dark).window_bg.into()
+    Theme::global(cx).chrome.window_bg.into()
 }
 
 /// 状态栏语言徽标的「徽记色点」色相（VS Code 式按语言类别分类着色）。
@@ -1134,5 +1898,312 @@ mod tests {
         // 未知语言回退到中性，绝不等同某语言辨识色。
         let unknown_d = language_badge_color("文本", true);
         assert!(unknown_d.s < 0.3, "未知类别应低饱和中性");
+    }
+
+    // ── 全站语义色主题系统 · ui 模型层测试（2026-11-22）──
+
+    /// 从 `(key, value)` 对构建 custom 覆写表。
+    fn custom(map: &[(&'static str, &'static str)]) -> BTreeMap<&'static str, String> {
+        map.iter().map(|&(k, v)| (k, v.into())).collect()
+    }
+
+    /// `music` 预设指针（供多处测试复用）。
+    fn music_preset() -> &'static PresetSkin {
+        PRESETS.iter().find(|p| p.id == "music").expect("music 预设存在")
+    }
+
+    #[gpui::test]
+    fn theme_token_key_roundtrips_and_unknown_returns_none(_cx: &mut TestAppContext) {
+        // 全部字段的 key()/from_key() 双向往返一致；未知 key 返回 None（调用方兜底不 panic）。
+        const ALL: &[ColorToken] = &[
+            ColorToken::Bg, ColorToken::Surface, ColorToken::Fg, ColorToken::FgMuted,
+            ColorToken::Border, ColorToken::Accent, ColorToken::Link, ColorToken::Error,
+            ColorToken::FgDisabled, ColorToken::FocusRing, ColorToken::SelectedBg,
+            ColorToken::PressedBg, ColorToken::DragHoverBorder, ColorToken::CardShadow,
+            ColorToken::CodeBlockBg, ColorToken::CodeInlineFg, ColorToken::CodeInlineBg,
+            ColorToken::EditorCodeBg, ColorToken::QuoteBg, ColorToken::TableHeadBg,
+            ColorToken::Heading, ColorToken::PopoverBg, ColorToken::MermaidAccentPalette,
+            ColorToken::MermaidBorder, ColorToken::EditorSelectionBg, ColorToken::EditorFoldBg,
+            ColorToken::EditorActiveLineBg, ColorToken::EditorFindMatchBg,
+            ColorToken::EditorFindCurrentBg, ColorToken::GuideInactive, ColorToken::GuideActive,
+            ColorToken::BracketGuidePalette, ColorToken::DocSelectionBg,
+            ColorToken::SrfDeep, ColorToken::SrfPrimary, ColorToken::SrfSecondary,
+            ColorToken::SrfCard, ColorToken::SrfHover, ColorToken::SrfBorder,
+            ColorToken::AccentLight, ColorToken::OverlayWhite,
+            ColorToken::Success, ColorToken::Warning, ColorToken::Info, ColorToken::Favorite,
+            ColorToken::WindowBg, ColorToken::MaterialTop, ColorToken::MaterialBottom,
+            ColorToken::BarBg, ColorToken::BarBorder, ColorToken::Hairline, ColorToken::PanelBg,
+            ColorToken::EditorBg, ColorToken::ChromeBg, ColorToken::TextPrimary,
+            ColorToken::TextMinor, ColorToken::TextTertiary, ColorToken::ChipBg,
+            ColorToken::ChipText, ColorToken::TabActiveBg, ColorToken::TabActiveBorder,
+            ColorToken::PillBg, ColorToken::PillFg, ColorToken::Dirty, ColorToken::HoverFill,
+            ColorToken::PressedFill, ColorToken::CloseHover, ColorToken::ClosePressed,
+            ColorToken::DragGhostBg, ColorToken::MenuHighlight, ColorToken::ScrollbarThumb,
+            ColorToken::TabReorderLine,
+        ];
+        for &t in ALL {
+            assert_eq!(
+                ColorToken::from_key(t.key()),
+                Some(t),
+                "key 往返一致：{}",
+                t.key()
+            );
+            // 文本寻址风格锚：colors.* / chrome.* 两域名前缀。
+            assert!(
+                t.key().starts_with("colors.") || t.key().starts_with("chrome."),
+                "键前缀必须 colors./chrome.：{}",
+                t.key()
+            );
+        }
+        // UI 可暴露子集是合法令牌（key 均可往返）。
+        for &t in UI_EXPOSABLE_TOKENS {
+            assert_eq!(
+                ColorToken::from_key(t.key()),
+                Some(t),
+                "UI 暴露子集 key 合法：{}",
+                t.key()
+            );
+        }
+        assert_eq!(ColorToken::from_key("colors.nope"), None, "未知 key 返回 None");
+        assert_eq!(ColorToken::from_key("chrome.nope"), None);
+    }
+
+    #[gpui::test]
+    fn parse_hex_accepts_only_six_digit_hash(_cx: &mut TestAppContext) {
+        // 仅 #rrggbb 6 位：合法 → Rgba；缺 # / 长度错 / 非法 hex / 带 alpha 位 → None。
+        assert_eq!(ColorToken::parse_hex("#ff0000"), Some(rgb(0xff0000)));
+        assert_eq!(ColorToken::parse_hex("#0d0b1a"), Some(rgb(0x0d0b1a)));
+        assert_eq!(ColorToken::parse_hex("#FFFFFF"), Some(rgb(0xffffff)), "大写 hex 亦可");
+        assert_eq!(ColorToken::parse_hex("ff0000"), None, "缺 # → None");
+        assert_eq!(ColorToken::parse_hex("#ff000"), None, "5 位 → None");
+        assert_eq!(ColorToken::parse_hex("#ff00000"), None, "7 位（含 alpha）→ None");
+        assert_eq!(ColorToken::parse_hex("#gg0000"), None, "非法 hex 字符 → None");
+        assert_eq!(ColorToken::parse_hex(""), None);
+    }
+
+    #[gpui::test]
+    fn merge_default_preset_is_byte_identical(_cx: &mut TestAppContext) {
+        // 零回归锚：default 预设（空覆盖）+ 空 custom → 合并结果与 `ColorScheme::light()/
+        // dark()`/`ChromeColors::light()/dark()` **逐字段字节相等**（整结构断言）。
+        // 判别式：撤掉合并改回直用 base 即 pass；合并误改任一既有字段即 fail。
+        let default = &PRESETS[0];
+        let empty = BTreeMap::new();
+        assert_eq!(
+            merge_spectrum(ThemeMode::Light, &ColorScheme::light(), default, &empty),
+            ColorScheme::light(),
+            "亮档 default 合并必须逐字段等于 base"
+        );
+        assert_eq!(
+            merge_spectrum(ThemeMode::Dark, &ColorScheme::dark(), default, &empty),
+            ColorScheme::dark(),
+            "暗档 default 合并必须逐字段等于 base"
+        );
+        assert_eq!(
+            merge_chrome(&ChromeColors::light(), &empty),
+            ChromeColors::light(),
+            "亮 chrome 空合并不变"
+        );
+        assert_eq!(
+            merge_chrome(&ChromeColors::dark(), &empty),
+            ChromeColors::dark(),
+            "暗 chrome 空合并不变"
+        );
+        // 新字段缺省值锚（零覆盖时的基座值，供后续对比阶段对照）。
+        let dark = ColorScheme::dark();
+        assert_eq!(dark.srf_deep, rgb(0x121314), "暗面坡深=中性");
+        assert_eq!(dark.srf_border, rgba(0xffffff0f), "暗表分隔=白6%");
+        assert_eq!(dark.overlay_white, rgb(0xffffff), "覆盖白=纯白");
+    }
+
+    #[gpui::test]
+    fn merge_music_preset_hits_personality_tokens(_cx: &mut TestAppContext) {
+        // preset 命中：music 暗档 accent/srf_deep/accent_light 逐字节对齐。
+        let merged = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(merged.accent, rgb(0x7c5cfc), "music 暗档 accent=#7C5CFC");
+        assert_eq!(merged.srf_deep, rgb(0x0d0b1a), "music 暗档 srf_deep=#0D0B1A");
+        assert_eq!(merged.accent_light, rgb(0xa78bfa), "music 暗档 accent_light=#A78BFA");
+        // 未列入人格表的底色保持 base（音乐紫不动主背景）。
+        assert_eq!(merged.bg, ColorScheme::dark().bg, "未覆盖字段保持 base");
+    }
+
+    #[gpui::test]
+    fn merge_custom_overrides_preset(_cx: &mut TestAppContext) {
+        // custom > preset：music + custom accent=#FF0000 → accent 被 custom 盖过。
+        let merged = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &custom(&[("colors.accent", "#ff0000")]),
+        );
+        assert_eq!(merged.accent, rgb(0xff0000), "custom 覆盖 preset accent");
+        assert_eq!(merged.srf_deep, rgb(0x0d0b1a), "preset 其余令牌不受影响");
+        assert_eq!(merged.accent_light, rgb(0xa78bfa), "未经 custom 的令牌保持 preset");
+    }
+
+    #[gpui::test]
+    fn merge_custom_default_reverts_to_preset(_cx: &mut TestAppContext) {
+        // 单 key "default"：还原到 preset 值（music accent 复原为 #7C5CFC，而非 base）。
+        let merged = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &custom(&[("colors.accent", "default")]),
+        );
+        assert_eq!(merged.accent, rgb(0x7c5cfc), "「default」还原到 preset accent");
+        assert_eq!(merged.srf_deep, rgb(0x0d0b1a), "preset 其余仍生效");
+    }
+
+    #[gpui::test]
+    fn merge_skips_invalid_hex_and_unknown_keys(_cx: &mut TestAppContext) {
+        // 非法 hex / 未知 key → 跳过该条、不影响其它 token、不 panic。
+        let merged = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &custom(&[
+                ("colors.accent", "nothex"),       // 非 hex
+                ("colors.link", "#zzzzzz"),        // 非法 hex 字符
+                ("colors.unknown_key", "#ff0000"), // 未知 key
+                ("colors.srf_deep", "#000000"),    // 合法 → 应生效
+            ]),
+        );
+        assert_eq!(
+            merged.accent,
+            rgb(0x7c5cfc),
+            "非法 hex 的 key 被跳过 → accent 保持 preset"
+        );
+        assert_eq!(
+            merged.link,
+            ColorScheme::dark().link,
+            "非法 hex 的 key 被跳过 → link 保持 base"
+        );
+        assert_eq!(merged.srf_deep, rgb(0x000000), "合法 key 正常生效");
+    }
+
+    #[gpui::test]
+    fn merge_modes_are_independent(_cx: &mut TestAppContext) {
+        // 两档独立：亮/暗合并互不污染。
+        let music = music_preset();
+        let light = merge_spectrum(ThemeMode::Light, &ColorScheme::light(), music, &BTreeMap::new());
+        let dark = merge_spectrum(ThemeMode::Dark, &ColorScheme::dark(), music, &BTreeMap::new());
+        assert_eq!(dark.accent, rgb(0x7c5cfc), "暗档用 music 暗表");
+        assert_eq!(dark.srf_deep, rgb(0x0d0b1a), "暗档深紫坡");
+        assert_eq!(light.accent, rgb(0x5b3fd1), "亮档用 music 亮表（协调深紫）");
+        assert_ne!(dark.srf_deep, light.srf_deep, "暗坡≠亮坡");
+        assert_ne!(light.srf_deep, ColorScheme::light().srf_deep, "亮档 preset 生效");
+    }
+
+    #[gpui::test]
+    fn set_is_default_preset_thin_wrapper(cx: &mut TestAppContext) {
+        // Theme::set = apply(default 预设 + 空覆写)：既有调用方语义零改动。
+        cx.update(|cx| Theme::set(ThemeMode::Dark, cx));
+        cx.update(|cx| {
+            let t = Theme::global(cx);
+            assert!(t.is_dark());
+            assert_eq!(t.colors, ColorScheme::dark(), "set → 逐字段等于 dark()");
+            assert_eq!(t.chrome, ChromeColors::dark(), "chrome 同源 dark()");
+        });
+        cx.update(|cx| Theme::set(ThemeMode::Light, cx));
+        cx.update(|cx| {
+            assert_eq!(
+                Theme::global(cx).colors,
+                ColorScheme::light(),
+                "set 亮档逐字段等于 light()"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn apply_writes_merged_theme_and_chrome(cx: &mut TestAppContext) {
+        // 端到端：apply(music + custom chrome) → 全局主题同时反映 preset 合并与 chrome 覆写。
+        cx.update(|cx| {
+            let mut c = BTreeMap::new();
+            c.insert("chrome.window_bg", "#112233".into());
+            Theme::apply(
+                ThemeSpec {
+                    mode: ThemeMode::Dark,
+                    preset: music_preset(),
+                    custom: c,
+                },
+                cx,
+            );
+            let t = Theme::global(cx);
+            assert!(t.is_dark());
+            assert_eq!(t.colors.accent, rgb(0x7c5cfc), "preset 合并生效");
+            assert_eq!(t.colors.srf_deep, rgb(0x0d0b1a), "preset srf 生效");
+            assert_eq!(t.chrome.window_bg, rgb(0x112233), "custom chrome 覆写生效");
+            assert_eq!(t.chrome.bar_bg, ChromeColors::dark().bar_bg, "未覆写 chrome 保持默认");
+        });
+    }
+
+    // ── P1-1：chrome 从「合并后 colors」重建（杜绝派生漂移）──
+
+    #[gpui::test]
+    fn from_scheme_matches_for_mode_on_default_scheme(_cx: &mut TestAppContext) {
+        // 零回归锚：`from_scheme` 对默认 scheme 必须与旧 `ChromeColors::for_mode` **逐字段
+        // 字节相等**（撤掉 from_scheme 重映射 / 任一 scheme 派生字段抄错即红）。
+        assert_eq!(
+            ChromeColors::from_scheme(&ColorScheme::light(), ThemeMode::Light),
+            ChromeColors::light(),
+            "亮档 from_scheme(默认) == for_mode(false)"
+        );
+        assert_eq!(
+            ChromeColors::from_scheme(&ColorScheme::dark(), ThemeMode::Dark),
+            ChromeColors::dark(),
+            "暗档 from_scheme(默认) == for_mode(true)"
+        );
+    }
+
+    #[gpui::test]
+    fn apply_custom_colors_rebuilds_chrome_from_merged(cx: &mut TestAppContext) {
+        // P1-1 判别式：custom 改 `colors.*`（如 bg），chrome 派生字段必须跟 merged colors
+        // 走 —— `panel_bg`/`tab_active_bg` 等「同名字段」不再停留在 base 值。
+        cx.update(|cx| {
+            Theme::apply(
+                ThemeSpec {
+                    mode: ThemeMode::Light,
+                    preset: &PRESETS[0],
+                    custom: custom(&[
+                        ("colors.bg", "#112233"),
+                        ("colors.fg", "#334455"),
+                        ("colors.accent", "#556677"),
+                    ]),
+                },
+                cx,
+            );
+            let t = Theme::global(cx);
+            assert_eq!(t.colors.bg, rgb(0x112233), "merged colors.bg");
+            // 同名字段物理同值不变式（theme.rs 364-367）：chrome 派生字段 = merged colors 同名字段。
+            assert_eq!(t.chrome.panel_bg, t.colors.bg, "panel_bg 重建自合并后 colors.bg");
+            assert_eq!(t.chrome.tab_active_bg, t.colors.bg, "tab_active_bg 同源 bg");
+            assert_eq!(t.chrome.text_primary, t.colors.fg, "text_primary 同源 fg");
+            assert_eq!(t.chrome.text_minor, t.colors.fg_muted, "text_minor 同源 fg_muted");
+            assert_eq!(t.chrome.chip_text, t.colors.fg, "chip_text 同源 fg");
+            assert_eq!(t.chrome.pill_fg, t.colors.fg, "pill_fg 同源 fg");
+            assert_eq!(t.chrome.bar_border, t.colors.border, "bar_border 同源 border");
+            assert_eq!(t.chrome.tab_active_border, t.colors.border);
+            assert_eq!(t.chrome.dirty, t.colors.error, "dirty 同源 error");
+            assert_eq!(t.chrome.drag_ghost_bg, t.colors.accent, "drag_ghost_bg 同源 accent");
+            // 外壳专属常量不受 colors 影响（从 light/dark 档既有值沿袭）。
+            assert_eq!(t.chrome.window_bg, ChromeColors::light().window_bg, "外壳专属常量保持");
+            assert_eq!(t.chrome.editor_bg, ChromeColors::light().editor_bg);
+        });
+    }
+
+    #[gpui::test]
+    fn apply_default_preset_chrome_equals_for_mode(cx: &mut TestAppContext) {
+        // P1-1 零回归锚：default 预设 + 空 custom → `apply` 后的 chrome 仍与旧
+        // `ChromeColors::for_mode` 逐字段字节相等（撤 from_scheme 重映射即红）。
+        cx.update(|cx| {
+            Theme::apply(ThemeSpec::plain(ThemeMode::Dark), cx);
+            assert_eq!(Theme::global(cx).chrome, ChromeColors::dark(), "暗档默认 chrome=for_mode(true)");
+            Theme::apply(ThemeSpec::plain(ThemeMode::Light), cx);
+            assert_eq!(Theme::global(cx).chrome, ChromeColors::light(), "亮档默认 chrome=for_mode(false)");
+        });
     }
 }

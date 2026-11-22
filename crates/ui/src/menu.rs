@@ -28,7 +28,7 @@ use gpui::{
     px, size,
 };
 
-use crate::ui::theme::{ChromeColors, Theme};
+use crate::ui::theme::Theme;
 
 /// 菜单项点击处理器。
 type ItemHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -780,12 +780,12 @@ impl PopupMenu {
         chevron: Option<usize>,
     ) -> AnyElement {
         let theme = Theme::global(cx);
-        let (colors, is_dark) = (theme.colors, theme.is_dark());
+        let colors = theme.colors;
         let fg: Hsla = colors.fg.into();
         let fg_disabled: Hsla = colors.fg_disabled.into();
         let fg_muted: Hsla = colors.fg_muted.into();
-        // Win11 中性菜单高亮：灰填充（非强调蓝 tint）。
-        let selected_bg: Hsla = ChromeColors::for_mode(is_dark).menu_highlight.into();
+        // Win11 中性菜单高亮：灰填充（非强调蓝 tint）；读**合并后** Theme（P1-2）。
+        let selected_bg: Hsla = theme.chrome.menu_highlight.into();
         match item {
             PopupMenuItem::Separator => {
                 let border: Hsla = colors.border.into();

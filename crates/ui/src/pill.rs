@@ -183,8 +183,8 @@ impl Styled for Pill {
 impl RenderOnce for Pill {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::global(cx);
-        let chrome = ChromeColors::for_mode(theme.is_dark());
-        let (bg, fg) = self.tone.colors(theme, &chrome);
+        // P1-2：取**合并后** Theme 的 chrome（不再从 `for_mode` base 现取）。
+        let (bg, fg) = self.tone.colors(theme, &theme.chrome);
         let (text_size, height) = self.size.profile();
         let on_click = self.on_click;
         let mouse_down = self.on_mouse_down;

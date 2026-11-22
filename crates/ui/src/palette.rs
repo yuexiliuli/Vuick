@@ -29,7 +29,7 @@ use crate::ui::list_item_row::ListItemRow;
 use crate::ui::motion::hover_spring;
 use crate::ui::scroll_panel::ScrollPanelBuilder;
 use crate::ui::float_card::{FloatCardBg, FloatCardPad, FloatCardRadius, FloatCardShadow};
-use crate::ui::theme::{ChromeColors, Theme};
+use crate::ui::theme::Theme;
 
 /// 面板模式（创建时定死；Ctrl+Shift+P / Ctrl+P 各自新建一个面板实体）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -432,7 +432,9 @@ impl Render for CommandPalette {
         let (colors, is_dark) = (theme.colors, theme.is_dark());
         let fg: Hsla = colors.fg.into();
         let fg_muted: Hsla = colors.fg_muted.into();
-        let chrome = ChromeColors::for_mode(is_dark);
+        // P1-2：取**合并后** Theme 的 chrome（不再从 `for_mode` base 现取）；选中高亮与
+        // 快捷键三级文字（`text_tertiary`）都随合并主题。
+        let chrome = theme.chrome;
         let selected_bg: Hsla = chrome.menu_highlight.into();
 
         // 面板高度 = 窗口 2/3：列表项多时不再撑出屏幕底部（超出部分列表区滚动）。

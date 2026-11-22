@@ -81,8 +81,8 @@ pub fn empty_state_hero(
         .size_full()
         .overflow_hidden()
         // 欢迎页底色与编辑区同色（暗色 = theme `editor_bg` #121314，原 config
-        // EDITOR_BG_DARK 常量已删）。
-        .bg(crate::ui::shell::content_bg(dark, c.bg.into()))
+        // EDITOR_BG_DARK 常量已删）；走合并后 theme（`content_bg_theme`，P1-2）。
+        .bg(crate::ui::shell::content_bg_theme(cx, dark, c.bg.into()))
         .flex()
         .flex_col()
         .items_center()
