@@ -672,7 +672,7 @@ use config::user::PdfBgPref;
             "PDF 默认档打开不存显式画布色（跟随主题走 render 层 default_canvas）"
         );
         let img0 = reader_bg(cx, i_img).expect("图片打开应有画布背景");
-        let bg0: gpui::Hsla = cx.update(|_w, cx| app.read(cx).window_bg());
+        let bg0: gpui::Hsla = cx.update(|_w, cx| app.read(cx).window_bg(cx));
 
         // 切到另一主题（真路径 refresh_theme_ui）→ 图片背景同步翻转（背景赋值在
         // refresh_theme_ui 内同步完成，无需 pump 渲染即可读）。回归点：曾漏刷非 PDF 阅读器。
@@ -687,7 +687,7 @@ use config::user::PdfBgPref;
                 cx.notify();
             });
         });
-        let toggled_bg: gpui::Hsla = cx.update(|_w, cx| app.read(cx).window_bg());
+        let toggled_bg: gpui::Hsla = cx.update(|_w, cx| app.read(cx).window_bg(cx));
         assert_ne!(bg0, toggled_bg, "翻转明暗后 window_bg 应变化（测试前提）");
         assert_eq!(
             reader_bg(cx, i_pdf),

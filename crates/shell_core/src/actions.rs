@@ -595,6 +595,10 @@ impl AppModel {
         let existing = UserPrefs::load();
         UserPrefs {
             theme: self.theme_pref,
+            // 全站主题（人格预设 / 自定义覆盖 / 音乐皮肤）随其它偏好一并落盘。
+            theme_preset: self.theme_preset.clone(),
+            theme_custom: self.theme_custom.clone(),
+            music_skin: self.music_skin.clone(),
             font_size: Some(self.font_size),
             sidebar_width: host.sidebar_width_manual(),
             // 会话恢复开关随其它偏好一并落盘（否则一次字号/主题保存就会把它重置回默认开）。

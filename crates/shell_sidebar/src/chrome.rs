@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    div, px, AnimationExt, AnyElement, Context, CursorStyle, Entity, Hsla, InteractiveElement,
+    div, px, AnimationExt, AnyElement, App, Context, CursorStyle, Entity, Hsla, InteractiveElement,
     IntoElement, MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled,
     Subscription, WeakEntity, Window,
 };
@@ -103,20 +103,17 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         self.search_input.clone()
     }
 
-    /// 当前明暗模式对应的外壳配色（`ui::theme::ChromeColors` 单一来源，与宿主
-    /// `EditorApp::chrome` 同口径：只读 `model.dark_mode`）。
+    /// 当前生效主题对应的外壳配色（`ui::theme::Theme::global(cx).chrome` 单一来源，与宿主
+    /// `EditorApp::chrome` 同口径；默认零覆盖 = 旧 `ChromeColors::for_mode(dark_mode)`，
+    /// 自定义 `chrome.*` 覆盖经 apply 合并后在此统一可见）。
     /// `pub(crate)`：`toc.rs` 拆分模块需配色（fg/muted/active_bg 等）。
-    pub(crate) fn chrome(&self) -> ChromeColors {
-        if self.model.borrow().dark_mode {
-            ChromeColors::dark()
-        } else {
-            ChromeColors::light()
-        }
+    pub(crate) fn chrome(&self, cx: &App) -> ChromeColors {
+        ui::theme::Theme::global(cx).chrome
     }
 
     /// Win11 Mica chrome 透明度（亮 0.86 / 暗 0.82）：半透明才能透出系统 Mica 材质。
-    fn mica_alpha(&self) -> f32 {
-        if self.model.borrow().dark_mode {
+    fn mica_alpha(&self, cx: &App) -> f32 {
+        if ui::theme::Theme::global(cx).is_dark() {
             ui::theme::MICA_CHROME_ALPHA_DARK
         } else {
             ui::theme::MICA_CHROME_ALPHA_LIGHT
@@ -124,42 +121,42 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     }
 
     /// 工具条/侧栏背景（Mica 半透明版；暗色主题改用 theme `chrome_bg` 不透明统一底色）。
-    fn mica_bar_bg(&self) -> Hsla {
-        if self.model.borrow().dark_mode {
-            ChromeColors::for_mode(true).chrome_bg.into()
+    fn mica_bar_bg(&self, cx: &App) -> Hsla {
+        if ui::theme::Theme::global(cx).is_dark() {
+            ui::theme::Theme::global(cx).chrome.chrome_bg.into()
         } else {
-            self.bar_bg().opacity(self.mica_alpha())
+            self.bar_bg(cx).opacity(self.mica_alpha(cx))
         }
     }
 
     /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景。
-    pub(crate) fn bar_bg(&self) -> Hsla {
-        self.chrome().bar_bg.into()
+    pub(crate) fn bar_bg(&self, cx: &App) -> Hsla {
+        self.chrome(cx).bar_bg.into()
     }
 
     /// 工具条分隔边框。
-    pub(crate) fn bar_border(&self) -> Hsla {
-        self.chrome().bar_border.into()
+    pub(crate) fn bar_border(&self, cx: &App) -> Hsla {
+        self.chrome(cx).bar_border.into()
     }
 
     /// 区域分隔发丝线（`ChromeColors::hairline` 语义 token、按明暗主题取色，不透明）。
-    pub(crate) fn hairline(&self) -> Hsla {
-        self.chrome().hairline.into()
+    pub(crate) fn hairline(&self, cx: &App) -> Hsla {
+        self.chrome(cx).hairline.into()
     }
 
     /// 主要文字颜色。
-    pub(crate) fn text_primary(&self) -> Hsla {
-        self.chrome().text_primary.into()
+    pub(crate) fn text_primary(&self, cx: &App) -> Hsla {
+        self.chrome(cx).text_primary.into()
     }
 
     /// 次要/弱化文字颜色。
-    pub(crate) fn text_minor(&self) -> Hsla {
-        self.chrome().text_minor.into()
+    pub(crate) fn text_minor(&self, cx: &App) -> Hsla {
+        self.chrome(cx).text_minor.into()
     }
 
     /// 激活选项卡背景。
-    pub(crate) fn tab_active_bg(&self) -> Hsla {
-        self.chrome().tab_active_bg.into()
+    pub(crate) fn tab_active_bg(&self, cx: &App) -> Hsla {
+        self.chrome(cx).tab_active_bg.into()
     }
 
     /// 切换视图（宿主 `app.toggle_sidebar_view` 测试入口的实体侧实现）：状态纯变换
@@ -187,7 +184,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (side_bg, border) = (self.mica_bar_bg(), self.bar_border());
+        let (side_bg, border) = (self.mica_bar_bg(cx), self.bar_border(cx));
         let width_px = if sb.panel_open {
             sb.width
         } else {
@@ -208,7 +205,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             .mb(px(0.))
             .bg(side_bg)
             .border_r_1()
-            .border_color(self.hairline())
+            .border_color(self.hairline(cx))
             .overflow_hidden()
             // 拖拽调宽事件由外层 app-body-with-sidebar 容器统一处理（见宿主 render_body_sidebar）
             .child(self.render_sidebar_activity_bar(sb, window, border, cx))
@@ -294,9 +291,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         border: Hsla,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (fg, muted) = (self.text_primary(), self.text_minor());
+        let (fg, muted) = (self.text_primary(cx), self.text_minor(cx));
         let accent: Hsla = ui::theme::Theme::global(cx).colors.accent.into();
-        let c = self.chrome();
+        let c = self.chrome(cx);
         let hover_fill: Hsla = c.hover_fill.into();
         let pressed_fill: Hsla = c.pressed_fill.into();
         let specs = [

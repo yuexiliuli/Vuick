@@ -24,9 +24,7 @@ impl EditorApp {
     {
         PopupMenuItem::element(move |_, cx| {
             // 快捷键提示灰字：渲染期取当前明暗模式（外壳色单一来源）。
-            let chrome = ui::theme::ChromeColors::for_mode(
-                ui::theme::Theme::global(cx).is_dark(),
-            );
+            let chrome = ui::theme::Theme::global(cx).chrome;
             let mut content = div()
                 .w_full()
                 .flex()
@@ -154,9 +152,7 @@ impl EditorApp {
     ) -> Vec<PopupMenuItem> {
         if folders.is_empty() && files.is_empty() {
             return vec![PopupMenuItem::element(move |_, cx| {
-                let chrome = ui::theme::ChromeColors::for_mode(
-                    ui::theme::Theme::global(cx).is_dark(),
-                );
+                let chrome = ui::theme::Theme::global(cx).chrome;
                 div()
                     .w_full()
                     .debug_selector(|| "recent-empty".into())
@@ -229,9 +225,7 @@ impl EditorApp {
             let debug = debug_render.clone();
             let name = name_render.clone();
             let path = path_render.clone();
-            let chrome = ui::theme::ChromeColors::for_mode(
-                ui::theme::Theme::global(cx).is_dark(),
-            );
+            let chrome = ui::theme::Theme::global(cx).chrome;
             div()
                 .w_full()
                 .debug_selector(move || debug.clone())
@@ -491,9 +485,7 @@ impl EditorApp {
                 .upgrade()
                 .map(|e| e.read(cx).model.borrow().media_new_window)
                 .unwrap_or(true);
-            let chrome = ui::theme::ChromeColors::for_mode(
-                ui::theme::Theme::global(cx).is_dark(),
-            );
+            let chrome = ui::theme::Theme::global(cx).chrome;
             div()
                 .w_full()
                 .flex()
@@ -522,9 +514,7 @@ impl EditorApp {
                 .upgrade()
                 .map(|e| e.read(cx).model.borrow().reuse_media_window)
                 .unwrap_or(true);
-            let chrome = ui::theme::ChromeColors::for_mode(
-                ui::theme::Theme::global(cx).is_dark(),
-            );
+            let chrome = ui::theme::Theme::global(cx).chrome;
             div()
                 .w_full()
                 .flex()
@@ -607,9 +597,7 @@ impl EditorApp {
                 .upgrade()
                 .map(|e| e.read(cx).model.borrow().wrap_enabled)
                 .unwrap_or(true);
-            let chrome = ui::theme::ChromeColors::for_mode(
-                ui::theme::Theme::global(cx).is_dark(),
-            );
+            let chrome = ui::theme::Theme::global(cx).chrome;
             div()
                 .w_full()
                 .flex()
@@ -737,7 +725,7 @@ impl EditorApp {
     /// 菜单按钮组（文件/编辑/查看/帮助），并入自绘标题栏使用。
     pub(super) fn render_menu_buttons(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
-        let text_primary = self.text_primary();
+        let text_primary = self.text_primary(cx);
         let make = |id: &'static str,
                     label: &'static str,
                     items: fn(

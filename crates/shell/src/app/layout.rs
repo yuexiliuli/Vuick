@@ -643,7 +643,7 @@ impl EditorApp {
                     this.toggle_music_player(window, cx)
                 }),
             )
-            .child(self.render_material_layer(window))
+            .child(self.render_material_layer(window, cx))
             .child(
                 div()
                     .flex()

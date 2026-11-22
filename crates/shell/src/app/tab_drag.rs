@@ -85,7 +85,7 @@ impl EditorApp {
             ed.set_soft_wrap(wrap);
         });
         // 预览/PDF 主题背景刷新 + PDF 订阅重建
-        let canvas_bg = self.window_bg();
+        let canvas_bg = self.window_bg(cx);
         // P4-2：MD / EPUB 预览都走统一 WyEditor 只读宿主——实体随选项卡搬迁已带内容，
         // 无需再喂 MarkdownPreview（该后端已删除）。
         let reader = self.model.borrow().tabs[idx].payload.reader.clone();

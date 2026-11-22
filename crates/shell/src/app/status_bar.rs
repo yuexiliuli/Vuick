@@ -156,7 +156,7 @@ impl EditorApp {
                 pdf_zoom,
             )
         };
-        let bar_border = self.bar_border();
+        let bar_border = self.bar_border(cx);
 
         // 左侧区：仅语言徽标；缩放滑条已移入中间区（紧随「第 N/M 页 100%」百分比右侧，
         // 见 `status_bar_middle`）。
@@ -171,7 +171,7 @@ impl EditorApp {
             // 仅保留顶部/四周发丝边框分隔。
             .mt(px(0.))
             .border_1()
-            .border_color(self.hairline())
+            .border_color(self.hairline(cx))
             .bg(ui::shell::card_surface(cx))
             .flex()
             .flex_row()
@@ -243,7 +243,7 @@ impl EditorApp {
     ) -> Option<gpui::Div> {
         // 只读预览（EPUB）：视口分页页码（滚动位置实时）。
         if let Some((page, total)) = epub_page {
-            return Some(self.middle_text("status-epub-page", format!("第 {page} / {total} 页")));
+            return Some(self.middle_text("status-epub-page", format!("第 {page} / {total} 页"), cx));
         }
         // PDF：当前第一张可见页 / 总页数（滚动位置）+ 当前缩放百分比（真机取证 zoom%），
         // 缩放滑条紧随百分比右侧（2026-11-20 用户要求「滑条放到缩放百分比右边」）；
@@ -257,6 +257,7 @@ impl EditorApp {
                 .child(self.middle_text(
                     "status-pdf-page",
                     format!("第 {page} / {total} 页  {:.0}%", pdf_zoom * 100.0),
+                    cx,
                 ));
             if !pdf_grid_on {
                 m = m.child(self.status_pdf_zoom_slider(pdf_zoom, cx));
@@ -265,19 +266,19 @@ impl EditorApp {
         }
         // 编辑区：有内容才显示 行:列（未命名空文档省略）。
         if let Some((ln, col)) = cursor_pos {
-            return Some(self.middle_text("status-cursor", format!("Ln {ln}, Col {col}")));
+            return Some(self.middle_text("status-cursor", format!("Ln {ln}, Col {col}"), cx));
         }
         None
     }
 
     /// 中间区单条文本（muted/弱化文字；`debug_selector` 供测试定位）。
-    fn middle_text(&self, sel: &'static str, text: String) -> gpui::Div {
+    fn middle_text(&self, sel: &'static str, text: String, cx: &App) -> gpui::Div {
         let owned = sel.to_string();
         div()
             .debug_selector(move || owned.clone())
             .flex_shrink_0()
             .text_size(px(12.))
-            .text_color(self.chip_text())
+            .text_color(self.chip_text(cx))
             .child(text)
     }
 
@@ -298,8 +299,8 @@ impl EditorApp {
         pdf_page_mode: PageMode,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let text_minor = self.text_minor();
-        let chip_text = self.chip_text();
+        let text_minor = self.text_minor(cx);
+        let chip_text = self.chip_text(cx);
 
         let mut right = div()
             .flex()
@@ -476,9 +477,9 @@ impl EditorApp {
         // 两态共用**同一 Pill 壳**（同 19px 高 / 同内边距 / 同圆角）→ 几何恒定，仅底色与
         // 文字色翻转——与「双页」钮同姿势（消除 纯文字 div ↔ Pill 切换的抖动）。
         let (bg, fg): (gpui::Hsla, gpui::Hsla) = if grid_on {
-            (active_bg, ui::theme::ChromeColors::for_mode(ui::theme::Theme::global(cx).is_dark()).pill_fg.into())
+            (active_bg, ui::theme::Theme::global(cx).chrome.pill_fg.into())
         } else {
-            (gpui::transparent_black(), self.chip_text())
+            (gpui::transparent_black(), self.chip_text(cx))
         };
         ui::Pill::new("status-pdf-grid-btn")
             .size(ui::PillSize::Md)
@@ -533,8 +534,7 @@ impl EditorApp {
         let active_bg: gpui::Hsla = ui::theme::Theme::global(cx).colors.selected_bg.into();
         // 图标颜色跟随文字色（未选中 muted chip_text / 选中 pill_fg），两态图标文字同色不跳。
         let theme = ui::theme::Theme::global(cx);
-        let chrome = ui::theme::ChromeColors::for_mode(theme.is_dark());
-        let pill_fg: gpui::Hsla = chrome.pill_fg.into();
+        let pill_fg: gpui::Hsla = theme.chrome.pill_fg.into();
         let on_click = self.status_pdf_mode_toggle(grid_on, current, target, cx);
 
         // 两态共用**同一 Pill 壳**（同 19px 高 / 同 px_2 内边距 / 同 rounded_sm）→ 几何恒定，
@@ -544,7 +544,7 @@ impl EditorApp {
         let (bg, fg): (gpui::Hsla, gpui::Hsla) = if selected {
             (active_bg, pill_fg)
         } else {
-            (gpui::transparent_black(), self.chip_text())
+            (gpui::transparent_black(), self.chip_text(cx))
         };
         ui::Pill::new(sel)
             .size(ui::PillSize::Md)

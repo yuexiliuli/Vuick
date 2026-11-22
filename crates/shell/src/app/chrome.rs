@@ -51,26 +51,24 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 当前明暗模式对应的外壳配色（[`ui::theme::ChromeColors`] 单一来源，
-    /// 值逐字节保持收编前硬编码；本系列后续步骤的配色地基）。
-    pub(super) fn chrome(&self) -> ChromeColors {
-        if self.model.borrow().dark_mode {
-            ChromeColors::dark()
-        } else {
-            ChromeColors::light()
-        }
+    /// 当前生效主题对应的外壳配色（`ui::theme::Theme::global(cx).chrome` 单一来源；
+    /// 默认零覆盖时与旧 `ChromeColors::for_mode(model.dark_mode)` 逐字节一致，
+    /// 自定义重点色经 `refresh_theme_ui` 的 `Theme::apply` 合并后由此处全程可见——
+    /// 自定义 `chrome.*` 覆盖对外壳的消费面统一生效（P1-1）。
+    pub(super) fn chrome(&self, cx: &App) -> ChromeColors {
+        ui::theme::Theme::global(cx).chrome
     }
 
     /// 窗口整体背景（编辑区以外的画布）。
     /// `#[doc(hidden)] pub`：`tests/pdf.rs` 主题切换背景断言（§8.6 外提清单）。
     #[doc(hidden)]
-    pub fn window_bg(&self) -> gpui::Hsla {
-        self.chrome().window_bg.into()
+    pub fn window_bg(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).window_bg.into()
     }
 
     /// Win11 Mica chrome 透明度（亮 0.86 / 暗 0.82）：半透明才能透出系统 Mica 材质。
-    pub(super) fn mica_alpha(&self) -> f32 {
-        if self.model.borrow().dark_mode {
+    pub(super) fn mica_alpha(&self, cx: &App) -> f32 {
+        if ui::theme::Theme::global(cx).is_dark() {
             ui::theme::MICA_CHROME_ALPHA_DARK
         } else {
             ui::theme::MICA_CHROME_ALPHA_LIGHT
@@ -78,11 +76,11 @@ impl EditorApp {
     }
     /// 标题栏/选项卡栏/侧栏工具条背景（Mica 半透明版；暗色主题改用 theme `chrome_bg`
     /// #191A1B（原 config `CHROME_BG_DARK`，常量已删）的不透明统一底色）。
-    pub(super) fn mica_bar_bg(&self) -> gpui::Hsla {
-        if self.model.borrow().dark_mode {
-            ui::theme::ChromeColors::for_mode(true).chrome_bg.into()
+    pub(super) fn mica_bar_bg(&self, cx: &App) -> gpui::Hsla {
+        if ui::theme::Theme::global(cx).is_dark() {
+            ui::theme::Theme::global(cx).chrome.chrome_bg.into()
         } else {
-            self.bar_bg().opacity(self.mica_alpha())
+            self.bar_bg(cx).opacity(self.mica_alpha(cx))
         }
     }
 
@@ -95,9 +93,9 @@ impl EditorApp {
     /// **不再重建 64 个 band Div / 重算插值**；只有高度桶或明暗主题变化才重算段数组。
     /// 失效面枚举：窗口高度（桶）变化 / 明暗主题切换 两维 → 重算，其余（滚动、内容变化、
     /// 鼠标移动、桶内小幅 resize）一律复用。
-    pub(super) fn render_material_layer(&mut self, window: &Window) -> impl IntoElement {
-        let dark = self.model.borrow().dark_mode;
-        let chrome = self.chrome();
+    pub(super) fn render_material_layer(&mut self, window: &Window, cx: &App) -> impl IntoElement {
+        let dark = ui::theme::Theme::global(cx).is_dark();
+        let chrome = self.chrome(cx);
         let top: gpui::Hsla = chrome.material_top.into();
         let bottom: gpui::Hsla = chrome.material_bottom.into();
         let h = window.bounds().size.height.as_f32();
@@ -119,41 +117,44 @@ impl EditorApp {
     }
 
     /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景。
-    pub(super) fn bar_bg(&self) -> gpui::Hsla {
-        self.chrome().bar_bg.into()
+    pub(super) fn bar_bg(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).bar_bg.into()
     }
 
     /// 工具条分隔边框。
-    pub(super) fn bar_border(&self) -> gpui::Hsla {
-        self.chrome().bar_border.into()
+    pub(super) fn bar_border(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).bar_border.into()
     }
 
     /// 区域分隔发丝线（`ChromeColors::hairline` 语义 token、按明暗主题取色，
     /// **不透明** —— 半透明叠不同底色会混出各自的灰色，这里统一成全屏一致的发丝线；
     /// 标题栏底 / 编辑区顶边 / 侧栏右缘 / 状态栏边框共用）。
-    pub(super) fn hairline(&self) -> gpui::Hsla {
-        self.chrome().hairline.into()
+    pub(super) fn hairline(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).hairline.into()
     }
 
     /// 编辑器/预览面板背景（暗色主题 = theme `editor_bg`（原 config `EDITOR_BG_DARK`
     /// #121314，常量已删）统一底色）。
-    pub(super) fn panel_bg(&self) -> gpui::Hsla {
-        ui::shell::content_bg(self.model.borrow().dark_mode, self.chrome().panel_bg.into())
+    pub(super) fn panel_bg(&self, cx: &App) -> gpui::Hsla {
+        ui::shell::content_bg(
+            ui::theme::Theme::global(cx).is_dark(),
+            self.chrome(cx).panel_bg.into(),
+        )
     }
 
     /// 主要文字颜色。
-    pub(super) fn text_primary(&self) -> gpui::Hsla {
-        self.chrome().text_primary.into()
+    pub(super) fn text_primary(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).text_primary.into()
     }
 
     /// 次要/弱化文字颜色。
-    pub(super) fn text_minor(&self) -> gpui::Hsla {
-        self.chrome().text_minor.into()
+    pub(super) fn text_minor(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).text_minor.into()
     }
 
     /// 芯片上的文字颜色。
-    pub(super) fn chip_text(&self) -> gpui::Hsla {
-        self.chrome().chip_text.into()
+    pub(super) fn chip_text(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).chip_text.into()
     }
 
     /// 切换黑白（深色/浅色）主题：作为 light↔dark 两态切换（退出「跟随」），
@@ -182,23 +183,37 @@ impl EditorApp {
         self.persist_prefs();
     }
 
-    /// 把当前 `dark_mode` 落地到全局主题 + 刷新所有预览背景
-    /// （toggle / 跟随系统 / 启动恢复共用同一入口）。
+    /// 把当前「有效主题」（明暗档 + 人格预设 + 自定义覆盖）落到底到全局主题 + 刷新
+    /// 所有预览背景（toggle / 跟随系统 / 启动恢复 / 导入设置共用同一入口）。
     /// `#[doc(hidden)] pub`：`tests/pdf.rs` 主题刷新后落位断言（§8.6 外提清单）。
     #[doc(hidden)]
     pub fn refresh_theme_ui(&mut self, cx: &mut Context<Self>) {
-        ui::theme::Theme::set(
-            if self.model.borrow().dark_mode {
-                ui::theme::ThemeMode::Dark
-            } else {
-                ui::theme::ThemeMode::Light
-            },
-            cx,
-        );
+        // 从模型组装主题规格：mode = 当前明暗档；preset = 按 model.theme_preset 解析
+        // （未知 id 兜底 `PRESETS[0]` = default）；custom = model.theme_custom（经
+        // `ColorToken` 校验只保留合法 key，把运行时 `String` 键回收成 `&'static str`
+        // 键——不泄漏、未知 key 丢弃，与 `merge_spectrum`/`merge_chrome` 跳过语义一致）。
+        // 合并只在本次调用跑一次，渲染只读 `Theme::global(cx)` 产物（性能纪律：非每帧）。
+        let model = self.model.borrow();
+        let mode = if model.dark_mode {
+            ui::theme::ThemeMode::Dark
+        } else {
+            ui::theme::ThemeMode::Light
+        };
+        let preset = ui::theme::PRESETS
+            .iter()
+            .find(|p| p.id == model.theme_preset)
+            .unwrap_or(&ui::theme::PRESETS[0]);
+        let custom = model
+            .theme_custom
+            .iter()
+            .filter_map(|(k, v)| ui::theme::ColorToken::from_key(k).map(|tok| (tok.key(), v.clone())))
+            .collect();
+        drop(model);
+        ui::theme::Theme::apply(ui::theme::ThemeSpec { mode, preset, custom }, cx);
         // 刷新所有预览/WYSIWYG 的调色主题：`WyTheme` 在创建时从 `StyleParams` 一次性
         // 派生并缓存，主题切换后必须重建（MD / EPUB 统一走 `WyEditor`；`MarkdownPreview`
         // 后端已删，M5-B5 P4-2）。PDF 画布用灰色系（window_bg）与"纸面"卡片分隔。
-        let canvas_bg = self.window_bg();
+        let canvas_bg = self.window_bg(cx);
         for tab in &self.model.borrow().tabs {
             // A2/A4：右栏统一 WyEditor 预览（md_wy）与 WYSIWYG 活区（live2）的调色主题
             //（原先只刷背景，内容色滞后 →"切换黑白后预览不完全重染色/用旧色"）。
@@ -288,10 +303,10 @@ impl EditorApp {
         kind: WinCtrlKind,
         icon: IconName,
     ) -> gpui::AnyElement {
-        let c = self.chrome();
+        let c = self.chrome(cx);
         let is_close = kind.is_close();
-        let primary = self.text_primary();
-        let minor = self.text_minor();
+        let primary = self.text_primary(cx);
+        let minor = self.text_minor(cx);
         // 测试可读：本帧解析出的图标前景色在 `icon_color_for` 闭包写入 probe（闭包在
         // `.build(window, cx)` 同步调用 = render 期），随构建一并落盘 app 实体——
         // 断言「注入」仍走真实渲染路径。
@@ -344,8 +359,8 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let text_minor = self.text_minor();
-        let c = self.chrome();
+        let text_minor = self.text_minor(cx);
+        let c = self.chrome(cx);
         let hover_fill: gpui::Hsla = c.hover_fill.into();
         // 侧边栏「展开/收起」开关：收拢时显示打开图标（点击展开），展开时显示收起图标。
         // 自绘图标按钮（非 window_control_area，普通点击交互）。P2-10：hover 淡入；
@@ -406,9 +421,9 @@ impl EditorApp {
             // 只留左内边距：Win11 Fluent 自绘标题栏下，窗口控制钮（最小化/最大化/
             // 关闭）右缘应贴齐窗口右缘，右内边距会在关闭钮右侧留 8px 可见 gap。
             .pl_2()
-            .bg(self.mica_bar_bg())
+            .bg(self.mica_bar_bg(cx))
             .border_b_1()
-            .border_color(self.hairline())
+            .border_color(self.hairline(cx))
             // 窗口最顶部最左：应用图标（内嵌 128×128 ICO 变色龙，ui::assets 同源）。
             .child(ui::assets::app_icon_element(px(18.)))
             .child(self.render_menu_buttons(cx))

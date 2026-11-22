@@ -10,7 +10,7 @@
 //! / [`LIVE_BODY_PAD_Y`]）下沉至此，宿主以重导出维持既有路径。
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -215,6 +215,15 @@ pub struct AppModel {
     pub dark_mode: bool,
     /// 主题偏好三态：Follow=跟随系统 / Light / Dark。
     pub theme_pref: ThemePref,
+    /// 全站主题人格预设 id（`default`/`music`/`ocean`/`solar`/`rose`/`graphite`；与
+    /// [`config::user::UserPrefs::theme_preset`] 对应，未知 id 由宿主 refresh_theme_ui 兜底 default）。
+    pub theme_preset: String,
+    /// 全站主题自定义色覆盖：token key → `#rrggbb`（与
+    /// [`config::user::UserPrefs::theme_custom`] 对应；`refresh_theme_ui` 合并注入）。
+    pub theme_custom: BTreeMap<String, String>,
+    /// 音乐窗口皮肤预设 id（默认 `music`；与 [`config::user::UserPrefs::music_skin`]
+    /// 对应，本 slice 只持久化、不消费——阶段②音乐线接管）。
+    pub music_skin: String,
     /// 编辑区是否自动换行（默认换行）。
     pub wrap_enabled: bool,
     /// 「恢复上次会话」开关（文件 → 菜单切换，随 [`UserPrefs`] 持久化）。
@@ -331,6 +340,9 @@ impl AppModel {
         font_size: f32,
         dark_mode: bool,
         theme_pref: ThemePref,
+        theme_preset: String,
+        theme_custom: BTreeMap<String, String>,
+        music_skin: String,
         pdf_bg: PdfBgPref,
         pdf_bg_custom: Option<String>,
         session_restore: bool,
@@ -354,6 +366,9 @@ impl AppModel {
             font_size,
             dark_mode,
             theme_pref,
+            theme_preset,
+            theme_custom,
+            music_skin,
             // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。
             wrap_enabled: false,
             session_restore,
@@ -542,6 +557,9 @@ impl Default for AppModel {
             font_size: 0.0,
             dark_mode: false,
             theme_pref: ThemePref::Follow,
+            theme_preset: "default".to_string(),
+            theme_custom: BTreeMap::new(),
+            music_skin: "music".to_string(),
             wrap_enabled: false,
             session_restore: true,
             close_to_tray: false,
@@ -810,7 +828,7 @@ pub struct TabDragGhost {
 impl Render for TabDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ui::theme::Theme::global(cx);
-        let c = ui::theme::ChromeColors::for_mode(theme.is_dark());
+        let c = theme.chrome;
         let s = self.size.get();
         let w = if s.width > px(0.) { s.width } else { px(120.) };
         let h = if s.height > px(0.) { s.height } else { px(26.) };

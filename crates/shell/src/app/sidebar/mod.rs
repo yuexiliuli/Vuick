@@ -381,7 +381,7 @@ impl EditorApp {
             // 顶边 1px 发丝线 = 选项卡栏↔编辑区之分隔（由后绘制的编辑区绘制，
             // 保证不受上层选项卡栏遮挡）；其余三边由侧栏右缘/状态栏顶边承担，不重复。
             .border_t_1()
-            .border_color(self.hairline())
+            .border_color(self.hairline(cx))
             .bg(ui::shell::body_card_face(cx))
             .overflow_hidden()
             .child(body)

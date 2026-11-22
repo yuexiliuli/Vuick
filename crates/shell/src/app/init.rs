@@ -93,6 +93,10 @@ impl EditorApp {
             start_dark,
             // 手动切主题会退到强制档；此处仅为「跟随 / 强制」的偏好记录。
             prefs.theme,
+            // 全站主题（人格预设 / 自定义覆盖 / 音乐皮肤）：随偏好恢复，refresh_theme_ui 消费。
+            prefs.theme_preset.clone(),
+            prefs.theme_custom.clone(),
+            prefs.music_skin.clone(),
             // PDF 画布背景偏好：启动即随配置恢复（默认跟随主题；显式档在打开时冻结）。
             prefs.pdf_bg,
             prefs.pdf_bg_custom.clone(),
@@ -229,19 +233,25 @@ impl EditorApp {
         }
         // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，
         // 首帧前完成，避免「先亮后暗」闪一下）。
-        // 主题模式未变则跳过 `Theme::set`：它内部会 `refresh_windows`（入队 RefreshWindows
-        // 效果），构造期入队的该效果会在 `open_window` 同步首帧**之后**才 flush → 新窗口
-        // 白画一整帧冗余重绘（大档拆窗松手延时的大头之一）。跳过不丢视觉（同模式同色板）。
-        let want_dark = app.model.borrow().dark_mode;
-        if ui::theme::Theme::global(cx).is_dark() != want_dark {
-            ui::theme::Theme::set(
-                if want_dark {
-                    ui::theme::ThemeMode::Dark
-                } else {
-                    ui::theme::ThemeMode::Light
-                },
-                cx,
-            );
+        // 守卫 =「有效主题」是否相对当前全局有变化：明暗档 / 人格预设 / 自定义覆盖任一维。
+        // Theme::apply 内部会 `refresh_windows`（入队 RefreshWindows 效果），构造期入队的
+        // 该效果会在 `open_window` 同步首帧**之后**才 flush → 新窗口白画一整帧冗余重绘
+        //（大档拆窗松手延时的大头之一）。跳过不丢视觉（同主题同色板）。
+        // P1-3：「默认亮档 + 自定义重点色」重启时暗档相同但 custom 非空 → 仍须 apply
+        //（旧守卫只看 is_dark 会跳过，preset/custom 不生效）。
+        let theme_changed = {
+            let model = app.model.borrow();
+            let preset_is_default = ui::theme::PRESETS
+                .iter()
+                .find(|p| p.id == model.theme_preset)
+                .map(|p| p.id == "default")
+                .unwrap_or(true);
+            ui::theme::Theme::global(cx).is_dark() != model.dark_mode
+                || !preset_is_default
+                || !model.theme_custom.is_empty()
+        };
+        if theme_changed {
+            app.refresh_theme_ui(cx);
         }
         // 运行中跟随系统深浅色：事件订阅（Windows 经 WM_SETTINGCHANGE 驱动）。
         // 仅在「跟随」模式生效；强制档下外观变化被忽略，切回跟随由

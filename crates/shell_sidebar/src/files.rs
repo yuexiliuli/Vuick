@@ -11,8 +11,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use gpui::{
-    div, px, AnimationExt, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px, AnimationExt, App, Context, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use ui::icon::{Icon, IconName};
 use ui::input::{Input, InputState};
@@ -28,9 +28,9 @@ use crate::toc::{TOC_BAND_BUFFER, TOC_VIRTUALIZE_MIN};
 
 impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     /// 「文件」视图顶栏：「文件」标题 + 根目录名（路径尾段，超长省略）。
-    fn render_sidebar_files_header(&self, sb: &SidebarChromeState) -> impl IntoElement {
-        let (fg, muted) = (self.text_primary(), self.text_minor());
-        let border = self.bar_border();
+    fn render_sidebar_files_header(&self, sb: &SidebarChromeState, cx: &App) -> impl IntoElement {
+        let (fg, muted) = (self.text_primary(cx), self.text_minor(cx));
+        let border = self.bar_border(cx);
         let root = sb
             .files
             .root
@@ -112,8 +112,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (fg, muted) = (self.text_primary(), self.text_minor());
-        let active_bg = self.tab_active_bg();
+        let (fg, muted) = (self.text_primary(cx), self.text_minor(cx));
+        let active_bg = self.tab_active_bg(cx);
         let content: gpui::AnyElement = if sb.files.root.is_none() {
             self.sidebar_files_empty(sb, window, cx)
         } else {
@@ -185,7 +185,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             .overflow_hidden()
             .flex()
             .flex_col()
-            .child(self.render_sidebar_files_header(sb))
+            .child(self.render_sidebar_files_header(sb, cx))
             .child(self.render_files_filter_input(sb, &files_filter_state, window, cx))
             .child(self.wrap_files_scroll(sb, content))
             // P2-10：面板开合轻淡入（同目录/搜索面板）。
@@ -459,7 +459,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         }
         let search = files_filter_state.clone();
         let handle = files_filter_state.read(cx).focus_handle(cx);
-        let border_color = ui::focus_border_color(window, &handle, self.bar_border(), cx);
+        let border_color = ui::focus_border_color(window, &handle, self.bar_border(cx), cx);
         div()
             .id("sidebar-files-filter-input")
             .debug_selector(|| "sidebar-files-filter-input".into())

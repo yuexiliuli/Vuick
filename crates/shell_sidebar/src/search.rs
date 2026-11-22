@@ -93,13 +93,13 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let muted = self.text_minor();
+        let muted = self.text_minor(cx);
         let query = self.model.borrow().search_committed.clone();
         let search = self.search_input.clone();
         // Fluent 文本框：整圈细边框 + 内缩边距（背景随 chrome 保持透明）；
         // 聚焦时边框点亮为强调色（聚焦边框色经 ui::focus_border_color 统一收敛）。
         let handle = self.search_input.read(cx).focus_handle(cx);
-        let border_color = ui::focus_border_color(window, &handle, self.bar_border(), cx);
+        let border_color = ui::focus_border_color(window, &handle, self.bar_border(cx), cx);
         let input = div()
             .id("sidebar-search-input")
             .debug_selector(|| "sidebar-search-input".into())
@@ -181,8 +181,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (fg, muted) = (self.text_primary(), self.text_minor());
-        let active_bg = self.tab_active_bg();
+        let (fg, muted) = (self.text_primary(cx), self.text_minor(cx));
+        let active_bg = self.tab_active_bg(cx);
         let has_folder = sb.files.root.is_some();
         let scope = effective_search_scope(&self.model.borrow(), sb);
         let view_id = window.current_view();
@@ -311,8 +311,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         q: &str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (fg, muted) = (self.text_primary(), self.text_minor());
-        let active_bg = self.tab_active_bg();
+        let (fg, muted) = (self.text_primary(cx), self.text_minor(cx));
+        let active_bg = self.tab_active_bg(cx);
         // PDF 标签：全文检索由 PdfViewer 后台执行（文本在 pdfium 里，不在 tab.content）。
         // 查询按（标签, 词）键控、变化才推送（阅读器内部 250ms 防抖）；侧边栏只展示
         // 计数/页列表并驱动跳转。结果异步到达 → 经对应 PDF 选项卡的 `_pdf_sub` 订阅
@@ -412,7 +412,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         };
         // 扫描进行中且尚无任何命中 → 「搜索中…」占位（有命中则走汇总头计数 + 分组行）。
         if scan.running && scan.total_hits == 0 {
-            return self.folder_search_loading(sb);
+            return self.folder_search_loading(sb, cx);
         }
         if scan.total_hits == 0 {
             return self.wrap_search_scroll(
@@ -426,8 +426,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
                 ),
             );
         }
-        let (fg, muted) = (self.text_primary(), self.text_minor());
-        let active_bg = self.tab_active_bg();
+        let (fg, muted) = (self.text_primary(cx), self.text_minor(cx));
+        let active_bg = self.tab_active_bg(cx);
         let rows = self.sidebar_folder_file_rows(window, &scan, fg, muted, active_bg, cx);
         let inner = div()
             .child(self.sidebar_folder_search_summary(&scan, muted))
@@ -436,8 +436,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     }
 
     /// 文件夹搜索「搜索中…」占位（扫描进行中、尚无命中时的整块提示）。
-    fn folder_search_loading(&self, sb: &SidebarChromeState) -> gpui::AnyElement {
-        let muted = self.text_minor();
+    fn folder_search_loading(&self, sb: &SidebarChromeState, cx: &App) -> gpui::AnyElement {
+        let muted = self.text_minor(cx);
         let container = div()
             .id("sidebar-search-loading")
             .debug_selector(|| "sidebar-search-loading".into())
@@ -894,8 +894,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         q: &str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (fg, muted) = (self.text_primary(), self.text_minor());
-        let active_bg = self.tab_active_bg();
+        let (fg, muted) = (self.text_primary(cx), self.text_minor(cx));
+        let active_bg = self.tab_active_bg(cx);
         let (count, truncated, active) = pdf.read(cx).search_summary();
         let snippets: Vec<(usize, String)> = pdf.read(cx).search_snippets();
 

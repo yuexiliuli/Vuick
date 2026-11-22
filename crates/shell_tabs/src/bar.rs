@@ -25,7 +25,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
-    div, px, AnimationExt, AppContext, Bounds, Context, CursorStyle, InteractiveElement,
+    div, px, AnimationExt, App, AppContext, Bounds, Context, CursorStyle, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, SharedString,
     StatefulInteractiveElement, Styled, WeakEntity, Window,
 };
@@ -83,19 +83,16 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         self.host.clone()
     }
 
-    /// 当前明暗模式对应的外壳配色（`ui::theme::ChromeColors` 单一来源，与宿主
-    /// `EditorApp::chrome` 同口径：只读 `model.dark_mode`）。
-    fn chrome(&self) -> ChromeColors {
-        if self.model.borrow().dark_mode {
-            ChromeColors::dark()
-        } else {
-            ChromeColors::light()
-        }
+    /// 当前生效主题对应的外壳配色（`ui::theme::Theme::global(cx).chrome` 单一来源，与宿主
+    /// `EditorApp::chrome` 同口径；默认零覆盖 = 旧 `ChromeColors::for_mode(dark_mode)`，
+    /// 自定义 `chrome.*` 覆盖经 apply 合并后在此统一可见——自定义重点色对外壳全程生效）。
+    fn chrome(&self, cx: &App) -> ChromeColors {
+        ui::theme::Theme::global(cx).chrome
     }
 
     /// Win11 Mica chrome 透明度（亮 0.86 / 暗 0.82）：半透明才能透出系统 Mica 材质。
-    fn mica_alpha(&self) -> f32 {
-        if self.model.borrow().dark_mode {
+    fn mica_alpha(&self, cx: &App) -> f32 {
+        if ui::theme::Theme::global(cx).is_dark() {
             ui::theme::MICA_CHROME_ALPHA_DARK
         } else {
             ui::theme::MICA_CHROME_ALPHA_LIGHT
@@ -103,48 +100,48 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
     }
 
     /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景。
-    fn bar_bg(&self) -> gpui::Hsla {
-        self.chrome().bar_bg.into()
+    fn bar_bg(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).bar_bg.into()
     }
 
     /// 标题栏/选项卡栏/侧栏工具条背景（Mica 半透明版；暗色主题改用 theme `chrome_bg`
     /// #191A1B 的不透明统一底色）。
-    fn mica_bar_bg(&self) -> gpui::Hsla {
-        if self.model.borrow().dark_mode {
-            ui::theme::ChromeColors::for_mode(true).chrome_bg.into()
+    fn mica_bar_bg(&self, cx: &App) -> gpui::Hsla {
+        if ui::theme::Theme::global(cx).is_dark() {
+            ui::theme::Theme::global(cx).chrome.chrome_bg.into()
         } else {
-            self.bar_bg().opacity(self.mica_alpha())
+            self.bar_bg(cx).opacity(self.mica_alpha(cx))
         }
     }
 
     /// 主要文字颜色。
-    fn text_primary(&self) -> gpui::Hsla {
-        self.chrome().text_primary.into()
+    fn text_primary(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).text_primary.into()
     }
 
     /// 次要/弱化文字颜色。
-    fn text_minor(&self) -> gpui::Hsla {
-        self.chrome().text_minor.into()
+    fn text_minor(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).text_minor.into()
     }
 
     /// 激活选项卡背景。
-    fn tab_active_bg(&self) -> gpui::Hsla {
-        self.chrome().tab_active_bg.into()
+    fn tab_active_bg(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).tab_active_bg.into()
     }
 
     /// 激活选项卡边框。
-    fn tab_active_border(&self) -> gpui::Hsla {
-        self.chrome().tab_active_border.into()
+    fn tab_active_border(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).tab_active_border.into()
     }
 
     /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
-    fn bar_colors(&self, _cx: &mut Context<Self>) -> TabBarColors {
-        let c = self.chrome();
+    fn bar_colors(&self, cx: &mut Context<Self>) -> TabBarColors {
+        let c = self.chrome(cx);
         TabBarColors {
-            text_primary: self.text_primary(),
-            text_minor: self.text_minor(),
-            tab_active_bg: self.tab_active_bg(),
-            tab_active_border: self.tab_active_border(),
+            text_primary: self.text_primary(cx),
+            text_minor: self.text_minor(cx),
+            tab_active_bg: self.tab_active_bg(cx),
+            tab_active_border: self.tab_active_border(cx),
             hover_fill: c.hover_fill.into(),
             reorder_line: c.tab_reorder_line.into(),
         }
@@ -482,11 +479,11 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
             return None;
         }
         let eye_color: gpui::Hsla = if preview_on {
-            self.chrome().pill_fg.into()
+            self.chrome(cx).pill_fg.into()
         } else {
-            self.chrome().text_tertiary.into()
+            self.chrome(cx).text_tertiary.into()
         };
-        let hover_fill: gpui::Hsla = self.chrome().hover_fill.into();
+        let hover_fill: gpui::Hsla = self.chrome(cx).hover_fill.into();
         // P2-10：hover 状态跨帧记录 → 背景淡入（统一走 ui::motion::hoverable 接线：
         // 状态键/弹簧键由元素 id 派生、只在悬停态实际翻转时 notify 宿主）。
         Some(
@@ -536,13 +533,17 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
 
     /// 横向滚动条自动隐藏：只在标签超宽 + （最近滚动 / 正在拖拽滑块）时出现；
     /// 半透明、贴着标签底部、浮在上方（不额外占高度）。
-    fn render_tab_bar_hscroll_overlay(&self, hscroll: &TableScrollState) -> Option<gpui::AnyElement> {
+    fn render_tab_bar_hscroll_overlay(
+        &self,
+        hscroll: &TableScrollState,
+        cx: &App,
+    ) -> Option<gpui::AnyElement> {
         let hscroll_dragging = hscroll.drag.borrow().is_some();
         if hscroll.handle.max_offset().x > px(0.)
             && (*hscroll.visible.borrow() || hscroll_dragging)
         {
             // 滑块底色取主题语义 token（ChromeColors::scrollbar_thumb，亮暗同值）。
-            let thumb = ChromeColors::for_mode(self.model.borrow().dark_mode).scrollbar_thumb;
+            let thumb = ui::theme::Theme::global(cx).chrome.scrollbar_thumb;
             Some(
                 div()
                     .absolute()
@@ -660,7 +661,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
 
         // 横向滚动条自动隐藏：只在标签超宽 + （最近滚动 / 正在拖拽滑块）时出现。
         let mut hscroll_overlay: Vec<gpui::AnyElement> = Vec::new();
-        if let Some(o) = self.render_tab_bar_hscroll_overlay(hscroll) {
+        if let Some(o) = self.render_tab_bar_hscroll_overlay(hscroll, cx) {
             hscroll_overlay.push(o);
         }
 
@@ -675,7 +676,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
             .flex()
             .items_center()
             .gap_1()
-            .bg(self.mica_bar_bg())
+            .bg(self.mica_bar_bg(cx))
             // 右键整条栏（含点在各选项卡上，事件冒泡到这）→ 「新建文件 / 打开文件」上下文菜单
             .on_mouse_down(
                 MouseButton::Right,

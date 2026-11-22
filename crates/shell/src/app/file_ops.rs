@@ -1129,7 +1129,7 @@ impl EditorApp {
             self.model.borrow_mut().pdf_search = None; // 新 PDF 阅读器 → 需重新推送查询
         }
         // 阅读画布用灰色系（非白面板），让阅读器与画布形成分隔（PDF / 图片 / 视频同源）
-        let canvas_bg = self.window_bg();
+        let canvas_bg = self.window_bg(cx);
         // 公共字段统一重置（编辑区置空 + markdown 语言 + 文件路径/计数 + 预览全屏只读）。
         // 选项卡不存在 → 早退（与旧逐条 load_* 一致：不创建查看器实体）。
         if !self.reset_common_tab_fields(idx, p, SharedString::default(), 0, 0, cx) {

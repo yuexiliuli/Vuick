@@ -174,6 +174,11 @@ impl EditorApp {
             // 主题即时生效：偏好三态落地 + 刷新全局主题与各预览/画布背景。
             self.model.borrow_mut().theme_pref = prefs.theme;
             self.model.borrow_mut().dark_mode = prefs.theme.resolved_dark(cx.window_appearance());
+            // 全站主题（人格预设 / 自定义覆盖 / 音乐皮肤）随导入即时生效：dark_mode 已按
+            // theme 三态落地，`refresh_theme_ui` 据 model 组装有效拼 spec（preset/custom）。
+            self.model.borrow_mut().theme_preset = prefs.theme_preset;
+            self.model.borrow_mut().theme_custom = prefs.theme_custom;
+            self.model.borrow_mut().music_skin = prefs.music_skin;
             // PDF 画布背景偏好：**先于** refresh_theme_ui 落地（其 default 守卫按新值走），
             // 之后再按偏好应用显式色到各 PDF 画布（default 档由守卫回落主题）。
             self.model.borrow_mut().pdf_bg = prefs.pdf_bg;

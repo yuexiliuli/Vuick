@@ -66,8 +66,8 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let model = self.model.clone();
-        let panel_bg = self.panel_bg();
-        let text_primary = self.text_primary();
+        let panel_bg = self.panel_bg(cx);
+        let text_primary = self.text_primary(cx);
         shell_preview::render::render_live_area(
             &model, ed, window, grow, cx, panel_bg, text_primary,
         )
@@ -94,7 +94,7 @@ impl EditorApp {
             .flex_grow(grow)
             .min_w(px(0.))
             .min_h(px(0.))
-            .bg(self.panel_bg())
+            .bg(self.panel_bg(cx))
             // 无边框、无圆角：编辑区占满整块区域，不留白
             .overflow_hidden()
             // 从资源管理器拖入文件 → 打开（编辑器自身不接收拖放）
@@ -135,7 +135,7 @@ impl EditorApp {
     /// `drag_hover_border` 强调色；命中区 / 拖拽逻辑完全不变（`w(6)` 命中带 +
     /// 容器 `on_mouse_move/up` 换算分屏比例）。
     pub(super) fn render_splitter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = self.bar_border();
+        let border = self.bar_border(cx);
         let drag_line: gpui::Hsla =
             ui::theme::Theme::global(cx).colors.drag_hover_border.into();
         let line_color: gpui::Hsla = if self.panes.splitter_hovered || self.panes.split_drag.is_some()
@@ -193,9 +193,9 @@ impl EditorApp {
         // 叠层为直接子件），避免旧包裹（flex-row + 内层相对块）在 gpui 测量时为
         // WyEditor 交替提供 definite 宽度（800↔388/440），导致帧缓存每键 ×7 重建。
         if self.md_wy_preview().is_some() {
-            let panel_bg = self.panel_bg();
-            let text_primary = self.text_primary();
-            let text_minor = self.text_minor();
+            let panel_bg = self.panel_bg(cx);
+            let text_primary = self.text_primary(cx);
+            let text_minor = self.text_minor(cx);
             return shell_preview::render::md_wy_host_children(
                 &self.model, window, cx, false, grow, panel_bg, text_primary, text_minor,
             );
@@ -205,7 +205,7 @@ impl EditorApp {
             .id("preview-pane")
             .flex_1()
             .min_w(px(0.))
-            .bg(self.panel_bg())
+            .bg(self.panel_bg(cx))
             .relative()
             // PDF → PdfViewer（整页原样）；其余 → Markdown 渲染器。
             // Entity 直接作为子元素渲染（内部 size_full）。
@@ -249,9 +249,9 @@ impl EditorApp {
     ) -> gpui::AnyElement {
         if self.md_wy_preview().is_some() {
             // A2：Markdown 全屏预览同样切统一组件 WyEditor（宿主滚动；结构与右栏同源）。
-            let panel_bg = self.panel_bg();
-            let text_primary = self.text_primary();
-            let text_minor = self.text_minor();
+            let panel_bg = self.panel_bg(cx);
+            let text_primary = self.text_primary(cx);
+            let text_minor = self.text_minor(cx);
             return shell_preview::render::md_wy_host_children(
                 &self.model, window, cx, true, 1.0, panel_bg, text_primary, text_minor,
             );
@@ -262,7 +262,7 @@ impl EditorApp {
             cx.notify();
         }
         // 全屏阅读（PDF / 图片 / 视频）：自包含阅读器自处理缩放，无需全局字号推进。
-        let panel_bg = self.panel_bg();
+        let panel_bg = self.panel_bg(cx);
         let m = self.model.borrow();
         let tab = &m.tabs[m.active_tab];
         let mut el = div()

@@ -139,9 +139,9 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
     }
 
     /// 目录视图顶栏：「目录」标题。开关交给左侧竖列「目录」按钮（再点一次收拢侧边栏）。
-    fn render_sidebar_toc_header(&mut self) -> impl IntoElement {
-        let fg = self.text_primary();
-        let border = self.bar_border();
+    fn render_sidebar_toc_header(&mut self, cx: &App) -> impl IntoElement {
+        let fg = self.text_primary(cx);
+        let border = self.bar_border(cx);
         crate::header::sidebar_panel_header(
             "sidebar-toc-header",
             "目录",
@@ -161,8 +161,8 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (fg, muted) = (self.text_primary(), self.text_minor());
-        let active_bg = self.tab_active_bg();
+        let (fg, muted) = (self.text_primary(cx), self.text_minor(cx));
+        let active_bg = self.tab_active_bg(cx);
         let accent = ui::theme::Theme::global(cx).colors.accent.into();
 
         // 折叠状态按文档缓存：切换文档即清空，并重新按新文档内容自适应宽度
@@ -364,7 +364,7 @@ impl<H: SidebarHost + FileTreePromptHost> Sidebar<H> {
             .overflow_hidden()
             .flex()
             .flex_col()
-            .child(self.render_sidebar_toc_header())
+            .child(self.render_sidebar_toc_header(cx))
             // 滚动条只覆盖面板内容区（不含头部），故把滚动容器 + 滚动条叠层包进
             // `relative` 包装层（对齐 panes/editor：叠层为滚动容器的兄弟、`absolute inset_0`）。
             // 结构/样式收敛到 ui::scroll_panel::ScrollPanelBuilder：三层 id 显式覆盖为

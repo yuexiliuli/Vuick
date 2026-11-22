@@ -292,8 +292,8 @@
                     .last_title_ctrl_fg
                     .expect("标题栏渲染后应落盘窗口钮前景色")
             });
-        let minor = cx.update(|_w, cx| app.read(cx).text_minor());
-        let primary = cx.update(|_w, cx| app.read(cx).text_primary());
+        let minor = cx.update(|_w, cx| app.read(cx).text_minor(cx));
+        let primary = cx.update(|_w, cx| app.read(cx).text_primary(cx));
         assert!(
             same_color(idle.minimize, minor) && same_color(idle.close, minor),
             "空闲时窗口钮图标应为次要灰，实际 min={:?} close={:?}",
