@@ -139,6 +139,11 @@ pub struct UserPrefs {
     pub music_window_size: Option<(f32, f32)>,
     /// 视频窗口的已记录尺寸（与 [`UserPrefs::music_window_size`] 对称，音乐/视频分开）。
     pub video_window_size: Option<(f32, f32)>,
+    /// 主窗口的已记录尺寸（逻辑像素 w×h；[`UserPrefs::main_window_size`]）。
+    /// `Some((w, h))` = 用户把主窗口 resize 后自动记录，下次启动按该尺寸（居中）打开；
+    /// `None` = 从未记录，主窗口用默认 980×720。
+    /// 非法值（非数组 / 非两个数 / NaN / 负 / 零 / ∞）一律回退 `None`。
+    pub main_window_size: Option<(f32, f32)>,
     /// 打开文件夹的根路径（侧边栏「文件」视图）。跨重启恢复文件树；`None` = 未打开过。
     pub opened_folder: Option<String>,
     /// 最近打开的文件夹路径（新→旧，至多 [`RECENT_MAX`] 条）。
@@ -370,6 +375,9 @@ impl UserPrefs {
         // NaN / 负 / 零 / ∞ 一律回退 None（安全护栏）。
         prefs.music_window_size = Self::read_size_tuple(map, "music_window_size");
         prefs.video_window_size = Self::read_size_tuple(map, "video_window_size");
+        // 主窗口记录尺寸（与媒体窗口同款安全护栏：数组 `[w, h]`；缺省 / 非数组 /
+        // 非两个数 / NaN / 负 / 零 / ∞ 一律回退 None）。
+        prefs.main_window_size = Self::read_size_tuple(map, "main_window_size");
         // 最近打开（文件夹 / 文件）：读取字符串数组，非数组 / 缺省 → 空；
         // 元素非字符串跳过；截断至 RECENT_MAX（安全护栏，防手改配置超长）。
         prefs.recent_folders = Self::read_string_array(map, "recent_folders", RECENT_MAX);
@@ -443,6 +451,7 @@ impl UserPrefs {
             "reuse_media_window": self.reuse_media_window,
             "music_window_size": self.music_window_size,
             "video_window_size": self.video_window_size,
+            "main_window_size": self.main_window_size,
             "opened_folder": self.opened_folder,
             "recent_folders": self.recent_folders,
             "recent_files": self.recent_files,
@@ -553,6 +562,7 @@ mod tests {
             reuse_media_window: None,
             music_window_size: None,
             video_window_size: None,
+            main_window_size: None,
             opened_folder: None,
             recent_folders: Vec::new(),
             recent_files: Vec::new(),
@@ -756,6 +766,59 @@ mod tests {
         let back = UserPrefs::from_json_value(&Value::Null);
         assert_eq!(back.music_window_size, None);
         assert_eq!(back.video_window_size, None);
+    }
+
+    /// 「主窗口记录尺寸」字段 roundtrip：None（从未记录）→ JSON 为 null、读回 None；
+    /// Some((w,h)) 写入 `[w, h]` 并读回；与媒体两字段互不影响。非法值（非数组 / 长度
+    /// 非 2 / 非数字 / NaN / 负 / 零 / ∞）一律回退 None。
+    #[test]
+    fn main_window_size_json_roundtrip() {
+        // None（从未记录）：null / 读回 None。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["main_window_size"], Value::Null);
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.main_window_size, None);
+
+        // Some((w,h))：写入 `[w, h]` 并 roundtrip；与媒体窗口字段互不影响。
+        let p = UserPrefs {
+            main_window_size: Some((1280.0, 800.0)),
+            ..UserPrefs::default()
+        };
+        assert_eq!(
+            p.to_json_value()["main_window_size"],
+            serde_json::json!([1280.0, 800.0])
+        );
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(back.main_window_size, Some((1280.0, 800.0)));
+        assert_eq!(back.music_window_size, None, "主窗口字段不影响音乐窗口字段");
+        assert_eq!(back.video_window_size, None, "主窗口字段不影响视频窗口字段");
+        // 媒体字段写在也互不影响主窗口字段。
+        let p2 = UserPrefs {
+            music_window_size: Some((800.0, 600.0)),
+            video_window_size: Some((960.0, 540.0)),
+            ..UserPrefs::default()
+        };
+        let back2 = UserPrefs::from_json_value(&p2.to_json_value());
+        assert_eq!(back2.main_window_size, None, "媒体字段本身不回填主窗口字段");
+
+        // 非法值 → 回退 None：非数组 / 长度非 2 / 成员非数字 / 负 / 零 / 缺字段。
+        for bad in [
+            serde_json::json!({ "main_window_size": "1280x800" }),
+            serde_json::json!({ "main_window_size": [1280.0, 800.0, 1.0] }),
+            serde_json::json!({ "main_window_size": [1280.0] }),
+            serde_json::json!({ "main_window_size": [1280.0, "800"] }),
+            serde_json::json!({ "main_window_size": [-1280.0, 800.0] }),
+            serde_json::json!({ "main_window_size": [0.0, 800.0] }),
+        ] {
+            assert_eq!(
+                UserPrefs::from_json_value(&bad).main_window_size,
+                None,
+                "非法尺寸应回退 None：{bad}"
+            );
+        }
+        // 非对象 → 全默认（缺字段）。
+        let back = UserPrefs::from_json_value(&Value::Null);
+        assert_eq!(back.main_window_size, None);
     }
 
     /// 「打开文件夹」根路径 roundtrip：None = 未打开（JSON 值为 null、读回 None）；

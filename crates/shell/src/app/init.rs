@@ -106,6 +106,10 @@ impl EditorApp {
             // 媒体窗口记录尺寸：None（未记录）= 新开跟随发起窗口大小。
             prefs.music_window_size.map(|(w, h)| gpui::size(px(w), px(h))),
             prefs.video_window_size.map(|(w, h)| gpui::size(px(w), px(h))),
+            // 主窗口记录尺寸：None（未记录）= 启动恢复用默认 980×720。
+            prefs
+                .main_window_size
+                .map(|(w, h)| gpui::size(px(w), px(h))),
             // 最近打开（文件夹 / 文件）：新→旧的路径列表，跨重启恢复「打开最近」面板。
             recent_folders,
             recent_files,
@@ -190,6 +194,9 @@ impl EditorApp {
             // 专用媒体窗口尺寸变化订阅：仅 `new_media_window` 构造并在下方注册（未注册 =
             // None，见 `!startup && !is_detached` 分支）。
             _bounds_sub: None,
+            // 主窗口尺寸变化订阅：仅 `startup` 构造并在下方注册（未注册 = None，见
+            // `if startup` 分支）。
+            _main_bounds_sub: None,
             palette: None,
             _palette_sub: None,
             // 音乐播放器视图（惰性创建；退出音乐模式不销毁 MusicView——播放继续）。
@@ -268,6 +275,19 @@ impl EditorApp {
                     return;
                 }
                 this.record_media_window_size(window.bounds().size, cx);
+            }));
+        }
+        // 主窗口（`startup` 创建）尺寸变化订阅：用户 resize 后记录窗口化尺寸到
+        // config.json（下次启动按记录尺寸居中打开，见 `src/main.rs` 启动恢复）。
+        // 专精媒体窗口 / 拖出窗口不注册（不记录，各自尺寸语义见 media_window.rs）。
+        // 最大化/全屏不记录（尺寸随系统态跳变无意义）；重复 resize 去重在
+        // `record_main_window_size`；首帧若回调一次初始尺寸 → 去重（与记录相同不写）无害。
+        if startup {
+            app._main_bounds_sub = Some(cx.observe_window_bounds(window, |this, window, cx| {
+                if window.is_maximized() || window.is_fullscreen() {
+                    return;
+                }
+                this.record_main_window_size(window.bounds().size, cx);
             }));
         }
         if let Some(first_tab) = first_tab {

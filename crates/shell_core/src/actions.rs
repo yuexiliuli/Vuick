@@ -25,6 +25,35 @@ use config::user::UserPrefs;
 use crate::host::AppHost;
 use crate::model::{AppModel, DetachedTab, EditorTab, MediaReader, MdWyInstall, TabPayload};
 
+/// 主窗口尺寸记录的最小尺寸护栏 w（防记录值被极端 resize / 误操作污染到退化过小）。
+pub const MIN_MAIN_WIN_W: f32 = 640.0;
+/// 主窗口尺寸记录的最小尺寸护栏 h（与 [`MIN_MAIN_WIN_W`] 配套）。
+pub const MIN_MAIN_WIN_H: f32 = 480.0;
+/// 主窗口尺寸记录的落盘防抖（ms）：对齐 `shell_media::media_window::MEDIA_SIZE_FLUSH_DEBOUNCE_MS`
+/// 同款口径——可重入、代序作废，停顿后才写盘一次。
+pub const MAIN_SIZE_FLUSH_DEBOUNCE_MS: u64 = 300;
+
+/// 记录主窗口窗口化尺寸（启动恢复用）到 [`AppModel::main_window_size`]。
+/// 最小尺寸护栏在写入前 clamp（防记录值退化到过小）；去重：尺寸与上次记录一致不写
+/// （首帧 `observe_window_bounds` 若回调一次初始尺寸 → 与记录相同即不写，无害）。
+/// 返回 `Some(最终尺寸)` = 有实际写入（宿主据此排防抖落盘 + 诊断 + notify）；
+/// `None` = 尺寸未变（无操作）。
+pub fn record_main_window_size(
+    m: &mut AppModel,
+    size: gpui::Size<gpui::Pixels>,
+) -> Option<gpui::Size<gpui::Pixels>> {
+    // 最小尺寸护栏（防退化到过小 / 记录值被极端 resize 污染）。
+    let size = gpui::size(
+        gpui::px(size.width.as_f32().max(MIN_MAIN_WIN_W)),
+        gpui::px(size.height.as_f32().max(MIN_MAIN_WIN_H)),
+    );
+    if m.main_window_size == Some(size) {
+        return None;
+    }
+    m.main_window_size = Some(size);
+    Some(size)
+}
+
 impl AppModel {
     // ---------- tabs 动作半 ----------
 
@@ -586,6 +615,10 @@ impl AppModel {
             video_window_size: self
                 .video_window_size
                 .map(|s| (s.width.as_f32(), s.height.as_f32())),
+            // 主窗口记录尺寸一并落盘（否则一次字号/主题保存就把记录清空回 None，白记）。
+            main_window_size: self
+                .main_window_size
+                .map(|s| (s.width.as_f32(), s.height.as_f32())),
             // 打开文件夹的根路径随偏好落盘（首次写前为空；路径失效时宿主 files_root 为
             // None → 这里写 null，下次启动不再恢复该失效文件夹）。
             opened_folder: host
@@ -674,4 +707,42 @@ fn content_hash(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `record_main_window_size` 域函数直驱：clamp 最小护栏 + 同尺寸去重（重复返回
+    /// `None` = 无实际写入，宿主据此**不**排防抖落盘 / 诊断 / notify）。
+    /// 与 `shell_media::media_window::tests::record_media_window_size_music_slot`
+    /// 同款直驱姿势——判别式：撤掉去重分支（恒 Some）→ 本断言红。
+    #[test]
+    fn record_main_window_size_clamps_and_dedups() {
+        let mut m = AppModel::default();
+        // 首次记录 → Some（有实际写入）。
+        assert_eq!(
+            record_main_window_size(&mut m, gpui::size(gpui::px(1280.), gpui::px(800.))),
+            Some(gpui::size(gpui::px(1280.), gpui::px(800.)))
+        );
+        assert_eq!(
+            m.main_window_size,
+            Some(gpui::size(gpui::px(1280.), gpui::px(800.)))
+        );
+        // 同尺寸重复 → None（去重：不重复覆盖 / 不排防抖落盘）。
+        assert_eq!(
+            record_main_window_size(&mut m, gpui::size(gpui::px(1280.), gpui::px(800.))),
+            None,
+            "去重：同尺寸不重复记录"
+        );
+        // 极端小尺寸 → clamp 到最小尺寸护栏（MIN_MAIN_WIN_W×MIN_MAIN_WIN_H）。
+        assert_eq!(
+            record_main_window_size(&mut m, gpui::size(gpui::px(100.), gpui::px(100.))),
+            Some(gpui::size(gpui::px(MIN_MAIN_WIN_W), gpui::px(MIN_MAIN_WIN_H)))
+        );
+        assert_eq!(
+            m.main_window_size,
+            Some(gpui::size(gpui::px(MIN_MAIN_WIN_W), gpui::px(MIN_MAIN_WIN_H)))
+        );
+    }
 }

@@ -84,6 +84,53 @@ impl EditorApp {
         }
     }
 
+    /// 记录主窗口窗口化尺寸到 [`AppModel::main_window_size`]，并在停顿时落盘到 config.json。
+    /// 域逻辑 [`shell_core::actions::record_main_window_size`]（clamp + 去重），落盘防抖
+    /// 调度 [`Self::schedule_main_size_flush`] 与诊断/notify 宿主落地。测试直接驱动
+    /// （persist_prefs 在测试构建为 no-op，断言内存字段即可）。
+    /// `#[doc(hidden)] pub`：`tests/main_window.rs` 尺寸记录断言（§8.6 外提清单）。
+    #[doc(hidden)]
+    pub fn record_main_window_size(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(size) =
+            shell_core::actions::record_main_window_size(&mut self.model.borrow_mut(), size)
+        else {
+            return;
+        };
+        // `&mut self.model.borrow_mut()` 的 guard 在语句结束已 drop，
+        // 此处 `&self` 路径（schedule / 诊断）不再持有模型借用（防 RefCell 双借 panic）。
+        self.schedule_main_size_flush(cx);
+        if std::env::var_os("VUICK_DIAG").is_some() {
+            eprintln!(
+                "[MAINWNDSZ] record size={}x{}",
+                size.width.as_f32().round() as i64,
+                size.height.as_f32().round() as i64,
+            );
+        }
+        cx.notify();
+    }
+
+    /// 把主窗口尺寸记录的落盘安排成防抖任务（可重入、代序作废，仿
+    /// [`Self::schedule_media_size_flush`]）：停顿
+    /// [`shell_core::actions::MAIN_SIZE_FLUSH_DEBOUNCE_MS`] 后写一次 config.json；
+    /// 期间再 resize → 旧单作废。内存字段已由 [`Self::record_main_window_size`] 更新
+    /// （测试直接驱动，断言内存字段即可）。
+    fn schedule_main_size_flush(&self, _cx: &mut Context<Self>) {
+        // 防抖只挂在非测试构建（不残留定时任务）。弱句柄先单独绑定（同一表达式里 `_cx`
+        // 可变实参与 `_cx.weak_entity()` 不可变借用冲突）。
+        #[cfg(not(test))]
+        {
+            let weak = _cx.weak_entity();
+            self.model.borrow().main_size_flush_debounce.after_weak(
+                _cx,
+                std::time::Duration::from_millis(shell_core::actions::MAIN_SIZE_FLUSH_DEBOUNCE_MS),
+                weak,
+                move |this, _| {
+                    this.persist_prefs();
+                },
+            );
+        }
+    }
+
     /// `open_file` 的重定向包装点：仅对「音频/视频 且 media_new_window 开启」做分流。
     /// 决策在 [`shell_media::media_window`]（`is_media_path` + `resolve_media_open_action`），
     /// 执行经 [`MediaHost`] 宿主服务面分发（开新窗 / 跨窗口路由）。返回 `true` = 已把

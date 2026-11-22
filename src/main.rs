@@ -7,7 +7,7 @@
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
-use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
+use gpui::{App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 use base::actions::*;
 use shell::{bind_local_keymaps, commands, EditorApp};
 use syntax::prewarm;
@@ -21,7 +21,14 @@ fn main() {
     // render 依次 mark，首次 render 时汇总打一行。轨 A 改动前基线。
     base::startup::boot();
     gpui_platform::application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(980.), px(720.)), cx);
+        // 启动首帧前先加载持久化偏好：主窗口初始尺寸（记忆的窗口化尺寸 → 按记录居中展开；
+        // 未记录 → 默认 980×720）与下方主题解析共用**同一份 prefs**（不重复 load）。
+        let prefs = UserPrefs::load();
+        let bounds = Bounds::centered(
+            None,
+            shell::app::main_window_initial_size(prefs.main_window_size),
+            cx,
+        );
 
         // 应用级快捷键（全局，None 上下文）：键串来自 `shell::commands` 公共命令表
         // （菜单/命令面板/键位三处共享同一真值，改快捷键只动命令表一处）。
@@ -31,7 +38,6 @@ fn main() {
             // 启动跟随：按持久化偏好解析；从未手动选过（默认 follow）→ 由系统深浅色决定。
             // EditorApp::new_impl 会用同一逻辑再落地一次（双保险 + 多窗口一致），
             // 此处在首帧前先落定，避免窗口以错误主题闪现。
-            let prefs = UserPrefs::load();
             Theme::set(
                 if prefs.theme.resolved_dark(cx.window_appearance()) {
                     ThemeMode::Dark

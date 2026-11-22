@@ -186,6 +186,22 @@ pub(super) struct MaterialBand {
     pub(super) last: bool,
 }
 
+/// 主窗口启动初始尺寸：`main_window_size` 已记录 → 用记录值（w×h，逻辑像素，居中展开）；
+/// 未记录 → 默认 980×720。`src/main.rs` 与「启动恢复」测试共用**同一真值函数**
+/// （测试增删还原逻辑即红：改此函数两处都变）。读路径镜像写路径的最小尺寸护栏
+/// （[`shell_core::actions::MIN_MAIN_WIN_W/H`]）：写路径保存时恒 ≥MIN，此处只兜底
+/// **手改/旧版**配置写了 <MIN 的有效尺寸 → 启动仍 clamp 到最小尺寸（对齐媒体窗口
+/// `host_impl.rs` 读记录尺寸的 clamp 姿势）。
+pub fn main_window_initial_size(recorded: Option<(f32, f32)>) -> gpui::Size<gpui::Pixels> {
+    match recorded {
+        Some((w, h)) => gpui::size(
+            px(w.max(shell_core::actions::MIN_MAIN_WIN_W)),
+            px(h.max(shell_core::actions::MIN_MAIN_WIN_H)),
+        ),
+        None => gpui::size(px(980.), px(720.)),
+    }
+}
+
 pub struct EditorApp {
     /// 模型半状态统一容器：`tabs` / `active_tab` 等文件/会话/搜索/偏好模型态在
     /// `shell_core::AppModel`；UI 半状态（窗口 / 布局 / 聚焦 / 主题 glue / registry）
@@ -338,6 +354,10 @@ pub struct EditorApp {
     /// 用户 resize 后按当前角色自动记录音乐/视频窗口尺寸到 config.json（下次新开按记录
     /// 尺寸）。主窗口 / 拖出窗口 / 复用目标不注册（不记录），`None` 即未注册。
     _bounds_sub: Option<Subscription>,
+    /// 主窗口（`startup` 创建）的尺寸变化订阅（`observe_window_bounds`）：用户 resize 后
+    /// 记录窗口化尺寸到 config.json（下次启动按记录尺寸居中打开）。媒体窗口 / 拖出窗口
+    /// 不注册（不记录），`None` 即未注册。
+    _main_bounds_sub: Option<Subscription>,
     /// 命令面板（P2-8）：打开时为 `Some`，选择/Esc/点击外（`DismissEvent`）关闭后清空。
     /// 面板是独立 `CommandPalette` 实体（query/选中/模式/条目自持），新建即情境。
     /// `#[doc(hidden)] pub`：`tests/palette.rs` quick open 扫描就绪轮询（§8.6 外提清单）。

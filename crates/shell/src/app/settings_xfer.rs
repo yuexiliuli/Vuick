@@ -209,6 +209,11 @@ impl EditorApp {
             self.model.borrow_mut().video_window_size = prefs
                 .video_window_size
                 .map(|(w, h)| gpui::size(px(w), px(h)));
+            // 主窗口记录尺寸：以导入值为准（None = 还原为默认 980×720；随 persist 落盘，
+            // 下一次启动按导入尺寸打开主窗口）。
+            self.model.borrow_mut().main_window_size = prefs
+                .main_window_size
+                .map(|(w, h)| gpui::size(px(w), px(h)));
             // 最近打开列表随配置恢复。
             self.model.borrow_mut().recent_folders = prefs.recent_folders;
             self.model.borrow_mut().recent_files = prefs.recent_files;

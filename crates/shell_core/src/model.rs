@@ -235,8 +235,12 @@ pub struct AppModel {
     pub music_window_size: Option<Size<Pixels>>,
     /// 视频窗口的已记录尺寸（与 `music_window_size` 对称）。
     pub video_window_size: Option<Size<Pixels>>,
+    /// 主窗口的已记录尺寸（逻辑像素，来自 [`UserPrefs::main_window_size`]）。
+    pub main_window_size: Option<Size<Pixels>>,
     /// 媒体窗口尺寸记录的防抖落盘。
     pub media_size_flush_debounce: SeqAfter,
+    /// 主窗口尺寸记录的防抖落盘（镜像 `media_size_flush_debounce`；启动恢复用）。
+    pub main_size_flush_debounce: SeqAfter,
     /// 会话持久化防抖：可重入、代序作废，
     /// 内容变化停顿后才写盘一次。
     pub session_flush_debounce: SeqAfter,
@@ -336,6 +340,7 @@ impl AppModel {
         restore_reading_progress: bool,
         music_window_size: Option<Size<Pixels>>,
         video_window_size: Option<Size<Pixels>>,
+        main_window_size: Option<Size<Pixels>>,
         recent_folders: Vec<String>,
         recent_files: Vec<String>,
         pdf_bookmarks: HashMap<String, Vec<PdfBookmark>>,
@@ -359,7 +364,9 @@ impl AppModel {
             reading_progress,
             music_window_size,
             video_window_size,
+            main_window_size,
             media_size_flush_debounce: SeqAfter::default(),
+            main_size_flush_debounce: SeqAfter::default(),
             session_flush_debounce: SeqAfter::default(),
             reading_progress_debounce: SeqAfter::default(),
             session_restoring: false,
@@ -544,7 +551,9 @@ impl Default for AppModel {
             reading_progress: HashMap::new(),
             music_window_size: None,
             video_window_size: None,
+            main_window_size: None,
             media_size_flush_debounce: SeqAfter::default(),
+            main_size_flush_debounce: SeqAfter::default(),
             session_flush_debounce: SeqAfter::default(),
             reading_progress_debounce: SeqAfter::default(),
             session_restoring: false,
