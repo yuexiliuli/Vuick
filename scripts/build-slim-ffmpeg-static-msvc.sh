@@ -5,7 +5,7 @@
 # 用途：
 #   在 B1 瘦共享包之上另建一套 **MSVC 静态** 瘦包（同一白名单）：
 #   - B1（scripts/build-slim-ffmpeg.sh）：shared（.dll），默认链路，
-#     FFMPEG_DIR = E:\Rust\temp\ffmpeg-slim，分发 5 件 dll（6.2MB）。
+#     FFMPEG_DIR 默认 = ${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-slim，分发 5 件 dll（6.2MB）。
 #   - B2（本脚本）：--toolchain=msvc --enable-static，产物是 5 个 COFF
 #     静态归档 avcodec.lib / avformat.lib / avutil.lib / swresample.lib /
 #     swscale.lib（无任何 dll，bin\ 为空）。
@@ -13,7 +13,7 @@
 #     以 `static=` 把这些 .lib 直接链进 media_ffmpeg.dll → 分发只需
 #     exe + 1 件 media_ffmpeg.dll（导入表只剩系统 dll，无 av*.dll）。
 #     B2 是 opt-in：默认（无 feature）仍是 B1 shared，FFMPEG_DIR 不动。
-#   版本 pin n9.0.2（与 B1 同一源树 E:\Rust\temp\ffmpeg）。
+#   版本 pin n9.0.2（与 B1 同一源树 ${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg）。
 #
 # 白名单与 B1 完全一致（不另定稿），只换静态/MSVC 相关：
 #   - --toolchain=msvc --enable-static --disable-shared
@@ -61,12 +61,12 @@
 # 运行方式（必须在 MSYS2 bash 下，本机 = C:\msys64\usr\bin\bash.exe）：
 #   bash scripts/build-slim-ffmpeg-static-msvc.sh
 #   可传两参覆盖：bash scripts/build-slim-ffmpeg-static-msvc.sh [SRC] [PREFIX]
-#   默认 SRC=/e/Rust/temp/ffmpeg、PREFIX=/e/Rust/temp/ffmpeg-slim-static
+#   默认 SRC=${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg、PREFIX=${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-slim-static
 #   脚本自行 make distclean（清掉 B1 mingw shared 配置残留），无需手动。
 #   MSVC 环境经 .bat shim 导入 vcvars64（规避 MSYS 引号/路径转换）。
 #
 # 验证（static-link 模式的回归与打包门禁）：
-#   $env:FFMPEG_DIR='E:\Rust\temp\ffmpeg-slim-static'
+#   $env:FFMPEG_DIR = Join-Path (($env:VUICK_DEV_DIR) ? $env:VUICK_DEV_DIR : "$env:USERPROFILE\.vuick-dev") 'ffmpeg-slim-static'
 #   cargo test -p media_ffmpeg --features static-link -- --test-threads=1
 #     # 期望 38 passed / 4 ignored（与 B1 shared 同套解码回归，静态链下跑）
 #   cargo build -p media_ffmpeg --features static-link
@@ -76,8 +76,8 @@
 # ============================================================
 set -e
 
-SRC="${1:-/e/Rust/temp/ffmpeg}"
-PREFIX="${2:-/e/Rust/temp/ffmpeg-slim-static}"
+SRC="${1:-${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg}"
+PREFIX="${2:-${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-slim-static}"
 TMPD=/c/Users/yuexi/AppData/Local/Temp/kilo
 VCVARS="C:\\WorkSpace\\Software\\Code\\MicrosoftVisualStudio\\2022\\Professional\\VC\\Auxiliary\\Build\\vcvars64.bat"
 REAL_CL="/c/WorkSpace/Software/Code/MicrosoftVisualStudio/2022/Professional/VC/Tools/MSVC/14.40.33807/bin/HostX64/x64/cl.exe"

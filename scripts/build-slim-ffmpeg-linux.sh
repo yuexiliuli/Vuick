@@ -29,8 +29,8 @@
 #
 # 如何运行（Linux bash）：
 #   bash scripts/build-slim-ffmpeg-linux.sh [PREFIX] [SRC]
-#   默认 PREFIX=$HOME/code/rust/temp/ffmpeg-linux-slim
-#   默认 SRC  =$HOME/code/rust/temp/ffmpeg-src
+#   默认 PREFIX=${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-linux-slim
+#   默认 SRC  =${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-src
 #   幂等：$PREFIX/lib/libavcodec.so 与 lib/pkgconfig/libavcodec.pc 已存在
 #        → 跳过构建直接打印三句 env。
 #   源码获取：优先 git clone -b n9.0.2；失败（github 被墙）退化下载
@@ -38,8 +38,8 @@
 # ============================================================
 set -euo pipefail
 
-PREFIX="${1:-$HOME/code/rust/temp/ffmpeg-linux-slim}"
-SRC="${2:-$HOME/code/rust/temp/ffmpeg-src}"
+PREFIX="${1:-${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-linux-slim}"
+SRC="${2:-${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-src}"
 
 log() { printf '[build-slim-ffmpeg-linux] %s\n' "$*"; }
 die() { printf '[build-slim-ffmpeg-linux][ERROR] %s\n' "$*" >&2; exit 1; }

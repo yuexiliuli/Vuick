@@ -10,8 +10,8 @@
 #
 # 用法:
 #   bash scripts/setup-ffmpeg-linux.sh [--remote-gpl] [目标前缀]
-#     默认前缀 = $HOME/code/rust/temp/ffmpeg-linux-slim （瘦自建，LGPL）
-#     --remote-gpl 时默认前缀 = $HOME/code/rust/temp/ffmpeg-linux  （BtbN GPL 兜底）
+#     默认前缀 = ${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-linux-slim （瘦自建，LGPL）
+#     --remote-gpl 时默认前缀 = ${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-linux  （BtbN GPL 兜底）
 #     幂等     = 相应前缀已就位则跳过（瘦: lib/libavcodec.so + lib/pkgconfig/libavcodec.pc；
 #                GPL: include/libavcodec/avcodec.h + lib/pkgconfig/libavcodec.pc）
 #
@@ -40,9 +40,9 @@ for arg in "$@"; do
 done
 if [ -z "$PREFIX" ]; then
   if [ "$REMOTE_GPL" = 1 ]; then
-    PREFIX="$HOME/code/rust/temp/ffmpeg-linux"
+    PREFIX="${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-linux"
   else
-    PREFIX="$HOME/code/rust/temp/ffmpeg-linux-slim"
+    PREFIX="${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-linux-slim"
   fi
 fi
 

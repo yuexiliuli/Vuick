@@ -62,18 +62,18 @@
 #     （llvm-objdump -p 复核：avutil 不再依赖 libwinpthread-1.dll）。
 #   若任一 dll 重建后仍依赖 libwinpthread-1.dll/libgcc_s_seh-1.dll（objdump 复核）或
 #   体积膨胀显著（合计 +>1.5MB），回退本方案：删掉 --extra-ldflags/--extra-libs 两行后
-#   重跑本脚本，两种方案都记录在 E:\Rust\temp\b1\。
+#   重跑本脚本，两种方案都记录在 "${VUICK_DEV_DIR:-$HOME/.vuick-dev}/b1"。
 #
 # 如何运行（MSYS2 UCRT64 环境下）：
 #   bash scripts/build-slim-ffmpeg.sh
 #   （UCRT64 环境 = MSYSTEM=UCRT64，或 msys2_shell.cmd -ucrt64 -c "bash scripts/build-slim-ffmpeg.sh"）
 #   可传两参覆盖：bash scripts/build-slim-ffmpeg.sh [SRC] [PREFIX]
-#   默认 SRC=/e/Rust/temp/ffmpeg、PREFIX=/e/Rust/temp/ffmpeg-slim
+#   默认 SRC=${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg、PREFIX=${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-slim
 # ============================================================
 set -e
 
-SRC="${1:-/e/Rust/temp/ffmpeg}"
-PREFIX="${2:-/e/Rust/temp/ffmpeg-slim}"
+SRC="${1:-${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg}"
+PREFIX="${2:-${VUICK_DEV_DIR:-$HOME/.vuick-dev}/ffmpeg-slim}"
 
 cd "$SRC"
 
