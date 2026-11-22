@@ -296,8 +296,9 @@ impl super::MusicView {
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("搜索歌曲、歌手、专辑…")
-                    // 搜索 pill 为存量固定深紫（`theme::bg_secondary` 0x1a1738），不随全局
-                    // 深浅翻转 → 注入音乐浅色文字 `theme::text()`（0xf0edff）保证深面上可读。
+                    // 搜索 pill 底色 `theme::bg_secondary` 现随音乐皮肤（music 档 0x1a1738、
+                    // ocean 档 0x122033…），文字 `theme::text()` 同随皮肤——同一皮肤下深底配
+                    // 浅字恒成立，无需硬编码明暗（③-2 前为固定深紫、不随全局深浅翻转）。
                     .text_color(theme::text())
             });
             let weak = cx.weak_entity();

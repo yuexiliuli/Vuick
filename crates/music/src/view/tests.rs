@@ -5,6 +5,7 @@
 //! 搜索过滤纯函数（大小写不敏感 / 中文 / 空查询）；默认状态。
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4194,6 +4195,7 @@ fn settings_button_toggles_skin_menu(cx: &mut TestAppContext) {
 /// 选同一值幂等（不再发事件）。初始默认位 music。
 #[gpui::test]
 fn choosing_skins_updates_current_and_emits_events(cx: &mut TestAppContext) {
+    let _guard = SkinViewGuard::new();
     let (view, wcx, skins) = open_skin_view(cx);
     assert_eq!(
         wcx.cx.read(|app| view.read(app).music_skin.clone()),
@@ -4232,6 +4234,7 @@ fn choosing_skins_updates_current_and_emits_events(cx: &mut TestAppContext) {
 /// 出音乐模式）；重开菜单键盘 ↓+Enter 应命中「跟随全局」（focus 重聚焦成功）。
 #[gpui::test]
 async fn skin_menu_item_click_keeps_open_and_updates(cx: &mut TestAppContext) {
+    let _guard = SkinViewGuard::new();
     let (view, wcx, skins) = open_skin_view(cx);
     let exits = Rc::new(Cell::new(0usize));
     {
@@ -4315,5 +4318,140 @@ fn music_skin_persists_through_user_prefs() {
         config::user::UserPrefs::load().music_skin,
         "follow",
         "跟随全局（follow）应原样落盘"
+    );
+}
+
+// ---- 阶段③-2：换肤取色渲染接线 + 封口测试（K153：渲染路径输出 == 主题 token） ----
+
+/// 触碰进程级皮肤缓存（`MusicSkin`）的视图测试用 RAII 守卫：进入/退出都 `reset()`，
+/// 并持有全 crate 共享串行锁（`theme::MUSIC_SKIN_TEST_SERIAL`，与 theme.rs `SkinTestGuard`
+/// 同一把锁）——防并行测试间皮肤缓存串扰，无需再依赖 `--test-threads=1`。
+#[allow(dead_code)] // 字段仅供 RAII 生命周期持有（不读取），见 `SkinViewGuard` 注释
+struct SkinViewGuard(std::sync::MutexGuard<'static, ()>);
+impl SkinViewGuard {
+    fn new() -> Self {
+        theme::MusicSkin::reset();
+        let lock = theme::MUSIC_SKIN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Self(lock)
+    }
+}
+impl Drop for SkinViewGuard {
+    fn drop(&mut self) {
+        theme::MusicSkin::reset();
+    }
+}
+
+/// 从最近渲染帧里取「根元素 #music-view」的纯色 bg quad 实绘色（K153 断言用）：
+/// 读 `window.painted_quads()` 的真实绘制输出，证明渲染路径真正消费皮肤 token，
+/// 而非「镜像 getter」假绿。根元素铺满窗口 → 取**面积最大**的纯色 quad（对 scale
+/// 不敏感；全窗无更大 solid 覆盖，故最大 solid = 根背景）。
+fn root_bg_paint_color(wcx: &mut VisualTestContext) -> gpui::Hsla {
+    let quads = wcx.update(|window, _| window.painted_quads());
+    let area = |q: &gpui::Quad| {
+        q.bounds.size.width.as_f32() * q.bounds.size.height.as_f32()
+    };
+    quads
+        .iter()
+        .filter_map(|q| q.background.as_solid().map(|c| (q, c)))
+        .max_by(|(a, _), (b, _)| area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, c)| c)
+        .expect("#music-view 应有覆盖自身的纯色 bg quad（最大 solid quad = 根背景）")
+}
+
+/// K153 封口：渲染根元素实绘 bg == `MusicPalette` 皮肤 token（真实渲染走皮肤，非镜像
+/// getter）。判别式（K201）：删掉 `choose_music_skin` 里的 `MusicSkin::set` 则切 ocean 后
+/// 根实绘仍为 music 底 → 本测试红；换肤残差：ocean → music 切回后 #0d0b1a 逐字节回原。
+#[gpui::test]
+async fn music_root_bg_matches_skin_palette(cx: &mut TestAppContext) {
+    let _guard = SkinViewGuard::new();
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    // 默认 music 皮肤：根实绘 bg == music 调色板 bg_deep（#0d0b1a）。
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert_eq!(
+        root_bg_paint_color(wcx),
+        theme::MusicPalette::from_skin("music").expect("music 预设可解析").bg_deep,
+        "默认 music：根实绘背景应随音乐调色板"
+    );
+    // 切 ocean：重绘后根实绘 bg == ocean 暗档 srf_deep（#0b111c），且 ≠ music 底。
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.choose_music_skin("ocean", cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let ocean_deep = theme::MusicPalette::from_skin("ocean").expect("ocean 预设存在").bg_deep;
+    assert_eq!(
+        root_bg_paint_color(wcx),
+        ocean_deep,
+        "切 ocean：根实绘背景应随 ocean 调色板"
+    );
+    assert_ne!(
+        ocean_deep,
+        theme::MusicPalette::from_skin("music").unwrap().bg_deep,
+        "判别：ocean 底 ≠ music 底（证明渲染真随皮肤走）"
+    );
+    // 换肤残差：ocean → 切回 music → 根实绘 bg 逐字节回 #0d0b1a。
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.choose_music_skin("music", cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert_eq!(
+        root_bg_paint_color(wcx),
+        theme::MusicPalette::from_skin("music").unwrap().bg_deep,
+        "换肤残差：ocean 切回 music 后根实绘 bg 应逐字节回 #0d0b1a"
+    );
+}
+
+/// ③-2 follow 全局联动（遗留风险）：music 皮肤 = "follow" 时，改全局主题（重绘触发
+/// render 钩子重调 `MusicSkin::set("follow")`）→ 音乐取色同步新全局合并值（bg_deep 随
+/// 预设面坡、accent 随自定义覆盖）。判别式：删掉 render 里的 follow 重取块则改全局后
+/// bg_deep 停留在旧值 → 红。
+#[gpui::test]
+async fn follow_palette_tracks_global_theme_change(cx: &mut TestAppContext) {
+    let _guard = SkinViewGuard::new();
+    // 固定 music 暗档为起点（合并后已知值）。
+    cx.update(|cx| {
+        ui::theme::Theme::apply(
+            ui::theme::ThemeSpec {
+                mode: ui::theme::ThemeMode::Dark,
+                preset: ui::theme::PRESETS.iter().find(|p| p.id == "music").unwrap(),
+                custom: Default::default(),
+            },
+            cx,
+        );
+    });
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    // 选「跟随全局」→ current_skin_id=follow（MusicSkin::set 即在当前全局建 palette）。
+    wcx.update(|_w, app| view.update(app, |v, cx| v.choose_music_skin("follow", cx)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert_eq!(theme::bg_deep(), theme::c(0x0d0b1a), "follow+music 暗档：bg_deep 跟随全局");
+    assert_eq!(theme::accent(), theme::c(0x7c5cfc), "follow+music 暗档：accent 跟随全局");
+    // 切全局为 ocean + 自定义 accent：重绘重入 render → follow 从新全局重取。
+    // 注：`cx` 已被 `add_window_view` 借出，经 `wcx.update` 拿 `&mut App` 改全局。
+    wcx.update(|_w, app| {
+        let mut custom = BTreeMap::new();
+        custom.insert("colors.accent", "#ffcc00".to_string());
+        ui::theme::Theme::apply(
+            ui::theme::ThemeSpec {
+                mode: ui::theme::ThemeMode::Dark,
+                preset: ui::theme::PRESETS.iter().find(|p| p.id == "ocean").unwrap(),
+                custom,
+            },
+            app,
+        );
+    });
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert_eq!(theme::bg_deep(), theme::c(0x0b111c), "follow 应重取 ocean 暗档 srf_deep");
+    assert_eq!(
+        theme::accent(),
+        theme::c(0xffcc00),
+        "follow 应重取被 custom 覆盖的 accent"
     );
 }

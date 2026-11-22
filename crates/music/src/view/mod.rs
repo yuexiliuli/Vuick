@@ -281,6 +281,19 @@ impl MusicView {
         let player_for_views = player.clone();
         // 底栏回父交互/tooltip 用：父视图弱柄（WeakEntity 防循环引用）。
         let parent_weak = cx.weak_entity();
+        // 音乐皮肤初始值：读已持久化偏好（测试构建屏蔽真实配置——config 依赖编译不受其
+        // 自身 cfg!(test) 门控，与 `load_default_dir`/`player.rs::prefs` 同款 K8 姿势）。
+        let music_skin = if cfg!(test) {
+            config::user::UserPrefs::default().music_skin
+        } else {
+            config::user::UserPrefs::load().music_skin
+        };
+        // ③-2：启动即把当前皮肤登记进进程级皮肤缓存（渲染唯一真相 = MusicSkin，由
+        // UserPrefs/AppModel 喂）——取色函数据此渲染，默认 "music" = 原型逐字节、
+        // "follow" 随全局主题。选择时经 `choose_music_skin` 再同步；局限：音乐窗口在
+        // 「设置导入」期间已打开时本地 `music_skin`（菜单 ✓）不会随导入重绘——已知
+        // （重启即按新偏好同步）；music crate 无 AppModel 访问，不在此扩大重同步。
+        theme::MusicSkin::set(&music_skin, cx);
         Self {
             player,
             state: ViewState::default(),
@@ -320,13 +333,9 @@ impl MusicView {
                         .ring(0.55, Duration::from_secs(9), true, "fsv-b")
                         .ring(0.30, Duration::from_secs(7), false, "fsv-c")
                 }),
-            // 音乐皮肤初始值：读已持久化偏好（测试构建屏蔽真实配置——config 依赖编译不受其
-            // 自身 cfg!(test) 门控，与 `load_default_dir`/`player.rs::prefs` 同款 K8 姿势）。
-            music_skin: if cfg!(test) {
-                config::user::UserPrefs::default().music_skin
-            } else {
-                config::user::UserPrefs::load().music_skin
-            },
+            // 音乐皮肤当前值（本地 ✓ 事实源）：`choose_music_skin` 更新并通知 shell；
+            // ③-2 起渲染唯一真相 = `MusicSkin` 缓存（本字段仅供菜单 ✓ + 初始默认）。
+            music_skin,
             skin_menu_open: false,
             skin_menu: ui::menu::MenuSlot::default(),
             bottom_bar: cx.new(|cx| {
@@ -687,6 +696,9 @@ impl MusicView {
             return;
         }
         self.music_skin = id.to_string();
+        // ③-2：换肤即时渲染——把选择同步进进程级皮肤缓存（渲染唯一真相），下一重绘
+        // 各取色函数即读新值；再发事件通知 shell 写 AppModel.music_skin + persist。
+        theme::MusicSkin::set(id, cx);
         cx.emit(MusicEvent::MusicSkinChanged(id));
         cx.notify();
     }
@@ -1011,8 +1023,9 @@ impl MusicView {
                 // 去手绘：走 ui::glass_card 纯壳——Solid(theme::glass()) 底、accent 边框（经
                 // border 覆盖参数）、Xl 圆角(12px) + PxPy(28,12) = 原 px_7/py_3、无影；14px 文案
                 // 与外层居中宿主定位留在原位。本卡 Solid+无影+border 覆盖 → card_shell 的
-                // surface/border/card_shadow 三色全未使用，传任意 ColorScheme 仅满足签名
-                // （music 自含深紫主题，不依赖 ui theme）。
+                // surface/border/card_shadow 三色全未消费，传任意 ColorScheme 仅满足签名
+                // （③-2：底 glass 音乐局部、accent/text 随音乐皮肤；假 ColorScheme::light()
+                // 只落在被 Solid/覆盖边框盖住的表面，保留不改为改而改）。
                 ui::glass_card(
                     &ui::theme::ColorScheme::light(),
                     false,
@@ -1049,6 +1062,14 @@ impl Render for MusicView {
         {
             self.toast = None;
         }
+        // ③-2 follow 跟随全局主题：全局主题变化（明暗切换/换预设/改重点色）经 `Theme::apply`
+        // → `cx.refresh_windows()` 触发窗级整帧重绘 → 本 render 在此重入（shell 侧
+        // `refresh_theme_ui` 每次 apply 即自然带动）。当前皮肤为 "follow" 时每次 render 从
+        // 新全局 theme 重取调色板（写进程级缓存），保证全部取色函数读到最新全局值；
+        // 仅 "follow" 触发写，其余皮肤 render 零额外开销。
+        if theme::MusicSkin::is_follow() {
+            theme::MusicSkin::set("follow", cx);
+        }
         // 子视图可见性门控（powered by 父现有状态——每次父 render 都刷新，结构切换后
         // 心跳立即对树上/离树实例正确取舍）：离树实例心跳空转（不跑跟随、不 notify）。
         // 右栏歌词仅「非全屏 + 歌词 tab」、全屏歌词仅 fs_open、右栏 np 进度仅「非全屏 +
@@ -1070,7 +1091,7 @@ impl Render for MusicView {
             .overflow_hidden()
             .flex()
             .flex_col()
-            .bg(theme::bg_deep())
+            .bg(theme::bg_deep()) // ③-2：随音乐皮肤（music/ocean/…/follow），无需改动
             .text_color(theme::text())
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key))
