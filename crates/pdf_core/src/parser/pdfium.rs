@@ -18,13 +18,24 @@ use sha2::{Digest, Sha256};
 /// 进程级单例：pdfium 动态库路径（只定位一次）。
 static PDFIUM_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-/// pdfium 版本号文件名（与 `resources/pdfium/` 内实际文件、`build.rs` 保持一致）。
+/// pdfium 动态库平台文件名（与 `resources/pdfium/` 内实际文件、`build.rs` 的
+/// `pdfium_lib_name()` 保持一致——Windows 保留版本号 `.dll`，非 Windows 走系统常见命名）。
 ///
-/// 用**带版本号**的文件名（`pdfium-<版本>.dll`）替代裸 `pdfium.dll`：
+/// Windows 用**带版本号**的文件名（`pdfium-<版本>.dll`）替代裸 `pdfium.dll`：
 /// - 一眼可辨当前内置的 pdfium 快照版本；
 /// - 升级 pdfium 时新旧文件可并存，随时回滚，不用覆盖。
 ///
+/// 非 Windows（`libpdfium.so` / `libpdfium.dylib`）本仓**不供给**对应文件——缺失时走现有
+/// 「仅磁盘候选/报错」路径（无内嵌兜底），编译不受影响，与 build.rs 静默跳过逻辑自洽。
+///
 /// 跨可见性（模块重组）：`parser/tests.rs` 的 DLL 定位用例引用 → 升 `pub(crate)`。
+#[cfg(windows)]
+pub(crate) const PDFIUM_VERSIONED_NAME: &str = "pdfium-154.0.8035.0.dll";
+#[cfg(target_os = "linux")]
+pub(crate) const PDFIUM_VERSIONED_NAME: &str = "libpdfium.so";
+#[cfg(target_os = "macos")]
+pub(crate) const PDFIUM_VERSIONED_NAME: &str = "libpdfium.dylib";
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) const PDFIUM_VERSIONED_NAME: &str = "pdfium-154.0.8035.0.dll";
 
 /// 内嵌的 pdfium 字节（仅当 `build.rs` 探测到 dll 存在时启用 `embed_pdfium` cfg）。

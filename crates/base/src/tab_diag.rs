@@ -6,8 +6,9 @@
 //!   [`crate::diag`]（本批 Pattern 7），未开时每次调用仅一次缓存查即返回，**零分配、零 IO**。
 //! - 只在**事件点**调用（Root `on_action_tab` / 编辑区 `tab()` / WY `tab_insert`），
 //!   不逐帧刷屏。
-//! - 追加写 `%APPDATA%\vuick\vuick-tab.log`（测试构建写 `%TEMP%\vuick-tab.log`，
-//!   不污染真实 APPDATA）。写失败静默丢弃，绝不影响主流程。
+//! - 追加写平台配置目录下 `vuick-tab.log`（Windows `%APPDATA%\vuick\vuick-tab.log`；
+//!   非 Windows XDG 配置目录，见 [`crate::paths`]；测试构建写 `%TEMP%\vuick-tab.log`，
+//!   不污染真实配置目录）。写失败静默丢弃，绝不影响主流程。
 //! - 结束运行**不清理**，保留供主 agent 读取；`.gitignore` 收 `vuick-tab.log` 不入库。
 
 /// 追加一行 `[TAB] <key> <detail>`。**仅在 `VUICK_TAB_DIAG=1` 时**分配 + 写盘；

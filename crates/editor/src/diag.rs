@@ -4,9 +4,10 @@
 //! 默认关（`VUICK_RP_DIAG=1` 开启，开关缓存一次判读）。为**同一份**
 //! `rp_diag` 日志追加 `[RP] ed_scroll from=<site> …` 行——开关/测试判定/日志路径收敛自
 //! `base::diag`（`env_flag` + `diag_log_path`，本批 Pattern 7）：测试构建写
-//! `%TEMP%\vuick-rp-diag.log`、生产写 `%APPDATA%\vuick\rp_diag.log`（与
+//! `%TEMP%\vuick-rp-diag.log`、生产写平台配置目录下 `rp_diag.log`（Windows
+//! `%APPDATA%\vuick\rp_diag.log`；非 Windows XDG 配置目录，见 `base::paths`——与
 //! `shell_core::rp_diag` 同一位置、行可交错归因；旧镜像里 shell_core 侧曾随
-//! `config_path` 覆盖改变位置，收敛后统一 APPDATA 口径）。
+//! `config_path` 覆盖改变位置，收敛后统一 `base::diag::diag_log_path` 口径）。
 //! 只在**实际发起滚动**的点调用（数值经 `scroll_to_px` 单一咽喉/`desired_scroll` 直写），
 //! 不逐帧刷屏；探针末行命中即输出，跨文件归因。
 

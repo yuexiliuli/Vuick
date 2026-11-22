@@ -6,10 +6,12 @@
 //! - [`warm`]：冷启动 COLR emoji 光栅预热（**勿删**，见模块内注释）；
 //! - [`util`]：UTF-8 字符边界钳制基元；
 //! - [`diag`]：进程级 env 门控诊断开关 / 测试构建判定 / 诊断日志路径（各 crate 手写探针收敛地）；
+//! - [`paths`]：平台应用配置目录解析（Windows APPDATA / 非 Windows XDG，供 config/diag 同口径消费）；
 //! - [`prof`]：性能剖析/操作级实时追踪微工具。
 
 pub mod actions;
 pub mod diag;
+pub mod paths;
 pub mod prof;
 pub mod startup;
 pub mod tab_diag;

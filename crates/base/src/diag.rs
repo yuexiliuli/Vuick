@@ -29,15 +29,19 @@ pub fn is_test_build() -> bool {
     cfg!(test) || matches!(std::env::var("VUICK_TEST").as_deref(), Ok("1"))
 }
 
-/// 诊断日志路径：测试构建 → `%TEMP%\{filename}`；生产 → `%APPDATA%\vuick\{filename}`。
+/// 诊断日志路径：测试构建 → `%TEMP%\{filename}`；生产 → 平台配置目录下 `{filename}`
+/// （Windows `%APPDATA%\vuick\{filename}`；非 Windows XDG 配置目录，见 [`crate::paths::app_config_dir`]；
+/// 基目录不可得 → 当前目录 `{filename}`，保持既有回退语义）。
 /// 与原 `tab_diag::log_path` / `editor::diag::log_path` 逐字等价（文件名换参）。
 pub fn diag_log_path(filename: &str) -> PathBuf {
     if is_test_build() {
         return std::env::temp_dir().join(filename);
     }
-    match std::env::var_os("APPDATA").map(PathBuf::from) {
-        Some(base) => base.join("vuick").join(filename),
-        _ => PathBuf::from(filename),
+    let dir = crate::paths::app_config_dir();
+    if dir.as_os_str().is_empty() {
+        PathBuf::from(filename)
+    } else {
+        dir.join(filename)
     }
 }
 

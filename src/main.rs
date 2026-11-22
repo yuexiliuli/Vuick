@@ -5,7 +5,7 @@
 //! syntax/ui/editor/markdown/toc/pdf/image/video/epub/shell），本包只剩初始化胶水。
 //! 各模块职责见各 crate（如 `shell` 的 `EditorApp` / `bind_local_keymaps`）。
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 use base::actions::*;

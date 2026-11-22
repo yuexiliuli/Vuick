@@ -175,10 +175,19 @@ pub struct Bridge {
     pub _lib: libloading::Library,
 }
 
+/// 运行库文件名按目标平台取 cdylib 默认产物名（libloading 用）。
+#[cfg(windows)]
+const MEDIA_FFMPEG_LIB_NAME: &str = "media_ffmpeg.dll";
+#[cfg(target_os = "linux")]
+const MEDIA_FFMPEG_LIB_NAME: &str = "libmedia_ffmpeg.so";
+#[cfg(target_os = "macos")]
+const MEDIA_FFMPEG_LIB_NAME: &str = "libmedia_ffmpeg.dylib";
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+const MEDIA_FFMPEG_LIB_NAME: &str = "libmedia_ffmpeg.so"; // 其它 Unix 兜底（cdylib 通用产物名）
+
 /// find_lib 的路径候选取出（**可纯测**）：`[exe_dir/name, exe_dir/../name]`。
 fn candidate_paths(exe_dir: &Path) -> [std::path::PathBuf; 2] {
-    let name = "media_ffmpeg.dll";
-    [exe_dir.join(name), exe_dir.join("..").join(name)]
+    [exe_dir.join(MEDIA_FFMPEG_LIB_NAME), exe_dir.join("..").join(MEDIA_FFMPEG_LIB_NAME)]
 }
 
 fn find_lib() -> std::path::PathBuf {
@@ -192,7 +201,7 @@ fn find_lib() -> std::path::PathBuf {
         }
     }
     // 兜底：交给 LoadLibrary 的 exe 目录 / CWD / PATH / 系统目录搜索
-    std::path::PathBuf::from("media_ffmpeg.dll")
+    std::path::PathBuf::from(MEDIA_FFMPEG_LIB_NAME)
 }
 
 fn load_bridge() -> Option<Bridge> {
@@ -309,8 +318,8 @@ mod tests {
     fn candidate_paths_yields_exe_dir_and_parent() {
         let dir = Path::new("C:/some/app/bin");
         let cands = candidate_paths(dir);
-        assert_eq!(cands[0], dir.join("media_ffmpeg.dll"));
-        assert_eq!(cands[1], dir.join("..").join("media_ffmpeg.dll"));
+        assert_eq!(cands[0], dir.join(MEDIA_FFMPEG_LIB_NAME));
+        assert_eq!(cands[1], dir.join("..").join(MEDIA_FFMPEG_LIB_NAME));
     }
 
     /// ParamFFI → AudioParams 换算（纯类型转换，语义同 music `params()`）。

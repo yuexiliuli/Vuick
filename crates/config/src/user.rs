@@ -182,8 +182,9 @@ fn config_meta(path: &Path) -> (Option<SystemTime>, u64) {
 /// 递归复制目录内容（不含正在写的文件锁占用问题：仅复制后读，源保持只读不删）。
 /// 迁移专用：源目录仅作「一次性搬家」，复制失败静默忽略（下次启动重试）。
 /// `test-mode`（shell 等消费方测试构建把 config 以该 feature 编译）下迁移不触发、
-/// 单测又不编 → 允许 dead_code（生产 + 纯 cfg(test) 均真实使用）。
-#[cfg_attr(any(test, feature = "test-mode"), allow(dead_code))]
+/// 单测又不编 → 允许 dead_code（生产 + 纯 cfg(test) 均真实使用；非 Windows 下
+/// `migrate_legacy_appdata` 为 `#[cfg(windows)]`，这两个纯函数无生产消费方）。
+#[cfg_attr(any(test, feature = "test-mode", not(windows)), allow(dead_code))]
 fn copy_dir(src: &Path, dst: &Path) {
     let entries = match std::fs::read_dir(src) {
         Ok(e) => e,
@@ -206,7 +207,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// 旧目录 → 新目录一次性迁移（判定 + 递归复制；独立于 `cfg` 门控，可单测）。
 /// 旧目录不存在或新目录已存在 → 无操作；否则整目录递归复制、保留源。
 /// `test-mode` 下同 [`copy_dir`] 一样可能 dead（见其 cfg_attr 注释）。
-#[cfg_attr(any(test, feature = "test-mode"), allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-mode", not(windows)), allow(dead_code))]
 fn migrate_legacy_dir(old: &Path, new: &Path) {
     if old.is_dir() && !new.exists() {
         copy_dir(old, new);
@@ -214,7 +215,10 @@ fn migrate_legacy_dir(old: &Path, new: &Path) {
 }
 
 impl UserPrefs {
-    /// 配置文件完整路径：环境变量覆盖 → 测试隔离临时目录 → APPDATA → 当前目录回退。
+    /// 配置文件完整路径：环境变量覆盖 → 测试隔离临时目录 → 平台配置目录 → 当前目录回退。
+    /// 平台配置目录：Windows `%APPDATA%\vuick`（含旧目录迁移，既有行为逐字节不变）；非
+    /// Windows 走 XDG（`$XDG_CONFIG_HOME\vuick` 或 `$HOME\.config\vuick`；见
+    /// [`base::paths::app_config_dir`]——同一口径，config 依赖 base，目录解析放 base）。
     pub fn config_path() -> PathBuf {
         if let Ok(over) = std::env::var("VUICK_CONFIG")
             && !over.trim().is_empty()
@@ -229,21 +233,37 @@ impl UserPrefs {
         {
             return Self::test_config_path();
         }
-        if let Ok(appdata) = std::env::var("APPDATA")
-            && !appdata.trim().is_empty()
+        #[cfg(windows)]
         {
-            let appdata_dir = PathBuf::from(appdata);
-            Self::migrate_legacy_appdata(&appdata_dir);
-            return appdata_dir.join("vuick").join("config.json");
+            // Windows：APPDATA 缺省/空 → 当前目录回退（既有语义原样）；旧目录迁移仅此分支。
+            if let Ok(appdata) = std::env::var("APPDATA")
+                && !appdata.trim().is_empty()
+            {
+                let appdata_dir = PathBuf::from(appdata);
+                Self::migrate_legacy_appdata(&appdata_dir);
+                return appdata_dir.join("vuick").join("config.json");
+            }
+            PathBuf::from("vuick-config.json")
         }
-        PathBuf::from("vuick-config.json")
+        #[cfg(not(windows))]
+        {
+            // 非 Windows：XDG 配置目录；无 XDG_CONFIG_HOME/HOME → 回落当前目录（保持既有回退语义）。
+            let dir = base::paths::app_config_dir();
+            if dir.as_os_str().is_empty() {
+                PathBuf::from("vuick-config.json")
+            } else {
+                dir.join("config.json")
+            }
+        }
     }
 
     /// 旧版本目录 `%APPDATA%\gpui-editor` 一次性迁移到新目录 `%APPDATA%\vuick`：
     /// 首次启动检测到旧目录存在且新目录不存在时，整目录递归复制（config.json /
     /// `session/` / `pdf_bookmarks.json` / `reading_progress.json` / 日志等一并带走），
-    /// 用户数据零丢失；复制成功后才读新路径，此后旧目录内容不再被消费。仅生产路径
-    /// 触发（测试隔离目录不经此函数）；旧目录不存在 / 新目录已存在 → 无操作。
+    /// 用户数据零丢失；复制成功后才读新路径，此后旧目录内容不再被消费。仅 Windows
+    /// （非 Windows 无旧目录迁移需求）；生产路径触发（测试隔离目录不经此函数）——
+    /// 旧目录不存在 / 新目录已存在 → 无操作。
+    #[cfg(windows)]
     fn migrate_legacy_appdata(appdata_dir: &Path) {
         #[cfg(any(test, feature = "test-mode"))]
         {

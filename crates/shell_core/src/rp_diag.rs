@@ -4,10 +4,11 @@
 //!   （本批 Pattern 7），不进入热路径。
 //! - 只在**事件点**调用（save / apply / apply_text_restore / check 置脏 / 预览收敛），
 //!   不逐帧刷屏。
-//! - 追加写 `%APPDATA%\vuick\rp_diag.log`（测试构建写 `%TEMP%\vuick-rp-diag.log`，
-//!   不污染真实 APPDATA；`reading_progress` 测试同款隔离姿势）。旧实现生产侧曾取
+//! - 追加写平台配置目录下 `rp_diag.log`（Windows `%APPDATA%\vuick\rp_diag.log`；非
+//!   Windows XDG 配置目录，见 `base::paths`；测试构建写 `%TEMP%\vuick-rp-diag.log`，
+//!   不污染真实配置目录；`reading_progress` 测试同款隔离姿势）。旧实现生产侧曾取
 //!   `UserPrefs::config_path().parent()`（`VUICK_CONFIG` 覆盖时 ≠ APPDATA）；收敛到
-//!   `base::diag::diag_log_path` 的统一 APPDATA 口径后与 `editor::diag` 同址、行可交错归因。
+//!   `base::diag::diag_log_path` 的统一口径后与 `editor::diag` 同址、行可交错归因。
 //! - 结束运行**不清理**，保留供主 agent 读取；`.gitignore` 收 `rp_diag.log` 不入库。
 //! - 与 `AppHost::is_test_build` 同口径判定测试构建（本模块无 host，运行时判 env）。
 
