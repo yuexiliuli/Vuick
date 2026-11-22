@@ -1,0 +1,82 @@
+name: release
+
+# Windows release 自动构建 + 发布。
+# 触发：push `v*` tag（自动建 GitHub Release 并附 zip）、或手动 workflow_dispatch。
+# 复用 scripts/package.ps1（自带 FFmpeg 瘦包自动供给 / pdfium 自动下载 / 无 .lib 断言 / 导入表校验）。
+# 范围：Windows-only（Linux/macOS 完善后再扩矩阵）。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: build windows release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust 工具链（对齐 rust-toolchain.toml 1.96.0）
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+
+      - name: Rust 缓存
+        uses: Swatinem/rust-cache@v2
+
+      - name: 安装 LLVM（bindgen 需 LIBCLANG_PATH + llvm-objdump 判定导入表）
+        run: choco install llvm -y --no-progress
+        shell: pwsh
+
+      - name: 安装 MSYS2 UCRT64 工具链（FFmpeg 瘦包构建依赖）
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            base-devel
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-nasm
+
+      - name: 准备 FFmpeg n9.0.2 源码
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP 'ffmpeg-src'
+          git clone --depth 1 --branch n9.0.2 https://github.com/FFmpeg/FFmpeg.git $src
+          Write-Output "FFMPEG_SRC=$src"
+          Write-Output "FFMPEG_DIR_DEFAULT=$env:RUNNER_TEMP"
+
+      - name: 打包（package.ps1 自动供给 FFmpeg 瘦包 + pdfium）
+        shell: pwsh
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP 'ffmpeg-src'
+          $ffmpegPrefix = Join-Path $env:RUNNER_TEMP 'ffmpeg-slim'
+          pwsh ./scripts/package.ps1 -FfmpegSrc $src -FfmpegPrefix $ffmpegPrefix
+
+      - name: 收集产物（exe + bin + third_party；不含 docs-archive 等开发档案）
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $zip  = Join-Path $env:GITHUB_WORKSPACE "vuick-win64-$tag.zip"
+          Compress-Archive -Path (Join-Path $dist 'vuick.exe'), `
+                           (Join-Path $dist 'bin'), `
+                           (Join-Path $dist 'third_party') `
+            -DestinationPath $zip -Force
+          Write-Output "ZIP=$zip  size=$((Get-Item $zip).Length) bytes"
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vuick-win64-*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
