@@ -70,6 +70,7 @@ pub(crate) fn pdfium_reuse_decision(
 /// 2. 可执行文件 `bin\pdf\`：`<版本号>.dll`（分发布局：exe 在 dist 根、pdfium 在 `dist\bin\pdf\`）
 /// 3. 可执行文件同目录：`<版本号>.dll`（旁置分发/就地升级）
 /// 4. 项目 `resources/pdfium/`：`<版本号>.dll`（开发树自带）
+///
 /// （2026-11-22 起无内嵌兜底——单文件分发不再可用，见模块头。）
 fn locate_dll() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("VUICK_PDFIUM") {
