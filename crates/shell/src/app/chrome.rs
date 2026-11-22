@@ -265,6 +265,86 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 「主题…」子菜单预设选择：写 `model.theme_preset` → 统一走 [`Self::refresh_theme_ui`]
+    /// 重建有效主题 → 持久化。预设选择与「跟随系统/亮/暗」三态**正交**（只动
+    /// `theme_preset`，不动 `theme_pref`/`dark_mode`）；自定义重点色叠加在当前预设上。
+    pub(super) fn set_theme_preset(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.model.borrow_mut().theme_preset = id.to_string();
+        self.refresh_theme_ui(cx);
+        self.persist_prefs();
+    }
+
+    /// 写自定义重点色（取色回调 / 测试共用）：校验 `#rrggbb` 合法才落
+    /// `model.theme_custom["colors.accent"]` → apply → persist。**非法 hex / 空 → 不落盘、
+    /// 保持原值**（评审 P1-7：保留最近有效值；非法值经 `merge_spectrum` 也会被跳过，此处
+    /// 前置拒绝保证存储面也干净）。
+    pub(super) fn set_theme_accent(&mut self, hex: String, cx: &mut Context<Self>) {
+        if ui::theme::ColorToken::parse_hex(&hex).is_none() {
+            return;
+        }
+        self.model
+            .borrow_mut()
+            .theme_custom
+            .insert("colors.accent".to_string(), hex);
+        self.refresh_theme_ui(cx);
+        self.persist_prefs();
+    }
+
+    /// 还原重点色：删 `model.theme_custom["colors.accent"]` → apply → persist（`merge_spectrum`
+    /// 回落 preset 值）。无自定义重点色时 no-op（菜单项置灰、点击期兜底拒绝的表现）。
+    pub(super) fn reset_theme_accent(&mut self, cx: &mut Context<Self>) {
+        if self.model.borrow_mut().theme_custom.remove("colors.accent").is_none() {
+            return;
+        }
+        self.refresh_theme_ui(cx);
+        self.persist_prefs();
+    }
+
+    /// 「自定义重点色…」取色入口：镜像 [`Self::pick_custom_pdf_bg`] 的 **K167 姿势**——
+    /// Windows 原生取色（CHOOSECOLORW，FFI 在 `shell_pdf::bg::pick_color`）移到**后台线程**，
+    /// 结果经 `futures::oneshot` + `window.spawn(...).detach()` 回传主线程再落地
+    /// ([`Self::set_theme_accent`])。原因同 PDF：事件帧持有 gpui App RefCell，模态消息泵
+    /// 同线程重入窗程 → 异步续体二次 `update_entity` 会 `borrow_mut` panic。确定/取消由
+    /// `pick_color` 返回 `None`（取消）区分；取消不落盘、保持原值。
+    pub(super) fn pick_custom_theme_accent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(all(windows, not(test)))]
+        {
+            use raw_window_handle::HasWindowHandle as _;
+            // 所有者句柄：当前窗口 HWND（`pick_custom_pdf_bg` 同款提取姿势）——让取色
+            // 对话框模态挂在本窗口上；取不到 → 零所有者仍可弹（顶层独立对话框）。
+            let mut owner: isize = 0;
+            if let Ok(handle) = window.window_handle()
+                && let raw_window_handle::RawWindowHandle::Win32(win32) = From::from(handle)
+            {
+                owner = win32.hwnd.get();
+            }
+            // 初始色 = 当前全局 accent（`Theme::apply` 已合并 preset+custom 的产物；
+            // 无自定义值时即 preset 值）。
+            let initial: gpui::Hsla = ui::theme::Theme::global(cx).colors.accent.into();
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let entity = cx.entity();
+            let _ = std::thread::Builder::new()
+                .name("theme-accent-dialog".into())
+                .spawn(move || {
+                    let r = shell_pdf::bg::pick_color(Some(initial), owner);
+                    let _ = tx.send(r);
+                });
+            window
+                .spawn(cx, async move |cx| {
+                    if let Ok(Some(hex)) = rx.await {
+                        let _ = cx.update_window_entity(&entity, move |this, _window, cx| {
+                            this.set_theme_accent(hex, cx);
+                        });
+                    }
+                })
+                .detach();
+        }
+        #[cfg(any(not(windows), test))]
+        {
+            let _ = (window, cx);
+        }
+    }
+
     /// 汇总当前偏好（主题三态 / 字号 / 侧栏宽度 / 会话与托盘开关 / 打开文件夹根 /
     /// 最近打开），供持久化与「导出设置」（`settings_xfer`）共用同一口径——导出即
     /// 「当前交互态」，两者始终一致。

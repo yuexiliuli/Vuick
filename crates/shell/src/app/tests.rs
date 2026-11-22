@@ -16,3 +16,4 @@ include!("tests/file_tree.rs");
 include!("tests/panes.rs");
 include!("tests/about.rs");
 include!("tests/theme_hot.rs");
+include!("tests/theme_settings_ui.rs");

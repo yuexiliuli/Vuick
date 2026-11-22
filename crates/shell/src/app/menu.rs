@@ -430,6 +430,17 @@ impl EditorApp {
             weak.clone(),
             |this, _window, cx| this.follow_system_theme(cx),
         ))
+        // 全站语义色主题「主题…」二级子菜单：预设（6 人格色，当前预设 ✓）+ 自定义重点色/
+        // 还原——与 PDF「背景色」flyout（pdf_host.rs `pdf_bg_*_item`）同款样式/交互姿势，
+        // 预设选择与「跟随系统/亮/暗」三态正交（只动 theme_preset）。
+        .item({
+            PopupMenuItem::element(move |_, _| {
+                div()
+                    .debug_selector(|| "menu-theme-submenu".into())
+                    .child("主题…")
+            })
+            .flyout(Self::theme_flyout_items(&weak))
+        })
         // 音乐播放器：整窗音乐模式开关（Ctrl+M / 命令面板 / 菜单共用同一动作）。
         .item(Self::menu_action_item(
             TOGGLE_MUSIC_PLAYER.menu_label,
@@ -535,6 +546,116 @@ impl EditorApp {
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_reuse_media_window(window, cx));
+        })
+    }
+
+    /// 「主题…」二级子菜单装配：[`PRESETS`] 全部预设（当前 `model.theme_preset` ✓）
+    /// → 分隔线 → 自定义重点色…（取色）→ 还原重点色（无自定义值时置灰）。
+    /// 与 PDF「背景色」flyout（pdf_host.rs `pdf_bg_*_item`）样式/交互逐字仿照：
+    /// ✓ 前缀独立元素 + `keep_open`——配置主题时菜单保持展开、✓ 即时移位
+    /// （`set_theme_preset` 触发 `refresh_theme_ui` 的 notify 后条目重渲染读模型）。
+    /// `pub(super)`：`tests/theme_settings_ui.rs` 结构护栏断言（同 `render_menu_buttons`）。
+    pub(super) fn theme_flyout_items(weak: &gpui::WeakEntity<Self>) -> Vec<PopupMenuItem> {
+        let Some(app) = weak.upgrade() else {
+            return Vec::new();
+        };
+        let mut children = Vec::with_capacity(ui::theme::PRESETS.len() + 3);
+        for preset in ui::theme::PRESETS {
+            children.push(Self::theme_preset_item(app.clone(), preset.id, preset.name));
+        }
+        children.push(PopupMenuItem::separator());
+        children.push(Self::theme_custom_accent_item(app.clone()));
+        children.push(Self::theme_reset_accent_item(app));
+        children
+    }
+
+    /// 「主题…」预设项：当前预设前导 ✓（`pdf_bg_preset_item` 同款样式）；点击 →
+    /// [`EditorApp::set_theme_preset`]（apply + persist，菜单保持展开、✓ 即时移位）。
+    fn theme_preset_item(
+        app: gpui::Entity<Self>,
+        id: &'static str,
+        name: &'static str,
+    ) -> PopupMenuItem {
+        let app2 = app.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let checked = app.read(cx).model.borrow().theme_preset == id;
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(18.)).child(if checked { "✓" } else { "" }))
+                .child(name)
+                .debug_selector(move || format!("menu-theme-preset-{id}").into())
+                .into_any_element()
+        })
+        .keep_open()
+        .on_click(move |_, _window, cx| {
+            app2.update(cx, |this, cx| this.set_theme_preset(id, cx));
+        })
+    }
+
+    /// 「自定义重点色…」：Windows 原生取色（[`EditorApp::pick_custom_theme_accent`]，K167
+    /// 后台线程 + oneshot 回传）→ 写 `theme_custom["colors.accent"]` + apply + persist。
+    /// 已有自定义重点色 → ✓ 前缀；取消 / 非法 → 不变（保持最近有效值）。`keep_open`
+    /// 仿 `pdf_bg_custom_item`（试色过程菜单保持展开）。
+    fn theme_custom_accent_item(app: gpui::Entity<Self>) -> PopupMenuItem {
+        let app2 = app.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let checked = app
+                .read(cx)
+                .model
+                .borrow()
+                .theme_custom
+                .contains_key("colors.accent");
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(18.)).child(if checked { "✓" } else { "" }))
+                .child("自定义重点色…")
+                .debug_selector(|| "menu-theme-custom-accent".into())
+                .into_any_element()
+        })
+        .keep_open()
+        .on_click(move |_click, window, cx| {
+            app2.update(cx, |this, cx| this.pick_custom_theme_accent(window, cx));
+        })
+    }
+
+    /// 「还原重点色」：删 `theme_custom["colors.accent"]` → apply + persist（回落 preset 值）。
+    /// 无自定义重点色 → **置灰**（渲染期灰字 + 点击期兜底：`reset_theme_accent` 无该 key
+    /// 时 no-op，双保险，同 [`Self::reuse_media_window_menu_item`] 姿势）。
+    fn theme_reset_accent_item(app: gpui::Entity<Self>) -> PopupMenuItem {
+        let app2 = app.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let enabled = app
+                .read(cx)
+                .model
+                .borrow()
+                .theme_custom
+                .contains_key("colors.accent");
+            let chrome = ui::theme::Theme::global(cx).chrome;
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(18.)).child(""))
+                .child(
+                    div()
+                        .text_color(if enabled {
+                            chrome.text_primary
+                        } else {
+                            chrome.text_tertiary
+                        })
+                        .child("还原重点色"),
+                )
+                .debug_selector(|| "menu-theme-reset-accent".into())
+                .into_any_element()
+        })
+        .keep_open()
+        .on_click(move |_click, _window, cx| {
+            app2.update(cx, |this, cx| this.reset_theme_accent(cx));
         })
     }
 

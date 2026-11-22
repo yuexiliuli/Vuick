@@ -229,7 +229,7 @@ impl EditorApp {
                 )
             }};
         }
-        vec![
+        let mut items = vec![
             // 文件
             command!("文件", NEW_FILE, |this, window, cx| {
                 this.new_tab(window, cx)
@@ -292,7 +292,25 @@ impl EditorApp {
             command!("设置", FOLLOW_THEME, |this, _window, cx| {
                 this.follow_system_theme(cx)
             }),
-        ]
+        ];
+        // 「主题…」预设镜像（菜单「查看 → 主题…」的全局可达平铺）：palette 条目无子菜单
+        // （ui::palette::PaletteItem 单层平铺），把 [`ui::theme::PRESETS`] 各预设注册一条。
+        // 上下文无关全局可达；点击 → [`EditorApp::set_theme_preset`]（apply + persist），
+        // 与菜单预设项同一入口、同一语义边界（预设与「跟随系统/亮/暗」三态正交）。
+        for preset in ui::theme::PRESETS {
+            let w = weak.clone();
+            let id = preset.id;
+            let name = preset.name;
+            items.push(PaletteItem::new(
+                format!("主题：{name}"),
+                "设置/主题",
+                "",
+                move |_window, cx| {
+                    let _ = w.update(cx, |this, cx| this.set_theme_preset(id, cx));
+                },
+            ));
+        }
+        items
     }
 
     /// 文件模式条目：已打开选项卡（名称 + 路径提示），末尾追加「打开文件…」入口。
