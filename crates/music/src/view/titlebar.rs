@@ -186,11 +186,24 @@ pub fn render(window: &mut Window, cx: &mut App) -> AnyElement {
                 .relative()
                 .rounded(px(3.))
                 .overflow_hidden()
-                .child(theme::gradient_cover((theme::accent(), theme::pink()), 3.0))
+                .debug_selector(|| "music-title-logo".into())
+                // 背景渐变 absolute-inset-0 铺满（135deg accent→pink，对齐原型 `.title-bar-icon`；
+                // gradient_cover 的 (light,dark) = dark 停 0% / light 停 100%）。
+                .child(theme::gradient_cover((theme::pink(), theme::accent()), 3.0))
+                // 前景白 disc 居中叠在渐变上（不作文本流兄弟，避免被挤到角落）。
                 .child(
-                    Icon::new(IconName::Disc)
-                        .size(px(10.))
-                        .text_color(theme::text()),
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .debug_selector(|| "music-title-logo-fg".into())
+                        .child(
+                            Icon::new(IconName::Disc)
+                                .size(px(10.))
+                                .text_color(theme::text()),
+                        ),
                 ),
         )
         .child(

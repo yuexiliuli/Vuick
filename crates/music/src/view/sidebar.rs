@@ -60,22 +60,25 @@ impl super::MusicView {
                     .w(px(36.))
                     .h(px(36.))
                     .rounded(px(10.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    // 渐变方块：canvas 画 accent→pink 135deg（原型 `.logo-icon`）。
+                    .relative()
+                    .debug_selector(|| "music-logo".into())
+                    // 背景渐变 absolute-inset-0 铺满（135deg accent→pink，对齐原型 `.logo-icon`；
+                    // gradient_cover 的 (light,dark) = dark 停 0% / light 停 100%）。
+                    .child(theme::gradient_cover((theme::pink(), theme::accent()), 10.0))
+                    // 前景白 disc 居中叠在渐变上（不再作 flex 兄弟，避免被挤到渐变旁）。
                     .child(
                         div()
-                            .size_full()
-                            .child(theme::gradient_cover(
-                                (theme::pink(), theme::accent()),
-                                10.0,
-                            )),
-                    )
-                    .child(
-                        Icon::new(IconName::Disc)
-                            .size(px(20.))
-                            .text_color(theme::text()),
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .debug_selector(|| "music-logo-fg".into())
+                            .child(
+                                Icon::new(IconName::Disc)
+                                    .size(px(20.))
+                                    .text_color(theme::text()),
+                            ),
                     ),
             )
             .child(
@@ -259,19 +262,28 @@ impl super::MusicView {
                     .w(px(32.))
                     .h(px(32.))
                     .rounded(px(16.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
+                    .relative()
+                    .debug_selector(|| "music-user-avatar".into())
+                    // 背景渐变 absolute-inset-0 铺满（135deg accent→pink，对齐原型 `.user-avatar`；
+                    // gradient_cover 的 (light,dark) = dark 停 0% / light 停 100%）。
+                    .child(theme::gradient_cover((theme::pink(), theme::accent()), 16.0))
+                    // 前景「K」字母居中叠在渐变上（不再作 flex 兄弟，避免错位）。
                     .child(
                         div()
-                            .size_full()
-                            .child(theme::gradient_cover(
-                                (theme::pink(), theme::accent()),
-                                16.0,
-                            )),
-                    )
-                    .child(div().text_size(px(14.)).font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme::text()).child("K")),
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .debug_selector(|| "music-user-avatar-fg".into())
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child("K"),
+                            ),
+                    ),
             )
             .child(
                 div()

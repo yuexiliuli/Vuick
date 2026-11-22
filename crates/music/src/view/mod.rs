@@ -613,8 +613,7 @@ impl MusicView {
             "right" => self.player.update(cx, |p, cx| p.next(cx)),
             "escape" => {
                 if self.state.fs_open {
-                    self.state.fs_open = false;
-                    cx.notify();
+                    self.exit_fullscreen(cx);
                 } else {
                     // 退出音乐模式：把当前播放位置写入偏好并 flush（Esc 退出是一致性落盘点；
                     // Ctrl+M 退出由 on_tick 周期 flush ≤5s 兜底）。
@@ -708,12 +707,33 @@ impl MusicView {
         self.player.update(cx, |p, cx| p.toggle_shuffle(cx));
     }
 
+    /// 退出全屏（中心化清理）：关 `fs_open` 并清空全屏元素悬停残留的提示/高亮。
+    ///
+    /// 全屏浮层整体从树上移除后其 hover-leave 事件不再分发——若不清 `tip`/`tip_box`/
+    /// `fs_hover`，`render_tooltip`（共享提示层、不按 `fs_open` 门控）会让「退出全屏」
+    /// 之类的 tooltip 永远挂在屏幕上（其它按钮的 hover-leave 按文案匹配清不掉它，动鼠标
+    /// 也无济于事）。三条退出路径（Esc / fs-close 点击 / `toggle_fs`）统一走本方法。
+    pub(super) fn exit_fullscreen(&mut self, cx: &mut Context<Self>) {
+        self.state.fs_open = false;
+        // 清全屏元素悬停提示/高亮：浮层被移除后其 hover-leave 不再分发，残留 tip 会让
+        // tooltip 永挂屏幕（render_tooltip 未按 fs_open 门控）。
+        self.tip = None;
+        self.tip_box = None;
+        self.fs_hover = None;
+        cx.notify();
+    }
+
     pub fn toggle_fs(&mut self, cx: &mut Context<Self>) {
-        self.state.fs_open = !self.state.fs_open;
         // 全屏切换：双歌词实例复位跟随/手动态（换渲染上下文从自动跟随重新开始）。
         self.lyrics_right.update(cx, |lv, _| lv.reset_follow());
         self.lyrics_fs.update(cx, |lv, _| lv.reset_follow());
-        cx.notify();
+        if self.state.fs_open {
+            // 处于全屏 → 中心化退出（顺带清全屏元素悬停残留 tip/高亮）。
+            self.exit_fullscreen(cx);
+        } else {
+            self.state.fs_open = true;
+            cx.notify();
+        }
     }
 
     fn set_section(&mut self, section: MainSection, cx: &mut Context<Self>) {

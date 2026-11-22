@@ -1328,6 +1328,12 @@ impl EditorApp {
     #[doc(hidden)]
     pub fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.maybe_redirect_media_open(path, window, cx) {
+            // 媒体重定向成功（已交给新开/复用媒体窗口）：由**发起窗口**记录最近。
+            // 对齐 host_impl.rs 跨窗语义——媒体窗口模型写盘不广播回主窗口内存，本会话内
+            // 主窗口「最近打开」读自身 model，故在发起窗入口即记录，保证本会话主窗口
+            // 立即可见。媒体窗口自身打开动作另在媒体窗模型记一次（push_recent 去重，无害）。
+            // 音频/视频统一：媒体窗口开的都算「打开过」。
+            self.record_recent_file(&PathBuf::from(path.trim()));
             return;
         }
         self.open_file_here(path, window, cx);
@@ -1347,7 +1353,12 @@ impl EditorApp {
         // 最近打开等全部进 open_file 的中心入口（clap 一下）。路由判定在
         // `shell_media::music::is_audio_path`（域 crate）。
         if shell_media::music::is_audio_path(&p) {
-            self.open_music_path(p, window, cx);
+            self.open_music_path(p.clone(), window, cx);
+            // 「发起即记录」口径：open_music_path 无成败返回，与 epub/pdf/image 分支的
+            // 「异步打开即记录」对称。覆盖 media_new_window=false（音乐在当前窗口打开）
+            // 与任何直调 open_file_here 的路径；media_new_window=true 时由 open_file
+            // 的重定向分支记录（两分支正交不叠，push_recent 去重）。
+            self.record_recent_file(&p);
             return;
         }
         // EPUB：先建选项卡 + 立即返回，解析放后台线程（对比 PDF 同款），避免大书卡首帧。

@@ -150,6 +150,116 @@ use common::*;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 打开音频文件进入最近记录（**非重定向路径**）：`media_new_window=false` 时音乐在
+    /// 当前窗口打开，`open_file_here` 音频分支应记录最近（修复 2）。判别式：撤掉修复 2
+    /// （音频分支 `open_music_path` 后不 record_recent_file）本测试红；修复 1 与本测试
+    /// 无关——媒体重定向未触发（`registry_window_count` 恒 1 守卫）。
+    #[gpui::test]
+    async fn open_audio_records_recent_in_current_window(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 清本实例最近列表（K8：config load 无 cfg(test) 门控，勿依赖机器真实 config）。
+        cx.update(|_w, cx| {
+            app.update(cx, |app, _| {
+                app.model.borrow_mut().recent_folders.clear();
+                app.model.borrow_mut().recent_files.clear();
+            });
+        });
+        // 音频夹具：假 .mp3（路由只看扩展名，见 media.rs/音乐库同款姿势；id3 字节不要求
+        // 可解码，打开失败停在占位不影响路由断言）。
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-recent-audio-current-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let s = dir.join("示例曲目.mp3");
+        std::fs::write(&s, b"id3").unwrap();
+        let ss = s.to_string_lossy().into_owned();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                // 断言对象 = 本窗口音乐模式路由：显式关掉媒体重定向开关（默认开），
+                // 否则 open_file 会把音频改投同进程新窗口（见 media_window.rs 行为表）。
+                app.model.borrow_mut().media_new_window = false;
+                app.open_file(&ss, window, cx);
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        // 守卫：重定向未触发，确认本测试走的是 open_file_here 音频分支。
+        assert_eq!(
+            cx.update(|_w, cx| cx.global::<EditorAppRegistry>().windows.len()),
+            1,
+            "media_new_window=false 应在当前窗口打开（不新开媒体窗口）"
+        );
+        let (mode, has_view) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.model.borrow().music_mode, a.music.is_some())
+        });
+        assert!(mode && has_view, "前置：打开音频应进入真实音乐模式（路由成立）");
+        let files = cx.update(|_w, cx| app.read(cx).model.borrow().recent_files.clone());
+        assert_eq!(files, vec![ss.clone()], "打开音频（当前窗口）应记录最近且置顶");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 打开音频文件进入最近记录（**重定向路径**）：`media_new_window=true`（默认）时
+    /// `open_file` 把音频交给新开的媒体窗口，由**发起窗口**（主窗口）在重定向分支记录
+    /// 最近（修复 1）。判别式：撤掉修复 1（重定向分支 return 前不 record_recent_file）
+    /// 本测试红；修复 2 与本测试无关——重定向触发后发起窗不再走 open_file_here
+    /// （`registry_window_count` 恒 2 守卫 + 断言的是发起窗模型）。
+    #[gpui::test]
+    async fn open_audio_records_recent_from_initiating_window_on_redirect(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            app.update(cx, |app, _| {
+                app.model.borrow_mut().recent_folders.clear();
+                app.model.borrow_mut().recent_files.clear();
+            });
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-recent-audio-redir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let s = dir.join("示例曲目.mp3");
+        std::fs::write(&s, b"id3").unwrap();
+        let ss = s.to_string_lossy().into_owned();
+
+        // 显式钉死开关（不依赖机器真实 config 的默认值）：开+复用 → 重定向新开媒体窗口。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.model.borrow_mut().media_new_window = true;
+                app.model.borrow_mut().reuse_media_window = true;
+                app.open_file(&ss, window, cx);
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        // 守卫：重定向确实发生（新开媒体窗口），本测试走的正是重定向记录分支。
+        assert_eq!(
+            cx.update(|_w, cx| cx.global::<EditorAppRegistry>().windows.len()),
+            2,
+            "media_new_window=true 应重定向新开媒体窗口"
+        );
+        // 发起窗口（主窗口）「最近打开」应含该音频：本会话内主窗口立即可见。
+        let files = cx.update(|_w, cx| app.read(cx).model.borrow().recent_files.clone());
+        assert_eq!(files, vec![ss.clone()], "重定向打开音频应由发起窗记录最近且置顶");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 统一的「打开最近」面板 → 渲染泵帧（deferred 浮层 + 弹簧淡入）。
     fn pump_panel(cx: &mut VisualTestContext) {
         for _ in 0..3 {

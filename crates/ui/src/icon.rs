@@ -218,7 +218,10 @@ impl IconName {
                 "<path d=\"M12 3l1.9 4.9L19 9.6l-4.2 1.8L12 16l-2.8-4.6L5 9.6l5.1-1.7z\"/>"
             }
             IconName::Disc => {
-                "<circle cx=\"12\" cy=\"12\" r=\"9\"/><circle cx=\"12\" cy=\"12\" r=\"2\" fill=\"currentColor\" stroke=\"currentColor\"/>"
+                // Material disc_full（原型 logo 图标）：实心唱片 + 中心同心镂空环（evenodd 镂空）。
+                // fill=currentColor 压渐变上呈白唱片，不依赖外层 stroke（原型 `.logo-icon` 白色）。
+                "<path fill=\"currentColor\" stroke=\"none\" fill-rule=\"evenodd\" \
+                    d=\"M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 13.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z\"/>"
             }
             // 播放/暂停（Feather 风格实心多边形，stroke 描边统一）
             #[cfg(feature = "video")]
@@ -451,6 +454,30 @@ mod tests {
             );
             assert!(m.ends_with("</svg>"), "{:?} 应为闭合 svg", name);
         }
+    }
+
+    /// Disc 专用回归：logo/avatar 用（`crates/music/src/view/{sidebar,titlebar}.rs`）。
+    /// 实心唱片（Material disc_full）：`path` fill=currentColor + evenodd 镂空中心环，
+    /// 不依赖外层 stroke——压渐变上呈白唱片，而不是 Feather 细线圆环（原型 `.logo-icon`）。
+    #[test]
+    fn disc_is_solid_record_with_evenodd_core_hole() {
+        let m = IconName::Disc.svg_markup();
+        assert!(
+            m.contains("fill=\"currentColor\""),
+            "Disc 应 currentColor 实心填充（压渐变上呈白唱片）"
+        );
+        assert!(
+            m.contains("fill-rule=\"evenodd\""),
+            "Disc 应 evenodd 镂空中心环（实心唱片 + 空心圆心）"
+        );
+        assert!(
+            m.contains("d=\"M12 2C6.48"),
+            "Disc 应为 Material disc_full 唱片路径"
+        );
+        assert!(
+            !m.contains("<circle"),
+            "Disc 不再用 Feather 细线圆环（外层圆 stroke + 小圆 fill）"
+        );
     }
 
     /// 结构性省写（针对 `Icon::paint` 每帧重建 `svg_markup()`+key 热路径浪费，见

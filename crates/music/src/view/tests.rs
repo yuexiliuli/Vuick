@@ -2398,6 +2398,128 @@ fn hover_fs_button_keeps_highlight_and_tip(cx: &mut TestAppContext) {
     assert!(tooltip_showing(&view, wcx), "全屏钮满 500ms 也应显示浮层");
 }
 
+// ---- 全屏「退出清残留 tooltip」回归（根因：退出全屏 = 浮层整体从树移除，其 hover-leave
+//      不再分发 → `tip`/`tip_box` 残留；`render_tooltip` 为共享提示层、不按 `fs_open` 门控，
+//      只要 tip 存在且过 TOOLTIP_SHOW_MS 就永远挂屏。修复 = 三条退出路径统一走中心化
+//      `exit_fullscreen` 清状态。判定式：撤掉 exit_fullscreen 内三行清除 → 本组用例红） ----
+
+/// 用例 T-FS1：Esc 退出全屏 → 清空悬停残留的「退出全屏」提示（不残留浮层）。
+#[gpui::test]
+fn fs_exit_clears_stuck_tooltip_on_escape(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_view(cx, player);
+    // 进入全屏（真实 F 键路径）。
+    wcx.simulate_keystrokes("f");
+    wcx.run_until_parked();
+    assert!(
+        wcx.update(|_w, app| view.read(app).state.fs_open),
+        "前置：F 应打开全屏"
+    );
+    // 模拟悬停全屏关闭钮（直调统一处理器，等价于 on_hover 进入动作写入的状态）。
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| {
+            v.set_fs_hover_and_tip("fs-close", Some("退出全屏"), true, cx);
+        });
+    });
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert_eq!(
+        tooltip_text(&view, wcx).as_deref(),
+        Some("退出全屏"),
+        "前置：悬停 fs-close 应设「退出全屏」提示"
+    );
+    assert!(tooltip_showing(&view, wcx), "前置：满 500ms 悬停态应显示浮层");
+    // Esc 退出全屏 → 残留提示必须被清空。
+    wcx.simulate_keystrokes("escape");
+    wcx.run_until_parked();
+    assert!(
+        !wcx.update(|_w, app| view.read(app).state.fs_open),
+        "Esc 应退出全屏"
+    );
+    assert_eq!(
+        tooltip_text(&view, wcx),
+        None,
+        "Esc 退出全屏应清空残留 tooltip（撤 exit_fullscreen 清除=红）"
+    );
+    assert!(
+        !tooltip_showing(&view, wcx),
+        "Esc 退出全屏后浮层不应残留显示（撤 exit_fullscreen 清除=红）"
+    );
+}
+
+/// 用例 T-FS2：点击全屏关闭钮退出 → 同样清空残留提示（真实 on_click 路径）。
+#[gpui::test]
+fn fs_close_click_clears_stuck_tooltip(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    // 打开全屏并重渲染一帧（fs-close debug 盒写入）。
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_fs(cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| {
+            v.set_fs_hover_and_tip("fs-close", Some("退出全屏"), true, cx);
+        });
+    });
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert!(tooltip_showing(&view, wcx), "前置：满 500ms 悬停态应显示浮层");
+    // 点击全屏关闭钮（真实 on_click 路径）→ 退出并清残留。
+    click_button(wcx, "fs-close");
+    assert!(
+        !wcx.cx.read(|app| view.read(app).state.fs_open),
+        "点击 fs-close 应退出全屏"
+    );
+    assert_eq!(
+        tooltip_text(&view, wcx),
+        None,
+        "点击 fs-close 退出应清空残留 tooltip（撤 exit_fullscreen 清除=红）"
+    );
+    assert!(
+        !tooltip_showing(&view, wcx),
+        "点击退出后浮层不应残留显示（撤 exit_fullscreen 清除=红）"
+    );
+}
+
+/// 用例 T-FS3：F 键（toggle_fs）再按一下退出全屏 → 同样清空残留提示（进入/退出对称）。
+#[gpui::test]
+fn fs_toggle_off_clears_stuck_tooltip(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_view(cx, player);
+    wcx.simulate_keystrokes("f");
+    wcx.run_until_parked();
+    assert!(
+        wcx.update(|_w, app| view.read(app).state.fs_open),
+        "前置：F 应打开全屏"
+    );
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| {
+            v.set_fs_hover_and_tip("fs-close", Some("退出全屏"), true, cx);
+        });
+    });
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert!(tooltip_showing(&view, wcx), "前置：满 500ms 悬停态应显示浮层");
+    // 再按 F（toggle_fs 关）→ 退出并清残留。
+    wcx.simulate_keystrokes("f");
+    wcx.run_until_parked();
+    assert!(
+        !wcx.update(|_w, app| view.read(app).state.fs_open),
+        "再按 F 应退出全屏"
+    );
+    assert_eq!(
+        tooltip_text(&view, wcx),
+        None,
+        "toggle_fs 退出应清空残留 tooltip（撤 exit_fullscreen 清除=红）"
+    );
+    assert!(
+        !tooltip_showing(&view, wcx),
+        "toggle_fs 退出后浮层不应残留显示（撤 exit_fullscreen 清除=红）"
+    );
+}
+
 /// 用例 T5：快速划过（<500ms 即离开）→ 不残留浮层。
 #[gpui::test]
 fn hover_quick_sweep_leaves_no_tooltip(cx: &mut TestAppContext) {
@@ -3254,6 +3376,37 @@ async fn title_bar_does_not_overlap_content_below(cx: &mut TestAppContext) {
         row0.origin.y.as_f32() > bar.origin.y.as_f32(),
         "首行应位于标题栏之下（标题栏只占新顶部行）"
     );
+}
+
+/// logo/头像「叠放」回归：渐变背景 absolute-inset-0 铺满盒，前景（Disc /「K」）置于
+/// absolute-inset-0 的居中覆盖层内叠其上——前景覆盖层布局盒必须正好=盒本身。曾把渐变与
+/// 前景当 flex 兄弟 → 图标被挤到渐变旁/角落（对齐原型 `.logo-icon`/`.title-bar-icon`/
+/// `.user-avatar`，三处同款布局 bug 修复后此结构不变式成立）。
+#[gpui::test]
+async fn logo_and_avatar_foreground_overlay_fills_gradient_box(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+
+    for (box_sel, fg_sel, _exp) in [
+        ("music-logo", "music-logo-fg", 36.0),
+        ("music-user-avatar", "music-user-avatar-fg", 32.0),
+        ("music-title-logo", "music-title-logo-fg", 16.0),
+    ] {
+        let b = wcx.debug_bounds(box_sel).expect("盒应渲染");
+        let fg = wcx.debug_bounds(fg_sel).expect("前景居中覆盖层应渲染");
+        let near = |a: f32, c: f32| (a - c).abs() < 0.5;
+        assert!(
+            near(fg.origin.x.as_f32(), b.origin.x.as_f32())
+                && near(fg.origin.y.as_f32(), b.origin.y.as_f32())
+                && near(fg.size.width.as_f32(), b.size.width.as_f32())
+                && near(fg.size.height.as_f32(), b.size.height.as_f32()),
+            "{box_sel} 前景覆盖层应 absolute-inset-0 正好填满盒（居中叠渐变上）：fg={fg:?} box={b:?}"
+        );
+    }
 }
 
 /// 全屏浮层（fs）盖住标题栏：标题栏仅常驻主界面，`fs_open` 时 `music-fs` 浮层 absolute

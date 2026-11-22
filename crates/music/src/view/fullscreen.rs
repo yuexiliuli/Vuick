@@ -182,11 +182,11 @@ impl super::MusicView {
     fn fs_close_btn(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let hovered = self.fs_hover == Some("fs-close");
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| {
-            this.state.fs_open = false;
-            cx.notify();
+            this.exit_fullscreen(cx);
         });
         div()
             .id("fs-close")
+            .debug_selector(|| "fs-close".into())
             .relative()
             .w(px(theme::FS_CTRL_BTN_SIZE))
             .h(px(theme::FS_CTRL_BTN_SIZE))
