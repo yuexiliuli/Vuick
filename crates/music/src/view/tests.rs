@@ -4,13 +4,13 @@
 //! 歌曲行点击 → `player.current` 指向该行（`handle_play_idx` 直调，不做像素命中）；
 //! 搜索过滤纯函数（大小写不敏感 / 中文 / 空查询）；默认状态。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use gpui::{AppContext as _, Bounds, Entity, MouseButton, Pixels, TestAppContext, VisualTestContext, px};
+use gpui::{AppContext as _, Bounds, Entity, Focusable as _, MouseButton, Pixels, TestAppContext, VisualTestContext, px};
 
 use super::lyrics::LYRIC_ROW_H;
 use super::icon::MusicIcon;
@@ -4106,4 +4106,214 @@ async fn placeholder_nav_items_still_toast_coming_soon(cx: &mut TestAppContext) 
         let sec = wcx.cx.read(|app| view.read(app).state.section);
         assert_eq!(sec, MainSection::Home, "「{label}」占位项不应切换分区");
     }
+}
+
+// ---- 换肤子菜单（阶段②入口：写选择进 music_skin + persist；取色渲染在阶段③接入） ----
+
+/// 建已渲染一帧的视图（设置按钮盒被 bounds_canvas 写入 tip_boxes）并订阅
+/// `MusicSkinChanged` 事件收集所选 skin id。
+fn open_skin_view<'a>(
+    cx: &'a mut TestAppContext,
+) -> (Entity<MusicView>, &'a mut VisualTestContext, Rc<RefCell<Vec<&'static str>>>) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    let skins = Rc::new(RefCell::new(Vec::new()));
+    {
+        let skins = skins.clone();
+        wcx.update(|window, app| {
+            window
+                .subscribe(&view, app, move |_, ev: &MusicEvent, _, _| {
+                    if let MusicEvent::MusicSkinChanged(id) = *ev {
+                        skins.borrow_mut().push(id);
+                    }
+                })
+                .detach();
+        });
+    }
+    // 一帧：设置按钮盒写入 tip_boxes["music-settings"]（换肤菜单锚点）。
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    (view, wcx, skins)
+}
+
+/// 设置按钮中心窗口坐标（tip_boxes 记录盒中点；box 宽>0 才算已布局）。
+fn settings_btn_center(
+    view: &Entity<MusicView>,
+    wcx: &mut VisualTestContext,
+) -> gpui::Point<Pixels> {
+    let b = wcx
+        .cx
+        .read(|app| view.read(app).tip_boxes.get("music-settings").expect("设置按钮盒已记录").get());
+    assert!(b.size.width > px(0.), "设置按钮盒应已布局，实得 {b:?}");
+    b.center()
+}
+
+/// 点按（down+up）给定窗口坐标。
+fn click_at(wcx: &mut VisualTestContext, p: gpui::Point<Pixels>) {
+    wcx.simulate_mouse_down(p, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(p, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+}
+
+/// 设置钮 toggle：点击 → 打开（slot 持实体）→ 再点 → 关闭；点外部 → 关闭。
+#[gpui::test]
+fn settings_button_toggles_skin_menu(cx: &mut TestAppContext) {
+    let (view, wcx, _) = open_skin_view(cx);
+    assert!(
+        !wcx.cx.read(|app| view.read(app).skin_menu_open),
+        "初始换肤菜单应关闭"
+    );
+    // 点击设置钮 → 打开。
+    let btn = settings_btn_center(&view, wcx);
+    click_at(wcx, btn);
+    assert!(
+        wcx.cx.read(|app| view.read(app).skin_menu_open),
+        "点击设置钮应打开换肤菜单"
+    );
+    assert!(
+        wcx.cx.read(|app| view.read(app).skin_menu.is_open()),
+        "菜单槽应持有实体"
+    );
+    // 再点设置钮 → 关闭（Dropdown 同款 toggle）。
+    click_at(wcx, btn);
+    assert!(
+        !wcx.cx.read(|app| view.read(app).skin_menu_open),
+        "再点设置钮应关闭换肤菜单"
+    );
+    // 再开，点菜单外远处 → 关闭（ui::menu 点击外关闭）。
+    click_at(wcx, btn);
+    assert!(wcx.cx.read(|app| view.read(app).skin_menu_open), "应再次打开");
+    click_at(wcx, gpui::point(px(600.), px(300.)));
+    assert!(
+        !wcx.cx.read(|app| view.read(app).skin_menu_open),
+        "点菜单外应关闭"
+    );
+}
+
+/// 逐个选择 5 预设 + 跟随全局 + 回 default：music_skin 即时更新、逐次发 `MusicSkinChanged`；
+/// 选同一值幂等（不再发事件）。初始默认位 music。
+#[gpui::test]
+fn choosing_skins_updates_current_and_emits_events(cx: &mut TestAppContext) {
+    let (view, wcx, skins) = open_skin_view(cx);
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).music_skin.clone()),
+        "music",
+        "默认音乐皮肤应为 music"
+    );
+    for id in ["ocean", "solar", "rose", "graphite", "follow", "default"] {
+        wcx.update(|_window, app| {
+            view.update(app, |v, cx| v.choose_music_skin(id, cx));
+        });
+        wcx.run_until_parked();
+        assert_eq!(
+            wcx.cx.read(|app| view.read(app).music_skin.clone()),
+            id,
+            "选择后 music_skin 应更新为 {id}"
+        );
+    }
+    let got = skins.borrow();
+    assert_eq!(
+        got.as_slice(),
+        &["ocean", "solar", "rose", "graphite", "follow", "default"],
+        "每次选择都应发出 MusicSkinChanged"
+    );
+    // 幂等：选同一值不重复发事件。
+    let n = got.len();
+    drop(got);
+    wcx.update(|_window, app| {
+        view.update(app, |v, cx| v.choose_music_skin("default", cx));
+    });
+    assert_eq!(skins.borrow().len(), n, "选同一值不应重复发事件");
+}
+
+/// 真实菜单项点击链：点设置钮开菜单 → 点「海青 ocean」行（debug_bounds 定位）→
+/// music_skin=="ocean" + 事件发出 + keep_open 菜单保持展开。再验**焦点/键盘边界**：
+/// 菜单展开期间 Esc 只关菜单、不发 `ExitRequested`（回归：曾因帧重建丢焦、Esc 走 root 退
+/// 出音乐模式）；重开菜单键盘 ↓+Enter 应命中「跟随全局」（focus 重聚焦成功）。
+#[gpui::test]
+async fn skin_menu_item_click_keeps_open_and_updates(cx: &mut TestAppContext) {
+    let (view, wcx, skins) = open_skin_view(cx);
+    let exits = Rc::new(Cell::new(0usize));
+    {
+        let exits = exits.clone();
+        wcx.update(|window, app| {
+            window
+                .subscribe(&view, app, move |_, ev: &MusicEvent, _, _| {
+                    if *ev == MusicEvent::ExitRequested {
+                        exits.set(exits.get() + 1);
+                    }
+                })
+                .detach();
+        });
+    }
+    let btn = settings_btn_center(&view, wcx);
+    click_at(wcx, btn);
+    // ocean 行应已物化（debug_selector "music-skin-ocean"）。
+    let ocean = wcx
+        .debug_bounds("music-skin-ocean")
+        .expect("ocean 菜单项应物化");
+    let p = ocean.center();
+    click_at(wcx, p);
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).music_skin.clone()),
+        "ocean",
+        "点「海青」应更新 music_skin"
+    );
+    assert_eq!(
+        *skins.borrow(),
+        vec!["ocean"],
+        "点菜单项应发 MusicSkinChanged(\"ocean\")"
+    );
+    assert!(
+        wcx.cx.read(|app| view.read(app).skin_menu_open),
+        "keep_open 项选中后菜单应保持展开"
+    );
+    // Esc：只关菜单、不退出音乐模式（K15 焦点边界回归——菜单展开期间键盘必须留在菜单语义）。
+    wcx.simulate_keystrokes("escape");
+    wcx.run_until_parked();
+    assert!(
+        !wcx.cx.read(|app| view.read(app).skin_menu_open),
+        "菜单展开时 Esc 应关闭菜单"
+    );
+    assert_eq!(exits.get(), 0, "Esc 关菜单不应发 ExitRequested（不退出音乐）");
+    // 键盘导航：重开菜单 → ↓ 选中首项（跟随全局）+ Enter 激活 → music_skin=="follow"、
+    // 菜单保持展开（keep_open）、仍不发 ExitRequested。
+    click_at(wcx, btn);
+    wcx.simulate_keystrokes("down");
+    wcx.run_until_parked();
+    wcx.simulate_keystrokes("enter");
+    wcx.run_until_parked();
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).music_skin.clone()),
+        "follow",
+        "↓+Enter 应激活首项「跟随全局」"
+    );
+    assert!(
+        wcx.cx.read(|app| view.read(app).skin_menu_open),
+        "keep_open 项键盘 Enter 后菜单应保持展开"
+    );
+    assert_eq!(exits.get(), 0, "键盘操作菜单不应发 ExitRequested");
+}
+
+/// persist 往返：`music_skin` 经 `UserPrefs` 落盘可来回读（config test-mode 隔离临时目录，
+/// 不污染真实 %APPDATA%；shell 侧 `persist_prefs` 以同一字段聚合写盘）。
+#[test]
+fn music_skin_persists_through_user_prefs() {
+    let mut prefs = config::user::UserPrefs::default();
+    prefs.music_skin = "ocean".to_string();
+    prefs.save();
+    assert_eq!(
+        config::user::UserPrefs::load().music_skin,
+        "ocean",
+        "music_skin 应经 UserPrefs 往返"
+    );
+    // 特殊值 "follow"（跟随全局）原样落盘（UserPrefs 未知 id 不校验）。
+    let mut p2 = config::user::UserPrefs::default();
+    p2.music_skin = "follow".to_string();
+    p2.save();
+    assert_eq!(
+        config::user::UserPrefs::load().music_skin,
+        "follow",
+        "跟随全局（follow）应原样落盘"
+    );
 }

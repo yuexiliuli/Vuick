@@ -272,7 +272,7 @@ impl super::MusicView {
                 div().flex().items_center().gap_x(px(12.))
                     .child(self.render_search_box(window, cx))
                     .child(self.round_icon_button("music-notify", IconName::Bell, "通知中心", cx))
-                    .child(self.round_icon_button("music-settings", IconName::Settings, "设置", cx)),
+                    .child(self.settings_icon_button(window, cx)),
             )
             .into_any_element()
     }
@@ -368,7 +368,36 @@ impl super::MusicView {
             .into_any_element()
     }
 
-    /// 圆角图标钮（通知/设置）：点击 toast。
+    /// 设置图标钮（换肤入口）：样式与通知钮同款；mousedown toggle 开/关换肤子菜单。
+    /// `theme::bounds_canvas` 记录按钮窗口盒（prepaint）→ 换肤菜单锚定按钮左下。
+    fn settings_icon_button(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let cl = cx.listener(|this: &mut MusicView, _ev, window, cx| {
+            this.toggle_skin_menu(window, cx);
+        });
+        div()
+            .id("music-settings")
+            .debug_selector(|| "music-settings".into())
+            .w(px(theme::ROUND_ICON_BTN_SIZE))
+            .h(px(theme::ROUND_ICON_BTN_SIZE))
+            .rounded(px(theme::ROUND_ICON_BTN_RADIUS))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::bg_secondary())
+            .border_1()
+            .border_color(theme::border())
+            .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(gpui::MouseButton::Left, cl)
+            .child(theme::bounds_canvas(self.tip_box_cell("music-settings")))
+            .child(
+                Icon::new(IconName::Settings)
+                    .size(px(theme::ROUND_ICON_BTN_ICON))
+                    .text_color(theme::text2()),
+            )
+            .into_any_element()
+    }
+
+    /// 圆角图标钮（通知）：点击 toast。
     fn round_icon_button(
         &mut self,
         id: &'static str,

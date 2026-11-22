@@ -89,6 +89,14 @@ impl EditorApp {
                     .detach();
                     cx.notify();
                 }
+                music::MusicEvent::MusicSkinChanged(skin) => {
+                    // 换肤：写 AppModel.music_skin（全站内存唯一事实源，阶段③取色据此渲染）
+                    // + persist（下次启动恢复）。持久化走 `persist_prefs` 既有聚合口径
+                    //（`collect_prefs` 已含 music_skin 字段；测试构建为 no-op 不写盘）。
+                    this.model.borrow_mut().music_skin = skin.to_string();
+                    this.persist_prefs();
+                    cx.notify();
+                }
             }
         });
         self.music = Some(view.clone());

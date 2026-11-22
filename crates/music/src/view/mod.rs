@@ -133,12 +133,20 @@ pub struct ViewState {
     pub last_scrub_retarget: Option<Instant>,
 }
 
-/// 音乐视图事件（shell 订阅退出音乐模式）。
+/// 音乐视图事件（shell 订阅退出音乐模式 / 换肤写入全局偏好）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MusicEvent {
     /// 请求退出音乐模式（非全屏按 Esc 时发出）。
     ExitRequested,
+    /// 用户换了音乐皮肤：携带新 skin id（`ui::theme::PRESETS` 预设 id 或
+    /// [`MUSIC_SKIN_FOLLOW`]）。shell 订阅后写 `AppModel.music_skin` + persist_prefs
+    /// （全站主题阶段①既有数据面，阶段③取色据此渲染）。
+    MusicSkinChanged(&'static str),
 }
+
+/// 换肤「跟随全局」特殊 skin id：写进 `music_skin`。阶段③据此决定「音乐窗随全局皮肤」
+/// （而非独立音乐预设渲染）；选独立的 `ui::theme::PRESETS` 预设 id 则用该预设。
+const MUSIC_SKIN_FOLLOW: &'static str = "follow";
 
 /// toast 常显时长（ms），原型 `.toast` 1.8s。
 const TOAST_MS: Duration = Duration::from_millis(1800);
@@ -240,6 +248,14 @@ pub struct MusicView {
     vinyl_np: Entity<widgets::VinylView>,
     /// 全屏封面黑胶三圈子视图（fs cover；与 np 实例前缀隔离）。
     vinyl_fs: Entity<widgets::VinylView>,
+    /// 换肤子菜单是否展开（设置按钮下载 toggle；与 `skin_menu` 槽位同生同灭）。
+    skin_menu_open: bool,
+    /// 换肤子菜单槽位（`ui::menu::PopupMenu` 实体 + 关闭订阅 + 窗口锚点）。
+    skin_menu: ui::menu::MenuSlot,
+    /// 当前音乐皮肤 id（`ui::theme::PRESETS` 预设或 [`MUSIC_SKIN_FOLLOW`]，默认 "music"）。
+    /// 换肤菜单 ✓ 的本地事实源：启动读 `UserPrefs::music_skin`；选择时更新并随
+    /// [`MusicEvent::MusicSkinChanged`] 通知 shell 写 AppModel + persist（阶段③取色据此）。
+    music_skin: String,
     /// 底栏子视图（B 段）：整块底部播放栏拆出——自带进度心跳 + 交互回父 + tooltip 回父。
     bottom_bar: Entity<bottom::BottomBarView>,
 }
@@ -304,6 +320,15 @@ impl MusicView {
                         .ring(0.55, Duration::from_secs(9), true, "fsv-b")
                         .ring(0.30, Duration::from_secs(7), false, "fsv-c")
                 }),
+            // 音乐皮肤初始值：读已持久化偏好（测试构建屏蔽真实配置——config 依赖编译不受其
+            // 自身 cfg!(test) 门控，与 `load_default_dir`/`player.rs::prefs` 同款 K8 姿势）。
+            music_skin: if cfg!(test) {
+                config::user::UserPrefs::default().music_skin
+            } else {
+                config::user::UserPrefs::load().music_skin
+            },
+            skin_menu_open: false,
+            skin_menu: ui::menu::MenuSlot::default(),
             bottom_bar: cx.new(|cx| {
                 bottom::BottomBarView::new(player_for_views.clone(), parent_weak.clone(), cx)
             }),
@@ -590,9 +615,13 @@ impl MusicView {
         }
     }
 
-    /// 先聚焦根（任意在 view 内点按都回焦点，除搜索框本身——其 `stop_propagation`）。
+    /// 先聚焦根（任意在 view 内点按都回焦点，除搜索框本身——其 `stop_propagation`；
+    /// 换肤菜单展开期间**不抢焦**——菜单内 mousedown 由 `ui::menu` 消费，root 若抢焦会让
+    /// 菜单失焦（键盘导航/ Esc 关闭失效）；菜单关闭时 dismiss 会把焦点归还 root）。
     fn on_root_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if ev.button == MouseButton::Left {
+        // 换肤菜单展开期间不抢焦：菜单内 mousedown 由 `ui::menu` 消费，root 若抢焦会让
+        // 菜单失焦（键盘导航/ Esc 关闭失效）；菜单关闭时 dismiss 会把焦点归还 root。
+        if ev.button == MouseButton::Left && !self.skin_menu_open {
             self.focus_handle.focus(window, cx);
         }
     }
@@ -612,7 +641,10 @@ impl MusicView {
             "left" => self.player.update(cx, |p, cx| p.prev(cx)),
             "right" => self.player.update(cx, |p, cx| p.next(cx)),
             "escape" => {
-                if self.state.fs_open {
+                if self.skin_menu_open {
+                    // 换肤菜单展开：Esc 只关菜单（不退出音乐模式——即便焦点落回 root）。
+                    self.close_skin_menu(cx);
+                } else if self.state.fs_open {
                     self.exit_fullscreen(cx);
                 } else {
                     // 退出音乐模式：把当前播放位置写入偏好并 flush（Esc 退出是一致性落盘点；
@@ -639,6 +671,153 @@ impl MusicView {
     /// 同款）：生产恒等于 `Instant::now()`，测试 `advance_clock` 精确控过期判定。
     pub fn toast_msg(&mut self, s: impl Into<String>, cx: &mut Context<Self>) {
         self.toast = Some((s.into().into(), cx.background_executor().now()));
+    }
+
+    // ---- 换肤子菜单（阶段②：写选择进 music_skin + persist；取色渲染在阶段③接入） ----
+
+    /// 当前音乐皮肤 id（默认 "music"；未知 id 原样保留——✓ 只在 PRESETS / follow 匹配时亮）。
+    pub fn current_music_skin(&self) -> &str {
+        &self.music_skin
+    }
+
+    /// 换肤选择（换肤菜单项回调）：写本地 ✓ 事实源 + 通知 shell 写 AppModel.music_skin
+    /// + persist（`MusicEvent::MusicSkinChanged`；shell 订阅后落盘，当前值 ✓ 即时移位）。
+    fn choose_music_skin(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        if self.music_skin == id {
+            return;
+        }
+        self.music_skin = id.to_string();
+        cx.emit(MusicEvent::MusicSkinChanged(id));
+        cx.notify();
+    }
+
+    /// 设置按钮 toggle（ui::menu::Dropdown 同款 mousedown toggle）：开/关换肤子菜单。
+    pub(super) fn toggle_skin_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.skin_menu_open {
+            self.close_skin_menu(cx);
+        } else {
+            self.open_skin_menu(window, cx);
+        }
+    }
+
+    /// 打开换肤子菜单：设置按钮左下锚定 `ui::menu` 列表（跟随全局 + 分隔 + 6 预设，当前 ✓）。
+    fn open_skin_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 设置按钮窗口盒（`theme::bounds_canvas` prepaint 写入）；尚未记录 → 本拍不开
+        //（首帧渲染后盒已写，再点即开）。
+        let Some(b) = self
+            .tip_boxes
+            .get("music-settings")
+            .map(|c| c.get())
+            .filter(|b| b.size.width > px(0.))
+        else {
+            return;
+        };
+        let pos = point(b.origin.x, b.origin.y + b.size.height);
+        let weak = cx.weak_entity();
+        let items = self.skin_menu_items(&weak);
+        let (menu, sub) = ui::menu::spawn_context_menu(
+            window,
+            cx,
+            move |menu, _window, _cx| {
+                let mut menu = menu;
+                for item in items {
+                    menu = menu.item(item);
+                }
+                menu
+            },
+            |this, emitter, cx| {
+                // Dismiss（Esc / 点击外 / 非 keep_open 选择）→ 清槽 + 关闭标志。
+                // 身份校验（对照 emitter）防旧菜单的迟到关闭误清新菜单。
+                if this.skin_menu.entity.as_ref() == Some(emitter) {
+                    this.skin_menu_open = false;
+                    this.skin_menu.clear();
+                    cx.notify();
+                }
+            },
+        );
+        let weak_menu = menu.downgrade();
+        self.skin_menu.pos = Some(pos);
+        self.skin_menu.entity = Some(menu);
+        self.skin_menu.sub = Some(sub);
+        self.skin_menu_open = true;
+        // 帧重建会把焦点带回 view root（`notify` 触发重绘后 root 的 track_focus 重新挂树，
+        // 曾致 Esc/方向键走 root 而非菜单）→ 本拍末经窗口句柄重聚焦菜单，保证键盘导航
+        //（↑↓/Enter/Esc）落在菜单上。task 改代码后立即 poll（`run_until_parked` 即执行）。
+        let win = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            if let Some(menu) = weak_menu.upgrade() {
+                let _ = cx.update(|app| {
+                    app.update_window(win, |_view, window, app| {
+                        window.focus(&menu.read(app).focus_handle(app), app);
+                    })
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 关闭换肤菜单：清展开标志 + 槽位（菜单自身 DismissEvent 侧 `on_dismiss` 也会清一次，
+    /// 幂等）。root Esc 分支 / 设置钮 toggle 共用。
+    fn close_skin_menu(&mut self, cx: &mut Context<Self>) {
+        if self.skin_menu_open {
+            self.skin_menu_open = false;
+            self.skin_menu.clear();
+            cx.notify();
+        }
+    }
+
+    /// 换肤菜单条目：跟随全局 + 分隔线 + 6 预设（`ui::theme::PRESETS`，当前 `music_skin` ✓）。
+    fn skin_menu_items(&self, weak: &gpui::WeakEntity<Self>) -> Vec<ui::menu::PopupMenuItem> {
+        let mut items = Vec::with_capacity(ui::theme::PRESETS.len() + 2);
+        items.push(Self::skin_choice_item(weak.clone(), MUSIC_SKIN_FOLLOW, "跟随全局"));
+        items.push(ui::menu::PopupMenuItem::separator());
+        for preset in ui::theme::PRESETS {
+            items.push(Self::skin_choice_item(weak.clone(), preset.id, preset.name));
+        }
+        items
+    }
+
+    /// 换肤单项：当前选中前导 ✓（shell「主题…」预设项同款样式；✓ 独立元素定宽对齐）；点击
+    /// → [`Self::choose_music_skin`]（更新 + 事件 + persist，`keep_open` → 菜单保持展开、
+    /// ✓ 即时移位）。
+    fn skin_choice_item(
+        weak: gpui::WeakEntity<Self>,
+        id: &'static str,
+        name: &'static str,
+    ) -> ui::menu::PopupMenuItem {
+        let weak2 = weak.clone();
+        ui::menu::PopupMenuItem::element(move |_, cx| {
+            let checked = weak
+                .upgrade()
+                .map(|e| e.read(cx).music_skin == id)
+                .unwrap_or(false);
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(18.)).child(if checked { "✓" } else { "" }))
+                .child(name)
+                .debug_selector(move || format!("music-skin-{id}").into())
+                .into_any_element()
+        })
+        .keep_open()
+        .on_click(move |_, _window, cx| {
+            let _ = weak2.update(cx, |this, cx| this.choose_music_skin(id, cx));
+        })
+    }
+
+    /// 换肤子菜单弹层（root 末尾子元素 → deferred 独立层，绘制在内容最上）。
+    /// `ui::menu::popup_overlay` 已含点击外关闭与左键按下拦截（K15：弹层内按下不穿透到
+    /// 下层播放器/列表——`PopupMenu` items 列的 `stop_propagation` 由 ui 组件保证）。
+    fn render_skin_menu(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> AnyElement {
+        let Some(menu) = self.skin_menu.entity.clone() else {
+            return div().into_any_element();
+        };
+        let Some(pos) = self.skin_menu.pos else {
+            return div().into_any_element();
+        };
+        ui::menu::popup_overlay(pos, menu, ui::menu::MENU_EDGE_MARGIN).into_any_element()
     }
 
     /// 载入默认音乐目录（shell 集成入口）：先读 `UserPrefs::music_dir`（未设置/空 →
@@ -918,6 +1097,8 @@ impl Render for MusicView {
         // toast 最顶层，其后是共享悬停提示浮层（最上）。
         root = root.child(self.render_toast());
         root = root.child(self.render_tooltip(window, cx));
+        // 换肤子菜单（独立 deferred 层，priority 100）—在 tooltip(120) 之下、内容之上。
+        root = root.child(self.render_skin_menu(window, cx));
         root
     }
 }
