@@ -185,9 +185,55 @@ const MEDIA_FFMPEG_LIB_NAME: &str = "libmedia_ffmpeg.dylib";
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 const MEDIA_FFMPEG_LIB_NAME: &str = "libmedia_ffmpeg.so"; // 其它 Unix 兜底（cdylib 通用产物名）
 
-/// find_lib 的路径候选取出（**可纯测**）：`[exe_dir/name, exe_dir/../name]`。
-fn candidate_paths(exe_dir: &Path) -> [std::path::PathBuf; 2] {
-    [exe_dir.join(MEDIA_FFMPEG_LIB_NAME), exe_dir.join("..").join(MEDIA_FFMPEG_LIB_NAME)]
+/// find_lib 的路径候选取出（**可纯测**）。分发布局 = exe 在 dist 根、ffmpeg dll 组
+/// （`media_ffmpeg.dll` + `av*.dll`）在 `dist\bin\ffmpeg\`；开发态 = dll 旁置 exe 目录。
+/// 顺序（先新后旧）：`exe_dir/name`（开发/就地旁置）→ `exe_dir/bin/ffmpeg/name`（dist 布局）
+/// → `exe_dir/../name`（旧「exe 上一级」布局兜底）。
+fn candidate_paths(exe_dir: &Path) -> [std::path::PathBuf; 3] {
+    [
+        exe_dir.join(MEDIA_FFMPEG_LIB_NAME),
+        exe_dir.join("bin").join("ffmpeg").join(MEDIA_FFMPEG_LIB_NAME),
+        exe_dir.join("..").join(MEDIA_FFMPEG_LIB_NAME),
+    ]
+}
+
+/// Windows dist `bin\ffmpeg\` 子目录命中判据（**纯函数**，供 altered-search 加载分支与单测共用）：
+/// 父目录名为 `ffmpeg` **且**为绝对路径（`LOAD_WITH_ALTERED_SEARCH_PATH` 要求全限定路径；
+/// 相对兜底名 `media_ffmpeg.dll` 与 exe 旁绝对路径均不命中 → 走普通加载）。
+#[cfg(windows)]
+fn is_ffmpeg_subdir_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n == std::ffi::OsStr::new("ffmpeg"))
+            .unwrap_or(false)
+}
+
+/// 加载 `media_ffmpeg.dll`。
+///
+/// Windows 下若库落在 dist 布局 `bin\ffmpeg\` 子目录（其内还并列 `av*.dll` 依赖），用
+/// `LoadLibraryExW` + `LOAD_WITH_ALTERED_SEARCH_PATH`（经 libloading `load_with_flags` 封装，
+/// 零新 FFI/依赖）：该标志让**库自身所在目录**进入依赖搜索路径，`media_ffmpeg.dll` 的
+/// `avcodec-*.dll` 等从 `bin\ffmpeg` 解析；否则普通加载（exe 旁/系统路径），依赖走默认搜索。
+/// 非 Windows（Linux/dlopen）路径保持现状：`av*.so` 依赖走 `LD_LIBRARY_PATH`/rpath，无搜索目录处理。
+#[cfg(windows)]
+fn load_media_ffmpeg(path: &Path) -> Option<libloading::Library> {
+    use libloading::os::windows::LOAD_WITH_ALTERED_SEARCH_PATH;
+    if is_ffmpeg_subdir_absolute(path) {
+        // load_with_flags 返回 `os::windows::Library`，经 `From` 转成跨平台 `Library`（借由
+        // libloading 同模块的 `From<imp::Library>`，Windows 下 imp == os::windows）。
+        unsafe { libloading::os::windows::Library::load_with_flags(path, LOAD_WITH_ALTERED_SEARCH_PATH) }
+            .map(libloading::Library::from)
+            .ok()
+    } else {
+        unsafe { libloading::Library::new(path) }.ok()
+    }
+}
+
+#[cfg(not(windows))]
+fn load_media_ffmpeg(path: &Path) -> Option<libloading::Library> {
+    unsafe { libloading::Library::new(path) }.ok()
 }
 
 fn find_lib() -> std::path::PathBuf {
@@ -206,7 +252,9 @@ fn find_lib() -> std::path::PathBuf {
 
 fn load_bridge() -> Option<Bridge> {
     let path = find_lib();
-    let lib = unsafe { libloading::Library::new(&path) }.ok()?;
+    // Windows dist `bin\ffmpeg\` 落点用 altered-search（av*.dll 依赖从库自身目录解析），
+    // 其余路径/平台走普通加载——见 `load_media_ffmpeg`。
+    let lib = load_media_ffmpeg(&path)?;
     macro_rules! sym {
         ($n:literal, $ty:ty) => {{
             let s = unsafe { lib.get::<$ty>($n).ok()? };
@@ -313,13 +361,38 @@ pub fn utf8_cstr(path: &Path) -> Result<std::ffi::CString> {
 mod tests {
     use super::*;
 
-    /// find_lib 路径候选取出（纯函数，不触及文件系统加载）：`[exe_dir/name, exe_dir/../name]`。
+    /// find_lib 路径候选取出（纯函数，不触及文件系统加载）：分发布局含 `bin\ffmpeg\`
+    /// 中间层——`[exe_dir/name, exe_dir/bin/ffmpeg/name, exe_dir/../name]`。
     #[test]
-    fn candidate_paths_yields_exe_dir_and_parent() {
-        let dir = Path::new("C:/some/app/bin");
+    fn candidate_paths_yields_exe_dir_ffmpeg_dir_and_parent() {
+        let dir = Path::new("C:/some/app/dist");
         let cands = candidate_paths(dir);
         assert_eq!(cands[0], dir.join(MEDIA_FFMPEG_LIB_NAME));
-        assert_eq!(cands[1], dir.join("..").join(MEDIA_FFMPEG_LIB_NAME));
+        assert_eq!(
+            cands[1],
+            dir.join("bin").join("ffmpeg").join(MEDIA_FFMPEG_LIB_NAME)
+        );
+        assert_eq!(cands[2], dir.join("..").join(MEDIA_FFMPEG_LIB_NAME));
+    }
+
+    /// Windows altered-search 触发判据（**纯函数**，即生产 `load_media_ffmpeg` 分支所用）：
+    /// 仅当候选为父目录名 `ffmpeg` 的**绝对**路径时启用 `LOAD_WITH_ALTERED_SEARCH_PATH`——
+    /// 相对兜底名/普通旁置路径不触发（依赖走默认搜索）。
+    #[cfg(windows)]
+    #[test]
+    fn windows_ffmpeg_dir_detection_rules() {
+        // dist 布局绝对路径 → 命中（进 altered-search 分支）
+        let dist = Path::new("C:/app/dist/bin/ffmpeg/media_ffmpeg.dll");
+        assert!(is_ffmpeg_subdir_absolute(dist));
+        // 相对兜底名（无父目录）→ 不命中
+        let rel = Path::new("media_ffmpeg.dll");
+        assert!(!is_ffmpeg_subdir_absolute(rel));
+        // exe 旁绝对路径（父目录名非 ffmpeg）→ 不命中
+        let exe = Path::new("C:/app/dist/media_ffmpeg.dll");
+        assert!(!is_ffmpeg_subdir_absolute(exe));
+        // 父目录名是 ffmpeg 但非绝对路径 → 不命中（LOADS flag 要求全限定路径）
+        let rel_ffmpeg = Path::new("bin/ffmpeg/media_ffmpeg.dll");
+        assert!(!is_ffmpeg_subdir_absolute(rel_ffmpeg));
     }
 
     /// ParamFFI → AudioParams 换算（纯类型转换，语义同 music `params()`）。

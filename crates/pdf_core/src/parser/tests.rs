@@ -72,50 +72,29 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 校验内嵌的 **zstd 压缩载荷** 能解压回有效 PE 可执行（`MZ` + `PE\0\0`）。
-    /// 若磁盘上的 dll 仍在，再确认解压后与磁盘一致（embed 来源正确）。
-    /// 不触碰 pdfium（无需串行锁）。
+    /// 磁盘候选路径顺序（纯函数，不触文件系统）：分发布局 `bin\pdf\` 先于 exe 旁置、
+    /// 再 resources —— 与 `locate_dll` 优先级一致（env 之外无内嵌兜底，2026-11-22 去内嵌）。
     #[test]
-    fn embedded_pdfium_is_valid_pe_and_matches_disk() {
-        #[cfg(embed_pdfium)]
-        {
-            let raw = zstd::bulk::decompress(EMBEDDED_PDFIUM, *PDFIUM_RAW_SIZE)
-                .expect("内嵌压缩载荷应能解压");
-            assert_eq!(raw.len(), *PDFIUM_RAW_SIZE, "解压长度应与原始 dll 一致");
-            // PE 校验：MZ 头 + e_lfanew(0x3C) → 指向 "PE\0\0"
-            assert_eq!(&raw[..2], b"MZ", "解压出的 pdfium 应以 MZ 开头");
-            let pe_off = u32::from_le_bytes(raw[0x3C..0x40].try_into().unwrap()) as usize;
-            assert_eq!(
-                &raw[pe_off..pe_off + 4],
-                b"PE\x00\x00",
-                "MZ 头应指向合法 PE 签名"
-            );
-            assert!(EMBEDDED_PDFIUM.len() < raw.len(), "内嵌应存压缩载荷而非原始 dll");
-            // 若磁盘 dll 尚在（development 树 resources/pdfium/），比对一致性
-            let disk_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../resources/pdfium")
-                .join(PDFIUM_VERSIONED_NAME);
-            if let Ok(disk) = std::fs::read(&disk_path) {
-                assert_eq!(raw.len(), disk.len(), "解压与磁盘长度应一致");
-                assert_eq!(raw[..16], disk[..16], "解压与磁盘头部应一致");
-            }
-        }
-        // 非 embed 配置下该测试无意义——直接通过（无断言）
-    }
-
-    /// 内嵌的压缩字节能正确解压、解出到临时目录并返回存在的文件路径。
-    ///
-    /// 注意：**不清理**解出的文件——pdf 测试并行跑，别的测试（worker_renders_* /
-    /// parses_all）可能正并发复用同一个临时 dll；此处清理会让它们读盘时文件已消失。
-    /// 该临时文件由系统 temp 清理机制回收，无泄漏问题。
-    #[cfg(embed_pdfium)]
-    #[test]
-    fn embedded_pdfium_extracts_to_temp_dir() {
-        let path = extract_embedded_pdfium().expect("解出内嵌 pdfium 应成功");
-        assert!(path.is_file(), "解出的 dll 文件应存在: {}", path.display());
-        let written = std::fs::read(&path).expect("应能读回解出的 dll");
-        assert_eq!(written.len(), *PDFIUM_RAW_SIZE, "解出内容长度应等于原始 dll 大小");
-        assert_eq!(&written[..2], b"MZ", "解出文件应以 MZ 开头");
+    fn pdfium_disk_candidates_bin_pdf_then_exe_then_resources() {
+        let dir = std::path::Path::new("C:/app/dist");
+        let cands = disk_candidates(Some(dir), "C:/repo/crates/pdf_core");
+        assert_eq!(
+            cands[0],
+            dir.join("bin").join("pdf").join(PDFIUM_VERSIONED_NAME),
+            "dist 布局 bin\\pdf\\ 应排第一"
+        );
+        assert_eq!(cands[1], dir.join(PDFIUM_VERSIONED_NAME), "exe 旁置应排第二");
+        assert!(
+            cands[2]
+                .parent()
+                .map(|p| p.ends_with("resources/pdfium"))
+                .unwrap_or(false),
+            "resources 候选应最后：{}",
+            cands[2].display()
+        );
+        // exe_dir 缺失（如测试进程无 current_exe）→ 只留 resources 候选
+        let no_exe = disk_candidates(None, "C:/repo/crates/pdf_core");
+        assert_eq!(no_exe.len(), 1, "无 exe_dir 时只剩 resources 候选");
     }
 
     fn target_pdf_paths() -> Vec<std::path::PathBuf> {
