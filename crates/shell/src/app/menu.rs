@@ -559,14 +559,10 @@ impl EditorApp {
             "关于",
             "",
             weak,
-            |this, _window, cx| {
-                // P2-① 唯一性：修正错位文案（原为「剪贴板生效」的复制提示）——关于 =
-                // 应用名 + 版本。
-                this.model.borrow_mut().status = SharedString::from(format!(
-                    "Vuick {}：基于 GPUI 的文本 / 代码 / Markdown 编辑器",
-                    env!("CARGO_PKG_VERSION")
-                ));
-                this.model.borrow_mut().status_ok = true;
+            |this, window, cx| {
+                // 帮助 → 关于：打开居中「关于」面板，取代旧的「状态栏文案」副作用
+                // （面板内展示全字段 + 复制/关闭）。
+                this.open_about_panel(window, cx);
                 cx.notify();
             },
         ))
@@ -842,5 +838,40 @@ impl RecentPanelHost for EditorApp {
         self.model.borrow_mut().recent_files.clear();
         self.persist_prefs();
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 守护：六个 ☑/☐ 切换项统一走 `toggle_item`（glyph 独立元素 + 统一 Segoe UI Symbol
+    /// 字族 + 文本独立元素）。headless `NoopTextSystem` 是 mock 指标——真实字库逐字符回退/
+    /// 字族解析/尺寸测不出（K137 平台陷阱），此层只能由真机观感确认；本测试守护 headless
+    /// 可断言的部分：
+    ///   ① `TOGGLE_ON_MARK`/`TOGGLE_OFF_MARK` 分别是 U+2611/U+2610 且互异（按字面实现，
+    ///     若有人把 on/off 写成同字即红）；
+    ///   ② 六个全真 label 的 on/off 两个分支都能经 `toggle_item` 构建为 `AnyElement`
+    ///     （结构/类型回归护栏：签名或元素装配出错即编译/运行红）。
+    #[test]
+    fn toggle_items_keep_distinct_marks_and_build_for_all_items() {
+        assert_eq!(EditorApp::TOGGLE_ON_MARK, "☑", "on 态必须用 U+2611 ☑");
+        assert_eq!(EditorApp::TOGGLE_OFF_MARK, "☐", "off 态必须用 U+2610 ☐");
+        assert_ne!(
+            EditorApp::TOGGLE_ON_MARK,
+            EditorApp::TOGGLE_OFF_MARK,
+            "on/off 标记必须互异"
+        );
+        for label in [
+            "媒体在新窗口打开",
+            "复用已有媒体窗口",
+            "自动换行",
+            "恢复上次会话",
+            "关闭时最小化到系统托盘",
+            "记住阅读进度",
+        ] {
+            let _ = EditorApp::toggle_item(true, label).into_any_element();
+            let _ = EditorApp::toggle_item(false, label).into_any_element();
+        }
     }
 }

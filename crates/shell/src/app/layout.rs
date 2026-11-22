@@ -657,6 +657,8 @@ impl EditorApp {
             .child(self.render_notifications(window, cx))
             // 命令面板浮层：同样作为外层 relative 的直子挂载（合成层约束同上）。
             .child(self.render_palette(window, cx))
+            // 「帮助 → 关于」面板浮层：同命令面板挂载姿势（面板自身包 `deferred`）。
+            .child(self.render_about_panel(window, cx))
     }
 
     /// 「打开最近」大面板浮层挂点：宿主持有面板实体时以根级直子渲染（面板自身包
@@ -680,6 +682,19 @@ impl EditorApp {
         _cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match self.palette.clone() {
+            Some(p) => p.into_any_element(),
+            None => div().into_any_element(),
+        }
+    }
+
+    /// 「帮助 → 关于」面板浮层挂点：宿主持有面板实体时以根级直子渲染（面板自身包
+    /// `deferred` 全窗 occlude 居中卡）；关闭后为空 → 返回空元素（同 [`Self::render_palette`]）。
+    pub(super) fn render_about_panel(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match self.about_panel.clone() {
             Some(p) => p.into_any_element(),
             None => div().into_any_element(),
         }

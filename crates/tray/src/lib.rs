@@ -109,6 +109,22 @@ pub fn request_quit() {
     imp::request_quit();
 }
 
+/// 当前操作系统完整版本号（「帮助 → 关于」信息行同款）：Windows →
+/// `Windows NT {major}.{minor}.{build}`（经 `RtlGetVersion`，取**真实**版本、
+/// 不随兼容层/清单虚报）；取数失败回退 `Windows NT unknown`；非 `windows` 目标
+/// 回退 `Other OS`（对齐 tray 既有 target 门控姿势，不破坏跨平台构建）。
+/// unsafe Win32 调用收敛在本 crate。
+pub fn os_version() -> String {
+    #[cfg(windows)]
+    {
+        imp::os_version_impl()
+    }
+    #[cfg(not(windows))]
+    {
+        String::from("Other OS")
+    }
+}
+
 /// 优雅清理（`on_app_quit` 兜底钩子调用，弱要求）：移除托盘图标 + 销毁隐藏窗口
 /// （进程退出系统也会自动清托盘图标，此为 best-effort）。
 pub fn shutdown() {
@@ -643,6 +659,28 @@ mod imp {
         }
     }
 
+    /// `RtlGetVersion` 取操作系统真实 major/minor/build 版本号（不经兼容层/清单虚报；
+    /// Windows 7/8/10/11 均返回实际内核版本）。返回 `Windows NT {maj}.{min}.{build}`；
+    /// 返回码非成功 → 回退 `Windows NT unknown`，不 panic。单 UI 线程调用。
+    pub(super) fn os_version_impl() -> String {
+        use windows::Wdk::System::SystemServices::RtlGetVersion;
+        use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+        // SAFETY：`RtlGetVersion` 按 `dwOSVersionInfoSize` 指明大小向调用方缓冲写入
+        // OSVERSIONINFOW（未初始化的剩余字段由调用方填充/系统覆盖）；`dwOSVersionInfoSize`
+        // 必须初始化为结构大小（Windows 校验），再以 `is_ok()` 判返回码。单 UI 线程、无并发。
+        let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+        info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+        let status = unsafe { RtlGetVersion(&mut info) };
+        if status.is_ok() {
+            format!(
+                "Windows NT {}.{}.{}",
+                info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+            )
+        } else {
+            String::from("Windows NT unknown")
+        }
+    }
+
     /// 创建托盘图标（`NIM_ADD`，幂等：已建隐藏窗口则重复创建会失败，静默返回 false）。
     /// 成功时置位 [`super::TRAY_ICON_REGISTERED`]（允许隐藏到托盘）；`NIM_ADD` 失败**不清位**
     /// ——失败可能是「图标已存在」（幂等重入/恢复流程）或 Explorer 未就绪，此时保留既有
@@ -1113,6 +1151,18 @@ mod tests {
         CLOSE_TO_TRAY.store(false, Ordering::SeqCst);
         FORCE_QUIT.store(false, Ordering::SeqCst);
         set_tray_icon_registered(false);
+    }
+
+    /// 本机为 Windows → `os_version` 必须返回真实版本串（非空 + `Windows NT ` 前缀约定）。
+    /// 防御式：即使换到非 Windows 目标也不崩（前缀 `Other` 兜底，见库函数 cfg 分支）。
+    #[test]
+    fn os_version_returns_windows_nt_prefix_or_other() {
+        let v = crate::os_version();
+        assert!(!v.is_empty(), "os_version 不得为空");
+        assert!(
+            v.starts_with("Windows NT ") || v.starts_with("Other"),
+            "os_version 前缀不符：{v}"
+        );
     }
 
     #[test]

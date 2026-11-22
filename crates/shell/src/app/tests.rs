@@ -14,3 +14,4 @@ include!("tests/tab_bar.rs");
 include!("tests/file_open.rs");
 include!("tests/file_tree.rs");
 include!("tests/panes.rs");
+include!("tests/about.rs");

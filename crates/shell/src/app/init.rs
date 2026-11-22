@@ -199,6 +199,8 @@ impl EditorApp {
             _main_bounds_sub: None,
             palette: None,
             _palette_sub: None,
+            about_panel: None,
+            _about_sub: None,
             // 音乐播放器视图（惰性创建；退出音乐模式不销毁 MusicView——播放继续）。
             music: None,
             _music_sub: None,

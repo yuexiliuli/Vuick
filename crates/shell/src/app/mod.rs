@@ -43,6 +43,7 @@ mod panes;
 mod sidebar;
 mod status_bar;
 mod tabs;
+mod about;
 
 // 职责子模块（`use super::*` 共享下方 prelude）的可见性约定：
 // 私有条目在 `app` 内对整棵子树（含 app::tests）可见 → 统一 `pub(super)`（可见于 `app`）；
@@ -365,6 +366,12 @@ pub struct EditorApp {
     pub palette: Option<gpui::Entity<ui::palette::CommandPalette>>,
     /// 面板关闭订阅（选择/Esc/点击外 → 清空 `palette` 并释放实体）。
     _palette_sub: Option<Subscription>,
+    /// 「帮助 → 关于」面板：打开时为 `Some`，「关闭」按钮 / Esc（`DismissEvent`）关闭后
+    /// 清空。面板是独立 [`about::AboutPanel`] 实体（about 文本 / 已复制反馈自持），
+    /// 复制按钮把整段写入系统剪贴板。面板打开**不写状态栏文案**（取代旧「关于」副作用）。
+    about_panel: Option<gpui::Entity<about::AboutPanel>>,
+    /// 关于面板关闭订阅（`DismissEvent` → 清空引用并释放实体）。
+    _about_sub: Option<Subscription>,
     /// 音乐播放器视图（惰性创建；不随退出音乐模式销毁——播放继续）。
     /// `#[doc(hidden)] pub`：`tests/music.rs`/`tests/media.rs` 断言音乐模式已建视图
     /// （`app.music.is_some()`）与 `ExitRequested` 事件驱动（§8.6 外提清单）。
