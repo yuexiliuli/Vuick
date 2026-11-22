@@ -884,19 +884,41 @@ impl ColorToken {
         TabReorderLine => "chrome.tab_reorder_line",
     }
 
-    /// 仅解析 `#rrggbb` 6 位十六进制 → 不透明 [`Rgba`]；含 alpha 位 / 缺 `#` / 非法
-    /// 十六进制一律返回 `None`（调用方跳过该 key，不 panic）。
+    /// 解析 `#rrggbb`（6 位，不透明 → alpha=1.0）或 `#rrggbbaa`（8 位，保留 alpha）十六进制
+    /// → [`Rgba`]；缺 `#` / 长度非 6/8 位 / 非法十六进制一律返回 `None`
+    /// （调用方跳过该 key，不 panic）。8 位支持让 `srf_border` 等半透明人格令牌诚实落位
+    /// （P2-2：`"#ffffff0f"` 此前因 8 位被跳过 → border 恒 base）。
     pub fn parse_hex(s: &str) -> Option<Rgba> {
         let b = s.as_bytes();
-        if b.len() != 7 || b[0] != b'#' {
+        if b.len() != 7 && b.len() != 9 {
             return None;
         }
-        let mut val: u32 = 0;
-        for &c in &b[1..] {
-            val <<= 4;
-            val |= (c as char).to_digit(16)?;
+        if b[0] != b'#' {
+            return None;
         }
-        Some(rgb(val))
+        match b.len() {
+            7 => {
+                // #rrggbb：r/g/b = 高 3 字节、alpha 恒 1.0（同 `gpui::rgb`）。
+                let mut val: u32 = 0;
+                for &c in &b[1..] {
+                    val <<= 4;
+                    val |= (c as char).to_digit(16)?;
+                }
+                Some(rgb(val))
+            }
+            _ => {
+                // #rrggbbaa：逐字节解析，alpha 位保留（同 `gpui::rgba` 的 0xrrggbbaa 布局）。
+                let byte = |i: usize| -> Option<u8> {
+                    let hi = (b[i] as char).to_digit(16)?;
+                    let lo = (b[i + 1] as char).to_digit(16)?;
+                    Some((hi * 16 + lo) as u8)
+                };
+                let (r, g, bl, a) = (byte(1)?, byte(3)?, byte(5)?, byte(7)?);
+                Some(rgba(
+                    ((r as u32) << 24) | ((g as u32) << 16) | ((bl as u32) << 8) | a as u32,
+                ))
+            }
+        }
     }
 }
 
@@ -1050,7 +1072,7 @@ pub static PRESETS: &[PresetSkin] = &[
         // 亮档：协调的紫调浅坡（浅紫灰在亮底上仍中性可读；accent 亮档深一档保对比）。
         light: &[
             (ColorToken::Accent, "#5b3fd1"),
-            (ColorToken::AccentLight, "#a78bfa"),
+            (ColorToken::AccentLight, "#8468dc"), // 对比度修正 #1：原 #a78bfa 亮面坡对比 1.99-2.52 <3，加深一档仍「音乐紫」
             (ColorToken::SrfDeep, "#f7f5ff"),
             (ColorToken::SrfPrimary, "#efecfc"),
             (ColorToken::SrfSecondary, "#e7e2f8"),
@@ -1073,10 +1095,10 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfHover, "#1a2d44"),
             (ColorToken::SrfBorder, "#ffffff0f"),
         ],
-        // 亮档：协调的冷浅蓝灰坡；accent 亮档深一档（#0D9488）保白底对比。
+        // 亮档：协调的冷浅蓝灰坡；accent 亮档深一档（#0C9185）保白底对比。
         light: &[
-            (ColorToken::Accent, "#0d9488"),
-            (ColorToken::AccentLight, "#14b8a6"),
+            (ColorToken::Accent, "#0c9185"), // 对比度修正 #2：原 #0d9488 vs 卡片面坡 2.98 <3，微深一档
+            (ColorToken::AccentLight, "#109185"), // 对比度修正 #3：原 #14b8a6 亮面坡对比 1.98-2.36 <3，加深一档
             (ColorToken::SrfDeep, "#f4faf9"),
             (ColorToken::SrfPrimary, "#e9f5f3"),
             (ColorToken::SrfSecondary, "#dfeff0"),
@@ -1102,7 +1124,7 @@ pub static PRESETS: &[PresetSkin] = &[
         // 亮档：协调的暖浅坡；accent 亮档深一档（#B45309）保白底对比。
         light: &[
             (ColorToken::Accent, "#b45309"),
-            (ColorToken::AccentLight, "#d97706"),
+            (ColorToken::AccentLight, "#c26a05"), // 对比度修正 #4：原 #d97706 vs 卡片面坡 2.53 <3，琥珀深一档
             (ColorToken::SrfDeep, "#fdf8f0"),
             (ColorToken::SrfPrimary, "#faf1e3"),
             (ColorToken::SrfSecondary, "#f7ead7"),
@@ -1158,7 +1180,7 @@ pub static PRESETS: &[PresetSkin] = &[
         // 亮档：同样中性纯灰坡；accent 中性深灰保白底对比；状态色同样压饱和。
         light: &[
             (ColorToken::Accent, "#5a5f66"),
-            (ColorToken::AccentLight, "#7a8087"),
+            (ColorToken::AccentLight, "#717880"), // 对比度修正 #5：原 #7a8087 vs 卡片面坡 2.95 <3，中性灰微深
             (ColorToken::SrfDeep, "#f6f7f8"),
             (ColorToken::SrfPrimary, "#edeeef"),
             (ColorToken::SrfSecondary, "#e4e6e8"),
@@ -1762,6 +1784,18 @@ mod tests {
     }
 
     #[gpui::test]
+    fn card_shadow_opaque_black_locks_shadow_base_contract(_cx: &mut TestAppContext) {
+        // 判别式（④-2 浮层投影收编）：menu/notification/tooltip/find/goto 卡片与 video 控制条
+        // 的投影底色一律取 colors.card_shadow。默认零覆盖下它必须 = 不透明黑
+        // （rgb(0x000000)、α=1）→ `card_shadow.opacity(α)` 与旧散值 `hsla(0,0,0,α)` 逐通道同值；
+        // 撤掉该前提（改成非黑/非不透明）→ 此处即红，投影将不再与旧观感逐字节不变。
+        for scheme in [ColorScheme::light(), ColorScheme::dark()] {
+            assert_eq!(scheme.card_shadow, rgb(0x000000), "卡片投影底=不透明黑");
+            assert_eq!(scheme.card_shadow.a, 1.0, "卡片投影底 α=1（不透明）");
+        }
+    }
+
+    #[gpui::test]
     fn chrome_state_colors_are_pinned(_cx: &mut TestAppContext) {
         // P1-7：外壳层状态色钉死——关闭按压红亮暗同值；拖拽幽灵随明暗且 = 强调色。
         let light = ChromeColors::light();
@@ -1969,15 +2003,41 @@ mod tests {
     }
 
     #[gpui::test]
-    fn parse_hex_accepts_only_six_digit_hash(_cx: &mut TestAppContext) {
-        // 仅 #rrggbb 6 位：合法 → Rgba；缺 # / 长度错 / 非法 hex / 带 alpha 位 → None。
+    fn parse_hex_accepts_six_and_eight_digit(_cx: &mut TestAppContext) {
+        // #rrggbb 6 位（不透明）与 #rrggbbaa 8 位（保留 alpha，P2-2）：
+        // 合法 → Rgba；缺 # / 长度非 6/8 / 非法 hex → None。
         assert_eq!(ColorToken::parse_hex("#ff0000"), Some(rgb(0xff0000)));
         assert_eq!(ColorToken::parse_hex("#0d0b1a"), Some(rgb(0x0d0b1a)));
         assert_eq!(ColorToken::parse_hex("#FFFFFF"), Some(rgb(0xffffff)), "大写 hex 亦可");
+        // 8 位：r/g/b + alpha 逐字节保留。
+        assert_eq!(
+            ColorToken::parse_hex("#ffffff0f"),
+            Some(rgba(0xffffff0f)),
+            "white 6% 半透明边框（预设 srf_border 字面）"
+        );
+        assert_eq!(
+            ColorToken::parse_hex("#11223380"),
+            Some(rgba(0x11223380)),
+            "8 位 α=0x80"
+        );
+        assert_eq!(
+            ColorToken::parse_hex("#00000000"),
+            Some(rgba(0x00000000)),
+            "8 位 α=0x00"
+        );
+        let a8 = ColorToken::parse_hex("#ff000080").expect("合法 8 位");
+        assert!(
+            (a8.a - ((0x80 as f32) / 255.0)).abs() < 1e-6,
+            "α 值保留（0x80/255）"
+        );
+        // 非法：缺 # / 长度非 6/8 / 非 hex。
         assert_eq!(ColorToken::parse_hex("ff0000"), None, "缺 # → None");
         assert_eq!(ColorToken::parse_hex("#ff000"), None, "5 位 → None");
-        assert_eq!(ColorToken::parse_hex("#ff00000"), None, "7 位（含 alpha）→ None");
+        assert_eq!(ColorToken::parse_hex("#ff00000"), None, "7 位 → None");
+        assert_eq!(ColorToken::parse_hex("#ff0000000"), None, "9 位 → None");
         assert_eq!(ColorToken::parse_hex("#gg0000"), None, "非法 hex 字符 → None");
+        assert_eq!(ColorToken::parse_hex("#zzzzzzzz"), None, "8 位非法 hex → None");
+        assert_eq!(ColorToken::parse_hex("#"), None);
         assert_eq!(ColorToken::parse_hex(""), None);
     }
 
@@ -2205,5 +2265,145 @@ mod tests {
             Theme::apply(ThemeSpec::plain(ThemeMode::Light), cx);
             assert_eq!(Theme::global(cx).chrome, ChromeColors::light(), "亮档默认 chrome=for_mode(false)");
         });
+    }
+
+    // ── 阶段④-1：每预设×明暗档 WCAG 对比度回归（P1-6）+ P2-2 8 位 hex 处置 ──
+
+    /// WCAG 2.x 相对亮度：sRGB 通道分段线性/伽马。
+    fn linearize(ch: f64) -> f64 {
+        if ch <= 0.03928 {
+            ch / 12.92
+        } else {
+            ((ch + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// WCAG 相对亮度 `L = 0.2126 R + 0.7152 G + 0.0722 B`（参与对比的令牌均不透明）。
+    fn luminance(c: Rgba) -> f64 {
+        0.2126 * linearize(c.r as f64)
+            + 0.7152 * linearize(c.g as f64)
+            + 0.0722 * linearize(c.b as f64)
+    }
+
+    /// WCAG 对比度 `(L亮 + 0.05) / (L暗 + 0.05)`（≥1）。
+    fn contrast_ratio(a: Rgba, b: Rgba) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 每预设 × 明暗档的对比度回归（阶段④-1，P1-6）：
+    /// - `fg`（text_primary 系）vs `srf_deep`（暗档）/`srf_primary`（亮档）≥ 4.5:1（正文）。
+    /// - `accent` vs 同档 `srf_deep` 与 `srf_card` ≥ 3:1（UI 组件强调色）。
+    /// - `accent_light`（限列于该档预设表内）vs `srf_deep` 与 `srf_card` ≥ 3:1。
+    ///
+    /// 全表数据（preset / mode / fg对表面 / acc对deep / acc对card / al对deep / al对card；
+    /// 阈值 fg≥4.5、acc≥3、al≥3；仅预设表内 AccentLight 才计 al 行；default 无 al 行）：
+    ///   default L 14.02 5.78 4.90 (—) ；default D 14.90 10.34 8.58 (—)
+    ///   music   L 14.02 6.33 5.00  3.90  3.08 ；music   D 15.58 4.44 3.66  7.15  5.89
+    ///   ocean   L 14.60 3.68 3.09  3.68  3.09 ；ocean   D 15.14 10.15 8.23 12.78 10.36
+    ///   solar   L 14.55 4.75 3.99  3.71  3.11 ；solar   D 14.66 8.52 6.85 10.96  8.81
+    ///   rose    L 14.33 5.67 4.64  4.32  3.53 ；rose    D 14.90 7.02 5.86 10.25  8.56
+    ///   graphite L 14.03 6.00 4.77 4.17  3.31 ；graphite D 15.25 11.80 9.87 15.63 13.07
+    ///
+    /// 亮档修正记录（2026-11-22，对比度修正 #1-#5；改色保持人格、解阈值禁放宽）：
+    ///   #1 music   accent_light #a78bfa→#8468dc（原 vs 卡片坡 1.99 <3）
+    ///   #2 ocean   accent       #0d9488→#0c9185（原 vs 卡片坡 2.98 <3）
+    ///   #3 ocean   accent_light #14b8a6→#109185（原 vs 亮面坡 1.98 <3）
+    ///   #4 solar   accent_light #d97706→#c26a05（原 vs 卡片坡 2.53 <3）
+    ///   #5 graphite accent_light #7a8087→#717880（原 vs 卡片坡 2.95 <3）
+    /// 判别式：任一条阈值被未来改色破坏 → 对应 assert 红（合法 hex 数据缺陷，非放宽阈值）。
+    #[gpui::test]
+    fn preset_contrast_meets_wcag_per_mode(_cx: &mut TestAppContext) {
+        for preset in PRESETS {
+            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                let empty = BTreeMap::new();
+                let colors = merge_spectrum(
+                    mode,
+                    &ColorScheme::for_mode(matches!(mode, ThemeMode::Dark)),
+                    preset,
+                    &empty,
+                );
+                // 正文表面：亮档主表面 srf_primary / 暗档最深表面 srf_deep。
+                let text_bg = if matches!(mode, ThemeMode::Dark) {
+                    colors.srf_deep
+                } else {
+                    colors.srf_primary
+                };
+                let fg_r = contrast_ratio(colors.fg, text_bg);
+                assert!(
+                    fg_r >= 4.5,
+                    "{} {:?} fg vs 表面 = {:.2}:1 < 4.5（正文）",
+                    preset.id,
+                    mode,
+                    fg_r
+                );
+                // 强调色 vs 同档 srf_deep 与 srf_card（最深/最浅两表面皆须达标）。
+                let (acc_deep, acc_card) = (
+                    contrast_ratio(colors.accent, colors.srf_deep),
+                    contrast_ratio(colors.accent, colors.srf_card),
+                );
+                assert!(
+                    acc_deep >= 3.0 && acc_card >= 3.0,
+                    "{} {:?} accent vs srf_deep={:.2} / srf_card={:.2} < 3:1",
+                    preset.id,
+                    mode,
+                    acc_deep,
+                    acc_card
+                );
+                // accent_light：仅当该档预设表显式列出（"若在表内"）才检查。
+                let table = if matches!(mode, ThemeMode::Dark) { preset.dark } else { preset.light };
+                if table.iter().any(|(t, _)| *t == ColorToken::AccentLight) {
+                    let (al_deep, al_card) = (
+                        contrast_ratio(colors.accent_light, colors.srf_deep),
+                        contrast_ratio(colors.accent_light, colors.srf_card),
+                    );
+                    assert!(
+                        al_deep >= 3.0 && al_card >= 3.0,
+                        "{} {:?} accent_light vs srf_deep={:.2} / srf_card={:.2} < 3:1",
+                        preset.id,
+                        mode,
+                        al_deep,
+                        al_card
+                    );
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn merge_applies_8bit_srf_border_with_alpha(_cx: &mut TestAppContext) {
+        // P2-2 决策 (a)：`parse_hex` 支持 `#rrggbbaa` 后，含 alpha 的 `srf_border`
+        // 人格令牌诚实落位（此前 8 位被跳过 → border 恒 base）。
+        // 判别式：撤掉 8 位支持 → ② 的 custom 8 位覆写被跳过 → 保持 base，此断言红。
+        // ① 预设表 8 位字面 `#ffffff0f` 现可解析（逐字节 = base 值，数据本身无观感回归）。
+        let merged = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(merged.srf_border, rgba(0xffffff0f), "music 暗档 8 位 srf_border 生效");
+        // ② custom 8 位覆写全链生效：r/g/b 与 α 都被保留（真正的判别支）。
+        let merged2 = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &custom(&[("colors.srf_border", "#11223380")]),
+        );
+        assert_eq!(merged2.srf_border, rgba(0x11223380), "custom 8 位 srf_border 生效");
+        assert!(
+            (merged2.srf_border.a - ((0x80 as f32) / 255.0)).abs() < 1e-6,
+            "α=0x80 保留"
+        );
+        // ③ 6 位 srf_border 仍不透明（不引入 over-engineering 的 alpha 分支）。
+        let merged3 = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &custom(&[("colors.srf_border", "#123456")]),
+        );
+        assert_eq!(merged3.srf_border, rgb(0x123456), "6 位 srf_border 不透明");
+        assert_eq!(merged3.srf_border.a, 1.0, "6 位 α=1.0");
     }
 }
