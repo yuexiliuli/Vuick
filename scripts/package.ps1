@@ -88,11 +88,11 @@ if ($needFfmpegProvision) {
     $prefix  = if ($FfmpegPrefix) { $FfmpegPrefix } else { Join-Path $devDir 'ffmpeg-slim' }
     $srcDir  = if ($FfmpegSrc) { $FfmpegSrc } else { Join-Path $devDir 'ffmpeg' }   # build-slim-ffmpeg.sh 默认 SRC（FFmpeg 源码树）
     $msys2 = $null
-    foreach ($cand in @(
-        'C:\msys64\msys2_shell.cmd',
-        (Join-Path $env:MSYS2_ROOT 'msys2_shell.cmd'),
-        'C:\Program Files\MSYS2\msys2_shell.cmd'
-    )) {
+    # 注意：不要在数组字面量里写 (Join-Path $env:MSYS2_ROOT ...) —— MSYS2_ROOT 未设时
+    # Join-Path 抛「Path 为 null」；先拼候选清单再判断，保持空值安全（CI runner 常无此变量）。
+    $cands = @('C:\msys64\msys2_shell.cmd', 'C:\Program Files\MSYS2\msys2_shell.cmd')
+    if ($env:MSYS2_ROOT) { $cands = @((Join-Path $env:MSYS2_ROOT 'msys2_shell.cmd')) + $cands }
+    foreach ($cand in $cands) {
         if ($cand -and (Test-Path $cand)) { $msys2 = $cand; break }
     }
     $msys2BashExists = Test-Path 'C:\msys64\usr\bin\bash.exe'

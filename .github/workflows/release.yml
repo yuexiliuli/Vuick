@@ -35,6 +35,7 @@ jobs:
         shell: pwsh
 
       - name: 安装 MSYS2 UCRT64 工具链（FFmpeg 瘦包构建依赖）
+        id: msys
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -56,6 +57,7 @@ jobs:
         shell: pwsh
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          MSYS2_ROOT: ${{ steps.msys.outputs.msys2-location }}
         run: |
           $src = Join-Path $env:RUNNER_TEMP 'ffmpeg-src'
           $ffmpegPrefix = Join-Path $env:RUNNER_TEMP 'ffmpeg-slim'
