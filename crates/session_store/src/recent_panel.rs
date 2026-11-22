@@ -534,8 +534,7 @@ impl<H: RecentPanelHost> RecentPanel<H> {
         let theme = ui::theme::Theme::global(cx);
         let fg: Hsla = theme.colors.fg.into();
         let fg_muted: Hsla = theme.colors.fg_muted.into();
-        let chrome = ui::theme::ChromeColors::for_mode(theme.is_dark());
-        let selected_bg: Hsla = chrome.menu_highlight.into();
+        let selected_bg: Hsla = theme.chrome.menu_highlight.into();
 
         let debug = line.debug().to_string();
         // 行壳复用 ui::ListItemRow + row_height 参数（本批 Pattern 10）：可导航行

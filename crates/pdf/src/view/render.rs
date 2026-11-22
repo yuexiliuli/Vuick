@@ -1318,7 +1318,7 @@ impl PdfViewer {
         }
         let theme = ui::theme::Theme::global(cx);
         let colors = theme.colors;
-        let chrome = ui::theme::ChromeColors::for_mode(theme.is_dark());
+        let chrome = theme.chrome;
         let accent: gpui::Hsla = colors.accent.into();
         let line_color: gpui::Hsla = chrome.tab_reorder_line.into();
         // ghost 尺寸取被拖组首卡的实际卡矩形（无卡矩形时退 cell_w × 120 兜底）。
@@ -1583,7 +1583,7 @@ impl PdfViewer {
     fn render_grid_toolbar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = ui::theme::Theme::global(cx);
         let colors = theme.colors;
-        let chrome = ui::theme::ChromeColors::for_mode(theme.is_dark());
+        let chrome = theme.chrome;
         let fg: gpui::Hsla = colors.fg.into();
         let fg_disabled: gpui::Hsla = colors.fg_disabled.into();
         let hover_bg: gpui::Hsla = colors.selected_bg.into();
