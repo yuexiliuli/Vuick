@@ -1032,9 +1032,12 @@ fn apply_chrome_token(cc: &mut ChromeColors, token: ColorToken, v: Rgba) {
     }
 }
 
-/// 表驱动预设：每预设只列**人格令牌**（accent/accent_light/srf_*/状态色偏差，6-10 条）；
-/// base 恒为 [`ColorScheme::light`]/[`ColorScheme::dark`]（零列 = 该档零覆盖 = 现状逐字节
-/// 不变）。`light`/`dark` 两表互不污染，由 [`ThemeSpec::mode`] 择一合并。
+/// 表驱动预设：每预设列**人格令牌**（accent/accent_light/srf_*/状态色偏差）+ **全量换肤带**
+/// （`colors.bg/surface` + `chrome.*` 7 键：window_bg/chrome_bg/bar_bg/editor_bg/hairline/
+/// material_top/bottom；面板/tab_active/bar_border 等同名字段经 [`ChromeColors::from_scheme`]
+/// 自动随 `colors.bg` 走，不重复列）。base 恒为 [`ColorScheme::light`]/[`ColorScheme::dark`]
+/// （default 零列 = 零覆盖 = 现状逐字节不变）。`light`/`dark` 两表互不污染，由
+/// [`ThemeSpec::mode`] 择一合并。
 #[derive(Clone, Copy, Debug)]
 pub struct PresetSkin {
     /// 稳定标识（config 传 id 用，如 `"music"`）。
@@ -1068,6 +1071,17 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#201d40"),
             (ColorToken::SrfHover, "#282452"),
             (ColorToken::SrfBorder, "#ffffff0f"),
+            // ── 全量换肤带（2026-11-23）：主体表面 + 外壳 chrome 7 键；音乐窗 15 消费值
+            // （srf_*/accent/al/状态色）在上列保持原样，本带为音乐窗不消费的全局面 ──
+            (ColorToken::Bg, "#1b1733"),
+            (ColorToken::Surface, "#1e1a38"),
+            (ColorToken::WindowBg, "#0e0c1e"),
+            (ColorToken::ChromeBg, "#16132c"),
+            (ColorToken::BarBg, "#16132c"),
+            (ColorToken::EditorBg, "#141129"),
+            (ColorToken::Hairline, "#3a3453"),
+            (ColorToken::MaterialTop, "#191531"),
+            (ColorToken::MaterialBottom, "#0d0b1c"),
         ],
         // 亮档：协调的紫调浅坡（浅紫灰在亮底上仍中性可读；accent 亮档深一档保对比）。
         light: &[
@@ -1079,6 +1093,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#dfd9f4"),
             (ColorToken::SrfHover, "#d7d0f0"),
             (ColorToken::SrfBorder, "#0000000f"),
+            // ── 全量换肤带（2026-11-23）：亮档主体表面 + 外壳 chrome 7 键 ──
+            (ColorToken::Bg, "#f3f0fd"),
+            (ColorToken::Surface, "#eeebfb"),
+            (ColorToken::WindowBg, "#f6f3ff"),
+            (ColorToken::ChromeBg, "#efecfa"),
+            (ColorToken::BarBg, "#efecfa"),
+            (ColorToken::EditorBg, "#fbfaff"),
+            (ColorToken::Hairline, "#d8d0ec"),
+            (ColorToken::MaterialTop, "#f3effc"),
+            (ColorToken::MaterialBottom, "#e9e3f6"),
         ],
     },
     PresetSkin {
@@ -1094,6 +1118,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#15263a"),
             (ColorToken::SrfHover, "#1a2d44"),
             (ColorToken::SrfBorder, "#ffffff0f"),
+            // ── 全量换肤带（2026-11-23）──
+            (ColorToken::Bg, "#111f25"),
+            (ColorToken::Surface, "#13252c"),
+            (ColorToken::WindowBg, "#0a1416"),
+            (ColorToken::ChromeBg, "#0f1e22"),
+            (ColorToken::BarBg, "#0f1e22"),
+            (ColorToken::EditorBg, "#0d1a1e"),
+            (ColorToken::Hairline, "#244048"),
+            (ColorToken::MaterialTop, "#122530"),
+            (ColorToken::MaterialBottom, "#0a1316"),
         ],
         // 亮档：协调的冷浅蓝灰坡；accent 亮档深一档（#0C9185）保白底对比。
         light: &[
@@ -1105,6 +1139,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#d6e9eb"),
             (ColorToken::SrfHover, "#cde3e6"),
             (ColorToken::SrfBorder, "#0000000f"),
+            // ── 全量换肤带（2026-11-23）：亮档主体表面 + 外壳 chrome 7 键 ──
+            (ColorToken::Bg, "#eaf5f3"),
+            (ColorToken::Surface, "#e2f0ee"),
+            (ColorToken::WindowBg, "#f0f8f7"),
+            (ColorToken::ChromeBg, "#e6f2f1"),
+            (ColorToken::BarBg, "#e6f2f1"),
+            (ColorToken::EditorBg, "#f7fcfb"),
+            (ColorToken::Hairline, "#b8d8d5"),
+            (ColorToken::MaterialTop, "#eaf6f5"),
+            (ColorToken::MaterialBottom, "#ddeeec"),
         ],
     },
     PresetSkin {
@@ -1120,6 +1164,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#332614"),
             (ColorToken::SrfHover, "#3c2d18"),
             (ColorToken::SrfBorder, "#ffffff0f"),
+            // ── 全量换肤带（2026-11-23）──
+            (ColorToken::Bg, "#221b0d"),
+            (ColorToken::Surface, "#261f0f"),
+            (ColorToken::WindowBg, "#171208"),
+            (ColorToken::ChromeBg, "#201a0c"),
+            (ColorToken::BarBg, "#201a0c"),
+            (ColorToken::EditorBg, "#1d1709"),
+            (ColorToken::Hairline, "#4a3f1e"),
+            (ColorToken::MaterialTop, "#241d0e"),
+            (ColorToken::MaterialBottom, "#151007"),
         ],
         // 亮档：协调的暖浅坡；accent 亮档深一档（#B45309）保白底对比。
         light: &[
@@ -1131,6 +1185,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#f4e3ca"),
             (ColorToken::SrfHover, "#f0dcbe"),
             (ColorToken::SrfBorder, "#0000000f"),
+            // ── 全量换肤带（2026-11-23）：亮档主体表面 + 外壳 chrome 7 键 ──
+            (ColorToken::Bg, "#faf1e0"),
+            (ColorToken::Surface, "#f5ead3"),
+            (ColorToken::WindowBg, "#fdf7ec"),
+            (ColorToken::ChromeBg, "#f9f0dd"),
+            (ColorToken::BarBg, "#f9f0dd"),
+            (ColorToken::EditorBg, "#fffaf0"),
+            (ColorToken::Hairline, "#e4d2ae"),
+            (ColorToken::MaterialTop, "#fbf3e3"),
+            (ColorToken::MaterialBottom, "#f3e5c8"),
         ],
     },
     PresetSkin {
@@ -1146,6 +1210,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#361a33"),
             (ColorToken::SrfHover, "#3f1f3d"),
             (ColorToken::SrfBorder, "#ffffff0f"),
+            // ── 全量换肤带（2026-11-23）──
+            (ColorToken::Bg, "#241522"),
+            (ColorToken::Surface, "#291827"),
+            (ColorToken::WindowBg, "#170d13"),
+            (ColorToken::ChromeBg, "#22131d"),
+            (ColorToken::BarBg, "#22131d"),
+            (ColorToken::EditorBg, "#1e1018"),
+            (ColorToken::Hairline, "#4a2c40"),
+            (ColorToken::MaterialTop, "#261622"),
+            (ColorToken::MaterialBottom, "#150c12"),
         ],
         // 亮档：协调的暖浅玫坡；accent 亮档深一档（#BE185D）保白底对比。
         light: &[
@@ -1157,6 +1231,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#f4dbe7"),
             (ColorToken::SrfHover, "#f1d2e1"),
             (ColorToken::SrfBorder, "#0000000f"),
+            // ── 全量换肤带（2026-11-23）：亮档主体表面 + 外壳 chrome 7 键 ──
+            (ColorToken::Bg, "#f9ebf2"),
+            (ColorToken::Surface, "#f4e3ec"),
+            (ColorToken::WindowBg, "#fdf4f8"),
+            (ColorToken::ChromeBg, "#f9e8f1"),
+            (ColorToken::BarBg, "#f9e8f1"),
+            (ColorToken::EditorBg, "#fff9fb"),
+            (ColorToken::Hairline, "#e8c6d8"),
+            (ColorToken::MaterialTop, "#fbf0f5"),
+            (ColorToken::MaterialBottom, "#f1dce6"),
         ],
     },
     PresetSkin {
@@ -1172,6 +1256,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#222222"),
             (ColorToken::SrfHover, "#2a2a2a"),
             (ColorToken::SrfBorder, "#ffffff0f"),
+            // ── 全量换肤带（2026-11-23）──
+            (ColorToken::Bg, "#181818"),
+            (ColorToken::Surface, "#1d1d1d"),
+            (ColorToken::WindowBg, "#0e0e0e"),
+            (ColorToken::ChromeBg, "#161616"),
+            (ColorToken::BarBg, "#161616"),
+            (ColorToken::EditorBg, "#131313"),
+            (ColorToken::Hairline, "#2e2e2e"),
+            (ColorToken::MaterialTop, "#1a1a1a"),
+            (ColorToken::MaterialBottom, "#0d0d0d"),
             (ColorToken::Success, "#7fb069"),
             (ColorToken::Warning, "#c9a25a"),
             (ColorToken::Info, "#8296b8"),
@@ -1187,6 +1281,16 @@ pub static PRESETS: &[PresetSkin] = &[
             (ColorToken::SrfCard, "#dcdedf"),
             (ColorToken::SrfHover, "#d3d5d7"),
             (ColorToken::SrfBorder, "#0000000f"),
+            // ── 全量换肤带（2026-11-23）：亮档主体表面 + 外壳 chrome 7 键 ──
+            (ColorToken::Bg, "#eceeef"),
+            (ColorToken::Surface, "#e5e7e9"),
+            (ColorToken::WindowBg, "#f3f4f5"),
+            (ColorToken::ChromeBg, "#e9eaec"),
+            (ColorToken::BarBg, "#e9eaec"),
+            (ColorToken::EditorBg, "#f8f9fa"),
+            (ColorToken::Hairline, "#c9cdd2"),
+            (ColorToken::MaterialTop, "#eef0f1"),
+            (ColorToken::MaterialBottom, "#e4e6e8"),
             (ColorToken::Success, "#4d7c3f"),
             (ColorToken::Warning, "#9a7b2d"),
             (ColorToken::Info, "#5a6f96"),
@@ -1261,23 +1365,46 @@ pub(crate) fn merge_spectrum(
     out
 }
 
-/// 合并 `ChromeColors`（外壳层）：仅 custom 的 `chrome.*` 键生效；本 slice 预设不列 chrome
-/// 令牌，故不参与。`"default"` 还原到 base 值。非法 hex / 未知 key 跳过、不 panic。
+/// 合并 `ChromeColors`（外壳层）：优先级 `base < preset（chrome.* 键）< custom`，对齐
+/// [`merge_spectrum`] 的 base<preset<custom 语义。`custom` 值 `"default"` → 还原到预设
+/// chrome 值；预设未列该键 = 还原 base。非法 hex / 未知 key 跳过、不 panic。**只在
+/// apply 时跑一次**（渲染只读本函数产物）。
 pub(crate) fn merge_chrome(
+    mode: ThemeMode,
     base: &ChromeColors,
+    preset_skin: &PresetSkin,
     custom: &BTreeMap<&'static str, String>,
 ) -> ChromeColors {
     let mut out = *base;
+    let table = if matches!(mode, ThemeMode::Dark) {
+        preset_skin.dark
+    } else {
+        preset_skin.light
+    };
+    // 1) base <- preset：先套预设表里的 `chrome.*` 键（colors.* / 数组板在本域 no-op）。
+    for &(token, hex) in table {
+        if let Some(v) = ColorToken::parse_hex(hex) {
+            apply_chrome_token(&mut out, token, v);
+        }
+    }
+    // 2) preset <- custom：逐个 key 覆盖。
     for (key, value) in custom {
         let Some(token) = ColorToken::from_key(key) else {
-            continue;
+            continue; // 未知 key：跳过
         };
         if value == "default" {
-            continue; // chrome 无 preset 层，「default」= 还原 base（当前已是）。
+            // 还原到预设 chrome 值（preset 表里该令牌 → 重新套用；不在表里 = 本来就=base，不动）。
+            if let Some(&(_, hex)) = table.iter().find(|(t, _)| *t == token) {
+                if let Some(v) = ColorToken::parse_hex(hex) {
+                    apply_chrome_token(&mut out, token, v);
+                }
+            }
+            continue;
         }
         if let Some(v) = ColorToken::parse_hex(value) {
             apply_chrome_token(&mut out, token, v);
         }
+        // 非法 hex：跳过该 key，不影响其它 token。
     }
     out
 }
@@ -1335,7 +1462,7 @@ impl Theme {
         let base_colors = ColorScheme::for_mode(matches!(spec.mode, ThemeMode::Dark));
         let colors = merge_spectrum(spec.mode, &base_colors, spec.preset, &spec.custom);
         let chrome_base = ChromeColors::from_scheme(&colors, spec.mode);
-        let chrome = merge_chrome(&chrome_base, &spec.custom);
+        let chrome = merge_chrome(spec.mode, &chrome_base, spec.preset, &spec.custom);
         let theme = Self {
             mode: spec.mode,
             colors,
@@ -2059,14 +2186,14 @@ mod tests {
             "暗档 default 合并必须逐字段等于 base"
         );
         assert_eq!(
-            merge_chrome(&ChromeColors::light(), &empty),
+            merge_chrome(ThemeMode::Light, &ChromeColors::light(), default, &empty),
             ChromeColors::light(),
-            "亮 chrome 空合并不变"
+            "亮 chrome default 合并必须逐字段等于 base"
         );
         assert_eq!(
-            merge_chrome(&ChromeColors::dark(), &empty),
+            merge_chrome(ThemeMode::Dark, &ChromeColors::dark(), default, &empty),
             ChromeColors::dark(),
-            "暗 chrome 空合并不变"
+            "暗 chrome default 合并必须逐字段等于 base"
         );
         // 新字段缺省值锚（零覆盖时的基座值，供后续对比阶段对照）。
         let dark = ColorScheme::dark();
@@ -2087,8 +2214,14 @@ mod tests {
         assert_eq!(merged.accent, rgb(0x7c5cfc), "music 暗档 accent=#7C5CFC");
         assert_eq!(merged.srf_deep, rgb(0x0d0b1a), "music 暗档 srf_deep=#0D0B1A");
         assert_eq!(merged.accent_light, rgb(0xa78bfa), "music 暗档 accent_light=#A78BFA");
-        // 未列入人格表的底色保持 base（音乐紫不动主背景）。
-        assert_eq!(merged.bg, ColorScheme::dark().bg, "未覆盖字段保持 base");
+        // 全量换肤带（2026-11-23）：music 预设现定义 colors.bg，主背景随预设换肤——
+        // 不再保持 base；其余既有人格令牌仍逐字原样。
+        assert_eq!(merged.bg, rgb(0x1b1733), "music 暗档 bg=#1B1733（全量换肤带新增）");
+        assert_eq!(
+            merged.surface,
+            rgb(0x1e1a38),
+            "music 暗档 surface=#1E1A38（全量换肤带新增）"
+        );
     }
 
     #[gpui::test]
@@ -2103,6 +2236,84 @@ mod tests {
         assert_eq!(merged.accent, rgb(0xff0000), "custom 覆盖 preset accent");
         assert_eq!(merged.srf_deep, rgb(0x0d0b1a), "preset 其余令牌不受影响");
         assert_eq!(merged.accent_light, rgb(0xa78bfa), "未经 custom 的令牌保持 preset");
+    }
+
+    #[gpui::test]
+    fn merge_chrome_applies_preset_chrome_keys(_cx: &mut TestAppContext) {
+        // 全量换肤：预设含 chrome.* 键时，走「from_scheme(合并 colors) → merge_chrome(preset,
+        // empty)」管线后 chrome 域 7 键生效（判别式：merge_chrome 不套预设 chrome →
+        // window_bg 恒 base #202020 → 此断言红）。
+        let colors = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &BTreeMap::new(),
+        );
+        let base = ChromeColors::from_scheme(&colors, ThemeMode::Dark);
+        let merged = merge_chrome(ThemeMode::Dark, &base, music_preset(), &BTreeMap::new());
+        assert_eq!(merged.window_bg, rgb(0x0e0c1e), "music 暗档 window_bg=#0E0C1E");
+        assert_eq!(merged.chrome_bg, rgb(0x16132c), "music 暗档 chrome_bg=#16132C");
+        assert_eq!(merged.bar_bg, rgb(0x16132c), "music 暗档 bar_bg=#16132C");
+        assert_eq!(merged.editor_bg, rgb(0x141129), "music 暗档 editor_bg=#141129");
+        assert_eq!(merged.hairline, rgb(0x3a3453), "music 暗档 hairline=#3A3453");
+        assert_eq!(merged.material_top, rgb(0x191531), "music 暗档 material_top=#191531");
+        assert_eq!(merged.material_bottom, rgb(0x0d0b1c), "music 暗档 material_bottom=#0D0B1C");
+        // 同名字段派生自「合并后 colors」（panel_bg/tab_active_bg 随 colors.bg）。
+        assert_eq!(merged.panel_bg, colors.bg, "panel_bg 同源合并后 bg");
+        assert_eq!(merged.tab_active_bg, colors.bg, "tab_active_bg 同源合并后 bg");
+        assert_eq!(colors.bg, rgb(0x1b1733), "colors.bg 已随预设换肤");
+    }
+
+    #[gpui::test]
+    fn merge_chrome_custom_overrides_preset(_cx: &mut TestAppContext) {
+        // custom > preset（chrome 域）：custom 的 chrome.* 键盖过预设 chrome 键。
+        let colors = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &BTreeMap::new(),
+        );
+        let base = ChromeColors::from_scheme(&colors, ThemeMode::Dark);
+        let merged = merge_chrome(
+            ThemeMode::Dark,
+            &base,
+            music_preset(),
+            &custom(&[("chrome.window_bg", "#112233")]),
+        );
+        assert_eq!(merged.window_bg, rgb(0x112233), "custom 覆盖 preset window_bg");
+        assert_eq!(merged.bar_bg, rgb(0x16132c), "preset 其余 chrome 键不因 custom 受影响");
+    }
+
+    #[gpui::test]
+    fn merge_chrome_custom_default_reverts_to_preset(_cx: &mut TestAppContext) {
+        // custom 值 "default"（chrome 域）：还原到预设 chrome 值；预设未列该键 → base。
+        let colors = merge_spectrum(
+            ThemeMode::Dark,
+            &ColorScheme::dark(),
+            music_preset(),
+            &BTreeMap::new(),
+        );
+        let base = ChromeColors::from_scheme(&colors, ThemeMode::Dark);
+        let merged = merge_chrome(
+            ThemeMode::Dark,
+            &base,
+            music_preset(),
+            &custom(&[("chrome.window_bg", "default")]),
+        );
+        assert_eq!(merged.window_bg, rgb(0x0e0c1e), "「default」还原到 preset window_bg");
+        // 预设未列 chrome.window_bg（default 预设空表）："default" 还原 base。
+        let base0 = ChromeColors::from_scheme(&ColorScheme::dark(), ThemeMode::Dark);
+        let merged0 = merge_chrome(
+            ThemeMode::Dark,
+            &base0,
+            &PRESETS[0],
+            &custom(&[("chrome.window_bg", "default")]),
+        );
+        assert_eq!(
+            merged0.window_bg,
+            ChromeColors::dark().window_bg,
+            "default 预设下「default」= base（无预设值）"
+        );
     }
 
     #[gpui::test]
@@ -2197,7 +2408,11 @@ mod tests {
             assert_eq!(t.colors.accent, rgb(0x7c5cfc), "preset 合并生效");
             assert_eq!(t.colors.srf_deep, rgb(0x0d0b1a), "preset srf 生效");
             assert_eq!(t.chrome.window_bg, rgb(0x112233), "custom chrome 覆写生效");
-            assert_eq!(t.chrome.bar_bg, ChromeColors::dark().bar_bg, "未覆写 chrome 保持默认");
+            assert_eq!(
+                t.chrome.bar_bg,
+                rgb(0x16132c),
+                "未覆写 chrome 随 preset 全量换肤带（bar_bg=#16132C），非 base #202020"
+            );
         });
     }
 
@@ -2292,19 +2507,16 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
-    /// 每预设 × 明暗档的对比度回归（阶段④-1，P1-6）：
+    /// 每预设 × 明暗档的对比度回归（阶段④-1 P1-6 + 2026-11-23 全量换肤带）：
     /// - `fg`（text_primary 系）vs `srf_deep`（暗档）/`srf_primary`（亮档）≥ 4.5:1（正文）。
-    /// - `accent` vs 同档 `srf_deep` 与 `srf_card` ≥ 3:1（UI 组件强调色）。
-    /// - `accent_light`（限列于该档预设表内）vs `srf_deep` 与 `srf_card` ≥ 3:1。
+    /// - 全量换肤外壳表面：`fg` vs `window_bg`/`chrome_bg`/`bar_bg`（两档）≥ 4.5:1；
+    ///   暗档补 `editor_bg`、亮档补 `colors.bg` ≥ 4.5:1。
+    /// - `fg_muted` vs 上表全部外壳表面 ≥ 3:1（次要文字）。
+    /// - `accent`/`accent_light` vs 同档 `srf_deep`/`srf_card`（既有）与 `window_bg`/
+    ///   `colors.bg`（新增）≥ 3:1（UI 强调色，最深/最浅表面皆须达标）。
     ///
-    /// 全表数据（preset / mode / fg对表面 / acc对deep / acc对card / al对deep / al对card；
-    /// 阈值 fg≥4.5、acc≥3、al≥3；仅预设表内 AccentLight 才计 al 行；default 无 al 行）：
-    ///   default L 14.02 5.78 4.90 (—) ；default D 14.90 10.34 8.58 (—)
-    ///   music   L 14.02 6.33 5.00  3.90  3.08 ；music   D 15.58 4.44 3.66  7.15  5.89
-    ///   ocean   L 14.60 3.68 3.09  3.68  3.09 ；ocean   D 15.14 10.15 8.23 12.78 10.36
-    ///   solar   L 14.55 4.75 3.99  3.71  3.11 ；solar   D 14.66 8.52 6.85 10.96  8.81
-    ///   rose    L 14.33 5.67 4.64  4.32  3.53 ；rose    D 14.90 7.02 5.86 10.25  8.56
-    ///   graphite L 14.03 6.00 4.77 4.17  3.31 ；graphite D 15.25 11.80 9.87 15.63 13.07
+    /// 教训锚：accent 最小档 = ocean 亮档 #0c9185 vs 亮 colors.bg #eaf5f3 ≈ 3.49:1
+    /// （全量换肤带最紧条）；fg 13.5–15.7 / fg_muted 5.5–7.1 / accent 3.49–11.9。
     ///
     /// 亮档修正记录（2026-11-22，对比度修正 #1-#5；改色保持人格、解阈值禁放宽）：
     ///   #1 music   accent_light #a78bfa→#8468dc（原 vs 卡片坡 1.99 <3）
@@ -2318,14 +2530,15 @@ mod tests {
         for preset in PRESETS {
             for mode in [ThemeMode::Light, ThemeMode::Dark] {
                 let empty = BTreeMap::new();
-                let colors = merge_spectrum(
-                    mode,
-                    &ColorScheme::for_mode(matches!(mode, ThemeMode::Dark)),
-                    preset,
-                    &empty,
-                );
+                let dark = matches!(mode, ThemeMode::Dark);
+                let colors = merge_spectrum(mode, &ColorScheme::for_mode(dark), preset, &empty);
+                // 合并主题 chrome：from_scheme(合并 colors) → merge_chrome(preset, empty)
+                // 取全量换肤表面（default 预设空表 → 依 from_scheme 全 base，仍须达标）。
+                let chrome_base = ChromeColors::from_scheme(&colors, mode);
+                let chrome = merge_chrome(mode, &chrome_base, preset, &empty);
+
                 // 正文表面：亮档主表面 srf_primary / 暗档最深表面 srf_deep。
-                let text_bg = if matches!(mode, ThemeMode::Dark) {
+                let text_bg = if dark {
                     colors.srf_deep
                 } else {
                     colors.srf_primary
@@ -2338,34 +2551,61 @@ mod tests {
                     mode,
                     fg_r
                 );
-                // 强调色 vs 同档 srf_deep 与 srf_card（最深/最浅两表面皆须达标）。
-                let (acc_deep, acc_card) = (
-                    contrast_ratio(colors.accent, colors.srf_deep),
-                    contrast_ratio(colors.accent, colors.srf_card),
-                );
-                assert!(
-                    acc_deep >= 3.0 && acc_card >= 3.0,
-                    "{} {:?} accent vs srf_deep={:.2} / srf_card={:.2} < 3:1",
-                    preset.id,
-                    mode,
-                    acc_deep,
-                    acc_card
-                );
-                // accent_light：仅当该档预设表显式列出（"若在表内"）才检查。
-                let table = if matches!(mode, ThemeMode::Dark) { preset.dark } else { preset.light };
-                if table.iter().any(|(t, _)| *t == ColorToken::AccentLight) {
-                    let (al_deep, al_card) = (
-                        contrast_ratio(colors.accent_light, colors.srf_deep),
-                        contrast_ratio(colors.accent_light, colors.srf_card),
-                    );
+                // 全量换肤外壳表面：window_bg/chrome_bg/bar_bg（两档）+ 暗档 editor_bg / 亮档 bg。
+                let shell_surfaces = [
+                    chrome.window_bg,
+                    chrome.chrome_bg,
+                    chrome.bar_bg,
+                    if dark { chrome.editor_bg } else { colors.bg },
+                ];
+                for bg in shell_surfaces {
+                    let fg_s = contrast_ratio(colors.fg, bg);
                     assert!(
-                        al_deep >= 3.0 && al_card >= 3.0,
-                        "{} {:?} accent_light vs srf_deep={:.2} / srf_card={:.2} < 3:1",
+                        fg_s >= 4.5,
+                        "{} {:?} fg vs 外壳面 = {:.2}:1 < 4.5（正文）",
                         preset.id,
                         mode,
-                        al_deep,
-                        al_card
+                        fg_s
                     );
+                    let fm_s = contrast_ratio(colors.fg_muted, bg);
+                    assert!(
+                        fm_s >= 3.0,
+                        "{} {:?} fg_muted vs 外壳面 = {:.2}:1 < 3（次要文字）",
+                        preset.id,
+                        mode,
+                        fm_s
+                    );
+                }
+                // 强调色 vs srf_deep/srf_card（既有）+ window_bg/colors.bg（新增），皆 ≥3。
+                let acc_surfaces = [
+                    colors.srf_deep,
+                    colors.srf_card,
+                    chrome.window_bg,
+                    colors.bg,
+                ];
+                for bg in acc_surfaces {
+                    let acc = contrast_ratio(colors.accent, bg);
+                    assert!(
+                        acc >= 3.0,
+                        "{} {:?} accent vs 表面 = {:.2}:1 < 3",
+                        preset.id,
+                        mode,
+                        acc
+                    );
+                }
+                // accent_light：仅当该档预设表显式列出（"若在表内"）才检查。
+                let table = if dark { preset.dark } else { preset.light };
+                if table.iter().any(|(t, _)| *t == ColorToken::AccentLight) {
+                    for bg in acc_surfaces {
+                        let al = contrast_ratio(colors.accent_light, bg);
+                        assert!(
+                            al >= 3.0,
+                            "{} {:?} accent_light vs 表面 = {:.2}:1 < 3",
+                            preset.id,
+                            mode,
+                            al
+                        );
+                    }
                 }
             }
         }
