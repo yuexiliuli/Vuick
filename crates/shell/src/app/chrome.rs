@@ -136,7 +136,10 @@ impl EditorApp {
     /// 编辑器/预览面板背景（暗色主题 = theme `editor_bg`（原 config `EDITOR_BG_DARK`
     /// #121314，常量已删）统一底色）。
     pub(super) fn panel_bg(&self, cx: &App) -> gpui::Hsla {
-        ui::shell::content_bg(
+        // 合并后 theme `chrome.editor_bg`（P1-2b：不读 `for_mode` 常量，预设/自定义
+        // chrome.editor_bg 覆盖对预览面板底生效）。默认零覆盖与 `#121314` 逐字节一致。
+        ui::shell::content_bg_theme(
+            cx,
             ui::theme::Theme::global(cx).is_dark(),
             self.chrome(cx).panel_bg.into(),
         )

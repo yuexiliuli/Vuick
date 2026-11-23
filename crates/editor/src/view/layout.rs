@@ -216,7 +216,9 @@ impl CodeEditor {
         }
         // 主题色/画布底色/行号列宽等便宜字段：每帧无条件写（主题切换后下一帧立即
         // 生效，成本可忽略，不与昂贵字体度量共用门控）。
-        self.bg = ui::shell::content_bg(dark, colors.bg.into());
+        // 合并后 theme `chrome.editor_bg`（P1-2b：不读 `for_mode` 常量，预设/自定义
+        // chrome.editor_bg 覆盖对编辑区底生效）。默认零覆盖与 `#121314` 逐字节一致。
+        self.bg = ui::shell::content_bg_theme(cx, dark, colors.bg.into());
         self.fg = colors.fg.into();
         self.gutter_fg = colors.fg_muted.into();
         // 垂直标尺线：次要前景（与行号同源、已验证明暗主题都可见；不用 `border`——
